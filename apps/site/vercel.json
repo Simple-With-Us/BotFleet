@@ -1,5 +1,5 @@
 {
-  "git": {"deploymentEnabled": {"**": false, "main": true}},
+  "git": {"deploymentEnabled": false},
   "buildCommand": "node build.mjs",
   "outputDirectory": "dist",
   "cleanUrls": true,

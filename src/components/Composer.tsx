@@ -11,7 +11,7 @@ import { ArrowUp, Check, Clock, Hand, Mic, Paperclip, ShieldCheck, Square, Users
 import { useStore, visibleMessages, type Bot, type Group, type Message } from "@/state/store";
 import { botSupportsImageAttachments } from "@/lib/model-images";
 import { cn } from "@/lib/cn";
-import { foldSentDrafts, useComposerDraft, useFailedSendRestore, type SentDraft } from "@/lib/drafts";
+import { botThreadDraftId, foldSentDrafts, getDraft, getDraftAttachments, getStore, migrateThreadDraft, useComposerDraft, useFailedSendRestore, type SentDraft } from "@/lib/drafts";
 import { BotMascot } from "./Avatar";
 import { BotOffComposer } from "./BotOffComposer";
 import { ComposerAttachments, pathForFile } from "./ComposerAttachments";
@@ -234,8 +234,36 @@ function ComposerInner({
     : (bot?.name ?? "The bot");
   // Per-thread draft: switching bots unmounts this component, so both the
   // text and its attachment chips have to outlive it (see lib/drafts).
-  const draftId = group ? `group:${group.id}:${group.threadId}` : `bot:${bot?.id ?? ""}`;
+  // A browsed non-active thread drafts under its own key; the active
+  // thread keeps the legacy per-bot key.
+  const draftId = group
+    ? `group:${group.id}:${group.threadId}`
+    : botThreadDraftId(
+        bot?.id ?? "",
+        bot?.threadId ?? "",
+        state.bots.find((candidate) => candidate.id === bot?.id)?.threadId ?? bot?.threadId ?? "",
+      );
   const [text, setText, attachments, setAttachments] = useComposerDraft(draftId);
+  // A thread typed while browsed drafts under its per-thread key; when
+  // that thread becomes the active one this composer resolves the legacy
+  // per-bot key instead.  Carry the text across so Switch keeps what was
+  // typed — scoped to this bot going active on the migrated thread, so
+  // closing a view or switching bots never moves text between threads.
+  const prevDraftId = useRef(draftId);
+  useEffect(() => {
+    const previous = prevDraftId.current;
+    prevDraftId.current = draftId;
+    if (!bot || group || previous === draftId) return;
+    const perThread = previous.match(/^bot:([^:]+):(.+)$/);
+    const [, migratedBotId, migratedThreadId] = perThread ?? [];
+    if (!migratedBotId || !migratedThreadId || `bot:${migratedBotId}` !== draftId || migratedBotId !== bot.id) return;
+    const liveThreadId = state.bots.find((candidate) => candidate.id === bot.id)?.threadId;
+    if (liveThreadId !== migratedThreadId) return;
+    const store = getStore();
+    migrateThreadDraft(store, previous, draftId);
+    setText(getDraft(store, draftId));
+    setAttachments(getDraftAttachments(store, draftId));
+  }, [bot, group, draftId, state.bots, setText, setAttachments]);
   // The composer clears the moment a message goes out; a send the server
   // refuses, or cannot be reached for, hands it all back through this.
   const restoreFailedSend = useFailedSendRestore<Message>(threadId, onRestoreReply);
@@ -833,33 +861,51 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
                 >
                   {queuedChipLabel({ text: entry.text, busyName, draining: updateHolding })}
                 </span>
-                <div className="flex shrink-0 items-center gap-1">
+                {/* Labeled actions, not bare glyphs: three 24px icons in a row were
+                    easy to mis-tap, and "Steer" beside "Cancel" says which one
+                    ends the wait.  The order is Steer, Edit, Cancel — Edit sits in
+                    the middle so neither neighbour reads as its default.  The
+                    accessible names stay the ones the screen readers and the
+                    tests already use. */}
+                <div className="flex shrink-0 items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={handleSteerQueued}
+                    className={cn(
+                      "inline-flex h-6 items-center gap-1 whitespace-nowrap rounded-md border px-2 text-[11.5px] font-medium leading-none transition-colors",
+                      "border-accent/30 bg-accent/10 text-accent hover:bg-accent/15",
+                    )}
+                    title="Stops the current turn and sends this now."
+                    aria-label="Steer Now"
+                  >
+                    <ArrowUp size={12} strokeWidth={2.5} aria-hidden="true" />
+                    Steer
+                  </button>
                   <button
                     type="button"
                     onClick={() => handleEditQueued(entry)}
-                    className="flex size-6 items-center justify-center rounded-md text-ink-secondary hover:bg-raised hover:text-ink transition-colors"
+                    className={cn(
+                      "inline-flex h-6 items-center gap-1 whitespace-nowrap rounded-md border px-2 text-[11.5px] font-medium leading-none transition-colors",
+                      "border-hairline/40 bg-inset/30 text-ink-secondary hover:bg-raised hover:text-ink",
+                    )}
                     title="Puts the message back in the composer to edit."
                     aria-label="Edit Queued Message"
                   >
-                    <Pencil size={12} strokeWidth={2} />
+                    <Pencil size={12} strokeWidth={2} aria-hidden="true" />
+                    Edit
                   </button>
                   <button
                     type="button"
                     onClick={() => handleCancelQueued(entry.queueId)}
-                    className="flex size-6 items-center justify-center rounded-md text-ink-secondary hover:bg-raised hover:text-danger transition-colors"
+                    className={cn(
+                      "inline-flex h-6 items-center gap-1 whitespace-nowrap rounded-md border px-2 text-[11.5px] font-medium leading-none transition-colors",
+                      "border-hairline/40 bg-inset/30 text-ink-secondary hover:bg-raised hover:text-danger",
+                    )}
                     title="Cancel Queued Message"
                     aria-label="Cancel Queued Message"
                   >
-                    <Trash2 size={12} strokeWidth={2} />
-                  </button>
-                  <button
-                    type="button"
-                    onClick={handleSteerQueued}
-                    className="flex size-6 items-center justify-center rounded-md text-accent hover:bg-accent/15 transition-colors"
-                    title="Stops the current turn and sends this now."
-                    aria-label="Steer Now"
-                  >
-                    <ArrowUp size={13} strokeWidth={2.5} />
+                    <Trash2 size={12} strokeWidth={2} aria-hidden="true" />
+                    Cancel
                   </button>
                 </div>
               </div>

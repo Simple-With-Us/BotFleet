@@ -46,7 +46,7 @@ jobs:
           sparse-checkout: .github/autofix
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 24
+          node-version: 26
       - run: npm install --prefix .github/autofix --omit=dev
       - run: node .github/autofix/kody-pilot.mjs prepare "$RUNNER_TEMP/pilot"
         env:
@@ -73,7 +73,7 @@ jobs:
           sparse-checkout: .github/autofix
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 24
+          node-version: 26
       - run: npm install --prefix .github/autofix --omit=dev
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
@@ -108,7 +108,7 @@ jobs:
           sparse-checkout: .github/autofix
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 24
+          node-version: 26
       - run: npm install --prefix .github/autofix --omit=dev
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:

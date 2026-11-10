@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Enforce Always-On in Tailscale and disable disconnect button -->
+    <key>AlwaysOn.Enabled</key>
+    <true/>
+    <key>ForceEnabled</key>
+    <true/>
+
+    <!-- Force device to use Tailscale DNS (MagicDNS) -->
+    <key>UseTailscaleDNSSettings</key>
+    <string>always</string>
+
+    <!-- Block and hide Exit Node usage entirely -->
+    <key>ExitNodesPicker</key>
+    <string>hide</string>
+    <key>AllowedSuggestedExitNodes</key>
+    <array/>
+    <key>RunExitNode</key>
+    <string>hide</string>
+
+    <!-- Hide VPN On Demand controls to prevent tampering -->
+    <key>VPNOnDemandSettings</key>
+    <string>hide</string>
+</dict>
+</plist>

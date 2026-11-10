@@ -1037,3 +1037,44 @@ test("the restart hint says stop before start, because the launcher will not sta
   assert.match(stdout, /stop the running harness/i);
   assert.match(stdout, /kickstart/);
 });
+
+test("the manifest records the version the deployer validated, defaulting to the tree's own", async (t) => {
+  // The runtime in a release reports the manifest's version when there is one,
+  // so the post-apply check compares against the number the deployer verified.
+  // With no deployer version, the staged package.json is the truth the same
+  // code would report anyway.
+  const dir = await mkdtemp(join(tmpdir(), "botfleet-manifest-version-"));
+  t.after(() => forceRemove(dir));
+  const env = { HOME: dir };
+  const staging = stagingPath(A, env);
+  await mkdir(staging, { recursive: true });
+  await writeFile(join(staging, "package.json"), JSON.stringify({ name: "botfleet", version: "1.0.42" }));
+
+  await promoteStaging({ commit: A, env });
+  const withDefault = validateReleaseManifest(
+    JSON.parse(await readFile(join(releasePath(A, env), ".botfleet-release.json"), "utf8")));
+  assert.equal(withDefault.version, "1.0.42", "no explicit version records the tree's package.json version");
+
+  const stagingB = stagingPath(B, env);
+  await mkdir(stagingB, { recursive: true });
+  await writeFile(join(stagingB, "package.json"), JSON.stringify({ name: "botfleet", version: "1.0.42" }));
+  await promoteStaging({ commit: B, env, version: "1.0.202611030400", build: "202611030400" });
+  const stamped = validateReleaseManifest(
+    JSON.parse(await readFile(join(releasePath(B, env), ".botfleet-release.json"), "utf8")));
+  assert.equal(stamped.version, "1.0.202611030400", "an explicit version wins");
+  assert.equal(stamped.build, "202611030400");
+
+  const stagingC = stagingPath(C, env);
+  await mkdir(stagingC, { recursive: true });
+  await promoteStaging({ commit: C, env });
+  const withoutPackage = validateReleaseManifest(
+    JSON.parse(await readFile(join(releasePath(C, env), ".botfleet-release.json"), "utf8")));
+  assert.equal(withoutPackage.version, undefined, "no package.json records no version rather than inventing one");
+});
+
+test("version and build are typed manifest fields", async () => {
+  const valid = { schemaVersion: 1, commit: A, promotedAt: "2026-11-03T00:00:00.000Z" };
+  assert.ok(validateReleaseManifest({ ...valid, version: "1.0.42", build: "42" }));
+  assert.equal(validateReleaseManifest({ ...valid, version: 42 }), null, "a numeric version is rejected");
+  assert.equal(validateReleaseManifest({ ...valid, build: { n: 1 } }), null, "a non-string build is rejected");
+});

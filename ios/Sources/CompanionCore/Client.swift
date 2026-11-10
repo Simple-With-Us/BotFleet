@@ -379,11 +379,15 @@ public struct CompanionClient: Sendable {
     public let connection: Connection
     private let token: String?
     private let session: URLSession
+    private let gateCredential: HostGateCredential?
+    private let hostOrigin: HostOrigin?
 
-    public init(connection: Connection, token: String?, session: URLSession = .shared) {
+    public init(connection: Connection, token: String?, session: URLSession = .shared, gateCredential: HostGateCredential? = nil, hostOrigin: HostOrigin? = nil) {
         self.connection = connection
         self.token = token
         self.session = session
+        self.gateCredential = gateCredential
+        self.hostOrigin = hostOrigin ?? gateCredential?.origin
     }
 
     // MARK: - Requests
@@ -395,6 +399,7 @@ public struct CompanionClient: Sendable {
         components.path = path
         components.queryItems = query.isEmpty ? nil : query
         guard let url = components.url else { throw APIError.badURL }
+        if let hostOrigin, !hostOrigin.contains(url) { throw SavedHostError.differentOrigin }
 
         var request = URLRequest(url: url)
         request.httpMethod = method
@@ -406,6 +411,7 @@ public struct CompanionClient: Sendable {
         if let token {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
+        if let gateCredential { try gateCredential.authorize(&request) }
         if let body {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
@@ -468,11 +474,13 @@ public struct CompanionClient: Sendable {
 
     private func perform(_ request: URLRequest) async throws -> (Data, URLResponse) {
         do {
-            return try await session.data(for: request)
+            if let hostOrigin, request.url.map(hostOrigin.contains) != true { throw SavedHostError.differentOrigin }
+            return try await session.data(for: request, delegate: hostOrigin.map { HostOriginRedirectPolicy(origin: $0) })
         } catch {
             if Task.isCancelled || (error as? URLError)?.code == .cancelled || error is CancellationError {
                 throw CancellationError()
             }
+            if let error = error as? SavedHostError { throw error }
             throw APIError.transport(error.localizedDescription)
         }
     }
@@ -1805,6 +1813,7 @@ public struct CompanionClient: Sendable {
         // first quiet gap and reconnect, forever, looking like a flaky network
         // rather than a number in the wrong place.
         streamRequest.timeoutInterval = 90
-        return eventStream(request: streamRequest, session: Self.streaming)
+        if let hostOrigin, streamRequest.url.map(hostOrigin.contains) != true { throw SavedHostError.differentOrigin }
+        return eventStream(request: streamRequest, session: Self.streaming, delegate: hostOrigin.map { HostOriginRedirectPolicy(origin: $0) })
     }
 }

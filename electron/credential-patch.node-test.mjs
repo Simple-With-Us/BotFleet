@@ -74,6 +74,13 @@ describe("desktop credential:set patches (CREDENTIAL_PATCH)", () => {
     assert.deepEqual(patch.infisicalClientSecret("shh"), { infisical: { clientSecret: "shh" } });
   });
 
+  it("wires both primary Infisical service tokens through the encrypted credential route", () => {
+    assert.ok(Object.hasOwn(patch, "infisicalReadToken"), "CREDENTIAL_PATCH is missing infisicalReadToken");
+    assert.ok(Object.hasOwn(patch, "infisicalWriteToken"), "CREDENTIAL_PATCH is missing infisicalWriteToken");
+    assert.deepEqual(patch.infisicalReadToken("read-token"), { infisical: { token: "read-token" } });
+    assert.deepEqual(patch.infisicalWriteToken("write-token"), { infisical: { writeToken: "write-token" } });
+  });
+
   it("can store a key for every provider the voice panels offer", () => {
     // The STS settings panel names Gemini beside xAI and tells the user to add
     // the key when one is missing.  That is only true if the panel's providers

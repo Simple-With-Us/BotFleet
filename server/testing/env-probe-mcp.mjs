@@ -8,7 +8,7 @@
 // from the environment.
 import { createInterface } from "node:readline";
 
-const REPORTED = /^(AGENT_|X_FIXTURE_)/;
+const REPORTED = /^(AGENT_|SIMPLE_TOOLS_|X_FIXTURE_)/;
 
 function report() {
   const seen = {};

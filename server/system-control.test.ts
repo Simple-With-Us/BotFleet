@@ -56,6 +56,102 @@ describe("system control", () => {
     expect(fence).not.toHaveBeenCalled();
   });
 
+  // BF-2536: the owner asked for the bots that are working to be stopped and
+  // the server to shut down afterwards, rather than for a refusal.  The count
+  // is still the refusal whenever the caller cannot say what would happen to
+  // the work, so the predicate is what decides it.
+  it("reserves the shutdown when the caller can stop the work in flight", () => {
+    const fence = vi.fn();
+    const reservation = reserveSystemShutdown({
+      guard: () => {},
+      activeWorkCount: () => 2,
+      canStopGracefully: () => true,
+      fence,
+      unfence: () => {},
+    });
+    expect(fence).toHaveBeenCalled();
+    reservation.release();
+  });
+
+  it("still refuses when the caller cannot stop the work in flight", () => {
+    const fence = vi.fn();
+    expect(() => reserveSystemShutdown({
+      guard: () => {},
+      activeWorkCount: () => 2,
+      canStopGracefully: () => false,
+      fence,
+      unfence: () => {},
+    })).toThrow(/2 active operation\(s\) must finish/);
+    expect(fence).not.toHaveBeenCalled();
+  });
+
+  // The owner's refusal on Oct 21, 2026 read "2 active operation(s) must
+  // finish before the server can stop" while the Control app's confirmation
+  // right above it said "0 bot turn(s) are active".  A bare total cannot be
+  // acted on, so the refusal names the kinds instead.
+  it("names the work that blocks a stop", () => {
+    expect(() => reserveSystemShutdown({
+      guard: () => {},
+      activeWorkCount: () => 2,
+      blockingWork: () => [
+        { count: 1, label: "routine run" },
+        { count: 1, label: "queued message" },
+      ],
+      fence: () => {}, unfence: () => {},
+    })).toThrow(/2 active operation\(s\) must finish before the server can stop: 1 routine run, 1 queued message/);
+  });
+
+  it("pluralizes the blocking kinds", () => {
+    expect(() => reserveSystemShutdown({
+      guard: () => {},
+      activeWorkCount: () => 3,
+      blockingWork: () => [{ count: 3, label: "bot turn" }],
+      fence: () => {}, unfence: () => {},
+    })).toThrow(/: 3 bot turns$/);
+  });
+
+  // A caller that knows more than a count brings its own wording:  a graceful
+  // stop knows which kinds it can carry across the restart, and the refusal
+  // has to say why the server stays up rather than that something is busy.
+  it("uses the caller's own refusal wording when it has one", () => {
+    expect(() => reserveSystemShutdown({
+      guard: () => {},
+      activeWorkCount: () => 3,
+      blockingWork: () => [{ count: 1, label: "room turn" }],
+      canStopGracefully: () => false,
+      refusal: () => "a room turn is in flight, so the server stays up",
+      fence: () => {}, unfence: () => {},
+    })).toThrow("a room turn is in flight, so the server stays up");
+  });
+
+  it("keeps the default refusal wording when the caller brings none", () => {
+    expect(() => reserveSystemShutdown({
+      guard: () => {},
+      activeWorkCount: () => 2,
+      fence: () => {}, unfence: () => {},
+    })).toThrow("2 active operation(s) must finish before the server can stop");
+  });
+
+  it("keeps the bare count when the kinds are unknown", () => {
+    expect(() => reserveSystemShutdown({
+      guard: () => {},
+      activeWorkCount: () => 2,
+      fence: () => {}, unfence: () => {},
+    })).toThrow("2 active operation(s) must finish before the server can stop");
+  });
+
+  it("does not name a kind it has no work for", () => {
+    expect(() => reserveSystemShutdown({
+      guard: () => {},
+      activeWorkCount: () => 1,
+      blockingWork: () => [
+        { count: 0, label: "routine run" },
+        { count: 1, label: "bot turn" },
+      ],
+      fence: () => {}, unfence: () => {},
+    })).toThrow(/: 1 bot turn$/);
+  });
+
   it("refuses active work before touching a VM", async () => {
     const f = fixture();
     f.setBusy(true);

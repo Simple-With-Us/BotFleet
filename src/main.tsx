@@ -49,11 +49,44 @@ if (fixtureParam === "tv-face") {
       </StrictMode>,
     );
   });
+} else if (fixtureParam === "merge-all-threads") {
+  // Visual-spec harness: dynamically import so the fixture chunk is not paid
+  // for in the real app boot path. The App render below is unchanged for any
+  // other URL.
+  void import("./components/MergeAllThreadsVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
+} else if (fixtureParam === "merge-all-threads-menu") {
+  // Visual-spec harness: dynamically import so the fixture chunk is not paid
+  // for in the real app boot path. The App render below is unchanged for any
+  // other URL.
+  void import("./components/MergeAllThreadsMenuVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
 } else if (fixtureParam === "engine-callout") {
   // Visual-spec harness: dynamically import so the fixture chunk is not paid
   // for in the real app boot path. The App render below is unchanged for any
   // other URL.
   void import("./components/EngineCalloutVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
+} else if (fixtureParam === "local-model-wait") {
+  void import("./components/LocalModelWaitVisualFixture").then((mod) => {
     const Fixture = mod.default;
     createRoot(rootElement).render(
       <StrictMode>
@@ -344,6 +377,17 @@ if (fixtureParam === "tv-face") {
       </StrictMode>,
     );
   });
+} else if (fixtureParam === "sidebar-menu") {
+  // Visual-spec harness (tests/e2e/sidebar-menu-hover.visual.spec.ts): the real
+  // bot context menu, for the hover fill on its rows.
+  void import("./components/SidebarMenuVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
 } else if (fixtureParam === "sign-in-card") {
   // Visual-spec harness (tests/e2e/sign-in-card.visual.spec.ts): the Sign in
   // needed card, open, with a persistent error, and after Done.
@@ -370,6 +414,28 @@ if (fixtureParam === "tv-face") {
   // Visual-spec harness (tests/e2e/settings-always-allow.visual.spec.ts):
   // Agent settings Always allowed empty and populated revoke list.
   void import("./components/SettingsAlwaysAllowVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
+} else if (fixtureParam === "infisical-auth") {
+  // Visual-spec harness for the explicit Infisical authentication method and
+  // scoped read/write source rows; network status is stubbed by Playwright.
+  void import("./components/SecretsSectionVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
+} else if (fixtureParam === "history-compression") {
+  // Visual-spec harness (tests/e2e/history-compression.visual.spec.ts):
+  // History Compression controls, editable and read-only.
+  void import("./components/HistoryCompressionVisualFixture").then((mod) => {
     const Fixture = mod.default;
     createRoot(rootElement).render(
       <StrictMode>

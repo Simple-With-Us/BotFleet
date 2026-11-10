@@ -14,9 +14,23 @@
 // server-sent events reach the renderer as the harness emits them, and a
 // client that goes away tears down its upstream request so the harness does
 // not keep streaming to nobody.
+//
+// The same shim also proxies to a REMOTE server (an https origin on another
+// machine).  The renderer still loads from this shim's loopback port, so the
+// app's own trust checks and the bundled UI are unaffected; only the far end
+// of the /api pipe changes.  `remoteOrigin` selects that mode and
+// `harnessPort` is then unused.
+//
+// A remote server can sit behind the BotFleet owner gate, which wants an
+// owner credential on every request.  `remoteToken` is that credential: the
+// shim sends it in the `x-botfleet-gate-token` header on every proxied
+// request and upgrade.  The renderer never sees it and never chooses it —
+// an incoming header of the same name is dropped and replaced.
 
 import http from "node:http";
+import https from "node:https";
 import net from "node:net";
+import tls from "node:tls";
 import { createReadStream, promises as fsp } from "node:fs";
 import path from "node:path";
 
@@ -40,6 +54,19 @@ export const MIME = {
   ".wasm": "application/wasm",
   ".txt": "text/plain; charset=utf-8",
 };
+
+/**
+ * True when the value is a string.
+ *
+ * A header value is decoded once, here, at the boundary, and the branches
+ * below work on the decoded text.
+ *
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+function isText(value) {
+  return Object.prototype.toString.call(value) === "[object String]";
+}
 
 export function isApiPath(pathname) {
   return pathname === "/api" || pathname.startsWith("/api/");
@@ -175,7 +202,171 @@ export function forwardedHeaders(req, harnessHost, harnessPort) {
   return headers;
 }
 
-function proxyHttp({ harnessHost, harnessPort, log }, req, res) {
+// Headers that describe a single hop and must not be relayed.  `connection`
+// and `upgrade` are the two the WebSocket path needs, so they are kept there
+// and dropped everywhere else.
+const HOP_BY_HOP_HEADERS = new Set([
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "te",
+  "trailer",
+  "trailers",
+  "transfer-encoding",
+  "upgrade",
+]);
+
+/**
+ * Split a remote origin into the parts the proxy needs.
+ *
+ * The origin is an `http(s)://host[:port]` string with no path, so the
+ * authority is the whole `host:port` and the port falls back to the
+ * protocol's default when the URL omits it.
+ */
+export function parseRemoteOrigin(remoteOrigin) {
+  const url = new URL(remoteOrigin);
+  const secure = url.protocol === "https:";
+  // `url.hostname` keeps the brackets on an IPv6 literal; the connect APIs
+  // want the bare address.
+  const hostname = url.hostname.replace(/^\[(.+)\]$/, "$1");
+  const port = url.port ? Number(url.port) : secure ? 443 : 80;
+  return {
+    url,
+    secure,
+    hostname,
+    port,
+    // SNI may not name an IP address, so an IP-literal remote skips it.
+    isIpAddress: net.isIP(hostname) !== 0,
+    // `url.host` is the authority as written: host plus a port when the URL
+    // carried one that is not the protocol default.
+    authority: url.host,
+    origin: url.origin,
+  };
+}
+
+/**
+ * Is this request a WebSocket-style upgrade?
+ *
+ * `upgrade` alone is enough to say so — the browser sets it for the handshake
+ * and for nothing else.
+ */
+function isUpgradeRequest(req) {
+  const upgrade = req.headers.upgrade;
+  return isText(upgrade) && upgrade !== "";
+}
+
+/**
+ * The headers to forward to a REMOTE server.
+ *
+ * `Host` becomes the remote authority, because the remote server answers for
+ * its own name.  Everything that describes the browser's page rather than the
+ * request itself is dropped:
+ *
+ *   - `origin` and `referer` name the loopback shim the renderer is served
+ *     from, which the remote server would rightly refuse as a foreign
+ *     origin;
+ *   - every `sec-fetch-*` header describes the browser's relationship with
+ *     the shim's origin, and would tell the remote server that the call
+ *     came from somewhere it cannot verify;
+ *   - the hop-by-hop headers belong to the shim's own connection to the
+ *     browser and describe that connection, not the request.
+ *
+ * `connection` and `upgrade` survive only on a WebSocket upgrade, where they
+ * ARE the request.
+ *
+ * Stripping `origin` is safe precisely because the shim's own origin guard
+ * has already run: it proved the request came from a page on the shim's own
+ * authority (the renderer) before this function ever sees the headers.  The
+ * remote server is not being asked to trust the browser — it is being asked
+ * to trust the shim, which is what it is talking to.
+ *
+ * The gate token header.  A remote server behind the BotFleet owner gate
+ * wants the desktop app's gate token, and the renderer must never be able
+ * to choose it: an incoming header of the same name is dropped and, when a
+ * token is configured, replaced with the real one.
+ */
+export const GATE_TOKEN_HEADER = "x-botfleet-gate-token";
+
+/**
+ * @param {import("node:http").IncomingMessage} req
+ * @param {string} remoteOrigin
+ * @param {string} [remoteToken]
+ */
+export function remoteForwardedHeaders(req, remoteOrigin, remoteToken = "") {
+  const remote = parseRemoteOrigin(remoteOrigin);
+  const upgrade = isUpgradeRequest(req);
+  const headers = {};
+  for (const [name, value] of Object.entries(req.headers)) {
+    const lower = name.toLowerCase();
+    if (lower === "host") continue;
+    if (lower === "origin" || lower === "referer") continue;
+    if (lower.startsWith("sec-fetch-")) continue;
+    // The renderer's own token header is never forwarded.
+    if (lower === GATE_TOKEN_HEADER) continue;
+    if (HOP_BY_HOP_HEADERS.has(lower)) {
+      if (upgrade && (lower === "connection" || lower === "upgrade")) headers[lower] = value;
+      continue;
+    }
+    headers[lower] = value;
+  }
+  headers.host = remote.authority;
+  if (remoteToken) headers[GATE_TOKEN_HEADER] = remoteToken;
+  return headers;
+}
+
+/**
+ * The same rewrite for the raw header list the upgrade path replays.  The
+ * browser sends this shim's origin on every handshake, and the remote server
+ * only trusts its own authority.
+ */
+function remoteRawHeaders(req, remote, remoteToken = "") {
+  const rawHeaders = [];
+  for (let i = 0; i < req.rawHeaders.length; i += 2) {
+    const name = req.rawHeaders[i];
+    const lower = name.toLowerCase();
+    const value = req.rawHeaders[i + 1];
+    if (lower === "host") {
+      rawHeaders.push(name, remote.authority);
+      continue;
+    }
+    if (lower === "origin" || lower === "referer") continue;
+    if (lower.startsWith("sec-fetch-")) continue;
+    // The renderer's own token header is never forwarded.
+    if (lower === GATE_TOKEN_HEADER) continue;
+    if (HOP_BY_HOP_HEADERS.has(lower)) {
+      // An upgrade IS a connection/upgrade request; the rest never travel.
+      if (lower === "connection" || lower === "upgrade") rawHeaders.push(name, value);
+      continue;
+    }
+    rawHeaders.push(name, value);
+  }
+  if (remoteToken) rawHeaders.push(GATE_TOKEN_HEADER, remoteToken);
+  return rawHeaders;
+}
+
+/**
+ * The request options for a proxied remote call.
+ *
+ * SNI has to name the remote host, not the shim's, and an IP-literal remote
+ * has no name to put in it -- so the option is added only when it applies.
+ */
+function remoteRequestOptions(remote, req, remoteToken) {
+  const options = {
+    host: remote.hostname,
+    port: remote.port,
+    method: req.method,
+    path: req.url,
+    // The remote server answers for its own authority and only for requests
+    // that do not claim to come from somewhere else, so the shim's own origin,
+    // referer and fetch metadata are stripped.
+    headers: remoteForwardedHeaders(req, remote.origin, remoteToken),
+  };
+  if (remote.secure && !remote.isIpAddress) options.servername = remote.hostname;
+  return options;
+}
+
+function proxyHttp({ harnessHost, harnessPort, remote, remoteToken, log }, req, res) {
   let attempts = 0;
   let current = null;
   let retryTimer = null;
@@ -188,46 +379,65 @@ function proxyHttp({ harnessHost, harnessPort, log }, req, res) {
     if (retryTimer) clearTimeout(retryTimer);
     current?.destroy();
   });
+  // What the failure names: the loopback harness by port, the remote server
+  // by its origin.
+  const targetName = remote ? remote.origin : `:${harnessPort}`;
   const send = () => {
     retryTimer = null;
     if (downstreamClosed || res.destroyed || res.writableEnded) return;
     attempts += 1;
     current?.destroy();
-    const upstream = http.request(
-      {
-        host: harnessHost,
-        port: harnessPort,
-        method: req.method,
-        path: req.url,
-        // `Host` is rewritten because the harness trusts only its own
-        // authority.  `Origin` is rewritten for the same reason and in the
-        // same breath: the renderer here is served on THIS shim's port, so
-        // its real origin is the shim's, and the harness's origin allowlist
-        // is built from the ports it serves UI from — not from the shim's
-        // port.  Forwarding ours verbatim would have the harness refuse the
-        // desktop's own mutating calls.  The shim guard above has already
-        // decided this request is ours, so by the time it reaches the
-        // harness it is genuinely same-origin; saying so is the accurate
-        // header, not a forged one.  A request that arrived with no `Origin`
-        // (a same-origin GET) keeps having none.
-        headers: forwardedHeaders(req, harnessHost, harnessPort),
-      },
-      (ures) => {
-        res.writeHead(ures.statusCode ?? 502, ures.headers);
-        ures.pipe(res);
-      },
-    );
+    const upstream = remote
+      ? (remote.secure ? https : http).request(
+          {
+            ...remoteRequestOptions(remote, req, remoteToken),
+          },
+          (ures) => {
+            res.writeHead(ures.statusCode ?? 502, ures.headers);
+            ures.pipe(res);
+          },
+        )
+      : http.request(
+          {
+            host: harnessHost,
+            port: harnessPort,
+            method: req.method,
+            path: req.url,
+            // `Host` is rewritten because the harness trusts only its own
+            // authority.  `Origin` is rewritten for the same reason and in the
+            // same breath: the renderer here is served on THIS shim's port, so
+            // its real origin is the shim's, and the harness's origin allowlist
+            // is built from the ports it serves UI from — not from the shim's
+            // port.  Forwarding ours verbatim would have the harness refuse the
+            // desktop's own mutating calls.  The shim guard above has already
+            // decided this request is ours, so by the time it reaches the
+            // harness it is genuinely same-origin; saying so is the accurate
+            // header, not a forged one.  A request that arrived with no `Origin`
+            // (a same-origin GET) keeps having none.
+            headers: forwardedHeaders(req, harnessHost, harnessPort),
+          },
+          (ures) => {
+            res.writeHead(ures.statusCode ?? 502, ures.headers);
+            ures.pipe(res);
+          },
+        );
     current = upstream;
     upstream.on("error", (error) => {
       if (idempotent && attempts < 2 && !res.headersSent && !downstreamClosed && !res.destroyed) {
-        log(`proxy retry :${harnessPort} ${req.method} ${req.url}: ${error?.code ?? error?.message ?? error}`);
+        log(`proxy retry ${targetName} ${req.method} ${req.url}: ${error?.code ?? error?.message ?? error}`);
         retryTimer = setTimeout(send, 150);
         return;
       }
       if (downstreamClosed || res.destroyed || res.writableEnded) return;
-      log(`proxy to harness :${harnessPort} failed for ${req.method} ${req.url}: ${error?.code ?? error?.message ?? error}`);
+      log(`proxy to ${remote ? "remote server" : "harness"} ${targetName} failed for ${req.method} ${req.url}: ${error?.code ?? error?.message ?? error}`);
       if (!res.headersSent) res.writeHead(502, { "content-type": "application/json" });
-      res.end(JSON.stringify({ error: `BotFleet harness on port ${harnessPort} is not reachable` }));
+      res.end(
+        JSON.stringify({
+          error: remote
+            ? `BotFleet server at ${remote.origin} is not reachable`
+            : `BotFleet harness on port ${harnessPort} is not reachable`,
+        }),
+      );
     });
     if (idempotent) upstream.end();
     else req.pipe(upstream);
@@ -235,7 +445,35 @@ function proxyHttp({ harnessHost, harnessPort, log }, req, res) {
   send();
 }
 
-function proxyUpgrade({ harnessHost, harnessPort }, req, socket, head) {
+function proxyUpgrade({ harnessHost, harnessPort, remote, remoteToken }, req, socket, head) {
+  if (remote) {
+    const rawHeaders = remoteRawHeaders(req, remote, remoteToken);
+    // A remote handshake is a TLS handshake when the remote origin is https,
+    // and a plain socket when it is an http loopback tunnel.
+    const writeHead = () => {
+      const lines = [`${req.method} ${req.url} HTTP/${req.httpVersion}`];
+      for (let i = 0; i < rawHeaders.length; i += 2) {
+        lines.push(`${rawHeaders[i]}: ${rawHeaders[i + 1]}`);
+      }
+      upstream.write(`${lines.join("\r\n")}\r\n\r\n`);
+      if (head?.length) upstream.write(head);
+      socket.pipe(upstream).pipe(socket);
+    };
+    // A TLS socket may only carry the request head once the handshake is
+    // done, so the head waits for 'secureConnect'; a plain socket writes on
+    // 'connect'.
+    const upstream = remote.secure
+      ? tls.connect(
+          { host: remote.hostname, port: remote.port, servername: remote.isIpAddress ? undefined : remote.hostname },
+          writeHead,
+        )
+      : net.connect(remote.port, remote.hostname, writeHead);
+    upstream.on("error", () => socket.destroy());
+    upstream.on("close", () => socket.destroy());
+    socket.on("error", () => upstream.destroy());
+    socket.on("close", () => upstream.destroy());
+    return;
+  }
   const authority = `${harnessHost}:${harnessPort}`;
   // Same rewriting as `proxyHttp`, applied to the raw header list this path
   // replays: the browser sends this shim's origin on every upgrade, and the
@@ -292,12 +530,22 @@ function listenOnFirstFree(server, host, ports) {
 }
 
 /**
+ * Start the shim.
+ *
+ * With `harnessPort` it proxies /api to a harness on loopback — the attached
+ * harness.  With `remoteOrigin` it proxies /api to a remote server instead,
+ * over https (or plain http on loopback, for an `ssh -L` tunnel).  Either way
+ * the UI itself is served from `uiDir` on a loopback port, so the renderer
+ * stays on a loopback origin and the app's own trust checks keep working.
+ *
  * @param {{
  *   uiDir: string,
- *   harnessPort: number,
+ *   harnessPort?: number,
  *   harnessHost?: string,
  *   host?: string,
  *   listenPorts?: number[],
+ *   remoteOrigin?: string,
+ *   remoteToken?: string,
  *   log?: (line: string) => void,
  * }} options
  * @returns {Promise<{ port: number, close: () => Promise<void> }>}
@@ -308,9 +556,19 @@ export async function startUiShim({
   harnessHost = "127.0.0.1",
   host = "127.0.0.1",
   listenPorts = [],
+  remoteOrigin = null,
+  remoteToken = "",
   log = () => {},
 }) {
-  const target = { harnessHost, harnessPort, log };
+  // A remote origin replaces the harness entirely: `harnessPort` is not
+  // consulted at all when one is given.
+  const remote = remoteOrigin ? parseRemoteOrigin(remoteOrigin) : null;
+  // The gate token belongs to the remote server only: a local harness trusts
+  // the loopback caller and needs no token.  It is never logged.
+  const token = remote ? String(remoteToken ?? "") : "";
+  const target = remote
+    ? { remote, remoteToken: token, log }
+    : { harnessHost, harnessPort, log };
   const server = http.createServer();
   server.keepAliveTimeout = 5_000;
   // A preferred port keeps the renderer origin (and its localStorage) stable

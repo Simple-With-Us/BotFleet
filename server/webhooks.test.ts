@@ -4,7 +4,15 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import type { JsonValue } from "./schema.ts";
-import { WebhookManager, type WebhookManagerOptions } from "./webhooks.ts";
+import {
+  githubHeadStateKey,
+  githubPrStateKey,
+  PR_STATE_DEDUPE_MS,
+  shouldIgnoreWebhookEvent,
+  WebhookManager,
+  type WebhookManagerOptions,
+  type WebhookManagerEvent,
+} from "./webhooks.ts";
 
 const dirs: string[] = [];
 
@@ -18,7 +26,7 @@ function harness() {
   let pending = 0;
   const queued: Array<Record<string, unknown>> = [];
   const cancelled: Array<{ id: string; message: string }> = [];
-  const emitted: unknown[] = [];
+  const emitted: WebhookManagerEvent[] = [];
   const options: WebhookManagerOptions = {
     file,
     now: () => now,
@@ -125,6 +133,36 @@ describe("WebhookManager", () => {
     expect(h.queued[0]?.prompt).toContain("[UNTRUSTED WEBHOOK EVENT DATA]");
     expect(h.queued[0]?.prompt).toMatch(/"lead"\s*:\s*"Ada"/);
     expect(h.manager.list()[0]).toMatchObject({ lastRunId: "run-1", deliveryCount: 1 });
+  });
+
+  it("logs a delivery the routine manager skipped as ignored with its reason, and a queued one as accepted (BF-2462)", () => {
+    const h = harness();
+    // A skipped delivery comes back as an unpersisted `cancelled` receipt:  an
+    // Off bot also carries its reason in `error` (its outcome code is `bot_off`,
+    // never a status), a snoozed bot carries none.
+    const receipts: Array<{ id: string; status?: string; error?: string }> = [
+      { id: "skip-off", status: "cancelled", error: "Skipped: this bot is off" },
+      { id: "skip-snoozed", status: "cancelled" },
+      { id: "run-queued", status: "queued" },
+    ];
+    const manager = new WebhookManager({ ...h.options, enqueue: () => receipts.shift()! });
+    const { webhook, secret } = create(manager);
+    for (const deliveryId of ["d-off", "d-snoozed", "d-queued"]) {
+      manager.receive(webhook.endpointId, secret, { payload: { lead: "Ada" }, contentType: "application/json", deliveryId });
+    }
+
+    const attempts = manager.listAttempts();
+    expect(attempts.find((attempt) => attempt.runId === "skip-off")).toMatchObject({
+      outcome: "ignored",
+      statusCode: 202,
+      reason: "Skipped: this bot is off",
+    });
+    const snoozed = attempts.find((attempt) => attempt.runId === "skip-snoozed");
+    expect(snoozed).toMatchObject({ outcome: "ignored", statusCode: 202 });
+    expect(snoozed).not.toHaveProperty("reason");
+    const queued = attempts.find((attempt) => attempt.runId === "run-queued");
+    expect(queued).toMatchObject({ outcome: "accepted", statusCode: 202 });
+    expect(queued).not.toHaveProperty("reason");
   });
 
   it("uses an authenticated task from the payload when default instructions are empty", () => {
@@ -1835,5 +1873,435 @@ describe("WebhookManager merged pull requests only", () => {
     const { webhook } = h.manager.create({ ...compiler, ignoredCount: 99 });
     expect(webhook.ignoredCount).toBeUndefined();
     expect(h.manager.update(webhook.id, { ignoredCount: 99, lastIgnoredAt: 1 })?.ignoredCount).toBeUndefined();
+  });
+});
+
+describe("request metadata on attempt events", () => {
+  it("carries repo/actor/action/number for accepted and duplicate deliveries, never titles", () => {
+    const h = harness();
+    const { webhook, secret } = create(h.manager);
+    const payload = {
+      action: "opened",
+      repository: { full_name: "Simple-With-Us/BotFleet" },
+      pull_request: { number: 901, title: "titles never leak" },
+      sender: { login: "jaywedgeworth22" },
+    };
+    const input = { payload, contentType: "application/json", eventName: "pull_request", deliveryId: "d-1" };
+    h.manager.receive(webhook.endpointId, secret, input);
+    h.manager.receive(webhook.endpointId, secret, input);
+    const attempts = h.emitted.filter((e) => e.kind === "webhook.attempt");
+    expect(attempts).toHaveLength(2);
+    for (const e of attempts) {
+      const meta = e.requestMetadata;
+      expect(meta).toMatchObject({
+        repository: "Simple-With-Us/BotFleet",
+        number: 901,
+        actor: "jaywedgeworth22",
+        action: "opened",
+      });
+      expect(JSON.stringify(meta)).not.toContain("titles never leak");
+    }
+    expect(attempts[0]?.attempt.outcome).toBe("accepted");
+    expect(attempts[1]?.attempt.outcome).toBe("duplicate");
+  });
+});
+
+describe("shouldIgnoreWebhookEvent UI Pass bot review pre-filter", () => {
+  const repository = { full_name: "Simple-With-Us/BotFleet", name: "BotFleet", default_branch: "main" };
+  const uiPass = {
+    name: "GitHub UI Pass",
+    prompt: "Run a UI pass on the pull request and report the verdict.",
+  };
+  const reviewEvent = (
+    login: string,
+    type = "Bot",
+    eventName = "pull_request_review",
+    action = "submitted",
+  ) => ({
+    eventName,
+    payload: {
+      action,
+      repository,
+      sender: { login, type },
+      review: { state: "commented" },
+      pull_request: { number: 7 },
+    },
+  });
+
+  it("ignores a kody-ai pull_request_review when the trigger id is a UI pass wake", () => {
+    const byId = {
+      id: "ui-pass-designer",
+      name: "Designer webhook",
+      prompt: "Review the pull request and post findings.",
+    };
+    expect(shouldIgnoreWebhookEvent(byId, reviewEvent("kody-ai"))).toEqual({
+      ignore: true,
+      reason:
+        "GitHub pull_request_review by bot 'kody-ai' ignored: UI Pass reacts to human reviews and code changes, not bot review churn",
+    });
+  });
+
+  it("ignores a kody-ai pull_request_review for a UI Pass trigger", () => {
+    expect(shouldIgnoreWebhookEvent(uiPass, reviewEvent("kody-ai"))).toEqual({
+      ignore: true,
+      reason:
+        "GitHub pull_request_review by bot 'kody-ai' ignored: UI Pass reacts to human reviews and code changes, not bot review churn",
+    });
+  });
+
+  it("ignores a cursor[bot] issue_comment for a UI Pass trigger", () => {
+    const event = {
+      eventName: "issue_comment",
+      payload: {
+        action: "created",
+        repository,
+        sender: { login: "cursor[bot]", type: "Bot" },
+        comment: { body: "Suggested fix" },
+        issue: { number: 7 },
+      },
+    };
+    expect(shouldIgnoreWebhookEvent(uiPass, event)).toMatchObject({ ignore: true });
+  });
+
+  it("ignores the other review events and bot sender shapes for a UI Pass trigger", () => {
+    expect(
+      shouldIgnoreWebhookEvent(
+        uiPass,
+        reviewEvent("github-actions", "Bot", "pull_request_review_comment", "created"),
+      ),
+    ).toMatchObject({ ignore: true });
+    expect(
+      shouldIgnoreWebhookEvent(
+        uiPass,
+        reviewEvent("some-reviewer", "Bot", "pull_request_review_thread", "resolved"),
+      ),
+    ).toMatchObject({ ignore: true });
+    expect(shouldIgnoreWebhookEvent(uiPass, reviewEvent("KODY-AI", "User"))).toMatchObject({
+      ignore: true,
+    });
+  });
+
+  it("does not ignore a human review for a UI Pass trigger", () => {
+    expect(shouldIgnoreWebhookEvent(uiPass, reviewEvent("jaywedgeworth22", "User"))).toEqual({
+      ignore: false,
+    });
+  });
+
+  it("does not ignore a bot review for a non-UI-pass trigger", () => {
+    const releaseWatcher = { name: "Release watcher", prompt: "Summarize pull request activity." };
+    expect(shouldIgnoreWebhookEvent(releaseWatcher, reviewEvent("kody-ai"))).toEqual({ ignore: false });
+    const classifyOnly = { name: "Designer classify", prompt: "Classify the event and stop." };
+    expect(shouldIgnoreWebhookEvent(classifyOnly, reviewEvent("kody-ai"))).toEqual({ ignore: false });
+  });
+
+  it("does not ignore a bot review when the saved prompt asks for Kody reviews", () => {
+    const asksForKody = {
+      name: "GitHub UI Pass",
+      prompt: "Run a UI pass.  Act on Kody bot review comments.",
+    };
+    expect(shouldIgnoreWebhookEvent(asksForKody, reviewEvent("kody-ai"))).toEqual({ ignore: false });
+  });
+
+  it("does not swallow a label signal for a UI Pass trigger that requires labels", () => {
+    // A required label landing is the signal the trigger asked for.  The
+    // pre-filter must keep that escape, the way sections 2 and 3 do.
+    const labeled = reviewEvent("kody-ai", "Bot", "issue_comment", "labeled");
+    expect(shouldIgnoreWebhookEvent({ ...uiPass, requiredLabels: ["ui"] }, labeled)).toEqual({
+      ignore: false,
+    });
+    expect(shouldIgnoreWebhookEvent(uiPass, labeled)).toMatchObject({ ignore: true });
+  });
+});
+
+describe("GitHub PR state dedupe for classify wakes", () => {
+  const startedAt = Date.parse("2026-08-16T10:00:00.000Z");
+  const repository = { full_name: "Simple-With-Us/BotFleet", name: "BotFleet" };
+  const HEAD_A = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const HEAD_B = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const uiPass = { name: "UI Pass", prompt: "Run a UI pass on the pull request.", botId: "maus-1" };
+  const prEvent = (
+    deliveryId: string,
+    overrides?: { action?: string; headSha?: string; eventName?: string },
+  ) => ({
+    eventName: overrides?.eventName ?? "pull_request",
+    deliveryId,
+    payload: {
+      action: overrides?.action ?? "synchronize",
+      repository,
+      pull_request: { number: 42, head: { sha: overrides?.headSha ?? HEAD_A } },
+    },
+  });
+
+  it("ignores a redelivery of the same PR head and action for a UI Pass trigger", () => {
+    const h = harness();
+    const { webhook, secret } = h.manager.create({ ...uiPass });
+    const first = h.manager.receive(webhook.endpointId, secret, prEvent("pr-state-1"));
+    expect(first).toMatchObject({ duplicate: false, runId: "run-1" });
+    expect(first.ignored).toBeUndefined();
+
+    const second = h.manager.receive(webhook.endpointId, secret, prEvent("pr-state-2"));
+    expect(second).toEqual({ deliveryId: "pr-state-2", duplicate: false, ignored: true });
+    expect(h.queued).toHaveLength(1);
+    expect(h.manager.listAttempts().at(-1)).toMatchObject({
+      outcome: "ignored",
+      reason: `GitHub PR state already handled: pull_request synchronize on Simple-With-Us/BotFleet#42 at ${HEAD_A.slice(0, 7)} (run run-1)`,
+    });
+
+    // The key is persisted, so a redelivery after a restart is ignored
+    // too.  Old receipts without a stateKey still load because the field
+    // is optional.
+    const reloaded = new WebhookManager(h.options);
+    expect(reloaded.receive(webhook.endpointId, secret, prEvent("pr-state-3"))).toMatchObject({ ignored: true });
+    expect(h.queued).toHaveLength(1);
+  });
+
+  it("accepts a new head SHA for the same PR and action", () => {
+    const h = harness();
+    const { webhook, secret } = h.manager.create({ ...uiPass });
+    expect(h.manager.receive(webhook.endpointId, secret, prEvent("pr-head-1")).runId).toBe("run-1");
+    const second = h.manager.receive(
+      webhook.endpointId,
+      secret,
+      prEvent("pr-head-2", { headSha: HEAD_B }),
+    );
+    expect(second).toMatchObject({ duplicate: false, runId: "run-2" });
+    expect(second.ignored).toBeUndefined();
+    expect(h.queued).toHaveLength(2);
+  });
+
+  it("accepts a different action for the same PR head", () => {
+    const h = harness();
+    const { webhook, secret } = h.manager.create({ ...uiPass });
+    expect(h.manager.receive(webhook.endpointId, secret, prEvent("pr-action-1")).runId).toBe("run-1");
+    const second = h.manager.receive(
+      webhook.endpointId,
+      secret,
+      prEvent("pr-action-2", { action: "labeled" }),
+    );
+    expect(second).toMatchObject({ duplicate: false, runId: "run-2" });
+    expect(second.ignored).toBeUndefined();
+    expect(h.queued).toHaveLength(2);
+  });
+
+  it("does not dedupe a non-classify trigger", () => {
+    const h = harness();
+    const { webhook, secret } = h.manager.create({
+      name: "Release notes",
+      prompt: "Draft release notes for the pull request.",
+      botId: "maus-1",
+    });
+    expect(h.manager.receive(webhook.endpointId, secret, prEvent("pr-notes-1")).runId).toBe("run-1");
+    const second = h.manager.receive(webhook.endpointId, secret, prEvent("pr-notes-2"));
+    expect(second).toMatchObject({ duplicate: false, runId: "run-2" });
+    expect(second.ignored).toBeUndefined();
+    expect(h.queued).toHaveLength(2);
+  });
+
+  it("accepts the same PR state again after the dedupe window", () => {
+    const h = harness();
+    const { webhook, secret } = h.manager.create({ ...uiPass });
+    expect(h.manager.receive(webhook.endpointId, secret, prEvent("pr-window-1")).runId).toBe("run-1");
+
+    h.setNow(startedAt + 60 * 60 * 1000);
+    expect(h.manager.receive(webhook.endpointId, secret, prEvent("pr-window-2"))).toMatchObject({
+      ignored: true,
+    });
+    expect(h.queued).toHaveLength(1);
+
+    h.setNow(startedAt + PR_STATE_DEDUPE_MS + 1);
+    const after = h.manager.receive(webhook.endpointId, secret, prEvent("pr-window-3"));
+    expect(after).toMatchObject({ duplicate: false, runId: "run-2" });
+    expect(after.ignored).toBeUndefined();
+    expect(h.queued).toHaveLength(2);
+  });
+
+  it("accepts two different human review ids on the same head", () => {
+    const h = harness();
+    const { webhook, secret } = h.manager.create({ ...uiPass });
+    const reviewEvent = (deliveryId: string, reviewId: number) => ({
+      eventName: "pull_request_review",
+      deliveryId,
+      payload: {
+        action: "submitted",
+        repository,
+        pull_request: { number: 42, head: { sha: HEAD_A } },
+        review: { id: reviewId, state: "approved" },
+      },
+    });
+    expect(h.manager.receive(webhook.endpointId, secret, reviewEvent("pr-review-1", 1001)).runId).toBe("run-1");
+    const second = h.manager.receive(webhook.endpointId, secret, reviewEvent("pr-review-2", 1002));
+    expect(second).toMatchObject({ duplicate: false, runId: "run-2" });
+    expect(second.ignored).toBeUndefined();
+    expect(h.queued).toHaveLength(2);
+
+    // The same review redelivered is the same state, so it is ignored.  A
+    // new review id above was not collapsed.
+    expect(h.manager.receive(webhook.endpointId, secret, reviewEvent("pr-review-3", 1001))).toMatchObject({
+      ignored: true,
+    });
+    expect(h.queued).toHaveLength(2);
+  });
+
+  it("returns undefined from githubPrStateKey without a head SHA", () => {
+    expect(
+      githubPrStateKey({
+        eventName: "pull_request",
+        payload: { action: "opened", repository, pull_request: { number: 42 } },
+      }),
+    ).toBeUndefined();
+    expect(
+      githubPrStateKey({
+        eventName: "issue_comment",
+        payload: {
+          action: "created",
+          repository,
+          issue: {
+            number: 42,
+            pull_request: { url: "https://api.github.com/repos/Simple-With-Us/BotFleet/pulls/42" },
+          },
+          comment: { id: 77 },
+        },
+      }),
+    ).toBeUndefined();
+  });
+
+  it("builds a state key from check_run pull_requests, head_sha and conclusion", () => {
+    const checkEvent = (conclusion: string) => ({
+      eventName: "check_run",
+      payload: {
+        action: "completed",
+        repository,
+        check_run: { head_sha: HEAD_A, conclusion, pull_requests: [{ number: 42 }] },
+      },
+    });
+    const success = githubPrStateKey(checkEvent("success"));
+    expect(success).toBeDefined();
+    expect(githubPrStateKey(checkEvent("success"))).toBe(success);
+    expect(githubPrStateKey(checkEvent("failure"))).not.toBe(success);
+  });
+
+  it("does not let a cancelled run block a later delivery for the same PR state", () => {
+    const h = harness();
+    const receipts: Array<{ id: string; status?: string; error?: string }> = [
+      { id: "skip-1", status: "cancelled", error: "Skipped: this bot is off" },
+      { id: "run-next", status: "queued" },
+    ];
+    const manager = new WebhookManager({ ...h.options, enqueue: () => receipts.shift()! });
+    const { webhook, secret } = manager.create({ ...uiPass });
+    expect(manager.receive(webhook.endpointId, secret, prEvent("pr-cancel-1")).runId).toBe("skip-1");
+    const second = manager.receive(webhook.endpointId, secret, prEvent("pr-cancel-2"));
+    expect(second).toMatchObject({ duplicate: false, runId: "run-next" });
+    expect(second.ignored).toBeUndefined();
+  });
+  it("does not let a run that later failed block a later delivery for the same PR state", () => {
+    const h = harness();
+    const statuses = new Map<string, string>();
+    const manager = new WebhookManager({ ...h.options, runStatus: (runId) => statuses.get(runId) });
+    const { webhook, secret } = manager.create({ ...uiPass });
+    const first = manager.receive(webhook.endpointId, secret, prEvent("pr-fail-1"));
+    expect(first.ignored).toBeUndefined();
+    statuses.set(first.runId!, "running");
+    expect(manager.receive(webhook.endpointId, secret, prEvent("pr-fail-2"))).toMatchObject({ ignored: true });
+    statuses.set(first.runId!, "failed");
+    const third = manager.receive(webhook.endpointId, secret, prEvent("pr-fail-3"));
+    expect(third.ignored).toBeUndefined();
+  });
+  it("isEventIgnoredAtEdge returns true for non-enabled events on enabled triggers and false for disabled triggers", () => {
+    const h = harness();
+    const manager = new WebhookManager(h.options);
+    const { webhook } = manager.create({ ...uiPass, eventTypes: ["pull_request"] });
+    expect(manager.isEventIgnoredAtEdge(webhook.endpointId, "workflow_run")).toBe(true);
+    expect(manager.isEventIgnoredAtEdge(webhook.endpointId, "pull_request")).toBe(false);
+    expect(manager.isEventIgnoredAtEdge(webhook.endpointId, undefined)).toBe(true);
+
+    manager.update(webhook.id, { enabled: false });
+    expect(manager.isEventIgnoredAtEdge(webhook.endpointId, "workflow_run")).toBe(false);
+  });
+});
+
+describe("GitHub head state dedupe for Compile gates", () => {
+  const repository = { full_name: "Simple-With-Us/BotFleet", name: "BotFleet", default_branch: "main" };
+  const HEAD_A = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const HEAD_B = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const compileGates = {
+    name: "Compile gates GitHub",
+    prompt: "You are Compiler. Watch failed workflow_run events on main.",
+    botId: "compiler-1",
+  };
+  const workflowEvent = (
+    deliveryId: string,
+    overrides?: { headSha?: string; conclusion?: string; name?: string },
+  ) => ({
+    eventName: "workflow_run",
+    deliveryId,
+    payload: {
+      action: "completed",
+      repository,
+      workflow_run: {
+        head_sha: overrides?.headSha ?? HEAD_A,
+        conclusion: overrides?.conclusion ?? "failure",
+        status: "completed",
+        name: overrides?.name ?? "test",
+        head_branch: "main",
+      },
+    },
+  });
+
+  it("builds a head state key without a pull request number", () => {
+    const key = githubHeadStateKey(workflowEvent("k1"));
+    expect(key).toBe(
+      `head|Simple-With-Us/BotFleet|${HEAD_A}|workflow_run|completed|failure`,
+    );
+    expect(githubPrStateKey(workflowEvent("k1"))).toBeUndefined();
+  });
+
+  it("ignores a second Compile gates delivery for the same failed head", () => {
+    const h = harness();
+    const { webhook, secret } = h.manager.create({ ...compileGates });
+    const first = h.manager.receive(webhook.endpointId, secret, workflowEvent("cg-1"));
+    expect(first).toMatchObject({ duplicate: false, runId: "run-1" });
+    expect(first.ignored).toBeUndefined();
+
+    const second = h.manager.receive(
+      webhook.endpointId,
+      secret,
+      workflowEvent("cg-2", { name: "lint" }),
+    );
+    expect(second).toEqual({ deliveryId: "cg-2", duplicate: false, ignored: true });
+    expect(h.queued).toHaveLength(1);
+    expect(h.manager.listAttempts().at(-1)).toMatchObject({
+      outcome: "ignored",
+      reason: `GitHub head state already handled: workflow_run completed on Simple-With-Us/BotFleet at ${HEAD_A.slice(0, 7)} (run run-1)`,
+    });
+  });
+
+  it("accepts a new head SHA for Compile gates", () => {
+    const h = harness();
+    const { webhook, secret } = h.manager.create({ ...compileGates });
+    expect(h.manager.receive(webhook.endpointId, secret, workflowEvent("cg-head-1")).runId).toBe(
+      "run-1",
+    );
+    const second = h.manager.receive(
+      webhook.endpointId,
+      secret,
+      workflowEvent("cg-head-2", { headSha: HEAD_B }),
+    );
+    expect(second).toMatchObject({ duplicate: false, runId: "run-2" });
+    expect(second.ignored).toBeUndefined();
+    expect(h.queued).toHaveLength(2);
+  });
+
+  it("does not dedupe a non-compile trigger on head state", () => {
+    const h = harness();
+    const { webhook, secret } = h.manager.create({
+      name: "Release notes",
+      prompt: "Draft release notes for the pull request.",
+      botId: "maus-1",
+    });
+    expect(h.manager.receive(webhook.endpointId, secret, workflowEvent("rel-1")).runId).toBe("run-1");
+    const second = h.manager.receive(webhook.endpointId, secret, workflowEvent("rel-2"));
+    expect(second).toMatchObject({ duplicate: false, runId: "run-2" });
+    expect(second.ignored).toBeUndefined();
+    expect(h.queued).toHaveLength(2);
   });
 });

@@ -21,9 +21,13 @@ import {
   cancelSteeredMessage,
   drainEveryReadyBatch,
   drainSteeredMessages,
+  dropSteeredMessagesForBot,
   queueSteeredMessage,
+  queuedMessageIdsForBot,
   restoreSteeredEntries,
+  steerBacklogInstruction,
   takeSteeredEntries,
+  STEER_BACKLOG_THRESHOLD,
   _queuedCount,
   type SteerStore,
 } from "./steer-queue.ts";
@@ -75,6 +79,66 @@ function fakeStore(bots: BotRecord[]): SteerStore & { messages: Message[] } {
 }
 
 describe("steer-queue module", () => {
+  it("asks the user what to do only once the backlog reaches the threshold", () => {
+    expect(steerBacklogInstruction(0)).toBeNull();
+    expect(steerBacklogInstruction(STEER_BACKLOG_THRESHOLD - 1)).toBeNull();
+    const deep = steerBacklogInstruction(STEER_BACKLOG_THRESHOLD);
+    expect(deep).toContain(`${STEER_BACKLOG_THRESHOLD} messages were sent`);
+    expect(deep).toMatch(/ask the user/i);
+  });
+
+  it("drains a short queue in plain order and a deep one as an ask", () => {
+    const short = fakeBot("bot-short", "thread-short", true);
+    const deep = fakeBot("bot-deep", "thread-deep", true);
+    const store = fakeStore([short, deep]);
+    queueSteeredMessage(short, "one");
+    queueSteeredMessage(short, "two");
+    for (const text of ["alpha", "beta", "gamma", "delta"]) queueSteeredMessage(deep, text);
+    short.busy = false;
+    deep.busy = false;
+    const run = vi.fn();
+    drainSteeredMessages(store, run);
+    // SAFETY: the mocked runner is always called with the prompt string in slot 2.
+    const promptFor = (botId: string) => run.mock.calls.find(([id]) => id === botId)?.[2] as string;
+
+    // Under the threshold the turn is just the messages, in order.
+    expect(promptFor("bot-short")).toBe("one\ntwo");
+    // Over it, the turn opens by handing the choice back, and still carries
+    // every waiting message — the ask is not a filter.
+    const deepPrompt = promptFor("bot-deep");
+    expect(deepPrompt).toContain("4 messages were sent");
+    expect(deepPrompt).toMatch(/ask the user/i);
+    expect(deepPrompt.endsWith("alpha\nbeta\ngamma\ndelta")).toBe(true);
+  });
+
+  it("asks about the batch, not the tail still queued behind it", () => {
+    // A Linq boundary hands the bot one chat per turn while a long tail waits.
+    // The ask is about the messages running together NOW, so a one-message
+    // turn must not claim a pile it is not answering — and must not stall the
+    // pipeline by asking the user to prioritise on every turn (BF-2442).
+    const bot = fakeBot("bot-linq-tail", "thread-linq-tail", true);
+    const store = fakeStore([bot]);
+    for (let chat = 0; chat < 6; chat += 1) queueSteeredMessage(bot, `chat ${chat}`, { linqChatId: `chat-${chat}` });
+    bot.busy = false;
+    const run = vi.fn();
+    drainEveryReadyBatch(store, run);
+    expect(run).toHaveBeenCalledTimes(6);
+    // Every turn carried exactly one chat and asked about exactly one chat,
+    // even though five waited behind it.
+    expect(run.mock.calls.map((call) => call[2])).toEqual(Array.from({ length: 6 }, (_, chat) => `chat ${chat}`));
+  });
+
+  it("never asks the user on an unattended relayed batch", () => {
+    const bot = fakeBot("bot-relayed", "thread-relayed", true);
+    const store = fakeStore([bot]);
+    for (const text of ["one", "two", "three"]) queueSteeredMessage(bot, text, { relayed: true });
+    bot.busy = false;
+    const run = vi.fn();
+    drainSteeredMessages(store, run);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(run.mock.calls[0]?.[2]).toBe("one\ntwo\nthree");
+  });
+
   it("lets an update carry a bot's waiting sends off the transcript and put them back in line", () => {
     const interrupted = fakeBot("bot-carry", "thread-carry", true);
     const other = fakeBot("bot-stay", "thread-stay", true);
@@ -357,6 +421,20 @@ describe("steer-queue module", () => {
     drainSteeredMessages(fakeStore([]), run);
     expect(run).not.toHaveBeenCalled();
     expect(_queuedCount("thread-d")).toBe(0);
+  });
+
+  it("drops every thread one bot owns for a typed /stop, and no one else's", () => {
+    const mine = fakeBot("bot-stop-all", "thread-stop-active", true);
+    const other = fakeBot("bot-untouched", "thread-untouched", true);
+    fakeStore([mine, other]);
+    queueSteeredMessage(mine, "on the active thread");
+    queueSteeredMessage(mine, "on a side thread", { threadId: "thread-stop-side" });
+    queueSteeredMessage(other, "not mine");
+    expect(queuedMessageIdsForBot(mine.id)).toHaveLength(2);
+    expect(dropSteeredMessagesForBot(mine.id)).toBe(2);
+    expect(_queuedCount("thread-stop-active")).toBe(0);
+    expect(_queuedCount("thread-stop-side")).toBe(0);
+    expect(_queuedCount("thread-untouched")).toBe(1);
   });
 
 });

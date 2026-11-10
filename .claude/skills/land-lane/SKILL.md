@@ -33,7 +33,7 @@ git config user.email "12656028+jaywedgeworth22@users.noreply.github.com"
 3. `docs/rollouts/YYYY-MM-DD-slug.md` — summary, why, files, verification commands actually run, follow-ups.
 4. Substantial owner-facing work: living Apple Note via the `apple-notes` skill, title `[APP, Monet] …`.
 
-Prose: commit body, rollout docs and Notes source take two ASCII spaces between sentences.  PR titles, bodies and comments take a real U+00A0 plus a space (convert with the `perl` recipe in `sentence-gap`; never the `&nbsp;` entity there).  Chat replies to the owner use `&nbsp;` plus a space in a Markdown chat pane and two ASCII spaces in a terminal.  See `owner-copy`.
+Prose:  commit bodies, rollout docs, Notes source, PR titles, bodies and comments, and chat replies to the owner all take a real U+00A0 plus a normal space between sentences (owner ruling 2026-10-23;  convert with the `perl` recipe in `sentence-gap`).  The one exception:  the chat panes of Claude Code (the Code tab) and MiniMax Code (the MiniMax Code pane) take the `&nbsp;` entity plus a normal space.  See `owner-copy`.
 
 ## Gate
 
@@ -79,7 +79,7 @@ gh pr create --fill
 | Personal-Site | CI `verify` is file-existence + About-copy grep.  `site/` is the TanStack Start source (README).  `AGENTS.md` may still say "static snapshot" — believe README + the tree.  Preserve `Earlier work included` and the Doximity `/profiles/…/view` URL or the daily mirror reverts them. |
 | AFL | No app test gate.  `python3 scripts/check-fleet-registry.py` if you touched registries. |
 
-CTS "prod" is an annotated tag `vX.Y.Z` after merge — announce on `#agent-sync` then tag.  Consumers pin the exact tag.
+CTS "prod" is an annotated tag `vX.Y.Z` after merge — announce on `#Work-In-Progress` then tag.  Consumers pin the exact tag.
 
 `STATUS.md` / `PLAN.md` often carry `merge=union` in `.gitattributes`.  Additive prose usually combines.  Effort logs are archived — do not resurrect `docs/EFFORT-LOG.md` edits during a merge.  Up to 3 land attempts are fine.
 
@@ -109,7 +109,7 @@ If the box is gating several lanes, post `[$AGENT_SEAT] gating now` with `repo:`
 
 ## Canon
 
-- `/Users/jay/apps/AGENT-SYNC.md` — Always commit + land; merge requirements; branch/worktree naming
+- `/Users/jay/apps/FLEET-PROTOCOL.md` — Always commit + land; merge requirements; branch/worktree naming
 - App `AGENTS.md` Pre-Commit / Handoff + Verify before claiming done
 - `scripts/land.sh` when present
 - Skills: `session-start`, `unstick-pr`, `codex-triage`, `deploy-verify`, `closeout`, `owner-copy`
