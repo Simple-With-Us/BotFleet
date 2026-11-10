@@ -1402,6 +1402,17 @@ describe("shellWord", () => {
     );
   });
 
+  it("quotes an empty word so it cannot vanish from the pasted command", () => {
+    expect(shellWord("", "linux")).toBe("''");
+    expect(shellWord("", "win32")).toBe('""');
+  });
+
+  it("quotes bracket globs and cmd.exe percent and caret", () => {
+    expect(shellWord("/srv/[a]", "linux")).toBe(`'/srv/[a]'`);
+    expect(shellWord("/srv/%PATH%", "win32")).toBe('"/srv/%PATH%"');
+    expect(shellWord("a^b", "win32")).toBe('"a^b"');
+  });
+
   it("leaves a backslash or tilde bare, as Windows paths have always printed", () => {
     expect(shellWord("C:\\Users\\jay", "linux")).toBe("C:\\Users\\jay");
     expect(shellWord("~~workspace", "linux")).toBe("~~workspace");

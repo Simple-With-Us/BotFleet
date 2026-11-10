@@ -2003,7 +2003,13 @@ export function containerComputerMcp(
  * escape; cmd.exe ignores single quotes, so win32 gets the double-quote form
  * with `""` doubling. */
 export function shellWord(word: string, platform: NodeJS.Platform = process.platform): string {
-  if (!/[\s!"'`$&;|<>()*?{}#]/.test(word)) return word;
+  if (word === "") return platform === "win32" ? '""' : "''";
+  // Bracket pairs glob in POSIX shells; cmd.exe additionally expands %VAR%
+  // inside double quotes and treats ^ as its escape character.
+  const trigger = platform === "win32"
+    ? /[\s!"'`$&;|<>()*?{}#[\]^%]/
+    : /[\s!"'`$&;|<>()*?{}#[\]]/;
+  if (!trigger.test(word)) return word;
   return platform === "win32"
     ? `"${word.replace(/"/g, '""')}"`
     : `'${word.replace(/'/g, `'\\''`)}'`;
