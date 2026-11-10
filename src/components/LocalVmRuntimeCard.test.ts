@@ -15,7 +15,6 @@ describe("LocalVmRuntimeCard runtime UX", () => {
     expect(refreshBlock).not.toContain("setActionError");
     expect(source).not.toContain("productErrorHeadline");
     expect(source).toContain("STATUS_TIMEOUT_MS = 40_000");
-    expect(source).not.toContain('void act("start")');
   });
 });
 

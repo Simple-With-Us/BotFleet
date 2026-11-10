@@ -47,6 +47,14 @@ let autoUpdateEnabled = false;
 let autoCheckFailureStreak = null;
 let autoCheckBackoffUntilMs = 0;
 let autoCheckBackoffLogged = false;
+let cachedMacFingerprint;
+
+function currentMacAppFingerprint() {
+  if (cachedMacFingerprint === undefined) {
+    cachedMacFingerprint = macAppFingerprint();
+  }
+  return cachedMacFingerprint;
+}
 
 function resetAutoCheckBackoff() {
   autoCheckFailureStreak = null;
@@ -109,7 +117,7 @@ function recordSuccessfulAutoCheck() {
   // that never wrote `disk` back, so `lastCheckMs` never reached disk and
   // the 6-hour throttle never actually engaged.
   try {
-    recordAutomaticCheck(configPath(), { fingerprint: macAppFingerprint() });
+    recordAutomaticCheck(configPath(), { fingerprint: currentMacAppFingerprint() });
   } catch {
     /* never let the check fail because we could not persist */
   }
@@ -378,7 +386,7 @@ export function startUpdater(mainWindow) {
       enabled: autoUpdateEnabled,
       lastCheckMs: record.lastCheckMs,
       lastAppFingerprint: record.lastAppFingerprint,
-      currentFingerprint: macAppFingerprint(),
+      currentFingerprint: currentMacAppFingerprint(),
     });
   };
 

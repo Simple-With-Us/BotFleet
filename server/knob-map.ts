@@ -90,6 +90,16 @@ export const KNOB_FIELDS: readonly KnobFieldSpec[] = [
     max: 360,
   },
   {
+    id: "jobs.queueWaitMinutes",
+    label: "Maximum job queue wait",
+    section: "jobs",
+    path: ["queueWaitMinutes"],
+    infisicalName: "BOTFLEET_JOBS_QUEUE_WAIT_MINUTES",
+    kind: "int",
+    min: 1,
+    max: 10080,
+  },
+  {
     id: "jobs.cpuCores",
     label: "Job CPU cores",
     section: "jobs",
@@ -119,6 +129,49 @@ export const KNOB_FIELDS: readonly KnobFieldSpec[] = [
     min: 0,
   },
   {
+    id: "jobs.admission.minFreeInodes",
+    label: "Job admission minimum free inodes",
+    section: "jobs",
+    path: ["admission", "minFreeInodes"],
+    infisicalName: "BOTFLEET_JOBS_MIN_FREE_INODES",
+    kind: "int",
+    min: 0,
+    max: Number.MAX_SAFE_INTEGER,
+  },
+  {
+    // Headroom knobs (P-BF-6 B7).  Absent means unset: no gate, exactly like
+    // `minFreeInodes` above.  There is deliberately no default anywhere for
+    // these three — choosing numbers is the owner's call, and an unset knob
+    // leaves admission byte-for-byte unchanged.
+    id: "jobs.admission.reservedCpuCores",
+    label: "Job admission reserved CPU cores",
+    section: "jobs",
+    path: ["admission", "reservedCpuCores"],
+    infisicalName: "BOTFLEET_JOBS_RESERVED_CPU_CORES",
+    kind: "int",
+    min: 0,
+    max: 64,
+  },
+  {
+    id: "jobs.admission.reservedRamMb",
+    label: "Job admission reserved RAM",
+    section: "jobs",
+    path: ["admission", "reservedRamMb"],
+    infisicalName: "BOTFLEET_JOBS_RESERVED_RAM_MB",
+    kind: "int",
+    min: 0,
+  },
+  {
+    id: "jobs.admission.minMemoryAvailablePercent",
+    label: "Job admission minimum available memory percent",
+    section: "jobs",
+    path: ["admission", "minMemoryAvailablePercent"],
+    infisicalName: "BOTFLEET_JOBS_MIN_MEMORY_AVAILABLE_PERCENT",
+    kind: "float",
+    min: 0,
+    max: 100,
+  },
+  {
     id: "jobs.webhookHotDeferMinutes",
     label: "Webhook hot-host deferral limit",
     section: "jobs",
@@ -127,6 +180,32 @@ export const KNOB_FIELDS: readonly KnobFieldSpec[] = [
     kind: "int",
     min: 1,
     max: 720,
+  },
+  {
+    // The placement transport's own two knobs (server/placement-controller-bridge.ts).
+    // `heartbeatSeconds` is how often a worker says it is alive, and the
+    // controller's sweep runs at the same cadence.  The other one is how
+    // long a worker may go quiet before the controller marks it unreachable,
+    // so the window has to stay longer than the period:  the pair is clamped
+    // to that order in `server/config.ts`, after the vault resolves as well.
+    id: "placement.heartbeatSeconds",
+    label: "Placement worker heartbeat period",
+    section: "placement",
+    path: ["heartbeatSeconds"],
+    infisicalName: "BOTFLEET_PLACEMENT_HEARTBEAT_SECONDS",
+    kind: "int",
+    min: 1,
+    max: 3600,
+  },
+  {
+    id: "placement.unreachableAfterSeconds",
+    label: "Placement unreachable window",
+    section: "placement",
+    path: ["unreachableAfterSeconds"],
+    infisicalName: "BOTFLEET_PLACEMENT_UNREACHABLE_AFTER_SECONDS",
+    kind: "int",
+    min: 16,
+    max: 86400,
   },
   {
     id: "observability.tracesSampleRate",
@@ -200,6 +279,16 @@ export const KNOB_FIELDS: readonly KnobFieldSpec[] = [
     max: 500,
   },
   {
+    id: "tts.audioRetentionDays",
+    label: "TTS audio clip retention days",
+    section: "tts",
+    path: ["audioRetentionDays"],
+    infisicalName: "BOTFLEET_TTS_AUDIO_RETENTION_DAYS",
+    kind: "int",
+    min: 0,
+    max: 365,
+  },
+  {
     id: "infisical.refreshMinutes",
     label: "Infisical refresh cadence",
     section: "infisical",
@@ -208,6 +297,136 @@ export const KNOB_FIELDS: readonly KnobFieldSpec[] = [
     kind: "int",
     min: 5,
     max: 1440,
+  },
+  {
+    id: "agentProxy.enabled",
+    label: "Agent proxy enabled",
+    section: "agentProxy",
+    path: ["enabled"],
+    infisicalName: "BOTFLEET_AGENT_PROXY_ENABLED",
+    kind: "bool",
+  },
+  {
+    // Off unless the owner says otherwise.  The phone's Open-on-Mac button
+    // and nothing else in the fleet depends on this, so it is the knob most
+    // worth being able to flip without a deploy.
+    //
+    // `server.persistOnExit` is deliberately NOT a row, and the reason is the
+    // difference between where this table's values end up and where that one
+    // is read.  A knob here is resolved by the harness into in-memory `cfg`,
+    // and `writeThroughKnobs` tombstones the field so `saveConfig` leaves it
+    // out of config.json — the vault owns it.  `persistOnExit` has exactly one
+    // consumer, `serverPersistsOnExit()` in electron/main.mjs, and that reads
+    // config.json off disk before the harness has been consulted; Electron
+    // cannot import this TypeScript module.  A row here would therefore look
+    // settable and do nothing: set it in the vault and the harness resolves
+    // `false` in memory, while Electron still sees an absent field, reads
+    // `undefined !== false`, and keeps the harness alive on quit.
+    //
+    // It is also the wrong shape for a knob.  This table is fleet-wide, and
+    // "quit should tear the harness down" is a per-Mac decision that would
+    // then apply to every machine sharing the project.  As a plain field in
+    // ~/.botfleet/config.json it is per-Mac, survives saves, and is read by
+    // the one process that acts on it.
+    id: "server.allowRemoteDesktopLaunch",
+    label: "Allow remote desktop launch",
+    section: "server",
+    path: ["allowRemoteDesktopLaunch"],
+    infisicalName: "BOTFLEET_SERVER_ALLOW_REMOTE_DESKTOP_LAUNCH",
+    kind: "bool",
+  },
+  {
+    id: "agentProxy.address",
+    label: "Agent proxy address",
+    section: "agentProxy",
+    path: ["address"],
+    infisicalName: "BOTFLEET_AGENT_PROXY_ADDRESS",
+    kind: "string",
+  },
+  {
+    id: "agentProxy.projectId",
+    label: "Agent proxy project ID",
+    section: "agentProxy",
+    path: ["projectId"],
+    infisicalName: "BOTFLEET_AGENT_PROXY_PROJECT_ID",
+    kind: "string",
+  },
+  {
+    id: "agentProxy.environment",
+    label: "Agent proxy environment",
+    section: "agentProxy",
+    path: ["environment"],
+    infisicalName: "BOTFLEET_AGENT_PROXY_ENV",
+    kind: "string",
+  },
+  {
+    id: "agentProxy.secretPath",
+    label: "Agent proxy secret path",
+    section: "agentProxy",
+    path: ["secretPath"],
+    infisicalName: "BOTFLEET_AGENT_PROXY_PATH",
+    kind: "string",
+  },
+  {
+    // The computer-call gate's waits (server/computer-call-gate.ts),
+    // resolved per call from the live cfg in server/index.ts.  Bounds are
+    // the gate's own clamps: no wait may outlast the bridge client blocked
+    // on it.  The legacy OMB_COMPUTER_* env names remain as the fallback
+    // underneath these fields in `computerCallSettings` (server/config.ts).
+    id: "computerCall.waitMs",
+    label: "Computer call wait",
+    section: "computerCall",
+    path: ["waitMs"],
+    infisicalName: "BOTFLEET_COMPUTER_CALL_WAIT_MS",
+    kind: "int",
+    min: 500,
+    max: 45000,
+  },
+  {
+    id: "computerCall.actWithinMs",
+    label: "Computer call act-within window",
+    section: "computerCall",
+    path: ["actWithinMs"],
+    infisicalName: "BOTFLEET_COMPUTER_CALL_ACT_WITHIN_MS",
+    kind: "int",
+    min: 100,
+    max: 5000,
+  },
+  {
+    id: "computerCall.personAwayMs",
+    label: "Computer call person-away ceiling",
+    section: "computerCall",
+    path: ["personAwayMs"],
+    infisicalName: "BOTFLEET_COMPUTER_CALL_WAIT_MAX_MS",
+    kind: "int",
+    min: 1,
+    max: 2_147_483_647,
+  },
+  {
+    // Read once when the Claude driver is created (server/drivers/claude.ts),
+    // so a change applies on the next provider rebuild — a Settings save of
+    // this section rebuilds the fleet (it is deliberately absent from
+    // CONFIG_KEYS_WITHOUT_PROVIDER_RELOAD).  The legacy
+    // OMB_CLAUDE_SESSION_IDLE_* env names remain as the fallback underneath
+    // these fields in `claudeSessionIdleMs` (server/config.ts).
+    id: "claudeSession.idleMs",
+    label: "Claude session idle lifetime",
+    section: "claudeSession",
+    path: ["idleMs"],
+    infisicalName: "BOTFLEET_CLAUDE_SESSION_IDLE_MS",
+    kind: "int",
+    min: 1,
+    max: 2_147_483_647,
+  },
+  {
+    id: "claudeSession.idleMinMs",
+    label: "Claude session idle lifetime floor",
+    section: "claudeSession",
+    path: ["idleMinMs"],
+    infisicalName: "BOTFLEET_CLAUDE_SESSION_IDLE_MIN_MS",
+    kind: "int",
+    min: 1,
+    max: 2_147_483_647,
   },
 ] as const;
 
@@ -278,10 +497,29 @@ function kindMatches(spec: KnobFieldSpec, value: unknown): value is KnobValue {
   }
 }
 
+/** The ids of the headroom knobs the patch clears with an explicit JSON null —
+ * the wire spelling of "clear this knob back to unset" (slice 7b).  Only the
+ * three unset-by-default knobs admit null through the patch schema, so the
+ * check reads the typed admission object straight off the zod-validated
+ * patch — the same differential `botDefaults.allowedComputers` and
+ * `callStt.provider` already use — instead of walking blindly.  An absent
+ * key or a real value is not a clear. */
+export function clearedHeadroomKnobs(patch: Partial<AppConfig> | undefined): string[] {
+  const admission = patch?.jobs?.admission;
+  if (!admission) return [];
+  const cleared: string[] = [];
+  if (admission.reservedCpuCores === null) cleared.push("jobs.admission.reservedCpuCores");
+  if (admission.reservedRamMb === null) cleared.push("jobs.admission.reservedRamMb");
+  if (admission.minMemoryAvailablePercent === null) cleared.push("jobs.admission.minMemoryAvailablePercent");
+  return cleared;
+}
+
 /** Read one knob off a config-shaped object, typed.  Returns `undefined`
  * when the field is absent or holds a value of the wrong kind — the schema
  * below this layer is zod-validated, so the wrong-kind case is a caller
- * handing in something unvalidated, not a state the file can be in. */
+ * handing in something unvalidated, not a state the file can be in.
+ * An explicit null (see `knobClearRequested`) is not a value and also reads
+ * as `undefined` here. */
 // SAFETY: `spec.section` is a `keyof AppConfig` from the table above, so
 // indexing a plain config object by it reads a declared section and nothing
 // else.

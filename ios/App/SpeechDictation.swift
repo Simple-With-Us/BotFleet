@@ -1,6 +1,6 @@
 // On-device dictation for the composer.
 //
-// Same engine as the desktop helper (`electron/resources/speech-helper.swift`):
+// Same engine as the desktop helper (`native/helpers/speech-helper.swift`):
 // `SFSpeechRecognizer` on an `AVAudioEngine` tap, partials streamed into the
 // text field, press to stop. Composer mode, not call mode — there is no
 // silence endpointing. The phone is better at this than the Mac was: the
@@ -63,6 +63,16 @@ final class SpeechDictation: ObservableObject {
         } else {
             start(base: base)
         }
+    }
+
+    /// Start capturing without toggling.
+    ///
+    /// `toggle` is the composer's control and a toggle is wrong for a voice
+    /// call: the call opens the microphone again at the end of every turn, and
+    /// a toggle would close it instead whenever the recognizer happened to have
+    /// stopped on its own.  Same work, no inversion.
+    func startCapturing(base: String) {
+        start(base: base)
     }
 
     private func start(base: String) {

@@ -8,6 +8,7 @@ import {
   Bug,
   Clock,
   Crown,
+  Eye,
   Folder,
   ListTree,
   Loader2,
@@ -50,6 +51,7 @@ import { showWorkingDots } from "@/lib/turn-tail";
 import { liveActivityLabel } from "@/lib/live-activity";
 import { modelChip } from "@/lib/model-chip";
 import { ChatMarkdown } from "./ChatMarkdown";
+import { recordChatViewBody, recordMessagesListBody } from "./chatViewRenderProbe";
 import { splitVoiceSummary, stripVoiceSummaryTags, writtenReply } from "../../shared/voice-summary";
 import { useMessageKaraoke } from "@/lib/tts/useMessageKaraoke";
 import { MentionText } from "./MentionText";
@@ -84,12 +86,14 @@ import { groupActivityRuns, nestHelperSteps } from "@/lib/activity-runs";
 import { ActivityRun } from "./ActivityRun";
 import { JobFinishedRow, JobsMenu } from "./JobsMenu";
 import { jobWakeSubtitle } from "../../shared/jobs";
+import { HelperCard } from "./HelperCard";
+import { isHelperRow, runningHelperCount } from "../../shared/helpers";
 import { ToolLine } from "./ToolLine";
 import { ContextInjectionRows } from "./ContextInjectionRows";
 import { webhookMessageView } from "@/lib/webhook-message";
 import { WebhookCard } from "./WebhookCard";
 import { imessageMessageView, stripToImessagePrefix } from "../../shared/imessage-message";
-import { delegationMessageView, isDelegationMessage } from "../../shared/delegation-message";
+import { delegationLiveLine, delegationMessageView, isDelegationMessage } from "../../shared/delegation-message";
 import { DelegationCard } from "./DelegationCard";
 import { splitAttachedImages } from "@/lib/composer-attachments";
 import { BOTTOM_FOLLOW_THRESHOLD, shouldResumeBottomFollow } from "@/lib/bottom-follow";
@@ -693,6 +697,10 @@ function Bubble({
  * contents, is what this is for. */
 const NO_QUEUE: ReadonlyArray<{ queueId: string; text: string }> = [];
 
+/** Shared empty transcript for a browsed thread whose first page has
+ * not landed yet.  Same identity reasoning as NO_QUEUE above. */
+const NO_MESSAGES: Message[] = [];
+
 function ActivityChip({ bot, message }: { bot: Bot, message: Message }) {
   const { dispatch } = useStore();
   const [expanded, setExpanded] = useState(false);
@@ -743,8 +751,9 @@ function ActivityChip({ bot, message }: { bot: Bot, message: Message }) {
       </div>
     );
   }
-  // everything that is not a bot⇄bot chip is a step in the work, and a step
-  // is a log line — see ToolLine for why it stopped being a card
+  if (isHelperRow(message)) return <HelperCard message={message} />;
+  // everything that is not a bot⇄bot chip or a helper is a step in the work,
+  // and a step is a log line — see ToolLine for why it stopped being a card
   return <ToolLine message={message} actor={message.from?.name ?? bot.name} threadId={bot.threadId} />;
 }
 
@@ -814,6 +823,7 @@ const MessagesList = memo(function MessagesList({
   onRegenerate: () => void;
   onReply: (message: Message) => void;
 }) {
+  recordMessagesListBody();
   const { state, dispatch } = useStore();
   const showToolCalls = showToolCallsEnabled(state.config);
   const summarizeToolCalls = summarizeToolCallsEnabled(state.config);
@@ -824,6 +834,16 @@ const MessagesList = memo(function MessagesList({
     const ordered = nestHelperSteps(messages);
     return summarizeToolCalls ? groupActivityRuns(ordered) : ordered.map((m) => ({ kind: "message" as const, message: m }));
   }, [messages, summarizeToolCalls]);
+  const delegationProgressById = useMemo(() => {
+    const busy = Boolean(bot.busy);
+    const map = new Map<string, string | undefined>();
+    for (let index = 0; index < messages.length; index++) {
+      const row = messages[index];
+      if (!isDelegationMessage(row)) continue;
+      map.set(row.id, delegationLiveLine(messages, index, busy));
+    }
+    return map;
+  }, [messages, bot.busy]);
   // A search hit inside a folded run has to open it: the fold keeps the
   // row out of the DOM, and there is nothing for the scroll to land on.
   const focus = state.focusMessage;
@@ -900,6 +920,8 @@ const MessagesList = memo(function MessagesList({
               }
               // a job's end is news, not a step: shown whatever the setting
               if (m.job) return <JobFinishedRow job={m.job} />;
+              // a helper card is the row, whether or not tool lines are on
+              if (isHelperRow(m)) return <HelperCard message={m} />;
               if (!showToolCalls && !m.comm) return null;
               return <ActivityChip bot={bot} message={m} />;
             }
@@ -986,8 +1008,9 @@ const MessagesList = memo(function MessagesList({
                 );
               };
               if (delegationView) {
+                const progress = delegationProgressById.get(m.id);
                 return withSystemChrome(
-                  <DelegationCard view={delegationView} comm={m.comm} targetBotName={bot.name} />,
+                  <DelegationCard view={delegationView} comm={m.comm} targetBotName={bot.name} progress={progress} />,
                 );
               }
               const webhookView = autoDelivered ? webhookMessageView(m.text ?? "") : null;
@@ -1126,17 +1149,36 @@ function formatHoverTime(at: number) {
 }
 
 export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; explicitThreadId?: string }) {
-  // A pin onto a different thread for App views.  Memoized so the derived
-  // object keeps a stable identity across renders and effects don't churn
-  // when the pin isn't shadowing anything.
+  recordChatViewBody();
+  const { state, dispatch } = useStore();
+  // A pin onto a different thread for App views and busy-time browsing.
+  // The derived bot reads that thread's own cached transcript — never
+  // the active thread's messages under the viewed thread's id.
+  // Memoized so the derived object keeps a stable identity across
+  // renders and effects don't churn when the pin isn't shadowing anything.
+  const viewingOther = Boolean(explicitThreadId && explicitThreadId !== originalBot.threadId);
+  const viewedMessages = explicitThreadId ? state.threadTranscripts[explicitThreadId] : undefined;
+  const viewedLoading = explicitThreadId ? Boolean(state.loadingThread[explicitThreadId]) : false;
+  // A failed page stays failed until the reader opens the thread again:
+  // without this, clearing `loadingThread` re-arms the fetch below and a
+  // persistently failing route refetches without bound.
+  const viewedFailed = explicitThreadId ? state.threadTranscriptErrors[explicitThreadId] : undefined;
   const bot = useMemo(
     () =>
-      explicitThreadId && explicitThreadId !== originalBot.threadId
-        ? { ...originalBot, threadId: explicitThreadId }
+      viewingOther && explicitThreadId
+        ? { ...originalBot, threadId: explicitThreadId, messages: viewedMessages ?? NO_MESSAGES }
         : originalBot,
-    [originalBot, explicitThreadId],
+    [originalBot, explicitThreadId, viewingOther, viewedMessages],
   );
-  const { state, dispatch } = useStore();
+  // First open of a retained thread fetches its page; later frames keep
+  // the cache live through the reducer.  The store wrapper dedupes
+  // concurrent fetches for the same thread, and a recorded failure
+  // blocks re-dispatch until the reader opens the thread again.
+  useEffect(() => {
+    if (viewingOther && explicitThreadId && !viewedMessages && !viewedLoading && !viewedFailed) {
+      dispatch({ type: "viewThread", botId: originalBot.id, threadId: explicitThreadId });
+    }
+  }, [viewingOther, explicitThreadId, viewedMessages, viewedLoading, viewedFailed, originalBot.id, dispatch]);
   const { capabilities } = useDesktopCapabilities();
   const macInset = capabilities.windowChrome === "mac-inset";
   const dragStyle: (React.CSSProperties & { WebkitAppRegion: "drag" }) | undefined = macInset
@@ -1220,6 +1262,7 @@ export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; exp
     }));
     return [...serverMessages, ...queued];
   }, [serverMessages, pendingQueued]);
+  const helperCount = useMemo(() => runningHelperCount(messages), [messages]);
   const latestServerError = useMemo(() => latestTurnErrorMessage(serverMessages), [serverMessages]);
   const errorBranchKey = useMemo(() => turnErrorBranchKey(bot.messages, serverMessages), [bot.messages, serverMessages]);
   // Windowed transcript: only a tail of the thread mounts (screenshots make
@@ -1555,7 +1598,7 @@ export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; exp
             <Search size={18} />
           </button>
           {/* Background jobs, left of Stop.  Stop ends the turn, never a job. */}
-          <JobsMenu threadId={bot.threadId} />
+          <JobsMenu threadId={bot.threadId} helperCount={helperCount} />
           {bot.busy && (
             <button
               onClick={() => dispatch({ type: "interrupt", botId: bot.id })}
@@ -1615,7 +1658,47 @@ export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; exp
         </div>
       </div>
 
-      <ThreadTabs bot={bot} />
+      <ThreadTabs bot={originalBot} />
+
+      {/* Browsing a retained thread is read-only: the bot keeps working
+          in its active thread, and becoming the execution target stays
+          gated on the turn finishing, exactly as tab switching was. */}
+      {viewingOther && explicitThreadId && (
+        <div
+          role="status"
+          className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-hairline/40 bg-raised/40 px-4 py-1.5 text-[12.5px] text-ink-secondary"
+        >
+          <span className="flex min-w-0 items-center gap-1.5">
+            <Eye size={13} className="shrink-0" />
+            <span className="truncate">
+              Viewing “{originalBot.tasks?.find((task) => task.threadId === explicitThreadId)?.title || "Untitled"}”
+              {viewedLoading && !viewedMessages ? " — loading…" : ""}
+              {" · "}
+              {originalBot.busy
+                ? `${originalBot.name} is working in “${originalBot.tasks?.find((task) => task.threadId === originalBot.threadId)?.title || "Untitled"}”.`
+                : `The active thread is “${originalBot.tasks?.find((task) => task.threadId === originalBot.threadId)?.title || "Untitled"}”.`}
+            </span>
+          </span>
+          <span className="ml-auto flex shrink-0 items-center gap-2">
+            <button
+              type="button"
+              disabled={Boolean(originalBot.busy)}
+              title={originalBot.busy ? "Let this turn finish first" : "Make this the active thread"}
+              onClick={() => dispatch({ type: "switchTask", botId: originalBot.id, threadId: explicitThreadId })}
+              className="rounded-full border border-hairline/40 px-2.5 py-0.5 text-ink hover:bg-raised disabled:opacity-40"
+            >
+              Switch to this thread
+            </button>
+            <button
+              type="button"
+              onClick={() => dispatch({ type: "viewThread", botId: originalBot.id, threadId: null })}
+              className="rounded-full border border-hairline/40 px-2.5 py-0.5 text-ink hover:bg-raised"
+            >
+              Back to active thread
+            </button>
+          </span>
+        </div>
+      )}
 
       {findOpen && !trajectoryOpen && <ChatFindBar threadId={bot.threadId} onClose={() => setFindOpen(false)} />}
 
@@ -1802,9 +1885,10 @@ export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; exp
         </div>
       </div>
 
-      {/* keyed by bot: a draft belongs to the conversation it was typed in,
-          so switching bots starts from an empty composer instead of carrying
-          the previous bot's half-written message over. ArrowUp-to-edit is
+      {/* keyed by bot and shown thread: a draft belongs to the conversation
+          it was typed in, so switching bots — or browsing a retained
+          thread — starts from that thread's composer instead of carrying
+          the previous thread's half-written message over. ArrowUp-to-edit is
           gated on busy like the pencil button — editing rewinds the thread,
           which a live turn forbids (the server 409s it). */}
       <div
@@ -1823,12 +1907,18 @@ export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; exp
       <div className="w-full">
       <UpdateDrainNotice />
       <Composer
-        key={bot.id}
+        key={`${bot.id}:${bot.threadId}`}
         bot={bot}
         replyTo={replyTo}
         onClearReply={() => setReplyTo(null)}
         onRestoreReply={(message) => setReplyTo((current) => current ?? message)}
         onEditLast={lastUserMessage && !bot.busy ? () => setEditingId(lastUserMessage.id) : undefined}
+        // Browsing is read-only while the bot works: a send from here
+        // would auto-switch the execution target to the viewed thread
+        // mid-turn (and steer onto it), defeating the busy gate the tabs
+        // and the banner above enforce.  The reader switches first, then
+        // sends — the Switch button unlocks when the turn finishes.
+        locked={viewingOther && originalBot.busy}
       />
       <ThreadStatsBar stats={activeTask?.stats} usage={activeTask?.usage} />
       </div>

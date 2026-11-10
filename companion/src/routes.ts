@@ -269,6 +269,7 @@ const ALLOWED: ReadonlyArray<{ method: string; path: RegExp }> = [
   // carries API keys — ever accepting a write from a device.
   { method: "PATCH", path: /^\/api\/terminology$/ },
   { method: "PATCH", path: /^\/api\/conversation-mode$/ },
+  { method: "PATCH", path: /^\/api\/busy-send-default$/ },
   // Display preferences only — never secrets. Mirrors terminology: each
   // setting gets its own narrow route so /api/config stays write-closed.
   { method: "PATCH", path: /^\/api\/features$/ },

@@ -186,7 +186,19 @@ export interface RoutineRun {
    *  close the same one.  Only set for a genuine "schedule" trigger on a
    *  recurring routine — see `checkInStart`/`checkInFinish`. */
   sentryCheckInId?: string;
+  /** A terminal check-in close queued or in flight, persisted across restarts
+   *  so a crashed or dropped delivery can be reconciled on server boot.
+   *  Cleared once Sentry confirms receipt. */
+  pendingClose?: RoutineRunPendingClose;
 }
+
+export interface RoutineRunPendingClose {
+  status: "ok" | "error";
+  attempts: number;
+  checkInId: string;
+}
+
+interface SeenRunsResult { acknowledged: number; runs: RoutineRun[] }
 
 export interface RoutineRequestReceipt {
   requestId: string;
@@ -267,6 +279,8 @@ function routineRequestOwnerKey(owner: RoutineRequestOwner): string {
 }
 
 export interface RoutineManagerOptions {
+  /** Preserve interrupted evidence and refuse startup recovery in a bridge. */
+  passive?: boolean;
   file?: string;
   now?: () => number;
   /** Keyed frames only: every payload on this bus is `{ kind, … }`, which
@@ -282,12 +296,17 @@ export interface RoutineManagerOptions {
    *  already going is not asked, and a person's turn never reaches this. */
   hostHot?: () => string | null;
   /** How long a queued webhook may wait on `hostHot` before it dispatches
-   *  anyway.  Measured from the receipt's `createdAt`.  Absent uses
-   *  `DEFAULT_WEBHOOK_HOT_DEFER_MS` (20 minutes).  Read on each tick so a
-   *  live config refresh applies without rebuilding the scheduler. */
+   *  anyway.  Measured from the tick that first parked it on the host, not
+   *  from `createdAt`, so time already spent on a busy bot or a dead engine
+   *  does not eat the window.  Absent uses `DEFAULT_WEBHOOK_HOT_DEFER_MS`
+   *  (20 minutes).  Read on each tick so a live config refresh applies
+   *  without rebuilding the scheduler. */
   webhookHotDeferMaxMs?: () => number;
   /** One-line operational log.  Absent writes with `console.log`. */
   log?: (line: string) => void;
+  /** When a queued run can never succeed on the bot's engine for this prompt
+   *  (capability gate `refuse`), settle it as skipped instead of holding forever. */
+  incapableRun?: (run: RoutineRun) => { reason: string } | undefined;
   /** Per-run readiness gate.  False leaves the durable run queued; callers
    * invoke tick() again when the missing runtime prerequisite arrives. */
   canStart?: (botId: string, threadId: string | undefined, runOn: RoutineRunOn) => boolean;
@@ -366,8 +385,14 @@ export interface RoutineManagerOptions {
    *  close later, or undefined when there is nothing to check in (Sentry
    *  off, or a one-off routine with no recurrence to watch). */
   checkInStart?: (run: RoutineRun, routine: Routine) => string | undefined;
-  /** Close a check-in `checkInStart` opened. */
-  checkInFinish?: (run: RoutineRun, checkInId: string, ok: boolean) => void;
+  /** Close a check-in `checkInStart` opened.  Optional `onSettled` callback
+   *  notifies when delivery was confirmed (or failed after all retries). */
+  checkInFinish?: (
+    run: RoutineRun,
+    checkInId: string,
+    ok: boolean,
+    onSettled?: (delivered: boolean) => void,
+  ) => void;
   /** Is this run's turn still in flight on the harness? Consulted by the
    * periodic sweep for runs stuck in running/waiting: the completion path
    * settles a run on `turn.completed`, but a harness path that settles the
@@ -508,6 +533,7 @@ export class RoutineManager {
   /** True when routines.json could not be read or moved aside, so saving would destroy the only
    * copy of it.  Logged and shown; the one case in which this manager stops saving. */
   private writesRefused = false;
+  private readonly passive: boolean;
   /** When each trigger last STARTED, keyed by `automationThreadKey`.
    *
    * In memory only: a gap is a rate limit on waking a bot, and after a
@@ -523,15 +549,70 @@ export class RoutineManager {
   private readonly botSnoozeUntil = new Map<string, number>();
   /** Coarse hold-reason signatures already persisted and broadcast. */
   private readonly publishedHoldBuckets = new Map<string, string>();
+  /** Deliveries dropped because the bot was snoozed/off (BF-2462). In-memory
+   * only: counting them must not rewrite routines.json. */
+  private skippedDeliveryTotal = 0;
+  private readonly skippedDeliveriesByTrigger = new Map<string, number>();
+
+  /** BF-2462: a webhook/resource delivery for a snoozed/off bot will never
+   * run, so do not persist a run (or its prompt copy) for it. Persisting
+   * ~1,970 instant cancelled rows rewrote all of routines.json with fsync
+   * per delivery and evicted real history. Return a transient receipt so
+   * callers still get 202 + status/outcomeCode, bump a counter, and store
+   * no prompt copy. */
+  private skippedDelivery(input: {
+    routineId: string;
+    routineName: string;
+    botId: string;
+    runOn: RoutineRunOn;
+    receivedAt: number;
+    off: boolean;
+    triggerSource: "webhook" | "resource";
+    webhookId: string;
+    deliveryId: string;
+  }): RoutineRun {
+    this.skippedDeliveryTotal += 1;
+    const key = `${input.triggerSource}:${input.webhookId}`;
+    this.skippedDeliveriesByTrigger.set(key, (this.skippedDeliveriesByTrigger.get(key) ?? 0) + 1);
+    return {
+      id: randomUUID(),
+      routineId: input.routineId,
+      routineName: input.routineName,
+      prompt: "",
+      botId: input.botId,
+      runOn: input.runOn,
+      scheduledFor: input.receivedAt,
+      status: "cancelled",
+      outcomeCode: input.off ? "bot_off" : "cancelled",
+      failurePhase: "lifecycle",
+      error: input.off ? BOT_OFF_SKIPPED : undefined,
+      finishedAt: this.now(),
+      manual: false,
+      triggerSource: input.triggerSource,
+      webhookId: input.webhookId,
+      deliveryId: input.deliveryId,
+      createdAt: this.now(),
+    };
+  }
+
+  skippedDeliveryCount(triggerId?: string, triggerSource?: "webhook" | "resource"): number {
+    if (!triggerId) return this.skippedDeliveryTotal;
+    if (triggerSource) return this.skippedDeliveriesByTrigger.get(`${triggerSource}:${triggerId}`) ?? 0;
+    return (
+      (this.skippedDeliveriesByTrigger.get(`webhook:${triggerId}`) ?? 0) +
+      (this.skippedDeliveriesByTrigger.get(`resource:${triggerId}`) ?? 0)
+    );
+  }
 
   constructor(options: RoutineManagerOptions) {
+    this.passive = options.passive === true;
     this.options = options;
     this.file = options.file ?? join(DATA_DIR, "routines.json");
     this.now = options.now ?? Date.now;
     let runOnMigrated = false;
     // A routines.json that cannot be used is moved aside, never deleted, and reported (store-guard.ts).
     // It used to read as "no routines", and the next save replaced it.
-    const loaded = loadGuarded(this.file, interpretRoutineFile);
+    const loaded = loadGuarded(this.file, interpretRoutineFile, this.now(), { readOnly: this.passive });
     this.writesRefused = loaded.writesRefused;
     const disk = loaded.value ?? {};
     const rawRoutines = Array.isArray(disk.routines) ? disk.routines : [];
@@ -571,6 +652,10 @@ export class RoutineManager {
         }
       }
     }
+    if (this.passive) {
+      this.writesRefused = true;
+      return;
+    }
     if (runOnMigrated) this.save();
     // A local process cannot still own these turns after a full restart.
     const recovered: RoutineRun[] = [];
@@ -595,8 +680,24 @@ export class RoutineManager {
       // or Sentry only learns of the failure when the monitor times out.
       // `this.options` is assigned first thing in the constructor, and the
       // server applies its Sentry settings before building this manager.
-      for (const run of recovered) {
-        if (run.sentryCheckInId) this.options.checkInFinish?.(run, run.sentryCheckInId, false);
+      // Pass the canonical run in this.runs so pendingClose persists to disk.
+      for (const rec of recovered) {
+        const canonical = this.runs.find((r) => r.id === rec.id) ?? rec;
+        if (canonical.sentryCheckInId) this.closeCheckIn(canonical, canonical.sentryCheckInId, false);
+      }
+    }
+    // Reconcile unclosed check-ins that were in-flight or pending when the
+    // server stopped or crashed (skipping runs just recovered above).
+    const recoveredIds = new Set(recovered.map((r) => r.id));
+    for (const run of this.runs) {
+      if (run.pendingClose && !recoveredIds.has(run.id) && run.status !== "running" && run.status !== "waiting") {
+        const checkInId = run.pendingClose.checkInId || run.sentryCheckInId;
+        if (checkInId) {
+          const isOk = run.pendingClose.status === "ok";
+          this.options.checkInFinish?.(run, checkInId, isOk, (delivered) => {
+            this.onCheckInSettled(run.id, delivered);
+          });
+        }
       }
     }
   }
@@ -633,15 +734,18 @@ export class RoutineManager {
    *  duration is until a person wakes the bot (a message, respond, or Run
    *  now clears the snooze via `clearBotSnooze`). */
   snoozeBot(botId: string, durationMs = Infinity): void {
+    if (this.passive) return;
     this.botSnoozeUntil.set(botId, durationMs === Infinity ? Infinity : this.now() + durationMs);
     this.save();
   }
 
   clearBotSnooze(botId: string): void {
+    if (this.passive) return;
     if (this.botSnoozeUntil.delete(botId)) this.save();
   }
 
   clearAllBotSnoozes(): void {
+    if (this.passive) return;
     if (this.botSnoozeUntil.size > 0) {
       this.botSnoozeUntil.clear();
       this.save();
@@ -652,7 +756,7 @@ export class RoutineManager {
     const until = this.botSnoozeUntil.get(botId);
     if (!until) return false;
     if (until !== Infinity && this.now() >= until) {
-      this.botSnoozeUntil.delete(botId);
+      if (!this.passive) this.botSnoozeUntil.delete(botId);
       return false;
     }
     return true;
@@ -663,6 +767,7 @@ export class RoutineManager {
    *  something else (a release that resumed it first), and queueing it again
    *  would run the same automation twice. */
   requeueRun(runId: string): boolean {
+    if (this.passive) return false;
     const run = this.runs.find((candidate) => candidate.id === runId);
     if (run && run.status === "cancelled") {
       run.status = "queued";
@@ -677,6 +782,7 @@ export class RoutineManager {
   }
 
   async cancelAllRunsForBot(botId: string): Promise<RoutineRun[]> {
+    if (this.passive) return [];
     const cancelled: RoutineRun[] = [];
     for (const run of this.runs) {
       if (!run.coalescedInto && run.botId === botId && ["queued", "running", "waiting"].includes(run.status)) {
@@ -719,6 +825,7 @@ export class RoutineManager {
    * actionable card may survive indefinitely and must retain its exact-once
    * recovery record for the same lifetime. */
   forgetRoutineRequestReceipt(request: RoutineRequestCommit): boolean {
+    if (this.passive) return false;
     const receipt = this.matchingRoutineRequestReceipt(request);
     if (!receipt) return false;
     const index = this.routineRequestReceipts.indexOf(receipt);
@@ -729,6 +836,7 @@ export class RoutineManager {
   }
 
   forgetRoutineRequestReceiptsForThread(threadId: string): number {
+    if (this.passive) return 0;
     const kept = this.routineRequestReceipts.filter((receipt) => receipt.threadId !== threadId);
     const removed = this.routineRequestReceipts.length - kept.length;
     if (removed === 0) return 0;
@@ -741,6 +849,7 @@ export class RoutineManager {
   /** Drop only receipts whose confirmation transcript no longer exists.
    * Reachable open cards retain exact-once recovery for their full lifetime. */
   reconcileRoutineRequestReceipts(reachable: readonly RoutineRequestOwner[]): number {
+    if (this.passive) return 0;
     const keys = new Set(reachable.map(routineRequestOwnerKey));
     const kept = this.routineRequestReceipts.filter((receipt) => keys.has(routineRequestOwnerKey(receipt)));
     const removed = this.routineRequestReceipts.length - kept.length;
@@ -758,6 +867,7 @@ export class RoutineManager {
   }
 
   create(input: RoutineInput, request?: RoutineRequestCommitFor<"create">): Routine {
+    if (this.passive) throw new Error("Routine manager is passive during placement rollback");
     if (request) {
       const receipt = this.matchingRoutineRequestReceipt(request);
       if (receipt) {
@@ -789,6 +899,7 @@ export class RoutineManager {
     patch: Partial<RoutineInput>,
     request?: RoutineRequestCommitFor<"update" | "pause" | "resume">,
   ): Routine | null {
+    if (this.passive) return null;
     if (request) {
       const receipt = this.matchingRoutineRequestReceipt(request);
       if (receipt) {
@@ -852,6 +963,7 @@ export class RoutineManager {
   }
 
   remove(id: string, request?: RoutineRequestCommitFor<"delete">): boolean {
+    if (this.passive) return false;
     if (request) {
       const receipt = this.matchingRoutineRequestReceipt(request);
       if (receipt) {
@@ -877,6 +989,7 @@ export class RoutineManager {
   }
 
   disableForBot(botId: string) {
+    if (this.passive) return;
     let changed = false;
     for (const routine of this.routines) {
       if (routine.botId !== botId || !routine.enabled) continue;
@@ -899,6 +1012,7 @@ export class RoutineManager {
   }
 
   runNow(id: string, request?: RoutineRequestCommitFor<"run_now">): RoutineRun | null {
+    if (this.passive) return null;
     if (request) {
       const receipt = this.matchingRoutineRequestReceipt(request);
       if (receipt) {
@@ -959,6 +1073,26 @@ export class RoutineManager {
     return { ...existing };
   }
 
+  canCoalesceWebhook(webhookId: string, botId: string): boolean {
+    if (this.passive) return false;
+    if (this.options.botState(botId) !== "busy") return false;
+    if (this.botIsOff(botId) || this.isBotSnoozed(botId)) return false;
+    const key = automationThreadKey({
+      routineId: webhookId,
+      webhookId,
+      triggerSource: "webhook",
+    });
+    return Boolean(
+      this.runs.find(
+        (run) =>
+          run.status === "queued" &&
+          !run.coalescedInto &&
+          run.botId === botId &&
+          automationThreadKey(run) === key,
+      ),
+    );
+  }
+
   /** Queue an event-driven job without inventing a calendar schedule. Webhook
    * definitions live in their own store; the execution receipt deliberately
    * reuses this manager so busy-bot ordering, task creation and VM routing stay
@@ -972,6 +1106,7 @@ export class RoutineManager {
     deliveryId: string;
     receivedAt: number;
   }): RoutineRun {
+    if (this.passive) throw new Error("Routine manager is passive during placement rollback");
     if (this.options.botState(input.botId) === "missing") {
       throw Object.assign(new Error("The assigned Bot no longer exists"), { status: 410 });
     }
@@ -994,6 +1129,19 @@ export class RoutineManager {
       });
       if (deferred) return deferred;
     }
+    if (snoozed) {
+      return this.skippedDelivery({
+        routineId: input.webhookId,
+        routineName: input.webhookName,
+        botId: input.botId,
+        runOn: input.runOn,
+        receivedAt: input.receivedAt,
+        off,
+        triggerSource: "webhook",
+        webhookId: input.webhookId,
+        deliveryId: input.deliveryId,
+      });
+    }
     const run: RoutineRun = {
       id: randomUUID(),
       routineId: input.webhookId,
@@ -1002,11 +1150,7 @@ export class RoutineManager {
       botId: input.botId,
       runOn: input.runOn,
       scheduledFor: input.receivedAt,
-      status: snoozed ? "cancelled" : "queued",
-      outcomeCode: off ? "bot_off" : snoozed ? "cancelled" : undefined,
-      failurePhase: snoozed ? "lifecycle" : undefined,
-      error: off ? BOT_OFF_SKIPPED : undefined,
-      finishedAt: snoozed ? this.now() : undefined,
+      status: "queued",
       manual: false,
       triggerSource: "webhook",
       webhookId: input.webhookId,
@@ -1016,9 +1160,7 @@ export class RoutineManager {
     this.runs.push(run);
     this.save();
     this.emitRun(run);
-    if (!snoozed) {
-      queueMicrotask(() => void this.tick());
-    }
+    queueMicrotask(() => void this.tick());
     return { ...run };
   }
 
@@ -1033,6 +1175,7 @@ export class RoutineManager {
     deliveryId: string;
     receivedAt: number;
   }): RoutineRun {
+    if (this.passive) throw new Error("Routine manager is passive during placement rollback");
     if (this.options.botState(input.botId) === "missing") {
       throw Object.assign(new Error("The assigned Bot no longer exists"), { status: 410 });
     }
@@ -1055,6 +1198,19 @@ export class RoutineManager {
       });
       if (deferred) return deferred;
     }
+    if (snoozed) {
+      return this.skippedDelivery({
+        routineId: input.triggerId,
+        routineName: input.triggerName,
+        botId: input.botId,
+        runOn: input.runOn,
+        receivedAt: input.receivedAt,
+        off,
+        triggerSource: "resource",
+        webhookId: input.triggerId,
+        deliveryId: input.deliveryId,
+      });
+    }
     const run: RoutineRun = {
       id: randomUUID(),
       routineId: input.triggerId,
@@ -1063,11 +1219,7 @@ export class RoutineManager {
       botId: input.botId,
       runOn: input.runOn,
       scheduledFor: input.receivedAt,
-      status: snoozed ? "cancelled" : "queued",
-      outcomeCode: off ? "bot_off" : snoozed ? "cancelled" : undefined,
-      failurePhase: snoozed ? "lifecycle" : undefined,
-      error: off ? BOT_OFF_SKIPPED : undefined,
-      finishedAt: snoozed ? this.now() : undefined,
+      status: "queued",
       manual: false,
       triggerSource: "resource",
       webhookId: input.triggerId,
@@ -1077,10 +1229,13 @@ export class RoutineManager {
     this.runs.push(run);
     this.save();
     this.emitRun(run);
-    if (!snoozed) {
-      queueMicrotask(() => void this.tick());
-    }
+    queueMicrotask(() => void this.tick());
     return { ...run };
+  }
+
+  /** The status of one run, or undefined once it has been pruned. */
+  runStatus(runId: string): RoutineRunStatus | undefined {
+    return this.runs.find((run) => run.id === runId)?.status;
   }
 
   activeWebhookRunCount(webhookId: string): number {
@@ -1090,6 +1245,7 @@ export class RoutineManager {
   }
 
   cancelQueuedWebhook(webhookId: string, message: string): void {
+    if (this.passive) return;
     let changed = false;
     for (const run of this.runs) {
       if (run.webhookId !== webhookId || run.status !== "queued") continue;
@@ -1103,6 +1259,7 @@ export class RoutineManager {
   }
 
   async cancelRun(id: string): Promise<RoutineRun | null> {
+    if (this.passive) return null;
     let run = this.runs.find((r) => r.id === id);
     if (run?.coalescedInto) run = this.runs.find((r) => r.id === run!.coalescedInto);
     if (!run || !["queued", "running", "waiting"].includes(run.status)) return null;
@@ -1114,13 +1271,14 @@ export class RoutineManager {
     this.emitRun(run);
     // The later turn.completed cannot close the check-in: handleRuntimeEvent
     // only matches running/waiting runs, and this one is now cancelled.
-    if (run.sentryCheckInId) this.options.checkInFinish?.(run, run.sentryCheckInId, false);
+    if (run.sentryCheckInId) this.closeCheckIn(run, run.sentryCheckInId, false);
     if (run.threadId) await this.options.interruptTurn?.(run.botId, run.threadId, normalizeRunOn(run.runOn)).catch(() => {});
     queueMicrotask(() => void this.tick());
     return { ...run };
   }
 
   markSeen(id: string): RoutineRun | null {
+    if (this.passive) return null;
     const run = this.runs.find((r) => r.id === id);
     if (!run) return null;
     if (!run.seenAt) {
@@ -1148,7 +1306,8 @@ export class RoutineManager {
    *  `webhookId`, so without the source a webhook and a resource trigger
    *  sharing an id would each clear the other's badge.  A scheduled routine
    *  has no `webhookId`, so a trigger sweep never touches one by accident. */
-  markAllSeen(filter: { triggerId?: string; triggerSource?: RoutineRunTrigger } = {}): { acknowledged: number; runs: RoutineRun[] } {
+  markAllSeen(filter: { triggerId?: string; triggerSource?: RoutineRunTrigger } = {}): SeenRunsResult {
+    if (this.passive) return { acknowledged: 0, runs: [] };
     const seenAt = this.now();
     const acknowledged: RoutineRun[] = [];
     for (const run of this.runs) {
@@ -1166,6 +1325,7 @@ export class RoutineManager {
   }
 
   start() {
+    if (this.passive) return;
     if (this.timer) return;
     void this.tick();
     this.timer = setInterval(() => void this.tick(), 10_000);
@@ -1203,6 +1363,7 @@ export class RoutineManager {
   }
 
   async tick(): Promise<void> {
+    if (this.passive) return;
     if (this.options.admit?.() === false) return;
     if (this.ticking) return;
     this.ticking = true;
@@ -1220,13 +1381,17 @@ export class RoutineManager {
           // The schedule still advances (below), so turning the bot back on
           // resumes at the next occurrence instead of replaying the backlog.
           // The run is recorded as skipped with its reason; it is not
-          // `missed`, which would count as needing attention.
+          // `missed`, which would count as needing attention.  Sentry has no
+          // skipped status, so the pause is reported explicitly: the check-in
+          // opens and closes non-ok (never `ok` for work that never ran, per
+          // BF-2476), because emitting nothing would let Sentry synthesize a
+          // `missed` check-in at the deadline with no context.  The run
+          // record itself, with outcomeCode `bot_off`, is the
+          // deliberate-pause signal.
           const skipped = this.newRun(routine, scheduledFor, false);
           this.skipForOff(skipped);
-          if (routine.schedule.type === "daily") {
-            const checkInId = this.options.checkInStart?.(skipped, routine);
-            if (checkInId) this.options.checkInFinish?.(skipped, checkInId, true);
-          }
+          skipped.sentryCheckInId = this.options.checkInStart?.(skipped, routine);
+          if (skipped.sentryCheckInId) this.closeCheckIn(skipped, skipped.sentryCheckInId, false);
         } else if (snoozed) {
           const skipped = this.newRun(routine, scheduledFor, false);
           skipped.status = "missed";
@@ -1234,11 +1399,13 @@ export class RoutineManager {
           skipped.error = botAutomationsPausedMessage();
           skipped.outcomeCode = "bot_stopped";
           skipped.failurePhase = "lifecycle";
+          skipped.sentryCheckInId = this.options.checkInStart?.(skipped, routine);
           this.emitRun(skipped);
-          if (routine.schedule.type === "daily") {
-            const checkInId = this.options.checkInStart?.(skipped, routine);
-            if (checkInId) this.options.checkInFinish?.(skipped, checkInId, true);
-          }
+          // Same explicit-pause reporting as above (BF-2476): a stopped bot
+          // is a deliberate pause, not a success — the check-in opens and
+          // closes non-ok, because the only statuses Sentry offers are `ok`
+          // and `error` and emitting nothing would synthesize `missed`.
+          if (skipped.sentryCheckInId) this.closeCheckIn(skipped, skipped.sentryCheckInId, false);
         } else if (late > CATCH_UP_MS) {
           const missed = this.newRun(routine, scheduledFor, false);
           missed.status = "missed";
@@ -1434,6 +1601,11 @@ export class RoutineManager {
             }
           }
         }
+        const incapable = this.options.incapableRun?.(run);
+        if (incapable) {
+          this.skipIncapable(run, incapable.reason);
+          continue;
+        }
         // Gate before creating, activating, or stamping a task.  A missing
         // runtime credential may take many scheduler ticks to arrive; those
         // retries must not mint duplicate empty tasks as a side effect.
@@ -1510,6 +1682,7 @@ export class RoutineManager {
         ) {
           this.options.activateTask?.(run.botId, ownerThreadId);
         }
+        const hotSince = run.hotDeferredAt ?? run.createdAt;
         run.threadId = threadId;
         run.startedAt = this.now();
         run.status = "running";
@@ -1517,7 +1690,6 @@ export class RoutineManager {
         run.hotDeferredAt = undefined;
         this.publishedHoldBuckets.delete(run.id);
         if (hotDeferExpiredReason) {
-          const hotSince = run.hotDeferredAt ?? run.createdAt;
           const waitedMin = Math.max(0, Math.round((this.now() - hotSince) / 60_000));
           this.writeLog(
             `[routines] webhook "${run.routineName}" (${run.id}) waited ${waitedMin} min for a busy host and is dispatching anyway.  ${hotDeferExpiredReason}`,
@@ -1617,7 +1789,21 @@ export class RoutineManager {
   }
 
   handleRuntimeEvent(event: RuntimeEvent, opts?: { fallingOver?: boolean }): RoutineRun | null {
-    const run = this.runs.find((r) => !r.coalescedInto && r.threadId === event.threadId && ["running", "waiting"].includes(r.status));
+    if (this.passive) return null;
+    if (
+      event.type !== "session.started" &&
+      event.type !== "request.opened" &&
+      event.type !== "request.resolved" &&
+      event.type !== "runtime.error" &&
+      event.type !== "turn.retrying" &&
+      event.type !== "turn.completed" &&
+      !(event.type === "item.completed" && event.itemType === "assistant_text")
+    ) {
+      return null;
+    }
+    const run = this.runs.find(
+      (r) => !r.coalescedInto && r.threadId === event.threadId && (r.status === "running" || r.status === "waiting"),
+    );
     if (!run) return null;
     run.engineId = event.providerInstanceId ?? event.provider;
     run.driver = event.provider;
@@ -1661,7 +1847,7 @@ export class RoutineManager {
         // A cancelled scheduled run did not complete, so Sentry sees it the
         // same as an error — that is what lets an owner ask "did today's
         // Housekeeper run actually happen" and get a real answer.
-        if (run.sentryCheckInId) this.options.checkInFinish?.(run, run.sentryCheckInId, false);
+        if (run.sentryCheckInId) this.closeCheckIn(run, run.sentryCheckInId, false);
       } else if (!event.ok) {
         this.failRun(run, reason ?? "The bot did not complete this run", code);
         if (run.ownerThreadId && run.threadId) {
@@ -1683,7 +1869,7 @@ export class RoutineManager {
         run.setupFailed = false;
         run.finishedAt = this.now();
         run.error = undefined;
-        if (run.sentryCheckInId) this.options.checkInFinish?.(run, run.sentryCheckInId, true);
+        if (run.sentryCheckInId) this.closeCheckIn(run, run.sentryCheckInId, true);
       }
       if (run.ownerThreadId && run.threadId && event.ok) {
         this.options.deliverEphemeralResult?.({
@@ -1705,7 +1891,10 @@ export class RoutineManager {
   }
 
   failThread(threadId: string, message: string, code = routineFailureCode(message)) {
-    const run = this.runs.find((r) => !r.coalescedInto && r.threadId === threadId && ["running", "waiting"].includes(r.status));
+    if (this.passive) return;
+    const run = this.runs.find(
+      (r) => !r.coalescedInto && r.threadId === threadId && (r.status === "running" || r.status === "waiting"),
+    );
     if (!run) return;
     this.failRun(run, message, code);
     this.deliverEphemeralFailure(run, message);
@@ -1729,6 +1918,7 @@ export class RoutineManager {
    * gets a grace so the sweep never races the dispatch that marks the bot
    * busy. Returns the receipts it settled. */
   reconcileOrphanedRuns(now = this.now()): RoutineRun[] {
+    if (this.passive) return [];
     const live = this.options.turnLive;
     if (!live) return [];
     const orphaned: RoutineRun[] = [];
@@ -1816,6 +2006,17 @@ export class RoutineManager {
     if (emit) this.emitRun(run);
   }
 
+  /** Engine can never run this queued prompt — record and drop, do not hold. */
+  private skipIncapable(run: RoutineRun, reason: string, emit = true): void {
+    this.leaveQueued(run, "failed");
+    run.error = reason.slice(0, 500);
+    run.outcomeCode = "skipped_incapable";
+    run.failurePhase = "dispatch";
+    run.finishedAt = this.now();
+    if (emit) this.emitRun(run);
+    this.save();
+  }
+
   /** Whether the bot this run targets is switched Off. */
   private botIsOff(botId: string): boolean {
     return this.options.botState(botId) === "off";
@@ -1825,6 +2026,7 @@ export class RoutineManager {
    *  Running and waiting receipts are left alone: a turn that has started
    *  finishes.  Returns the receipts it settled. */
   skipQueuedRunsForBot(botId: string): RoutineRun[] {
+    if (this.passive) return [];
     const skipped: RoutineRun[] = [];
     for (const run of this.runs) {
       if (run.botId !== botId || run.status !== "queued") continue;
@@ -1846,10 +2048,39 @@ export class RoutineManager {
     // any run that never opened a check-in (nothing was running yet, or it
     // was not a "schedule" trigger) leaves sentryCheckInId unset and this
     // is a no-op.
-    if (run.sentryCheckInId) this.options.checkInFinish?.(run, run.sentryCheckInId, false);
+    if (run.sentryCheckInId) this.closeCheckIn(run, run.sentryCheckInId, false);
     this.save();
     this.emitRun(run);
     this.options.onRunFailed?.({ ...run });
+  }
+
+  private closeCheckIn(run: RoutineRun, checkInId: string, ok: boolean): void {
+    const canonical = this.runs.find((r) => r.id === run.id) ?? run;
+    canonical.pendingClose = {
+      status: ok ? "ok" : "error",
+      attempts: canonical.pendingClose?.attempts ?? 0,
+      checkInId,
+    };
+    if (run !== canonical) {
+      run.pendingClose = canonical.pendingClose;
+    }
+    this.save();
+    this.flushNow();
+    this.options.checkInFinish?.(canonical, checkInId, ok, (delivered) => {
+      this.onCheckInSettled(canonical.id, delivered);
+    });
+  }
+
+  private onCheckInSettled(runId: string, delivered: boolean): void {
+    const run = this.runs.find((r) => r.id === runId);
+    if (!run?.pendingClose) return;
+    if (delivered) {
+      delete run.pendingClose;
+      this.save();
+    } else {
+      run.pendingClose.attempts = (run.pendingClose.attempts ?? 0) + 1;
+      this.save();
+    }
   }
 
   private initialOccurrence(schedule: RoutineSchedule, now: number): number | null {
@@ -1966,6 +2197,7 @@ export class RoutineManager {
    * nothing left to catch it.
    */
   private commitMutation(mutate: () => void): void {
+    if (this.passive) throw new Error("Routine manager is passive during placement rollback");
     const before = {
       routines: this.routines.map((routine) => ({ ...routine, schedule: { ...routine.schedule } })),
       runs: this.runs.map((run) => ({ ...run, denials: run.denials ? [...run.denials] : undefined })),
@@ -2023,6 +2255,7 @@ export class RoutineManager {
    * coalesced save is never lost when the process exits. A no-op when
    * nothing is dirty. */
   flushNow(): void {
+    if (this.passive) return;
     if (this.saveTimer) {
       clearTimeout(this.saveTimer);
       this.saveTimer = null;

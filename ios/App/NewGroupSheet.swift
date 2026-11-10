@@ -61,8 +61,7 @@ struct NewGroupSheet: View {
                             }
                         } label: {
                             HStack(spacing: 12) {
-                                BotAvatarView(bot: bot, size: 36, state: .idle, animated: false)
-                                    .providerBadge(for: bot, avatarSize: 36)
+                                BotAvatarWithProviderBadge(bot: bot, size: 36, state: .idle, animated: false)
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(bot.name).font(.system(size: 16, weight: .semibold)).foregroundStyle(Color.primary)
                                     if !bot.title.isEmpty {

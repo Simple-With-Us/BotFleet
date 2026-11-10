@@ -4,7 +4,7 @@ import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { RuntimeEvent, TurnToolHost } from "../contracts.ts";
+import type { RuntimeEvent, SendTurnInput, TurnToolHost } from "../contracts.ts";
 import { recordEvents } from "../testing/events.ts";
 import { startFakeOpenAiServer } from "../testing/fake-openai-server.ts";
 import { observeRuntimeEvent, resetSentryAiForTests, type SentryAiSink } from "../sentry-ai.ts";
@@ -15,7 +15,9 @@ import {
   isPricedMinimaxEndpoint,
   loadLocalMiniMaxConfig,
   MinimaxDriver,
+  minimaxWindowTokens,
   MINIMAX_PRICE_PER_MILLION,
+  type MinimaxConfig,
 } from "./minimax.ts";
 
 /** M3.1's reasoning-effort levels, as MiniMax's OpenAI-compatible API takes
@@ -110,15 +112,25 @@ describe("MinimaxDriver", () => {
 
   it("offers only current official text models", () => {
     expect(MinimaxDriver.models).toEqual({
-      default: "MiniMax-M3.1-Flash-Preview",
+      default: "MiniMax-M3.1-Flash",
       options: [
         {
-          id: "MiniMax-M3.1-Flash-Preview",
-          label: "MiniMax M3.1 Flash Preview",
+          id: "MiniMax-M3.1-Flash",
+          label: "MiniMax M3.1 Flash (512K)",
+          contextWindow: 524_288,
+          effortLevels: M31_LEVELS,
+          defaultEffort: "max",
+          supportsMaxOutput: true,
+        },
+        {
+          id: "MiniMax-M3.1-Flash-1M",
+          label: "MiniMax M3.1 Flash (1M)",
           contextWindow: 1_000_000,
           effortLevels: M31_LEVELS,
+          defaultEffort: "max",
+          supportsMaxOutput: true,
         },
-        { id: "MiniMax-M2.7-highspeed", label: "MiniMax M2.7 Highspeed", contextWindow: 204_800, effortLevels: [] },
+        { id: "MiniMax-M2.7-highspeed", label: "MiniMax M2.7 Highspeed", contextWindow: 204_800, effortLevels: [], supportsMaxOutput: true },
       ],
     });
     // The retired MiniMax-M3 is neither offered nor priced: it is out of the
@@ -594,7 +606,16 @@ describe("MinimaxDriver", () => {
 
   it("refreshModels replaces the static catalog from GET /models, off the same fetch snapshot() uses", async () => {
     const fetchMock = vi.fn(async () => new Response(
-      JSON.stringify({ data: [{ id: "MiniMax-M3.1-Flash-Preview" }, { id: "MiniMax-Next" }, { id: "MiniMax-M3" }, { id: "MiniMax-M2.7" }] }),
+      JSON.stringify({
+        data: [
+          { id: "MiniMax-M3.1-Flash" },
+          { id: "MiniMax-Next" },
+          { id: "MiniMax-M3" },
+          { id: "MiniMax-M2.7" },
+          { id: "MiniMax-M3.1-Flash-Preview" },
+          { id: "MiniMax-M3.1-Flash-Preview-1M" },
+        ],
+      }),
       { status: 200, headers: { "content-type": "application/json" } },
     ));
     vi.stubGlobal("fetch", fetchMock);
@@ -607,9 +628,14 @@ describe("MinimaxDriver", () => {
     });
 
     await instance.refreshModels?.();
-    expect(instance.models.options.map((o) => o.id)).toEqual(["MiniMax-M3.1-Flash-Preview", "MiniMax-Next"]);
+    expect(instance.models.options.map((o) => o.id)).toEqual([
+      "MiniMax-M3.1-Flash",
+      "MiniMax-M3.1-Flash-1M",
+      "MiniMax-Next",
+    ]);
     // a model already in the static catalog keeps its hand-written label
-    expect(instance.models.options.find((o) => o.id === "MiniMax-M3.1-Flash-Preview")?.label).toBe("MiniMax M3.1 Flash Preview");
+    expect(instance.models.options.find((o) => o.id === "MiniMax-M3.1-Flash")?.label).toBe("MiniMax M3.1 Flash (512K)");
+    expect(instance.models.options.find((o) => o.id === "MiniMax-M3.1-Flash-1M")?.label).toBe("MiniMax M3.1 Flash (1M)");
     // a genuinely new model gets its id as the label rather than nothing
     expect(instance.models.options.find((o) => o.id === "MiniMax-Next")?.label).toBe("MiniMax-Next");
     // a retired id the API still serves does not reappear at all: a live
@@ -617,6 +643,11 @@ describe("MinimaxDriver", () => {
     // the picker keeps latest-per-class only.
     expect(instance.models.options.some((o) => o.id === "MiniMax-M3")).toBe(false);
     expect(instance.models.options.some((o) => o.id === "MiniMax-M2.7")).toBe(false);
+    // The API keeps serving the retired M3.1 Flash spellings too, so the
+    // filter has to drop them or a live list re-inflates a dead row next to
+    // its live replacement.
+    expect(instance.models.options.some((o) => o.id === "MiniMax-M3.1-Flash-Preview")).toBe(false);
+    expect(instance.models.options.some((o) => o.id === "MiniMax-M3.1-Flash-Preview-1M")).toBe(false);
 
     // one call already spent by refreshModels; snapshot() reuses the cached
     // probe rather than firing a second GET /models
@@ -637,15 +668,25 @@ describe("MinimaxDriver", () => {
 
     await instance.refreshModels?.();
     expect(instance.models).toEqual({
-      default: "MiniMax-M3.1-Flash-Preview",
+      default: "MiniMax-M3.1-Flash",
       options: [
         {
-          id: "MiniMax-M3.1-Flash-Preview",
-          label: "MiniMax M3.1 Flash Preview",
+          id: "MiniMax-M3.1-Flash",
+          label: "MiniMax M3.1 Flash (512K)",
+          contextWindow: 524_288,
+          effortLevels: M31_LEVELS,
+          defaultEffort: "max",
+          supportsMaxOutput: true,
+        },
+        {
+          id: "MiniMax-M3.1-Flash-1M",
+          label: "MiniMax M3.1 Flash (1M)",
           contextWindow: 1_000_000,
           effortLevels: M31_LEVELS,
+          defaultEffort: "max",
+          supportsMaxOutput: true,
         },
-        { id: "MiniMax-M2.7-highspeed", label: "MiniMax M2.7 Highspeed", contextWindow: 204_800, effortLevels: [] },
+        { id: "MiniMax-M2.7-highspeed", label: "MiniMax M2.7 Highspeed", contextWindow: 204_800, effortLevels: [], supportsMaxOutput: true },
       ],
     });
     await instance.dispose();
@@ -676,7 +717,7 @@ describe("MinimaxDriver", () => {
     const body = JSON.parse(String(request?.body));
 
     expect(body).toMatchObject({
-      model: "MiniMax-M3.1-Flash-Preview",
+      model: "MiniMax-M3.1-Flash",
       stream: true,
       reasoning_split: true,
       stream_options: { include_usage: true },
@@ -685,6 +726,196 @@ describe("MinimaxDriver", () => {
     expect(completed).toMatchObject({ ok: true, usage: { input: 12, output: 3 } });
     recorder.stop();
     await instance.dispose();
+  });
+
+  describe("prompt budget", () => {
+    const stable = `STABLE ${"s ".repeat(20)}`;
+    const old = `MEMORY-BLOCK ${"m ".repeat(600)}`;
+    const keep = "MENTION-KEPT";
+    const turnWith = (extra: Partial<SendTurnInput> = {}) => ({
+      threadId: "thread-budget",
+      text: "CURRENT",
+      system: stable + old + keep,
+      systemStable: stable,
+      systemVolatile: old + keep,
+      systemSections: [
+        { id: "persona", text: stable, volatile: false },
+        { id: "memory", text: old, volatile: true },
+        { id: "mentions", text: keep, volatile: true },
+      ],
+      ...extra,
+    });
+    const make = async (config: Partial<MinimaxConfig>, bodies: Array<{ messages: Array<{ role: string; content: string }> }>) => {
+      vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+        bodies.push(JSON.parse(String(init?.body)));
+        return sse('{"choices":[{"delta":{"content":"ok"}}]}');
+      }));
+      return MinimaxDriver.create({
+        instanceId: "minimax-budget",
+        displayName: "MiniMax",
+        enabled: true,
+        config: decodeMinimaxConfig(config),
+        environment: { MINIMAX_API_KEY: "secret" },
+      });
+    };
+
+    it("sends the prompt untouched when it fits, and emits no Compressing Context row", async () => {
+      const bodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+      const instance = await make({}, bodies);
+      const recorder = recordEvents(instance.adapter);
+      await instance.adapter.sendTurn(turnWith());
+      await recorder.until((event) => event.type === "turn.completed");
+      expect(bodies[0].messages[0].content).toBe(stable);
+      expect(recorder.events.some((e) => e.type === "context.injected" && e.source === "compression")).toBe(false);
+      recorder.stop();
+      await instance.dispose();
+    });
+
+    it("with no config, does not trim at 128 KiB: the budget is the model's 1M window", async () => {
+      const bodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+      const instance = await make({}, bodies);
+      const recorder = recordEvents(instance.adapter);
+      const huge = `HUGE-MEMORY ${"x".repeat(300 * 1024)}`;
+      await instance.adapter.sendTurn(turnWith({
+        system: stable + huge + keep,
+        systemVolatile: huge + keep,
+        systemSections: [
+          { id: "persona", text: stable, volatile: false },
+          { id: "memory", text: huge, volatile: true },
+          { id: "mentions", text: keep, volatile: true },
+        ],
+      }));
+      await recorder.until((event) => event.type === "turn.completed");
+      expect(JSON.stringify(bodies[0].messages)).toContain("HUGE-MEMORY");
+      expect(recorder.events.some((e) => e.type === "context.injected" && e.source === "compression")).toBe(false);
+      recorder.stop();
+      await instance.dispose();
+    });
+
+    it("trims the volatile sections past promptBudgetBytes and emits the row", async () => {
+      const bodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+      const instance = await make({ promptBudgetBytes: 512 }, bodies);
+      const recorder = recordEvents(instance.adapter);
+      const compressed: Array<{ id: string; source: string; preview: string; bytes: number }> = [];
+      await instance.adapter.sendTurn(turnWith({ onContextCompressed: (ref) => void compressed.push(ref) }));
+      await recorder.until((event) => event.type === "turn.completed");
+      const sent = JSON.stringify(bodies[0].messages);
+      expect(sent).not.toContain("MEMORY-BLOCK");
+      expect(sent).toContain(keep);
+      expect(bodies[0].messages.at(-1)).toMatchObject({ role: "user", content: "CURRENT" });
+      const row = recorder.events.find((e) => e.type === "context.injected" && e.source === "compression");
+      expect(row).toBeDefined();
+      // the harness hears the same row once, to hang it under the turn's message
+      expect(compressed).toHaveLength(1);
+      expect(compressed[0]).toMatchObject({ source: "compression", id: row && "itemId" in row ? row.itemId : undefined });
+      recorder.stop();
+      await instance.dispose();
+    });
+
+    it("counts the volatile-context framing the request carries, so a prompt that only fits unframed still trims", async () => {
+      const composedBytes = Buffer.byteLength(`${stable + old + keep}\n\nCURRENT`);
+      // just over the composed prompt: it fits as composed, but the request also
+      // carries the framed context note (about a hundred bytes), which does not
+      const tight: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+      const tightInstance = await make({ promptBudgetBytes: composedBytes + 10 }, tight);
+      const tightRecorder = recordEvents(tightInstance.adapter);
+      await tightInstance.adapter.sendTurn(turnWith());
+      await tightRecorder.until((event) => event.type === "turn.completed");
+      expect(JSON.stringify(tight[0].messages)).not.toContain("MEMORY-BLOCK");
+      expect(tightRecorder.events.some((e) => e.type === "context.injected" && e.source === "compression")).toBe(true);
+      tightRecorder.stop();
+      await tightInstance.dispose();
+      // with room for the framing the same turn is sent whole
+      const roomy: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+      const roomyInstance = await make({ promptBudgetBytes: composedBytes + 400 }, roomy);
+      const roomyRecorder = recordEvents(roomyInstance.adapter);
+      await roomyInstance.adapter.sendTurn(turnWith());
+      await roomyRecorder.until((event) => event.type === "turn.completed");
+      expect(JSON.stringify(roomy[0].messages)).toContain("MEMORY-BLOCK");
+      expect(roomyRecorder.events.some((e) => e.type === "context.injected" && e.source === "compression")).toBe(false);
+      roomyRecorder.stop();
+      await roomyInstance.dispose();
+    });
+
+    it("frees the thread after a refused turn, so the next turn on it is not 'already running'", async () => {
+      const bodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+      const instance = await make({ promptBudgetBytes: 64 }, bodies);
+      const recorder = recordEvents(instance.adapter);
+      const big = `STABLE ${"s ".repeat(400)}`;
+      await expect(
+        instance.adapter.sendTurn(turnWith({
+          system: big + old + keep,
+          systemStable: big,
+          systemSections: [
+            { id: "persona", text: big, volatile: false },
+            { id: "memory", text: old, volatile: true },
+            { id: "mentions", text: keep, volatile: true },
+          ],
+        })),
+      ).rejects.toThrow(/not sent/);
+      expect(bodies).toHaveLength(0);
+      // same thread, now a prompt with no system block, which no budget applies to
+      await instance.adapter.sendTurn({ threadId: "thread-budget", text: "again" });
+      await recorder.until((event) => event.type === "turn.completed");
+      expect(bodies).toHaveLength(1);
+      recorder.stop();
+      await instance.dispose();
+    });
+
+    it("trims from a contextCapTokens cap alone", async () => {
+      const bodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+      const instance = await make({ contextCapTokens: 200 }, bodies);
+      const recorder = recordEvents(instance.adapter);
+      await instance.adapter.sendTurn(turnWith());
+      await recorder.until((event) => event.type === "turn.completed");
+      expect(JSON.stringify(bodies[0].messages)).not.toContain("MEMORY-BLOCK");
+      recorder.stop();
+      await instance.dispose();
+    });
+
+    it("a turn's contextCapTokens (the bot's picked cap) sizes the budget", async () => {
+      const bodies: Array<{ messages: Array<{ role: string; content: string }>; max_completion_tokens?: number }> = [];
+      const instance = await make({}, bodies);
+      const recorder = recordEvents(instance.adapter);
+      await instance.adapter.sendTurn(turnWith({ contextCapTokens: 200 }));
+      await recorder.until((event) => event.type === "turn.completed");
+      expect(JSON.stringify(bodies[0].messages)).not.toContain("MEMORY-BLOCK");
+      recorder.stop();
+      await instance.dispose();
+    });
+
+    it("sends max_completion_tokens only when the bot set an output limit", async () => {
+      const bodies: Array<{ messages: Array<{ role: string; content: string }>; max_completion_tokens?: number }> = [];
+      const instance = await make({}, bodies);
+      const recorder = recordEvents(instance.adapter);
+      await instance.adapter.sendTurn(turnWith());
+      await recorder.until((event) => event.type === "turn.completed");
+      expect("max_completion_tokens" in bodies[0]).toBe(false);
+      await instance.adapter.sendTurn(turnWith({ threadId: "thread-max", maxOutputTokens: 8192 }));
+      await recorder.until((event) => event.type === "turn.completed" && event.threadId === "thread-max");
+      expect(bodies[1].max_completion_tokens).toBe(8192);
+      recorder.stop();
+      await instance.dispose();
+    });
+
+    it("refuses a turn whose protected text is past the hard ceiling, without calling the API", async () => {
+      const bodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+      const instance = await make({ promptBudgetBytes: 64 }, bodies);
+      const big = `STABLE ${"s ".repeat(400)}`;
+      await expect(
+        instance.adapter.sendTurn(turnWith({
+          system: big + old + keep,
+          systemStable: big,
+          systemSections: [
+            { id: "persona", text: big, volatile: false },
+            { id: "memory", text: old, volatile: true },
+            { id: "mentions", text: keep, volatile: true },
+          ],
+        })),
+      ).rejects.toThrow(/not sent/);
+      expect(bodies).toHaveLength(0);
+      await instance.dispose();
+    });
   });
 
   // Coverage for PR 625 (unattended turns get the 900s wall-clock budget as
@@ -1529,7 +1760,7 @@ describe("MinimaxDriver", () => {
     }
   });
 
-  it("prices a settled turn from its real usage, at the M3.1 Flash Preview ≤512K-token rate", async () => {
+  it("prices a settled turn from its real usage, at the M3.1 Flash ≤512K-token rate", async () => {
     vi.stubGlobal("fetch", vi.fn(async () =>
       sse(
         '{"choices":[{"delta":{"content":"here you go"}}]}',
@@ -1552,7 +1783,7 @@ describe("MinimaxDriver", () => {
     // (100,000 @ $0.30/M) + (50,000 @ $1.20/M) = $0.03 + $0.06 = $0.09
     expect(costOf(completed)).toBeCloseTo(0.09, 10);
     expect(costOf(completed)).toBe(
-      costUsd({ input: 100_000, output: 50_000 }, MINIMAX_PRICE_PER_MILLION, "MiniMax-M3.1-Flash-Preview"),
+      costUsd({ input: 100_000, output: 50_000 }, MINIMAX_PRICE_PER_MILLION, "MiniMax-M3.1-Flash"),
     );
     recorder.stop();
     await instance.dispose();
@@ -1640,7 +1871,7 @@ describe("MinimaxDriver", () => {
     // TOOL_CALL_ROUND's own usage: prompt_tokens: 10, completion_tokens: 5
     expect(completed).toMatchObject({ ok: false, stopReason: "error", usage: { input: 10, output: 5 } });
     expect(costOf(completed)).toBeCloseTo(
-      costUsd({ input: 10, output: 5 }, MINIMAX_PRICE_PER_MILLION, "MiniMax-M3.1-Flash-Preview")!,
+      costUsd({ input: 10, output: 5 }, MINIMAX_PRICE_PER_MILLION, "MiniMax-M3.1-Flash")!,
       12,
     );
     recorder.stop();
@@ -1927,7 +2158,7 @@ describe("MinimaxDriver", () => {
       const completed = await runTurn(instance, {
         threadId: "thread",
         text: "hi",
-        model: "MiniMax-M3.1-Flash-Preview",
+        model: "MiniMax-M3.1-Flash",
         effort: "xhigh",
       });
 
@@ -1953,7 +2184,7 @@ describe("MinimaxDriver", () => {
       const completed = await runTurn(instance, {
         threadId: "thread",
         text: "who is around?",
-        model: "MiniMax-M3.1-Flash-Preview",
+        model: "MiniMax-M3.1-Flash",
         effort: "xhigh",
         tools: [{ name: "list_bots" }, { name: "ask_bot" }],
         toolHost: answeringHost,
@@ -1969,7 +2200,7 @@ describe("MinimaxDriver", () => {
       const bodies = stubChat();
       const instance = await createInstance("minimax-effort-default");
 
-      await runTurn(instance, { threadId: "thread", text: "hi", model: "MiniMax-M3.1-Flash-Preview" });
+      await runTurn(instance, { threadId: "thread", text: "hi", model: "MiniMax-M3.1-Flash" });
 
       expect(bodies[0]).not.toHaveProperty("reasoning_effort");
       await instance.dispose();
@@ -1981,7 +2212,7 @@ describe("MinimaxDriver", () => {
 
       await runTurn(instance, { threadId: "thread", text: "hi" });
 
-      expect(bodies[0].model).toBe("MiniMax-M3.1-Flash-Preview");
+      expect(bodies[0].model).toBe("MiniMax-M3.1-Flash");
       expect(bodies[0]).not.toHaveProperty("reasoning_effort");
       await instance.dispose();
     });
@@ -1992,7 +2223,7 @@ describe("MinimaxDriver", () => {
 
       await runTurn(instance, { threadId: "thread", text: "hi", effort: "low" });
 
-      expect(bodies[0].model).toBe("MiniMax-M3.1-Flash-Preview");
+      expect(bodies[0].model).toBe("MiniMax-M3.1-Flash");
       expect(bodies[0].reasoning_effort).toBe("low");
       await instance.dispose();
     });
@@ -2012,7 +2243,7 @@ describe("MinimaxDriver", () => {
       const bodies = stubChat();
       const instance = await createInstance("minimax-effort-none");
 
-      await runTurn(instance, { threadId: "thread", text: "hi", model: "MiniMax-M3.1-Flash-Preview", effort: "none" });
+      await runTurn(instance, { threadId: "thread", text: "hi", model: "MiniMax-M3.1-Flash", effort: "none" });
 
       expect(bodies[0]).not.toHaveProperty("reasoning_effort");
       expect(bodies[0]).not.toHaveProperty("thinking");
@@ -2039,7 +2270,7 @@ describe("MinimaxDriver", () => {
 
     it("keeps M3.1's levels through refreshModels and gives an id it has never seen none", async () => {
       vi.stubGlobal("fetch", vi.fn(async () => new Response(
-        JSON.stringify({ data: [{ id: "MiniMax-M3.1-Flash-Preview" }, { id: "MiniMax-Next" }] }),
+        JSON.stringify({ data: [{ id: "MiniMax-M3.1-Flash" }, { id: "MiniMax-Next" }] }),
         { status: 200, headers: { "content-type": "application/json" } },
       )));
       const instance = await createInstance("minimax-effort-refresh");
@@ -2047,7 +2278,7 @@ describe("MinimaxDriver", () => {
       await instance.refreshModels?.();
 
       const byId = new Map(instance.models.options.map((option) => [option.id, option]));
-      expect(byId.get("MiniMax-M3.1-Flash-Preview")?.effortLevels).toEqual(M31_LEVELS);
+      expect(byId.get("MiniMax-M3.1-Flash")?.effortLevels).toEqual(M31_LEVELS);
       // MiniMax documents reasoning_effort as M3.1-only, so a newly listed id
       // must not inherit the engine-wide list.
       expect(byId.get("MiniMax-Next")?.effortLevels).toEqual([]);
@@ -2085,5 +2316,26 @@ describe("MinimaxDriver", () => {
       expect(instance.adapter.capabilities?.effortLevels).toEqual(M31_LEVELS);
       await instance.dispose();
     });
+  });
+});
+
+describe("minimaxWindowTokens", () => {
+  // The catalog row's own cap is the budget source (Kody review, PR #1283):
+  // the 512K Flash row is a deliberate billing-tier cap, and the shared
+  // table's published 1M would push those turns into the higher input tier.
+  const options = [
+    { id: "MiniMax-M3.1-Flash", label: "MiniMax M3.1 Flash (512K)", contextWindow: 524_288 },
+    { id: "MiniMax-M3.1-Flash-1M", label: "MiniMax M3.1 Flash (1M)", contextWindow: 1_000_000 },
+  ];
+
+  it("prefers the catalog row's own cap over the shared published table", () => {
+    expect(minimaxWindowTokens("MiniMax-M3.1-Flash", options)).toBe(524_288);
+    expect(minimaxWindowTokens("MiniMax-M3.1-Flash-1M", options)).toBe(1_000_000);
+  });
+
+  it("falls back to the shared table for an id the catalog does not carry, and stays undefined for an unknown one", () => {
+    expect(minimaxWindowTokens("MiniMax-M2.7", options)).toBe(204_800);
+    expect(minimaxWindowTokens("some-other-model", options)).toBeUndefined();
+    expect(minimaxWindowTokens(undefined, options)).toBeUndefined();
   });
 });

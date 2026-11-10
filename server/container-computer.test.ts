@@ -45,9 +45,11 @@ import {
   boxGatewayUrl,
   computerProxyEnv,
   containerComputerAction,
+  createStoppedSharedLocalVm,
   containerComputerMcp,
   containerComputerScreenshot,
   containerComputerStatus,
+  containerProbeContext,
   wakeContainerComputer,
   containerNetworkArgs,
   containerRuntimeStatus,
@@ -96,6 +98,16 @@ function runner(responses: Record<string, string | Error>) {
     return { stdout: response };
   };
   return { calls, run };
+}
+
+/** The answers a fake runner serves, keyed by the exact command line.
+ *
+ *  A named contract rather than a bare `Record<string, ...>`: the lint
+ *  ratchet treats an open dictionary annotation on a binding as throwing
+ *  away known type evidence, and a named owner keeps the index signature
+ *  while saying what the map holds. */
+interface ProbeResponses {
+  [command: string]: string | Error;
 }
 
 const DOCKER_PROBE = "docker info --format {{.ServerVersion}}";
@@ -997,6 +1009,69 @@ describe("containerComputerAction", () => {
     await expect(containerComputerAction("start", fake.run, "linux")).rejects.toThrow("cannot safely resume");
     expect(fake.calls).not.toContain(`docker start ${CONTAINER}`);
   });
+
+  it("starts only a never-started managed desktop with verified safety fields", async () => {
+    let started = false;
+    const calls: string[] = [];
+    const fake: CommandRunner = async (command, args) => {
+      const key = [command, ...args].join(" ");
+      calls.push(key);
+      if (key === "/usr/bin/which docker") return { stdout: "docker\n" };
+      if (key === "/usr/bin/which podman") throw new Error("missing");
+      if (key === "docker info --format {{.ServerVersion}}") return { stdout: "29\n" };
+      if (key === `docker image inspect ${IMAGE}`) return { stdout: preparedImageInspect() };
+      if (key === `docker inspect ${CONTAINER}`) {
+        return { stdout: readyInspect({ State: started ? { Running: true } : { Running: false, Status: "created" } }) };
+      }
+      if (key === `docker start ${CONTAINER}`) {
+        started = true;
+        return { stdout: `${CONTAINER}\n` };
+      }
+      throw new Error(`fixture probe unavailable: ${key}`);
+    };
+    const created = await containerComputerStatus(fake, "linux");
+    expect(created).toMatchObject({ container: "created", imageMatches: true, managed: true,
+      network: "loopback", security: "hardened", persistence: "durable" });
+    await containerComputerAction("start", fake, "linux");
+    expect(calls).toContain(`docker start ${CONTAINER}`);
+    expect(calls.some((call) => call.startsWith("docker rm ") || call.startsWith("docker run "))).toBe(false);
+  });
+
+  it("provisions a fresh shared VM with Docker create only", async () => {
+    const commands: string[][] = [];
+    let failCreate = false;
+    const fake: CommandRunner = async (command, args) => {
+      commands.push([command, ...args]);
+      const key = [command, ...args].join(" ");
+      if (key === `docker image inspect --format {{json .Config.Labels}} ${IMAGE}`) return { stdout: JSON.stringify({
+        [MANAGED_LABEL]: "1", [DRIVER_LABEL]: CUA_DRIVER_VERSION,
+        [BASE_IMAGE_LABEL]: BASE_IMAGE_DIGEST, [IMAGE_LAYER_LABEL]: IMAGE_LAYER_VERSION,
+      }) };
+      if (key === "docker info --format {{.NCPU}} {{.MemTotal}}") return { stdout: "8 17179869184\n" };
+      if (key === "docker info --format {{.OperatingSystem}}") return { stdout: "OrbStack\n" };
+      if (args[0] === "create") {
+        if (failCreate) throw new Error(`Docker rejected ${args.join(" ")}`);
+        return { stdout: "new-container-id\n" };
+      }
+      throw new Error(`unexpected command: ${key}`);
+    };
+
+    await createStoppedSharedLocalVm(fake, "darwin");
+
+    const mutations = commands.filter((args) => ["create", "start", "run", "rm", "pull", "build"].includes(args[1] ?? ""));
+    expect(mutations).toHaveLength(1);
+    const create = mutations[0]!;
+    expect(create.slice(0, 2)).toEqual(["docker", "create"]);
+    expect(create).toContain(`${MANAGED_LABEL}=1`);
+    expect(create).toContain(`${TARGET_LABEL}=shared`);
+    expect(create).toContain(`type=bind,source=${VM_WORKSPACE_DIR},target=${VM_WORKSPACE_GUEST}`);
+    expect(create).toContain(IMAGE);
+    expect(create).not.toContain("-d");
+    failCreate = true;
+    await expect(createStoppedSharedLocalVm(fake, "darwin")).rejects.toThrow(
+      /^Docker could not create the stopped Local VM; check the local daemon and available resources$/,
+    );
+  });
 });
 
 // Regression, 2026-10-08.  On a Mac whose load average sat between 115 and 450,
@@ -1805,4 +1880,107 @@ describe("PATH driver symlink repair", () => {
     expect(dockerfile).not.toContain("ping '-V'");
   });
 
+});
+
+describe("shared container probe context", () => {
+  const sharedTargets = [
+    SHARED_LOCAL_VM_TARGET,
+    perBotLocalVmTarget("bot-a"),
+    perBotLocalVmTarget("bot-b"),
+  ];
+
+  /** A container that exists but is not running: enough for the detail read,
+   *  and it never reaches the CUA probes. */
+  function stoppedInspect(): string {
+    return JSON.stringify([
+      {
+        Config: { Image: IMAGE, Labels: {}, Env: [] },
+        State: { Running: false, Status: "exited" },
+        Image: "sha256:managed-image-id",
+        HostConfig: {},
+        Mounts: [],
+        NetworkSettings: {},
+      },
+    ]);
+  }
+
+  function probeResponses(): ProbeResponses {
+    const responses: ProbeResponses = {
+      "/usr/bin/which docker": "/usr/bin/docker\n",
+      "/usr/bin/which podman": new Error("missing"),
+      [DOCKER_PROBE]: "29.0.0\n",
+      [`docker image inspect ${IMAGE}`]: preparedImageInspect(),
+    };
+    for (const target of sharedTargets) {
+      responses[`docker inspect ${target.containerName}`] = stoppedInspect();
+    }
+    return responses;
+  }
+
+  it("probes the runtime and the image once for a whole list of targets", async () => {
+    const fake = runner(probeResponses());
+    const context = await containerProbeContext(fake.run, "linux");
+    await Promise.all(sharedTargets.map((target) =>
+      containerComputerStatus(fake.run, "linux", target, context)));
+
+    expect(fake.calls.filter((call) => call === DOCKER_PROBE)).toHaveLength(1);
+    expect(fake.calls.filter((call) => call === `docker image inspect ${IMAGE}`)).toHaveLength(1);
+    // One inspect per target, not two: the detail read reuses the first.
+    for (const target of sharedTargets) {
+      expect(fake.calls.filter((call) => call === `docker inspect ${target.containerName}`)).toHaveLength(1);
+    }
+  });
+
+  it("probes the runtime and the image once per target without a shared context", async () => {
+    const fake = runner(probeResponses());
+    for (const target of sharedTargets) {
+      await containerComputerStatus(fake.run, "linux", target);
+    }
+
+    expect(fake.calls.filter((call) => call === DOCKER_PROBE)).toHaveLength(sharedTargets.length);
+    expect(fake.calls.filter((call) => call === `docker image inspect ${IMAGE}`)).toHaveLength(sharedTargets.length);
+  });
+
+  it("reports the same state with a shared context as without one", async () => {
+    const withContext = runner(probeResponses());
+    const context = await containerProbeContext(withContext.run, "linux");
+    const alone = runner(probeResponses());
+
+    for (const target of sharedTargets) {
+      const shared = await containerComputerStatus(withContext.run, "linux", target, context);
+      const single = await containerComputerStatus(alone.run, "linux", target);
+      expect(shared).toEqual(single);
+    }
+  });
+
+  it("does not inspect the image when no runtime is usable", async () => {
+    const fake = runner({
+      "/usr/bin/which docker": new Error("missing"),
+      "/usr/bin/which podman": new Error("missing"),
+    });
+    const context = await containerProbeContext(fake.run, "linux");
+
+    expect(context.runtimeStatus.runtime).toBeNull();
+    expect(context.image).toEqual({ present: false, image_id: null });
+    expect(fake.calls.some((call) => call.includes("image inspect"))).toBe(false);
+
+    const status = await containerComputerStatus(fake.run, "linux", SHARED_LOCAL_VM_TARGET, context);
+    expect(status.image).toBe(false);
+    expect(status.problem).toMatch(/runtime/i);
+  });
+
+  it("still reports a missing image when the shared context found none", async () => {
+    const fake = runner({
+      "/usr/bin/which docker": "/usr/bin/docker\n",
+      "/usr/bin/which podman": new Error("missing"),
+      [DOCKER_PROBE]: "29.0.0\n",
+      [`docker image inspect ${IMAGE}`]: new Error("no such image"),
+    });
+    const context = await containerProbeContext(fake.run, "linux");
+
+    expect(context.image).toEqual({ present: false, image_id: null });
+    const status = await containerComputerStatus(fake.run, "linux", SHARED_LOCAL_VM_TARGET, context);
+    expect(status.image).toBe(false);
+    expect(status.problem).toMatch(/Prepare the CUA desktop image/);
+  });
 });

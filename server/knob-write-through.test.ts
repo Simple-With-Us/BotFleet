@@ -23,6 +23,10 @@ describe("patchChangesInfisicalConnection", () => {
   it("flags connection keys and ignores the refresh cadence", () => {
     expect(patchChangesInfisicalConnection({ infisical: { projectId: "abc" } })).toBe(true);
     expect(patchChangesInfisicalConnection({ infisical: { clientSecret: "x" } })).toBe(true);
+    expect(patchChangesInfisicalConnection({ infisical: { authMethod: "machine-identity" } })).toBe(true);
+    expect(patchChangesInfisicalConnection({ infisical: { token: "fake-read" } })).toBe(true);
+    expect(patchChangesInfisicalConnection({ infisical: { writeToken: "fake-write" } })).toBe(true);
+    expect(patchChangesInfisicalConnection({ infisical: { readSources: [] } })).toBe(true);
     expect(patchChangesInfisicalConnection({ infisical: { refreshMinutes: 5 } })).toBe(false);
     expect(patchChangesInfisicalConnection({ infisical: { enabled: false } })).toBe(false);
     expect(patchChangesInfisicalConnection({})).toBe(false);
@@ -40,7 +44,7 @@ describe("writeThroughKnobs", () => {
     }));
     // The tombstone runs after the vault write: observe it by re-reading the
     // patch only once the helper has resolved.
-    expect(result).toEqual({ ok: true, written: ["jobs.defaultMinutes"] });
+    expect(result).toEqual({ ok: true, written: ["jobs.defaultMinutes"], cleared: [] });
     expect(order).toEqual(["vault:BOTFLEET_JOBS_DEFAULT_MINUTES=30"]);
     expect(patch.jobs).toBeUndefined();
   });
@@ -58,7 +62,7 @@ describe("writeThroughKnobs", () => {
     const writeSecret = vi.fn();
     const patch: Partial<AppConfig> = { profile: { name: "Jay" } };
     const result = await writeThroughKnobs(patch, baseDeps({ writeSecret }));
-    expect(result).toEqual({ ok: true, written: [] });
+    expect(result).toEqual({ ok: true, written: [], cleared: [] });
     expect(writeSecret).not.toHaveBeenCalled();
     expect(patch.profile?.name).toBe("Jay");
   });
@@ -67,7 +71,7 @@ describe("writeThroughKnobs", () => {
     const writeSecret = vi.fn();
     const patch: Partial<AppConfig> = { jobs: { defaultMinutes: 30 } };
     const result = await writeThroughKnobs(patch, baseDeps({ enabled: false, writeSecret }));
-    expect(result).toEqual({ ok: true, written: [] });
+    expect(result).toEqual({ ok: true, written: [], cleared: [] });
     expect(writeSecret).not.toHaveBeenCalled();
     expect(patch.jobs?.defaultMinutes).toBe(30);
   });
@@ -119,7 +123,7 @@ describe("writeThroughKnobs", () => {
         },
       }),
     );
-    expect(result).toEqual({ ok: true, written: ["jobs.defaultMinutes"] });
+    expect(result).toEqual({ ok: true, written: ["jobs.defaultMinutes"], cleared: [] });
     expect(calls).toEqual([["BOTFLEET_JOBS_DEFAULT_MINUTES", "30"]]);
   });
 
@@ -149,11 +153,12 @@ describe("writeThroughKnobs", () => {
   it("serialises every knob kind the way the resolver reads it back", async () => {
     const calls = new Map<string, string>();
     const patch: Partial<AppConfig> = {
-      jobs: { defaultMinutes: 30, cpuCores: 4 },
+      jobs: { defaultMinutes: 30, queueWaitMinutes: 1440, cpuCores: 4, admission: { minFreeInodes: 1250 } },
       observability: { tracesSampleRate: 0.5 },
       usage: { spendCeilingUsd: 25.5 },
       infisical: { refreshMinutes: 10 },
       autoReview: { maxReviewsPerTurn: 80 },
+      agentProxy: { enabled: true, address: "127.0.0.1:17322", projectId: "proj-1", environment: "prod", secretPath: "/agents" },
     };
     const result = await writeThroughKnobs(
       patch,
@@ -165,11 +170,115 @@ describe("writeThroughKnobs", () => {
     );
     expect(result.ok).toBe(true);
     expect(calls.get("BOTFLEET_JOBS_DEFAULT_MINUTES")).toBe("30");
+    expect(calls.get("BOTFLEET_JOBS_QUEUE_WAIT_MINUTES")).toBe("1440");
     expect(calls.get("BOTFLEET_JOBS_CPU_CORES")).toBe("4");
+    expect(calls.get("BOTFLEET_JOBS_MIN_FREE_INODES")).toBe("1250");
     expect(calls.get("BOTFLEET_TRACES_SAMPLE_RATE")).toBe("0.5");
     expect(calls.get("BOTFLEET_SPEND_CEILING_USD")).toBe("25.5");
     expect(calls.get("BOTFLEET_INFISICAL_REFRESH_MINUTES")).toBe("10");
     expect(calls.get("BOTFLEET_AUTO_REVIEW_MAX_PER_TURN")).toBe("80");
-    expect(KNOB_FIELDS.length).toBe(16);
+    expect(calls.get("BOTFLEET_AGENT_PROXY_ENABLED")).toBe("true");
+    expect(calls.get("BOTFLEET_AGENT_PROXY_ADDRESS")).toBe("127.0.0.1:17322");
+    expect(calls.get("BOTFLEET_AGENT_PROXY_PROJECT_ID")).toBe("proj-1");
+    expect(calls.get("BOTFLEET_AGENT_PROXY_ENV")).toBe("prod");
+    expect(calls.get("BOTFLEET_AGENT_PROXY_PATH")).toBe("/agents");
+    // 29 includes the computerCall and claudeSession rows migrated from
+    // the OMB_COMPUTER_* / OMB_CLAUDE_SESSION_IDLE_* env names, and 35 adds
+    // the two placement rows;  bump this
+    // deliberately: the count is here so that adding or dropping a knob is
+    // a decision someone reads rather than an edit that slips through --
+    // it is what caught nineteen rows disappearing at once.
+    expect(KNOB_FIELDS.length).toBe(35);
+  });
+});
+
+describe("writeThroughKnobs null-clear (slice 7b)", () => {
+  it("passes a file-backed clear through with the null intact for the merge to delete", async () => {
+    const writeSecret = vi.fn();
+    const patch: Partial<AppConfig> = { jobs: { admission: { reservedCpuCores: null } } };
+    const result = await writeThroughKnobs(patch, baseDeps({ writeSecret }));
+    expect(result).toEqual({ ok: true, written: [], cleared: ["jobs.admission.reservedCpuCores"] });
+    expect(writeSecret).not.toHaveBeenCalled();
+    // The null stays in the patch: mergeConfigPatch turns it into the disk
+    // deletion, so the file keeps reading "unset".
+    expect(patch.jobs?.admission).toEqual({ reservedCpuCores: null });
+  });
+
+  it("clears without Write Through: a file delete never touches the vault", async () => {
+    const writeSecret = vi.fn();
+    const patch: Partial<AppConfig> = { jobs: { admission: { reservedRamMb: null } } };
+    const result = await writeThroughKnobs(patch, baseDeps({ writeThrough: false, writeSecret }));
+    expect(result).toEqual({ ok: true, written: [], cleared: ["jobs.admission.reservedRamMb"] });
+    expect(writeSecret).not.toHaveBeenCalled();
+  });
+
+  it("reports the clear when the vault integration is off: the disk merge still unsets the key", async () => {
+    const writeSecret = vi.fn();
+    const patch: Partial<AppConfig> = { jobs: { admission: { reservedCpuCores: null } } };
+    const result = await writeThroughKnobs(patch, baseDeps({ enabled: false, writeSecret }));
+    expect(result).toEqual({ ok: true, written: [], cleared: ["jobs.admission.reservedCpuCores"] });
+    expect(writeSecret).not.toHaveBeenCalled();
+    expect(patch.jobs?.admission).toEqual({ reservedCpuCores: null });
+  });
+
+  it("refuses a clear the vault manages with 409, naming the vault name to remove", async () => {
+    const writeSecret = vi.fn();
+    const patch: Partial<AppConfig> = { jobs: { admission: { minMemoryAvailablePercent: null } } };
+    const result = await writeThroughKnobs(
+      patch,
+      baseDeps({
+        knownNames: new Set(["BOTFLEET_JOBS_MIN_MEMORY_AVAILABLE_PERCENT"]),
+        writeSecret,
+      }),
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("unreachable");
+    expect(result.status).toBe(409);
+    expect(result.field).toBe("jobs.admission.minMemoryAvailablePercent");
+    expect(result.infisicalName).toBe("BOTFLEET_JOBS_MIN_MEMORY_AVAILABLE_PERCENT");
+    expect(result.error).toContain("BOTFLEET_JOBS_MIN_MEMORY_AVAILABLE_PERCENT");
+    expect(writeSecret).not.toHaveBeenCalled();
+    // Nothing was written anywhere: the patch is untouched for the caller to
+    // answer with.
+    expect(patch.jobs?.admission).toEqual({ minMemoryAvailablePercent: null });
+  });
+
+  it("refuses a clear when the store is unreachable and cannot say what it manages", async () => {
+    const writeSecret = vi.fn();
+    const patch: Partial<AppConfig> = { jobs: { admission: { reservedCpuCores: null } } };
+    const result = await writeThroughKnobs(patch, baseDeps({ unreachable: true, writeSecret }));
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("unreachable");
+    expect(result.status).toBe(503);
+    expect(writeSecret).not.toHaveBeenCalled();
+  });
+
+  it("passes a clear of a fresh name through: with nothing in the vault there is nothing to refuse", async () => {
+    const writeSecret = vi.fn();
+    const patch: Partial<AppConfig> = { jobs: { admission: { reservedCpuCores: null } } };
+    const result = await writeThroughKnobs(
+      patch,
+      baseDeps({ knownNames: new Set<string>(), sourceOf: () => "none", writeSecret }),
+    );
+    expect(result).toEqual({ ok: true, written: [], cleared: ["jobs.admission.reservedCpuCores"] });
+    expect(writeSecret).not.toHaveBeenCalled();
+  });
+
+  it("carries a value write and a clear in one patch", async () => {
+    const calls = new Map<string, string>();
+    const patch: Partial<AppConfig> = {
+      jobs: { admission: { maxSwapPercent: 90, reservedCpuCores: null } },
+    };
+    const result = await writeThroughKnobs(
+      patch,
+      baseDeps({
+        writeSecret: async (name, value) => {
+          calls.set(name, value);
+        },
+      }),
+    );
+    expect(result).toEqual({ ok: true, written: ["jobs.admission.maxSwapPercent"], cleared: ["jobs.admission.reservedCpuCores"] });
+    expect(calls.get("BOTFLEET_JOBS_MAX_SWAP_PERCENT")).toBe("90");
+    expect(patch.jobs?.admission).toEqual({ reservedCpuCores: null });
   });
 });

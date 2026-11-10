@@ -30,8 +30,8 @@ struct ChatView: View {
     @State private var showingTasks = false
     @State private var showingRoutines = false
     @State private var showingComputer = false
+    @State private var showingVoiceCall = false
     @State private var showingPlus = false
-    @State private var showingCompose = false
     @State private var showingProfile = false
     @State private var showCommandHUD = false
     @State private var pickingPhoto = false
@@ -82,9 +82,12 @@ struct ChatView: View {
 
     /// What sits after the last settled row while the bot works.
     private var liveRow: BottomFollow.LiveRow {
-        if let live = session.state.streaming[threadId], !live.isEmpty { return .text }
-        if let thinking = session.state.reasoning[threadId], !thinking.isEmpty { return .reasoning }
-        return current.busy ? .typing : .none
+        bottomLiveRow(
+            streaming: session.state.streaming[displayedThreadId],
+            reasoning: session.state.reasoning[displayedThreadId],
+            viewingOther: viewingOther,
+            busy: current.busy
+        )
     }
 
     /// The bot whose reply is streaming: the chat's bot, or in a room the
@@ -116,8 +119,25 @@ struct ChatView: View {
     /// live record instead of the snapshot that opened this screen.
     private var threadId: String { current.threadId }
 
+    /// The thread open for reading when it is not the bot's active one
+    /// (Slice 0: browse a retained thread while the bot works). Nil on the
+    /// active thread, for rooms, and for a pin that outlived its task.
+    private var viewedThreadId: String? {
+        guard case let .bot(bot) = current else { return nil }
+        return session.state.viewingThreadId(forBotId: bot.id)
+    }
+
+    /// Browsing a retained thread is read-only: the bot keeps working in
+    /// its active thread, and becoming the execution target stays gated on
+    /// the turn finishing, exactly as tab switching was.
+    private var viewingOther: Bool { viewedThreadId != nil }
+
+    /// The transcript on screen: the viewed thread's own page while
+    /// browsing, the active thread's otherwise.
+    private var displayedThreadId: String { viewedThreadId ?? threadId }
+
     private var messages: [Message] {
-        session.state.visibleTranscript(forThread: threadId)
+        session.state.visibleTranscript(forThread: displayedThreadId)
     }
 
     /// Unread elsewhere — what the back pill's badge counts, like Messages.
@@ -135,21 +155,7 @@ struct ChatView: View {
     /// `Session` rather than parsing `instanceId`, which is operator-named
     private var currentModelSelection: ModelSelection? {
         guard case let .bot(bot) = current else { return nil }
-        guard let currentTask = bot.tasks?.first(where: { $0.threadId == bot.threadId }) else {
-            // Older harnesses send no task list; the bot-level record is all
-            // there is.
-            return bot.activeModelSelection ?? bot.modelSelection
-        }
-        if let taskSelection = currentTask.modelSelection {
-            return currentTask.activeModelSelection ?? taskSelection
-        }
-        // An inheriting task reads its own last-turn selection, never
-        // `bot.activeModelSelection`: that is the bot's latest turn across
-        // every task, so a fallback on another task would leak into this
-        // header.  The server clears an inheriting task's
-        // `activeModelSelection` when the bot's model changes (`patchBot`
-        // in server/store.ts), so a stale fallback does not outlive it.
-        return currentTask.activeModelSelection ?? bot.modelSelection
+        return BotConversationModelSelection.selection(for: bot, inThread: threadId)
     }
 
     private var currentDriverKind: String? {
@@ -257,12 +263,17 @@ struct ChatView: View {
             // While the Mac holds new work for an update, a message sent now
             // is saved and runs after the restart; this says so.
             UpdateHoldNotice()
-            // An Off bot refuses every new turn, so the input is replaced by
-            // the way out of that state.  The transcript above stays as it was.
-            if current.isOff, case let .bot(bot) = current {
-                offComposer(for: bot)
-            } else {
-                composer
+            // Browsing a retained thread is read-only, so there is no input
+            // under it: the draft, the queued chips and the send path all
+            // stay exactly where they were, on the active thread.
+            if !viewingOther {
+                // An Off bot refuses every new turn, so the input is replaced by
+                // the way out of that state.  The transcript above stays as it was.
+                if current.isOff, case let .bot(bot) = current {
+                    offComposer(for: bot)
+                } else {
+                    composer
+                }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
@@ -291,11 +302,18 @@ struct ChatView: View {
         .navigationDestination(isPresented: $showingComputer) {
             if case let .bot(bot) = current { ComputerView(bot: bot) }
         }
+        .navigationDestination(isPresented: $showingVoiceCall) {
+            VoiceCallView(call: VoiceCall(chat: current, botName: current.name, session: session))
+        }
         .task(id: threadId) {
             if current.unread { await session.markRead(current) }
 #if DEBUG
             if ProcessInfo.processInfo.arguments.contains("-open-plus") { showingPlus = true }
             if ProcessInfo.processInfo.arguments.contains("-open-profile") { showingProfile = true }
+            // Opens the voice call screen directly (with -voice-fixture, on
+            // the scripted session) for layout verification without tapping
+            // through chat.
+            if ProcessInfo.processInfo.arguments.contains("-open-voice-call") { showingVoiceCall = true }
             // Raises the keyboard on open, for checking that the composer
             // clears it: the transcript has to stay visible above the
             // keyboard rather than behind it.
@@ -305,7 +323,7 @@ struct ChatView: View {
         .onChange(of: current.unread) { _, unread in
             if unread { Task { await session.markRead(current) } }
         }
-        .onAppear { NotificationCoordinator.shared.viewingThreadId = threadId }
+        .onAppear { NotificationCoordinator.shared.viewingThreadId = displayedThreadId }
         .onChange(of: threadId) { _, newId in
             dictation.stop()
             NotificationCoordinator.shared.viewingThreadId = newId
@@ -314,9 +332,17 @@ struct ChatView: View {
             follow = BottomFollow()
             scrollTracker.reset()
         }
+        // Entering or leaving a viewed thread moves the reader to its own
+        // transcript, so the follow state starts over rather than carrying
+        // the other thread's position across.
+        .onChange(of: viewedThreadId) { _, newId in
+            NotificationCoordinator.shared.viewingThreadId = newId ?? threadId
+            follow = BottomFollow()
+            scrollTracker.reset()
+        }
         .onDisappear {
             dictation.stop()
-            if NotificationCoordinator.shared.viewingThreadId == threadId {
+            if NotificationCoordinator.shared.viewingThreadId == displayedThreadId {
                 NotificationCoordinator.shared.viewingThreadId = nil
             }
         }
@@ -326,11 +352,11 @@ struct ChatView: View {
                 // ChatView stays mounted while backgrounded, so onDisappear
                 // never clears this — without clearing, same-thread APNs/SSE
                 // banners are suppressed for the linger window.
-                if NotificationCoordinator.shared.viewingThreadId == threadId {
+                if NotificationCoordinator.shared.viewingThreadId == displayedThreadId {
                     NotificationCoordinator.shared.viewingThreadId = nil
                 }
             } else {
-                NotificationCoordinator.shared.viewingThreadId = threadId
+                NotificationCoordinator.shared.viewingThreadId = displayedThreadId
             }
         }
         .onChange(of: showingComputer) { _, shown in
@@ -388,14 +414,6 @@ struct ChatView: View {
         .sheet(item: $shareFile) { file in
             ActivityShareSheet(items: [file.url])
         }
-        .confirmationDialog("New", isPresented: $showingCompose, titleVisibility: .visible) {
-            if case let .bot(bot) = current {
-                Button("New Task") {
-                    Task { await session.createTask(for: bot, title: nil) }
-                }
-            }
-            Button("Cancel", role: .cancel) {}
-        }
         .modifier(CloseWhenGone(isGone: chatIsGone, waiting: showingProfile, close: { closeIfGone() }))
     }
 
@@ -433,21 +451,31 @@ struct ChatView: View {
     /// exceeded the type-check budget on CI.
     private var transcriptColumn: some View {
         let transcript = messages
-        let items = groupActivityRuns(transcript)
+        let items = groupMessageRuns(transcript)
         let live = liveRow
         let newestSettled = BottomFollow.newestSettledId(in: transcript)
         return ScrollViewReader { proxy in
                 ScrollView {
-                    // VStack, not LazyVStack. A lazy stack does not know how
-                    // tall it is until its rows have been built, so
+                    // VStack, not LazyVStack — measured, not assumed
+                    // (BF-2609). A lazy stack does not know how tall it is
+                    // until its rows have been built, so
                     // `.defaultScrollAnchor(.bottom)` anchors against an
                     // estimate and the chat opens somewhere in the middle of
                     // the conversation. Building all of it up front makes the
                     // height exact and the anchor land on the newest message.
-                    // A thread holds 50 messages until you ask for more, so
-                    // there is nothing here worth being lazy about.
+                    // At the 50-message default page the eager cost is the
+                    // grouping pass plus 50 row bodies (~3x the ~15 rows a
+                    // lazy stack would build, and sub-millisecond of
+                    // grouping on the bench in StreamingBatchTests'
+                    // companion probe); expanded history is reader-paced,
+                    // not streamed, so it never pays that cost per token.
+                    // Lazy only wins at several hundred held rows, which
+                    // today takes many deliberate Load Earlier taps — if
+                    // the default page ever grows to that scale, re-measure
+                    // before swapping, because the anchor cost above is a
+                    // correctness loss, not a performance trade.
                     VStack(alignment: .leading, spacing: 6) {
-                        if session.state.hasMore[threadId] == true {
+                        if session.state.hasMore[displayedThreadId] == true {
                             Button("Load earlier messages") {
                                 // keep the reader where they were: after older
                                 // messages are prepended, sit back on the row
@@ -456,12 +484,12 @@ struct ChatView: View {
                                 follow.leaveBottom(newestSettledId: newestSettled)
                                 prepending = true
                                 Task {
-                                    await session.loadOlder(threadId: threadId)
+                                    await session.loadOlder(threadId: displayedThreadId)
                                     // Found again in the new rows: the old top
                                     // row may have joined a longer tool run
                                     // from the loaded page, under a new id.
                                     if let firstMessageId,
-                                       let row = transcriptRowId(containing: firstMessageId, in: groupActivityRuns(messages)) {
+                                       let row = transcriptRowId(containing: firstMessageId, in: groupMessageRuns(messages)) {
                                         proxy.scrollTo(row, anchor: .top)
                                     }
                                     // Let the prepended rows lay out under the
@@ -487,13 +515,39 @@ struct ChatView: View {
                                     MessageRow(
                                         chat: current,
                                         message: message,
-                                        endsRun: endsRun(at: index, in: items, live: live)
+                                        endsRun: endsRun(at: index, in: items, live: live),
+                                        threadId: displayedThreadId,
+                                        readOnly: viewingOther
                                     )
                                 case let .run(_, runMessages):
-                                    ActivityRunView(
-                                        chat: current,
-                                        messages: runMessages
-                                    )
+                                    if runMessages.allSatisfy(isFoldableActivity) {
+                                        ActivityRunView(
+                                            chat: current,
+                                            messages: runMessages
+                                        )
+                                    } else {
+                                        let rowEndsRun = endsRun(at: index, in: items, live: live)
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            ForEach(Array(runMessages.enumerated()), id: \.element.id) { msgIndex, message in
+                                                MessageRow(
+                                                    chat: current,
+                                                    message: message,
+                                                    startsRun: msgIndex == 0,
+                                                    endsRun: msgIndex == runMessages.count - 1 && rowEndsRun,
+                                                    threadId: displayedThreadId,
+                                                    readOnly: viewingOther
+                                                )
+                                            }
+                                        }
+                                        .accessibilityElement(children: .contain)
+                                        .accessibilityLabel(
+                                            messageRunAccessibilityLabel(
+                                                item,
+                                                sender: runSenderLabel(for: runMessages.first),
+                                                relativeTime: runRelativeTimeLabel(for: runMessages.first)
+                                            )
+                                        )
+                                    }
                                 }
                             }
                             .id(item.id)
@@ -526,7 +580,12 @@ struct ChatView: View {
                 // Opaque header: the transcript starts below the tabs and
                 // never shows through them.  Glass over the bubbles was
                 // what made Monitor's thread leak into the tab strip.
-                .safeAreaInset(edge: .top, spacing: 0) { chatHeader }
+                .safeAreaInset(edge: .top, spacing: 0) {
+                    VStack(spacing: 0) {
+                        chatHeader
+                        if viewingOther { viewingBanner }
+                    }
+                }
                 // A conversation grows from the bottom: a transcript shorter
                 // than the screen rests at the bottom, and opening a chat
                 // starts on the newest message rather than the oldest.  While
@@ -566,7 +625,7 @@ struct ChatView: View {
                 // and without animation.  Animating every token turns a
                 // smooth stream into a stutter, because each scroll
                 // interrupts the last.
-                .onChange(of: session.state.streaming[threadId]?.count ?? 0) { _, length in
+                .onChange(of: session.state.streaming[displayedThreadId]?.count ?? 0) { _, length in
                     guard length > 0, follow.isFollowing else { return }
                     followStream(proxy)
                 }
@@ -581,7 +640,11 @@ struct ChatView: View {
                     withAnimation(reduceMotion ? nil : .default) { proxy.scrollTo(row, anchor: .center) }
                     session.consumeFocus(messageId)
                 }
-                .task(id: threadId) {
+                // A viewed thread's first page may not be held yet; the
+                // store answers whether a fetch is still needed, so a frame
+                // that landed first is never refetched.
+                .task(id: displayedThreadId) {
+                    if viewingOther { await session.ensureViewedThreadLoaded() }
                     if let messageId = session.focusedMessageId,
                        let row = transcriptRowId(containing: messageId, in: items) {
                         follow.leaveBottom(newestSettledId: newestSettled)
@@ -603,7 +666,7 @@ struct ChatView: View {
                     }
                 }
             }
-            .id(threadId)
+            .id(displayedThreadId)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
@@ -711,8 +774,8 @@ struct ChatView: View {
                 LiveReplyRow(
                     chat: current,
                     sender: liveSender,
-                    text: live == .text ? session.state.streaming[threadId] : nil,
-                    reasoning: live == .reasoning ? session.state.reasoning[threadId] : nil
+                    text: live == .text ? session.state.streaming[displayedThreadId] : nil,
+                    reasoning: live == .reasoning ? session.state.reasoning[displayedThreadId] : nil
                 )
             }
             .id(Self.liveBubbleId)
@@ -727,8 +790,16 @@ struct ChatView: View {
 
     // MARK: - Header
 
-    /// Solid chrome: back, identity, computer, and (in Projects) compose
-    /// plus opaque thread tabs.  The transcript starts below this block.
+    /// Solid chrome: back and identity, plus opaque thread tabs.  The
+    /// transcript starts below this block.
+    ///
+    /// Nothing sits to the right of the identity.  "New task" and "Watch
+    /// computer" used to live there as two more 44pt glass buttons, and the
+    /// row they shared with the bot's name was so tight that the name
+    /// truncated to "BF…" on a phone — you could not read who you were
+    /// talking to.  Both actions are in the composer's + sheet with a line
+    /// explaining each, so the header keeps the width for the one thing only
+    /// it can say: who this is.
     private var chatHeader: some View {
         VStack(spacing: 8) {
             HStack(alignment: .center) {
@@ -768,18 +839,19 @@ struct ChatView: View {
                             state: BotState.forChat(current, in: session.state),
                             animated: BotState.forChat(current, in: session.state).showsActivity
                         )
-                        .overlay(alignment: .bottomTrailing) {
-                            if let currentDriverKind {
-                                ProviderMarkView(driverKind: currentDriverKind, model: currentModelSelection?.model, size: 21)
-                                    .offset(x: 3, y: 3)
-                            }
-                        }
+                        .providerBadge(for: current, avatarSize: 36)
                         VStack(alignment: .leading, spacing: 1) {
                             HStack(spacing: 6) {
+                                // The name is the one thing in this row that
+                                // cannot be replaced by an icon, so it wins the
+                                // contested width and truncates last.  The
+                                // badge and the connection mark are fixed-size
+                                // and yield instead.
                                 Text(current.name)
                                     .font(.headline.weight(.semibold))
                                     .foregroundStyle(Color.primary)
                                     .lineLimit(1)
+                                    .layoutPriority(1)
                                 if headerShowsBypass { BypassBadge() }
                                 // A label inside the identity button: the
                                 // state reads as part of who you are talking
@@ -802,29 +874,13 @@ struct ChatView: View {
                 .accessibilityLabel(headerProfileAccessibilityLabel)
 
                 Spacer(minLength: 4)
-
-                if case .bot = current {
-                    HStack(spacing: 8) {
-                        if session.config?.allowsMultipleBotThreads == true {
-                            GlassButton(systemImage: "square.and.pencil", size: 44, weight: .medium) {
-                                showingCompose = true
-                            }
-                            .accessibilityLabel("New task")
-                        }
-                        GlassButton(systemImage: "display", size: 44, weight: .medium) {
-                            showingComputer = true
-                        }
-                        .accessibilityLabel("Watch \(current.name)'s computer")
-                    }
-                } else {
-                    Color.clear.frame(width: 44, height: 44)
-                }
             }
             .padding(.horizontal, 16)
 
             // Background jobs: draws nothing until a bot in this conversation
             // has one worth showing (running, or ended in the last half hour).
-            JobsPill(threadId: threadId, showsBotNames: isRoomChat)
+            // Follows the viewed thread, like the transcript below it.
+            JobsPill(threadId: displayedThreadId, showsBotNames: isRoomChat)
 
             if case let .bot(bot) = current,
                session.config?.allowsMultipleBotThreads == true {
@@ -839,6 +895,62 @@ struct ChatView: View {
         .padding(.bottom, 8)
         .frame(maxWidth: .infinity)
         .background(Color(uiColor: .systemBackground), ignoresSafeAreaEdges: .top)
+    }
+
+    /// The read-only banner over a browsed retained thread: which thread is
+    /// on screen, where the bot is actually working, and the two ways out.
+    /// Switching stays gated on the turn finishing, exactly as tab
+    /// switching was; backing out just drops the pin.
+    @ViewBuilder
+    private var viewingBanner: some View {
+        if case let .bot(bot) = current,
+           let viewed = viewedThreadId,
+           let viewedTask = (bot.tasks ?? []).first(where: { $0.threadId == viewed }) {
+            let activeTitle = (bot.tasks ?? []).first(where: { $0.threadId == bot.threadId })?.title
+            let loading = session.state.loadingThread[viewed] == true && messages.isEmpty
+            VStack(spacing: 8) {
+                HStack(spacing: 6) {
+                    Image(systemName: "eye")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Color.secondary)
+                    Text(
+                        "Viewing “\(viewedTask.title.isEmpty ? "Untitled Thread" : viewedTask.title)”\(loading ? " — loading…" : "")"
+                    )
+                    .font(.system(size: 13))
+                    .foregroundStyle(Color.secondary)
+                    .lineLimit(2)
+                    Spacer(minLength: 0)
+                }
+                Text(
+                    bot.busy == true
+                        ? "\(bot.name) is working in “\(activeTitle?.isEmpty == false ? activeTitle! : "Untitled Thread")”."
+                        : "The active thread is “\(activeTitle?.isEmpty == false ? activeTitle! : "Untitled Thread")”."
+                )
+                .font(.system(size: 12))
+                .foregroundStyle(Color.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                HStack(spacing: 8) {
+                    Button("Switch to This Thread") {
+                        Task { await session.switchTask(viewedTask, for: bot) }
+                    }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(bot.busy == true ? Color.secondary.opacity(0.5) : Color.accentColor)
+                    .disabled(bot.busy == true)
+                    .accessibilityHint(bot.busy == true ? "Let this turn finish first" : "Make this the active thread")
+                    Spacer(minLength: 0)
+                    Button("Back to Active Thread") {
+                        session.showActiveThread(for: bot)
+                    }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(Color.accentColor)
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+            .background(Color.secondary.opacity(0.08))
+        }
     }
 
     // MARK: - The + sheet
@@ -911,8 +1023,18 @@ struct ChatView: View {
         let run: () -> Void
     }
 
+    /// The rows an Off bot loses.  Only the ones that exist to start a turn:
+    /// an Off bot refuses every new turn, so each of these would be a row that
+    /// does nothing.  Everything whose liveness does not depend on Off is
+    /// absent from this set on purpose and survives the filter below.
+    private static let offBotComposingActionIds: Set<String> = [
+        "photo", "file", "dictate", "commands", "paste",
+        "task", "tasks", "routines", "call",
+    ]
+
     private var plusActions: [PlusAction] {
         var out: [PlusAction] = []
+
         out.append(PlusAction(
             id: "photo", systemImage: "photo", title: "Photo",
             subtitle: "Attach a photo from your library"
@@ -945,19 +1067,36 @@ struct ChatView: View {
                 subtitle: "Add the copied image or file"
             ) { pasteFromClipboard() })
         }
-        if case let .bot(bot) = current, session.config?.allowsMultipleBotThreads == true {
+        if case let .bot(bot) = current {
+            if session.config?.allowsMultipleBotThreads == true {
+                out.append(PlusAction(
+                    id: "task", systemImage: "plus.square.on.square", title: "New task",
+                    subtitle: "Start a fresh thread with \(bot.name)", disabled: bot.busy == true
+                ) { Task { await session.createTask(for: bot, title: nil) } })
+                out.append(PlusAction(
+                    id: "tasks", systemImage: "square.stack", title: "Tasks",
+                    subtitle: "Switch, rename or remove one"
+                ) { showingTasks = true })
+                out.append(PlusAction(
+                    id: "routines", systemImage: "calendar.badge.clock", title: "Tasks & Routines",
+                    subtitle: "Automate tasks on a schedule"
+                ) { showingRoutines = true })
+            }
+            // A voice call talks to the same bot, hands-free.  The call screen
+            // owns its lifecycle: appearing starts it, leaving ends it.  It
+            // lives here, not in the header, because the header keeps its
+            // width for the bot's name.  Outside the Projects gate too: a
+            // call is one conversation and needs no thread of its own.
             out.append(PlusAction(
-                id: "task", systemImage: "plus.square.on.square", title: "New task",
-                subtitle: "Start a fresh thread with \(bot.name)", disabled: bot.busy == true
-            ) { Task { await session.createTask(for: bot, title: nil) } })
-            out.append(PlusAction(
-                id: "tasks", systemImage: "square.stack", title: "Tasks",
-                subtitle: "Switch, rename or remove one"
-            ) { showingTasks = true })
-            out.append(PlusAction(
-                id: "routines", systemImage: "calendar.badge.clock", title: "Tasks & Routines",
-                subtitle: "Automate tasks on a schedule"
-            ) { showingRoutines = true })
+                id: "call", systemImage: "phone.fill", title: "Call \(bot.name)",
+                subtitle: "Talk hands-free, out loud"
+            ) { showingVoiceCall = true })
+            // Deliberately outside the Projects gate.  The header button this
+            // action replaces was never gated either, so gating it here would
+            // take the only remaining way to watch a bot away from anyone whose
+            // Mac runs one conversation per channel.  Kept last so the sheet
+            // reads the same as before for everyone who had all four.  A bot
+            // that is Off never reaches this list — there it is the whole sheet.
             out.append(PlusAction(
                 id: "computer", systemImage: "display", title: "Watch computer",
                 subtitle: "Live view of what \(bot.name) is doing"
@@ -1014,12 +1153,31 @@ struct ChatView: View {
                 }
             })
         }
+
+        // An Off bot refuses every new turn, so the rows above that only exist
+        // to start one would each be a row that does nothing.  Off gates
+        // STARTING work and never interrupts what is already running
+        // (`shared/bot-power.ts`), so the rows whose liveness does not depend
+        // on Off are deliberately left in: Interrupt is the only control left
+        // that can end a turn — the composer's own Stop sits in the row this
+        // state replaces whole — and a transcript can be read and exported
+        // from a bot that is Off.  Filtering the built list keeps one
+        // definition of each row instead of hand-copying the survivors.
+        if case .bot = current, current.isOff {
+            return out.filter { !Self.offBotComposingActionIds.contains($0.id) }
+        }
         return out
     }
 
     /// Where a run of bubbles gets its tail; `transcriptRowEndsRun` holds
     /// the rule, including the reply being typed counting as the next
     /// message.
+    private static let runTimeFormatter: RelativeDateTimeFormatter = {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .full
+        return formatter
+    }()
+
     private func endsRun(at index: Int, in items: [TranscriptItem], live: BottomFollow.LiveRow) -> Bool {
         // In a room the settled reply is attributed to the member holding
         // the turn; in a bot chat it carries no speaker.
@@ -1029,7 +1187,23 @@ struct ChatView: View {
             at: index,
             in: items,
             liveReply: live == .text || live == .reasoning,
-            liveSpeaker: liveSpeaker
+            liveSpeaker: liveSpeaker,
+            liveAt: Date()
+        )
+    }
+
+    private func runSenderLabel(for message: Message?) -> String? {
+        guard let message else { return nil }
+        if let from = message.from?.name, !from.isEmpty { return from }
+        if message.role == .user { return "You" }
+        return current.name
+    }
+
+    private func runRelativeTimeLabel(for message: Message?) -> String? {
+        guard let message else { return nil }
+        return Self.runTimeFormatter.localizedString(
+            for: Date(timeIntervalSince1970: message.at / 1_000),
+            relativeTo: Date()
         )
     }
 
@@ -1058,8 +1232,15 @@ struct ChatView: View {
     /// Returns the task carrying the send, so a caller that has to act on
     /// the server's answer (Steer Now) can wait for it instead of guessing
     /// with a sleep.  Callers that do not care discard it.
+    private func busySendDefaultMode() -> String {
+        // "queue" mirrors DEFAULT_BUSY_SEND_DEFAULT in
+        // shared/busy-send-default.ts — keep the two in step (BF-2442).
+        let raw = session.config?.busySendDefault?.lowercased() ?? "queue"
+        return raw == "queue" ? "queue" : "steer"
+    }
+
     @discardableResult
-    private func submit(_ explicitText: String? = nil) -> Task<Void, Never>? {
+    private func submit(_ explicitText: String? = nil, busyDelivery: String? = nil) -> Task<Void, Never>? {
         // This also cancels an in-flight permission prompt before it can
         // open the microphone after the message has already been sent.
         dictation.stop()
@@ -1091,8 +1272,20 @@ struct ChatView: View {
         )
         let sentText = text
         sending = true
+        var delivery = busyDelivery
+        // Until the config loads the client cannot know the workspace default, so it
+        // sends no override and the server's own setting decides.
+        if delivery == nil, current.busy, case .bot = current, session.config != nil, busySendDefaultMode() == "queue" {
+            delivery = "queue"
+        }
         let task = Task {
-            let outcome = await session.send(sentText, to: current, attachments: outgoing, recording: recording)
+            let outcome = await session.send(
+                sentText,
+                to: current,
+                attachments: outgoing,
+                recording: recording,
+                busyDelivery: delivery
+            )
             sending = false
             let transcript = session.state.transcript(forThread: threadId)
             guard ComposerSendRecovery.shouldRestoreClearedDraft(
@@ -1312,38 +1505,53 @@ struct ChatView: View {
                                 .foregroundStyle(Color.primary)
                                 .frame(maxWidth: .infinity, alignment: .leading)
 
-                            Button {
-                                editQueuedMessage(item)
-                            } label: {
-                                Image(systemName: "pencil")
-                                    .font(.system(size: 13, weight: .medium))
-                                    .foregroundStyle(Color.secondary)
-                                    .frame(width: 28, height: 28)
-                                    .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                            .accessibilityLabel("Edit Queued Message")
-
+                            // Labeled actions, not bare glyphs: three 28pt icons in a
+                            // row were easy to mis-tap, and "Steer" beside "Cancel"
+                            // says which one ends the wait.  The order is Steer,
+                            // Edit, Cancel — Edit sits in the middle so neither
+                            // neighbour reads as its default.  The accessibility
+                            // labels stay the ones the screen readers already use.
                             Button {
                                 steerNow()
                             } label: {
-                                Image(systemName: "arrow.up")
-                                    .font(.system(size: 13, weight: .bold))
+                                Text("Steer")
+                                    .font(.system(size: 12, weight: .semibold))
                                     .foregroundStyle(BubbleColor.mine)
-                                    .frame(width: 28, height: 28)
-                                    .contentShape(Rectangle())
+                                    .padding(.horizontal, 10)
+                                    .frame(height: 28)
+                                    .background(Capsule().strokeBorder(BubbleColor.mine.opacity(0.5), lineWidth: 1))
+                                    .contentShape(Capsule())
+                                    .fixedSize()
                             }
                             .buttonStyle(.plain)
                             .accessibilityLabel("Steer Now")
 
                             Button {
+                                editQueuedMessage(item)
+                            } label: {
+                                Text("Edit")
+                                    .font(.system(size: 12, weight: .semibold))
+                                    .foregroundStyle(Color.secondary)
+                                    .padding(.horizontal, 10)
+                                    .frame(height: 28)
+                                    .background(Capsule().strokeBorder(Color.secondary.opacity(0.4), lineWidth: 1))
+                                    .contentShape(Capsule())
+                                    .fixedSize()
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel("Edit Queued Message")
+
+                            Button {
                                 cancelQueuedMessage(item.queueId)
                             } label: {
-                                Image(systemName: "xmark")
-                                    .font(.system(size: 13, weight: .medium))
+                                Text("Cancel")
+                                    .font(.system(size: 12, weight: .semibold))
                                     .foregroundStyle(Color.red.opacity(0.85))
-                                    .frame(width: 28, height: 28)
-                                    .contentShape(Rectangle())
+                                    .padding(.horizontal, 10)
+                                    .frame(height: 28)
+                                    .background(Capsule().strokeBorder(Color.red.opacity(0.4), lineWidth: 1))
+                                    .contentShape(Capsule())
+                                    .fixedSize()
                             }
                             .buttonStyle(.plain)
                             .accessibilityLabel("Cancel Queued Message")
@@ -1546,7 +1754,7 @@ struct ChatView: View {
                     Label("Steer Now", systemImage: "bolt.fill")
                 }
                 Button {
-                    submit()
+                    submit(busyDelivery: "queue")
                 } label: {
                     Label("Queue Message", systemImage: "clock")
                 }
@@ -1568,6 +1776,26 @@ struct ChatView: View {
                 .font(.subheadline)
                 .foregroundStyle(Color.secondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
+            // The composer's + was the only door into the sheet, and this row
+            // replaces the composer whole.  "Watch computer" used to sit in
+            // the header instead, ungated, so a bot that is Off could still be
+            // watched; without this it could not be reached at all.  Drawn
+            // small so the notice keeps its line, tapped at 44pt.
+            Button {
+                withAnimation(reduceMotion ? nil : .snappy(duration: 0.28)) { showingPlus.toggle() }
+            } label: {
+                Image(systemName: "plus")
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundStyle(Color.secondary)
+                    .frame(width: 32, height: 32)
+                    .background(Circle().fill(Color.secondary.opacity(0.14)))
+                    .rotationEffect(.degrees(showingPlus ? 45 : 0))
+                    .frame(width: 44, height: 44)
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(showingPlus ? "Close" : "More")
+
             Button {
                 Task { _ = await session.updateProfile(BotProfilePatch(off: false), for: bot) }
             } label: {
@@ -1758,8 +1986,20 @@ struct ChatView: View {
 struct MessageRow: View {
     let chat: Chat
     let message: Message
+    /// First bubble of a run from the same speaker: the one that shows the speaker header in rooms.
+    var startsRun = true
     /// Last bubble of a run from the same side: the one that gets the tail.
     var endsRun = true
+    /// The thread on screen, which is the viewed (non-active) thread while
+    /// browsing. Every lookup below follows it instead of the chat's active
+    /// thread, so a viewed row never reads the wrong one.
+    var threadId: String? = nil
+    /// A viewed thread renders without its write actions: answers, reactions,
+    /// retries, pins and recording reviews all target the thread on screen,
+    /// which is not the execution target.
+    var readOnly = false
+    /// The thread every lookup and action in this row uses.
+    private var tid: String { threadId ?? chat.threadId }
     @EnvironmentObject private var session: Session
     @State private var editingText = ""
     @State private var showingEdit = false
@@ -1770,7 +2010,7 @@ struct MessageRow: View {
     private static let reactionChoices = ["👍", "❤️", "😂", "🎉", "👀"]
 
     private var versions: [Message] {
-        session.state.versions(of: message, inThread: chat.threadId)
+        session.state.versions(of: message, inThread: tid)
     }
 
     /// This message is the chat's pinned one.
@@ -1790,20 +2030,14 @@ struct MessageRow: View {
     }
 
     private var senderModelSelection: ModelSelection? {
-        senderBot.flatMap { Self.modelSelection(of: $0, inThread: chat.threadId) }
+        senderBot.flatMap { Self.modelSelection(of: $0, inThread: tid) }
     }
 
     /// The model a bot is answering with in this thread, for the provider
     /// mark on its avatar.  Shared with the live reply row so the mark is
     /// already there while the reply is typed.
     static func modelSelection(of bot: Bot, inThread threadId: String) -> ModelSelection? {
-        if let currentTask = bot.tasks?.first(where: { $0.threadId == threadId }) {
-            if let taskSelection = currentTask.modelSelection {
-                return currentTask.activeModelSelection ?? taskSelection
-            }
-            return currentTask.activeModelSelection ?? bot.activeModelSelection ?? bot.modelSelection
-        }
-        return bot.activeModelSelection ?? bot.modelSelection
+        BotConversationModelSelection.selection(for: bot, inThread: threadId)
     }
 
     /// Whether a settled reply from `bot` carries the Read Aloud capsule.
@@ -1816,13 +2050,6 @@ struct MessageRow: View {
         return hasAudio
             || PersonalVoiceContract.isPersonalVoice(voice)
             || config?.canSpeak(agentVoice: voice) == true
-    }
-
-    private var senderDriverKind: String? {
-        guard let selection = senderModelSelection else { return nil }
-        // A cold registry cannot tell whether a named instance runs this model's
-        // native driver or a different one. Do not mislabel the sender's mark.
-        return session.instanceDriverKinds[selection.instanceId]
     }
 
     /// Who this message reads as coming from, in the reader's own words.  The
@@ -1873,13 +2100,7 @@ struct MessageRow: View {
         } else if message.role != .user {
             if let bot = senderBot {
                 if endsRun {
-                    BotAvatarView(bot: bot, size: 28, state: .idle, animated: false)
-                        .overlay(alignment: .bottomTrailing) {
-                            if let senderDriverKind {
-                                ProviderMarkView(driverKind: senderDriverKind, model: senderModelSelection?.model, size: 16)
-                                    .offset(x: 3, y: 3)
-                            }
-                        }
+                    BotAvatarWithProviderBadge(bot: bot, conversationThreadId: tid, size: 28, state: .idle, animated: false)
                 } else {
                     Color.clear.frame(width: 28, height: 28)
                 }
@@ -1929,7 +2150,7 @@ struct MessageRow: View {
             if let recording = message.recording, message.role == .user {
                 VStack(alignment: .leading, spacing: 4) {
                     Button {
-                        session.playRecording(message, threadId: chat.threadId)
+                        session.playRecording(message, threadId: tid)
                     } label: {
                         Label(session.speakingMessageId == message.id ? "Stop recording" : "Replay recording",
                               systemImage: session.speakingMessageId == message.id ? "stop.fill" : "waveform")
@@ -1944,12 +2165,16 @@ struct MessageRow: View {
                     if let comment = message.recordingReview?.comment, !comment.isEmpty {
                         Text("Note: \(comment)").font(.caption)
                     }
-                    Button("Correct or add a note") {
-                        recordingCorrection = message.recordingReview?.correction ?? ""
-                        recordingComment = message.recordingReview?.comment ?? ""
-                        showingRecordingReview = true
+                    // Recording reviews are filed against the thread on
+                    // screen, which a viewed thread is not allowed to be.
+                    if !readOnly {
+                        Button("Correct or add a note") {
+                            recordingCorrection = message.recordingReview?.correction ?? ""
+                            recordingComment = message.recordingReview?.comment ?? ""
+                            showingRecordingReview = true
+                        }
+                        .font(.caption)
                     }
-                    .font(.caption)
                     if let translation = message.translation {
                         Text("Translation (\(translation.language)): \(translation.text)").font(.caption)
                     }
@@ -1960,7 +2185,7 @@ struct MessageRow: View {
             if message.role == .bot, message.kind == .text,
                Self.offersVoice(from: senderBot, hasAudio: message.audio?.isEmpty == false, config: session.config) {
                 Button {
-                    session.playVoice(message, threadId: chat.threadId)
+                    session.playVoice(message, threadId: tid)
                 } label: {
                     Label(session.speakingMessageId == message.id ? "Stop Voice" : (message.audio?.isEmpty == false ? "Replay Voice" : "Read Aloud"),
                           systemImage: session.speakingMessageId == message.id ? "stop.fill" : "speaker.wave.2")
@@ -1970,21 +2195,28 @@ struct MessageRow: View {
                 .buttonBorderShape(.capsule)
             }
 
+            // Reactions are writes against the thread on screen, which a
+            // viewed thread is not allowed to be. The counts still read;
+            // only the tap goes away — fail closed both in the control
+            // state and in the action, so a read-only row can never file
+            // a toggle against a thread that is not the execution target.
             if let reactions = message.reactions, !reactions.isEmpty {
                 HStack(spacing: 6) {
                     ForEach(reactionGroups(reactions), id: \.emoji) { group in
                         Button("\(group.emoji) \(group.count)") {
-                            Task { await session.react(to: message, in: chat.threadId, emoji: group.emoji) }
+                            guard !readOnly else { return }
+                            Task { await session.react(to: message, in: tid, emoji: group.emoji) }
                         }
                         .font(.system(size: 13))
                         .buttonStyle(.bordered)
                         .buttonBorderShape(.capsule)
                         .tint(group.mine ? Color.accentColor : Color.secondary)
+                        .disabled(readOnly)
                     }
                 }
             }
 
-            if versions.count > 1, let index = versions.firstIndex(where: { $0.id == message.id }),
+            if !readOnly, versions.count > 1, let index = versions.firstIndex(where: { $0.id == message.id }),
                case let .bot(bot) = chat {
                 HStack(spacing: 8) {
                     Button {
@@ -2023,30 +2255,35 @@ struct MessageRow: View {
                     UIPasteboard.general.string = text
                 }
             }
-            // One pin per chat, shown above the transcript.  Pinning another
-            // message replaces it, as on the desktop.
-            if BotOrganize.canPin(message) {
-                Button(isPinned ? "Unpin Message" : "Pin Message", systemImage: isPinned ? "pin.slash" : "pin") {
-                    let messageId: String? = isPinned ? nil : message.id
-                    Task { await session.pinMessage(messageId, in: chat) }
+            // Pins, reactions and retries all write against the thread on
+            // screen, which a viewed thread is not allowed to be. Copying
+            // and the timestamp stay, because they write nothing.
+            if !readOnly {
+                // One pin per chat, shown above the transcript.  Pinning another
+                // message replaces it, as on the desktop.
+                if BotOrganize.canPin(message) {
+                    Button(isPinned ? "Unpin Message" : "Pin Message", systemImage: isPinned ? "pin.slash" : "pin") {
+                        let messageId: String? = isPinned ? nil : message.id
+                        Task { await session.pinMessage(messageId, in: chat) }
+                    }
                 }
-            }
-            Divider()
-            ForEach(Self.reactionChoices, id: \.self) { emoji in
-                Button(emoji) { Task { await session.react(to: message, in: chat.threadId, emoji: emoji) } }
-            }
-            if (message.role == .user ||
-                (message.role == .system && message.automationSource == "delegation")),
-               message.kind == .text, message.recording == nil,
-               WebhookMessageView.parse(message.text) == nil,
-               ImessageMessageView.parse(message.text) == nil,
-               case let .bot(bot) = chat {
                 Divider()
-                Button("Edit and retry", systemImage: "pencil") {
-                    editingText = message.text ?? ""
-                    showingEdit = true
+                ForEach(Self.reactionChoices, id: \.self) { emoji in
+                    Button(emoji) { Task { await session.react(to: message, in: tid, emoji: emoji) } }
                 }
-                .disabled(bot.busy == true)
+                if (message.role == .user ||
+                    (message.role == .system && message.automationSource == "delegation")),
+                   message.kind == .text, message.recording == nil,
+                   WebhookMessageView.parse(message.text) == nil,
+                   ImessageMessageView.parse(message.text) == nil,
+                   case let .bot(bot) = chat {
+                    Divider()
+                    Button("Edit and retry", systemImage: "pencil") {
+                        editingText = message.text ?? ""
+                        showingEdit = true
+                    }
+                    .disabled(bot.busy == true)
+                }
             }
 
             if let reqId = message.card?.requestId {
@@ -2080,7 +2317,7 @@ struct MessageRow: View {
                     }
                     ToolbarItem(placement: .confirmationAction) {
                         Button("Save") {
-                            Task { await session.saveRecordingReview(message, threadId: chat.threadId,
+                            Task { await session.saveRecordingReview(message, threadId: tid,
                                                                       correction: recordingCorrection, comment: recordingComment) }
                             showingRecordingReview = false
                         }
@@ -2146,14 +2383,14 @@ struct MessageRow: View {
             } else if message.role == .user, let imessage = ImessageMessageView.parse(message.text) {
                 ImessageEventCard(view: imessage)
             } else {
-                TextBubble(message: message, chat: chat, tailed: endsRun)
+                TextBubble(message: message, chat: chat, tailed: endsRun, showsSpeaker: startsRun)
             }
         case .options:
-            CardView(chat: chat, message: message)
+            CardView(chat: chat, message: message, readOnly: readOnly)
         case .activity:
             ActivityChip(tool: message.tool)
         case .screen:
-            ScreenShot(threadId: chat.threadId, message: message)
+            ScreenShot(threadId: tid, message: message)
         case .unknown:
             // A message kind from a newer computer. Almost everything the
             // harness sends carries `text`, so showing it is usually the
@@ -2161,7 +2398,7 @@ struct MessageRow: View {
             // When there is nothing to show, show nothing — a placeholder
             // saying "unsupported" is a worse gap than the gap.
             if let text = message.text, !text.isEmpty {
-                TextBubble(message: message, chat: chat, tailed: endsRun)
+                TextBubble(message: message, chat: chat, tailed: endsRun, showsSpeaker: startsRun)
             }
         }
     }
@@ -2219,6 +2456,7 @@ struct TextBubble: View {
     let message: Message
     let chat: Chat
     var tailed = true
+    var showsSpeaker = true
     @Environment(\.horizontalSizeClass) private var sizeClass
 
     private var parsedDiff: (filename: String, diff: String)? {
@@ -2304,7 +2542,7 @@ struct TextBubble: View {
             if mine { Spacer(minLength: 56) }
 
             VStack(alignment: .leading, spacing: 4) {
-                if let speaker, !mine {
+                if showsSpeaker, let speaker, !mine {
                     Text(speaker.name)
                         .font(.footnote.weight(.semibold))
                         .foregroundStyle(BotPalette.color(speaker.color))
@@ -2713,9 +2951,16 @@ struct ActivityRunView: View {
 struct CardView: View {
     let chat: Chat
     let message: Message
+    /// A viewed thread shows the card without its answers: approving or
+    /// answering would file against the thread on screen, which is not the
+    /// execution target.
+    var readOnly = false
     @EnvironmentObject private var session: Session
     @State private var answering = false
     @State private var approvingAll = false
+    /// A question card's typed answer, for when the right reply is not one
+    /// of the offered choices — or none were offered.
+    @State private var answerText = ""
 
     /// One definition of "the refusal", shared by the button tint and the
     /// choice above so the two cannot drift apart.
@@ -2757,6 +3002,94 @@ struct CardView: View {
         .accessibilityHint(ApproveAll.hint)
     }
 
+    /// Every way of answering — a choice button or typed text — goes
+    /// through here, so they all send the same way and share the
+    /// "answer in flight" state that disables the card.
+    private func answer(card: OptionCard, choice: String) {
+        answering = true
+        Task {
+            await session.answer(chat: chat, card: card, choice: choice)
+            answering = false
+        }
+    }
+
+    @ViewBuilder
+    private func choiceButton(_ option: String, card: OptionCard, stacked: Bool) -> some View {
+        Button {
+            answer(card: card, choice: option)
+        } label: {
+            if stacked {
+                Text(card.displayChoice(for: option))
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(Self.isRefusal(option) ? Color.primary : .white)
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                    .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                    .background(
+                        Capsule().fill(Self.isRefusal(option) ? Color.secondary.opacity(0.18) : tint)
+                    )
+            } else {
+                Text(card.displayChoice(for: option))
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(Self.isRefusal(option) ? Color.primary : .white)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 40)
+                    .background(
+                        Capsule().fill(Self.isRefusal(option) ? Color.secondary.opacity(0.18) : tint)
+                    )
+            }
+        }
+        .buttonStyle(.plain)
+        .disabled(answering)
+    }
+
+    private var trimmedAnswerText: String {
+        answerText.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var canSendAnswerText: Bool {
+        !answering && !trimmedAnswerText.isEmpty
+    }
+
+    private func sendAnswerText(card: OptionCard) {
+        let text = trimmedAnswerText
+        guard !text.isEmpty, !answering else { return }
+        answerText = ""
+        answer(card: card, choice: text)
+    }
+
+    /// The typed answer under a question's choices.  Shown only while the
+    /// card is pending, so it disappears with the buttons once answered.
+    @ViewBuilder
+    private func answerField(card: OptionCard) -> some View {
+        HStack(spacing: 8) {
+            TextField("Type an answer", text: $answerText)
+                .font(.subheadline)
+                .padding(.horizontal, 12)
+                .frame(minHeight: 44)
+                .background(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(Color.secondary.opacity(0.12))
+                )
+                .submitLabel(.send)
+                .onSubmit { sendAnswerText(card: card) }
+                .disabled(answering)
+
+            Button {
+                sendAnswerText(card: card)
+            } label: {
+                Image(systemName: "arrow.up.circle.fill")
+                    .font(.title2)
+                    .foregroundStyle(canSendAnswerText ? tint : Color.secondary.opacity(0.4))
+            }
+            .buttonStyle(.plain)
+            .disabled(!canSendAnswerText)
+            .accessibilityLabel("Send answer")
+        }
+    }
+
     var body: some View {
         if let card = message.card {
             VStack(alignment: .leading, spacing: 10) {
@@ -2783,30 +3116,32 @@ struct CardView: View {
                         .foregroundStyle(.orange)
                 }
 
-                if card.isPending {
-                    HStack(spacing: 8) {
-                        ForEach(card.options, id: \.self) { option in
-                            Button {
-                                answering = true
-                                Task {
-                                    await session.answer(chat: chat, card: card, choice: option)
-                                    answering = false
-                                }
-                            } label: {
-                                Text(card.displayChoice(for: option))
-                                    .font(.subheadline.weight(.semibold))
-                                    .foregroundStyle(Self.isRefusal(option) ? Color.primary : .white)
-                                    .frame(maxWidth: .infinity)
-                                    .frame(height: 40)
-                                    .background(
-                                        Capsule().fill(Self.isRefusal(option) ? Color.secondary.opacity(0.18) : tint)
-                                    )
+                // Answers file against the thread on screen, so a viewed
+                // thread shows the pending card without its buttons.
+                if card.isPending, !readOnly {
+                    if card.prefersStackedChoices {
+                        // Too many choices, or too long, to share one row:
+                        // stack them full-width so each stays readable.
+                        VStack(spacing: 8) {
+                            ForEach(card.options, id: \.self) { option in
+                                choiceButton(option, card: card, stacked: true)
                             }
-                            .buttonStyle(.plain)
-                            .disabled(answering)
                         }
+                        .padding(.top, 2)
+                    } else if !card.options.isEmpty {
+                        HStack(spacing: 8) {
+                            ForEach(card.options, id: \.self) { option in
+                                choiceButton(option, card: card, stacked: false)
+                            }
+                        }
+                        .padding(.top, 2)
                     }
-                    .padding(.top, 2)
+
+                    // Questions (no `tool`) can always be answered in your
+                    // own words — including when no choices were offered.
+                    if !card.isPermission {
+                        answerField(card: card)
+                    }
 
                     if let count = approveAllCount {
                         approveAllButton(count: count)
@@ -2915,14 +3250,7 @@ struct LiveReplyRow: View {
     @ViewBuilder
     private var avatar: some View {
         if let sender {
-            BotAvatarView(bot: sender, size: 28, state: .idle, animated: false)
-                .overlay(alignment: .bottomTrailing) {
-                    if let selection = MessageRow.modelSelection(of: sender, inThread: chat.threadId),
-                       let driverKind = session.instanceDriverKinds[selection.instanceId] {
-                        ProviderMarkView(driverKind: driverKind, model: selection.model, size: 16)
-                            .offset(x: 3, y: 3)
-                    }
-                }
+            BotAvatarWithProviderBadge(bot: sender, conversationThreadId: chat.threadId, size: 28, state: .idle, animated: false)
         } else if case let .room(room) = chat {
             RoomAvatarView(room: room, size: 28, state: .idle, animated: false)
         }

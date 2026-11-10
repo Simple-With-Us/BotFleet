@@ -21,6 +21,7 @@
 import type { RuntimeEvent } from "./contracts.ts";
 import { observability } from "./observability.ts";
 import { classifyError } from "./drivers/retry.ts";
+import { isMcodeLockContentionMessage } from "./mcode-lock-contention.ts";
 import { estimateCatalogCost, isCatalogPricedModel } from "./gen-ai-cost.ts";
 import { redactSecrets, redactSecretsInText } from "./redact.ts";
 import { getSentry, isSentryActive, scrubWebhookSecrets } from "./sentry.ts";
@@ -537,6 +538,11 @@ const GEN_AI_PROVIDERS = new Map<string, string>([
   ["mcode", "minimax"],
   ["mcodeagent", "minimax"],
   ["boxagent", "box"],
+  // The fleet's own provider token for the z.ai GLM Coding Plan engines
+  // (server/telemetry.ts PROVIDER_BY_ENGINE reports "zcode" for both zcode
+  // and zcodeAcp).  The headless kind has no row and keeps rendering its raw
+  // kind, exactly as before.
+  ["zcodeacp", "zcode"],
 ]);
 
 /** Opt-in prompt/response capture for gen_ai spans.  Off by default:
@@ -992,6 +998,7 @@ export function observeRuntimeEvent(event: RuntimeEvent, sink: SentryAiSink | nu
       if (event.cachedInput != null) {
         turn.span.setAttribute("gen_ai.usage.input_tokens.cached", event.cachedInput);
       }
+      if (event.contextWindow != null) turn.span.setAttribute("gen_ai.request.context_window", event.contextWindow);
       break;
     }
     case "runtime.error": {
@@ -1006,7 +1013,8 @@ export function observeRuntimeEvent(event: RuntimeEvent, sink: SentryAiSink | nu
         event.message.includes("timeout waiting for response") ||
         event.message.includes("initialize timed out") ||
         event.message.includes("the model did not answer within") ||
-        event.message.startsWith(ANTIGRAVITY_POLICY_REFUSAL);
+        event.message.startsWith(ANTIGRAVITY_POLICY_REFUSAL) ||
+        isMcodeLockContentionMessage(event.message);
 
       if (isExpectedNonCrash) {
         sink.addBreadcrumb?.({

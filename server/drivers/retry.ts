@@ -15,7 +15,8 @@ export type TransientReason =
   | "overloaded"
   | "server_error"
   | "connection_reset"
-  | "timeout";
+  | "timeout"
+  | "signaled";
 
 export type TerminalReason =
   | "auth"
@@ -86,6 +87,8 @@ const TRANSIENT_PATTERNS: Array<{ pattern: RegExp; reason: TransientReason }> = 
       /\b(?:econnreset|econnrefused|epipe|etimedout|eai_again|connection reset|connection refused|socket hang up|network error|fetch failed)\b/i,
     reason: "connection_reset",
   },
+  // MiniMax Code runtime turn lock left behind by an aborted predecessor (BOTFLEET-2K).
+  { pattern: /\block file\b.*\balready being held\b/i, reason: "connection_reset" },
   { pattern: /\btimeout(ed)?\b|\btimed? out\b/i, reason: "timeout" },
 ];
 
@@ -244,6 +247,12 @@ export function classifyError(err: FailureInput): ErrorClassification {
   for (const { pattern, reason } of TERMINAL_PATTERNS) {
     if (pattern.test(text)) return { transient: false, reason };
   }
+  // POSIX 143/137 (SIGTERM/SIGKILL as an exit status): the CLI was reaped under
+  // us (BOTFLEET-R, SessionEnd hook), so another spawn is worth it.  This reads
+  // only after stderr had its say: auth, quota and the other terminal shapes
+  // keep their verdict even when the process also died with 143/137.  A driver
+  // interrupt sets retry.cancelled and uses a negative code, handled above.
+  if (exit && (exit.exitCode === 143 || exit.exitCode === 137)) return { transient: true, reason: "signaled" };
   const byCode = classifyByStatusCode(text);
   if (byCode) return byCode;
   if (exit && exit.exitCode !== null && exit.exitCode !== 0 && !text.trim()) {
