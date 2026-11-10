@@ -1633,7 +1633,10 @@ struct ChatView: View {
                         }
                         ComposerMultilineField(
                             text: $draft,
-                            isFocused: $composerFocused,
+                            isFocused: Binding(
+                                get: { composerFocused },
+                                set: { composerFocused = $0 }
+                            ),
                             placeholder: composerPrompt,
                             isEditable: !dictation.isListening && !dictation.isStarting,
                             usesKeyboardAccessory: composerKeyboardAccessoryAvailable,
