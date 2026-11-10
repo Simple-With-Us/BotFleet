@@ -40,7 +40,9 @@ export type ContextSource =
   | "reply"
   /** the note the harness sent as the whole turn when a card was finished
    * (a connector connected, a credential provided or declined) */
-  | "continuation";
+  | "continuation"
+  /** the harness cut older context to fit the turn's prompt budget */
+  | "compression";
 
 export const CONTEXT_SOURCES: readonly ContextSource[] = [
   "memory",
@@ -52,6 +54,7 @@ export const CONTEXT_SOURCES: readonly ContextSource[] = [
   "rewind",
   "reply",
   "continuation",
+  "compression",
 ];
 
 /** The word after "Context injection ·".  Lowercase on purpose: it is a value
@@ -66,6 +69,7 @@ export const CONTEXT_SOURCE_LABEL: Record<ContextSource, string> = {
   rewind: "rewind",
   reply: "reply quote",
   continuation: "continuation",
+  compression: "compressed",
 };
 
 /** What the chat persists on the user message for one injection.  Short by
@@ -94,6 +98,7 @@ export function isContextSource(value: unknown): value is ContextSource {
 
 /** The row's label: "Context injection · memory". */
 export function contextInjectionLabel(source: ContextSource): string {
+  if (source === "compression") return "Compressing Context";
   return `Context injection · ${CONTEXT_SOURCE_LABEL[source]}`;
 }
 

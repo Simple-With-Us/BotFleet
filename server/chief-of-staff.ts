@@ -52,6 +52,8 @@ export function chiefOfStaffSystemPrompt(
   chiefId: string,
   bots: ChiefTeamMember[],
   availableAgentTools: readonly string[],
+  /** @deprecated Prefer the volatile `botfleet-status` prompt section at the
+   *  harness call site (BF-1358) instead of passing status here. */
   trustedBotFleetStatus = "",
 ): string {
   const chief = bots.find((bot) => bot.id === chiefId);

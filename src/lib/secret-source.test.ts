@@ -7,6 +7,8 @@ import {
   buildInfisicalConfigPatch,
   infisicalStatusLabel,
   infisicalSwitchDefault,
+  saveInfisicalSettings,
+  sourceDraftsFromStatus,
   secretSourceDisplay,
   secretSourceLabel,
   secretSourceTone,
@@ -90,18 +92,18 @@ describe("infisicalStatusLabel", () => {
 });
 
 describe("infisicalSwitchDefault", () => {
-  it("shows the documented default on an install with nothing configured", () => {
-    // `GET /api/config` reports `enabled: configured && settings.enabled`, so
-    // a fresh install sends `false` here.  Seeding the switch from that value
-    // renders Use Infisical off and makes the operator's very first Save
-    // persist a hard `enabled: false` — a store that authenticates and then
-    // governs nothing, with no message saying why.
+  it("uses the default on older responses with nothing configured", () => {
     expect(infisicalSwitchDefault({ configured: false, enabled: false })).toBe(true);
     expect(infisicalSwitchDefault(undefined)).toBe(true);
     expect(infisicalSwitchDefault(null)).toBe(true);
   });
 
-  it("honours the stored kill switch once there is a store to switch off", () => {
+  it("prefers the persisted toggle before credentials exist", () => {
+    expect(infisicalSwitchDefault({ configured: false, enabled: false, enabledSetting: false })).toBe(false);
+    expect(infisicalSwitchDefault({ configured: false, enabled: false, enabledSetting: true })).toBe(true);
+  });
+
+  it("honours the stored kill switch on older configured responses", () => {
     expect(infisicalSwitchDefault({ configured: true, enabled: false })).toBe(false);
     expect(infisicalSwitchDefault({ configured: true, enabled: true })).toBe(true);
   });
@@ -111,14 +113,32 @@ describe("buildInfisicalConfigPatch", () => {
   const base = {
     enabled: true,
     writeThrough: false,
+    authMethod: "service-token" as const,
     siteUrl: "https://app.infisical.com",
     projectId: "test-project-0000",
     environment: "prod",
     secretPath: "/",
     clientId: "client-id",
     clientSecret: "",
+    token: "",
+    writeToken: "",
+    readSources: [],
     refreshMinutes: 15,
   };
+
+  it("preserves an explicit disabled toggle through a save with no credentials", () => {
+    const enabled = infisicalSwitchDefault({ configured: false, enabled: false, enabledSetting: false });
+    const result = buildInfisicalConfigPatch({ ...base, enabled, projectId: "", clientId: "" });
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.patch.enabled).toBe(false);
+  });
+
+  it("preserves an explicit enabled toggle when the install is only partially configured", () => {
+    const enabled = infisicalSwitchDefault({ configured: false, enabled: false, enabledSetting: true });
+    const result = buildInfisicalConfigPatch({ ...base, enabled, token: "", clientSecret: "" });
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.patch.enabled).toBe(true);
+  });
 
   it("omits an empty client secret so Save cannot wipe a stored one", () => {
     const result = buildInfisicalConfigPatch(base);
@@ -139,6 +159,67 @@ describe("buildInfisicalConfigPatch", () => {
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.patch.clientSecret).toBe(SENTINEL_SECRET);
+  });
+
+  it("omits empty read/write tokens so blank fields keep saved encrypted credentials", () => {
+    const result = buildInfisicalConfigPatch(base);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.patch).not.toHaveProperty("token");
+    expect(result.patch).not.toHaveProperty("writeToken");
+  });
+
+  it("includes trimmed primary read and write tokens for the encrypted bridge", () => {
+    const result = buildInfisicalConfigPatch({ ...base, token: ` ${SENTINEL_SECRET} `, writeToken: ` ${SENTINEL_SECRET}-write ` });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.patch.token).toBe(SENTINEL_SECRET);
+    expect(result.patch.writeToken).toBe(`${SENTINEL_SECRET}-write`);
+  });
+
+  it("serializes additional sources as locator-only exact scopes", () => {
+    const result = buildInfisicalConfigPatch({
+      ...base,
+      readSources: [{
+        name: "fleet-ops-cli-logins",
+        projectId: "fleet-ops-project",
+        environment: "prod",
+        secretPath: "/cli-logins/CODEX",
+        readSourceType: "env",
+        readSource: "BOTFLEET_CLI_LOGINS_READ_TOKEN",
+        writeSourceType: "file",
+        writeSource: "/home/botfleet/.botfleet/fleet-cli-write-token",
+      }],
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.patch.readSources).toEqual([{
+      name: "fleet-ops-cli-logins",
+      projectId: "fleet-ops-project",
+      environment: "prod",
+      secretPath: "/cli-logins/CODEX",
+      tokenEnv: "BOTFLEET_CLI_LOGINS_READ_TOKEN",
+      writeTokenFile: "/home/botfleet/.botfleet/fleet-cli-write-token",
+    }]);
+    expect(JSON.stringify(result.patch)).not.toContain(SENTINEL_SECRET);
+  });
+
+  it("rejects incomplete source rows, invalid locators, and duplicate exact scopes", () => {
+    const incomplete = buildInfisicalConfigPatch({ ...base, readSources: [{
+      name: "source-one", projectId: "proj-one", environment: "prod", secretPath: "/one",
+      readSourceType: "env", readSource: "", writeSourceType: "env", writeSource: "",
+    }] });
+    expect(incomplete).toMatchObject({ ok: false });
+    const invalidEnv = buildInfisicalConfigPatch({ ...base, readSources: [{
+      name: "source-one", projectId: "proj-one", environment: "prod", secretPath: "/one",
+      readSourceType: "env", readSource: "lowercase", writeSourceType: "env", writeSource: "",
+    }] });
+    expect(invalidEnv).toMatchObject({ ok: false });
+    const duplicateScope = buildInfisicalConfigPatch({ ...base, readSources: [
+      { name: "source-one", projectId: "proj-one", environment: "prod", secretPath: "/one", readSourceType: "env", readSource: "ONE_TOKEN", writeSourceType: "env", writeSource: "" },
+      { name: "source-two", projectId: "proj-one", environment: "prod", secretPath: "/one", readSourceType: "env", readSource: "TWO_TOKEN", writeSourceType: "env", writeSource: "" },
+    ] });
+    expect(duplicateScope).toMatchObject({ ok: false });
   });
 
   it("trims the site URL", () => {
@@ -207,7 +288,7 @@ describe("buildInfisicalConfigPatch", () => {
     // check here is that no OTHER field smuggles a value out, not that the
     // patch is value-free (a write-through save has to carry the secret).
     expect(Object.keys(result.patch).sort()).toEqual(
-      ["clientId", "clientSecret", "enabled", "environment", "projectId", "refreshMinutes", "secretPath", "siteUrl", "writeThrough"].sort(),
+      ["authMethod", "clientId", "clientSecret", "enabled", "environment", "projectId", "readSources", "refreshMinutes", "secretPath", "siteUrl", "writeThrough"].sort(),
     );
     expect(serialized).toContain(SENTINEL_SECRET);
   });
@@ -218,70 +299,165 @@ describe("splitInfisicalPatch", () => {
     const result = buildInfisicalConfigPatch({
       enabled: true,
       writeThrough: false,
+      authMethod: "service-token",
       siteUrl: "https://app.infisical.com",
       projectId: "proj-1",
       environment: "prod",
       secretPath: "/",
       clientId: "client-1",
       clientSecret: SENTINEL_SECRET,
+      token: SENTINEL_SECRET,
+      writeToken: `${SENTINEL_SECRET}-write`,
+      readSources: [],
       refreshMinutes: 15,
     });
     if (!result.ok) throw new Error(result.error);
     return result.patch;
   };
 
-  it("sends the client secret through the bridge and everything else over PATCH", () => {
-    const { configPatch, bridgeSecret } = splitInfisicalPatch(built(), true);
-
-    // The whole point: the one value that can read every name in the project
-    // never rides in a plain HTTP body that the server would write into
-    // plaintext config.json.
-    expect(bridgeSecret).toBe(SENTINEL_SECRET);
-    expect(JSON.stringify(configPatch)).not.toContain(SENTINEL_SECRET);
-    expect("clientSecret" in configPatch).toBe(false);
-    // And nothing else is lost on the way — the client id is a plain
-    // identifier and stays in the PATCH, exactly as it does on disk.
-    expect(Object.keys(configPatch).sort()).toEqual(
-      ["clientId", "enabled", "environment", "projectId", "refreshMinutes", "secretPath", "siteUrl", "writeThrough"].sort(),
-    );
-    expect(configPatch.clientId).toBe("client-1");
+  it("sends all primary credentials through the bridge and only metadata over PATCH", () => {
+    const result = splitInfisicalPatch(built(), true);
+    expect("error" in result).toBe(false);
+    if ("error" in result) return;
+    expect(result.bridgeCredentials).toEqual([
+      { name: "infisicalClientSecret", value: SENTINEL_SECRET },
+      { name: "infisicalReadToken", value: SENTINEL_SECRET },
+      { name: "infisicalWriteToken", value: `${SENTINEL_SECRET}-write` },
+    ]);
+    expect(JSON.stringify(result.configPatch)).not.toContain(SENTINEL_SECRET);
+    expect(result.configPatch).not.toHaveProperty("clientSecret");
+    expect(result.configPatch).not.toHaveProperty("token");
+    expect(result.configPatch).not.toHaveProperty("writeToken");
+    expect(result.configPatch.clientId).toBe("client-1");
   });
 
-  it("keeps the secret in the PATCH body when there is no desktop bridge", () => {
-    // A browser against the loopback harness has no OS credential store to
-    // reach, so the server's own file is the only place the identity can go.
-    const { configPatch, bridgeSecret } = splitInfisicalPatch(built(), false);
-
-    expect(bridgeSecret).toBeNull();
-    expect(configPatch.clientSecret).toBe(SENTINEL_SECRET);
+  it("refuses to put a credential in a plain HTTP config patch without Electron", () => {
+    expect(splitInfisicalPatch(built(), false)).toEqual({
+      error: "Save Infisical credentials from the BotFleet desktop app so they stay in its encrypted credential store.",
+    });
   });
 
   it("takes the plain PATCH path when the save carries no secret at all", () => {
     const result = buildInfisicalConfigPatch({
       enabled: true,
       writeThrough: true,
+      authMethod: "service-token",
       siteUrl: "https://app.infisical.com",
       projectId: "proj-1",
       environment: "prod",
       secretPath: "/",
       clientId: "",
       clientSecret: "",
+      token: "",
+      writeToken: "",
+      readSources: [],
       refreshMinutes: 30,
     });
     if (!result.ok) throw new Error(result.error);
 
-    const { configPatch, bridgeSecret } = splitInfisicalPatch(result.patch, true);
-
-    // Changing Refresh Minutes on its own must not call the bridge with an
-    // empty string — `credential:set` reads that as "delete this credential".
-    expect(bridgeSecret).toBeNull();
-    expect(configPatch).toEqual(result.patch);
+    const split = splitInfisicalPatch(result.patch, true);
+    expect("error" in split).toBe(false);
+    if ("error" in split) return;
+    expect(split.bridgeCredentials).toEqual([]);
+    expect(split.configPatch).toEqual(result.patch);
   });
 
   it("leaves the built patch untouched", () => {
     const patch = built();
     splitInfisicalPatch(patch, true);
     expect(patch.clientSecret).toBe(SENTINEL_SECRET);
+    expect(patch.token).toBe(SENTINEL_SECRET);
+  });
+});
+
+describe("token source metadata round trips", () => {
+  it("preserves file precedence instead of switching credentials on an ordinary save", () => {
+    const [draft] = sourceDraftsFromStatus([{
+      name: "extra", projectId: "extra-project", environment: "prod", secretPath: "/folder",
+      tokenFile: "/fixture/read-token", tokenEnv: "IGNORED_READ_TOKEN",
+      writeTokenFile: "/fixture/write-token", writeTokenEnv: "IGNORED_WRITE_TOKEN",
+    }]);
+    expect(draft).toMatchObject({
+      readSourceType: "file", readSource: "/fixture/read-token",
+      writeSourceType: "file", writeSource: "/fixture/write-token",
+    });
+    const result = buildInfisicalConfigPatch({
+      enabled: false, writeThrough: false, authMethod: "service-token",
+      siteUrl: "https://app.infisical.com", projectId: "", environment: "prod", secretPath: "/",
+      clientId: "", clientSecret: "", token: "", writeToken: "", refreshMinutes: 15,
+      readSources: [draft],
+    });
+    if (!result.ok) throw new Error(result.error);
+    expect(result.patch.readSources).toEqual([{
+      name: "extra", projectId: "extra-project", environment: "prod", secretPath: "/folder",
+      tokenFile: "/fixture/read-token", writeTokenFile: "/fixture/write-token",
+    }]);
+  });
+});
+
+describe("saving credentials with a changed Infisical destination", () => {
+  const settings: InfisicalConfigPatch = {
+    enabled: true, writeThrough: false, authMethod: "service-token",
+    siteUrl: "https://new.example.test", projectId: "new-project",
+    environment: "prod", secretPath: "/new-folder", refreshMinutes: 15,
+    token: SENTINEL_SECRET, writeToken: "synthetic-write-token",
+  };
+
+  function split() {
+    const result = splitInfisicalPatch(settings, true);
+    if ("error" in result) throw new Error(result.error);
+    return result;
+  }
+
+  it("cannot refresh a new token at the previous site or enable before both encrypted writes", async () => {
+    let current = { ...settings, siteUrl: "https://old.example.test", projectId: "old-project" };
+    const saved: string[] = [];
+    const requests: Array<{ site: string; credentials: string[] }> = [];
+    const result = await saveInfisicalSettings(split(), async (patch) => {
+      current = { ...current, ...patch };
+      if (current.enabled) requests.push({ site: current.siteUrl, credentials: [...saved] });
+      expect(patch).not.toHaveProperty("token");
+      expect(patch).not.toHaveProperty("writeToken");
+      return current.projectId;
+    }, async (name) => {
+      saved.push(name);
+      // The encrypted store's bridge reload must observe a disabled target.
+      expect(current.enabled).toBe(false);
+      expect(current.siteUrl).toBe(settings.siteUrl);
+      expect(current.projectId).toBe(settings.projectId);
+      if (current.enabled) requests.push({ site: current.siteUrl, credentials: [...saved] });
+    });
+    expect(result).toBe("new-project");
+    expect(requests).toEqual([{ site: settings.siteUrl, credentials: ["infisicalReadToken", "infisicalWriteToken"] }]);
+  });
+
+  it("leaves reads disabled when a later encrypted write fails", async () => {
+    let enabled = true;
+    let stored = 0;
+    await expect(saveInfisicalSettings(split(), async (patch) => {
+      enabled = patch.enabled;
+      return true;
+    }, async () => {
+      if (++stored === 2) throw new Error("synthetic protected-store failure");
+    })).rejects.toThrow("Infisical was left disabled");
+    expect(stored).toBe(2);
+    expect(enabled).toBe(false);
+  });
+
+  it("never writes credentials when staging is refused", async () => {
+    let stored = false;
+    await expect(saveInfisicalSettings(split(), async () => {
+      throw new Error("synthetic config refusal");
+    }, async () => { stored = true; })).rejects.toThrow("synthetic config refusal");
+    expect(stored).toBe(false);
+  });
+
+  it("keeps a requested disabled state after replacing credentials", async () => {
+    const value = split();
+    value.configPatch.enabled = false;
+    const states: boolean[] = [];
+    await saveInfisicalSettings(value, async (patch) => { states.push(patch.enabled); }, async () => {});
+    expect(states).toEqual([false, false]);
   });
 });
 

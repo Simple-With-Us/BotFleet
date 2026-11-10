@@ -3,8 +3,10 @@ import { describe, expect, it } from "vitest";
 import {
   DELEGATION_PREFIX_MID,
   DELEGATION_PREFIX_START,
+  delegationLiveLine,
   delegationMessageView,
   isDelegationMessage,
+  type DelegationProgressRow,
 } from "./delegation-message";
 
 describe("shared/delegation-message", () => {
@@ -59,5 +61,19 @@ describe("shared/delegation-message", () => {
     expect(delegationMessageView("user", "User typed text")).toBeNull();
     expect(delegationMessageView("user", "")).toBeNull();
     expect(delegationMessageView("bot", sample)).toBeNull();
+  });
+
+  it("says what the bot is doing with the handoff, and stops at the next message from a person", () => {
+    const rows: DelegationProgressRow[] = [
+      { role: "system", kind: "text" },
+      { role: "bot", kind: "activity", tool: { name: "Read", target: "notes.md" } },
+      { role: "bot", kind: "activity", tool: { name: "Bash", target: "pnpm test" } },
+      { role: "user", kind: "text" },
+      { role: "bot", kind: "activity", tool: { name: "Edit", target: "later.ts" } },
+    ];
+    expect(delegationLiveLine(rows, 0, true)).toBe("Working · pnpm test · 2 tools");
+    expect(delegationLiveLine([...rows.slice(0, 3), { role: "bot", kind: "text" }], 0, false)).toBe("Done · 2 tools");
+    expect(delegationLiveLine([{ role: "system", kind: "text" }], 0, true)).toBe("Working");
+    expect(delegationLiveLine([{ role: "system", kind: "text" }], 0, false)).toBeUndefined();
   });
 });

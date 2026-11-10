@@ -10,6 +10,7 @@
 // inbounds keep their own chat id until drain starts that turn.
 
 import { outboundImessageText } from "../../shared/imessage-message.ts";
+import { redactSecretsInText } from "../../shared/redact.ts";
 import { linqSendMessage, linqStopTyping } from "./client.ts";
 import { loadConfig } from "../config.ts";
 
@@ -119,8 +120,12 @@ export async function deliverLinqOutboundIfNeeded(
   if (cfg.botDefaults?.imessagePerBot?.[botId] !== "linq") {
     return { sent: false, reason: "bot_not_linq" };
   }
-  const outbound = outboundImessageText(text);
-  if (!outbound) return { sent: false, reason: "not_tagged" };
+  const tagged = outboundImessageText(text);
+  if (!tagged) return { sent: false, reason: "not_tagged" };
+  // The stored row and the stream frame are scrubbed before they leave the
+  // server, but this is the raw event text.  A phone is not a place a key
+  // should ever arrive, so it passes through the same redaction here.
+  const outbound = redactSecretsInText(tagged);
   try {
     await linqSendMessage(binding.chatId, { text: outbound });
     await linqStopTyping(binding.chatId).catch(() => undefined);
@@ -131,5 +136,20 @@ export async function deliverLinqOutboundIfNeeded(
       sent: false,
       reason: err instanceof Error ? err.message : "send_failed",
     };
+  }
+}
+
+/** Answer a slash command over Linq: the reply goes straight to the chat the
+ *  command came from, redacted like every other outbound text, and the typing
+ *  indicator the inbound started is stopped (a command starts no turn, so no
+ *  turn completion would stop it). */
+export async function sendLinqCommandReply(chatId: string, text: string): Promise<{ sent: boolean; reason?: string }> {
+  try {
+    await linqSendMessage(chatId, { text: redactSecretsInText(text) });
+    await linqStopTyping(chatId).catch(() => undefined);
+    return { sent: true };
+  } catch (err) {
+    await linqStopTyping(chatId).catch(() => undefined);
+    return { sent: false, reason: err instanceof Error ? err.message : "send_failed" };
   }
 }

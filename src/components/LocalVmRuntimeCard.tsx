@@ -19,7 +19,7 @@ import { Card, CommandLine } from "./SettingsPrimitives";
 import { cn } from "@/lib/cn";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { redactCommandSecrets } from "@/lib/redact-command-secrets";
-import { localVmSetupLine } from "@/lib/local-vm-setup-line";
+import { localVmSetupLine, type LocalVmSetupFacts } from "@/lib/local-vm-setup-line";
 import { PersistentActionErrorCard } from "./PersistentActionErrorCard";
 
 // Must outlast the harness's worst case for one status read: a 4 s presence
@@ -41,7 +41,7 @@ interface Status {
   image: boolean;
   imageMatches: boolean;
   managed: boolean;
-  container: "running" | "stopped" | "missing";
+  container: "running" | "stopped" | "created" | "missing";
   network: "loopback" | "unsafe" | "unknown";
   security: "hardened" | "unsafe" | "unknown";
   persistence: "durable" | "unsafe" | "unknown";
@@ -167,6 +167,9 @@ export function LocalVmRuntimeCard() {
       } catch (e) {
         if (!active) return;
         if (e instanceof DOMException && e.name === "AbortError" && !timedOut) return;
+        // A previous poll is stale after a failed refresh.  Stop exposing
+        // actions based on it until the server confirms the current state.
+        setStatus(null);
         const message = e instanceof Error ? e.message : String(e);
         setStatusError(
           redactCommandSecrets(
@@ -240,20 +243,45 @@ export function LocalVmRuntimeCard() {
 
   const c = status?.commands;
   const ready = status?.ready === true;
-  const existing = status?.container !== "missing";
+  const createdVmVerified = Boolean(
+    status?.container === "created" &&
+      status.image &&
+      status.imageMatches &&
+      status.managed &&
+      status.network === "loopback" &&
+      status.security === "hardened" &&
+      status.persistence === "durable",
+  );
+  const firstStartSafe = createdVmVerified && status?.daemonUp === true;
+  // Only an explicitly returned container state is affirmative evidence
+  // that a VM exists.  A
+  // failed/null/malformed status response must never expose destructive VM
+  // controls or imply that its durable workspace is absent.
+  const existing = status?.container === "running" || status?.container === "stopped" || status?.container === "created";
   const needsRecreate = Boolean(
     existing &&
       (status?.container === "stopped" ||
+        (status?.container === "created" && !createdVmVerified) ||
         !status?.imageMatches ||
         !status?.managed ||
         status?.network === "unsafe" ||
         status?.security === "unsafe" ||
         status?.persistence === "unsafe"),
   );
-  const unavailable = !loading && !status && Boolean(statusError);
+  const unavailable = !loading && !status;
   const host = status?.platform === "darwin" ? "Mac" : "computer";
   const perBotRuntimeUnsupported = perBot && status?.runtime === "container";
   const headerReady = perBot ? Boolean(status?.daemonUp && status?.image && !perBotRuntimeUnsupported) : ready;
+  const setupStatus: LocalVmSetupFacts | null = status
+    ? {
+        runtime: status.runtime,
+        daemonUp: status.daemonUp,
+        daemonSlow: status.daemonSlow,
+        image: status.image,
+        container: status.container === "created" ? "missing" : status.container,
+        problem: status.problem,
+      }
+    : null;
 
   const switchMode = (next: "shared" | "per-bot") => {
     if (modePending) return;
@@ -297,7 +325,11 @@ export function LocalVmRuntimeCard() {
                     ? "Per-bot mode requires Docker or Podman"
                   : ready
                     ? "Ready"
-                    : localVmSetupLine(status, perBot)}
+                    : status?.container === "created"
+                      ? createdVmVerified
+                        ? firstStartSafe ? "Ready to start" : status.daemonSlow ? "Waiting for Docker to respond" : `Start ${status.runtime ?? "the container runtime"} first`
+                        : status.problem ?? "Local VM needs attention"
+                      : localVmSetupLine(setupStatus, perBot)}
           </span>
           <button
             onClick={() => {
@@ -363,7 +395,14 @@ export function LocalVmRuntimeCard() {
       </Card>
 
       <Card title="Setup" subtitle="Once a container runtime is open, BotFleet prepares the Linux desktop and the VM for you.">
-        <div className="flex flex-col gap-4">
+        {unavailable ? (
+          <div className="flex items-center gap-2 text-[13px] text-ink-secondary">
+            <AlertTriangle size={15} className="shrink-0 text-warning" />
+            <span>Runtime and VM state are unknown until status is available.{"\u00a0 "}Re-check above before preparing an image or creating a VM.</span>
+          </div>
+        ) : loading ? (
+          <div className="flex items-center gap-2 text-[13px] text-ink-secondary"><Loader2 size={14} className="animate-spin" /> Checking runtime and VM status…</div>
+        ) : <div className="flex flex-col gap-4">
           <Step n={1} title="Install a Container Runtime" done={Boolean(status?.runtime)}>
             <div className="text-[13px] leading-relaxed text-ink-secondary">
               Podman and Colima are free.{"\u00a0 "}Docker Desktop may require a paid licence for larger companies and government use.
@@ -408,7 +447,13 @@ export function LocalVmRuntimeCard() {
 
           <Step
             n={4}
-            title={perBot ? "Create a Private Desktop from Each Bot's Computer Panel" : needsRecreate ? "Replace the Older or Unsafe VM" : "Create and Start the Local VM"}
+            title={perBot
+              ? "Create a Private Desktop from Each Bot's Computer Panel"
+              : needsRecreate
+                ? "Replace the Older or Unsafe VM"
+                : status?.container === "created" && createdVmVerified
+                  ? "Start the Local VM"
+                  : "Create and Start the Local VM"}
             done={!perBot && ready}
           >
             {perBot ? (
@@ -441,17 +486,23 @@ export function LocalVmRuntimeCard() {
                 </div>
                 {status?.image ? (
                   <ActionButton action="recreate" pending={pending} onClick={() => void act("recreate")} danger disabled={localVmOff}>
-                    <RotateCcw size={13} /> Delete and recreate
+                    <RotateCcw size={13} /> Delete and Recreate
                   </ActionButton>
                 ) : (
                   <div className="text-[13px] text-ink-secondary">Prepare the pinned Linux desktop above before recreating this VM.</div>
                 )}
               </>
+            ) : status?.container === "created" && firstStartSafe ? (
+              <ActionButton action="start" pending={pending} onClick={() => void act("start")} disabled={localVmOff}>Start Local VM</ActionButton>
+            ) : status?.container === "created" && createdVmVerified ? (
+              <div className="text-[13px] text-ink-secondary">
+                {status.daemonSlow ? `Waiting for ${status.runtime ?? "the container runtime"} to respond.` : `Start ${status.runtime ?? "the container runtime"} above first.`}
+              </div>
             ) : status?.container === "running" ? (
               <div className="flex items-center gap-2 text-[13px] text-ink-secondary"><Loader2 size={13} className="animate-spin" /> Waiting for the desktop…</div>
-            ) : status?.image ? (
+            ) : status?.container === "missing" && status.image ? (
               <ActionButton action="run" pending={pending} onClick={() => void act("run")} disabled={localVmOff}>Create Local VM</ActionButton>
-            ) : status ? (
+            ) : status?.container === "missing" ? (
               // The VM comes last: say which step is still ahead of it.
               <div className="text-[13px] text-ink-secondary">
                 {status.daemonUp
@@ -460,20 +511,28 @@ export function LocalVmRuntimeCard() {
                     ? "Waiting for the container runtime to respond."
                     : "Start the container runtime above first."}
               </div>
+            ) : status ? (
+              <div className="text-[13px] text-ink-secondary">VM state is unknown. Re-check status before creating or removing a VM.</div>
             ) : null}
             {localVmOff && !perBot && (
-              <div className="text-[13px] text-ink-secondary">Local VM is turned off in Computer settings.{"\u00a0 "}Turn it on above to create or start it.</div>
+              <div className="text-[13px] text-ink-secondary">
+                Local VM is turned off in Computer settings.{"\u00a0 "}
+                <a href="#setting-computers-providers" className="text-accent hover:underline">Enable Local VM in Computer settings</a> to create or start it.
+              </div>
             )}
             {c?.run && <details className="text-[12px] text-ink-secondary"><summary className="cursor-pointer">Show Command</summary><div className="mt-2"><CommandLine command={c.run} /></div></details>}
           </Step>
-        </div>
+        </div>}
       </Card>
 
       {unavailable && (
         <Card>
           <div className="flex gap-2 text-[13px] text-ink-secondary">
             <AlertTriangle size={15} className="mt-0.5 shrink-0 text-warning" />
-            <span>BotFleet could not inspect the container runtime.{"\u00a0 "}Re-check, or review the app logs.</span>
+            <span>
+              BotFleet could not confirm whether a Local VM exists.{"\u00a0 "}
+              {statusError ? <>Re-check after the status request recovers, or review the app logs.</> : <>Re-check status before creating or removing a VM.</>}
+            </span>
           </div>
         </Card>
       )}
@@ -497,8 +556,8 @@ export function LocalVmRuntimeCard() {
           </div>
         )}
         <div className="mt-3 break-all text-[11px] text-ink-secondary">
-          Durable workspace: {status?.workspace_path ?? "not created"} ·{" "}
-          Computer Driver: {status?.driver_version ?? "0.20.0"} · Local image: {status?.image_ref ?? "not prepared"}
+          Durable workspace: {status ? status.workspace_path || (status.container === "missing" ? "not created" : "unknown") : "status unavailable"} ·{" "}
+          Computer Driver: {status?.driver_version ?? "0.20.0"} · Local image: {status ? status.image_ref || (status.image ? "prepared" : "not prepared") : "status unavailable"}
           {status?.base_image_ref ? <> · Base: {status.base_image_ref}</> : null}
         </div>
       </Card>

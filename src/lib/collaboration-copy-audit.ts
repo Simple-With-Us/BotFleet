@@ -7,7 +7,10 @@ export function hasSlackReference(...values: Array<string | undefined | null>): 
  * chooses this action for that saved routine or webhook. */
 export function convertSlackReferenceToZulip(value: string): string {
   return value
-    .replace(/slack-(?:sync|collab)/gi, "agent-sync")
+    // `slack-sync`/`slack-collab` were retired spellings of the fleet chat
+    // CLI, not the channel:  convert them to the current CLI name so the
+    // saved routine still runs.
+    .replace(/slack-(?:sync|collab)/gi, "simple-chat")
     // Replace only the standalone product name.  A sentence-ending period is
     // not part of the word.  A period that starts a host (`slack.com`) is.
     // URLs, channel names, environment variables, and other identifiers stay

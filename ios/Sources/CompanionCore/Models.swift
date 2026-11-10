@@ -68,6 +68,25 @@ public struct OptionCard: Codable, Hashable, Sendable {
     /// Permission cards carry a tool; questions do not.
     public var isPermission: Bool { tool != nil }
 
+    /// Whether the choices should be stacked full-width instead of laid
+    /// out as equal-width capsules in one row.  A permission card's
+    /// Allow/Deny pair always fits the row, so only questions stack — when
+    /// there are more than two choices, or any one of them is too long to
+    /// survive being squeezed into a share of the row.
+    public var prefersStackedChoices: Bool {
+        Self.prefersStackedChoices(options: options, isPermission: isPermission)
+    }
+
+    /// The longest choice a two-across capsule row can show before the
+    /// text is crushed past reading.
+    public static let stackedChoiceLength = 18
+
+    public static func prefersStackedChoices(options: [String], isPermission: Bool) -> Bool {
+        guard !isPermission else { return false }
+        if options.count > 2 { return true }
+        return options.contains { $0.count > stackedChoiceLength }
+    }
+
     /// The wire API accepts an approval behavior rather than the button's
     /// display text. Treat the one refusal as deny and every other offered
     /// permission choice as allow: providers may say "Approve", "Yes", or
@@ -266,13 +285,59 @@ public struct ModelSelection: Codable, Hashable, Sendable {
     /// Kept as a string so a newer server's saved value still round-trips
     /// through an older phone until the person explicitly changes it.
     public var effort: String?
+    /// A model class this entry floats on ("Latest Sonnet" is `latest: "sonnet"`).
+    public var latest: String?
     public var fallbacks: [ModelSelection]?
 
-    public init(instanceId: String, model: String, effort: String? = nil, fallbacks: [ModelSelection]? = nil) {
+    public init(
+        instanceId: String,
+        model: String,
+        effort: String? = nil,
+        latest: String? = nil,
+        fallbacks: [ModelSelection]? = nil
+    ) {
         self.instanceId = instanceId
         self.model = model
         self.effort = effort
+        self.latest = latest
         self.fallbacks = fallbacks
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case instanceId
+        case model
+        case effort
+        case latest
+        case fallbacks
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.instanceId = try container.decode(String.self, forKey: .instanceId)
+        let rawModel = try container.decode(String.self, forKey: .model)
+        self.effort = try container.decodeIfPresent(String.self, forKey: .effort)
+        let rawLatest = try container.decodeIfPresent(String.self, forKey: .latest)
+        self.fallbacks = try container.decodeIfPresent([ModelSelection].self, forKey: .fallbacks)
+
+        if let rawLatest, !rawLatest.isEmpty {
+            self.latest = rawLatest
+            self.model = rawModel
+        } else if let alias = ModelLineage.detectAlias(from: rawModel) {
+            self.latest = alias
+            self.model = rawModel
+        } else {
+            self.latest = nil
+            self.model = rawModel
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(instanceId, forKey: .instanceId)
+        try container.encode(model, forKey: .model)
+        try container.encodeIfPresent(effort, forKey: .effort)
+        try container.encodeIfPresent(latest, forKey: .latest)
+        try container.encodeIfPresent(fallbacks, forKey: .fallbacks)
     }
 }
 
@@ -409,7 +474,7 @@ public struct Bot: Codable, Hashable, Identifiable, Sendable {
 }
 
 public enum AvatarCrop: String, Codable, CaseIterable, Hashable, Sendable {
-    case mascot, circle, rounded, square
+    case mascot, tvface, circle, rounded, square
 
     /// The desktop may gain crop modes before this app updates. Falling back
     /// keeps the complete bot/fleet payload decodable and guarantees a safe,
@@ -962,6 +1027,8 @@ public struct ConfigStatus: Codable, Sendable {
     /// `simple` or `projects`.  Absent means simple.  A leftover `fleet`
     /// value is treated as projects.
     public var conversationMode: String?
+    /// `queue` or `steer`.  Absent means steer-first (legacy harness behavior).
+    public var busySendDefault: String?
     public var sidebarSectionOrder: [String]?
     /// Enable Automatic Update Checks.  Absent on a harness that predates
     /// the desktop updater, which is not the same as off.

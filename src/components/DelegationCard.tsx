@@ -12,11 +12,14 @@ export function DelegationCard({
   comm,
   targetBotName,
   icon,
+  progress,
 }: {
   view: DelegationMessageView;
   comm?: Message["comm"];
   targetBotName?: string;
   icon?: ReactNode;
+  /** What the bot is doing with this handoff, while it works and once it answers. */
+  progress?: string;
 }) {
   const { dispatch } = useStore();
   const [open, setOpen] = useState(false);
@@ -45,6 +48,11 @@ export function DelegationCard({
         {view.subtitle && (
           <span className="truncate text-[11.5px] text-ink-secondary" title={view.subtitle}>
             {view.subtitle}
+          </span>
+        )}
+        {progress && (
+          <span className="truncate text-[11.5px] text-ink-secondary" title={progress} data-testid="delegation-progress">
+            {progress}
           </span>
         )}
       </span>

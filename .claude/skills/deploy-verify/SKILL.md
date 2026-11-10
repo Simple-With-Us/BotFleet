@@ -25,7 +25,7 @@ Operator host (live 2026-08-07+): Hetzner NBG1 **`<PROD_ORIGIN_IP>`** / `fleet-h
 | `COOLIFY_SERVER_STATS` | Read-only.  App server-stats panels.  Infisical metrics token. |
 | `COOLIFY_AGENTS` | Full deploy/admin.  Agent ops only.  **Never** store this in Infisical as the app's `COOLIFY_API_TOKEN`. |
 
-Load via env, not argv.  Names only from the handoff file: `grep -oE '^[A-Z][A-Z0-9_]*' ~/.secrets/global-api-keys`.  See `secret-handoff`.
+Load via env, not argv.  Names only: `fleet-secrets names`.  See `secret-handoff`.
 
 If Infisical still has `COOLIFY_API_TOKEN` for metrics, it must equal `COOLIFY_SERVER_STATS`.
 
@@ -43,7 +43,7 @@ If Infisical still has `COOLIFY_API_TOKEN` for metrics, it must equal `COOLIFY_S
 
 Prefer live `GET /api/v1/applications` (via a helper that reads the token itself, or Coolify MCP) over memorized UUIDs.
 
-AGENT-SYNC's "sanctioned deploy path" table still names ST uuid `<OLD_ST_COOLIFY_APP_UUID>`, CT Worker `deploy.yml`, and UM Render — **stale**.  Prefer this table + `~/apps/COOLIFY.md` (top Hetzner section only; the Oracle body below the cut is historical).
+FLEET-PROTOCOL's "sanctioned deploy path" table still names ST uuid `<OLD_ST_COOLIFY_APP_UUID>`, CT Worker `deploy.yml`, and UM Render — **stale**.  Prefer this table + `~/apps/COOLIFY.md` (top Hetzner section only; the Oracle body below the cut is historical).
 
 Steady state: ST/CT/UM auto-deploy via Coolify webhook; DealDex via Vercel; AFL digest via Pages; CTS via tag.  Announce-then-deploy (~10 min, one deployer) only for a **manual** Coolify/API click.  Do not double-trigger: Coolify cancel is unreliable.
 
@@ -70,7 +70,7 @@ Do not interpolate the token into a command you will see.  Prefer Coolify MCP or
 ssh -i ~/.ssh/hetzner root@<PROD_ORIGIN_IP> 'docker ps --format "{{.Names}} {{.Status}}"'
 ```
 
-**Zombie:** a deploy stuck `in_progress` blocks the queue (`concurrent_builds` serializes).  Post `#agent-sync` with the deployment id if you can see it from the box.
+**Zombie:** a deploy stuck `in_progress` blocks the queue (`concurrent_builds` serializes).  Post `#Work-In-Progress` with the deployment id if you can see it from the box.
 
 **Silent freeze (ST #2545 class):** webhook 200 + healthy `/api/health` on an **old** sha.  Standing watch: ST `.github/workflows/deploy-freshness.yml`.  Do not hand-trigger; inspect the queue.
 
@@ -110,7 +110,7 @@ Move the effort row to **Deployed** only when you say how you verified.  `closeo
 ## Canon
 
 - `/Users/jay/apps/COOLIFY.md`
-- `/Users/jay/apps/AGENT-SYNC.md` — Production deploys; Coolify tokens
+- `/Users/jay/apps/FLEET-PROTOCOL.md` — Production deploys; Coolify tokens
 - ST `docs/rollouts/2026-08-07-hetzner-fleet-cutover.md`
 - ST `docs/rollouts/2026-07-10-auto-deploy-on.md` (mechanism; UUIDs/IPs in that note may be pre-cutover)
 - Skills: `secret-handoff`, `closeout`, `land-lane`

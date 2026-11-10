@@ -41,4 +41,23 @@ describe("the transcript row a tool step becomes", () => {
     expect(completedToolRow(undefined, { ok: true }, undefined).name).toBe("tool");
     expect(startedToolRow({}, undefined).name).toBe("tool");
   });
+
+  it("uses a terminal title supplied by the engine and otherwise keeps the started title", () => {
+    expect(completedToolRow({ name: "hookRun: inProgress" }, { ok: true, title: "hookRun: completed" }, 5).name)
+      .toBe("hookRun: completed");
+    expect(completedToolRow({ name: "hookRun: inProgress" }, { ok: true }, 5).name)
+      .toBe("hookRun: inProgress");
+  });
+
+  it("redacts secret-shaped terminal titles before they replace a stored row", () => {
+    const secret = "ak9999999999999999999999999999999";
+    const row = completedToolRow(
+      { name: "hookRun: inProgress" },
+      { ok: false, title: `hookRun: failed api_key=${secret}` },
+      5,
+    );
+
+    expect(row.name).toContain("redacted");
+    expect(row.name).not.toContain(secret);
+  });
 });

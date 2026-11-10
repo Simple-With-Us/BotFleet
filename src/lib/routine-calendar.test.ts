@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import type { Routine } from "./routines";
 import {
@@ -13,6 +13,23 @@ import {
   timeZoneLabel,
 } from "./routine-calendar";
 import { startOfDayInTimeZone } from "../../shared/time-zone";
+
+/** The clock part of a label is rendered in the host's locale, so the
+ *  expectation is built with the same formatter the label uses.  A hard-coded
+ *  "9:00 AM" only holds on an English twelve-hour host, and the label is
+ *  what the app shows, locale and all. */
+function wallClockLabel(hour: number, minute: number): string {
+  return new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit", timeZone: "UTC" })
+    .format(Date.UTC(2000, 0, 1, hour, minute));
+}
+
+/** The same, for a whole label: the day and the clock are fixed, and only
+ *  the zone abbreviation is allowed to vary between the two spellings ICU
+ *  gives a zone with no name of its own. */
+function labelPattern(day: string, hour: number, minute: number, zone: string): RegExp {
+  const clock = wallClockLabel(hour, minute).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`^${day} at ${clock} (${zone})$`);
+}
 
 function routine(schedule: Routine["schedule"]): Routine {
   return {
@@ -63,8 +80,31 @@ describe("routine calendar timezone", () => {
 
   it("names both the Central calendar policy and a preserved legacy host zone", () => {
     expect(timeZoneLabel("America/Chicago", Date.parse("2026-07-01T12:00:00Z"))).toBe("Central Time (CDT)");
-    const legacy = routine({ type: "daily", time: "09:00", weekdays: [1], timeZone: "Europe/Athens" });
-    expect(routineScheduleLabel(legacy)).toMatch(/^Mon at 9:00 AM (GMT\+3|EEST)$/);
+    //  The zone name follows the instant the label is built from, so the
+    //  fixture pins one.  Europe/Athens is GMT+3 in July and GMT+2 in
+    //  winter, so an unpinned label flips with the daylight-saving switch
+    //  and fails every run on one side of it.
+    const legacy = {
+      ...routine({ type: "daily", time: "09:00", weekdays: [1], timeZone: "Europe/Athens" }),
+      nextRunAt: Date.parse("2026-07-01T09:00:00Z"),
+    };
+    expect(routineScheduleLabel(legacy)).toMatch(labelPattern("Mon", 9, 0, "GMT\\+3|EEST"));
+  });
+
+  it("keeps the disabled-routine label on a pinned winter instant", () => {
+    //  A disabled routine carries no next run, so the label falls back to
+    //  the current instant, and the zone abbreviation it prints follows that
+    //  instant.  Pin the clock, or the assertion flips with the
+    //  daylight-saving switch exactly like the fixture above did.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(Date.parse("2026-01-15T09:00:00Z"));
+      const disabled = routine({ type: "daily", time: "09:00", weekdays: [1], timeZone: "Europe/Athens" });
+      expect(disabled.nextRunAt).toBeNull();
+      expect(routineScheduleLabel(disabled)).toMatch(labelPattern("Mon", 9, 0, "GMT\\+2|EET"));
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("omits a display-only host zone when an existing legacy recurrence is edited", () => {

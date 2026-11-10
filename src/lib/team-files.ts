@@ -21,7 +21,7 @@ function downloadPlaybook(playbook: ExportedPlaybook): { name: string; members: 
   document.body.appendChild(link);
   link.click();
   link.remove();
-  window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
   return { name: playbook.name, members: playbook.members };
 }
 
@@ -60,6 +60,6 @@ export async function downloadAllConversations(): Promise<{ conversations: numbe
   document.body.appendChild(link);
   link.click();
   link.remove();
-  window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
   return { conversations: dump.conversationCount };
 }
