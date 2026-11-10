@@ -1996,12 +1996,15 @@ export function containerComputerMcp(
 }
 
 /** Display text a person may paste into a shell.  Any word that is not a bare
- * shell token (letters, digits, and a small punctuation set) is single-quoted
- * so whitespace, `!`, or a Windows path separator cannot be split or
- * history-expanded when the string is pasted into cmd or bash. */
-export function shellWord(word: string): string {
-  return /^[A-Za-z0-9_@%+=:,./-]+$/.test(word)
-    ? word
+ * shell token (letters, digits, and a small punctuation set) is quoted so
+ * whitespace, `!`, or a Windows path separator cannot be split or
+ * history-expanded on paste.  POSIX shells get single quotes with the `'\\''`
+ * escape; cmd.exe ignores single quotes, so it gets the double-quote form
+ * with `""` doubling. */
+export function shellWord(word: string, platform: NodeJS.Platform = process.platform): string {
+  if (/^[A-Za-z0-9_@%+=:,./-]+$/.test(word)) return word;
+  return platform === "win32"
+    ? `"${word.replace(/"/g, '""')}"`
     : `'${word.replace(/'/g, `'\\''`)}'`;
 }
 
@@ -2041,7 +2044,7 @@ export function setupCommands(
       view: target.viewerPort ? `http://127.0.0.1:${target.viewerPort}/vnc.html` : "",
     };
   }
-  const command = (args: string[]) => [runtime, ...args].map(shellWord).join(" ");
+  const command = (args: string[]) => [runtime, ...args].map((arg) => shellWord(arg, platform)).join(" ");
   return {
     install,
     runtimeStart,
