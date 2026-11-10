@@ -153,6 +153,8 @@ struct RootView: View {
 #if DEBUG
             if ProcessInfo.processInfo.arguments.contains("-tvface-preview") {
                 TVFacePreviewHarness()
+            } else if ProcessInfo.processInfo.arguments.contains("-composer-regression-preview") {
+                ComposerScrollRegressionPreview().padding()
             } else {
                 mainRoutes
             }
