@@ -176,7 +176,7 @@ export function ResourceTriggersPanel({ bots }: { bots: Bot[] }) {
             const bot = bots.find((candidate) => candidate.id === trigger.botId);
             return (
               <li key={trigger.id} className="flex items-start gap-3 rounded-2xl border border-hairline/50 bg-panel/80 p-3">
-                {bot ? <BotAvatar bot={bot} state={stateForBot(bot)} size={36} /> : <div className="h-9 w-9 rounded-full bg-panel" />}
+                {bot ? <BotAvatar bot={bot} state={stateForBot(bot)} size={36} animated={false} /> : <div className="h-9 w-9 rounded-full bg-panel" />}
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2">
                     <button onClick={() => setEditor(trigger)} className="truncate text-[14px] font-medium text-ink hover:text-accent" title={trigger.name}>{trigger.name}</button>

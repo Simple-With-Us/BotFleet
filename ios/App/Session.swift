@@ -139,6 +139,17 @@ final class Session: ObservableObject {
     /// and persisted — when a stream goes live.
     private var rotation = CandidateRotation(hosts: [])
     private var streamTask: Task<Void, Never>?
+    /// Streamed deltas held between publishes (BF-2608). The buffer is pure
+    /// policy in CompanionCore; the clock and every flush decision live here.
+    /// `bufferedSeq` is the newest sequence a held delta carried: the cursor
+    /// commits when the buffer drains, not per token, because touching the
+    /// `@Published` state to advance it would publish anyway and defeat the
+    /// batching. A crash inside one 50 ms window replays those deltas on
+    /// reconnect, which is safe — live text is not persisted, and settled
+    /// messages dedupe by id.
+    private var deltaBuffer = StreamingDeltaBuffer()
+    private var deltaFlushTask: Task<Void, Never>?
+    private var bufferedSeq: Int?
     /// Best-effort authenticated route refresh started by the latest live SSE
     /// hello. Kept separate so endpoint discovery never stalls event delivery.
     private var endpointRefreshTask: Task<Void, Never>?
@@ -194,6 +205,10 @@ final class Session: ObservableObject {
     /// for the same attachment path.
     private var avatarFetches: [String: (id: UUID, task: Task<Data?, Never>)] = [:]
     private var avatarCacheGeneration = 0
+    /// Viewed-thread first pages in flight, by threadId. The store's
+    /// `loadingThread` flag cannot guard this on its own: these calls run
+    /// before the render that would publish the flag.
+    private var threadViewFetches: Set<String> = []
     /// Per-mutation success flags for one settings flush.  `status` may be a
     /// recovery GET applied for display even when a PATCH failed; callers must
     /// require their own OK flag before treating the mutation as saved.
@@ -579,6 +594,7 @@ final class Session: ObservableObject {
 
     func signOut() {
         stopVoice()
+        discardDeltas()
         streamTask?.cancel()
         streamTask = nil
         endpointRefreshTask?.cancel()
@@ -637,6 +653,9 @@ final class Session: ObservableObject {
         guard client != nil else { return }
         if let existing = streamTask {
             if case .offline = status {
+                // Same stale-cursor hazard as `restartStream()`: publish
+                // held deltas before the replacement stream resumes.
+                flushDeltas()
                 existing.cancel()
                 streamTask = nil
             } else {
@@ -700,6 +719,11 @@ final class Session: ObservableObject {
     /// cursor survives, so this is a gap, not a reset.
     private func restartStream() {
         guard streamTask != nil else { return }
+        // Publish held deltas and commit their cursor first: the new stream
+        // resumes from that cursor, so anything left buffered would be both
+        // replayed by the server and flushed locally — the same tokens
+        // appended twice, with no dedupe on live text (BF-2608).
+        flushDeltas()
         streamTask?.cancel()
         streamTask = nil
         connect()
@@ -713,6 +737,9 @@ final class Session: ObservableObject {
     /// requests, not this stream, and the `audio` background mode keeps it
     /// playing after the linger window closes.  Sign-out still stops it.
     func disconnect() {
+        // Held deltas publish before the stream goes away, so backgrounding
+        // never strands the tail of a reply mid-window (BF-2608).
+        flushDeltas()
         streamTask?.cancel()
         streamTask = nil
         endpointRefreshTask?.cancel()
@@ -762,6 +789,58 @@ final class Session: ObservableObject {
         lingerTask = .invalid
     }
 
+    /// Publish every held delta as one state mutation, and commit the
+    /// cursor those deltas arrived with. Called on the flush interval, on
+    /// the buffer's own bounds, before any frame that must observe or clear
+    /// the live text, and when the stream ends — so the text a turn-ending
+    /// frame clears, and the text a settled message supersedes, is always
+    /// the complete text.
+    private func flushDeltas() {
+        deltaFlushTask?.cancel()
+        deltaFlushTask = nil
+        guard !deltaBuffer.isEmpty else {
+            if let bufferedSeq { state.advance(to: bufferedSeq) }
+            bufferedSeq = nil
+            return
+        }
+        let events = deltaBuffer.drain()
+        let seq = bufferedSeq
+        bufferedSeq = nil
+        // One assignment, one publish: mutating the `@Published` struct per
+        // coalesced event plus once for the cursor would re-invalidate the
+        // transcript once per stream key and defeat the batching.
+        var next = state
+        next.applyCoalesced(events)
+        if let seq { next.advance(to: seq) }
+        state = next
+        NotificationCoordinator.shared.setBadge(state.unreadCount)
+    }
+
+    /// Hold deltas until the flush interval, unless the bounds trip first.
+    /// The first delta of a burst arms the timer; later ones join the same
+    /// window, so a steady stream publishes at the interval and a burst
+    /// publishes once.
+    private func scheduleDeltaFlush() {
+        guard deltaFlushTask == nil else { return }
+        deltaFlushTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(Int64(StreamingDeltaBuffer.flushInterval * 1_000)))
+            guard !Task.isCancelled, let self else { return }
+            self.deltaFlushTask = nil
+            self.flushDeltas()
+        }
+    }
+
+    /// Drop held deltas without publishing. Sign-out replaces the whole
+    /// state, so draining into it first would only publish text nobody
+    /// keeps; a cancelled stream, by contrast, flushes (see `run()`),
+    /// because the state survives it.
+    private func discardDeltas() {
+        deltaFlushTask?.cancel()
+        deltaFlushTask = nil
+        _ = deltaBuffer.drain()
+        bufferedSeq = nil
+    }
+
     private func run() async {
         while !Task.isCancelled {
             guard let client else { return }
@@ -783,6 +862,33 @@ final class Session: ObservableObject {
                 ) {
                     if Task.isCancelled { return }
                     reconnectBackoff.reset()
+
+                    // BF-2608: hold streamed deltas for one publish window.
+                    // Anything else first publishes what is held, so a
+                    // settled message, a turn ending or a reconnect never
+                    // observes a live bubble missing its buffered tail.
+                    if case let .runtime(event) = frame.frame {
+                        switch deltaBuffer.enqueue(event) {
+                        case .buffered:
+                            if let seq = frame.seq { bufferedSeq = max(bufferedSeq ?? seq, seq) }
+                            if deltaBuffer.shouldFlush { flushDeltas() } else { scheduleDeltaFlush() }
+                            continue
+                        case .dropped:
+                            // Never commit past text still held: fold the
+                            // sequence into the pending commit so the flush
+                            // advances once, to the newest sequence seen.
+                            if deltaBuffer.isEmpty {
+                                if let seq = frame.seq { state.advance(to: seq) }
+                            } else if let seq = frame.seq {
+                                bufferedSeq = max(bufferedSeq ?? seq, seq)
+                            }
+                            continue
+                        case .applyNow:
+                            flushDeltas()
+                        }
+                    } else if !deltaBuffer.isEmpty {
+                        flushDeltas()
+                    }
 
                     if case let .hello(cursor, resumed) = frame.frame {
                         log.info("stream live, resumed=\(resumed, privacy: .public)")
@@ -858,6 +964,10 @@ final class Session: ObservableObject {
                         applyInstances(fetched, describedAt: describedAt)
                     }
                 }
+                // Publish anything still held: the state survives the
+                // reconnect, and dropping the tail would truncate the reply
+                // the reader is watching (BF-2608).
+                flushDeltas()
                 // the stream ended without an error — the harness went away
                 log.notice("stream ended without an error")
                 offlineMessage = "Lost the connection."
@@ -1044,7 +1154,13 @@ final class Session: ObservableObject {
     }
 
     @discardableResult
-    func send(_ text: String, to chat: Chat, attachments: [PendingChatAttachment] = [], recording: (data: Data, transcript: String)? = nil) async -> MessageSendOutcome {
+    func send(
+        _ text: String,
+        to chat: Chat,
+        attachments: [PendingChatAttachment] = [],
+        recording: (data: Data, transcript: String)? = nil,
+        busyDelivery: String? = nil
+    ) async -> MessageSendOutcome {
         guard let client else { return MessageSendOutcome(ok: false, clientNonce: "") }
         var clientNonce = ""
         do {
@@ -1093,7 +1209,8 @@ final class Session: ObservableObject {
                         toBot: bot.id,
                         threadId: threadId,
                         idempotencyKey: localId,
-                        recording: savedRecording
+                        recording: savedRecording,
+                        busyDelivery: busyDelivery
                     )
                     if result.queued == true, let queueId = result.queueId, !queueId.isEmpty {
                         let dest = result.threadId ?? bot.threadId
@@ -1215,6 +1332,23 @@ final class Session: ObservableObject {
             choice: choice,
             isPermission: card.isPermission
         )
+    }
+
+    /// What this computer can do for a voice call: which providers hold a
+    /// key and which one a call would take.  Booleans and a choice, never a
+    /// key -- the permanent credentials stay on the computer.  Throws so a
+    /// voice call can tell "unreachable" from "no provider" and say so.
+    func voiceCallStatus() async throws -> StsStatus {
+        guard let client else { throw APIError.transport("Not connected to your computer.") }
+        return try await client.stsStatus()
+    }
+
+    /// One short-lived call token.  Spent opening a single realtime session;
+    /// it is not the provider's permanent key and it is not a credential for
+    /// anything else.
+    func voiceCallToken(provider: String) async throws -> StsSessionToken {
+        guard let client else { throw APIError.transport("Not connected to your computer.") }
+        return try await client.stsToken(provider: provider)
     }
 
     /// Allow every permission request waiting in this conversation (the
@@ -1847,6 +1981,57 @@ final class Session: ObservableObject {
         guard let client, task.threadId != bot.threadId else { return }
         do { state.apply(.bot(try await client.switchTask(botId: bot.id, threadId: task.threadId))) }
         catch { recordActionError(error) }
+    }
+
+    /// Open a retained thread for reading without making it the execution
+    /// target. Passive: the pin moves, `Bot.threadId` does not, so the
+    /// running turn is untouched and `switchTask` is never called. The
+    /// busy gate stays exactly where it was — on switching alone.
+    func viewThread(_ task: BotTask, for bot: Bot) async {
+        guard task.threadId != bot.threadId,
+              (bot.tasks ?? []).contains(where: { $0.threadId == task.threadId })
+        else {
+            if task.threadId == bot.threadId { showActiveThread(for: bot) }
+            return
+        }
+        // Only a retained, non-active thread needs its own page; the active
+        // thread already lives on the bot. Reading never consults busy —
+        // that guard stays on switching alone.
+        guard state.viewThread(botId: bot.id, threadId: task.threadId) else { return }
+        guard let client else {
+            state.threadTranscriptFailed(threadId: task.threadId)
+            return
+        }
+        guard threadViewFetches.insert(task.threadId).inserted else { return }
+        defer { threadViewFetches.remove(task.threadId) }
+        do {
+            let page = try await client.messages(threadId: task.threadId)
+            state.threadTranscriptLoaded(
+                threadId: task.threadId,
+                messages: page.messages,
+                hasMore: page.hasMore
+            )
+        } catch {
+            state.threadTranscriptFailed(threadId: task.threadId)
+            recordActionError(error)
+        }
+    }
+
+    /// Return to the bot's active thread from a viewed one.
+    func showActiveThread(for bot: Bot) {
+        state.viewThread(botId: bot.id, threadId: nil)
+    }
+
+    /// Fetch the viewed thread's first page when its screen appears without
+    /// one — the store answers whether a fetch is still needed, so only a
+    /// fetched page suppresses it; frames that landed first are buffered
+    /// and merge after the page instead.
+    func ensureViewedThreadLoaded() async {
+        guard let botId = state.viewedBotId, let threadId = state.viewedThreadId,
+              let bot = state.bot(botId),
+              let task = bot.tasks?.first(where: { $0.threadId == threadId })
+        else { return }
+        await viewThread(task, for: bot)
     }
 
     func renameTask(_ task: BotTask, for bot: Bot, title: String) async {
@@ -2636,6 +2821,21 @@ final class Session: ObservableObject {
     }
 
     @MainActor
+    func updateBusySendDefault(_ busySendDefault: String) async -> ConfigStatus? {
+        guard let client else { return nil }
+        do {
+            let status = try await client.updateBusySendDefault(busySendDefault)
+            config = status
+            return status
+        } catch let error as APIError where error.isUnauthorized {
+            status = .unauthorized
+            return nil
+        } catch {
+            recordActionError(error)
+            return nil
+        }
+    }
+
     func updateConversationMode(_ conversationMode: String, mergeThreads: Bool = false) async -> ConfigStatus? {
         pendingConversationMode = conversationMode
         pendingConversationMergeThreads = mergeThreads
@@ -3931,7 +4131,7 @@ extension CompanionState {
                 return ChatSummary(
                     chat: chat,
                     preview: Self.preview(of: last),
-                    lastActivity: latestActivity(for: chat),
+                    lastActivity: latestActivity(for: chat, newest: last),
                     pinned: Self.pinned(chat)
                 )
             }
@@ -3949,18 +4149,28 @@ extension CompanionState {
 
     /// Newest loaded message across this chat's threads. Other tasks may
     /// not be hydrated yet; `latestActivity` still reads their stamps.
+    ///
+    /// Runs for every chat on every chat-list render, so it resolves the
+    /// active leaf from the bot already in hand instead of letting
+    /// `visibleTranscript(forThread:)` scan the whole roster per thread
+    /// (BOTFLEET-3R). Rooms have no branching leaf.
     func newestLoadedMessage(for chat: Chat) -> Message? {
         var candidates = [Message]()
         switch chat {
         case let .bot(bot):
-            if let last = visibleTranscript(forThread: bot.threadId).last { candidates.append(last) }
+            let leaf = bot.activeLeafId
+            if let last = visibleTranscript(forThread: bot.threadId, activeLeafId: leaf).last {
+                candidates.append(last)
+            }
             for task in bot.tasks ?? [] {
-                if let last = visibleTranscript(forThread: task.threadId).last ?? task.lastMessage {
+                if let last = visibleTranscript(forThread: task.threadId, activeLeafId: leaf).last ?? task.lastMessage {
                     candidates.append(last)
                 }
             }
         case let .room(room):
-            if let last = visibleTranscript(forThread: room.threadId).last { candidates.append(last) }
+            if let last = visibleTranscript(forThread: room.threadId, activeLeafId: nil).last {
+                candidates.append(last)
+            }
         }
         return candidates.max { $0.at < $1.at }
     }
@@ -3969,7 +4179,13 @@ extension CompanionState {
     /// `lastActivity`, so an unread update on a background task does not
     /// keep showing yesterday from the currently selected thread.
     func latestActivity(for chat: Chat) -> Double {
-        let fromMessages = newestLoadedMessage(for: chat)?.at
+        latestActivity(for: chat, newest: newestLoadedMessage(for: chat))
+    }
+
+    /// `latestActivity(for:)` with the newest loaded message already found,
+    /// so `chatSummaries` walks each chat's transcripts once, not twice.
+    func latestActivity(for chat: Chat, newest: Message?) -> Double {
+        let fromMessages = newest?.at
         switch chat {
         case let .bot(bot):
             let taskActivities = (bot.tasks ?? []).map { $0.lastActivity ?? $0.createdAt }

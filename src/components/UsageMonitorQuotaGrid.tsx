@@ -1,3 +1,4 @@
+import { quotaPlanMetadataLines } from "../../shared/quota-plan-metadata";
 import { isQuotaCellExhausted, type UsageMonitorQuotaWindow } from "@/lib/usage-monitor-quota";
 import { absoluteQuotaLabel, formatResetCountdown } from "@/lib/quota-display";
 
@@ -63,6 +64,11 @@ export function UsageMonitorQuotaGrid({ windows }: { windows: UsageMonitorQuotaW
                 {absolute}
               </div>
             )}
+            {quotaPlanMetadataLines(window.planMetadata).map((line, index) => (
+              <div key={index} className="truncate text-[10.5px] text-ink-secondary" title={line}>
+                {line}
+              </div>
+            ))}
             <div
               className="truncate text-[10.5px] text-ink-secondary"
               title={resetHover(resetAt)}

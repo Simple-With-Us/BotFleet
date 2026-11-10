@@ -7,20 +7,20 @@ import { fileURLToPath } from "node:url";
 
 const electronDir = path.dirname(fileURLToPath(import.meta.url));
 const projectDir = path.dirname(electronDir);
-const resourcesDir = path.join(electronDir, "resources");
+const helpersDir = path.join(projectDir, "native", "helpers");
 
-export const recorderHelperBundle = path.join(resourcesDir, "BotFleet Recorder.app");
+export const recorderHelperBundle = path.join(helpersDir, "BotFleet Recorder.app");
 export const recorderHelperBinary = path.join(recorderHelperBundle, "Contents", "MacOS", "recorder-helper");
 
 export function buildRecorderHelper() {
   const contents = path.join(recorderHelperBundle, "Contents");
   mkdirSync(path.join(contents, "MacOS"), { recursive: true });
-  copyFileSync(path.join(resourcesDir, "recorder-helper-Info.plist"), path.join(contents, "Info.plist"));
+  copyFileSync(path.join(helpersDir, "recorder-helper-Info.plist"), path.join(contents, "Info.plist"));
   const slices = ["arm64", "x86_64"].map((arch) => {
     const slice = `${recorderHelperBinary}-${arch}`;
     execFileSync(
       "swiftc",
-      ["-O", "-target", `${arch}-apple-macos12`, path.join(resourcesDir, "recorder-helper.swift"), "-o", slice],
+      ["-O", "-target", `${arch}-apple-macos12`, path.join(helpersDir, "recorder-helper.swift"), "-o", slice],
       { stdio: "inherit", timeout: 120_000 },
     );
     return slice;

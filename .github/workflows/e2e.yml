@@ -1,5 +1,9 @@
 name: E2E smoke
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 on:
   push:
     branches: [main]
@@ -17,19 +21,22 @@ jobs:
   changes:
     name: Classify E2E scope
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     outputs:
       web_changed: ${{ steps.scope.outputs.web_changed }}
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          # Scope compares commit/tree metadata, without historical file blobs.
+          filter: blob:none
           persist-credentials: false
       - name: Check whether web-app paths changed
         id: scope
         shell: bash
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
           # Fail open: any event we cannot diff takes the full run, matching
@@ -38,11 +45,18 @@ jobs:
             echo "web_changed=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          if [[ ! "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]] || [[ "$BASE_SHA" =~ ^0+$ ]] || ! git cat-file -e "${BASE_SHA}^{commit}"; then
+          # The same scope ci.yml's classifier uses:  the pull request's own
+          # two ends,  the branch point to the head.  Diffing from the stored
+          # base SHA to the merge commit folded main's newer commits into the
+          # scope,  so a documentation-only pull request looked like a web
+          # change and paid for the whole Playwright suite.
+          scope_paths="$(mktemp)"
+          trap 'rm -f "$scope_paths"' EXIT
+          if ! bash scripts/ci-scope-diff.sh "$BASE_SHA" "$HEAD_SHA" > "$scope_paths"; then
             echo "web_changed=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          if git diff --no-renames --name-only "$BASE_SHA" "$GITHUB_SHA" | grep -Eq '^(src|shared|tests/e2e|public)/|^(index\.html|vite\.config\.ts|playwright\.config\.ts|package\.json|pnpm-lock\.yaml)$'; then
+          if grep -zEq '^(src|shared|tests/e2e|public)/|^(index\.html|vite\.config\.ts|playwright\.config\.ts|package\.json|pnpm-lock\.yaml)$' "$scope_paths"; then
             echo "web_changed=true" >> "$GITHUB_OUTPUT"
           else
             echo "web_changed=false" >> "$GITHUB_OUTPUT"
@@ -55,9 +69,13 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
+      # The tv-face visual fixture plays the blue skin's real GIFs; they are
+      # git-LFS pointers without this pull (the onError chain then settles on
+      # a still and the spec's first-paint assertions fail).
+      - run: git lfs pull --include "public/tv-face/skins/blue/**"
       - uses: actions/setup-node@v7
         with:
-          node-version: "24"
+          node-version: "26"
       - name: Enable pnpm
         run: corepack enable && corepack prepare pnpm@10.33.0 --activate
       - run: pnpm install --frozen-lockfile

@@ -272,8 +272,8 @@ describe("antigravity group summary", () => {
       ],
       { remainingPercentage: 0.46 },
     );
-    expect(groups[0].headline).toBe("Gemini: 90% available (5h window, resets in 3h 21m)");
-    expect(groups[1].headline).toBe("Third-Party: 46% available (5h window, resets in 3h 21m)");
+    expect(groups[0].headline).toBe("Gemini: 90% available (5-hour window, resets in 3h 21m)");
+    expect(groups[1].headline).toBe("Third-Party: 46% available (5-hour window, resets in 3h 21m)");
   });
 
   it("ties the reset countdown to the model that supplied the displayed percentage, not the earliest reset in the group", () => {
@@ -293,7 +293,7 @@ describe("antigravity group summary", () => {
     const thirdParty = groups.find((group) => group.group === "external")!;
     expect(thirdParty.remainingPercent).toBe(10);
     expect(thirdParty.resetAtMs).toBe(Date.parse(tenPercentResetsIn4h));
-    expect(thirdParty.headline).toBe("Third-Party: 10% available (5h window, resets in 4h 5m)");
+    expect(thirdParty.headline).toBe("Third-Party: 10% available (5-hour window, resets in 4h 5m)");
   });
 });
 
@@ -336,7 +336,7 @@ describe("formatDualQuotaBadge", () => {
   });
 
   it("formats single percentage with windows label or left suffix", () => {
-    expect(formatDualQuotaBadge(75, null, { windowsLabel: "5hr/Week" })).toBe("(75% for 5h / w)");
+    expect(formatDualQuotaBadge(75, null, { windowsLabel: "5hr/Week" })).toBe("(75% for 5-Hour / Weekly)");
     expect(formatDualQuotaBadge(75, null)).toBe("75% left");
     expect(formatDualQuotaBadge(null, 50)).toBe("(50%)");
     expect(formatDualQuotaBadge(null, null)).toBeNull();
@@ -369,6 +369,37 @@ describe("windowsLabelFromHeadlines", () => {
 
   it("returns undefined for an empty window list", () => {
     expect(windowsLabelFromHeadlines([])).toBeUndefined();
+  });
+
+  // These assert the RENDERED window names rather than the intermediate bucket.
+  // A bucket can classify correctly while the label the panel resolves from it
+  // is wrong, which is how a 5-hour session window came to read "Hourly" --
+  // and why a guard on the bucket alone would not have caught it.
+  /** What the panel paints for these raw window names.  `secondaryPercent`
+   *  stays null unless the case under test is genuinely a two-window engine,
+   *  so an unlabelled second window never shows up as the "Longer" fallback. */
+  function renderedLabels(windows: string[], secondaryPercent: number | null = null): string[] {
+    const label = windowsLabelFromHeadlines(
+      windowHeadlines(windows.map((window) => ({ label: "Token Plan", window, remainingPercent: 100, skip: false }))),
+    );
+    return quotaWindows(40, secondaryPercent, { windowsLabel: label }).map((w) => w.label);
+  }
+
+  it("resolves the compact '5hr' spelling to 5-Hour, not Hourly", () => {
+    expect(renderedLabels(["5hr", "Week"], 90)).toEqual(["5-Hour", "Weekly"]);
+  });
+
+  it("resolves every spelling of the 5-hour window the same way", () => {
+    for (const window of ["5h", "5hr", "5hrs", "5 hour", "5-hour"]) {
+      expect(renderedLabels([window])).toEqual(["5-Hour"]);
+    }
+  });
+
+  it("classifies bare durations into real periods instead of leaving them unlabelled", () => {
+    expect(renderedLabels(["7d"])).toEqual(["Weekly"]);
+    expect(renderedLabels(["2w"])).toEqual(["Weekly"]);
+    expect(renderedLabels(["30d"])).toEqual(["Monthly"]);
+    expect(renderedLabels(["24h"])).toEqual(["Daily"]);
   });
 });
 
@@ -415,12 +446,12 @@ describe("minimaxQuotaLine", () => {
       resetsAt,
     });
     const expectedTime = new Date(resetsAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
-    expect(line).toBe(`94% left this week, 100% left in the current 5 h window, resets at ${expectedTime}`);
+    expect(line).toBe(`94% left this week, 100% left in the current 5-hour window, resets at ${expectedTime}`);
   });
 
   it("formats a Token Plan line with only the 5h window known, and no reset clause when the reset is unknown", () => {
     const line = minimaxQuotaLine({ ...base, source: "token-plan", status: "ok", remainingPercent: 62 });
-    expect(line).toBe("62% left in the current 5 h window");
+    expect(line).toBe("62% left in the current 5-hour window");
   });
 
   it("formats a Token Plan line with only the weekly window known", () => {
@@ -448,7 +479,7 @@ describe("minimaxQuotaLine", () => {
       { ...base, source: "token-plan", status: "ok", remainingPercent: 100, resetsAt: now - 60_000 },
       now,
     );
-    expect(line).toBe("100% left in the current 5 h window, resets soon");
+    expect(line).toBe("100% left in the current 5-hour window, resets soon");
   });
 
   it("names the WEEKLY reset when the week is the window that has run out", () => {
@@ -464,7 +495,7 @@ describe("minimaxQuotaLine", () => {
     );
     // A countdown, not a clock time: the weekly reset is three days out,
     // and "resets at 3:00 PM" would read as this afternoon.
-    expect(line).toBe("0% left this week, 100% left in the current 5 h window, resets in 3d");
+    expect(line).toBe("0% left this week, 100% left in the current 5-hour window, resets in 3d");
   });
 
   it("keeps naming the 5-hour reset while the weekly window still has room", () => {
@@ -475,7 +506,7 @@ describe("minimaxQuotaLine", () => {
       now,
     );
     const expectedTime = new Date(resetsAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
-    expect(line).toBe(`80% left this week, 4% left in the current 5 h window, resets at ${expectedTime}`);
+    expect(line).toBe(`80% left this week, 4% left in the current 5-hour window, resets at ${expectedTime}`);
   });
 
   it("still shows a clock time for a reset that has not passed yet", () => {
@@ -486,7 +517,7 @@ describe("minimaxQuotaLine", () => {
       now,
     );
     const expectedTime = new Date(resetsAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
-    expect(line).toBe(`100% left in the current 5 h window, resets at ${expectedTime}`);
+    expect(line).toBe(`100% left in the current 5-hour window, resets at ${expectedTime}`);
   });
 });
 

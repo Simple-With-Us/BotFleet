@@ -92,9 +92,11 @@ function fakeHarness(): FakeHarness {
 }
 
 describe("browser Sentry", () => {
-  it("keeps Replay 100% on error / 10% session, Feedback, and mask-all privacy", () => {
+  it("keeps Replay opt-in (100% on error / 10% session when on), Feedback, and mask-all privacy", () => {
     const src = readFileSync(join(ROOT, "src/lib/sentry.ts"), "utf8");
     expect(src).toMatch(/VITE_SENTRY_DSN/);
+    expect(src).toMatch(/replayOptedIn\(\)/);
+    expect(src).toMatch(/\/\^\(true\|1\|on\|yes\)\$\/i/);
     expect(src).toMatch(/replaysSessionSampleRate[\s\S]*\?\? "0\.1"/);
     expect(src).toMatch(/replaysOnErrorSampleRate[\s\S]*\?\? "1\.0"/);
     expect(src).toMatch(/maskAllText:\s*true/);
@@ -277,6 +279,53 @@ describe("renderer diagnostics refresh", () => {
     expect(sentry.record.inits).toHaveLength(4);
     expect(sentry.record.inits[3]).toMatchObject({ dsn: BUILD_DSN });
     expect(harness.calls()).toBe(4);
+  });
+
+  // BF-2466: Replay must stay off unless a build explicitly opts in, on
+  // both the packaged path and a runtime-DSN client started later.
+  it("keeps Replay off by default on the packaged and runtime paths", async () => {
+    vi.stubEnv("VITE_SENTRY_DSN", BUILD_DSN);
+    initSentry();
+    expect(sentry.record.inits).toHaveLength(1);
+    expect(sentry.record.inits[0]).toMatchObject({
+      dsn: BUILD_DSN,
+      replayEnabled: false,
+      replaysSessionSampleRate: 0,
+      replaysOnErrorSampleRate: 0,
+    });
+
+    harness.answer({ enabled: true, dsn: RUNTIME_DSN, environment: "production", tracesSampleRate: 0.2 });
+    await refreshSentryFromRuntime();
+    expect(sentry.record.inits).toHaveLength(2);
+    expect(sentry.record.inits[1]).toMatchObject({
+      dsn: RUNTIME_DSN,
+      replayEnabled: false,
+      replaysSessionSampleRate: 0,
+      replaysOnErrorSampleRate: 0,
+    });
+  });
+
+  it("enables Replay at 10% session / 100% on error only on explicit opt-in", async () => {
+    vi.stubEnv("VITE_SENTRY_DSN", BUILD_DSN);
+    vi.stubEnv("VITE_SENTRY_REPLAY_ENABLED", "true");
+    initSentry();
+    expect(sentry.record.inits).toHaveLength(1);
+    expect(sentry.record.inits[0]).toMatchObject({
+      dsn: BUILD_DSN,
+      replayEnabled: true,
+      replaysSessionSampleRate: 0.1,
+      replaysOnErrorSampleRate: 1.0,
+    });
+
+    harness.answer({ enabled: true, dsn: RUNTIME_DSN, environment: "production", tracesSampleRate: 0.2 });
+    await refreshSentryFromRuntime();
+    expect(sentry.record.inits).toHaveLength(2);
+    expect(sentry.record.inits[1]).toMatchObject({
+      dsn: RUNTIME_DSN,
+      replayEnabled: true,
+      replaysSessionSampleRate: 0.1,
+      replaysOnErrorSampleRate: 1.0,
+    });
   });
 
   it("does not start the packaged client before the saved opt-out is known", async () => {

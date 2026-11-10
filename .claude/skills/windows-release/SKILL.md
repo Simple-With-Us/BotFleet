@@ -1,9 +1,14 @@
 ---
 name: windows-release
-description: Build, verify, and publish the Windows desktop build (NSIS installer + latest.yml) to the Simple-With-Us/BotFleet repo. Use when cutting a release, shipping a new version to Windows users, or when a Windows user reports they are stuck on an old version. Windows only — does not cover the macOS dmg/notarization flow.
+description: Hand-build and verify the Windows desktop package (NSIS installer + latest.yml) on a Windows machine. Windows desktop is no longer part of CI or releases (BF-2500), so use this only when the owner asks for a hand-built Windows package. Does not cover the macOS dmg/notarization flow.
 ---
 
 # Windows release
+
+> **BF-2500: retired from the release process.**  CI and `release.yml` no longer build
+> or publish Windows (or Ubuntu) desktop packages, and a macOS release does not
+> need a Windows counterpart.  This runbook stays for hand-built packages only;
+> skip [Every release ships both](#every-release-ships-both) for normal releases.
 
 Ships `BotFleet-<version>-setup.exe` and its update feed to
 [Simple-With-Us/BotFleet](https://github.com/Simple-With-Us/BotFleet),
@@ -107,16 +112,10 @@ update, which looks like "updates silently do nothing".
 
 ## Every release ships both
 
-A version that exists on macOS but not on this release is a Windows user stuck on
-old code with no signal that anything is wrong — the updater reports "up to date"
-because `latest.yml` still describes the older build.
-
-So: **whenever a new version goes out, this flow runs too.** If Windows can't ship
-for some reason, don't publish the mac-only release under a new version tag either
-— or accept that Windows is knowingly frozen and say so in the release notes.
-
-Because the two builds must run on two machines, the tag is the join point: cut the
-release, attach mac artifacts from the Mac, attach Windows artifacts from here.
+**Retired by BF-2500.**  This section used to require a Windows build with every macOS
+version.  Releases are macOS-only now, so a version without a Windows build is
+expected, and `latest.yml` is no longer kept in step with `latest-mac.yml`.  A
+hand-built Windows package is outside the CI-verified release set.
 
 ## Known: the build is unsigned
 

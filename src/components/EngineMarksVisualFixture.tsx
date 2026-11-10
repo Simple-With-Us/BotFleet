@@ -111,7 +111,7 @@ export default function EngineMarksVisualFixture() {
       <div className="flex items-center gap-2 rounded-2xl border border-hairline/50 bg-card px-3 py-2">
         <span data-testid="engine-marks-trigger" className="flex items-center gap-1.5">
           <ProviderMark driverKind="minimax" size={14} />
-          <span className="text-[12px]">MiniMax-M3.1-Flash-Preview</span>
+          <span className="text-[12px]">MiniMax-M3.1-Flash</span>
         </span>
       </div>
     </div>

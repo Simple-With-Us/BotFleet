@@ -274,6 +274,9 @@ describe("the Add Engine form's driver choice", () => {
     // on a default-fleet engine.
     expect(isCustomEngineInstance({ driverKind: "mcodeAgent", instanceId: "mcode" })).toBe(false);
     expect(isCustomEngineInstance({ driverKind: "mcodeAgent", instanceId: "mcode-china" })).toBe(true);
+    expect(isCustomEngineInstance({ driverKind: "opencodeGo", instanceId: "opencode" })).toBe(false);
+    expect(isCustomEngineInstance({ driverKind: "opencodeGo", instanceId: "opencodeGo" })).toBe(false);
+    expect(isCustomEngineInstance({ driverKind: "opencodeGo", instanceId: "custom-opencode" })).toBe(true);
     // …and a driver nobody listed fails SAFE: its reserved id is its own
     // kind, so anything else reads as operator-added and offers a delete
     // button, rather than hiding one for an engine that really was added.
@@ -281,6 +284,7 @@ describe("the Add Engine form's driver choice", () => {
     expect(isCustomEngineInstance({ driverKind: "someFutureDriver", instanceId: "custom-x" })).toBe(true);
     // The server's own flag still wins when it is set.
     expect(isCustomEngineInstance({ driverKind: "claudeAgent", instanceId: "claude", isCustom: true })).toBe(true);
+    expect(isCustomEngineInstance({ driverKind: "opencodeGo", instanceId: "opencodeGo", isCustom: false })).toBe(false);
   });
 
   it("names the engine the operator actually added in the row callout", () => {

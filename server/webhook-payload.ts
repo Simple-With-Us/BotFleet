@@ -738,6 +738,17 @@ export function isGithubWebhookPayload(payload: JsonValue): boolean {
   return Boolean(slimRepo(root.repository) || slimRepo(root.head_repository));
 }
 
+/** A `pull_request` payload for a PR that merged: action `closed` with the
+ * merged flag set or a merge timestamp present.  GitHub sends the same
+ * `closed` action when a PR is closed without merging, so the action alone
+ * does not say a merge happened. */
+export function isMergedPullRequestPayload(payload: JsonValue): boolean {
+  const root = asRecord(payload);
+  if (pickStr(root, "action") !== "closed") return false;
+  const pullRequest = asRecord(root?.pull_request);
+  return pullRequest?.merged === true || pickStr(pullRequest, "merged_at") !== undefined;
+}
+
 const COOLIFY_DEPLOYMENT_EVENTS = new Set([
   "deployment_success",
   "deployment_failed",

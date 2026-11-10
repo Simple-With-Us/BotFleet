@@ -125,7 +125,10 @@ describe("EngineCapabilitiesMatrix orientation", () => {
   });
 
   it("renders an access pill for every engine without conflating billing", () => {
-    expect(html).toContain("CLI + API");
+    // Every engine reads CLI or API. "CLI + API" is gone: no engine in the
+    // registry has two drivers, so the compound label described a vendor
+    // surface BotFleet cannot reach rather than one it runs.
+    expect(html).not.toContain("CLI + API");
     expect(html).toContain("CLI");
     expect(html).toContain("API");
     expect(html).not.toContain("Subscription");
@@ -175,13 +178,23 @@ describe("EngineCapabilitiesMatrix cell vocabulary", () => {
       /unknown:\s*"[^"]*border-dashed[^"]*"/,
     );
     expect(source).not.toMatch(/unknown:[^"]*bg-inset/);
-    // And the rendered markup agrees: the "?" cells carry the dashed
-    // treatment and none of them carries the "no" background.
-    const unknownCells = html.match(/aria-label="[^"]*: Not audited"[^>]*>/g) ?? [];
-    expect(unknownCells.length, "the registry backfill should leave audited unknowns").toBeGreaterThan(0);
-    for (const cell of unknownCells) {
-      expect(cell).toContain("border-dashed");
-      expect(cell).not.toContain("bg-inset");
+    // Every cell in the default registry is now audited, while an explicit
+    // "unknown" cell still renders with the dashed treatment and never the
+    // "no" background.
+    const defaultUnknownCells = html.match(/aria-label="[^"]*: Not audited"[^>]*>/g) ?? [];
+    expect(defaultUnknownCells.length, "every default registry cell is audited").toBe(0);
+    const prev = ENGINE_CAPABILITIES.qwen.capabilities.webAccess;
+    ENGINE_CAPABILITIES.qwen.capabilities.webAccess = "unknown";
+    try {
+      const withUnknownHtml = renderToStaticMarkup(<EngineCapabilitiesMatrix instances={[]} />);
+      const unknownCells = withUnknownHtml.match(/aria-label="[^"]*: Not audited"[^>]*>/g) ?? [];
+      expect(unknownCells.length).toBe(1);
+      for (const cell of unknownCells) {
+        expect(cell).toContain("border-dashed");
+        expect(cell).not.toContain("bg-inset");
+      }
+    } finally {
+      ENGINE_CAPABILITIES.qwen.capabilities.webAccess = prev;
     }
   });
 

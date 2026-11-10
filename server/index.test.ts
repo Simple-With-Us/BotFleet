@@ -29,6 +29,18 @@ const BASE = `http://127.0.0.1:${PORT}`;
 const WEBHOOK_PORT = 39000 + Math.floor(Math.random() * 10_000);
 const WEBHOOK_BASE = `http://127.0.0.1:${WEBHOOK_PORT}`;
 
+// The harness server runs as a child process, and its environment is built
+// by hand rather than inherited, so it used to fall back to the machine's
+// own zone while this process ran in whatever zone its environment named.
+// The two then disagreed, and an assertion that compared the zone the server
+// reported against the zone this process saw failed on any host whose
+// environment did not match the machine's — which is every runner that sets
+// TZ.  Pinning the child's zone to a fixed one, and asserting that same
+// fixed zone, makes the pair independent of the host: the assertion still
+// catches a server that ignores its own environment, and it no longer says
+// anything about where the machine happens to be.
+const CHILD_TIME_ZONE = "America/Chicago";
+
 let child: ChildProcess;
 /** stands in for the box provider so config saving never touches the network */
 let boxStub: Server;
@@ -141,6 +153,9 @@ const settlesWithin = async (
   }
 };
 
+/** windows-latest is slower and overlaps vitest files more; scale settle budgets there. */
+const winSettleMs = (ms: number) => (process.platform === "win32" ? Math.round(ms * 2) : ms);
+
 const uploadAvatar = async (mime = "image/png"): Promise<string> => {
   const response = await fetch(`${BASE}/api/attachments`, {
     method: "POST",
@@ -187,7 +202,7 @@ const statusWithHeaders = (headers: Record<string, string>): Promise<number> =>
 const writeFakeClaudeWrapper = (
   file: string,
   mode: "exit-early" | "hang" | "happy" | "quota" | "model-not-found",
-  options: { keepDump?: boolean; quotaGate?: string; launchLog?: string; replyText?: string; toolIo?: boolean } = {},
+  options: { keepDump?: boolean; quotaGate?: string; launchLog?: string; replyText?: string; toolIo?: boolean; replyGate?: { path: string; present: string; absent: string } } = {},
 ): string => {
   const lines = [
     "#!/usr/bin/env node",
@@ -205,6 +220,9 @@ const writeFakeClaudeWrapper = (
   }
   if (options.replyText) {
     lines.push(`process.env.FAKE_CLAUDE_REPLY = ${JSON.stringify(options.replyText)};`);
+  }
+  if (options.replyGate) {
+    lines.push(`process.env.FAKE_CLAUDE_REPLY = (await import("node:fs")).existsSync(${JSON.stringify(options.replyGate.path)}) ? ${JSON.stringify(options.replyGate.present)} : ${JSON.stringify(options.replyGate.absent)};`);
   }
   if (options.toolIo) lines.push('process.env.FAKE_CLAUDE_TOOL_IO = "1";');
   lines.push(`await import(${JSON.stringify(pathToFileURL(FAKE_CLAUDE_CLI).href)});`, "");
@@ -473,6 +491,7 @@ beforeAll(async () => {
       ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
       HOME: home,
       USERPROFILE: home,
+      TZ: CHILD_TIME_ZONE,
       OMB_PORT: String(PORT),
       OMB_WEBHOOK_PORT: String(WEBHOOK_PORT),
       OMB_BOX_API: `http://127.0.0.1:${boxStubPort}`,
@@ -541,6 +560,93 @@ beforeAll(async () => {
     expect(back.body.conversationMode).toBe("projects");
   });
 
+  it("folds every extra thread of one bot into the chosen one", async () => {
+    const created = await api("POST", "/api/bots");
+    const bot = created.body.bot;
+    const destination = bot.threadId;
+    expect((await api("POST", `/api/bots/${bot.id}/tasks`, { title: "Second" })).status).toBe(201);
+    expect((await api("POST", `/api/bots/${bot.id}/tasks`, { title: "Third" })).status).toBe(201);
+
+    const merged = await api("POST", `/api/bots/${bot.id}/merge-threads`, { intoThreadId: destination });
+    expect(merged.status).toBe(200);
+    expect(merged.body.merged).toHaveLength(2);
+    expect(merged.body.skipped).toEqual([]);
+    // one conversation is left, and it is the one that was chosen
+    expect(merged.body.bot.tasks).toHaveLength(1);
+    expect(merged.body.bot.tasks[0].threadId).toBe(destination);
+    expect(merged.body.bot.threadId).toBe(destination);
+
+    const after = await api("GET", "/api/bots");
+    const fresh = after.body.bots.find((candidate: { id: string }) => candidate.id === bot.id);
+    expect(fresh.tasks).toHaveLength(1);
+  });
+
+  it("refuses a merge-all with no destination, a foreign destination, or an unknown bot", async () => {
+    const created = await api("POST", "/api/bots");
+    const bot = created.body.bot;
+    await api("POST", `/api/bots/${bot.id}/tasks`, { title: "Side work" });
+    const other = (await api("POST", "/api/bots")).body.bot;
+
+    const missing = await api("POST", `/api/bots/${bot.id}/merge-threads`, {});
+    expect(missing.status).toBe(400);
+    const foreign = await api("POST", `/api/bots/${bot.id}/merge-threads`, { intoThreadId: other.threadId });
+    expect(foreign.status).toBe(400);
+    const unknown = await api("POST", "/api/bots/no-such-bot/merge-threads", { intoThreadId: bot.threadId });
+    expect(unknown.status).toBe(404);
+
+    // none of those refusals moved anything
+    const after = await api("GET", "/api/bots");
+    const fresh = after.body.bots.find((candidate: { id: string }) => candidate.id === bot.id);
+    expect(fresh.tasks.length).toBeGreaterThan(1);
+  });
+
+  it("validates the merge request before it reaches the store", async () => {
+    const created = await api("POST", "/api/bots");
+    const bot = created.body.bot;
+
+    // an unknown key is a typo, not a field to carry along
+    const unknown = await api("POST", `/api/bots/${bot.id}/merge-threads`, {
+      intoThreadId: bot.threadId,
+      also: "x",
+    });
+    expect(unknown.status).toBe(400);
+    // a thread id that is not a string, and one far longer than any id
+    const wrongType = await api("POST", `/api/bots/${bot.id}/merge-threads`, { intoThreadId: 42 });
+    expect(wrongType.status).toBe(400);
+    const tooLong = await api("POST", `/api/bots/${bot.id}/merge-threads`, { intoThreadId: "x".repeat(200) });
+    expect(tooLong.status).toBe(400);
+
+    // and none of those refusals moved anything
+    const after = await api("GET", "/api/bots");
+    const fresh = after.body.bots.find((candidate: { id: string }) => candidate.id === bot.id);
+    expect(fresh.tasks).toHaveLength(1);
+  });
+
+  it("answers a merge with the roster, not the whole transcript", async () => {
+    const created = await api("POST", "/api/bots");
+    const bot = created.body.bot;
+    await api("POST", `/api/bots/${bot.id}/tasks`, { title: "Second" });
+
+    const merged = await api("POST", `/api/bots/${bot.id}/merge-threads`, { intoThreadId: bot.threadId });
+    expect(merged.status).toBe(200);
+    expect(merged.body.merged).toHaveLength(1);
+    // A merged conversation can hold far more than one event frame
+    // carries, so the answer carries the roster and leaves the transcript
+    // to the paged endpoint.
+    expect(merged.body.bot.messages).toBeUndefined();
+    expect(merged.body.bot.tasks).toHaveLength(1);
+  });
+
+  it("tells a person how much conversation each thread holds", async () => {
+    const created = await api("POST", "/api/bots");
+    const bot = created.body.bot;
+    const listed = await api("GET", "/api/bots");
+    const fresh = listed.body.bots.find((candidate: { id: string }) => candidate.id === bot.id);
+    for (const task of fresh.tasks) {
+      expect(typeof task.messageCount).toBe("number");
+    }
+  });
+
 afterAll(async () => {
   boxStub?.close();
   // Upstream fixed this same Linux scratch-cleanup flake with an inline
@@ -552,7 +658,9 @@ afterAll(async () => {
 
 describe("harness HTTP API", () => {
   it("restores encrypted workspace credentials only through authenticated runtime memory", async () => {
-    const owner = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8"));
+    const owner = z.object({ nonce: z.string().min(1) }).parse(
+      JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8")),
+    );
     const restore = (body: unknown, nonce = owner.nonce) => fetch(`${BASE}/api/runtime/credentials`, {
       method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${nonce}` },
       body: JSON.stringify(body),
@@ -681,6 +789,64 @@ describe("harness HTTP API", () => {
     expect(body.app).toBe("botfleet");
     expect(typeof body.pid).toBe("number");
     expect(body.static).toBe(true);
+  });
+
+  it("native server controls expose VM state without configuration secrets", async () => {
+    const response = await api("GET", "/api/system/control");
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({ activeBotCount: 0, persistOnExit: expect.any(Boolean) });
+    expect(response.body.localVms).toEqual(expect.arrayContaining([
+      expect.objectContaining({ key: "shared", running: false, state: "missing" }),
+    ]));
+    // The response also carries the work that is holding a stop, so the
+    // Control app can name it instead of reporting a bare total.  Each entry
+    // is a count and a plain label, and nothing else.
+    z.array(z.object({ count: z.number(), label: z.string() }).strict()).parse(response.body.blockingWork);
+    // This fixture spawns the server from source, where no release stamp
+    // exists, so build is null: the legacy unknown-order case the handshake
+    // must keep accepting.  A packaged release bundle stamps the planner's
+    // non-null ordered build instead (BF-2588), covered by the
+    // runtime-identity and stamp-commit-version node tests.
+    expect(response.body.serverBuild).toMatchObject({ version: expect.any(String), build: null });
+    expect(Object.keys(response.body).sort()).toEqual(["activeBotCount", "blockingWork", "localVms", "persistOnExit", "serverBuild"]);
+  });
+
+  it("native server controls reject companion replays and non-JSON shutdowns", async () => {
+    expect((await fetch(`${BASE}/api/system/control`, {
+      headers: { "x-botfleet-companion": "1" },
+    })).status).toBe(403);
+    expect((await fetch(`${BASE}/api/system/control/stop`, { method: "POST" })).status).toBe(415);
+    expect((await fetch(`${BASE}/api/system/control/stop`, {
+      method: "POST", headers: { "content-type": "application/json", "x-botfleet-companion": "1" }, body: "{}",
+    })).status).toBe(403);
+    expect((await api("GET", "/api/health")).status).toBe(200);
+  });
+
+  it("native server controls refuse another admission before writing a shutdown marker", async () => {
+    const owner = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8"));
+    const authorization = { authorization: `Bearer ${owner.nonce}` };
+    const held = request({ hostname: "127.0.0.1", port: PORT, path: "/api/bots", method: "POST",
+      headers: { "content-type": "application/json", "content-length": "2" } });
+    held.on("error", () => {});
+    held.write("{");
+    const active = async () => {
+      const runtime = await (await fetch(`${BASE}/api/runtime`, { headers: authorization })).json();
+      return z.object({ activeWorkCount: z.number() }).parse(runtime).activeWorkCount;
+    };
+    try {
+      await expect.poll(active).toBe(1);
+      const refused = await api("POST", "/api/system/control/stop", {});
+      expect(refused.status).toBe(409);
+      // The refusal names the work that is holding the stop, so the owner can
+      // act on it instead of being told only that something is busy.
+      expect(refused.body.error).toContain("active operation(s) must finish before the server can stop");
+      expect(refused.body.error).toContain("in-flight request");
+      expect(existsSync(join(home, ".botfleet", "stopped.marker"))).toBe(false);
+      expect((await api("GET", "/api/health")).status).toBe(200);
+    } finally {
+      held.destroy();
+      await expect.poll(active).toBe(0);
+    }
   });
 
   it("returns 400 for a doubled-slash request target without killing the harness", async () => {
@@ -961,6 +1127,7 @@ describe("harness HTTP API", () => {
     const SLOW = { timeout: 30_000, interval: 250 };
     // SAFETY: the harness's own JSON answer, read back by its test; the assertions below check it.
     const runtime = async () => (await (await fetch(`${BASE}/api/runtime`, { headers: authorization })).json()) as {
+      activeWorkCount: number;
       quiescing: boolean;
       fencing: boolean;
       draining: boolean;
@@ -989,12 +1156,14 @@ describe("harness HTTP API", () => {
 
       // A request still reading its body keeps the forced quiesce settling
       // (it waits up to 15 seconds for work in flight to clear).
+      const activeBeforeHeld = (await runtime()).activeWorkCount;
       heldMutation = request({
         hostname: "127.0.0.1", port: PORT, path: "/api/config", method: "PUT",
         headers: { "content-type": "application/json", "content-length": "2" },
       });
       heldMutation.on("error", () => {});
       heldMutation.write("{");
+      await expect.poll(async () => (await runtime()).activeWorkCount, SLOW).toBeGreaterThan(activeBeforeHeld);
       const forced = quiesce("POST", "?force=true");
       await expect.poll(async () => (await runtime()).fencing, SLOW).toBe(true);
 
@@ -2693,13 +2862,17 @@ describe("harness HTTP API", () => {
   });
 
   it("judges a strict write against the catalog the detected CLI can run, not the registry's full one", async () => {
-    // The fixture Claude CLI reports 2.1.232, older than the 2.1.280 that
-    // Opus 5.5 needs: the picker does not list it, so an MCP-style strict
-    // write must not persist it either, on the primary or on a fallback.
+    // The fixture Claude CLI reports 2.1.232, older than 2.1.280 (Opus 5.5)
+    // and 2.1.284 (Sonnet 5.5): the picker does not list either, so an
+    // MCP-style strict write must not persist them, on the primary or on a
+    // fallback.
     const instances = (await api("GET", "/api/instances")).body.instances;
     const claude = instances.find((instance: { instanceId: string }) => instance.instanceId === "claude");
     expect(claude.snapshot.version).toMatch(/^2\.1\.232/);
-    expect(claude.models.options.map((option: { id: string }) => option.id)).not.toContain("claude-opus-5-5");
+    expect(claude.models.default).toBe("claude-sonnet-5");
+    const ids = claude.models.options.map((option: { id: string }) => option.id);
+    expect(ids).not.toContain("claude-opus-5-5");
+    expect(ids).not.toContain("claude-sonnet-5-5");
     const bot = (await api("POST", "/api/bots")).body.bot;
     try {
       const primary = await api("PATCH", `/api/bots/${bot.id}`, {
@@ -2708,6 +2881,13 @@ describe("harness HTTP API", () => {
       });
       expect(primary.status).toBe(400);
       expect(primary.body.error).toMatch(/"claude-opus-5-5" is not offered by instance "claude"/);
+
+      const sonnet = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "claude", model: "claude-sonnet-5-5" },
+        requireAvailableModel: true,
+      });
+      expect(sonnet.status).toBe(400);
+      expect(sonnet.body.error).toMatch(/"claude-sonnet-5-5" is not offered by instance "claude"/);
 
       const fallback = await api("PATCH", `/api/bots/${bot.id}`, {
         modelSelection: {
@@ -2899,7 +3079,7 @@ describe("harness HTTP API", () => {
           (candidate: { id: string }) => candidate.id === bot.id,
         );
         return state?.busy;
-      }).toBe(true);
+      }, { timeout: winSettleMs(10_000) }).toBe(true);
 
       // the record still names the engine that is NOT running the turn
       const midFlight = (await api("GET", "/api/bots?messages=0")).body.bots.find(
@@ -2912,17 +3092,24 @@ describe("harness HTTP API", () => {
       // hasSession found claude, the real owner; a modelSelection lookup would
       // have asked crasher, which owns nothing, and reported success anyway
       expect(stop.body).toMatchObject({ ok: true, stopped: true });
-      await expect.poll(async () => {
-        const state = (await api("GET", "/api/bots?messages=0")).body.bots.find(
-          (candidate: { id: string }) => candidate.id === bot.id,
-        );
-        return state?.busy;
-      }).toBe(false);
+      // On windows-latest the failover owner can take longer to clear busy after
+      // interrupt; the default expect.poll window is a coin flip there (#867).
+      await settlesWithin(
+        async ({ signal }) => {
+          const state = (await api("GET", "/api/bots?messages=0", undefined, { signal })).body.bots.find(
+            (candidate: { id: string }) => candidate.id === bot.id,
+          );
+          return state?.busy === false;
+        },
+        winSettleMs(20_000),
+        200,
+        "bot clearing busy after interrupt on the failover owner",
+      );
     } finally {
       await api("POST", `/api/bots/${bot.id}/interrupt`, {});
       await api("DELETE", `/api/bots/${bot.id}`);
     }
-  });
+  }, winSettleMs(60_000));
 
   it("the mid-turn fail-over skips a chain entry the doomed breaker is refusing", async () => {
     // Regression: selectTurnFallback only skipped a doomed engine when its
@@ -3224,6 +3411,151 @@ describe("harness HTTP API", () => {
       expect((await api("PATCH", "/api/instances/quota", { enabled: false })).status).toBe(200);
     }
   }, 30_000);
+
+  it("keeps routine receipts queued when the primary model is cooling with no viable fallback", async () => {
+    expect((await api("PATCH", "/api/instances/quota", { enabled: true })).status).toBe(200);
+    const instances = (await api("GET", "/api/instances?fresh=1")).body.instances;
+    const quota = instances.find((instance: { instanceId: string }) => instance.instanceId === "quota");
+    expect(quota?.snapshot.state).toBe("available");
+
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    let routineId: string | undefined;
+    try {
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: {
+          instanceId: "quota",
+          model: quota.models.default,
+          fallbacks: [{ instanceId: "quota", model: quota.models.default }],
+        },
+      })).status).toBe(200);
+      expect((await api("PATCH", "/api/instances/quotaProse", { enabled: true })).status).toBe(200);
+      expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "cool the primary model" })).status).toBe(202);
+      await expect.poll(async () => {
+        // SAFETY: The harness /api/quotas response returns cooldown rows with botId fields.
+        const cooldowns = (await api("GET", "/api/quotas")).body.cooldowns as Array<{ botId: string }>;
+        return cooldowns.some((cooldown) => cooldown.botId === bot.id);
+      }, { timeout: 15_000 }).toBe(true);
+
+      const created = await api("POST", "/api/routines", {
+        name: "Cooldown queue probe",
+        prompt: "Process the queued event",
+        botId: bot.id,
+        runOn: "bot",
+        enabled: false,
+        schedule: { type: "daily", time: "10:00", weekdays: [1] },
+      });
+      expect(created.status).toBe(201);
+      routineId = created.body.routine.id;
+      const delivered = await api("POST", `/api/routines/${routineId}/run`, {});
+      expect(delivered.status).toBe(201);
+      const accepted = delivered.body.run;
+
+      await expect.poll(async () => {
+        // SAFETY: /api/routines returns run rows with status and optional holdReason fields.
+        const runs = (await api("GET", "/api/routines")).body.runs as Array<{
+          id: string;
+          status: string;
+          holdReason?: string;
+        }>;
+        return runs.find((run) => run.id === accepted.id);
+      }, { timeout: 10_000 }).toMatchObject({
+        id: accepted.id,
+        status: "queued",
+        holdReason: expect.stringMatching(/cooling down.*start automatically/i),
+      });
+
+      const quotaProse = (await api("GET", "/api/instances?fresh=1")).body.instances.find(
+        (instance: { instanceId: string }) => instance.instanceId === "quotaProse",
+      );
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "quotaProse", model: quotaProse.models.default },
+      })).status).toBe(200);
+      await expect.poll(async () => {
+        // SAFETY: /api/routines returns run rows keyed by the ingress runId.
+        const runs = (await api("GET", "/api/routines")).body.runs as Array<{ id: string; status: string }>;
+        return runs.find((run) => run.id === accepted.id);
+      }, { timeout: 20_000 }).toMatchObject({ id: accepted.id, status: "completed" });
+    } finally {
+      if (routineId) await api("DELETE", `/api/routines/${routineId}`);
+      await api("DELETE", `/api/bots/${bot.id}`);
+      expect((await api("PATCH", "/api/instances/quota", { enabled: false })).status).toBe(200);
+      expect((await api("PATCH", "/api/instances/quotaProse", { enabled: false })).status).toBe(200);
+    }
+  }, 30_000);
+
+  it("resumes a capacity-held routine when another bot succeeds on the same model route", async () => {
+    const gate = join(home, "capacity-route-healthy");
+    const cli = writeFakeClaudeWrapper(join(home, "fake-capacity-route"), "happy", {
+      replyGate: {
+        path: gate,
+        present: "The same model route is working successfully.",
+        absent: "HTTP 429: concurrency limit reached; retry after 120 seconds",
+      },
+    });
+    expect((await api("PATCH", "/api/instances/quotaProse", { cli, enabled: true })).status).toBe(200);
+    const instance = (await api("GET", "/api/instances?fresh=1")).body.instances.find(
+      (candidate: { instanceId: string }) => candidate.instanceId === "quotaProse",
+    );
+    const first = (await api("POST", "/api/bots")).body.bot;
+    const sibling = (await api("POST", "/api/bots")).body.bot;
+    let routineId: string | undefined;
+    try {
+      for (const candidate of [first, sibling]) {
+        expect((await api("PATCH", `/api/bots/${candidate.id}`, {
+          modelSelection: {
+            instanceId: instance.instanceId,
+            model: instance.models.default,
+            fallbacks: [{ instanceId: instance.instanceId, model: instance.models.default }],
+          },
+        })).status).toBe(200);
+      }
+      expect((await api("POST", `/api/bots/${first.id}/messages`, { text: "probe a busy route" })).status).toBe(202);
+      await expect.poll(async () => {
+        const state = (await api("GET", "/api/bots?messages=0")).body.bots.find(
+          (candidate: { id: string }) => candidate.id === first.id,
+        );
+        return state?.busy;
+      }, { timeout: 15_000 }).toBe(false);
+      // SAFETY: /api/quotas returns the cooldown rows in the harness response contract.
+      const cooldowns = (await api("GET", "/api/quotas")).body.cooldowns as Array<{ botId: string }>;
+      expect(cooldowns.some((row) => row.botId === first.id)).toBe(false);
+
+      const created = await api("POST", "/api/routines", {
+        name: "Transient capacity queue probe",
+        prompt: "Process the pending capacity event",
+        botId: first.id,
+        runOn: "bot",
+        enabled: false,
+        schedule: { type: "daily", time: "10:00", weekdays: [1] },
+      });
+      expect(created.status).toBe(201);
+      routineId = created.body.routine.id;
+      const delivered = await api("POST", `/api/routines/${routineId}/run`, {});
+      expect(delivered.status).toBe(201);
+      const accepted = delivered.body.run;
+      const receipt = async () => {
+        // SAFETY: /api/routines returns run rows with these public status fields.
+        const runs = (await api("GET", "/api/routines")).body.runs as Array<{ id: string; status: string; holdReason?: string }>;
+        return runs.find((row) => row.id === accepted.id);
+      };
+      await expect.poll(receipt, { timeout: 10_000 }).toMatchObject({
+        status: "queued",
+        holdReason: expect.stringMatching(/temporarily at capacity/i),
+      });
+
+      writeFileSync(gate, "healthy");
+      expect((await api("POST", `/api/bots/${sibling.id}/messages`, { text: "prove the same route is healthy" })).status).toBe(202);
+      // The receipt resumes well before its two-minute Retry-After because
+      // the other bot's live provider activity proves this exact route works.
+      await expect.poll(receipt, { timeout: 20_000 }).toMatchObject({ id: accepted.id, status: "completed" });
+    } finally {
+      if (routineId) await api("DELETE", `/api/routines/${routineId}`);
+      await api("DELETE", `/api/bots/${first.id}`);
+      await api("DELETE", `/api/bots/${sibling.id}`);
+      rmSync(gate, { force: true });
+      expect((await api("PATCH", "/api/instances/quotaProse", { cli: fakeQuotaProseCli, enabled: false })).status).toBe(200);
+    }
+  }, 45_000);
 
   it("does not cool down or replay a successful reply that discusses subscription accounting", async () => {
     expect((await api("PATCH", "/api/instances/quotaProse", { enabled: true })).status).toBe(200);
@@ -3538,7 +3870,38 @@ describe("harness HTTP API", () => {
         }
 
         if (queueSuccessor) {
-          expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "run after reload" }))).toEqual({
+          // The POST must land while the bot is still busy; on windows-latest a
+          // fast reload can clear busy between the reload tool frame and here.
+          // Poll for the queued response in one step: wait for busy, POST once,
+          // and stop — never spin on busy alone while the bot is already idle.
+          type MessageSendResult = { status: number; body: unknown };
+          const queuedSendBodySchema = z.object({ queued: z.literal(true) }).passthrough();
+          const isQueuedSend = (result: MessageSendResult | undefined): boolean =>
+            !!result
+            && result.status === 202
+            && queuedSendBodySchema.safeParse(result.body).success;
+          let successorSend: MessageSendResult | undefined;
+          await expect
+            .poll(
+              async () => {
+                if (isQueuedSend(successorSend)) return true;
+                if (successorSend) return false;
+                const state = (await api("GET", "/api/bots?messages=0")).body.bots.find(
+                  (candidate: { id: string }) => candidate.id === bot.id,
+                );
+                if (!state?.busy) return false;
+                successorSend = await api("POST", `/api/bots/${bot.id}/messages`, { text: "run after reload" });
+                return isQueuedSend(successorSend);
+              },
+              {
+                timeout: winSettleMs(15_000),
+                interval: 100,
+                message:
+                  "queued successor send while the reload-held bot is busy (idle here means the reload window closed early)",
+              },
+            )
+            .toBe(true);
+          expect(successorSend).toEqual({
             status: 202,
             body: expect.objectContaining({ ok: true, queued: true }),
           });
@@ -3576,7 +3939,7 @@ describe("harness HTTP API", () => {
                 (message: { text?: string }) => message.text?.includes("You've hit your session limit"),
               ).length,
             };
-          }, { timeout: 10_000 }).toEqual({
+          }, { timeout: winSettleMs(10_000) }).toEqual({
             launchedQueuedPrompt: true,
             queuedUserVisible: true,
             quotaReplies: 2,
@@ -3592,7 +3955,7 @@ describe("harness HTTP API", () => {
                 message.tool?.name?.startsWith("Fell over to"),
               ),
             };
-          }, { timeout: 10_000 }).toEqual({ busy: true, fellOver: true });
+          }, { timeout: winSettleMs(10_000) }).toEqual({ busy: true, fellOver: true });
         }
 
         const beforeStop = (await api("GET", "/api/bots?messages=0")).body.bots.find(
@@ -3638,12 +4001,12 @@ describe("harness HTTP API", () => {
           }
           return true;
         },
-        6_000,
+        winSettleMs(6_000),
         200,
         "instance cleanup writes",
       );
     }
-  }, 40_000);
+  }, winSettleMs(40_000));
 
   it("reports stopped:false when the stop matched no live turn", async () => {
     // An idle bot has no session on any instance. The old endpoint answered a
@@ -4616,6 +4979,100 @@ describe("harness HTTP API", () => {
     expect(res.body.error).toMatch(/Updating Infisical settings and credentials in the same request is not supported/);
   });
 
+  it("keeps externally stored Infisical read and write tokens off disk and out of responses", async () => {
+    const readToken = "st.fixture-read-token";
+    const writeToken = "st.fixture-write-token";
+    try {
+      const saved = await api("PUT", "/api/config?secretStorage=external", {
+        infisical: {
+          enabled: false,
+          authMethod: "service-token",
+          projectId: "11111111-1111-4111-8111-111111111111",
+          token: readToken,
+          writeToken,
+        },
+      });
+      expect(saved.status).toBe(200);
+      expect(saved.body.infisical).toMatchObject({
+        enabled: false, authMethod: "service-token", hasToken: true, hasWriteToken: true,
+      });
+      const disk = JSON.parse(readFileSync(join(home, ".botfleet", "config.json"), "utf8"));
+      expect(disk.infisical).toMatchObject({ token: "", writeToken: "", credentialStorage: "external" });
+      const status = await api("GET", "/api/infisical/status");
+      expect(status.status).toBe(200);
+      for (const payload of [saved.body, disk, status.body]) {
+        expect(JSON.stringify(payload)).not.toContain(readToken);
+        expect(JSON.stringify(payload)).not.toContain(writeToken);
+      }
+      const reloaded = await api("PUT", "/api/config", { profile: { name: "Grace" } });
+      expect(reloaded.status).toBe(200);
+      expect(reloaded.body.infisical).toMatchObject({ hasToken: true, hasWriteToken: true });
+    } finally {
+      await api("PUT", "/api/config?secretStorage=external", {
+        infisical: { enabled: false, projectId: "", token: "", writeToken: "", authMethod: "service-token" },
+      });
+    }
+  });
+
+  it("allows exact source-based Infisical test and sync despite an encrypted primary credential marker", async () => {
+    const projectId = "fixture-source-project";
+    const source = { name: "primary-source", projectId, environment: "prod", secretPath: "/", tokenEnv: "BF_SCOPE_FIXTURE_MISSING" };
+    try {
+      expect((await api("PUT", "/api/config?secretStorage=external", { infisical: {
+        enabled: false, authMethod: "machine-identity", projectId, clientId: "fixture-client", clientSecret: "fixture-encrypted-secret",
+      } })).status).toBe(200);
+      const saved = await api("PATCH", "/api/config", { infisical: {
+        enabled: true, authMethod: "service-token", environment: "prod", secretPath: "/", readSources: [source],
+      } });
+      expect(saved.status).toBe(200);
+      const tested = await api("POST", "/api/infisical/test");
+      expect(tested.status).toBe(200);
+      expect(tested.body.ok).toBe(false);
+      expect(tested.body.error).toContain("BF_SCOPE_FIXTURE_MISSING");
+      expect((await api("POST", "/api/infisical/sync")).status).toBe(200);
+      expect((await api("PATCH", "/api/config", { infisical: { readSources: [{ ...source, secretPath: "/another-folder" }] } })).status).toBe(200);
+      expect((await api("POST", "/api/infisical/test")).status).toBe(409);
+    } finally {
+      await api("PUT", "/api/config?secretStorage=external", { infisical: {
+        enabled: false, authMethod: "service-token", projectId: "", clientId: "", clientSecret: "", token: "", writeToken: "", readSources: [],
+      } });
+    }
+  });
+
+  it("retains partial Infisical setup metadata and the explicit off switch across saves", async () => {
+    try {
+      const saved = await api("PATCH", "/api/config", { infisical: {
+        enabled: false, authMethod: "service-token", projectId: "partial-project", siteUrl: "https://vault.example.test", readSources: [],
+      } });
+      expect(saved.status).toBe(200);
+      expect(saved.body.infisical).toMatchObject({ configured: false, enabled: false, enabledSetting: false });
+      expect((await api("GET", "/api/infisical/status")).body.infisical).toMatchObject({
+        enabledSetting: false, siteUrl: "https://vault.example.test", projectId: "partial-project",
+      });
+      expect((await api("PATCH", "/api/config", { infisical: { refreshMinutes: 20 } })).body.infisical.enabledSetting).toBe(false);
+    } finally {
+      await api("PATCH", "/api/config", { infisical: { enabled: false, projectId: "", siteUrl: "", refreshMinutes: 15 } });
+    }
+  });
+
+  it("rejects extra per-project token references before persisting or exposing credentials", async () => {
+    const token = "st.fixture-cap-read";
+    try {
+      expect((await api("PUT", "/api/config?secretStorage=external", { infisical: {
+        enabled: false, authMethod: "service-token", projectId: "cap-project", token,
+      } })).status).toBe(200);
+      const refused = await api("PATCH", "/api/config", { infisical: { readSources: [{
+        name: "extra", projectId: "cap-project", secretPath: "/extra", tokenEnv: "OTHER_READ_REFERENCE",
+      }] } });
+      expect(refused.status).toBe(400);
+      expect(refused.body.error).toMatch(/one read token reference/);
+      expect(JSON.stringify(refused.body)).not.toContain(token);
+      expect((await api("GET", "/api/infisical/status")).body.infisical.readSources).toEqual([]);
+    } finally {
+      await api("PUT", "/api/config?secretStorage=external", { infisical: { enabled: false, projectId: "", token: "", readSources: [] } });
+    }
+  });
+
   it("keeps shared Local VM mode by default and resolves isolated targets per bot when enabled", async () => {
     const first = (await api("POST", "/api/bots")).body.bot;
     const second = (await api("POST", "/api/bots")).body.bot;
@@ -5032,7 +5489,7 @@ describe("harness HTTP API", () => {
       }).toEqual(["card-shown:routine", "user-approved:user"]);
 
       const after = await api("GET", "/api/routines");
-      expect(after.body.timeZone).toBe(Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC");
+      expect(after.body.timeZone).toBe(CHILD_TIME_ZONE);
       expect(after.body.routines.filter((routine: { botId: string }) => routine.botId === bot.id)).toHaveLength(1);
       const duplicate = await api("POST", `/api/threads/${bot.threadId}/respond`, {
         requestId: proposal.requestId,
@@ -5069,7 +5526,7 @@ describe("harness HTTP API", () => {
         });
         bulkRoutineIds.push(bulk.body.routine.id);
       }
-      expect(legacy.body.routine.schedule.timeZone).toBe(Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC");
+      expect(legacy.body.routine.schedule.timeZone).toBe(CHILD_TIME_ZONE);
       const listed = await fetch(
         `${BASE}/api/internal/routines?fromBotId=${encodeURIComponent(bot.id)}&fromThreadId=${encodeURIComponent(bot.threadId)}`,
         { headers: internalHeaders },
@@ -5357,6 +5814,71 @@ describe("harness HTTP API", () => {
     if (process.platform !== "win32") {
       expect(statSync(join(home, ".botfleet", "webhooks.json")).mode & 0o777).toBe(0o600);
     }
+  });
+
+  it("narrows a webhook to merged pull requests through PATCH and filters the rest without starting a run", async () => {
+    const bots = await api("GET", "/api/bots");
+    const created = await api("POST", "/api/webhooks", {
+      name: "Compiler",
+      prompt: "Verify the merge.",
+      botId: bots.body.bots[0].id,
+      runOn: "bot",
+    });
+    expect(created.status).toBe(201);
+    expect(created.body.webhook.mergedPullRequestsOnly).toBeUndefined();
+    const webhookId: string = created.body.webhook.id;
+    const repository = { full_name: "Simple-With-Us/BotFleet", name: "BotFleet" };
+    const deliver = (event: string, deliveryId: string, body: string) => fetch(created.body.credential.url, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-github-event": event, "x-github-delivery": deliveryId },
+      body,
+    });
+
+    const patched = await api("PATCH", `/api/webhooks/${webhookId}`, { mergedPullRequestsOnly: true });
+    expect(patched.status).toBe(200);
+    expect(patched.body.webhook).toMatchObject({ id: webhookId, name: "Compiler", mergedPullRequestsOnly: true });
+
+    const checkRun = await deliver(
+      "check_run",
+      "gh-check-run",
+      JSON.stringify({ repository, action: "completed", check_run: { status: "completed", conclusion: "failure" } }),
+    );
+    expect(checkRun.status).toBe(202);
+    expect(await checkRun.json()).toMatchObject({ accepted: true, ignored: true });
+    const unmerged = await deliver(
+      "pull_request",
+      "gh-pr-unmerged",
+      JSON.stringify({ repository, action: "closed", pull_request: { number: 7, merged: false, merged_at: null } }),
+    );
+    expect(await unmerged.json()).toMatchObject({ accepted: true, ignored: true });
+    const beforeMerge = await api("GET", "/api/routines");
+    expect(beforeMerge.body.runs.filter((run: { webhookId?: string }) => run.webhookId === webhookId)).toEqual([]);
+
+    const merged = await deliver(
+      "pull_request",
+      "gh-pr-merged",
+      JSON.stringify({ repository, action: "closed", pull_request: { number: 7, merged: true, merged_at: "2026-10-18T21:00:00Z" } }),
+    );
+    expect(merged.status).toBe(202);
+    const mergedBody = await merged.json();
+    expect(mergedBody).toMatchObject({ accepted: true, duplicate: false, runId: expect.any(String) });
+    expect(mergedBody).not.toHaveProperty("ignored");
+    const receipts = await api("GET", "/api/routines");
+    const run = receipts.body.runs.find((candidate: { deliveryId?: string }) => candidate.deliveryId === "gh-pr-merged");
+    expect(run).toMatchObject({ triggerSource: "webhook", webhookId, routineName: "Compiler" });
+    // This test is about filtering, not about what the bot does with the run.
+    await api("POST", `/api/routine-runs/${run.id}/cancel`);
+
+    const listed = await api("GET", "/api/webhooks");
+    expect(listed.body.webhooks.find((webhook: { id: string }) => webhook.id === webhookId)).toMatchObject({
+      mergedPullRequestsOnly: true,
+      deliveryCount: 1,
+      ignoredCount: 2,
+    });
+
+    const cleared = await api("PATCH", `/api/webhooks/${webhookId}`, { mergedPullRequestsOnly: false });
+    expect(cleared.body.webhook.mergedPullRequestsOnly).toBeUndefined();
+    expect((await api("DELETE", `/api/webhooks/${webhookId}`)).status).toBe(200);
   });
 
   it("stores OpenCode Go credentials as a configured-only status", async () => {
@@ -6129,6 +6651,44 @@ describe("instance CLI override API", () => {
     expect((await api("GET", "/api/cli-candidates?name=")).body.candidates).toEqual([]);
   });
 
+  it("searches an engine's alias names alongside its default", async () => {
+    // Clutch's driver default is `dsh` but its own build installs as `clutch`,
+    // so the Engines dropdown could only ever offer the binary that runs
+    // against ~/.dsh — never the one carrying Clutch's own profiles.
+    //
+    // The server under test is a SEPARATE process with its own PATH, so this
+    // cannot plant a binary and assert on it; the widening itself is proved in
+    // env-path.test.ts, which owns a controlled PATH.  What is pinned here is
+    // the HTTP contract — the parameter is parsed, searched, and cannot make
+    // the answer worse — and every assertion holds whatever is installed.
+    const candidates = async (query: string): Promise<string[]> =>
+      (await api("GET", `/api/cli-candidates?${query}`)).body.candidates;
+    const bare = await candidates("name=dsh");
+    const aliased = await candidates("name=dsh&aliases=clutch");
+    // The default's hits still lead, in the same order: an alias adds rows, it
+    // never reorders or drops what the default name already found.
+    expect(aliased.slice(0, bare.length)).toEqual(bare);
+    // Anything the alias finds on its own is in the union the picker asks for,
+    // which is what "the alias was actually searched" means over HTTP.
+    for (const path of await candidates("name=clutch")) expect(aliased).toContain(path);
+    // A blank or padded list is not a name and must not widen the search.
+    expect(await candidates("name=dsh&aliases=")).toEqual(bare);
+    expect(await candidates("name=dsh&aliases=%20,%20")).toEqual(bare);
+  });
+
+  it("rejects an oversized cli-candidates query instead of searching it", async () => {
+    // Kody review: the boundary value used to be split and spread straight into
+    // the search.  It is schema-bounded now, and an over-long value is a client
+    // error rather than a few thousand existsSync calls.
+    const tooLong = await api("GET", `/api/cli-candidates?name=dsh&aliases=${"c".repeat(5000)}`);
+    expect(tooLong.status).toBe(400);
+    expect(tooLong.body).toMatchObject({ ok: false, error: "invalid_cli_candidates_query" });
+    // A name long enough to be a path still fits: the head is length-bounded,
+    // not shape-restricted, because a configured override IS a path.
+    expect((await api("GET", `/api/cli-candidates?name=${"x".repeat(600)}`)).status).toBe(400);
+    expect((await api("GET", `/api/cli-candidates?name=${"/opt/"}${"y".repeat(200)}`)).status).toBe(200);
+  });
+
   it("reports a missing binary as a failed probe with install info", async () => {
     const res = await api("POST", "/api/cli-test", { cli: "/no/such/binary-anywhere", driver: "claudeAgent" });
     expect(res.status).toBe(200);
@@ -6165,6 +6725,7 @@ describe("instance CLI override API", () => {
     const claude = instances.find((instance: { instanceId: string }) => instance.instanceId === "claude");
     const claude2 = instances.find((instance: { instanceId: string }) => instance.instanceId === "claude2");
     const bot = (await api("POST", "/api/bots")).body.bot as { id: string; threadId: string };
+    const idlePoll = { timeout: winSettleMs(30_000), interval: 250 };
     const persistedTask = () => {
       const bots = JSON.parse(readFileSync(join(home, ".botfleet", "bots.json"), "utf8")) as Array<{
         id: string;
@@ -6184,14 +6745,14 @@ describe("instance CLI override API", () => {
           (candidate: { id: string }) => candidate.id === bot.id,
         );
         return state?.busy;
-      }).toBe(false);
+      }, idlePoll).toBe(false);
     };
 
     try {
       await select("claude", claude.models.default);
       rmSync(fakeClaudeDump, { force: true });
       expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "establish a Claude cursor" })).status).toBe(202);
-      await expect.poll(() => persistedTask(), { timeout: 5_000 }).toMatchObject({
+      await expect.poll(() => persistedTask(), { timeout: winSettleMs(10_000) }).toMatchObject({
         lastInstanceId: "claude",
         resumeCursors: { claude: expect.any(String) },
       });
@@ -6200,7 +6761,7 @@ describe("instance CLI override API", () => {
 
       await select("claude2", claude2.models.default);
       expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "make the second engine current" })).status).toBe(202);
-      await expect.poll(() => persistedTask()?.lastInstanceId, { timeout: 5_000 }).toBe("claude2");
+      await expect.poll(() => persistedTask()?.lastInstanceId, { timeout: winSettleMs(10_000) }).toBe("claude2");
       await interrupt();
 
       expect((await api("PATCH", "/api/instances/claude", { cli: fakeUnsupportedClaudeCli })).status).toBe(200);
@@ -6211,7 +6772,7 @@ describe("instance CLI override API", () => {
           (candidate: { id: string }) => candidate.id === bot.id,
         );
         return state?.busy;
-      }, { timeout: 5_000 }).toBe(false);
+      }, idlePoll).toBe(false);
 
       expect(persistedTask()).toMatchObject({
         lastInstanceId: "claude2",
@@ -6222,7 +6783,8 @@ describe("instance CLI override API", () => {
       await api("DELETE", `/api/bots/${bot.id}`);
       expect((await api("PATCH", "/api/instances/claude", { cli: FAKE_CLAUDE_CLI })).status).toBe(200);
     }
-  }, 20_000);
+    // Three interrupt idle polls (each up to winSettleMs(30_000)) plus setup polls must fit inside the case budget.
+  }, winSettleMs(120_000));
 
   it("does not let setup from before a provider reload dispatch or clear its successor", async () => {
     const launchLog = join(home, "fake-claude-setup-race-launches");
@@ -6295,7 +6857,7 @@ describe("instance CLI override API", () => {
           );
           return live?.busy === true;
         },
-        10_000,
+        winSettleMs(10_000),
         200,
         "successor dispatch persisting lastInstanceId and claude resume cursor without a stale launch",
       );
@@ -6320,7 +6882,7 @@ describe("instance CLI override API", () => {
       expect((await api("PATCH", "/api/instances/claude", { cli: FAKE_CLAUDE_CLI, fullAuto: false })).status).toBe(200);
       expect((await api("PUT", "/api/config", { box: { token: "" } })).status).toBe(200);
     }
-  }, 30_000);
+  }, winSettleMs(30_000));
 
   it("rejects overlapping provider configuration writes", async () => {
     const slowConfigWrite = api("PUT", "/api/config", { box: { token: "box_slow" } });
@@ -6424,15 +6986,40 @@ describe("instance CLI override API", () => {
     const instanceId = created.body.instanceId;
     expect(instanceId).toContain("custom-ollama-local");
 
+    type CustomEngineListItem = {
+      instanceId: string;
+      replyWaitMinutes?: number;
+      displayName?: string;
+      driverKind?: string;
+      isCustom?: boolean;
+      localModelWaitAvailable?: boolean;
+      snapshot?: { state?: string; authenticated?: boolean };
+      models?: { options?: Array<{ id: string }> };
+    };
+    const findInstance = (instances: CustomEngineListItem[], id: string): CustomEngineListItem | undefined =>
+      instances.find((item) => item.instanceId === id);
+
     const instancesRes = await api("GET", "/api/instances");
-    const found = instancesRes.body.instances.find((i: any) => i.instanceId === instanceId);
+    const found = findInstance(instancesRes.body.instances, instanceId);
     expect(found).toBeDefined();
-    expect(found.displayName).toBe("Ollama Local");
-    expect(found.driverKind).toBe("openai-compat");
-    expect(found.isCustom).toBe(true);
-    expect(found.snapshot.state).toBe("available");
-    expect(found.snapshot.authenticated).toBe(true);
-    expect(found.models.options.map((m: any) => m.id)).toEqual(["llama3.3:70b", "mistral:latest"]);
+    expect(found?.displayName).toBe("Ollama Local");
+    expect(found?.driverKind).toBe("openai-compat");
+    expect(found?.isCustom).toBe(true);
+    expect(found?.snapshot?.state).toBe("available");
+    expect(found?.snapshot?.authenticated).toBe(true);
+    expect(found?.models?.options?.map((model) => model.id)).toEqual(["llama3.3:70b", "mistral:latest"]);
+    expect(found?.localModelWaitAvailable).toBe(true);
+
+    expect((await api("PATCH", `/api/instances/${instanceId}`, { replyWaitMinutes: 20 })).status).toBe(200);
+    expect((await api("PATCH", `/api/instances/${instanceId}`, { replyWaitMinutes: 10, unexpected: true })).status).toBe(400);
+    const configured = await api("GET", "/api/instances");
+    expect(findInstance(configured.body.instances, instanceId)?.replyWaitMinutes).toBe(20);
+    for (const invalid of [1, 4, 61, 2.5, "20"]) {
+      expect((await api("PATCH", `/api/instances/${instanceId}`, { replyWaitMinutes: invalid })).status).toBe(400);
+    }
+    expect((await api("PATCH", `/api/instances/${instanceId}`, { replyWaitMinutes: null })).status).toBe(200);
+    const reset = await api("GET", "/api/instances");
+    expect(findInstance(reset.body.instances, instanceId)).not.toHaveProperty("replyWaitMinutes");
 
     const botRes = await api("POST", "/api/bots", {
       name: "Local Bot",
@@ -6444,6 +7031,7 @@ describe("instance CLI override API", () => {
 
     expect((await api("DELETE", "/api/instances/claude")).status).toBe(400);
     expect((await api("DELETE", "/api/instances/openaiCompat")).status).toBe(400);
+    expect((await api("DELETE", "/api/instances/opencode")).status).toBe(400);
 
     const deleted = await api("DELETE", `/api/instances/${instanceId}`);
     expect(deleted.status).toBe(200);
@@ -8842,10 +9430,11 @@ describe("POST /api/bots/apply-model-defaults (set all bots to default models)",
 });
 
 describe("model lineage over HTTP: saved selections move forward, never aliased", () => {
-  type Saved = { instanceId: string; model: string; latest?: string; fallbacks?: Saved[] };
+  type Saved = { instanceId: string; model: string; latest?: string; contextCap?: number; maxOutputTokens?: number; fallbacks?: Saved[] };
   // A describe records each engine's CLI version; until the Claude CLI has
   // reported one, nothing on a Claude engine is moved.  The fixture CLI
-  // reports 2.1.232, older than the 2.1.280 that Opus 5.5 needs.
+  // reports 2.1.232, older than 2.1.280 (Opus 5.5) and 2.1.284 (Sonnet 5.5),
+  // so the runnable Sonnet on it is Sonnet 5.
   beforeAll(async () => {
     await api("GET", "/api/instances");
   });
@@ -8866,9 +9455,16 @@ describe("model lineage over HTTP: saved selections move forward, never aliased"
     );
     expect(claude.snapshot.version).toMatch(/^2\.1\.232/);
     const ids = claude.models.options.map((option: { id: string }) => option.id);
-    expect(ids).toEqual(expect.arrayContaining(["claude-sonnet-5-5", "claude-opus-5"]));
-    expect(ids).not.toContain("claude-sonnet-5");
+    expect(ids).toEqual(expect.arrayContaining(["claude-sonnet-5", "claude-opus-5"]));
+    expect(ids).not.toContain("claude-sonnet-5-5");
     expect(ids).not.toContain("claude-opus-5-5");
+    expect(claude.models.default).toBe("claude-sonnet-5");
+  });
+
+  it("starts a new bot on Sonnet 5 when the CLI cannot run Sonnet 5.5", async () => {
+    await withBot("Lineage Default Sonnet", async (bot) => {
+      expect(await selectionOf(bot.id)).toMatchObject({ instanceId: "claude", model: "claude-sonnet-5" });
+    });
   });
 
   it("never moves a pinned Opus 5 onto Opus 5.5 for a CLI too old to run it", async () => {
@@ -8924,7 +9520,7 @@ describe("model lineage over HTTP: saved selections move forward, never aliased"
         modelSelection: { instanceId: "claude", model: "claude-3-7-sonnet" },
       });
       expect(saved.status).toBe(200);
-      expect(await selectionOf(bot.id)).toMatchObject({ instanceId: "claude", model: "claude-sonnet-5-5", latest: "sonnet" });
+      expect(await selectionOf(bot.id)).toMatchObject({ instanceId: "claude", model: "claude-sonnet-5", latest: "sonnet" });
     });
   });
 
@@ -8933,13 +9529,13 @@ describe("model lineage over HTTP: saved selections move forward, never aliased"
       expect((await api("PATCH", `/api/bots/${bot.id}`, {
         modelSelection: { instanceId: "claude", model: "claude-sonnet-5", latest: "sonnet" },
       })).status).toBe(200);
-      expect(await selectionOf(bot.id)).toMatchObject({ model: "claude-sonnet-5-5", latest: "sonnet" });
+      expect(await selectionOf(bot.id)).toMatchObject({ model: "claude-sonnet-5", latest: "sonnet" });
 
       expect((await api("PATCH", `/api/bots/${bot.id}`, {
-        modelSelection: { instanceId: "claude", model: "claude-sonnet-5-5", latest: null },
+        modelSelection: { instanceId: "claude", model: "claude-sonnet-5", latest: null },
       })).status).toBe(200);
       const pinned = await selectionOf(bot.id);
-      expect(pinned?.model).toBe("claude-sonnet-5-5");
+      expect(pinned?.model).toBe("claude-sonnet-5");
       expect(pinned?.latest).toBeUndefined();
 
       const bad = await api("PATCH", `/api/bots/${bot.id}`, {
@@ -8947,6 +9543,87 @@ describe("model lineage over HTTP: saved selections move forward, never aliased"
       });
       expect(bad.status).toBe(400);
       expect(bad.body.error).toMatch(/latest/);
+    });
+  });
+
+  it("refuses a context cap or output limit that is not a whole number of tokens from 1 to 10,000,000", async () => {
+    await withBot("Limits Refused", async (bot) => {
+      const sonnet = { instanceId: "claude", model: "claude-sonnet-5" };
+      for (const bad of [0, -5, 1.5, "8k", 10_000_001, true]) {
+        const cap = await api("PATCH", `/api/bots/${bot.id}`, { modelSelection: { ...sonnet, contextCap: bad } });
+        expect(cap.status, `contextCap ${String(bad)}`).toBe(400);
+        expect(cap.body.error).toMatch(/contextCap/);
+        const out = await api("PATCH", `/api/bots/${bot.id}`, { modelSelection: { ...sonnet, maxOutputTokens: bad } });
+        expect(out.status, `maxOutputTokens ${String(bad)}`).toBe(400);
+        expect(out.body.error).toMatch(/maxOutputTokens/);
+      }
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { ...sonnet, contextCap: 1, maxOutputTokens: 10_000_000 },
+      })).status).toBe(200);
+    });
+  });
+
+  it("keeps a saved context cap and output limit when an older client re-sends the selection without them", async () => {
+    await withBot("Limits Older Client", async (bot) => {
+      const sonnet = { instanceId: "claude", model: "claude-sonnet-5" };
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: {
+          ...sonnet,
+          contextCap: 524_288,
+          maxOutputTokens: 8192,
+          fallbacks: [{ instanceId: "claude2", model: "claude-opus-5", maxOutputTokens: 4096 }],
+        },
+      })).status).toBe(200);
+      expect(await selectionOf(bot.id)).toMatchObject({ contextCap: 524_288, maxOutputTokens: 8192 });
+
+      // The shipped iOS app decodes instanceId, model, effort and fallbacks
+      // only, so an effort edit from the phone re-sends exactly that.
+      const phone = await api("PATCH", `/api/bots/${bot.id}/profile`, {
+        modelSelection: { ...sonnet, effort: "high", fallbacks: [{ instanceId: "claude2", model: "claude-opus-5" }] },
+      });
+      expect(phone.status).toBe(200);
+      expect(await selectionOf(bot.id)).toMatchObject({
+        effort: "high",
+        contextCap: 524_288,
+        maxOutputTokens: 8192,
+        fallbacks: [{ instanceId: "claude2", model: "claude-opus-5", maxOutputTokens: 4096 }],
+      });
+    });
+  });
+
+  it("clears a context cap and output limit on an explicit null, and drops them on another model", async () => {
+    await withBot("Limits Cleared", async (bot) => {
+      const sonnet = { instanceId: "claude", model: "claude-sonnet-5" };
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { ...sonnet, contextCap: 524_288, maxOutputTokens: 8192 },
+      })).status).toBe(200);
+
+      // The desktop picker's "No Limit" and an emptied Max Output field.
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { ...sonnet, contextCap: null, maxOutputTokens: 8192 },
+      })).status).toBe(200);
+      const capCleared = await selectionOf(bot.id);
+      expect(capCleared?.contextCap).toBeUndefined();
+      expect(capCleared).toMatchObject({ maxOutputTokens: 8192 });
+
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { ...sonnet, contextCap: null, maxOutputTokens: null },
+      })).status).toBe(200);
+      const bothCleared = await selectionOf(bot.id);
+      expect(bothCleared?.contextCap).toBeUndefined();
+      expect(bothCleared?.maxOutputTokens).toBeUndefined();
+
+      // Limits belong to the model they were set on.
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { ...sonnet, contextCap: 524_288, maxOutputTokens: 8192 },
+      })).status).toBe(200);
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "claude", model: "claude-opus-5" },
+      })).status).toBe(200);
+      const moved = await selectionOf(bot.id);
+      expect(moved).toMatchObject({ model: "claude-opus-5" });
+      expect(moved?.contextCap).toBeUndefined();
+      expect(moved?.maxOutputTokens).toBeUndefined();
     });
   });
 
@@ -8989,24 +9666,44 @@ describe("model lineage over HTTP: saved selections move forward, never aliased"
   });
 
   it("keeps a float when an older client writes back the slug it read before the float moved on", async () => {
-    await withBot("Lineage Stale Write", async (bot) => {
-      expect((await api("PATCH", `/api/bots/${bot.id}`, {
-        modelSelection: { instanceId: "claude", model: "claude-sonnet-5-5", latest: "sonnet" },
-      })).status).toBe(200);
-      // The shipped iOS app read `claude-sonnet-5` while the float pointed
-      // there, the harness has since moved it to 5.5, and the app writes its
-      // copy back with no `latest`.
-      const stale = await api("PATCH", `/api/bots/${bot.id}`, {
-        modelSelection: { instanceId: "claude", model: "claude-sonnet-5", effort: "high" },
+    // The fixture CLI is too old to list Sonnet 5.5, so this story runs on a
+    // CLI that reports 2.1.284, where Latest Sonnet resolves to 5.5.
+    const newerCli = join(home, "fake-claude-newer-sonnet");
+    writeFileSync(
+      newerCli,
+      [
+        "#!/usr/bin/env node",
+        'process.env.FAKE_CLAUDE_VERSION = "2.1.284 (Claude Code)";',
+        "delete process.env.FAKE_CLAUDE_DUMP;",
+        `await import(${JSON.stringify(pathToFileURL(FAKE_CLAUDE_CLI).href)});`,
+        "",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    try {
+      await withBot("Lineage Stale Write", async (bot) => {
+        expect((await api("PATCH", "/api/instances/claude2", { cli: newerCli })).status).toBe(200);
+        expect((await api("PATCH", `/api/bots/${bot.id}`, {
+          modelSelection: { instanceId: "claude2", model: "claude-sonnet-5", latest: "sonnet" },
+        })).status).toBe(200);
+        expect(await selectionOf(bot.id)).toMatchObject({ model: "claude-sonnet-5-5", latest: "sonnet" });
+        // The shipped iOS app read `claude-sonnet-5` while the float pointed
+        // there, the harness has since moved it to 5.5, and the app writes its
+        // copy back with no `latest`.
+        const stale = await api("PATCH", `/api/bots/${bot.id}`, {
+          modelSelection: { instanceId: "claude2", model: "claude-sonnet-5", effort: "high" },
+        });
+        expect(stale.status).toBe(200);
+        expect(await selectionOf(bot.id)).toMatchObject({
+          instanceId: "claude2",
+          model: "claude-sonnet-5-5",
+          latest: "sonnet",
+          effort: "high",
+        });
       });
-      expect(stale.status).toBe(200);
-      expect(await selectionOf(bot.id)).toMatchObject({
-        instanceId: "claude",
-        model: "claude-sonnet-5-5",
-        latest: "sonnet",
-        effort: "high",
-      });
-    });
+    } finally {
+      await api("PATCH", "/api/instances/claude2", { cli: FAKE_CLAUDE_CLI });
+    }
   });
 
   it("refuses a retired id with no successor that the write introduces", async () => {
@@ -9030,11 +9727,11 @@ describe("model lineage over HTTP: saved selections move forward, never aliased"
       expect((await api("PATCH", `/api/bots/${bot.id}`, {
         modelSelection: {
           instanceId: "claude",
-          model: "claude-sonnet-5-5",
+          model: "claude-sonnet-5",
           latest: "sonnet",
           fallbacks: [
-            { instanceId: "claude2", model: "claude-opus-5-5" },
-            { instanceId: "claude2", model: "claude-sonnet-5-5", latest: "sonnet" },
+            { instanceId: "claude2", model: "claude-opus-5" },
+            { instanceId: "claude2", model: "claude-sonnet-5", latest: "sonnet" },
           ],
         },
       })).status).toBe(200);
@@ -9043,13 +9740,13 @@ describe("model lineage over HTTP: saved selections move forward, never aliased"
       expect((await api("PATCH", `/api/bots/${bot.id}`, {
         modelSelection: {
           instanceId: "claude",
-          model: "claude-sonnet-5-5",
-          fallbacks: [{ instanceId: "claude2", model: "claude-sonnet-5-5" }],
+          model: "claude-sonnet-5",
+          fallbacks: [{ instanceId: "claude2", model: "claude-sonnet-5" }],
         },
       })).status).toBe(200);
       expect(await selectionOf(bot.id)).toMatchObject({
         latest: "sonnet",
-        fallbacks: [{ instanceId: "claude2", model: "claude-sonnet-5-5", latest: "sonnet" }],
+        fallbacks: [{ instanceId: "claude2", model: "claude-sonnet-5", latest: "sonnet" }],
       });
 
       const taskPath = `/api/bots/${bot.id}/tasks/${bot.threadId}`;
@@ -9057,12 +9754,12 @@ describe("model lineage over HTTP: saved selections move forward, never aliased"
         modelSelection: { instanceId: "claude2", model: "claude-sonnet-5", latest: "sonnet" },
       });
       expect(floated.status).toBe(200);
-      expect(floated.body.task.modelSelection).toMatchObject({ model: "claude-sonnet-5-5", latest: "sonnet" });
+      expect(floated.body.task.modelSelection).toMatchObject({ model: "claude-sonnet-5", latest: "sonnet" });
       const resent = await api("PATCH", taskPath, {
-        modelSelection: { instanceId: "claude2", model: "claude-sonnet-5-5" },
+        modelSelection: { instanceId: "claude2", model: "claude-sonnet-5" },
       });
       expect(resent.status).toBe(200);
-      expect(resent.body.task.modelSelection).toMatchObject({ model: "claude-sonnet-5-5", latest: "sonnet" });
+      expect(resent.body.task.modelSelection).toMatchObject({ model: "claude-sonnet-5", latest: "sonnet" });
     });
   });
 
@@ -9070,20 +9767,20 @@ describe("model lineage over HTTP: saved selections move forward, never aliased"
     await withBot("Lineage Apply", async (bot) => {
       const floating = await api("POST", "/api/bots/apply-model-defaults", {
         slots: {
-          primary: { instanceId: "claude", model: "claude-sonnet-5-5", latest: "sonnet" },
+          primary: { instanceId: "claude", model: "claude-sonnet-5", latest: "sonnet" },
           fallbacks: [{ instanceId: "claude2", model: "claude-haiku-4-5", latest: "haiku" }, null, null],
         },
       });
       expect(floating.status).toBe(200);
       expect(await selectionOf(bot.id)).toMatchObject({
         instanceId: "claude",
-        model: "claude-sonnet-5-5",
+        model: "claude-sonnet-5",
         latest: "sonnet",
         fallbacks: [{ instanceId: "claude2", model: "claude-haiku-4-5", latest: "haiku" }],
       });
 
       const pinned = await api("POST", "/api/bots/apply-model-defaults", {
-        slots: { primary: { instanceId: "claude", model: "claude-sonnet-5-5" } },
+        slots: { primary: { instanceId: "claude", model: "claude-sonnet-5" } },
       });
       expect(pinned.status).toBe(200);
       const after = await selectionOf(bot.id);
@@ -9933,6 +10630,21 @@ describe("CSRF security hardening", () => {
     });
     expect(result.status).toBe(403);
     expect(result.body).toContain("forbidden: cross-origin request");
+  });
+
+  it("refuses mutating API requests that carry Cloudflare tunnel markers", async () => {
+    const result = await rawRequest({
+      method: "POST",
+      path: "/api/bots",
+      headers: {
+        "content-type": "application/json",
+        "content-length": "2",
+        "cf-ray": "fixture-ray",
+      },
+      body: "{}",
+    });
+    expect(result.status).toBe(403);
+    expect(result.body).toContain("named tunnel");
   });
 
   it("accepts Origin from the server's own port", async () => {

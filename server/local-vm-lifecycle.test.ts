@@ -1,11 +1,11 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { containerRuntimeLockdownEnv } from "./container-runtime-guard.ts";
-import { removeTempDir, waitForExit } from "./testing/cleanup.ts";
+import { removeTempDir, spawnDetached, waitForExit } from "./testing/cleanup.ts";
 import { harnessReady } from "./testing/harness-ready.ts";
 
 // Real HTTP admission and state changes, with every container executable
@@ -32,6 +32,16 @@ describe.skipIf(process.platform === "win32")("Local VM lifecycle exclusion", ()
     writeFileSync(gate, "hold");
   };
   const release = () => rmSync(gate, { force: true });
+  /** After the fake runtime signals `entered`, late startup docker lines can
+   *  still land on macOS CI.  Wait until the held-gate `info` and any boot
+   *  probe traffic are both in the log before snapshotting exact equality. */
+  const waitForHeldGateLogSettled = async () => {
+    await expect.poll(() => existsSync(entered), { timeout: 10000 }).toBe(true);
+    await expect.poll(
+      () => readFileSync(log, "utf8").split("\n").filter(Boolean).length,
+      { timeout: 5000 },
+    ).toBeGreaterThanOrEqual(2);
+  };
 
   beforeAll(async () => {
     home = mkdtempSync(join(tmpdir(), "bf-vm-lifecycle-"));
@@ -70,7 +80,7 @@ fs.appendFileSync(path.join(home, "runtime.log"), args.join(" ") + "\\n");
     // three makes runtime discovery probe Docker and Podman concurrently, so
     // a second preflight line can race an assertion about the fenced request.
     writeFileSync(join(bin, "docker"), fake, { mode: 0o755 });
-    child = spawn(process.execPath, [join(serverDir, "index.ts")], {
+    child = spawnDetached(process.execPath, ["--experimental-strip-types", "--no-warnings", join(serverDir, "index.ts")], {
       cwd: join(serverDir, ".."), stdio: ["ignore", "pipe", "pipe"],
       env: { HOME: home, USERPROFILE: home, PATH: process.env.PATH, OMB_EXTRA_PATH: bin,
         // Container runtimes are off for the harness except the fixture above,
@@ -111,20 +121,7 @@ fs.appendFileSync(path.join(home, "runtime.log"), args.join(" ") + "\\n");
     hold();
     const mode = api("POST", "/api/local-computer/mode", { mode: "per-bot" });
     try {
-      await expect.poll(() => existsSync(entered), { timeout: 10000 }).toBe(true);
-      // The boot-time IIFE (server/index.ts — the shared-target
-      // containerComputerStatus fired at module load) writes one `info`
-      // line in its own subprocess, and that write can land AFTER
-      // `entered` becomes visible to the test on macos.  Wait until at
-      // least two lines are present before snapshotting so the IIFE's
-      // flush and the held-gate info have both landed.  The fake writes
-      // the log line synchronously before signalling `entered`, so once
-      // two lines exist the only thing that can add a third is the test
-      // asserting it didn't.
-      await expect.poll(
-        () => readFileSync(log, "utf8").split("\n").filter(Boolean).length,
-        { timeout: 5000 },
-      ).toBeGreaterThanOrEqual(2);
+      await waitForHeldGateLogSettled();
       const before = readFileSync(log, "utf8");
       expect((await api("DELETE", `/api/bots/${bot.id}`)).status).toBe(409);
       expect((await api("GET", "/api/bots")).body.bots.some((item: any) => item.id === bot.id)).toBe(true);
@@ -145,7 +142,7 @@ fs.appendFileSync(path.join(home, "runtime.log"), args.join(" ") + "\\n");
     hold();
     const deletion = api("DELETE", `/api/bots/${bot.id}`);
     try {
-      await expect.poll(() => existsSync(entered), { timeout: 10000 }).toBe(true);
+      await waitForHeldGateLogSettled();
       const before = readFileSync(log, "utf8");
       expect((await api("POST", "/api/local-computer/mode", { mode: "shared" })).status).toBe(409);
       // Same contract as the deletion fence case above.

@@ -11,7 +11,7 @@ final class SpeechProjectionTests: XCTestCase {
         XCTAssertEqual(SpeechProjection.speakable("Edit `server/drivers/acp/core.ts` first"), "Edit core.ts first")
         XCTAssertEqual(SpeechProjection.speakable("## Summary"), "Summary.")
         XCTAssertEqual(SpeechProjection.speakable("- one\n- two"), "one. two")
-        XCTAssertEqual(SpeechProjection.speakable("Run this:\n```swift\nlet x = 1\n```\nThen stop."), "Run this:. (a Swift code block). Then stop.")
+        XCTAssertEqual(SpeechProjection.speakable("Run this:\n```swift\nlet x = 1\n```\nThen stop."), "Run this:. A Swift code block. Then stop.")
     }
 
     func testTablesReadAsCellsAndEmojiAreSilent() {
@@ -56,7 +56,7 @@ final class SpeechProjectionTests: XCTestCase {
         XCTAssertEqual(segments, [
             SpeechSegment(text: "First paragraph. Still first.", endsParagraph: true),
             SpeechSegment(text: "Second paragraph.", endsParagraph: true),
-            SpeechSegment(text: "(a code block)", endsParagraph: true),
+            SpeechSegment(text: "A code block.", endsParagraph: true),
         ])
     }
 

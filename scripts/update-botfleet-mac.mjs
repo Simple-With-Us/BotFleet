@@ -2,7 +2,7 @@
 
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { createReadStream, realpathSync } from "node:fs";
+import { createReadStream, realpathSync, rmSync } from "node:fs";
 import {
   chmod,
   lstat,
@@ -13,8 +13,9 @@ import {
   realpath,
   rename,
   rm,
+  mkdtemp,
   stat,
-  writeFile,
+  writeFile
 } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
@@ -27,12 +28,38 @@ import {
   outcomeMessage,
 } from "./update-progress.mjs";
 import { validUpdateCredentialReceipt } from "../electron/update-credential-preparation.mjs";
+import { createDesktopStartupRequest, readDesktopStartupReceipt } from "../electron/desktop-startup-receipt.mjs";
 import { stageIsPrunable } from "./stage-entries.mjs";
+import {
+  FAILED_INSTALL_KEEP,
+  failedInstallBundles,
+  failedInstallBundlesToPrune,
+  pruneFailedInstallBundles,
+} from "./failed-install-retention.mjs";
+
+export {
+  FAILED_INSTALL_KEEP,
+  failedInstallBundles,
+  failedInstallBundlesToPrune,
+  failedInstallStamp,
+} from "./failed-install-retention.mjs";
 import {
   downloadBuiltBundle,
   ResolutionError,
   updateSourcePolicy,
 } from "./ci-build-resolver.mjs";
+import {
+  currentCommit as storeCurrentCommit,
+  currentLink as storeCurrentLink,
+  promoteStaging,
+  releasePath as storeReleasePath,
+  resolveCurrent as resolveStoreCurrent,
+  stageRelease,
+  stagingPath as storeStagingPath,
+  swapCurrent,
+  validateReleaseManifest,
+} from "./harness-release-store.mjs";
+import { dependencyScopeStatus, verifyReleaseAgainstCommit } from "./release-provenance.mjs";
 
 const EXPECTED_TEAM_ID = "CC8UTF7ATG";
 // Transition release: main still BUILDS com.botfleet.app (LEGACY_BUNDLE_ID).
@@ -51,6 +78,8 @@ const BUILDER_SIGN_SELECTOR = "Jay Wedgeworth, LLC (CC8UTF7ATG)";
 export const DEFAULT_PORTS = [8799, 18799, 28799];
 const BUILD_MANIFEST_RELATIVE = "Contents/Resources/server/build-identity.json";
 const GENERATED_PATHS = [
+  "native/helpers/BotFleet Recorder.app/Contents/MacOS/recorder-helper",
+  "native/helpers/BotFleet Speech.app/Contents/MacOS/speech-helper",
   "electron/resources/BotFleet Recorder.app/Contents/MacOS/recorder-helper",
   "electron/resources/BotFleet Speech.app/Contents/MacOS/speech-helper",
   "electron/vendor/electron-updater.cjs",
@@ -69,6 +98,27 @@ export class CommandError extends Error {
   }
 }
 
+export const UPDATE_COMPONENT_MODES = Object.freeze(["both", "server", "app"]);
+
+export function normalizeUpdateComponents(value) {
+  const raw = String(value ?? "both").trim().toLowerCase();
+  if (raw === "server-only") return "server";
+  if (!UPDATE_COMPONENT_MODES.includes(raw)) {
+    throw new Error(`--components must be one of: ${UPDATE_COMPONENT_MODES.join(", ")} (or --server-only)`);
+  }
+  return raw;
+}
+
+/** Which halves of an install this run owns.  The parsed CLI is the source of truth. */
+export function resolveUpdateComponentFlags(components) {
+  const mode = normalizeUpdateComponents(components);
+  return {
+    mode,
+    updateServer: mode === "both" || mode === "server",
+    updateApp: mode === "both" || mode === "app",
+  };
+}
+
 export function parseArguments(argv) {
   const args = [...argv];
   const command = ["prepare", "apply", "update", "unquiesce"].includes(args[0]) ? args.shift() : "update";
@@ -79,6 +129,7 @@ export function parseArguments(argv) {
     stage: undefined,
     bundle: undefined,
     dependencies: undefined,
+    components: "both",
     openApplication: true,
     progress: undefined,
     runId: undefined,
@@ -91,6 +142,11 @@ export function parseArguments(argv) {
     else if (arg === "--stage") parsed.stage = resolve(requiredValue(arg, args.shift()));
     else if (arg === "--bundle") parsed.bundle = resolve(requiredValue(arg, args.shift()));
     else if (arg === "--dependencies") parsed.dependencies = resolve(requiredValue(arg, args.shift()));
+    else if (arg === "--components") parsed.components = normalizeUpdateComponents(requiredValue(arg, args.shift()));
+    else if (arg.startsWith("--components=")) {
+      parsed.components = normalizeUpdateComponents(requiredValue("--components", arg.slice("--components=".length)));
+    }
+    else if (arg === "--server-only") parsed.components = "server";
     else if (arg === "--progress") parsed.progress = resolve(requiredValue(arg, args.shift()));
     else if (arg === "--run-id") parsed.runId = requiredValue(arg, args.shift());
     else if (arg === "--no-open") parsed.openApplication = false;
@@ -109,8 +165,8 @@ export function parseArguments(argv) {
   }
   if (command === "apply" && !parsed.stage) throw new Error("apply requires --stage <directory>");
   if (command === "unquiesce" && (parsed.target !== "origin/main" || parsed.source || parsed.stage || parsed.bundle ||
-      parsed.dependencies || parsed.openApplication === false || parsed.progress || parsed.runId ||
-      parsed.graceMs !== undefined || parsed.waitForIdleMs !== undefined)) {
+      parsed.dependencies || parsed.components !== "both" || parsed.openApplication === false || parsed.progress ||
+      parsed.runId || parsed.graceMs !== undefined || parsed.waitForIdleMs !== undefined)) {
     throw new Error("unquiesce accepts no options");
   }
   if (parsed.force && parsed.waitForIdleMs !== undefined) {
@@ -124,6 +180,9 @@ export function parseArguments(argv) {
   }
   if (parsed.bundle && !parsed.source) {
     throw new Error("importing a built bundle requires its exact --source checkout");
+  }
+  if (parsed.components === "app" && !(parsed.bundle && parsed.dependencies)) {
+    throw new Error("--components app is only supported when importing a built bundle with --bundle and --dependencies");
   }
   if (parsed.runId !== undefined) {
     if (!parsed.progress) throw new Error("--run-id requires --progress <path>");
@@ -164,6 +223,12 @@ function usage() {
   update-botfleet-mac.mjs apply   --stage PATH [--no-open]
                               [--grace SECONDS | --wait-for-idle [MINUTES] | --force]
   update-botfleet-mac.mjs unquiesce
+
+--components both|server|app (or --server-only) states which halves a run owns, defaulting to both.
+A server-only run stops the harness, swaps the dependency tree, restarts it, and proves it is the
+single authenticated data owner, without quitting the desktop app, renaming its bundle, preparing
+its credentials, reopening it, or sampling its processes.  --components app is refused unless the
+caller imports a built bundle with --bundle and --dependencies.
 
 With no --target, update and prepare (run through scripts/update-botfleet.sh) install the newest
 commit on origin/main whose hosted Mac build succeeded and that is newer than the installed build,
@@ -467,8 +532,22 @@ export function reconcilableGenerations(generations, { appPath, installedCommit 
  * follow it: the running binary and everything it maps stay open as `txt`
  * descriptors, and lsof prints their current paths.
  */
+/**
+ * `/var` is a symlink to `/private/var`.  lsof prints one of them and
+ * `realpath` returns the other, so both have to count as the same bundle.
+ */
+function bundlePathPrefixes(bundleRealPath) {
+  const prefixes = [`${bundleRealPath}${sep}`];
+  if (bundleRealPath.startsWith("/private/var/")) {
+    prefixes.push(`${bundleRealPath.slice("/private".length)}${sep}`);
+  } else if (bundleRealPath.startsWith("/var/")) {
+    prefixes.push(`/private${bundleRealPath}${sep}`);
+  }
+  return prefixes;
+}
+
 export function txtHolderPids(lsofOutput, bundleRealPath) {
-  const prefix = `${bundleRealPath}${sep}`;
+  const prefixes = bundlePathPrefixes(bundleRealPath);
   const pids = new Set();
   let pid = null;
   for (const line of lsofOutput.split("\n")) {
@@ -478,7 +557,8 @@ export function txtHolderPids(lsofOutput, bundleRealPath) {
       continue;
     }
     if (pid === null || !line.startsWith("n")) continue;
-    if (line.slice(1).startsWith(prefix)) pids.add(pid);
+    const name = line.slice(1);
+    if (prefixes.some((prefix) => name.startsWith(prefix))) pids.add(pid);
   }
   return [...pids];
 }
@@ -488,60 +568,6 @@ export function txtHolderPids(lsofOutput, bundleRealPath) {
  * process that survives the swap keeps running out of the renamed bundle and
  * shows that name in the Dock and menu bar until it is relaunched.
  */
-/**
- * A failed install leaves the replacement behind as `<name>.failed-<stamp>`
- * so it can be examined.  They are evidence of a failed update, so they are
- * reported rather than deleted.
- *
- * Evidence is worth keeping for a while and worthless forever, though, and
- * this used to have no end: every failed update left a whole second copy of
- * the app in /Applications forever.  Four of them held 2.5 GB on a disk that
- * was 99% full.  So they are now capped -- see `FAILED_INSTALL_KEEP`.  The
- * newest few stay as evidence; the rest go.
- */
-export function failedInstallBundles(names, bundleName) {
-  return names.filter((name) => name.startsWith(`${bundleName}.failed-`));
-}
-
-/**
- * How many failed-install bundles to keep.
- *
- * Three is enough to diagnose a bad update (the one you just hit, plus the
- * couple before it that might share a cause) without letting a flapping
- * updater fill the disk.  Each one is a full copy of the app, so on a 600 MB
- * bundle the difference between three and unlimited is the whole disk.
- */
-export const FAILED_INSTALL_KEEP = 3;
-
-/**
- * The millisecond stamp a failed-install bundle carries, or null when the name
- * is not one.  The stamp is written by the failed install itself, so it is the
- * only age signal available without stat'ing every bundle.
- */
-export function failedInstallStamp(name, bundleName) {
-  const prefix = `${bundleName}.failed-`;
-  if (!name.startsWith(prefix)) return null;
-  const stamp = Number(name.slice(prefix.length));
-  return Number.isSafeInteger(stamp) && stamp > 0 ? stamp : null;
-}
-
-/**
- * Which failed-install bundles are past the retention cap: the oldest ones,
- * keeping the `keep` newest.  Pure, so the policy is testable without a disk.
- *
- * A bundle whose stamp does not parse is never pruned.  It is not ours to age
- * out, and guessing could delete the wrong thing.
- */
-export function failedInstallBundlesToPrune(names, bundleName, keep = FAILED_INSTALL_KEEP) {
-  const stamped = [];
-  for (const name of names) {
-    const stamp = failedInstallStamp(name, bundleName);
-    if (stamp !== null) stamped.push({ name, stamp });
-  }
-  stamped.sort((a, b) => b.stamp - a.stamp);
-  return stamped.slice(Math.max(0, keep)).map((entry) => entry.name);
-}
-
 export function survivingRollbackProcessError(pids, rollbackPath) {
   if (!pids.length) return null;
   return `BotFleet process ${pids.join(", ")} still runs from the prior bundle ${rollbackPath}; it would keep showing that bundle's name until relaunch`;
@@ -859,10 +885,10 @@ async function requestJson(url, { headers = {}, method = "GET", timeoutMs = 3_00
   return { kind: "ok", status: response.status, body };
 }
 
-async function probeHealthWithRetry(port, { attempts = 3, backoffMs = 250 } = {}) {
+async function probeHealthWithRetry(port, { attempts = 3, backoffMs = 250, dataDirectory } = {}) {
   let result;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
-    result = await probeHealth(port);
+    result = await probeHealth(port, { dataDirectory });
     // none, botfleet, foreign and http are all definitive; only an
     // unreachable or ambiguous response is worth asking again, because a
     // single three-second timeout is not evidence that a port is owned.
@@ -872,20 +898,34 @@ async function probeHealthWithRetry(port, { attempts = 3, backoffMs = 250 } = {}
   return { ...result, port };
 }
 
-async function probeHealth(port, { timeoutMs = 3_000 } = {}) {
+export async function localListenerPids(port) {
+  const result = await run("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"], { allowFailure: true });
+  if (![0, 1].includes(result.code)) return [];
+  return [...new Set(result.stdout.split(/\s+/).filter(Boolean).map(Number)
+    .filter((pid) => Number.isSafeInteger(pid) && pid > 0))];
+}
+
+export function classifyLocalHealth(body, port, listeners, owner) {
+  if (body?.app !== "botfleet" || !Number.isSafeInteger(body?.pid) || body.pid <= 0) return { kind: "foreign" };
+  if (listeners.length !== 1) return { kind: "unavailable", reason: "local listener ownership is ambiguous", port };
+  // A UI shim forwards the far end's health unchanged; its PID is never a local process identity.
+  if (listeners[0] !== body.pid || (owner && owner.port !== port)) return { kind: "proxy", port };
+  if (!owner || owner.pid !== body.pid || owner.port !== port) {
+    return { kind: "unavailable", reason: "local runtime has no matching private owner record", port };
+  }
+  if (body.ready === false || body.booting === true) return { kind: "unavailable", reason: "booting", port };
+  return { kind: "botfleet", pid: body.pid, static: Boolean(body.static), port };
+}
+
+async function probeHealth(port, { timeoutMs = 3_000, dataDirectory } = {}) {
   const result = await requestJson(`http://127.0.0.1:${port}/api/health`, { accept: [200], timeoutMs });
   if (result.kind !== "ok") return result;
-  if (result.body?.app !== "botfleet" || !Number.isInteger(result.body?.pid) || result.body.pid <= 0) {
+  if (result.body?.app !== "botfleet" || !Number.isSafeInteger(result.body?.pid) || result.body.pid <= 0) {
     return { kind: "foreign" };
   }
-  // The harness binds its port before the boot work and answers health with
-  // `ready: false` until that work finishes, 503-ing every other route
-  // meanwhile.  Alive but not yet serving is exactly what "unavailable" means
-  // here — and it is the one kind probeHealthWithRetry asks again about.
-  if (result.body.ready === false || result.body.booting === true) {
-    return { kind: "unavailable", reason: "booting", port };
-  }
-  return { kind: "botfleet", pid: result.body.pid, static: Boolean(result.body.static), port };
+  const directory = dataDirectory ?? resolve(process.env.BOTFLEET_DATA_DIR || join(homedir(), ".botfleet"));
+  const [listeners, state] = await Promise.all([localListenerPids(port), ownerRecordState(directory)]);
+  return classifyLocalHealth(result.body, port, listeners, state.state === "live" ? state.owner : null);
 }
 
 async function sqliteHolders(dataDirectory) {
@@ -915,7 +955,7 @@ export function healthTopologyResult(results, { allowMultiple = false } = {}) {
 }
 
 async function healthTopology(ports, options = {}) {
-  const probe = (port) => probeHealth(port, options.timeoutMs ? { timeoutMs: options.timeoutMs } : undefined);
+  const probe = (port) => probeHealth(port, options);
   return healthTopologyResult(await Promise.all(ports.map(probe)), options);
 }
 
@@ -1010,7 +1050,402 @@ async function ownerRecordState(dataDirectory) {
 
 async function readOwner(dataDirectory) {
   const { state, owner } = await ownerRecordState(dataDirectory);
-  return state === "live" ? owner : null;
+  if (state !== "live") return null;
+  const listeners = await localListenerPids(owner.port);
+  return listeners.length === 1 && listeners[0] === owner.pid ? owner : null;
+}
+
+/** Environment handed to the release-store helpers: the updater's own, with
+ *  HOME pinned to the account this config was built for. */
+function storeEnvFor(config) {
+  return { ...process.env, HOME: config.home ?? homedir() };
+}
+
+/**
+ * Whether this host's launcher will start the harness from the release store.
+ * Mirrors botfleet-server-start.sh: BOTFLEET_SERVER_ROOT overrides the
+ * pointer, the pointer wins when it exists (even dangling, which the launcher
+ * also treats as present), and the checkout is the fallback.  A store-backed
+ * host deploys through the store; a checkout-backed host deploys as it always
+ * has, and this file's store paths never touch it.
+ */
+export async function storeHarnessState(config) {
+  const env = storeEnvFor(config);
+  if (process.env.BOTFLEET_SERVER_ROOT) return { mode: "checkout", env };
+  let pointerPresent = false;
+  try {
+    await lstat(storeCurrentLink(env));
+    pointerPresent = true;
+  } catch { /* an absent pointer is the fallback case */ }
+  if (!pointerPresent) return { mode: "checkout", env };
+  return { mode: "release", env, physical: await resolveStoreCurrent(env) };
+}
+
+/** The physical directory a process runs from, via its cwd descriptor. */
+async function runningRootOfPid(pid) {
+  const result = await run("lsof", ["-Fn", "-a", "-p", String(pid), "-d", "cwd"], { allowFailure: true });
+  if (result.code !== 0) return null;
+  const line = result.stdout.split("\n").find((entry) => entry.startsWith("n/"));
+  return line ? line.slice(1) : null;
+}
+
+/** A release manifest that binds to its own directory name, or null. */
+async function readRunningReleaseManifest(root) {
+  try {
+    const manifest = validateReleaseManifest(JSON.parse(await readFile(join(root, ".botfleet-release.json"), "utf8")));
+    if (!manifest || manifest.commit !== basename(root)) return null;
+    return manifest;
+  } catch {
+    return null;
+  }
+}
+
+async function readReleasePackageVersion(root, commit) {
+  try {
+    const value = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
+    // Bootstrap archives have no node_modules; these checks parse the consumed JSON boundary without a third-party schema dependency.
+    // oxlint-disable-next-line anti-slop/no-runtime-typeof -- dependency-free JSON boundary parse
+    if (!value || typeof value !== "object" || Array.isArray(value) || !Object.hasOwn(value, "version")) throw new Error("invalid package object");
+    // Keep the same version syntax as validBuildIdentity, rather than introduce a stricter release dialect here.
+    // oxlint-disable-next-line anti-slop/no-runtime-typeof -- dependency-free JSON boundary parse
+    if (typeof value.version !== "string" || !/^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(value.version)) throw new Error("invalid package version");
+    return value.version;
+  } catch {
+    throw new Error(
+      `Existing release ${commit.slice(0, 12)} cannot be trusted: package.json is missing, unreadable or has an invalid runtime version.\u00A0 ` +
+        "Discard and re-stage it before retrying.",
+    );
+  }
+}
+
+/** The two refusals a store-backed harness can legitimately need cleared by
+ *  EXTERNAL verification: its runtime predates release identity reporting
+ *  (all-zeros commit), or it could not verify itself at boot.  Anything else
+ *  — wrong app, wrong pid, wrong commit, wrong build, work in flight — is
+ *  never overridden. */
+const STORE_CLEARABLE_IDENTITY_ERRORS = new Set([
+  "Authenticated runtime did not report an exact source commit",
+  "Authenticated runtime reports a dirty or unknown source checkout",
+]);
+
+/**
+ * Prove the RUNNING harness's identity from outside the process when the
+ * runtime cannot prove it itself: resolve the owner process's real working
+ * directory (not the mutable pointer — between a swap and a restart the two
+ * name different releases), require it to be a manifest-bound store release,
+ * and verify the exported bytes against the commit's tree objects in the
+ * updater's checkout.  The release's own manifest supplies only WHICH commit
+ * to check; the proof comes from git's objects, which a writer inside the
+ * release cannot recompute.  Returns null when identity is proven, else the
+ * refusal to report.
+ */
+export async function clearStoreIdentityError(config, owner, runtime, expectedBuild, identityError, { requireIdle = false } = {}, adapters = {}) {
+  if (!STORE_CLEARABLE_IDENTITY_ERRORS.has(identityError)) return identityError;
+  const store = await (adapters.storeState ?? storeHarnessState)(config);
+  if (store.mode !== "release") return identityError;
+  const root = await (adapters.runningRoot ?? runningRootOfPid)(owner.pid);
+  const physicalRoot = root ? await realpath(root).catch(() => null) : null;
+  const manifest = physicalRoot ? await readRunningReleaseManifest(physicalRoot) : null;
+  if (!manifest) {
+    return "Harness runs from a tree that is not a manifest-bound store release; its identity cannot be proven";
+  }
+  // Root association: the launcher cd's (physically) into the release before
+  // exec, the verified server source contains no chdir, so the owner pid's
+  // cwd IS the root its code was loaded from — and that root must be the very
+  // directory the STORE names for this commit, not an arbitrary manifest-
+  // carrying tree elsewhere.  Residue: a same-UID writer with repo control is
+  // outside this check's scope, as the verifier's header states.
+  const storeRoot = await realpath(storeReleasePath(manifest.commit, store.env)).catch(() => null);
+  if (!storeRoot || physicalRoot !== storeRoot) {
+    return `Harness runs from ${physicalRoot}, which is not the store's release ${storeRoot ?? "(unresolvable)"} for ${manifest.commit.slice(0, 12)}`;
+  }
+  let expectedDepsFingerprint = adapters.expectedDepsFingerprint ?? null;
+  if (adapters.expectedDepsFingerprintFor) {
+    // The updater's per-commit custody: a fingerprint it captured while
+    // holding that commit's dependency scope known-good THIS run, or one it
+    // builds now from a fresh install of that commit's byte-verified
+    // lockfile.  Never the release's own snapshot of itself.
+    try {
+      expectedDepsFingerprint = (await adapters.expectedDepsFingerprintFor(manifest.commit)) ?? expectedDepsFingerprint;
+    } catch (error) {
+      return `Running release's dependency scope cannot be proven: ${error?.message || error}`;
+    }
+  }
+  const verdict = await (adapters.verify ?? verifyReleaseAgainstCommit)({
+    releaseRoot: physicalRoot,
+    commit: manifest.commit,
+    repo: config.checkout,
+    referenceDeps: adapters.referenceDeps ?? null,
+    expectedDepsFingerprint,
+  });
+  if (!verdict?.ok) {
+    return verdict?.reason === "drift"
+      ? `Running release is not the commit it names: ${verdict.detail}`
+      : `Running release cannot be verified against the updater's checkout: ${verdict?.detail ?? "verification unavailable"}`;
+  }
+  // The remaining gates run in the SAME order authenticatedRuntimeError would
+  // have run them had the self-report been complete: commit, then build, then
+  // idleness.  Clearing the first refusal must never mask a later one.
+  if (expectedBuild && manifest.commit !== expectedBuild.targetCommit) {
+    return `Harness is running ${manifest.commit.slice(0, 12)}, expected ${expectedBuild.targetCommit.slice(0, 12)}`;
+  }
+  if (expectedBuild && (runtime.version !== expectedBuild.version || runtime.apiVersion !== expectedBuild.apiVersion ||
+      (runtime.uiHash !== null && runtime.uiHash !== expectedBuild.uiHash))) {
+    return "Harness runtime identity does not match the prepared application build";
+  }
+  // Whole-runtime proof at EVERY gate, pre- or post-apply.  This clear
+  // overrides a refusal to move the harness; a verified source tree says
+  // nothing about the executable dependency scope, and unknown executable
+  // bytes are never cleared on a source-only claim.  The pre-apply question
+  // (WHICH commit serves, for rollback targeting) is answered by the
+  // verified source; the gate to ACT on that answer needs the whole runtime.
+  if (verdict.dependencies === "unverified") {
+    return "Running release's dependency tree cannot be verified; identity requires whole-runtime proof";
+  }
+  const activeWorkCount = runtime?.activeWorkCount ?? runtime?.activeWork?.count;
+  if (requireIdle && (runtime.safeToRestart !== true || activeWorkCount !== 0)) {
+    return `${Number.isInteger(activeWorkCount) ? activeWorkCount : "Unknown"} active operations prevent update`;
+  }
+  return null;
+}
+
+/**
+ * Deploy the prepared commit through the release store when the launcher is
+ * store-backed: stage the export (with dependencies, from the checkout the
+ * transaction just advanced), promote it with the prepared build's version
+ * stamped into the manifest, and move the pointer.  The running process keeps
+ * serving its own release until startHarness restarts it — the pointer is a
+ * launch-time decision, so swapping it here interrupts nothing.
+ */
+/**
+ * Fingerprint a dependency scope this run holds known-good.  A scope whose
+ * links reach outside the tree can never be trusted: its fingerprint records
+ * target text for bytes nobody hashed.
+ */
+function captureDepsFingerprint(root) {
+  const status = dependencyScopeStatus(root);
+  if (status.linkProblems.length) {
+    throw new Error(`dependency scope has links outside the tree's custody: ${status.linkProblems[0]}`);
+  }
+  return status.fingerprint;
+}
+
+/**
+ * Build a fresh, throwaway dependency reference for a commit: export the
+ * commit's tree from git objects, prove the exported source bytes BEFORE any
+ * install hook runs, install from that verified tree's lockfile, and prove
+ * the hooks left the source alone.  The result is the ONE dependency tree
+ * this run holds known-good, used to prove an existing release whose staging
+ * custody this run never saw.  The caller removes the directory.
+ */
+export async function installReferenceDeps(config, commit, env, adapters = {}) {
+  const dir = await mkdtemp(join(tmpdir(), "botfleet-ref-"));
+  const archive = join(dir, ".botfleet-reference-source.tar");
+  const verify = adapters.verifyRelease ?? verifyReleaseAgainstCommit;
+  try {
+    await run("git", ["-C", config.checkout, "archive", "--format=tar", "--output", archive, commit], { timeout: 300_000 });
+    await run("tar", ["-xf", archive, "-C", dir], { timeout: 300_000 });
+    await rm(archive, { force: true });
+    const exported = verify({ releaseRoot: dir, commit, repo: config.checkout });
+    if (!exported.ok) {
+      throw new Error(`reference export of ${commit.slice(0, 12)} is not the commit's tree before install: ${exported.detail}`);
+    }
+    if (exported.dependencies !== "absent") {
+      throw new Error(`reference export of ${commit.slice(0, 12)} already carries a dependency scope before install`);
+    }
+    await (adapters.install ?? (async (target) => {
+      await run("pnpm", ["install", "--frozen-lockfile"], {
+        cwd: target,
+        timeout: 30 * 60_000,
+        maxBuffer: 32 * 1024 * 1024,
+        env: { ...env },
+      });
+    }))(dir);
+    const settled = verify({ releaseRoot: dir, commit, repo: config.checkout });
+    if (!settled.ok) {
+      throw new Error(`dependency install mutated the reference source of ${commit.slice(0, 12)}: ${settled.detail}`);
+    }
+  } catch (error) {
+    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }).catch(() => {});
+    throw new Error(`Could not build a trusted dependency reference for ${commit.slice(0, 12)}: ${error?.message || error}`);
+  }
+  return dir;
+}
+
+/**
+ * PREPARE the release-store deploy, entirely outside the interruption
+ * window: stage the export, prove the exported source bytes BEFORE any
+ * install hook runs (git archive honors attributes; the export is the tree
+ * the lockfile will be interpreted against), install, prove the hooks left
+ * the source alone, promote, and capture dependency custody.  An existing
+ * release is proven against a fresh trusted reference instead.  Every slow
+ * failure mode here — minutes of install, network, drift — fires while the
+ * harness still serves; the boundary itself only swaps the pointer.
+ */
+export async function prepareStoreReleaseDeploy(config, prepared, previous, adapters = {}) {
+  const store = await storeHarnessState(config);
+  if (store.mode !== "release") return false;
+  const commit = prepared.targetCommit;
+  const releaseDir = storeReleasePath(commit, store.env);
+  const stage = adapters.stageRelease ?? stageRelease;
+  const install = adapters.install ?? (async (dir) => {
+    await run("pnpm", ["install", "--frozen-lockfile"], {
+      cwd: dir,
+      timeout: 30 * 60_000,
+      maxBuffer: 32 * 1024 * 1024,
+      env: { ...store.env },
+    });
+  });
+  const verify = adapters.verifyRelease ?? verifyReleaseAgainstCommit;
+  let trustedDepsFingerprint = null;
+  if (!(await isReleaseDirectoryForUpdater(releaseDir))) {
+    await stage({
+      commit,
+      repo: config.checkout,
+      env: store.env,
+      install: false,
+      log: (line) => console.log(line),
+    });
+    const staging = storeStagingPath(commit, store.env);
+    const exported = verify({ releaseRoot: staging, commit, repo: config.checkout });
+    if (!exported.ok) {
+      throw new Error(`Staged export of ${commit.slice(0, 12)} is not the commit's tree before install: ${exported.detail}`);
+    }
+    if (exported.dependencies !== "absent") {
+      throw new Error(`Staged export of ${commit.slice(0, 12)} already carries a dependency scope before install`);
+    }
+    await install(staging);
+    const settled = verify({ releaseRoot: staging, commit, repo: config.checkout });
+    if (!settled.ok) {
+      throw new Error(`Dependency install mutated the staged source of ${commit.slice(0, 12)}: ${settled.detail}`);
+    }
+    await promoteStaging({ commit, env: store.env, version: prepared.version, build: prepared.build });
+    // Installed from the byte-verified lockfile by THIS run, over a source
+    // tree verified before AND after the hooks: the dependency scope is
+    // known-good now, and the fingerprint keeps that custody through the
+    // pointer swap and restart.
+    trustedDepsFingerprint = captureDepsFingerprint(releaseDir);
+  } else {
+    // Reusing an existing release: its stamped version must BE the prepared
+    // one.  The manifest is only transport — the updater's expectedBuild is
+    // the authority — so a mismatch is a refusal before the pointer moves,
+    // never a post-apply surprise.  An unstamped manifest falls back to the
+    // exported package.json version, the same value the runtime would report.
+    const manifest = await readRunningReleaseManifest(releaseDir);
+    const releaseVersion = manifest?.version
+      ?? await readReleasePackageVersion(releaseDir, commit);
+    if (!/^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(releaseVersion)) {
+      throw new Error(
+        `Existing release ${commit.slice(0, 12)} cannot be trusted: its stamped runtime version is invalid.\u00A0 ` +
+          "Discard and re-stage it before retrying.",
+      );
+    }
+    if (releaseVersion !== prepared.version) {
+      throw new Error(
+        `Existing release ${commit.slice(0, 12)} carries version ${releaseVersion}, but this update prepared ${prepared.version}.  ` +
+          "Refusing to point the store at a release whose version was not the validated one; discard and re-stage it first.",
+      );
+    }
+    // An existing release was staged by an earlier run whose custody this
+    // run cannot see; snapshotting its own dependency tree would prove only
+    // stability, never that the bytes came from the lockfile.  Prove it
+    // instead against a FRESH reference installed right now from git objects
+    // plus the byte-verified lockfile — source bytes AND dependency scope
+    // must both match, or the store never points at it.
+    const referenceDir = await (adapters.installReference ?? installReferenceDeps)(config, commit, store.env);
+    let referenceFingerprint = null;
+    try {
+      referenceFingerprint = captureDepsFingerprint(referenceDir);
+    } finally {
+      await rm(referenceDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }).catch(() => {});
+    }
+    const verify = adapters.verifyRelease ?? verifyReleaseAgainstCommit;
+    const verdict = verify({
+      releaseRoot: releaseDir,
+      commit,
+      repo: config.checkout,
+      expectedDepsFingerprint: referenceFingerprint,
+    });
+    if (!verdict.ok || (referenceFingerprint ? verdict.dependencies !== "verified" : verdict.dependencies !== "absent")) {
+      throw new Error(
+        `Existing release ${commit.slice(0, 12)} cannot be trusted: ${verdict.ok ? "its dependency scope could not be proven against a fresh install" : verdict.detail}  ` +
+          "Discard and re-stage it instead of pointing the store at unproven bytes.",
+      );
+    }
+    trustedDepsFingerprint = referenceFingerprint;
+  }
+  // The post-apply gates compare the RUNNING release against the fingerprint
+  // captured while the updater held the dependency scope known-good, closing
+  // the window between install and restart.
+  if (previous) {
+    previous.releaseDepsFingerprint = trustedDepsFingerprint;
+    previous.storeDeployPrepared = commit;
+  }
+  await (config.storeAdapters?.registerTrustedFingerprint ?? (() => {}))(commit, trustedDepsFingerprint);
+  return true;
+}
+
+/**
+ * The boundary half of the store deploy: preparation already proved the
+ * release outside the interruption window, so inside the fence the deploy is
+ * the pointer swap and NOTHING else.  It fails closed: an unprepared commit
+ * is a hard refusal — never a fallback install with the harness down.  A
+ * standalone caller runs prepareStoreReleaseDeploy first, explicitly.
+ */
+export async function deployStoreReleaseIfBacked(config, prepared, previous, _adapters = {}) {
+  const store = await storeHarnessState(config);
+  if (store.mode !== "release") return false;
+  const commit = prepared.targetCommit;
+  if (previous?.storeDeployPrepared !== commit) {
+    throw new Error(`Release ${commit.slice(0, 12)} was not prepared outside the boundary by this run; refusing to deploy unprepared (no install inside the fence)`);
+  }
+  const result = await swapCurrent({ commit, env: store.env });
+  if (result.activated !== storeReleasePath(commit, store.env)) {
+    throw new Error(`Release store did not activate ${commit.slice(0, 12)}`);
+  }
+  console.log(`Release store now points at ${commit.slice(0, 12)}.`);
+  return true;
+}
+
+/**
+ * Post-apply, on a store-backed host: the owner process must run from the
+ * release the prepared commit was activated into, and that release must
+ * verify byte-for-byte against the commit's tree in the checkout.  Both
+ * checks are external to the process being checked.
+ */
+async function assertStoreReleaseRunning(config, prepared, previous) {
+  const store = await storeHarnessState(config);
+  if (store.mode !== "release") return;
+  const owner = await readOwner(config.dataDirectory);
+  if (!owner) throw new Error("Updated harness has no live owner record for release verification");
+  const root = await runningRootOfPid(owner.pid);
+  const physicalRoot = root ? await realpath(root).catch(() => null) : null;
+  const expectedRoot = await realpath(storeReleasePath(prepared.targetCommit, store.env)).catch(() => null);
+  if (!physicalRoot || !expectedRoot || physicalRoot !== expectedRoot) {
+    throw new Error(`Updated harness runs from ${physicalRoot ?? "an unknown root"}, not the activated release ${expectedRoot ?? storeReleasePath(prepared.targetCommit, store.env)}`);
+  }
+  const verdict = verifyReleaseAgainstCommit({
+    releaseRoot: physicalRoot,
+    commit: prepared.targetCommit,
+    repo: config.checkout,
+    expectedDepsFingerprint: previous?.releaseDepsFingerprint ?? null,
+  });
+  if (!verdict.ok) {
+    throw new Error(`Activated release failed byte verification: ${verdict.detail}`);
+  }
+  // The dependency scope is executable code git never exported: when the
+  // updater holds a known-good fingerprint the scope must still match it,
+  // and a scope the verifier could not see (unverified while one exists) is
+  // a refusal, never a skip.
+  if (previous?.releaseDepsFingerprint && verdict.dependencies !== "verified") {
+    throw new Error("Activated release's dependency scope changed between install and verification");
+  }
+}
+
+// The store's own isReleaseDirectory, aliased at import time would shadow
+// nothing, but the call sites read better when the check names its subject.
+async function isReleaseDirectoryForUpdater(path) {
+  return (await readRunningReleaseManifest(path)) !== null;
 }
 
 export function authenticatedRuntimeError(runtime, owner, expectedBuild, { requireIdle }) {
@@ -1042,7 +1477,7 @@ export function authenticatedRuntimeError(runtime, owner, expectedBuild, { requi
  *  is a slow harness, not a wrong one, and worth asking again. */
 const TOPOLOGY_UNAVAILABLE = /unavailable or ambiguous/;
 
-async function strictRuntimePreflight(config, expectedBuild, { requireIdle }) {
+async function strictRuntimePreflight(config, expectedBuild, { requireIdle, depsFingerprint = null }) {
   const { state, owner } = await ownerRecordState(config.dataDirectory);
   // A record naming a dead pid is a stopped or crashed harness, not an
   // unadopted one.  Say which it is, so the operator restarts the app instead
@@ -1059,6 +1494,10 @@ async function strictRuntimePreflight(config, expectedBuild, { requireIdle }) {
     return { safe: false, reason: `BotFleet harness (pid ${owner.pid}) is not running` };
   }
   if (state !== "live") return null;
+  const listeners = await localListenerPids(owner.port);
+  if (listeners.length !== 1 || listeners[0] !== owner.pid) {
+    return { safe: false, reason: "Private runtime owner does not own the local listening socket" };
+  }
   const response = await requestJson(`http://127.0.0.1:${owner.port}/api/runtime`, {
     headers: harnessAuthorizationHeader(owner),
     accept: [200],
@@ -1072,8 +1511,18 @@ async function strictRuntimePreflight(config, expectedBuild, { requireIdle }) {
   }
   const runtime = response.body;
   const identityError = authenticatedRuntimeError(runtime, owner, expectedBuild, { requireIdle });
-  if (identityError) return { safe: false, reason: identityError };
-  const topology = await healthTopology(config.ports, { timeoutMs: PATIENT_REQUEST_MS });
+  if (identityError) {
+    // A store-backed harness whose runtime cannot self-prove is not refused
+    // yet: the updater verifies the running release's bytes itself, against
+    // git objects, before it believes or disbelieves anything.
+    const storeAdapters = { ...config.storeAdapters };
+    if (depsFingerprint && storeAdapters.expectedDepsFingerprint == null) {
+      storeAdapters.expectedDepsFingerprint = depsFingerprint;
+    }
+    const standing = await clearStoreIdentityError(config, owner, runtime, expectedBuild, identityError, { requireIdle }, storeAdapters);
+    if (standing) return { safe: false, reason: standing };
+  }
+  const topology = await healthTopology(config.ports, { timeoutMs: PATIENT_REQUEST_MS, dataDirectory: config.dataDirectory });
   if (!topology.safe || topology.pid !== owner.pid) {
     return {
       safe: false,
@@ -1153,12 +1602,12 @@ export function rollbackFenceConfig(config) {
   return { ...config, fenceNow: waitForIdleFor(config) > 0 ? "idle" : "force" };
 }
 
-export async function runtimePreflight(config, expectedBuild, adapters = {}) {
+export async function runtimePreflight(config, expectedBuild, adapters = {}, { depsFingerprint = null } = {}) {
   // Work in flight is never a reason to stop here: the fence step decides
   // what happens to it.  What this checks is that the harness is the one this
   // Mac owns, and a harness too slow to say so is asked again.
   const strict = await retryTransient(
-    () => (adapters.strictPreflight ?? strictRuntimePreflight)(config, expectedBuild, { requireIdle: false }),
+    () => (adapters.strictPreflight ?? strictRuntimePreflight)(config, expectedBuild, { requireIdle: false, depsFingerprint }),
     {
       windowMs: Number.isFinite(config?.preflightRetryMs) ? config.preflightRetryMs : DEFAULT_PREFLIGHT_RETRY_MS,
       now: adapters.now,
@@ -1169,8 +1618,8 @@ export async function runtimePreflight(config, expectedBuild, adapters = {}) {
   return { safe: false, reason: "Runtime does not expose complete authenticated readiness; manual first adoption is required" };
 }
 
-async function runtimeIdentityPreflight(config, expectedBuild) {
-  const strict = await strictRuntimePreflight(config, expectedBuild, { requireIdle: false });
+async function runtimeIdentityPreflight(config, expectedBuild, { depsFingerprint = null } = {}) {
+  const strict = await strictRuntimePreflight(config, expectedBuild, { requireIdle: false, depsFingerprint });
   return strict || { safe: false, reason: "Expected build does not expose authenticated runtime identity" };
 }
 
@@ -1736,7 +2185,7 @@ async function fenceWithin(config, owner, { request, inspectTopology, inspectHol
   try {
     [topology, settled] = await Promise.all([
       retryTransient(async () => {
-        const result = await inspectTopology(config.ports);
+        const result = await inspectTopology(config.ports, { dataDirectory: config.dataDirectory });
         return { ...result, transient: !stop.stoppedBy && !result.safe && TOPOLOGY_UNAVAILABLE.test(result.reason || "") };
       }, { windowMs: 30_000, now, wait: pause }),
       // A bot's own tool holding the database for a moment is waited out,
@@ -1906,7 +2355,11 @@ export async function validateBuiltBundle(bundlePath, expectedCommit) {
   // Transition release: main still builds the legacy bundle ID, so a built
   // candidate may carry either accepted ID; applicationIdentitiesCanTransition()
   // decides which installed app it may replace.
-  return { ...(await signatureIdentity(bundlePath, { allowLegacyBundleId: true })), version: build.version, apiVersion: build.apiVersion, uiHash: build.uiHash };
+  const identity = { ...(await signatureIdentity(bundlePath, { allowLegacyBundleId: true })), version: build.version,
+    apiVersion: build.apiVersion, uiHash: build.uiHash };
+  if (build.build !== undefined) identity.build = build.build;
+  if (build.desktopStartupProtocol !== undefined) identity.desktopStartupProtocol = build.desktopStartupProtocol;
+  return identity;
 }
 
 // ---------------------------------------------------------------------------
@@ -2325,6 +2778,47 @@ async function exactAppPids(appPath) {
   return exactAppPidsFromPs(result.stdout, join(appPath, "Contents/MacOS/BotFleet"));
 }
 
+function pidsFromFieldLsof(stdout) {
+  const pids = [];
+  for (const line of stdout.split("\n")) {
+    if (!line.startsWith("p")) continue;
+    const pid = Number(line.slice(1));
+    if (Number.isInteger(pid) && pid > 0) pids.push(pid);
+  }
+  return pids;
+}
+
+function lsofFieldPids(args) {
+  return run("lsof", ["-Fn", ...args], { allowFailure: true }).then((result) => ({
+    ok: [0, 1].includes(result.code),
+    pids: pidsFromFieldLsof(result.stdout),
+  }));
+}
+
+/** Open-file pids under one directory, without walking into children.
+ * A flat directory uses `lsof -Fn +D`, the command the release-store probe
+ * uses.  Hosted macOS 14 answers that for an ordinary open file.  `lsof -t`
+ * on the same image returned exit 1 and an empty pid list.  A directory that
+ * contains a subdirectory, such as `Contents/Resources/server`, is not given
+ * to `+D`.  `+D` would walk that tree.  Its top-level files are named
+ * instead, including a symlink, so `cua-driver` is still visible.
+ * `Dirent.isFile()` is false for a symlink, so the filter is "not a directory". */
+async function scanOpenDirectory(directory) {
+  let names;
+  try {
+    names = await readdir(directory, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+  const files = names.filter((entry) => !entry.isDirectory());
+  if (!names.some((entry) => entry.isDirectory()) && names.length <= 64) {
+    return lsofFieldPids(["+D", directory]);
+  }
+  if (!files.length) return null;
+  return lsofFieldPids(files.slice(0, 64).map((entry) => join(directory, entry.name)));
+}
+
 /**
  * Every process holding any executable or mapped library inside the bundle, by
  * the kernel's open reference rather than by recorded arguments.  This is what
@@ -2333,8 +2827,16 @@ async function exactAppPids(appPath) {
  * embedded computer-use driver at `Contents/Resources/cua-driver` and the
  * `BotFleet Speech.app` / `BotFleet Recorder.app` helpers.  Renaming the
  * bundle while any of them runs is the thing to avoid.
+ *
+ * The text scan is what a developer Mac reports for a mapped binary.  Hosted
+ * macOS 14 often prints nothing for that mapping.  `lsof -Fn +D` on a flat
+ * directory is the form that image already answers for an open file.
  */
-async function bundleHolderPids(bundlePath) {
+export function isMacSystemBundleInspector(executable = "") {
+  return executable.trim().startsWith("/System/Library/");
+}
+
+export async function bundleHolderPids(bundlePath, { executableOf = processExecutable } = {}) {
   let root;
   try {
     root = await realpath(bundlePath);
@@ -2342,9 +2844,29 @@ async function bundleHolderPids(bundlePath) {
     if (error?.code === "ENOENT") return [];
     throw error;
   }
-  const result = await run("lsof", ["-F", "pn", "-d", "txt"], { allowFailure: true });
-  if (![0, 1].includes(result.code)) throw new Error("Could not inspect BotFleet bundle ownership with lsof");
-  return withoutExitedPids(txtHolderPids(result.stdout, root));
+  const resourcesDir = join(root, "Contents", "Resources");
+  const [textScan, macosScan, resourcesScan] = await Promise.all([
+    (async () => {
+      const result = await run("lsof", ["-F", "pn", "-d", "txt"], { allowFailure: true });
+      return { ok: [0, 1].includes(result.code), pids: txtHolderPids(result.stdout, root) };
+    })(),
+    scanOpenDirectory(join(root, "Contents", "MacOS")),
+    scanOpenDirectory(resourcesDir),
+  ]);
+  const results = [textScan, macosScan, resourcesScan].filter((result) => result);
+  const usable = results.filter((result) => result.ok);
+  if (!usable.length) throw new Error("Could not inspect BotFleet bundle ownership with lsof");
+  const pids = new Set();
+  for (const result of usable) {
+    for (const pid of result.pids) pids.add(pid);
+  }
+  const live = await withoutExitedPids([...pids]);
+  const kept = [];
+  for (const pid of live) {
+    if (isMacSystemBundleInspector(await executableOf(pid))) continue;
+    kept.push(pid);
+  }
+  return kept;
 }
 
 /**
@@ -3208,14 +3730,69 @@ export async function swapPreparedFiles({
   }
 }
 
+/** Application bundle half of swapPreparedFiles — same progress flags and restore-on-failure behaviour. */
+export async function swapApplicationBundle({
+  appPath,
+  candidateApp,
+  rollbackApp,
+  progress = {},
+}, renamePath = rename) {
+  progress.rollbackAppHolds = false;
+  let newAppMoved = false;
+  try {
+    await renamePath(appPath, rollbackApp);
+    progress.rollbackAppHolds = true;
+    await renamePath(candidateApp, appPath);
+    newAppMoved = true;
+  } catch (error) {
+    if (newAppMoved) await renamePath(appPath, candidateApp);
+    if (progress.rollbackAppHolds) {
+      await renamePath(rollbackApp, appPath);
+      progress.rollbackAppHolds = false;
+    }
+    throw error;
+  }
+}
+
+/** Dependency half of swapPreparedFiles — same progress flags and restore-on-failure behaviour. */
+export async function swapDependencyTree({
+  liveDependencies,
+  candidateDependencies,
+  rollbackDependencies,
+  progress = {},
+}, renamePath = rename) {
+  progress.rollbackDependenciesHold = false;
+  let newDependenciesMoved = false;
+  try {
+    await renamePath(liveDependencies, rollbackDependencies);
+    progress.rollbackDependenciesHold = true;
+    await renamePath(candidateDependencies, liveDependencies);
+    newDependenciesMoved = true;
+  } catch (error) {
+    if (newDependenciesMoved) await renamePath(liveDependencies, candidateDependencies);
+    if (progress.rollbackDependenciesHold) {
+      await renamePath(rollbackDependencies, liveDependencies);
+      progress.rollbackDependenciesHold = false;
+    }
+    throw error;
+  }
+}
+
 /**
  * One receipt shape for both writes.  Every key the first schema carried stays
  * in place and keeps its meaning, so an older reader still resolves the prior
  * bundle, dependency tree, and commit; the added keys describe placement and
  * whether the install has been verified yet.
  */
+/** Receipt path for this run: beside the bundle rollback or the dependency rollback. */
+export function rollbackReceiptPathForPrevious(previous) {
+  return previous.rollbackPath
+    ? `${previous.rollbackPath}.json`
+    : `${previous.rollbackDependencies}.json`;
+}
+
 function rollbackReceipt(prepared, previous, config, extra) {
-  return {
+  const receipt = {
     schemaVersion: 1,
     previousCommit: previous.checkoutCommit,
     // The checkout commit and the installed build can disagree: `ubf --force`
@@ -3225,18 +3802,21 @@ function rollbackReceipt(prepared, previous, config, extra) {
     // actually is — the build anyone recovering from it would get.
     previousInstalledCommit: previous.installedCommit ?? null,
     replacementCommit: prepared.targetCommit,
-    rollbackBundle: previous.rollbackPath,
+    rollbackBundle: previous.rollbackPath ?? config.appPath,
     rollbackDependencies: previous.rollbackDependencies,
     installedAt: previous.installedAt,
     appPath: config.appPath,
     stageDirectory: prepared.stageDirectory,
     rollbackPlacement: previous.rollbackPlacement,
     crossVolume: previous.crossVolume === true,
-    ...(previous.crossVolumeReason ? { crossVolumeReason: previous.crossVolumeReason } : {}),
     candidateBundle: previous.candidatePath,
     candidateDependencies: previous.candidateDependencies,
     ...extra,
   };
+  if (previous.crossVolumeReason) {
+    receipt.crossVolumeReason = previous.crossVolumeReason;
+  }
+  return receipt;
 }
 
 async function readRollbackReceipt(receiptPath) {
@@ -3246,7 +3826,8 @@ async function readRollbackReceipt(receiptPath) {
   } catch {
     return null;
   }
-  if (!receipt || typeof receipt.rollbackBundle !== "string") return null;
+  const rollbackBundle = receipt?.rollbackBundle;
+  if (!receipt || rollbackBundle == null || rollbackBundle !== `${rollbackBundle}`) return null;
   return { receiptPath, receipt };
 }
 
@@ -3279,6 +3860,17 @@ export async function rollbackGenerations(config, { stageDirectories = [] } = {}
   for (const name of await listDirectory(applicationsDirectory)) {
     if (!name.startsWith(".BotFleet.rollback-") || !name.endsWith(".app")) continue;
     await consider(join(applicationsDirectory, name));
+  }
+  if (config.checkout) {
+    const checkoutParent = dirname(config.checkout);
+    for (const name of await listDirectory(checkoutParent)) {
+      if (!name.startsWith(".botfleet-server.node_modules.rollback-")) continue;
+      const dependencyPath = join(checkoutParent, name);
+      const receiptPath = `${dependencyPath}.json`;
+      const [hasTree, hasReceipt] = await Promise.all([exists(dependencyPath), exists(receiptPath)]);
+      if (hasReceipt) receiptPaths.push(receiptPath);
+      else if (hasTree) orphans.push(dependencyPath);
+    }
   }
   // A stage named with `--stage` need not sit under the updates root, so the
   // caller passes the stages it knows about as well.  Each stage's rollback
@@ -3343,6 +3935,7 @@ export async function stageEntries(config, generations = []) {
 function createConfig(parsed) {
   const home = homedir();
   return {
+    home,
     checkout: resolve(process.env.BOTFLEET_CHECKOUT || join(home, "apps/botfleet-server")),
     appPath: resolve(process.env.BOTFLEET_APP_PATH || "/Applications/BotFleet.app"),
     dataDirectory: resolve(process.env.BOTFLEET_DATA_DIR || join(home, ".botfleet")),
@@ -3388,8 +3981,133 @@ function environmentMs(name, fallback) {
   return Number.isFinite(value) && value >= 0 ? value : fallback;
 }
 
-function createOperations(config) {
+async function sweepExpiredFailedInstallBundles(config, { reportKept = false } = {}) {
+  const appDir = dirname(config.appPath);
+  const bundleName = basename(config.appPath);
+  const present = await listDirectory(appDir);
+  const kept = present.filter(
+    (name) => failedInstallBundles([name], bundleName).length === 1
+      && !failedInstallBundlesToPrune(present, bundleName).includes(name),
+  );
+  if (reportKept) {
+    for (const name of kept) {
+      console.error(`A previous update left ${join(appDir, name)} behind; it is recent enough to keep as evidence of that failure.`);
+    }
+  }
+  const { removed, failures } = pruneFailedInstallBundles(config.appPath, {
+    listNames: () => present,
+    remove: (target) => rmSync(target, { recursive: true, force: true }),
+  });
+  for (const path of removed) {
+    console.log(`Removed ${basename(path)}, past the ${FAILED_INSTALL_KEEP}-bundle retention limit for failed installs.`);
+  }
+  for (const { path, error } of failures) {
+    console.error(
+      `Could not remove expired failed-install bundle ${path}: ${error?.message ?? error}; it will be cleaned up on a later sweep`,
+    );
+  }
+}
+
+async function sweepAbandonedStageDirectories(config, stageDirectories = []) {
+  const { generations } = await rollbackGenerations(config, { stageDirectories });
+  const { entries, referenced } = await stageEntries(config, generations);
+  const stages = abandonedStages(entries, {
+    referenced: [...referenced, ...stageDirectories.map((path) => resolve(path))],
+  });
+  for (const path of stages.prune) {
+    if (!prunablePath(path, [config.updatesDirectory])) continue;
+    await rm(path, { recursive: true, force: true });
+    console.log(`Removed the leftover update stage ${path}`);
+  }
+  for (const path of stages.report) {
+    console.error(`Update stage ${path} has no prepared manifest and no rollback generation, and holds files this updater did not write; it was left in place for manual review.`);
+  }
+}
+
+/** Establish the requested desktop owner before its watchdog can start a source release. */
+export function shouldStartDesktop({ updateApp, openApplication, wasRunning = true }) {
+  return updateApp && openApplication !== false && wasRunning;
+}
+
+export async function startDesktopBeforeWatchdog({ desktop, open, verify, bootstrap }) {
+  if (desktop) {
+    await open();
+    await verify();
+  }
+  await bootstrap();
+}
+
+/** A receipt is accepted only after the installed app and its local socket are independently observed. */
+export async function desktopStartupPreflight(receipt, { appPids, listeners, localRuntime }) {
+  if (!receipt || !["local", "remote"].includes(receipt.mode) ||
+      !Number.isSafeInteger(receipt.pid) || receipt.pid <= 0 ||
+      !Number.isSafeInteger(receipt.uiPort) || receipt.uiPort < 1 || receipt.uiPort > 65535 ||
+      !Array.isArray(appPids) || appPids.length !== 1 || appPids[0] !== receipt.pid) {
+    return { safe: false, reason: "Installed desktop has not confirmed its exact running process" };
+  }
+  const uiListeners = await listeners(receipt.uiPort);
+  if (receipt.mode === "remote") {
+    return uiListeners.length === 1 && uiListeners[0] === receipt.pid
+      ? { safe: true, mode: "remote-desktop", pid: receipt.pid }
+      : { safe: false, reason: "Remote desktop does not own its local UI listening socket" };
+  }
+  const snapshot = await localRuntime();
+  if (!snapshot?.safe || snapshot.mode !== "authenticated") {
+    return { safe: false, reason: snapshot?.reason || "Local desktop has no authenticated runtime owner" };
+  }
+  const uiOwner = uiListeners.length === 1 ? uiListeners[0] : null;
+  if (uiOwner !== receipt.pid && uiOwner !== snapshot.pid) {
+    return { safe: false, reason: "Desktop UI socket is not owned by the app or its authenticated local harness" };
+  }
+  return snapshot;
+}
+
+/** An in-place receipt write may be observed between bytes; every retry still validates the whole receipt. */
+export async function observeDesktopStartup({ readReceipt, ...dependencies }) {
+  let receipt;
+  try { receipt = readReceipt(); }
+  catch { return { safe: false, reason: "Desktop startup confirmation is not readable yet" }; }
+  return desktopStartupPreflight(receipt, dependencies);
+}
+
+/** Recovery still attempts every watchdog if the preferred desktop cannot start. */
+export async function restoreDesktopBeforeWatchdogs({ desktop, open, verify, bootstraps, record }) {
+  if (desktop) await record(async () => { await open(); await verify(); });
+  for (const bootstrap of bootstraps) await record(bootstrap);
+}
+
+export function createOperations(config) {
   let lastPreflight;
+  const storeDeployPreparer = config.storeDeployPreparer ?? prepareStoreReleaseDeploy;
+  // Trusted dependency custody for the release store, scoped to THIS run: a
+  // fingerprint enters only from a tree this run installed from the
+  // byte-verified lockfile (fresh stage or fresh reference), never from a
+  // release's own snapshot of itself.  Built lazily during preflight or
+  // preparation — always BEFORE the fence, never inside the interruption.
+  const storeReferenceFingerprints = new Map();
+  const referenceFingerprintFor = async (commit) => {
+    if (storeReferenceFingerprints.has(commit)) return storeReferenceFingerprints.get(commit);
+    const store = await storeHarnessState(config);
+    const dir = await installReferenceDeps(config, commit, store.env);
+    let fingerprint = null;
+    try {
+      fingerprint = captureDepsFingerprint(dir);
+    } finally {
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }).catch(() => {});
+    }
+    storeReferenceFingerprints.set(commit, fingerprint);
+    return fingerprint;
+  };
+  config.storeAdapters = {
+    ...config.storeAdapters,
+    expectedDepsFingerprintFor: config.storeAdapters?.expectedDepsFingerprintFor ?? referenceFingerprintFor,
+    registerTrustedFingerprint: (commit, fingerprint) => {
+      storeReferenceFingerprints.set(commit, fingerprint);
+    },
+  };
+  let desktopStartupRequest;
+  let desktopStartupPath;
+  const componentFlags = () => resolveUpdateComponentFlags(config.parsed.components);
   const git = (cwd, args, options) => run("git", ["-C", cwd, ...args], options);
   const gitOutput = (cwd, args, options) => output("git", ["-C", cwd, ...args], options);
 
@@ -3467,16 +4185,7 @@ function createOperations(config) {
     // nothing in one to examine.
     await sweepCandidates(dirname(config.checkout), FAILED_DEPENDENCY_PREFIX, "", [], roots);
 
-    const { entries, referenced } = await stageEntries(config, generations);
-    const stages = abandonedStages(entries, { referenced: [...referenced, ...stageDirectories.map((path) => resolve(path))] });
-    for (const path of stages.prune) {
-      if (!prunablePath(path, [config.updatesDirectory])) continue;
-      await rm(path, { recursive: true, force: true });
-      console.log(`Removed the leftover update stage ${path}`);
-    }
-    for (const path of stages.report) {
-      console.error(`Update stage ${path} has no prepared manifest and no rollback generation, and holds files this updater did not write; it was left in place for manual review.`);
-    }
+    await sweepAbandonedStageDirectories(config, stageDirectories);
 
     for (const orphan of orphans) {
       console.error(`Rollback bundle ${orphan} has no receipt; it was left in place for manual review.`);
@@ -3484,29 +4193,7 @@ function createOperations(config) {
     for (const item of unclaimedGenerations(generations)) {
       console.error(`Rollback receipt ${item.receiptPath} names no installed application; it was left in place for manual review.`);
     }
-    const appDir = dirname(config.appPath);
-    const bundleName = basename(config.appPath);
-    const present = await listDirectory(appDir);
-    const kept = present.filter(
-      (name) => failedInstallBundles([name], bundleName).length === 1 && !failedInstallBundlesToPrune(present, bundleName).includes(name),
-    );
-    for (const name of kept) {
-      console.error(`A previous update left ${join(appDir, name)} behind; it is recent enough to keep as evidence of that failure.`);
-    }
-    // Past the retention cap these are not evidence any more, just disk.  Each
-    // one is a whole second copy of the app.
-    for (const name of failedInstallBundlesToPrune(present, bundleName)) {
-      const path = join(appDir, name);
-      // Only ever something this updater itself named, sitting beside the app
-      // it manages.  A same-named bundle anywhere else is not ours to remove.
-      if (dirname(path) !== appDir) continue;
-      try {
-        await rm(path, { recursive: true, force: true });
-        console.log(`Removed ${name}, past the ${FAILED_INSTALL_KEEP}-bundle retention limit for failed installs.`);
-      } catch (error) {
-        console.error(`Could not remove the expired failed-install bundle ${path}: ${error.message}`);
-      }
-    }
+    await sweepExpiredFailedInstallBundles(config, { reportKept: true });
   };
 
   return {
@@ -3684,6 +4371,8 @@ function createOperations(config) {
         version: identity.version,
         apiVersion: identity.apiVersion,
         uiHash: identity.uiHash,
+        build: identity.build,
+        desktopStartupProtocol: identity.desktopStartupProtocol,
         teamIdentifier: identity.teamIdentifier,
         bundleIdentifier: identity.bundleIdentifier,
         designatedRequirement: identity.designatedRequirement,
@@ -3707,10 +4396,15 @@ function createOperations(config) {
 
     validatePrepared: async (prepared) => {
       const identity = await validateBuiltBundle(prepared.bundlePath, prepared.targetCommit);
+      if (shouldStartDesktop({ updateApp: componentFlags().updateApp, openApplication: config.parsed.openApplication }) &&
+          identity.desktopStartupProtocol !== 1) {
+        throw new Error("The candidate predates desktop startup confirmation; a newer verified build is required");
+      }
       if (identity.teamIdentifier !== prepared.teamIdentifier ||
           identity.bundleIdentifier !== prepared.bundleIdentifier ||
           identity.designatedRequirement !== prepared.designatedRequirement ||
-          identity.version !== prepared.version || identity.apiVersion !== prepared.apiVersion || identity.uiHash !== prepared.uiHash) {
+          identity.version !== prepared.version || identity.apiVersion !== prepared.apiVersion || identity.uiHash !== prepared.uiHash ||
+          identity.build !== prepared.build || identity.desktopStartupProtocol !== prepared.desktopStartupProtocol) {
         throw new Error("Prepared bundle identity no longer matches its immutable manifest");
       }
       if (await dependencyFingerprint(prepared.dependenciesPath) !== prepared.dependencyFingerprint) {
@@ -3743,6 +4437,8 @@ function createOperations(config) {
       await sweepCandidates(dirname(config.appPath), CANDIDATE_BUNDLE_PREFIX, ".app", [], roots);
       await sweepCandidates(dirname(config.checkout), CANDIDATE_DEPENDENCY_PREFIX, "", [], roots);
       await sweepCandidates(dirname(config.checkout), FAILED_DEPENDENCY_PREFIX, "", [], roots);
+      await sweepAbandonedStageDirectories(config);
+      await sweepExpiredFailedInstallBundles(config);
       for (const name of await listDirectory(config.updatesDirectory)) {
         const receipt = join(config.updatesDirectory, name, "pending-recovery.json");
         if (await exists(receipt)) {
@@ -3756,7 +4452,7 @@ function createOperations(config) {
     // stale owner record does not refuse every later update) and after every
     // failure.  A no-op when a harness answers.
     ensureRunning: async () => ensureBotFleetRunning({
-      answers: async () => (await Promise.all(config.ports.map((port) => probeHealthWithRetry(port))))
+      answers: async () => (await Promise.all(config.ports.map((port) => probeHealthWithRetry(port, { dataDirectory: config.dataDirectory }))))
         .some((item) => item.kind === "botfleet"),
       bundleBusy: () => bundleProcessPids(config.appPath),
       mismatch: async () => {
@@ -3793,7 +4489,20 @@ function createOperations(config) {
     fence: async () => fenceRuntimeAdmission(config),
 
     capturePrevious: async (prepared) => {
+      const { updateApp } = componentFlags();
       const checkoutCommit = await gitOutput(config.checkout, ["rev-parse", "HEAD"]);
+      // What the store-backed launcher currently serves, so rollback can
+      // point the store back at it.  Null on a checkout-backed host.
+      const storeState = await storeHarnessState(config);
+      const releaseCommit = storeState.mode === "release" ? await storeCurrentCommit(storeState.env) : null;
+      if (storeState.mode === "release" && !releaseCommit) {
+        // The pointer exists but names nothing resolvable (a dangling link, a
+        // non-commit directory, or a manifest that does not bind to it).  A
+        // capture with no prior release would let rollback restore the
+        // checkout while the FAILED release kept serving, so refuse here,
+        // before anything moves.
+        throw new Error("Release store pointer is present but unresolvable; refusing update until the store is cleared");
+      }
       const dirty = await gitOutput(config.checkout, ["status", "--porcelain"]);
       if (dirty) {
         // Name them.  An untracked directory left by an earlier failure blocks
@@ -3834,26 +4543,36 @@ function createOperations(config) {
       const appPids = bundlePids.filter((pid) => livePids.includes(pid));
       const stamp = Date.now();
       const generation = `${stamp}-${checkoutCommit.slice(0, 12)}`;
-      const rollback = await resolveRollbackPlacement({
-        livePath: config.appPath,
-        stageDirectory: prepared.stageDirectory,
-        stageName: basename(config.appPath),
-        generation,
-        adjacentPath: join(dirname(config.appPath), `.BotFleet.rollback-${generation}.app`),
-      });
-      const rollbackDependencies = join(dirname(config.checkout), `.botfleet-server.node_modules.rollback-${generation}`);
-      // Refuse here, before the interruption boundary, rather than at the
-      // install step: after the boundary this refusal would run rollback(),
-      // and rollback() restores whatever sits at the rollback path — which in
-      // that case is an older generation, not this run's prior bundle.
-      if (await exists(rollback.path)) {
-        throw new Error(`Rollback path already exists before install: ${rollback.path}`);
+      let rollback = {
+        path: null,
+        directory: null,
+        placement: null,
+        crossVolume: false,
+        crossVolumeReason: undefined,
+      };
+      if (updateApp) {
+        rollback = await resolveRollbackPlacement({
+          livePath: config.appPath,
+          stageDirectory: prepared.stageDirectory,
+          stageName: basename(config.appPath),
+          generation,
+          adjacentPath: join(dirname(config.appPath), `.BotFleet.rollback-${generation}.app`),
+        });
+        // Refuse here, before the interruption boundary, rather than at the
+        // install step: after the boundary this refusal would run rollback(),
+        // and rollback() restores whatever sits at the rollback path — which in
+        // that case is an older generation, not this run's prior bundle.
+        if (await exists(rollback.path)) {
+          throw new Error(`Rollback path already exists before install: ${rollback.path}`);
+        }
       }
+      const rollbackDependencies = join(dirname(config.checkout), `.botfleet-server.node_modules.rollback-${generation}`);
       if (await exists(rollbackDependencies)) {
         throw new Error(`Dependency rollback path already exists before install: ${rollbackDependencies}`);
       }
       return {
         checkoutCommit,
+        releaseCommit,
         installedIdentity,
         installedCommit,
         installedDependencyFingerprint,
@@ -3877,17 +4596,34 @@ function createOperations(config) {
     },
 
     materializeCandidate: async (prepared, previous) => {
-      await rm(previous.candidatePath, { recursive: true, force: true });
-      await run("ditto", [prepared.bundlePath, previous.candidatePath]);
-      const identity = await validateBuiltBundle(previous.candidatePath, prepared.targetCommit);
-      if (identity.designatedRequirement !== prepared.designatedRequirement ||
-          !applicationIdentitiesCanTransition(previous.installedIdentity, identity)) {
-        throw new Error("Candidate and installed app do not share an accepted signing identity");
+      const { updateApp, updateServer } = componentFlags();
+      if (updateApp) {
+        await rm(previous.candidatePath, { recursive: true, force: true });
+        await run("ditto", [prepared.bundlePath, previous.candidatePath]);
+        const identity = await validateBuiltBundle(previous.candidatePath, prepared.targetCommit);
+        if (identity.designatedRequirement !== prepared.designatedRequirement ||
+            !applicationIdentitiesCanTransition(previous.installedIdentity, identity)) {
+          throw new Error("Candidate and installed app do not share an accepted signing identity");
+        }
       }
-      await rm(previous.candidateDependencies, { recursive: true, force: true });
-      await run("/bin/cp", ["-cR", prepared.dependenciesPath, previous.candidateDependencies]);
-      if (await dependencyFingerprint(previous.candidateDependencies) !== prepared.dependencyFingerprint) {
-        throw new Error("Materialized dependency candidate does not match the prepared tree");
+      if (updateServer) {
+        await rm(previous.candidateDependencies, { recursive: true, force: true });
+        await run("/bin/cp", ["-cR", prepared.dependenciesPath, previous.candidateDependencies]);
+        if (await dependencyFingerprint(previous.candidateDependencies) !== prepared.dependencyFingerprint) {
+          throw new Error("Materialized dependency candidate does not match the prepared tree");
+        }
+      }
+      // The release-store deploy is PREPARED here, before the fence: staging,
+      // source verification, the dependency install, and any trusted
+      // reference build are minutes of work and network failure modes that
+      // must never sit inside the interruption window.  The boundary itself
+      // (advanceCheckout) only swaps the pointer.
+      await storeDeployPreparer(config, prepared, previous);
+      // A rollback would restore the release serving NOW: keep its trusted
+      // dependency custody ready too, so a mid-transaction rollback never
+      // needs an install inside its own fence.
+      if (previous.releaseCommit && previous.releaseCommit !== prepared.targetCommit) {
+        await (config.storeAdapters?.expectedDepsFingerprintFor ?? referenceFingerprintFor)(previous.releaseCommit);
       }
     },
 
@@ -3897,8 +4633,11 @@ function createOperations(config) {
     },
 
     quiesce: async (previous) => {
+      const { updateApp } = componentFlags();
       await bootOutHarnessForQuiesce(config, previous);
-      await run("osascript", ["-e", 'if application "BotFleet" is running then tell application "BotFleet" to quit'], { allowFailure: true });
+      if (updateApp) {
+        await run("osascript", ["-e", 'if application "BotFleet" is running then tell application "BotFleet" to quit'], { allowFailure: true });
+      }
       // Re-resolve what holds BotFleet state now rather than trusting the
       // capture.  The embedded driver and the helper apps start on demand, so
       // one can appear between the capture and the shutdown; and the harness
@@ -3910,14 +4649,17 @@ function createOperations(config) {
       // non-BotFleet process holding BotFleet state is waited out and never
       // signalled, and a refusal names it.
       await waitOutUnrecognizedHolders(async () => {
-        const [currentHolders, currentBundlePids, health] = await Promise.all([
+        const [currentHolders, health] = await Promise.all([
           sqliteHolders(config.dataDirectory),
-          bundleProcessPids(config.appPath),
-          Promise.all(config.ports.map(probeHealth)),
+          Promise.all(config.ports.map((port) => probeHealth(port, { dataDirectory: config.dataDirectory }))),
         ]);
+        const currentBundlePids = updateApp ? await bundleProcessPids(config.appPath) : [];
         const current = ownedRuntimePids({ holders: currentHolders, bundlePids: currentBundlePids, health });
+        const shutdownPids = updateApp
+          ? [...previous.runtimePids, ...previous.appPids, ...current]
+          : [...previous.runtimePids, ...current];
         await terminateVerified(
-          [...previous.runtimePids, ...previous.appPids, ...current],
+          shutdownPids,
           previous,
           config,
           { current },
@@ -3926,6 +4668,7 @@ function createOperations(config) {
     },
 
     assertQuiesced: async (previous) => {
+      const { updateApp } = componentFlags();
       // Waited for, not checked once: on a loaded Mac the app's own verified
       // processes can take minutes to quit (2026-10-09, "BotFleet process
       // 11736 still runs from inside /Applications/BotFleet.app after
@@ -3936,17 +4679,19 @@ function createOperations(config) {
         if (holders.length) {
           return { reason: `BotFleet database still has ${holders.length} live holders after graceful shutdown`, pids: holders };
         }
-        // A process can hold no database handle and answer no port while still
-        // running out of the installed bundle.  Renaming that bundle under it is
-        // exactly what leaves the owner looking at a rollback name, so the swap
-        // waits for the bundle to be empty of processes, not only for its state
-        // — and that means the whole bundle: the main binary, the embedded
-        // computer-use driver, and the speech and recorder helper apps.
-        const appPids = await bundleProcessPids(config.appPath);
-        if (appPids.length) {
-          return { reason: `BotFleet process ${appPids.join(", ")} still runs from inside ${config.appPath} after graceful shutdown`, pids: appPids };
+        if (updateApp) {
+          // A process can hold no database handle and answer no port while still
+          // running out of the installed bundle.  Renaming that bundle under it is
+          // exactly what leaves the owner looking at a rollback name, so the swap
+          // waits for the bundle to be empty of processes, not only for its state
+          // — and that means the whole bundle: the main binary, the embedded
+          // computer-use driver, and the speech and recorder helper apps.
+          const appPids = await bundleProcessPids(config.appPath);
+          if (appPids.length) {
+            return { reason: `BotFleet process ${appPids.join(", ")} still runs from inside ${config.appPath} after graceful shutdown`, pids: appPids };
+          }
         }
-        const health = await Promise.all(config.ports.map((port) => probeHealthWithRetry(port)));
+        const health = await Promise.all(config.ports.map((port) => probeHealthWithRetry(port, { dataDirectory: config.dataDirectory })));
         const portError = quiescedPortError(health);
         return portError ? { reason: portError, pids: [] } : null;
       }, {
@@ -3956,52 +4701,82 @@ function createOperations(config) {
       });
     },
 
-    advanceCheckout: async (targetCommit) => {
+    advanceCheckout: async (prepared, previous) => {
+      const targetCommit = prepared.targetCommit;
       await git(config.checkout, ["checkout", "--detach", targetCommit]);
       const head = await gitOutput(config.checkout, ["rev-parse", "HEAD"]);
       if (head !== targetCommit) throw new Error("Live checkout did not advance to the prepared commit");
+      // The checkout is the updater's source of truth either way.  What RUNS
+      // is a second question: a store-backed launcher serves the release the
+      // pointer names, so the deploy is not done until the store holds this
+      // commit and the pointer says so.  A checkout-backed host is untouched.
+      await deployStoreReleaseIfBacked(config, prepared, previous);
     },
 
     installCandidate: async (prepared, previous) => {
-      // The renamed executable cannot decrypt the Keychain item Electron
-      // safeStorage created under com.botfleet.app.  The still-authorized
-      // predecessor writes credentials.migration.json before the swap.
-      if (shouldExportSafeStorageBeforeRename(
-        previous.installedIdentity.bundleIdentifier,
-        prepared.bundleIdentifier,
-      )) {
-        const executable = join(config.appPath, "Contents/MacOS/BotFleet");
-        await run(executable, [SAFE_STORAGE_EXPORT_FLAG]);
+      const { updateApp, updateServer, mode } = componentFlags();
+      const liveDependencies = join(config.checkout, "node_modules");
+      if (await exists(previous.rollbackDependencies)) {
+        throw new Error(`Dependency rollback path already exists: ${previous.rollbackDependencies}`);
       }
-      // capturePrevious already refused a pre-existing rollback path before the
-      // boundary; this repeats the check because the window between them is
-      // where a concurrent run would have to have raced the updater lock.
-      if (await exists(previous.rollbackPath)) throw new Error(`Rollback path already exists: ${previous.rollbackPath}`);
-      if (await exists(previous.rollbackDependencies)) throw new Error(`Dependency rollback path already exists: ${previous.rollbackDependencies}`);
-      await mkdir(previous.rollbackDirectory, { recursive: true, mode: 0o700 });
+      previous.installedAt = new Date().toISOString();
+      const receiptPath = rollbackReceiptPathForPrevious(previous);
+      if (updateApp) {
+        // The renamed executable cannot decrypt the Keychain item Electron
+        // safeStorage created under com.botfleet.app.  The still-authorized
+        // predecessor writes credentials.migration.json before the swap.
+        if (shouldExportSafeStorageBeforeRename(
+          previous.installedIdentity.bundleIdentifier,
+          prepared.bundleIdentifier,
+        )) {
+          const executable = join(config.appPath, "Contents/MacOS/BotFleet");
+          await run(executable, [SAFE_STORAGE_EXPORT_FLAG]);
+        }
+        // capturePrevious already refused a pre-existing rollback path before the
+        // boundary; this repeats the check because the window between them is
+        // where a concurrent run would have to have raced the updater lock.
+        if (await exists(previous.rollbackPath)) throw new Error(`Rollback path already exists: ${previous.rollbackPath}`);
+        await mkdir(previous.rollbackDirectory, { recursive: true, mode: 0o700 });
+      }
       // Written before the first rename, so a run killed mid-swap leaves a
       // record naming which application the displaced bundle came from and
       // what commit it is, not just a directory somebody has to identify.
-      previous.installedAt = new Date().toISOString();
-      const receiptPath = `${previous.rollbackPath}.json`;
-      await atomicJson(receiptPath, rollbackReceipt(prepared, previous, config, { status: "installing" }));
-      const liveDependencies = join(config.checkout, "node_modules");
-      await swapPreparedFiles({
-        appPath: config.appPath,
-        candidateApp: previous.candidatePath,
-        rollbackApp: previous.rollbackPath,
-        liveDependencies,
-        candidateDependencies: previous.candidateDependencies,
-        rollbackDependencies: previous.rollbackDependencies,
-        progress: previous.swap,
-      });
-      await atomicJson(receiptPath, rollbackReceipt(prepared, previous, config, { status: "installing" }));
-      await run("touch", [config.appPath]);
-      const register = "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister";
-      await run(register, ["-f", config.appPath], { allowFailure: true });
+      await atomicJson(receiptPath, rollbackReceipt(prepared, previous, config, { status: "installing", components: mode }));
+      if (updateApp && updateServer) {
+        await swapPreparedFiles({
+          appPath: config.appPath,
+          candidateApp: previous.candidatePath,
+          rollbackApp: previous.rollbackPath,
+          liveDependencies,
+          candidateDependencies: previous.candidateDependencies,
+          rollbackDependencies: previous.rollbackDependencies,
+          progress: previous.swap,
+        });
+      } else if (updateServer) {
+        await swapDependencyTree({
+          liveDependencies,
+          candidateDependencies: previous.candidateDependencies,
+          rollbackDependencies: previous.rollbackDependencies,
+          progress: previous.swap,
+        });
+      } else {
+        await swapApplicationBundle({
+          appPath: config.appPath,
+          candidateApp: previous.candidatePath,
+          rollbackApp: previous.rollbackPath,
+          progress: previous.swap,
+        });
+      }
+      await atomicJson(receiptPath, rollbackReceipt(prepared, previous, config, { status: "installing", components: mode }));
+      if (updateApp) {
+        await run("touch", [config.appPath]);
+        const register = "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister";
+        await run(register, ["-f", config.appPath], { allowFailure: true });
+      }
     },
 
     prepareCredentials: async (prepared) => {
+      if (!componentFlags().updateApp) return;
       const receiptPath = credentialPreparationReceiptPath(prepared);
       await rm(receiptPath, { force: true });
       const executable = join(config.appPath, "Contents/MacOS/BotFleet");
@@ -4024,14 +4799,38 @@ function createOperations(config) {
       // Recorded before the bootstrap: a bootstrap that errors can still have
       // loaded the job, and rollback must boot out the label that is running.
       if (previous) previous.startedHarnessLabel = await startedHarnessLabel(config, plist);
-      await run("launchctl", ["bootstrap", config.domain, plist]);
+      await startDesktopBeforeWatchdog({
+        desktop: shouldStartDesktop({ updateApp: componentFlags().updateApp, openApplication: config.parsed.openApplication }),
+        open: async () => {
+          desktopStartupPath = join(prepared.stageDirectory, "desktop-startup.json");
+          await rm(desktopStartupPath, { force: true });
+          const startupIdentity = {
+            sourceCommit: prepared.targetCommit, version: prepared.version, apiVersion: prepared.apiVersion, uiHash: prepared.uiHash,
+          };
+          if (prepared.build !== undefined) startupIdentity.build = prepared.build;
+          desktopStartupRequest = createDesktopStartupRequest(desktopStartupPath, startupIdentity);
+          await run("open", ["-a", config.appPath, "--args", `--update-startup-receipt=${desktopStartupPath}`]);
+        },
+        verify: () => waitForStartup({
+          attempt: async () => observeDesktopStartup({
+              readReceipt: () => readDesktopStartupReceipt(desktopStartupPath, desktopStartupRequest),
+              appPids: await exactAppPids(config.appPath), listeners: localListenerPids,
+              localRuntime: () => runtimeIdentityPreflight(config, prepared, { depsFingerprint: previous?.releaseDepsFingerprint ?? null }),
+            }),
+          timeoutMs: config.startupTimeoutMs,
+          what: "the packaged version",
+          fallback: "Installed application did not prove its expected build and ownership",
+          report: config.reportDetail,
+        }),
+        bootstrap: () => run("launchctl", ["bootstrap", config.domain, plist]),
+      });
     },
 
     verifyHarness: async (prepared, previous) => {
       // A slow boot is waited out, with progress; only a harness that has really
       // died (its launchd job exited) ends the wait early.
       await waitForStartup({
-        attempt: () => runtimeIdentityPreflight(config, prepared),
+        attempt: () => runtimeIdentityPreflight(config, prepared, { depsFingerprint: previous?.releaseDepsFingerprint ?? null }),
         crashed: () => launchdExitReason(
           [previous?.startedHarnessLabel ?? config.label],
           { print: (label) => run("launchctl", ["print", `${config.domain}/${label}`], { allowFailure: true }) },
@@ -4041,9 +4840,15 @@ function createOperations(config) {
         fallback: "Updated harness did not prove its expected build and ownership before timeout",
         report: config.reportDetail,
       });
+      // The runtime's own answer is not the whole proof on a store-backed
+      // host: also verify, from outside the process, that the owner runs from
+      // the activated release and that the release's bytes ARE the prepared
+      // commit's tree.  A runtime can only claim; this checks.
+      await assertStoreReleaseRunning(config, prepared, previous);
     },
 
     startApplication: async (_prepared, previous, options) => {
+      if (!componentFlags().updateApp) return;
       // open(1) activates an already-running instance of the bundle identifier
       // instead of launching a second one, so a survivor from the renamed
       // bundle would simply come forward under the rollback name.  Refuse
@@ -4055,21 +4860,33 @@ function createOperations(config) {
     },
 
     verifySingleOwner: async (prepared, previous) => {
+      const { updateApp } = componentFlags();
+      if (!updateApp) {
+        const snapshot = await runtimeIdentityPreflight(config, prepared, { depsFingerprint: previous?.releaseDepsFingerprint ?? null });
+        if (!snapshot.safe || snapshot.mode !== "authenticated") {
+          throw new Error(snapshot.reason || "Updated harness did not prove authenticated single ownership");
+        }
+        return;
+      }
       if (config.parsed.openApplication !== false) {
         await waitForStableApplication({
           samplePids: () => exactAppPids(config.appPath),
           attachmentError: async () => {
-            const snapshot = await runtimeIdentityPreflight(config, prepared);
+            const snapshot = await runtimeIdentityPreflight(config, prepared, { depsFingerprint: previous?.releaseDepsFingerprint ?? null });
             if (!snapshot.safe || snapshot.mode !== "authenticated") {
               return snapshot.reason || "Updated application did not attach to the authenticated single data owner";
             }
-            return applicationAttachmentError(snapshot, true);
+            const desktop = await observeDesktopStartup({
+                readReceipt: () => readDesktopStartupReceipt(desktopStartupPath, desktopStartupRequest),
+                appPids: await exactAppPids(config.appPath), listeners: localListenerPids, localRuntime: async () => snapshot,
+              });
+            return desktop?.safe ? null : desktop?.reason || "Desktop startup is incomplete";
           },
           timeoutMs: config.startupTimeoutMs,
           report: config.reportDetail,
         });
       } else {
-        const snapshot = await runtimeIdentityPreflight(config, prepared);
+        const snapshot = await runtimeIdentityPreflight(config, prepared, { depsFingerprint: previous?.releaseDepsFingerprint ?? null });
         if (!snapshot.safe || snapshot.mode !== "authenticated") {
           throw new Error(snapshot.reason || "Updated application did not attach to the authenticated single data owner");
         }
@@ -4080,13 +4897,15 @@ function createOperations(config) {
     },
 
     finish: async (prepared, previous) => {
-      const receiptPath = `${previous.rollbackPath}.json`;
+      const { updateApp, mode } = componentFlags();
+      const receiptPath = rollbackReceiptPathForPrevious(previous);
       await atomicJson(receiptPath, rollbackReceipt(prepared, previous, config, {
         status: "verified",
         verifiedAt: new Date().toISOString(),
+        components: mode,
       }));
-      console.log(`Updated BotFleet to ${prepared.targetCommit.slice(0, 12)}.`);
-      console.log(`Recoverable prior bundle: ${previous.rollbackPath}`);
+      console.log(`Updated BotFleet to ${prepared.targetCommit.slice(0, 12)} (${mode} components).`);
+      if (updateApp) console.log(`Recoverable prior bundle: ${previous.rollbackPath}`);
       console.log(`Recoverable prior dependency tree: ${previous.rollbackDependencies}`);
       console.log(`Recoverable prior checkout commit: ${previous.checkoutCommit}`);
       if (previous.rollbackPlacement === "adjacent") {
@@ -4103,10 +4922,11 @@ function createOperations(config) {
     },
 
     rollback: async (prepared, previous, originalError) => {
+      const { updateApp } = componentFlags();
       const [holders, appPids, health] = await Promise.all([
         sqliteHolders(config.dataDirectory),
-        bundleProcessPids(config.appPath),
-        Promise.all(config.ports.map(probeHealth)),
+        updateApp ? bundleProcessPids(config.appPath) : Promise.resolve([]),
+        Promise.all(config.ports.map((port) => probeHealth(port, { dataDirectory: config.dataDirectory }))),
       ]);
       const runtimePids = health.filter((item) => item.kind === "botfleet").map((item) => item.pid);
       const runningPids = [...new Set([...holders, ...appPids, ...runtimePids])];
@@ -4171,11 +4991,19 @@ function createOperations(config) {
           }
         });
       }
-      await recordStop(async () => { await run("osascript", ["-e", 'if application "BotFleet" is running then tell application "BotFleet" to quit'], { allowFailure: true }); });
+      if (updateApp) {
+        await recordStop(async () => {
+          await run("osascript", ["-e", 'if application "BotFleet" is running then tell application "BotFleet" to quit'], { allowFailure: true });
+        });
+      }
       await recordStop(async () => {
         const holders = await sqliteHolders(config.dataDirectory);
-        const appPids = await bundleProcessPids(config.appPath);
-        await terminateVerified([...holders, ...appPids], { ...previous, runtimePids: [...new Set([...previous.runtimePids, ...holders])] }, config);
+        const bundlePids = updateApp ? await bundleProcessPids(config.appPath) : [];
+        await terminateVerified(
+          [...holders, ...bundlePids],
+          { ...previous, runtimePids: [...new Set([...previous.runtimePids, ...holders])] },
+          config,
+        );
       });
       await recordStop(async () => {
         let strangerSaid = false;
@@ -4184,8 +5012,8 @@ function createOperations(config) {
         await waitForBotFleetExit(async () => {
           const [holders, bundlePids, health, owner] = await Promise.all([
             sqliteHolders(config.dataDirectory),
-            bundleProcessPids(config.appPath),
-            Promise.all(config.ports.map((port) => probeHealthWithRetry(port))),
+            updateApp ? bundleProcessPids(config.appPath) : Promise.resolve([]),
+            Promise.all(config.ports.map((port) => probeHealthWithRetry(port, { dataDirectory: config.dataDirectory }))),
             readOwner(config.dataDirectory).catch(() => null),
           ]);
           const stranger = health.filter((item) => item.kind === "foreign" || item.kind === "http");
@@ -4231,12 +5059,34 @@ function createOperations(config) {
       });
       await record(async () => {
         if (previous.swap?.rollbackAppHolds && await exists(previous.rollbackPath)) {
-          if (await exists(config.appPath)) await rename(config.appPath, `${config.appPath}.failed-${Date.now()}`);
+          let failedReplacementPath = null;
+          if (await exists(config.appPath)) {
+            failedReplacementPath = `${config.appPath}.failed-${Date.now()}`;
+            await rename(config.appPath, failedReplacementPath);
+          }
           await rename(previous.rollbackPath, config.appPath);
           previous.swap.rollbackAppHolds = false;
+          if (failedReplacementPath && await exists(failedReplacementPath)) {
+            try {
+              await rm(failedReplacementPath, { recursive: true, force: true });
+              console.log(`Removed the failed replacement bundle ${failedReplacementPath}`);
+            } catch (cleanupError) {
+              console.error(
+                `Could not remove the failed replacement bundle ${failedReplacementPath}: ${cleanupError.message}; it will be cleaned up by the next sweep`,
+              );
+            }
+          }
         }
       });
       await record(async () => { await git(config.checkout, ["checkout", "--detach", previous.checkoutCommit]); });
+      await record(async () => {
+        if (previous.releaseCommit) {
+          // The launcher serves the release the pointer names: restoring the
+          // checkout without restoring the pointer would leave the FAILED
+          // release serving under a restored checkout.
+          await swapCurrent({ commit: previous.releaseCommit, env: storeEnvFor(config) });
+        }
+      });
       await record(async () => { await rm(previous.candidatePath, { recursive: true, force: true }); });
       await record(async () => { await rm(previous.candidateDependencies, { recursive: true, force: true }); });
       // The receipt describes two copies, the bundle and the dependency tree,
@@ -4249,11 +5099,15 @@ function createOperations(config) {
       // its place, which the provisional receipt cannot know when it is written.
       await record(async () => {
         if (previous.swap?.rollbackAppHolds || previous.swap?.rollbackDependenciesHold) return;
-        await rm(`${previous.rollbackPath}.json`, { force: true });
+        await rm(rollbackReceiptPathForPrevious(previous), { force: true });
       });
       await record(async () => {
         const head = await gitOutput(config.checkout, ["rev-parse", "HEAD"]);
         if (head !== previous.checkoutCommit) throw new Error("Rollback did not restore the prior checkout commit");
+        if (previous.releaseCommit) {
+          const current = await storeCurrentCommit(storeEnvFor(config));
+          if (current !== previous.releaseCommit) throw new Error("Rollback did not restore the prior release pointer");
+        }
         const identity = await signatureIdentity(config.appPath, {
           allowLegacyBundleId: previous.installedIdentity.bundleIdentifier === LEGACY_BUNDLE_ID,
         });
@@ -4273,10 +5127,19 @@ function createOperations(config) {
         legacyPlistExists: await exists(config.legacyPlist),
         plistLabel: config.customPlist && rollbackPlistExists ? await launchAgentPlistLabel(config.plist) : null,
       });
-      for (const plist of rollbackHarnessPlists) {
-        await record(async () => { await run("launchctl", ["bootstrap", config.domain, plist]); });
-      }
-      if (previous.appWasRunning) await record(async () => { await run("open", [config.appPath]); });
+      await restoreDesktopBeforeWatchdogs({
+        desktop: shouldStartDesktop({ updateApp, openApplication: config.parsed.openApplication, wasRunning: previous.appWasRunning }),
+        open: () => run("open", [config.appPath]),
+        verify: () => waitForStartup({
+          attempt: () => runtimePreflight(config),
+          timeoutMs: config.startupTimeoutMs,
+          what: "the restored application",
+          fallback: "Restored application did not regain authenticated ownership",
+          report: config.reportDetail,
+        }),
+        bootstraps: rollbackHarnessPlists.map((plist) => () => run("launchctl", ["bootstrap", config.domain, plist])),
+        record,
+      });
       if (previous.launchdLoaded || previous.legacyLaunchdLoaded || previous.appWasRunning) await record(async () => {
         // The restored build boots as slowly as the one it replaced did: on
         // 2026-10-09 it took about two minutes at a load average near 900.  The

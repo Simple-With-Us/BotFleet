@@ -12,7 +12,7 @@ const dirs: string[] = [];
 
 const POLICY = {
   mode: "allowlist",
-  commands: [{ argv0: "/Users/jay/.local/bin/agent-sync", sub: ["whoami"], flags: { "--json": { value: "none" } } }],
+  commands: [{ argv0: "/Users/jay/.local/bin/simple-chat", sub: ["whoami"], flags: { "--json": { value: "none" } } }],
   writePaths: ["/Users/jay/apps/state/plumber/line.md"],
 };
 
@@ -68,7 +68,7 @@ describe("routine toolPolicy", () => {
   it("refuses an invalid allowlist and one on a cloud run", () => {
     const h = harness();
     expect(() =>
-      h.manager.create({ name: "Bad", prompt: "Check", botId: "bot", schedule: daily, toolPolicy: { mode: "allowlist", commands: [{ argv0: "agent-sync" }] } }),
+      h.manager.create({ name: "Bad", prompt: "Check", botId: "bot", schedule: daily, toolPolicy: { mode: "allowlist", commands: [{ argv0: "simple-chat" }] } }),
     ).toThrow(/Command allowlist/);
     expect(() =>
       h.manager.create({ name: "Cloud", prompt: "Check", botId: "bot", runOn: "cloud", schedule: daily, toolPolicy: POLICY }),
