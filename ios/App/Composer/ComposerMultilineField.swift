@@ -71,6 +71,14 @@ struct ComposerMultilineField: UIViewRepresentable {
             // reload so the Hide bar appears or disappears immediately.
             uiView.reloadInputViews()
         }
+        // Scroll only once the draft passes the 8-line cap, so longer content
+        // stays reachable instead of clipping under the fixed height.
+        let insets = uiView.textContainerInset.top + uiView.textContainerInset.bottom
+        let lineHeight = uiView.font?.lineHeight ?? UIFont.preferredFont(forTextStyle: .body).lineHeight
+        let maxLines = max(uiView.textContainer.maximumNumberOfLines, 1)
+        let maxHeight = ceil(lineHeight * CGFloat(maxLines) + insets)
+        let contentHeight = uiView.sizeThatFits(CGSize(width: uiView.bounds.width, height: .greatestFiniteMagnitude)).height
+        uiView.isScrollEnabled = uiView.bounds.width > 0 && contentHeight > maxHeight
         uiView.invalidateIntrinsicContentSize()
     }
 }
@@ -80,7 +88,6 @@ struct ComposerMultilineField: UIViewRepresentable {
 /// inside a one-line strip.
 private final class ComposerTextView: UITextView {
     override var intrinsicContentSize: CGSize {
-        guard !isScrollEnabled else { return super.intrinsicContentSize }
         let width = bounds.width > 0 ? bounds.width : frame.width
         guard width > 0, let font else {
             return CGSize(width: UIView.noIntrinsicMetric, height: 44)
