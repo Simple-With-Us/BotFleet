@@ -1402,6 +1402,12 @@ describe("shellWord", () => {
     );
   });
 
+  it("leaves a backslash or tilde bare, as Windows paths have always printed", () => {
+    expect(shellWord("C:\\Users\\jay", "linux")).toBe("C:\\Users\\jay");
+    expect(shellWord("~~workspace", "linux")).toBe("~~workspace");
+    expect(shellWord("C:\\Users\\my dir", "win32")).toBe(`"C:\\Users\\my dir"`);
+  });
+
   it("single-quotes POSIX words with spaces and escapes single quotes", () => {
     expect(shellWord('/srv/my dir', 'linux')).toBe(`'/srv/my dir'`);
     expect(shellWord("/srv/o'brien", 'linux')).toBe(`'/srv/o'\\''brien'`);
