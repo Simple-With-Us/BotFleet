@@ -101,6 +101,23 @@ final class ComposerPendingThumbnailCacheTests: XCTestCase {
         _ = await ComposerPendingThumbnailCache.thumbnail(for: attachment, screenScale: 2)
         XCTAssertEqual(ComposerPendingThumbnailCache.tombstoneCountForTests(), 0)
     }
+
+    func testOverlappingDecodesKeepGuardsUntilTheLastOneEnds() {
+        let id = UUID()
+        ComposerPendingThumbnailCache.beginDecodeForTests(id: id)
+        ComposerPendingThumbnailCache.beginDecodeForTests(id: id)
+        ComposerPendingThumbnailCache.remove(id: id)
+        ComposerPendingThumbnailCache.endDecodeForTests(id: id)
+
+        XCTAssertEqual(ComposerPendingThumbnailCache.inFlightDecodeCountForTests(id), 1)
+        ComposerPendingThumbnailCache.pruneTombstones(keeping: [])
+        XCTAssertGreaterThan(ComposerPendingThumbnailCache.tombstoneCountForTests(), 0)
+
+        ComposerPendingThumbnailCache.endDecodeForTests(id: id)
+        XCTAssertEqual(ComposerPendingThumbnailCache.inFlightDecodeCountForTests(id), 0)
+        ComposerPendingThumbnailCache.pruneTombstones(keeping: [])
+        XCTAssertEqual(ComposerPendingThumbnailCache.tombstoneCountForTests(), 0)
+    }
 }
 
 final class ComposerThumbnailCachePolicyTests: XCTestCase {

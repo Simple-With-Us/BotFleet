@@ -63,13 +63,6 @@ public enum ComposerPendingThumbnailCache {
         let maxPixel = max(Int((pointSize * max(screenScale, 1)).rounded(.up)), 1)
         let decoded = await downsampleOffMain(data: data, maxPixelSize: maxPixel)
         guard let decoded else { return nil }
-        guard ComposerThumbnailCachePolicy.shouldStoreThumbnailInCache(
-            attachmentId: attachmentId,
-            isCancelled: Task.isCancelled,
-            droppedFromStrip: false
-        ) else {
-            return nil
-        }
 
         let cost = decoded.cgImage.bytesPerRow * decoded.cgImage.height
         return gate.store(decoded, for: attachmentId, cost: cost, isCancelled: Task.isCancelled)
@@ -154,7 +147,7 @@ public enum ComposerPendingThumbnailCache {
     private final class CacheGate: @unchecked Sendable {
         private let lock = NSLock()
         private var removedIds = Set<UUID>()
-        private var inFlightDecodes = Set<UUID>()
+        private var decodeCounts: [UUID: Int] = [:]
 
         func remove(id: UUID) {
             lock.lock()
@@ -173,21 +166,26 @@ public enum ComposerPendingThumbnailCache {
         func pruneTombstones(keeping pending: Set<UUID>) {
             lock.lock()
             removedIds.subtract(pending)
-            removedIds = removedIds.filter { inFlightDecodes.contains($0) }
+            removedIds = removedIds.filter { inFlightDecodeCountLocked($0) > 0 }
             capTombstonesLocked()
             lock.unlock()
         }
 
         func beginDecode(id: UUID) {
             lock.lock()
-            inFlightDecodes.insert(id)
+            decodeCounts[id, default: 0] += 1
             lock.unlock()
         }
 
         func endDecode(id: UUID) {
             lock.lock()
-            inFlightDecodes.remove(id)
-            removedIds.remove(id)
+            let remaining = max((decodeCounts[id] ?? 1) - 1, 0)
+            if remaining == 0 {
+                decodeCounts.removeValue(forKey: id)
+                removedIds.remove(id)
+            } else {
+                decodeCounts[id] = remaining
+            }
             lock.unlock()
         }
 
@@ -199,14 +197,24 @@ public enum ComposerPendingThumbnailCache {
         ) -> Bool {
             lock.lock()
             defer { lock.unlock() }
-            guard !isCancelled, !removedIds.contains(id) else { return false }
+            guard ComposerThumbnailCachePolicy.shouldStoreThumbnailInCache(
+                attachmentId: id,
+                isCancelled: isCancelled,
+                droppedFromStrip: removedIds.contains(id)
+            ) else {
+                return false
+            }
             images.setObject(thumb, forKey: id.uuidString as NSString, cost: cost)
             return true
         }
 
+        private func inFlightDecodeCountLocked(_ id: UUID) -> Int {
+            decodeCounts[id] ?? 0
+        }
+
         private func capTombstonesLocked() {
             guard removedIds.count > ComposerPendingThumbnailCache.tombstoneLimit else { return }
-            let droppable = removedIds.subtracting(inFlightDecodes)
+            let droppable = removedIds.filter { inFlightDecodeCountLocked($0) == 0 }
             let overflow = removedIds.count - ComposerPendingThumbnailCache.tombstoneLimit
             guard overflow > 0 else { return }
             let dropCount = min(droppable.count, overflow)
@@ -225,8 +233,22 @@ public enum ComposerPendingThumbnailCache {
         func clearAllForTests() {
             lock.lock()
             removedIds.removeAll()
-            inFlightDecodes.removeAll()
+            decodeCounts.removeAll()
             lock.unlock()
+        }
+
+        func beginDecodeForTests(id: UUID) {
+            beginDecode(id: id)
+        }
+
+        func endDecodeForTests(id: UUID) {
+            endDecode(id: id)
+        }
+
+        func inFlightDecodeCountForTests(id: UUID) -> Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return decodeCounts[id] ?? 0
         }
         #endif
     }
@@ -246,6 +268,18 @@ extension ComposerPendingThumbnailCache {
 
     static func tombstoneCountForTests() -> Int {
         gate.tombstoneCountForTests()
+    }
+
+    static func beginDecodeForTests(id: UUID) {
+        gate.beginDecodeForTests(id: id)
+    }
+
+    static func endDecodeForTests(id: UUID) {
+        gate.endDecodeForTests(id: id)
+    }
+
+    static func inFlightDecodeCountForTests(id: UUID) -> Int {
+        gate.inFlightDecodeCountForTests(id: id)
     }
 }
 #endif
