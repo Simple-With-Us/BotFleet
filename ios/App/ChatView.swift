@@ -14,6 +14,7 @@ import CompanionCore
 // isn't. The App target is iOS; CompanionCore is where the portable half
 // lives.
 import UIKit
+import ImageIO
 import AVFoundation
 import PhotosUI
 import UniformTypeIdentifiers
@@ -1254,7 +1255,7 @@ struct ChatView: View {
         // steering; keep the capture locally rather than upload an orphan.
         guard recording == nil || !current.busy else { return nil }
         draft = ""
-        pendingAttachments = []
+        clearPendingAttachments()
         dictation.discardRecording()
         showCommandHUD = false
         // Sending is the reader asking to be at the newest message again,
@@ -1362,12 +1363,12 @@ struct ChatView: View {
     private func restoreQueuedDraft(from item: QueuedSend) {
         if let rawText = item.rawText {
             draft = rawText
-            pendingAttachments = item.attachments
+            replacePendingAttachments(item.attachments)
         } else {
             // Legacy rows only stored composed wire text; re-applying chips would
             // duplicate markers already embedded in `text`.
             draft = item.text
-            pendingAttachments = []
+            clearPendingAttachments()
         }
         composerFocused = true
     }
@@ -1582,6 +1583,7 @@ struct ChatView: View {
                                         .foregroundStyle(Color.secondary)
                                 }
                                 Button {
+                                    PendingAttachmentThumbCache.remove(id: item.id)
                                     pendingAttachments.removeAll { $0.id == item.id }
                                 } label: {
                                     Image(systemName: "xmark.circle.fill")
@@ -1984,43 +1986,122 @@ struct ChatView: View {
         }
         pendingAttachments.append(PendingChatAttachment(name: name, mime: resolved, data: data))
     }
+
+    /// Drop decoded thumbs for attachments that leave the strip.
+    private func clearPendingAttachments() {
+        replacePendingAttachments([])
+    }
+
+    private func replacePendingAttachments(_ next: [PendingChatAttachment]) {
+        let kept = Set(next.map(\.id))
+        for item in pendingAttachments where !kept.contains(item.id) {
+            PendingAttachmentThumbCache.remove(id: item.id)
+        }
+        pendingAttachments = next
+    }
 }
 
 /// The mark on a pending attachment.  A photo uses the picture itself.
 /// A file, or an image the phone cannot decode, keeps an icon.
 private struct PendingAttachmentGlyph: View {
     let item: PendingChatAttachment
+    @State private var thumbnail: UIImage?
 
     var body: some View {
-        if let image = PendingAttachmentThumbCache.image(for: item) {
-            Image(uiImage: image)
-                .resizable()
-                .scaledToFill()
-                .frame(width: 36, height: 36)
-                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                .accessibilityHidden(true)
-        } else {
-            Image(systemName: item.kind == .image ? "photo" : "doc")
-                .font(.system(size: 13, weight: .semibold))
-                .frame(width: 36, height: 36)
-                .accessibilityHidden(true)
+        Group {
+            if let image = thumbnail {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: 36, height: 36)
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .accessibilityHidden(true)
+            } else {
+                Image(systemName: item.kind == .image ? "photo" : "doc")
+                    .font(.system(size: 13, weight: .semibold))
+                    .frame(width: 36, height: 36)
+                    .accessibilityHidden(true)
+            }
+        }
+        .task(id: item.id) {
+            let scale = UIScreen.main.scale
+            thumbnail = await PendingAttachmentThumbCache.thumbnail(for: item, screenScale: scale)
         }
     }
 }
 
-/// Decoded photo thumbnails, keyed by the pending item.  The strip redraws
-/// as the draft changes, and decoding the same photo on every pass is wasted
-/// work.
+/// Downsampled photo thumbnails, keyed by the pending item.
+///
+/// The strip redraws as the draft changes.  ImageIO builds a thumbnail off
+/// the main thread, and the cache drops an entry when that attachment leaves
+/// the strip.  Count and cost limits cover anything a removal missed.
 private enum PendingAttachmentThumbCache {
-    static let images = NSCache<NSString, UIImage>()
+    /// The chip draws the photo at 36 points.
+    static let pointSize: CGFloat = 36
+    /// The composer holds eight attachments.  A few extra slots cover a
+    /// send that puts the same photos back.
+    static let countLimit = 16
 
-    static func image(for item: PendingChatAttachment) -> UIImage? {
+    static let images: NSCache<NSString, UIImage> = {
+        let cache = NSCache<NSString, UIImage>()
+        cache.countLimit = countLimit
+        cache.totalCostLimit = countLimit * 128 * 128 * 4
+        return cache
+    }()
+
+    static func remove(id: UUID) {
+        images.removeObject(forKey: id.uuidString as NSString)
+    }
+
+    static func thumbnail(for item: PendingChatAttachment, screenScale: CGFloat) async -> UIImage? {
         guard let data = item.previewImageData else { return nil }
         let key = item.id.uuidString as NSString
         if let cached = images.object(forKey: key) { return cached }
-        guard let decoded = UIImage(data: data) else { return nil }
-        images.setObject(decoded, forKey: key)
+        let maxPixel = max(Int((pointSize * max(screenScale, 1)).rounded(.up)), 1)
+        let decoded = await downsampleOffMain(data: data, maxPixelSize: maxPixel)
+        guard let decoded, !Task.isCancelled else { return nil }
+        let cost = decoded.cgImage.map { $0.bytesPerRow * $0.height } ?? (maxPixel * maxPixel * 4)
+        images.setObject(decoded, forKey: key, cost: cost)
         return decoded
+    }
+
+    /// The continuation carries `Void` so the decoded image never has to
+    /// cross as a sendable value.  The box is filled before resume, and the
+    /// caller reads it only after that resume.
+    private static func downsampleOffMain(data: Data, maxPixelSize: Int) async -> UIImage? {
+        let box = ThumbnailBox()
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                box.image = downsample(data: data, maxPixelSize: maxPixelSize)
+                continuation.resume()
+            }
+        }
+        return box.image
+    }
+
+    private final class ThumbnailBox: @unchecked Sendable {
+        var image: UIImage?
+    }
+
+    /// ImageIO decodes only the pixels the chip needs.  A full
+    /// `UIImage(data:)` would expand the photo on the main thread.
+    private static func downsample(data: Data, maxPixelSize: Int) -> UIImage? {
+        let sourceOptions: [CFString: Any] = [
+            kCGImageSourceShouldCache: false,
+        ]
+        guard let source = CGImageSourceCreateWithData(data as CFData, sourceOptions as CFDictionary) else {
+            return nil
+        }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
+        ]
+        guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
+            return nil
+        }
+        return UIImage(cgImage: cgImage)
     }
 }
 

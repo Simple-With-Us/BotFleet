@@ -21,11 +21,15 @@ public enum ComposerPromptChips {
     ]
 
     /// True when choosing the chip would only paste a canned sentence.
+    ///
+    /// A shared title is not enough.  The title hides a chip only when the
+    /// prompt is empty.  A prompt that is one of the canned sentences is
+    /// hidden on its own.  A custom prompt keeps the chip.
     public static func isCannedSnippet(title: String, prompt: String) -> Bool {
         let title = title.trimmingCharacters(in: .whitespacesAndNewlines)
         let prompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         if prompt.hasPrefix("/") { return false }
         if snippetOnlyPrompts.contains(prompt) { return true }
-        return snippetOnlyTitles.contains(title)
+        return prompt.isEmpty && snippetOnlyTitles.contains(title)
     }
 }

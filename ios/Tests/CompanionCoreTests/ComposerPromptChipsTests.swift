@@ -26,4 +26,34 @@ final class ComposerPromptChipsTests: XCTestCase {
     func testARealPromptIsNotRejectedByTitleAloneWhenItIsNotCanned() {
         XCTAssertFalse(ComposerPromptChips.isCannedSnippet(title: "Review the patch", prompt: "Look at the open change"))
     }
+
+    func testACustomPromptKeepsACannedTitle() {
+        XCTAssertFalse(
+            ComposerPromptChips.isCannedSnippet(
+                title: "Run tests",
+                prompt: "Run the CompanionCore suite and paste the failing names"
+            )
+        )
+        XCTAssertFalse(
+            ComposerPromptChips.isCannedSnippet(
+                title: "Show diff",
+                prompt: "Show the diff for the receipt status fix"
+            )
+        )
+    }
+
+    func testAnEmptyPromptWithACannedTitleIsStillASnippet() {
+        XCTAssertTrue(ComposerPromptChips.isCannedSnippet(title: "Run tests", prompt: ""))
+        XCTAssertTrue(ComposerPromptChips.isCannedSnippet(title: "  What's next?  ", prompt: " \n "))
+        XCTAssertFalse(ComposerPromptChips.isCannedSnippet(title: "Review the patch", prompt: ""))
+    }
+
+    func testACannedPromptIsASnippetEvenWithAnotherTitle() {
+        XCTAssertTrue(
+            ComposerPromptChips.isCannedSnippet(
+                title: "Check the suite",
+                prompt: "Run all automated tests"
+            )
+        )
+    }
 }
