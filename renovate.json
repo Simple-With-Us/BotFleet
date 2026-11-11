@@ -38,7 +38,7 @@
         "Copy the guard rules into any repo where the suggestion cannot land."
       ],
       "matchPackageNames": ["typescript"],
-      "matchCurrentVersion": "/^[0-5]([.!+~-]|$)/",
+      "matchCurrentVersion": "/^[\\^~v]?[0-5]([.!+~-]|$)/",
       "allowedVersions": "<6"
     },
     {
@@ -46,17 +46,17 @@
         "Fleet compatibility guard: a repo that has deliberately moved to the typescript 6 line stays on it until a human opens 7."
       ],
       "matchPackageNames": ["typescript"],
-      "matchCurrentVersion": "/^6([.!+~-]|$)/",
+      "matchCurrentVersion": "/^[\\^~v]?6([.!+~-]|$)/",
       "allowedVersions": "<7"
     },
     {
       "description": [
         "Fleet compatibility guard: a repo on node 18 through 25 never sees node 26+ suggestions.",
         "Owner 2026-11-10: node 26 proposals keep landing where the deployed runtime or platform cannot take them.",
-        "Covers the docker and nvm managers; repos already on 26 or newer are exempt."
+        "Covers the dockerfile and nvm managers; repos already on 26 or newer are exempt."
       ],
       "matchPackageNames": ["node"],
-      "matchManagers": ["docker", "nvm"],
+      "matchManagers": ["dockerfile", "nvm"],
       "matchCurrentVersion": "/^v?(1[89]|2[0-5])([.!-]|$)/",
       "allowedVersions": "!/^(v?)(2[6-9]|[3-9][0-9])/"
     },
