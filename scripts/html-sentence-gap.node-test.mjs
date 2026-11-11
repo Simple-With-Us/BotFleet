@@ -52,7 +52,7 @@ test("the companion control page does not hang a sentence gap off a non-sentence
 });
 
 // The owner rule of 2026-10-25 named one exception to the one mechanism:  the chat
-// panes of Claude Code (the Code tab) and MiniMax Code (the MiniMax Code pane) take
+// panes of Claude Code (the Code tab), MiniMax Code (the MiniMax Code pane) and Z Code (the Z Code pane) take
 // the `&nbsp;` entity plus a normal space, because those panes normalize a raw
 // U+00A0 away and collapse two ASCII spaces.  Every other surface takes the real
 // U+00A0.
@@ -125,6 +125,10 @@ test("every copy that states the gap rule names the one chat-pane exception", ()
       `${copy.path} must name the MiniMax Code chat pane as an exception`,
     );
     assert.ok(
+      rule.includes("Z Code"),
+      `${copy.path} must name the Z Code chat pane as an exception`,
+    );
+    assert.ok(
       rule.includes("Claude Code"),
       `${copy.path} must name the Claude Code Code tab as an exception`,
     );
@@ -136,28 +140,28 @@ test("every copy that states the gap rule names the one chat-pane exception", ()
   }
 });
 
-test("the operative rule pins the entity as the two chat panes' mechanism", () => {
+test("the operative rule pins the entity as the three chat panes' mechanism", () => {
   // Naming the exception is not enough:  the operative rule has to say which
-  // mechanism the two panes take, so a different one cannot slip through.
+  // mechanism the three panes take, so a different one cannot slip through.
   for (const copy of RULE_STATING_COPIES) {
     const rule = operativeRule(read(join(ROOT, copy.path)), copy);
     assert.ok(
       /`&nbsp;` entity plus a normal space/i.test(rule),
-      `${copy.path} must say the two chat panes take the entity plus a normal space`,
+      `${copy.path} must say the three chat panes take the entity plus a normal space`,
     );
   }
 });
 
 test("no operative rule bans the entity everywhere", () => {
   // A blanket ban refuses the entity without the "anywhere else" qualifier, so
-  // it contradicts the two chat panes that need it.  The qualifier is what
+  // it contradicts the three chat panes that need it.  The qualifier is what
   // makes the canonical wording legal, so the ban is matched up to it.
   const blanketBan = /never (?:write )?the `&nbsp;` entity(?!\s+anywhere else)/i;
   for (const copy of RULE_STATING_COPIES) {
     const rule = operativeRule(read(join(ROOT, copy.path)), copy);
     assert.ok(
       !blanketBan.test(rule),
-      `${copy.path} must not ban the entity everywhere; the two chat panes take it`,
+      `${copy.path} must not ban the entity everywhere; the three chat panes take it`,
     );
   }
 });
