@@ -60,6 +60,16 @@ final class ComposerPendingThumbnailCacheTests: XCTestCase {
         XCTAssertNil(ComposerPendingThumbnailCache.cachedThumbnail(for: id))
     }
 
+    func testAFailedSendRestoreMustReinstateBeforeThumbnailsCache() async {
+        let attachment = PendingChatAttachment(name: "retry.png", mime: "image/png", data: Self.onePixelPNG)
+        ComposerPendingThumbnailCache.remove(id: attachment.id)
+        _ = await ComposerPendingThumbnailCache.thumbnail(for: attachment, screenScale: 2)
+        XCTAssertNil(ComposerPendingThumbnailCache.cachedThumbnail(for: attachment.id))
+        ComposerPendingThumbnailCache.reinstate(id: attachment.id)
+        _ = await ComposerPendingThumbnailCache.thumbnail(for: attachment, screenScale: 2)
+        XCTAssertNotNil(ComposerPendingThumbnailCache.cachedThumbnail(for: attachment.id))
+    }
+
     func testReinstateLetsAThumbLoadAgainAfterReplacement() async {
         let attachment = PendingChatAttachment(name: "back.png", mime: "image/png", data: Self.onePixelPNG)
         ComposerPendingThumbnailCache.remove(id: attachment.id)

@@ -1297,7 +1297,7 @@ struct ChatView: View {
                 transcript: transcript
             ) else { return }
             if draft.isEmpty { draft = sentText }
-            if pendingAttachments.isEmpty { pendingAttachments = outgoing }
+            if pendingAttachments.isEmpty { replacePendingAttachments(outgoing) }
             if let recording, dictation.recordedWAV == nil {
                 dictation.restoreRecording(recording.data, transcript: recording.transcript)
             }
