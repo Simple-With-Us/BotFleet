@@ -109,12 +109,12 @@ final class ComposerPendingThumbnailCacheTests: XCTestCase {
         ComposerPendingThumbnailCache.remove(id: id)
         ComposerPendingThumbnailCache.endDecodeForTests(id: id)
 
-        XCTAssertEqual(ComposerPendingThumbnailCache.inFlightDecodeCountForTests(id), 1)
+        XCTAssertEqual(ComposerPendingThumbnailCache.inFlightDecodeCountForTests(id: id), 1)
         ComposerPendingThumbnailCache.pruneTombstones(keeping: [])
         XCTAssertGreaterThan(ComposerPendingThumbnailCache.tombstoneCountForTests(), 0)
 
         ComposerPendingThumbnailCache.endDecodeForTests(id: id)
-        XCTAssertEqual(ComposerPendingThumbnailCache.inFlightDecodeCountForTests(id), 0)
+        XCTAssertEqual(ComposerPendingThumbnailCache.inFlightDecodeCountForTests(id: id), 0)
         ComposerPendingThumbnailCache.pruneTombstones(keeping: [])
         XCTAssertEqual(ComposerPendingThumbnailCache.tombstoneCountForTests(), 0)
     }
