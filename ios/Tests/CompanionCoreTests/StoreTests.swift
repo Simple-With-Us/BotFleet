@@ -143,6 +143,40 @@ final class StoreTests: XCTestCase {
         )
     }
 
+    func testPendingApprovalsFindsANonTipCardAfterTheBackfillMerge() throws {
+        // #1660: hydration carries one message per thread, so a thread
+        // whose unanswered card is not its newest message contributes
+        // nothing to pendingApprovals until its first page is merged —
+        // which is what Session.backfillStubThreads does, per stub
+        // thread, when the chat list goes live.
+        var state = try hydrated()
+        let threadId = try XCTUnwrap(state.bots.first?.threadId)
+        func card(_ id: String, at: Double) -> Message {
+            var message = Message(id: id, role: .bot, kind: .options, at: at)
+            message.card = OptionCard(
+                title: "Approval needed", subtitle: "rm -rf ./build", options: ["Allow", "Deny"],
+                answered: nil, dismissed: nil, requestId: "r-\(id)", tool: "Bash",
+                held: nil, allowKey: "Bash:rm"
+            )
+            return message
+        }
+        // The stub: only the tip is held, and the tip is not the card.
+        state.messages[threadId] = [message("tip", at: 10)]
+        XCTAssertFalse(
+            state.pendingApprovals.contains { $0.threadId == threadId },
+            "a stub thread cannot surface an approval it has not loaded"
+        )
+        // The backfill merge: the first page carries the older card.
+        state.merge(
+            ThreadPage(messages: [card("card", at: 5), message("tip", at: 10)], hasMore: true),
+            intoThread: threadId
+        )
+        XCTAssertEqual(
+            state.pendingApprovals.filter { $0.threadId == threadId }.map(\.message.id),
+            ["card"]
+        )
+    }
+
     func testRehydrateWithNoMessagesFieldLeavesExistingScrollbackUntouched() throws {
         var state = try hydrated()
         let threadId = try XCTUnwrap(state.bots.first?.threadId)
