@@ -62,12 +62,18 @@ final class ComposerPendingThumbnailCacheTests: XCTestCase {
 
     func testAFailedSendRestoreMustReinstateBeforeThumbnailsCache() async {
         let attachment = PendingChatAttachment(name: "retry.png", mime: "image/png", data: Self.onePixelPNG)
-        ComposerPendingThumbnailCache.remove(id: attachment.id)
-        _ = await ComposerPendingThumbnailCache.thumbnail(for: attachment, screenScale: 2)
-        XCTAssertNil(ComposerPendingThumbnailCache.cachedThumbnail(for: attachment.id))
-        ComposerPendingThumbnailCache.reinstate(id: attachment.id)
-        _ = await ComposerPendingThumbnailCache.thumbnail(for: attachment, screenScale: 2)
-        XCTAssertNotNil(ComposerPendingThumbnailCache.cachedThumbnail(for: attachment.id))
+        let id = attachment.id
+        ComposerPendingThumbnailCache.remove(id: id)
+
+        let blocked = await ComposerPendingThumbnailCache.thumbnail(for: attachment, screenScale: 2)
+        XCTAssertNil(blocked)
+        XCTAssertNil(ComposerPendingThumbnailCache.cachedThumbnail(for: id))
+
+        ComposerPendingThumbnailCache.remove(id: id)
+        ComposerPendingThumbnailCache.reinstate(id: id)
+        let restored = await ComposerPendingThumbnailCache.thumbnail(for: attachment, screenScale: 2)
+        XCTAssertNotNil(restored)
+        XCTAssertNotNil(ComposerPendingThumbnailCache.cachedThumbnail(for: id))
     }
 
     func testReinstateLetsAThumbLoadAgainAfterReplacement() async {
