@@ -307,6 +307,11 @@ struct ChatView: View {
         }
         .task(id: threadId) {
             if current.unread { await session.markRead(current) }
+            // Hydration now carries only one message per thread to avoid
+            // blocking the main thread with bulk text layout at launch.
+            // Load the full initial page here, the first time this chat is
+            // opened, so the transcript is complete before the user scrolls.
+            await session.loadInitialMessages(threadId: threadId)
 #if DEBUG
             if ProcessInfo.processInfo.arguments.contains("-open-plus") { showingPlus = true }
             if ProcessInfo.processInfo.arguments.contains("-open-profile") { showingProfile = true }

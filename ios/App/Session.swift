@@ -1014,7 +1014,7 @@ final class Session: ObservableObject {
         let previousMessages = state.messages
         let previousHasMore = state.hasMore
         let previousPending = state.pendingQueued
-        let fleet = try await requestClient.fleet(messages: 50)
+        let fleet = try await requestClient.fleet(messages: 1)
         try Task.checkCancellation()
         guard pairingGeneration == generation else { return .pairingChanged }
         guard state.hydrate(fleet, ifUnchangedSince: hydrationToken) else { return .newerState }
@@ -1920,6 +1920,57 @@ final class Session: ObservableObject {
             state.prepend(page, toThread: threadId)
         } catch {
             recordActionError(error)
+        }
+    }
+
+    /// Fetch the newest page of messages for a thread that was hydrated
+    /// with only a one-message preview stub.
+    ///
+    /// Called from ChatView when the chat is first opened, so the main-thread
+    /// text-layout cost is deferred until the user actually navigates to that
+    /// chat rather than paid up front for every bot at launch.
+    ///
+    /// There is deliberately no "already populated" skip.  A thread holding
+    /// 50+ rows can still have a hole above them: a reconnect hydrate merges
+    /// only the newest-message stub, so anything that arrived while the
+    /// phone was offline lands as an isolated tip, and `loadOlder` pages
+    /// only backward from the oldest held row — the missed middle would
+    /// never be repaired.  A missing `hasMore` entry must not skip either:
+    /// it means the hydrate carried no page information for this thread,
+    /// and ChatView's `.task(id:)` will not rerun for the same threadId,
+    /// so skipping would pin the stub forever.  Refetching the newest page
+    /// on open is the repair for both, and `merge` deduplicates by message
+    /// id, so a thread that was already complete pays one redundant fetch
+    /// and changes nothing.
+    func loadInitialMessages(threadId: String) async {
+        guard let client else { return }
+        do {
+            // No `before:` — returns the newest 50, which includes the stub
+            // message already in state.  merge() deduplicates by message id.
+            let page = try await client.messages(threadId: threadId)
+            state.merge(page, intoThread: threadId)
+        } catch {
+            recordActionError(error)
+        }
+    }
+
+    /// Load the first page for every thread still holding only its
+    /// one-message hydrate stub.
+    ///
+    /// `pendingApprovals` derives from held messages, and the fleet payload
+    /// carries no per-thread pending signal, so a thread whose unanswered
+    /// card is not its newest message is invisible to the Approvals surface
+    /// and the chat list's waiting markers until its page is loaded.
+    /// Backfilling the stubs — and only the stubs; a thread already holding
+    /// a page is skipped — restores that derivation without returning to a
+    /// bulk hydrate: the launch fetch stays at one message per thread, and
+    /// this runs when the chat list goes live, off the launch path.
+    func backfillStubThreads() async {
+        let threadIds = state.bots.map(\.threadId) + state.rooms.map(\.threadId)
+        for threadId in threadIds {
+            guard (state.messages[threadId]?.count ?? 0) < 50,
+                  state.hasMore[threadId] ?? true else { continue }
+            await loadInitialMessages(threadId: threadId)
         }
     }
 
