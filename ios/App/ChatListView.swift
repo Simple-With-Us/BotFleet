@@ -121,6 +121,15 @@ struct ChatListView: View {
         }
 #endif
         .task { _ = await session.configStatus() }
+        // Hydration carries one message per thread; backfill the stub
+        // threads so pending-approval derivation (Approvals, the list's
+        // waiting markers) sees cards that are not a thread's newest
+        // message.  Keyed on live so a reconnect re-runs it for threads
+        // stubbed by the reconnect hydrate.
+        .task(id: sessionIsLive) {
+            guard sessionIsLive else { return }
+            await session.backfillStubThreads()
+        }
         // Warms `session.instanceDriverKinds` before any chat is opened, so
         // the chat header's provider mark resolves synchronously instead of
         // firing a network call per render. Quiet path — offline/cancel must
