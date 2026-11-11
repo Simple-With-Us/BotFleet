@@ -1997,6 +1997,9 @@ struct ChatView: View {
         for item in pendingAttachments where !kept.contains(item.id) {
             ComposerPendingThumbnailCache.remove(id: item.id)
         }
+        for item in next {
+            ComposerPendingThumbnailCache.reinstate(id: item.id)
+        }
         pendingAttachments = next
     }
 }

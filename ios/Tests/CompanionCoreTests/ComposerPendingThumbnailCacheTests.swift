@@ -47,10 +47,26 @@ final class ComposerPendingThumbnailCacheTests: XCTestCase {
     func testRemoveDuringDecodeDoesNotPopulateCache() async {
         let id = UUID()
         let attachment = PendingChatAttachment(id: id, name: "flight.png", mime: "image/png", data: Self.onePixelPNG)
-        async let pending = ComposerPendingThumbnailCache.thumbnail(for: attachment, screenScale: 2)
-        ComposerPendingThumbnailCache.remove(id: id)
-        _ = await pending
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask {
+                _ = await ComposerPendingThumbnailCache.thumbnail(for: attachment, screenScale: 2)
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: 1_000)
+                ComposerPendingThumbnailCache.remove(id: id)
+            }
+            await group.waitForAll()
+        }
         XCTAssertNil(ComposerPendingThumbnailCache.cachedThumbnail(for: id))
+    }
+
+    func testReinstateLetsAThumbLoadAgainAfterReplacement() async {
+        let attachment = PendingChatAttachment(name: "back.png", mime: "image/png", data: Self.onePixelPNG)
+        ComposerPendingThumbnailCache.remove(id: attachment.id)
+        ComposerPendingThumbnailCache.reinstate(id: attachment.id)
+        let thumb = await ComposerPendingThumbnailCache.thumbnail(for: attachment, screenScale: 2)
+        XCTAssertNotNil(thumb)
+        XCTAssertNotNil(ComposerPendingThumbnailCache.cachedThumbnail(for: attachment.id))
     }
 
     func testCancelledTaskSkipsCachePopulation() async {

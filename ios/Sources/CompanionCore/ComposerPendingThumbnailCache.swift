@@ -36,6 +36,11 @@ public enum ComposerPendingThumbnailCache {
     removedIds.insert(id)
   }
 
+  /// A thumb is loading again for an attachment the strip still holds.
+  public static func reinstate(id: UUID) {
+    removedIds.clear(id)
+  }
+
   public static func thumbnail(
     for item: PendingChatAttachment,
     screenScale: CGFloat
@@ -43,7 +48,6 @@ public enum ComposerPendingThumbnailCache {
     guard let data = item.previewImageData else { return nil }
     let attachmentId = item.id
     let key = attachmentId.uuidString as NSString
-    removedIds.clear(attachmentId)
 
     if let cached = images.object(forKey: key) { return cached }
 
