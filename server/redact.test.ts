@@ -166,6 +166,14 @@ describe("redactSecretsInText", () => {
       [`XAI_API_KEY ${"xai" + "-"}${alpha}${alpha}`, /xai-[a-z]/],
       [`groq ${"gsk" + "_"}${alpha}${alpha.slice(0, 16)}`, /gsk_[a-z]/],
       [`hugging face ${"hf" + "_"}${alpha}`, /hf_[a-z]/],
+      // S13: shapes BotFleet itself issues or stores (underscore Stripe
+      // forms, webhook secrets, Google OAuth access tokens, GitLab PATs).
+      [`stripe live ${"sk_" + "live_"}${alpha}`, /sk_live_/],
+      [`stripe test ${"sk_" + "test_"}${alpha}`, /sk_test_/],
+      [`webhook ${"wh" + "sec_"}${alpha}`, /whsec_/],
+      [`generic ${"ak" + "_"}${alpha}`, /ak_[a-z]/],
+      [`google oauth ${"ya29" + "."}${alpha}${alpha.slice(0, 10)}`, /ya29\./],
+      [`gitlab ${"glpat" + "-"}${alpha.slice(0, 20)}`, /glpat-/],
     ];
     for (const [input, leak] of cases) {
       const out = redactSecretsInText(input);

@@ -10,11 +10,11 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 import { CREDENTIAL_TARGETS } from "../../shared/credential-request.ts";
+import { looksSensitive } from "../auto-approve.ts";
 import {
   CREDENTIAL_TARGET_IDS,
   HARNESS_TOOLS,
   MAX_CREATED_BOTS_PER_TURN,
-  descriptionFor,
   harnessTool,
   httpToolDefinitions,
   mcpToolDefinitions,
@@ -23,6 +23,13 @@ import {
   type ToolGateContext,
 } from "./registry.ts";
 import { createPhoneTools } from "./phone.ts";
+import {
+  JOB_DEFAULT_MINUTES,
+  JOB_MODEL_MAX_MINUTES,
+  JOB_OUTPUT_MAX_BYTES,
+  JOB_OUTPUT_WAIT_MAX_SECONDS_HTTP,
+} from "../../shared/jobs.ts";
+import { JOB_SUMMARY_MAX_CHARS } from "./registry.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -68,12 +75,65 @@ describe("every record is complete", () => {
     }
   });
 
-  it("keeps read tools free of an approval ask — only a write tool needs a card", () => {
+  it("keeps read tools free of a blanket approval ask — only a write tool needs a card", () => {
+    // A read tool may still ask, but only through a DECLARED condition the
+    // host evaluates — never as an unconditional card, which would put
+    // read_file's own `src/index.ts` reads in front of a person. The
+    // condition below is the whole of that latitude: one named condition,
+    // on the one read tool that can reach a credential store.
+    const conditioned = new Set<string>();
     for (const tool of HARNESS_TOOLS) {
       if (tool.sideEffect === "read") {
-        expect(tool.approval?.policy ?? "never", `${tool.name}`).toBe("never");
+        if (tool.approval?.policy === "ask") {
+          expect(tool.approval.condition, `${tool.name} asks unconditionally`).toBeTruthy();
+          conditioned.add(tool.name);
+        } else {
+          expect(tool.approval?.policy ?? "never", `${tool.name}`).toBe("never");
+        }
         expect(tool.settles, `${tool.name}`).toBe("immediate");
       }
+    }
+    expect([...conditioned]).toEqual(["read_file"]);
+  });
+
+  it("asks for read_file only through the sensitive-path condition", () => {
+    const readFile = harnessTool("read_file")!;
+    expect(readFile.approval).toMatchObject({ policy: "ask", condition: "sensitive-file-path" });
+    expect(readFile.approval!.summary({ path: "/Users/jay/.botfleet/config.json" })).toBe(
+      "read file /Users/jay/.botfleet/config.json",
+    );
+    // the two write tools on the same paths already asked unconditionally,
+    // so a card there is not a new behaviour — pinned so it cannot go quiet
+    for (const name of ["write_file", "edit_file"]) {
+      expect(harnessTool(name)!.approval, name).toMatchObject({ policy: "ask" });
+      expect(harnessTool(name)!.approval!.condition, name).toBeUndefined();
+    }
+  });
+
+  it("gates read_file's ask on sensitive paths only, in parity with auto-approve's SENSITIVE", () => {
+    // The catalog names the condition rather than restating the path rules:
+    // `host.ts` resolves the argument and calls `looksSensitive`, so the two
+    // lists cannot drift the way a hand-copied regex table did.  The parity is
+    // therefore structural, and what is worth pinning here is that read_file
+    // IS gated and that the gate is the named condition.
+    const approval = harnessTool("read_file")!.approval!;
+    expect(approval.policy).toBe("ask");
+    expect(approval.condition).toBe("sensitive-file-path");
+    // Every shape the list knows must be a shape this gate catches, and
+    // nothing ordinary may be caught by accident.
+    const sensitivePaths = [
+      ".env", "/home/u/app/.env.production", "~/.ssh/id_ed25519",
+      "~/.aws/credentials", ".npmrc", "creds/credentials.json",
+      "~/.botfleet/config.json", ".botfleet/bots.json",
+    ];
+    const ordinaryPaths = [
+      "package.json", "src/index.ts", "README.md", "/tmp/notes.txt",
+    ];
+    for (const path of sensitivePaths) {
+      expect(looksSensitive(path), `SENSITIVE: ${path}`).toBe(true);
+    }
+    for (const path of ordinaryPaths) {
+      expect(looksSensitive(path), `SENSITIVE: ${path}`).toBe(false);
     }
   });
 
@@ -103,22 +163,13 @@ describe("both lanes derive from the same records", () => {
     }
   });
 
-  it("carry ask_bot's longer per-tool ceiling onto the HTTP lane (DR9)", () => {
-    // The loop's uniform 90s clock cut ask_bot off mid-peer-turn, under the
-    // three minutes the fleet documents for a peer reply.  The number lives
-    // on the tool so it travels with the behaviour that needs it.
-    const askBot = harnessTool("ask_bot")!;
-    expect(askBot.timeoutMs).toBe(240_000);
-    expect(askBot.promptFragment).toContain("prefer delegate_bot");
-
-    const http = new Map(
-      httpToolDefinitions(gate({ localComputer: true })).map((t) => [t.name, t]),
-    );
-    expect(http.get("ask_bot")!.timeoutMs).toBe(240_000);
-    // and a tool with no declared ceiling carries none, so the loop keeps
-    // its own default for it
+  it("returns immediately, so coordinate_bots has no peer-turn timeout", () => {
+    const tool = harnessTool("coordinate_bots")!;
+    expect(tool.timeoutMs).toBeUndefined();
+    expect(tool.promptFragment).toContain("assignment_status");
+    const http = new Map(httpToolDefinitions(gate({ localComputer: true })).map((t) => [t.name, t]));
+    expect(http.get("coordinate_bots")!.timeoutMs).toBeUndefined();
     expect(http.get("bash")!.timeoutMs).toBeUndefined();
-    expect("timeoutMs" in http.get("bash")!).toBe(false);
   });
 
   it("tell the model read_file is bounded and how to page past the cut (DR5)", () => {
@@ -172,17 +223,17 @@ describe("both lanes derive from the same records", () => {
     }
   });
 
-  it("keeps ask_bot's two argument spellings in step — same required arity, one alias", () => {
-    const tool = harnessTool("ask_bot")!;
-    expect(schemaFor(tool, "mcp").required).toEqual(["bot_id", "message"]);
-    expect(schemaFor(tool, "http").required).toEqual(["bot_id", "task"]);
-    expect(schemaFor(tool, "http").required!.length).toBe(schemaFor(tool, "mcp").required!.length);
-    expect(descriptionFor(tool, "mcp")).not.toBe(descriptionFor(tool, "http"));
+  it("advertises one coordinate_bots schema on both lanes", () => {
+    const tool = harnessTool("coordinate_bots")!;
+    expect(schemaFor(tool, "mcp").required).toEqual(["bot_ids", "message"]);
+    expect(schemaFor(tool, "http").required).toEqual(["bot_ids", "message"]);
+    expect(tool.wire).toBeUndefined();
   });
 
-  it("declares no wire deviation for any of the five PR 7 tools — one schema, both lanes", () => {
+  it("declares no wire deviation for the coordination tools or the PR 7 tools — one schema, both lanes", () => {
     for (const name of [
-      "delegate_bot",
+      "coordinate_bots",
+      "assignment_status",
       "create_bot",
       "request_credential",
       "propose_routine",
@@ -229,12 +280,13 @@ describe("gating", () => {
     const ctx = gate({ commsDepth: 1, maxCommsDepth: 1 });
     const names = mcpToolDefinitions(ctx).map((t) => t.name);
     expect(names).not.toContain("list_bots");
-    expect(names).not.toContain("ask_bot");
-    expect(names).not.toContain("delegate_bot");
+    expect(names).not.toContain("coordinate_bots");
+    expect(names).not.toContain("assignment_status");
     // None of these are a hop, so the ceiling does not apply to them.
     expect(names).toContain("list_routines");
     expect(names).toContain("create_bot");
     expect(names).toContain("request_credential");
+    expect(names).toContain("request_sign_in");
     expect(names).toContain("propose_routine");
     expect(names).toContain("propose_routine_action");
   });
@@ -251,10 +303,11 @@ describe("gating", () => {
   it("offers the full set to a depth-0 chief bot with comms on", () => {
     expect(mcpToolDefinitions(gate()).map((t) => t.name)).toEqual([
       "list_bots",
-      "ask_bot",
-      "delegate_bot",
+      "coordinate_bots",
+      "assignment_status",
       "create_bot",
       "request_credential",
+      "request_sign_in",
       "list_routines",
       "propose_routine",
       "propose_routine_action",
@@ -264,9 +317,10 @@ describe("gating", () => {
   it("offers everything but create_bot to a depth-0 non-chief bot with comms on", () => {
     expect(mcpToolDefinitions(gate({ chiefOfStaff: false })).map((t) => t.name)).toEqual([
       "list_bots",
-      "ask_bot",
-      "delegate_bot",
+      "coordinate_bots",
+      "assignment_status",
       "request_credential",
+      "request_sign_in",
       "list_routines",
       "propose_routine",
       "propose_routine_action",
@@ -425,5 +479,53 @@ describe("the import cycle stays broken", () => {
     // must not drag the harness in behind it.
     const source = readFileSync(join(HERE, "registry.ts"), "utf8");
     expect(source).not.toMatch(/^\s*import\s/m);
+  });
+});
+
+// Background jobs (P1).  registry.ts imports nothing, so the limits its
+// descriptions state are literals; these rows pin them to the numbers
+// shared/jobs.ts actually enforces.
+describe("the background job records", () => {
+  it("leave the run limits the owner can change to the system prompt, and state the fixed ones", () => {
+    const start = harnessTool("job_start")!;
+    // `jobs.defaultMinutes` and `jobs.maxMinutes` are the owner's: a literal
+    // here would tell the model a limit the harness no longer enforces
+    const stated = JSON.stringify([start.description, start.schema]);
+    expect(stated).not.toContain(String(JOB_DEFAULT_MINUTES));
+    expect(stated).not.toContain(String(JOB_MODEL_MAX_MINUTES));
+    expect(start.description).toContain("in your instructions");
+    expect(JSON.stringify(start.schema)).toContain(`at most ${JOB_SUMMARY_MAX_CHARS} characters`);
+    const output = harnessTool("job_output")!;
+    expect(output.description).toContain(`at most ${JOB_OUTPUT_MAX_BYTES / 1024} KB`);
+    expect(output.description).toContain(`wait_seconds (at most ${JOB_OUTPUT_WAIT_MAX_SECONDS_HTTP})`);
+    expect(output.timeoutMs).toBeGreaterThan(JOB_OUTPUT_WAIT_MAX_SECONDS_HTTP * 1000);
+  });
+
+  it("ask before job_start only, carrying the whole command, and cut only past the card's limit", () => {
+    const start = harnessTool("job_start")!;
+    expect(start.approval?.policy).toBe("ask");
+    expect(start.approval!.summary({ command: "pnpm test &&\n  pnpm build" })).toBe("job: pnpm test && pnpm build");
+    const long = start.approval!.summary({ command: "y".repeat(JOB_SUMMARY_MAX_CHARS + 50) });
+    expect(long.endsWith("…")).toBe(true);
+    for (const name of ["job_output", "job_list", "job_kill"]) expect(harnessTool(name)!.approval).toBeUndefined();
+  });
+
+  it("are offered on both lanes, and only when jobs are mounted", () => {
+    const names = ["job_start", "job_output", "job_list", "job_kill"];
+    expect(httpToolDefinitions(gate({ jobs: true })).map((t) => t.name)).toEqual(expect.arrayContaining(names));
+    expect(httpToolDefinitions(gate({ jobs: false })).map((t) => t.name).filter((n) => n.startsWith("job_"))).toEqual([]);
+    // jobs P2: the MCP lane mounts them too, on the same single gate.
+    expect(mcpToolDefinitions(gate({ jobs: true })).map((t) => t.name).filter((n) => n.startsWith("job_"))).toEqual(names);
+    expect(mcpToolDefinitions(gate({ jobs: false })).map((t) => t.name).filter((n) => n.startsWith("job_"))).toEqual([]);
+  });
+
+  it("advertises the MCP lane's longer job_output wait, and only there", () => {
+    // jobs P2: 120 s over MCP, 75 s on the HTTP lane, and the deviation says
+    // why in the record rather than only in a comment.
+    const mcp = mcpToolDefinitions(gate({ jobs: true })).find((t) => t.name === "job_output")!;
+    const http = httpToolDefinitions(gate({ jobs: true })).find((t) => t.name === "job_output")!;
+    expect(mcp.description).toContain("at most 120");
+    expect(http.description).toContain("at most 75");
+    expect(harnessTool("job_output")!.wire!.mcp!.reason).toContain("120");
   });
 });

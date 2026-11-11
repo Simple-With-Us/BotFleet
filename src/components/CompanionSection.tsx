@@ -128,6 +128,11 @@ export function CompanionSection({ profileEmail = "" }: { profileEmail?: string 
       <CompanionGatewayCard />
 
       <Card
+        title="Desktop Browser Access"
+        subtitle="Looking to open BotFleet in a web browser from another Mac or PC?  Manage and test your public web ingress tunnel under the Remote tab in Settings."
+      />
+
+      <Card
         title="Paired Phones"
         subtitle={pairedCount ? "Manage the phones that can use this BotFleet." : "No phones are paired yet."}
       >
@@ -317,7 +322,7 @@ export function CompanionSection({ profileEmail = "" }: { profileEmail?: string 
 
           {state.enabled && !hosted && state.tailscale && !state.tailnetName && (
             <div className="rounded-lg bg-warning/10 px-3 py-2 text-[11.5px] leading-relaxed text-ink-secondary">
-              Tailscale is connected, but its device name could not be read. Check MagicDNS in Tailscale or use the secure account above.
+              Tailscale is connected, but its device name could not be read.{"\u00a0 "}Check MagicDNS in Tailscale or use the secure account above.
             </div>
           )}
           {state.enabled && !hosted && !state.tailscale && (

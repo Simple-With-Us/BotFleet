@@ -1,0 +1,27 @@
+/*
+ * Karaoke over the rendered message (src/lib/karaoke-highlight.ts).
+ *
+ * ::highlight() paints over existing glyphs and cannot change layout, which is
+ * the point: no font-weight, padding or size here, so lines never re-wrap.
+ * Only color and text-shadow are used.  The theme tokens already switch for
+ * light, dark and every skin, so these rules need no theme variants.
+ */
+
+/* Not yet spoken: the secondary ink every theme already defines. */
+::highlight(karaoke-ahead) {
+  color: var(--color-ink-secondary);
+}
+
+/* Rolling in: the accent text color plus a hairline shadow on each side as
+ * faux bold.  The shadow adds weight without changing glyph advances. */
+::highlight(karaoke-current) {
+  color: var(--color-accent-text);
+  text-shadow:
+    0.02em 0 0 var(--color-accent-text),
+    -0.02em 0 0 var(--color-accent-text);
+}
+
+/* Just spoken: a softer accent for a moment, then back to normal ink. */
+::highlight(karaoke-trail) {
+  color: color-mix(in srgb, var(--color-accent-text) 55%, var(--color-ink));
+}

@@ -1,15 +1,20 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import type { BotDispatchState } from "../shared/bot-profile.ts";
 import { mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { z } from "zod";
 
 import { writeFileAtomic } from "./atomic.ts";
+import { extractRequestMetadata, type WebhookRequestMetadata } from "./request-log.ts";
 import { DATA_DIR } from "./config.ts";
+import { isClassifyOrUiPassWake, isCompileGatesWake, isUiPassWake } from "./ephemeral-dispatch.ts";
 import type { RoutineRunOn } from "./routines.ts";
 import { parseJson, schemaIssue, type JsonValue } from "./schema.ts";
 import {
   asRecord,
   isGithubWebhookPayload,
+  isMergedPullRequestPayload,
+  isPagerDutyWebhookPayload,
   isSentryWebhookPayload,
   pickStr,
   serializeWebhookPayload,
@@ -34,10 +39,44 @@ export interface WebhookTrigger {
   verificationSample?: WebhookVerificationSample;
   /** Optional event-name allowlist. Empty means every event type. */
   eventTypes?: string[];
+  /** Optional action allowlist, read from the payload (GitHub/Sentry `action`,
+   *  PagerDuty `event.event_type`, otherwise a top-level `event`/`type`
+   *  string).  A delivery whose action is missing or not listed is filtered
+   *  at ingress before a run exists.  Absent means every action. */
+  actions?: string[];
+  /** GitHub only: a pull request or issue must carry at least one of these
+   *  labels (case-insensitive).  A payload without a pull request or issue
+   *  is filtered when this list is set. */
+  requiredLabels?: string[];
+  /** GitHub only: a `workflow_run`, `check_run`, `check_suite` or
+   *  `workflow_job` must be completed with one of these conclusions.  Other
+   *  events are unaffected. */
+  conclusions?: string[];
+  /** GitHub only: run only for the repository's default branch. */
+  defaultBranchOnly?: boolean;
+  /** Sentry only: ignore issues and events below this level. */
+  minSentryLevel?: SentryLevel;
+  /** Sentry only: ignore every delivery from these projects. */
+  excludeSentryProjects?: string[];
+  /** PagerDuty only: require this incident urgency. */
+  pagerdutyUrgency?: PagerDutyUrgency;
+  /** Run only when a GitHub pull request is merged: a `pull_request` delivery
+   *  whose action is `closed` and whose PR was merged.  Every other delivery,
+   *  including a PR closed without merging, is filtered at ingress before a
+   *  run exists, whatever `eventTypes` allows.  Absent or false adds no filter. */
+  mergedPullRequestsOnly?: boolean;
+  /** Deliveries this webhook filtered at ingress (event allowlist, built-in
+   *  pre-filters, merged-only) since the count began.  Counted in memory and
+   *  saved with the next write, so a filtered flood costs no extra disk work. */
+  ignoredCount?: number;
+  lastIgnoredAt?: number;
   /** Minimum minutes between activations of this trigger.  Deliveries that
    * arrive inside the gap wait and run together when it closes, rather than
    * waking the bot once each.  Absent or 0 runs every delivery. */
   minGapMinutes?: number;
+  /** Run each delivery on a fresh thread and post one summary line back to
+   *  the owning automation thread. */
+  oneShotWake?: boolean;
 }
 
 export interface WebhookTriggerInput {
@@ -48,7 +87,16 @@ export interface WebhookTriggerInput {
   enabled?: boolean;
   verificationPending?: boolean;
   eventTypes?: string[];
+  actions?: string[];
+  requiredLabels?: string[];
+  conclusions?: string[];
+  defaultBranchOnly?: boolean;
+  minSentryLevel?: SentryLevel | null;
+  excludeSentryProjects?: string[];
+  pagerdutyUrgency?: PagerDutyUrgency | null;
+  mergedPullRequestsOnly?: boolean;
   minGapMinutes?: number;
+  oneShotWake?: boolean;
 }
 
 type CleanWebhookInput = Omit<
@@ -60,6 +108,8 @@ type CleanWebhookInput = Omit<
   | "lastReceivedAt"
   | "lastRunId"
   | "deliveryCount"
+  | "ignoredCount"
+  | "lastIgnoredAt"
   | "verifiedAt"
   | "verificationSample"
 >;
@@ -72,6 +122,9 @@ export interface WebhookVerificationSample {
 }
 
 export type WebhookAttemptOutcome = "accepted" | "captured" | "duplicate" | "ignored" | "rejected";
+
+/** Sentry severity levels, ordered from least to most severe. */
+export type SentryLevel = "debug" | "info" | "warning" | "error" | "fatal";
 
 export interface WebhookAttempt {
   id: string;
@@ -94,6 +147,7 @@ interface DeliveryReceipt {
   key: string;
   runId: string;
   at: number;
+  stateKey?: string;
 }
 
 interface WebhookFile {
@@ -128,7 +182,7 @@ export interface WebhookManagerOptions {
   file?: string;
   now?: () => number;
   emit?: (event: WebhookManagerEvent) => void;
-  botState: (botId: string) => "ready" | "busy" | "missing";
+  botState: (botId: string) => BotDispatchState;
   /** Resolve a live bot by display name. Used to reroute fleet-infra Sentry
    * onto Plumber without baking that bot's id into the webhook record. */
   findBotIdByName?: (name: string) => string | undefined;
@@ -140,28 +194,57 @@ export interface WebhookManagerOptions {
     runOn: RoutineRunOn;
     deliveryId: string;
     receivedAt: number;
-  }) => { id: string };
+  }) => { id: string; status?: string; error?: string };
   cancelQueued?: (webhookId: string, message: string) => void;
   pendingRuns?: (webhookId: string) => number;
+  /** Whether a new delivery for this webhook and bot can be coalesced into an existing queued run. */
+  canCoalesce?: (webhookId: string, botId: string) => boolean;
+  /** The current status of a run, when the engine still holds it.  A PR
+   *  state whose run failed, was cancelled or was missed did not get
+   *  handled, so it must not block a later delivery. */
+  runStatus?: (runId: string) => string | undefined;
 }
+
+/** Run statuses that mean the PR state was not handled. */
+const UNHANDLED_RUN_STATUSES = new Set(["failed", "cancelled", "missed"]);
 
 export type WebhookManagerEvent =
   | { kind: "webhook"; webhook: WebhookTrigger }
   | { kind: "webhook.deleted"; webhookId: string }
-  | { kind: "webhook.attempt"; attempt: WebhookAttempt };
+  | { kind: "webhook.attempt"; attempt: WebhookAttempt; requestMetadata?: WebhookRequestMetadata };
 
+/** How long a burst of save() calls coalesces into one atomic write.
+ * Trailing-edge: set once per burst, not reset per call, so sustained
+ * receipt traffic still flushes on a bounded cadence. */
+const SAVE_DEBOUNCE_MS = 250;
 const MAX_DELIVERIES = 2_000;
-const MAX_ATTEMPTS = 2_000;
+// Attempts carry a payload preview (see previewPayload below) and are UI
+// history, not idempotency state like deliveries — 2,000 of them with a
+// 2,000-character preview each made webhooks.json a 3 MB write on every
+// receipt.  500 keeps enough recent history for the delivery log without the
+// bulk.
+const MAX_ATTEMPTS = 500;
 const RATE_WINDOW_MS = 60_000;
 const RATE_LIMIT = 10;
 const MAX_PENDING_RUNS = 3;
 const MAX_IGNORED_ATTEMPTS_PER_WINDOW = 3;
 const IGNORED_ATTEMPTS_WINDOW_MS = 10_000;
+// An unauthenticated caller can reject forever, so rejected rows are capped
+// per window too.  See recordRejectedForTrigger.
+const MAX_REJECTED_ATTEMPTS_PER_WINDOW = 10;
+const REJECTED_ATTEMPTS_WINDOW_MS = 60_000;
 
 const runOnSchema = z
   .enum(["bot", "cloud", "maus"])
   .transform((value): "bot" | "cloud" => (value === "maus" ? "bot" : value));
 const eventTypesSchema = z.array(z.string()).max(20).optional();
+/** A list filter: action allowlist, required labels, conclusions, excluded
+ *  Sentry projects.  Length is validated in cleanFilterList after trim and de-dupe. */
+const filterListSchema = z.array(z.string()).optional();
+const sentryLevelSchema = z.enum(["debug", "info", "warning", "error", "fatal"]);
+const pagerDutyUrgencySchema = z.enum(["high", "low"]);
+/** PagerDuty incident urgency. */
+export type PagerDutyUrgency = z.infer<typeof pagerDutyUrgencySchema>;
 /** A whole number of minutes.  A day is the ceiling — past that a person
  * wants a schedule, not a trigger. */
 const minGapSchema = z.number().int().min(0).max(1440).optional();
@@ -173,7 +256,16 @@ const triggerInputSchema = z.object({
   enabled: z.boolean().optional(),
   verificationPending: z.boolean().optional(),
   eventTypes: eventTypesSchema,
+  actions: filterListSchema,
+  requiredLabels: filterListSchema,
+  conclusions: filterListSchema,
+  defaultBranchOnly: z.boolean().optional(),
+  minSentryLevel: sentryLevelSchema.nullish(),
+  excludeSentryProjects: filterListSchema,
+  pagerdutyUrgency: pagerDutyUrgencySchema.nullish(),
+  mergedPullRequestsOnly: z.boolean().optional(),
   minGapMinutes: minGapSchema,
+  oneShotWake: z.boolean().optional(),
 });
 const triggerPatchSchema = triggerInputSchema.partial();
 const verificationSampleSchema = z.object({
@@ -199,13 +291,25 @@ const storedWebhookSchema = z.object({
   verifiedAt: z.number().finite().nonnegative().optional(),
   verificationSample: verificationSampleSchema.optional(),
   eventTypes: eventTypesSchema,
+  actions: filterListSchema,
+  requiredLabels: filterListSchema,
+  conclusions: filterListSchema,
+  defaultBranchOnly: z.boolean().optional(),
+  minSentryLevel: sentryLevelSchema.optional(),
+  excludeSentryProjects: filterListSchema,
+  pagerdutyUrgency: pagerDutyUrgencySchema.optional(),
+  mergedPullRequestsOnly: z.boolean().optional(),
+  ignoredCount: z.number().int().nonnegative().optional(),
+  lastIgnoredAt: z.number().finite().nonnegative().optional(),
   minGapMinutes: minGapSchema,
+  oneShotWake: z.boolean().optional(),
   secretHash: z.string().regex(/^[a-f0-9]{64}$/),
 });
 const deliveryReceiptSchema = z.object({
   key: z.string().min(1),
   runId: z.string().min(1),
   at: z.number().finite().nonnegative(),
+  stateKey: z.string().min(1).optional(),
 });
 const webhookAttemptSchema = z.object({
   id: z.string().min(1),
@@ -255,6 +359,22 @@ function newSecret(): string {
   return `whsec_${randomBytes(32).toString("base64url")}`;
 }
 
+const MAX_FILTER_LIST = 20;
+
+/** A filter list: trimmed and de-duplicated.  An empty list means "no filter",
+ *  so it is dropped by the caller. */
+function cleanFilterList(values: string[] | undefined): string[] {
+  const cleaned = Array.from(new Set(
+    (values ?? [])
+      .map((value) => value.trim().slice(0, 200))
+      .filter(Boolean),
+  ));
+  if (cleaned.length > MAX_FILTER_LIST) {
+    fail(400, "You can add up to 20 filters.");
+  }
+  return cleaned;
+}
+
 function cleanInput(input: WebhookTriggerInput): CleanWebhookInput {
   const name = input.name.trim().slice(0, 80);
   const prompt = input.prompt.trim().slice(0, 20_000);
@@ -268,6 +388,10 @@ function cleanInput(input: WebhookTriggerInput): CleanWebhookInput {
       .map((value) => value.trim().slice(0, 200))
       .filter(Boolean),
   )).slice(0, 20);
+  const actions = cleanFilterList(input.actions);
+  const requiredLabels = cleanFilterList(input.requiredLabels);
+  const conclusions = cleanFilterList(input.conclusions);
+  const excludeSentryProjects = cleanFilterList(input.excludeSentryProjects);
   const enabled = input.enabled !== false;
   const clean: CleanWebhookInput = {
     name,
@@ -278,9 +402,18 @@ function cleanInput(input: WebhookTriggerInput): CleanWebhookInput {
     verificationPending: enabled ? false : input.verificationPending === true,
   };
   if (eventTypes.length) clean.eventTypes = eventTypes;
+  if (actions.length) clean.actions = actions;
+  if (requiredLabels.length) clean.requiredLabels = requiredLabels;
+  if (conclusions.length) clean.conclusions = conclusions;
+  if (excludeSentryProjects.length) clean.excludeSentryProjects = excludeSentryProjects;
+  if (input.defaultBranchOnly === true) clean.defaultBranchOnly = true;
+  if (input.minSentryLevel) clean.minSentryLevel = input.minSentryLevel;
+  if (input.pagerdutyUrgency) clean.pagerdutyUrgency = input.pagerdutyUrgency;
   // 0 means "no gap", which is also the absent value — keep the record small
   const minGapMinutes = Math.max(0, Math.min(1440, Math.round(input.minGapMinutes ?? 0)));
   if (minGapMinutes > 0) clean.minGapMinutes = minGapMinutes;
+  if (input.oneShotWake === true) clean.oneShotWake = true;
+  if (input.mergedPullRequestsOnly === true) clean.mergedPullRequestsOnly = true;
   return clean;
 }
 
@@ -306,7 +439,7 @@ function serializePayload(payload: JsonValue): string {
 }
 
 function previewPayload(payload: JsonValue): string {
-  return serializePayload(payload).replace(/\s+/g, " ").trim().slice(0, 2_000);
+  return serializePayload(payload).replace(/\s+/g, " ").trim().slice(0, 512);
 }
 
 function taskFromPayload(payload: JsonValue): string {
@@ -341,8 +474,46 @@ function scopePattern(source: string, flags: string): RegExp {
   return pattern;
 }
 
+/** The `labeled` action is the moment a required label lands, so a trigger
+ *  that asks for labels must receive it.  The built-in pre-filters below keep
+ *  routine churn and not-ready pull requests out of the bot, so a
+ *  label-driven trigger opts out of the ones that would drop that delivery. */
+function isLabelSignal(
+  trigger: { requiredLabels?: string[] },
+  action: string | undefined,
+): boolean {
+  return action === "labeled" && (trigger.requiredLabels?.length ?? 0) > 0;
+}
+
+/** Review bots whose GitHub login carries no `[bot]` suffix.  Lower case. */
+export const KNOWN_REVIEW_BOT_LOGINS: readonly string[] = [
+  "kody-ai",
+  "kodus-ai",
+  "coderabbitai",
+  "sentry-io",
+  "vercel",
+  "seer-by-sentry",
+];
+
+/** PR review and comment events that a bot account sends as review churn. */
+const UI_PASS_REVIEW_EVENTS = new Set([
+  "pull_request_review",
+  "pull_request_review_comment",
+  "pull_request_review_thread",
+  "issue_comment",
+]);
+
+/** A saved prompt that asks the bot to act on bot reviews keeps them. */
+const ASKS_FOR_BOT_REVIEWS = /\bkody\b|\bbot[\s-]+reviews?\b|\breview[\s-]+comments?\b/i;
+
+function isBotAccount(sender: Record<string, JsonValue> | undefined, login: string): boolean {
+  if (/\[bot\]$/i.test(login) || login === "github-actions") return true;
+  if (pickStr(sender, "type") === "Bot") return true;
+  return KNOWN_REVIEW_BOT_LOGINS.includes(login.toLowerCase());
+}
+
 export function shouldIgnoreWebhookEvent(
-  trigger: { prompt?: string; name?: string; eventTypes?: string[] },
+  trigger: { id?: string; prompt?: string; name?: string; eventTypes?: string[]; requiredLabels?: string[] },
   event: WebhookEvent,
 ): IngressIgnoreDecision {
   const payload = event.payload;
@@ -680,12 +851,12 @@ export function shouldIgnoreWebhookEvent(
   }
 
   // 2. GitHub Compile Gates Pre-Filter (only applies to verified GitHub payloads)
-  const isCompileGatesTrigger =
-    /\bcompile[\s-]*gates?\b/i.test(name) || /\b(?:own compile gates|bf-compiler)\b/i.test(prompt);
+  const isCompileGatesTrigger = isCompileGatesWake({ name, instructions: prompt, id: trigger.id });
   if (isCompileGatesTrigger && isGithubWebhookPayload(payload)) {
     const eventName = event.eventName;
     const root = asRecord(payload);
     const action = pickStr(root, "action");
+    const labelSignal = isLabelSignal(trigger, action);
 
     if (eventName === "workflow_run") {
       const workflowRun = asRecord(root?.workflow_run);
@@ -756,9 +927,7 @@ export function shouldIgnoreWebhookEvent(
         };
       }
     } else if (eventName === "pull_request") {
-      const pr = asRecord(root?.pull_request);
-      const isMerged = action === "closed" && (pr?.merged === true || pickStr(pr, "merged_at") !== undefined);
-      if (!isMerged) {
+      if (!isMergedPullRequestPayload(payload) && !labelSignal) {
         const desc = action === "closed" ? "unmerged closed" : `action '${action ?? "unknown"}'`;
         return {
           ignore: true,
@@ -779,6 +948,142 @@ export function shouldIgnoreWebhookEvent(
       return {
         ignore: true,
         reason: `GitHub event '${eventName ?? "unknown"}' ignored: compile gates wait for concluded failure or merged PR`,
+      };
+    }
+  }
+
+  // 3. GitHub Deployer / Merge Conflicts Pre-Filter (only applies to verified GitHub payloads)
+  const isDeployerTrigger =
+    /\b(?:merge[\s-]*conflicts?|bf-deployer)\b/i.test(name) ||
+    /\b(?:bf-deployer|land merge-ready prs|merges ready prs)\b/i.test(prompt);
+  if (isDeployerTrigger && isGithubWebhookPayload(payload)) {
+    const eventName = event.eventName;
+    const root = asRecord(payload);
+    const action = pickStr(root, "action");
+    const sender = asRecord(root?.sender);
+    const senderLogin = pickStr(sender, "login") ?? "";
+    // A trigger that requires labels is waiting for the label to land, so the
+    // `labeled` delivery itself is the signal it asked for.  The pre-filters
+    // below keep routine churn out; they must not swallow that one action.
+    const labelSignal = isLabelSignal(trigger, action);
+
+    // Issues: Deployer only handles direct user assignments, never routine bot churn or unassigned edits/closures
+    if (eventName === "issues") {
+      const isBotSender = /\[bot\]$/i.test(senderLogin) || senderLogin === "github-actions";
+      const isAssigned = action === "assigned";
+      if (isBotSender || (!isAssigned && !labelSignal)) {
+        return {
+          ignore: true,
+          reason: `GitHub issues action '${action ?? "unknown"}' from '${senderLogin || "unknown"}' ignored: Deployer only handles direct issue assignments, not routine issue metadata churn`,
+        };
+      }
+    }
+
+    // Pull requests: ignore draft PRs, closed unmerged PRs, or routine label/review metadata
+    if (eventName === "pull_request") {
+      const pr = asRecord(root?.pull_request);
+      const isDraft = pr?.draft === true;
+      if (isDraft && action !== "ready_for_review" && !labelSignal) {
+        return {
+          ignore: true,
+          reason: `GitHub draft pull_request action '${action ?? "unknown"}' ignored: Deployer waits for ready_for_review`,
+        };
+      }
+      if (action === "closed") {
+        const isMerged = pr?.merged === true || pickStr(pr, "merged_at") !== undefined;
+        if (!isMerged) {
+          return {
+            ignore: true,
+            reason: `GitHub pull_request closed unmerged ignored: Deployer waits for merge or open PR`,
+          };
+        }
+      }
+      if (
+        action === "unlabeled" ||
+        action === "review_requested" ||
+        action === "review_request_removed" ||
+        (action === "labeled" && !labelSignal)
+      ) {
+        return {
+          ignore: true,
+          reason: `GitHub pull_request metadata action '${action}' ignored: Deployer acts on lifecycle changes and check conclusions`,
+        };
+      }
+    }
+
+    // Workflow & Check runs: ignore in-progress or queued runs; wait for terminal completion
+    if (eventName === "workflow_run") {
+      const workflowRun = asRecord(root?.workflow_run);
+      const runStatus = pickStr(workflowRun, "status");
+      if (runStatus !== "completed") {
+        return {
+          ignore: true,
+          reason: `GitHub workflow_run status '${runStatus ?? "unknown"}' ignored: Deployer waits for completed conclusion`,
+        };
+      }
+    } else if (eventName === "check_run") {
+      const checkRun = asRecord(root?.check_run);
+      const checkStatus = pickStr(checkRun, "status");
+      if (checkStatus !== "completed") {
+        return {
+          ignore: true,
+          reason: `GitHub check_run status '${checkStatus ?? "unknown"}' ignored: Deployer waits for completed conclusion`,
+        };
+      }
+    } else if (eventName === "check_suite") {
+      const checkSuite = asRecord(root?.check_suite);
+      const suiteStatus = pickStr(checkSuite, "status");
+      if (suiteStatus !== "completed") {
+        return {
+          ignore: true,
+          reason: `GitHub check_suite status '${suiteStatus ?? "unknown"}' ignored: Deployer waits for completed conclusion`,
+        };
+      }
+    } else if (eventName === "workflow_job") {
+      const workflowJob = asRecord(root?.workflow_job);
+      const jobStatus = pickStr(workflowJob, "status");
+      if (jobStatus !== "completed") {
+        return {
+          ignore: true,
+          reason: `GitHub workflow_job status '${jobStatus ?? "unknown"}' ignored: Deployer waits for completed conclusion`,
+        };
+      }
+    }
+  }
+
+  // 4. GitHub UI Pass Pre-Filter: bot review churn (only applies to verified GitHub payloads)
+  // A UI pass judges code changes and human reviews.  Reviews and comments
+  // from bot accounts (Kody, Cursor, Actions) never change that verdict, and
+  // each one used to cost a full model turn.
+  if (
+    isGithubWebhookPayload(payload) &&
+    UI_PASS_REVIEW_EVENTS.has(event.eventName ?? "") &&
+    isUiPassWake({ id: trigger.id, name, instructions: prompt }) &&
+    !ASKS_FOR_BOT_REVIEWS.test(prompt)
+  ) {
+    const root = asRecord(payload);
+    const action = pickStr(root, "action");
+    const sender = asRecord(root?.sender);
+    const senderLogin = pickStr(sender, "login") ?? "";
+    if (!isLabelSignal(trigger, action) && isBotAccount(sender, senderLogin)) {
+      return {
+        ignore: true,
+        reason: `GitHub ${event.eventName} by bot '${senderLogin}' ignored: UI Pass reacts to human reviews and code changes, not bot review churn`,
+      };
+    }
+  }
+
+  // 5. Universal GitHub Ingress Guard: automated bot issue edits across any trigger
+  if (isGithubWebhookPayload(payload) && event.eventName === "issues") {
+    const root = asRecord(payload);
+    const action = pickStr(root, "action");
+    const sender = asRecord(root?.sender);
+    const senderLogin = pickStr(sender, "login") ?? "";
+    const isBotSender = /\[bot\]$/i.test(senderLogin) || senderLogin === "github-actions";
+    if (isBotSender && (action === "edited" || action === "closed") && !/\bgithub-actions\b/i.test(prompt)) {
+      return {
+        ignore: true,
+        reason: `GitHub issues action '${action}' by bot '${senderLogin}' ignored: automated metadata rollup`,
       };
     }
   }
@@ -807,7 +1112,7 @@ export function resolveWebhookBotId(
   trigger: { botId: string; name: string },
   payload: JsonValue,
   findBotIdByName?: (name: string) => string | undefined,
-  botState?: (botId: string) => "ready" | "busy" | "missing",
+  botState?: (botId: string) => BotDispatchState,
 ): { botId: string; skipConfiguredPrompt: boolean } {
   // Name is owner-configured, not attacker-controlled.  Do not reroute an
   // unrelated webhook just because its untrusted JSON mentioned fleet-infra.
@@ -863,6 +1168,363 @@ function eventPrompt(
   ].join("\n");
 }
 
+/** Why a delivery is not a merged pull request, or undefined when it is one.
+ *  The reason lands in the delivery log, so it says what arrived. */
+function notMergedPullRequestReason(event: WebhookEvent): string | undefined {
+  const scope = "this webhook runs only when a pull request is merged";
+  if (event.eventName !== "pull_request") {
+    return `Event '${(event.eventName ?? "unknown").slice(0, 80)}' ignored: ${scope}`;
+  }
+  if (isMergedPullRequestPayload(event.payload)) return undefined;
+  const action = pickStr(asRecord(event.payload), "action");
+  const what = action === "closed" ? "closed without merging" : `action '${(action ?? "unknown").slice(0, 80)}'`;
+  return `GitHub pull_request ${what} ignored: ${scope}`;
+}
+
+/** The per-trigger filters a delivery is checked against at ingress.  Every
+ *  one of them is optional: an absent filter accepts every delivery it
+ *  could otherwise judge, so a webhook without filters behaves exactly as it
+ *  did before. */
+export interface WebhookTriggerFilters {
+  actions?: string[];
+  requiredLabels?: string[];
+  conclusions?: string[];
+  defaultBranchOnly?: boolean;
+  minSentryLevel?: SentryLevel;
+  excludeSentryProjects?: string[];
+  pagerdutyUrgency?: PagerDutyUrgency;
+}
+
+/** Sentry levels, least to most severe. */
+const SENTRY_LEVEL_ORDER: SentryLevel[] = ["debug", "info", "warning", "error", "fatal"];
+
+/** The payload's action, read from the shapes the supported senders use:
+ *  GitHub and Sentry send a top-level `action`, PagerDuty v3 sends
+ *  `event.event_type`, and a sender with no event header at all (Congress.Trade
+ *  sends `{"event": "review_queue.entered"}`) sends a top-level `event` or
+ *  `type` string. */
+export function webhookAction(payload: JsonValue): string | undefined {
+  const root = asRecord(payload);
+  if (!root) return undefined;
+  const action = pickStr(root, "action");
+  if (action) return action;
+  const nested = asRecord(root.event);
+  const eventType = pickStr(nested, "event_type");
+  if (eventType) return eventType;
+  return pickStr(root, "event") ?? pickStr(root, "type");
+}
+
+/** Label names on a pull request or issue payload. */
+function webhookLabelNames(record: Record<string, JsonValue> | undefined): string[] {
+  const labels = record?.labels;
+  if (!Array.isArray(labels)) return [];
+  return labels
+    .map((label) => (typeof label === "string" ? label : pickStr(asRecord(label), "name")))
+    .filter((name): name is string => Boolean(name));
+}
+
+/** A GitHub delivery: the repository object, or one of the GitHub-only
+ *  payload objects.  Used where a filter says "GitHub only". */
+function isGithubEventPayload(payload: JsonValue): boolean {
+  if (isGithubWebhookPayload(payload)) return true;
+  const root = asRecord(payload);
+  if (!root) return false;
+  return Boolean(
+    root.pull_request ??
+      root.issue ??
+      root.check_run ??
+      root.check_suite ??
+      root.workflow_run ??
+      root.workflow_job,
+  );
+}
+
+/** The Sentry level of a delivery, and whether the payload carries a Sentry
+ *  issue or event structure at all. */
+interface SentryLevelReading {
+  level?: string;
+  isSentry: boolean;
+}
+
+/** A Sentry issue webhook carries the issue under `data`, so the shape is
+ *  checked as well as the provider marker: a payload without a level still
+ *  has to be judged. */
+function sentryLevelOf(payload: JsonValue): SentryLevelReading {
+  const root = asRecord(payload);
+  if (!root) return { isSentry: false };
+  const data = asRecord(root.data);
+  const issue = asRecord(data?.issue) ?? asRecord(root.issue);
+  const event = asRecord(data?.event) ?? asRecord(root.event);
+  const level = pickStr(issue, "level") ?? pickStr(event, "level") ?? pickStr(root, "level");
+  return { level, isSentry: isSentryWebhookPayload(payload) };
+}
+
+/** The head branch a GitHub delivery belongs to, for the event kinds the
+ *  default-branch filter reads. */
+function githubHeadBranch(root: Record<string, JsonValue>): string | undefined {
+  const pullRequest = asRecord(root.pull_request);
+  if (pullRequest) return pickStr(asRecord(pullRequest.base), "ref");
+  const workflowRun = asRecord(root.workflow_run);
+  if (workflowRun) return pickStr(workflowRun, "head_branch");
+  const checkSuite = asRecord(root.check_suite);
+  if (checkSuite) return pickStr(checkSuite, "head_branch");
+  const checkRun = asRecord(root.check_run);
+  if (checkRun) return pickStr(asRecord(checkRun.check_suite), "head_branch");
+  const ref = pickStr(root, "ref");
+  if (ref) return ref.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : ref;
+  return undefined;
+}
+
+/** The run object a conclusion filter reads, and the event kind it came from. */
+function githubRunObject(root: Record<string, JsonValue>): Record<string, JsonValue> | undefined {
+  return (
+    asRecord(root.workflow_run) ??
+    asRecord(root.check_run) ??
+    asRecord(root.check_suite) ??
+    asRecord(root.workflow_job) ??
+    undefined
+  );
+}
+
+/** How long a handled GitHub PR state blocks a repeat classify wake.  Six
+ *  hours covers a redelivery burst for one head without hiding a later
+ *  re-check of the same head. */
+export const PR_STATE_DEDUPE_MS = 6 * 60 * 60 * 1000;
+
+interface GithubPrStateParts {
+  repo: string;
+  prNumber: number;
+  headSha: string;
+  eventName: string;
+  action: string;
+  key: string;
+}
+
+const prNumberSchema = z.number().int().positive();
+const githubIdSchema = z.union([z.number().finite(), z.string().min(1)]);
+
+function pickNumberField(record: Record<string, JsonValue> | undefined, key: string): number | undefined {
+  const parsed = prNumberSchema.safeParse(record?.[key]);
+  return parsed.success ? parsed.data : undefined;
+}
+
+function pickIdField(record: Record<string, JsonValue> | undefined, key: string): string | undefined {
+  const parsed = githubIdSchema.safeParse(record?.[key]);
+  return parsed.success ? String(parsed.data) : undefined;
+}
+
+function githubPrStateParts(event: WebhookEvent): GithubPrStateParts | undefined {
+  if (!isGithubWebhookPayload(event.payload)) return undefined;
+  const root = asRecord(event.payload);
+  if (!root) return undefined;
+  const repo = pickStr(asRecord(root.repository), "full_name");
+  if (!repo) return undefined;
+  const pullRequest = asRecord(root.pull_request);
+  let prNumber = pickNumberField(pullRequest, "number");
+  if (prNumber === undefined) {
+    const issue = asRecord(root.issue);
+    if (issue && issue.pull_request !== undefined && issue.pull_request !== null) {
+      prNumber = pickNumberField(issue, "number");
+    }
+  }
+  if (prNumber === undefined) {
+    for (const containerName of ["check_run", "check_suite", "workflow_run"] as const) {
+      const container = asRecord(root[containerName]);
+      const pulls = container?.pull_requests;
+      if (!Array.isArray(pulls) || pulls.length === 0) continue;
+      prNumber = pickNumberField(asRecord(pulls[0]), "number");
+      if (prNumber !== undefined) break;
+    }
+  }
+  if (prNumber === undefined) return undefined;
+  const headSha =
+    pickStr(asRecord(pullRequest?.head), "sha") ??
+    pickStr(asRecord(root.check_run), "head_sha") ??
+    pickStr(asRecord(root.check_suite), "head_sha") ??
+    pickStr(asRecord(root.workflow_run), "head_sha");
+  if (!headSha) return undefined;
+  const eventName = event.eventName ?? "";
+  const action = pickStr(root, "action") ?? "";
+  const parts: string[] = [repo, String(prNumber), headSha, eventName, action];
+  if (eventName === "check_run" || eventName === "check_suite" || eventName === "workflow_run") {
+    parts.push(pickStr(asRecord(root[eventName]), "conclusion") ?? "");
+  }
+  if (eventName === "pull_request_review") {
+    parts.push(`review:${pickIdField(asRecord(root.review), "id") ?? ""}`);
+  }
+  if (eventName === "issue_comment" || eventName === "pull_request_review_comment") {
+    parts.push(`comment:${pickIdField(asRecord(root.comment), "id") ?? ""}`);
+  }
+  return { repo, prNumber, headSha, eventName, action, key: parts.join("|") };
+}
+
+/** A stable key for one GitHub PR state, or undefined when the payload
+ *  does not carry a repo, a PR number and a head SHA.  Each human review
+ *  or comment keeps its own id in the key, so new human input is never
+ *  collapsed. */
+export function githubPrStateKey(event: WebhookEvent): string | undefined {
+  return githubPrStateParts(event)?.key;
+}
+
+/** A stable key for one GitHub head SHA state that does not require a pull
+ *  request number.  Compile gates mostly see default-branch `workflow_run`
+ *  failures, which often carry no `pull_requests` array, so the PR-state key
+ *  never arms for them. */
+export function githubHeadStateKey(event: WebhookEvent): string | undefined {
+  if (!isGithubWebhookPayload(event.payload)) return undefined;
+  const root = asRecord(event.payload);
+  if (!root) return undefined;
+  const repo = pickStr(asRecord(root.repository), "full_name");
+  if (!repo) return undefined;
+  const pullRequest = asRecord(root.pull_request);
+  const headSha =
+    pickStr(asRecord(pullRequest?.head), "sha") ??
+    pickStr(asRecord(root.check_run), "head_sha") ??
+    pickStr(asRecord(root.check_suite), "head_sha") ??
+    pickStr(asRecord(root.workflow_run), "head_sha") ??
+    pickStr(root, "sha");
+  if (!headSha) return undefined;
+  const eventName = event.eventName ?? "";
+  const action = pickStr(root, "action") ?? "";
+  const parts: string[] = [`head`, repo, headSha, eventName, action];
+  if (eventName === "check_run" || eventName === "check_suite" || eventName === "workflow_run") {
+    parts.push(pickStr(asRecord(root[eventName]), "conclusion") ?? "");
+  }
+  return parts.join("|");
+}
+
+/** Which GitHub state key, if any, this trigger uses for ingress dedupe. */
+export function webhookGithubStateDedupeKey(
+  trigger: { name: string; prompt: string; id?: string },
+  event: WebhookEvent,
+): { key: string; kind: "pr" | "head" } | undefined {
+  const meta = { name: trigger.name, instructions: trigger.prompt, id: trigger.id };
+  if (isClassifyOrUiPassWake(meta)) {
+    const key = githubPrStateKey(event);
+    return key ? { key, kind: "pr" } : undefined;
+  }
+  if (isCompileGatesWake(meta)) {
+    const key = githubHeadStateKey(event);
+    return key ? { key, kind: "head" } : undefined;
+  }
+  return undefined;
+}
+
+/** The one decision every per-trigger filter makes, in one pure function so
+ *  it can be tested without a delivery.  A filter that is not set never
+ *  ignores anything. */
+export function triggerFilterDecision(
+  trigger: WebhookTriggerFilters,
+  event: WebhookEvent,
+): IngressIgnoreDecision {
+  const payload = event.payload;
+  const root = asRecord(payload) ?? {};
+  const isGithub = isGithubEventPayload(payload);
+
+  // 1. Action allowlist.  The action is read per sender, so a GitHub
+  //    `synchronize` and a PagerDuty `incident.triggered` are compared the
+  //    same way.
+  if (trigger.actions?.length) {
+    const action = webhookAction(payload);
+    if (!action) return { ignore: true, reason: "Action is missing" };
+    if (!trigger.actions.some((allowed) => allowed.toLowerCase() === action.toLowerCase())) {
+      return { ignore: true, reason: `Action “${action}” is not enabled` };
+    }
+  }
+
+  // 2. Required GitHub labels.  Only a pull request or issue can carry them.
+  if (trigger.requiredLabels?.length) {
+    if (!isGithub) {
+      return { ignore: true, reason: "Required labels apply to GitHub pull requests and issues only" };
+    }
+    const pullRequest = asRecord(root.pull_request);
+    const issue = asRecord(root.issue);
+    if (!pullRequest && !issue) {
+      return { ignore: true, reason: "Delivery carries no pull request or issue to check labels on" };
+    }
+    const names = webhookLabelNames(pullRequest ?? issue).map((name) => name.toLowerCase());
+    const matched = trigger.requiredLabels.some((label) => names.includes(label.toLowerCase()));
+    if (!matched) {
+      return {
+        ignore: true,
+        reason: `No required label (${trigger.requiredLabels.join(", ")})`,
+      };
+    }
+  }
+
+  // 3. GitHub conclusions.  Only the run-bearing event kinds carry one; any
+  //    other event is unaffected by this filter.
+  if (trigger.conclusions?.length) {
+    const run = githubRunObject(root);
+    if (run) {
+      const status = pickStr(run, "status");
+      if (status !== "completed") {
+        return { ignore: true, reason: `Run status “${status ?? "unknown"}” is not completed` };
+      }
+      const conclusion = pickStr(run, "conclusion");
+      if (!conclusion || !trigger.conclusions.some((allowed) => allowed.toLowerCase() === conclusion.toLowerCase())) {
+        return { ignore: true, reason: `Conclusion “${conclusion ?? "unknown"}” is not enabled` };
+      }
+    }
+  }
+
+  // 4. Default branch only.  GitHub event kinds that carry a branch are
+  //    checked; the data must be present to prove the delivery is on the
+  //    default branch.
+  if (trigger.defaultBranchOnly && isGithub) {
+    const defaultBranch = pickStr(asRecord(root.repository), "default_branch");
+    const branch = githubHeadBranch(root);
+    if (!defaultBranch) return { ignore: true, reason: "Repository default branch is unknown" };
+    if (!branch) return { ignore: true, reason: "Delivery carries no branch to check" };
+    if (branch !== defaultBranch) {
+      return { ignore: true, reason: `Not the default branch (${branch})` };
+    }
+  }
+
+  // 5. Sentry minimum level.  Only verified Sentry payloads are judged; GitHub
+  //    issues and other senders can carry issue/event shapes without hitting
+  //    this filter.
+  if (trigger.minSentryLevel && isSentryWebhookPayload(payload)) {
+    const { level } = sentryLevelOf(payload);
+    if (level) {
+      const rank = SENTRY_LEVEL_ORDER.findIndex((known) => known === level.toLowerCase());
+      const floor = SENTRY_LEVEL_ORDER.indexOf(trigger.minSentryLevel);
+      if (rank < 0) return { ignore: true, reason: `Sentry level “${level}” is unknown` };
+      if (rank < floor) {
+        return { ignore: true, reason: `Sentry level “${level}” is below ${trigger.minSentryLevel}` };
+      }
+    } else {
+      return { ignore: true, reason: "Sentry level is missing" };
+    }
+  }
+
+  // 6. Excluded Sentry projects.  This runs before the fleet-infra reroute,
+  //    so an excluded project never reaches the bot it would have been
+  //    rerouted to.
+  if (trigger.excludeSentryProjects?.length) {
+    const project = sentryProjectSlug(payload);
+    if (project && trigger.excludeSentryProjects.some((slug) => slug.toLowerCase() === project.toLowerCase())) {
+      return { ignore: true, reason: `Sentry project “${project}” is excluded` };
+    }
+  }
+
+  // 7. PagerDuty urgency.  A generic top-level `event` field must not be
+  //    treated as PagerDuty.
+  if (trigger.pagerdutyUrgency && isPagerDutyWebhookPayload(payload)) {
+    const eventData = asRecord(asRecord(root.event)?.data);
+    const urgency = pickStr(eventData, "urgency") ?? pickStr(asRecord(eventData?.incident), "urgency");
+    if (urgency) {
+      if (urgency.toLowerCase() !== trigger.pagerdutyUrgency.toLowerCase()) {
+        return { ignore: true, reason: `PagerDuty urgency “${urgency}” is not ${trigger.pagerdutyUrgency}` };
+      }
+    } else {
+      return { ignore: true, reason: "PagerDuty urgency is missing" };
+    }
+  }
+
+  return { ignore: false };
+}
+
 export class WebhookManager {
   private readonly file: string;
   private readonly now: () => number;
@@ -872,6 +1534,9 @@ export class WebhookManager {
   private attempts: WebhookAttempt[] = [];
   private rate = new Map<string, number[]>();
   private recentIgnored = new Map<string, number[]>();
+  private recentRejected = new Map<string, number[]>();
+  private saveTimer: ReturnType<typeof setTimeout> | null = null;
+  private dirty = false;
 
   constructor(options: WebhookManagerOptions) {
     this.options = options;
@@ -916,7 +1581,17 @@ export class WebhookManager {
       deliveryCount: 0,
     };
     this.webhooks.unshift(trigger);
-    this.save();
+    // The caller is about to receive the only copy of this secret, so its
+    // hash must be on disk before we return — a crash inside a debounce
+    // window would otherwise hand out a secret no restarted harness accepts.
+    // If the write fails, undo the insert so memory never runs ahead of disk.
+    try {
+      this.saveNow();
+    } catch (error) {
+      const at = this.webhooks.indexOf(trigger);
+      if (at !== -1) this.webhooks.splice(at, 1);
+      throw error;
+    }
     this.emit(trigger);
     return { webhook: publicTrigger(trigger), secret };
   }
@@ -933,12 +1608,30 @@ export class WebhookManager {
       enabled: patch.enabled ?? trigger.enabled,
       verificationPending: patch.verificationPending ?? trigger.verificationPending,
       eventTypes: patch.eventTypes ?? trigger.eventTypes,
+      actions: patch.actions ?? trigger.actions,
+      requiredLabels: patch.requiredLabels ?? trigger.requiredLabels,
+      conclusions: patch.conclusions ?? trigger.conclusions,
+      defaultBranchOnly: patch.defaultBranchOnly ?? trigger.defaultBranchOnly,
+      minSentryLevel: patch.minSentryLevel === undefined ? trigger.minSentryLevel : patch.minSentryLevel,
+      excludeSentryProjects: patch.excludeSentryProjects ?? trigger.excludeSentryProjects,
+      pagerdutyUrgency: patch.pagerdutyUrgency === undefined ? trigger.pagerdutyUrgency : patch.pagerdutyUrgency,
+      mergedPullRequestsOnly: patch.mergedPullRequestsOnly ?? trigger.mergedPullRequestsOnly,
       minGapMinutes: patch.minGapMinutes ?? trigger.minGapMinutes,
+      oneShotWake: patch.oneShotWake ?? trigger.oneShotWake,
     });
     if (this.options.botState(clean.botId) === "missing") fail(400, "That Bot no longer exists");
     Object.assign(trigger, clean, { updatedAt: this.now() });
     if (!clean.eventTypes?.length) delete trigger.eventTypes;
+    if (!clean.actions?.length) delete trigger.actions;
+    if (!clean.requiredLabels?.length) delete trigger.requiredLabels;
+    if (!clean.conclusions?.length) delete trigger.conclusions;
+    if (!clean.defaultBranchOnly) delete trigger.defaultBranchOnly;
+    if (!clean.minSentryLevel) delete trigger.minSentryLevel;
+    if (!clean.excludeSentryProjects?.length) delete trigger.excludeSentryProjects;
+    if (!clean.pagerdutyUrgency) delete trigger.pagerdutyUrgency;
     if (!clean.minGapMinutes) delete trigger.minGapMinutes;
+    if (!clean.oneShotWake) delete trigger.oneShotWake;
+    if (!clean.mergedPullRequestsOnly) delete trigger.mergedPullRequestsOnly;
     if (patch.enabled === false) {
       this.options.cancelQueued?.(trigger.id, "The webhook was paused before this delivery started");
     }
@@ -955,6 +1648,7 @@ export class WebhookManager {
     this.attempts = this.attempts.filter((attempt) => attempt.webhookId !== trigger.id);
     this.rate.delete(trigger.endpointId);
     this.recentIgnored.delete(trigger.id);
+    this.recentRejected.delete(trigger.id);
     this.options.cancelQueued?.(trigger.id, "The webhook was deleted before this delivery started");
     this.save();
     this.options.emit?.({ kind: "webhook.deleted", webhookId: id });
@@ -965,9 +1659,19 @@ export class WebhookManager {
     const trigger = this.webhooks.find((candidate) => candidate.id === id);
     if (!trigger) return null;
     const secret = newSecret();
+    const previous = { secretHash: trigger.secretHash, updatedAt: trigger.updatedAt };
     trigger.secretHash = hashSecret(secret);
     trigger.updatedAt = this.now();
-    this.save();
+    // Same contract as create(): the new hash is durable before the secret is
+    // returned, so a crash cannot leave the rotated-out secret valid on disk
+    // after the caller was told it was replaced.  A failed write restores the
+    // old hash and throws instead of returning a secret that never landed.
+    try {
+      this.saveNow();
+    } catch (error) {
+      Object.assign(trigger, previous);
+      throw error;
+    }
     this.emit(trigger);
     return { webhook: publicTrigger(trigger), secret };
   }
@@ -1023,6 +1727,41 @@ export class WebhookManager {
     return this.recordRejectedForTrigger(trigger, statusCode, reason, event);
   }
 
+  isEventIgnoredAtEdge(endpointId: string, eventName?: string): boolean {
+    const trigger = this.webhooks.find((candidate) => candidate.endpointId === endpointId);
+    if (!trigger || trigger.enabled === false) return false;
+    const allowed = trigger.eventTypes ?? [];
+    if (allowed.length > 0 && (!eventName || !allowed.includes(eventName))) {
+      return true;
+    }
+    return false;
+  }
+
+  recordIgnoredAtEdge(
+    endpointId: string,
+    meta: { eventName?: string; contentType?: string; deliveryId?: string },
+  ): WebhookReceiveResult {
+    const trigger = this.webhooks.find((candidate) => candidate.endpointId === endpointId);
+    const deliveryId = meta.deliveryId || randomUUID();
+    const reason = meta.eventName
+      ? `Event type “${meta.eventName}” is not enabled`
+      : "Event type is missing";
+    if (trigger) {
+      this.recordIgnoredAttempt(
+        trigger,
+        {
+          payload: {},
+          contentType: meta.contentType ?? "text/plain",
+          eventName: meta.eventName,
+          deliveryId,
+        },
+        deliveryId,
+        reason,
+      );
+    }
+    return { deliveryId, duplicate: false, ignored: true };
+  }
+
   private dispatch(trigger: StoredWebhookTrigger, event: WebhookEvent): WebhookReceiveResult {
     if (!trigger.enabled) fail(409, "This webhook is paused");
     if (this.options.botState(trigger.botId) === "missing") fail(410, "The assigned Bot no longer exists");
@@ -1056,12 +1795,43 @@ export class WebhookManager {
       return { deliveryId, duplicate: false, ignored: true };
     }
 
+    if (trigger.mergedPullRequestsOnly) {
+      const reason = notMergedPullRequestReason(event);
+      if (reason) {
+        const deliveryId = requestedDeliveryId || randomUUID();
+        this.recordIgnoredAttempt(trigger, event, deliveryId, reason);
+        return { deliveryId, duplicate: false, ignored: true };
+      }
+    }
+
+    const filterDecision = triggerFilterDecision(trigger, event);
+    if (filterDecision.ignore) {
+      const deliveryId = requestedDeliveryId || randomUUID();
+      this.recordIgnoredAttempt(
+        trigger,
+        event,
+        deliveryId,
+        filterDecision.reason ?? "Ignored by trigger filter",
+      );
+      return { deliveryId, duplicate: false, ignored: true };
+    }
+
     const route = resolveWebhookBotId(
       trigger,
       event.payload,
       this.options.findBotIdByName,
       this.options.botState,
     );
+
+    // An Off bot starts no work from any source, so a webhook delivery for
+    // one is recorded as ignored rather than queued as a run that would be
+    // cancelled a moment later.  The check is on the bot the delivery
+    // actually routes to, after the fleet-infra reroute.
+    if (this.options.botState(route.botId) === "off") {
+      const deliveryId = requestedDeliveryId || randomUUID();
+      this.recordIgnoredAttempt(trigger, event, deliveryId, "Bot is Off");
+      return { deliveryId, duplicate: false, ignored: true };
+    }
 
     if (!route.skipConfiguredPrompt) {
       const ignoreDecision = shouldIgnoreWebhookEvent(trigger, event);
@@ -1079,10 +1849,43 @@ export class WebhookManager {
 
     const now = this.now();
 
+    // A classify/UI-pass or Compile gates wake for a GitHub state already
+    // handled in the window is ignored here, before rate limiting.  Other
+    // triggers still run for every delivery.
+    const stateDedupe = webhookGithubStateDedupeKey(trigger, event);
+    const prStateKey = stateDedupe?.key;
+    if (prStateKey && stateDedupe) {
+      const prior = this.deliveries.find(
+        (delivery) =>
+          delivery.key.startsWith(`${trigger.endpointId}:`) &&
+          delivery.stateKey === prStateKey &&
+          now - delivery.at < PR_STATE_DEDUPE_MS &&
+          !UNHANDLED_RUN_STATUSES.has(this.options.runStatus?.(delivery.runId) ?? ""),
+      );
+      if (prior) {
+        const deliveryId = requestedDeliveryId || randomUUID();
+        const reason =
+          stateDedupe.kind === "head"
+            ? (() => {
+                const [, repo, headSha, eventName, action] = prStateKey.split("|");
+                return `GitHub head state already handled: ${eventName || "unknown"} ${action || "unknown"} on ${repo} at ${(headSha ?? "").slice(0, 7)} (run ${prior.runId})`;
+              })()
+            : (() => {
+                const [repo, prNumber, headSha, eventName, action] = prStateKey.split("|");
+                return `GitHub PR state already handled: ${eventName || "unknown"} ${action || "unknown"} on ${repo}#${prNumber} at ${(headSha ?? "").slice(0, 7)} (run ${prior.runId})`;
+              })();
+        this.recordIgnoredAttempt(trigger, event, deliveryId, reason);
+        return { deliveryId, duplicate: false, ignored: true };
+      }
+    }
+
     // A sender retrying an already-accepted delivery must remain idempotent
     // even while this webhook's queue is full. Only new work consumes a slot.
     if ((this.options.pendingRuns?.(trigger.id) ?? 0) >= MAX_PENDING_RUNS) {
-      fail(429, "This webhook already has too many unfinished tasks");
+      const canCoalesce = this.options.canCoalesce?.(trigger.id, route.botId) ?? false;
+      if (!canCoalesce) {
+        fail(429, "This webhook already has too many unfinished tasks");
+      }
     }
 
     const recent = (this.rate.get(trigger.endpointId) ?? []).filter((at) => now - at < RATE_WINDOW_MS);
@@ -1102,7 +1905,12 @@ export class WebhookManager {
       deliveryId,
       receivedAt: now,
     });
-    this.deliveries.push({ key: `${trigger.endpointId}:${deliveryId}`, runId: run.id, at: now });
+    // Only classify/UI-pass and Compile gates wakes store a stateKey.  A
+    // cancelled run did not handle the state, so it stores none either.  A
+    // later delivery for the same state can still run.
+    const receipt: DeliveryReceipt = { key: `${trigger.endpointId}:${deliveryId}`, runId: run.id, at: now };
+    if (prStateKey && run.status !== "cancelled") receipt.stateKey = prStateKey;
+    this.deliveries.push(receipt);
     if (this.deliveries.length > MAX_DELIVERIES) {
       this.deliveries.splice(0, this.deliveries.length - MAX_DELIVERIES);
     }
@@ -1110,13 +1918,24 @@ export class WebhookManager {
     trigger.lastRunId = run.id;
     trigger.deliveryCount += 1;
     trigger.updatedAt = now;
+    // A delivery skipped because the bot is off or snoozed comes back as an
+    // unpersisted cancelled receipt.  Record it as ignored with its reason so
+    // the activity log does not claim it was accepted.
+    const skipped = run.status === "cancelled";
     this.appendAttempt(trigger, event, {
-      outcome: "accepted",
+      outcome: skipped ? "ignored" : "accepted",
       statusCode: 202,
       deliveryId,
       runId: run.id,
+      reason: skipped ? run.error : undefined,
     });
-    this.save();
+    // This just added a new entry to `this.deliveries` — the record that
+    // makes a retried delivery idempotent. It must be durable before the
+    // HTTP 202 is returned, or a restart between accepting this delivery and
+    // a debounced flush would forget it, and the sender's retry would be
+    // treated as new.  create() and rotateSecret() make the same exception
+    // for newly issued secrets; every other save() here can coalesce.
+    this.saveNow();
     this.emit(trigger);
     return { runId: run.id, deliveryId, duplicate: false };
   }
@@ -1146,7 +1965,23 @@ export class WebhookManager {
     return { deliveryId, duplicate: false, captured: true };
   }
 
-  private recordRejectedForTrigger(trigger: StoredWebhookTrigger, statusCode: number, reason: string, event: Partial<WebhookEvent>): WebhookAttempt {
+  private recordRejectedForTrigger(trigger: StoredWebhookTrigger, statusCode: number, reason: string, event: Partial<WebhookEvent>): WebhookAttempt | null {
+    // A rejection is an UNAUTHENTICATED caller writing to this trigger's log.
+    // Without a window, anyone who can reach the receiver can flush the
+    // 500-row cap with bad secrets and erase the delivery history the owner
+    // is trying to read.  Throttle the row exactly as ignored attempts are
+    // throttled, and say so in the reason so the operator can tell a
+    // suppressed row from a missing one.
+    const now = this.now();
+    const recent = (this.recentRejected.get(trigger.id) ?? []).filter(
+      (at) => now - at < REJECTED_ATTEMPTS_WINDOW_MS,
+    );
+    if (recent.length >= MAX_REJECTED_ATTEMPTS_PER_WINDOW) {
+      this.recentRejected.set(trigger.id, recent);
+      return null;
+    }
+    recent.push(now);
+    this.recentRejected.set(trigger.id, recent);
     const attempt = this.appendAttempt(trigger, event, {
       outcome: "rejected",
       statusCode,
@@ -1164,6 +1999,11 @@ export class WebhookManager {
     reason: string,
   ): void {
     const now = this.now();
+    // Counted before the log throttle below, so a flood that mostly never
+    // reaches the log still shows here.  No save(): the new value goes out
+    // with the next write, which keeps a filtered flood off the disk.
+    trigger.ignoredCount = (trigger.ignoredCount ?? 0) + 1;
+    trigger.lastIgnoredAt = now;
     const recent = (this.recentIgnored.get(trigger.id) ?? []).filter(
       (at) => now - at < IGNORED_ATTEMPTS_WINDOW_MS,
     );
@@ -1199,7 +2039,11 @@ export class WebhookManager {
     if (details.reason) attempt.reason = details.reason;
     this.attempts.push(attempt);
     if (this.attempts.length > MAX_ATTEMPTS) this.attempts.splice(0, this.attempts.length - MAX_ATTEMPTS);
-    this.options.emit?.({ kind: "webhook.attempt", attempt: { ...attempt } });
+    this.options.emit?.({
+      kind: "webhook.attempt",
+      attempt: { ...attempt },
+      requestMetadata: { ...extractRequestMetadata(event) },
+    });
     return attempt;
   }
 
@@ -1207,12 +2051,53 @@ export class WebhookManager {
     this.options.emit?.({ kind: "webhook", webhook: publicTrigger(trigger) });
   }
 
+  /** Coalesces bursts of save() calls — a push storm was one full
+   * serialize-fsync-rename per event on the request path — into one write.
+   * See flushNow() for the durability exception on the receive path. */
   private save(): void {
+    this.dirty = true;
+    if (this.saveTimer) return;
+    this.saveTimer = setTimeout(() => this.flushFromTimer(), SAVE_DEBOUNCE_MS);
+    this.saveTimer.unref?.();
+  }
+
+  /** Mark dirty and write through now.  For the few mutations that must be
+   * durable before the call returns; throws if the write fails. */
+  private saveNow(): void {
+    this.dirty = true;
+    this.flushNow();
+  }
+
+  /** The debounce timer's flush.  A throw here would be an uncaught exception
+   * in a timer callback, so a failed write is logged instead; `dirty` stays
+   * set, and the next save() or the shutdown flush retries the whole file. */
+  private flushFromTimer(): void {
+    this.saveTimer = null;
+    try {
+      this.flushNow();
+    } catch (error) {
+      console.error("webhooks: debounced save failed; the next save or shutdown retries it", error);
+    }
+  }
+
+  /** Synchronous, immediate write-through — used by the receive path for the
+   * new-delivery record (see dispatch()), by tests asserting on-disk state
+   * right after a mutation, and by the shutdown path so a pending coalesced
+   * save is never lost when the process exits. A no-op when nothing is
+   * dirty.  `dirty` is cleared only after the write succeeds, so a failed
+   * write throws with the pending mutation still marked for the next try. */
+  flushNow(): void {
+    if (this.saveTimer) {
+      clearTimeout(this.saveTimer);
+      this.saveTimer = null;
+    }
+    if (!this.dirty) return;
     mkdirSync(dirname(this.file), { recursive: true });
     writeFileAtomic(
       this.file,
-      JSON.stringify({ version: 1, webhooks: this.webhooks, deliveries: this.deliveries, attempts: this.attempts } satisfies WebhookFile, null, 2),
+      JSON.stringify({ version: 1, webhooks: this.webhooks, deliveries: this.deliveries, attempts: this.attempts } satisfies WebhookFile),
       { mode: 0o600 },
     );
+    this.dirty = false;
   }
 }

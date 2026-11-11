@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { z } from "zod";
 import {
   CalendarClock,
   CalendarDays,
@@ -6,6 +7,7 @@ import {
   ChevronLeft,
   ChevronRight,
   CircleAlert,
+  PauseCircle,
   Cloud,
   ExternalLink,
   Gauge,
@@ -21,27 +23,44 @@ import {
 
 import { BotAvatar } from "@/components/Avatar";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { MiniMonth } from "@/components/routines/MiniMonth";
 import { stateForBot } from "@/lib/mascot";
 import { WebhooksPanel } from "@/components/WebhooksPanel";
 import { ResourceTriggersPanel } from "@/components/ResourceTriggersPanel";
 import { cn } from "@/lib/cn";
+import { convertSlackReferenceToZulip, hasSlackReference } from "@/lib/collaboration-copy-audit";
 import { BOT_COLORS, type BotState } from "@/lib/mascot";
-import type { Routine, RoutineInput, RoutineRunOn, RoutineRunStatus } from "@/lib/routines";
+import {
+  attentionRuns,
+  attentionSettledAt,
+  attentionSourcesTooltip,
+  attentionTriggerLabel,
+  attentionWindowLabel,
+  relativeRunTime,
+  summarizeAttention,
+  type AttentionSummary,
+} from "@/lib/routine-attention";
+import { useNow } from "@/lib/use-now";
+import type { Routine, RoutineInput, RoutineRun, RoutineRunOn, RoutineRunStatus, RoutineSchedule } from "@/lib/routines";
+import type { WebhookTrigger } from "@/lib/webhooks";
 import {
   CENTRAL_TIME_ZONE,
   DAY_NAMES,
   calendarDayLabel,
   calendarMinuteOfDay,
   editedDailySchedule,
+  groupOverlappingCalendarItems,
   niceCalendarDate,
   niceCalendarTime,
   projectedRoutineItems,
   routineScheduleLabel,
   timeZoneLabel,
   type CalendarItem,
+  type CalendarItemGroup,
 } from "@/lib/routine-calendar";
 import { api, useStore, type Bot } from "@/state/store";
 import { routineOutcomeCode, routineOutcomeSummary, ROUTINE_OUTCOME_LABELS } from "../../shared/routine-outcomes";
+import { useDesktopCapabilities } from "./DesktopCapabilities";
 import {
   addDaysInTimeZone,
   epochFromInputDateTime,
@@ -51,6 +70,49 @@ import {
   startOfDayInTimeZone,
   startOfWeekInTimeZone,
 } from "../../shared/time-zone";
+
+const routineScheduleResponse = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("once"), at: z.number() }).strict(),
+  z.object({ type: z.literal("daily"), time: z.string(), weekdays: z.array(z.number()), timeZone: z.string().optional() }).strict(),
+]);
+// Mirrors server/tool-policy.ts's allowlist.  The routine object is strict, so
+// a command allowlist has to be named here or a successful PATCH of a routine
+// that has one throws and the panel shows a schema trace.
+const routineToolPolicyResponse = z.object({
+  mode: z.literal("allowlist"),
+  commands: z.array(z.object({
+    argv0: z.string(),
+    sub: z.array(z.string()).optional(),
+    flags: z.record(z.string(), z.object({ value: z.string() }).catchall(z.unknown())).optional(),
+    args: z.array(z.object({ value: z.string() }).catchall(z.unknown())).optional(),
+    positionals: z.number().optional(),
+  }).strict()),
+  writePaths: z.array(z.string()),
+  readPaths: z.array(z.string()),
+}).strict();
+const routineResponse = z.object({
+  routine: z.object({
+    id: z.string(), name: z.string(), prompt: z.string(), botId: z.string(),
+    runOn: z.enum(["bot", "cloud"]), enabled: z.boolean(), schedule: routineScheduleResponse,
+    scheduleTimeZoneSource: z.enum(["stored", "host"]).optional(), durationMinutes: z.number(),
+    oneShotWake: z.boolean().optional(), toolPolicy: routineToolPolicyResponse.optional(),
+    nextRunAt: z.number().nullable(), createdAt: z.number(), updatedAt: z.number(),
+  }).strict(),
+}).strict();
+const webhookResponse = z.object({
+  webhook: z.object({
+    id: z.string(), endpointId: z.string(), name: z.string(), prompt: z.string(), botId: z.string(),
+    runOn: z.enum(["bot", "cloud"]), enabled: z.boolean(), createdAt: z.number(), updatedAt: z.number(),
+    lastReceivedAt: z.number().optional(), lastRunId: z.string().optional(), deliveryCount: z.number(),
+    verificationPending: z.boolean().optional(), verifiedAt: z.number().optional(),
+    verificationSample: z.object({ receivedAt: z.number(), eventName: z.string().optional(), contentType: z.string().optional(), preview: z.string() }).strict().optional(),
+    eventTypes: z.array(z.string()).optional(), minGapMinutes: z.number().optional(), oneShotWake: z.boolean().optional(),
+    actions: z.array(z.string()).optional(), requiredLabels: z.array(z.string()).optional(), conclusions: z.array(z.string()).optional(),
+    defaultBranchOnly: z.boolean().optional(), minSentryLevel: z.enum(["debug", "info", "warning", "error", "fatal"]).optional(),
+    excludeSentryProjects: z.array(z.string()).optional(), pagerdutyUrgency: z.enum(["high", "low"]).optional(),
+    mergedPullRequestsOnly: z.boolean().optional(), ignoredCount: z.number().optional(), lastIgnoredAt: z.number().optional(),
+  }).strict(),
+}).strict();
 
 const HOUR_HEIGHT = 68;
 
@@ -182,7 +244,157 @@ function RoutineCard({ item, bot, compact, onOpen }: { item: CalendarItem; bot: 
   );
 }
 
-function CalendarGrid({
+function itemTitle(item: CalendarItem) {
+  return item.routine?.name ?? item.run?.routineName ?? "Routine";
+}
+
+function itemBot(item: CalendarItem, bots: Bot[]) {
+  return bots.find((candidate) => candidate.id === (item.routine?.botId ?? item.run?.botId));
+}
+
+function RoutineStackCard({ group, bots, onOpen }: { group: CalendarItemGroup; bots: Bot[]; onOpen: () => void }) {
+  const visible = group.items.slice(0, 2);
+  const failed = group.items.filter((item) => item.run?.status === "failed" || item.run?.status === "missed").length;
+  const colors = [...new Set(group.items.map((item) => itemBot(item, bots)).filter(Boolean).map((bot) => BOT_COLORS[bot!.color]))].slice(0, 5);
+  const spanMinutes = Math.max(45, Math.round((group.endAt - group.startAt) / 60_000));
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      data-testid="routine-collision-stack"
+      className="group absolute left-1.5 right-1.5 z-10 overflow-hidden rounded-xl border border-hairline/70 bg-raised/95 px-2.5 py-2 text-left shadow-xl shadow-black/15 backdrop-blur transition hover:z-20 hover:-translate-y-0.5 hover:border-accent/45"
+      style={{
+        top: `${(calendarMinuteOfDay(group.startAt) / 60) * HOUR_HEIGHT}px`,
+        minHeight: "54px",
+        height: `${Math.max(54, Math.min(104, (spanMinutes / 60) * HOUR_HEIGHT))}px`,
+      }}
+    >
+      <div className="flex min-w-0 items-start gap-2">
+        <span className="mt-0.5 flex shrink-0 -space-x-1" aria-hidden="true">
+          {colors.map((color, index) => <span key={`${color}-${index}`} className="size-3 rounded-full border-2 border-raised" style={{ backgroundColor: color }} />)}
+        </span>
+        <span className="min-w-0 flex-1">
+          <span className="flex items-center gap-1.5 text-[11.5px] font-semibold text-ink">
+            <span>{group.items.length} Overlapping</span>
+            {failed > 0 && <span className="rounded-full bg-danger/15 px-1.5 py-0.5 text-[9px] text-danger">{failed} failed</span>}
+          </span>
+          <span className="mt-0.5 block truncate text-[10px] text-ink-secondary">{niceTime(group.startAt)}–{niceTime(group.endAt)}</span>
+          <span className="mt-1 block truncate text-[10.5px] text-ink-secondary">
+            {visible.map(itemTitle).join(" · ")}{group.items.length > visible.length ? ` · +${group.items.length - visible.length} more` : ""}
+          </span>
+        </span>
+      </div>
+    </button>
+  );
+}
+
+function RoutineStackPanel({ group, bots, onClose, onOpen }: { group: CalendarItemGroup; bots: Bot[]; onClose: () => void; onOpen: (item: CalendarItem) => void }) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/65 p-5 backdrop-blur-sm" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+      <div data-testid="routine-collision-panel" className="flex max-h-[82vh] w-full max-w-[620px] flex-col overflow-hidden rounded-2xl border border-hairline/60 bg-panel shadow-2xl">
+        <div className="flex items-start justify-between border-b border-hairline/45 px-5 py-4">
+          <div>
+            <div className="text-[17px] font-semibold text-ink">{group.items.length} Overlapping Items</div>
+            <div className="mt-1 text-[12px] text-ink-secondary">{niceDate(group.startAt)} · {niceTime(group.startAt)}–{niceTime(group.endAt)}</div>
+          </div>
+          <button type="button" onClick={onClose} aria-label="Close Overlapping Items" className="rounded-lg p-2 text-ink-secondary hover:bg-raised hover:text-ink"><X size={18} /></button>
+        </div>
+        <div className="min-h-0 flex-1 overflow-y-auto p-3">
+          {group.items.map((item) => {
+            const bot = itemBot(item, bots);
+            const status = item.run?.status;
+            return (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => onOpen(item)}
+                className="flex w-full min-w-0 items-center gap-3 rounded-xl border border-transparent px-3 py-2.5 text-left hover:border-hairline/55 hover:bg-raised"
+              >
+                {bot ? <BotAvatar bot={bot} state={status ? statusState(status) : "idle"} size={38} animated={false} /> : <span className="size-[38px] rounded-xl bg-inset" />}
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate text-[12.5px] font-medium text-ink">{itemTitle(item)}</span>
+                  <span className="mt-0.5 block truncate text-[10.5px] text-ink-secondary">{niceTime(item.at)} · {bot?.name ?? "Unknown bot"}{item.run?.triggerSource ? ` · ${item.run.triggerSource}` : ""}</span>
+                </span>
+                <span className={cn("shrink-0 text-[10.5px] capitalize", status ? statusTone(status) : "text-ink-secondary")}>{status?.replace("waiting", "needs you") ?? "Scheduled"}</span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function CollaborationCopyReviewPanel({ routines, webhooks, onClose }: { routines: Routine[]; webhooks: WebhookTrigger[]; onClose: () => void }) {
+  const { dispatch } = useStore();
+  const [working, setWorking] = useState<string | null>(null);
+  const [error, setError] = useState("");
+  const entries = [
+    ...routines.filter((routine) => hasSlackReference(routine.name, routine.prompt)).map((routine) => ({ kind: "routine" as const, value: routine })),
+    ...webhooks.filter((webhook) => hasSlackReference(webhook.name, webhook.prompt)).map((webhook) => ({ kind: "webhook" as const, value: webhook })),
+  ];
+
+  const convert = async (entry: (typeof entries)[number]) => {
+    const key = `${entry.kind}:${entry.value.id}`;
+    setWorking(key);
+    setError("");
+    try {
+      const response = await api(`/api/${entry.kind === "routine" ? "routines" : "webhooks"}/${entry.value.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          name: convertSlackReferenceToZulip(entry.value.name),
+          prompt: convertSlackReferenceToZulip(entry.value.prompt),
+        }),
+      });
+      if (entry.kind === "routine") dispatch({ type: "routinePatched", routine: routineResponse.parse(response).routine });
+      else dispatch({ type: "webhookPatched", webhook: webhookResponse.parse(response).webhook });
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setWorking(null);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/65 p-5 backdrop-blur-sm" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+      <div className="flex max-h-[82vh] w-full max-w-[700px] flex-col overflow-hidden rounded-2xl border border-hairline/60 bg-panel shadow-2xl">
+        <div className="flex items-start justify-between border-b border-hairline/45 px-5 py-4">
+          <div>
+            <div className="text-[17px] font-semibold text-ink">Review Collaboration Copy</div>
+            <div className="mt-1 max-w-[560px] text-[12px] leading-relaxed text-ink-secondary">These saved workflows mention Slack.{"\u00a0 "}Slack is still a valid connected app, so BotFleet will only change a workflow when you choose Use Zulip.</div>
+          </div>
+          <button type="button" onClick={onClose} aria-label="Close Collaboration Copy Review" className="rounded-lg p-2 text-ink-secondary hover:bg-raised hover:text-ink"><X size={18} /></button>
+        </div>
+        <div className="min-h-0 flex-1 space-y-2 overflow-y-auto p-3">
+          {entries.length === 0 ? (
+            <div className="flex items-center gap-2 rounded-xl bg-success/10 px-4 py-4 text-[12.5px] text-success"><CheckCircle2 size={16} />No saved routines or webhooks mention Slack.</div>
+          ) : entries.map((entry) => {
+            const key = `${entry.kind}:${entry.value.id}`;
+            const canConvert = convertSlackReferenceToZulip(entry.value.name) !== entry.value.name
+              || convertSlackReferenceToZulip(entry.value.prompt) !== entry.value.prompt;
+            return (
+              <div key={key} className="flex min-w-0 items-center gap-3 rounded-xl border border-hairline/45 bg-inset/35 px-3.5 py-3">
+                <span className="min-w-0 flex-1">
+                  <span className="flex items-center gap-2">
+                    <span className="truncate text-[12.5px] font-medium text-ink">{entry.value.name}</span>
+                    <span className="shrink-0 rounded-full bg-warning/10 px-2 py-0.5 text-[9.5px] font-medium text-warning">{entry.kind === "routine" ? "Routine" : "Webhook"}</span>
+                  </span>
+                  <span className="mt-1 block truncate text-[10.5px] text-ink-secondary" title={entry.value.prompt}>{entry.value.prompt || "Slack appears in the saved name."}</span>
+                </span>
+                <button type="button" disabled={working !== null || !canConvert} title={canConvert ? "Replace retired fleet collaboration wording" : "URLs and identifiers require manual review"} onClick={() => void convert(entry)} className="flex shrink-0 items-center gap-1.5 rounded-lg border border-accent/30 bg-accent/10 px-3 py-2 text-[11px] font-medium text-accent hover:bg-accent/15 disabled:opacity-45">
+                  {working === key && <Loader2 size={12} className="animate-spin" />}Use Zulip
+                </button>
+              </div>
+            );
+          })}
+          {error && <div className="rounded-xl border border-danger/30 bg-danger/10 px-3.5 py-3 text-[12px] text-danger">{error}</div>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export function CalendarGrid({
   anchor,
   days,
   items,
@@ -196,6 +408,7 @@ function CalendarGrid({
   onOpen: (item: CalendarItem) => void;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
+  const [openGroup, setOpenGroup] = useState<CalendarItemGroup | null>(null);
   const today = startOfDay(Date.now());
   const starts = Array.from({ length: days }, (_, index) => addDays(anchor, index));
   const minDayWidth = days === 7 ? 110 : days === 3 ? 180 : 300;
@@ -229,7 +442,8 @@ function CalendarGrid({
           ))}
         </div>
         {starts.map((start) => {
-          const dayItems = items.filter((item) => startOfDay(item.at) === start);
+          const dayItems = items.filter((item) => startOfDay(item.at) === start && itemBot(item, bots));
+          const itemGroups = groupOverlappingCalendarItems(dayItems);
           const nowTop = (calendarMinuteOfDay(Date.now()) / 60) * HOUR_HEIGHT;
           return (
             <div key={start} className="relative border-r border-hairline/40 last:border-r-0">
@@ -242,14 +456,17 @@ function CalendarGrid({
                   <span className="h-px flex-1 bg-danger/80" />
                 </div>
               )}
-              {dayItems.map((item) => {
-                const bot = bots.find((candidate) => candidate.id === (item.routine?.botId ?? item.run?.botId));
+              {itemGroups.map((group) => {
+                if (group.items.length > 1) return <RoutineStackCard key={group.id} group={group} bots={bots} onOpen={() => setOpenGroup(group)} />;
+                const item = group.items[0]!;
+                const bot = itemBot(item, bots);
                 return bot ? <RoutineCard key={item.id} item={item} bot={bot} compact={days === 7} onOpen={() => onOpen(item)} /> : null;
               })}
             </div>
           );
         })}
       </div>
+      {openGroup && <RoutineStackPanel group={openGroup} bots={bots} onClose={() => setOpenGroup(null)} onOpen={(item) => { setOpenGroup(null); onOpen(item); }} />}
     </div>
   );
 }
@@ -288,6 +505,18 @@ export function RoutineEditor({
   const [error, setError] = useState("");
   const cloudInstance = state.instances.find((instance) => instance.driverKind === "boxAgent");
   const cloudReady = Boolean(state.config?.box.configured && cloudInstance?.snapshot.state === "available");
+  // MiniMonth preview of the schedule being edited — null while the "once"
+  // date/time field is mid-edit and momentarily unparseable, same guard
+  // `save()` needs around `epochFromInputDateTime`.
+  const schedulePreview = useMemo<RoutineSchedule | null>(() => {
+    try {
+      return kind === "once"
+        ? { type: "once", at: epochFromInputDateTime(at, CENTRAL_TIME_ZONE) }
+        : { type: "daily", time, weekdays, timeZone };
+    } catch {
+      return null;
+    }
+  }, [kind, at, time, weekdays, timeZone]);
 
   const save = async () => {
     setSaving(true);
@@ -407,6 +636,15 @@ export function RoutineEditor({
                 <p className="text-[11.5px] text-ink-secondary">Time zone: {timeZoneLabel(timeZone, routine?.nextRunAt ?? Date.now())}.{'  '}Existing routines keep their saved zone.</p>
               </div>
             )}
+            {schedulePreview && (
+              <div className="mt-3 overflow-hidden rounded-xl border border-hairline/40 bg-inset">
+                <MiniMonth
+                  anchor={schedulePreview.type === "once" ? schedulePreview.at : Date.now()}
+                  schedule={schedulePreview}
+                  timeZone={timeZone}
+                />
+              </div>
+            )}
           </div>
           <label className="block">
             <span className="mb-1.5 block text-[12px] font-medium text-ink-secondary">Calendar Block</span>
@@ -427,7 +665,10 @@ export function RoutineEditor({
   );
 }
 
-function RoutineDetails({ item, bot, onClose, onEdit }: { item: CalendarItem; bot: Bot; onClose: () => void; onEdit: (routine: Routine) => void }) {
+// Exported for the visual fixture (src/components/RoutineHoldVisualFixture.tsx),
+// which mounts this panel in its hold state.  The app only ever renders it from
+// RoutinesPage below.
+export function RoutineDetails({ item, bot, onClose, onEdit }: { item: CalendarItem; bot: Bot; onClose: () => void; onEdit: (routine: Routine) => void }) {
   const { state, dispatch } = useStore();
   const routine = item.routine;
   const run = item.run;
@@ -460,7 +701,7 @@ function RoutineDetails({ item, bot, onClose, onEdit }: { item: CalendarItem; bo
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-5 backdrop-blur-sm" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <div className="w-full max-w-[520px] overflow-hidden rounded-2xl border border-hairline/60 bg-panel shadow-2xl">
+      <div data-testid="routine-details" className="w-full max-w-[520px] overflow-hidden rounded-2xl border border-hairline/60 bg-panel shadow-2xl">
         <div className="relative overflow-hidden border-b border-hairline/40 px-5 py-5" style={{ background: `linear-gradient(135deg, color-mix(in srgb, ${BOT_COLORS[bot.color]} 28%, #111), #111)` }}>
           <button onClick={onClose} aria-label="Close Routine Details" className="absolute right-3 top-3 rounded-lg p-2 text-white/60 hover:bg-white/10 hover:text-white"><X size={18} /></button>
           <div className="flex items-center gap-4 pr-10">
@@ -480,6 +721,19 @@ function RoutineDetails({ item, bot, onClose, onEdit }: { item: CalendarItem; bo
           {run?.coalescedInto && <p className="text-[12px] text-ink-secondary">Combined with another delivery in this turn.{'\u00a0 '}All combined deliveries share its final outcome and cancellation.</p>}
           {outcome && outcome !== "completed" && <p className="text-[12px] font-medium text-ink">{ROUTINE_OUTCOME_LABELS[outcome]}{run?.failurePhase ? ` · ${run.failurePhase}` : ""}</p>}
           {run?.engineId && <p className="text-[12px] text-ink-secondary">Engine: {run.engineId}{run.model ? ` · ${run.model}` : ""}</p>}
+          {run?.holdReason && (
+            // The reason is only rendered while it is true, and it is cleared
+            // wherever the run stops being queued, so this cannot outlive the
+            // wait it describes.  A run still showing "queued" with nothing
+            // under it is the exact state this whole change set removed.
+            <div className="flex items-start gap-2 rounded-xl border border-hairline/25 bg-inset/40 px-3.5 py-3 text-[13px] leading-relaxed text-ink-secondary">
+              <PauseCircle size={16} className="mt-0.5 shrink-0" />
+              <span>
+                <span className="font-medium text-ink">Holding</span>{"\u00a0\u00a0"}
+                {run.holdReason}
+              </span>
+            </div>
+          )}
           {run?.error && <div className="flex items-start gap-2 rounded-xl border border-danger/30 bg-danger/10 px-3.5 py-3 text-[13px] text-danger"><CircleAlert size={16} className="mt-0.5 shrink-0" /><span>{run.error}</span></div>}
           {routine && (
             <div className="grid grid-cols-2 gap-3">
@@ -513,7 +767,7 @@ function RoutineDetails({ item, bot, onClose, onEdit }: { item: CalendarItem; bo
             <p className="mt-2 text-[11px]">Based on retained history.{'\u00a0 '}Combined deliveries count once per execution; cancellations and denials are excluded from the completion rate.</p>
           </section>
           {error && <div className="flex items-start gap-2 rounded-xl border border-danger/30 bg-danger/10 px-3.5 py-3 text-[13px] text-danger"><CircleAlert size={16} className="mt-0.5 shrink-0" /><span>{error}</span></div>}
-          {run?.status === "waiting" && <div className="rounded-xl border border-warning/30 bg-warning/10 px-3.5 py-3 text-[13px] text-warning">This bot needs your answer. Open its task to continue the run.</div>}
+          {run?.status === "waiting" && <div className="rounded-xl border border-warning/30 bg-warning/10 px-3.5 py-3 text-[13px] text-warning">This bot needs your answer.{"\u00a0 "}Open its task to continue the run.</div>}
         </div>
         <div className="flex flex-wrap items-center gap-2 border-t border-hairline/40 px-5 py-4">
           {routine && <button disabled={working} onClick={() => void invoke(`/api/routines/${routine.id}/run`)} className="flex items-center gap-2 rounded-xl bg-accent px-3.5 py-2 text-[13px] font-medium text-white hover:brightness-110 disabled:opacity-40"><Play size={14} />Run Now</button>}
@@ -582,8 +836,127 @@ function PausedRoutines({ routines, bots, onClose, onEdit }: { routines: Routine
   );
 }
 
+/** Hover card for the badge: a bare count cannot be acted on, so the number
+ *  arrives with its recency and with the routines and triggers feeding it. */
+function AttentionTooltip({ summary }: { summary: AttentionSummary }) {
+  const sources = summary.sources.slice(0, 6);
+  return (
+    <span
+      role="tooltip"
+      title={attentionSourcesTooltip(summary)}
+      className="pointer-events-none absolute right-0 top-full z-40 mt-2 hidden w-[300px] rounded-xl border border-hairline/60 bg-panel p-3 text-left shadow-xl group-hover:block group-focus-within:block"
+    >
+      <div className="text-[11.5px] font-medium text-ink">{attentionWindowLabel(summary)}</div>
+      <div className="mt-2 space-y-1">
+        {sources.map((source) => (
+          <div key={`${source.label}:${source.name}`} className="flex items-baseline justify-between gap-2 text-[11px] text-ink-secondary">
+            <span className="min-w-0 truncate text-ink" title={source.name}>{source.name}</span>
+            <span className="shrink-0">{source.label} · {source.count}</span>
+          </div>
+        ))}
+      </div>
+      {summary.sources.length > sources.length && <div className="mt-1.5 text-[10.5px] text-ink-secondary">and {summary.sources.length - sources.length} more</div>}
+    </span>
+  );
+}
+
+/** Every failure that has not been looked at, newest first.
+ *
+ *  The badge was the only surface, and a count like 421 told the owner nothing
+ *  they could act on: it could not be selected, there was no way to clear a
+ *  historic backlog, and every trigger still looked healthy.  This is the step
+ *  that names the runs, shows how recent they are, and lets each one be
+ *  acknowledged on its own or all at once. */
+function AttentionPanel({ summary, runs, bots, onClose, onOpenRun }: {
+  summary: AttentionSummary;
+  runs: RoutineRun[];
+  bots: Bot[];
+  onClose: () => void;
+  onOpenRun: (run: RoutineRun) => void;
+}) {
+  const { dispatch } = useStore();
+  const [pendingDismiss, setPendingDismiss] = useState(false);
+  const now = Date.now();
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-5 backdrop-blur-sm" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+      <div className="flex max-h-[82vh] w-full max-w-[640px] flex-col overflow-hidden rounded-2xl border border-hairline/60 bg-panel shadow-2xl">
+        <div className="flex items-start justify-between gap-3 border-b border-hairline/40 px-5 py-4">
+          <div className="min-w-0">
+            <div className="text-[17px] font-semibold text-ink">Needs Attention</div>
+            <div className="mt-0.5 text-[12px] text-ink-secondary">{attentionWindowLabel(summary)}</div>
+          </div>
+          <div className="flex shrink-0 items-center gap-2">
+            <button onClick={() => setPendingDismiss(true)} className="rounded-lg border border-hairline/50 bg-inset px-3 py-1.5 text-[12px] font-medium text-ink hover:bg-raised">Acknowledge All {summary.total}</button>
+            <button onClick={onClose} className="rounded-lg p-2 text-ink-secondary hover:bg-raised hover:text-ink"><X size={18} /></button>
+          </div>
+        </div>
+        <div className="min-h-0 flex-1 space-y-2 overflow-y-auto p-4">
+          {runs.length === 0 && (
+            // Reachable by acknowledging the last row one at a time, and the
+            // moment after Acknowledge All closes the panel.
+            <div className="flex flex-col items-center gap-2 px-6 py-10 text-center">
+              <CheckCircle2 size={26} className="text-accent" />
+              <div className="text-[14px] font-semibold text-ink">All Caught Up</div>
+              <div className="text-[12px] leading-relaxed text-ink-secondary">Nothing is waiting.  The next failure shows up here and raises the badge again.</div>
+            </div>
+          )}
+          {runs.map((run) => {
+            const bot = bots.find((candidate) => candidate.id === run.botId);
+            const code = routineOutcomeCode(run);
+            const detail = (run.error || run.output || "").replace(/\s+/g, " ").trim();
+            return (
+              <div key={run.id} className="rounded-xl border border-hairline/40 bg-inset p-3">
+                <div className="flex items-start gap-3">
+                  {bot ? <BotAvatar bot={bot} state="crash" size={40} animated={false} label={bot.name} /> : <div className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-raised text-ink-secondary"><CircleAlert size={18} /></div>}
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-baseline gap-2">
+                      <span className="truncate text-[14px] font-semibold text-ink" title={run.routineName}>{run.routineName}</span>
+                      <span className="shrink-0 rounded-full bg-raised px-1.5 py-0.5 text-[10px] text-ink-secondary">{attentionTriggerLabel(run.triggerSource)}</span>
+                    </div>
+                    <div className="mt-0.5 truncate text-[11.5px] text-ink-secondary" title={`${bot?.name ?? "Deleted bot"} · ${relativeRunTime(attentionSettledAt(run), now)}`}>
+                      {bot?.name ?? "Deleted bot"} · {relativeRunTime(attentionSettledAt(run), now)}{code ? ` · ${ROUTINE_OUTCOME_LABELS[code]}` : ""}
+                    </div>
+                    {detail && <div className="mt-1 line-clamp-2 font-mono text-[10.5px] text-ink-secondary/85" title={detail}>{detail}</div>}
+                  </div>
+                  <div className="flex shrink-0 items-center gap-1">
+                    <button onClick={() => onOpenRun(run)} className="rounded-lg px-2 py-1.5 text-[12px] text-ink-secondary hover:bg-raised hover:text-ink">View</button>
+                    <button onClick={() => dispatch({ type: "markRoutineRunSeen", runId: run.id })} className="rounded-lg p-2 text-ink-secondary hover:bg-raised hover:text-ink" title="Acknowledge This Run"><CheckCircle2 size={15} /></button>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        <div className="border-t border-hairline/40 px-5 py-3 text-[11.5px] leading-relaxed text-ink-secondary">
+          Acknowledging keeps every run in the calendar with its error.  It only clears the badge, and the next failure brings it back.
+        </div>
+      </div>
+      <ConfirmDialog
+        open={pendingDismiss}
+        title={`Acknowledge ${summary.total} ${summary.total === 1 ? "Failure" : "Failures"}?`}
+        body="They stay in the calendar with their errors.  This only clears the badge, and the next failure brings it back."
+        confirmLabel="Acknowledge All"
+        onCancel={() => setPendingDismiss(false)}
+        onConfirm={() => {
+          dispatch({ type: "acknowledgeAllAttention" });
+          setPendingDismiss(false);
+          onClose();
+        }}
+      />
+    </div>
+  );
+}
+
 export function RoutinesPage() {
   const { state, dispatch } = useStore();
+  const { capabilities } = useDesktopCapabilities();
+  const macInset = capabilities.windowChrome === "mac-inset";
+  const dragStyle: (React.CSSProperties & { WebkitAppRegion: "drag" }) | undefined = macInset
+    ? { WebkitAppRegion: "drag" }
+    : undefined;
+  const noDragStyle: (React.CSSProperties & { WebkitAppRegion: "no-drag" }) | undefined = macInset
+    ? { WebkitAppRegion: "no-drag" }
+    : undefined;
   const [section, setSection] = useState<"calendar" | "webhooks" | "resources">("calendar");
   const [viewDays, setViewDays] = useState<1 | 3 | 7>(7);
   const [anchor, setAnchor] = useState(() => startOfWeek(Date.now()));
@@ -591,6 +964,8 @@ export function RoutinesPage() {
   const [editor, setEditor] = useState<Routine | "new" | null>(null);
   const [selected, setSelected] = useState<CalendarItem | null>(null);
   const [pausedOpen, setPausedOpen] = useState(false);
+  const [attentionOpen, setAttentionOpen] = useState(false);
+  const [copyReviewOpen, setCopyReviewOpen] = useState(false);
   const visibleBots = state.bots.filter((bot) => !bot.hidden);
   const rangeStart = viewDays === 7 ? startOfWeek(anchor) : startOfDay(anchor);
   const rangeEnd = addDays(rangeStart, viewDays);
@@ -608,9 +983,15 @@ export function RoutinesPage() {
   const selectedBot = liveSelected
     ? state.bots.find((bot) => bot.id === (liveSelected.routine?.botId ?? liveSelected.run?.botId))
     : undefined;
-  const unseenFailures = state.routineRuns.filter((run) => ["failed", "missed"].includes(run.status) && !run.seenAt).length;
+  const attentionNow = useNow();
+  // The recency windows derive from Date.now(), so the clock is a
+  // real dependency: without it the counts freeze until run state changes.
+  const attention = useMemo(() => summarizeAttention(state.routineRuns, attentionNow), [state.routineRuns, attentionNow]);
+  const pendingAttention = useMemo(() => attentionRuns(state.routineRuns), [state.routineRuns]);
   const running = state.routineRuns.filter((run) => ["queued", "running", "waiting"].includes(run.status)).length;
   const paused = state.routines.filter((routine) => !routine.enabled && canToggleRoutine(routine));
+  const copyReviewCount = state.routines.filter((routine) => hasSlackReference(routine.name, routine.prompt)).length
+    + state.webhooks.filter((webhook) => hasSlackReference(webhook.name, webhook.prompt)).length;
   useEffect(() => {
     if (pausedOpen && paused.length === 0) setPausedOpen(false);
   }, [pausedOpen, paused.length]);
@@ -638,28 +1019,52 @@ export function RoutinesPage() {
     }
   };
 
+  /** Jump the calendar to a run from the attention list, so "View" lands on
+   *  the day it ran instead of an unrelated week. */
+  const openAttentionRun = (run: RoutineRun) => {
+    setAttentionOpen(false);
+    setViewDays(1);
+    setAnchor(startOfDay(run.scheduledFor));
+    setSelected({
+      id: run.id,
+      at: run.scheduledFor,
+      routine: state.routines.find((routine) => routine.id === run.routineId) ?? null,
+      run,
+    });
+    dispatch({ type: "markRoutineRunSeen", runId: run.id });
+  };
+
   return (
     <main className="flex h-full min-w-0 flex-1 flex-col bg-app">
       <header
+        style={dragStyle}
         className={cn(
           "shrink-0 px-5 pb-4 pt-4",
           // Room for the drawer button, which overlays this corner below md.
           "pl-11 md:pl-5",
         )}
       >
-        <div className="flex flex-wrap items-start justify-between gap-3">
+        <div style={noDragStyle} className="flex flex-wrap items-start justify-between gap-3">
           <div>
             <div className="flex items-center gap-2.5">{section === "calendar" ? <CalendarDays size={21} className="text-accent" /> : section === "resources" ? <Gauge size={21} className="text-accent" /> : <Webhook size={21} className="text-accent" />}<h1 className="text-[20px] font-semibold tracking-tight text-ink">Tasks &amp; Routines</h1></div>
             <p className="mt-1 text-[12.5px] text-ink-secondary">{section === "calendar" ? "Routines start fresh bot tasks on a schedule." : section === "resources" ? "Resource triggers start a bot when disk, RAM, or CPU crosses a threshold." : "Webhooks start fresh bot tasks when an event arrives."}</p>
           </div>
-          <div className="flex items-center gap-2">
+          <div style={noDragStyle} className="flex items-center gap-2">
             {running > 0 && <span className="flex items-center gap-1.5 rounded-full border border-accent/25 bg-accent/10 px-2.5 py-1.5 text-[11px] text-accent"><Loader2 size={12} className="animate-spin" />{running} active</span>}
-            {unseenFailures > 0 && <span className="flex items-center gap-1.5 rounded-full border border-danger/25 bg-danger/10 px-2.5 py-1.5 text-[11px] text-danger"><CircleAlert size={12} />{unseenFailures} need attention</span>}
+            {attention.total > 0 && (
+              <div className="group relative">
+                <button onClick={() => setAttentionOpen(true)} className="flex items-center gap-1.5 rounded-full border border-danger/25 bg-danger/10 px-2.5 py-1.5 text-[11px] text-danger hover:bg-danger/20">
+                  <CircleAlert size={12} />{attention.total} need attention
+                </button>
+                <AttentionTooltip summary={attention} />
+              </div>
+            )}
             {paused.length > 0 && <button onClick={() => setPausedOpen(true)} className="flex items-center gap-1.5 rounded-full border border-hairline/50 bg-panel px-2.5 py-1.5 text-[11px] text-ink-secondary hover:bg-raised hover:text-ink"><Pause size={12} />{paused.length} paused</button>}
+            {copyReviewCount > 0 && <button onClick={() => setCopyReviewOpen(true)} className="flex items-center gap-1.5 rounded-full border border-warning/25 bg-warning/10 px-2.5 py-1.5 text-[11px] text-warning hover:bg-warning/15"><CircleAlert size={12} />{copyReviewCount} copy review{copyReviewCount === 1 ? "" : "s"}</button>}
             {section === "calendar" && <button onClick={() => setEditor("new")} disabled={visibleBots.length === 0} className="flex items-center gap-2 rounded-xl bg-accent px-3.5 py-2 text-[13px] font-medium text-white shadow-lg shadow-accent/10 hover:brightness-110 disabled:opacity-40"><Plus size={15} />New Routine</button>}
           </div>
         </div>
-        <div className="mt-4 flex items-center gap-1 rounded-xl bg-panel p-1 sm:w-fit">
+        <div style={noDragStyle} className="mt-4 flex items-center gap-1 rounded-xl bg-panel p-1 sm:w-fit">
           <button onClick={() => setSection("calendar")} className={cn("flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-[12px] font-medium", section === "calendar" ? "bg-raised text-ink shadow" : "text-ink-secondary hover:text-ink")}><CalendarDays size={13} />Routines</button>
           <button onClick={() => setSection("webhooks")} className={cn("flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-[12px] font-medium", section === "webhooks" ? "bg-raised text-ink shadow" : "text-ink-secondary hover:text-ink")}><Webhook size={13} />Webhooks{state.webhooks.length > 0 && <span className="rounded-full bg-accent/15 px-1.5 text-[10px] text-accent">{state.webhooks.length}</span>}</button>
           <button onClick={() => setSection("resources")} className={cn("flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-[12px] font-medium", section === "resources" ? "bg-raised text-ink shadow" : "text-ink-secondary hover:text-ink")}><Gauge size={13} />Resources{state.resourceTriggers.length > 0 && <span className="rounded-full bg-accent/15 px-1.5 text-[10px] text-accent">{state.resourceTriggers.length}</span>}</button>
@@ -673,7 +1078,7 @@ export function RoutinesPage() {
             <><strong className="font-medium text-ink">Webhook</strong> = an event endpoint that creates a fresh task. Connected services can call it when something happens; the receiving bot keeps its existing tools and permissions.</>
           )}
         </div>
-        {section === "calendar" && <div className="mt-3 flex flex-wrap items-center gap-2">
+        {section === "calendar" && <div style={noDragStyle} className="mt-3 flex flex-wrap items-center gap-2">
           <div className="flex items-center rounded-xl border border-hairline/50 bg-panel p-0.5">
             <button onClick={() => move(-1)} className="rounded-lg p-2 text-ink-secondary hover:bg-raised hover:text-ink" aria-label="Previous Dates"><ChevronLeft size={16} /></button>
             <button onClick={goToday} className="px-2.5 py-1.5 text-[12px] font-medium text-ink hover:text-accent">Today</button>
@@ -705,7 +1110,7 @@ export function RoutinesPage() {
               {visibleBots.length === 0 && <CalendarClock size={58} className="text-ink-secondary/40" />}
             </div>
             <h2 className="text-[18px] font-semibold text-ink">Put your bot fleet on a rhythm</h2>
-            <p className="mt-2 text-[13px] leading-relaxed text-ink-secondary">Plan research briefs, daily check-ins, recurring reviews, or one-time work. Every run becomes a separate task with its own result.</p>
+            <p className="mt-2 text-[13px] leading-relaxed text-ink-secondary">Plan research briefs, daily check-ins, recurring reviews, or one-time work.{"\u00a0 "}Every run becomes a separate task with its own result.</p>
             <button onClick={() => setEditor("new")} disabled={visibleBots.length === 0} className="mt-5 inline-flex items-center gap-2 rounded-xl bg-accent px-4 py-2.5 text-[13px] font-medium text-white hover:brightness-110 disabled:opacity-40"><Plus size={15} />Create Your First Routine</button>
             {visibleBots.length === 0 && <p className="mt-3 text-[12px] text-warning">Create a bot first, then come back to schedule it.</p>}
           </div>
@@ -717,6 +1122,8 @@ export function RoutinesPage() {
       {editor && <RoutineEditor routine={editor === "new" ? undefined : editor} bots={visibleBots} onClose={() => setEditor(null)} />}
       {liveSelected && selectedBot && <RoutineDetails item={liveSelected} bot={selectedBot} onClose={() => setSelected(null)} onEdit={(routine) => { setSelected(null); setEditor(routine); }} />}
       {pausedOpen && <PausedRoutines routines={paused} bots={state.bots} onClose={() => setPausedOpen(false)} onEdit={(routine) => { setPausedOpen(false); setEditor(routine); }} />}
+      {attentionOpen && <AttentionPanel summary={attention} runs={pendingAttention} bots={state.bots} onClose={() => setAttentionOpen(false)} onOpenRun={openAttentionRun} />}
+      {copyReviewOpen && <CollaborationCopyReviewPanel routines={state.routines} webhooks={state.webhooks} onClose={() => setCopyReviewOpen(false)} />}
     </main>
   );
 }

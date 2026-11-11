@@ -60,6 +60,9 @@ export type ObservabilityConfigPatch = {
   enabled: boolean;
   environment: string;
   tracesSampleRate: number;
+  aiTracesSampleRate?: number;
+  httpTracesSampleRate?: number;
+  uiTracesSampleRate?: number;
   logsEnabled: boolean;
 };
 
@@ -68,6 +71,9 @@ export function buildObservabilityConfigPatch(input: {
   enabled: boolean;
   environment: string;
   tracesSampleRate: number;
+  aiTracesSampleRate?: number;
+  httpTracesSampleRate?: number;
+  uiTracesSampleRate?: number;
   logsEnabled: boolean;
 }): { ok: true; patch: ObservabilityConfigPatch } | { ok: false; error: string } {
   const dsn = input.sentryDsn.trim();
@@ -84,6 +90,24 @@ export function buildObservabilityConfigPatch(input: {
   if (!Number.isFinite(input.tracesSampleRate) || input.tracesSampleRate < 0 || input.tracesSampleRate > 1) {
     return { ok: false, error: "Traces sample rate must be between 0 and 1." };
   }
+  if (
+    input.aiTracesSampleRate !== undefined &&
+    (!Number.isFinite(input.aiTracesSampleRate) || input.aiTracesSampleRate < 0 || input.aiTracesSampleRate > 1)
+  ) {
+    return { ok: false, error: "AI traces sample rate must be between 0 and 1." };
+  }
+  if (
+    input.httpTracesSampleRate !== undefined &&
+    (!Number.isFinite(input.httpTracesSampleRate) || input.httpTracesSampleRate < 0 || input.httpTracesSampleRate > 1)
+  ) {
+    return { ok: false, error: "HTTP traces sample rate must be between 0 and 1." };
+  }
+  if (
+    input.uiTracesSampleRate !== undefined &&
+    (!Number.isFinite(input.uiTracesSampleRate) || input.uiTracesSampleRate < 0 || input.uiTracesSampleRate > 1)
+  ) {
+    return { ok: false, error: "UI traces sample rate must be between 0 and 1." };
+  }
 
   const patch: ObservabilityConfigPatch = {
     enabled: input.enabled,
@@ -91,6 +115,9 @@ export function buildObservabilityConfigPatch(input: {
     tracesSampleRate: input.tracesSampleRate,
     logsEnabled: input.logsEnabled,
   };
+  if (input.aiTracesSampleRate !== undefined) patch.aiTracesSampleRate = input.aiTracesSampleRate;
+  if (input.httpTracesSampleRate !== undefined) patch.httpTracesSampleRate = input.httpTracesSampleRate;
+  if (input.uiTracesSampleRate !== undefined) patch.uiTracesSampleRate = input.uiTracesSampleRate;
   if (dsn) patch.sentryDsn = dsn;
   return { ok: true, patch };
 }

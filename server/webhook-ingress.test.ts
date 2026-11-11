@@ -1,4 +1,6 @@
 import { mkdtempSync, rmSync } from "node:fs";
+import { request } from "node:http";
+import { connect } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -43,7 +45,35 @@ afterAll(async () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
+/** A request line `fetch` would refuse to build, sent straight down the socket. */
+async function rawPost(url: string): Promise<{ status: number }> {
+  const { hostname, port, pathname } = new URL(url);
+  return new Promise((resolve, reject) => {
+    const req = request(
+      { host: hostname, port: Number(port), path: pathname, method: "POST" },
+      (res) => {
+        res.resume();
+        res.on("end", () => resolve({ status: res.statusCode ?? 0 }));
+      },
+    );
+    req.on("error", reject);
+    req.end("{}");
+  });
+}
+
+/** Rejected rows recorded against the endpoint this suite created. */
+function rejectedAttemptCount(): number {
+  const id = manager.list().find((webhook) => webhook.endpointId === endpointId)?.id;
+  return manager.listAttempts().filter((attempt) => attempt.webhookId === id && attempt.outcome === "rejected").length;
+}
+
 describe("webhook-only ingress", () => {
+  it("returns 400 for a malformed doubled-slash URL without killing the receiver", async () => {
+    const malformed = await fetch(`${ingress.baseUrl}//`);
+    expect(malformed.status).toBe(400);
+    expect((await fetch(`${ingress.baseUrl}/health`)).status).toBe(200);
+  });
+
   it("exposes health but nothing from the main BotFleet API", async () => {
     const health = await fetch(`${ingress.baseUrl}/health`);
     expect(health.status).toBe(200);
@@ -172,5 +202,150 @@ describe("webhook-only ingress", () => {
     });
     expect(oversized.status).toBe(413);
     expect(manager.listAttempts().filter((attempt) => attempt.webhookId === manager.list().find((webhook) => webhook.endpointId === endpointId)?.id && attempt.outcome === "rejected").length).toBeGreaterThanOrEqual(3);
+  });
+
+  it("keeps multi-byte UTF-8 intact when the body splits across TCP chunks", async () => {
+    // A raw socket is the only way to control TCP chunk boundaries; fetch
+    // and http.request both coalesce small writes. A fresh endpoint keeps a
+    // fresh rate bucket: the shared one is spent by the earlier tests.
+    const own = manager.create({ name: "UTF-8 probe", prompt: "Report the note", botId: "maus-1" });
+    const credential = webhookCredential(ingress.baseUrl, own.webhook.endpointId, own.secret);
+    const url = new URL(credential.url);
+    const text = "héllo 🙂 wörld";
+    const payload = Buffer.from(JSON.stringify({ note: text }), "utf8");
+    const emojiAt = payload.indexOf(0xf0); // first byte of the 4-byte emoji
+    expect(emojiAt).toBeGreaterThan(0);
+    const first = payload.subarray(0, emojiAt + 2);
+    const second = payload.subarray(emojiAt + 2);
+    const raw = await new Promise<string>((resolve, reject) => {
+      const socket = connect(Number(url.port), url.hostname);
+      let response = "";
+      socket.setEncoding("utf8");
+      socket.on("data", (chunk) => (response += chunk));
+      socket.on("end", () => resolve(response));
+      socket.on("error", reject);
+      socket.on("connect", () => {
+        socket.write(
+          `POST ${url.pathname} HTTP/1.1\r\nHost: ${url.host}\r\nContent-Type: application/json\r\nContent-Length: ${payload.length}\r\nConnection: close\r\n\r\n`,
+        );
+        socket.write(first);
+        setTimeout(() => {
+          socket.write(second);
+          socket.end();
+        }, 25);
+      });
+    });
+    expect(raw.startsWith("HTTP/1.1 202")).toBe(true);
+    const prompt = queued.at(-1)?.prompt as string;
+    expect(prompt).toContain(text);
+    expect(prompt).not.toContain("\uFFFD");
+  });
+
+  it("answers malformed percent-encoding in the path as a 4xx and never raises", async () => {
+    // The raw path is what a real attacker sends; `fetch` would normalize a
+    // well-formed escape, so this has to go out as a literal request line.
+    const response = await rawPost(`${ingress.baseUrl}/hooks/${endpointId}/%E0%A4%A`);
+    expect(response.status).toBeGreaterThanOrEqual(400);
+    expect(response.status).toBeLessThan(500);
+    expect(response.status).not.toBe(500);
+  });
+
+  it("throttles unauthenticated rejection rows so a bad-secret flood cannot flush the log", async () => {
+    const before = rejectedAttemptCount();
+    // 25 bad secrets, well past the 10-per-minute cap.
+    for (let i = 0; i < 25; i += 1) {
+      const response = await fetch(`${ingress.baseUrl}/hooks/${endpointId}/wrong-secret-${i}`, { method: "POST", body: "{}" });
+      expect(response.status).toBe(401);
+    }
+    const recorded = rejectedAttemptCount() - before;
+    expect(recorded).toBeLessThanOrEqual(10);
+    expect(recorded).toBeGreaterThan(0);
+  });
+
+  // BF-2459: the Compiler's GitHub hook sends the event name in X-GitHub-Event.
+  it("answers 202 and starts no run for GitHub deliveries a merged-pull-requests-only webhook filters", async () => {
+    const compiler = manager.create({
+      name: "Compiler",
+      prompt: "Verify the merge.",
+      botId: "maus-1",
+      mergedPullRequestsOnly: true,
+    });
+    const url = webhookCredential(ingress.baseUrl, compiler.webhook.endpointId, compiler.secret).url;
+    const repository = { full_name: "Simple-With-Us/BotFleet", name: "BotFleet" };
+    const send = (event: string, deliveryId: string, body: string) =>
+      fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-github-event": event, "x-github-delivery": deliveryId },
+        body,
+      });
+    const before = queued.length;
+
+    const checkRun = await send(
+      "check_run",
+      "gh-check-run",
+      JSON.stringify({ repository, action: "completed", check_run: { status: "completed", conclusion: "failure" } }),
+    );
+    expect(checkRun.status).toBe(202);
+    expect(await checkRun.json()).toEqual({ accepted: true, deliveryId: "gh-check-run", duplicate: false, ignored: true });
+
+    const unmerged = await send(
+      "pull_request",
+      "gh-pr-unmerged",
+      JSON.stringify({ repository, action: "closed", pull_request: { number: 7, merged: false, merged_at: null } }),
+    );
+    expect(unmerged.status).toBe(202);
+    expect(await unmerged.json()).toMatchObject({ accepted: true, ignored: true });
+    expect(queued).toHaveLength(before);
+
+    const mergedPr = await send(
+      "pull_request",
+      "gh-pr-merged",
+      JSON.stringify({
+        repository,
+        action: "closed",
+        pull_request: { number: 7, merged: true, merged_at: "2026-10-18T21:00:00Z" },
+      }),
+    );
+    expect(mergedPr.status).toBe(202);
+    const body = await mergedPr.json();
+    expect(body).toMatchObject({ accepted: true, duplicate: false, deliveryId: "gh-pr-merged", runId: expect.any(String) });
+    expect(body).not.toHaveProperty("ignored");
+    expect(queued).toHaveLength(before + 1);
+    expect(queued.at(-1)?.prompt).toContain("Event: pull_request");
+    expect(manager.list().find((webhook) => webhook.id === compiler.webhook.id)).toMatchObject({
+      deliveryCount: 1,
+      ignoredCount: 2,
+    });
+  });
+});
+
+describe("webhook-only ingress fixed routes", () => {
+  it("serves a mounted partner route (Linq) on the ingress listener, POST only, behind admission", async () => {
+    const seen: string[] = [];
+    let admit = true;
+    const routed = await listenWebhookIngress(manager, {
+      port: 0,
+      beginAdmission: () => (admit ? () => {} : null),
+      routes: {
+        "/api/webhooks/linq": async (req, res) => {
+          seen.push(req.method ?? "");
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ ok: true }));
+        },
+      },
+    });
+    try {
+      const ok = await fetch(`${routed.baseUrl}/api/webhooks/linq`, { method: "POST", body: "{}" });
+      expect(ok.status).toBe(200);
+      expect(await ok.json()).toEqual({ ok: true });
+      expect((await fetch(`${routed.baseUrl}/api/webhooks/linq`)).status).toBe(405);
+      admit = false;
+      expect((await fetch(`${routed.baseUrl}/api/webhooks/linq`, { method: "POST", body: "{}" })).status).toBe(503);
+      expect(seen).toEqual(["POST"]);
+      // Mounting a route does not open the rest of the app API.
+      expect((await fetch(`${routed.baseUrl}/api/bots`)).status).toBe(404);
+    } finally {
+      await new Promise<void>((resolve) => routed.server.close(() => resolve()));
+    }
   });
 });

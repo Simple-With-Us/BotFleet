@@ -77,6 +77,18 @@ describe("permission broker", () => {
     await expect(pending).resolves.toBe("allowed-once");
   });
 
+  it("carries host scope through the opened event and keeps other asks unscoped", async () => {
+    const h = harness();
+    const host = h.ask({ tool: "bash", summary: "bash: bash -c echo", approvalScope: "local-computer" });
+    expect(h.opened()[0]).toMatchObject({ tool: "bash", approvalScope: "local-computer" });
+    h.broker.respond("thread-1", "req-1", { behavior: "deny" });
+    await host;
+    const peer = h.ask();
+    expect(h.opened()[1]).not.toHaveProperty("approvalScope", "local-computer");
+    h.broker.respond("thread-1", "req-2", { behavior: "deny" });
+    await peer;
+  });
+
   it("blocks until answered", async () => {
     const h = harness();
     let settled = false;

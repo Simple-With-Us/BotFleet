@@ -17,7 +17,7 @@ describe("computerProviders migrateAllowedComputersToProviders", () => {
       localVm: false,
       localMac: false,
     });
-    expect(result.vpsMode).toBe("per-bot");
+    expect(result.vpsMode).toBe("shared");
   });
 
   it("maps [\"vm\"] to { localVm: true } with no VPS mode", () => {
@@ -50,7 +50,7 @@ describe("computerProviders migrateAllowedComputersToProviders", () => {
       localVm: false,
       localMac: true,
     });
-    expect(result.vpsMode).toBe("per-bot");
+    expect(result.vpsMode).toBe("shared");
   });
 
   it("maps null to ALL providers enabled (legacy meaning was 'every destination allowed')", () => {
@@ -61,7 +61,7 @@ describe("computerProviders migrateAllowedComputersToProviders", () => {
       localVm: true,
       localMac: true,
     });
-    expect(result.vpsMode).toBe("per-bot");
+    expect(result.vpsMode).toBe("shared");
   });
 
   it("maps undefined to ALL providers enabled", () => {
@@ -72,7 +72,7 @@ describe("computerProviders migrateAllowedComputersToProviders", () => {
       localVm: true,
       localMac: true,
     });
-    expect(result.vpsMode).toBe("per-bot");
+    expect(result.vpsMode).toBe("shared");
   });
 
   it("preserves an empty allowlist as a deliberate deny-all (NOT the default)", () => {
@@ -97,7 +97,7 @@ describe("computerProviders migrateAllowedComputersToProviders", () => {
     const result = migrateAllowedComputersToProviders(["cloud", "alien"] as Array<"cloud" | "vm" | "local">);
     expect(result.providers.asciiBox).toBe(true);
     expect(result.providers.selfHostedVps).toBe(true);
-    expect(result.vpsMode).toBe("per-bot");
+    expect(result.vpsMode).toBe("shared");
   });
 
   it("is idempotent on the new shape (running on already-migrated data is a no-op)", () => {

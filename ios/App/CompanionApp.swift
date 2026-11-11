@@ -22,6 +22,12 @@ struct CompanionApp: App {
         SentryTelemetry.start()
         let session = Session()
         _session = StateObject(wrappedValue: session)
+        // Answer from the island or the Lock Screen.  Installed here rather
+        // than in `onAppear` because a `LiveActivityIntent` launches this
+        // process in the background without ever showing the scene, so a route
+        // wired on appearance would be nil at exactly the moment a Lock Screen
+        // tap needs it.
+        LiveActivityApprovalRoute.install(session: session)
         appDelegate.onDeviceToken = { hex in
             Task { await session.registerPushToken(hex) }
         }
@@ -50,6 +56,11 @@ struct CompanionApp: App {
                     liveActivities.attach(to: session)
                     liveActivities.transition(to: liveActivityPhase(scenePhase))
                     Task { await testFlightUpdate.checkIfDue() }
+                    #if DEBUG
+                    if ProcessInfo.processInfo.arguments.contains("-live-activity-preview") {
+                        LiveActivityCoordinator.startPreviewActivity()
+                    }
+                    #endif
                 }
                 .onOpenURL { session.receiveOpenURL($0) }
                 .onChange(of: scenePhase) { _, phase in
@@ -59,7 +70,11 @@ struct CompanionApp: App {
                         session.connect()
                         Task { await session.refreshNotificationAuthorization() }
                         Task { await testFlightUpdate.checkIfDue() }
-                    case .background: session.linger()
+                    case .background:
+                        // A reply being read keeps going: the `audio`
+                        // background mode lets it outlast auto-lock, which
+                        // used to cut every long read off partway.
+                        session.linger()
                     case .inactive: break
                     @unknown default: break
                     }
@@ -135,7 +150,50 @@ struct RootView: View {
 
     var body: some View {
         Group {
-            switch route {
+#if DEBUG
+            if ProcessInfo.processInfo.arguments.contains("-tvface-preview") {
+                TVFacePreviewHarness()
+            } else if ProcessInfo.processInfo.arguments.contains("-composer-regression-preview") {
+                ComposerScrollRegressionPreview().padding()
+            } else {
+                mainRoutes
+            }
+#else
+            mainRoutes
+#endif
+        }
+        .onChange(of: session.pairingInvite) { _, invite in
+            guard invite != nil else { return }
+            hasSeenWelcome = true
+            pairingRequested = true
+        }
+        .onAppear { reconcileNotificationOnboarding() }
+        .onChange(of: session.notificationAuthorizationResolved) { _, _ in
+            reconcileNotificationOnboarding()
+        }
+        .onChange(of: session.notificationAuthorization) { _, _ in
+            reconcileNotificationOnboarding()
+        }
+        .onChange(of: notificationOnboardingPending) { _, isPending in
+            if isPending { reconcileNotificationOnboarding() }
+        }
+        .alert(
+            "Something went wrong",
+            isPresented: Binding(
+                get: { session.actionError != nil },
+                set: { if !$0 { session.actionError = nil } }
+            ),
+            presenting: session.actionError
+        ) { _ in
+            Button("OK", role: .cancel) { session.actionError = nil }
+        } message: { message in
+            Text(message)
+        }
+    }
+
+    @ViewBuilder
+    private var mainRoutes: some View {
+        switch route {
             case .welcome:
                 CompanionWelcomeView(
                     onConnect: startPairing,
@@ -177,34 +235,6 @@ struct RootView: View {
                     session.signOut()
                     startPairing()
                 }
-            }
-        }
-        .onChange(of: session.pairingInvite) { _, invite in
-            guard invite != nil else { return }
-            hasSeenWelcome = true
-            pairingRequested = true
-        }
-        .onAppear { reconcileNotificationOnboarding() }
-        .onChange(of: session.notificationAuthorizationResolved) { _, _ in
-            reconcileNotificationOnboarding()
-        }
-        .onChange(of: session.notificationAuthorization) { _, _ in
-            reconcileNotificationOnboarding()
-        }
-        .onChange(of: notificationOnboardingPending) { _, isPending in
-            if isPending { reconcileNotificationOnboarding() }
-        }
-        .alert(
-            "Something went wrong",
-            isPresented: Binding(
-                get: { session.actionError != nil },
-                set: { if !$0 { session.actionError = nil } }
-            ),
-            presenting: session.actionError
-        ) { _ in
-            Button("OK", role: .cancel) { session.actionError = nil }
-        } message: { message in
-            Text(message)
         }
     }
 

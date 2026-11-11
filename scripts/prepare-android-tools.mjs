@@ -11,11 +11,11 @@
 // is installed right now, the always-on checkout — and only reach for the
 // network when there is genuinely nothing to copy.  A download that does work
 // is written into the shared cache, so the next stage copies it instead.
-import { cpSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 export const PLATFORM_NAMES = { darwin: "darwin", linux: "linux", win32: "win32" };
@@ -266,7 +266,18 @@ export async function prepareAndroidTools(options = {}) {
   }
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1] || "").href) {
+// Compare physical paths.  Node's ESM loader realpaths the entry module, so an
+// invocation through a symlinked directory (macOS /var -> /private/var) never
+// matches process.argv[1] when compared as text.
+function isEntryModule() {
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (isEntryModule()) {
   prepareAndroidTools().catch((error) => {
     console.error(`BotFleet could not stage the Android Platform Tools: ${error?.message ?? error}`);
     process.exitCode = 1;

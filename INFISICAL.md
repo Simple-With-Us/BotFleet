@@ -1,0 +1,152 @@
+# INFISICAL.md — BotFleet
+
+The managed Infisical connection is optional in BotFleet.  When an install connects it, Infisical is canonical only for the mapped names this app reads and writes.  An install can keep using its local configuration without connecting a vault.  Per-user settings stay in the app's own store and never go in Infisical.
+
+The connection toggle controls the backend and native credential resolvers.  Startup server-target enrollment in the packaged Electron shell and the managed shell launcher bootstrap are separate paths that currently run before this product setting controls access.  BF-2636 tracks an explicit local opt-in before their Keychain, credential-helper or vault access; AFC-600 owns the separate live credential handoff.  An existing remote enrollment must keep its fail-closed behavior rather than silently choose a local server.  Work already initiated while the managed connection was enabled may finish before the next live-state guard; queued refreshes and later credential or HTTP stages do not start after disable, and late read results are discarded.
+
+BotFleet's Infisical project: **BotFleet** (`836aebe2-c8f7-4e09-978e-7e3e82500bce`), environments `dev` / `staging` / `prod`.  The harness reads the `prod` environment by default (`DEFAULT_INFISICAL_ENVIRONMENT` in `server/config.ts`).
+
+## The policy
+
+- When enabled, Infisical holds the mapped secrets (provider API keys, tokens, webhook signing secrets), env config (service URLs, collections, integration endpoints), and tunable settings knobs (job limits, admission thresholds, Sentry sample rates, the spend ceiling, the Infisical refresh cadence itself).  BotFleet defaults to the service-token auth method; machine identity is available only when explicitly selected in this app's settings.
+- Per-user settings live in BotFleet's own store (the bot/room/thread database) and are **explicitly out of scope** — they never go in Infisical.  See "What stays out" below.
+- Local dev overrides are documented in `.env.example`; real values are never committed.
+- Secret values never appear in code, logs, PR bodies, or chat — names and metadata only.
+
+## The runtime contract
+
+1. **Load at startup.**  `server/index.ts` calls `infisical.preload()` (bounded by a boot cap so a slow or unreachable store can never hang boot), then re-reads the whole config with `loadConfig()`.  `loadConfig()` applies the vault snapshot last: `resolveSecretFields` (credentials, `server/secret-map.ts`) then `resolveKnobFields` (tunables, `server/knob-map.ts`).  For a name the vault holds, the vault wins over env and file.
+2. **Never fetch per-request.**  `settings.get`-style reads do not exist here as network calls at all: runtime code reads the resolved `cfg` object from memory (`server/jobs/registry.ts` re-resolves job settings from `cfg.jobs` at each use; `observabilitySettings(cfg)` reads `cfg.observability`).  A per-request, per-tick or per-event call to Infisical is the one forbidden pattern.
+3. **Background refresh.**  The `InfisicalManager` (`server/infisical.ts`) re-lists the vault on an interval (default 15 minutes, tunable via the `BOTFLEET_INFISICAL_REFRESH_MINUTES` knob — the cadence is itself stored in Infisical) and on demand (`Sync Now` in Settings > Secrets, any Settings save that touches the `infisical` section, `SIGHUP` where the server installs one).  Refresh failures log loudly, mark the status stale, and keep serving the last-known-good snapshot — settings staleness is safer than an outage.  An unparsable knob value is logged and ignored; the configured value stands.
+4. **Write-through on admin save.**  `PUT /api/config` writes vault-managed values to Infisical FIRST (`infisical.writeSecret`, which upserts), then drops the local copy from the patch bound for disk — an empty-string tombstone for credentials, a deleted key for knobs — so the file never shadows the store.  If the Infisical write fails, the save fails (409 for a policy refusal, 502 for the store failing to answer, 503 when the store is unreachable and cannot say what it manages) and nothing is written locally.  The cache and Infisical never diverge silently.
+5. **A per-seat credential is not a config value.**  The CLI logins (see the inventory below) are the one credential this app reads outside the snapshot:  they are read per seat, out of the fleet's own project, and handed to one launched child.  They never become a config field, so the snapshot filter, the write-through and the status views do not apply to them — and nothing may make them apply, or one seat's login would land in every bot's config.
+
+## Admin gating
+
+BotFleet is a single-user local harness: the server binds loopback-only (`127.0.0.1`) behind a loopback-host + origin + `sec-fetch-site` fence, and the local operator's own app (Electron) and CLIs are the only callers.  The local user IS the admin — there is no multi-user role model to gate against, and no parallel auth system was invented.  The Settings UI (including Settings > Secrets) and `PUT /api/config` are reachable only through that loopback fence, which is the documented gate.
+
+## Key inventory for THIS app
+
+### Credentials and env config (`server/secret-map.ts`)
+
+| Infisical name | Config field | Kind |
+|---|---|---|
+| `XAI_API_KEY` | xai.key | secret |
+| `OPENAI_COMPAT_API_KEY` | openaiCompat.key | secret |
+| `OPENAI_COMPAT_URL` | openaiCompat.url | config |
+| `MINIMAX_API_KEY` | minimax.key | secret |
+| `MINIMAX_BASE_URL` | minimax.url | config |
+| `COMPOSIO_API_KEY` | composio.apiKey | secret |
+| `BOX_TOKEN` | box.token | secret |
+| `OPENCODE_API_KEY` | opencodeGo.apiKey | secret |
+| `OMB_TTS_KEY` | tts.key | secret |
+| `OMB_OPENAI_IMAGE_KEY` | imageGen.key | secret |
+| `DEEPSEEK_API_KEY` | deepseek.key | secret |
+| `DEEPSEEK_URL` | deepseek.url | config |
+| `USAGE_MONITOR_INGEST_URL` | usage.ingestUrl | config |
+| `USAGE_MONITOR_INGEST_TOKEN` | usage.ingestToken | secret |
+| `USAGE_READ_TOKEN` | usage.readToken | secret |
+| `OMB_RECALL_URL` | qdrant.url | config |
+| `OMB_RECALL_API_KEY` | qdrant.apiKey | secret |
+| `OMB_RECALL_COLLECTION` | qdrant.collection | config |
+| `OMB_RECALL_ACCESS_CLIENT_ID` | qdrant.accessClientId | config |
+| `OMB_RECALL_ACCESS_CLIENT_SECRET` | qdrant.accessClientSecret | secret |
+| `LINQ_API_TOKEN` | imessageLinq.apiToken | secret |
+| `GITHUB_REQUEST_LOG_WEBHOOK_SECRET` | githubRequestLog.webhookSecret | secret |
+| `LINQ_WEBHOOK_SECRET` | imessageLinq.webhookSecret | secret |
+| `SENTRY_DSN` | observability.sentryDsn | secret |
+| `SENTRY_FLEET_DSN` | observability.sentryFleetDsn | secret |
+
+"config" rows are non-secret values (URLs, collection names) that travel the same vault path; the Secrets card shows them the way `GET /api/config` already does.
+
+### CLI logins (`server/secret-map.ts`, `server/cli-logins.ts`)
+
+A seat's CLI login — the GitHub CLI's token, the Copilot CLI's token — lives in the fleet's own Infisical project, not in BotFleet's.  The protocol is the fleet's (AI-Fleet-Coordinator, `docs/protocols/cli-login-sync.md`):  the project **Fleet-OPS**, environment `prod`, one folder per seat at `/cli-logins/<SEAT>`, and inside it the names the CLIs read out of their environment.
+
+The seat is the bot's role seat, the one the launch identity carries (`BF-ORACLE`, `BF-MONITOR`, …), so the folder to sync is `/cli-logins/BF-ORACLE` and not the folder of a coding seat that happens to work on the same machine.  The fleet's writer accepts that shape under the same path pattern it accepts every other seat with.
+
+| Infisical name | Delivered as | Read by |
+|---|---|---|
+| `GH_TOKEN` | `GH_TOKEN` | the GitHub CLI, and anything else that speaks to GitHub as the owner |
+| `GITHUB_TOKEN` | `GITHUB_TOKEN` | the same, for a tool that looks for that name |
+| `GH_ENTERPRISE_TOKEN` | `GH_ENTERPRISE_TOKEN` | the GitHub CLI against a GitHub Enterprise host |
+| `COPILOT_GITHUB_TOKEN` | `COPILOT_GITHUB_TOKEN` | the Copilot CLI |
+
+These four are not config fields, so they are not in the snapshot above and not in `loadConfig()`.  The seat comes from the launch identity, so one bot's login goes to that bot's launched child process and to no other.  The value goes from the vault into that child's environment and nowhere else:  never into `cfg`, never into `process.env`, never into a log line, an error message or the status view.  A child never inherits a login from the harness process — the four names are removed from the child's environment before the seat's own value goes in — so a bot with no seat gets no login at all, rather than somebody else's.
+
+The read is per seat, cached for 15 minutes, and happens in the BACKGROUND (`server/cli-logins.ts`).  A turn's child is spawned with whatever the cache holds, and a turn that names a seat starts the read: the turns after the first have the login.  The read is deliberately not awaited in the turn path, because a vault read there would suspend the driver between the turn's guard and the registration that follows it, and a second turn on the same thread would then walk through a guard the first one already passed.  A failed read keeps the last good value and is not retried for a minute.  Cross-project CLI login reads use an explicitly configured dedicated token source scoped to the exact Fleet-OPS project, environment, and folder; the product does not reuse BotFleet's primary token or machine identity for another project.
+
+### Tunable knobs (`server/knob-map.ts`)
+
+| Infisical name | Config field | Kind | Bounds |
+|---|---|---|---|
+| `BOTFLEET_JOBS_DEFAULT_MINUTES` | jobs.defaultMinutes | int | 1–360 |
+| `BOTFLEET_JOBS_MAX_MINUTES` | jobs.maxMinutes | int | 1–360 |
+| `BOTFLEET_JOBS_CPU_CORES` | jobs.cpuCores | int | 1–64 |
+| `BOTFLEET_JOBS_MAX_SWAP_PERCENT` | jobs.admission.maxSwapPercent | float | 1–100 |
+| `BOTFLEET_JOBS_MIN_FREE_DISK_MB` | jobs.admission.minFreeDiskMb | float | ≥ 0 |
+| `BOTFLEET_JOBS_MIN_FREE_INODES` | jobs.admission.minFreeInodes | integer | ≥ 0; unset by default, measured inventory required before selecting a floor |
+| `BOTFLEET_WEBHOOK_HOT_DEFER_MINUTES` | jobs.webhookHotDeferMinutes | int | 1–720 |
+| `BOTFLEET_PLACEMENT_HEARTBEAT_SECONDS` | placement.heartbeatSeconds | int | 1–3600 |
+| `BOTFLEET_PLACEMENT_UNREACHABLE_AFTER_SECONDS` | placement.unreachableAfterSeconds | int | 16–86400; longer than the heartbeat period |
+| `BOTFLEET_TRACES_SAMPLE_RATE` | observability.tracesSampleRate | float | 0–1 |
+| `BOTFLEET_AI_TRACES_SAMPLE_RATE` | observability.aiTracesSampleRate | float | 0–1 |
+| `BOTFLEET_HTTP_TRACES_SAMPLE_RATE` | observability.httpTracesSampleRate | float | 0–1 |
+| `BOTFLEET_UI_TRACES_SAMPLE_RATE` | observability.uiTracesSampleRate | float | 0–1 |
+| `BOTFLEET_SPEND_CEILING_USD` | usage.spendCeilingUsd | float | ≥ 0 |
+| `BOTFLEET_SPEND_CEILING_MIN_PRICED_SHARE` | usage.spendCeilingMinPricedShare | float | 0–1 |
+| `BOTFLEET_AUTO_REVIEW_MAX_PER_TURN` | autoReview.maxReviewsPerTurn | int | 1–500 |
+| `BOTFLEET_TTS_AUDIO_RETENTION_DAYS` | tts.audioRetentionDays | int | 0–365 |
+| `BOTFLEET_INFISICAL_REFRESH_MINUTES` | infisical.refreshMinutes | int | 5–1440 |
+| `BOTFLEET_AGENT_PROXY_ENABLED` | agentProxy.enabled | bool | — |
+| `BOTFLEET_AGENT_PROXY_ADDRESS` | agentProxy.address | string | — |
+| `BOTFLEET_AGENT_PROXY_PROJECT_ID` | agentProxy.projectId | string | — |
+| `BOTFLEET_AGENT_PROXY_ENV` | agentProxy.environment | string | — |
+| `BOTFLEET_AGENT_PROXY_PATH` | agentProxy.secretPath | string | — |
+| `BOTFLEET_COMPUTER_CALL_WAIT_MS` | computerCall.waitMs | int | 500–45000 |
+| `BOTFLEET_COMPUTER_CALL_ACT_WITHIN_MS` | computerCall.actWithinMs | int | 100–5000 |
+| `BOTFLEET_COMPUTER_CALL_WAIT_MAX_MS` | computerCall.personAwayMs | int | ≥ 1 |
+| `BOTFLEET_CLAUDE_SESSION_IDLE_MS` | claudeSession.idleMs | int | ≥ 1 |
+| `BOTFLEET_CLAUDE_SESSION_IDLE_MIN_MS` | claudeSession.idleMinMs | int | ≥ 1 |
+
+Knob values are parsed from their vault strings and clamped to the bounds above; an unparsable value is logged and ignored.  Knob values are not secrets — they are already visible in Settings and `GET /api/config` — so only ids and counts travel the status views.
+
+### Infisical Agent Proxy (optional)
+
+BotFleet can route child agent CLIs and process turns through a local or network Infisical Agent Proxy daemon (`infisical secrets agent-proxy start`).
+When `agentProxy.enabled` is `true` (via Settings or knob `BOTFLEET_AGENT_PROXY_ENABLED=true`), spawned CLIs receive:
+- `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`: `http://<address>` (default `http://127.0.0.1:17322`)
+- `NO_PROXY`: `localhost,127.0.0.1`
+- `INFISICAL_AGENT_PROXY_ADDRESS`: `<address>`
+- `INFISICAL_PROJECT_ID`: `agentProxy.projectId` (defaults to BotFleet's project ID)
+- `INFISICAL_ENVIRONMENT`: `agentProxy.environment` (default `prod`)
+- `INFISICAL_SECRET_PATH`: `agentProxy.secretPath` (default `/`)
+- `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`: `agentProxy.caCertPath` (when specified)
+
+Precedence: the four proxy URL variables keep whatever the caller already set, so a deliberate corporate proxy is never replaced.  Everything configured under `agentProxy` (address, project, environment, path, CA file) wins over an `INFISICAL_*`, `SSL_CERT_FILE` or `NODE_EXTRA_CA_CERTS` value the harness inherited.  A project, environment or path that only fell back to BotFleet's own Infisical settings does not displace an inherited one.
+
+The environment is built from the in-memory config the harness already holds (the same `cfg` that Settings saves and vault refreshes update), so a spawn never re-reads `config.json`.  When disabled (default), process spawning is completely direct with no proxy interception.
+
+## What stays out (deliberately)
+
+- **The store's own authentication**: BotFleet is optional; when enabled, the default method uses `INFISICAL_TOKEN` for reads and the separate `INFISICAL_WRITE_TOKEN` for writes.  A missing or rejected token does not activate machine identity.  An operator may explicitly select this install's machine identity in Settings > Secrets.  Store authentication lives in the process environment or the encrypted Settings credential store, never in the vault it unlocks.  The managed launch bootstrap binding is documented in [the Nov 3 service-token rollout](docs/rollouts/2026-11-03-service-token-bindings.md); live provisioning and helper authentication remain an AFC-600 handoff.
+- **The store's own timeouts** (`OMB_INFISICAL_CALL_TIMEOUT_MS`, `OMB_INFISICAL_BOOT_TIMEOUT_MS`): they are read before the first login, so the vault they would come from does not exist yet.
+- **Per-user settings**: bot and room configuration, per-bot transports, notification and UI preferences, per-user API keys.  These live in BotFleet's own database, never in Infisical.
+- **Launch-time process parameters** (ports, data directories, updater paths, `BOTFLEET_TOKEN`): these shape the process before settings load and stay as env/flags.
+- **Engine-internal tunables read once at module import** (e.g. `OMB_TURN_STALL_MS`): migrating them means changing import-time reads into resolved-config reads; tracked as follow-up work, not silently left as env.
+- **Build-time constants** that never change at runtime.
+
+## Cache, refresh and write-through mechanics
+
+- The vault snapshot is published synchronously through `setInfisicalSnapshot` (filtered to mapped credential + knob names only — a stray row can never change behavior) and consumed by `loadConfig()`.  `server/index.ts` re-runs `loadConfig()` into the live `cfg` after every successful preload, refresh-with-reason, and Settings save.
+- `GET /api/config` answers from the resolved `cfg`; the loopback Infisical status view reports `appliedFields` / `appliedKnobs` (ids only), `vaultCount`, `knobCount`, `unusedVaultNames`, staleness and the last error.
+- A Settings save of a vault-managed knob with Write Through off is refused with 409 ("managed by Infisical — change it in Infisical, or turn on Write Through").  A save that changes the Infisical *connection* (project, site, environment, path, identity) in the same request as a knob write is refused with 400 — the knob would otherwise land in the old project.
+- `saveConfig()` strips vault-managed values from anything bound for disk as a last line of defence, and warns with field ids.
+
+## Rotating a value
+
+Change it in Infisical (or save it in Settings with Write Through on).  The next background refresh — or `Sync Now` in Settings > Secrets — picks it up; credential changes that require a fleet rebuild set the `pendingProviderReload` flag and are applied on Sync Now or the next Settings save, never mid-turn.  Knob changes (job limits, sample rates, the refresh cadence) take effect on the next resolution with no rebuild: `infisical.start()` re-arms the poller when the cadence moves.
+
+## For agents
+
+`AGENTS.md` points here.  When adding a new tunable or credential: add it to the table in `server/knob-map.ts` or `server/secret-map.ts` (one row — the snapshot filter, resolution, provenance, write-through and status views all follow the table), add the default to the vault's `prod` environment when one exists, and cover it in `server/knob-map.test.ts` / `server/secret-map.test.ts`.  Never add a `process.env` read for a setting that belongs in these tables; never fetch Infisical per-request.  A credential that belongs to a seat rather than to the app is a CLI login:  it is a row in `CLI_LOGIN_FIELDS` (`server/secret-map.ts`), it is read per seat by `server/cli-logins.ts`, and it is never a config field.

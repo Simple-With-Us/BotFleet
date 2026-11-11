@@ -12,6 +12,7 @@ import { z } from "zod";
 
 import type {
   DriverCreateInput,
+  EffortLevel,
   ModelCatalog,
   ProviderDriver,
   ProviderInstance,
@@ -21,13 +22,25 @@ import type {
   SendTurnInput,
 } from "../contracts.ts";
 import { newEventId, newId } from "../contracts.ts";
+import { boundText } from "../../shared/item-io.ts";
+import type { ReviewPrompt } from "../../shared/auto-review.ts";
 import { appendNative } from "./native.ts";
+import { contextWindowFor } from "../model-context-windows.ts";
+import { joinedSystemPrompt, splitChatPrompt } from "./prompt-split.ts";
+import {
+  acpPromptCeilingRefusal,
+  applyAcpPromptBudget,
+  decodeAcpContextCapTokens,
+  decodeAcpPromptBudgetBytes,
+  describeAcpPromptTrim,
+  resolveAcpPromptBudget,
+} from "./acp/prompt-budget.ts";
 import { toolFields } from "../tool-fields.ts";
 import { classifyHttpError, httpErrorFor, type HttpErrorClassification } from "./chat-completions/errors.ts";
-import { runTurnLoop, type ChatMessage, type TurnLoopDeps, type TurnUsage } from "./chat-completions/loop.ts";
+import { runTurnLoop, DEFAULT_TURN_LOOP_BUDGET, type ChatMessage, type TurnLoopDeps, type TurnUsage } from "./chat-completions/loop.ts";
 import { costUsd, type ChatCompletionsPriceTable } from "./chat-completions/pricing.ts";
 import { capReplayedTranscript } from "./chat-completions/replay-cap.ts";
-import { genAiProvider, withChatSpan } from "../sentry-ai.ts";
+import { formatGenAiMessages, genAiProvider, withChatSpan } from "../sentry-ai.ts";
 
 const DRIVER_KIND = "minimax";
 const API_KEY_ENV = "MINIMAX_API_KEY";
@@ -43,19 +56,98 @@ const CN_URL = "https://api.minimaxi.com/v1";
 // two, per PR 10's "off the same fetch".
 const SNAPSHOT_CACHE_MS = 60_000;
 const SNAPSHOT_PROBE_TIMEOUT_MS = 8_000;
+// A stall guard independent of the per-request ceiling `complete()` reads
+// off `opts.signal`.  Unattended turns run at the full 900s wall-clock
+// budget (see `sendTurn`'s `runTurnLoop` call below) so a slow-but-working
+// stream has room to finish, but a CONNECTION that stops producing bytes
+// entirely must not get to hold the bot busy for the full 900s before
+// anything notices — that is exactly the failure board row bf77b434 (a
+// MiniMax round stalling right after a tool call) tracks.  Measured
+// against `reader.read()` resolving with a real chunk, not against parsed
+// content: MiniMax can send frames this driver's `takeSseLine` does not
+// turn into a delta (an empty `choices` array, an unparsed keep-alive),
+// and "is the socket still moving" is the question, not "did the model
+// say something new."  90–120s was the reviewed range on PR 625's
+// follow-up; 120s errs toward not cutting off a merely-slow-but-live
+// reasoning burst.
+const STREAM_IDLE_TIMEOUT_MS = 120_000;
 
 // Plain MiniMax-M2.7 dropped: it billed the same $0.30/$1.20 per million as
-// M3's own <=512K tier for a fifth of the context, so M3 strictly dominated
-// it.  M2.7-highspeed stays — it is MiniMax's own faster-inference tier
-// (see UTILITY_MODEL below) priced at $0.60/$2.40, genuinely different from
-// M3's rate at any input size highspeed's own 204,800 context can hold.
+// M3.1's own <=512K tier for a fifth of the context, so M3.1 strictly
+// dominates it.  M2.7-highspeed stays — it is MiniMax's own faster-inference
+// tier (see UTILITY_MODEL below) priced at $0.60/$2.40, genuinely different
+// from M3.1's rate at any input size highspeed's own 204,800 context can
+// hold.
+/** Ids the picker retired on purpose.  refreshModels replaces the static
+ *  catalog with whatever GET /models serves, and the MiniMax API keeps
+ *  listing retired models after the picker drops them - without this
+ *  filter a live list re-inflates them as bare-id rows, the same
+ *  stale-source shape as an old settings row in the DSH union
+ *  (DSH_EXCLUDED_MODEL_IDS).  Exact ids only: MiniMax-M2.7-highspeed and
+ *  the M3.1 rows are current and must not match. */
+const MINIMAX_RETIRED_MODEL_IDS: readonly string[] = [
+  // Dropped as dominated: same $0.30/$1.20 as M3.1's <=512K tier for a
+  // fifth of the context.
+  "MiniMax-M2.7",
+  // Superseded by MiniMax-M3.1-Flash.
+  "MiniMax-M3",
+  // The former spellings of the two M3.1 Flash rows.  MiniMax renamed them
+  // and the API keeps serving the retired ids, so a live list would
+  // otherwise re-inflate a dead row next to its live replacement.
+  "MiniMax-M3.1-Flash-Preview",
+  "MiniMax-M3.1-Flash-Preview-1M",
+];
+
+/** The `reasoning_effort` values MiniMax accepts on /v1/chat/completions, for
+ *  MiniMax-M3.1-Flash only.  Source:
+ *  https://platform.minimax.io/docs/api-reference/text-openai-api.  The field
+ *  is sent top-level and never paired with a `thinking` object:
+ *   - omitting it means `max`, which is what Default sends;
+ *   - `none` returns HTTP 400, and so does `thinking: {type: "disabled"}` on
+ *     M3.1, so this driver offers no way to switch reasoning off;
+ *   - other models ignore the field, so they declare no levels.
+ *  The API has no context-window parameter: M3.1's window is a fixed 1M, and
+ *  input past 512K bills at the higher tier the price table already models. */
+const M31_EFFORT_LEVELS: readonly EffortLevel[] = ["low", "medium", "high", "xhigh", "max"];
+
 const MODELS: ModelCatalog = {
-  default: "MiniMax-M3",
+  default: "MiniMax-M3.1-Flash",
   options: [
-    { id: "MiniMax-M3", label: "MiniMax M3", contextWindow: 1_000_000 },
-    { id: "MiniMax-M2.7-highspeed", label: "MiniMax M2.7 Highspeed", contextWindow: 204_800 },
+    {
+      id: "MiniMax-M3.1-Flash",
+      label: "MiniMax M3.1 Flash (512K)",
+      contextWindow: 524_288,
+      effortLevels: [...M31_EFFORT_LEVELS],
+      defaultEffort: "max",
+      supportsMaxOutput: true,
+    },
+    {
+      id: "MiniMax-M3.1-Flash-1M",
+      label: "MiniMax M3.1 Flash (1M)",
+      contextWindow: 1_000_000,
+      effortLevels: [...M31_EFFORT_LEVELS],
+      defaultEffort: "max",
+      supportsMaxOutput: true,
+    },
+    // Explicit `[]`: src/lib/model-effort.ts gives a row with no list the
+    // engine-wide one, which is M3.1's.
+    { id: "MiniMax-M2.7-highspeed", label: "MiniMax M2.7 Highspeed", contextWindow: 204_800, effortLevels: [], supportsMaxOutput: true },
   ],
 };
+
+/** The prompt-budget window for a MiniMax model: the catalog row's own cap
+ *  when the id is one the catalog carries - the 512K Flash row is a deliberate
+ *  client-side billing-tier cap, and budgeting it at the shared table's
+ *  published 1M would push those turns into the higher input tier (Kody
+ *  review, PR #1283) - else the shared published table, else undefined. */
+export function minimaxWindowTokens(
+  model: string | undefined,
+  options: ModelCatalog["options"],
+): number | undefined {
+  if (!model) return undefined;
+  const row = options.find((option) => option.id === model);
+  return row?.contextWindow ?? contextWindowFor(model);
+}
 
 /** Published MiniMax API rates, USD per million tokens, STANDARD service
  *  tier — this driver never sends `service_tier: "priority"`.  Source:
@@ -77,7 +169,8 @@ const MODELS: ModelCatalog = {
  *  against the pricing page above as the maintenance cost of having a
  *  cost column at all. */
 export const MINIMAX_PRICE_PER_MILLION: ChatCompletionsPriceTable = {
-  "MiniMax-M3": [
+  "MiniMax-M3.1-Flash": [{ input: 0.3, output: 1.2, cachedInput: 0.06 }],
+  "MiniMax-M3.1-Flash-1M": [
     { maxInputTokens: 512_000, input: 0.3, output: 1.2, cachedInput: 0.06 },
     { input: 0.6, output: 2.4, cachedInput: 0.12 },
   ],
@@ -133,6 +226,47 @@ function toTurnUsage(raw: any): TurnUsage {
   return usage;
 }
 
+/** Thrown by `readChunkOrStall` when the SSE reader goes `STREAM_IDLE_TIMEOUT_MS`
+ *  with no chunk.  The message deliberately contains "timed out" — that is
+ *  the phrase `classifyError` (server/drivers/retry.ts) matches onto the
+ *  `timeout` transient reason, so a stall before anything published rides
+ *  the SAME up-to-three-attempt retry policy a slow-to-connect socket
+ *  already gets, and a stall AFTER a delta published never retries because
+ *  `published` is already true by then (loop.ts's retry guard) — replaying
+ *  it would show the person text they already read twice. */
+class StreamStallError extends Error {
+  constructor(idleMs: number) {
+    super(`MiniMax stream timed out: no data received for ${Math.round(idleMs / 1000)}s`);
+    this.name = "StreamStallError";
+  }
+}
+
+/** Races one `reader.read()` against an idle timer, so a connection that
+ *  stops producing bytes fails in `idleMs`, not in whatever's left of the
+ *  round's full request ceiling.  Every read that resolves — `done`
+ *  included, the stream closing IS activity — gets a fresh window on the
+ *  NEXT call; only true silence trips it.  The timer is `unref`'d so a
+ *  turn nobody is waiting on cannot hold the process open, matching
+ *  `unrefTimer` in chat-completions/loop.ts (not imported — that file's
+ *  helper is module-private and this is a two-line duplicate, not a
+ *  dependency worth adding). */
+async function readChunkOrStall(reader: ReadableStreamDefaultReader<Uint8Array>, idleMs: number) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const stall = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new StreamStallError(idleMs)), idleMs);
+    // Node's timer carries `unref`; the DOM's does not, and this file is
+    // typed against both — declared type, not a cast, so nothing here
+    // asserts past what `timer` actually is.
+    const handle: { unref?: () => void } = timer;
+    handle.unref?.();
+  });
+  try {
+    return await Promise.race([reader.read(), stall]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /** Where `MinimaxConfig.url` came from.  "default" is the ONLY value that
  * means nothing chose a host: `url` is filled in unconditionally, so the
  * string alone cannot tell "not configured" apart from "configured as the
@@ -143,6 +277,11 @@ export type MinimaxUrlSource = "instance" | "workspace" | "environment" | "defau
 export interface MinimaxConfig {
   url: string;
   urlSource: MinimaxUrlSource;
+  /** Prompt budget override in bytes (0 turns it off).  Same meaning as the
+   *  ACP engines' `promptBudgetBytes`. */
+  promptBudgetBytes?: number;
+  /** Working-context cap in tokens; see `resolveAcpPromptBudget`. */
+  contextCapTokens?: number;
 }
 
 interface LocalMiniMaxConfig {
@@ -165,6 +304,8 @@ const driverConfigSchema = z.object({
   // a workspace-wide endpoint apart from one this instance carries WITHOUT
   // comparing the two values.
   urlSource: z.string().optional(),
+  promptBudgetBytes: z.unknown().optional(),
+  contextCapTokens: z.unknown().optional(),
 });
 
 /** server/config.ts's `WORKSPACE_URL_SOURCE`: the marker instanceConfigs()
@@ -227,6 +368,8 @@ export function loadLocalMiniMaxConfig(home = homedir()): LocalMiniMaxConfig {
 export function decodeMinimaxConfig(raw: unknown): MinimaxConfig {
   const parsed = driverConfigSchema.safeParse(raw ?? {});
   const config = parsed.success ? parsed.data : {};
+  const promptBudgetBytes = decodeAcpPromptBudgetBytes(config.promptBudgetBytes);
+  const contextCapTokens = decodeAcpContextCapTokens(config.contextCapTokens);
   const ownUrl = config.url?.trim();
   const envUrl = process.env.MINIMAX_BASE_URL?.trim();
   // Provenance, decided here once, where all three inputs are still
@@ -241,6 +384,8 @@ export function decodeMinimaxConfig(raw: unknown): MinimaxConfig {
   return {
     url: normalizedApiUrl(ownUrl || envUrl || DEFAULT_URL),
     urlSource,
+    ...(promptBudgetBytes === undefined ? {} : { promptBudgetBytes }),
+    ...(contextCapTokens === undefined ? {} : { contextCapTokens }),
   };
 }
 
@@ -250,7 +395,14 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
   // ~/.mmx/config.json (loadLocalMiniMaxConfig above), and only as one of
   // three key sources. "MiniMax CLI" told users to install and debug a
   // binary that has no bearing on whether a turn works.
-  metadata: { displayName: "MiniMax", supportsMultipleInstances: true },
+  metadata: {
+    displayName: "MiniMax",
+    supportsMultipleInstances: true,
+    // Mirrors the `capabilities` block in `create` below: this driver mounts
+    // agents and local-computer tools, with no Composio, no screen channel,
+    // and no image input.
+    channelWiring: { agentsMcp: true, computerMcp: false, composioMcp: false, localComputerMcp: true, images: false },
+  },
   models: MODELS,
   install: {
     docsUrl: "https://platform.minimax.io/docs/token-plan/minimax-cli",
@@ -346,6 +498,24 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
         onDelta?: (d: string, streamKind?: "assistant_text" | "reasoning_text") => void;
         onToolCallDelta?: (index: number, id?: string, name?: string, args?: string) => void;
         onUsage?: (usage: TurnUsage) => void;
+        // Guards a WIDENED per-request ceiling only — see STREAM_IDLE_TIMEOUT_MS.
+        // Undefined (the interactive-turn default) leaves reading plain: the
+        // turn loop's own idle clock (`requestIdleMs`, fed by `onChunk`)
+        // already bounds total silence there.  Only the unattended caller
+        // (900s ceiling, loop idle clock off) sets this, because that is
+        // the path where a stalled connection would otherwise sit
+        // unnoticed for a long time.
+        idleTimeoutMs?: number;
+        /** Raw-bytes liveness for the turn loop's idle clock
+         *  (`requestIdleMs` in chat-completions/loop.ts). */
+        onChunk?: () => void;
+        /** M3.1's `reasoning_effort`.  Set only for a user turn's own rounds;
+         *  the utility path (titles, summaries) never passes it. */
+        reasoningEffort?: EffortLevel;
+        /** The bot's optional output limit, sent as `max_completion_tokens`
+         *  (MiniMax: "use this field for new integrations").  Absent sends
+         *  nothing, so the model keeps its own limit. */
+        maxOutputTokens?: number;
       },
     ): Promise<{ text: string; reasoning: string; tool_calls?: any[]; usage: TurnUsage | null }> => {
       // When the caller supplies a signal it already carries the request
@@ -355,13 +525,22 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
       // with no signal — generateText for titles and summaries — keep the
       // driver's own 180s ceiling.
       const signal = opts.signal ?? AbortSignal.timeout(180_000);
+      const upstreamModel = model.replace(/-1M$/i, "");
       const body = {
-        model,
+        model: upstreamModel,
         messages,
         stream: opts.stream,
         reasoning_split: true,
         stream_options: opts.stream ? { include_usage: true } : undefined,
         ...(opts.tools && opts.tools.length > 0 ? { tools: opts.tools } : {}),
+        // Top-level `reasoning_effort`, never a `thinking` field: MiniMax
+        // answers HTTP 400 to `reasoning_effort: "none"` and to
+        // `thinking: {type: "disabled"}` on M3.1, and treats an omitted field
+        // as `max`.  Default therefore sends nothing.  Docs:
+        // https://platform.minimax.io/docs/api-reference/text-openai-api
+        // (An undefined value is dropped by JSON.stringify, so Default adds no key.)
+        reasoning_effort: opts.reasoningEffort,
+        max_completion_tokens: opts.maxOutputTokens,
       };
       const res = await fetch(`${apiUrl}/chat/completions`, {
         method: "POST",
@@ -382,6 +561,8 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
         // MiniMax's own `Retry-After` instead of regexing this message.
         throw httpErrorFor(res.status, body, res.headers);
       }
+      // headers are progress too: the socket answered
+      opts.onChunk?.();
 
       if (!opts.stream) {
         const json: any = await res.json();
@@ -463,7 +644,10 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
 
       try {
         for (;;) {
-          const { done, value } = await reader.read();
+          const { done, value } = opts.idleTimeoutMs
+            ? await readChunkOrStall(reader, opts.idleTimeoutMs)
+            : await reader.read();
+          if (!done) opts.onChunk?.();
           if (done) {
             // Flush whatever is left in the decoder and the line buffer.
             // MiniMax's stream_options.include_usage frame — the one
@@ -511,14 +695,78 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
       const abort = new AbortController();
       active.set(threadId, { abort, turnId, startedAt: Date.now() });
       const model = turn.model || models.default;
+      // Effort rides every round of the turn, and only when the picked level is
+      // one this model's catalog row declares: M2.7 Highspeed declares none,
+      // `none` is not a level MiniMax takes, and an unknown id (discovered
+      // from GET /models) gets `[]`.  No level means the field is omitted.
+      const row = models.options.find((option) => option.id === model);
+      const reasoningEffort =
+        turn.effort && turn.effort !== "none" && row?.effortLevels?.includes(turn.effort)
+          ? turn.effort
+          : undefined;
       // Round 1's prefix.  The loop owns this array from here and only ever
       // APPENDS to it, so rounds 2..N re-send a byte-identical prefix.
       // The transcript is byte-capped and entry-count-capped first so a
       // long thread cannot grow past the model's prompt window or the
       // provider's per-request size — see chat-completions/replay-cap.ts.
       const cappedTranscript = capReplayedTranscript(turn.transcript);
+      // Only the stable half of the prompt heads the request; the volatile
+      // half rides the newest user message, every request, so the resent
+      // prefix stays byte-identical across a memory write (see
+      // prompt-split.ts splitChatPrompt).
+      let chat = splitChatPrompt(turn);
+      // The same prompt budget the ACP engines apply: trim the volatile
+      // system sections (oldest first by priority) when the system prompt plus
+      // this message is past the budget.  The transcript has its own cap above.
+      // A trimmed prompt is sent as one system block, so that turn gives up the
+      // stable/volatile cache split; an untrimmed turn is unchanged.
+      const system = joinedSystemPrompt(turn);
+      let trim: ReturnType<typeof describeAcpPromptTrim> = null;
+      if (system) {
+        // A refusal throws out of sendTurn before the loop exists, so nothing
+        // would ever settle this turn: release the thread's slot first, or the
+        // next turn on it is refused as "already running".
+        try {
+          const composed = `${system}\n\n${turn.text}`;
+          // No config at all must not inherit the ACP 128 KiB default: a MiniMax
+          // bot has a 1M window.  Without an override or a cap the budget is the
+          // model's own window (80% of it), and off for a model with no known one.
+          const windowTokens = minimaxWindowTokens(model, models.options);
+          const unconfigured =
+            config.promptBudgetBytes === undefined && config.contextCapTokens === undefined && turn.contextCapTokens === undefined;
+          const budgetBytes = unconfigured && windowTokens === undefined
+            ? null
+            : resolveAcpPromptBudget({
+                configuredBytes: config.promptBudgetBytes,
+                capTokens: turn.contextCapTokens ?? config.contextCapTokens ?? windowTokens,
+                model,
+                composed,
+              }).bytes;
+          // An untrimmed request carries the volatile half as a framed context
+          // note on the user message (splitChatPrompt), about a hundred bytes the
+          // composed prompt does not have.  Leave room for them when deciding
+          // whether to trim, and judge the hard ceiling on what is really sent.
+          const untrimmedSent = `${chat.system ?? ""}\n\n${chat.text}`;
+          const framingBytes = Math.max(0, Buffer.byteLength(untrimmedSent) - Buffer.byteLength(composed));
+          const budgeted = applyAcpPromptBudget({
+            composed,
+            sections: turn.systemSections,
+            userText: turn.text,
+            budgetBytes: budgetBytes === null ? null : Math.max(1, budgetBytes - framingBytes),
+          });
+          const refusal = acpPromptCeilingRefusal(budgeted.trimmed ? budgeted.text : untrimmedSent, budgetBytes);
+          if (refusal) throw new Error(refusal.message);
+          trim = describeAcpPromptTrim(budgeted, budgetBytes);
+          if (budgeted.trimmed) {
+            chat = { system: budgeted.text.slice(0, budgeted.text.length - turn.text.length - 2) || undefined, text: turn.text };
+          }
+        } catch (error) {
+          active.delete(threadId);
+          throw error;
+        }
+      }
       const messages: ChatMessage[] = [
-        ...(turn.system ? [{ role: "system" as const, content: turn.system }] : []),
+        ...(chat.system ? [{ role: "system" as const, content: chat.system }] : []),
         ...cappedTranscript.flatMap((m): ChatMessage[] => {
           const res: ChatMessage[] = [];
           if (m.role === "assistant") {
@@ -542,11 +790,35 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
           }
           return res;
         }),
-        ...(turn.text ? [{ role: "user" as const, content: turn.text }] : []),
+        ...(chat.text ? [{ role: "user" as const, content: chat.text }] : []),
       ];
 
       emit({ ...base(threadId, turnId), type: "turn.started" });
       emit({ ...base(threadId, turnId), type: "session.started", sessionId: null, model });
+      if (trim) {
+        const itemId = `ctx-${newId()}`;
+        emit({
+          ...base(threadId, turnId),
+          type: "context.injected",
+          itemId,
+          source: "compression",
+          preview: trim.preview,
+          bytes: trim.bytesSaved,
+          io: { text: boundText(trim.text) },
+        });
+        try {
+          // Only the harness knows which message this turn answers, so it
+          // hangs the row there (the ACP driver does the same).
+          turn.onContextCompressed?.({
+            id: itemId,
+            source: "compression",
+            preview: trim.preview,
+            bytes: trim.bytesSaved,
+          });
+        } catch (error) {
+          console.error("minimax: onContextCompressed threw", error);
+        }
+      }
 
       // Tool ids this turn has already opened a step for.  The stream
       // announces a call once and then keeps sending argument fragments for
@@ -579,12 +851,29 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
         // item.started at all; calling it here would double every tool
         // span.
         const { text, reasoning, usage, tool_calls } = await withChatSpan(
-          { model, conversationId: threadId, taskId: turnId, provider: genAiProvider(DRIVER_KIND) },
+          {
+            model,
+            conversationId: threadId,
+            taskId: turnId,
+            provider: genAiProvider(DRIVER_KIND),
+            input: formatGenAiMessages(roundMessages),
+          },
           ({ recordUsage }) =>
             complete(roundMessages, model, {
               stream: true,
               tools: openAiTools,
               signal: opts.signal,
+              // Only the unattended path gets a per-request ceiling wide
+              // enough (900s, below) for a stalled connection to go
+              // unnoticed for a long time — see STREAM_IDLE_TIMEOUT_MS and
+              // the `budget` comment on this turn's runTurnLoop call.
+              idleTimeoutMs: turn.unattended ? STREAM_IDLE_TIMEOUT_MS : undefined,
+              reasoningEffort,
+              maxOutputTokens: turn.maxOutputTokens,
+              // Every raw chunk feeds the loop's idle clock, which is what
+              // bounds silence on the interactive path now that its hard
+              // ceiling is the loop's default rather than 180s.
+              onChunk: opts.onChunk,
               // `onPublished` before every emit that reaches the bus: it
               // is what tells the loop this round can no longer be
               // retried, because a replay would show the person text they
@@ -653,6 +942,33 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
         // Only `timeoutMs` is read from this; the provider payload is built
         // separately above from name/description/parameters.
         tools: turn.tools,
+        // Unattended turns (webhook- or resource-triggered) may need much
+        // longer than the interactive ceiling (180s when PR 625 landed) to
+        // stream a full reasoning and code response, such as the Compiler
+        // bot analysing a CI failure.  BOTFLEET-V (board row bf77b434)
+        // showed the Compiler failing this shape of turn at 180s repeatedly.  Use the wall-clock budget as
+        // the per-request ceiling so a genuinely slow-but-live stream can
+        // finish instead of being cut off mid-answer.  This is a SEPARATE
+        // policy from efficiency-and-connectivity.md's "180s timeout
+        // treated as silence" note (PR #533) — that is alert-silencing
+        // for the timeout that still fires at 180s; this changes when it
+        // fires at all.  See docs/efficiency-and-connectivity.md's
+        // "Unattended Request Ceiling" section for the fuller writeup and
+        // why only MiniMax has this override today.  A stalled CONNECTION
+        // (as opposed to a slow but live one) is still caught well before
+        // 900s by `readChunkOrStall`'s STREAM_IDLE_TIMEOUT_MS below.
+        //
+        // Interactive turns take the loop's shared defaults: a hard ceiling
+        // plus an idle clock fed by `onChunk`, so a slow-but-live stream is
+        // no longer cut off at 180s while a silent one still ends in 120s.
+        // The unattended path keeps `readChunkOrStall` as its ONLY idle
+        // guard for now (`requestIdleMs: 0`): it retries a pre-output stall
+        // as a transient `timeout`, which the loop's own idle clock does
+        // not, and retiring it waits until the shared clock has run in
+        // production.
+        budget: turn.unattended
+          ? { requestTimeoutMs: DEFAULT_TURN_LOOP_BUDGET.wallClockMs, requestIdleMs: 0 }
+          : undefined,
         toolHost: turn.toolHost,
         // The harness's permission broker, carried across on the same
         // per-turn service object caller identity rides on.  The driver
@@ -736,13 +1052,37 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
       const options: ModelCatalog["options"] = [];
       for (const row of probe.rows) {
         const id = typeof (row as { id?: unknown })?.id === "string" ? (row as { id: string }).id : "";
-        if (!id || seen.has(id)) continue;
+        if (!id || seen.has(id) || MINIMAX_RETIRED_MODEL_IDS.includes(id)) continue;
         seen.add(id);
         // Preserve the hand-written label/contextWindow for a model MODELS
         // already knows about; a genuinely new model gets its id as the
         // label rather than nothing.
         const known = MODELS.options.find((m) => m.id === id);
-        options.push({ id, label: known?.label ?? id, contextWindow: known?.contextWindow });
+        // `effortLevels` is always explicit: an id MODELS has never heard of
+        // gets `[]`, because MiniMax documents `reasoning_effort` as M3.1-only
+        // and a row with no list would inherit the engine-wide one.
+        options.push({
+          id,
+          label: known?.label ?? id,
+          contextWindow: known?.contextWindow,
+          effortLevels: known?.effortLevels ?? [],
+          defaultEffort: known?.defaultEffort,
+          supportsMaxOutput: known?.supportsMaxOutput,
+        });
+        if (id === "MiniMax-M3.1-Flash") {
+          const m1 = MODELS.options.find((m) => m.id === "MiniMax-M3.1-Flash-1M");
+          if (m1 && !seen.has(m1.id)) {
+            seen.add(m1.id);
+            options.push({
+              id: m1.id,
+              label: m1.label,
+              contextWindow: m1.contextWindow,
+              effortLevels: m1.effortLevels ?? [],
+              defaultEffort: m1.defaultEffort,
+              supportsMaxOutput: m1.supportsMaxOutput,
+            });
+          }
+        }
       }
       if (options.length === 0) return; // an empty or malformed list keeps the current catalog
       const keptDefault = options.find((o) => o.id === models.default)?.id;
@@ -811,6 +1151,16 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
           toolLoop: true,
           replaysTranscript: true,
           localComputerMcp: true,
+          // The engine gate; each catalog row names the levels its model
+          // honours (M3.1 only).
+          effortLevels: M31_EFFORT_LEVELS,
+          // Jobs matrix: BotFleet's own job tools run in this loop (P1,
+          // server/tools/jobs.ts); helpers stay `delegate_bot`.
+          backgroundJobs: "emulated",
+          helpers: "none",
+          // Every tool with an `ask` policy opens a card on the in-process
+          // permission broker (server/tools/approvals.ts) before it runs.
+          reviewHook: "before",
         },
         sendTurn,
         interruptTurn: async (threadId) => active.get(threadId)?.abort.abort(),
@@ -844,6 +1194,21 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
           stream: false,
         });
         return text.trim() ? text : reasoning;
+      },
+      // Auto-review on this same account: the utility model, no `tools`, the
+      // brief as the system message and the action as the user message,
+      // cancelled by the reviewer's deadline.
+      // Only the answer text counts as a verdict, never the reasoning.
+      reviewPermission: async (prompt: ReviewPrompt, signal?: AbortSignal) => {
+        const { text } = await complete(
+          [
+            { role: "system", content: prompt.system },
+            { role: "user", content: prompt.data },
+          ],
+          UTILITY_MODEL,
+          { stream: false, signal },
+        );
+        return text;
       },
       dispose: async () => {
         for (const { abort } of active.values()) abort.abort();

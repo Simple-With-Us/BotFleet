@@ -13,11 +13,11 @@
 // the count cannot be determined at all. An uncountable run must never report
 // success: that is exactly the shape a collection failure has.
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 
 // The FLOOR, not an exact count. An exact count would catch the failure mode
 // too, but it would need editing on every PR that adds or removes a test —
@@ -159,6 +159,17 @@ async function main(cliArgs = process.argv.slice(2)) {
 
 // Only act as a CLI when invoked directly; the unit test imports evaluateRun
 // without wanting a full suite run as a side effect.
-if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
+// Compare physical paths.  Node's ESM loader realpaths the entry module, so an
+// invocation through a symlinked directory (macOS /var -> /private/var) never
+// matches process.argv[1] when compared as text.
+function isEntryModule() {
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (isEntryModule()) {
   await main();
 }

@@ -8,7 +8,7 @@ export type LocalComputerDestination = "cloud" | "vm" | "local";
 /** The four computer providers the operator can enable. Each maps to one or
  * more legacy `LocalComputerDestination`s (see
  * `migrateAllowedComputersToProviders`). `localMac` is the host running the
- * app ("This Computer"); `localVm` is a containerized Cua desktop the
+ * app ("This Computer"); `localVm` is a containerized CUA desktop the
  * operator has prepared on this machine; `asciiBox` is the hosted
  * ASCII.dev Box; `selfHostedVps` is a container on the operator's own
  * server, reached over SSH. */
@@ -43,7 +43,7 @@ export const COMPUTER_PROVIDER_LABEL: Record<ComputerProviderId, string> = {
 export const COMPUTER_PROVIDER_DISABLE_IMPACT: Record<ComputerProviderId, string> = {
   asciiBox: "Turning this off blocks every bot that currently uses ASCII.dev Box.  Each affected bot would need a new computer picked manually.",
   selfHostedVps: "Turning this off stops new use of the VPS; existing containers and workspaces stay until removed.  Bots that use it lose the VPS until they get another computer.",
-  localVm: "Turning this off stops the Local VM container from starting.  Affected bots lose their private or shared VM desktop.",
+  localVm: "Turning this off stops the Local VM container from starting.  Affected bots lose their VM desktop.",
   localMac: "Turning this off keeps every bot off this computer.  Bots that use This Computer lose it, and Auto approvals stop working for them.",
 };
 
@@ -64,12 +64,11 @@ export const DEFAULT_COMPUTER_PROVIDERS: ComputerProviders = {
   localMac: true,
 };
 
-/** Default VPS mode whenever `selfHostedVps` is on.  Per-bot is the only
- * mode the VPS runtime implements (`server/vps-computer.ts` derives one
- * container and lease per bot id); "shared" is accepted on disk for
- * forward compatibility but is not offered in the UI until it has a
- * runtime. */
-export const DEFAULT_VPS_MODE: VpsMode = "per-bot";
+/** Default VPS mode whenever `selfHostedVps` is on.  Both modes are
+ * implemented: shared gives every bot one container with per-bot isolated
+ * desktops, per-bot gives each bot its own container and durable workspace.
+ * Shared turn leases are keyed per bot while lifecycle stays on one container. */
+export const DEFAULT_VPS_MODE: VpsMode = "shared";
 
 /** All four keys as a stable iteration order so tests and UI code do not
  * depend on `Object.keys` (which is insertion-order in modern engines but

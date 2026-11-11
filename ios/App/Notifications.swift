@@ -86,6 +86,9 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate 
         let content = UNMutableNotificationContent()
         content.title = notification.title
         content.body = notification.body
+            .replacingOccurrences(of: "&nbsp;", with: " ", options: .caseInsensitive)
+            .replacingOccurrences(of: "&#160;", with: " ")
+            .replacingOccurrences(of: "&#xA0;", with: " ", options: .caseInsensitive)
         content.sound = .default
         // `kind`, never `isBlocking` — a question is blocking too, but has
         // no verdict for Approve/Deny to send.  `isBlocking` still governs

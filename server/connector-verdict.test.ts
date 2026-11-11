@@ -34,6 +34,16 @@ describe("connectorCallFromFrame", () => {
     expect(connectorCallFromFrame(toolsCall("SLACK_WAIT_FOR_CONNECTIONS", {}))).toEqual({ kind: "passthrough" });
   });
 
+  it("does not let remote code-running meta-tools bypass a bot's grant", () => {
+    const grants: Record<string, ConnectorToolGrant> = { gmail: { tools: ["GMAIL_FETCH_EMAILS"] } };
+    for (const name of ["COMPOSIO_REMOTE_WORKBENCH", "COMPOSIO_REMOTE_BASH_TOOL"]) {
+      expect(connectorCallFromFrame(toolsCall(name, {}))).toEqual({ kind: "tools", invoked: name, names: [name] });
+      expect(evaluateConnectorTools([name], grants).allowed).toBe(false);
+      expect(filterConnectorToolsList([{ name }], grants)).toEqual([]);
+      expect(evaluateConnectorTools([name], { composio: { tools: [name] } }).allowed).toBe(true);
+    }
+  });
+
   it("reads a direct per-toolkit call", () => {
     expect(connectorCallFromFrame(toolsCall("GMAIL_SEND_EMAIL", { to: "a@b.c" })))
       .toEqual({ kind: "tools", invoked: "GMAIL_SEND_EMAIL", names: ["GMAIL_SEND_EMAIL"] });

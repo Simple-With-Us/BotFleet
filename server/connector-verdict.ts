@@ -68,6 +68,7 @@ export function serviceSlugFor(tool: string): string | null {
  * Shared by the call classifier and the tools/list filter so the two can
  * never show/allow different sets. */
 function isUngatedToolName(name: string): boolean {
+  if (name === "COMPOSIO_REMOTE_WORKBENCH" || name === "COMPOSIO_REMOTE_BASH_TOOL") return false;
   if (name.startsWith("COMPOSIO_")) return true;
   return name.endsWith("_MANAGE_CONNECTIONS") || name.endsWith("_WAIT_FOR_CONNECTIONS");
 }
@@ -89,9 +90,8 @@ export function connectorCallFromFrame(payload: unknown): ConnectorCall {
   if (name === COMPOSIO_MULTI_EXECUTE_TOOL) {
     return multiExecuteCall(name, (params as { arguments?: unknown }).arguments);
   }
-  // Platform meta-tools (search, schemas, remote workbench) are not
-  // connected-app tools, and per-service connection cards keep their card
-  // flow in any spelling — neither is gated by connectorTools.
+  // Search/schema discovery and connection cards stay ungated. Code-running
+  // platform meta-tools are treated as ordinary grantable names.
   if (isUngatedToolName(name)) return { kind: "passthrough" };
   if (!CONNECTOR_TOOL_NAME_PATTERN.test(name)) {
     return { kind: "unrecognized", invoked: name, reason: "the tool name is not a Composio tool name" };

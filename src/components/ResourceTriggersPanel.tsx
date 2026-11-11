@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Gauge, Loader2, Pause, Play, Plus, Trash2, X } from "lucide-react";
 
 import { BotAvatar } from "@/components/Avatar";
+import { TriggerErrorBadge } from "@/components/TriggerErrorBadge";
 import { stateForBot } from "@/lib/mascot";
 import { cn } from "@/lib/cn";
 import {
@@ -175,7 +176,7 @@ export function ResourceTriggersPanel({ bots }: { bots: Bot[] }) {
             const bot = bots.find((candidate) => candidate.id === trigger.botId);
             return (
               <li key={trigger.id} className="flex items-start gap-3 rounded-2xl border border-hairline/50 bg-panel/80 p-3">
-                {bot ? <BotAvatar bot={bot} state={stateForBot(bot)} size={36} /> : <div className="h-9 w-9 rounded-full bg-panel" />}
+                {bot ? <BotAvatar bot={bot} state={stateForBot(bot)} size={36} animated={false} /> : <div className="h-9 w-9 rounded-full bg-panel" />}
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2">
                     <button onClick={() => setEditor(trigger)} className="truncate text-[14px] font-medium text-ink hover:text-accent" title={trigger.name}>{trigger.name}</button>
@@ -187,6 +188,7 @@ export function ResourceTriggersPanel({ bots }: { bots: Bot[] }) {
                     {" · "}last fire {relativeTime(trigger.lastFiredAt)}
                   </p>
                 </div>
+                <TriggerErrorBadge triggerId={trigger.id} name={trigger.name} source="resource" />
                 <button onClick={() => void toggle(trigger)} className="rounded-lg p-2 text-ink-secondary hover:bg-raised hover:text-ink" aria-label={trigger.enabled ? "Pause" : "Enable"}>
                   {trigger.enabled ? <Pause size={14} /> : <Play size={14} />}
                 </button>

@@ -13,16 +13,19 @@ export function RenameTitle({
   onEditingChange,
   onActivate,
   showEditButton = false,
+  embedded = false,
   className,
   inputClassName,
 }: {
   value: string;
   onCommit: (next: string) => void;
   onEditingChange?: (editing: boolean) => void;
-  /** Optional single-click action for locations where the title opens a profile. */
+  /** Optional single-click action for locations where the title opens a profile or selects. */
   onActivate?: () => void;
   /** Preserve deliberate inline rename beside an onActivate title. */
   showEditButton?: boolean;
+  /** When embedded inside an outer interactive row or button, avoid nested role="button"/tabIndex. */
+  embedded?: boolean;
   className?: string;
   inputClassName?: string;
 }) {
@@ -107,6 +110,22 @@ export function RenameTitle({
         >
           <Pencil size={12} />
         </button>
+      </span>
+    );
+  }
+
+  if (embedded) {
+    return (
+      <span
+        className={cn("cursor-pointer select-none", className)}
+        title={`${value} · Double-click to rename`}
+        onClick={(e) => {
+          e.stopPropagation();
+          onActivate?.();
+        }}
+        onDoubleClick={startRename}
+      >
+        {value}
       </span>
     );
   }

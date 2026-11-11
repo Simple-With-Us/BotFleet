@@ -112,11 +112,15 @@ describe("skins", () => {
 
   it("site claim matches getDefaultSkin() System Auto", () => {
     const features = readFileSync(join(here, "../../apps/site/features.json"), "utf8");
-    const html = readFileSync(join(here, "../../apps/site/index.html"), "utf8");
     expect(getDefaultSkin()).toBe("system");
     expect(features).toContain("First visit uses System Auto");
     expect(features).not.toMatch(/First visit uses Studio \(light\)/);
-    expect(html).toContain("First visit uses System Auto");
+    // The rendered page is a build product (`apps/site/dist/index.html`),
+    // built from `features.json` into a directory that is not committed, so
+    // the durable check is on the content the build reads — and the build
+    // itself refuses to ship anything outside the published allowlist.
+    const published = readFileSync(join(here, "../../apps/site/public-assets.mjs"), "utf8");
+    expect(published).toContain("index.html");
   });
 });
 
