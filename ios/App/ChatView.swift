@@ -14,6 +14,7 @@ import CompanionCore
 // isn't. The App target is iOS; CompanionCore is where the portable half
 // lives.
 import UIKit
+import ImageIO
 import AVFoundation
 import PhotosUI
 import UniformTypeIdentifiers
@@ -1259,7 +1260,7 @@ struct ChatView: View {
         // steering; keep the capture locally rather than upload an orphan.
         guard recording == nil || !current.busy else { return nil }
         draft = ""
-        pendingAttachments = []
+        clearPendingAttachments()
         dictation.discardRecording()
         showCommandHUD = false
         // Sending is the reader asking to be at the newest message again,
@@ -1301,7 +1302,7 @@ struct ChatView: View {
                 transcript: transcript
             ) else { return }
             if draft.isEmpty { draft = sentText }
-            if pendingAttachments.isEmpty { pendingAttachments = outgoing }
+            if pendingAttachments.isEmpty { replacePendingAttachments(outgoing) }
             if let recording, dictation.recordedWAV == nil {
                 dictation.restoreRecording(recording.data, transcript: recording.transcript)
             }
@@ -1367,12 +1368,12 @@ struct ChatView: View {
     private func restoreQueuedDraft(from item: QueuedSend) {
         if let rawText = item.rawText {
             draft = rawText
-            pendingAttachments = item.attachments
+            replacePendingAttachments(item.attachments)
         } else {
             // Legacy rows only stored composed wire text; re-applying chips would
             // duplicate markers already embedded in `text`.
             draft = item.text
-            pendingAttachments = []
+            clearPendingAttachments()
         }
         composerFocused = true
     }
@@ -1577,8 +1578,7 @@ struct ChatView: View {
                     HStack(spacing: 8) {
                         ForEach(pendingAttachments) { item in
                             HStack(spacing: 6) {
-                                Image(systemName: item.kind == .image ? "photo" : "doc")
-                                    .font(.system(size: 13, weight: .semibold))
+                                PendingAttachmentGlyph(item: item)
                                 VStack(alignment: .leading, spacing: 1) {
                                     Text(item.name)
                                         .font(.subheadline.weight(.medium))
@@ -1588,6 +1588,7 @@ struct ChatView: View {
                                         .foregroundStyle(Color.secondary)
                                 }
                                 Button {
+                                    ComposerPendingThumbnailCache.remove(id: item.id)
                                     pendingAttachments.removeAll { $0.id == item.id }
                                 } label: {
                                     Image(systemName: "xmark.circle.fill")
@@ -1596,9 +1597,10 @@ struct ChatView: View {
                                 .buttonStyle(.plain)
                                 .accessibilityLabel("Remove \(item.name)")
                             }
-                            .padding(.leading, 10)
+                            .padding(.leading, 8)
                             .padding(.trailing, 8)
-                            .padding(.vertical, 8)
+                            .padding(.vertical, 6)
+                            .frame(minHeight: 44)
                             .background(Capsule().fill(Color.secondary.opacity(0.14)))
                         }
                     }
@@ -1988,6 +1990,64 @@ struct ChatView: View {
             return
         }
         pendingAttachments.append(PendingChatAttachment(name: name, mime: resolved, data: data))
+    }
+
+    /// Drop decoded thumbs for attachments that leave the strip.
+    private func clearPendingAttachments() {
+        replacePendingAttachments([])
+    }
+
+    private func replacePendingAttachments(_ next: [PendingChatAttachment]) {
+        let kept = Set(next.map(\.id))
+        for item in pendingAttachments where !kept.contains(item.id) {
+            ComposerPendingThumbnailCache.remove(id: item.id)
+        }
+        ComposerPendingThumbnailCache.pruneTombstones(keeping: kept)
+        for item in next {
+            ComposerPendingThumbnailCache.reinstate(id: item.id)
+        }
+        pendingAttachments = next
+    }
+}
+
+/// The mark on a pending attachment.  A photo uses the picture itself.
+/// A file, or an image the phone cannot decode, keeps an icon.
+private struct PendingAttachmentGlyph: View {
+    let item: PendingChatAttachment
+    @State private var thumbnail: UIImage?
+
+    var body: some View {
+        Group {
+            if let image = thumbnail {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: 36, height: 36)
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .accessibilityHidden(true)
+            } else {
+                Image(systemName: item.kind == .image ? "photo" : "doc")
+                    .font(.system(size: 13, weight: .semibold))
+                    .frame(width: 36, height: 36)
+                    .accessibilityHidden(true)
+            }
+        }
+        .task(id: item.id) {
+            let requestedId = item.id
+            thumbnail = nil
+            let scale = UIScreen.main.scale
+            guard let thumb = await ComposerPendingThumbnailCache.thumbnail(for: item, screenScale: scale) else {
+                return
+            }
+            guard ComposerThumbnailCachePolicy.shouldApplyThumbnailToRow(
+                requestedId: requestedId,
+                rowId: item.id,
+                isCancelled: Task.isCancelled
+            ) else {
+                return
+            }
+            thumbnail = UIImage(cgImage: thumb.cgImage)
+        }
     }
 }
 
@@ -2771,13 +2831,34 @@ struct ActivityChip: View {
         if let tool {
             SkillExecutionReceiptView(
                 skillName: tool.name,
-                status: tool.ok.map { $0 ? "success" : "error" } ?? "running",
+                status: ToolStepStatus(ok: tool.ok).receiptStatus,
                 durationMs: tool.durationMs ?? 0,
                 parameters: tool.target ?? "",
                 output: tool.detail ?? ""
             )
-            .padding(.leading, 2)
+            .modifier(ChildStepInset(parentItemId: tool.parentItemId))
         }
+    }
+}
+
+/// A child step is indented from the bot's own steps, with a rule on its
+/// left, the same idea as the desktop transcript.  The words on the row
+/// stay Done, Running, or Failed.
+private struct ChildStepInset: ViewModifier {
+    let parentItemId: String?
+
+    func body(content: Content) -> some View {
+        content
+            .padding(.leading, parentItemId == nil ? 2 : 18)
+            .overlay(alignment: .leading) {
+                if parentItemId != nil {
+                    Capsule()
+                        .fill(Color.secondary.opacity(0.45))
+                        .frame(width: 2)
+                        .padding(.vertical, 10)
+                        .accessibilityHidden(true)
+                }
+            }
     }
 }
 
@@ -2808,7 +2889,7 @@ struct ActivityRunView: View {
         } else if hasFailure {
             parts.append("\(desc.failedCount) failed")
         } else {
-            parts.append("Complete")
+            parts.append("Done")
         }
         return parts.joined(separator: ", ")
     }
@@ -2874,7 +2955,7 @@ struct ActivityRunView: View {
                                     .foregroundStyle(Color.red)
                                     .lineLimit(1)
                             } else if !isRunning {
-                                Text("• Complete")
+                                Text("• Done")
                                     .font(.scaled(12, weight: .medium, relativeTo: .caption))
                                     .foregroundStyle(Color.green)
                                     .lineLimit(1)
@@ -2932,11 +3013,12 @@ struct ActivityRunView: View {
                         if let tool = msg.tool {
                             SkillExecutionReceiptView(
                                 skillName: tool.name,
-                                status: tool.ok.map { $0 ? "success" : "error" } ?? "running",
+                                status: ToolStepStatus(ok: tool.ok).receiptStatus,
                                 durationMs: tool.durationMs ?? 0,
                                 parameters: tool.target ?? "",
                                 output: tool.detail ?? ""
                             )
+                            .modifier(ChildStepInset(parentItemId: tool.parentItemId))
                         }
                     }
                 }

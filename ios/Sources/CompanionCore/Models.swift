@@ -129,6 +129,10 @@ public struct ToolActivity: Codable, Hashable, Sendable {
     public var kind: String?
     public var detail: String?
     public var durationMs: Int?
+    /// The harness id for this step.  A child step points at the step that
+    /// started it with `parentItemId`.
+    public var itemId: String? = nil
+    public var parentItemId: String? = nil
 }
 
 public struct Sender: Codable, Hashable, Sendable {
