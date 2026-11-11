@@ -78,6 +78,29 @@ final class ComposerPendingThumbnailCacheTests: XCTestCase {
         _ = await task.value
         XCTAssertNil(ComposerPendingThumbnailCache.cachedThumbnail(for: attachment.id))
     }
+
+    func testManyRemovesStayWithinTheTombstoneCap() {
+        for _ in 0..<50 {
+            ComposerPendingThumbnailCache.remove(id: UUID())
+        }
+        XCTAssertLessThanOrEqual(
+            ComposerPendingThumbnailCache.tombstoneCountForTests(),
+            32
+        )
+    }
+
+    func testPruneDropsTombstonesThatNoLongerGuardAStripId() {
+        let gone = UUID()
+        ComposerPendingThumbnailCache.remove(id: gone)
+        ComposerPendingThumbnailCache.pruneTombstones(keeping: [])
+        XCTAssertEqual(ComposerPendingThumbnailCache.tombstoneCountForTests(), 0)
+    }
+
+    func testDecodeCompletionClearsItsTombstone() async {
+        let attachment = PendingChatAttachment(name: "once.png", mime: "image/png", data: Self.onePixelPNG)
+        _ = await ComposerPendingThumbnailCache.thumbnail(for: attachment, screenScale: 2)
+        XCTAssertEqual(ComposerPendingThumbnailCache.tombstoneCountForTests(), 0)
+    }
 }
 
 final class ComposerThumbnailCachePolicyTests: XCTestCase {
