@@ -1,0 +1,89 @@
+import XCTest
+@testable import CompanionCore
+
+final class ComposerPendingThumbnailCacheTests: XCTestCase {
+    private static let onePixelPNG = Data(
+        base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+    )!
+
+    override func setUp() {
+        super.setUp()
+        ComposerPendingThumbnailCache.resetForTests()
+    }
+
+    func testDownsampleStaysWithinTheChipBudget() {
+        let thumb = ComposerPendingThumbnailCache.downsample(
+            data: Self.onePixelPNG,
+            maxPixelSize: 72
+        )
+        XCTAssertNotNil(thumb)
+        XCTAssertLessThanOrEqual(thumb?.cgImage.width ?? 0, 72)
+        XCTAssertLessThanOrEqual(thumb?.cgImage.height ?? 0, 72)
+    }
+
+    func testThumbnailCachesAndReusesDecodedPixels() async {
+        let attachment = PendingChatAttachment(name: "a.png", mime: "image/png", data: Self.onePixelPNG)
+        let first = await ComposerPendingThumbnailCache.thumbnail(for: attachment, screenScale: 2)
+        XCTAssertNotNil(first)
+        let second = await ComposerPendingThumbnailCache.thumbnail(for: attachment, screenScale: 2)
+        XCTAssertTrue(first === second)
+    }
+
+    func testRemoveEvictsAndBlocksAStoreDecision() async {
+        let attachment = PendingChatAttachment(name: "gone.png", mime: "image/png", data: Self.onePixelPNG)
+        _ = await ComposerPendingThumbnailCache.thumbnail(for: attachment, screenScale: 2)
+        XCTAssertNotNil(ComposerPendingThumbnailCache.cachedThumbnail(for: attachment.id))
+        ComposerPendingThumbnailCache.remove(id: attachment.id)
+        XCTAssertNil(ComposerPendingThumbnailCache.cachedThumbnail(for: attachment.id))
+        XCTAssertFalse(
+            ComposerThumbnailCachePolicy.shouldStoreThumbnailInCache(
+                attachmentId: attachment.id,
+                isCancelled: false,
+                droppedFromStrip: true
+            )
+        )
+    }
+
+    func testRemoveDuringDecodeDoesNotPopulateCache() async {
+        let id = UUID()
+        let attachment = PendingChatAttachment(id: id, name: "flight.png", mime: "image/png", data: Self.onePixelPNG)
+        async let pending = ComposerPendingThumbnailCache.thumbnail(for: attachment, screenScale: 2)
+        ComposerPendingThumbnailCache.remove(id: id)
+        _ = await pending
+        XCTAssertNil(ComposerPendingThumbnailCache.cachedThumbnail(for: id))
+    }
+
+    func testCancelledTaskSkipsCachePopulation() async {
+        let attachment = PendingChatAttachment(name: "slow.png", mime: "image/png", data: Self.onePixelPNG)
+        let task = Task {
+            await ComposerPendingThumbnailCache.thumbnail(for: attachment, screenScale: 2)
+        }
+        task.cancel()
+        _ = await task.value
+        XCTAssertNil(ComposerPendingThumbnailCache.cachedThumbnail(for: attachment.id))
+    }
+}
+
+final class ComposerThumbnailCachePolicyTests: XCTestCase {
+    func testStaleDecodeIsDroppedWhenRowIdentityChanged() {
+        let first = UUID()
+        let second = UUID()
+        XCTAssertFalse(
+            ComposerThumbnailCachePolicy.shouldApplyThumbnailToRow(
+                requestedId: first,
+                rowId: second,
+                isCancelled: false
+            )
+        )
+    }
+
+    func testRemovedAttachmentIsNotStoredInCache() {
+        XCTAssertFalse(
+            ComposerThumbnailCachePolicy.shouldStoreThumbnailInCache(
+                attachmentId: UUID(),
+                isCancelled: false,
+                droppedFromStrip: true
+            )
+        )
+    }
+}

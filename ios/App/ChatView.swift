@@ -1583,7 +1583,7 @@ struct ChatView: View {
                                         .foregroundStyle(Color.secondary)
                                 }
                                 Button {
-                                    PendingAttachmentThumbCache.remove(id: item.id)
+                                    ComposerPendingThumbnailCache.remove(id: item.id)
                                     pendingAttachments.removeAll { $0.id == item.id }
                                 } label: {
                                     Image(systemName: "xmark.circle.fill")
@@ -1995,7 +1995,7 @@ struct ChatView: View {
     private func replacePendingAttachments(_ next: [PendingChatAttachment]) {
         let kept = Set(next.map(\.id))
         for item in pendingAttachments where !kept.contains(item.id) {
-            PendingAttachmentThumbCache.remove(id: item.id)
+            ComposerPendingThumbnailCache.remove(id: item.id)
         }
         pendingAttachments = next
     }
@@ -2024,84 +2024,21 @@ private struct PendingAttachmentGlyph: View {
             }
         }
         .task(id: item.id) {
+            let requestedId = item.id
+            thumbnail = nil
             let scale = UIScreen.main.scale
-            thumbnail = await PendingAttachmentThumbCache.thumbnail(for: item, screenScale: scale)
-        }
-    }
-}
-
-/// Downsampled photo thumbnails, keyed by the pending item.
-///
-/// The strip redraws as the draft changes.  ImageIO builds a thumbnail off
-/// the main thread, and the cache drops an entry when that attachment leaves
-/// the strip.  Count and cost limits cover anything a removal missed.
-private enum PendingAttachmentThumbCache {
-    /// The chip draws the photo at 36 points.
-    static let pointSize: CGFloat = 36
-    /// The composer holds eight attachments.  A few extra slots cover a
-    /// send that puts the same photos back.
-    static let countLimit = 16
-
-    static let images: NSCache<NSString, UIImage> = {
-        let cache = NSCache<NSString, UIImage>()
-        cache.countLimit = countLimit
-        cache.totalCostLimit = countLimit * 128 * 128 * 4
-        return cache
-    }()
-
-    static func remove(id: UUID) {
-        images.removeObject(forKey: id.uuidString as NSString)
-    }
-
-    static func thumbnail(for item: PendingChatAttachment, screenScale: CGFloat) async -> UIImage? {
-        guard let data = item.previewImageData else { return nil }
-        let key = item.id.uuidString as NSString
-        if let cached = images.object(forKey: key) { return cached }
-        let maxPixel = max(Int((pointSize * max(screenScale, 1)).rounded(.up)), 1)
-        let decoded = await downsampleOffMain(data: data, maxPixelSize: maxPixel)
-        guard let decoded, !Task.isCancelled else { return nil }
-        let cost = decoded.cgImage.map { $0.bytesPerRow * $0.height } ?? (maxPixel * maxPixel * 4)
-        images.setObject(decoded, forKey: key, cost: cost)
-        return decoded
-    }
-
-    /// The continuation carries `Void` so the decoded image never has to
-    /// cross as a sendable value.  The box is filled before resume, and the
-    /// caller reads it only after that resume.
-    private static func downsampleOffMain(data: Data, maxPixelSize: Int) async -> UIImage? {
-        let box = ThumbnailBox()
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            DispatchQueue.global(qos: .userInitiated).async {
-                box.image = downsample(data: data, maxPixelSize: maxPixelSize)
-                continuation.resume()
+            guard let thumb = await ComposerPendingThumbnailCache.thumbnail(for: item, screenScale: scale) else {
+                return
             }
+            guard ComposerThumbnailCachePolicy.shouldApplyThumbnailToRow(
+                requestedId: requestedId,
+                rowId: item.id,
+                isCancelled: Task.isCancelled
+            ) else {
+                return
+            }
+            thumbnail = UIImage(cgImage: thumb.cgImage)
         }
-        return box.image
-    }
-
-    private final class ThumbnailBox: @unchecked Sendable {
-        var image: UIImage?
-    }
-
-    /// ImageIO decodes only the pixels the chip needs.  A full
-    /// `UIImage(data:)` would expand the photo on the main thread.
-    private static func downsample(data: Data, maxPixelSize: Int) -> UIImage? {
-        let sourceOptions: [CFString: Any] = [
-            kCGImageSourceShouldCache: false,
-        ]
-        guard let source = CGImageSourceCreateWithData(data as CFData, sourceOptions as CFDictionary) else {
-            return nil
-        }
-        let options: [CFString: Any] = [
-            kCGImageSourceCreateThumbnailFromImageAlways: true,
-            kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceShouldCacheImmediately: true,
-            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
-        ]
-        guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
-            return nil
-        }
-        return UIImage(cgImage: cgImage)
     }
 }
 
