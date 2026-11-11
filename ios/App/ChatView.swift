@@ -1572,8 +1572,7 @@ struct ChatView: View {
                     HStack(spacing: 8) {
                         ForEach(pendingAttachments) { item in
                             HStack(spacing: 6) {
-                                Image(systemName: item.kind == .image ? "photo" : "doc")
-                                    .font(.system(size: 13, weight: .semibold))
+                                PendingAttachmentGlyph(item: item)
                                 VStack(alignment: .leading, spacing: 1) {
                                     Text(item.name)
                                         .font(.subheadline.weight(.medium))
@@ -1591,9 +1590,10 @@ struct ChatView: View {
                                 .buttonStyle(.plain)
                                 .accessibilityLabel("Remove \(item.name)")
                             }
-                            .padding(.leading, 10)
+                            .padding(.leading, 8)
                             .padding(.trailing, 8)
-                            .padding(.vertical, 8)
+                            .padding(.vertical, 6)
+                            .frame(minHeight: 44)
                             .background(Capsule().fill(Color.secondary.opacity(0.14)))
                         }
                     }
@@ -1983,6 +1983,44 @@ struct ChatView: View {
             return
         }
         pendingAttachments.append(PendingChatAttachment(name: name, mime: resolved, data: data))
+    }
+}
+
+/// The mark on a pending attachment.  A photo uses the picture itself.
+/// A file, or an image the phone cannot decode, keeps an icon.
+private struct PendingAttachmentGlyph: View {
+    let item: PendingChatAttachment
+
+    var body: some View {
+        if let image = PendingAttachmentThumbCache.image(for: item) {
+            Image(uiImage: image)
+                .resizable()
+                .scaledToFill()
+                .frame(width: 36, height: 36)
+                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .accessibilityHidden(true)
+        } else {
+            Image(systemName: item.kind == .image ? "photo" : "doc")
+                .font(.system(size: 13, weight: .semibold))
+                .frame(width: 36, height: 36)
+                .accessibilityHidden(true)
+        }
+    }
+}
+
+/// Decoded photo thumbnails, keyed by the pending item.  The strip redraws
+/// as the draft changes, and decoding the same photo on every pass is wasted
+/// work.
+private enum PendingAttachmentThumbCache {
+    static let images = NSCache<NSString, UIImage>()
+
+    static func image(for item: PendingChatAttachment) -> UIImage? {
+        guard let data = item.previewImageData else { return nil }
+        let key = item.id.uuidString as NSString
+        if let cached = images.object(forKey: key) { return cached }
+        guard let decoded = UIImage(data: data) else { return nil }
+        images.setObject(decoded, forKey: key)
+        return decoded
     }
 }
 
@@ -2766,13 +2804,34 @@ struct ActivityChip: View {
         if let tool {
             SkillExecutionReceiptView(
                 skillName: tool.name,
-                status: tool.ok.map { $0 ? "success" : "error" } ?? "running",
+                status: ToolStepStatus(ok: tool.ok).receiptStatus,
                 durationMs: tool.durationMs ?? 0,
                 parameters: tool.target ?? "",
                 output: tool.detail ?? ""
             )
-            .padding(.leading, 2)
+            .modifier(ChildStepInset(parentItemId: tool.parentItemId))
         }
+    }
+}
+
+/// A child step is indented from the bot's own steps, with a rule on its
+/// left, the same idea as the desktop transcript.  The words on the row
+/// stay Done, Running, or Failed.
+private struct ChildStepInset: ViewModifier {
+    let parentItemId: String?
+
+    func body(content: Content) -> some View {
+        content
+            .padding(.leading, parentItemId == nil ? 2 : 18)
+            .overlay(alignment: .leading) {
+                if parentItemId != nil {
+                    Capsule()
+                        .fill(Color.secondary.opacity(0.45))
+                        .frame(width: 2)
+                        .padding(.vertical, 10)
+                        .accessibilityHidden(true)
+                }
+            }
     }
 }
 
@@ -2803,7 +2862,7 @@ struct ActivityRunView: View {
         } else if hasFailure {
             parts.append("\(desc.failedCount) failed")
         } else {
-            parts.append("Complete")
+            parts.append("Done")
         }
         return parts.joined(separator: ", ")
     }
@@ -2869,7 +2928,7 @@ struct ActivityRunView: View {
                                     .foregroundStyle(Color.red)
                                     .lineLimit(1)
                             } else if !isRunning {
-                                Text("• Complete")
+                                Text("• Done")
                                     .font(.scaled(12, weight: .medium, relativeTo: .caption))
                                     .foregroundStyle(Color.green)
                                     .lineLimit(1)
@@ -2927,11 +2986,12 @@ struct ActivityRunView: View {
                         if let tool = msg.tool {
                             SkillExecutionReceiptView(
                                 skillName: tool.name,
-                                status: tool.ok.map { $0 ? "success" : "error" } ?? "running",
+                                status: ToolStepStatus(ok: tool.ok).receiptStatus,
                                 durationMs: tool.durationMs ?? 0,
                                 parameters: tool.target ?? "",
                                 output: tool.detail ?? ""
                             )
+                            .modifier(ChildStepInset(parentItemId: tool.parentItemId))
                         }
                     }
                 }

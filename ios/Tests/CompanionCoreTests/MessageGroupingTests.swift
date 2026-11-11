@@ -119,6 +119,22 @@ struct MessageGroupingTests {
         #expect(summary.contains("read ×2"))
     }
 
+    @Test("a step still running, and a child step, stay on their own rows")
+    func runningAndChildStepsStayVisible() {
+        var running = Message(id: "run", role: .bot, kind: .activity, at: 1_002)
+        running.tool = ToolActivity(name: "Read", ok: nil)
+        var child = Message(id: "child", role: .bot, kind: .activity, at: 1_008)
+        child.tool = ToolActivity(name: "Read", ok: true, itemId: "read-1", parentItemId: "task-1")
+        let items = groupMessageRuns([
+            tool("t1", at: 1_000),
+            running,
+            tool("t2", at: 1_004),
+            child,
+        ])
+        #expect(items.map(\.id) == ["t1", "run", "t2", "child"])
+        #expect(items.flatMap { $0.messages.map(\.id) } == ["t1", "run", "t2", "child"])
+    }
+
     @Test("error: tools never fold")
     func errorToolsNeverFold() {
         var m = tool("e1", at: 1_000)

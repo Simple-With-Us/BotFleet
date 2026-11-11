@@ -45,10 +45,13 @@ public struct SkillExecutionReceiptView: View {
         case running, success, failure
 
         init(_ raw: String) {
-            switch raw {
-            case "running": self = .running
-            case "error": self = .failure
-            default: self = .success
+            switch raw.lowercased() {
+            case "running", "in_progress":
+                self = .running
+            case "error", "failed", "failure":
+                self = .failure
+            default:
+                self = .success
             }
         }
 

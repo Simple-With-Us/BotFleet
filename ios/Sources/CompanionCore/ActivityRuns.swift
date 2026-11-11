@@ -32,10 +32,47 @@ public enum TranscriptItem: Identifiable, Hashable, Sendable {
     }
 }
 
+/// The three words a tool row may show.  No outcome yet means it is still
+/// running.  `ok == false` is the only failure.
+public enum ToolStepStatus: String, Sendable, Equatable {
+    case done = "Done"
+    case running = "Running"
+    case failed = "Failed"
+
+    public init(ok: Bool?) {
+        switch ok {
+        case .some(true):
+            self = .done
+        case .some(false):
+            self = .failed
+        case .none:
+            self = .running
+        }
+    }
+
+    /// The status string the receipt card already understands.
+    public var receiptStatus: String {
+        switch self {
+        case .done:
+            return "success"
+        case .running:
+            return "running"
+        case .failed:
+            return "error"
+        }
+    }
+}
+
 /// A step that may be folded into an activity run.
 public func isFoldableActivity(_ message: Message) -> Bool {
     guard message.kind == .activity, let tool = message.tool else { return false }
     if message.comm != nil { return false }
+    // A step still running stays on its own row.  Folding it would hide
+    // mid-turn work until the turn finished.
+    if tool.ok == nil { return false }
+    // A child step stays on its own row too.  Folding it into the summary
+    // hides whose work it was until the reader opens the run.
+    if tool.parentItemId != nil { return false }
     return !tool.name.hasPrefix("error:")
 }
 
