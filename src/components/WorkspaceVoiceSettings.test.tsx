@@ -214,7 +214,7 @@ describe("workspace voice settings", () => {
 
   it("tells an older computer's owner to update instead of showing an empty list", async () => {
     await mount(list_({ ...baseTts(), pronunciations: undefined }));
-    expect(container.textContent).toContain("Update the bot server on this computer to edit pronunciations.");
+    expect(container.textContent).toContain("Update BotFleet on this computer to edit pronunciations.");
     expect(rows()).toHaveLength(0);
   });
 

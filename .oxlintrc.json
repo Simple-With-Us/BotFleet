@@ -16,6 +16,7 @@
     "dist-native/**",
     "dist-server/**",
     "electron/vendor/**",
+    "public/tv-face/vendor/**",
     "release/**",
     "tools/oxlint/anti-slop/**"
   ],

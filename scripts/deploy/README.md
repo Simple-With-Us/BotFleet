@@ -8,7 +8,7 @@ The workflow is off until the repository variable `VERCEL_CATCH_UP_ENABLED` is e
 
 1. Check the IDs, root directory and watched paths in `vercel-config.json` against the live project.  Stable GitHub repo IDs are used because the provider owner-name fields can lag a repository move.
 2. Confirm the CI machine identity can read only the required `VERCEL_TOKEN` from Fleet-OPS production root.  Do not copy token values into code, logs or chat.  Existing authentication loads it into the runner environment.  The pinned CLI reads `VERCEL_TOKEN` from the environment, not a command-line token argument.
-3. Disable the provider Git publisher for this project, keeping its Git link, root directory, domains and protection.  Disable any older CLI publisher as well.  The new gate refuses to run unless `gitProviderOptions.createDeployments` is `disabled`; all other provider changes are outside this PR.
+3. Disable the provider Git publisher for this project, keeping its Git link, root directory, domains and protection.  The switch is `git.deploymentEnabled` in `apps/site/vercel.json`, set to the plain boolean `false` by this change (no branch map, so no matching-rule ambiguity) (`gitProviderOptions.createDeployments` only controls GitHub Deployment records, not Git-push builds, so it is not the cutover).  Disable any older CLI publisher as well.  The gate re-reads the site `vercel.json` at the exact checkout on every run and refuses while production-branch builds stay enabled; all other provider changes are outside this PR.
 4. Enable `VERCEL_CATCH_UP_ENABLED`.  Run the catch-up workflow once on main.  It skips until the last production attempt is at least 10800 seconds old.  Failures and cancellations count too, so repeated failures cannot spend a deployment every hour.  No deploy occurs while one is in flight.
 5. Inspect the provider receipt: current project production target, exact checkout SHA, READY state and deployment URL.  A successful CLI exit or a green no-op workflow is not a shipping receipt.  Verify the public site separately.
 
@@ -18,7 +18,7 @@ Keep the workflow disabled if token access, project mapping, deployment metadata
 
 `node --test scripts/deploy/vercel-catch-up.node-test.mjs`
 
-The dependency-free unit and entrypoint integration tests cover the 3h boundary, last-skipped-merge catch-up, docs-only later commits, failed/canceled attempts, in-flight builds, binding/root drift, malformed provider data, exact-SHA CI, and deployment receipts.  PR runs execute tests without secrets.  Builds run from the repo root so the Vercel root directory is applied once.  CLI is pinned to 64.5.0.
+The dependency-free unit and entrypoint integration tests cover the 3h boundary, last-skipped-merge catch-up, docs-only later commits, failed/canceled attempts, in-flight builds, binding/root drift, competing-publisher state, malformed provider data, exact-SHA CI, and deployment receipts.  PR runs execute tests without secrets.  Builds run from the repo root so the Vercel root directory is applied once.  CLI is pinned to 64.5.0.
 
 If upload times out, do not retry the POST blindly.  The next hourly run reads provider history and the current production target before deciding again.  A READY deployment with a mismatched SHA, or a deployment not promoted to production, fails receipt verification.
 

@@ -1,6 +1,6 @@
 // On-device dictation for the composer.
 //
-// Same engine as the desktop helper (`electron/resources/speech-helper.swift`):
+// Same engine as the desktop helper (`native/helpers/speech-helper.swift`):
 // `SFSpeechRecognizer` on an `AVAudioEngine` tap, partials streamed into the
 // text field, press to stop. Composer mode, not call mode — there is no
 // silence endpointing. The phone is better at this than the Mac was: the

@@ -1,8 +1,9 @@
 import { downloadAllBots, downloadAllConversations } from "@/lib/team-files";
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { Loader2, Menu, X } from "lucide-react";
-import { StoreProvider, useStore, getRoomTerminology, type AppSettingsSection } from "@/state/store";
+import { StoreProvider, useStore, getConversationMode, getRoomTerminology, type AppSettingsSection } from "@/state/store";
 import { eligibleTaskApps } from "@/lib/task-app-context";
+import type { ConversationMode } from "../shared/conversation-mode";
 import { ERROR_RECOVERY_EVENT, type ErrorRecoveryDetail } from "@/components/ErrorRow";
 import { Onboarding } from "@/components/Onboarding";
 import { emailGateDone, initAnalytics } from "@/lib/analytics";
@@ -15,6 +16,7 @@ import { UpdateBanner } from "@/components/UpdateBanner";
 import { DesktopCapabilitiesProvider } from "@/components/DesktopCapabilities";
 import { NoEngines } from "@/components/NoEngines";
 import { noEngineCanRun } from "@/lib/engine-status";
+import { planAppThreadOpen } from "@/lib/simple-app-thread-switch";
 import { resolveAppContext, shownThreadId, threadIdForApp } from "@/lib/task-app-thread";
 import { useDismissOnSelection } from "@/lib/use-dismiss-on-selection";
 
@@ -64,6 +66,7 @@ const SkillRecorderPage = lazy(() =>
   import("@/components/SkillRecorderPage").then((m) => ({ default: m.SkillRecorderPage })),
 );
 import { AppDeck } from "@/components/AppDeck";
+import { SimpleAppThreadRefusal } from "@/components/SimpleAppThreadRefusal";
 
 const FleetMatrixView = lazy(() =>
   import("@/components/FleetMatrixView").then((m) => ({ default: m.FleetMatrixView })),
@@ -102,6 +105,15 @@ function Shell() {
   const taskCreationBot = state.bots.find((entry) => entry.id === state.taskCreationBotId);
   const [selectedAppId, setSelectedAppId] = useState<string | null>(() => (group && !group.dm ? group.id : null));
   const [matrixOverviewActive, setMatrixOverviewActive] = useState(false);
+  const [threadRefusal, setThreadRefusal] = useState<{
+    botId: string;
+    message: string;
+    /** Selection and workspace-arrangement epoch when the refusal was shown:
+     *  the banner lives until the user makes a new pick or the arrangement
+     *     changes, whichever comes first. */
+    nonce: number;
+    mode: ConversationMode;
+  } | null>(null);
   const hasApps = state.groups.some((g) => !g.dm);
 
   // The task-switch ack clears the pin, so a null pin means "the bot's active
@@ -154,14 +166,37 @@ function Shell() {
   // engine whose probe has not answered yet is not proof of an empty Mac.
   const noEngines = state.connected && noEngineCanRun(state.instances);
 
+  const conversationMode = getConversationMode(state.config);
   const openBotInApp = useCallback((botId: string, appId: string) => {
     const b = state.bots.find((x) => x.id === botId);
-    const threadId = threadIdForApp(b, appId);
-    dispatch({ type: "select", id: botId, viewedThreadId: threadId });
-    if (threadId && threadId !== b?.threadId && !b?.busy) {
-      dispatch({ type: "switchTask", botId, threadId });
+    const plan = planAppThreadOpen({
+      // An unloaded config is not a Simple arrangement: pass null so the gate
+      // stays out of the way until the real one is known.
+      mode: state.config ? conversationMode : null,
+      bot: b,
+      appId,
+    });
+    switch (plan.action) {
+      case "refuse":
+        // The refusal copy says nothing was switched, so nothing is: no
+        // select dispatch, no cleared thread pin, no lost App context.  The
+        // banner anchors to this pick's nonce and mode instead.
+        // The pick no longer brings the bot on screen, so the note names it.
+        setThreadRefusal({ botId, message: `${b?.name ?? botId}: ${plan.message}`, nonce: state.selectionNonce, mode: conversationMode });
+        return;
+      case "show":
+        setThreadRefusal(null);
+        dispatch({ type: "select", id: botId, viewedThreadId: plan.threadId ?? null });
+        if (plan.activate && plan.threadId && !b?.busy) {
+          dispatch({ type: "switchTask", botId, threadId: plan.threadId });
+        }
+        return;
+      default: {
+        const _exhaustive: never = plan;
+        return _exhaustive;
+      }
     }
-  }, [state.bots, dispatch]);
+  }, [state.bots, state.config, state.selectionNonce, conversationMode, dispatch]);
 
   // App-wide shortcuts: ⌘N new bot · ⌘1–9 jump to bot · ⌘⇧[ / ⌘⇧] prev/next.
   // Kept deliberately small; every panel already closes on Esc.
@@ -199,6 +234,15 @@ function Shell() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [state.bots, state.selectedId, selectedAppId, appKeyboardRouting, dispatch, openBotInApp]);
+
+  useEffect(() => {
+    if (
+      threadRefusal
+      && (state.selectionNonce !== threadRefusal.nonce || conversationMode !== threadRefusal.mode)
+    ) {
+      setThreadRefusal(null);
+    }
+  }, [state.selectionNonce, conversationMode, threadRefusal]);
 
   useEffect(() => {
     window.ogb?.setUnreadCount?.(unreadCount);
@@ -355,10 +399,8 @@ function Shell() {
     });
   }, [dispatch]);
 
-  // Pin the app thread, and switch the server's active task when it differs.
-  // `select` only changes client state.  Messages, reactions, recordings, and
-  // loadEarlier follow `bot.threadId`, so a pin onto another thread would
-  // render a transcript the store never loaded.
+  // A pin onto another conversation would render a transcript the store never loaded.
+  // Simple keeps the open conversation and names a saved App conversation instead of opening it.
 
   return (
     <div className="flex h-full flex-col">
@@ -381,6 +423,12 @@ function Shell() {
             <X size={14} />
           </button>
         </div>
+      )}
+      {threadRefusal && (
+        <SimpleAppThreadRefusal
+          message={threadRefusal.message}
+          onDismiss={() => setThreadRefusal(null)}
+        />
       )}
       {state.hydration.error && (
         <div

@@ -27,8 +27,8 @@ Kody re-reviews the **entire diff** on each push, so an open PR can accumulate n
 
 Requirements: **Node 24+**, **pnpm**, and for actually chatting with a bot, at least one agent CLI
 ([`claude`](https://claude.com/claude-code) or [`codex`](https://github.com/openai/codex)) installed
-and logged in. macOS is the primary release platform and Ubuntu 24.04 x64 is the Linux desktop beta;
-the harness server itself is portable Node and the test suite runs on macOS, Linux, and Windows.
+and logged in. macOS is the only release platform (BF-2500 dropped the Windows and Ubuntu desktop builds from CI
+and releases); the harness server itself is portable Node and the test suite runs on macOS and Linux.
 
 ```sh
 git clone https://github.com/Simple-With-Us/BotFleet && cd BotFleet
@@ -55,23 +55,11 @@ launching Electron, run `node scripts/prepare-cloudflared.mjs --current`.
 
 For Ubuntu installation and real desktop checks, see [`docs/linux-desktop.md`](docs/linux-desktop.md).
 
-## Ubuntu release checklist
+## Ubuntu packages
 
-Ubuntu release packages must come from the manual **Package Ubuntu** workflow on an exact release commit or tag,
-not from a developer workstation. The Ubuntu 24.04 runner builds and verifies both formats, launches the unpacked
-app and AppImage, routes `click` and `type_text` through the overlay-free bundled Cua runtime on Xorg, runs the
-fail-closed Wayland CUA smoke,
-and produces one release artifact containing:
-
-- the versioned `.deb` and AppImage;
-- stable `BotFleet-amd64.deb` and `BotFleet.AppImage` copies used by the latest-download links;
-- `SHA256SUMS-ubuntu-x64.txt` covering both versioned and stable names.
-
-Before publishing, confirm that `package.json` has the release version and dispatch the workflow against the same
-commit used for the other platforms. Attach all five Ubuntu files to the matching release in the separate
-[Releases page](https://github.com/Simple-With-Us/BotFleet/releases).  Then verify the checksum
-file and install the `.deb` plus launch the AppImage in a clean Ubuntu 24.04 x86_64 GNOME environment. Never combine
-packages built from different commits under one version.
+CI no longer builds, verifies, or releases Ubuntu packages (BF-2500 removed the manual **Package Ubuntu** workflow and
+the release workflow's Ubuntu job).  A package built by hand from [`docs/linux-desktop.md`](docs/linux-desktop.md) has no
+CI verification, and the Releases page carries macOS builds only.
 
 ## Repo map
 

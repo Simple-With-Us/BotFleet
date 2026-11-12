@@ -12,7 +12,7 @@
 // - The recognizer's locale is the user's language, not a hardcoded
 //   English. A French speaker talking to an en-US recognizer gets
 //   nonsense, which is how this went wrong on the desktop the first time
-//   (`electron/resources/speech-helper.swift`). Same candidate list here.
+//   (`native/helpers/speech-helper.swift`). Same candidate list here.
 import Foundation
 
 public enum Dictation {

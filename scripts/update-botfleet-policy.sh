@@ -271,14 +271,17 @@ if [[ "$BOTFLEET_CHECKOUT_IS_GIT" == "1" ]]; then
   # options on unquiesce, so a target can never reach it as an argument;
   # ignore targets for its bootstrap too and recover with origin/main's
   # updater.
-  if [[ "${1:-update}" == "unquiesce" ]]; then
-    BOOTSTRAP_REF="origin/main"
-  fi
+  # status and recover only read or restore local state, so a stray target
+  # must not keep them from running.  unquiesce is the same kind of recovery.
+  case "${1:-update}" in
+    unquiesce|status|recover) BOOTSTRAP_REF="origin/main" ;;
+  esac
   # BOTFLEET_UPDATE_TARGET is part of the wrapper interface, so forward it to
   # commands that resolve a candidate as well as using it for bootstrap policy.
   # apply gets its immutable target from prepared.json; unquiesce takes no options.
   if [[ -n "${BOTFLEET_UPDATE_TARGET:-}" && "$HAS_BOOTSTRAP_TARGET" == "0" &&
-        "${1:-update}" != "apply" && "${1:-update}" != "unquiesce" ]]; then
+        "${1:-update}" != "apply" && "${1:-update}" != "unquiesce" &&
+        "${1:-update}" != "status" && "${1:-update}" != "recover" ]]; then
     UPDATER_ARGS+=(--target "$BOTFLEET_UPDATE_TARGET")
   fi
   # `apply --stage PATH` takes no --target: its target is the immutable commit
@@ -367,7 +370,7 @@ if [[ "$BOTFLEET_CHECKOUT_IS_GIT" == "1" ]]; then
   SELECT_NEWEST_GREEN=0
   if [[ "$HAS_BOOTSTRAP_TARGET" == "0" && -z "${BOTFLEET_UPDATE_TARGET:-}" ]]; then
     case "${1:-update}" in
-      apply|unquiesce) ;;
+      apply|unquiesce|status|recover) ;;
       *) SELECT_NEWEST_GREEN=1 ;;
     esac
     for arg in "$@"; do
@@ -489,20 +492,28 @@ if [[ "$BOTFLEET_CHECKOUT_IS_GIT" == "1" ]]; then
         BOOTSTRAP_ASSEMBLED=1
       else
         BOOTSTRAP_ASSEMBLED=0
+        OPTIONAL_STARTUP_RECEIPT=()
+        if git -C "$BOTFLEET_CHECKOUT" cat-file -e "$BOOTSTRAP_COMMIT:electron/desktop-startup-receipt.mjs" 2>/dev/null; then
+          OPTIONAL_STARTUP_RECEIPT=(electron/desktop-startup-receipt.mjs)
+        fi
         if git -C "$BOTFLEET_CHECKOUT" archive "$BOOTSTRAP_COMMIT" -- \
           scripts/update-botfleet-mac.mjs \
           scripts/mac-update-transaction.mjs \
+          scripts/harness-release-store.mjs \
+          scripts/release-provenance.mjs \
           scripts/update-progress.mjs \
           scripts/ci-build-resolver.mjs \
           scripts/stage-entries.mjs \
           scripts/failed-install-retention.mjs \
-          electron/update-credential-preparation.mjs | tar -x -C "$BOOTSTRAP_DIR"; then
+          electron/update-credential-preparation.mjs \
+          ${OPTIONAL_STARTUP_RECEIPT[@]+"${OPTIONAL_STARTUP_RECEIPT[@]}"} | tar -x -C "$BOOTSTRAP_DIR"; then
           BOOTSTRAP_ASSEMBLED=1
         fi
       fi
       if [[ "$BOOTSTRAP_ASSEMBLED" == 1 ]]; then
         PINNED_ARGS=()
-        if [[ "${1:-update}" != "apply" && "${1:-update}" != "unquiesce" ]]; then
+        if [[ "${1:-update}" != "apply" && "${1:-update}" != "unquiesce" &&
+              "${1:-update}" != "status" && "${1:-update}" != "recover" ]]; then
           SKIP_TARGET_VALUE=0
           for arg in ${UPDATER_ARGS[@]+"${UPDATER_ARGS[@]}"}; do
             if [[ "$SKIP_TARGET_VALUE" == "1" ]]; then

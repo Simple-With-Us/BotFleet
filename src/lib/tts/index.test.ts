@@ -8,6 +8,7 @@ import {
   PERSONAL_VOICE_NOT_ON_THIS_MAC,
   REPLY_TOO_LONG,
   Speaker,
+  speakingBotId,
 } from "./index";
 import type { KaraokeFeed } from "./karaoke-feed";
 import type { TtsAudioBody } from "./schema";
@@ -570,6 +571,27 @@ describe("Speaker with an Apple Personal Voice on this Mac", () => {
     await second;
     expect(calls.map((c) => c.url)).toEqual([endpoint, clip(0), endpoint2, clip2]);
     expect(speaker.state).toEqual({ status: "idle" });
+  });
+});
+
+describe("speakingBotId", () => {
+  it("names the bot whose voice is playing", () => {
+    expect(speakingBotId({ status: "speaking", botId: "a" })).toBe("a");
+  });
+
+  it("names nobody while the voice is still being prepared", () => {
+    // The voice is on its way, but nothing has been said yet, so no mouth is
+    // moving and no avatar should claim to be talking.
+    expect(speakingBotId({ status: "preparing", botId: "a" })).toBeUndefined();
+  });
+
+  it("names nobody when the voice is idle", () => {
+    expect(speakingBotId({ status: "idle" })).toBeUndefined();
+  });
+
+  it("names nobody when a voice plays without saying whose it is", () => {
+    // A voice with no bot behind it belongs to no avatar.
+    expect(speakingBotId({ status: "speaking" })).toBeUndefined();
   });
 });
 

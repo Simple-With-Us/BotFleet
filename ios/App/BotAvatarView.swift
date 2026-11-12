@@ -37,11 +37,14 @@ struct BotAvatarView: View {
     @State private var failed = false
 
     private var crop: AvatarCrop { bot.avatarCrop ?? .mascot }
-    private var usesImage: Bool { crop != .mascot && bot.avatarUrl != nil && !failed }
+    private var usesImage: Bool { crop != .mascot && crop != .tvface && bot.avatarUrl != nil && !failed }
+    private var usesTVFace: Bool { crop == .tvface }
 
     var body: some View {
         Group {
-            if usesImage, let image {
+            if usesTVFace {
+                TVFaceAvatar(color: bot.color, state: state, size: size, animated: animated)
+            } else if usesImage, let image {
                 Image(uiImage: image)
                     .resizable()
                     .scaledToFill()
@@ -57,7 +60,7 @@ struct BotAvatarView: View {
         .task(id: "\(bot.avatarUrl ?? "")|\(crop.rawValue)") {
             image = nil
             failed = false
-            guard crop != .mascot, bot.avatarUrl != nil else { return }
+            guard crop != .mascot, crop != .tvface, bot.avatarUrl != nil else { return }
             let data = await session.avatarData(forPath: bot.avatarUrl)
             guard !Task.isCancelled else { return }
             guard let data, let decoded = BotAvatarView.cachedImage(for: data) else {
@@ -86,7 +89,7 @@ struct BotAvatarView: View {
         switch crop {
         case .circle: AnyShape(Circle())
         case .rounded: AnyShape(RoundedRectangle(cornerRadius: size * 0.22, style: .continuous))
-        case .square, .mascot: AnyShape(Rectangle())
+        case .square, .mascot, .tvface: AnyShape(Rectangle())
         }
     }
 }
@@ -108,7 +111,7 @@ struct RoomAvatarView: View {
         switch crop {
         case .circle: AnyShape(Circle())
         case .rounded: AnyShape(RoundedRectangle(cornerRadius: size * 0.22, style: .continuous))
-        case .square, .mascot: AnyShape(Rectangle())
+        case .square, .mascot, .tvface: AnyShape(Rectangle())
         }
     }
 

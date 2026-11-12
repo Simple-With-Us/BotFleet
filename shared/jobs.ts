@@ -7,10 +7,12 @@
 // it ends.  This file is the wire shape and the words, nothing that runs
 // anything — the client imports it too.
 
+import type { HostId } from "./placement.ts";
+
 /** Where a job is in its life.  `stopping` is a kill in flight (SIGTERM sent,
  *  SIGKILL after 5 s).  `lost` is a job the harness stopped tracking: it was
  *  running when the harness shut down or restarted. */
-export type JobStatus = "running" | "stopping" | "completed" | "failed" | "killed" | "lost";
+export type JobStatus = "queued" | "dispatching" | "worker-unreachable" | "running" | "stopping" | "completed" | "failed" | "killed" | "lost";
 
 /** `botfleet`: started by the harness's own job tools.  `native`: an engine's
  *  own background task, mirrored (a later phase). */
@@ -51,6 +53,13 @@ export interface JobSnapshot {
   /** Working directory the command ran in. */
   cwd: string;
   status: JobStatus;
+  /** Placement metadata is absent on jobs written before host identity existed. */
+  controllerHostId?: HostId;
+  host?: HostId;
+  leaseId?: string;
+  epoch?: number;
+  placedReason?: string;
+  queuedReason?: string;
   /** The command's own exit code, when it exited on its own. */
   exitCode: number | null;
   /** The signal that ended it, when one did (`SIGTERM`, `SIGXCPU`). */
@@ -101,7 +110,8 @@ export const JOB_OUTPUT_WAIT_MAX_SECONDS_HTTP = 75;
 export const JOB_OUTPUT_WAIT_MAX_SECONDS_MCP = 120;
 
 export function isJobActive(job: Pick<JobSnapshot, "status">): boolean {
-  return job.status === "running" || job.status === "stopping";
+  return job.status === "queued" || job.status === "dispatching" || job.status === "worker-unreachable" ||
+    job.status === "running" || job.status === "stopping";
 }
 
 /** "4m 12s", "12s", "1h 3m".  Whole seconds; never negative. */
@@ -123,6 +133,12 @@ export function jobElapsedMs(job: Pick<JobSnapshot, "startedAt" | "endedAt">, no
 /** The chip the dropdown shows beside a job.  Sentence case: it is a value. */
 export function jobExitChip(job: Pick<JobSnapshot, "status" | "exitCode" | "signal" | "killedBy">): string {
   switch (job.status) {
+    case "queued":
+      return "Queued";
+    case "dispatching":
+      return "Dispatching";
+    case "worker-unreachable":
+      return "Worker unreachable";
     case "running":
       return "Running";
     case "stopping":
