@@ -3213,13 +3213,19 @@ function isResourceNoise(resourcePath) {
   return base === ".DS_Store" || base.startsWith("._");
 }
 
+/* oxlint-disable anti-slop/no-runtime-typeof -- dependency-free JSON boundary parse; zod is unavailable in the updater bootstrap graph. */
+function isString(value) {
+  return typeof value === "string";
+}
+/* oxlint-enable anti-slop/no-runtime-typeof */
+
 /**
  * Rules for `Contents/Resources` from a CodeResources plist.  `null` means the
  * seal could not be read, which is not treated as drift.  A later `files2`
  * entry replaces the same path from `files`.
  */
 export function sealedResourceRules(plistXml) {
-  if (typeof plistXml !== "string" || !plistXml.includes("<plist")) return null;
+  if (!isString(plistXml) || !plistXml.includes("<plist")) return null;
   const rules = new Map();
   const pattern = /<key>(Resources\/[^<]+)<\/key>\s*(<data>([\s\S]*?)<\/data>|<dict>([\s\S]*?)<\/dict>)/g;
   let found = false;
@@ -3355,7 +3361,7 @@ export function resourceDriftAction({ updateApp, force, drift }) {
 export async function backupDirtyResources({ appPath, backupDirectory, findings, now = new Date() }) {
   await mkdir(backupDirectory, { recursive: true, mode: 0o700 });
   for (const finding of findings) {
-    if (typeof finding.path !== "string" || !finding.path.startsWith("Resources/") || finding.path.split("/").includes("..")) {
+    if (!isString(finding.path) || !finding.path.startsWith("Resources/") || finding.path.split("/").includes("..")) {
       throw new Error(`Refusing to back up a Resources path outside the bundle: ${finding.path}`);
     }
     const source = join(appPath, "Contents", finding.path);
@@ -3429,7 +3435,7 @@ export async function collectUpdateStatus(config) {
   try {
     const build = JSON.parse(await readFile(join(config.appPath, BUILD_MANIFEST_RELATIVE), "utf8"));
     installedCommit = /^[a-f0-9]{40}$/.test(build?.sourceCommit || "") ? build.sourceCommit : null;
-    installedVersion = typeof build.version === "string" ? build.version : null;
+    installedVersion = isString(build?.version) ? build.version : null;
     installedBuild = build.build ?? null;
   } catch {
     installedCommit = null;
@@ -3500,7 +3506,7 @@ export async function collectUpdateStatus(config) {
   const { generations } = await rollbackGenerations(config);
   for (const item of generations) {
     if (rollbackGenerationStatus(item.receipt) !== "verified") continue;
-    if (typeof item.receipt.rollbackBundle !== "string") continue;
+    if (!isString(item.receipt.rollbackBundle)) continue;
     backups.push({
       kind: "rollback",
       path: item.receipt.rollbackBundle,
@@ -3512,7 +3518,7 @@ export async function collectUpdateStatus(config) {
   let lastResult = null;
   try {
     const parsed = JSON.parse(await readFile(join(config.updatesDirectory, LAST_RESULT_NAME), "utf8"));
-    if (parsed?.schemaVersion === 1 && typeof parsed.outcome === "string") lastResult = parsed;
+    if (parsed?.schemaVersion === 1 && isString(parsed.outcome)) lastResult = parsed;
   } catch {
     lastResult = null;
   }
@@ -3578,7 +3584,7 @@ export function renderUpdateStatus(status) {
 
 export function newestBackup(backups) {
   return [...(backups || [])]
-    .filter((item) => item && (item.kind === "resources" || item.kind === "rollback") && typeof item.path === "string")
+    .filter((item) => item && (item.kind === "resources" || item.kind === "rollback") && isString(item.path))
     .sort((left, right) => String(right.createdAt || "").localeCompare(String(left.createdAt || "")) || left.path.localeCompare(right.path))[0] || null;
 }
 
@@ -3648,7 +3654,7 @@ async function restoreResourceBackup(config, backup, { holders, copyTree }) {
   const findings = Array.isArray(manifest?.findings) ? manifest.findings : [];
   const pending = [];
   for (const finding of findings) {
-    if (typeof finding?.path !== "string" || !finding.path.startsWith("Resources/") || finding.path.split("/").includes("..")) {
+    if (!isString(finding?.path) || !finding.path.startsWith("Resources/") || finding.path.split("/").includes("..")) {
       throw new Error(`Backup manifest names a path outside Resources: ${finding?.path}`);
     }
     const source = join(backup.path, finding.path);
