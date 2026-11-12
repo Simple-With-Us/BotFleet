@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { JOB_CAP_PER_BOT, JOB_CAP_PER_THREAD } from "../shared/jobs.ts";
 import { PLACEMENT_WIRE_VERSION, type CapacitySample, type HostId } from "../shared/placement.ts";
 import { PlacementLeaseService, placementLeaseRoute } from "./placement-leases.ts";
 
@@ -60,6 +61,48 @@ describe("placement lease compare-and-set", () => {
     expect(first.ok && first.reply.accepted).toBe(true);
     expect(second.ok && second.reply).toMatchObject({ accepted: true, duplicate: true, jobId: "job-1", status: "queued" });
     expect(leases.jobsList()).toHaveLength(1);
+  });
+
+  it("refuses a new job past the per-thread and per-bot caps, and a settled job frees its slot", () => {
+    const { leases } = service();
+    const admit = (jobId: string, botId = "bot-a", threadId = "t") =>
+      leases.enqueue({ ...fence, jobId, botId, threadId, command: "true", cwd: "/tmp", timeoutMs: 60_000 });
+    for (let index = 0; index < JOB_CAP_PER_THREAD; index += 1) {
+      expect(admit(`thread-${index}`).ok).toBe(true);
+    }
+    const threadFull = admit("thread-extra");
+    expect(threadFull.ok).toBe(false);
+    expect(!threadFull.ok ? threadFull.reason : "").toContain(`${JOB_CAP_PER_THREAD} jobs running`);
+    expect(leases.job("thread-extra")).toBeNull();
+    // The same id is a replay, so the cap does not swallow a duplicate.
+    const replay = admit("thread-0");
+    expect(replay.ok && replay.reply).toMatchObject({
+      accepted: true,
+      duplicate: true,
+      queuedReason: "waiting for an eligible host",
+    });
+
+    expect(admit("bot-extra", "bot-a", "other-thread").ok).toBe(true);
+    const botFull = admit("bot-over", "bot-a", "third-thread");
+    expect(botFull.ok).toBe(false);
+    expect(!botFull.ok ? botFull.reason : "").toContain(`${JOB_CAP_PER_BOT} jobs running`);
+    expect(admit("other-bot", "bot-b", "third-thread").ok).toBe(true);
+
+    leases.register({ ...fence, hostId: workerId, role: "worker", capabilities: ["shell"], sample });
+    const claim = leases.claim({ ...fence, hostId: workerId, jobId: "thread-0" });
+    expect(claim.ok && claim.reply.accepted).toBe(true);
+    const leaseId = claim.ok && claim.reply.accepted ? claim.reply.lease.leaseId : "";
+    expect(leases.report({
+      ...fence,
+      jobId: "thread-0",
+      leaseId,
+      hostId: workerId,
+      status: "completed",
+      exitCode: 0,
+      signal: null,
+      endedAt: 2_000,
+    }).ok).toBe(true);
+    expect(admit("thread-after-finish").ok).toBe(true);
   });
 
   it("refuses a higher epoch instead of adopting it, keeping its own pair", () => {

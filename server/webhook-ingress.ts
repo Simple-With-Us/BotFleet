@@ -164,7 +164,11 @@ export function createWebhookIngressHandler(
       return;
     }
     if (req.method === "GET" && url.pathname === "/health") {
-      return json(res, 200, { app: "botfleet-webhooks", ready: true });
+      return json(res, 200, {
+        app: "botfleet-webhooks",
+        ready: true,
+        payloadDedupeSkips: manager.payloadDedupeSkipCount(),
+      });
     }
     if (req.method === "GET" && url.pathname === "/.well-known/apple-app-site-association") {
       return json(res, 200, {

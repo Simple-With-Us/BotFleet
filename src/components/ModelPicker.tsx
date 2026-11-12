@@ -43,6 +43,7 @@ import { formatWindowPairLabel } from "@/lib/quota-display";
 import { EngineGroupLabel } from "./EngineGroupLabel";
 import { EngineCallout } from "./EngineCallout";
 import { cn } from "@/lib/cn";
+import { modelControlLabel } from "@/lib/chat-accessibility";
 import { COMPACT_SQUARE } from "@/lib/compact-chip";
 import {
   latestRows,
@@ -893,6 +894,11 @@ export function ModelPicker({
     else if (id.includes("hermes")) activeDriverKind = "hermesAgent";
   }
 
+  const modelAriaLabel = modelControlLabel(
+    active ? selectionChipLabel(active, selection, { showLatest: contained }) : selection.model,
+    savedStatus.badge ?? undefined,
+  );
+
   const trigger = (
     <button
       type="button"
@@ -906,6 +912,7 @@ export function ModelPicker({
       }}
       aria-expanded={open}
       aria-haspopup="dialog"
+      aria-label={modelAriaLabel}
       className={cn(
         "flex max-w-full items-center gap-1.5 border border-hairline/40 bg-control/60 py-1 pl-2 pr-2.5 text-[13px] text-ink hover:bg-raised-hover",
         // The contained trigger now sits on its own line under the label, so
@@ -940,6 +947,7 @@ export function ModelPicker({
       )}
       <ChevronDown
         size={14}
+        aria-hidden="true"
         className={cn(
           "text-ink-secondary transition-transform",
           open && "rotate-180",
@@ -1196,7 +1204,7 @@ export function ModelPicker({
                               onClick={() => setShowAll(true)}
                               className="mt-1 flex w-full items-center justify-between rounded-lg border-t border-hairline/40 px-2.5 py-2 text-[12.5px] font-medium text-ink-secondary hover:bg-control/60 hover:text-ink"
                             >
-                              Show all {official.length} models{windowsLabel ? ` (${formatWindowPairLabel(windowsLabel)})` : ""} <ChevronDown size={13} />
+                              Show all {official.length} models{windowsLabel ? ` (${formatWindowPairLabel(windowsLabel)})` : ""} <ChevronDown size={13} aria-hidden="true" />
                             </button>
                           )}
                           {!query && showAll && official.length > COMPACT_MODEL_COUNT && (

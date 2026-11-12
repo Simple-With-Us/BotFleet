@@ -236,6 +236,17 @@ final class OnboardingTests: XCTestCase {
         XCTAssertNil(pending)
     }
 
+    func testUnsettledLaunchRestoreDoesNotLookLikeAFirstRun() {
+        XCTAssertEqual(
+            CompanionOnboardingRouter.route(for: .init(
+                pairingState: .unpaired,
+                hasSeenWelcome: false,
+                launchRestoreSettled: false
+            )),
+            .restoring
+        )
+    }
+
     func testRevokedPairingAlwaysShowsRecovery() {
         XCTAssertEqual(
             CompanionOnboardingRouter.route(for: .init(

@@ -1,4 +1,10 @@
-import { boundStalePromptSnapshots, retainRoutineRuns } from "../shared/routine-retention.ts";
+import {
+  boundStalePromptSnapshots,
+  parseRoutineRunRetentionDays,
+  retainRoutineRuns,
+  ROUTINE_RUN_TERMINAL_SAFETY_CAP,
+  routineRunRetentionMaxAgeMs,
+} from "../shared/routine-retention.ts";
 import type { BotDispatchState } from "../shared/bot-profile.ts";
 import { ROUTINE_ATTENTION_STATUSES } from "../shared/routine-outcomes.ts";
 import { randomUUID } from "node:crypto";
@@ -437,7 +443,9 @@ const CATCH_UP_MS = 12 * 60 * 60_000;
  *  overrides it with `jobs.webhookHotDeferMinutes` when that knob is set. */
 export const DEFAULT_WEBHOOK_HOT_DEFER_MINUTES = 20;
 export const DEFAULT_WEBHOOK_HOT_DEFER_MS = DEFAULT_WEBHOOK_HOT_DEFER_MINUTES * 60_000;
-const MAX_RUNS = 2_000;
+/** Terminal history window; override with `BOTFLEET_ROUTINE_RUN_RETENTION_DAYS` (days, default 7). */
+const ROUTINE_RUN_RETENTION_DAYS = parseRoutineRunRetentionDays(process.env.BOTFLEET_ROUTINE_RUN_RETENTION_DAYS);
+const ROUTINE_RUN_RETENTION_MS = routineRunRetentionMaxAgeMs(ROUTINE_RUN_RETENTION_DAYS);
 /** What acknowledging the backlog is allowed to clear — see markAllSeen. */
 const ATTENTION_STATUSES: ReadonlySet<RoutineRunStatus> = new Set(ROUTINE_ATTENTION_STATUSES);
 /** Settled runs that keep their full prompt snapshot.  A webhook run's
@@ -2337,7 +2345,10 @@ export class RoutineManager {
     const receiptResultIds = this.routineRequestReceipts
       .filter((receipt) => receipt.action === "run_now")
       .map((receipt) => receipt.resultId);
-    this.runs = retainRoutineRuns(this.runs, MAX_RUNS, receiptResultIds);
+    this.runs = retainRoutineRuns(this.runs, ROUTINE_RUN_TERMINAL_SAFETY_CAP, receiptResultIds, {
+      maxAgeMs: ROUTINE_RUN_RETENTION_MS,
+      nowMs: this.now(),
+    });
     boundStalePromptSnapshots(this.runs, PROMPT_SNAPSHOT_LIMIT, receiptResultIds);
     this.scheduleFlush();
   }
