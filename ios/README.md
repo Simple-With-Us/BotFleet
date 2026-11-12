@@ -85,9 +85,13 @@ swift test
 The app needs Xcode. The `.xcodeproj` is generated rather than committed:
 
 ```sh
-brew install xcodegen
+bash scripts/ios-install-xcodegen.sh
 cd ios && xcodegen generate && open BotFleet.xcodeproj
 ```
+
+`xcodegen generate` runs `scripts/ios-xcodegen-post.sh` via `postGenCommand` so
+the generated project uses the Xcode 27.0 document format (objectVersion 100).  XcodeGen
+2.45+ is required; 2.46+ is what hosted CI installs.
 
 **Re-run `xcodegen generate` after pulling any change that adds a file to
 `App/`.** The spec says `sources: App`, but XcodeGen resolves that to explicit

@@ -4,7 +4,7 @@
 // CLI's whole boot: module loading, plugin activation, config reads.  That
 // is CPU work, and this Mac routinely runs with a load average many times
 // its core count while the fleet builds and tests.  A fixed 60 s wall clock
-// was sized for Grok (p50 0.7 s) and cut off DeepSeek Harness boots that
+// was sized for Grok (p50 0.7 s) and cut off Harness boots that
 // were still making progress — `dsh --profile acp` spends about 3.5 s of CPU
 // loading ~200 Cordis plugins, which stretched to 24-52 s of wall time at a
 // load average of ~400-500 on 10 cores, and 89% of BotFleet's failed-turn

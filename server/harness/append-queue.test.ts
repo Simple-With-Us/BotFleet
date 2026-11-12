@@ -101,6 +101,26 @@ describe("BoundedAppendQueue", () => {
     expect(writer.written.map((w) => w.data.trim())).toEqual(["123456789", "123456789", "123456789", "123456789"]);
   });
 
+  it("names the log it serves in the drop line", async () => {
+    const report = vi.fn();
+    const writer = controlledWriter();
+    writer.pause();
+    const queue = new BoundedAppendQueue<string>(writer.write, {
+      maxQueuedBytes: 10,
+      report,
+      label: "native protocol tee",
+    });
+
+    for (let i = 0; i < 3; i += 1) queue.enqueue("a.log", "123456789\n", `${i}`);
+    writer.resume();
+    await queue.flush();
+
+    // Two queues share this code, so the line has to say which one filled.
+    expect(report).toHaveBeenCalled();
+    expect(String(report.mock.calls[0][0])).toContain("from the native protocol tee");
+    expect(String(report.mock.calls[0][0])).not.toContain("event log tee");
+  });
+
   it("keeps a single record larger than the whole cap rather than erasing it", async () => {
     const writer = controlledWriter();
     const queue = new BoundedAppendQueue<string>(writer.write, { maxQueuedBytes: 8 });

@@ -1,3 +1,4 @@
+import { quotaPlanMetadataLines } from "../../shared/quota-plan-metadata";
 import { isQuotaCellExhausted, type UsageMonitorQuotaWindow } from "@/lib/usage-monitor-quota";
 import { absoluteQuotaLabel, formatResetCountdown } from "@/lib/quota-display";
 
@@ -32,8 +33,24 @@ function resetHover(resetAt: string | undefined): string | undefined {
   });
 }
 
-export function UsageMonitorQuotaGrid({ windows }: { windows: UsageMonitorQuotaWindow[] }) {
-  if (windows.length === 0) return null;
+const emptyStateClass =
+  "ml-9 mt-1.5 rounded-lg border border-hairline/25 bg-inset/30 px-2.5 py-2 text-[11.5px] leading-relaxed text-ink-secondary";
+
+export type UsageMonitorQuotaGridProps = {
+  windows: UsageMonitorQuotaWindow[];
+  /** Plain status when `windows` is empty — distinguishes loading from nothing reported. */
+  emptyLine?: string | null;
+};
+
+export function UsageMonitorQuotaGrid({ windows, emptyLine }: UsageMonitorQuotaGridProps) {
+  if (windows.length === 0) {
+    if (!emptyLine) return null;
+    return (
+      <div className={emptyStateClass} data-testid="usage-monitor-quota-grid-empty">
+        {emptyLine}
+      </div>
+    );
+  }
   const rows = windows;
 
   return (
@@ -63,6 +80,11 @@ export function UsageMonitorQuotaGrid({ windows }: { windows: UsageMonitorQuotaW
                 {absolute}
               </div>
             )}
+            {quotaPlanMetadataLines(window.planMetadata).map((line, index) => (
+              <div key={index} className="truncate text-[10.5px] text-ink-secondary" title={line}>
+                {line}
+              </div>
+            ))}
             <div
               className="truncate text-[10.5px] text-ink-secondary"
               title={resetHover(resetAt)}

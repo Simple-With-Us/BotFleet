@@ -4,7 +4,7 @@ import XCTest
 final class ChatDeepLinkTests: XCTestCase {
     func testBuildsAndParsesABotThreadURL() throws {
         let url = try XCTUnwrap(ChatDeepLink.url(botId: "bot-1", threadId: "thread-9"))
-        XCTAssertEqual(url.scheme, "botfleet")
+        XCTAssertEqual(url.scheme, "botfleet-ios")
         XCTAssertEqual(url.host, "chat")
         let parsed = try XCTUnwrap(ChatDeepLink.parse(url))
         XCTAssertEqual(parsed.botId, "bot-1")
@@ -16,6 +16,18 @@ final class ChatDeepLinkTests: XCTestCase {
         let parsed = try XCTUnwrap(ChatDeepLink.parse(url))
         XCTAssertEqual(parsed.botId, "b2")
         XCTAssertEqual(parsed.threadId, "t2")
+    }
+
+    func testAcceptsLegacySchemeAndParsesPrimaryScheme() throws {
+        let legacy = try XCTUnwrap(URL(string: "botfleet://chat?bot=b3&thread=t3"))
+        let legacyParsed = try XCTUnwrap(ChatDeepLink.parse(legacy))
+        XCTAssertEqual(legacyParsed.botId, "b3")
+        XCTAssertEqual(legacyParsed.threadId, "t3")
+
+        let primary = try XCTUnwrap(URL(string: "botfleet-ios://chat?bot=b4&thread=t4"))
+        let primaryParsed = try XCTUnwrap(ChatDeepLink.parse(primary))
+        XCTAssertEqual(primaryParsed.botId, "b4")
+        XCTAssertEqual(primaryParsed.threadId, "t4")
     }
 
     func testRejectsPairingURLs() throws {

@@ -6,8 +6,10 @@
 // SDK tax.  Browser Replay/Feedback live in src/lib/sentry.ts.
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
+import { resetSentryCronsForTests } from "./sentry-crons.ts";
+import { runtimeBuildIdentity } from "./runtime-identity.ts";
 
-type SentryNode = typeof import("@sentry/node");
+export type SentryNode = typeof import("@sentry/node");
 type SentryIntegration = Parameters<SentryNode["addIntegration"]>[0];
 
 /** How the harness got its DSN.  `env` means a CI runner or the LaunchAgent
@@ -19,8 +21,13 @@ export interface SentryRuntimeInput {
   enabled: boolean;
   environment: string;
   tracesSampleRate: number;
+  aiTracesSampleRate?: number;
+  httpTracesSampleRate?: number;
+  uiTracesSampleRate?: number;
   logsEnabled: boolean;
   source: SentrySource;
+  /** Git SHA so `sentry-deploy.yml` markers line up with events. */
+  release?: string | null;
 }
 
 export interface SentryRuntimeState {
@@ -32,6 +39,9 @@ export interface SentryRuntimeState {
   projectId: string | null;
   environment: string;
   tracesSampleRate: number;
+  aiTracesSampleRate: number;
+  httpTracesSampleRate: number;
+  uiTracesSampleRate: number;
   logsEnabled: boolean;
   profilingAvailable: boolean;
   lastError: string | null;
@@ -44,6 +54,9 @@ const DORMANT: SentryRuntimeState = {
   projectId: null,
   environment: "production",
   tracesSampleRate: 0,
+  aiTracesSampleRate: 0,
+  httpTracesSampleRate: 0,
+  uiTracesSampleRate: 0,
   logsEnabled: false,
   profilingAvailable: false,
   lastError: null,
@@ -113,6 +126,12 @@ export const MALFORMED_DSN_MESSAGE = "The stored DSN is not a Sentry https:// DS
 export const SDK_REJECTED_DSN_MESSAGE =
   "Sentry refused this DSN, so nothing is being reported.  Check it in Settings > Observability.";
 
+/** Shown when configuration looks healthy but the SDK client is closed or has
+ * no transport — for example after a config refresh closed the old client
+ * before the replacement finished starting. */
+export const SENTRY_DELIVERY_NOT_READY_MESSAGE =
+  "Sentry is configured but not delivering events yet.  Save Settings or wait for the client to finish restarting.";
+
 /** Split a DSN into the two halves that are safe to show.  Returns null for
  * anything that is not a DSN, which is how a malformed stored value becomes
  * a visible `lastError` instead of a silently inert SDK. */
@@ -170,6 +189,24 @@ export function sentryDsnFromEnv(
   return raw || undefined;
 }
 
+const UNKNOWN_COMMIT = "0".repeat(40);
+const RELEASE_SHA = /^[0-9a-f]{7,40}$/i;
+
+/** A git SHA Sentry can use as `release`.  All-zeros (unknown checkout) is
+ *  not a release.  `SENTRY_RELEASE` wins, then `GITHUB_SHA`, then
+ *  `VERCEL_GIT_COMMIT_SHA`. */
+export function sentryReleaseName(
+  env: NodeJS.ProcessEnv = process.env,
+  fallback?: string | null,
+): string | undefined {
+  const candidates = [env.SENTRY_RELEASE, env.GITHUB_SHA, env.VERCEL_GIT_COMMIT_SHA, fallback];
+  for (const raw of candidates) {
+    const value = raw?.trim();
+    if (value && value !== UNKNOWN_COMMIT && RELEASE_SHA.test(value)) return value;
+  }
+  return undefined;
+}
+
 interface SentrySdkLoad {
   sdk: SentryNode | null;
   error: string | null;
@@ -197,21 +234,33 @@ async function loadSdk(): Promise<SentrySdkLoad> {
   }
 }
 
-/** Stop the running client.  The close is deliberately not awaited: this
- * runs on the PATCH /api/config path, and a hung flush must not hold a
- * request open.  `initialized` drops first, so `isSentryActive()` gates
- * captures off the instant the switch flips, flush or no flush. */
-function shutdown(): void {
+/** Best-effort flush budget when swapping clients.  Buffered events are
+ * discarded after this cap so `PATCH /api/config` is not held open for two
+ * seconds on every observability save. */
+const SENTRY_CLIENT_CLOSE_MS = 500;
+
+/** Stop the running client.  `initialized` drops first, so `isSentryActive()`
+ * gates captures off the instant the switch flips.  Only the re-init path
+ * awaits the close so `init()` never races a stale global client; turning
+ * diagnostics off keeps the historical fire-and-forget close. */
+async function closeRunningClient(options?: { awaitFlush?: boolean }): Promise<void> {
   const sdk = sentrySdk;
   sentrySdk = null;
   initialized = false;
   activeFingerprint = null;
   if (!sdk) return;
+  let close: Promise<unknown>;
   try {
-    void Promise.resolve(sdk.close(2000)).catch(() => {});
+    close = Promise.resolve(sdk.close(SENTRY_CLIENT_CLOSE_MS)).catch(() => {});
   } catch {
     /* an SDK that cannot close must not take the harness down with it */
+    return;
   }
+  if (options?.awaitFlush) {
+    await close;
+    return;
+  }
+  void close;
 }
 
 /** @sentry/profiling-node is in neither package.json nor the lockfile, so
@@ -254,6 +303,125 @@ function acceptedDsn(sdk: SentryNode): "ok" | "rejected" | "unknown" {
   }
 }
 
+/** A webhook capability URL is `/hooks/<endpoint id>/<secret>`: the id is
+ * safe to keep (it names the endpoint an operator has to look at), the path
+ * segment after it is the credential.  The Node SDK's HTTP instrumentation
+ * copies the raw request path into the transaction name, `request.url`, the
+ * culprit and span descriptions, so without this pass a live secret lands in
+ * Sentry on every delivery — which is exactly what happened to three
+ * endpoints before this scrub existed.  Kept in step with the route regex in
+ * webhook-ingress.ts. */
+const WEBHOOK_PATH_SECRET = /\/hooks\/(wh_[A-Za-z0-9_-]+)\/[^/?#\s"'<>]+/g;
+/** A secret that shows up anywhere else — a breadcrumb, a log line, a bearer
+ * value echoed into an error — is caught by its own prefix. */
+const WEBHOOK_BARE_SECRET = /\bwhsec_[A-Za-z0-9_-]+/g;
+
+/** Replace every webhook secret in `text`, keeping the endpoint id. */
+export function scrubWebhookSecrets(text: string): string {
+  if (!text.includes("/hooks/") && !text.includes("whsec_")) return text;
+  return text
+    .replace(WEBHOOK_PATH_SECRET, "/hooks/$1/:secret")
+    .replace(WEBHOOK_BARE_SECRET, "whsec_[redacted]");
+}
+
+/** How deep the scrub walks.  Sentry payloads are a handful of levels deep
+ * (event → spans → data → value); anything past this is not a shape the SDK
+ * builds, and the bound keeps a pathological payload from costing more than
+ * it is worth on the send path. */
+const SCRUB_MAX_DEPTH = 12;
+
+/** Keys the scrub never descends into.  `sdkProcessingMetadata` carries
+ * live SDK objects (the captured Scope, and through it the client and its
+ * promise buffer), and @sentry/core's envelope builder deletes it before
+ * anything is sent, so nothing under it can reach Sentry. */
+const SCRUB_SKIP_KEYS = new Set(["sdkProcessingMetadata"]);
+
+function isPlainRecord(value: object): value is Record<string, unknown> {
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+/** Scrub every string in a Sentry payload in place and hand it back.  A
+ * field-by-field list (transaction, request.url, culprit, span descriptions,
+ * breadcrumbs, tags) would miss whichever field the next SDK release starts
+ * copying the URL into, so this walks the whole payload instead: the
+ * `includes` pre-check makes the common case one scan per string.
+ *
+ * A real SDK event is not pure JSON.  It can hold class instances (a Scope,
+ * the client, an OTel span) whose properties include getter-only accessors,
+ * and writing to one of those throws in strict mode.  So the walk descends
+ * only into arrays and plain objects, reads each property exactly once, and
+ * writes back only a string that the scrub actually changed. */
+export function scrubSentryPayload<T>(payload: T): T {
+  if (typeof payload === "string") {
+    // SAFETY: a string only ever becomes another string.
+    return scrubWebhookSecrets(payload) as T;
+  }
+  const seen = new WeakSet<object>();
+  const walk = (value: object, depth: number): void => {
+    if (depth > SCRUB_MAX_DEPTH || seen.has(value)) return;
+    seen.add(value);
+    if (Array.isArray(value)) {
+      for (let i = 0; i < value.length; i += 1) {
+        const cur: unknown = value[i];
+        if (typeof cur === "string") {
+          const next = scrubWebhookSecrets(cur);
+          if (next !== cur) value[i] = next;
+        } else if (cur !== null && typeof cur === "object") {
+          walk(cur, depth + 1);
+        }
+      }
+      return;
+    }
+    if (!isPlainRecord(value)) return;
+    for (const key of Object.keys(value)) {
+      if (SCRUB_SKIP_KEYS.has(key)) continue;
+      // Fail closed on request payloads, even if another SDK integration or
+      // a future version adds them after HTTP capture is disabled below.
+      if (key === "request" && value[key] !== null && typeof value[key] === "object" &&
+          isPlainRecord(value[key] as object)) {
+        const request = value[key] as Record<string, unknown>;
+        for (const sensitive of ["data", "body", "headers", "cookies", "query_string", "env"]) {
+          delete request[sensitive];
+        }
+      }
+      const cur = value[key];
+      if (typeof cur === "string") {
+        const next = scrubWebhookSecrets(cur);
+        if (next !== cur) value[key] = next;
+      } else if (cur !== null && typeof cur === "object") {
+        walk(cur, depth + 1);
+      }
+    }
+  };
+  if (payload !== null && typeof payload === "object") walk(payload, 0);
+  return payload;
+}
+
+/** Wrap a before-send hook so a throw drops the payload instead of
+ * escaping into the SDK.  When a hook throws, the SDK reports its own
+ * internal error event, and that event skips beforeSend and carries the
+ * scope's transaction name and breadcrumbs unscrubbed, so a throw here would
+ * leak the very secret the hook exists to remove.  Dropping one payload is
+ * the safe failure. */
+export function safeScrubHook<T>(payload: T): T | null {
+  try {
+    return scrubSentryPayload(payload);
+  } catch {
+    return null;
+  }
+}
+
+/** Incoming `/hooks/*` requests get no server span: the path is a
+ * credential.  That is not the whole defence.  A span started while such a
+ * request is handled (a bot turn a webhook kicks off, say) still becomes its
+ * own root transaction, and the isolation scope's request URL, transaction
+ * name and breadcrumbs ride along on it and on any error captured there.  The
+ * payload scrub above is what keeps those clean. */
+export function isWebhookIngressPath(urlPath: string): boolean {
+  return urlPath.startsWith("/hooks/");
+}
+
 /** Bring the running client in line with `input`, and report what actually
  * happened.  Called at boot and again after every settings change, so it
  * has to be idempotent: an unchanged option set leaves the client alone. */
@@ -268,19 +436,35 @@ export async function applySentryConfig(input: SentryRuntimeInput): Promise<Sent
 
 async function applySentryConfigLocked(input: SentryRuntimeInput): Promise<SentryRuntimeState> {
   const parsed = input.dsn ? describeDsn(input.dsn) : null;
+  const aiRate =
+    input.aiTracesSampleRate !== undefined && Number.isFinite(input.aiTracesSampleRate)
+      ? Math.min(Math.max(input.aiTracesSampleRate, 0), 1)
+      : 1.0;
+  const httpRate =
+    input.httpTracesSampleRate !== undefined && Number.isFinite(input.httpTracesSampleRate)
+      ? Math.min(Math.max(input.httpTracesSampleRate, 0), 1)
+      : 0.1;
+  const uiRate =
+    input.uiTracesSampleRate !== undefined && Number.isFinite(input.uiTracesSampleRate)
+      ? Math.min(Math.max(input.uiTracesSampleRate, 0), 1)
+      : 0.1;
+
   const base: Omit<SentryRuntimeState, "active"> = {
     source: input.source,
     host: parsed?.host ?? null,
     projectId: parsed?.projectId ?? null,
     environment: input.environment,
     tracesSampleRate: input.tracesSampleRate,
+    aiTracesSampleRate: aiRate,
+    httpTracesSampleRate: httpRate,
+    uiTracesSampleRate: uiRate,
     logsEnabled: input.logsEnabled,
     profilingAvailable: false,
     lastError: null,
   };
 
   if (!input.enabled || !input.dsn || !parsed) {
-    shutdown();
+    await closeRunningClient({ awaitFlush: false });
     killed = !input.enabled;
     runtimeState = {
       ...base,
@@ -305,16 +489,20 @@ async function applySentryConfigLocked(input: SentryRuntimeInput): Promise<Sentr
     dsnDigest(input.dsn),
     input.environment,
     String(input.tracesSampleRate),
+    String(aiRate),
+    String(httpRate),
+    String(uiRate),
     input.logsEnabled ? "logs" : "nologs",
     genAiCollection ? "ai-data-on" : "ai-data-off",
     "stream-genai",
+    sentryReleaseName(process.env, input.release) || "norelease",
   ].join("|");
   if (initialized && activeFingerprint === fingerprint) {
     runtimeState = { ...base, active: true, profilingAvailable: runtimeState.profilingAvailable };
     return runtimeState;
   }
 
-  shutdown();
+  await closeRunningClient({ awaitFlush: true });
   const { sdk, error } = await loadSdk();
   if (!sdk) {
     runtimeState = { ...base, active: false, lastError: error };
@@ -322,23 +510,87 @@ async function applySentryConfigLocked(input: SentryRuntimeInput): Promise<Sentr
   }
 
   const profileSessionSampleRate = Number(process.env.SENTRY_PROFILE_SESSION_SAMPLE_RATE ?? "1");
+  const integrations: SentryIntegration[] = [];
+  // Replaces the default Http integration by name, keeping its other
+  // defaults.  A stand-in SDK installed by a test may not carry the factory.
+  if (sdk.httpIntegration) {
+    integrations.push(sdk.httpIntegration({
+      ignoreIncomingRequests: (urlPath) => isWebhookIngressPath(urlPath),
+      maxRequestBodySize: "none",
+    }));
+  }
+  // v11 dropped enableLogs; the console integration is what turns a
+  // warn or an error into a Sentry log.
+  if (input.logsEnabled) integrations.push(sdk.consoleLoggingIntegration({ levels: ["warn", "error"] }));
   try {
     sdk.init({
       dsn: input.dsn,
       environment: input.environment,
+      release: sentryReleaseName(process.env, input.release),
       tracesSampleRate: input.tracesSampleRate,
-      enableLogs: true,
-      // enableLogs alone only produces breadcrumbs; the console integration
-      // is what turns a warn or an error into a Sentry log.
-      integrations: input.logsEnabled
-        ? [sdk.consoleLoggingIntegration({ levels: ["warn", "error"] })]
-        : [],
-      sendDefaultPii: false,
-      // Sentry Agents (SaaS): standalone gen_ai envelopes for Conversations.
-      // Opt-out only for self-hosted that cannot ingest them.
-      streamGenAiSpans: true,
+      tracesSampler: (samplingContext: {
+        parentSampled?: boolean;
+        name?: string;
+        op?: string;
+        attributes?: { "sentry.op"?: string };
+      }) => {
+        if (samplingContext.parentSampled !== undefined) {
+          return samplingContext.parentSampled;
+        }
+        const op = samplingContext.attributes?.["sentry.op"] ?? samplingContext.op;
+        const opStr = typeof op === "string" ? op : "";
+        const name = typeof samplingContext.name === "string" ? samplingContext.name : "";
+
+        if (
+          opStr.startsWith("gen_ai.") ||
+          name.startsWith("gen_ai.") ||
+          opStr === "tool" ||
+          name.startsWith("execute_tool")
+        ) {
+          return aiRate;
+        }
+
+        if (
+          opStr.startsWith("http.server") ||
+          opStr === "http" ||
+          /^(GET|POST|PATCH|PUT|DELETE|HEAD|OPTIONS) /.test(name)
+        ) {
+          if (name.includes("/healthz") || name.includes("/api/telemetry/status")) {
+            return Math.min(httpRate, 0.01);
+          }
+          return httpRate;
+        }
+
+        if (opStr.startsWith("http.client")) {
+          return httpRate;
+        }
+
+        return input.tracesSampleRate;
+      },
+      integrations,
+      // v11 streams spans by default, which makes beforeSendTransaction a
+      // no-op.  Static lifecycle keeps one transaction event so the webhook
+      // secret scrub still walks names, URLs, and child spans.
+      traceLifecycle: "static",
+      // Every payload kind the client sends passes the webhook-secret scrub:
+      // errors and messages, transactions with all their child spans, and
+      // console-derived logs.  No beforeSendSpan: in this SDK the gen_ai
+      // spans are split out of the transaction in `sendEvent`, after
+      // beforeSendTransaction has already walked them, so a span hook would
+      // only scan the same strings twice.
+      beforeSend: (event) => safeScrubHook(event),
+      beforeSendTransaction: (event) => safeScrubHook(event),
+      beforeSendLog: (log) => safeScrubHook(log),
       // GenAI I/O collection ON by default; kill with SENTRY_AI_DATA_COLLECTION=0.
-      dataCollection: genAiDataCollectionOptions(),
+      // v11 dropped sendDefaultPii and streamGenAiSpans; dataCollection is the
+      // remaining privacy knob, and gen_ai spans always stream.
+      dataCollection: {
+        ...genAiDataCollectionOptions(),
+        httpBodies: [],
+        httpHeaders: { request: false, response: false },
+        cookies: false,
+        urlQueryParams: false,
+      },
       profileSessionSampleRate: Number.isFinite(profileSessionSampleRate)
         ? Math.min(Math.max(profileSessionSampleRate, 0), 1)
         : 1,
@@ -355,7 +607,7 @@ async function applySentryConfigLocked(input: SentryRuntimeInput): Promise<Sentr
   // module exists to prevent.  A stand-in SDK without `getClient` answers
   // "unknown" and is left alone.
   if (acceptedDsn(sdk) === "rejected") {
-    shutdown();
+    await closeRunningClient({ awaitFlush: false });
     runtimeState = { ...base, active: false, lastError: SDK_REJECTED_DSN_MESSAGE };
     return runtimeState;
   }
@@ -368,11 +620,30 @@ async function applySentryConfigLocked(input: SentryRuntimeInput): Promise<Sentr
   return runtimeState;
 }
 
+/** True when the SDK can actually send events.  `@sentry/core`'s
+ * `captureCheckIn` returns a uuid even when there is no live client, so
+ * callers must gate on this — not merely on `initialized`. */
+export function isSentryDeliveryReady(): boolean {
+  if (!initialized || killed) return false;
+  const sdk = sentrySdk;
+  if (!sdk) return false;
+  if (sdk.isEnabled === undefined && sdk.getClient === undefined) return true;
+  try {
+    if (sdk.isEnabled !== undefined) return sdk.isEnabled();
+    const client = sdk.getClient?.();
+    if (!client) return false;
+    if (client.getOptions?.().enabled === false) return false;
+    return Boolean(client.getTransport?.());
+  } catch {
+    return false;
+  }
+}
+
 /** True only while a client is running and nobody has turned it off.  Every
  * capture site gates on this, not on `isSentryInitialized`, so flipping the
  * switch stops reporting immediately instead of at the next restart. */
 export function isSentryActive(): boolean {
-  return initialized && !killed;
+  return isSentryDeliveryReady();
 }
 
 export function sentryRuntimeState(): SentryRuntimeState {
@@ -386,6 +657,9 @@ export async function initSentry(env: NodeJS.ProcessEnv = process.env): Promise<
   if (env.VITEST === "true" || env.NODE_ENV === "test") return false;
   const dsn = sentryDsnFromEnv(env);
   const tracesSampleRate = Number(env.SENTRY_TRACES_SAMPLE_RATE ?? "0.2");
+  const aiTracesSampleRate = Number(env.SENTRY_AI_TRACES_SAMPLE_RATE ?? "1.0");
+  const httpTracesSampleRate = Number(env.SENTRY_HTTP_TRACES_SAMPLE_RATE ?? "0.1");
+  const uiTracesSampleRate = Number(env.SENTRY_UI_TRACES_SAMPLE_RATE ?? "0.1");
   return (await applySentryConfig({
     dsn: dsn ?? null,
     enabled: true,
@@ -393,8 +667,18 @@ export async function initSentry(env: NodeJS.ProcessEnv = process.env): Promise<
     tracesSampleRate: Number.isFinite(tracesSampleRate)
       ? Math.min(Math.max(tracesSampleRate, 0), 1)
       : 0.2,
+    aiTracesSampleRate: Number.isFinite(aiTracesSampleRate)
+      ? Math.min(Math.max(aiTracesSampleRate, 0), 1)
+      : 1.0,
+    httpTracesSampleRate: Number.isFinite(httpTracesSampleRate)
+      ? Math.min(Math.max(httpTracesSampleRate, 0), 1)
+      : 0.1,
+    uiTracesSampleRate: Number.isFinite(uiTracesSampleRate)
+      ? Math.min(Math.max(uiTracesSampleRate, 0), 1)
+      : 0.1,
     logsEnabled: true,
     source: dsn ? "env" : "none",
+    release: sentryReleaseName(env, runtimeBuildIdentity.sourceCommit),
   })).active;
 }
 
@@ -404,6 +688,38 @@ export function isSentryInitialized(): boolean {
 
 export function getSentry(): SentryNode | null {
   return sentrySdk;
+}
+
+/** Partial @sentry/node surface implemented by vitest stand-ins. */
+export type SentrySdkTestStandIn = {
+  init: (...opts: Parameters<SentryNode["init"]>) => ReturnType<SentryNode["init"]> | void;
+  close: (...args: Parameters<SentryNode["close"]>) => ReturnType<SentryNode["close"]>;
+  addIntegration: (...args: Parameters<SentryNode["addIntegration"]>) => void;
+  consoleLoggingIntegration: (
+    ...args: Parameters<SentryNode["consoleLoggingIntegration"]>
+  ) => { name: string };
+  captureCheckIn?: SentryNode["captureCheckIn"];
+  isEnabled?: () => boolean;
+  getClient?: () => {
+    getDsn(): { host?: string } | undefined;
+    getOptions(): { enabled: boolean };
+    getTransport(): undefined | Record<string, never>;
+  };
+  httpIntegration?: (
+    options: Parameters<NonNullable<SentryNode["httpIntegration"]>>[0],
+  ) => { name: string; options: Parameters<NonNullable<SentryNode["httpIntegration"]>>[0] };
+};
+
+/** Coerce a partial SDK stand-in to the lazy-loaded module type for test loaders. */
+export function asSentryNodeTestStandIn(standIn: SentrySdkTestStandIn): SentryNode {
+  // SAFETY: stand-ins stamp only members applySentryConfig and cron check-ins
+  // call; the real SDK stays dynamically imported so vitest never loads it.
+  return standIn as unknown as SentryNode;
+}
+
+/** Loader wrapper for `setSentryLoaderForTests` that accepts a partial stand-in. */
+export function sentryTestLoader(standIn: SentrySdkTestStandIn): () => Promise<SentryNode> {
+  return async () => asSentryNodeTestStandIn(standIn);
 }
 
 /** Install a stand-in for @sentry/node so a test can exercise the init,
@@ -424,4 +740,5 @@ export function resetSentryForTests(): void {
   loaderForTests = null;
   applyQueue = Promise.resolve();
   runtimeState = { ...DORMANT };
+  resetSentryCronsForTests();
 }

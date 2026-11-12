@@ -13,6 +13,7 @@ import type {
   TurnToolOutcome,
 } from "../../contracts.ts";
 import { ProviderError } from "../../contracts.ts";
+import { DEFAULT_MAX_TOOL_ROUNDS } from "../../../shared/bot-profile.ts";
 import { RETRY_AFTER_CAP_MS, httpErrorFor } from "./errors.ts";
 import {
   DEFAULT_TURN_LOOP_BUDGET,
@@ -25,6 +26,7 @@ import {
   type TurnLoopExit,
   type TurnRoundResult,
 } from "./loop.ts";
+import { ToolResultArtifactStore } from "../../tool-result-history.ts";
 
 type TerminalEvent = RuntimeEventBase & {
   type: "turn.completed";
@@ -76,6 +78,8 @@ interface Harness {
     emit?: (event: RuntimeEvent) => void;
     computeCost?: (usage: { input: number; output: number; cachedInput?: number }) => number | null;
     tools?: ReadonlyArray<{ name: string; timeoutMs?: number }>;
+    toolResultHistoryChars?: number;
+    toolResultArtifacts?: ToolResultArtifactStore;
     requestApproval?: (ask: {
       tool: string;
       summary: string;
@@ -91,8 +95,30 @@ type ScriptedRound =
       round: number;
       attempt: number;
       onPublished?: () => void;
+      onChunk?: () => void;
       onUsage?: (usage: { input: number; output: number; cachedInput?: number }) => void;
     }) => Promise<TurnRoundResult>);
+
+/** A model request that reports a raw chunk every `everyMs` and answers
+ *  after `totalMs` — a slow-but-live stream.  Rejects if aborted first. */
+const trickles = (everyMs: number, totalMs: number, text = "slow answer") =>
+  async (opts: { signal: AbortSignal; onChunk?: () => void }): Promise<TurnRoundResult> =>
+    new Promise<TurnRoundResult>((resolve, reject) => {
+      const ticker = setInterval(() => opts.onChunk?.(), everyMs);
+      const done = setTimeout(() => {
+        clearInterval(ticker);
+        resolve({ text, usage: null });
+      }, totalMs);
+      opts.signal.addEventListener(
+        "abort",
+        () => {
+          clearInterval(ticker);
+          clearTimeout(done);
+          reject(new DOMException("aborted", "AbortError"));
+        },
+        { once: true },
+      );
+    });
 
 /** A model request that only ends when something aborts it — the shape a
  *  hung or very slow provider has, and the only shape that exercises the
@@ -137,6 +163,8 @@ function harness(rounds: ScriptedRound[]): Harness {
         retryDelayScale: over?.retryDelayScale,
         computeCost: over?.computeCost,
         tools: over?.tools,
+        toolResultHistoryChars: over?.toolResultHistoryChars,
+        toolResultArtifacts: over?.toolResultArtifacts,
         runRound: async (roundMessages, opts) => {
           roundsSeen.push(roundMessages.map((m) => ({ ...m })));
           attempts.push({ round: opts.round, attempt: opts.attempt });
@@ -359,6 +387,83 @@ describe("runTurnLoop — the turn is settled by exactly one place", () => {
     const exit = await h.run();
     expect(exit).toBe("interrupted");
     expect(h.roundsSeen).toHaveLength(0);
+    expect(terminals(h.events)).toHaveLength(1);
+  });
+
+  it("settles the tool host once, before the terminal event, on a clean finish and on Stop (jobs P0)", async () => {
+    // The host's settle is the lost-job detector: whatever a tool started and
+    // left running is stopped with the turn, before anything can dispatch
+    // the next one from its turn.completed.
+    for (const stop of [false, true]) {
+      const h = harness([wantsTools([call("c1", "bash")]), answer("done")]);
+      const settledAt: number[] = [];
+      await h.run({
+        toolHost: {
+          execute: async () => {
+            if (stop) h.abort.abort();
+            return { kind: "result", content: "ok" } as TurnToolOutcome;
+          },
+          settle: () => {
+            settledAt.push(h.events.length);
+          },
+        },
+      });
+      expect(settledAt).toHaveLength(1);
+      const terminalIndex = h.events.findIndex((e) => e.type === "turn.completed");
+      expect(settledAt[0]).toBeLessThanOrEqual(terminalIndex);
+    }
+  });
+
+  it("hands the model a job notice between rounds, once, as an appended user message (jobs P1)", async () => {
+    // A background job that ends mid-turn reaches the model before its next
+    // call, so it does not start the same work again.  Appended after the
+    // tool results — the prefix the provider already saw never changes.
+    const h = harness([wantsTools([call("c1", "bash")]), wantsTools([call("c2", "bash")]), answer("done")]);
+    const queued = [["Background job job_x `pnpm test` finished: exit code 0 after 4m 12s."], [], []];
+    let drains = 0;
+    const exit = await h.run({
+      toolHost: {
+        execute: async () => ({ kind: "result", content: "ok" }),
+        drainNotices: () => queued[drains++] ?? [],
+      },
+    });
+    expect(exit).toBe("settled");
+    const round2 = h.roundsSeen[1]!;
+    expect(round2.at(-2)).toMatchObject({ role: "tool", tool_call_id: "c1" });
+    expect(round2.at(-1)).toEqual({
+      role: "user",
+      content: "[BotFleet notice]\nBackground job job_x `pnpm test` finished: exit code 0 after 4m 12s.",
+    });
+    // round 2's prefix is round 1's, untouched; the notice never repeats
+    expect(round2.slice(0, h.roundsSeen[0]!.length)).toEqual(h.roundsSeen[0]);
+    expect(h.roundsSeen[2]!.filter((m) => m.content.startsWith("[BotFleet notice]"))).toHaveLength(1);
+    expect(drains).toBe(2);
+  });
+
+  it("keeps looping when a notice drain throws", async () => {
+    const h = harness([wantsTools([call("c1", "bash")]), answer("done")]);
+    const exit = await h.run({
+      toolHost: {
+        execute: async () => ({ kind: "result", content: "ok" }),
+        drainNotices: () => {
+          throw new Error("drain exploded");
+        },
+      },
+    });
+    expect(exit).toBe("settled");
+  });
+
+  it("still emits its one terminal event when the tool host's settle throws", async () => {
+    const h = harness([answer("done")]);
+    const exit = await h.run({
+      toolHost: {
+        execute: async () => ({ kind: "result", content: "unused" }),
+        settle: () => {
+          throw new Error("settle exploded");
+        },
+      },
+    });
+    expect(exit).toBe("settled");
     expect(terminals(h.events)).toHaveLength(1);
   });
 });
@@ -626,6 +731,23 @@ describe("runTurnLoop — tool results are real", () => {
     expect(started.map((e) => e.itemId)).toEqual(["c2"]);
   });
 
+  it("attaches the whole result the model was told to a finished tool, beside the clipped detail", async () => {
+    const h = harness([wantsTools([call("c1")]), answer("ok")]);
+    const whole = `first line\n${"r".repeat(600)}\nlast line`;
+    await h.run({ toolHost: hostReturning({ kind: "result", content: whole, detail: "first line" }) });
+    const done = h.events.find((e) => e.type === "item.completed" && e.itemType === "tool")!;
+    expect(done).toMatchObject({ itemId: "c1", ok: true, detail: "first line" });
+    expect(done.io?.output).toEqual({ text: whole, truncated: false, length: whole.length });
+  });
+
+  it("files a failing tool's message the same way", async () => {
+    const h = harness([wantsTools([call("c1")]), answer("ok")]);
+    await h.run({ toolHost: hostReturning({ kind: "error", content: "Tool bash failed: boom", detail: "boom" }) });
+    const done = h.events.find((e) => e.type === "item.completed" && e.itemType === "tool")!;
+    expect(done).toMatchObject({ ok: false, detail: "boom" });
+    expect(done.io?.output?.text).toBe("Tool bash failed: boom");
+  });
+
   it("closes the chips of tools that never finished when the turn is stopped", async () => {
     const h = harness([wantsTools([call("c1"), call("c2")])]);
     await h.run({
@@ -666,6 +788,64 @@ describe("runTurnLoop — rounds", () => {
     const toolMessages = h.messages.filter((m) => m.role === "tool");
     expect(toolMessages.map((m) => m.tool_call_id)).toEqual(["slow", "fast"]);
     expect(toolMessages.map((m) => m.content)).toEqual(["slow result", "fast result"]);
+  });
+
+  it("keeps an oversized tool result whole for the round that receives it, then stores a head and tail", async () => {
+    const marker = "MIDDLE-MARKER-2664";
+    const huge = `${"H".repeat(20_000)}${marker}${"T".repeat(20_000)}`;
+    const store = new ToolResultArtifactStore();
+    const h = harness([
+      wantsTools([call("c1", "bash")]),
+      wantsTools([call("c2", "bash")]),
+      answer("done"),
+    ]);
+    await h.run({
+      toolHost: hostReturning({ kind: "result", content: huge }),
+      toolResultHistoryChars: 8_000,
+      toolResultArtifacts: store,
+    });
+    const toolAt = (round: number, id: string) =>
+      h.roundsSeen[round].find((message) => message.role === "tool" && message.tool_call_id === id);
+    expect(toolAt(1, "c1")?.content).toBe(huge);
+    const stored = toolAt(2, "c1");
+    const storedId = stored?.content.match(/artifact_id "([^"]+)"/)?.[1] ?? "";
+    expect(stored?.content.length).toBeLessThanOrEqual(8_000);
+    expect(storedId.startsWith("tr_")).toBe(true);
+    expect(stored?.content).toContain("H".repeat(32));
+    expect(stored?.content.endsWith("T".repeat(32))).toBe(true);
+    expect(stored?.content).not.toContain(marker);
+    expect(toolAt(2, "c2")?.content).toBe(huge);
+    expect(store.get(storedId)).toBe(huge);
+    expect(h.messages.find((message) => message.tool_call_id === "c1")?.content).not.toContain(marker);
+    expect(h.messages.find((message) => message.tool_call_id === "c2")?.content.length).toBeLessThanOrEqual(8_000);
+  });
+
+  it("truncates a tool result carried in from an earlier turn before the first request", async () => {
+    const huge = "Q".repeat(10_000);
+    const store = new ToolResultArtifactStore();
+    const h = harness([answer("done")]);
+    h.messages.push(
+      { role: "assistant", content: "", tool_calls: [call("old")] },
+      { role: "tool", tool_call_id: "old", content: huge },
+    );
+    await h.run({ toolResultArtifacts: store });
+    const prior = h.roundsSeen[0].find((message) => message.tool_call_id === "old");
+    const priorId = prior?.content.match(/artifact_id "([^"]+)"/)?.[1] ?? "";
+    expect(prior?.content.length).toBeLessThanOrEqual(8_000);
+    expect(prior?.content).not.toBe(huge);
+    expect(priorId.startsWith("tr_")).toBe(true);
+    expect(store.get(priorId)).toBe(huge);
+  });
+
+  it("leaves tool results whole when the history threshold is turned off", async () => {
+    const huge = "Z".repeat(12_000);
+    const h = harness([wantsTools([call("c1")]), answer("done")]);
+    await h.run({
+      toolHost: hostReturning({ kind: "result", content: huge }),
+      toolResultHistoryChars: 0,
+    });
+    expect(h.roundsSeen[1].find((message) => message.role === "tool")?.content).toBe(huge);
+    expect(h.messages.find((message) => message.role === "tool")?.content).toBe(huge);
   });
 
   it("only ever APPENDS to the messages array, so each round re-sends a byte-identical prefix", async () => {
@@ -795,13 +975,171 @@ describe("runTurnLoop — rounds", () => {
 describe("the shipped budget", () => {
   it("is the one the design signed off on", () => {
     expect(DEFAULT_TURN_LOOP_BUDGET).toEqual({
-      maxRounds: 12,
-      requestTimeoutMs: 180_000,
+      // Not a literal.  The unset-bot round budget lives in
+      // shared/bot-profile.ts as DEFAULT_MAX_TOOL_ROUNDS because that is the
+      // same number the turn's prompt names and the settings copy shows; the
+      // hard stop is derived from it so the three cannot disagree.  Pinning a
+      // literal here is exactly what let the prompt say 40 while the loop
+      // stopped at 12.
+      maxRounds: DEFAULT_MAX_TOOL_ROUNDS,
+      requestTimeoutMs: 600_000,
+      requestIdleMs: 120_000,
       toolTimeoutMs: 90_000,
       wallClockMs: 900_000,
       toolConcurrency: 4,
       maxRequestAttempts: 3,
     });
+  });
+
+  it("spends a real budget on an unset turn, not a token twelve", () => {
+    // A turn that runs out of rounds dies with its work undone and nobody
+    // watching, so the floor has to leave room for a multi-step change.
+    expect(DEFAULT_TURN_LOOP_BUDGET.maxRounds).toBeGreaterThanOrEqual(20);
+  });
+});
+
+describe("runTurnLoop — the round's idle clock and hard ceiling", () => {
+  const errors = (events: RuntimeEvent[]) =>
+    events.filter((e): e is Extract<RuntimeEvent, { type: "runtime.error" }> => e.type === "runtime.error");
+
+  it("lets a stream that keeps delivering bytes run well past the idle window", async () => {
+    vi.useFakeTimers();
+    try {
+      // 300s of work, a chunk every 30s: never 120s of silence, and inside
+      // the 600s hard ceiling — this is the slow reasoning round the old
+      // single 180s number cut off.
+      const h = harness([trickles(30_000, 300_000)]);
+      const running = h.run();
+      await vi.advanceTimersByTimeAsync(301_000);
+      expect(await running).toBe("settled");
+      expect(h.attempts).toHaveLength(1);
+      expect(terminals(h.events)[0]).toMatchObject({ ok: true, stopReason: "end_turn" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("counts published output as progress too", async () => {
+    vi.useFakeTimers();
+    try {
+      const h = harness([
+        async (opts) =>
+          new Promise<TurnRoundResult>((resolve) => {
+            const ticker = setInterval(() => opts.onPublished?.(), 60_000);
+            setTimeout(() => {
+              clearInterval(ticker);
+              resolve(answer("done"));
+            }, 250_000);
+          }),
+      ]);
+      const running = h.run();
+      await vi.advanceTimersByTimeAsync(251_000);
+      expect(await running).toBe("settled");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("ends a silent request at the idle deadline as request_timeout, without a retry", async () => {
+    vi.useFakeTimers();
+    try {
+      const h = harness([hangs()]);
+      const running = h.run();
+      await vi.advanceTimersByTimeAsync(119_000);
+      expect(terminals(h.events)).toHaveLength(0);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(await running).toBe("request_timeout");
+      expect(h.attempts).toHaveLength(1);
+      expect(h.events.filter((e) => e.type === "turn.retrying")).toHaveLength(0);
+      expect(terminals(h.events)[0]).toMatchObject({ ok: false, stopReason: "timeout" });
+      // the prefix sentry-ai.ts treats as an expected timeout, not a crash
+      expect(errors(h.events)[0].message).toBe("the model did not answer within 120s — the stream went silent");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("measures silence from the LAST chunk, not from the start of the request", async () => {
+    vi.useFakeTimers();
+    try {
+      const h = harness([
+        async (opts) =>
+          new Promise<TurnRoundResult>((_resolve, reject) => {
+            // live for 100s, then silent forever.  The last chunk is a
+            // setTimeout, not the 100s interval tick: Vitest 5 can fire
+            // clearInterval first when both are due at the same instant.
+            const ticker = setInterval(() => opts.onChunk?.(), 10_000);
+            const stop = setTimeout(() => {
+              clearInterval(ticker);
+              opts.onChunk?.();
+            }, 100_000);
+            opts.signal.addEventListener("abort", () => {
+              clearInterval(ticker);
+              clearTimeout(stop);
+              reject(new DOMException("aborted", "AbortError"));
+            });
+          }),
+      ]);
+      const running = h.run();
+      // last chunk at 100s: still alive at 215s, gone by 225s
+      await vi.advanceTimersByTimeAsync(215_000);
+      expect(terminals(h.events)).toHaveLength(0);
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(await running).toBe("request_timeout");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still enforces the hard ceiling on a stream that never goes quiet", async () => {
+    vi.useFakeTimers();
+    try {
+      const h = harness([trickles(10_000, 10_000_000)]);
+      const running = h.run({ budget: { requestTimeoutMs: 200_000 } });
+      await vi.advanceTimersByTimeAsync(201_000);
+      expect(await running).toBe("request_timeout");
+      expect(errors(h.events)[0].message).toBe("the model did not answer within 200s");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("requestIdleMs: 0 turns the idle clock off for a driver with its own stall guard", async () => {
+    vi.useFakeTimers();
+    try {
+      const h = harness([hangs()]);
+      const running = h.run({ budget: { requestIdleMs: 0, requestTimeoutMs: 400_000 } });
+      await vi.advanceTimersByTimeAsync(300_000);
+      expect(terminals(h.events)).toHaveLength(0);
+      await vi.advanceTimersByTimeAsync(101_000);
+      expect(await running).toBe("request_timeout");
+      expect(errors(h.events)[0].message).toBe("the model did not answer within 400s");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not count the backoff between attempts as model silence", async () => {
+    vi.useFakeTimers();
+    try {
+      let calls = 0;
+      const h = harness([
+        async (opts) => {
+          calls += 1;
+          if (calls === 1) throw httpErrorFor(503, "busy");
+          return trickles(30_000, 60_000)(opts);
+        },
+      ]);
+      // The ~1s first backoff scaled x60 is longer than the 40s idle
+      // window, so a clock left running through the wait would abort the
+      // round before the retry ever started.
+      const running = h.run({ budget: { requestIdleMs: 40_000 }, retryDelayScale: 60 });
+      await vi.advanceTimersByTimeAsync(200_000);
+      expect(await running).toBe("settled");
+      expect(h.attempts.map((a) => a.attempt)).toEqual([1, 2]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

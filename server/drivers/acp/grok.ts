@@ -7,15 +7,49 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { z } from "zod";
+
 import type { ModelCatalog } from "../../contracts.ts";
+import type { JsonValue } from "../../schema.ts";
 import { decodeInjectId, hostApiKey, localHost, mergeLocalInject } from "../local-inject.ts";
-import { createAcpDriver, type AcpSupport } from "./core.ts";
+import { classifyError } from "../retry.ts";
+import { AcpModelRejectedError, createAcpDriver, type AcpSupport } from "./core.ts";
+
+/** Hover text for the "If offered" chip on the rows below.  The Grok Build
+ *  CLI answers `session/set_model` only for the models its own account lists
+ *  (`grok models`, or the `session/new` model list), so a row here can be
+ *  picked on an account the CLI does not serve it to.  That turn fails with
+ *  the "Grok rejected model" error in `configureSession`, which names what the
+ *  account is offered.  Chip text stays under ~10 chars (contracts.ts). */
+const ACCOUNT_GATED_BADGE = "If offered";
+const ACCOUNT_GATED_TITLE =
+  "The Grok Build CLI only offers this model on accounts that have it.  " +
+  "Run \"grok models\" in a terminal to see what this account can use.";
 
 export const STATIC_GROK_MODELS: ModelCatalog = {
   default: "grok-4.7",
   options: [
     { id: "grok-4.7", label: "Grok 4.7" },
-    { id: "grok-4.7-build-fast", label: "Grok 4.7 Build Fast" },
+    // Same underlying Grok 4.7 served on high-performance infrastructure:
+    // ~2x output speed, 2x the per-token cost of the standard tier.
+    // Surface that tradeoff in the picker so the operator does not pick it
+    // by accident — the chip is short on purpose (fits a narrow chat head).
+    {
+      id: "grok-4.7-build-fast",
+      label: "Grok 4.7 Build Fast",
+      badge: "2× $",
+      badgeTitle: "Same Grok 4.7 model on high-performance infrastructure — 2× the output speed at 2× the per-token price.",
+    },
+    // Composer 2.5 is Cursor's model, selectable inside the Grok Build CLI
+    // via /model (https://x.ai/news/composer-2-5).  Same id the Cursor engine
+    // uses (cursor.ts), so src/lib/engine-capabilities.tsx lists it under both
+    // engines to keep model-id attribution ambiguous rather than Grok's.
+    // composer-2.5-fast is not listed: xAI has not documented it.
+    { id: "composer-2.5", label: "Composer 2.5", badge: ACCOUNT_GATED_BADGE, badgeTitle: ACCOUNT_GATED_TITLE },
+    // xAI's own coding model, public beta since 2026-05-29 and the model that
+    // powers the Grok Build CLI (https://x.ai/news/grok-build-0-1).  Also an
+    // xAI API id: see MODELS in ../grok.ts.
+    { id: "grok-build-0.1", label: "Grok Build 0.1", badge: ACCOUNT_GATED_BADGE, badgeTitle: ACCOUNT_GATED_TITLE },
     { id: "grok-4.6", label: "Grok 4.6" },
     { id: "grok-4.5", label: "Grok 4.5" },
   ],
@@ -182,6 +216,51 @@ export function ensureGrokInjectSlug(
   return slug;
 }
 
+/** At most this many offered ids are named in the rejected-model error. */
+const OFFERED_IDS_IN_ERROR = 12;
+
+/** The reason an RPC failed.  ACP carries the specific reason in the error's
+ *  `data`, and acp/core.ts keeps it off `Error.message`: grok 1.0.46 answers a
+ *  model it does not serve with -32602, message "Invalid params", data
+ *  "unknown model id".  Without the data the text says only "Invalid params",
+ *  and drivers/retry.ts cannot read the failure as an unknown model. */
+export function grokRpcReason(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  const data = (error as { data?: unknown } | null | undefined)?.data;
+  const detail = typeof data === "string" ? data.trim().slice(0, 200) : "";
+  return detail && !message.includes(detail) ? `${message}: ${detail}` : message;
+}
+
+/** The error a rejected `session/set_model` becomes.  Two rules:
+ *   - It keeps the CLI's own wording (`cause`, see grokRpcReason) verbatim.
+ *     The retry classifier (drivers/retry.ts) reads "unknown model id" out of
+ *     it to mark the failure terminal `unknown_model` instead of `unknown`;
+ *     nothing here may add a phrase that an earlier arm of that classifier
+ *     (auth, quota) would claim.
+ *   - It names what the signed-in account IS offered.  `sessionModels` is the
+ *     `session/new` model list, verbatim, so the answer is the CLI's own and
+ *     needs no second probe.  Some models in this picker (Composer 2.5, Grok
+ *     Build 0.1) reach only the accounts the CLI serves them to. */
+export function grokRejectedModelMessage(
+  model: string,
+  cause: string,
+  sessionModels: ReadonlyArray<{ modelId?: string; name?: string }> = [],
+): string {
+  const offered = [
+    ...new Set(
+      sessionModels
+        .map((m) => (typeof m?.modelId === "string" ? m.modelId.trim() : ""))
+        .filter((id) => id && id.length <= 80 && SLUG.test(id)),
+    ),
+  ].slice(0, OFFERED_IDS_IN_ERROR);
+  const offers = offered.length ? `This account's Grok CLI offers: ${offered.join(", ")}.  ` : "";
+  return (
+    `Grok rejected model "${model}" via session/set_model: ${cause}.  ${offers}` +
+    `Run \`grok models\` in a terminal to see everything this account can use.  ` +
+    `A slug from ~/.grok/config.toml is also accepted, and \`grok update\` installs the current CLI.`
+  );
+}
+
 const support: AcpSupport = {
   driverKind: "grokAgent",
   displayName: "Grok",
@@ -230,17 +309,46 @@ const support: AcpSupport = {
     return args;
   },
 
+  // A routine with a command allowlist (server/drivers/acp/allowlist.ts).
+  // Never bypassPermissions.  The owner's own ~/.grok/config.toml allow
+  // rules (`Bash(*)`, `MCPTool(*)`) still auto-approve in `default` mode, and
+  // agent mode ignores --deny, --tools and --disallowed-tools, so the mode is
+  // not the guard:  the client-registered pre_tool_use hook is, with the
+  // client terminal and file calls behind it.  Web search and fetch and
+  // subagents are switched off because nothing in a routine needs them.
+  // --no-leader keeps this turn in its own process, where the hook and the
+  // client capabilities this connection registered apply.
+  allowlist: {
+    spawnArgs: (_config, turn) => [
+      "--permission-mode",
+      "default",
+      "--disable-web-search",
+      "--no-subagents",
+      "agent",
+      ...(turn.model ? ["-m", turn.model] : []),
+      ...(turn.effort ? ["--reasoning-effort", turn.effort] : []),
+      "--no-leader",
+      "stdio",
+    ],
+    verifyInitialize: (init) => grokAllowlistProblem(init),
+  },
+
   // -m on argv is necessary but not sufficient: session/new still starts on
   // [models].default. Pin the slug over the wire, same as Hermes/Droid.
-  async configureSession({ request, sessionId, turn }) {
+  async configureSession({ request, sessionId, turn, sessionModels }) {
     if (!turn.model) return;
     try {
       await request("session/set_model", { sessionId, modelId: turn.model });
     } catch (e) {
-      throw new Error(
-        `Grok rejected model "${turn.model}" via session/set_model: ${(e as Error).message}. ` +
-          `Check that grok is current (1.0.6+ supports it) and that this slug exists in ~/.grok/config.toml.`,
-      );
+      const reason = grokRpcReason(e);
+      const message = grokRejectedModelMessage(turn.model, reason, sessionModels);
+      // Only the CLI's own refusal of the id settles the turn `unknown_model`,
+      // which marks the model rejected for later turns and fail-overs.  A
+      // timeout or a crash during set_model says nothing about the model, so
+      // it must not hide a working one for hours.
+      throw classifyError({ text: reason }).reason === "unknown_model"
+        ? new AcpModelRejectedError(message)
+        : new Error(message);
     }
   },
 
@@ -254,7 +362,7 @@ const support: AcpSupport = {
   // an unauthenticated CLI is a user action, not something to paper over.
   // OIDC disk login (auth.json) is still signed in when initialize omits
   // cached_token; acp/core proceeds on ambient login in that case.
-  pickAuthMethod: (methods) => (methods.some((m) => m.id === "cached_token") ? "cached_token" : null),
+  pickAuthMethod: (methods, _env) => (methods.some((m) => m.id === "cached_token") ? "cached_token" : null),
   authFailure: "fail",
   // this instance's HOME, not the server process's: an instance can carry
   // its own, and probing the wrong one reports another account's login
@@ -265,5 +373,40 @@ const support: AcpSupport = {
   // persona is prepended codex-style.
   buildPromptText: (turn) => (turn.system ? `${turn.system}\n\n${turn.text}` : turn.text),
 };
+
+/** Grok's client-hook capability, as `initialize` describes it.
+ *
+ *  Deliberately `.looseObject` (Zod's `.passthrough()`), not `.strict()`.  The
+ *  one thing that decides anything is `grokAllowlistProblem` below:  it accepts
+ *  only when `blockingEvents` includes `pre_tool_use` AND `decisions` includes
+ *  `deny`.  No unknown key can satisfy that pair, so passing extra keys through
+ *  cannot turn "this CLI offers no hooks" into "it does" -- there is nothing to
+ *  smuggle through an ignored field.
+ *
+ *  Strict buys no safety here and costs real robustness:  one new field anywhere
+ *  in `initialize` would fail `safeParse`, `hooks` would read as absent, and
+ *  every routine carrying an allowlist would be refused until someone edits this
+ *  file.  Leniency degrades to "the new field is ignored";  strictness degrades
+ *  to "the feature is off fleet-wide". */
+export const hookCapabilitySchema = z.looseObject({
+  blockingEvents: z.array(z.string()).optional().catch(undefined),
+  decisions: z.array(z.string()).optional().catch(undefined),
+});
+export const hookMetaSchema = z.looseObject({ "x.ai/hooks": hookCapabilitySchema.optional().catch(undefined) }).optional().catch(undefined);
+export const initializeHooksSchema = z.looseObject({
+  _meta: hookMetaSchema,
+  agentCapabilities: z.looseObject({ _meta: hookMetaSchema }).optional().catch(undefined),
+});
+
+/** Why this Grok CLI cannot be held to a routine's allowlist, from its
+ *  `initialize` answer:  it must offer a blocking `pre_tool_use` client hook
+ *  that can deny.  Grok 1.0.50 says so in `agentCapabilities._meta`.  Null
+ *  when it can be held. */
+export function grokAllowlistProblem(init: JsonValue | undefined): string | null {
+  const parsed = initializeHooksSchema.safeParse(init);
+  const hooks = parsed.success ? (parsed.data.agentCapabilities?._meta?.["x.ai/hooks"] ?? parsed.data._meta?.["x.ai/hooks"]) : undefined;
+  if (hooks?.blockingEvents?.includes("pre_tool_use") && hooks.decisions?.includes("deny")) return null;
+  return "This Grok CLI offers no blocking pre-tool hook, so BotFleet cannot hold a routine to its command allowlist.  Update Grok Build.";
+}
 
 export const GrokAgentDriver = createAcpDriver(support);

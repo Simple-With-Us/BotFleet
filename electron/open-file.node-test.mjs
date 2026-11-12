@@ -6,7 +6,7 @@ import { after, before, describe, it } from "node:test";
 import { pathToFileURL } from "node:url";
 
 import { parseExternalHttpUrl, windowOpenExternalUrl } from "./external-url.mjs";
-import { resolveOpenablePath } from "./open-file.mjs";
+import { mayOpenBotFile, resolveLocalRevealPath, resolveOpenablePath } from "./open-file.mjs";
 
 let home;
 let botHome;
@@ -75,3 +75,18 @@ describe("open-file / show-in-folder path confinement", () => {
     });
   });
 });
+
+describe("plugin source reveal paths", () => {
+  it("accepts an existing folder outside ~/.botfleet", async () => {
+    const outsideDir = path.join(home, "my-plugin");
+    fs.mkdirSync(outsideDir, { recursive: true });
+    const expected = await fs.promises.realpath(outsideDir);
+    assert.equal(await resolveLocalRevealPath(outsideDir), expected);
+  });
+});
+
+// OS openers execute these on at least one supported desktop platform.
+assert.equal(mayOpenBotFile("/tmp/report.pdf"), true);
+for (const unsafe of ["run.command", "run.sh", "run.bat", "run.cmd", "run.js", "run.ps1", "run.exe", "run.desktop", "run.app", "run.html"]) {
+  assert.equal(mayOpenBotFile(`/tmp/${unsafe}`), false);
+}

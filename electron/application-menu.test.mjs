@@ -12,7 +12,8 @@ const read = (relative) =>
 
 const main = read("./main.mjs");
 const store = read("../src/state/store.tsx");
-const settingsModal = read("../src/components/SettingsModal.tsx");
+// The Settings rail (section ids and the labels it shows) lives in its own file.
+const settingsNav = read("../src/components/SettingsNav.tsx");
 
 /** Every id in the AppSettingsSection union. */
 function declaredSections() {
@@ -23,7 +24,7 @@ function declaredSections() {
 
 /** id -> the name the Settings nav shows for it. */
 function sectionLabels() {
-  const entries = [...settingsModal.matchAll(/\{ id: "([a-zA-Z]+)", label: "([^"]+)"/g)];
+  const entries = [...settingsNav.matchAll(/\{ id: "([a-zA-Z]+)", label: "([^"]+)"/g)];
   expect(entries.length).toBeGreaterThan(0);
   return new Map(entries.map((m) => [m[1], m[2]]));
 }

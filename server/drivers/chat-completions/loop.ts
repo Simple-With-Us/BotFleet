@@ -26,6 +26,11 @@
 //      and (in loop.test.ts) a test row.
 //   2. The messages array lives here and is only appended to, so the
 //      prefix the provider already saw stays byte-identical across rounds.
+//      One exception: a tool result over the history threshold is replaced
+//      with a head, a tail, and an artifact pointer after the round that
+//      received the full text (server/tool-result-history.ts).  Later
+//      rounds do not re-send the body.  Results under the threshold are
+//      never rewritten.
 //   3. Usage sums across rounds and is carried on the terminal event, on
 //      the error path as well as the success path.
 //   4. `item.completed` for a tool carries the REAL outcome, emitted after
@@ -41,7 +46,7 @@
 //      anything (a text delta, a reasoning delta, a tool call announced
 //      off the stream) — replaying that round would duplicate output a
 //      person already read, which is worse than the failure.  And it never
-//      starts an attempt it cannot finish: the round's own 180s ceiling
+//      starts an attempt it cannot finish: the round's own ceiling
 //      and the turn's 900s wall clock both have to have real headroom
 //      left, and the sleep between attempts aborts with the turn, so Stop
 //      during a backoff settles immediately instead of after the wait.
@@ -55,7 +60,15 @@ import type {
   TurnToolOutcome,
 } from "../../contracts.ts";
 import { ProviderError } from "../../contracts.ts";
+import { DEFAULT_MAX_TOOL_ROUNDS } from "../../../shared/bot-profile.ts";
 import { parseToolArguments, toolFields } from "../../tool-fields.ts";
+import { captureOutput } from "../../../shared/item-io.ts";
+import {
+  compactDeliveredToolResults,
+  resolveToolResultHistoryChars,
+  sharedToolResultArtifacts,
+  type ToolResultArtifactStore,
+} from "../../tool-result-history.ts";
 import { RETRY_MAX_ATTEMPTS, classifyError, computeBackoff, interruptibleDelay } from "../retry.ts";
 import { UNHINTED_RATE_LIMIT_ATTEMPTS, httpFailureOf, httpRetryPolicy, isPrematureCloseError } from "./errors.ts";
 
@@ -71,7 +84,8 @@ export type TurnLoopExit =
   | "tool_round_limit"
   /** The whole-turn budget ran out. */
   | "wall_clock"
-  /** One model request exceeded `requestTimeoutMs`. */
+  /** One model request exceeded `requestTimeoutMs`, or went silent for
+   *  `requestIdleMs`. */
   | "request_timeout"
   /** An HTTP or stream failure from the provider. */
   | "provider_error"
@@ -108,10 +122,19 @@ export interface TurnLoopBudget {
    *  — running side effects nobody reads is worse than stopping one round
    *  earlier. */
   maxRounds: number;
-  /** Ceiling on one model request, enforced by an abort the request itself
-   *  carries.  A harness-side timer that fires while the request keeps
-   *  streaming is what manufactured orphaned late completions before. */
+  /** HARD ceiling on one model round, however live its stream is, enforced
+   *  by an abort the request itself carries.  A harness-side timer that
+   *  fires while the request keeps streaming is what manufactured orphaned
+   *  late completions before.  Shared by every attempt at the round. */
   requestTimeoutMs: number;
+  /** IDLE ceiling on one model request: how long it may go without the
+   *  driver reporting progress (`onChunk` for any raw bytes off the socket,
+   *  `onPublished` for anything put on the bus) before it is aborted as a
+   *  `request_timeout`.  Re-armed at the start of every attempt and on
+   *  every progress report, so a slow reasoning round that keeps streaming
+   *  runs until the hard ceiling while a dead connection is caught in this
+   *  long.  `0` turns it off, for a driver that owns its own stall guard. */
+  requestIdleMs: number;
   /** Ceiling on one tool call. */
   toolTimeoutMs: number;
   /** Ceiling on the whole turn, rounds and tools together. */
@@ -126,9 +149,22 @@ export interface TurnLoopBudget {
   maxRequestAttempts: number;
 }
 
+/** The unset-bot round budget.  `maxRounds` is NOT a second opinion: it is
+ *  the same `DEFAULT_MAX_TOOL_ROUNDS` the turn's system prompt names and the
+ *  same number `toolRoundsCaption()` shows the owner.
+ *
+ *  These were three separate literals — 12 here, 40 in shared/bot-profile.ts,
+ *  and "Empty uses 12" in the desktop and iOS copy — and they disagreed.  An
+ *  unset bot was told "This turn has a budget of 40 model→tool rounds" and
+ *  then hard-stopped at 12, which is exactly the mid-work truncation
+ *  `toolBudgetPrompt` exists to prevent: the model planned against 40 because
+ *  we told it to, spent accordingly, and got cut off with nobody watching.
+ *  Deriving the hard stop from the shared constant makes that split
+ *  unrepresentable rather than merely fixed today. */
 export const DEFAULT_TURN_LOOP_BUDGET: TurnLoopBudget = {
-  maxRounds: 12,
-  requestTimeoutMs: 180_000,
+  maxRounds: DEFAULT_MAX_TOOL_ROUNDS,
+  requestTimeoutMs: 600_000,
+  requestIdleMs: 120_000,
   toolTimeoutMs: 90_000,
   wallClockMs: 900_000,
   toolConcurrency: 4,
@@ -163,6 +199,9 @@ export interface TurnUsage {
   input: number;
   output: number;
   cachedInput?: number;
+  /** The reasoning share of `output` (already inside it), when the provider
+   *  reports it: `completion_tokens_details.reasoning_tokens`. */
+  reasoning?: number;
 }
 
 /** What one model request produced. */
@@ -204,6 +243,15 @@ export interface TurnLoopDeps {
        *  started streaming — the safe direction; one that calls it too
        *  eagerly loses a retry, never duplicates output. */
       onPublished?: () => void;
+      /** Called by the driver for every raw chunk its response body
+       *  yields (and once when the response headers arrive), parsed into
+       *  anything or not.  It is the liveness signal `requestIdleMs` is
+       *  measured against: "is the socket still moving", not "did the
+       *  model say something new" — keep-alives and reasoning frames a
+       *  driver does not surface still count.  A driver that never calls
+       *  it is judged on `onPublished` alone, and one that calls neither
+       *  gets `requestIdleMs` of total budget per attempt. */
+      onChunk?: () => void;
       onUsage?: (usage: TurnUsage) => void;
     },
   ) => Promise<TurnRoundResult>;
@@ -260,6 +308,13 @@ export interface TurnLoopDeps {
    *  this tool needs longer than the uniform per-tool ceiling.  Absent, or a
    *  tool with no override, keeps `budget.toolTimeoutMs`. */
   tools?: ReadonlyArray<{ name: string; timeoutMs?: number }>;
+  /** Characters of a tool result kept in the messages array after the round
+   *  that saw the full text.  Absent uses 8,000.  `0` leaves every result
+   *  whole, which is the old re-send behaviour. */
+  toolResultHistoryChars?: number;
+  /** Where the full text goes when history keeps only an excerpt.  Absent
+   *  uses the process store `read_tool_result` reads. */
+  toolResultArtifacts?: ToolResultArtifactStore;
 }
 
 /** A tool's arguments are declared as a JSON object schema; anything else on
@@ -278,6 +333,17 @@ function decodeArguments(raw: unknown): Record<string, unknown> {
 function unrefTimer(timer: ReturnType<typeof setTimeout>): void {
   const handle: { unref?: () => void } = timer;
   handle.unref?.();
+}
+
+/** Push a pending timer's deadline out by its full delay, in place.  Node's
+ *  `Timeout.refresh()` does that without allocating, which matters on a path
+ *  that runs once per streamed chunk; where it is missing the caller re-arms
+ *  instead. */
+function refreshTimer(timer: ReturnType<typeof setTimeout>): boolean {
+  const handle: { refresh?: () => unknown } = timer;
+  if (typeof handle.refresh !== "function") return false;
+  handle.refresh();
+  return true;
 }
 
 /** Rejects when `signal` aborts, and detaches its listener either way so a
@@ -308,6 +374,16 @@ export async function runTurnLoop(deps: TurnLoopDeps): Promise<TurnLoopExit> {
   const now = deps.now ?? Date.now;
   const startedAt = now();
   const messages = deps.messages;
+  const historyChars = resolveToolResultHistoryChars(deps.toolResultHistoryChars);
+  const historyStore = deps.toolResultArtifacts ?? sharedToolResultArtifacts();
+  // Anything already in the array was shown on an earlier turn.  Results
+  // appended during this turn stay full until the round after the one that
+  // received them, then this prefix is what later rounds re-send.
+  let deliveredUntil = messages.length;
+  const compactSeenToolResults = () => {
+    if (historyChars === null) return;
+    compactDeliveredToolResults(messages, deliveredUntil, { threshold: historyChars, store: historyStore });
+  };
   const announced = deps.startedToolIds ?? new Set<string>();
   const maxRounds = Math.max(1, deps.toolHost?.maxRounds ?? budget.maxRounds);
 
@@ -490,7 +566,7 @@ export async function runTurnLoop(deps: TurnLoopDeps): Promise<TurnLoopExit> {
     /** The host's channel to a person.  The loop owns the clock semantics;
      *  the broker owns the card.  No broker mounted is fail-closed: the
      *  host reads `"unavailable"` as a deny and the tool never runs. */
-    const requestApproval = async (ask: { tool: string; summary: string }): Promise<RequestOutcome> => {
+    const requestApproval = async (ask: { tool: string; summary: string; approvalScope?: "local-computer" | "disposable-computer" }): Promise<RequestOutcome> => {
       const broker = deps.requestApproval;
       if (!broker) return "unavailable";
       stopClock();
@@ -507,7 +583,7 @@ export async function runTurnLoop(deps: TurnLoopDeps): Promise<TurnLoopExit> {
         // the contract says a host never throws; this normalises the one
         // that does rather than letting it end the turn
         host
-          .execute(decoded, { signal, requestApproval })
+          .execute(decoded, { signal, requestApproval, turnId: deps.base().turnId })
           .catch((e: unknown) => {
             const message = e instanceof Error ? e.message : String(e);
             return { kind: "error", content: `Tool ${decoded.name} failed: ${message}`, detail: message } as TurnToolOutcome;
@@ -554,6 +630,9 @@ export async function runTurnLoop(deps: TurnLoopDeps): Promise<TurnLoopExit> {
           itemId: call.id,
           ok: outcome.kind !== "error",
           arguments: call.function.arguments,
+          // the text the model is told the tool returned, whole — the bus
+          // files it in the side store, never on the event
+          ...captureOutput(outcome.content),
         };
         deps.emit(outcome.detail ? { ...row, detail: outcome.detail } : row);
       }
@@ -599,18 +678,59 @@ export async function runTurnLoop(deps: TurnLoopDeps): Promise<TurnLoopExit> {
         break;
       }
 
+      // Shorten tool results the model has already seen.  The result this
+      // round is about to receive for the first time is still past
+      // `deliveredUntil`, so this request gets that one in full.
+      compactSeenToolResults();
+
       const request = new AbortController();
       let requestTimedOut = false;
+      // Which of the round's two clocks fired, for the message only: both
+      // are the same `request_timeout` exit.
+      let idleTimedOut = false;
       const requestTimer = setTimeout(() => {
         requestTimedOut = true;
         request.abort();
       }, budget.requestTimeoutMs);
       unrefTimer(requestTimer);
-      // The round's deadline, shared by EVERY attempt at it rather than
-      // re-armed per try: `requestTimeoutMs` is what a person is willing
-      // to wait for this round's answer, and a fresh 180s per retry would
-      // silently turn that into nine minutes.  It is also the ceiling the
-      // retry budget guard measures headroom against.
+      // The idle clock.  Split out of the hard ceiling because one number
+      // cannot be both: 180s total cut a slow-but-live reasoning round off
+      // mid-answer (grok's 120s fetch timer made it worse, racing this one
+      // and ending the round as a provider_error that paged), while a
+      // ceiling long enough for that round let a dead socket hold the bot
+      // for just as long.  Armed per ATTEMPT (a retry is a new request with
+      // a new socket) and disarmed across the backoff between attempts.
+      const idleEnabled = Number.isFinite(budget.requestIdleMs) && budget.requestIdleMs > 0;
+      let idleTimer: ReturnType<typeof setTimeout> | null = null;
+      const disarmIdle = () => {
+        if (idleTimer !== null) clearTimeout(idleTimer);
+        idleTimer = null;
+      };
+      const armIdle = () => {
+        disarmIdle();
+        if (!idleEnabled || request.signal.aborted) return;
+        idleTimer = setTimeout(() => {
+          idleTimer = null;
+          requestTimedOut = true;
+          idleTimedOut = true;
+          request.abort();
+        }, budget.requestIdleMs);
+        unrefTimer(idleTimer);
+      };
+      // Progress from the driver.  A no-op once the attempt is over or the
+      // clock has fired, so a straggling chunk can never re-arm a timer for
+      // a request that already ended.
+      // Refresh the deadline in place when `Timeout.refresh()` is honest
+      // (production Node): zero allocations on the per-chunk hot path.
+      const noteProgress = () => {
+        if (idleTimer === null || request.signal.aborted) return;
+        if (!refreshTimer(idleTimer)) armIdle();
+      };
+      // The round's hard deadline, shared by EVERY attempt at it rather
+      // than re-armed per try: `requestTimeoutMs` is the most a person will
+      // wait for this round's answer, and a fresh ceiling per retry would
+      // silently triple it.  It is also the ceiling the retry budget guard
+      // measures headroom against.
       const roundDeadline = now() + budget.requestTimeoutMs;
       const roundSignal = AbortSignal.any([turnSignal, wall.signal, request.signal]);
       // Set by the driver through `onPublished` the moment this round puts
@@ -629,6 +749,7 @@ export async function runTurnLoop(deps: TurnLoopDeps): Promise<TurnLoopExit> {
           // analysis does not follow the reassignment happening inside the
           // callback closure.
           const roundState: { usage: TurnUsage | null } = { usage: null };
+          armIdle();
           try {
             result = await deps.runRound(messages, {
               signal: roundSignal,
@@ -636,13 +757,17 @@ export async function runTurnLoop(deps: TurnLoopDeps): Promise<TurnLoopExit> {
               attempt,
               onPublished: () => {
                 published = true;
+                noteProgress();
               },
+              onChunk: noteProgress,
               onUsage: (usage) => {
                 roundState.usage = usage;
               },
             });
             break;
           } catch (e) {
+            // this attempt is over; the backoff below is not model silence
+            disarmIdle();
             const error = e instanceof Error ? e : new Error(String(e));
             // A retry has to be invisible to be correct.  It is only
             // considered when the turn is still live (an interrupt, the
@@ -697,6 +822,7 @@ export async function runTurnLoop(deps: TurnLoopDeps): Promise<TurnLoopExit> {
               totals.output += roundState.usage.output;
               const cached = roundState.usage.cachedInput;
               if (cached !== undefined) totals.cachedInput = (totals.cachedInput ?? 0) + cached;
+              if (roundState.usage.reasoning !== undefined) totals.reasoning = (totals.reasoning ?? 0) + roundState.usage.reasoning;
               // These tokens are in `totals`, so they must be in `costSoFar`
               // too — see priceRound's own comment.
               priceRound(roundState.usage);
@@ -707,7 +833,12 @@ export async function runTurnLoop(deps: TurnLoopDeps): Promise<TurnLoopExit> {
               errorMessage = `the turn ran past its ${Math.round(budget.wallClockMs / 1000)}s budget and was stopped`;
             } else if (requestTimedOut) {
               exit = "request_timeout";
-              errorMessage = `the model did not answer within ${Math.round(budget.requestTimeoutMs / 1000)}s`;
+              // Both wordings keep the "the model did not answer within"
+              // prefix sentry-ai.ts files as an expected timeout rather
+              // than a crash.
+              errorMessage = idleTimedOut
+                ? `the model did not answer within ${Math.round(budget.requestIdleMs / 1000)}s — the stream went silent`
+                : `the model did not answer within ${Math.round(budget.requestTimeoutMs / 1000)}s`;
             } else {
               exit = "provider_error";
               errorMessage = error.message;
@@ -721,7 +852,12 @@ export async function runTurnLoop(deps: TurnLoopDeps): Promise<TurnLoopExit> {
         }
       } finally {
         clearTimeout(requestTimer);
+        disarmIdle();
       }
+
+      // This round has now seen every message currently in the array.
+      // Tool results appended below stay past this index until the next round.
+      deliveredUntil = messages.length;
 
       if (result.usage) {
         sawUsage = true;
@@ -729,6 +865,7 @@ export async function runTurnLoop(deps: TurnLoopDeps): Promise<TurnLoopExit> {
         totals.output += result.usage.output;
         const cached = result.usage.cachedInput;
         if (cached !== undefined) totals.cachedInput = (totals.cachedInput ?? 0) + cached;
+        if (result.usage.reasoning !== undefined) totals.reasoning = (totals.reasoning ?? 0) + result.usage.reasoning;
         // Priced from THIS round's own usage, never the running `totals`
         // — a size-tiered model must see this request's own size, not the
         // turn's cumulative size, or a multi-round turn gets billed as if
@@ -754,9 +891,8 @@ export async function runTurnLoop(deps: TurnLoopDeps): Promise<TurnLoopExit> {
         break;
       }
 
-      // The prefix the provider already saw is never rewritten — only
-      // appended to — which is what keeps prompt caching reachable and what
-      // removed the duplicate-replay bug the transcript rebuild had.
+      // Append only.  An oversized tool result already in the prefix is
+      // replaced before the next request, after this round has seen it whole.
       messages.push({ role: "assistant", content: result.text ?? "", tool_calls: calls });
 
       if (round === maxRounds) {
@@ -789,6 +925,21 @@ export async function runTurnLoop(deps: TurnLoopDeps): Promise<TurnLoopExit> {
         stopReasonOverride = suspended.stopReason;
         break;
       }
+
+      // Between rounds, before the next model call: anything the harness is
+      // holding for this turn — a background job that just ended — goes in
+      // as one more user message, so the model reads it before it decides
+      // what to do next (and does not start the same work again).  Appended,
+      // never spliced, so the prefix the provider already saw is unchanged.
+      let notices: string[] = [];
+      try {
+        notices = deps.toolHost?.drainNotices?.() ?? [];
+      } catch (error) {
+        console.error("tool host notice drain failed", error);
+      }
+      if (notices.length > 0) {
+        messages.push({ role: "user", content: `[BotFleet notice]\n${notices.join("\n")}` });
+      }
     }
   } catch (e) {
     const error = e instanceof Error ? e : new Error(String(e));
@@ -802,6 +953,17 @@ export async function runTurnLoop(deps: TurnLoopDeps): Promise<TurnLoopExit> {
     }
   } finally {
     clearTimeout(wallTimer);
+    // The round that saw a result has finished.  Keep the excerpt in the
+    // array the driver still holds, and the full text in the artifact store.
+    compactSeenToolResults();
+    // Whatever a tool started and left running ends with the turn
+    // (server/tools/process-group.ts).  Before the terminal event, so a
+    // queued turn that dispatches from it never inherits this turn's work.
+    try {
+      deps.toolHost?.settle?.();
+    } catch (error) {
+      console.error("tool host settle failed", error);
+    }
     // Drop the driver's active entry BEFORE the terminal event: the fold
     // that handles turn.completed drains queued sends synchronously, and a
     // fresh dispatch must not find this thread still busy.

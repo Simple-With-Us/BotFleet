@@ -1,10 +1,12 @@
+import type { QuotaPlanMetadata } from "../../shared/quota-plan-metadata";
 // App settings → Usage: what every bot has spent, so "which of my bots is
 // costing me money" is answerable without a provider dashboard. Figures are
 // banked per settled turn on each task (server/store.ts addTaskUsage) and
 // summed here; nothing is fetched.
 import * as React from "react";
 import { Check, CheckCircle, ChevronDown, Loader2, RefreshCw, XCircle } from "lucide-react";
-import { api, useSecretSources, useStore, type ConfigStatus, type TaskUsage } from "@/state/store";
+import { api, useSecretSources, useStore, type ConfigStatus, type InstanceInfo, type TaskUsage } from "@/state/store";
+import { isCheckingEngine, isHiddenEngine } from "@/lib/engine-status";
 import { cn } from "@/lib/cn";
 import { BotMascot } from "./Avatar";
 import { Card } from "./SettingsPrimitives";
@@ -13,10 +15,11 @@ import type { BotColor } from "@/lib/mascot";
 import { SecretSourceBadge } from "./SecretSourceBadge";
 import { UsageMonitorQuotaGrid } from "./UsageMonitorQuotaGrid";
 import { UsageWhatIfProjection } from "./UsageWhatIfProjection";
+import { HeldBotsNotice, RedundantChainsNotice } from "./UsageNotices";
 import { ENGINE_CAPABILITIES, engineIdFromDriverKind, uniqueModelToEngineId } from "@/lib/engine-capabilities";
 import { telemetryBadge, telemetryHost, type TelemetryStatusView } from "@/lib/telemetry-status";
 import { buildUsageConfigPatch } from "@/lib/usage-config";
-import { antigravityGroupSummary, antigravityQuotaLines, formatResetCountdown, headlinesExhausted, headlinesNearCap, isEngineUnconfigured, localQuotaStatusLine, minimaxQuotaLine, providerIssueLine, quotaLinesSummary, usageWindowLines, windowHeadlines, windowsLabelFromHeadlines, type LocalQuotaFreshnessView } from "@/lib/quota-display";
+import { antigravityGroupSummary, antigravityQuotaLines, formatResetCountdown, headlinesExhausted, headlinesNearCap, isEngineUnconfigured, localQuotaStatusLine, minimaxQuotaLine, providerIssueLine, quotaGridPlaceholderLine, quotaLinesSummary, usageWindowLines, windowHeadlines, windowsLabelFromHeadlines, type LocalQuotaFreshnessView } from "@/lib/quota-display";
 import {
   antigravityQuotaCapped,
   antigravityDisplayWindows,
@@ -25,8 +28,9 @@ import {
   isMiniMaxVideoQuotaWindow,
 } from "@/lib/usage-monitor-quota";
 import { engineMeterNote, isPlanLevelSkip, quotaProviderForDriver, windowsForDriver } from "../../server/quota-window-map";
-import { botUsage, cachedInput, costCaption, formatTokens, formatUsd, hasFiniteCost, sumUsage, usageDetail } from "@/lib/usage";
+import { botUsage, botUsageByModel, cachedInput, costCaption, formatTokens, formatUsd, hasFiniteCost, sumUsage, usageDetail } from "@/lib/usage";
 import { productErrorHeadline } from "@/lib/product-error";
+import { z } from "zod";
 
 interface QuotaCooldownInfo {
   botId: string;
@@ -105,13 +109,212 @@ function formatUsdBalance(balance: number | null): string {
   return `$${balance.toFixed(2)} remaining`;
 }
 
+/** One engine's rolling spend as the tracker reports it. */
+export interface EngineSpend {
+  spend5hUsd: number;
+  spend7dUsd: number;
+  /** Settled turns the engine could not price.  A non-zero count means the
+   *  dollar figures beside it are a floor, not a total. */
+  unpricedTurns5h?: number;
+  unpricedTurns7d?: number;
+}
+
+/** One `(bot, engine)` pair the dispatcher is refusing to start. */
+export interface DoomedPair {
+  botId: string;
+  instanceId: string;
+  consecutiveFailures: number;
+  openedAt: number;
+  lastFailureAt: number;
+  lastError?: string;
+  /** Whether this entry is refusing dispatches right now.  Absent on a server
+   *  that predates the flag — treated as open, which is the old behaviour. */
+  open?: boolean;
+  /** Whether an OPEN breaker here is actually holding this bot, i.e. the
+   *  engine it names is one this bot's work could be on.  An open breaker on
+   *  an engine no run is waiting on outlives recovery and holds nothing.
+   *
+   *  Absent on a server that predates it, and absent means OPEN — the same
+   *  compatibility contract as `open` above.  Showing the entry is the safe
+   *  direction: an over-warning costs a glance, a hidden one loses a stop. */
+  holds?: boolean;
+}
+
+/** One bot whose configured fallback chain is longer than the runtime will
+ *  actually walk. */
+export interface RedundantChain {
+  botId: string;
+  name: string;
+  /** "bot" for the bot-level chain, "task" for a Projects task's own chain. */
+  scope?: "bot" | "task";
+  threadId?: string | null;
+  total: number;
+  effective: number;
+  redundant: { instanceId: string; model: string; reason: "same-as-primary" | "duplicate" }[];
+}
+
+/** Trust-boundary schemas for `GET /api/usage`'s `fallbackChains`.  The
+ *  payload crosses HTTP, so the array check alone is not enough: counts and
+ *  nested redundant entries are validated before anything reaches state. */
+const RedundantFallbackSchema = z.object({
+  instanceId: z.string(),
+  model: z.string(),
+  reason: z.enum(["same-as-primary", "duplicate"]),
+}).strict();
+
+const RedundantChainSchema = z.object({
+  botId: z.string(),
+  name: z.string(),
+  scope: z.enum(["bot", "task"]).optional(),
+  threadId: z.string().nullable().optional(),
+  total: z.number(),
+  effective: z.number(),
+  redundant: z.array(RedundantFallbackSchema),
+}).strict();
+
+const RedundantChainArraySchema = z.array(RedundantChainSchema);
+
+/** Trust-boundary schema for the same route's `doomed` pairs.  The array check
+ *  this replaced validated only the container, and `heldPairs` below reads
+ *  `holds`/`open` to decide which pairs are actually holding a bot — a string
+ *  `"true"` landing there reads as truthy and reports a healthy engine as held.
+ *
+ *  Strict on purpose: the route spreads one `DoomedEntry` and adds `open` and
+ *  `holds`, so an unknown key means the payload is not what this panel was
+ *  written against.  Rejected rather than coerced, because the two failure
+ *  directions are not equal: an over-warning costs a glance, while dropping a
+ *  real hold loses the one stop the operator needed to see. */
+const DoomedPairSchema = z.object({
+  botId: z.string(),
+  instanceId: z.string(),
+  // A count the server increments by one, so a fraction means the payload is
+  // not this shape.  Timestamps stay plain numbers: they are formatted, never
+  // compared, so an unexpected value there costs nothing worth a strict gate.
+  consecutiveFailures: z.number().int(),
+  openedAt: z.number(),
+  lastFailureAt: z.number(),
+  lastError: z.string().optional(),
+  open: z.boolean().optional(),
+  holds: z.boolean().optional(),
+}).strict();
+
+/** The same route's `doomed` pairs once parsed, or nothing at all.  A payload
+ *  that does not parse leaves the previous answer in state rather than
+ *  clearing the list: the two failure directions are not equal, because an
+ *  over-warning costs a glance while a dropped hold loses the one stop the
+ *  operator needed to see.  That is why the caller checks `.success` and skips
+ *  the update instead of writing an empty list. */
+export const DoomedPairArraySchema = z.array(DoomedPairSchema);
+
+/** Whether an engine row has enough to be worth showing.
+ *
+ *  Dollars OR unpriced turns.  An engine that settled work but reported no
+ *  cost has spent money the panel cannot price, and the row used to be hidden
+ *  entirely — which is how `dsh`, carrying six of twelve bots, came to read as
+ *  free.  A blank row is not the same as no activity. */
+export function hasEngineSpendActivity(spend: EngineSpend | undefined): boolean {
+  if (!spend) return false;
+  return spend.spend5hUsd > 0
+    || spend.spend7dUsd > 0
+    || (spend.unpricedTurns5h ?? 0) > 0
+    || (spend.unpricedTurns7d ?? 0) > 0;
+}
+
+/** Whether an unavailable engine with no quota data of its own stays out of
+ *  Engine Quotas.  Only engines never set up (no CLI, no key/token), turned
+ *  off, or optional and unconfigured are hidden.  One whose last probe just
+ *  did not answer in time keeps its row: it is being re-checked, not missing. */
+export function hidesIdleUnavailableEngineRow(instance: Pick<InstanceInfo, "snapshot">): boolean {
+  if (isHiddenEngine(instance)) return true;
+  if (isCheckingEngine(instance)) return false;
+  return isEngineUnconfigured(instance.snapshot);
+}
+
+/** Total turns in the window the panel could not put a price on. */
+export function unpricedTurnCount(spend: EngineSpend | undefined): number {
+  return (spend?.unpricedTurns5h ?? 0) + (spend?.unpricedTurns7d ?? 0);
+}
+
+export interface UsageDetailLine {
+  label: string;
+  value: string;
+  exhausted: boolean;
+  group: "window" | "external";
+}
+
+/** Construct detail lines for the Clutch row: DeepSeek Remaining Balance and the MiniMax subscription note. */
+export function buildClutchDetailLines(deepseekRow?: {
+  balanceUsd?: number | null;
+  grantedUsd?: number | null;
+  toppedUpUsd?: number | null;
+  availability?: string | null;
+  error?: string | null;
+} | null): UsageDetailLine[] {
+  const lines: UsageDetailLine[] = [];
+  if (deepseekRow && !deepseekRow.error && deepseekRow.balanceUsd != null) {
+    lines.push({
+      label: "DeepSeek Remaining Balance",
+      value: formatUsdBalance(deepseekRow.balanceUsd),
+      exhausted: deepseekRow.availability === "exhausted" || deepseekRow.balanceUsd <= 0,
+      group: "external",
+    });
+  }
+  lines.push({
+    label: "MiniMax (MM & MC)",
+    value: "Subscription (not API)",
+    exhausted: false,
+    group: "external",
+  });
+  if (deepseekRow && !deepseekRow.error && deepseekRow.grantedUsd != null && deepseekRow.toppedUpUsd != null) {
+    lines.push({
+      label: "Granted / Topped Up",
+      value: `$${deepseekRow.grantedUsd.toFixed(2)} granted · $${deepseekRow.toppedUpUsd.toFixed(2)} topped up`,
+      exhausted: false,
+      group: "external",
+    });
+  }
+  return lines;
+}
+
 function formatSpendUsd(amount: number): string {
   if (!amount || amount === 0) return "$0.00";
   if (amount < 0.01) return `<$0.01 ($${amount.toFixed(4)})`;
   return `$${amount.toFixed(2)}`;
 }
 
-export function UsageSection() {
+import {
+  ENGINE_PLAN_OPTIONS,
+  FALLBACK_MODEL_NAMES,
+  modelDisplayName,
+  defaultEnginePlan,
+  findMatchingPreset,
+  getInitialEnginePlans,
+  detectEnginePlanFromWindows,
+  autoDetectAllEnginePlans,
+  type EnginePlanOption,
+} from "@/lib/usage-plans";
+
+export {
+  ENGINE_PLAN_OPTIONS,
+  FALLBACK_MODEL_NAMES,
+  modelDisplayName,
+  defaultEnginePlan,
+  findMatchingPreset,
+  getInitialEnginePlans,
+  detectEnginePlanFromWindows,
+  autoDetectAllEnginePlans,
+  type EnginePlanOption,
+};
+
+
+
+export function UsageSection({ highlightClass }: { highlightClass?: (domId: string) => string | undefined }) {
+  const [speechUsage, setSpeechUsage] = React.useState<{ minimax: { characters: number; requests: number } } | null>(null);
+  React.useEffect(() => {
+    let active = true;
+    api("/api/tts/usage").then((data) => { if (active) setSpeechUsage(data.totals); }).catch(() => {});
+    return () => { active = false; };
+  }, []);
   const { state, dispatch } = useStore();
   const [telemetryStatus, setTelemetryStatus] = React.useState<TelemetryStatusView | null>(null);
   const [telemetryFetchError, setTelemetryFetchError] = React.useState<string | null>(null);
@@ -119,7 +322,13 @@ export function UsageSection() {
   const [antigravityQuota, setAntigravityQuota] = React.useState<AntigravityUsageSnapshot | null>(null);
   const [grokQuota, setGrokQuota] = React.useState<GrokUsageSnapshot | null>(null);
   const [deepseekBalance, setDeepSeekBalance] = React.useState<DeepSeekBalanceView | null>(null);
-  const [engineSpend, setEngineSpend] = React.useState<Record<string, { spend5hUsd: number; spend7dUsd: number }>>({});
+  const [engineSpend, setEngineSpend] = React.useState<Record<string, EngineSpend>>({});
+  // Engines the dispatcher is refusing to start, and chains that are longer in
+  // the picker than at runtime.  Both have been on this payload since they were
+  // added with nothing rendering them, which is the same defect a dead field is:
+  // a fact recorded for someone and read by no one.
+  const [doomed, setDoomed] = React.useState<DoomedPair[]>([]);
+  const [redundantChains, setRedundantChains] = React.useState<RedundantChain[]>([]);
   const [quotaWindows, setQuotaWindows] = React.useState<Array<{
     id: string;
     provider: string;
@@ -138,6 +347,7 @@ export function UsageSection() {
     modelId?: string | null;
     skipReason?: string | null;
     planName?: string | null;
+    planMetadata?: QuotaPlanMetadata;
     absoluteRemaining?: number | null;
     absoluteLimit?: number | null;
     quotaUnit?: string | null;
@@ -147,6 +357,7 @@ export function UsageSection() {
     fileSkipReason?: string | null;
   }>>([]);
   const [localQuota, setLocalQuota] = React.useState<LocalQuotaFreshnessView | null>(null);
+  const [quotasLoaded, setQuotasLoaded] = React.useState(false);
   const [expandedQuota, setExpandedQuota] = React.useState<string | null>(null);
   const usageConfig = state.config?.usage;
   const secretSources = useSecretSources();
@@ -174,23 +385,56 @@ export function UsageSection() {
   // the engine rows already describe.
   const localQuotaRouting = usageConfig?.localQuotaRouting !== false;
 
+  const configuredEnginePlans = usageConfig?.enginePlans;
+  const [enginePlans, setEnginePlans] = React.useState<Record<string, { planName: string; costPerMonth: number | null }>>(() =>
+    getInitialEnginePlans(configuredEnginePlans),
+  );
+  const [savingPlans, setSavingPlans] = React.useState(false);
+  const [savePlansOk, setSavePlansOk] = React.useState(false);
+  const [savePlansError, setSavePlansError] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    setEnginePlans(getInitialEnginePlans(configuredEnginePlans));
+  }, [configuredEnginePlans]);
+
+  const saveEnginePlans = async () => {
+    setSavingPlans(true);
+    setSavePlansError(null);
+    setSavePlansOk(false);
+    try {
+      const config: ConfigStatus = await api("/api/config", {
+        method: "PATCH",
+        body: JSON.stringify({ usage: { enginePlans } }),
+      });
+      dispatch({ type: "configStatus", config });
+      setSavePlansOk(true);
+      setTimeout(() => setSavePlansOk(false), 3000);
+    } catch (_caught) {
+      setSavePlansError("Couldn't save engine plans.\u00a0 Try again.");
+    } finally {
+      setSavingPlans(false);
+    }
+  };
+
   React.useEffect(() => {
     if (usageConfig?.ingestUrl !== undefined) setIngestUrl(usageConfig.ingestUrl);
   }, [usageConfig?.ingestUrl]);
 
   React.useEffect(() => {
-    fetch("/api/telemetry/status")
+    const controller = new AbortController();
+    fetch("/api/telemetry/status", { signal: controller.signal })
       .then((res) => res.json())
       .then((data) => {
         setTelemetryStatus(data && typeof data === "object" ? data : null);
         setTelemetryFetchError(null);
       })
-      .catch(() => {
+      .catch((err) => {
+        if (err instanceof Error && err.name === "AbortError") return;
         setTelemetryFetchError("Failed to fetch telemetry status");
       });
 
     const fetchQuotas = () => {
-      fetch("/api/quotas")
+      fetch("/api/quotas", { signal: controller.signal })
         .then((res) => res.json())
         .then((data) => {
           if (data?.ok && Array.isArray(data.cooldowns)) {
@@ -224,13 +468,36 @@ export function UsageSection() {
           if (data?.engineSpend && typeof data.engineSpend === "object") {
             setEngineSpend(data.engineSpend);
           }
+          const parsedDoomed = DoomedPairArraySchema.safeParse(data?.doomed);
+          if (parsedDoomed.success) setDoomed(parsedDoomed.data);
+          const parsedChains = RedundantChainArraySchema.safeParse(data?.fallbackChains);
+          if (parsedChains.success) setRedundantChains(parsedChains.data);
+          setQuotasLoaded(true);
         })
-        .catch(() => {});
+        .catch(() => {
+          setQuotasLoaded(true);
+        });
     };
     fetchQuotas();
-    const quotaInterval = setInterval(fetchQuotas, 30_000);
-    return () => clearInterval(quotaInterval);
+    const quotaInterval = setInterval(() => {
+      if (globalThis.document?.visibilityState === "hidden") return;
+      fetchQuotas();
+    }, 30_000);
+    return () => {
+      controller.abort();
+      clearInterval(quotaInterval);
+    };
   }, []);
+  // `doomed` also carries sub-threshold counters and expired half-open
+  // entries, both of which dispatch normally. Rendering every row of it as
+  // "held" would report a healthy engine as held after one transient failure,
+  // so only the entries that are actually refusing are shown.
+  // `holds`, not `open`. An open breaker on a FALLBACK engine does not hold the
+  // bot — the primary still dispatches, and the dispatcher only consults the
+  // engine the run would actually use. The server answers that with the same
+  // question the dispatcher asks, so the panel does not have to re-derive it
+  // from a list that knows nothing about a bot's selection.
+  const heldPairs = doomed.filter((pair) => pair.holds ?? pair.open ?? true);
   const badge = telemetryBadge(telemetryStatus, telemetryFetchError);
   // Whatever host the operator pointed this at — never a built-in name.
   const host = telemetryHost(telemetryStatus);
@@ -409,14 +676,25 @@ export function UsageSection() {
   // (claude-sonnet-4.5 is listed under Cursor AND Claude) used to
   // first-win onto Cursor and steal legacy Claude usage.
   const modelToEngineId = uniqueModelToEngineId();
+  const resolveModelEngine = (model: string | undefined, fallbackEngine: string | null): string | null => {
+    if (model) {
+      if (model.toLowerCase().includes("minimax")) return "minimax";
+      if (model.toLowerCase().includes("deepseek")) return "deepseek-harness";
+      const byModelId = modelToEngineId.get(model);
+      if (byModelId) return byModelId;
+    }
+    return fallbackEngine;
+  };
   const legacyEngine = (instanceId: string | undefined, model?: string) => {
+    if (model) {
+      if (model.toLowerCase().includes("minimax")) return "minimax";
+      if (model.toLowerCase().includes("deepseek")) return "deepseek-harness";
+      const byModelId = modelToEngineId.get(model);
+      if (byModelId) return byModelId;
+    }
     if (instanceId) {
       const resolved = engineFor(instanceId);
       if (ENGINE_CAPABILITIES[resolved]) return resolved;
-    }
-    if (model) {
-      const byModelId = modelToEngineId.get(model);
-      if (byModelId) return byModelId;
     }
     return null;
   };
@@ -450,6 +728,10 @@ export function UsageSection() {
           if ((bucketUsage.turns ?? 0) <= 0) continue;
           if (bucketUsage.engineId) continue;
           if (legacyBucketEngine(bucketInstanceId)) continue;
+          if (bucketUsage.byModel && Object.keys(bucketUsage.byModel).length > 0) {
+            const hasResolved = Object.keys(bucketUsage.byModel).some((m) => resolveModelEngine(m, null) != null);
+            if (hasResolved) continue;
+          }
           unattributedTokens30d += bucketUsage.input + bucketUsage.output;
         }
         // Un-bucketed usage (a task with no buckets at all, or the
@@ -470,14 +752,31 @@ export function UsageSection() {
         if ((roomUsage.turns ?? 0) <= 0) continue;
         if (roomUsage.engineId) continue;
         if (legacyBucketEngine(roomInstanceId)) continue;
+        if (roomUsage.byModel && Object.keys(roomUsage.byModel).length > 0) {
+          const hasResolved = Object.keys(roomUsage.byModel).some((m) => resolveModelEngine(m, null) != null);
+          if (hasResolved) continue;
+        }
         unattributedTokens30d += roomUsage.input + roomUsage.output;
       }
     }
   }
 
   return (
+    <>
+      <Card
+        id="setting-usage-speech"
+        className={highlightClass?.("setting-usage-speech")}
+        title="Speech Synthesis"
+        subtitle="Speech is measured in characters, not model tokens.  Counts include successful requests on this computer only."
+      >
+        <div className="text-[13px] text-ink-secondary">
+          {speechUsage ? <>MiniMax: {speechUsage.minimax.characters.toLocaleString()} characters ({speechUsage.minimax.requests} requests)</> : "Speech usage unavailable"}
+        </div>
+      </Card>
     <div className="flex flex-col gap-4">
       <Card
+        id="setting-usage-summary"
+        className={highlightClass?.("setting-usage-summary")}
         title="Usage"
         subtitle={`Tokens and cost per bot, added up from every settled turn.\u00A0  Click a bot to expand its sessions and see model, tokens in/out, $/turn, and the per-session cumulative.\u00A0  A turn that ran on a fallback is billed as that fallback reported it, not as the bot's current model.\u00A0  Only engines that report a price show one.`}
         actions={
@@ -510,6 +809,7 @@ export function UsageSection() {
                   bot={bot}
                   usage={usage}
                   open={open}
+                  instances={state.instances}
                   onToggle={() => {
                     toggleBot(bot.id);
                     if (allExpanded) setAllExpanded(false);
@@ -540,6 +840,8 @@ export function UsageSection() {
       </Card>
 
       <Card
+        id="setting-usage-quotas"
+        className={highlightClass?.("setting-usage-quotas")}
         title="Engine Quotas"
         subtitle="Live remaining usage for each engine.  Hover or click a row for the full remaining breakdown."
       >
@@ -548,9 +850,11 @@ export function UsageSection() {
             {localQuotaNotice}
           </div>
         )}
+        <HeldBotsNotice heldPairs={heldPairs} />
+        <RedundantChainsNotice redundantChains={redundantChains} />
         <div className="flex flex-col divide-y divide-hairline/20">
           {state.instances.filter((instance) => {
-            if (instance.enabled === false || isHiddenQuotaEngine(instance.driverKind)) return false;
+            if (instance.enabled === false || isHiddenQuotaEngine(instance.driverKind) || isHiddenEngine(instance)) return false;
             const isDeepSeek =
               instance.driverKind === "deepseekAgent" ||
               instance.driverKind === "dshAgent" ||
@@ -584,7 +888,7 @@ export function UsageSection() {
               // MiniMax row, which is what let a second connection show the
               // reserved instance's numbers.
               (isMiniMax && Boolean(instance.snapshot.quota?.minimax?.capExists)) ||
-              Boolean(spend && (spend.spend5hUsd > 0 || spend.spend7dUsd > 0));
+              hasEngineSpendActivity(spend);
             // A configured engine that has gone unavailable — a Box token set
             // but the API unreachable, a login that expired, a CLI that stops
             // launching — must still show its row with the real failure
@@ -592,7 +896,7 @@ export function UsageSection() {
             // or explicitly disabled are worth hiding when they have no
             // quota data of their own.
             if (instance.snapshot.state !== "available" && !hasQuotaData) {
-              return !isEngineUnconfigured(instance.snapshot.reason);
+              return !hidesIdleUnavailableEngineRow(instance);
             }
             return true;
           }).map((instance) => {
@@ -703,6 +1007,21 @@ export function UsageSection() {
             const engineIssue = !showGenericGrid && !hasUsageMonitorAG && engineProvider
               ? providerIssueLine(instance.displayName, localQuota?.issues?.[engineProvider], localQuota?.producer)
               : null;
+            const expectsUsageMonitorPlaceholder =
+              Boolean(engineProvider) &&
+              instance.instanceId !== "grok" &&
+              !hasUsageMonitorAG &&
+              instanceWindows.length === 0 &&
+              !engineIssue &&
+              // MiniMax and DeepSeek already say their quota or balance in the headline.
+              !minimaxStatus &&
+              !deepseekStatus &&
+              !(instance.instanceId === "antigravity" && agGroups.length > 0);
+            const usageMonitorGridEmptyLine = expectsUsageMonitorPlaceholder
+              ? quotaGridPlaceholderLine(quotasLoaded ? "empty" : "loading", instance.displayName)
+              : null;
+            const showUsageMonitorGrid =
+              hasUsageMonitorAG || showGenericGrid || Boolean(usageMonitorGridEmptyLine);
             const baseDetailLines = hasUsageMonitorAG
               ? []
               : agLines.length > 0
@@ -719,23 +1038,20 @@ export function UsageSection() {
                 group: "external" as const,
               });
             }
-            if (isDeepSeek && deepseekRow && !deepseekRow.error && deepseekRow.balanceUsd != null) {
-              detailLines.unshift({
-                label: "Remaining Balance",
-                value: formatUsdBalance(deepseekRow.balanceUsd),
-                exhausted: deepseekRow.availability === "exhausted" || deepseekRow.balanceUsd <= 0,
-                group: "external" as const,
-              });
-              if (deepseekRow.grantedUsd != null && deepseekRow.toppedUpUsd != null) {
-                detailLines.push({
-                  label: "Granted / Topped Up",
-                  value: `$${deepseekRow.grantedUsd.toFixed(2)} granted · $${deepseekRow.toppedUpUsd.toFixed(2)} topped up`,
-                  exhausted: false,
-                  group: "external" as const,
-                });
+            if (isDeepSeek) {
+              const clutchLines = buildClutchDetailLines(deepseekRow);
+              const balanceLine = clutchLines.find((l) => l.label === "DeepSeek Remaining Balance");
+              if (balanceLine) {
+                detailLines.unshift(balanceLine);
+              }
+              for (const line of clutchLines) {
+                if (line.label !== "DeepSeek Remaining Balance") {
+                  detailLines.push(line);
+                }
               }
             }
-            if (spend && (spend.spend5hUsd > 0 || spend.spend7dUsd > 0 || isDeepSeek)) {
+            const unpriced = unpricedTurnCount(spend);
+            if (spend && (hasEngineSpendActivity(spend) || isDeepSeek)) {
               detailLines.push({
                 label: "Spend (Past 5 Hours)",
                 value: formatSpendUsd(spend.spend5hUsd),
@@ -748,6 +1064,17 @@ export function UsageSection() {
                 exhausted: false,
                 group: "window" as const,
               });
+              if (unpriced > 0) {
+                // Say it in words rather than rendering a confident dollar
+                // total that quietly excludes this engine. The count is a
+                // floor on how much is unaccounted for, not the missing cash.
+                detailLines.push({
+                  label: "Unpriced turns",
+                  value: `${unpriced} could not be costed — the totals above exclude them`,
+                  exhausted: false,
+                  group: "window" as const,
+                });
+              }
             }
             const fullSummary = detailLines.length > 0
               ? quotaLinesSummary(detailLines)
@@ -763,7 +1090,7 @@ export function UsageSection() {
                   const value = group.remainingPercent == null
                     ? "not reported"
                     : `${group.remainingPercent}% available`;
-                  return `${group.label}: ${value} (5h window)`;
+                  return `${group.label}: ${value} (5-hour window)`;
                 })
               : [
                   // The wildcard cooldown (Cursor's monthly cap, an exhausted
@@ -906,8 +1233,12 @@ export function UsageSection() {
                     />
                   </div>
                 </button>
-                {hasUsageMonitorAG && <UsageMonitorQuotaGrid windows={usageMonitorAGWindows} />}
-                {showGenericGrid && <UsageMonitorQuotaGrid windows={instanceWindows as any} />}
+                {showUsageMonitorGrid && (
+                  <UsageMonitorQuotaGrid
+                    windows={hasUsageMonitorAG ? usageMonitorAGWindows : (instanceWindows as any)}
+                    emptyLine={usageMonitorGridEmptyLine}
+                  />
+                )}
                 {engineIssue && (
                   <div className="ml-9 mt-1.5 rounded-lg border border-hairline/25 bg-inset/30 px-2.5 py-2 text-[11.5px] leading-relaxed text-ink-secondary" title={engineIssue}>
                     {engineIssue}
@@ -961,138 +1292,158 @@ export function UsageSection() {
       </Card>
 
       <Card
+        id="setting-usage-pricing"
+        className={highlightClass?.("setting-usage-pricing")}
         title="Pricing Mode by Engine"
-        subtitle={'What you actually pay on each engine.  Subscription engines show "included in plan" — never an API rate, even when one exists for reference.'}
+        subtitle={'What you actually pay on each engine.\u00A0 Select your plan or enter a custom monthly cost so the estimate below matches what you pay.'}
       >
         <div className="flex flex-col">
-          <div className="grid grid-cols-[1.4fr_1.1fr_1.4fr_0.9fr_0.9fr] gap-x-3 border-b border-hairline/40 pb-2 text-[11.5px] font-medium uppercase tracking-wide text-ink-secondary">
+          <div className="grid grid-cols-[1.3fr_1.8fr_1.1fr_0.9fr] gap-x-3 border-b border-hairline/40 pb-2 text-[11.5px] font-medium text-ink-secondary">
             <span>Engine</span>
-            <span>Plan / Pricing mode</span>
-            <span>Notes</span>
-            <span className="text-right">Subscription</span>
-            <span className="text-right">PAYG / 1k in</span>
+            <span>Your Plan</span>
+            <span className="text-right">Monthly Cost</span>
+            <span className="text-right">Per 1k In</span>
           </div>
           {Object.entries(ENGINE_CAPABILITIES).map(([id, entry]) => {
+            const currentPlan = enginePlans[id] ?? defaultEnginePlan(id);
+            const options = ENGINE_PLAN_OPTIONS[id] ?? [];
             const sub = entry.pricing.kind === "subscription" || entry.pricing.kind === "subscription+api"
               ? entry.pricing.subscription
               : null;
             const api = entry.pricing.kind === "api" || entry.pricing.kind === "subscription+api"
               ? entry.pricing.api
               : null;
-            // Group display rule from the task: only show a numeric rate
-            // when EVERY engine in the displayed set has API pricing.  In
-            // practice that is never (subscription engines always exist),
-            // so we collapse the API column to a single label per row.
-            const subCost = sub == null
-              ? "Not billed"
-              : sub.costPerMonth != null
-                ? `$${sub.costPerMonth.toFixed(2)}/mo`
-                : "—";
-            // Group display rule from the task: only show a numeric rate
-            // when EVERY engine in the displayed set has API pricing.
-            // The displayed set is `ENGINE_CAPABILITIES`, which always
-            // contains subscription-only engines (Claude, Codex, Cursor),
-            // so this check is always false.  The "Included" pill is
-            // what shows for every row.  When the registry grows past
-            // seven engines and the user filters down to only
-            // subscription+api engines, this guard will start to return
-            // the numeric rate — that is intentional.
             const allRowsHaveApi = Object.values(ENGINE_CAPABILITIES).every((entry) =>
               entry.pricing.kind === "subscription+api" || entry.pricing.kind === "api",
             );
             const showNumericApi = api != null && allRowsHaveApi;
             const apiCost = showNumericApi ? `$${api.inputPer1k.toFixed(5)}` : "—";
-            // The `??` and `?:` operators don't compose the way a reader
-            // might expect — `a ?? b ? c : d` parses as
-            // `a ?? (b ? c : d)`.  Pin each branch in a parens block so a
-            // future edit cannot silently swap the meaning again.
-            const planLabel = sub
-              ? sub.tierLabel
-              : entry.pricing.kind === "api"
-                ? "API only"
-                : entry.pricing.kind === "free"
-                  ? "Free"
-                  : "n/a";
-            const notes = entry.pricing.notes ?? sub?.notes ?? api?.notes ?? "";
+            const matchingPreset = findMatchingPreset(id, currentPlan.planName, currentPlan.costPerMonth);
+            const isCustom = !matchingPreset;
+
             return (
-              <div key={id} className="grid grid-cols-[1.4fr_1.1fr_1.4fr_0.9fr_0.9fr] items-start gap-x-3 border-b border-hairline/20 py-2.5 text-[13px]">
+              <div key={id} className="grid grid-cols-[1.3fr_1.8fr_1.1fr_0.9fr] items-center gap-x-3 border-b border-hairline/20 py-2.5 text-[13px]">
                 <div className="flex min-w-0 flex-col">
                   <span className="truncate font-medium text-ink" title={entry.displayName}>{entry.displayName}</span>
+                  <span className="truncate text-[11px] text-ink-secondary/90" title={entry.pricing.notes ?? sub?.notes ?? api?.notes ?? ""}>
+                    {entry.pricing.kind === "api" ? "API pay-as-you-go" : entry.pricing.kind === "free" ? "Free engine" : entry.pricing.kind === "unknown" ? "Pricing unknown" : "Subscription engine"}
+                  </span>
                 </div>
-                <span className="truncate text-ink-secondary" title={planLabel}>{planLabel}</span>
-                <span className="truncate text-[11px] text-ink-secondary/90" title={notes}>{notes}</span>
-                <span className="text-right tabular-nums text-ink">{subCost}</span>
-                <span className="text-right tabular-nums text-ink-secondary" title={showNumericApi ? `${api.inputPer1k}/1k in · ${api.outputPer1k}/1k out` : "Subscription pricing"}>
+                <div className="flex flex-col gap-1">
+                  <select
+                    value={isCustom ? "custom" : matchingPreset.planName}
+                    onChange={(e) => {
+                      const selectedVal = e.target.value;
+                      if (selectedVal === "custom") {
+                        setEnginePlans((prev) => ({
+                          ...prev,
+                          [id]: { planName: matchingPreset ? "Custom Plan" : (currentPlan.planName || "Custom Plan"), costPerMonth: currentPlan.costPerMonth ?? 0 },
+                        }));
+                      } else {
+                        const opt = options.find((o) => o.planName === selectedVal);
+                        if (opt) {
+                          setEnginePlans((prev) => ({
+                            ...prev,
+                            [id]: { planName: opt.planName, costPerMonth: opt.costPerMonth },
+                          }));
+                        }
+                      }
+                    }}
+                    className="rounded border border-hairline/40 bg-control px-2 py-1 text-[12px] text-ink"
+                  >
+                    {options.map((opt) => (
+                      <option key={opt.planName} value={opt.planName}>
+                        {opt.label}
+                      </option>
+                    ))}
+                    <option value="custom">Custom Plan…</option>
+                  </select>
+                  {isCustom && (
+                    <input
+                      type="text"
+                      placeholder="Plan Name"
+                      value={currentPlan.planName ?? ""}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        setEnginePlans((prev) => ({
+                          ...prev,
+                          [id]: { planName: val, costPerMonth: prev[id]?.costPerMonth ?? currentPlan.costPerMonth ?? null },
+                        }));
+                      }}
+                      className="rounded border border-hairline/40 bg-control px-2 py-0.5 text-[11.5px] text-ink"
+                    />
+                  )}
+                </div>
+                <div className="flex items-center justify-end gap-1">
+                  <span className="text-[12px] text-ink-secondary">$</span>
+                  <input
+                    type="number"
+                    step="any"
+                    min="0"
+                    placeholder="0.00"
+                    disabled={currentPlan.costPerMonth === null && !isCustom && entry.pricing.kind !== "subscription+api"}
+                    value={currentPlan.costPerMonth != null ? currentPlan.costPerMonth : ""}
+                    onChange={(e) => {
+                      const val = e.target.value === "" ? null : parseFloat(e.target.value);
+                      setEnginePlans((prev) => ({
+                        ...prev,
+                        [id]: { planName: prev[id]?.planName ?? currentPlan.planName ?? "Custom Plan", costPerMonth: val != null && !isNaN(val) ? val : null },
+                      }));
+                    }}
+                    className="w-20 rounded border border-hairline/40 bg-control px-1.5 py-1 text-right text-[12px] tabular-nums text-ink disabled:opacity-40"
+                  />
+                  <span className="text-[11px] text-ink-secondary">/mo</span>
+                </div>
+                <span className="text-right tabular-nums text-ink-secondary" title={showNumericApi ? `${api?.inputPer1k}/1k in · ${api?.outputPer1k}/1k out` : "Subscription pricing"}>
                   {showNumericApi ? apiCost : <span className="text-emerald-700 dark:text-emerald-300">Included</span>}
                 </span>
               </div>
             );
           })}
-          <div className="mt-3 text-[12px] leading-relaxed text-ink-secondary">
-            The "PAYG / 1k in" column shows the public API rate only when the engine's
-            pricing block carries an API rate — subscription-only engines render{" "}
-            <span className="text-emerald-700 dark:text-emerald-300">Included</span>{" "}
-            instead.{"\u00A0 "}Catalog rates feed the what-if projection.{"\u00A0 "}They are not an invoice.{"\u00A0 "}The same registry backs the Capability Matrix at
-            the top of the Settings → Engines panel so the two views cannot drift.
+          <div className="mt-3 flex flex-wrap items-center justify-between gap-3 border-t border-hairline/20 pt-3">
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => void saveEnginePlans()}
+                disabled={savingPlans}
+                className="flex items-center justify-center gap-1.5 rounded-lg bg-control px-3 py-1.5 text-[12.5px] font-medium text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {savingPlans ? <Loader2 size={13} className="animate-spin" /> : <Check size={13} />}
+                Save Engine Plans
+              </button>
+              {savePlansOk && (
+                <span className="flex items-center gap-1 text-[12px] text-success">
+                  <CheckCircle size={13} />
+                  Saved
+                </span>
+              )}
+              {savePlansError && (
+                <span className="text-[12px] text-danger">{savePlansError}</span>
+              )}
+            </div>
+            <span className="text-[11.5px] text-ink-secondary">
+              Plans are stored in your settings so the estimate below matches what you pay.
+            </span>
           </div>
         </div>
       </Card>
 
-      <UsageWhatIfProjection
+      <div id="setting-usage-projection" className={highlightClass?.("setting-usage-projection")}>
+        <UsageWhatIfProjection
         periodLabel="Last 30 days"
         unattributedTokens={unattributedTokens30d}
         byEngine={[
-          // Populated from the same rows we render above: each engine that
-          // has a registered api or subscription+api pricing block gets a
-          // row here, regardless of whether it actually ran turns.  An
-          // engine that never ran reports 0 tokens and 0 cost — honest,
-          // and the projection handles "actual cost is 0 and API cost is
-          // 0" cleanly.
           ...Object.entries(ENGINE_CAPABILITIES).flatMap(([id, entry]) => {
             if (entry.pricing.kind !== "subscription+api" && entry.pricing.kind !== "api") return [];
-            // For MiniMax we want the actual subscription cost: $55/mo for
-            // the period.  Every other engine's "actual cost" is its
-            // subscription fee in full — subscription engines bill a flat
-            // monthly fee regardless of how many turns ran, so prorating
-            // by turns (the previous shape) understated what the user
-            // actually pays.  Bundle-only engines (costPerMonth null)
-            // report 0; the projection card then shows "Your cost:
-            // bundled" instead of a fabricated number.
-            //
-            // Attribution walks each task's own records so a bot that
-            // switched engines mid-history attributes its old tokens to
-            // the engine that ran them.  We iterate `state.bots` rather
-            // than the per-bot `rows` shape because rows aggregates the
-            // task totals — we need the per-task detail.
-            //
-            // "Last 30 days": only activity inside the window counts —
-            // the card compares this usage against ONE monthly
-            // subscription fee, so lifetime usage would overstate the
-            // API-equivalent by an unbounded factor.
             const periodStartMs = Date.now() - 30 * 24 * 60 * 60 * 1000;
-            // Map the raw instanceId back to a registry key so a user
-            // with a second MiniMax connection under a custom id still
-            // aggregates into the canonical row; engineIdFromDriverKind
-            // covers instances deleted since the turn ran, including the
-            // legacy deepseek/dshAgent aliases.
-            // (engineFor/bucketEngine/legacyEngine are hoisted above the
-            // component's return so the unattributed scan shares them.)
             let tokensForEngine = 0;
             let cachedForEngine = 0;
             let inputForEngine = 0;
             let outputForEngine = 0;
             for (const bot of state.bots) {
-              // Archived (hidden) bots are NOT skipped: their in-window
-              // usage still ran on the engine, and the subscription fee
-              // on the other side of the comparison still counts — dropping
-              // them understated the API-equivalent (review flagged it).
               const botInstanceId = bot.modelSelection?.instanceId;
               for (const task of bot.tasks ?? []) {
                 if ((task.lastActivity ?? task.createdAt) < periodStartMs) continue;
-                // The per-instance breakdown records the engine that
-                // ACTUALLY ran each turn (fallbacks included); legacy
-                // tasks without it attribute the whole task to the
-                // configured selection, the only attribution they have.
                 const buckets = task.usageByInstance && Object.keys(task.usageByInstance).length > 0
                   ? Object.entries(task.usageByInstance)
                   : null;
@@ -1107,35 +1458,54 @@ export function UsageSection() {
                     bucketedOutput += bucketUsage.output;
                     bucketedCached += cachedInput(bucketUsage);
                     if ((bucketUsage.turns ?? 0) <= 0) continue;
-                    // Legacy buckets banked before engine metadata existed
-                    // carry no engineId; a deleted custom connection id
-                    // resolves to nothing, so fall back to the model map —
-                    // otherwise the usage is skipped here yet still
-                    // subtracted from the legacy remainder and vanishes.
-                    // A metadata-free bucket whose instance id no longer
-                    // resolves came from a deleted connection.  Guessing
-                    // the engine — from the task's configured model OR
-                    // from a recreated slug's live mapping — would credit
-                    // the wrong driver with the old bucket's history
-                    // (review flagged both) — those tokens surface in the
-                    // unattributed total instead of any engine row.
                     const resolvedBucketEngine = bucketUsage.engineId
                       ? bucketEngine(bucketInstanceId, bucketUsage.engineId)
                       : legacyBucketEngine(bucketInstanceId);
-                    if (resolvedBucketEngine !== id) continue;
-                    tokensForEngine += bucketUsage.input + bucketUsage.output;
-                    cachedForEngine += cachedInput(bucketUsage);
-                    inputForEngine += bucketUsage.input;
-                    outputForEngine += bucketUsage.output;
+
+                    const byModelEntries = Object.entries(bucketUsage.byModel ?? {});
+                    if (byModelEntries.length > 0) {
+                      let modeledTurns = 0;
+                      let modeledInput = 0;
+                      let modeledOutput = 0;
+                      let modeledCached = 0;
+                      for (const [modelName, modelUsage] of byModelEntries) {
+                        modeledTurns += modelUsage.turns ?? 0;
+                        modeledInput += modelUsage.input;
+                        modeledOutput += modelUsage.output;
+                        modeledCached += cachedInput(modelUsage);
+                        const modelEngine = resolveModelEngine(modelName, resolvedBucketEngine);
+                        if (modelEngine === id) {
+                          tokensForEngine += modelUsage.input + modelUsage.output;
+                          cachedForEngine += cachedInput(modelUsage);
+                          inputForEngine += modelUsage.input;
+                          outputForEngine += modelUsage.output;
+                        }
+                      }
+                      const remTurns = (bucketUsage.turns ?? 0) - modeledTurns;
+                      if (remTurns > 0) {
+                        const remInput = Math.max(0, bucketUsage.input - modeledInput);
+                        const remOutput = Math.max(0, bucketUsage.output - modeledOutput);
+                        const remCached = Math.max(0, cachedInput(bucketUsage) - modeledCached);
+                        if (resolvedBucketEngine === id) {
+                          tokensForEngine += remInput + remOutput;
+                          cachedForEngine += remCached;
+                          inputForEngine += remInput;
+                          outputForEngine += remOutput;
+                        }
+                      }
+                    } else {
+                      if (resolvedBucketEngine === id) {
+                        tokensForEngine += bucketUsage.input + bucketUsage.output;
+                        cachedForEngine += cachedInput(bucketUsage);
+                        inputForEngine += bucketUsage.input;
+                        outputForEngine += bucketUsage.output;
+                      }
+                    }
                   }
-                  // The first post-upgrade turn banks only ITSELF into
-                  // usageByInstance; the task's pre-upgrade aggregate still
-                  // lives in `usage`.  Attribute the un-bucketed remainder
-                  // through the legacy configured-selection path so the
-                  // projection does not drop that history.
                   const legacy = task.usage;
                   if (legacy && (legacy.turns ?? 0) - bucketedTurns > 0) {
-                    const legacyEngineId = legacyEngine(task.modelSelection?.instanceId ?? botInstanceId, task.modelSelection?.model);
+                    const fallback = legacyEngine(task.modelSelection?.instanceId ?? botInstanceId, task.modelSelection?.model);
+                    const legacyEngineId = resolveModelEngine(task.modelSelection?.model, fallback);
                     if (legacyEngineId === id) {
                       const rInput = Math.max(0, legacy.input - bucketedInput);
                       const rOutput = Math.max(0, legacy.output - bucketedOutput);
@@ -1149,41 +1519,68 @@ export function UsageSection() {
                   continue;
                 }
                 if ((task.usage?.turns ?? 0) <= 0) continue;
-                const legacyEngineId = legacyEngine(task.modelSelection?.instanceId ?? botInstanceId, task.modelSelection?.model);
+                const fallback = legacyEngine(task.modelSelection?.instanceId ?? botInstanceId, task.modelSelection?.model);
+                const legacyEngineId = resolveModelEngine(task.modelSelection?.model, fallback);
                 if (legacyEngineId !== id) continue;
                 tokensForEngine += task.usage!.input + task.usage!.output;
                 cachedForEngine += cachedInput(task.usage!);
                 inputForEngine += task.usage!.input;
                 outputForEngine += task.usage!.output;
               }
-              // Shared-room turns bank per engine on the speaking bot —
-              // they have no task thread, so without this the room's
-              // spend reached telemetry only and the projection's
-              // API-equivalent understated the engine's real volume.
               for (const [roomInstanceId, roomUsage] of Object.entries(bot.roomUsageByInstance ?? {})) {
                 if (roomUsage.lastAt < periodStartMs) continue;
                 if ((roomUsage.turns ?? 0) <= 0) continue;
                 const resolvedRoomEngine = roomUsage.engineId
                   ? bucketEngine(roomInstanceId, roomUsage.engineId)
                   : legacyBucketEngine(roomInstanceId);
-                if (resolvedRoomEngine !== id) continue;
-                tokensForEngine += roomUsage.input + roomUsage.output;
-                cachedForEngine += cachedInput(roomUsage);
-                inputForEngine += roomUsage.input;
-                outputForEngine += roomUsage.output;
+                const roomByModelEntries = Object.entries(roomUsage.byModel ?? {});
+                if (roomByModelEntries.length > 0) {
+                  let modeledTurns = 0;
+                  let modeledInput = 0;
+                  let modeledOutput = 0;
+                  let modeledCached = 0;
+                  for (const [modelName, modelUsage] of roomByModelEntries) {
+                    modeledTurns += modelUsage.turns ?? 0;
+                    modeledInput += modelUsage.input;
+                    modeledOutput += modelUsage.output;
+                    modeledCached += cachedInput(modelUsage);
+                    const modelEngine = resolveModelEngine(modelName, resolvedRoomEngine);
+                    if (modelEngine === id) {
+                      tokensForEngine += modelUsage.input + modelUsage.output;
+                      cachedForEngine += cachedInput(modelUsage);
+                      inputForEngine += modelUsage.input;
+                      outputForEngine += modelUsage.output;
+                    }
+                  }
+                  const remTurns = (roomUsage.turns ?? 0) - modeledTurns;
+                  if (remTurns > 0) {
+                    const remInput = Math.max(0, roomUsage.input - modeledInput);
+                    const remOutput = Math.max(0, roomUsage.output - modeledOutput);
+                    const remCached = Math.max(0, cachedInput(roomUsage) - modeledCached);
+                    if (resolvedRoomEngine === id) {
+                      tokensForEngine += remInput + remOutput;
+                      cachedForEngine += remCached;
+                      inputForEngine += remInput;
+                      outputForEngine += remOutput;
+                    }
+                  }
+                } else {
+                  if (resolvedRoomEngine === id) {
+                    tokensForEngine += roomUsage.input + roomUsage.output;
+                    cachedForEngine += cachedInput(roomUsage);
+                    inputForEngine += roomUsage.input;
+                    outputForEngine += roomUsage.output;
+                  }
+                }
               }
             }
-            // NOTE: tokens fold per ENGINE before pricing, so multi-model
-            // engines price every token at the registry's single PAYG rate
-            // block (Gemini Flash as Pro, MiniMax H3 at the M3 rates).
-            // Buckets now bank per-model usage (`byModel`), but per-model
-            // PAYG rates do not exist in the registry yet — adding them
-            // needs owner-confirmed pricing data, not invented numbers.
-            const actualCostUsd = id === "minimax"
-              ? 55
-              : entry.pricing.kind === "subscription+api" && entry.pricing.subscription.costPerMonth != null
-                ? entry.pricing.subscription.costPerMonth
-                : 0;
+            const configuredPlan = enginePlans[id] ?? configuredEnginePlans?.[id];
+            const defaultCost = entry.pricing.kind === "subscription+api"
+              ? (entry.pricing.subscription.costPerMonth ?? 0)
+              : 0;
+            const actualCostUsd = configuredPlan?.costPerMonth !== undefined
+              ? (configuredPlan.costPerMonth ?? 0)
+              : defaultCost;
             return [{
               engineId: id,
               totalTokens: tokensForEngine,
@@ -1195,8 +1592,11 @@ export function UsageSection() {
           }),
         ]}
       />
+      </div>
 
       <Card
+        id="setting-usage-monitor"
+        className={highlightClass?.("setting-usage-monitor")}
         title="Usage Monitor & Central Accounting"
         subtitle="An optional, lightweight telemetry stream reporting token consumption classified by model, project, and repository to a usage monitor you run.  Nothing is sent until you set an endpoint and a token."
       >
@@ -1399,6 +1799,7 @@ export function UsageSection() {
         </div>
       </Card>
     </div>
+    </>
   );
 }
 
@@ -1414,11 +1815,13 @@ function UsageRow({
   bot,
   usage,
   open,
+  instances,
   onToggle,
 }: {
   bot: { id: string; name: string; color?: BotColor; tasks?: ReadonlyArray<TaskLike>; modelSelection: ModelSelectionLike; roomUsageByInstance?: Record<string, TaskUsage & { lastAt: number; engineId?: string; byModel?: Record<string, TaskUsage> }> };
   usage: TaskUsage;
   open: boolean;
+  instances?: Array<{ models?: { options?: Array<{ id: string; label: string }> } }>;
   onToggle: () => void;
 }) {
   // Local state for the "expand all" / "collapse all" toggle.  When the
@@ -1492,11 +1895,12 @@ function UsageRow({
         ? [...ranModels, configuredModel]
         : ranModels
       : [];
+    const formattedModels = labelModels.map((m) => modelDisplayName(m, instances));
     const model = isRoomRow
       ? task.modelSelection?.model || task.modelSelection?.instanceId || "room"
-      : labelModels.length > 0
-        ? labelModels.join(", ") + (historyIncomplete ? " + earlier usage" : "")
-        : configuredModel;
+      : formattedModels.length > 0
+        ? formattedModels.join(", ") + (historyIncomplete ? " + earlier usage" : "")
+        : (configuredModel ? modelDisplayName(configuredModel, instances) : configuredModel);
     if (!isRoomRow && labelModels.length > 0) {
       for (const m of labelModels) modelSet.add(m);
     } else if (model && !isRoomRow) {
@@ -1513,6 +1917,18 @@ function UsageRow({
   });
 
   const modelCount = modelSet.size;
+  const modelSummaries = botUsageByModel(bot);
+  const totalModelTurns = modelSummaries.reduce((sum, m) => sum + (m.usage.turns ?? 0), 0);
+  const totalModelInput = modelSummaries.reduce((sum, m) => sum + m.usage.input, 0);
+  const totalModelOutput = modelSummaries.reduce((sum, m) => sum + m.usage.output, 0);
+  const totalModelCached = modelSummaries.reduce((sum, m) => sum + cachedInput(m.usage), 0);
+  const totalModelCost = modelSummaries.reduce<number | null>((sum, m) => {
+    if (m.usage.costUsd != null) return (sum ?? 0) + m.usage.costUsd;
+    return sum;
+  }, null);
+  const totalPerTurnCost = hasFiniteCost(totalModelCost) && totalModelTurns > 0
+    ? (totalModelCost ?? 0) / totalModelTurns
+    : null;
 
   return (
     <div className="border-b border-hairline/20">
@@ -1542,50 +1958,117 @@ function UsageRow({
           {hasFiniteCost(usage.costUsd) ? formatUsd(usage.costUsd) : <span className="text-ink-secondary">—</span>}
         </span>
       </button>
-      {open && cumulative.length > 0 && (
-        <div className="mb-2 ml-9 mr-1 rounded-lg border border-hairline/20 bg-inset/25 p-2.5">
-          <div className="grid grid-cols-[1.4fr_1fr_0.9fr_0.9fr_0.7fr_0.9fr_0.9fr] gap-x-3 border-b border-hairline/30 pb-1 text-[10.5px] font-medium uppercase tracking-wide text-ink-secondary">
-            <span>Session</span>
-            <span>Model</span>
-            <span className="text-right">Tokens in</span>
-            <span className="text-right">Cached</span>
-            <span className="text-right">Out</span>
-            <span className="text-right">$/turn</span>
-            <span className="text-right">Cum. cost</span>
-          </div>
-          {cumulative.map(({ task, taskUsage, model, cumulativeTokens: cumTokens, cumulativeCost: cumCost }, index) => {
-            const turnCount = taskUsage.turns || 0;
-            const perTurnCost = hasFiniteCost(taskUsage.costUsd) && turnCount > 0
-              ? (taskUsage.costUsd ?? 0) / turnCount
-              : null;
-            const cached = cachedInput(taskUsage);
-            const last = task.lastActivity ?? task.createdAt;
-            const date = new Date(last).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
-            return (
-              <div
-                key={`${task.threadId}:${index}`}
-                className="grid grid-cols-[1.4fr_1fr_0.9fr_0.9fr_0.7fr_0.9fr_0.9fr] items-center gap-x-3 border-b border-hairline/10 py-1.5 text-[12px]"
-              >
-                <span className="min-w-0 truncate text-ink" title={task.title || task.threadId}>
-                  {task.title || task.threadId.slice(0, 12)}
-                  <span className="ml-1 text-ink-secondary/80">{date}</span>
-                </span>
-                <span className="min-w-0 truncate font-mono text-[11.5px] text-ink-secondary" title={model}>
-                  {model}
-                </span>
-                <span className="text-right tabular-nums text-ink">{formatTokens(taskUsage.input)}</span>
-                <span className="text-right tabular-nums text-ink-secondary">{cached > 0 ? formatTokens(cached) : "—"}</span>
-                <span className="text-right tabular-nums text-ink">{formatTokens(taskUsage.output)}</span>
-                <span className="text-right tabular-nums text-ink-secondary">
-                  {perTurnCost != null ? formatUsd(perTurnCost) : "—"}
-                </span>
-                <span className="text-right tabular-nums text-ink">
-                  {hasFiniteCost(taskUsage.costUsd) ? formatUsd(cumCost) : "—"}
-                  <span className="block text-[10.5px] text-ink-secondary">{formatTokens(cumTokens)} cumulative</span>
-                </span>
+      {open && (modelSummaries.length > 0 || cumulative.length > 0) && (
+        <div className="mb-2 ml-9 mr-1 flex flex-col gap-3 rounded-lg border border-hairline/20 bg-inset/25 p-2.5">
+          {modelSummaries.length > 0 && (
+            <div>
+              <div className="mb-1.5 flex items-center justify-between text-[11px] font-semibold text-ink-secondary">
+                <span>Usage by Model</span>
+                <span>{modelSummaries.length} model{modelSummaries.length === 1 ? "" : "s"}</span>
               </div>
-            );
-          })}
+              <div className="grid grid-cols-[1.6fr_0.7fr_0.9fr_0.9fr_0.7fr_0.9fr_0.9fr] gap-x-3 border-b border-hairline/30 pb-1 text-[10.5px] font-medium text-ink-secondary">
+                <span>Model</span>
+                <span className="text-right">Turns</span>
+                <span className="text-right">Tokens In</span>
+                <span className="text-right">Cached</span>
+                <span className="text-right">Out</span>
+                <span className="text-right">Per Turn</span>
+                <span className="text-right">Cost</span>
+              </div>
+              {modelSummaries.map((m) => {
+                const cached = cachedInput(m.usage);
+                const perTurn = m.perTurnCost;
+                return (
+                  <div
+                    key={m.model}
+                    className="grid grid-cols-[1.6fr_0.7fr_0.9fr_0.9fr_0.7fr_0.9fr_0.9fr] items-center gap-x-3 border-b border-hairline/10 py-1.5 text-[12px]"
+                  >
+                    <span className="min-w-0 truncate text-[11.5px] font-medium text-ink" title={m.model}>
+                      {modelDisplayName(m.model, instances)}
+                    </span>
+                    <span className="text-right tabular-nums text-ink-secondary">{m.usage.turns ?? 0}</span>
+                    <span className="text-right tabular-nums text-ink">{formatTokens(m.usage.input)}</span>
+                    <span className="text-right tabular-nums text-ink-secondary">{cached > 0 ? formatTokens(cached) : "—"}</span>
+                    <span className="text-right tabular-nums text-ink">{formatTokens(m.usage.output)}</span>
+                    <span className="text-right tabular-nums text-ink-secondary">
+                      {perTurn != null ? formatUsd(perTurn) : "—"}
+                    </span>
+                    <span className="text-right tabular-nums text-ink">
+                      {hasFiniteCost(m.usage.costUsd) ? formatUsd(m.usage.costUsd) : "—"}
+                    </span>
+                  </div>
+                );
+              })}
+              {modelSummaries.length > 1 && (
+                <div className="grid grid-cols-[1.6fr_0.7fr_0.9fr_0.9fr_0.7fr_0.9fr_0.9fr] items-center gap-x-3 pt-1.5 text-[12px] font-medium">
+                  <span className="text-ink">Total across models</span>
+                  <span className="text-right tabular-nums text-ink-secondary">{totalModelTurns}</span>
+                  <span className="text-right tabular-nums text-ink">{formatTokens(totalModelInput)}</span>
+                  <span className="text-right tabular-nums text-ink-secondary">
+                    {totalModelCached > 0 ? formatTokens(totalModelCached) : "—"}
+                  </span>
+                  <span className="text-right tabular-nums text-ink">{formatTokens(totalModelOutput)}</span>
+                  <span className="text-right tabular-nums text-ink-secondary">
+                    {totalPerTurnCost != null ? formatUsd(totalPerTurnCost) : "—"}
+                  </span>
+                  <span className="text-right tabular-nums text-ink">
+                    {hasFiniteCost(totalModelCost) ? formatUsd(totalModelCost) : "—"}
+                  </span>
+                </div>
+              )}
+            </div>
+          )}
+
+          {cumulative.length > 0 && (
+            <div>
+              <div className="mb-1.5 flex items-center justify-between text-[11px] font-semibold text-ink-secondary">
+                <span>Sessions</span>
+                <span>{cumulative.length} session{cumulative.length === 1 ? "" : "s"}</span>
+              </div>
+              <div className="grid grid-cols-[1.4fr_1fr_0.9fr_0.9fr_0.7fr_0.9fr_0.9fr] gap-x-3 border-b border-hairline/30 pb-1 text-[10.5px] font-medium text-ink-secondary">
+                <span>Session</span>
+                <span>Model</span>
+                <span className="text-right">Tokens In</span>
+                <span className="text-right">Cached</span>
+                <span className="text-right">Out</span>
+                <span className="text-right">Per Turn</span>
+                <span className="text-right">Cumulative Cost</span>
+              </div>
+              {cumulative.map(({ task, taskUsage, model, cumulativeTokens: cumTokens, cumulativeCost: cumCost }, index) => {
+                const turnCount = taskUsage.turns || 0;
+                const perTurnCost = hasFiniteCost(taskUsage.costUsd) && turnCount > 0
+                  ? (taskUsage.costUsd ?? 0) / turnCount
+                  : null;
+                const cached = cachedInput(taskUsage);
+                const last = task.lastActivity ?? task.createdAt;
+                const date = new Date(last).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+                return (
+                  <div
+                    key={`${task.threadId}:${index}`}
+                    className="grid grid-cols-[1.4fr_1fr_0.9fr_0.9fr_0.7fr_0.9fr_0.9fr] items-center gap-x-3 border-b border-hairline/10 py-1.5 text-[12px]"
+                  >
+                    <span className="min-w-0 truncate text-ink" title={task.title || task.threadId}>
+                      {task.title || task.threadId.slice(0, 12)}
+                      <span className="ml-1 text-ink-secondary/80">{date}</span>
+                    </span>
+                    <span className="min-w-0 truncate text-[11.5px] text-ink-secondary" title={task.modelSelection?.model ?? model}>
+                      {modelDisplayName(model, instances)}
+                    </span>
+                    <span className="text-right tabular-nums text-ink">{formatTokens(taskUsage.input)}</span>
+                    <span className="text-right tabular-nums text-ink-secondary">{cached > 0 ? formatTokens(cached) : "—"}</span>
+                    <span className="text-right tabular-nums text-ink">{formatTokens(taskUsage.output)}</span>
+                    <span className="text-right tabular-nums text-ink-secondary">
+                      {perTurnCost != null ? formatUsd(perTurnCost) : "—"}
+                    </span>
+                    <span className="text-right tabular-nums text-ink">
+                      {hasFiniteCost(taskUsage.costUsd) ? formatUsd(cumCost) : "—"}
+                      <span className="block text-[10.5px] text-ink-secondary">{formatTokens(cumTokens)} cumulative</span>
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
       )}
     </div>

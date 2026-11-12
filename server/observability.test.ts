@@ -70,6 +70,7 @@ function fakeSentry(options: { acceptsDsn?: boolean } = {}) {
       record.messages.push(message);
       return "evt0000000000000000000000000000ab";
     },
+    isEnabled: () => true,
   });
   // Only stamped when a test asks for it: the real SDK answers a DSN its own
   // parser refused by building a client that kept none, and `init` never
@@ -133,13 +134,27 @@ describe("observability status resolution", () => {
     expect(observability.effectiveDsn()).toBe(ENV_DSN);
   });
 
-  it("uses the stored DSN when the environment has none", async () => {
+  it("keeps enabled as configuration while delivering stays false before apply", () => {
     useConfig({ observability: { sentryDsn: CONFIG_DSN } });
     const status = observability.getStatus();
+    expect(status.configured).toBe(true);
+    expect(status.requestedEnabled).toBe(true);
+    expect(status.enabled).toBe(true);
+    expect(status.delivering).toBe(false);
+    expect(status.lastError).toBeNull();
+    expect(observabilityBootLine(status)).toContain("[sentry] starting (config)");
+  });
+
+  it("uses the stored DSN when the environment has none", async () => {
+    const { loader } = fakeSentry();
+    setSentryLoaderForTests(loader);
+    useConfig({ observability: { sentryDsn: CONFIG_DSN } });
+    const status = await observability.apply();
     expect(status).toMatchObject({
       source: "config",
       configured: true,
       enabled: true,
+      delivering: true,
       requestedEnabled: true,
       host: "o0.ingest.sentry.io",
       projectId: "1",
@@ -147,8 +162,10 @@ describe("observability status resolution", () => {
   });
 
   it("reports an explicit zero trace sample rate as zero, not as the default", async () => {
+    const { loader } = fakeSentry();
+    setSentryLoaderForTests(loader);
     useConfig({ observability: { sentryDsn: CONFIG_DSN, tracesSampleRate: 0 } });
-    const status = observability.getStatus();
+    const status = await observability.apply();
     expect(status.tracesSampleRate).toBe(0);
     expect(observabilityBootLine(status)).toContain("traces=0 ");
   });
@@ -156,6 +173,27 @@ describe("observability status resolution", () => {
   it("falls back to the shipped sample rate when nothing is stored", async () => {
     useConfig({ observability: { sentryDsn: CONFIG_DSN } });
     expect(observability.getStatus().tracesSampleRate).toBe(0.2);
+  });
+
+  it("reports explicit and defaulted separate trace sample rates", async () => {
+    useConfig({
+      observability: {
+        sentryDsn: CONFIG_DSN,
+        aiTracesSampleRate: 0.8,
+        httpTracesSampleRate: 0.05,
+        uiTracesSampleRate: 0.15,
+      },
+    });
+    const status = observability.getStatus();
+    expect(status.aiTracesSampleRate).toBe(0.8);
+    expect(status.httpTracesSampleRate).toBe(0.05);
+    expect(status.uiTracesSampleRate).toBe(0.15);
+
+    useConfig({ observability: { sentryDsn: CONFIG_DSN } });
+    const defaulted = observability.getStatus();
+    expect(defaulted.aiTracesSampleRate).toBe(1.0);
+    expect(defaulted.httpTracesSampleRate).toBe(0.1);
+    expect(defaulted.uiTracesSampleRate).toBe(0.1);
   });
 });
 
@@ -187,9 +225,7 @@ describe("observability kill switch", () => {
     expect(record.inits).toHaveLength(1);
     expect(record.inits[0]).toMatchObject({
       dsn: CONFIG_DSN,
-      sendDefaultPii: false,
-      enableLogs: true,
-      streamGenAiSpans: true,
+      traceLifecycle: "static",
       // Main's Sentry Agents implementation (#469) narrows dataCollection to
       // the genAI block; GenAI I/O collection defaults on (kill with
       // SENTRY_AI_DATA_COLLECTION=0).
@@ -197,6 +233,8 @@ describe("observability kill switch", () => {
         genAI: { inputs: true, outputs: true },
       },
     });
+    expect(record.inits[0]).not.toHaveProperty("sendDefaultPii");
+    expect(record.inits[0]).not.toHaveProperty("streamGenAiSpans");
 
     cfg.observability = { ...cfg.observability, enabled: false };
     expect((await observability.apply()).enabled).toBe(false);
