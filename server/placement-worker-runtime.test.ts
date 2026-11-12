@@ -34,12 +34,12 @@ afterEach(() => {
 });
 
 interface MockWorkerClient extends PlacementWorkerClientLike {
-  register: Mock<Parameters<PlacementWorkerClientLike["register"]>, ReturnType<PlacementWorkerClientLike["register"]>>;
-  heartbeat: Mock<Parameters<PlacementWorkerClientLike["heartbeat"]>, ReturnType<PlacementWorkerClientLike["heartbeat"]>>;
-  assignment: Mock<Parameters<PlacementWorkerClientLike["assignment"]>, ReturnType<PlacementWorkerClientLike["assignment"]>>;
-  payload: Mock<Parameters<PlacementWorkerClientLike["payload"]>, ReturnType<PlacementWorkerClientLike["payload"]>>;
-  report: Mock<Parameters<PlacementWorkerClientLike["report"]>, ReturnType<PlacementWorkerClientLike["report"]>>;
-  stopReceipt: Mock<Parameters<PlacementWorkerClientLike["stopReceipt"]>, ReturnType<PlacementWorkerClientLike["stopReceipt"]>>;
+  register: Mock<PlacementWorkerClientLike["register"]>;
+  heartbeat: Mock<PlacementWorkerClientLike["heartbeat"]>;
+  assignment: Mock<PlacementWorkerClientLike["assignment"]>;
+  payload: Mock<PlacementWorkerClientLike["payload"]>;
+  report: Mock<PlacementWorkerClientLike["report"]>;
+  stopReceipt: Mock<PlacementWorkerClientLike["stopReceipt"]>;
 }
 
 function fixtureEnv() {
