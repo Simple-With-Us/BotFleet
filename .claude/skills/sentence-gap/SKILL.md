@@ -1,7 +1,7 @@
 ---
 name: sentence-gap
 description: >-
-  Always put a visibly wider gap between sentences in every human-readable reply and file.  Applies on every turn — Cursor desktop, Cursor cloud, CLI, Grok, chat, commits, PRs, and docs.  Follows Monet's portable protocol.  Mechanism (owner ruling 2026-10-23, reaffirmed 2026-10-25): a real U+00A0 plus a normal space between sentences on every surface, with one exception, the chat panes of Claude Code (the Code tab), MiniMax Code (the MiniMax Code pane) and Z Code (the Z Code pane), which take the &nbsp; entity plus a normal space; never two plain ASCII spaces, which collapse on rendered surfaces.  Use whenever writing any prose a human will read.
+  Always put a visibly wider gap between sentences in every human-readable reply and file.  Applies on every turn — Cursor desktop, Cursor cloud, CLI, Grok, chat, commits, PRs, and docs.  Follows Monet's portable protocol.  Mechanism (owner ruling 2026-10-23, reaffirmed 2026-10-25; Z Code chat pane added 2026-11-11): a real U+00A0 plus a normal space between sentences on every surface, with one exception, the chat panes of Claude Code (the Code tab), MiniMax Code (the MiniMax Code pane) and Z Code (the Z Code pane), which take the &nbsp; entity plus a normal space; never two plain ASCII spaces, which collapse on rendered surfaces.  Use whenever writing any prose a human will read.
 ---
 
 # Sentence gap (portable — always on)
@@ -27,7 +27,7 @@ notes, design docs.
 Do **not** add a gap after a non-terminal abbreviation (`e.g.`, `i.e.`, `Dr.`, `v1.2.3`),
 inside a URL, email, filename, or a brand name containing a period.
 
-### Current rule (owner ruling 2026-10-23, reaffirmed 2026-10-25) — one mechanism on every surface, and one exception
+### Current rule (owner ruling 2026-10-23, reaffirmed 2026-10-25, Z Code pane added 2026-11-11) — one mechanism on every surface, and one exception
 
 Jay, Fri, Oct 23:  update the rule everywhere, so it is the same on every surface.  Between
 sentences, write a **real U+00A0 (no-break space) followed by a normal space**.  That covers
@@ -53,8 +53,9 @@ Slack, commit messages, repo docs and Markdown, skills, agent instructions, and 
 
 This replaces every earlier per-surface rule:  the entity in chat panes (2026-10-08, 2026-10-18)
 and on GitHub (2026-10-22), and two ASCII spaces in files, commits, terminals and untested
-surfaces (2026-10-20).  The three chat panes named above are the one exception, reaffirmed by the
-owner on 2026-10-25.  Where older text below disagrees, this section wins.
+surfaces (2026-10-20).  The three chat panes named above are the one exception.  The owner
+reaffirmed Claude Code and MiniMax Code on 2026-10-25.  The owner added the Z Code chat pane on
+2026-11-11.  Where older text below disagrees, this section wins.
 
 ### The catch that wastes everyone's time
 
@@ -95,12 +96,12 @@ the text as it is, never switch to the `&nbsp;` entity, and report the surface i
 ### History — 2026-08-19/20 findings on Claude Code (terminal + desktop), do NOT re-run these tests
 
 **2026-10-25 update — one exception.**  The owner reaffirmed the one mechanism and named the one
-exception:  the chat panes of Claude Code (the Code tab), MiniMax Code (the MiniMax Code
-pane) and Z Code (the Z Code pane) take the `&nbsp;` entity plus a normal space, because they normalize a raw U+00A0 away
+exception:  the chat panes of Claude Code (the Code tab) and MiniMax Code (the MiniMax Code
+pane) take the `&nbsp;` entity plus a normal space, because they normalize a raw U+00A0 away
 and collapse two ASCII spaces.  Everywhere else is a real U+00A0 plus a normal space.  The
-MiniMax Code and Z Code chat panes always take the entity.
+MiniMax Code chat pane always takes the entity.
 
-**2026-11-11 update — Z Code chat pane.**  The owner added the Z Code chat pane as the third pane that takes the `&nbsp;` entity plus a normal space, after a byte-level check on 2026-11-10.  Every other surface is unchanged.
+**2026-11-11 update — Z Code chat pane.**  The owner added the Z Code chat pane as the third pane that takes the `&nbsp;` entity plus a normal space, after a byte-level check on 2026-11-10.  Every other surface is unchanged.
 
 **2026-10-23 update — one mechanism everywhere.**  The owner replaced every per-surface rule
 with one:  a real U+00A0 plus a normal space on every surface, never the `&nbsp;` entity, and
