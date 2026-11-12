@@ -87,16 +87,17 @@ afterEach(() => {
   host = undefined;
 });
 
-function mount(runs: RoutineRun[], handlers: { onSelectBotInApp?: (botId: string, appId: string) => void } = {}) {
+function renderBoard(
+  runs: RoutineRun[],
+  filterAppId?: string | null,
+  handlers: { onSelectBotInApp?: (botId: string, appId: string) => void } = {},
+) {
   const value = {
     state: { ...initialState, bots: [bot], groups: [app], routineRuns: runs },
     dispatch: () => {},
     flushBotPatches: async () => {},
     refreshInstances: async () => {},
   };
-  host = document.createElement("div");
-  document.body.appendChild(host);
-  root = createRoot(host);
   act(() => {
     root!.render(
       createElement(
@@ -106,11 +107,23 @@ function mount(runs: RoutineRun[], handlers: { onSelectBotInApp?: (botId: string
           onSelectApp: () => {},
           onSelectBot: () => {},
           onOpenAppRoom: () => {},
+          filterAppId,
           ...handlers,
         }),
       ),
     );
   });
+}
+
+function mount(
+  runs: RoutineRun[],
+  handlers: { onSelectBotInApp?: (botId: string, appId: string) => void } = {},
+  filterAppId?: string | null,
+) {
+  host = document.createElement("div");
+  document.body.appendChild(host);
+  root = createRoot(host);
+  renderBoard(runs, filterAppId, handlers);
   return host;
 }
 
@@ -131,6 +144,42 @@ function click(element: HTMLElement) {
   act(() => {
     element.click();
   });
+}
+
+function searchInput(container: HTMLElement) {
+  const found = container.querySelector<HTMLInputElement>('input[placeholder="Filter tasks, bots, or apps..."]');
+  if (!found) throw new Error("search input not found");
+  return found;
+}
+
+function setInputValue(input: HTMLInputElement, value: string) {
+  const setter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(input), "value")?.set;
+  if (!setter) throw new Error("missing input value setter");
+  setter.call(input, value);
+  input.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
+async function typeSearch(container: HTMLElement, query: string) {
+  await act(async () => {
+    setInputValue(searchInput(container), query);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+}
+
+function foldedRuns(routineId: string): RoutineRun[] {
+  return Array.from({ length: 3 }, (_, i) => ({
+    id: `fold-run-${i}`,
+    routineId,
+    routineName: "GitHub UI Pass",
+    botId: "bot-1",
+    runOn: "bot" as const,
+    scheduledFor: NOW - (3 - i) * 60_000,
+    finishedAt: NOW - (3 - i) * 60_000 + 1_000,
+    status: "failed" as const,
+    manual: false,
+    createdAt: NOW - (3 - i) * 60_000,
+    error: i === 0 ? "first docker miss" : "Start docker first",
+  }));
 }
 
 describe("KanbanCommandCenter Show More", () => {
@@ -168,6 +217,40 @@ describe("KanbanCommandCenter Show More", () => {
     expect(showMoreButton(container, "completed")).toBeUndefined();
     // Completed paging did not touch the Attention Queue.
     expect(cards(container, "attention")).toHaveLength(COLUMN_VISIBLE_CAP);
+  });
+
+  it("resets expanded columns when the app filter changes", () => {
+    const container = mount(failingRuns(40));
+    click(showMoreButton(container, "attention")!);
+    expect(cards(container, "attention")).toHaveLength(COLUMN_VISIBLE_CAP * 2);
+
+    renderBoard(failingRuns(40), "app-1");
+    expect(cards(container, "attention")).toHaveLength(COLUMN_VISIBLE_CAP);
+    expect(showMoreButton(container, "attention")?.textContent).toBe("Show 15 More");
+    expect(container.textContent).toContain("Filtered to Ops Console");
+  });
+
+  it("resets expanded columns when the search filter changes", async () => {
+    const container = mount(failingRuns(40));
+    click(showMoreButton(container, "attention")!);
+    expect(cards(container, "attention")).toHaveLength(COLUMN_VISIBLE_CAP * 2);
+
+    await typeSearch(container, "Failing 39");
+    expect(cards(container, "attention")).toHaveLength(1);
+    expect(showMoreButton(container, "attention")).toBeUndefined();
+
+    await typeSearch(container, "");
+    expect(cards(container, "attention")).toHaveLength(COLUMN_VISIBLE_CAP);
+    expect(showMoreButton(container, "attention")?.textContent).toBe("Show 15 More");
+  });
+
+  it("matches folded older run text and marks the folded count", async () => {
+    const container = mount(foldedRuns("routine-fold"));
+    expect(cards(container, "attention")).toHaveLength(1);
+
+    await typeSearch(container, "first docker miss");
+    expect(cards(container, "attention")).toHaveLength(1);
+    expect(column(container, "attention").textContent).toContain("+2 older, matches your search");
   });
 
   it("keeps a card click opening the bot in its app, and the paging control out of that path", () => {
