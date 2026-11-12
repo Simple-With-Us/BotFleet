@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { copyFile, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, sep } from "node:path";
@@ -142,20 +143,16 @@ test("a rollback bundle this run did not move is never promoted over the install
 async function spawnHoldingMarker(marker, t) {
   const child = spawn("/bin/sh", ["-c", 'exec 3<"$1"; printf r; exec /bin/sleep 120', "_", marker], { stdio: ["ignore", "pipe", "ignore"] });
   t.after(() => { try { child.kill("SIGKILL"); } catch { /* already gone */ } });
-  const opened = await new Promise((resolve) => {
-    let text = "";
-    const timer = setTimeout(() => resolve(false), 5_000);
-    child.stdout.on("data", (chunk) => {
-      text += chunk;
-      if (!text.includes("r")) return;
-      clearTimeout(timer);
-      resolve(true);
-    });
-    child.once("exit", () => {
-      clearTimeout(timer);
-      resolve(false);
-    });
-  });
+  child.stdout.setEncoding("utf8");
+  const opened = await Promise.race([
+    (async () => {
+      for await (const chunk of child.stdout) {
+        if (chunk.includes("r")) return true;
+      }
+      return false;
+    })(),
+    once(child, "exit").then(() => false),
+  ]);
   return { child, opened };
 }
 
