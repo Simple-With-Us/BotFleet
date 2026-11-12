@@ -1042,6 +1042,21 @@ describe("CodexDriver turns (fake app-server)", () => {
     await recorder.until((e) => e.type === "turn.completed");
   });
 
+  it("refuses a second turn that arrives while the first is still claiming the thread", async () => {
+    // The two turns are started together, so the second one reaches the
+    // guard while the first is still claiming the thread.  A vault read
+    // between the guard and the registration would let both through, so the
+    // seat's CLI login is read BEFORE the guard, never after it.
+    await create({ mode: "approval" });
+    const first = instance.adapter.sendTurn({ threadId: "t-race", text: "one" });
+    const second = instance.adapter.sendTurn({ threadId: "t-race", text: "two" });
+    await expect(second).rejects.toThrow(/already running/);
+    await first;
+    await recorder.until((e) => e.type === "request.opened");
+    await instance.adapter.interruptTurn("t-race");
+    await recorder.until((e) => e.type === "turn.completed");
+  });
+
   it("a missing binary surfaces as a failed turn, and snapshot says unavailable", async () => {
     instance = await CodexDriver.create({
       instanceId: "codex-missing",

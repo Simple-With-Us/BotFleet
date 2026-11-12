@@ -2,6 +2,7 @@ import Foundation
 
 /// Engine family identifier for the scrubbed replay fixture corpus.
 public enum EngineReplayFamily: String, Equatable, Sendable, Codable, CaseIterable {
+    case antigravity = "antigravity"
     case claude = "claude"
     case codex = "codex"
     case grok = "grok"
@@ -280,8 +281,8 @@ public actor ScriptedProcessLauncher: EngineProcessLauncher {
     }
 }
 
-/// Harness that executes scrubbed replay fixtures against `ClaudeStreamRunner`, `CodexAppServerRunner`,
-/// and `AcpProcessRunner` (Grok, MiniMax `mcode`, Muse) and verifies exact `TurnEvent` parity.
+/// Harness that executes scrubbed replay fixtures against `AntigravityStreamRunner`, `ClaudeStreamRunner`,
+/// `CodexAppServerRunner`, and `AcpProcessRunner` (Grok, MiniMax `mcode`, Muse) and verifies exact `TurnEvent` parity.
 public enum EngineReplayHarness {
     /// Executes a single `EngineReplayFixture` against its corresponding native Swift `EngineDriver`.
     public static func runFixture(_ fixture: EngineReplayFixture) async throws -> EngineReplayResult {
@@ -289,6 +290,8 @@ public enum EngineReplayHarness {
         let driver: any EngineDriver
 
         switch fixture.family {
+        case .antigravity:
+            driver = AntigravityStreamRunner(launcher: launcher)
         case .claude:
             driver = ClaudeStreamRunner(launcher: launcher)
         case .codex:
@@ -311,6 +314,7 @@ public enum EngineReplayHarness {
         let recordedStdin = await launcher.getCapturedStdinLines()
         let specMatches = (recordedSpec == fixture.expectedSpawnSpec)
         let eventsMatch = (actualEvents == fixture.expectedEvents)
+        let stdinMatches = (fixture.family != .antigravity || fixture.id != "agy-turn-16" || recordedStdin.contains(where: { $0.utf8.count > AntigravityStreamRunner.maxArgvPromptUTF8Bytes }))
 
         return EngineReplayResult(
             fixtureId: fixture.id,
@@ -318,17 +322,18 @@ public enum EngineReplayHarness {
             recordedSpawnSpec: recordedSpec,
             actualEvents: actualEvents,
             recordedClientStdinLines: recordedStdin,
-            passed: specMatches && eventsMatch
+            passed: specMatches && eventsMatch && stdinMatches
         )
     }
 
-    /// Returns all 100 scrubbed replay fixtures (20 per engine family across all 5 families).
+    /// Returns all 120 scrubbed replay fixtures (20 per engine family across all 6 families).
     public static func allFixtures() -> [EngineReplayFixture] {
-        claudeFixtures() + codexFixtures() + grokFixtures() + mcodeFixtures() + museFixtures()
+        antigravityFixtures() + claudeFixtures() + codexFixtures() + grokFixtures() + mcodeFixtures() + museFixtures()
     }
 
     public static func fixtures(for family: EngineReplayFamily) -> [EngineReplayFixture] {
         switch family {
+        case .antigravity: return antigravityFixtures()
         case .claude: return claudeFixtures()
         case .codex: return codexFixtures()
         case .grok: return grokFixtures()
@@ -592,6 +597,235 @@ public enum EngineReplayHarness {
         }
 
         return list
+    }
+
+    /// Codex may run a tool before acknowledging `turn/start`; if that RPC fails,
+    /// preserve the tool event so the dispatcher does not replay on a fallback engine.
+    public static func codexEarlyToolBeforeTurnStartErrorFixture() -> EngineReplayFixture {
+        let input = TurnInput(
+            threadId: "thread-codex-early-tool",
+            botId: "bot-codex",
+            prompt: "Create the fixture marker once",
+            modelId: "gpt-5.4",
+            workingDirectory: "/tmp/codex"
+        )
+        let threadId = "codex-thr-early-tool"
+        let tool = #"{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"codex-thr-early-tool","item":{"id":"action-1","type":"commandExecution","command":"touch marker","status":"in_progress"}}}"#
+        return EngineReplayFixture(
+            id: "codex-early-tool-before-turn-start-error",
+            family: .codex,
+            title: "Codex tool action arrives before transient turn/start error",
+            input: input,
+            expectedSpawnSpec: CodexAppServerRunner.buildSpawnSpec(input: input),
+            steps: [
+                .onClientRequest(method: "initialize", replyResultJSON: #"{"serverInfo":{"name":"codex"}}"#),
+                .onClientRequest(method: "thread/start", replyResultJSON: #"{"thread":{"id":"codex-thr-early-tool"}}"#),
+                .onClientRequest(
+                    method: "turn/start",
+                    notificationsBeforeReply: [tool],
+                    replyErrorJSON: #"{"code":-32000,"message":"HTTP 429 rate limit exceeded"}"#
+                )
+            ],
+            expectedEvents: [
+                .sessionStarted(sessionId: threadId),
+                .toolCall(
+                    id: "action-1",
+                    name: "touch marker",
+                    argumentsJSON: #"{"command":"touch marker","type":"commandExecution"}"#
+                ),
+                .error(code: "rate_limited", message: "HTTP 429 rate limit exceeded")
+            ]
+        )
+    }
+
+    /// Grok's selected auth method must follow the supported-method priority,
+    /// independent of the order the CLI advertises them.
+    public static func grokAuthPriorityFixture() -> EngineReplayFixture {
+        grokAuthFixture(
+            id: "grok-auth-prefers-cached-token",
+            methods: [#"{"id":"grok.com"}"#, #"{"id":"browser"}"#, #"{"id":"cached_token"}"#],
+            authenticateWith: "cached_token"
+        )
+    }
+
+    public static func grokAuthMethodFallbackFixture() -> EngineReplayFixture {
+        grokAuthFixture(
+            id: "grok-auth-uses-grok-com-when-no-cached-token",
+            methods: [#"{"id":"grok.com"}"#],
+            authenticateWith: "grok.com"
+        )
+    }
+
+    public static func grokUnsupportedAuthMethodFixture() -> EngineReplayFixture {
+        let input = grokProtocolFixtureInput(thread: "grok-unsupported-auth", model: nil)
+        let spec = AcpProcessRunner.buildSpawnSpec(harnessKind: .grok, input: input)
+        return EngineReplayFixture(
+            id: "grok-auth-rejects-unsupported-method",
+            family: .grok,
+            title: "Grok rejects an advertised unsupported ACP auth method",
+            input: input,
+            expectedSpawnSpec: spec,
+            steps: [
+                .onClientRequest(method: "initialize", replyResultJSON: #"{"authMethods":[{"id":"browser"}]}"#)
+            ],
+            expectedEvents: [
+                .error(code: "unsupported_auth_method", message: "Grok ACP advertised no supported authentication method")
+            ]
+        )
+    }
+
+    public static func mcodeIgnoresGrokAuthMethodsFixture() -> EngineReplayFixture {
+        let input = grokProtocolFixtureInput(thread: "mcode-auth-ignored", model: nil)
+        let spec = AcpProcessRunner.buildSpawnSpec(harnessKind: .mcode, input: input)
+        return EngineReplayFixture(
+            id: "mcode-does-not-authenticate-grok-methods",
+            family: .mcode,
+            title: "MiniMax Code ignores Grok-specific ACP auth methods",
+            input: input,
+            expectedSpawnSpec: spec,
+            steps: [
+                .onClientRequest(method: "initialize", replyResultJSON: #"{"authMethods":[{"id":"cached_token"}]}"#),
+                .onClientRequest(method: "session/new", replyResultJSON: #"{"sessionId":"mcode-auth-ignored"}"#),
+                .onClientRequest(method: "session/prompt", replyResultJSON: #"{"stopReason":"end_turn"}"#)
+            ],
+            expectedEvents: [
+                .sessionStarted(sessionId: "mcode-auth-ignored"),
+                .completed(stopReason: "end_turn", inputTokens: nil, outputTokens: nil)
+            ]
+        )
+    }
+
+    public static func grokAlreadySelectedModelFixture() -> EngineReplayFixture {
+        grokModelFixture(
+            id: "grok-skips-model-when-already-selected",
+            currentModel: "grok-4.7",
+            selectedModel: "grok-4.7",
+            advertisedModels: ["grok-4", "grok-4.7"],
+            setModel: false
+        )
+    }
+
+    public static func grokSelectsAdvertisedModelFixture() -> EngineReplayFixture {
+        grokModelFixture(
+            id: "grok-sets-advertised-selected-model",
+            currentModel: "grok-4",
+            selectedModel: "grok-4.7",
+            advertisedModels: ["grok-4", "grok-4.7"],
+            setModel: true
+        )
+    }
+
+    public static func grokRejectsUnadvertisedModelFixture() -> EngineReplayFixture {
+        grokModelFixture(
+            id: "grok-rejects-unadvertised-selected-model",
+            currentModel: "grok-4",
+            selectedModel: "grok-4.7",
+            advertisedModels: ["grok-4"],
+            setModel: false,
+            expectUnknownModel: true
+        )
+    }
+
+    public static func grokMismatchedToolOwnerFixture() -> EngineReplayFixture {
+        let identity = NativeToolIdentity(
+            hostId: "mac:test",
+            installationId: "fixture-installation",
+            userId: "fixture-user",
+            generation: 1
+        )
+        let preparation = NativeTurnToolPreparation(botId: "other-bot", identity: identity)
+        let input = TurnInput(
+            threadId: "thread-grok-mismatched-tools",
+            botId: "bot-grok",
+            prompt: "Fail closed on a mismatched prepared tool owner",
+            workingDirectory: "/tmp/grok",
+            toolPreparation: preparation
+        )
+        return EngineReplayFixture(
+            id: "grok-rejects-mismatched-prepared-tool-owner",
+            family: .grok,
+            title: "Grok ACP rejects tool preparation for another bot",
+            input: input,
+            expectedSpawnSpec: AcpProcessRunner.buildSpawnSpec(harnessKind: .grok, input: input),
+            steps: [],
+            expectedEvents: []
+        )
+    }
+
+    private static func grokProtocolFixtureInput(thread: String, model: String?) -> TurnInput {
+        TurnInput(
+            threadId: "thread-\(thread)",
+            botId: "bot-grok",
+            prompt: "Run isolated Grok protocol fixture",
+            modelId: model,
+            workingDirectory: "/tmp/grok"
+        )
+    }
+
+    private static func grokAuthFixture(
+        id: String,
+        methods: [String],
+        authenticateWith methodId: String
+    ) -> EngineReplayFixture {
+        let sessionId = "session-\(id)"
+        let input = grokProtocolFixtureInput(thread: id, model: nil)
+        return EngineReplayFixture(
+            id: id,
+            family: .grok,
+            title: "Grok ACP auth selects \(methodId)",
+            input: input,
+            expectedSpawnSpec: AcpProcessRunner.buildSpawnSpec(harnessKind: .grok, input: input),
+            steps: [
+                .onClientRequest(method: "initialize", replyResultJSON: #"{"authMethods":[\#(methods.joined(separator: ","))]}"#),
+                .onClientRequest(method: "authenticate", replyResultJSON: "{}"),
+                .onClientRequest(method: "session/new", replyResultJSON: #"{"sessionId":"\#(sessionId)"}"#),
+                .onClientRequest(method: "session/prompt", replyResultJSON: #"{"stopReason":"end_turn"}"#)
+            ],
+            expectedEvents: [
+                .sessionStarted(sessionId: sessionId),
+                .completed(stopReason: "end_turn", inputTokens: nil, outputTokens: nil)
+            ]
+        )
+    }
+
+    private static func grokModelFixture(
+        id: String,
+        currentModel: String,
+        selectedModel: String,
+        advertisedModels: [String],
+        setModel: Bool,
+        expectUnknownModel: Bool = false
+    ) -> EngineReplayFixture {
+        let sessionId = "session-\(id)"
+        let input = grokProtocolFixtureInput(thread: id, model: selectedModel)
+        let availableModels = advertisedModels.map { #"{"modelId":"\#($0)"}"# }.joined(separator: ",")
+        let sessionReply = #"{"sessionId":"\#(sessionId)","models":{"currentModelId":"\#(currentModel)","availableModels":[\#(availableModels)]}}"#
+        var steps: [ScriptedWireStep] = [
+            .onClientRequest(method: "initialize", replyResultJSON: #"{"agentCapabilities":{}}"#),
+            .onClientRequest(method: "session/new", replyResultJSON: sessionReply)
+        ]
+        var expected: [TurnEvent] = [.sessionStarted(sessionId: sessionId)]
+        if expectUnknownModel {
+            expected.append(.error(code: "unknown_model", message: "Grok ACP does not advertise the selected model \(selectedModel)"))
+        } else {
+            if setModel {
+                steps.append(.onClientRequest(
+                    method: "session/set_model",
+                    replyResultJSON: #"{"models":{"currentModelId":"\#(selectedModel)"}}"#
+                ))
+            }
+            steps.append(.onClientRequest(method: "session/prompt", replyResultJSON: #"{"stopReason":"end_turn"}"#))
+            expected.append(.completed(stopReason: "end_turn", inputTokens: nil, outputTokens: nil))
+        }
+        return EngineReplayFixture(
+            id: id,
+            family: .grok,
+            title: "Grok ACP model selection: \(id)",
+            input: input,
+            expectedSpawnSpec: AcpProcessRunner.buildSpawnSpec(harnessKind: .grok, input: input),
+            steps: steps,
+            expectedEvents: expected
+        )
     }
 
     // MARK: - 2. Codex App-Server JSON-RPC Corpus (20 Scrubbed Turn Fixtures)
@@ -1271,6 +1505,276 @@ public enum EngineReplayHarness {
                 input: input,
                 expectedSpawnSpec: spec,
                 steps: steps,
+                expectedEvents: expected
+            ))
+        }
+
+        return list
+    }
+
+    // MARK: - 6. Antigravity (`agy`) Stream-JSON Corpus (20 Scrubbed Turn Fixtures)
+
+    public static func antigravityFixtures() -> [EngineReplayFixture] {
+        var list: [EngineReplayFixture] = []
+
+        // Turns 1..8: Streaming `agent_response` text deltas, thinking deltas, session resume (`--conversation`),
+        // `fullAuto` (`--dangerously-skip-permissions`) vs default (`--mode accept-edits`), and token usage.
+        for idx in 1...8 {
+            let isResumed = (idx % 2 == 0)
+            let includeThinking = (idx >= 5)
+            let isFullAuto = (idx % 3 == 0)
+            let modelId = (idx % 2 == 0) ? "gemini-3.1-pro-low" : "gemini-3.1-pro-high"
+            let convId = "agy-conv-\(idx)"
+            var configOptions: [String: String] = [:]
+            if isFullAuto {
+                configOptions["fullAuto"] = "true"
+            }
+            let input = TurnInput(
+                threadId: "thread-agy-\(idx)",
+                botId: "bot-agy",
+                prompt: "Inspect Antigravity module \(idx).",
+                modelId: modelId,
+                resumeSessionId: isResumed ? convId : nil,
+                workingDirectory: "/tmp/agy-workspace",
+                configOptions: configOptions
+            )
+            let spec = AntigravityStreamRunner.buildSpawnSpec(input: input)
+
+            var lines: [String] = [
+                #"{"event":"init","conversation_id":"\#(convId)","init":{"permission_mode":"request-review"}}"#
+            ]
+            var expected: [TurnEvent] = [
+                .sessionStarted(sessionId: convId)
+            ]
+
+            if includeThinking {
+                lines.append(#"{"event":"step_update","step_update":{"step_type":"agent_response","thinking_delta":"Planning module \#(idx) check."}}"#)
+                expected.append(.reasoningDelta("Planning module \(idx) check."))
+            }
+
+            lines.append(#"{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"Antigravity module \#(idx) "}}"#)
+            lines.append(#"{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"is verified."}}"#)
+            lines.append(#"{"event":"result","result":{"status":"SUCCESS","response":"Antigravity module \#(idx) is verified.","usage":{"input_tokens":\#(150 + idx),"cache_read_tokens":20,"output_tokens":\#(30 + idx)}}}"#)
+
+            expected.append(.textDelta("Antigravity module \(idx) "))
+            expected.append(.textDelta("is verified."))
+            expected.append(.completed(stopReason: "end_turn", inputTokens: 170 + idx, outputTokens: 30 + idx))
+
+            list.append(EngineReplayFixture(
+                id: "agy-turn-\(String(format: "%02d", idx))",
+                family: .antigravity,
+                title: "Antigravity streaming turn \(idx) (resume=\(isResumed), fullAuto=\(isFullAuto))",
+                input: input,
+                expectedSpawnSpec: spec,
+                steps: [.emitStdoutLines(lines)],
+                expectedEvents: expected
+            ))
+        }
+
+        // Turns 9..15: Tool calls (`step_update` with `step_type: "tool"`, `ACTIVE` -> `DONE`/`ERROR`) + final answer.
+        let toolNames = ["read_file", "run_command", "edit_file", "write_file", "grep_search", "list_dir", "run_command"]
+        for offset in 0..<7 {
+            let idx = 9 + offset
+            let toolName = toolNames[offset]
+            let isToolError = (offset == 6)
+            let convId = "agy-conv-\(idx)"
+            let stepIndex = offset + 1
+            let itemId = "\(convId):\(stepIndex)"
+            let resultState = isToolError ? "ERROR" : "DONE"
+            let input = TurnInput(
+                threadId: "thread-agy-\(idx)",
+                botId: "bot-agy",
+                prompt: "Execute \(toolName) for step \(idx)",
+                modelId: "gemini-3.1-pro-high",
+                workingDirectory: "/tmp/agy-workspace"
+            )
+            let spec = AntigravityStreamRunner.buildSpawnSpec(input: input)
+
+            let lines: [String] = [
+                #"{"event":"init","conversation_id":"\#(convId)","init":{"permission_mode":"request-review"}}"#,
+                #"{"event":"step_update","step_update":{"step_type":"tool","step_index":\#(stepIndex),"state":"ACTIVE","tool_name":"\#(toolName)","tool_info":{"parameters":{"path":"target_\#(idx)"}}}}"#,
+                #"{"event":"step_update","step_update":{"step_type":"tool","step_index":\#(stepIndex),"state":"\#(resultState)","tool_name":"\#(toolName)","output":"Output for \#(toolName) \#(idx)"}}"#,
+                #"{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"Finished \#(toolName) step \#(idx)."}}"#,
+                #"{"event":"result","result":{"status":"SUCCESS","usage":{"input_tokens":210,"output_tokens":40}}}"#
+            ]
+            let expected: [TurnEvent] = [
+                .sessionStarted(sessionId: convId),
+                .toolCall(id: itemId, name: toolName, argumentsJSON: #"{"path":"target_\#(idx)"}"#),
+                .toolResult(id: itemId, output: "Output for \(toolName) \(idx)", isError: isToolError),
+                .textDelta("Finished \(toolName) step \(idx)."),
+                .completed(stopReason: "end_turn", inputTokens: 210, outputTokens: 40)
+            ]
+
+            list.append(EngineReplayFixture(
+                id: "agy-turn-\(String(format: "%02d", idx))",
+                family: .antigravity,
+                title: "Antigravity tool step_update turn \(idx) (\(toolName), state=\(resultState))",
+                input: input,
+                expectedSpawnSpec: spec,
+                steps: [.emitStdoutLines(lines)],
+                expectedEvents: expected
+            ))
+        }
+
+        // Turn 16: Large prompt (> 64 KiB) piped via stdin (`--print -`).
+        do {
+            let convId = "agy-conv-16"
+            let largePrompt = String(repeating: "A", count: (64 * 1024) + 128)
+            let input = TurnInput(
+                threadId: "thread-agy-16",
+                botId: "bot-agy",
+                prompt: largePrompt,
+                modelId: "gemini-3.1-pro-high",
+                workingDirectory: "/tmp/agy-workspace"
+            )
+            let spec = AntigravityStreamRunner.buildSpawnSpec(input: input)
+            let lines: [String] = [
+                #"{"event":"init","conversation_id":"\#(convId)","init":{"permission_mode":"request-review"}}"#,
+                #"{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"Processed stdin payload."}}"#,
+                #"{"event":"result","result":{"status":"SUCCESS","usage":{"input_tokens":18000,"output_tokens":12}}}"#
+            ]
+            let expected: [TurnEvent] = [
+                .sessionStarted(sessionId: convId),
+                .textDelta("Processed stdin payload."),
+                .completed(stopReason: "end_turn", inputTokens: 18000, outputTokens: 12)
+            ]
+            list.append(EngineReplayFixture(
+                id: "agy-turn-16",
+                family: .antigravity,
+                title: "Antigravity large prompt (> 64 KiB) piped over stdin with --print -",
+                input: input,
+                expectedSpawnSpec: spec,
+                steps: [.emitStdoutLines(lines)],
+                expectedEvents: expected
+            ))
+        }
+
+        // Turn 17: Non-streamed fallback response on `result` when no prior `agent_response` delta was emitted.
+        do {
+            let convId = "agy-conv-17"
+            let input = TurnInput(
+                threadId: "thread-agy-17",
+                botId: "bot-agy",
+                prompt: "Return whole response on result frame",
+                workingDirectory: "/tmp/agy-workspace"
+            )
+            let spec = AntigravityStreamRunner.buildSpawnSpec(input: input)
+            let lines: [String] = [
+                #"{"event":"init","conversation_id":"\#(convId)","init":{"permission_mode":"request-review"}}"#,
+                #"{"event":"result","result":{"status":"SUCCESS","response":"Fallback result-only answer.","usage":{"input_tokens":95,"output_tokens":14}}}"#
+            ]
+            let expected: [TurnEvent] = [
+                .sessionStarted(sessionId: convId),
+                .textDelta("Fallback result-only answer."),
+                .completed(stopReason: "end_turn", inputTokens: 95, outputTokens: 14)
+            ]
+            list.append(EngineReplayFixture(
+                id: "agy-turn-17",
+                family: .antigravity,
+                title: "Antigravity whole-response fallback on result frame",
+                input: input,
+                expectedSpawnSpec: spec,
+                steps: [.emitStdoutLines(lines)],
+                expectedEvents: expected
+            ))
+        }
+
+        // Turn 18: Host-control turn (`controlsHostMac: true`) with safe `request-review` policy strips bypass and completes.
+        do {
+            let convId = "agy-conv-18"
+            let input = TurnInput(
+                threadId: "thread-agy-18",
+                botId: "bot-agy",
+                prompt: "Check desktop window with asking policy",
+                workingDirectory: "/tmp/agy-workspace",
+                configOptions: [
+                    "fullAuto": "true",
+                    "controlsHostMac": "true"
+                ]
+            )
+            let spec = AntigravityStreamRunner.buildSpawnSpec(input: input)
+            let lines: [String] = [
+                #"{"event":"init","conversation_id":"\#(convId)","init":{"permission_mode":"request-review"}}"#,
+                #"{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"Host-control policy verified."}}"#,
+                #"{"event":"result","result":{"status":"SUCCESS","usage":{"input_tokens":110,"output_tokens":16}}}"#
+            ]
+            let expected: [TurnEvent] = [
+                .sessionStarted(sessionId: convId),
+                .textDelta("Host-control policy verified."),
+                .completed(stopReason: "end_turn", inputTokens: 110, outputTokens: 16)
+            ]
+            list.append(EngineReplayFixture(
+                id: "agy-turn-18",
+                family: .antigravity,
+                title: "Antigravity host-control turn with request-review policy strips bypass and succeeds",
+                input: input,
+                expectedSpawnSpec: spec,
+                steps: [.emitStdoutLines(lines)],
+                expectedEvents: expected
+            ))
+        }
+
+        // Turn 19: Host-control turn (`controlsHostMac: true`) refused at `init` when `permission_mode` is `always-proceed`.
+        do {
+            let convId = "agy-conv-19"
+            let input = TurnInput(
+                threadId: "thread-agy-19",
+                botId: "bot-agy",
+                prompt: "Refuse unsafe host-control policy",
+                workingDirectory: "/tmp/agy-workspace",
+                configOptions: [
+                    "fullAuto": "true",
+                    "controlsHostMac": "true"
+                ]
+            )
+            let spec = AntigravityStreamRunner.buildSpawnSpec(input: input)
+            let refusalMessage = AntigravityDriverPolicy.hostPolicyRefusal(for: "always-proceed") ?? ""
+            let lines: [String] = [
+                #"{"event":"init","conversation_id":"\#(convId)","init":{"permission_mode":"always-proceed"}}"#,
+                #"{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"MUST NOT EMIT AFTER REFUSAL"}}"#,
+                #"{"event":"result","result":{"status":"SUCCESS"}}"#
+            ]
+            let expected: [TurnEvent] = [
+                .sessionStarted(sessionId: convId),
+                .error(code: "host_control_policy", message: refusalMessage)
+            ]
+            list.append(EngineReplayFixture(
+                id: "agy-turn-19",
+                family: .antigravity,
+                title: "Antigravity host-control turn refused on always-proceed permission_mode",
+                input: input,
+                expectedSpawnSpec: spec,
+                steps: [.emitStdoutLines(lines)],
+                expectedEvents: expected
+            ))
+        }
+
+        // Turn 20: Terminal `result` frame with `status: "ERROR"` and quota/rate-limit error message.
+        do {
+            let convId = "agy-conv-20"
+            let errorText = "Individual quota reached; resets in 44h3m45s."
+            let input = TurnInput(
+                threadId: "thread-agy-20",
+                botId: "bot-agy",
+                prompt: "Trigger Antigravity quota error",
+                workingDirectory: "/tmp/agy-workspace"
+            )
+            let spec = AntigravityStreamRunner.buildSpawnSpec(input: input)
+            let lines: [String] = [
+                #"{"event":"init","conversation_id":"\#(convId)","init":{"permission_mode":"request-review"}}"#,
+                #"{"event":"result","result":{"status":"ERROR","error":"\#(errorText)"}}"#
+            ]
+            let expected: [TurnEvent] = [
+                .sessionStarted(sessionId: convId),
+                .error(code: "error", message: errorText)
+            ]
+            list.append(EngineReplayFixture(
+                id: "agy-turn-20",
+                family: .antigravity,
+                title: "Antigravity terminal ERROR result frame surfaces quota message",
+                input: input,
+                expectedSpawnSpec: spec,
+                steps: [.emitStdoutLines(lines)],
                 expectedEvents: expected
             ))
         }

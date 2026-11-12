@@ -257,7 +257,13 @@ def save():
 def blob(doc):
     return hashlib.md5(json.dumps(doc, sort_keys=True).encode()).hexdigest()
 def tsv(doc):
-    print(blob(doc) + "\\t" + base64.b64encode((json.dumps(doc, indent=2) + "\\n").encode()).decode())
+    # The real contents API: base64 wrapped every 60 characters with newlines,
+    # which is what broke the old --jq '@tsv' read.  A --jq filter on this
+    # call is refused so the script has to parse the raw response.
+    if "--jq" in args: sys.exit(1)
+    b64 = base64.b64encode((json.dumps(doc, indent=2) + "\\n").encode()).decode()
+    wrapped = "\\n".join(b64[i:i + 60] for i in range(0, len(b64), 60)) + "\\n"
+    print(json.dumps({"sha": blob(doc), "encoding": "base64", "content": wrapped}))
 def opt(name):
     return args[args.index(name) + 1] if name in args else None
 def flag(name):
@@ -527,10 +533,26 @@ test("a missing audit script blocks too, warn continues, off skips", () => {
   assert.match(warned.stderr, /publishing anyway/);
   const off = publish(stub, [], { FLEET_ICON_AUDIT: "off", FLEET_ICON_AUDIT_SCRIPT: missing });
   assert.equal(off.status, 0, off.stderr);
+  assert.match(off.stderr, /icon-audit: skipped \(FLEET_ICON_AUDIT=off\)/);
+  assert.doesNotMatch(off.stderr, /icon audit failed or could not run/);
   const bad = publish(stub, [], { FLEET_ICON_AUDIT: "maybe" });
   assert.equal(bad.status, 2);
   rmSync(stub, { recursive: true, force: true });
   rmSync(audit.dir, { recursive: true, force: true });
+});
+
+test("FLEET_ICON_AUDIT=off publishes when no audit script is present", () => {
+  // The hosted ship has no fleet-icon-audit.mjs (a Mac-side tool, not
+  // vendored), so off must publish rather than refuse on the audit.
+  const stub = stubDir();
+  const missing = join(stub, "no-such-audit.mjs");
+  assert.ok(!existsSync(missing));
+  const res = publish(stub, [], { FLEET_ICON_AUDIT: "off", FLEET_ICON_AUDIT_SCRIPT: missing });
+  assert.equal(res.status, 0, res.stderr || res.stdout);
+  assert.match(res.stderr, /icon-audit: skipped \(FLEET_ICON_AUDIT=off\)/);
+  assert.doesNotMatch(res.stderr, /icon audit failed or could not run/);
+  assert.equal(stateOf(stub).branch.doc.apps["com.socratictrade.ios"].marketingVersion, "1.0.69");
+  rmSync(stub, { recursive: true, force: true });
 });
 
 test("the sheet sync runs after the publish, a failure fails the run, a missing shim is skipped", () => {

@@ -28,6 +28,13 @@ name: iOS TestFlight ship (GitHub-hosted macOS)
 # /Users/jay/apps/ios-fleet. App key `botfleet`, bundle `app.botfleet.ios`,
 # team `CC8UTF7ATG`. Versioning is 1.0.<commit count>, and CFBundleVersion is
 # that same integer (owner 2026-10-18); UTC timestamps are retired.
+#
+# The build number is planned ONCE per release, by the plan-build job below
+# (owner 2026-10-29): one shared merge-timestamp build, max(S, M + 1), where
+# S is the committer date of HEAD in America/Chicago as YYYYMMDDHHMM and M
+# is the highest build already in App Store Connect. The ship job receives
+# that single value as its --build and never plans its own, so a release
+# cannot upload two different builds.
 
 on:
   push:
@@ -38,6 +45,8 @@ on:
       - '.github/workflows/sentry-testflight.yml'
       - 'scripts/sentry-report-testflight.mjs'
       - 'scripts/sentry-testflight-receipt.mjs'
+      - 'scripts/ios-post-sync-tf-ready.sh'
+      - 'scripts/ios-observe-ship.mjs'
       - 'scripts/ios-fleet/**'
       - 'scripts/ios-ship-testflight.sh'
       - 'scripts/ios-appstore-gm-prepare.sh'
@@ -71,8 +80,52 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  plan-build:
+    name: Plan the shared release build (once)
+    if: github.event.repository.fork == false
+    # No Xcode here: --plan-build-only exits before the toolchain
+    # requirements, so this runs on a plain Ubuntu runner.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      build: ${{ steps.plan.outputs.build }}
+    steps:
+      # Default depth is enough: the plan reads only HEAD (its committer
+      # date is the merge stamp S), never the history behind it.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Same names the ship job loads: the plan consults App Store Connect,
+      # so it authenticates the same way. Values are masked, never printed.
+      - name: Load Infisical signing secrets
+        uses: ./.github/actions/infisical-secrets
+        with:
+          names: >-
+            APPLE_API_KEY_ID APPLE_API_ISSUER_ID APPLE_API_KEY_P8_BASE64
+            IOS_CERT_P12_BASE64 IOS_CERT_PASSWORD SENTRY_DSN SENTRY_AUTH_TOKEN
+          required: >-
+            APPLE_API_KEY_ID APPLE_API_ISSUER_ID APPLE_API_KEY_P8_BASE64
+            IOS_CERT_P12_BASE64 IOS_CERT_PASSWORD
+          project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
+          token: ${{ secrets.INFISICAL_IOS_SHIP_READ_TOKEN }}
+        env:
+          GH_FALLBACK_SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          GH_FALLBACK_SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+
+      - name: Plan the shared release build
+        id: plan
+        run: |
+          build="$(bash scripts/ios-ship-testflight.sh --plan-build-only)"
+          if [[ ! "$build" =~ ^[1-9][0-9]{11}$ ]]; then
+            echo "::error::plan-build produced no 12-digit merge-timestamp build"
+            exit 1
+          fi
+          echo "build=${build}" >> "$GITHUB_OUTPUT"
+
   ship:
     name: TestFlight archive + upload
+    needs: plan-build
     if: github.event.repository.fork == false
     # GitHub-hosted `xcode-27` image (actions/runner-images#14404): the iOS 27
     # deployment floor needs the iOS 27 SDK, which macos-latest (Xcode 26.x)
@@ -81,8 +134,8 @@ jobs:
     runs-on: xcode-27
     timeout-minutes: 90
     outputs:
-      sentry_receipt: ${{ steps.ship.outputs.sentry_receipt }}
-      sentry_receipt_error: ${{ steps.ship.outputs.sentry_receipt_error }}
+      sentry_receipt: ${{ steps.post_sync_tf.outputs.sentry_receipt }}
+      sentry_receipt_error: ${{ steps.post_sync_tf.outputs.sentry_receipt_error }}
     env:
       DEVELOPER_DIR: /Applications/Xcode_27.0.app/Contents/Developer
     steps:
@@ -96,12 +149,24 @@ jobs:
           fetch-depth: 0
 
       - name: Restore iOS ship state
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/ios-fleet
-          key: ios-fleet-botfleet-${{ github.run_id }}
+          key: ios-fleet-botfleet-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
+            ios-fleet-botfleet-${{ github.run_id }}-
             ios-fleet-botfleet-
+
+      - name: Clear stale ship-state lockdirs after cache restore
+        run: |
+          shopt -s nullglob
+          lockdirs=( "${HOME}/.cache/ios-fleet/"*.lockdir )
+          if ((${#lockdirs[@]})); then
+            rm -rf "${lockdirs[@]}"
+            echo "Removed stale lockdir(s): ${lockdirs[*]}"
+          else
+            echo "No stale lockdir entries under ~/.cache/ios-fleet."
+          fi
 
       # Runs FIRST so a tick with nothing to ship costs seconds and cannot go
       # red on an unrelated environment problem. The logic lives in a script,
@@ -109,9 +174,22 @@ jobs:
       - name: Scheduled ship gate (skip unless iOS code changed)
         id: gate
         run: |
+          # One --path-prefix per on.push.paths entry above: the cron
+          # backstop ships exactly what a push would have shipped, so a
+          # merge the push trigger missed still ships (owner 2026-10-29).
           bash "$GITHUB_WORKSPACE/scripts/ios-fleet/scheduled-ship-gate.sh" \
             --event "${{ github.event_name }}" \
-            --path-prefix 'ios/' \
+            --path-prefix 'ios/**' \
+            --path-prefix '.github/workflows/ios-ship.yml' \
+            --path-prefix '.github/workflows/sentry-testflight.yml' \
+            --path-prefix 'scripts/sentry-report-testflight.mjs' \
+            --path-prefix 'scripts/sentry-testflight-receipt.mjs' \
+            --path-prefix 'scripts/ios-post-sync-tf-ready.sh' \
+            --path-prefix 'scripts/ios-observe-ship.mjs' \
+            --path-prefix 'scripts/ios-fleet/**' \
+            --path-prefix 'scripts/ios-ship-testflight.sh' \
+            --path-prefix 'scripts/ios-appstore-gm-prepare.sh' \
+            --path-prefix 'scripts/ios-install-appstore-profiles.sh' \
             --repo-root "$GITHUB_WORKSPACE" \
             botfleet
 
@@ -189,16 +267,23 @@ jobs:
       # execs scripts/ios-fleet/ship-testflight.sh (BotFleet apps.json is
       # app.botfleet.ios, 1.0.N).
       #
-      # No extra flags. Standing gate is DEFAULT_MIN_INTERVAL_SEC=3600
-      # (1 hour) in the fleet script. The 30-minute cron picks up an unbuilt
-      # merge on the next eligible hour; same-HEAD ticks still exit 0
-      # without shipping.
+      # The build comes from the plan-build job: one shared value per
+      # release, passed as --build and never re-planned here. Standing gate
+      # is DEFAULT_MIN_INTERVAL_SEC=3600 (1 hour) in the fleet script. The
+      # 30-minute cron picks up an unbuilt merge on the next eligible hour;
+      # same-HEAD ticks still exit 0 without shipping.
       - name: Ship BotFleet to TestFlight
         id: ship
         if: steps.gate.outputs.should_ship == '1'
         env:
           IOS_TF_RELEASE_NOTES: "1"  # Jay 2026-09-08: publish ASC What to Test
           IOS_MANUAL_SIGN: "1"  # 2026-10-07: API profiles; no Xcode provisioning service
+          # Receipt uses the post-sync ensure-tf-ready pass, not the in-ship check.
+          IOS_DEFER_SENTRY_RECEIPT: "1"
+          # fleet-icon-audit.mjs is a Mac-side fleet tool not vendored in
+          # this repo, so the hosted ship cannot run it; hand runs on the
+          # Mac keep the publisher's default block gate.
+          FLEET_ICON_AUDIT: "off"
           # The fleet iOS version manifest lives in AI-Fleet-Coordinator, and
           # that repository's ruleset refuses a direct write to its protected
           # branch, so the publish is a branch plus a pull request.  The
@@ -207,7 +292,7 @@ jobs:
           # passed for that one step.  The publisher refuses GITHUB_TOKEN
           # outright, and it never arms auto-merge with one.
           GH_TOKEN: ${{ secrets.GH_PAT }}
-        run: bash scripts/ios-ship-testflight.sh
+        run: node scripts/ios-observe-ship.mjs bash scripts/ios-ship-testflight.sh --build "${{ needs.plan-build.outputs.build }}"
 
       # Standing TestFlight testers (asc-standing-testers skill): make sure the
       # three standing emails are in BotFleet's external beta group and the new
@@ -240,6 +325,55 @@ jobs:
           if [ "$rc" -ne 0 ]; then
             echo "::warning title=TestFlight standing testers::tester sync exited ${rc}; see the standing-testers lines above.  The TestFlight upload itself succeeded."
           fi
+
+      # The in-ship ensure-tf-ready runs before standing-tester sync, so rc=5
+      # is common when the external group is not ready yet.  Re-check after sync
+      # so the job summary and Sentry receipt reflect post-sync installability
+      # (OPS-1052 / BF-2552).
+      - name: Re-check TestFlight readiness after tester sync
+        id: post_sync_tf
+        if: success() && steps.gate.outputs.should_ship == '1' && steps.ship.outputs.uploaded == 'true'
+        continue-on-error: true
+        timeout-minutes: 15
+        env:
+          IOS_TF_READY_TIMEOUT_SEC: "300"
+          IOS_SHIP_ARCHIVE_PATH: ${{ steps.ship.outputs.ios_ship_archive_path }}
+          IOS_SHIP_ARCHIVE_COMMIT: ${{ steps.ship.outputs.ios_ship_commit }}
+        run: |
+          build="${{ needs.plan-build.outputs.build }}"
+          [[ "$build" =~ ^[1-9][0-9]{11}$ ]] || { echo "::error::missing planned build for post-sync tf-ready recheck"; exit 1; }
+          bash "$GITHUB_WORKSPACE/scripts/ios-post-sync-tf-ready.sh" "$build"
+
+      - name: iOS ship summary (TestFlight readiness after sync)
+        if: always() && steps.gate.outputs.should_ship == '1'
+        run: |
+          set -euo pipefail
+          {
+            echo "## TestFlight readiness (after standing-tester sync)"
+            if [ "${{ steps.ship.outputs.uploaded }}" != "true" ]; then
+              echo "- BotFleet: no TestFlight upload this run (ship gate skip or no new build); post-sync readiness not evaluated."
+            elif [ -n "${{ steps.post_sync_tf.outputs.tf_ready_summary }}" ]; then
+              echo "- BotFleet (${{ steps.post_sync_tf.outputs.tf_ready_bundle }} build ${{ steps.post_sync_tf.outputs.tf_ready_build }}): rc=${{ steps.post_sync_tf.outputs.tf_ready_rc }} — ${{ steps.post_sync_tf.outputs.tf_ready_summary }}"
+            else
+              echo "- BotFleet: post-sync readiness check did not run or produced no summary"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove ship-state lockdirs before saving cache
+        if: always()
+        run: |
+          shopt -s nullglob
+          lockdirs=( "${HOME}/.cache/ios-fleet/"*.lockdir )
+          if ((${#lockdirs[@]})); then
+            rm -rf "${lockdirs[@]}"
+          fi
+
+      - name: Save iOS ship state
+        if: always()
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/ios-fleet
+          key: ios-fleet-botfleet-${{ github.run_id }}-${{ github.run_attempt }}
 
   report-sentry-deployment:
     needs: ship

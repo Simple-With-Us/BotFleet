@@ -20,6 +20,7 @@ public actor CodexAppServerRunner: EngineDriver {
     public nonisolated let executable: String
     private let launcher: any EngineProcessLauncher
     private let approvalHandler: ApprovalHandler?
+    private let ownFileReadPolicy: NativeOwnFileReadPolicy?
     private var activeSessions: [String: EngineProcessSession] = [:]
     /// Identifies the turn that owns each registered session, so a turn that is winding down cannot
     /// clear a newer turn's session for the same thread.
@@ -42,12 +43,14 @@ public actor CodexAppServerRunner: EngineDriver {
         engineId: String = "codex",
         executable: String = "codex",
         launcher: any EngineProcessLauncher = ProcessSupervisorActor(),
-        approvalHandler: ApprovalHandler? = nil
+        approvalHandler: ApprovalHandler? = nil,
+        ownFileReadPolicy: NativeOwnFileReadPolicy? = nil
     ) {
         self.engineId = engineId
         self.executable = executable
         self.launcher = launcher
         self.approvalHandler = approvalHandler
+        self.ownFileReadPolicy = ownFileReadPolicy
     }
 
     /// Reasoning-effort values Codex accepts.  The value is interpolated into a Codex `-c` config
@@ -58,6 +61,10 @@ public actor CodexAppServerRunner: EngineDriver {
     /// Builds the verified spawn specification for Codex `app-server` over stdio.
     public static func buildSpawnSpec(executable: String = "codex", input: TurnInput) -> EngineSpawnSpec {
         var args = ["app-server"]
+        if let preparation = input.toolPreparation,
+           let overrides = try? preparation.codexConfigurationOverrides(forBot: input.botId) {
+            for override in overrides { args.append(contentsOf: ["-c", override]) }
+        }
         if let effort = input.configOptions["effort"], !effort.isEmpty {
             let normalized = effort.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             if allowedEfforts.contains(normalized) {
@@ -81,6 +88,7 @@ public actor CodexAppServerRunner: EngineDriver {
     }
 
     public func sendTurn(input: TurnInput) async throws -> AsyncStream<TurnEvent> {
+        _ = try input.toolPreparation?.codexConfigurationOverrides(forBot: input.botId)
         guard activeSessions[input.threadId] == nil else {
             throw EngineDriverError.turnAlreadyActive(threadId: input.threadId)
         }
@@ -94,6 +102,9 @@ public actor CodexAppServerRunner: EngineDriver {
         let (stream, continuation) = AsyncStream<TurnEvent>.makeStream()
         let threadId = input.threadId
         let handler = approvalHandler
+        let ownFilePolicy = ownFileReadPolicy
+        let turnBotId = input.botId
+        let turnCwd = input.workingDirectory ?? "/"
         let fullAuto = input.configOptions["fullAuto"] == "true"
 
         Task { [weak self] in
@@ -101,7 +112,10 @@ public actor CodexAppServerRunner: EngineDriver {
                 session: session,
                 continuation: continuation,
                 approvalHandler: handler,
-                fullAuto: fullAuto
+                fullAuto: fullAuto,
+                ownFileReadPolicy: ownFilePolicy,
+                botId: turnBotId,
+                workingDirectory: turnCwd
             )
 
             let readerTask = Task {
@@ -224,6 +238,9 @@ private actor CodexRpcCoordinator {
     private let continuation: AsyncStream<TurnEvent>.Continuation
     private let approvalHandler: CodexAppServerRunner.ApprovalHandler?
     private let fullAuto: Bool
+    private let ownFileReadPolicy: NativeOwnFileReadPolicy?
+    private let botId: String
+    private let workingDirectory: String
 
     private var nextId: Int = 1
     private var pendingRequests: [Int: CheckedContinuation<[String: Any], Error>] = [:]
@@ -238,12 +255,18 @@ private actor CodexRpcCoordinator {
         session: EngineProcessSession,
         continuation: AsyncStream<TurnEvent>.Continuation,
         approvalHandler: CodexAppServerRunner.ApprovalHandler?,
-        fullAuto: Bool
+        fullAuto: Bool,
+        ownFileReadPolicy: NativeOwnFileReadPolicy? = nil,
+        botId: String = "",
+        workingDirectory: String = "/"
     ) {
         self.session = session
         self.continuation = continuation
         self.approvalHandler = approvalHandler
         self.fullAuto = fullAuto
+        self.ownFileReadPolicy = ownFileReadPolicy
+        self.botId = botId
+        self.workingDirectory = workingDirectory
     }
 
     func setCodexThreadId(_ id: String) {
@@ -397,8 +420,20 @@ private actor CodexRpcCoordinator {
 
         continuation.yield(.permissionRequest(id: reqId, tool: toolName, description: description))
 
+        // Own-file shell reads never wait for the person when a policy is
+        // injected (upstream #3791); edits, questions and MCP elicitations
+        // always keep the handler path.
+        let isOwnFileRead: Bool = {
+            guard let ownFileReadPolicy, toolName == "shell",
+                  let command = params["command"] as? String else { return false }
+            let cwd = (params["cwd"] as? String) ?? workingDirectory
+            return NativeOwnFileReads.readsOwnFiles(policy: ownFileReadPolicy, botId: botId, command: command, cwd: cwd)
+        }()
+
         let decision: CodexApprovalDecision
-        if fullAuto && method != "item/tool/requestUserInput" {
+        if isOwnFileRead {
+            decision = .accept
+        } else if fullAuto && method != "item/tool/requestUserInput" {
             decision = .accept
         } else if let approvalHandler {
             decision = await approvalHandler(reqId, toolName, description)

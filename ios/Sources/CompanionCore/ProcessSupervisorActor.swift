@@ -260,6 +260,7 @@ public actor ProcessSupervisorActor: EngineProcessLauncher {
 
     public let config: ProcessSupervisorConfig
     private let protocolTee: ProtocolTeeHandler?
+    private let baseEnvironment: [String: String]
     private var activeProcesses: [Int32: SupervisedProcessState] = [:]
     private var pidsByThread: [String: Int32] = [:]
     /// PIDs this supervisor has already reaped.  A late cancel for one of them must not sweep the
@@ -270,10 +271,12 @@ public actor ProcessSupervisorActor: EngineProcessLauncher {
 
     public init(
         config: ProcessSupervisorConfig = .production,
-        protocolTee: ProtocolTeeHandler? = nil
+        protocolTee: ProtocolTeeHandler? = nil,
+        baseEnvironment: [String: String] = ProcessInfo.processInfo.environment
     ) {
         self.config = config
         self.protocolTee = protocolTee
+        self.baseEnvironment = baseEnvironment
     }
 
     public func activeProcessCount() -> Int {
@@ -346,7 +349,7 @@ public actor ProcessSupervisorActor: EngineProcessLauncher {
         posix_spawnattr_setpgroup(&spawnAttr, 0)
 
         let argvStrings = [resolvedPath] + spec.arguments
-        var mergedEnv = ProcessInfo.processInfo.environment
+        var mergedEnv = baseEnvironment
         for (k, v) in spec.environment {
             mergedEnv[k] = v
         }

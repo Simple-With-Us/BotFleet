@@ -37,6 +37,12 @@ public struct MacRenderedMarkdownBlock: Equatable, Identifiable, Sendable {
             self.codePage = nil
             let approxLines = max(1, (text.count + 69) / 70)
             self.estimatedHeight = Double(approxLines) * 20.0 + 12.0
+        case .table(_, _, let rows):
+            self.codePage = nil
+            // The renderers show at most 200 rows; estimate what is drawn,
+            // not what arrived, or one huge table reserves a screenful of
+            // spacer it never fills.
+            self.estimatedHeight = Double(min(rows.count, 200) + 1) * 24.0 + 20.0
         case .rule:
             self.codePage = nil
             self.estimatedHeight = 16.0
@@ -322,6 +328,19 @@ public enum MacBotMascotExpression: String, Codable, CaseIterable, Equatable, Se
         }
     }
 
+    /// Maps the canonical sidebar category onto the full `MacMascotExpression` design vocabulary.
+    public var designExpression: MacMascotExpression {
+        switch self {
+        case .idle: return .idle
+        case .working: return .working
+        case .thinking: return .thinking
+        case .waiting: return .alerting
+        case .happy: return .happy
+        case .error: return .crash
+        case .offline: return .sleeping
+        }
+    }
+
     /// Resolves a bot's live mascot expression from its state, pending cards,
     /// reasoning stream, and connection health.
     public static func resolve(
@@ -342,9 +361,13 @@ public enum MacBotMascotExpression: String, Codable, CaseIterable, Equatable, Se
         if bot.busy == true {
             return .working
         }
-        if let raw = bot.mascotExpression?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
-           let explicit = MacBotMascotExpression(rawValue: raw) {
-            return explicit
+        if let raw = bot.mascotExpression?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            if let explicit = MacBotMascotExpression(rawValue: raw) {
+                return explicit
+            }
+            if let fullExpression = MacMascotExpression(rawValue: raw) {
+                return fullExpression.canonicalCategory
+            }
         }
         return .idle
     }
@@ -518,6 +541,9 @@ public struct MacDesktopCapabilities: Codable, Equatable, Sendable {
 /// Surface 2: Native macOS Settings sections and deep-link router.
 public enum MacSettingsSection: String, CaseIterable, Codable, Hashable, Identifiable, Sendable {
     case general
+    case servers
+    case resources
+    case secrets
     case models
     case voice
     case shortcuts
@@ -529,6 +555,9 @@ public enum MacSettingsSection: String, CaseIterable, Codable, Hashable, Identif
     public var displayTitle: String {
         switch self {
         case .general: return "General"
+        case .servers: return "Servers"
+        case .resources: return "Resources"
+        case .secrets: return "Secrets"
         case .models: return "Models"
         case .voice: return "Voice"
         case .shortcuts: return "Shortcuts"
@@ -540,6 +569,9 @@ public enum MacSettingsSection: String, CaseIterable, Codable, Hashable, Identif
     public var symbolName: String {
         switch self {
         case .general: return "gearshape"
+        case .servers: return "server.rack"
+        case .resources: return "gauge.with.dots.needle.33percent"
+        case .secrets: return "key.horizontal"
         case .models: return "cpu"
         case .voice: return "waveform"
         case .shortcuts: return "command"

@@ -204,12 +204,21 @@ test("the publish guard compares the stamped version, not an empty needs context
   const prepare = workflow.slice(workflow.indexOf("\n  prepare:"), workflow.indexOf("\n  mac:"));
   assert.ok(prepare.length > 0, "the workflow has a prepare job");
 
-  // The release version is stamped from history, not read from package.json:
+  // The release version comes from the shared planner, not from package.json:
   // package.json says 1.0.31, which is the version already installed on the
-  // owner's Mac, so a feed carrying it can never offer an update.
-  assert.match(prepare, /version=\$\(node scripts\/stamp-commit-version\.mjs \.\)/);
-  // The stamp is `git rev-list --count`, which answers 1 on a shallow clone,
-  // so the checkout has to be full depth or every release would number 1.0.1.
+  // owner's Mac, so a feed carrying it can never offer an update (BF-2588).
+  assert.match(prepare, /node scripts\/electron-release-version\.mjs --repo-root \. --sha/);
+  assert.match(prepare, /echo "version=\$app_version" >> "\$GITHUB_OUTPUT"/);
+  assert.match(prepare, /echo "marketing_version=\$marketing_version" >> "\$GITHUB_OUTPUT"/);
+  assert.match(prepare, /echo "build=\$build" >> "\$GITHUB_OUTPUT"/);
+  // The planner reads the App Store Connect inventory, so the plan job needs
+  // the ASC credentials or it cannot plan a build at all.
+  assert.match(prepare, /required: APPLE_API_KEY_ID APPLE_API_ISSUER_ID APPLE_API_KEY_P8_BASE64/);
+  // The retired scheme must be gone from the release path:  it numbered a
+  // build 1.0.<commit_count>, which is not the policy's build number.
+  assert.doesNotMatch(prepare, /stamp-commit-version/);
+  // The stamp is the committer date of the commit, which a shallow clone
+  // cannot prove, so the checkout has to be full depth.
   assert.match(prepare, /fetch-depth: 0/);
   // Inside the prepare job the needs context is empty -- prepare is the first
   // job and depends on nothing -- so needs.prepare.outputs.version rendered
@@ -223,6 +232,43 @@ test("the publish guard compares the stamped version, not an empty needs context
     .join("\n");
   assert.match(prepareCode, /v="v\$\{\{ steps\.pin\.outputs\.version \}\}"/);
   assert.doesNotMatch(prepareCode, /needs\.prepare\.outputs\.version/);
+});
+
+test("the desktop release carries the shared version and build (BF-2588)", () => {
+  // The policy splits the desktop bundle's version in two:  the marketing
+  // version 0.1.0 is what a person sees (CFBundleShortVersionString), and the
+  // build number is the commit's merge stamp (CFBundleVersion).  The app
+  // version carries that build in its patch, because the Electron updater
+  // orders releases by semver on it and by nothing else.
+  const workflow = readFileSync(join(ROOT, ".github/workflows/release.yml"), "utf8").replace(/\r\n/g, "\n");
+  const commitBuild = readFileSync(join(ROOT, ".github/workflows/mac-commit-build.yml"), "utf8").replace(/\r\n/g, "\n");
+  for (const [name, text] of [["release.yml", workflow], ["mac-commit-build.yml", commitBuild]]) {
+    assert.match(text, /BOTFLEET_MARKETING_VERSION=/, `${name} pins the marketing version`);
+    assert.match(text, /-c\.mac\.bundleShortVersion="\$BOTFLEET_MARKETING_VERSION"/, `${name} sets the short version`);
+    assert.match(text, /-c\.mac\.bundleVersion="\$\{\{ needs\.\w+\.outputs\.build \}\}"/, `${name} sets the build number`);
+    assert.match(text, /-c\.extraMetadata\.version="\$BOTFLEET_BUILD_VERSION"/, `${name} sets the app version`);
+    assert.doesNotMatch(text, /stamp-commit-version/, `${name} does not stamp the retired scheme`);
+  }
+  // The Control bundle and the packaged server have to agree on the version,
+  // or the version handshake reads them as different builds.
+  const control = readFileSync(join(ROOT, "electron/build-control-app.mjs"), "utf8");
+  assert.match(control, /CFBundleShortVersionString<\/key><string>\$\{version\}<\/string>/);
+  assert.match(control, /CFBundleVersion<\/key><string>\$\{buildNumber\}<\/string>/);
+  // Wiring alone cannot prove the shipped bytes agree: the stampers are
+  // covered in isolation while nothing reads the packaged app back, so a
+  // Control bundle on the retired number could ride inside a release whose
+  // feed and server carry the merge stamp with every gate green (BF-2531).
+  // Both shippers of an installable Mac app prove the bytes against the pin.
+  assert.match(
+    workflow,
+    /node scripts\/verify-packaged-versions\.mjs "\$\{\{ matrix\.app \}\}" \\\n\s+--version "\$\{\{ needs\.prepare\.outputs\.version \}\}" \\\n\s+--build "\$\{\{ needs\.prepare\.outputs\.build \}\}"/,
+    "release.yml verifies the packaged bundle set against the pinned release",
+  );
+  assert.match(
+    commitBuild,
+    /node scripts\/verify-packaged-versions\.mjs release\/mac-arm64\/BotFleet\.app \\\n\s+--version "\$\{\{ needs\.pin\.outputs\.version \}\}" \\\n\s+--build "\$\{\{ needs\.pin\.outputs\.build \}\}"/,
+    "mac-commit-build.yml verifies the packaged bundle set against the pinned build",
+  );
 });
 
 test("release tags must resolve to the pinned build, including nested annotated tags", async () => {

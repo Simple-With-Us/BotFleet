@@ -15,12 +15,12 @@
 // files follow their implementation file, so a *.test.* / *.node-test.*
 // twin of a covered file is covered.
 //
-// The optional server deployment is audited too, and is a documented
-// exception rather than a finding.  BotFleet may run with the server as the
-// primary BotFleet server (BF-2544), and deploy/linux-server/ ships the SAME
-// server/ code as that optional deployment.  The Mac-local harness is what
-// Phase 6 retires; the optional server path stays, so it is listed in
-// RETAINED_PATHS and reported as retained, never as uncovered.
+// The optional server deployment is audited and remains retained, but it is
+// also a dependent surface: BF-2544 runs the shared server/ source and its UI
+// build, so BF-2515 needs separate preservation evidence before deleting that
+// source; deploy/linux-server/ is inside the audited deploy/ root, retained
+// from inventory findings, and listed in DEPENDENT_PATHS so the dependency is
+// visible in this audit without treating the deployment files as Node ports.
 import { execFileSync } from "node:child_process";
 import { readFileSync, realpathSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
@@ -44,6 +44,33 @@ export const RETAINED_PATHS = [
     why: "the optional Linux server deployment (BF-2544) ships the same server/ code and is deliberately retained",
   },
 ];
+
+/**
+ * Surfaces whose operation depends on audited code targeted for removal: Control
+ * is outside the audited roots; Linux deployment files are inside deploy/ and
+ * retained from inventory findings; listing both here makes their dependencies
+ * visible without changing the inventory's file ownership.
+ */
+export const DEPENDENT_PATHS = [
+  {
+    path: "mac-control/",
+    why: "BotFleet Control's local half is the Mac-local Node stack; its post-Node disposition is Decision 1 in docs/plans/2026-10-29-botfleet-control-after-node.md and the gate's control-disposition evidence (BF-2583)",
+  },
+  {
+    path: "deploy/linux-server/",
+    why: "BF-2544 runs the shared server/ source and built UI; preserve its runtime, UI, update and rollback closure or verify a replacement before BF-2515 deletes shared source (BF-2586)",
+  },
+];
+
+/** The tracked files under each dependent surface, so the CLI can count them. */
+export function dependentFiles(repoRoot) {
+  const out = execFileSync(
+    "git",
+    ["-C", repoRoot, "ls-files", "--", ...DEPENDENT_PATHS.map((entry) => entry.path)],
+    { encoding: "utf8", timeout: 30_000 },
+  );
+  return out.split("\n").filter(Boolean).sort();
+}
 
 /** Expand one `dir/{a,b,c}.ts` claim into the files it names. */
 function expandBraces(token) {
@@ -217,6 +244,13 @@ if (isEntryModule()) {
     const count = files.filter((file) => file.startsWith(entry.path)).length;
     console.log(
       `retained on purpose: ${entry.path} (${count} tracked file(s)) — ${entry.why}`,
+    );
+  }
+  const dependents = dependentFiles(repoRoot);
+  for (const entry of DEPENDENT_PATHS) {
+    const count = dependents.filter((file) => file.startsWith(entry.path)).length;
+    console.log(
+      `depends on the stack being deleted: ${entry.path} (${count} tracked file(s)) — ${entry.why}`,
     );
   }
   if (uncovered.length > 0) {

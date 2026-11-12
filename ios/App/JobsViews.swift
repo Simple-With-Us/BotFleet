@@ -64,6 +64,7 @@ struct JobsPill: View {
                         Image(systemName: "chevron.right")
                             .font(.system(size: 10, weight: .semibold))
                             .foregroundStyle(Color.secondary)
+                            .accessibilityHidden(true)
                     }
                     .padding(.horizontal, 12)
                     .frame(minHeight: 32)

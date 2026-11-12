@@ -109,6 +109,27 @@ public enum MacSentryPolicy {
         return dsn.hasPrefix("https://")
     }
 
+    /// Assembles the desktop options contract when Sentry may activate, or
+    /// returns nil when it must stay inert (no DSN, a non-HTTPS DSN, or a
+    /// test runner).  The Mac app starter feeds the result straight into the
+    /// Sentry SDK, so this assembly is the testable half of the wiring:  the
+    /// activation gate and the release stamp are decided here, not in the
+    /// app target.
+    public static func desktopOptions(
+        dsn: String?,
+        env: [String: String] = ProcessInfo.processInfo.environment,
+        bundleCommit: String? = nil
+    ) -> DesktopSentryOptions? {
+        guard shouldActivateSentry(dsn: dsn, env: env),
+              let dsn = dsn?.trimmingCharacters(in: .whitespacesAndNewlines) else {
+            return nil
+        }
+        return DesktopSentryOptions(
+            dsn: dsn,
+            release: resolveReleaseSHA(env: env, bundleCommit: bundleCommit)
+        )
+    }
+
     /// Captures the standard restrictive Sentry options contract for the native macOS desktop app.
     public struct DesktopSentryOptions: Equatable, Sendable {
         public let dsn: String

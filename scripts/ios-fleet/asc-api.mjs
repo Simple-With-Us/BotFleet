@@ -27,6 +27,8 @@
  *   node asc-api.mjs latest-build-seq <bundleId> <prefix> [platform] [appleId]
  *   node asc-api.mjs latest-marketing-patch <bundleId> <prefix> [platform] [appleId]
  *   node asc-api.mjs build-floor <bundleId> <version> [platform] [appleId]
+ *   node asc-api.mjs plan-release-build <bundleId> [pairedBundleId] [floor...] --merge-stamp <S>
+ *   node asc-api.mjs max-build <bundleId> [platform] [appleId]
  *
  * The version-numbering rules live in ./version-plan.mjs (pure, no I/O); this
  * client only fetches the App Store Connect state they need.
@@ -43,6 +45,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { normalizePrivateKey } from "./asc-key.mjs";
+import { nextSharedBuild } from "./shared-build.mjs";
 import {
   buildFloor,
   isDriftTrain,
@@ -221,7 +224,7 @@ function signJwt({ keyId, issuerId, privateKeyPem }) {
 // Every build of every fleet app shipped with this EMPTY (24 builds checked
 // 2026-08-13; `GET /v1/builds/<id>/betaBuildLocalizations` returns `data: []`,
 // i.e. the en-US row is ABSENT, not blank -- so this must CREATE, not only
-// PATCH). /Users/jay/apps/AGENT-SYNC.md "App Versioning & TestFlight Build
+// PATCH). /Users/jay/apps/FLEET-PROTOCOL.md "App Versioning & TestFlight Build
 // Policy" defines a mandatory template that nothing implemented.
 //
 // PUBLISHING SAFETY. This is the only step in the ship pipeline that writes
@@ -236,7 +239,7 @@ function signJwt({ keyId, issuerId, privateKeyPem }) {
 //
 // A hard deny-list assertion runs on the FULLY RENDERED body: if any internal
 // agent name survives, the upload is skipped entirely rather than publishing a
-// violation (AGENT-SYNC forbids agent names in release notes). Offending
+// violation (FLEET-PROTOCOL forbids agent names in release notes). Offending
 // bullets are dropped whole -- never word-deleted in place, which yields
 // mangled copy like "Fix:  lane".
 const AGENT_NAMES = "grok|claude|monet|codex|antigravity|cursor|kimi|fable|gemini|deepseek|opus|sonnet|haiku";
@@ -248,26 +251,26 @@ const AGENT_NAMES = "grok|claude|monet|codex|antigravity|cursor|kimi|fable|gemin
 // stripped only /^\[[A-Za-z]+\]/ and left "AG" out of the deny-list below on
 // the stated assumption that the strip covered it. It did not: every one of
 // those 48 subjects would have published "[AG]" straight to TestFlight, which
-// AGENT-SYNC's STRICT no-agent-names rule names explicitly.
+// FLEET-PROTOCOL's STRICT no-agent-names rule names explicitly.
 const AGENT_MARKER = new RegExp(`\\[\\s*(?:ag|${AGENT_NAMES})\\s*\\]`, "gi");
 // Bare "AG" stays OUT of the word-boundary deny-list -- as a naked token it
 // fires on ordinary English and on tickers. The bracketed form is unambiguous,
 // so the final rendered-body assertion tests for that form specifically.
 const AGENT_NAME_DENY = new RegExp(`(?:\\b(?:${AGENT_NAMES})\\b|\\[\\s*ag\\s*\\])`, "i");
 
-function centralTimestamp(now = new Date()) {
-  // AGENT-SYNC renders "Mon, Aug 12, 2026 at 1:15 AM CT". One combined
-  // Intl call yields "Mon, Aug 12, 2026, 1:15 AM" (comma, not "at"), so build
-  // the two halves separately. America/Chicago handles CDT/CST automatically.
+export function centralTimestamp(now = new Date()) {
+  // TestFlight "Released:" line: owner's clock in America/Chicago, 12-hour
+  // lowercase am/pm, zone never named (Usage-Monitor #1693).
   const d = new Intl.DateTimeFormat("en-US", {
     timeZone: "America/Chicago",
     weekday: "short", month: "short", day: "numeric", year: "numeric"
   }).format(now);
-  const t = new Intl.DateTimeFormat("en-US", {
+  let t = new Intl.DateTimeFormat("en-US", {
     timeZone: "America/Chicago",
     hour: "numeric", minute: "2-digit", hour12: true
   }).format(now);
-  return `${d} at ${t} CT`;
+  t = t.replace(/\u202F/g, "").replace(/\s*(AM|PM)\s*$/i, (_, ap) => ap.toLowerCase());
+  return `${d} at ${t}`;
 }
 
 function gitSubjects(repoRoot, prevSha) {
@@ -447,6 +450,42 @@ export async function ascAllRows({ api, url }) {
 export function ascErrorText(res) {
   const e = (res?.parsed?.errors || [])[0] || {};
   return `HTTP ${res?.status} ${e.code || ""} ${e.detail || e.title || ""}`.trim();
+}
+
+// One authenticated client for importers (fleet-tf-audit.mjs).  It resolves the
+// credential and signs the JWT exactly as main() does, then hands back the
+// same api(method, path, jsonBody) shape the helpers above take.  Nothing here
+// changes the CLI:  main() keeps its own client.  Key material and the token
+// stay inside the closure and are never returned or printed.
+export function createAscApi({ fetchImpl = fetch } = {}) {
+  const cred = resolveCredential();
+  if (cred.error) return { ok: false, error: cred.error };
+  if (!cred.privateKeyPem) {
+    const notes = RESOLUTION_NOTES.length ? ` Skipped: ${RESOLUTION_NOTES.join("; ")}.` : "";
+    return { ok: false, error: `no App Store Connect credential found.${notes}` };
+  }
+  let token;
+  try {
+    token = signJwt({ keyId: cred.keyId, issuerId: cred.issuerId, privateKeyPem: cred.privateKeyPem });
+  } catch {
+    return { ok: false, error: "could not sign the App Store Connect token with the resolved credential" };
+  }
+  async function api(methodName, apiPath, jsonBody) {
+    const url = apiPath.startsWith("http") ? apiPath : `https://api.appstoreconnect.apple.com${apiPath}`;
+    const res = await fetchImpl(url, {
+      method: methodName,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json"
+      },
+      body: jsonBody ? jsonBody : undefined
+    });
+    const text = await res.text();
+    let parsed;
+    try { parsed = JSON.parse(text); } catch { parsed = { raw: text }; }
+    return { status: res.status, ok: res.ok, parsed, text };
+  }
+  return { ok: true, api, source: cred.source };
 }
 
 export function maskEmail(email) {
@@ -797,7 +836,93 @@ async function setWhatToTest({ api, buildId, appId, marketing }) {
     : `release-notes: POST failed HTTP ${res.status}`);
 }
 
+/**
+ * The arguments of a shared release build plan.
+ *
+ * Parsed and validated on its own, before any credential is resolved, so a
+ * usage mistake is answered as a usage mistake.  A caller that misspells
+ * --platform must not be told it has no App Store Connect credential: that
+ * sends the operator to the wrong place, and the plan is a release step.
+ *
+ * Throws with the message to print; the caller turns that into exit 2.
+ */
+export function parseSharedPlanArgs(command, restArgs) {
+  const usage = `Usage: node asc-api.mjs ${command} <bundleId> [pairedBundleId] [floor...] --merge-stamp <S> [--platform ios|macos]`;
+  const bundleId = restArgs[0] || "";
+  if (!bundleId || bundleId.startsWith("--")) {
+    throw new Error(usage);
+  }
+  // A pure-integer arg is a floor, not a bundle id (bundle ids are never
+  // bare integers), so a caller with no paired app passes only floors.
+  // --merge-stamp S (or --merge-stamp=S) carries the merge stamp.
+  let macBundleId = "";
+  let platform = "";
+  let platformFlagSeen = false;
+  const floorArgs = [];
+  let mergeStamp = "";
+  const rest = restArgs.slice(1);
+  for (let i = 0; i < rest.length; i++) {
+    const arg = rest[i];
+    if (arg === "--platform") {
+      platformFlagSeen = true;
+      platform = rest[i + 1] || "";
+      i++;
+    } else if (arg.startsWith("--platform=")) {
+      platformFlagSeen = true;
+      platform = arg.slice("--platform=".length);
+    } else if (arg === "--merge-stamp") {
+      mergeStamp = rest[i + 1] || "";
+      i++;
+    } else if (arg.startsWith("--merge-stamp=")) {
+      mergeStamp = arg.slice("--merge-stamp=".length);
+    } else if (arg.startsWith("--")) {
+      throw new Error(usage);
+    } else if (/^[0-9]+$/.test(arg)) {
+      floorArgs.push(arg);
+    } else if (!macBundleId) {
+      macBundleId = arg;
+    } else {
+      throw new Error(usage);
+    }
+  }
+  if (!/^[1-9][0-9]{11}$/.test(mergeStamp)) {
+    throw new Error(`${command}: --merge-stamp must be a 12-digit YYYYMMDDHHMM string`);
+  }
+  if (platform && platform !== "ios" && platform !== "macos") {
+    throw new Error(`${command}: --platform must be ios or macos (got "${platform}")`);
+  }
+  // A --platform with no value is a caller mistake, not a request for the
+  // legacy plan.  Falling through would plan the legacy max + 1 build and
+  // split the iOS and Mac builds of one commit by one, silently.
+  if (platformFlagSeen && !platform) {
+    throw new Error(`${command}: --platform requires a value (ios or macos)`);
+  }
+  // Floors stay strings: an 18-digit Sparkle floor is past Number's safe
+  // range, and the planner compares them as BigInt.
+  const extraFloors = [];
+  for (const f of floorArgs) {
+    if (!/^[0-9]+$/.test(f)) {
+      throw new Error(`${command}: floor ${JSON.stringify(f)} is not a non-negative integer`);
+    }
+    extraFloors.push(f);
+  }
+  return { bundleId, macBundleId, platform, extraFloors, mergeStamp };
+}
+
 async function main() {
+  const [method, path, body, arg4, arg5] = process.argv.slice(2);
+  // The plan commands validate their arguments BEFORE any credential is
+  // resolved.  A usage mistake must be answered as a usage mistake: telling
+  // the operator that they have no credential when they misspelled a flag
+  // sends them to the wrong place, and the plan is a release step.
+  if (method === "plan-release-build" || method === "next-shared-build") {
+    try {
+      parseSharedPlanArgs(method, process.argv.slice(3));
+    } catch (error) {
+      console.error(error.message);
+      process.exit(2);
+    }
+  }
   const cred = resolveCredential();
   if (cred.error) {
     console.error(`asc-auth: ${cred.error}`);
@@ -820,7 +945,6 @@ async function main() {
   console.error(`asc-auth: using ${cred.source} (key id length ${cred.keyId.length})`);
   const token = signJwt({ keyId: cred.keyId, issuerId: cred.issuerId, privateKeyPem: cred.privateKeyPem });
 
-  const [method, path, body, arg4, arg5] = process.argv.slice(2);
   if (!method || !path) {
     console.error("Usage: node asc-api.mjs <METHOD> <PATH> [JSON_BODY]");
     console.error("       node asc-api.mjs ensure-tf-ready <bundleId> <buildVersion> [marketingVersion] [appleId]");
@@ -829,6 +953,8 @@ async function main() {
     console.error("       node asc-api.mjs latest-build-seq <bundleId> <prefix> [platform] [appleId]");
     console.error("       node asc-api.mjs latest-marketing-patch <bundleId> <prefix> [platform] [appleId]");
     console.error("       node asc-api.mjs build-floor <bundleId> <version> [platform] [appleId]");
+    console.error("       node asc-api.mjs plan-release-build <bundleId> [pairedBundleId] [floor...] --merge-stamp <S>");
+    console.error("       node asc-api.mjs max-build <bundleId> [platform] [appleId]");
     process.exit(1);
   }
 
@@ -1073,6 +1199,54 @@ async function main() {
   const ASC_VERSION_RE = /^\d+(\.\d+)*$/;
   // v === String(v) admits only a primitive string (a number or null fails).
   const validVersion = (v) => v === String(v) && ASC_VERSION_RE.test(v);
+
+  // Every build version of one app on one platform, across all trains, fully
+  // paged.  Fails closed (exits) on an unavailable, malformed or truncated
+  // inventory, never a partial list presented as whole.  Shared by the
+  // release-build planner and max-build below.
+  async function allBuilds(forAppId, platform, logPrefix) {
+    // A non-null non-array object, in the same hand-written idiom as isAscRow
+    // (this client is dependency-free, so no zod; no typeof either, which the
+    // lint baseline refuses).
+    const isRecord = (v) => Object.prototype.toString.call(v) === "[object Object]";
+    const out = [];
+    let url = `/v1/builds?filter[app]=${forAppId}&filter[preReleaseVersion.platform]=${platform}&limit=200`;
+    for (let page = 0; page < 100 && url; page++) {
+      const res = await ascGet(url);
+      if (!res.ok) {
+        console.error(`${logPrefix}: inventory unavailable`);
+        failExit(res.status);
+      }
+      if (!isRecord(res.parsed)) {
+        console.error(`${logPrefix}: malformed pagination`);
+        process.exit(2);
+      }
+      if (!Array.isArray(res.parsed.data)) {
+        console.error(`${logPrefix}: inventory unavailable`);
+        failExit(res.status);
+      }
+      for (const b of res.parsed.data) out.push(b?.attributes?.version);
+      const links = res.parsed.links;
+      if (links !== undefined) {
+        if (!isRecord(links)) {
+          console.error(`${logPrefix}: malformed pagination`);
+          process.exit(2);
+        }
+        const nextUrl = links.next;
+        // String(x) === x is true only for a string primitive (see isAscRow).
+        if (nextUrl !== undefined && nextUrl !== null && String(nextUrl) !== nextUrl) {
+          console.error(`${logPrefix}: malformed pagination`);
+          process.exit(2);
+        }
+      }
+      url = res.parsed.links?.next || "";
+    }
+    if (url) {
+      console.error(`${logPrefix}: incomplete pagination`);
+      process.exit(2);
+    }
+    return out;
+  }
 
   // Every build of one train, page by page.  Used when the train's inline
   // build list is truncated, so a drift train is never mistaken for an
@@ -1324,65 +1498,118 @@ async function main() {
     process.exit(0);
   }
 
-  // Next dotted build for a fixed marketing version M.m.p:  the train's builds
-  // must be M.m.<n>, and the next one is M.m.<max n + 1>; an empty train starts
-  // at M.m.p, so the first build reads like its version (1.1.2 (1.1.2)).  A
-  // train that holds any build of another shape stops the run with the reason,
-  // because the ordering between shapes (239 is 239.0.0, above 1.1.2) is not
-  // something to guess.  READ ONLY.
+  // Read-only, fully paged shared merge-timestamp build (owner, Oct 29 2026):
+  // build = max(S, M + 1), where S is the merge stamp (--merge-stamp, the
+  // committer date of HEAD in America/Chicago as YYYYMMDDHHMM) and M is the
+  // highest first numeric component among every iOS build and every macOS
+  // build on ALL trains (expired included, timestamp-style builds included)
+  // plus every extra floor.  A paired bundle id joins BOTH platforms of the
+  // second app to the same max.  READ ONLY.
   //
-  // Two ships at once would read the same train and pick the same n.  The CI
-  // ship is serialised (ios-ship.yml concurrency group, cancel-in-progress
-  // false), and a duplicate CFBundleVersion is refused by App Store Connect at
-  // upload, so the loser fails loudly and nothing is promoted.  Do not run a
-  // local ship while the workflow is running.
-  if (method === "next-dotted-build") {
-    const bundleId = path;
-    const version = body;
-    const platform = String(arg4 || "IOS").toUpperCase();
-    const vm = /^(\d+)\.(\d+)\.(\d+)$/.exec(version || "");
-    if (!bundleId || !vm) {
-      console.error("Usage: node asc-api.mjs next-dotted-build <bundleId> <M.m.p> [platform=IOS]");
+  // plan-release-build is the name the release workflow's plan-build job and
+  // the ship script call; next-shared-build is the same command under its
+  // original name.  Both run this one function, so a local plan and the CI
+  // plan can never disagree.
+  //
+  // Two ships at once would read the same inventory and pick the same build.
+  // The CI ship is serialised (ios-ship.yml concurrency group,
+  // cancel-in-progress false), and a duplicate CFBundleVersion is refused by
+  // App Store Connect at upload, so the loser fails loudly and nothing is
+  // promoted.  Do not run a local ship while the workflow is running.
+  async function planSharedReleaseBuild(command, restArgs) {
+    let parsed;
+    try {
+      parsed = parseSharedPlanArgs(command, restArgs);
+    } catch (error) {
+      console.error(error.message);
       process.exit(2);
     }
-    const appleIdHint = String(arg5 || process.env.ASC_APPLE_ID || "").trim();
-    const { appId } = await resolveAscAppId(bundleId, appleIdHint, "next-dotted-build");
+    const { bundleId, macBundleId, platform, extraFloors, mergeStamp } = parsed;
+    // No positional appleId slot: the floors are variadic.  A hint set in the
+    // environment still applies through resolveAscAppId.
+    const { appId } = await resolveAscAppId(bundleId, "", command);
     if (!appId) {
-      console.error(`next-dotted-build: app not found for bundle ${bundleId}`);
+      console.error(`${command}: app not found`);
       process.exit(2);
     }
-    const prefix = `${vm[1]}.${vm[2]}.`;
-    let max = -1;
-    let seen = 0;
-    let nextUrl =
-      `/v1/builds?filter[app]=${appId}` +
-      `&filter[preReleaseVersion.version]=${encodeURIComponent(version)}` +
-      `&filter[preReleaseVersion.platform]=${encodeURIComponent(platform)}&limit=200`;
-    for (let page = 0; page < 10 && nextUrl; page++) {
-      const res = await ascGet(nextUrl);
-      if (!res.ok) {
-        console.error(`next-dotted-build: train builds query failed (HTTP ${res.status})`);
-        failExit(res.status);
+    let macAppId = "";
+    if (macBundleId && macBundleId !== bundleId) {
+      const macResolved = await resolveAscAppId(macBundleId, "", command);
+      if (!macResolved.appId) {
+        console.error(`${command}: paired app not found`);
+        process.exit(2);
       }
-      for (const b of res.parsed.data || []) {
-        const bv = b?.attributes?.version;
-        const bm = typeof bv === "string" && bv.startsWith(prefix) ? /^\d+$/.exec(bv.slice(prefix.length)) : null;
-        if (!bm) {
-          console.error(`next-dotted-build: train ${version} holds build ${JSON.stringify(bv ?? null)}, which is not ${prefix}<n>; not guessing how it orders against a dotted build`);
-          process.exit(3);
-        }
-        seen += 1;
-        max = Math.max(max, parseInt(bm[0], 10));
-      }
-      nextUrl = res.parsed.links?.next || "";
+      macAppId = macResolved.appId;
     }
-    if (nextUrl) {
-      console.error("next-dotted-build: more than 10 pages of builds in one train; refusing to guess");
+    // The paired app contributes BOTH platforms, like the app itself: the two
+    // records are one product, so an iOS build on either one joins the max.
+    // The inventories are independent, so they are read concurrently.  Each
+    // read still pages to the same cap and fails closed when the list runs
+    // past it (see allBuilds), never truncated.
+    let iosBuilds;
+    let macBuilds;
+    if (macAppId) {
+      const [iosA, macA, iosB, macB] = await Promise.all([
+        allBuilds(appId, "IOS", command),
+        allBuilds(appId, "MAC_OS", command),
+        allBuilds(macAppId, "IOS", command),
+        allBuilds(macAppId, "MAC_OS", command)
+      ]);
+      iosBuilds = iosA.concat(iosB);
+      macBuilds = macA.concat(macB);
+    } else {
+      const [iosA, macA] = await Promise.all([
+        allBuilds(appId, "IOS", command),
+        allBuilds(appId, "MAC_OS", command)
+      ]);
+      iosBuilds = iosA;
+      macBuilds = macA;
+    }
+    try {
+      const planned = nextSharedBuild({ iosBuilds, macBuilds, extraFloors, complete: true, mergeStamp, platform: platform || undefined });
+      console.error(`${command}: ${iosBuilds.length} iOS build(s) + ${macBuilds.length} macOS build(s) inspected; merge stamp ${mergeStamp}; next is ${planned.build}`);
+      console.log(planned.build);
+    } catch (error) {
+      console.error(`${command}: ${error.message}`);
+      process.exit(3);
+    }
+  }
+  if (method === "plan-release-build" || method === "next-shared-build") {
+    await planSharedReleaseBuild(method, process.argv.slice(3));
+    process.exit(0);
+  }
+
+  // The highest first numeric component among every build of one app on one
+  // platform, across all trains.  The ship script uses it to check an
+  // operator --build in fixed mode against THIS platform only, so the paired
+  // platform may reuse the same value.  Prints nothing when the app has no
+  // builds yet.  READ ONLY.
+  if (method === "max-build") {
+    const bundleId = path;
+    const platformArg = String(body || "IOS").toUpperCase();
+    const platform = platformArg === "MACOS" || platformArg === "MAC_OS" ? "MAC_OS" : "IOS";
+    if (!bundleId) {
+      console.error("Usage: node asc-api.mjs max-build <bundleId> [platform] [appleId]");
       process.exit(2);
     }
-    const next = Math.max(max + 1, parseInt(vm[3], 10));
-    console.error(`next-dotted-build: ${seen} build(s) in train ${version}; next is ${prefix}${next}`);
-    console.log(`${prefix}${next}`);
+    const appleIdHint = String(arg4 || process.env.ASC_APPLE_ID || "").trim();
+    const { appId, appsStatus } = await resolveAscAppId(bundleId, appleIdHint, "max-build");
+    if (!appId) {
+      console.error(`max-build: app not found for bundle (HTTP ${appsStatus})`);
+      failExit(appsStatus);
+    }
+    const builds = await allBuilds(appId, platform, "max-build");
+    let best = null;
+    for (const version of builds) {
+      if (!validVersion(version)) {
+        console.error("max-build: malformed build version in inventory");
+        process.exit(2);
+      }
+      const first = BigInt(String(version).split(".")[0]);
+      if (best === null || first > best) best = first;
+    }
+    console.error(`max-build: ${builds.length} ${platform} build(s) inspected; max is ${best === null ? "none" : String(best)}`);
+    console.log(best === null ? "" : String(best));
     process.exit(0);
   }
 

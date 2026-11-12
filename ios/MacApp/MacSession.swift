@@ -19,12 +19,25 @@ public enum MacConnectionStatus: Equatable, Sendable {
         return false
     }
 
-    public var statusColor: Color {
+    public var statusPillKind: MacStatusPillKind {
         switch self {
+        case .connected:
+            return .connected
+        case .connecting:
+            return .reconnecting
+        case .disconnected:
+            return .offline
+        case .failed:
+            return .error
+        }
+    }
+
+    public var statusColor: Color {
+        switch statusPillKind {
         case .connected: return .green
-        case .connecting: return .yellow
-        case .disconnected: return .gray
-        case .failed: return .red
+        case .reconnecting: return .yellow
+        case .offline: return .gray
+        case .error: return .red
         }
     }
 
@@ -57,7 +70,7 @@ public protocol MacSessionSourceProtocol: AnyObject {
     var activeReasoningText: String? { get }
     var unreadSummary: MacUnreadBadgeSummary { get }
 
-    func connect(host: String, port: Int)
+    func connect(host: HostRecord)
     func disconnect()
     @discardableResult
     func sendMessage(_ text: String) async -> Bool
@@ -75,8 +88,10 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     }
     @Published public var selectedThreadId: String?
     @Published public var isSending: Bool = false
-    @Published public var host: String = "127.0.0.1"
-    @Published public var port: Int = 8799
+    @Published public private(set) var host: String = "127.0.0.1"
+    @Published public private(set) var port: Int = 8799
+    public let servers: ServersCoordinator
+    public let resources: ResourcesCoordinator
 
     // Lifecycle & Remote Wake state (BF-2497)
     @Published public var lifecycleSettings = MacLifecycleSettings()
@@ -84,6 +99,30 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     /// The last lifecycle-save failure, so the Settings panel can say why the
     /// toggles went back to their previous values.
     @Published public var lifecycleErrorMessage: String?
+
+    // Native companion listener lifecycle (BF-2590, the lifecycle half of BF-2511)
+    /// What the native companion listener is doing, mirrored from the
+    /// controller so the Settings section observes it.
+    @Published public var companionListenerState: CompanionListenerState = .off
+    /// Whether the person turned the native companion listener on.  Off by
+    /// default until the native pairing contract lands.
+    @Published public var companionListenerEnabled: Bool = false
+    /// Owns the listener's start and stop; the backend opens the app's store
+    /// only on the first start, so nothing is created while the setting is off.
+    public let companionListener: CompanionListenerController
+
+    // Native engine composition (sole-writer handoff from AG).  The
+    // supervisor is owned here so its supervised-process count is readable
+    // even before the listener first starts; the engine turns are read
+    // through the listener-built runtime below.  Together they feed the
+    // graceful-stop drain counters (AG busy-flag note).
+    private let nativeProcessSupervisor: ProcessSupervisorActor
+    private let nativeRuntimeBox: MacNativeRuntimeBox
+    /// Native engine work currently in flight on the listener graph, for the
+    /// server-bridge session state.  Zero until the listener first starts.
+    @Published public private(set) var nativeBusy = MacNativeBusySnapshot()
+    /// What the last quit-time native drain did, in the owner's words.
+    @Published public private(set) var nativeDrainSummary: String?
 
     // CUA Live Stream & Safety state (BF-2499)
     @Published public var showCuaViewer: Bool = false
@@ -100,6 +139,9 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     /// The composer's text.  The session owns it so the menubar can compose
     /// and dictate without a view in the window being the source of truth.
     @Published public var composerDraft: String = ""
+    /// Published model windows, keyed by instance and model.  Empty until a
+    /// conversation asks for them.
+    @Published public private(set) var modelWindows: [String: Int] = [:]
     /// Bumped whenever something asks the composer to take the keyboard.
     @Published public var composerFocusToken: Int = 0
 
@@ -114,6 +156,7 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
 
     private var client: CompanionClient?
     private var streamTask: Task<Void, Never>?
+    private var connectionGeneration = UUID()
     private var reconnectAttempt = 0
     private let policyStore: MacPersistencePolicyStore
     private let permissionMonitor: CuaPermissionMonitor
@@ -135,12 +178,83 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
         permissionMonitor: CuaPermissionMonitor = CuaPermissionMonitor()
     ) {
         self.policyStore = policyStore
+        let hostStore = HostStore(fileURL: policyStore.dataDir.appendingPathComponent("hosts.json"))
+        self.servers = ServersCoordinator(store: hostStore)
+        self.resources = ResourcesCoordinator(store: hostStore)
+        self.resources.observeHosts(from: self.servers)
         self.permissionMonitor = permissionMonitor
         if let localPersist = policyStore.readPersistOnExit() {
             self.lifecycleSettings = MacLifecycleSettings(
                 allowRemoteDesktopLaunch: nil,
                 persistOnExit: localPersist
             )
+        }
+        // BF-2511's acceptance has landed: durable device credentials
+        // (digest-only `devices.json`, revocation, the fleet cap), Origin
+        // rejection on every device route, and the pairing contract now
+        // stand between a network peer and this listener.  So the LAN
+        // opt-in and the Bonjour advertisement turn on together here —
+        // and only together: both read the one explicit opt-in
+        // (`OMB_COMPANION_ALLOW_CLEARTEXT_LAN`, as the Node sidecar reads
+        // it), and with nothing configured the listener still binds
+        // loopback and advertises nothing a phone could not connect to.
+        // The listener itself also stays off until it is turned on.
+        let lanPolicy = CompanionLANPolicy.read()
+        let listenerOptions = NativeCompanionServer.ListenerOptions(
+            allowCleartextLAN: lanPolicy.allowCleartextLAN
+        )
+        let advertisement = listenerOptions.allowCleartextLAN
+            ? CompanionListenerController.defaultAdvertisement(computerName: Host.current().localizedName)
+            : nil
+        let storeURL = policyStore.dataDir
+            .appendingPathComponent("native", isDirectory: true)
+            .appendingPathComponent("companion.sqlite")
+        // The paired fleet's durable home, beside the listener's store:
+        // digests only, so a paired phone survives an app restart.
+        let deviceStoreURL = storeURL.deletingLastPathComponent()
+            .appendingPathComponent("devices.json")
+        // Session-owned composition pieces: the supervisor is created now
+        // (no disk I/O) and injected into the listener graph on first start,
+        // so the session reads the one supervised-process count its drain
+        // counters use.  The box ferries the built runtime back out for
+        // quit-time drain; it stays empty while the setting is off, and an
+        // empty box honestly reads as nothing to drain.
+        let nativeProcessSupervisor = ProcessSupervisorActor()
+        let nativeRuntimeBox = MacNativeRuntimeBox()
+        self.nativeProcessSupervisor = nativeProcessSupervisor
+        self.nativeRuntimeBox = nativeRuntimeBox
+        let backend = NativeCompanionListenerBackend(port: 0, options: listenerOptions) {
+            // A store of the listener's own, under the Mac's data directory,
+            // created only when the listener is first turned on.  Where the
+            // native engine's store finally lives is BF-2504's call; this
+            // path is provisional and named in the BF-2590 PR.
+            try FileManager.default.createDirectory(
+                at: storeURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let database = try DatabaseService(path: storeURL.path)
+            // Inject the native runtime so the wait routes serve instead of
+            // answering 503, with workspaces confined beside the store.  The
+            // server retains the runtime (and through it the graph's actors);
+            // the listener stays default-off and stop stays socket-only.
+            let workspacesRoot = storeURL.deletingLastPathComponent()
+                .appendingPathComponent("workspaces", isDirectory: true)
+            let macRuntime = NativeMacCompanionRuntime(
+                database: database,
+                workspacesRoot: workspacesRoot,
+                processSupervisor: nativeProcessSupervisor
+            )
+            nativeRuntimeBox.store(macRuntime)
+            return NativeCompanionServer(database: database, deviceStoreURL: deviceStoreURL, nativeRuntime: macRuntime.runtime)
+        }
+        self.companionListener = CompanionListenerController(
+            backend: backend,
+            policyStore: policyStore,
+            advertisement: advertisement
+        )
+        self.companionListenerEnabled = self.companionListener.isEnabled
+        self.companionListener.onStateChange = { [weak self] state in
+            self?.companionListenerState = state
         }
         // Registering the notification categories is not asking for
         // permission:  the permission prompt stays lazy, at the first event
@@ -528,43 +642,38 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     /// A reconnect never clears the deliberate-stop sentinel: the marker is the
     /// only thing keeping the launchd `StartInterval` tick from resurrecting a
     /// harness the operator stopped on purpose.  Only `launch()` clears it.
-    public func connect(host: String = "127.0.0.1", port: Int = 8799) {
-        self.host = host
-        self.port = port
+    public func connect() {
+        guard servers.isLoaded, let local = servers.hosts.first(where: \.isLocal) else { return }
+        connect(host: local)
+    }
+
+    public func connect(host record: HostRecord) {
+        // Remote enrollment does not opt the app into remote chat or actions.
+        guard record.isLocal, let connection = try? record.companionConnection() else {
+            status = .failed("Choose This Mac to connect.")
+            return
+        }
+        self.host = connection.host
+        self.port = connection.port
         disconnect()
 
         if didDeliberatelyStopServer {
             // The harness was deliberately stopped in this session, so a
             // reconnect would only hammer a server that is meant to stay down.
-            status = .failed("Server was deliberately stopped. Start the harness to reconnect.")
+            status = .failed("Server was deliberately stopped.\u{00A0} Start the harness to reconnect.")
             return
         }
 
         status = .connecting
 
-        let normalizedHost = Connection.urlHost(host)
-        guard let url = URL(string: "http://\(normalizedHost):\(port)"),
-              let endpoint = CompanionEndpoint(url: url.absoluteString, kind: .lan, priority: 1) else {
-            status = .failed("Invalid server URL: http://\(normalizedHost):\(port)")
-            return
-        }
-
-        let connection = Connection(
-            name: "Local Mac",
-            host: host,
-            port: port,
-            activeEndpoint: endpoint,
-            endpoints: [endpoint],
-            allowedRouteKinds: [.lan, .bonjour, .hosted],
-            allowedLocalRouteURLs: [endpoint.url]
-        )
-
         // Local loopback does not require a bearer token in dev mode
-        let client = CompanionClient(connection: connection, token: nil)
+        let client = CompanionClient(connection: connection, token: nil, hostOrigin: record.origin)
         self.client = client
+        servers.connectedRecordID = record.id
+        let generation = connectionGeneration
 
         streamTask = Task { [weak self] in
-            await self?.runConnectionLoop(client: client, endpoint: "\(host):\(port)")
+            await self?.runConnectionLoop(client: client, endpoint: record.origin.url.absoluteString, generation: generation)
         }
     }
 
@@ -572,12 +681,124 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     ///
     /// The launch clears the deliberate-stop sentinel so the launchd wrapper is
     /// allowed to start or supervise the harness again.
-    public func launch(host: String = "127.0.0.1", port: Int = 8799) {
-        if !hasLaunched {
-            hasLaunched = true
-            _ = try? policyStore.clearStoppedMarker(for: .appLaunch)
+    public func launch() {
+        guard !hasLaunched else { return }
+        hasLaunched = true
+        _ = try? policyStore.clearStoppedMarker(for: .appLaunch)
+        // The native companion listener starts with the app when the
+        // setting is on; off by default, so this is a no-op today.
+        Task { @MainActor [weak self] in
+            await self?.companionListener.applyLaunch()
         }
-        connect(host: host, port: port)
+        let generation = connectionGeneration
+        Task { [weak self] in
+            guard let self else { return }
+            await MacLocalConnectionBootstrap.run(
+                loadHosts: {
+                    await self.servers.load()
+                    return self.servers.isLoaded ? self.servers.hosts : nil
+                },
+                isCurrent: { self.connectionGeneration == generation && !self.didDeliberatelyStopServer },
+                connect: { self.connect(host: $0) }
+            )
+        }
+    }
+
+    /// Turns the native companion listener on or off from Settings.  The
+    /// setting is written before the listener moves, and a refusal is shown
+    /// on the same line the other lifecycle toggles use.
+    public func setCompanionListenerEnabled(_ enabled: Bool) async {
+        do {
+            try await companionListener.setEnabled(enabled)
+            companionListenerEnabled = companionListener.isEnabled
+            lifecycleErrorMessage = nil
+        } catch {
+            companionListenerEnabled = companionListener.isEnabled
+            lifecycleErrorMessage = "The companion listener setting could not be saved: \(error.localizedDescription)"
+        }
+        await refreshNativeBusyState()
+    }
+
+    // MARK: - Native Engine Composition (drain counters + graceful stop)
+
+    /// Reads the current native busy snapshot for the server-bridge session
+    /// state: engine turns from the listener graph's coordinator and
+    /// supervised processes from the session-owned supervisor.  Zero while
+    /// the listener has never started.
+    public func refreshNativeBusyState() async {
+        let engineTurns = await nativeRuntimeBox.runtime?.activeEngineTurnCount() ?? 0
+        let processes = await nativeProcessSupervisor.activeProcessCount()
+        nativeBusy = MacNativeBusySnapshot(engineTurns: engineTurns, supervisedProcesses: processes)
+    }
+
+    /// Reads the snapshot without publishing it, for the drain path.
+    private func readNativeBusySnapshot() async -> MacNativeBusySnapshot {
+        let engineTurns = await nativeRuntimeBox.runtime?.activeEngineTurnCount() ?? 0
+        let processes = await nativeProcessSupervisor.activeProcessCount()
+        return MacNativeBusySnapshot(engineTurns: engineTurns, supervisedProcesses: processes)
+    }
+
+    /// Bounded graceful drain of the native runtime for app termination.
+    ///
+    /// Fences admission first so the bounded wait converges, waits for the
+    /// in-flight native turns and processes to settle, then runs the
+    /// terminal runtime shutdown which stops what remains and flushes the
+    /// stores.  Both phases are bounded: quit replies and proceeds even if a
+    /// cancelled engine task never exits, because a hung quit is worse than
+    /// a shutdown that finishes behind it.  A listener that never started
+    /// drains trivially.  This never runs on window close: a persisted
+    /// window close keeps the listener up, and the terminal shutdown would
+    /// make a later listener start fail.
+    public func drainNativeEnginesForTermination(
+        deadlineMs: Double = MacNativeComposition.drainDeadlineMs,
+        pollMs: Double = MacNativeComposition.drainPollMs,
+        shutdownAckTimeoutMs: Double = MacNativeComposition.shutdownAckTimeoutMs
+    ) async -> MacNativeDrainResult {
+        guard let macRuntime = nativeRuntimeBox.runtime else {
+            let result = MacNativeDrainResult(settledCleanly: true)
+            nativeDrainSummary = result.summary
+            return result
+        }
+        // Fence first: no new wait dispatches while the bounded wait runs,
+        // so the counters it watches can actually reach zero.  In-flight
+        // engine turns keep running until they settle or are stopped below.
+        // This is the right layer for this composition: the app dispatches
+        // native turns only through the wait queue, which this shutdown
+        // fences, and supervised processes stop through the engine
+        // cancellations the terminal shutdown below performs.
+        await macRuntime.runtime.shutdown()
+        var result = await MacNativeGracefulDrain.drain(
+            deadlineMs: deadlineMs,
+            pollMs: pollMs,
+            readSnapshot: { [weak self] in await self?.readNativeBusySnapshot() ?? MacNativeBusySnapshot() }
+        )
+        // The terminal phase runs detached and only acknowledged: awaiting
+        // it directly would hang quit past the bounded window when a
+        // cancelled engine task never exits.
+        let shutdownAck = MacNativeShutdownAck()
+        let runtime = macRuntime.runtime
+        Task.detached(priority: .utility) {
+            do {
+                try await runtime.shutdownAndDrain()
+                await shutdownAck.acknowledge(success: true)
+            } catch {
+                NSLog("Native runtime shutdown failed: %@", error.localizedDescription)
+                await shutdownAck.acknowledge(success: false)
+            }
+        }
+        let ackedCleanly = await MacNativeGracefulDrain.waitUntil(
+            deadlineMs: shutdownAckTimeoutMs,
+            pollMs: pollMs,
+            condition: { await shutdownAck.isAcknowledged }
+        )
+        let shutdownSucceeded = await shutdownAck.didSucceed
+        result.didShutDownRuntime = ackedCleanly && shutdownSucceeded
+        if !ackedCleanly {
+            NSLog("Native runtime shutdown did not answer before quitting; proceeding with termination.")
+        }
+        await refreshNativeBusyState()
+        nativeDrainSummary = result.summary
+        return result
     }
 
     /// Observes the close of the app's main window.
@@ -659,15 +880,17 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     }
 
     public func disconnect() {
+        connectionGeneration = UUID()
         streamTask?.cancel()
         streamTask = nil
         client = nil
+        servers.connectedRecordID = nil
         status = .disconnected
         syncSystemSurfaces(force: true)
     }
 
-    private func runConnectionLoop(client: CompanionClient, endpoint: String) async {
-        while !Task.isCancelled {
+    private func runConnectionLoop(client: CompanionClient, endpoint: String, generation: UUID) async {
+        while !Task.isCancelled && connectionGeneration == generation {
             do {
                 // The roster snapshot and the lifecycle settings are fetched once
                 // per successful connection.  Fetching the settings on the
@@ -677,23 +900,25 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
                 try await MacHarnessConnectionCycle.connect(
                     fetchFleet: { try await client.fleet() },
                     hydrate: { [weak self] fleet in
-                        guard let self else { return }
+                        guard let self, self.connectionGeneration == generation, !Task.isCancelled else { return }
                         self.state.hydrate(fleet)
                         if self.selection == nil, let first = fleet.bots.first {
                             self.selection = .bot(first.id)
                         }
                     },
                     refreshLifecycleSettings: { [weak self] in
-                        await self?.refreshLifecycleSettings()
+                        guard let self, self.connectionGeneration == generation, !Task.isCancelled else { return }
+                        await self.refreshLifecycleSettings()
                     }
                 )
+                guard connectionGeneration == generation, !Task.isCancelled else { return }
                 self.status = .connected(endpoint: endpoint)
                 self.reconnectAttempt = 0
                 self.syncSystemSurfaces(force: true)
 
                 let stream = try client.events(since: state.cursor, screens: true)
                 for try await frame in stream {
-                    if Task.isCancelled { break }
+                    if Task.isCancelled || connectionGeneration != generation { break }
                     self.state.apply(frame)
                     if case let .notify(notification) = frame.frame {
                         self.handleNotificationFrame(notification)
@@ -705,12 +930,12 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
                     self.syncSystemSurfaces()
                 }
             } catch {
-                if Task.isCancelled { break }
+                if Task.isCancelled || connectionGeneration != generation { break }
                 reconnectAttempt += 1
                 let baseBackoff = min(Double(reconnectAttempt) * 1.5, 10.0)
                 let jitter = Double.random(in: -0.2...0.2) * baseBackoff
                 let backoff = max(1.0, baseBackoff + jitter)
-                status = .failed("Connection lost. Retrying in \(Int(backoff))s…")
+                status = .failed("Connection lost.\u{00A0} Retrying in \(Int(backoff))s…")
                 syncSystemSurfaces(force: true)
                 try? await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
             }
@@ -771,8 +996,10 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     }
 
     public func refreshLifecycleSettings() async {
+        let generation = connectionGeneration
         let lifecycleClient = makeLifecycleClient()
         guard let fetched = try? await lifecycleClient.fetchLifecycleSettings() else { return }
+        guard connectionGeneration == generation, !Task.isCancelled else { return }
         // A grant the harness did not report stays unknown, so the next save
         // never writes back a `false` the app never read.
         var merged = fetched
@@ -825,17 +1052,27 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     /// closing the SwiftUI window does not terminate the app, so the policy has
     /// to be evaluated here as well as on termination.
     public func handleWindowClose() async {
-        await applyExitPolicy()
+        await applyExitPolicy(for: .mainWindowClosed)
     }
 
     /// Applies the exit policy when the app terminates.
+    ///
+    /// The native engine graph drains first, inside its bounded window, so
+    /// in-flight turns settle or are stopped and flushed before the listener
+    /// socket closes and the harness shuts down.
     public func handleAppTermination() async {
         triggerCuaEmergencyStop()
-        await applyExitPolicy()
+        await drainNativeEnginesForTermination()
+        await applyExitPolicy(for: .appTerminating)
     }
 
-    private func applyExitPolicy() async {
+    private func applyExitPolicy(for event: CompanionListenerExitEvent) async {
         let persist = policyStore.readPersistOnExit() ?? lifecycleSettings.persistOnExit
+        // The native listener reads the setting the same way the harness
+        // shutdown does: it stays up through a window close that keeps the
+        // server running, and stops when the server is shut down or the app
+        // quits.
+        await companionListener.applyExitPolicy(event, persistOnExit: persist)
         guard MacLifecycleClient.evaluateQuitAction(persistOnExit: persist) == .shutDownServerAndVM else {
             return
         }
@@ -957,6 +1194,42 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     /// The emergency-stop confirmation is sticky, so the asynchronous
     /// "stream stopped" update that lands right after an emergency stop cannot
     /// replace the safety message the operator just triggered.
+    func contextCommands(botId: String, threadId: String) async -> [ContextMeterMath.Command]? {
+        guard let client else { return nil }
+        return try? await client.contextCommands(botId: botId, threadId: threadId, surface: "desktop")
+    }
+
+    func catalogWindow(instanceId: String, model: String) -> Int? {
+        modelWindows["\(instanceId)\u{1e}\(model)"]
+    }
+
+    func refreshModelWindows() async {
+        guard let client else { return }
+        guard let list = try? await client.instanceList() else { return }
+        var next: [String: Int] = [:]
+        for instance in list.instances {
+            for option in instance.models.options {
+                if let window = option.contextWindow, window > 0 {
+                    next["\(instance.instanceId)\u{1e}\(option.id)"] = window
+                }
+            }
+        }
+        modelWindows = next
+    }
+
+    /// Nil means compact started.  A string is the reason it did not.
+    func compactSession(botId: String, commandId: String, threadId: String) async -> String? {
+        guard let client else { return ContextMeterMath.unavailable }
+        do {
+            try await client.runContextCommand(botId: botId, id: commandId, threadId: threadId, surface: "desktop")
+            return nil
+        } catch {
+            let message = (error as? LocalizedError)?.errorDescription?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let message, !message.isEmpty { return message }
+            return ContextMeterMath.unavailable
+        }
+    }
+
     private func setCuaStatus(_ status: MacCuaStatus) {
         cuaStatusState.record(status)
         cuaStatusMessage = cuaStatusState.current?.message

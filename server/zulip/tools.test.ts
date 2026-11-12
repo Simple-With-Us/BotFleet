@@ -83,12 +83,12 @@ describe("the HTTP tool host", () => {
       zulip: {
         send: async (request) => {
           seen.push(request);
-          return { ok: true, text: "Following #agent-sync > BF watch." };
+          return { ok: true, text: "Following #Work-In-Progress > BF watch." };
         },
       },
     });
     const outcome = await host.execute(
-      { id: "c1", name: "zulip_follow_topic", arguments: { channel: "agent-sync", topic: "BF watch", follow: true, botId: "bot-other" } },
+      { id: "c1", name: "zulip_follow_topic", arguments: { channel: "Work-In-Progress", topic: "BF watch", follow: true, botId: "bot-other" } },
       runtime,
     );
     expect(outcome).toMatchObject({ kind: "result", detail: "changed" });

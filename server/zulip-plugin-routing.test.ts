@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { FakeZulip } from "./testing/fake-zulip-server.ts";
-import { ZulipHub, type ZulipHubDeps, type ZulipPluginDecision, type ZulipSession } from "./zulip/hub.ts";
+import { ZulipHub, type ZulipHubDeps, type ZulipPluginDecision, type ZulipPluginEventInput, type ZulipSession } from "./zulip/hub.ts";
 import type { ZulipMessage, ZulipSettings } from "./zulip/types.ts";
 
 const JAY = 9;
@@ -28,6 +28,8 @@ let starters: Map<string, string>;
 let logs: string[];
 let nextDecision: ZulipPluginDecision | null;
 let decideCalls: number;
+/** The envelope the plugin platform was asked to route. */
+let decideInputs: ZulipPluginEventInput[];
 
 async function waitFor(predicate: () => boolean, what: string, ms = 5_000): Promise<void> {
   const deadline = Date.now() + ms;
@@ -72,8 +74,9 @@ function makeHub(over: Partial<ZulipHubDeps> = {}): ZulipHub {
     },
     pluginEvents: {
       isActive: () => true,
-      decide: async () => {
+      decide: async (input) => {
         decideCalls += 1;
+        decideInputs.push(input);
         return nextDecision;
       },
     },
@@ -110,6 +113,15 @@ function mention(id: number): ZulipMessage {
   };
 }
 
+/** Jay's channel-wide broadcast:  the bot was called out with the channel. */
+function broadcast(id: number): ZulipMessage {
+  return {
+    ...mention(id),
+    content: "@**all** please check this",
+    flags: ["stream_wildcard_mentioned"],
+  };
+}
+
 beforeEach(async () => {
   fake = new FakeZulip();
   fake.heartbeatMs = 50;
@@ -136,6 +148,7 @@ beforeEach(async () => {
   logs = [];
   nextDecision = null;
   decideCalls = 0;
+  decideInputs = [];
 });
 
 afterEach(async () => {
@@ -166,6 +179,19 @@ describe("plugin-routed Zulip wakes", () => {
     expect(turns[0]?.botId).toBe("bot-director");
     expect(turns[0]?.text).toContain("[PLUGIN ROUTE from BF-Plumber");
     expect(turns[0]?.text).toContain("reply in builds");
+  });
+
+  it("reports a broadcast as a mention that carries the bot's role", async () => {
+    const hub = makeHub();
+    await connected(hub, "bot-plumber");
+    await hub.routeMessage(sessionOf(hub, "bot-plumber"), broadcast(907));
+    await hub.drain();
+    expect(decideInputs).toHaveLength(1);
+    // A broadcast is mention-like, so the envelope says "mention" and names
+    // the bot it woke:  a mention reason with an empty mentions list would
+    // read as a wake with no mention behind it.
+    expect(decideInputs[0]?.wakeReason).toBe("mention");
+    expect(decideInputs[0]?.mentions).toEqual(["BF-Plumber"]);
   });
 
   it("falls back to the legacy wake when the plugin declines", async () => {

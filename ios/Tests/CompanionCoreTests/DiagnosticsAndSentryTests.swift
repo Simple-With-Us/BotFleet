@@ -58,11 +58,15 @@ final class DiagnosticsAndSentryTests: XCTestCase {
             "ghp_" + "12345678901234567890",
             "github_" + "pat_" + "12345678901234567890",
             "xox" + "b-" + "123456789012-" + "1234567890123",
+            "xapp-" + "12345678901234567890",
             "sk_" + "live_" + "12345678",
             "ak_" + "1234567890123456",
             "whsec_" + "12345678",
             "ya29." + "1234",
             "glpat-" + "12345678",
+            "gldt-" + "12345678",
+            "glrt-" + "12345678",
+            "glrtr-" + "12345678",
             "A" + "KIA" + "IOSFODNN7EXAMPLE",
             "A" + "Iza" + "SyD-1234567890abcdefghijklmnopqr",
             "npm_" + "12345678901234567890",
@@ -74,6 +78,22 @@ final class DiagnosticsAndSentryTests: XCTestCase {
             XCTAssertFalse(redacted.contains(token), "Failed to redact token \(token)")
             XCTAssertTrue(redacted.contains("«redacted \(token.count) chars»"), "Incorrect mask for token \(token)")
         }
+    }
+
+    func testCredentialTokenPatternsMirrorRedactShapes() {
+        // Tripwire against drift: every shape in Redact.credentialTokenPatternSources
+        // must have a counterpart here, or DiagnosticsReporter.redactSecrets emits
+        // it in the clear. The regex flavors differ (lookbehind vs \b), so this
+        // pins the prefixes, not the sources.
+        let sources = DiagnosticsReporter.credentialTokenPatterns.joined(separator: "\n")
+        for prefix in ["xapp-", "gldt-", "glrtr?-"] {
+            XCTAssertTrue(sources.contains(prefix), "DiagnosticsReporter is missing the \(prefix) shape")
+        }
+        XCTAssertEqual(
+            DiagnosticsReporter.credentialTokenPatterns.count,
+            Redact.credentialTokenPatternSources.count,
+            "Pattern lists drifted: add the new shape to DiagnosticsReporter too"
+        )
     }
 
     // MARK: - Config Summary Flattening & Filtering Tests
@@ -222,5 +242,41 @@ final class DiagnosticsAndSentryTests: XCTestCase {
         XCTAssertFalse(MacSentryPolicy.shouldActivateSentry(dsn: "", env: [:]))
         XCTAssertFalse(MacSentryPolicy.shouldActivateSentry(dsn: "http://insecure.com/123", env: [:]))
         XCTAssertTrue(MacSentryPolicy.shouldActivateSentry(dsn: "https://key@o1.ingest.sentry.io/123", env: [:]))
+    }
+
+    func testDesktopOptionsAssemblesRestrictiveContractWithReleaseStamp() {
+        let contract = MacSentryPolicy.desktopOptions(
+            dsn: " https://key@o1.ingest.sentry.io/123 ",
+            env: ["SENTRY_RELEASE": "724425968dcc"]
+        )
+
+        XCTAssertEqual(contract?.dsn, "https://key@o1.ingest.sentry.io/123")
+        XCTAssertEqual(contract?.environment, "production")
+        XCTAssertEqual(contract?.release, "724425968dcc")
+        XCTAssertEqual(contract?.sendDefaultPii, false)
+        XCTAssertEqual(contract?.attachScreenshot, false)
+        XCTAssertEqual(contract?.attachViewHierarchy, false)
+        XCTAssertEqual(contract?.sessionReplayMaskAllText, true)
+        XCTAssertEqual(contract?.sessionReplayMaskAllImages, true)
+    }
+
+    func testDesktopOptionsStaysInertWithoutUsableDSN() {
+        XCTAssertNil(MacSentryPolicy.desktopOptions(dsn: "", env: [:]))
+        XCTAssertNil(MacSentryPolicy.desktopOptions(dsn: nil, env: [:]))
+        XCTAssertNil(MacSentryPolicy.desktopOptions(dsn: "http://insecure.com/123", env: [:]))
+        XCTAssertNil(MacSentryPolicy.desktopOptions(
+            dsn: "https://key@o1.ingest.sentry.io/123",
+            env: ["XCTestConfigurationFilePath": "/tmp/Test.xctestconfiguration"]
+        ))
+    }
+
+    func testDesktopOptionsFallsBackToBundleCommitForRelease() {
+        let contract = MacSentryPolicy.desktopOptions(
+            dsn: "https://key@o1.ingest.sentry.io/123",
+            env: [:],
+            bundleCommit: "fedcba0987654321"
+        )
+
+        XCTAssertEqual(contract?.release, "fedcba0987654321")
     }
 }

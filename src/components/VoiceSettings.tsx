@@ -94,7 +94,7 @@ const personalName = (id: string) => id.replace(/^(personal|apple-personal):/, "
 export const deviceVoicesSupported = (bot: Bot): boolean => bot.voices !== undefined;
 
 export const DEVICE_VOICES_NEED_UPDATE =
-  "The iPhone uses this voice too.\u00A0 A separate iPhone voice needs an update to the bot server on this computer.";
+  "The iPhone uses this voice too.\u00A0 Update BotFleet on this computer to pick a separate iPhone voice.";
 
 /** A per-device override counts only when it is a non-blank string, the
  * same rule voiceForDevice applies. */

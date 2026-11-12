@@ -1,6 +1,32 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
-import { stateWithSpeech } from "./mascot";
+import { ROLE_TIERS, stateForBot, stateWithSpeech } from "./mascot";
+
+describe("stateForBot role tiers", () => {
+  it("matches the iOS app's tiers word for word and in order", () => {
+    // A bot has to wear the same face on the phone as on the laptop, so the
+    // Swift port may not add, drop or reorder a tier on its own.
+    const swift = readFileSync(new URL("../../ios/App/MascotState.swift", import.meta.url), "utf8");
+    const ios = [...swift.matchAll(/if matches\((\[[^\]]*\])\) \{ return \.(\w+) \}/g)].map(
+      ([, words, state]) => [state, JSON.parse(words) as string[]],
+    );
+    expect(ios).toEqual(ROLE_TIERS.map(([state, words]) => [state, [...words]]));
+  });
+
+  it("matches whole words, including the full form of a role", () => {
+    expect(stateForBot({ name: "Orchestrator" })).toBe("fleet");
+    expect(stateForBot({ name: "Bot", title: "fleet orchestration" })).toBe("fleet");
+    // A word that only contains a keyword is not a match.
+    expect(stateForBot({ name: "Pricing analyst" })).toBe("idle");
+  });
+
+  it("lets the specific TV-Face tiers win over the general ones", () => {
+    expect(stateForBot({ name: "Builder", description: "build and deploy" })).toBe("git");
+    expect(stateForBot({ name: "UI designer" })).toBe("screen");
+    expect(stateForBot({ name: "Coder", description: "writes software" })).toBe("working");
+  });
+});
 
 describe("stateWithSpeech", () => {
   it("draws the bot that is speaking as speaking", () => {

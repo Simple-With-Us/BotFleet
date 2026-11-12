@@ -42,8 +42,8 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-# Sections 1-11 test the unchanged next-patch behaviour, so they run a copy of
-# the fleet dir whose apps.json carries no fixed-version keys.  Section 12 tests
+# Sections 1-12 test the unchanged next-patch behaviour, so they run a copy of
+# the fleet dir whose apps.json carries no fixed-version keys.  Section 13 tests
 # the keys on their own copy.
 LEGACY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ios-fleet-legacy.XXXXXX")"
 cp -R "$SCRIPT_DIR/." "$LEGACY_DIR/"
@@ -54,6 +54,9 @@ d = json.load(open(p))
 for a in d["apps"].values():
     a.pop("fixedMarketingVersion", None)
     a.pop("buildCountSeed", None)
+    a.pop("macBundleId", None)
+    a.pop("pairedBundleId", None)
+    a.pop("pairedBuildFeed", None)
 json.dump(d, open(p, "w"), indent=2)
 PY
 SHIP="${LEGACY_DIR}/ship-testflight.sh"
@@ -107,7 +110,7 @@ cmd=""
 for a in "\$@"; do
   case "\$a" in
     */asc-api.mjs) cmd="asc-api" ;;
-    latest-marketing-patch|build-floor|released-store-version|next-dotted-build)
+    latest-marketing-patch|build-floor|released-store-version|next-shared-build|plan-release-build|max-build)
       if [[ "\$cmd" == "asc-api" ]]; then cmd="\${cmd}:\${a}"; fi
       ;;
   esac
@@ -126,10 +129,19 @@ case "\$cmd" in
     printf '%s\n' "\${FAKE_RELEASED:-}"
     exit 0
     ;;
-  asc-api:next-dotted-build)
-    [[ "\${FAKE_DOTTED:-}" == "fail" ]] && exit 3
-    [[ -n "\${FAKE_DOTTED:-}" ]] || exit 2
-    printf '%s\n' "\$FAKE_DOTTED"
+  asc-api:next-shared-build|asc-api:plan-release-build)
+    [[ -n "\${FAKE_ARGV_LOG:-}" ]] && printf '%s\n' "\$*" >>"\$FAKE_ARGV_LOG"
+    [[ "\${FAKE_SHARED:-}" == "fail" ]] && exit 3
+    [[ -n "\${FAKE_SHARED:-}" ]] || exit 2
+    printf '%s\n' "\$FAKE_SHARED"
+    exit 0
+    ;;
+  asc-api:max-build)
+    [[ -n "\${FAKE_ARGV_LOG:-}" ]] && printf '%s\n' "\$*" >>"\$FAKE_ARGV_LOG"
+    [[ "\${FAKE_MAXTHIS:-}" == "fail" ]] && exit 3
+    [[ -n "\${FAKE_MAXTHIS:-}" ]] || exit 2
+    [[ "\${FAKE_MAXTHIS:-}" == "empty" ]] && { printf '\n'; exit 0; }
+    printf '%s\n' "\$FAKE_MAXTHIS"
     exit 0
     ;;
   asc-api:build-floor)
@@ -226,7 +238,13 @@ run_ship() {
     FAKE_ASC_PATCH="$FAKE_ASC_PATCH" \
     FAKE_ASC_FLOOR="$FAKE_ASC_FLOOR" \
     FAKE_RELEASED="${FAKE_RELEASED:-}" \
-    FAKE_DOTTED="${FAKE_DOTTED:-}" \
+    FAKE_SHARED="${FAKE_SHARED:-}" \
+    FAKE_MAXTHIS="${FAKE_MAXTHIS:-}" \
+    FAKE_CURL_FAIL="${FAKE_CURL_FAIL:-}" \
+    FAKE_CURL_BODY="${FAKE_CURL_BODY:-}" \
+    FAKE_CURL_ERR="${FAKE_CURL_ERR:-}" \
+    FAKE_CURL_LOG="${FAKE_CURL_LOG:-}" \
+    FAKE_ARGV_LOG="${FAKE_ARGV_LOG:-}" \
     EXPECT_ASC_KEY="$expect_key" \
     bash -c '
       if [[ "${EXPECT_ASC_KEY:-0}" == "1" ]]; then
@@ -676,7 +694,7 @@ SHIP_TMPDIR=""
 FAKE_ASC_PATCH=236
 echo
 
-echo "13. fixed marketing version + dotted build (apps.json fixedMarketingVersion)"
+echo "13. fixed marketing version + shared merge-timestamp build (apps.json fixedMarketingVersion)"
 FIXDIR="${WORK}/fleet-fixed"
 rm -rf "$FIXDIR"; cp -R "$SCRIPT_DIR" "$FIXDIR"
 python3 - "$FIXDIR/apps.json" <<'PY'
@@ -687,35 +705,39 @@ a = d["apps"]
 for k in list(a)[:1]:
     a[k]["fixedMarketingVersion"] = "1.1.2"
     a[k].pop("buildCountSeed", None)
+    a[k].pop("macBundleId", None)
+    a[k].pop("pairedBundleId", None)
+    a[k].pop("pairedBuildFeed", None)
 json.dump(d, open(p, "w"), indent=2)
 PY
 FIXAPP="$(python3 -c 'import json,sys; print(list(json.load(open(sys.argv[1]))["apps"])[0])' "$FIXDIR/apps.json")"
+FIXBUNDLE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["apps"][sys.argv[2]]["bundleId"])' "$FIXDIR/apps.json" "$FIXAPP")"
 SHIP_REAL="$SHIP"; SHIP="${FIXDIR}/ship-testflight.sh"
 rm -f "${STATE}/build-seq-${FIXAPP}.txt" "${STATE}/last-ship-${FIXAPP}.txt"
 write_record "$FIXAPP" 5
-FAKE_ASC_PATCH=239; FAKE_ASC_FLOOR=2383; FAKE_RELEASED=""; FAKE_DOTTED="1.1.2"
+FAKE_ASC_PATCH=239; FAKE_ASC_FLOOR=2383; FAKE_RELEASED=""; FAKE_SHARED="202610290000"; FAKE_MAXTHIS=""
 run_ship "$FIXAPP" --repo-root "$REPO" --dry-run
 planned_pair
 check "fixed: marketing stays 1.1.2 even though ASC holds patch 239 (got '${PLANNED_MARKETING}')" \
   "$([[ "$PLANNED_MARKETING" == "1.1.2" ]] && echo 0 || echo 1)"
-check "fixed: an empty train plans the first build as the version (got '${PLANNED_BUILD}')" \
-  "$([[ "$PLANNED_BUILD" == "1.1.2" ]] && echo 0 || echo 1)"
+check "fixed: an empty inventory plans the stubbed merge-timestamp build (got '${PLANNED_BUILD}')" \
+  "$([[ "$PLANNED_BUILD" == "202610290000" ]] && echo 0 || echo 1)"
 check "fixed: the integer floor and commit count play no part" \
-  "$(contains 'dotted build 1.1.2 for fixed version 1.1.2' && echo 0 || echo 1)"
-FAKE_DOTTED="1.1.3"
+  "$(contains 'shared merge-timestamp build 202610290000 for fixed version 1.1.2' && echo 0 || echo 1)"
+FAKE_SHARED="202610290001"
 run_ship "$FIXAPP" --repo-root "$REPO" --dry-run
 planned_pair
-check "fixed: a train holding 1.1.2 goes to 1.1.3 (got '${PLANNED_BUILD}')" \
-  "$([[ "$PLANNED_BUILD" == "1.1.3" ]] && echo 0 || echo 1)"
-FAKE_DOTTED="fail"
+check "fixed: one above the max plans one higher (got '${PLANNED_BUILD}')" \
+  "$([[ "$PLANNED_BUILD" == "202610290001" ]] && echo 0 || echo 1)"
+FAKE_SHARED="fail"
 run_ship "$FIXAPP" --repo-root "$REPO" --dry-run
-check "fixed: a train with a build of another shape stops the run, nothing guessed" \
-  "$(contains 'cannot work out the next dotted build' && echo 0 || echo 1)"
-FAKE_DOTTED=""
+check "fixed: an unreadable inventory stops the run, nothing guessed" \
+  "$(contains 'cannot work out the next shared merge-timestamp build' && echo 0 || echo 1)"
+FAKE_SHARED=""
 run_ship "$FIXAPP" --repo-root "$REPO" --dry-run
-check "fixed: an unreadable train stops the run" \
-  "$(contains 'cannot work out the next dotted build' && echo 0 || echo 1)"
-FAKE_DOTTED="1.1.2"; FAKE_RELEASED="1.1.2"
+check "fixed: an unreachable inventory stops the run" \
+  "$(contains 'cannot work out the next shared merge-timestamp build' && echo 0 || echo 1)"
+FAKE_SHARED="202610290000"; FAKE_RELEASED="1.1.2"
 run_ship "$FIXAPP" --repo-root "$REPO" --dry-run
 check "fixed: a version at the released App Store version is refused, not bumped" \
   "$(contains 'at or below the released App Store version 1.1.2' && echo 0 || echo 1)"
@@ -723,18 +745,345 @@ FAKE_RELEASED="fail"
 run_ship "$FIXAPP" --repo-root "$REPO" --dry-run
 check "fixed: an unreadable released App Store version stops the run (fail closed)" \
   "$(contains 'cannot read the released App Store version' && echo 0 || echo 1)"
-FAKE_DOTTED="0.1.0"; FAKE_RELEASED=""
-run_ship "$FIXAPP" --repo-root "$REPO" --dry-run --build 7
-check "fixed: an integer --build is refused (it would poison the dotted train)" \
-  "$(contains 'is not 1.1.<n>' && echo 0 || echo 1)"
-run_ship "$FIXAPP" --repo-root "$REPO" --dry-run --build 1.1.9
-check "fixed: a dotted --build of the fixed shape is honoured" \
-  "$([[ "$OUT" != *'is not 1.1.'* ]] && echo 0 || echo 1)"
+# The --build runs below pin HEAD's committer date: the stamp check compares
+# the value against the merge stamp of the commit being shipped, and the
+# shared $REPO stamps "now", which would make these assertions time-dependent.
+# Oct 29 2026 is CDT (UTC-5), so this pins the stamp to 202610290000.
+STAMPREPO="${WORK}/stamp-repo"
+rm -rf "$STAMPREPO"; mkdir -p "$STAMPREPO"
+git -C "$STAMPREPO" init -q 2>/dev/null || git -C "$STAMPREPO" init >/dev/null
+git -C "$STAMPREPO" config user.email test@example.invalid
+git -C "$STAMPREPO" config user.name "stamp test"
+echo seed >"${STAMPREPO}/README"
+git -C "$STAMPREPO" add README
+GIT_COMMITTER_DATE="2026-10-29 00:00:00 -0500" git -C "$STAMPREPO" -c commit.gpgsign=false commit -qm seed
+FAKE_SHARED="202610290001"; FAKE_RELEASED=""; FAKE_MAXTHIS="202610290000"
+run_ship "$FIXAPP" --repo-root "$STAMPREPO" --dry-run --build 1.1.9
+check "fixed: a dotted --build is refused (fixed mode needs a 12-digit merge-timestamp build)" \
+  "$(contains 'fixed mode requires a 12-digit merge-timestamp build' && echo 0 || echo 1)"
+run_ship "$FIXAPP" --repo-root "$STAMPREPO" --dry-run --build 999
+check "fixed: a three-digit --build is refused" \
+  "$(contains 'fixed mode requires a 12-digit merge-timestamp build' && echo 0 || echo 1)"
+run_ship "$FIXAPP" --repo-root "$STAMPREPO" --dry-run --build 202610290000
+check "fixed: a --build equal to this platform's max is refused" \
+  "$(contains 'at or below this platform'"'"'s highest build 202610290000' && echo 0 || echo 1)"
+run_ship "$FIXAPP" --repo-root "$STAMPREPO" --dry-run --build 202610270000
+check "fixed: a --build below this platform's max is refused" \
+  "$(contains 'at or below this platform'"'"'s highest build 202610290000' && echo 0 || echo 1)"
+run_ship "$FIXAPP" --repo-root "$STAMPREPO" --dry-run --build 202610290001
+planned_pair
+check "fixed: a --build above this platform's max is honoured even when it equals the paired platform's build (got '${PLANNED_BUILD}')" \
+  "$([[ "$PLANNED_BUILD" == "202610290001" ]] && echo 0 || echo 1)"
+FAKE_MAXTHIS=""
+run_ship "$FIXAPP" --repo-root "$STAMPREPO" --dry-run --build 202610290001
+check "fixed: an unreadable this-platform max stops --build (fail closed)" \
+  "$(contains 'cannot verify this platform'"'"'s highest build' && echo 0 || echo 1)"
+FAKE_MAXTHIS="empty"
+run_ship "$FIXAPP" --repo-root "$STAMPREPO" --dry-run --build 202610290001
+planned_pair
+check "fixed: with no builds on this platform yet any 12-digit --build at or above the stamp is honoured (got '${PLANNED_BUILD}')" \
+  "$([[ "$PLANNED_BUILD" == "202610290001" ]] && echo 0 || echo 1)"
+# A --build below the merge stamp of the HEAD being shipped was planned for
+# an older commit: refused even when this platform's max would allow it.
+run_ship "$FIXAPP" --repo-root "$STAMPREPO" --dry-run --build 202610280000
+check "fixed: a --build below the HEAD merge stamp is refused with no builds on this platform" \
+  "$(contains 'below the merge stamp 202610290000' && contains 'planned for an older commit' && echo 0 || echo 1)"
+FAKE_MAXTHIS="202610270000"
+run_ship "$FIXAPP" --repo-root "$STAMPREPO" --dry-run --build 202610280000
+check "fixed: a --build above this platform's max but below the HEAD merge stamp is refused" \
+  "$(contains 'below the merge stamp 202610290000' && echo 0 || echo 1)"
+FAKE_MAXTHIS="202610290000"
 run_ship "$FIXAPP" --repo-root "$REPO" --dry-run --version 1.1.2
 planned_pair
 check "fixed: --version equal to the fixed version stays in fixed mode (got '${PLANNED_BUILD}')" \
-  "$([[ "$PLANNED_BUILD" == "0.1.0" ]] && echo 0 || echo 1)"
-SHIP="$SHIP_REAL"; FAKE_ASC_FLOOR=0; FAKE_RELEASED=""; FAKE_DOTTED=""; FAKE_ASC_PATCH=236
+  "$([[ "$PLANNED_BUILD" == "202610290001" ]] && echo 0 || echo 1)"
+# The planner receives HEAD's committer date as the merge stamp (STAMPREPO
+# above pins it to 202610290000).
+FAKE_ARGV_LOG="${WORK}/stamp-argv.log"; : >"$FAKE_ARGV_LOG"
+FAKE_SHARED="202610290000"
+run_ship "$FIXAPP" --repo-root "$STAMPREPO" --dry-run
+check "fixed: the planner receives HEAD's committer date as --merge-stamp 202610290000" \
+  "$(grep -a -q "plan-release-build ${FIXBUNDLE} --merge-stamp 202610290000" "$FAKE_ARGV_LOG" && echo 0 || echo 1)"
+FAKE_ARGV_LOG=""
+python3 - "$FIXDIR/apps.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["apps"]["fixmac"] = {
+  "displayName": "Fixed Mac",
+  "fixedMarketingVersion": "1.1.2",
+  "bundleId": "app.botfleet.fixmac",
+  "scheme": "FixMac",
+  "projectRel": "mac/FixMac.xcodeproj",
+  "platform": "macOS",
+  "marketingVersionDefault": "1.0.0"
+}
+json.dump(d, open(p, "w"), indent=2)
+PY
+FAKE_SHARED="202610290000"; FAKE_RELEASED=""
+rm -f "${STATE}/build-seq-fixmac.txt" "${STATE}/last-ship-fixmac.txt"
+run_ship "fixmac" --repo-root "$REPO" --dry-run
+planned_pair
+check "fixed macOS: marketing stays 1.1.2 (got '${PLANNED_MARKETING}')" \
+  "$([[ "$PLANNED_MARKETING" == "1.1.2" ]] && echo 0 || echo 1)"
+check "fixed macOS: plans the shared merge-timestamp build instead of refusing (got '${PLANNED_BUILD}')" \
+  "$([[ "$PLANNED_BUILD" == "202610290000" ]] && echo 0 || echo 1)"
+check "fixed macOS: logs the shared build line" \
+  "$(contains 'shared merge-timestamp build 202610290000 for fixed version 1.1.2' && echo 0 || echo 1)"
+SHIP="$SHIP_REAL"; FAKE_ASC_FLOOR=0; FAKE_RELEASED=""; FAKE_SHARED=""; FAKE_MAXTHIS=""; FAKE_ASC_PATCH=236
+echo
+
+echo "14. paired build feed + paired bundle id (apps.json pairedBuildFeed / pairedBundleId)"
+# A stub curl: records its argv, then fails with FAKE_CURL_FAIL (a curl exit
+# code, e.g. 28 for a timeout) or serves FAKE_CURL_BODY.  It lands in FAKE_BIN
+# only here, so the earlier sections keep the real curl they never call.
+cat >"${FAKE_BIN}/curl" <<'FAKE'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${FAKE_CURL_LOG:-/dev/null}"
+if [[ -n "${FAKE_CURL_FAIL:-}" ]]; then
+  echo "curl: (${FAKE_CURL_FAIL}) ${FAKE_CURL_ERR:-Simulated curl failure}" >&2
+  exit "${FAKE_CURL_FAIL}"
+fi
+printf '%s' "${FAKE_CURL_BODY:-}"
+FAKE
+chmod +x "${FAKE_BIN}/curl"
+FAKE_CURL_LOG="${WORK}/curl-argv.log"
+FAKE_ARGV_LOG="${WORK}/asc-argv.log"
+: >"$FAKE_CURL_LOG"; : >"$FAKE_ARGV_LOG"
+FEEDDIR="${WORK}/fleet-feed"
+rm -rf "$FEEDDIR"; cp -R "$SCRIPT_DIR" "$FEEDDIR"
+python3 - "$FEEDDIR/apps.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+for k in list(d["apps"])[:1]:
+    d["apps"][k]["fixedMarketingVersion"] = "1.1.2"
+    d["apps"][k].pop("buildCountSeed", None)
+json.dump(d, open(p, "w"), indent=2)
+PY
+FEEDAPP="$(python3 -c 'import json,sys; print(list(json.load(open(sys.argv[1]))["apps"])[0])' "$FEEDDIR/apps.json")"
+FEEDBUNDLE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["apps"][sys.argv[2]]["bundleId"])' "$FEEDDIR/apps.json" "$FEEDAPP")"
+SHIP_REAL="$SHIP"; SHIP="${FEEDDIR}/ship-testflight.sh"
+rm -f "${STATE}/build-seq-${FEEDAPP}.txt" "${STATE}/last-ship-${FEEDAPP}.txt"
+write_record "$FEEDAPP" 5
+set_feed_keys() { # <pairedBundleId> <macBundleId> <pairedBuildFeed> (empty clears)
+  python3 - "$FEEDDIR/apps.json" "$FEEDAPP" "$1" "$2" "$3" <<'PY'
+import json, sys
+p, app, paired, mac, feed = sys.argv[1:6]
+d = json.load(open(p))
+a = d["apps"][app]
+for key, val in (("pairedBundleId", paired), ("macBundleId", mac), ("pairedBuildFeed", feed)):
+    if val:
+        a[key] = val
+    else:
+        a.pop(key, None)
+json.dump(d, open(p, "w"), indent=2)
+PY
+}
+FEED_URL="https://example.invalid/appcast.xml"
+FAKE_RELEASED=""; FAKE_SHARED="202610290005"; FAKE_CURL_FAIL=""; FAKE_CURL_BODY=""; FAKE_CURL_ERR=""
+# pairedBundleId reaches the client as the second arg, ahead of --merge-stamp.
+set_feed_keys "app.example.mac" "" ""
+: >"$FAKE_ARGV_LOG"
+run_ship "$FEEDAPP" --repo-root "$REPO" --dry-run
+planned_pair
+check "paired: pairedBundleId is passed to plan-release-build" \
+  "$(grep -a -E -q "plan-release-build ${FEEDBUNDLE} app.example.mac --merge-stamp [0-9]{12}$" "$FAKE_ARGV_LOG" && echo 0 || echo 1)"
+check "paired: the run still plans the stubbed build (got '${PLANNED_BUILD}')" \
+  "$([[ "$PLANNED_BUILD" == "202610290005" ]] && echo 0 || echo 1)"
+# macBundleId stays an accepted alias.
+set_feed_keys "" "app.example.mac-legacy" ""
+: >"$FAKE_ARGV_LOG"
+run_ship "$FEEDAPP" --repo-root "$REPO" --dry-run
+check "paired: macBundleId is still accepted as the paired id" \
+  "$(grep -a -E -q "plan-release-build ${FEEDBUNDLE} app.example.mac-legacy --merge-stamp [0-9]{12}$" "$FAKE_ARGV_LOG" && echo 0 || echo 1)"
+# pairedBundleId wins when both are set.
+set_feed_keys "app.example.mac" "app.example.mac-legacy" ""
+: >"$FAKE_ARGV_LOG"
+run_ship "$FEEDAPP" --repo-root "$REPO" --dry-run
+_paired_exact="$(grep -a -E -c "plan-release-build ${FEEDBUNDLE} app.example.mac --merge-stamp [0-9]{12}$" "$FAKE_ARGV_LOG" || true)"
+_paired_legacy="$(grep -a -c "mac-legacy" "$FAKE_ARGV_LOG" || true)"
+check "paired: pairedBundleId is preferred over macBundleId" \
+  "$([[ "$_paired_exact" -ge 1 && "$_paired_legacy" -eq 0 ]] && echo 0 || echo 1)"
+# A curl timeout (rc 28) is a feed failure: fail closed, with the URL and
+# curl's stderr in the message -- not an App Store Connect failure.
+set_feed_keys "" "" "$FEED_URL"
+FAKE_CURL_FAIL=28; FAKE_CURL_ERR="Operation timed out after 30000 milliseconds"
+: >"$FAKE_CURL_LOG"
+run_ship "$FEEDAPP" --repo-root "$REPO" --dry-run
+check "feed: a curl timeout fails the run closed (rc=${RC})" "$([[ $RC -ne 0 ]] && echo 0 || echo 1)"
+check "feed: says the shared build cannot be worked out" \
+  "$(contains 'cannot work out the next shared merge-timestamp build' && echo 0 || echo 1)"
+check "feed: the message names the feed URL" \
+  "$(contains "$FEED_URL" && echo 0 || echo 1)"
+check "feed: the message carries curl's stderr" \
+  "$(contains 'Operation timed out' && echo 0 || echo 1)"
+check "feed: the fetch is bounded with connect and max timeouts" \
+  "$(grep -a -q -- '--connect-timeout 10 --max-time 30' "$FAKE_CURL_LOG" && echo 0 || echo 1)"
+check "feed: the fetch pins https and caps the body" \
+  "$(grep -a -q -- '--proto =https --proto-redir =https' "$FAKE_CURL_LOG" && grep -a -q -- '--max-filesize 5000000' "$FAKE_CURL_LOG" && echo 0 || echo 1)"
+check "feed: not reported as an App Store Connect failure" \
+  "$(contains 'App Store Connect could not be' && echo 1 || echo 0)"
+FAKE_CURL_FAIL=""; FAKE_CURL_ERR=""
+# A feed with no numeric <sparkle:version> fails closed and says so.
+FAKE_CURL_BODY='<rss version="2.0"><channel><title>x</title></channel></rss>'
+run_ship "$FEEDAPP" --repo-root "$REPO" --dry-run
+check "feed: no numeric sparkle:version fails the run closed" \
+  "$(contains 'cannot work out the next shared merge-timestamp build' && echo 0 || echo 1)"
+check "feed: the message names the URL and says no numeric version was found" \
+  "$(contains "$FEED_URL" && contains 'no numeric' && echo 0 || echo 1)"
+check "feed: empty feed fails closed (rc=${RC})" "$([[ $RC -ne 0 ]] && echo 0 || echo 1)"
+# The feed's max numeric version joins the counter as a floor arg.
+FAKE_CURL_BODY='<rss><channel><item><sparkle:version>1500</sparkle:version></item><item><sparkle:version>1499</sparkle:version></item></channel></rss>'
+: >"$FAKE_ARGV_LOG"
+run_ship "$FEEDAPP" --repo-root "$REPO" --dry-run
+planned_pair
+check "feed: the max sparkle:version is passed as the floor" \
+  "$(grep -a -E -q "plan-release-build ${FEEDBUNDLE} 1500 --merge-stamp [0-9]{12}$" "$FAKE_ARGV_LOG" && echo 0 || echo 1)"
+check "feed: the run still plans the stubbed build (got '${PLANNED_BUILD}')" \
+  "$([[ "$PLANNED_BUILD" == "202610290005" ]] && echo 0 || echo 1)"
+# Whitespace-padded versions still count: the digits are extracted.
+FAKE_CURL_BODY='<rss><channel><item><sparkle:version>  1501  </sparkle:version></item><item><sparkle:version>1499</sparkle:version></item></channel></rss>'
+: >"$FAKE_ARGV_LOG"
+run_ship "$FEEDAPP" --repo-root "$REPO" --dry-run
+check "feed: whitespace-padded sparkle:version is read as the floor" \
+  "$(grep -a -E -q "plan-release-build ${FEEDBUNDLE} 1501 --merge-stamp [0-9]{12}$" "$FAKE_ARGV_LOG" && echo 0 || echo 1)"
+# A non-https feed is rejected before curl runs.
+set_feed_keys "" "" "http://example.invalid/appcast.xml"
+FAKE_CURL_BODY='<rss><channel><item><sparkle:version>1500</sparkle:version></item></channel></rss>'
+: >"$FAKE_CURL_LOG"
+run_ship "$FEEDAPP" --repo-root "$REPO" --dry-run
+check "feed: non-https URL fails the run closed (rc=${RC})" "$([[ $RC -ne 0 ]] && echo 0 || echo 1)"
+check "feed: non-https rejection names the URL" \
+  "$(contains 'http://example.invalid/appcast.xml' && contains 'https' && echo 0 || echo 1)"
+check "feed: non-https URL never reaches curl" \
+  "$([[ ! -s "$FAKE_CURL_LOG" ]] && echo 0 || echo 1)"
+set_feed_keys "" "" "$FEED_URL"
+# No four-digit cap any more: 9999 is a valid floor and reaches the planner.
+FAKE_CURL_BODY='<rss><channel><item><sparkle:version>9999</sparkle:version></item></channel></rss>'
+: >"$FAKE_ARGV_LOG"
+run_ship "$FEEDAPP" --repo-root "$REPO" --dry-run
+planned_pair
+check "feed: floor 9999 plans the stubbed build (got '${PLANNED_BUILD}')" \
+  "$([[ "$PLANNED_BUILD" == "202610290005" ]] && echo 0 || echo 1)"
+check "feed: floor 9999 reaches the planner" \
+  "$(grep -a -E -q "plan-release-build ${FEEDBUNDLE} 9999 --merge-stamp [0-9]{12}$" "$FAKE_ARGV_LOG" && echo 0 || echo 1)"
+# A 12-digit Sparkle floor is valid and travels exactly, digit for digit.
+FAKE_CURL_BODY='<rss><channel><item><sparkle:version>202610290007</sparkle:version></item></channel></rss>'
+: >"$FAKE_ARGV_LOG"
+run_ship "$FEEDAPP" --repo-root "$REPO" --dry-run
+check "feed: a 12-digit floor reaches the planner exactly" \
+  "$(grep -a -E -q "plan-release-build ${FEEDBUNDLE} 202610290007 --merge-stamp [0-9]{12}$" "$FAKE_ARGV_LOG" && echo 0 || echo 1)"
+# Past 12 digits the floor fails closed: it would plan a build the 12-digit
+# gate rejects, so the run stops with the feed URL and the value.
+FAKE_CURL_BODY='<rss><channel><item><sparkle:version>202610290000000001</sparkle:version></item></channel></rss>'
+run_ship "$FEEDAPP" --repo-root "$REPO" --dry-run
+check "feed: an 18-digit floor fails the run closed (rc=${RC})" "$([[ $RC -ne 0 ]] && echo 0 || echo 1)"
+check "feed: out-of-range 18-digit floor names the URL and the value" \
+  "$(contains "$FEED_URL" && contains '202610290000000001' && contains 'exceeds 12 digits' && echo 0 || echo 1)"
+FAKE_CURL_BODY='<rss><channel><item><sparkle:version>0</sparkle:version></item></channel></rss>'
+run_ship "$FEEDAPP" --repo-root "$REPO" --dry-run
+check "feed: floor 0 fails the run closed (rc=${RC})" "$([[ $RC -ne 0 ]] && echo 0 || echo 1)"
+check "feed: out-of-range zero names the URL" \
+  "$(contains "$FEED_URL" && contains 'outside 1..999999999999' && echo 0 || echo 1)"
+FAKE_CURL_BODY='<rss><channel><item><sparkle:version>1234567890123456789</sparkle:version></item></channel></rss>'
+run_ship "$FEEDAPP" --repo-root "$REPO" --dry-run
+check "feed: a 19-digit floor fails the run closed (rc=${RC})" "$([[ $RC -ne 0 ]] && echo 0 || echo 1)"
+check "feed: out-of-range 19-digit floor names the URL and the value" \
+  "$(contains "$FEED_URL" && contains '1234567890123456789' && contains 'exceeds 12 digits' && echo 0 || echo 1)"
+FAKE_CURL_BODY='<rss><channel><item><sparkle:version>1500</sparkle:version></item><item><sparkle:version>1499</sparkle:version></item></channel></rss>'
+# Paired id and feed floor travel together, in that order.
+set_feed_keys "app.example.mac" "" "$FEED_URL"
+: >"$FAKE_ARGV_LOG"
+run_ship "$FEEDAPP" --repo-root "$REPO" --dry-run
+check "feed: paired id and feed floor travel together" \
+  "$(grep -a -E -q "plan-release-build ${FEEDBUNDLE} app.example.mac 1500 --merge-stamp [0-9]{12}$" "$FAKE_ARGV_LOG" && echo 0 || echo 1)"
+FAKE_CURL_BODY=""
+# A macOS entry names the iOS bundle id as its paired id.
+python3 - "$FEEDDIR/apps.json" "$FEEDBUNDLE" <<'PY'
+import json, sys
+p, ios_bundle = sys.argv[1:3]
+d = json.load(open(p))
+d["apps"]["feedmac"] = {
+  "displayName": "Feed Mac",
+  "fixedMarketingVersion": "1.1.2",
+  "bundleId": "app.example.mac",
+  "pairedBundleId": ios_bundle,
+  "scheme": "FeedMac",
+  "projectRel": "mac/FeedMac.xcodeproj",
+  "platform": "macOS",
+  "marketingVersionDefault": "1.0.0"
+}
+json.dump(d, open(p, "w"), indent=2)
+PY
+rm -f "${STATE}/build-seq-feedmac.txt" "${STATE}/last-ship-feedmac.txt"
+: >"$FAKE_ARGV_LOG"
+run_ship "feedmac" --repo-root "$REPO" --dry-run
+planned_pair
+check "paired: a macOS entry passes the iOS bundle id as the paired id" \
+  "$(grep -a -E -q "plan-release-build app.example.mac ${FEEDBUNDLE} --merge-stamp [0-9]{12}$" "$FAKE_ARGV_LOG" && echo 0 || echo 1)"
+check "paired: the macOS entry still plans the stubbed build (got '${PLANNED_BUILD}')" \
+  "$([[ "$PLANNED_BUILD" == "202610290005" ]] && echo 0 || echo 1)"
+# A macOS entry with no paired id borrows the iOS peer that points at it.
+python3 - "$FEEDDIR/apps.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["apps"]["revmac"] = {
+  "displayName": "Rev Mac",
+  "fixedMarketingVersion": "1.1.2",
+  "bundleId": "app.example.revmac",
+  "scheme": "RevMac",
+  "projectRel": "mac/RevMac.xcodeproj",
+  "platform": "macOS",
+  "marketingVersionDefault": "1.0.0"
+}
+json.dump(d, open(p, "w"), indent=2)
+PY
+rm -f "${STATE}/build-seq-revmac.txt" "${STATE}/last-ship-revmac.txt"
+set_feed_keys "app.example.revmac" "" ""
+: >"$FAKE_ARGV_LOG"
+run_ship "revmac" --repo-root "$REPO" --dry-run
+check "paired: macOS reverse lookup passes the iOS bundle id" \
+  "$(grep -a -E -q "plan-release-build app.example.revmac ${FEEDBUNDLE} --merge-stamp [0-9]{12}$" "$FAKE_ARGV_LOG" && echo 0 || echo 1)"
+set_feed_keys "" "app.example.revmac" ""
+: >"$FAKE_ARGV_LOG"
+run_ship "revmac" --repo-root "$REPO" --dry-run
+check "paired: macOS reverse lookup follows the macBundleId alias" \
+  "$(grep -a -E -q "plan-release-build app.example.revmac ${FEEDBUNDLE} --merge-stamp [0-9]{12}$" "$FAKE_ARGV_LOG" && echo 0 || echo 1)"
+set_feed_keys "" "" ""
+# The client joins both platforms of both apps, concurrently.
+check "union: plan-release-build reads IOS and MAC_OS for both apps via Promise.all" \
+  "$(grep -a -q 'allBuilds(macAppId, "IOS", ' "${SCRIPT_DIR}/asc-api.mjs" && grep -a -q 'allBuilds(macAppId, "MAC_OS", ' "${SCRIPT_DIR}/asc-api.mjs" && grep -a -q 'Promise.all' "${SCRIPT_DIR}/asc-api.mjs" && echo 0 || echo 1)"
+check "union: the planner command exists under both names" \
+  "$(grep -a -q 'method === "plan-release-build"' "${SCRIPT_DIR}/asc-api.mjs" && grep -a -q 'method === "next-shared-build"' "${SCRIPT_DIR}/asc-api.mjs" && echo 0 || echo 1)"
+check "union: no four-digit counter wording remains in the planner, client or ship script" \
+  "$(grep -a -q 'four-digit' "${SCRIPT_DIR}/shared-build.mjs" "${SCRIPT_DIR}/asc-api.mjs" "${SCRIPT_DIR}/ship-testflight.sh" && echo 1 || echo 0)"
+SHIP="$SHIP_REAL"; FAKE_SHARED=""; FAKE_MAXTHIS=""; FAKE_CURL_LOG=""; FAKE_ARGV_LOG=""
+rm -f "${FAKE_BIN}/curl"
+echo
+
+echo "15. --plan-build-only prints the shared build and exits before Xcode"
+SHIP_REAL="$SHIP"; SHIP="${FIXDIR}/ship-testflight.sh"
+rm -f "${STATE}/build-seq-${FIXAPP}.txt" "${STATE}/last-ship-${FIXAPP}.txt"
+FAKE_SHARED="202610290007"; FAKE_RELEASED=""; FAKE_MAXTHIS=""
+mv "${FAKE_BIN}/xcodebuild" "${FAKE_BIN}/xcodebuild.hidden"
+run_ship "$FIXAPP" --repo-root "$REPO" --plan-build-only
+mv "${FAKE_BIN}/xcodebuild.hidden" "${FAKE_BIN}/xcodebuild"
+check "plan: exits 0 with no xcodebuild on PATH" "$([[ $RC -eq 0 ]] && echo 0 || echo 1)"
+check "plan: stdout is exactly the planned build (got '${OUT}')" \
+  "$([[ "$OUT" == "202610290007" ]] && echo 0 || echo 1)"
+FAKE_SHARED="fail"
+run_ship "$FIXAPP" --repo-root "$REPO" --plan-build-only
+check "plan: an unreadable inventory fails closed (rc=${RC})" "$([[ $RC -ne 0 ]] && echo 0 || echo 1)"
+check "plan: says the shared release build cannot be worked out" \
+  "$(contains 'cannot work out the shared release build' && echo 0 || echo 1)"
+FAKE_SHARED="202610290007"
+SHIP="${LEGACY_DIR}/ship-testflight.sh"
+run_ship "botfleet" --repo-root "$REPO" --plan-build-only
+check "plan: without fixedMarketingVersion it refuses instead of guessing" \
+  "$(contains 'no fixedMarketingVersion' && echo 0 || echo 1)"
+SHIP="$SHIP_REAL"; FAKE_SHARED=""; FAKE_MAXTHIS=""
 echo
 
 echo "----------------------------------------"

@@ -426,7 +426,7 @@ test("gateDecision accepts the gate token with no login header", () => {
 test("gateDecision refuses a wrong gate token", () => {
   const decision = gateDecision({
     remoteAddress: "127.0.0.1",
-    headers: { "x-botfleet-gate-token": `${DESKTOP_TOKEN.slice(0, -1)}0` },
+    headers: { "x-botfleet-gate-token": `${DESKTOP_TOKEN.slice(0, -1)}${DESKTOP_TOKEN.endsWith("0") ? "1" : "0"}` },
     owners: new Set(),
     publicOrigin: PUBLIC_ORIGIN,
     tokenSha256,

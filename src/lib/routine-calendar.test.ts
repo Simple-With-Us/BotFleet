@@ -14,6 +14,23 @@ import {
 } from "./routine-calendar";
 import { startOfDayInTimeZone } from "../../shared/time-zone";
 
+/** The clock part of a label is rendered in the host's locale, so the
+ *  expectation is built with the same formatter the label uses.  A hard-coded
+ *  "9:00 AM" only holds on an English twelve-hour host, and the label is
+ *  what the app shows, locale and all. */
+function wallClockLabel(hour: number, minute: number): string {
+  return new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit", timeZone: "UTC" })
+    .format(Date.UTC(2000, 0, 1, hour, minute));
+}
+
+/** The same, for a whole label: the day and the clock are fixed, and only
+ *  the zone abbreviation is allowed to vary between the two spellings ICU
+ *  gives a zone with no name of its own. */
+function labelPattern(day: string, hour: number, minute: number, zone: string): RegExp {
+  const clock = wallClockLabel(hour, minute).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`^${day} at ${clock} (${zone})$`);
+}
+
 function routine(schedule: Routine["schedule"]): Routine {
   return {
     id: "routine",
@@ -71,7 +88,7 @@ describe("routine calendar timezone", () => {
       ...routine({ type: "daily", time: "09:00", weekdays: [1], timeZone: "Europe/Athens" }),
       nextRunAt: Date.parse("2026-07-01T09:00:00Z"),
     };
-    expect(routineScheduleLabel(legacy)).toMatch(/^Mon at 9:00 AM (GMT\+3|EEST)$/);
+    expect(routineScheduleLabel(legacy)).toMatch(labelPattern("Mon", 9, 0, "GMT\\+3|EEST"));
   });
 
   it("keeps the disabled-routine label on a pinned winter instant", () => {
@@ -84,7 +101,7 @@ describe("routine calendar timezone", () => {
       vi.setSystemTime(Date.parse("2026-01-15T09:00:00Z"));
       const disabled = routine({ type: "daily", time: "09:00", weekdays: [1], timeZone: "Europe/Athens" });
       expect(disabled.nextRunAt).toBeNull();
-      expect(routineScheduleLabel(disabled)).toMatch(/^Mon at 9:00 AM (GMT\+2|EET)$/);
+      expect(routineScheduleLabel(disabled)).toMatch(labelPattern("Mon", 9, 0, "GMT\\+2|EET"));
     } finally {
       vi.useRealTimers();
     }
