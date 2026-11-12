@@ -1590,4 +1590,43 @@ struct Phase1StoreImporterAndPerfTests {
         let reloadedBot = reloadedBots.first { $0.id == "bot-1" }
         #expect(reloadedBot?.snoozedUntil == 1_700_001_000)
     }
+
+    @Test("Filtering import by botId excludes snoozes for other bots and avoids false unmapped warnings (BF-2651)")
+    func testFilteredBotImportExcludesOtherBotSnoozes() async throws {
+        let tempDir = try makeTempDir("filtered-bot-snooze-test")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        try populateSourceFixture(in: tempDir)
+
+        // Multiple bot snoozes in routines.json: bot-1 and bot-2.
+        let routinesJson = """
+        {
+          "routines": [],
+          "runs": [],
+          "botSnoozes": {
+            "bot-1": 1700000950000,
+            "bot-2": 1700000960000
+          },
+          "routineRequestReceipts": []
+        }
+        """
+        try Data(routinesJson.utf8).write(to: tempDir.appendingPathComponent("routines.json"))
+
+        let dbPath = tempDir.appendingPathComponent("native.sqlite").path
+        let db = try DatabaseService(path: dbPath)
+        let importer = StoreImporter(batchSize: 10)
+
+        // Import only bot-1.
+        let report = try await importer.importStore(from: tempDir, into: db, filterBotId: "bot-1")
+
+        // bot-1 migrated with its snooze.
+        let bots = try await db.loadBots()
+        let snoozedBot = bots.first { $0.id == "bot-1" }
+        #expect(snoozedBot?.snoozedUntil == 1_700_000_950)
+
+        // bot-2 was filtered out, and its snooze must NOT trigger an unmapped snooze warning.
+        #expect(report.warnings.contains { $0.contains("manual bot snooze") } == false)
+        #expect(report.isParityVerified == true)
+        #expect(report.isFullyVerified == true)
+    }
 }

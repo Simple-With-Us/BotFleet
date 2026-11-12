@@ -795,6 +795,9 @@ public struct StoreImporter: Sendable {
         var botSnoozes: [String: Double?] = [:]
         if let rawSnoozes = root["botSnoozes"] as? [String: Any] {
             for (botId, until) in rawSnoozes {
+                if let filter = filterBotId, botId != filter {
+                    continue
+                }
                 if until is NSNull {
                     botSnoozes[botId] = threadSnoozeUntilActivity
                 } else if let num = until as? NSNumber {
