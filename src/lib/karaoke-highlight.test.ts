@@ -131,33 +131,48 @@ describe("feature detection", () => {
 });
 
 describe("timeline painting", () => {
-  it("dims what is ahead, rolls the current word in, and trails the last one", () => {
+  it("dims what is past the lead, bolds the current word, and eases off ahead and behind", () => {
     const fake = fakeEnv();
     const hl = createKaraokeHighlighter(mount("<p>alpha beta gamma delta</p>"), { env: fake.env });
     hl.play(evenTimeline(4), () => 0);
-    expect(fake.registry.get(KARAOKE_HIGHLIGHT_NAMES.current)?.priority).toBe(3);
+    expect(fake.registry.get(KARAOKE_HIGHLIGHT_NAMES.current)?.priority).toBe(7);
+    expect(fake.registry.get(KARAOKE_HIGHLIGHT_NAMES.roll)?.priority).toBe(8);
 
     hl.renderAt(-1);
     expect(fake.painted("ahead")).toEqual(["alpha", "beta", "delta", "gamma"]);
+    expect(fake.painted("lead")).toEqual([]);
+    expect(fake.painted("trail")).toEqual([]);
 
-    // halfway through "gamma" (600-850): "gam" lit, "ma" still dim, "beta"
-    // (ended at 550) trailing
+    // halfway through "gamma" (600-850): the whole word is bold, "gam" has
+    // rolled in, "delta" leads, and "beta" then "alpha" trail
     hl.renderAt(725);
     expect(hl.currentIndex).toBe(2);
-    expect(fake.painted("current")).toEqual(["gam"]);
-    expect(fake.painted("ahead")).toEqual(["delta", "ma"]);
+    expect(fake.painted("current")).toEqual(["gamma"]);
+    expect(fake.painted("roll")).toEqual(["gam"]);
+    expect(fake.painted("lead")).toEqual(["delta"]);
+    expect(fake.painted("leadFar")).toEqual([]);
     expect(fake.painted("trail")).toEqual(["beta"]);
+    expect(fake.painted("trailMid")).toEqual(["alpha"]);
+    expect(fake.painted("trailFar")).toEqual([]);
+    expect(fake.painted("ahead")).toEqual([]);
 
-    // after the end: nothing dim, nothing current
+    // after the end: the window has lingered out
     hl.renderAt(2000);
     expect(fake.painted("ahead")).toEqual([]);
     expect(fake.painted("current")).toEqual([]);
+    expect(fake.painted("roll")).toEqual([]);
+    expect(fake.painted("lead")).toEqual([]);
     expect(fake.painted("trail")).toEqual([]);
+    expect(fake.painted("trailMid")).toEqual([]);
 
-    // seeking back re-dims
+    // seeking back: "beta" is current, the next two lead, "alpha" trails
     hl.renderAt(310);
-    expect(fake.painted("ahead")).toEqual(["delta", "eta", "gamma"]);
-    expect(fake.painted("current")).toEqual(["b"]);
+    expect(fake.painted("current")).toEqual(["beta"]);
+    expect(fake.painted("roll")).toEqual(["b"]);
+    expect(fake.painted("lead")).toEqual(["gamma"]);
+    expect(fake.painted("leadFar")).toEqual(["delta"]);
+    expect(fake.painted("trail")).toEqual(["alpha"]);
+    expect(fake.painted("ahead")).toEqual([]);
     hl.dispose();
   });
 
@@ -173,6 +188,7 @@ describe("timeline painting", () => {
     hl.renderAt(301);
     expect(fake.painted("current")).toEqual(["gamma"]);
     expect(fake.painted("trail")).toEqual([]);
+    expect(fake.painted("lead")).toEqual([]);
     hl.dispose();
   });
 
@@ -197,7 +213,7 @@ describe("timeline painting", () => {
     hl.play(evenTimeline(3), () => t);
     // Count every write to the highlight registry's sets.
     const writes = { count: 0 };
-    expect(fake.registry.size).toBe(3);
+    expect(fake.registry.size).toBe(8);
     for (const highlight of fake.registry.values()) {
       const add = highlight.add.bind(highlight);
       const remove = highlight.delete.bind(highlight);
@@ -237,7 +253,7 @@ describe("timeline painting", () => {
     const second = createKaraokeHighlighter(mount("<p>second message</p>"), { env: fake.env });
     second.play(evenTimeline(2), () => 0);
     first.stop();
-    expect(fake.registry.size).toBe(3);
+    expect(fake.registry.size).toBe(8);
     second.stop();
     expect(fake.registry.size).toBe(0);
   });
@@ -264,7 +280,10 @@ describe("live cues", () => {
     expect(hl.currentIndex).toBe(2);
     hl.renderAt(1425);
     expect(hl.currentIndex).toBe(4);
-    expect(fake.painted("ahead")).toEqual(["ow"]);
+    expect(fake.painted("current")).toEqual(["now"]);
+    expect(fake.painted("roll")).toEqual(["n"]);
+    expect(fake.painted("ahead")).toEqual([]);
+    expect(fake.painted("trail")).toEqual(["com"]);
     hl.dispose();
   });
 

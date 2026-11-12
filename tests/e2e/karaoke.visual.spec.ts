@@ -6,12 +6,12 @@ import { test, expect, type Locator, type Page } from '@playwright/test';
 // src/components/KaraokeVisualFixture.tsx).  The voice is a stand-in Audio
 // element with a pinned clock, so the frame is the same every run; nothing
 // talks to a harness.
-// - The word being spoken is partly rolled in (accent color, faux-bold
-//   shadow), the word before it trails off, and every other word keeps its
-//   normal ink.
+// - The word being spoken is bold, with the letters rolling in. One or two
+//   words ahead lead, and two or three behind trail off. The rest keeps
+//   its normal ink.
 // - Light (the default) and dark (Midnight), each against a baseline.
-// - A second moment in the reply (another word rolling in) and Reduce
-//   Motion (whole words, no trail), checked through the highlight registry.
+// - A second moment in the reply (another word in the window) and Reduce
+//   Motion (whole words, no lead, no trail), checked through the highlight registry.
 // - Every frame proves the ::highlight() styles paint: the bubble with the
 //   highlights unregistered looks different.
 // - The bubble is exactly as tall while reading as before: no re-flow.
@@ -58,7 +58,12 @@ async function paintedState(page: Page) {
     };
     return {
       current: read('karaoke-current'),
+      roll: read('karaoke-roll'),
+      lead: read('karaoke-lead'),
+      leadFar: read('karaoke-lead-far'),
       trail: read('karaoke-trail'),
+      trailMid: read('karaoke-trail-mid'),
+      trailFar: read('karaoke-trail-far'),
       ahead: read('karaoke-ahead'),
     };
   });
@@ -89,13 +94,18 @@ for (const theme of ['light', 'dark'] as const) {
     const bubble = await openMidReading(page, { query: theme === 'dark' ? '&theme=dark' : '' });
 
     const painted = await paintedState(page);
-    // At 4.8 s into the first sentence "installer" is rolling in, and "the"
-    // before it is still trailing off.
-    expect(painted.current).toHaveLength(1);
-    expect('installer'.startsWith(painted.current[0])).toBe(true);
-    expect(painted.current[0].length).toBeGreaterThan(0);
-    expect(painted.current[0].length).toBeLessThan('installer'.length);
+    // At 4.8 s "installer" is the spoken word. "is" and "signed" lead.
+    // "the", "and" and "try" trail.
+    expect(painted.current).toEqual(['installer']);
+    expect(painted.roll).toHaveLength(1);
+    expect('installer'.startsWith(painted.roll[0])).toBe(true);
+    expect(painted.roll[0].length).toBeGreaterThan(0);
+    expect(painted.roll[0].length).toBeLessThan('installer'.length);
+    expect(painted.lead).toEqual(['is']);
+    expect(painted.leadFar).toEqual(['signed']);
     expect(painted.trail).toEqual(['the']);
+    expect(painted.trailMid).toEqual(['and']);
+    expect(painted.trailFar).toEqual(['try']);
     expect(painted.ahead).toEqual([]);
     await expectNoReflow(bubble);
 
@@ -107,25 +117,35 @@ for (const theme of ['light', 'dark'] as const) {
 }
 
 test('karaoke: another moment in the reply rolls in its own word', async ({ page }) => {
-  // 6.5 s: "ready" is rolling in, and "and" before it trails off.
+  // 6.5 s: "ready" is the spoken word. "to" and "share" lead.
+  // "and", "signed" and "is" trail.
   const bubble = await openMidReading(page, { query: '&t=6.5' });
   const painted = await paintedState(page);
-  expect(painted.current).toHaveLength(1);
-  expect(painted.current[0].length).toBeGreaterThan(0);
-  expect(painted.current[0].length).toBeLessThan('ready'.length);
-  expect('ready'.startsWith(painted.current[0])).toBe(true);
+  expect(painted.current).toEqual(['ready']);
+  expect(painted.roll).toHaveLength(1);
+  expect('ready'.startsWith(painted.roll[0])).toBe(true);
+  expect(painted.roll[0].length).toBeLessThan('ready'.length);
+  expect(painted.lead).toEqual(['to']);
+  expect(painted.leadFar).toEqual(['share']);
   expect(painted.trail).toEqual(['and']);
+  expect(painted.trailMid).toEqual(['signed']);
+  expect(painted.trailFar).toEqual(['is']);
   expect(painted.ahead).toEqual([]);
   await expectNoReflow(bubble);
   await expectHighlightPainted(page, bubble);
 });
 
-test('karaoke: Reduce Motion lights the whole word, with no trail', async ({ page }) => {
+test('karaoke: Reduce Motion lights the whole word, with no lead or trail', async ({ page }) => {
   const bubble = await openMidReading(page, { reducedMotion: 'reduce' });
   const painted = await paintedState(page);
   // The same moment as the baseline frames: the whole word at once.
   expect(painted.current).toEqual(['installer']);
+  expect(painted.roll).toEqual(['installer']);
+  expect(painted.lead).toEqual([]);
+  expect(painted.leadFar).toEqual([]);
   expect(painted.trail).toEqual([]);
+  expect(painted.trailMid).toEqual([]);
+  expect(painted.trailFar).toEqual([]);
   expect(painted.ahead).toEqual([]);
   await expectNoReflow(bubble);
   await expectHighlightPainted(page, bubble);

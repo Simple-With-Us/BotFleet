@@ -9,13 +9,15 @@
 // There is no font-weight change anywhere; "bold" is a text-shadow.
 //
 // The look, per frame:
-//   - words not yet spoken are dimmed (karaoke-ahead);
-//   - the current word rolls in left to right at grapheme granularity over its
-//     duration in the accent color with a faux-bold shadow (karaoke-current);
-//   - words just finished keep a softer accent briefly (karaoke-trail), then
-//     return to their normal ink.
+//   - words not yet spoken, past the lead, are dimmed (karaoke-ahead);
+//   - the current word is the peak: faux bold on the whole word, with the
+//     spoken letters rolling in to the full accent (karaoke-current, karaoke-roll);
+//   - one or two words ahead take a softer bold (karaoke-lead, karaoke-lead-far);
+//   - two or three words just spoken ease off (karaoke-trail and the mid and
+//     far steps).
+// Bold is a text-shadow. It does not change glyph advances.
 // With prefers-reduced-motion the current word steps in whole, there is no
-// trail, and words swept past in under 80 ms are never shown as current.
+// lead and no trail, and words swept past in under 80 ms are never shown.
 //
 // Two ways to drive it:
 //   - play(timeline, clock): display-word times known up front (MiniMax clips,
@@ -31,9 +33,32 @@ import { tokenizeWords, type WordToken } from "../../shared/karaoke-align.ts";
 
 export const KARAOKE_HIGHLIGHT_NAMES = {
   ahead: "karaoke-ahead",
+  lead: "karaoke-lead",
+  leadFar: "karaoke-lead-far",
   current: "karaoke-current",
+  roll: "karaoke-roll",
   trail: "karaoke-trail",
+  trailMid: "karaoke-trail-mid",
+  trailFar: "karaoke-trail-far",
 } as const;
+
+type KaraokeLayer = keyof typeof KARAOKE_HIGHLIGHT_NAMES;
+
+const LAYER_PRIORITY: Record<KaraokeLayer, number> = {
+  ahead: 1,
+  trailFar: 2,
+  trailMid: 3,
+  trail: 4,
+  leadFar: 5,
+  lead: 6,
+  current: 7,
+  roll: 8,
+};
+
+const LEAD_LAYERS = ["lead", "leadFar"] as const satisfies readonly KaraokeLayer[];
+const TRAIL_LAYERS = ["trail", "trailMid", "trailFar"] as const satisfies readonly KaraokeLayer[];
+const DEFAULT_LEAD_WORDS = 2;
+const DEFAULT_TRAIL_WORDS = 3;
 
 /** Subtrees a voice never reads word by word: fenced code (spoken as "a code
  * block"), controls, and anything marked as decoration or opted out. */
@@ -246,8 +271,13 @@ export interface KaraokeHighlightOptions {
   reducedMotion?: boolean;
   /** Dim words not yet spoken.  Default true. */
   dimAhead?: boolean;
-  /** How long a finished word keeps the softer accent.  Default 220 ms. */
+  /** How long the window lingers after the last word. Default 220 ms.
+   * During the read, the trail is the words behind, not this timer. */
   trailMs?: number;
+  /** Words ahead of the one being spoken. Default 2. */
+  leadWords?: number;
+  /** Words behind the one being spoken. Default 3. */
+  trailWords?: number;
   /** Live mode: sweep step and ceiling for skipped words (as the timeline). */
   skipStepMs?: number;
   skipMaxMs?: number;
@@ -306,6 +336,8 @@ export function createKaraokeHighlighter(
   const reducedMotion = options.reducedMotion ?? env.prefersReducedMotion();
   const dimAhead = options.dimAhead ?? true;
   const trailMs = options.trailMs ?? 220;
+  const leadWords = options.leadWords ?? DEFAULT_LEAD_WORDS;
+  const trailWords = options.trailWords ?? DEFAULT_TRAIL_WORDS;
   const skipStep = options.skipStepMs ?? 40;
   const skipMax = options.skipMaxMs ?? 320;
 
@@ -319,13 +351,27 @@ export function createKaraokeHighlighter(
     return wordRanges[index] ?? null;
   };
 
-  let ahead: HighlightLike | null = null;
-  let current: HighlightLike | null = null;
-  let trail: HighlightLike | null = null;
+  const layers: Record<KaraokeLayer, HighlightLike | null> = {
+    ahead: null,
+    lead: null,
+    leadFar: null,
+    current: null,
+    roll: null,
+    trail: null,
+    trailMid: null,
+    trailFar: null,
+  };
   /** Words [aheadFrom, count) have their whole range in `ahead`. */
   let aheadFrom = count;
-  let currentParts: Range[] = [];
-  let trailRanges: Range[] = [];
+  const shown: Record<Exclude<KaraokeLayer, "ahead">, Range[]> = {
+    lead: [],
+    leadFar: [],
+    current: [],
+    roll: [],
+    trail: [],
+    trailMid: [],
+    trailFar: [],
+  };
   let painted = -1;
 
   let timeline = new Float64Array(count * 2);
@@ -341,44 +387,60 @@ export function createKaraokeHighlighter(
   let renderedAt = Number.NaN;
   let dirty = true;
 
+  const layerNames = Object.keys(KARAOKE_HIGHLIGHT_NAMES) as KaraokeLayer[];
+
   const register = (): void => {
     if (!supported || !env.highlights || !env.createHighlight) return;
-    if (!ahead) {
-      ahead = env.createHighlight();
-      ahead.priority = 1;
-      trail = env.createHighlight();
-      trail.priority = 2;
-      current = env.createHighlight();
-      current.priority = 3;
+    if (!layers.ahead) {
+      for (const name of layerNames) {
+        const highlight = env.createHighlight();
+        highlight.priority = LAYER_PRIORITY[name];
+        layers[name] = highlight;
+      }
     }
-    env.highlights.set(KARAOKE_HIGHLIGHT_NAMES.ahead, ahead);
-    env.highlights.set(KARAOKE_HIGHLIGHT_NAMES.trail, trail!);
-    env.highlights.set(KARAOKE_HIGHLIGHT_NAMES.current, current!);
+    for (const name of layerNames) {
+      const highlight = layers[name];
+      if (highlight) env.highlights.set(KARAOKE_HIGHLIGHT_NAMES[name], highlight);
+    }
   };
 
   const unregister = (): void => {
     if (!env.highlights) return;
     // Another message may have taken the names since; only remove our own.
-    if (ahead && env.highlights.get(KARAOKE_HIGHLIGHT_NAMES.ahead) === ahead) {
-      env.highlights.delete(KARAOKE_HIGHLIGHT_NAMES.ahead);
+    for (const name of layerNames) {
+      const highlight = layers[name];
+      if (highlight && env.highlights.get(KARAOKE_HIGHLIGHT_NAMES[name]) === highlight) {
+        env.highlights.delete(KARAOKE_HIGHLIGHT_NAMES[name]);
+      }
     }
-    if (trail && env.highlights.get(KARAOKE_HIGHLIGHT_NAMES.trail) === trail) {
-      env.highlights.delete(KARAOKE_HIGHLIGHT_NAMES.trail);
+  };
+
+  const clearShown = (): void => {
+    for (const name of layerNames) {
+      if (name === "ahead") continue;
+      const highlight = layers[name];
+      if (highlight) {
+        for (const range of shown[name]) highlight.delete(range);
+      }
+      shown[name] = [];
     }
-    if (current && env.highlights.get(KARAOKE_HIGHLIGHT_NAMES.current) === current) {
-      env.highlights.delete(KARAOKE_HIGHLIGHT_NAMES.current);
-    }
+  };
+
+  const show = (name: Exclude<KaraokeLayer, "ahead">, range: Range | null): void => {
+    if (!range) return;
+    layers[name]?.add(range);
+    shown[name].push(range);
   };
 
   const resetPaint = (): void => {
     dirty = true;
-    ahead?.clear();
-    trail?.clear();
-    current?.clear();
-    currentParts = [];
-    trailRanges = [];
+    for (const name of layerNames) layers[name]?.clear();
+    for (const name of layerNames) {
+      if (name !== "ahead") shown[name] = [];
+    }
     painted = -1;
     aheadFrom = count;
+    const ahead = layers.ahead;
     if (dimAhead && ahead) {
       for (let i = 0; i < count; i += 1) {
         const r = wordRange(i);
@@ -406,13 +468,47 @@ export function createKaraokeHighlighter(
   };
 
   const renderAt = (t: number): void => {
-    if (!supported || !ahead || !current || !trail || disposed) return;
+    if (!supported || !layers.ahead || !layers.current || !layers.trail || disposed) return;
     renderedAt = t;
     dirty = false;
     const c = indexAt(t);
-    // Words before c (and c itself) leave the dimmed set as they are reached.
+    const ahead = layers.ahead;
+
+    let speaking = false;
+    let cut = 0;
+    if (c >= 0) {
+      const start = timeline[2 * c];
+      const end = timeline[2 * c + 1];
+      const duration = end - start;
+      const audible = t < end;
+      if (audible && (!reducedMotion || duration >= REDUCED_MOTION_MIN_MS)) {
+        speaking = true;
+        const w = words[c];
+        cut = w.end - w.start;
+        if (!reducedMotion && duration > 0) {
+          const bounds = graphemes[c] ?? (graphemes[c] = graphemeBoundaries(w.text));
+          const steps = bounds.length - 1;
+          const progress = Math.max(0, Math.min(1, (t - start) / duration));
+          // At least the first grapheme is lit as soon as the word starts.
+          cut = bounds[Math.max(1, Math.min(steps, Math.ceil(progress * steps)))];
+        }
+      }
+    }
+
+    const more = c >= 0 && c + 1 < count && Number.isFinite(timeline[2 * (c + 1)]);
+    const lingerOver = c >= 0 && !speaking && !more && t - timeline[2 * c + 1] >= trailMs;
+    const showWindow = !reducedMotion && c >= 0 && !lingerOver;
+    const leadIndexes: number[] = [];
+    if (showWindow) {
+      for (let i = c + 1; i < count && leadIndexes.length < leadWords; i += 1) {
+        if (timeline[2 * i] > t) leadIndexes.push(i);
+      }
+    }
+    const leadEnd = leadIndexes.length > 0 ? leadIndexes[leadIndexes.length - 1] + 1 : c + 1;
+    const firstAhead = c < 0 ? 0 : Math.min(count, Math.max(c + 1, leadEnd));
+
+    // Words already reached, the current word, and the lead leave the dimmed set.
     if (dimAhead) {
-      const firstAhead = c + 1;
       if (firstAhead > aheadFrom) {
         for (let i = aheadFrom; i < Math.min(firstAhead, count); i += 1) {
           const r = wordRange(i);
@@ -427,59 +523,27 @@ export function createKaraokeHighlighter(
       aheadFrom = Math.max(0, Math.min(firstAhead, count));
     }
 
-    for (const r of currentParts) {
-      current.delete(r);
-      ahead.delete(r);
-    }
-    currentParts = [];
+    clearShown();
     painted = -1;
-    if (c >= 0) {
-      const start = timeline[2 * c];
-      const end = timeline[2 * c + 1];
-      const duration = end - start;
-      const speaking = t < end;
-      const showCurrent = speaking && (!reducedMotion || duration >= REDUCED_MOTION_MIN_MS);
-      if (showCurrent) {
-        const w = words[c];
-        let cut = w.end - w.start;
-        if (!reducedMotion && duration > 0) {
-          const bounds = graphemes[c] ?? (graphemes[c] = graphemeBoundaries(w.text));
-          const steps = bounds.length - 1;
-          const progress = Math.max(0, Math.min(1, (t - start) / duration));
-          // At least the first grapheme is lit as soon as the word starts.
-          cut = bounds[Math.max(1, Math.min(steps, Math.ceil(progress * steps)))];
-        }
-        const lit = rangeForOffsets(display, w.start, w.start + cut);
-        if (lit) {
-          current.add(lit);
-          currentParts.push(lit);
-        }
-        if (dimAhead && cut < w.end - w.start) {
-          const rest = rangeForOffsets(display, w.start + cut, w.end);
-          if (rest) {
-            ahead.add(rest);
-            currentParts.push(rest);
-          }
-        }
-        painted = c;
-      }
+    if (speaking && c >= 0) {
+      const w = words[c];
+      show("current", wordRange(c));
+      show("roll", rangeForOffsets(display, w.start, w.start + cut));
+      painted = c;
     }
 
-    for (const r of trailRanges) trail.delete(r);
-    trailRanges = [];
-    if (!reducedMotion && trailMs > 0) {
-      // Recently finished words, newest first; ends never decrease, so stop
-      // at the first one that finished too long ago.
-      const from = painted === c ? c - 1 : c;
-      for (let i = from, n = 0; i >= 0 && n < 8; i -= 1, n += 1) {
-        const end = timeline[2 * i + 1];
-        if (end > t) continue;
-        if (t - end >= trailMs) break;
-        const r = wordRange(i);
-        if (r) {
-          trail.add(r);
-          trailRanges.push(r);
-        }
+    if (showWindow) {
+      for (let level = 0; level < leadIndexes.length; level += 1) {
+        const name = LEAD_LAYERS[Math.min(level, LEAD_LAYERS.length - 1)];
+        show(name, wordRange(leadIndexes[level]));
+      }
+      const from = speaking ? c - 1 : c;
+      let level = 0;
+      for (let i = from; i >= 0 && level < trailWords; i -= 1) {
+        if (timeline[2 * i + 1] > t) continue;
+        const name = TRAIL_LAYERS[Math.min(level, TRAIL_LAYERS.length - 1)];
+        show(name, wordRange(i));
+        level += 1;
       }
     }
   };
@@ -520,11 +584,10 @@ export function createKaraokeHighlighter(
     clock = null;
     live = false;
     liveIndex = -1;
-    ahead?.clear();
-    trail?.clear();
-    current?.clear();
-    currentParts = [];
-    trailRanges = [];
+    for (const name of layerNames) layers[name]?.clear();
+    for (const name of layerNames) {
+      if (name !== "ahead") shown[name] = [];
+    }
     painted = -1;
     aheadFrom = count;
     dirty = true;
