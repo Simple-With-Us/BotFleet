@@ -8152,7 +8152,7 @@ async function startTurn(
         };
         wakeUserText = arranged.userText;
         wakeHoisted = arranged.hoisted;
-        if (typeof recoveryText === "string" && turnText.length > 0 && recoveryText.endsWith(turnText)) {
+        if (recoveryText !== undefined && turnText.length > 0 && recoveryText.endsWith(turnText)) {
           wakeRecoveryText = recoveryText.slice(0, recoveryText.length - turnText.length) + arranged.userText;
         }
       }

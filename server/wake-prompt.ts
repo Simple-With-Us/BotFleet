@@ -6,6 +6,7 @@
 // payloads, and per-run ids.  The tail has to follow the standing prefix.
 // Model selection, tool execution, and the stored transcript are untouched.
 import { volatileDigest } from "./system-prompt.ts";
+import type { JsonSchemaObject } from "./tools/registry.ts";
 import { TURN_REPLY_CUE } from "./turn-context.ts";
 
 export interface WakePromptSection {
@@ -19,7 +20,7 @@ export interface WakePromptSection {
 export interface WakeToolSchema {
   name: string;
   description?: string;
-  parameters?: { type: "object"; properties?: Record<string, unknown>; required?: string[] };
+  parameters?: JsonSchemaObject;
 }
 
 export interface ArrangedWakePrompt {
@@ -57,42 +58,32 @@ function isVolatileLine(line: string): boolean {
   );
 }
 
-function untrustedClose(line: string): boolean {
-  return line.includes("[/UNTRUSTED WEBHOOK EVENT DATA]") || line.includes("[/UNTRUSTED RESOURCE SAMPLE]");
-}
+const UNTRUSTED_OPEN = /^\[UNTRUSTED (?:WEBHOOK EVENT DATA|RESOURCE SAMPLE)\]/;
 
 function untrustedOpen(line: string): boolean {
-  return line.includes("[UNTRUSTED WEBHOOK EVENT DATA]") || line.includes("[UNTRUSTED RESOURCE SAMPLE]");
+  return UNTRUSTED_OPEN.test(line.trim());
 }
 
 /** Split one wake body into saved instructions and the per-wake tail.
- *  Volatile lines and untrusted blocks keep their relative order.  The
- *  standing instructions keep theirs. */
-export function splitUnattendedWakeText(text: string): { stableContext: string; volatileTail: string } {
+ *  Volatile lines keep their relative order.  The standing instructions keep
+ *  theirs.  An untrusted block runs to the end of the body: the payload can
+ *  contain the closer, so the first closer is not a boundary.  Nothing after
+ *  the opening line is hoisted into the system prefix. */
+export function splitUnattendedWakeText(text: string) {
   const stable: string[] = [];
   const volatile: string[] = [];
   const lines = text.split("\n");
-  for (let i = 0; i < lines.length; ) {
+  for (let i = 0; i < lines.length; i++) {
     const line = lines[i] ?? "";
     if (untrustedOpen(line)) {
-      let close = i;
-      if (!untrustedClose(line)) {
-        for (let j = i + 1; j < lines.length; j++) {
-          close = j;
-          if (untrustedClose(lines[j] ?? "")) break;
-        }
-      }
-      volatile.push(lines.slice(i, close + 1).join("\n"));
-      i = close + 1;
-      continue;
+      volatile.push(lines.slice(i).join("\n"));
+      break;
     }
     if (isVolatileLine(line)) {
       volatile.push(line.trim());
-      i++;
       continue;
     }
     stable.push(line);
-    i++;
   }
   return {
     stableContext: stable.join("\n").trim(),
@@ -103,14 +94,16 @@ export function splitUnattendedWakeText(text: string): { stableContext: string; 
 /** The tool list an HTTP driver sends, in that order, as one stable block. */
 export function canonicalToolSchemaBlock(tools: readonly WakeToolSchema[]): string {
   if (tools.length === 0) return "";
-  const payload = tools.map((tool) => ({
-    type: "function" as const,
-    function: {
-      name: tool.name,
-      ...(tool.description !== undefined ? { description: tool.description } : {}),
-      parameters: tool.parameters ?? { type: "object", properties: {}, required: [] },
-    },
-  }));
+  const payload = tools.map((tool) => {
+    const parameters = tool.parameters ?? { type: "object" as const, properties: {}, required: [] };
+    if (tool.description === undefined) {
+      return { type: "function" as const, function: { name: tool.name, parameters } };
+    }
+    return {
+      type: "function" as const,
+      function: { name: tool.name, description: tool.description, parameters },
+    };
+  });
   return `Tool schemas:\n${JSON.stringify(payload)}`;
 }
 
@@ -118,7 +111,7 @@ function withBytes(section: WakePromptSection): WakePromptSection & { bytes: num
   return { ...section, bytes: Buffer.byteLength(section.text, "utf8"), volatile: section.volatile };
 }
 
-function replaySplit(wakeText: string): { head: string; body: string } {
+function replaySplit(wakeText: string) {
   const at = wakeText.lastIndexOf(REPLAY_BOUNDARY);
   if (at < 0) return { head: "", body: wakeText };
   const cut = at + REPLAY_BOUNDARY.length;
@@ -184,10 +177,12 @@ export function logReportedCachedTokens(usage: {
   output?: number;
   cachedInput?: number;
 } | undefined): void {
-  if (!usage || typeof usage.cachedInput !== "number" || !Number.isFinite(usage.cachedInput)) return;
-  const input = typeof usage.input === "number" && Number.isFinite(usage.input) ? Math.round(usage.input) : 0;
-  const output = typeof usage.output === "number" && Number.isFinite(usage.output) ? Math.round(usage.output) : 0;
+  if (!usage) return;
+  const cached = usage.cachedInput;
+  if (cached === undefined || !Number.isFinite(cached)) return;
+  const input = usage.input !== undefined && Number.isFinite(usage.input) ? Math.round(usage.input) : 0;
+  const output = usage.output !== undefined && Number.isFinite(usage.output) ? Math.round(usage.output) : 0;
   console.info(
-    `[prompt-cache] cachedInputTokens=${Math.round(usage.cachedInput)} inputTokens=${input} outputTokens=${output}`,
+    `[prompt-cache] cachedInputTokens=${Math.round(cached)} inputTokens=${input} outputTokens=${output}`,
   );
 }
