@@ -59,7 +59,10 @@ struct BotFleetMacApp: App {
     @NSApplicationDelegateAdaptor(BotFleetMacAppDelegate.self) private var appDelegate
 
     init() {
-        // Native macOS app startup; notifications are NEVER requested at launch.
+        // Sentry first, so a crash in session startup is captured; it stays
+        // inert without a stamped DSN (BF-2541).  Notifications are NEVER
+        // requested at launch.
+        MacSentryTelemetry.start()
     }
 
     var body: some Scene {
@@ -159,21 +162,6 @@ struct BotFleetMacApp: App {
                             .font(.headline)
 
                         if section == .general {
-                            HStack {
-                                Text("Local Harness Address:")
-                                TextField("Host", text: $session.host)
-                                    .frame(width: 120)
-                                Text(":")
-                                TextField("Port", value: $session.port, format: .number.grouping(.never))
-                                    .frame(width: 70)
-                            }
-
-                            Button("Save and Reconnect") {
-                                session.connect(host: session.host, port: session.port)
-                            }
-
-                            Divider()
-
                             GroupBox("Remote Wake & Lifecycle") {
                                 VStack(alignment: .leading, spacing: 12) {
                                     Toggle(
@@ -200,6 +188,19 @@ struct BotFleetMacApp: App {
                                         )
                                     )
 
+                                    Toggle(
+                                        "Host The Companion API From This App",
+                                        isOn: Binding(
+                                            get: { session.companionListenerEnabled },
+                                            set: { newValue in
+                                                Task { await session.setCompanionListenerEnabled(newValue) }
+                                            }
+                                        )
+                                    )
+                                    Text(session.companionListenerState.summary)
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+
                                     HStack {
                                         Button(role: .destructive) {
                                             Task { await session.shutDownServerAndLocalVM() }
@@ -221,6 +222,12 @@ struct BotFleetMacApp: App {
                                 .padding(8)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                             }
+                        } else if section == .servers {
+                            MacServersSettings(coordinator: session.servers) { session.connect(host: $0) }
+                        } else if section == .resources {
+                            MacResourcesSettings(coordinator: session.resources)
+                        } else if section == .secrets {
+                            MacSecretsSettings(servers: session.servers)
                         } else if section == .permissions,
                                   let banner = session.notificationCoordinator.settingsStatusBanner {
                             Text(banner)
@@ -241,7 +248,7 @@ struct BotFleetMacApp: App {
                     .tag(section)
                 }
             }
-            .frame(width: 520, height: 420)
+            .frame(width: 620, height: 500)
         }
         #endif
     }

@@ -72,17 +72,28 @@ public enum NativeProbePolicy {
 /// - A changed bundle fingerprint counts as never checked, so a build that
 ///   landed on disk outside the updater's own path surfaces immediately.
 /// - Manual checks bypass the throttle entirely.
-public struct NativeUpdateThrottle: Sendable, Equatable {
+public struct NativeUpdateThrottle: Codable, Sendable, Equatable {
     public static let autoCheckInterval: TimeInterval = 6 * 60 * 60
     public static let failureStreakThreshold = 3
     public static let failureBackoff: TimeInterval = 24 * 60 * 60
 
     public private(set) var lastCheck: Date?
-    public private(set) var lastFailureClass: String?
+    public private(set) var lastFailureClass: String? = nil
     public private(set) var failureStreak = 0
     public private(set) var bundleFingerprint: String?
 
+    // Restart clears failure backoff, matching the Electron policy; only the clock and identity persist.
+    private enum CodingKeys: String, CodingKey {
+        case lastCheck, bundleFingerprint
+    }
+
     public init() {}
+
+    /// An explicit check clears automatic-failure backoff without moving the automatic-check clock.
+    public mutating func resetFailureBackoff() {
+        lastFailureClass = nil
+        failureStreak = 0
+    }
 
     /// Whether an automatic check may run at `now`.  Pass the fingerprint
     /// of the bundle on disk; a new fingerprint is a new app for throttle
@@ -109,7 +120,8 @@ public struct NativeUpdateThrottle: Sendable, Equatable {
             failureStreak = 0
             return
         }
-        failureStreak = failureClass == lastFailureClass ? failureStreak + 1 : 1
+        failureStreak = failureClass == lastFailureClass
+            ? min(max(0, failureStreak), Self.failureStreakThreshold - 1) + 1 : 1
         lastFailureClass = failureClass
     }
 }

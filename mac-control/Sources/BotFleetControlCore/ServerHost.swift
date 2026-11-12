@@ -30,23 +30,16 @@ public struct ServerHost: Codable, Equatable, Identifiable, Sendable {
         authToken: nil,
         isLocal: true
     )
-
-    /// The default Hetzner cloud server endpoint.
-    public static let defaultHetzner = ServerHost(
-        id: "hetzner",
-        name: "Hetzner Server",
-        baseURL: URL(string: "https://hetzner.botfleet.app")!,
-        authToken: nil,
-        isLocal: false
-    )
 }
 
 /// Atomic storage for known server hosts in `~/.botfleet/control-hosts.json`.
 public final class ServerHostStore: @unchecked Sendable {
     private let fileURL: URL
+    private let preservedHostIDs: () -> Set<String>?
     private let lock = NSLock()
 
-    public init(fileURL: URL? = nil) {
+    public init(fileURL: URL? = nil, preservedHostIDs: @escaping () -> Set<String>? = { Set<String>() }) {
+        self.preservedHostIDs = preservedHostIDs
         if let fileURL {
             self.fileURL = fileURL
         } else {
@@ -55,35 +48,24 @@ public final class ServerHostStore: @unchecked Sendable {
         }
     }
 
-    /// Loads the saved server hosts, seeding with Local Mac and Hetzner Server if missing.
+    /// Loads saved server hosts, seeding only the Local Mac anchor when no store exists.
     public func loadHosts() -> [ServerHost] {
         lock.lock()
         defer { lock.unlock() }
 
         guard FileManager.default.fileExists(atPath: fileURL.path) else {
-            let defaults = [ServerHost.defaultLocal, ServerHost.defaultHetzner]
+            let defaults = [ServerHost.defaultLocal]
             saveInternal(defaults)
             return defaults
         }
 
-        do {
-            let data = try Data(contentsOf: fileURL)
-            let hosts = try JSONDecoder().decode([ServerHost].self, from: data)
-            // Ensure Local Mac always exists as the anchor host.
-            if !hosts.contains(where: { $0.id == ServerHost.defaultLocal.id || $0.isLocal }) {
-                var augmented = [ServerHost.defaultLocal]
-                augmented.append(contentsOf: hosts)
-                saveInternal(augmented)
-                return augmented
-            }
-            return hosts
-        } catch {
+        guard let hosts = loadHostsInternal() else {
             // Preserve the unreadable file by backing it up rather than silently erasing it.
             let backupURL = fileURL.deletingPathExtension().appendingPathExtension("corrupt.\(Int(Date().timeIntervalSince1970)).json")
             try? FileManager.default.copyItem(at: fileURL, to: backupURL)
-            let defaults = [ServerHost.defaultLocal, ServerHost.defaultHetzner]
-            return defaults
+            return [ServerHost.defaultLocal]
         }
+        return hosts
     }
 
     /// Saves the host list atomically with 0600 file permissions.
@@ -128,13 +110,34 @@ public final class ServerHostStore: @unchecked Sendable {
 
     private func loadHostsInternal() -> [ServerHost]? {
         guard FileManager.default.fileExists(atPath: fileURL.path) else {
-            return [ServerHost.defaultLocal, ServerHost.defaultHetzner]
+            return [ServerHost.defaultLocal]
         }
         guard let data = try? Data(contentsOf: fileURL),
-              let hosts = try? JSONDecoder().decode([ServerHost].self, from: data) else {
+              let decodedHosts = try? JSONDecoder().decode([ServerHost].self, from: data) else {
             return nil
         }
+        var hosts = decodedHosts
+        let originalHosts = hosts
+        if hosts.contains(where: isLegacySyntheticRemoteHost),
+           let preservedIDs = preservedHostIDs(),
+           !preservedIDs.contains("hetzner") {
+            hosts.removeAll(where: isLegacySyntheticRemoteHost)
+        }
+        if !hosts.contains(where: { $0.id == ServerHost.defaultLocal.id || $0.isLocal }) {
+            hosts.insert(ServerHost.defaultLocal, at: 0)
+        }
+        if hosts != originalHosts {
+            saveInternal(hosts)
+        }
         return hosts
+    }
+
+    private func isLegacySyntheticRemoteHost(_ host: ServerHost) -> Bool {
+        host.id == "hetzner"
+            && host.name == "Hetzner Server"
+            && host.baseURL.absoluteString == "https://hetzner.botfleet.app"
+            && host.authToken == nil
+            && !host.isLocal
     }
 
     private func saveInternal(_ hosts: [ServerHost]) {

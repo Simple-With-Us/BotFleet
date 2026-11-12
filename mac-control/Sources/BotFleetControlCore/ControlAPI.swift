@@ -26,17 +26,21 @@ public struct ControlStatus: Decodable, Equatable, Sendable {
     /// something else entirely.  The server sends the same breakdown it uses
     /// for that refusal, so the dialog and the refusal agree.
     public let blockingWork: [BlockingWork]?
+    /// The server's release metadata, absent from older servers.
+    public let serverBuild: ControlBuildIdentity?
 
     public init(
         activeBotCount: Int,
         localVms: [LocalVM],
         persistOnExit: Bool = true,
-        blockingWork: [BlockingWork]? = nil
+        blockingWork: [BlockingWork]? = nil,
+        serverBuild: ControlBuildIdentity? = nil
     ) {
         self.activeBotCount = activeBotCount
         self.localVms = localVms
         self.persistOnExit = persistOnExit
         self.blockingWork = blockingWork
+        self.serverBuild = serverBuild
     }
 
     public var runningVMCount: Int { localVms.filter(\.running).count }
@@ -64,6 +68,42 @@ public struct BlockingWork: Decodable, Equatable, Sendable {
     }
 }
 
+/// What a graceful stop did, in the words the owner reads (BF-2536).
+///
+/// The server stops the bots that are working and then shuts down.  It says
+/// which of them had already finished, which were stopped, and what was
+/// still running when the stop ran out of time.
+public struct ControlStopReport: Decodable, Equatable, Sendable {
+    /// Bots that had already finished by the time the stop reached them.
+    public let finished: [String]
+    /// Bots that were mid-turn and were stopped.
+    public let interrupted: [String]
+    /// What was still running when the deadline passed.
+    public let leftRunning: [String]
+    /// Whether the server may shut down.
+    public let ok: Bool
+    /// Why the server had to stay up, when it did.
+    public let refusal: String?
+
+    public init(finished: [String] = [], interrupted: [String] = [], leftRunning: [String] = [],
+                ok: Bool = true, refusal: String? = nil) {
+        self.finished = finished
+        self.interrupted = interrupted
+        self.leftRunning = leftRunning
+        self.ok = ok
+        self.refusal = refusal
+    }
+
+    /// The report as one sentence, or nil when there is nothing to say.
+    public var summary: String? {
+        var parts: [String] = []
+        if !finished.isEmpty { parts.append("already finished: \(finished.joined(separator: ", "))") }
+        if !interrupted.isEmpty { parts.append("stopped: \(interrupted.joined(separator: ", "))") }
+        if !leftRunning.isEmpty { parts.append("still running: \(leftRunning.joined(separator: ", "))") }
+        return parts.isEmpty ? nil : parts.joined(separator: "; ")
+    }
+}
+
 public enum ControlAPIError: LocalizedError, Equatable {
     case unavailable
     /// The server answered the health check but did not answer the status
@@ -72,6 +112,11 @@ public enum ControlAPIError: LocalizedError, Equatable {
     case foreignService
     case invalidResponse
     case refused(String)
+    /// The server answered the health check as BotFleet but has no such
+    /// route.  It is running, and it is older than this app: the control
+    /// routes were added to the server after this Control was built against
+    /// them.
+    case outdatedServer
 
     public var errorDescription: String? {
         switch self {
@@ -80,6 +125,7 @@ public enum ControlAPIError: LocalizedError, Equatable {
         case .foreignService: return "Port is not answering as BotFleet Server."
         case .invalidResponse: return "BotFleet Server returned an invalid response.  Update BotFleet and try again."
         case .refused(let message): return message
+        case .outdatedServer: return "BotFleet Server is running, but it is older than Control and has no control routes.  Update BotFleet, then try again."
         }
     }
 }
@@ -141,12 +187,34 @@ public final class ControlAPI {
         guard try await status().persistOnExit == value else { throw ControlAPIError.invalidResponse }
     }
 
-    public func stopServer() async throws { try await post("/api/system/control/stop") }
+    /// Stops the server, and reports what the graceful stop did (BF-2536).
+    ///
+    /// The server stops the bots that are working and then shuts down, so the
+    /// owner is told which bots stopped and what was still running.  An older
+    /// server sends no report, and the owner is told nothing rather than
+    /// something invented.
+    @discardableResult
+    public func stopServer() async throws -> ControlStopReport? {
+        try await verifyIdentity()
+        let data = try await send("/api/system/control/stop", method: "POST", body: Data("{}".utf8), timeout: 300)
+        guard let result = try? decoder.decode(ActionResult.self, from: data), result.ok else {
+            throw ControlAPIError.invalidResponse
+        }
+        // The report is best effort:  a stop that worked is a stop that
+        // worked, whatever the server managed to say about it.
+        return (try? decoder.decode(StopServerReply.self, from: data))?.report
+    }
     public func startVM() async throws { try await post("/api/system/control/vms/start") }
     public func stopVMs() async throws { try await post("/api/system/control/vms/stop") }
 
     public func startSharedVM() async throws { try await startVM() }
     public func stopSharedVM() async throws { try await stopVMs() }
+
+    /// The stop route's reply: whether it worked, and what the stop did.
+    private struct StopServerReply: Decodable {
+        let ok: Bool
+        let report: ControlStopReport?
+    }
 
     private func post(_ path: String) async throws {
         try await verifyIdentity()
@@ -202,6 +270,15 @@ public final class ControlAPI {
         }
         if !(200..<300).contains(http.statusCode) {
             if path == "/api/health" { throw ControlAPIError.foreignService }
+            // The identity check has already proved this is a BotFleet
+            // Server, so a route it does not know is a route it predates.
+            // Reporting that as a refusal left the menu saying
+            // "unresponsive" about a server that was up, with every action
+            // greyed out (BF-2527).  Only the local server is read this way:
+            // a remote host sits behind a gateway that can answer 404 for
+            // reasons of its own, and its row already says what the server
+            // answered.
+            if http.statusCode == 404 && host.isLocal { throw ControlAPIError.outdatedServer }
             let message = (try? decoder.decode(ErrorResponse.self, from: data))?.message
             if http.statusCode == 409 {
                 throw ControlAPIError.refused(message ?? "BotFleet is busy with active bots or leases.  Try again after they finish.")

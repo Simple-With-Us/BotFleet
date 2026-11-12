@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { readFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, readFileSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,13 +12,62 @@ function read(rel) {
   return readFileSync(join(ROOT, rel), "utf8");
 }
 
+function extractPushPaths(block) {
+  return [...block.matchAll(/^\s+-\s+['"]?([^'"\s]+)['"]?\s*(?:#.*)?$/gm)].map((m) => m[1]);
+}
+
+function extractGatePrefixes(block) {
+  return [...block.matchAll(/^\s*--path-prefix\s+['"]?([^'"\s]+)['"]?\s*(?:\\\s*)?(?:#.*)?$/gm)].map((m) => m[1]);
+}
+
 test("ios-ship.yml targets botfleet / ios on the GitHub-hosted xcode-27 image", () => {
   const yml = read(".github/workflows/ios-ship.yml");
   const wrapper = read("scripts/ios-ship-testflight.sh");
   const prepare = read("scripts/ios-appstore-gm-prepare.sh");
 
   assert.match(yml, /ios\/\*\*/);
-  assert.match(yml, /--path-prefix 'ios\/'/);
+  // The scheduled backstop must watch the same path set as on.push.paths:
+  // a merge that only touched ship tooling ships no push-filtered run when
+  // its push event is missed, so the gate is the only thing that ships it
+  // (owner rule 2026-10-29: "unless they built recently they should
+  // automatically build").
+  // Self-check (Jay review 2026-10-29): both extractors accept single,
+  // double and unquoted values, keep entries with trailing comments, and
+  // the gate extractor skips full-line comments.
+  assert.deepEqual(
+    extractPushPaths("    paths:\n      - 'a/**'\n      - \"b/**\"\n      - c/**\n      - 'd/**' # reason\n"),
+    ["a/**", "b/**", "c/**", "d/**"]
+  );
+  assert.deepEqual(
+    extractGatePrefixes(
+      "          # One --path-prefix per on.push.paths entry above\n" +
+        "            --path-prefix 'a/**' \\\n" +
+        '            --path-prefix "b/**" \\\n' +
+        "            --path-prefix c/** \\\n" +
+        "            --path-prefix 'd/**' # reason\n"
+    ),
+    ["a/**", "b/**", "c/**", "d/**"]
+  );
+  const pushStart = yml.indexOf("\n    paths:");
+  const pushEnd = yml.indexOf("\n  workflow_dispatch:");
+  const ignoreAt = yml.indexOf("\n    paths-ignore:", pushStart);
+  const pushBlock = yml.slice(pushStart, ignoreAt !== -1 && ignoreAt < pushEnd ? ignoreAt : pushEnd);
+  const pushPaths = extractPushPaths(pushBlock);
+  assert.ok(pushPaths.length >= 9, `expected the full push path set, got ${pushPaths.length}`);
+  const gateStep = yml.slice(
+    yml.indexOf("name: Scheduled ship gate"),
+    yml.indexOf("- name: Assert stable Xcode")
+  );
+  const gatePrefixes = extractGatePrefixes(gateStep);
+  for (const p of pushPaths) {
+    assert.ok(gatePrefixes.includes(p), `gate must watch push path ${p}`);
+  }
+  assert.equal(
+    gatePrefixes.length,
+    pushPaths.length,
+    "gate watches exactly the push path set (no fewer, no extras)"
+  );
+  assert.match(read("scripts/ios-fleet/scheduled-ship-gate.sh"), /repeatable/);
   assert.match(yml, /scripts\/ios-fleet\/\*\*/);
   assert.match(yml, /runs-on:\s*xcode-27\s*$/m);
   assert.doesNotMatch(yml, /runs-on:\s*macos-latest/);
@@ -50,6 +99,11 @@ test("ios-ship.yml targets botfleet / ios on the GitHub-hosted xcode-27 image", 
   // Every group/tester/build mutation is gated on a successful tester listing.
   assert.match(read("scripts/ios-fleet/asc-api.mjs"), /if \(!inGroupRes\.ok\)/);
   assert.match(read("scripts/ios-fleet/ship-testflight.sh"), /sentry_redact/);
+  const shipPath = read("scripts/ios-fleet/ship-testflight.sh");
+  assert.match(
+    shipPath,
+    /export PATH="\/usr\/bin:\/bin:\/usr\/sbin:\/sbin:\/opt\/homebrew\/bin:\/usr\/local\/bin:\$\{PATH\}"/
+  );
   // Sentry org is centralized, not triple-hardcoded: verified 2026-10-09 the
   // botfleet project lives in org simple-with-us while the vault token was
   // still scoped to the retired slug jays-services ("organization not found",
@@ -69,15 +123,18 @@ test("ios-ship.yml targets botfleet / ios on the GitHub-hosted xcode-27 image", 
   assert.match(yml, /fetch-depth:\s*0/);
   assert.match(yml, /cancel-in-progress:\s*false/);
   assert.match(yml, /github\.event\.repository\.fork == false/);
-  assert.match(yml, /bash scripts\/ios-ship-testflight\.sh/);
+  assert.match(yml, /ios-observe-ship\.mjs bash scripts\/ios-ship-testflight\.sh/);
   assert.doesNotMatch(yml, /--force-ship/);
   assert.match(yml, /ios-appstore-gm-prepare\.sh/);
   // Signing material comes from Infisical prod, through the shared
-  // composite action; identity stays on GitHub.
+  // composite action; identity stays on GitHub -- a read-only service token
+  // scoped to this project, environment and folder, NOT the machine
+  // identity this pipeline used to hold.
   assert.match(yml, /Load Infisical signing secrets/);
   assert.match(yml, /secrets\.INFISICAL_PROJECT_ID/);
-  assert.match(yml, /secrets\.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID/);
-  assert.match(yml, /secrets\.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET/);
+  assert.match(yml, /secrets\.INFISICAL_IOS_SHIP_READ_TOKEN/);
+  assert.doesNotMatch(yml, /secrets\.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID/);
+  assert.doesNotMatch(yml, /secrets\.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET/);
   assert.match(yml, /uses:\s*\.\/\.github\/actions\/infisical-secrets/);
   assert.match(yml, /APPLE_API_KEY_ID/);
   assert.match(yml, /IOS_CERT_P12_BASE64/);
@@ -108,7 +165,14 @@ test("ios-ship.yml targets botfleet / ios on the GitHub-hosted xcode-27 image", 
   assert.doesNotMatch(yml, /--allow-dirty/);
   assert.doesNotMatch(yml, /--allow-unverified-seq/);
   assert.doesNotMatch(yml, /--version /);
-  assert.doesNotMatch(yml, /--build /);
+  // The build is planned ONCE per release (owner 2026-10-29): the
+  // plan-build job computes one shared merge-timestamp build and the ship
+  // job takes it as its --build, never planning its own.
+  assert.match(yml, /needs: plan-build/);
+  assert.match(yml, /--build "\$\{\{ needs\.plan-build\.outputs\.build \}\}"/);
+  assert.match(yml, /--plan-build-only/);
+  assert.match(yml, /build: \$\{\{ steps\.plan\.outputs\.build \}\}/);
+  assert.match(yml, /runs-on: ubuntu-latest/);
 
   // CI invokes the complete package test chain; ci-change-scope checks that
   // workflow contract.  Keep this ship contract included in the same chain.
@@ -118,7 +182,8 @@ test("ios-ship.yml targets botfleet / ios on the GitHub-hosted xcode-27 image", 
   const project = read("ios/project.yml");
   assert.match(project, /DEVELOPMENT_TEAM:\s*CC8UTF7ATG/);
   assert.match(project, /PRODUCT_BUNDLE_IDENTIFIER:\s*app\.botfleet\.ios/);
-  assert.match(project, /MARKETING_VERSION:\s*"1\.0\.\d+"/);
+  assert.match(project, /MARKETING_VERSION:\s*"0\.1\.0"/);
+  assert.match(project, /CURRENT_PROJECT_VERSION:\s*"202610290000"/);
   assert.match(project, /configs:\s*\n\s*Release:\s*\n\s*CODE_SIGN_STYLE:\s*Manual/);
   assert.match(project, /PROVISIONING_PROFILE_SPECIFIER:\s*"BotFleet iOS App Store \(API\)"/);
   assert.match(project, /PROVISIONING_PROFILE_SPECIFIER:\s*"BotFleet Widgets App Store \(API\)"/);
@@ -143,6 +208,11 @@ test("ios-ship.yml targets botfleet / ios on the GitHub-hosted xcode-27 image", 
   assert.match(wrapper, /exec bash "\$IN_REPO" botfleet --repo-root "\$ROOT"/);
   assert.match(wrapper, /botfleet --repo-root/);
   assert.doesNotMatch(wrapper, /--force-ship/);
+  // The plan-build job captures this wrapper's stdout as the 12-digit build,
+  // so every diagnostic it prints must go to stderr (PR #1404 review).
+  for (const line of wrapper.split("\n")) {
+    if (line.includes("[ios-ship]") && /(echo|\bsed\b)/.test(line)) assert.match(line, />&2/);
+  }
 
   assert.match(prepare, /APPLE_API_KEY_P8_BASE64/);
   assert.match(prepare, /IOS_CERT_P12_BASE64/);
@@ -150,6 +220,64 @@ test("ios-ship.yml targets botfleet / ios on the GitHub-hosted xcode-27 image", 
   assert.doesNotMatch(prepare, /echo "\$APPLE_API_KEY_P8/);
   assert.doesNotMatch(prepare, /echo "\$IOS_DIST_P12/);
   assert.doesNotMatch(prepare, /echo "\$IOS_CERT_P12/);
+});
+
+test("ios-ship.yml restores and saves ship state with run_attempt and drops stale lockdirs", () => {
+  const yml = read(".github/workflows/ios-ship.yml");
+  assert.match(yml, /uses: actions\/cache\/restore@/);
+  assert.match(yml, /uses: actions\/cache\/save@/);
+  assert.doesNotMatch(yml, /uses: actions\/cache@[^\n]*# v6\.1\.0/);
+  const shipJob = yml.slice(yml.indexOf("  ship:"), yml.indexOf("  report-sentry-deployment:"));
+  assert.equal(
+    (shipJob.match(/ios-fleet-botfleet-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/g) ?? []).length,
+    2,
+    "restore and save share one run_id+run_attempt key",
+  );
+  assert.match(shipJob, /restore-keys:\s*\|\s*\n\s*ios-fleet-botfleet-\$\{\{ github\.run_id \}\}-\s*\n\s*ios-fleet-botfleet-/);
+  assert.match(shipJob, /name: Clear stale ship-state lockdirs after cache restore/);
+  assert.match(shipJob, /name: Remove ship-state lockdirs before saving cache/);
+  assert.equal((shipJob.match(/\*\.lockdir/g) ?? []).length, 2, "both lockdir sweeps glob *.lockdir");
+  assert.match(shipJob, /name: Save iOS ship state[\s\S]*if: always\(\)/);
+});
+
+test("ios-ship.yml skips the unvendored icon audit only on the hosted ship step", () => {
+  const yml = read(".github/workflows/ios-ship.yml");
+  const shipStep = yml.slice(
+    yml.indexOf("name: Ship BotFleet to TestFlight"),
+    yml.indexOf("name: Sync standing TestFlight testers")
+  );
+  assert.ok(shipStep.length > 0, "the Ship BotFleet to TestFlight step is present");
+  assert.match(shipStep, /FLEET_ICON_AUDIT:\s*"off"/);
+  assert.match(shipStep, /Mac-side fleet tool/);
+  assert.match(shipStep, /not vendored/);
+  assert.match(shipStep, /hosted ship cannot run it/);
+  assert.match(shipStep, /default block gate/);
+  assert.equal((yml.match(/FLEET_ICON_AUDIT:/g) || []).length, 1);
+});
+
+test("wrapper --plan-build-only keeps stdout clean for the plan-build capture", () => {
+  // Git bash on windows-latest may exist while /usr/bin/python3 does not.
+  if (process.platform === "win32") return;
+  // IOS_FLEET_NODE=/bin/false makes the ASC client fail immediately, so this
+  // proves the stdout/stderr split without touching the network: the wrapper
+  // must fail with empty stdout and the diagnosis on stderr.  Before the
+  // PR #1404 fix, the "using in-repo fleet script" line went to stdout and
+  // broke the workflow's 12-digit validation on every run.
+  const tmp = mkdtempSync(join(tmpdir(), "ios-plan-stdout-"));
+  try {
+    const run = spawnSync("bash", [join(ROOT, "scripts/ios-ship-testflight.sh"), "--plan-build-only"], {
+      encoding: "utf8",
+      env: { PATH: process.env.PATH || "", HOME: tmp, IOS_FLEET_NODE: "/bin/false" },
+    });
+    if (run.error && run.error.code === "ENOENT") {
+      return;
+    }
+    assert.notEqual(run.status, 0);
+    assert.equal(run.stdout, "");
+    assert.match(run.stderr, /using in-repo fleet script/);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
 });
 
 test("the shared Infisical action masks every value, warns rather than fails on a non-required empty name, and never prints one", () => {
@@ -170,9 +298,9 @@ test("the shared Infisical action masks every value, warns rather than fails on 
   assert.match(fetcher, /is empty after the Infisical \$\{environment\} export and the GitHub secret fallback/);
   assert.match(fetcher, /required\.has\(name\)/);
   assert.match(fetcher, /Missing required Infisical name\(s\)/);
-  // Never string-interpolate the login body -- a client secret containing
-  // a quote must not be able to reshape the request.
-  assert.match(fetcher, /JSON\.stringify\(\{\s*clientId,\s*clientSecret\s*\}\)/);
+  // Managed CI never authenticates a machine identity.
+  assert.doesNotMatch(fetcher, /universal-auth\/login|loginUniversalAuth/);
+  assert.doesNotMatch(action, /inputs\.client-id|inputs\.client-secret/);
 });
 
 test("retired ios-testflight.yml is gone so hosted ships do not double-upload", () => {
@@ -195,6 +323,7 @@ test("vendored ios-fleet ships app.botfleet.ios on the 1.0.N train", () => {
   assert.equal(botfleet.appleId, 6820175685);
   assert.equal(botfleet.xcodegenDir, "ios");
   assert.match(botfleet.marketingVersionDefault, /^1\.0\.\d+$/);
+  assert.equal(botfleet.fixedMarketingVersion, "0.1.0");
   assert.deepEqual(botfleet.extraBundleIds, ["app.botfleet.ios.widgets"]);
   assert.equal(Object.keys(apps.apps).join(","), "botfleet");
 
@@ -353,11 +482,12 @@ test("asc-api.mjs stays dependency-free: it runs from a bare directory with no n
   try {
     const copy = join(tmp, "asc-api.mjs");
     writeFileSync(copy, src);
-    // The client imports asc-key.mjs and version-plan.mjs, so the bare copy
+    // The client imports asc-key.mjs, version-plan.mjs and shared-build.mjs, so the bare copy
     // needs them too:  a missing sibling is ERR_MODULE_NOT_FOUND, which is
     // the same failure this test exists to catch.
     writeFileSync(join(tmp, "asc-key.mjs"), read("scripts/ios-fleet/asc-key.mjs"));
     writeFileSync(join(tmp, "version-plan.mjs"), read("scripts/ios-fleet/version-plan.mjs"));
+    writeFileSync(join(tmp, "shared-build.mjs"), read("scripts/ios-fleet/shared-build.mjs"));
     const run = spawnSync(process.execPath, [copy, "latest-build-seq", "app.botfleet.ios", "1.0"], {
       encoding: "utf8",
       env: { PATH: process.env.PATH || "", HOME: tmp },
@@ -794,20 +924,15 @@ test("the ship readiness is external installability, and never prints a false su
   assert.doesNotMatch(readyBranch, /countInternalTesters\(/);
   assert.match(readyBranch, /externalInstallability\(/);
   assert.match(readyBranch, /process\.exit\(nobody \? 5 : reach\.ok \? 0 : 6\)/);
-  // The wrapper turns rc=5 into a warning plus a CI annotation, not a success line.
-  const rc5 = sh.slice(sh.indexOf("if [[ $rc -eq 5 ]]"), sh.indexOf("if [[ $rc -eq 6 ]]"));
-  assert.match(rc5, /no external TestFlight group with testers or a public link/);
-  assert.match(rc5, /::warning title=TestFlight has no reachable external tester::/);
-  assert.doesNotMatch(rc5, /can install this build/);
-  // An unreadable read (rc=6) must not print the success line either.
-  const rc6 = sh.slice(sh.indexOf("if [[ $rc -eq 6 ]]"), sh.indexOf("if [[ $rc -eq 3 ]]"));
-  assert.match(rc6, /installability is unverified/);
-  assert.match(rc6, /::warning title=TestFlight installability unverified::/);
-  assert.doesNotMatch(rc6, /can install this build/);
-  // The only success line is the rc=0 branch, and it names external testing.
-  // The readiness step runs before the sync assigns the build, so the rc=0
-  // line states exactly what was verified: the app's external install path.
-  assert.equal(sh.split("TestFlight external install path is live for ${BUNDLE_ID} (an external group has testers or an enabled public link); the standing-testers sync assigns and verifies this build next").length - 1, 1);
+  const rcSh = read("scripts/ios-fleet/tf-ready-rc.sh");
+  assert.match(rcSh, /no external TestFlight group with testers or a public link/);
+  assert.match(rcSh, /::warning title=TestFlight has no reachable external tester::/);
+  assert.doesNotMatch(rcSh, /can install this build/);
+  assert.match(rcSh, /installability is unverified/);
+  assert.match(rcSh, /::warning title=TestFlight installability unverified::/);
+  assert.match(sh, /source "\$\{FLEET_DIR\}\/tf-ready-rc\.sh"/);
+  assert.match(sh, /handle_ensure_tf_ready_rc "\$rc"/);
+  assert.equal(rcSh.split("TestFlight external install path is live for ${BUNDLE_ID} (an external group has testers or an enabled public link); the standing-testers sync assigns and verifies this build next").length - 1, 1);
   assert.doesNotMatch(sh, /TestFlight external testers can install this build/);
   assert.doesNotMatch(sh, /TestFlight internal testers can install this build/);
   // The sync step must NOT re-create the internal group; it deletes leftovers.
@@ -832,6 +957,246 @@ test("the ship readiness is external installability, and never prints a false su
   // ensureInternalTesterGroup stays exported: this repo's own suite is its
   // living consumer (see the behavior tests above).
   assert.match(mjs, /export async function ensureInternalTesterGroup\(/);
+});
+
+test("standing-tester sync is followed by a post-sync ensure-tf-ready summary step", () => {
+  const yml = read(".github/workflows/ios-ship.yml");
+  const syncAt = yml.indexOf("name: Sync standing TestFlight testers");
+  const postAt = yml.indexOf("name: Re-check TestFlight readiness after tester sync");
+  assert.ok(syncAt > -1 && postAt > syncAt, "post-sync readiness follows tester sync");
+  const postStep = yml.slice(postAt).split(/\n\s+- name:/)[0];
+  assert.match(postStep, /ios-post-sync-tf-ready\.sh/);
+  assert.match(postStep, /continue-on-error:\s*true/);
+  assert.match(postStep, /IOS_TF_READY_TIMEOUT_SEC/);
+  assert.match(postStep, /steps\.ship\.outputs\.uploaded == 'true'/);
+  assert.match(yml, /iOS ship summary \(TestFlight readiness after sync\)/);
+  const postSh = read("scripts/ios-post-sync-tf-ready.sh");
+  assert.match(postSh, /failed to read BotFleet app metadata/);
+  assert.match(postSh, /incomplete BotFleet app metadata/);
+  assert.match(postSh, /IOS_POST_SYNC_TEST_MODE/);
+  assert.match(postSh, /GITHUB_ACTIONS/);
+  assert.doesNotMatch(postSh, /GITHUB_STEP_SUMMARY/);
+  assert.match(yml, /IOS_DEFER_SENTRY_RECEIPT/);
+  assert.match(yml, /steps\.post_sync_tf\.outputs\.sentry_receipt/);
+});
+
+test("ios-observe-ship marks gate-skip as not uploaded", async () => {
+  const fakeShip = join(ROOT, "scripts", ".tmp-fake-ship.sh");
+  const outFile = join(ROOT, "scripts", ".tmp-github-output.txt");
+  writeFileSync(
+    fakeShip,
+    '#!/bin/sh\necho "[ios-ship] ship-gate: exiting 0 before any build number is consumed (sequence untouched)"\nexit 0\n',
+    { mode: 0o755 },
+  );
+  try {
+    const r = spawnSync("node", ["scripts/ios-observe-ship.mjs", "sh", fakeShip], {
+      cwd: ROOT,
+      env: { ...process.env, GITHUB_OUTPUT: outFile },
+    });
+    assert.equal(r.status, 0);
+    const out = readFileSync(outFile, "utf8");
+    assert.match(out, /uploaded=false/);
+    assert.match(out, /ship_observed=skipped/);
+    assert.match(out, /ship_exit_code=0/);
+  } finally {
+    rmSync(fakeShip, { force: true });
+    rmSync(outFile, { force: true });
+  }
+});
+
+test("ios-observe-ship spawn failure writes uploaded=false and nonzero exit code", () => {
+  const outFile = join(ROOT, "scripts", ".tmp-github-output-spawn.txt");
+  try {
+    const r = spawnSync(
+      "node",
+      ["scripts/ios-observe-ship.mjs", "/no/such/ios-observe-ship-binary"],
+      { cwd: ROOT, env: { ...process.env, GITHUB_OUTPUT: outFile } },
+    );
+    assert.notEqual(r.status, 0);
+    const out = readFileSync(outFile, "utf8");
+    assert.match(out, /uploaded=false/);
+    assert.match(out, /ship_observed=spawn_error/);
+    assert.match(out, /ship_exit_code=1/);
+  } finally {
+    rmSync(outFile, { force: true });
+  }
+});
+
+test("ios-observe-ship matches upload markers after a large log tail", () => {
+  const fakeShip = join(ROOT, "scripts", ".tmp-big-log-ship.sh");
+  const outFile = join(ROOT, "scripts", ".tmp-github-output-biglog.txt");
+  writeFileSync(
+    fakeShip,
+    '#!/bin/sh\nfor i in $(seq 1 8000); do echo "noise line $i padding"; done\necho "[ios-ship] upload submitted; watch TestFlight processing for app.botfleet.ios build 202501011201"\nexit 0\n',
+    { mode: 0o755 },
+  );
+  try {
+    const r = spawnSync("node", ["scripts/ios-observe-ship.mjs", "sh", fakeShip], {
+      cwd: ROOT,
+      env: { ...process.env, GITHUB_OUTPUT: outFile },
+    });
+    assert.equal(r.status, 0);
+    const out = readFileSync(outFile, "utf8");
+    assert.match(out, /uploaded=true/);
+    assert.match(out, /ship_observed=uploaded/);
+  } finally {
+    rmSync(fakeShip, { force: true });
+    rmSync(outFile, { force: true });
+  }
+});
+
+function observeRegexDecl(source, name) {
+  const start = source.indexOf(`const ${name} =`);
+  assert.ok(start >= 0, name);
+  const end = source.indexOf(";", start);
+  assert.ok(end > start, name);
+  return source.slice(start, end + 1);
+}
+
+test("ios-observe-ship upload/skip regexes match ship-testflight.sh log() output", () => {
+  const observe = read("scripts/ios-observe-ship.mjs");
+  const uploadedDecl = observeRegexDecl(observe, "uploadedRe");
+  const skippedDecl = observeRegexDecl(observe, "skippedRe");
+  for (const decl of [uploadedDecl, skippedDecl]) {
+    assert.doesNotMatch(decl, /\/(?:\\.|[^/])*\^/);
+    assert.match(decl, /\\\[ios-ship\\\]/);
+  }
+  const ship = read("scripts/ios-fleet/ship-testflight.sh");
+  assert.match(ship, /log\(\) \{ echo "\[ios-ship\] \$\*"; \}/);
+  const cases = [
+    { line: "[ios-ship] upload path succeeded via xcodebuild export (destination=upload)", wantUpload: true },
+    {
+      line: "[ios-ship] build 1.0.5 (202501011201) submitted for app.botfleet.ios",
+      wantUpload: true,
+    },
+    {
+      line: "[ios-ship] upload submitted; watch TestFlight processing for app.botfleet.ios build 202501011201",
+      wantUpload: true,
+    },
+    {
+      line: "[ios-ship] ship-gate: exiting 0 before any build number is consumed (sequence untouched)",
+      wantSkip: true,
+    },
+  ];
+  try {
+    for (const { line, wantUpload, wantSkip } of cases) {
+      const fake = join(ROOT, "scripts", ".tmp-prefixed-ship.sh");
+      const outFile = join(ROOT, "scripts", `.tmp-github-output-prefixed-${wantUpload ? "up" : "skip"}.txt`);
+      writeFileSync(
+        fake,
+        `#!/bin/sh
+cat <<'EOF'
+${line}
+EOF
+exit 0
+`,
+        { mode: 0o755 },
+      );
+      const r = spawnSync("node", ["scripts/ios-observe-ship.mjs", "sh", fake], {
+        cwd: ROOT,
+        env: { ...process.env, GITHUB_OUTPUT: outFile },
+      });
+      assert.equal(r.status, 0, line);
+      const out = readFileSync(outFile, "utf8");
+      if (wantUpload) {
+        assert.match(out, /uploaded=true/, line);
+      } else if (wantSkip) {
+        assert.match(out, /uploaded=false/, line);
+        assert.match(out, /ship_observed=skipped/, line);
+      }
+      rmSync(fake, { force: true });
+      rmSync(outFile, { force: true });
+    }
+  } finally {
+    rmSync(join(ROOT, "scripts", ".tmp-prefixed-ship.sh"), { force: true });
+  }
+});
+
+test("ios-observe-ship ignores bare upload markers without [ios-ship] log prefix", () => {
+  const fakeShip = join(ROOT, "scripts", ".tmp-bare-marker-ship.sh");
+  const outFile = join(ROOT, "scripts", ".tmp-github-output-bare.txt");
+  writeFileSync(
+    fakeShip,
+    "#!/bin/sh\ncat <<'EOF'\nupload submitted; watch TestFlight processing for app.botfleet.ios build 202501011201\nEOF\nexit 0\n",
+    { mode: 0o755 },
+  );
+  try {
+    const r = spawnSync("node", ["scripts/ios-observe-ship.mjs", "sh", fakeShip], {
+      cwd: ROOT,
+      env: { ...process.env, GITHUB_OUTPUT: outFile },
+    });
+    assert.equal(r.status, 0);
+    const out = readFileSync(outFile, "utf8");
+    assert.match(out, /uploaded=false/);
+  } finally {
+    rmSync(fakeShip, { force: true });
+    rmSync(outFile, { force: true });
+  }
+});
+
+test("ios-observe-ship keeps separate rolling tails for stdout and stderr", () => {
+  const src = read("scripts/ios-observe-ship.mjs");
+  assert.match(src, /function createStreamFeeder/);
+  assert.match(src, /const stdoutFeed = createStreamFeeder/);
+  assert.match(src, /const stderrFeed = createStreamFeeder/);
+  const feeder = src.slice(src.indexOf("function createStreamFeeder"), src.indexOf("function writeShipOutputs"));
+  assert.doesNotMatch(feeder, /\.split\("\\n"\)/);
+  assert.match(feeder, /const window = tail \+ text/);
+});
+
+test("ios-observe-ship does not match upload marker stitched across stdout and stderr", () => {
+  const fakeShip = join(ROOT, "scripts", ".tmp-cross-stream-ship.sh");
+  const outFile = join(ROOT, "scripts", ".tmp-github-output-cross-stream.txt");
+  writeFileSync(
+    fakeShip,
+    "#!/bin/sh\nprintf 'upload submit'\nprintf 'ted; watch TestFlight processing' >&2\nexit 0\n",
+    { mode: 0o755 },
+  );
+  try {
+    const r = spawnSync("node", ["scripts/ios-observe-ship.mjs", "sh", fakeShip], {
+      cwd: ROOT,
+      env: { ...process.env, GITHUB_OUTPUT: outFile },
+    });
+    assert.equal(r.status, 0);
+    const out = readFileSync(outFile, "utf8");
+    assert.match(out, /uploaded=false/);
+  } finally {
+    rmSync(fakeShip, { force: true });
+    rmSync(outFile, { force: true });
+  }
+});
+
+test("post-sync tf-ready avoids bash 4+ syntax (mapfile, readarray, associative arrays)", () => {
+  const postSh = read("scripts/ios-post-sync-tf-ready.sh");
+  assert.doesNotMatch(postSh, /\bmapfile\b/);
+  assert.doesNotMatch(postSh, /\breadarray\b/);
+  assert.doesNotMatch(postSh, /declare -A/);
+});
+
+test("post-sync tf-ready fails fast when apps.json metadata is incomplete", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ios-bad-apps-"));
+  const fleetDir = join(dir, "fleet");
+  mkdirSync(fleetDir, { recursive: true });
+  writeFileSync(join(fleetDir, "apps.json"), JSON.stringify({ apps: { botfleet: { bundleId: "" } } }));
+  copyFileSync(join(ROOT, "scripts/ios-fleet/tf-ready-rc.sh"), join(fleetDir, "tf-ready-rc.sh"));
+  try {
+    const r = spawnSync("bash", ["scripts/ios-post-sync-tf-ready.sh", "202501011201"], {
+      cwd: ROOT,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        IOS_FLEET_DIR: fleetDir,
+        IOS_POST_SYNC_TEST_MODE: "1",
+        GITHUB_ACTIONS: "",
+      },
+    });
+    assert.notEqual(r.status, 0);
+    const combined = `${r.stdout ?? ""}${r.stderr ?? ""}`;
+    assert.match(combined, /post-sync tf-ready/);
+    assert.match(combined, /failed to read BotFleet app metadata|missing bundleId/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("externalInstallability defers tester-read failures behind public links and counts missing-flag groups as external", async () => {
@@ -929,4 +1294,35 @@ test("externalInstallability follows the external-group/public-link policy", asy
   const out = await externalInstallability({ api: failing, buildId: "b1" });
   assert.equal(out.ok, false);
   assert.equal(out.installable, false);
+});
+
+test("a --platform with no value is refused instead of planning the legacy build", () => {
+  // An empty --platform would pass the "is it ios or macos" check and fall
+  // through to the legacy max + 1 plan, which splits the iOS and the Mac
+  // build of one commit by one, silently.  The flag itself must fail.
+  const empty = spawnSync(
+    process.execPath,
+    [join(ROOT, "scripts/ios-fleet/asc-api.mjs"), "plan-release-build", "app.botfleet.ios", "--merge-stamp", "202610291425", "--platform"],
+    { encoding: "utf8", env: { PATH: process.env.PATH || "", HOME: tmpdir() } },
+  );
+  assert.equal(empty.status, 2);
+  assert.match(empty.stderr, /--platform requires a value/);
+
+  const emptyEquals = spawnSync(
+    process.execPath,
+    [join(ROOT, "scripts/ios-fleet/asc-api.mjs"), "plan-release-build", "app.botfleet.ios", "--merge-stamp", "202610291425", "--platform="],
+    { encoding: "utf8", env: { PATH: process.env.PATH || "", HOME: tmpdir() } },
+  );
+  assert.equal(emptyEquals.status, 2);
+  assert.match(emptyEquals.stderr, /--platform requires a value/);
+});
+
+test("an unknown --platform is still refused by name", () => {
+  const bad = spawnSync(
+    process.execPath,
+    [join(ROOT, "scripts/ios-fleet/asc-api.mjs"), "plan-release-build", "app.botfleet.ios", "--merge-stamp", "202610291425", "--platform", "windows"],
+    { encoding: "utf8", env: { PATH: process.env.PATH || "", HOME: tmpdir() } },
+  );
+  assert.equal(bad.status, 2);
+  assert.match(bad.stderr, /--platform must be ios or macos/);
 });

@@ -29,7 +29,7 @@ const message = (id: number, over: { content?: string | number; timestamp?: stri
   sender_full_name: "Jay",
   client: "website",
   type: "stream",
-  display_recipient: "agent-sync",
+  display_recipient: "Work-In-Progress",
   subject: "BF x",
   stream_id: 7,
   content: "hello",

@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-import { botAvatarCropSchema, botAvatarUrlSchema } from "../shared/bot-avatar.ts";
+import { BOT_AVATAR_CROPS, botAvatarCropSchema, botAvatarUrlSchema } from "../shared/bot-avatar.ts";
 import { BOT_PROFILE_LIMITS, MAX_TOOL_ROUNDS, maxHistoryTurnsSchema } from "../shared/bot-profile.ts";
 import { mergeBotVoices, type BotVoices } from "../shared/bot-voice.ts";
 import {
@@ -264,7 +264,14 @@ export function parseBotProfilePatch(
     }
     const issue = parsed.error.issues[0];
     if (issue?.path[0] === "avatarCrop") {
-      return { ok: false, error: "avatarCrop must be mascot, circle, rounded, or square" };
+      // The message lists the crops a bot can actually pick.  It used to omit
+      // TV-Face, and it would have gone on omitting the animated crop, so it
+      // is built from the list the schema uses instead of being written out
+      // by hand.
+      return {
+        ok: false,
+        error: `avatarCrop must be ${BOT_AVATAR_CROPS.join(", ")}`,
+      };
     }
     return { ok: false, error: issue?.message ?? "invalid profile patch" };
   }

@@ -28,7 +28,7 @@ const FAKE = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "testing"
 let scratch: string;
 let instance: ProviderInstance | undefined;
 let recorder: EventRecorder | undefined;
-/** A stand-in for agent-sync:  prints its argv and the seat it was launched as,
+/** A stand-in for simple-chat:  prints its argv and the seat it was launched as,
  *  and leaves a marker so a test can prove it ran. */
 let tool: string;
 let dmFile: string;
@@ -101,7 +101,7 @@ beforeEach(() => {
   scratch = mkdtempSync(join(tmpdir(), "omb-allowlist-"));
   mkdirSync(join(scratch, ".grok"), { recursive: true });
   writeFileSync(join(scratch, ".grok", "auth.json"), "{}");
-  tool = join(scratch, "fake-agent-sync");
+  tool = join(scratch, "fake-simple-chat");
   writeFileSync(tool, `#!/bin/sh\necho "ran:$*:seat=$AGENT_LAUNCH_SEAT"\ntouch "${join(scratch, "TOOL-RAN")}"\n`);
   chmodSync(tool, 0o755);
   dmFile = join(scratch, "state", "dm.md");
@@ -118,9 +118,9 @@ afterEach(async () => {
   removeTempDir(scratch);
 });
 
-// The turns below run a real fake agent-sync CLI:  a `#!/bin/sh` script, POSIX argv0 paths, and
+// The turns below run a real fake simple-chat CLI:  a `#!/bin/sh` script, POSIX argv0 paths, and
 // `/bin/cat` and `/bin/pwd`, which `isCleanAbsolutePath` rightly refuses on Windows, where mkdtemp
-// hands back `C:\Users\...\fake-agent-sync`.  The suite is POSIX-only;  `grokAllowlistProblem` below
+// hands back `C:\Users\...\fake-simple-chat`.  The suite is POSIX-only;  `grokAllowlistProblem` below
 // is pure logic and runs everywhere.
 const posix = describe.skipIf(process.platform === "win32");
 
@@ -167,11 +167,11 @@ posix("an allowlist turn on Grok", () => {
     expect(existsSync(join(scratch, "PWNED"))).toBe(false);
     expect(existsSync(join(scratch, "TOOL-RAN"))).toBe(false);
     expect(done.denials).toEqual([
-      "allowlist: fake-agent-sync",
+      "allowlist: fake-simple-chat",
       "allowlist: touch",
       "allowlist: gh",
       "allowlist: touch",
-      "allowlist: fake-agent-sync",
+      "allowlist: fake-simple-chat",
     ]);
   });
 
@@ -399,12 +399,12 @@ posix("an allowlist turn on Grok", () => {
     expect(readFileSync(other, "utf8")).toBe("OTHER-FILE\n");
   });
 
-  it("keeps agent-sync's rules when it runs under another name through a link", async () => {
+  it("keeps simple-chat's rules when it runs under another name through a link", async () => {
     await grok();
-    // The policy names `poster`, so nothing at save time says agent-sync;  the gate resolves the link.
+    // The policy names `poster`, so nothing at save time says simple-chat;  the gate resolves the link.
     const realDir = join(scratch, "fleet");
     mkdirSync(realDir);
-    const real = join(realDir, "agent-sync");
+    const real = join(realDir, "simple-chat");
     writeFileSync(real, readFileSync(tool, "utf8"));
     chmodSync(real, 0o755);
     const alias = join(scratch, "poster");

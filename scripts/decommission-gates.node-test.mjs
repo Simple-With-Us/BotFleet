@@ -5,8 +5,12 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+// Keep the final CLI's receipt-boundary fixtures in the existing native-release gate.
+import "./decommission-evidence.node-test.mjs";
 import {
+  DEPENDENT_SURFACES,
   MAC_LOCAL_ROOTS,
+  REQUIRED_EVIDENCE,
   REQUIRED_ISSUES,
   RETAINED_OPTIONAL_SERVER_PATHS,
   StateSchema,
@@ -15,12 +19,20 @@ import {
 } from "./check-decommission-gates.mjs";
 import {
   AUDITED_ROOTS,
+  DEPENDENT_PATHS,
   INVENTORY_DOCS,
   RETAINED_PATHS,
+  dependentFiles,
   findUncovered,
   retainedFiles,
   trackedFiles,
 } from "./audit-node-decommission.mjs";
+import {
+  HUMAN_ONLY_EVIDENCE,
+  buildGateState,
+  collectLinearNodes,
+  unwrapNodes,
+} from "./decommission-gate-state.mjs";
 
 const ALL_DONE = {
   issues: {
@@ -33,10 +45,13 @@ const ALL_DONE = {
     "BF-2514": "Done",
   },
   evidence: {
+    "placement-evidence": true,
     "soak-24h-no-node": true,
     "replay-parity": true,
     "final-import-parity": true,
     "inventory-clean": true,
+    "control-disposition": true,
+    "linux-server-preservation": true,
   },
   // The Mac-local harness is gone, and the optional server deployment is
   // kept on purpose.
@@ -54,6 +69,14 @@ test("all gates green lets the decommission proceed", () => {
       { path: "deploy/linux-server/", why: "optional server deployment (BF-2544)" },
     ],
   });
+});
+
+test("placement evidence is human-only and never inferred from landed issues", () => {
+  assert.ok(HUMAN_ONLY_EVIDENCE.includes("placement-evidence"));
+  const state = buildGateState(linearNodes(ALL_DONE.issues), { inventoryClean: true });
+  assert.equal(state.evidence["placement-evidence"], false);
+  const { "placement-evidence": _removed, ...without } = ALL_DONE.evidence;
+  assert.deepEqual(evaluateGates({ ...ALL_DONE, evidence: without }).blockers.map((item) => item.split(":")[0]), ["evidence placement-evidence"]);
 });
 
 test("today's Phase 6 state is blocked, naming the unruled decision first", () => {
@@ -104,12 +127,60 @@ test("one unasserted evidence item blocks on its own", () => {
   assert.match(verdict.blockers[0], /final-import-parity/);
 });
 
-// BF-2544: BotFleet may run with the server as the primary BotFleet server,
-// and deploy/linux-server/ ships that server code as the optional
-// deployment.  The Phase 6 gate therefore guards the Mac-local harness only:
-// it must pass with the optional server path still on disk, and it must
-// still fail while the Mac-local harness is there.
-test("the gate passes with the Mac-local harness gone and deploy/ retained", () => {
+// BF-2583: BotFleet Control is Swift, so no inventory row retires it, but
+// every local thing it does goes through the Mac-local Node stack.  Deleting
+// the stack before Control's future is decided and landed leaves a menu bar
+// app whose rows all read "not installed", so that decision is a gate of
+// its own, and a state file written before the gate existed must not pass.
+test("Control's disposition is a gate that an older state file cannot satisfy", () => {
+  assert.ok(
+    REQUIRED_EVIDENCE.some((gate) => gate.id === "control-disposition"),
+    "the gate must require Control's disposition",
+  );
+  assert.deepEqual(
+    DEPENDENT_SURFACES.map((entry) => entry.path),
+    ["mac-control/", "deploy/linux-server/"],
+  );
+  const { "control-disposition": _omitted, ...withoutControl } = ALL_DONE.evidence;
+  const verdict = evaluateGates({ ...ALL_DONE, evidence: withoutControl });
+  assert.equal(verdict.ok, false);
+  assert.deepEqual(verdict.blockers.length, 1);
+  assert.match(verdict.blockers[0], /^evidence control-disposition: not asserted/);
+  assert.match(verdict.blockers[0], /mac-control\//);
+  assert.match(verdict.blockers[0], /2026-10-29-botfleet-control-after-node\.md/);
+});
+
+// BF-2586: retaining deploy/linux-server/ does not preserve the shared source,
+// UI build, runtime, update refs or rollback path that BF-2544 uses.
+test("Linux source preservation blocks independently of the retained directory", () => {
+  assert.ok(
+    REQUIRED_EVIDENCE.some((gate) => gate.id === "linux-server-preservation"),
+    "the gate must require Linux source-preservation evidence",
+  );
+  const linux = DEPENDENT_SURFACES.find((entry) => entry.path === "deploy/linux-server/");
+  assert.equal(linux?.decision, "docs/native-rewrite-linux-source-retention.md");
+  assert.equal(linux?.evidence, "linux-server-preservation");
+
+  for (const evidence of [
+    Object.fromEntries(Object.entries(ALL_DONE.evidence).filter(([key]) => key !== "linux-server-preservation")),
+    { ...ALL_DONE.evidence, "linux-server-preservation": false },
+  ]) {
+    const verdict = evaluateGates({ ...ALL_DONE, evidence });
+    assert.equal(verdict.ok, false);
+    assert.equal(verdict.blockers.length, 1, "only the missing Linux preservation assertion should block");
+    assert.match(verdict.blockers[0], /^evidence linux-server-preservation: not asserted/);
+    assert.match(verdict.blockers[0], /server\/index\.ts|server\/|Linux/);
+    assert.deepEqual(verdict.retained, [
+      { path: "deploy/linux-server/", why: "optional server deployment (BF-2544)" },
+    ]);
+  }
+
+  assert.equal(evaluateGates(ALL_DONE).ok, true, "all required preservation evidence permits the gate to pass");
+});
+
+// BF-2544: the gate may pass with the Linux deployment directory retained
+// only when its independent source-preservation evidence is also satisfied.
+test("the gate passes with the Mac-local harness gone and Linux preservation asserted", () => {
   const verdict = evaluateGates({
     issues: ALL_DONE.issues,
     evidence: ALL_DONE.evidence,
@@ -137,12 +208,11 @@ test("the gate still fails while the Mac-local harness is present", () => {
   );
 });
 
-test("the optional server path is retained, never a blocker", () => {
+test("the optional server path is retained and separately gated as a dependency", () => {
   assert.deepEqual(RETAINED_OPTIONAL_SERVER_PATHS, ["deploy/linux-server/"]);
   assert.ok(!MAC_LOCAL_ROOTS.includes("deploy"));
   const verdict = evaluateGates(ALL_DONE);
   assert.equal(verdict.ok, true);
-  assert.ok(verdict.blockers.every((line) => !line.includes("deploy/")));
   assert.deepEqual(verdict.retained, [
     { path: "deploy/linux-server/", why: "optional server deployment (BF-2544)" },
   ]);
@@ -172,7 +242,7 @@ test("the state file is validated before it reaches the gate", () => {
   }
 });
 
-test("the CLI validates the state file before it decides", () => {
+test("the CLI validates the state file before it decides", { skip: process.platform === "win32" ? "Final private evidence requires POSIX ownership" : false }, () => {
   const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
   const cli = join(repoRoot, "scripts/check-decommission-gates.mjs");
   const directory = mkdtempSync(join(tmpdir(), "botfleet-gate-"));
@@ -185,21 +255,18 @@ test("the CLI validates the state file before it decides", () => {
       JSON.stringify({
         ...ALL_DONE,
         evidence: { ...ALL_DONE.evidence, "soak-24h-no-node": "yes" },
-      }),
+      }), { mode: 0o600 },
     );
     const refused = spawnSync("node", [cli, malformed], { encoding: "utf8" });
     assert.equal(refused.status, 2, "a malformed state file must be refused");
     assert.match(refused.stderr, /does not match the state schema/);
 
-    // The same CLI prints the retained optional server path, so a reader
-    // can see it is kept on purpose and not merely unmentioned.
+    // Even a previously green boolean-only file cannot authorize deletion.
     const green = join(directory, "green.json");
-    writeFileSync(green, JSON.stringify(ALL_DONE));
+    writeFileSync(green, JSON.stringify(ALL_DONE), { mode: 0o600 });
     const passed = spawnSync("node", [cli, green], { encoding: "utf8" });
-    assert.equal(passed.status, 0);
-    assert.match(passed.stdout, /all green/);
-    assert.match(passed.stdout, /Retained on purpose: deploy\/linux-server\//);
-    assert.match(passed.stdout, /is deliberately retained and is not a decommission target/);
+    assert.equal(passed.status, 1);
+    assert.match(passed.stderr, /final evidence bundle: required/);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -246,10 +313,9 @@ test("feature tests follow their subsystem's prefix", () => {
   assert.deepEqual(uncovered, []);
 });
 
-// The optional server deployment is audited too, and it is a documented
-// exception rather than a finding: the audit must SEE it, and must report
-// it as retained rather than as uncovered.
-test("the audit covers deploy/ and records the optional server path as retained", () => {
+// The optional deployment is retained from inventory findings and also
+// reported as a dependency whose source-preservation evidence gates deletion.
+test("the audit covers deploy/ and records the retained dependency", () => {
   assert.ok(AUDITED_ROOTS.includes("deploy"), "deploy/ must be an audited root");
   const optional = [
     "deploy/linux-server/install.sh",
@@ -267,6 +333,33 @@ test("the audit covers deploy/ and records the optional server path as retained"
   assert.deepEqual(findUncovered(["deploy/windows/thing.ps1"], INVENTORY), [
     "deploy/windows/thing.ps1",
   ]);
+});
+
+// Dependents may be outside the audited roots (Control) or inside one that is
+// also retained (Linux deployment); the audit reports both distinctly.
+test("the audit names Control and Linux deployment as dependent surfaces", () => {
+  assert.deepEqual(
+    DEPENDENT_PATHS.map((entry) => entry.path),
+    ["mac-control/", "deploy/linux-server/"],
+  );
+  assert.ok(!AUDITED_ROOTS.includes("mac-control"), "mac-control/ is a dependent, not a retired root");
+  assert.ok(
+    !RETAINED_PATHS.some((entry) => entry.path.startsWith("mac-control")),
+    "mac-control/ is a dependent, not a retained path",
+  );
+  const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const files = dependentFiles(repoRoot).filter((file) => file.startsWith("mac-control/"));
+  assert.ok(files.includes("mac-control/Package.swift"), `expected the Control package, got: ${files.slice(0, 5).join(", ")}`);
+  assert.ok(files.every((file) => file.startsWith("mac-control/")));
+  const linuxFiles = dependentFiles(repoRoot).filter((file) => file.startsWith("deploy/linux-server/"));
+  assert.ok(linuxFiles.includes("deploy/linux-server/install.sh"));
+  assert.ok(linuxFiles.every((file) => file.startsWith("deploy/linux-server/")));
+  const cli = join(repoRoot, "scripts/audit-node-decommission.mjs");
+  const result = spawnSync("node", [cli], { encoding: "utf8" });
+  assert.match(result.stdout, /depends on the stack being deleted: mac-control\/ \(\d+ tracked file\(s\)\)/);
+  assert.match(result.stdout, /BF-2583/);
+  assert.match(result.stdout, /depends on the stack being deleted: deploy\/linux-server\/ \(\d+ tracked file\(s\)\)/);
+  assert.match(result.stdout, /BF-2586/);
 });
 
 // The fixtures above prove the matcher works; this one proves the committed
@@ -296,4 +389,148 @@ test("the tree as committed is fully covered by the inventories", () => {
     retained.every((file) => file.startsWith("deploy/linux-server/")),
     `unexpected retained paths: ${retained.join(", ")}`,
   );
+});
+
+// The refresh step is where a safety gate usually leaks: somebody reshapes a
+// GraphQL response by hand once, the file goes stale, and the guard reads a
+// memory instead of a fact.  These pin the two properties that make the
+// generated file trustworthy — a missing issue is visible rather than absent,
+// and only the two machine-checkable halves are filled in.
+const linearNodes = (states) =>
+  Object.entries(states).map(([identifier, name]) => ({ identifier, state: { name } }));
+
+const ALL_DONE_STATES = {
+  "BF-2510": "Done",
+  "BF-2511": "Done",
+  "BF-2512": "Done",
+  "BF-2513": "Done",
+  "BF-2503": "Done",
+  "BF-2504": "Done",
+  "BF-2514": "Done",
+};
+
+test("generated state passes the gate's schema and blocks on the human-only halves", () => {
+  const state = buildGateState(linearNodes(ALL_DONE_STATES), { inventoryClean: true });
+  assert.equal(StateSchema.safeParse(state).success, true);
+  // Even with every issue Done and the inventory clean, the generated file
+  // blocks: all human-only evidence and the Mac harness check need a human.
+  assert.equal(evaluateGates(state).ok, false);
+  for (const id of HUMAN_ONLY_EVIDENCE) {
+    assert.equal(state.evidence[id], false, `${id} must remain false in generated state`);
+    assert.ok(evaluateGates(state).blockers.some((blocker) => blocker.startsWith(`evidence ${id}`)));
+  }
+  assert.ok(
+    evaluateGates(state).blockers.some((blocker) => blocker.startsWith("macLocalHarness")),
+  );
+});
+
+test("state generator CLI names every human-only item and writes Linux evidence false", () => {
+  const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const cli = join(repoRoot, "scripts/decommission-gate-state.mjs");
+  const directory = mkdtempSync(join(tmpdir(), "botfleet-gate-state-"));
+  try {
+    const input = join(directory, "issues.json");
+    const output = join(directory, "state.json");
+    writeFileSync(input, JSON.stringify(linearNodes(ALL_DONE_STATES)));
+    const result = spawnSync("node", [cli, "--board-json", input, "--out", output], {
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr);
+    for (const id of HUMAN_ONLY_EVIDENCE) assert.ok(result.stdout.includes(id), `${id} must be called out`);
+    const generated = JSON.parse(readFileSync(output, "utf8"));
+    assert.equal(generated.evidence["linux-server-preservation"], false);
+    assert.equal(generated.evidence["control-disposition"], false);
+    assert.equal(generated.macLocalHarness.present, true);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("an issue Linear did not mention is recorded as Unknown, not omitted", () => {
+  const { "BF-2504": _dropped, ...withoutOne } = ALL_DONE_STATES;
+  const state = buildGateState(linearNodes(withoutOne), { inventoryClean: true });
+  assert.equal(state.issues["BF-2504"], "Unknown");
+  assert.ok(evaluateGates(state).blockers.some((blocker) => blocker.startsWith("BF-2504: Unknown")));
+});
+
+test("a dirty inventory blocks the gate even when every issue is Done", () => {
+  const state = buildGateState(linearNodes(ALL_DONE_STATES), { inventoryClean: false });
+  assert.equal(state.evidence["inventory-clean"], false);
+  assert.ok(
+    evaluateGates(state).blockers.some((blocker) => blocker.startsWith("evidence inventory-clean")),
+  );
+});
+
+test("explicit human assertions are preserved while the Mac harness stays blocking", () => {
+  const humanEvidence = Object.fromEntries(HUMAN_ONLY_EVIDENCE.map((id) => [id, true]));
+  const state = buildGateState(linearNodes(ALL_DONE_STATES), { inventoryClean: true, humanEvidence });
+  for (const id of HUMAN_ONLY_EVIDENCE) {
+    assert.equal(state.evidence[id], true, `${id} must preserve an explicit true assertion`);
+  }
+  assert.equal(state.macLocalHarness.present, true);
+  assert.equal(evaluateGates(state).ok, false);
+  const unverified = buildGateState(linearNodes(ALL_DONE_STATES), {
+    inventoryClean: true,
+    humanEvidence: { "linux-server-preservation": "yes" },
+  });
+  assert.equal(unverified.evidence["linux-server-preservation"], false);
+});
+
+test("identifiers outside the required set do not leak into the state", () => {
+  const state = buildGateState(
+    linearNodes({ ...ALL_DONE_STATES, "BF-9999": "Done" }),
+    { inventoryClean: true },
+  );
+  assert.equal(Object.hasOwn(state.issues, "BF-9999"), false);
+});
+
+test("a malformed Linear node fails the refresh instead of writing a guess", () => {
+  assert.throws(
+    () =>
+      buildGateState([{ identifier: "BF-2510", state: { name: 7 } }], {
+        inventoryClean: true,
+      }),
+  );
+});
+
+test("a saved CLI dump unwraps like the live query does", () => {
+  const nodes = linearNodes(ALL_DONE_STATES);
+  assert.deepEqual(unwrapNodes(nodes), nodes);
+  assert.deepEqual(unwrapNodes({ data: { issues: { nodes } } }), nodes);
+  assert.deepEqual(unwrapNodes({ issues: { nodes } }), nodes);
+  assert.throws(() => unwrapNodes({ data: { issues: { nodes: null } } }), /no Linear issues array/);
+});
+
+test("pagination stops as soon as every required issue has been seen", () => {
+  let calls = 0;
+  const nodes = collectLinearNodes(() => {
+    calls += 1;
+    return { nodes: linearNodes(ALL_DONE_STATES), pageInfo: { hasNextPage: true, endCursor: "cursor-1" } };
+  });
+  assert.equal(calls, 1);
+  assert.equal(nodes.length, Object.keys(ALL_DONE_STATES).length);
+});
+
+test("pagination follows cursors until the required set is complete", () => {
+  const first = linearNodes({ "BF-2510": "Done" });
+  const rest = linearNodes({ ...ALL_DONE_STATES, "BF-2510": "Done" });
+  const seen = [];
+  const nodes = collectLinearNodes((after) => {
+    seen.push(after);
+    return after === null
+      ? { nodes: first, pageInfo: { hasNextPage: true, endCursor: "cursor-1" } }
+      : { nodes: rest, pageInfo: { hasNextPage: false, endCursor: null } };
+  });
+  assert.deepEqual(seen, [null, "cursor-1"]);
+  const state = buildGateState(nodes, { inventoryClean: true });
+  assert.equal(state.issues["BF-2514"], "Done");
+});
+
+test("pagination is capped so a broken cursor cannot loop forever", () => {
+  let calls = 0;
+  collectLinearNodes(() => {
+    calls += 1;
+    return { nodes: [], pageInfo: { hasNextPage: true, endCursor: `cursor-${calls}` } };
+  });
+  assert.equal(calls, 4);
 });

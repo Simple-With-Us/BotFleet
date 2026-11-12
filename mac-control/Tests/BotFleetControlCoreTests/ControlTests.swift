@@ -49,6 +49,31 @@ final class ControlTests: XCTestCase {
         XCTAssertTrue(created.canStartSharedVM)
     }
 
+    /// The graceful stop's report:  what the server stopped and what was
+    /// still running (BF-2536).
+    func testStopServerReportsWhatTheGracefulStopDid() async throws {
+        MockURLProtocol.handler = { request in
+            if request.url!.path == "/api/health" { return (200, Data(#"{"app":"botfleet","pid":42,"ready":true}"#.utf8)) }
+            return (200, Data(#"{"ok":true,"detail":{"markerWritten":true,"localVmStop":"stopped"},"report":{"finished":["Daylight"],"interrupted":["Nightowl"],"leftRunning":["1 routine run"],"ok":true}}"#.utf8))
+        }
+        let report = try await ControlAPI(session: mockSession()).stopServer()
+        XCTAssertEqual(report?.finished, ["Daylight"])
+        XCTAssertEqual(report?.interrupted, ["Nightowl"])
+        XCTAssertEqual(report?.leftRunning, ["1 routine run"])
+        XCTAssertEqual(report?.summary, "already finished: Daylight; stopped: Nightowl; still running: 1 routine run")
+    }
+
+    /// An older server sends no report at all.  The stop still happened, so
+    /// the owner is told nothing rather than something invented.
+    func testStopServerWithoutAReportReportsNothing() async throws {
+        MockURLProtocol.handler = { request in
+            if request.url!.path == "/api/health" { return (200, Data(#"{"app":"botfleet","pid":42,"ready":true}"#.utf8)) }
+            return (200, Data(#"{"ok":true,"detail":{"markerWritten":true,"localVmStop":"stopped"}}"#.utf8))
+        }
+        let report = try await ControlAPI(session: mockSession()).stopServer()
+        XCTAssertNil(report)
+    }
+
     func testBusyRefusalIsSurfaced() async {
         MockURLProtocol.handler = { request in
             if request.url!.path == "/api/health" { return (200, Data(#"{"app":"botfleet","pid":42,"ready":true}"#.utf8)) }
@@ -72,6 +97,146 @@ final class ControlTests: XCTestCase {
         }
         do { _ = try await ControlAPI(session: mockSession()).status(); XCTFail("Expected unresponsive") }
         catch { XCTAssertEqual(error as? ControlAPIError, .unresponsive) }
+    }
+
+    /// A server that answers the health check as BotFleet but has no control
+    /// route is running and older than this app.  Reporting that as a refusal
+    /// left the menu calling an up server unresponsive, with every action
+    /// greyed out (BF-2527).
+    func testAServerWithoutTheControlRouteIsOutdatedRatherThanRefused() async {
+        MockURLProtocol.handler = { request in
+            if request.url!.path == "/api/health" { return (200, Data(#"{"app":"botfleet","pid":42,"ready":true}"#.utf8)) }
+            return (404, Data(#"{"error":"no route: GET /api/system/control"}"#.utf8))
+        }
+        do { _ = try await ControlAPI(session: mockSession()).status(); XCTFail("Expected outdated server") }
+        catch { XCTAssertEqual(error as? ControlAPIError, .outdatedServer) }
+        XCTAssertEqual(MockURLProtocol.requests.map(\.url!.path), ["/api/health", "/api/system/control"])
+    }
+
+    /// A server older than Control cannot be asked to stop, so the marker is
+    /// written and the LaunchAgent is booted out.  The agent is not disabled:
+    /// the marker is the server's durable stop, and a disabled agent would
+    /// defeat Start Server At Login.
+    func testForceStopWritesTheMarkerAndBootsTheAgentOutWithoutDisablingIt() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        try FileManager.default.createDirectory(at: home.appendingPathComponent("Library/LaunchAgents"), withIntermediateDirectories: true)
+        try Data().write(to: home.appendingPathComponent("Library/LaunchAgents/app.botfleet.server.plist"))
+        let runner = MockCommands()
+        let launchdAsked = try StartupPolicy(home: home, commands: runner, uid: 501, environment: [:]).forceStopServer()
+        XCTAssertTrue(launchdAsked)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: home.appendingPathComponent(".botfleet/stopped.marker").path))
+        XCTAssertEqual(runner.calls, ["/bin/launchctl bootout gui/501/app.botfleet.server"])
+    }
+
+    func testForceStopWithoutTheAgentWritesTheMarkerAndAsksLaunchdNothing() throws {
+        // A server the desktop app forked has no plist.  The marker still
+        // records the owner's stop, launchd is not asked, and the caller's
+        // port check is what finds out whether the server is gone.
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let runner = MockCommands()
+        let launchdAsked = try StartupPolicy(home: home, commands: runner, uid: 501, environment: [:]).forceStopServer()
+        XCTAssertFalse(launchdAsked)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: home.appendingPathComponent(".botfleet/stopped.marker").path))
+        XCTAssertTrue(runner.calls.isEmpty)
+    }
+
+    func testANonzeroBootoutDoesNotFailTheForceStop() throws {
+        // launchctl bootout exits nonzero when the job was already gone and
+        // while a teardown is still in progress, so its exit status proves
+        // nothing.  The marker stays, nothing is thrown, and the caller's
+        // port check decides.
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        try FileManager.default.createDirectory(at: home.appendingPathComponent("Library/LaunchAgents"), withIntermediateDirectories: true)
+        try Data().write(to: home.appendingPathComponent("Library/LaunchAgents/app.botfleet.server.plist"))
+        let runner = MockCommands()
+        runner.failBootout = true
+        let launchdAsked = try StartupPolicy(home: home, commands: runner, uid: 501, environment: [:]).forceStopServer()
+        XCTAssertTrue(launchdAsked)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: home.appendingPathComponent(".botfleet/stopped.marker").path))
+    }
+
+    /// The outdated mapping covers every control route, not only the status
+    /// read, so the Fleet Services stop path reads the same server the same
+    /// way; a 404 on the health check itself is still a foreign service.
+    func testEveryLocalControlRouteReadsA404AsAnOutdatedServer() async {
+        MockURLProtocol.handler = { request in
+            if request.url!.path == "/api/health" { return (200, Data(#"{"app":"botfleet","pid":42,"ready":true}"#.utf8)) }
+            return (404, Data(#"{"error":"no route: POST /api/system/control/stop"}"#.utf8))
+        }
+        do { try await ControlAPI(session: mockSession()).stopServer(); XCTFail("Expected outdated server") }
+        catch { XCTAssertEqual(error as? ControlAPIError, .outdatedServer) }
+        MockURLProtocol.handler = { _ in (404, Data(#"{"error":"no route: GET /api/health"}"#.utf8)) }
+        do { _ = try await ControlAPI(session: mockSession()).status(); XCTFail("Expected foreign service") }
+        catch { XCTAssertEqual(error as? ControlAPIError, .foreignService) }
+    }
+
+    /// A remote host sits behind a gateway that can answer 404 for reasons of
+    /// its own, so its 404 stays a refusal that carries the server's text.
+    func testARemoteHostsMissingRouteStaysARefusal() async {
+        MockURLProtocol.handler = { request in
+            if request.url!.path == "/api/health" { return (200, Data(#"{"app":"botfleet","ready":true}"#.utf8)) }
+            return (404, Data(#"{"error":"no route: GET /api/system/control"}"#.utf8))
+        }
+        let remote = ServerHost(name: "Remote", baseURL: URL(string: "https://remote.example")!, isLocal: false)
+        do { _ = try await ControlAPI(session: mockSession(), host: remote).status(); XCTFail("Expected refusal") }
+        catch { XCTAssertEqual(error as? ControlAPIError, .refused("no route: GET /api/system/control")) }
+    }
+
+    /// The menu's server line and its Stop offer, as pure functions of what
+    /// the probe found.
+    func testTheServerLineSaysOlderThanControlBeforeAnythingElse() {
+        XCTAssertEqual(ManagedServices.serverStatusLine(apiUnavailable: false, serverOutdated: true, installedServerState: .running),
+                       "Server: running, but older than Control")
+        XCTAssertEqual(ManagedServices.serverStatusLine(apiUnavailable: false, serverOutdated: true, installedServerState: .notInstalled),
+                       "Server: running, but older than Control")
+        XCTAssertEqual(ManagedServices.serverStatusLine(apiUnavailable: true, serverOutdated: false, installedServerState: .stopped),
+                       "Server: stopped")
+        XCTAssertEqual(ManagedServices.serverStatusLine(apiUnavailable: false, serverOutdated: false, installedServerState: .notInstalled),
+                       "Server: not installed")
+        XCTAssertEqual(ManagedServices.serverStatusLine(apiUnavailable: false, serverOutdated: false, installedServerState: .running),
+                       "Server: unresponsive")
+        XCTAssertEqual(ManagedServices.serverStatusLine(apiUnavailable: false, serverOutdated: false, installedServerState: .unknown),
+                       "Server: unknown")
+    }
+
+    func testStopIsOfferedForAnAnsweringServerAndForAnOutdatedOne() {
+        XCTAssertTrue(ManagedServices.canStopServer(statusAvailable: true, serverOutdated: false))
+        XCTAssertTrue(ManagedServices.canStopServer(statusAvailable: false, serverOutdated: true))
+        XCTAssertFalse(ManagedServices.canStopServer(statusAvailable: false, serverOutdated: false))
+    }
+
+    /// An outdated server proved alive by the health check is running for
+    /// the fleet services too: the server row keeps its Stop and the MCP
+    /// server stays wanted, instead of both reading unknown.
+    func testAnOutdatedServerIsRunningForTheFleetServices() {
+        XCTAssertEqual(ManagedServices.serverState(statusAvailable: false, serverOutdated: true,
+                                                   installedServerState: .stopped, serverPresence: .present), .running)
+        XCTAssertEqual(ManagedServices.serverState(statusAvailable: false, serverOutdated: true,
+                                                   installedServerState: .notInstalled, serverPresence: .present), .running)
+        XCTAssertEqual(ManagedServices.serverState(statusAvailable: false, serverOutdated: false,
+                                                   installedServerState: .stopped, serverPresence: .present), .unknown)
+    }
+
+    /// What the forced stop says afterwards: nothing when the port closed,
+    /// Free Port only when something is proven to be listening, and a plain
+    /// "could not check" when the probe could not tell.
+    func testTheForcedStopNamesFreePortOnlyForAProvenListener() {
+        XCTAssertNil(ManagedServices.forceStopOutcome(answer: .absent, launchdAsked: true))
+        XCTAssertNil(ManagedServices.forceStopOutcome(answer: .absent, launchdAsked: false))
+        let listening = ManagedServices.forceStopOutcome(answer: .present, launchdAsked: true) ?? ""
+        XCTAssertTrue(listening.contains("Free Port 8799"))
+        XCTAssertTrue(listening.contains("hard kill"))
+        XCTAssertTrue(listening.contains("booted out"))
+        let noAgent = ManagedServices.forceStopOutcome(answer: .present, launchdAsked: false) ?? ""
+        XCTAssertTrue(noAgent.contains("not installed"))
+        XCTAssertTrue(noAgent.contains("Free Port 8799"))
+        let blind = ManagedServices.forceStopOutcome(answer: .unknown, launchdAsked: true) ?? ""
+        XCTAssertTrue(blind.contains("could not check port 8799"))
+        XCTAssertFalse(blind.contains("Free Port"))
+        XCTAssertFalse((ManagedServices.forceStopOutcome(answer: .unknown, launchdAsked: false) ?? "").contains("booted out"))
     }
 
     /// A server that does not answer the health check at all really is gone.
@@ -258,11 +423,159 @@ final class ControlTests: XCTestCase {
         try Data("BF_CONTROL_STARTUP_POLICY_V1".utf8).write(to: home.appendingPathComponent("apps/botfleet-server-start.sh"))
         try Data().write(to: home.appendingPathComponent("Library/LaunchAgents/app.botfleet.server.plist"))
         let marker = home.appendingPathComponent(".botfleet/stopped.marker")
-        try Data().write(to: marker)
+        let contents = Data("owner-stop-start".utf8)
+        try contents.write(to: marker)
         let runner = MockCommands()
         runner.failKickstart = true
         XCTAssertThrowsError(try StartupPolicy(home: home, commands: runner, uid: 501, environment: [:]).startServer())
+        XCTAssertEqual(try Data(contentsOf: marker), contents)
+    }
+
+    func testSettledStartRestoresTheDeliberateStopWhenTheServerNeverRuns() async throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        try FileManager.default.createDirectory(at: home.appendingPathComponent("apps"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: home.appendingPathComponent("Library/LaunchAgents"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".botfleet"), withIntermediateDirectories: true)
+        try Data("BF_CONTROL_STARTUP_POLICY_V1".utf8).write(to: home.appendingPathComponent("apps/botfleet-server-start.sh"))
+        try Data().write(to: home.appendingPathComponent("Library/LaunchAgents/app.botfleet.server.plist"))
+        let marker = home.appendingPathComponent(".botfleet/stopped.marker")
+        let contents = Data("owner-stop-settled".utf8)
+        try contents.write(to: marker)
+        // The kickstart succeeds, and the job never shows a process.
+        let runner = MockCommands()
+        let policy = StartupPolicy(home: home, commands: runner, uid: 501, environment: [:])
+        let stopped = try await policy.startServerAndSettle(attempts: 0)
+        XCTAssertNotEqual(stopped, .running)
+        XCTAssertTrue(runner.calls.contains("/bin/launchctl kickstart gui/501/app.botfleet.server"))
+        XCTAssertEqual(try Data(contentsOf: marker), contents)
+        // The same start that comes up leaves the stop lifted.
+        runner.launchctlListing = "PID\tStatus\tLabel\n1234\t0\tapp.botfleet.server"
+        let running = try await policy.startServerAndSettle(attempts: 0)
+        XCTAssertEqual(running, .running)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    func testRestartServerClearsTheDeliberateStopAndReplacesTheRunningInstance() throws {
+        // The installed wrapper stays down while the deliberate-stop marker
+        // exists, so a restart that left the marker in place would report a
+        // server that never came back.
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        try FileManager.default.createDirectory(at: home.appendingPathComponent("apps"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: home.appendingPathComponent("Library/LaunchAgents"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".botfleet"), withIntermediateDirectories: true)
+        try Data("BF_CONTROL_STARTUP_POLICY_V1".utf8).write(to: home.appendingPathComponent("apps/botfleet-server-start.sh"))
+        try Data().write(to: home.appendingPathComponent("Library/LaunchAgents/app.botfleet.server.plist"))
+        let marker = home.appendingPathComponent(".botfleet/stopped.marker")
+        try Data().write(to: marker)
+        let runner = MockCommands()
+        runner.agentIsLoaded = true
+        try StartupPolicy(home: home, commands: runner, uid: 501, environment: [:]).restartServer()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+        XCTAssertTrue(runner.calls.contains("/bin/launchctl kickstart -k gui/501/app.botfleet.server"))
+    }
+
+    func testAFailedRestartRestoresTheDeliberateStop() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        try FileManager.default.createDirectory(at: home.appendingPathComponent("apps"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: home.appendingPathComponent("Library/LaunchAgents"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".botfleet"), withIntermediateDirectories: true)
+        try Data("BF_CONTROL_STARTUP_POLICY_V1".utf8).write(to: home.appendingPathComponent("apps/botfleet-server-start.sh"))
+        try Data().write(to: home.appendingPathComponent("Library/LaunchAgents/app.botfleet.server.plist"))
+        let marker = home.appendingPathComponent(".botfleet/stopped.marker")
+        let contents = Data("owner-stop-restart".utf8)
+        try contents.write(to: marker)
+        let runner = MockCommands()
+        runner.failKickstart = true
+        XCTAssertThrowsError(try StartupPolicy(home: home, commands: runner, uid: 501, environment: [:]).restartServer())
+        XCTAssertEqual(try Data(contentsOf: marker), contents)
+    }
+
+    func testServerStartAndRestartRefuseUnsafeStopMarkers() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        try FileManager.default.createDirectory(at: home.appendingPathComponent("apps"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: home.appendingPathComponent("Library/LaunchAgents"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".botfleet"), withIntermediateDirectories: true)
+        try Data("BF_CONTROL_STARTUP_POLICY_V1".utf8).write(to: home.appendingPathComponent("apps/botfleet-server-start.sh"))
+        try Data().write(to: home.appendingPathComponent("Library/LaunchAgents/app.botfleet.server.plist"))
+        let marker = home.appendingPathComponent(".botfleet/stopped.marker")
+        let session = home.appendingPathComponent(".botfleet/startup-session")
+        let priorSession = Data("original-boot-session\n".utf8)
+        try priorSession.write(to: session)
+        let oversized = Data(repeating: 0x41, count: 64 * 1024 + 1)
+        try oversized.write(to: marker)
+        let runner = MockCommands()
+        let startup = StartupPolicy(home: home, commands: runner, uid: 501, environment: [:])
+        XCTAssertThrowsError(try startup.startServer())
+        XCTAssertThrowsError(try startup.restartServer())
+        XCTAssertEqual(try Data(contentsOf: marker), oversized)
+        XCTAssertEqual(try Data(contentsOf: session), priorSession)
+        XCTAssertTrue(runner.calls.isEmpty)
+
+        try FileManager.default.removeItem(at: marker)
+        let target = home.appendingPathComponent("owner-stop-metadata")
+        let contents = Data("owner-stop".utf8)
+        try contents.write(to: target)
+        try FileManager.default.createSymbolicLink(at: marker, withDestinationURL: target)
+        XCTAssertThrowsError(try startup.startServer())
+        XCTAssertThrowsError(try startup.restartServer())
+        XCTAssertEqual(try Data(contentsOf: target), contents)
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: marker.path), target.path)
+        XCTAssertEqual(try Data(contentsOf: session), priorSession)
+        XCTAssertTrue(runner.calls.isEmpty)
+    }
+
+    func testUnparkedCompanionStartUsesOnlyTheCompanionAgent() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        try FileManager.default.createDirectory(at: home.appendingPathComponent("Library/LaunchAgents"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".botfleet"), withIntermediateDirectories: true)
+        try Data().write(to: home.appendingPathComponent("Library/LaunchAgents/app.botfleet.companion.plist"))
+        let marker = home.appendingPathComponent(".botfleet/stopped.marker")
+        let runner = MockCommands()
+        try StartupPolicy(home: home, commands: runner, uid: 501, environment: [:]).startCompanion()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+        XCTAssertEqual(runner.calls, [
+            "/bin/launchctl enable gui/501/app.botfleet.companion",
+            "/bin/launchctl print gui/501/app.botfleet.companion",
+            "/bin/launchctl bootstrap gui/501 \(home.path)/Library/LaunchAgents/app.botfleet.companion.plist",
+            "/bin/launchctl kickstart gui/501/app.botfleet.companion"
+        ])
+    }
+
+    func testParkedCompanionStartAndRestartRefuseBeforeAnyCommand() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        try FileManager.default.createDirectory(at: home.appendingPathComponent("Library/LaunchAgents"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".botfleet"), withIntermediateDirectories: true)
+        try Data().write(to: home.appendingPathComponent("Library/LaunchAgents/app.botfleet.companion.plist"))
+        let marker = home.appendingPathComponent(".botfleet/stopped.marker")
+        try Data().write(to: marker)
+        let runner = MockCommands()
+        let startup = StartupPolicy(home: home, commands: runner, uid: 501, environment: [:])
+        XCTAssertThrowsError(try startup.startCompanion()) { error in
+            XCTAssertTrue(error.localizedDescription.contains("Start the BotFleet Server"))
+        }
+        XCTAssertThrowsError(try startup.restartCompanion())
         XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
+        XCTAssertTrue(runner.calls.isEmpty)
+    }
+
+    func testUnparkedCompanionRestartReplacesOnlyItsOwnInstance() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        try FileManager.default.createDirectory(at: home.appendingPathComponent("Library/LaunchAgents"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".botfleet"), withIntermediateDirectories: true)
+        try Data().write(to: home.appendingPathComponent("Library/LaunchAgents/app.botfleet.companion.plist"))
+        let marker = home.appendingPathComponent(".botfleet/stopped.marker")
+        let runner = MockCommands()
+        runner.agentIsLoaded = true
+        try StartupPolicy(home: home, commands: runner, uid: 501, environment: [:]).restartCompanion()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+        XCTAssertTrue(runner.calls.contains("/bin/launchctl kickstart -k gui/501/app.botfleet.companion"))
     }
 
     private func mockSession() -> URLSession {
@@ -277,12 +590,21 @@ private final class MockCommands: CommandRunning {
     let boot = "4F9389E9-AFE4-42C8-AE2C-7FEEDBA31B6C"
     var calls: [String] = []
     var failKickstart = false
+    /// True when `launchctl bootout` fails the way launchctl fails.
+    var failBootout = false
     var launchctlListing = "PID\tStatus\tLabel\n-\t0\tother.service"
+    /// True when launchctl already knows the agent.
+    var agentIsLoaded = false
     func run(_ executable: String, _ arguments: [String]) throws -> String {
         calls.append(([executable] + arguments).joined(separator: " "))
         if executable == "/usr/sbin/sysctl" { return boot }
+        if failBootout && arguments.first == "bootout" { throw CommandExitError(output: "Boot-out failed: 5: Input/output error") }
         if arguments == ["list"] { return launchctlListing }
-        if arguments.first == "print" { throw StartupPolicyError.commandFailed }
+        if arguments.first == "print" {
+            if agentIsLoaded { return "state = running" }
+            // launchctl exits nonzero for a job that is not loaded, saying so on stderr.
+            throw CommandExitError(output: "", errorOutput: "Could not find service in domain for uid: 501")
+        }
         if failKickstart && arguments.first == "kickstart" { throw StartupPolicyError.commandFailed }
         return ""
     }

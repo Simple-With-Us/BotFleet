@@ -21,12 +21,18 @@ settings:
     # Native Sentry. Empty unless xcodebuild/CI passes SENTRY_DSN=...
     # Do not put a live DSN in this file or in Info.plist.
     SENTRY_DSN: ""
+    # Release stamp for native Sentry. Empty unless xcodebuild/CI passes
+    # SOURCE_COMMIT=...; MacSentryPolicy uses it as the release name.
+    SOURCE_COMMIT: ""
 packages:
   CompanionCore:
     path: .
   Sentry:
     url: https://github.com/getsentry/sentry-cocoa.git
-    from: 9.30.2
+    from: 9.33.0
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle.git
+    exactVersion: 2.10.1
 targets:
   BotFleet:
     type: application
@@ -56,8 +62,8 @@ targets:
         # the ship script passes both values on the xcodebuild command line, and
         # reads this one as the build-number FLOOR, so it must stay below the
         # commit count of any commit that can ship.
-        MARKETING_VERSION: "1.0.2222"
-        CURRENT_PROJECT_VERSION: "2222"
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "202610290000"
         SWIFT_VERSION: '5.9'
         TARGETED_DEVICE_FAMILY: '1,2'
         SUPPORTS_MACCATALYST: false
@@ -150,8 +156,8 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: app.botfleet.ios.widgets
         DEVELOPMENT_TEAM: CC8UTF7ATG
         CODE_SIGN_STYLE: Automatic
-        MARKETING_VERSION: "1.0.2222"
-        CURRENT_PROJECT_VERSION: "2222"
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "202610290000"
         SWIFT_VERSION: '5.9'
         TARGETED_DEVICE_FAMILY: '1,2'
         ENABLE_ON_DEMAND_RESOURCES: false
@@ -182,12 +188,15 @@ targets:
     platform: macOS
     sources:
     - path: MacApp
+    - path: MacUpdater
     - path: Assets.xcassets
     dependencies:
     - package: CompanionCore
       product: CompanionCore
     - package: Sentry
       product: Sentry
+    - package: Sparkle
+      product: Sparkle
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.botfleet.macos
@@ -198,10 +207,13 @@ targets:
         # release assets keep the BotFleetMac- prefix so the Sparkle and
         # electron-updater feeds never share a name.
         PRODUCT_NAME: BotFleet
+        # Public release metadata only; unresolved values keep the updater unavailable.
+        BOTFLEET_NATIVE_UPDATE_FEED_URL: ""
+        BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY: ""
         DEVELOPMENT_TEAM: CC8UTF7ATG
         CODE_SIGN_STYLE: Automatic
-        MARKETING_VERSION: "1.0.2222"
-        CURRENT_PROJECT_VERSION: "2222"
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "202610290000"
         SWIFT_VERSION: '5.9'
         MACOSX_DEPLOYMENT_TARGET: '14.0'
         # Notarization refuses a bundle without the Hardened Runtime, and
@@ -224,6 +236,18 @@ targets:
         # build settings.
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        # Same rewrite rule for the Sentry DSN (BF-2541):  MacSentryTelemetry
+        # reads SENTRY_DSN from the Info.plist, and the key must be declared
+        # here or `xcodegen generate` drops it before the archive is built.
+        # The base setting above defaults to empty, which keeps shipped
+        # builds inert unless a build passes SENTRY_DSN=... the way the iOS
+        # ship stamps it.
+        SENTRY_DSN: $(SENTRY_DSN)
+        SOURCE_COMMIT: $(SOURCE_COMMIT)
+        SUFeedURL: $(BOTFLEET_NATIVE_UPDATE_FEED_URL)
+        SUPublicEDKey: $(BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY)
+        SUScheduledCheckInterval: 21600
+        SUAutomaticallyUpdate: false
         # The same rewrite rule applies to the privacy strings: the Mac app
         # requests the microphone and speech recognition for voice capture, and
         # macOS TERMINATES an app that asks for a permission whose usage

@@ -15,6 +15,7 @@
 import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createPublicKey, verify } from "node:crypto";
 import { NATIVE_FEED_NAME, buildNumberFor, nativeArtifactNames } from "./native-appcast.mjs";
 
 export function parseAppcast(text) {
@@ -36,10 +37,27 @@ export function parseAppcast(text) {
   return { items };
 }
 
-export function verifyNativeRelease(directory, version, { requireSignature = false } = {}) {
+/** Sparkle 2.10.1 signs raw archive bytes with Ed25519; RFC 8410 wraps its raw 32-byte public key. */
+export function verifyNativeArchiveSignature(bytes, signature, publicKey) {
+  const fail = () => { throw new Error("Native update Ed25519 signature verification failed."); };
+  if (!/^[A-Za-z0-9+/]{43}=$/.test(publicKey ?? "") ||
+      !/^[A-Za-z0-9+/]{86}==$/.test(signature ?? "")) fail();
+  const rawKey = Buffer.from(publicKey, "base64"), rawSignature = Buffer.from(signature, "base64");
+  if (rawKey.length !== 32 || rawSignature.length !== 64 ||
+      rawKey.toString("base64") !== publicKey || rawSignature.toString("base64") !== signature) fail();
+  let valid = false;
+  try {
+    const key = createPublicKey({ key: Buffer.concat([Buffer.from("302a300506032b6570032100", "hex"), rawKey]),
+      format: "der", type: "spki" });
+    valid = verify(null, bytes, key, rawSignature);
+  } catch { fail(); }
+  if (!valid) fail();
+}
+
+export function verifyNativeRelease(directory, version, { requireSignature = false, publicKey, build } = {}) {
   const rootDir = resolve(directory);
   const { zip, dmg } = nativeArtifactNames(version);
-  const build = buildNumberFor(version);
+  const buildNumber = buildNumberFor(version, build);
 
   for (const name of [zip, dmg, NATIVE_FEED_NAME]) {
     if (!existsSync(join(rootDir, name))) {
@@ -66,9 +84,9 @@ export function verifyNativeRelease(directory, version, { requireSignature = fal
   const { items } = parseAppcast(readFileSync(join(rootDir, NATIVE_FEED_NAME), "utf8"));
   if (items.length === 0) throw new Error(`${NATIVE_FEED_NAME}: no items`);
   const [head, ...older] = items;
-  if (head.shortVersion !== version || head.build !== build) {
+  if (head.shortVersion !== version || head.build !== buildNumber) {
     throw new Error(
-      `${NATIVE_FEED_NAME}: head item is ${head.shortVersion}/${head.build}, release is ${version}/${build}`,
+      `${NATIVE_FEED_NAME}: head item is ${head.shortVersion}/${head.build}, release is ${version}/${buildNumber}`,
     );
   }
   for (let i = 1; i < items.length; i += 1) {
@@ -90,17 +108,19 @@ export function verifyNativeRelease(directory, version, { requireSignature = fal
         `regenerate the appcast after stapling`,
     );
   }
-  if (requireSignature && !head.edSignature) {
+  const verifySignature = requireSignature || publicKey !== undefined;
+  if (verifySignature && !head.edSignature) {
     throw new Error(
       `${NATIVE_FEED_NAME}: head item carries no sparkle:edSignature; ` +
         `sign the stapled ZIP with sign_update before publishing`,
     );
   }
+  if (verifySignature) verifyNativeArchiveSignature(readFileSync(join(rootDir, zip)), head.edSignature, publicKey);
   console.log(
-    `native release ${version} (build ${build}): DMG, ZIP and appcast agree` +
-      (head.edSignature ? " (EdDSA-signed)" : " (unsigned draft)"),
+    `native release ${version} (build ${buildNumber}): DMG, ZIP and appcast agree` +
+      (verifySignature ? " (Ed25519 verified)" : " (unverified draft; not activatable)"),
   );
-  return { zip, dmg, signed: Boolean(head.edSignature) };
+  return { zip, dmg, signed: verifySignature };
 }
 
 // Compare physical paths.  Node's ESM loader realpaths the entry module, so an
@@ -118,10 +138,18 @@ if (isEntryModule()) {
   const [, , directory, version, ...rest] = process.argv;
   if (!directory || !version) {
     throw new Error(
-      "usage: node scripts/verify-native-release.mjs <directory> <version> [--require-signature]",
+      "usage: node scripts/verify-native-release.mjs <directory> <version> [--require-signature --public-key KEY] [--build N]",
     );
+  }
+  const buildIndex = rest.indexOf("--build");
+  const build = buildIndex === -1 ? undefined : rest[buildIndex + 1];
+  const keyIndex = rest.indexOf("--public-key");
+  if (keyIndex !== -1 && (!rest[keyIndex + 1] || rest[keyIndex + 1].startsWith("--"))) {
+    throw new Error("--public-key requires a value.");
   }
   verifyNativeRelease(directory, version, {
     requireSignature: rest.includes("--require-signature"),
+    publicKey: keyIndex === -1 ? undefined : rest[keyIndex + 1],
+    build,
   });
 }

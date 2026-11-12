@@ -14,6 +14,7 @@ import { isAbsolute, join, resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
 import type { RequestOutcome } from "../contracts.ts";
+import { ToolResultArtifactStore, resetSharedToolResultArtifacts, sharedToolResultArtifacts } from "../tool-result-history.ts";
 import { createTurnToolHost, type TurnToolHostDeps } from "./host.ts";
 import { listAgentsResponse, type AgentBot, type AgentRequestResult } from "./agents.ts";
 
@@ -65,6 +66,7 @@ const hostFor = (
     workspace?: boolean;
     cwd?: string;
     launchIdentity?: { seat: string | null; session: string };
+    toolResultArchive?: boolean;
   } = {},
 ) =>
   createTurnToolHost({
@@ -76,6 +78,7 @@ const hostFor = (
     workspace: ctx.workspace,
     cwd: ctx.cwd,
     launchIdentity: ctx.launchIdentity,
+    toolResultArchive: ctx.toolResultArchive,
     deps: deps(over),
   });
 
@@ -547,6 +550,27 @@ describe("read_file asks only when the path is a credential store", () => {
     // and on Windows that is `C:\tmp\.ssh\config`.
     expect(isAbsolute(asking.asks[0]!.summary.replace("read file ", ""))).toBe(true);
     expect(asking.asks[0]!.summary.replace(/\\/g, "/")).toBe(`read file ${resolve(cwd, "../.ssh/config").replace(/\\/g, "/")}`);
+  });
+});
+
+describe("read_tool_result", () => {
+  it("returns the stored artifact when the turn offers the tool, and refuses it otherwise", async () => {
+    resetSharedToolResultArtifacts();
+    const store = sharedToolResultArtifacts();
+    expect(store).toBeInstanceOf(ToolResultArtifactStore);
+    store.put("call_9", "full tool result body");
+    const offered = await hostFor({}, { localComputer: true, toolResultArchive: true }).execute(
+      { id: "1", name: "read_tool_result", arguments: { artifact_id: "call_9", offset: 5, limit: 4 } },
+      runtime,
+    );
+    expect(offered).toMatchObject({ kind: "result", content: "tool", detail: "21 characters" });
+    const hidden = await hostFor({}, { localComputer: true }).execute(
+      { id: "2", name: "read_tool_result", arguments: { artifact_id: "call_9" } },
+      runtime,
+    );
+    expect(hidden.kind).toBe("error");
+    expect(hidden.content).toContain("is not available");
+    resetSharedToolResultArtifacts();
   });
 });
 
