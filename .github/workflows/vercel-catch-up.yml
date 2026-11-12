@@ -30,7 +30,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@v7
         with:
-          node-version: '24'
+          node-version: '26'
       - run: node --test scripts/deploy/vercel-catch-up.node-test.mjs
 
   deploy:
@@ -51,18 +51,39 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@v7
         with:
-          node-version: '24'
-      - name: Load deploy token from shared Fleet-OPS secret scope
+          node-version: '26'
+      - name: Check Dedicated Service Token Binding
+        id: credentials
+        env:
+          INFISICAL_TOKEN: ${{ secrets.BOTFLEET_VERCEL_CATCHUP_READ_TOKEN }}
+          INFISICAL_SECRET_PATH: ${{ vars.INFISICAL_VERCEL_CATCH_UP_SECRET_PATH }}
+        run: |
+          canonical_non_root=true
+          case "$INFISICAL_SECRET_PATH" in
+            ''|'/'|[!/]*) canonical_non_root=false ;;
+            *'//'*|*/./*|*/../*|*/.|*/..|*'*'*|*'?'*|*'['*|*']'*|*'{'*|*'}'*) canonical_non_root=false ;;
+          esac
+          if [ -n "$INFISICAL_TOKEN" ] && [ "$canonical_non_root" = true ]; then
+            echo 'available=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'available=false' >> "$GITHUB_OUTPUT"
+            echo '::notice::Vercel catch-up is paused until its dedicated token and non-root Infisical folder are bound.'
+            echo 'Vercel catch-up is paused until its dedicated token and non-root Infisical folder are bound.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Load deploy token through its dedicated Fleet-OPS read binding
+        if: steps.credentials.outputs.available == 'true'
         env:
           INFISICAL_PROJECT_ID: 8dae6d03-8f12-48b2-adf3-e5c1b881c8c5
           INFISICAL_ENVIRONMENT: prod
-          INFISICAL_SECRET_PATH: /
+          INFISICAL_SECRET_PATH: ${{ vars.INFISICAL_VERCEL_CATCH_UP_SECRET_PATH }}
           INFISICAL_NAMES: VERCEL_TOKEN
           INFISICAL_REQUIRED: VERCEL_TOKEN
-          INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_AUTOMATION_CLIENT_ID }}
-          INFISICAL_CLIENT_SECRET: ${{ secrets.INFISICAL_AUTOMATION_CLIENT_SECRET }}
+          # Binding is pending AFC-600 scope and registry verification.
+          # No broad machine identity fallback is permitted.
+          INFISICAL_TOKEN: ${{ secrets.BOTFLEET_VERCEL_CATCHUP_READ_TOKEN }}
         run: node scripts/infisical-fetch.mjs
       - name: Check binding, deployed SHA, cooldown and exact-main CI
+        if: steps.credentials.outputs.available == 'true'
         id: gate
         run: node scripts/deploy/vercel-catch-up.mjs prepare
       - name: Install pinned Vercel CLI

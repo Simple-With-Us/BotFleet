@@ -121,6 +121,15 @@ struct ChatListView: View {
         }
 #endif
         .task { _ = await session.configStatus() }
+        // Hydration carries one message per thread; backfill the stub
+        // threads so pending-approval derivation (Approvals, the list's
+        // waiting markers) sees cards that are not a thread's newest
+        // message.  Keyed on live so a reconnect re-runs it for threads
+        // stubbed by the reconnect hydrate.
+        .task(id: sessionIsLive) {
+            guard sessionIsLive else { return }
+            await session.backfillStubThreads()
+        }
         // Warms `session.instanceDriverKinds` before any chat is opened, so
         // the chat header's provider mark resolves synchronously instead of
         // firing a network call per render. Quiet path — offline/cancel must
@@ -278,7 +287,8 @@ struct ChatListView: View {
                                     at: summary.lastActivity,
                                     state: BotState.forChat(summary.chat, in: session.state),
                                     waiting: waiting.contains(summary.chat.id),
-                                    last: index == rows.count - 1 && nestedTasks(for: summary.chat).isEmpty && (query.isEmpty ? customSectionNames.isEmpty && !showingBotChats : true)
+                                    last: index == rows.count - 1 && nestedTasks(for: summary.chat).isEmpty && (query.isEmpty ? customSectionNames.isEmpty && !showingBotChats : true),
+                                    fill: fillLabel(for: summary.chat)
                                 )
                             }
                             if session.config?.allowsMultipleBotThreads == true {
@@ -286,7 +296,7 @@ struct ChatListView: View {
                                     Button {
                                         Task { await openTask(task, in: summary.chat) }
                                     } label: {
-                                        ThreadRow(task: task, active: summary.chat.threadId == task.threadId)
+                                        ThreadRow(task: task, active: summary.chat.threadId == task.threadId, viewed: session.state.viewingThreadId(forBotId: summary.chat.id) == task.threadId, fill: fillLabel(task: task, chat: summary.chat))
                                     }
                                     .buttonStyle(.plain)
                                 }
@@ -312,9 +322,10 @@ struct ChatListView: View {
                                                     chat: summary.chat,
                                                     preview: summary.preview,
                                                     at: summary.lastActivity,
-                                                    state: BotState.forChat(summary.chat, in: session.state),
-                                                    waiting: waiting.contains(summary.chat.id),
-                                                    last: index == sectionRows.count - 1 && nestedTasks(for: summary.chat).isEmpty && (section == customSectionNames.last ? !showingBotChats : false)
+                                    state: BotState.forChat(summary.chat, in: session.state),
+                                    waiting: waiting.contains(summary.chat.id),
+                                    last: index == sectionRows.count - 1 && nestedTasks(for: summary.chat).isEmpty && (section == customSectionNames.last ? !showingBotChats : false),
+                                    fill: fillLabel(for: summary.chat)
                                                 )
                                             }
                                             if session.config?.allowsMultipleBotThreads == true {
@@ -322,7 +333,7 @@ struct ChatListView: View {
                                                     Button {
                                                         Task { await openTask(task, in: summary.chat) }
                                                     } label: {
-                                                        ThreadRow(task: task, active: summary.chat.threadId == task.threadId)
+                                                        ThreadRow(task: task, active: summary.chat.threadId == task.threadId, viewed: session.state.viewingThreadId(forBotId: summary.chat.id) == task.threadId, fill: fillLabel(task: task, chat: summary.chat))
                                                     }
                                                     .buttonStyle(.plain)
                                                 }
@@ -349,7 +360,8 @@ struct ChatListView: View {
                                             at: summary.lastActivity,
                                             state: BotState.forChat(summary.chat, in: session.state),
                                             waiting: waiting.contains(summary.chat.id),
-                                            last: index == botChatRows.count - 1
+                                            last: index == botChatRows.count - 1,
+                                            fill: fillLabel(for: summary.chat)
                                         )
                                     }
                                 }
@@ -702,6 +714,32 @@ struct ChatListView: View {
         all.filter(\.chat.isBotToBot)
     }
 
+    private func catalogWindow(for selection: ModelSelection) -> Int? {
+        session.cachedInstances
+            .first { $0.instanceId == selection.instanceId }?
+            .models.options.first { $0.id == selection.model }?
+            .contextWindow
+    }
+
+    private func fillLabel(for chat: Chat) -> String? {
+        guard case let .bot(bot) = chat else { return nil }
+        let task = bot.tasks?.first { $0.threadId == bot.threadId }
+        return ContextMeterMath.badge(
+            used: task?.usage?.lastInput,
+            reportedWindow: task?.usage?.contextWindow,
+            catalogWindow: catalogWindow(for: task?.modelSelection ?? bot.modelSelection)
+        )
+    }
+
+    private func fillLabel(task: BotTask, chat: Chat) -> String? {
+        guard case let .bot(bot) = chat else { return nil }
+        return ContextMeterMath.badge(
+            used: task.usage?.lastInput,
+            reportedWindow: task.usage?.contextWindow,
+            catalogWindow: catalogWindow(for: task.modelSelection ?? bot.modelSelection)
+        )
+    }
+
     private func nestedTasks(for chat: Chat) -> [BotTask] {
         guard session.config?.allowsMultipleBotThreads == true else { return [] }
         guard case let .bot(bot) = chat else { return [] }
@@ -712,8 +750,28 @@ struct ChatListView: View {
 
     private func openTask(_ task: BotTask, in chat: Chat) async {
         guard case let .bot(bot) = chat else { return }
-        await session.switchTask(task, for: bot)
-        if let live = session.state.bot(bot.id) { open(Chat.bot(live)) }
+        let live = session.state.bot(bot.id) ?? bot
+        // While the bot works, a non-active thread opens for reading only —
+        // becoming the execution target stays gated on the turn finishing,
+        // exactly as the tab switch was.
+        switch threadPickIntent(
+            busy: live.busy == true,
+            active: task.threadId == live.threadId,
+            viewing: session.state.viewingThreadId(forBotId: live.id) != nil,
+            canView: true
+        ) {
+        case .switchTo:
+            await session.switchTask(task, for: live)
+            if let next = session.state.bot(live.id) { open(Chat.bot(next)) }
+        case .view, .viewActive:
+            await session.viewThread(task, for: live)
+            if let next = session.state.bot(live.id) { open(Chat.bot(next)) }
+        case .none:
+            // The active thread with no view pinned: nothing to switch or
+            // view, but the row was tapped from the list, so the active
+            // chat still has to open.
+            open(Chat.bot(live))
+        }
     }
 
     /// Chats with an unanswered approval. Whole-fleet work: read it once per
@@ -1023,21 +1081,38 @@ struct GroupTile: View {
 struct ThreadRow: View {
     let task: BotTask
     var active = false
+    /// Open for reading while another thread runs. The eye says which of
+    /// the non-active rows is on screen; the active row keeps no mark.
+    var viewed = false
+    var fill: String? = nil
 
     var body: some View {
         HStack(spacing: 10) {
-            Image(systemName: "text.bubble")
+            Image(systemName: viewed ? "eye" : "text.bubble")
                 .font(.system(size: 14, weight: .medium))
                 .foregroundStyle(Color.secondary)
                 .frame(width: 22)
             VStack(alignment: .leading, spacing: 1) {
-                Text(task.title.isEmpty ? "Untitled" : task.title)
-                    .font(.system(size: 15, weight: active ? .semibold : .regular))
-                    .foregroundStyle(Color.primary)
-                    .lineLimit(1)
-                Text(RelativeStamp.list(task.lastActivity ?? task.createdAt))
-                    .font(.system(size: 12))
-                    .foregroundStyle(Color.secondary)
+                HStack(spacing: 6) {
+                    Text(task.title.isEmpty ? "Untitled Thread" : task.title)
+                        .font(.system(size: 15, weight: active ? .semibold : .regular))
+                        .foregroundStyle(Color.primary)
+                        .lineLimit(1)
+                    if let fill {
+                        Text(fill)
+                            .font(.system(size: 11, weight: .medium))
+                            .monospacedDigit()
+                            .foregroundStyle(Color.secondary)
+                    }
+                }
+                HStack(spacing: 4) {
+                    Text(RelativeStamp.list(task.lastActivity ?? task.createdAt))
+                    if viewed {
+                        Text("· Viewing")
+                    }
+                }
+                .font(.system(size: 12))
+                .foregroundStyle(Color.secondary)
             }
             Spacer(minLength: 0)
         }
@@ -1045,7 +1120,9 @@ struct ThreadRow: View {
         .padding(.trailing, 16)
         .padding(.vertical, 8)
         .contentShape(Rectangle())
-        .accessibilityLabel(task.title.isEmpty ? "Untitled thread" : task.title)
+        .accessibilityLabel(
+            (task.title.isEmpty ? "Untitled Thread" : task.title) + (viewed ? ", viewing" : "")
+        )
     }
 }
 
@@ -1056,6 +1133,7 @@ struct ChatRow: View {
     var state: BotState = .idle
     var waiting = false
     var last = false
+    var fill: String? = nil
 
     var body: some View {
         HStack(alignment: .top, spacing: 0) {
@@ -1087,6 +1165,17 @@ struct ChatRow: View {
                             .foregroundStyle(Color.primary)
                             .lineLimit(1)
                             .layoutPriority(1)
+
+                        if let fill {
+                            Text(fill)
+                                .font(.system(size: 12, weight: .medium))
+                                .monospacedDigit()
+                                .foregroundStyle(Color.secondary)
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 3)
+                                .background(Capsule().fill(Color.secondary.opacity(0.15)))
+                                .accessibilityLabel("Context \(fill) used")
+                        }
 
                         if chat.isOff {
                             Text("Off")

@@ -461,6 +461,38 @@ export const SETTINGS_SEARCH_ITEMS: SettingsSearchItem[] = [
     domId: "setting-secrets-infisical",
     badge: "Vault",
   },
+
+  // --- Resources ---
+  {
+    id: "resources:host",
+    sectionId: "resources",
+    sectionLabel: "Resources",
+    title: "Host Resource Readings",
+    subtitle: "Detected capacity, current use and per-resource enforcement for this host.",
+    keywords: ["resources", "host", "cpu", "cores", "memory", "ram", "swap", "disk", "root disk", "inodes", "io", "capacity", "current use", "enforcement"],
+    domId: "setting-resources-host",
+    badge: "Host",
+  },
+  {
+    id: "resources:thresholds",
+    sectionId: "resources",
+    sectionLabel: "Resources",
+    title: "Admission Thresholds (Saved vs Applied)",
+    subtitle: "Saved owner thresholds against what the runtime actually applies, with the reason when they differ.",
+    keywords: ["resources", "admission", "thresholds", "saved", "applied", "headroom", "reserved", "gates", "not applied", "not set"],
+    domId: "setting-resources-thresholds",
+    badge: "Thresholds",
+  },
+  {
+    id: "resources:headroom",
+    sectionId: "resources",
+    sectionLabel: "Resources",
+    title: "Owner-Set Headroom",
+    subtitle: "Reserved CPU, RAM and available-memory knobs, shown read-only.",
+    keywords: ["resources", "headroom", "reserved cpu", "reserved ram", "available memory", "owner", "read-only"],
+    domId: "setting-resources-headroom",
+    badge: "Headroom",
+  },
 ];
 
 export interface TextSegment {
@@ -518,6 +550,7 @@ export function searchSettings(rawQuery: string): SettingsSearchResult {
     "usage",
     "observability",
     "secrets",
+    "resources",
   ];
 
   const matchingSectionIds = new Set<AppSettingsSection>();

@@ -18,6 +18,7 @@ export const CREDENTIAL_ENV_NAMES = [
   "BOTFLEET_LINQAPP_API_KEY",
   "LINQ_API_TOKEN",
   "LINQ_WEBHOOK_SECRET",
+  "GITHUB_REQUEST_LOG_WEBHOOK_SECRET",
   "BOX_TOKEN",
   "OPENCODE_API_KEY",
   "OMB_TTS_KEY",
@@ -39,6 +40,11 @@ export const CREDENTIAL_ENV_NAMES = [
   // clear.
   "INFISICAL_UNIVERSAL_AUTH_CLIENT_ID",
   "INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET",
+  // The service tokens: the read token and the write token are credentials
+  // too, and a bundle collected on an install that exports them would
+  // otherwise carry them in the clear.
+  "INFISICAL_TOKEN",
+  "INFISICAL_WRITE_TOKEN",
 ];
 
 // Credential-shaped tokens: unmistakable formats are masked wherever they
@@ -60,15 +66,19 @@ const CREDENTIAL_TOKEN_FORMATS = [
   /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}/g,
   /\bgithub_pat_[A-Za-z0-9_]{20,}/g,
   /\bxox[abposr]-[A-Za-z0-9-]{20,}/g,
+  /\bxapp-[A-Za-z0-9-]{20,}/g,
   /\bsk_(?:live|test)_[A-Za-z0-9]{8,}/g,
   /\bak_[A-Za-z0-9_-]{16,}/g,
   /\bwhsec_[A-Za-z0-9_-]{8,}/g,
   /\bya29\.[A-Za-z0-9_-]{4,}/g,
   /\bglpat-[A-Za-z0-9_-]{8,}/g,
+  /\bgldt-[A-Za-z0-9_-]{8,}/g,
+  /\bglrtr?-[A-Za-z0-9_-]{8,}/g,
   /\bAKIA[0-9A-Z]{16}\b/g,
   /\bAIza[0-9A-Za-z_-]{30,}/g,
   /\bnpm_[A-Za-z0-9]{20,}/g,
   /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]*)?/g,
+  /\bst\.[A-Za-z0-9_-]{20,}(?:\.[A-Za-z0-9_-]{16,}){0,3}/g,
 ];
 const KEY_VALUE_PAIR =
   /\b([A-Za-z0-9_.-]*(?:api[_-]?key|apikey|secret|token|password|passwd|authorization|auth[_-]?token|access[_-]?key|private[_-]?key)s?)\s*[:=]\s*("[^"]*"|'[^']*'|[^\s"',;)\]}]+)/gi;

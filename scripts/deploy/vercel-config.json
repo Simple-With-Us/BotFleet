@@ -11,5 +11,6 @@
   "watch": [
     "apps/site/**",
     ".vercelignore"
-  ]
+  ],
+  "productionAlias": "botfleet.app"
 }

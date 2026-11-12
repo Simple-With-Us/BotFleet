@@ -422,13 +422,13 @@ describe("a model row keeps its name readable beside its tags", () => {
   it("renders the full slug in the title when the visible name is clipped", () => {
     const html = renderToStaticMarkup(
       <ModelRow
-        option={{ id: "m3.1", label: "MiniMax M3.1 Flash Preview · thinking" }}
+        option={{ id: "m3.1", label: "MiniMax M3.1 Flash · thinking" }}
         current={false}
         defaultId=""
         onPick={() => {}}
       />,
     );
-    expect(html).toContain('title="MiniMax M3.1 Flash Preview · thinking"');
+    expect(html).toContain('title="MiniMax M3.1 Flash · thinking"');
     expect(html).toContain("truncate");
   });
 });

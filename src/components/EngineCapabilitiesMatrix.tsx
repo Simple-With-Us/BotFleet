@@ -131,6 +131,8 @@ export function engineAvailability(
 function engineIdFor(instance: InstanceInfo): string | null {
   const normalized = instance.driverKind.replace(/Agent$/i, "").toLowerCase();
   if (normalized === "dsh" || normalized === "deepseek") return "deepseek-harness";
+  // The ZCode ACP bridge driver shares the headless zcode engine row.
+  if (normalized === "zcodeacp") return "zcode";
   return ENGINE_CAPABILITIES[normalized] ? normalized : null;
 }
 

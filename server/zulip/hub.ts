@@ -23,6 +23,8 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 
 import { BOT_OFF_CODE } from "../../shared/bot-power.ts";
 
+import { canonicalZulipRole } from "../launch-identity.ts";
+
 import {
   ZULIP_TOPIC_FOLLOWED,
   ZULIP_TOPIC_NONE,
@@ -33,11 +35,14 @@ import {
   type ZulipUserTopic,
 } from "./client.ts";
 import {
+  ZULIP_DEFAULT_INFISICAL_PATH,
   ZulipCredentialError,
   credentialSourceFor,
+  describeVaultLocation,
   resolveRealm,
   validZulipRole,
   verifyCredentialRealm,
+  zulipVaultNames,
   type ZulipCredentialSource,
   type ZulipCredentials,
   type ZulipVaultReader,
@@ -51,7 +56,7 @@ import {
   zulipToolArgsSchema,
   type ZulipTarget,
 } from "./outbound.ts";
-import { DEFAULT_OWNER_CLIENTS, classify, wakeVerdict, type Classification, type RouterContext, type WakeVerdict } from "./router.ts";
+import { DEFAULT_OWNER_CLIENTS, classify, wakeVerdict, type Classification, type RouterContext, type WakeReason, type WakeVerdict } from "./router.ts";
 import { HANDLED_RING_LIMIT, ZulipStateStore, emptyState, type ZulipBotState } from "./state.ts";
 import type { PluginEventEnvelope } from "../../shared/plugin-events.ts";
 import { ZULIP_OUTGOING_MAX_ATTEMPTS, ZulipOutgoingSpool } from "./outgoing-spool.ts";
@@ -61,11 +66,27 @@ import type { ZulipIdentity, ZulipInboundItem, ZulipMessage, ZulipOrigin, ZulipS
  *  owner (100) or admin (200) key is refused outright: a bot that can change
  *  the realm is not one the harness will drive. */
 const ALLOWED_ROLES = new Set([300, 400]);
+/** Legacy outgoing-webhook role URLs, kept live until every bot has been
+ *  re-pointed at its current role.  2026-10-28 (owner): the role BF-Builder
+ *  was renamed BF-Engineer, and anything still posting to
+ *  /zulip/outgoing/BF-BUILDER keeps reaching that bot.  The alias only chooses which
+ *  session answers the URL: the alias path still demands that session's own
+ *  outgoing token and its bot email, so it grants nothing the renamed bot's
+ *  own URL does not. */
+// The lookup key is a general `string` (a role read out of a webhook URL), so
+// this table genuinely needs an index signature rather than the narrow
+// literal-keyed type `satisfies` would infer.  An unmapped role reads back
+// `undefined`, which is exactly the "unknown" the caller answers.
+// oxlint-disable-next-line anti-slop/no-known-value-widening
+const LEGACY_OUTGOING_ROLE_ALIASES: Record<string, string> = {
+  "BF-BUILDER": "BF-ENGINEER",
+};
 const BACKOFF_MS = [5_000, 30_000, 60_000, 120_000];
 const PAGE = 100;
 const MAX_PAGES = 20;
 /** Followed topics a reconnect backfills, and pages per topic: what was said
- *  there while the queue was down (the fleet listener caps it the same way). */
+ *  there while the queue was down (the Operator's eavesdropper caps it the
+ *  same way). */
 const FOLLOWED_BACKFILL_TOPICS = 25;
 const FOLLOWED_BACKFILL_PAGES = 2;
 /** Zulip's own limit on a topic name. */
@@ -300,6 +321,14 @@ function describe(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** The reason a queued item carries, and the reason the plugin platform is
+ *  told.  A broadcast is mention-like:  the bot was called out to the whole
+ *  channel and may answer, and neither the stored item nor the plugin
+ *  envelope has a "broadcast" reason of its own. */
+function queuedVia(via: WakeReason): "mention" | "dm" | "followed" {
+  return via === "broadcast" ? "mention" : via;
+}
+
 /** One BF bot's connection to Zulip. */
 class ZulipSession {
   readonly abort = new AbortController();
@@ -342,14 +371,20 @@ class ZulipSession {
   private readonly hub: ZulipHub;
   readonly botId: string;
   readonly role: string;
+  /** The role the key is loaded under: the configured binding, which keeps a
+   *  legacy name (`BF-Builder-zuliprc`) while `role` carries the canonical
+   *  one.  Renaming the Zulip bot and its credential is an owner migration
+   *  step (docs/launch-identity.md). */
+  readonly credentialRole: string;
   readonly realm: string;
 
   // Plain fields, not constructor parameter properties: the server runs under
   // Node's strip-only TypeScript, which refuses those at load time.
-  constructor(hub: ZulipHub, botId: string, role: string, realm: string) {
+  constructor(hub: ZulipHub, botId: string, role: string, realm: string, credentialRole?: string) {
     this.hub = hub;
     this.botId = botId;
     this.role = role;
+    this.credentialRole = credentialRole ?? role;
     this.realm = realm;
     this.state = hub.store.load(botId, role);
     this.status = { botId, role, state: "starting", pending: this.state.pending.length, since: hub.now() };
@@ -493,6 +528,7 @@ class ZulipSession {
       } catch (e) {
         if (signal.aborted) return;
         if (e instanceof ZulipCredentialError || e instanceof RoleRefused) {
+          if (e instanceof ZulipCredentialError) this.hub.warnVaultUnreadableOnce(e, this.credentialRole);
           this.setStatus("disabled", e.message);
           return;
         }
@@ -539,7 +575,8 @@ class ZulipSession {
         "missing",
       );
     }
-    const creds = await source.load(this.role);
+    const creds = await source.load(this.credentialRole);
+    this.hub.noteVaultCredentialLoaded(creds);
     verifyCredentialRealm(creds, this.realm);
     this.creds = creds;
     this.client = new ZulipClient(creds, this.realm, {
@@ -777,6 +814,17 @@ export class ZulipHub {
   /** Sessions being stopped.  A replacement for the same bot waits for the
    *  old one to finish, so two sessions never write one bot's state file. */
   private readonly stopping = new Map<string, Promise<void>>();
+  /** Vault folders plus refusal status (a refusal) and folder+role pairs
+   *  (missing names) the consolidated unreadable-folder warn line has
+   *  already been logged for, so a scoped token that cannot read `/zulip`
+   *  warns once per distinct outage no matter how many bots are bound or
+   *  how often the reconcile timer retries them.  A successful credential
+   *  load from a folder and a Zulip settings change clear that folder's
+   *  entries, so a later outage warns again. */
+  private readonly vaultUnreadableWarned = new Set<string>();
+  /** The Zulip settings as last seen by `reconcile`, fingerprinted so a
+   *  settings change can clear the warned set above. */
+  private lastSettingsFingerprint: string | undefined;
   private readonly outgoingSpool: ZulipOutgoingSpool;
   private readonly outgoingRetry = new Map<string, number>();
   private outgoingDraining = false;
@@ -823,6 +871,59 @@ export class ZulipHub {
     });
   }
 
+  /** One consolidated warn line when the vault folder the Infisical source
+   *  reads is refused (401/403/404) or holds none of a role's expected
+   *  names.  The per-bot `disabled` line still carries the precise reason;
+   *  this is the single operator-facing signal: once per folder and status
+   *  for a refusal, once per folder and role for missing names (a shared folder
+   *  may hold other roles).  Path and names only, never a value. */
+  warnVaultUnreadableOnce(error: ZulipCredentialError, role: string): void {
+    const vault = error.vaultUnreadable;
+    if (!vault) return;
+    const key = vault.status === undefined ? `${vault.where} ${role}` : `${vault.where} ${vault.status}`;
+    if (this.vaultUnreadableWarned.has(key)) return;
+    this.vaultUnreadableWarned.add(key);
+    if (vault.status === undefined) {
+      const names = zulipVaultNames(role);
+      this.log(`[zulip] infisical ${vault.where} has none of ${role}'s expected names (${names.email}, ${names.key}); Zulip credentials unavailable`);
+    } else {
+      this.log(`[zulip] infisical ${vault.where} unreadable with the configured token (${vault.status}); Zulip credentials unavailable`);
+    }
+  }
+
+  /** Forget the warned entries for one vault folder, so its next outage
+   *  warns again.  Without a folder every entry goes. */
+  private clearVaultUnreadableWarned(where?: string): void {
+    if (!where) {
+      this.vaultUnreadableWarned.clear();
+      return;
+    }
+    for (const key of this.vaultUnreadableWarned) {
+      if (key === where || key.startsWith(`${where} `)) this.vaultUnreadableWarned.delete(key);
+    }
+  }
+
+  /** A credential load that succeeded: the folder it came from is readable
+   *  again, so a later refusal there is a new outage and warns again.  The
+   *  folder is read off the credential's source (`infisical <where>`), or
+   *  derived from the settings when a test double names it differently. */
+  noteVaultCredentialLoaded(creds: ZulipCredentials): void {
+    let where: string | undefined;
+    if (creds.source.startsWith("infisical ")) {
+      where = creds.source.slice("infisical ".length);
+    } else {
+      const settings = this.settings();
+      if (settings?.credentialSource === "infisical") {
+        where = describeVaultLocation({
+          secretPath: settings.infisicalPath?.trim() || ZULIP_DEFAULT_INFISICAL_PATH,
+          projectId: settings.infisicalProjectId,
+          environment: settings.infisicalEnv,
+        });
+      }
+    }
+    if (where) this.clearVaultUnreadableWarned(where);
+  }
+
   /** Whether the Zulip source should run at all. */
   enabled(): boolean {
     return this.settings()?.enabled === true && this.env.OMB_ZULIP_DISABLE !== "1";
@@ -857,7 +958,14 @@ export class ZulipHub {
     if (this.stopped) return;
     const retryDisabled = opts.retryDisabled ?? true;
     const settings = this.settings();
-    const wanted = new Map<string, string>();
+    // A Zulip settings change may point the hub at a fixed token or a new
+    // folder: forget what already warned, so the next refusal warns again.
+    const settingsFingerprint = JSON.stringify(settings ?? null);
+    if (this.lastSettingsFingerprint !== undefined && this.lastSettingsFingerprint !== settingsFingerprint) {
+      this.clearVaultUnreadableWarned();
+    }
+    this.lastSettingsFingerprint = settingsFingerprint;
+    const wanted = new Map<string, { role: string; credentialRole: string }>();
     let realm = "";
     if (this.enabled()) {
       const resolved = resolveRealm(settings, this.env);
@@ -867,27 +975,36 @@ export class ZulipHub {
         realm = resolved.realm;
         const roles = new Set<string>();
         for (const [botId, entry] of Object.entries(settings?.bots ?? {})) {
-          const role = typeof entry?.role === "string" ? entry.role.trim() : "";
-          if (entry?.enabled === false || !role || !this.deps.botExists(botId)) continue;
-          if (!validZulipRole(role)) {
-            this.log(`[zulip] bot ${botId}: "${role}" is not a valid Zulip role name; skipped`);
+          const configured = typeof entry?.role === "string" ? entry.role.trim() : "";
+          if (entry?.enabled === false || !configured || !this.deps.botExists(botId)) continue;
+          if (!validZulipRole(configured)) {
+            this.log(`[zulip] bot ${botId}: "${configured}" is not a valid Zulip role name; skipped`);
             continue;
           }
+          // The session posts and wakes under the canonical role: a bot still
+          // bound as BF-Builder is BF-Engineer on Zulip.  Its key stays under
+          // the configured name until the owner migrates the credential.
+          const role = canonicalZulipRole(configured);
           // One Zulip identity, one session: two queues for the same bot
           // would answer every message twice.
           if (roles.has(role.toLowerCase())) {
-            this.log(`[zulip] bot ${botId}: ${role} is already bound to another bot; skipped`);
+            this.log(`[zulip] bot ${botId}: ${configured} is already bound to another bot; skipped`);
             continue;
           }
           roles.add(role.toLowerCase());
-          wanted.set(botId, role);
+          wanted.set(botId, { role, credentialRole: configured });
         }
       }
     }
     for (const [botId, session] of this.sessions) {
-      const role = wanted.get(botId);
+      const next = wanted.get(botId);
       const retry = retryDisabled && session.status.state === "disabled";
-      if (role !== session.role || session.realm !== realm || retry) {
+      // A changed credential name rebuilds the session too: same canonical
+      // role, but the key moves (the owner migrating BF-Builder to
+      // BF-Engineer re-points the binding at the renamed credential).
+      const changed =
+        next?.role !== session.role || next?.credentialRole !== session.credentialRole || session.realm !== realm || retry;
+      if (changed) {
         this.sessions.delete(botId);
         const stopped = session.stop().finally(() => {
           this.stopping.delete(botId);
@@ -900,9 +1017,9 @@ export class ZulipHub {
         this.stopping.set(botId, stopped);
       }
     }
-    for (const [botId, role] of wanted) {
+    for (const [botId, next] of wanted) {
       if (this.sessions.has(botId) || this.stopping.has(botId)) continue;
-      const session = new ZulipSession(this, botId, role, realm);
+      const session = new ZulipSession(this, botId, next.role, realm, next.credentialRole);
       this.sessions.set(botId, session);
       session.start();
     }
@@ -959,18 +1076,31 @@ export class ZulipHub {
     return out;
   }
 
+  /** The session a `/zulip/outgoing/<ROLE>` URL belongs to: an exact role
+   *  match first (the role as the settings write it, compared
+   *  case-insensitively), and only when there is none, the legacy alias for
+   *  that role.  An exact match always wins, so a bot that really is bound
+   *  to the legacy name keeps its own URL. */
+  private outgoingSessionFor(role: string): ZulipSession | undefined {
+    const normalized = role.trim().toUpperCase();
+    const sessions = [...this.sessions.values()];
+    const exact = sessions.find((candidate) => candidate.role.toUpperCase() === normalized);
+    if (exact) return exact;
+    const alias = LEGACY_OUTGOING_ROLE_ALIASES[normalized];
+    if (!alias) return undefined;
+    return sessions.find((candidate) => candidate.role.toUpperCase() === alias);
+  }
+
   /** Authenticate a native outgoing webhook against the configured role's
    *  cached credentials.  The POST body is never trusted as message content. */
   outgoingWebhookAvailability(role: string): "unknown" | "unavailable" | "ready" {
-    const normalized = role.trim().toUpperCase();
-    const session = [...this.sessions.values()].find((candidate) => candidate.role.toUpperCase() === normalized);
+    const session = this.outgoingSessionFor(role);
     if (!session) return "unknown";
     return session.creds?.outgoingWebhookToken ? "ready" : "unavailable";
   }
 
   authorizeOutgoingWebhook(role: string, botEmail: string, token: string): "ok" | "unknown" | "unavailable" | "unauthorized" {
-    const normalized = role.trim().toUpperCase();
-    const session = [...this.sessions.values()].find((candidate) => candidate.role.toUpperCase() === normalized);
+    const session = this.outgoingSessionFor(role);
     if (!session) return "unknown";
     const expected = session.creds?.outgoingWebhookToken;
     if (!session.creds || !expected) return "unavailable";
@@ -983,8 +1113,7 @@ export class ZulipHub {
 
   /** Add the authenticated bot/message pair to the durable inbound queue. */
   enqueueOutgoingWebhook(role: string, messageId: number): "accepted" | "duplicate" | "unknown" | "unavailable" {
-    const normalized = role.trim().toUpperCase();
-    const session = [...this.sessions.values()].find((candidate) => candidate.role.toUpperCase() === normalized);
+    const session = this.outgoingSessionFor(role);
     if (!session) return "unknown";
     if (!session.creds?.outgoingWebhookToken) return "unavailable";
     return this.outgoingSpool.add(session.botId, messageId) ? "accepted" : "duplicate";
@@ -1075,9 +1204,9 @@ export class ZulipHub {
       conversationKey: originKey(origin),
       channel: origin.kind === "stream" ? origin.channel : undefined,
       topic: origin.kind === "stream" ? origin.topic : undefined,
-      mentions: verdict.via === "mention" ? [session.role] : [],
+      mentions: queuedVia(verdict.via) === "mention" ? [session.role] : [],
       contentText: String(message.content ?? ""),
-      wakeReason: verdict.via,
+      wakeReason: queuedVia(verdict.via),
       senderKind: verdict.wake,
       botId: session.botId,
     };
@@ -1151,9 +1280,12 @@ export class ZulipHub {
   async applyLatePluginDecision(event: PluginEventEnvelope, decision: ZulipPluginDecision): Promise<void> {
     try {
       if (event.type !== "zulip.message" || event.source.platform !== "zulip") return;
-      const role = event.source.accountId;
+      // Fold both sides: a persisted envelope may carry the pre-rename
+      // account id ("BF-Builder"), which reads as the canonical role.
+      const role = canonicalZulipRole(event.source.accountId);
       const botId = Object.entries(this.settings()?.bots ?? {}).find(
-        ([id, binding]) => binding.role === role && (binding.enabled ?? true) && this.deps.botExists(id),
+        ([id, binding]) =>
+          canonicalZulipRole(binding.role) === role && (binding.enabled ?? true) && this.deps.botExists(id),
       )?.[0];
       if (!botId) return;
       const session = this.sessions.get(botId);
@@ -1231,7 +1363,7 @@ export class ZulipHub {
       ownerViaApi: c.ownerViaApi,
       content: String(message.content ?? ""),
       timestamp: typeof message.timestamp === "number" ? message.timestamp : Math.floor(now / 1000),
-      via: verdict.via,
+      via: queuedVia(verdict.via),
     };
     if (pluginRoute?.hint) item.pluginHint = pluginRoute.hint.slice(0, 2000);
     if (pluginRoute?.fromRole) item.routedFrom = pluginRoute.fromRole.slice(0, 128);
@@ -1239,7 +1371,8 @@ export class ZulipHub {
       session.markHandled([id]);
       this.log(
         `[zulip] ${session.role}: dry run — message ${id} would wake (${verdict.wake})` +
-          (verdict.via === "followed" ? " from a followed topic" : ""),
+          (verdict.via === "followed" ? " from a followed topic" : "") +
+          (verdict.via === "broadcast" ? " from an @all broadcast" : ""),
       );
       session.save(true);
       return;

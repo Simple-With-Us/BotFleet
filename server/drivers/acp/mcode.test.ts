@@ -9,6 +9,8 @@ import type { ModelCatalog, ProviderInstance } from "../../contracts.ts";
 import { removeTempDir } from "../../testing/cleanup.ts";
 import { recordEvents, type EventRecorder } from "../../testing/events.ts";
 import {
+  botNameFromPersona,
+  mcodePromptPrefix,
   MCODE_EFFORT_CONFIG_ID,
   MCODE_M31_EFFORT_LEVELS,
   McodeAgentDriver,
@@ -47,10 +49,10 @@ describe("STATIC_MCODE_MODELS", () => {
     // model config option, folded through mcodePickerId.  A row the session
     // does not advertise fails the turn with an opaque "does not offer", so
     // the shipped list is the advertised set and not a hand-written guess.
-    expect(STATIC_MCODE_MODELS.default).toBe("MiniMax-M3.1-Flash-Preview-thinking");
+    expect(STATIC_MCODE_MODELS.default).toBe("MiniMax-M3.1-Flash-thinking");
     expect(STATIC_MCODE_MODELS.options.map((o) => o.id)).toEqual([
-      "MiniMax-M3.1-Flash-Preview-thinking",
-      "MiniMax-M3.1-Flash-Preview-thinking-1M",
+      "MiniMax-M3.1-Flash-thinking",
+      "MiniMax-M3.1-Flash-thinking-1M",
       "MiniMax-M2.7-highspeed-thinking",
     ]);
   });
@@ -61,7 +63,7 @@ describe("STATIC_MCODE_MODELS", () => {
     // M2.7 must say `[]` out loud: src/lib/model-effort.ts hands a row that
     // declares no list the engine-wide one, which is M3.1's.
     const byId = new Map(STATIC_MCODE_MODELS.options.map((option) => [option.id, option]));
-    expect(byId.get("MiniMax-M3.1-Flash-Preview-thinking")?.effortLevels).toEqual([
+    expect(byId.get("MiniMax-M3.1-Flash-thinking")?.effortLevels).toEqual([
       "low",
       "medium",
       "high",
@@ -83,8 +85,8 @@ describe("STATIC_MCODE_MODELS", () => {
       {
         id: "model",
         options: [
-          { value: "m:minimax:MiniMax-M3.1-Flash-Preview:v:", name: "M3.1-Flash-Preview" },
-          { value: "m:minimax:MiniMax-M3.1-Flash-Preview:v:thinking", name: "flash · thinking" },
+          { value: "m:minimax:MiniMax-M3.1-Flash:v:", name: "M3.1-Flash" },
+          { value: "m:minimax:MiniMax-M3.1-Flash:v:thinking", name: "flash · thinking" },
           { value: "m:minimax:MiniMax-M2.7-highspeed:v:thinking", name: "M2.7 highspeed" },
           ],
       },
@@ -95,8 +97,9 @@ describe("STATIC_MCODE_MODELS", () => {
   });
 
   it("resolves the shipped Flash rows against a CLI that dropped the Preview name (BOTFLEET-4D)", () => {
-    // A newer mcode advertises the GA model as `MiniMax-M3.1-Flash`.  Bots keep
-    // the saved Preview-spelled picker id, so it must still match.
+    // A newer mcode advertises the GA model as `MiniMax-M3.1-Flash`.  A bot
+    // saved against the retired suffix still has to match, so the shipped
+    // picker id and the advertised id have to compare equal.
     const advertised = [
       {
         id: "model",
@@ -108,10 +111,10 @@ describe("STATIC_MCODE_MODELS", () => {
         ],
       },
     ];
-    expect(mcodeModelOptionValue("MiniMax-M3.1-Flash-Preview-thinking", advertised)).toBe(
+    expect(mcodeModelOptionValue("MiniMax-M3.1-Flash-thinking", advertised)).toBe(
       "m:minimax:MiniMax-M3.1-Flash:v:thinking",
     );
-    expect(mcodeModelOptionValue("MiniMax-M3.1-Flash-Preview-thinking-1M", advertised)).toBe(
+    expect(mcodeModelOptionValue("MiniMax-M3.1-Flash-thinking-1M", advertised)).toBe(
       "m:minimax:MiniMax-M3.1-Flash:v:thinking",
     );
     // The new spelling also resolves, and the non-thinking row stays distinct.
@@ -122,9 +125,9 @@ describe("STATIC_MCODE_MODELS", () => {
   });
 
   it("maps a renamed advertised value back to the shipped picker id", () => {
-    expect(mcodeModelForValue("m:minimax:MiniMax-M3.1-Flash:v:thinking")).toBe("MiniMax-M3.1-Flash-Preview-thinking");
-    expect(mcodeModelForValue("m:minimax:MiniMax-M3.1-Flash-Preview:v:thinking")).toBe(
-      "MiniMax-M3.1-Flash-Preview-thinking",
+    expect(mcodeModelForValue("m:minimax:MiniMax-M3.1-Flash:v:thinking")).toBe("MiniMax-M3.1-Flash-thinking");
+    expect(mcodeModelForValue("m:minimax:MiniMax-M3.1-Flash:v:thinking")).toBe(
+      "MiniMax-M3.1-Flash-thinking",
     );
     expect(mcodeModelForValue("m:minimax:MiniMax-M3:v:thinking")).toBe("MiniMax-M3-thinking");
     expect(mcodeModelForValue("not-a-value")).toBeNull();
@@ -149,13 +152,13 @@ describe("readMcodeModelCatalog", () => {
     writeConfig(
       dataDir,
       [
-        "defaultModel: minimax/MiniMax-M3.1-Flash-Preview",
+        "defaultModel: minimax/MiniMax-M3.1-Flash",
         "defaultModelVariant: thinking",
         "defaultModelContextWindow: 1000000",
       ].join("\n"),
     );
     const catalog = readMcodeModelCatalog({ MINIMAX_DATA_DIR: dataDir });
-    expect(catalog.default).toBe("MiniMax-M3.1-Flash-Preview-thinking-1M");
+    expect(catalog.default).toBe("MiniMax-M3.1-Flash-thinking-1M");
     expect(catalog.options.find((o) => o.id === catalog.default)?.contextWindow).toBe(1_000_000);
   });
 
@@ -168,13 +171,13 @@ describe("readMcodeModelCatalog", () => {
         "defaultModelContextWindow: 1000000",
       ].join("\n"),
     );
-    expect(readMcodeModelCatalog({ MINIMAX_DATA_DIR: dataDir }).default).toBe("MiniMax-M3.1-Flash-Preview-thinking-1M");
+    expect(readMcodeModelCatalog({ MINIMAX_DATA_DIR: dataDir }).default).toBe("MiniMax-M3.1-Flash-thinking-1M");
   });
 
   it("never adopts a default that is not on offer", () => {
     // Adopting it would send every turn to a row the picker never showed.
     writeConfig(dataDir, ["defaultModel: minimax/MiniMax-M9-Imaginary", "defaultModelVariant: thinking"].join("\n"));
-    expect(readMcodeModelCatalog({ MINIMAX_DATA_DIR: dataDir }).default).toBe("MiniMax-M3.1-Flash-Preview-thinking");
+    expect(readMcodeModelCatalog({ MINIMAX_DATA_DIR: dataDir }).default).toBe("MiniMax-M3.1-Flash-thinking");
   });
 
   it("keeps the shipped rows rather than appending unverified ids", () => {
@@ -190,7 +193,7 @@ describe("readMcodeModelCatalog", () => {
 
   it("keeps the shipped catalog when there is no config at all", () => {
     const catalog = readMcodeModelCatalog({ MINIMAX_DATA_DIR: join(dataDir, "missing") });
-    expect(catalog.default).toBe("MiniMax-M3.1-Flash-Preview-thinking");
+    expect(catalog.default).toBe("MiniMax-M3.1-Flash-thinking");
     expect(catalog.options).toEqual(STATIC_MCODE_MODELS.options);
   });
 
@@ -198,23 +201,23 @@ describe("readMcodeModelCatalog", () => {
     writeConfig(dataDir, "defaultModel: [not, a, string]\n\tdefaultModelVariant: : :\n");
     const catalog = readMcodeModelCatalog({ MINIMAX_DATA_DIR: dataDir });
     expect(catalog.options).toEqual(STATIC_MCODE_MODELS.options);
-    expect(catalog.default).toBe("MiniMax-M3.1-Flash-Preview-thinking");
+    expect(catalog.default).toBe("MiniMax-M3.1-Flash-thinking");
   });
 });
 
 describe("withMcodeEffortLevels", () => {
   it("gives a bare row an explicit empty list and leaves declared lists alone", () => {
     const catalog: ModelCatalog = {
-      default: "MiniMax-M3.1-Flash-Preview",
+      default: "MiniMax-M3.1-Flash",
       options: [
         // the bare rows another branch adds to STATIC_MCODE_MODELS
-        { id: "MiniMax-M3.1-Flash-Preview", label: "M3.1 Flash Preview" },
+        { id: "MiniMax-M3.1-Flash", label: "M3.1 Flash" },
         { id: "MiniMax-M2.7-highspeed", label: "M2.7 Highspeed" },
-        { id: "MiniMax-M3.1-Flash-Preview-thinking", label: "thinking", effortLevels: ["low", "max"] },
+        { id: "MiniMax-M3.1-Flash-thinking", label: "thinking", effortLevels: ["low", "max"] },
       ],
     };
     const fitted = withMcodeEffortLevels(catalog);
-    expect(fitted.default).toBe("MiniMax-M3.1-Flash-Preview");
+    expect(fitted.default).toBe("MiniMax-M3.1-Flash");
     expect(fitted.options.map((option) => option.effortLevels)).toEqual([[], [], ["low", "max"]]);
     // the input is not mutated
     expect(catalog.options[0].effortLevels).toBeUndefined();
@@ -237,7 +240,7 @@ describe("readMcodeModelCatalog effort levels", () => {
       expect(option.effortLevels, `${option.id} must declare its effort levels`).toBeDefined();
     }
     const byId = new Map(catalog.options.map((option) => [option.id, option]));
-    expect(byId.get("MiniMax-M3.1-Flash-Preview-thinking")?.effortLevels).toEqual([...MCODE_M31_EFFORT_LEVELS]);
+    expect(byId.get("MiniMax-M3.1-Flash-thinking")?.effortLevels).toEqual([...MCODE_M31_EFFORT_LEVELS]);
     expect(byId.get("MiniMax-M2.7-highspeed-thinking")?.effortLevels).toEqual([]);
   });
 
@@ -255,33 +258,33 @@ describe("parseMcodeModelValue — the advertised no-variant form", () => {
     // `m:minimax:MiniMax-M3:v:` — a bare `v:` with an EMPTY variant, not the
     // `u` suffix its own type suggests.  Rejecting that spelling made every
     // no-variant model unselectable, including plain MiniMax-M3.
-    expect(parseMcodeModelValue("m:minimax:MiniMax-M3.1-Flash-Preview:v:")).toEqual({
+    expect(parseMcodeModelValue("m:minimax:MiniMax-M3.1-Flash:v:")).toEqual({
       providerId: "minimax",
-      modelId: "MiniMax-M3.1-Flash-Preview",
+      modelId: "MiniMax-M3.1-Flash",
     });
   });
 
   it("folds an empty variant to the same picker id the `u` spelling gives", () => {
-    const emptyVariant = parseMcodeModelValue("m:minimax:MiniMax-M3.1-Flash-Preview:v:");
-    const uSuffix = parseMcodeModelValue("m:minimax:MiniMax-M3.1-Flash-Preview:u");
-    expect(mcodePickerId(emptyVariant!)).toBe("MiniMax-M3.1-Flash-Preview");
-    expect(mcodePickerId(uSuffix!)).toBe("MiniMax-M3.1-Flash-Preview");
+    const emptyVariant = parseMcodeModelValue("m:minimax:MiniMax-M3.1-Flash:v:");
+    const uSuffix = parseMcodeModelValue("m:minimax:MiniMax-M3.1-Flash:u");
+    expect(mcodePickerId(emptyVariant!)).toBe("MiniMax-M3.1-Flash");
+    expect(mcodePickerId(uSuffix!)).toBe("MiniMax-M3.1-Flash");
   });
 
   it("still reads a real variant", () => {
-    const parsed = parseMcodeModelValue("m:minimax:MiniMax-M3.1-Flash-Preview:v:thinking");
+    const parsed = parseMcodeModelValue("m:minimax:MiniMax-M3.1-Flash:v:thinking");
     expect(parsed?.variant).toBe("thinking");
-    expect(mcodePickerId(parsed!)).toBe("MiniMax-M3.1-Flash-Preview-thinking");
+    expect(mcodePickerId(parsed!)).toBe("MiniMax-M3.1-Flash-thinking");
   });
 
   it("decodes percent-encoded segments", () => {
-    const parsed = parseMcodeModelValue("m:mini%20max:MiniMax%2DM3.1%2DFlash%2DPreview:v:high%20speed");
-    expect(parsed).toEqual({ providerId: "mini max", modelId: "MiniMax-M3.1-Flash-Preview", variant: "high speed" });
+    const parsed = parseMcodeModelValue("m:mini%20max:MiniMax%2DM3.1%2DFlash:v:high%20speed");
+    expect(parsed).toEqual({ providerId: "mini max", modelId: "MiniMax-M3.1-Flash", variant: "high speed" });
   });
 
   it("still rejects a value that is not a model selection", () => {
     expect(parseMcodeModelValue("not-a-value")).toBeNull();
-    expect(parseMcodeModelValue("m:minimax:MiniMax-M3.1-Flash-Preview:x:y:z")).toBeNull();
+    expect(parseMcodeModelValue("m:minimax:MiniMax-M3.1-Flash:x:y:z")).toBeNull();
     expect(parseMcodeModelValue(undefined)).toBeNull();
   });
 });
@@ -354,14 +357,14 @@ describe("mcodeModelOptionValue", () => {
     {
       id: "model",
       options: [
-        { value: "m:minimax:MiniMax-M3.1-Flash-Preview:u", name: "MiniMax-M3.1-Flash-Preview" },
+        { value: "m:minimax:MiniMax-M3.1-Flash:u", name: "MiniMax-M3.1-Flash" },
         { value: "m:minimax:MiniMax-M2.7:v:highspeed", name: "MiniMax-M2.7 (highspeed)" },
       ],
     },
   ];
 
   it("matches a plain model id and returns the advertised value verbatim", () => {
-    expect(mcodeModelOptionValue("MiniMax-M3.1-Flash-Preview", advertised)).toBe("m:minimax:MiniMax-M3.1-Flash-Preview:u");
+    expect(mcodeModelOptionValue("MiniMax-M3.1-Flash", advertised)).toBe("m:minimax:MiniMax-M3.1-Flash:u");
   });
 
   it("matches the variant folded into the picker id", () => {
@@ -369,14 +372,31 @@ describe("mcodeModelOptionValue", () => {
   });
 
   it("keeps the user's own BYOK provider id instead of constructing one", () => {
-    const byok = [{ id: "model", options: [{ value: "m:my-openai:MiniMax-M3.1-Flash-Preview:u", name: "MiniMax-M3.1-Flash-Preview" }] }];
-    expect(mcodeModelOptionValue("MiniMax-M3.1-Flash-Preview", byok)).toBe("m:my-openai:MiniMax-M3.1-Flash-Preview:u");
+    const byok = [{ id: "model", options: [{ value: "m:my-openai:MiniMax-M3.1-Flash:u", name: "MiniMax-M3.1-Flash" }] }];
+    expect(mcodeModelOptionValue("MiniMax-M3.1-Flash", byok)).toBe("m:my-openai:MiniMax-M3.1-Flash:u");
+  });
+
+  it("still selects the row when an older CLI advertises the retired suffix", () => {
+    // MiniMax renamed the model, but the mcode CLI is installed on the
+    // owner's Mac and upgrades on its own schedule, so a session can still
+    // advertise the old id.  The key fold is what keeps it selectable.
+    const legacy = [
+      {
+        id: "model",
+        options: [
+          { value: "m:minimax:MiniMax-M3.1-Flash-Preview:v:thinking", name: "MiniMax-M3.1-Flash-Preview" },
+        ],
+      },
+    ];
+    expect(mcodeModelOptionValue("MiniMax-M3.1-Flash-thinking", legacy)).toBe(
+      "m:minimax:MiniMax-M3.1-Flash-Preview:v:thinking",
+    );
   });
 
   it("skips the switch when the session advertises no model option (older mcode)", () => {
-    expect(mcodeModelOptionValue("MiniMax-M3.1-Flash-Preview", [])).toBeNull();
-    expect(mcodeModelOptionValue("MiniMax-M3.1-Flash-Preview", undefined)).toBeNull();
-    expect(mcodeModelOptionValue("MiniMax-M3.1-Flash-Preview", [{ id: "mode", options: [] }])).toBeNull();
+    expect(mcodeModelOptionValue("MiniMax-M3.1-Flash", [])).toBeNull();
+    expect(mcodeModelOptionValue("MiniMax-M3.1-Flash", undefined)).toBeNull();
+    expect(mcodeModelOptionValue("MiniMax-M3.1-Flash", [{ id: "mode", options: [] }])).toBeNull();
   });
 
   it("fails clearly when the model is not in the advertised options", () => {
@@ -390,20 +410,20 @@ describe("parseMcodeModelValue / mcodePickerId", () => {
     const parsed = parseMcodeModelValue("m:minimax:MiniMax-M2.7:v:highspeed");
     expect(parsed).toEqual({ providerId: "minimax", modelId: "MiniMax-M2.7", variant: "highspeed" });
     expect(mcodePickerId(parsed!)).toBe("MiniMax-M2.7-highspeed");
-    expect(mcodePickerId(parseMcodeModelValue("m:minimax:MiniMax-M3.1-Flash-Preview:u")!)).toBe("MiniMax-M3.1-Flash-Preview");
+    expect(mcodePickerId(parseMcodeModelValue("m:minimax:MiniMax-M3.1-Flash:u")!)).toBe("MiniMax-M3.1-Flash");
     expect(parseMcodeModelValue("m:p:Some%20Model:u")).toEqual({ providerId: "p", modelId: "Some Model" });
   });
 
   it("rejects values that are not mcode-shaped", () => {
     expect(parseMcodeModelValue("m-two")).toBeNull();
-    expect(parseMcodeModelValue("m:minimax:MiniMax-M3.1-Flash-Preview:x")).toBeNull();
+    expect(parseMcodeModelValue("m:minimax:MiniMax-M3.1-Flash:x")).toBeNull();
     expect(parseMcodeModelValue(42)).toBeNull();
   });
 });
 
 describe("MiniMax Code reasoning effort over ACP", () => {
   const M27 = "m:minimax:MiniMax-M2.7-highspeed:v:thinking";
-  const M31 = "m:minimax:MiniMax-M3.1-Flash-Preview:v:thinking";
+  const M31 = "m:minimax:MiniMax-M3.1-Flash:v:thinking";
   // The order a live mcode 0.5.5 session advertises for M3.1.
   const EFFORTS = "default,low,medium,high,xhigh,max";
   const ENV_KEYS = [
@@ -485,7 +505,7 @@ describe("MiniMax Code reasoning effort over ACP", () => {
     const dump = dumpTo("xhigh.json");
     await create();
 
-    const done = await runTurn({ threadId: "mcode-effort-xhigh", model: "MiniMax-M3.1-Flash-Preview-thinking", effort: "xhigh" });
+    const done = await runTurn({ threadId: "mcode-effort-xhigh", model: "MiniMax-M3.1-Flash-thinking", effort: "xhigh" });
 
     expect(done).toMatchObject({ ok: true });
     expect(configCalls(dump)).toEqual([setConfig("model", M31), setConfig("thinkingEffort", "xhigh")]);
@@ -495,7 +515,7 @@ describe("MiniMax Code reasoning effort over ACP", () => {
     const dump = dumpTo("default.json");
     await create();
 
-    const done = await runTurn({ threadId: "mcode-effort-default", model: "MiniMax-M3.1-Flash-Preview-thinking" });
+    const done = await runTurn({ threadId: "mcode-effort-default", model: "MiniMax-M3.1-Flash-thinking" });
 
     expect(done).toMatchObject({ ok: true });
     expect(configCalls(dump)).toEqual([setConfig("model", M31), setConfig("thinkingEffort", "default")]);
@@ -517,11 +537,11 @@ describe("MiniMax Code reasoning effort over ACP", () => {
     process.env.FAKE_ACP_REASONING_STICKS = "1";
     await create();
 
-    const done = await runTurn({ threadId: "mcode-effort-stuck", model: "MiniMax-M3.1-Flash-Preview-thinking", effort: "high" });
+    const done = await runTurn({ threadId: "mcode-effort-stuck", model: "MiniMax-M3.1-Flash-thinking", effort: "high" });
 
     expect(done).toMatchObject({ ok: false });
     expect(errorMessage()).toMatch(
-      /MiniMax Code did not accept thinking effort high for MiniMax-M3\.1-Flash-Preview-thinking/,
+      /MiniMax Code did not accept thinking effort high for MiniMax-M3\.1-Flash-thinking/,
     );
     const methods: string[] = JSON.parse(readFileSync(rpcDump, "utf8"));
     expect(methods).not.toContain("session/prompt");
@@ -538,11 +558,11 @@ describe("MiniMax Code reasoning effort over ACP", () => {
     process.env.FAKE_ACP_REASONING_STICKS = "1";
     await create();
 
-    const done = await runTurn({ threadId: "mcode-effort-sticky-default", model: "MiniMax-M3.1-Flash-Preview-thinking" });
+    const done = await runTurn({ threadId: "mcode-effort-sticky-default", model: "MiniMax-M3.1-Flash-thinking" });
 
     expect(done).toMatchObject({ ok: false });
     expect(errorMessage()).toMatch(
-      /MiniMax Code did not accept thinking effort default for MiniMax-M3\.1-Flash-Preview-thinking: still high/,
+      /MiniMax Code did not accept thinking effort default for MiniMax-M3\.1-Flash-thinking: still high/,
     );
     const methods: string[] = JSON.parse(readFileSync(rpcDump, "utf8"));
     expect(methods).not.toContain("session/prompt");
@@ -552,7 +572,7 @@ describe("MiniMax Code reasoning effort over ACP", () => {
     process.env.FAKE_ACP_REASONING_STICKS = "1";
     await create();
 
-    const done = await runTurn({ threadId: "mcode-effort-stuck-default", model: "MiniMax-M3.1-Flash-Preview-thinking" });
+    const done = await runTurn({ threadId: "mcode-effort-stuck-default", model: "MiniMax-M3.1-Flash-thinking" });
 
     expect(done).toMatchObject({ ok: true });
   });
@@ -562,7 +582,7 @@ describe("MiniMax Code reasoning effort over ACP", () => {
     process.env.FAKE_ACP_REASONING_EFFORTS = "default,low,medium,high,max";
     await create();
 
-    const done = await runTurn({ threadId: "mcode-effort-unadvertised", model: "MiniMax-M3.1-Flash-Preview-thinking", effort: "xhigh" });
+    const done = await runTurn({ threadId: "mcode-effort-unadvertised", model: "MiniMax-M3.1-Flash-thinking", effort: "xhigh" });
 
     expect(done).toMatchObject({ ok: false });
     expect(errorMessage()).toMatch(/MiniMax Code did not accept thinking effort xhigh/);
@@ -573,7 +593,7 @@ describe("MiniMax Code reasoning effort over ACP", () => {
     const dump = dumpTo("none.json");
     await create();
 
-    const done = await runTurn({ threadId: "mcode-effort-none", model: "MiniMax-M3.1-Flash-Preview-thinking", effort: "none" });
+    const done = await runTurn({ threadId: "mcode-effort-none", model: "MiniMax-M3.1-Flash-thinking", effort: "none" });
 
     expect(done).toMatchObject({ ok: true });
     expect(configCalls(dump)).toEqual([setConfig("model", M31), setConfig("thinkingEffort", "default")]);
@@ -592,8 +612,8 @@ describe("MiniMax Code reasoning effort over ACP", () => {
     process.env.FAKE_ACP_RPC_DUMP = rpcDump;
     await create();
 
-    const picked = await runTurn({ threadId: "mcode-effort-absent-pick", model: "MiniMax-M3.1-Flash-Preview-thinking", effort: "high" });
-    const plain = await runTurn({ threadId: "mcode-effort-absent-default", model: "MiniMax-M3.1-Flash-Preview-thinking" });
+    const picked = await runTurn({ threadId: "mcode-effort-absent-pick", model: "MiniMax-M3.1-Flash-thinking", effort: "high" });
+    const plain = await runTurn({ threadId: "mcode-effort-absent-default", model: "MiniMax-M3.1-Flash-thinking" });
 
     expect(picked).toMatchObject({ ok: true });
     expect(plain).toMatchObject({ ok: true });
@@ -611,7 +631,7 @@ describe("MiniMax Code reasoning effort over ACP", () => {
     const dump = dumpTo("no-effort-option-no-switch.json");
     await create();
 
-    const done = await runTurn({ threadId: "mcode-effort-absent-noswitch", model: "MiniMax-M3.1-Flash-Preview-thinking", effort: "max" });
+    const done = await runTurn({ threadId: "mcode-effort-absent-noswitch", model: "MiniMax-M3.1-Flash-thinking", effort: "max" });
 
     expect(done).toMatchObject({ ok: true });
     expect(configCalls(dump)).toEqual([]);
@@ -628,11 +648,11 @@ describe("MiniMax Code reasoning effort over ACP", () => {
     process.env.FAKE_ACP_CONFIG_REPLY_BARE = "1";
     await create();
 
-    const plain = await runTurn({ threadId: "mcode-effort-unknown-default", model: "MiniMax-M3.1-Flash-Preview-thinking" });
+    const plain = await runTurn({ threadId: "mcode-effort-unknown-default", model: "MiniMax-M3.1-Flash-thinking" });
     expect(plain).toMatchObject({ ok: true });
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("did not accept thinking effort default"));
 
-    const picked = await runTurn({ threadId: "mcode-effort-unknown-pick", model: "MiniMax-M3.1-Flash-Preview-thinking", effort: "high" });
+    const picked = await runTurn({ threadId: "mcode-effort-unknown-pick", model: "MiniMax-M3.1-Flash-thinking", effort: "high" });
     expect(picked).toMatchObject({ ok: false });
     expect(errorMessage()).toMatch(/MiniMax Code did not accept thinking effort high/);
   });
@@ -645,11 +665,11 @@ describe("MiniMax Code reasoning effort over ACP", () => {
     process.env.FAKE_ACP_REASONING_ERROR_CODE = "-32603";
     await create();
 
-    const done = await runTurn({ threadId: "mcode-effort-reset-error", model: "MiniMax-M3.1-Flash-Preview-thinking" });
+    const done = await runTurn({ threadId: "mcode-effort-reset-error", model: "MiniMax-M3.1-Flash-thinking" });
 
     expect(done).toMatchObject({ ok: false });
     expect(errorMessage()).toMatch(
-      /MiniMax Code did not accept thinking effort default for MiniMax-M3\.1-Flash-Preview-thinking: effort set failed: default/,
+      /MiniMax Code did not accept thinking effort default for MiniMax-M3\.1-Flash-thinking: effort set failed: default/,
     );
     const methods: string[] = JSON.parse(readFileSync(rpcDump, "utf8"));
     expect(methods).not.toContain("session/prompt");
@@ -662,7 +682,7 @@ describe("MiniMax Code reasoning effort over ACP", () => {
     process.env.FAKE_ACP_CONFIG_REPLY_BARE = "1";
     await create();
 
-    const done = await runTurn({ threadId: "mcode-effort-reset-error-unknown", model: "MiniMax-M3.1-Flash-Preview-thinking" });
+    const done = await runTurn({ threadId: "mcode-effort-reset-error-unknown", model: "MiniMax-M3.1-Flash-thinking" });
 
     expect(done).toMatchObject({ ok: false });
     expect(errorMessage()).toMatch(/MiniMax Code did not accept thinking effort default/);
@@ -678,7 +698,7 @@ describe("MiniMax Code reasoning effort over ACP", () => {
     process.env.FAKE_ACP_REASONING_EFFORTS = "low,medium,high,xhigh,max";
     await create();
 
-    const done = await runTurn({ threadId: "mcode-effort-default-missing", model: "MiniMax-M3.1-Flash-Preview-thinking" });
+    const done = await runTurn({ threadId: "mcode-effort-default-missing", model: "MiniMax-M3.1-Flash-thinking" });
 
     expect(done).toMatchObject({ ok: false });
     expect(errorMessage()).toMatch(/MiniMax Code did not accept thinking effort default/);
@@ -690,7 +710,7 @@ describe("MiniMax Code reasoning effort over ACP", () => {
     process.env.FAKE_ACP_CONFIG_REPLY_BARE = "1";
     await create();
 
-    const done = await runTurn({ threadId: "mcode-effort-bare", model: "MiniMax-M3.1-Flash-Preview-thinking", effort: "max" });
+    const done = await runTurn({ threadId: "mcode-effort-bare", model: "MiniMax-M3.1-Flash-thinking", effort: "max" });
 
     expect(done).toMatchObject({ ok: true });
   });
@@ -699,5 +719,51 @@ describe("MiniMax Code reasoning effort over ACP", () => {
     await create();
 
     expect(instance!.adapter.capabilities?.effortLevels).toEqual(["low", "medium", "high", "xhigh", "max"]);
+  });
+});
+
+describe("botNameFromPersona", () => {
+  it("reads the name the harness persona opens with", () => {
+    const persona = "You are Fixer (display: Fixer), a bot in BotFleet. Role: Engineer.";
+    expect(botNameFromPersona(persona)).toBe("Fixer");
+  });
+
+  it("reads it out of the room persona too", () => {
+    const persona = 'You are Deployer (display: Deployer), a bot in the room "Ops" in BotFleet.';
+    expect(botNameFromPersona(persona)).toBe("Deployer");
+  });
+
+  it("is null for anything that is not a BotFleet persona", () => {
+    expect(botNameFromPersona(undefined)).toBeNull();
+    expect(botNameFromPersona("")).toBeNull();
+    expect(botNameFromPersona("Summarise this file.")).toBeNull();
+    // A leading preamble defeats the anchored read on purpose: better no
+    // marker than a marker naming the wrong thing.
+    expect(botNameFromPersona("Note: You are Fixer (display: Fixer).")).toBeNull();
+  });
+});
+
+describe("mcodePromptPrefix", () => {
+  const persona = (name: string) => `You are ${name} (display: ${name}), a bot in BotFleet.`;
+
+  it("is the bot's configured name, exactly as written, for a new session", () => {
+    for (const name of ["Plumber", "Team Scout", "Zed-9 Prime", "ab-cd Name", "BF-Plumber", "BF Plumber", "BF-BF-Plumber", "GB-Plumber"]) {
+      expect(mcodePromptPrefix({ system: persona(name) }, { newSession: true })).toBe(`[${name}]\n\n`);
+    }
+  });
+
+  it("shows a name that already carries a prefix exactly once, unchanged", () => {
+    const marker = mcodePromptPrefix({ system: persona("BF-Plumber") }, { newSession: true });
+    expect(marker).toBe("[BF-Plumber]\n\n");
+    expect(marker?.match(/BF/g)).toHaveLength(1);
+  });
+
+  it("is absent for a session that already has its marker", () => {
+    expect(mcodePromptPrefix({ system: persona("Plumber") }, { newSession: false })).toBeUndefined();
+  });
+
+  it("is absent without a BotFleet persona", () => {
+    expect(mcodePromptPrefix({}, { newSession: true })).toBeUndefined();
+    expect(mcodePromptPrefix({ system: "Be brief." }, { newSession: true })).toBeUndefined();
   });
 });

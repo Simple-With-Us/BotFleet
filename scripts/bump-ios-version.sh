@@ -1,26 +1,36 @@
 #!/usr/bin/env bash
-# Bump the iOS version pair to the repo's commit count, and regenerate the
-# Xcode project.
+# Bump the iOS version pair recorded in ios/project.yml to the repo's commit
+# count, and regenerate the Xcode project.
 #
-#   MARKETING_VERSION        1.0.<commit_count>
-#   CURRENT_PROJECT_VERSION  <commit_count>
+#   MARKETING_VERSION        1.0.<commit_count>   (the project's declared
+#                                                    default, NOT the shipped
+#                                                    marketing version)
+#   CURRENT_PROJECT_VERSION  <commit_count>       (the build number)
 #
 # Usage:
 #   scripts/bump-ios-version.sh
 #
 # The build-number scheme is shared with ios/project.yml and the fleet ship
-# script (scripts/ios-fleet/ship-testflight.sh).  Both numbers come from the
-# repo's commit count, so MARKETING and BUILD_NUM always describe one number.
-# UTC YYYYMMDDHHMM stamps are retired.
+# script (scripts/ios-fleet/ship-testflight.sh).  Since the owner directive of
+# 2026-10-24 (AFC-517) the two numbers are INDEPENDENT:  the shipped marketing
+# version is the next patch on the app's App Store Connect train (the ship
+# script passes it to xcodebuild and overrides whatever is recorded here), and
+# the shipped build number is the commit count, raised above the App Store
+# Connect floor when it has to be.  UTC YYYYMMDDHHMM stamps are retired.
 #
-# The pair must strictly increase: App Store Connect rejects a CFBundleVersion
-# that does not increase, so this script refuses a commit count that is not
-# greater than the one already recorded.
+# What this script writes is therefore the PROJECT's declared value, not what
+# ships:  the project file is not a sequencing input any more, and the ship
+# script prints a NOTICE when the recorded value and the shipped value
+# disagree.
 #
-# The recorded value is a floor input for the ship script, not the source of
-# truth for what ships next, so it must stay below the commit count of any
-# commit that can ship.  It does: this bump is committed ON TOP of the commit
-# it names, so the shipping commit always counts one higher.
+# The build number must strictly increase: App Store Connect rejects a
+# CFBundleVersion that does not increase, so this script refuses a commit count
+# that is not greater than the one already recorded.
+#
+# The recorded build number must stay below the commit count of any commit
+# that can ship, so it is never the build number a real ship would use.  It
+# does: this bump is committed ON TOP of the commit it names, so the shipping
+# commit always counts one higher.
 set -euo pipefail
 cd "$(dirname "$0")/../ios"
 

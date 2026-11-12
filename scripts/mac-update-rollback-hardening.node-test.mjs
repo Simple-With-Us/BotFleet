@@ -612,7 +612,7 @@ test("the retrying probe asks again only when the answer was ambiguous", async (
   assert.match(source, /if \(result\.kind !== "unavailable"\) return \{ \.\.\.result, port \};/);
   assert.match(source, /await sleep\(backoffMs \* \(attempt \+ 1\)\)/);
   // Both gates go through the retrying probe.
-  assert.equal(source.split("probeHealthWithRetry(port)").length - 1 >= 2, true);
+  assert.ok([...source.matchAll(/probeHealthWithRetry\(port, \{ dataDirectory: config\.dataDirectory \}\)/g)].length >= 2);
   // And rollback no longer refuses on port state alone.
   assert.doesNotMatch(source, /Rollback cannot mutate files while a BotFleet process, port, or database owner remains/);
   assert.match(source, /rollback is not waiting on it/);

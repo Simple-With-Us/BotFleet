@@ -516,6 +516,13 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
     },
     defaultModels: [
       { id: "gemini-3.8-flash-high", display: "Gemini 3.8 Flash (High)", ctxTokens: 1_000_000 },
+      { id: "gemini-4-hydrogen-xhigh", display: "Gemini 4 Hydrogen (XHigh)", ctxTokens: 1_000_000 },
+      { id: "gemini-4-hydrogen-high", display: "Gemini 4 Hydrogen (High)", ctxTokens: 1_000_000 },
+      { id: "gemini-4-hydrogen-medium", display: "Gemini 4 Hydrogen (Medium)", ctxTokens: 1_000_000 },
+      { id: "gemini-4-hydrogen-low", display: "Gemini 4 Hydrogen (Low)", ctxTokens: 1_000_000 },
+      { id: "gemini-4-argon-high", display: "Gemini 4 Argon (High)", ctxTokens: 1_000_000 },
+      { id: "gemini-4-argon-medium", display: "Gemini 4 Argon (Medium)", ctxTokens: 1_000_000 },
+      { id: "gemini-4-argon-low", display: "Gemini 4 Argon (Low)", ctxTokens: 1_000_000 },
       { id: "gemini-3.1-pro-high", display: "Gemini 3.1 Pro (High)", ctxTokens: 1_000_000 },
       { id: "gemini-3.1-pro-low", display: "Gemini 3.1 Pro (Low)", ctxTokens: 1_000_000 },
       { id: "gemini-3.8-flash-medium", display: "Gemini 3.8 Flash (Medium)", ctxTokens: 1_000_000 },
@@ -570,7 +577,7 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       crossBotCoordination:
         "Team tools ride the same generic ACP mount, so a DeepSeek bot can hand work to a peer and take it back.",
       longContext:
-        "Clutch serves 1M-token context models across DeepSeek V4.1 Flash, DeepSeek V4 Pro, Meta Muse Spark, and MiniMax M3.1 Flash Preview.",
+        "Clutch serves 1M-token context models across DeepSeek V4.1 Flash, DeepSeek V4 Pro, Meta Muse Spark, and MiniMax M3.1 Flash.",
       computerUse:
         "The Clutch ACP bridge mounts BotFleet's screen channel so a bot can inspect and drive a desktop under the standard approval cards.",
     },
@@ -649,8 +656,8 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       ],
     },
     defaultModels: [
-      { id: "MiniMax-M3.1-Flash-Preview", display: "MiniMax M3.1 Flash Preview (512K)", ctxTokens: 524_288 },
-      { id: "MiniMax-M3.1-Flash-Preview-1M", display: "MiniMax M3.1 Flash Preview (1M)", ctxTokens: 1_000_000 },
+      { id: "MiniMax-M3.1-Flash", display: "MiniMax M3.1 Flash (512K)", ctxTokens: 524_288 },
+      { id: "MiniMax-M3.1-Flash-1M", display: "MiniMax M3.1 Flash (1M)", ctxTokens: 1_000_000 },
       { id: "MiniMax-H3", display: "MiniMax H3", ctxTokens: 256_000 },
     ],
   },
@@ -714,8 +721,8 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       ],
     },
     defaultModels: [
-      { id: "MiniMax-M3.1-Flash-Preview-thinking", display: "MiniMax M3.1 Flash · thinking (512K)", ctxTokens: 524_288 },
-      { id: "MiniMax-M3.1-Flash-Preview-thinking-1M", display: "MiniMax M3.1 Flash · thinking (1M)", ctxTokens: 1_000_000 },
+      { id: "MiniMax-M3.1-Flash-thinking", display: "MiniMax M3.1 Flash · thinking (512K)", ctxTokens: 524_288 },
+      { id: "MiniMax-M3.1-Flash-thinking-1M", display: "MiniMax M3.1 Flash · thinking (1M)", ctxTokens: 1_000_000 },
       // Context length for the M2.7 tiers is not published in the CLI's own
       // catalog, so no figure is claimed here.
       { id: "MiniMax-M2.7-highspeed-thinking", display: "MiniMax M2.7 Highspeed · thinking" },
@@ -787,7 +794,7 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       headline: "Meta's coding CLI, over a 1M-token window with no long-context premium.",
       prose: [
         "Muse Code runs inside BotFleet through Meta's Muse Spark models.  Files, terminal, this computer, computer use, image attachments, and long context are available.",
-        "The model a turn actually uses is your account's startup model, which the engine does not control yet; the matrix names Muse Spark 1.2 because that is the one this driver can point at.",
+        "The model a turn actually uses is your account's startup model, which the engine does not control yet; the matrix names Muse Spark 1.2 because that is the one this driver can point at.  Fleet accounts report muse-spark-1.3-contributor as that startup model.  Meta's docs verify the Contributor tier takes reasoning effort minimal, low, medium, high, and xhigh — never none, and not max, which is Standard-tier only (https://dev.meta.ai/docs/models, https://dev.meta.ai/docs/reasoning).  This driver exposes low through xhigh:  minimal is a docs-verified rung this build does not expose yet, because the shared effort union has no member for it.",
         "Connected apps, cross-bot coordination, and rooms are available through the adapter.  Web access, live research, and voice chat are not available on this engine.",
         "Voice chat is not available on this engine.  BotFleet drives Muse Code through a community ACP adapter, because Muse Code speaks its own session protocol rather than ACP.",
         "Signing in needs an API key:  a browser session stored in the Mac keychain is not readable by the adapter, so a keychain-only account cannot run a turn.",
@@ -808,7 +815,23 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
     displayName: "Kimi",
     capabilityBadgeColor: "bg-slate-700 text-white",
     group: "Cloud",
-    pricing: { kind: "unknown", notes: "Pricing for this engine is not recorded in this build." },
+    pricing: {
+      kind: "subscription",
+      subscription: {
+        // Every current international plan includes Kimi Code; Plus is the
+        // cheapest way in.  Rolling 5-hour Kimi Code limit on a monthly
+        // shared credit pool.  Source:
+        // https://www.kimi.ai/help/membership/membership-pricing (fetched
+        // 2026-10-21; their page capture is dated 2026-10-19).
+        tierLabel: "Kimi Plus",
+        costPerMonth: 19,
+        includedQuota: "Kimi Code on every plan; rolling 5-hour limit, monthly shared credit pool",
+        notes:
+          "Plans run from Plus at $19/month up to Ultra at $199/month, all with Kimi Code access, with a discount for annual billing.  Source:  https://www.kimi.ai/help/membership/membership-pricing",
+      },
+      // No outer `notes`: UsageSection shows `pricing.notes` ahead of the
+      // subscription note, and the plan sentence belongs in the tooltip.
+    },
     capabilities: {
       files: "yes",
       terminal: "yes",
@@ -832,7 +855,7 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       prose: [
         "BotFleet drives the Kimi CLI over ACP.  Files, terminal, this computer, computer use, web access, image attachments, connected apps, cross-bot coordination, rooms, and long context are available.",
         "Voice chat and live research are not available on this engine.",
-        "Pricing for this engine is not recorded in this build.",
+        "Kimi Code comes with every current membership plan, from Plus at $19 a month up.",
       ],
     },
     defaultModels: [
@@ -843,12 +866,90 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
     ],
   },
 
+  zcode: {
+    id: "zcode",
+    displayName: "ZCode",
+    capabilityBadgeColor: "bg-indigo-700 text-white",
+    group: "Cloud",
+    pricing: {
+      kind: "subscription",
+      subscription: {
+        // The plan tiers are account-side; the quota endpoint names the
+        // active one as "GLM Coding <Level>".  costPerMonth is null so the
+        // pricing chip does not invent a billed amount.
+        tierLabel: "GLM Coding Plan",
+        costPerMonth: null,
+        includedQuota: "Rolling 5-hour and weekly token windows plus a monthly MCP-call window, reported by the plan quota endpoint",
+        notes:
+          "GLM Coding Plan subscription.  BotFleet does not register a separate z.ai API rate for this engine.  Source:  https://z.ai/subscribe",
+      },
+    },
+    capabilities: {
+      files: "yes",
+      terminal: "yes",
+      thisComputer: "yes",
+      imageAttachments: "yes",
+      connectedApps: "yes",
+      crossBotCoordination: "yes",
+      roomCoordination: "yes",
+      computerUse: "yes",
+      voiceChat: "no",
+      webAccess: "yes",
+      longContext: "yes",
+      liveResearch: "no",
+    },
+    capabilityNotes: {
+      thisComputer:
+        "ZCode ACP turns run on the zcode-acp-server bridge, which mounts BotFleet's local computer channel; a bot on this engine reaches the host desktop under the standard approval cards.  The headless CLI driver mounts nothing.",
+      imageAttachments:
+        "ZCode ACP turns carry image and PDF attachments natively (the bridge stages embedded resources for the backend); the headless CLI driver takes text prompts only.",
+      connectedApps:
+        "The ZCode ACP driver mounts the Connected Apps via Composio bridge alongside the team and computer channels.  The headless CLI driver declares no MCP wiring, so BotFleet's servers are not mounted for it.",
+      crossBotCoordination:
+        "The ZCode ACP driver mounts BotFleet's team tools, so a ZCode bot can delegate work to peers and answer when asked; the headless CLI driver does not.",
+      roomCoordination: "The ZCode ACP driver mounts the room channel with the team tools; the headless CLI driver does not.",
+      computerUse:
+        "The ZCode ACP driver mounts BotFleet's screen channel so a bot can inspect and drive a desktop under the standard approval cards; the headless CLI driver declares no host-control wiring.",
+      webAccess:
+        "The ZCode CLI registers WebSearch as a core read-only tool (apps/zcode-cli/packages/core/src/tool/scheduler.ts, implemented in tool/handlers/websearch.ts), and both drivers run it:  the ACP bridge drives the official app-server with the full tool set, and the headless driver's --disallowed-tools removes only the ask tools.",
+      longContext:
+        "GLM-5.3 documents a 1M-token context window and is the default model on both drivers.  Source:  https://docs.z.ai/guides/llm/glm-5.3 (fetched 2026-11-03).",
+      liveResearch:
+        "The CLI's modes are build, edit, plan, yolo, and guarded; there is no dedicated multi-step research pass, only single-shot WebSearch.",
+    },
+    whyThisEngine: {
+      headline: "Z.ai's GLM Coding Plan agent — over ACP or headless.",
+      prose: [
+        "BotFleet drives ZCode two ways.  The ACP engine speaks the Agent Client Protocol to the zcode-acp-server bridge, which runs the official zcode app-server:  BotFleet's team, computer, screen and Connected Apps channels mount, image and PDF attachments ride along, sessions resume, and the model and thought level switch per turn.",
+        "The headless driver spawns the zcode CLI one prompt per turn, NDJSON events back, resume by session id, with no MCP wiring \u2014 files, terminal and web search inside the CLI's own workspace.",
+        "Turns ride the GLM Coding Plan behind the Mac's own ZCode sign-in, so a reported cost is notional.",
+      ],
+    },
+    defaultModels: [
+      { id: "GLM-5.3", display: "GLM-5.3" },
+      { id: "GLM-5.3-Flash", display: "GLM-5.3 Flash" },
+    ],
+  },
+
   droid: {
     id: "droid",
     displayName: "Droid",
     capabilityBadgeColor: "bg-stone-800 text-white",
     group: "Cloud",
-    pricing: { kind: "unknown", notes: "Pricing for this engine is not recorded in this build." },
+    pricing: {
+      kind: "subscription",
+      subscription: {
+        // Pro is the cheapest individual plan.  Source:
+        // https://factory.com/pricing (fetched 2026-10-21).
+        tierLabel: "Factory Pro",
+        costPerMonth: 20,
+        includedQuota: "Pro $20, Plus $100 (~5x Pro), Max $200 (~10x Pro) per month",
+        notes:
+          "Individual plans:  Pro $20/month, Plus $100/month at about five times Pro's usage, Max $200/month at about ten.  Teams is $60/month plus $40 per seat.  Source:  https://factory.com/pricing",
+      },
+      // No outer `notes`: UsageSection shows `pricing.notes` ahead of the
+      // subscription note, and the plan sentence belongs in the tooltip.
+    },
     capabilities: {
       files: "yes",
       terminal: "yes",
@@ -873,7 +974,7 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
         "BotFleet drives the Droid CLI over ACP.  Files, terminal, this computer, computer use, web access, image attachments, connected apps, cross-bot coordination, rooms, and long context are available.",
         "The engine's own catalog spans several providers, which is why its row carries one badge rather than a model-family claim.",
         "Voice chat and live research are not available on this engine.",
-        "Pricing for this engine is not recorded in this build.",
+        "Factory's individual plans start at Pro $20 a month.",
       ],
     },
     defaultModels: [
@@ -890,7 +991,11 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
     displayName: "OpenCode",
     capabilityBadgeColor: "bg-teal-600 text-white",
     group: "Cloud",
-    pricing: { kind: "unknown", notes: "Pricing for this engine is not recorded in this build." },
+    pricing: {
+      kind: "unknown",
+      notes:
+        "The CLI is free and open-source.  Models run on the account's own provider keys at the provider's rates, or on OpenCode Zen pay-as-you-go sold at cost per 1M tokens (https://opencode.ai/docs/zen/, fetched 2026-10-21).  Rates live with the provider, so no single figure is claimed here.",
+    },
     capabilities: {
       files: "yes",
       terminal: "yes",
@@ -914,7 +1019,7 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       prose: [
         "BotFleet drives the OpenCode CLI over ACP.  Files, terminal, this computer, computer use, web access, image attachments, connected apps, cross-bot coordination, rooms, and long context are available.",
         "Voice chat and live research are not available on this engine.",
-        "Pricing for this engine is not recorded in this build.",
+        "The CLI itself is free and open-source.  Models run on the account's own provider keys at the provider's rates, or on OpenCode Zen pay-as-you-go sold at cost per 1M tokens (https://opencode.ai/docs/zen/, fetched 2026-10-21).",
       ],
     },
     // No hardcoded id: the free catalog rotates and the previous entry
@@ -1074,7 +1179,7 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       thisComputer: "no",
       connectedApps: "no",
       crossBotCoordination: "no",
-      computerUse: "no",
+      computerUse: "limited",
       imageAttachments: "no",
       roomCoordination: "no",
       webAccess: "yes",
@@ -1084,13 +1189,13 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
     },
     capabilityNotes: {
       computerUse:
-        "Worth an audit:  this engine runs on a remote sandbox, yet its driver declares no screen channel at all.  A box you cannot see is a strange default, and it is the one cell on this row most likely to be wrong.",
+        "Audited:  the bot has the box's full desktop — Chrome, shell, and disk — driven through the Box substrate's own native facility.  BotFleet shows that screen live through a screenshot poll rather than its own screen channel, so the standard approval cards do not wrap what the bot does there.",
     },
     whyThisEngine: {
       headline: "A remote sandbox reached over its own API.",
       prose: [
         "BotFleet drives ASCII.dev Box as a remote sandbox.  Files, terminal, and web access are available.",
-        "Connected apps, peers, rooms, voice chat, computer use, long context, and live research are unavailable — including the screen channel, which is worth an audit on an engine that exists to be looked at.",
+        "Computer use is the point:  the bot has the box's full desktop (Chrome, shell, disk) and the chat shows its screen live through a screenshot poll, outside BotFleet's own screen channel and approval cards.  Connected apps, peers, rooms, voice chat, long context, and live research are unavailable.",
         "Pricing for this engine is not recorded in this build.",
       ],
     },
@@ -1264,6 +1369,7 @@ export const ENGINE_DISPLAY_ORDER: string[] = [
   "mcode",
   "muse",
   "kimi",
+  "zcode",
   "droid",
   "opencode",
   "qwen",
@@ -1300,6 +1406,7 @@ export function engineAccessLabel(entry: EngineCapabilityEntry): string {
     case "mcode":
     case "muse":
     case "kimi":
+    case "zcode":
     case "droid":
     case "opencode":
     case "qwen":
@@ -1335,6 +1442,11 @@ export function engineIdFromDriverKind(driverKind: string | undefined | null): s
   // from Go to OpenCode.  The registry id follows the product name, so the
   // kind needs spelling out here.
   if (normalized === "opencodego") return "opencode";
+  // The ZCode ACP bridge driver rides the same engine row as the headless
+  // CLI (the grok pair precedent): one row, notes name which driver mounts
+  // what. `zcodeAcp` normalizes to `zcodeacp`, which matches nothing without
+  // this alias.
+  if (normalized === "zcodeacp") return "zcode";
   // antigravity / cursor / claude / codex / grok / deepseek all collapse
   // to their registry id after the Agent suffix strip.
   if (ENGINE_CAPABILITIES[normalized]) return normalized;

@@ -281,7 +281,9 @@ type SkillRecordingPayload = {
           | "opencodeGoApiKey"
           | "ttsKey"
           | "openaiImageApiKey"
-          | "infisicalClientSecret",
+          | "infisicalClientSecret"
+          | "infisicalReadToken"
+          | "infisicalWriteToken",
         value: string,
         provider?: "minimax" | "system",
       ): Promise<ConfigStatus>;

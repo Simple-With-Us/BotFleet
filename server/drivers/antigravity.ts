@@ -75,7 +75,7 @@ import type {
   SendTurnInput,
 } from "../contracts.ts";
 import { newEventId, newId } from "../contracts.ts";
-import { applyLaunchIdentity } from "../launch-identity.ts";
+import { cliLoginEnvironment, launchedChildEnvironment, primeCliLogin } from "../cli-logins.ts";
 import { appendNative } from "./native.ts";
 
 const DRIVER_KIND = "antigravityAgent";
@@ -735,6 +735,11 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
     const sendTurn = async (turn: SendTurnInput) => {
       const { threadId } = turn;
       if (disposed) throw new Error("Antigravity instance is disposed");
+      // The seat's CLI login is read in the BACKGROUND, and the read is started
+      // here, before the guard:  the guard and the registration that follows it
+      // have to stay free of `await`, or a second turn on this thread would walk
+      // through the guard the first one already passed.
+      primeCliLogin(turn.launchIdentity?.seat);
       if (active.has(threadId) || pending.has(threadId)) throw new Error("a turn is already running on this thread");
       pending.add(threadId);
       const turnId = newId();
@@ -942,7 +947,7 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
           cwd,
           // `env` is built once per instance and shared by every turn; the
           // launch identity is this bot's and this turn's, applied to a copy.
-          env: applyLaunchIdentity(env, turn.launchIdentity),
+          env: launchedChildEnvironment(env, turn.launchIdentity, cliLoginEnvironment(turn.launchIdentity?.seat)),
           stdio: [useStdin ? "pipe" : "ignore", "pipe", "pipe"],
         });
         if (useStdin && child.stdin) {
