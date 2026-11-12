@@ -8005,8 +8005,8 @@ async function startTurn(
           ? { localComputer: hasHostComputer, workspace: worksInWorkspace }
           : { ...integrations, localComputer: hasHostComputer, workspace: worksInWorkspace, recall: hasRecall, phone: hasPhone, linq: hasLinq, jobs: jobsForTurn, zulip: zulipMounted },
         oneShot
-          ? { chiefOfStaff: false }
-          : { chiefOfStaff: Boolean(bot.chiefOfStaff), linq: hasLinq },
+          ? { chiefOfStaff: false, toolResultArchive: usesDriverToolLoop }
+          : { chiefOfStaff: Boolean(bot.chiefOfStaff), linq: hasLinq, toolResultArchive: usesDriverToolLoop },
       );
       const httpToolPrompt = usesDriverToolLoop
         ? httpCatalogPromptFor(
@@ -8345,6 +8345,7 @@ async function startTurn(
               // the chiefOfStaff check both live there), independent of
               // whatever the model was actually offered this turn.
               chiefOfStaff: Boolean(bot.chiefOfStaff),
+              toolResultArchive: true,
               // The same `jobsForTurn` the catalog above was built from.
               jobs: jobsForTurn
                 ? { registry: jobRegistry, onComplete: "wake", wakes: jobSettings().wake, maxWaitSeconds: JOB_OUTPUT_WAIT_MAX_SECONDS_HTTP }
@@ -10580,7 +10581,7 @@ async function runGroupMemberTurn(
             phone: hasRoomPhone,
             jobs: roomJobs,
           },
-          { chiefOfStaff: Boolean(bot.chiefOfStaff) },
+          { chiefOfStaff: Boolean(bot.chiefOfStaff), toolResultArchive: true },
         )
       : [];
   // `commsDepth: hop` — the room's own hop, not zero.  The catalog above
@@ -10604,6 +10605,7 @@ async function runGroupMemberTurn(
           confinement: confinementForRoom,
           cwd: cwd ?? bot.cwd ?? undefined,
           chiefOfStaff: Boolean(bot.chiefOfStaff),
+          toolResultArchive: true,
           jobs: roomJobs
             ? { registry: jobRegistry, onComplete: "notice", maxWaitSeconds: JOB_OUTPUT_WAIT_MAX_SECONDS_HTTP }
             : undefined,
