@@ -342,6 +342,16 @@ if (fixtureParam === "tv-face") {
       </StrictMode>,
     );
   });
+} else if (fixtureParam === "simple-app-thread-refusal") {
+  // Shows the note Simple uses when an App chip would open a saved conversation.
+  void import("./components/SimpleAppThreadRefusalVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
 } else if (fixtureParam === "engine-marks") {
   // Visual-spec harness (tests/e2e/engine-marks.visual.spec.ts): the model
   // picker's engine rail, in a preset skin or in the Custom Palette whose main
