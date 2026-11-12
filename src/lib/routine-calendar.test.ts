@@ -1,15 +1,35 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import type { Routine } from "./routines";
 import {
   calendarDayLabel,
   calendarMinuteOfDay,
   editedDailySchedule,
+  groupOverlappingCalendarItems,
   nextCalendarRunLabel,
   projectedRoutineItems,
   routineScheduleLabel,
+  scheduleFireDays,
   timeZoneLabel,
 } from "./routine-calendar";
+import { startOfDayInTimeZone } from "../../shared/time-zone";
+
+/** The clock part of a label is rendered in the host's locale, so the
+ *  expectation is built with the same formatter the label uses.  A hard-coded
+ *  "9:00 AM" only holds on an English twelve-hour host, and the label is
+ *  what the app shows, locale and all. */
+function wallClockLabel(hour: number, minute: number): string {
+  return new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit", timeZone: "UTC" })
+    .format(Date.UTC(2000, 0, 1, hour, minute));
+}
+
+/** The same, for a whole label: the day and the clock are fixed, and only
+ *  the zone abbreviation is allowed to vary between the two spellings ICU
+ *  gives a zone with no name of its own. */
+function labelPattern(day: string, hour: number, minute: number, zone: string): RegExp {
+  const clock = wallClockLabel(hour, minute).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`^${day} at ${clock} (${zone})$`);
+}
 
 function routine(schedule: Routine["schedule"]): Routine {
   return {
@@ -60,8 +80,31 @@ describe("routine calendar timezone", () => {
 
   it("names both the Central calendar policy and a preserved legacy host zone", () => {
     expect(timeZoneLabel("America/Chicago", Date.parse("2026-07-01T12:00:00Z"))).toBe("Central Time (CDT)");
-    const legacy = routine({ type: "daily", time: "09:00", weekdays: [1], timeZone: "Europe/Athens" });
-    expect(routineScheduleLabel(legacy)).toMatch(/^Mon at 9:00 AM (GMT\+3|EEST)$/);
+    //  The zone name follows the instant the label is built from, so the
+    //  fixture pins one.  Europe/Athens is GMT+3 in July and GMT+2 in
+    //  winter, so an unpinned label flips with the daylight-saving switch
+    //  and fails every run on one side of it.
+    const legacy = {
+      ...routine({ type: "daily", time: "09:00", weekdays: [1], timeZone: "Europe/Athens" }),
+      nextRunAt: Date.parse("2026-07-01T09:00:00Z"),
+    };
+    expect(routineScheduleLabel(legacy)).toMatch(labelPattern("Mon", 9, 0, "GMT\\+3|EEST"));
+  });
+
+  it("keeps the disabled-routine label on a pinned winter instant", () => {
+    //  A disabled routine carries no next run, so the label falls back to
+    //  the current instant, and the zone abbreviation it prints follows that
+    //  instant.  Pin the clock, or the assertion flips with the
+    //  daylight-saving switch exactly like the fixture above did.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(Date.parse("2026-01-15T09:00:00Z"));
+      const disabled = routine({ type: "daily", time: "09:00", weekdays: [1], timeZone: "Europe/Athens" });
+      expect(disabled.nextRunAt).toBeNull();
+      expect(routineScheduleLabel(disabled)).toMatch(labelPattern("Mon", 9, 0, "GMT\\+2|EET"));
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("omits a display-only host zone when an existing legacy recurrence is edited", () => {
@@ -88,5 +131,81 @@ describe("routine calendar timezone", () => {
     const now = Date.parse("2026-09-13T04:45:00.000Z");
     const at = Date.parse("2026-09-13T04:55:00.000Z");
     expect(nextCalendarRunLabel(at, now)).toBe("Today, 11:55 PM CDT");
+  });
+});
+
+describe("scheduleFireDays", () => {
+  const zone = "America/Chicago";
+  // 2026-09-01..2026-10-01, both bounds expressed as Chicago midnights so a
+  // fixture change never has to hand-recompute UTC offsets.
+  const septStart = Date.parse("2026-09-01T05:00:00.000Z");
+  const octStart = Date.parse("2026-10-01T05:00:00.000Z");
+
+  it("marks the single day a one-shot schedule fires on, in range", () => {
+    const at = Date.parse("2026-09-14T14:00:00.000Z"); // Mon Sep 14, 9am Central
+    const days = scheduleFireDays({ type: "once", at }, zone, septStart, octStart);
+    expect(days).toEqual(new Set([startOfDayInTimeZone(at, zone)]));
+  });
+
+  it("omits a one-shot day outside the requested range", () => {
+    const at = Date.parse("2026-11-02T14:00:00.000Z");
+    expect(scheduleFireDays({ type: "once", at }, zone, septStart, octStart).size).toBe(0);
+  });
+
+  it("marks every Monday in September 2026 for a weekly recurrence, and only Mondays", () => {
+    const days = scheduleFireDays({ type: "daily", time: "09:00", weekdays: [1], timeZone: zone }, zone, septStart, octStart);
+    expect(days.size).toBe(4); // Sep 2026 has exactly four Mondays: 7, 14, 21, 28
+    for (const day of days) {
+      expect(calendarDayLabel(day).weekday).toBe("Mon");
+    }
+  });
+
+  it("never loops on a recurrence with no weekdays selected", () => {
+    const days = scheduleFireDays({ type: "daily", time: "09:00", weekdays: [], timeZone: zone }, zone, septStart, octStart);
+    expect(days.size).toBe(0);
+  });
+
+  it("keys days by the schedule's own zone, not UTC or the host's", () => {
+    // 00:30 Monday in Tokyo is still Sunday everywhere west of it — the
+    // returned day must be the Tokyo calendar day, matching
+    // projectedRoutineItems' own occurrence (see the timezone test above).
+    const days = scheduleFireDays(
+      { type: "daily", time: "00:30", weekdays: [1], timeZone: "Asia/Tokyo" },
+      "Asia/Tokyo",
+      Date.parse("2026-09-13T05:00:00.000Z"),
+      Date.parse("2026-09-14T05:00:00.000Z"),
+    );
+    expect(days).toEqual(new Set([startOfDayInTimeZone(Date.parse("2026-09-13T15:30:00.000Z"), "Asia/Tokyo")]));
+  });
+});
+
+describe("groupOverlappingCalendarItems", () => {
+  const item = (id: string, minute: number, durationMinutes = 30) => ({
+    id,
+    at: Date.parse("2026-10-13T13:00:00.000Z") + minute * 60_000,
+    routine: { ...routine({ type: "once", at: Date.parse("2026-10-13T13:00:00.000Z") }), id, durationMinutes },
+    run: null,
+  });
+
+  it("keeps distinct appointments as separate cards", () => {
+    expect(groupOverlappingCalendarItems([item("a", 0), item("b", 45)]).map((group) => group.items.map((entry) => entry.id)))
+      .toEqual([["a"], ["b"]]);
+  });
+
+  it("collapses a transitive collision chain into one stack", () => {
+    const groups = groupOverlappingCalendarItems([
+      item("late", 40),
+      item("first", 0),
+      item("middle", 20),
+    ]);
+
+    expect(groups).toHaveLength(1);
+    expect(groups[0].items.map((entry) => entry.id)).toEqual(["first", "middle", "late"]);
+    expect(groups[0].endAt).toBe(groups[0].items[2].at + 45 * 60_000);
+  });
+
+  it("uses a routine's longer duration for collision detection", () => {
+    expect(groupOverlappingCalendarItems([item("long", 0, 90), item("inside", 70)]).map((group) => group.items.length))
+      .toEqual([2]);
   });
 });

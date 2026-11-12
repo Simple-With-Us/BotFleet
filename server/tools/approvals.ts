@@ -67,6 +67,7 @@ export interface ApprovalAsk {
   providerInstanceId?: string;
   tool: string;
   summary: string;
+  approvalScope?: "local-computer" | "disposable-computer";
   /** The tool call's own abort signal.  When the turn is interrupted, swept
    *  or torn down this fires, and the ask settles `"unavailable"` rather
    *  than leaving a promise nothing can ever resolve. */
@@ -89,7 +90,12 @@ export interface PermissionBroker {
   /** How many asks are open right now.  A test seam and a leak detector:
    *  this must be 0 once every turn has settled. */
   pending(): number;
-  /** Whether this exact ask is open.  Test seam. */
+  /** Whether this exact ask is open on THIS broker, which is to say the
+   *  in-process tool host raised it.  No engine and no mounted MCP server
+   *  can open one here, so this is how the `request.opened` handler tells
+   *  the harness's own `job_start` from a third-party tool that borrows the
+   *  name (`isOwnJobStartRequest`, server/auto-approve.ts).  Also a test
+   *  seam. */
   isOpen(threadId: string, requestId: string): boolean;
 }
 
@@ -200,6 +206,7 @@ export function createPermissionBroker(deps: PermissionBrokerDeps): PermissionBr
           requestType: "permission",
           tool: ask.tool,
           summary: ask.summary,
+          approvalScope: ask.approvalScope,
         });
       });
     },

@@ -7,6 +7,7 @@ public struct GitPRDiffCardView: View {
     public let deletions: Int
     
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var showDiff: Bool = true
     @State private var showAllLines: Bool = false
 
@@ -41,7 +42,7 @@ public struct GitPRDiffCardView: View {
             // Header
             HStack(spacing: 6) {
                 Image(systemName: "arrow.triangle.pull")
-                    .font(.system(size: 12, weight: .bold))
+                    .font(.scaled(12, weight: .bold, relativeTo: .caption))
                     .foregroundColor(Color(hex: "#22C55E"))
                 
                 Text(filename)
@@ -54,10 +55,10 @@ public struct GitPRDiffCardView: View {
                 // Diff Delta (+ / -)
                 HStack(spacing: 4) {
                     Text("+\(additions)")
-                        .font(.system(size: 10.5, weight: .bold, design: .monospaced))
+                        .font(.scaled(10.5, weight: .bold, design: .monospaced, relativeTo: .caption))
                         .foregroundColor(Color(hex: "#22C55E"))
                     Text("-\(deletions)")
-                        .font(.system(size: 10.5, weight: .bold, design: .monospaced))
+                        .font(.scaled(10.5, weight: .bold, design: .monospaced, relativeTo: .caption))
                         .foregroundColor(Color(hex: "#EF4444"))
                 }
                 .padding(.horizontal, 6)
@@ -70,14 +71,14 @@ public struct GitPRDiffCardView: View {
             if !diffText.isEmpty {
                 VStack(alignment: .leading, spacing: 0) {
                     Button {
-                        withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
+                        withAnimation(reduceMotion ? nil : .spring(response: 0.3, dampingFraction: 0.7)) {
                             showDiff.toggle()
                         }
                         Haptics.selection()
                     } label: {
                         HStack {
                             Image(systemName: showDiff ? "chevron.down" : "chevron.right")
-                                .font(.system(size: 9, weight: .bold))
+                                .font(.scaled(9, weight: .bold, relativeTo: .caption2))
                             Text(showDiff ? "Hide Diff" : "View Diff")
                                 .font(.caption2.weight(.semibold))
                             Spacer()
@@ -86,6 +87,9 @@ public struct GitPRDiffCardView: View {
                         .padding(.vertical, 2)
                     }
                     .buttonStyle(.plain)
+                    // "View Diff" says nothing about the state it put the card
+                    // in; the arrow beside it is a picture, not an answer.
+                    .accessibilityValue(showDiff ? "Expanded" : "Collapsed")
                     
                     if showDiff {
                         ScrollView(.horizontal, showsIndicators: false) {
@@ -102,7 +106,7 @@ public struct GitPRDiffCardView: View {
 
                         if lines.count > 80 {
                             Button(showAllLines ? "Show first 80 lines" : "Show all \(lines.count) lines") {
-                                withAnimation(.easeInOut(duration: 0.2)) { showAllLines.toggle() }
+                                withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.2)) { showAllLines.toggle() }
                                 Haptics.selection()
                             }
                             .font(.caption2.weight(.semibold))
@@ -133,21 +137,11 @@ public struct GitPRDiffCardView: View {
             }
         }
         .padding(10)
-        .background(
-            LinearGradient(
-                colors: isDark ? [
-                    Color(hex: "#0D1117").opacity(0.96),
-                    Color(hex: "#161B22").opacity(0.92)
-                ] : [
-                    Color.white.opacity(0.96),
-                    Color(hex: "#F8FAFC").opacity(0.92)
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-        )
-        .background(.ultraThinMaterial)
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        // The one material the chrome is made of (Glass.swift), replacing a
+        // gradient stacked under a second material. The hairline stroke and
+        // the shadow stay, because the diff panel underneath is dark in both
+        // appearances and needs that edge to read as a well.
+        .glassRounded(cornerRadius: 12, interactive: false)
         .overlay(
             RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .stroke(isDark ? Color.white.opacity(0.12) : Color.black.opacity(0.08), lineWidth: 0.75)
@@ -162,7 +156,7 @@ public struct GitPRDiffCardView: View {
         let isHeader = line.hasPrefix("@@") || line.hasPrefix("diff")
         
         Text(line)
-            .font(.system(size: 10, design: .monospaced))
+            .font(.scaled(10, design: .monospaced, relativeTo: .caption2))
             .foregroundColor(
                 isAddition ? Color(hex: "#4ADE80") :
                 isDeletion ? Color(hex: "#F87171") :

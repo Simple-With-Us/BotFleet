@@ -11,10 +11,20 @@
 // fails visibly when the native session cannot be restored.
 import { homedir } from "node:os";
 
+import { z } from "zod";
+
 import { stripWorkspaceCredentialEnv } from "../config.ts";
 import { computerProxyEnv } from "../container-computer.ts";
 import { hostToolPrefix, turnComputerMounts } from "../computer-grants.ts";
-import { describeSpawnFailure, execCli, killCliTree, spawnCli } from "../procs.ts";
+import {
+  classifyVersionProbeFailure,
+  describeSpawnFailure,
+  execCli,
+  killCliTree,
+  LastKnownAnswer,
+  logProbeFailure,
+  spawnCli,
+} from "../procs.ts";
 import { SPAWNED_PROXIES } from "../proxy-paths.ts";
 
 import type {
@@ -27,11 +37,20 @@ import type {
   SendTurnInput,
 } from "../contracts.ts";
 import { newEventId, newId } from "../contracts.ts";
-import { decodeCodexSelection, readCodexModelCatalog, STATIC_CODEX_MODELS } from "./codex-catalog.ts";
+import { cliLoginEnvironment, launchedChildEnvironment, primeCliLogin } from "../cli-logins.ts";
+import { codexShellPolicyArgs } from "../launch-identity.ts";
+import {
+  decodeCodexSelection,
+  readCodexModelCatalogDetailed,
+  STATIC_CODEX_MODELS,
+  type CodexCatalogMemory,
+  type CodexProbeFailure,
+} from "./codex-catalog.ts";
 import { codexLocalProviderArgs } from "./local-inject.ts";
 import { augmentedPath } from "../env-path.ts";
 import { toolFields } from "../tool-fields.ts";
 import { describeResult } from "../../shared/tool-activity.ts";
+import { captureInput, captureOutput } from "../../shared/item-io.ts";
 import { classifyError, computeBackoff, RETRY_MAX_ATTEMPTS } from "./retry.ts";
 import { classifyResumeFailure, mayReplay, recoveryPromptFor } from "../resume-recovery.ts";
 import { appendNative } from "./native.ts";
@@ -39,6 +58,38 @@ import { appendNative } from "./native.ts";
 export { decodeCodexSelection, readCodexModelCatalog, STATIC_CODEX_MODELS } from "./codex-catalog.ts";
 
 const DRIVER_KIND = "codex";
+const codexNonemptyString = z.string().min(1);
+
+/** The part of a Codex item that is the step's INPUT: the command, the files
+ * it changes, the tool and its arguments, the search.  The item also carries
+ * its own outcome (status, output, exit code), which belongs to OUT, and its
+ * id, which is the key. */
+const CODEX_ITEM_OUTCOME_FIELDS = new Set([
+  "id",
+  "status",
+  "aggregatedOutput",
+  "output",
+  "result",
+  "error",
+  "exitCode",
+  "durationMs",
+]);
+
+function codexItemInput(item: Record<string, unknown>): Record<string, unknown> {
+  const input: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(item)) {
+    if (!CODEX_ITEM_OUTCOME_FIELDS.has(key)) input[key] = value;
+  }
+  return input;
+}
+
+// A resumed thread keeps the model it was started with, so changing the bot's
+// model cannot fix a retired one there — only a fresh thread or a rewind can.
+function unknownModelMessage(resumed: boolean): string {
+  return resumed
+    ? "This conversation's Codex model isn't available.  Start a new thread or rewind."
+    : "This Codex model isn't available.  Pick another model in Settings.";
+}
 
 class CodexResumeError extends Error {
   constructor(options?: { cause?: unknown }) {
@@ -105,9 +156,24 @@ function mountMcpServer(
   );
 }
 
+/** What `codex login status` said, or undefined when it said nothing
+ * recognizable.  A signed-out CLI exits 1 with "Not logged in" on stderr, so
+ * the text decides regardless of the exit code; a probe that timed out or
+ * printed nothing is inconclusive, never a sign-out. */
+export function codexLoginAnswer(output: string): boolean | undefined {
+  if (/\bnot logged in\b/i.test(output)) return false;
+  if (/^logged in\b/im.test(output)) return true;
+  return undefined;
+}
+
 export const CodexDriver: ProviderDriver<CodexConfig> = {
   driverKind: DRIVER_KIND,
-  metadata: { displayName: "Codex", supportsMultipleInstances: true },
+  metadata: {
+    displayName: "Codex",
+    supportsMultipleInstances: true,
+    // Mirrors the `capabilities` block in `create` below.
+    channelWiring: { agentsMcp: true, computerMcp: true, composioMcp: true, localComputerMcp: true, images: true },
+  },
   install: {
     command: {
       darwin: "npm install -g @openai/codex",
@@ -141,10 +207,33 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
     };
     const catalogEnv = childEnv();
     let models = STATIC_CODEX_MODELS;
+    // Whether `models` ever held rows Codex itself answered with.  Once it
+    // has, a failed probe must not swap those for BotFleet's own fallback.
+    let modelsConfirmed = false;
+    const catalogMemory: CodexCatalogMemory = {};
+    let lastProbeFailure: CodexProbeFailure | null = null;
     const refreshModels = async () => {
       try {
-        const resolved = await readCodexModelCatalog(catalogEnv, fetch, config.cli);
-        if (resolved.options.length) models = resolved;
+        const { catalog, source } = await readCodexModelCatalogDetailed(catalogEnv, fetch, config.cli, {
+          memory: catalogMemory,
+          // 8 s by default.  A host under heavy load can need longer to spawn
+          // the app-server; the list served meanwhile is the last good one,
+          // so raising this only delays the refresh, never the picker.
+          probeTimeoutMs: Number(process.env.OMB_CODEX_CATALOG_PROBE_MS) || undefined,
+          // The probe used to fail silently, so a timeout under host load
+          // looked the same as a CLI that answered with nothing.  Logged on a
+          // change only: describe runs often and one line per pass is noise.
+          onProbeFailure: (reason) => {
+            if (reason === lastProbeFailure) return;
+            lastProbeFailure = reason;
+            console.warn(`[codex:${instanceId}] model catalog probe failed (${reason})`);
+          },
+        });
+        if (!catalog.options.length) return;
+        if (source === "static" && modelsConfirmed) return;
+        if (source === "live") lastProbeFailure = null;
+        models = catalog;
+        modelsConfirmed = source !== "static";
       } catch {
         // Keep the last usable catalog when a local provider is down.
       }
@@ -161,6 +250,12 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
     // decision in `sendTurn`: a sandbox is fixed at thread/start, so a later
     // host-control turn can only reuse a thread it knows was started brokered.
     const brokeredThreads = new Set<string>();
+    // codex thread ids whose model was rejected (unknown_model).  A thread
+    // keeps its start model, and the harness has already saved it as the
+    // resume cursor, so resuming it after the user picks another model would
+    // fail the same way.  A cursor in this set is never resumed; the next
+    // turn starts a fresh thread on the newly selected model.
+    const modelRejectedThreads = new Set<string>();
 
     const emit = (event: RuntimeEvent) => {
       for (const l of [...listeners]) l(event);
@@ -178,6 +273,12 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       // this turn so activity elsewhere cannot cancel or revive its retry.
       let stopRequested = false;
       const { threadId } = turn;
+      // The seat's CLI login is read in the BACKGROUND, and the read is
+      // started here, before the guard:  the guard and the registration
+      // that follows it have to stay free of `await`, or a second turn on
+      // this thread would walk through the guard the first one already
+      // passed.
+      primeCliLogin(turn.launchIdentity?.seat);
       if (active.has(threadId)) throw new Error("a turn is already running on this thread");
       const turnId = newId();
       // Host control means the user's real desktop — the Local VM and a VPS
@@ -195,8 +296,14 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       // Reached from a room as well as a 1:1 chat since the room lane started
       // resolving computers, so a full-auto Codex bot with This Computer now
       // asks in BOTH lanes.
-      const controlsHost = hostToolPrefix(turnComputerMounts(turn.integrations)) !== null;
-      const brokered = controlsHost && config.fullAuto;
+      const computerMounts = turnComputerMounts(turn.integrations);
+      const hostPrefix = hostToolPrefix(computerMounts);
+      const controlsHost = hostPrefix !== null;
+      // A turn the harness holds for auto-review (`holdForReview`) is
+      // brokered for the same reason: the reviewer can only hold an ask the
+      // app-server actually sends.  It runs inside workspace-write on-request
+      // and resumes only a thread started brokered, exactly like a host turn.
+      const brokered = (controlsHost || turn.holdForReview === true) && config.fullAuto;
       const turnFullAuto = config.fullAuto && !brokered;
       // a retry relaunches the whole app-server; the backoff is scaled down in
       // tests so a fake's transient failures don't stall real seconds
@@ -209,8 +316,16 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       let promptText = turn.system ? `${turn.system}\n\n${turn.text}` : turn.text;
 
       const launchAttempt = async (attempt: number): Promise<void> => {
-        const env = childEnv();
-        const appServerArgs = ["app-server", ...codexLocalProviderArgs(env, turn.model)];
+        // `childEnv()` is the instance's; the launch identity is this bot's
+        // and this turn's, so it goes on last (a relaunch rebuilds it).
+        const env = launchedChildEnvironment(childEnv(), turn.launchIdentity, cliLoginEnvironment(turn.launchIdentity?.seat));
+        const appServerArgs = [
+          "app-server",
+          ...codexLocalProviderArgs(env, turn.model),
+          // The model's shell commands run under Codex's own environment
+          // policy, which a user config can narrow to an allowlist.
+          ...codexShellPolicyArgs(turn.launchIdentity),
+        ];
         if (turn.integrations?.composio) {
           mountMcpServer(appServerArgs, env, "botfleet_connectors", turn.integrations.composio);
         }
@@ -228,6 +343,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
               env: {
                 ELECTRON_RUN_AS_NODE: "1",
                 OGB_BOX_ID: proxyEnv.OGB_BOX_ID ?? "",
+                OGB_BOX_API: proxyEnv.OGB_BOX_API ?? "",
                 OGB_BOX_TOKEN: proxyEnv.OGB_BOX_TOKEN ?? "",
                 // who-is-driving endpoint, so a person taking the wheel in the
                 // panel pauses this bot's hands mid-turn
@@ -237,7 +353,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
             });
           } else if (mount.stdio) {
             // The host daemon, the isolated Local VM, and a VPS desktop all
-            // arrive as a direct Cua Driver stdio MCP server.
+            // arrive as a direct CUA Driver stdio MCP server.
             mountMcpServer(appServerArgs, env, mount.name, mount.stdio);
           }
         }
@@ -267,9 +383,17 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         settled: false,
         lastText: "",
         sawStreamDelta: false,
+        // this attempt continues a saved codex thread (thread/resume succeeded)
+        resumed: false,
+        // the codex thread this attempt resumed or started, once known
+        codexThreadId: null as string | null,
         // codex reports token usage as a running THREAD total; the harness
         // wants this turn's figure, so the last report is banked on settle
         usage: undefined as { input: number; output: number; cachedInput?: number } | undefined,
+        // helper-thread notifications kept out of this turn (see handleNotification)
+        foreignThreadNotifications: 0,
+        // helper thread id -> the spawn_agent item that started it
+        helperParents: new Map<string, string>(),
       };
 
       const asks = new Map<string, (behavior: "allow" | "deny" | "answer", message?: string, source?: "user" | "timeout" | "system") => void>();
@@ -312,6 +436,9 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       const settle = (ok: boolean, stopReason: string | null) => {
         if (state.settled) return;
         state.settled = true;
+        if (state.foreignThreadNotifications > 0) {
+          console.warn(`[codex] kept ${state.foreignThreadNotifications} helper-thread notification(s) out of this turn`);
+        }
         for (const finish of [...asks.values()]) finish("deny", "BotFleet: the turn ended", "system");
         for (const p of rpcPending.values()) p.reject(new Error("turn settled"));
         rpcPending.clear();
@@ -321,9 +448,18 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       };
 
       // server→client approval request → canonical request.opened
+      // Native shell/file asks can run on the host, even with a remote
+      // computer mounted. Only an MCP elicitation explicitly naming a
+      // different granted computer may use that computer's coarse grants.
       // Host-scope tagging mirrors claude.ts: when this turn mounts the real
       // Mac (not a VM), every card carries approvalScope so the harness's
       // local-computer-block backstop applies to remembered always-allows.
+      // Never resume this thread again: remembered here for this process,
+      // and announced so the harness drops the saved cursor durably.
+      const rejectThreadModel = (codexThreadId: string) => {
+        modelRejectedThreads.add(codexThreadId);
+        emit({ ...base(threadId, turnId), type: "session.invalidated", sessionId: codexThreadId, reason: "unknown_model" });
+      };
       const handleServerRequest = (msg: any) => {
         const method = msg.method as string;
         const params = msg.params ?? {};
@@ -335,7 +471,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         const mcpTool = isMcpElicitation
           ? String(params.message ?? "").match(/tool \"([^\"]+)\"/)?.[1]
           : undefined;
-        const tool =
+        let tool =
           isMcpElicitation
             ? (mcpTool ?? "mcp")
             : method === "item/fileChange/requestApproval" || method === "applyPatchApproval"
@@ -353,9 +489,23 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           });
         }
         const requestId = newId();
+        const remoteComputerAsk = isMcpElicitation && computerMounts.some((mount) =>
+          mount.kind !== "local" && params.serverName === mount.name &&
+          codexNonemptyString.safeParse(mcpTool).success,
+        );
+        if (remoteComputerAsk) tool = `mcp__${params.serverName}__${mcpTool}`;
+        const approvalScope = remoteComputerAsk && params.serverName === "computer" ? "disposable-computer"
+          : controlsHost && !remoteComputerAsk ? "local-computer" : undefined;
+        const remoteShellCommand = codexNonemptyString.safeParse(
+          remoteComputerAsk ? params._meta?.tool_params?.command : undefined,
+        );
         const summary =
-          isMcpElicitation && typeof params.message === "string"
-            ? params.message
+          remoteShellCommand.success
+            ? remoteShellCommand.data
+            : remoteComputerAsk
+              ? mcpTool!
+              : isMcpElicitation && typeof params.message === "string"
+                ? params.message
             : typeof params.command === "string"
             ? params.command
             : Array.isArray(params.questions)
@@ -394,20 +544,105 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         );
         timer.unref?.();
         asks.set(requestId, finish);
+        // The step this ask is about (v2 `itemId`, legacy `callId`), the
+        // same id its item.started carries, so the auto-review step watch
+        // leaves it to the card.
+        const askedItem = codexNonemptyString.safeParse(params.itemId ?? params.callId);
         emit({
           ...base(threadId, turnId),
           type: "request.opened",
           requestId,
+          itemId: askedItem.success ? askedItem.data : undefined,
           requestType: isQuestion ? "question" : "permission",
           tool,
           summary,
           choices,
-          approvalScope: controlsHost ? "local-computer" : undefined,
+          approvalScope,
         });
+      };
+
+      /** A tool step's title, or null for an item that is not a step. */
+      const toolTitle = (item: any): string | null =>
+        item.type === "commandExecution"
+          ? String(item.command ?? "shell")
+          : item.type === "fileChange"
+            ? "edit"
+            : item.type === "mcpToolCall"
+              ? (item.tool ?? item.name ?? "mcp")
+              : item.type === "webSearch"
+                ? "web_search"
+                : item.type === "collabAgentToolCall" && item.tool === "spawnAgent"
+                  ? "spawn_agent"
+                  : null;
+      const emitToolStarted = (item: any, parentItemId?: string) => {
+        const title = toolTitle(item);
+        if (!title) return;
+        // the app-server names the file it changed and the query it
+        // searched; a row that says only "edit" makes the reader open
+        // the diff to learn which file
+        emit({
+          ...base(threadId, turnId),
+          type: "item.started",
+          itemType: "tool",
+          itemId: item.id,
+          title,
+          ...(parentItemId === undefined ? {} : { parentItemId, subagentId: parentItemId }),
+          ...toolFields(title, item, { cwd: turn.cwd }),
+          ...captureInput(codexItemInput(item)),
+        });
+      };
+      const emitToolCompleted = (item: any) => {
+        if (!toolTitle(item)) return;
+        emit({
+          ...base(threadId, turnId),
+          type: "item.completed",
+          itemType: "tool",
+          itemId: item.id,
+          ok: item.status !== "failed" && item.status !== "declined",
+          detail: describeResult(item.aggregatedOutput ?? item.output ?? item.result ?? item.error),
+          ...captureOutput(item.aggregatedOutput ?? item.output ?? item.result ?? item.error),
+        });
+      };
+      /** The main thread's spawn_agent call: which helper thread it started,
+       *  so that helper's steps nest under its row. */
+      const noteHelperSpawn = (item: any) => {
+        if (item?.type !== "collabAgentToolCall" || item.tool !== "spawnAgent" || !Array.isArray(item.receiverThreadIds)) return;
+        for (const receiver of item.receiverThreadIds) {
+          const helperThread = codexNonemptyString.safeParse(receiver);
+          if (helperThread.success && typeof item.id === "string") state.helperParents.set(helperThread.data, item.id);
+        }
       };
 
       const handleNotification = (msg: any) => {
         const p = msg.params ?? {};
+        // Codex runs its helpers (multi_agent) as threads of their own on
+        // this same app-server connection, and every v2 notification names
+        // its thread (required by the 0.159 schema).  Only this turn's
+        // thread may speak for it: a helper's text is not the bot's reply,
+        // its usage is not the bot's context, and its turn/completed would
+        // otherwise settle this turn the moment the helper finished.  A
+        // notification with no threadId (an older app-server) predates
+        // helpers and passes, as does anything before thread/start answers.
+        const notifiedThread = codexNonemptyString.safeParse(p.threadId);
+        if (notifiedThread.success && state.codexThreadId !== null && notifiedThread.data !== state.codexThreadId) {
+          // A helper's own steps still reach the transcript: in a full-auto
+          // bot its host commands are approved without a card, and a row is
+          // the only record that they ran.  Each nests under the spawn_agent
+          // row that started the helper (or, before that row names the
+          // helper's thread, under the thread itself, which the chat marks
+          // as a helper's step either way).
+          const item = p.item ?? {};
+          if ((msg.method === "item/started" || msg.method === "item/completed") && toolTitle(item)) {
+            if (msg.method === "item/started") {
+              emitToolStarted(item, state.helperParents.get(notifiedThread.data) ?? notifiedThread.data);
+            } else {
+              emitToolCompleted(item);
+            }
+            return;
+          }
+          state.foreignThreadNotifications++;
+          return;
+        }
         switch (msg.method) {
           // token-level chat text; the item/completed frame follows with the
           // whole message, so its delta is only a fallback when none streamed
@@ -427,29 +662,8 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           }
           case "item/started": {
             const item = p.item ?? {};
-            const title =
-              item.type === "commandExecution"
-                ? String(item.command ?? "shell")
-                : item.type === "fileChange"
-                  ? "edit"
-                  : item.type === "mcpToolCall"
-                    ? (item.tool ?? item.name ?? "mcp")
-                    : item.type === "webSearch"
-                      ? "web_search"
-                      : null;
-            if (title) {
-              // the app-server names the file it changed and the query it
-              // searched; a row that says only "edit" makes the reader open
-              // the diff to learn which file
-              emit({
-                ...base(threadId, turnId),
-                type: "item.started",
-                itemType: "tool",
-                itemId: item.id,
-                title,
-                ...toolFields(title, item, { cwd: turn.cwd }),
-              });
-            }
+            noteHelperSpawn(item);
+            emitToolStarted(item);
             break;
           }
           case "item/completed": {
@@ -463,15 +677,10 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
                 state.sawStreamDelta = false;
                 emit({ ...base(threadId, turnId), type: "item.completed", itemType: "assistant_text", text: item.text });
               }
-            } else if (["commandExecution", "fileChange", "mcpToolCall", "webSearch"].includes(item.type)) {
-              emit({
-                ...base(threadId, turnId),
-                type: "item.completed",
-                itemType: "tool",
-                itemId: item.id,
-                ok: item.status !== "failed" && item.status !== "declined",
-                detail: describeResult(item.aggregatedOutput ?? item.output ?? item.result ?? item.error),
-              });
+            } else if (toolTitle(item)) {
+              // a spawn_agent call names the helper's thread by the time it completes
+              noteHelperSpawn(item);
+              emitToolCompleted(item);
             } else if (item.type === "reasoning") {
               emit({ ...base(threadId, turnId), type: "item.updated", itemType: "reasoning", tokens: null });
             }
@@ -510,7 +719,14 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           }
           case "turn/completed": {
             const t = p.turn ?? {};
-            settle(t.status === "completed", t.status === "completed" ? null : (t.error?.message ?? t.status ?? "failed"));
+            const reason = t.error?.message ?? t.status ?? "failed";
+            const unavailable = classifyError({ text: String(reason) }).reason === "unknown_model";
+            const failureMessage = unavailable ? unknownModelMessage(state.resumed) : reason;
+            if (t.status !== "completed" && unavailable && state.codexThreadId) rejectThreadModel(state.codexThreadId);
+            if (t.status !== "completed" && unavailable) {
+              emit({ ...base(threadId, turnId), type: "runtime.error", message: failureMessage });
+            }
+            settle(t.status === "completed", t.status === "completed" ? null : failureMessage);
             break;
           }
           case "error":
@@ -601,13 +817,27 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         // otherwise starts a fresh one.  The cost is one lost codex-side
         // continuation per instance restart, for full-auto bots that also
         // hold this computer; the alternative is an unbrokered host turn.
-        const cursor = brokered && !(resumeCursor && brokeredThreads.has(resumeCursor)) ? null : resumeCursor;
+        //
+        // The same rule runs the other way for an UNATTENDED full-auto turn.
+        // A thread started brokered (a host turn, or a turn held for
+        // auto-review) keeps asking when resumed, and an unattended turn's
+        // ask waits on a card nobody is there to answer.  Such a turn starts
+        // fresh instead, so a webhook on a full-auto bot runs the way its
+        // instance is configured.
+        const unattendedFullAuto = turnFullAuto && turn.unattended === true;
+        const cursor =
+          (brokered && !(resumeCursor && brokeredThreads.has(resumeCursor))) ||
+          (unattendedFullAuto && resumeCursor !== null && brokeredThreads.has(resumeCursor)) ||
+          (resumeCursor !== null && modelRejectedThreads.has(resumeCursor))
+            ? null
+            : resumeCursor;
         let codexThreadId: string | null = null;
         let startedModel: string | null = null;
         if (cursor && !recoveredMissingSession) {
           try {
             const resumed = await request("thread/resume", { threadId: cursor });
             codexThreadId = resumed?.thread?.id ?? cursor;
+            state.resumed = true;
           } catch (error) {
             const failure = classifyResumeFailure({
               attempted: true,
@@ -634,6 +864,14 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
               failure,
             });
             rebuiltFromReplay = rebuild.replayed;
+            if (rebuild.replayed) {
+              // the replay is in the prompt now; let the harness say so
+              try {
+                turn.onReplayRecovered?.();
+              } catch (error) {
+                console.error("codex: onReplayRecovered threw", error);
+              }
+            }
             promptText = turn.system ? `${turn.system}\n\n${rebuild.text}` : rebuild.text;
           }
         }
@@ -655,6 +893,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           // full-auto and replaced rather than trusted.
           if (brokered && codexThreadId) brokeredThreads.add(codexThreadId);
         }
+        state.codexThreadId = codexThreadId;
         emit({
           ...base(threadId, turnId),
           type: "session.started",
@@ -692,11 +931,16 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           : "text" in failure
             ? failure.text
             : String(failure);
-        const message = resumeFailure && failureMessage !== e.message
-          ? `${e.message}  ${failureMessage}`
-          : failureMessage;
         const needsAuth = /(?:\b401\b|unauthorized|missing bearer|authentication required)/i.test(failureMessage);
         const verdict = classifyError(failure);
+        if (verdict.reason === "unknown_model" && !resumeFailure && state.codexThreadId) {
+          rejectThreadModel(state.codexThreadId);
+        }
+        const message = resumeFailure
+          ? failureMessage !== e.message ? `${e.message}  ${failureMessage}` : e.message
+          : verdict.reason === "unknown_model"
+            ? unknownModelMessage(state.resumed)
+            : failureMessage;
         // A rejected RPC proves turn/start did not accept the prompt. A
         // timeout, connection loss or error after acceptance cannot prove
         // that; never replay a possibly acted-on turn in those cases.
@@ -742,25 +986,58 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
     return { turnId };
   };
 
+  // Last definitive answers: one probe that runs out of time on a busy Mac
+  // must not flip a working, signed-in Codex to "not installed" or
+  // "sign-in required".
+  const lastKnownVersion = new LastKnownAnswer<string>();
+  const lastKnownAuth = new LastKnownAnswer<boolean>();
+  const engineLabel = input.displayName || "Codex";
   const snapshot = async (): Promise<ProviderSnapshot> => {
     const env = childEnv();
-    const version = await new Promise<string | null>((resolve) => {
-      execCli(config.cli, ["--version"], { timeout: 8000, env }, (err, stdout) =>
-        resolve(err ? null : stdout.trim()),
-      );
+    // Its place among overlapping probes: taken before the process starts,
+    // so a slow older probe cannot replace what a newer one remembered.
+    const versionOrder = lastKnownVersion.begin();
+    const startedAt = Date.now();
+    const probed = await new Promise<{ version: string | null; error: Error | null }>((resolve) => {
+      execCli(config.cli, ["--version"], { timeout: 20000, env }, (err, stdout) => {
+        resolve({ version: err ? null : stdout.trim() || null, error: err });
+      });
     });
-    if (!version) return { state: "unavailable", reason: `\`${config.cli}\` CLI not found` };
+    let version = probed.version;
+    if (version) {
+      lastKnownVersion.record(version, versionOrder);
+    } else {
+      const elapsed = Date.now() - startedAt;
+      logProbeFailure(instanceId, `${config.cli} --version`, probed.error, elapsed);
+      const failure = classifyVersionProbeFailure(probed.error, config.cli, engineLabel, elapsed, 20000);
+      const remembered = failure.kind === "transient" ? lastKnownVersion.get() : null;
+      if (remembered) {
+        // Only a probe that gave no answer may stand on the last good
+        // version.  A missing or crashing binary is a verdict.
+        version = remembered;
+      } else {
+        if (failure.kind !== "transient") lastKnownVersion.forget(versionOrder);
+        return failure.kind === "transient"
+          ? { state: "unavailable", transient: true, reason: failure.reason }
+          : { state: "unavailable", reason: failure.reason };
+      }
+    }
     const match = version.match(/(\d+)\.(\d+)\.(\d+)/);
     if (match && (parseInt(match[1]) === 0 && parseInt(match[2]) < 151)) {
       return { state: "unavailable", reason: `Codex CLI is out of date (needs 0.151.0+). Run \`npm install -g @openai/codex\`` };
     }
-    const authenticated = await new Promise<boolean>((resolve) => {
-      execCli(config.cli, ["login", "status"], { timeout: 8000, env }, (err, stdout, stderr) =>
-        resolve(!err && /^logged in\b/im.test(`${stdout}\n${stderr ?? ""}`)),
-      );
+    const authOrder = lastKnownAuth.begin();
+    const authStartedAt = Date.now();
+    const probedAuth = await new Promise<boolean | undefined>((resolve) => {
+      execCli(config.cli, ["login", "status"], { timeout: 20000, env }, (err, stdout, stderr) => {
+        const answer = codexLoginAnswer(`${stdout ?? ""}\n${stderr ?? ""}`);
+        if (answer === undefined) logProbeFailure(instanceId, `${config.cli} login status`, err, Date.now() - authStartedAt);
+        resolve(answer);
+      });
     });
+    if (probedAuth !== undefined) lastKnownAuth.record(probedAuth, authOrder);
     // childEnv drops OPENAI_API_KEY on purpose — turns run on the ChatGPT login
-    return { state: "available", version, authenticated, billing: "subscription" };
+    return { state: "available", version, authenticated: probedAuth ?? lastKnownAuth.get() ?? undefined, billing: "subscription" };
   };
 
   return {
@@ -785,6 +1062,22 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         qdrantMcp: true,
         images: true,
         effortLevels: ["low", "medium", "high", "xhigh", "max"],
+        // Jobs matrix (docs/plans/2026-10-01-background-jobs-and-subagents-decision.md):
+        // BotFleet's own job tools reach Codex over the MCP
+        // server it already mounts.  Truthful about containment: the job
+        // process is spawned by the HARNESS, not by Codex, so it is not
+        // inside the codex sandbox.  The approval card is what stands between
+        // a Codex bot and a job, and a full-auto Codex bot is under the
+        // owner's full-auto ruling (b) instead — which is exactly the trade
+        // the decision doc records for Codex.
+        backgroundJobs: "emulated",
+        // Typed: a helper's steps name the spawn_agent call that started
+        // them, and the chat draws that call as a helper card (jobs P3).
+        helpers: "typed",
+        // on-request approvals arrive as request.opened; a full-auto
+        // instance (approvalPolicy "never") asks nothing unless held
+        reviewHook: config.fullAuto ? "after" : "before",
+        asksWhenHeld: true,
       },
       sendTurn,
       interruptTurn: async (threadId) => active.get(threadId)?.stop(),

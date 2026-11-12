@@ -5,8 +5,18 @@
 // session/prompt, and streams session/update notifications for a scripted
 // turn. Failure modes mirror how real ACP agents misbehave:
 //
-//   FAKE_ACP_MODE   happy (default) | empty-reply | exit-early | fail-after-text | hang | hang-exit-gated | cancel-exits | cancel-exits-with-child | resume-fails | no-auth | auth-required | permission
+//   FAKE_ACP_MODE   happy (default) | empty-reply | exit-early | fail-after-text | hang | hang-exit-gated | cancel-exits | cancel-exits-with-child | exit-with-lingering-child | happy-with-lingering-child | resume-fails | no-auth | auth-required | permission | initial-terminal-tool-call | update-only-tool-call | refreshed-tool-title
 //                   | interleave (message → tool → message → tool → message)
+//                   | exit-with-lingering-child (the leader exits before the
+//                     prompt result while a SIGTERM-ignoring descendant stays
+//                     alive in its process group — the wedge stop() must reap)
+//                   | happy-with-lingering-child (a normal turn whose
+//                     SIGTERM-ignoring descendant outlives the leader when the
+//                     driver tears the group down after the result)
+//                   | late-input-tool-call (a tool_call announced with an empty
+//                     rawInput whose real arguments arrive on a later
+//                     tool_call_update; on the completion itself when
+//                     FAKE_ACP_LATE_INPUT_AT=completion)
 //                   | drip (stream one agent_message_chunk every
 //                     FAKE_ACP_DRIP_MS — default 20 — for the prompt idle
 //                     guard's "still alive" side: with FAKE_ACP_DRIP_COUNT
@@ -29,6 +39,20 @@
 //                     file exists — a deterministic busy window for the
 //                     steer-queue e2e, with the echo pinning exactly what a
 //                     drained turn was sent)
+//   FAKE_ACP_COMMANDS  comma-separated command names.  The agent announces
+//                     them in an `available_commands_update` right after
+//                     session/new and session/load, before any prompt, and
+//                     marks the one after session/load as replayed history
+//                     when FAKE_ACP_COMMANDS_REPLAY is set.
+//   FAKE_ACP_MULTI_SESSION=1
+//                     session/new returns distinct ids (fake-acp-session-1, -2,
+//                     ...) and echo-gated prompt notifications carry their
+//                     session's id, so a test can drive a history-summary side
+//                     session beside the turn's own.  The FIRST session is the
+//                     turn's; for any later one FAKE_ACP_SIDE_FAIL=new|prompt
+//                     answers that call with a JSON-RPC error,
+//                     FAKE_ACP_SIDE_REPLY fixes the reply text, and
+//                     FAKE_ACP_SIDE_DUMP appends each side prompt as JSONL.
 //   FAKE_ACP_DUMP   path to write {argv, env} as JSON, so a test can assert
 //                   argv shape (agent/stdio flags) and env hygiene
 //   FAKE_ACP_MODELS      comma-separated model ids. Enables the opencode-shaped
@@ -38,11 +62,39 @@
 //   FAKE_ACP_MODEL_STICKS  session/set_config_option succeeds but leaves the
 //                        model where it was, so the confirmation guard in
 //                        core.ts has something to catch
+//   FAKE_ACP_REASONING_EFFORTS  comma-separated effort values.  Advertises a
+//                        reasoning-effort config option (category thought_level)
+//                        whose first value is the starting one, and lets
+//                        session/set_config_option set it.
+//   FAKE_ACP_REASONING_CONFIG_ID  the id that effort option carries in
+//                        configOptions and in set_config_option.  Default
+//                        `reasoning_effort` (stock dsh); `thinkingEffort` is
+//                        what `mcode acp` uses.
+//   FAKE_ACP_REASONING_MODELS  comma-separated model option values (the same
+//                        strings as FAKE_ACP_MODELS).  When set, the effort
+//                        option is advertised, and a set is accepted, only
+//                        while the current model is in the list; any other set
+//                        answers -32602 "Thinking effort is not advertised for
+//                        the selected model: <v>", as mcode does for M3 and
+//                        M2.7.  A model switch then also resets the effort to
+//                        `default` when that is one of the efforts, as mcode
+//                        does.  Unset, the effort option is always on and a
+//                        model switch leaves it alone.
+//   FAKE_ACP_REASONING_STICKS  a set of the effort option succeeds but leaves
+//                        the effort where it was, like FAKE_ACP_MODEL_STICKS
+//   FAKE_ACP_REASONING_ERROR_CODE  a set of the effort option answers a JSON-RPC
+//                        error with this numeric code (for example -32603)
+//                        instead of applying it, so a test can tell a refused
+//                        value (-32602) from any other failure
 //   FAKE_ACP_CONFIG_REPLY_BARE  session/set_config_option applies the value but
 //                        answers with a bare `{}`, the shape stock dsh used:
 //                        no configOptions, so nothing to confirm against
 //   FAKE_ACP_USAGE_ROOT  put the prompt result's usage at the root instead of
 //                        under _meta (what opencode 1.18.18 actually does)
+//   FAKE_ACP_CACHE_READ  a cache-read token count, reported alongside
+//                        FAKE_ACP_USAGE_ROOT as `cachedInputTokens`
+//   FAKE_ACP_COST  a dollar figure, reported alongside FAKE_ACP_USAGE_ROOT
+//                        as `cost` — the field ACP core used to discard
 //   FAKE_ACP_INIT_DELAY_MS  answer initialize only after this many ms — a
 //                        slow cold boot, or (with a large value) one that
 //                        never finishes inside the driver's deadline
@@ -53,19 +105,62 @@
 //
 // Keep this file dependency-free — it runs as a bare `node` subprocess.
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { z } from "zod";
 
 const mode = process.env.FAKE_ACP_MODE ?? "happy";
-if (mode === "cancel-exits-with-child") {
+
+// FAKE_ACP_MULTI_SESSION bookkeeping: session/new hands out distinct ids and
+// the first one created is treated as the turn's own session.
+let sessionCounter = 0;
+let firstSessionId: string | null = null;
+
+/** The agent's catalog of slash commands, announced the way ACP agents do:
+ *  a session/update notification, before any prompt. */
+const announceCommands = (replayed: boolean): void => {
+  const names = (process.env.FAKE_ACP_COMMANDS ?? "").split(",").filter(Boolean);
+  if (names.length === 0) return;
+  const sessionId = "fake-acp-session";
+  const update = {
+    sessionUpdate: "available_commands_update",
+    availableCommands: names.map((name) => ({ name, description: `fake ${name}` })),
+  };
+  const params = replayed ? { sessionId, _meta: { isReplay: true }, update } : { sessionId, update };
+  out({ jsonrpc: "2.0", method: "session/update", params });
+};
+
+const LINGERING_CHILD_MODES = new Set(["cancel-exits-with-child", "exit-with-lingering-child", "happy-with-lingering-child"]);
+/** Spawn the SIGTERM-ignoring MCP-shaped descendant, once, in this CLI's
+ * process group, and call `ready` once it has installed its SIGTERM handler.
+ * Only the session/prompt path calls this, never module load: the driver
+ * also launches this file for its `--version` probe, and a descendant spawned
+ * there would outlive the probe's own tree kill and leak for the rest of the
+ * suite.  Modes whose leader goes on to finish or exit wait for `ready`: a
+ * turn that ends while the descendant is still booting would have it die on
+ * the driver's SIGTERM by default, and nothing would be left lingering to
+ * test. */
+let lingeringChildReady = false;
+let lingeringChildWaiters: Array<() => void> | null = null;
+const spawnLingeringChild = (ready: () => void) => {
+  if (lingeringChildWaiters) {
+    lingeringChildWaiters.push(ready);
+    return;
+  }
+  lingeringChildWaiters = [ready];
   const descendant = spawn(
     process.execPath,
-    ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"],
-    { stdio: "ignore" },
+    ["-e", "process.on('SIGTERM', () => {}); process.stdout.write('ready\\n'); setInterval(() => {}, 1000)"],
+    { stdio: ["ignore", "pipe", "ignore"] },
   );
   if (process.env.FAKE_ACP_DESCENDANT_PID && descendant.pid) {
     writeFileSync(process.env.FAKE_ACP_DESCENDANT_PID, String(descendant.pid));
   }
-}
+  descendant.stdout.once("data", () => {
+    descendant.stdout.destroy();
+    lingeringChildReady = true;
+    for (const waiter of lingeringChildWaiters ?? []) waiter();
+  });
+};
 // opencode-shaped surface: the session carries its own model catalog and the
 // model is chosen with session/set_config_option, because `opencode acp` takes
 // no -m. Off unless FAKE_ACP_MODELS is set, so every existing mode is byte-
@@ -76,6 +171,18 @@ const models: string[] = process.env.FAKE_ACP_MODELS_JSON
 let currentModel: string | null = models[0] ?? null;
 const reasoningEfforts = (process.env.FAKE_ACP_REASONING_EFFORTS ?? "").split(",").filter(Boolean);
 let currentReasoningEffort: string | null = reasoningEfforts[0] ?? null;
+const reasoningConfigId = process.env.FAKE_ACP_REASONING_CONFIG_ID || "reasoning_effort";
+// zcode-acp-shaped surface: the session carries a permission mode select
+// (configId "mode") beside the model. Off unless FAKE_ACP_SESSION_MODES is
+// set, so every existing mode stays byte-identical to before.
+const sessionModes = (process.env.FAKE_ACP_SESSION_MODES ?? "").split(",").filter(Boolean);
+let currentMode: string | null = sessionModes[0] ?? null;
+const reasoningModels = (process.env.FAKE_ACP_REASONING_MODELS ?? "").split(",").filter(Boolean);
+// Whether the effort option is on offer right now: always when no model list is
+// declared, otherwise only while the current model is one of the listed ones.
+const reasoningAdvertised = () =>
+  reasoningEfforts.length > 0 &&
+  (reasoningModels.length === 0 || (currentModel !== null && reasoningModels.includes(currentModel)));
 const configOptions = () => {
   const options = [
     ...(models.length
@@ -90,10 +197,22 @@ const configOptions = () => {
         },
       ]
       : []),
-    ...(reasoningEfforts.length
+    ...(sessionModes.length
       ? [
         {
-          id: "reasoning_effort",
+          id: "mode",
+          name: "Mode",
+          category: "mode",
+          type: "select",
+          currentValue: currentMode,
+          options: sessionModes.map((value) => ({ value, name: value })),
+        },
+      ]
+      : []),
+    ...(reasoningAdvertised()
+      ? [
+        {
+          id: reasoningConfigId,
           name: "Reasoning effort",
           category: "thought_level",
           type: "select",
@@ -110,14 +229,22 @@ const configOptions = () => {
 // (`auto`). Off unless FAKE_ACP_SESSION_MODELS is set, so every existing mode
 // stays byte-identical. Format: "id|Name,id|Name" — the name is optional.
 const acpModels = (process.env.FAKE_ACP_SESSION_MODELS ?? "")
-  .split(",")
+  .split(/,(?![^[]*\])/)
   .filter(Boolean)
   .map((entry) => {
     const [modelId, name] = entry.split("|");
     return name ? { modelId, name } : { modelId };
   });
-const sessionModels = () =>
-  acpModels.length ? { currentModelId: acpModels[0].modelId, availableModels: acpModels } : null;
+const sessionModels = (currentModelId?: string) =>
+  acpModels.length
+    ? {
+        currentModelId:
+          currentModelId && acpModels.some((m) => m.modelId === currentModelId)
+            ? currentModelId
+            : acpModels[0].modelId,
+        availableModels: acpModels,
+      }
+    : null;
 
 const argv = process.argv.slice(2);
 const dumpEnv = Object.fromEntries(
@@ -141,13 +268,18 @@ const dumpEnv = Object.fromEntries(
     "UNSLOTH_STUDIO_AUTH_TOKEN",
     "CURSOR_API_KEY",
     "CURSOR_AUTH_TOKEN",
+    "Z_AI_API_KEY",
+    "GLM_API_KEY",
+    "ZCODE_ACP_MODE",
     "KIMI_MODEL_NAME",
     "KIMI_MODEL_API_KEY",
     "KIMI_MODEL_BASE_URL",
     "KIMI_MODEL_PROVIDER_TYPE",
     "KIMI_MODEL_DISPLAY_NAME",
     "TEST_TURN_MODEL",
-  ].flatMap((key) => (process.env[key] === undefined ? [] : [[key, process.env[key]]] as const)),
+  ]
+    .concat(Object.keys(process.env).filter((key) => /^(AGENT_|SIMPLE_TOOLS_|ZULIP_|CLAUDE_CODE_SESSION_ID$)/.test(key)))
+    .flatMap((key) => (process.env[key] === undefined ? [] : [[key, process.env[key]]] as const)),
 );
 const dumpState: Record<string, unknown> = { argv, env: dumpEnv };
 if (process.env.FAKE_ACP_DUMP) {
@@ -209,6 +341,11 @@ if (argv[0] === "models" || argv.includes("--list-models")) {
 // twice, then answered once".  FAKE_ACP_PARTIAL_FAILS instead streams a chunk
 // and THEN dies, which the replay-safety guard must refuse to retry.
 let failAfterChunk = false;
+// FAKE_ACP_FAIL_AT_PROMPT defers the same 503 death to the session/prompt
+// request, so the child boots and answers every setup call first.  That is the
+// shape of a failure after the harness has budgeted and sent the prompt but
+// before any output: the one a relaunch retries with the prompt built twice.
+let failAtPrompt = false;
 if (process.env.FAKE_ACP_TRANSIENTS && process.env.FAKE_ACP_STATE) {
   let launched = 0;
   try {
@@ -219,6 +356,8 @@ if (process.env.FAKE_ACP_TRANSIENTS && process.env.FAKE_ACP_STATE) {
   if (launched < quota) {
     if (process.env.FAKE_ACP_PARTIAL_FAILS) {
       failAfterChunk = true;
+    } else if (process.env.FAKE_ACP_FAIL_AT_PROMPT) {
+      failAtPrompt = true;
     } else {
       process.stderr.write("fake-acp: HTTP 503 service temporarily unavailable\n");
       process.exit(5);
@@ -232,6 +371,16 @@ const rpcMethods: string[] = [];
 const recordMethod = (method: string) => {
   rpcMethods.push(method);
   if (process.env.FAKE_ACP_RPC_DUMP) writeFileSync(process.env.FAKE_ACP_RPC_DUMP, JSON.stringify(rpcMethods));
+  if (process.env.FAKE_ACP_RPC_APPEND_FILE) {
+    try {
+      appendFileSync(
+        process.env.FAKE_ACP_RPC_APPEND_FILE,
+        JSON.stringify({ pid: process.pid, method, cwd: process.cwd() }) + "\n",
+      );
+    } catch {
+      // test-only
+    }
+  }
 };
 if (mode === "hang-exit-gated") {
   process.on("SIGTERM", () => {
@@ -244,15 +393,77 @@ if (mode === "hang-exit-gated") {
   });
 }
 
-// session/set_mode + session/set_model calls seen this run
+// session/set_mode + session/set_model calls seen this run (and prior runs when
+// FAKE_ACP_DUMP is set — each turn spawns a fresh child, so tests that assert
+// multi-turn wiring read accumulated calls from the dump sidecar).
+const configCallFile = z.array(z.object({ method: z.string(), params: z.unknown() }).strict());
 const configCalls: Array<{ method: string; params: unknown }> = [];
+if (process.env.FAKE_ACP_DUMP) {
+  const priorConfig = `${process.env.FAKE_ACP_DUMP}.config.json`;
+  if (existsSync(priorConfig)) {
+    try {
+      const parsed = configCallFile.safeParse(JSON.parse(readFileSync(priorConfig, "utf8")));
+      if (parsed.success) configCalls.push(...parsed.data);
+    } catch {
+      // test-only
+    }
+  }
+}
+
+// A resumed session keeps the model its last accepted set_model pinned, so
+// session/load reports that as current; session/new starts at the first
+// advertised model instead.
+const lastAcceptedModelId = (): string | undefined => {
+  for (let i = configCalls.length - 1; i >= 0; i--) {
+    const call = configCalls[i]!;
+    if (call.method !== "session/set_model") continue;
+    const parsed = z.object({ modelId: z.string() }).safeParse(call.params);
+    if (parsed.success) return parsed.data.modelId;
+  }
+  return undefined;
+};
 
 // pending server→client permission request id → resolver
 let pendingPermissionId: number | null = null;
 let onPermissionAnswered: (() => void) | null = null;
 
-// ask-peer mode: the "agents" MCP server entry from session/new's mcpServers
-type McpEntry = { command: string; args?: string[]; env?: Array<{ name: string; value: string }> };
+// Inbound payloads are JSON:  every string, array and record value carries
+// a cap, so one oversized message cannot pin unbounded memory or CPU.
+export const boundedContentValue: z.ZodType<unknown> = z.lazy(() =>
+  z.union([
+    z.string().max(10_000_000),
+    z.number(),
+    z.boolean(),
+    z.null(),
+    z.array(boundedContentValue).max(10_000),
+    // record branch caps key COUNT as well as key length, mirroring
+    // ACP_JSON_MAX_KEYS in the driver:  many bounded values must not
+    // aggregate into an unbounded tree.
+    z.record(z.string().max(256), boundedContentValue).refine((record) => Object.keys(record).length <= 256, { message: "too many keys" }),
+  ]),
+);
+export type BoundedContentValue = z.infer<typeof boundedContentValue>;
+
+// Top-level params view:  bounded keys and values AND a bounded entry
+// count, so one message cannot declare arbitrarily many bounded fields.
+export const paramsRecordSchema = z
+  .record(z.string().max(256), boundedContentValue)
+  .refine((record) => Object.keys(record).length <= 256, { message: "too many keys" });
+export type ParamsRecord = z.infer<typeof paramsRecordSchema>;
+
+// ask-peer mode: the "agents" MCP server entry from session/new's mcpServers.
+// The schema bounds the array and every string inside each entry, and the
+// entry type is derived from it — no any-widening at the boundary.
+const mcpEntrySchema = z.object({
+  name: z.string().max(256),
+  command: z.string().max(4_096),
+  args: z.array(z.string().max(4_096)).max(256).optional(),
+  env: z.array(z.object({ name: z.string().max(256), value: z.string().max(65_536) }).strict()).max(256).optional(),
+  // Lenient on everything else:  MCP server entries are vendor-owned
+  // (ACP clients add fields as the protocol grows), so unknown keys are
+  // bounded JSON and ignored, never rejected.
+}).catchall(boundedContentValue);
+type McpEntry = z.infer<typeof mcpEntrySchema>;
 let agentsMcp: McpEntry | null = null;
 
 /** Minimal one-shot MCP stdio client: initialize, call each tool in
@@ -322,6 +533,43 @@ function playInterleaveTurn() {
   out({ jsonrpc: "2.0", method: "session/update", params: { update: { sessionUpdate: "agent_message_chunk", content: { text: "after" } } } });
 }
 
+/** The JSON-RPC envelope every inbound message is parsed against before
+ *  any field of it is read:  a bounded id, a bounded method name, and the
+ *  params, result or error left for each method's own bounded schema.  The
+ *  envelope is closed:  every message here comes from BotFleet's own ACP
+ *  driver, so an unknown top-level key is contract drift and the message is
+ *  dropped unanswered rather than accepted.  A reply echoes the id, and an
+ *  unvalidated id is never echoed. */
+export const jsonRpcEnvelopeSchema = z.object({
+  jsonrpc: z.literal("2.0").optional(),
+  id: z.union([z.string().max(256), z.number().int()]).optional(),
+  method: z.string().max(128).optional(),
+  params: z.unknown().optional(),
+  result: z.unknown().optional(),
+  error: z.unknown().optional(),
+}).strict();
+export type JsonRpcEnvelope = z.infer<typeof jsonRpcEnvelopeSchema>;
+
+/** A session/prompt payload's content block.  Bounded on the text, lenient
+ *  on everything else:  content blocks are vendor-owned (ACP agents add
+ *  fields as the protocol grows), so the schema passes unknown fields
+ *  through instead of rejecting a newer agent. */
+// Content-block fields a newer agent adds are bounded JSON, not free-form:
+// every string, array and record value carries a cap.
+export const promptContentSchema = z
+  .object({ type: z.string().max(64).optional(), text: z.string().max(10_000_000) })
+  .catchall(boundedContentValue);
+export type PromptContent = z.infer<typeof promptContentSchema>;
+
+/** A session/prompt call's params, bounded and strict at the method level:
+ *  the one schema the handler parses, and the source of truth for the
+ *  derived type below. */
+export const promptParamsSchema = z.object({
+  sessionId: z.string().min(1).max(256),
+  prompt: z.array(promptContentSchema).max(1_000),
+}).strict();
+export type PromptParams = z.infer<typeof promptParamsSchema>;
+
 let buf = "";
 process.stdin.on("data", (c) => {
   buf += c;
@@ -330,7 +578,7 @@ process.stdin.on("data", (c) => {
     const line = buf.slice(0, nl);
     buf = buf.slice(nl + 1);
     if (!line.trim()) continue;
-    let msg: any;
+    let msg: unknown;
     try {
       msg = JSON.parse(line);
     } catch {
@@ -340,7 +588,24 @@ process.stdin.on("data", (c) => {
   }
 });
 
-function handle(msg: any) {
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- parser for the untrusted JSON-RPC line, validated against the envelope schema before any field is read
+function handle(rawMsg: unknown, resumed = false) {
+  // The whole envelope is validated before a field is read:  every reply
+  // below echoes the PARSED id, never the raw one.
+  const parsedEnvelope = jsonRpcEnvelopeSchema.safeParse(rawMsg);
+  if (!parsedEnvelope.success) return;
+  const msg = parsedEnvelope.data;
+  // params is method-shaped and vendor-owned:  each case reads it through
+  // this decoded record view and validates the fields it needs
+  // (session/prompt parses its own strict schema below).  Absent params
+  // decode as {};  present-but-invalid params are rejected at the
+  // boundary with -32602 and never reach dispatch.
+  const parsedParams = paramsRecordSchema.safeParse(msg.params === undefined ? {} : msg.params);
+  if (!parsedParams.success) {
+    if (msg.id !== undefined) out({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: "Invalid params" } });
+    return;
+  }
+  const params: ParamsRecord = parsedParams.data;
   // client's response to our permission request
   if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined) && msg.id === pendingPermissionId) {
     pendingPermissionId = null;
@@ -348,7 +613,7 @@ function handle(msg: any) {
     return;
   }
   if (!msg.method) return;
-  recordMethod(msg.method);
+  if (!resumed) recordMethod(msg.method);
 
   switch (msg.method) {
     case "initialize": {
@@ -356,7 +621,7 @@ function handle(msg: any) {
         process.stderr.write("fake-acp: simulated crash before result\n");
         process.exit(3);
       }
-      const authMethods = mode === "no-auth" ? [] : [{ id: "cached_token" }];
+      const authMethods = mode === "no-auth" ? [] : [{ id: process.env.FAKE_ACP_AUTH_METHOD ?? "cached_token" }];
       const reply = () =>
         result(msg.id, { protocolVersion: 1, authMethods, _meta: { modelState: { currentModelId: "fake-acp-model" } } });
       const initDelayMs = Number(process.env.FAKE_ACP_INIT_DELAY_MS ?? "0");
@@ -376,22 +641,35 @@ function handle(msg: any) {
         });
         break;
       }
-      const servers: McpEntry[] = Array.isArray(msg.params?.mcpServers) ? msg.params.mcpServers : [];
+      const parsedMcpServers = z.array(mcpEntrySchema).max(100).safeParse(params.mcpServers);
+      if (params.mcpServers !== undefined && !parsedMcpServers.success) {
+        out({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: "Invalid params" } });
+        break;
+      }
+      const servers: McpEntry[] = parsedMcpServers.success ? parsedMcpServers.data : [];
       if (process.env.FAKE_ACP_DUMP) {
         dumpState.mcpServers = servers;
         writeFileSync(process.env.FAKE_ACP_DUMP, JSON.stringify(dumpState, null, 2));
       }
-      agentsMcp = servers.find((s: any) => s?.name === "agents") ?? null;
+      agentsMcp = servers.find((s) => s.name === "agents") ?? null;
       if (process.env.FAKE_ACP_DUMP) {
         writeFileSync(`${process.env.FAKE_ACP_DUMP}.mcp.json`, JSON.stringify(servers, null, 2));
+      }
+      sessionCounter += 1;
+      const newSessionId = process.env.FAKE_ACP_MULTI_SESSION === "1" ? `fake-acp-session-${sessionCounter}` : "fake-acp-session";
+      if (firstSessionId === null) firstSessionId = newSessionId;
+      if (newSessionId !== firstSessionId && process.env.FAKE_ACP_SIDE_FAIL === "new") {
+        out({ jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: "side session/new failed" } });
+        break;
       }
       const opts = configOptions();
       const mdls = sessionModels();
       result(msg.id, {
-        sessionId: "fake-acp-session",
+        sessionId: newSessionId,
         ...(opts ? { configOptions: opts } : {}),
         ...(mdls ? { models: mdls } : {}),
       });
+      announceCommands(false);
       break;
     }
     case "session/load":
@@ -400,32 +678,52 @@ function handle(msg: any) {
         out({ jsonrpc: "2.0", id: msg.id, error: { code: -32001, message: "saved session is gone" } });
         break;
       }
+      if (mode === "resume-poisoned") {
+        out({
+          jsonrpc: "2.0",
+          id: msg.id,
+          error: { code: -32001, message: "The saved Muse session has an unfinished turn or pending input" },
+        });
+        break;
+      }
       if (mode === "resume-auth") {
         out({ jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: "authentication required" } });
         break;
       }
       const opts = configOptions();
-      const mdls = sessionModels();
+      const mdls = sessionModels(lastAcceptedModelId());
       result(msg.id, { ...(opts ? { configOptions: opts } : {}), ...(mdls ? { models: mdls } : {}) });
+      announceCommands(process.env.FAKE_ACP_COMMANDS_REPLAY === "1");
       break;
     }
     // per-session settings (droid sets model/autonomy here, not via argv).
     // Recorded next to FAKE_ACP_DUMP so a test can assert what was applied.
-    // NOTE: last writer wins — each turn spawns a fresh child, so a two-turn
-    // test would only ever see the final turn's calls.
+    // Prior calls are loaded at process start so multi-turn tests accumulate.
     case "session/set_mode":
     case "session/set_model": {
       if (mode === "no-session-config") {
         // an older agent that predates these methods
         return out({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "method not found" } });
       }
-      if (mode === "set-model-invalid-params" && msg.method === "session/set_model") {
+      if (
+        msg.method === "session/set_model" &&
+        (mode === "set-model-invalid-params" ||
+          (mode === "set-model-invalid-after-first" && configCalls.some((call) => call.method === "session/set_model")))
+      ) {
         // an agent whose ACP model namespace does not contain the id it was
         // sent — Cursor's answer when handed an argv slug like `auto`.
-        return out({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: "Invalid params" } });
+        // The reason rides in `data`, as grok 1.0.46 sends it for a model its
+        // account is not served ("unknown model id").
+        return out({
+          jsonrpc: "2.0",
+          id: msg.id,
+          error: { code: -32602, message: "Invalid params", data: "unknown model id" },
+        });
       }
       const settingId = msg.method === "session/set_mode" ? "modeId" : "modelId";
-      if (typeof msg.params?.sessionId !== "string" || typeof msg.params?.[settingId] !== "string") {
+      const parsedSettingSession = z.string().max(256).safeParse(params.sessionId);
+      const parsedSettingValue = z.string().max(256).safeParse(params[settingId]);
+      if (!parsedSettingSession.success || !parsedSettingValue.success) {
         out({
           jsonrpc: "2.0",
           id: msg.id,
@@ -441,12 +739,41 @@ function handle(msg: any) {
       break;
     }
     case "session/set_config_option": {
-      const { configId, value } = msg.params ?? {};
+      const parsedConfigId = z.string().max(256).safeParse(params.configId);
+      const configId = parsedConfigId.success ? parsedConfigId.data : undefined;
+      const value = params.value;
+      const parsedValue = z.string().max(256).safeParse(value);
+      if (configId === reasoningConfigId && process.env.FAKE_ACP_REASONING_ERROR_CODE) {
+        out({
+          jsonrpc: "2.0",
+          id: msg.id,
+          error: { code: Number(process.env.FAKE_ACP_REASONING_ERROR_CODE), message: `effort set failed: ${value}` },
+        });
+        break;
+      }
+      if (configId === "mode" && process.env.FAKE_ACP_MODE_ERROR_CODE) {
+        out({
+          jsonrpc: "2.0",
+          id: msg.id,
+          error: { code: Number(process.env.FAKE_ACP_MODE_ERROR_CODE), message: `mode set failed: ${value}` },
+        });
+        break;
+      }
+      if (configId === reasoningConfigId && reasoningModels.length > 0 && !reasoningAdvertised()) {
+        out({
+          jsonrpc: "2.0",
+          id: msg.id,
+          error: { code: -32602, message: `Thinking effort is not advertised for the selected model: ${value}` },
+        });
+        break;
+      }
       const accepted = configId === "model"
-        ? models.includes(value)
-        : configId === "reasoning_effort"
-          ? reasoningEfforts.includes(value)
-          : false;
+        ? parsedValue.success && models.includes(parsedValue.data)
+        : configId === reasoningConfigId
+          ? parsedValue.success && reasoningEfforts.includes(parsedValue.data)
+          : configId === "mode"
+            ? parsedValue.success && sessionModes.includes(parsedValue.data)
+            : false;
       if (!accepted) {
         out({
           jsonrpc: "2.0",
@@ -458,9 +785,18 @@ function handle(msg: any) {
       // FAKE_ACP_MODEL_STICKS: answer OK and keep the old model anyway. Nothing
       // in the protocol forbids it, and it is the shape core.ts's confirmation
       // guard exists for — an error is loud, this is silent.
-      if (configId === "model" && !process.env.FAKE_ACP_MODEL_STICKS) currentModel = value;
-      if (configId === "reasoning_effort" && !process.env.FAKE_ACP_REASONING_STICKS) {
-        currentReasoningEffort = value;
+      if (configId === "model" && !process.env.FAKE_ACP_MODEL_STICKS && parsedValue.success) {
+        currentModel = parsedValue.data;
+        // mcode resets the session's effort to `default` on every model switch.
+        if (reasoningModels.length > 0 && reasoningEfforts.includes("default")) {
+          currentReasoningEffort = "default";
+        }
+      }
+      if (configId === reasoningConfigId && !process.env.FAKE_ACP_REASONING_STICKS && parsedValue.success) {
+        currentReasoningEffort = parsedValue.data;
+      }
+      if (configId === "mode" && !process.env.FAKE_ACP_MODE_STICKS && parsedValue.success) {
+        currentMode = parsedValue.data;
       }
       configCalls.push({ method: msg.method, params: msg.params });
       if (process.env.FAKE_ACP_DUMP) {
@@ -471,6 +807,54 @@ function handle(msg: any) {
       break;
     }
     case "session/prompt": {
+      // The whole inbound payload is parsed against one bounded method
+      // schema: a malformed or oversized session/prompt is rejected
+      // with JSON-RPC -32602 before any field reaches downstream code, and
+      // the handler reads the session id and prompt text only from the
+      // validated result — never from the raw message.
+      const parsedPromptParams = promptParamsSchema.safeParse(msg.params);
+      if (!parsedPromptParams.success) {
+        out({
+          jsonrpc: "2.0",
+          id: msg.id,
+          error: { code: -32602, message: "Invalid params" },
+        });
+        break;
+      }
+      const promptSessionId = parsedPromptParams.data.sessionId;
+      const promptText = parsedPromptParams.data.prompt[0]?.text ?? "";
+      const isSidePrompt =
+        process.env.FAKE_ACP_MULTI_SESSION === "1" &&
+        promptSessionId !== null &&
+        firstSessionId !== null &&
+        promptSessionId !== firstSessionId;
+      if (isSidePrompt && process.env.FAKE_ACP_SIDE_FAIL === "prompt") {
+        out({ jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: "side session/prompt failed" } });
+        break;
+      }
+      if (isSidePrompt && process.env.FAKE_ACP_SIDE_DUMP) {
+        appendFileSync(process.env.FAKE_ACP_SIDE_DUMP, JSON.stringify({ sessionId: promptSessionId, text: promptText }) + "\n");
+      }
+      if (failAtPrompt) {
+        process.stderr.write("fake-acp: HTTP 503 service temporarily unavailable\n");
+        process.exit(5);
+      }
+      if (LINGERING_CHILD_MODES.has(mode) && !lingeringChildReady) {
+        if (mode === "cancel-exits-with-child") {
+          // The prompt hangs from here on, so there is nothing to hold back.
+          spawnLingeringChild(() => {});
+        } else {
+          spawnLingeringChild(() => handle(msg, true));
+          return;
+        }
+      }
+      if (mode === "exit-with-lingering-child") {
+        // The leader dies before the prompt result while its SIGTERM-ignoring
+        // descendant stays alive in the process group it still leads — the
+        // shape core.ts's stop() must still reap once the leader is already
+        // gone (killCliTree early-returns on an exited leader).
+        process.exit(3);
+      }
       if (
         mode === "hang" ||
         mode === "hang-exit-gated" ||
@@ -512,10 +896,225 @@ function handle(msg: any) {
           process.env.FAKE_ACP_USAGE_UPDATE
             ? { stopReason: "end_turn" }
             : process.env.FAKE_ACP_USAGE_ROOT
-              ? { stopReason: "end_turn", usage: { inputTokens: 10, outputTokens: 5 }, _meta: {} }
+              ? {
+                  stopReason: "end_turn",
+                  usage: {
+                    inputTokens: 10,
+                    outputTokens: 5,
+                    // FAKE_ACP_CACHE_READ / _COST let a test script the fields
+                    // an agent may or may not report.  Absent by default, which
+                    // is the shape most ACP agents actually send.
+                    ...(process.env.FAKE_ACP_CACHE_READ
+                      ? { cachedInputTokens: Number(process.env.FAKE_ACP_CACHE_READ) }
+                      : {}),
+                    ...(process.env.FAKE_ACP_COST ? { cost: Number(process.env.FAKE_ACP_COST) } : {}),
+                  },
+                  _meta: {},
+                }
               : { stopReason: "end_turn", _meta: { inputTokens: 10, outputTokens: 5 } },
         );
       };
+      if (mode === "quiet-tool-call") {
+        // A tool call that starts and then runs SILENTLY — the `pnpm build`
+        // shape from the audit: one tool_call notification, no traffic while
+        // it runs past the idle window, then a completion and the turn end.
+        // The idle guard must not trip while the call is open.
+        const quietMs = Number(process.env.FAKE_ACP_QUIET_MS) || 400;
+        const callId = "quiet-tool-1";
+        // FAKE_ACP_QUIET_TITLE names the call something else (a connected-app
+        // or peer-message tool), which then carries a non-command input.
+        const quietTitle = process.env.FAKE_ACP_QUIET_TITLE || "pnpm build";
+        out({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            update: {
+              sessionUpdate: "tool_call",
+              toolCallId: callId,
+              title: quietTitle,
+              kind: process.env.FAKE_ACP_QUIET_TITLE ? "other" : "execute",
+              rawInput: process.env.FAKE_ACP_QUIET_TITLE ? { bot_id: "peer", message: "hi" } : { command: "pnpm build" },
+            },
+          },
+        });
+        setTimeout(() => {
+          out({
+            jsonrpc: "2.0",
+            method: "session/update",
+            params: { update: { sessionUpdate: "tool_call_update", toolCallId: callId, status: "completed", content: [{ type: "content", content: { type: "text", text: "built" } }] } },
+          });
+          complete();
+        }, quietMs);
+        return;
+      }
+      if (mode === "initial-terminal-tool-call") {
+        // Muse's public adapter can put terminal state/output on tool_call and repeat it in a terminal update.
+        const status = process.env.FAKE_ACP_TERMINAL_STATUS === "failed" ? "failed" : "completed";
+        const output = [{ type: "content", content: { type: "text", text: status === "failed" ? "hook rejected" : "hook ran" } }];
+        out({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            update: {
+              sessionUpdate: "tool_call",
+              toolCallId: "initial-terminal-1",
+              title: status === "failed" ? "hookRun: failed" : "hookRun: completed",
+              kind: "other",
+              status,
+              rawInput: { hook: "Run" },
+              content: output,
+            },
+          },
+        });
+        // Follow it with the adapter's redundant terminal update for the same toolCallId.
+        out({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            update: {
+              sessionUpdate: "tool_call_update",
+              toolCallId: "initial-terminal-1",
+              title: status === "failed" ? "hookRun: failed" : "hookRun: completed",
+              status,
+              content: output,
+            },
+          },
+        });
+        complete();
+        return;
+      }
+      if (mode === "update-only-tool-call") {
+        // Some ACP adapters only report the tool's terminal update.
+        out({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            update: {
+              sessionUpdate: "tool_call_update",
+              toolCallId: "update-only-1",
+              title: "hookRun: completed",
+              status: "completed",
+              content: [{ type: "content", content: { type: "text", text: "hook ran" } }],
+            },
+          },
+        });
+        complete();
+        return;
+      }
+      if (mode === "lifecycle-completed-with-errors") {
+        const callId = "lifecycle-completed-with-errors-1";
+        const output = [{ type: "content", content: { type: "text", text: "Hook run completed with errors" } }];
+        out({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            update: {
+              sessionUpdate: "tool_call",
+              toolCallId: callId,
+              title: "hookRun: inProgress",
+              kind: "other",
+              rawInput: { hook: "Run" },
+            },
+          },
+        });
+        out({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            update: {
+              sessionUpdate: "tool_call_update",
+              toolCallId: callId,
+              status: "completed",
+              title: "hookRun: completed",
+              content: output,
+            },
+          },
+        });
+        complete();
+        return;
+      }
+      if (mode === "lifecycle-failed-done") {
+        const callId = "lifecycle-failed-done-1";
+        const output = [{ type: "content", content: { type: "text", text: "Reminder child session main run completed." } }];
+        out({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            update: {
+              sessionUpdate: "tool_call",
+              toolCallId: callId,
+              title: "reminderChild: inProgress",
+              kind: "other",
+              rawInput: { child: "reminder" },
+            },
+          },
+        });
+        out({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            update: {
+              sessionUpdate: "tool_call_update",
+              toolCallId: callId,
+              status: "failed",
+              title: "reminderChild: failed",
+              content: output,
+            },
+          },
+        });
+        complete();
+        return;
+      }
+      if (mode === "refreshed-tool-title") {
+        const callId = "refreshed-title-1";
+        out({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: { update: { sessionUpdate: "tool_call", toolCallId: callId, title: "hookRun: inProgress", kind: "other", rawInput: { hook: "Run" } } },
+        });
+        out({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: { update: { sessionUpdate: "tool_call_update", toolCallId: callId, status: "completed", title: "hookRun: completed", content: [{ type: "content", content: { type: "text", text: "hook ran" } }] } },
+        });
+        complete();
+        return;
+      }
+      if (mode === "late-input-tool-call") {
+        // A streaming agent: the call is announced with an EMPTY rawInput and
+        // the real arguments arrive on a later tool_call_update — mid-run by
+        // default, or on the completion itself when FAKE_ACP_LATE_INPUT_AT is
+        // "completion".
+        const callId = "late-input-1";
+        const onCompletion = process.env.FAKE_ACP_LATE_INPUT_AT === "completion";
+        out({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: { update: { sessionUpdate: "tool_call", toolCallId: callId, title: "ls", kind: "execute", rawInput: {} } },
+        });
+        if (!onCompletion) {
+          out({
+            jsonrpc: "2.0",
+            method: "session/update",
+            params: { update: { sessionUpdate: "tool_call_update", toolCallId: callId, status: "in_progress", rawInput: { command: "ls -la" } } },
+          });
+        }
+        out({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            update: {
+              sessionUpdate: "tool_call_update",
+              toolCallId: callId,
+              status: "completed",
+              ...(onCompletion ? { rawInput: { command: "ls -la" } } : {}),
+              content: [{ type: "content", content: { type: "text", text: "total 0" } }],
+            },
+          },
+        });
+        complete();
+        return;
+      }
       if (mode === "drip") {
         // Periodic output for the prompt idle guard's "still alive" side:
         // each chunk is inbound traffic that must renew core.ts's idle
@@ -545,7 +1144,7 @@ function handle(msg: any) {
         void driveMcp(agentsMcp, [
           { name: "list_bots", args: () => ({}) },
           {
-            name: "ask_bot",
+            name: "coordinate_bots",
             args: (list) => ({ bot_id: /id: ([\w-]+)/.exec(list)?.[1] ?? "", message: "ping from fake" }),
           },
         ])
@@ -570,9 +1169,9 @@ function handle(msg: any) {
             }),
           },
           {
-            name: "delegate_bot",
+            name: "coordinate_bots",
             args: (created) => ({
-              bot_id: /id: ([\w-]+)/.exec(created)?.[1] ?? "",
+              bot_ids: [/id: ([\w-]+)/.exec(created)?.[1] ?? ""],
               message: "Review the new onboarding flow.",
               reason: "design review",
             }),
@@ -593,9 +1192,14 @@ function handle(msg: any) {
         // echoing the WHOLE prompt (system + turn text) lets a test assert
         // both what a drained turn was sent and what it was NOT sent (e.g.
         // the webhook untrusted-data paragraph a steered turn must not get)
-        const promptText = String(msg.params?.prompt?.[0]?.text ?? "");
+        const replyText = isSidePrompt ? (process.env.FAKE_ACP_SIDE_REPLY ?? `side echo: ${promptText}`) : `echo: ${promptText}`;
         const finish = () => {
-          out({ jsonrpc: "2.0", method: "session/update", params: { update: { sessionUpdate: "agent_message_chunk", content: { text: `echo: ${promptText}` } } } });
+          const update = { sessionUpdate: "agent_message_chunk", content: { text: replyText } };
+          const params =
+            process.env.FAKE_ACP_MULTI_SESSION === "1" && promptSessionId !== null
+              ? { sessionId: promptSessionId, update }
+              : { update };
+          out({ jsonrpc: "2.0", method: "session/update", params });
           complete();
         };
         const gate = process.env.FAKE_ACP_GATE_FILE;
@@ -618,9 +1222,9 @@ function handle(msg: any) {
         void driveMcp(agentsMcp, [
           { name: "list_bots", args: () => ({}) },
           {
-            name: "delegate_bot",
+            name: "coordinate_bots",
             args: (list) => ({
-              bot_id: /id: ([\w-]+)/.exec(list)?.[1] ?? "",
+              bot_ids: [/id: ([\w-]+)/.exec(list)?.[1] ?? ""],
               message: "delegated task",
               reason: "followup",
             }),
@@ -646,8 +1250,20 @@ function handle(msg: any) {
       }
       if (mode === "interleave") playInterleaveTurn();
       else if (mode !== "empty-reply") playTurn();
-      if (mode === "permission") {
-        // ask the client to approve a tool, then complete once answered
+      if (mode === "permission" || mode === "remote-computer-permission" || mode === "remote-execute-permission") {
+        // ask the client to approve a tool, then complete once answered.
+        // FAKE_ACP_PERMISSION_COMMAND changes the command asked about, and
+        // FAKE_ACP_PERMISSION_CALL_ID first announces the call as a step and
+        // then asks about that same call by id, the way a real agent does.
+        const askedCommand = process.env.FAKE_ACP_PERMISSION_COMMAND || "echo hi";
+        const askedCallId = process.env.FAKE_ACP_PERMISSION_CALL_ID || undefined;
+        if (askedCallId) {
+          out({
+            jsonrpc: "2.0",
+            method: "session/update",
+            params: { update: { sessionUpdate: "tool_call", toolCallId: askedCallId, title: askedCommand, kind: "execute", status: "pending", rawInput: { command: askedCommand } } },
+          });
+        }
         pendingPermissionId = 9001;
         onPermissionAnswered = complete;
         out({
@@ -655,7 +1271,9 @@ function handle(msg: any) {
           id: pendingPermissionId,
           method: "session/request_permission",
           params: {
-            toolCall: { kind: "execute", rawInput: { command: "echo hi" }, title: "echo hi" },
+            toolCall: { toolCallId: askedCallId, kind: mode === "remote-computer-permission" ? "mcp" : "execute", rawInput: mode === "remote-computer-permission" || mode === "remote-execute-permission"
+              ? { serverName: "computer_shared_vm", toolName: "bash", command: "bash -c echo hi" }
+              : { command: askedCommand }, title: askedCommand },
             options: [
               { optionId: "allow-once", kind: "allow_once" },
               { optionId: "reject", kind: "reject_once" },

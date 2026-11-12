@@ -9,11 +9,15 @@ import {
   withoutManagedCompanionTunnelAccess,
 } from "./managed-companion-tunnel.mjs";
 
-/** Packaged builds ship WITHOUT a hosted control plane. The former default,
- * https://accounts.botfleet.com, is a domain this project does not own; every
- * install probed it at boot and the sign-in card sent users' email addresses
- * there. Hosted "Secure access" stays hidden until a control plane on a
- * fleet-owned domain is configured through OMB_CONTROL_PLANE_URL. */
+/** No build has an implicit hosted control plane. Packaged and development
+ * builds alike start without one; "Secure access" stays hidden until a
+ * fleet-owned control plane is configured through OMB_CONTROL_PLANE_URL
+ * on a `*.botfleet.app` origin (or a loopback Worker under development).
+ *
+ * The earlier default pointed at `accounts.botfleet.com`, a domain this
+ * project does not own (parked since 2016, on giantpanda.com nameservers).
+ * That default was removed in board row `43068cd4` along with the
+ * confused-agent `cloudflare/control-plane/` Worker that targeted it. */
 export const DEFAULT_COMPANION_CONTROL_PLANE_URL = "";
 
 /** The only public domain a hosted control plane may live on. Loopback HTTP

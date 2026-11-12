@@ -1,31 +1,50 @@
-import { writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { describe, expect, it } from "vitest";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { describe, expect, it, vi } from "vitest";
 
 import type { EffortLevel, ModelSelection } from "./contracts.ts";
 import {
   AUTO_FALLBACK_PRIORITY,
   DEFAULT_QUOTA_COOLDOWN_TTL_MS,
   bootRecoveryTurnOpts,
+  continuedTurnToolPolicy,
+  isModelRejectionText,
   isQuotaOrCapText,
   isShortProviderErrorText,
+  isTransientCapacityChip,
   lastTurnStartIndex,
   parseQuotaResetTime,
   providerErrorCodeFromStopReason,
   QuotaCooldownRegistry,
   quotaCooldowns,
   quotaOrCapFromErrorCode,
+  isTransientCapacityText,
   selectTurnFallback,
+  selectionForFallbackPick,
   shouldReplayPersistedStarter,
   sliceIsShortProviderError,
   turnHitQuotaOrCap,
+  turnModelRejectionEvidence,
   turnQuotaOrCapEvidence,
+  turnTransientCapacityEvidence,
+  transientCapacityRetryDelayMs,
   turnProducedAssistantOutput,
+  TransientRouteHealthRegistry,
+  transientRouteHealth,
   inheritedUnattended,
+  dshVisionSelection,
   type FallbackScanMessage,
   unattendedModelDowngrade,
 } from "./model-fallback.ts";
+import { STATIC_CLAUDE_MODELS } from "./claude-models.ts";
+import { withoutModelsTooNewForCli } from "./model-lineage.ts";
 import { eligibleAutoFallbackChain, type AutoFallbackCandidate } from "./turn-safety.ts";
+import { doomedDispatches } from "./doomed-dispatch.ts";
+import { MODEL_REJECTION_TTL_MS, ModelRejectionRegistry, modelRejections } from "./model-rejections.ts";
+import { STATIC_MCODE_MODELS } from "./drivers/acp/mcode.ts";
+import { STATIC_DSH_MODELS } from "./drivers/acp/dsh.ts";
 
 const fallbacks: ModelSelection[] = [
   { instanceId: "grok", model: "grok-4" },
@@ -52,6 +71,42 @@ function decide(messagesAfterUser: FallbackScanMessage[], opts: {
     current: opts.current,
   });
 }
+
+describe("DSH vision route migration", () => {
+  it("updates the Pro primary and matching fallback without changing unrelated routes", () => {
+    const original: ModelSelection = {
+      instanceId: "dsh", model: "DeepSeek-V4-Pro", effort: "high",
+      fallbacks: [
+        { instanceId: "claude", model: "DeepSeek-V4-Pro" },
+        { instanceId: "dsh", model: "DeepSeek-V4-Pro", effort: "none" },
+        { instanceId: "dsh", model: "MiniMax-M3.1-Flash" },
+      ],
+    };
+    expect(dshVisionSelection(original)).toEqual({
+      instanceId: "dsh", model: "DeepSeek-V4.1-Flash", effort: "high",
+      fallbacks: [
+        { instanceId: "claude", model: "DeepSeek-V4-Pro" },
+        { instanceId: "dsh", model: "DeepSeek-V4.1-Flash", effort: "none" },
+        { instanceId: "dsh", model: "MiniMax-M3.1-Flash" },
+      ],
+    });
+    expect(original.model).toBe("DeepSeek-V4-Pro");
+    expect(original.fallbacks?.[1]?.model).toBe("DeepSeek-V4-Pro");
+  });
+
+  it("still routes the retired DeepSeek-V4.1-Pro spelling off Pro", () => {
+    // A send path can carry the old id before the store rewrite reaches it, and
+    // a Pro turn that stayed on Pro would fail on the image instead of routing.
+    expect(
+      dshVisionSelection({ instanceId: "dsh", model: "DeepSeek-V4.1-Pro" }),
+    ).toEqual({ instanceId: "dsh", model: "DeepSeek-V4.1-Flash" });
+  });
+
+  it("leaves a non-dsh entry named DeepSeek-V4-Pro alone", () => {
+    const chain: ModelSelection = { instanceId: "claude", model: "DeepSeek-V4-Pro" };
+    expect(dshVisionSelection(chain)).toEqual(chain);
+  });
+});
 
 describe("turnProducedAssistantOutput", () => {
   it("does not count a tool-start chip (ok undefined) as produced, so 1:1 failover starts the next instance", () => {
@@ -160,8 +215,10 @@ describe("quota and session-limit failover", () => {
     expect(isQuotaOrCapText("Insufficient Balance")).toBe(true);
     expect(isQuotaOrCapText("out of credits")).toBe(true);
     expect(isQuotaOrCapText("Your credit balance is too low")).toBe(true);
-    expect(isQuotaOrCapText("HTTP 429: Too Many Requests")).toBe(true);
-    expect(isQuotaOrCapText("RESOURCE_EXHAUSTED")).toBe(true);
+    expect(isQuotaOrCapText("HTTP 429: Too Many Requests")).toBe(false);
+    expect(isShortProviderErrorText("HTTP 429: Too Many Requests")).toBe(true);
+    expect(isQuotaOrCapText("RESOURCE_EXHAUSTED")).toBe(false);
+    expect(isTransientCapacityText("RESOURCE_EXHAUSTED")).toBe(true);
     expect(isQuotaOrCapText("Here is a long successful answer about quotas that is well over five hundred characters. ".repeat(8))).toBe(false);
     expect(isQuotaOrCapText("Done.")).toBe(false);
   });
@@ -173,25 +230,19 @@ describe("quota and session-limit failover", () => {
       // grok.com consumer
       "Message limit reached",
       "You've exceeded your messaging allowance for the moment",
-      // xAI API
-      "429 Too Many Requests",
       // Claude.ai subscription (support.claude.com)
       "5-hour limit reached - resets 3:00pm",
       // Claude API (docs.claude.com / platform.claude.com)
       "You have reached your API usage limits: your organization has crossed its monthly API usage threshold",
-      "This request would exceed your organization's rate limit of 30,000 input tokens per minute",
-      "rate_limit_error",
       "enforced_spend_limit_reached",
       // Gemini API (ai.google.dev)
       "Resource has been exhausted (e.g. check quota).",
       "You exceeded your current quota, please check your plan and billing details.",
-      "429 RESOURCE_EXHAUSTED",
       "Your prepayment credits are depleted.",
       // Codex CLI (openai/codex + help.openai.com)
       "You've hit your usage limit. Upgrade to Plus to continue using Codex, or try again later.",
       "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Sep 6th, 2026 11:41 PM.",
       "usage_limit_exceeded",
-      "Rate limit reached for gpt-4.1 in organization org-example on tokens per min (TPM)",
       // Cursor CLI / editor
       "You've reached your monthly limit. Set a new on-demand limit to continue.",
       "Increase limits for faster responses Claude Opus 4.5 is not available in the slow pool. Please switch to Auto.",
@@ -200,15 +251,85 @@ describe("quota and session-limit failover", () => {
       "Upgrade your plan to continue",
       // DeepSeek API (api-docs.deepseek.com)
       "402 Insufficient Balance",
-      "429 Rate Limit Reached",
       // Kimi Code (kimi.com/code/docs error-reference)
       "You've reached your 5-hour usage limit",
       "You've reached your weekly (7-day) usage limit",
       "You've reached your monthly usage limit for this billing cycle",
-      "We're receiving too many requests at the moment. Please wait a moment and try again.",
       "Quota exceeded, please upgrade your plan or retry later",
     ];
     expect(hits.filter((text) => !isQuotaOrCapText(text))).toEqual([]);
+    const transient = [
+      "429 Too Many Requests",
+      "HTTP 429: Too Many Requests",
+      "429 Rate Limit Reached",
+      "429 RESOURCE_EXHAUSTED",
+      "rate_limit_error",
+      "This request would exceed your organization's rate limit of 30,000 input tokens per minute",
+      "Rate limit reached for gpt-4.1 in organization org-example on tokens per min (TPM)",
+      "We're receiving too many requests at the moment. Please wait a moment and try again.",
+      "Concurrency limit reached",
+      "Session limit reached",
+      "Too many concurrent requests",
+      "Maximum number of in-flight sessions exceeded",
+      "RESOURCE_EXHAUSTED concurrency limit",
+    ];
+    expect(transient.filter((text) => !isTransientCapacityText(text))).toEqual([]);
+    expect(transient.filter((text) => isQuotaOrCapText(text))).toEqual([]);
+    expect(turnTransientCapacityEvidence([{ role: "bot", kind: "text", text: "429 Too Many Requests" }], true)).toMatchObject({
+      source: "terminal-text",
+      text: "429 Too Many Requests",
+    });
+    for (const text of [
+      "Maximum number of in-flight sessions exceeded",
+      "HTTP 429: Maximum number of concurrent sessions exceeded",
+    ]) {
+      expect(turnTransientCapacityEvidence([{ role: "bot", kind: "text", text }], true), text).toMatchObject({
+        source: "terminal-text",
+        text,
+      });
+    }
+    expect(isTransientCapacityChip("Rate limit parsing is tested.")).toBe(false);
+    expect(isShortProviderErrorText("Rate limit parsing is tested.")).toBe(false);
+    expect(isTransientCapacityChip("Rate limit reached tests now pass.")).toBe(false);
+    expect(isTransientCapacityChip("Concurrency limit reached tests now pass.")).toBe(false);
+    const healthyConcurrencyText = "Concurrency limit is 3 and currently healthy after the update.";
+    expect(isTransientCapacityChip(healthyConcurrencyText)).toBe(false);
+    expect(isShortProviderErrorText(healthyConcurrencyText)).toBe(false);
+    expect(turnTransientCapacityEvidence([{ role: "bot", kind: "text", text: healthyConcurrencyText }], true)).toBeUndefined();
+    expect(isQuotaOrCapText("429 rate limit reached for this month")).toBe(true);
+    expect(isQuotaOrCapText("429 concurrency limit; resets at 4:30 PM")).toBe(true);
+    expect(isQuotaOrCapText("429 Billing verification failed")).toBe(true);
+    expect(isTransientCapacityText("429 Billing verification failed")).toBe(false);
+    for (const reset of ["resets in30s", "resets in2h", "resets in30"]) {
+      const message = `429 concurrency limit; ${reset}`;
+      expect(isQuotaOrCapText(message), message).toBe(true);
+      expect(isTransientCapacityText(message), message).toBe(false);
+    }
+    for (const reset of [
+      "resets at 5pm",
+      "resets 5 PM",
+      "resets Monday",
+      "resets on Nov 3",
+      "resets today",
+      "resets tomorrow",
+      "resets tonight",
+      "resets next week",
+      "resets next month",
+      "resets in a week",
+    ]) {
+      const message = `You've hit your session limit · ${reset}`;
+      expect(isQuotaOrCapText(message), message).toBe(true);
+      expect(isTransientCapacityText(message), message).toBe(false);
+      expect(turnTransientCapacityEvidence([{ role: "bot", kind: "text", text: message }], true), message).toBeUndefined();
+    }
+    for (const code of ["HTTP 429 insufficient_quota", "HTTP 429 usage_limit_exceeded", "HTTP 429 enforced_spend_limit_reached"]) {
+      expect(isQuotaOrCapText(code), code).toBe(true);
+      expect(isTransientCapacityText(code), code).toBe(false);
+    }
+    for (const code of ["HTTP 429 insufficient_balance", "HTTP 429 insufficient_funds"]) {
+      expect(isQuotaOrCapText(code), code).toBe(true);
+      expect(isTransientCapacityText(code), code).toBe(false);
+    }
     expect(isQuotaOrCapText("Approaching 5-hour limit.")).toBe(false);
     expect(isQuotaOrCapText("You've used 80% of your included usage")).toBe(false);
   });
@@ -258,14 +379,73 @@ describe("quota and session-limit failover", () => {
       { role: "bot", kind: "text", text: "The billing review is complete." },
       { role: "bot", kind: "activity", tool: { name: "error: API request failed: 429 rate limit reached · retry after 45s", ok: false } },
     ];
-    expect(turnQuotaOrCapEvidence(afterUser, false)).toEqual({
+    expect(turnQuotaOrCapEvidence(afterUser, false)).toBeUndefined();
+    expect(turnTransientCapacityEvidence(afterUser, false)).toEqual({
       text: "API request failed: 429 rate limit reached · retry after 45s",
       source: "provider-error",
     });
+    const longProviderError = `429 rate limit reached ${"provider details ".repeat(40)}`;
+    expect(turnTransientCapacityEvidence([
+      { role: "bot", kind: "activity", tool: { name: `error: ${longProviderError}`, ok: false } },
+    ], false)).toMatchObject({ text: longProviderError.trim(), source: "provider-error" });
+    expect(transientCapacityRetryDelayMs("API request failed: 429 rate limit reached · retry after 45s")).toBe(45_000);
+    expect(transientCapacityRetryDelayMs("concurrency limit reached; retry after 120s")).toBe(120_000);
+    expect(transientCapacityRetryDelayMs("concurrency limit reached; try again in 10 minutes")).toBe(300_000);
+    expect(transientCapacityRetryDelayMs("concurrency limit reached; retry-after: 0")).toBe(1_000);
+    expect(transientCapacityRetryDelayMs("HTTP 429 Retry-After:120")).toBe(120_000);
+    expect(transientCapacityRetryDelayMs("retry after 10 seconds.")).toBe(10_000);
+    expect(transientCapacityRetryDelayMs("retry after10requests")).toBe(5_000);
+    expect(transientCapacityRetryDelayMs("retry after 10 requests")).toBe(5_000);
+    expect(transientCapacityRetryDelayMs("concurrency limit reached")).toBe(5_000);
     expect(parseQuotaResetTime("API request failed: 429 rate limit reached · retry after 45s", 1_000, true)).toEqual({
       isQuotaOrCap: true,
       resetsAt: 46_000,
       rawTimeText: "retry after 45s",
+    });
+  });
+
+  it("keeps an earlier transient error when a later generic error is not capacity evidence", () => {
+    const transient = "concurrency limit reached; retry after 10s";
+    const hardQuota = "quota exceeded for the plan";
+    expect(turnTransientCapacityEvidence([
+      { role: "bot", kind: "activity", tool: { name: `error: ${transient}`, ok: false } },
+      { role: "bot", kind: "activity", tool: { name: "error: request failed: transport closed", ok: false } },
+    ], false)).toEqual({ text: transient, source: "provider-error" });
+    expect(turnTransientCapacityEvidence([
+      { role: "bot", kind: "activity", tool: { name: `error: ${transient}`, ok: false } },
+      { role: "bot", kind: "activity", tool: { name: `error: ${hardQuota}`, ok: false } },
+    ], false)).toBeUndefined();
+    expect(turnQuotaOrCapEvidence([
+      { role: "bot", kind: "activity", tool: { name: `error: ${hardQuota}`, ok: false } },
+      { role: "bot", kind: "activity", tool: { name: `error: ${transient}`, ok: false } },
+    ], false)).toEqual({ text: hardQuota, source: "provider-error" });
+    expect(turnTransientCapacityEvidence([
+      { role: "bot", kind: "activity", tool: { name: `error: ${hardQuota}`, ok: false } },
+      { role: "bot", kind: "activity", tool: { name: `error: ${transient}`, ok: false } },
+    ], false)).toBeUndefined();
+    expect(turnQuotaOrCapEvidence([
+      { role: "bot", kind: "activity", tool: { name: `error: ${transient}`, ok: false } },
+      { role: "bot", kind: "activity", tool: { name: `error: ${hardQuota}`, ok: false } },
+    ], false)).toEqual({ text: hardQuota, source: "provider-error" });
+    expect(turnTransientCapacityEvidence([
+      { role: "bot", kind: "activity", tool: { name: `error: ${transient}`, ok: false } },
+      { role: "bot", kind: "activity", tool: { name: `error: ${hardQuota}`, ok: false } },
+    ], false)).toBeUndefined();
+  });
+
+  it("keeps an explicit hard quota ahead of concurrent-cap wording and treats reset chips as hard", () => {
+    const hardQuota = "quota exceeded: maximum concurrent sessions reached";
+    const resetChip = "You've hit your session limit · resets 12:10am (America/Chicago)";
+    expect(turnTransientCapacityEvidence([
+      { role: "bot", kind: "activity", tool: { name: `error: ${hardQuota}`, ok: false } },
+    ], false)).toBeUndefined();
+    expect(turnQuotaOrCapEvidence([
+      { role: "bot", kind: "activity", tool: { name: `error: ${hardQuota}`, ok: false } },
+    ], false)).toMatchObject({ text: hardQuota, source: "provider-error" });
+    expect(turnTransientCapacityEvidence([{ role: "bot", kind: "text", text: resetChip }], true)).toBeUndefined();
+    expect(turnQuotaOrCapEvidence([{ role: "bot", kind: "text", text: resetChip }], true)).toMatchObject({
+      text: resetChip,
+      source: "terminal-chip",
     });
   });
 
@@ -337,6 +517,32 @@ describe("quota and session-limit failover", () => {
 });
 
 describe("selectTurnFallback", () => {
+  it("keeps a floating fallback's latest class on the pick", () => {
+    const pick = selectTurnFallback({
+      ok: false,
+      stopReason: null,
+      produced: false,
+      quotaOrCap: true,
+      fallbacks: [{ instanceId: "codex", model: "gpt-5.6-luna", latest: "luna" }],
+      used: 0,
+    });
+    expect(pick).toMatchObject({ instanceId: "codex", model: "gpt-5.6-luna", latest: "luna" });
+    // What the 1:1 relaunch and a room member's replayed fallback dispatch.
+    expect(selectionForFallbackPick(pick!)).toEqual({ instanceId: "codex", model: "gpt-5.6-luna", effort: undefined, latest: "luna" });
+    expect(selectionForFallbackPick({ instanceId: "claude", model: "claude-opus-5-5", effort: "high" })).toEqual({
+      instanceId: "claude",
+      model: "claude-opus-5-5",
+      effort: "high",
+    });
+  });
+
+  it("carries a fallback's own context cap and output limit, and adds neither when unset", () => {
+    expect(
+      selectionForFallbackPick({ instanceId: "minimax", model: "m", effort: "high", contextCap: 524_288, maxOutputTokens: 8192 }),
+    ).toEqual({ instanceId: "minimax", model: "m", effort: "high", contextCap: 524_288, maxOutputTokens: 8192 });
+    expect("contextCap" in selectionForFallbackPick({ instanceId: "minimax", model: "m" })).toBe(false);
+  });
+
   it("cancelled or interrupted does not fail over", () => {
     const afterUser: FallbackScanMessage[] = [{ role: "bot", kind: "activity", tool: { name: "Bash" } }];
     expect(decide(afterUser, { ok: false, stopReason: "cancelled" })).toBeUndefined();
@@ -356,6 +562,71 @@ describe("selectTurnFallback", () => {
       nextUsed: 2,
     });
     expect(decide(afterUser, { ok: false, used: 2 })).toBeUndefined();
+  });
+
+  it("skips cooling fallback routes in saved order and advances past the selected entry", () => {
+    const coolingChecks: Array<[string, string, string, number]> = [];
+    const isCooling = (botId: string, instanceId: string, model: string, now: number): boolean => {
+      coolingChecks.push([botId, instanceId, model, now]);
+      return instanceId === "grok";
+    };
+    expect(selectTurnFallback({
+      ok: false,
+      stopReason: null,
+      produced: false,
+      quotaOrCap: true,
+      botId: "bot-1",
+      fallbacks: [
+        { instanceId: "grok", model: "grok-4" },
+        { instanceId: "claude", model: "claude-sonnet-5" },
+      ],
+      used: 0,
+      now: 123,
+      isCooling,
+    })).toEqual({ instanceId: "claude", model: "claude-sonnet-5", nextUsed: 2 });
+    expect(coolingChecks).toEqual([
+      ["bot-1", "grok", "grok-4", 123],
+      ["bot-1", "claude", "claude-sonnet-5", 123],
+    ]);
+  });
+
+  it("does not dispatch when every remaining fallback route is cooling", () => {
+    expect(selectTurnFallback({
+      ok: false,
+      stopReason: null,
+      produced: false,
+      quotaOrCap: true,
+      botId: "bot-1",
+      fallbacks: [
+        { instanceId: "grok", model: "grok-4" },
+        { instanceId: "claude", model: "claude-sonnet-5" },
+      ],
+      used: 0,
+      isCooling: () => true,
+    })).toBeUndefined();
+  });
+
+  it("skips a transiently busy exact route when walking the fallback chain", () => {
+    const now = 1_780_000_100_000;
+    const busyModel = "claude-sonnet-transient-capacity-test";
+    transientRouteHealth.recordFailure("bot-1", "claude", busyModel, "429 rate limit", now);
+    try {
+      expect(selectTurnFallback({
+        ok: false,
+        stopReason: null,
+        produced: false,
+        quotaOrCap: true,
+        botId: "bot-1",
+        fallbacks: [
+          { instanceId: "claude", model: busyModel },
+          { instanceId: "grok", model: "grok-4.7" },
+        ],
+        used: 0,
+        now,
+      })).toMatchObject({ instanceId: "grok", model: "grok-4.7", nextUsed: 2 });
+    } finally {
+      transientRouteHealth.markHealthy("sibling", "claude", busyModel, now + 1);
+    }
   });
 });
 
@@ -408,7 +679,7 @@ describe("structured provider-error code feeds selectTurnFallback exactly as ind
   // "error" are kept off the auto-failover path, not inside
   // selectTurnFallback's own produced/quotaOrCap gate (that gate only
   // matters once a chain has already been handed to it).
-  const compose = (stopReason: string, current = { instanceId: "minimax", model: "MiniMax-M3" }) => {
+  const compose = (stopReason: string, current = { instanceId: "minimax", model: "MiniMax-M3.1-Flash" }) => {
     const code = providerErrorCodeFromStopReason(stopReason);
     const quotaOrCap = quotaOrCapFromErrorCode(code) ?? false;
     const chain = quotaOrCap ? [{ instanceId: "claude", model: "claude-sonnet-5" }] : undefined;
@@ -500,6 +771,28 @@ describe("AUTO_FALLBACK_PRIORITY — #90 auto-failover ordering", () => {
     expect(pick(["openaiCompat", "minimax"])).toBe("minimax");
   });
 
+  it("trims Claude defaults the detected CLI is too old to run before picking failover", () => {
+    const cliVersion = "2.1.279";
+    const described: AutoFallbackCandidate = {
+      instanceId: "claude",
+      driverKind: "claudeAgent",
+      snapshot: { state: "available", authenticated: true },
+      models: STATIC_CLAUDE_MODELS,
+    };
+    const runnable = {
+      ...described,
+      models: withoutModelsTooNewForCli(described.driverKind!, STATIC_CLAUDE_MODELS, cliVersion),
+    };
+    const chain = eligibleAutoFallbackChain([runnable], {
+      botId: "bot-1",
+      currentInstanceId: "codex",
+      isCooling: () => false,
+      priority: AUTO_FALLBACK_PRIORITY,
+    });
+    expect(chain[0]?.model).toBe("claude-sonnet-5");
+    expect(chain[0]?.model).not.toBe("claude-sonnet-5-5");
+  });
+
   it("leaves every existing CLI ordering unchanged: claude, antigravity, gemini, codex, openaiCompat, grok", () => {
     expect(pick(["grok", "codex", "openaiCompat", "claude", "gemini", "antigravity"])).toBe("claude");
     expect(pick(["grok", "codex", "openaiCompat", "gemini", "antigravity"])).toBe("antigravity");
@@ -521,6 +814,34 @@ describe("AUTO_FALLBACK_PRIORITY — #90 auto-failover ordering", () => {
     expect(codexIdx).toBeGreaterThanOrEqual(0);
     expect(codexIdx).toBeLessThan(minimaxIdx);
     expect(minimaxIdx).toBeLessThan(openaiCompatIdx);
+  });
+});
+
+describe("continuedTurnToolPolicy", () => {
+  const toolPolicy = { mode: "allowlist" as const, commands: [], writePaths: [], readPaths: [] };
+
+  it("returns the allowlist on the turn starter a card continuation resumes", () => {
+    expect(
+      continuedTurnToolPolicy([
+        { role: "user", kind: "text", text: "earlier chat" },
+        { role: "bot", kind: "text", text: "reply" },
+        { role: "system", kind: "text", text: "run the routine", toolPolicy },
+        { role: "bot", kind: "activity", tool: { name: "connector" } },
+        { role: "bot", kind: "options" },
+      ]),
+    ).toEqual(toolPolicy);
+  });
+
+  it("returns none when the turn being continued is an ordinary one", () => {
+    expect(
+      continuedTurnToolPolicy([
+        { role: "system", kind: "text", text: "run the routine", toolPolicy },
+        { role: "bot", kind: "text", text: "done" },
+        { role: "user", kind: "text", text: "now a chat turn" },
+        { role: "bot", kind: "options" },
+      ]),
+    ).toBeUndefined();
+    expect(continuedTurnToolPolicy([])).toBeUndefined();
   });
 });
 
@@ -584,6 +905,15 @@ describe("shouldReplayPersistedStarter", () => {
 });
 
 describe("bootRecoveryTurnOpts", () => {
+  it("carries a routine's command allowlist on the continuation path as well as on replay", () => {
+    const toolPolicy = { mode: "allowlist" as const, commands: [], writePaths: [], readPaths: [] };
+    const resume = { role: "system", automationSource: "manual" as const, toolPolicy };
+    // false is the BOOT_RECOVERY_NOTICE continuation, which never reuses the starter as userMessage
+    expect(bootRecoveryTurnOpts(resume, false)).toEqual({ automationSource: "manual", unattended: true, toolPolicy });
+    expect(bootRecoveryTurnOpts(resume, true)).toEqual({ automationSource: "manual", unattended: true, toolPolicy });
+    expect(bootRecoveryTurnOpts({ role: "user" }, false)).not.toHaveProperty("toolPolicy");
+  });
+
   it("forwards webhook automationSource and marks unattended on both replay and BOOT_RECOVERY_NOTICE paths", () => {
     const resume = { role: "system", automationSource: "webhook" as const };
     const notice = bootRecoveryTurnOpts(resume, false);
@@ -624,11 +954,11 @@ describe("bootRecoveryTurnOpts", () => {
 describe("parseQuotaResetTime", () => {
   it("parses relative reset durations in minutes and seconds", () => {
     const base = 1700000000000;
-    const res1 = parseQuotaResetTime("Rate limit reached. Try again in 15 minutes.", base);
+    const res1 = parseQuotaResetTime("You've hit your usage limit. Try again in 15 minutes.", base);
     expect(res1.isQuotaOrCap).toBe(true);
     expect(res1.resetsAt).toBe(base + 15 * 60 * 1000);
 
-    const res2 = parseQuotaResetTime("HTTP 429: Too Many Requests · retry after 45s", base);
+    const res2 = parseQuotaResetTime("HTTP 429: Too Many Requests · retry after 45s", base, true);
     expect(res2.isQuotaOrCap).toBe(true);
     expect(res2.resetsAt).toBe(base + 45 * 1000);
   });
@@ -639,6 +969,42 @@ describe("parseQuotaResetTime", () => {
     expect(res.isQuotaOrCap).toBe(true);
     expect(typeof res.resetsAt).toBe("number");
     expect(res.resetsAt).toBeGreaterThan(Date.now() - 1000);
+  });
+
+  // Behaviour pin for the hoisted Intl.DateTimeFormat in computeNextOccurrence:
+  // the zoned search must land on the same instant it always did, and it must
+  // build its formatter once per parse rather than once per candidate minute.
+  it("resolves a zoned time-of-day reset to the exact next instant in that zone", () => {
+    // 12:00 UTC on Fri, Sep 25, 2026 is 7:00 AM CDT (UTC-5).
+    const now = Date.UTC(2026, 8, 25, 12, 0, 0);
+    const res = parseQuotaResetTime("You've hit your session limit · resets 12:10am (America/Chicago)", now);
+    // The next 12:10 AM in Chicago is 05:10 UTC the following day.
+    expect(res.resetsAt).toBe(Date.UTC(2026, 8, 26, 5, 10, 0));
+
+    // Same wall time in winter, when Chicago is UTC-6.
+    const winter = Date.UTC(2026, 0, 15, 12, 0, 0);
+    const winterRes = parseQuotaResetTime("You've hit your session limit · resets 3:30pm (America/Chicago)", winter);
+    expect(winterRes.resetsAt).toBe(Date.UTC(2026, 0, 15, 21, 30, 0));
+  });
+
+  it("builds the zone formatter once per parse, not once per candidate minute", () => {
+    const now = Date.UTC(2026, 8, 25, 12, 0, 0);
+    const spy = vi.spyOn(Intl, "DateTimeFormat");
+    try {
+      parseQuotaResetTime("You've hit your session limit · resets 12:10am (America/Chicago)", now);
+      expect(spy).toHaveBeenCalledTimes(1);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("falls back to local time for a zone Intl does not recognize", () => {
+    const now = Date.UTC(2026, 8, 25, 12, 0, 0);
+    const res = parseQuotaResetTime("You've hit your session limit · resets 12:10am (Not/AZone)", now);
+    const local = new Date(now);
+    local.setHours(0, 10, 0, 0);
+    if (local.getTime() <= now) local.setDate(local.getDate() + 1);
+    expect(res.resetsAt).toBe(local.getTime());
   });
 
   it("parses midnight reset", () => {
@@ -689,6 +1055,56 @@ describe("a user stop must not fail over", () => {
 });
 
 describe("QuotaCooldownRegistry", () => {
+  it("does not lazily prune live cooldowns outside persisted-load migration", () => {
+    const registry = new QuotaCooldownRegistry();
+    const resetsAt = Date.now() + 60_000;
+    registry.record({
+      botId: "grok-bot",
+      instanceId: "grok",
+      model: "grok-4",
+      resetsAt,
+      error: "session limit",
+      recordedAt: Date.now(),
+    });
+    registry.record({
+      botId: "*",
+      instanceId: "minimax",
+      model: "MiniMax-M3",
+      resetsAt,
+      error: "Rate limit reached for MiniMax-M3",
+      recordedAt: Date.now(),
+    });
+
+    // A balance refresh for another provider calls list() before filtering.
+    // It must not erase the Grok row, and a real MiniMax rate-limit row must
+    // remain authoritative while the account balance is healthy.
+    expect(registry.list()).toHaveLength(2);
+    expect(registry.get("grok-bot", "grok", "grok-4")?.resetsAt).toBe(resetsAt);
+    expect(registry.get("any-bot", "minimax", "MiniMax-M3")?.error)
+      .toBe("Rate limit reached for MiniMax-M3");
+  });
+
+  it("drops a transient row after record normalizes its missing reset to a default TTL", () => {
+    const file = `${tmpdir()}/quota-cooldowns-transient-roundtrip-${Date.now()}.json`;
+    const now = Date.now();
+    const first = new QuotaCooldownRegistry();
+    first.enablePersist(file, (_path, json) => writeFileSync(file, json));
+    first.record({
+      botId: "roundtrip-bot",
+      instanceId: "claude",
+      model: "claude-sonnet-5",
+      error: "429 rate limit reached",
+      recordedAt: now,
+      source: "provider-error",
+    });
+    expect(JSON.parse(readFileSync(file, "utf8")).cooldowns[0].resetsAt).toBe(now + DEFAULT_QUOTA_COOLDOWN_TTL_MS);
+
+    const second = new QuotaCooldownRegistry();
+    second.enablePersist(file, (_path, json) => writeFileSync(file, json));
+    expect(second.get("roundtrip-bot", "claude", "claude-sonnet-5", now + 1)).toBeUndefined();
+    expect(JSON.parse(readFileSync(file, "utf8")).cooldowns).toHaveLength(0);
+  });
+
   it("resolves fallback when primary is on active cooldown and switches back once expired", () => {
     const registry = new (quotaCooldowns.constructor as any)();
     const primary: ModelSelection = {
@@ -705,7 +1121,7 @@ describe("QuotaCooldownRegistry", () => {
       instanceId: "grok",
       model: "grok-4",
       resetsAt,
-      error: "session limit",
+      error: "usage limit reached",
       recordedAt: now,
     });
 
@@ -730,14 +1146,14 @@ describe("QuotaCooldownRegistry", () => {
       fallbacks: [{ instanceId: "antigravity", model: "gemini-3.8-flash-high" }],
     };
 
-    registry.recordInstanceCap("codex", "*", { error: "Codex session limit reached" });
+    registry.recordInstanceCap("codex", "*", { error: "Codex session limit reached · resets in 1 hour" });
 
     // Any bot targeting codex should automatically use fallback
     const resolved = registry.resolveModel("any-bot-id", primary);
     expect(resolved.isFallback).toBe(true);
     expect(resolved.selection.instanceId).toBe("antigravity");
     expect(resolved.selection.model).toBe("gemini-3.8-flash-high");
-    expect(resolved.cooldown?.error).toBe("Codex session limit reached");
+    expect(resolved.cooldown?.error).toBe("Codex session limit reached · resets in 1 hour");
 
     // Cooldown list includes the instance cap
     const active = registry.list();
@@ -784,7 +1200,7 @@ describe("QuotaCooldownRegistry", () => {
     expect(second.get("bot", "grok", "grok-4.6")).toBeUndefined();
   });
 
-  it("drops only legacy sourceless prose cooldowns while retaining terminal chips and named sources", () => {
+  it("drops legacy prose and transient route failures while retaining hard chips and named sources", () => {
     const file = `${tmpdir()}/quota-cooldowns-prose-${Date.now()}.json`;
     writeFileSync(file, JSON.stringify({
       version: 1,
@@ -814,6 +1230,33 @@ describe("QuotaCooldownRegistry", () => {
           recordedAt: Date.now(),
         },
         {
+          botId: "reset-cap-bot",
+          instanceId: "grok",
+          model: "grok-4",
+          resetsAt: null,
+          error: "429 concurrency limit; resets in30s",
+          recordedAt: Date.now(),
+          source: "provider-error",
+        },
+        {
+          botId: "long-transient-bot",
+          instanceId: "grok",
+          model: "grok-4",
+          resetsAt: null,
+          error: `429 rate limit reached ${"provider detail ".repeat(40)}`,
+          recordedAt: Date.now(),
+          source: "provider-error",
+        },
+        {
+          botId: "timestamped-transient-bot",
+          instanceId: "grok",
+          model: "grok-4",
+          resetsAt: Date.now() + 60_000,
+          error: "429 concurrency limit; resets in30s",
+          recordedAt: Date.now(),
+          source: "provider-error",
+        },
+        {
           botId: "monitor-bot",
           instanceId: "antigravity",
           model: "gemini",
@@ -833,10 +1276,68 @@ describe("QuotaCooldownRegistry", () => {
 
     expect(registry.get("prose-bot", "grok", "grok-4")).toBeUndefined();
     expect(registry.get("chip-bot", "grok", "grok-4")?.source).toBeUndefined();
-    expect(registry.get("prefixed-cap-bot", "grok", "grok-4")?.source).toBeUndefined();
+    expect(registry.get("prefixed-cap-bot", "grok", "grok-4")).toBeUndefined();
+    expect(registry.get("reset-cap-bot", "grok", "grok-4")?.source).toBe("provider-error");
+    expect(registry.get("long-transient-bot", "grok", "grok-4")).toBeUndefined();
+    expect(registry.get("timestamped-transient-bot", "grok", "grok-4")?.resetsAt).toBeGreaterThan(Date.now());
     expect(registry.get("monitor-bot", "antigravity", "gemini")?.source).toBe("antigravity-usage");
     expect(writes).toHaveLength(1);
-    expect(JSON.parse(writes[0]).cooldowns).toHaveLength(3);
+    expect(JSON.parse(writes[0]).cooldowns).toHaveLength(4);
+  });
+
+  it("keeps explicitly timed transient-looking cooldowns across persisted migration", () => {
+    const file = `${tmpdir()}/quota-cooldowns-explicit-reset-${Date.now()}.json`;
+    const recordedAt = Date.now();
+    const explicitReset = recordedAt + 60_000;
+    const defaultReset = recordedAt + DEFAULT_QUOTA_COOLDOWN_TTL_MS;
+    writeFileSync(file, JSON.stringify({
+      version: 1,
+      cooldowns: [
+        {
+          botId: "minimax-bot",
+          instanceId: "minimax",
+          model: "MiniMax-M3",
+          resetsAt: explicitReset,
+          error: "Rate limit reached for MiniMax-M3",
+          recordedAt,
+        },
+        {
+          botId: "provider-error-code-bot",
+          instanceId: "grok",
+          model: "grok-4",
+          resetsAt: explicitReset,
+          error: "API request failed: 429 rate limit reached",
+          recordedAt,
+          source: "provider-error-code",
+        },
+        {
+          botId: "*",
+          instanceId: "minimax",
+          model: "*",
+          resetsAt: explicitReset,
+          error: "429 rate limit reached",
+          recordedAt,
+          source: "usage-monitor",
+        },
+        {
+          botId: "legacy-bot",
+          instanceId: "grok",
+          model: "grok-3",
+          resetsAt: defaultReset,
+          error: "429 rate limit reached",
+          recordedAt,
+        },
+      ],
+    }));
+
+    const registry = new QuotaCooldownRegistry();
+    registry.enablePersist(file, (_path, json) => writeFileSync(file, json));
+
+    expect(registry.get("minimax-bot", "minimax", "MiniMax-M3")?.resetsAt).toBe(explicitReset);
+    expect(registry.get("provider-error-code-bot", "grok", "grok-4")?.resetsAt).toBe(explicitReset);
+    expect(registry.get("any-bot", "minimax", "MiniMax-M2.7")?.source).toBe("usage-monitor");
+    expect(registry.get("legacy-bot", "grok", "grok-3")).toBeUndefined();
+    expect(registry.list()).toHaveLength(3);
   });
 
   it("clearWhere removes a deleted instance's cooldowns even when they never expire, leaving other instances untouched", () => {
@@ -883,6 +1384,166 @@ describe("QuotaCooldownRegistry", () => {
     expect(cd?.resetsAt).toBe(now + DEFAULT_QUOTA_COOLDOWN_TTL_MS);
     expect(registry.get("bot1", "antigravity", "gemini-3.8-flash-high", now + DEFAULT_QUOTA_COOLDOWN_TTL_MS + 1)).toBeUndefined();
   });
+
+  it("skips redundant disk writes when recordInstanceCap or clear makes no state change", () => {
+    const file = `${tmpdir()}/quota-cooldowns-dedup-${Date.now()}.json`;
+    const registry = new QuotaCooldownRegistry();
+    const writes: string[] = [];
+    registry.enablePersist(file, (_path, json) => {
+      writes.push(json);
+    });
+    const resetsAt = Date.now() + 60_000;
+    registry.recordInstanceCap("antigravity", "gemini-3.8-pro-high", {
+      resetsAt,
+      error: "exhausted",
+      source: "antigravity-usage",
+    });
+    expect(writes).toHaveLength(1);
+
+    // Repeated poll with identical resetsAt/error/source should not re-write the file
+    registry.recordInstanceCap("antigravity", "gemini-3.8-pro-high", {
+      resetsAt,
+      error: "exhausted",
+      source: "antigravity-usage",
+    });
+    expect(writes).toHaveLength(1);
+
+    // Clearing a non-existent bot cooldown should not write to disk either
+    registry.clear("non-existent-bot");
+    registry.clear("non-existent-bot", "antigravity", "gemini-3.8-pro-high");
+    expect(writes).toHaveLength(1);
+  });
+});
+
+describe("TransientRouteHealthRegistry", () => {
+  it("holds a transient route briefly without crossing engine or model ids", () => {
+    const health = new TransientRouteHealthRegistry();
+    health.recordFailure("bot-a", "claude", "claude-sonnet-5", "429 rate limit", 1_000, 5_000);
+    expect(health.get("claude", "claude-sonnet-5", 2_000)?.botId).toBe("bot-a");
+    expect(health.get("claude2", "claude-sonnet-5", 2_000)).toBeUndefined();
+    expect(health.get("claude", "claude-opus-5", 2_000)).toBeUndefined();
+    expect(health.get("claude", "claude-sonnet-5", 6_000)).toBeUndefined();
+    expect(health.recordFailure("bot-b", "claude", "claude-sonnet-5", "retry after 0", 7_000, 0)?.retryAt).toBe(8_000);
+  });
+
+  it("uses four other bots' recent same-route health to suppress transient holds, not hard quota", () => {
+    const health = new TransientRouteHealthRegistry();
+    const quotas = new QuotaCooldownRegistry();
+    for (const botId of ["bot-a", "bot-b", "bot-c", "bot-d"]) {
+      health.markHealthy(botId, "claude", "claude-sonnet-5", 10_000);
+    }
+    expect(health.recordFailure("bot-e", "claude", "claude-sonnet-5", "429 rate limit", 11_000)).toBeUndefined();
+    expect(health.get("claude", "claude-sonnet-5", 11_000)).toBeUndefined();
+
+    quotas.record({
+      botId: "bot-e",
+      instanceId: "claude",
+      model: "claude-sonnet-5",
+      resetsAt: 100_000,
+      error: "quota exceeded for the plan",
+      recordedAt: 11_000,
+      source: "provider-error",
+    });
+    health.markHealthy("bot-a", "claude", "claude-sonnet-5", 12_000);
+    expect(health.get("claude", "claude-sonnet-5", 12_000)).toBeUndefined();
+    expect(quotas.get("bot-e", "claude", "claude-sonnet-5", 12_000)?.error).toBe("quota exceeded for the plan");
+  });
+
+  it("requires a currently active sibling before prior health suppresses a new hold", () => {
+    const health = new TransientRouteHealthRegistry();
+    health.markHealthy("finished-bot", "claude", "claude-sonnet-5", 10_000);
+    expect(health.recordFailure(
+      "new-bot",
+      "claude",
+      "claude-sonnet-5",
+      "429 rate limit",
+      11_000,
+      5_000,
+      (botId) => botId === "active-bot",
+    )).toMatchObject({ botId: "new-bot", retryAt: 16_000 });
+
+    const activeHealth = new TransientRouteHealthRegistry();
+    activeHealth.markHealthy("active-bot", "claude", "claude-sonnet-5", 10_000);
+    expect(activeHealth.recordFailure(
+      "new-bot",
+      "claude",
+      "claude-sonnet-5",
+      "429 rate limit",
+      11_000,
+      5_000,
+      (botId) => botId === "active-bot",
+    )).toBeUndefined();
+  });
+
+  it("does not let the failing bot's own earlier health sample suppress its transient hold", () => {
+    const health = new TransientRouteHealthRegistry();
+    health.markHealthy("bot-a", "claude", "claude-sonnet-5", 10_000);
+    expect(health.recordFailure("bot-a", "claude", "claude-sonnet-5", "concurrency limit reached", 11_000)).toMatchObject({
+      botId: "bot-a",
+      retryAt: 16_000,
+    });
+  });
+
+  it("forgets failed bots before using sibling health and ignores stale success events", () => {
+    const health = new TransientRouteHealthRegistry();
+    health.markHealthy("bot-a", "claude", "claude-sonnet-5", 10_000);
+    health.markHealthy("bot-b", "claude", "claude-sonnet-5", 10_000);
+    expect(health.recordFailure("bot-a", "claude", "claude-sonnet-5", "429 rate limit", 11_000)).toBeUndefined();
+    expect(health.recordFailure("bot-b", "claude", "claude-sonnet-5", "429 rate limit", 12_000)).toMatchObject({ botId: "bot-b" });
+
+    health.markHealthy("bot-c", "claude", "claude-sonnet-5", 9_000);
+    expect(health.get("claude", "claude-sonnet-5", 12_001)?.botId).toBe("bot-b");
+    health.markHealthy("bot-b", "claude", "claude-sonnet-5", 8_000);
+    expect(health.get("claude", "claude-sonnet-5", 12_002)?.botId).toBe("bot-b");
+
+    const isolated = new TransientRouteHealthRegistry();
+    isolated.markHealthy("bot-c", "claude", "claude-sonnet-5", 10_000);
+    isolated.markUnhealthy("bot-c", "claude", "claude-sonnet-5");
+    expect(isolated.recordFailure("bot-c", "claude", "claude-sonnet-5", "concurrency limit reached", 11_000)).toMatchObject({ botId: "bot-c" });
+  });
+
+  it("bounds transient route and health state", () => {
+    const health = new TransientRouteHealthRegistry();
+    for (let index = 0; index < 520; index++) {
+      health.recordFailure(`bot-${index}`, "engine", `model-${index}`, "429 rate limit", 1_000);
+    }
+    expect(health.list(1_001)).toHaveLength(512);
+  });
+
+  it("resolves around a transiently busy fallback without replacing the primary hard-quota row", () => {
+    const now = 1_780_000_200_000;
+    const registry = new QuotaCooldownRegistry();
+    const busyModel = "grok-transient-capacity-test";
+    const primary: ModelSelection = {
+      instanceId: "codex",
+      model: "gpt-5.4",
+      fallbacks: [
+        { instanceId: "grok", model: busyModel },
+        { instanceId: "claude", model: "claude-sonnet-5" },
+      ],
+    };
+    registry.record({
+      botId: "bot-1",
+      instanceId: "codex",
+      model: "gpt-5.4",
+      resetsAt: now + 60_000,
+      error: "usage limit reached",
+      recordedAt: now,
+      source: "provider-error",
+    });
+    transientRouteHealth.recordFailure("bot-2", "grok", busyModel, "429 rate limit", now);
+    try {
+      const resolved = registry.resolveModel("bot-1", primary, now + 1_000);
+      expect(resolved).toMatchObject({
+        selection: { instanceId: "claude", model: "claude-sonnet-5" },
+        isFallback: true,
+        cooldown: { error: "usage limit reached" },
+      });
+      expect(registry.get("bot-1", "codex", "gpt-5.4", now + 1_000)?.error).toBe("usage limit reached");
+    } finally {
+      transientRouteHealth.markHealthy("sibling", "grok", busyModel, now + 2_000);
+    }
+  });
 });
 
 describe("inheritedUnattended", () => {
@@ -900,6 +1561,14 @@ describe("inheritedUnattended", () => {
   it("honors an explicit caller flag", () => {
     expect(inheritedUnattended({ unattended: true }, () => false)).toBe(true);
     expect(inheritedUnattended({ unattended: false, cardContinuation: true }, marked)).toBe(false);
+  });
+});
+
+describe("non-thinking Flash catalog", () => {
+  it("is a DSH row and not an mcode picker row", () => {
+    expect(STATIC_DSH_MODELS.options.some((option) => option.id === "MiniMax-M3.1-Flash")).toBe(true);
+    expect(STATIC_MCODE_MODELS.options.some((option) => option.id === "MiniMax-M3.1-Flash")).toBe(false);
+    expect(STATIC_MCODE_MODELS.default).toBe("MiniMax-M3.1-Flash-thinking");
   });
 });
 
@@ -933,6 +1602,14 @@ describe("unattendedModelDowngrade", () => {
     expect(out).not.toHaveProperty("effort");
   });
 
+  it("keeps a job's wake turn on the bot's own model, though it is unattended (owner ruling b)", () => {
+    for (const selection of [gemini, claude]) {
+      expect(
+        unattendedModelDowngrade(selection, { unattended: true, automationSource: "job", effortLevels: ["low"] }),
+      ).toEqual(selection);
+    }
+  });
+
   it("downgrades fresh webhook and resource deliveries, which carry automationSource not unattended", () => {
     for (const automationSource of ["webhook", "resource"]) {
       expect(
@@ -947,6 +1624,119 @@ describe("unattendedModelDowngrade", () => {
         unattendedModelDowngrade(gemini, { automationSource, effortLevels: ["low"] }),
       ).toEqual(gemini);
     }
+  });
+
+  it("stamps low on an unattended MiniMax M3.1 run over mcode, like every other effort engine", () => {
+    // M3.1's effort list came to mcode and the direct MiniMax API on
+    // 2026-09-30, so webhook, resource and unattended M3.1 runs now start at
+    // Low rather than at MiniMax's own default of max.  M2.7 Highspeed
+    // declares no levels, so it is left alone.
+    const levelsFor = (model: string) =>
+      STATIC_MCODE_MODELS.options.find((option) => option.id === model)?.effortLevels;
+    const m31: ModelSelection = { instanceId: "mcode", model: "MiniMax-M3.1-Flash-thinking" };
+    expect(
+      unattendedModelDowngrade(m31, { unattended: true, driverKind: "mcodeAgent", effortLevels: levelsFor }),
+    ).toEqual({ ...m31, effort: "low" });
+    expect(
+      unattendedModelDowngrade(m31, { automationSource: "webhook", driverKind: "mcodeAgent", effortLevels: levelsFor }),
+    ).toEqual({ ...m31, effort: "low" });
+    // an attended turn, or an explicit selection, still runs at Default
+    expect(unattendedModelDowngrade(m31, { driverKind: "mcodeAgent", effortLevels: levelsFor })).toEqual(m31);
+    expect(
+      unattendedModelDowngrade(m31, {
+        unattended: true,
+        hasExplicitSelection: true,
+        driverKind: "mcodeAgent",
+        effortLevels: levelsFor,
+      }),
+    ).toEqual(m31);
+
+    const m27: ModelSelection = { instanceId: "mcode", model: "MiniMax-M2.7-highspeed-thinking" };
+    expect(
+      unattendedModelDowngrade(m27, { unattended: true, driverKind: "mcodeAgent", effortLevels: levelsFor }),
+    ).toEqual(m27);
+  });
+
+  it("moves a webhook classify seat off thinking Flash onto a live non-thinking row", () => {
+    // mcode's shipped catalog does not offer MiniMax-M3.1-Flash
+    // (0.5.5 advertises the no-variant wire value and then fails the turn).
+    // DSH's static catalog does.  The caller passes that row.  A cross-engine
+    // move drops effort so DSH is not handed mcode's "low".
+    const levelsFor = (model: string) =>
+      STATIC_MCODE_MODELS.options.find((option) => option.id === model)?.effortLevels;
+    const thinking: ModelSelection = {
+      instanceId: "mcode",
+      model: "MiniMax-M3.1-Flash-thinking",
+      effort: "max",
+    };
+    const live = { instanceId: "dsh", model: "MiniMax-M3.1-Flash" };
+    expect(
+      unattendedModelDowngrade(thinking, {
+        automationSource: "webhook",
+        driverKind: "mcodeAgent",
+        effortLevels: levelsFor,
+        nonThinkingFlash: live,
+      }),
+    ).toEqual(live);
+    // No live row: keep today's behavior, thinking Flash at low effort.
+    expect(
+      unattendedModelDowngrade(thinking, {
+        automationSource: "webhook",
+        driverKind: "mcodeAgent",
+        effortLevels: levelsFor,
+      }),
+    ).toEqual({ ...thinking, effort: "low" });
+    // Same engine already offers the id: stay there and still stamp low.
+    const onMinimax: ModelSelection = { instanceId: "minimax", model: "MiniMax-M3.1-Flash-thinking" };
+    expect(
+      unattendedModelDowngrade(onMinimax, {
+        automationSource: "webhook",
+        driverKind: "minimax",
+        effortLevels: (model) => (model === "MiniMax-M3.1-Flash" ? ["low", "max"] : []),
+        nonThinkingFlash: { instanceId: "minimax", model: "MiniMax-M3.1-Flash" },
+      }),
+    ).toEqual({ instanceId: "minimax", model: "MiniMax-M3.1-Flash", effort: "low" });
+  });
+
+  it("does not move human, job, or resource turns, or a cooling non-thinking row", () => {
+    const levelsFor = (model: string) =>
+      STATIC_MCODE_MODELS.options.find((option) => option.id === model)?.effortLevels;
+    const thinking: ModelSelection = { instanceId: "mcode", model: "MiniMax-M3.1-Flash-thinking" };
+    const live = { instanceId: "dsh", model: "MiniMax-M3.1-Flash" };
+    const base = { driverKind: "mcodeAgent" as const, effortLevels: levelsFor, nonThinkingFlash: live };
+    expect(unattendedModelDowngrade(thinking, base)).toEqual(thinking);
+    expect(
+      unattendedModelDowngrade(thinking, { ...base, unattended: true, automationSource: "job" }),
+    ).toEqual(thinking);
+    expect(
+      unattendedModelDowngrade(thinking, { ...base, automationSource: "resource" }),
+    ).toEqual({ ...thinking, effort: "low" });
+    expect(
+      unattendedModelDowngrade(thinking, {
+        ...base,
+        automationSource: "webhook",
+        isCooling: (instanceId, model) => instanceId === "dsh" && model === "MiniMax-M3.1-Flash",
+      }),
+    ).toEqual({ ...thinking, effort: "low" });
+  });
+
+  it("replaces a bot's own saved effort with low on an unattended run, since only a caller-supplied selection is exempt", () => {
+    // Documents the behaviour the M3.1 rollout note describes: a bot saved at
+    // Max still runs automated turns at Low, and there is no per-bot opt-out.
+    const levelsFor = (model: string) =>
+      STATIC_MCODE_MODELS.options.find((option) => option.id === model)?.effortLevels;
+    const saved: ModelSelection = { instanceId: "mcode", model: "MiniMax-M3.1-Flash-thinking", effort: "max" };
+    expect(
+      unattendedModelDowngrade(saved, { unattended: true, driverKind: "mcodeAgent", effortLevels: levelsFor }),
+    ).toEqual({ ...saved, effort: "low" });
+    expect(
+      unattendedModelDowngrade(saved, {
+        unattended: true,
+        hasExplicitSelection: true,
+        driverKind: "mcodeAgent",
+        effortLevels: levelsFor,
+      }),
+    ).toEqual(saved);
   });
 
   it("never overrides an explicit caller modelSelection", () => {
@@ -1139,5 +1929,688 @@ describe("unattendedModelDowngrade", () => {
         { unattended: true, effortLevels: ["low"] },
       ),
     ).toEqual({ instanceId: "claude", model: "claude-haiku-4-5", effort: "low" });
+  });
+});
+
+// A fail-over is the exact moment a SECOND dead engine gets picked: the
+// primary failed over cleanly, and the chain then handed the turn to an engine
+// whose CLI is missing, is not executable, or is waiting on an interactive
+// login.  216 of 2,001 runs on one Mac were `spawn_error` — the process never
+// came up at all — and two bots whose primary is `antigravity` had already
+// fallen back when this was written.
+describe("a setup-dead engine is not a fallback candidate", () => {
+  const T0 = 1_780_000_000_000;
+  const CHAIN: ModelSelection[] = [
+    { instanceId: "grok", model: "grok-4.7" },
+    { instanceId: "dsh", model: "MiniMax-M3.1-Flash" },
+    { instanceId: "claude", model: "claude-sonnet-5" },
+  ];
+  const doomed = (...instances: string[]) => (botId: string, instanceId: string) =>
+    botId === "bot1" && instances.includes(instanceId);
+
+  it("resolves to the third entry when the second is setup-dead", () => {
+    // used: 1 is the position the just-failed primary occupies, so the walk
+    // starts at chain index 1 (dsh).  That one is dead, so the next saved
+    // engine is the third.
+    expect(
+      selectTurnFallback({
+        ok: false,
+        produced: false,
+        quotaOrCap: true,
+        fallbacks: CHAIN,
+        used: 1,
+        botId: "bot1",
+        isDoomed: doomed("dsh"),
+        now: T0,
+      }),
+    ).toEqual({ instanceId: "claude", model: "claude-sonnet-5", nextUsed: 3 });
+  });
+
+  it("leaves a chain with nothing doomed exactly as it was", () => {
+    const input = {
+      ok: false,
+      produced: false,
+      quotaOrCap: true,
+      fallbacks: CHAIN,
+      used: 0,
+      botId: "bot1",
+      isDoomed: () => false,
+      now: T0,
+    };
+    expect(selectTurnFallback(input)).toEqual({ instanceId: "grok", model: "grok-4.7", nextUsed: 1 });
+    // …and with no bot id and no gate, which is every caller on today's
+    // wiring, nothing is excluded on the breaker's account.
+    expect(selectTurnFallback({ ...input, botId: undefined, isDoomed: undefined }))
+      .toEqual({ instanceId: "grok", model: "grok-4.7", nextUsed: 1 });
+  });
+
+  it("returns undefined for an entirely doomed chain — the whole-chain behaviour is unchanged", () => {
+    expect(
+      selectTurnFallback({
+        ok: false,
+        produced: false,
+        quotaOrCap: true,
+        fallbacks: CHAIN,
+        used: 0,
+        botId: "bot1",
+        isDoomed: doomed("grok", "dsh", "claude"),
+        now: T0,
+      }),
+    ).toBeUndefined();
+  });
+
+  it("skips, never re-orders: a dead first entry leaves the rest in saved order", () => {
+    const next = selectTurnFallback({
+      ok: false,
+      produced: false,
+      quotaOrCap: true,
+      fallbacks: CHAIN,
+      used: 0,
+      botId: "bot1",
+      isDoomed: doomed("grok"),
+      now: T0,
+    });
+    expect(next).toEqual({ instanceId: "dsh", model: "MiniMax-M3.1-Flash", nextUsed: 2 });
+    // nextUsed still points past the entry that was chosen, so the second
+    // failure of the same turn walks on to the third rather than re-offering
+    // the dead first entry.
+    expect(
+      selectTurnFallback({
+        ok: false,
+        produced: false,
+        quotaOrCap: true,
+        fallbacks: CHAIN,
+        used: next!.nextUsed,
+        current: { instanceId: next!.instanceId, model: next!.model },
+        botId: "bot1",
+        isDoomed: doomed("grok"),
+        now: T0,
+      }),
+    ).toEqual({ instanceId: "claude", model: "claude-sonnet-5", nextUsed: 3 });
+  });
+
+  it("reads the process-wide breaker by default, the one canStart already consults", () => {
+    doomedDispatches.clear();
+    try {
+      // Below the threshold the pair is only a counter, so the chain is
+      // untouched — one ENOENT can land mid-install and must not exclude an
+      // engine on its own.
+      doomedDispatches.recordFailure("bot1", "dsh", "spawn ENOENT", T0);
+      doomedDispatches.recordFailure("bot1", "dsh", "spawn ENOENT", T0);
+      expect(
+        selectTurnFallback({
+          ok: false,
+          produced: false,
+          quotaOrCap: true,
+          fallbacks: CHAIN,
+          used: 0,
+          botId: "bot1",
+          now: T0,
+        }),
+      ).toEqual({ instanceId: "grok", model: "grok-4.7", nextUsed: 1 });
+
+      doomedDispatches.recordFailure("bot1", "dsh", "spawn ENOENT", T0);
+      expect(
+        selectTurnFallback({
+          ok: false,
+          produced: false,
+          quotaOrCap: true,
+          fallbacks: CHAIN,
+          used: 1,
+          botId: "bot1",
+          now: T0,
+        }),
+      ).toEqual({ instanceId: "claude", model: "claude-sonnet-5", nextUsed: 3 });
+
+      // The pair is keyed per bot: another bot's chain still offers dsh.
+      expect(
+        selectTurnFallback({
+          ok: false,
+          produced: false,
+          quotaOrCap: true,
+          fallbacks: CHAIN,
+          used: 1,
+          botId: "bot2",
+          now: T0,
+        }),
+      ).toEqual({ instanceId: "dsh", model: "MiniMax-M3.1-Flash", nextUsed: 2 });
+    } finally {
+      doomedDispatches.clear();
+    }
+  });
+
+  it("resolveModel skips a doomed fallback and returns the primary when none is left", () => {
+    const registry = new (quotaCooldowns.constructor as any)();
+    const primary: ModelSelection = {
+      instanceId: "antigravity",
+      model: "gemini-3.8-pro-high",
+      fallbacks: [
+        { instanceId: "grok", model: "grok-4.7" },
+        { instanceId: "dsh", model: "MiniMax-M3.1-Flash" },
+        { instanceId: "claude", model: "claude-sonnet-5" },
+      ],
+    };
+    registry.record({
+      botId: "bot1",
+      instanceId: primary.instanceId,
+      model: primary.model,
+      resetsAt: T0 + 60_000,
+      error: "usage limit reached",
+      recordedAt: T0,
+    });
+    // The first chain entry is cooling too, so the walk reaches dsh — which
+    // is exactly the entry this change is about.
+    registry.record({
+      botId: "bot1",
+      instanceId: "grok",
+      model: "grok-4.7",
+      resetsAt: T0 + 60_000,
+      error: "429 rate limit reached for this month",
+      recordedAt: T0,
+    });
+
+    // Nothing dead: the first usable entry, untouched.
+    expect(registry.resolveModel("bot1", primary, T0 + 1_000, { isDoomed: () => false }).selection)
+      .toMatchObject({ instanceId: "dsh", model: "MiniMax-M3.1-Flash" });
+
+    // dsh cannot start for this bot, so the next saved engine is the third.
+    const skipped = registry.resolveModel("bot1", primary, T0 + 1_000, { isDoomed: doomed("dsh") });
+    expect(skipped.isFallback).toBe(true);
+    expect(skipped.selection).toMatchObject({ instanceId: "claude", model: "claude-sonnet-5" });
+
+    // Every remaining candidate is dead: the primary plus its cooldown, which
+    // is exactly what an all-cooling chain has always returned.
+    const none = registry.resolveModel("bot1", primary, T0 + 1_000, { isDoomed: doomed("dsh", "claude") });
+    expect(none.selection).toMatchObject({ instanceId: primary.instanceId, model: primary.model });
+    expect(none.isFallback).toBe(false);
+    expect(none.cooldown?.error).toBe("usage limit reached");
+  });
+});
+
+// The tests above inject `isDoomed` directly, which is a seam — not how the
+// product runs.  Production passes no gate at all and relies on
+// `doomedGate()` falling back to `defaultDoomedGate`, which reads the same
+// process-wide breaker `canStart` consults.  Nothing pinned that path: if
+// `defaultDoomedGate` were ever stubbed to a no-op, every test above would
+// still pass while the feature was dead in the only configuration that ships.
+//
+// This test therefore registers a real pair on the module-level registry and
+// resolves a chain with NO `isDoomed` argument, so the production wiring is
+// what is under test.  It exists because a Sentry review claimed this path was
+// inactive; the claim was wrong, and this is the proof that will keep proving
+// it — including if the claim later turns out to have been right.
+describe("the default doomed gate is live, not a stub", () => {
+  const T0 = 1_780_000_000_000;
+  const CHAIN: ModelSelection[] = [
+    { instanceId: "grok", model: "grok-4.7" },
+    { instanceId: "dsh", model: "MiniMax-M3.1-Flash" },
+    { instanceId: "claude", model: "claude-sonnet-5" },
+  ];
+
+  /** Drive a real pair to the threshold on the shared registry. */
+  function doomTheRealPair(botId: string, instanceId: string) {
+    for (let i = 0; i < 3; i++) doomedDispatches.recordFailure(botId, instanceId, "spawn ENOENT", T0);
+  }
+
+  it("excludes a setup-dead engine with no isDoomed argument passed", () => {
+    doomTheRealPair("bot-default-gate", "dsh");
+    try {
+      expect(
+        selectTurnFallback({
+          ok: false,
+          produced: false,
+          quotaOrCap: true,
+          fallbacks: CHAIN,
+          used: 1,
+          botId: "bot-default-gate",
+          now: T0,
+        }),
+      ).toEqual({ instanceId: "claude", model: "claude-sonnet-5", nextUsed: 3 });
+    } finally {
+      doomedDispatches.clear();
+    }
+  });
+
+  it("leaves a healthy chain untouched through the same default path", () => {
+    // Guards the other direction: the default gate must not exclude anything
+    // just because no gate was injected.
+    try {
+      expect(
+        selectTurnFallback({
+          ok: false,
+          produced: false,
+          quotaOrCap: true,
+          fallbacks: CHAIN,
+          used: 1,
+          botId: "bot-default-gate-clean",
+          now: T0,
+        }),
+      ).toEqual({ instanceId: "dsh", model: "MiniMax-M3.1-Flash", nextUsed: 2 });
+    } finally {
+      doomedDispatches.clear();
+    }
+  });
+
+  it("resolveModel's default path skips a doomed fallback too", () => {
+    const registry = new QuotaCooldownRegistry();
+    const primary: ModelSelection = {
+      instanceId: "antigravity",
+      model: "gemini-3.8-pro-high",
+      fallbacks: [{ instanceId: "grok", model: "grok-4.7" }, { instanceId: "dsh", model: "MiniMax-M3.1-Flash" }],
+    };
+    registry.record({
+      botId: "bot-default-gate",
+      instanceId: primary.instanceId,
+      model: primary.model,
+      resetsAt: T0 + 60_000,
+      error: "usage limit reached",
+      recordedAt: T0,
+    });
+    doomTheRealPair("bot-default-gate", "dsh");
+    try {
+      const picked = registry.resolveModel("bot-default-gate", primary, T0);
+      expect(picked.isFallback).toBe(true);
+      expect(picked.selection.instanceId).toBe("grok");
+    } finally {
+      doomedDispatches.clear();
+    }
+  });
+});
+
+// A provider that rejects the model id answers before doing any work.  The
+// Claude CLI used to phrase that as an assistant reply, which counted as real
+// output and ended the walk on the dead entry: Deployer's chain held
+// claude-3-7-sonnet ahead of two healthy engines and stopped there in 24 of 26
+// fall-overs.  These tests pin the fold the way index.ts wires it.
+describe("a rejected model id does not end the fallback walk", () => {
+  const T0 = 1_780_000_000_000;
+  const CHAIN: ModelSelection[] = [
+    { instanceId: "claude", model: "claude-3-7-sonnet" },
+    { instanceId: "codex", model: "gpt-5.6-luna" },
+    { instanceId: "minimax", model: "MiniMax-M3.1-Flash" },
+  ];
+  const DEAD_TEXT =
+    "There's an issue with the selected model (claude-3-7-sonnet). It may not exist or you may not have access to it.";
+  const errorRow = (name: string): FallbackScanMessage => ({
+    role: "bot",
+    kind: "activity",
+    tool: { name: `error: ${name}`, ok: false },
+  });
+  const textRow = (text: string): FallbackScanMessage => ({ role: "bot", kind: "text", text });
+  const notice = (name: string): FallbackScanMessage => ({
+    role: "bot",
+    kind: "activity",
+    tool: { name, ok: true, kind: "notice" },
+  });
+
+  /** The fold in server/index.ts, reduced to the decision it feeds. */
+  function walk(
+    afterUser: FallbackScanMessage[],
+    opts: { stopReason?: string | null; used: number; current: { instanceId: string; model: string }; ok?: boolean },
+  ) {
+    const evidence = turnModelRejectionEvidence(afterUser, opts.ok ?? false, opts.stopReason);
+    const textIsError = sliceIsShortProviderError(afterUser) || Boolean(evidence);
+    return selectTurnFallback({
+      ok: (opts.ok ?? false) && !textIsError,
+      stopReason: opts.stopReason,
+      produced: turnProducedAssistantOutput(afterUser, { textIsError }),
+      quotaOrCap: Boolean(turnQuotaOrCapEvidence(afterUser, opts.ok ?? false)),
+      fallbacks: CHAIN,
+      used: opts.used,
+      current: opts.current,
+      botId: "bot-rejected",
+      now: T0,
+    });
+  }
+
+  it("reproduces the dead end this fixes: the apology text alone reads as real output", () => {
+    const afterUser = [errorRow("unknown model option"), notice("Fell over to claude-3-7-sonnet"), textRow(DEAD_TEXT)];
+    // The pre-fix fold knew nothing of rejections: the text counts as output.
+    expect(
+      selectTurnFallback({
+        ok: false,
+        produced: turnProducedAssistantOutput(afterUser, { textIsError: sliceIsShortProviderError(afterUser) }),
+        fallbacks: CHAIN,
+        used: 1,
+        current: CHAIN[0],
+      }),
+    ).toBeUndefined();
+  });
+
+  it("walks on from a rejection the driver reported structurally", () => {
+    const afterUser = [
+      errorRow("Claude can't use the model claude-3-7-sonnet.  It may not exist."),
+      notice("Fell over to claude-3-7-sonnet"),
+    ];
+    expect(turnModelRejectionEvidence(afterUser, false, "unknown_model")).toMatchObject({
+      source: "stop-reason",
+      text: expect.stringContaining("claude-3-7-sonnet"),
+    });
+    expect(walk(afterUser, { stopReason: "unknown_model", used: 1, current: CHAIN[0] })).toEqual({
+      instanceId: "codex",
+      model: "gpt-5.6-luna",
+      effort: undefined,
+      nextUsed: 2,
+    });
+  });
+
+  it("walks on from the rejection prose when an older driver forwarded it as text", () => {
+    const afterUser = [notice("Fell over to claude-3-7-sonnet"), textRow(DEAD_TEXT)];
+    expect(turnModelRejectionEvidence(afterUser, false, "api_error")).toMatchObject({ source: "terminal-text" });
+    expect(walk(afterUser, { stopReason: "api_error", used: 1, current: CHAIN[0] })).toMatchObject({
+      instanceId: "codex",
+      nextUsed: 2,
+    });
+  });
+
+  it("reads the LAST bot text, so a second dead entry is not hidden behind the first", () => {
+    // The slice accumulates across attempts: the fallback re-uses the same
+    // user message.  sliceIsShortProviderError wants exactly one text row and
+    // would have answered false here.
+    const afterUser = [textRow(DEAD_TEXT), notice("Fell over to claude-3-5-sonnet"), textRow(DEAD_TEXT.replace("3-7", "3-5"))];
+    expect(sliceIsShortProviderError(afterUser)).toBe(false);
+    expect(turnModelRejectionEvidence(afterUser, false, "api_error")).toBeDefined();
+    const chain: ModelSelection[] = [
+      { instanceId: "claude", model: "claude-3-7-sonnet" },
+      { instanceId: "claude", model: "claude-3-5-sonnet" },
+      { instanceId: "codex", model: "gpt-5.6-luna" },
+    ];
+    const evidence = turnModelRejectionEvidence(afterUser, false, "api_error");
+    expect(
+      selectTurnFallback({
+        ok: false,
+        produced: turnProducedAssistantOutput(afterUser, { textIsError: Boolean(evidence) }),
+        fallbacks: chain,
+        used: 2,
+        current: chain[1],
+      }),
+    ).toMatchObject({ instanceId: "codex", nextUsed: 3 });
+  });
+
+  it("never reads a successful turn, or ordinary prose about a missing model, as a rejection", () => {
+    // Anchored and length-capped on purpose: a real answer may discuss this.
+    expect(turnModelRejectionEvidence([textRow(DEAD_TEXT)], true, "end_turn")).toBeUndefined();
+    for (const prose of [
+      "The staging model id was not found in the catalog, so I added it.",
+      "that model is not available on the free tier",
+      "There's an issue with the selected model dropdown: it shows stale ids, so I fixed the filter.".repeat(6),
+      "I looked at why there's an issue with the selected model in the UI.",
+    ]) {
+      expect(isModelRejectionText(prose)).toBe(false);
+      expect(turnModelRejectionEvidence([textRow(prose)], false, "api_error")).toBeUndefined();
+    }
+    // …and a failed turn that did answer keeps ending the walk as before.
+    expect(
+      walk([textRow("Here is the diff you asked for."), errorRow("connection reset")], {
+        stopReason: "exit_before_result",
+        used: 0,
+        current: CHAIN[0],
+      }),
+    ).toBeUndefined();
+  });
+
+  it("falls back to a generic line when the driver gave a stop reason and no error row", () => {
+    expect(turnModelRejectionEvidence([], false, "unknown_model")).toMatchObject({
+      source: "stop-reason",
+      text: expect.any(String),
+    });
+  });
+
+  describe("the rejected-model mark", () => {
+    it("skips a marked entry in the walk and lands on the next usable one", () => {
+      const input = {
+        ok: false,
+        produced: false,
+        fallbacks: CHAIN,
+        used: 0,
+        botId: "bot-rejected",
+        now: T0,
+      };
+      expect(selectTurnFallback({ ...input, isModelRejected: () => false })).toMatchObject({ instanceId: "claude", nextUsed: 1 });
+      expect(
+        selectTurnFallback({
+          ...input,
+          isModelRejected: (botId, instanceId, model) =>
+            botId === "bot-rejected" && instanceId === "claude" && model === "claude-3-7-sonnet",
+        }),
+      ).toMatchObject({ instanceId: "codex", model: "gpt-5.6-luna", nextUsed: 2 });
+    });
+
+    it("marks one model, not the engine: a healthy entry on the same instance still runs", () => {
+      const chain: ModelSelection[] = [
+        { instanceId: "claude", model: "claude-3-7-sonnet" },
+        { instanceId: "claude", model: "claude-sonnet-5" },
+      ];
+      expect(
+        selectTurnFallback({
+          ok: false,
+          produced: false,
+          fallbacks: chain,
+          used: 0,
+          botId: "bot-rejected",
+          now: T0,
+          isModelRejected: (_bot, _instance, model) => model === "claude-3-7-sonnet",
+        }),
+      ).toMatchObject({ instanceId: "claude", model: "claude-sonnet-5", nextUsed: 2 });
+    });
+
+    it("needs a bot id, like the doomed gate: no bot, nothing excluded", () => {
+      expect(
+        selectTurnFallback({
+          ok: false,
+          produced: false,
+          fallbacks: CHAIN,
+          used: 0,
+          isModelRejected: () => true,
+        }),
+      ).toMatchObject({ instanceId: "claude" });
+    });
+
+    it("ends the walk when every remaining entry is marked", () => {
+      expect(
+        selectTurnFallback({
+          ok: false,
+          produced: false,
+          fallbacks: CHAIN,
+          used: 1,
+          botId: "bot-rejected",
+          now: T0,
+          isModelRejected: () => true,
+        }),
+      ).toBeUndefined();
+    });
+
+    it("reads the process-wide registry when no gate is passed, and stops at its TTL", () => {
+      modelRejections.record({
+        botId: "bot-default-mark",
+        instanceId: "claude",
+        model: "claude-3-7-sonnet",
+        reason: "rejected",
+        now: T0,
+      });
+      try {
+        const input = { ok: false, produced: false, fallbacks: CHAIN, used: 0, botId: "bot-default-mark" };
+        expect(selectTurnFallback({ ...input, now: T0 + 1_000 })).toMatchObject({ instanceId: "codex" });
+        // another bot is unaffected
+        expect(selectTurnFallback({ ...input, botId: "some-other-bot", now: T0 + 1_000 })).toMatchObject({ instanceId: "claude" });
+        // past the TTL the entry is offered again
+        expect(selectTurnFallback({ ...input, now: T0 + MODEL_REJECTION_TTL_MS + 1 })).toMatchObject({ instanceId: "claude" });
+      } finally {
+        modelRejections.clearWhere(() => true);
+      }
+    });
+
+    it("resolveModel routes around a rejected primary without recording a quota cooldown", () => {
+      const registry = new QuotaCooldownRegistry();
+      const primary: ModelSelection = {
+        instanceId: "dsh",
+        model: "DeepSeek-V4.1-Flash",
+        fallbacks: [
+          { instanceId: "claude", model: "claude-3-7-sonnet" },
+          { instanceId: "codex", model: "gpt-5.6-luna" },
+        ],
+      };
+      const rejected = (model: string) => (botId: string, instanceId: string, m: string) =>
+        botId === "bot1" && m === model && instanceId !== "";
+
+      expect(registry.resolveModel("bot1", primary, T0, { isModelRejected: () => false })).toEqual({
+        selection: primary,
+        isFallback: false,
+      });
+
+      // the primary itself was rejected, and so was the first fallback
+      const both = (botId: string, instanceId: string, model: string) =>
+        rejected("DeepSeek-V4.1-Flash")(botId, instanceId, model) || rejected("claude-3-7-sonnet")(botId, instanceId, model);
+      const resolved = registry.resolveModel("bot1", primary, T0, { isModelRejected: both });
+      expect(resolved.isFallback).toBe(true);
+      expect(resolved.selection).toMatchObject({ instanceId: "codex", model: "gpt-5.6-luna" });
+      expect(resolved.cooldown).toBeUndefined();
+      // a mark is not a quota hit: nothing for the Usage settings to list
+      expect(registry.list(T0)).toEqual([]);
+    });
+
+    it("resolveModel keeps a rejected primary when no usable fallback is left, so the failure stays visible", () => {
+      const registry = new QuotaCooldownRegistry();
+      const primary: ModelSelection = {
+        instanceId: "claude",
+        model: "claude-3-7-sonnet",
+        fallbacks: [{ instanceId: "codex", model: "gpt-5.6-luna" }],
+      };
+      expect(registry.resolveModel("bot1", primary, T0, { isModelRejected: () => true })).toEqual({
+        selection: primary,
+        isFallback: false,
+      });
+      // and with no chain at all
+      const lone: ModelSelection = { instanceId: "claude", model: "claude-3-7-sonnet" };
+      expect(registry.resolveModel("bot1", lone, T0, { isModelRejected: () => true }).selection).toEqual(lone);
+    });
+  });
+});
+
+describe("ModelRejectionRegistry", () => {
+  const T0 = 1_780_000_000_000;
+
+  it("keys on bot, instance and model, expires lazily, and restarts the clock on a repeat", () => {
+    const registry = new ModelRejectionRegistry();
+    registry.record({ botId: "b", instanceId: "claude", model: "claude-3-7-sonnet", reason: "gone", now: T0 });
+    expect(registry.isRejected("b", "claude", "claude-3-7-sonnet", T0 + 1)).toBe(true);
+    expect(registry.isRejected("b", "claude", "claude-sonnet-5", T0 + 1)).toBe(false);
+    expect(registry.isRejected("b", "codex", "claude-3-7-sonnet", T0 + 1)).toBe(false);
+    expect(registry.isRejected("other", "claude", "claude-3-7-sonnet", T0 + 1)).toBe(false);
+
+    registry.record({ botId: "b", instanceId: "claude", model: "claude-3-7-sonnet", now: T0 + MODEL_REJECTION_TTL_MS - 10 });
+    expect(registry.isRejected("b", "claude", "claude-3-7-sonnet", T0 + MODEL_REJECTION_TTL_MS + 5)).toBe(true);
+    expect(registry.isRejected("b", "claude", "claude-3-7-sonnet", T0 + 2 * MODEL_REJECTION_TTL_MS)).toBe(false);
+    expect(registry.list(T0 + 2 * MODEL_REJECTION_TTL_MS)).toEqual([]);
+  });
+
+  it("clears one mark, one instance, or everything", () => {
+    const registry = new ModelRejectionRegistry();
+    registry.record({ botId: "b", instanceId: "claude", model: "m1", now: T0 });
+    registry.record({ botId: "b", instanceId: "claude", model: "m2", now: T0 });
+    registry.record({ botId: "b", instanceId: "codex", model: "m3", now: T0 });
+    registry.clear("b", "claude", "m1");
+    expect(registry.list(T0).map((row) => row.model).sort()).toEqual(["m2", "m3"]);
+    registry.clearInstance("claude");
+    expect(registry.list(T0).map((row) => row.model)).toEqual(["m3"]);
+    registry.clearWhere(() => true);
+    expect(registry.list(T0)).toEqual([]);
+  });
+
+  it("survives a restart through the persist seam, drops expired rows, and treats a corrupt file as empty", () => {
+    const writes: string[] = [];
+    const first = new ModelRejectionRegistry();
+    first.enablePersist(join(tmpdir(), "omb-model-rejections-missing.json"), (_path, json) => writes.push(json));
+    first.record({ botId: "b", instanceId: "claude", model: "live", reason: "gone", now: Date.now() });
+    first.record({ botId: "b", instanceId: "claude", model: "stale", now: Date.now() - MODEL_REJECTION_TTL_MS - 5_000 });
+    expect(writes.length).toBeGreaterThan(0);
+
+    const file = join(mkdtempSync(join(tmpdir(), "omb-model-rejections-")), "model-rejections.json");
+    writeFileSync(file, writes.at(-1)!);
+    const second = new ModelRejectionRegistry();
+    second.enablePersist(file, () => undefined);
+    expect(second.isRejected("b", "claude", "live")).toBe(true);
+    expect(second.isRejected("b", "claude", "stale")).toBe(false);
+
+    writeFileSync(file, "{not json");
+    const third = new ModelRejectionRegistry();
+    third.enablePersist(file, () => undefined);
+    expect(third.list()).toEqual([]);
+  });
+});
+
+// The launcher lives in server/index.ts, which boots a harness on import, so
+// its stop-latch handling is pinned by shape the way secret-persistence pins
+// the credential fingerprint: a later edit that files a failed routine run for
+// a turn somebody stopped is caught even though the HTTP suite cannot race a
+// Stop against a fallback that has not started yet.
+describe("launchFallbackTurn and a stopped turn", () => {
+  const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.ts"), "utf8");
+  const start = source.indexOf("async function launchFallbackTurn(");
+  const launcher = source.slice(start, source.indexOf("\nbus.subscribe(", start));
+
+  it("files a failed routine run only for a turn nobody stopped", () => {
+    expect(launcher.length).toBeGreaterThan(0);
+    // the chain-ran-out exit: notice and failed run share one `!stopped` gate
+    expect(launcher).toMatch(
+      /if \(!stopped\) \{\s*note\(`No other engine[^`]*`\);\s*routines\?\.failThread\(threadId, `Could not start /,
+    );
+    // the walk-ending throw consumes the latch before it speaks
+    expect(launcher).toMatch(
+      /if \(!stoppedTurns\.delete\(key\)\) \{\s*note\(`Couldn't retry this turn[^`]*`\);\s*routines\?\.failThread\(threadId, `Could not retry on /,
+    );
+    // and no failThread outside those two gates
+    const sites = launcher.split("\n").filter((line) => /routines\?\.failThread/.test(line));
+    expect(sites).toHaveLength(2);
+  });
+});
+
+describe("retired MiniMax-M3 ids are rewritten before failover", () => {
+  it("selectTurnFallback returns dsh's live M3.1 Flash id for a MiniMax-M3 entry", () => {
+    // The Preview suffix is retired, so a MiniMax-M3 entry lands on the
+    // MiniMax-M3.1-Flash id every engine now serves.
+    const next = selectTurnFallback({
+      ok: false,
+      produced: false,
+      fallbacks: [
+        { instanceId: "dsh", model: "MiniMax-M3" },
+        { instanceId: "grok", model: "grok-4.7" },
+      ],
+      used: 0,
+      current: { instanceId: "mcode", model: "MiniMax-M3.1-Flash-thinking" },
+    });
+    expect(next).toEqual({
+      instanceId: "dsh",
+      model: "MiniMax-M3.1-Flash",
+      nextUsed: 1,
+    });
+  });
+
+  it("selectTurnFallback heals a saved dsh Flash Preview entry onto MiniMax-M3.1-Flash (BOTFLEET-4E)", () => {
+    const next = selectTurnFallback({
+      ok: false,
+      produced: false,
+      fallbacks: [{ instanceId: "dsh", model: "MiniMax-M3.1-Flash" }],
+      used: 0,
+      current: { instanceId: "grok", model: "grok-4.7" },
+    });
+    expect(next).toEqual({ instanceId: "dsh", model: "MiniMax-M3.1-Flash", nextUsed: 1 });
+  });
+
+  it("resolveModel heals a Director-shaped MiniMax-M3 primary without waiting for rejection", () => {
+    const registry = new QuotaCooldownRegistry();
+    const resolved = registry.resolveModel("director", {
+      instanceId: "dsh",
+      model: "MiniMax-M3",
+      fallbacks: [{ instanceId: "minimax", model: "MiniMax-M3" }],
+    });
+    expect(resolved.isFallback).toBe(false);
+    // Each engine gets its own live spelling: dsh dropped the Preview suffix,
+    // the native MiniMax driver still serves it.
+    expect(resolved.selection).toEqual({
+      instanceId: "dsh",
+      model: "MiniMax-M3.1-Flash",
+      fallbacks: [{ instanceId: "minimax", model: "MiniMax-M3.1-Flash" }],
+    });
   });
 });

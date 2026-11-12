@@ -42,6 +42,8 @@ describe("per-thread snooze in the store", () => {
     const timed = store.createTask(bot.id, "Timed")!;
     store.patchTask(bot.id, firstThread, { snoozedUntil: SNOOZE_UNTIL_ACTIVITY });
     store.patchTask(bot.id, timed.threadId, { snoozedUntil: deadline });
+    // A relaunch goes through the shutdown flush of the debounced roster save.
+    store.flushBotsNow();
 
     const reloaded = new Store(selection);
     expect(reloaded.taskByThread(bot.id, firstThread)?.snoozedUntil).toBe(SNOOZE_UNTIL_ACTIVITY);

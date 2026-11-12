@@ -64,19 +64,26 @@ public enum Frame: Sendable {
     /// The bot's cloud computer is being provisioned.
     case computer(botId: String, state: String)
     case config
+    /// A describe finished behind a stale-while-revalidate answer; the harness
+    /// pushes the fresh roster (`{ kind: "instances", instances, describedAt }`).
+    case instances([Instance], describedAt: Double?)
     case runtime(RuntimeEvent)
     /// The paired Mac's update status changed — a check completed, an
     /// install started, its progress moved, or it finished.  Carries the same
     /// shape as `GET /api/update/status` so a client never has to follow this
     /// with a fetch just to see what changed.
     case updateStatus(MacUpdateStatus)
+    /// Every background job of one conversation, debounced by the harness.  A
+    /// full set rather than a diff, so a frame that was missed is put right by
+    /// the next one: folding it replaces that conversation's jobs.
+    case jobs(threadId: String, jobs: [JobSnapshot])
     case unknown(kind: String)
 }
 
 extension Frame: Decodable {
     private enum CodingKeys: String, CodingKey {
         case kind, cursor, resumed, threadId, message, activeLeafId
-        case bot, botId, group, groupId, notification, png, mime, state, event, status
+        case bot, botId, group, groupId, notification, png, mime, state, event, status, instances, describedAt, jobs
     }
 
     public init(from decoder: Decoder) throws {
@@ -127,6 +134,11 @@ extension Frame: Decodable {
             )
         case "config":
             self = .config
+        case "instances":
+            self = .instances(
+                try container.decode([Instance].self, forKey: .instances),
+                describedAt: try container.decodeIfPresent(Double.self, forKey: .describedAt)
+            )
         case "runtime":
             self = .runtime(try container.decode(RuntimeEvent.self, forKey: .event))
         case "update.status":
@@ -149,6 +161,20 @@ extension Frame: Decodable {
                 self = .updateStatus(status)
             } else if let status = try? MacUpdateStatus(from: decoder) {
                 self = .updateStatus(status)
+            } else {
+                self = .unknown(kind: kind)
+            }
+        case "jobs":
+            // `{ kind: "jobs", threadId, jobs: [...] }`.  Both reads are `try?`
+            // for the reason the update frame's are: a frame this build cannot
+            // make sense of folds to `.unknown` rather than throwing out of the
+            // initializer, which the stream reader would take for the
+            // connection failing.  And a set with one unreadable job is not
+            // folded at all, because a full set is a replacement and a partial
+            // one would silently drop a running job from the pill.
+            if let threadId = try? container.decode(String.self, forKey: .threadId),
+               let jobs = try? container.decode([JobSnapshot].self, forKey: .jobs) {
+                self = .jobs(threadId: threadId, jobs: jobs)
             } else {
                 self = .unknown(kind: kind)
             }

@@ -30,6 +30,8 @@ import type { LucideIcon } from "lucide-react";
 import { classifyTool, toolVerb, type ToolKind } from "../../shared/tool-activity";
 import type { Message } from "@/state/store";
 import { cn } from "@/lib/cn";
+import { itemIoRefOf } from "@/lib/item-io";
+import { ItemIoBlocks, useItemIo } from "./ItemIoBlocks";
 
 const ICONS: Record<ToolKind, LucideIcon> = {
   read: FileText,
@@ -52,9 +54,28 @@ export function formatStepDuration(ms: number | undefined): string | null {
   return seconds ? `${minutes}m${seconds}s` : `${minutes}m`;
 }
 
-export function ToolLine({ message, actor }: { message: Message; actor?: string }) {
+export function ToolLine({
+  message,
+  actor,
+  threadId,
+  defaultOpen = false,
+}: {
+  message: Message;
+  actor?: string;
+  /** The thread this row belongs to.  With it, opening the row reads the
+   * step's full input and output from the harness; without it (a view that
+   * does not know its thread) the row shows the headline it has always shown. */
+  threadId?: string;
+  /** Start opened.  The chat never passes this; tests render the open row. */
+  defaultOpen?: boolean;
+}) {
   const tool = message.tool;
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(defaultOpen);
+  // The step's key in the harness's side store.  Null for a row recorded before
+  // the harness kept one, which then says so when opened.
+  const ioRef = itemIoRefOf(threadId, tool);
+  // A step still running has written no output yet: show what is there, keep nothing.
+  const io = useItemIo(ioRef, open, tool?.ok !== undefined);
   if (!tool) return null;
 
   const running = tool.ok === undefined;
@@ -72,15 +93,51 @@ export function ToolLine({ message, actor }: { message: Message; actor?: string 
   const named = verb !== tool.name ? tool.name : undefined;
   const line = failed ? (tool.detail ?? tool.target ?? named) : (tool.target ?? named);
   const duration = formatStepDuration(tool.durationMs);
-  // only a step with something more to say is worth a disclosure triangle
-  const expandable = Boolean(tool.detail && !failed) || Boolean(failed && tool.target);
+  // Expandable whenever there is detail OR a target (like a command or file path) to view,
+  // or the harness may hold the step's whole input and output
+  const hasTarget = Boolean(tool.target && tool.target !== tool.name);
+  const hasDetail = Boolean(tool.detail);
+  const expandable = hasDetail || hasTarget || ioRef !== null;
   const time = new Date(message.at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
-  const title = `${actor ? `${actor} · ` : ""}${tool.name}${
+  // A helper's (native subagent's) step hangs under the row that started the
+  // helper: indented, with a rule down its left edge, so parallel helpers'
+  // work reads as theirs and not as the bot's own (full Helper cards: P3).
+  const helperStep = Boolean(tool.parentItemId);
+  const title = `${actor ? `${actor} · ` : ""}${helperStep ? "helper · " : ""}${tool.name}${
     tool.target ? ` · ${tool.target}` : ""
   } · ${time}${failed ? " · failed" : running ? " · running" : ""}`;
 
+  // The clipped headline the row has always had: what the step acted on and
+  // one line of what came back.  The fallback whenever the full payload is not
+  // there, and the whole of it for a row with no key.
+  const targetBlock = tool.target ? (
+    <div className="flex flex-col gap-0.5">
+      <span className="text-[10px] font-semibold uppercase tracking-wider text-ink-secondary/70">
+        {kind === "execute" ? "Command" : kind === "read" || kind === "edit" ? "File" : "Target"}
+      </span>
+      <pre className="whitespace-pre-wrap break-words font-mono text-[11.5px] leading-relaxed text-ink font-medium select-text">
+        {tool.target}
+      </pre>
+    </div>
+  ) : null;
+  const detailBlock = tool.detail ? (
+    <div className="flex flex-col gap-0.5">
+      {tool.target && (
+        <span className={cn("text-[10px] font-semibold uppercase tracking-wider", failed ? "text-danger/90" : "text-ink-secondary/70")}>
+          {failed ? "Error Details" : "Output"}
+        </span>
+      )}
+      <pre className={cn("whitespace-pre-wrap break-words font-mono text-[11.5px] leading-relaxed select-text", failed ? "text-danger" : "text-ink-secondary")}>
+        {tool.detail}
+      </pre>
+    </div>
+  ) : null;
+
   return (
-    <div className="flex w-full flex-col">
+    <div
+      className={cn("flex w-full flex-col", helperStep && "ml-4 w-[calc(100%-1rem)] border-l border-hairline/70 pl-1.5")}
+      data-helper-step={helperStep ? tool.parentItemId : undefined}
+    >
       <div
         className={cn(
           "group/step flex w-full items-baseline gap-2 rounded-md px-1.5 py-[3px] text-[13px] leading-6",
@@ -116,7 +173,7 @@ export function ToolLine({ message, actor }: { message: Message; actor?: string 
                 className={cn(
                   "min-w-0 truncate",
                   failed ? "text-danger" : "select-text text-ink-secondary",
-                  !failed && (kind === "read" || kind === "edit") && "font-mono text-[12px]",
+                  !failed && (kind === "read" || kind === "edit" || kind === "execute") && "font-mono text-[12px]",
                 )}
                 // A failed step clips its reason to one line, and one with
                 // no target has no disclosure triangle either — so the reason
@@ -130,7 +187,12 @@ export function ToolLine({ message, actor }: { message: Message; actor?: string 
             </>
           )}
           {expandable && (
-            <span className="shrink-0 text-ink-secondary/40 opacity-0 transition-opacity group-hover/step:opacity-100">
+            <span
+              className={cn(
+                "shrink-0 text-ink-secondary/50 transition-opacity",
+                open ? "opacity-100" : "opacity-40 group-hover/step:opacity-100",
+              )}
+            >
               {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
             </span>
           )}
@@ -140,13 +202,33 @@ export function ToolLine({ message, actor }: { message: Message; actor?: string 
         )}
       </div>
       {open && (
-        <div className="mb-1 ml-7 max-h-56 overflow-auto rounded-lg border border-hairline/40 bg-panel/70 px-3 py-2">
-          {failed && tool.target && (
-            <div className="mb-1 truncate font-mono text-[11px] text-ink-secondary" title={tool.target}>{tool.target}</div>
+        <div
+          className={cn(
+            "mb-1 ml-7 flex flex-col gap-1.5 overflow-auto rounded-lg border border-hairline/40 bg-panel/70 p-2.5",
+            ioRef ? "max-h-[32rem]" : "max-h-64",
           )}
-          <pre className="whitespace-pre-wrap break-words font-mono text-[11.5px] leading-relaxed text-ink-secondary select-text">
-            {tool.detail}
-          </pre>
+        >
+          {threadId ? (
+            <ItemIoBlocks
+              state={ioRef ? io.state : { status: "unavailable" }}
+              failed={failed}
+              subject={tool.name}
+              onRetry={io.retry}
+              headline={targetBlock}
+              fallback={
+                <>
+                  {targetBlock}
+                  {detailBlock}
+                </>
+              }
+              outputFallback={detailBlock}
+            />
+          ) : (
+            <>
+              {targetBlock}
+              {detailBlock}
+            </>
+          )}
         </div>
       )}
     </div>

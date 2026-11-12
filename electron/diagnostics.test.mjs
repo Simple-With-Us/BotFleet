@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import { createRequire } from "node:module";
 import { readFileSync } from "node:fs";
 
+import { CREDENTIAL_TOKEN_PATTERNS } from "../shared/redact.ts";
+
 const require = createRequire(import.meta.url);
 const {
   buildDiagnosticsReport,
@@ -22,6 +24,71 @@ describe("credential env parity with server/config.ts", () => {
     expect(match).not.toBeNull();
     const names = [...match[1].matchAll(/"([A-Z0-9_]+)"/g)].map((m) => m[1]);
     expect(CREDENTIAL_ENV_NAMES).toEqual(names);
+  });
+});
+
+// S13, second half. The token-shape list in diagnostics.mjs is the same
+// mechanical copy as CREDENTIAL_ENV_NAMES above, and for the same reason: this
+// shell is plain `.mjs` on Electron's own Node with no transpile step, so it
+// cannot import shared/redact.ts at runtime. The difference is that the copy
+// is now checked against the redactor's own export — pattern by pattern,
+// `.source` for `.source` — rather than against nothing. A bug report is
+// pasted into a public issue, so a shape the redactor knows and this list
+// does not is a credential shipped in the clear, and that is exactly the
+// drift the audit found: four of the five added shapes were missing here when
+// the two lists were each maintained by hand.
+describe("credential shape parity with shared/redact.ts", () => {
+  it("carries every shape the redactor knows, in the same order", () => {
+    const source = readFileSync(new URL("./diagnostics.mjs", import.meta.url), "utf8");
+    const block = source.match(/const CREDENTIAL_TOKEN_FORMATS = \[([\s\S]*?)\n\];/);
+    expect(block, "CREDENTIAL_TOKEN_FORMATS is no longer a plain array literal").not.toBeNull();
+    // The same pattern literals, read out of the array rather than imported —
+    // importing them would require exporting the const, and a copy that
+    // cannot be reached from the test is a copy nothing pins.
+    const copied = [...block[1].matchAll(/\/(.+)\/([a-z]*)/g)].map((m) => m[1]);
+    expect(copied).toEqual(CREDENTIAL_TOKEN_PATTERNS.map((token) => token.source));
+  });
+
+  it("redacts every value the shared redactor's S13 shapes are there for", () => {
+    // Assembled at runtime so no credential-shaped literal sits in the source.
+    const alpha = "abcdefghijklmnopqrstuvwxyz0123456789";
+    const samples = [
+      ["stripe live", ["sk", "_live_", alpha.slice(0, 14)].join("")],
+      ["stripe test", ["sk", "_test_", alpha.slice(0, 14)].join("")],
+      ["generic access key", ["ak", "_", alpha].join("")],
+      ["webhook signing secret", ["wh", "sec_", "test", "_", "fake"].join("")],
+      ["google oauth", ["ya29", ".", "fake"].join("")],
+      ["gitlab pat", ["glpat", "-", "fake0000"].join("")],
+      ["gitlab deploy", ["gldt", "-", "fake0000"].join("")],
+      ["gitlab runner", ["glrt", "-", "fake0000"].join("")],
+      ["gitlab runner registration", ["glrtr", "-", "fake0000"].join("")],
+      ["slack app", ["xapp", "-", "fake000000000000000000"].join("")],
+      ["infisical service token", ["st", ".", "fake0000000000000000000"].join("")],
+    ];
+    for (const [label, sample] of samples) {
+      const out = redactSecretsInLine(`login failed while sending ${sample}`);
+      expect(out, `${label}: ${sample}`).not.toContain(sample);
+      expect(out).toMatch(/«redacted \d+ chars»/);
+    }
+  });
+
+  it("masks a DOTTED infisical service token whole, not just its first segment", () => {
+    // Infisical issues `st.<uuid>.<segment>.<segment>`.  A pattern that
+    // stops at the first dot masks the uuid and leaves the two secret
+    // segments in the clear, which is the whole credential.
+    const token = [
+      "st",
+      ".",
+      "11111111-2222-3333-4444-555555555555",
+      ".",
+      "abcdefabcdefabcdefabcdefabcdefab",
+      ".",
+      "0123456789abcdef0123456789abcdef",
+    ].join("");
+    const out = redactSecretsInLine(`login failed while sending ${token}`);
+    expect(out).not.toContain("abcdefabcdefabcdefabcdefabcdefab");
+    expect(out).not.toContain("0123456789abcdef0123456789abcdef");
+    expect(out).not.toContain(token);
   });
 });
 
@@ -110,6 +177,28 @@ describe("buildDiagnosticsReport", () => {
     expect(report).not.toContain("sk-proj-abcdefghijklmnop");
     expect(report).not.toContain("abcdefghijklmnop");
     expect(report).not.toContain("hunter2000");
+    expect(report).toContain("«redacted");
+  });
+
+  it.each([
+    "sk" + "_live_abcdefghijklmnopqrstuvwxyz0123456789",
+    "sk" + "_test_abcdefghijklmnopqrstuvwxyz0123456789",
+    "wh" + "sec_abcdefghijklmnopqrstuvwxyz0123456789",
+    "ya29" + ".abcdefghijklmnopqrstuvwxyz0123456789abcdefghij",
+    "glpat" + "-abcdefghijklmnopqrst",
+    "gldt" + "-abcdefghijklmnopqrst",
+    "glrt" + "-abcdefghijklmnopqrst",
+    "glrtr" + "-abcdefghijklmnopqrst",
+    "xapp" + "-abcdefghijklmnopqrst",
+  ])("masks the issued-credential shape %s", (token) => {
+    // S13: credential shapes BotFleet itself issues or stores must not ride
+    // out in a diagnostics bundle.
+    const report = buildDiagnosticsReport({
+      appInfo,
+      configSummary: {},
+      logTail: `token ${token} ok`,
+    });
+    expect(report).not.toContain(token);
     expect(report).toContain("«redacted");
   });
 

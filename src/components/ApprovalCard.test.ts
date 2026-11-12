@@ -3,8 +3,14 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 
 import { ApprovalCard } from "./ApprovalCard";
-import { spokenApprovalPrompt, type Pending } from "./PendingApproval";
-import type { Message } from "@/state/store";
+import {
+  PendingApprovalActions,
+  PendingApprovalPanel,
+  pendingApprovalLabel,
+  spokenApprovalPrompt,
+  type Pending,
+} from "./PendingApproval";
+import { StoreProvider, type Message } from "@/state/store";
 
 const routineRequest = {
   version: 1 as const,
@@ -69,7 +75,7 @@ describe("ApprovalCard routine proposals", () => {
 
     const markup = renderToStaticMarkup(createElement(ApprovalCard, { message }));
     expect(markup).toContain("Delete “Daily inbox”?");
-    expect(markup).toContain("Routine deleted");
+    expect(markup).toContain("Routine Deleted");
   });
 
   it("does not imply a run-now request has already started", () => {
@@ -93,7 +99,7 @@ describe("ApprovalCard routine proposals", () => {
     };
 
     const markup = renderToStaticMarkup(createElement(ApprovalCard, { message }));
-    expect(markup).toContain("Routine run queued");
+    expect(markup).toContain("Routine Run Queued");
     expect(markup).not.toContain("Routine started");
   });
 
@@ -125,5 +131,88 @@ describe("ApprovalCard routine proposals", () => {
     expect(spoken).toContain("Review the schedule and instructions on screen");
     expect(spoken).not.toContain("Review every item in the backlog");
     expect(spoken.length).toBeLessThan(200);
+  });
+});
+
+describe("a background job's approval", () => {
+  const message: Message = {
+    id: "job-card",
+    role: "bot",
+    kind: "options",
+    at: 1,
+    card: { title: "Approve?", subtitle: "job: pnpm test", options: ["Allow", "Deny"], requestId: "req-job", tool: "job_start" },
+  };
+
+  it("says a background job is starting, and that it keeps running after Allow", () => {
+    const markup = renderToStaticMarkup(createElement(ApprovalCard, { message }));
+    expect(markup).toContain("Wants to start a background job");
+    expect(markup).not.toContain("job start");
+    expect(markup).toContain("keeps running in the background after you allow it.\u00a0 You can stop it");
+    expect(markup).not.toContain("&nbsp;");
+  });
+
+  it("names the job approval in the composer strip", () => {
+    expect(pendingApprovalLabel({ message, requestId: "req-job", tool: "job_start", detail: "job: pnpm test" })).toBe("Background job approval requested");
+  });
+});
+
+describe("PendingApprovalPanel and Actions", () => {
+  const pending: Pending = {
+    message: {
+      id: "msg-1",
+      role: "bot",
+      kind: "options",
+      at: 1,
+      card: { title: "Approve bash?", subtitle: "ls -la", options: ["Allow", "Deny"], requestId: "req-1", tool: "Bash" },
+    },
+    requestId: "req-1",
+    tool: "Bash",
+    detail: "ls -la",
+  };
+
+  it("shows Bypass Active pill when bypassActive is true", () => {
+    const markup = renderToStaticMarkup(
+      createElement(PendingApprovalPanel, {
+        pending,
+        count: 1,
+        index: 0,
+        bypassActive: true,
+      }),
+    );
+    expect(markup).toContain("Bypass Active");
+  });
+
+  it("shows Approve All button when totalCount is greater than 1", () => {
+    const markup = renderToStaticMarkup(
+      createElement(
+        StoreProvider,
+        null,
+        createElement(PendingApprovalActions, {
+          pending,
+          threadId: "th-1",
+          totalCount: 4,
+          onCancelTurn() {},
+        }),
+      ),
+    );
+    expect(markup).toContain("Approve All (4)");
+    expect(markup).toContain("Allow Once");
+  });
+
+  it("omits Approve All button when totalCount is 1", () => {
+    const markup = renderToStaticMarkup(
+      createElement(
+        StoreProvider,
+        null,
+        createElement(PendingApprovalActions, {
+          pending,
+          threadId: "th-1",
+          totalCount: 1,
+          onCancelTurn() {},
+        }),
+      ),
+    );
+    expect(markup).not.toContain("Approve All");
+    expect(markup).toContain("Allow Once");
   });
 });

@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>BotFleet Avatars — FleetLink Hub</title>
+<style>
+  :root { --bg:#0b0d12; --card:#151922; --text:#e8eaed; --muted:#9aa0a6; --accent:#22d3ee; --line:#2a3140; --ok:#34d399; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif;
+    background: var(--bg); color: var(--text); line-height: 1.55; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  header { padding: 2rem 1.5rem 1rem; max-width: 1100px; margin: 0 auto; }
+  h1 { font-size: 1.75rem; margin: 0 0 .35rem; letter-spacing: -.02em; }
+  /* Keep two ASCII spaces visibly wider (HTML would collapse them otherwise). */
+  .prose, .sub, footer p, .ok { white-space: pre-wrap; max-width: 70ch; }
+  .sub, .ok { color: var(--muted); }
+  .ok { color: var(--ok); font-size: .85rem; }
+  main { max-width: 1100px; margin: 0 auto; padding: 0 1.5rem 3rem; }
+  section { margin: 1.75rem 0; }
+  h2 { font-size: 1.1rem; margin: 0 0 .75rem; border-bottom: 1px solid var(--line); padding-bottom: .4rem; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: .75rem; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: .75rem;
+    display: flex; flex-direction: column; gap: .45rem; color: inherit; }
+  .card:hover { border-color: var(--accent); text-decoration: none; }
+  .card img { width: 100%; aspect-ratio: 1; object-fit: contain; background: #000; border-radius: 8px; }
+  .card .name { font-weight: 600; font-size: .9rem; text-transform: capitalize; }
+  .card .meta { font-size: .75rem; color: var(--muted); }
+  .links { display: grid; gap: .45rem; }
+  .links a { display: block; padding: .55rem .7rem; background: var(--card); border: 1px solid var(--line);
+    border-radius: 8px; }
+  .pill { display: inline-block; font-size: .7rem; padding: .15rem .45rem; border-radius: 999px;
+    background: #1e293b; color: var(--accent); margin-left: .35rem; }
+  footer { max-width: 1100px; margin: 0 auto; padding: 1rem 1.5rem 2rem; color: var(--muted); font-size: .8rem; }
+  code { font-size: .85em; background: #1a1f2a; padding: .1rem .3rem; border-radius: 4px; }
+  pre { background: #1a1f2a; padding: .75rem 1rem; border-radius: 8px; overflow-x: auto; font-size: .8rem; }
+</style>
+<meta name="apple-itunes-app" content="app-clip-bundle-id=online.fleetlink.Clip, app-clip-display=card"/>
+</head>
+<body>
+<header>
+  <h1>BotFleet Avatars <span class="pill">one FleetLink hub</span></h1>
+  <p class="sub">TV-Face packs, color skins, SVG runtimes, OrbBot, mouth science, packaging rules, and the agent handoff live here.  Humans and agents can start from this single page.</p>
+  <p class="ok">Portal status: docs and skins are live.  Mega zip downloads hit Cloudflare 413, so use per-skin file URLs instead.</p>
+</header>
+<main>
+
+<section>
+  <h2>Start Here (agents)</h2>
+  <div class="links">
+    <a href="docs/TV-FACE-AVATAR-SYSTEM-HANDOFF.md"><strong>System handoff</strong> — avatar, app, and speaking/karaoke bold-text design</a>
+    <a href="docs/AGENT-HUB.md"><strong>Agent hub</strong> — art science read order</a>
+    <a href="docs/AVATAR-PACKAGING-GUIDELINES.md"><strong>Packaging guidelines</strong> — BotFleet filesystem and 40-expression contract</a>
+    <a href="docs/CODE-ANIMATION-FEASIBILITY.md">Code animation feasibility (SVG vs film)</a>
+    <a href="docs/HOW-WE-DID-IT.md">Bookend identity engineering</a>
+    <a href="docs/MOUTH.md">Mouth landmarks</a>
+    <a href="docs/MOUTH-CHROMA.md">Mouth chroma key</a>
+    <a href="docs/COLOR-RECOLOR-PROCESS.md">Multi-tone casing recolor</a>
+    <a href="docs/voice-mode.md">BotFleet voice mode (TTS clock for karaoke)</a>
+    <a href="docs/SVG-BLOUB-NOTES.md"><strong>SVG craft notes</strong> — bloub inspiration for pure sample(t)</a>
+    <a href="downloads/avatar-docs-hub.zip"><strong>Download docs zip</strong> (small agent pack)</a>
+  </div>
+</section>
+
+<section>
+  <h2>Live Demos</h2>
+  <div class="links">
+    <a href="code/tv-face/demo.html"><strong>TV-Face SVG v4</strong> — pure sample(t), per-state morph, blinkIn, freeze-on-chain</a>
+    <a href="code/orbbot/demo.html"><strong>OrbBot</strong> — next avatar scaffold</a>
+    <a href="code/compare.html">Compare TV-Face vs OrbBot</a>
+    <a href="index.html">Original TV-Face gallery (MP4 clips)</a>
+    <a href="hub/colors.html">Color skins gallery</a>
+    <a href="hub/fleet-live.html">Multi-bot live demo (6 bots, about 1 min)</a>
+    <a href="ALL_STATES_REVIEW.mp4">All-states review reel</a>
+  </div>
+</section>
+
+<section>
+  <h2>BotFleet GIF Skins (app-ready)</h2>
+  <p class="sub" style="margin-top:0">Path pattern: <code>botfleet-skins/{color}/stills|gifs/…</code>.  <code>orange</code> mirrors <code>default</code>.  Green shell uses red face glyphs by design.</p>
+  <div class="grid" id="skins"></div>
+</section>
+
+<section>
+  <h2>Downloads</h2>
+  <div class="links">
+    <a href="downloads/avatar-docs-hub.zip">avatar-docs-hub.zip — handoff, packaging, mouth, and voice docs</a>
+    <a href="downloads/README.md">Why mega zips failed (413) and how to pull full skins</a>
+  </div>
+  <p class="sub">Full skin trees are already hosted as individual files, not one giant zip.  Cloudflare rejected multi-hundred-MB zip uploads.  Per-file paths work.</p>
+  <pre>BASE=https://fleetlink.online/TV-Face/botfleet-skins
+# Example: open one color pack in the browser
+# $BASE/green/stills/resting.png
+# $BASE/green/gifs/speaking_hold.gif</pre>
+</section>
+
+<section>
+  <h2>URL Map</h2>
+  <div class="links">
+    <a href="botfleet-skins/default/stills/resting.png">default resting still</a>
+    <a href="botfleet-skins/green/stills/resting.png">green resting</a>
+    <a href="botfleet-skins/purple/gifs/speaking_hold.gif">purple speaking_hold.gif</a>
+    <a href="botfleet/gifs/speaking_hold.gif">legacy botfleet/gifs speaking_hold</a>
+    <a href="gifs/transparent/think_enter_transparent.gif">transparent think_enter GIF</a>
+    <a href="variants/purple/stills/resting.png">variant purple resting</a>
+    <a href="stills/resting.png">master resting.png</a>
+  </div>
+</section>
+
+<section>
+  <h2>Product Contract</h2>
+  <p class="sub">Every enter first frame and return last frame equals shared resting.  Shell may move mid-clip.  Casing is theme.  Mouth is a speech data channel.  Spoken words go bold in a <em>separate</em> text field while the avatar speaks.</p>
+</section>
+
+<section>
+  <h2>SVG craft notes</h2>
+  <p class="sub">The TV-Face SVG runtime follows animation craft from <a href="https://bloub.vercel.app">bloub</a>: pure <code>sample(t)</code>, per-state morph durations, ease-out morphs, freeze-on-chain mid-fade, blinkIn on entry, and rest liveliness from gaze plus blink.  The silhouette stays TV-Face.  We are not recreating the x.ai blob.</p>
+</section>
+
+</main>
+<footer>
+  <p class="prose">Hub for fleet agents.  Base <code>https://fleetlink.online/TV-Face/</code>.  Updated 2026-10-01 CDT.  Fleet prose uses two ASCII spaces after sentence terminators (visible via pre-wrap on this page).</p>
+</footer>
+<script>
+const colors = ['default','orange','blue','green','purple','pink','red','cyan','yellow','teal','coral','white','black'];
+const root = document.getElementById('skins');
+for (const c of colors) {
+  const a = document.createElement('a');
+  a.className = 'card';
+  a.href = `botfleet-skins/${c}/stills/resting.png`;
+  a.innerHTML = `<img loading="lazy" src="botfleet-skins/${c}/stills/resting.png" alt="${c} resting"/><div class="name">${c}</div><div class="meta">stills + gifs</div>`;
+  root.appendChild(a);
+}
+</script>
+</body>
+</html>

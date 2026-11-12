@@ -1,0 +1,90 @@
+{
+  "_comment": "Fleet TestFlight audit config for fleet-tf-audit.mjs.  Bundle ids were derived by reading each sibling clone under /workspace (scripts/ios-fleet/apps.json first, then project.yml).  Expected marketing version is the fleet policy value: 0.1.0 for every app except Congress.Trade (1.1.2).  A MAC_OS bundle id is listed only where the app ships a macOS build through App Store Connect, so check (c) compares the two platforms of one release.",
+  "apps": [
+    {
+      "app": "BotFleet",
+      "expectedMarketingVersion": "0.1.0",
+      "bundleIds": {
+        "IOS": "app.botfleet.ios"
+      },
+      "notes": "Source: BotFleet scripts/ios-fleet/apps.json (app.botfleet.ios, fixedMarketingVersion 0.1.0).  The macOS app (app.botfleet.macos) is the Electron app distributed outside App Store Connect, so no MAC_OS bundle is audited here."
+    },
+    {
+      "app": "Clutch",
+      "expectedMarketingVersion": "0.1.0",
+      "bundleIds": {
+        "IOS": "codes.clutch.ios"
+      },
+      "notes": "Source: Clutch scripts/ios-fleet/apps.json (codes.clutch.ios).  App Store Connect has no Clutch macOS record (checked 2026-11-01), so no MAC_OS bundle is audited."
+    },
+    {
+      "app": "Usage-Monitor",
+      "expectedMarketingVersion": "0.1.0",
+      "bundleIds": {
+        "IOS": "com.simplewithus.usage.client.ios"
+      },
+      "notes": "Source: Usage-Monitor scripts/ios-fleet/apps.json, usage entry (com.simplewithus.usage.client.ios, fixedMarketingVersion 0.1.0).  The macOS build is paired through the Sparkle appcast (pairedBuildFeed), not App Store Connect.  The separate Local Monitor record (com.simplewithus.usage.local.ios) is not covered by this entry."
+    },
+    {
+      "app": "DealDex",
+      "expectedMarketingVersion": "0.1.0",
+      "bundleIds": {
+        "IOS": "net.dealdex"
+      },
+      "notes": "Source: DealDex scripts/ios-fleet/apps.json (net.dealdex, fixedMarketingVersion 0.1.0).  No macOS target ships."
+    },
+    {
+      "app": "FleetLink",
+      "expectedMarketingVersion": "0.1.0",
+      "bundleIds": {
+        "IOS": "online.fleetlink.ios"
+      },
+      "notes": "Source: FleetLink scripts/ios-fleet/apps.json (online.fleetlink.ios).  No macOS target ships."
+    },
+    {
+      "app": "ContactLogo",
+      "expectedMarketingVersion": "0.1.0",
+      "bundleIds": {
+        "IOS": "com.contactlogo",
+        "MAC_OS": "com.contactlogo.macos"
+      },
+      "notes": "App Store Connect lists the iOS app as com.contactlogo and the Mac app as com.contactlogo.macos (checked 2026-11-01).  ContactLogo scripts/ios-fleet/apps.json names com.contactlogo.ios, which has no App Store Connect record."
+    },
+    {
+      "app": "Congress.Trade",
+      "expectedMarketingVersion": "1.1.2",
+      "bundleIds": {
+        "IOS": "trade.congress.ios"
+      },
+      "notes": "Source: Congress.Trade scripts/ios-fleet/apps.json (trade.congress.ios).  Expected marketing version 1.1.2 is the fleet policy exception for this app.  No macOS target ships."
+    },
+    {
+      "app": "Socratic-Trade",
+      "expectedMarketingVersion": "0.1.0",
+      "bundleIds": {
+        "IOS": "com.socratictrade.ios"
+      },
+      "notes": "Source: Socratic-Trade scripts/ios-fleet/apps.json (com.socratictrade.ios; the 2026-09-23 bundle rename record).  Older fleet copies still name the retired trade.socratic.app bundle.  No macOS target ships."
+    },
+    {
+      "app": "HogHunter",
+      "expectedMarketingVersion": "0.1.0",
+      "bundleIds": {
+        "IOS": "com.simplewithus.hoghunter.ios"
+      },
+      "notes": "Source: HogHunter project.yml (HogHunterIOS com.simplewithus.hoghunter.ios, HogHunter macOS com.simplewithus.hoghunter.macos).  HogHunter has no scripts/ios-fleet/apps.json.  App Store Connect has no HogHunter macOS record (checked 2026-11-01), so no MAC_OS bundle is audited."
+    },
+    {
+      "app": "CodeCaps",
+      "expectedMarketingVersion": "0.1.0",
+      "bundleIds": {
+        "IOS": "com.simplewithus.codecaps.ios"
+      },
+      "notes": "Source: CodeCaps scripts/ios-fleet/apps.json (com.simplewithus.codecaps.ios, fixedMarketingVersion 0.1.0).  The macOS build is paired through the Sparkle appcast (pairedBuildFeed), not App Store Connect, so no MAC_OS bundle is audited here even though project.yml declares com.simplewithus.codecaps.macos."
+    }
+  ],
+  "_todo": [
+    "Usage-Monitor Local Monitor (com.simplewithus.usage.local.ios) is a second App Store Connect record in the same repo and is not one of the 10 audited apps.  Add it as its own entry if the q6hr check should cover it.",
+    "CodeCaps and Usage-Monitor macOS builds ship outside App Store Connect (Sparkle appcast), so check (c) cannot compare them from ASC data.  Audit those pairings from the appcast if that coverage is wanted."
+  ]
+}

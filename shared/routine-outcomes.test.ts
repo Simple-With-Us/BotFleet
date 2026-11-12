@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { routineFailureCode, routineOutcomeCode, routineOutcomeSummary, type RoutineOutcomeRecord } from "./routine-outcomes";
+import { routineFailureCode, routineFailurePhase, routineOutcomeCode, routineOutcomeSummary, ROUTINE_OUTCOME_LABELS, type RoutineOutcomeRecord } from "./routine-outcomes";
 
 describe("routine execution outcomes", () => {
   it("keeps cancellation, denied capability, setup, and execution failure separate", () => {
@@ -44,4 +44,45 @@ describe("routine execution outcomes", () => {
     expect(summary.lastSuccessAt).toBe(now - 1);
   });
 
+});
+
+describe("engine_unavailable", () => {
+  it("keeps a setup-class spawn failure out of the generic dispatch bucket", () => {
+    // The reason this exists: an ENOENT spawn used to be recorded as
+    // `dispatch_failed`, which reads as a transient problem and is the one
+    // thing a recurring trigger will keep retrying.
+    expect(routineFailureCode("spawn_error", true)).toBe("engine_unavailable");
+    expect(routineFailureCode("setup_required", true)).toBe("engine_unavailable");
+  });
+
+  it("leaves a non-setup spawn failure as a dispatch failure", () => {
+    // Same word, different fact: a spawn that threw mid-flight says nothing
+    // about whether the engine can start, so it must not open a breaker.
+    expect(routineFailureCode("spawn_error", false)).toBe("dispatch_failed");
+  });
+
+  it("does not let the setup flag hijack an unrelated reason", () => {
+    expect(routineFailureCode("tool_round_limit", true)).toBe("budget_exhausted");
+    expect(routineFailureCode("interrupted", true)).toBe("cancelled");
+  });
+
+  it("files an engine failure under the dispatch phase", () => {
+    expect(routineFailurePhase("engine_unavailable")).toBe("dispatch");
+    expect(ROUTINE_OUTCOME_LABELS.engine_unavailable).toBe("Engine unavailable");
+  });
+});
+
+describe("budget_exhausted", () => {
+  it("separates a spent round budget from a crash", () => {
+    // A turn that hit its ceiling did real work and stopped on a line the
+    // owner set.  Calling that `execution_failed` made a budget decision
+    // indistinguishable from a broken driver in receipts and digests.
+    expect(routineFailureCode("tool_round_limit")).toBe("budget_exhausted");
+    expect(routineFailureCode("runtime_error")).toBe("execution_failed");
+  });
+
+  it("files budget exhaustion under execution, not dispatch", () => {
+    expect(routineFailurePhase("budget_exhausted")).toBe("execution");
+    expect(ROUTINE_OUTCOME_LABELS.budget_exhausted).toBe("Round budget reached");
+  });
 });

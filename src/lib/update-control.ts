@@ -11,7 +11,7 @@
 // Everything here is either a fetch or a pure string: the components own the
 // markup, this file owns the wording and the decision about which path is
 // live, so both can be tested without rendering anything.
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 
 /** The gap protocol's wide sentence break, for copy a person reads. */
 const GAP = "\u00a0 ";
@@ -32,8 +32,29 @@ export interface UpdateRunning {
   runId: string;
   startedAt: string;
   step: string;
+  /** What the step is waiting on ("Waiting for 3 bots to finish"), when the
+   * updater says.  Absent from an older harness, and most of the time. */
+  detail?: string;
   progress?: number;
   logTail: string[];
+}
+
+/** An update is holding new work while bots finish (`UpdateStatus.drain`).
+ * Counts and times, epoch milliseconds, from the harness's own clock. */
+export interface UpdateDrain {
+  startedAt: number;
+  /** The latest the restart begins: the end of the updater's own window.  The
+   * hold ends by then, or the update is called off and everything runs. */
+  windowEndsAt: number;
+  /** When the harness gives the hold up by itself.  Past this, a screen still
+   * showing the hold is showing a harness that went away. */
+  deadline: number;
+  /** Bots mid-turn: what the update is waiting for. */
+  bots: number;
+  /** Live room turns, which an update will not interrupt. */
+  rooms: number;
+  /** What is saved and waiting rather than running. */
+  held: { sends: number; rooms: number; routineRuns: number };
 }
 
 export type UpdateOutcome = "verified" | "rolled-back" | "failed" | "refused";
@@ -65,7 +86,13 @@ export interface UpdateStatus {
      * harness that has never heard of it, so every read of this falls back
      * to the harness's own sentence at that index. */
     codes?: string[];
+    /** Bots are working.  Not a blocker: the update gives them a short grace,
+     * then pauses and resumes them.  Absent from an older harness. */
+    busy?: boolean;
   };
+  /** Present only while an update is holding new work for bots to finish,
+   * whether or not the harness started the run.  Absent from an older harness. */
+  drain?: UpdateDrain;
 }
 
 /** The event the store re-broadcasts when an `update.status` frame lands. */
@@ -201,13 +228,101 @@ export function availableLabel(status: UpdateStatus): string | null {
   return `Update Available: ${name}, ${commits}`;
 }
 
+/** The percent to draw beside a running step, or null when there is none worth
+ * drawing.
+ *
+ * `progress` counts the run's own steps and stays where it is while a step
+ * waits on something outside it: bots finishing, a process letting go of
+ * BotFleet's files.  "Waiting for 3 bots to finish (40%)" read as 40% of the
+ * wait, and sat there for a minute.  So a wait detail replaces the percent on
+ * every surface that draws one (this label, the banner's bar, the phone), and
+ * the percent comes back with the next step that has no detail. */
+export function runningPercent(running: UpdateRunning): number | null {
+  const { progress, detail } = running;
+  if (progress === undefined || !Number.isFinite(progress) || detail) return null;
+  return Math.round(Math.min(1, Math.max(0, progress)) * 100);
+}
+
 /** Sentence case, present tense, and never a percentage the updater did not
- * actually report. */
+ * actually report, nor one that has stopped moving. */
 export function runningLabel(running: UpdateRunning): string {
-  const percent = typeof running.progress === "number"
-    ? ` (${Math.round(Math.min(1, Math.max(0, running.progress)) * 100)}%)`
-    : "";
-  return `${running.step}${percent}…`;
+  const percent = runningPercent(running);
+  return `${running.detail ?? running.step}${percent === null ? "" : ` (${percent}%)`}…`;
+}
+
+/** The hold, when this build can trust what the harness sent.  Finite numbers
+ * only: `Number.isFinite` does not coerce, so a string or a missing field is
+ * not one. */
+export function isUpdateDrain(value: UpdateDrain | null | undefined): value is UpdateDrain {
+  if (!value?.held) return false;
+  const { startedAt, windowEndsAt, deadline, bots, rooms, held } = value;
+  return [startedAt, windowEndsAt, deadline, bots, rooms, held.sends, held.rooms, held.routineRuns]
+    .every((count) => Number.isFinite(count));
+}
+
+/** The hold that is still worth showing at `now`.  One whose lease has run
+ * out is a harness that went away mid-update: the restart itself, which the
+ * next status answer clears. */
+export function activeDrain(status: Pick<UpdateStatus, "drain"> | null | undefined, now: number): UpdateDrain | null {
+  const drain = status?.drain;
+  return isUpdateDrain(drain) && now < drain.deadline ? drain : null;
+}
+
+/** How long a person should expect to wait, as they would say it: "about 40
+ * seconds", "about 4 minutes", or null when it is nearly over.  Rounded up
+ * on purpose; a wait that ends early costs nobody anything. */
+export function waitLabel(ms: number): string | null {
+  if (!Number.isFinite(ms) || ms <= 5_000) return null;
+  if (ms < 90_000) return `about ${Math.ceil(ms / 10_000) * 10} seconds`;
+  return `about ${Math.ceil(ms / 60_000)} minutes`;
+}
+
+/** When the restart begins, as the end of a sentence. */
+function restartTiming(drain: UpdateDrain, now: number): string {
+  const label = waitLabel(drain.windowEndsAt - now);
+  return label ? `The restart begins within ${label}.` : "The restart begins shortly.";
+}
+
+/** Messages saved for after the restart: a send waiting in a bot's queue, or
+ * a room round waiting for its bots to speak. */
+export function heldMessageCount(drain: UpdateDrain): number {
+  return drain.held.sends + drain.held.rooms;
+}
+
+/**
+ * What a chat or a room says while an update holds new work.
+ *
+ * The harness accepts a message sent now and keeps it: it neither runs nor
+ * errors until the restart.  With nothing said, a bot looks stuck and a room
+ * goes quiet.  The counts are the whole harness's, not this thread's, so
+ * nothing here claims a message of THIS thread is among them; it says what
+ * happens to the one being typed.
+ */
+export function drainNoticeCopy(drain: UpdateDrain, now: number): string {
+  return `BotFleet is updating.${GAP}Messages you send now are saved and will run after the restart.${GAP}${restartTiming(drain, now)}`;
+}
+
+/** What the update's own card says about the hold, beside the step it is on:
+ * how many messages are waiting, and when the restart begins. */
+export function drainLabel(drain: UpdateDrain | null | undefined, now: number): string | null {
+  if (!drain) return null;
+  const held = heldMessageCount(drain);
+  const saved = held > 0
+    ? `${held} ${held === 1 ? "message is" : "messages are"} saved and will run after the restart.`
+    : "New messages are saved and will run after the restart.";
+  return `${saved}${GAP}${restartTiming(drain, now)}`;
+}
+
+/** The card's step line when an update is holding new work but this harness
+ * is not the one running it (an updater started from a terminal). */
+export const HOLDING_COPY = "Holding new work while running work finishes…";
+
+/** The queued-message chip's sentence in a chat.  A send held for an update
+ * waits for the restart, not for the bot, which is idle. */
+export function queuedChipLabel(input: { text: string; busyName: string; draining: boolean }): string {
+  return input.draining
+    ? `Saved — runs after the update restarts: “${input.text}”`
+    : `Queued — sends when ${input.busyName} finishes: “${input.text}”`;
 }
 
 /** A short local date and time for a finished run, or null when there is
@@ -332,16 +447,17 @@ export function installBlockedReason(status: UpdateStatus | null): string | null
  * looks like.
  */
 /**
- * Whether the selected blocker's reason is the transient busy one — the only
- * refusal `force` can talk past.  Reads the same first code
- * `installBlockedReason` renders, so a structural blocker that merely shares
- * the list with "busy" (an outdated updater on a working Mac, say) is never
- * misclassified as forceable and the real guidance is never swapped for
- * pause-and-resume copy.
+ * Whether installing now would pause busy bots.  Busy is not a blocker any
+ * more: the update holds new work, gives the bots a short grace to finish,
+ * then pauses what is left and resumes it after the restart.  True only when
+ * Install is actually available, so a structural blocker always wins.
  */
-export function installBlockedBusy(status: UpdateStatus | null): boolean {
-  return installBlockedReason(status) !== null && status?.capabilities.codes?.[0] === "busy";
+export function installPausesWork(status: UpdateStatus | null): boolean {
+  return Boolean(status?.available && !status.running && status.capabilities.canRun && status.capabilities.busy);
 }
+
+/** What a surface says when installing would pause busy bots. */
+export const PAUSES_WORK_COPY = "Busy bots get a minute to finish, then pause and resume after the update";
 
 export function installBlockedReasonDetail(status: UpdateStatus | null): string | null {
   if (!status?.available || status.running || status.capabilities.canRun) return null;
@@ -378,6 +494,7 @@ export function keepLocalError(local: string | null, next: UpdateStatus): string
  */
 export function bannerDismissKey(status: UpdateStatus): string {
   if (status.running) return `running:${status.running.runId}`;
+  if (isUpdateDrain(status.drain)) return "holding";
   const offer = status.available ? `available:${status.available.sourceCommit}` : "idle";
   const lastRun = status.lastRun ? `${status.lastRun.runId}@${status.lastRun.finishedAt}` : "none";
   return `${offer}|${lastRun}`;
@@ -386,7 +503,7 @@ export function bannerDismissKey(status: UpdateStatus): string {
 /** Whether the floating banner should show the harness card at all. */
 export function bannerIsActionable(status: UpdateStatus | null): boolean {
   if (!status) return false;
-  if (status.running) return true;
+  if (status.running || isUpdateDrain(status.drain)) return true;
   if (status.available) return true;
   return status.lastRun !== null && status.lastRun.outcome !== "verified";
 }
@@ -550,7 +667,9 @@ export function useUpdateControl(pollMs = 5_000): UpdateControlView {
     setBusy("install");
     setError(null);
     try {
-      const result = await requestUpdateRun(options ?? { force: true });
+      // No `force`: the harness's own default already never waits on busy
+      // bots for long, and it gives them a grace before pausing them.
+      const result = await requestUpdateRun(options ?? {});
       // The refusal's own status is the one that explains it — take it even
       // when the answer is no.
       if (result.status) setStatus(result.status);
@@ -565,4 +684,104 @@ export function useUpdateControl(pollMs = 5_000): UpdateControlView {
   // `error` is this session's own failure; the status carries the harness's
   // memory of the last failed check.  A remount has only the second one.
   return { status, error: visibleUpdateError(error, status), busy, check, install };
+}
+
+// ── the hold, for a chat or a room ───────────────────────────────────────
+//
+// A chat or a room only needs one fact — "an update is holding new work, and
+// until when" — and there can be several of them mounted at once (the
+// transcript's notice and the composer's queued chip).  They share one
+// watcher: a status fetch when the first mounts, the `update.status` push,
+// a refetch on focus, and a slow poll for as long as a hold lasts, as a
+// backstop for a dropped stream.  None of it runs when nothing is mounted.
+
+/** How often a hold is re-read when the stream stays quiet.  A hold lasts
+ * minutes at the most, and the harness pushes every change. */
+export const DRAIN_POLL_MS = 5_000;
+
+let sharedDrain: UpdateDrain | null = null;
+const drainListeners = new Set<() => void>();
+let stopDrainWatch: (() => void) | null = null;
+
+function sameDrain(a: UpdateDrain | null, b: UpdateDrain | null): boolean {
+  return a === b || (a !== null && b !== null && JSON.stringify(a) === JSON.stringify(b));
+}
+
+function watchDrain(): () => void {
+  let alive = true;
+  let poll: ReturnType<typeof setInterval> | null = null;
+
+  const arm = () => {
+    if (sharedDrain && !poll) poll = setInterval(refresh, DRAIN_POLL_MS);
+    if (!sharedDrain && poll) {
+      clearInterval(poll);
+      poll = null;
+    }
+  };
+  const adopt = (next: UpdateStatus | null) => {
+    // A failed fetch is a harness that is restarting, which is what an
+    // update does to it; it says nothing about the hold until it answers.
+    if (!alive || !next) return;
+    const drain = isUpdateDrain(next.drain) ? next.drain : null;
+    if (!sameDrain(drain, sharedDrain)) {
+      sharedDrain = drain;
+      for (const listener of drainListeners) listener();
+    }
+    arm();
+  };
+  function refresh() {
+    void fetchUpdateStatus().then(adopt);
+  }
+  const onPush = (event: Event) => {
+    const detail = event instanceof CustomEvent ? event.detail : null;
+    if (isUpdateStatus(detail)) adopt(detail);
+  };
+
+  refresh();
+  window.addEventListener(UPDATE_STATUS_EVENT, onPush);
+  window.addEventListener("focus", refresh);
+  return () => {
+    alive = false;
+    if (poll) clearInterval(poll);
+    window.removeEventListener(UPDATE_STATUS_EVENT, onPush);
+    window.removeEventListener("focus", refresh);
+  };
+}
+
+/** What the shared watcher knows right now. */
+export function currentDrain(): UpdateDrain | null {
+  return sharedDrain;
+}
+
+/** Start watching for the hold for as long as `listener` is subscribed.  The
+ * first listener starts the watcher and the last one stops it. */
+export function subscribeDrain(listener: () => void): () => void {
+  drainListeners.add(listener);
+  if (drainListeners.size === 1) stopDrainWatch = watchDrain();
+  return () => {
+    drainListeners.delete(listener);
+    if (drainListeners.size === 0) {
+      stopDrainWatch?.();
+      stopDrainWatch = null;
+      sharedDrain = null;
+    }
+  };
+}
+
+/** The hold an update has on new work right now, or null.  Re-renders only
+ * when the hold changes; use `useNow` beside it for a countdown. */
+export function useUpdateDrain(): UpdateDrain | null {
+  return useSyncExternalStore(subscribeDrain, currentDrain, () => null);
+}
+
+/** A clock that ticks only while something is showing a countdown. */
+export function useNow(intervalMs: number | null): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (intervalMs === null) return;
+    setNow(Date.now());
+    const timer = setInterval(() => setNow(Date.now()), intervalMs);
+    return () => clearInterval(timer);
+  }, [intervalMs]);
+  return now;
 }

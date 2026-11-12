@@ -55,15 +55,28 @@ export const ENGINE_FIXTURES: readonly EngineFixture[] = [
   },
   { displayName: "DSH", driverKind: "dshAgent", capabilities: { computerMcp: true, localComputerMcp: true } },
   { displayName: "Kimi", driverKind: "kimiAgent", capabilities: { computerMcp: true, localComputerMcp: true } },
+  // ZCode's driver spawns the CLI headless and declares no host MCP wiring.
+  { displayName: "ZCode", driverKind: "zcodeAgent", capabilities: {} },
+  // ZCode over the zcode-acp-server bridge mounts MCP like every other ACP
+  // harness (see drivers/acp/zcode.ts).
+  { displayName: "ZCode ACP", driverKind: "zcodeAcp", capabilities: { computerMcp: true, localComputerMcp: true } },
   { displayName: "Droid", driverKind: "droidAgent", capabilities: { computerMcp: true, localComputerMcp: true } },
   { displayName: "Cursor", driverKind: "cursorAgent", capabilities: { computerMcp: true, localComputerMcp: true } },
   { displayName: "OpenCode", driverKind: "opencodeGo", capabilities: { computerMcp: true, localComputerMcp: true } },
   { displayName: "Qwen", driverKind: "qwenAgent", capabilities: { computerMcp: true, localComputerMcp: true } },
   { displayName: "Hermes", driverKind: "hermesAgent", capabilities: { computerMcp: true, localComputerMcp: true } },
+  { displayName: "MiniMax Code", driverKind: "mcodeAgent", capabilities: { computerMcp: true, localComputerMcp: true } },
+  // Muse Code mounts MCP for the same reason every other ACP coding CLI does:
+  // the core answers every MCP flag from `mcpServers !== false`, and this
+  // driver does not opt out.
+  { displayName: "Muse Code", driverKind: "museAgent", capabilities: { computerMcp: true, localComputerMcp: true } },
 
   // The remote agent.  Its driver declares no computer flag at all: the turn
   // runs on the box, so there is nothing to mount.
-  { displayName: "Computer", driverKind: "boxAgent", capabilities: {} },
+  { displayName: "ASCII.dev Box", driverKind: "boxAgent", capabilities: {} },
+
+  // Generic CLI wrapper: spawns local processes without mounting a computer.
+  { displayName: "Generic CLI Wrapper", driverKind: "cli-wrapper", capabilities: {} },
 ];
 
 /** Cells that no shipped engine occupies but the derivation still has to
@@ -81,7 +94,7 @@ export const SYNTHETIC_FIXTURES: readonly EngineFixture[] = [
   // The box-native engine is asked again with host control declared, because
   // "runs somewhere else" has to beat a flag, not lose to it.
   {
-    displayName: "Computer with host control declared",
+    displayName: "ASCII.dev Box with host control declared",
     driverKind: "boxAgent",
     capabilities: { localComputerMcp: true },
   },
