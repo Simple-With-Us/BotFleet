@@ -51,18 +51,21 @@ const PRIMARY_PACK = {
   black: "tvface-black.webp",
 } satisfies Readonly<Partial<Record<TVFacePackSkin, string>>>;
 
-/** Thinking-focused pack (enter/hold/return denser).  Optional per color. */
+/** Thinking-focused pack (denser enter/hold/return).  Default family only. */
 const THINKING_PACK = {
   orange: "tvface-thinking.webp",
   default: "tvface-thinking.webp",
 } satisfies Readonly<Partial<Record<TVFacePackSkin, string>>>;
 
-/** Bot states that prefer the thinking pack when one is registered. */
-const THINKING_PACK_STATES: ReadonlySet<string> = new Set([
-  "thinking",
-  "working",
-  "computer",
+/**
+ * States that only the expanded default pack embeds today (beyond thin color
+ * shells' `*` / working / speaking).  Non-default colors keep the multi-GIF
+ * tree for these until their shells are re-expanded.
+ */
+const EXPANDED_DEFAULT_ONLY_STATES: ReadonlySet<string> = new Set([
+  "listening",
   "tools",
+  "computer",
   "memory",
   "fleet",
   "routine",
@@ -85,16 +88,20 @@ function packUrl(basename: string | undefined): string | null {
  */
 export function tvFaceOneFilePackUrl(color: TVFacePackSkin, state: string): string | null {
   const key: TVFacePackSkin = color === "default" ? "default" : color;
+  const isDefaultFamily = key === "orange" || key === "default";
 
-  if (THINKING_PACK_STATES.has(state)) {
-    // Only the default family ships a thinking pack.
-    const thinking =
-      key === "orange" || key === "default" ? packUrl(THINKING_PACK[key]) : undefined;
-    if (thinking) return thinking;
-    // A color without its own thinking pack keeps the multi-GIF tree for
-    // thinking-class states:  the color packs' manifests document only the
-    // default ranges (`*`, working, speaking), so these states would
-    // collapse to the hold loop and lose their dedicated expressions.
+  // Pure thinking uses the denser thinking pack on the default family.
+  if (state === "thinking") {
+    if (isDefaultFamily) {
+      const thinking = packUrl(THINKING_PACK[key]);
+      if (thinking) return thinking;
+    }
+    // Non-default colors: multi-GIF keeps a dedicated thinking expression.
+    return null;
+  }
+
+  // Expanded-only states on thin color shells would collapse to `*`; fall back.
+  if (EXPANDED_DEFAULT_ONLY_STATES.has(state) && !isDefaultFamily) {
     return null;
   }
 
