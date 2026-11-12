@@ -59,8 +59,13 @@ export function resolveToolResultHistoryChars(value: number | undefined): number
 export class ToolResultArtifactStore {
   private readonly entries = new Map<string, string>();
   private bytes = 0;
+  private readonly maxBytes: number;
 
-  constructor(private readonly maxBytes = 64 * 1024 * 1024) {}
+  // Parameter properties are invalid under Node's strip-only TypeScript mode
+  // (CI boots server/index.ts that way).
+  constructor(maxBytes = 64 * 1024 * 1024) {
+    this.maxBytes = maxBytes;
+  }
 
   put(id: string, text: string): void {
     const existing = this.entries.get(id);
