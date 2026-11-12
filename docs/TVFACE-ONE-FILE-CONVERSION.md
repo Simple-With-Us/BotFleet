@@ -10,11 +10,12 @@ The one-file player is wired.  `TVFaceAvatar` loads a pack from `public/tv-face/
 
 | File | Role |
 |---|---|
-| `tvface-default.webp` | Orange / default expanded: `*`, thinking, working, speaking, listening, tools, computer, memory (enter/hold/return where art ships) under 2 MB |
-| `tvface-thinking.webp` | Orange thinking denser pack (still used for thinking-class states on orange) |
-| `tvface-blue.webp` … `tvface-black.webp` | Color shells still on the thin layout (`*`, working, speaking) until recolored from the expanded default |
+| `tvface-default.webp` | Orange / default expanded: `*`, working, speaking, listening, tools, computer, memory (enter/hold/return where art ships) under 2 MB |
+| `tvface-thinking.webp` | Orange denser pack used only for pure `thinking` |
+| `tvface-blue.webp` … `tvface-black.webp` | Thin color shells (`*`, working, speaking).  Expanded states fall back to multi-GIF until recolored |
 
-Orange and `default` share `tvface-default.webp`.  Thinking/working-class bot states on orange prefer `tvface-thinking.webp`.  Other colors use their color pack (wildcard covers unnamed states).
+Orange and `default` share `tvface-default.webp`.  Pure `thinking` on orange prefers `tvface-thinking.webp`.  Working / tools / computer / memory / listening on orange use the expanded default pack.  Other colors use their color pack for idle/working/speaking; thinking-class expanded states still use multi-GIF until shells are re-expanded.
+
 
 ## Demos Already On Main
 
