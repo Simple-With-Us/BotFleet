@@ -4979,6 +4979,100 @@ describe("harness HTTP API", () => {
     expect(res.body.error).toMatch(/Updating Infisical settings and credentials in the same request is not supported/);
   });
 
+  it("keeps externally stored Infisical read and write tokens off disk and out of responses", async () => {
+    const readToken = "st.fixture-read-token";
+    const writeToken = "st.fixture-write-token";
+    try {
+      const saved = await api("PUT", "/api/config?secretStorage=external", {
+        infisical: {
+          enabled: false,
+          authMethod: "service-token",
+          projectId: "11111111-1111-4111-8111-111111111111",
+          token: readToken,
+          writeToken,
+        },
+      });
+      expect(saved.status).toBe(200);
+      expect(saved.body.infisical).toMatchObject({
+        enabled: false, authMethod: "service-token", hasToken: true, hasWriteToken: true,
+      });
+      const disk = JSON.parse(readFileSync(join(home, ".botfleet", "config.json"), "utf8"));
+      expect(disk.infisical).toMatchObject({ token: "", writeToken: "", credentialStorage: "external" });
+      const status = await api("GET", "/api/infisical/status");
+      expect(status.status).toBe(200);
+      for (const payload of [saved.body, disk, status.body]) {
+        expect(JSON.stringify(payload)).not.toContain(readToken);
+        expect(JSON.stringify(payload)).not.toContain(writeToken);
+      }
+      const reloaded = await api("PUT", "/api/config", { profile: { name: "Grace" } });
+      expect(reloaded.status).toBe(200);
+      expect(reloaded.body.infisical).toMatchObject({ hasToken: true, hasWriteToken: true });
+    } finally {
+      await api("PUT", "/api/config?secretStorage=external", {
+        infisical: { enabled: false, projectId: "", token: "", writeToken: "", authMethod: "service-token" },
+      });
+    }
+  });
+
+  it("allows exact source-based Infisical test and sync despite an encrypted primary credential marker", async () => {
+    const projectId = "fixture-source-project";
+    const source = { name: "primary-source", projectId, environment: "prod", secretPath: "/", tokenEnv: "BF_SCOPE_FIXTURE_MISSING" };
+    try {
+      expect((await api("PUT", "/api/config?secretStorage=external", { infisical: {
+        enabled: false, authMethod: "machine-identity", projectId, clientId: "fixture-client", clientSecret: "fixture-encrypted-secret",
+      } })).status).toBe(200);
+      const saved = await api("PATCH", "/api/config", { infisical: {
+        enabled: true, authMethod: "service-token", environment: "prod", secretPath: "/", readSources: [source],
+      } });
+      expect(saved.status).toBe(200);
+      const tested = await api("POST", "/api/infisical/test");
+      expect(tested.status).toBe(200);
+      expect(tested.body.ok).toBe(false);
+      expect(tested.body.error).toContain("BF_SCOPE_FIXTURE_MISSING");
+      expect((await api("POST", "/api/infisical/sync")).status).toBe(200);
+      expect((await api("PATCH", "/api/config", { infisical: { readSources: [{ ...source, secretPath: "/another-folder" }] } })).status).toBe(200);
+      expect((await api("POST", "/api/infisical/test")).status).toBe(409);
+    } finally {
+      await api("PUT", "/api/config?secretStorage=external", { infisical: {
+        enabled: false, authMethod: "service-token", projectId: "", clientId: "", clientSecret: "", token: "", writeToken: "", readSources: [],
+      } });
+    }
+  });
+
+  it("retains partial Infisical setup metadata and the explicit off switch across saves", async () => {
+    try {
+      const saved = await api("PATCH", "/api/config", { infisical: {
+        enabled: false, authMethod: "service-token", projectId: "partial-project", siteUrl: "https://vault.example.test", readSources: [],
+      } });
+      expect(saved.status).toBe(200);
+      expect(saved.body.infisical).toMatchObject({ configured: false, enabled: false, enabledSetting: false });
+      expect((await api("GET", "/api/infisical/status")).body.infisical).toMatchObject({
+        enabledSetting: false, siteUrl: "https://vault.example.test", projectId: "partial-project",
+      });
+      expect((await api("PATCH", "/api/config", { infisical: { refreshMinutes: 20 } })).body.infisical.enabledSetting).toBe(false);
+    } finally {
+      await api("PATCH", "/api/config", { infisical: { enabled: false, projectId: "", siteUrl: "", refreshMinutes: 15 } });
+    }
+  });
+
+  it("rejects extra per-project token references before persisting or exposing credentials", async () => {
+    const token = "st.fixture-cap-read";
+    try {
+      expect((await api("PUT", "/api/config?secretStorage=external", { infisical: {
+        enabled: false, authMethod: "service-token", projectId: "cap-project", token,
+      } })).status).toBe(200);
+      const refused = await api("PATCH", "/api/config", { infisical: { readSources: [{
+        name: "extra", projectId: "cap-project", secretPath: "/extra", tokenEnv: "OTHER_READ_REFERENCE",
+      }] } });
+      expect(refused.status).toBe(400);
+      expect(refused.body.error).toMatch(/one read token reference/);
+      expect(JSON.stringify(refused.body)).not.toContain(token);
+      expect((await api("GET", "/api/infisical/status")).body.infisical.readSources).toEqual([]);
+    } finally {
+      await api("PUT", "/api/config?secretStorage=external", { infisical: { enabled: false, projectId: "", token: "", readSources: [] } });
+    }
+  });
+
   it("keeps shared Local VM mode by default and resolves isolated targets per bot when enabled", async () => {
     const first = (await api("POST", "/api/bots")).body.bot;
     const second = (await api("POST", "/api/bots")).body.bot;
@@ -6892,15 +6986,40 @@ describe("instance CLI override API", () => {
     const instanceId = created.body.instanceId;
     expect(instanceId).toContain("custom-ollama-local");
 
+    type CustomEngineListItem = {
+      instanceId: string;
+      replyWaitMinutes?: number;
+      displayName?: string;
+      driverKind?: string;
+      isCustom?: boolean;
+      localModelWaitAvailable?: boolean;
+      snapshot?: { state?: string; authenticated?: boolean };
+      models?: { options?: Array<{ id: string }> };
+    };
+    const findInstance = (instances: CustomEngineListItem[], id: string): CustomEngineListItem | undefined =>
+      instances.find((item) => item.instanceId === id);
+
     const instancesRes = await api("GET", "/api/instances");
-    const found = instancesRes.body.instances.find((i: any) => i.instanceId === instanceId);
+    const found = findInstance(instancesRes.body.instances, instanceId);
     expect(found).toBeDefined();
-    expect(found.displayName).toBe("Ollama Local");
-    expect(found.driverKind).toBe("openai-compat");
-    expect(found.isCustom).toBe(true);
-    expect(found.snapshot.state).toBe("available");
-    expect(found.snapshot.authenticated).toBe(true);
-    expect(found.models.options.map((m: any) => m.id)).toEqual(["llama3.3:70b", "mistral:latest"]);
+    expect(found?.displayName).toBe("Ollama Local");
+    expect(found?.driverKind).toBe("openai-compat");
+    expect(found?.isCustom).toBe(true);
+    expect(found?.snapshot?.state).toBe("available");
+    expect(found?.snapshot?.authenticated).toBe(true);
+    expect(found?.models?.options?.map((model) => model.id)).toEqual(["llama3.3:70b", "mistral:latest"]);
+    expect(found?.localModelWaitAvailable).toBe(true);
+
+    expect((await api("PATCH", `/api/instances/${instanceId}`, { replyWaitMinutes: 20 })).status).toBe(200);
+    expect((await api("PATCH", `/api/instances/${instanceId}`, { replyWaitMinutes: 10, unexpected: true })).status).toBe(400);
+    const configured = await api("GET", "/api/instances");
+    expect(findInstance(configured.body.instances, instanceId)?.replyWaitMinutes).toBe(20);
+    for (const invalid of [1, 4, 61, 2.5, "20"]) {
+      expect((await api("PATCH", `/api/instances/${instanceId}`, { replyWaitMinutes: invalid })).status).toBe(400);
+    }
+    expect((await api("PATCH", `/api/instances/${instanceId}`, { replyWaitMinutes: null })).status).toBe(200);
+    const reset = await api("GET", "/api/instances");
+    expect(findInstance(reset.body.instances, instanceId)).not.toHaveProperty("replyWaitMinutes");
 
     const botRes = await api("POST", "/api/bots", {
       name: "Local Bot",

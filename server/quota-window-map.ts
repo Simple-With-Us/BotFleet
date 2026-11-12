@@ -140,6 +140,9 @@ const DRIVER_KIND_PROVIDERS: Readonly<Record<string, string>> = {
   deepseekAgent: "deepseek",
   dshAgent: "dsh",
   zcodeAgent: "zcode",
+  // The bridge engine spends the same GLM Coding Plan windows as the headless
+  // CLI (mcodeAgent: "minimax" precedent).
+  zcodeAcp: "zcode",
 };
 
 export function quotaProviderForDriver(driverKind: string): string | null {
@@ -213,7 +216,7 @@ export function driverKindsForWindow(window: QuotaWindowMatch): string[] {
   // ZCode windows arrive from CodeCaps under providerKey "zcode"; telemetry
   // (inferProviderAndService) reports the engine under provider "zcode" too,
   // and a window labeled with the vendor ("z.ai" / "GLM") is the same plan.
-  if (hay.includes("zcode") || hay.includes("z.ai") || hay.includes("glm")) return ["zcodeAgent"];
+  if (hay.includes("zcode") || hay.includes("z.ai") || hay.includes("glm")) return ["zcodeAgent", "zcodeAcp"];
   if (hay.includes("dsh")) return ["dshAgent"];
   if (hay.includes("deepseek")) return ["deepseekAgent", "deepseek"];
   // Factory is droid's real commercial product/subscription (droid.ts:

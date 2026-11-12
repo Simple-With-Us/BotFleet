@@ -106,7 +106,7 @@ struct NativeMCPHTTPClientTests {
         let originalState = NativeMCPHTTPFixtureState(.redirect(target))
         let original = NativeMCPFixtureURLProtocol.register(originalState)
         defer { NativeMCPFixtureURLProtocol.remove(original); NativeMCPFixtureURLProtocol.remove(target) }
-        let transport = NativeMCPURLSessionHTTPClient(configuration: privateMCPTestConfiguration(), timeout: 0.2)
+        let transport = NativeMCPURLSessionHTTPClient(configuration: privateMCPTestConfiguration())
         var request = URLRequest(url: original)
         request.setValue("private-fixture-secret", forHTTPHeaderField: "CF-Access-Client-Secret")
         let response = try await transport.execute(request)
@@ -136,14 +136,16 @@ struct NativeMCPHTTPClientTests {
         let failed = NativeMCPHTTPFixtureState(.error(.networkConnectionLost))
         let failedURL = NativeMCPFixtureURLProtocol.register(failed)
         defer { NativeMCPFixtureURLProtocol.remove(failedURL) }
-        let transport = NativeMCPURLSessionHTTPClient(configuration: privateMCPTestConfiguration(), timeout: 0.03)
+        // Error propagation and cancellation must not race the deliberately short deadline below.
+        let transport = NativeMCPURLSessionHTTPClient(configuration: privateMCPTestConfiguration())
         do { _ = try await transport.execute(URLRequest(url: failedURL)); Issue.record("A network error became a response") }
         catch { #expect((error as? URLError)?.code == .networkConnectionLost) }
 
         let held = NativeMCPHTTPFixtureState(.hold)
         let heldURL = NativeMCPFixtureURLProtocol.register(held)
         defer { NativeMCPFixtureURLProtocol.remove(heldURL) }
-        do { _ = try await transport.execute(URLRequest(url: heldURL)); Issue.record("An unfinished request escaped its deadline") }
+        let deadlineTransport = NativeMCPURLSessionHTTPClient(configuration: privateMCPTestConfiguration(), timeout: 0.03)
+        do { _ = try await deadlineTransport.execute(URLRequest(url: heldURL)); Issue.record("An unfinished request escaped its deadline") }
         catch { #expect((error as? URLError)?.code == .timedOut) }
         let cancelled = Task { try await transport.execute(URLRequest(url: heldURL)) }
         cancelled.cancel()

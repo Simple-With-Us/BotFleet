@@ -18,7 +18,7 @@ import { isIP } from "node:net";
 import { extname, join } from "node:path";
 
 import { z } from "zod";
-import { instanceModelsSchema } from "./instance-models.ts";
+import { InstancePatchBodySchema, InstancePatchRestoreBodySchema, instancePatchInputError } from "./instance-patch.ts";
 import { ScreenPollers } from "./screen-poller.ts";
 import { ReplayBuffer, SLOW_CLIENT_BYTE_LIMIT, wants, writeToClient, type SseClient } from "./sse-broadcast.ts";
 import { BOT_AVATAR_CROPS, botAvatarRecolorableSchema, botAvatarUrlFromStoredPath, botAvatarUrlSchema } from "../shared/bot-avatar.ts";
@@ -119,15 +119,25 @@ import { classifyWorkerRequest } from "../shared/placement-worker-http.mjs";
 import { openRollbackPlacementAuthority, PLACEMENT_ROLLBACK_REFUSAL } from "./placement-readonly.ts";
 import { PlacementLeaseService, placementLeaseRoute, PLACEMENT_LEASE_ACTIONS, type PlacementLeaseAction } from "./placement-leases.ts";
 import { PlacementModeStore, placementModeRead, placementModeWrite } from "./placement-mode-store.ts";
+import {
+  PlacementControllerBridge,
+  DEFAULT_PLACEMENT_HEARTBEAT_SECONDS,
+  DEFAULT_PLACEMENT_UNREACHABLE_AFTER_SECONDS,
+} from "./placement-controller-bridge.ts";
 import { createHostProbe } from "./jobs/admission.ts";
 import { storageDeviceGuard, STORAGE_OFFLINE_EXIT_CODE } from "./storage-device.ts";
 import {
   appendHeldWork,
   drainViewOf,
   inFlightCounts,
+  carriedWorkIds,
+  journalItemStillOwed,
   partitionByAge,
+  readQueueJournal,
+  seedQueuedFirstSeen,
   takeHeldWork,
   UpdateDrain,
+  writeQueueJournal,
   type UpdateDrainView,
   type HeldQueueEntry,
   type HeldRoomRound,
@@ -174,6 +184,7 @@ import {
 } from "./turn-worktree-admission.ts";
 import { RoomTurnDeadline, RoomTurnStallRegistry, roomTurnTimeoutMessage } from "./room-turn-timeout.ts";
 import { buildSystemPrompt, ownerNotesPrompt } from "./system-prompt.ts";
+import { arrangeUnattendedWakePrompt, logReportedCachedTokens, unattendedCurrentWakeIsStandingText } from "./wake-prompt.ts";
 import { telemetry, turnUsageDetail } from "./telemetry.ts";
 import { usageQuotaPoller } from "./usage-quota.ts";
 import { getDeepSeekBalance } from "./deepseek-balance.ts";
@@ -293,9 +304,11 @@ import {
   ensureDirs,
   instanceConfigs,
   loadConfig,
+  type AppConfig,
   localVmMaxInstances,
   allowedBotComputers,
   infisicalSettings,
+  validateInfisicalConfigPatch,
   observabilitySettings,
   parseConfigPatch,
   publicIngressUrlEffective,
@@ -403,6 +416,7 @@ import { TurnStatsTracker } from "./turn-stats.ts";
 import { ChildSessionIds } from "./child-session-ids.ts";
 
 import { BUILT_IN_DRIVERS } from "./drivers/builtIn.ts";
+import { isLocalModelEndpoint, ReplyWaitMinutesSchema } from "./drivers/openai-compat.ts";
 // Read-only probe for the Secrets card: whether ~/.mmx/config.json holds a
 // MiniMax key at all.  The driver's own resolver is the authority on
 // precedence; this only reports what the secret map structurally cannot see.
@@ -431,6 +445,8 @@ import {
   restoreJobNotices,
   drainEveryReadyBatch,
   restoreSteeredEntries,
+  setSteerQueueObserver,
+  snapshotSteerQueue,
   takeSteeredEntries,
   type SteerQueueSnapshot,
   type JobNoticeItem,
@@ -500,7 +516,7 @@ import { credentialFingerprint, SECRET_FIELDS, secretProvenance, secretSource, v
 import { KNOB_FIELDS, clearedHeadroomKnobs, knobSource, readKnobField } from "./knob-map.ts";
 import { patchChangesInfisicalConnection, writeThroughKnobs } from "./knob-write-through.ts";
 import { configureTurnIdentity, observeRuntimeEvent } from "./sentry-ai.ts";
-import { checkInRoutineFinish, checkInRoutineStart } from "./sentry-crons.ts";
+import { checkInRoutineFinish, checkInRoutineStart, releaseRoutineMonitor } from "./sentry-crons.ts";
 import { ProviderRegistry, type DescribedInstance } from "./harness/registry.ts";
 import { cancelPeerApprovalsFor, cancelPeerApprovalsForThread, dismissStalePeerCards, resolvePeerComms, type ApprovalBus } from "./peer-approval.ts";
 import {
@@ -665,6 +681,7 @@ import {
   type CommandSurface,
 } from "../shared/bot-commands.ts";
 import { memberTurnSelection } from "./member-turn.ts";
+import { DEFAULT_WEBHOOK_PAYLOAD_DEDUPE_MS } from "./webhook-payload-dedupe.ts";
 import { WebhookManager } from "./webhooks.ts";
 import { ResourceTriggerManager } from "./resource-triggers.ts";
 import { readHostDispatchHoldReason, readHostDispatchHot } from "./host-dispatch-hot.ts";
@@ -835,8 +852,27 @@ const hostId = loadHostId(DATA_DIR);
 const placementAuthority = openRollbackPlacementAuthority(DATA_DIR, hostId);
 // Immutable for this process: updater unquiesce cannot grant execution authority.
 const placementRollbackReadOnly = placementAuthority.kind === "readonly";
+// The placement transport's two knobs, read live.  The config object is
+// mutated in place on every save and vault refresh, so a holder that points
+// at it always answers with the current value.  It starts empty because the
+// config is loaded further down this file and the lease service is built
+// before that, so nothing may read the config yet.
+let placementConfig: AppConfig | null = null;
+/** How long a worker may go quiet before the controller marks it
+ *  unreachable.  The lease service asks for this every time it judges a
+ *  worker, so a knob change applies without a restart. */
+const placementUnreachableAfterMs = (): number =>
+  (placementConfig?.placement?.unreachableAfterSeconds ?? DEFAULT_PLACEMENT_UNREACHABLE_AFTER_SECONDS) * 1000;
+/** How often a worker says it is alive.  The controller's sweep runs at the
+ *  same cadence:  the sweep exists to notice that a worker's heartbeat
+ *  stopped, so the controller re-checks liveness as often as workers report
+ *  it, and a quiet worker is marked unreachable within one period of the
+ *  window closing rather than within a whole window. */
+const placementHeartbeatMs = (): number =>
+  (placementConfig?.placement?.heartbeatSeconds ?? DEFAULT_PLACEMENT_HEARTBEAT_SECONDS) * 1000;
 const placementLeases = placementAuthority.kind === "legacy" ? new PlacementLeaseService({
   hostId, controller: placementAuthority.controllerStore.read(), controllerStore: placementAuthority.controllerStore,
+  unreachableAfterMs: placementUnreachableAfterMs,
 }) : null;
 // The server's copy of the mode record, beside `jobs.json`.  It shares the
 // lease service's epoch and keeps no epoch of its own, so the record can
@@ -848,6 +884,32 @@ const placementModeStore = new PlacementModeStore(join(DATA_DIR, "jobs"), {
     if (!placementLeases) throw new Error("Placement authority is unavailable");
     return placementLeases.controller();
   },
+});
+// The bridge between that record and the job registry (slice T4).  It is
+// built on every host, including one with no writable authority:  a server
+// mode on a host that cannot admit a job refuses the start with a reason,
+// and it never falls through to running the job here.  A bridge that was
+// absent would leave the registry's own path open, which is the one thing
+// the plan refuses.
+const placementBridge = new PlacementControllerBridge({
+  hostId,
+  view: () => {
+    const view = placementModeStore.read();
+    return {
+      mode: view.record.mode,
+      controllerId: view.controller.controllerId,
+      epoch: view.controller.epoch,
+      acknowledged: view.acknowledged,
+    };
+  },
+  enqueue: (message) => {
+    if (!placementLeases) {
+      return { ok: false, reason: "The placement authority on this computer is read-only, so no job is admitted.  Run the command with bash if it is short, or switch to This Mac Only in Settings." };
+    }
+    return placementLeases.enqueue(message);
+  },
+  queuedReason: (jobId) => placementLeases?.job(jobId)?.queuedReason,
+  sweepUnreachable: () => placementLeases?.sweepUnreachable() ?? [],
 });
 const jobHostProbe = createHostProbe({
   storageState: storageGuard?.sample,
@@ -1160,6 +1222,9 @@ const updateDrain = new UpdateDrain({
   log: (line) => console.warn(line),
 });
 const cfg = loadConfig();
+// The placement knobs read this object, and it is mutated in place on every
+// save and vault refresh, so a knob change applies without a restart.
+placementConfig = cfg;
 // Agent CLIs spawn with the Infisical Agent Proxy environment when it is on.  Read
 // from the in-memory `cfg` (mutated in place on every save and vault refresh), so a
 // spawn never re-reads config.json.
@@ -2339,8 +2404,23 @@ function presentInstances<T extends Parameters<typeof presentDescribedInstances>
 }
 
 function instancesPayload(described: DescribedInstance[]) {
+  const configs = instanceConfigs(cfg);
+  const instances = presentInstances(described).map((instance) => {
+    const entry = configs[instance.instanceId];
+    if (entry?.driver !== "openai-compat") return instance;
+    const config = z.object({
+      url: z.string().optional(),
+      replyWaitMinutes: ReplyWaitMinutesSchema.optional(),
+    }).safeParse(entry.config);
+    if (!config.success || !config.data.url || !isLocalModelEndpoint(config.data.url)) return instance;
+    const available = Object.assign({}, instance, { localModelWaitAvailable: true });
+    if (config.data.replyWaitMinutes !== undefined) {
+      Object.assign(available, { replyWaitMinutes: config.data.replyWaitMinutes });
+    }
+    return available;
+  });
   return {
-    instances: presentInstances(described),
+    instances,
     describedAt: registry.describedAtOf(described),
     ...(registry.describeWasStale() ? { stale: true } : {}),
   };
@@ -2936,6 +3016,17 @@ const jobRegistry = new JobRegistry({
   dataDir: DATA_DIR,
   probe: jobHostProbe,
   settings: jobSettings,
+  // The bridge to the placement authority (slice T4).  It is always present,
+  // so a server mode can never fall through to running the job on this host.
+  placementBridge,
+  // The mode the record holds, so the per-host cap refuses only in This Mac
+  // Only:  in a server mode the cap is an eligibility input and the job
+  // queues instead.
+  placementMode: () => placementBridge.mode(),
+  // The jobs the controller's queue still holds.  In a server mode the
+  // registry keeps no copy of them, so the per-bot and per-thread caps count
+  // them from there.
+  placementActiveJobs: () => placementLeases?.activeJobs() ?? [],
   // A job is a shell the model started: it carries its bot's launch identity
   // the way the engine's own children do (server/launch-identity.ts).
   launchEnv: (botId, threadId) => {
@@ -4319,7 +4410,7 @@ configureTurnIdentity((threadId) => {
 // The latest running token totals for the turn in flight on each thread.
 // Providers report cumulative-within-turn numbers; the final value is folded
 // into the task's tally when the turn settles.
-const turnUsage = new Map<string, { input: number; output?: number; cachedInput?: number }>();
+const turnUsage = new Map<string, { input: number; output?: number; cachedInput?: number; contextWindow?: number }>();
 
 // Where each 1:1 turn in flight is spending its wall time (model, tools, or
 // waiting on a person).  Folded into the task's `stats` aggregate at
@@ -4441,6 +4532,7 @@ function scheduleStalledTurnRelease(
 const watchdog = new TurnWatchdog({
   stallMs: TURN_STALL_MS,
   checkMs: 60_000,
+  liveThreadIds: () => registry.instances().flatMap((instance) => instance.adapter.liveTurnThreadIds?.() ?? []),
   onSweep: () => {
     for (const instance of registry.instances()) {
       const sweep = instance.adapter.sweepStuckTurns;
@@ -5946,11 +6038,29 @@ bus.subscribe((event: RuntimeEvent) => {
       if (event.setup && bot) store.setActivity(bot.id, "dead");
       break;
     }
-    case "thread.token-usage.updated":
+    case "thread.token-usage.updated": {
       // running totals for the turn in flight; folded into the task's
-      // tally at turn.completed (below) so retries never double-count
-      turnUsage.set(event.threadId, { input: event.input, output: event.output, cachedInput: event.cachedInput });
+      // tally at turn.completed (below) so retries never double-count.
+      // A later tick that omits the window keeps the size already reported.
+      logReportedCachedTokens(event);
+      const previous = turnUsage.get(event.threadId);
+      const contextWindow = event.contextWindow ?? previous?.contextWindow;
+      if (contextWindow === undefined) {
+        turnUsage.set(event.threadId, {
+          input: event.input,
+          output: event.output,
+          cachedInput: event.cachedInput,
+        });
+      } else {
+        turnUsage.set(event.threadId, {
+          input: event.input,
+          output: event.output,
+          cachedInput: event.cachedInput,
+          contextWindow,
+        });
+      }
       break;
+    }
     case "turn.completed": {
       const completionToken = Symbol(event.turnId);
       const completionFold = (async () => {
@@ -6274,6 +6384,7 @@ bus.subscribe((event: RuntimeEvent) => {
           input: tokens?.input,
           output: tokens?.output,
           cachedInput: tokens?.cachedInput,
+          contextWindow: lastReported?.contextWindow,
           costUsd: event.cost ?? null,
           billingMode: event.billingMode,
           // No live entry (a repeated completion, a turn from before a
@@ -6726,6 +6837,76 @@ function drainRoomQueue() {
  *  typed text runs unattended — the conservative reading. */
 const relayQueuedMessageIds = new Set<string>();
 
+/** The steer queue lives in memory, so a crash or kill between accepting a
+ *  queued send and draining it would lose the user's words.  Every change to
+ *  the queue is therefore written to a small journal (steer-queue-journal.json
+ *  in the data directory), and the entries a previous run left are put back at
+ *  boot through the same path an update's held sends take, so the age rule and
+ *  the in-thread notice for a too-old send apply to them too. */
+let unrestoredQueueJournal: HeldQueueEntry[] = placementRollbackReadOnly
+  ? []
+  : readQueueJournal(DATA_DIR, (line) => console.warn(line));
+/** When each live queued send was first journaled, so rewriting the journal
+ *  never makes an old send look new to the age rule. */
+const queuedFirstSeen = new Map<string, number>();
+
+function steerJournalEntries(): HeldQueueEntry[] {
+  const now = Date.now();
+  const live = snapshotSteerQueue().map((entry): HeldQueueEntry => {
+    let heldAt = now;
+    const items = entry.items.map((item): HeldQueueEntry["items"][number] => {
+      const seen = queuedFirstSeen.get(item.messageId) ?? now;
+      queuedFirstSeen.set(item.messageId, seen);
+      heldAt = Math.min(heldAt, item.committed ? item.committed.heldAt : seen);
+      const held: HeldQueueEntry["items"][number] = {
+        messageId: item.messageId,
+        text: item.text,
+        prompt: item.prompt,
+        relayed: item.committed ? item.committed.relayed : Boolean(item.relayed) || relayQueuedMessageIds.has(item.messageId),
+      };
+      if (item.replyToId) held.replyToId = item.replyToId;
+      if (item.linqChatId) held.linqChatId = item.linqChatId;
+      if (item.automationSource) held.automationSource = item.automationSource;
+      if (item.committed) held.committed = { ...item.committed, excludeIds: [...item.committed.excludeIds] };
+      return held;
+    });
+    return { botId: entry.botId, threadId: entry.threadId, heldAt, items };
+  });
+  const liveIds = new Set(live.flatMap((entry) => entry.items.map((item) => item.messageId)));
+  for (const id of queuedFirstSeen.keys()) if (!liveIds.has(id)) queuedFirstSeen.delete(id);
+  return [...live, ...unrestoredQueueJournal];
+}
+
+/** Why the last journal write failed, or null when it succeeded.  A queued
+ *  send is only acknowledged while this is null: a send the journal could not
+ *  save is refused, not accepted into a memory-only queue. */
+let steerJournalFailure: string | null = null;
+function writeSteerJournal() {
+  if (placementRollbackReadOnly) return;
+  const failure = writeQueueJournal(DATA_DIR, steerJournalEntries());
+  // Only the error code is logged: nothing a user wrote ever reaches a log line.
+  // SAFETY: the journal writer only reports fs errors, which carry an optional string code.
+  steerJournalFailure = failure ? ((failure as NodeJS.ErrnoException).code ?? failure.name) : null;
+  if (failure) console.warn(`[steer-queue] could not write the crash journal (${steerJournalFailure})`);
+}
+setSteerQueueObserver(writeSteerJournal);
+
+/** What the last run's journal still holds that is not already running or
+ *  carried: a send that was drained into its thread before the journal caught
+ *  up (its `queueId` is on a transcript line), or that an update carried, is
+ *  dropped here so nothing runs twice. */
+function takeRecoveredQueueJournal(carried: HeldWork): HeldQueueEntry[] {
+  const carriedIds = carriedWorkIds(carried);
+  const recovered: HeldQueueEntry[] = [];
+  for (const entry of unrestoredQueueJournal) {
+    const inThread = new Set(store.messagesFor(entry.threadId).flatMap((message) => (message.queueId ? [message.queueId] : [])));
+    const items = entry.items.filter((item) => journalItemStillOwed(item, carriedIds, inThread, (messageId) => store.hasMessage(entry.threadId, messageId)));
+    if (items.length > 0) recovered.push({ ...entry, items });
+  }
+  unrestoredQueueJournal = [];
+  return recovered;
+}
+
 /** Whether a drained batch carried any relayed line, consuming the marks.
  *  Read back off the transcript lines drain just appended (their `queueId`). */
 function takeRelayMark(threadId: string, excludeIds: readonly string[]): boolean {
@@ -6920,6 +7101,9 @@ function restoreHeldWork(work: HeldWork, context: string) {
   for (const entry of queued.run) {
     if (!store.bot(entry.botId)) continue;
     for (const item of entry.items) if (item.relayed && !item.committed) relayQueuedMessageIds.add(item.messageId);
+    // Keep the send's true age: without this the next journal rewrite would
+    // treat every restored send as first seen now and reset its clock.
+    seedQueuedFirstSeen(queuedFirstSeen, [entry]);
     pending.push({
       heldAt: entry.heldAt,
       entry: {
@@ -6929,6 +7113,7 @@ function restoreHeldWork(work: HeldWork, context: string) {
           const restored: SteerQueueSnapshot["items"][number] = { messageId: item.messageId, text: item.text, prompt: item.prompt };
           if (item.replyToId) restored.replyToId = item.replyToId;
           if (item.linqChatId) restored.linqChatId = item.linqChatId;
+          if (item.relayed && !item.committed) restored.relayed = true;
           if (item.automationSource) {
             // SAFETY: the carrier only ever holds what `persistHeldWork` copied
             // out of a steer-queue item, whose automationSource is this type.
@@ -7821,8 +8006,8 @@ async function startTurn(
           ? { localComputer: hasHostComputer, workspace: worksInWorkspace }
           : { ...integrations, localComputer: hasHostComputer, workspace: worksInWorkspace, recall: hasRecall, phone: hasPhone, linq: hasLinq, jobs: jobsForTurn, zulip: zulipMounted },
         oneShot
-          ? { chiefOfStaff: false }
-          : { chiefOfStaff: Boolean(bot.chiefOfStaff), linq: hasLinq },
+          ? { chiefOfStaff: false, toolResultArchive: usesDriverToolLoop }
+          : { chiefOfStaff: Boolean(bot.chiefOfStaff), linq: hasLinq, toolResultArchive: usesDriverToolLoop },
       );
       const httpToolPrompt = usesDriverToolLoop
         ? httpCatalogPromptFor(
@@ -7870,7 +8055,7 @@ async function startTurn(
                 : opts?.automationSource === "schedule"
                   ? scheduleAutomationNote(zulipMounted, oneShot)
                   : "";
-      const prompt = buildSystemPrompt(oneShot ? ephemeralPromptSections({ persona, automationNote }) : [
+      let prompt = buildSystemPrompt(oneShot ? ephemeralPromptSections({ persona, automationNote }) : [
         { id: "persona", label: "Identity", text: persona },
         ...(fleetSeat ? [{ id: "fleet-seat", label: "Fleet seat", text: fleetSeat.text }] : []),
         { id: "voice-summary", label: "Speech-friendly summaries", text: cfg.tts?.optimizedSummary ? VOICE_SUMMARY_PROMPT : "" },
@@ -7958,6 +8143,43 @@ async function startTurn(
             : "",
         },
       ]);
+      // Webhook and schedule wakes keep a byte-identical prefix: standing
+      // system sections, then tool schemas, then saved instructions.  The
+      // per-wake tail (timestamps, payloads, run ids) follows that prefix.
+      const cacheFriendlyWake =
+        (opts?.automationSource === "webhook" || opts?.automationSource === "schedule") &&
+        opts?.command === undefined &&
+        !oneShot;
+      let wakeUserText = turnText;
+      let wakeRecoveryText = recoveryText;
+      let wakeHoisted = false;
+      if (cacheFriendlyWake) {
+        const arranged = arrangeUnattendedWakePrompt({
+          sections: prompt.sections,
+          toolSchemas: turnTools.map((tool) => ({
+            name: tool.name,
+            description: tool.description,
+            parameters: tool.parameters,
+          })),
+          wakeText: turnText,
+          // HTTP tool-loop drivers cache the catalog in the prefix.  CLI
+          // lanes discover tools at runtime and must not get a second copy.
+          inlineToolSchemas: usesDriverToolLoop,
+        });
+        prompt = {
+          text: arranged.system,
+          stable: arranged.systemStable,
+          volatile: arranged.systemVolatile,
+          volatileDigest: arranged.volatileDigest,
+          sections: arranged.sections,
+          bytes: arranged.bytes,
+        };
+        wakeUserText = arranged.userText;
+        wakeHoisted = arranged.hoisted;
+        if (recoveryText !== undefined && turnText.length > 0 && recoveryText.endsWith(turnText)) {
+          wakeRecoveryText = recoveryText.slice(0, recoveryText.length - turnText.length) + arranged.userText;
+        }
+      }
       turnPromptBytes.set(threadId, prompt.bytes);
       // Where a turn's context-injection records go: a `context.injected` event
       // for the Trajectory, and a short list on the message the chat hangs the
@@ -7996,6 +8218,22 @@ async function startTurn(
       // A command takes nothing in front of it, so the notices wait for the next turn.
       const jobReminder = opts?.command ? { text: "", items: [] } : jobTurnReminder(bot.id, threadId, jobsMounted);
       jobNoticeItems = jobReminder.items;
+      // A job reminder names live jobs, so it is volatile.  On a wake whose
+      // user text is still the saved routine, it follows that text.  A hoisted
+      // wake's user text is already the per-wake tail, and the reminder stays
+      // in front of that tail.  A payload-only webhook is not hoisted, and
+      // the reminder stays in front of that untrusted body too.
+      const remindedWakeText = (body: string): string => {
+        if (!jobReminder.text) return body;
+        // Saved standing text is stable, so a live job reminder follows it.
+        // Every other turn keeps the reminder in front, including a hoisted
+        // wake whose body is already the volatile tail, and a webhook whose
+        // body is a payload-derived task or untrusted event block.
+        if (cacheFriendlyWake && !wakeHoisted && unattendedCurrentWakeIsStandingText(body)) {
+          return `${body}\n\n${jobReminder.text}`;
+        }
+        return `${jobReminder.text}\n\n${body}`;
+      };
       // The replayed-history cap and the model-written summary toggle.
       // Only a driver that budgets the prompt (ACP) honours them; the
       // rest ignore what they do not know.
@@ -8009,7 +8247,7 @@ async function startTurn(
       if (bot.historySummaryModel === true) historySettings.historySummaryModel = true;
       const turnInput = {
         threadId,
-        text: jobReminder.text ? `${jobReminder.text}\n\n${turnText}` : turnText,
+        text: remindedWakeText(wakeUserText),
         model,
         effort,
         // Only a cap this model's row offers reaches a driver; a stale value
@@ -8033,7 +8271,7 @@ async function startTurn(
         // the active task's own session — another task's cursor would
         // resume the wrong conversation and defeat the context bubble
         resumeCursor: resume ? task.resumeCursors[instanceId] : undefined,
-        recoveryText: recoveryText !== undefined && jobReminder.text ? `${jobReminder.text}\n\n${recoveryText}` : recoveryText,
+        recoveryText: wakeRecoveryText !== undefined ? remindedWakeText(wakeRecoveryText) : undefined,
         ...(recoveryText !== undefined && recoveryText !== turnText ? { recoveryIsReplay: true } : {}),
         ...historySettings,
         // A driver whose provider lost its session sends `recoveryText` in place
@@ -8112,6 +8350,7 @@ async function startTurn(
               // the chiefOfStaff check both live there), independent of
               // whatever the model was actually offered this turn.
               chiefOfStaff: Boolean(bot.chiefOfStaff),
+              toolResultArchive: true,
               // The same `jobsForTurn` the catalog above was built from.
               jobs: jobsForTurn
                 ? { registry: jobRegistry, onComplete: "wake", wakes: jobSettings().wake, maxWaitSeconds: JOB_OUTPUT_WAIT_MAX_SECONDS_HTTP }
@@ -8502,6 +8741,7 @@ routines = new RoutineManager({
   },
   checkInStart: checkInRoutineStart,
   checkInFinish: checkInRoutineFinish,
+  releaseMonitor: releaseRoutineMonitor,
 });
 // Catch up retained durable receipts after restart; delivery IDs deduplicate states.
 for (const run of routines.listRuns()) webhookRequestLog.routineSubscriber({ kind: "routine.run", run });
@@ -8700,6 +8940,12 @@ const webhooks = new WebhookManager({
   pendingRuns: (webhookId) => routines!.activeWebhookRunCount(webhookId),
   canCoalesce: (webhookId, botId) => routines!.canCoalesceWebhook(webhookId, botId),
   runStatus: (runId) => routines!.runStatus(runId),
+  // Live read so an Infisical refresh applies on the next delivery, with 120 seconds when the knob is absent.
+  payloadDedupeWindowMs: () => {
+    const seconds = cfg.jobs?.webhookPayloadDedupeSeconds;
+    if (seconds === undefined || !Number.isFinite(seconds) || seconds < 0) return DEFAULT_WEBHOOK_PAYLOAD_DEDUPE_MS;
+    return seconds * 1000;
+  },
 });
 webhookEphemeralSource = (webhookId) => {
   const hook = webhooks.list().find((candidate) => candidate.id === webhookId);
@@ -10347,7 +10593,7 @@ async function runGroupMemberTurn(
             phone: hasRoomPhone,
             jobs: roomJobs,
           },
-          { chiefOfStaff: Boolean(bot.chiefOfStaff) },
+          { chiefOfStaff: Boolean(bot.chiefOfStaff), toolResultArchive: true },
         )
       : [];
   // `commsDepth: hop` — the room's own hop, not zero.  The catalog above
@@ -10371,6 +10617,7 @@ async function runGroupMemberTurn(
           confinement: confinementForRoom,
           cwd: cwd ?? bot.cwd ?? undefined,
           chiefOfStaff: Boolean(bot.chiefOfStaff),
+          toolResultArchive: true,
           jobs: roomJobs
             ? { registry: jobRegistry, onComplete: "notice", maxWaitSeconds: JOB_OUTPUT_WAIT_MAX_SECONDS_HTTP }
             : undefined,
@@ -11324,6 +11571,15 @@ function secretFieldRows() {
   });
 }
 
+function infisicalCredentialPending(): boolean {
+  const settings = infisicalSettings(cfg);
+  if (!settings.enabled || settings.configurationError) return false;
+  if (settings.authMethod === "machine-identity") return workspaceCredentialPending(cfg, "infisicalClientSecret");
+  const dedicatedSource = settings.readSources.some((source) => source.projectId === settings.projectId &&
+    source.environment === settings.environment && source.secretPath === settings.secretPath);
+  return !dedicatedSource && workspaceCredentialPending(cfg, "infisicalReadToken");
+}
+
 function configStatus() {
   const diagnostics = observability.getStatus();
   const vault = infisical.getStatus();
@@ -11506,9 +11762,13 @@ function configStatus() {
     infisical: {
       configured: vault.configured,
       enabled: vault.enabled,
+      enabledSetting: vault.enabledSetting,
+      authMethod: vault.authMethod,
       writeThrough: vault.writeThrough,
       environment: vault.environment,
       hasClientSecret: vault.hasClientSecret,
+      hasToken: vault.hasToken,
+      hasWriteToken: vault.hasWriteToken,
       managedCount: vault.appliedCount,
       lastSyncAt: vault.lastSyncAt,
       stale: vault.stale,
@@ -15945,14 +16205,18 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // not a guard.  The six organize fields are parsed together.
       // From a paired phone (the sidecar stamps `x-botfleet-companion`) the
       // body may carry the six organize fields and nothing else.
-      if (!botAvatarRecolorableSchema.safeParse(body.recolorable).success) {
-        return json(res, 400, { error: "recolorable must be a boolean" });
+      const recolorableParsed = botAvatarRecolorableSchema.safeParse(body.recolorable);
+      if (!recolorableParsed.success) {
+        return json(res, 400, { error: "recolorable must be none, shell, full, or a legacy boolean" });
       }
       const organize = checkBotOrganizeBody(body, req.headers["x-botfleet-companion"] === "1");
       if (!organize.ok) return json(res, organize.status, { error: organize.error });
-      for (const key of ["unread", "cloudBackend", "color", "mascotExpression", "recolorable", "pinned", "hidden"] as const) {
+      for (const key of ["unread", "cloudBackend", "color", "mascotExpression", "pinned", "hidden"] as const) {
         if (body[key] !== undefined) patch[key] = body[key];
       }
+      // Store the normalised enum (true→shell, false→none) so clients never
+      // see a bare boolean after the none|shell|full upgrade.
+      if (body.recolorable !== undefined) patch.recolorable = recolorableParsed.data;
       if (normalizedSelection) {
         patch.modelSelection = normalizedSelection;
         patch.activeModelSelection = normalizedSelection;
@@ -16587,7 +16851,14 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
             prompt: promptWithReply(text, replyTo, cfg.profile?.name?.trim() || "User"),
             linqChatId,
             ...(fromImessage ? { automationSource: "imessage" as const } : {}),
+            relayed: relaySourced,
           });
+          if (steerJournalFailure) {
+            // Not durable: refuse rather than acknowledge a send a crash would lose.
+            const failedWith = steerJournalFailure;
+            cancelSteeredMessage(bot.threadId, queued.id);
+            return { status: 503, body: { error: `could not save the queued message (${failedWith}); send it again` } };
+          }
           if (relaySourced) relayQueuedMessageIds.add(queued.id);
           // The same answer a busy bot's queued send gets: the client's
           // response schema is strict, and the pending chip is already right.
@@ -16699,7 +16970,14 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
             prompt: promptWithReply(text, replyTo, cfg.profile?.name?.trim() || "User"),
             linqChatId,
             automationSource: fromImessage ? "imessage" : undefined,
+            relayed: relaySourced,
           });
+          if (steerJournalFailure) {
+            // Not durable: refuse rather than acknowledge a send a crash would lose.
+            const failedWith = steerJournalFailure;
+            cancelSteeredMessage(targetThreadId, queued.id);
+            return { status: 503, body: { error: `could not save the queued message (${failedWith}); send it again` } };
+          }
           if (relaySourced) relayQueuedMessageIds.add(queued.id);
           return { status: 202, body: { ok: true, queued: true, queueId: queued.id, threadId: targetThreadId } };
         }
@@ -17520,7 +17798,8 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         await serializeProviderReload(async () => {
           Object.assign(process.env, plan.env);
           Object.assign(cfg, loadConfig());
-          if (plan.restored.includes("infisicalClientSecret")) {
+          if (plan.restored.some((name) => name === "infisicalClientSecret" ||
+              name === "infisicalReadToken" || name === "infisicalWriteToken")) {
             // Timer semantics refresh the canonical snapshot without nesting
             // a provider reload inside the mutation already holding its fence.
             await infisical.refresh("timer");
@@ -17810,7 +18089,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     // Sync Now: the one refresh that is allowed to rebuild the fleet, because
     // a person asked for it and is watching.
     if (method === "POST" && path === "/api/infisical/sync") {
-      if (workspaceCredentialPending(cfg, "infisicalClientSecret")) {
+      if (infisicalCredentialPending()) {
         return json(res, 409, { error: "Infisical is waiting for its encrypted credential" });
       }
       // Takes the same fence the two Settings routes take: this is the one
@@ -17836,7 +18115,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     // Test Connection: proves the identity works without changing what any
     // bot resolves to mid-session — it never reads a value, only names.
     if (method === "POST" && path === "/api/infisical/test") {
-      if (workspaceCredentialPending(cfg, "infisicalClientSecret")) {
+      if (infisicalCredentialPending()) {
         return json(res, 409, { error: "Infisical is waiting for its encrypted credential" });
       }
       return json(res, 200, await infisical.probe());
@@ -18231,35 +18510,6 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         return json(res, 415, { error: UNSUPPORTED_JSON_BODY });
       }
       const body = await readBody(req);
-      const patchOptions: { cli?: string; fullAuto?: boolean; enabled?: boolean; key?: string; externalCredential?: boolean; models?: Array<{ id: string; label: string }> } = {};
-
-      if (body?.cli !== undefined) {
-        if (typeof body.cli !== "string") return json(res, 400, { error: "cli must be a string" });
-        if (/[\n\r]/.test(body.cli)) return json(res, 400, { error: "cli must not contain newlines" });
-        patchOptions.cli = body.cli;
-      }
-
-      if (body?.models !== undefined) {
-        const parsedModels = instanceModelsSchema.safeParse(body.models);
-        if (!parsedModels.success) return json(res, 400, { error: "models must contain at most 100 unique IDs with valid labels" });
-        patchOptions.models = parsedModels.data;
-      }
-
-      if (body?.fullAuto !== undefined) {
-        if (typeof body.fullAuto !== "boolean") return json(res, 400, { error: "fullAuto must be a boolean" });
-        patchOptions.fullAuto = body.fullAuto;
-      }
-
-      if (body?.enabled !== undefined) {
-        if (typeof body.enabled !== "boolean") return json(res, 400, { error: "enabled must be a boolean" });
-        patchOptions.enabled = body.enabled;
-      }
-
-      if (body?.key !== undefined) {
-        if (typeof body.key !== "string") return json(res, 400, { error: "key must be a string" });
-        if (/[\n\r]/.test(body.key)) return json(res, 400, { error: "key must not contain newlines" });
-        patchOptions.key = body.key;
-      }
 
       if (url.searchParams.get("restore") === "1") {
         if (!isLoopbackAddress(req.socket.remoteAddress) || !authorizedRuntime(harnessOwner, req.headers.authorization)) {
@@ -18272,9 +18522,12 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         // same table the live override rides on, so a replay can never push a
         // key into an engine that has nowhere to read it from.
         const restoreKeyEnv = INSTANCE_API_KEY_ENV.get(current.driver);
-        if (!restoreKeyEnv || !body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).some((key) => key !== "key") || !patchOptions.key?.trim() || patchOptions.key.length > 16_384) {
+        const restoredBody = InstancePatchRestoreBodySchema.safeParse(body);
+        const restoreKey = restoredBody.success ? restoredBody.data.key : "";
+        if (!restoreKeyEnv || !restoreKey.trim() || restoreKey.length > 16_384) {
           return json(res, 400, { error: "Invalid instance credential restore payload" });
         }
+        const patchOptions = { key: restoreKey };
         const configuredKey = current.config && typeof current.config === "object" && "key" in current.config ? current.config.key : undefined;
         if (configuredKey || current.environment?.[restoreKeyEnv]) return json(res, 200, { retained: true });
         if (!currentRuntimeReadiness(ownAdmissionActive, true).safeToRestart) return json(res, 409, { error: "Credential restoration waits for current work to finish" });
@@ -18294,6 +18547,21 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           return json(res, 503, { error: "Instance credential restoration could not refresh provider readiness" });
         } finally { providerConfigBusy = false; }
       }
+
+      const parsedBody = InstancePatchBodySchema.safeParse(body);
+      if (!parsedBody.success) {
+        return json(res, 400, { error: instancePatchInputError(parsedBody.error) });
+      }
+      const patchOptions: { cli?: string; fullAuto?: boolean; enabled?: boolean; key?: string; externalCredential?: boolean; models?: Array<{ id: string; label: string }>; replyWaitMinutes?: number | null } = { ...parsedBody.data };
+
+      if (patchOptions.replyWaitMinutes !== undefined) {
+        const configured = instanceConfigs(cfg)[instancePatch[1]];
+        if (!configured) return json(res, 404, { error: `unknown instance "${instancePatch[1]}"` });
+        if (configured.driver !== "openai-compat") {
+          return json(res, 400, { error: "replyWaitMinutes is available for OpenAI-compatible servers only" });
+        }
+      }
+
       if (providerConfigBusy) return json(res, 409, { error: "provider settings are already being updated" });
       providerConfigBusy = true;
       try {
@@ -19366,6 +19634,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     if ((method === "PUT" || method === "PATCH") && path === "/api/config") {
       const body = await readBody(req);
       const patch = parseConfigPatch(body);
+      validateInfisicalConfigPatch(cfg, patch);
       if (!Object.keys(patch).length) return json(res, 400, { error: "nothing to save" });
       if (providerConfigBusy) return json(res, 409, { error: "provider settings are already being updated" });
       // The window confirmed a provider disable against its own copy of the
@@ -19774,6 +20043,8 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           ["tts", "key"],
           ["imageGen", "key"],
           ["infisical", "clientSecret"],
+          ["infisical", "token"],
+          ["infisical", "writeToken"],
         ] as const;
         for (const [section, field] of externalFields) {
           const externalSection = persisted[section] as Record<string, string | undefined> | undefined;
@@ -19782,8 +20053,8 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           externalSection![field] = "";
           externalCredentialSections[section] = Boolean(supplied.trim());
         }
-        // The one credential the store can never hold for us: its own client
-        // secret.  The client id is a plain identifier and stays readable,
+        // The credentials the store can never hold for us: its own client
+        // secret and service tokens.  The client id stays readable,
         // the way the Access client id does.
         saveConfig(persisted, { externalCredentialSections });
         syncCredentialEnv(patch);
@@ -20605,6 +20876,12 @@ if (!placementRollbackReadOnly) try {
   console.error(`[helpers] could not settle interrupted helpers: ${error instanceof Error ? error.message : String(error)}`);
 }
 jobRegistry.startTimers();
+// The unreachable sweep (slice T4).  It is the one part of the lease service
+// that had no production caller:  a controller runs it to notice a worker
+// that went quiet, and nothing is requeued when it does.  The period is the
+// heartbeat period, so the controller looks as often as workers report, and
+// a knob change applies on the next tick.
+if (placementLeases) placementBridge.startUnreachableSweep(placementHeartbeatMs);
 // Boot is done: the socket has been open since the top of this file, and the
 // full route table takes over from the boot-phase handler on the very next
 // request.  `/api/health` flips to `ready: true`, and the 503 gate lifts.
@@ -20737,7 +21014,13 @@ if (!placementRollbackReadOnly) setTimeout(() => {
   void runBootRecovery()
     .catch((error) => console.error("[boot-recovery] failed:", error))
     .finally(() => {
-      restoreHeldWork(takeHeldWork(DATA_DIR, (line) => console.warn(line)), "update-held");
+      const carried = takeHeldWork(DATA_DIR, (line) => console.warn(line));
+      const recovered = takeRecoveredQueueJournal(carried);
+      if (recovered.length > 0) console.warn(`[boot-recovery] ${recovered.length} queued send batch(es) survived a crash in the journal`);
+      restoreHeldWork({ ...carried, queued: [...carried.queued, ...recovered] }, "update-held");
+      // The journal must now say what is in memory, even when nothing changed
+      // the queue (a too-old send was written into its thread instead).
+      writeSteerJournal();
       drainQueuedSends();
       drainRoomQueue();
     });

@@ -8,9 +8,9 @@ import Foundation
 /// one speaker inside `groupMessageTimeGap`, so a text turn with two prose
 /// bubbles is a run too, and gets a header and an identity.
 ///
-/// Tool runs keep their extra rules — failures stay enumerated, `error:`
-/// tools and comm rows never fold — because those are about not hiding
-/// something the user needs.
+/// Tool runs keep their extra rules — failures stay enumerated, and a step
+/// that is still running, a child step, an `error:` tool, or a comm row
+/// never folds — because those are about not hiding something the user needs.
 
 /// How long a pause can be and still be the same run.
 ///

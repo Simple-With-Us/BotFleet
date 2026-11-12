@@ -1,7 +1,22 @@
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
+import { quotaGridPlaceholderLine } from "@/lib/quota-display";
 import { UsageMonitorQuotaGrid } from "./UsageMonitorQuotaGrid";
+
+describe("UsageMonitorQuotaGrid empty state", () => {
+  it("renders a plain placeholder when there are no windows", () => {
+    const line = quotaGridPlaceholderLine("empty", "Claude");
+    const html = renderToStaticMarkup(createElement(UsageMonitorQuotaGrid, { windows: [], emptyLine: line }));
+    expect(html).toContain("No usage limits reported yet for Claude.");
+    expect(html).toContain("usage-monitor-quota-grid-empty");
+  });
+
+  it("renders nothing when there are no windows and no placeholder line", () => {
+    const html = renderToStaticMarkup(createElement(UsageMonitorQuotaGrid, { windows: [] }));
+    expect(html).toBe("");
+  });
+});
 
 describe("quota plan details", () => {
   it("renders both reported names and user details as escaped text", () => {

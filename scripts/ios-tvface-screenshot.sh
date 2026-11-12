@@ -100,9 +100,46 @@ xcrun simctl launch "$UDID" "$BUNDLE_ID" -tvface-preview
 sleep 4
 xcrun simctl io "$UDID" screenshot "$OUT"
 
+# Reuse this job's already-built DEBUG app and simulator, never a paired
+# device or account. Keep the original TV-Face comparison unchanged, then
+# join both actual pixel captures into the existing uploaded artifact.
+capture_composer_regression() {
+  local container report
+  container="$(xcrun simctl get_app_container "$UDID" "$BUNDLE_ID" data)"
+  report="$container/Documents/composer-regression.json"
+  rm -f "$report" "$container/Documents/composer-regression.png"
+  xcrun simctl terminate "$UDID" "$BUNDLE_ID" 2>/dev/null || true
+  xcrun simctl launch "$UDID" "$BUNDLE_ID" -composer-regression-preview
+  for attempt in $(seq 1 30); do
+    [[ -s "$report" ]] && break
+    sleep 1
+  done
+  test -s "$report"
+  test -s "$container/Documents/composer-regression.png"
+  swift "$ROOT/scripts/ios-join-preview-captures.swift" "$OUT" "$container/Documents/composer-regression.png" "$OUT"
+  python3 - "$report" <<'COMPOSER_REPORT'
+import json, sys
+report = json.load(open(sys.argv[1]))
+expected = {
+    "initial short draft does not scroll", "typed growth enables scrolling",
+    "typed input reached the binding", "typed shrink disables scrolling",
+    "narrow width enables overflow scrolling", "wider width disables overflow scrolling",
+    "programmatic edit clamps the selection", "programmatic cursor remains visible",
+    "typed growth viewport is capped at eight lines", "editing while scrolling preserves capped height",
+    "height-only resize uses the smaller viewport", "height-only resize keeps the cursor visible",
+    "unchanged layout preserves intentional reading offset", "horizontal drift recovers visible cursor",
+}
+checks = report.get("checks", {})
+print(json.dumps(report, sort_keys=True))
+if set(checks) != expected or any(value is not True for value in checks.values()) or report.get("passed") is not True:
+    sys.exit("real composer regression failed; inspect joined capture")
+COMPOSER_REPORT
+}
+
 if [[ ! -f "$BASELINE" ]]; then
   echo "TV-Face iOS baseline missing at $BASELINE — captured fresh screenshot at $OUT for review."
   test -s "$OUT"
+  capture_composer_regression
   exit 0
 fi
 
@@ -234,3 +271,5 @@ if mismatches:
     raise SystemExit(f"TV-Face screenshot differs from baseline ({mismatches} byte mismatches)")
 print(f"TV-Face screenshot matches baseline {baseline_path}")
 PNG_COMPARE
+
+capture_composer_regression

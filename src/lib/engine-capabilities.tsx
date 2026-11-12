@@ -880,36 +880,41 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
     capabilities: {
       files: "yes",
       terminal: "yes",
-      thisComputer: "no",
-      imageAttachments: "no",
-      connectedApps: "no",
-      crossBotCoordination: "no",
-      roomCoordination: "no",
-      computerUse: "no",
+      thisComputer: "yes",
+      imageAttachments: "yes",
+      connectedApps: "yes",
+      crossBotCoordination: "yes",
+      roomCoordination: "yes",
+      computerUse: "yes",
       voiceChat: "no",
       webAccess: "yes",
       longContext: "yes",
       liveResearch: "no",
     },
     capabilityNotes: {
-      connectedApps:
-        "This driver spawns the ZCode CLI directly and declares no MCP wiring, so BotFleet's servers are not mounted for it.  BotFleet does not wire this here.",
-      computerUse:
-        "This driver declares no host-control wiring.  BotFleet does not wire this here.",
+      thisComputer:
+        "ZCode ACP turns run on the zcode-acp-server bridge, which mounts BotFleet's local computer channel; a bot on this engine reaches the host desktop under the standard approval cards.  The headless CLI driver mounts nothing.",
       imageAttachments:
-        "Turns are sent as text prompts only; BotFleet does not wire attachments into this driver.",
+        "ZCode ACP turns carry image and PDF attachments natively (the bridge stages embedded resources for the backend); the headless CLI driver takes text prompts only.",
+      connectedApps:
+        "The ZCode ACP driver mounts the Connected Apps via Composio bridge alongside the team and computer channels.  The headless CLI driver declares no MCP wiring, so BotFleet's servers are not mounted for it.",
+      crossBotCoordination:
+        "The ZCode ACP driver mounts BotFleet's team tools, so a ZCode bot can delegate work to peers and answer when asked; the headless CLI driver does not.",
+      roomCoordination: "The ZCode ACP driver mounts the room channel with the team tools; the headless CLI driver does not.",
+      computerUse:
+        "The ZCode ACP driver mounts BotFleet's screen channel so a bot can inspect and drive a desktop under the standard approval cards; the headless CLI driver declares no host-control wiring.",
       webAccess:
-        "The ZCode CLI registers WebSearch as a core read-only tool (apps/zcode-cli/packages/core/src/tool/scheduler.ts, implemented in tool/handlers/websearch.ts).  This driver runs --mode yolo and its --disallowed-tools only removes AskUserQuestion, EnterPlanMode, and ExitPlanMode, so search stays mounted in headless turns.",
+        "The ZCode CLI registers WebSearch as a core read-only tool (apps/zcode-cli/packages/core/src/tool/scheduler.ts, implemented in tool/handlers/websearch.ts), and both drivers run it:  the ACP bridge drives the official app-server with the full tool set, and the headless driver's --disallowed-tools removes only the ask tools.",
       longContext:
-        "This driver passes --model GLM-5.3 unless the turn names another model, and GLM-5.3 documents a 1M-token context window.  Source:  https://docs.z.ai/guides/llm/glm-5.3 (fetched 2026-11-03).",
+        "GLM-5.3 documents a 1M-token context window and is the default model on both drivers.  Source:  https://docs.z.ai/guides/llm/glm-5.3 (fetched 2026-11-03).",
       liveResearch:
         "The CLI's modes are build, edit, plan, yolo, and guarded; there is no dedicated multi-step research pass, only single-shot WebSearch.",
     },
     whyThisEngine: {
-      headline: "Z.ai's GLM Coding Plan CLI, driven headless.",
+      headline: "Z.ai's GLM Coding Plan agent — over ACP or headless.",
       prose: [
-        "BotFleet drives the ZCode CLI headless.  One prompt per turn, NDJSON events back, resume by session id.  Files and terminal are available inside the CLI's own workspace.",
-        "This computer, connected apps, computer use, cross-bot coordination, and rooms are not wired on this driver; voice chat and image attachments are not available.",
+        "BotFleet drives ZCode two ways.  The ACP engine speaks the Agent Client Protocol to the zcode-acp-server bridge, which runs the official zcode app-server:  BotFleet's team, computer, screen and Connected Apps channels mount, image and PDF attachments ride along, sessions resume, and the model and thought level switch per turn.",
+        "The headless driver spawns the zcode CLI one prompt per turn, NDJSON events back, resume by session id, with no MCP wiring \u2014 files, terminal and web search inside the CLI's own workspace.",
         "Turns ride the GLM Coding Plan behind the Mac's own ZCode sign-in, so a reported cost is notional.",
       ],
     },
@@ -1430,6 +1435,11 @@ export function engineIdFromDriverKind(driverKind: string | undefined | null): s
   // from Go to OpenCode.  The registry id follows the product name, so the
   // kind needs spelling out here.
   if (normalized === "opencodego") return "opencode";
+  // The ZCode ACP bridge driver rides the same engine row as the headless
+  // CLI (the grok pair precedent): one row, notes name which driver mounts
+  // what. `zcodeAcp` normalizes to `zcodeacp`, which matches nothing without
+  // this alias.
+  if (normalized === "zcodeacp") return "zcode";
   // antigravity / cursor / claude / codex / grok / deepseek all collapse
   // to their registry id after the Agent suffix strip.
   if (ENGINE_CAPABILITIES[normalized]) return normalized;

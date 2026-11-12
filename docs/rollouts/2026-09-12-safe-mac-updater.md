@@ -4,7 +4,7 @@ Issue #319 replaces the machine-only update script with a tracked, tested transa
 
 ## Transaction
 
-`scripts/update-botfleet.sh` launches `scripts/update-botfleet-mac.mjs` from the detached always-on checkout.  The implementation has four commands:
+`scripts/update-botfleet.sh` launches `scripts/update-botfleet-mac.mjs` from the detached always-on checkout.  The implementation has six commands:
 
 ```sh
 # Compose both phases for an ordinary update from current origin/main.
@@ -29,6 +29,12 @@ scripts/update-botfleet.sh apply --stage /absolute/path/to/stage
 
 # Recover admission if an interrupted updater fenced the harness but did not stop it.
 scripts/update-botfleet.sh unquiesce
+
+# Show the installed build, any staged update, pending recovery, backups and the last result.
+scripts/update-botfleet.sh status
+
+# Restore the newest backup.  A second run does nothing when the install already matches.
+scripts/update-botfleet.sh recover
 ```
 
 `prepare` fetches and pins a commit reachable from `origin/main`, requires a private stage and a clean staging checkout distinct from the live checkout, installs the frozen lockfile, and packages with the stable Developer ID identity.  The optional import form avoids rebuilding an existing artifact from that exact source and requires its dependency tree at the same time.  Both forms verify the code signature, Team ID, bundle ID, generated `Contents/Resources/server/build-identity.json`, and dependency fingerprint.  A dirty, mislabeled, symlinked, or publicly writable stage is rejected.  The command persists the signed application and exact staged `node_modules` tree before releasing a disposable worktree.
@@ -54,6 +60,16 @@ Discovery covers the stage this run is applying even when `--stage` places it ou
 The live checkout, application bundle, and dependency tree move only after staging and quiescence succeed.  Same-volume renames retain the prior bundle and dependency tree while the checkout retains the prior commit.  Startup must prove the exact expected runtime and one data owner before the transaction succeeds.  Before rollback interrupts a failed replacement, the updater re-proves complete authenticated idle state.  If work began during startup verification or readiness is unknown, it leaves the replacement and every prior recovery copy intact, writes `pending-recovery.json` in the private stage, and exits unsuccessfully for supervised recovery after the work drains.  Otherwise, a checkout, copy, launchd, startup, identity, or attachment failure restores the prior bundle, dependency tree, and checkout and restarts only the components that were running before the attempt.
 
 The desktop keeps the local update in `installing` state while its detached process runs.  At two minutes and again after one hour it reports progress without claiming failure or suggesting a concurrent retry; only a child-process error or nonzero exit marks the update failed.
+
+## Resources Guard, Pending Recovery, Status And Recover
+
+Before the installed app bundle is swapped, the updater compares `Contents/Resources` with the code-signature seal.  A file the seal does not name is a leftover.  A sealed file whose bytes or symlink target differ is a modification.  Finder `.DS_Store` files and AppleDouble `._` names are ignored, so opening the bundle in Finder does not block an update.  A helper the seal records with a cdhash is a nested bundle: the files inside it belong to that helper's own signature and are not leftovers.  When anything else differs, the update refuses and names the paths.  `--force` copies those paths under `~/Library/Caches/BotFleet/updates/resource-backups/` and continues.  A seal that cannot be read does not count as drift, and a clean Resources tree takes the same path as before.
+
+A successful update then probes the live harness.  Only a `live-ok` result deletes `pending-recovery.json` markers left by an earlier deferred rollback.  Anything short of that leaves the markers in place.  The update's own success is already recorded before this cleanup, so a cleanup problem does not roll the new build back.
+
+`ubf status` prints the installed version and commit, any staged update whose commit is not the installed one, a running update when the lock is held, pending-recovery markers, backup locations, and the last result.  It does not change the app.
+
+`ubf recover` restores the newest of those backups and leaves the backup where it is.  A rollback bundle is copied back into place when the installed build differs, and only while BotFleet is not running.  A Resources backup is copied back the same way.  A second run finds the installed files already match and does nothing.
 
 ## Rollout Ownership
 

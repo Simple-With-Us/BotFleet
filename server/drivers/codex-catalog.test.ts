@@ -486,7 +486,7 @@ name = "oMLX"
     const instance = await CodexDriver.create({
       instanceId: "codex-catalog",
       displayName: "Codex",
-      environment: { HOME: home },
+      environment: { HOME: home, CODEX_HOME: join(home, ".codex") },
       enabled: true,
       config: { ...CodexDriver.defaultConfig(), cli: FAKE_CLI },
     });
@@ -505,7 +505,7 @@ name = "oMLX"
     const instance = await CodexDriver.create({
       instanceId: "codex-catalog-keep",
       displayName: "Codex",
-      environment: { HOME: home, FAKE_CODEX_DOWN_FILE: down },
+      environment: { HOME: home, CODEX_HOME: join(home, ".codex"), FAKE_CODEX_DOWN_FILE: down },
       enabled: true,
       config: { ...CodexDriver.defaultConfig(), cli: FAKE_CLI },
     });
@@ -533,7 +533,7 @@ name = "oMLX"
     const instance = await CodexDriver.create({
       instanceId: "codex-catalog-cold",
       displayName: "Codex",
-      environment: { HOME: home, FAKE_CODEX_DOWN_FILE: down },
+      environment: { HOME: home, CODEX_HOME: join(home, ".codex"), FAKE_CODEX_DOWN_FILE: down },
       enabled: true,
       config: { ...CodexDriver.defaultConfig(), cli: FAKE_CLI },
     });
@@ -552,7 +552,7 @@ name = "oMLX"
     const instance = await CodexDriver.create({
       instanceId: "codex-catalog-static",
       displayName: "Codex",
-      environment: { HOME: home, FAKE_CODEX_DOWN_FILE: down },
+      environment: { HOME: home, CODEX_HOME: join(home, ".codex"), FAKE_CODEX_DOWN_FILE: down },
       enabled: true,
       config: { ...CodexDriver.defaultConfig(), cli: FAKE_CLI },
     });

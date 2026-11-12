@@ -56,6 +56,20 @@ let package = Package(
             dependencies: ["CompanionCore"],
             path: "Scripts/StoreImportParityProbe"
         ),
+        // The replay parity probe (BF-2647).  It replays each engine's
+        // recorded turns through the native drivers and writes the
+        // per-engine report the decommission evidence bundle reads.  The
+        // engine list comes from the bundle request, so the probe and the
+        // receipt cannot disagree about which engines are in scope, and an
+        // engine with no replay family behind it earns a failing check with
+        // the reason named rather than a passing one.
+        // Run with
+        // `swift run --package-path ios EngineReplayParityProbe -- --request <bundle-request.json> --out <report.json>`.
+        .executableTarget(
+            name: "EngineReplayParityProbe",
+            dependencies: ["CompanionCore"],
+            path: "Scripts/EngineReplayParityProbe"
+        ),
     ],
     swiftLanguageModes: [.v5]
 )

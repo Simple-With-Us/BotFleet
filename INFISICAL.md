@@ -1,12 +1,14 @@
 # INFISICAL.md — BotFleet
 
-Owner directive (2026-10-03): Infisical is the sole source of truth for every app — secrets, env variables, and tunable settings knobs.  "Truth" means everything an app's behavior depends on that is not code.  Per-user settings stay in the app's own store and never go in Infisical.
+The managed Infisical connection is optional in BotFleet.  When an install connects it, Infisical is canonical only for the mapped names this app reads and writes.  An install can keep using its local configuration without connecting a vault.  Per-user settings stay in the app's own store and never go in Infisical.
+
+The connection toggle controls the backend and native credential resolvers.  Startup server-target enrollment in the packaged Electron shell and the managed shell launcher bootstrap are separate paths that currently run before this product setting controls access.  BF-2636 tracks an explicit local opt-in before their Keychain, credential-helper or vault access; AFC-600 owns the separate live credential handoff.  An existing remote enrollment must keep its fail-closed behavior rather than silently choose a local server.  Work already initiated while the managed connection was enabled may finish before the next live-state guard; queued refreshes and later credential or HTTP stages do not start after disable, and late read results are discarded.
 
 BotFleet's Infisical project: **BotFleet** (`836aebe2-c8f7-4e09-978e-7e3e82500bce`), environments `dev` / `staging` / `prod`.  The harness reads the `prod` environment by default (`DEFAULT_INFISICAL_ENVIRONMENT` in `server/config.ts`).
 
 ## The policy
 
-- Infisical holds secrets (provider API keys, tokens, webhook signing secrets), env config (service URLs, collections, integration endpoints), and tunable settings knobs (job limits, admission thresholds, Sentry sample rates, the spend ceiling, the Infisical refresh cadence itself).
+- When enabled, Infisical holds the mapped secrets (provider API keys, tokens, webhook signing secrets), env config (service URLs, collections, integration endpoints), and tunable settings knobs (job limits, admission thresholds, Sentry sample rates, the spend ceiling, the Infisical refresh cadence itself).  BotFleet defaults to the service-token auth method; machine identity is available only when explicitly selected in this app's settings.
 - Per-user settings live in BotFleet's own store (the bot/room/thread database) and are **explicitly out of scope** — they never go in Infisical.  See "What stays out" below.
 - Local dev overrides are documented in `.env.example`; real values are never committed.
 - Secret values never appear in code, logs, PR bodies, or chat — names and metadata only.
@@ -72,7 +74,7 @@ The seat is the bot's role seat, the one the launch identity carries (`BF-ORACLE
 
 These four are not config fields, so they are not in the snapshot above and not in `loadConfig()`.  The seat comes from the launch identity, so one bot's login goes to that bot's launched child process and to no other.  The value goes from the vault into that child's environment and nowhere else:  never into `cfg`, never into `process.env`, never into a log line, an error message or the status view.  A child never inherits a login from the harness process — the four names are removed from the child's environment before the seat's own value goes in — so a bot with no seat gets no login at all, rather than somebody else's.
 
-The read is per seat, cached for 15 minutes, and happens in the BACKGROUND (`server/cli-logins.ts`).  A turn's child is spawned with whatever the cache holds, and a turn that names a seat starts the read:  the turns after the first have the login.  The read is deliberately not awaited in the turn path, because a vault read there would suspend the driver between the turn's guard and the registration that follows it, and a second turn on the same thread would then walk through a guard the first one already passed.  A failed read keeps the last good value and is not retried for a minute.  The credential is the machine identity the harness already holds:  the second project is addressed with a project id, not with a second credential.  That project id is never committed — it comes from the environment variable the fleet's own tools read, `INFISICAL_FLEET_OPS_PROJECT_ID`, and the product server reads nothing else for it.  A host without that variable has no fleet project to address, and is told so instead of reading BotFleet's own project.
+The read is per seat, cached for 15 minutes, and happens in the BACKGROUND (`server/cli-logins.ts`).  A turn's child is spawned with whatever the cache holds, and a turn that names a seat starts the read: the turns after the first have the login.  The read is deliberately not awaited in the turn path, because a vault read there would suspend the driver between the turn's guard and the registration that follows it, and a second turn on the same thread would then walk through a guard the first one already passed.  A failed read keeps the last good value and is not retried for a minute.  Cross-project CLI login reads use an explicitly configured dedicated token source scoped to the exact Fleet-OPS project, environment, and folder; the product does not reuse BotFleet's primary token or machine identity for another project.
 
 ### Tunable knobs (`server/knob-map.ts`)
 
@@ -85,6 +87,9 @@ The read is per seat, cached for 15 minutes, and happens in the BACKGROUND (`ser
 | `BOTFLEET_JOBS_MIN_FREE_DISK_MB` | jobs.admission.minFreeDiskMb | float | ≥ 0 |
 | `BOTFLEET_JOBS_MIN_FREE_INODES` | jobs.admission.minFreeInodes | integer | ≥ 0; unset by default, measured inventory required before selecting a floor |
 | `BOTFLEET_WEBHOOK_HOT_DEFER_MINUTES` | jobs.webhookHotDeferMinutes | int | 1–720 |
+| `BOTFLEET_WEBHOOK_PAYLOAD_DEDUPE_SECONDS` | jobs.webhookPayloadDedupeSeconds | int | 0–3600; absent means 120 seconds, and 0 disables |
+| `BOTFLEET_PLACEMENT_HEARTBEAT_SECONDS` | placement.heartbeatSeconds | int | 1–3600 |
+| `BOTFLEET_PLACEMENT_UNREACHABLE_AFTER_SECONDS` | placement.unreachableAfterSeconds | int | 16–86400; longer than the heartbeat period |
 | `BOTFLEET_TRACES_SAMPLE_RATE` | observability.tracesSampleRate | float | 0–1 |
 | `BOTFLEET_AI_TRACES_SAMPLE_RATE` | observability.aiTracesSampleRate | float | 0–1 |
 | `BOTFLEET_HTTP_TRACES_SAMPLE_RATE` | observability.httpTracesSampleRate | float | 0–1 |
@@ -125,7 +130,7 @@ The environment is built from the in-memory config the harness already holds (th
 
 ## What stays out (deliberately)
 
-- **The store's own identity**: a service token (`INFISICAL_TOKEN` for reads, `INFISICAL_WRITE_TOKEN` for writes) or, for an install that has not migrated yet, the machine identity (`infisical.clientId` / `clientSecret`, env `INFISICAL_CLIENT_ID` / `INFISICAL_CLIENT_SECRET`): a lock cannot hold its own key.  It lives in the environment (`scripts/botfleet-server-start.sh` fetches the tokens from Fleet-OPS) or in Settings > Secrets, never in the vault.
+- **The store's own authentication**: BotFleet is optional; when enabled, the default method uses `INFISICAL_TOKEN` for reads and the separate `INFISICAL_WRITE_TOKEN` for writes.  A missing or rejected token does not activate machine identity.  An operator may explicitly select this install's machine identity in Settings > Secrets.  Store authentication lives in the process environment or the encrypted Settings credential store, never in the vault it unlocks.  The managed launch bootstrap binding is documented in [the Nov 3 service-token rollout](docs/rollouts/2026-11-03-service-token-bindings.md); live provisioning and helper authentication remain an AFC-600 handoff.
 - **The store's own timeouts** (`OMB_INFISICAL_CALL_TIMEOUT_MS`, `OMB_INFISICAL_BOOT_TIMEOUT_MS`): they are read before the first login, so the vault they would come from does not exist yet.
 - **Per-user settings**: bot and room configuration, per-bot transports, notification and UI preferences, per-user API keys.  These live in BotFleet's own database, never in Infisical.
 - **Launch-time process parameters** (ports, data directories, updater paths, `BOTFLEET_TOKEN`): these shape the process before settings load and stay as env/flags.

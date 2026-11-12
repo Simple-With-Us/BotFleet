@@ -1061,6 +1061,26 @@ describe("Store task usage", () => {
     })).toEqual({ input: 30, output: 3, costUsd: 0.02, lastInput: 20, turns: 2 });
   });
 
+  it("keeps the window the engine reported and does not invent one", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    expect(store.addTaskUsage(bot.id, bot.threadId, {
+      input: 910_800,
+      output: 20,
+      costUsd: null,
+      contextWindow: 1_000_000,
+    })?.contextWindow).toBe(1_000_000);
+    expect(store.addTaskUsage(bot.id, bot.threadId, {
+      input: 40_000,
+      output: 2,
+      costUsd: null,
+    })?.contextWindow).toBe(1_000_000);
+    expect(store.addTaskUsage(bot.id, bot.threadId, {
+      costUsd: null,
+      contextWindow: 0,
+    })?.contextWindow).toBe(1_000_000);
+  });
+
   it("counts a turn that reported no tokens at all", () => {
     const store = new Store(selection);
     const bot = store.createBot();

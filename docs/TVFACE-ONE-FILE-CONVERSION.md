@@ -1,54 +1,45 @@
 # TV-Face One-File Conversion
 
-Target:  256×256 animated WebP with an embedded manifest.  Keep the shipped glossy orange TV head and cyan neon visor glyphs.  The head stays still on a transparent background.  Do not redesign.
+Target:  256×256 animated WebP with an embedded manifest.  Keep the shipped glossy TV head and cyan neon visor glyphs (red glyphs on green).  The head stays still on a transparent background.  Do not redesign.
 
 ## Status
 
-This conversion is not finished.  Nothing loads the two packs below yet, so the app still draws TV-Face from its existing skins.
+The one-file player is wired.  `TVFaceAvatar` loads a pack from `public/tv-face/packs/` through `AnimatedFileAvatar` when `tvFaceOneFilePackUrl(color, state)` returns a URL.  Colors without a pack still use the multi-GIF skin tree.
+
+## Packs On Main
+
+| File | Role |
+|---|---|
+| `tvface-default.webp` | Orange / default expanded: `*`, working, speaking, listening, tools, computer, memory (enter/hold/return where art ships) under 2 MB |
+| `tvface-thinking.webp` | Orange denser pack used only for pure `thinking` |
+| `tvface-blue.webp` … `tvface-black.webp` | Thin color shells (`*`, working, speaking).  Expanded states fall back to multi-GIF until recolored |
+
+Orange and `default` share `tvface-default.webp`.  Pure `thinking` on orange prefers `tvface-thinking.webp`.  Working / tools / computer / memory / listening on orange use the expanded default pack.  Other colors use their color pack for idle/working/speaking; thinking-class expanded states still use multi-GIF until shells are re-expanded.
+
 
 ## Demos Already On Main
 
 `tests/fixtures/avatar/`:
 
-- `tvface-working-demo.webp`:  resting loop only (`*` hold 0–35)
-- `tvface-three-part-demo.webp`:  enter, hold and return for working (152 frames after folding)
-- `tvface-speaking-demo.webp`:  resting and speaking holds (107 frames)
+- `tvface-working-demo.webp`
+- `tvface-three-part-demo.webp`
+- `tvface-speaking-demo.webp`
 
-These were built from the `public/tv-face/skins/default` GIFs with `scripts/avatar-build.ts`, with the source scaled from 480 to 256.
+## Building Color Packs From The Default Pack
 
-## Packs From Existing Art
+1. Extract frames:  `magick public/tv-face/packs/tvface-default.webp -coalesce -scene 0 frames/f%03d.png`
+2. Recolor shell pixels (same masks as `scripts/tv-face-build-color-skins.py`).
+3. Encode with `img2webp -loop 0 -d 83 -lossless … -o raw.webp`
+4. Embed the AVAT manifest (same frame ranges as default; `name` = `tvface-<color>`).
 
-Sizes and states below come from `--inspect` on the committed files.
+Multi-GIF color skins under `public/tv-face/skins/{color}/` remain for desktop bundles and as a fallback when a one-file pack is not registered in `SHIPPED_ONE_FILE_PACKS`.
 
-| File | Size | Frames | States |
-|---|---|---|---|
-| `public/tv-face/packs/tvface-default.webp` | 2.13 MB | 222 | `*` hold, `working` enter, hold and return, `speaking` hold |
-| `public/tv-face/packs/tvface-thinking.webp` | 618 KB | 152 | `*` hold, `thinking` and `working` enter, hold and return |
 
-BF-2627 asks for under 2 MB, so the default pack is slightly over.
+## Size budget (BF-2627)
 
-Recipe for the default skin:
+Every shipped pack under `public/tv-face/packs/` must stay under 2 MB.  Packs that were slightly over were re-encoded lossy at 256×256 (quality ~70) with the same frame count and AVAT ranges re-embedded.  Expanding to the full TVFACE_MANIFEST expression set still requires a Mac seat running `scripts/avatar-build.ts` against the multi-GIF art.
 
-```bash
-# 1) Extract and scale the GIF frames
-magick public/tv-face/skins/default/gifs/resting_hold.gif -coalesce -resize 256x256 PNG32:frames/rest/%03d.png
-magick public/tv-face/skins/default/gifs/speaking_hold.gif -coalesce -resize 256x256 PNG32:frames/speak/%03d.png
-# Concatenate into one sequence 000..N, then write avatar.json with the frame ranges
 
-# 2) Build and embed the manifest
-node --experimental-strip-types scripts/avatar-build.ts ./frames \
-  --manifest ./avatar.json --out ./tvface-default.webp
+## Expanded default (BF-2627)
 
-# Inspect
-node --experimental-strip-types scripts/avatar-build.ts --inspect ./tvface-default.webp
-```
-
-Notes:
-
-- The manifest's `frame.width` and `frame.height` are the delivery size, 256.  The build scales the source down and never up.
-- Identical seam frames fold, and the build remaps the ranges.  See the three-part demo and `tvface-thinking`.
-- The wildcard `*` means other bot states need no re-cut art.
-
-## Full Multi-Expression Pack (Later)
-
-Map each of the 13 transition expressions and the non-transition holds into named states in one file, or ship several focused packs.  Prefer one default pack with `*`, `speaking` and the deep-work three-part states, thinking and working first.
+The default pack now embeds thinking / working / speaking / listening / tools / computer / memory ranges.  Build recipe: `python3 scripts/tv-face-expand-onefile-packs.py --skin public/tv-face/skins/default --out public/tv-face/packs/tvface-default.webp`.  Color shells still need a Mac recolor pass from the expanded frames.
