@@ -165,6 +165,34 @@ export function engineReachKnown({
   return instances.length > 0 || hydrationStatus === "ready";
 }
 
+/** Shown while the engine list has not arrived, so a grey remote choice is
+ *  never a silent control and never a claim about an engine we have not seen. */
+export const COMPUTER_REACH_CHECKING = "Checking which computers this engine can use.";
+
+function engineDisplayName(
+  instances: InstanceInfo[],
+  bot: Pick<Bot, "modelSelection">,
+): string {
+  const engine = instances.find((candidate) => candidate.instanceId === bot.modelSelection.instanceId);
+  const name = engine?.displayName?.trim();
+  return name ? name : "This engine";
+}
+
+/** Host tools only: no box, no VPS, no Local VM.  That is the harness HTTP
+ *  tool loop (Grok, MiniMax, OpenAI-compatible). */
+function isLocalOnlyReach(reach: ComputerReach | null): boolean {
+  return reach !== null && reach.local && !reach.box && !reach.vps && !reach.vm;
+}
+
+function localHostPhrase(platformIsMac: boolean): string {
+  return platformIsMac ? "this Mac" : "this computer";
+}
+
+/** One sentence for an engine that cannot leave the host. */
+export function localOnlyComputerReason(name: string, platformIsMac: boolean): string {
+  return `${name} runs only on ${localHostPhrase(platformIsMac)}.`;
+}
+
 /** Why a computer destination is not offered, in the words the picker shows.
  * `null` means it is available. */
 export function computerDestinationDisabledReason(
@@ -172,15 +200,58 @@ export function computerDestinationDisabledReason(
   instances: InstanceInfo[],
   bot: Pick<Bot, "modelSelection">,
   cloudBackend: CloudBackend,
+  platformIsMac = true,
 ): string | null {
   const supported =
     mode === "vm"
       ? instanceSupportsLocalVm(instances, bot)
       : instanceSupportsCloudComputer(instances, bot, cloudBackend);
   if (supported) return null;
-  const engine = instances.find((candidate) => candidate.instanceId === bot.modelSelection.instanceId);
-  const name = engine?.displayName ?? "This engine";
+  const name = engineDisplayName(instances, bot);
+  const reach = reachFor(instances, bot);
+  if (isLocalOnlyReach(reach)) return localOnlyComputerReason(name, platformIsMac);
   return mode === "vm"
     ? `${name} cannot drive a Local VM.\u00A0 Choose Claude or an ACP engine, or another destination.`
     : `${name} cannot drive a remote desktop.\u00A0 Choose Claude or an ACP engine, or another destination.`;
+}
+
+/** The line under the Box / Self-hosted VPS control.
+ *
+ * `null` means both remote backends are available, so the control stays
+ * quiet.  A local-only engine gets one plain sentence instead of a tooltip
+ * on a button that still looks clickable. */
+export function cloudBackendUnavailableNote(
+  instances: InstanceInfo[],
+  bot: Pick<Bot, "modelSelection">,
+  platformIsMac: boolean,
+): string | null {
+  const vps = instanceSupportsCloudComputer(instances, bot, "vps");
+  const box = instanceSupportsCloudComputer(instances, bot, "box");
+  if (vps && box) return null;
+  const name = engineDisplayName(instances, bot);
+  const reach = reachFor(instances, bot);
+  if (isLocalOnlyReach(reach)) return localOnlyComputerReason(name, platformIsMac);
+  if (!vps && !box) return `${name} cannot use a remote computer.`;
+  if (!vps) {
+    return `${name} can't run a desktop on your own server.\u00A0 Pick an engine that can control a computer, such as Claude, to use Self-hosted VPS.`;
+  }
+  return `${name} cannot drive a remote desktop.\u00A0 Choose Claude or an ACP engine, or another destination.`;
+}
+
+/** The one line under Runs On.
+ *
+ * The cloud-backend picker shows the remote reason itself, so this stays
+ * quiet when it would only repeat that sentence. */
+export function runsOnDisabledNote(
+  cloudReason: string | null,
+  vmReason: string | null,
+  pickerNote: string | null,
+  pickerVisible: boolean,
+): string | null {
+  for (const reason of [cloudReason, vmReason]) {
+    if (!reason) continue;
+    if (pickerVisible && reason === pickerNote) continue;
+    return reason;
+  }
+  return null;
 }
