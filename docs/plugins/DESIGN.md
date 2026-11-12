@@ -7,6 +7,12 @@ to this repo.  Plugins are user data, not repo code.
 This document is the contract.  The code mirrors it.  Open questions sit
 at the end and are deliberately not guessed.
 
+Host API v2 (events, settings, secrets, dispatcher routing) is
+specified in `docs/plugins/EVENT-PLATFORM.md`, which extends this
+contract without changing anything v1 promises: v1 manifests load
+unchanged, and cards/commands work as before.  The reference
+integration is `docs/plugins/zulip-plugin/`.
+
 ## Goals
 
 1.  Adding, removing, updating, enabling, or disabling a plugin never

@@ -349,6 +349,10 @@ export class HelperTracker {
     this.removeActiveHelper(live.snapshot.threadId, live.snapshot.id);
     this.pendingSteps.delete(helperKey);
     this.settledKeys.add(helperKey);
+    if (this.settledKeys.size > 500) {
+      const oldest = this.settledKeys.values().next().value;
+      if (oldest !== undefined) this.settledKeys.delete(oldest);
+    }
     const threadPrefix = `${live.snapshot.threadId}:`;
     for (const [child, parentId] of this.childOf) {
       if (child.startsWith(threadPrefix) && parentId === live.snapshot.id) this.childOf.delete(child);

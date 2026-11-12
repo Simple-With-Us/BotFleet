@@ -367,6 +367,27 @@ const shutdown = async (signal: string): Promise<void> => {
 process.on("SIGINT", () => void shutdown("SIGINT"));
 process.on("SIGTERM", () => void shutdown("SIGTERM"));
 
+// Opt-in parent-death watchdog, used only by the launchd supervisor.
+//
+// "Supervision" has two halves: the supervisor must keep this process alive,
+// and this process must not outlive its supervisor. A SIGKILLed supervisor
+// cannot run cleanup and cannot signal its children, so without this the
+// sidecar survives as an orphan still holding :8810 — the app then finds a
+// port it cannot account for and refuses to start a companion of its own.
+//
+// The mechanism is the same parent-death pipe the managed connector guardian
+// already uses: the supervisor holds the write end of our stdin open for as
+// long as it is alive, so EOF means it is gone. Opt-in because Electron's
+// `utilityProcess.fork` runs us with stdin closed, where EOF is immediate and
+// unconditional — treating that as parent death would kill every in-app
+// sidecar on launch.
+if (process.env.OMB_COMPANION_PARENT_STDIN === "1") {
+  process.stdin.on("end", () => void shutdown("stdin EOF"));
+  process.stdin.on("close", () => void shutdown("stdin EOF"));
+  process.stdin.on("error", () => void shutdown("stdin EOF"));
+  process.stdin.resume();
+}
+
 main().catch((error: unknown) => {
   console.error(error instanceof Error ? error.message : String(error));
   process.exit(1);

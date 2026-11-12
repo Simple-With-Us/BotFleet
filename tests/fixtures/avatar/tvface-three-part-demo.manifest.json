@@ -1,0 +1,35 @@
+{
+  "formatVersion": 1,
+  "name": "tvface-three-part-demo",
+  "version": "1.0.0",
+  "author": "BotFleet",
+  "frame": {
+    "width": 256,
+    "height": 256,
+    "count": 152,
+    "delayMs": 83
+  },
+  "restingFrame": 0,
+  "states": {
+    "*": {
+      "hold": {
+        "from": 0,
+        "to": 35
+      }
+    },
+    "working": {
+      "enter": {
+        "from": 35,
+        "to": 58
+      },
+      "hold": {
+        "from": 58,
+        "to": 128
+      },
+      "return": {
+        "from": 128,
+        "to": 151
+      }
+    }
+  }
+}

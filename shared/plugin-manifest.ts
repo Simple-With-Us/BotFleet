@@ -18,7 +18,7 @@ import {
   parsePluginNetworkAllow,
 } from "./plugin-net-allow.ts";
 
-export const HOST_API_VERSION = 1;
+export const HOST_API_VERSION = 2;
 
 /** Recursive JSON value type.  Mirrors server/schema.ts § JsonValue.
  *  Declared here so a caller at the shared/plugin-manifest.ts boundary
@@ -62,9 +62,15 @@ export const SEMVER = /^\d+\.\d+\.\d+$/;
 const SUPPORTED_BOTFLEET_RANGE =
   /^(?:\d+|\d+\.\d+\.\d+|>=\s*\d+|<=\s*\d+|[\^~]\s*\d+\.\d+\.\d+)$/;
 
-/** Capability allowlist for v1.  Adding a new capability is a breaking
- *  change because plugins render this without a fallback.  Unknown
- *  capabilities fail validation with the field name. */
+/** Capability allowlist for v2.  v1 shipped the three `read.*`
+ *  capabilities plus `net.hosts` (declared with `needs.network`;
+ *  without it, a host list is not granted); v2 adds the event-driven
+ *  integration scopes: `events.subscribe` (receive typed host events),
+ *  `chat.read` (scoped conversation summaries attached to events),
+ *  `dispatch.wake` (request a bot wake or thread continuation), and
+ *  `connector.reply` (reserved: send a reply through an approved
+ *  connector; enforced by the host, which owns the transport).
+ *  Unknown capabilities fail validation with the field name. */
 /** Declared with `needs.network`.  Without it, a host list is not granted. */
 export const NET_HOSTS_CAPABILITY = "net.hosts";
 
@@ -72,6 +78,10 @@ export const PLUGIN_CAPABILITIES = [
   "read.bots",
   "read.status",
   "read.config",
+  "events.subscribe",
+  "chat.read",
+  "dispatch.wake",
+  "connector.reply",
   NET_HOSTS_CAPABILITY,
 ] as const;
 export type PluginCapability = typeof PLUGIN_CAPABILITIES[number];
@@ -111,10 +121,60 @@ const commandContribution = z.object({
   args: z.array(z.string().min(1).max(64)).max(8).optional(),
 }).strict();
 
+const eventSubscriptionContribution = z.object({
+  id: z.string().min(1).max(PLUGIN_NAME_MAX)
+    .refine((value) => PLUGIN_NAME.test(value), {
+      message: `expected a slug (lowercase alphanumerics with single hyphens, max ${PLUGIN_NAME_MAX})`,
+    }),
+  source: z.enum(["zulip"], {
+    error: (issue) => `unknown event source "${String(issue.input)}"; allowed: zulip`,
+  }),
+  kinds: z.array(z.enum(["message"], {
+    error: (issue) => `unknown event kind "${String(issue.input)}"; allowed: message`,
+  })).min(1).max(8),
+  includeContent: z.boolean().optional().default(false),
+  includeChats: z.boolean().optional().default(false),
+  maxChats: z.number().int().min(0).max(20).optional().default(10),
+}).strict();
+
+/** One user-configurable plugin setting.  `type: "secret"` values are
+ *  write-only: they are stored by the host secret broker, never
+ *  returned to the UI, and never handed to plugin code.  A non-secret
+ *  setting whose key looks like a credential is rejected so secrets
+ *  cannot hide in plain settings. */
+const SECRET_SETTING_KEY = /key|token|secret|credential|password/i;
+const settingDefinition = z.object({
+  key: z.string().min(1).max(64)
+    .refine((value) => /^[a-z][a-zA-Z0-9_]{0,63}$/.test(value), {
+      message: "expected a setting key starting with a lowercase letter (letters, numbers, underscores, max 64)",
+    }),
+  label: z.string().min(1).max(120),
+  type: z.enum(["string", "number", "boolean", "secret"]),
+  required: z.boolean().optional().default(false),
+  default: z.json().optional(),
+  description: z.string().max(PLUGIN_DESCRIPTION_MAX).optional(),
+}).strict().superRefine((value, ctx) => {
+  if (value.type !== "secret" && SECRET_SETTING_KEY.test(value.key)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["key"],
+      message: `setting key "${value.key}" looks like a credential; use type "secret"`,
+    });
+  }
+  if (value.type === "secret" && value.default !== undefined) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["default"],
+      message: "secret settings must not carry a default value",
+    });
+  }
+});
+
 const contributes = z
   .object({
     cards: z.array(cardContribution).max(16).optional(),
     commands: z.array(commandContribution).max(16).optional(),
+    eventSubscriptions: z.array(eventSubscriptionContribution).max(8).optional(),
   })
   .strict()
   .superRefine((value, ctx) => {
@@ -139,6 +199,17 @@ const contributes = z
         });
       }
       seenCmd.add(cmd.name);
+    }
+    const seenSub = new Set<string>();
+    for (const sub of value.eventSubscriptions ?? []) {
+      if (seenSub.has(sub.id)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["eventSubscriptions"],
+          message: `duplicate subscription id "${sub.id}" within plugin`,
+        });
+      }
+      seenSub.add(sub.id);
     }
   })
   .optional();
@@ -207,9 +278,43 @@ export const pluginManifestSchema = z
       }),
     capabilities,
     contributes,
+    /** User settings schema.  Absent parses as []. */
+    settings: z.array(settingDefinition).max(32).optional().default([]),
+    /** Settings schema version.  Bumped when keys change shape; the
+     *  host runs the plugin's `migrateSettings` export on upgrade. */
+    settingsVersion: z.number().int().min(1).max(1000).optional().default(1),
     needs,
   })
-  .strict();
+  .strict()
+  .superRefine((value, ctx) => {
+    const seen = new Set<string>();
+    for (const setting of value.settings) {
+      if (seen.has(setting.key)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["settings"],
+          message: `duplicate setting key "${setting.key}" within plugin`,
+        });
+      }
+      seen.add(setting.key);
+    }
+    if ((value.contributes?.eventSubscriptions?.length ?? 0) > 0 &&
+      !value.capabilities.includes("events.subscribe")) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["capabilities"],
+        message: "eventSubscriptions requires the \"events.subscribe\" capability",
+      });
+    }
+    if ((value.contributes?.eventSubscriptions ?? []).some((sub) => sub.includeChats) &&
+      !value.capabilities.includes("chat.read")) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["capabilities"],
+        message: "subscriptions with includeChats require the \"chat.read\" capability",
+      });
+    }
+  });
 
 /** The full manifest as the host sees it after parsing.  Inferred from
  *  the schema, so consumer code relies on exactly what zod produced. */
@@ -263,8 +368,19 @@ export function parsePluginManifestJson(text: string): PluginManifestParseResult
 /** A conservative semver comparison that handles the four operators
  *  the manifest constraint accepts.  Returns true when `actual`
  *  satisfies `constraint`.  Anything we do not understand returns
- *  false — fail closed. */
+ *  false — fail closed.
+ *
+ *  Host API v2 retains the full v1 surface, so a host with major > 1
+ *  also satisfies any constraint satisfiable by major 1.  v1 plugins
+ *  (`"botfleet": "1"`, `"^1.0.0"`, `">=1"`) keep loading unchanged;
+ *  only constraints that name a newer major (e.g. `">=3"`) refuse. */
 export function satisfiesBotfleetVersion(constraint: string, actual: number): boolean {
+  if (satisfiesBotfleetMajor(constraint, actual)) return true;
+  if (actual > 1 && satisfiesBotfleetMajor(constraint, 1)) return true;
+  return false;
+}
+
+function satisfiesBotfleetMajor(constraint: string, actual: number): boolean {
   const trimmed = constraint.trim();
   // Bare major version: "1" means "host API major version 1".
   const bare = trimmed.match(/^(\d+)$/);

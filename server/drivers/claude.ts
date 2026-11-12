@@ -16,7 +16,8 @@ import { join, dirname } from "node:path";
 
 import { z } from "zod";
 
-import { DATA_DIR, stripWorkspaceCredentialEnv } from "../config.ts";
+import { claudeSessionIdleMs, DATA_DIR, loadConfig, stripWorkspaceCredentialEnv } from "../config.ts";
+import { ClaudeSingleCallLedger } from "../claude-billed-call.ts";
 import { stderrExcerpt } from "../stderr-excerpt.ts";
 import { augmentedPath } from "../env-path.ts";
 import { fileWritePaths } from "../auto-approve.ts";
@@ -50,7 +51,7 @@ export { STATIC_CLAUDE_MODELS };
 import { computerProxyEnv } from "../container-computer.ts";
 import { hostToolPrefix, turnComputerMounts } from "../computer-grants.ts";
 import { newEventId, newId } from "../contracts.ts";
-import { applyLaunchIdentity } from "../launch-identity.ts";
+import { cliLoginEnvironment, launchedChildEnvironment, primeCliLogin } from "../cli-logins.ts";
 import { classifyError, computeBackoff, interruptibleDelay, RETRY_MAX_ATTEMPTS } from "./retry.ts";
 import {
   applyClaudeInject,
@@ -375,14 +376,52 @@ function startsUnsolicitedTurn(frame: { type?: unknown; subtype?: unknown; state
   return frame.type === "system" && (frame.subtype === "init" || frame.subtype === "task_notification");
 }
 
-type TurnUsage = { input: number; output: number; cachedInput?: number };
+type TurnUsage = {
+  input: number;
+  output: number;
+  cachedInput?: number;
+  /** Cache writes (5 minute TTL, or a TTL the CLI did not break down).  Like
+   *  `cachedInput`, a subset of `input`, so `input` still reads as the whole
+   *  context the turn sent. */
+  cacheWrite5m?: number;
+  /** Cache writes to the 1 hour cache; also a subset of `input`. */
+  cacheWrite1h?: number;
+};
 
-/** Two reported usages as one, keeping the cache share when either has it. */
+/** The slice of the CLI's `usage` object the cache-write split reads. */
+type CliUsage = {
+  cache_creation_input_tokens?: number;
+  cache_creation?: { ephemeral_5m_input_tokens?: number; ephemeral_1h_input_tokens?: number };
+};
+
+/** The cache-write share of one Anthropic `usage` object, split by TTL.
+ * `cache_creation` carries the 5 minute and 1 hour figures.  An older CLI
+ * reports only the flat `cache_creation_input_tokens`, which files under 5
+ * minutes (the shared usage schema's rule for a TTL nobody reported).  Empty
+ * when the usage reported no cache write. */
+export function cacheWritesOf(usage: CliUsage | undefined): { cacheWrite5m?: number; cacheWrite1h?: number } {
+  const count = (value: number | undefined) => (value != null && Number.isFinite(value) && value > 0 ? Math.round(value) : 0);
+  const fiveMinutes = count(usage?.cache_creation?.ephemeral_5m_input_tokens);
+  const oneHour = count(usage?.cache_creation?.ephemeral_1h_input_tokens);
+  const writes: { cacheWrite5m?: number; cacheWrite1h?: number } = {};
+  if (fiveMinutes > 0 || oneHour > 0) {
+    if (fiveMinutes > 0) writes.cacheWrite5m = fiveMinutes;
+    if (oneHour > 0) writes.cacheWrite1h = oneHour;
+    return writes;
+  }
+  const flat = count(usage?.cache_creation_input_tokens);
+  if (flat > 0) writes.cacheWrite5m = flat;
+  return writes;
+}
+
+/** Two reported usages as one, keeping the cache shares when either has them. */
 function sumUsage(a: TurnUsage | undefined, b: TurnUsage | undefined): TurnUsage | undefined {
   if (!a) return b;
   if (!b) return a;
   const usage: TurnUsage = { input: a.input + b.input, output: a.output + b.output };
   if (a.cachedInput !== undefined || b.cachedInput !== undefined) usage.cachedInput = (a.cachedInput ?? 0) + (b.cachedInput ?? 0);
+  if (a.cacheWrite5m !== undefined || b.cacheWrite5m !== undefined) usage.cacheWrite5m = (a.cacheWrite5m ?? 0) + (b.cacheWrite5m ?? 0);
+  if (a.cacheWrite1h !== undefined || b.cacheWrite1h !== undefined) usage.cacheWrite1h = (a.cacheWrite1h ?? 0) + (b.cacheWrite1h ?? 0);
   return usage;
 }
 
@@ -978,9 +1017,14 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         /** Usage summed over this turn's own CLI results (each result's
          *  usage is that CLI turn's alone). */
         usage?: TurnUsage;
+        /** The model the provider says answered (the assistant frame's
+         *  `model`), which can differ from the one requested: an alias, a
+         *  fallback, a dated snapshot.  Last non-helper frame wins. */
+        servedModel?: string;
         /** Highest helper-token total already counted for one assistant
          *  message id.  Streamed frames repeat that message's usage. */
         helperUsage: Map<string, number>;
+        billedCalls: ClaudeSingleCallLedger;
         /** How this turn's latest own CLI turn ended: what the settle
          *  reports, once nothing more of the turn is still to run. */
         outcome?: { ok: boolean; stopReason: string | null };
@@ -1025,11 +1069,13 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
     const cliCostTotals = new Map<string, number>();
     const sessions = new Map<string, Session>();
     sweepReceiptsOnce();
-    const configuredIdleMinimum = Number(process.env.OMB_CLAUDE_SESSION_IDLE_MIN_MS);
-    const sessionIdleMinimum = Number.isFinite(configuredIdleMinimum) && configuredIdleMinimum > 0
-      ? configuredIdleMinimum
-      : 10_000;
-    const SESSION_IDLE_MS = Math.max(sessionIdleMinimum, Number(process.env.OMB_CLAUDE_SESSION_IDLE_MS) || 10 * 60_000);
+    // Resolved from cfg (file, vault knob, legacy env underneath — see
+    // `claudeSessionIdleMs` in server/config.ts) at create time, the same
+    // moment the env names were read before this became a knob.  A
+    // Settings save of `claudeSession` rebuilds the provider fleet, so the
+    // new window applies then; `loadConfig()` here follows the pattern
+    // server/container-computer.ts uses for its own cfg reads.
+    const SESSION_IDLE_MS = claudeSessionIdleMs(loadConfig());
 
     const closeSession = (threadId: string, why: string) => {
       const s = sessions.get(threadId);
@@ -1113,6 +1159,11 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
 
     const sendTurn = async (turn: SendTurnInput) => {
       const { threadId } = turn;
+      // The seat's CLI login is read in the BACKGROUND, and the read is started
+      // here, before the guard:  the guard and the registration that follows it
+      // have to stay free of `await`, or a second turn on this thread would walk
+      // through the guard the first one already passed.
+      primeCliLogin(turn.launchIdentity?.seat);
       if (active.has(threadId)) throw new Error("a turn is already running on this thread");
       const turnId = newId();
       let preflightCancelled = false;
@@ -1318,7 +1369,11 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       // The launch identity is per bot and per turn (`turnEnvironment` is the
       // instance's), and a retained process keeps the env it was spawned with,
       // so it is part of the contract key below.
-      const env = applyLaunchIdentity(claudeEnvironment(turnModel, turnEnvironment), turn.launchIdentity);
+      const env = launchedChildEnvironment(
+        claudeEnvironment(turnModel, turnEnvironment),
+        turn.launchIdentity,
+        cliLoginEnvironment(turn.launchIdentity?.seat),
+      );
       const cwd = turn.cwd ?? homedir();
       // everything that shapes the process, minus session/turn specifics
       // (the --mcp-config file is a fresh temp path each time; its CONTENT
@@ -1365,10 +1420,13 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       // Reuse the live process when it is idle, unchanged, and is the session
       // the harness wants resumed. Anything else: close it and spawn fresh
       // (with --resume, so the conversation continues in the new process).
+      // One user turn announces turn.started exactly once, even when a reused
+      // session fails its stdin write and the turn falls through to a fresh spawn.
+      let turnStartedEmitted = false;
       const live = sessions.get(threadId);
       if (live && !live.turn && !live.unsolicited && !live.closing && live.child.exitCode === null && live.argsKey === argsKey && (!sessionId || sessionId === live.sessionId)) {
         if (live.idleTimer) clearTimeout(live.idleTimer);
-        live.turn = { turnId, settled: false, sawStreamDelta: false, producedOutput: false, sends: new Set(), helperUsage: new Map(), input: turn, retry, retryAbort };
+        live.turn = { turnId, settled: false, sawStreamDelta: false, producedOutput: false, sends: new Set(), helperUsage: new Map(), billedCalls: new ClaudeSingleCallLedger(), input: turn, retry, retryAbort };
         live.engaged = false;
         live.foreignRunning = false;
         // stderr feeds the crash message; a warm process still holds turn
@@ -1386,25 +1444,30 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           broker: live.broker,
         });
         emit({ ...base(threadId, turnId), type: "turn.started" });
+        turnStartedEmitted = true;
         const plan = planTurnText(live.sessionId ?? sessionId ?? newSessionId!);
         live.pendingReceipt = plan.pending;
         const written = await writeUser(live, threadId, plan.text, plan.bare);
-        if (!written) {
-          live.pendingReceipt = null;
-          active.delete(threadId);
-          live.turn = null;
-          closeSession(threadId, "stdin write failed");
-          throw new Error("claude session stdin is not writable");
+        if (written) {
+          // the MCP config was for the first spawn; nothing to clean here
+          if (mcpConfigPath) {
+            try {
+              rmSync(dirname(mcpConfigPath), { recursive: true, force: true });
+            } catch {}
+          }
+          return { turnId };
         }
-        // the MCP config was for the first spawn; nothing to clean here
-        if (mcpConfigPath) {
-          try {
-            rmSync(dirname(mcpConfigPath), { recursive: true, force: true });
-          } catch {}
-        }
-        return { turnId };
+        // BOTFLEET-S: a retained CLI can report exitCode=null while stdin is
+        // already closed (half-dead after a SessionEnd hook / prior SIGTERM).
+        // Failing the turn here was the whole incident. Drop the dead session
+        // and spawn fresh the way a spawn-contract change already does.
+        live.pendingReceipt = null;
+        active.delete(threadId);
+        live.turn = null;
+        closeSession(threadId, "stdin write failed");
+      } else if (live) {
+        closeSession(threadId, live.unsolicited ? "engine is running its own turn" : "spawn contract changed");
       }
-      if (live) closeSession(threadId, live.unsolicited ? "engine is running its own turn" : "spawn contract changed");
 
       // Only create a broker for a new process. A compatible retained process
       // keeps its existing proxy connection and broker across turns.
@@ -1476,7 +1539,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         argsKey,
         sessionId: sessionId ?? newSessionId,
         pendingReceipt: null,
-        turn: { turnId, settled: false, sawStreamDelta: false, producedOutput: false, sends: new Set(), helperUsage: new Map(), input: turn, retry, retryAbort },
+        turn: { turnId, settled: false, sawStreamDelta: false, producedOutput: false, sends: new Set(), helperUsage: new Map(), billedCalls: new ClaudeSingleCallLedger(), input: turn, retry, retryAbort },
         idleTimer: null,
         closing: false,
         stderr: "",
@@ -1523,7 +1586,9 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         // A settled turn owns no retry budget. Retained CLI sessions may run
         // many later turns on this thread, and each must start fresh.
         retryState.delete(threadId);
-        emit({
+        // Spread as an object or as nothing: absent unless the provider said.
+        const servedModel = t.servedModel ? { servedModel: t.servedModel } : undefined;
+        const completed: RuntimeEvent = {
           ...base(threadId, t.turnId),
           type: "turn.completed",
           ok,
@@ -1533,7 +1598,11 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           // total_cost_usd is the equivalent API price, not a cash charge.
           ...(cost != null ? { billingMode: "estimated" as const } : {}),
           ...(usage ? { usage } : {}),
-        });
+          ...servedModel,
+        };
+        const billedCall = t.billedCalls.proof();
+        if (billedCall) completed.billedCall = billedCall;
+        emit(completed);
         if (session.child.exitCode === null && !session.closing) armIdle(threadId);
       };
       /** The running BotFleet turn's id.  Only called with a turn running:
@@ -1767,6 +1836,11 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           case "assistant": {
             const msg = o.message ?? {};
             const text = firstText(msg.content);
+            // `<synthetic>` is the CLI's own placeholder for an error reply,
+            // not a model that served anything.
+            if (!helperOf && session.turn && typeof msg.model === "string" && msg.model && msg.model !== "<synthetic>") {
+              session.turn.servedModel = msg.model;
+            }
             if (!helperOf && session.turn && isModelRejectionFrame(o, text)) {
               // Not an assistant reply: an error the turn failed on.  It must
               // reach the transcript as an error row, never as bot text, so
@@ -1813,6 +1887,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
             // A helper's usage is ITS context, not the bot's: reported as the
             // bot's it would swing the context meter on every helper step.
             // The turn's result frame carries the whole bill either way.
+            if (!helperOf) session.turn?.billedCalls.observe(msg, session.lifecycle && session.engaged);
             if (msg.usage && !helperOf) {
               emit({
                 ...base(threadId, currentTurnId()),
@@ -1867,13 +1942,23 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
             }
             break;
           case "result": {
+            // The cache writes by TTL (or the flat figure of an older CLI).
+            // `input` takes the sum of whichever form arrived, so a CLI that
+            // sends only the TTL split, with the flat total null or zero, does
+            // not leave the writes out of the context while still naming them.
+            const cacheWrites = o.usage ? cacheWritesOf(o.usage) : {};
+            const cacheWritten = (cacheWrites.cacheWrite5m ?? 0) + (cacheWrites.cacheWrite1h ?? 0);
             const resultUsage: TurnUsage | undefined = o.usage
               ? {
-                  input: (o.usage.input_tokens || 0) + (o.usage.cache_read_input_tokens || 0) + (o.usage.cache_creation_input_tokens || 0),
+                  input: (o.usage.input_tokens || 0) + (o.usage.cache_read_input_tokens || 0) + cacheWritten,
                   output: o.usage.output_tokens || 0,
                   ...(typeof o.usage.cache_read_input_tokens === "number"
                     ? { cachedInput: o.usage.cache_read_input_tokens }
                     : {}),
+                  // Cache writes stay inside `input` (the context meter reads
+                  // the whole figure) but are named, so telemetry can bill
+                  // them at the write rate instead of the plain input rate.
+                  ...cacheWrites,
                 }
               : undefined;
             const t = session.turn;
@@ -1890,6 +1975,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
             const ours = session.lifecycle
               ? session.engaged || claimsOurs
               : claimsOurs || origin === undefined || origin === "human";
+            t.billedCalls.result(o.usage, ours);
             session.engaged = false;
             const share = advanceCost(meta.total_cost_usd);
             if (!ours) {
@@ -2113,7 +2199,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         killCliTree(child);
       };
       active.set(threadId, { stop, turnId, broker });
-      emit({ ...base(threadId, turnId), type: "turn.started" });
+      if (!turnStartedEmitted) emit({ ...base(threadId, turnId), type: "turn.started" });
 
       // prompt over stdin as a stream-json message — never argv (ARG_MAX).
       // stdin stays OPEN: that is what keeps the session alive for a

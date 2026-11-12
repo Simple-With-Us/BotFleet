@@ -1,0 +1,244 @@
+# The Phase 6 Decommission Runbook (BF-2515)
+
+`docs/native-rewrite-port-inventory.md` says what replaces every Node file.  This runbook says in what order the Node stack comes out, what proves each step is safe, and what to do when a step is not safe yet.
+
+Read the two together.  The inventory owns "who replaces what"; this file owns "when", and the failure modes that make "when" matter.
+
+## The One Rule
+
+**Nothing is deleted before `scripts/check-decommission-gates.mjs` exits 0.**
+
+That is not a formality.  Deleting `server/`, `companion/` or the Node build chain does not degrade a feature, it stops every bot, and it does so at the next launch rather than at the moment of the commit.  A green gate is the difference between a cleanup and an outage.
+
+## The Gate
+
+```
+node scripts/check-decommission-gates.mjs <state.json> --bundle <bundle.json> \
+  --source-sha <exact-source-sha> --build <exact-build> --artifact-sha256 <signed-artifact-sha256>
+```
+
+The state file is plain JSON, so the check itself needs no network; the final CLI additionally requires the [private final evidence bundle](verification/native-final-evidence.md), including exact candidate and artifact bindings, linked runtime receipts, separate observation intervals and explicit external owner acceptance.
+
+```json
+{
+  "issues":   { "BF-2510": "In Progress", "BF-2514": "Todo" },
+  "evidence": { "soak-24h-no-node": false, "inventory-clean": true, "control-disposition": false, "linux-server-preservation": false },
+  "macLocalHarness": {
+    "present": false,
+    "retained": { "deploy/linux-server/": "optional server deployment (BF-2544)" }
+  }
+}
+```
+
+Seven issues must be Done, seven evidence items asserted, and the Mac-local harness asserted to be gone:
+
+| Gate | Why it blocks the deletion |
+|---|---|
+| BF-2510 | The iOS companion endpoint ruling decides whether a slim Node companion host survives.  Deleting first answers the question by accident. |
+| BF-2511 | The chosen companion endpoint must be built, or paired phones strand at cutover. |
+| BF-2512 | The Swift Zulip actor and Linear sync client replace `server/zulip/*` and the Linear write path. |
+| BF-2513 | The Swift routines and webhooks scheduler replaces the Node scheduler that fires every routine. |
+| BF-2503 | Replay fixtures must be captured from the `events/*.ndjson` tee before the tee stops, or engine parity becomes unprovable. |
+| BF-2504 | The `EngineDriver` contract and core actors are the runtime every native engine turn runs on. |
+| BF-2514 | The single-writer cutover retires `app.botfleet.server` and owns the 24-hour no-Node run.  Phase 6 owns only the reboot check after it. |
+
+| Evidence | What must be true |
+|---|---|
+| `placement-evidence` | All sixteen placement recipes pass the existing artifact validator with both host inventories and the required hand-run logs; the final bundle binds their exact bytes. |
+| `soak-24h-no-node` | 24 hours with the Node harness stopped and its launchd job booted out, every bot answering. |
+| `replay-parity` | Each engine's recorded turns replay through `EngineDriver` with the same ordered `TurnEvent` kinds the Node harness recorded. |
+| `final-import-parity` | The final import parity report matches, the Node store is archived read-only, and rollback has been rehearsed once. |
+| `inventory-clean` | `scripts/audit-node-decommission.mjs` reports no unowned file under the Mac-local roots; `deploy/linux-server/` remains retained and is reported separately as a dependent surface.  Linux source preservation is enforced by its own evidence gate. |
+| `control-disposition` | BotFleet Control's post-Node disposition is recorded and landed before Step 5; `mac-control/` is reported as dependent on the stack being deleted. |
+| `linux-server-preservation` | BF-2544 has a maintained Linux source/build/update/rollback closure, or a verified replacement preserving harness startup, UI assets, required runtime, updates and rollback.  Verify it explicitly; retaining `deploy/linux-server/`, a clean inventory, a Mac soak, or completed issue states do not prove it. |
+
+Anything that is not a completed state counts as unmet, including `In Review`.  The gate exists to stop nearly-done from reading as done.  A cancelled or duplicate issue is not a completed state either: the replacement never landed, so deleting the code it was to replace stops the bots instead of cleaning up after a finished job.
+
+Refresh the state file from Linear at run time rather than editing it by hand.  Issue states and evidence booleans remain necessary prerequisites, but cannot pass the final CLI without their hash-bound evidence packet.  Offline validation establishes binding and consistency, not the authenticity or truth of the captured claims.
+
+```
+node scripts/decommission-gate-state.mjs --out /private/captures/state.json
+```
+
+That reads the seven issue states through the board CLI, derives `inventory-clean` by running the audit against the committed tree, and pre-fills the approved `deploy/linux-server/` retention.  It leaves external evidence and `macLocalHarness.present` blocking: the soak, replay parity and final import require Mac-side verification; `control-disposition` requires the selected Control disposition to be implemented and landed; and `linux-server-preservation` requires verification of the Linux source/build/update/rollback closure or a replacement.  The generator never asserts these items.  The owner’s Option C ruling alone does not assert `control-disposition`.  A failed Linear read exits non-zero instead of writing a partial file, so a refresh that did not happen cannot read as one that did.  Use a fresh `0600` state file inside a private `0700` capture directory.  After actual verification and the responsible human's updates, collect the linked receipts into the final private bundle; editing the state cannot replace them.
+
+`inventory-clean` is checked for you.  `pnpm test:native-release` runs `scripts/decommission-gates.node-test.mjs`, whose last test audits the committed tree against both inventory documents, so inventory drift fails CI on the pull request that caused it rather than surfacing during a rebase months later.
+
+## Linux Server Preservation
+
+BotFleet may also run with the server as the primary BotFleet server, and `deploy/linux-server/` deploys the same `server/` code as that optional deployment (BF-2544).  The deployment directory remains retained, and its dependency on shared server/build sources is separately reported by the audit and blocked by `linux-server-preservation`.
+
+The gate separately asks whether the Mac runs the Node stack through `macLocalHarness.present`.  Linux evidence must be asserted after verifying that a maintained source/ref and build path preserve the harness, served UI, runtime, update and rollback closure, or that a replacement has been verified.  The final evidence bundle requires a separate Linux receipt with pinned source refs, closure manifest and build/install/update/rollback results; the checker validates its bindings without performing live deployment or proving the claims true.  `macLocalHarness.retained` and the audit's retained-path output only show that the deployment directory remains present; they are not preservation evidence.
+
+A retained path that is not the optional server deployment blocks the gate: sparing Mac-local code quietly is exactly what the gate exists to prevent.
+
+## Why The Order Is Not The Obvious Order
+
+Three couplings invert the naive sequence, which would start by deleting Electron because Electron is the old shell.
+
+**1. The Electron binary is the harness's Node runtime.**  `electron-builder.yml` sets `runAsNode: true` deliberately, and the harness launches the Electron binary with `ELECTRON_RUN_AS_NODE=1` from the ACP drivers, the container computer and the MCP lanes.  Remove `electron/` while `server/` is still the running harness and the next boot has no runtime at all.  The failure arrives at launch, not at the next cleanup.
+
+**2. The transcript tee is the only source of replay fixtures.**  `server/thread-events.ts` writes the per-thread `events/*.ndjson` files, and BF-2503 captures fixtures from them.  Once that file retires, the corpus is gone and engine parity stops being unproven in practice and becomes unprovable in principle.
+
+**3. Paired phones talk to the companion, not the harness.**  `companion/src/*` serves the device endpoint.  If the sidecar goes before BF-2511 builds the chosen endpoint, the Mac app keeps working and the phone quietly stops, which is the worst shape a regression can take.
+
+So the sequence runs from the leaves inward: dev-only and already-superseded surfaces first, then the companion, then the harness, then the Electron shell that is currently hosting the harness's runtime, then the build chain that produced all of it.
+
+## The Sequence
+
+### Step 0 — Prove The Gate
+
+```
+node scripts/decommission-gate-state.mjs --out /private/captures/state.json
+node scripts/collect-decommission-evidence.mjs /private/captures/request.json --out /private/review-packet
+node scripts/check-decommission-gates.mjs /private/review-packet/state.json \
+  --bundle /private/review-packet/bundle.json \
+  --source-sha "$CANDIDATE_SOURCE_SHA" --build "$CANDIDATE_BUILD" --artifact-sha256 "$CANDIDATE_ARTIFACT_SHA256"
+```
+
+Prepare and review the complete receipt request before collection; the collector's default is a blocked read-only preview with no production host readers.  The final checker must pass before deletion.  Archiving, preparing the candidate and observing acceptance supply its evidence under their own existing authority; the gate does not grant that authority.  If the final gate blocks, its blockers name the evidence to finish before the destructive steps.
+
+**Verification:** every audited file has an inventory row or deliberate retention, and the final CLI reports consistent evidence bindings and assertions.  Confirm authentic provenance and actual owner authorization separately; an offline pass does not prove runtime acceptance or grant deletion permission.
+
+### Step 1 — Archive Before Anything Moves
+
+Do this while both stores still exist, because it is the only window in which they can be compared.
+
+- Export the Node store with the importer and run the parity report (BF-2495).
+- Copy every `events/*.ndjson` and `native/*.ndjson` corpus to the archive, and capture the BF-2503 fixtures from it.
+- Record the read-only archive location in BF-2515 before the deletion commit, so the archive is discoverable after the code that wrote it is gone.
+- Rehearse the rollback once: restore the archive into a scratch data root and boot the native app against it.
+
+**The archive and the rehearsal have a producer.**  `scripts/archive-node-store.mjs` captures the Node store into a private capture directory, snapshots its SQLite database through SQLite's own online backup rather than copying a live WAL file, redacts credential shapes out of the text it copies, makes the copy read-only and proves that claim by trying to write to it.  It then restores the archive into a scratch data root, verifies every file against the archive's own hash manifest, and reports the restored store's structural health.  It emits the `rollback` receipt, and the `import` receipt when an import parity report is supplied, in the shape `scripts/decommission-evidence-bundle.mjs` validates.
+
+```sh
+node scripts/archive-node-store.mjs archive --store "$OMB_DATA_DIR" --out /private/captures/capture
+node scripts/archive-node-store.mjs restore --archive /private/captures/capture --into /private/scratch/store
+node scripts/archive-node-store.mjs receipt --capture /private/captures/capture \
+  --request /private/captures/request.json \
+  --provenance-record /private/captures/capture/provenance.txt \
+  --provenance-source "$PROVENANCE_URL" --provenance-by "$WHO" \
+  --parity-report /private/captures/capture/import-parity.json
+```
+
+**What the producer does not prove.**  It says nothing about whether the Swift store holds the same data: that is the import parity report, which the producer only carries.  Its `restored-health` is a statement about the RESTORE and not about the store:  the database opens and passes SQLite's own integrity check, and a file that parses in the archive and does not parse in the restore is a failure — while a file that was already unparsable in the source is not, because a faithful restore reproduces it.  It says nothing about a running harness.  **The exit codes in a receipt are read out of the reports they point at.**  A receipt never asserts that a check passed: each exit code comes from the artifact it names, so a failed rehearsal earns a failing code and the bundle refuses it.  **The credential rule is narrower than it looks, and the archive report says so.**  The archive is a private copy of the owner's own store and it holds what the store holds: files whose names mark them as credential stores are excluded, text files are redacted, and a binary small enough to inspect is left out when it holds a recognizable credential, with every exclusion named in the manifest.  A database snapshot and a binary above the redaction bound are copied whole, because a binary cannot be redacted without corrupting it, and the credential shapes the snapshot holds are counted in the manifest and in the archive report rather than removed.  What travels in the packet is the archive report, not the archive, and the collector refuses any captured file that is not redacted UTF-8.  **The report and the manifest are different files on purpose.**  A store with eighteen thousand files produces a manifest far larger than the bundle will carry, so the archive report summarizes the capture and binds the manifest by its SHA-256, and it is the report the receipt points at.
+
+**What breaks if skipped:** a parity bug found after the deletion has no reference to compare against, and the Node store becomes the only copy of a history nobody can read.
+
+### The Replay Corpus Has A Producer Too
+
+**`replay-parity` had no producer.**  The bundle's `replay` receipt names one check per engine — `engine:<id>`, for every id in the packet's own `engines` list — and nothing in the tree produced those checks, so the receipt could only ever be asserted by a person.  There are two halves now.  `ios/Scripts/EngineReplayParityProbe` is the measurement:  it replays each engine's recorded turns through the native `EngineDriver` and writes a per-engine report.  `scripts/emit-replay-receipt.mjs` is the receipt:  it reads that report and emits the `replay` receipt in the shape `scripts/decommission-evidence-bundle.mjs` validates.
+
+**The producer does not pick the engine vocabulary.**  The bundle derives its check names from `bundle.engines`, so the probe reads the engine list from the bundle request and names its checks from that list.  A packet that names an engine with no replay family behind it earns a failing check with the reason named — never a passing one, and never a silent skip.
+
+**How an engine id finds its family.**  The thirteen engines in the runtime matrix are not thirteen replay families.  Three of them (`grok-api`, `minimax-api`, `gemini-api`) speak HTTPS to a provider and launch no CLI at all, and four more (`cursor`, `gemini-cli`, `dsh`, `opencode`) launch a CLI the harness does not script.  So an engine id is resolved by the executable its driver would launch — a fact `EngineMatrixRegistry` already states — and the family that drives that executable is found in the corpus.  Six matrix ids resolve to a family:  `antigravity`, `claude`, `codex`, `grok-acp`, `mcode` and `muse`.  The other seven resolve to nothing, and each one that a packet names earns a failing check that says why.  The mapping is derived from the tree rather than written down as a table, so a family that changes its executable is a failed check instead of a silent mismatch.
+
+**The corpus is the numbered turns plus the standalone protocol fixtures.**  The twenty numbered turns per family do not cover the auth-priority rule, the model-selection rules, the mismatched tool owner, or the early tool before the turn-start acknowledgement, so the nine standalone fixtures are replayed with them.  One of them is expected to be REFUSED rather than replayed:  the ACP driver must reject tool preparation owned by another bot before it launches anything, and the probe checks both that the turn was refused and that nothing was launched.  Treating that refusal as a failure would be measuring the wrong thing.
+
+**The exit codes are read out of the report, never asserted.**  Every `engine:<id>` check takes its exit code from the report it names, so a replay that did not hold earns a failing code and the bundle refuses the packet.
+
+```sh
+swift run --package-path ios EngineReplayParityProbe -- \
+  --request /private/captures/request.json \
+  --out /private/captures/capture/replay-parity.json
+node scripts/emit-replay-receipt.mjs \
+  --capture /private/captures/capture \
+  --request /private/captures/request.json \
+  --report /private/captures/capture/replay-parity.json \
+  --provenance-record /private/captures/capture/replay-provenance.txt \
+  --provenance-source "$PROVENANCE_URL" --provenance-by "$WHO"
+```
+
+**What the producer does not prove.**  It does not record the recorded stdin trace, because the Claude family's user frame carries a fresh UUID per call and that trace is not byte-stable across runs;  it records the stdin guard's verdict instead, which is the part that is stable.  It does not record the spawn spec's environment either, because that names the variables an engine expects.  It says nothing about whether a live bot answers:  the replay runs against recorded turns, in memory, with no process launched and no network touched.
+
+**What breaks if skipped:** a parity bug in an engine's wire protocol is found only after the Node harness is gone, and the claim that the native drivers replay what the Node harness recorded rests on a person's word.
+### Step 2 — The Cutover Belongs To BF-2514, Not Here
+
+`app.botfleet.server` is booted out, the native app becomes the single writer, and the 24-hour no-Node soak runs under BF-2514.  Phase 6 does not repeat that work and does not shorten it.  The rule that decides which host writes, and the ordered commands that retire the LaunchAgent, are in [the single-writer contract](native-rewrite-single-writer-contract.md) and [its cutover runbook](native-rewrite-single-writer-cutover.md).
+
+**Precondition:** BF-2514 Done, `soak-24h-no-node` asserted, and `app.botfleet.server` confirmed booted out with `launchctl print` showing no job.
+
+**What breaks if skipped:** the harness is still the writer when the deletion lands, and the deletion is what discovers it.
+
+### Step 3 — Dev-Only Surfaces
+
+Safe in any order, and safe to do in one commit.  None of these has a production caller.
+
+- `scripts/mcp-server.ts`, `scripts/mcp-sse.ts`, `scripts/start-mcp-sse.sh`, `server/mcp-server-config.ts`, `server/sse-*.ts` test helpers.
+- The runtime surfaces that bridge owns, or they outlive it as a lie:  the pm2 application `botfleet-mcp` with its ecosystem entry and its launcher, the `127.0.0.1:8794` listener with its `/health` endpoint, and the public route `botfleetadmin.jays.services`, which forwards to that listener.
+
+  **The "no production caller" line above does not hold for this bridge.**  The route was built for a third-party iOS MCP client and answers `502` for every path on the Mac today, because nothing is listening on `:8794` and pm2 still calls the application `online`:  pm2 keeps the record of an application it started after the process is gone, so a stopped adapter reads as a running one.  The caller is already broken, so the deletion does not break it further.  What the deletion must not do is leave the public route and the pm2 record in place afterwards, pointing at nothing and reading as running.  Nothing in the rewrite replaces that route:  the native app's MCP surface is a per-turn loopback mount for engines, on an ephemeral port that is never advertised, so it cannot serve a public hostname.  The route's fate is the owner's decision, and BF-2613 carries it.
+
+  **The supervisors that still expect the bridge go with it.**  BotFleet Control watches the application (`mac-control/Sources/BotFleetControlCore/ProcessMonitor.swift`), probes its health endpoint and offers pm2 start and stop for it (`McpServerControl.swift`, `FleetServices.swift`);  the Mac's `mac-process-watch` script lists it under `expect_pm2`;  the fleet's named tunnel carries an ingress rule that forwards the public route to the listener;  and the Mac process register carries the rows.  Control's own disposition is the `control-disposition` gate (BF-2583, Decision 1 in `docs/plans/2026-10-29-botfleet-control-after-node.md`), which moves the fleet rows to Muster, so those rows have an owner and this list does not have to invent one.
+- `scripts/e2e-server.mjs`, `scripts/bundle-server.mjs`, `scripts/plugin-smoke.mjs` and the packaged-server smoke scripts, plus only the dev-proxy configuration within `vite.config.ts`.  Keep the Vite file and Linux build inputs while the retained Linux UI build uses them.
+- `server/testing/*` (28 fakes and harness files), superseded by `ReplayHarness` fixtures.
+- `cloudflare/control-plane/` (a stub with no code left in it).
+- The `e2e` and packaged-server CI jobs that exist only to drive those scripts.
+
+**Verification:** `pnpm typecheck` and the surviving test suite still pass; no workflow references a deleted script.
+
+### Step 4 — The Companion Sidecar
+
+**Precondition:** BF-2510 Done and BF-2511 Done, and a paired phone has completed a full session against the native endpoint.
+
+- `companion/` (17 source files, 19 test files), the ignored `dist-companion` build output, and `scripts/capture-companion-fixtures.mjs`.
+- `scripts/botfleet-companion-start.sh`, `scripts/launchd/app.botfleet.companion.plist`, and the Electron-side supervisors `electron/managed-companion-*.mjs` and `electron/companion-*.mjs`.
+
+**Verification:** pair a phone, send a turn, receive a reply, and confirm the app reports the phone as connected without any `:8810` listener owned by Node (`lsof -nP -iTCP -sTCP:LISTEN` shows nothing on that port).
+
+**What breaks if skipped:** every paired phone strands silently, and the failure looks like a phone problem rather than a deletion.
+
+### Step 5 — The Harness
+
+This is the irreversible one, and it is the step the whole gate exists for.
+
+**Precondition:** BF-2512, BF-2513, BF-2503 and BF-2504 all Done; `replay-parity`, `final-import-parity`, `linux-server-preservation` and `control-disposition` asserted; the soak complete.
+
+- Retire the Mac-local harness launch path, its LaunchAgent and Mac-only runtime packaging.  Remove `server/` or shared files only when the asserted Linux-preservation evidence confirms their required closure remains available from the maintained Linux source/ref or a verified replacement.
+- Keep Linux-required `server/` and `shared/` source, `dist/` UI output or its reproducible build inputs, and the runtime and package/build inputs used by Linux install and update.  BF-2544 owns the exact closure; this runbook does not claim an exhaustive import inventory.  The current systemd service uses Node to execute TypeScript source; a verified replacement may use another runtime.
+- Remove Mac-only `tsconfig.server.json` and `dev:server`/`mcp` wiring only after confirming the Linux install/update path does not depend on them.
+- `scripts/launchd/app.botfleet.server.plist`, `scripts/botfleet-server-start.sh`, `scripts/botfleet-server-healthcheck.sh`, `scripts/launchd/harness-watchdog.node-test.mjs`.
+- Mac-specific CI jobs that build and test the Mac harness.  Preserve or replace Linux install/build/update coverage needed by BF-2544.
+
+**Verification:** a cold boot with no Mac-local BotFleet Node process, every bot answering a turn, routines firing on schedule, Zulip and Linear round-tripping, and the reboot check from BF-2515 (`node scripts/check-post-reboot-node.mjs`) passing twice.  Verify the retained Linux runtime separately; unrelated Node processes are outside this decommission.
+
+**What breaks if skipped:** the Mac app has no runtime.  Linux remains a separate deployment: deleting its shared harness source or build inputs also breaks Linux, even after the Mac LaunchAgent is gone.
+
+### Step 6 — The Electron Shell
+
+**Precondition:** Step 5 complete, which is what makes this step legal rather than fatal, plus BF-2486 Done and one installed build already updated through the Sparkle feed.  Deleting `electron/updater*.mjs` before that leaves every installed app polling an update feed that nothing maintains any more, which reads as a working app that silently never updates again.
+
+- `electron/` (135 tracked files), `electron-builder.yml`, `package.json` `main`, `preload.cjs`.
+- `.github/workflows/release.yml`, `mac-commit-build.yml`, `mac-package-gate.yml`, `mac-server-menu-smoke.yml`, and the electron-updater feed jobs.
+- Mac-only Electron UI packaging.  Preserve `src/`, Vite configuration, public assets and other build inputs while BF-2544's Linux UI build uses them; the native Mac UI does not replace that Linux-served UI.
+
+**Verification:** the native app builds, signs, notarizes and staples through `native-mac-release.yml`, and an installed previous build receives the Sparkle update.
+
+**What breaks if skipped:** nothing, if Step 5 really is complete.  If Step 5 was skipped, this step is the one that makes the outage permanent.
+
+### Step 7 — The Build Chain And The Repository It Left Behind
+
+- Desktop dependencies and scripts only when BF-2544's Linux install/build no longer needs them.  Keep the manifest, lockfile, required runtime (Node in the current deployment), and Vite/build dependencies used by Linux source and UI build.
+- Mac-only Node CI and matrix legs.  Keep or replace the Linux install/build/update coverage needed to maintain BF-2544's source and rollback contract.
+- `scripts/update-botfleet*.sh`, `scripts/regenerate-*.mjs`, `scripts/stamp-commit-version.mjs`, and the Node updater scripts that BF-2486's Sparkle pipeline replaced.
+- `scripts/computer-vm-cli/` thin shims, while `vm-image-build.yml` and the image itself stay.
+
+**Verification:** CI passes with the Linux install/build/update coverage and any typecheck or runtime prerequisites that the retained Linux contract still needs.  Confirm that retired Mac launch/build paths no longer invoke Electron as Node; verify the retained Linux inputs against their preservation evidence.
+
+### Step 8 — Post-Deletion Checks
+
+- Cold boot on a clean data root, and again after a reboot, verified by `node scripts/check-post-reboot-node.mjs` (processes, launchd jobs, and loopback port listeners).
+- One full day of routines, Zulip traffic and a phone session.
+- `node scripts/audit-node-decommission.mjs` reports zero unowned files under the Mac-local roots, and reports the Linux deployment as both retained and dependent on source being deleted.
+- The gate script reports green only when `inventory-clean`, `linux-server-preservation`, the other evidence, issue states and Mac-harness absence are all asserted.  Linux preservation remains a separately verified claim; a green inventory or Mac soak alone cannot satisfy it.
+- BF-2515 closes with the deletion commit, the soak dates and the archive location.
+
+## What Stays
+
+The native app, `ios/`, the VM image build, `apps/site`, `tools/`, `tv-face/`, and `cloudflare/composio-broker/` (self-hosted, no harness calls).  None of them is part of the decommission, and deleting any of them is a different issue.
+
+`mac-control/` is already Swift and is not deleted by this runbook either, but it is not simply kept: every local thing BotFleet Control does goes through the stack this runbook deletes (the `:8799` routes in `server/index.ts`, the two LaunchAgents, pm2 `botfleet-mcp`, the offline VM helper built from `server/local-vm-offline-cli.ts`, and the Electron-side build and install in Step 6).  The gate's `control-disposition` evidence (BF-2583) requires Control's post-Node disposition, Decision 1 in `docs/plans/2026-10-29-botfleet-control-after-node.md`, to be recorded and landed before Step 5, and `scripts/audit-node-decommission.mjs` reports `mac-control/` as a dependent of the audited roots so the dependency stays visible.
+
+## Rollback
+
+Before Step 5, rollback is `git revert`.  After Step 5 there is no code rollback, only the archive from Step 1: restore the data root, check out the last pre-deletion commit, and boot the Node harness from it.  That path is why Step 1 rehearses it once, while it is still cheap to discover that the archive is incomplete.

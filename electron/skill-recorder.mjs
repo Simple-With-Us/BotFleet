@@ -29,8 +29,9 @@ import {
 } from "./build-recorder-helper.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const SOURCE = path.join(__dirname, "resources", "recorder-helper.swift");
-const INFO = path.join(__dirname, "resources", "recorder-helper-Info.plist");
+const projectDir = path.dirname(__dirname);
+const SOURCE = path.join(projectDir, "native", "helpers", "recorder-helper.swift");
+const INFO = path.join(projectDir, "native", "helpers", "recorder-helper-Info.plist");
 const BUNDLE = app.isPackaged
   ? path.join(process.resourcesPath, "BotFleet Recorder.app")
   : recorderHelperBundle;

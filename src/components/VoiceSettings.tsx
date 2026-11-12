@@ -47,7 +47,7 @@ import {
   VOICE_CLONE_MIN_SECONDS,
   type MicRecorder,
 } from "@/lib/voice-clone-recording";
-import { DefaultVoicePicker, PronunciationSettings } from "./WorkspaceVoiceSettings";
+import { AudioRetentionPicker, DefaultVoicePicker, PronunciationSettings } from "./WorkspaceVoiceSettings";
 
 const SAMPLE = "Morning.  Overnight the tests went green, and I left two notes for you in the thread.";
 
@@ -94,7 +94,7 @@ const personalName = (id: string) => id.replace(/^(personal|apple-personal):/, "
 export const deviceVoicesSupported = (bot: Bot): boolean => bot.voices !== undefined;
 
 export const DEVICE_VOICES_NEED_UPDATE =
-  "The iPhone uses this voice too.\u00A0 A separate iPhone voice needs an update to the bot server on this computer.";
+  "The iPhone uses this voice too.\u00A0 Update BotFleet on this computer to pick a separate iPhone voice.";
 
 /** A per-device override counts only when it is a non-blank string, the
  * same rule voiceForDevice applies. */
@@ -114,9 +114,11 @@ function clientPlatform(): ClientPlatform {
 export function VoiceSettings({
   bot,
   onPatch,
+  showAudioRetention = true,
 }: {
   bot: Bot;
   onPatch: (patch: VoiceSettingsPatch) => void;
+  showAudioRetention?: boolean;
 }) {
   const { state, dispatch } = useStore();
   const { capabilities, ready: capabilitiesReady } = useDesktopCapabilities();
@@ -1036,6 +1038,11 @@ export function VoiceSettings({
 
       {/* ── Pronunciations (workspace) ── */}
       <PronunciationSettings tts={tts} onConfig={(config) => dispatch({ type: "configStatus", config })} />
+
+      {/* ── Audio File Retention (workspace) ── */}
+      {showAudioRetention && (
+        <AudioRetentionPicker tts={tts} onConfig={(config) => dispatch({ type: "configStatus", config })} />
+      )}
 
       {/* ── Speech to Text ── */}
       <div className="mt-4 border-t border-hairline/40 pt-4">

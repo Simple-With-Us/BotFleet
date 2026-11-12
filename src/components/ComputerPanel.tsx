@@ -275,7 +275,7 @@ export function ComputerPanel({
     }
     if (previewSource === "vm") {
       if (!vmSupported) {
-        setError("This model engine cannot use the Local VM. Choose Claude or an ACP engine.");
+        setError("This bot cannot use the Local VM.\u00A0 Choose Claude or an ACP engine.");
         setPhase("vm-unavailable");
         return;
       }
@@ -327,7 +327,7 @@ export function ComputerPanel({
       };
     }
     if (previewSource === "cloud" && !cloudSupported) {
-      setError("This model engine cannot use cloud computer tools. Choose Claude, an ACP engine, or the ASCII.dev Box engine.");
+      setError("This bot cannot use cloud computer tools.\u00A0 Choose Claude, an ACP engine, or ASCII.dev Box.");
       setPhase("error");
       return;
     }
@@ -345,7 +345,7 @@ export function ComputerPanel({
       if (!vpsSupported) {
         if (autoLocal) setPhase("local");
         else {
-          setError("This model engine cannot use a self-hosted VPS. Choose Claude or an ACP engine, or switch the cloud backend to Box.");
+          setError("This bot cannot use a self-hosted VPS.\u00A0 Choose Claude or an ACP engine, or switch the cloud backend to Box.");
           setPhase("error");
         }
         return;
@@ -600,7 +600,7 @@ export function ComputerPanel({
     };
   }, []);
   useEffect(() => {
-    if (!preview.poll) return;
+    if (!preview.poll || !pageVisible) return;
     const shoot = () => {
       pendingCapture.current ??= (async () => {
         try {
@@ -660,7 +660,7 @@ export function ComputerPanel({
     return () => {
       clearInterval(timer);
     };
-  }, [preview.poll, preview.intervalMs, bot.id]);
+  }, [preview.poll, preview.intervalMs, bot.id, pageVisible]);
 
   // Local VM preview comes directly from Computer Driver through the harness. It
   // does not use the password-protected noVNC viewer or cloud endpoints.
@@ -1414,6 +1414,7 @@ export function ComputerPanel({
                 value={cloudBackend}
                 inherited={cloudBackendInherited(bot)}
                 vpsSupported={vpsSupported}
+                engineName={selectedInstance?.displayName}
                 onChange={(backend) => dispatch({ type: "updateBot", botId: bot.id, patch: { cloudBackend: backend } })}
               />
               {!(bot.computers?.length) && cloudBackend === "vps" && (

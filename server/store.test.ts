@@ -1061,6 +1061,26 @@ describe("Store task usage", () => {
     })).toEqual({ input: 30, output: 3, costUsd: 0.02, lastInput: 20, turns: 2 });
   });
 
+  it("keeps the window the engine reported and does not invent one", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    expect(store.addTaskUsage(bot.id, bot.threadId, {
+      input: 910_800,
+      output: 20,
+      costUsd: null,
+      contextWindow: 1_000_000,
+    })?.contextWindow).toBe(1_000_000);
+    expect(store.addTaskUsage(bot.id, bot.threadId, {
+      input: 40_000,
+      output: 2,
+      costUsd: null,
+    })?.contextWindow).toBe(1_000_000);
+    expect(store.addTaskUsage(bot.id, bot.threadId, {
+      costUsd: null,
+      contextWindow: 0,
+    })?.contextWindow).toBe(1_000_000);
+  });
+
   it("counts a turn that reported no tokens at all", () => {
     const store = new Store(selection);
     const bot = store.createBot();
@@ -1455,6 +1475,27 @@ describe("Store thread cache", () => {
     // durable across a full restart, not just this process's cache
     const reloaded = new Store(selection);
     expect(reloaded.messagesFor(target.threadId).map((m) => m.text)).toEqual(["before eviction", "after eviction"]);
+  });
+
+  it("appendMessage on a warm thread updates retained message count and evicts older cached threads", () => {
+    const store = new Store(selection, { threadCacheLimit: 8, threadCacheMaxMessages: 4 });
+    const older = store.createBot({ name: "Older" }, { seedMessages: false });
+    const active = store.createBot({ name: "Active" }, { seedMessages: false });
+
+    store.appendMessage(older.threadId, { role: "user", kind: "text", text: "o1" });
+    store.appendMessage(older.threadId, { role: "bot", kind: "text", text: "o2" });
+    expect(store.threadIsCachedForTests(older.threadId)).toBe(true);
+
+    store.appendMessage(active.threadId, { role: "user", kind: "text", text: "a1" });
+    store.appendMessage(active.threadId, { role: "bot", kind: "text", text: "a2" });
+    // 2 + 2 = 4 retained (at the bound of 4)
+    expect(store.threadIsCachedForTests(older.threadId)).toBe(true);
+    expect(store.threadIsCachedForTests(active.threadId)).toBe(true);
+
+    // 5th retained message across the cache via in-place appendMessage evicts older
+    store.appendMessage(active.threadId, { role: "user", kind: "text", text: "a3" });
+    expect(store.threadIsCachedForTests(older.threadId)).toBe(false);
+    expect(store.threadIsCachedForTests(active.threadId)).toBe(true);
   });
 });
 

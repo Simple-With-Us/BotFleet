@@ -106,3 +106,68 @@ test.describe('the Settings model picker stacks label above dropdown', () => {
     expect(box.triggerHeight).toBeGreaterThan(box.oneLineHeight);
   });
 });
+test.describe('fleet-wide model picker', () => {
+  for (const width of [1440, 800, 390]) {
+    test(`uses available width and stays on screen at ${width}px`, async ({ page }) => {
+      await page.setViewportSize({ width, height: 900 });
+      await page.goto('/?fixture=settings-model-picker&wide=1');
+      const trigger = page.locator('[data-testid="settings-model-picker-card"] button[aria-haspopup="dialog"]');
+      await trigger.click();
+      const menu = page.getByRole('dialog', { name: 'Choose Model' });
+      const box = await menu.boundingBox();
+      const button = await trigger.boundingBox();
+      expect(box).not.toBeNull();
+      expect(button).not.toBeNull();
+      expect(box!.width).toBeGreaterThan(350);
+      expect(box!.width).toBeGreaterThan(button!.width);
+      expect(box!.x).toBeGreaterThanOrEqual(11);
+      expect(box!.x + box!.width).toBeLessThanOrEqual(width - 11);
+      expect(box!.y).toBeGreaterThanOrEqual(button!.y + button!.height);
+      // The fixture deliberately clips its parent. The portaled menu must
+      // remain visible and interactive outside that card.
+      await expect(menu.getByRole('button', { name: /Claude Sonnet/ })).toBeVisible();
+      // The menu mounts inside the modal dialog, not on the body, so that
+      // dialog's Tab trap (which only walks its own subtree) still reaches it.
+      await expect(page.locator('[aria-modal="true"] [data-model-picker-content]')).toHaveCount(1);
+      // Opening moves focus into the menu, and Tab keeps it there.
+      const focusInMenu = () => menu.evaluate((node) => node.contains(document.activeElement));
+      expect(await focusInMenu()).toBe(true);
+      await page.keyboard.press('Tab');
+      expect(await focusInMenu()).toBe(true);
+      await page.keyboard.press('Escape');
+      await expect(menu).toHaveCount(0);
+    });
+  }
+
+  test('re-aligns to the window when it narrows while open', async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto('/?fixture=settings-model-picker&wide=1');
+    const trigger = page.locator('[data-testid="settings-model-picker-card"] button[aria-haspopup="dialog"]');
+    await trigger.click();
+    const menu = page.getByRole('dialog', { name: 'Choose Model' });
+    await expect(menu).toBeVisible();
+    await page.setViewportSize({ width: 600, height: 900 });
+    await expect.poll(async () => {
+      const box = await menu.boundingBox();
+      return box ? box.x + box.width : Number.POSITIVE_INFINITY;
+    }).toBeLessThanOrEqual(600 - 11);
+    const box = await menu.boundingBox();
+    const button = await trigger.boundingBox();
+    expect(box!.x).toBeGreaterThanOrEqual(11);
+    expect(box!.y).toBeGreaterThanOrEqual(button!.y + button!.height);
+  });
+
+  test('closes on a click outside the menu and its trigger', async ({ page }) => {
+    await page.setViewportSize({ width: 800, height: 900 });
+    await page.goto('/?fixture=settings-model-picker&wide=1');
+    const trigger = page.locator('[data-testid="settings-model-picker-card"] button[aria-haspopup="dialog"]');
+    await trigger.click();
+    const menu = page.getByRole('dialog', { name: 'Choose Model' });
+    await expect(menu).toBeVisible();
+    // A click inside the portaled menu is not "outside" it.
+    await menu.click({ position: { x: 4, y: 4 } });
+    await expect(menu).toBeVisible();
+    await page.mouse.click(2, 898);
+    await expect(menu).toHaveCount(0);
+  });
+});

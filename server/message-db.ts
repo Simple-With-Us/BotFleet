@@ -31,7 +31,9 @@ function open(): DatabaseSync {
   closeSync(openSync(file, "a", 0o600));
   try {
     chmodSync(file, 0o600);
-  } catch {}
+  } catch {
+    // best-effort permission repair; a file just created above is already 0o600
+  }
   const db = new DatabaseSync(file);
   // auto_vacuum only takes effect set on an EMPTY database (SQLite ignores
   // it once a table exists, short of a full VACUUM), so this only ever runs
@@ -93,7 +95,11 @@ function backfillRunningHelpers(database: DatabaseSync): void {
     try {
       // SAFETY: `json` is `JSON.stringify` of a `Message`, the same cast `rowToMessage` uses.
       message = JSON.parse(row.json) as Message;
-    } catch {
+    } catch (error) {
+      console.error(
+        `[message-db] backfillRunningHelpers: skipping unparseable message row ${row.thread_id}/${row.id}`,
+        error,
+      );
       continue;
     }
     if (message.helper?.status !== "running") continue;
@@ -123,7 +129,9 @@ function db(): DatabaseSync {
   if (handle && handlePath === DB_FILE() && existsSync(DB_FILE())) return handle;
   try {
     handle?.close();
-  } catch {}
+  } catch (error) {
+    console.error("[message-db] closing the previous database handle before reopen failed", error);
+  }
   handle = open();
   handlePath = DB_FILE();
   return handle;
@@ -138,16 +146,69 @@ export interface ThreadRows {
 
 /** Read one thread, importing its legacy JSON file on first touch. */
 export function readThread(threadId: string, legacyFile: string): ThreadRows {
-  const rows = db()
+  // Stream row by row: `.all()` held every raw JSON string alongside the
+  // parsed objects, doubling the peak for a large thread at boot.
+  const messages: Message[] = [];
+  // SAFETY: the query selects only `json`, a TEXT NOT NULL column on `messages`.
+  for (const row of db()
     .prepare("SELECT json FROM messages WHERE thread_id = ? ORDER BY rowid")
-    .all(threadId) as Array<{ json: string }>;
-  if (rows.length) {
+    .iterate(threadId) as Iterable<{ json: string }>) {
+    messages.push(rowToMessage(row));
+  }
+  if (messages.length) {
     const state = db()
       .prepare("SELECT active_leaf_id FROM thread_state WHERE thread_id = ?")
       .get(threadId) as { active_leaf_id: string | null } | undefined;
-    return { messages: rows.map(rowToMessage), activeLeafId: state?.active_leaf_id ?? null };
+    return { messages, activeLeafId: state?.active_leaf_id ?? null };
   }
   return importLegacy(threadId, legacyFile);
+}
+
+/** One message by id, without hydrating its thread — the boot helper sweep
+ * and the held-work restore only ever need a single row. Returns null when
+ * the thread has no such row (a legacy file that was never imported has no
+ * rows to find it in; callers that must see it hydrate explicitly). */
+export function readMessageById(threadId: string, messageId: string): Message | null {
+  // SAFETY: the query selects only `json`, a TEXT NOT NULL column; `get` is undefined when no row matches.
+  const row = db()
+    .prepare("SELECT json FROM messages WHERE thread_id = ? AND id = ?")
+    .get(threadId, messageId) as { json: string } | undefined;
+  return row ? rowToMessage(row) : null;
+}
+
+/** Whether a thread has any rows at all — a `SELECT 1 … LIMIT 1` existence
+ * probe, not a count or a read, so a caller can tell a legacy-only thread
+ * (no rows yet, messages still only in its JSON file) from a migrated one
+ * without hydrating either. */
+export function hasThreadRows(threadId: string): boolean {
+  return db().prepare("SELECT 1 AS one FROM messages WHERE thread_id = ? LIMIT 1").get(threadId) !== undefined;
+}
+
+/** The first user text in a thread, read at the SQL boundary — naming a
+ * task at boot must not hydrate (or cache) a whole transcript to find its
+ * first line. Falls back to the legacy JSON file only when the thread has
+ * no rows yet, mirroring `firstMessageAt`. */
+export function firstUserText(threadId: string, legacyFile: string): string | null {
+  if (hasThreadRows(threadId)) {
+    // SAFETY: the query selects only `text`, a nullable TEXT column on `messages`.
+    for (const row of db()
+      .prepare("SELECT text FROM messages WHERE thread_id = ? AND role = 'user' AND kind = 'text' ORDER BY rowid")
+      .iterate(threadId) as Iterable<{ text: string | null }>) {
+      if (row.text?.trim()) return row.text;
+    }
+    return null;
+  }
+  try {
+    const raw = JSON.parse(readFileSync(legacyFile, "utf8"));
+    // SAFETY: a legacy messages file is either a bare `Message[]` or `{ messages: Message[] }`, the same two shapes
+    // `importLegacy` reads; a malformed file throws or yields no match and lands in the catch / null below.
+    const messages = Array.isArray(raw)
+      ? (raw as Message[])
+      : (((raw as { messages?: Message[] }).messages ?? []) as Message[]);
+    return messages.find((m) => m.role === "user" && m.kind === "text" && m.text?.trim())?.text ?? null;
+  } catch {
+    return null;
+  }
 }
 
 export interface ThreadTailRows extends ThreadRows {
@@ -180,13 +241,51 @@ export function readThreadTail(threadId: string, legacyFile: string, limit: numb
   return importLegacy(threadId, legacyFile);
 }
 
+/** Read the newest `limit` messages for multiple threads in one batched query.
+ * Uses a window function to partition by thread_id and order by rowid so
+ * only the tail rows are returned in chronological order. */
+export function readThreadsTail(threadIds: readonly string[], limit: number): Map<string, Message[]> {
+  const result = new Map<string, Message[]>();
+  for (const id of threadIds) {
+    result.set(id, []);
+  }
+  const uniqueIds = Array.from(new Set(threadIds));
+  if (uniqueIds.length === 0 || limit <= 0) return result;
+
+  const placeholders = uniqueIds.map(() => "?").join(", ");
+  const statement = db().prepare(
+    "SELECT thread_id, json FROM (" +
+      "SELECT thread_id, rowid AS seq, json, ROW_NUMBER() OVER (PARTITION BY thread_id ORDER BY rowid DESC) AS rn " +
+      `FROM messages WHERE thread_id IN (${placeholders})` +
+    ") WHERE rn <= ? ORDER BY thread_id, seq ASC",
+  );
+  // SAFETY: query returns `thread_id` and `json`, both TEXT columns on `messages`.
+  const rows = statement.all(...uniqueIds, limit) as Array<{ thread_id: string; json: string }>;
+  for (const row of rows) {
+    const list = result.get(row.thread_id);
+    const msg = rowToMessage(row);
+    if (list) {
+      list.push(msg);
+    } else {
+      result.set(row.thread_id, [msg]);
+    }
+  }
+  return result;
+}
+
 function importLegacy(threadId: string, legacyFile: string): ThreadRows {
   let messages: Message[] = [];
   let activeLeafId: string | null = null;
   let raw: unknown;
   try {
     raw = JSON.parse(readFileSync(legacyFile, "utf8"));
-  } catch {
+  } catch (error) {
+    // ENOENT is a fresh thread with no legacy file yet; anything else means a
+    // real transcript failed to read and is about to masquerade as empty.
+    // SAFETY: a failed `readFileSync` throws an errno exception carrying `code`.
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      console.error(`[message-db] could not read legacy thread file ${legacyFile}; treating the thread as empty`, error);
+    }
     return { messages, activeLeafId }; // fresh thread
   }
   if (Array.isArray(raw)) messages = raw as Message[]; // pre-branching flat file
@@ -214,8 +313,14 @@ function importLegacy(threadId: string, legacyFile: string): ThreadRows {
     renameSync(legacyFile, `${legacyFile}.imported`);
     try {
       chmodSync(`${legacyFile}.imported`, 0o600);
-    } catch {}
-  } catch {}
+    } catch {
+      // best-effort permission tightening on the one-time backup
+    }
+  } catch (error) {
+    // Without the rename, a later read of a thread whose rows were deleted
+    // would re-import this stale file as if it were live history.
+    console.error(`[message-db] could not rename imported legacy thread file ${legacyFile} aside`, error);
+  }
   return { messages, activeLeafId };
 }
 
@@ -251,6 +356,63 @@ export function appendMessage(threadId: string, message: Message): void {
   }
 }
 
+/** Persist a WHOLE transcript in one transaction.
+ *
+ * Folding a long conversation into another copies every message it holds,
+ * and one transaction per message turned that into thousands of commits
+ * that each blocked the event loop.  The rows land together and the branch
+ * head moves to the last one, so the transcript reads exactly as it would
+ * have if the messages had arrived one at a time. */
+export function appendMessages(threadId: string, messages: Message[]): void {
+  if (messages.length === 0) return;
+  const database = db();
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    for (const message of messages) insertMessage(threadId, message);
+    setActiveLeaf(threadId, messages[messages.length - 1]!.id);
+    database.exec("COMMIT");
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+/** When a thread first spoke, without hydrating the transcript.
+ *
+ * The first row by insertion order is the thread's start, which is what the
+ * merge order reads; a comparator that asked for it through the full
+ * transcript instead pulled every message — base64 captures included —
+ * into memory, once per comparison.  A thread whose rows still live only in
+ * its legacy JSON file is read from that file, not imported: this is a
+ * question about a timestamp, not a reason to write. */
+export function firstMessageAt(threadId: string, legacyFile: string): number | null {
+  // SAFETY: the query selects the single column `at` from at most one row, so
+  // the row is `{ at: number }` and `.get()` returns undefined when the thread
+  // has no rows yet.
+  const row = db()
+    .prepare("SELECT at FROM messages WHERE thread_id = ? ORDER BY rowid LIMIT 1")
+    .get(threadId) as { at: number } | undefined;
+  if (row) return row.at;
+  try {
+    const raw = JSON.parse(readFileSync(legacyFile, "utf8"));
+    // SAFETY: a legacy transcript file holds either the message array itself
+    // or an object with a `messages` array.  Both shapes are read here, and
+    // any other shape yields an empty list rather than a wrong answer.
+    const messages = Array.isArray(raw)
+      ? (raw as Message[])
+      : (((raw as { messages?: Message[] }).messages ?? []) as Message[]);
+    return messages[0]?.at ?? null;
+  } catch (error) {
+    // ENOENT just means no legacy file; a parse or IO failure returning null
+    // would silently reorder a merge as if the thread never started.
+    // SAFETY: a failed `readFileSync` throws an errno exception carrying `code`.
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      console.error(`[message-db] could not read legacy thread file ${legacyFile} for its first timestamp`, error);
+    }
+    return null;
+  }
+}
+
 /** Rows whose stored helper is still running.  The LIKE pass is a candidate
  * filter; the helper status is what decides.  A restart has no live tracker,
  * so these are the cards that would otherwise tick forever. */
@@ -268,7 +430,8 @@ export function runningHelperRows(): Array<{ threadId: string; message: Message 
     try {
       // SAFETY: `json` is `JSON.stringify` of a `Message`, the same cast `rowToMessage` uses.
       message = JSON.parse(json) as Message;
-    } catch {
+    } catch (error) {
+      console.error(`[message-db] runningHelperRows: skipping unparseable message row in thread ${thread_id}`, error);
       continue;
     }
     if (message.helper?.status !== "running") {
@@ -466,16 +629,18 @@ export function searchMessages(query: string, limit = 40, threadId?: string): Se
   if (!needle) return [];
   // escape LIKE wildcards so a literal % or _ in the query stays literal
   const pattern = `%${needle.replace(/([\\%_])/g, "\\$1")}%`;
-  // text messages by their text; activity chips by the tool name — "which
+  // text messages by their text/content; activity chips by the tool name — "which
   // bot ran that migration" is a tool-name question. The chip's name lives
   // in the row's json; a JSON1 extract keeps this one query.
   const scope = threadId ? "thread_id = ? AND " : "";
   const statement = db().prepare(
-    "SELECT thread_id, id, at, role, kind, text, json_extract(json, '$.tool.name') AS tool_name, json_extract(json, '$.from.name') AS from_name FROM messages " +
-      `WHERE ${scope}((kind = 'text' AND text IS NOT NULL AND lower(text) LIKE ? ESCAPE '\\') ` +
+    "SELECT thread_id, id, at, role, kind, text, json_extract(json, '$.content') AS content, json_extract(json, '$.tool.name') AS tool_name, json_extract(json, '$.from.name') AS from_name FROM messages " +
+      `WHERE ${scope}json_extract(json, '$.role') IN ('user', 'bot') ` +
+      "  AND ((lower(COALESCE(text, json_extract(json, '$.content'), '')) LIKE ? ESCAPE '\\') " +
       "   OR (kind = 'activity' AND tool_name IS NOT NULL AND lower(tool_name) LIKE ? ESCAPE '\\')) " +
       "ORDER BY at DESC LIMIT ?",
   );
+  // SAFETY: query returns columns from `messages` and JSON1 extractions.
   const rows = (threadId
     ? statement.all(threadId, pattern, pattern, limit)
     : statement.all(pattern, pattern, limit)) as Array<{
@@ -485,11 +650,12 @@ export function searchMessages(query: string, limit = 40, threadId?: string): Se
     role: string;
     kind: string;
     text: string | null;
+    content: string | null;
     tool_name: string | null;
     from_name: string | null;
   }>;
   return rows.map((row) => {
-    const haystack = row.kind === "activity" ? (row.tool_name ?? "") : (row.text ?? "");
+    const haystack = row.kind === "activity" ? (row.tool_name ?? "") : (row.text ?? row.content ?? "");
     const hitAt = Math.max(0, haystack.toLowerCase().indexOf(needle));
     const start = Math.max(0, hitAt - 60);
     const end = Math.min(haystack.length, hitAt + needle.length + 90);
@@ -518,7 +684,9 @@ export function searchMessages(query: string, limit = 40, threadId?: string): Se
 export function closeMessageDb(): void {
   try {
     handle?.close();
-  } catch {}
+  } catch {
+    // shutdown/test dispose; the handle is dropped either way
+  }
   handle = null;
   handlePath = null;
 }

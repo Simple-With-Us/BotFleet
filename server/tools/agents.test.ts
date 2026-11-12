@@ -212,6 +212,53 @@ describe("coordinate_bots goes through executeCoordinateBotsRequest", () => {
     expect(executeCoordinateBotsRequest).not.toHaveBeenCalled();
   });
 
+  it("names every token that matched no peer, so one retry can fix them all", async () => {
+    const executeCoordinateBotsRequest = vi.fn(
+      async (): Promise<AgentRequestResult> => ({ status: 200, body: { message: "ok", assignments: [] } }),
+    );
+    const tools = createAgentTools(deps({ executeCoordinateBotsRequest }));
+    // "@peer" is on the roster; the other three are a hidden bot, another section's bot and the caller itself,
+    // and "bot-hidden" is said twice.
+    const outcome = await tools.coordinate_bots(
+      call("coordinate_bots", { bot_ids: ["bot-hidden", "@peer", "bot-other", "bot-hidden", "bot-self"], message: "x" }),
+      ctx(),
+      runtime,
+    );
+    expect(outcome.kind).toBe("error");
+    const expected = "no bot matches bot-hidden; no bot matches bot-other; no bot matches bot-self";
+    expect(JSON.parse(outcome.content).error).toBe(expected);
+    expect(outcome.detail).toBe(expected);
+    expect(executeCoordinateBotsRequest).not.toHaveBeenCalled();
+  });
+
+  it("passes a refusal that names several bots straight through", async () => {
+    const tools = createAgentTools(
+      deps({
+        executeCoordinateBotsRequest: async () => ({
+          status: 200,
+          body: { error: "Sleepy is switched off; Archived is hidden" },
+        }),
+      }),
+    );
+    const outcome = await tools.coordinate_bots(call("coordinate_bots", { bot_ids: ["@peer", "@busy"], message: "x" }), ctx(), runtime);
+    expect(outcome.kind).toBe("error");
+    expect(JSON.parse(outcome.content).error).toBe("Sleepy is switched off; Archived is hidden");
+    expect(outcome.detail).toBe("Sleepy is switched off; Archived is hidden");
+  });
+
+  it("shows the model which bots were not handed the work when only some took it", async () => {
+    const body = {
+      message: "Handed to @peer.  The result comes back on this conversation when the work finishes.  Not handed off: busy is switched off.",
+      assignments: [{ id: "asg-1" }],
+      errors: ["busy is switched off"],
+    };
+    const tools = createAgentTools(deps({ executeCoordinateBotsRequest: async () => ({ status: 200, body }) }));
+    const outcome = await tools.coordinate_bots(call("coordinate_bots", { bot_ids: ["@peer", "@busy"], message: "x" }), ctx(), runtime);
+    expect(outcome.kind).toBe("result");
+    expect(JSON.parse(outcome.content)).toEqual(body);
+    expect(outcome.detail).toBe(body.message);
+  });
+
   it("requires bot_ids and message", async () => {
     const tools = createAgentTools(deps());
     const outcome = await tools.coordinate_bots(call("coordinate_bots", { bot_ids: ["@peer"] }), ctx(), runtime);

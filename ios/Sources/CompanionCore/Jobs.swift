@@ -18,6 +18,8 @@ import Foundation
 /// because it was running when the harness shut down.
 public enum JobStatus: String, Codable, Hashable, Sendable {
     case running, stopping, completed, failed, killed, lost
+    case queued, dispatching
+    case workerUnreachable = "worker-unreachable"
     case unknown
 
     public init(from decoder: Decoder) throws {
@@ -48,6 +50,12 @@ public struct JobSnapshot: Codable, Hashable, Identifiable, Sendable {
     public var label: String
     public var cwd: String?
     public var status: JobStatus
+    public var controllerHostId: String?
+    public var host: String?
+    public var leaseId: String?
+    public var epoch: Int?
+    public var placedReason: String?
+    public var queuedReason: String?
     /// The command's own exit code, when it exited on its own.
     public var exitCode: Int?
     /// The signal that ended it, when one did (`SIGTERM`, `SIGXCPU`).
@@ -61,6 +69,7 @@ public struct JobSnapshot: Codable, Hashable, Identifiable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case id, botId, threadId, label, cwd, status, exitCode, signal, startedAt, endedAt, killedBy, reason
+        case controllerHostId, host, leaseId, epoch, placedReason, queuedReason
     }
 
     public init(
@@ -75,7 +84,13 @@ public struct JobSnapshot: Codable, Hashable, Identifiable, Sendable {
         startedAt: Double = 0,
         endedAt: Double? = nil,
         killedBy: JobKilledBy? = nil,
-        reason: String? = nil
+        reason: String? = nil,
+        controllerHostId: String? = nil,
+        host: String? = nil,
+        leaseId: String? = nil,
+        epoch: Int? = nil,
+        placedReason: String? = nil,
+        queuedReason: String? = nil
     ) {
         self.id = id
         self.botId = botId
@@ -89,6 +104,12 @@ public struct JobSnapshot: Codable, Hashable, Identifiable, Sendable {
         self.endedAt = endedAt
         self.killedBy = killedBy
         self.reason = reason
+        self.controllerHostId = controllerHostId
+        self.host = host
+        self.leaseId = leaseId
+        self.epoch = epoch
+        self.placedReason = placedReason
+        self.queuedReason = queuedReason
     }
 
     public init(from decoder: Decoder) throws {
@@ -105,10 +126,18 @@ public struct JobSnapshot: Codable, Hashable, Identifiable, Sendable {
         endedAt = try container.decodeIfPresent(Double.self, forKey: .endedAt)
         killedBy = try container.decodeIfPresent(JobKilledBy.self, forKey: .killedBy)
         reason = try container.decodeIfPresent(String.self, forKey: .reason)
+        controllerHostId = try container.decodeIfPresent(String.self, forKey: .controllerHostId)
+        host = try container.decodeIfPresent(String.self, forKey: .host)
+        leaseId = try container.decodeIfPresent(String.self, forKey: .leaseId)
+        epoch = try container.decodeIfPresent(Int.self, forKey: .epoch)
+        placedReason = try container.decodeIfPresent(String.self, forKey: .placedReason)
+        queuedReason = try container.decodeIfPresent(String.self, forKey: .queuedReason)
     }
 
-    /// Running or being stopped: the states a Stop still means something in.
-    public var isActive: Bool { status == .running || status == .stopping }
+    /// Unfinished states stay visible until the controller reports an end.
+    public var isActive: Bool {
+        status == .queued || status == .dispatching || status == .workerUnreachable || status == .running || status == .stopping
+    }
 
     /// How long it has run: to `now` while it runs, to its end once it ended.
     public func elapsedMs(now: Double) -> Double {
@@ -118,6 +147,12 @@ public struct JobSnapshot: Codable, Hashable, Identifiable, Sendable {
     /// The chip beside a job.  Sentence case: it is a value, not a heading.
     public var exitChip: String {
         switch status {
+        case .queued:
+            return "Queued"
+        case .dispatching:
+            return "Dispatching"
+        case .workerUnreachable:
+            return "Worker unreachable"
         case .running:
             return "Running"
         case .stopping:

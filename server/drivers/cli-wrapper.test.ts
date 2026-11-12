@@ -166,7 +166,7 @@ describe("CliWrapperDriver turns (real child process)", () => {
           command: NODE,
           args: [
             "-e",
-            "const keep = Object.entries(process.env).filter(([k]) => /^(AGENT_|ZULIP_|CLAUDE_CODE_SESSION_ID$)/.test(k));" +
+            "const keep = Object.entries(process.env).filter(([k]) => /^(AGENT_|SIMPLE_TOOLS_|ZULIP_|CLAUDE_CODE_SESSION_ID$)/.test(k));" +
               "process.stdout.write(JSON.stringify(Object.fromEntries(keep)))",
           ],
           passPromptAs: "arg",

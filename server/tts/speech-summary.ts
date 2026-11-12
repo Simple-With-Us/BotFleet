@@ -2,6 +2,8 @@ import { z } from "zod";
 import type { Pronunciation } from "../../shared/pronunciations.ts";
 import { utterancesWithSpans } from "../../shared/speech-spans.ts";
 import { spokenReply, stripVoiceSummaryTags } from "../../shared/voice-summary.ts";
+import { aiTokensFromChatUsage, ChatUsageSchema } from "../ai-usage.ts";
+import { telemetry } from "../telemetry.ts";
 import { sanitizeForTTSByLine } from "./minimax.ts";
 
 export const DeepSeekChatMessageSchema = z.object({
@@ -21,7 +23,7 @@ export const DeepSeekChatResponseSchema = z.object({
   created: z.number().optional(),
   model: z.string().optional(),
   choices: z.array(DeepSeekChatChoiceSchema).optional(),
-  usage: z.record(z.string(), z.unknown()).optional(),
+  usage: ChatUsageSchema.optional().catch(undefined),
 });
 
 export type DeepSeekChatResponse = z.infer<typeof DeepSeekChatResponseSchema>;
@@ -38,6 +40,29 @@ export function resolveDeepSeekKey(providedKey?: string): string {
   const general = process.env.DEEPSEEK_API_KEY?.trim();
   if (general && general !== "undefined") return general;
   return "";
+}
+
+/** Report one distiller call to Usage Monitor (BF-2435).  Every call that
+ * came back with a usage figure was billed, whether or not its rewrite was
+ * usable, so this runs on the response and not on the verdict.  DeepSeek
+ * reports the cached share as `prompt_cache_hit_tokens`. */
+function reportSummaryUsage(requestedModel: string, data: DeepSeekChatResponse, startedAt: number): void {
+  const tokens = aiTokensFromChatUsage(data.usage);
+  if (Object.keys(tokens).length === 0) return;
+  telemetry.trackAux({
+    kind: "speech-summary",
+    provider: "deepseek",
+    service: data.model || requestedModel,
+    label: "BotFleet speech summary",
+    unit: "token",
+    latencyMs: Date.now() - startedAt,
+    ai: {
+      model: { requested: requestedModel, served: data.model },
+      tokens,
+      durationMs: Date.now() - startedAt,
+      billingMode: "payg",
+    },
+  });
 }
 
 export function completionsUrl(baseUrl?: string): string {
@@ -287,6 +312,7 @@ export async function summarizeForVoiceDetailed(
   };
 
   try {
+    let startedAt = Date.now();
     const response = await fetch(endpoint, {
       method: "POST",
       headers: {
@@ -308,11 +334,13 @@ export async function summarizeForVoiceDetailed(
 
     if (response.ok) {
       const parsed = DeepSeekChatResponseSchema.safeParse(await response.json());
+      if (parsed.success) reportSummaryUsage("deepseek-flash", parsed.data, startedAt);
       const verdict = judge(parsed.success ? parsed.data : null);
       if (verdict) return verdict;
     }
 
     // Fallback: try deepseek-chat if deepseek-flash returned empty or non-200
+    startedAt = Date.now();
     const fallbackResponse = await fetch(endpoint, {
       method: "POST",
       headers: {
@@ -333,6 +361,7 @@ export async function summarizeForVoiceDetailed(
 
     if (fallbackResponse.ok) {
       const parsed = DeepSeekChatResponseSchema.safeParse(await fallbackResponse.json());
+      if (parsed.success) reportSummaryUsage("deepseek-chat", parsed.data, startedAt);
       const verdict = judge(parsed.success ? parsed.data : null);
       if (verdict) return verdict;
     }

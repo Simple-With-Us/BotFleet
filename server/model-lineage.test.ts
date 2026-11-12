@@ -292,6 +292,88 @@ describe("checkLineageWrite", () => {
     });
   });
 
+  describe("context cap and output limit", () => {
+    const saved: ModelSelection = {
+      instanceId: "claude",
+      model: "claude-sonnet-5-5",
+      contextCap: 524_288,
+      maxOutputTokens: 8192,
+      fallbacks: [
+        { instanceId: "codex", model: "gpt-5.5", maxOutputTokens: 4096 },
+        { instanceId: "grok", model: "grok-4.7", contextCap: 131_072 },
+      ],
+    };
+    const ask = (raw: ModelSelection) => {
+      const result = write(raw, saved, raw);
+      if (!result.ok) throw new Error(result.error);
+      return result.selection;
+    };
+
+    it("keeps the saved limits when an older client re-sends the selection without them", () => {
+      // The shipped iOS app decodes instanceId, model, effort and fallbacks only.
+      const resent = ask({
+        instanceId: "claude",
+        model: "claude-sonnet-5-5",
+        effort: "high",
+        fallbacks: [
+          { instanceId: "codex", model: "gpt-5.5" },
+          { instanceId: "grok", model: "grok-4.7" },
+        ],
+      });
+      expect(resent).toMatchObject({
+        effort: "high",
+        contextCap: 524_288,
+        maxOutputTokens: 8192,
+        fallbacks: [
+          { instanceId: "codex", model: "gpt-5.5", maxOutputTokens: 4096 },
+          { instanceId: "grok", model: "grok-4.7", contextCap: 131_072 },
+        ],
+      });
+      expect(resent.fallbacks?.[0]?.contextCap).toBeUndefined();
+    });
+
+    it("follows a reordered fallback to its own limits", () => {
+      const resent = ask({
+        instanceId: "claude",
+        model: "claude-sonnet-5-5",
+        fallbacks: [
+          { instanceId: "grok", model: "grok-4.7" },
+          { instanceId: "codex", model: "gpt-5.5" },
+        ],
+      });
+      expect(resent.fallbacks).toEqual([
+        { instanceId: "grok", model: "grok-4.7", contextCap: 131_072 },
+        { instanceId: "codex", model: "gpt-5.5", maxOutputTokens: 4096 },
+      ]);
+    });
+
+    it("clears a limit only on an explicit null, and keeps the other one", () => {
+      const raw = { instanceId: "claude", model: "claude-sonnet-5-5", contextCap: null };
+      const result = write({ instanceId: "claude", model: "claude-sonnet-5-5" }, saved, raw);
+      expect(result.ok && result.selection.contextCap).toBeUndefined();
+      expect(result.ok && result.selection.maxOutputTokens).toBe(8192);
+    });
+
+    it("never hands a limit to a different model", () => {
+      const moved = ask({ instanceId: "claude", model: "claude-opus-5" });
+      expect(moved.contextCap).toBeUndefined();
+      expect(moved.maxOutputTokens).toBeUndefined();
+      const otherEngine = ask({ instanceId: "claude2", model: "claude-sonnet-5-5" });
+      expect(otherEngine.contextCap).toBeUndefined();
+    });
+
+    it("lets a value the client sends win over the saved one", () => {
+      const resent = ask({ instanceId: "claude", model: "claude-sonnet-5-5", contextCap: 262_144 });
+      expect(resent.contextCap).toBe(262_144);
+      expect(resent.maxOutputTokens).toBe(8192);
+    });
+
+    it("carries nothing when there is no saved selection", () => {
+      const result = write({ instanceId: "claude", model: "claude-sonnet-5-5" }, undefined);
+      expect(result.ok && result.selection.contextCap).toBeUndefined();
+    });
+  });
+
   it("lets a saved retired leftover through so another slot can still be edited", () => {
     const saved: ModelSelection = {
       instanceId: "claude",

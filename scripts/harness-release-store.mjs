@@ -105,7 +105,7 @@ export async function isReleaseDirectory(path) {
   return validateReleaseManifest(await readReleaseManifest(path)) !== null;
 }
 
-const MANIFEST_FIELDS = Object.freeze(["schemaVersion", "commit", "promotedAt", "node", "platform"]);
+const MANIFEST_FIELDS = Object.freeze(["schemaVersion", "commit", "promotedAt", "node", "platform", "version", "build"]);
 
 /**
  * Strictly validate a release manifest, or return null.
@@ -140,6 +140,16 @@ export function validateReleaseManifest(manifest) {
   if (manifest.node !== undefined && typeof manifest.node !== "string") return null;
   // oxlint-disable-next-line anti-slop/no-runtime-typeof -- schema field validation
   if (manifest.platform !== undefined && typeof manifest.platform !== "string") return null;
+  // The version the release's runtime reports.  Optional because the first
+  // release schema predates it; absent means the runtime falls back to the
+  // exported package.json, which is exactly what it reports today.  Present,
+  // it is the version the deployer validated for this release — the updater
+  // stamps the prepared build's version, so the post-apply check compares the
+  // runtime against the SAME number the update was prepared with.
+  // oxlint-disable-next-line anti-slop/no-runtime-typeof -- schema field validation
+  if (manifest.version !== undefined && typeof manifest.version !== "string") return null;
+  // oxlint-disable-next-line anti-slop/no-runtime-typeof -- schema field validation
+  if (manifest.build !== undefined && typeof manifest.build !== "string") return null;
   return manifest;
 }
 
@@ -196,7 +206,7 @@ async function readReleaseManifest(directory) {
  * complete.  `mkdir` first is the portable way to fail on a cross-device rename
  * with a clear error rather than an obscure one from the kernel.
  */
-export async function promoteStaging({ commit, env = process.env, renameImpl = rename, promotedAt = new Date().toISOString() } = {}) {
+export async function promoteStaging({ commit, env = process.env, renameImpl = rename, promotedAt = new Date().toISOString(), version, build } = {}) {
   const from = stagingPath(commit, env);
   const to = releasePath(commit, env);
   try {
@@ -216,6 +226,19 @@ export async function promoteStaging({ commit, env = process.env, renameImpl = r
       { stagingPath: from },
     );
   }
+  // The default version is the staged tree's own package.json: that is the
+  // version this code reports about itself, so recording it is a fact, not a
+  // claim.  A deployer that validated a different version (the updater stamps
+  // the prepared build's) passes it explicitly; a tree without a readable
+  // package.json simply records no version rather than inventing one.
+  let resolvedVersion = version;
+  if (resolvedVersion === undefined) {
+    try {
+      resolvedVersion = JSON.parse(await readFile(join(from, "package.json"), "utf8")).version;
+    } catch {
+      resolvedVersion = undefined;
+    }
+  }
   const manifest = {
     schemaVersion: 1,
     commit,
@@ -225,6 +248,8 @@ export async function promoteStaging({ commit, env = process.env, renameImpl = r
     node: process.version,
     platform: process.platform,
   };
+  if (resolvedVersion !== undefined) manifest.version = resolvedVersion;
+  if (build !== undefined) manifest.build = build;
   const manifestPath = join(from, MANIFEST);
   // Remove any leftover first.  A previous attempt may have written the manifest
   // read-only, and fs.writeFile applies `mode` only when it CREATES a file — so
@@ -269,6 +294,93 @@ export async function promoteStaging({ commit, env = process.env, renameImpl = r
     );
   }
   return to;
+}
+
+/**
+ * Stage a commit into `staging/<commit>`: the tree, then its dependencies.
+ *
+ * The tree is exported with `git archive`, which reads an object and writes
+ * bytes.  It never checks a branch out, never touches a worktree, and never
+ * mutates the repository it reads from — so preparing a release cannot
+ * disturb the tree that is currently running, which is the whole point of
+ * having a store instead of a checkout.
+ *
+ * The dependency install runs inside the staging tree, so the promoted
+ * release carries the exact tree it was verified with.  `--frozen-lockfile`
+ * is not optional here: a release that resolved different versions than
+ * the lockfile names is not the commit it claims to be.
+ */
+export async function stageRelease({
+  commit,
+  repo,
+  env = process.env,
+  install = true,
+  pnpm = "pnpm",
+  log = () => {},
+} = {}) {
+  if (!FULL_COMMIT.test(commit || "")) {
+    throw new ResolutionError(
+      `Refusing to stage a non-commit value: ${commit}.  A release is named by the commit it holds.`,
+      "not-a-commit",
+    );
+  }
+  // A commit that is already a release is not staged again.  Promoting it
+  // would fail with `already-released` AFTER a full dependency install, so
+  // the check has to come first: the install is the expensive part, and the
+  // staging tree it leaves behind is a leftover nobody asked for.
+  if (await isReleaseDirectory(releasePath(commit, env))) {
+    throw new ResolutionError(
+      `Commit ${commit.slice(0, 12)} is already a release at ${releasePath(commit, env)}; nothing to stage.  ` +
+        "Point the pointer at it with `swap`, or pick a different commit.",
+      "already-released",
+      { releasePath: releasePath(commit, env) },
+    );
+  }
+  const source = repo || env.BOTFLEET_RELEASE_SOURCE_REPO || "";
+  if (!source) {
+    throw new ResolutionError(
+      "No source repository to stage from.  Pass --repo <path> or set BOTFLEET_RELEASE_SOURCE_REPO.",
+      "no-source-repo",
+    );
+  }
+  const staging = stagingPath(commit, env);
+  await rm(staging, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  await mkdir(staging, { recursive: true, mode: 0o755 });
+
+  const archive = join(staging, ".botfleet-release-source.tar");
+  try {
+    await run("git", ["-C", source, "archive", "--format=tar", "--output", archive, commit], { timeout: 300_000 });
+    await run("tar", ["-xf", archive, "-C", staging], { timeout: 300_000 });
+  } catch (error) {
+    await rm(archive, { force: true });
+    throw new ResolutionError(
+      `Could not export ${commit.slice(0, 12)} from ${source}: ${error?.message || error}.  ` +
+        "The commit must exist in that repository (fetch it first if it is new).",
+      "stage-export-failed",
+      { stagingPath: staging },
+    );
+  }
+  await rm(archive, { force: true });
+
+  if (install) {
+    log(`installing dependencies in ${staging}`);
+    try {
+      await run(pnpm, ["install", "--frozen-lockfile"], {
+        cwd: staging,
+        timeout: 30 * 60_000,
+        maxBuffer: 32 * 1024 * 1024,
+        env: { ...env },
+      });
+    } catch (error) {
+      throw new ResolutionError(
+        `Dependency install failed for ${commit.slice(0, 12)}: ${error?.message || error}.  ` +
+          "The staging tree is left in place for inspection.",
+        "stage-install-failed",
+        { stagingPath: staging },
+      );
+    }
+  }
+  return staging;
 }
 
 /**
