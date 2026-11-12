@@ -9,8 +9,9 @@
 //     controller's own queue, where the record is written as `queued` and
 //     the controller places it.
 //   * A server mode on a host that does not hold the controller:  the start
-//     is refused with a reason.  Forwarding has no route yet, and a local
-//     waiting list would be a second queue outside the authoritative one
+//     is forwarded to the controller if a forwarder is configured; otherwise
+//     refused with a reason.  Forwarding sends `enqueue` to the authoritative
+//     controller so a local waiting list does not become a second queue
 //     (`docs/plans/2026-10-29-native-server-mode.md`).
 //
 // The bridge never writes the mode record:  only the person writes the mode,
@@ -77,6 +78,8 @@ export interface PlacementBridgeDeps {
   queuedReason: (jobId: string) => string | undefined;
   /** The authority's unreachable sweep:  the jobs whose worker went quiet. */
   sweepUnreachable: () => string[];
+  /** Optional forwarder to the controller when this host does not hold the controller. */
+  forward?: (message: EnqueueMessage) => PlacementEnqueueResult;
 }
 
 /** How often the unreachable sweep runs when nothing else says. */
@@ -123,6 +126,38 @@ export class PlacementControllerBridge {
     }
     if (view.mode === "localOnly") return { kind: "local" };
     if (view.controllerId !== this.deps.hostId) {
+      if (this.deps.forward) {
+        if (!view.acknowledged) {
+          return {
+            kind: "refused",
+            reason: `The placement mode record is not held at the current fence (epoch ${view.epoch}), so no job is admitted.  Re-apply the mode in Settings, or switch to This Mac Only.`,
+          };
+        }
+        const result = this.deps.forward({
+          version: PLACEMENT_WIRE_VERSION,
+          controllerId: view.controllerId,
+          epoch: view.epoch,
+          jobId: request.jobId,
+          botId: request.botId,
+          threadId: request.threadId,
+          command: request.command,
+          cwd: request.cwd,
+          timeoutMs: request.timeoutMs,
+        });
+        if (!result.ok) return { kind: "refused", reason: result.reason };
+        const reply = result.reply;
+        if (!reply.accepted) {
+          return { kind: "refused", reason: reply.reason ?? "The controller did not admit the job." };
+        }
+        return {
+          kind: "queued",
+          jobId: reply.jobId,
+          queuedReason: this.deps.queuedReason(reply.jobId) ?? "waiting for an eligible host",
+          controllerId: reply.controllerId,
+          epoch: reply.epoch,
+          duplicate: reply.duplicate === true,
+        };
+      }
       return {
         kind: "refused",
         reason: `This computer runs in ${view.mode}, and the controller is ${view.controllerId} at epoch ${view.epoch}, so this computer does not admit jobs of its own.  Run the command with bash if it is short, or switch to This Mac Only in Settings.`,
