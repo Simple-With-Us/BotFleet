@@ -44,7 +44,30 @@ export const KARAOKE_HIGHLIGHT_NAMES = {
 
 type KaraokeLayer = keyof typeof KARAOKE_HIGHLIGHT_NAMES;
 
-const LAYER_PRIORITY: Record<KaraokeLayer, number> = {
+/** Closed table of every highlight layer. A new name has to be filled in here. */
+type KaraokeLayerTable<Value> = {
+  ahead: Value;
+  lead: Value;
+  leadFar: Value;
+  current: Value;
+  roll: Value;
+  trail: Value;
+  trailMid: Value;
+  trailFar: Value;
+};
+
+/** The same table without the dimmed-ahead layer, which is tracked on its own. */
+type KaraokeSpokenTable<Value> = {
+  lead: Value;
+  leadFar: Value;
+  current: Value;
+  roll: Value;
+  trail: Value;
+  trailMid: Value;
+  trailFar: Value;
+};
+
+const LAYER_PRIORITY: KaraokeLayerTable<number> = {
   ahead: 1,
   trailFar: 2,
   trailMid: 3,
@@ -351,7 +374,7 @@ export function createKaraokeHighlighter(
     return wordRanges[index] ?? null;
   };
 
-  const layers: Record<KaraokeLayer, HighlightLike | null> = {
+  const layers: KaraokeLayerTable<HighlightLike | null> = {
     ahead: null,
     lead: null,
     leadFar: null,
@@ -363,7 +386,7 @@ export function createKaraokeHighlighter(
   };
   /** Words [aheadFrom, count) have their whole range in `ahead`. */
   let aheadFrom = count;
-  const shown: Record<Exclude<KaraokeLayer, "ahead">, Range[]> = {
+  const shown: KaraokeSpokenTable<Range[]> = {
     lead: [],
     leadFar: [],
     current: [],
@@ -387,6 +410,7 @@ export function createKaraokeHighlighter(
   let renderedAt = Number.NaN;
   let dirty = true;
 
+  // SAFETY: `as const` fixes the keys, so they are KaraokeLayer and nothing else.
   const layerNames = Object.keys(KARAOKE_HIGHLIGHT_NAMES) as KaraokeLayer[];
 
   const register = (): void => {
