@@ -1897,6 +1897,7 @@
     {"path":"src/lib/bubble-metrics.ts","category":"ui-build","reason":"Import from src/components/ChatView.tsx"},
     {"path":"src/lib/call-stt.ts","category":"ui-build","reason":"Import from src/components/CallView.tsx"},
     {"path":"src/lib/call.ts","category":"ui-build","reason":"Import from src/state/store.tsx"},
+    {"path":"src/lib/chat-accessibility.ts","category":"ui-build","reason":"Import from src/components/ChatView.tsx"},
     {"path":"src/lib/cloud-backend.ts","category":"ui-build","reason":"Import from src/components/ComputerPanel.tsx"},
     {"path":"src/lib/cloud-stt-capabilities.ts","category":"ui-build","reason":"Import from src/components/CallView.tsx"},
     {"path":"src/lib/cn.ts","category":"ui-build","reason":"Import from src/components/TeamMapPage.tsx"},
