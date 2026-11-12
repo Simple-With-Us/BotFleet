@@ -13,15 +13,15 @@ export function isLifecycleToolTitle(title: string | undefined): boolean {
 
 /** Whether lifecycle output or a terminal title says the step finished. */
 export function lifecycleTextSaysCompleted(detail: string | undefined, title?: string): boolean {
+  const lower = (detail ?? "").trim().toLowerCase();
+  // Output that names errors or failures stays failed, even under a "completed" title.
+  if (/\b(?:\d+\s+)?(?:errors?|failed|failures?)\b/.test(lower)) return false;
   if (title && TITLE_TERMINAL_SUCCESS.test(title.trim())) return true;
-  const text = (detail ?? "").trim();
-  if (!text) return false;
-  const lower = text.toLowerCase();
+  if (!lower) return false;
   if (!/\b(?:main run )?(?:completed|finished)\b/.test(lower)) return false;
   if (/\b(?:not|never|unable to|couldn't|could not)\b.{0,48}\b(?:completed|finished)\b/.test(lower)) return false;
   if (/\b(?:did not|didn't)\s+(?:complete|finish)\b/.test(lower)) return false;
   if (/\bfailed to\b.{0,48}\b(?:complete|finish)\b/.test(lower)) return false;
-  if (/\b(?:\d+\s+)?(?:errors?|failed|failures?)\b/.test(lower)) return false;
   return true;
 }
 
