@@ -418,6 +418,7 @@ const CATCH_UP_MS = 12 * 60 * 60_000;
  *  overrides it with `jobs.webhookHotDeferMinutes` when that knob is set. */
 export const DEFAULT_WEBHOOK_HOT_DEFER_MINUTES = 20;
 export const DEFAULT_WEBHOOK_HOT_DEFER_MS = DEFAULT_WEBHOOK_HOT_DEFER_MINUTES * 60_000;
+/** Terminal history window; override with `BOTFLEET_ROUTINE_RUN_RETENTION_DAYS` (days, default 7). */
 const ROUTINE_RUN_RETENTION_DAYS = parseRoutineRunRetentionDays(process.env.BOTFLEET_ROUTINE_RUN_RETENTION_DAYS);
 const ROUTINE_RUN_RETENTION_MS = routineRunRetentionMaxAgeMs(ROUTINE_RUN_RETENTION_DAYS);
 /** What acknowledging the backlog is allowed to clear — see markAllSeen. */
