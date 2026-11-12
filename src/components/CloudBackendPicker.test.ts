@@ -24,6 +24,11 @@ const vpsButton = (html: string): string => {
   return buttons.find((b) => b.includes("Self-hosted VPS")) ?? "";
 };
 
+const boxButton = (html: string): string => {
+  const buttons = html.match(/<button[^>]*>(?:(?!<\/button>).)*<\/button>/gs) ?? [];
+  return buttons.find((b) => b.includes("ASCII.dev Box")) ?? "";
+};
+
 const describedById = (buttonHtml: string): string | null =>
   buttonHtml.match(/aria-describedby="([^"]+)"/)?.[1] ?? null;
 
@@ -131,6 +136,28 @@ describe("CloudBackendPicker", () => {
     const html = markup({ ...base, vpsSupported: true, value: "box", engineName: "MiniMax" });
     expect(html).not.toContain("run a desktop on your own server.");
     expect(vpsButton(html)).not.toContain("disabled");
+    expect(boxButton(html)).not.toContain("disabled");
     expect(describedById(vpsButton(html))).toBeNull();
+  });
+
+  it("greys both remote desktops for an engine that runs only on this Mac", () => {
+    const html = markup({
+      ...base,
+      vpsSupported: false,
+      boxSupported: false,
+      value: "vps",
+      engineName: "Grok",
+      unavailableNote: "Grok runs only on this Mac.",
+    });
+    expect(vpsButton(html)).toContain("disabled");
+    expect(boxButton(html)).toContain("disabled");
+    expect(boxButton(html)).not.toContain("hover:");
+    expect(html).toContain("Grok runs only on this Mac.");
+    expect(html).not.toContain("can&#x27;t run a desktop on your own server.");
+    expect(html).not.toContain("Choose Self-hosted VPS");
+    expect(html).toContain("Remote desktops stay listed so a saved choice is not hidden.");
+    const id = describedById(boxButton(html));
+    expect(id).not.toBeNull();
+    expect(textForId(html, id!)).toBe("Grok runs only on this Mac.");
   });
 });
