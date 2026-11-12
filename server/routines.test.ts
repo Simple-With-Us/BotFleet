@@ -8,6 +8,7 @@ import type { BotDispatchState } from "../shared/bot-profile.ts";
 import { BOT_OFF_SKIPPED } from "../shared/bot-power.ts";
 import { ROUTINE_ATTENTION_STATUSES } from "../shared/routine-outcomes.ts";
 import { wantsEphemeralDispatch } from "./ephemeral-dispatch.ts";
+import { ROUTINE_RUN_TERMINAL_SAFETY_CAP } from "../shared/routine-retention.ts";
 import { BUSY_DEFER_NOTE, DEFAULT_WEBHOOK_HOT_DEFER_MS, nextOccurrence, RoutineManager, type RoutineManagerOptions, type RoutineRunOn, type RoutineSchedule } from "./routines.ts";
 
 type TurnCompletedEvent = Extract<RuntimeEvent, { type: "turn.completed" }>;
@@ -130,20 +131,32 @@ afterEach(() => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-it("persists queued receipts while pruning more than 2,000 terminal records", () => {
+it("persists queued receipts while pruning terminal records past the safety cap", () => {
   const h = harness();
   h.setAdmitting(false);
-  const input = { runOn: "bot" as const, webhookId: "retention-hook", webhookName: "Retention", prompt: "Fixture", botId: "bot", receivedAt: 1 };
+  const anchor = new Date(2026, 7, 17, 8, 0, 0).getTime();
+  const input = { runOn: "bot" as const, webhookId: "retention-hook", webhookName: "Retention", prompt: "Fixture", botId: "bot", receivedAt: anchor };
   const queued = h.manager.enqueueWebhook({ ...input, deliveryId: "queued" });
   h.manager.flushNow();
   const disk = JSON.parse(readFileSync(h.options.file!, "utf8"));
-  disk.runs = [queued, ...Array.from({ length: 2001 }, (_, i) => ({ ...queued, id: `history-${i}`, deliveryId: `history-${i}`, status: "completed", createdAt: i + 2, finishedAt: i + 3 }))];
+  const excess = ROUTINE_RUN_TERMINAL_SAFETY_CAP + 1;
+  disk.runs = [
+    queued,
+    ...Array.from({ length: excess }, (_, i) => ({
+      ...queued,
+      id: `history-${i}`,
+      deliveryId: `history-${i}`,
+      status: "completed",
+      createdAt: anchor - excess + i,
+      finishedAt: anchor - excess + i + 1,
+    })),
+  ];
   writeFileSync(h.options.file!, JSON.stringify(disk));
   const reloaded = new RoutineManager(h.options);
   const second = reloaded.enqueueWebhook({ ...input, deliveryId: "new-queued" });
   reloaded.flushNow();
   const persisted = JSON.parse(readFileSync(h.options.file!, "utf8"));
-  expect(persisted.runs).toHaveLength(2002);
+  expect(persisted.runs).toHaveLength(ROUTINE_RUN_TERMINAL_SAFETY_CAP + 2);
   expect(persisted.runs.filter((run: { status: string }) => run.status === "queued").map((run: { id: string }) => run.id)).toEqual([queued.id, second.id]);
   expect(persisted.runs.some((run: { id: string }) => run.id === "history-0")).toBe(false);
 });
@@ -151,13 +164,24 @@ it("persists queued receipts while pruning more than 2,000 terminal records", ()
 it("bounds the prompt snapshot of settled runs older than the newest 100 when it saves", () => {
   const h = harness();
   h.setAdmitting(false);
+  const anchor = new Date(2026, 7, 17, 8, 0, 0).getTime();
   const payload = "p".repeat(20_000);
   const prompt = ["Event: deploy.finished", "[UNTRUSTED WEBHOOK EVENT DATA]", payload, "[/UNTRUSTED WEBHOOK EVENT DATA]"].join("\n");
-  const input = { runOn: "bot" as const, webhookId: "bound-hook", webhookName: "Bound", prompt, botId: "bot", receivedAt: 1 };
+  const input = { runOn: "bot" as const, webhookId: "bound-hook", webhookName: "Bound", prompt, botId: "bot", receivedAt: anchor };
   const queued = h.manager.enqueueWebhook({ ...input, deliveryId: "queued" });
   h.manager.flushNow();
   const disk = JSON.parse(readFileSync(h.options.file!, "utf8"));
-  disk.runs = [queued, ...Array.from({ length: 105 }, (_, i) => ({ ...queued, id: `history-${i}`, deliveryId: `history-${i}`, status: "completed", createdAt: i + 2, finishedAt: i + 3 }))];
+  disk.runs = [
+    queued,
+    ...Array.from({ length: 105 }, (_, i) => ({
+      ...queued,
+      id: `history-${i}`,
+      deliveryId: `history-${i}`,
+      status: "completed",
+      createdAt: anchor - 105 + i,
+      finishedAt: anchor - 105 + i + 1,
+    })),
+  ];
   writeFileSync(h.options.file!, JSON.stringify(disk));
   const reloaded = new RoutineManager(h.options);
   reloaded.enqueueWebhook({ ...input, deliveryId: "new-queued" });
@@ -178,25 +202,35 @@ it("bounds the prompt snapshot of settled runs older than the newest 100 when it
 it("retains the exact result of an unsettled run-now confirmation until its card settles", () => {
   const h = harness();
   h.setAdmitting(false);
+  const anchor = new Date(2026, 7, 17, 8, 0, 0).getTime();
   const routine = h.manager.create({ name: "Fixture", prompt: "Check", botId: "bot", schedule: { type: "daily", time: "09:00", weekdays: [1] } });
   const request = { requestId: "retained-request", messageId: "message", botId: "bot", threadId: "thread", action: "run_now" as const, fingerprintVersion: 1 as const, fingerprint: "a".repeat(64) };
   const committed = h.manager.runNow(routine.id, request)!;
   h.manager.flushNow();
   const disk = JSON.parse(readFileSync(h.options.file!, "utf8"));
-  const terminal = { ...committed, status: "completed", finishedAt: 1 };
-  disk.runs = [terminal, ...Array.from({ length: 2001 }, (_, i) => ({ ...terminal, id: `later-${i}`, createdAt: i + 2, finishedAt: i + 3 }))];
+  const terminal = { ...committed, status: "completed", finishedAt: anchor - 1 };
+  const history = 2001;
+  disk.runs = [
+    terminal,
+    ...Array.from({ length: history }, (_, i) => ({
+      ...terminal,
+      id: `later-${i}`,
+      createdAt: anchor - history + i,
+      finishedAt: anchor - history + i + 1,
+    })),
+  ];
   writeFileSync(h.options.file!, JSON.stringify(disk));
   const reloaded = new RoutineManager(h.options);
   reloaded.update(routine.id, { name: "Prune history" });
   reloaded.flushNow();
   const afterPruning = new RoutineManager(h.options);
   expect(afterPruning.runNow(routine.id, request)).toMatchObject({ id: committed.id, status: "completed" });
-  expect(afterPruning.listRuns()).toHaveLength(2001);
+  expect(afterPruning.listRuns()).toHaveLength(history + 1);
   afterPruning.forgetRoutineRequestReceipt(request);
   afterPruning.flushNow();
   const settled = new RoutineManager(h.options);
-  expect(settled.listRuns()).toHaveLength(2000);
-  expect(settled.listRuns().some((run) => run.id === committed.id)).toBe(false);
+  expect(settled.listRuns()).toHaveLength(history + 1);
+  expect(settled.listRuns().some((run) => run.id === committed.id)).toBe(true);
 });
 
 it("coalesces a burst of saves into one write, and stop() flushes a pending save", () => {
