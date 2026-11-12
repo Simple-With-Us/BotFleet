@@ -516,7 +516,7 @@ import { credentialFingerprint, SECRET_FIELDS, secretProvenance, secretSource, v
 import { KNOB_FIELDS, clearedHeadroomKnobs, knobSource, readKnobField } from "./knob-map.ts";
 import { patchChangesInfisicalConnection, writeThroughKnobs } from "./knob-write-through.ts";
 import { configureTurnIdentity, observeRuntimeEvent } from "./sentry-ai.ts";
-import { checkInRoutineFinish, checkInRoutineStart } from "./sentry-crons.ts";
+import { checkInRoutineFinish, checkInRoutineStart, releaseRoutineMonitor } from "./sentry-crons.ts";
 import { ProviderRegistry, type DescribedInstance } from "./harness/registry.ts";
 import { cancelPeerApprovalsFor, cancelPeerApprovalsForThread, dismissStalePeerCards, resolvePeerComms, type ApprovalBus } from "./peer-approval.ts";
 import {
@@ -8741,6 +8741,7 @@ routines = new RoutineManager({
   },
   checkInStart: checkInRoutineStart,
   checkInFinish: checkInRoutineFinish,
+  releaseMonitor: releaseRoutineMonitor,
 });
 // Catch up retained durable receipts after restart; delivery IDs deduplicate states.
 for (const run of routines.listRuns()) webhookRequestLog.routineSubscriber({ kind: "routine.run", run });

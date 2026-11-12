@@ -9,8 +9,21 @@
 // routines.ts stays Sentry-agnostic (RoutineManagerOptions calls back into
 // this module rather than importing @sentry/node itself) so its extensive
 // unit tests never have to stand up or stub the SDK.
+import {
+  RETIRED_MONITOR_CRONTAB,
+  isRoutineMonitorSlug,
+  routineMonitorSlug,
+} from "./routine-monitor-slug.ts";
 import type { Routine, RoutineRun } from "./routines.ts";
 import { getSentry, isSentryActive, type SentryNode } from "./sentry.ts";
+
+export {
+  RETIRED_MONITOR_CRONTAB,
+  isRoutineMonitorSlug,
+  legacyRoutineMonitorSlug,
+  routineMonitorSlug,
+  stableRoutineMonitorSlug,
+} from "./routine-monitor-slug.ts";
 
 // Derived rather than imported from @sentry/core, the same way sentry-ai.ts
 // derives its span options type: @sentry/node is loaded lazily so vitest
@@ -40,25 +53,42 @@ interface SentryClientWithEvents {
   on: (event: string, cb: (envelope: SentryEnvelope) => void) => () => void;
 }
 
-/** `a b c` -> `a-b-c`, ASCII-lowercase, no leading/trailing/doubled hyphens. */
-function slugify(value: string): string {
-  return value
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-}
+/** Slugs currently retired by this process.  A slug leaves the set again
+ *  when a real check-in opens on it (checkInRoutineStart), so a routine that
+ *  is resumed, runs, and is paused again is retired a second time. */
+const releasedMonitorSlugs = new Set<string>();
 
-/** Stable per-routine monitor slug.  Reads off the RUN's own routineId/
- *  routineName snapshot (present on every RoutineRun, not just the live
- *  Routine) so the start and finish check-in for the same run always
- *  compute the identical slug, even if the routine was renamed or deleted
- *  in between.  The id suffix keeps two routines named "Monitor" on two
- *  different bots from colliding on one Sentry monitor. */
-export function routineMonitorSlug(run: Pick<RoutineRun, "routineId" | "routineName">): string {
-  const name = slugify(run.routineName) || "routine";
-  const shortId = run.routineId.replace(/[^a-z0-9]/gi, "").slice(0, 8) || "0";
-  return `botfleet-${name}-${shortId}`.slice(0, 50);
+/** Tell Sentry a slug is no longer a live schedule.
+ *
+ *  A renamed, paused, or deleted routine used to leave its old monitor on
+ *  the previous crontab, and that monitor then reported a missed check-in
+ *  every day for a job that no longer runs under that name.  The DSN
+ *  check-in API cannot disable a monitor, so the slug is upserted onto a
+ *  once-a-year crontab and closed `ok`.  That `ok` means "this slug is
+ *  retired", not "today's job succeeded".  A resumed routine's next real
+ *  firing upserts its own schedule onto the same slug.  Never throws. */
+export function releaseRoutineMonitor(slug: string): boolean {
+  const normalized = slug.trim().toLowerCase();
+  if (!isRoutineMonitorSlug(normalized) || releasedMonitorSlugs.has(normalized)) return false;
+  if (!isSentryActive()) return false;
+  const sdk = getSentry();
+  if (!sdk) return false;
+  releasedMonitorSlugs.add(normalized);
+  try {
+    sdk.captureCheckIn(
+      { monitorSlug: normalized, status: "ok" },
+      {
+        schedule: { type: "crontab", value: RETIRED_MONITOR_CRONTAB },
+        timezone: "UTC",
+        checkinMargin: 1440,
+        maxRuntime: 1,
+      },
+    );
+  } catch {
+    releasedMonitorSlugs.delete(normalized);
+    return false;
+  }
+  return true;
 }
 
 /** The cron/interval config Sentry needs to know when a run is late or
@@ -100,10 +130,17 @@ export function checkInRoutineStart(run: RoutineRun, routine: Routine): string |
   const monitorConfig = routineMonitorConfig(routine);
   if (!monitorConfig) return undefined;
   try {
+    const monitorSlug = routineMonitorSlug(run);
     const checkInId = sdk.captureCheckIn(
-      { monitorSlug: routineMonitorSlug(run), status: "in_progress" },
+      { monitorSlug, status: "in_progress" },
       monitorConfig,
     );
+    // The check-in just upserted this routine's live schedule onto the slug,
+    // so an earlier retirement no longer holds and a later pause or delete
+    // must be allowed to retire it again.  Only the routine's frozen slug is
+    // cleared: a run slug that differs from it names an obsolete monitor
+    // that must stay retired.
+    if (monitorSlug === routine.sentryMonitorSlug) releasedMonitorSlugs.delete(monitorSlug);
     // The SDK fabricates a uuid when the client is missing or closed; never
     // store that as a real Crons check-in id on the run record.
     if (!checkInId || !isSentryActive()) return undefined;
@@ -312,4 +349,5 @@ export async function awaitPendingCheckInCloses(): Promise<void> {
  *  `awaitPendingCheckInCloses()` under real timers. */
 export function resetSentryCronsForTests(): void {
   pendingCheckInCloses.clear();
+  releasedMonitorSlugs.clear();
 }

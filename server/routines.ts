@@ -31,6 +31,11 @@ import { BOT_OFF_SKIPPED } from "../shared/bot-power.ts";
 import { canonicalTimeZone, nextZonedOccurrence } from "../shared/time-zone.ts";
 import { normalizeRunOn, type RoutineRunOn } from "../shared/run-on.ts";
 import { sanitizeToolPolicy, type ToolPolicy } from "./tool-policy.ts";
+import {
+  isRoutineMonitorSlug,
+  legacyRoutineMonitorSlug,
+  stableRoutineMonitorSlug,
+} from "./routine-monitor-slug.ts";
 
 export type RoutineSchedule =
   | { type: "once"; at: number }
@@ -126,6 +131,9 @@ export interface Routine {
   /** The commands and files this routine's turns may touch
    *  (server/tool-policy.ts).  Absent: an ordinary routine turn. */
   toolPolicy?: ToolPolicy;
+  /** Sentry Crons monitor this routine checks in to.  Set once and kept
+   *  across renames so a new title cannot mint a second monitor. */
+  sentryMonitorSlug?: string;
   nextRunAt: number | null;
   createdAt: number;
   updatedAt: number;
@@ -192,6 +200,10 @@ export interface RoutineRun {
    *  close the same one.  Only set for a genuine "schedule" trigger on a
    *  recurring routine — see `checkInStart`/`checkInFinish`. */
   sentryCheckInId?: string;
+  /** Monitor slug copied from the routine when the run was created, so the
+   *  start and finish check-ins stay on one monitor if the routine is
+   *  renamed while the run is in flight. */
+  sentryMonitorSlug?: string;
   /** A terminal check-in close queued or in flight, persisted across restarts
    *  so a crashed or dropped delivery can be reconciled on server boot.
    *  Cleared once Sentry confirms receipt. */
@@ -262,6 +274,27 @@ interface RoutineFile {
  * handling below, as they always had; a stricter test here would set aside a file an older build wrote. */
 const routineFileSchema = z.looseObject({ routines: z.array(z.unknown()).optional(), runs: z.array(z.unknown()).optional() });
 const routineEntrySchema = z.looseObject({ id: z.string().min(1) });
+/** The two fields the legacy monitor slug reads, parsed at the disk boundary.
+ * routineEntrySchema only requires an id, so a hand-edited or half-written
+ * routines.json can carry a routine with no name, or a run with no routineName
+ * or routineId.  Those slug as "routine" and "0" instead of throwing inside the
+ * constructor and failing the boot. */
+export const legacySlugSourceSchema = z.object({
+  routineId: z.string().catch(""),
+  routineName: z.string().catch(""),
+});
+export type LegacySlugSource = z.infer<typeof legacySlugSourceSchema>;
+/** The legacy slug a run opened, or undefined when the run no longer carries
+ * a usable routineId and routineName.  Without them the formula falls back to
+ * placeholders ("routine", "0") and would name a monitor no run ever opened,
+ * such as botfleet-routine-0, so there is nothing safe to release. */
+function legacyRunMonitorSlug(run: Pick<RoutineRun, "routineId" | "routineName">): string | undefined {
+  const source: LegacySlugSource = legacySlugSourceSchema.parse(run);
+  return source.routineId && source.routineName ? legacyRoutineMonitorSlug(source) : undefined;
+}
+/** A stored monitor slug read from disk; anything that is not a string is
+ * treated as absent and re-derived from the legacy formula. */
+const storedMonitorSlugSchema = z.string().catch("");
 const isRoutineFile = (candidate: JsonValue): candidate is JsonValue & Partial<RoutineFile> =>
   routineFileSchema.safeParse(candidate).success;
 
@@ -399,6 +432,10 @@ export interface RoutineManagerOptions {
     ok: boolean,
     onSettled?: (delivered: boolean) => void,
   ) => void;
+  /** Stop a Sentry monitor that is no longer this routine's live schedule.
+   *  Called for a rename's previous slug, a paused or deleted daily routine,
+   *  and a slug found on an old run that no current routine still owns. */
+  releaseMonitor?: (slug: string) => void;
   /** Is this run's turn still in flight on the harness? Consulted by the
    * periodic sweep for runs stuck in running/waiting: the completion path
    * settles a run on `turn.completed`, but a harness path that settles the
@@ -618,6 +655,7 @@ export class RoutineManager {
     this.file = options.file ?? join(DATA_DIR, "routines.json");
     this.now = options.now ?? Date.now;
     let runOnMigrated = false;
+    let slugMigrated = false;
     // A routines.json that cannot be used is moved aside, never deleted, and reported (store-guard.ts).
     // It used to read as "no routines", and the next save replaced it.
     const loaded = loadGuarded(this.file, interpretRoutineFile, this.now(), { readOnly: this.passive });
@@ -628,11 +666,28 @@ export class RoutineManager {
     this.routines = rawRoutines.map((routine) => {
       const runOn = normalizeRunOn(routine.runOn);
       if ((routine as { runOn?: unknown }).runOn !== runOn) runOnMigrated = true;
-      return { ...routine, runOn };
+      const stored = storedMonitorSlugSchema.parse(routine.sentryMonitorSlug).trim().toLowerCase();
+      const sentryMonitorSlug = isRoutineMonitorSlug(stored)
+        ? stored
+        : legacyRoutineMonitorSlug(legacySlugSourceSchema.parse({ routineId: routine.id, routineName: routine.name }));
+      if (sentryMonitorSlug !== routine.sentryMonitorSlug) slugMigrated = true;
+      return { ...routine, runOn, sentryMonitorSlug };
     });
+    const frozenSlugs = new Map(this.routines.map((routine) => [routine.id, routine.sentryMonitorSlug]));
     this.runs = rawRuns.map((run) => {
       const runOn = normalizeRunOn(run.runOn);
       if ((run as { runOn?: unknown }).runOn !== runOn) runOnMigrated = true;
+      // A run queued before the slug was frozen carries no slug of its own,
+      // so its start would fall back to the name-based legacy slug.  After a
+      // rename that is a monitor the boot pass below retires, and starting
+      // on it would put the live crontab back on it.  It has not opened a
+      // check-in yet, so give it the routine's frozen slug instead.
+      const storedRunSlug = storedMonitorSlugSchema.parse(run.sentryMonitorSlug);
+      const frozen = frozenSlugs.get(run.routineId);
+      if (run.status === "queued" && !run.sentryCheckInId && !isRoutineMonitorSlug(storedRunSlug) && frozen) {
+        slugMigrated = true;
+        return { ...run, runOn, sentryMonitorSlug: frozen };
+      }
       return { ...run, runOn };
     });
     this.routineRequestReceipts = Array.isArray(disk.routineRequestReceipts)
@@ -664,7 +719,11 @@ export class RoutineManager {
       this.writesRefused = true;
       return;
     }
-    if (runOnMigrated) this.save();
+    // Read the history as it sits on disk before any save: save() applies the
+    // run retention window, and a migration save would otherwise drop the
+    // old schedule runs that name the monitors this pass has to retire.
+    this.releaseStaleMonitors();
+    if (runOnMigrated || slugMigrated) this.save();
     // A local process cannot still own these turns after a full restart.
     const recovered: RoutineRun[] = [];
     for (const run of this.runs) {
@@ -707,6 +766,43 @@ export class RoutineManager {
           });
         }
       }
+    }
+  }
+
+  /** Retire monitors that would otherwise keep reporting a missed check-in
+   *  for a slug nothing still runs.  An enabled routine's own slug is never
+   *  released.  A historical slug is released only when some schedule run
+   *  actually opened a check-in on it, so a name that never reached Sentry
+   *  does not get a monitor created just to retire it. */
+  private releaseStaleMonitors(): void {
+    const release = this.options.releaseMonitor;
+    if (!release) return;
+    const live = new Set<string>();
+    for (const routine of this.routines) {
+      if (routine.enabled && routine.sentryMonitorSlug) live.add(routine.sentryMonitorSlug);
+    }
+    const seen = new Set<string>();
+    const releaseOne = (slug: string | undefined): void => {
+      if (!slug || !isRoutineMonitorSlug(slug) || live.has(slug) || seen.has(slug)) return;
+      seen.add(slug);
+      release(slug);
+    };
+    for (const routine of this.routines) {
+      if (routine.enabled || routine.schedule.type !== "daily") continue;
+      const opened = this.runs.some((run) => run.routineId === routine.id && Boolean(run.sentryCheckInId));
+      if (opened) releaseOne(routine.sentryMonitorSlug);
+    }
+    const known = new Set(this.routines.map((routine) => routine.id));
+    for (const run of this.runs) {
+      if (!run.sentryCheckInId || run.manual) continue;
+      if (run.triggerSource && run.triggerSource !== "schedule") continue;
+      const historical = run.sentryMonitorSlug && isRoutineMonitorSlug(run.sentryMonitorSlug)
+        ? run.sentryMonitorSlug
+        : legacyRunMonitorSlug(run);
+      if (known.has(run.routineId) && historical === this.routines.find((routine) => routine.id === run.routineId)?.sentryMonitorSlug) {
+        continue;
+      }
+      releaseOne(historical);
     }
   }
 
@@ -887,9 +983,11 @@ export class RoutineManager {
     const clean = sanitizeInput(input);
     if (this.options.botState(clean.botId) === "missing") throw new Error("That Bot no longer exists");
     const at = this.now();
+    const id = randomUUID();
     const routine: Routine = {
-      id: randomUUID(),
+      id,
       ...clean,
+      sentryMonitorSlug: stableRoutineMonitorSlug(id),
       nextRunAt: clean.enabled ? this.initialOccurrence(clean.schedule, at) : null,
       createdAt: at,
       updatedAt: at,
@@ -945,8 +1043,12 @@ export class RoutineManager {
     });
     if (this.options.botState(clean.botId) === "missing") throw new Error("That Bot no longer exists");
     const cancelledRuns: RoutineRun[] = [];
+    const previousName = routine.name;
+    const previousSlug = routine.sentryMonitorSlug;
+    const wasDaily = routine.schedule.type === "daily";
     this.commitMutation(() => {
       Object.assign(routine, clean, {
+        sentryMonitorSlug: previousSlug ?? stableRoutineMonitorSlug(routine.id),
         nextRunAt: clean.enabled ? this.initialOccurrence(clean.schedule, now) : null,
         // `updatedAt` doubles as the optimistic revision on durable routine
         // confirmation cards. Keep it monotonic even for two writes in one ms.
@@ -967,6 +1069,27 @@ export class RoutineManager {
     });
     for (const run of cancelledRuns) this.emitRun(run);
     this.emitRoutine(routine);
+    if (clean.name !== previousName && previousSlug) {
+      const oldLegacy = legacyRoutineMonitorSlug(legacySlugSourceSchema.parse({ routineId: routine.id, routineName: previousName }));
+      // Release only a slug a schedule run actually opened.  A new routine's
+      // id slug was never the name-based slug, so retiring that name would
+      // create a monitor that Sentry has never seen.
+      const used = this.runs.some((run) => {
+        if (run.routineId !== routine.id || !run.sentryCheckInId || run.manual) return false;
+        if (run.triggerSource && run.triggerSource !== "schedule") return false;
+        const historical = run.sentryMonitorSlug && isRoutineMonitorSlug(run.sentryMonitorSlug)
+          ? run.sentryMonitorSlug
+          : legacyRunMonitorSlug(run);
+        return historical === oldLegacy;
+      });
+      if (used && oldLegacy !== routine.sentryMonitorSlug) this.options.releaseMonitor?.(oldLegacy);
+    }
+    const stoppedDaily = wasDaily && patch.enabled === false;
+    const leftDaily = wasDaily && routine.schedule.type !== "daily";
+    if ((stoppedDaily || leftDaily) && routine.sentryMonitorSlug) {
+      const opened = this.runs.some((run) => run.routineId === routine.id && Boolean(run.sentryCheckInId));
+      if (opened) this.options.releaseMonitor?.(routine.sentryMonitorSlug);
+    }
     return { ...routine, schedule: { ...routine.schedule } };
   }
 
@@ -980,6 +1103,7 @@ export class RoutineManager {
     }
     const at = this.routines.findIndex((r) => r.id === id);
     if (at === -1) return false;
+    const removed = this.routines[at]!;
     const cancelledRuns: RoutineRun[] = [];
     this.commitMutation(() => {
       this.routines.splice(at, 1);
@@ -993,6 +1117,10 @@ export class RoutineManager {
     });
     for (const run of cancelledRuns) this.emitRun(run);
     this.options.emit?.({ kind: "routine.deleted", routineId: id });
+    if (removed.schedule.type === "daily" && removed.sentryMonitorSlug) {
+      const opened = this.runs.some((run) => run.routineId === id && Boolean(run.sentryCheckInId));
+      if (opened) this.options.releaseMonitor?.(removed.sentryMonitorSlug);
+    }
     return true;
   }
 
@@ -1005,6 +1133,10 @@ export class RoutineManager {
       routine.nextRunAt = null;
       routine.updatedAt = Math.max(this.now(), routine.updatedAt + 1);
       this.emitRoutine(routine);
+      if (routine.schedule.type === "daily" && routine.sentryMonitorSlug) {
+        const opened = this.runs.some((run) => run.routineId === routine.id && Boolean(run.sentryCheckInId));
+        if (opened) this.options.releaseMonitor?.(routine.sentryMonitorSlug);
+      }
       changed = true;
     }
     for (const run of this.runs) {
@@ -1421,7 +1553,12 @@ export class RoutineManager {
           missed.error = "This computer was offline for more than 12 hours after the scheduled time";
           missed.outcomeCode = "missed_offline";
           missed.failurePhase = "schedule";
+          // Same rule as a paused bot: say what happened.  Emitting nothing
+          // leaves Sentry to synthesize `missed` with no record of the
+          // offline catch-up this process actually took.
+          missed.sentryCheckInId = this.options.checkInStart?.(missed, routine);
           this.emitRun(missed);
+          if (missed.sentryCheckInId) this.closeCheckIn(missed, missed.sentryCheckInId, false);
         } else {
           const run = this.newRun(routine, scheduledFor, false);
           this.emitRun(run);
@@ -2116,6 +2253,7 @@ export class RoutineManager {
       status: "queued",
       manual,
       triggerSource: manual ? "manual" : "schedule",
+      sentryMonitorSlug: routine.sentryMonitorSlug,
       createdAt: this.now(),
     };
     this.runs.push(run);
@@ -2127,14 +2265,16 @@ export class RoutineManager {
   }
 
   private clientRoutine(routine: Routine, effectiveTimeZone?: string): Routine {
-    if (routine.schedule.type !== "daily") return { ...routine, schedule: { ...routine.schedule } };
-    if (routine.schedule.timeZone) {
-      return { ...routine, schedule: { ...routine.schedule }, scheduleTimeZoneSource: "stored" };
+    const rest = { ...routine };
+    delete rest.sentryMonitorSlug;
+    if (rest.schedule.type !== "daily") return { ...rest, schedule: { ...rest.schedule } };
+    if (rest.schedule.timeZone) {
+      return { ...rest, schedule: { ...rest.schedule }, scheduleTimeZoneSource: "stored" };
     }
     const schedule = effectiveTimeZone
-      ? { ...routine.schedule, timeZone: effectiveTimeZone }
-      : { ...routine.schedule };
-    return { ...routine, schedule, scheduleTimeZoneSource: "host" };
+      ? { ...rest.schedule, timeZone: effectiveTimeZone }
+      : { ...rest.schedule };
+    return { ...rest, schedule, scheduleTimeZoneSource: "host" };
   }
 
   private emitRun(run: RoutineRun) {

@@ -11,9 +11,14 @@ import {
   awaitPendingCheckInCloses,
   checkInRoutineFinish,
   checkInRoutineStart,
+  isRoutineMonitorSlug,
+  legacyRoutineMonitorSlug,
+  releaseRoutineMonitor,
   resetSentryCronsForTests,
+  RETIRED_MONITOR_CRONTAB,
   routineMonitorConfig,
   routineMonitorSlug,
+  stableRoutineMonitorSlug,
 } from "./sentry-crons.ts";
 import type { Routine, RoutineRun } from "./routines.ts";
 
@@ -86,6 +91,68 @@ describe("routineMonitorSlug", () => {
   it("falls back to a safe slug for a blank or unicode-only name", () => {
     expect(routineMonitorSlug(run({ routineName: "" }))).toMatch(/^botfleet-routine-/);
   });
+
+  it("keeps a stored slug so a rename cannot open a second monitor", () => {
+    const stored = "botfleet-mac-coolify-health-21-00-79c6c49d";
+    const slug = routineMonitorSlug(run({
+      routineId: "79c6c49d-1111-2222-3333-444444444444",
+      routineName: "Mac Hetzner Health 21:00",
+      sentryMonitorSlug: stored,
+    }));
+    expect(slug).toBe(stored);
+    expect(slug).not.toBe(legacyRoutineMonitorSlug(run({
+      routineId: "79c6c49d-1111-2222-3333-444444444444",
+      routineName: "Mac Hetzner Health 21:00",
+    })));
+  });
+
+  it("keys a new routine on its id and keeps that id when the name is long", () => {
+    const id = "ABCDEF12-3456-7890-ABCD-EF1234567890";
+    const slug = stableRoutineMonitorSlug(id);
+    expect(slug).toBe("botfleet-abcdef1234567890abcdef1234567890");
+    expect(slug.length).toBeLessThanOrEqual(50);
+    expect(stableRoutineMonitorSlug(id)).toBe(stableRoutineMonitorSlug(id));
+    const renamed = routineMonitorSlug(run({
+      routineId: id,
+      routineName: "Weekly practices token efficiency proposal extra words",
+      sentryMonitorSlug: slug,
+    }));
+    expect(renamed).toBe(slug);
+  });
+
+  it("documents that the legacy formula drops the id when the name is long", () => {
+    const slug = legacyRoutineMonitorSlug(run({
+      routineId: "12345678-aaaa-bbbb-cccc-ddddeeeeffff",
+      routineName: "Weekly practices token efficiency proposal",
+    }));
+    expect(slug.length).toBeLessThanOrEqual(50);
+    expect(slug.endsWith("12345678")).toBe(false);
+  });
+
+  it("accepts a legacy slug the 50-character slice ended on a hyphen", () => {
+    const slug = legacyRoutineMonitorSlug(run({
+      routineId: "12345678-aaaa-bbbb-cccc-ddddeeeeffff",
+      routineName: `${"a".repeat(40)} b`,
+    }));
+    expect(slug).toHaveLength(50);
+    expect(slug.endsWith("-")).toBe(true);
+    expect(isRoutineMonitorSlug(slug)).toBe(true);
+    expect(routineMonitorSlug(run({
+      routineId: "12345678-aaaa-bbbb-cccc-ddddeeeeffff",
+      routineName: "Renamed",
+      sentryMonitorSlug: slug,
+    }))).toBe(slug);
+  });
+
+  it("rejects a trailing-hyphen slug shorter than the legacy 50-character slice", () => {
+    expect(isRoutineMonitorSlug("botfleet-mac-coolify-")).toBe(false);
+    const theRun = run({
+      routineId: "79c6c49d-1111-2222-3333-444444444444",
+      routineName: "Mac Coolify Health",
+      sentryMonitorSlug: "botfleet-mac-coolify-",
+    });
+    expect(routineMonitorSlug(theRun)).toBe(legacyRoutineMonitorSlug(theRun));
+  });
 });
 
 describe("routineMonitorConfig", () => {
@@ -152,6 +219,11 @@ describe("checkInRoutineStart / checkInRoutineFinish", () => {
     return checkIns;
   }
 
+  it("does not retire a slug while Sentry is inactive", () => {
+    expect(isSentryActive()).toBe(false);
+    expect(releaseRoutineMonitor("botfleet-mac-hetzner-health-21-00-79c6c49d")).toBe(false);
+  });
+
   it("upserts a monitor and opens an in_progress check-in for a recurring routine", async () => {
     const checkIns = await activateFakeSentry();
     const theRun = run();
@@ -163,6 +235,51 @@ describe("checkInRoutineStart / checkInRoutineFinish", () => {
       status: "in_progress",
     });
     expect(checkIns[0].monitorConfig).toMatchObject({ schedule: { type: "crontab" } });
+  });
+
+  it("checks a stored slug in and retires an abandoned slug onto a yearly crontab", async () => {
+    const checkIns = await activateFakeSentry();
+    const stored = "botfleet-spend-downs-slack-digest-1f8addcb";
+    const theRun = run({ sentryMonitorSlug: stored, routineName: "Spend Downs and Incidents Digest" });
+    checkInRoutineStart(theRun, routine());
+    expect(checkIns[0].checkIn).toMatchObject({ monitorSlug: stored, status: "in_progress" });
+    expect(releaseRoutineMonitor("botfleet-mac-hetzner-health-21-00-79c6c49d")).toBe(true);
+    expect(releaseRoutineMonitor("botfleet-mac-hetzner-health-21-00-79c6c49d")).toBe(false);
+    expect(checkIns[1].checkIn).toMatchObject({
+      monitorSlug: "botfleet-mac-hetzner-health-21-00-79c6c49d",
+      status: "ok",
+    });
+    expect(checkIns[1].monitorConfig).toMatchObject({
+      schedule: { type: "crontab", value: RETIRED_MONITOR_CRONTAB },
+      timezone: "UTC",
+    });
+    expect(releaseRoutineMonitor("not a slug")).toBe(false);
+  });
+
+  it("keeps an obsolete run slug retired when a start opens on it", async () => {
+    await activateFakeSentry();
+    const obsolete = "botfleet-mac-hetzner-health-21-00-79c6c49d";
+    expect(releaseRoutineMonitor(obsolete)).toBe(true);
+    checkInRoutineStart(
+      run({ sentryMonitorSlug: obsolete }),
+      routine({ sentryMonitorSlug: "botfleet-mac-coolify-health-21-00-79c6c49d" }),
+    );
+    // Only the routine's frozen slug has its retirement cleared.
+    expect(releaseRoutineMonitor(obsolete)).toBe(false);
+  });
+
+  it("retires a slug again after a resumed routine checks in on it", async () => {
+    const checkIns = await activateFakeSentry();
+    const stored = "botfleet-spend-downs-slack-digest-1f8addcb";
+    expect(releaseRoutineMonitor(stored)).toBe(true);
+    expect(releaseRoutineMonitor(stored)).toBe(false);
+    checkInRoutineStart(run({ sentryMonitorSlug: stored }), routine({ sentryMonitorSlug: stored }));
+    expect(checkIns[1].checkIn).toMatchObject({ monitorSlug: stored, status: "in_progress" });
+    expect(releaseRoutineMonitor(stored)).toBe(true);
+    expect(checkIns[2].checkIn).toMatchObject({ monitorSlug: stored, status: "ok" });
+    expect(checkIns[2].monitorConfig).toMatchObject({
+      schedule: { type: "crontab", value: RETIRED_MONITOR_CRONTAB },
+    });
   });
 
   it("opens nothing for a one-off routine even with Sentry active", async () => {
