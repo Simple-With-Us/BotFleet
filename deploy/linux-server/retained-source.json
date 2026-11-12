@@ -1662,6 +1662,7 @@
     {"path":"shared/item-io.ts","category":"runtime","reason":"Import from server/context-injection.ts"},
     {"path":"shared/jobs.ts","category":"runtime","reason":"Import from server/index.ts"},
     {"path":"shared/karaoke-align.ts","category":"ui-build","reason":"Import from src/lib/tts/index.ts"},
+    {"path":"shared/lifecycle-tool.ts","category":"runtime","reason":"Import from server/tool-row.ts"},
     {"path":"shared/local-auto-consent.ts","category":"runtime","reason":"Import from server/index.ts"},
     {"path":"shared/local-hosts.ts","category":"ui-build","reason":"Import from src/lib/local-models.ts"},
     {"path":"shared/mac-only-capabilities.ts","category":"runtime","reason":"Import from server/placement-leases.ts"},
