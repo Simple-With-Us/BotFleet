@@ -11,6 +11,7 @@ import {
   headlinesNearCap,
   isEngineUnconfigured,
   localQuotaStatusLine,
+  quotaGridPlaceholderLine,
   minimaxQuotaLine,
   NEAR_CAP_PERCENT,
   providerIssueLine,
@@ -559,6 +560,13 @@ describe("absolute allowances and handoff health", () => {
     expect(absoluteQuotaLabel({ planName: "ultra" })).toBe("Ultra plan");
     expect(absoluteQuotaLabel({ absoluteRemaining: 12, absoluteLimit: null, quotaUnit: "credits" })).toBeNull();
     expect(absoluteQuotaLabel({})).toBeNull();
+  });
+
+  it("names loading and empty quota grid placeholders for an engine", () => {
+    expect(quotaGridPlaceholderLine("loading", "Claude")).toBe("Loading usage limits for Claude…");
+    expect(quotaGridPlaceholderLine("empty", "Claude")).toBe("No usage limits reported yet for Claude.");
+    expect(quotaGridPlaceholderLine("empty", "  ")).toBe("No usage limits reported yet.");
+    expect(quotaGridPlaceholderLine("loading")).toBe("Loading usage limits…");
   });
 
   it("says why the grid is empty instead of rendering nothing", () => {
