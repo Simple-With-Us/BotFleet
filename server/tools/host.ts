@@ -53,6 +53,7 @@ import { createRecallTools } from "./recall.ts";
 import { createLinqTools, type LinqToolDeps } from "./linq.ts";
 import { createZulipTools, type ZulipToolSend } from "./zulip.ts";
 import type { RecallSettings } from "../recall-transport.ts";
+import { readToolResultArtifact } from "../tool-result-history.ts";
 import { harnessTool, toolsFor, type ToolApproval, type ToolGateContext } from "./registry.ts";
 
 export type { AgentBot as TurnToolBot } from "./agents.ts";
@@ -120,6 +121,10 @@ export interface TurnToolHostContext {
   drainNotices?: () => string[];
   /** Ceiling on model-to-tool rounds; absent = the driver's default. */
   maxRounds?: number;
+  /** Offer `read_tool_result` for artifacts this turn's tool loop stored.
+   *  The catalog gate uses the same flag, so the model is only told about
+   *  a tool this host will run. */
+  toolResultArchive?: boolean;
   /** The harness's permission broker, already bound to this turn's bot and
    *  thread.  Absent = no broker mounted, and an ask-policy tool is refused
    *  rather than run — fail-closed, because "nobody could be asked" must
@@ -188,6 +193,32 @@ function approvalArgs(
  *  `server/tools/*.ts` file from importing an `index.ts` to keep the
  *  cycle that previously duplicated the `list_bots` filter out. */
 
+function integerArg(value: unknown): number | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value === "number" && Number.isInteger(value)) return value;
+  if (typeof value === "string" && /^-?\d+$/.test(value)) return Number(value);
+  return Number.NaN;
+}
+
+/** `read_tool_result` body.  The full text lives in the process store the
+ *  tool loop filled when it shortened a result for later rounds. */
+async function readStoredToolResult(call: TurnToolCall): Promise<TurnToolOutcome> {
+  const raw = call.arguments.artifact_id;
+  const id = typeof raw === "string" ? raw.trim() : "";
+  if (!id) return failed("artifact_id must be a non-empty string.", "invalid_argument");
+  const offset = integerArg(call.arguments.offset);
+  const limit = integerArg(call.arguments.limit);
+  if (Number.isNaN(offset) || Number.isNaN(limit)) {
+    return failed("offset and limit must be integers.", "invalid_argument");
+  }
+  const read = readToolResultArtifact(id, {
+    ...(offset === undefined ? {} : { offset }),
+    ...(limit === undefined ? {} : { limit }),
+  });
+  if (!read.ok) return failed(read.message, "not_found");
+  return { kind: "result", content: read.text, detail: `${read.chars} characters` };
+}
+
 /** Build the tool host for ONE turn.  The returned host closes over the
  *  caller's identity, so nothing downstream can forge it. */
 export function createTurnToolHost(ctx: TurnToolHostContext): TurnToolHost {
@@ -246,6 +277,7 @@ export function createTurnToolHost(ctx: TurnToolHostContext): TurnToolHost {
         )
       : []),
     ...(ctx.zulip ? Object.entries(createZulipTools({ send: ctx.zulip.send })) : []),
+    ["read_tool_result", readStoredToolResult],
   ]);
   const gate: ToolGateContext = {
     // The dispatch only builds a host when the agents integration is
@@ -272,6 +304,7 @@ export function createTurnToolHost(ctx: TurnToolHostContext): TurnToolHost {
     linq: Boolean(ctx.linq),
     jobs: Boolean(ctx.jobs),
     zulip: Boolean(ctx.zulip),
+    toolResultArchive: Boolean(ctx.toolResultArchive),
   };
   // The same gate the catalog handed the model.  A hallucinated name, or a
   // real name the model was not offered this turn, finds no executor.

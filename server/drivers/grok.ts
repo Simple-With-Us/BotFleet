@@ -336,6 +336,7 @@ export const GrokDriver: ProviderDriver<GrokConfig> = {
         // Only `timeoutMs` is read from this; the provider payload is built
         // separately above from name/description/parameters.
         tools: turn.tools,
+        toolResultHistoryChars: turn.toolResultHistoryChars,
         toolHost: turn.toolHost,
         requestApproval: turn.toolHost?.requestApproval
           ? (ask) => turn.toolHost!.requestApproval!(ask)

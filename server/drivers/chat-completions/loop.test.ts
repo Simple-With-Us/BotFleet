@@ -26,6 +26,7 @@ import {
   type TurnLoopExit,
   type TurnRoundResult,
 } from "./loop.ts";
+import { ToolResultArtifactStore } from "../../tool-result-history.ts";
 
 type TerminalEvent = RuntimeEventBase & {
   type: "turn.completed";
@@ -77,6 +78,8 @@ interface Harness {
     emit?: (event: RuntimeEvent) => void;
     computeCost?: (usage: { input: number; output: number; cachedInput?: number }) => number | null;
     tools?: ReadonlyArray<{ name: string; timeoutMs?: number }>;
+    toolResultHistoryChars?: number;
+    toolResultArtifacts?: ToolResultArtifactStore;
     requestApproval?: (ask: {
       tool: string;
       summary: string;
@@ -160,6 +163,8 @@ function harness(rounds: ScriptedRound[]): Harness {
         retryDelayScale: over?.retryDelayScale,
         computeCost: over?.computeCost,
         tools: over?.tools,
+        toolResultHistoryChars: over?.toolResultHistoryChars,
+        toolResultArtifacts: over?.toolResultArtifacts,
         runRound: async (roundMessages, opts) => {
           roundsSeen.push(roundMessages.map((m) => ({ ...m })));
           attempts.push({ round: opts.round, attempt: opts.attempt });
@@ -783,6 +788,62 @@ describe("runTurnLoop — rounds", () => {
     const toolMessages = h.messages.filter((m) => m.role === "tool");
     expect(toolMessages.map((m) => m.tool_call_id)).toEqual(["slow", "fast"]);
     expect(toolMessages.map((m) => m.content)).toEqual(["slow result", "fast result"]);
+  });
+
+  it("keeps an oversized tool result whole for the round that receives it, then stores a head and tail", async () => {
+    const marker = "MIDDLE-MARKER-2664";
+    const huge = `${"H".repeat(20_000)}${marker}${"T".repeat(20_000)}`;
+    const store = new ToolResultArtifactStore();
+    const h = harness([
+      wantsTools([call("c1", "bash")]),
+      wantsTools([call("c2", "bash")]),
+      answer("done"),
+    ]);
+    await h.run({
+      toolHost: hostReturning({ kind: "result", content: huge }),
+      toolResultHistoryChars: 8_000,
+      toolResultArtifacts: store,
+    });
+    const toolAt = (round: number, id: string) =>
+      h.roundsSeen[round].find((message) => message.role === "tool" && message.tool_call_id === id);
+    expect(toolAt(1, "c1")?.content).toBe(huge);
+    const stored = toolAt(2, "c1");
+    expect(stored?.content.length).toBeLessThanOrEqual(8_000);
+    expect(stored?.content).toContain('artifact_id "c1"');
+    expect(stored?.content).toContain("H".repeat(32));
+    expect(stored?.content.endsWith("T".repeat(32))).toBe(true);
+    expect(stored?.content).not.toContain(marker);
+    expect(toolAt(2, "c2")?.content).toBe(huge);
+    expect(store.get("c1")).toBe(huge);
+    expect(h.messages.find((message) => message.tool_call_id === "c1")?.content).not.toContain(marker);
+    expect(h.messages.find((message) => message.tool_call_id === "c2")?.content.length).toBeLessThanOrEqual(8_000);
+  });
+
+  it("truncates a tool result carried in from an earlier turn before the first request", async () => {
+    const huge = "Q".repeat(10_000);
+    const store = new ToolResultArtifactStore();
+    const h = harness([answer("done")]);
+    h.messages.push(
+      { role: "assistant", content: "", tool_calls: [call("old")] },
+      { role: "tool", tool_call_id: "old", content: huge },
+    );
+    await h.run({ toolResultArtifacts: store });
+    const prior = h.roundsSeen[0].find((message) => message.tool_call_id === "old");
+    expect(prior?.content.length).toBeLessThanOrEqual(8_000);
+    expect(prior?.content).not.toBe(huge);
+    expect(prior?.content).toContain('artifact_id "old"');
+    expect(store.get("old")).toBe(huge);
+  });
+
+  it("leaves tool results whole when the history threshold is turned off", async () => {
+    const huge = "Z".repeat(12_000);
+    const h = harness([wantsTools([call("c1")]), answer("done")]);
+    await h.run({
+      toolHost: hostReturning({ kind: "result", content: huge }),
+      toolResultHistoryChars: 0,
+    });
+    expect(h.roundsSeen[1].find((message) => message.role === "tool")?.content).toBe(huge);
+    expect(h.messages.find((message) => message.role === "tool")?.content).toBe(huge);
   });
 
   it("only ever APPENDS to the messages array, so each round re-sends a byte-identical prefix", async () => {

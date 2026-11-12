@@ -439,6 +439,10 @@ export interface SendTurnInput {
      * Completions API expects.  Default is an empty object schema. */
     parameters?: { type: "object"; properties?: Record<string, unknown>; required?: string[] };
   }>;
+  /** Characters of a tool result kept in replayed history after the round
+   *  that saw the full text.  Absent uses 8,000.  `0` leaves every result
+   *  whole.  See server/tool-result-history.ts. */
+  toolResultHistoryChars?: number;
   /** Per-bot integrations the driver may hand to the agent as tools. */
   integrations?: {
     /** A local stdio bridge owns the remote Composio transport. Keeping the
