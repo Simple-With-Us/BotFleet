@@ -165,6 +165,8 @@ export interface EnqueueReply extends ControllerEpoch {
   status: string;
   duplicate?: boolean;
   reason?: string;
+  /** Why an accepted job waits, copied from the controller's own record. */
+  queuedReason?: string;
 }
 /** A worker giving back a lease it has not started yet.  Distinct from
  *  `ReleaseMessage`, which hands the controller role itself over. */

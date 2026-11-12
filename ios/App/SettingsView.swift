@@ -477,7 +477,7 @@ struct SettingsView: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Simple is one conversation per bot.\u{00A0} Merge extra threads into that conversation, or keep them saved but hidden.")
+            Text("Simple is one conversation per bot.\u{00A0} Merge extra threads into that conversation, or keep them saved but hidden.\u{00A0} If some belong to different Apps or folders, nothing is merged and this arrangement stays.")
         }
     }
 
