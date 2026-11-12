@@ -595,21 +595,22 @@ struct Phase4DirectLlmAndCuaSocketTests {
             load: saturatedLoad
         )
         #expect(probeDeadline.timeoutMs == 50_000)
+        let gap = "\u{00A0} "
         #expect(
             OpenCodeProbeFailureKind.timedOut(deadline: probeDeadline).statusSentence
-                == "OpenCode's model probe timed out after 50 s (host load 2.5 per core)"
+                == "BotFleet couldn't load OpenCode's models.\(gap)It timed out while your computer was busy."
         )
         #expect(
             OpenCodeProbeFailureKind.stoppedBySignal(signal: "SIGTERM").statusSentence
-                == "OpenCode's model probe was stopped by SIGTERM before it answered"
+                == "BotFleet couldn't load OpenCode's models.\(gap)OpenCode stopped before it could answer."
         )
         #expect(
             OpenCodeProbeFailureKind.emptyOutput(verboseError: nil).statusSentence
-                == "opencode models answered nothing"
+                == "OpenCode answered but listed no models."
         )
         #expect(
             OpenCodeProbeFailureKind.emptyOutput(verboseError: "Unrecognized flag: --verbose").statusSentence
-                == "opencode models listed nothing (Unrecognized flag: --verbose)"
+                == "OpenCode listed no models."
         )
     }
 

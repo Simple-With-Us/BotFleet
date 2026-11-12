@@ -1140,6 +1140,30 @@ final class Session: ObservableObject {
         return true
     }
 
+    /// Commands the engine offers for this conversation.  Nil when the menu
+    /// could not be read, which the meter treats as "not offered".
+    func contextCommands(botId: String, threadId: String) async -> [ContextMeterMath.Command]? {
+        guard let client else { return nil }
+        do {
+            return try await client.contextCommands(botId: botId, threadId: threadId, surface: "ios")
+        } catch {
+            return nil
+        }
+    }
+
+    /// Start compacting.  Nil means it started.  A string is the reason it did not.
+    func compactSession(botId: String, commandId: String, threadId: String) async -> String? {
+        guard let client else { return ContextMeterMath.unavailable }
+        do {
+            try await client.runContextCommand(botId: botId, id: commandId, threadId: threadId, surface: "ios")
+            return nil
+        } catch {
+            let message = (error as? LocalizedError)?.errorDescription?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let message, !message.isEmpty { return message }
+            return ContextMeterMath.unavailable
+        }
+    }
+
     // MARK: - Actions
     //
     // Each of these does the thing and lets the event stream deliver the

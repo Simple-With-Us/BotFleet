@@ -69,6 +69,13 @@ import { AttachedFileChips, AttachedImageGallery } from "./AttachmentPreview";
 import { ModelPicker } from "./ModelPicker";
 import { RenameTitle } from "./RenameTitle";
 import { ThreadStatsBar } from "./ThreadStatsBar";
+import {
+  CompactSessionRow,
+  ContextNote,
+  ContextUsageStrip,
+  contextMeterFor,
+  useContextSession,
+} from "./ContextUsage";
 import { ThreadTabs } from "./ThreadTabs";
 import { ThreadViewSwitch } from "./ThreadViewSwitch";
 import { TrajectoryView } from "./TrajectoryView";
@@ -933,6 +940,13 @@ const MessagesList = memo(function MessagesList({
               return src ? <ScreenFrame src={src} /> : null;
             }
             default: {
+              if (m.command?.name === "compact" && m.role === "user") {
+                const index = transcript.findIndex((row) => row.id === m.id);
+                const settled = index >= 0 && transcript.slice(index + 1).some((later) =>
+                  later.role === "bot" && later.kind === "text" && later.command?.name !== "compact",
+                );
+                return <CompactSessionRow settled={settled} />;
+              }
               // Auto-delivered instructions (routine / webhook / resource) are
               // stored as role=system.  Older webhook rows still used
               // role=user; keep those off the blue bubble too.
@@ -1193,6 +1207,23 @@ export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; exp
   const scrollRef = useRef<HTMLDivElement>(null);
   // the open thread's task: its banked usage and timing feed the footer chips
   const activeTask = bot.tasks?.find((t) => t.threadId === bot.threadId);
+  const activeSelection = activeTask?.modelSelection ?? bot.modelSelection;
+  const catalogWindow = state.instances
+    .find((instance) => instance.instanceId === activeSelection.instanceId)
+    ?.models.options.find((option) => option.id === activeSelection.model)?.contextWindow;
+  const contextMeter = contextMeterFor({
+    used: activeTask?.usage?.lastInput,
+    reportedWindow: activeTask?.usage?.contextWindow,
+    catalogWindow,
+  });
+  const contextSession = useContextSession({
+    botId: bot.id,
+    threadId: bot.threadId,
+    used: contextMeter.used,
+    window: contextMeter.window,
+    busy: Boolean(bot.busy),
+    viewingOther,
+  });
   // Chat or Trajectory, remembered per thread.  The chat pane below stays
   // mounted (just not shown) in Trajectory, so its scroll position, draft and
   // streaming state are exactly where they were when the person switches back.
@@ -1827,6 +1858,13 @@ export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; exp
             onRegenerate={regenerate}
             onReply={setReplyTo}
           />
+          {laterCount === 0 && contextSession.note.show ? (
+            <ContextNote
+              pending={contextSession.pending}
+              disabledReason={contextSession.offer.state === "disabled" ? contextSession.offer.reason : null}
+              onCompact={contextSession.compact}
+            />
+          ) : null}
           {laterCount > 0 && (
             <div className="flex justify-center">
               <button
@@ -1936,6 +1974,13 @@ export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; exp
         // and the banner above enforce.  The reader switches first, then
         // sends — the Switch button unlocks when the turn finishes.
         locked={viewingOther && originalBot.busy}
+      />
+      <ContextUsageStrip
+        meter={contextMeter}
+        offer={contextSession.offer}
+        pending={contextSession.pending}
+        error={contextSession.error}
+        onCompact={contextSession.compact}
       />
       <ThreadStatsBar stats={activeTask?.stats} usage={activeTask?.usage} />
       </div>
