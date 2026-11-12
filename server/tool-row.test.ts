@@ -49,6 +49,16 @@ describe("the transcript row a tool step becomes", () => {
       .toBe("hookRun: inProgress");
   });
 
+  it("marks a lifecycle tool done when its output says it completed", () => {
+    const started = startedToolRow({ title: "reminderChild: inProgress", itemId: "rc-1" }, undefined);
+    const row = completedToolRow(
+      started,
+      { ok: false, title: "reminderChild: failed", detail: "Reminder child session main run completed." },
+      12,
+    );
+    expect(row.ok).toBe(true);
+  });
+
   it("redacts secret-shaped terminal titles before they replace a stored row", () => {
     const secret = "ak9999999999999999999999999999999";
     const row = completedToolRow(

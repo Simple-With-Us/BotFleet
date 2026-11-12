@@ -1233,6 +1233,21 @@ describe("ACP turns (fake CLI)", () => {
     expect(recorder.events.some((event) => event.type === "item.started" && event.itemId === "update-only-1")).toBe(false);
   });
 
+  it("marks a failed lifecycle tool done when its output says it completed", async () => {
+    await create(GrokAgentDriver, "lifecycle-failed-done");
+    await instance.adapter.sendTurn({ threadId: "t-acp-lifecycle-failed-done", text: "run the reminder child" });
+    await recorder.until((event) => event.type === "turn.completed", 3_000);
+
+    const completion = recorder.events.find(
+      (event) => event.type === "item.completed" && event.itemType === "tool" && event.itemId === "lifecycle-failed-done-1",
+    );
+    expect(completion).toMatchObject({
+      ok: true,
+      title: "reminderChild: failed",
+      detail: "Reminder child session main run completed.",
+    });
+  });
+
   it("uses a truthful terminal title from tool_call_update", async () => {
     await create(GrokAgentDriver, "refreshed-tool-title");
     await instance.adapter.sendTurn({ threadId: "t-acp-refreshed-title", text: "run the hook" });
