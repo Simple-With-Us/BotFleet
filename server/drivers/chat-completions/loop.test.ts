@@ -808,13 +808,14 @@ describe("runTurnLoop — rounds", () => {
       h.roundsSeen[round].find((message) => message.role === "tool" && message.tool_call_id === id);
     expect(toolAt(1, "c1")?.content).toBe(huge);
     const stored = toolAt(2, "c1");
+    const storedId = stored?.content.match(/artifact_id "([^"]+)"/)?.[1] ?? "";
     expect(stored?.content.length).toBeLessThanOrEqual(8_000);
-    expect(stored?.content).toContain('artifact_id "c1"');
+    expect(storedId.startsWith("tr_")).toBe(true);
     expect(stored?.content).toContain("H".repeat(32));
     expect(stored?.content.endsWith("T".repeat(32))).toBe(true);
     expect(stored?.content).not.toContain(marker);
     expect(toolAt(2, "c2")?.content).toBe(huge);
-    expect(store.get("c1")).toBe(huge);
+    expect(store.get(storedId)).toBe(huge);
     expect(h.messages.find((message) => message.tool_call_id === "c1")?.content).not.toContain(marker);
     expect(h.messages.find((message) => message.tool_call_id === "c2")?.content.length).toBeLessThanOrEqual(8_000);
   });
@@ -829,10 +830,11 @@ describe("runTurnLoop — rounds", () => {
     );
     await h.run({ toolResultArtifacts: store });
     const prior = h.roundsSeen[0].find((message) => message.tool_call_id === "old");
+    const priorId = prior?.content.match(/artifact_id "([^"]+)"/)?.[1] ?? "";
     expect(prior?.content.length).toBeLessThanOrEqual(8_000);
     expect(prior?.content).not.toBe(huge);
-    expect(prior?.content).toContain('artifact_id "old"');
-    expect(store.get("old")).toBe(huge);
+    expect(priorId.startsWith("tr_")).toBe(true);
+    expect(store.get(priorId)).toBe(huge);
   });
 
   it("leaves tool results whole when the history threshold is turned off", async () => {

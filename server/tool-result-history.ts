@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 // Oversized tool results in replayed conversation history.
 //
 // The round that receives a tool result still gets the full text.  Every
@@ -89,6 +91,11 @@ export class ToolResultArtifactStore {
     return this.entries.has(id);
   }
 
+  /** The stored text without refreshing its place in the eviction order. */
+  peek(id: string): string | undefined {
+    return this.entries.get(id);
+  }
+
   get size(): number {
     return this.entries.size;
   }
@@ -116,6 +123,18 @@ export function renderToolResultHistory(text: string, id: string, threshold: num
   const header =
     `[Tool result truncated for later turns. ${text.length} characters stored as artifact ${id}. ` +
     `Call ${READ_TOOL_RESULT_TOOL} with artifact_id "${id}" to retrieve the full text.]\n`;
+  return fitHistory(header, text, threshold);
+}
+
+/** A window returned by `read_tool_result`, still pointing at the original artifact. */
+function renderRetrievedWindow(windowText: string, id: string, fullChars: number, threshold: number): string {
+  const header =
+    `[Retrieved window of artifact ${id}. This reply is ${windowText.length} characters of the ${fullChars}-character artifact. ` +
+    `Call ${READ_TOOL_RESULT_TOOL} with artifact_id "${id}" and a new offset to read more.]\n`;
+  return fitHistory(header, windowText, threshold);
+}
+
+function fitHistory(header: string, text: string, threshold: number): string {
   if (header.length >= threshold) return takeHead(header, threshold);
   const room = threshold - header.length;
   const maxGap = gapFor(Math.max(0, text.length - 1)).length;
@@ -139,15 +158,50 @@ export function renderToolResultHistory(text: string, id: string, threshold: num
   return out.length > threshold ? takeHead(out, threshold) : out;
 }
 
+/** A fresh id.  Provider tool-call ids are not unique across turns or threads. */
+function newArtifactId(): string {
+  return `tr_${randomUUID()}`;
+}
+
+export interface DeliveredToolCall {
+  id: string;
+  function: { name: string; arguments: string };
+}
+
 export interface DeliveredToolMessage {
   role: string;
   content: string;
   tool_call_id?: string;
+  tool_calls?: DeliveredToolCall[];
+}
+
+function originatingCall(messages: DeliveredToolMessage[], toolCallId: string | undefined): DeliveredToolCall | undefined {
+  if (!toolCallId) return undefined;
+  for (const message of messages) {
+    const match = message.tool_calls?.find((call) => call.id === toolCallId);
+    if (match) return match;
+  }
+  return undefined;
+}
+
+function artifactIdFromArguments(raw: string | undefined): string {
+  if (!raw) return "";
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return "";
+  }
+  if (typeof parsed !== "object" || parsed === null || !("artifact_id" in parsed)) return "";
+  const id = parsed.artifact_id;
+  return typeof id === "string" ? id.trim() : "";
 }
 
 /** Replace tool results in `messages[0, deliveredUntil)` that are over the
- *  threshold.  The full text is stored under the tool call id first, so a
- *  later `read_tool_result` still returns what the model already saw. */
+ *  threshold.  The full text is stored under a new artifact id first, so a
+ *  later `read_tool_result` still returns what the model already saw.  A
+ *  `read_tool_result` reply is not stored again: its excerpt keeps pointing
+ *  at the artifact the model asked for. */
 export function compactDeliveredToolResults(
   messages: DeliveredToolMessage[],
   deliveredUntil: number,
@@ -158,7 +212,20 @@ export function compactDeliveredToolResults(
   for (let i = 0; i < end; i++) {
     const message = messages[i];
     if (message.role !== "tool" || message.content.length <= opts.threshold) continue;
-    const id = message.tool_call_id?.trim() ? message.tool_call_id : `tool-result-${i}`;
+    const call = originatingCall(messages, message.tool_call_id);
+    if (call?.function.name === READ_TOOL_RESULT_TOOL) {
+      const parentId = artifactIdFromArguments(call.function.arguments);
+      const stored = parentId ? opts.store.peek(parentId) : undefined;
+      if (parentId && stored !== undefined) {
+        message.content =
+          stored === message.content
+            ? renderToolResultHistory(message.content, parentId, opts.threshold)
+            : renderRetrievedWindow(message.content, parentId, stored.length, opts.threshold);
+        count += 1;
+        continue;
+      }
+    }
+    const id = newArtifactId();
     opts.store.put(id, message.content);
     message.content = renderToolResultHistory(message.content, id, opts.threshold);
     count += 1;

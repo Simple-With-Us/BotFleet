@@ -18,6 +18,10 @@ import {
 
 const MARKER = "MIDDLE-MARKER-2664";
 
+function artifactId(content: string): string {
+  return content.match(/artifact_id "([^"]+)"/)?.[1] ?? "";
+}
+
 function oversizedResult(): string {
   return `${"H".repeat(40_000)}${MARKER}${"T".repeat(40_000)}`;
 }
@@ -79,11 +83,30 @@ describe("compactDeliveredToolResults", () => {
     expect(messages[1].content.length).toBeLessThanOrEqual(8_000);
     expect(messages[1].content).not.toContain(MARKER);
     expect(messages[2].content).toBe(full);
-    expect(store.get("seen")).toBe(full);
+    const id = artifactId(messages[1].content);
+    expect(id.startsWith("tr_")).toBe(true);
+    expect(store.get(id)).toBe(full);
+    expect(store.has("seen")).toBe(false);
     expect(store.has("fresh")).toBe(false);
-    expect(readToolResultArtifact("seen", { store }) ).toEqual({ ok: true, text: full, chars: full.length });
-    const window = readToolResultArtifact("seen", { store, offset: 40_000, limit: MARKER.length });
+    expect(readToolResultArtifact(id, { store })).toEqual({ ok: true, text: full, chars: full.length });
+    const window = readToolResultArtifact(id, { store, offset: 40_000, limit: MARKER.length });
     expect(window).toEqual({ ok: true, text: MARKER, chars: full.length });
+  });
+
+  it("keeps two results that share a provider tool-call id", () => {
+    const store = new ToolResultArtifactStore();
+    const first = "A".repeat(9_000);
+    const second = "B".repeat(9_000);
+    const messages = [
+      { role: "tool", tool_call_id: "call_0", content: first },
+      { role: "tool", tool_call_id: "call_0", content: second },
+    ];
+    expect(compactDeliveredToolResults(messages, 2, { threshold: 8_000, store })).toBe(2);
+    const firstId = artifactId(messages[0].content);
+    const secondId = artifactId(messages[1].content);
+    expect(firstId).not.toBe(secondId);
+    expect(store.get(firstId)).toBe(first);
+    expect(store.get(secondId)).toBe(second);
   });
 
   it("does not replace the stored original when compacting the excerpt again", () => {
@@ -92,9 +115,42 @@ describe("compactDeliveredToolResults", () => {
     const messages = [{ role: "tool", tool_call_id: "seen", content: full }];
     compactDeliveredToolResults(messages, 1, { threshold: 8_000, store });
     const excerpt = messages[0].content;
+    const id = artifactId(excerpt);
     expect(compactDeliveredToolResults(messages, 1, { threshold: 8_000, store })).toBe(0);
     expect(messages[0].content).toBe(excerpt);
-    expect(store.get("seen")).toBe(full);
+    expect(store.get(id)).toBe(full);
+  });
+
+  it("keeps a windowed read_tool_result pointed at the original artifact", () => {
+    const store = new ToolResultArtifactStore();
+    const full = oversizedResult();
+    const first = [{ role: "tool", tool_call_id: "bash1", content: full }];
+    compactDeliveredToolResults(first, 1, { threshold: 8_000, store });
+    const id = artifactId(first[0].content);
+    const windowText = full.slice(0, 9_000);
+    const messages = [
+      {
+        role: "assistant",
+        content: "",
+        tool_calls: [
+          {
+            id: "r1",
+            function: {
+              name: READ_TOOL_RESULT_TOOL,
+              arguments: JSON.stringify({ artifact_id: id, limit: 9_000 }),
+            },
+          },
+        ],
+      },
+      { role: "tool", tool_call_id: "r1", content: windowText },
+    ];
+    expect(compactDeliveredToolResults(messages, messages.length, { threshold: 8_000, store })).toBe(1);
+    expect(store.size).toBe(1);
+    expect(store.get(id)).toBe(full);
+    expect(messages[1].content.length).toBeLessThanOrEqual(8_000);
+    expect(messages[1].content).toContain(`artifact_id "${id}"`);
+    expect(messages[1].content).toContain(`${full.length}-character artifact`);
+    expect(messages[1].content).not.toContain("9000 characters stored");
   });
 
   it("drops the oldest artifact when the byte cap is exceeded and keeps the newest", () => {
