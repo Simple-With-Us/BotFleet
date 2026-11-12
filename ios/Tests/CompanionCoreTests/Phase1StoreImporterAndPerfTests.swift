@@ -554,8 +554,12 @@ struct Phase1StoreImporterAndPerfTests {
         // Nothing was dropped, so there is no receipt gap to report.
         #expect(report.warnings.contains { $0.contains("routine request receipt") } == false)
 
-        // The manual snooze has no native column either, and says so.
-        #expect(report.warnings.contains { $0.contains("bot snooze") })
+        // The manual snooze is migrated into the native bots table (BF-2651).
+        let bots = try await db.loadBots()
+        let snoozedBot = bots.first { $0.id == "bot-1" }
+        #expect(snoozedBot?.snoozedUntil == 1_700_000_900)
+        #expect(report.warnings.contains { $0.contains("bot snooze") } == false)
+        #expect(report.isFullyVerified == true)
     }
 
     // MARK: - Review Fix: a cross-thread message id fails the import in the importer's own words
@@ -1388,33 +1392,241 @@ struct Phase1StoreImporterAndPerfTests {
         #expect(Set(MacConnectionStatusPill.pillByConnectionState.values) == Set(MacStatusPillKind.allCases))
     }
 
-    @Test("The Mac app does not render the mascot or status pill surface yet")
-    func macAppVisualSurfaceIsNotImplementedYet() throws {
+    @Test("The Mac app renders the mascot and status pill surface without hardcoded hex colors")
+    func macAppVisualSurfaceRendersMascotAndStatusPillsWithoutHardcodedHex() throws {
         let repoRoot = Self.repoRoot()
         let sources = try Self.macAppSources(repoRoot: repoRoot)
 
         let rendersMascot = sources.contains { $0.contains("MacMascotExpression") }
         let rendersStatusPills = sources.contains { $0.contains("MacStatusPillKind") }
-        let appSurfaceVerified = rendersMascot && rendersStatusPills
+        let forcesScheme = sources.contains { $0.contains(".preferredColorScheme(") }
+        let hexPattern = try NSRegularExpression(pattern: "#[0-9A-Fa-f]{6}")
+        let hardcodedHexCount = sources.reduce(into: 0) { count, source in
+            let range = NSRange(source.startIndex..<source.endIndex, in: source)
+            count += hexPattern.numberOfMatches(in: source, range: range)
+        }
 
-        // Phase 1 ships the shared design contract; the views that draw it
-        // land with the Phase 2 and Phase 3 user interface.  This tripwire
-        // fails the moment the app starts rendering the contract, so the
-        // visual parity gate has to be updated to verify the app surface and
-        // to run the snapshot suite BF-2496 asks for.
+        #expect(rendersMascot == true)
+        #expect(rendersStatusPills == true)
+        #expect(forcesScheme == false)
+        #expect(hardcodedHexCount == 0)
+
+        // Every expression in the shared contract resolves a non-empty symbol,
+        // display label, and canonical sidebar category across light and dark
+        // system appearance.
+        for expression in MacMascotExpression.allCases {
+            #expect(expression.symbolName.isEmpty == false)
+            #expect(expression.displayLabel.isEmpty == false)
+            #expect(expression.canonicalCategory.symbolName.isEmpty == false)
+        }
+        let coreExpressions: [MacMascotExpression] = [
+            .idle, .thinking, .working, .happy, .confused,
+            .sleeping, .crash, .celebrate, .listening, .speaking
+        ]
+        for expression in coreExpressions {
+            var bot = Bot(
+                id: "bot-\(expression.rawValue)",
+                threadId: "thread-\(expression.rawValue)",
+                name: "Bot",
+                title: "",
+                description: "",
+                notifications: true,
+                color: "blue",
+                unread: false,
+                modelSelection: ModelSelection(instanceId: "claude", model: "sonnet"),
+                createdAt: 1,
+                mascotExpression: expression.rawValue
+            )
+            let resolved = MacMascotExpression.resolve(for: bot, isConnected: true)
+            #expect(resolved == expression)
+            bot.busy = true
+            let busyResolved = MacMascotExpression.resolve(for: bot, isConnected: true)
+            let canonicalBusyResolved = MacBotMascotExpression.resolve(for: bot, isConnected: true)
+            #expect(busyResolved == .working)
+            #expect(canonicalBusyResolved == .working)
+            #expect(busyResolved.canonicalCategory == canonicalBusyResolved)
+        }
+        let baseBot = Bot(
+            id: "bot-live",
+            threadId: "thread-live",
+            name: "Monet",
+            title: "",
+            description: "",
+            notifications: true,
+            color: "blue",
+            unread: false,
+            modelSelection: ModelSelection(instanceId: "claude", model: "sonnet"),
+            createdAt: 1
+        )
+        #expect(MacMascotExpression.resolve(for: baseBot, isConnected: false) == .sleeping)
+        #expect(MacMascotExpression.resolve(for: baseBot, hasPendingCard: true, isConnected: true) == .alerting)
+        #expect(MacMascotExpression.resolve(for: baseBot, hasReasoning: true, isConnected: true) == .thinking)
+        #expect(MacMascotExpression.resolve(for: baseBot, isConnected: true) == .idle)
+
+        // Every status pill kind carries a label, symbol, semantic color token,
+        // and VoiceOver accessibility label (including visible detail text).
+        for pill in MacStatusPillKind.allCases {
+            #expect(pill.label.isEmpty == false)
+            #expect(pill.symbolName.isEmpty == false)
+            #expect(pill.semanticColorToken.isEmpty == false)
+            #expect(pill.accessibilityLabel == "Connection status: \(pill.label)")
+            #expect(pill.accessibilityLabel(detailText: nil) == pill.accessibilityLabel)
+            #expect(pill.accessibilityLabel(detailText: pill.label) == pill.accessibilityLabel)
+        }
         #expect(
-            appSurfaceVerified == false,
-            "The Mac app renders the mascot or status pill surface now; update the visual parity gate to verify the app surface and to run the snapshot suite."
+            MacStatusPillKind.connected.accessibilityLabel(detailText: "Connected (http://127.0.0.1:8799)") ==
+            "Connection status: Connected, Connected (http://127.0.0.1:8799)"
         )
+        #expect(
+            MacStatusPillKind.error.accessibilityLabel(detailText: "Error: Connection refused") ==
+            "Connection status: Error, Error: Connection refused"
+        )
+        #expect(MacThemeMode.system.followsSystemAppearance == true)
+        #expect(MacThemeMode.light.followsSystemAppearance == false)
+        #expect(MacThemeMode.dark.followsSystemAppearance == false)
 
-        // The gate reports the app surface separately from the contract, so a
-        // contract pass can never read as an app surface pass.
-        let report = MacPerformanceHarness.verifyVisualParity(
-            appSurfaceVerified: appSurfaceVerified,
-            appSurfaceNote: "the Mac app does not render the mascot or status pill surface yet"
-        )
+        // Light/dark snapshot suite covers all 3 theme modes across light and dark
+        // effective appearances, 51 mascot expressions, and 4 status pills.
+        let snapshots = MacPerformanceHarness.runLightDarkVisualSnapshotSuite()
+        #expect(snapshots.count == 4)
+        #expect(MacPerformanceHarness.verifyLightDarkVisualSnapshotSuite() == true)
+        for snapshot in snapshots {
+            #expect(snapshot.mascotSnapshots.count == 51)
+            #expect(snapshot.statusPillSnapshots.count == 4)
+        }
+
+        let report = MacPerformanceHarness.verifyVisualParity(macAppSources: sources)
         #expect(report.contractSnapshotVerified == true)
-        #expect(report.appSurfaceVerified == false)
+        #expect(report.appSurfaceVerified == true)
         #expect(report.allPassed == true)
+        #expect(report.summaryLine.isEmpty == false)
+
+        let emptySurfaceReport = MacPerformanceHarness.verifyVisualParity(macAppSources: [])
+        #expect(emptySurfaceReport.appSurfaceVerified == false)
+
+        // Comment-only mentions of MacMascotExpression and MacStatusPillKind must
+        // never satisfy the visual parity gate.
+        let commentOnlySources = [
+            "// MacMascotExpression.resolve(for: bot) : MacMascotExpression\n/* MacStatusPillView(kind: .connected) : MacStatusPillKind */\nstruct PlaceholderView {}"
+        ]
+        let commentOnlyReport = MacPerformanceHarness.verifyVisualParity(macAppSources: commentOnlySources)
+        #expect(commentOnlyReport.appSurfaceVerified == false)
+    }
+
+    // MARK: - BF-2651: Manual Bot Snooze Column & Migration
+
+    @Test("The native store migrates manual bot snoozes into the bots table with schema upgrade and warns on unmapped bots (BF-2651)")
+    func testManualBotSnoozeMigrationAndSchemaUpgrade() async throws {
+        let tempDir = try makeTempDir("bot-snooze-test")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        try populateSourceFixture(in: tempDir)
+
+        // Write routines.json with one mapped snooze and one unmapped snooze.
+        let routinesJson = """
+        {
+          "routines": [
+            {
+              "id": "routine-1",
+              "name": "Nightly Check",
+              "botId": "bot-1",
+              "enabled": true,
+              "createdAt": 1700000010000,
+              "updatedAt": 1700000020000
+            }
+          ],
+          "runs": [],
+          "botSnoozes": {
+            "bot-1": 1700000950000,
+            "bot-ghost": 1700000850000
+          },
+          "routineRequestReceipts": []
+        }
+        """
+        try Data(routinesJson.utf8).write(to: tempDir.appendingPathComponent("routines.json"))
+
+        // Create an older SQLite database with the pre-migration bots schema (no snoozed_until column).
+        let dbPath = tempDir.appendingPathComponent("native.sqlite").path
+        var rawDb: OpaquePointer?
+        #expect(sqlite3_open(dbPath, &rawDb) == SQLITE_OK)
+        let oldBotsSchema = """
+        CREATE TABLE bots (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            thread_id TEXT,
+            created_at REAL NOT NULL,
+            raw_json TEXT NOT NULL
+        );
+        """
+        #expect(sqlite3_exec(rawDb, oldBotsSchema, nil, nil, nil) == SQLITE_OK)
+        sqlite3_close(rawDb)
+
+        // Opening via DatabaseService must migrate the bots table and add snoozed_until column cleanly.
+        let db = try DatabaseService(path: dbPath)
+        let importer = StoreImporter(batchSize: 10)
+        let report = try await importer.importStore(from: tempDir, into: db)
+
+        // Mapped snooze migrated to bot-1 in bots table.
+        let bots = try await db.loadBots()
+        let snoozedBot = bots.first { $0.id == "bot-1" }
+        #expect(snoozedBot?.snoozedUntil == 1_700_000_950)
+
+        // Unmapped snooze is warned rather than dropping silently.
+        #expect(report.warnings.contains { $0.contains("1 manual bot snooze(s) name a bot not in bots.json") })
+        #expect(report.isParityVerified == true)
+        #expect(report.isFullyVerified == false)
+
+        // Upserting a bot with a manual snooze updates the column.
+        let updatedBot = StoredBotRecord(
+            id: "bot-1",
+            name: "Updated Bot",
+            threadId: nil,
+            createdAt: 1_700_000_000,
+            snoozedUntil: 1_700_001_000,
+            rawJSON: "{}"
+        )
+        try await db.upsertBot(updatedBot)
+        let reloadedBots = try await db.loadBots()
+        let reloadedBot = reloadedBots.first { $0.id == "bot-1" }
+        #expect(reloadedBot?.snoozedUntil == 1_700_001_000)
+    }
+
+    @Test("Filtering import by botId excludes snoozes for other bots and avoids false unmapped warnings (BF-2651)")
+    func testFilteredBotImportExcludesOtherBotSnoozes() async throws {
+        let tempDir = try makeTempDir("filtered-bot-snooze-test")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        try populateSourceFixture(in: tempDir)
+
+        // Multiple bot snoozes in routines.json: bot-1 and bot-2.
+        let routinesJson = """
+        {
+          "routines": [],
+          "runs": [],
+          "botSnoozes": {
+            "bot-1": 1700000950000,
+            "bot-2": 1700000960000
+          },
+          "routineRequestReceipts": []
+        }
+        """
+        try Data(routinesJson.utf8).write(to: tempDir.appendingPathComponent("routines.json"))
+
+        let dbPath = tempDir.appendingPathComponent("native.sqlite").path
+        let db = try DatabaseService(path: dbPath)
+        let importer = StoreImporter(batchSize: 10)
+
+        // Import only bot-1.
+        let report = try await importer.importStore(from: tempDir, into: db, filterBotId: "bot-1")
+
+        // bot-1 migrated with its snooze.
+        let bots = try await db.loadBots()
+        let snoozedBot = bots.first { $0.id == "bot-1" }
+        #expect(snoozedBot?.snoozedUntil == 1_700_000_950)
+
+        // bot-2 was filtered out, and its snooze must NOT trigger an unmapped snooze warning.
+        #expect(report.warnings.contains { $0.contains("manual bot snooze") } == false)
+        #expect(report.isParityVerified == true)
+        #expect(report.isFullyVerified == true)
     }
 }

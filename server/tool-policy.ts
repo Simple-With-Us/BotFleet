@@ -63,16 +63,30 @@ const FLAG_NAME = /^(?:-[A-Za-z0-9]|--[A-Za-z0-9][A-Za-z0-9_-]*)$/;
 const ENV_ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
 const INTEGER = /^(?:0|[1-9][0-9]{0,8})$/;
 
-/** The fleet chat CLI's basenames:  `simple-chat` is the current name and
- *  `agent-sync` survives on PATH only as a compatibility launcher that runs
- *  it.  They are one tool, so a routine is held to the same rules under
- *  either spelling. */
-export const CHAT_CLI_NAMES = ["simple-chat", "agent-sync"] as const;
+/** The fleet chat CLI's basename:  `simple-chat`.  The retired launcher
+ *  name is gone from PATH, so there is one spelling and one rule set. */
+export const CHAT_CLI_NAMES = ["simple-chat"] as const;
 
-/** How a refusal names the fleet chat CLI:  the current name first, with the
- *  retired spelling it still answers to, so a routine that called the old
- *  name sees why it was refused. */
-const CHAT_CLI_LABEL = "simple-chat (agent-sync)";
+/** How a refusal names the fleet chat CLI. */
+const CHAT_CLI_LABEL = "simple-chat";
+
+/** The fleet chat CLI's retired launcher spelling.  It names nothing
+ *  runnable:  direct use as a program word is refused with a pointer to
+ *  the current name - never matched, migrated or aliased.  Compared in
+ *  any letter case, the same way `namesChatCli` treats the current name:
+ *  on a case-insensitive volume `AGENT-SYNC` is the same retired binary,
+ *  and a same-named program word is only ever a refusal.  A launch
+ *  wrapped in an interpreter or another launcher is not specially
+ *  detected;  that coverage is unimplemented, and whether one runs is
+ *  the ordinary allowlist's call - a genuinely allowed interpreter can
+ *  still execute such a script. */
+const RETIRED_CHAT_CLI_NAME = "agent-sync";
+
+/** Whether a program word spells the retired launcher name, in any
+ *  letter case.  A suffix (`agent-sync.log`) is not the name. */
+function namesRetiredChatCli(word: string): boolean {
+  return posix.basename(word).toLowerCase() === RETIRED_CHAT_CLI_NAME;
+}
 
 /** simple-chat flags no routine may pass, whatever its policy says:  each one
  *  changes who the post is from or who it wakes.  A word that is a prefix of
@@ -125,8 +139,8 @@ export function isProtectedPath(path: string): boolean {
   return PROTECTED_WRITE_PARTS.some((part) => folded.includes(part.toLowerCase()));
 }
 
-/** Whether a program or script path names the fleet chat CLI (`simple-chat`,
- *  or the `agent-sync` compatibility launcher), in any letter case:  a
+/** Whether a program or script path names the fleet chat CLI (`simple-chat`),
+ *  in any letter case:  a
  *  `SIMPLE-CHAT` spelling on a case-insensitive volume is the same binary, and
  *  the forbidden-flag checks must still apply.  This is a basename, so the ACP
  *  gate also resolves links — an alias of another name is caught at run time
@@ -204,6 +218,13 @@ const commandSchema = z
   .superRefine((command, ctx) => {
     const names = Object.keys(command.flags);
     if (names.length > MAX_FLAGS) ctx.addIssue({ code: "custom", message: `has more than ${MAX_FLAGS} flags` });
+    // the retired launcher spelling as the program word:  never saved.
+    //  Fixed words are not scanned - they can pin data operands, and a
+    //  file may carry the retired name, the same way run time leaves
+    //  data words alone.
+    if (namesRetiredChatCli(command.argv0)) {
+      ctx.addIssue({ code: "custom", message: `${RETIRED_CHAT_CLI_NAME} has been retired: use ${CHAT_CLI_LABEL}` });
+    }
     // the chat CLI as the program, or as the script an interpreter runs
     const fixed = [command.argv0, ...command.sub];
     const chatCliAt = fixed.findIndex(namesChatCli);
@@ -420,7 +441,20 @@ export function evaluateArgv(policy: ToolPolicy, argv: string[]): PolicyDecision
     const problem = chatCliProblem(argv.slice(chatCliAt));
     if (problem) return { ok: false, reason: problem, name };
   }
+  // The retired launcher spelling as the program word is refused by
+  //  name, even if a stored policy from before the rename still lists
+  //  it:  it is not an alias.  Only the program word is checked.  A
+  //  launch wrapped in an interpreter or another launcher is not
+  //  specially detected - that coverage is unimplemented - so whether
+  //  one runs is the ordinary allowlist's call:  a genuinely allowed
+  //  interpreter can still execute such a script.  Data words are never
+  //  scanned, so a file that carries the retired name
+  //  (`rm ~/.local/bin/agent-sync`, when deleting the retired
+  //  launcher) runs normally.
   const candidates = policy.commands.filter((entry) => entry.argv0 === argv0);
+  if (namesRetiredChatCli(argv0)) {
+    return { ok: false, reason: `${RETIRED_CHAT_CLI_NAME} has been retired: use ${CHAT_CLI_LABEL}`, name };
+  }
   if (candidates.length === 0) return { ok: false, reason: "the program is not on the allowlist", name };
   let lastProblem = "it matches no allowlist entry";
   for (const entry of candidates) {
@@ -447,7 +481,7 @@ export function evaluateCommand(policy: ToolPolicy, command: string): PolicyDeci
 const WRAPPER_SHELLS = new Set(["bash", "sh", "zsh"]);
 
 /** An engine that runs commands through the client terminal hands BotFleet a
- *  wrapper such as `/opt/homebrew/bin/bash -lc 'agent-sync whoami'`.  Return
+ *  wrapper such as `/opt/homebrew/bin/bash -lc 'simple-chat whoami'`.  Return
  *  the inner command when `command` is exactly such a wrapper, the command
  *  itself when it is not a wrapper, or null when it is a wrapper of any other
  *  shape. */

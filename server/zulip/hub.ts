@@ -35,11 +35,14 @@ import {
   type ZulipUserTopic,
 } from "./client.ts";
 import {
+  ZULIP_DEFAULT_INFISICAL_PATH,
   ZulipCredentialError,
   credentialSourceFor,
+  describeVaultLocation,
   resolveRealm,
   validZulipRole,
   verifyCredentialRealm,
+  zulipVaultNames,
   type ZulipCredentialSource,
   type ZulipCredentials,
   type ZulipVaultReader,
@@ -82,7 +85,8 @@ const BACKOFF_MS = [5_000, 30_000, 60_000, 120_000];
 const PAGE = 100;
 const MAX_PAGES = 20;
 /** Followed topics a reconnect backfills, and pages per topic: what was said
- *  there while the queue was down (the fleet listener caps it the same way). */
+ *  there while the queue was down (the Operator's eavesdropper caps it the
+ *  same way). */
 const FOLLOWED_BACKFILL_TOPICS = 25;
 const FOLLOWED_BACKFILL_PAGES = 2;
 /** Zulip's own limit on a topic name. */
@@ -524,6 +528,7 @@ class ZulipSession {
       } catch (e) {
         if (signal.aborted) return;
         if (e instanceof ZulipCredentialError || e instanceof RoleRefused) {
+          if (e instanceof ZulipCredentialError) this.hub.warnVaultUnreadableOnce(e, this.credentialRole);
           this.setStatus("disabled", e.message);
           return;
         }
@@ -571,6 +576,7 @@ class ZulipSession {
       );
     }
     const creds = await source.load(this.credentialRole);
+    this.hub.noteVaultCredentialLoaded(creds);
     verifyCredentialRealm(creds, this.realm);
     this.creds = creds;
     this.client = new ZulipClient(creds, this.realm, {
@@ -808,6 +814,17 @@ export class ZulipHub {
   /** Sessions being stopped.  A replacement for the same bot waits for the
    *  old one to finish, so two sessions never write one bot's state file. */
   private readonly stopping = new Map<string, Promise<void>>();
+  /** Vault folders plus refusal status (a refusal) and folder+role pairs
+   *  (missing names) the consolidated unreadable-folder warn line has
+   *  already been logged for, so a scoped token that cannot read `/zulip`
+   *  warns once per distinct outage no matter how many bots are bound or
+   *  how often the reconcile timer retries them.  A successful credential
+   *  load from a folder and a Zulip settings change clear that folder's
+   *  entries, so a later outage warns again. */
+  private readonly vaultUnreadableWarned = new Set<string>();
+  /** The Zulip settings as last seen by `reconcile`, fingerprinted so a
+   *  settings change can clear the warned set above. */
+  private lastSettingsFingerprint: string | undefined;
   private readonly outgoingSpool: ZulipOutgoingSpool;
   private readonly outgoingRetry = new Map<string, number>();
   private outgoingDraining = false;
@@ -854,6 +871,59 @@ export class ZulipHub {
     });
   }
 
+  /** One consolidated warn line when the vault folder the Infisical source
+   *  reads is refused (401/403/404) or holds none of a role's expected
+   *  names.  The per-bot `disabled` line still carries the precise reason;
+   *  this is the single operator-facing signal: once per folder and status
+   *  for a refusal, once per folder and role for missing names (a shared folder
+   *  may hold other roles).  Path and names only, never a value. */
+  warnVaultUnreadableOnce(error: ZulipCredentialError, role: string): void {
+    const vault = error.vaultUnreadable;
+    if (!vault) return;
+    const key = vault.status === undefined ? `${vault.where} ${role}` : `${vault.where} ${vault.status}`;
+    if (this.vaultUnreadableWarned.has(key)) return;
+    this.vaultUnreadableWarned.add(key);
+    if (vault.status === undefined) {
+      const names = zulipVaultNames(role);
+      this.log(`[zulip] infisical ${vault.where} has none of ${role}'s expected names (${names.email}, ${names.key}); Zulip credentials unavailable`);
+    } else {
+      this.log(`[zulip] infisical ${vault.where} unreadable with the configured token (${vault.status}); Zulip credentials unavailable`);
+    }
+  }
+
+  /** Forget the warned entries for one vault folder, so its next outage
+   *  warns again.  Without a folder every entry goes. */
+  private clearVaultUnreadableWarned(where?: string): void {
+    if (!where) {
+      this.vaultUnreadableWarned.clear();
+      return;
+    }
+    for (const key of this.vaultUnreadableWarned) {
+      if (key === where || key.startsWith(`${where} `)) this.vaultUnreadableWarned.delete(key);
+    }
+  }
+
+  /** A credential load that succeeded: the folder it came from is readable
+   *  again, so a later refusal there is a new outage and warns again.  The
+   *  folder is read off the credential's source (`infisical <where>`), or
+   *  derived from the settings when a test double names it differently. */
+  noteVaultCredentialLoaded(creds: ZulipCredentials): void {
+    let where: string | undefined;
+    if (creds.source.startsWith("infisical ")) {
+      where = creds.source.slice("infisical ".length);
+    } else {
+      const settings = this.settings();
+      if (settings?.credentialSource === "infisical") {
+        where = describeVaultLocation({
+          secretPath: settings.infisicalPath?.trim() || ZULIP_DEFAULT_INFISICAL_PATH,
+          projectId: settings.infisicalProjectId,
+          environment: settings.infisicalEnv,
+        });
+      }
+    }
+    if (where) this.clearVaultUnreadableWarned(where);
+  }
+
   /** Whether the Zulip source should run at all. */
   enabled(): boolean {
     return this.settings()?.enabled === true && this.env.OMB_ZULIP_DISABLE !== "1";
@@ -888,6 +958,13 @@ export class ZulipHub {
     if (this.stopped) return;
     const retryDisabled = opts.retryDisabled ?? true;
     const settings = this.settings();
+    // A Zulip settings change may point the hub at a fixed token or a new
+    // folder: forget what already warned, so the next refusal warns again.
+    const settingsFingerprint = JSON.stringify(settings ?? null);
+    if (this.lastSettingsFingerprint !== undefined && this.lastSettingsFingerprint !== settingsFingerprint) {
+      this.clearVaultUnreadableWarned();
+    }
+    this.lastSettingsFingerprint = settingsFingerprint;
     const wanted = new Map<string, { role: string; credentialRole: string }>();
     let realm = "";
     if (this.enabled()) {

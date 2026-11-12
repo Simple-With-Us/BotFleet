@@ -15,6 +15,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { ensureDirs } from "../config.ts";
 import type { ProviderInstance, RuntimeEvent } from "../contracts.ts";
+import { awaitCliLogin, primeCliLogin, resetCliLoginCache, setCliLoginVault } from "../cli-logins.ts";
 import { recordEvents, type EventRecorder } from "../testing/events.ts";
 import { expectLaunchedAs, inheritHarnessIdentity, readEngineDump } from "../testing/launch-identity.ts";
 import {
@@ -253,6 +254,9 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     delete process.env.OMB_TTS_KEY;
     delete process.env.OMB_CLAUDE_SESSION_IDLE_MS;
     delete process.env.OMB_CLAUDE_SESSION_IDLE_MIN_MS;
+    delete process.env.GH_TOKEN;
+    setCliLoginVault(null);
+    resetCliLoginCache();
     recorder?.stop();
     await instance?.dispose();
     await removeTempDir(scratch);
@@ -503,6 +507,88 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     expect(seen.env.XAI_API_KEY).toBeUndefined();
     expect(seen.env.BOX_TOKEN).toBeUndefined();
     expect(seen.env.OMB_TTS_KEY).toBeUndefined();
+  });
+
+  it("gives the launched child the seat's CLI login, and nobody else's", async () => {
+    await create();
+    const dump = join(scratch, "dump-login.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+    // The harness process may hold a login of its own.  A child must never
+    // inherit it:  the seat's own login replaces it, and a child with no
+    // seat gets none at all.
+    process.env.GH_TOKEN = "harness-login-not-real";
+    const asked: Array<{ project: string; secretPath: string }> = [];
+    setCliLoginVault({
+      async readProjectPath(project, secretPath) {
+        asked.push({ project, secretPath });
+        return new Map([["GH_TOKEN", "seat-login-not-real"]]);
+      },
+    });
+    // The login is read in the background, so it is primed and awaited
+    // before the turn:  a turn that starts with a cold cache runs without
+    // the login, and the turns after it have one.
+    primeCliLogin("BF-ORACLE");
+    await awaitCliLogin("BF-ORACLE");
+
+    await instance.adapter.sendTurn({
+      threadId: "t-cli-login",
+      text: "hi",
+      launchIdentity: { seat: "BF-ORACLE", session: "session-1" },
+    });
+    await recorder.until((e) => e.type === "turn.completed");
+
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    expect(seen.env.GH_TOKEN).toBe("seat-login-not-real");
+    expect(seen.env.AGENT_LAUNCH_SEAT).toBe("BF-ORACLE");
+    // The seat's own folder, in the fleet's project.
+    expect(asked).toEqual([{ project: "fleet-ops", secretPath: "/cli-logins/BF-ORACLE" }]);
+  });
+
+  it("takes the harness's own login away from a child with no seat", async () => {
+    await create();
+    const dump = join(scratch, "dump-no-seat.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+    process.env.GH_TOKEN = "harness-login-not-real";
+    const asked: string[] = [];
+    setCliLoginVault({
+      async readProjectPath(_project, secretPath) {
+        asked.push(secretPath);
+        return new Map();
+      },
+    });
+
+    await instance.adapter.sendTurn({ threadId: "t-no-seat", text: "hi" });
+    await recorder.until((e) => e.type === "turn.completed");
+
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    expect(seen.env.GH_TOKEN).toBeUndefined();
+    // A bot with no seat has no folder, so nothing is read.
+    expect(asked).toEqual([]);
+  });
+
+  it("starts the seat's login read for a turn that names a seat", async () => {
+    await create();
+    const dump = join(scratch, "dump-prime.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+    const asked: string[] = [];
+    setCliLoginVault({
+      async readProjectPath(_project, secretPath) {
+        asked.push(secretPath);
+        return new Map();
+      },
+    });
+
+    await instance.adapter.sendTurn({
+      threadId: "t-prime",
+      text: "hi",
+      launchIdentity: { seat: "BF-MONITOR", session: "session-2" },
+    });
+    await recorder.until((e) => e.type === "turn.completed");
+    await awaitCliLogin("BF-MONITOR");
+
+    // The turn itself starts the read, so the turns after it have the
+    // login even when the first one ran with a cold cache.
+    expect(asked).toEqual(["/cli-logins/BF-MONITOR"]);
   });
 
   it("uses instance credentials when launching an injected local model", async () => {

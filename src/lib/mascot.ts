@@ -178,32 +178,6 @@ export function normalizeState(value: string | null | undefined): BotState | nul
   return LEGACY_STATES[value] ?? null;
 }
 
-/**
- * The states worth offering in the appearance picker.
- *
- * The engine carries 39, but many are transient beats the app drives itself
- * (`sending`, `alerting`, `powering-down`) and make no sense as a bot's resting
- * face. More importantly, states share resting faces: `happy`, `excited` and
- * `playful` all rest on expression 2, and `curious`, `surprised` and `scared`
- * all rest on 3 — they differ in which faces they *drift* to, which a static
- * swatch cannot show. Offering them all gave 15 buttons showing 8 pictures.
- *
- * Across all 39 states there are only 11 distinct resting faces, so this is one
- * state per face, chosen for the clearest name. Every swatch looks different.
- */
-export const PICKABLE_STATES: BotState[] = [
-  "idle", // expression 0
-  "happy", // 2
-  "curious", // 3
-  "drowsy", // 4
-  "working", // 7
-  "thinking", // 8
-  "listening", // 10
-  "sleeping", // 13
-  "suspicious", // 14
-  "proud", // 15
-];
-
 type MascotMessage = {
   kind: string;
   tool?: { ok?: boolean };

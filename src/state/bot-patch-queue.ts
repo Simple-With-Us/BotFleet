@@ -21,6 +21,7 @@ export type BotUpdatePatch = Partial<
     | "mascotExpression"
     | "avatarUrl"
     | "avatarCrop"
+    | "recolorable"
     | "autoApprove"
     | "bypassPermissions"
     | "speakReplies"

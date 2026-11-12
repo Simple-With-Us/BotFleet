@@ -17,6 +17,13 @@
 //   3. Values are hashed or counted, never returned, logged or rendered.  The
 //      only strings that leave this module are ids, labels and vault names.
 //
+// Those three rules govern the config-shaped rows.  The CLI logins — the
+// names a CLI reads out of its environment, which belong to a seat and live
+// in the fleet's own project — are a different shape and get their own
+// table below, with their own rule: such a value never lands in the config
+// object either, it goes to one launched child's environment and nowhere
+// else.  See `server/cli-logins.ts` for the read and the delivery.
+//
 // Pure data plus pure functions.  The `AppConfig` import is `import type` on
 // purpose: `config.ts` imports this module for real, and a value import here
 // would close the cycle.
@@ -375,6 +382,93 @@ const MAPPED_NAMES: ReadonlySet<string> = new Set([
   ...SECRET_FIELDS.map((spec) => spec.infisicalName),
   ...KNOB_INFISICAL_NAMES,
 ]);
+
+/** One CLI login: a name a CLI reads out of its environment, and the
+ * environment variable a launched child is given.
+ *
+ * A CLI login is not a config field, so it is not one of the rows above.
+ * It belongs to a SEAT rather than to this app, it lives in the fleet's own
+ * project rather than in BotFleet's, and it goes to a launched child process
+ * rather than into `cfg` — so it has its own table, and the rules above are
+ * restated for it:
+ *
+ *   4. A CLI login never lands in `cfg`, in `process.env`, in a log line, in
+ *      an error message or in a status view.  It goes from the vault into
+ *      one child's environment and nowhere else.
+ *
+ * The names are the four the fleet's own writer accepts, so a name BotFleet
+ * reads is a name the fleet can write. */
+export interface CliLoginFieldSpec {
+  id: string;
+  /** Sentence case, for the docs and the status view. */
+  label: string;
+  /** The name the CLI reads out of its environment, and the name the seat's
+   * folder holds. */
+  env: string;
+  /** The project the value lives in.  The fleet's CLI logins live in the
+   * fleet's own project, not in BotFleet's: the same machine identity reads
+   * both, and no value is ever copied from one project into the other. */
+  project: "fleet-ops";
+  /** True when the value must never be rendered, logged or returned. */
+  secret: boolean;
+}
+
+/** The canonical table of the CLI logins BotFleet knows how to consume.
+ *
+ * These names are deliberately NOT in `MAPPED_NAMES`: they are not config
+ * fields, they do not live in BotFleet's own project, and the snapshot
+ * filter above must not be the thing that decides where they come from.
+ * They are read per seat, out of the fleet's project, by
+ * `server/cli-logins.ts`. */
+export const CLI_LOGIN_FIELDS: readonly CliLoginFieldSpec[] = [
+  {
+    id: "cliLogin.ghToken",
+    label: "GitHub CLI token",
+    env: "GH_TOKEN",
+    project: "fleet-ops",
+    secret: true,
+  },
+  {
+    id: "cliLogin.githubToken",
+    label: "GitHub token",
+    env: "GITHUB_TOKEN",
+    project: "fleet-ops",
+    secret: true,
+  },
+  {
+    id: "cliLogin.ghEnterpriseToken",
+    label: "GitHub Enterprise token",
+    env: "GH_ENTERPRISE_TOKEN",
+    project: "fleet-ops",
+    secret: true,
+  },
+  {
+    id: "cliLogin.copilotGithubToken",
+    label: "Copilot CLI GitHub token",
+    env: "COPILOT_GITHUB_TOKEN",
+    project: "fleet-ops",
+    secret: true,
+  },
+] as const;
+
+/** Every environment name a CLI login may use.  The allowlist: a row in the
+ * seat's folder that is not one of these is ignored, and one of these the
+ * folder does not hold is simply absent. */
+export const CLI_LOGIN_ENV_NAMES: readonly string[] = CLI_LOGIN_FIELDS.map((spec) => spec.env);
+
+/** The seat names a CLI login folder may have.  The same shape the fleet's
+ * writer accepts for a path (`/cli-logins/[A-Z][A-Z0-9-]{0,15}`), so a
+ * folder BotFleet reads is a folder the fleet can write. */
+export const CLI_LOGIN_SEAT_PATTERN = /^[A-Z][A-Z0-9-]{0,15}$/;
+
+/** The folder a seat's CLI logins live in: `/cli-logins/<SEAT>`.
+ *
+ * Null when the seat is not one the fleet's writer could have produced.  A
+ * bot with no seat has no folder, and no folder is invented for it. */
+export function cliLoginSecretPath(seat: string): string | null {
+  if (!CLI_LOGIN_SEAT_PATTERN.test(seat)) return null;
+  return `/cli-logins/${seat}`;
+}
 
 export type SecretSource = "infisical" | "env" | "file" | "none";
 

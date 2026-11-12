@@ -11,6 +11,58 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const workflow = readFileSync(join(ROOT, ".github/workflows/native-mac-release.yml"), "utf8");
 const localScript = readFileSync(join(ROOT, "scripts/mac-package.sh"), "utf8");
 
+test("only the native Mac target links Sparkle and retains explicit public update metadata", () => {
+  const project = parseYaml(readFileSync(join(ROOT, "ios/project.yml"), "utf8"));
+  const mac = project.targets.BotFleetMac;
+  assert.equal(project.packages.Sparkle.exactVersion, "2.10.1");
+  assert.ok(mac.dependencies.some((dependency) => dependency.package === "Sparkle"));
+  assert.ok(!project.targets.BotFleet.dependencies.some((dependency) => dependency.package === "Sparkle"));
+  assert.equal(mac.info.properties.SUFeedURL, "$(BOTFLEET_NATIVE_UPDATE_FEED_URL)");
+  assert.equal(mac.info.properties.SUPublicEDKey, "$(BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY)");
+  assert.equal(mac.settings.base.BOTFLEET_NATIVE_UPDATE_FEED_URL, "");
+  assert.equal(mac.settings.base.BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY, "");
+  assert.equal(mac.info.properties.SUAutomaticallyUpdate, false);
+  const archive = parseYaml(workflow).jobs["mac-native"].steps.find((step) => step.name === "Archive BotFleetMac");
+  for (const setting of ["BOTFLEET_NATIVE_UPDATE_FEED_URL", "BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY"]) {
+    assert.equal(archive.env[setting], "${{ env." + setting + " }}");
+    assert.ok(archive.run.includes(`${setting}="$${setting}"`));
+    assert.ok(localScript.includes(setting + '="${' + setting + ':-}"'));
+  }
+});
+
+test("the archive consumes only canonical exports after the dedicated read-only metadata gate", () => {
+  const steps = parseYaml(workflow).jobs["mac-native"].steps;
+  const gate = steps.findIndex((step) => step.name === "Verify canonical native update configuration");
+  const archive = steps.findIndex((step) => step.name === "Archive BotFleetMac");
+  assert.ok(gate >= 0 && gate < archive);
+  assert.equal(steps[gate].env.INFISICAL_NATIVE_RELEASE_READ_TOKEN, "${{ secrets.INFISICAL_NATIVE_RELEASE_READ_TOKEN }}");
+  assert.match(steps[gate].run, /node scripts\/native-update-release-config\.mjs --output/);
+  assert.match(steps[gate].run, /cat .* >> "\$GITHUB_ENV"/);
+  for (const name of ["BOTFLEET_NATIVE_UPDATE_FEED_URL", "BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY"]) {
+    assert.equal(steps[gate].env[`MIRROR_${name}`], "${{ vars." + name + " }}");
+    assert.equal(steps[archive].env[name], "${{ env." + name + " }}");
+  }
+  assert.doesNotMatch(JSON.stringify(steps[gate]), /GH_FALLBACK|CLIENT_SECRET|CLIENT_ID|allow-unconfigured/);
+  assert.ok(localScript.indexOf("native-update-release-config.mjs") < localScript.indexOf("xcodebuild archive"));
+});
+
+test("trusted native assets are cryptographically verified with the canonical public key after packaging", () => {
+  const parsed = parseYaml(workflow);
+  assert.equal(parsed.on.workflow_dispatch.inputs["unsigned-draft"].default, false);
+  assert.equal(parsed.jobs.draft.if, "${{ inputs.draft && !inputs.unsigned-draft }}");
+  const steps = parsed.jobs["mac-native"].steps;
+  const signing = steps.find((step) => step.name === "Generate and verify the appcast over the final bytes");
+  assert.equal(signing.env.BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY, "${{ env.BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY }}");
+  assert.match(signing.run, /--require-signature --public-key "\$BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY"/);
+  assert.match(signing.run, /test "\$UNSIGNED_DRAFT" = true \|\|/);
+  const assemble = parsed.jobs.assemble.steps.find((step) => step.name === "Verify the appcast against the actual bytes");
+  assert.equal(assemble.env.INFISICAL_NATIVE_RELEASE_READ_TOKEN, "${{ secrets.INFISICAL_NATIVE_RELEASE_READ_TOKEN }}");
+  assert.match(assemble.run, /native-update-release-config\.mjs/);
+  assert.match(assemble.run, /--require-signature --public-key "\$BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY"/);
+  assert.match(localScript, /--require-signature --public-key "\$BOTFLEET_NATIVE_UPDATE_PUBLIC_KEY"/);
+  assert.ok(localScript.indexOf("Sparkle signing key file and sign_update") < localScript.indexOf("xcodebuild archive"));
+});
+
 /** One top-level shell function, taken verbatim out of the script. */
 function shellFunction(source, name) {
   const match = source.match(new RegExp(`^${name}\\(\\) \\{[\\s\\S]*?^\\}`, "m"));
@@ -31,15 +83,28 @@ test("the native workflow is dispatch-only and never publishes", () => {
   assert.doesNotMatch(workflow, /gh release edit/);
 });
 
-test("the version is stamped once from a full-history checkout", () => {
+test("the version is planned once from a full-history checkout", () => {
   assert.match(workflow, /fetch-depth: 0/);
-  assert.match(workflow, /stamp-commit-version\.mjs/);
+  assert.match(workflow, /mac-release-version\.mjs/);
   // The overwrite guard reads the producing job's own output.  Reading
   // needs.prepare.outputs.version inside prepare was the release.yml bug
   // fixed in PR #1315: needs is empty there, so the guard never fired.
   assert.match(workflow, /steps\.pin\.outputs\.version/);
   const prepare = workflow.slice(workflow.indexOf("prepare:"), workflow.indexOf("mac-native:"));
   assert.doesNotMatch(prepare, /needs\.prepare\.outputs/);
+});
+
+test("the native release carries the shared build beside the marketing version", () => {
+  // One shared build per commit, planned once: the marketing version is
+  // fixed and the build is the commit's Central merge stamp, so the appcast
+  // and the verifier are told the build instead of deriving it from a
+  // version string (BF-2588).
+  assert.match(workflow, /BUILD: \$\{\{ needs\.prepare\.outputs\.build \}\}/);
+  assert.match(workflow, /CURRENT_PROJECT_VERSION="\$build"/);
+  assert.match(workflow, /--build "\$BUILD"/);
+  // The release tag carries the build, so two releases of the same
+  // marketing version cannot collide on one tag.
+  assert.match(workflow, /tag="v\$\{VERSION\}-\$\{BUILD\}/);
 });
 
 test("the codesign gate runs before any notarization submission", () => {
@@ -84,17 +149,17 @@ test("the local script refuses beta toolchains and labels dev builds", () => {
   assert.match(localScript, /spctl --assess/);
 });
 
-// A failed version stamp must stop the job where it happens.  `echo
+// A failed version plan must stop the job where it happens.  `echo
 // "$(...)"` returns echo's status, so the stamp script's failure was
 // swallowed and an empty version was published.
-test("a failed version stamp stops the prepare job", () => {
+test("a failed version plan stops the prepare job", () => {
   assert.match(
     workflow,
-    /version="\$\(node scripts\/stamp-commit-version\.mjs \.\)" \|\| exit 1/,
+    /plan="\$\(node scripts\/mac-release-version\.mjs --repo-root \. --sha "\$\(git rev-parse HEAD\)"\)" \|\| exit 1/,
   );
   assert.doesNotMatch(
     workflow,
-    /echo "version=\$\(node scripts\/stamp-commit-version\.mjs \.\)"/,
+    /echo "version=\$\(node scripts\/mac-release-version\.mjs/,
   );
 });
 
@@ -142,12 +207,16 @@ test("the native assets live on their own release tag", () => {
   assert.match(workflow, /NATIVE_TAG_SUFFIX: "-native"/);
   // The tag is used for the release, for the published guard, and for the
   // appcast's enclosure URL, or the feed would point at a release that does
-  // not carry the bytes.
-  assert.match(workflow, /tag="v\$VERSION\$\{NATIVE_TAG_SUFFIX\}"/);
-  assert.match(workflow, /v="v\$\{\{ steps\.pin\.outputs\.version \}\}\$\{NATIVE_TAG_SUFFIX\}"/);
+  // not carry the bytes.  It carries the build, so two releases of the same
+  // fixed marketing version cannot collide on one tag (BF-2588).
+  assert.match(workflow, /tag="v\$\{VERSION\}-\$\{BUILD\}\$\{NATIVE_TAG_SUFFIX\}"/);
   assert.match(
     workflow,
-    /node scripts\/native-appcast\.mjs native-upload "\$VERSION" "v\$VERSION\$\{NATIVE_TAG_SUFFIX\}"/,
+    /v="v\$\{\{ steps\.pin\.outputs\.version \}\}-\$\{\{ steps\.pin\.outputs\.build \}\}\$\{NATIVE_TAG_SUFFIX\}"/,
+  );
+  assert.match(
+    workflow,
+    /node scripts\/native-appcast\.mjs native-upload "\$VERSION" "v\$\{VERSION\}-\$\{BUILD\}\$\{NATIVE_TAG_SUFFIX\}"/,
   );
   assert.match(localScript, /native-appcast\.mjs" "\$OUT" "\$VERSION" "v\$VERSION\$\{NATIVE_TAG_SUFFIX\}"/);
 });

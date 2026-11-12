@@ -44,6 +44,32 @@ export function isClassifyOrUiPassWake(input: {
   return false;
 }
 
+const COMPILE_GATES = /\bcompile[\s-]*gates?\b/i;
+const COMPILE_GATES_PROMPT = /\b(?:own compile gates|bf-compiler)\b/i;
+
+/** True when this trigger's own name, id, or saved instructions are the
+ *  Compile gates webhook.  Matches the ingress pre-filter naming.  Compile
+ *  gates stay on the owning thread (not one-shot), but they share GitHub
+ *  state dedupe so a failed head SHA does not wake Compiler twice. */
+export function isCompileGatesWake(input: {
+  name?: string;
+  instructions?: string;
+  id?: string;
+}): boolean {
+  const name = input.name ?? "";
+  const instructions = input.instructions ?? "";
+  const id = input.id ?? "";
+  // Name/id use the compile-gates phrase.  Instructions stay on the narrow
+  // "own compile gates" / "bf-compiler" forms so an unrelated webhook whose
+  // prompt merely mentions compile gates does not inherit the pre-filter or
+  // head-SHA dedupe (same shape as the previous inline pre-filter).
+  return (
+    COMPILE_GATES.test(name) ||
+    COMPILE_GATES.test(id) ||
+    COMPILE_GATES_PROMPT.test(instructions)
+  );
+}
+
 /** Whether this run should dispatch as a one-shot.  An explicit `oneShotWake`
  *  flag counts, and so does a classify / UI-pass trigger.  Resource wakes
  *  and anything a person typed stay on the owning thread. */

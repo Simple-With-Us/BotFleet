@@ -38,7 +38,7 @@ struct CompanionApp: App {
 
     var body: some Scene {
         WindowGroup {
-            RootView()
+            launchRoot
                 // Fleet UI ruling 2026-09-19: default theme is **system**, not
                 // light.  We removed the explicit `.preferredColorScheme(.light)`
                 // so the iOS app follows the OS appearance setting; a Light
@@ -56,6 +56,14 @@ struct CompanionApp: App {
                     liveActivities.attach(to: session)
                     liveActivities.transition(to: liveActivityPhase(scenePhase))
                     Task { await testFlightUpdate.checkIfDue() }
+                    // Categories and the notification-settings lookup are
+                    // XPC.  Yield once so they are not inside the same
+                    // main-thread turn as the first layout.
+                    Task { @MainActor in
+                        await Task.yield()
+                        session.activateAfterFirstFrame()
+                        await session.refreshNotificationAuthorization()
+                    }
                     #if DEBUG
                     if ProcessInfo.processInfo.arguments.contains("-live-activity-preview") {
                         LiveActivityCoordinator.startPreviewActivity()
@@ -79,6 +87,18 @@ struct CompanionApp: App {
                     @unknown default: break
                     }
                 }
+        }
+    }
+
+    /// RootView reads onboarding preferences and builds the real route.
+    /// That waits until pairing restore has published, so the first layout
+    /// is not also the keychain read (BOTFLEET-W).
+    @ViewBuilder
+    private var launchRoot: some View {
+        if session.launchRestoreSettled {
+            RootView()
+        } else {
+            CompanionLaunchPlaceholder()
         }
     }
 
@@ -140,6 +160,18 @@ final class CompanionAppDelegate: NSObject, UIApplicationDelegate {
     }
 }
 
+/// Static first frame while pairing restore runs off the main thread.
+/// No accessibility modifiers and no asset lookup: those are what pull
+/// UIKit's settings bundle onto the main thread during launch.
+struct CompanionLaunchPlaceholder: View {
+    var body: some View {
+        Text("BotFleet")
+            .font(.title2)
+            .foregroundStyle(Color.gray)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
 struct RootView: View {
     @EnvironmentObject private var session: Session
     @AppStorage("companion.onboarding.welcomeSeen") private var hasSeenWelcome = false
@@ -153,6 +185,8 @@ struct RootView: View {
 #if DEBUG
             if ProcessInfo.processInfo.arguments.contains("-tvface-preview") {
                 TVFacePreviewHarness()
+            } else if ProcessInfo.processInfo.arguments.contains("-composer-regression-preview") {
+                ComposerScrollRegressionPreview().padding()
             } else {
                 mainRoutes
             }
@@ -192,6 +226,8 @@ struct RootView: View {
     @ViewBuilder
     private var mainRoutes: some View {
         switch route {
+            case .restoring:
+                CompanionLaunchPlaceholder()
             case .welcome:
                 CompanionWelcomeView(
                     onConnect: startPairing,
@@ -252,7 +288,8 @@ struct RootView: View {
             hasPendingPairingInvite: session.pairingInvite != nil,
             notificationOnboardingPending: notificationOnboardingPending,
             hasSeenNotificationPrompt: hasSeenNotificationPrompt,
-            notificationAuthorization: notificationAuthorizationState
+            notificationAuthorization: notificationAuthorizationState,
+            launchRestoreSettled: session.launchRestoreSettled
         ))
     }
 

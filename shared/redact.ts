@@ -1,3 +1,5 @@
+import type { JsonValue } from "./plugin-manifest.ts";
+
 // Keeping secrets out of the native protocol log — and out of the transcript.
 //
 // The native tee writes every provider message verbatim, which is what makes
@@ -58,6 +60,7 @@ const KEY_PREFIXES: RegExp[] = [
   /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}/g, // github classic
   /\bgithub_pat_[A-Za-z0-9_]{20,}/g, // github fine-grained
   /\bxox[abposr]-[A-Za-z0-9-]{20,}/g, // slack
+  /\bxapp-[A-Za-z0-9-]{20,}/g, // slack app-level token
   // ── shapes BotFleet itself issues or stores ──
   // The four above are all somebody else's format, recognised because the
   // provider's own prefix is in the value. These are the same kind of thing
@@ -82,6 +85,8 @@ const KEY_PREFIXES: RegExp[] = [
   /\bwhsec_[A-Za-z0-9_-]{8,}/g, // stripe / botfleet webhook signing secret
   /\bya29\.[A-Za-z0-9_-]{4,}/g, // google oauth access token
   /\bglpat-[A-Za-z0-9_-]{8,}/g, // gitlab personal access token
+  /\bgldt-[A-Za-z0-9_-]{8,}/g, // gitlab deploy token
+  /\bglrtr?-[A-Za-z0-9_-]{8,}/g, // gitlab runner authentication token (glrt-, glrtr- via registration token)
   /\bAKIA[0-9A-Z]{16}\b/g, // aws access key id
   /\bAIza[0-9A-Za-z_-]{30,}/g, // google api key
   /\bnpm_[A-Za-z0-9]{20,}/g, // npm
@@ -1079,47 +1084,143 @@ export function redactSecretsInText(text: string): string {
   return out;
 }
 
+/** How deep the shared tree walk redacts before it stops trusting the shape.
+ * Past this a container is masked whole (see `maskDeep`) rather than walked:
+ * returning it verbatim handed every credential field below the cap back in
+ * the clear. */
+const MAX_REDACT_DEPTH = 12;
+
+/** JSON object branch of `JsonValue` — not arrays or primitives.  Same
+ * `toString`-tag discrimination as `isJsonObject` in
+ * `./plugin-manifest.ts`, local so this module stays dependency-free. */
+function isJsonRecord(value: JsonValue): value is Record<string, JsonValue> {
+  if (value === null || Array.isArray(value)) return false;
+  return Object.prototype.toString.call(value) === "[object Object]";
+}
+
+/** JSON string branch of `JsonValue`.  Local for the same reason. */
+function isJsonString(value: JsonValue): value is string {
+  return Object.prototype.toString.call(value) === "[object String]";
+}
+
+/** What `maskDeep` returns for a value it refuses to walk: a subtree cut by
+ * the depth/node budget, or an object reached twice through a cycle.  A fixed
+ * marker rather than a length report — the length of an un-walked subtree is
+ * not a debugging fact — and shaped so a second redaction pass leaves it
+ * alone (no pattern matches inside either marker). */
+const MASKED_SUBTREE: JsonValue = "«redacted subtree»";
+const MASKED_CIRCULAR: JsonValue = "«redacted circular»";
+/** The cycle marker through a call: the shared walk returns `unknown`, and
+ * returning the constant directly widens a known value into it. A declared
+ * `string` return keeps inference exactly like `mask` and `text` do. */
+const circularMarker = (): string => MASKED_CIRCULAR;
+
+/** How far below its own root `maskDeep` still descends.  A past-cap chain a
+ * hundred thousand levels deep would otherwise overflow the stack on the
+ * redaction hot path; 32 levels keep every realistic shape intact while the
+ * recursion stays trivially shallow. */
+const MAX_MASK_DEPTH = 32;
+/** How many values one `maskDeep` call walks before it elides the rest.  A
+ * past-cap object with hundreds of thousands of entries is either an attack
+ * or a tool result nobody reads whole; either way the per-event cost on the
+ * publish path stays bounded. */
+const MAX_MASK_NODES = 100_000;
+
+/** Mask a subtree whose root sits past `MAX_REDACT_DEPTH`, using only the
+ * existing mask marker.  Keys survive so the shape still says WHERE a secret
+ * was; every string value is masked with its true length, so nothing below
+ * the cap is trusted — not secret-shaped keys, not `{name, value}` env
+ * entries, not plain strings that merely contain one.  Non-strings carry no
+ * credential value and pass through.
+ *
+ * `seen` is the chain of ancestors from the shared walk: an object reached
+ * twice is a cycle, and it is elided rather than recursed into.  `depth` and
+ * the `budget` node count bound the walk itself — past either, the remainder
+ * of the subtree is elided rather than walked. */
+function maskDeep(input: JsonValue, seen: Set<unknown>, depth = 0, budget: { nodes: number } = { nodes: MAX_MASK_NODES }): JsonValue {
+  if (input === null) return input;
+  if (budget.nodes <= 0) return MASKED_SUBTREE;
+  budget.nodes -= 1;
+  if (isJsonString(input)) return mask(input);
+  // The unknown-typed ancestor set needs no narrowing and no `typeof`: a
+  // primitive is never added, so it can never hit, while any object reached
+  // twice — plain, exotic, or bridged — is elided instead of recursed into.
+  if (seen.has(input)) return MASKED_CIRCULAR;
+  if (Array.isArray(input) || isJsonRecord(input)) {
+    if (depth > MAX_MASK_DEPTH) return MASKED_SUBTREE;
+    seen.add(input);
+    try {
+      if (Array.isArray(input)) return input.map((item) => maskDeep(item, seen, depth + 1, budget));
+      const out: Record<string, JsonValue> = {};
+      for (const [key, value] of Object.entries(input)) out[key] = maskDeep(value, seen, depth + 1, budget);
+      return out;
+    } finally {
+      seen.delete(input);
+    }
+  }
+  return input;
+}
+
 /** The walk both public deep redactors share.  `text` is what every string
  * that is NOT under a secret-shaped key goes through: the plain content pass
  * for `redactSecrets`, the cap-then-content pass for `redactSecretsForLog`.  A
  * secret-shaped key is masked outright either way, so a caller can never widen
  * what a known credential field reports. */
-function redactTree(input: unknown, depth: number, text: (value: string) => string): unknown {
+function redactTree(input: unknown, depth: number, text: (value: string) => string, seen: Set<unknown> = new Set()): unknown {
   if (typeof input === "string") return text(input);
-  if (depth > 12 || input === null || typeof input !== "object") return input;
+  if (input === null || typeof input !== "object") return input;
+  // Live harness events (bus log entries, tool I/O captures) reach this walk,
+  // and a live object graph can cycle — an error with a circular `cause`, a
+  // tool result echoing a structure with back-references.  An object reached
+  // twice through its own ancestors is elided, never recursed into.
+  if (seen.has(input)) return circularMarker();
+  // SAFETY: only JSON-shaped payloads reach the tree walk (provider messages
+  // and tool results), and maskDeep masks any exotic object whole or passes
+  // it through without recursing, so the assertion cannot widen what is trusted.
+  if (depth > MAX_REDACT_DEPTH) return maskDeep(input as JsonValue, seen);
 
-  if (Array.isArray(input)) {
-    return input.map((item) => {
-      // ACP env entries: {name: "OMB_COMMS_TOKEN", value: "…"}
-      if (
-        item !== null &&
-        typeof item === "object" &&
-        !Array.isArray(item) &&
-        typeof (item as { name?: unknown }).name === "string" &&
-        typeof (item as { value?: unknown }).value === "string"
-      ) {
-        const entry = item as { name: string; value: string };
-        // A non-secret-shaped name (a custom env var, a feature flag) does
-        // not clear the value of suspicion — the same content pass every
-        // other string in this tree gets is what catches a credential
-        // someone stashed under an ordinary-looking name.
-        return isSecretName(entry.name) ? { ...entry, value: mask(entry.value) } : { ...entry, value: text(entry.value) };
-      }
-      return redactTree(item, depth + 1, text);
-    });
-  }
-
-  const out: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(input as Record<string, unknown>)) {
-    if (typeof value === "string" && isSecretName(key)) {
-      out[key] = mask(value);
-      continue;
+  seen.add(input);
+  try {
+    if (Array.isArray(input)) {
+      return input.map((item) => {
+        // A cyclic entry never reaches the leaf handling below: spreading it
+        // would copy the cyclic reference into the output, where the
+        // eventual JSON.stringify throws. The unknown-typed set takes the
+        // entry as-is — no narrowing needed.
+        if (seen.has(item)) return MASKED_CIRCULAR;
+        // ACP env entries: {name: "OMB_COMMS_TOKEN", value: "…"}
+        if (
+          item !== null &&
+          typeof item === "object" &&
+          !Array.isArray(item) &&
+          typeof (item as { name?: unknown }).name === "string" &&
+          typeof (item as { value?: unknown }).value === "string"
+        ) {
+          const entry = item as { name: string; value: string };
+          // A non-secret-shaped name (a custom env var, a feature flag) does
+          // not clear the value of suspicion — the same content pass every
+          // other string in this tree gets is what catches a credential
+          // someone stashed under an ordinary-looking name.
+          return isSecretName(entry.name) ? { ...entry, value: mask(entry.value) } : { ...entry, value: text(entry.value) };
+        }
+        return redactTree(item, depth + 1, text, seen);
+      });
     }
-    // any other string may still CONTAIN a credential (a command line, a
-    // header value, a bot's reply) — the content pass catches those
-    out[key] = redactTree(value, depth + 1, text);
+
+    const out: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(input as Record<string, unknown>)) {
+      if (typeof value === "string" && isSecretName(key)) {
+        out[key] = mask(value);
+        continue;
+      }
+      // any other string may still CONTAIN a credential (a command line, a
+      // header value, a bot's reply) — the content pass catches those
+      out[key] = redactTree(value, depth + 1, text, seen);
+    }
+    return out;
+  } finally {
+    seen.delete(input);
   }
-  return out;
 }
 
 /** Deep copy with credential VALUES replaced.  Handles the two shapes that
@@ -1152,23 +1253,53 @@ export function redactSecretsWith(input: unknown, text: (value: string) => strin
  * fan-out and `/api/health` waited behind it. */
 export const LOG_TEE_MAX_STRING_CHARS = 256 * 1024;
 
+/** How far past the cap the log-tee content pass still reads before it cuts.
+ *
+ * A secret straddling the cap has to be WHOLE to match: its prefix on its own
+ * is below a pattern floor (`gsk_` needs 40 body characters) or has lost the
+ * closing shape the pattern anchors on.  The margin only has to cover the
+ * longest such floor, so 4 KB is generous; it costs ~1.5% on a capped scan,
+ * against the megabytes of tool output the cap exists to avoid scanning. */
+export const LOG_TEE_OVERLAP_CHARS = 4 * 1024;
+
 /** Content pass for the log tee: redact, THEN cut.
  *
  * The order is load-bearing and is the reason this is not "slice and call
- * `redactSecretsInText`".  `KEY_VALUE_UNTERMINATED` exists because a
- * credential whose closing quote was lost to a clip is still a credential, and
- * it anchors at end-of-text — so the head has to be redacted while the clip is
- * still the last thing in the string.  Cutting first would end it in a marker
- * instead, and a secret straddling the boundary would ship its prefix in the
- * clear.
+ * `redactSecretsInText`".  The head is redacted over a window that overlaps
+ * the cap by `LOG_TEE_OVERLAP_CHARS`, and the REDACTED window is then cut back
+ * to the cap — so a secret straddling the boundary is whole inside the window,
+ * matches, and masks, and the cut lands in the marker, never in the
+ * credential.  Cutting the raw head first instead shipped the straddling
+ * prefix in the clear whenever the piece before the cap was too short to
+ * match on its own.
  *
  * The elided tail is never written, redacted or not, so nothing in it can
  * leak.  A string within the cap takes exactly the path it took before this
  * function existed. */
+/** A JWT opener whose closing dots were cut off by the log-tee window.
+ *
+ * Every other credential shape either matches its in-window prefix on its
+ * floor alone (`xai-` needs 20 body characters, and the overlap margin is
+ * 4 KB, so a visible prefix always matches) or anchors at end-of-text, which
+ * the window slice provides (`KEY_VALUE_UNTERMINATED`, `PEM_BLOCK`, the
+ * quoted authorization header).  A JWT without a dot in the window is the one
+ * shape that matches nothing when cut: its in-cap prefix would ship in the
+ * clear.  The 8-character floor mirrors the JWT pattern's own first-segment
+ * floor, so prose that merely names the shape stays untouched. */
+const TRUNCATED_JWT_TAIL = /eyJ[A-Za-z0-9_-]{8,}$/;
+
 export function redactSecretsInLogText(text: string, maxChars = LOG_TEE_MAX_STRING_CHARS): string {
   if (text.length <= maxChars) return redactSecretsInText(text);
   const elided = text.length - maxChars;
-  return `${redactSecretsInText(text.slice(0, maxChars))}[… ${elided} characters elided from log]`;
+  const rawWindow = text.slice(0, maxChars + LOG_TEE_OVERLAP_CHARS);
+  // Fail closed: an `eyJ…` run reaching the window edge lost the dots its
+  // pattern anchors on, so the normal pass would emit its in-cap prefix in
+  // the clear.  Mask it here, where the cut is still the last thing in the
+  // string.  Anything without a credential opener is untouched — a long
+  // non-secret still takes the cut path with no mask.
+  const closedWindow = rawWindow.replace(TRUNCATED_JWT_TAIL, (m) => mask(m));
+  const windowed = redactSecretsInText(closedWindow);
+  return `${windowed.slice(0, maxChars)}[… ${elided} characters elided from log]`;
 }
 
 /** `redactSecrets` for a destination that is a log file rather than a live

@@ -61,7 +61,7 @@ describe("ChatView Trajectory switch", () => {
     expect(SRC).toContain("<ThreadViewSwitch view={threadView} onChange={setThreadView} />");
     // in the header's right-hand cluster, ahead of the find button, and not among the thread tabs
     expect(SRC.indexOf("<ThreadViewSwitch")).toBeLessThan(SRC.indexOf('aria-label={trajectoryOpen ? "Search Steps" : "Find in Conversation"}'));
-    expect(SRC.indexOf("<ThreadViewSwitch")).toBeLessThan(SRC.indexOf("<ThreadTabs bot={bot} />"));
+    expect(SRC.indexOf("<ThreadViewSwitch")).toBeLessThan(SRC.indexOf("<ThreadTabs bot={originalBot} />"));
   });
 
   // The switch sits beside a button that used to unmount in Trajectory, which
@@ -145,5 +145,17 @@ describe("ChatView karaoke on the reply itself", () => {
     const firstReturn = SRC.indexOf("if (humanTyped && editing) {");
     expect(hook).toBeGreaterThan(-1);
     expect(hook).toBeLessThan(firstReturn);
+  });
+});
+
+describe("browsing a retained thread while the bot works", () => {
+  it("holds the view fetch while the page failure stands, until the reader reopens it", () => {
+    expect(SRC).toContain("const viewedFailed = explicitThreadId ? state.threadTranscriptErrors[explicitThreadId] : undefined;");
+    expect(SRC).toContain("if (viewingOther && explicitThreadId && !viewedMessages && !viewedLoading && !viewedFailed) {");
+    expect(SRC).toContain("[viewingOther, explicitThreadId, viewedMessages, viewedLoading, viewedFailed, originalBot.id, dispatch]);");
+  });
+
+  it("locks the composer while browsing with a busy bot, so a send cannot retarget the turn", () => {
+    expect(SRC).toContain("locked={viewingOther && originalBot.busy}");
   });
 });

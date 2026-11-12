@@ -40,3 +40,16 @@ paths = [
   '''^ios/Tests/CompanionCoreTests/Phase5BotServicesTests\.swift$''',
 ]
 regexes = ['''P256\.Signing\.PrivateKey''', '''00112233445566778899aabbccddeeff''']
+
+# The Redact.swift port (5a075a94) committed two synthetic PEM fixtures with
+# full BEGIN/END key-block literals; the follow-up commit rebuilds them from
+# string parts, so the tip tree is clean, but that commit stays in the pull
+# request range and the scan reads its diff.  Scoped to private-key, this one
+# test file, and the two exact synthetic bodies, so a real key anywhere
+# (including this file) still fails.
+[[allowlists]]
+description = "Synthetic PEM fixtures in the Redact port tests"
+targetRules = ["private-key"]
+condition = "AND"
+paths = ['''^ios/Tests/CompanionCoreTests/RedactTests\.swift$''']
+regexes = ['''MIIE realsupersecretkeymaterial''', '''clippedwithoutend0123456789abcdef''']

@@ -26,7 +26,12 @@
 # point where prepare-cua resolves and electron-builder has produced and parsed
 # a plist.  `--dir` gives the .app bundle without the DMG, and
 # CSC_IDENTITY_AUTO_DISCOVERY=false keeps electron-builder out of the keychain
-# entirely, so no secret is needed and nothing here can leak one.
+# entirely, so the ordinary packaging jobs need no credential bindings.
+#
+# An explicitly selected Linux-only audit checks existing Infisical readers
+# separately, before rollout of the service-token migration.
+# It runs only from an exact protected-main commit, emits metadata only, and skips both ordinary jobs
+# under distinct check names; ordinary pull-request runs never receive its tokens.
 #
 # On required-ness: this is deliberately NOT required, and the reasoning is in
 # the pull request.  Two reasons.  First, a path-filtered required check is a
@@ -44,19 +49,88 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
+    inputs:
+      audit_infisical_bindings:
+        description: Run the read-only managed-token binding audit only
+        type: boolean
+        required: false
+        default: false
+      expected_head_sha:
+        description: Exact protected-main SHA to validate against the dispatch metadata
+        type: string
+        required: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: mac-package-gate-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.event_name == 'workflow_dispatch' && inputs.audit_infisical_bindings == true && format('mac-package-audit-{0}', github.sha) || format('mac-package-gate-{0}', github.event.pull_request.number || github.ref) }}
   cancel-in-progress: true
 
 jobs:
+  audit-infisical-bindings:
+    name: Read-only Infisical binding audit
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.audit_infisical_bindings == true && github.ref == 'refs/heads/main' && github.ref_protected == true }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Validate dispatch ref and expected commit before credential reads
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          ACTUAL_SHA: ${{ github.sha }}
+          EXPECTED_SHA: ${{ inputs.expected_head_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$EVENT_NAME" == "workflow_dispatch" ]] || exit 1
+          [[ "$REF" == refs/heads/main ]] || exit 1
+          [[ "$REF_PROTECTED" == true ]] || exit 1
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || exit 1
+          # A sha may arrive in either case.  macOS ships Bash 3.2, which has no ${var,,}.
+          shopt -s nocasematch
+          [[ "$ACTUAL_SHA" == "$EXPECTED_SHA" ]] || exit 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26
+          package-manager-cache: false
+      - name: Audit existing read-token bindings without printing values
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REF: ${{ github.ref }}
+          GITHUB_REF_PROTECTED: ${{ github.ref_protected }}
+          EXPECTED_HEAD_SHA: ${{ inputs.expected_head_sha }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_PROJECT_ID }}
+          INFISICAL_IOS_SHIP_READ_TOKEN: ${{ secrets.INFISICAL_IOS_SHIP_READ_TOKEN }}
+          INFISICAL_RELEASE_READ_TOKEN: ${{ secrets.INFISICAL_RELEASE_READ_TOKEN }}
+          INFISICAL_MAC_COMMIT_BUILD_READ_TOKEN: ${{ secrets.INFISICAL_MAC_COMMIT_BUILD_READ_TOKEN }}
+          INFISICAL_NATIVE_RELEASE_READ_TOKEN: ${{ secrets.INFISICAL_NATIVE_RELEASE_READ_TOKEN }}
+          INFISICAL_SENTRY_DEPLOY_READ_TOKEN: ${{ secrets.INFISICAL_SENTRY_DEPLOY_READ_TOKEN }}
+          INFISICAL_SENTRY_CI_REPORT_READ_TOKEN: ${{ secrets.INFISICAL_SENTRY_CI_REPORT_READ_TOKEN }}
+          INFISICAL_SENTRY_TESTFLIGHT_READ_TOKEN: ${{ secrets.INFISICAL_SENTRY_TESTFLIGHT_READ_TOKEN }}
+          GH_FALLBACK_APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID != '' }}
+          GH_FALLBACK_APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID != '' }}
+          GH_FALLBACK_APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 != '' }}
+          GH_FALLBACK_MAC_CERT_P12_BASE64: ${{ secrets.MAC_CERT_P12_BASE64 != '' }}
+          GH_FALLBACK_MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD != '' }}
+          GH_FALLBACK_SENTRY_DSN: ${{ secrets.SENTRY_DSN != '' }}
+          GH_FALLBACK_SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN != '' }}
+          GH_FALLBACK_SENTRY_FLEET_DSN: ${{ secrets.SENTRY_FLEET_DSN != '' }}
+        run: node scripts/infisical-ci-binding-audit.mjs
+
   scope:
-    name: Classify Mac packaging scope
+    name: "${{ github.event_name == 'workflow_dispatch' && inputs.audit_infisical_bindings == true && 'Audit-only: Mac packaging classifier skipped' || 'Classify Mac packaging scope' }}"
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.audit_infisical_bindings == true) }}
     runs-on: ubuntu-26.04
-    timeout-minutes: 5
+    timeout-minutes: 10
     outputs:
       run: ${{ steps.scope.outputs.run }}
       reason: ${{ steps.scope.outputs.reason }}
@@ -68,25 +142,29 @@ jobs:
           # answers by running the gate -- correct, but an expensive way to say
           # the diff was unavailable.
           fetch-depth: 0
+          # Scope compares commit/tree metadata, without historical file blobs.
+          filter: blob:none
           persist-credentials: false
       - name: Diff against the base ref
         id: base
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
-          base="${BASE_SHA:-}"
-          if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
-            base="$(git merge-base HEAD origin/"${GITHUB_REF_NAME}")"
-          fi
-          if [ -z "$base" ]; then
-            # No base at all: emit nothing and let the classifier fail closed.
+          # The pull request's own two ends,  computed by the same script
+          # ci.yml's classifier uses.  The stored base SHA is the base
+          # branch's tip at the last synchronisation and HEAD is the merge
+          # commit,  so the old diff folded main's newer commits into the
+          # scope:  a pull request that touched nothing here took a hosted
+          # macOS runner because main had moved a packaging file.
+          if ! bash scripts/ci-scope-diff.sh "$BASE_SHA" "$HEAD_SHA" > changed-paths.z; then
+            # No usable scope:  emit nothing and let the classifier fail closed.
             echo "base_sha=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          git diff --no-renames --name-only -z "$base" HEAD > changed-paths.z
-          echo "base_sha=$base" >> "$GITHUB_OUTPUT"
-          echo "changed $(tr -cd '\0' < changed-paths.z | wc -c | tr -d ' ') path(s) against ${base:0:9}"
+          echo "base_sha=$BASE_SHA" >> "$GITHUB_OUTPUT"
+          echo "changed $(tr -cd '\0' < changed-paths.z | wc -c | tr -d ' ') path(s) against ${BASE_SHA:0:9}"
       - name: Decide whether to package
         id: scope
         env:
@@ -106,9 +184,9 @@ jobs:
           fi
 
   package:
-    name: Unsigned arm64 package (prepare-cua + plist)
+    name: "${{ github.event_name == 'workflow_dispatch' && inputs.audit_infisical_bindings == true && 'Audit-only: unsigned package skipped' || 'Unsigned arm64 package (prepare-cua + plist)' }}"
     needs: scope
-    if: ${{ needs.scope.outputs.run == 'true' && !cancelled() }}
+    if: ${{ needs.scope.outputs.run == 'true' && !cancelled() && !(github.event_name == 'workflow_dispatch' && inputs.audit_infisical_bindings == true) }}
     runs-on: macos-26
     timeout-minutes: 45
     steps:
@@ -119,7 +197,7 @@ jobs:
           # count, and the stamp refuses a shallow clone rather than
           # numbering the build 1.0.1.
           fetch-depth: 0
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 26

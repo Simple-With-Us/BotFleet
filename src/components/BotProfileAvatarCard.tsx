@@ -6,7 +6,6 @@ import { guessImageMime, imageAttachmentFromFile } from "@/lib/composer-attachme
 import { cn } from "@/lib/cn";
 import { productErrorHeadline } from "@/lib/product-error";
 import {
-  PICKABLE_STATES,
   BOT_COLORS,
   BOT_COLOR_NAMES,
   type BotMotion,
@@ -20,12 +19,22 @@ import {
 } from "../../shared/bot-avatar";
 import { extractAvatarManifest } from "../../shared/avatar-manifest";
 import { toManifestBytes } from "./avatar-file/bytes";
-import { BotAvatar, BotMascot } from "./Avatar";
-import { TVFaceAvatar } from "./tv-face/TVFaceAvatar";
+import { BotAvatar } from "./Avatar";
 
 type AvatarPatch = Partial<
-  Pick<Bot, "avatarCrop" | "avatarUrl" | "color" | "mascotExpression">
+  Pick<Bot, "avatarCrop" | "avatarUrl" | "color" | "mascotExpression" | "recolorable">
 >;
+
+/**
+ * What choosing a crop changes.  Expressions follow the bot's situation, so
+ * the mascot and TV-Face crops clear any pinned expression.  TV-Face keeps the
+ * bot's color.
+ */
+export function patchForCrop(next: NonNullable<Bot["avatarCrop"]>, color: Bot["color"] | undefined): AvatarPatch {
+  if (next === "tvface") return { avatarCrop: "tvface", mascotExpression: null, color: color || "orange" };
+  if (next === "mascot") return { avatarCrop: "mascot", mascotExpression: null };
+  return { avatarCrop: next };
+}
 
 const CROP_LABEL = {
   mascot: "Mascot",
@@ -81,9 +90,12 @@ export function BotProfileAvatarCard({
       // follows the file.  Anything else keeps the crop an upload would
       // have had, which is what stops a plain picture from being left in a
       // crop that cannot draw it.
+      // Manifest packs are shell-recolourable (TV-Face bezel).  Nothing draws
+      // that recolor yet, so the Color row stays off for the animated crop.
       onPatch({
         avatarUrl,
         avatarCrop: carriesManifest ? "animated" : avatarCropAfterUpload(latestCrop),
+        recolorable: carriesManifest ? "shell" : "none",
       });
     } catch (uploadError) {
       setError(uploadError instanceof Error ? uploadError.message : String(uploadError));
@@ -95,14 +107,22 @@ export function BotProfileAvatarCard({
 
   const removeImage = () => {
     setError(null);
-    onPatch({ avatarUrl: null, avatarCrop: "mascot" });
+    onPatch({ avatarUrl: null, avatarCrop: "mascot", recolorable: "none" });
   };
+
   return (
     <div className="overflow-hidden rounded-xl border border-hairline/40 bg-card">
       <div className="flex items-center justify-between border-b border-hairline/40 px-3 py-2.5">
         <span className="rounded-lg bg-control px-3 py-1.5 text-[14px] font-medium text-ink">Avatar</span>
         <button
-          onClick={() => onPatch({ avatarCrop: "mascot", color: "green", mascotExpression: null })}
+          onClick={() =>
+            onPatch({
+              avatarCrop: "mascot",
+              color: "green",
+              mascotExpression: null,
+              recolorable: "none",
+            })
+          }
           className="rounded-md px-2 py-1.5 text-[13px] text-ink-secondary hover:bg-control hover:text-ink"
         >
           Reset mascot
@@ -184,8 +204,12 @@ export function BotProfileAvatarCard({
             </button>
           )}
         </div>
-        <div className="mt-1.5 text-[11.5px] text-ink-secondary">Drop an image onto the avatar.  PNG, JPEG, GIF, WebP, HEIC, BMP, or SVG · up to 10 MB</div>
-        <div className="mt-1 text-[11.5px] text-ink-secondary">An animated WebP that carries its own manifest plays as one avatar file.</div>
+        <div className="mt-1.5 text-[11.5px] text-ink-secondary">
+          Drop an image onto the avatar.&#160; PNG, JPEG, GIF, WebP, HEIC, BMP, or SVG · up to 10 MB
+        </div>
+        <div className="mt-1 text-[11.5px] text-ink-secondary">
+          An animated WebP that carries its own manifest plays as one avatar file.
+        </div>
 
         <div className="mb-2 mt-4 text-[12px] font-medium uppercase tracking-[0.08em] text-ink-secondary">
           Shape
@@ -196,11 +220,13 @@ export function BotProfileAvatarCard({
               key={candidate}
               type="button"
               aria-pressed={crop === candidate}
-              onClick={() => onPatch({ avatarCrop: candidate })}
+              onClick={() => onPatch(patchForCrop(candidate, bot.color))}
               className={cn(
                 "py-1.5 text-[12.5px]",
                 index > 0 && "border-l border-hairline/40",
-                crop === candidate ? "bg-control text-ink" : "text-ink-secondary hover:bg-control/60 hover:text-ink",
+                crop === candidate
+                  ? "bg-control text-ink"
+                  : "text-ink-secondary hover:bg-control/60 hover:text-ink",
               )}
             >
               {CROP_LABEL[candidate]}
@@ -211,34 +237,11 @@ export function BotProfileAvatarCard({
         {(crop === "mascot" || crop === "tvface") && (
           <>
             <div className="mb-2 mt-4 text-[12px] font-medium uppercase tracking-[0.08em] text-ink-secondary">
-              Expression
-            </div>
-            <div className="grid grid-cols-5 gap-2">
-              {PICKABLE_STATES.map((expression) => (
-                <button
-                  key={expression}
-                  type="button"
-                  aria-pressed={activeState === expression}
-                  onClick={() => onPatch({ mascotExpression: expression })}
-                  className={cn(
-                    "flex h-[58px] items-center justify-center rounded-xl bg-inset transition-colors hover:bg-control",
-                    activeState === expression && "ring-2 ring-accent-border",
-                  )}
-                  title={expression.charAt(0).toUpperCase() + expression.slice(1)}
-                  aria-label={`Use ${expression} expression`}
-                >
-                  {crop === "tvface" ? (
-                    <TVFaceAvatar color={bot.color} state={expression} size={42} animated={false} />
-                  ) : (
-                    <BotMascot color={bot.color} state={expression} size={42} animated={false} />
-                  )}
-                </button>
-              ))}
-            </div>
-
-            <div className="mb-2 mt-4 text-[12px] font-medium uppercase tracking-[0.08em] text-ink-secondary">
               Color
             </div>
+            <p className="mb-2 text-[11.5px] text-ink-secondary">
+              Expressions follow the bot's situation.
+            </p>
             <div className="flex flex-wrap gap-2.5">
               {BOT_COLOR_NAMES.map((color) => (
                 <button
@@ -259,8 +262,11 @@ export function BotProfileAvatarCard({
           </>
         )}
 
-
-        {error && <div role="alert" className="mt-3 text-[12px] text-danger" title={error}>{productErrorHeadline(error)}</div>}
+        {error && (
+          <div role="alert" className="mt-3 text-[12px] text-danger" title={error}>
+            {productErrorHeadline(error)}
+          </div>
+        )}
       </div>
     </div>
   );

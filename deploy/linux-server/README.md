@@ -22,7 +22,7 @@ The runtime root (`BF_ROOT`) holds everything the service writes:
 ├── logs/      server.log and historical owner-gate.log (new gate logs use journal)
 ├── bin/       installed startup/preflight helpers retained through code rollback
 ├── tmp/       TMPDIR
-├── config/    server.env and infisical-read-token
+├── config/    server.env, infisical-read-token and harness-infisical-token
 ├── workdir/   the systemd working directory
 └── node/      the private Node install (v24)
 
@@ -56,7 +56,7 @@ At least one of `BOTFLEET_OWNER_LOGINS` and `BOTFLEET_SERVER_GATE_TOKEN` has to 
 
 ### The One Local Item: config/infisical-read-token
 
-Reading the vault needs a key, so the host keeps exactly one local file:
+Reading the vault needs a key, so the gate keeps one local file:
 
 ```
 /mnt/fleet-extra/apps/botfleet-server/config/infisical-read-token
@@ -68,6 +68,25 @@ Reading the vault needs a key, so the host keeps exactly one local file:
 
 ```sh
 sudo install -m 600 -o jay -g fleet /dev/null /mnt/fleet-extra/apps/botfleet-server/config/infisical-read-token && sudo -u jay bash -c 'IFS= read -rs t && printf %s "$t" > '/mnt/fleet-extra/apps/botfleet-server'/config/infisical-read-token'
+```
+
+The token is read from the terminal without echo and written straight into the file, so it never reaches argv or the shell history.
+
+### Harness vault token: config/harness-infisical-token
+
+A second local file, distinct from the gate's token above: the key the harness itself reads its vault secrets with.
+
+```
+/mnt/fleet-extra/apps/botfleet-server/config/harness-infisical-token
+```
+
+- A **read-only Infisical service token** (`st.…`), scoped to the BotFleet project, the `prod` environment and the folders the harness reads: the root path, plus `/zulip` when Zulip credentials come from the vault (`zulip.credentialSource: "infisical"`).  It grants reading those secrets and nothing else.
+- Mode `0600`, owned by the service user (`jay`), a regular file: `start.sh` refuses a symlink, a non-regular file, a foreign owner, or any group/other permission bits, prints one line naming the file and the reason, and starts the server without it.
+- `start.sh` loads it into `INFISICAL_TOKEN` only when the environment does not already set one; an `INFISICAL_TOKEN` already in the environment always wins.  The project itself comes from `INFISICAL_PROJECT_ID` in `config/server.env` (or the stored Settings); the token file carries only the token.
+- The file is optional and the installer never creates it: without it (and without `INFISICAL_TOKEN` in the environment) the harness simply has no vault to read.  Create it with:
+
+```sh
+sudo install -m 600 -o jay -g fleet /dev/null /mnt/fleet-extra/apps/botfleet-server/config/harness-infisical-token && sudo -u jay bash -c 'IFS= read -rs t && printf %s "$t" > '/mnt/fleet-extra/apps/botfleet-server'/config/harness-infisical-token'
 ```
 
 The token is read from the terminal without echo and written straight into the file, so it never reaches argv or the shell history.

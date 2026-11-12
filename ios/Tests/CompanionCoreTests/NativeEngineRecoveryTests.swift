@@ -45,6 +45,40 @@ struct NativeEngineRecoveryTests {
         #expect(await recovery.hold(for: route, now: now.addingTimeInterval(124)) == nil)
     }
 
+    @Test("A newly observed healthy sibling clears existing shared capacity suppression only on its exact route")
+    func healthySiblingClearsExistingCapacity() async {
+        let recovery = NativeEngineRecoveryActor()
+        let now = Date()
+        let route = NativeEngineRoute(botId: "a", engineId: "muse", modelId: "wonder")
+        let peer = NativeEngineRoute(botId: "b", engineId: "muse", modelId: "wonder")
+        let anotherHeldBot = NativeEngineRoute(botId: "c", engineId: "muse", modelId: "wonder")
+        let quotaRoute = NativeEngineRoute(botId: "quota", engineId: "muse", modelId: "wonder")
+        let otherModel = NativeEngineRoute(botId: "a", engineId: "muse", modelId: "spark")
+        let otherEngine = NativeEngineRoute(botId: "a", engineId: "grok", modelId: "wonder")
+        let capacity = NativeEngineLimit(kind: .capacity, retryAfterSeconds: 120)
+        await recovery.markHealthy(route: peer, now: now)
+        let refusedAt = now.addingTimeInterval(1)
+        #expect(await recovery.recordFailure(route: route, limit: capacity, now: refusedAt) != nil)
+        #expect(await recovery.recordFailure(route: anotherHeldBot, limit: capacity, now: refusedAt) != nil)
+        let quota = await recovery.recordFailure(route: quotaRoute, limit: .init(kind: .quota, retryAfterSeconds: 3_600), now: refusedAt)
+        let modelHold = await recovery.recordFailure(route: otherModel, limit: capacity, now: refusedAt)
+        let engineHold = await recovery.recordFailure(route: otherEngine, limit: capacity, now: refusedAt)
+        #expect(quota?.kind == .quota)
+        #expect(modelHold?.kind == .capacity)
+        #expect(engineHold?.kind == .capacity)
+        #expect(await recovery.hold(for: route, now: refusedAt)?.kind == .capacity)
+
+        let observedAt = now.addingTimeInterval(2)
+        #expect(await recovery.recordFailure(route: route, limit: capacity, activeSiblingBots: [peer.botId], now: observedAt) == nil)
+        #expect(await recovery.hold(for: route, now: observedAt) == nil)
+        #expect(await recovery.hold(for: anotherHeldBot, now: observedAt) == nil)
+        #expect(await recovery.hold(for: peer, now: observedAt) == nil)
+        #expect(await recovery.hold(for: quotaRoute, now: observedAt) == quota)
+        #expect(await recovery.recordFailure(route: quotaRoute, limit: capacity, activeSiblingBots: [peer.botId], now: observedAt) == quota)
+        #expect(await recovery.hold(for: otherModel, now: observedAt) == modelHold)
+        #expect(await recovery.hold(for: otherEngine, now: observedAt) == engineHold)
+    }
+
     @Test("Own stale activity cannot clear quota, and only quota survives restart")
     func persistedQuota() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("bf-recovery-\(UUID().uuidString)")

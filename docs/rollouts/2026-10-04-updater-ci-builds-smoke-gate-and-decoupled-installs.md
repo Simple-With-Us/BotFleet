@@ -174,7 +174,7 @@ reason is a critical standing rule rather than a preference.  The Kody rule
 that contract is real here: `electron-updater` is vendored at
 `electron/vendor/electron-updater.cjs`, `electron/updater.mjs` drives the in-app
 updater, and `.github/workflows/release.yml` publishes a real feed to
-`jaywedgeworth22/BotFleet`.  (The rule's own file paths — `docs/AUTO-UPDATE.md`,
+`Simple-With-Us/BotFleet`.  (The rule's own file paths — `docs/AUTO-UPDATE.md`,
 `script/build_and_run.sh`, `.github/workflows/mac-release.yml` — do not exist in
 this repository, so the rule text is generic, but its substance is accurate and a
 critical-severity guard is not something to route around.)

@@ -7,6 +7,8 @@ public protocol ServersHostStore: Sendable {
     func upsert(_ host: HostRecord) async throws
     func updateThisMacOrigin(_ origin: HostOrigin) async throws
     func remove(id: String, controllerID: String?, leasedHostIDs: Set<String>) async throws
+    func save(_ selection: PlacementSelection) async throws
+    func recordApplied(_ selection: PlacementSelection) async throws
 }
 extension HostStore: ServersHostStore {}
 
@@ -29,6 +31,7 @@ public final class ServersCoordinator: ObservableObject {
     @Published public private(set) var isBusy = false
     @Published public private(set) var isLoaded = false
     @Published public private(set) var errorMessage: String?
+    @Published public private(set) var placement = PlacementSettings()
     public var connectedRecordID: String? = HostRecord.localID
     public var controllerID: String?
     public var leasedHostIDs: Set<String> = []
@@ -36,13 +39,20 @@ public final class ServersCoordinator: ObservableObject {
     private let store: any ServersHostStore
     private let credentials: ServersCredentials
     private let handshake: Handshake
+    private let placementClient: PlacementModeClient
     private var generations: [String: UUID] = [:]
     private var tasks: [String: Task<Void, Never>] = [:]
     private var loading: Task<[HostRecord], Error>?
+    /// Freshest controller epoch observed from each verified controller identity.
+    /// `confirmPlacementApplied` refuses acks older than this; a replayed ack
+    /// from a prior epoch must not record applied state.
+    private var controllerEpochs: [String: Int] = [:]
 
     public init(store: any ServersHostStore, tokens: any HostTokenStore = KeychainHostTokenStore(),
-                handshake: @escaping Handshake = { try await ServerHandshake().test(host: $0, credential: $1) }) {
+                handshake: @escaping Handshake = { try await ServerHandshake().test(host: $0, credential: $1) },
+                placementClient: PlacementModeClient = PlacementModeClient()) {
         self.store = store; self.credentials = ServersCredentials(tokens); self.handshake = handshake
+        self.placementClient = placementClient
     }
 
     public func load() async {
@@ -51,9 +61,10 @@ public final class ServersCoordinator: ObservableObject {
         if loading == nil { loading = Task { try await store.hosts() } }
         guard let loading else { return }
         do {
-            let loaded = try await loading.value
+            let loadedHosts = try await loading.value
+            let loadedSettings = try await store.settings()
             guard !isLoaded else { return }
-            hosts = loaded; isLoaded = true; errorMessage = nil
+            hosts = loadedHosts; placement = loadedSettings; isLoaded = true; errorMessage = nil
         } catch { errorMessage = SavedHostError.unreadableStore.localizedDescription }
         self.loading = nil; isBusy = false
     }
@@ -94,6 +105,103 @@ public final class ServersCoordinator: ObservableObject {
             hosts = records; errorMessage = nil
             return records.first(where: \.isLocal)
         } catch { errorMessage = safeMessage(error); return nil }
+    }
+
+    /// Saves a placement selection without applying it.  Applied state is
+    /// recorded only by `confirmPlacementApplied` after the controller answers.
+    @discardableResult
+    public func savePlacement(_ selection: PlacementSelection) async -> Bool {
+        guard canMutate else { return false }
+        isBusy = true; defer { isBusy = false }
+        do {
+            try await store.save(selection)
+            placement = try await store.settings(); errorMessage = nil
+            return true
+        } catch { errorMessage = safeMessage(error); return false }
+    }
+
+    /// Records applied state only for the saved selection and only with the
+    /// controller's acknowledgement naming that selection's expected
+    /// controller: the saved server's pinned identity in Server First, this
+    /// Mac's pinned identity otherwise.  Expected identities resolve from the
+    /// store — the same source as the saved selection — never from in-memory
+    /// hosts, which can lag a repin.  An ack older than the freshest epoch
+    /// observed from that controller is a replay and is refused.  Anything
+    /// else leaves applied alone.
+    @discardableResult
+    public func confirmPlacementApplied(_ selection: PlacementSelection, acknowledgedBy ack: ControllerAcknowledgement) async -> Bool {
+        guard canMutate else { return false }
+        isBusy = true; defer { isBusy = false }
+        do {
+            let current = try await store.settings()
+            guard selection == current.saved else { throw SavedHostError.placementNotSaved }
+            guard HostRecord.validHostId(ack.controllerId), ack.epoch >= 0 else { throw SavedHostError.placementUnacknowledged }
+            let storedHosts = try await store.hosts()
+            let expected: String?
+            if selection.mode == .serverFirst {
+                expected = storedHosts.first(where: { !$0.isLocal && $0.id == selection.serverID })?.hostId
+            } else {
+                expected = storedHosts.first(where: \.isLocal)?.hostId
+            }
+            guard let expected, ack.controllerId == expected else { throw SavedHostError.placementUnacknowledged }
+            if let observed = controllerEpochs[ack.controllerId], ack.epoch < observed {
+                throw SavedHostError.placementUnacknowledged
+            }
+            try await store.recordApplied(selection)
+            placement = try await store.settings(); errorMessage = nil
+            return true
+        } catch { errorMessage = safeMessage(error); return false }
+    }
+
+    /// Puts the saved selection once, using the controller pair the caller
+    /// already holds.  A 409 is retried once with only the pair that refusal
+    /// returned.  Applied state is recorded only when the reply says the
+    /// controller holds the record.  A second 409, a false acknowledgement, or
+    /// a 400, 403, or 503 leaves applied state unchanged.  This does not start
+    /// a worker or open a runtime connection.
+    @discardableResult
+    public func applySavedPlacement(on host: HostRecord, credential: HostGateCredential?, controller: ControllerAcknowledgement) async -> Bool {
+        guard canMutate else { return false }
+        isBusy = true
+        do {
+            let selection = try await store.settings().saved
+            let serverId = try await placedServerId(selection)
+            let body = try await submitPlacement(on: host, credential: credential, selection: selection, serverId: serverId, controller: controller)
+            guard body.acknowledged else { throw SavedHostError.placementUnacknowledged }
+            guard HostRecord.validHostId(body.controllerId), body.epoch >= 0 else { throw SavedHostError.invalidResponse }
+            isBusy = false
+            return await confirmPlacementApplied(selection, acknowledgedBy: ControllerAcknowledgement(controllerId: body.controllerId, epoch: body.epoch))
+        } catch {
+            isBusy = false
+            errorMessage = safeMessage(error)
+            return false
+        }
+    }
+
+    /// The wire `serverId` is the pinned host id, never the saved-record id.
+    /// This Mac Only names no server.  A server mode with no pin is not sent.
+    private func placedServerId(_ selection: PlacementSelection) async throws -> String? {
+        if selection.mode == .localOnly {
+            guard selection.serverID == nil else { throw SavedHostError.invalidRecord }
+            return nil
+        }
+        guard let recordID = selection.serverID else { throw SavedHostError.placementUnacknowledged }
+        let known = try await store.hosts()
+        guard let serverId = known.first(where: { !$0.isLocal && $0.id == recordID })?.hostId,
+              HostRecord.validHostId(serverId) else { throw SavedHostError.placementUnacknowledged }
+        return serverId
+    }
+
+    private func submitPlacement(on host: HostRecord, credential: HostGateCredential?, selection: PlacementSelection, serverId: String?, controller: ControllerAcknowledgement) async throws -> PlacementModeAcknowledgement {
+        guard HostRecord.validHostId(controller.controllerId), controller.epoch >= 0 else { throw SavedHostError.placementUnacknowledged }
+        let first = PlacementModeSubmission(mode: selection.mode, controllerId: controller.controllerId, epoch: controller.epoch, serverId: serverId, allowOverflowToThisMac: selection.allowOverflowToThisMac)
+        do {
+            return try await placementClient.write(first, host: host, credential: credential)
+        } catch let error as PlacementModeTransportError {
+            guard case .staleFence(let controllerId, let epoch) = error else { throw error }
+            let retry = PlacementModeSubmission(mode: selection.mode, controllerId: controllerId, epoch: epoch, serverId: serverId, allowOverflowToThisMac: selection.allowOverflowToThisMac)
+            return try await placementClient.write(retry, host: host, credential: credential)
+        }
     }
 
     public func removalReason(_ host: HostRecord) -> String? {
@@ -166,6 +274,7 @@ public final class ServersCoordinator: ObservableObject {
             }
             let verified = try await handshake(host, credential)
             guard current(host, generation) else { return }
+            controllerEpochs[verified.controllerId] = verified.epoch
             guard !isBusy else {
                 statuses[host.id] = "Settings changed during this test.\u{00A0} Test the server again."
                 return
@@ -205,6 +314,7 @@ public final class ServersCoordinator: ObservableObject {
             if known == .missingPlacementRoutes { return "Update the server: required placement routes are unavailable." }
             return known.localizedDescription
         }
+        if let transport = error as? PlacementModeTransportError { return transport.localizedDescription }
         return "Could not reach this server.\u{00A0} Check its address and try again."
     }
 }
