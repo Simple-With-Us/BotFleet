@@ -331,12 +331,12 @@ test("nextAutoUpdateRecord omits the fingerprint on a non-darwin host", () => {
 test("recordAutomaticCheck persists lastCheckMs to a fresh config file", () => {
   const dir = mkdtempSync(join(tmpdir(), "botfleet-throttle-"));
   const configPath = join(dir, "config.json");
-  const before = Date.now();
+  const nowMs = 1_700_000_000_123;
   try {
-    recordAutomaticCheck(configPath, { fingerprint: "202609041230:abcdef123456" });
+    recordAutomaticCheck(configPath, { fingerprint: "202609041230:abcdef123456", nowMs });
     const onDisk = JSON.parse(readFileSync(configPath, "utf8"));
     assert.equal(typeof onDisk.autoUpdate.lastCheckMs, "number");
-    assert.ok(onDisk.autoUpdate.lastCheckMs >= before);
+    assert.equal(onDisk.autoUpdate.lastCheckMs, nowMs);
     assert.equal(onDisk.autoUpdate.lastAppFingerprint, "202609041230:abcdef123456");
     assert.equal("enabled" in onDisk.autoUpdate, false, "the toggle is the harness's to write");
     assert.equal(readAutoUpdateConfig(configPath).lastCheckMs, onDisk.autoUpdate.lastCheckMs);
@@ -349,6 +349,7 @@ test("recordAutomaticCheck persists lastCheckMs to a fresh config file", () => {
 test("recordAutomaticCheck merges into an existing config without disturbing other sections or the toggle", () => {
   const dir = mkdtempSync(join(tmpdir(), "botfleet-throttle-"));
   const configPath = join(dir, "config.json");
+  const nowMs = 1_700_000_000_456;
   try {
     writeFileSync(
       configPath,
@@ -357,13 +358,13 @@ test("recordAutomaticCheck merges into an existing config without disturbing oth
         autoUpdate: { enabled: false, lastCheckMs: 1_600_000_000_000, lastAppFingerprint: "old" },
       }),
     );
-    recordAutomaticCheck(configPath, { fingerprint: "new-fingerprint" });
+    recordAutomaticCheck(configPath, { fingerprint: "new-fingerprint", nowMs });
     const onDisk = JSON.parse(readFileSync(configPath, "utf8"));
     assert.deepEqual(onDisk.ingress, { publicUrl: "https://example.test/hook" });
     // Before this fix Electron wrote its own in-memory `enabled` here, so a
     // toggle the user had just switched off could flip back on.
     assert.equal(onDisk.autoUpdate.enabled, false);
-    assert.ok(onDisk.autoUpdate.lastCheckMs > 1_600_000_000_000);
+    assert.equal(onDisk.autoUpdate.lastCheckMs, nowMs);
     assert.equal(onDisk.autoUpdate.lastAppFingerprint, "new-fingerprint");
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -375,15 +376,18 @@ test("recordAutomaticCheck starts fresh when the config file is missing or unrea
   // A nested, not-yet-created directory -- recordAutomaticCheck must create
   // it rather than fail on a first launch that raced ahead of the harness.
   const configPath = join(dir, "nested", "deeper", "config.json");
+  const firstNow = 1_700_000_001_000;
+  const secondNow = 1_700_000_002_000;
   try {
-    recordAutomaticCheck(configPath, { fingerprint: null });
+    recordAutomaticCheck(configPath, { fingerprint: null, nowMs: firstNow });
     const onDisk = JSON.parse(readFileSync(configPath, "utf8"));
-    assert.equal(typeof onDisk.autoUpdate.lastCheckMs, "number");
+    assert.equal(onDisk.autoUpdate.lastCheckMs, firstNow);
     assert.equal("lastAppFingerprint" in onDisk.autoUpdate, false);
 
     writeFileSync(configPath, "{ this is not json");
-    recordAutomaticCheck(configPath, { fingerprint: "after-garbage" });
+    recordAutomaticCheck(configPath, { fingerprint: "after-garbage", nowMs: secondNow });
     const recovered = JSON.parse(readFileSync(configPath, "utf8"));
+    assert.equal(recovered.autoUpdate.lastCheckMs, secondNow);
     assert.equal(recovered.autoUpdate.lastAppFingerprint, "after-garbage");
   } finally {
     rmSync(dir, { recursive: true, force: true });
