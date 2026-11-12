@@ -295,7 +295,7 @@ export function CallTargetButton({
               : "text-ink-secondary hover:bg-raised hover:text-ink",
         )}
       >
-        {active ? <PhoneOff size={17} /> : <Phone size={17} />}
+        {active ? <PhoneOff size={17} aria-hidden="true" /> : <Phone size={17} aria-hidden="true" />}
         {unavailable && (
           <span className="absolute right-1 top-1 size-1.5 rounded-full bg-warning ring-2 ring-app" aria-hidden="true" />
         )}
