@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { parse } from "yaml";
+import { z } from "zod";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -63,8 +64,10 @@ test("weekly and ship crons stay schedule-only so a push cannot mark them ok", (
 });
 
 test("the reporter workflow runs for a successful main-branch catch-up", () => {
-  const workflow = parse(readFileSync(join(ROOT, ".github/workflows/sentry-ci-report.yml"), "utf8"));
-  const gate = String(workflow.jobs.report.if);
+  const workflow = z
+    .object({ jobs: z.object({ report: z.object({ if: z.string() }) }) })
+    .parse(parse(readFileSync(join(ROOT, ".github/workflows/sentry-ci-report.yml"), "utf8")));
+  const gate = workflow.jobs.report.if;
   assert.match(gate, /workflow_run\.event == 'schedule'/);
   assert.match(gate, /Vercel production catch-up/);
   assert.match(gate, /head_branch == 'main'/);

@@ -268,6 +268,15 @@ interface RoutineFile {
  * handling below, as they always had; a stricter test here would set aside a file an older build wrote. */
 const routineFileSchema = z.looseObject({ routines: z.array(z.unknown()).optional(), runs: z.array(z.unknown()).optional() });
 const routineEntrySchema = z.looseObject({ id: z.string().min(1) });
+/** The two fields the legacy monitor slug reads, parsed at the disk boundary.
+ * routineEntrySchema only requires an id, so a hand-edited or half-written
+ * routines.json can carry a routine with no name, or a run with no routineName
+ * or routineId.  Those slug as "routine" and "0" instead of throwing inside the
+ * constructor and failing the boot. */
+const legacySlugSourceSchema = z.object({
+  routineId: z.string().catch(""),
+  routineName: z.string().catch(""),
+});
 const isRoutineFile = (candidate: JsonValue): candidate is JsonValue & Partial<RoutineFile> =>
   routineFileSchema.safeParse(candidate).success;
 
@@ -640,7 +649,7 @@ export class RoutineManager {
       const stored = typeof routine.sentryMonitorSlug === "string" ? routine.sentryMonitorSlug.trim().toLowerCase() : "";
       const sentryMonitorSlug = isRoutineMonitorSlug(stored)
         ? stored
-        : legacyRoutineMonitorSlug({ routineId: routine.id, routineName: routine.name });
+        : legacyRoutineMonitorSlug(legacySlugSourceSchema.parse({ routineId: routine.id, routineName: routine.name }));
       if (sentryMonitorSlug !== routine.sentryMonitorSlug) slugMigrated = true;
       return { ...routine, runOn, sentryMonitorSlug };
     });
@@ -754,7 +763,7 @@ export class RoutineManager {
       if (run.triggerSource && run.triggerSource !== "schedule") continue;
       const historical = run.sentryMonitorSlug && isRoutineMonitorSlug(run.sentryMonitorSlug)
         ? run.sentryMonitorSlug
-        : legacyRoutineMonitorSlug(run);
+        : legacyRoutineMonitorSlug(legacySlugSourceSchema.parse(run));
       if (known.has(run.routineId) && historical === this.routines.find((routine) => routine.id === run.routineId)?.sentryMonitorSlug) {
         continue;
       }
@@ -1026,7 +1035,7 @@ export class RoutineManager {
     for (const run of cancelledRuns) this.emitRun(run);
     this.emitRoutine(routine);
     if (clean.name !== previousName && previousSlug) {
-      const oldLegacy = legacyRoutineMonitorSlug({ routineId: routine.id, routineName: previousName });
+      const oldLegacy = legacyRoutineMonitorSlug(legacySlugSourceSchema.parse({ routineId: routine.id, routineName: previousName }));
       // Release only a slug a schedule run actually opened.  A new routine's
       // id slug was never the name-based slug, so retiring that name would
       // create a monitor that Sentry has never seen.
@@ -1035,7 +1044,7 @@ export class RoutineManager {
         if (run.triggerSource && run.triggerSource !== "schedule") return false;
         const historical = run.sentryMonitorSlug && isRoutineMonitorSlug(run.sentryMonitorSlug)
           ? run.sentryMonitorSlug
-          : legacyRoutineMonitorSlug(run);
+          : legacyRoutineMonitorSlug(legacySlugSourceSchema.parse(run));
         return historical === oldLegacy;
       });
       if (used && oldLegacy !== routine.sentryMonitorSlug) this.options.releaseMonitor?.(oldLegacy);

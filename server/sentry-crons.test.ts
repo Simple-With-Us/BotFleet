@@ -11,6 +11,7 @@ import {
   awaitPendingCheckInCloses,
   checkInRoutineFinish,
   checkInRoutineStart,
+  isRoutineMonitorSlug,
   legacyRoutineMonitorSlug,
   releaseRoutineMonitor,
   resetSentryCronsForTests,
@@ -127,6 +128,21 @@ describe("routineMonitorSlug", () => {
     expect(slug.length).toBeLessThanOrEqual(50);
     expect(slug.endsWith("12345678")).toBe(false);
   });
+
+  it("accepts a legacy slug the 50-character slice ended on a hyphen", () => {
+    const slug = legacyRoutineMonitorSlug(run({
+      routineId: "12345678-aaaa-bbbb-cccc-ddddeeeeffff",
+      routineName: `${"a".repeat(40)} b`,
+    }));
+    expect(slug).toHaveLength(50);
+    expect(slug.endsWith("-")).toBe(true);
+    expect(isRoutineMonitorSlug(slug)).toBe(true);
+    expect(routineMonitorSlug(run({
+      routineId: "12345678-aaaa-bbbb-cccc-ddddeeeeffff",
+      routineName: "Renamed",
+      sentryMonitorSlug: slug,
+    }))).toBe(slug);
+  });
 });
 
 describe("routineMonitorConfig", () => {
@@ -228,6 +244,20 @@ describe("checkInRoutineStart / checkInRoutineFinish", () => {
       timezone: "UTC",
     });
     expect(releaseRoutineMonitor("not a slug")).toBe(false);
+  });
+
+  it("retires a slug again after a resumed routine checks in on it", async () => {
+    const checkIns = await activateFakeSentry();
+    const stored = "botfleet-spend-downs-slack-digest-1f8addcb";
+    expect(releaseRoutineMonitor(stored)).toBe(true);
+    expect(releaseRoutineMonitor(stored)).toBe(false);
+    checkInRoutineStart(run({ sentryMonitorSlug: stored }), routine());
+    expect(checkIns[1].checkIn).toMatchObject({ monitorSlug: stored, status: "in_progress" });
+    expect(releaseRoutineMonitor(stored)).toBe(true);
+    expect(checkIns[2].checkIn).toMatchObject({ monitorSlug: stored, status: "ok" });
+    expect(checkIns[2].monitorConfig).toMatchObject({
+      schedule: { type: "crontab", value: RETIRED_MONITOR_CRONTAB },
+    });
   });
 
   it("opens nothing for a one-off routine even with Sentry active", async () => {

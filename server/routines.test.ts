@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { z } from "zod";
 
 import type { RuntimeEvent } from "./contracts.ts";
 import type { BotDispatchState } from "../shared/bot-profile.ts";
@@ -9,6 +10,14 @@ import { BOT_OFF_SKIPPED } from "../shared/bot-power.ts";
 import { ROUTINE_ATTENTION_STATUSES } from "../shared/routine-outcomes.ts";
 import { wantsEphemeralDispatch } from "./ephemeral-dispatch.ts";
 import { BUSY_DEFER_NOTE, DEFAULT_WEBHOOK_HOT_DEFER_MS, nextOccurrence, RoutineManager, type RoutineManagerOptions, type RoutineRunOn, type RoutineSchedule } from "./routines.ts";
+
+/** routines.json as the manager wrote it, validated before a test reads a field. */
+const routinesOnDiskSchema = z.object({
+  routines: z.array(z.looseObject({ sentryMonitorSlug: z.string().optional() })),
+});
+function routinesOnDisk(file: string): z.infer<typeof routinesOnDiskSchema> {
+  return routinesOnDiskSchema.parse(JSON.parse(readFileSync(file, "utf8")));
+}
 
 type TurnCompletedEvent = Extract<RuntimeEvent, { type: "turn.completed" }>;
 
@@ -3032,10 +3041,50 @@ describe("bot on/off switch", () => {
       releaseMonitor: (slug) => released.push(slug),
     });
     restarted.flushNow();
-    const disk = JSON.parse(readFileSync(h.options.file!, "utf8"));
+    const disk = routinesOnDisk(h.options.file!);
     expect(disk.routines[0]?.sentryMonitorSlug).toBe("botfleet-mac-coolify-health-21-00-79c6c49d");
     expect(released).toEqual(["botfleet-mac-hetzner-health-21-00-79c6c49d"]);
     expect(restarted.listRoutines()[0]).not.toHaveProperty("sentryMonitorSlug");
+  });
+
+  it("loads a routine and run with no usable name instead of failing the monitor slug migration", () => {
+    const h = harness();
+    const id = "79c6c49d-1111-2222-3333-444444444444";
+    writeFileSync(h.options.file!, JSON.stringify({
+      routines: [{
+        id,
+        name: null,
+        prompt: "check the host",
+        botId: "sweeper",
+        runOn: "bot",
+        enabled: false,
+        schedule: { type: "daily", time: "21:00", weekdays: [0, 1, 2, 3, 4, 5, 6] },
+        durationMinutes: 30,
+        nextRunAt: 1,
+        createdAt: 1,
+        updatedAt: 1,
+      }],
+      runs: [{
+        id: "old-run",
+        routineId: "gone-routine",
+        botId: "sweeper",
+        runOn: "bot",
+        scheduledFor: 1,
+        status: "completed",
+        manual: false,
+        triggerSource: "schedule",
+        sentryCheckInId: "check-in-old",
+        createdAt: 1,
+      }],
+    }));
+    const released: string[] = [];
+    const restarted = new RoutineManager({
+      ...h.options,
+      releaseMonitor: (slug) => released.push(slug),
+    });
+    restarted.flushNow();
+    expect(routinesOnDisk(h.options.file!).routines[0]?.sentryMonitorSlug).toBe("botfleet-routine-79c6c49d");
+    expect(released).toEqual(["botfleet-routine-gonerout"]);
   });
 
   it("retires a deleted daily monitor only after a schedule check-in was opened", async () => {

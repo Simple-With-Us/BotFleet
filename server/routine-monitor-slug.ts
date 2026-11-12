@@ -31,9 +31,14 @@ export function stableRoutineMonitorSlug(routineId: string): string {
   return `botfleet-${id}`.slice(0, MONITOR_SLUG_MAX);
 }
 
-/** A slug this process is willing to send to Sentry. */
+/** A slug this process is willing to send to Sentry.
+ *
+ *  A trailing hyphen is allowed on purpose.  The legacy formula slices the
+ *  whole string to 50 characters, so a long routine name can end the slug on
+ *  a hyphen, and that exact string is the monitor Sentry already holds.
+ *  Rejecting it would leave that monitor on its daily crontab forever. */
 export function isRoutineMonitorSlug(slug: string): boolean {
-  return /^botfleet-[a-z0-9-]{1,41}$/.test(slug) && slug.length <= MONITOR_SLUG_MAX && !slug.endsWith("-");
+  return /^botfleet-[a-z0-9-]{1,41}$/.test(slug) && slug.length <= MONITOR_SLUG_MAX;
 }
 
 /** Slug for a check-in.  A slug stored on the run wins, so the start and the

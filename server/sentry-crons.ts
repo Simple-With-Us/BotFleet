@@ -53,7 +53,9 @@ interface SentryClientWithEvents {
   on: (event: string, cb: (envelope: SentryEnvelope) => void) => () => void;
 }
 
-/** Slugs already told to stop expecting a daily check-in during this process. */
+/** Slugs currently retired by this process.  A slug leaves the set again
+ *  when a real check-in opens on it (checkInRoutineStart), so a routine that
+ *  is resumed, runs, and is paused again is retired a second time. */
 const releasedMonitorSlugs = new Set<string>();
 
 /** Tell Sentry a slug is no longer a live schedule.
@@ -128,10 +130,15 @@ export function checkInRoutineStart(run: RoutineRun, routine: Routine): string |
   const monitorConfig = routineMonitorConfig(routine);
   if (!monitorConfig) return undefined;
   try {
+    const monitorSlug = routineMonitorSlug(run);
     const checkInId = sdk.captureCheckIn(
-      { monitorSlug: routineMonitorSlug(run), status: "in_progress" },
+      { monitorSlug, status: "in_progress" },
       monitorConfig,
     );
+    // The check-in just upserted this routine's live schedule onto the slug,
+    // so an earlier retirement no longer holds and a later pause or delete
+    // must be allowed to retire it again.
+    releasedMonitorSlugs.delete(monitorSlug);
     // The SDK fabricates a uuid when the client is missing or closed; never
     // store that as a real Crons check-in id on the run record.
     if (!checkInId || !isSentryActive()) return undefined;
