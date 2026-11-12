@@ -222,6 +222,24 @@ test("ios-ship.yml targets botfleet / ios on the GitHub-hosted xcode-27 image", 
   assert.doesNotMatch(prepare, /echo "\$IOS_CERT_P12/);
 });
 
+test("ios-ship.yml restores and saves ship state with run_attempt and drops stale lockdirs", () => {
+  const yml = read(".github/workflows/ios-ship.yml");
+  assert.match(yml, /uses: actions\/cache\/restore@/);
+  assert.match(yml, /uses: actions\/cache\/save@/);
+  assert.doesNotMatch(yml, /uses: actions\/cache@[^\n]*# v6\.1\.0/);
+  const shipJob = yml.slice(yml.indexOf("  ship:"), yml.indexOf("  report-sentry-deployment:"));
+  assert.equal(
+    (shipJob.match(/ios-fleet-botfleet-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/g) ?? []).length,
+    2,
+    "restore and save share one run_id+run_attempt key",
+  );
+  assert.match(shipJob, /restore-keys:\s*\|\s*\n\s*ios-fleet-botfleet-\$\{\{ github\.run_id \}\}-\s*\n\s*ios-fleet-botfleet-/);
+  assert.match(shipJob, /name: Clear stale ship-state lockdirs after cache restore/);
+  assert.match(shipJob, /name: Remove ship-state lockdirs before saving cache/);
+  assert.equal((shipJob.match(/\*\.lockdir/g) ?? []).length, 2, "both lockdir sweeps glob *.lockdir");
+  assert.match(shipJob, /name: Save iOS ship state[\s\S]*if: always\(\)/);
+});
+
 test("ios-ship.yml skips the unvendored icon audit only on the hosted ship step", () => {
   const yml = read(".github/workflows/ios-ship.yml");
   const shipStep = yml.slice(
