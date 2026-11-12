@@ -176,6 +176,17 @@ describe("timeline painting", () => {
     hl.dispose();
   });
 
+  it("does not lead into words that were never scheduled", () => {
+    const fake = fakeEnv();
+    const hl = createKaraokeHighlighter(mount("<p>alpha beta gamma delta</p>"), { env: fake.env });
+    hl.play([0, 100], () => 50);
+    hl.renderAt(50);
+    expect(fake.painted("current")).toEqual(["alpha"]);
+    expect(fake.painted("lead")).toEqual([]);
+    expect(fake.painted("leadFar")).toEqual([]);
+    hl.dispose();
+  });
+
   it("steps whole words with reduced motion, without trails or flashes", () => {
     const fake = fakeEnv();
     const hl = createKaraokeHighlighter(mount("<p>alpha beta gamma</p>"), { env: fake.env, reducedMotion: true });

@@ -192,7 +192,7 @@ public struct KaraokePlayhead: Sendable {
                 var ahead = c + 1
                 while ahead < words.count && leadLevel < leadWords {
                     defer { ahead += 1 }
-                    if timeline[2 * ahead] > t {
+                    if timeline[2 * ahead].isFinite && timeline[2 * ahead] > t {
                         frame.lead.append(KaraokeLeadWord(index: ahead, level: leadLevel))
                         leadLevel += 1
                     }

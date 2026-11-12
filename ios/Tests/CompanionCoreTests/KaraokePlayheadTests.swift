@@ -74,7 +74,9 @@ final class KaraokePlayheadTests: XCTestCase {
     func testAShortTimelineLeavesTheRestUnspoken() {
         var playhead = KaraokePlayhead(words: words, reducedMotion: false)
         playhead.setTimeline([0, 100])
-        XCTAssertEqual(playhead.frame(at: 50).current, 0)
+        let mid = playhead.frame(at: 50)
+        XCTAssertEqual(mid.current, 0)
+        XCTAssertEqual(mid.lead, [], "words with no start time are not a lead")
         XCTAssertEqual(playhead.frame(at: 5_000).current, -1)
         XCTAssertFalse(playhead.finished(at: 5_000))
     }

@@ -525,7 +525,7 @@ export function createKaraokeHighlighter(
     const leadIndexes: number[] = [];
     if (showWindow) {
       for (let i = c + 1; i < count && leadIndexes.length < leadWords; i += 1) {
-        if (timeline[2 * i] > t) leadIndexes.push(i);
+        if (Number.isFinite(timeline[2 * i]) && timeline[2 * i] > t) leadIndexes.push(i);
       }
     }
     const leadEnd = leadIndexes.length > 0 ? leadIndexes[leadIndexes.length - 1] + 1 : c + 1;
