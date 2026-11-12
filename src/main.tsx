@@ -24,6 +24,11 @@ if (globalThis.window && window.matchMedia) {
 const rootElement = document.getElementById("root")!;
 const fixtureParam =
   globalThis.window ? new URLSearchParams(window.location.search).get("fixture") : null;
+// Dev server and `vite build --mode test` only.  A production build constant-folds
+// this to false and drops the usage-grid harness chunk, so a packaged app cannot
+// mount it from /?fixture=usage-monitor-quota-grid.
+const usageMonitorQuotaGridFixture =
+  import.meta.env.DEV || import.meta.env.MODE === "test";
 
 if (fixtureParam === "tv-face") {
   // Visual-spec harness: dynamically import so the fixture chunk is not paid
@@ -443,9 +448,10 @@ if (fixtureParam === "tv-face") {
       </StrictMode>,
     );
   });
-} else if (fixtureParam === "usage-monitor-quota-grid") {
+} else if (usageMonitorQuotaGridFixture && fixtureParam === "usage-monitor-quota-grid") {
   // Visual-spec harness (tests/e2e/usage-monitor-quota-grid.visual.spec.ts):
   // Settings → Usage quota cells with plan metadata and reset countdowns.
+  // Compiled for dev and test builds only; production falls through to <App />.
   void import("./components/UsageMonitorQuotaGridVisualFixture").then((mod) => {
     const Fixture = mod.default;
     createRoot(rootElement).render(

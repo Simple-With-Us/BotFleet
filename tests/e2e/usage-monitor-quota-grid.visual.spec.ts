@@ -4,7 +4,10 @@ import { test, expect, type Locator, type Page } from '@playwright/test';
 // limits, and per-window reset countdowns.  The fixture mounts fixed windows
 // via /?fixture=usage-monitor-quota-grid&state=… (see
 // src/components/UsageMonitorQuotaGridVisualFixture.tsx), so nothing here
-// mocks a route.  Regenerate baselines with
+// mocks a route.  The hook is compiled only for `vite` and
+// `vite build --mode test`; a production bundle ignores the query.
+// Playwright previews that test-mode build.  Regenerate baselines with
+// `pnpm exec vite build --mode test` and then
 // `pnpm run e2e:update tests/e2e/usage-monitor-quota-grid.visual.spec.ts`.
 //
 // Reset countdowns are frozen with page.clock and masked on the snapshot so

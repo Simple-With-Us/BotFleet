@@ -166,7 +166,12 @@ jobs:
         run: pnpm check:electron
       - name: production UI build
         if: needs.changes.outputs.docs_only != 'true' && matrix.os == 'ubuntu-latest'
-        run: pnpm exec vite build
+        run: |
+          pnpm exec vite build
+          if grep -R --include='*.js' -F -q 'usage-grid-empty-placeholder' dist; then
+            echo 'production dist still contains the usage grid visual fixture' >&2
+            exit 1
+          fi
 
   control-plane:
     name: control-plane check + workerd tests + dry run
