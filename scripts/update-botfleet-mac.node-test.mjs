@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import assert from "node:assert/strict";
 import { chmod, copyFile, mkdtemp, mkdir, readFile, readdir, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -58,6 +59,18 @@ import {
   swapDependencyTree,
   parseHealthBody,
   pendingRecoveryReceiptPath,
+  LIVE_OK,
+  liveHealthMark,
+  sealedResourceRules,
+  inspectInstalledResourceDrift,
+  resourceDriftAction,
+  guardInstalledResources,
+  clearPendingRecoveryAfterLiveOk,
+  collectUpdateStatus,
+  renderUpdateStatus,
+  newestBackup,
+  recoverFromLatestBackup,
+  resourceBackupRoot,
   quiesceBootoutLabels,
   rollbackHarnessBootoutLabels,
   rollbackHarnessBootstrapPlists,
@@ -690,6 +703,16 @@ test("unquiesce ignores update targets and bootstraps the recovery from origin/m
     label: "main",
     args: ["unquiesce"],
   }, "unquiesce bootstraps origin/main's updater and stays option-free");
+
+  for (const command of ["status", "recover"]) {
+    await rm(marker, { force: true });
+    const local = await run("bash", [wrapper, command], { env, allowFailure: true });
+    assert.equal(local.code, 0, `${command} recovers from origin/main: ${local.stderr}`);
+    assert.deepEqual(JSON.parse(await readFile(marker, "utf8")), {
+      label: "main",
+      args: [command],
+    }, `${command} bootstraps origin/main's updater and stays option-free`);
+  }
 
   // The same env target still gates a plain update run.
   await rm(marker, { force: true });
@@ -2763,6 +2786,8 @@ test("an explicit target, apply, unquiesce and imported sources are never second
     { args: [], env: { BOTFLEET_UPDATE_TARGET: "origin/main" }, expected: { label: "tip", args: ["--target", tip], hint: null } },
     { args: [], env: { BOTFLEET_UPDATE_TARGET: "origin/main~1" }, expected: { label: "older", args: ["--target", older], hint: null } },
     { args: ["unquiesce"], expected: { label: "tip", args: ["unquiesce"], hint: null } },
+    { args: ["status"], expected: { label: "tip", args: ["status"], hint: null } },
+    { args: ["recover"], expected: { label: "tip", args: ["recover"], hint: null } },
     { args: ["apply", "--stage", stage], expected: { label: "tip", args: ["apply", "--stage", stage], hint: null } },
     { args: ["--source", fixture], expected: { label: "tip", args: ["--source", fixture, "--target", tip], hint: null } },
     { args: ["--help"], expected: { label: "tip", args: ["--help", "--target", tip], hint: null } },
@@ -2809,7 +2834,7 @@ test("the selection runs after the tip is fetched and before anything is archive
   assert.ok(ancestry > chosen && archive > ancestry, "a chosen commit meets the same origin/main ancestry rule before its updater is archived");
   // Only a plain update or prepare with no target of any kind is eligible.
   assert.match(source, /if \[\[ "\$HAS_BOOTSTRAP_TARGET" == "0" && -z "\$\{BOTFLEET_UPDATE_TARGET:-\}" \]\]; then/);
-  assert.match(source, /apply\|unquiesce\) ;;/);
+  assert.match(source, /apply\|unquiesce\|status\|recover\) ;;/);
   // Nothing new is passed to the updater as an argument: the chosen commit may
   // predate this feature, and an unknown option would stop it.
   assert.doesNotMatch(source, /PINNED_ARGS\+=\(--(?!target)/);
@@ -3905,4 +3930,265 @@ test("deployStoreReleaseIfBacked fails closed unprepared: zero install, zero sta
     "a null previous is still a refusal, not a silent prepare",
   );
   assert.equal(await realpath(join(home, ".botfleet", "current")), await realpath(oldRoot), "the serving release is untouched");
+});
+
+function sha256Base64(bytes) {
+  return createHash("sha256").update(bytes).digest("base64");
+}
+
+function resourceSeal(rules) {
+  const body = rules.map((rule) => {
+    if (rule.symlink !== undefined) {
+      return `<key>${rule.path}</key><dict><key>symlink</key><string>${rule.symlink}</string></dict>`;
+    }
+    return `<key>${rule.path}</key><dict><key>hash2</key><data>${rule.hash2}</data></dict>`;
+  }).join("");
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>files2</key><dict>${body}</dict></dict></plist>
+`;
+}
+
+async function writeSealedApp(root, { commit, note = "sealed\n" } = {}) {
+  const app = join(root, "BotFleet.app");
+  const resources = join(app, "Contents", "Resources", "server");
+  await mkdir(resources, { recursive: true });
+  const identity = `${JSON.stringify({ sourceCommit: commit, version: "0.1.0", build: "202611120028" })}\n`;
+  await writeFile(join(resources, "build-identity.json"), identity);
+  await writeFile(join(resources, "note.txt"), note);
+  await symlink("note.txt", join(resources, "link"));
+  const seal = resourceSeal([
+    { path: "Resources/server/build-identity.json", hash2: sha256Base64(identity) },
+    { path: "Resources/server/note.txt", hash2: sha256Base64(note) },
+    { path: "Resources/server/link", symlink: "note.txt" },
+  ]);
+  await mkdir(join(app, "Contents", "_CodeSignature"), { recursive: true });
+  await writeFile(join(app, "Contents", "_CodeSignature", "CodeResources"), seal);
+  return app;
+}
+
+test("status and recover accept no options, and a clean Resources tree is not drift", async () => {
+  assert.equal(parseArguments(["status"]).command, "status");
+  assert.equal(parseArguments(["recover"]).command, "recover");
+  assert.throws(() => parseArguments(["status", "--force"]), /status accepts no options/);
+  assert.throws(() => parseArguments(["recover", "--stage", "/tmp/stage"]), /recover accepts no options/);
+  assert.equal(liveHealthMark({ safe: true, health: [{ kind: "botfleet", pid: 1 }] }), LIVE_OK);
+  assert.equal(liveHealthMark({ safe: false, health: [{ kind: "botfleet", pid: 1 }] }), "not-live");
+  assert.equal(sealedResourceRules("not a plist"), null);
+  assert.equal(sealedResourceRules("<plist version=\"1.0\"><dict></dict></plist>"), null);
+
+  const root = await mkdtemp(join(tmpdir(), "ubf-resources-"));
+  const app = await writeSealedApp(root, { commit: "a".repeat(40) });
+  const clean = await inspectInstalledResourceDrift(app);
+  assert.equal(clean.checked, true);
+  assert.deepEqual(clean.findings, []);
+  assert.equal(resourceDriftAction({ updateApp: true, force: false, drift: clean }), "skip");
+
+  await writeFile(join(app, "Contents", "Resources", ".DS_Store"), "finder\n");
+  const noise = await inspectInstalledResourceDrift(app);
+  assert.deepEqual(noise.findings, [], "Finder metadata is not a local Resources change");
+
+  await writeFile(join(app, "Contents", "Resources", "server", "note.txt"), "edited\n");
+  await writeFile(join(app, "Contents", "Resources", "server", "extra.txt"), "leftover\n");
+  const helper = join(app, "Contents", "Resources", "BotFleet Recorder.app", "Contents", "MacOS");
+  await mkdir(helper, { recursive: true });
+  await writeFile(join(helper, "recorder-helper"), "helper\n");
+  const sealedHelper = await inspectInstalledResourceDrift(app);
+  assert.ok(sealedHelper.findings.some((item) => item.path.endsWith("recorder-helper") && item.reason === "leftover"));
+  const sealPath = join(app, "Contents", "_CodeSignature", "CodeResources");
+  const seal = await readFile(sealPath, "utf8");
+  await writeFile(sealPath, seal.replace(
+    "<key>files2</key><dict>",
+    "<key>files2</key><dict><key>Resources/BotFleet Recorder.app</key><dict><key>cdhash</key><data>qqqqqqqqqqqqqqqqqqqqqqqqqqq=</data></dict>",
+  ));
+  const nested = await inspectInstalledResourceDrift(app);
+  assert.ok(!nested.findings.some((item) => item.path.includes("BotFleet Recorder.app")), "a cdhash helper is not leftover drift");
+  const dirty = await inspectInstalledResourceDrift(app);
+  assert.deepEqual(dirty.findings.map((item) => item.reason), ["leftover", "modified"]);
+  const updates = join(root, "updates");
+  await assert.rejects(
+    guardInstalledResources({ appPath: app, updatesDirectory: updates, updateApp: true, force: false }),
+    (error) => {
+      assert.equal(error.name, "UpdateRefusedError");
+      assert.match(error.message, /Re-run with --force/);
+      assert.match(error.message, /Resources\/server\/extra\.txt/);
+      assert.match(error.message, /Resources\/server\/note\.txt/);
+      return true;
+    },
+  );
+  assert.equal(resourceDriftAction({ updateApp: false, force: false, drift: dirty }), "skip");
+  const forced = await guardInstalledResources({
+    appPath: app,
+    updatesDirectory: updates,
+    updateApp: true,
+    force: true,
+    now: new Date("2026-11-12T06:28:00.000Z"),
+  });
+  assert.equal(forced.skipSealVerify, true);
+  const manifest = JSON.parse(await readFile(join(forced.backupPath, "manifest.json"), "utf8"));
+  assert.equal(manifest.kind, "resources");
+  assert.equal(await readFile(join(forced.backupPath, "Resources", "server", "extra.txt"), "utf8"), "leftover\n");
+  assert.equal(await readFile(join(app, "Contents", "Resources", "server", "extra.txt"), "utf8"), "leftover\n");
+  await rm(root, { recursive: true, force: true });
+});
+
+test("pending-recovery markers clear only after live-ok", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ubf-recovery-"));
+  const receipt = join(root, "stage", "pending-recovery.json");
+  await mkdir(dirname(receipt), { recursive: true });
+  await writeFile(receipt, "{\"status\":\"pending-recovery\"}\n");
+  assert.deepEqual(await clearPendingRecoveryAfterLiveOk({ updatesDirectory: root, liveMark: "not-live" }), []);
+  assert.equal(await readFile(receipt, "utf8"), "{\"status\":\"pending-recovery\"}\n");
+  const cleared = await clearPendingRecoveryAfterLiveOk({ updatesDirectory: root, liveMark: LIVE_OK });
+  assert.deepEqual(cleared, [receipt]);
+  assert.equal(await readFile(receipt, "utf8").catch(() => null), null);
+  assert.deepEqual(await clearPendingRecoveryAfterLiveOk({ updatesDirectory: root, liveMark: LIVE_OK }), []);
+  await rm(root, { recursive: true, force: true });
+});
+
+test("status reports the install, stage, recovery, backups and last result", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ubf-status-"));
+  const app = await writeSealedApp(join(root, "Applications"), { commit: "a".repeat(40) });
+  const updates = join(root, "updates");
+  const stage = join(updates, "staged");
+  await mkdir(stage, { recursive: true });
+  await writeFile(join(stage, "prepared.json"), JSON.stringify({
+    sourceCommit: "b".repeat(40),
+    version: "0.1.0",
+    createdAt: "2026-11-12T05:00:00.000Z",
+  }));
+  await writeFile(join(stage, "pending-recovery.json"), JSON.stringify({ reason: "work still running" }));
+  const backup = join(resourceBackupRoot(updates), "1");
+  await mkdir(backup, { recursive: true });
+  await writeFile(join(backup, "manifest.json"), JSON.stringify({
+    schemaVersion: 1,
+    kind: "resources",
+    createdAt: "2026-11-12T04:00:00.000Z",
+    findings: [{ path: "Resources/server/extra.txt", reason: "leftover" }],
+  }));
+  const rollback = join(root, "Applications", `.BotFleet.rollback-1-${"c".repeat(12)}.app`);
+  await writeSealedApp(join(root, "Applications", "rollback-holder"), { commit: "c".repeat(40) });
+  await rename(join(root, "Applications", "rollback-holder", "BotFleet.app"), rollback);
+  await writeFile(`${rollback}.json`, JSON.stringify({
+    schemaVersion: 1,
+    previousCommit: "c".repeat(40),
+    previousInstalledCommit: "c".repeat(40),
+    replacementCommit: "a".repeat(40),
+    rollbackBundle: rollback,
+    rollbackDependencies: join(root, "node_modules.rollback"),
+    installedAt: "2026-11-12T03:00:00.000Z",
+    appPath: app,
+    status: "verified",
+  }));
+  await writeFile(join(updates, "last-result.json"), JSON.stringify({
+    schemaVersion: 1,
+    outcome: "verified",
+    live: LIVE_OK,
+    message: "Updated BotFleet to bbbbbbbbbbbb.",
+  }));
+  const config = { appPath: app, updatesDirectory: updates, checkout: join(root, "checkout"), lockDirectory: join(root, "lock") };
+  const status = await collectUpdateStatus(config);
+  const text = renderUpdateStatus(status);
+  assert.match(text, /Installed: 0\.1\.0 build 202611120028 \(aaaaaaaaaaaa\)/);
+  assert.match(text, new RegExp(`Staged update: ${stage} bbbbbbbbbbbb`));
+  assert.match(text, /Pending recovery: .*pending-recovery\.json \(work still running\)/);
+  assert.match(text, /Backup: .* \(1 files\)/);
+  assert.match(text, new RegExp(`Backup: ${rollback.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+  assert.match(text, /Last result: verified live-ok Updated BotFleet to bbbbbbbbbbbb\./);
+  assert.equal(newestBackup(status.backups).kind, "resources");
+  await rm(root, { recursive: true, force: true });
+});
+
+test("recover restores the newest backup and does nothing the second time", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ubf-recover-"));
+  const applications = join(root, "Applications");
+  const app = await writeSealedApp(applications, { commit: "a".repeat(40) });
+  const updates = join(root, "updates");
+  await mkdir(updates, { recursive: true });
+  const rollbackHolder = join(root, "rollback-src");
+  const rollbackApp = await writeSealedApp(rollbackHolder, { commit: "b".repeat(40) });
+  const rollback = join(applications, `.BotFleet.rollback-9-${"b".repeat(12)}.app`);
+  await rename(rollbackApp, rollback);
+  await writeFile(`${rollback}.json`, JSON.stringify({
+    schemaVersion: 1,
+    previousCommit: "b".repeat(40),
+    previousInstalledCommit: "b".repeat(40),
+    replacementCommit: "a".repeat(40),
+    rollbackBundle: rollback,
+    rollbackDependencies: join(root, "deps"),
+    installedAt: "2026-11-12T02:00:00.000Z",
+    appPath: app,
+    status: "verified",
+  }));
+  const config = { appPath: app, updatesDirectory: updates, checkout: join(root, "checkout"), lockDirectory: join(root, "lock") };
+  const busy = await recoverFromLatestBackup(config, { holders: async () => [42] }).then(() => null, (error) => error);
+  assert.match(busy.message, /still running \(pid 42\)/);
+  assert.match(busy.message, /Quit it before ubf recover/);
+  assert.equal(JSON.parse(await readFile(join(app, "Contents", "Resources", "server", "build-identity.json"), "utf8")).sourceCommit, "a".repeat(40));
+
+  const first = await recoverFromLatestBackup(config, { holders: async () => [] });
+  assert.equal(first.restored, true);
+  assert.equal(JSON.parse(await readFile(join(app, "Contents", "Resources", "server", "build-identity.json"), "utf8")).sourceCommit, "b".repeat(40));
+  assert.equal(JSON.parse(await readFile(join(rollback, "Contents", "Resources", "server", "build-identity.json"), "utf8")).sourceCommit, "b".repeat(40));
+  const second = await recoverFromLatestBackup(config, { holders: async () => [99] });
+  assert.equal(second.restored, false);
+  assert.equal(second.reason, "already");
+
+  const resourceRoot = await mkdtemp(join(tmpdir(), "ubf-recover-files-"));
+  const resourceApp = await writeSealedApp(join(resourceRoot, "Applications"), { commit: "c".repeat(40) });
+  const resourceUpdates = join(resourceRoot, "updates");
+  const resourceBackup = join(resourceBackupRoot(resourceUpdates), "9");
+  await mkdir(join(resourceBackup, "Resources", "server"), { recursive: true });
+  await writeFile(join(resourceBackup, "Resources", "server", "extra.txt"), "kept\n");
+  await writeFile(join(resourceBackup, "manifest.json"), JSON.stringify({
+    schemaVersion: 1,
+    kind: "resources",
+    createdAt: "2026-11-12T07:00:00.000Z",
+    findings: [{ path: "Resources/server/extra.txt", reason: "leftover" }],
+  }));
+  const resourceConfig = {
+    appPath: resourceApp,
+    updatesDirectory: resourceUpdates,
+    checkout: join(resourceRoot, "checkout"),
+    lockDirectory: join(resourceRoot, "lock"),
+  };
+  const restored = await recoverFromLatestBackup(resourceConfig, { holders: async () => [] });
+  assert.equal(restored.restored, true);
+  assert.equal(await readFile(join(resourceApp, "Contents", "Resources", "server", "extra.txt"), "utf8"), "kept\n");
+  assert.equal(await readFile(join(resourceBackup, "Resources", "server", "extra.txt"), "utf8"), "kept\n");
+  const repeated = await recoverFromLatestBackup(resourceConfig, { holders: async () => [7] });
+  assert.equal(repeated.reason, "already");
+  const none = await recoverFromLatestBackup({
+    appPath: join(resourceRoot, "missing", "BotFleet.app"),
+    updatesDirectory: join(resourceRoot, "empty-updates"),
+    checkout: join(resourceRoot, "checkout"),
+    lockDirectory: join(resourceRoot, "lock"),
+  });
+  assert.equal(none.reason, "none");
+  await rm(root, { recursive: true, force: true });
+  await rm(resourceRoot, { recursive: true, force: true });
+});
+
+test("ubf status prints the fixture and does not require a target", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ubf-status-cli-"));
+  const app = await writeSealedApp(join(root, "Applications"), { commit: "d".repeat(40) });
+  const updater = join(scripts, "update-botfleet-mac.mjs");
+  const result = await run(process.execPath, [updater, "status"], {
+    env: {
+      BOTFLEET_UPDATE_ALLOW_NON_DARWIN: "1",
+      BOTFLEET_APP_PATH: app,
+      BOTFLEET_UPDATE_ROOT: join(root, "updates"),
+      BOTFLEET_UPDATE_LOCK: join(root, "lock"),
+      BOTFLEET_CHECKOUT: join(root, "checkout"),
+      BOTFLEET_DATA_DIR: join(root, "data"),
+    },
+    allowFailure: true,
+  });
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /BotFleet updater status/);
+  assert.match(result.stdout, /Installed: 0\.1\.0 build 202611120028 \(dddddddddddd\)/);
+  assert.match(result.stdout, /Staged update: none/);
+  assert.match(result.stdout, /Pending recovery: none/);
+  assert.match(result.stdout, /Last result: none/);
+  await rm(root, { recursive: true, force: true });
 });
