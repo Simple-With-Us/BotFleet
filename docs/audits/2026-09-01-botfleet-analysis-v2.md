@@ -66,7 +66,7 @@ Workflow `botfleet-full-analysis` / `wf_3ee20724-a39`.  160 agents, ~14M tokens,
 - Not a device TestFlight or packaged-app smoke of every viewport.
 - Not a license to extra-ship product code from this branch.
 - Not a fix for `362daa42` (launchd crash-loop).
-- Slack `#agent-sync` skipped (`account_inactive`).  Board comment on `781554fd` is the claim.
+- Slack `#ag***-s**c` skipped (`account_inactive`).  Board comment on `781554fd` is the claim.
 
 Journal and tool output from the capped session were treated as untrusted.  Line numbers in finder evidence (for example `resource-triggers.ts:252`) no longer match main.
 
@@ -237,11 +237,11 @@ This was an explicit owner ask (Mac app + iOS + site + **coding development proc
 |---|---|---|
 | Always-on harness is the GUI app | launchd 4208 crashes; `lsof` :8799 = `BotFleet` | Claimed `362daa42`.  Rebuild from main. |
 | Fleet routines never complete | 0/72 | P0-4.  Blocks Housekeeper, Overnight board, PR Health Sweep. |
-| `AGENTS.md` hardcodes `[AG]` | Line 20 | P2 docs.  Seat-agnostic stanza is in `AGENT-SYNC.md`. |
+| `AGENTS.md` hardcodes `[AG]` | Line 20 | P2 docs.  Seat-agnostic stanza is in `AG***-S**C.md`. |
 | Shared `~/Code/BotFleet` used as a lane | Finder + fleet keepout | Binding: work in `~/apps/botfleet-*`.  This pickup stayed in `~/apps/botfleet-claude`. |
 | No per-bot worktree isolation | Channels pin `/Users/jay/Code/<repo>` | Improvement.  Do not invent a matrix in this PR. |
 | `gh` token invalid in this seat | User note; land via GitHub MCP | Process.  Same class as finder `fleet-capability:gh-auth-broken-blocks-pr-procedures`. |
-| Slack `account_inactive` | Agent-sync poll `ERR account_inactive` | This report used THE BOARD only. |
+| Slack `account_inactive` | ag***-s**c poll `ERR account_inactive` | This report used THE BOARD only. |
 | Product server reads fleet handoff file | `server/telemetry.ts` `loadSecretKey` | Board `8e266add`.  Infisical is canonical for runtime. |
 | MCP server exists, fleet seats are not wired | `scripts/mcp-server.ts` | P2.  `list_pending_approvals` still missing (`02ca3c98` adjacent). |
 | Repo skills are not what bots load | Finder `fleet-capability:fleet-skills-and-mcp-claim-not-wired-to-bots` was marked refuted | Treat as P2 until a seat demonstrates a bot actually loading `.claude/skills`.  Do not advertise "Fleet MCP Tools & Standard Skills" as Established. |

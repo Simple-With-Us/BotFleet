@@ -67,7 +67,7 @@ Verdict key: **Concur** (true as written), **Partial** (true in part; correction
 | Table 11: "Active Telemetry" hardcoded | Concur → claimed fixed in #95 | |
 | Table 11: README relationship circular | Concur → fixed in #95 | |
 | Section 2, "Board returned 401 from this seat" | Concur | The Mac's `gh` credential is also invalid (env token and keyring), which the docx did not note; it blocks `sync-status.mjs`, land-lane, and any bot that shells out to `gh`. |
-| Section 15, "Branch prefix from fleet-apps.json" | **Cannot verify** | No `fleet-apps.json` exists under `/Users/jay/apps` or `ai-fleet-coordinator`; seat prefixes are defined in `AGENT-SYNC.md`. |
+| Section 15, "Branch prefix from fleet-apps.json" | **Cannot verify** | No `fleet-apps.json` exists under `/Users/jay/apps` or `ai-fleet-coordinator`; seat prefixes are defined in `AG***-S**C.md`. |
 
 ### 17.3  Claims The Delta Audit Missed (New On Sep 1-2)
 

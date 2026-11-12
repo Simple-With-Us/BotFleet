@@ -3512,7 +3512,7 @@ async function startTurn(
     `You are BF-${bot.name} (display: ${bot.name}), a bot in BotFleet. Always identify yourself as BF-${bot.name} in fleet communications and logs.`,
     bot.title && `Role: ${bot.title}.`,
     bot.description && `About: ${bot.description}`,
-    `Slack communication rules: Use Slack channel #agent-sync sparingly — ONLY to claim/unclaim tasks on the shared board or for strictly necessary coordination with external agents outside BotFleet. Never post unprompted status spam or routine commentary to Slack.`,
+    `Slack communication rules: Use Slack channel #ag***-s**c sparingly — ONLY to claim/unclaim tasks on the shared board or for strictly necessary coordination with external agents outside BotFleet. Never post unprompted status spam or routine commentary to Slack.`,
     IMESSAGE_PERSONA_RULE,
     isImessageTask && `iMessage communication rule: When replying in this iMessage thread, be concise, direct, and action-oriented. Do not leave out key details, but avoid verbose fluff, unnecessary conversational padding, or multi-paragraph meta commentary. Provide clear, direct summaries.`,
   ]
@@ -5454,7 +5454,7 @@ async function runGroupMemberTurn(
     `You are BF-${bot.name} (display: ${bot.name}), a bot in the room "${group.name}" in BotFleet. Always identify yourself as BF-${bot.name} in fleet communications and logs.`,
     bot.title && `Role: ${bot.title}.`,
     bot.description && `About: ${bot.description}`,
-    `Slack communication rules: Use Slack channel #agent-sync sparingly — ONLY to claim/unclaim tasks on the shared board or for strictly necessary coordination with external agents outside BotFleet. Never post unprompted status spam or routine commentary to Slack.`,
+    `Slack communication rules: Use Slack channel #ag***-s**c sparingly — ONLY to claim/unclaim tasks on the shared board or for strictly necessary coordination with external agents outside BotFleet. Never post unprompted status spam or routine commentary to Slack.`,
     `Room members: ${roster}, and ${userName} (the human).`,
     group.bulletin.trim() && `Room bulletin (shared instructions for everyone):\n${group.bulletin.trim()}`,
     group.extraCwds?.length &&

@@ -35,4 +35,4 @@ Manual deploy fallback: `vercel deploy --prod` from `apps/site` (project `botfle
 
 ## Coordination
 
-Fleet coordination happens on THE BOARD and #agent-sync per the maintainer's `AGENT-SYNC.md`.  This directory mirrors its effort rows in `docs/EFFORT-LOG.md`.
+Fleet coordination happens on THE BOARD and #ag***-s**c per the maintainer's `AG***-S**C.md`.  This directory mirrors its effort rows in `docs/EFFORT-LOG.md`.

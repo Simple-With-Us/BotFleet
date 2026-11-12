@@ -88,7 +88,7 @@ Do not pass a packed markdown blob.  If you use the plain-body MD path, put a bl
 
 Do Notes: plans, design docs, reviews, handoffs, rollouts, **Completion / work-complete** for anything the owner might ask about.
 
-Skip: pure `#agent-sync` chatter, effort-board row edits, routine commit messages, peer-only PR nits.
+Skip: pure `#ag***-s**c` chatter, effort-board row edits, routine commit messages, peer-only PR nits.
 
 Open a living work note when substantial work starts.  Always Completion at the end.  Update in place; unpin stale Completion notes when the lane closes (`--unpin-only`).
 
@@ -96,7 +96,7 @@ Background-jobs inventory note is `⭐️ Background Jobs Master List` — refre
 
 ## Canon
 
-- `/Users/jay/apps/AGENT-SYNC.md` § Apple Notes
+- `/Users/jay/apps/AG***-S**C.md` § Apple Notes
 - Skills: `closeout`, `owner-copy`
 
 ### Handoff Reports (Immediate & Living)

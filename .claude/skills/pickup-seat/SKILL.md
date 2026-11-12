@@ -33,7 +33,7 @@ git worktree list
 
 git for-each-ref --sort=-committerdate refs/remotes/origin --format='%(committerdate:short) %(refname:short) %(authorname)' | head -30
 
-AGENT_TAG="${AGENT_SEAT:?set MONET, CLAUDE, or RENOIR}" /usr/bin/python3 /Users/jay/apps/agent-sync-poll.py
+AGENT_TAG="${AGENT_SEAT:?set MONET, CLAUDE, or RENOIR}" /usr/bin/python3 /Users/jay/apps/ag***-s**c-poll.py
 ```
 
 Also read their last Slack claim and any living Apple Note titled `[APP, <Seat>] …`.
@@ -43,7 +43,7 @@ Also read their last Slack claim and any living Apple Note titled `[APP, <Seat>]
 Post repo-first, naming exactly what you are taking:
 
 ```bash
-AGENT_TAG="${AGENT_SEAT:?set MONET, CLAUDE, or RENOIR}" /Users/jay/apps/agent-sync-websocket.py --post "[MONET-><SEAT>] sync-1
+AGENT_TAG="${AGENT_SEAT:?set MONET, CLAUDE, or RENOIR}" /Users/jay/apps/ag***-s**c-websocket.py --post "[MONET-><SEAT>] sync-1
 repo: <project>
 claim: picking up <SEAT> cap — effort + PR #<n>
 state: WIP
@@ -95,14 +95,14 @@ Answer disambiguation pings fast.  Cede lanes the returning seat re-claims, espe
 
 ## Canon
 
-- `/Users/jay/apps/AGENT-SYNC.md` — handoff, seats, Mac local processes
+- `/Users/jay/apps/AG***-S**C.md` — handoff, seats, Mac local processes
 - `/Users/jay/apps/EFFORT-LOG-PROTOCOL.md`
 - Skills: `session-start`, `board-ops`, `land-lane`, `unstick-pr`, `closeout`
 
 ## Substitute Agent Direct Slack Closeout `[SUB->ORIGINAL]`
 
 Once you finish taking over a peer agent's work (or reach a clean handoff point):
-1. **Send Direct Slack Message:** Post directly to `#agent-sync` addressed to the original agent:
+1. **Send Direct Slack Message:** Post directly to `#ag***-s**c` addressed to the original agent:
    ```text
    [<YOUR_TAG>-><ORIGINAL_TAG>]
    repo: <repo>

@@ -71,6 +71,6 @@ The board is the **write surface**.  Live `~/apps/*-EFFORT-LOG.md` and GitHub Is
 
 ## Canon
 
-- `/Users/jay/apps/AGENT-SYNC.md` § THE BOARD
+- `/Users/jay/apps/AG***-S**C.md` § THE BOARD
 - `/Users/jay/apps/EFFORT-LOG-PROTOCOL.md`
 - `board --help` / `board file --help`

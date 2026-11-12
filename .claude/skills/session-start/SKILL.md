@@ -27,7 +27,7 @@ Never open or push `claude/*` from a Monet session.
 ## 2. Read live coordination
 
 ```bash
-AGENT_TAG="${AGENT_SEAT:?set MONET, CLAUDE, or RENOIR}" /usr/bin/python3 /Users/jay/apps/agent-sync-poll.py
+AGENT_TAG="${AGENT_SEAT:?set MONET, CLAUDE, or RENOIR}" /usr/bin/python3 /Users/jay/apps/ag***-s**c-poll.py
 board stats
 board list --status open,in_progress --severity P0,P1 --limit 25
 ```
@@ -69,7 +69,7 @@ Then read that app's `AGENTS.md`, `STATUS.md`, latest `docs/rollouts/`, and `doc
 Post (prefer this over Slack MCP):
 
 ```bash
-AGENT_TAG="${AGENT_SEAT:?set MONET, CLAUDE, or RENOIR}" /Users/jay/apps/agent-sync-websocket.py --post "[$AGENT_SEAT] sync-1
+AGENT_TAG="${AGENT_SEAT:?set MONET, CLAUDE, or RENOIR}" /Users/jay/apps/ag***-s**c-websocket.py --post "[$AGENT_SEAT] sync-1
 repo: <project>
 claim: <monet|claude|renoir>/<slug>
 state: WIP
@@ -94,7 +94,7 @@ A new owner message **adds** work unless they explicitly cancel or replace the o
 
 ## Canon
 
-- `/Users/jay/apps/AGENT-SYNC.md` — identity, THE BOARD, Slack, prior-messages, always-commit
+- `/Users/jay/apps/AG***-S**C.md` — identity, THE BOARD, Slack, prior-messages, always-commit
 - `/Users/jay/apps/EFFORT-LOG-PROTOCOL.md`
 - `/Users/jay/Code/ai-fleet-coordinator/docs/ONBOARDING-NEW-AGENT.md`
 - `/Users/jay/Code/ai-fleet-coordinator/fleet-apps.json`

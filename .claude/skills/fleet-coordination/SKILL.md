@@ -12,8 +12,8 @@ description: Comprehensive master skill for multi-agent fleet operations across 
 > Cursor, Grok, Grok Bot, Codex, AG, DeepSeek, Kimi, and Fx have their own skill dirs and must not take identity from here.
 
 
-Canonical reference: `/Users/jay/apps/AGENT-SYNC.md` and `/Users/jay/apps/EFFORT-LOG-PROTOCOL.md`.  
-Slack Coordination Channel: `#agent-sync` (`C0BEZDJDNKV`).
+Canonical reference: `/Users/jay/apps/AG***-S**C.md` and `/Users/jay/apps/EFFORT-LOG-PROTOCOL.md`.  
+Slack Coordination Channel: `#ag***-s**c` (`C0BEZDJDNKV`).
 
 This skill governs how autonomous AI agents collaborate across the entire application fleet (Socratic.Trade, Congress.Trade, Usage-Monitor, congress-trading-shared, DealDex, Personal-Site, Autorotate, ContactLogo, and ai-fleet-coordinator).
 
@@ -21,7 +21,7 @@ This skill governs how autonomous AI agents collaborate across the entire applic
 
 ## Canonical Fleet App Acronyms
 
-Use these canonical acronyms in Apple Notes titles (`[APP, Agent] topic`), commit messages, PRs, and Slack `#agent-sync` communications:
+Use these canonical acronyms in Apple Notes titles (`[APP, Agent] topic`), commit messages, PRs, and Slack `#ag***-s**c` communications:
 
 | Acronym | App / Scope | Repository |
 | :--- | :--- | :--- |
@@ -60,7 +60,7 @@ Every agent session must start with systematic orientation before touching code:
 
 2. **Poll Coordination Channel:**
    ```bash
-   AGENT_TAG=<YOUR_TAG> /usr/bin/python3 /Users/jay/apps/agent-sync-poll.py
+   AGENT_TAG=<YOUR_TAG> /usr/bin/python3 /Users/jay/apps/ag***-s**c-poll.py
    ```
    Skim for your agent tag or repositories you plan to touch.  Grok Bot seats also full-read `[SENDER->FLEET]` (every GB seat must spend time).  Coordinator self-id is `AFL`, not `FLEET`.
 
@@ -93,7 +93,7 @@ Before starting substantial work, reserve your lane across three durable surface
    - Live boards are branch-neutral and canonical.  Mirror your update to `docs/EFFORT-LOG.md` in the repo before committing.
 2. **GitHub Issue:**
    - Link your branch to the corresponding GitHub Issue or create one.
-3. **Slack Channel `#agent-sync`:**
+3. **Slack Channel `#ag***-s**c`:**
    Post a standardized claim header:
    ```text
    [<YOUR_TAG>] sync-1
@@ -193,7 +193,7 @@ Once PR merges to `main`:
 2. **Triple Closeout:**
    - Effort board: Update row to **Deployed** (or **Completed**) with live verification note.
    - GitHub Issue: Close issue.
-   - Slack `#agent-sync`: Post `[<YOUR_TAG>] closeout` with deployed status and health check results.
+   - Slack `#ag***-s**c`: Post `[<YOUR_TAG>] closeout` with deployed status and health check results.
    - Apple Note: Add final verification stamp.
 
 ---
