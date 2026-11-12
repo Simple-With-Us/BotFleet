@@ -23,7 +23,7 @@ function bot(): AppThreadOpenBot {
 }
 
 const REFUSAL =
-  "“Build the deck” cannot be opened from here, because it belongs to a different App.\u00A0 Nothing was switched, and the open conversation stayed as it is.\u00A0 Switch to Projects in Settings to open it.";
+  "“Build the deck” cannot be opened from here, because it belongs to a different App than the open conversation.\u00A0 Nothing was switched, and the open conversation stayed as it is.\u00A0 Switch to Projects in Settings to open it.";
 
 describe("planAppThreadOpen", () => {
   it("lets Projects make a different App conversation the open one", () => {

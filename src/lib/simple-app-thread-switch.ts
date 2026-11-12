@@ -25,7 +25,12 @@ export type AppThreadOpenPlan =
 const UNTITLED_CONVERSATION = "New task";
 
 function becauseClause(reason: string): string {
-  if (reason === "belongs to another App") return "it belongs to a different App";
+  // taskWorkspaceMergeSkipReason compares against the OPEN conversation:  the
+  // saved conversation may belong to the very App the user clicked, so keep
+  // the comparison explicit like the sibling clauses do.
+  if (reason === "belongs to another App") {
+    return "it belongs to a different App than the open conversation";
+  }
   if (reason === "runs in a different folder") return "it runs in a different folder";
   if (reason === "is bound to an App") return "it belongs to an App and the open conversation does not";
   if (reason === "is not bound to an App") return "it is not tied to an App and the open conversation is";

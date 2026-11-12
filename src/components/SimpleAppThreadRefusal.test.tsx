@@ -14,7 +14,7 @@ describe("SimpleAppThreadRefusal", () => {
     expect(html).toContain('role="status"');
     expect(html).toContain("This Stays Separate");
     expect(html).toContain("Build the deck");
-    expect(html).toContain("cannot be opened from here, because it belongs to a different App.");
+    expect(html).toContain("cannot be opened from here, because it belongs to a different App than the open conversation.");
     expect(html).toContain("Nothing was switched, and the open conversation stayed as it is.");
     expect(html).toContain("Switch to Projects in Settings to open it.");
     expect(html).toContain('aria-label="Dismiss Notice"');
