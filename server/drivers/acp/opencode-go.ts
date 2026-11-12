@@ -8,6 +8,10 @@ import { join } from "node:path";
 import { decodeInjectId, hostApiKey, localHost, mergeLocalInject } from "../local-inject.ts";
 import { createAcpDriver, type AcpSupport } from "./core.ts";
 import {
+  humanizeOpenCodeModelProbeProblem,
+  openCodeModelProbeProblemIsUnknown,
+} from "../../../shared/opencode-model-probe.ts";
+import {
   describeInitDeadline,
   readHostLoad,
   resolveInitDeadline,
@@ -343,7 +347,11 @@ export async function discoverOpenCodeModels(
     // An engine with no models and no reason reads as broken.  It is not: the
     // CLI answered and had nothing to list, and the person needs the sentence
     // that says which of the two it was.
-    lastProbeProblem = error instanceof Error ? error.message : String(error);
+    const raw = error instanceof Error ? error.message : String(error);
+    if (openCodeModelProbeProblemIsUnknown(raw)) {
+      console.warn(`[acp] opencodeGo: opencode models catalog: ${raw}`);
+    }
+    lastProbeProblem = humanizeOpenCodeModelProbeProblem(raw);
     return lastSuccessfulCatalog ?? STATIC_MODELS;
   }
 }
