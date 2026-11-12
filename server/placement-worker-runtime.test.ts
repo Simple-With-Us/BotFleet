@@ -1,17 +1,22 @@
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi, type Mock } from "vitest";
 import {
   type CapacitySample,
+  type ClaimReply,
+  type HeartbeatReply,
   type HostId,
+  type RegisterReply,
+  type ReportReply,
 } from "../shared/placement.ts";
 import { PlacementReportSpool } from "./placement-report-spool.ts";
 import {
   PlacementWorkerRuntime,
+  type PlacementWorkerClientLike,
   type WorkerSpawnResult,
 } from "./placement-worker-runtime.ts";
-import type { PlacementWorkerClient, WorkerCallOutcome } from "./placement-worker-client.ts";
+import type { PayloadReply, StopReceiptReply, WorkerCallOutcome } from "./placement-worker-client.ts";
 
 const controllerId: HostId = "server:11111111-1111-4111-8111-111111111111";
 const workerId: HostId = "mac:22222222-2222-4222-8222-222222222222";
@@ -28,21 +33,36 @@ afterEach(() => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
+interface MockWorkerClient extends PlacementWorkerClientLike {
+  register: Mock<Parameters<PlacementWorkerClientLike["register"]>, ReturnType<PlacementWorkerClientLike["register"]>>;
+  heartbeat: Mock<Parameters<PlacementWorkerClientLike["heartbeat"]>, ReturnType<PlacementWorkerClientLike["heartbeat"]>>;
+  assignment: Mock<Parameters<PlacementWorkerClientLike["assignment"]>, ReturnType<PlacementWorkerClientLike["assignment"]>>;
+  payload: Mock<Parameters<PlacementWorkerClientLike["payload"]>, ReturnType<PlacementWorkerClientLike["payload"]>>;
+  report: Mock<Parameters<PlacementWorkerClientLike["report"]>, ReturnType<PlacementWorkerClientLike["report"]>>;
+  stopReceipt: Mock<Parameters<PlacementWorkerClientLike["stopReceipt"]>, ReturnType<PlacementWorkerClientLike["stopReceipt"]>>;
+}
+
 function fixtureEnv() {
   const dir = mkdtempSync(join(tmpdir(), "bf-worker-runtime-"));
   dirs.push(dir);
   const spool = new PlacementReportSpool(dir);
   let now = 1000;
 
-  const mockClient = {
-    controller: vi.fn(() => ({ controllerId, epoch: 1 })),
-    register: vi.fn(async () => ({ outcome: "accepted", reply: { controllerId, epoch: 1, accepted: true } } as WorkerCallOutcome<any>)),
-    heartbeat: vi.fn(async () => ({ outcome: "accepted", reply: { controllerId, epoch: 1, pendingStops: [] } } as WorkerCallOutcome<any>)),
-    assignment: vi.fn(async () => ({ outcome: "accepted", reply: { controllerId, epoch: 1, accepted: false, reason: "no eligible jobs" } } as WorkerCallOutcome<any>)),
-    payload: vi.fn(async () => ({ outcome: "accepted", reply: { controllerId, epoch: 1, accepted: true, command: "echo test", cwd: "/tmp", timeoutMs: 1000 } } as WorkerCallOutcome<any>)),
-    report: vi.fn(async () => ({ outcome: "accepted", reply: { controllerId, epoch: 1, accepted: true } } as WorkerCallOutcome<any>)),
-    stopReceipt: vi.fn(async () => ({ outcome: "accepted", reply: { controllerId, epoch: 1, accepted: true } } as WorkerCallOutcome<any>)),
-  } as unknown as PlacementWorkerClient;
+  const registerReply: WorkerCallOutcome<RegisterReply> = { outcome: "accepted", reply: { controllerId, epoch: 1, accepted: true } };
+  const heartbeatReply: WorkerCallOutcome<HeartbeatReply> = { outcome: "accepted", reply: { controllerId, epoch: 1, pendingStops: [] } };
+  const assignmentReply: WorkerCallOutcome<ClaimReply> = { outcome: "accepted", reply: { controllerId, epoch: 1, accepted: false, reason: "no eligible jobs" } };
+  const payloadReply: WorkerCallOutcome<PayloadReply> = { outcome: "accepted", reply: { controllerId, epoch: 1, accepted: true, command: "echo test", cwd: "/tmp", timeoutMs: 1000 } };
+  const reportReply: WorkerCallOutcome<ReportReply> = { outcome: "accepted", reply: { controllerId, epoch: 1, accepted: true } };
+  const stopReceiptReply: WorkerCallOutcome<StopReceiptReply> = { outcome: "accepted", reply: { controllerId, epoch: 1, accepted: true } };
+
+  const mockClient: MockWorkerClient = {
+    register: vi.fn(async () => registerReply),
+    heartbeat: vi.fn(async () => heartbeatReply),
+    assignment: vi.fn(async () => assignmentReply),
+    payload: vi.fn(async () => payloadReply),
+    report: vi.fn(async () => reportReply),
+    stopReceipt: vi.fn(async () => stopReceiptReply),
+  };
 
   return { dir, spool, mockClient, now: () => now, setNow: (n: number) => { now = n; } };
 }
@@ -75,6 +95,12 @@ describe("PlacementWorkerRuntime", () => {
   it("sends heartbeats and acknowledges pending stops from controller", async () => {
     const { dir, spool, mockClient, now } = fixtureEnv();
     const stopped: string[] = [];
+
+    let finishJob: ((res: { exitCode: number | null; signal: NodeJS.Signals | null }) => void) | undefined;
+    const donePromise = new Promise<{ exitCode: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+      finishJob = resolve;
+    });
+
     const runtime = new PlacementWorkerRuntime({
       client: mockClient,
       spool,
@@ -83,38 +109,33 @@ describe("PlacementWorkerRuntime", () => {
       dataDir: dir,
       sampleProvider: () => sample,
       admissionProvider: () => ({ admit: true }),
-      spawnJob: vi.fn(),
+      spawnJob: vi.fn(async () => ({
+        pid: 12345,
+        done: donePromise,
+      })),
       stopJob: vi.fn(async (id) => { stopped.push(id); }),
       now,
     });
 
     // Mock an active job in runtime by mocking an assignment poll
-    (mockClient.assignment as any).mockResolvedValueOnce({
+    const assignmentSuccess: WorkerCallOutcome<ClaimReply> = {
       outcome: "accepted",
       reply: {
         controllerId, epoch: 1, accepted: true,
         lease: { controllerId, epoch: 1, leaseId: "lease-101", jobId: "job-101", host: workerId },
       },
-    });
-
-    let finishJob!: (res: { exitCode: number | null; signal: NodeJS.Signals | null }) => void;
-    const donePromise = new Promise<{ exitCode: number | null; signal: NodeJS.Signals | null }>((resolve) => {
-      finishJob = resolve;
-    });
-
-    (runtime as any).deps.spawnJob = vi.fn(async () => ({
-      pid: 12345,
-      done: donePromise,
-    }));
+    };
+    mockClient.assignment.mockResolvedValueOnce(assignmentSuccess);
 
     await runtime.pullAssignment();
     expect(runtime.getActiveJobs().has("job-101")).toBe(true);
 
     // Now mock heartbeat reply with pendingStop for job-101
-    (mockClient.heartbeat as any).mockResolvedValueOnce({
+    const heartbeatStop: WorkerCallOutcome<HeartbeatReply> = {
       outcome: "accepted",
       reply: { controllerId, epoch: 1, pendingStops: ["job-101"] },
-    });
+    };
+    mockClient.heartbeat.mockResolvedValueOnce(heartbeatStop);
 
     await runtime.tickHeartbeat();
 
@@ -123,7 +144,7 @@ describe("PlacementWorkerRuntime", () => {
     expect(stopped).toEqual(["job-101"]);
 
     // When the stopped process exits with signal SIGTERM
-    finishJob({ exitCode: null, signal: "SIGTERM" });
+    finishJob?.({ exitCode: null, signal: "SIGTERM" });
     await donePromise;
     // Allow microtasks to settle
     await new Promise((r) => setTimeout(r, 10));
@@ -143,13 +164,18 @@ describe("PlacementWorkerRuntime", () => {
     const { dir, spool, mockClient, now } = fixtureEnv();
     const leaseFile = join(dir, "placement", "worker-leases.json");
 
-    let finishJob!: (res: { exitCode: number | null; signal: NodeJS.Signals | null }) => void;
+    let finishJob: ((res: { exitCode: number | null; signal: NodeJS.Signals | null }) => void) | undefined;
     const donePromise = new Promise<{ exitCode: number | null; signal: NodeJS.Signals | null }>((resolve) => {
       finishJob = resolve;
     });
 
     let leaseFileExistedDuringSpawn = false;
     let leaseFileContentDuringSpawn = "";
+
+    const spawnJobResult: WorkerSpawnResult = {
+      pid: 9999,
+      done: donePromise,
+    };
 
     const runtime = new PlacementWorkerRuntime({
       client: mockClient,
@@ -162,22 +188,20 @@ describe("PlacementWorkerRuntime", () => {
       spawnJob: vi.fn(async () => {
         leaseFileExistedDuringSpawn = existsSync(leaseFile);
         leaseFileContentDuringSpawn = readFileSync(leaseFile, "utf8");
-        return {
-          pid: 9999,
-          done: donePromise,
-        } as WorkerSpawnResult;
+        return spawnJobResult;
       }),
       stopJob: vi.fn(),
       now,
     });
 
-    (mockClient.assignment as any).mockResolvedValueOnce({
+    const assignmentSuccess: WorkerCallOutcome<ClaimReply> = {
       outcome: "accepted",
       reply: {
         controllerId, epoch: 1, accepted: true,
         lease: { controllerId, epoch: 1, leaseId: "lease-abc", jobId: "job-abc", host: workerId },
       },
-    });
+    };
+    mockClient.assignment.mockResolvedValueOnce(assignmentSuccess);
 
     await runtime.pullAssignment();
 
@@ -187,7 +211,7 @@ describe("PlacementWorkerRuntime", () => {
     expect(leaseFileContentDuringSpawn).toContain("lease-abc");
 
     // Complete the job cleanly
-    finishJob({ exitCode: 0, signal: null });
+    finishJob?.({ exitCode: 0, signal: null });
     await donePromise;
     await new Promise((r) => setTimeout(r, 10));
 

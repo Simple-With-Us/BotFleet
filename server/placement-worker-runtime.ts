@@ -18,11 +18,29 @@ import {
   type AdmissionVerdict,
   type CapacitySample,
   type Capability,
+  type ClaimReply,
+  type HeartbeatReply,
   type HostId,
+  type RegisterReply,
   type ReportMessage,
+  type ReportReply,
 } from "../shared/placement.ts";
-import type { PlacementWorkerClient, WorkerCallOutcome } from "./placement-worker-client.ts";
+import type {
+  PlacementWorkerClient,
+  WorkerCallOutcome,
+  PayloadReply,
+  StopReceiptReply,
+} from "./placement-worker-client.ts";
 import { PlacementReportSpool, settlePendingReports } from "./placement-report-spool.ts";
+
+export interface PlacementWorkerClientLike {
+  register(req: { capabilities: Capability[]; sample: CapacitySample }): Promise<WorkerCallOutcome<RegisterReply>>;
+  heartbeat(req: { leases: string[]; admission: AdmissionVerdict; sample: CapacitySample }): Promise<WorkerCallOutcome<HeartbeatReply>>;
+  assignment(): Promise<WorkerCallOutcome<ClaimReply>>;
+  payload(req: { jobId: string; leaseId: string }): Promise<WorkerCallOutcome<PayloadReply>>;
+  report(report: ReportMessage): Promise<WorkerCallOutcome<ReportReply>>;
+  stopReceipt(req: { jobId: string; leaseId: string }): Promise<WorkerCallOutcome<StopReceiptReply>>;
+}
 
 export interface WorkerLocalLeaseRecord {
   jobId: string;
@@ -39,7 +57,10 @@ export interface WorkerLocalLeaseRecord {
 const leaseRecordSchema = z.object({
   jobId: z.string().min(1),
   leaseId: z.string().min(1),
-  controllerId: z.string().min(1).max(64).regex(HOST_ID_PATTERN).transform((v) => v as HostId),
+  controllerId: z.string().min(1).max(64).regex(HOST_ID_PATTERN).transform((v) => {
+    // SAFETY: the regex above matched the HOST_ID_PATTERN shape, so the string is a valid HostId.
+    return v as HostId;
+  }),
   epoch: z.number().int().nonnegative(),
   command: z.string().min(1),
   cwd: z.string().optional(),
@@ -57,7 +78,7 @@ export interface WorkerSpawnResult {
 }
 
 export interface PlacementWorkerRuntimeDeps {
-  client: PlacementWorkerClient;
+  client: PlacementWorkerClientLike;
   spool: PlacementReportSpool;
   hostId: HostId;
   capabilities: Capability[];
