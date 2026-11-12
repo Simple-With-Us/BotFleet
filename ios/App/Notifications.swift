@@ -31,12 +31,23 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate 
     /// Approve and Deny for a request only one of them can settle.
     private var pushDelivered = PushDeliveryLedger()
 
+    private var didRegisterCategories = false
+
     private override init() {
         super.init()
+        // The delegate has to be in place before launch returns, or a
+        // notification action delivered during startup is dropped.  Category
+        // registration is a separate XPC and waits until after the first
+        // frame (`registerCategories`).
         center.delegate = self
-        // Registered on every launch, before `RootView` appears and before
-        // any notification (local or remote) can be delivered — see
-        // `NotificationCategories` for why the set lives in CompanionCore.
+    }
+
+    /// Installs Approve, Deny, and reply actions.  Idempotent.  Called after
+    /// the first frame, and again when a background launch finishes restoring,
+    /// because that launch never shows a scene.
+    func registerCategories() {
+        guard !didRegisterCategories else { return }
+        didRegisterCategories = true
         center.setNotificationCategories(NotificationCategories.all())
     }
 
@@ -86,6 +97,9 @@ final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate 
         let content = UNMutableNotificationContent()
         content.title = notification.title
         content.body = notification.body
+            .replacingOccurrences(of: "&nbsp;", with: " ", options: .caseInsensitive)
+            .replacingOccurrences(of: "&#160;", with: " ")
+            .replacingOccurrences(of: "&#xA0;", with: " ", options: .caseInsensitive)
         content.sound = .default
         // `kind`, never `isBlocking` — a question is blocking too, but has
         // no verdict for Approve/Deny to send.  `isBlocking` still governs

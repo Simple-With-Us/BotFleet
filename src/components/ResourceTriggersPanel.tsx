@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Gauge, Loader2, Pause, Play, Plus, Trash2, X } from "lucide-react";
 
 import { BotAvatar } from "@/components/Avatar";
+import { TriggerErrorBadge } from "@/components/TriggerErrorBadge";
 import { stateForBot } from "@/lib/mascot";
 import { cn } from "@/lib/cn";
 import {
@@ -41,7 +42,7 @@ function Editor({
   const [cmp, setCmp] = useState<ResourceCmp>(trigger?.cmp ?? "below");
   const [threshold, setThreshold] = useState(String(trigger?.threshold ?? 80));
   const [cooldownMinutes, setCooldownMinutes] = useState(String(trigger?.cooldownMinutes ?? 45));
-  const [runOn, setRunOn] = useState<RoutineRunOn>(trigger?.runOn ?? "maus");
+  const [runOn, setRunOn] = useState<RoutineRunOn>(trigger?.runOn ?? "bot");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
 
@@ -58,7 +59,7 @@ function Editor({
       cooldownMinutes: Number(cooldownMinutes),
     };
     if (!input.prompt) {
-      setError("Give the bot a prompt");
+      setError("Tell the bot what to do.");
       return;
     }
     if (!Number.isFinite(input.threshold)) {
@@ -86,8 +87,8 @@ function Editor({
       <div className="max-h-[90vh] w-full max-w-[520px] overflow-y-auto rounded-2xl bg-raised p-5 shadow-xl">
         <div className="flex items-center justify-between">
           <h2 className="text-[16px] font-semibold text-ink">{trigger ? "Edit Resource Trigger" : "New Resource Trigger"}</h2>
-          <button onClick={onClose} className="rounded-lg p-1 text-ink-secondary hover:bg-panel hover:text-ink" aria-label="Close">
-            <X size={16} />
+          <button type="button" onClick={onClose} className="inline-flex size-11 items-center justify-center rounded-lg text-ink-secondary hover:bg-panel hover:text-ink" aria-label="Close">
+            <X size={18} />
           </button>
         </div>
         <label className="mt-4 block text-[12px] font-medium text-ink-secondary">Bot</label>
@@ -95,8 +96,8 @@ function Editor({
           {bots.map((bot) => <option key={bot.id} value={bot.id}>{bot.name}</option>)}
         </select>
         <label className="mt-3 block text-[12px] font-medium text-ink-secondary">Name</label>
-        <input value={name} onChange={(event) => setName(event.target.value)} className="mt-1 w-full rounded-xl border border-hairline/50 bg-panel px-3 py-2 text-[13px] text-ink" placeholder="Disk low — Housekeeper" />
-        <div className="mt-3 grid grid-cols-3 gap-2">
+        <input value={name} onChange={(event) => setName(event.target.value)} className="mt-1 w-full rounded-xl border border-hairline/50 bg-panel px-3 py-2 text-[13px] text-ink" placeholder="Disk space is low" />
+        <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-3">
           <div>
             <label className="block text-[12px] font-medium text-ink-secondary">Metric</label>
             <select value={metric} onChange={(event) => setMetric(event.target.value as ResourceMetric)} className="mt-1 w-full rounded-xl border border-hairline/50 bg-panel px-2 py-2 text-[12px] text-ink">
@@ -117,10 +118,10 @@ function Editor({
         </div>
         <label className="mt-3 block text-[12px] font-medium text-ink-secondary">Cooldown (minutes)</label>
         <input value={cooldownMinutes} onChange={(event) => setCooldownMinutes(event.target.value)} className="mt-1 w-full rounded-xl border border-hairline/50 bg-panel px-3 py-2 text-[13px] text-ink" />
-        <label className="mt-3 block text-[12px] font-medium text-ink-secondary">Prompt</label>
+        <label className="mt-3 block text-[12px] font-medium text-ink-secondary">Instructions</label>
         <textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} rows={6} className="mt-1 w-full rounded-xl border border-hairline/50 bg-panel px-3 py-2 text-[13px] text-ink" />
         <label className="mt-3 flex items-center gap-2 text-[12px] text-ink-secondary">
-          <input type="checkbox" checked={runOn === "cloud"} onChange={(event) => setRunOn(event.target.checked ? "cloud" : "maus")} />
+          <input type="checkbox" checked={runOn === "cloud"} onChange={(event) => setRunOn(event.target.checked ? "cloud" : "bot")} />
           Run on ASCII.dev Box
         </label>
         {error && <p className="mt-2 text-[12px] text-danger">{error}</p>}
@@ -155,19 +156,19 @@ export function ResourceTriggersPanel({ bots }: { bots: Bot[] }) {
 
   return (
     <div className="min-h-0 flex-1 overflow-y-auto p-4">
-      <div className="mb-3 flex items-center justify-between">
-        <p className="max-w-[520px] text-[12px] leading-relaxed text-ink-secondary">
-          While BotFleet is running it samples this computer every 30 seconds.  When a metric crosses the threshold, it starts a fresh task on the chosen bot — the same queue as webhooks and routines.
+      <div className="mb-3 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <p className="max-w-[520px] text-[13px] leading-relaxed text-ink-secondary">
+          While BotFleet is open, it checks this computer every 30 seconds.{'\u00A0 '}When disk, memory, or processor use crosses the line you set, it starts a fresh task for the bot you chose.
         </p>
-        <button onClick={() => setEditor("new")} disabled={bots.length === 0} className="inline-flex items-center gap-2 rounded-xl bg-accent px-3.5 py-2 text-[13px] font-medium text-white disabled:opacity-40">
+        <button onClick={() => setEditor("new")} disabled={bots.length === 0} className="inline-flex min-h-11 shrink-0 items-center justify-center gap-2 whitespace-nowrap rounded-xl bg-accent px-3.5 py-2 text-[13px] font-medium text-white disabled:opacity-40">
           <Plus size={15} />New Trigger
         </button>
       </div>
       {state.resourceTriggers.length === 0 ? (
         <div className="flex min-h-[280px] flex-col items-center justify-center text-center">
           <Gauge size={42} className="text-ink-secondary/40" />
-          <h2 className="mt-3 text-[16px] font-semibold text-ink">Wake a bot when the machine is in trouble</h2>
-          <p className="mt-2 max-w-[420px] text-[13px] text-ink-secondary">Disk filling up, swap climbing, or load stuck high can start Housekeeper automatically instead of waiting for the next scheduled check.</p>
+          <h2 className="mt-3 text-[16px] font-semibold text-ink">Wake a Bot When This Computer Is in Trouble</h2>
+          <p className="mt-2 max-w-[420px] text-[13px] leading-relaxed text-ink-secondary">A full disk, rising memory use, or a stuck processor can start a bot on its own.{'\u00A0 '}You do not have to wait for the next scheduled check.</p>
         </div>
       ) : (
         <ul className="space-y-2">
@@ -175,7 +176,7 @@ export function ResourceTriggersPanel({ bots }: { bots: Bot[] }) {
             const bot = bots.find((candidate) => candidate.id === trigger.botId);
             return (
               <li key={trigger.id} className="flex items-start gap-3 rounded-2xl border border-hairline/50 bg-panel/80 p-3">
-                {bot ? <BotAvatar bot={bot} state={stateForBot(bot)} size={36} /> : <div className="h-9 w-9 rounded-full bg-panel" />}
+                {bot ? <BotAvatar bot={bot} state={stateForBot(bot)} size={36} animated={false} /> : <div className="h-9 w-9 rounded-full bg-panel" />}
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2">
                     <button onClick={() => setEditor(trigger)} className="truncate text-[14px] font-medium text-ink hover:text-accent" title={trigger.name}>{trigger.name}</button>
@@ -184,9 +185,10 @@ export function ResourceTriggersPanel({ bots }: { bots: Bot[] }) {
                   <p className="mt-0.5 text-[12px] text-ink-secondary">
                     {METRIC_LABEL[trigger.metric]} {trigger.cmp === "below" ? "≤" : "≥"} {trigger.threshold}
                     {trigger.lastValue != null ? ` · now ${trigger.lastValue}` : ""}
-                    {" · "}last fire {relativeTime(trigger.lastFiredAt)}
+                    {" · "}Last run {relativeTime(trigger.lastFiredAt)}
                   </p>
                 </div>
+                <TriggerErrorBadge triggerId={trigger.id} name={trigger.name} source="resource" />
                 <button onClick={() => void toggle(trigger)} className="rounded-lg p-2 text-ink-secondary hover:bg-raised hover:text-ink" aria-label={trigger.enabled ? "Pause" : "Enable"}>
                   {trigger.enabled ? <Pause size={14} /> : <Play size={14} />}
                 </button>

@@ -4,8 +4,10 @@ import type { Bot, Group } from "@/state/store";
 import type { Routine } from "./routines";
 import { getAvailableApps } from "./apps-catalog";
 
+import type { BotCommand } from "../../shared/bot-commands.ts";
+
 export interface AutocompleteTrigger {
-  trigger: "@" | "#";
+  trigger: "@" | "#" | "/";
   start: number;
   query: string;
 }
@@ -13,14 +15,16 @@ export interface AutocompleteTrigger {
 export interface AutocompleteChoice {
   id: string;
   name: string;
-  kind: "bot" | "channel" | "app" | "routine";
+  kind: "bot" | "channel" | "app" | "routine" | "command";
   badge: string;
   description?: string;
   bot?: Bot;
   connected?: boolean;
+  command?: BotCommand;
+  disabled?: boolean;
 }
 
-function findLastValidTrigger(upto: string, char: "@" | "#"): number {
+function findLastValidTrigger(upto: string, char: "@" | "#" | "/"): number {
   let idx = upto.lastIndexOf(char);
   while (idx !== -1) {
     if (idx === 0 || /\s|[(\["'“‘]/.test(upto[idx - 1])) {
@@ -40,10 +44,13 @@ export function autocompleteQueryAt(text: string, caret: number): AutocompleteTr
   const upto = text.slice(0, caret);
   const validAt = findLastValidTrigger(upto, "@");
   const validHash = findLastValidTrigger(upto, "#");
-  const start = Math.max(validAt, validHash);
+  const validSlash = findLastValidTrigger(upto, "/");
+  const start = Math.max(validAt, validHash, validSlash);
   if (start === -1) return null;
 
-  const trigger = upto[start] as "@" | "#";
+  const triggerChar = upto[start];
+  if (triggerChar !== "@" && triggerChar !== "#" && triggerChar !== "/") return null;
+  const trigger = triggerChar;
   const query = upto.slice(start + 1);
 
   // Stop if query contains line breaks or is excessively long
@@ -116,7 +123,7 @@ export function getAutocompleteCandidates(
       }
     } else {
       // Direct chat: prioritize the current bot, followed by the rest of the fleet
-      const sortedBots = [...ctx.bots.filter((b) => !b.hidden)].sort((a, b) => {
+      const sortedBots = ctx.bots.filter((b) => !b.hidden).toSorted((a, b) => {
         if (a.id === ctx.currentBotId) return -1;
         if (b.id === ctx.currentBotId) return 1;
         return a.name.localeCompare(b.name);
@@ -217,7 +224,10 @@ export function applyAutocomplete(
   choice: AutocompleteChoice,
 ): { text: string; caret: number } {
   const prefix = triggerInfo.trigger;
-  const replacement = `${prefix}${choice.name} `;
+  const replacement =
+    triggerInfo.trigger === "/" && choice.command
+      ? `${choice.command.label} `
+      : `${prefix}${choice.name} `;
   const after = text.slice(caret);
   const cleanAfter = after.startsWith(" ") ? after.slice(1) : after;
   const nextText = `${text.slice(0, triggerInfo.start)}${replacement}${cleanAfter}`;

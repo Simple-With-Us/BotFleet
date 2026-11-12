@@ -13,6 +13,7 @@ import SwiftUI
 import CompanionCore
 import UserNotifications
 import UIKit
+import AVFoundation
 
 /// Stream lifecycle, in Console.app and the Xcode console. A companion that
 /// is silently not connected looks exactly like one with nothing to say, so
@@ -28,6 +29,14 @@ final class Session: ObservableObject {
         /// The token stopped working — revoked on the computer, most likely.
         case unauthorized
         case offline(String)
+        /// A sustained run of gateway failures (502/503/530-family — see
+        /// `ReconnectBackoff.gatewayEscalationThreshold`), distinct from an
+        /// ordinary `.offline`: Cloudflare, not the app, is answering every
+        /// attempt, which means the Mac's sidecar has nothing listening.
+        /// The reconnect loop keeps retrying underneath at the raised
+        /// backoff cap; this status exists so the UI stops implying a
+        /// quick retry will help and offers a manual one instead (IO11).
+        case macOffline
     }
 
     private enum SnapshotHydrationOutcome {
@@ -73,6 +82,12 @@ final class Session: ObservableObject {
     /// predates PR #383 and does not report the route.  Distinct from
     /// "have not fetched yet" so the row can render the right copy.
     @Published private(set) var pushSenderHealthNotReported = false
+    /// Shared memory (the recall corpus) status, read-only, for the Settings
+    /// row.  `nil` until the first fetch resolves; a failed fetch keeps the
+    /// last answer, and a 404 (a sidecar that predates the route) is
+    /// `sharedMemoryNotReported`.
+    @Published private(set) var sharedMemoryStatus: SharedMemoryStatus?
+    @Published private(set) var sharedMemoryNotReported = false
 
     /// instanceId -> driverKind, cached from the last `instances()` fetch so
     /// the chat header can resolve a bot's current-model provider mark
@@ -84,10 +99,35 @@ final class Session: ObservableObject {
     /// transient sheet dismissals and cancelled tasks so the profile model picker
     /// never empties spuriously.
     @Published private(set) var cachedInstances: [Instance] = []
+    /// The roster behind `cachedInstances` and the `describedAt` high-water mark
+    /// every fetch and push is ordered by (`InstanceRoster`).  Reset with them
+    /// on pair / sign-out: another computer's stamps share nothing with this one's.
+    private var instanceRoster = InstanceRoster()
 
     /// A notification response that should be pushed by the roster's
     /// NavigationStack after the exact detached task has been activated.
     @Published private(set) var notificationChat: Chat?
+
+    // Shared across chat screens so a settled reply keeps playing when the
+    // person switches chats. Audio bytes stay on the paired computer.
+    private var voiceTask: Task<Void, Never>?
+    private var voiceGeneration = UUID()
+    private var voicePlayer: AVAudioPlayer?
+    /// Completion of the hosted clip that is playing.  Held so stopVoice()
+    /// can end the wait: AVAudioPlayer.stop() sends no delegate callback.
+    private var voicePlayback: ClipPlayback?
+    /// The next hosted clip, fetched while the current one plays.
+    private var voicePrefetch: Task<Data, Error>?
+    /// Bots (and voices) already told this iPhone lacks their Personal Voice
+    /// this session.  Auto-play must not raise the same alert every reply.
+    private var personalVoiceMissingNoted: Set<String> = []
+    private var voiceAudioObservers: [NSObjectProtocol] = []
+    /// A read was playing when the current audio interruption began.
+    private var voiceInterrupted = false
+    /// DEBUG `-store-preview -preview-voice` only: voices for a profile
+    /// screenshot with no paired computer.  Nil everywhere else.
+    private var previewVoiceOptions: [Voice]?
+    @Published private(set) var speakingMessageId: String?
 
     private var client: CompanionClient?
     /// The device token, kept in memory so the client can be rebuilt when the
@@ -99,6 +139,17 @@ final class Session: ObservableObject {
     /// and persisted — when a stream goes live.
     private var rotation = CandidateRotation(hosts: [])
     private var streamTask: Task<Void, Never>?
+    /// Streamed deltas held between publishes (BF-2608). The buffer is pure
+    /// policy in CompanionCore; the clock and every flush decision live here.
+    /// `bufferedSeq` is the newest sequence a held delta carried: the cursor
+    /// commits when the buffer drains, not per token, because touching the
+    /// `@Published` state to advance it would publish anyway and defeat the
+    /// batching. A crash inside one 50 ms window replays those deltas on
+    /// reconnect, which is safe — live text is not persisted, and settled
+    /// messages dedupe by id.
+    private var deltaBuffer = StreamingDeltaBuffer()
+    private var deltaFlushTask: Task<Void, Never>?
+    private var bufferedSeq: Int?
     /// Best-effort authenticated route refresh started by the latest live SSE
     /// hello. Kept separate so endpoint discovery never stalls event delivery.
     private var endpointRefreshTask: Task<Void, Never>?
@@ -136,11 +187,10 @@ final class Session: ObservableObject {
     /// Bumped on pair / restore / sign-out so an in-flight instances warm
     /// cannot write the previous computer's provider map onto a new pairing.
     private var pairingGeneration = 0
-    private var reconnectDelay: UInt64 = 0
-    /// How many computer panels are open. A count rather than a flag: the
-    /// panel can be pushed twice in a navigation stack, and the last one to
-    /// close is the one that should turn screens back off.
-    private var screenWatchers = 0
+    private var reconnectBackoff = ReconnectBackoff()
+    /// Open computer panels per bot.  A view can be pushed twice in a
+    /// navigation stack; its last close releases that bot's subscription.
+    private var screenWatchers: [String: Int] = [:]
     /// Authenticated avatar bytes shared by roster, header, group and task
     /// surfaces. Both entry count and byte cost are bounded because one valid
     /// uploaded image may be 10 MB.
@@ -155,15 +205,106 @@ final class Session: ObservableObject {
     /// for the same attachment path.
     private var avatarFetches: [String: (id: UUID, task: Task<Data?, Never>)] = [:]
     private var avatarCacheGeneration = 0
+    /// Viewed-thread first pages in flight, by threadId. The store's
+    /// `loadingThread` flag cannot guard this on its own: these calls run
+    /// before the render that would publish the flag.
+    private var threadViewFetches: Set<String> = []
+    /// Per-mutation success flags for one settings flush.  `status` may be a
+    /// recovery GET applied for display even when a PATCH failed; callers must
+    /// require their own OK flag before treating the mutation as saved.
+    private struct SettingsFlushOutcome: Sendable {
+        var status: ConfigStatus?
+        var conversationModeOK: Bool? = nil
+        var terminologyOK: Bool? = nil
+        var featuresOK: Bool? = nil
+        var profileOK: Bool? = nil
+        var timeoutOK: Bool? = nil
+
+        /// True when at least one mutation in this flush reported failure.
+        var hasFailedMutation: Bool {
+            conversationModeOK == false
+                || terminologyOK == false
+                || featuresOK == false
+                || profileOK == false
+                || timeoutOK == false
+        }
+
+        /// Merge a superseded partial with the flush that inherited requeued
+        /// fields.  Confirmed successes (`true`) win so an earlier PATCH in the
+        /// partial flush is not lost; a requeued field that the replacement
+        /// saved upgrades `false` to `true`.
+        func mergingRequeuedFollow(from replacement: SettingsFlushOutcome) -> SettingsFlushOutcome {
+            func mergeFlag(_ partial: Bool?, _ replacement: Bool?) -> Bool? {
+                if partial == true || replacement == true { return true }
+                if partial == false || replacement == false { return false }
+                return nil
+            }
+            return SettingsFlushOutcome(
+                status: replacement.status ?? status,
+                conversationModeOK: mergeFlag(conversationModeOK, replacement.conversationModeOK),
+                terminologyOK: mergeFlag(terminologyOK, replacement.terminologyOK),
+                featuresOK: mergeFlag(featuresOK, replacement.featuresOK),
+                profileOK: mergeFlag(profileOK, replacement.profileOK),
+                timeoutOK: mergeFlag(timeoutOK, replacement.timeoutOK)
+            )
+        }
+    }
+
+    /// One-in-flight settings PATCH chain shared by every full-config settings
+    /// mutation (conversation mode, terminology, features, profile, room
+    /// timeout).  Concurrent cross-type saves each return a full ConfigStatus;
+    /// a shared tail keeps those assignments ordered so an older snapshot
+    /// cannot finish last and regress session.config.  Field-level coalesce
+    /// remains per endpoint; queued work is pairing-bound and cleared on
+    /// sign-out / re-pair.  Callers get nil when their own PATCH failed even
+    /// if a recovery GET refreshed config for display.
+    private var settingsUpdateTail: Task<SettingsFlushOutcome?, Never>?
+    private var settingsUpdateGeneration = 0
+    private var pendingConversationMode: String?
+    private var pendingConversationMergeThreads = false
+    private var pendingConversationModeSet = false
+    private var pendingTerminology: String?
+    private var pendingTerminologyCustom: RoomLabels?
+    private var pendingTerminologySet = false
+    private var pendingFeaturesShowToolCalls: Bool?
+    private var pendingFeaturesSummarizeToolCalls: Bool?
+    private var pendingProfileName: String?
+    private var pendingProfileEmail: String?
+    private var pendingProfileHasName = false
+    private var pendingProfileHasEmail = false
+    private var pendingRoomTurnTimeoutMinutes: Int?
+    private var pendingRoomTurnTimeout = false
     /// A saved connection exists, but its token could not be read yet. Keeps
     /// "the keychain is locked" from being mistaken for "not paired".
     private var restorePending = false
+    /// False until the off-main launch restore has published a result.  The
+    /// root stays on a static placeholder for that interval so Welcome is not
+    /// a flash for a phone that is already paired, and so the first frame
+    /// does not wait on the keychain.
+    @Published private(set) var launchRestoreSettled = false
+    /// `connect()` ran before a client existed.  Restore completion starts
+    /// the stream.
+    private var connectRequested = false
+    /// Bumped on sign-out and on a new pairing so an in-flight restore cannot
+    /// publish the previous computer's token afterwards.
+    private var launchGeneration = 0
+    /// The decision the in-flight restore last published.  `finishLaunchRestore`
+    /// reads it after `launchRestoreSettled` flips, which is the moment a tap
+    /// that arrived during the read has to be kept or dropped.
+    private var launchRestoreDecision: CompanionLaunchRestoreDecision = .unpaired
+    private var launchRestoreTask: Task<Void, Never>?
+    private var voiceObserversInstalled = false
     /// A notification can cold-launch the app before protected Keychain data
     /// is available. Retain the last explicitly tapped destination until the
     /// paired client can be rebuilt after unlock.
     private var pendingNotification: NotificationTarget?
 
-    private static let connectionKey = "companion.connection"
+    static let connectionKey = CompanionConnectionStore.connectionKey
+    /// The last `PostedPushToken` this phone successfully posted — see
+    /// `registerPushToken`.  IO17: without this, a token iOS hands back
+    /// unchanged on almost every launch was POSTed unconditionally, every
+    /// launch, forever.
+    private static let postedPushTokenKey = "companion.pushToken.posted"
 
     // MARK: - Pairing
 
@@ -186,66 +327,267 @@ final class Session: ObservableObject {
         if ProcessInfo.processInfo.arguments.contains("-store-preview"),
            let url = Bundle.main.url(forResource: "StorePreview", withExtension: "json"),
            let data = try? Data(contentsOf: url),
-           let fleet = try? JSONDecoder().decode(Fleet.self, from: data) {
+           var fleet = try? JSONDecoder().decode(Fleet.self, from: data) {
             connection = Connection(name: "Preview Mac", host: "preview.tailnet.ts.net", port: 8810)
+            if ProcessInfo.processInfo.arguments.contains("-preview-voice") {
+                seedVoicePreview(&fleet)
+            }
+            if ProcessInfo.processInfo.arguments.contains("-preview-off") {
+                seedOffPreview(&fleet)
+            }
             state.hydrate(fleet)
             // StorePreview bots all select instanceId "preview"; seed the
             // driver map so the chat-header provider mark appears in the
-            // screenshot harness (no live client to warm from).
+            // screenshot harness (no live client to warm from).  The fixture
+            // decode stays synchronous only on this DEBUG launch, which is
+            // not the production hang.
             instanceDriverKinds = ["preview": "claude"]
             status = .live
+            launchRestoreSettled = true
+            TranscriptScrollDemo.startIfRequested(self)
+            KaraokeDemo.startIfRequested(self)
+            ChatFixture.startIfRequested(self)
+            return
+        }
+        // Screenshot and Lock Screen fixtures must paint their harness on the
+        // first frame.  They have no pairing to restore, and waiting on the
+        // app-group container would race the capture.
+        let launchFixtures = [
+            "-tvface-preview",
+            "-composer-regression-preview",
+            "-live-activity-preview",
+        ]
+        if launchFixtures.contains(where: { ProcessInfo.processInfo.arguments.contains($0) }) {
+            launchRestoreSettled = true
             return
         }
 #endif
-        restore()
-        Task { await refreshNotificationAuthorization() }
+        // Blob export, JSON decode, and the keychain read used to run here,
+        // on the main thread, before UIKit could finish accessibility
+        // startup (BOTFLEET-W).  They now run off the main thread after one
+        // yield.  The notification delegate above is the part that has to
+        // stay, because a cold launch can deliver an action before a frame.
+        scheduleLaunchRestore(yieldsFirst: true)
     }
 
-    /// Rebuild the last connection at launch.
+#if DEBUG
+    /// Scroll harness only (`-scroll-demo`): change state as if the stream
+    /// had delivered a frame.  `state` is otherwise written only here.
+    func debugMutateState(_ body: (inout CompanionState) -> Void) {
+        body(&state)
+    }
+
+    /// Karaoke fixture only (`-karaoke-demo`): show a reply as being read
+    /// aloud, so its bubble wears Stop Voice.
+    func debugSetSpeaking(_ messageId: String?) {
+        speakingMessageId = messageId
+    }
+
+    /// `-preview-off`: Pixel is switched Off, so the chat list's dimmed row and
+    /// Off label, the disabled composer and the profile's Power section can be
+    /// screenshotted without a paired computer.  Pass `-open-first` as well to
+    /// land on Scout, then open Pixel from the list.
+    private func seedOffPreview(_ fleet: inout Fleet) {
+        for index in fleet.bots.indices where fleet.bots[index].id == "preview-pixel" {
+            fleet.bots[index].off = true
+        }
+    }
+
+    /// `-preview-voice`: every preview bot speaks a MiniMax voice on this
+    /// iPhone and a Mac Personal Voice on the Mac, with the voice engine
+    /// configured, so the profile's two voice pickers can be screenshotted.
+    private func seedVoicePreview(_ fleet: inout Fleet) {
+        for index in fleet.bots.indices {
+            fleet.bots[index].voice = "English_Graceful_Lady"
+            fleet.bots[index].voices = BotVoices(mac: "personal:com.apple.speech.personalvoice.preview-mac")
+            fleet.bots[index].speechDevices = ["mac", "iphone"]
+        }
+        // The owner's own setup: his MiniMax clone as the workspace default
+        // (listed with no friendly label, so it reads as the id made
+        // readable) and the seeded pronunciation list.
+        config = try? JSONDecoder().decode(
+            ConfigStatus.self,
+            from: Data(#"""
+            {"tts":{"configured":true,"voice":"jay-wedgeworth-001","provider":"minimax","pronunciations":[
+              {"term":"JSON","say":"Jason"},{"term":"SaaS","say":"sass"},{"term":"SQL","say":"sequel"},
+              {"term":"REGEX","say":"redge ex"},{"term":"GUI","say":"gooey"},{"term":"CAPTCHA","say":"cap cha"},
+              {"term":"sudo","say":"soo doo"},{"term":"cron","say":"kron"},{"term":"OAuth","say":"oh auth"}]}}
+            """#.utf8)
+        )
+        previewVoiceOptions = [
+            Voice(id: "jay-wedgeworth-001", label: "jay-wedgeworth-001", description: "Custom"),
+            Voice(id: "English_Graceful_Lady", label: "Graceful Lady"),
+            Voice(id: "English_Persuasive_Man", label: "Persuasive Man"),
+            Voice(id: "English_Wise_Woman", label: "Wise Woman"),
+        ]
+    }
+#endif
+
+    /// Drop coalesced settings PATCHes when the paired computer changes so a
+    /// queued mode, terminology, name, email, toggle, or timeout cannot land
+    /// on the next pairing.  Also detach `settingsUpdateTail` so the next
+    /// pairing does not await an in-flight request that still targets the
+    /// previous computer (and its request timeout).
+    private func cancelPendingSettingsMutations() {
+        pendingConversationMode = nil
+        pendingConversationMergeThreads = false
+        pendingConversationModeSet = false
+        pendingTerminology = nil
+        pendingTerminologyCustom = nil
+        pendingTerminologySet = false
+        pendingFeaturesShowToolCalls = nil
+        pendingFeaturesSummarizeToolCalls = nil
+        pendingProfileName = nil
+        pendingProfileEmail = nil
+        pendingProfileHasName = false
+        pendingProfileHasEmail = false
+        pendingRoomTurnTimeoutMinutes = nil
+        pendingRoomTurnTimeout = false
+        settingsUpdateGeneration += 1
+        // Detach before cancel so a concurrent enqueue cannot re-chain onto
+        // this task after we bump the generation.
+        let abandoned = settingsUpdateTail
+        settingsUpdateTail = nil
+        abandoned?.cancel()
+    }
+
+    /// Categories, voice observers, and the notification-settings lookup.
+    /// Idempotent.  Foreground launch calls this after the first frame.
+    /// Background launch calls it from restore completion, because that
+    /// process never shows a scene.
+    func activateAfterFirstFrame() {
+        NotificationCoordinator.shared.registerCategories()
+        observeVoiceAudioSession()
+    }
+
+    /// Rebuild the last connection without blocking the main thread.
     ///
-    /// Three outcomes, and keeping them apart is the whole point. No saved
-    /// connection: stay unpaired. A saved connection whose token reads back:
-    /// connect. A saved connection whose token cannot be read *yet* — the
+    /// Three outcomes, and keeping them apart is the whole point.  No saved
+    /// connection: stay unpaired.  A saved connection whose token reads back:
+    /// connect.  A saved connection whose token cannot be read *yet* — the
     /// locked keychain before a phone's first unlock after reboot, which is
     /// when iOS is most likely to have launched us in the background — hold
-    /// on to it and try again. Only the middle case is a real pairing, and
+    /// on to it and try again.  Only the middle case is a real pairing, and
     /// only the first should ever send someone back to the pairing screen.
-    private func restore() {
-        restorePending = false
-        guard let data = UserDefaults.standard.data(forKey: Self.connectionKey),
-              let saved = try? JSONDecoder().decode(Connection.self, from: data)
-        else { return }
+    ///
+    /// `yieldsFirst` is the cold-launch path.  One turn of the main executor
+    /// lets UIKit drain the accessibility startup block before this task
+    /// does file or keychain work.
+    private func scheduleLaunchRestore(yieldsFirst: Bool) {
+        guard launchRestoreTask == nil else { return }
+        let generation = launchGeneration
+        launchRestoreTask = Task { [weak self] in
+            if yieldsFirst { await Task.yield() }
+            await self?.performLaunchRestore(generation: generation)
+            await self?.finishLaunchRestore(generation: generation)
+        }
+    }
 
-        let stored: String?
+    private func performLaunchRestore(generation: Int) async {
+        let saved = await Task.detached(priority: .userInitiated) { () -> CompanionLaunchSavedConnection? in
+            assert(!Thread.isMainThread)
+            return CompanionLaunchRestore.loadDecoded()
+        }.value
+        guard generation == launchGeneration else { return }
+        let tokenRead: CompanionLaunchTokenRead
+        if let saved {
+            let connectionId = saved.connection.id
+            tokenRead = await Task.detached(priority: .userInitiated) { () -> CompanionLaunchTokenRead in
+                assert(!Thread.isMainThread)
+                return Self.readLaunchToken(connectionId)
+            }.value
+        } else {
+            tokenRead = .missing
+        }
+        guard generation == launchGeneration else { return }
+        if let saved {
+            // Same-container dual-compat: a standard-only blob is promoted
+            // into the app-group suite so a later sibling install can import
+            // it.  The copy stays on this actor, after the generation check.
+            CompanionConnectionStore.promoteStandardToSharedIfNeeded(
+                source: saved.source,
+                data: saved.data
+            )
+        }
+        applyLaunchDecision(
+            CompanionLaunchRestore.decide(saved: saved?.connection, token: tokenRead)
+        )
+    }
+
+    private nonisolated static func readLaunchToken(_ connectionId: String) -> CompanionLaunchTokenRead {
         do {
-            stored = try Keychain.token(for: saved.id)
+            if let token = try Keychain.token(for: connectionId) {
+                return .token(token)
+            }
+            return .missing
+        } catch let error as KeychainError {
+            return .unavailable(isLocked: error.isLocked, message: error.localizedDescription)
         } catch {
-            // Keep the connection and say why. `.offline` rather than
+            return .unavailable(isLocked: false, message: error.localizedDescription)
+        }
+    }
+
+    private func applyLaunchDecision(_ decision: CompanionLaunchRestoreDecision) {
+        launchRestoreDecision = decision
+        switch decision {
+        case .unpaired:
+            restorePending = false
+        case .waitForKeychain(let saved, let message):
+            // Keep the connection and say why.  `.offline` rather than
             // `.unpaired` matters: the latter is what puts PairingView on
             // screen, and asking for a new code is the one recovery that
             // costs a walk to the computer.
             connection = saved
             restorePending = true
-            status = .offline(
-                (error as? KeychainError)?.isLocked == true
-                    ? "Unlock this phone to reach your computer."
-                    : error.localizedDescription
-            )
-            return
+            status = .offline(message)
+        case .connect(let saved, let stored):
+            connection = saved
+            token = stored
+            // New connections honor the desktop's transport policy.  Automatic
+            // walking is credential-safe: protected routes stay protected, while
+            // a legacy/local route is only tried when it was the exact saved route.
+            rotation = CandidateRotation(endpoints: saved.orderedEndpoints)
+            let first = rotation.currentEndpoint.map(saved.dialing) ?? saved
+            client = CompanionClient(connection: first, token: stored)
+            pairingGeneration += 1
+            cancelPendingSettingsMutations()
+            cachedInstances = []
+            instanceRoster.reset()
+            restorePending = false
+            status = .connecting
         }
-        guard let stored else { return } // no token: genuinely not paired
+        // Unpaired drops a destination queued while this read was still
+        // running.  Connect and a locked keychain keep it.  `finishLaunchRestore`
+        // clears again, because a tap can still arrive before settle.
+        if !CompanionLaunchRestore.retainsQueuedNotification(decision) {
+            pendingNotification = nil
+        }
+    }
 
-        connection = saved
-        token = stored
-        // New connections honor the desktop's transport policy. Automatic
-        // walking is credential-safe: protected routes stay protected, while
-        // a legacy/local route is only tried when it was the exact saved route.
-        rotation = CandidateRotation(endpoints: saved.orderedEndpoints)
-        let first = rotation.currentEndpoint.map(saved.dialing) ?? saved
-        client = CompanionClient(connection: first, token: stored)
-        pairingGeneration += 1
-        cachedInstances = []
-        status = .connecting
+    private func finishLaunchRestore(generation: Int) {
+        guard generation == launchGeneration else { return }
+        launchRestoreTask = nil
+        launchRestoreSettled = true
+        // A tap can land after `applyLaunchDecision` and before this settle,
+        // while `launchRestoreSettled` is still false and `openNotification`
+        // is still willing to queue.  Clear that queue once the outcome is
+        // unpaired, with no await in between, so the next `pair()` does not
+        // open the stale chat.
+        if !CompanionLaunchRestore.retainsQueuedNotification(launchRestoreDecision) {
+            pendingNotification = nil
+        }
+        activateAfterFirstFrame()
+        guard connectRequested, client != nil else { return }
+        connect()
+    }
+
+    /// Drop an in-flight restore so it cannot publish over sign-out or a
+    /// pairing that just committed.
+    private func cancelLaunchRestore() {
+        launchGeneration += 1
+        launchRestoreTask?.cancel()
+        launchRestoreTask = nil
+        launchRestoreSettled = true
     }
 
     /// Redeem a one-time pairing credential. On success the device token goes
@@ -257,6 +599,7 @@ final class Session: ObservableObject {
         deviceName: String,
         pairRequestId: String
     ) async throws {
+        cancelLaunchRestore()
         var invited = connection
         // QR invites already carry this policy. Manual entry reaches the
         // session as a parsed Connection, so establish the same consent
@@ -300,9 +643,8 @@ final class Session: ObservableObject {
                 forKey: CompanionOnboardingPreferences.pendingNotificationOnboardingKey
             )
         } saveConnection: {
-            UserDefaults.standard.set(
-                try? JSONEncoder().encode(stored),
-                forKey: Self.connectionKey
+            CompanionConnectionStore.saveConnectionData(
+                try? JSONEncoder().encode(stored)
             )
         }
 
@@ -321,9 +663,11 @@ final class Session: ObservableObject {
             token: paired.token
         )
         pairingGeneration += 1
+        cancelPendingSettingsMutations()
         self.state = CompanionState()
         instanceDriverKinds = [:]
         cachedInstances = []
+        instanceRoster.reset()
         // A fresh pairing settles any restore that was still waiting on the
         // keychain — the token is in hand, so there is nothing left to retry.
         restorePending = false
@@ -364,6 +708,10 @@ final class Session: ObservableObject {
     }
 
     func signOut() {
+        cancelLaunchRestore()
+        connectRequested = false
+        stopVoice()
+        discardDeltas()
         streamTask?.cancel()
         streamTask = nil
         endpointRefreshTask?.cancel()
@@ -378,10 +726,14 @@ final class Session: ObservableObject {
             after: .signedOut
         )
         if let id = connection?.id { Keychain.remove(id) }
-        UserDefaults.standard.removeObject(forKey: Self.connectionKey)
+        CompanionConnectionStore.saveConnectionData(nil)
         UserDefaults.standard.removeObject(
             forKey: CompanionOnboardingPreferences.pendingNotificationOnboardingKey
         )
+        // The sidecar forgets this device's token when the pairing is
+        // removed, so a later re-pair to the very same Mac must be free to
+        // post again even if the token itself never changed.
+        UserDefaults.standard.removeObject(forKey: Self.postedPushTokenKey)
         connection = nil
         client = nil
         token = nil
@@ -389,9 +741,13 @@ final class Session: ObservableObject {
         state = CompanionState()
         pushSenderHealth = nil
         pushSenderHealthNotReported = false
+        sharedMemoryStatus = nil
+        sharedMemoryNotReported = false
         instanceDriverKinds = [:]
         cachedInstances = []
+        instanceRoster.reset()
         pairingGeneration += 1
+        cancelPendingSettingsMutations()
         resetAvatarCache()
         NotificationCoordinator.shared.setBadge(0)
         status = .unpaired
@@ -401,10 +757,16 @@ final class Session: ObservableObject {
 
     /// Called when the app comes to the front, and once at launch.
     func connect() {
+        connectRequested = true
         // A restore that found the keychain locked left `client` nil on
         // purpose. Coming to the front is the moment worth retrying on: the
         // app is on screen, so the phone is in someone's hand and unlocked.
-        if client == nil, restorePending { restore() }
+        // The retry reads the keychain off the main thread, same as launch.
+        if client == nil, !launchRestoreSettled || restorePending {
+            scheduleLaunchRestore(yieldsFirst: false)
+            endLinger()
+            return
+        }
         if client != nil, let pendingNotification {
             self.pendingNotification = nil
             Task { [weak self] in await self?.openNotification(pendingNotification) }
@@ -414,13 +776,16 @@ final class Session: ObservableObject {
         guard client != nil else { return }
         if let existing = streamTask {
             if case .offline = status {
+                // Same stale-cursor hazard as `restartStream()`: publish
+                // held deltas before the replacement stream resumes.
+                flushDeltas()
                 existing.cancel()
                 streamTask = nil
             } else {
                 return
             }
         }
-        reconnectDelay = 0
+        reconnectBackoff.reset()
         streamGeneration += 1
         let generation = streamGeneration
         streamTask = Task { [weak self] in
@@ -457,13 +822,17 @@ final class Session: ObservableObject {
     /// session, including on cellular, whether or not anyone is looking.
     /// The reconnect resumes from the cursor, so nothing is missed.
     func watchScreen(of botId: String) {
-        screenWatchers += 1
-        if screenWatchers == 1 { restartStream() }
+        let count = screenWatchers[botId, default: 0]
+        screenWatchers[botId] = count + 1
+        if count == 0 { restartStream() }
     }
 
     func stopWatchingScreen(of botId: String) {
-        screenWatchers = max(0, screenWatchers - 1)
-        if screenWatchers == 0 {
+        guard let count = screenWatchers[botId] else { return }
+        if count > 1 {
+            screenWatchers[botId] = count - 1
+        } else {
+            screenWatchers.removeValue(forKey: botId)
             state.clearScreen(botId)
             restartStream()
         }
@@ -473,6 +842,11 @@ final class Session: ObservableObject {
     /// cursor survives, so this is a gap, not a reset.
     private func restartStream() {
         guard streamTask != nil else { return }
+        // Publish held deltas and commit their cursor first: the new stream
+        // resumes from that cursor, so anything left buffered would be both
+        // replayed by the server and flushed locally — the same tokens
+        // appended twice, with no dedupe on live text (BF-2608).
+        flushDeltas()
         streamTask?.cancel()
         streamTask = nil
         connect()
@@ -481,7 +855,14 @@ final class Session: ObservableObject {
     /// Called when the app leaves the screen. iOS will kill the connection
     /// anyway; dropping it deliberately means the cursor is written down at
     /// a known point instead of wherever the socket happened to die.
+    ///
+    /// A reply being read aloud is left alone: its clips come over their own
+    /// requests, not this stream, and the `audio` background mode keeps it
+    /// playing after the linger window closes.  Sign-out still stops it.
     func disconnect() {
+        // Held deltas publish before the stream goes away, so backgrounding
+        // never strands the tail of a reply mid-window (BF-2608).
+        flushDeltas()
         streamTask?.cancel()
         streamTask = nil
         endpointRefreshTask?.cancel()
@@ -531,11 +912,65 @@ final class Session: ObservableObject {
         lingerTask = .invalid
     }
 
+    /// Publish every held delta as one state mutation, and commit the
+    /// cursor those deltas arrived with. Called on the flush interval, on
+    /// the buffer's own bounds, before any frame that must observe or clear
+    /// the live text, and when the stream ends — so the text a turn-ending
+    /// frame clears, and the text a settled message supersedes, is always
+    /// the complete text.
+    private func flushDeltas() {
+        deltaFlushTask?.cancel()
+        deltaFlushTask = nil
+        guard !deltaBuffer.isEmpty else {
+            if let bufferedSeq { state.advance(to: bufferedSeq) }
+            bufferedSeq = nil
+            return
+        }
+        let events = deltaBuffer.drain()
+        let seq = bufferedSeq
+        bufferedSeq = nil
+        // One assignment, one publish: mutating the `@Published` struct per
+        // coalesced event plus once for the cursor would re-invalidate the
+        // transcript once per stream key and defeat the batching.
+        var next = state
+        next.applyCoalesced(events)
+        if let seq { next.advance(to: seq) }
+        state = next
+        NotificationCoordinator.shared.setBadge(state.unreadCount)
+    }
+
+    /// Hold deltas until the flush interval, unless the bounds trip first.
+    /// The first delta of a burst arms the timer; later ones join the same
+    /// window, so a steady stream publishes at the interval and a burst
+    /// publishes once.
+    private func scheduleDeltaFlush() {
+        guard deltaFlushTask == nil else { return }
+        deltaFlushTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(Int64(StreamingDeltaBuffer.flushInterval * 1_000)))
+            guard !Task.isCancelled, let self else { return }
+            self.deltaFlushTask = nil
+            self.flushDeltas()
+        }
+    }
+
+    /// Drop held deltas without publishing. Sign-out replaces the whole
+    /// state, so draining into it first would only publish text nobody
+    /// keeps; a cancelled stream, by contrast, flushes (see `run()`),
+    /// because the state survives it.
+    private func discardDeltas() {
+        deltaFlushTask?.cancel()
+        deltaFlushTask = nil
+        _ = deltaBuffer.drain()
+        bufferedSeq = nil
+    }
+
     private func run() async {
         while !Task.isCancelled {
             guard let client else { return }
             status = .connecting
             log.info("opening stream, cursor=\(self.state.cursor ?? "none", privacy: .public)")
+            var isGatewayFailure = false
+            var offlineMessage: String?
             do {
                 // The query is fixed when the connection opens, so changing
                 // it means a new connection — `restartStream()` cancels this
@@ -543,9 +978,40 @@ final class Session: ObservableObject {
                 // breaking out here instead would fall through to the "the
                 // harness went away" path and flash a lost-connection banner
                 // on what is actually a deliberate reconnect.
-                for try await frame in try client.events(since: state.cursor, screens: screenWatchers > 0) {
+                for try await frame in try client.events(
+                    since: state.cursor,
+                    screens: !screenWatchers.isEmpty,
+                    screenBotIds: Array(screenWatchers.keys).sorted()
+                ) {
                     if Task.isCancelled { return }
-                    reconnectDelay = 0
+                    reconnectBackoff.reset()
+
+                    // BF-2608: hold streamed deltas for one publish window.
+                    // Anything else first publishes what is held, so a
+                    // settled message, a turn ending or a reconnect never
+                    // observes a live bubble missing its buffered tail.
+                    if case let .runtime(event) = frame.frame {
+                        switch deltaBuffer.enqueue(event) {
+                        case .buffered:
+                            if let seq = frame.seq { bufferedSeq = max(bufferedSeq ?? seq, seq) }
+                            if deltaBuffer.shouldFlush { flushDeltas() } else { scheduleDeltaFlush() }
+                            continue
+                        case .dropped:
+                            // Never commit past text still held: fold the
+                            // sequence into the pending commit so the flush
+                            // advances once, to the newest sequence seen.
+                            if deltaBuffer.isEmpty {
+                                if let seq = frame.seq { state.advance(to: seq) }
+                            } else if let seq = frame.seq {
+                                bufferedSeq = max(bufferedSeq ?? seq, seq)
+                            }
+                            continue
+                        case .applyNow:
+                            flushDeltas()
+                        }
+                    } else if !deltaBuffer.isEmpty {
+                        flushDeltas()
+                    }
 
                     if case let .hello(cursor, resumed) = frame.frame {
                         log.info("stream live, resumed=\(resumed, privacy: .public)")
@@ -555,6 +1021,11 @@ final class Session: ObservableObject {
                         // the request dies halfway through replay/hydration,
                         // reconnecting must still ask for the missing gap.
                         if !resumed {
+                            // A stream that cannot resume is usually a restarted
+                            // harness, whose describedAt clock owes nothing to
+                            // the last process's.  Keep the roster, drop the
+                            // mark, so the next fetch is not judged against it.
+                            instanceRoster.forgetOrder()
                             coldHydration: while true {
                                 switch try await hydrateSnapshot(using: client) {
                                 case .applied:
@@ -579,6 +1050,10 @@ final class Session: ObservableObject {
                         // Refresh provider marks after reconnect — instances
                         // may have changed while the phone was backgrounded.
                         Task { await self.warmInstanceDriverKinds() }
+                        // Jobs only ride the stream as they change, so a
+                        // connect, or a reconnect that missed frames, asks
+                        // for the whole set once.
+                        Task { await self.loadJobs() }
                         // The last frame this phone saw before the gap may
                         // have said a run was in progress — and the restart
                         // that gap likely IS took the connection down with
@@ -591,6 +1066,14 @@ final class Session: ObservableObject {
                         continue
                     }
                     state.apply(frame)
+                    if case let .message(threadId, message) = frame.frame,
+                       message.role == .bot, message.kind == .text,
+                       let bot = state.bot(forThread: threadId),
+                       bot.speechDevices?.contains("iphone") == true,
+                       UIApplication.shared.applicationState == .active,
+                       !(message.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        playVoice(message, threadId: threadId)
+                    }
                     if case let .notify(notification) = frame.frame {
                         NotificationCoordinator.shared.deliver(notification, sequence: frame.seq)
                     }
@@ -599,10 +1082,18 @@ final class Session: ObservableObject {
                     if case .updateStatus = frame.frame {
                         pollMacUpdateWhileRunning()
                     }
+                    if case let .instances(fetched, describedAt) = frame.frame {
+                        // A pushed roster replaces the cached one, the same as a fetch.
+                        applyInstances(fetched, describedAt: describedAt)
+                    }
                 }
+                // Publish anything still held: the state survives the
+                // reconnect, and dropping the tail would truncate the reply
+                // the reader is watching (BF-2608).
+                flushDeltas()
                 // the stream ended without an error — the harness went away
                 log.notice("stream ended without an error")
-                status = .offline("Lost the connection.")
+                offlineMessage = "Lost the connection."
             } catch let error as APIError where error.isUnauthorized {
                 log.error("stream refused: unauthorized")
                 status = .unauthorized
@@ -615,14 +1106,23 @@ final class Session: ObservableObject {
                     return
                 }
                 log.error("stream failed: \(error.localizedDescription, privacy: .public)")
-                status = .offline(failureMessage(for: error))
+                isGatewayFailure = ConnectionAdvice.isGatewayOutage(error)
+                offlineMessage = failureMessage(for: error)
             }
 
             if Task.isCancelled { return }
-            // 1s, 2s, 4s… to 15s. A phone that woke on a network which is
-            // not the laptop's should not hammer it.
-            reconnectDelay = reconnectDelay == 0 ? 1 : min(reconnectDelay * 2, 15)
-            try? await Task.sleep(nanoseconds: reconnectDelay * 1_000_000_000)
+            // 1s, 2s, 4s… to 15s ordinarily; the cap raises to 60s, with
+            // ±25% jitter throughout, once `isGatewayFailure` has been true
+            // for `ReconnectBackoff.gatewayEscalationThreshold` attempts in
+            // a row — Cloudflare answering every attempt with a
+            // 502/503/530-family status, which means the Mac's sidecar has
+            // nothing listening rather than an ordinary network blip.  That
+            // same run of failures is what flips the status to
+            // `.macOffline` so the banner stops implying a quick retry will
+            // help (IO11).
+            let delay = reconnectBackoff.recordFailure(isGatewayFailure: isGatewayFailure)
+            status = reconnectBackoff.isMacLikelyOffline ? .macOffline : .offline(offlineMessage ?? "Lost the connection.")
+            try? await Task.sleep(nanoseconds: UInt64((delay * 1_000_000_000).rounded()))
         }
     }
 
@@ -637,7 +1137,7 @@ final class Session: ObservableObject {
         let previousMessages = state.messages
         let previousHasMore = state.hasMore
         let previousPending = state.pendingQueued
-        let fleet = try await requestClient.fleet(messages: 50)
+        let fleet = try await requestClient.fleet(messages: 1)
         try Task.checkCancellation()
         guard pairingGeneration == generation else { return .pairingChanged }
         guard state.hydrate(fleet, ifUnchangedSince: hydrationToken) else { return .newerState }
@@ -696,7 +1196,7 @@ final class Session: ObservableObject {
               updated.activeEndpoint?.url != winner.url else { return }
         updated.promote(winner)
         connection = updated
-        UserDefaults.standard.set(try? JSONEncoder().encode(updated), forKey: Self.connectionKey)
+        CompanionConnectionStore.saveConnectionData(try? JSONEncoder().encode(updated))
     }
 
     /// Learn routes enabled after this phone originally paired. The endpoint
@@ -720,10 +1220,7 @@ final class Session: ObservableObject {
 
                 updated.reconcile(metadata)
                 self.connection = updated
-                UserDefaults.standard.set(
-                    try? JSONEncoder().encode(updated),
-                    forKey: Self.connectionKey
-                )
+                CompanionConnectionStore.saveConnectionData(try? JSONEncoder().encode(updated))
 
                 // Keep the currently live route first until this stream ends.
                 // CandidateRotation applies the same no-downgrade policy used
@@ -754,7 +1251,7 @@ final class Session: ObservableObject {
         ) else { return false }
         updated.resetRoutePolicy(selecting: endpoint)
         connection = updated
-        UserDefaults.standard.set(try? JSONEncoder().encode(updated), forKey: Self.connectionKey)
+        CompanionConnectionStore.saveConnectionData(try? JSONEncoder().encode(updated))
         rotation = CandidateRotation(endpoints: updated.orderedEndpoints)
         if let token {
             client = CompanionClient(connection: updated.dialing(endpoint), token: token)
@@ -766,6 +1263,30 @@ final class Session: ObservableObject {
         return true
     }
 
+    /// Commands the engine offers for this conversation.  Nil when the menu
+    /// could not be read, which the meter treats as "not offered".
+    func contextCommands(botId: String, threadId: String) async -> [ContextMeterMath.Command]? {
+        guard let client else { return nil }
+        do {
+            return try await client.contextCommands(botId: botId, threadId: threadId, surface: "ios")
+        } catch {
+            return nil
+        }
+    }
+
+    /// Start compacting.  Nil means it started.  A string is the reason it did not.
+    func compactSession(botId: String, commandId: String, threadId: String) async -> String? {
+        guard let client else { return ContextMeterMath.unavailable }
+        do {
+            try await client.runContextCommand(botId: botId, id: commandId, threadId: threadId, surface: "ios")
+            return nil
+        } catch {
+            let message = (error as? LocalizedError)?.errorDescription?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let message, !message.isEmpty { return message }
+            return ContextMeterMath.unavailable
+        }
+    }
+
     // MARK: - Actions
     //
     // Each of these does the thing and lets the event stream deliver the
@@ -774,9 +1295,21 @@ final class Session: ObservableObject {
     // frame (or 202 queueId) lands. Everything else still waits on the
     // harness so the phone does not invent a second fold.
 
+    struct MessageSendOutcome: Sendable {
+        let ok: Bool
+        let clientNonce: String
+    }
+
     @discardableResult
-    func send(_ text: String, to chat: Chat, attachments: [PendingChatAttachment] = []) async -> Bool {
-        guard let client else { return false }
+    func send(
+        _ text: String,
+        to chat: Chat,
+        attachments: [PendingChatAttachment] = [],
+        recording: (data: Data, transcript: String)? = nil,
+        busyDelivery: String? = nil
+    ) async -> MessageSendOutcome {
+        guard let client else { return MessageSendOutcome(ok: false, clientNonce: "") }
+        var clientNonce = ""
         do {
             var prompt = text
             if !attachments.isEmpty {
@@ -792,14 +1325,29 @@ final class Session: ObservableObject {
                 }
                 prompt = ChatAttachments.composeMessage(text: text, attachments: uploaded)
             }
-            guard !prompt.isEmpty else { return false }
+            guard !prompt.isEmpty else { return MessageSendOutcome(ok: false, clientNonce: "") }
+            let savedRecording: IncomingRecording?
+            if let recording {
+                let path = try await client.uploadRecording(recording.data)
+                savedRecording = IncomingRecording(path: path, transcript: recording.transcript)
+            } else {
+                savedRecording = nil
+            }
             let threadId: String
             switch chat {
             case let .bot(bot): threadId = bot.threadId
             case let .room(room): threadId = room.threadId
             }
             let localId = UUID().uuidString
-            state.rememberPendingSend(threadId: threadId, id: localId, text: prompt, queued: false)
+            clientNonce = localId
+            state.rememberPendingSend(
+                threadId: threadId,
+                id: localId,
+                text: prompt,
+                queued: false,
+                rawText: text,
+                attachments: attachments
+            )
             do {
                 switch chat {
                 case let .bot(bot):
@@ -807,13 +1355,21 @@ final class Session: ObservableObject {
                         text: prompt,
                         toBot: bot.id,
                         threadId: threadId,
-                        idempotencyKey: localId
+                        idempotencyKey: localId,
+                        recording: savedRecording,
+                        busyDelivery: busyDelivery
                     )
                     if result.queued == true, let queueId = result.queueId, !queueId.isEmpty {
                         let dest = result.threadId ?? bot.threadId
                         if dest != threadId {
                             state.cancelPendingQueued(threadId: threadId, queueId: localId)
-                            state.rememberPendingQueued(threadId: dest, queueId: queueId, text: prompt)
+                            state.rememberPendingQueued(
+                                threadId: dest,
+                                queueId: queueId,
+                                text: prompt,
+                                rawText: text,
+                                attachments: attachments
+                            )
                         } else {
                             state.promotePendingSend(threadId: dest, from: localId, to: queueId)
                         }
@@ -823,10 +1379,11 @@ final class Session: ObservableObject {
                         text: prompt,
                         toRoom: room.id,
                         threadId: threadId,
-                        idempotencyKey: localId
+                        idempotencyKey: localId,
+                        recording: savedRecording
                     )
                 }
-                return true
+                return MessageSendOutcome(ok: true, clientNonce: localId)
             } catch {
                 state.cancelPendingQueued(threadId: threadId, queueId: localId)
                 if let apiError = error as? APIError, apiError.isConflict {
@@ -836,19 +1393,51 @@ final class Session: ObservableObject {
             }
         } catch let error as APIError where error.isUnauthorized {
             status = .unauthorized
-            return false
+            return MessageSendOutcome(ok: false, clientNonce: clientNonce)
         } catch {
             recordActionError(error)
-            return false
+            return MessageSendOutcome(ok: false, clientNonce: clientNonce)
         }
     }
 
+    /// iOS hands the device token back on almost every launch, unchanged —
+    /// posting it unconditionally meant every launch was a POST the sidecar
+    /// already had the answer to.  Skip it unless the token itself changed
+    /// or the paired endpoint did (a token is meaningless to a *different*
+    /// Mac, so re-pairing must still post it).  See IO17.
     func registerPushToken(_ hex: String) async {
-        await perform(quietly: true) { try await $0.registerPushToken(hex) }
+        let candidate = PostedPushToken(
+            token: hex,
+            endpointURL: connection?.activeEndpoint?.url ?? connection?.host
+        )
+        let lastPosted = UserDefaults.standard.data(forKey: Self.postedPushTokenKey)
+            .flatMap { try? JSONDecoder().decode(PostedPushToken.self, from: $0) }
+        guard PushTokenRegistration.shouldPost(candidate, lastPosted: lastPosted) else { return }
+
+        let posted = await perform(quietly: true) { try await $0.registerPushToken(hex) }
+        guard posted, let data = try? JSONEncoder().encode(candidate) else { return }
+        UserDefaults.standard.set(data, forKey: Self.postedPushTokenKey)
     }
 
-    func cancelQueued(botId: String, queueId: String) async {
-        guard let client else { return }
+    /// Hand a Live Activity token to the sidecar.
+    ///
+    /// Quietly, and deliberately without the dedupe the device token gets.
+    /// ActivityKit's push-to-start sequence re-emits on rotation rather than
+    /// once per launch, so the repetition here is rotation being reported, not
+    /// a redundant POST — and a token the sidecar has not been told about is
+    /// an app that cannot be reached while it is dead.
+    func registerLiveActivityToken(_ hex: String, kind: LiveActivityTokenKind) async {
+        await perform(quietly: true) { try await $0.registerLiveActivityToken(hex, kind: kind) }
+    }
+
+    func dropPendingQueued(threadId: String, queueId: String) {
+        state.cancelPendingQueued(threadId: threadId, queueId: queueId)
+    }
+
+    /// Returns whether the harness took the queued entry (local chip removed).
+    @discardableResult
+    func cancelQueued(botId: String, queueId: String) async -> Bool {
+        guard let client else { return false }
         func dropLocalChip() {
             if let threadId = state.bot(botId)?.threadId {
                 state.cancelPendingQueued(threadId: threadId, queueId: queueId)
@@ -862,19 +1451,23 @@ final class Session: ObservableObject {
         do {
             try await client.cancelQueued(botId: botId, queueId: queueId)
             dropLocalChip()
+            return true
         } catch let error as APIError where error.isUnauthorized {
             status = .unauthorized
+            return false
         } catch let error as APIError where error.isNotFound {
             let message = error.errorDescription ?? ""
             if message.contains("no route") {
                 // Packaged companion older than #224 deny-lists DELETE /queue/.
                 // Dropping the chip locally would hide a message that still sends.
                 actionError = "This Mac is running an older BotFleet.  Update BotFleet on your computer, then you can cancel a queued message."
-            } else {
-                dropLocalChip()
+                return false
             }
+            dropLocalChip()
+            return true
         } catch {
             recordActionError(error)
+            return false
         }
     }
 
@@ -886,6 +1479,32 @@ final class Session: ObservableObject {
             choice: choice,
             isPermission: card.isPermission
         )
+    }
+
+    /// What this computer can do for a voice call: which providers hold a
+    /// key and which one a call would take.  Booleans and a choice, never a
+    /// key -- the permanent credentials stay on the computer.  Throws so a
+    /// voice call can tell "unreachable" from "no provider" and say so.
+    func voiceCallStatus() async throws -> StsStatus {
+        guard let client else { throw APIError.transport("Not connected to your computer.") }
+        return try await client.stsStatus()
+    }
+
+    /// One short-lived call token.  Spent opening a single realtime session;
+    /// it is not the provider's permanent key and it is not a credential for
+    /// anything else.
+    func voiceCallToken(provider: String) async throws -> StsSessionToken {
+        guard let client else { throw APIError.transport("Not connected to your computer.") }
+        return try await client.stsToken(provider: provider)
+    }
+
+    /// Allow every permission request waiting in this conversation (the
+    /// desktop's "Approve All").  The cards settle through the stream as the
+    /// harness answers each one, so nothing is folded in here.
+    @discardableResult
+    func approveAll(chat: Chat) async -> Bool {
+        let threadId = chat.threadId
+        return await perform { _ = try await $0.approveAll(threadId: threadId) }
     }
 
     /// The same answer, from something that only has the ids — the Live
@@ -923,6 +1542,49 @@ final class Session: ObservableObject {
         }
     }
 
+    /// Answer from a Live Activity's own buttons — the Lock Screen card or the
+    /// Dynamic Island — which is the one place an approval can be given
+    /// without the app ever being opened.
+    ///
+    /// Two things differ from an in-app card.  The system may have cold-launched
+    /// this process to run the intent, so the client is rebuilt on demand
+    /// first, on the same bounded round trip a notification action uses.  And
+    /// the answer is quiet: there is no screen to put an error on, and the
+    /// person tapping is looking at the Lock Screen, not at this thread.
+    ///
+    /// `requestId` and `isPermission` come from the card that drew the buttons,
+    /// so nothing is re-resolved here.  Picking "whatever is pending on this
+    /// thread" instead is the bug PR #383's review caught — it answers a
+    /// different card than the one the person was looking at.
+    @discardableResult
+    func answerFromLiveActivity(
+        threadId: String,
+        requestId: String,
+        choice: String,
+        isPermission: Bool
+    ) async -> Bool {
+        let attempt: @MainActor @Sendable () async throws -> Bool = {
+            while self.client == nil {
+                try await Task.sleep(nanoseconds: 100_000_000)
+                self.connect()
+            }
+            return await self.answer(
+                threadId: threadId,
+                requestId: requestId,
+                choice: choice,
+                isPermission: isPermission,
+                quietly: true
+            )
+        }
+        let bounded = await BackgroundRefreshCoordinator.run(
+            timeoutNanoseconds: Self.liveActivityActionTimeoutNanoseconds
+        ) { try await attempt() }
+        switch bounded {
+        case .newData: return true
+        case .noData, .failed: return false
+        }
+    }
+
     /// A bare notification-action background launch gets a much smaller
     /// execution budget than the 15 s full background-fetch grant in
     /// `CompanionAppDelegate` — long enough for one hydrate-and-respond
@@ -930,6 +1592,13 @@ final class Session: ObservableObject {
     /// enough to stay well inside what iOS is likely to allow before
     /// reclaiming the process.
     private static let approvalActionTimeoutNanoseconds: UInt64 = 8_000_000_000
+
+    /// A Live Activity intent is not a notification action.  Nothing is
+    /// holding a completion handler that has to be released, and the system
+    /// keeps the app alive for its own background window, so this gets the
+    /// longer budget — still bounded, because a process left waiting on a
+    /// harness that never answers is reclaimed either way.
+    private static let liveActivityActionTimeoutNanoseconds: UInt64 = 20_000_000_000
 
     /// Signals "this attempt could not even be made" (no client within the
     /// timeout, or the answer itself failed) to `BackgroundRefreshCoordinator`,
@@ -987,8 +1656,8 @@ final class Session: ObservableObject {
         // the body read them at all.
         let attempt: @MainActor @Sendable () async throws -> Bool = {
             // Poll rather than fail on the first check: a cold launch may
-            // still be rebuilding the client — `restore()` reading the
-            // keychain — right now, and one moment later it may well exist.
+            // still be rebuilding the client — the keychain read runs off
+            // the main thread — and one moment later it may well exist.
             // No inner cap of its own: `run`'s 8 s deadline above is the
             // only timeout, and cancelling this sleep when that deadline
             // hits is what reaches `.failed` correctly.
@@ -1182,13 +1851,53 @@ final class Session: ObservableObject {
         }
     }
 
+    /// Duplicate a bot: make a new one, then copy onto it the profile fields a
+    /// paired phone is allowed to set (`BotDuplicate.profilePatch`).  The new
+    /// bot is folded in as soon as it exists, so if filling in its profile
+    /// fails the person still sees the bot that was made, with the reason.
+    @discardableResult
+    func duplicateBot(_ source: Bot) async -> Bot? {
+        guard let client else { return nil }
+        let patch = BotDuplicate.profilePatch(from: source)
+        let created: Bot
+        do {
+            created = try await client.createBot()
+            state.apply(.bot(created))
+        } catch {
+            recordActionError(error)
+            return nil
+        }
+        do {
+            let patched = try await client.updateProfile(botId: created.id, patch: patch)
+            state.apply(.bot(patched))
+            return patched
+        } catch {
+            if !isCancellation(error) {
+                actionError = "The new bot was made, but its profile could not be copied.\u{00A0} \(error.localizedDescription)"
+            }
+            return created
+        }
+    }
+
     /// Make a room from the phone. Same shape as `createBot`: fold it in
     /// rather than wait for a broadcast, and hand it back so it can be opened.
     @discardableResult
-    func createRoom(name: String?, memberIds: [String]) async -> Room? {
+    func createRoom(
+        name: String?,
+        memberIds: [String],
+        cwd: String? = nil,
+        bulletin: String? = nil,
+        defaultResponder: GroupResponder? = nil
+    ) async -> Room? {
         guard let client else { return nil }
         do {
-            let room = try await client.createRoom(name: name, memberIds: memberIds)
+            let room = try await client.createRoom(
+                name: name,
+                memberIds: memberIds,
+                cwd: cwd,
+                bulletin: bulletin,
+                defaultResponder: defaultResponder
+            )
             state.apply(.room(room))
             return room
         } catch {
@@ -1230,7 +1939,16 @@ final class Session: ObservableObject {
     /// completion, and `connect` keeps the event stream ready during the
     /// remaining background execution window.
     func refreshFromRemoteNotification() async throws -> Bool {
-        if client == nil, restorePending { restore() }
+        if client == nil, restorePending || !launchRestoreSettled {
+            connect()
+            // The delegate's background budget is 15 seconds.  Leave the rest
+            // of it for the hydrate after the keychain read returns.
+            let deadline = Date().addingTimeInterval(8)
+            while client == nil, !Task.isCancelled, Date() < deadline,
+                  !launchRestoreSettled || launchRestoreTask != nil {
+                try await Task.sleep(nanoseconds: 50_000_000)
+            }
+        }
         guard let client else { return false }
         connect()
         switch try await hydrateSnapshot(using: client) {
@@ -1240,21 +1958,52 @@ final class Session: ObservableObject {
         }
     }
 
-    /// Fetch a post-resume snapshot before local-only Live Activities are
-    /// allowed to reappear.  A racing SSE frame invalidates the snapshot; retry
-    /// with bounded backoff until one lands without overwriting newer stream
-    /// state.  The caller cancels this quiet loop on the next background
-    /// transition.
+    /// Wait for the current app-open to settle before local-only Live
+    /// Activities are allowed to reappear, without issuing a second
+    /// full-fleet fetch of our own on top of the one `connect()` may
+    /// already be doing.
+    ///
+    /// `run()`'s hello handling already resumes the SSE cursor and, only
+    /// when the hello frame reports `resumed: false`, performs the one cold
+    /// hydration the app needs.  This used to call `hydrateSnapshot` here
+    /// too, unconditionally — a second full-fleet download on every
+    /// foreground even when the resume needed none at all (IO13).  So this
+    /// now just waits for `connect()`'s own stream to reach `.live`, which
+    /// covers both cases: a resumed stream needed no hydrate, and a cold
+    /// one already got its hydrate from `run()` before flipping to `.live`.
+    /// Only a stream that cannot settle within the deadline — resume not
+    /// possible, or no route to the Mac yet — falls back to one direct
+    /// hydrate here, so Live Activities still get *something*.
     func refreshLiveActivityState() async -> CompanionState? {
+        var clientWaitBackoff = LiveActivityRefreshBackoff()
+        while client == nil, !Task.isCancelled {
+            if restorePending || !launchRestoreSettled { connect() }
+            guard client == nil else { break }
+            let delay = clientWaitBackoff.takeNextDelay()
+            try? await Task.sleep(nanoseconds: delay)
+        }
+        guard !Task.isCancelled, client != nil else { return nil }
+
+        connect()
+        let deadline = Date().addingTimeInterval(10)
+        while !Task.isCancelled, Date() < deadline {
+            switch status {
+            case .live:
+                return state
+            case .unauthorized:
+                return nil
+            case .unpaired, .connecting, .offline, .macOffline:
+                break
+            }
+            try? await Task.sleep(nanoseconds: 150_000_000)
+        }
+        guard !Task.isCancelled else { return nil }
+
+        // The stream did not settle in time — fall back to one direct
+        // hydrate, with the same bounded retry the direct fetch always had.
         var retryBackoff = LiveActivityRefreshBackoff()
         while !Task.isCancelled {
-            if client == nil, restorePending { restore() }
-            guard let requestClient = client else {
-                let delay = retryBackoff.takeNextDelay()
-                try? await Task.sleep(nanoseconds: delay)
-                continue
-            }
-            connect()
+            guard let requestClient = client else { return nil }
             do {
                 switch try await hydrateSnapshot(using: requestClient) {
                 case .applied:
@@ -1300,6 +2049,17 @@ final class Session: ObservableObject {
         }
     }
 
+    /// Ask the paired Mac to open or unhide the BotFleet desktop app.
+    func openDesktopApp() async throws {
+        guard let client else { throw APIError.transport("This computer is not paired.") }
+        do {
+            try await client.openDesktopApp()
+        } catch let error as APIError where error.isUnauthorized {
+            status = .unauthorized
+            throw error
+        }
+    }
+
     func markRead(_ chat: Chat) async {
         await perform(quietly: true) {
             switch chat {
@@ -1316,6 +2076,57 @@ final class Session: ObservableObject {
             state.prepend(page, toThread: threadId)
         } catch {
             recordActionError(error)
+        }
+    }
+
+    /// Fetch the newest page of messages for a thread that was hydrated
+    /// with only a one-message preview stub.
+    ///
+    /// Called from ChatView when the chat is first opened, so the main-thread
+    /// text-layout cost is deferred until the user actually navigates to that
+    /// chat rather than paid up front for every bot at launch.
+    ///
+    /// There is deliberately no "already populated" skip.  A thread holding
+    /// 50+ rows can still have a hole above them: a reconnect hydrate merges
+    /// only the newest-message stub, so anything that arrived while the
+    /// phone was offline lands as an isolated tip, and `loadOlder` pages
+    /// only backward from the oldest held row — the missed middle would
+    /// never be repaired.  A missing `hasMore` entry must not skip either:
+    /// it means the hydrate carried no page information for this thread,
+    /// and ChatView's `.task(id:)` will not rerun for the same threadId,
+    /// so skipping would pin the stub forever.  Refetching the newest page
+    /// on open is the repair for both, and `merge` deduplicates by message
+    /// id, so a thread that was already complete pays one redundant fetch
+    /// and changes nothing.
+    func loadInitialMessages(threadId: String) async {
+        guard let client else { return }
+        do {
+            // No `before:` — returns the newest 50, which includes the stub
+            // message already in state.  merge() deduplicates by message id.
+            let page = try await client.messages(threadId: threadId)
+            state.merge(page, intoThread: threadId)
+        } catch {
+            recordActionError(error)
+        }
+    }
+
+    /// Load the first page for every thread still holding only its
+    /// one-message hydrate stub.
+    ///
+    /// `pendingApprovals` derives from held messages, and the fleet payload
+    /// carries no per-thread pending signal, so a thread whose unanswered
+    /// card is not its newest message is invisible to the Approvals surface
+    /// and the chat list's waiting markers until its page is loaded.
+    /// Backfilling the stubs — and only the stubs; a thread already holding
+    /// a page is skipped — restores that derivation without returning to a
+    /// bulk hydrate: the launch fetch stays at one message per thread, and
+    /// this runs when the chat list goes live, off the launch path.
+    func backfillStubThreads() async {
+        let threadIds = state.bots.map(\.threadId) + state.rooms.map(\.threadId)
+        for threadId in threadIds {
+            guard (state.messages[threadId]?.count ?? 0) < 50,
+                  state.hasMore[threadId] ?? true else { continue }
+            await loadInitialMessages(threadId: threadId)
         }
     }
 
@@ -1379,6 +2190,57 @@ final class Session: ObservableObject {
         catch { recordActionError(error) }
     }
 
+    /// Open a retained thread for reading without making it the execution
+    /// target. Passive: the pin moves, `Bot.threadId` does not, so the
+    /// running turn is untouched and `switchTask` is never called. The
+    /// busy gate stays exactly where it was — on switching alone.
+    func viewThread(_ task: BotTask, for bot: Bot) async {
+        guard task.threadId != bot.threadId,
+              (bot.tasks ?? []).contains(where: { $0.threadId == task.threadId })
+        else {
+            if task.threadId == bot.threadId { showActiveThread(for: bot) }
+            return
+        }
+        // Only a retained, non-active thread needs its own page; the active
+        // thread already lives on the bot. Reading never consults busy —
+        // that guard stays on switching alone.
+        guard state.viewThread(botId: bot.id, threadId: task.threadId) else { return }
+        guard let client else {
+            state.threadTranscriptFailed(threadId: task.threadId)
+            return
+        }
+        guard threadViewFetches.insert(task.threadId).inserted else { return }
+        defer { threadViewFetches.remove(task.threadId) }
+        do {
+            let page = try await client.messages(threadId: task.threadId)
+            state.threadTranscriptLoaded(
+                threadId: task.threadId,
+                messages: page.messages,
+                hasMore: page.hasMore
+            )
+        } catch {
+            state.threadTranscriptFailed(threadId: task.threadId)
+            recordActionError(error)
+        }
+    }
+
+    /// Return to the bot's active thread from a viewed one.
+    func showActiveThread(for bot: Bot) {
+        state.viewThread(botId: bot.id, threadId: nil)
+    }
+
+    /// Fetch the viewed thread's first page when its screen appears without
+    /// one — the store answers whether a fetch is still needed, so only a
+    /// fetched page suppresses it; frames that landed first are buffered
+    /// and merge after the page instead.
+    func ensureViewedThreadLoaded() async {
+        guard let botId = state.viewedBotId, let threadId = state.viewedThreadId,
+              let bot = state.bot(botId),
+              let task = bot.tasks?.first(where: { $0.threadId == threadId })
+        else { return }
+        await viewThread(task, for: bot)
+    }
+
     func renameTask(_ task: BotTask, for bot: Bot, title: String) async {
         guard let client else { return }
         do {
@@ -1387,9 +2249,158 @@ final class Session: ObservableObject {
         } catch { recordActionError(error) }
     }
 
+    /// Snooze one thread, or wake it with nil.  Refreshes rather than
+    /// guessing: the harness heals a deadline that has already passed, so
+    /// what it hands back is the only reading of "asleep" worth painting.
+    @discardableResult
+    func snoozeTask(_ task: BotTask, for bot: Bot, snoozedUntil: Double?) async -> Bool {
+        guard let client else { return false }
+        do {
+            try await client.snoozeTask(botId: bot.id, threadId: task.threadId, snoozedUntil: snoozedUntil)
+            await refresh()
+            return true
+        } catch {
+            recordActionError(error)
+            return false
+        }
+    }
+
     func deleteTask(_ task: BotTask, for bot: Bot) async {
         guard let client else { return }
         do { state.apply(.bot(try await client.deleteTask(botId: bot.id, threadId: task.threadId))) }
+        catch { recordActionError(error) }
+    }
+
+    // MARK: - Roster organization
+    //
+    // Archive, Restore, Pin, Mark As Unread, Make Chief Of Staff, Move To
+    // Section, Pin Message, and Delete.  Each applies the harness's answer
+    // as soon as it arrives, the way `updateProfile` does, instead of waiting
+    // for the stream frame that follows.  The rules about what may be asked
+    // live in `BotOrganize`.
+
+    /// The bot PATCH, throwing the harness's refusal so a caller inside a
+    /// sheet can show it there.  No pairing reads as a cancelled tap: the
+    /// same silence every other action here gives it.
+    @MainActor
+    func applyOrganize(_ patch: BotOrganizePatch, to bot: Bot) async throws -> Bot {
+        guard let client, !patch.isEmpty else { throw CancellationError() }
+        let updated = try await client.organizeBot(id: bot.id, patch: patch)
+        // A new Chief of Staff demotes the old one in its section.  The
+        // harness sends that bot as its own frame too; folding it in now
+        // keeps the roster from showing two at once.  A bot deleted while the
+        // request was in flight is not put back (`botsToApply`).
+        for folded in BotOrganize.botsToApply(after: updated, in: state.bots) {
+            state.apply(.bot(folded))
+        }
+        return updated
+    }
+
+    /// `applyOrganize`, reporting a refusal through `actionError`.
+    @MainActor
+    @discardableResult
+    func organizeBot(_ bot: Bot, _ patch: BotOrganizePatch) async -> Bot? {
+        do {
+            return try await applyOrganize(patch, to: bot)
+        } catch {
+            recordActionError(error)
+            return nil
+        }
+    }
+
+    /// Delete a bot for good.  Throws the harness's refusal (a running Local
+    /// VM action is a 409 with a sentence) so the caller decides where to
+    /// show it.  On success the bot leaves `state` now rather than when the
+    /// `bot.deleted` frame lands, so no screen is left showing it.
+    @MainActor
+    func deleteBot(_ bot: Bot) async throws {
+        guard let client else { throw CancellationError() }
+        try await client.deleteBot(id: bot.id)
+        state.apply(.botDeleted(botId: bot.id))
+    }
+
+    /// Delete a room and its transcripts.  Same shape as `deleteBot`.
+    @MainActor
+    func deleteRoom(_ room: Room) async throws {
+        guard let client else { throw CancellationError() }
+        try await client.deleteRoom(id: room.id)
+        state.apply(.roomDeleted(groupId: room.id))
+    }
+
+    /// Move To Section for a room.  A blank or nil name takes it out.
+    @MainActor
+    @discardableResult
+    func moveRoom(_ room: Room, toSection section: String?) async -> Bool {
+        let value: BotProfilePatch.SectionString
+        if let name = BotOrganize.normalizedSection(section) {
+            value = .set(name)
+        } else {
+            value = .clear
+        }
+        return await patchRoom(room, RoomPatch(section: value))
+    }
+
+    /// Pin Message, or unpin with nil, in a bot chat or a room.
+    @MainActor
+    @discardableResult
+    func pinMessage(_ messageId: String?, in chat: Chat) async -> Bool {
+        switch chat {
+        case let .bot(bot):
+            return await organizeBot(bot, .pinMessage(messageId)) != nil
+        case let .room(room):
+            return await patchRoom(room, RoomPatch(pinnedMessageId: MessagePin(messageId)))
+        }
+    }
+
+    @MainActor
+    private func patchRoom(_ room: Room, _ patch: RoomPatch) async -> Bool {
+        guard let client else { return false }
+        do {
+            let updated = try await client.updateRoom(id: room.id, patch: patch)
+            if state.rooms.contains(where: { $0.id == updated.id }) {
+                state.apply(.room(updated))
+            }
+            return true
+        } catch {
+            recordActionError(error)
+            return false
+        }
+    }
+
+    /// Bring one message of the open chat into view, as a search hit does.
+    func focus(_ messageId: String) {
+        focusedMessageId = messageId
+    }
+
+    // MARK: - Room tasks
+    //
+    // A channel's separate conversations, mirrored from the bot task methods
+    // above.  Create, switch and delete answer with the room as it now stands,
+    // transcript included, so the answer is folded in directly.
+
+    func createRoomTask(for room: Room, title: String?) async {
+        guard let client else { return }
+        do { state.apply(.room(try await client.createRoomTask(roomId: room.id, title: title))) }
+        catch { recordActionError(error) }
+    }
+
+    func switchRoomTask(_ task: BotTask, for room: Room) async {
+        guard let client, task.threadId != room.threadId else { return }
+        do { state.apply(.room(try await client.switchRoomTask(roomId: room.id, threadId: task.threadId))) }
+        catch { recordActionError(error) }
+    }
+
+    func renameRoomTask(_ task: BotTask, for room: Room, title: String) async {
+        guard let client else { return }
+        do {
+            try await client.renameRoomTask(roomId: room.id, threadId: task.threadId, title: title)
+            await refresh()
+        } catch { recordActionError(error) }
+    }
+
+    func deleteRoomTask(_ task: BotTask, for room: Room) async {
+        guard let client else { return }
+        do { state.apply(.room(try await client.deleteRoomTask(roomId: room.id, threadId: task.threadId))) }
         catch { recordActionError(error) }
     }
 
@@ -1461,10 +2472,20 @@ final class Session: ObservableObject {
     }
 
     @MainActor
-    func updateProfile(_ patch: BotProfilePatch, for bot: Bot) async -> Bot? {
+    /// `withoutDeviceVoices` is the same save for a computer that predates
+    /// per-device voices.  Such a computer refuses the whole PATCH over the
+    /// `voices` key, so it is sent once more without it, rather than losing a
+    /// rename or a model change made in the same sheet.
+    func updateProfile(_ patch: BotProfilePatch, for bot: Bot, withoutDeviceVoices: BotProfilePatch? = nil) async -> Bot? {
         guard let client else { return nil }
         do {
-            let updated = try await client.updateProfile(botId: bot.id, patch: patch)
+            let updated: Bot
+            do {
+                updated = try await client.updateProfile(botId: bot.id, patch: patch)
+            } catch let refusal where withoutDeviceVoices != nil && BotVoiceEdit.isDeviceVoicesUnsupported(refusal) {
+                guard let fallback = withoutDeviceVoices, !Task.isCancelled else { return nil }
+                updated = try await client.updateProfile(botId: bot.id, patch: fallback)
+            }
             guard !Task.isCancelled else { return nil }
             state.apply(.bot(updated))
             return updated
@@ -1534,9 +2555,447 @@ final class Session: ObservableObject {
     }
 
     func voiceOptions() async -> [Voice] {
-        guard let client else { return [] }
+        guard let client else { return previewVoiceOptions ?? [] }
         do { return try await client.voices() }
         catch { recordActionError(error); return [] }
+    }
+
+    // MARK: - Workspace voice settings
+
+    /// Save the workspace default voice.  Returns the refusal in words, or
+    /// nil when it saved.
+    @MainActor
+    func updateDefaultVoice(_ voiceId: String) async -> String? {
+        guard let client else {
+            // The store preview has no computer; apply it here so the screen
+            // can be exercised.
+            guard previewVoiceOptions != nil else { return "Connect a computer first." }
+            config?.tts?.voice = voiceId
+            return nil
+        }
+        let pairing = pairingGeneration
+        do {
+            let status = try await client.updateDefaultVoice(voiceId)
+            guard pairingGeneration == pairing else { return nil }
+            config = status
+            return nil
+        } catch {
+            return isCancellation(error) ? nil : error.localizedDescription
+        }
+    }
+
+    /// Replace the workspace pronunciation list.  Returns the refusal in
+    /// words, or nil when it saved.
+    @MainActor
+    func updatePronunciations(_ list: [Pronunciation]) async -> String? {
+        guard let client else {
+            guard previewVoiceOptions != nil else { return "Connect a computer first." }
+            config?.tts?.pronunciations = list
+            return nil
+        }
+        let pairing = pairingGeneration
+        do {
+            let status = try await client.updatePronunciations(list)
+            guard pairingGeneration == pairing else { return nil }
+            config = status
+            return nil
+        } catch {
+            return isCancellation(error) ? nil : error.localizedDescription
+        }
+    }
+
+    func stopVoice() {
+        let wasPlaying = voiceTask != nil || voicePlayer != nil || PersonalVoiceService.shared.isSpeaking
+        voiceGeneration = UUID()
+        voiceTask?.cancel()
+        voiceTask = nil
+        voicePrefetch?.cancel()
+        voicePrefetch = nil
+        voicePlayer?.stop()
+        voicePlayer = nil
+        voicePlayback?.finish(false)
+        voicePlayback = nil
+        PersonalVoiceService.shared.stop()
+        // The highlight follows the voice: an early stop clears it at once.
+        // A reply read to the end keeps its short linger.
+        KaraokeCenter.shared.stop()
+        speakingMessageId = nil
+        // The interruption belonged to the read that just ended.  Left set,
+        // its late end would stop the next read.
+        voiceInterrupted = false
+        if wasPlaying { try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation) }
+    }
+
+    /// Runs `work` with background execution time.  The `audio` background
+    /// mode keeps the app running only while something plays, so a locked
+    /// phone could be suspended in the silent waits of a read: the request
+    /// that plans it, and a clip that is not ready when the last one ends.
+    private func withVoiceBackgroundTime<T>(_ work: () async throws -> T) async rethrows -> T {
+        let time = VoiceBackgroundTime()
+        defer { time.end() }
+        return try await work()
+    }
+
+    /// Read a bot reply aloud with the voice this bot uses on the iPhone.
+    ///
+    /// The harness projects the reply for speech either way.  A Personal
+    /// Voice speaks those utterances here; a hosted (MiniMax) voice plays the
+    /// clips progressively, the first while the next is fetched, so a long
+    /// reply starts in seconds instead of waiting on every clip (which the
+    /// companion's 30-second header deadline used to turn into a 504).
+    func playVoice(_ message: Message, threadId: String) {
+        if speakingMessageId == message.id { stopVoice(); return }
+        stopVoice()
+        let bot = state.bot(forThread: threadId)
+        let voiceId = bot?.voice(for: .iphone)
+        let personal = BotVoice.isPersonalVoiceId(voiceId)
+        // A Personal Voice can still read from the local projection without
+        // a client; a hosted voice cannot.
+        guard personal || client != nil else { return }
+        speakingMessageId = message.id
+        let generation = voiceGeneration
+        let client = self.client
+        voiceTask = Task { [weak self] in
+            await self?.readAloud(message, threadId: threadId, botId: bot?.id, voiceId: voiceId, client: client)
+            if self?.voiceGeneration == generation { self?.stopVoice() }
+        }
+    }
+
+    private func readAloud(
+        _ message: Message,
+        threadId: String,
+        botId: String?,
+        voiceId: String?,
+        client: CompanionClient?
+    ) async {
+        let engine: VoiceTelemetry.Engine = BotVoice.isPersonalVoiceId(voiceId) ? .personal : .hosted
+        do {
+            if let voiceId, engine == .personal {
+                try await speakOnDevice(message, threadId: threadId, botId: botId, voiceId: voiceId, client: client)
+                return
+            }
+            guard let client else { return }
+            let answer: MessageVoice
+            do {
+                answer = try await withVoiceBackgroundTime {
+                    try await client.messageVoice(
+                        threadId: threadId, messageId: message.id, device: .iphone, progressive: true
+                    )
+                }
+            } catch {
+                if !isCancellation(error) { VoiceTelemetry.audioRequestFailed(error, stage: "post", engine: .hosted) }
+                throw error
+            }
+            try Task.checkCancellation()
+            if answer.speaksOnDevice {
+                // The harness resolved a Personal Voice this phone did not
+                // know about (a workspace default, or a newer choice).
+                let reading = personalReading(answer, message: message)
+                try await speakPersonal(
+                    reading.segments, voiceId: answer.voice ?? voiceId ?? "", botId: botId,
+                    karaoke: reading.script.map { (message, $0) }
+                )
+            } else {
+                try await playHostedClips(answer, threadId: threadId, message: message, client: client)
+            }
+        } catch {
+            guard !isCancellation(error), !Task.isCancelled else { return }
+            VoiceTelemetry.playbackFailed(error, engine: engine)
+            recordActionError(error)
+        }
+    }
+
+    /// A Personal Voice reads the harness's projection of the reply (no
+    /// markdown, URLs, or code), falling back to the same rules on this
+    /// phone only when the computer cannot answer.  Speaking on the device
+    /// never bills, so a reply over the hosted clip limit (413) is still
+    /// read in full from the local projection.
+    private func speakOnDevice(
+        _ message: Message,
+        threadId: String,
+        botId: String?,
+        voiceId: String,
+        client: CompanionClient?
+    ) async throws {
+        var answered: MessageVoice?
+        var speakWith = voiceId
+        if let client {
+            // Only the request may fall back to the local projection.  A
+            // failure while playing hosted clips below is a playback failure.
+            var answer: MessageVoice?
+            do {
+                answer = try await withVoiceBackgroundTime {
+                    try await client.messageVoice(
+                        threadId: threadId, messageId: message.id, device: .iphone, progressive: true
+                    )
+                }
+            } catch {
+                if isCancellation(error) || Task.isCancelled { throw error }
+                VoiceTelemetry.audioRequestFailed(error, stage: "post", engine: .personal)
+            }
+            try Task.checkCancellation()
+            if let answer {
+                guard answer.speaksOnDevice else {
+                    // The computer resolved a hosted voice for this iPhone;
+                    // this phone's copy of the bot is older.  Play its clips.
+                    try await playHostedClips(answer, threadId: threadId, message: message, client: client)
+                    return
+                }
+                answered = answer
+                if let resolved = answer.voice, BotVoice.isPersonalVoiceId(resolved) { speakWith = resolved }
+            }
+        }
+        let reading = personalReading(answered, message: message)
+        try await speakPersonal(
+            reading.segments,
+            voiceId: speakWith,
+            botId: botId,
+            karaoke: reading.script.map { (message, $0) }
+        )
+    }
+
+    /// What a Personal Voice reads for `message`, and the karaoke script
+    /// that follows it.  The harness's utterances when it answered: the
+    /// distilled rewrite by default (aligned to the message without spans),
+    /// or the written script with its spans (`script: "written"`).  Without
+    /// an answer this phone projects the reply itself, and the highlight
+    /// follows that projection without spans, anchored on words that occur
+    /// once on each side.
+    private func personalReading(_ answer: MessageVoice?, message: Message) -> (segments: [SpeechSegment], script: KaraokeScript?) {
+        if let answer, let utterances = answer.utterances {
+            return (SpeechProjection.segments(fromUtterances: utterances), answer.karaokeScript)
+        }
+        let segments = SpeechProjection.segments(fromReply: message.text ?? "")
+        return (segments, KaraokeScript.unguided(utterances: segments.map(\.text)))
+    }
+
+    private func speakPersonal(
+        _ segments: [SpeechSegment],
+        voiceId: String,
+        botId: String?,
+        karaoke follow: (message: Message, script: KaraokeScript)? = nil
+    ) async throws {
+        let service = PersonalVoiceService.shared
+        if service.authorizationStatus == .notDetermined {
+            _ = await service.requestAuthorization()
+            try Task.checkCancellation()
+        }
+        if !service.hasVoice(voiceId) { notePersonalVoiceMissing(botId: botId, voiceId: voiceId) }
+        // The bubble follows each word the synthesizer reports.
+        var karaoke: MessageKaraoke?
+        if let follow {
+            karaoke = KaraokeCenter.shared.begin(
+                messageId: follow.message.id,
+                messageText: follow.message.text ?? "",
+                script: follow.script,
+                mode: .live,
+                pronunciations: config?.pronunciations ?? []
+            )
+            karaoke?.setChunks(segments.map(\.text))
+        }
+        _ = try await service.speak(segments: segments, voiceId: voiceId) { [weak karaoke] progress in
+            karaoke?.liveWord(chunk: progress.segment, location: progress.location, at: progress.at)
+        }
+        // A stopped read already cleared it; finish only a read that ended.
+        KaraokeCenter.shared.finish(karaoke)
+    }
+
+    /// Say once per bot and voice why a different voice is reading, and
+    /// where to fix it.  Playback goes on with this iPhone's own voice.
+    private func notePersonalVoiceMissing(botId: String?, voiceId: String) {
+        guard personalVoiceMissingNoted.insert("\(botId ?? "")|\(voiceId)").inserted else { return }
+        VoiceTelemetry.personalVoiceMissing()
+        let service = PersonalVoiceService.shared
+        if service.authorizationStatus != .authorized {
+            actionError = "BotFleet cannot use Personal Voice on this iPhone, so the standard voice is reading instead.\u{00A0} Allow it in Settings > Accessibility > Personal Voice, or choose another voice for this iPhone in the bot's profile."
+        } else if service.personalVoices.isEmpty {
+            actionError = "This bot's iPhone voice is a Personal Voice from another device, so the standard voice is reading instead.\u{00A0} Choose a voice for this iPhone in the bot's profile."
+        } else {
+            actionError = "This bot's iPhone voice is a Personal Voice from another device, so your Personal Voice on this iPhone is reading instead.\u{00A0} Choose a voice for this iPhone in the bot's profile."
+        }
+    }
+
+    /// Plays every clip of a hosted reply in order, fetching the next clip
+    /// while the current one plays.  Walks `0..<total`, not the clips that
+    /// were ready when the harness answered.
+    private func playHostedClips(
+        _ answer: MessageVoice,
+        threadId: String,
+        message: Message,
+        client: CompanionClient
+    ) async throws {
+        let messageId = message.id
+        let total = answer.clipCount
+        guard total > 0 else { return }
+        let audioSession = AVAudioSession.sharedInstance()
+        try audioSession.setCategory(.playback, mode: .spokenAudio)
+        try audioSession.setActive(true)
+        // Karaoke over the message, one clip per utterance, for the
+        // distilled script and the written one alike: each word's time is
+        // proportional to its place in its clip, and a clip's real length
+        // replaces the estimate once it plays.
+        var karaoke: MessageKaraoke?
+        if let script = answer.karaokeScript, script.utterances.count == total {
+            karaoke = KaraokeCenter.shared.begin(
+                messageId: messageId,
+                messageText: message.text ?? "",
+                script: script,
+                mode: .clips,
+                pronunciations: config?.pronunciations ?? []
+            )
+        }
+        var next = prefetchClip(0, threadId: threadId, messageId: messageId, client: client)
+        for index in 0..<total {
+            let data: Data
+            do {
+                // Usually already fetched while the last clip played.  When
+                // it is not, nothing plays during this wait.
+                let pending = next
+                data = try await withVoiceBackgroundTime { try await pending.value }
+            } catch {
+                if !isCancellation(error) { VoiceTelemetry.audioRequestFailed(error, stage: "clip", engine: .hosted) }
+                throw error
+            }
+            try Task.checkCancellation()
+            if index + 1 < total {
+                next = prefetchClip(index + 1, threadId: threadId, messageId: messageId, client: client)
+            }
+            try await playClip(data, karaoke: karaoke, index: index)
+        }
+        KaraokeCenter.shared.finish(karaoke)
+    }
+
+    private func prefetchClip(_ index: Int, threadId: String, messageId: String, client: CompanionClient) -> Task<Data, Error> {
+        let task = Task { [weak self] () async throws -> Data in
+            guard let self else { throw CancellationError() }
+            return try await self.fetchClip(index, threadId: threadId, messageId: messageId, client: client)
+        }
+        voicePrefetch = task
+        return task
+    }
+
+    /// One clip, with the bounded retries the harness asks for: a clip still
+    /// being made answers 425, and a job the harness forgot answers 404 and
+    /// is resumed with one more progressive POST.
+    private func fetchClip(_ index: Int, threadId: String, messageId: String, client: CompanionClient) async throws -> Data {
+        var policy = VoiceClipFetchPolicy()
+        while true {
+            do {
+                return try await client.voiceClip(threadId: threadId, messageId: messageId, index: index, device: .iphone)
+            } catch {
+                if isCancellation(error) { throw error }
+                switch policy.decide(statusCode: (error as? APIError)?.statusCode) {
+                case let .retry(after):
+                    try await Task.sleep(nanoseconds: UInt64(after * 1_000_000_000))
+                case .resume:
+                    _ = try await client.messageVoice(threadId: threadId, messageId: messageId, device: .iphone, progressive: true)
+                case .fail:
+                    throw error
+                }
+            }
+        }
+    }
+
+    /// Plays one clip to its end.  Waits on the player's delegate rather
+    /// than polling isPlaying, which an interruption also turns false.
+    private func playClip(_ data: Data, karaoke: MessageKaraoke? = nil, index: Int = 0) async throws {
+        let player = try AVAudioPlayer(data: data)
+        let playback = ClipPlayback()
+        player.delegate = playback
+        guard player.prepareToPlay(), player.play() else { throw APIError.transport("Voice clip could not be played.") }
+        voicePlayer = player
+        voicePlayback = playback
+        karaoke?.attachClip(index, player: player)
+        let finished = await withTaskCancellationHandler {
+            await playback.wait()
+        } onCancel: {
+            Task { @MainActor in playback.finish(false) }
+        }
+        karaoke?.detachClip(index, finished: finished)
+        if voicePlayback === playback {
+            voicePlayback = nil
+            voicePlayer = nil
+        }
+        try Task.checkCancellation()
+        guard finished else { throw APIError.transport("Voice clip could not be played.") }
+    }
+
+    /// Calls, Siri, and alarms pause playback; unplugged headphones stop it.
+    /// A Personal Voice read also handles these in PersonalVoiceService.
+    private func observeVoiceAudioSession() {
+        guard !voiceObserversInstalled else { return }
+        voiceObserversInstalled = true
+        let center = NotificationCenter.default
+        voiceAudioObservers.append(center.addObserver(
+            forName: AVAudioSession.interruptionNotification, object: nil, queue: .main
+        ) { [weak self] note in
+            let typeRaw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
+            let optionsRaw = note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt
+            MainActor.assumeIsolated { self?.handleVoiceInterruption(typeRaw: typeRaw, optionsRaw: optionsRaw) }
+        })
+        voiceAudioObservers.append(center.addObserver(
+            forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main
+        ) { [weak self] note in
+            let reasonRaw = note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt
+            MainActor.assumeIsolated {
+                guard let self, self.speakingMessageId != nil,
+                      reasonRaw.flatMap(AVAudioSession.RouteChangeReason.init(rawValue:)) == .oldDeviceUnavailable
+                else { return }
+                self.stopVoice()
+            }
+        })
+    }
+
+    private func handleVoiceInterruption(typeRaw: UInt?, optionsRaw: UInt?) {
+        guard let type = typeRaw.flatMap(AVAudioSession.InterruptionType.init(rawValue:)) else { return }
+        if type == .began {
+            voiceInterrupted = speakingMessageId != nil
+            return
+        }
+        // Only an interruption a read saw begin; a stale end must not stop
+        // a read that started after it.
+        guard type == .ended, voiceInterrupted else { return }
+        voiceInterrupted = false
+        guard speakingMessageId != nil else { return }
+        // The system already paused the player when the interruption began.
+        guard AVAudioSession.InterruptionOptions(rawValue: optionsRaw ?? 0).contains(.shouldResume) else {
+            stopVoice()
+            return
+        }
+        try? AVAudioSession.sharedInstance().setActive(true)
+        voicePlayer?.play()
+    }
+
+    func playRecording(_ message: Message, threadId: String) {
+        if speakingMessageId == message.id { stopVoice(); return }
+        guard message.recording != nil, let client else { return }
+        stopVoice()
+        speakingMessageId = message.id
+        let generation = voiceGeneration
+        voiceTask = Task { [weak self] in
+            do {
+                let data = try await client.recording(threadId: threadId, messageId: message.id)
+                try Task.checkCancellation()
+                let audioSession = AVAudioSession.sharedInstance()
+                try audioSession.setCategory(.playback, mode: .spokenAudio)
+                try audioSession.setActive(true)
+                let player = try AVAudioPlayer(data: data)
+                guard player.prepareToPlay(), player.play() else { throw APIError.transport("Recording could not be played.") }
+                self?.voicePlayer = player
+                while player.isPlaying && !Task.isCancelled {
+                    try await Task.sleep(nanoseconds: 100_000_000)
+                }
+            } catch {
+                if !Task.isCancelled { self?.recordActionError(error) }
+            }
+            if self?.voiceGeneration == generation { self?.stopVoice() }
+        }
+    }
+
+    func saveRecordingReview(_ message: Message, threadId: String, correction: String, comment: String) async {
+        guard let client else { return }
+        do { _ = try await client.reviewRecording(threadId: threadId, messageId: message.id, correction: correction, comment: comment) }
+        catch { recordActionError(error) }
     }
 
     func previewVoice(_ voiceId: String, for bot: Bot) async -> Data? {
@@ -1547,50 +3006,670 @@ final class Session: ObservableObject {
 
     @MainActor
     func configStatus() async -> ConfigStatus? {
-        guard let client else { return nil }
+        // Departure can await saveProfile() then enqueue saveRoomTimeout(),
+        // replacing `settingsUpdateTail` and bumping generation while a single
+        // await of the prior tail is suspended.  Keep awaiting until generation
+        // is unchanged across an await of the current tail (tail stable), then
+        // capture that generation for the GET guard so we never run concurrent
+        // with a replacement PATCH and apply a stale full status last.
+        let generation: Int
+        while true {
+            let generationAtAwait = settingsUpdateGeneration
+            _ = await settingsUpdateTail?.value
+            if settingsUpdateGeneration == generationAtAwait {
+                generation = generationAtAwait
+                break
+            }
+        }
+        guard let client else { return previewVoiceOptions == nil ? nil : config }
         let status = try? await client.config()
-        if let status { self.config = status }
+        guard let status else { return nil }
+        guard settingsUpdateGeneration == generation else { return nil }
+        self.config = status
         return status
     }
 
     @MainActor
-    func updateConversationMode(_ conversationMode: String, mergeThreads: Bool = false) async -> ConfigStatus? {
+    func updateBusySendDefault(_ busySendDefault: String) async -> ConfigStatus? {
         guard let client else { return nil }
         do {
-            let updated = try await client.updateConversationMode(conversationMode, mergeThreads: mergeThreads)
-            self.config = updated
-            return updated
+            let status = try await client.updateBusySendDefault(busySendDefault)
+            config = status
+            return status
+        } catch let error as APIError where error.isUnauthorized {
+            status = .unauthorized
+            return nil
         } catch {
             recordActionError(error)
             return nil
         }
     }
 
+    func updateConversationMode(_ conversationMode: String, mergeThreads: Bool = false) async -> ConfigStatus? {
+        pendingConversationMode = conversationMode
+        pendingConversationMergeThreads = mergeThreads
+        pendingConversationModeSet = true
+        let outcome = await enqueueSettingsUpdate()
+        guard let outcome, outcome.conversationModeOK == true else { return nil }
+        return outcome.status
+    }
+
     @MainActor
     func updateTerminology(_ terminology: String, custom: RoomLabels? = nil) async -> ConfigStatus? {
-        guard let client else { return nil }
-        do {
-            let updated = try await client.updateTerminology(terminology, custom: custom)
-            self.config = updated
-            return updated
-        } catch {
-            recordActionError(error)
-            return nil
+        pendingTerminology = terminology
+        pendingTerminologyCustom = custom
+        pendingTerminologySet = true
+        let outcome = await enqueueSettingsUpdate()
+        guard let outcome, outcome.terminologyOK == true else { return nil }
+        return outcome.status
+    }
+
+    @MainActor
+    func updateFeatures(showToolCalls: Bool? = nil, summarizeToolCalls: Bool? = nil) async -> ConfigStatus? {
+        if let showToolCalls {
+            pendingFeaturesShowToolCalls = showToolCalls
         }
+        if let summarizeToolCalls {
+            pendingFeaturesSummarizeToolCalls = summarizeToolCalls
+        }
+        guard pendingFeaturesShowToolCalls != nil || pendingFeaturesSummarizeToolCalls != nil else {
+            return config
+        }
+        let outcome = await enqueueSettingsUpdate()
+        guard let outcome, outcome.featuresOK == true else { return nil }
+        return outcome.status
+    }
+
+    @MainActor
+    func updateRoomTurnTimeout(minutes: Int) async -> ConfigStatus? {
+        pendingRoomTurnTimeoutMinutes = minutes
+        pendingRoomTurnTimeout = true
+        let outcome = await enqueueSettingsUpdate()
+        guard let outcome, outcome.timeoutOK == true else { return nil }
+        return outcome.status
+    }
+
+    /// Enable Automatic Update Checks, through `PATCH /api/auto-update`.
+    /// One boolean, so it skips the coalescing queue the other settings
+    /// share; it only waits out a flush already in flight, the way
+    /// `configStatus()` does, so it never lands between that flush's write
+    /// and the status it reads back.  The Mac Update card says the outcome
+    /// in place, so nothing here raises the app-wide alert.
+    @MainActor
+    func setAutoUpdateEnabled(_ enabled: Bool) async -> PhoneWriteOutcome<ConfigStatus> {
+        while true {
+            let generationAtAwait = settingsUpdateGeneration
+            _ = await settingsUpdateTail?.value
+            if settingsUpdateGeneration == generationAtAwait { break }
+        }
+        guard let client else { return .failed(nil) }
+        let pairing = pairingGeneration
+        do {
+            let saved = try await client.setAutoUpdate(enabled: enabled)
+            guard pairingGeneration == pairing else { return .failed(nil) }
+            self.config = saved
+            return .saved(saved)
+        } catch let error as APIError where error.isUnauthorized {
+            self.status = .unauthorized
+            return .failed(nil)
+        } catch {
+            if isCancellation(error) { return .failed(nil) }
+            return PhoneWriteOutcome<ConfigStatus>.failure(error)
+        }
+    }
+
+    /// Set All Bots To Default on the Models screen.  Every bot the harness
+    /// changed also arrives on the event stream as a `bot` frame, which is
+    /// what updates the rows; the reply only says who was left alone.
+    @MainActor
+    func applyModelDefaults(
+        primary: DefaultModelSlot?,
+        fallbacks: [DefaultModelSlot?]
+    ) async -> PhoneWriteOutcome<ApplyModelDefaultsResult> {
+        guard let client else { return .failed(nil) }
+        do {
+            let result = try await client.applyModelDefaults(primary: primary, fallbacks: fallbacks)
+            return .saved(result)
+        } catch let error as APIError where error.isUnauthorized {
+            self.status = .unauthorized
+            return .failed(nil)
+        } catch {
+            if isCancellation(error) { return .failed(nil) }
+            return PhoneWriteOutcome<ApplyModelDefaultsResult>.failure(error)
+        }
+    }
+
+    @MainActor
+    func updateProfile(name: String? = nil, email: String? = nil) async -> ConfigStatus? {
+        // nil means omit (dirty-only PATCH).  Only non-nil args join the coalesce.
+        if let name {
+            pendingProfileName = name
+            pendingProfileHasName = true
+        }
+        if let email {
+            pendingProfileEmail = email
+            pendingProfileHasEmail = true
+        }
+        guard pendingProfileHasName || pendingProfileHasEmail else { return config }
+        let outcome = await enqueueSettingsUpdate()
+        guard let outcome, outcome.profileOK == true else { return nil }
+        return outcome.status
+    }
+
+    /// Chain one settings flush behind any in-flight full-config settings work.
+    /// The latest generation drains every pending field group so a superseded
+    /// task cannot leave another endpoint's coalesce stranded.  Superseded
+    /// waiters follow `settingsUpdateTail` to that drain instead of treating
+    /// latest-wins as a failed save.
+    @MainActor
+    private func enqueueSettingsUpdate() async -> SettingsFlushOutcome? {
+        settingsUpdateGeneration += 1
+        let generation = settingsUpdateGeneration
+        let enqueuePairing = pairingGeneration
+        let previous = settingsUpdateTail
+        let task = Task<SettingsFlushOutcome?, Never> { @MainActor in
+            _ = await previous?.value
+            guard self.pairingGeneration == enqueuePairing else { return nil }
+            // Latest-wins: a newer enqueue already holds our coalesced fields.
+            // Return nil from this generation's task; the waiter below follows
+            // the replacement tail so callers are not told the save failed.
+            guard self.settingsUpdateGeneration == generation else { return nil }
+            return await self.flushPendingSettingsMutations(
+                enqueuePairing: enqueuePairing,
+                generation: generation
+            )
+        }
+        settingsUpdateTail = task
+        if let outcome = await task.value {
+            // Superseded flush may requeue failed fields into a newer generation
+            // and still return a non-nil partial outcome (e.g. timeoutOK == false).
+            // Follow that replacement like the nil supersession path so callers
+            // are not told the save failed when the inheriting flush succeeds.
+            if outcome.hasFailedMutation, settingsUpdateGeneration > generation {
+                if let followed = await awaitSettingsFlushAfterSupersede(
+                    generation: generation,
+                    enqueuePairing: enqueuePairing
+                ) {
+                    return outcome.mergingRequeuedFollow(from: followed)
+                }
+            }
+            return outcome
+        }
+        return await awaitSettingsFlushAfterSupersede(
+            generation: generation,
+            enqueuePairing: enqueuePairing
+        )
+    }
+
+    /// After latest-wins skips our generation, await the flush that inherited
+    /// our pending fields so `updateRoomTurnTimeout` (and siblings) observe
+    /// that outcome instead of a false nil / "Could not save".
+    @MainActor
+    private func awaitSettingsFlushAfterSupersede(
+        generation: Int,
+        enqueuePairing: Int
+    ) async -> SettingsFlushOutcome? {
+        var accumulated: SettingsFlushOutcome?
+        while true {
+            guard pairingGeneration == enqueuePairing else { return nil }
+            let generationAtAwait = settingsUpdateGeneration
+            // We were still the tip and finished with nil → real failure / empty.
+            guard generationAtAwait > generation else { return accumulated }
+            guard let tail = settingsUpdateTail else { return accumulated }
+            let outcome = await tail.value
+            if let outcome {
+                let merged = accumulated.map { $0.mergingRequeuedFollow(from: outcome) } ?? outcome
+                // Superseded partial failure: failed fields were requeued into a
+                // newer flush — keep following, preserving any successes already
+                // confirmed in this chain.
+                if merged.hasFailedMutation, settingsUpdateGeneration > generationAtAwait {
+                    accumulated = merged
+                    continue
+                }
+                return merged
+            }
+            // That tail was also superseded. Loop if a newer generation exists.
+            if settingsUpdateGeneration == generationAtAwait {
+                return accumulated
+            }
+        }
+    }
+
+
+    /// After a mid-flush supersede, restore profile fields that were snapshotted
+    /// but never PATCHed, skipping any field a newer call already coalesced.
+    @MainActor
+    private func requeueUnsentProfileAfterSupersede(
+        sendName: String?,
+        sendEmail: String?,
+        hadProfile: Bool
+    ) {
+        guard hadProfile else { return }
+        if let sendName, !pendingProfileHasName {
+            pendingProfileName = sendName
+            pendingProfileHasName = true
+        }
+        if let sendEmail, !pendingProfileHasEmail {
+            pendingProfileEmail = sendEmail
+            pendingProfileHasEmail = true
+        }
+    }
+
+    @MainActor
+    private func requeueUnsentTimeoutAfterSupersede(
+        timeoutMinutes: Int?,
+        hadTimeout: Bool
+    ) {
+        guard hadTimeout, let timeoutMinutes, !pendingRoomTurnTimeout else { return }
+        pendingRoomTurnTimeoutMinutes = timeoutMinutes
+        pendingRoomTurnTimeout = true
+    }
+
+    @MainActor
+    private func requeueUnsentConversationModeAfterSupersede(
+        mode: String?,
+        mergeThreads: Bool,
+        hadMode: Bool
+    ) {
+        guard hadMode, let mode, !pendingConversationModeSet else { return }
+        pendingConversationMode = mode
+        pendingConversationMergeThreads = mergeThreads
+        pendingConversationModeSet = true
+    }
+
+    @MainActor
+    private func requeueUnsentTerminologyAfterSupersede(
+        terminology: String?,
+        custom: RoomLabels?,
+        hadTerminology: Bool
+    ) {
+        guard hadTerminology, let terminology, !pendingTerminologySet else { return }
+        pendingTerminology = terminology
+        pendingTerminologyCustom = custom
+        pendingTerminologySet = true
+    }
+
+    @MainActor
+    private func requeueUnsentFeaturesAfterSupersede(
+        show: Bool?,
+        summarize: Bool?
+    ) {
+        if show != nil, pendingFeaturesShowToolCalls == nil {
+            pendingFeaturesShowToolCalls = show
+        }
+        if summarize != nil, pendingFeaturesSummarizeToolCalls == nil {
+            pendingFeaturesSummarizeToolCalls = summarize
+        }
+    }
+
+    /// Re-queue every still-unsent snapshot after a mid-flush supersede.
+    @MainActor
+    private func requeueUnsentAfterSupersede(
+        mode: String?,
+        mergeThreads: Bool,
+        hadMode: Bool,
+        terminology: String?,
+        terminologyCustom: RoomLabels?,
+        hadTerminology: Bool,
+        show: Bool?,
+        summarize: Bool?,
+        sendName: String?,
+        sendEmail: String?,
+        hadProfile: Bool,
+        timeoutMinutes: Int?,
+        hadTimeout: Bool
+    ) {
+        requeueUnsentConversationModeAfterSupersede(
+            mode: mode,
+            mergeThreads: mergeThreads,
+            hadMode: hadMode
+        )
+        requeueUnsentTerminologyAfterSupersede(
+            terminology: terminology,
+            custom: terminologyCustom,
+            hadTerminology: hadTerminology
+        )
+        requeueUnsentFeaturesAfterSupersede(show: show, summarize: summarize)
+        requeueUnsentProfileAfterSupersede(
+            sendName: sendName,
+            sendEmail: sendEmail,
+            hadProfile: hadProfile
+        )
+        requeueUnsentTimeoutAfterSupersede(
+            timeoutMinutes: timeoutMinutes,
+            hadTimeout: hadTimeout
+        )
+    }
+
+    /// Snapshot and send whatever settings fields are pending, in a fixed order.
+    /// Confirmed applies still update `config` for this pairing; a mid-flush
+    /// generation bump stops further PATCHes so the newer tail can drain what
+    /// remains (including requeued fields after a superseded failure).  When a
+    /// PATCH fails, a recovery GET still refreshes `config` for display, but
+    /// the matching OK flag stays false so callers do not advance dirty baselines.
+    @MainActor
+    private func flushPendingSettingsMutations(
+        enqueuePairing: Int,
+        generation: Int
+    ) async -> SettingsFlushOutcome? {
+        let mode = pendingConversationModeSet ? pendingConversationMode : nil
+        let mergeThreads = pendingConversationMergeThreads
+        let hadMode = pendingConversationModeSet
+        pendingConversationModeSet = false
+        pendingConversationMode = nil
+        pendingConversationMergeThreads = false
+
+        let terminology = pendingTerminologySet ? pendingTerminology : nil
+        let terminologyCustom = pendingTerminologySet ? pendingTerminologyCustom : nil
+        let hadTerminology = pendingTerminologySet
+        pendingTerminologySet = false
+        pendingTerminology = nil
+        pendingTerminologyCustom = nil
+
+        let show = pendingFeaturesShowToolCalls
+        let summarize = pendingFeaturesSummarizeToolCalls
+        pendingFeaturesShowToolCalls = nil
+        pendingFeaturesSummarizeToolCalls = nil
+
+        let sendName = pendingProfileHasName ? pendingProfileName : nil
+        let sendEmail = pendingProfileHasEmail ? pendingProfileEmail : nil
+        let hadProfile = pendingProfileHasName || pendingProfileHasEmail
+        pendingProfileHasName = false
+        pendingProfileHasEmail = false
+        pendingProfileName = nil
+        pendingProfileEmail = nil
+
+        let timeoutMinutes = pendingRoomTurnTimeout ? pendingRoomTurnTimeoutMinutes : nil
+        let hadTimeout = pendingRoomTurnTimeout
+        pendingRoomTurnTimeout = false
+        pendingRoomTurnTimeoutMinutes = nil
+
+        guard hadMode || hadTerminology || show != nil || summarize != nil || hadProfile || hadTimeout else {
+            return SettingsFlushOutcome(status: config)
+        }
+        guard let client else { return nil }
+
+        var outcome = SettingsFlushOutcome(status: config)
+        var latest = config
+
+        func applyRecoveryConfig() async {
+            if let status = try? await client.config(),
+               pairingGeneration == enqueuePairing,
+               settingsUpdateGeneration == generation {
+                config = status
+                latest = status
+                outcome.status = status
+            }
+        }
+
+        if hadMode, let mode {
+            do {
+                let updated = try await client.updateConversationMode(mode, mergeThreads: mergeThreads)
+                guard pairingGeneration == enqueuePairing else {
+                    return SettingsFlushOutcome(status: updated, conversationModeOK: true)
+                }
+                config = updated
+                latest = updated
+                outcome.status = updated
+                outcome.conversationModeOK = true
+            } catch {
+                guard pairingGeneration == enqueuePairing else { return outcome }
+                if settingsUpdateGeneration != generation {
+                    requeueUnsentAfterSupersede(
+                        mode: mode,
+                        mergeThreads: mergeThreads,
+                        hadMode: true,
+                        terminology: terminology,
+                        terminologyCustom: terminologyCustom,
+                        hadTerminology: hadTerminology,
+                        show: show,
+                        summarize: summarize,
+                        sendName: sendName,
+                        sendEmail: sendEmail,
+                        hadProfile: hadProfile,
+                        timeoutMinutes: timeoutMinutes,
+                        hadTimeout: hadTimeout
+                    )
+                    outcome.conversationModeOK = false
+                    return outcome
+                }
+                recordActionError(error)
+                outcome.conversationModeOK = false
+                await applyRecoveryConfig()
+            }
+            if settingsUpdateGeneration != generation || pairingGeneration != enqueuePairing {
+                requeueUnsentAfterSupersede(
+                    mode: nil,
+                    mergeThreads: false,
+                    hadMode: false,
+                    terminology: terminology,
+                    terminologyCustom: terminologyCustom,
+                    hadTerminology: hadTerminology,
+                    show: show,
+                    summarize: summarize,
+                    sendName: sendName,
+                    sendEmail: sendEmail,
+                    hadProfile: hadProfile,
+                    timeoutMinutes: timeoutMinutes,
+                    hadTimeout: hadTimeout
+                )
+                return outcome
+            }
+        }
+
+        if hadTerminology, let terminology {
+            do {
+                let updated = try await client.updateTerminology(terminology, custom: terminologyCustom)
+                guard pairingGeneration == enqueuePairing else {
+                    return SettingsFlushOutcome(status: updated, terminologyOK: true)
+                }
+                config = updated
+                latest = updated
+                outcome.status = updated
+                outcome.terminologyOK = true
+            } catch {
+                guard pairingGeneration == enqueuePairing else { return outcome }
+                if settingsUpdateGeneration != generation {
+                    requeueUnsentAfterSupersede(
+                        mode: nil,
+                        mergeThreads: false,
+                        hadMode: false,
+                        terminology: terminology,
+                        terminologyCustom: terminologyCustom,
+                        hadTerminology: true,
+                        show: show,
+                        summarize: summarize,
+                        sendName: sendName,
+                        sendEmail: sendEmail,
+                        hadProfile: hadProfile,
+                        timeoutMinutes: timeoutMinutes,
+                        hadTimeout: hadTimeout
+                    )
+                    outcome.terminologyOK = false
+                    return outcome
+                }
+                recordActionError(error)
+                outcome.terminologyOK = false
+                await applyRecoveryConfig()
+            }
+            if settingsUpdateGeneration != generation || pairingGeneration != enqueuePairing {
+                requeueUnsentAfterSupersede(
+                    mode: nil,
+                    mergeThreads: false,
+                    hadMode: false,
+                    terminology: nil,
+                    terminologyCustom: nil,
+                    hadTerminology: false,
+                    show: show,
+                    summarize: summarize,
+                    sendName: sendName,
+                    sendEmail: sendEmail,
+                    hadProfile: hadProfile,
+                    timeoutMinutes: timeoutMinutes,
+                    hadTimeout: hadTimeout
+                )
+                return outcome
+            }
+        }
+
+        if show != nil || summarize != nil {
+            do {
+                let updated = try await client.updateFeatures(
+                    showToolCalls: show,
+                    summarizeToolCalls: summarize
+                )
+                guard pairingGeneration == enqueuePairing else {
+                    return SettingsFlushOutcome(status: updated, featuresOK: true)
+                }
+                config = updated
+                latest = updated
+                outcome.status = updated
+                outcome.featuresOK = true
+            } catch {
+                guard pairingGeneration == enqueuePairing else { return outcome }
+                if settingsUpdateGeneration != generation {
+                    requeueUnsentAfterSupersede(
+                        mode: nil,
+                        mergeThreads: false,
+                        hadMode: false,
+                        terminology: nil,
+                        terminologyCustom: nil,
+                        hadTerminology: false,
+                        show: show,
+                        summarize: summarize,
+                        sendName: sendName,
+                        sendEmail: sendEmail,
+                        hadProfile: hadProfile,
+                        timeoutMinutes: timeoutMinutes,
+                        hadTimeout: hadTimeout
+                    )
+                    outcome.featuresOK = false
+                    return outcome
+                }
+                recordActionError(error)
+                outcome.featuresOK = false
+                // Keep going so a feature failure does not drop a pending
+                // profile or timeout that shared this flush snapshot.
+                await applyRecoveryConfig()
+            }
+            if settingsUpdateGeneration != generation || pairingGeneration != enqueuePairing {
+                requeueUnsentAfterSupersede(
+                    mode: nil,
+                    mergeThreads: false,
+                    hadMode: false,
+                    terminology: nil,
+                    terminologyCustom: nil,
+                    hadTerminology: false,
+                    show: nil,
+                    summarize: nil,
+                    sendName: sendName,
+                    sendEmail: sendEmail,
+                    hadProfile: hadProfile,
+                    timeoutMinutes: timeoutMinutes,
+                    hadTimeout: hadTimeout
+                )
+                return outcome
+            }
+        }
+
+        if hadProfile, sendName != nil || sendEmail != nil {
+            do {
+                let updated = try await client.updateProfile(name: sendName, email: sendEmail)
+                guard pairingGeneration == enqueuePairing else {
+                    return SettingsFlushOutcome(status: updated, profileOK: true)
+                }
+                config = updated
+                latest = updated
+                outcome.status = updated
+                outcome.profileOK = true
+            } catch {
+                guard pairingGeneration == enqueuePairing else { return outcome }
+                if settingsUpdateGeneration != generation {
+                    requeueUnsentAfterSupersede(
+                        mode: nil,
+                        mergeThreads: false,
+                        hadMode: false,
+                        terminology: nil,
+                        terminologyCustom: nil,
+                        hadTerminology: false,
+                        show: nil,
+                        summarize: nil,
+                        sendName: sendName,
+                        sendEmail: sendEmail,
+                        hadProfile: true,
+                        timeoutMinutes: timeoutMinutes,
+                        hadTimeout: hadTimeout
+                    )
+                    outcome.profileOK = false
+                    return outcome
+                }
+                recordActionError(error)
+                outcome.profileOK = false
+                // Continue so a pending timeout in this snapshot still sends.
+                await applyRecoveryConfig()
+            }
+            if settingsUpdateGeneration != generation || pairingGeneration != enqueuePairing {
+                requeueUnsentTimeoutAfterSupersede(
+                    timeoutMinutes: timeoutMinutes,
+                    hadTimeout: hadTimeout
+                )
+                return outcome
+            }
+        }
+
+        if hadTimeout, let timeoutMinutes {
+            do {
+                let updated = try await client.updateRoomTurnTimeout(minutes: timeoutMinutes)
+                guard pairingGeneration == enqueuePairing else {
+                    return SettingsFlushOutcome(status: updated, timeoutOK: true)
+                }
+                config = updated
+                latest = updated
+                outcome.status = updated
+                outcome.timeoutOK = true
+            } catch {
+                guard pairingGeneration == enqueuePairing else { return outcome }
+                if settingsUpdateGeneration != generation {
+                    requeueUnsentTimeoutAfterSupersede(
+                        timeoutMinutes: timeoutMinutes,
+                        hadTimeout: true
+                    )
+                    outcome.timeoutOK = false
+                    return outcome
+                }
+                recordActionError(error)
+                outcome.timeoutOK = false
+                // Refresh display from server, but keep timeoutOK false so
+                // saveRoomTimeout does not advance savedRoomTimeout.
+                await applyRecoveryConfig()
+            }
+        }
+
+        outcome.status = latest
+        return outcome
+    }
+
+    /// Replaces the cached roster unless the harness already described a newer
+    /// one: a slow fetch must not overwrite a fresher push, or the reverse.
+    /// Every path that installs a roster goes through here, so one high-water
+    /// mark orders them all.  An answer without a stamp (an older harness) is
+    /// applied as before.
+    @discardableResult
+    private func applyInstances(_ fetched: [Instance], describedAt: Double?) -> Bool {
+        guard instanceRoster.apply(fetched, describedAt: describedAt) else { return false }
+        cachedInstances = instanceRoster.instances
+        instanceDriverKinds = instanceRoster.driverKinds
+        return true
     }
 
     func instances() async -> [Instance] {
         guard let client else { return [] }
         let generation = pairingGeneration
         do {
-            let fetched = try await client.instances()
-            guard pairingGeneration == generation else { return fetched }
-            cachedInstances = fetched
-            instanceDriverKinds = Dictionary(
-                fetched.map { ($0.instanceId, $0.driverKind) },
-                uniquingKeysWith: { _, latest in latest }
-            )
-            return fetched
+            let list = try await client.instanceList()
+            guard pairingGeneration == generation else { return list.instances }
+            // A fetch older than the roster already held answers with the newer one.
+            return applyInstances(list.instances, describedAt: list.describedAt) ? list.instances : cachedInstances
         } catch {
             recordActionError(error)
             if pairingGeneration == generation && !cachedInstances.isEmpty {
@@ -1609,13 +3688,9 @@ final class Session: ObservableObject {
         guard let client else { return }
         let generation = pairingGeneration
         do {
-            let fetched = try await client.instances()
+            let list = try await client.instanceList()
             guard pairingGeneration == generation else { return }
-            cachedInstances = fetched
-            instanceDriverKinds = Dictionary(
-                fetched.map { ($0.instanceId, $0.driverKind) },
-                uniquingKeysWith: { _, latest in latest }
-            )
+            applyInstances(list.instances, describedAt: list.describedAt)
         } catch {
             // Quiet: connectivity / cancel while the roster is open.
         }
@@ -1667,6 +3742,27 @@ final class Session: ObservableObject {
         catch { recordActionError(error); return false }
     }
 
+    /// Stop a routine run that is queued, running or waiting.
+    func cancelRoutineRun(_ run: RoutineRun) async -> Bool {
+        guard let client else { return false }
+        do { _ = try await client.cancelRoutineRun(id: run.id); return true }
+        catch { recordActionError(error); return false }
+    }
+
+    /// Acknowledge one failed or missed run.  It keeps its status and error.
+    func markRoutineRunSeen(_ run: RoutineRun) async -> Bool {
+        guard let client else { return false }
+        do { _ = try await client.markRoutineRunSeen(id: run.id); return true }
+        catch { recordActionError(error); return false }
+    }
+
+    /// Acknowledge every unseen failure at once.
+    func markAllRoutineRunsSeen() async -> Bool {
+        guard let client else { return false }
+        do { _ = try await client.markAllRoutineRunsSeen(); return true }
+        catch { recordActionError(error); return false }
+    }
+
     // MARK: - Notification navigation
 
     func openNotification(_ target: NotificationTarget) async {
@@ -1674,7 +3770,7 @@ final class Session: ObservableObject {
             // Do not carry a stale destination into a future, unrelated
             // pairing. Only a saved connection waiting for Keychain access is
             // eligible for replay.
-            if restorePending {
+            if restorePending || !launchRestoreSettled {
                 pendingNotification = target
                 connect()
             } else {
@@ -1713,7 +3809,7 @@ final class Session: ObservableObject {
 
     func consumeNotificationChat() { notificationChat = nil }
 
-    /// Lock-screen Live Activity (and any `botfleet://chat` URL) lands on
+    /// Lock-screen Live Activity (and any `botfleet-ios://chat` / legacy `botfleet://chat` URL) lands on
     /// the named bot, switching task when the thread is not the active one.
     func openChat(botId: String, threadId: String) async {
         guard let target = NotificationTarget(botId: botId, threadId: threadId) else { return }
@@ -1752,6 +3848,112 @@ final class Session: ObservableObject {
             recordActionError(error)
             return nil
         }
+    }
+
+    // MARK: - Background jobs
+
+    /// Read every conversation's jobs and replace what the phone holds.
+    ///
+    /// Silent on failure: an older harness or sidecar has no jobs route, and
+    /// then the pill simply never appears.  A pairing that changed while the
+    /// request was out keeps the answer out of the new pairing's state.
+    func loadJobs() async {
+        guard let client else { return }
+        let generation = pairingGeneration
+        do {
+            let jobs = try await client.jobs()
+            guard pairingGeneration == generation else { return }
+            state.hydrateJobs(jobs)
+        } catch {
+            return
+        }
+    }
+
+    /// One job's newest output.  Throws, so the sheet can say what failed in
+    /// place rather than raising an alert over the screen.
+    func readJobOutput(_ jobId: String) async throws -> JobOutputResponse {
+        guard let client else { throw APIError.transport("This iPhone is not connected to a computer.") }
+        return try await client.jobOutput(id: jobId)
+    }
+
+    /// The owner's Stop for one job.  The next `jobs` frame shows it
+    /// stopping, then stopped; this only reports whether the request went in.
+    @discardableResult
+    func stopJob(_ jobId: String) async -> Bool {
+        guard let client else { return false }
+        do {
+            try await client.stopJob(id: jobId)
+            return true
+        } catch {
+            recordActionError(error)
+            return false
+        }
+    }
+
+    /// Stop every running job of one conversation.
+    @discardableResult
+    func stopAllJobs(threadId: String) async -> Bool {
+        guard let client else { return false }
+        do {
+            try await client.stopAllJobs(threadId: threadId)
+            return true
+        } catch {
+            recordActionError(error)
+            return false
+        }
+    }
+
+    // MARK: - Usage and cost
+
+    /// Quota windows, rolling spend and held engines.  `nil` on any failure,
+    /// and never an alert: the screen polls this, and a computer that is
+    /// asleep should not raise an alert every half minute.
+    func loadQuotas() async -> QuotasSnapshot? {
+        guard let client else { return nil }
+        return try? await client.quotas()
+    }
+
+    func loadSpeechUsage() async -> SpeechUsage? {
+        guard let client else { return nil }
+        return try? await client.speechUsage()
+    }
+
+    // MARK: - Shared memory
+
+    /// Refresh the shared-memory status.  Informational, like push health: a
+    /// failure keeps the last answer so a transient blip never blanks the row.
+    func refreshSharedMemoryStatus() async {
+        guard let client else { return }
+        let generation = pairingGeneration
+        do {
+            let fetched = try await client.sharedMemoryStatus()
+            guard pairingGeneration == generation else { return }
+            sharedMemoryStatus = fetched
+            sharedMemoryNotReported = false
+        } catch let error as APIError where error.isNotFound {
+            guard pairingGeneration == generation else { return }
+            sharedMemoryStatus = nil
+            sharedMemoryNotReported = true
+        } catch {
+            return
+        }
+    }
+
+    // MARK: - Skills
+
+    func loadBotSkills(botId: String) async throws -> SkillsResponse {
+        guard let client else { throw APIError.transport("This iPhone is not connected to a computer.") }
+        return try await client.botSkills(botId: botId)
+    }
+
+    func loadSkillText(botId: String, name: String) async throws -> String {
+        guard let client else { throw APIError.transport("This iPhone is not connected to a computer.") }
+        return try await client.skillText(botId: botId, name: name)
+    }
+
+    func setSkillEnabled(botId: String, name: String, enabled: Bool) async throws -> SkillListing {
+        guard let client else { throw APIError.transport("This iPhone is not connected to a computer.") }
+        return try await client.setSkillEnabled(botId: botId, name: name, enabled: enabled)
     }
 
     // MARK: - Connected apps
@@ -2089,6 +4291,15 @@ enum Chat: Identifiable, Hashable {
         }
     }
 
+    /// A bot switched Off.  Rooms are never Off themselves: an Off member is
+    /// skipped inside the room with a notice, and the room composer stays.
+    var isOff: Bool {
+        switch self {
+        case let .bot(bot): return bot.isOff
+        case .room: return false
+        }
+    }
+
     var color: String {
         switch self {
         case let .bot(bot): return bot.color
@@ -2123,24 +4334,21 @@ extension CompanionState {
     var chatSummaries: [ChatSummary] {
         let bots = self.bots.filter { $0.hidden != true }.map(Chat.bot)
         let rooms = self.rooms.map(Chat.room)
-        return (bots + rooms)
+        let summaries = (bots + rooms)
             .map { chat in
                 let last = newestLoadedMessage(for: chat)
                 return ChatSummary(
                     chat: chat,
                     preview: Self.preview(of: last),
-                    lastActivity: latestActivity(for: chat),
+                    lastActivity: latestActivity(for: chat, newest: last),
                     pinned: Self.pinned(chat)
                 )
             }
-            .sorted { left, right in
-                ChatListOrder.orderedBefore(
-                    pinnedLeft: left.pinned,
-                    activityLeft: left.lastActivity,
-                    pinnedRight: right.pinned,
-                    activityRight: right.lastActivity
-                )
-            }
+        // Pinned first, then newest activity, then the order the harness sent:
+        // the same order the desktop sidebar draws (`ChatListOrder`).
+        return ChatListOrder.stableOrder(summaries) { summary in
+            (pinned: summary.pinned, activity: summary.lastActivity)
+        }
     }
 
     private static func pinned(_ chat: Chat) -> Bool {
@@ -2150,18 +4358,28 @@ extension CompanionState {
 
     /// Newest loaded message across this chat's threads. Other tasks may
     /// not be hydrated yet; `latestActivity` still reads their stamps.
+    ///
+    /// Runs for every chat on every chat-list render, so it resolves the
+    /// active leaf from the bot already in hand instead of letting
+    /// `visibleTranscript(forThread:)` scan the whole roster per thread
+    /// (BOTFLEET-3R). Rooms have no branching leaf.
     func newestLoadedMessage(for chat: Chat) -> Message? {
         var candidates = [Message]()
         switch chat {
         case let .bot(bot):
-            if let last = visibleTranscript(forThread: bot.threadId).last { candidates.append(last) }
+            let leaf = bot.activeLeafId
+            if let last = visibleTranscript(forThread: bot.threadId, activeLeafId: leaf).last {
+                candidates.append(last)
+            }
             for task in bot.tasks ?? [] {
-                if let last = visibleTranscript(forThread: task.threadId).last ?? task.lastMessage {
+                if let last = visibleTranscript(forThread: task.threadId, activeLeafId: leaf).last ?? task.lastMessage {
                     candidates.append(last)
                 }
             }
         case let .room(room):
-            if let last = visibleTranscript(forThread: room.threadId).last { candidates.append(last) }
+            if let last = visibleTranscript(forThread: room.threadId, activeLeafId: nil).last {
+                candidates.append(last)
+            }
         }
         return candidates.max { $0.at < $1.at }
     }
@@ -2170,7 +4388,13 @@ extension CompanionState {
     /// `lastActivity`, so an unread update on a background task does not
     /// keep showing yesterday from the currently selected thread.
     func latestActivity(for chat: Chat) -> Double {
-        let fromMessages = newestLoadedMessage(for: chat)?.at
+        latestActivity(for: chat, newest: newestLoadedMessage(for: chat))
+    }
+
+    /// `latestActivity(for:)` with the newest loaded message already found,
+    /// so `chatSummaries` walks each chat's transcripts once, not twice.
+    func latestActivity(for chat: Chat, newest: Message?) -> Double {
+        let fromMessages = newest?.at
         switch chat {
         case let .bot(bot):
             let taskActivities = (bot.tasks ?? []).map { $0.lastActivity ?? $0.createdAt }
@@ -2214,5 +4438,55 @@ extension CompanionState {
         case .screen: return "Screenshot"
         case .unknown: return last.text ?? ""
         }
+    }
+}
+
+/// One stretch of background execution time for a read.  Ends exactly once:
+/// when the work finishes, or when iOS says the time is up.  The expiration
+/// handler holds the object strongly so the task is always ended.
+@MainActor
+private final class VoiceBackgroundTime {
+    private var id: UIBackgroundTaskIdentifier = .invalid
+
+    init() {
+        id = UIApplication.shared.beginBackgroundTask(withName: "Read Aloud") {
+            MainActor.assumeIsolated { self.end() }
+        }
+    }
+
+    func end() {
+        guard id != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(id)
+        id = .invalid
+    }
+}
+
+/// Turns AVAudioPlayer's completion callback into something a voice task can
+/// await.  `finish` is idempotent, so a stop and a late callback cannot both
+/// resume the waiter.
+@MainActor
+private final class ClipPlayback: NSObject, AVAudioPlayerDelegate {
+    private var result: Bool?
+    private var waiter: CheckedContinuation<Bool, Never>?
+
+    func wait() async -> Bool {
+        if let result { return result }
+        return await withCheckedContinuation { waiter = $0 }
+    }
+
+    func finish(_ succeeded: Bool) {
+        guard result == nil else { return }
+        result = succeeded
+        let waiter = waiter
+        self.waiter = nil
+        waiter?.resume(returning: succeeded)
+    }
+
+    nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+        Task { @MainActor in self.finish(flag) }
+    }
+
+    nonisolated func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {
+        Task { @MainActor in self.finish(false) }
     }
 }

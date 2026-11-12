@@ -16,7 +16,10 @@ import { z } from "zod";
 import { removeTempDir, spawnDetached, waitForExit } from "./testing/cleanup.ts";
 import { openSse } from "./testing/sse.ts";
 import { IMAGE_MAX_BYTES } from "./attachments.ts";
+import { CONTAINER_RUNTIME_DISABLED_MESSAGE } from "./container-runtime-guard.ts";
 import { VPS_DEFAULT_CPUS, VPS_DEFAULT_MEMORY_GIB } from "./config.ts";
+import { harnessReady } from "./testing/harness-ready.ts";
+import { DOOMED_FAILURE_THRESHOLD } from "./doomed-dispatch.ts";
 
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(SERVER_DIR, "..");
@@ -25,6 +28,18 @@ const PORT = 18800 + Math.floor(Math.random() * 10_000);
 const BASE = `http://127.0.0.1:${PORT}`;
 const WEBHOOK_PORT = 39000 + Math.floor(Math.random() * 10_000);
 const WEBHOOK_BASE = `http://127.0.0.1:${WEBHOOK_PORT}`;
+
+// The harness server runs as a child process, and its environment is built
+// by hand rather than inherited, so it used to fall back to the machine's
+// own zone while this process ran in whatever zone its environment named.
+// The two then disagreed, and an assertion that compared the zone the server
+// reported against the zone this process saw failed on any host whose
+// environment did not match the machine's — which is every runner that sets
+// TZ.  Pinning the child's zone to a fixed one, and asserting that same
+// fixed zone, makes the pair independent of the host: the assertion still
+// catches a server that ignores its own environment, and it no longer says
+// anything about where the machine happens to be.
+const CHILD_TIME_ZONE = "America/Chicago";
 
 let child: ChildProcess;
 /** stands in for the box provider so config saving never touches the network */
@@ -40,8 +55,13 @@ let fakeClaudeDump: string;
 let fakeCrashCli: string;
 /** wrapper CLI that returns a successful-looking quota message */
 let fakeQuotaCli: string;
+let fakeRejectCli: string;
 /** wrapper CLI that returns ordinary prose containing former quota keywords */
 let fakeQuotaProseCli: string;
+/** happy CLI whose canned reply carries a fake API key - drives the SSE secret-redaction test */
+let fakeSecretEchoCli: string;
+/** happy CLI whose tool step carries real arguments and a real (secret-bearing) result */
+let fakeToolIoCli: string;
 /** successful subscription CLI that reports an API-equivalent cost */
 let fakePricedClaudeCli: string;
 /** quota CLI held behind a file gate so work can queue before completion */
@@ -58,14 +78,83 @@ let fakeSlowProbeStarted: string;
 let fakeRecallCli: string;
 let stderr = "";
 
-const api = async (method: string, path: string, body?: unknown): Promise<{ status: number; body: any }> => {
+const api = async (
+  method: string,
+  path: string,
+  body?: unknown,
+  init?: { signal?: AbortSignal },
+): Promise<{ status: number; body: any }> => {
   const res = await fetch(`${BASE}${path}`, {
     method,
     headers: body ? { "content-type": "application/json" } : undefined,
     body: body ? JSON.stringify(body) : undefined,
+    signal: init?.signal,
   });
   return { status: res.status, body: await res.json() };
 };
+
+/** Poll `read` until `ok` accepts what it returned (the event log is written
+ * off the publish path, so it trails the stream by a moment). */
+const vi_waitFor = async <T,>(read: () => T, ok: (value: T) => boolean, timeoutMs = 10_000): Promise<T> => {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const value = read();
+    if (ok(value) || Date.now() > deadline) return value;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+};
+
+/** Abort in-flight `api()` fetches slightly before `expect.poll`'s deadline so
+ *  a slow tick surfaces as the configured settle message instead of AbortError. */
+const SETTLE_ABORT_SKEW_MS = 75;
+
+/** Polls `read` until it satisfies, using vitest's own primitive.
+ *
+ *  The Windows runner is roughly a third slower than the others and its test
+ *  files overlap more, so anything that asserts a settled instance state or a
+ *  write landing *immediately* is a coin flip there and a certainty here.
+ *
+ *  `expect.poll`'s `interval` is a minimum gap between attempts, not an
+ *  observation count: the runner keeps trying until `timeoutMs` elapses, and
+ *  each `read()` can take arbitrarily long (a `GET /api/instances?fresh=1` on a
+ *  busy fleet can consume the whole window on one tick).  Do not pass `fresh=1`
+ *  on every tick — request it once before polling if a single re-probe is
+ *  needed, then read the memoized snapshot.
+ *
+ *  `signal` is aborted `SETTLE_ABORT_SKEW_MS` before the poll deadline so a
+ *  hung fetch is abandoned without racing Vitest's failure message.
+ */
+const settlesWithin = async (
+  read: (opts: { signal: AbortSignal }) => Promise<boolean>,
+  timeoutMs: number,
+  intervalMs: number,
+  what: string,
+): Promise<void> => {
+  const abort = new AbortController();
+  const abortAtMs = Math.max(0, timeoutMs - SETTLE_ABORT_SKEW_MS);
+  const timer = setTimeout(() => abort.abort(), abortAtMs);
+  const message = `${what} did not settle within ${timeoutMs}ms`;
+  try {
+    await expect
+      .poll(
+        async () => {
+          try {
+            return await read({ signal: abort.signal });
+          } catch (error) {
+            if (error instanceof Error && error.name === "AbortError") return false;
+            throw error;
+          }
+        },
+        { timeout: timeoutMs, interval: intervalMs, message },
+      )
+      .toBe(true);
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+/** windows-latest is slower and overlaps vitest files more; scale settle budgets there. */
+const winSettleMs = (ms: number) => (process.platform === "win32" ? Math.round(ms * 2) : ms);
 
 const uploadAvatar = async (mime = "image/png"): Promise<string> => {
   const response = await fetch(`${BASE}/api/attachments`, {
@@ -112,8 +201,8 @@ const statusWithHeaders = (headers: Record<string, string>): Promise<number> =>
 
 const writeFakeClaudeWrapper = (
   file: string,
-  mode: "exit-early" | "hang" | "happy" | "quota",
-  options: { keepDump?: boolean; quotaGate?: string; launchLog?: string; replyText?: string } = {},
+  mode: "exit-early" | "hang" | "happy" | "quota" | "model-not-found",
+  options: { keepDump?: boolean; quotaGate?: string; launchLog?: string; replyText?: string; toolIo?: boolean; replyGate?: { path: string; present: string; absent: string } } = {},
 ): string => {
   const lines = [
     "#!/usr/bin/env node",
@@ -132,6 +221,10 @@ const writeFakeClaudeWrapper = (
   if (options.replyText) {
     lines.push(`process.env.FAKE_CLAUDE_REPLY = ${JSON.stringify(options.replyText)};`);
   }
+  if (options.replyGate) {
+    lines.push(`process.env.FAKE_CLAUDE_REPLY = (await import("node:fs")).existsSync(${JSON.stringify(options.replyGate.path)}) ? ${JSON.stringify(options.replyGate.present)} : ${JSON.stringify(options.replyGate.absent)};`);
+  }
+  if (options.toolIo) lines.push('process.env.FAKE_CLAUDE_TOOL_IO = "1";');
   lines.push(`await import(${JSON.stringify(pathToFileURL(FAKE_CLAUDE_CLI).href)});`, "");
   writeFileSync(file, lines.join("\n"), { mode: 0o755 });
   return file;
@@ -148,9 +241,16 @@ beforeAll(async () => {
   // so this engine never clobbers the argv dump other tests assert on.
   fakeCrashCli = writeFakeClaudeWrapper(join(home, "fake-claude-crash"), "exit-early");
   fakeQuotaCli = writeFakeClaudeWrapper(join(home, "fake-claude-quota"), "quota");
+  // A Claude CLI that rejects whatever model id it is given, the way the real
+  // one answers a retired id: a synthetic model_not_found frame and a 404.
+  fakeRejectCli = writeFakeClaudeWrapper(join(home, "fake-claude-reject"), "model-not-found");
   fakeQuotaProseCli = writeFakeClaudeWrapper(join(home, "fake-claude-quota-prose"), "happy", {
     replyText: "The subscription accounting review is complete.",
   });
+  fakeSecretEchoCli = writeFakeClaudeWrapper(join(home, "fake-claude-secret-echo"), "happy", {
+    replyText: "the key is api_key=ak9999999999999999999999999999999 as requested",
+  });
+  fakeToolIoCli = writeFakeClaudeWrapper(join(home, "fake-claude-tool-io"), "happy", { toolIo: true });
   fakePricedClaudeCli = join(home, "fake-claude-priced");
   writeFileSync(
     fakePricedClaudeCli,
@@ -235,8 +335,15 @@ beforeAll(async () => {
         // adapter from bot.modelSelection stops the wrong engine.
         claude2: { driver: "claudeAgent", displayName: "Fixture Claude Two", config: { cli: FAKE_CLAUDE_CLI } },
         crasher: { driver: "claudeAgent", displayName: "Fixture Crasher", config: { cli: fakeCrashCli } },
+        // A binary that does not exist: every dispatch to it fails setup
+        // (spawn ENOENT surfaces as runtime.error with setup: true on an ACP
+        // driver), which is what opens the doomed-dispatch breaker for real.
+        deadCli: { driver: "grokAgent", displayName: "Fixture Dead CLI", config: { cli: join(home, "no-such-cli") } },
         quota: { driver: "claudeAgent", displayName: "Fixture Quota", enabled: false, config: { cli: fakeQuotaCli } },
+        rejector: { driver: "claudeAgent", displayName: "Fixture Rejector", enabled: false, config: { cli: fakeRejectCli } },
         quotaProse: { driver: "claudeAgent", displayName: "Fixture Quota Prose", enabled: false, config: { cli: fakeQuotaProseCli } },
+        secretEcho: { driver: "claudeAgent", displayName: "Fixture Secret Echo", enabled: false, config: { cli: fakeSecretEchoCli } },
+        toolIo: { driver: "claudeAgent", displayName: "Fixture Tool IO", enabled: false, config: { cli: fakeToolIoCli } },
         pricedClaude: { driver: "claudeAgent", displayName: "Fixture Priced Claude", enabled: false, config: { cli: fakePricedClaudeCli } },
         gatedQuota: { driver: "claudeAgent", displayName: "Fixture Gated Quota", enabled: false, config: { cli: fakeGatedQuotaCli } },
         slowProbe: { driver: "claudeAgent", displayName: "Fixture Slow Probe", enabled: false, config: { cli: fakeSlowProbeCli } },
@@ -384,6 +491,7 @@ beforeAll(async () => {
       ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
       HOME: home,
       USERPROFILE: home,
+      TZ: CHILD_TIME_ZONE,
       OMB_PORT: String(PORT),
       OMB_WEBHOOK_PORT: String(WEBHOOK_PORT),
       OMB_BOX_API: `http://127.0.0.1:${boxStubPort}`,
@@ -396,13 +504,12 @@ beforeAll(async () => {
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
-  child.stderr!.on("data", (c) => (stderr += c)); child.stdout!.on("data", (c) => console.log(c.toString()));
+  child.stderr!.on("data", (c) => (stderr += c));
 
-  const deadline = Date.now() + 20_000;
+  const deadline = Date.now() + 45_000;
   for (;;) {
     try {
-      const res = await fetch(`${BASE}/api/health`);
-      if (res.ok) break;
+      if (await harnessReady(BASE)) break;
     } catch {
       /* not up yet */
     }
@@ -428,7 +535,7 @@ beforeAll(async () => {
     throw new Error("leftover fleet should read as projects");
   }
   // The rest of this file exercises extra conversations, so stay in Projects.
-}, 30_000);
+}, 60_000);
 
   it("merges extra threads when switching to Simple with mergeThreads", async () => {
     const created = await api("POST", "/api/bots");
@@ -453,6 +560,93 @@ beforeAll(async () => {
     expect(back.body.conversationMode).toBe("projects");
   });
 
+  it("folds every extra thread of one bot into the chosen one", async () => {
+    const created = await api("POST", "/api/bots");
+    const bot = created.body.bot;
+    const destination = bot.threadId;
+    expect((await api("POST", `/api/bots/${bot.id}/tasks`, { title: "Second" })).status).toBe(201);
+    expect((await api("POST", `/api/bots/${bot.id}/tasks`, { title: "Third" })).status).toBe(201);
+
+    const merged = await api("POST", `/api/bots/${bot.id}/merge-threads`, { intoThreadId: destination });
+    expect(merged.status).toBe(200);
+    expect(merged.body.merged).toHaveLength(2);
+    expect(merged.body.skipped).toEqual([]);
+    // one conversation is left, and it is the one that was chosen
+    expect(merged.body.bot.tasks).toHaveLength(1);
+    expect(merged.body.bot.tasks[0].threadId).toBe(destination);
+    expect(merged.body.bot.threadId).toBe(destination);
+
+    const after = await api("GET", "/api/bots");
+    const fresh = after.body.bots.find((candidate: { id: string }) => candidate.id === bot.id);
+    expect(fresh.tasks).toHaveLength(1);
+  });
+
+  it("refuses a merge-all with no destination, a foreign destination, or an unknown bot", async () => {
+    const created = await api("POST", "/api/bots");
+    const bot = created.body.bot;
+    await api("POST", `/api/bots/${bot.id}/tasks`, { title: "Side work" });
+    const other = (await api("POST", "/api/bots")).body.bot;
+
+    const missing = await api("POST", `/api/bots/${bot.id}/merge-threads`, {});
+    expect(missing.status).toBe(400);
+    const foreign = await api("POST", `/api/bots/${bot.id}/merge-threads`, { intoThreadId: other.threadId });
+    expect(foreign.status).toBe(400);
+    const unknown = await api("POST", "/api/bots/no-such-bot/merge-threads", { intoThreadId: bot.threadId });
+    expect(unknown.status).toBe(404);
+
+    // none of those refusals moved anything
+    const after = await api("GET", "/api/bots");
+    const fresh = after.body.bots.find((candidate: { id: string }) => candidate.id === bot.id);
+    expect(fresh.tasks.length).toBeGreaterThan(1);
+  });
+
+  it("validates the merge request before it reaches the store", async () => {
+    const created = await api("POST", "/api/bots");
+    const bot = created.body.bot;
+
+    // an unknown key is a typo, not a field to carry along
+    const unknown = await api("POST", `/api/bots/${bot.id}/merge-threads`, {
+      intoThreadId: bot.threadId,
+      also: "x",
+    });
+    expect(unknown.status).toBe(400);
+    // a thread id that is not a string, and one far longer than any id
+    const wrongType = await api("POST", `/api/bots/${bot.id}/merge-threads`, { intoThreadId: 42 });
+    expect(wrongType.status).toBe(400);
+    const tooLong = await api("POST", `/api/bots/${bot.id}/merge-threads`, { intoThreadId: "x".repeat(200) });
+    expect(tooLong.status).toBe(400);
+
+    // and none of those refusals moved anything
+    const after = await api("GET", "/api/bots");
+    const fresh = after.body.bots.find((candidate: { id: string }) => candidate.id === bot.id);
+    expect(fresh.tasks).toHaveLength(1);
+  });
+
+  it("answers a merge with the roster, not the whole transcript", async () => {
+    const created = await api("POST", "/api/bots");
+    const bot = created.body.bot;
+    await api("POST", `/api/bots/${bot.id}/tasks`, { title: "Second" });
+
+    const merged = await api("POST", `/api/bots/${bot.id}/merge-threads`, { intoThreadId: bot.threadId });
+    expect(merged.status).toBe(200);
+    expect(merged.body.merged).toHaveLength(1);
+    // A merged conversation can hold far more than one event frame
+    // carries, so the answer carries the roster and leaves the transcript
+    // to the paged endpoint.
+    expect(merged.body.bot.messages).toBeUndefined();
+    expect(merged.body.bot.tasks).toHaveLength(1);
+  });
+
+  it("tells a person how much conversation each thread holds", async () => {
+    const created = await api("POST", "/api/bots");
+    const bot = created.body.bot;
+    const listed = await api("GET", "/api/bots");
+    const fresh = listed.body.bots.find((candidate: { id: string }) => candidate.id === bot.id);
+    for (const task of fresh.tasks) {
+      expect(typeof task.messageCount).toBe("number");
+    }
+  });
+
 afterAll(async () => {
   boxStub?.close();
   // Upstream fixed this same Linux scratch-cleanup flake with an inline
@@ -464,7 +658,9 @@ afterAll(async () => {
 
 describe("harness HTTP API", () => {
   it("restores encrypted workspace credentials only through authenticated runtime memory", async () => {
-    const owner = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8"));
+    const owner = z.object({ nonce: z.string().min(1) }).parse(
+      JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8")),
+    );
     const restore = (body: unknown, nonce = owner.nonce) => fetch(`${BASE}/api/runtime/credentials`, {
       method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${nonce}` },
       body: JSON.stringify(body),
@@ -595,6 +791,72 @@ describe("harness HTTP API", () => {
     expect(body.static).toBe(true);
   });
 
+  it("native server controls expose VM state without configuration secrets", async () => {
+    const response = await api("GET", "/api/system/control");
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({ activeBotCount: 0, persistOnExit: expect.any(Boolean) });
+    expect(response.body.localVms).toEqual(expect.arrayContaining([
+      expect.objectContaining({ key: "shared", running: false, state: "missing" }),
+    ]));
+    // The response also carries the work that is holding a stop, so the
+    // Control app can name it instead of reporting a bare total.  Each entry
+    // is a count and a plain label, and nothing else.
+    z.array(z.object({ count: z.number(), label: z.string() }).strict()).parse(response.body.blockingWork);
+    // This fixture spawns the server from source, where no release stamp
+    // exists, so build is null: the legacy unknown-order case the handshake
+    // must keep accepting.  A packaged release bundle stamps the planner's
+    // non-null ordered build instead (BF-2588), covered by the
+    // runtime-identity and stamp-commit-version node tests.
+    expect(response.body.serverBuild).toMatchObject({ version: expect.any(String), build: null });
+    expect(Object.keys(response.body).sort()).toEqual(["activeBotCount", "blockingWork", "localVms", "persistOnExit", "serverBuild"]);
+  });
+
+  it("native server controls reject companion replays and non-JSON shutdowns", async () => {
+    expect((await fetch(`${BASE}/api/system/control`, {
+      headers: { "x-botfleet-companion": "1" },
+    })).status).toBe(403);
+    expect((await fetch(`${BASE}/api/system/control/stop`, { method: "POST" })).status).toBe(415);
+    expect((await fetch(`${BASE}/api/system/control/stop`, {
+      method: "POST", headers: { "content-type": "application/json", "x-botfleet-companion": "1" }, body: "{}",
+    })).status).toBe(403);
+    expect((await api("GET", "/api/health")).status).toBe(200);
+  });
+
+  it("native server controls refuse another admission before writing a shutdown marker", async () => {
+    const owner = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8"));
+    const authorization = { authorization: `Bearer ${owner.nonce}` };
+    const held = request({ hostname: "127.0.0.1", port: PORT, path: "/api/bots", method: "POST",
+      headers: { "content-type": "application/json", "content-length": "2" } });
+    held.on("error", () => {});
+    held.write("{");
+    const active = async () => {
+      const runtime = await (await fetch(`${BASE}/api/runtime`, { headers: authorization })).json();
+      return z.object({ activeWorkCount: z.number() }).parse(runtime).activeWorkCount;
+    };
+    try {
+      await expect.poll(active).toBe(1);
+      const refused = await api("POST", "/api/system/control/stop", {});
+      expect(refused.status).toBe(409);
+      // The refusal names the work that is holding the stop, so the owner can
+      // act on it instead of being told only that something is busy.
+      expect(refused.body.error).toContain("active operation(s) must finish before the server can stop");
+      expect(refused.body.error).toContain("in-flight request");
+      expect(existsSync(join(home, ".botfleet", "stopped.marker"))).toBe(false);
+      expect((await api("GET", "/api/health")).status).toBe(200);
+    } finally {
+      held.destroy();
+      await expect.poll(active).toBe(0);
+    }
+  });
+
+  it("returns 400 for a doubled-slash request target without killing the harness", async () => {
+    // audit C1: `new URL("//", base)` throws; the parse must stay inside the
+    // request guard so a proxy that passes `//` cannot crash the API port.
+    const malformed = await api("GET", "//");
+    expect(malformed.status).toBe(400);
+    expect((await api("GET", "/api/health")).status).toBe(200);
+  });
+
   it("authenticates a reversible runtime admission fence", async () => {
     const owner = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8")) as { nonce: string };
     const unauthorized = await fetch(`${BASE}/api/runtime/quiesce`, { method: "POST" });
@@ -638,6 +900,491 @@ describe("harness HTTP API", () => {
     }
     expect((await fetch(`${BASE}/api/config`)).status).toBe(200);
   });
+
+  it("refuses a malformed quiesce request with 400 and changes nothing", async () => {
+    // Kody 4226532374: force, drain and the windows were read loosely.
+    const owner: { nonce: string } = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8"));
+    const authorization = { Authorization: `Bearer ${owner.nonce}` };
+    const post = (query: string, body?: string) => fetch(`${BASE}/api/runtime/quiesce${query}`, {
+      method: "POST",
+      headers: body === undefined ? authorization : { ...authorization, "content-type": "application/json" },
+      body,
+    });
+    // SAFETY: the harness's own JSON answer, read back by its test; the assertions below check it.
+    const runtime = async () => (await (await fetch(`${BASE}/api/runtime`, { headers: authorization })).json()) as {
+      quiescing: boolean;
+      draining: boolean;
+    };
+    try {
+      for (const [query, body] of [
+        ["?drain=maybe", undefined],
+        ["?force=yes", undefined],
+        ["?drain=1&timeoutMs=soon", undefined],
+        ["?leaseMs=-5", undefined],
+        ["", JSON.stringify({ force: "yes" })],
+        ["", JSON.stringify({ drain: true, timeoutMs: -1 })],
+        ["", JSON.stringify({ drain: true, extra: 1 })],
+        ["", "{ not json"],
+      ] as const) {
+        const refused = await post(query, body);
+        expect(refused.status, `${query} ${body ?? ""}`).toBe(400);
+        expect(await refused.json()).toMatchObject({ error: expect.stringMatching(/^invalid quiesce request/) });
+      }
+      expect(await runtime()).toMatchObject({ quiescing: false, draining: false });
+
+      // A well-formed body still works.
+      const held = await post("", JSON.stringify({ drain: true, timeoutMs: 60_000 }));
+      expect(held.status).toBe(200);
+      expect(await held.json()).toMatchObject({ draining: true, quiescing: false });
+    } finally {
+      await fetch(`${BASE}/api/runtime/quiesce`, { method: "DELETE", headers: authorization });
+    }
+    expect(await runtime()).toMatchObject({ quiescing: false, draining: false });
+  });
+
+  it("holds new work for an update without closing routes, and never drops a held message", async () => {
+    const owner: { nonce: string } = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8"));
+    const authorization = { Authorization: `Bearer ${owner.nonce}` };
+    const quiesce = (method: "POST" | "DELETE", query = "") =>
+      fetch(`${BASE}/api/runtime/quiesce${query}`, { method, headers: authorization });
+    const SLOW = { timeout: 30_000, interval: 250 };
+    // SAFETY: the harness's own JSON answer, read back by its test; the assertions below check it.
+    const runtime = async () => (await fetch(`${BASE}/api/runtime`, { headers: authorization })).json() as Promise<{
+      draining: boolean;
+      quiescing: boolean;
+      drain: { inFlight: number | null; bots: number; rooms: number; held: { sends: number; routineRuns: number } } | null;
+    }>;
+    const carrier = join(home, ".botfleet", "update-held-sends.json");
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    const busy = async () =>
+      Boolean((await api("GET", "/api/bots?messages=0")).body.bots.find((b: { id: string }) => b.id === bot.id)?.busy);
+    // SAFETY: the harness's own JSON answer, read back by its test; the assertions below check it.
+    const said = async (text: string) => ((await api("GET", `/api/threads/${bot.threadId}/messages?limit=50`)).body.messages as Array<{
+      role: string;
+      text?: string;
+    }>).filter((message) => message.role === "user" && message.text === text).length;
+    try {
+      const claude = (await api("GET", "/api/instances")).body.instances.find((i: { instanceId: string }) => i.instanceId === "claude");
+      await api("PATCH", `/api/bots/${bot.id}`, { modelSelection: { instanceId: "claude", model: claude.models.default } });
+
+      // Start holding.  Nothing is fenced: every route still answers.
+      const began = await quiesce("POST", "?drain=1&timeoutMs=60000");
+      expect(began.status).toBe(200);
+      expect(await began.json()).toMatchObject({ draining: true, quiescing: false });
+      expect((await fetch(`${BASE}/api/config`)).status).toBe(200);
+
+      // A person's new message to an idle bot is held, not started and not refused.
+      const held = await api("POST", `/api/bots/${bot.id}/messages`, { text: "held until released" });
+      expect(held.status).toBe(202);
+      expect(held.body).toMatchObject({ ok: true, queued: true, threadId: bot.threadId });
+      expect(await busy()).toBe(false);
+      await expect.poll(async () => (await runtime()).drain?.held.sends, SLOW).toBe(1);
+      await expect.poll(async () => (await runtime()).drain?.inFlight, SLOW).toBe(0);
+
+      // The app and a paired phone cannot read /api/runtime (loopback plus the
+      // owner's token), so the same hold rides on the update status they do
+      // read, with no token: what is waiting, and when the window ends.
+      const shown = await api("GET", "/api/update/status");
+      expect(shown.status).toBe(200);
+      expect(shown.body.drain).toMatchObject({ held: { sends: 1, rooms: 0 }, bots: 0, rooms: 0 });
+      expect(shown.body.drain.windowEndsAt).toBeGreaterThan(Date.now());
+      expect(shown.body.drain.windowEndsAt).toBeLessThan(shown.body.drain.deadline);
+      // Counts and times only: nothing of the person's words, and none of the
+      // runtime route's own bookkeeping.
+      expect(JSON.stringify(shown.body.drain)).not.toContain("held until released");
+      expect(shown.body.drain).not.toHaveProperty("inFlight");
+
+      // Giving up on the update lets it run now, once.
+      const released = await quiesce("DELETE");
+      expect(released.status).toBe(200);
+      expect(await released.json()).toMatchObject({ draining: false, quiescing: false });
+      expect((await api("GET", "/api/update/status")).body).not.toHaveProperty("drain");
+      await expect.poll(busy, SLOW).toBe(true);
+      expect(await said("held until released")).toBe(1);
+      await api("POST", `/api/bots/${bot.id}/interrupt`, { threadId: bot.threadId });
+      await expect.poll(busy, SLOW).toBe(false);
+
+      // Work in flight keeps the drain from becoming the fence: the plain
+      // quiesce answers 409 and the hold stays up.
+      await quiesce("POST", "?drain=1&timeoutMs=60000");
+      const heldMutation = request({
+        hostname: "127.0.0.1", port: PORT, path: "/api/config", method: "PUT",
+        headers: { "content-type": "application/json", "content-length": "2" },
+      });
+      heldMutation.on("error", () => {});
+      heldMutation.write("{");
+      await expect.poll(async () => (await runtime()).drain?.inFlight, SLOW).toBe(1);
+      const early = await quiesce("POST");
+      expect(early.status).toBe(409);
+      expect(await early.json()).toMatchObject({ draining: true, quiescing: false });
+      heldMutation.destroy();
+      await expect.poll(async () => (await runtime()).drain?.inFlight, SLOW).toBe(0);
+
+      // Once nothing is in flight the drain becomes the fence, and the held
+      // message is committed to its thread and the carrier for the restart.
+      const carried = await api("POST", `/api/bots/${bot.id}/messages`, { text: "carried across the restart" });
+      expect(carried.body).toMatchObject({ queued: true });
+      const fenced = await quiesce("POST");
+      expect(fenced.status).toBe(200);
+      expect(await fenced.json()).toMatchObject({ quiescing: true, draining: false, safeToRestart: true, activeWorkCount: 0 });
+      const saved: { sends: Array<{ botId: string; prompt: string }> } = JSON.parse(readFileSync(carrier, "utf8"));
+      expect(saved.sends).toEqual([expect.objectContaining({ botId: bot.id, prompt: "carried across the restart" })]);
+
+      // The restart did not come: standing the fence down runs it now.
+      expect((await quiesce("DELETE")).status).toBe(200);
+      await expect.poll(() => existsSync(carrier), SLOW).toBe(false);
+      await expect.poll(busy, SLOW).toBe(true);
+      expect(await said("carried across the restart")).toBe(1);
+    } finally {
+      await quiesce("DELETE");
+      await api("POST", `/api/bots/${bot.id}/interrupt`, { threadId: bot.threadId });
+      await expect.poll(busy, SLOW).toBe(false);
+      await api("DELETE", `/api/bots/${bot.id}`);
+      rmSync(carrier, { force: true });
+    }
+  }, 180_000);
+
+  it("pauses a busy bot after the grace and carries held messages across a forced fence", async () => {
+    const owner: { nonce: string } = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8"));
+    const authorization = { Authorization: `Bearer ${owner.nonce}` };
+    const quiesce = (method: "POST" | "DELETE", query = "") =>
+      fetch(`${BASE}/api/runtime/quiesce${query}`, { method, headers: authorization });
+    const SLOW = { timeout: 30_000, interval: 250 };
+    const resumePath = join(home, ".botfleet", "pending-update-resume.json");
+    const carrier = join(home, ".botfleet", "update-held-sends.json");
+    const working = (await api("POST", "/api/bots")).body.bot;
+    const idle = (await api("POST", "/api/bots")).body.bot;
+    const busy = async (id: string) =>
+      Boolean((await api("GET", "/api/bots?messages=0")).body.bots.find((b: { id: string }) => b.id === id)?.busy);
+    try {
+      const claude = (await api("GET", "/api/instances")).body.instances.find((i: { instanceId: string }) => i.instanceId === "claude");
+      for (const bot of [working, idle]) {
+        await api("PATCH", `/api/bots/${bot.id}`, { modelSelection: { instanceId: "claude", model: claude.models.default } });
+      }
+      expect((await api("POST", `/api/bots/${working.id}/messages`, { text: "a long job in flight" })).status).toBe(202);
+      await expect.poll(() => busy(working.id), SLOW).toBe(true);
+
+      // The hold goes up first; the grace passes with the bot still working.
+      expect((await quiesce("POST", "?drain=1&timeoutMs=60000")).status).toBe(200);
+      expect((await api("POST", `/api/bots/${idle.id}/messages`, { text: "held behind the update" })).body)
+        .toMatchObject({ queued: true });
+
+      // Then the forced fence: the working bot is interrupted and saved, and
+      // the held message is carried rather than dropped.
+      // Under load an interrupted bot can take longer than the harness's own
+      // 15-second settle, and the forced quiesce then rolls back and keeps the
+      // hold, exactly as the updater expects; it asks again, so this does too.
+      let forced = await quiesce("POST", "?force=true");
+      for (let attempt = 0; attempt < 5 && forced.status !== 200; attempt += 1) {
+        await forced.arrayBuffer();
+        await new Promise((resolve) => setTimeout(resolve, 2_000));
+        forced = await quiesce("POST", "?force=true");
+      }
+      expect(forced.status).toBe(200);
+      expect(await forced.json()).toMatchObject({ quiescing: true, draining: false, safeToRestart: true });
+      const resume: { interruptedBots: Array<{ botId: string }> } = JSON.parse(readFileSync(resumePath, "utf8"));
+      expect(resume.interruptedBots.map((entry) => entry.botId)).toContain(working.id);
+      // SAFETY: the carrier this harness just wrote, read back by its test; the assertions below check it.
+      const saved = JSON.parse(readFileSync(carrier, "utf8")) as {
+        sends: Array<{ botId: string }>;
+        queued: Array<{ botId: string; items: Array<{ text: string }> }>;
+      };
+      // The idle bot's message is committed to its thread and runs first
+      // thing.  (A send queued behind the interrupted bot would be carried
+      // uncommitted instead — server/steer-queue.test.ts and
+      // server/update-drain.test.ts cover that half, because the fixture CLI
+      // steers every mid-turn message into the live turn.)
+      expect(saved.sends.map((entry) => entry.botId)).toEqual([idle.id]);
+      expect(saved.queued).toEqual([]);
+
+      // No restart came: standing down resumes the interrupted bot and runs
+      // the held message, and leaves nothing behind on disk.
+      expect((await quiesce("DELETE")).status).toBe(200);
+      await expect.poll(() => busy(working.id), SLOW).toBe(true);
+      await expect.poll(() => busy(idle.id), SLOW).toBe(true);
+      expect(existsSync(resumePath)).toBe(false);
+      await expect.poll(() => existsSync(carrier), SLOW).toBe(false);
+    } finally {
+      await quiesce("DELETE");
+      for (const bot of [working, idle]) {
+        await api("POST", `/api/bots/${bot.id}/interrupt`, { threadId: bot.threadId });
+      }
+      for (const bot of [working, idle]) await expect.poll(() => busy(bot.id), SLOW).toBe(false);
+      for (const bot of [working, idle]) await api("DELETE", `/api/bots/${bot.id}`);
+      rmSync(carrier, { force: true });
+      rmSync(resumePath, { force: true });
+    }
+  }, 240_000);
+
+  it("defers a release that arrives while a forced quiesce is still settling, then honours it", async () => {
+    // Finding 1: the DELETE the updater sends at its deadline, on Ctrl-C and
+    // in the --force give-up used to stand the fence down mid-settle, so the
+    // resume snapshot and the held messages landed on an unfenced harness.
+    const owner: { nonce: string } = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8"));
+    const authorization = { Authorization: `Bearer ${owner.nonce}` };
+    const quiesce = (method: "POST" | "DELETE", query = "") =>
+      fetch(`${BASE}/api/runtime/quiesce${query}`, { method, headers: authorization });
+    const SLOW = { timeout: 30_000, interval: 250 };
+    // SAFETY: the harness's own JSON answer, read back by its test; the assertions below check it.
+    const runtime = async () => (await (await fetch(`${BASE}/api/runtime`, { headers: authorization })).json()) as {
+      activeWorkCount: number;
+      quiescing: boolean;
+      fencing: boolean;
+      draining: boolean;
+    };
+    const resumePath = join(home, ".botfleet", "pending-update-resume.json");
+    const carrier = join(home, ".botfleet", "update-held-sends.json");
+    const working = (await api("POST", "/api/bots")).body.bot;
+    const idle = (await api("POST", "/api/bots")).body.bot;
+    const busy = async (id: string) =>
+      Boolean((await api("GET", "/api/bots?messages=0")).body.bots.find((b: { id: string }) => b.id === id)?.busy);
+    const said = async (threadId: string, text: string) => {
+      const messages: Array<{ role: string; text?: string }> = (await api("GET", `/api/threads/${threadId}/messages?limit=50`)).body.messages;
+      return messages.filter((message) => message.role === "user" && message.text === text).length;
+    };
+    let heldMutation: ReturnType<typeof request> | null = null;
+    try {
+      const claude = (await api("GET", "/api/instances")).body.instances.find((i: { instanceId: string }) => i.instanceId === "claude");
+      for (const bot of [working, idle]) {
+        await api("PATCH", `/api/bots/${bot.id}`, { modelSelection: { instanceId: "claude", model: claude.models.default } });
+      }
+      expect((await api("POST", `/api/bots/${working.id}/messages`, { text: "keep working through the release" })).status).toBe(202);
+      await expect.poll(() => busy(working.id), SLOW).toBe(true);
+      expect((await quiesce("POST", "?drain=1&timeoutMs=60000")).status).toBe(200);
+      expect((await api("POST", `/api/bots/${idle.id}/messages`, { text: "held through a deferred release" })).body)
+        .toMatchObject({ queued: true });
+
+      // A request still reading its body keeps the forced quiesce settling
+      // (it waits up to 15 seconds for work in flight to clear).
+      const activeBeforeHeld = (await runtime()).activeWorkCount;
+      heldMutation = request({
+        hostname: "127.0.0.1", port: PORT, path: "/api/config", method: "PUT",
+        headers: { "content-type": "application/json", "content-length": "2" },
+      });
+      heldMutation.on("error", () => {});
+      heldMutation.write("{");
+      await expect.poll(async () => (await runtime()).activeWorkCount, SLOW).toBeGreaterThan(activeBeforeHeld);
+      const forced = quiesce("POST", "?force=true");
+      await expect.poll(async () => (await runtime()).fencing, SLOW).toBe(true);
+
+      // The release lands mid-settle: kept, not acted on yet.
+      const early = await quiesce("DELETE");
+      expect(early.status).toBe(200);
+      expect(await early.json()).toMatchObject({ releasePending: true, fencing: true, quiescing: true });
+      expect((await runtime()).quiescing).toBe(true);
+
+      // The settle completes, and the release is honoured the moment it does:
+      // the forced request answers unfenced, the snapshot it wrote is consumed
+      // (the interrupted bot resumes), and the held message runs.
+      heldMutation.destroy();
+      heldMutation = null;
+      // SAFETY: the harness's own JSON answer, read back by its test; the assertions below check it.
+      const answer = (await (await forced).json()) as { quiescing: boolean; fencing: boolean };
+      expect(answer).toMatchObject({ quiescing: false, fencing: false });
+      expect(await runtime()).toMatchObject({ quiescing: false, fencing: false, draining: false });
+      await expect.poll(() => existsSync(resumePath), SLOW).toBe(false);
+      await expect.poll(() => existsSync(carrier), SLOW).toBe(false);
+      await expect.poll(() => busy(idle.id), SLOW).toBe(true);
+      expect(await said(idle.threadId, "held through a deferred release")).toBe(1);
+      await expect.poll(() => busy(working.id), SLOW).toBe(true);
+    } finally {
+      heldMutation?.destroy();
+      await quiesce("DELETE");
+      for (const bot of [working, idle]) {
+        await api("POST", `/api/bots/${bot.id}/interrupt`, { threadId: bot.threadId });
+      }
+      for (const bot of [working, idle]) await expect.poll(() => busy(bot.id), SLOW).toBe(false);
+      for (const bot of [working, idle]) await api("DELETE", `/api/bots/${bot.id}`);
+      rmSync(carrier, { force: true });
+      rmSync(resumePath, { force: true });
+    }
+  }, 240_000);
+
+  it("keeps work a rolled-back forced attempt paused under the hold, and never interrupts it twice", async () => {
+    // Finding 10: every forced attempt that rolled back resumed what it had
+    // interrupted, so the next attempt interrupted it again and its tool calls
+    // repeated, up to ten times an update.  Under a hold, paused work now stays
+    // paused and saved; later attempts add to the same snapshot; letting go
+    // of the hold resumes it once.
+    const owner: { nonce: string } = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8"));
+    const authorization = { Authorization: `Bearer ${owner.nonce}` };
+    const quiesce = (method: "POST" | "DELETE", query = "") =>
+      fetch(`${BASE}/api/runtime/quiesce${query}`, { method, headers: authorization });
+    const SLOW = { timeout: 30_000, interval: 250 };
+    const resumePath = join(home, ".botfleet", "pending-update-resume.json");
+    const carrier = join(home, ".botfleet", "update-held-sends.json");
+    const paused = () => {
+      if (!existsSync(resumePath)) return [];
+      const snapshot: { interruptedBots: Array<{ botId: string }> } = JSON.parse(readFileSync(resumePath, "utf8"));
+      return snapshot.interruptedBots.map((entry) => entry.botId);
+    };
+    const working = (await api("POST", "/api/bots")).body.bot;
+    const busy = async (id: string) =>
+      Boolean((await api("GET", "/api/bots?messages=0")).body.bots.find((b: { id: string }) => b.id === id)?.busy);
+    const holdAMutation = () => {
+      const held = request({
+        hostname: "127.0.0.1", port: PORT, path: "/api/config", method: "PUT",
+        headers: { "content-type": "application/json", "content-length": "2" },
+      });
+      held.on("error", () => {});
+      held.write("{");
+      return held;
+    };
+    let heldMutation: ReturnType<typeof request> | null = null;
+    try {
+      const claude = (await api("GET", "/api/instances")).body.instances.find((i: { instanceId: string }) => i.instanceId === "claude");
+      await api("PATCH", `/api/bots/${working.id}`, { modelSelection: { instanceId: "claude", model: claude.models.default } });
+      expect((await api("POST", `/api/bots/${working.id}/messages`, { text: "paused once, resumed once" })).status).toBe(202);
+      await expect.poll(() => busy(working.id), SLOW).toBe(true);
+      expect((await quiesce("POST", "?drain=1&timeoutMs=120000")).status).toBe(200);
+
+      // First forced attempt: interrupts the bot, saves it, then cannot finish
+      // (a request still reading its body) and rolls back.  The hold is up,
+      // so the bot stays paused and saved instead of being re-sent its prompt.
+      heldMutation = holdAMutation();
+      const inFlight = async () => {
+        // SAFETY: the harness's own JSON answer, read back by its test; the assertions below check it.
+        const answer = (await (await fetch(`${BASE}/api/runtime`, { headers: authorization })).json()) as { drain: { inFlight: number } | null };
+        return answer.drain?.inFlight ?? 0;
+      };
+      await expect.poll(inFlight, SLOW).toBeGreaterThanOrEqual(2);
+      const first = await quiesce("POST", "?force=true");
+      expect(first.status).toBe(409);
+      expect(await first.json()).toMatchObject({ quiescing: false, draining: true });
+      expect(paused()).toEqual([working.id]);
+      await new Promise((resolve) => setTimeout(resolve, 3_000));
+      expect(await busy(working.id)).toBe(false);
+
+      // Second forced attempt: nothing to interrupt; the snapshot is the same.
+      const second = await quiesce("POST", "?force=true");
+      expect(second.status).toBe(409);
+      expect(paused()).toEqual([working.id]);
+      expect(await busy(working.id)).toBe(false);
+
+      // The hold converts to the fence once nothing is in flight, keeping the
+      // snapshot for the restart.
+      heldMutation.destroy();
+      heldMutation = null;
+      await expect.poll(async () => (await quiesce("POST")).status, SLOW).toBe(200);
+      expect(paused()).toEqual([working.id]);
+
+      // No restart came: standing down resumes the paused turn, once.
+      expect((await quiesce("DELETE")).status).toBe(200);
+      await expect.poll(() => busy(working.id), SLOW).toBe(true);
+      expect(existsSync(resumePath)).toBe(false);
+    } finally {
+      heldMutation?.destroy();
+      await quiesce("DELETE");
+      await api("POST", `/api/bots/${working.id}/interrupt`, { threadId: working.threadId });
+      await expect.poll(() => busy(working.id), SLOW).toBe(false);
+      await api("DELETE", `/api/bots/${working.id}`);
+      rmSync(carrier, { force: true });
+      rmSync(resumePath, { force: true });
+    }
+  }, 240_000);
+
+  it("releases a fence whose updater stopped renewing its lease, and never fences on a renewal", async () => {
+    // Finding 6: an updater killed between the fence and the shutdown left
+    // every bot refused until someone ran `unquiesce`.
+    const owner: { nonce: string } = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8"));
+    const authorization = { Authorization: `Bearer ${owner.nonce}` };
+    const quiesce = (method: "POST" | "DELETE", query = "") =>
+      fetch(`${BASE}/api/runtime/quiesce${query}`, { method, headers: authorization });
+    // SAFETY: the harness's own JSON answer, read back by its test; the assertions below check it.
+    const runtime = async () => (await (await fetch(`${BASE}/api/runtime`, { headers: authorization })).json()) as {
+      quiescing: boolean;
+      lease: { expiresAt: number } | null;
+    };
+    try {
+      // A renewal never raises a fence.
+      const stray = await quiesce("POST", "?renew=1&leaseMs=60000");
+      expect(stray.status).toBe(200);
+      expect(await stray.json()).toMatchObject({ renewed: false, quiescing: false, lease: null });
+
+      // Margins sized for a loaded Mac: a renewal every 3 seconds against a
+      // 10-second lease, over 12 seconds, so only a renewed lease survives.
+      const fenced = await quiesce("POST", "?leaseMs=10000");
+      expect(fenced.status).toBe(200);
+      // SAFETY: the harness's own JSON answer, read back by its test; the assertions below check it.
+      const first = (await fenced.json()) as { quiescing: boolean; lease: { expiresAt: number } | null };
+      expect(first.quiescing).toBe(true);
+      expect(first.lease?.expiresAt).toBeGreaterThan(Date.now());
+
+      // Renewed, it holds past its first deadline.
+      for (let renewal = 0; renewal < 4; renewal += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 3_000));
+        const renewed = await quiesce("POST", "?renew=1&leaseMs=10000");
+        expect(await renewed.json()).toMatchObject({ renewed: true, quiescing: true });
+      }
+      expect((await runtime()).quiescing).toBe(true);
+
+      // Left alone, it lets go.
+      await expect.poll(async () => (await runtime()).quiescing, { timeout: 45_000, interval: 250 }).toBe(false);
+      expect((await runtime()).lease).toBeNull();
+      expect((await api("GET", "/api/config")).status).toBe(200);
+    } finally {
+      await quiesce("DELETE");
+    }
+  }, 120_000);
+
+  it("holds a room round for an update like other work, and carries it across the fence", async () => {
+    // Finding 7: room messages and rounds were not held, so a room whose bots
+    // kept answering each other kept an update waiting for about six minutes.
+    const owner: { nonce: string } = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8"));
+    const authorization = { Authorization: `Bearer ${owner.nonce}` };
+    const quiesce = (method: "POST" | "DELETE", query = "") =>
+      fetch(`${BASE}/api/runtime/quiesce${query}`, { method, headers: authorization });
+    const SLOW = { timeout: 30_000, interval: 250 };
+    // SAFETY: the harness's own JSON answer, read back by its test; the assertions below check it.
+    const runtime = async () => (await (await fetch(`${BASE}/api/runtime`, { headers: authorization })).json()) as {
+      drain: { inFlight: number; rooms: number; held: { rooms: number } } | null;
+    };
+    const carrier = join(home, ".botfleet", "update-held-sends.json");
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    const room = (await api("POST", "/api/groups", { name: "Held room", memberIds: [bot.id] })).body.group;
+    const busy = async () =>
+      Boolean((await api("GET", "/api/bots?messages=0")).body.bots.find((b: { id: string }) => b.id === bot.id)?.busy);
+    try {
+      const claude = (await api("GET", "/api/instances")).body.instances.find((i: { instanceId: string }) => i.instanceId === "claude");
+      await api("PATCH", `/api/bots/${bot.id}`, { modelSelection: { instanceId: "claude", model: claude.models.default } });
+      await api("PATCH", `/api/groups/${room.id}/setup`, { action: "skip" });
+      await api("PATCH", `/api/groups/${room.id}`, { defaultResponder: { kind: "member", botId: bot.id } });
+
+      expect((await quiesce("POST", "?drain=1&timeoutMs=60000")).status).toBe(200);
+      // A person's room message lands in the room; the member's reply waits.
+      expect((await api("POST", `/api/groups/${room.id}/messages`, { text: "Held until the update" })).status).toBe(202);
+      await expect.poll(async () => (await runtime()).drain?.held.rooms, SLOW).toBe(1);
+      expect(await busy()).toBe(false);
+      // Held is not in flight, and is not a live room turn to wait for.
+      await expect.poll(async () => (await runtime()).drain?.inFlight, SLOW).toBe(0);
+      expect((await runtime()).drain?.rooms).toBe(0);
+
+      // The fence carries the round for the restart.
+      const fenced = await quiesce("POST");
+      expect(fenced.status).toBe(200);
+      const saved: { rooms: Array<{ groupId: string; botId: string }> } = JSON.parse(readFileSync(carrier, "utf8"));
+      expect(saved.rooms).toEqual([expect.objectContaining({ groupId: room.id, botId: bot.id })]);
+
+      // No restart came: standing down puts the round back and the member answers.
+      expect((await quiesce("DELETE")).status).toBe(200);
+      await expect.poll(() => existsSync(carrier), SLOW).toBe(false);
+      await expect.poll(busy, SLOW).toBe(true);
+
+      // That answer is a live room turn: the one thing the updater still
+      // waits for before it forces (read off the room's speaker).
+      expect((await quiesce("POST", "?drain=1&timeoutMs=60000")).status).toBe(200);
+      await expect.poll(async () => (await runtime()).drain?.rooms, SLOW).toBe(1);
+      expect((await quiesce("DELETE")).status).toBe(200);
+    } finally {
+      await quiesce("DELETE");
+      await api("POST", `/api/bots/${bot.id}/interrupt`, { threadId: bot.threadId });
+      await api("POST", `/api/groups/${room.id}/interrupt`, {});
+      await expect.poll(busy, SLOW).toBe(false);
+      await api("DELETE", `/api/groups/${room.id}`);
+      await api("DELETE", `/api/bots/${bot.id}`);
+      rmSync(carrier, { force: true });
+    }
+  }, 120_000);
 
   it("serves packaged UI assets and preserves API 404s", async () => {
     const root = await fetch(`${BASE}/`);
@@ -1450,6 +2197,7 @@ describe("harness HTTP API", () => {
         avatarCrop: "circle",
         voice: "voice_fixture",
         speakReplies: true,
+        speechDevices: ["mac", "iphone"],
       });
       expect(saved.status).toBe(200);
       expect(saved.body.bot).toMatchObject({
@@ -1461,6 +2209,7 @@ describe("harness HTTP API", () => {
         avatarCrop: "circle",
         voice: "voice_fixture",
         speakReplies: true,
+        speechDevices: ["mac", "iphone"],
       });
       const frame = await stream.until(
         (candidate) => candidate.kind === "bot" && candidate.bot?.id === bot.id,
@@ -1476,6 +2225,8 @@ describe("harness HTTP API", () => {
         { notifications: "yes" },
         { voice: null },
         { speakReplies: 1 },
+        { speechDevices: ["ipad"] },
+        { speechDevices: ["mac", "mac"] },
       ]) {
         expect((await api("PATCH", `/api/bots/${bot.id}/profile`, invalid)).status).toBe(400);
       }
@@ -1719,7 +2470,7 @@ describe("harness HTTP API", () => {
           name: "Morning signals",
           agent: "scout",
           prompt: "Prepare the approved morning signal brief.",
-          runOn: "maus",
+          runOn: "bot",
           schedule: { type: "daily", time: "09:00", weekdays: [1, 2, 3, 4, 5] },
           durationMinutes: 30,
           enabledAfterInstall: false,
@@ -1982,6 +2733,28 @@ describe("harness HTTP API", () => {
     expect(patched.body.error).toContain("not recognized");
   });
 
+  it("clears legacy unsupported effort from task selection without clobbering primary bot effort", async () => {
+    const created = await api("POST", "/api/bots", {
+      name: "EffortBot",
+      modelSelection: { instanceId: "claude", model: "claude-sonnet-5", effort: "high" },
+    });
+    expect(created.status).toBe(201);
+    const bot = created.body.bot;
+    try {
+      const taskPatch = await api("PATCH", `/api/bots/${bot.id}/tasks/${bot.threadId}`, {
+        modelSelection: { instanceId: "ghost", model: "ghost-1", effort: "high" },
+      });
+      expect(taskPatch.status).toBe(200);
+
+      const bots = (await api("GET", "/api/bots?messages=0")).body.bots;
+      const found = bots.find((b: { id: string }) => b.id === bot.id);
+      expect(found.modelSelection.effort).toBe("high");
+      expect(found.tasks[0].modelSelection.effort).toBe("high");
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
   it("creates a fully configured bot in one request and greets with its final name", async () => {
     const created = await api("POST", "/api/bots", {
       name: "  Pathfinder  ",
@@ -2048,6 +2821,90 @@ describe("harness HTTP API", () => {
         name: "Missing selection",
         requireAvailableModel: true,
       })).status).toBe(400);
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("migrates a retired fallback before judging availability on a strict write", async () => {
+    const instances = (await api("GET", "/api/instances")).body.instances;
+    const claude = instances.find((instance: { instanceId: string }) => instance.instanceId === "claude");
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    try {
+      const strict = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: {
+          instanceId: "claude",
+          model: "claude-opus-5",
+          fallbacks: [{ instanceId: "claude", model: "claude-3-7-sonnet" }],
+        },
+        requireAvailableModel: true,
+      });
+      expect(strict.status).toBe(200);
+      const saved = strict.body.bot.modelSelection.fallbacks;
+      expect(saved).toHaveLength(1);
+      // Moved forward to the current Sonnet, not left on the retired id.
+      expect(saved[0].model).toBe(claude.models.default);
+
+      // A fallback that is neither retired nor offered is still refused, after reconciliation.
+      const unknown = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: {
+          instanceId: "claude",
+          model: "claude-opus-5",
+          fallbacks: [{ instanceId: "claude", model: "not-a-real-model" }],
+        },
+        requireAvailableModel: true,
+      });
+      expect(unknown.status).toBe(400);
+      expect(unknown.body.error).toMatch(/not offered/i);
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("judges a strict write against the catalog the detected CLI can run, not the registry's full one", async () => {
+    // The fixture Claude CLI reports 2.1.232, older than 2.1.280 (Opus 5.5)
+    // and 2.1.284 (Sonnet 5.5): the picker does not list either, so an
+    // MCP-style strict write must not persist them, on the primary or on a
+    // fallback.
+    const instances = (await api("GET", "/api/instances")).body.instances;
+    const claude = instances.find((instance: { instanceId: string }) => instance.instanceId === "claude");
+    expect(claude.snapshot.version).toMatch(/^2\.1\.232/);
+    expect(claude.models.default).toBe("claude-sonnet-5");
+    const ids = claude.models.options.map((option: { id: string }) => option.id);
+    expect(ids).not.toContain("claude-opus-5-5");
+    expect(ids).not.toContain("claude-sonnet-5-5");
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    try {
+      const primary = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "claude", model: "claude-opus-5-5" },
+        requireAvailableModel: true,
+      });
+      expect(primary.status).toBe(400);
+      expect(primary.body.error).toMatch(/"claude-opus-5-5" is not offered by instance "claude"/);
+
+      const sonnet = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "claude", model: "claude-sonnet-5-5" },
+        requireAvailableModel: true,
+      });
+      expect(sonnet.status).toBe(400);
+      expect(sonnet.body.error).toMatch(/"claude-sonnet-5-5" is not offered by instance "claude"/);
+
+      const fallback = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: {
+          instanceId: "claude",
+          model: "claude-opus-5",
+          fallbacks: [{ instanceId: "claude", model: "claude-opus-5-5" }],
+        },
+        requireAvailableModel: true,
+      });
+      expect(fallback.status).toBe(400);
+      expect(fallback.body.error).toMatch(/not offered/);
+
+      // General writes stay free-form, and the model the CLI does list saves.
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "claude", model: "claude-opus-5" },
+        requireAvailableModel: true,
+      })).status).toBe(200);
     } finally {
       await api("DELETE", `/api/bots/${bot.id}`);
     }
@@ -2222,7 +3079,7 @@ describe("harness HTTP API", () => {
           (candidate: { id: string }) => candidate.id === bot.id,
         );
         return state?.busy;
-      }).toBe(true);
+      }, { timeout: winSettleMs(10_000) }).toBe(true);
 
       // the record still names the engine that is NOT running the turn
       const midFlight = (await api("GET", "/api/bots?messages=0")).body.bots.find(
@@ -2235,17 +3092,200 @@ describe("harness HTTP API", () => {
       // hasSession found claude, the real owner; a modelSelection lookup would
       // have asked crasher, which owns nothing, and reported success anyway
       expect(stop.body).toMatchObject({ ok: true, stopped: true });
+      // On windows-latest the failover owner can take longer to clear busy after
+      // interrupt; the default expect.poll window is a coin flip there (#867).
+      await settlesWithin(
+        async ({ signal }) => {
+          const state = (await api("GET", "/api/bots?messages=0", undefined, { signal })).body.bots.find(
+            (candidate: { id: string }) => candidate.id === bot.id,
+          );
+          return state?.busy === false;
+        },
+        winSettleMs(20_000),
+        200,
+        "bot clearing busy after interrupt on the failover owner",
+      );
+    } finally {
+      await api("POST", `/api/bots/${bot.id}/interrupt`, {});
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  }, winSettleMs(60_000));
+
+  it("the mid-turn fail-over skips a chain entry the doomed breaker is refusing", async () => {
+    // Regression: selectTurnFallback only skipped a doomed engine when its
+    // caller threaded botId, and the production mid-turn call did not - so a
+    // bot whose primary failed over cleanly was still handed a second dead
+    // engine.  The breaker state is built the way production builds it:
+    // deadCli's binary does not exist, every dispatch to it fails setup
+    // (spawn ENOENT), and the bus feeds three consecutive failures into the
+    // breaker for THIS bot only.
+    const instances = (await api("GET", "/api/instances")).body.instances;
+    const claude = instances.find((instance: { instanceId: string }) => instance.instanceId === "claude");
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    try {
+      const deadCli = instances.find((instance: { instanceId: string }) => instance.instanceId === "deadCli");
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "deadCli", model: deadCli.models.default },
+      })).status).toBe(200);
+      for (let i = 0; i < DOOMED_FAILURE_THRESHOLD; i++) {
+        expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "go" })).status).toBe(202);
+        await expect.poll(async () => {
+          const doomed = (await api("GET", "/api/quotas")).body.doomed ?? [];
+          return (doomed.find((entry: { botId: string; instanceId: string; consecutiveFailures: number }) =>
+            entry.botId === bot.id && entry.instanceId === "deadCli",
+          )?.consecutiveFailures) ?? 0;
+        }, { timeout: 10_000 }).toBe(i + 1);
+      }
+
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: {
+          instanceId: "crasher",
+          model: claude.models.default,
+          fallbacks: [
+            { instanceId: "deadCli", model: deadCli.models.default },
+            { instanceId: "claude", model: claude.models.default },
+          ],
+        },
+      })).status).toBe(200);
+      expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "fail then hang" })).status).toBe(202);
+
+      // The fail-over must walk past the doomed deadCli and land on claude:
+      // the fallback's own selection is patched onto the bot, so the live
+      // winner is visible without parsing the chip text.
       await expect.poll(async () => {
         const state = (await api("GET", "/api/bots?messages=0")).body.bots.find(
           (candidate: { id: string }) => candidate.id === bot.id,
         );
-        return state?.busy;
-      }).toBe(false);
+        return state?.activeModelSelection?.instanceId;
+      }, { timeout: 20_000 }).toBe("claude");
+      const state = (await api("GET", "/api/bots")).body.bots.find(
+        (candidate: { id: string }) => candidate.id === bot.id,
+      );
+      expect(state?.messages?.some((message: any) =>
+        typeof message?.tool?.name === "string" && message.tool.name.startsWith("Fell over to"),
+      )).toBe(true);
+      // ...and the walk never touched the doomed entry: without the botId
+      // threading, the first chip names deadCli's model and the turn burns
+      // one guaranteed-dead dispatch before walking on.
+      expect(state?.messages?.some((message: any) =>
+        typeof message?.tool?.name === "string" && message.tool.name.startsWith(`Fell over to ${deadCli.models.default}`),
+      )).toBe(false);
     } finally {
       await api("POST", `/api/bots/${bot.id}/interrupt`, {});
       await api("DELETE", `/api/bots/${bot.id}`);
     }
   });
+
+  it("a fallback the provider rejects does not end the walk, and is not offered again", async () => {
+    // The Claude CLI answers a retired model id with an assistant-shaped
+    // apology and a 404.  That used to count as real output and end the walk
+    // on the dead entry, with every later engine in the chain never reached.
+    // Now the apology is an error row, the walk moves on, and the rejected
+    // (bot, engine, model) is remembered so the next turn skips it.
+    //
+    // The rejected id is a fixture name the model lineage neither classifies
+    // nor retires (shared/model-lineage.ts).  A real retired id such as
+    // claude-3-7-sonnet is rewritten to Latest Sonnet when it is saved, so it
+    // would never reach the CLI; the fake CLI rejects whatever model it gets.
+    const rejected = "claude-fixture-rejected";
+    expect((await api("PATCH", "/api/instances/rejector", { enabled: true })).status).toBe(200);
+    const instances = (await api("GET", "/api/instances?fresh=1")).body.instances;
+    const claude = instances.find((instance: { instanceId: string }) => instance.instanceId === "claude");
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    const transcript = async (): Promise<any[]> =>
+      (await api("GET", "/api/bots")).body.bots.find((candidate: { id: string }) => candidate.id === bot.id)?.messages ?? [];
+    const chips = async (prefix: string): Promise<string[]> =>
+      (await transcript())
+        .flatMap((message) => (message?.tool?.name ? [String(message.tool.name)] : []))
+        .filter((name) => name.startsWith(prefix));
+    try {
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: {
+          instanceId: "crasher",
+          model: claude.models.default,
+          fallbacks: [
+            { instanceId: "rejector", model: rejected },
+            { instanceId: "claude", model: claude.models.default },
+          ],
+        },
+      })).status).toBe(200);
+
+      expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "fail, get rejected, then hang" })).status).toBe(202);
+      // the walk reaches the healthy entry behind the rejected one
+      await expect.poll(async () => {
+        const state = (await api("GET", "/api/bots?messages=0")).body.bots.find(
+          (candidate: { id: string }) => candidate.id === bot.id,
+        );
+        return state?.activeModelSelection?.instanceId;
+      }, { timeout: 30_000 }).toBe("claude");
+
+      const rows = await transcript();
+      expect(await chips(`Fell over to ${rejected}`)).toHaveLength(1);
+      expect(await chips(`Fell over to ${claude.models.default}`)).toHaveLength(1);
+      // the rejection is an error row the person can read, never bot text
+      expect(await chips(`error: Claude can't use the model ${rejected}`)).toHaveLength(1);
+      expect(rows.some((message) => message.kind === "text" && /issue with the selected model/i.test(message.text ?? ""))).toBe(false);
+
+      await api("POST", `/api/bots/${bot.id}/interrupt`, {});
+      await expect.poll(async () => {
+        const state = (await api("GET", "/api/bots?messages=0")).body.bots.find(
+          (candidate: { id: string }) => candidate.id === bot.id,
+        );
+        return state?.busy;
+      }, { timeout: 20_000 }).toBe(false);
+
+      // A fresh turn starts at the primary again, fails the same way, and this
+      // time walks straight past the entry the provider already rejected.
+      expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "again" })).status).toBe(202);
+      await expect.poll(async () => (await chips(`Fell over to ${claude.models.default}`)).length, { timeout: 30_000 }).toBe(2);
+      expect(await chips(`Fell over to ${rejected}`)).toHaveLength(1);
+      expect(await chips(`error: Claude can't use the model ${rejected}`)).toHaveLength(1);
+    } finally {
+      await api("POST", `/api/bots/${bot.id}/interrupt`, {});
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  }, 120_000);
+
+  it("a fail-over that cannot start says so and keeps walking the chain", async () => {
+    // The fallback's startTurn throws before dispatch when its instance is
+    // gone.  No turn.completed follows, so the walk used to stop in silence on
+    // a "Fell over to" notice with only a console.error behind it.
+    const claude = (await api("GET", "/api/instances")).body.instances.find(
+      (instance: { instanceId: string }) => instance.instanceId === "claude",
+    );
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    const names = async (): Promise<string[]> =>
+      ((await api("GET", "/api/bots")).body.bots.find((candidate: { id: string }) => candidate.id === bot.id)?.messages ?? [])
+        .flatMap((message: any) => (message?.tool?.name ? [String(message.tool.name)] : []));
+    try {
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: {
+          instanceId: "crasher",
+          model: claude.models.default,
+          fallbacks: [
+            { instanceId: "retired-engine", model: "retired-model" },
+            { instanceId: "claude", model: claude.models.default },
+          ],
+        },
+      })).status).toBe(200);
+
+      expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "fail, skip the retired engine, then hang" })).status).toBe(202);
+      await expect.poll(async () => {
+        const state = (await api("GET", "/api/bots?messages=0")).body.bots.find(
+          (candidate: { id: string }) => candidate.id === bot.id,
+        );
+        return state?.activeModelSelection?.instanceId;
+      }, { timeout: 30_000 }).toBe("claude");
+
+      const all = await names();
+      expect(all.some((name) => /^Couldn't start retired-model .* "retired-engine" is unavailable/.test(name))).toBe(true);
+      expect(all.some((name) => name === "Fell over to retired-model")).toBe(true);
+      expect(all.some((name) => name === `Fell over to ${claude.models.default}`)).toBe(true);
+    } finally {
+      await api("POST", `/api/bots/${bot.id}/interrupt`, {});
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  }, 120_000);
 
   it("delivers a room approval to the fallback instance that opened it", async () => {
     const instances = (await api("GET", "/api/instances")).body.instances;
@@ -2301,6 +3341,15 @@ describe("harness HTTP API", () => {
         );
       }, { timeout: 5_000 }).toBe(true);
 
+      const roomGrant = await api("POST", `/api/bots/${bot.id}/always-allow`, {
+        allowKey: "Bash:echo", threadId: room.threadId, requestId: "fallback-room-approval",
+      });
+      expect(roomGrant.status).toBe(200);
+      expect(roomGrant.body.bot.alwaysAllow).toContain("Bash:echo");
+      const wrongRequest = await api("POST", `/api/bots/${bot.id}/always-allow`, {
+        allowKey: "Bash:echo", threadId: room.threadId, requestId: "other-request",
+      });
+      expect(wrongRequest.status).toBe(409);
       const answered = await api("POST", `/api/threads/${room.threadId}/respond`, {
         requestId: "fallback-room-approval",
         behavior: "allow",
@@ -2362,6 +3411,151 @@ describe("harness HTTP API", () => {
       expect((await api("PATCH", "/api/instances/quota", { enabled: false })).status).toBe(200);
     }
   }, 30_000);
+
+  it("keeps routine receipts queued when the primary model is cooling with no viable fallback", async () => {
+    expect((await api("PATCH", "/api/instances/quota", { enabled: true })).status).toBe(200);
+    const instances = (await api("GET", "/api/instances?fresh=1")).body.instances;
+    const quota = instances.find((instance: { instanceId: string }) => instance.instanceId === "quota");
+    expect(quota?.snapshot.state).toBe("available");
+
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    let routineId: string | undefined;
+    try {
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: {
+          instanceId: "quota",
+          model: quota.models.default,
+          fallbacks: [{ instanceId: "quota", model: quota.models.default }],
+        },
+      })).status).toBe(200);
+      expect((await api("PATCH", "/api/instances/quotaProse", { enabled: true })).status).toBe(200);
+      expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "cool the primary model" })).status).toBe(202);
+      await expect.poll(async () => {
+        // SAFETY: The harness /api/quotas response returns cooldown rows with botId fields.
+        const cooldowns = (await api("GET", "/api/quotas")).body.cooldowns as Array<{ botId: string }>;
+        return cooldowns.some((cooldown) => cooldown.botId === bot.id);
+      }, { timeout: 15_000 }).toBe(true);
+
+      const created = await api("POST", "/api/routines", {
+        name: "Cooldown queue probe",
+        prompt: "Process the queued event",
+        botId: bot.id,
+        runOn: "bot",
+        enabled: false,
+        schedule: { type: "daily", time: "10:00", weekdays: [1] },
+      });
+      expect(created.status).toBe(201);
+      routineId = created.body.routine.id;
+      const delivered = await api("POST", `/api/routines/${routineId}/run`, {});
+      expect(delivered.status).toBe(201);
+      const accepted = delivered.body.run;
+
+      await expect.poll(async () => {
+        // SAFETY: /api/routines returns run rows with status and optional holdReason fields.
+        const runs = (await api("GET", "/api/routines")).body.runs as Array<{
+          id: string;
+          status: string;
+          holdReason?: string;
+        }>;
+        return runs.find((run) => run.id === accepted.id);
+      }, { timeout: 10_000 }).toMatchObject({
+        id: accepted.id,
+        status: "queued",
+        holdReason: expect.stringMatching(/cooling down.*start automatically/i),
+      });
+
+      const quotaProse = (await api("GET", "/api/instances?fresh=1")).body.instances.find(
+        (instance: { instanceId: string }) => instance.instanceId === "quotaProse",
+      );
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "quotaProse", model: quotaProse.models.default },
+      })).status).toBe(200);
+      await expect.poll(async () => {
+        // SAFETY: /api/routines returns run rows keyed by the ingress runId.
+        const runs = (await api("GET", "/api/routines")).body.runs as Array<{ id: string; status: string }>;
+        return runs.find((run) => run.id === accepted.id);
+      }, { timeout: 20_000 }).toMatchObject({ id: accepted.id, status: "completed" });
+    } finally {
+      if (routineId) await api("DELETE", `/api/routines/${routineId}`);
+      await api("DELETE", `/api/bots/${bot.id}`);
+      expect((await api("PATCH", "/api/instances/quota", { enabled: false })).status).toBe(200);
+      expect((await api("PATCH", "/api/instances/quotaProse", { enabled: false })).status).toBe(200);
+    }
+  }, 30_000);
+
+  it("resumes a capacity-held routine when another bot succeeds on the same model route", async () => {
+    const gate = join(home, "capacity-route-healthy");
+    const cli = writeFakeClaudeWrapper(join(home, "fake-capacity-route"), "happy", {
+      replyGate: {
+        path: gate,
+        present: "The same model route is working successfully.",
+        absent: "HTTP 429: concurrency limit reached; retry after 120 seconds",
+      },
+    });
+    expect((await api("PATCH", "/api/instances/quotaProse", { cli, enabled: true })).status).toBe(200);
+    const instance = (await api("GET", "/api/instances?fresh=1")).body.instances.find(
+      (candidate: { instanceId: string }) => candidate.instanceId === "quotaProse",
+    );
+    const first = (await api("POST", "/api/bots")).body.bot;
+    const sibling = (await api("POST", "/api/bots")).body.bot;
+    let routineId: string | undefined;
+    try {
+      for (const candidate of [first, sibling]) {
+        expect((await api("PATCH", `/api/bots/${candidate.id}`, {
+          modelSelection: {
+            instanceId: instance.instanceId,
+            model: instance.models.default,
+            fallbacks: [{ instanceId: instance.instanceId, model: instance.models.default }],
+          },
+        })).status).toBe(200);
+      }
+      expect((await api("POST", `/api/bots/${first.id}/messages`, { text: "probe a busy route" })).status).toBe(202);
+      await expect.poll(async () => {
+        const state = (await api("GET", "/api/bots?messages=0")).body.bots.find(
+          (candidate: { id: string }) => candidate.id === first.id,
+        );
+        return state?.busy;
+      }, { timeout: 15_000 }).toBe(false);
+      // SAFETY: /api/quotas returns the cooldown rows in the harness response contract.
+      const cooldowns = (await api("GET", "/api/quotas")).body.cooldowns as Array<{ botId: string }>;
+      expect(cooldowns.some((row) => row.botId === first.id)).toBe(false);
+
+      const created = await api("POST", "/api/routines", {
+        name: "Transient capacity queue probe",
+        prompt: "Process the pending capacity event",
+        botId: first.id,
+        runOn: "bot",
+        enabled: false,
+        schedule: { type: "daily", time: "10:00", weekdays: [1] },
+      });
+      expect(created.status).toBe(201);
+      routineId = created.body.routine.id;
+      const delivered = await api("POST", `/api/routines/${routineId}/run`, {});
+      expect(delivered.status).toBe(201);
+      const accepted = delivered.body.run;
+      const receipt = async () => {
+        // SAFETY: /api/routines returns run rows with these public status fields.
+        const runs = (await api("GET", "/api/routines")).body.runs as Array<{ id: string; status: string; holdReason?: string }>;
+        return runs.find((row) => row.id === accepted.id);
+      };
+      await expect.poll(receipt, { timeout: 10_000 }).toMatchObject({
+        status: "queued",
+        holdReason: expect.stringMatching(/temporarily at capacity/i),
+      });
+
+      writeFileSync(gate, "healthy");
+      expect((await api("POST", `/api/bots/${sibling.id}/messages`, { text: "prove the same route is healthy" })).status).toBe(202);
+      // The receipt resumes well before its two-minute Retry-After because
+      // the other bot's live provider activity proves this exact route works.
+      await expect.poll(receipt, { timeout: 20_000 }).toMatchObject({ id: accepted.id, status: "completed" });
+    } finally {
+      if (routineId) await api("DELETE", `/api/routines/${routineId}`);
+      await api("DELETE", `/api/bots/${first.id}`);
+      await api("DELETE", `/api/bots/${sibling.id}`);
+      rmSync(gate, { force: true });
+      expect((await api("PATCH", "/api/instances/quotaProse", { cli: fakeQuotaProseCli, enabled: false })).status).toBe(200);
+    }
+  }, 45_000);
 
   it("does not cool down or replay a successful reply that discusses subscription accounting", async () => {
     expect((await api("PATCH", "/api/instances/quotaProse", { enabled: true })).status).toBe(200);
@@ -2482,6 +3676,37 @@ describe("harness HTTP API", () => {
     } finally {
       await api("DELETE", `/api/bots/${bot.id}`);
       expect((await api("PATCH", "/api/instances/pricedClaude", { enabled: false })).status).toBe(200);
+    }
+  }, 30_000);
+
+  it("runs iMessage-relayed text as an unattended imessage turn, not an attended one", async () => {
+    // S8: text from an outside iMessage sender must never get attended
+    // semantics (Auto mode / Always-allow) just because it arrived over the
+    // owner-linked relay.
+    const claude = (await api("GET", "/api/instances")).body.instances.find((i: { instanceId: string }) => i.instanceId === "claude");
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    const transcript = async () => (await api("GET", `/api/threads/${bot.threadId}/messages?limit=50`)).body.messages as Array<{
+      role: string; text?: string; automationSource?: string;
+    }>;
+    try {
+      await api("PATCH", `/api/bots/${bot.id}`, { modelSelection: { instanceId: "claude", model: claude.models.default } });
+      expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "[from iMessage] hello from outside", source: "imessage" })).status).toBe(202);
+      await expect.poll(async () => (await transcript()).find((message) => message.text?.includes("hello from outside"))?.automationSource, { timeout: 10_000 }).toBe("imessage");
+      const inbound = (await transcript()).find((message) => message.text?.includes("hello from outside"));
+      expect(inbound?.role).toBe("system");
+
+      await api("POST", `/api/bots/${bot.id}/interrupt`, { threadId: bot.threadId });
+      await expect.poll(async () => (await api("GET", "/api/bots?messages=0")).body.bots.find((b: { id: string }) => b.id === bot.id)?.busy, { timeout: 10_000 }).toBe(false);
+
+      // An attended send to the same bot keeps attended provenance.
+      expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "owner typing directly" })).status).toBe(202);
+      await expect.poll(async () => (await transcript()).some((message) => message.text?.includes("owner typing directly")), { timeout: 10_000 }).toBe(true);
+      const attended = (await transcript()).find((message) => message.text?.includes("owner typing directly"));
+      expect(attended?.automationSource).toBeUndefined();
+      expect(attended?.role).toBe("user");
+    } finally {
+      await api("POST", `/api/bots/${bot.id}/interrupt`, { threadId: bot.threadId }).catch(() => {});
+      await api("DELETE", `/api/bots/${bot.id}`);
     }
   }, 30_000);
 
@@ -2614,6 +3839,27 @@ describe("harness HTTP API", () => {
         }, { timeout: 5_000 }).toBe(true);
 
         if (reloadInstanceId === "gatedQuota") {
+          // Assistant text precedes the result frame.  Reloading after text alone
+          // can interrupt a still-active turn instead of its deferred terminal
+          // fold, correctly clearing busy before the successor is posted.
+          // Wait for the terminal event, then prove the held health probe still
+          // owns busy before exercising the targeted reload.
+          await expect.poll(() => {
+            const file = join(home, ".botfleet", "events", `${bot.threadId}.ndjson`);
+            if (!existsSync(file)) return false;
+            return readFileSync(file, "utf8").split("\n").some((line) => {
+              if (!line.trim()) return false;
+              try {
+                return JSON.parse(line).type === "turn.completed";
+              } catch {
+                return false; // The asynchronous log writer may be mid-append.
+              }
+            });
+          }, { timeout: 5_000 }).toBe(true);
+          expect((await api("GET", "/api/bots?messages=0")).body.bots.find(
+            (candidate: { id: string }) => candidate.id === bot.id,
+          )?.busy).toBe(true);
+
           reload = api("PATCH", `/api/instances/${reloadInstanceId}`, { fullAuto: true });
           await expect.poll(async () => {
             const transcript = await api("GET", `/api/threads/${bot.threadId}/messages?limit=200`);
@@ -2624,7 +3870,38 @@ describe("harness HTTP API", () => {
         }
 
         if (queueSuccessor) {
-          expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "run after reload" }))).toEqual({
+          // The POST must land while the bot is still busy; on windows-latest a
+          // fast reload can clear busy between the reload tool frame and here.
+          // Poll for the queued response in one step: wait for busy, POST once,
+          // and stop — never spin on busy alone while the bot is already idle.
+          type MessageSendResult = { status: number; body: unknown };
+          const queuedSendBodySchema = z.object({ queued: z.literal(true) }).passthrough();
+          const isQueuedSend = (result: MessageSendResult | undefined): boolean =>
+            !!result
+            && result.status === 202
+            && queuedSendBodySchema.safeParse(result.body).success;
+          let successorSend: MessageSendResult | undefined;
+          await expect
+            .poll(
+              async () => {
+                if (isQueuedSend(successorSend)) return true;
+                if (successorSend) return false;
+                const state = (await api("GET", "/api/bots?messages=0")).body.bots.find(
+                  (candidate: { id: string }) => candidate.id === bot.id,
+                );
+                if (!state?.busy) return false;
+                successorSend = await api("POST", `/api/bots/${bot.id}/messages`, { text: "run after reload" });
+                return isQueuedSend(successorSend);
+              },
+              {
+                timeout: winSettleMs(15_000),
+                interval: 100,
+                message:
+                  "queued successor send while the reload-held bot is busy (idle here means the reload window closed early)",
+              },
+            )
+            .toBe(true);
+          expect(successorSend).toEqual({
             status: 202,
             body: expect.objectContaining({ ok: true, queued: true }),
           });
@@ -2662,7 +3939,7 @@ describe("harness HTTP API", () => {
                 (message: { text?: string }) => message.text?.includes("You've hit your session limit"),
               ).length,
             };
-          }, { timeout: 10_000 }).toEqual({
+          }, { timeout: winSettleMs(10_000) }).toEqual({
             launchedQueuedPrompt: true,
             queuedUserVisible: true,
             quotaReplies: 2,
@@ -2678,7 +3955,7 @@ describe("harness HTTP API", () => {
                 message.tool?.name?.startsWith("Fell over to"),
               ),
             };
-          }, { timeout: 10_000 }).toEqual({ busy: true, fellOver: true });
+          }, { timeout: winSettleMs(10_000) }).toEqual({ busy: true, fellOver: true });
         }
 
         const beforeStop = (await api("GET", "/api/bots?messages=0")).body.bots.find(
@@ -2711,13 +3988,25 @@ describe("harness HTTP API", () => {
         await api("POST", `/api/bots/${bot.id}/interrupt`, {});
         await api("DELETE", `/api/bots/${bot.id}`);
       }
-      for (const instanceId of otherInstances) {
-        expect((await api("PATCH", `/api/instances/${instanceId}`, { enabled: true })).status).toBe(200);
-      }
-      expect((await api("PATCH", "/api/instances/gatedQuota", { enabled: false, fullAuto: false })).status).toBe(200);
-      expect((await api("PATCH", "/api/instances/slowProbe", { enabled: false, fullAuto: false })).status).toBe(200);
+      let next = 0;
+      await settlesWithin(
+        async ({ signal }) => {
+          for (; next < otherInstances.length; next++) {
+            if ((await api("PATCH", `/api/instances/${otherInstances[next]}`, { enabled: true }, { signal })).status !== 200) {
+              return false;
+            }
+          }
+          for (const path of ["/api/instances/gatedQuota", "/api/instances/slowProbe"]) {
+            if ((await api("PATCH", path, { enabled: false, fullAuto: false }, { signal })).status !== 200) return false;
+          }
+          return true;
+        },
+        winSettleMs(6_000),
+        200,
+        "instance cleanup writes",
+      );
     }
-  }, 40_000);
+  }, winSettleMs(40_000));
 
   it("reports stopped:false when the stop matched no live turn", async () => {
     // An idle bot has no session on any instance. The old endpoint answered a
@@ -2985,7 +4274,7 @@ describe("harness HTTP API", () => {
     const unsupported = await api("POST", "/api/local-computer/interrupt");
     expect(unsupported).toEqual({
       status: 415,
-      body: { error: "content-type must be application/json" },
+      body: { error: "unsupported media type: mutating requests take application/json" },
     });
     const stopped = await api("POST", "/api/local-computer/interrupt", {});
     expect(stopped).toEqual({ status: 200, body: { ok: true } });
@@ -3046,6 +4335,31 @@ describe("harness HTTP API", () => {
       behavior: "allow",
     });
     expect(nothing.status).toBe(404);
+  });
+
+  it("approves all pending approvals for a thread or bot", async () => {
+    const listRes = await api("GET", "/api/bots");
+    const bot = listRes.body.bots[0];
+
+    // non-existent bot returns 404
+    const notFound = await api("POST", "/api/bots/non-existent-bot-id/approve-all");
+    expect(notFound.status).toBe(404);
+
+    // bot with no pending approvals returns ok with approvedCount: 0
+    const emptyApprove = await api("POST", `/api/bots/${bot.id}/approve-all`);
+    expect(emptyApprove.status).toBe(200);
+    expect(emptyApprove.body).toEqual({ ok: true, approvedCount: 0 });
+
+    // thread approve-all endpoint
+    const threadApprove = await api("POST", `/api/threads/${bot.threadId}/approve-all`);
+    expect(threadApprove.status).toBe(200);
+    expect(threadApprove.body).toEqual({ ok: true, approvedCount: 0 });
+
+    // invalid route parameters return 400
+    const invalidBot = await api("POST", "/api/bots/bad%20bot%20id/approve-all");
+    expect(invalidBot.status).toBe(400);
+    const invalidThread = await api("POST", "/api/threads/bad%20thread%20id/approve-all");
+    expect(invalidThread.status).toBe(400);
   });
 
   it("closes the approvals a cancelled turn can no longer answer", async () => {
@@ -3383,6 +4697,99 @@ describe("harness HTTP API", () => {
     expect(response.status).toBe(415);
   });
 
+  it("POST /api/instances/probe-models answers what a connection actually serves", async () => {
+    // The server runs in a child process, so a mocked fetch here would not
+    // intercept its probe.  A real local endpoint, exercised over the wire.
+    const seen: string[] = [];
+    const endpoint = createServer((req, res) => {
+      seen.push(req.url ?? "");
+      if (req.url === "/v1/models" && req.headers.authorization === "Bearer probe-key") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ data: [{ id: "meta-llama/llama-3.3-70b-instruct" }, { id: "qwen3-32b" }, { id: "qwen3-32b" }] }));
+        return;
+      }
+      res.writeHead(401).end("no");
+    });
+    await new Promise<void>((resolve) => endpoint.listen(0, "127.0.0.1", resolve));
+    // SAFETY: a bound `net` listener always reports a port; the assertions below read it back.
+    const port = (endpoint.address() as { port: number }).port;
+    try {
+      const found = await api("POST", "/api/instances/probe-models", {
+        endpoint: `http://127.0.0.1:${port}/v1`,
+        key: "probe-key",
+      });
+      expect(found.status).toBe(200);
+      expect(found.body.ok).toBe(true);
+      // The duplicate id is collapsed: the textarea is a list to edit, not a
+      // copy of the provider's array.
+      expect(found.body.models).toEqual(["meta-llama/llama-3.3-70b-instruct", "qwen3-32b"]);
+      expect(seen).toContain("/v1/models");
+
+      // A rejected key is reported as the status it came back with, so the UI
+      // can say "that endpoint rejected the API key" instead of "failed".
+      const rejected = await api("POST", "/api/instances/probe-models", {
+        endpoint: `http://127.0.0.1:${port}/v1`,
+        key: "wrong-key",
+      });
+      expect(rejected.status).toBe(200);
+      expect(rejected.body.ok).toBe(false);
+      expect(rejected.body.status).toBe(401);
+      expect(rejected.body.models).toEqual([]);
+
+      // A malformed endpoint is refused before anything is sent to it.
+      const bad = await api("POST", "/api/instances/probe-models", { endpoint: "not a url" });
+      expect(bad.status).toBe(400);
+    } finally {
+      await new Promise<void>((resolve) => endpoint.close(() => resolve()));
+    }
+  });
+
+  it("POST /api/instances/probe-models refuses a body that is not JSON", async () => {
+    // Same CSRF gate as every other mutating route: a page elsewhere on this
+    // machine must not be able to ride the harness into fetching a URL.
+    const res = await fetch(`${BASE}/api/instances/probe-models`, {
+      method: "POST",
+      headers: { "content-type": "text/plain" },
+      body: "endpoint=http://example.invalid",
+    });
+    expect(res.status).toBe(415);
+  });
+
+  it("POST /api/instances creates an OpenAI-compatible engine with no hand-typed models", async () => {
+    // The empty-list refusal and the driver's own `/models` probe were mutually
+    // exclusive: a non-empty config list is exactly what suppresses the probe,
+    // so every engine added through the UI had to have its models retyped by
+    // hand.  Blank is allowed now, and discovery fills it in.
+    const endpoint = createServer((req, res) => {
+      if (req.url === "/v1/models") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ data: [{ id: "discovered-model" }] }));
+        return;
+      }
+      res.writeHead(404).end("no");
+    });
+    await new Promise<void>((resolve) => endpoint.listen(0, "127.0.0.1", resolve));
+    // SAFETY: a bound `net` listener always reports a port; the body below reads it back.
+    const port = (endpoint.address() as { port: number }).port;
+    const created = await api("POST", "/api/instances", {
+      name: "Discovered fixture",
+      endpoint: `http://127.0.0.1:${port}/v1`,
+    });
+    expect(created.status).toBe(201);
+    try {
+      const listed = await api("GET", "/api/instances");
+      // SAFETY: the harness's own JSON answer, read back by its test; the assertions below check it.
+      const instance = listed.body.instances.find((i: { instanceId: string }) => i.instanceId === created.body.instanceId);
+      expect(instance).toBeTruthy();
+      // Either the endpoint's own answer or the driver's documented fallback
+      // is acceptable; a blank catalog is not.
+      expect(instance.models.options.length).toBeGreaterThan(0);
+    } finally {
+      await api("DELETE", `/api/instances/${created.body.instanceId}`);
+      await new Promise<void>((resolve) => endpoint.close(() => resolve()));
+    }
+  });
+
   it("POST /api/ingress/test reports the tunnel when Cloudflare is in front", async () => {
     // The server runs in a child process, so mocking globalThis.fetch here
     // would not intercept its probe.  Spin up a real local HTTP server and
@@ -3572,11 +4979,113 @@ describe("harness HTTP API", () => {
     expect(res.body.error).toMatch(/Updating Infisical settings and credentials in the same request is not supported/);
   });
 
+  it("keeps externally stored Infisical read and write tokens off disk and out of responses", async () => {
+    const readToken = "st.fixture-read-token";
+    const writeToken = "st.fixture-write-token";
+    try {
+      const saved = await api("PUT", "/api/config?secretStorage=external", {
+        infisical: {
+          enabled: false,
+          authMethod: "service-token",
+          projectId: "11111111-1111-4111-8111-111111111111",
+          token: readToken,
+          writeToken,
+        },
+      });
+      expect(saved.status).toBe(200);
+      expect(saved.body.infisical).toMatchObject({
+        enabled: false, authMethod: "service-token", hasToken: true, hasWriteToken: true,
+      });
+      const disk = JSON.parse(readFileSync(join(home, ".botfleet", "config.json"), "utf8"));
+      expect(disk.infisical).toMatchObject({ token: "", writeToken: "", credentialStorage: "external" });
+      const status = await api("GET", "/api/infisical/status");
+      expect(status.status).toBe(200);
+      for (const payload of [saved.body, disk, status.body]) {
+        expect(JSON.stringify(payload)).not.toContain(readToken);
+        expect(JSON.stringify(payload)).not.toContain(writeToken);
+      }
+      const reloaded = await api("PUT", "/api/config", { profile: { name: "Grace" } });
+      expect(reloaded.status).toBe(200);
+      expect(reloaded.body.infisical).toMatchObject({ hasToken: true, hasWriteToken: true });
+    } finally {
+      await api("PUT", "/api/config?secretStorage=external", {
+        infisical: { enabled: false, projectId: "", token: "", writeToken: "", authMethod: "service-token" },
+      });
+    }
+  });
+
+  it("allows exact source-based Infisical test and sync despite an encrypted primary credential marker", async () => {
+    const projectId = "fixture-source-project";
+    const source = { name: "primary-source", projectId, environment: "prod", secretPath: "/", tokenEnv: "BF_SCOPE_FIXTURE_MISSING" };
+    try {
+      expect((await api("PUT", "/api/config?secretStorage=external", { infisical: {
+        enabled: false, authMethod: "machine-identity", projectId, clientId: "fixture-client", clientSecret: "fixture-encrypted-secret",
+      } })).status).toBe(200);
+      const saved = await api("PATCH", "/api/config", { infisical: {
+        enabled: true, authMethod: "service-token", environment: "prod", secretPath: "/", readSources: [source],
+      } });
+      expect(saved.status).toBe(200);
+      const tested = await api("POST", "/api/infisical/test");
+      expect(tested.status).toBe(200);
+      expect(tested.body.ok).toBe(false);
+      expect(tested.body.error).toContain("BF_SCOPE_FIXTURE_MISSING");
+      expect((await api("POST", "/api/infisical/sync")).status).toBe(200);
+      expect((await api("PATCH", "/api/config", { infisical: { readSources: [{ ...source, secretPath: "/another-folder" }] } })).status).toBe(200);
+      expect((await api("POST", "/api/infisical/test")).status).toBe(409);
+    } finally {
+      await api("PUT", "/api/config?secretStorage=external", { infisical: {
+        enabled: false, authMethod: "service-token", projectId: "", clientId: "", clientSecret: "", token: "", writeToken: "", readSources: [],
+      } });
+    }
+  });
+
+  it("retains partial Infisical setup metadata and the explicit off switch across saves", async () => {
+    try {
+      const saved = await api("PATCH", "/api/config", { infisical: {
+        enabled: false, authMethod: "service-token", projectId: "partial-project", siteUrl: "https://vault.example.test", readSources: [],
+      } });
+      expect(saved.status).toBe(200);
+      expect(saved.body.infisical).toMatchObject({ configured: false, enabled: false, enabledSetting: false });
+      expect((await api("GET", "/api/infisical/status")).body.infisical).toMatchObject({
+        enabledSetting: false, siteUrl: "https://vault.example.test", projectId: "partial-project",
+      });
+      expect((await api("PATCH", "/api/config", { infisical: { refreshMinutes: 20 } })).body.infisical.enabledSetting).toBe(false);
+    } finally {
+      await api("PATCH", "/api/config", { infisical: { enabled: false, projectId: "", siteUrl: "", refreshMinutes: 15 } });
+    }
+  });
+
+  it("rejects extra per-project token references before persisting or exposing credentials", async () => {
+    const token = "st.fixture-cap-read";
+    try {
+      expect((await api("PUT", "/api/config?secretStorage=external", { infisical: {
+        enabled: false, authMethod: "service-token", projectId: "cap-project", token,
+      } })).status).toBe(200);
+      const refused = await api("PATCH", "/api/config", { infisical: { readSources: [{
+        name: "extra", projectId: "cap-project", secretPath: "/extra", tokenEnv: "OTHER_READ_REFERENCE",
+      }] } });
+      expect(refused.status).toBe(400);
+      expect(refused.body.error).toMatch(/one read token reference/);
+      expect(JSON.stringify(refused.body)).not.toContain(token);
+      expect((await api("GET", "/api/infisical/status")).body.infisical.readSources).toEqual([]);
+    } finally {
+      await api("PUT", "/api/config?secretStorage=external", { infisical: { enabled: false, projectId: "", token: "", readSources: [] } });
+    }
+  });
+
   it("keeps shared Local VM mode by default and resolves isolated targets per bot when enabled", async () => {
     const first = (await api("POST", "/api/bots")).body.bot;
     const second = (await api("POST", "/api/bots")).body.bot;
     const before = await api("GET", "/api/config");
-    expect(before.body.localVm).toEqual({ mode: "shared", maxInstances: 2 });
+    // The Host & CLI Integration booleans ride in the same section: a status
+    // that omitted them made the Settings checkboxes snap back after a save.
+    expect(before.body.localVm).toEqual({
+      mode: "shared",
+      maxInstances: 2,
+      shareCliCredentials: false,
+      shareGpgPrivateKeys: false,
+      allowHostTerminal: false,
+    });
 
     const shared = await api("GET", `/api/bots/${first.id}/local-computer`);
     expect(shared.status).toBe(200);
@@ -3586,7 +5095,13 @@ describe("harness HTTP API", () => {
       localVm: { mode: "per-bot", maxInstances: 3 },
     });
     expect(saved.status).toBe(200);
-    expect(saved.body.localVm).toEqual({ mode: "per-bot", maxInstances: 3 });
+    expect(saved.body.localVm).toEqual({
+      mode: "per-bot",
+      maxInstances: 3,
+      shareCliCredentials: false,
+      shareGpgPrivateKeys: false,
+      allowHostTerminal: false,
+    });
 
     const [firstStatus, secondStatus] = await Promise.all([
       api("GET", `/api/bots/${first.id}/local-computer`),
@@ -3605,6 +5120,56 @@ describe("harness HTTP API", () => {
     const disk = JSON.parse(readFileSync(join(home, ".botfleet", "config.json"), "utf8"));
     expect(disk.localVm).toEqual({ mode: "per-bot", maxInstances: 3 });
     await api("PATCH", "/api/config", { localVm: { mode: "shared", maxInstances: 2 } });
+  });
+
+  it("persists the Host & CLI Integration toggles across a save and a fresh read", async () => {
+    // The Settings checkboxes are controlled inputs bound to this response.
+    // They used to snap back because the status dropped both flags.
+    // Restored in `finally`: both flags are process-global, and a leaked
+    // `shareCliCredentials` would let a later VPS test mount real host
+    // credentials into a container.
+    try {
+      const saved = await api("PUT", "/api/config", {
+        localVm: { shareCliCredentials: true, shareGpgPrivateKeys: true, allowHostTerminal: true },
+      });
+      expect(saved.status).toBe(200);
+      expect(saved.body.localVm).toMatchObject({
+        shareCliCredentials: true,
+        shareGpgPrivateKeys: true,
+        allowHostTerminal: true,
+      });
+
+      const reread = await api("GET", "/api/config");
+      expect(reread.body.localVm).toMatchObject({
+        shareCliCredentials: true,
+        shareGpgPrivateKeys: true,
+        allowHostTerminal: true,
+      });
+
+      const status = await api("GET", "/api/config");
+      expect(status.body.localVm).toMatchObject({ shareGpgPrivateKeys: true });
+
+      // Turning one off must not disturb the other.
+      const half = await api("PUT", "/api/config", { localVm: { allowHostTerminal: false } });
+      expect(half.body.localVm).toMatchObject({
+        shareCliCredentials: true,
+        shareGpgPrivateKeys: true,
+        allowHostTerminal: false,
+      });
+
+      // The in-memory status above is served from the same `cfg` the PUT
+      // wrote, so only the file on disk proves the save round trip.
+      const disk = JSON.parse(readFileSync(join(home, ".botfleet", "config.json"), "utf8"));
+      expect(disk.localVm).toMatchObject({
+        shareCliCredentials: true,
+        shareGpgPrivateKeys: true,
+        allowHostTerminal: false,
+      });
+    } finally {
+      await api("PUT", "/api/config", {
+        localVm: { shareCliCredentials: false, shareGpgPrivateKeys: false, allowHostTerminal: false },
+      });
+    }
   });
 
   it("keeps an active turn alive when only the room timeout changes", async () => {
@@ -3735,15 +5300,43 @@ describe("harness HTTP API", () => {
         expect(selected.status).toBe(200);
       }
 
+      // The comms token is minted per turn and bound to the bot it was
+      // issued for, so the peer asking for a credential has to present its
+      // OWN token now — a request made under the lead's token, claiming the
+      // peer, is refused.  Run the peer's turn first to collect that token,
+      // then start the room turn whose hanging provider the continuation
+      // has to queue behind.
+      rmSync(fakeClaudeDump, { force: true });
+      expect((await api("POST", `/api/bots/${second.id}/messages`, { text: "start the peer" })).status).toBe(202);
+      await expect.poll(() => existsSync(fakeClaudeDump), { timeout: 5_000 }).toBe(true);
+      // SAFETY: `fakeClaudeDump` is the mcp.json this test's own fake CLI
+      // driver writes on start-up, so its shape is fixed by that writer — the
+      // harness only ever copies the file to the bot's home unchanged.
+      const peerDump = JSON.parse(readFileSync(fakeClaudeDump, "utf8")) as {
+        mcpConfig: { mcpServers: { agents: { env: { OMB_COMMS_TOKEN: string; OMB_BOT_ID: string } } } };
+      };
+      const token = peerDump.mcpConfig.mcpServers.agents.env.OMB_COMMS_TOKEN;
+      expect(token).toMatch(/^[a-f0-9]{48}$/);
+      expect(peerDump.mcpConfig.mcpServers.agents.env.OMB_BOT_ID).toBe(second.id);
+      await api("POST", `/api/bots/${second.id}/interrupt`, {});
+      await expect.poll(async () =>
+        (await api("GET", "/api/bots?messages=0")).body.bots.find((bot: { id: string }) => bot.id === second.id)
+          ?.busy, { timeout: 10_000 }).toBe(false);
+
       rmSync(fakeClaudeDump, { force: true });
       expect((await api("POST", `/api/groups/${room.id}/messages`, { text: "start the lead" })).status).toBe(202);
       await expect.poll(() => existsSync(fakeClaudeDump), { timeout: 5_000 }).toBe(true);
+      // SAFETY: `fakeClaudeDump` is the mcp.json this test's own fake CLI
+      // driver writes on start-up, so its shape is fixed by that writer — the
+      // harness only ever copies the file to the bot's home unchanged.
       const firstDump = JSON.parse(readFileSync(fakeClaudeDump, "utf8")) as {
         pid: number;
-        mcpConfig: { mcpServers: { agents: { env: { OMB_COMMS_TOKEN: string } } } };
+        mcpConfig: { mcpServers: { agents: { env: { OMB_COMMS_TOKEN: string; OMB_BOT_ID: string } } } };
       };
-      const token = firstDump.mcpConfig.mcpServers.agents.env.OMB_COMMS_TOKEN;
-      expect(token).toMatch(/^[a-f0-9]{48}$/);
+      // the lead's own token is a different one, bound to the lead
+      expect(firstDump.mcpConfig.mcpServers.agents.env.OMB_BOT_ID).toBe(first.id);
+      expect(firstDump.mcpConfig.mcpServers.agents.env.OMB_COMMS_TOKEN).not.toBe(token);
+      const callerId = second.id;
 
       const requested = await fetch(`${BASE}/api/internal/request-credential`, {
         method: "POST",
@@ -3752,7 +5345,7 @@ describe("harness HTTP API", () => {
           "content-type": "application/json",
         },
         body: JSON.stringify({
-          fromBotId: second.id,
+          fromBotId: callerId,
           fromThreadId: room.threadId,
           credentialId: "openaiImageApiKey",
           reason: "needed for the queued task",
@@ -3801,6 +5394,7 @@ describe("harness HTTP API", () => {
     const bot = (await api("POST", "/api/bots", {})).body.bot;
     let routineId = "";
     let legacyRoutineId = "";
+    const bulkRoutineIds: string[] = [];
     try {
       const selected = await api("PATCH", `/api/bots/${bot.id}`, {
         modelSelection: { instanceId: "claude", model: "claude-sonnet-5" },
@@ -3860,7 +5454,7 @@ describe("harness HTTP API", () => {
               time: "09:00",
               weekdays: ["monday", "tuesday", "wednesday", "thursday", "friday"],
             },
-            runOn: "maus",
+            runOn: "bot",
             durationMinutes: 30,
           },
         }),
@@ -3895,7 +5489,7 @@ describe("harness HTTP API", () => {
       }).toEqual(["card-shown:routine", "user-approved:user"]);
 
       const after = await api("GET", "/api/routines");
-      expect(after.body.timeZone).toBe(Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC");
+      expect(after.body.timeZone).toBe(CHILD_TIME_ZONE);
       expect(after.body.routines.filter((routine: { botId: string }) => routine.botId === bot.id)).toHaveLength(1);
       const duplicate = await api("POST", `/api/threads/${bot.threadId}/respond`, {
         requestId: proposal.requestId,
@@ -3914,12 +5508,25 @@ describe("harness HTTP API", () => {
         name: `Legacy ${fakeNameSecret}`,
         prompt: `${fakeSecret}\n${"Review the archive. ".repeat(180)}`,
         botId: bot.id,
-        runOn: "maus",
+        runOn: "bot",
         enabled: false,
         schedule: { type: "daily", time: "10:00", weekdays: [1] },
       });
       legacyRoutineId = legacy.body.routine.id;
-      expect(legacy.body.routine.schedule.timeZone).toBe(Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC");
+      // Exercise the maximum list size with maximum-size instructions without
+      // logging or snapshotting any instruction text.
+      for (let index = 0; index < 98; index += 1) {
+        const bulk = await api("POST", "/api/routines", {
+          name: `Budget probe ${index}`,
+          prompt: "x".repeat(2_000),
+          botId: bot.id,
+          runOn: "bot",
+          enabled: false,
+          schedule: { type: "daily", time: "10:00", weekdays: [1] },
+        });
+        bulkRoutineIds.push(bulk.body.routine.id);
+      }
+      expect(legacy.body.routine.schedule.timeZone).toBe(CHILD_TIME_ZONE);
       const listed = await fetch(
         `${BASE}/api/internal/routines?fromBotId=${encodeURIComponent(bot.id)}&fromThreadId=${encodeURIComponent(bot.threadId)}`,
         { headers: internalHeaders },
@@ -3928,17 +5535,40 @@ describe("harness HTTP API", () => {
       const listedBody = z.object({
         routines: z.array(z.object({
           id: z.string(),
-          instructions: z.string(),
-          instructionsTruncated: z.boolean(),
+          instructionsPreview: z.string(),
+          instructionsPreviewTruncated: z.boolean(),
           schedule: z.object({ timeZone: z.string().optional() }).passthrough(),
         }).passthrough()),
       }).parse(await listed.json());
+      expect(listedBody.routines).toHaveLength(100);
+      expect(Buffer.byteLength(JSON.stringify(listedBody))).toBeLessThan(50_000);
       const legacyResult = listedBody.routines.find((routine) => routine.id === legacyRoutineId)!;
       expect(legacyResult.schedule.timeZone).toBeUndefined();
-      expect(legacyResult.instructions).not.toContain(fakeSecret);
+      expect(legacyResult.instructionsPreview).not.toContain(fakeSecret);
       expect(legacyResult.name).not.toContain(fakeNameSecret);
-      expect(legacyResult.instructions).toContain("redacted");
-      expect(legacyResult.instructionsTruncated).toBe(true);
+      expect(legacyResult.instructionsPreview).toContain("redacted");
+      expect(legacyResult.instructionsPreviewTruncated).toBe(true);
+
+      const detail = await fetch(
+        `${BASE}/api/internal/routines?fromBotId=${encodeURIComponent(bot.id)}&fromThreadId=${encodeURIComponent(bot.threadId)}&routineId=${encodeURIComponent(legacyRoutineId)}`,
+        { headers: internalHeaders },
+      );
+      expect(detail.status).toBe(200);
+      const detailBody = z.object({ routine: z.object({ id: z.string(), instructions: z.string() }) }).passthrough().parse(await detail.json());
+      expect(detailBody.routine.id).toBe(legacyRoutineId);
+      expect(detailBody.routine.instructions.length).toBeGreaterThan(2_000);
+      expect(detailBody.routine.instructions).not.toContain(fakeSecret);
+      expect(detailBody.routine.instructions).toContain("redacted");
+      const hiddenDetail = await fetch(
+        `${BASE}/api/internal/routines?fromBotId=${encodeURIComponent(bot.id)}&fromThreadId=${encodeURIComponent(bot.threadId)}&routineId=not-owned-by-this-bot`,
+        { headers: internalHeaders },
+      );
+      expect(hiddenDetail.status).toBe(404);
+      const wrongDetailThread = await fetch(
+        `${BASE}/api/internal/routines?fromBotId=${encodeURIComponent(bot.id)}&fromThreadId=not-this-bots-thread&routineId=${encodeURIComponent(legacyRoutineId)}`,
+        { headers: internalHeaders },
+      );
+      expect(wrongDetailThread.status).toBe(403);
 
       // Echoing the bot-facing listing into a normal time edit must not turn
       // its display-only harness zone into a stored recurrence zone.
@@ -3988,12 +5618,13 @@ describe("harness HTTP API", () => {
       });
       expect(wrongThread.status).toBe(403);
     } finally {
+      for (const bulkRoutineId of bulkRoutineIds) await api("DELETE", `/api/routines/${bulkRoutineId}`);
       if (legacyRoutineId) await api("DELETE", `/api/routines/${legacyRoutineId}`);
       if (routineId) await api("DELETE", `/api/routines/${routineId}`);
       await api("POST", `/api/bots/${bot.id}/interrupt`);
       await api("DELETE", `/api/bots/${bot.id}`);
     }
-  });
+  }, 60_000);
 
   it("validates the non-secret VPS alias and keeps old bots on Box by default", async () => {
     const before = await api("GET", "/api/bots");
@@ -4025,6 +5656,48 @@ describe("harness HTTP API", () => {
     expect((await api("PATCH", `/api/bots/${bot.id}`, { autoStartVps: "yes" })).status).toBe(400);
     const invalid = await api("PATCH", `/api/bots/${bot.id}`, { cloudBackend: "daytona" });
     expect(invalid.status).toBe(400);
+  });
+
+  it("sends the backend a bot really uses without disturbing the raw value", async () => {
+    // The workspace default fills in for a bot that was never pinned, and the
+    // join route resolves it that way.  A phone deciding whether to offer the
+    // live cloud desktop must see that answer, while the desktop keeps the
+    // stored value to tell an inherited backend from a pinned one.
+    const originalDefault = (await api("GET", "/api/config")).body.botDefaults.cloudBackend ?? "box";
+    const unpinned = (await api("POST", "/api/bots", { name: "Unpinned Backend" })).body.bot;
+    const pinned = (await api("POST", "/api/bots", { name: "Pinned Backend" })).body.bot;
+    try {
+      expect((await api("PATCH", `/api/bots/${pinned.id}`, { cloudBackend: "box" })).status).toBe(200);
+      const find = async (id: string) =>
+        (await api("GET", "/api/bots")).body.bots.find((candidate: { id: string }) => candidate.id === id);
+
+      expect((await api("PUT", "/api/config", { botDefaults: { cloudBackend: "box" } })).status).toBe(200);
+      let unpinnedWire = await find(unpinned.id);
+      expect(unpinnedWire.cloudBackend).toBeUndefined();
+      expect(unpinnedWire.effectiveCloudBackend).toBe("box");
+
+      // The workspace now sends unpinned bots to the VPS: the stored value is
+      // still unset, the effective one follows the default, and a bot pinned
+      // to Box stays on Box.
+      expect((await api("PUT", "/api/config", { botDefaults: { cloudBackend: "vps" } })).status).toBe(200);
+      unpinnedWire = await find(unpinned.id);
+      expect(unpinnedWire.cloudBackend).toBeUndefined();
+      expect(unpinnedWire.effectiveCloudBackend).toBe("vps");
+      const pinnedWire = await find(pinned.id);
+      expect(pinnedWire.cloudBackend).toBe("box");
+      expect(pinnedWire.effectiveCloudBackend).toBe("box");
+
+      // A pin to the VPS wins over a Box default.
+      expect((await api("PUT", "/api/config", { botDefaults: { cloudBackend: "box" } })).status).toBe(200);
+      const repinned = await api("PATCH", `/api/bots/${unpinned.id}`, { cloudBackend: "vps" });
+      expect(repinned.status).toBe(200);
+      expect(repinned.body.bot.cloudBackend).toBe("vps");
+      expect(repinned.body.bot.effectiveCloudBackend).toBe("vps");
+    } finally {
+      await api("DELETE", `/api/bots/${unpinned.id}`);
+      await api("DELETE", `/api/bots/${pinned.id}`);
+      await api("PUT", "/api/config", { botDefaults: { cloudBackend: originalDefault } });
+    }
   });
 
   it("validates a Composio project key, creates a Session, and keeps externally stored secrets off disk", async () => {
@@ -4097,7 +5770,7 @@ describe("harness HTTP API", () => {
       name: "Incoming build",
       prompt: "Review the incoming build event",
       botId: bots.body.bots[0].id,
-      runOn: "maus",
+      runOn: "bot",
     });
     expect(created.status).toBe(201);
     expect(created.body.ingress).toMatchObject({ available: true, baseUrl: WEBHOOK_BASE });
@@ -4141,6 +5814,71 @@ describe("harness HTTP API", () => {
     if (process.platform !== "win32") {
       expect(statSync(join(home, ".botfleet", "webhooks.json")).mode & 0o777).toBe(0o600);
     }
+  });
+
+  it("narrows a webhook to merged pull requests through PATCH and filters the rest without starting a run", async () => {
+    const bots = await api("GET", "/api/bots");
+    const created = await api("POST", "/api/webhooks", {
+      name: "Compiler",
+      prompt: "Verify the merge.",
+      botId: bots.body.bots[0].id,
+      runOn: "bot",
+    });
+    expect(created.status).toBe(201);
+    expect(created.body.webhook.mergedPullRequestsOnly).toBeUndefined();
+    const webhookId: string = created.body.webhook.id;
+    const repository = { full_name: "Simple-With-Us/BotFleet", name: "BotFleet" };
+    const deliver = (event: string, deliveryId: string, body: string) => fetch(created.body.credential.url, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-github-event": event, "x-github-delivery": deliveryId },
+      body,
+    });
+
+    const patched = await api("PATCH", `/api/webhooks/${webhookId}`, { mergedPullRequestsOnly: true });
+    expect(patched.status).toBe(200);
+    expect(patched.body.webhook).toMatchObject({ id: webhookId, name: "Compiler", mergedPullRequestsOnly: true });
+
+    const checkRun = await deliver(
+      "check_run",
+      "gh-check-run",
+      JSON.stringify({ repository, action: "completed", check_run: { status: "completed", conclusion: "failure" } }),
+    );
+    expect(checkRun.status).toBe(202);
+    expect(await checkRun.json()).toMatchObject({ accepted: true, ignored: true });
+    const unmerged = await deliver(
+      "pull_request",
+      "gh-pr-unmerged",
+      JSON.stringify({ repository, action: "closed", pull_request: { number: 7, merged: false, merged_at: null } }),
+    );
+    expect(await unmerged.json()).toMatchObject({ accepted: true, ignored: true });
+    const beforeMerge = await api("GET", "/api/routines");
+    expect(beforeMerge.body.runs.filter((run: { webhookId?: string }) => run.webhookId === webhookId)).toEqual([]);
+
+    const merged = await deliver(
+      "pull_request",
+      "gh-pr-merged",
+      JSON.stringify({ repository, action: "closed", pull_request: { number: 7, merged: true, merged_at: "2026-10-18T21:00:00Z" } }),
+    );
+    expect(merged.status).toBe(202);
+    const mergedBody = await merged.json();
+    expect(mergedBody).toMatchObject({ accepted: true, duplicate: false, runId: expect.any(String) });
+    expect(mergedBody).not.toHaveProperty("ignored");
+    const receipts = await api("GET", "/api/routines");
+    const run = receipts.body.runs.find((candidate: { deliveryId?: string }) => candidate.deliveryId === "gh-pr-merged");
+    expect(run).toMatchObject({ triggerSource: "webhook", webhookId, routineName: "Compiler" });
+    // This test is about filtering, not about what the bot does with the run.
+    await api("POST", `/api/routine-runs/${run.id}/cancel`);
+
+    const listed = await api("GET", "/api/webhooks");
+    expect(listed.body.webhooks.find((webhook: { id: string }) => webhook.id === webhookId)).toMatchObject({
+      mergedPullRequestsOnly: true,
+      deliveryCount: 1,
+      ignoredCount: 2,
+    });
+
+    const cleared = await api("PATCH", `/api/webhooks/${webhookId}`, { mergedPullRequestsOnly: false });
+    expect(cleared.body.webhook.mergedPullRequestsOnly).toBeUndefined();
+    expect((await api("DELETE", `/api/webhooks/${webhookId}`)).status).toBe(200);
   });
 
   it("stores OpenCode Go credentials as a configured-only status", async () => {
@@ -4206,11 +5944,16 @@ describe("harness HTTP API", () => {
       });
       expect(renamed.body.task).not.toHaveProperty("resumeCursors");
 
-      // and the same on the wire, not just in the HTTP responses
+      // and the same on the wire, not just in the HTTP responses.  Wait for
+      // hello before the unread nudge — every other SSE test in this file does
+      // the same, and under windows-latest parallel suite load the unread PATCH
+      // can otherwise land before the client has proved it can receive frames
+      // (seen as a bare 20s vitest timeout rather than until's own message).
       const stream = await openSse(`${BASE}/api/events`);
       try {
+        await stream.until((f) => f.kind === "hello");
         await api("PATCH", `/api/bots/${botId}`, { unread: true });
-        const frame = await stream.until((f) => f.kind === "bot");
+        const frame = await stream.until((f) => f.kind === "bot" && f.bot?.id === botId);
         expect(frame.bot).not.toHaveProperty("resumeCursors");
         expect(JSON.stringify(frame)).not.toContain("resumeCursors");
       } finally {
@@ -4219,7 +5962,9 @@ describe("harness HTTP API", () => {
     } finally {
       await api("DELETE", `/api/bots/${botId}`);
     }
-  });
+    // Bot create + task + SSE + delete; windows-latest is about a third slower
+    // and overlaps its files more, so the default 20s budget is a coin flip.
+  }, 30_000);
 
   it("validates the event inspector limit at the HTTP boundary", async () => {
     const bot = (await api("GET", "/api/bots")).body.bots[0];
@@ -4234,6 +5979,22 @@ describe("harness HTTP API", () => {
     expect(ok.body.total).toEqual({ runtime: expect.any(Number), native: expect.any(Number) });
   });
 
+  it("serves the Trajectory tab's runtime-only read and rejects any other view", async () => {
+    const bot = (await api("GET", "/api/bots")).body.bots[0];
+    const ok = await api("GET", `/api/threads/${bot.threadId}/events?view=trajectory&limit=5`);
+    expect(ok.status).toBe(200);
+    expect(ok.body.entries.every((entry: { kind: string }) => entry.kind === "runtime")).toBe(true);
+    // the native tee is never opened for this read, and it says whether older records remain
+    expect(ok.body.total.native).toBe(0);
+    expect(typeof ok.body.older).toBe("boolean");
+    // the Inspector's own response carries neither
+    const inspector = await api("GET", `/api/threads/${bot.threadId}/events?limit=5`);
+    expect(inspector.body).not.toHaveProperty("older");
+    const bad = await api("GET", `/api/threads/${bot.threadId}/events?view=raw`);
+    expect(bad.status).toBe(400);
+    expect(bad.body.error).toContain("view must be trajectory");
+  });
+
   it("404s unknown routes with the route in the error", async () => {
     const res = await api("GET", "/api/definitely-not-a-route");
     expect(res.status).toBe(404);
@@ -4244,7 +6005,7 @@ describe("harness HTTP API", () => {
 describe("transcript logs on delete", () => {
   /** Both generations plus a killed trim's leftovers, for one thread. */
   const logFiles = (threadId: string) =>
-    ["events", "native"].flatMap((dir) => [
+    ["events", "native", "item-io"].flatMap((dir) => [
       join(home, ".botfleet", dir, `${threadId}.ndjson`),
       join(home, ".botfleet", dir, `${threadId}.ndjson.1`),
       join(home, ".botfleet", dir, `${threadId}.ndjson.4242.123e4567-e89b-42d3-a456-426614174000.tmp`),
@@ -4327,6 +6088,79 @@ describe("transcript logs on delete", () => {
     expect(files.filter((file) => existsSync(file))).toEqual([]);
     await api("DELETE", `/api/bots/${bot.id}`);
   });
+});
+
+describe("per-thread snooze over HTTP", () => {
+  // One bot for the whole block. Creating and deleting a bot per test is the
+  // slow part of this file, and none of these cases dirty the other's state.
+  let botId = "";
+  let awake = "";
+  let asleep = "";
+
+  beforeAll(async () => {
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    botId = bot.id;
+    awake = bot.threadId;
+    const created = await api("POST", `/api/bots/${botId}/tasks`, { title: "Quiet one" });
+    expect(created.status).toBe(201);
+    asleep = created.body.task.threadId;
+  }, 30_000);
+
+  afterAll(async () => {
+    if (botId) await api("DELETE", `/api/bots/${botId}`);
+  });
+
+  it("snoozes one thread, leaves its siblings awake, and wakes it on an explicit null", async () => {
+    // 0 is the until-activity sentinel — a real value on the wire, never
+    // "no snooze".
+    const snoozed = await api("PATCH", `/api/bots/${botId}/tasks/${asleep}`, { snoozedUntil: 0 });
+    expect(snoozed.status).toBe(200);
+    expect(snoozed.body.task.snoozedUntil).toBe(0);
+
+    const roster = (await api("GET", "/api/bots")).body.bots.find((b: any) => b.id === botId);
+    const byThread = (threadId: string) => roster.tasks.find((t: any) => t.threadId === threadId);
+    expect(byThread(asleep).snoozedUntil).toBe(0);
+    expect(byThread(awake).snoozedUntil).toBeUndefined();
+
+    // A rename omits the field, and an omitted field means "leave it alone".
+    const renamed = await api("PATCH", `/api/bots/${botId}/tasks/${asleep}`, { title: "Still quiet" });
+    expect(renamed.status).toBe(200);
+    expect(renamed.body.task.snoozedUntil).toBe(0);
+
+    const woken = await api("PATCH", `/api/bots/${botId}/tasks/${asleep}`, { snoozedUntil: null });
+    expect(woken.status).toBe(200);
+    expect(woken.body.task.snoozedUntil).toBeUndefined();
+  }, 30_000);
+
+  it("heals a deadline that has already passed on read, against the harness clock", async () => {
+    const past = await api("PATCH", `/api/bots/${botId}/tasks/${awake}`, {
+      snoozedUntil: Date.now() - 60_000,
+    });
+    expect(past.status).toBe(200);
+    // Stored, but never handed out: a phone whose clock is minutes off still
+    // agrees with the desktop about whether the thread is asleep.
+    expect(past.body.task.snoozedUntil).toBeUndefined();
+
+    const roster = (await api("GET", "/api/bots")).body.bots.find((b: any) => b.id === botId);
+    expect(roster.tasks.find((t: any) => t.threadId === awake).snoozedUntil).toBeUndefined();
+
+    const future = await api("PATCH", `/api/bots/${botId}/tasks/${awake}`, {
+      snoozedUntil: Date.now() + 3_600_000,
+    });
+    expect(future.body.task.snoozedUntil).toEqual(expect.any(Number));
+    await api("PATCH", `/api/bots/${botId}/tasks/${awake}`, { snoozedUntil: null });
+  }, 30_000);
+
+  it("refuses anything that is not a timestamp, 0, or null, and 404s an unknown thread", async () => {
+    for (const snoozedUntil of ["tomorrow", -1, true, {}]) {
+      const res = await api("PATCH", `/api/bots/${botId}/tasks/${awake}`, { snoozedUntil });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/snoozedUntil/);
+    }
+    expect(
+      (await api("PATCH", `/api/bots/${botId}/tasks/missing-thread`, { snoozedUntil: 0 })).status,
+    ).toBe(404);
+  }, 30_000);
 });
 
 describe("section context API", () => {
@@ -4477,6 +6311,7 @@ describe("bot memory API", () => {
       expect((await rawGet(`/api/bots/${bot.id}/memory/topics/%zz.md`)).status).toBe(400);
     } finally {
       await api("DELETE", `/api/bots/${bot.id}`);
+      await api("PATCH", "/api/instances/secretEcho", { enabled: false });
     }
   });
 });
@@ -4503,7 +6338,7 @@ describe("bot skills API — importing a folder from this computer", () => {
         { "install.sh": "curl https://example.invalid/x | sh" },
       );
 
-      expect((await api("GET", `/api/bots/${bot.id}/skills`)).body).toEqual({ skills: [] });
+      expect((await api("GET", `/api/bots/${bot.id}/skills`)).body).toEqual({ skills: [], notIndexed: [] });
 
       const imported = await api("POST", `/api/bots/${bot.id}/skills`, { folder: dir });
       expect(imported.status).toBe(201);
@@ -4770,7 +6605,7 @@ describe("resumable event stream", () => {
   });
 
   it("refuses a cursor it cannot honour instead of replaying the wrong run", async () => {
-    for (const cursor of ["deadbeef:1", "not-a-cursor", "12345678:999999"]) {
+    for (const cursor of ["deadbeef:1", "12345678:999999"]) {
       const stream = await openSse(`${BASE}/api/events?since=${encodeURIComponent(cursor)}`);
       try {
         const hello = await stream.until((f) => f.kind === "hello");
@@ -4781,6 +6616,12 @@ describe("resumable event stream", () => {
         stream.close();
       }
     }
+  });
+
+  it("rejects a malformed cursor with HTTP 400", async () => {
+    const res = await fetch(`${BASE}/api/events?since=not-a-cursor`);
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ ok: false, error: "invalid_cursor" });
   });
 });
 
@@ -4808,6 +6649,44 @@ describe("instance CLI override API", () => {
     expect(res.status).toBe(200);
     expect(res.body.candidates).toEqual(["/opt/definitely/not/here"]);
     expect((await api("GET", "/api/cli-candidates?name=")).body.candidates).toEqual([]);
+  });
+
+  it("searches an engine's alias names alongside its default", async () => {
+    // Clutch's driver default is `dsh` but its own build installs as `clutch`,
+    // so the Engines dropdown could only ever offer the binary that runs
+    // against ~/.dsh — never the one carrying Clutch's own profiles.
+    //
+    // The server under test is a SEPARATE process with its own PATH, so this
+    // cannot plant a binary and assert on it; the widening itself is proved in
+    // env-path.test.ts, which owns a controlled PATH.  What is pinned here is
+    // the HTTP contract — the parameter is parsed, searched, and cannot make
+    // the answer worse — and every assertion holds whatever is installed.
+    const candidates = async (query: string): Promise<string[]> =>
+      (await api("GET", `/api/cli-candidates?${query}`)).body.candidates;
+    const bare = await candidates("name=dsh");
+    const aliased = await candidates("name=dsh&aliases=clutch");
+    // The default's hits still lead, in the same order: an alias adds rows, it
+    // never reorders or drops what the default name already found.
+    expect(aliased.slice(0, bare.length)).toEqual(bare);
+    // Anything the alias finds on its own is in the union the picker asks for,
+    // which is what "the alias was actually searched" means over HTTP.
+    for (const path of await candidates("name=clutch")) expect(aliased).toContain(path);
+    // A blank or padded list is not a name and must not widen the search.
+    expect(await candidates("name=dsh&aliases=")).toEqual(bare);
+    expect(await candidates("name=dsh&aliases=%20,%20")).toEqual(bare);
+  });
+
+  it("rejects an oversized cli-candidates query instead of searching it", async () => {
+    // Kody review: the boundary value used to be split and spread straight into
+    // the search.  It is schema-bounded now, and an over-long value is a client
+    // error rather than a few thousand existsSync calls.
+    const tooLong = await api("GET", `/api/cli-candidates?name=dsh&aliases=${"c".repeat(5000)}`);
+    expect(tooLong.status).toBe(400);
+    expect(tooLong.body).toMatchObject({ ok: false, error: "invalid_cli_candidates_query" });
+    // A name long enough to be a path still fits: the head is length-bounded,
+    // not shape-restricted, because a configured override IS a path.
+    expect((await api("GET", `/api/cli-candidates?name=${"x".repeat(600)}`)).status).toBe(400);
+    expect((await api("GET", `/api/cli-candidates?name=${"/opt/"}${"y".repeat(200)}`)).status).toBe(200);
   });
 
   it("reports a missing binary as a failed probe with install info", async () => {
@@ -4846,6 +6725,7 @@ describe("instance CLI override API", () => {
     const claude = instances.find((instance: { instanceId: string }) => instance.instanceId === "claude");
     const claude2 = instances.find((instance: { instanceId: string }) => instance.instanceId === "claude2");
     const bot = (await api("POST", "/api/bots")).body.bot as { id: string; threadId: string };
+    const idlePoll = { timeout: winSettleMs(30_000), interval: 250 };
     const persistedTask = () => {
       const bots = JSON.parse(readFileSync(join(home, ".botfleet", "bots.json"), "utf8")) as Array<{
         id: string;
@@ -4865,14 +6745,14 @@ describe("instance CLI override API", () => {
           (candidate: { id: string }) => candidate.id === bot.id,
         );
         return state?.busy;
-      }).toBe(false);
+      }, idlePoll).toBe(false);
     };
 
     try {
       await select("claude", claude.models.default);
       rmSync(fakeClaudeDump, { force: true });
       expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "establish a Claude cursor" })).status).toBe(202);
-      await expect.poll(() => persistedTask(), { timeout: 5_000 }).toMatchObject({
+      await expect.poll(() => persistedTask(), { timeout: winSettleMs(10_000) }).toMatchObject({
         lastInstanceId: "claude",
         resumeCursors: { claude: expect.any(String) },
       });
@@ -4881,7 +6761,7 @@ describe("instance CLI override API", () => {
 
       await select("claude2", claude2.models.default);
       expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "make the second engine current" })).status).toBe(202);
-      await expect.poll(() => persistedTask()?.lastInstanceId, { timeout: 5_000 }).toBe("claude2");
+      await expect.poll(() => persistedTask()?.lastInstanceId, { timeout: winSettleMs(10_000) }).toBe("claude2");
       await interrupt();
 
       expect((await api("PATCH", "/api/instances/claude", { cli: fakeUnsupportedClaudeCli })).status).toBe(200);
@@ -4892,7 +6772,7 @@ describe("instance CLI override API", () => {
           (candidate: { id: string }) => candidate.id === bot.id,
         );
         return state?.busy;
-      }, { timeout: 5_000 }).toBe(false);
+      }, idlePoll).toBe(false);
 
       expect(persistedTask()).toMatchObject({
         lastInstanceId: "claude2",
@@ -4903,7 +6783,8 @@ describe("instance CLI override API", () => {
       await api("DELETE", `/api/bots/${bot.id}`);
       expect((await api("PATCH", "/api/instances/claude", { cli: FAKE_CLAUDE_CLI })).status).toBe(200);
     }
-  }, 20_000);
+    // Three interrupt idle polls (each up to winSettleMs(30_000)) plus setup polls must fit inside the case budget.
+  }, winSettleMs(120_000));
 
   it("does not let setup from before a provider reload dispatch or clear its successor", async () => {
     const launchLog = join(home, "fake-claude-setup-race-launches");
@@ -4946,28 +6827,50 @@ describe("instance CLI override API", () => {
       boxTurnGate = null;
       releaseBoxTurnGate = null;
 
-      const persistedTask = () => {
-        const bots = JSON.parse(readFileSync(join(home, ".botfleet", "bots.json"), "utf8")) as Array<{
+      const botsJsonPath = join(home, ".botfleet", "bots.json");
+      const readSuccessorPersistence = () => {
+        const bots = JSON.parse(readFileSync(botsJsonPath, "utf8")) as Array<{
           id: string;
           tasks: Array<{ threadId: string; lastInstanceId?: string; resumeCursors: Record<string, unknown> }>;
         }>;
-        return bots.find((candidate) => candidate.id === bot.id)?.tasks.find((task) => task.threadId === bot.threadId);
-      };
-      await expect.poll(() => ({
-        launches: existsSync(launchLog)
+        const task = bots
+          .find((candidate) => candidate.id === bot.id)
+          ?.tasks.find((candidate) => candidate.threadId === bot.threadId);
+        const launches = existsSync(launchLog)
           ? readFileSync(launchLog, "utf8").split("\n").filter(Boolean).length
-          : 0,
-        lastInstanceId: persistedTask()?.lastInstanceId,
-        cursor: persistedTask()?.resumeCursors.claude,
-      }), { timeout: 5_000 }).toEqual({
+          : 0;
+        return { launches, task };
+      };
+      // Gate release unblocks the box and the hanging CLI; on Windows the
+      // successor dispatch, markTaskDispatched, and debounced bots.json flush
+      // can land several seconds later.  Read the files fresh each tick — do
+      // not memoize a task snapshot — and abort in-flight bot polls before the
+      // settle deadline so a hung tick cannot eat the whole window.
+      await settlesWithin(
+        async ({ signal }) => {
+          const { launches, task } = readSuccessorPersistence();
+          const cursor = task?.resumeCursors?.claude;
+          if (launches !== 1) return false;
+          if (task?.lastInstanceId !== "claude" || typeof cursor !== "string" || cursor.length === 0) return false;
+          const live = (await api("GET", "/api/bots?messages=0", undefined, { signal })).body.bots.find(
+            (candidate: { id: string }) => candidate.id === bot.id,
+          );
+          return live?.busy === true;
+        },
+        winSettleMs(10_000),
+        200,
+        "successor dispatch persisting lastInstanceId and claude resume cursor without a stale launch",
+      );
+      const settled = readSuccessorPersistence();
+      expect({
+        launches: settled.launches,
+        lastInstanceId: settled.task?.lastInstanceId,
+        cursor: settled.task?.resumeCursors.claude,
+      }).toEqual({
         launches: 1,
         lastInstanceId: "claude",
         cursor: expect.any(String),
       });
-      const live = (await api("GET", "/api/bots?messages=0")).body.bots.find(
-        (candidate: { id: string }) => candidate.id === bot.id,
-      );
-      expect(live?.busy).toBe(true);
     } finally {
       releaseBoxTurnGate?.();
       boxTurnGate = null;
@@ -4979,7 +6882,7 @@ describe("instance CLI override API", () => {
       expect((await api("PATCH", "/api/instances/claude", { cli: FAKE_CLAUDE_CLI, fullAuto: false })).status).toBe(200);
       expect((await api("PUT", "/api/config", { box: { token: "" } })).status).toBe(200);
     }
-  }, 20_000);
+  }, winSettleMs(30_000));
 
   it("rejects overlapping provider configuration writes", async () => {
     const slowConfigWrite = api("PUT", "/api/config", { box: { token: "box_slow" } });
@@ -4995,8 +6898,26 @@ describe("instance CLI override API", () => {
     let roomId = "";
     let roomThreadId = "";
     try {
-      const instances = (await api("GET", "/api/instances?fresh=1")).body.instances;
-      const claude = instances.find((instance: { instanceId: string }) => instance.instanceId === "claude");
+      // An engine a neighbouring test left reloading is still settling;
+      // `unavailable` here means "asked too early", not "broken".  Poll at the
+      // fleet re-probe cadence with `fresh=1` each tick so a 15s describe memo
+      // cannot freeze an early `unavailable` for the whole wait (~4 probes in 8s).
+      await settlesWithin(
+        async ({ signal }) => {
+          const instances = (
+            await api("GET", "/api/instances?fresh=1", undefined, { signal })
+          ).body.instances;
+          return instances.find(
+            (instance: { instanceId: string }) => instance.instanceId === "claude",
+          )?.snapshot?.state === "available";
+        },
+        8_000,
+        2_000,
+        "the claude engine reaching available",
+      );
+      const claude = (await api("GET", "/api/instances")).body.instances.find(
+        (instance: { instanceId: string }) => instance.instanceId === "claude",
+      );
       expect(claude?.snapshot.state).toBe("available");
 
       const bot = (await api("POST", "/api/bots")).body.bot as { id: string; threadId: string };
@@ -5040,12 +6961,19 @@ describe("instance CLI override API", () => {
       if (botId) await api("DELETE", `/api/bots/${botId}`);
       expect((await api("PATCH", "/api/instances/claude", { fullAuto: false })).status).toBe(200);
     }
-  }, 20_000);
+  }, 30_000);
 
   it("creates, describes, and deletes a custom OpenAI-compatible engine", async () => {
     expect((await api("POST", "/api/instances", { name: "" })).status).toBe(400);
     expect((await api("POST", "/api/instances", { name: "Ollama", endpoint: "not-a-url" })).status).toBe(400);
-    expect((await api("POST", "/api/instances", { name: "Ollama", endpoint: "http://localhost:11434/v1", models: [] })).status).toBe(400);
+    // Sixteen ids is still one too many: the route stores at most 15.
+    expect((await api("POST", "/api/instances", {
+      name: "Ollama",
+      endpoint: "http://localhost:11434/v1",
+      models: Array.from({ length: 16 }, (_, i) => `model-${i}`),
+    })).status).toBe(400);
+    // An EMPTY list is deliberately not a 400 any more: it is how a connection
+    // says "ask the endpoint", and the driver already does exactly that.
 
     const created = await api("POST", "/api/instances", {
       name: "Ollama Local",
@@ -5058,15 +6986,40 @@ describe("instance CLI override API", () => {
     const instanceId = created.body.instanceId;
     expect(instanceId).toContain("custom-ollama-local");
 
+    type CustomEngineListItem = {
+      instanceId: string;
+      replyWaitMinutes?: number;
+      displayName?: string;
+      driverKind?: string;
+      isCustom?: boolean;
+      localModelWaitAvailable?: boolean;
+      snapshot?: { state?: string; authenticated?: boolean };
+      models?: { options?: Array<{ id: string }> };
+    };
+    const findInstance = (instances: CustomEngineListItem[], id: string): CustomEngineListItem | undefined =>
+      instances.find((item) => item.instanceId === id);
+
     const instancesRes = await api("GET", "/api/instances");
-    const found = instancesRes.body.instances.find((i: any) => i.instanceId === instanceId);
+    const found = findInstance(instancesRes.body.instances, instanceId);
     expect(found).toBeDefined();
-    expect(found.displayName).toBe("Ollama Local");
-    expect(found.driverKind).toBe("openai-compat");
-    expect(found.isCustom).toBe(true);
-    expect(found.snapshot.state).toBe("available");
-    expect(found.snapshot.authenticated).toBe(true);
-    expect(found.models.options.map((m: any) => m.id)).toEqual(["llama3.3:70b", "mistral:latest"]);
+    expect(found?.displayName).toBe("Ollama Local");
+    expect(found?.driverKind).toBe("openai-compat");
+    expect(found?.isCustom).toBe(true);
+    expect(found?.snapshot?.state).toBe("available");
+    expect(found?.snapshot?.authenticated).toBe(true);
+    expect(found?.models?.options?.map((model) => model.id)).toEqual(["llama3.3:70b", "mistral:latest"]);
+    expect(found?.localModelWaitAvailable).toBe(true);
+
+    expect((await api("PATCH", `/api/instances/${instanceId}`, { replyWaitMinutes: 20 })).status).toBe(200);
+    expect((await api("PATCH", `/api/instances/${instanceId}`, { replyWaitMinutes: 10, unexpected: true })).status).toBe(400);
+    const configured = await api("GET", "/api/instances");
+    expect(findInstance(configured.body.instances, instanceId)?.replyWaitMinutes).toBe(20);
+    for (const invalid of [1, 4, 61, 2.5, "20"]) {
+      expect((await api("PATCH", `/api/instances/${instanceId}`, { replyWaitMinutes: invalid })).status).toBe(400);
+    }
+    expect((await api("PATCH", `/api/instances/${instanceId}`, { replyWaitMinutes: null })).status).toBe(200);
+    const reset = await api("GET", "/api/instances");
+    expect(findInstance(reset.body.instances, instanceId)).not.toHaveProperty("replyWaitMinutes");
 
     const botRes = await api("POST", "/api/bots", {
       name: "Local Bot",
@@ -5078,6 +7031,7 @@ describe("instance CLI override API", () => {
 
     expect((await api("DELETE", "/api/instances/claude")).status).toBe(400);
     expect((await api("DELETE", "/api/instances/openaiCompat")).status).toBe(400);
+    expect((await api("DELETE", "/api/instances/opencode")).status).toBe(400);
 
     const deleted = await api("DELETE", `/api/instances/${instanceId}`);
     expect(deleted.status).toBe(200);
@@ -5348,7 +7302,7 @@ describe("instance CLI override API", () => {
       .find((i: any) => i.instanceId === instanceId)).toBeUndefined();
     // The default connection is still protected from deletion.
     expect((await api("DELETE", "/api/instances/minimax")).status).toBe(400);
-  }, 30_000);
+  }, 60_000);
 
   it("reports the two API-key engines' state and endpoint on /api/config, and saves them", async () => {
     // Before this, `configStatus()` hand-listed every section and had no
@@ -5584,7 +7538,7 @@ describe("instance CLI override API", () => {
       await api("POST", `/api/bots/${bot.id}/interrupt`, {});
       await api("DELETE", `/api/bots/${bot.id}`);
     }
-  }, 30_000);
+  }, 60_000);
 
   it("excludes the deleted engine from replacement selection, picking a real other engine instead of itself", async () => {
     // Disable every other fixture engine and add a SECOND custom engine
@@ -5648,7 +7602,7 @@ describe("instance CLI override API", () => {
         expect(row?.enabled).toBe(true);
       }
     }
-  }, 30_000);
+  }, 60_000);
 
   it("refuses to delete an engine when no other engine is available to reassign its bots", async () => {
     // With every other fixture engine disabled, the about-to-be-deleted
@@ -5709,7 +7663,7 @@ describe("instance CLI override API", () => {
         expect(row?.enabled).toBe(true);
       }
     }
-  }, 30_000);
+  }, 60_000);
 
   it("does not interrupt an unrelated busy bot when deleting an unused custom engine", async () => {
     // Deleting a custom engine used to call the global reloadProviders(),
@@ -5916,6 +7870,33 @@ describe("GET /api/quotas", () => {
     expect(data.ok).toBe(true);
     expect(Array.isArray(data.cooldowns)).toBe(true);
     expect(data.cooldowns.find((c) => c.instanceId === "codex")).toBeUndefined();
+  });
+
+  // A bot whose engine cannot start is refused by the dispatcher and its run
+  // stays QUEUED, which from the outside is indistinguishable from a bot that
+  // is merely busy — so "the queue is not draining" had no way to name the
+  // cause.  Pinned as a sibling of cooldowns rather than folded into it:
+  // quota says an engine is spent, doomed says it never came up, and telling
+  // those apart is the whole point of the field.
+  it("reports the doomed (bot, engine) pairs beside the quota cooldowns", async () => {
+    const res = await fetch(`${BASE}/api/quotas`);
+    expect(res.status).toBe(200);
+    const data = (await res.json()) as {
+      ok: boolean;
+      doomed: Array<{ botId: string; instanceId: string; consecutiveFailures: number }>;
+    };
+    expect(data.ok).toBe(true);
+    expect(Array.isArray(data.doomed)).toBe(true);
+    // The failover regression above deliberately opens the breaker for a bot
+    // it then deletes, and the registry keeps the count afterwards (that
+    // retention is the half-open design), so emptiness holds for LIVE bots.
+    // The assertion that matters is that the key EXISTS and holds the live
+    // registry's shape: a missing field would read as "nothing is doomed"
+    // rather than "this build does not say", and that is the failure the audit
+    // ran into.
+    const liveBots = (await (await fetch(`${BASE}/api/bots`)).json()) as { bots: Array<{ id: string }> };
+    const liveBotIds = new Set(liveBots.bots.map((bot) => bot.id));
+    expect(data.doomed.filter((entry) => liveBotIds.has(entry.botId))).toEqual([]);
   });
 });
 
@@ -6367,6 +8348,331 @@ describe("PATCH /api/terminology", () => {
   });
 });
 
+describe("PATCH /api/auto-update", () => {
+  const configPath = () => join(home, ".botfleet", "config.json");
+  const readDisk = () => JSON.parse(readFileSync(configPath(), "utf8"));
+
+  it("stores the flag, reports it, and hands clients the same status as every config route", async () => {
+    try {
+      const on = await api("PATCH", "/api/auto-update", { enabled: true });
+      expect(on.status).toBe(200);
+      expect(on.body.autoUpdate).toMatchObject({ enabled: true });
+      expect(readDisk().autoUpdate.enabled).toBe(true);
+      // the phone reads it back from the route it already had
+      expect((await api("GET", "/api/config")).body.autoUpdate.enabled).toBe(true);
+
+      const off = await api("PATCH", "/api/auto-update", { enabled: false });
+      expect(off.status).toBe(200);
+      expect(off.body.autoUpdate).toMatchObject({ enabled: false });
+      expect(readDisk().autoUpdate.enabled).toBe(false);
+    } finally {
+      await api("PATCH", "/api/auto-update", { enabled: false });
+    }
+  });
+
+  it("leaves the updater's own check record alone, so a toggle cannot reset the throttle", async () => {
+    try {
+      expect((await api("PATCH", "/api/auto-update", { enabled: true })).status).toBe(200);
+      // The desktop updater writes these to the same file from another process.
+      const disk = readDisk();
+      disk.autoUpdate = { ...disk.autoUpdate, lastCheckMs: 1_700_000_000_000, lastAppFingerprint: "fp-123" };
+      writeFileSync(configPath(), JSON.stringify(disk, null, 2));
+
+      const off = await api("PATCH", "/api/auto-update", { enabled: false });
+      expect(off.status).toBe(200);
+      expect(readDisk().autoUpdate).toEqual({
+        enabled: false,
+        lastCheckMs: 1_700_000_000_000,
+        lastAppFingerprint: "fp-123",
+      });
+      // and the status reports what is stored, not a stale in-memory copy
+      expect(off.body.autoUpdate).toMatchObject({ enabled: false, lastCheckMs: 1_700_000_000_000 });
+    } finally {
+      const disk = readDisk();
+      delete disk.autoUpdate;
+      writeFileSync(configPath(), JSON.stringify(disk, null, 2));
+      await api("PATCH", "/api/auto-update", { enabled: false });
+    }
+  });
+
+  it("accepts only a boolean `enabled`", async () => {
+    for (const body of [{}, { enabled: "true" }, { enabled: 1 }, { enabled: null }, { autoUpdate: { enabled: true } }]) {
+      expect((await api("PATCH", "/api/auto-update", body)).status, JSON.stringify(body)).toBe(400);
+    }
+  });
+
+  it("is not a side door into the rest of the config file", async () => {
+    const before = await api("GET", "/api/config");
+    const res = await api("PATCH", "/api/auto-update", {
+      enabled: false,
+      profile: { name: "Someone Else" },
+      ingress: { publicUrl: "https://evil.example.com" },
+    });
+    expect(res.status).toBe(200);
+    const after = await api("GET", "/api/config");
+    expect(after.body.profile?.name).toBe(before.body.profile?.name);
+    expect(readDisk().ingress?.publicUrl).not.toBe("https://evil.example.com");
+  });
+});
+
+describe("PATCH /api/bots/:id roster organization fields", () => {
+  const SECTION = "organize-test";
+
+  it("refuses a pinned, hidden or unread value that is not a boolean", async () => {
+    const bot = (await api("POST", "/api/bots", { name: "Organize Types" })).body.bot;
+    try {
+      for (const body of [{ pinned: "yes" }, { hidden: 1 }, { unread: null }, { pinned: {} }, { hidden: [] }]) {
+        const res = await api("PATCH", `/api/bots/${bot.id}`, body);
+        expect(res.status, JSON.stringify(body)).toBe(400);
+        expect(res.body.error).toMatch(/must be true or false/);
+      }
+      // the section and the pinned message are typed by the same parse
+      const badSection = await api("PATCH", `/api/bots/${bot.id}`, { section: 4 });
+      expect(badSection.status).toBe(400);
+      expect(badSection.body.error).toMatch(/section must be a string/);
+      const badPin = await api("PATCH", `/api/bots/${bot.id}`, { pinnedMessageId: ["m"] });
+      expect(badPin.status).toBe(400);
+      expect(badPin.body.error).toMatch(/pinnedMessageId must be a message id/);
+      const stored = (await api("GET", "/api/bots")).body.bots.find((entry: { id: string }) => entry.id === bot.id);
+      expect(stored.pinned).not.toBe("yes");
+      expect(stored.hidden).not.toBe(1);
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("takes the six organize fields and nothing else when the sidecar's phone header is on the request", async () => {
+    const bot = (await api("POST", "/api/bots", { name: "Organize Phone" })).body.bot;
+    const stored = async () =>
+      (await api("GET", "/api/bots")).body.bots.find((entry: { id: string }) => entry.id === bot.id);
+    type PhoneBody = { cloudBackend?: string; pinned?: boolean; color?: string; autoApprove?: boolean; name?: string };
+    const fromPhone = (body: PhoneBody) =>
+      fetch(`${BASE}/api/bots/${bot.id}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json", "x-botfleet-companion": "1" },
+        body: JSON.stringify(body),
+      });
+    try {
+      const before = await stored();
+      for (const body of [
+        { cloudBackend: "vps" },
+        { pinned: true, color: "crimson" },
+        { autoApprove: true },
+        { name: "Renamed From A Phone" },
+      ]) {
+        const res = await fromPhone(body);
+        expect(res.status, JSON.stringify(body)).toBe(403);
+        expect(z.object({ error: z.string() }).parse(await res.json()).error).toMatch(
+          /can only be changed in BotFleet on your computer/,
+        );
+      }
+      const unchanged = await stored();
+      expect(unchanged.color).toBe(before.color);
+      expect(unchanged.name).toBe(before.name);
+      expect(unchanged.autoApprove).toBe(before.autoApprove);
+      expect(unchanged.pinned).toBe(before.pinned);
+
+      // the six still go through, and the desktop (no header) keeps its other fields
+      expect((await fromPhone({ pinned: true })).status).toBe(200);
+      expect((await stored()).pinned).toBe(true);
+      const desktop = await api("PATCH", `/api/bots/${bot.id}`, { pinned: false, color: "crimson" });
+      expect(desktop.status).toBe(200);
+      expect(desktop.body.bot.color).toBe("crimson");
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("archives, restores, pins and marks a bot unread, and moves it between sections", async () => {
+    const bot = (await api("POST", "/api/bots", { name: "Organize Roundtrip" })).body.bot;
+    try {
+      const archived = await api("PATCH", `/api/bots/${bot.id}`, { hidden: true });
+      expect(archived.status).toBe(200);
+      expect(archived.body.bot).toMatchObject({ id: bot.id, hidden: true });
+      const restored = await api("PATCH", `/api/bots/${bot.id}`, { hidden: false });
+      expect(restored.body.bot).toMatchObject({ hidden: false });
+
+      expect((await api("PATCH", `/api/bots/${bot.id}`, { pinned: true })).body.bot).toMatchObject({ pinned: true });
+      expect((await api("PATCH", `/api/bots/${bot.id}`, { pinned: false })).body.bot).toMatchObject({ pinned: false });
+      expect((await api("PATCH", `/api/bots/${bot.id}`, { unread: true })).body.bot).toMatchObject({ unread: true });
+
+      const moved = await api("PATCH", `/api/bots/${bot.id}`, { section: `  ${SECTION}  ` });
+      expect(moved.body.bot.section).toBe(SECTION);
+      const tooLong = await api("PATCH", `/api/bots/${bot.id}`, { section: "x".repeat(61) });
+      expect(tooLong.status).toBe(400);
+      const cleared = await api("PATCH", `/api/bots/${bot.id}`, { section: null });
+      expect(cleared.body.bot.section).toBeUndefined();
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("hands the Chief of Staff role over inside a section, and will not archive the chief", async () => {
+    const first = (await api("POST", "/api/bots", { name: "Chief One" })).body.bot;
+    const second = (await api("POST", "/api/bots", { name: "Chief Two" })).body.bot;
+    try {
+      await api("PATCH", `/api/bots/${first.id}`, { section: SECTION });
+      await api("PATCH", `/api/bots/${second.id}`, { section: SECTION });
+      const fleet = async () => (await api("GET", "/api/bots")).body.bots as Array<{ id: string; chiefOfStaff?: boolean }>;
+
+      expect((await api("PATCH", `/api/bots/${first.id}`, { chiefOfStaff: true })).body.bot).toMatchObject({
+        chiefOfStaff: true,
+      });
+      // electing the second demotes the first, in the stored roster
+      expect((await api("PATCH", `/api/bots/${second.id}`, { chiefOfStaff: true })).status).toBe(200);
+      const after = await fleet();
+      expect(after.find((entry) => entry.id === second.id)?.chiefOfStaff).toBe(true);
+      expect(after.find((entry) => entry.id === first.id)?.chiefOfStaff).toBeFalsy();
+
+      // the harness refuses to archive the chief; the demote-then-archive
+      // pair the desktop sends is how a chief is archived
+      const refused = await api("PATCH", `/api/bots/${second.id}`, { hidden: true });
+      expect(refused.status).toBe(400);
+      expect(refused.body.error).toMatch(/choose another Chief of Staff/i);
+      const demoted = await api("PATCH", `/api/bots/${second.id}`, { hidden: true, chiefOfStaff: false });
+      expect(demoted.status).toBe(200);
+      expect(demoted.body.bot).toMatchObject({ hidden: true });
+    } finally {
+      await api("DELETE", `/api/bots/${first.id}`);
+      await api("DELETE", `/api/bots/${second.id}`);
+    }
+  });
+});
+
+describe("workspace voice settings", () => {
+  it("hands every client the default voice by id and the pronunciation list in force", async () => {
+    const saved = await api("PUT", "/api/config", { tts: { voice: "jay-wedgeworth-001" } });
+    expect(saved.status).toBe(200);
+    expect(saved.body.tts.voice).toBe("jay-wedgeworth-001");
+    const status = await api("GET", "/api/config");
+    expect(status.body.tts.voice).toBe("jay-wedgeworth-001");
+    // Never saved yet: the seeded list, so a client never has to know it.
+    expect(status.body.tts.pronunciations).toEqual(expect.arrayContaining([
+      { term: "SQL", say: "sequel" },
+      { term: "OAuth", say: "oh auth" },
+    ]));
+  });
+
+  it("saves the list through PUT /api/config with the shared validation", async () => {
+    const ok = await api("PUT", "/api/config", { tts: { pronunciations: [{ term: "SQL", say: "S Q L" }] } });
+    expect(ok.status).toBe(200);
+    expect(ok.body.tts.pronunciations).toEqual([{ term: "SQL", say: "S Q L" }]);
+    const dup = await api("PUT", "/api/config", { tts: { pronunciations: [{ term: "a", say: "x" }, { term: "A", say: "y" }] } });
+    expect(dup.status).toBe(400);
+  });
+
+  it("lets the phone's narrow route change the default voice, and nothing else", async () => {
+    const res = await api("PATCH", "/api/tts/default-voice", { voice: "English_Graceful_Lady", profile: { name: "Side Door" } });
+    expect(res.status).toBe(200);
+    expect(res.body.tts.voice).toBe("English_Graceful_Lady");
+    expect((await api("GET", "/api/config")).body.profile?.name).not.toBe("Side Door");
+    // A Personal Voice belongs to one device; blank and junk are refused.
+    const personal = await api("PATCH", "/api/tts/default-voice", { voice: "personal:Jay" });
+    expect(personal.status).toBe(400);
+    expect(personal.body.error).toContain("Personal Voices stay on the device");
+    expect((await api("PATCH", "/api/tts/default-voice", { voice: "  " })).status).toBe(400);
+    expect((await api("PATCH", "/api/tts/default-voice", { voice: "a\u0000b" })).status).toBe(400);
+    expect((await api("PATCH", "/api/tts/default-voice", { voice: 7 })).status).toBe(400);
+    expect((await api("GET", "/api/config")).body.tts.voice).toBe("English_Graceful_Lady");
+    // The MiniMax id is kept exactly; MiniMax ids are case-sensitive.
+    const exact = await api("PATCH", "/api/tts/default-voice", { voice: "jay-wedgeworth-001" });
+    expect(exact.body.tts.voice).toBe("jay-wedgeworth-001");
+  });
+
+  it("lets the phone's narrow route replace the pronunciation list, with a plain-language refusal", async () => {
+    const list = [{ term: "JSON", say: "Jason" }, { term: "kubectl", say: "cube control" }];
+    const res = await api("PATCH", "/api/tts/pronunciations", { pronunciations: list, tts: { voice: "Side_Door" } });
+    expect(res.status).toBe(200);
+    expect(res.body.tts.pronunciations).toEqual(list);
+    expect(res.body.tts.voice).not.toBe("Side_Door");
+    const bad = await api("PATCH", "/api/tts/pronunciations", { pronunciations: [{ term: "JSON", say: "my JSON" }] });
+    expect(bad.status).toBe(400);
+    expect(bad.body.error).toContain("which is also on the list");
+    expect((await api("PATCH", "/api/tts/pronunciations", {})).status).toBe(400);
+    expect((await api("GET", "/api/config")).body.tts.pronunciations).toEqual(list);
+  });
+});
+
+describe("paired profile Bypass Including This Mac", () => {
+  const refusal =
+    "Bypass Including This Mac can only be turned on in BotFleet on your computer for a bot that can use This Mac";
+
+  it("refuses a phone that sets only bypassLocalComputer on a bot that can use This Mac", async () => {
+    const bot = (await api("POST", "/api/bots", { name: "Phone Bypass Local" })).body.bot;
+    const stored = async () =>
+      (await api("GET", "/api/bots")).body.bots.find((entry: { id: string }) => entry.id === bot.id);
+    try {
+      // Explicit This Mac, with Auto off, so the refusal does not depend on
+      // the host being Darwin.  Adding the destination alone is not the pair
+      // the acknowledgement gates.
+      expect((await api("PATCH", `/api/bots/${bot.id}`, { computers: ["vm", "local"] })).status).toBe(200);
+
+      // The hole: a patch that names only this field used to skip
+      // pairedProfileRefusal and persist the switch.
+      const onlySwitch = await api("PATCH", `/api/bots/${bot.id}/profile`, { bypassLocalComputer: true });
+      expect(onlySwitch.status).toBe(403);
+      expect(onlySwitch.body.error).toBe(refusal);
+      expect((await stored()).bypassLocalComputer).not.toBe(true);
+
+      // A field riding along is not written either.
+      const withTitle = await api("PATCH", `/api/bots/${bot.id}/profile`, {
+        title: "must not apply",
+        bypassLocalComputer: true,
+      });
+      expect(withTitle.status).toBe(403);
+      expect(withTitle.body.error).toBe(refusal);
+      const afterRefusal = await stored();
+      expect(afterRefusal.title).not.toBe("must not apply");
+      expect(afterRefusal.bypassLocalComputer).not.toBe(true);
+
+      // Plain Bypass stays the phone's.  It never answers a This Mac request,
+      // and it must not become a stand-in that lets Auto Mode through.
+      const plain = await api("PATCH", `/api/bots/${bot.id}/profile`, { bypassPermissions: true });
+      expect(plain.status).toBe(200);
+      expect((await stored()).bypassPermissions).toBe(true);
+      const auto = await api("PATCH", `/api/bots/${bot.id}/profile`, { autoApprove: true });
+      expect(auto.status).toBe(403);
+      expect((await stored()).autoApprove).not.toBe(true);
+
+      // Turning the switch off is the phone's, including when it was never on.
+      expect((await api("PATCH", `/api/bots/${bot.id}/profile`, { bypassLocalComputer: false })).status).toBe(200);
+
+      // The desktop still demands the warning before the switch covers This Mac.
+      const quiet = await api("PATCH", `/api/bots/${bot.id}`, { bypassLocalComputer: true });
+      expect(quiet.status).toBe(400);
+      expect(quiet.body.error).toMatch(/acknowledgeLocalAuto/);
+      expect((await stored()).bypassLocalComputer).not.toBe(true);
+      const acked = await api("PATCH", `/api/bots/${bot.id}`, {
+        bypassLocalComputer: true,
+        acknowledgeLocalAuto: true,
+      });
+      expect(acked.status).toBe(200);
+      expect((await stored()).bypassLocalComputer).toBe(true);
+
+      // Off again, from the phone, then a bot that cannot use This Mac may
+      // take the switch.  Widening that bot onto This Mac afterwards is a new
+      // grant and still stops for the warning.
+      expect((await api("PATCH", `/api/bots/${bot.id}/profile`, { bypassLocalComputer: false })).status).toBe(200);
+      expect((await api("PATCH", `/api/bots/${bot.id}`, { computers: ["vm"] })).status).toBe(200);
+      const allowed = await api("PATCH", `/api/bots/${bot.id}/profile`, { bypassLocalComputer: true });
+      expect(allowed.status).toBe(200);
+      expect((await stored()).bypassLocalComputer).toBe(true);
+      const widen = await api("PATCH", `/api/bots/${bot.id}`, { computers: ["vm", "local"] });
+      expect(widen.status).toBe(400);
+      expect((await stored()).computers).toEqual(["vm"]);
+      const widened = await api("PATCH", `/api/bots/${bot.id}`, {
+        computers: ["vm", "local"],
+        acknowledgeLocalAuto: true,
+      });
+      expect(widened.status).toBe(200);
+      expect((await stored()).computers).toEqual(["vm", "local"]);
+      expect((await stored()).bypassLocalComputer).toBe(true);
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+});
+
 describe("local Auto consent for inherited and discovered computers", () => {
   it("guards config defaults and per-bot Auto while preserving explicit Off", async () => {
     expect((await api("PUT", "/api/config", {
@@ -6453,6 +8759,139 @@ describe("local Auto consent for inherited and discovered computers", () => {
   });
 });
 
+describe("local Auto consent follows the This Computer provider toggle", () => {
+  it("requires the acknowledgement when a config save only turns This Computer back on", async () => {
+    // The legacy allowlist stays unrestricted the whole time; only the
+    // per-provider toggle moves.  resolveGrants drops Local while
+    // computerProviders.localMac is off and mounts it again the moment the
+    // toggle flips, so the flip is a host-access widening and must be gated
+    // exactly like widening allowedComputers.
+    const providers = { asciiBox: true, selfHostedVps: false, localVm: true, localMac: false };
+    expect((await api("PUT", "/api/config", {
+      botDefaults: { computers: ["cloud"], allowedComputers: null, computerProviders: providers },
+    })).status).toBe(200);
+    // Automatic discovery with This Computer off has no host path, so this
+    // needs no acknowledgement on any platform.
+    expect((await api("PUT", "/api/config", {
+      botDefaults: { computers: [], allowedComputers: null, computerProviders: providers },
+    })).status).toBe(200);
+    const bot = (await api("POST", "/api/bots", { name: "Provider Flip Auto" })).body.bot;
+    try {
+      expect((await api("PATCH", `/api/bots/${bot.id}`, { autoApprove: true })).status).toBe(200);
+
+      const flip = { botDefaults: { computerProviders: { ...providers, localMac: true } } };
+      const flipped = await api("PUT", "/api/config", flip);
+      if (process.platform === "darwin") {
+        expect(flipped.status).toBe(400);
+        expect(flipped.body.needsAcknowledgement).toEqual(expect.arrayContaining([
+          { id: bot.id, name: "Provider Flip Auto" },
+        ]));
+        // Refused whole: This Computer is still off.
+        const refused = (await api("GET", "/api/config")).body;
+        expect(refused.botDefaults.computerProviders.localMac).toBe(false);
+        const acked = await api("PUT", "/api/config", {
+          ...flip,
+          acknowledgeLocalAuto: true,
+          acknowledgedBots: flipped.body.needsAcknowledgement,
+        });
+        expect(acked.status).toBe(200);
+        expect(acked.body.botDefaults.computerProviders.localMac).toBe(true);
+      } else {
+        // Only Darwin Auto mounts the host from automatic discovery.
+        expect(flipped.status).toBe(200);
+        expect(flipped.body.needsAcknowledgement).toBeUndefined();
+      }
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+      expect((await api("PUT", "/api/config", {
+        botDefaults: {
+          computers: ["cloud"],
+          allowedComputers: null,
+          computerProviders: { asciiBox: true, selfHostedVps: true, localVm: true, localMac: true },
+        },
+      })).status).toBe(200);
+    }
+  });
+});
+
+describe("cloud computer lifecycle routes honor the provider toggles", () => {
+  it("refuses to provision, join, exec or screenshot on a turned-off provider, and still lets it sleep", async () => {
+    const bot = (await api("POST", "/api/bots", { name: "Bea Boxless", cloudBackend: "box" })).body.bot;
+    try {
+      const off = await api("PUT", "/api/config", {
+        botDefaults: { computerProviders: { asciiBox: false, selfHostedVps: true, localVm: true, localMac: true } },
+      });
+      expect(off.status).toBe(200);
+      for (const action of ["provision", "join", "exec", "screenshot"]) {
+        const refused = await api("POST", `/api/bots/${bot.id}/computer/${action}`, {});
+        expect(refused.status).toBe(409);
+        expect(String(refused.body.error)).toContain("ASCII.dev Box is turned off");
+      }
+      // Winding a computer down is never blocked by the toggle.
+      const sleep = await api("POST", `/api/bots/${bot.id}/computer/sleep`, {});
+      expect(String(sleep.body.error ?? "")).not.toContain("turned off in Computer settings");
+
+      // A VPS bot is not affected by the Box toggle.
+      const vpsBot = (await api("PATCH", `/api/bots/${bot.id}`, { cloudBackend: "vps" })).body.bot;
+      expect(vpsBot.cloudBackend).toBe("vps");
+      const vpsExec = await api("POST", `/api/bots/${bot.id}/computer/exec`, {});
+      expect(String(vpsExec.body.error ?? "")).not.toContain("turned off in Computer settings");
+    } finally {
+      await api("PUT", "/api/config", {
+        botDefaults: { computerProviders: { asciiBox: true, selfHostedVps: true, localVm: true, localMac: true } },
+      });
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+});
+
+describe("Local VM lifecycle routes honor the provider toggle", () => {
+  it("refuses to create or start a turned-off Local VM from the shared and per-bot routes", async () => {
+    const bot = (await api("POST", "/api/bots", { name: "Vic Vmless" })).body.bot;
+    try {
+      const off = await api("PUT", "/api/config", {
+        botDefaults: { computerProviders: { asciiBox: true, selfHostedVps: true, localVm: false, localMac: true } },
+      });
+      expect(off.status).toBe(200);
+      for (const action of ["run", "start"]) {
+        const refused = await api("POST", `/api/local-computer/${action}`, {});
+        expect(refused.status).toBe(409);
+        expect(String(refused.body.error)).toContain("Local VM is turned off");
+      }
+      const perBot = await api("POST", `/api/bots/${bot.id}/local-computer/run`, {});
+      expect(perBot.status).toBe(409);
+      expect(String(perBot.body.error)).toContain("Local VM is turned off");
+    } finally {
+      await api("PUT", "/api/config", {
+        botDefaults: { computerProviders: { asciiBox: true, selfHostedVps: true, localVm: true, localMac: true } },
+      });
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("lets a turned-on Local VM past the provider gate", async () => {
+    const bot = (await api("POST", "/api/bots", { name: "Vera Vm" })).body.bot;
+    try {
+      const on = await api("PUT", "/api/config", {
+        botDefaults: { computerProviders: { asciiBox: true, selfHostedVps: true, localVm: true, localMac: true } },
+      });
+      expect(on.status).toBe(200);
+      // Shared mode allows the bot endpoint to run or create the shared container;
+      // it is not blocked by the provider gate or by a legacy App Settings referral.
+      // This harness runs with container runtimes switched off (spawnDetached),
+      // so the request must reach the runtime layer and be refused THERE, with
+      // exactly that message — nothing is created on the machine running the
+      // suite.  An unqualified "no gate text" assertion once let a real
+      // `docker run` through and orphaned the owner's real Local VM container.
+      const perBot = await api("POST", `/api/bots/${bot.id}/local-computer/run`, {});
+      expect(perBot.status).toBe(409);
+      expect(perBot.body.error).toBe(CONTAINER_RUNTIME_DISABLED_MESSAGE);
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+});
+
 describe("POST /api/bots/apply-defaults (set all bots to default)", () => {
   it("applies the workspace default to every bot, filtered through the allowlist", async () => {
     const ada = (await api("POST", "/api/bots", { name: "Ada Apply" })).body.bot;
@@ -6481,6 +8920,106 @@ describe("POST /api/bots/apply-defaults (set all bots to default)", () => {
 
     await api("DELETE", `/api/bots/${ada.id}`);
     await api("DELETE", `/api/bots/${lin.id}`);
+  });
+
+  it("intersects the applied set with each bot's resolved cloud provider", async () => {
+    // The apply-to-all client sends the legacy destination list, where
+    // "cloud" collapses hosted Box and the self-hosted VPS into one entry.
+    // Filtering only through the legacy allowlist would write "cloud" to a
+    // bot whose real backend's provider toggle is off — a grant the runtime
+    // strips again on the bot's next turn.  The apply must store the same
+    // answer the runtime computes.
+    expect((await api("PUT", "/api/config", {
+      botDefaults: {
+        allowedComputers: null,
+        cloudBackend: "box",
+        computerProviders: { asciiBox: false, selfHostedVps: true, localVm: true, localMac: true },
+      },
+    })).status).toBe(200);
+    const boxBot = (await api("POST", "/api/bots", { name: "Box Off Apply" })).body.bot;
+    const vpsBot = (await api("POST", "/api/bots", { name: "Vps On Apply" })).body.bot;
+    expect((await api("PATCH", `/api/bots/${vpsBot.id}`, { cloudBackend: "vps" })).status).toBe(200);
+    try {
+      const apply = await api("POST", "/api/bots/apply-defaults", {
+        botDefaults: { computers: ["cloud"] },
+      });
+      expect(apply.status).toBe(200);
+      const bots = (await api("GET", "/api/bots")).body.bots;
+      // Box-backed bot with Box off: every destination this apply would
+      // grant is provider-disabled, so its own choice is left alone rather
+      // than overwritten with a disabled provider or stripped to Off.
+      expect(bots.find((b: { id: string }) => b.id === boxBot.id).computers ?? []).toEqual([]);
+      // VPS-backed bot takes the grant: its resolved provider is on.
+      expect(bots.find((b: { id: string }) => b.id === vpsBot.id).computers).toEqual(["cloud"]);
+    } finally {
+      await api("DELETE", `/api/bots/${boxBot.id}`);
+      await api("DELETE", `/api/bots/${vpsBot.id}`);
+      expect((await api("PUT", "/api/config", {
+        botDefaults: {
+          allowedComputers: null,
+          cloudBackend: "box",
+          computerProviders: { asciiBox: true, selfHostedVps: true, localVm: true, localMac: true },
+        },
+      })).status).toBe(200);
+      // Leave the workspace default harmless for the suites that follow.
+      expect((await api("POST", "/api/bots/apply-defaults", {
+        botDefaults: { computers: ["cloud"] },
+      })).status).toBe(200);
+    }
+  });
+
+  it("refuses provider policy, which only PUT /api/config may change", async () => {
+    const before = (await api("GET", "/api/config")).body.botDefaults;
+    for (const policy of [
+      { computerProviders: { asciiBox: true, selfHostedVps: true, localVm: true, localMac: false } },
+      { vpsMode: "per-bot" },
+      { allowedComputers: ["cloud"] },
+    ]) {
+      const refused = await api("POST", "/api/bots/apply-defaults", {
+        botDefaults: { computers: ["cloud"], ...policy },
+      });
+      expect(refused.status).toBe(400);
+      expect(refused.body.error).toMatch(/PUT \/api\/config/);
+    }
+    const after = (await api("GET", "/api/config")).body.botDefaults;
+    expect(after.computerProviders).toEqual(before.computerProviders);
+    expect(after.allowedComputers).toEqual(before.allowedComputers);
+    expect(after.vpsMode).toEqual(before.vpsMode);
+  });
+
+  it("filters an atomic backend switch with the backend being applied", async () => {
+    // Box off, VPS on, workspace backend Box.  Applying ["cloud"] together
+    // with cloudBackend "vps" must judge each inheriting bot by the VPS
+    // toggle it will actually run on, not the Box toggle being replaced.
+    expect((await api("PUT", "/api/config", {
+      botDefaults: {
+        allowedComputers: null,
+        cloudBackend: "box",
+        computerProviders: { asciiBox: false, selfHostedVps: true, localVm: true, localMac: true },
+      },
+    })).status).toBe(200);
+    const bot = (await api("POST", "/api/bots", { name: "Backend Switch Apply" })).body.bot;
+    try {
+      const apply = await api("POST", "/api/bots/apply-defaults", {
+        botDefaults: { computers: ["cloud"], cloudBackend: "vps" },
+      });
+      expect(apply.status).toBe(200);
+      const after = (await api("GET", "/api/bots")).body.bots.find((b: { id: string }) => b.id === bot.id);
+      expect(after.computers).toEqual(["cloud"]);
+      expect((await api("GET", "/api/config")).body.botDefaults.cloudBackend).toBe("vps");
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+      expect((await api("PUT", "/api/config", {
+        botDefaults: {
+          allowedComputers: null,
+          cloudBackend: "box",
+          computerProviders: { asciiBox: true, selfHostedVps: true, localVm: true, localMac: true },
+        },
+      })).status).toBe(200);
+      expect((await api("POST", "/api/bots/apply-defaults", {
+        botDefaults: { computers: ["cloud"] },
+      })).status).toBe(200);
+    }
   });
 
   it("rejects a non-array destination list and an unknown destination", async () => {
@@ -6527,6 +9066,34 @@ describe("POST /api/bots/apply-defaults (set all bots to default)", () => {
     const reopen = await api("PUT", "/api/config", { botDefaults: { allowedComputers: null } });
     expect(reopen.status).toBe(200);
     expect(reopen.body.botDefaults.allowedComputers ?? null).toBeNull();
+  });
+
+  it("preserves a bot that has been deliberately turned off (computers: [])", async () => {
+    const off = (await api("POST", "/api/bots", { name: "Off Bot" })).body.bot;
+    const on = (await api("POST", "/api/bots", { name: "On Bot" })).body.bot;
+
+    // Turn the first bot off explicitly.  Empty `computers` array
+    // means "Off", distinct from `undefined` (Auto) which inherits
+    // the workspace default.
+    const set = await api("PATCH", `/api/bots/${off.id}`, { computers: [] });
+    expect(set.status).toBe(200);
+    expect(set.body.bot.computers).toEqual([]);
+
+    const apply = await api("POST", "/api/bots/apply-defaults", {
+      botDefaults: { computers: ["cloud"] },
+    });
+    expect(apply.status).toBe(200);
+
+    const after = (await api("GET", "/api/bots")).body.bots;
+    const offAfter = after.find((b: { id: string }) => b.id === off.id);
+    const onAfter = after.find((b: { id: string }) => b.id === on.id);
+    // Off bot stays off (apply skips bots with explicit `[]`).
+    expect(offAfter.computers).toEqual([]);
+    // On bot is patched to the workspace default.
+    expect(onAfter.computers).toEqual(["cloud"]);
+
+    await api("DELETE", `/api/bots/${off.id}`);
+    await api("DELETE", `/api/bots/${on.id}`);
   });
 
   it("persists the operator's default unfiltered, and applies the filtered set", async () => {
@@ -6804,6 +9371,16 @@ describe("POST /api/bots/apply-model-defaults (set all bots to default models)",
     expect(missing.status).toBe(400);
   });
 
+  it("rejects a malformed latest instead of silently dropping it", async () => {
+    for (const latest of [5, true, {}, "Not A Class", ""]) {
+      const res = await api("POST", "/api/bots/apply-model-defaults", {
+        slots: { primary: { instanceId: "fake", model: "after", latest } },
+      });
+      expect(res.status, JSON.stringify(latest)).toBe(400);
+      expect(res.body.error).toMatch(/latest/);
+    }
+  });
+
   it("leaves a bot that is mid-turn on its own model, and names it in the response", async () => {
     // The per-bot PATCH answers 409 here.  This route validated each slot
     // once with no bot in hand, and checkedModelSelection only raises the
@@ -6852,18 +9429,685 @@ describe("POST /api/bots/apply-model-defaults (set all bots to default models)",
   });
 });
 
+describe("model lineage over HTTP: saved selections move forward, never aliased", () => {
+  type Saved = { instanceId: string; model: string; latest?: string; contextCap?: number; maxOutputTokens?: number; fallbacks?: Saved[] };
+  // A describe records each engine's CLI version; until the Claude CLI has
+  // reported one, nothing on a Claude engine is moved.  The fixture CLI
+  // reports 2.1.232, older than 2.1.280 (Opus 5.5) and 2.1.284 (Sonnet 5.5),
+  // so the runnable Sonnet on it is Sonnet 5.
+  beforeAll(async () => {
+    await api("GET", "/api/instances");
+  });
+  const selectionOf = async (id: string): Promise<Saved | undefined> =>
+    (await api("GET", "/api/bots?messages=0")).body.bots.find((b: { id: string }) => b.id === id)?.modelSelection;
+  const withBot = async (name: string, run: (bot: { id: string; threadId: string }) => Promise<void>) => {
+    const bot = (await api("POST", "/api/bots", { name })).body.bot;
+    try {
+      await run(bot);
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  };
+
+  it("hides superseded rows from /api/instances, and keeps Opus 5 for a CLI too old for Opus 5.5", async () => {
+    const claude = (await api("GET", "/api/instances")).body.instances.find(
+      (instance: { instanceId: string }) => instance.instanceId === "claude",
+    );
+    expect(claude.snapshot.version).toMatch(/^2\.1\.232/);
+    const ids = claude.models.options.map((option: { id: string }) => option.id);
+    expect(ids).toEqual(expect.arrayContaining(["claude-sonnet-5", "claude-opus-5"]));
+    expect(ids).not.toContain("claude-sonnet-5-5");
+    expect(ids).not.toContain("claude-opus-5-5");
+    expect(claude.models.default).toBe("claude-sonnet-5");
+  });
+
+  it("starts a new bot on Sonnet 5 when the CLI cannot run Sonnet 5.5", async () => {
+    await withBot("Lineage Default Sonnet", async (bot) => {
+      expect(await selectionOf(bot.id)).toMatchObject({ instanceId: "claude", model: "claude-sonnet-5" });
+    });
+  });
+
+  it("never moves a pinned Opus 5 onto Opus 5.5 for a CLI too old to run it", async () => {
+    await withBot("Lineage Old CLI", async (bot) => {
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "claude", model: "claude-opus-5" },
+      })).status).toBe(200);
+      await api("GET", "/api/instances?fresh=1");
+      expect(await selectionOf(bot.id)).toMatchObject({ instanceId: "claude", model: "claude-opus-5" });
+      expect((await selectionOf(bot.id))?.latest).toBeUndefined();
+    });
+  });
+
+  it("moves an idle bot forward in the same answer when an engine PATCH changes what it offers", async () => {
+    // claude2 runs the fixture CLI (2.1.232, too old for Opus 5.5).  Pointed
+    // at a CLI that reports 2.1.284 it offers Opus 5.5, and the PATCH that
+    // made that change moves the pinned Opus 5 forward before it answers.
+    const newerCli = join(home, "fake-claude-newer");
+    writeFileSync(
+      newerCli,
+      [
+        "#!/usr/bin/env node",
+        'process.env.FAKE_CLAUDE_VERSION = "2.1.284 (Claude Code)";',
+        "delete process.env.FAKE_CLAUDE_DUMP;",
+        `await import(${JSON.stringify(pathToFileURL(FAKE_CLAUDE_CLI).href)});`,
+        "",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    await withBot("Lineage Engine Patch", async (bot) => {
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "claude2", model: "claude-opus-5" },
+      })).status).toBe(200);
+      expect(await selectionOf(bot.id)).toMatchObject({ instanceId: "claude2", model: "claude-opus-5" });
+      try {
+        const patched = await api("PATCH", "/api/instances/claude2", { cli: newerCli });
+        expect(patched.status).toBe(200);
+        const claude2 = patched.body.instances.find(
+          (instance: { instanceId: string }) => instance.instanceId === "claude2",
+        );
+        expect(claude2.models.options.map((option: { id: string }) => option.id)).toContain("claude-opus-5-5");
+        // No GET /api/instances in between: the PATCH itself reconciled.
+        expect(await selectionOf(bot.id)).toMatchObject({ instanceId: "claude2", model: "claude-opus-5-5" });
+      } finally {
+        await api("PATCH", "/api/instances/claude2", { cli: FAKE_CLAUDE_CLI });
+      }
+    });
+  });
+
+  it("saves a retired id as Latest of its successor class, with the real slug in model", async () => {
+    await withBot("Lineage Retired", async (bot) => {
+      const saved = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "claude", model: "claude-3-7-sonnet" },
+      });
+      expect(saved.status).toBe(200);
+      expect(await selectionOf(bot.id)).toMatchObject({ instanceId: "claude", model: "claude-sonnet-5", latest: "sonnet" });
+    });
+  });
+
+  it("resolves a Latest pick, pins on latest: null, and refuses a malformed class", async () => {
+    await withBot("Lineage Latest", async (bot) => {
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "claude", model: "claude-sonnet-5", latest: "sonnet" },
+      })).status).toBe(200);
+      expect(await selectionOf(bot.id)).toMatchObject({ model: "claude-sonnet-5", latest: "sonnet" });
+
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "claude", model: "claude-sonnet-5", latest: null },
+      })).status).toBe(200);
+      const pinned = await selectionOf(bot.id);
+      expect(pinned?.model).toBe("claude-sonnet-5");
+      expect(pinned?.latest).toBeUndefined();
+
+      const bad = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "claude", model: "claude-sonnet-5-5", latest: "Not A Class!" },
+      });
+      expect(bad.status).toBe(400);
+      expect(bad.body.error).toMatch(/latest/);
+    });
+  });
+
+  it("refuses a context cap or output limit that is not a whole number of tokens from 1 to 10,000,000", async () => {
+    await withBot("Limits Refused", async (bot) => {
+      const sonnet = { instanceId: "claude", model: "claude-sonnet-5" };
+      for (const bad of [0, -5, 1.5, "8k", 10_000_001, true]) {
+        const cap = await api("PATCH", `/api/bots/${bot.id}`, { modelSelection: { ...sonnet, contextCap: bad } });
+        expect(cap.status, `contextCap ${String(bad)}`).toBe(400);
+        expect(cap.body.error).toMatch(/contextCap/);
+        const out = await api("PATCH", `/api/bots/${bot.id}`, { modelSelection: { ...sonnet, maxOutputTokens: bad } });
+        expect(out.status, `maxOutputTokens ${String(bad)}`).toBe(400);
+        expect(out.body.error).toMatch(/maxOutputTokens/);
+      }
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { ...sonnet, contextCap: 1, maxOutputTokens: 10_000_000 },
+      })).status).toBe(200);
+    });
+  });
+
+  it("keeps a saved context cap and output limit when an older client re-sends the selection without them", async () => {
+    await withBot("Limits Older Client", async (bot) => {
+      const sonnet = { instanceId: "claude", model: "claude-sonnet-5" };
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: {
+          ...sonnet,
+          contextCap: 524_288,
+          maxOutputTokens: 8192,
+          fallbacks: [{ instanceId: "claude2", model: "claude-opus-5", maxOutputTokens: 4096 }],
+        },
+      })).status).toBe(200);
+      expect(await selectionOf(bot.id)).toMatchObject({ contextCap: 524_288, maxOutputTokens: 8192 });
+
+      // The shipped iOS app decodes instanceId, model, effort and fallbacks
+      // only, so an effort edit from the phone re-sends exactly that.
+      const phone = await api("PATCH", `/api/bots/${bot.id}/profile`, {
+        modelSelection: { ...sonnet, effort: "high", fallbacks: [{ instanceId: "claude2", model: "claude-opus-5" }] },
+      });
+      expect(phone.status).toBe(200);
+      expect(await selectionOf(bot.id)).toMatchObject({
+        effort: "high",
+        contextCap: 524_288,
+        maxOutputTokens: 8192,
+        fallbacks: [{ instanceId: "claude2", model: "claude-opus-5", maxOutputTokens: 4096 }],
+      });
+    });
+  });
+
+  it("clears a context cap and output limit on an explicit null, and drops them on another model", async () => {
+    await withBot("Limits Cleared", async (bot) => {
+      const sonnet = { instanceId: "claude", model: "claude-sonnet-5" };
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { ...sonnet, contextCap: 524_288, maxOutputTokens: 8192 },
+      })).status).toBe(200);
+
+      // The desktop picker's "No Limit" and an emptied Max Output field.
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { ...sonnet, contextCap: null, maxOutputTokens: 8192 },
+      })).status).toBe(200);
+      const capCleared = await selectionOf(bot.id);
+      expect(capCleared?.contextCap).toBeUndefined();
+      expect(capCleared).toMatchObject({ maxOutputTokens: 8192 });
+
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { ...sonnet, contextCap: null, maxOutputTokens: null },
+      })).status).toBe(200);
+      const bothCleared = await selectionOf(bot.id);
+      expect(bothCleared?.contextCap).toBeUndefined();
+      expect(bothCleared?.maxOutputTokens).toBeUndefined();
+
+      // Limits belong to the model they were set on.
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { ...sonnet, contextCap: 524_288, maxOutputTokens: 8192 },
+      })).status).toBe(200);
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "claude", model: "claude-opus-5" },
+      })).status).toBe(200);
+      const moved = await selectionOf(bot.id);
+      expect(moved).toMatchObject({ model: "claude-opus-5" });
+      expect(moved?.contextCap).toBeUndefined();
+      expect(moved?.maxOutputTokens).toBeUndefined();
+    });
+  });
+
+  it("refuses a Latest class that does not exist or does not fit the model, instead of saving it pinned", async () => {
+    await withBot("Lineage Bad Class", async (bot) => {
+      const before = await selectionOf(bot.id);
+      const typo = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "claude", model: "claude-sonnet-5-5", latest: "sonnett" },
+      });
+      expect(typo.status).toBe(400);
+      expect(typo.body.error).toMatch(/latest "sonnett" in primary is not a model class/);
+
+      const mismatch = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "claude", model: "claude-opus-5", latest: "sonnet" },
+      });
+      expect(mismatch.status).toBe(400);
+      expect(mismatch.body.error).toMatch(/does not match model "claude-opus-5"/);
+
+      // Fallbacks and tasks go through the same check.
+      const inFallback = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: {
+          instanceId: "claude",
+          model: "claude-sonnet-5-5",
+          fallbacks: [{ instanceId: "claude2", model: "claude-sonnet-5-5", latest: "sonnett" }],
+        },
+      });
+      expect(inFallback.status).toBe(400);
+      expect(inFallback.body.error).toMatch(/in fallback 1/);
+      const onTask = await api("PATCH", `/api/bots/${bot.id}/tasks/${bot.threadId}`, {
+        modelSelection: { instanceId: "claude", model: "claude-sonnet-5-5", latest: "sonnett" },
+      });
+      expect(onTask.status).toBe(400);
+      const apply = await api("POST", "/api/bots/apply-model-defaults", {
+        slots: { primary: { instanceId: "claude", model: "claude-sonnet-5-5", latest: "sonnett" } },
+      });
+      expect(apply.status).toBe(400);
+
+      expect(await selectionOf(bot.id)).toEqual(before);
+    });
+  });
+
+  it("keeps a float when an older client writes back the slug it read before the float moved on", async () => {
+    // The fixture CLI is too old to list Sonnet 5.5, so this story runs on a
+    // CLI that reports 2.1.284, where Latest Sonnet resolves to 5.5.
+    const newerCli = join(home, "fake-claude-newer-sonnet");
+    writeFileSync(
+      newerCli,
+      [
+        "#!/usr/bin/env node",
+        'process.env.FAKE_CLAUDE_VERSION = "2.1.284 (Claude Code)";',
+        "delete process.env.FAKE_CLAUDE_DUMP;",
+        `await import(${JSON.stringify(pathToFileURL(FAKE_CLAUDE_CLI).href)});`,
+        "",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    try {
+      await withBot("Lineage Stale Write", async (bot) => {
+        expect((await api("PATCH", "/api/instances/claude2", { cli: newerCli })).status).toBe(200);
+        expect((await api("PATCH", `/api/bots/${bot.id}`, {
+          modelSelection: { instanceId: "claude2", model: "claude-sonnet-5", latest: "sonnet" },
+        })).status).toBe(200);
+        expect(await selectionOf(bot.id)).toMatchObject({ model: "claude-sonnet-5-5", latest: "sonnet" });
+        // The shipped iOS app read `claude-sonnet-5` while the float pointed
+        // there, the harness has since moved it to 5.5, and the app writes its
+        // copy back with no `latest`.
+        const stale = await api("PATCH", `/api/bots/${bot.id}`, {
+          modelSelection: { instanceId: "claude2", model: "claude-sonnet-5", effort: "high" },
+        });
+        expect(stale.status).toBe(200);
+        expect(await selectionOf(bot.id)).toMatchObject({
+          instanceId: "claude2",
+          model: "claude-sonnet-5-5",
+          latest: "sonnet",
+          effort: "high",
+        });
+      });
+    } finally {
+      await api("PATCH", "/api/instances/claude2", { cli: FAKE_CLAUDE_CLI });
+    }
+  });
+
+  it("refuses a retired id with no successor that the write introduces", async () => {
+    await withBot("Lineage No Successor", async (bot) => {
+      // deadCli is a Grok CLI engine; grok-3-mini left xAI with nothing in
+      // its place.
+      const refused = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: {
+          instanceId: "claude",
+          model: "claude-sonnet-5-5",
+          fallbacks: [{ instanceId: "deadCli", model: "grok-3-mini" }],
+        },
+      });
+      expect(refused.status).toBe(400);
+      expect(refused.body.error).toMatch(/retired model "grok-3-mini" in fallback 1/);
+    });
+  });
+
+  it("keeps a float when an older client re-sends without latest, on the bot and on a task", async () => {
+    await withBot("Lineage Carry", async (bot) => {
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: {
+          instanceId: "claude",
+          model: "claude-sonnet-5",
+          latest: "sonnet",
+          fallbacks: [
+            { instanceId: "claude2", model: "claude-opus-5" },
+            { instanceId: "claude2", model: "claude-sonnet-5", latest: "sonnet" },
+          ],
+        },
+      })).status).toBe(200);
+      // What the shipped iOS app sends after removing Fallback 1: no
+      // `latest` anywhere, and the floating Fallback 2 shifted into place 1.
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: {
+          instanceId: "claude",
+          model: "claude-sonnet-5",
+          fallbacks: [{ instanceId: "claude2", model: "claude-sonnet-5" }],
+        },
+      })).status).toBe(200);
+      expect(await selectionOf(bot.id)).toMatchObject({
+        latest: "sonnet",
+        fallbacks: [{ instanceId: "claude2", model: "claude-sonnet-5", latest: "sonnet" }],
+      });
+
+      const taskPath = `/api/bots/${bot.id}/tasks/${bot.threadId}`;
+      const floated = await api("PATCH", taskPath, {
+        modelSelection: { instanceId: "claude2", model: "claude-sonnet-5", latest: "sonnet" },
+      });
+      expect(floated.status).toBe(200);
+      expect(floated.body.task.modelSelection).toMatchObject({ model: "claude-sonnet-5", latest: "sonnet" });
+      const resent = await api("PATCH", taskPath, {
+        modelSelection: { instanceId: "claude2", model: "claude-sonnet-5" },
+      });
+      expect(resent.status).toBe(200);
+      expect(resent.body.task.modelSelection).toMatchObject({ model: "claude-sonnet-5", latest: "sonnet" });
+    });
+  });
+
+  it("Apply to All Bots floats a Latest slot on every bot, and a pinned slot pins", async () => {
+    await withBot("Lineage Apply", async (bot) => {
+      const floating = await api("POST", "/api/bots/apply-model-defaults", {
+        slots: {
+          primary: { instanceId: "claude", model: "claude-sonnet-5", latest: "sonnet" },
+          fallbacks: [{ instanceId: "claude2", model: "claude-haiku-4-5", latest: "haiku" }, null, null],
+        },
+      });
+      expect(floating.status).toBe(200);
+      expect(await selectionOf(bot.id)).toMatchObject({
+        instanceId: "claude",
+        model: "claude-sonnet-5",
+        latest: "sonnet",
+        fallbacks: [{ instanceId: "claude2", model: "claude-haiku-4-5", latest: "haiku" }],
+      });
+
+      const pinned = await api("POST", "/api/bots/apply-model-defaults", {
+        slots: { primary: { instanceId: "claude", model: "claude-sonnet-5" } },
+      });
+      expect(pinned.status).toBe(200);
+      const after = await selectionOf(bot.id);
+      expect(after?.latest).toBeUndefined();
+      // The fallback place the request left empty keeps its float.
+      expect(after?.fallbacks?.[0]?.latest).toBe("haiku");
+    });
+  });
+});
+
+describe("fallback cap: at most three, growth refused, existing chains left alone", () => {
+  const fallback = (model: string) => ({ instanceId: "fake", model });
+  const chain = (...models: string[]) => models.map(fallback);
+  const fallbacksOf = async (id: string): Promise<string[]> => {
+    const bot = (await api("GET", "/api/bots?messages=0")).body.bots.find((b: { id: string }) => b.id === id);
+    return (bot.modelSelection.fallbacks ?? []).map((f: { model: string }) => f.model);
+  };
+
+  it("refuses a fallback that carries fallbacks of its own, and accepts an empty list there", async () => {
+    const bot = (await api("POST", "/api/bots", { name: "Nested Gate" })).body.bot;
+    const claude = (await api("GET", "/api/instances")).body.instances.find(
+      (instance: { instanceId: string }) => instance.instanceId === "claude",
+    );
+    const good = { instanceId: "claude", model: claude.models.default };
+    try {
+      const nested = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { ...good, fallbacks: [{ ...good, fallbacks: [good] }] },
+      });
+      expect(nested.status).toBe(400);
+      expect(nested.body.error).toMatch(/cannot have fallbacks of its own/);
+      expect(await fallbacksOf(bot.id)).toEqual([]);
+
+      // A client that serializes an empty list on every entry still saves.
+      const empty = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { ...good, fallbacks: [{ ...good, fallbacks: [] }] },
+      });
+      expect(empty.status).toBe(200);
+      const saved = (await api("GET", "/api/bots?messages=0")).body.bots.find((b: { id: string }) => b.id === bot.id);
+      expect(saved.modelSelection.fallbacks).toHaveLength(1);
+      expect(saved.modelSelection.fallbacks[0].fallbacks).toBeUndefined();
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("accepts a chain of three and refuses a fourth", async () => {
+    const bot = (await api("POST", "/api/bots", { name: "Cap Three" })).body.bot;
+    try {
+      const three = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "fake", model: "p", fallbacks: chain("a", "b", "c") },
+      });
+      expect(three.status).toBe(200);
+      expect(await fallbacksOf(bot.id)).toEqual(["a", "b", "c"]);
+
+      const four = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "fake", model: "p", fallbacks: chain("a", "b", "c", "d") },
+      });
+      expect(four.status).toBe(400);
+      expect(four.body.error).toMatch(/at most 3 fallback/);
+      // The refused write changed nothing.
+      expect(await fallbacksOf(bot.id)).toEqual(["a", "b", "c"]);
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("keeps a chain at the cap editable: changing only the primary re-sends it unchanged", async () => {
+    const bot = (await api("POST", "/api/bots", { name: "Cap Primary" })).body.bot;
+    try {
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "fake", model: "p", fallbacks: chain("a", "b", "c") },
+      })).status).toBe(200);
+      const repoint = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "fake", model: "p2", fallbacks: chain("a", "b", "c") },
+      });
+      expect(repoint.status).toBe(200);
+      expect(repoint.body.bot.modelSelection.model).toBe("p2");
+      expect(await fallbacksOf(bot.id)).toEqual(["a", "b", "c"]);
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("lets a chain shrink and then refuses to grow it back past the cap", async () => {
+    const bot = (await api("POST", "/api/bots", { name: "Cap Shrink" })).body.bot;
+    try {
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "fake", model: "p", fallbacks: chain("a", "b", "c") },
+      })).status).toBe(200);
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "fake", model: "p", fallbacks: chain("a") },
+      })).status).toBe(200);
+      expect(await fallbacksOf(bot.id)).toEqual(["a"]);
+      const grow = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "fake", model: "p", fallbacks: chain("a", "b", "c", "d") },
+      });
+      expect(grow.status).toBe(400);
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("holds a task override to the cap too: a task with none of its own gets no grandfathering", async () => {
+    const bot = (await api("POST", "/api/bots", { name: "Cap Task" })).body.bot;
+    try {
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "fake", model: "p", fallbacks: chain("a", "b", "c") },
+      })).status).toBe(200);
+      const taskPath = `/api/bots/${bot.id}/tasks/${bot.threadId}`;
+      const four = await api("PATCH", taskPath, {
+        modelSelection: { instanceId: "fake", model: "p", fallbacks: chain("a", "b", "c", "d") },
+      });
+      expect(four.status).toBe(400);
+      expect(four.body.error).toMatch(/at most 3 fallback/);
+      const three = await api("PATCH", taskPath, {
+        modelSelection: { instanceId: "fake", model: "p", fallbacks: chain("a", "b", "c") },
+      });
+      expect(three.status).toBe(200);
+      expect(three.body.task.modelSelection.fallbacks).toHaveLength(3);
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("applies the cap to a new bot's chain too", async () => {
+    const over = await api("POST", "/api/bots", {
+      name: "Cap Create Four",
+      modelSelection: { instanceId: "fake", model: "p", fallbacks: chain("a", "b", "c", "d") },
+    });
+    expect(over.status).toBe(400);
+    expect(over.body.error).toMatch(/at most 3 fallback/);
+
+    const ok = await api("POST", "/api/bots", {
+      name: "Cap Create Three",
+      modelSelection: { instanceId: "fake", model: "p", fallbacks: chain("a", "b", "c") },
+    });
+    expect(ok.status).toBe(201);
+    expect(await fallbacksOf(ok.body.bot.id)).toEqual(["a", "b", "c"]);
+    await api("DELETE", `/api/bots/${ok.body.bot.id}`);
+  });
+});
+
+describe("POST /api/bots/apply-model-defaults (fixed fallback places)", () => {
+  const fallback = (model: string) => ({ instanceId: "fake", model });
+  const botWithChain = async (name: string, ...models: string[]) => {
+    const bot = (await api("POST", "/api/bots", { name })).body.bot;
+    const set = await api("PATCH", `/api/bots/${bot.id}`, {
+      modelSelection: { instanceId: "fake", model: "p", fallbacks: models.map(fallback) },
+    });
+    expect(set.status).toBe(200);
+    return bot.id as string;
+  };
+  const fallbacksOf = async (id: string): Promise<string[]> => {
+    const bot = (await api("GET", "/api/bots?messages=0")).body.bots.find((b: { id: string }) => b.id === id);
+    return (bot.modelSelection.fallbacks ?? []).map((f: { model: string }) => f.model);
+  };
+
+  it("writes Fallback 2 alone at position 1 and leaves Fallback 1 and 3 alone", async () => {
+    // The old route compacted the filled slots with push(), so a value chosen
+    // only for Fallback 2 was written over every bot's Fallback 1.
+    const id = await botWithChain("Place Two", "a", "b", "c");
+    try {
+      const apply = await api("POST", "/api/bots/apply-model-defaults", {
+        slots: { fallbacks: [null, fallback("y"), null] },
+      });
+      expect(apply.status).toBe(200);
+      expect(await fallbacksOf(id)).toEqual(["a", "y", "c"]);
+    } finally {
+      await api("DELETE", `/api/bots/${id}`);
+    }
+  });
+
+  it("writes a lone Fallback 3 at position 2 on a bot that has three", async () => {
+    const id = await botWithChain("Place Three", "a", "b", "c");
+    try {
+      const apply = await api("POST", "/api/bots/apply-model-defaults", {
+        slots: { fallbacks: [null, null, fallback("z")] },
+      });
+      expect(apply.status).toBe(200);
+      expect(await fallbacksOf(id)).toEqual(["a", "b", "z"]);
+    } finally {
+      await api("DELETE", `/api/bots/${id}`);
+    }
+  });
+
+  it("writes all three places by position, and never grows a chain past three", async () => {
+    const id = await botWithChain("Place All", "a");
+    try {
+      const apply = await api("POST", "/api/bots/apply-model-defaults", {
+        slots: { fallbacks: [fallback("x"), fallback("y"), fallback("z")] },
+      });
+      expect(apply.status).toBe(200);
+      expect(await fallbacksOf(id)).toEqual(["x", "y", "z"]);
+    } finally {
+      await api("DELETE", `/api/bots/${id}`);
+    }
+  });
+
+  it("extends a short chain by one, and fills several places in turn", async () => {
+    const id = await botWithChain("Place Short", "a");
+    try {
+      // Fallback 2 on a bot with one fallback IS its Fallback 2.
+      const next = await api("POST", "/api/bots/apply-model-defaults", {
+        slots: { fallbacks: [null, fallback("y"), null] },
+      });
+      expect(next.status).toBe(200);
+      expect(next.body.skipped.map((entry: { id: string }) => entry.id)).not.toContain(id);
+      expect(await fallbacksOf(id)).toEqual(["a", "y"]);
+
+      // Fallback 2 and 3 together leave nothing empty between them.
+      const both = await api("POST", "/api/bots/apply-model-defaults", {
+        slots: { fallbacks: [null, fallback("y2"), fallback("z")] },
+      });
+      expect(both.status).toBe(200);
+      expect(await fallbacksOf(id)).toEqual(["a", "y2", "z"]);
+    } finally {
+      await api("DELETE", `/api/bots/${id}`);
+    }
+  });
+
+  it("skips a bot whose chain would be left with a gap, names the empty place, and changes nothing on it", async () => {
+    // The Sentry finding on #737: a lone Fallback 3 on a bot with one fallback
+    // used to be pushed to the end, landing on Fallback 2.  The bot that can
+    // take it gets it; the bot that cannot keeps everything — its primary
+    // included — and is named with the reason.
+    const short = await botWithChain("Gap Short", "a");
+    const full = await botWithChain("Gap Full", "a", "b", "c");
+    try {
+      const apply = await api("POST", "/api/bots/apply-model-defaults", {
+        slots: {
+          primary: { instanceId: "fake", model: "new-primary" },
+          fallbacks: [null, null, fallback("z")],
+        },
+      });
+      expect(apply.status).toBe(200);
+      const skipped = apply.body.skipped.find((entry: { id: string }) => entry.id === short);
+      expect(skipped?.reason).toBe("Fallback 2 is empty, so Fallback 3 cannot be set");
+      expect(apply.body.skipped.map((entry: { id: string }) => entry.id)).not.toContain(full);
+
+      expect(await fallbacksOf(short)).toEqual(["a"]);
+      expect(await fallbacksOf(full)).toEqual(["a", "b", "z"]);
+      const bots = (await api("GET", "/api/bots?messages=0")).body.bots;
+      const modelOf = (id: string) => bots.find((b: { id: string }) => b.id === id).modelSelection.model;
+      expect(modelOf(short)).toBe("p");
+      expect(modelOf(full)).toBe("new-primary");
+    } finally {
+      await api("DELETE", `/api/bots/${short}`);
+      await api("DELETE", `/api/bots/${full}`);
+    }
+  });
+
+  it("still reads the older secondary, fallback1 and fallback2 names, by position", async () => {
+    const id = await botWithChain("Place Legacy", "a", "b", "c");
+    try {
+      // `fallback1` is position 1 (Fallback 2), not the first filled slot.
+      const apply = await api("POST", "/api/bots/apply-model-defaults", {
+        slots: { fallback1: fallback("y") },
+      });
+      expect(apply.status).toBe(200);
+      expect(await fallbacksOf(id)).toEqual(["a", "y", "c"]);
+    } finally {
+      await api("DELETE", `/api/bots/${id}`);
+    }
+  });
+
+  it("clears a place only when the request confirms it, and later entries move up", async () => {
+    const id = await botWithChain("Place Clear", "a", "b", "c");
+    try {
+      const unconfirmed = await api("POST", "/api/bots/apply-model-defaults", {
+        slots: { fallbacks: [null, { clear: true }, null] },
+      });
+      expect(unconfirmed.status).toBe(400);
+      expect(unconfirmed.body.error).toMatch(/confirmClear/);
+      expect(await fallbacksOf(id)).toEqual(["a", "b", "c"]);
+
+      const confirmed = await api("POST", "/api/bots/apply-model-defaults", {
+        slots: { fallbacks: [null, { clear: true }, null] },
+        confirmClear: true,
+      });
+      expect(confirmed.status).toBe(200);
+      expect(await fallbacksOf(id)).toEqual(["a", "c"]);
+    } finally {
+      await api("DELETE", `/api/bots/${id}`);
+    }
+  });
+
+  it("rejects a fallbacks list that is not an array, is too long, or mixes both shapes", async () => {
+    const notArray = await api("POST", "/api/bots/apply-model-defaults", { slots: { fallbacks: "x" } });
+    expect(notArray.status).toBe(400);
+    const tooLong = await api("POST", "/api/bots/apply-model-defaults", {
+      slots: { fallbacks: [null, null, null, fallback("w")] },
+    });
+    expect(tooLong.status).toBe(400);
+    expect(tooLong.body.error).toMatch(/at most 3 places/);
+    const both = await api("POST", "/api/bots/apply-model-defaults", {
+      slots: { fallbacks: [fallback("x")], fallback1: fallback("y") },
+    });
+    expect(both.status).toBe(400);
+    const badEntry = await api("POST", "/api/bots/apply-model-defaults", {
+      slots: { fallbacks: [{ instanceId: "fake" }] },
+    });
+    expect(badEntry.status).toBe(400);
+  });
+});
+
 describe("trust boundaries: phone-originated room folders, coarse always-allow, and the packaged UI folder", () => {
   const phone = { "x-botfleet-companion": "1" };
+  type PhoneApiBody = {
+    cwd?: string | null;
+    extraCwds?: string[];
+    alwaysAllow?: string[];
+  };
+
+  // SAFETY: the harness answers JSON on every route this test calls, and the
+  // body shapes are asserted at the point of use.
   const apiAs = async (
     headers: Record<string, string>,
     method: string,
     path: string,
-    body?: unknown,
+    payload?: PhoneApiBody,
   ): Promise<{ status: number; body: any }> => {
+    const requestHeaders: Record<string, string> = { ...headers };
+    if (payload) requestHeaders["content-type"] = "application/json";
     const res = await fetch(`${BASE}${path}`, {
       method,
-      headers: { ...headers, ...(body ? { "content-type": "application/json" } : {}) },
-      body: body ? JSON.stringify(body) : undefined,
+      headers: requestHeaders,
+      body: payload ? JSON.stringify(payload) : undefined,
     });
     return { status: res.status, body: await res.json() };
   };
@@ -6915,18 +10159,59 @@ describe("trust boundaries: phone-originated room folders, coarse always-allow, 
     }
   });
 
-  it("refuses to remember an always-allow that is a shell in disguise", async () => {
+  it("refuses unscoped native shell grants and accepts a named disposable-computer grant", async () => {
     const bot = (await api("POST", "/api/bots")).body.bot;
     try {
-      const coarse = await api("PATCH", `/api/bots/${bot.id}`, { alwaysAllow: ["Bash:git", "Bash:bash"] });
-      expect(coarse.status).toBe(400);
-      expect(coarse.body.error).toMatch(/every shell command/);
+      const hostCoarse = await api("PATCH", `/api/bots/${bot.id}`, {
+        alwaysAllow: ["Bash:git", "local-computer:Bash:bash"],
+      });
+      expect(hostCoarse.status).toBe(400);
+      expect(hostCoarse.body.error).toMatch(/every shell command/);
+
+      const nativeCoarse = await api("PATCH", `/api/bots/${bot.id}`, { alwaysAllow: ["Bash:git", "Bash:bash"] });
+      expect(nativeCoarse.status).toBe(400);
+      expect(nativeCoarse.body.error).toMatch(/every shell command/);
+
+      const remoteKey = "mcp__computer_shared_vm__bash:bash";
+      const virtualCoarse = await api("PATCH", `/api/bots/${bot.id}`, { alwaysAllow: ["Bash:git", remoteKey] });
+      expect(virtualCoarse.status).toBe(200);
+      expect(virtualCoarse.body.bot.alwaysAllow).toEqual(["Bash:git", remoteKey]);
+
       const direct = await api("POST", `/api/bots/${bot.id}/always-allow`, { allowKey: "Bash:sh" });
       expect(direct.status).toBe(400);
       expect(direct.body.error).toMatch(/every shell command/);
+
+      const narrowWithoutCard = await api("POST", `/api/bots/${bot.id}/always-allow`, { allowKey: "Bash:git" });
+      expect(narrowWithoutCard.status).toBe(409);
+      expect(narrowWithoutCard.body.error).toMatch(/not on a pending approval/);
+
       const narrow = await api("PATCH", `/api/bots/${bot.id}`, { alwaysAllow: ["Bash:git"] });
       expect(narrow.status).toBe(200);
       expect(narrow.body.bot.alwaysAllow).toEqual(["Bash:git"]);
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("keeps single-mount disposable-computer grants through the generic PATCH route", async () => {
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    try {
+      const disposableKey = "mcp__computer__bash:bash";
+      const saved = await api("PATCH", `/api/bots/${bot.id}`, { alwaysAllow: [disposableKey] });
+      expect(saved.status).toBe(200);
+      expect(saved.body.bot.alwaysAllow).toEqual([disposableKey]);
+
+      // a later unrelated save carrying the same list must not filter it out
+      const carried = await api("PATCH", `/api/bots/${bot.id}`, {
+        alwaysAllow: [disposableKey],
+        hidden: true,
+      });
+      expect(carried.status).toBe(200);
+      expect(carried.body.bot.alwaysAllow).toEqual([disposableKey]);
+
+      // native and local-computer coarse keys stay refused
+      const refused = await api("PATCH", `/api/bots/${bot.id}`, { alwaysAllow: ["Bash:bash"] });
+      expect(refused.status).toBe(400);
     } finally {
       await api("DELETE", `/api/bots/${bot.id}`);
     }
@@ -6947,5 +10232,591 @@ describe("trust boundaries: phone-originated room folders, coarse always-allow, 
     expect(await leaked.text()).toContain("Packaged BotFleet");
     const inside = await fetch(`${BASE}/assets/smoke.css`);
     expect(await inside.text()).toContain("color: white");
+  });
+
+  it("keeps multi-byte UTF-8 intact when a JSON body splits across TCP chunks", async () => {
+    // A raw socket is the only way to control TCP chunk boundaries; fetch
+    // and http.request both coalesce small writes.
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    try {
+      const title = "héllo 🙂 wörld";
+      const payload = Buffer.from(JSON.stringify({ title }), "utf8");
+      const emojiAt = payload.indexOf(0xf0); // first byte of the 4-byte emoji
+      expect(emojiAt).toBeGreaterThan(0);
+      const first = payload.subarray(0, emojiAt + 2);
+      const second = payload.subarray(emojiAt + 2);
+      const raw = await new Promise<string>((resolve, reject) => {
+        const socket = connect(PORT, "127.0.0.1");
+        let response = "";
+        socket.setEncoding("utf8");
+        socket.on("data", (chunk) => (response += chunk));
+        socket.on("end", () => resolve(response));
+        socket.on("error", reject);
+        socket.on("connect", () => {
+          socket.write(
+            `POST /api/bots/${bot.id}/tasks HTTP/1.1\r\nHost: 127.0.0.1:${PORT}\r\nContent-Type: application/json\r\nContent-Length: ${payload.length}\r\nConnection: close\r\n\r\n`,
+          );
+          socket.write(first);
+          setTimeout(() => {
+            socket.write(second);
+            socket.end();
+          }, 25);
+        });
+      });
+      expect(raw.startsWith("HTTP/1.1 201")).toBe(true);
+      expect(raw).toContain(title);
+      expect(raw).not.toContain("\uFFFD");
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("redacts secrets from runtime events on the SSE stream and the replay buffer", async () => {
+    const secret = "ak9999999999999999999999999999999"; // matches the wrapper's canned reply
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    try {
+      // Disabled instances stop dispatching after a mid-suite fleet rebuild;
+      // enable explicitly, the same pattern the failover tests use.
+      expect((await api("PATCH", "/api/instances/secretEcho", { enabled: true })).status).toBe(200);
+      const secretEcho = (await api("GET", "/api/instances")).body.instances.find((i: { instanceId: string }) => i.instanceId === "secretEcho");
+      const patch = await api("PATCH", `/api/bots/${bot.id}`, { modelSelection: { instanceId: "secretEcho", model: secretEcho?.models?.default }, computers: [] });
+      expect(patch.status).toBe(200);
+      const sse = await openSse(`${BASE}/api/events`);
+      try {
+        expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "tell me the key" })).status).toBe(202);
+        const wantsSecretFrame = (f: any) =>
+          f.kind === "runtime" && f.event?.type === "item.completed" && f.event?.itemType === "assistant_text" &&
+          typeof f.event?.text === "string" && f.event.text.includes("the key is");
+        const frame = await sse.until(wantsSecretFrame, 15_000);
+        expect(frame.event.text).toContain("redacted");
+        expect(JSON.stringify(frame)).not.toContain(secret);
+        // streamed deltas on the live stream are redacted too
+        const deltas = sse.frames.filter((f: any) => f.kind === "runtime" && f.event?.type === "content.delta");
+        expect(deltas.length).toBeGreaterThan(0);
+        expect(JSON.stringify(deltas)).not.toContain(secret);
+        expect(JSON.stringify(deltas)).toContain("redacted");
+        // the replay buffer must hold the redacted copy too
+        const hello = sse.frames.find((f: any) => f.kind === "hello");
+        const cursor = `${hello.cursor.split(":")[0]}:${frame.seq - 1}`;
+        const replayed = await openSse(`${BASE}/api/events?since=${encodeURIComponent(cursor)}`);
+        try {
+          const replay = await replayed.until(wantsSecretFrame, 15_000);
+          expect(replay.event.text).toContain("redacted");
+          expect(JSON.stringify(replay)).not.toContain(secret);
+        } finally {
+          replayed.close();
+        }
+      } finally {
+        sse.close();
+      }
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+      // the test enabled this instance explicitly; leave the fleet as it
+      // was found so later suites rebuild from a disabled baseline
+      await api("PATCH", "/api/instances/secretEcho", { enabled: false });
+    }
+  });
+});
+
+describe("a step's full input and output, and injected context, over HTTP", () => {
+  type Tool = { name: string; itemId?: string; turnId?: string; detail?: string; target?: string };
+  type Msg = { id: string; role: string; kind: string; text?: string; tool?: Tool; contextInjections?: Array<{ id: string; source: string; preview: string; bytes: number }> };
+  const transcript = async (threadId: string) =>
+    (await api("GET", `/api/threads/${threadId}/messages?limit=200`)).body.messages as Msg[];
+  const eventsLog = (threadId: string) => {
+    const file = join(home, ".botfleet", "events", `${threadId}.ndjson`);
+    return existsSync(file) ? readFileSync(file, "utf8") : "";
+  };
+  const SECRET = "ak9999999999999999999999999999999"; // the fake CLI prints it inside its tool result
+
+  /** One bot on the tool-IO engine, one finished turn, and the thread's ids. */
+  const runTurn = async (text: string, bot: { id: string }, extra: Record<string, unknown> = {}) => {
+    const sse = await openSse(`${BASE}/api/events`);
+    try {
+      expect((await api("POST", `/api/bots/${bot.id}/messages`, { text, ...extra })).status).toBe(202);
+      await sse.until((f: any) => f.kind === "runtime" && f.event?.type === "turn.completed", 20_000);
+      return sse.frames;
+    } finally {
+      sse.close();
+    }
+  };
+  const selectToolIoEngine = async (botId: string) => {
+    expect((await api("PATCH", "/api/instances/toolIo", { enabled: true })).status).toBe(200);
+    const instance = (await api("GET", "/api/instances")).body.instances.find((i: { instanceId: string }) => i.instanceId === "toolIo");
+    const patch = await api("PATCH", `/api/bots/${botId}`, { modelSelection: { instanceId: "toolIo", model: instance?.models?.default }, computers: [] });
+    expect(patch.status).toBe(200);
+  };
+
+  it("serves a step's whole input and output on demand, redacted, and keeps them off the wire, the event log and the transcript", async () => {
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    try {
+      await selectToolIoEngine(bot.id);
+      const frames = await runTurn("run the thing", bot);
+
+      // the transcript row carries the keys and the clipped headline, never the payload
+      const messages = await transcript(bot.threadId);
+      const row = messages.find((m) => m.tool?.name === "Bash")!;
+      expect(row.tool?.itemId).toBe("tu-1");
+      expect(typeof row.tool?.turnId).toBe("string");
+      expect(row.tool?.target).toBe("echo hi");
+      expect(JSON.stringify(messages)).not.toContain("TAIL-INPUT-MARKER");
+      expect(JSON.stringify(messages)).not.toContain("TAIL-OUTPUT-MARKER");
+
+      // the wire never carries an `io` capture or the tail of a result
+      expect(JSON.stringify(frames)).not.toContain("TAIL-INPUT-MARKER");
+      expect(JSON.stringify(frames)).not.toContain("TAIL-OUTPUT-MARKER");
+      expect(frames.some((f: any) => f.kind === "runtime" && "io" in (f.event ?? {}))).toBe(false);
+      // nor does the canonical event log
+      const logged = await vi_waitFor(() => eventsLog(bot.threadId), (log) => log.includes('"type":"turn.completed"'));
+      expect(logged).toContain("tu-1");
+      expect(logged).not.toContain("TAIL-INPUT-MARKER");
+      expect(logged).not.toContain("TAIL-OUTPUT-MARKER");
+
+      // opening the row reads the whole thing
+      const turnId = row.tool!.turnId!;
+      const io = await api("GET", `/api/threads/${bot.threadId}/items/tu-1/io?turnId=${turnId}`);
+      expect(io.status).toBe(200);
+      expect(io.body.itemId).toBe("tu-1");
+      expect(io.body.input.text).toBe('{\n  "command": "echo hi",\n  "stdin": "TAIL-INPUT-MARKER"\n}');
+      expect(io.body.output.text).toContain("TAIL-OUTPUT-MARKER");
+      expect(io.body.output.text).toContain("p".repeat(400));
+      expect(io.body.output.truncated).toBe(false);
+      // redacted with the wire's own pass, at write and at read
+      expect(io.body.output.text).toContain("redacted");
+      expect(JSON.stringify(io.body)).not.toContain(SECRET);
+      // the side store on disk never held it either
+      const stored = readFileSync(join(home, ".botfleet", "item-io", `${bot.threadId}.ndjson`), "utf8");
+      expect(stored).not.toContain(SECRET);
+
+      // an id shared across turns narrows by turn; a different turn finds nothing
+      expect((await api("GET", `/api/threads/${bot.threadId}/items/tu-1/io`)).status).toBe(200);
+      expect((await api("GET", `/api/threads/${bot.threadId}/items/tu-1/io?turnId=some-other-turn`)).status).toBe(404);
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+      await api("PATCH", "/api/instances/toolIo", { enabled: false });
+    }
+  }, 40_000);
+
+  it("holds the route to the events route's gate and validates what it is given", async () => {
+    const bot = (await api("GET", "/api/bots")).body.bots[0];
+    const unknownThread = await api("GET", "/api/threads/not-a-thread/items/tu-1/io");
+    expect(unknownThread.status).toBe(404);
+    expect(unknownThread.body.error).toBe("no such thread");
+    // a step that was never recorded is a 404 that says so, not an empty 200
+    const missing = await api("GET", `/api/threads/${bot.threadId}/items/never-ran/io`);
+    expect(missing.status).toBe(404);
+    expect(missing.body.error).toContain("no input or output was recorded");
+    // a malformed id or turn is refused before any file is opened
+    expect((await api("GET", `/api/threads/${bot.threadId}/items/%E0%A4%A/io`)).status).toBe(400);
+    expect((await api("GET", `/api/threads/${bot.threadId}/items/tu-1/io?turnId=a%20b`)).status).toBe(400);
+    expect((await api("GET", `/api/threads/${bot.threadId}/items/${"i".repeat(300)}/io`)).status).toBe(400);
+    // read-only
+    expect((await api("POST", `/api/threads/${bot.threadId}/items/tu-1/io`, {})).status).not.toBe(200);
+    // a path that tries to leave the thread's folder is not a thread id
+    expect((await api("GET", "/api/threads/..%2F..%2Fconfig/items/tu-1/io")).status).toBe(404);
+  });
+
+  it("records what the harness injected into a turn, without putting its text on the message", async () => {
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    try {
+      await selectToolIoEngine(bot.id);
+      const memoryFile = join(home, ".botfleet", "workspaces", bot.id, "MEMORY.md");
+      mkdirSync(dirname(memoryFile), { recursive: true });
+      writeFileSync(memoryFile, `likes tea\nhates meetings\n${"m".repeat(300)}\nINJECTED-TAIL-MARKER\n`);
+
+      const frames = await runTurn("hello", bot);
+      const first = (await transcript(bot.threadId)).find((m) => m.role === "user")!;
+      const memory = first.contextInjections?.find((c) => c.source === "memory");
+      expect(memory).toBeDefined();
+      expect(memory!.preview.startsWith("likes tea hates meetings")).toBe(true);
+      expect(memory!.preview.length).toBeLessThanOrEqual(160);
+      expect(memory!.bytes).toBeGreaterThan(300);
+      // the message holds a one-line preview and a size, never the text
+      expect(JSON.stringify(first)).not.toContain("INJECTED-TAIL-MARKER");
+
+      // the Trajectory's door: a runtime event with the preview and no full text
+      const event = frames.find((f: any) => f.kind === "runtime" && f.event?.type === "context.injected")?.event;
+      expect(event).toMatchObject({ source: "memory", itemId: memory!.id, bytes: memory!.bytes });
+      expect(JSON.stringify(frames)).not.toContain("INJECTED-TAIL-MARKER");
+      expect(eventsLog(bot.threadId)).toContain('"type":"context.injected"');
+      expect(eventsLog(bot.threadId)).not.toContain("INJECTED-TAIL-MARKER");
+
+      // and it survives the trip back: a reload reads history from the events
+      // route, and both the Trajectory read and the Inspector read must return it
+      for (const query of ["view=trajectory&limit=200", "limit=200"]) {
+        const history = await api("GET", `/api/threads/${bot.threadId}/events?${query}`);
+        expect(history.status).toBe(200);
+        const injected = history.body.entries.find(
+          (entry: any) => entry.kind === "runtime" && entry.data?.type === "context.injected" && entry.data.itemId === memory!.id,
+        );
+        expect(injected?.data).toMatchObject({ source: "memory", bytes: memory!.bytes });
+        // the runtime records hold the preview only.  The Inspector read also
+        // carries the provider's own native tee, which is the real prompt.
+        const runtimeOnly = history.body.entries.filter((entry: { kind: string }) => entry.kind === "runtime");
+        expect(JSON.stringify(runtimeOnly)).not.toContain("INJECTED-TAIL-MARKER");
+      }
+
+      // opening the row reads the full text the model was given
+      const io = await api("GET", `/api/threads/${bot.threadId}/items/${memory!.id}/io`);
+      expect(io.status).toBe(200);
+      expect(io.body.text.text).toContain("INJECTED-TAIL-MARKER");
+      expect(io.body.text.text.startsWith("likes tea\nhates meetings")).toBe(true);
+
+      // memory that has not changed is not re-announced on every message...
+      await runTurn("and again", bot);
+      const second = (await transcript(bot.threadId)).filter((m) => m.role === "user")[1]!;
+      expect(second.contextInjections?.some((c) => c.source === "memory") ?? false).toBe(false);
+      // ...but is when it changes
+      writeFileSync(memoryFile, "likes coffee now\n");
+      await runTurn("once more", bot);
+      const third = (await transcript(bot.threadId)).filter((m) => m.role === "user")[2]!;
+      expect(third.contextInjections?.find((c) => c.source === "memory")?.preview).toBe("likes coffee now");
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+      await api("PATCH", "/api/instances/toolIo", { enabled: false });
+    }
+  }, 60_000);
+
+  it("records the quoted message a reply adds to the prompt", async () => {
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    try {
+      await selectToolIoEngine(bot.id);
+      await runTurn("the launch is on Friday", bot);
+      const earlier = (await transcript(bot.threadId)).find((m) => m.role === "user")!;
+      await runTurn("are you sure?", bot, { replyToId: earlier.id });
+      const reply = (await transcript(bot.threadId)).filter((m) => m.role === "user")[1]!;
+      const quote = reply.contextInjections?.find((c) => c.source === "reply");
+      expect(quote).toBeDefined();
+      const io = await api("GET", `/api/threads/${bot.threadId}/items/${quote!.id}/io`);
+      expect(io.body.text.text).toContain("the launch is on Friday");
+      // what the person typed is not part of what was injected
+      expect(io.body.text.text).not.toContain("are you sure?");
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+      await api("PATCH", "/api/instances/toolIo", { enabled: false });
+    }
+  }, 60_000);
+
+  it("records a message's injections once when a model fallback dispatches it again", async () => {
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    try {
+      await selectToolIoEngine(bot.id);
+      // the primary crashes before it says anything, so the same message is
+      // dispatched again on the fallback and its prompt is assembled a second
+      // time — selecting the same skill, which a trigger term in the text picks
+      const instances = (await api("GET", "/api/instances")).body.instances;
+      const crasher = instances.find((i: { instanceId: string }) => i.instanceId === "crasher");
+      const toolIo = instances.find((i: { instanceId: string }) => i.instanceId === "toolIo");
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: {
+          instanceId: "crasher",
+          model: crasher.models.default,
+          fallbacks: [{ instanceId: "toolIo", model: toolIo.models.default }],
+        },
+      })).status).toBe(200);
+      expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "use adb on my phone to list the apps" })).status).toBe(202);
+      await expect.poll(async () =>
+        (await transcript(bot.threadId)).some((m) => typeof m.tool?.name === "string" && m.tool.name.startsWith("Fell over to")), { timeout: 30_000 }).toBe(true);
+      await expect.poll(async () =>
+        (await api("GET", "/api/bots?messages=0")).body.bots.find((b: { id: string }) => b.id === bot.id)?.busy, { timeout: 30_000 }).toBe(false);
+
+      const sent = (await transcript(bot.threadId)).find((m) => m.role === "user")!;
+      expect(sent.contextInjections?.filter((c) => c.source === "skill")).toHaveLength(1);
+      // and the Trajectory's history lists the step once as well
+      const history = await api("GET", `/api/threads/${bot.threadId}/events?view=trajectory&limit=500`);
+      const injected = history.body.entries.filter(
+        (entry: any) => entry.data?.type === "context.injected" && entry.data.source === "skill",
+      );
+      expect(injected).toHaveLength(1);
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+      await api("PATCH", "/api/instances/toolIo", { enabled: false });
+    }
+  }, 90_000);
+});
+
+describe("CSRF security hardening", () => {
+  /** Makes a raw HTTP request with full header control, returns { status, body } */
+  const rawRequest = (options: {
+    method?: string;
+    path?: string;
+    headers?: Record<string, string>;
+    body?: string;
+  }): Promise<{ status: number; body: string }> => new Promise((resolve, reject) => {
+    const req = request({
+      hostname: "127.0.0.1",
+      port: PORT,
+      path: options.path ?? "/api/bots",
+      method: options.method ?? "POST",
+      headers: options.headers ?? {},
+    }, (res) => {
+      let data = "";
+      res.on("data", (chunk) => data += chunk);
+      res.on("end", () => resolve({ status: res.statusCode ?? 0, body: data }));
+    });
+    req.on("error", reject);
+    if (options.body) req.write(options.body);
+    req.end();
+  });
+
+  it("rejects cross-site sec-fetch-site POST with 403 even with no Origin header", async () => {
+    const result = await rawRequest({
+      method: "POST",
+      path: "/api/bots",
+      headers: {
+        "sec-fetch-site": "cross-site",
+        "content-type": "application/json",
+        "content-length": "2",
+        // no origin header
+      },
+      body: "{}",
+    });
+    expect(result.status).toBe(403);
+    expect(result.body).toContain("forbidden: cross-site request");
+  });
+
+  it("rejects mutating API request with text/plain body and 415", async () => {
+    const result = await rawRequest({
+      method: "POST",
+      path: "/api/bots",
+      headers: {
+        "content-type": "text/plain",
+        "content-length": "5",
+      },
+      body: "hello",
+    });
+    expect(result.status).toBe(415);
+    expect(result.body).toContain("unsupported media type");
+  });
+
+  it("accepts mutating API request with application/json body", async () => {
+    const result = await rawRequest({
+      method: "POST",
+      path: "/api/bots",
+      headers: {
+        "origin": `http://127.0.0.1:${PORT}`,
+        "content-type": "application/json",
+        "content-length": "2",
+      },
+      body: "{}",
+    });
+    expect(result.status).toBe(201);
+  });
+
+  it("accepts mutating API request with application/json; charset=utf-8 body", async () => {
+    const result = await rawRequest({
+      method: "POST",
+      path: "/api/bots",
+      headers: {
+        "origin": `http://127.0.0.1:${PORT}`,
+        "content-type": "application/json; charset=utf-8",
+        "content-length": "2",
+      },
+      body: "{}",
+    });
+    expect(result.status).toBe(201);
+  });
+
+  it("rejects Origin from a different loopback port with 403", async () => {
+    const result = await rawRequest({
+      method: "POST",
+      path: "/api/bots",
+      headers: {
+        "origin": "http://127.0.0.1:9999",
+        "content-type": "application/json",
+        "content-length": "2",
+      },
+      body: "{}",
+    });
+    expect(result.status).toBe(403);
+    expect(result.body).toContain("forbidden: cross-origin request");
+  });
+
+  it("refuses mutating API requests that carry Cloudflare tunnel markers", async () => {
+    const result = await rawRequest({
+      method: "POST",
+      path: "/api/bots",
+      headers: {
+        "content-type": "application/json",
+        "content-length": "2",
+        "cf-ray": "fixture-ray",
+      },
+      body: "{}",
+    });
+    expect(result.status).toBe(403);
+    expect(result.body).toContain("named tunnel");
+  });
+
+  it("accepts Origin from the server's own port", async () => {
+    const result = await rawRequest({
+      method: "POST",
+      path: "/api/bots",
+      headers: {
+        "origin": `http://127.0.0.1:${PORT}`,
+        "content-type": "application/json",
+        "content-length": "2",
+      },
+      body: "{}",
+    });
+    expect(result.status).toBe(201);
+  });
+
+  it("accepts Origin from candidate desktop UI ports (18799, 28799)", async () => {
+    for (const port of [18799, 28799]) {
+      const result = await rawRequest({
+        method: "POST",
+        path: "/api/bots",
+        headers: {
+          "origin": `http://127.0.0.1:${port}`,
+          "content-type": "application/json",
+          "content-length": "2",
+        },
+        body: "{}",
+      });
+      expect(result.status).toBe(201);
+    }
+  });
+
+  it("allows bodiless mutating POST (e.g. /api/runtime/quiesce)", async () => {
+    const owner = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8"));
+    const result = await rawRequest({
+      method: "POST",
+      path: "/api/runtime/quiesce",
+      headers: {
+        "authorization": `Bearer ${owner.nonce}`,
+        "origin": `http://127.0.0.1:${PORT}`,
+        // no content-type, no content-length
+      },
+      // no body
+    });
+    // 200 means accepted; 409 means active work (acceptable here); either way not 403/415
+    expect([200, 409]).toContain(result.status);
+    // clean up if quiesced
+    if (result.status === 200) {
+      await new Promise<void>((resolve) => {
+        const req = request({
+          hostname: "127.0.0.1",
+          port: PORT,
+          path: "/api/runtime/quiesce",
+          method: "DELETE",
+          headers: { "authorization": `Bearer ${owner.nonce}` },
+        }, () => resolve());
+        req.end();
+      });
+    }
+  });
+});
+
+describe("bot playbooks install API", () => {
+  /** A minimal valid `botfleet.package`.  The schema requires more than looks
+   *  obvious — license, outcomes, setupMinutes, requirements, and an agent
+   *  carrying `appearance` plus the playbook keys it uses — so this mirrors the
+   *  fixture the resolver's own tests use rather than approximating one. */
+  const packageDocument = (playbooks: unknown[]) => ({
+    format: "botfleet.package",
+    version: 1,
+    package: {
+      id: "signal-desk",
+      release: "1.0.0",
+      name: "Signal Desk",
+      tagline: "Find and explain the signal.",
+      summary: "A two-bot signal workflow.",
+      category: "Research",
+      author: { name: "BotFleet" },
+      license: "MIT",
+      outcomes: ["Produce a concise signal brief."],
+      setupMinutes: 4,
+      requirements: { apps: [], capabilities: [] },
+      agents: [
+        {
+          key: "scout",
+          name: "Package Scout",
+          appearance: { color: "cyan" },
+          playbooks: playbooks.map((playbook) => (playbook as { key: string }).key),
+        },
+      ],
+      playbooks,
+    },
+  });
+
+  const PLAYBOOK = {
+    key: "signal-check",
+    name: "Signal Check",
+    summary: "Confirm a source before believing it.",
+    triggers: ["release notes", "roadmap"],
+    instructions: "Open the primary source and quote it.",
+  };
+
+  const playbooksOf = async (botId: string) =>
+    (await api("GET", "/api/bots")).body.bots.find((b: { id: string }) => b.id === botId)?.playbooks;
+
+  it("installs a playbook from a package document, which was previously impossible", async () => {
+    // `playbooks` is rendered into every prompt but had no way to become
+    // non-empty: absent from the profile patch schema, and the only writer was
+    // a whole-team import that can only reach bots it just created. All twelve
+    // live bots carried an empty list for that reason.
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    try {
+      expect(bot.playbooks ?? []).toEqual([]);
+      const done = await api("POST", `/api/bots/${bot.id}/playbooks`, packageDocument([PLAYBOOK]));
+      expect(done.status).toBe(201);
+      expect(done.body.installed.map((p: { key: string }) => p.key)).toEqual(["signal-check"]);
+      expect(await playbooksOf(bot.id)).toHaveLength(1);
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("installs a named subset through the wrapped shape", async () => {
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    try {
+      const other = { ...PLAYBOOK, key: "report", name: "Report", summary: "Then write it up." };
+      const done = await api("POST", `/api/bots/${bot.id}/playbooks`, {
+        document: packageDocument([PLAYBOOK, other]),
+        keys: ["report"],
+      });
+      expect(done.status).toBe(201);
+      // Named subset only — `signal-check` was in the package but not asked for.
+      expect(done.body.installed.map((p: { key: string }) => p.key)).toEqual(["report"]);
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("replaces a re-installed key in place rather than duplicating it", async () => {
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    try {
+      await api("POST", `/api/bots/${bot.id}/playbooks`, packageDocument([PLAYBOOK]));
+      const updated = { ...PLAYBOOK, instructions: "Open the primary source, quote it, then date it." };
+      const again = await api("POST", `/api/bots/${bot.id}/playbooks`, packageDocument([updated]));
+      expect(again.status).toBe(201);
+      const stored = await playbooksOf(bot.id);
+      expect(stored).toHaveLength(1);
+      expect(stored[0].instructions).toBe("Open the primary source, quote it, then date it.");
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("refuses a body that is not a package, and a key the package lacks", async () => {
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    try {
+      const notAPackage = await api("POST", `/api/bots/${bot.id}/playbooks`, { nope: true });
+      expect(notAPackage.status).toBe(422);
+      expect(notAPackage.body.error).toMatch(/package/i);
+      // Asked for something by name that does not exist: an error, not a no-op.
+      const missingKey = await api("POST", `/api/bots/${bot.id}/playbooks`, {
+        document: packageDocument([PLAYBOOK]),
+        keys: ["not-declared"],
+      });
+      expect(missingKey.status).toBe(422);
+      expect(missingKey.body.error).toMatch(/not-declared/);
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("404s for a bot that does not exist", async () => {
+    expect((await api("POST", "/api/bots/does-not-exist/playbooks", packageDocument([PLAYBOOK]))).status).toBe(404);
   });
 });

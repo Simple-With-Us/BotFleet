@@ -534,3 +534,170 @@ describe("getCachedLocalMiniMaxConfig", () => {
     expect(load).toHaveBeenCalledTimes(2);
   });
 });
+
+describe("applyMiniMaxBalanceToRegistry", () => {
+  // Local fresh-reset epoch, derived from now() instead of hardcoded, so CI
+  // run-anywhere keeps the cooldown non-expired (matches the convention
+  // antigravity-quota.test.ts established).
+  const FIVE_HOURS_MS = 5 * 60 * 60 * 1000;
+  const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+  const intervalEnd = Date.now() + FIVE_HOURS_MS;
+  const weeklyEnd = Date.now() + FIVE_HOURS_MS + SEVEN_DAYS_MS;
+
+  function accountBalanceSnapshot(balanceUsd: number): Awaited<ReturnType<typeof loadModule>> extends infer M ? M extends { getMiniMaxBalance: (...args: any) => Promise<infer S> } ? S : never : never {
+    // We don't actually call the network — applyMiniMaxBalanceToRegistry
+    // accepts any MiniMaxBalanceSnapshot. Build one with the same shape the
+    // production parseAccountBalanceResponse yields.
+    return {
+      source: "account-balance" as const,
+      capExists: balanceUsd != null,
+      status: balanceUsd <= 0 ? "capped" as const : "ok" as const,
+      balanceUsd,
+      remainingPercent: null,
+      secondaryRemainingPercent: null,
+      windowsLabel: undefined,
+      models: null,
+      resetsAt: null,
+      weeklyResetsAt: null,
+      fetchedAt: Date.now(),
+      error: null,
+    } as any;
+  }
+
+  function tokenPlanSnapshot(generalInterval: number, generalWeekly: number): any {
+    return {
+      source: "token-plan" as const,
+      capExists: true,
+      status: (generalInterval <= 0 || generalWeekly <= 0) ? "capped" as const : "ok" as const,
+      balanceUsd: null,
+      remainingPercent: generalInterval,
+      secondaryRemainingPercent: generalWeekly,
+      windowsLabel: "5hr/Week",
+      models: {
+        general: {
+          remainingPercent: generalInterval,
+          secondaryRemainingPercent: generalWeekly,
+          windowsLabel: "5hr/Week",
+          resetsAt: Math.min(intervalEnd, weeklyEnd),
+          intervalResetsAt: intervalEnd,
+          weeklyResetsAt: weeklyEnd,
+          intervalStatus: "active" as const,
+          weeklyStatus: "active" as const,
+        },
+        // An unrelated, healthy pool ("video") — must not trigger a
+        // cap when "general" is fine.
+        video: {
+          remainingPercent: 100,
+          secondaryRemainingPercent: 100,
+          windowsLabel: "5hr/Week",
+          resetsAt: intervalEnd,
+          intervalResetsAt: intervalEnd,
+          weeklyResetsAt: weeklyEnd,
+          intervalStatus: "active" as const,
+          weeklyStatus: "active" as const,
+        },
+      },
+      resetsAt: intervalEnd,
+      weeklyResetsAt: weeklyEnd,
+      fetchedAt: Date.now(),
+      error: null,
+    };
+  }
+
+  it("broadcasts a pay-as-you-go wallet cap to every bot reusing the instance", async () => {
+    const mod = await loadModule();
+    const { QuotaCooldownRegistry } = await import("./model-fallback.ts");
+    const registry = new QuotaCooldownRegistry();
+    const snapshot = accountBalanceSnapshot(0);
+    const applied = mod.applyMiniMaxBalanceToRegistry(snapshot as any, registry);
+    expect(applied.capped).toBe(true);
+    // ANY bot asking for the instance should see the wildcard cap —
+    // this is what stops bot B from re-paging the dead wallet that
+    // bot A just hit with 402 (board 555c5227).
+    const seenByBotB = registry.get("bot-b", "minimax", "MiniMax-M3");
+    expect(seenByBotB).toMatchObject({
+      botId: "*",
+      instanceId: "minimax",
+      model: "*",
+      error: "MiniMax account balance exhausted",
+      source: "minimax-account-balance",
+    });
+    // The account has no known reset time (recovery is a top-up, not a
+    // window); the registry falls back to a 15-min default TTL until
+    // the next describe() observes `status: "ok"` and clears it.
+    expect(seenByBotB?.resetsAt).toEqual(expect.any(Number));
+  });
+
+  it("broadcasts a Token Plan cap when general pool runs out on either window", async () => {
+    const mod = await loadModule();
+    const { QuotaCooldownRegistry } = await import("./model-fallback.ts");
+    const registry = new QuotaCooldownRegistry();
+    // Weekly window at 0% must trigger even though 5-hour stays fresh.
+    const snapshot = tokenPlanSnapshot(100, 0);
+    const applied = mod.applyMiniMaxBalanceToRegistry(snapshot, registry);
+    expect(applied.capped).toBe(true);
+    expect(registry.get("any-bot", "minimax", "MiniMax-M3")).toMatchObject({
+      botId: "*",
+      source: "minimax-account-balance",
+      error: "MiniMax Token Plan exhausted",
+      resetsAt: intervalEnd,
+    });
+  });
+
+  it("does NOT broadcast when only an unrelated pool (video) is exhausted", async () => {
+    const mod = await loadModule();
+    const { QuotaCooldownRegistry } = await import("./model-fallback.ts");
+    const registry = new QuotaCooldownRegistry();
+    const snapshot = {
+      source: "token-plan" as const,
+      capExists: true,
+      status: "ok" as const, // the snapshot's overall status stays ok —
+                             // only a non-general pool is gone.
+      balanceUsd: null,
+      remainingPercent: 100,
+      secondaryRemainingPercent: 100,
+      windowsLabel: "5hr/Week",
+      models: {
+        general: { remainingPercent: 100, secondaryRemainingPercent: 100,
+                   windowsLabel: "5hr/Week", resetsAt: intervalEnd,
+                   intervalResetsAt: intervalEnd, weeklyResetsAt: weeklyEnd,
+                   intervalStatus: "active" as const, weeklyStatus: "active" as const },
+        video: { remainingPercent: 0, secondaryRemainingPercent: 0,
+                 windowsLabel: "5hr/Week", resetsAt: intervalEnd,
+                 intervalResetsAt: intervalEnd, weeklyResetsAt: weeklyEnd,
+                 intervalStatus: "active" as const, weeklyStatus: "active" as const },
+      },
+      resetsAt: intervalEnd,
+      weeklyResetsAt: weeklyEnd,
+      fetchedAt: Date.now(),
+      error: null,
+    };
+    const applied = mod.applyMiniMaxBalanceToRegistry(snapshot, registry);
+    expect(applied.capped).toBe(false);
+    expect(registry.get("any-bot", "minimax", "MiniMax-M3")).toBeUndefined();
+  });
+
+  it("clears a previously broadcast cap once the balance recovers", async () => {
+    const mod = await loadModule();
+    const { QuotaCooldownRegistry } = await import("./model-fallback.ts");
+    const registry = new QuotaCooldownRegistry();
+    const capped = accountBalanceSnapshot(0);
+    mod.applyMiniMaxBalanceToRegistry(capped as any, registry);
+    expect(registry.get("any-bot", "minimax", "MiniMax-M3")).toBeDefined();
+    const recovered = accountBalanceSnapshot(12.34);
+    const applied = mod.applyMiniMaxBalanceToRegistry(recovered as any, registry);
+    expect(applied.capped).toBe(false);
+    expect(registry.get("any-bot", "minimax", "MiniMax-M3")).toBeUndefined();
+  });
+
+  it("does not touch cooldowns on a different instance", async () => {
+    const mod = await loadModule();
+    const { QuotaCooldownRegistry } = await import("./model-fallback.ts");
+    const registry = new QuotaCooldownRegistry();
+    registry.record({ botId: "grok-bot", instanceId: "grok", model: "grok-4",
+                      resetsAt: Date.now() + 60_000, error: "session limit",
+                      recordedAt: Date.now() });
+    mod.applyMiniMaxBalanceToRegistry(accountBalanceSnapshot(0) as any, registry);
+    expect(registry.get("grok-bot", "grok", "grok-4")).toBeDefined();
+  });
+});

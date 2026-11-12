@@ -5,12 +5,14 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import { cn } from "@/lib/cn";
 
 export function TurnPresence({
+  startedAt,
   avatar,
   visible,
   label = "Thinking",
   answering = false,
   modelMark,
   modelName,
+  actorName,
   children,
 }: {
   avatar: ReactNode;
@@ -19,6 +21,8 @@ export function TurnPresence({
   answering?: boolean;
   modelMark?: ReactNode;
   modelName?: string;
+  actorName?: string;
+  startedAt?: number;
   children?: ReactNode;
 }) {
   const [mounted, setMounted] = useState(visible);
@@ -28,14 +32,14 @@ export function TurnPresence({
 
   useEffect(() => {
     if (visible && phase === "think") {
-      setElapsed(0);
-      const start = Date.now();
+      const start = startedAt ?? Date.now();
+      setElapsed(Math.max(1, Math.floor((Date.now() - start) / 1000)));
       const timer = setInterval(() => {
         setElapsed(Math.max(1, Math.floor((Date.now() - start) / 1000)));
       }, 1000);
       return () => clearInterval(timer);
     }
-  }, [visible, phase]);
+  }, [visible, phase, startedAt]);
 
   useEffect(() => {
     if (visible) {
@@ -72,9 +76,17 @@ export function TurnPresence({
       >
         {avatar}
         {showWorking ? (
-          <span className="flex items-center gap-2" aria-live="polite">
-            <span className="thinking-shimmer animate-shimmer text-[13px] leading-none">
-              {label}{elapsed > 0 ? ` · ${elapsed}s` : ""}
+          <span className="flex items-center gap-2">
+            <span className="flex items-center gap-2" aria-live="polite">
+              {actorName ? (
+                <span className="text-[13px] font-semibold text-ink">
+                  {actorName}
+                </span>
+              ) : null}
+              <span className="thinking-shimmer animate-shimmer text-[13px] leading-none">
+                {label}
+                {elapsed > 0 ? <span aria-hidden="true">{` · ${elapsed}s`}</span> : null}
+              </span>
             </span>
             {modelName ? (
               <span className="flex items-center gap-1.5 text-[12px] leading-none text-ink-secondary">

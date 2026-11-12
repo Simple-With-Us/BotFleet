@@ -1,10 +1,40 @@
-import type { ModelSelection } from "./contracts.ts";
+import { EFFORT_LEVELS, type CloudBackend, type ModelSelection, type EffortLevel } from "./contracts.ts";
+import { modelEffortLevels } from "../src/lib/model-effort.ts";
+
+/** The bot's computer settings as they were when a turn was dispatched, which
+ * is what that turn mounted.  A later bot edit changes the stored grants but
+ * not the live mounts, so a provider disable must be judged against these. */
+export interface TurnComputerInputs {
+  computers: readonly ("cloud" | "vm" | "local")[] | undefined;
+  cloudBackend: CloudBackend | undefined;
+  /** The destination an automation dispatched the turn to: a cloud routine,
+   * webhook or resource trigger mounts the cloud computer whatever the bot's
+   * own computers say. */
+  runOn?: "bot" | "cloud";
+  /** The providers the turn actually mounted, once its computers resolved.
+   * Auto can fall back from an unavailable cloud computer to This Computer,
+   * so the grant alone over-counts what the turn holds. */
+  mounted?: readonly ("asciiBox" | "selfHostedVps" | "localVm" | "localMac")[];
+}
 
 export interface ActiveTurnOwner {
   dispatchId: number;
+  /** Monotonic dispatch time, including provider setup and retry backoff. */
+  startedAtMs: number;
+  /** Available only after this exact dispatch settles. */
+  latencyMs?: number;
   botId: string;
   selection: ModelSelection;
   fallbackPolicy: ModelSelection;
+  computerInputs?: TurnComputerInputs;
+  /** What started the turn when nobody typed it: `job` is a background
+   *  job's wake, whose cost is counted on its own (server/jobs/wake-usage.ts). */
+  automationSource?: string;
+  /** Set when a settings change took away a provider this dispatch holds or
+   * could reach.  A dispatch that has not reached its provider yet has no
+   * session to interrupt, so its own pre-dispatch checks must see this and
+   * stop instead of starting the turn with the revoked mount. */
+  revoked?: boolean;
 }
 
 /** The engine/model that owns each live dispatch.  A fallback is a per-turn
@@ -16,8 +46,13 @@ export class ActiveTurnOwners {
   private readonly byThread = new Map<string, Map<string, ActiveTurnOwner>>();
   private readonly latestDispatchByThread = new Map<string, number>();
   private nextDispatchId = 1;
+  private readonly now: () => number;
 
-  claim(threadId: string, owner: Omit<ActiveTurnOwner, "dispatchId">): ActiveTurnOwner {
+  constructor(now: () => number = () => performance.now()) {
+    this.now = now;
+  }
+
+  claim(threadId: string, owner: Omit<ActiveTurnOwner, "dispatchId" | "startedAtMs" | "latencyMs">): ActiveTurnOwner {
     let owners = this.byThread.get(threadId);
     if (!owners) {
       owners = new Map();
@@ -28,7 +63,7 @@ export class ActiveTurnOwners {
         `thread ${threadId} already has a live turn on provider instance ${owner.selection.instanceId}`,
       );
     }
-    const claimed = { ...owner, dispatchId: this.nextDispatchId++ };
+    const claimed = { ...owner, dispatchId: this.nextDispatchId++, startedAtMs: this.now() };
     owners.set(owner.selection.instanceId, claimed);
     this.latestDispatchByThread.set(threadId, claimed.dispatchId);
     return claimed;
@@ -48,6 +83,11 @@ export class ActiveTurnOwners {
     return owners.size === 1 ? owners.values().next().value : undefined;
   }
 
+  /** The provider instances with a live dispatch on this thread. */
+  instancesOn(threadId: string): string[] {
+    return [...(this.byThread.get(threadId)?.keys() ?? [])];
+  }
+
   current(threadId: string): ActiveTurnOwner | undefined {
     const owners = this.byThread.get(threadId);
     if (!owners) return undefined;
@@ -65,6 +105,42 @@ export class ActiveTurnOwners {
     return latest;
   }
 
+  /** Record what a live dispatch actually mounted.  A dispatch that has
+   * already settled, or been replaced, is left alone. */
+  recordMounted(threadId: string, dispatchId: number, mounted: NonNullable<TurnComputerInputs["mounted"]>): void {
+    const owners = this.byThread.get(threadId);
+    if (!owners) return;
+    for (const owner of owners.values()) {
+      if (owner.dispatchId !== dispatchId) continue;
+      owner.computerInputs = {
+        ...(owner.computerInputs ?? { computers: undefined, cloudBackend: undefined }),
+        mounted: [...mounted],
+      };
+    }
+  }
+
+  /** Fence one exact dispatch after its computer access was revoked.  A
+   * dispatch that already settled, or was replaced, is left alone. */
+  revoke(threadId: string, dispatchId: number): boolean {
+    const owners = this.byThread.get(threadId);
+    if (!owners) return false;
+    for (const owner of owners.values()) {
+      if (owner.dispatchId !== dispatchId) continue;
+      owner.revoked = true;
+      return true;
+    }
+    return false;
+  }
+
+  isRevoked(threadId: string, dispatchId: number): boolean {
+    const owners = this.byThread.get(threadId);
+    if (!owners) return false;
+    for (const owner of owners.values()) {
+      if (owner.dispatchId === dispatchId) return owner.revoked === true;
+    }
+    return false;
+  }
+
   threadForBot(botId: string): string | undefined {
     return this.forBot(botId)?.threadId;
   }
@@ -72,6 +148,8 @@ export class ActiveTurnOwners {
   settle(threadId: string, providerInstanceId?: string): ActiveTurnOwner | undefined {
     const owner = this.forEvent(threadId, providerInstanceId);
     if (!owner) return undefined;
+    const elapsed = this.now() - owner.startedAtMs;
+    if (Number.isFinite(elapsed) && elapsed >= 0) owner.latencyMs = Math.round(elapsed);
     const owners = this.byThread.get(threadId)!;
     owners.delete(owner.selection.instanceId);
     if (owners.size === 0) this.byThread.delete(threadId);
@@ -87,16 +165,39 @@ export interface ExactTurnLease {
   readonly botId: string;
   readonly threadId: string;
   readonly dispatchId: number;
+  /** The resource this lease guards.  When set, mutual exclusion is keyed
+   *  by targetKey rather than botId — typically one occupancy key per bot
+   *  on a shared VPS container so several bots can run concurrently. */
+  readonly targetKey?: string;
 }
 
 /** A resource marker owned by one exact dispatch.  A later turn may reuse the
  * same bot and thread before an older asynchronous finalizer finishes, so a
- * thread id alone is not an ownership token. */
+ * thread id alone is not an ownership token.
+ *
+ * When `targetKey` is provided, mutual exclusion is by that key rather than
+ * by bot id alone — two different bots sharing one occupancy key are refused,
+ * while distinct per-bot keys on one shared container can coexist. */
 export class ExactTurnLeases {
   private readonly byBot = new Map<string, ExactTurnLease>();
+  private readonly byTarget = new Map<string, ExactTurnLease>();
 
-  claim(botId: string, threadId: string, dispatchId: number): ExactTurnLease {
-    const lease = { botId, threadId, dispatchId };
+  /** Claim a lease.  When `targetKey` is provided, the claim is keyed by
+   *  that target: if another bot already holds the same target, `null` is
+   *  returned (the caller should throw a user-facing 409).  A successor on
+   *  the same bot+thread replaces the previous lease. */
+  claim(botId: string, threadId: string, dispatchId: number, targetKey?: string): ExactTurnLease | null {
+    const lease: ExactTurnLease = { botId, threadId, dispatchId, targetKey };
+    if (targetKey) {
+      const existing = this.byTarget.get(targetKey);
+      // A different bot already on this desktop: refuse (shared mutual exclusion).
+      // The same bot replaces — successor on the same thread, or recovery when a
+      // prior turn's release never ran and left a stale byTarget entry.  The
+      // historical byBot map always overwrote per bot id; keeping that for the
+      // owning bot avoids a permanent self-block after a missed cleanup.
+      if (existing && existing.botId !== botId) return null;
+      this.byTarget.set(targetKey, lease);
+    }
     this.byBot.set(botId, lease);
     return lease;
   }
@@ -109,12 +210,24 @@ export class ExactTurnLeases {
     return this.byBot.has(botId);
   }
 
+  hasTarget(targetKey: string): boolean {
+    return this.byTarget.has(targetKey);
+  }
+
   release(lease: ExactTurnLease): boolean {
     if (this.byBot.get(lease.botId) !== lease) return false;
-    return this.byBot.delete(lease.botId);
+    this.byBot.delete(lease.botId);
+    if (lease.targetKey && this.byTarget.get(lease.targetKey) === lease) {
+      this.byTarget.delete(lease.targetKey);
+    }
+    return true;
   }
 
   clearBot(botId: string): void {
+    const lease = this.byBot.get(botId);
+    if (lease?.targetKey && this.byTarget.get(lease.targetKey) === lease) {
+      this.byTarget.delete(lease.targetKey);
+    }
     this.byBot.delete(botId);
   }
 
@@ -221,7 +334,48 @@ export interface AutoFallbackCandidate {
       models?: Record<string, { capped: boolean }>;
     };
   };
-  models: { default: string };
+  driverKind?: string;
+  capabilities?: {
+    effortLevels?: readonly string[];
+    computerMcp?: boolean;
+    localComputerMcp?: boolean;
+    composioMcp?: boolean;
+    agentsMcp?: boolean;
+    phoneMcp?: boolean;
+    images?: boolean;
+    queueing?: boolean;
+    toolLoop?: boolean;
+  };
+  /** Which computer destinations this engine can be given at all, shipped by
+   *  the registry's describe() so failover filters instead of restating it. */
+  computerReach?: Partial<Record<"box" | "vps" | "vm" | "local", boolean>>;
+  models: {
+    default: string;
+    options?: ReadonlyArray<{ id: string; effortLevels?: readonly EffortLevel[]; supportsEffort?: boolean }>;
+  };
+}
+
+/** Fit the failing dispatch's effort to what the fallback model offers.  The
+ * turn-start check 409s an effort the model does not list (max on a Codex
+ * model that tops out at xhigh), which would lose the turn the failover was
+ * meant to save.  Keep a supported effort as-is, otherwise step down to the
+ * highest offered level below it, otherwise send no effort. */
+function fallbackEffort(candidate: AutoFallbackCandidate, effort: EffortLevel | undefined): EffortLevel | undefined {
+  if (!effort) return undefined;
+  const model = candidate.models.default;
+  const allowed = modelEffortLevels(
+    {
+      driverKind: candidate.driverKind,
+      capabilities: { effortLevels: candidate.capabilities?.effortLevels as readonly EffortLevel[] | undefined },
+    },
+    candidate.models.options?.find((option) => option.id === model),
+    model,
+  );
+  if (allowed.includes(effort)) return effort;
+  const requested = EFFORT_LEVELS.indexOf(effort);
+  return [...allowed]
+    .filter((level) => EFFORT_LEVELS.indexOf(level) < requested)
+    .sort((a, b) => EFFORT_LEVELS.indexOf(b) - EFFORT_LEVELS.indexOf(a))[0];
 }
 
 /** Preserve the existing one-hop automatic failover while refusing candidates
@@ -231,10 +385,17 @@ export function eligibleAutoFallbackChain(
   input: {
     botId: string;
     currentInstanceId: string;
+    effort?: EffortLevel;
+    /** Computer destinations the failing turn holds; a fallback that cannot
+     *  reach every one of them would lose the turn's computer tools, so it
+     *  is not a fallback at all (E5).  A candidate without a shipped reach
+     *  predates the field and stays eligible, matching the old behavior. */
+    requires?: Partial<Record<"box" | "vps" | "vm" | "local", boolean>>;
     isCooling: (botId: string, instanceId: string, model: string) => boolean;
     priority: readonly string[];
   },
 ): ModelSelection[] {
+  const needed = (["box", "vps", "vm", "local"] as const).filter((kind) => input.requires?.[kind] === true);
   const viable = candidates
     .map((candidate, order) => ({ candidate, order }))
     .filter(({ candidate }) => {
@@ -247,7 +408,8 @@ export function eligibleAutoFallbackChain(
         candidate.snapshot.quota?.capped !== true &&
         candidate.snapshot.quota?.models?.[model]?.capped !== true &&
         Boolean(model) &&
-        !input.isCooling(input.botId, candidate.instanceId, model)
+        !input.isCooling(input.botId, candidate.instanceId, model) &&
+        needed.every((kind) => candidate.computerReach?.[kind] !== false)
       );
     })
     .sort((a, b) => {
@@ -258,7 +420,11 @@ export function eligibleAutoFallbackChain(
       return rank(a.candidate.instanceId) - rank(b.candidate.instanceId) || a.order - b.order;
     });
   const pick = viable[0]?.candidate;
-  return pick ? [{ instanceId: pick.instanceId, model: pick.models.default }] : [];
+  if (!pick) return [];
+  const selection: ModelSelection = { instanceId: pick.instanceId, model: pick.models.default };
+  const effort = fallbackEffort(pick, input.effort);
+  if (effort) selection.effort = effort;
+  return [selection];
 }
 
 export interface ThreadRuntimeInstance {
@@ -335,6 +501,22 @@ export function inspectThreadOwners(
     }
   }
   return { owners, inspectionFailed };
+}
+
+/** How far an auto-review stop reaches (server/index.ts
+ * `stopTurnForReview`).  `instance` stops only the engine that took the
+ * refused step and closes only its cards: another engine is live on the same
+ * thread, which is a room running two members at once, and stopping the
+ * thread would stop a member the reviewer never refused.  `thread` is the
+ * person's own Stop, which also settles in-process asks and peer approvals:
+ * the step's engine has the thread to itself, or the step did not say which
+ * engine took it, so the only safe stop is all of it. */
+export function reviewStopScope(args: {
+  instanceId: string | undefined;
+  liveInstanceIds: readonly string[];
+}): "instance" | "thread" {
+  if (!args.instanceId) return "thread";
+  return args.liveInstanceIds.some((id) => id !== args.instanceId) ? "instance" : "thread";
 }
 
 export async function interruptThreadOwners(

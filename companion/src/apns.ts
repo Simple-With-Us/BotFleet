@@ -1,10 +1,19 @@
 // Closed-app wake: when a paired phone has no live SSE stream, the sidecar
 // sends an APNs alert so iOS can relaunch the companion.  The .p8 never
 // leaves this process; tests inject sendImpl.
+import { connect as http2Connect, constants as http2Constants, type ClientHttp2Session, type ClientHttp2Stream } from "node:http2";
 import { createHash, createPrivateKey, sign as cryptoSign } from "node:crypto";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { execFile } from "node:child_process";
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
+
+import { isFiniteJsonNumber, isJsonObject, isJsonString, type JsonObject, type JsonValue } from "./json.ts";
+import { DATA_DIR, writeFileAtomic } from "./state.ts";
+import { loadScopedApnsMaterial, resetScopedApnsCache, type ApnsScopedBinding } from "./apns-scoped-binding.ts";
+
+export type { ApnsScopedBinding };
 
 export interface ApnsConfig {
   keyId: string;
@@ -14,36 +23,302 @@ export interface ApnsConfig {
   production: boolean;
 }
 
-/** Where the signing key lives.  The path, never the contents. */
-export function apnsKeyPath(): string {
-  const keyId = process.env.APNS_KEY_ID?.trim() || "N3949G7CN6";
-  return process.env.APNS_P8_PATH?.trim() || join(homedir(), ".secrets", `AuthKey_${keyId}.p8`);
+/** The fleet's shared APNs key (Simple With Us team CC8UTF7ATG), used when
+ * neither the environment nor Infisical names another one (AFC-359). */
+export const SHARED_APNS_KEY_ID = "HSJ98QN95V";
+/** Fleet-OPS root names of the shared key:  references into `/apns`, so a
+ * rotation there reaches the sidecar without a code change. */
+export const SHARED_APNS_KEY_ID_NAME = "APNS_KEY_ID";
+export const SHARED_APNS_P8_NAME = "APNS_KEY_P8";
+
+/** The Infisical name of an APNs signing key.  With no key id it is the
+ * shared key (`APNS_KEY_P8`);  a key pinned by `APNS_KEY_ID` in the
+ * environment is read as `AUTHKEY_<KEY_ID>`, one per Apple key (AFC-359: the
+ * retired secrets folder is never read). */
+export function apnsVaultName(keyId?: string): string {
+  return keyId ? `AUTHKEY_${keyId}` : SHARED_APNS_P8_NAME;
 }
 
-/** A fingerprint of the key FILE — modification time and size, never a
- * byte of the key itself.  Cheap enough to take every few minutes, and
- * enough to notice a rotated .p8 that kept its path. */
-export function apnsKeyStamp(path = apnsKeyPath()): string | null {
+/** The key id pinned in the environment, if any. */
+function pinnedKeyId(): string | undefined {
+  return process.env.APNS_KEY_ID?.trim() || undefined;
+}
+
+/** The `fleet-secrets` binary.  `FLEET_SECRETS_BIN` is the test seam. */
+function fleetSecretsBin(): string {
+  return process.env.FLEET_SECRETS_BIN?.trim() || join(homedir(), ".local", "bin", "fleet-secrets");
+}
+
+/** How long a key read from Infisical is trusted before it is read again.
+ * The sidecar re-checks the key every few minutes; one `fleet-secrets` call
+ * per window is enough to notice a rotation without a process per tick. */
+export const APNS_VAULT_CACHE_MS = 4 * 60 * 1000;
+/** A failed read is retried sooner: a Mac that was still booting should not
+ *  keep pushes off for a whole window.  The window is measured from the moment
+ *  the read FINISHED, so a read that runs longer than the window cannot expire
+ *  its own failure entry and trigger an immediate second blocking read. */
+export const APNS_VAULT_RETRY_MS = 30_000;
+
+/** The slowest `fleet-secrets` read measured on the fleet Mac (2026-10-19):
+ *  3.6-5.3 s warm, 16.6 s with a cold cache.  The ceiling below is derived
+ *  from this number rather than picked by feel, so re-measuring retunes the
+ *  guard instead of leaving a magic constant behind. */
+export const APNS_VAULT_READ_BUDGET_MS = 16_600;
+
+/** How long one `fleet-secrets` read may take before it counts as failed.
+ *
+ * The read is an Infisical round-trip, not a local file read.  A ceiling below
+ * the vault's own latency does not slow the sidecar down — it removes the
+ * key:  the read is killed, the failure looks like "no key", and the sidecar
+ * turns APNs pushes OFF.  That is exactly what the old 10 s ceiling did to a
+ * cold-cache read.  Three times the measured worst case leaves room for a
+ * slower network without letting a wedged read hang the key path. */
+export const APNS_VAULT_READ_TIMEOUT_MS = 3 * APNS_VAULT_READ_BUDGET_MS;
+
+/** A finite, positive integer from the environment, or the fallback.
+ *
+ * Both failure modes here are the same one:  the value stops being a sensible
+ * timeout and the read stops working, which the sidecar reads as "no key" and
+ * turns APNs pushes off.  `Number("-1")` is a number, so a negative value
+ * sails through a `|| fallback` and becomes a timeout that fires instantly.
+ * `Number("0.5")` is a number too, and Node's `execFile` rejects a
+ * fractional timeout with ERR_OUT_OF_RANGE — so the read throws, the catch
+ * swallows it, and the key silently disappears. */
+function positiveIntegerEnv(name: string, fallback: number): number {
+  const configured = Number(process.env[name]);
+  return Number.isInteger(configured) && configured > 0 ? configured : fallback;
+}
+
+/** The read ceiling actually used, overridable for a slower vault. */
+function vaultReadTimeoutMs(): number {
+  return positiveIntegerEnv("APNS_VAULT_READ_TIMEOUT_MS", APNS_VAULT_READ_TIMEOUT_MS);
+}
+
+/** The retry window actually used, overridable for a slower vault. */
+function vaultRetryMs(): number {
+  return positiveIntegerEnv("APNS_VAULT_RETRY_MS", APNS_VAULT_RETRY_MS);
+}
+
+interface VaultKey {
+  /** The pinned key id this read was for, or "" for the shared key. */
+  pin: string;
+  keyId: string;
+  p8: string | null;
+  at: number;
+}
+
+let vaultKey: VaultKey | null = null;
+
+/** The read in flight, so two callers that miss the cache together cause ONE
+ * vault read rather than two.  A synchronous read could not be interleaved;
+ * an async one can, and two concurrent reads would double the wall time of
+ * exactly the slow case this module exists to survive. */
+let vaultReadInFlight: Promise<VaultKey> | null = null;
+
+/** Bumped by `resetApnsKeyCache`.  A read that started before the bump must
+ * not write its answer into the cache the caller just cleared. */
+let vaultGeneration = 0;
+
+/** Test seam: forget the cached Infisical read. */
+export function resetApnsKeyCache(): void {
+  vaultKey = null;
+  vaultReadInFlight = null;
+  vaultGeneration++;
+  resetScopedApnsCache();
+}
+
+const execFileAsync = promisify(execFile);
+
+/** One `fleet-secrets` read, off the event loop.
+ *
+ * The read is an Infisical round-trip:  3.6-5.3 s warm, 16.6 s cold on the
+ * fleet Mac, and the ceiling above allows up to 49.8 s for a slower vault.
+ * Run synchronously, that window is time the sidecar cannot answer a request,
+ * fire a timer, or drain a push queue for — and the two reads a cold start
+ * needs are sequential, so the worst case froze the event loop for ~100 s.
+ * The read is async and the caller awaits it, and the same `timeout` still
+ * bounds it:  the child is killed at the ceiling, and a killed read is still
+ * a failed read, which is what turns APNs pushes off. */
+async function fleetSecretsGet(name: string): Promise<string | null> {
   try {
-    const info = statSync(path);
-    return `${info.mtimeMs}:${info.size}`;
+    const { stdout } = await execFileAsync(fleetSecretsBin(), ["get", name], {
+      encoding: "utf8",
+      timeout: vaultReadTimeoutMs(),
+    });
+    return stdout.replace(/\n$/, "");
   } catch {
     return null;
   }
 }
 
-export function loadApnsConfig(): ApnsConfig | null {
-  const keyId = process.env.APNS_KEY_ID?.trim() || "N3949G7CN6";
+/** The key id Infisical names for the shared key, or null when the read
+ * fails or does not look like an Apple key id. */
+async function sharedKeyId(): Promise<string | null> {
+  const id = (await fleetSecretsGet(SHARED_APNS_KEY_ID_NAME))?.trim();
+  return id && /^[A-Z0-9]{10}$/.test(id) ? id : null;
+}
+
+/** The read itself, away from the cache check. */
+async function readVaultFromVault(pin: string, retryMs: number, generation: number): Promise<VaultKey> {
+  const p8 = await fleetSecretsGet(apnsVaultName(pin || undefined));
+  // The entry is stamped when the read FINISHED, not when it started.  A read
+  // that runs longer than the retry window would otherwise leave an
+  // already-expired entry behind, and the very next caller — `refreshConfig`
+  // asks for the stamp and then the config — would run another full read
+  // instead of the cached answer.
+  let completedAt = Date.now();
+  const store = (next: VaultKey): VaultKey => {
+    if (generation === vaultGeneration) vaultKey = next;
+    return next;
+  };
+  if (p8 === null && vaultKey && vaultKey.pin === pin && vaultKey.p8) {
+    // A transient failure keeps the last good key (pushes keep flowing) and
+    // is retried after the short window rather than the long one.
+    return store({ ...vaultKey, at: completedAt - (APNS_VAULT_CACHE_MS - retryMs) });
+  }
+  if (pin || p8 === null) {
+    return store({ pin, keyId: pin || SHARED_APNS_KEY_ID, p8, at: completedAt });
+  }
+  const id = await sharedKeyId();
+  // The read is not finished until the id read returns.  Stamping before it
+  // left an entry that was already expired by the time it was stored, when the
+  // id read took longer than the retry window — and the raised ceiling allows
+  // exactly that — so the next caller ran a second full vault round trip
+  // instead of taking the cached answer.
+  completedAt = Date.now();
+  if (id) {
+    return store({ pin, keyId: id, p8, at: completedAt });
+  }
+  // The PEM read but its id did not:  keep the last good id for the same
+  // key, otherwise use the built-in id, and retry after the short window
+  // either way.  The id is part of the stamp, so a fault Apple records
+  // against a wrong fallback id clears once the real id is read.
+  const keyId = vaultKey && vaultKey.pin === pin && vaultKey.p8 === p8 ? vaultKey.keyId : SHARED_APNS_KEY_ID;
+  return store({ pin, keyId, p8, at: completedAt - (APNS_VAULT_CACHE_MS - retryMs) });
+}
+
+async function readVault(now = Date.now()): Promise<VaultKey> {
+  const pin = pinnedKeyId() ?? "";
+  const retryMs = vaultRetryMs();
+  if (vaultKey && vaultKey.pin === pin && now - vaultKey.at < (vaultKey.p8 ? APNS_VAULT_CACHE_MS : retryMs)) {
+    return vaultKey;
+  }
+  if (!vaultReadInFlight) {
+    const read = readVaultFromVault(pin, retryMs, vaultGeneration);
+    vaultReadInFlight = read;
+    const clear = () => {
+      if (vaultReadInFlight === read) vaultReadInFlight = null;
+    };
+    void read.then(clear, clear);
+  }
+  return vaultReadInFlight;
+}
+
+/** Where the signing key comes from, as text for status lines.  Never the
+ * contents.  Order: `APNS_P8` (the PEM itself, for a host that injects it),
+ * then `APNS_P8_PATH` (an explicit file), then Infisical:  `AUTHKEY_<KEY_ID>`
+ * when `APNS_KEY_ID` pins a key, otherwise the shared `APNS_KEY_P8`.
+ * An explicit scoped binding keeps that order and labels the vault read as scoped. */
+export function apnsKeySource(binding?: ApnsScopedBinding): string {
+  if (process.env.APNS_P8?.trim()) return "APNS_P8 environment";
+  const explicit = process.env.APNS_P8_PATH?.trim();
+  if (explicit) return explicit;
+  const name = apnsVaultName(pinnedKeyId());
+  return binding ? `Infisical scoped ${name}` : `Infisical ${name}`;
+}
+
+async function resolveP8(binding?: ApnsScopedBinding): Promise<{ p8: string; origin: string; keyId: string } | null> {
+  const pinned = pinnedKeyId();
+  const inline = process.env.APNS_P8?.trim();
+  if (inline) return { p8: inline, origin: "env", keyId: pinned ?? SHARED_APNS_KEY_ID };
+  const explicit = process.env.APNS_P8_PATH?.trim();
+  if (explicit) {
+    try {
+      if (!existsSync(explicit)) return null;
+      return {
+        p8: readFileSync(explicit, "utf8"),
+        origin: `${explicit}:${statSync(explicit).mtimeMs}`,
+        keyId: pinned ?? SHARED_APNS_KEY_ID,
+      };
+    } catch {
+      return null;
+    }
+  }
+  // A caller-supplied scoped binding replaces the fleet-secrets read. Without one, the path below is unchanged.
+  if (binding) {
+    const got = await loadScopedApnsMaterial(binding, {
+      pin: pinned ?? "",
+      timeoutMs: vaultReadTimeoutMs(),
+      retryMs: vaultRetryMs(),
+      cacheMs: APNS_VAULT_CACHE_MS,
+      keyIdFallback: SHARED_APNS_KEY_ID,
+    });
+    return got.p8 ? { p8: got.p8, origin: "vault", keyId: got.keyId } : null;
+  }
+  const got = await readVault();
+  return got.p8 ? { p8: got.p8, origin: "vault", keyId: got.keyId } : null;
+}
+
+/** A fingerprint of the key — where it came from plus a one-way digest of
+ * the PEM, never a byte of the key itself.  Cheap enough to take every few
+ * minutes, and enough to notice a rotated .p8 that kept its name.  The
+ * source is part of it because `APNS_P8_PATH` or `APNS_P8` can move the
+ * key: pointing the sidecar at a different key is a key change, and a fault
+ * recorded against the old one must not survive it. */
+// The stamp format changed from `<path>:<mtime>:<size>` in AFC-359.  A key
+// fault persisted before the upgrade therefore never matches and is cleared
+// once on load:  the safe direction, since a key that is still bad is simply
+// re-recorded by the next push Apple refuses.
+export async function apnsKeyStamp(binding?: ApnsScopedBinding): Promise<string | null> {
+  const got = await resolveP8(binding);
+  if (!got) return null;
+  // The key id is hashed with the PEM:  the same PEM under a different id is
+  // a different signing identity to Apple.
+  const digest = createHash("sha256").update(`${got.keyId}\n${got.p8}`).digest("hex").slice(0, 16);
+  return `${apnsKeySource(binding)}:${digest}`;
+}
+
+/** The mask:  the first eight and the last four characters of the key
+ * material, and nothing else.  Kept as widths so the short-material guard
+ * below can be written in terms of the mask itself rather than as a
+ * hand-copied total that a later edit could drift away from. */
+const KEY_PREVIEW_HEAD = 8;
+const KEY_PREVIEW_TAIL = 4;
+
+/** A masked preview of a signing key:  the first eight and the last four
+ * characters of the key material, and nothing else.
+ *
+ * Rule 43:  a rejected provider key is identified by its masked preview, so
+ * the operator can tell WHICH key Apple refused without the key ever being
+ * printed.  The PEM armour is stripped first, so the preview describes the
+ * key material and not the header.  An absent key previews as "unavailable"
+ * rather than as an empty string, so the line still says something useful.
+ *
+ * A material too short to mask also previews as "unavailable":  the mask
+ * shows the first eight and the last four characters, so a material of
+ * twelve characters or fewer is COVERED by it — the two pieces hand back
+ * every character of the key, just in two halves.  A preview that prints
+ * the secret it exists to hide is worse than no preview at all, so the
+ * short case is refused.
+ *
+ * The bound is the mask's own width, not a copy of it.  At exactly the mask
+ * width the two slices are ADJACENT rather than overlapping, and adjacency
+ * is not the reason the key is refused:  covering it is.  A maintainer who
+ * "corrects" the bound to `<` on the strength of an overlap story would
+ * re-open the full-key echo this guard exists to close. */
+export function keyPreview(p8: string | null | undefined): string {
+  const material = (p8 ?? "").replace(/-----(?:BEGIN|END) PRIVATE KEY-----/g, "").trim();
+  if (!material) return "unavailable";
+  if (material.length <= KEY_PREVIEW_HEAD + KEY_PREVIEW_TAIL) return "unavailable";
+  return `${material.slice(0, KEY_PREVIEW_HEAD)}…${material.slice(-KEY_PREVIEW_TAIL)}`;
+}
+
+export async function loadApnsConfig(binding?: ApnsScopedBinding): Promise<ApnsConfig | null> {
   const teamId = process.env.APNS_TEAM_ID?.trim() || "CC8UTF7ATG";
-  const bundleId = process.env.APNS_BUNDLE_ID?.trim() || "app.botfleet";
-  const p8Path = apnsKeyPath();
-  if (!existsSync(p8Path)) return null;
-  let p8: string;
-  try {
-    p8 = readFileSync(p8Path, "utf8");
-  } catch {
-    return null;
-  }
+  const bundleId = process.env.APNS_BUNDLE_ID?.trim() || "app.botfleet.ios";
+  const got = await resolveP8(binding);
+  if (!got) return null;
+  const { p8, keyId } = got;
   if (!p8.includes("BEGIN PRIVATE KEY")) return null;
   return {
     keyId,
@@ -237,7 +512,372 @@ export function apnsPayload(alert: ApnsAlert): ApnsPayload {
   };
 }
 
+// --- Live Activities ------------------------------------------------------
+//
+// A Live Activity has its own APNs channel: a different push type, a
+// different topic, and a body that is decoded by the synthesized `Codable` on
+// `BotActivityAttributes` in ios/Shared/BotActivity.swift rather than by our
+// own app.  Every key below is that struct's field name, and the type name
+// travels as a string, so nothing here may be "cleaned up" — a renamed key is
+// a widget that silently stops updating.
+
+/** The literal Swift type name `attributes-type` must carry.  Change this and
+ * the system has no type to decode the attributes against. */
+export const LIVE_ACTIVITY_ATTRIBUTES_TYPE = "BotActivityAttributes";
+
+/** Seconds between the Unix epoch and Apple's reference date
+ * (2001-01-01T00:00:00Z).  A synthesized `Codable` reads a Swift `Date` from a
+ * NUMBER of seconds since that date; an ISO-8601 string here decodes as a
+ * crash on the phone, not a wrong-looking timer. */
+export const APPLE_REFERENCE_DATE_OFFSET = 978_307_200;
+
+/** A `BotState` raw value — the face the island wears. */
+export type LiveActivityFace = string;
+
+/** The static, immutable half of the activity: what the widget was started
+ * for.  Sent once, on `start`, and never again — ActivityKit refuses to
+ * change it. */
+export interface LiveActivityAttributes {
+  botId: string;
+  threadId: string;
+  name: string;
+  /** A `BotPalette` name.  An unknown name falls back to neutral grey in the
+   * widget rather than failing the decode. */
+  color: string;
+}
+
+/** `BotActivityAttributes.ContentState` — the half that changes. */
+export interface LiveActivityContentState {
+  face: LiveActivityFace;
+  /** "needsYou" | "working" | "toReview" */
+  kind: string;
+  headline: string;
+  line: string;
+  requestId?: string;
+  options: string[];
+  isPermission: boolean;
+  /** Seconds since Apple's reference date.  See
+   * `APPLE_REFERENCE_DATE_OFFSET` for why this is a number. */
+  since: number;
+}
+
+export interface LiveActivityAlertBody {
+  title: string;
+  body: string;
+}
+
+export type LiveActivityEvent = "start" | "update" | "end";
+
+export interface LiveActivityPayload {
+  aps: {
+    /** Unix seconds. */
+    timestamp: number;
+    event: LiveActivityEvent;
+    "content-state": LiveActivityContentState;
+    /** Start only. */
+    "attributes-type"?: string;
+    /** Start only. */
+    attributes?: LiveActivityAttributes;
+    /** Start only — and the system rejects a start without one. */
+    alert?: LiveActivityAlertBody;
+    /** End only: when the activity should leave the island. */
+    "dismissal-date"?: number;
+  };
+}
+
+/** The topic a Live Activity push is addressed to.  Derived from the
+ * configured bundle id rather than spelled out, so moving a build between
+ * sandbox and production moves both channels together and the two can never
+ * disagree about which app it is talking to. */
+export function liveActivityTopic(bundleId: string): string {
+  return `${bundleId}.push-type.liveactivity`;
+}
+
+/** The palette name used when the frame did not say.  `BotPalette.color`
+ * resolves anything it does not know to the same neutral grey, so a missing
+ * field costs the island its colour and nothing else. */
+export const DEFAULT_LIVE_ACTIVITY_COLOR = "gray";
+
+/** What one Live Activity push says.  Attributes travel on every event here
+ * because they are the same value throughout the activity's life — the start
+ * carries them and the updates below do not resend them. */
+export interface LiveActivityPush {
+  event: LiveActivityEvent;
+  attributes: LiveActivityAttributes;
+  state: LiveActivityContentState;
+  /** Defaults to the state's own headline and line, because a start without
+   * an alert is rejected outright. */
+  alert?: LiveActivityAlertBody;
+  /** Unix seconds; defaults to now. */
+  timestamp?: number;
+  /** Unix seconds; `end` only. */
+  dismissalDate?: number;
+}
+
+/** The JSON body for one Live Activity event.  Exported so a test can read
+ * the shape without standing up a fetch. */
+export function liveActivityPayload(
+  event: LiveActivityEvent,
+  attributes: LiveActivityAttributes,
+  state: LiveActivityContentState,
+  alert?: LiveActivityAlertBody,
+  options: { timestamp?: number; dismissalDate?: number } = {},
+): LiveActivityPayload {
+  const timestamp = options.timestamp ?? Math.floor(Date.now() / 1000);
+  // `requestId` is `String?` in Swift, and a synthesized decoder reads an
+  // absent optional as nil.  Both halves are built explicitly rather than
+  // spread over an empty object, so the two shapes stay visible.
+  const { requestId, ...stateWithoutRequest } = state;
+  const contentState: LiveActivityContentState =
+    requestId === undefined ? { ...stateWithoutRequest } : { ...stateWithoutRequest, requestId };
+  const aps: LiveActivityPayload["aps"] = {
+    timestamp,
+    event,
+    "content-state": contentState,
+  };
+  if (event === "start") {
+    aps["attributes-type"] = LIVE_ACTIVITY_ATTRIBUTES_TYPE;
+    aps.attributes = attributes;
+    aps.alert = alert ?? { title: state.headline, body: state.line };
+  }
+  if (event === "end" && options.dismissalDate !== undefined) {
+    aps["dismissal-date"] = options.dismissalDate;
+  }
+  return { aps };
+}
+
+/** One string out of a raw JSON frame.
+ *
+ * The frame is whatever `JSON.parse` returned, so a `title` that arrived as
+ * a number is not a string and must not become one here — the alert path
+ * falls back exactly as it would for an absent field rather than putting a
+ * number in a banner title. */
+const frameString = (frame: JsonObject, field: string): string | undefined => {
+  const value = frame[field];
+  return isJsonString(value) ? String(value) : undefined;
+};
+
+/** What the harness notify frame carries, once it has been parsed.
+ *
+ * The fields are optional because the frame is: a harness that predates the
+ * Live Activity work sends no `color`, no `options` and no `isPermission`,
+ * and that must cost the island a caption rather than the push.  They are
+ * optional in the type but NOT in the parsing — `parseLiveActivitySource`
+ * is what decides whether a value that IS there is the right shape, and
+ * this interface is only ever handed what that function returned. */
+export interface LiveActivitySource {
+  title?: string;
+  body?: string;
+  kind?: string;
+  threadId?: string;
+  botId?: string;
+  requestId?: string;
+  tool?: string;
+  /** Newer harness frames carry the bot's own name and palette colour. */
+  botName?: string;
+  color?: string;
+  options?: string[];
+  isPermission?: boolean;
+  /** Epoch ms — when this kind began.  Defaults to now. */
+  since?: number;
+}
+
+/** Every field the Live Activity reads, with the type it must have when it is
+ * there at all.  An absent field is fine — that is the degraded path — and a
+ * field of the wrong type is not: it would be indexed as if it were a string
+ * and reach a widget that decodes it strictly. */
+const LIVE_ACTIVITY_SOURCE_FIELDS = {
+  title: "string",
+  body: "string",
+  kind: "string",
+  threadId: "string",
+  botId: "string",
+  requestId: "string",
+  tool: "string",
+  botName: "string",
+  color: "string",
+  options: "string[]",
+  isPermission: "boolean",
+  since: "number",
+} as const satisfies Record<string, string>;
+
+/** What `parseLiveActivitySource` concluded about one inbound frame. */
+export type LiveActivitySourceParse =
+  | { ok: true; source: LiveActivitySource }
+  | { ok: false; error: string };
+
+/** True when `value` is what `expected` says, for the shapes above. */
+const conforms = (value: JsonValue, expected: string): boolean => {
+  if (expected === "string") return isJsonString(value);
+  if (expected === "boolean") return value === true || value === false;
+  if (expected === "number") return isFiniteJsonNumber(value);
+  if (expected === "string[]") return Array.isArray(value) && value.every((entry) => isJsonString(entry));
+  return false;
+};
+
+/** The strings out of an array `conforms` has already cleared.  Read entry by
+ * entry rather than asserted, so a value that slipped through is dropped
+ * rather than carried into the payload. */
+const jsonStrings = (value: JsonValue[]): string[] => {
+  const out: string[] = [];
+  for (const entry of value) {
+    if (isJsonString(entry)) out.push(String(entry));
+  }
+  return out;
+};
+
+/** Name the shape a rejected value actually had, so the log line says what
+ * arrived rather than only what was wanted. */
+const describeJson = (value: JsonValue): string => {
+  if (Array.isArray(value)) return "an array";
+  if (isJsonObject(value)) return "an object";
+  if (value === null) return "null";
+  return Object.prototype.toString.call(value).slice(8, -1).toLowerCase();
+};
+
+/** Put one already-checked value on the parsed source.  A switch rather than
+ * an index cast, so the field the value lands on is spelled out. */
+const assignSource = (source: LiveActivitySource, field: string, value: JsonValue): void => {
+  switch (field) {
+    case "title":
+      source.title = String(value);
+      return;
+    case "body":
+      source.body = String(value);
+      return;
+    case "kind":
+      source.kind = String(value);
+      return;
+    case "threadId":
+      source.threadId = String(value);
+      return;
+    case "botId":
+      source.botId = String(value);
+      return;
+    case "requestId":
+      source.requestId = String(value);
+      return;
+    case "tool":
+      source.tool = String(value);
+      return;
+    case "botName":
+      source.botName = String(value);
+      return;
+    case "color":
+      source.color = String(value);
+      return;
+    case "options":
+      source.options = jsonStrings(Array.isArray(value) ? value : []);
+      return;
+    case "isPermission":
+      source.isPermission = value === true;
+      return;
+    case "since":
+      source.since = Number(value);
+      return;
+    default:
+      return;
+  }
+};
+
+/** Parse one notify frame's notification before anything indexes off it.
+ *
+ * The frame arrives as raw JSON off the harness's loopback stream, and an
+ * interface alone is a promise about a value nobody checked: `??` catches a
+ * field that is ABSENT and nothing else.  A `title` that arrived as a
+ * number, or `options` that arrived as an object, would be copied straight
+ * into a payload the widget decodes strictly.  This is the boundary that
+ * says no.
+ *
+ * Unknown keys are ignored rather than refused, and that is deliberate.  The
+ * harness frame is a contract this sidecar neither owns nor versions against
+ * — `server/notify.ts` already sends `avatarUrl`, which nothing here reads,
+ * and refusing on an unrecognised key would drop every push from every bot
+ * that has a profile picture.  The fields the builder actually reads are the
+ * ones held to their types; a sparse frame still parses, and keeps its
+ * fallbacks. */
+export function parseLiveActivitySource(raw: JsonValue): LiveActivitySourceParse {
+  if (!isJsonObject(raw)) return { ok: false, error: "notification is not a JSON object" };
+  const source: LiveActivitySource = {};
+  for (const [field, expected] of Object.entries(LIVE_ACTIVITY_SOURCE_FIELDS)) {
+    const value = raw[field];
+    if (value === undefined || value === null) continue;
+    if (!conforms(value, expected)) {
+      return { ok: false, error: `${field} must be ${expected}, got ${describeJson(value)}` };
+    }
+    assignSource(source, field, value);
+  }
+  return { ok: true, source };
+}
+
+/** One notify frame, as the Live Activity sees it. */
+export interface LiveActivityContent {
+  attributes: LiveActivityAttributes;
+  state: LiveActivityContentState;
+  alert: LiveActivityAlertBody;
+}
+
+/** Map a harness notify frame onto the widget's contract, degrading field by
+ * field rather than refusing to build: a frame from an older harness has no
+ * bot name, no palette and no option list, and the island should still start
+ * with a caption and a timer instead of nothing at all. */
+export function liveActivityContent(
+  notification: LiveActivitySource,
+  now: number = Date.now(),
+): LiveActivityContent {
+  const kind = notification.kind;
+  const blocking = alertIsBlocking(kind);
+  // The title is the frame's own headline ("Forge needs you") when no name
+  // came with it — one word too long on the island, and never absent.
+  const name = notification.botName ?? notification.title ?? "BotFleet";
+  // A permission card answers allow/deny; a question wants an answer typed,
+  // so a frame that says nothing offers the verdict only when the kind says
+  // it is a permission.
+  const isPermission = notification.isPermission ?? kind === "approval";
+  const headline = blocking ? `${name} needs you` : `${name} is working`;
+  const state: LiveActivityContentState = {
+    face: blocking ? "thinking" : "idle",
+    kind: blocking ? "needsYou" : kind === "done" ? "toReview" : "working",
+    headline,
+    line: notification.body ?? "",
+    options: notification.options ?? (isPermission ? ["Allow", "Deny"] : []),
+    isPermission,
+    since: (notification.since ?? now) / 1000 - APPLE_REFERENCE_DATE_OFFSET,
+  };
+  // Absent rather than null: a synthesized decoder reads a missing optional as
+  // nil, and a literal null in the body is what a hand-written encoder sends.
+  if (notification.requestId !== undefined) state.requestId = notification.requestId;
+  return {
+    attributes: {
+      botId: notification.botId ?? "",
+      threadId: notification.threadId ?? "",
+      name,
+      color: notification.color ?? DEFAULT_LIVE_ACTIVITY_COLOR,
+    },
+    state,
+    alert: { title: headline, body: notification.body ?? "" },
+  };
+}
+
 // --- Sending --------------------------------------------------------------
+
+/** The bucketed shape of why a send did not land.  Defaults to "none" on a
+ * healthy send so old callers that build `ApnsSendResult` by hand stay valid
+ * — a missing `failureKind` field reads as "none", which is the value the
+ * helper writes for every successful send and for the cheap rejections that
+ * never went anywhere near the wire (a bad device token in the call site). */
+export type ApnsFailureKind =
+  | "none"
+  | "transport"        // DNS / TCP / TLS handshake before any HTTP/2 frame
+  | "http2_protocol"   // GOAWAY, RST_STREAM, INTERNAL_ERROR, PROTOCOL_ERROR
+  | "socket_closed"    // socket dropped mid-request
+  | "timeout"
+  | "rate_limit"       // 429 / 503 with Retry-After
+  | "bad_token"        // 400 BadDeviceToken / DeviceTokenNotForTopic, 410
+  | "expired_token"    // 403 ExpiredProviderToken
+  | "key_fault"        // 403 InvalidProviderToken
+  | "server"           // 500-504 other than 503 rate limit
+  | "rejected";        // 400 / 403 with reason Apple sent that does not match the buckets above
 
 export interface ApnsSendResult {
   ok: boolean;
@@ -245,6 +885,17 @@ export interface ApnsSendResult {
   /** Apple's own `reason` string, when it sent one.  Safe to log. */
   reason?: string;
   attempts: number;
+  /** The bucketed shape of why this send did not land.  "none" on a healthy
+   * send or on the cheap rejections that never reached the wire. */
+  failureKind?: ApnsFailureKind;
+  /** Apple-side `err.code` / HTTP/2 code, surfaced verbatim from the underlying
+   * transport error so the health page can name what actually went wrong
+   * (e.g. "ECONNRESET", "ERR_HTTP2_PROTOCOL_ERROR"). */
+  errorCode?: string;
+  /** Apple's own `timestamp` field — sent on a 403 InvalidProviderToken
+   * body and on a 410 Unregistered body (the token's invalidation time).
+   * The exact value the Apple debug page asks for. */
+  errorTimestamp?: number;
 }
 
 export interface ApnsSendOptions {
@@ -252,6 +903,9 @@ export interface ApnsSendOptions {
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
   maxAttempts?: number;
+  /** Inject a session factory for tests.  The default opens a Node http2
+   * session with the APNs-recommended keepalive and concurrency settings. */
+  http2SessionFactory?: Http2SessionFactory;
 }
 
 /** One send plus its retries.  Three is enough to ride out a rate limit or
@@ -308,43 +962,687 @@ function backoffMs(attempt: number): number {
   return Math.min(1000 * 2 ** (attempt - 1), APNS_MAX_BACKOFF_MS);
 }
 
-/** Apple answers a rejection with `{"reason":"BadDeviceToken"}`.  The body
- * is tiny and the parse is best-effort: a reason we could not read must not
- * turn a clean 400 into a thrown error. */
-async function readReason(res: Response): Promise<string | undefined> {
+// --- HTTP/2 transport -----------------------------------------------------
+//
+// Node 26's native `fetch` (undici) opens a fresh HTTP/2 session per
+// request, sets no TCP keepalive, no HTTP/2 keepalive, and reports
+// GOAWAY/RST_STREAM as a generic "fetch failed".  Apple explicitly asks
+// long-lived APNs senders to keep a persistent HTTP/2 session with PING
+// keepalives.  We hold one session per (host, keyId) — a key rotation
+// rebuilds the cache entry — close it cleanly when the stream is idle and
+// no peer still holds a request, and rebuild lazily after a GOAWAY.
+
+/** What an `http2.connect(...)` call takes, narrowed to the options we use.
+ * Node silently ignores unknown keys here, so placement matters:
+ * `keepaliveTimeoutMillis` / `keepaliveIntervalMillis` are not real options
+ * at all, `initialWindowSize` only applies nested under `settings`, and
+ * `maxSessionMemory` is measured in MEGAbytes — 10_485_760 would be ~10 TB,
+ * not 10 MiB.  The HTTP/2 PING keepalive Apple asks for has no connect
+ * option either; the default factory runs `session.ping` on
+ * `pingIntervalMs`. */
+export interface Http2ConnectOptions {
+  /** The local settings frame sent to the peer. */
+  settings: {
+    /** 1 MiB initial flow-control window — Apple's documented guidance. */
+    initialWindowSize: number;
+    /** Concurrent-stream cap; 500 is the documented APNs guidance. */
+    maxConcurrentStreams: number;
+  };
+  /** Session memory cap in MEGAbytes — 10 means 10 MiB. */
+  maxSessionMemory: number;
+  /** TCP keepalive, applied with `socket.setKeepAlive` once the session
+   * connects; the delay is milliseconds. */
+  keepAlive: boolean;
+  keepAliveInitialDelay: number;
+  /** HTTP/2 PING keepalive cadence in milliseconds. */
+  pingIntervalMs: number;
+  /** How long one PING may go unanswered before the session is treated as
+   * half-open, evicted, and destroyed.  Node puts no deadline on a PING. */
+  pingDeadlineMs: number;
+}
+
+/** Apple's recommended dial for long-lived APNs HTTP/2 senders.  Pulled from
+ * the APNs HTTP/2 reference: TCP keepalive after 30s idle, an HTTP/2 PING
+ * every 30s, and the 1 MiB initial window + 500 concurrent streams cap. */
+export const DEFAULT_HTTP2_OPTIONS: Http2ConnectOptions = {
+  settings: {
+    initialWindowSize: 1_048_576,
+    maxConcurrentStreams: 500,
+  },
+  maxSessionMemory: 10,
+  keepAlive: true,
+  keepAliveInitialDelay: 30_000,
+  pingIntervalMs: 30_000,
+  pingDeadlineMs: 10_000,
+};
+
+/** One transport session: the http2 client + a notifier for the call site. */
+export interface Http2ApnsSession {
+  /** The Node http2 session.  May be closed by either side; callers must
+   * reopen rather than reuse a session whose `closed` flag is true. */
+  raw: ClientHttp2Session;
+}
+
+/** Factory injected into `sendApnsAlert` so tests can count rebuilds and
+ * fake the wire without standing up a real socket. */
+export type Http2SessionFactory = (host: string, keyId: string) => Http2ApnsSession;
+
+/** Wire a session's own error / goaway / close events to the cache and to
+ * the sends in flight on it.  Pulled out of the default factory so tests
+ * can drive the same wiring on a fake session; a custom factory that wants
+ * the production failure handling calls it too. */
+export function watchHttp2SessionLifecycle(host: string, session: ClientHttp2Session): void {
+  // A session-level 'error' with no listener is an uncaught exception: one
+  // DNS/TCP/TLS failure would take the whole companion process down.
+  // Handle it, drop the session from the cache, and reject everything still
+  // in flight on it — a send waiting on a dead session must fail, not hang.
+  session.on("error", (err) => {
+    failCachedSession(host, session, err);
+    try {
+      session.destroy();
+    } catch {
+      /* already gone */
+    }
+  });
+  // A GOAWAY means the peer refuses new streams on this session.  In-flight
+  // streams still settle on their own, so evict rather than destroy: the
+  // next send opens a fresh session while this one drains.
+  session.on("goaway", () => {
+    evictCachedSession(host, session);
+  });
+  // A close with requests still pending is a dropped connection: those
+  // streams will never settle on their own, so reject them now.
+  session.on("close", () => {
+    failCachedSession(
+      host,
+      session,
+      Object.assign(new Error("APNs http2 session closed with requests in flight"), {
+        code: "ERR_HTTP2_SESSION_EOF",
+        name: "Error",
+      }),
+    );
+  });
+}
+
+/** Default factory — `node:http2` with Apple's recommended settings. */
+export const defaultHttp2SessionFactory: Http2SessionFactory = (host, _keyId) => {
+  const session = http2Connect(
+    `https://${host}`,
+    {
+      settings: DEFAULT_HTTP2_OPTIONS.settings,
+      maxSessionMemory: DEFAULT_HTTP2_OPTIONS.maxSessionMemory,
+    },
+    (_session, socket) => {
+      // TCP keepalive: `http2.connect` exposes no typed option for it, so
+      // set it on the underlying socket the moment the connection is up.
+      socket.setKeepAlive(
+        DEFAULT_HTTP2_OPTIONS.keepAlive,
+        DEFAULT_HTTP2_OPTIONS.keepAliveInitialDelay,
+      );
+    },
+  );
+  watchHttp2SessionLifecycle(host, session);
+  startHttp2PingKeepalive(host, session);
+  return { raw: session };
+};
+
+export interface Http2PingKeepaliveOptions {
+  /** Cadence in ms; defaults to DEFAULT_HTTP2_OPTIONS.pingIntervalMs. */
+  intervalMs?: number;
+  /** Per-PING deadline in ms; defaults to DEFAULT_HTTP2_OPTIONS.pingDeadlineMs. */
+  deadlineMs?: number;
+}
+
+/** The PING keepalive Apple asks long-lived senders for.  Node has no
+ * connect option for it, so run `session.ping` on a cadence.  A PING is
+ * the only probe an idle session gets, so it has to act on what it learns:
+ * an error delivered to the PING callback, or no answer inside the
+ * deadline, means the connection is dead or half-open.  Either one evicts
+ * the session from the cache, fails every send still pending on it, and
+ * destroys it, so the next send opens a fresh session instead of waiting
+ * out the full request deadline on a dead socket.  One PING is in flight at
+ * a time; the timers are unref'd so they never keep the process alive, and
+ * everything stops with the session.  Exported so tests can drive it on a
+ * fake session; returns a stop function. */
+export function startHttp2PingKeepalive(
+  host: string,
+  session: ClientHttp2Session,
+  options: Http2PingKeepaliveOptions = {},
+): () => void {
+  const intervalMs = options.intervalMs ?? DEFAULT_HTTP2_OPTIONS.pingIntervalMs;
+  const deadlineMs = options.deadlineMs ?? DEFAULT_HTTP2_OPTIONS.pingDeadlineMs;
+  let stopped = false;
+  let inFlight: ReturnType<typeof setTimeout> | null = null;
+  const stop = () => {
+    if (stopped) return;
+    stopped = true;
+    clearInterval(timer);
+    if (inFlight) clearTimeout(inFlight);
+    inFlight = null;
+  };
+  const kill = (err: unknown) => {
+    stop();
+    failCachedSession(host, session, err);
+    try {
+      session.destroy();
+    } catch {
+      /* already gone, or a test double with no destroy() */
+    }
+  };
+  const timer = setInterval(() => {
+    if (session.closed || session.destroyed) {
+      stop();
+      return;
+    }
+    // The previous PING is still out; its own deadline decides its fate.
+    if (inFlight) return;
+    let answered = false;
+    const deadline = setTimeout(() => {
+      if (answered) return;
+      answered = true;
+      inFlight = null;
+      kill(
+        Object.assign(new Error(`APNs http2 PING went unanswered for ${deadlineMs}ms`), {
+          code: "ETIMEDOUT",
+          name: "TimeoutError",
+        }),
+      );
+    }, deadlineMs);
+    deadline.unref?.();
+    inFlight = deadline;
+    try {
+      const sent = session.ping((err) => {
+        if (answered) return;
+        answered = true;
+        clearTimeout(deadline);
+        inFlight = null;
+        if (err) kill(err);
+      });
+      if (sent === false && !answered) {
+        // Node refused to queue the PING (too many outstanding); nothing
+        // was written, so there is nothing to wait for this cycle.
+        answered = true;
+        clearTimeout(deadline);
+        inFlight = null;
+      }
+    } catch (err) {
+      // `ping` throws only on a session that is already unusable.
+      answered = true;
+      clearTimeout(deadline);
+      inFlight = null;
+      kill(err);
+    }
+  }, intervalMs);
+  timer.unref?.();
+  session.once("close", stop);
+  return stop;
+}
+
+/** Read every field Node attaches to a thrown error in a single helper, so
+ * the caller can stash them on `ApnsSendResult` verbatim and the health
+ * page can render what actually went wrong without re-classifying. */
+export interface TransportErrorInfo {
+  name: string;
+  code: string;
+  message: string;
+  /** The underlying cause when the error chains; HTTP/2 surfaces the real
+   * reason on `err.cause`, undici chains an `UndiciError` onto a `fetch`,
+   * and the stack of `Error` subclasses Node produces otherwise all
+   * converge there. */
+  cause?: unknown;
+}
+
+export function inspectTransportError(err: unknown): TransportErrorInfo {
+  if (err && typeof err === "object") {
+    const e = err as { name?: unknown; code?: unknown; message?: unknown; cause?: unknown };
+    return {
+      name: typeof e.name === "string" ? e.name : "Error",
+      code: typeof e.code === "string" ? e.code : "",
+      message: typeof e.message === "string" ? e.message : String(err),
+      cause: e.cause,
+    };
+  }
+  return { name: "Error", code: "", message: String(err) };
+}
+
+/** Bucketed shape of why a transport-layer call did not return a Response.
+ * Pure decision: takes the fields we read off the error and the elapsed
+ * time, returns the `ApnsFailureKind` that lands on the health page. */
+export function classifyTransportError(info: TransportErrorInfo): Exclude<ApnsFailureKind, "none"> {
+  const code = info.code.toUpperCase();
+  const name = info.name.toUpperCase();
+  // Timeouts first: the request deadline raises ETIMEDOUT / TimeoutError, a
+  // PING that never came back is ERR_HTTP2_PING_CANCEL, and a session that
+  // ended under a live stream is ERR_HTTP2_SESSION_EOF.  The last two start
+  // with ERR_HTTP2 but are a dead or stalled link, not Apple speaking bad
+  // HTTP/2, so they must not feed the protocol breaker.
+  if (name === "TIMEOUTERROR" || code === "ETIMEDOUT" || code === "ERR_HTTP2_PING_CANCEL" ||
+      code === "ERR_HTTP2_SESSION_EOF") return "timeout";
+  // HTTP/2 protocol-level: GOAWAY, RST_STREAM, INTERNAL_ERROR, PROTOCOL_ERROR,
+  // FRAME_SIZE_ERROR, FLOW_CONTROL_ERROR, COMPRESSION_ERROR.  Node raises
+  // these as a `DOMException` whose `code` carries one of the magic strings
+  // (`ERR_HTTP2_PROTOCOL_ERROR`, `ERR_HTTP2_STREAM_ERROR`, etc.) — name
+  // rarely matches because the wrapper class is generic.
+  if (code.startsWith("ERR_HTTP2") || name.includes("HTTP2")) return "http2_protocol";
+  // The classic mid-request drop: ECONNRESET / EPIPE on the TCP layer, and
+  // the http2-specific RST_STREAM that arrives too late for the request
+  // promise to resolve.
+  if (code === "ECONNRESET" || code === "EPIPE") return "socket_closed";
+  // Anything below the TLS layer — DNS, TCP handshake, TLS handshake —
+  // gets the generic "transport" bucket.  Err.code is normally enough.
+  if (code === "ENOTFOUND" || code === "EAI_AGAIN" || code === "ECONNREFUSED" ||
+      code === "EHOSTUNREACH" || code === "ENETUNREACH" ||
+      code === "ECONNRESET" || code === "EPIPE" || code === "CERT_HAS_EXPIRED" ||
+      code === "DEPTH_ZERO_SELF_SIGNED_CERT" || code === "SELF_SIGNED_CERT_IN_CHAIN" ||
+      code === "ERR_TLS_CERT_ALTNAME_INVALID" || code.startsWith("ERR_SSL"))
+    return "transport";
+  // Fall-through: still a transport error — we never saw a Response, so
+  // "transport" is the honest default.
+  return "transport";
+}
+
+/** Apple answers a rejection with `{"reason":"BadDeviceToken"}`; the 403
+ * InvalidProviderToken body additionally carries a `timestamp` field whose
+ * value Apple's debug page asks for verbatim.  Both reads are best-effort:
+ * a body we could not parse must not turn a clean 400 into a thrown error. */
+async function readErrorBody(res: Response): Promise<{ reason?: string; timestamp?: number }> {
   try {
     const text = (await res.text()).slice(0, 512);
-    if (!text) return undefined;
+    if (!text) return {};
     // SAFETY: this came from Apple's error body and the assertion grants no
-    // behaviour — it permits one optional property read whose value must be
-    // a string before it is used, and that value is only logged or compared
-    // to a fixed literal.
-    const parsed = JSON.parse(text) as { reason?: unknown };
-    return typeof parsed.reason === "string" ? parsed.reason : undefined;
+    // behaviour — it permits two optional property reads, each of which is
+    // type-checked before use, and the values are only logged or compared
+    // to fixed literals.
+    const parsed = JSON.parse(text) as { reason?: unknown; timestamp?: unknown };
+    return {
+      reason: typeof parsed.reason === "string" ? parsed.reason : undefined,
+      timestamp: typeof parsed.timestamp === "number" ? parsed.timestamp : undefined,
+    };
   } catch {
-    return undefined;
+    return {};
   }
 }
 
-export async function sendApnsAlert(
+/** POST one JSON payload over a persistent http2 session.  Returns a
+ * `Response`-shaped object so the test seam and the production path stay
+ * type-compatible with `fetch`.  Internally holds the session open and
+ * rebuilds it after a GOAWAY. */
+export type ApnsHttp2Fetch = (
+  input: URL | string,
+  init?: { method?: string; headers?: Record<string, string>; body?: string },
+) => Promise<Response>;
+
+interface SessionCacheEntry {
+  factory: Http2SessionFactory;
+  session: Http2ApnsSession | null;
+  lastKeyId: string | null;
+}
+
+const sessionCache = new Map<string, SessionCacheEntry>();
+
+/** Reject callbacks for the sends in flight, keyed by the session they were
+ * written to.  Scoped per session, not per host: after a GOAWAY evicts a
+ * session, its streams keep draining while the replacement serves new
+ * sends, and a failure on either one must reject only its own streams.
+ * A WeakMap so a session that is gone takes its set with it. */
+const pendingBySession = new WeakMap<ClientHttp2Session, Set<(err: unknown) => void>>();
+
+function pendingFor(session: ClientHttp2Session): Set<(err: unknown) => void> {
+  let pending = pendingBySession.get(session);
+  if (!pending) {
+    pending = new Set();
+    pendingBySession.set(session, pending);
+  }
+  return pending;
+}
+
+/** Build (or reuse) the cache entry for `(host, keyId)`.  Pulled out so
+ * tests can inject a factory that counts how many times a fresh session
+ * was opened — the rebuild-on-rotation invariant asserts on that count. */
+function getOrOpenEntry(
+  host: string,
+  keyId: string,
+  factory: Http2SessionFactory,
+): SessionCacheEntry {
+  let entry = sessionCache.get(host);
+  if (!entry) {
+    entry = { factory, session: null, lastKeyId: null };
+    sessionCache.set(host, entry);
+  }
+  // Always replace a session whose key changed — a rotated .p8 should never
+  // share a TLS session with the key it replaced, and a small hole of
+  // reusing the same TLS ticket is not worth the bookkeeping.  This is the
+  // invariant `refreshConfig` asserts on in the watcher.
+  if (entry.factory !== factory || entry.lastKeyId !== keyId || !entry.session || entry.session.raw.closed || entry.session.raw.destroyed) {
+    if (entry.session && !entry.session.raw.closed && !entry.session.raw.destroyed) {
+      try {
+        entry.session.raw.close();
+      } catch {
+        /* ignore — close() can throw on an already-closing session */
+      }
+    }
+    entry.factory = factory;
+    entry.lastKeyId = keyId;
+    entry.session = factory(host, keyId);
+  }
+  return entry;
+}
+
+/** Build (or reuse) the persistent session for `(host, keyId)`. */
+export function getOrOpenSession(
+  host: string,
+  keyId: string,
+  factory: Http2SessionFactory,
+): Http2ApnsSession {
+  return getOrOpenEntry(host, keyId, factory).session as Http2ApnsSession;
+}
+
+/** Evict a session from the cache without touching its in-flight sends:
+ * the next send opens a fresh session while this one drains.  Used on
+ * GOAWAY, where the peer keeps serving streams it already accepted. */
+function evictCachedSession(host: string, session: ClientHttp2Session): void {
+  const entry = sessionCache.get(host);
+  if (!entry || !entry.session || entry.session.raw !== session) return;
+  entry.session = null;
+}
+
+/** A session died underneath its sends (error or close).  Drop it from the
+ * cache if it is still the cached one, and reject every send still waiting
+ * on THIS session — a dead session must fail its queue, never hang it.
+ * The sweep runs even when the session was already evicted (GOAWAY), so a
+ * draining session's own close/error still settles its streams, and it
+ * never touches the replacement session's sends. */
+function failCachedSession(host: string, session: ClientHttp2Session, err: unknown): void {
+  const entry = sessionCache.get(host);
+  if (entry && entry.session && entry.session.raw === session) entry.session = null;
+  const set = pendingBySession.get(session);
+  if (!set || set.size === 0) return;
+  const pending = [...set];
+  set.clear();
+  for (const reject of pending) {
+    try {
+      reject(err);
+    } catch {
+      /* a drained rejector must never take the sweep down with it */
+    }
+  }
+}
+
+/** Clear every cached session.  Exposed so tests can reset between runs
+ * and so `refreshConfig` can drop the cache when the loaded key changes
+ * fingerprint (not just keyId — a same-id-but-different-bytes key should
+ * also force a rebuild, which the caller does by calling this with the
+ * new keyId, and the cache miss on next send reopens). */
+export function dropHttp2Sessions(): void {
+  for (const entry of sessionCache.values()) {
+    if (entry.session && !entry.session.raw.closed && !entry.session.raw.destroyed) {
+      try {
+        entry.session.raw.close();
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+  sessionCache.clear();
+}
+
+/** How long one push may sit unanswered before the stream is cancelled and
+ * the send fails with ETIMEDOUT.  Apple answers in milliseconds; a stream
+ * with no response after 30s is a stalled gateway, and letting it hang
+ * would park that phone's queue and starve the circuit breaker of the
+ * failures it counts. */
+export const APNS_REQUEST_DEADLINE_MS = 30_000;
+
+export interface ApnsHttp2FetchOptions {
+  /** Sessions are keyed by the signing key id, passed in explicitly —
+   * never derived from the request URL, whose last path segment is the
+   * DEVICE TOKEN.  Keying by that would close and re-open the TLS session
+   * for every phone, paying a fresh handshake per push. */
+  keyId: string;
+  /** Session factory; tests inject a fake, production uses the default. */
+  factory?: Http2SessionFactory;
+  /** Per-request deadline in ms; defaults to APNS_REQUEST_DEADLINE_MS. */
+  requestDeadlineMs?: number;
+}
+
+/** Build the default production transport: POST through a persistent http2
+ * session, accepting the same `(URL | string, init)` shape as `fetch` so a
+ * test can swap a `fetchImpl` in and the rest of `sendApnsAlert` does not
+ * change.  The key id and session factory come in through options, so the
+ * session cache is keyed by the signing key and tests can inject their own
+ * session. */
+export function createApnsHttp2Fetch(options: ApnsHttp2FetchOptions): ApnsHttp2Fetch {
+  const factory = options.factory ?? defaultHttp2SessionFactory;
+  const keyId = options.keyId;
+  const deadlineMs = options.requestDeadlineMs ?? APNS_REQUEST_DEADLINE_MS;
+  return (input, init) => {
+    const url = typeof input === "string" ? new URL(input) : input;
+    const host = url.host;
+    return new Promise<Response>((resolve, reject) => {
+      let entry = getOrOpenEntry(host, keyId, factory);
+      const open = entry.session as Http2ApnsSession;
+      if (open.raw.closed || open.raw.destroyed) {
+        // Mid-GOAWAY race: drop the cache and re-open.
+        dropHttp2Sessions();
+        entry = getOrOpenEntry(host, keyId, factory);
+      }
+      sendOver(entry, url, init, resolve, reject, deadlineMs);
+    });
+  };
+}
+
+/** Names for the HTTP/2 error codes `req.rstCode` can carry, so a reset
+ * rejection records the reason Apple gave instead of a bare number. */
+const NGHTTP2_ERROR_NAMES: Record<number, string> = {
+  [http2Constants.NGHTTP2_NO_ERROR]: "NO_ERROR",
+  [http2Constants.NGHTTP2_PROTOCOL_ERROR]: "PROTOCOL_ERROR",
+  [http2Constants.NGHTTP2_INTERNAL_ERROR]: "INTERNAL_ERROR",
+  [http2Constants.NGHTTP2_FLOW_CONTROL_ERROR]: "FLOW_CONTROL_ERROR",
+  [http2Constants.NGHTTP2_SETTINGS_TIMEOUT]: "SETTINGS_TIMEOUT",
+  [http2Constants.NGHTTP2_STREAM_CLOSED]: "STREAM_CLOSED",
+  [http2Constants.NGHTTP2_FRAME_SIZE_ERROR]: "FRAME_SIZE_ERROR",
+  [http2Constants.NGHTTP2_REFUSED_STREAM]: "REFUSED_STREAM",
+  [http2Constants.NGHTTP2_CANCEL]: "CANCEL",
+  [http2Constants.NGHTTP2_COMPRESSION_ERROR]: "COMPRESSION_ERROR",
+  [http2Constants.NGHTTP2_CONNECT_ERROR]: "CONNECT_ERROR",
+  [http2Constants.NGHTTP2_ENHANCE_YOUR_CALM]: "ENHANCE_YOUR_CALM",
+  [http2Constants.NGHTTP2_INADEQUATE_SECURITY]: "INADEQUATE_SECURITY",
+  [http2Constants.NGHTTP2_HTTP_1_1_REQUIRED]: "HTTP_1_1_REQUIRED",
+};
+
+/** The rejection for a stream that closed before its response settled.
+ * `rstCode` is the HTTP/2 error code from the RST_STREAM frame, or
+ * NGHTTP2_NO_ERROR when the stream closed without one.  A real RST_STREAM
+ * is Apple speaking HTTP/2 at us and classifies as `http2_protocol`; a
+ * close with no reset means the socket went away and classifies as
+ * `socket_closed`, like any mid-request drop. */
+function streamClosedError(req: ClientHttp2Stream): Error {
+  // Test doubles and older Node leaves may not carry rstCode at all.
+  const rstCode = typeof req.rstCode === "number" ? req.rstCode : http2Constants.NGHTTP2_NO_ERROR;
+  if (rstCode === http2Constants.NGHTTP2_NO_ERROR) {
+    return Object.assign(new Error("APNs http2 stream closed before a response, with no RST_STREAM"), {
+      code: "ECONNRESET",
+      name: "Error",
+    });
+  }
+  const rstName = NGHTTP2_ERROR_NAMES[rstCode] ?? `code ${rstCode}`;
+  return Object.assign(new Error(`APNs http2 stream reset before a response (RST_STREAM ${rstName})`), {
+    code: "ERR_HTTP2_STREAM_ERROR",
+    name: "HTTP2StreamError",
+  });
+}
+
+function sendOver(
+  entry: SessionCacheEntry,
+  url: URL,
+  init: { method?: string; headers?: Record<string, string>; body?: string } | undefined,
+  resolve: (response: Response) => void,
+  reject: (reason: unknown) => void,
+  deadlineMs: number,
+): void {
+  const raw = entry.session?.raw;
+  if (!raw) {
+    reject(new Error("APNs http2 session is not open"));
+    return;
+  }
+  const headers: Record<string, string> = { ":method": init?.method ?? "POST", ":path": url.pathname, ...(init?.headers ?? {}) };
+  // Host header is required by HTTP/2; Node fills `:authority` from the
+  // connect URL automatically, but we set Host explicitly so the header map
+  // matches what `fetch` would have produced.
+  headers[":authority"] = url.host;
+  headers["host"] = url.host;
+  let settled = false;
+  let deadline: ReturnType<typeof setTimeout> | null = null;
+  // Registered on the session this send is written to: when that session
+  // fails, its handler drains its pending set and this send rejects instead
+  // of hanging on a dead connection.
+  const pending = pendingFor(raw);
+  const onSessionFailure = (err: unknown) => settle(() => reject(err));
+  const settle = (fn: () => void) => {
+    if (settled) return;
+    settled = true;
+    if (deadline) clearTimeout(deadline);
+    pending.delete(onSessionFailure);
+    fn();
+  };
+  let req: ReturnType<ClientHttp2Session["request"]>;
+  try {
+    req = raw.request(headers, { endStream: false });
+  } catch (err) {
+    settle(() => reject(err));
+    return;
+  }
+  req.setEncoding("utf8");
+  pending.add(onSessionFailure);
+  // Bound the request: a stalled stream never settles on its own, and an
+  // unbounded wait would park this phone's queue and starve the circuit
+  // breaker of the failures it counts.  On expiry, cancel the stream and
+  // fail the send as a timeout so the retry ladder and breaker see it.
+  deadline = setTimeout(() => {
+    settle(() => {
+      try {
+        req.close(http2Constants.NGHTTP2_CANCEL);
+      } catch {
+        /* the stream is already gone */
+      }
+      reject(
+        Object.assign(new Error(`APNs request exceeded the ${deadlineMs}ms deadline`), {
+          code: "ETIMEDOUT",
+          name: "TimeoutError",
+        }),
+      );
+    });
+    // A stream that got no answer at all means the connection under it is
+    // most likely half-open, and cancelling the stream does not fix that:
+    // left cached, the retry and every later send would be written to the
+    // same dead socket.  The PING keepalive would only catch it on its next
+    // cycle, up to a full interval plus the PING deadline later.  So evict
+    // the session, fail every other send still waiting on it (they are on
+    // the same dead connection and would each wait out their own deadline),
+    // and destroy it.  Only this session's pending set is swept; a
+    // replacement session's sends are never touched.
+    failCachedSession(
+      url.host,
+      raw,
+      Object.assign(new Error(`APNs http2 session evicted after a request exceeded the ${deadlineMs}ms deadline`), {
+        code: "ETIMEDOUT",
+        name: "TimeoutError",
+      }),
+    );
+    try {
+      raw.destroy();
+    } catch {
+      /* already gone, or a test double with no destroy() */
+    }
+  }, deadlineMs);
+  deadline.unref?.();
+  const bodyChunks: string[] = [];
+  req.on("response", (responseHeaders) => {
+    const status = Number(responseHeaders[":status"] ?? 0);
+    const responseHeadersObj: Record<string, string> = {};
+    for (const [key, value] of Object.entries(responseHeaders)) {
+      if (key.startsWith(":")) continue;
+      if (typeof value === "string") responseHeadersObj[key.toLowerCase()] = value;
+    }
+    req.on("data", (chunk: string) => bodyChunks.push(chunk));
+    req.on("end", () => {
+      const body = bodyChunks.join("");
+      const response = new Response(body, {
+        status,
+        statusText: responseHeadersObj["status"] ?? "",
+        headers: responseHeadersObj,
+      });
+      settle(() => resolve(response));
+    });
+    req.on("error", (err) => {
+      settle(() => reject(err));
+    });
+  });
+  req.on("error", (err) => {
+    settle(() => reject(err));
+  });
+  req.on("frameError", (type, code) => {
+    settle(() => reject(Object.assign(new Error(`HTTP/2 frameError type=${type} code=${code}`), { code: "ERR_HTTP2_PROTOCOL_ERROR", name: "HTTP2FrameError" })));
+  });
+  // A close with no response settled means the stream ended before APNs
+  // answered — almost always an RST_STREAM ahead of any headers.  Reject
+  // right away: waiting out the request deadline would turn a retry-now
+  // reset into a 30s stall, and the deadline path would evict and destroy
+  // a session that just proved it is alive.  settle() clears the deadline
+  // timer, so this path never runs the eviction: an RST_STREAM kills one
+  // stream, not the connection, and the retry belongs on this same
+  // session.  A close after a settled response — or after the deadline's
+  // own CANCEL — is a no-op through the settled guard.
+  req.on("close", () => {
+    settle(() => reject(streamClosedError(req)));
+  });
+  // Write the body and end the stream.  An empty body is fine — APNs allows
+  // it for keepalive probes.
+  req.end(init?.body ?? "");
+}
+
+/** One APNs request: the shared transport, retry ladder and failure
+ * classification behind both push channels.
+ *
+ * Everything push-type specific — topic, priority, body — arrives as an
+ * argument, so a Live Activity goes through the same HTTP/2 session cache, the
+ * same 20-minute provider-token cache and the same key-fault handling as an
+ * alert.  A refused key is the key's verdict, not a channel's, and splitting
+ * the ladder would have meant teaching the watcher a second one. */
+async function sendApnsPush(
   config: ApnsConfig,
   deviceToken: string,
-  alert: ApnsAlert,
-  options: ApnsSendOptions = {},
+  request: { topic: string; pushType: string; priority: string; body: string },
+  options: ApnsSendOptions,
 ): Promise<ApnsSendResult> {
-  const fetchImpl = options.fetchImpl ?? fetch;
+  // The default transport is the http2 path, keyed by the SIGNING KEY and
+  // opened through the injected session factory when one is given; tests
+  // inject `fetchImpl` and bypass it entirely.  `fetchImpl` keeps the same
+  // URL-or-string input shape as the production impl so a test that swaps
+  // in a fake does not have to know about http2.
+  const fetchImpl: typeof fetch =
+    (options.fetchImpl as typeof fetch | undefined) ??
+    (createApnsHttp2Fetch({
+      keyId: config.keyId,
+      factory: options.http2SessionFactory,
+    }) as unknown as typeof fetch);
   const now = options.now ?? Date.now;
   const sleep = options.sleep ?? defaultSleep;
   const maxAttempts = Math.max(1, options.maxAttempts ?? APNS_MAX_ATTEMPTS);
   const host = config.production ? "api.push.apple.com" : "api.sandbox.push.apple.com";
   const token = deviceToken.replace(/\s+/g, "").toLowerCase();
-  if (!/^[0-9a-f]{64,}$/.test(token)) return { ok: false, status: 400, reason: "BadDeviceToken", attempts: 0 };
-  const body = JSON.stringify(apnsPayload(alert));
+  if (!/^[0-9a-f]{64,}$/.test(token)) {
+    return { ok: false, status: 400, reason: "BadDeviceToken", attempts: 0, failureKind: "bad_token" };
+  }
+  const body = request.body;
 
   let attempts = 0;
   let resigned = false;
   let lastStatus = 0;
   let lastReason: string | undefined;
+  let lastFailureKind: ApnsFailureKind = "none";
+  let lastErrorCode: string | undefined;
+  let lastErrorTimestamp: number | undefined;
 
   while (attempts < maxAttempts) {
     attempts += 1;
@@ -354,33 +1652,42 @@ export async function sendApnsAlert(
         method: "POST",
         headers: {
           authorization: `bearer ${providerToken(config, now())}`,
-          "apns-topic": config.bundleId,
-          "apns-push-type": "alert",
-          "apns-priority": "10",
+          "apns-topic": request.topic,
+          "apns-push-type": request.pushType,
+          "apns-priority": request.priority,
           "content-type": "application/json",
         },
         body,
       });
-    } catch {
-      // A reset connection, a DNS blip, a Wi-Fi drop.  This is the most
-      // common transient failure on a home link and the only one the status
-      // ladder below cannot see, so it earns the same bounded backoff a 503
-      // gets rather than losing the alert on the first attempt.
+    } catch (err) {
+      // A reset connection, a DNS blip, a Wi-Fi drop, an HTTP/2 GOAWAY.  This
+      // is the most common transient failure on a home link and the only
+      // one the status ladder below cannot see, so it earns the same bounded
+      // backoff a 503 gets rather than losing the alert on the first
+      // attempt.  The bucketed kind lands on `failureKind` so the health
+      // page can tell a DNS blip apart from a RST_STREAM.
+      const info = inspectTransportError(err);
       lastStatus = 0;
       lastReason = TRANSPORT_FAILURE_REASON;
+      lastFailureKind = classifyTransportError(info);
+      lastErrorCode = info.code || undefined;
       if (attempts >= maxAttempts) break;
       await sleep(backoffMs(attempts));
       continue;
     }
-    if (res.ok) return { ok: true, status: res.status, attempts };
+    if (res.ok) return { ok: true, status: res.status, attempts, failureKind: "none" };
 
-    const reason = await readReason(res);
+    const { reason, timestamp } = await readErrorBody(res);
     lastStatus = res.status;
+    lastErrorCode = undefined;
     lastReason = reason;
+    lastErrorTimestamp = timestamp;
+    lastFailureKind = classifyHttpResponse(res.status, reason);
 
     // Apple has unregistered this token.  The caller drops it; sending again
-    // would only earn the same answer.
-    if (res.status === 410) return { ok: false, status: 410, reason, attempts };
+    // would only earn the same answer.  The 410 body carries Apple's
+    // invalidation `timestamp` — keep it for the health page.
+    if (res.status === 410) return { ok: false, status: 410, reason, attempts, failureKind: "bad_token", errorTimestamp: timestamp };
 
     // A stale provider token is the one failure worth retrying instantly:
     // sign a new one and go straight back, no backoff, exactly once.
@@ -390,16 +1697,131 @@ export async function sendApnsAlert(
       continue;
     }
 
-    if (!RETRYABLE_STATUSES.has(res.status)) return { ok: false, status: res.status, reason, attempts };
+    if (!RETRYABLE_STATUSES.has(res.status)) {
+      // Surface the InvalidProviderToken timestamp on the health page so
+      // Jay's debug page interaction does not require a log dive.
+      return {
+        ok: false,
+        status: res.status,
+        reason,
+        attempts,
+        failureKind: lastFailureKind,
+        errorTimestamp: timestamp,
+      };
+    }
     if (attempts >= maxAttempts) break;
     const wait = res.status === 429 ? retryAfterMs(res.headers.get("retry-after")) : null;
     await sleep(wait ?? backoffMs(attempts));
   }
 
-  return { ok: false, status: lastStatus, reason: lastReason, attempts };
+  return {
+    ok: false,
+    status: lastStatus,
+    reason: lastReason,
+    attempts,
+    failureKind: lastFailureKind,
+    errorCode: lastErrorCode,
+    errorTimestamp: lastErrorTimestamp,
+  };
+}
+
+/** Post one banner alert on the ordinary push channel. */
+export async function sendApnsAlert(
+  config: ApnsConfig,
+  deviceToken: string,
+  alert: ApnsAlert,
+  options: ApnsSendOptions = {},
+): Promise<ApnsSendResult> {
+  return sendApnsPush(
+    config,
+    deviceToken,
+    {
+      topic: config.bundleId,
+      pushType: "alert",
+      priority: "10",
+      body: JSON.stringify(apnsPayload(alert)),
+    },
+    options,
+  );
+}
+
+/** Start, update or end one Live Activity.
+ *
+ * `start` carries priority 10 because it is the push that puts the island on
+ * the screen; `update` and `end` carry 5, which Apple treats as
+ * power-friendly and is all a content change or a dismissal needs.  The
+ * attributes go on the start alone — ActivityKit treats them as immutable,
+ * and resending them is at best wasted bytes. */
+export async function sendApnsLiveActivity(
+  config: ApnsConfig,
+  deviceToken: string,
+  push: LiveActivityPush,
+  options: ApnsSendOptions = {},
+): Promise<ApnsSendResult> {
+  return sendApnsPush(
+    config,
+    deviceToken,
+    {
+      topic: liveActivityTopic(config.bundleId),
+      pushType: "liveactivity",
+      priority: push.event === "start" ? "10" : "5",
+      body: JSON.stringify(
+        liveActivityPayload(push.event, push.attributes, push.state, push.alert, {
+          timestamp: push.timestamp,
+          dismissalDate: push.dismissalDate,
+        }),
+      ),
+    },
+    options,
+  );
+}
+
+/** Bucketed shape of why a HTTP-layer call did not land.  Decision table:
+ * every status Apple commonly returns plus the matching reason string. */
+export function classifyHttpResponse(status: number, reason: string | undefined): Exclude<ApnsFailureKind, "none"> {
+  if (status === 429) return "rate_limit";
+  if (status === 410) return "bad_token";
+  if (status === 400 && (reason === "BadDeviceToken" || reason === "DeviceTokenNotForTopic")) return "bad_token";
+  if (status === 403 && reason === EXPIRED_TOKEN_REASON) return "expired_token";
+  if (status === 403 && reason === INVALID_PROVIDER_TOKEN) return "key_fault";
+  if (status === 503) return "rate_limit";
+  if (status >= 500 && status < 600) return "server";
+  if (status === 400 || status === 403) return "rejected";
+  return "server";
 }
 
 // --- Sender health --------------------------------------------------------
+
+/** Why this sidecar is not sending pushes at all.  A word rather than a
+ * sentence, so the phone and the pairing page can each say it their own
+ * way: `no-key` (no usable signing key), `key-rejected` (Apple refuses the
+ * one we have), `unreachable` (every paired phone's circuit is open because
+ * Apple's push service cannot be reached). */
+export type PushesOffReason = "no-key" | "key-rejected" | "unreachable";
+
+/** One paired phone's own push state.
+ *
+ * Per device because the breaker is per device.  A single shared counter
+ * could not open: `deliver` fans every notification out to every
+ * disconnected phone, so one other phone's `400 BadDeviceToken` zeroed the
+ * run before it could reach the threshold, and a link that was down for two
+ * days never tripped anything. */
+export interface PushDeviceHealth {
+  deviceId: string;
+  /** The bucketed shape of this phone's last failure. */
+  failureKind: ApnsFailureKind;
+  /** Transport-family failures in a row for THIS phone. */
+  consecutiveTransportFailures: number;
+  /** `err.code` from this phone's last failure, verbatim. */
+  lastErrorCode: string | null;
+  /** Epoch ms; non-null means this phone's lane is holding its alerts until
+   * then.  They are held, not discarded. */
+  circuitOpenUntil: number | null;
+  /** Alerts waiting on this phone's lane right now. */
+  queued: number;
+  /** Alerts this phone's lane has dropped because it was full. */
+  dropped: number;
+}
 
 /** What the desktop and the phone may know about the push sender.  Every
  * field here is either a count, a timestamp, or a status Apple sent us —
@@ -415,25 +1837,118 @@ export interface PushSenderHealth {
   failed: number;
   lastSentAt: number | null;
   lastErrorAt: number | null;
-  /** Status plus Apple's reason, e.g. `403 ExpiredProviderToken`. */
+  /** Status plus Apple's reason, e.g. `403 ExpiredProviderToken`.  The
+   * InvalidProviderToken case additionally carries the `timestamp` field
+   * Apple sent (formatted as `InvalidProviderToken (timestamp=12345)`) so
+   * the owner can paste it straight into the Apple debug page. */
   lastError: string | null;
   /** Set when Apple refused the signing key itself.  Sending is off until
-   * the key file changes; a new signature from the same key cannot help. */
+   * the signing key changes; a new signature from the same key cannot help. */
   keyRejected: string | null;
   /** Notifications dropped because a device's queue was already full. */
   dropped: number;
+  /** Drain passes HELD BACK because the circuit breaker was open — Apple's
+   * push service was unreachable, not a full queue on this computer.  Kept
+   * apart from `dropped` so the phone can say which one happened, and it is
+   * deliberately not a count of lost notifications: an open circuit now
+   * leaves every alert on its lane and sends it when the circuit closes. */
+  circuitDropped: number;
+  /** The bucketed shape of the last failure — Apple vs transport vs key.
+   * "none" when the last attempt succeeded or no attempt has happened yet.
+   * This is the field that tells the owner which fix to read next. */
+  failureKind: ApnsFailureKind;
+  /** Transport failures in a row (DNS / TCP / TLS / HTTP/2 socket drop,
+   * request timeout).
+   * Resets to zero the moment a send lands at Apple with a 2xx, regardless
+   * of how many transport failures came before — a recovered network
+   * should not carry an old run's bad luck forward. */
+  consecutiveTransportFailures: number;
+  /** `err.code` / HTTP/2 code from the last failure, surfaced verbatim so
+   * the owner sees exactly what Node raised (e.g. `ECONNRESET`,
+   * `ERR_HTTP2_PROTOCOL_ERROR`).  Null between failures. */
+  lastErrorCode: string | null;
+  /** Epoch ms; non-null means at least one phone's lane is intentionally
+   * holding its alerts because transport failures exceeded the threshold.
+   * The latest of the open circuits, so it reads as "everything is moving
+   * again by then".  Null when every circuit is closed. */
+  circuitOpenUntil: number | null;
+  /** One row per phone the sender knows something about — its own failure
+   * run, its own circuit, its own backlog.  Empty when nothing has failed
+   * and nothing is queued. */
+  devices: PushDeviceHealth[];
+  /** True when this sidecar is not going to deliver a push right now, for
+   * any reason.  The one field a phone can trust to say "closed-app
+   * notifications are off" — `lastSentAt` cannot, because a sender that
+   * stopped working an hour ago still has one. */
+  pushesOff: boolean;
+  /** Why, when `pushesOff`.  Null when pushes are on. */
+  pushesOffReason: PushesOffReason | null;
 }
 
 interface HealthTracker {
   snapshot(): PushSenderHealth;
   setConfigured(config: ApnsConfig | null): void;
-  rejectKey(at: number, reason: string): void;
-  recordSent(at: number): void;
-  recordError(at: number, status: number, reason?: string): void;
-  recordDropped(): void;
+  rejectKey(at: number, reason: string, errorTimestamp?: number): void;
+  recordSent(deviceId: string, at: number): void;
+  recordError(
+    deviceId: string,
+    at: number,
+    status: number,
+    reason?: string,
+    failureKind?: ApnsFailureKind,
+    errorCode?: string,
+    errorTimestamp?: number,
+  ): void;
+  recordDropped(deviceId: string): void;
+  /** A drain pass held back because that phone's circuit is open. */
+  recordCircuitDeferred(): void;
+  /** Transport-family failures in a row for one phone. */
+  transportFailureRun(deviceId: string): number;
+  /** HTTP/2 protocol errors in a row for one phone — only `http2_protocol`
+   * failures, so timeouts and socket drops never trip the tighter protocol
+   * breaker. */
+  protocolFailureRun(deviceId: string): number;
+  /** True iff this phone's circuit is open — its lane must hold rather than
+   * send, and without incrementing `failed`. */
+  circuitIsOpen(deviceId: string, at: number): boolean;
+  /** When this phone's circuit closes, or null. */
+  circuitClosesAt(deviceId: string): number | null;
+  /** Open one phone's circuit for 60 seconds.  Used by the watcher when the
+   * transport-failure or http2-protocol threshold trips for that phone. */
+  openCircuit(deviceId: string, at: number, ms: number): void;
 }
 
-function createHealthTracker(tokensRegistered: () => number): HealthTracker {
+export const APNS_CIRCUIT_WINDOW_MS = 60_000;
+export const APNS_TRANSPORT_THRESHOLD = 20;
+export const APNS_HTTP2_PROTOCOL_THRESHOLD = 5;
+
+/** The failure shapes that mean the request never reached Apple.  These are
+ * the only ones the breaker counts: an answer from Apple — a dead token, a
+ * rate limit, a refused key — says the connection is fine, and counting it
+ * as transport weather is what kept the breaker from ever opening.
+ *
+ * `http2_protocol` belongs here.  It used to increment the run and then be
+ * excluded from the branch that trips, so a GOAWAY arriving on the run's
+ * twentieth failure skipped the trip entirely. */
+export function isTransportFailure(kind: ApnsFailureKind | undefined): boolean {
+  return kind === "transport" || kind === "socket_closed" || kind === "timeout" || kind === "http2_protocol";
+}
+
+/** One phone's slice of the sender state. */
+interface DeviceCircuit {
+  consecutiveTransportFailures: number;
+  consecutiveProtocolFailures: number;
+  failureKind: ApnsFailureKind;
+  lastErrorCode: string | null;
+  circuitOpenUntil: number | null;
+  dropped: number;
+}
+
+function createHealthTracker(
+  tokensRegistered: () => number,
+  queueDepths: () => Map<string, number>,
+  now: () => number,
+): HealthTracker {
   let configured = false;
   let production: boolean | null = null;
   let sent = 0;
@@ -443,19 +1958,87 @@ function createHealthTracker(tokensRegistered: () => number): HealthTracker {
   let lastError: string | null = null;
   let keyRejected: string | null = null;
   let dropped = 0;
+  let circuitDropped = 0;
+  let failureKind: ApnsFailureKind = "none";
+  let lastErrorCode: string | null = null;
+  const perDevice = new Map<string, DeviceCircuit>();
+
+  const state = (deviceId: string): DeviceCircuit => {
+    let found = perDevice.get(deviceId);
+    if (!found) {
+      found = {
+        consecutiveTransportFailures: 0,
+        consecutiveProtocolFailures: 0,
+        failureKind: "none",
+        lastErrorCode: null,
+        circuitOpenUntil: null,
+        dropped: 0,
+      };
+      perDevice.set(deviceId, found);
+    }
+    return found;
+  };
+
+  const isOpen = (device: DeviceCircuit, at: number): boolean =>
+    device.circuitOpenUntil !== null && device.circuitOpenUntil > at;
+
   return {
-    snapshot: () => ({
-      configured,
-      production,
-      tokensRegistered: tokensRegistered(),
-      sent,
-      failed,
-      lastSentAt,
-      lastErrorAt,
-      lastError,
-      keyRejected,
-      dropped,
-    }),
+    snapshot: () => {
+      const at = now();
+      const depths = queueDepths();
+      const ids = new Set([...perDevice.keys(), ...depths.keys()]);
+      const devices: PushDeviceHealth[] = [...ids].map((deviceId) => {
+        const device = perDevice.get(deviceId);
+        return {
+          deviceId,
+          failureKind: device?.failureKind ?? "none",
+          consecutiveTransportFailures: device?.consecutiveTransportFailures ?? 0,
+          lastErrorCode: device?.lastErrorCode ?? null,
+          circuitOpenUntil: device && isOpen(device, at) ? device.circuitOpenUntil : null,
+          queued: depths.get(deviceId) ?? 0,
+          dropped: device?.dropped ?? 0,
+        };
+      });
+      const open = devices.filter((device) => device.circuitOpenUntil !== null);
+      const tokens = tokensRegistered();
+      // Pushes are off when there is no usable key, when Apple refuses the
+      // one we have, or when every phone that holds a token is behind an
+      // open circuit.  A quiet fleet with nothing queued is not "off".
+      let pushesOffReason: PushesOffReason | null = null;
+      if (keyRejected !== null) pushesOffReason = "key-rejected";
+      else if (!configured) pushesOffReason = "no-key";
+      else if (tokens > 0 && open.length >= tokens) pushesOffReason = "unreachable";
+      return {
+        configured,
+        production,
+        tokensRegistered: tokens,
+        sent,
+        failed,
+        lastSentAt,
+        lastErrorAt,
+        lastError,
+        keyRejected,
+        dropped,
+        circuitDropped,
+        failureKind,
+        // The worst run across the fleet: the number the owner wants when a
+        // single phone's link is the thing that is broken.
+        consecutiveTransportFailures: devices.reduce(
+          (worst, device) => Math.max(worst, device.consecutiveTransportFailures),
+          0,
+        ),
+        lastErrorCode,
+        // The latest of the open circuits, so the page can say when
+        // everything is moving again rather than when the first one is.
+        circuitOpenUntil: open.reduce<number | null>(
+          (latest, device) => (latest === null || (device.circuitOpenUntil ?? 0) > latest ? device.circuitOpenUntil : latest),
+          null,
+        ),
+        devices,
+        pushesOff: pushesOffReason !== null,
+        pushesOffReason,
+      };
+    },
     setConfigured: (config) => {
       configured = config !== null;
       production = config ? config.production : null;
@@ -463,24 +2046,167 @@ function createHealthTracker(tokensRegistered: () => number): HealthTracker {
       // the verdict on the old one no longer describes what we hold.
       if (config) keyRejected = null;
     },
-    rejectKey: (at, reason) => {
+    rejectKey: (at, reason, errorTimestamp) => {
       configured = false;
       production = null;
       keyRejected = reason;
       lastErrorAt = at;
-      lastError = reason;
+      // Apple stamps InvalidProviderToken rejections with a `timestamp`
+      // field the debug page asks for verbatim.  Surface it on the health
+      // so the owner does not have to dig through the log.
+      if (reason === INVALID_PROVIDER_TOKEN && typeof errorTimestamp === "number") {
+        lastError = `${reason} (timestamp=${errorTimestamp})`;
+      } else {
+        lastError = reason;
+      }
     },
-    recordSent: (at) => {
+    recordSent: (deviceId, at) => {
       sent += 1;
       lastSentAt = at;
+      // A successful send resets THIS phone's transport-failure run and
+      // closes its circuit.  Even a 200 against the test seam means the
+      // round trip worked, which is the only signal the circuit reacts to.
+      // Another phone's run is untouched: its link may still be broken.
+      const device = state(deviceId);
+      device.consecutiveTransportFailures = 0;
+      device.consecutiveProtocolFailures = 0;
+      device.failureKind = "none";
+      device.lastErrorCode = null;
+      device.circuitOpenUntil = null;
+      failureKind = "none";
+      lastErrorCode = null;
     },
-    recordError: (at, status, reason) => {
+    recordError: (deviceId, at, status, reason, kind, code, errorTimestamp) => {
       failed += 1;
       lastErrorAt = at;
-      lastError = reason ? `${status} ${reason}` : String(status);
+      failureKind = kind ?? "transport";
+      const device = state(deviceId);
+      device.failureKind = failureKind;
+      // A transport-layer failure increments THIS phone's run; an HTTP-layer
+      // Apple verdict zeroes it — but only for the phone it was about.  One
+      // shared counter, reset by any device's 400, is why the breaker shipped
+      // in #525 could never reach its threshold.
+      if (isTransportFailure(failureKind)) {
+        device.consecutiveTransportFailures += 1;
+      } else {
+        device.consecutiveTransportFailures = 0;
+      }
+      device.consecutiveProtocolFailures =
+        failureKind === "http2_protocol" ? device.consecutiveProtocolFailures + 1 : 0;
+      device.lastErrorCode = code ?? null;
+      lastErrorCode = code ?? null;
+      let formatted: string;
+      if (reason) {
+        formatted = `${status} ${reason}`;
+        // Apple stamps a `timestamp` on the two verdicts that carry one:
+        // 403 InvalidProviderToken and 410 Unregistered — the token's
+        // invalidation time, which the debug page asks for verbatim.
+        // Surface it on the health so the owner does not have to dig
+        // through the log.
+        if ((failureKind === "key_fault" || status === 410) && typeof errorTimestamp === "number") {
+          formatted = `${formatted} (timestamp=${errorTimestamp})`;
+        }
+      } else {
+        formatted = String(status);
+        if (status === 410 && typeof errorTimestamp === "number") {
+          formatted = `${formatted} (timestamp=${errorTimestamp})`;
+        }
+      }
+      lastError = formatted;
     },
-    recordDropped: () => {
+    recordDropped: (deviceId) => {
       dropped += 1;
+      state(deviceId).dropped += 1;
+    },
+    recordCircuitDeferred: () => {
+      circuitDropped += 1;
+    },
+    transportFailureRun: (deviceId) => perDevice.get(deviceId)?.consecutiveTransportFailures ?? 0,
+    protocolFailureRun: (deviceId) => perDevice.get(deviceId)?.consecutiveProtocolFailures ?? 0,
+    circuitIsOpen: (deviceId, at) => {
+      const device = perDevice.get(deviceId);
+      return device !== undefined && isOpen(device, at);
+    },
+    circuitClosesAt: (deviceId) => perDevice.get(deviceId)?.circuitOpenUntil ?? null,
+    openCircuit: (deviceId, at, ms) => {
+      state(deviceId).circuitOpenUntil = at + ms;
+    },
+  };
+}
+
+// --- Key-fault persistence ------------------------------------------------
+//
+// `InvalidProviderToken` means Apple refuses the signing KEY, not this
+// request: a fresh signature earns the identical answer, forever.  Holding
+// that verdict in a process-local `let` meant every Electron relaunch
+// resumed full-rate sends against a key Apple had already refused — two
+// days of them, one failure every forty seconds, with every surface still
+// reporting pushes as on.
+//
+// So the verdict goes on disk, beside the device registry, keyed to the
+// signing KEY: replacing the key is what clears it, and nothing else does.
+// What is written is a fingerprint — the key's source plus a one-way digest
+// of its bytes — plus Apple's own words.  Never a byte of the key.
+
+export interface PersistedKeyFault {
+  /** Apple's reason string, e.g. `InvalidProviderToken`. */
+  reason: string;
+  /** When the verdict was recorded, epoch ms. */
+  at: number;
+  /** `apnsKeyStamp()` at the moment of the fault.  A different value means a
+   * different key, which is the only thing that turns pushes back on. */
+  keyStamp: string | null;
+  /** Apple's own `timestamp` field, for the debug page. */
+  errorTimestamp?: number;
+}
+
+/** Where a key fault is remembered across restarts.  A seam rather than a
+ * bare file path so a test can hold one in memory, and so a watcher given
+ * no store behaves exactly as it did before — in memory, for this process
+ * only. */
+export interface KeyFaultStore {
+  load(): PersistedKeyFault | null;
+  save(fault: PersistedKeyFault | null): void;
+}
+
+/** The file name, beside `devices.json` rather than inside it: the registry
+ * rewrites its whole document on every change, so a second key living in
+ * that object would be erased by the next pairing. */
+export const KEY_FAULT_FILE = "push-key-fault.json";
+
+/** The production store.  Every failure is swallowed: a full or read-only
+ * disk is a reason for the fault to be forgotten at the next restart, never
+ * a reason to take down the sidecar every paired phone depends on. */
+export function diskKeyFaultStore(dir: string = DATA_DIR): KeyFaultStore {
+  const file = join(dir, KEY_FAULT_FILE);
+  return {
+    load: () => {
+      try {
+        const parsed = JSON.parse(readFileSync(file, "utf8")) as Partial<PersistedKeyFault>;
+        if (typeof parsed?.reason !== "string") return null;
+        return {
+          reason: parsed.reason,
+          at: typeof parsed.at === "number" && Number.isFinite(parsed.at) ? parsed.at : 0,
+          keyStamp: typeof parsed.keyStamp === "string" ? parsed.keyStamp : null,
+          errorTimestamp: typeof parsed.errorTimestamp === "number" ? parsed.errorTimestamp : undefined,
+        };
+      } catch {
+        return null;
+      }
+    },
+    save: (fault) => {
+      try {
+        if (fault === null) {
+          rmSync(file, { force: true });
+          return;
+        }
+        // 0700, the same posture the registry keeps: this file names a path
+        // on this machine, and nothing else on it needs to read that.
+        mkdirSync(dir, { recursive: true, mode: 0o700 });
+        writeFileAtomic(file, JSON.stringify(fault, null, 2));
+      } catch {
+        /* the fault still holds in memory; it just will not survive a restart */
+      }
     },
   };
 }
@@ -499,6 +2225,18 @@ export const APNS_KEY_RECHECK_MS = 5 * 60 * 1000;
  * backlog does form the newest alerts are the ones worth keeping. */
 export const APNS_MAX_QUEUED_PER_DEVICE = 8;
 
+/** The same cap for Live Activity starts, on their own lanes.  Small on
+ * purpose: a phone that has been asleep through five approvals wants the
+ * newest one on its island, not a queue replayed at it on wake. */
+export const APNS_MAX_QUEUED_LIVE_ACTIVITIES = 2;
+
+/** How often a link that keeps failing is allowed to say so.  A broken
+ * transport produced 6,003 identical log lines over two days — one per
+ * attempt cycle, forever — because transport failures were the one outcome
+ * class with no dedupe.  The first failure of a kind is logged; after that
+ * one summary line carries the count. */
+export const APNS_TRANSPORT_SUMMARY_MS = 10 * 60 * 1000;
+
 export interface PushWatch {
   /** Stop tailing the harness and sending. */
   stop(): void;
@@ -515,24 +2253,79 @@ export function watchHarnessNotifications(options: {
   /** Explicit config pins the sender; `undefined` discovers it from disk and
    * keeps looking until it appears, then watches for it changing. */
   config?: ApnsConfig | null;
-  loadConfig?: () => ApnsConfig | null;
-  /** Fingerprint of the key file, so a rotated key is noticed. */
-  keyStamp?: () => string | null;
+  loadConfig?: () => ApnsConfig | null | Promise<ApnsConfig | null>;
+  /** Fingerprint of the signing key, so a rotated key is noticed. */
+  keyStamp?: () => string | null | Promise<string | null>;
   /** Retire a token Apple has rejected.  The token is named so a phone
    * that registered a replacement while this send was in flight keeps it. */
   forgetToken?: (deviceId: string, token: string) => void;
+  /** Phones holding a push-to-start Live Activity token.  Its own list, never
+   * appended to `tokensForDisconnected`: health counts the phones on that one
+   * to decide whether pushes are off, and counting a phone twice there would
+   * have every phone counted against itself. */
+  liveActivityTokensForDisconnected?: () => { deviceId: string; token: string }[];
+  /** Test seam, the Live Activity twin of `send`. */
+  sendLiveActivity?: typeof sendApnsLiveActivity;
+  /** Retire a Live Activity token Apple has rejected.  Separate from
+   * `forgetToken` because the registry holds two independent tokens and
+   * clearing one against the other would silently do nothing. */
+  forgetLiveActivityToken?: (deviceId: string, token: string) => void;
   fetchImpl?: typeof fetch;
   now?: () => number;
   keyRecheckMs?: number;
   maxQueuedPerDevice?: number;
+  /** How many Live Activity starts one phone may have waiting. */
+  maxQueuedLiveActivities?: number;
+  /** Where a key fault is remembered across restarts.  The sidecar hands in
+   * `diskKeyFaultStore()`; a watcher without one keeps the fault in memory
+   * for this process only, which is what a test wants. */
+  keyFaultStore?: KeyFaultStore;
+  /** Test seam: how a lane holding alerts behind an open circuit schedules
+   * its retry.  Production uses an unref'd `setTimeout`; a test with a fake
+   * clock hands in something it can fire itself.  Returns its own cancel. */
+  scheduleRetry?: (run: () => void, ms: number) => () => void;
 }): PushWatch {
-  const health = createHealthTracker(() => options.tokensForDisconnected().length);
   const fixed = options.config;
   const loadConfig = options.loadConfig ?? loadApnsConfig;
   const keyStamp = options.keyStamp ?? (() => apnsKeyStamp());
   const now = options.now ?? Date.now;
   const recheckMs = options.keyRecheckMs ?? APNS_KEY_RECHECK_MS;
   const maxQueued = Math.max(1, options.maxQueuedPerDevice ?? APNS_MAX_QUEUED_PER_DEVICE);
+  const keyFaultStore = options.keyFaultStore ?? null;
+  const scheduleRetry =
+    options.scheduleRetry ??
+    ((run: () => void, ms: number) => {
+      const handle = setTimeout(run, ms);
+      handle.unref?.();
+      return () => clearTimeout(handle);
+    });
+
+  // One queue per device, drained on its own chain.  A phone Apple is rate
+  // limiting sleeps out its own Retry-After without holding up any other
+  // phone, and each phone still sees its notifications in order.  Declared
+  // here, above the pinned-off early return, because the health snapshot
+  // reads the queue depths and a pinned-off watcher still answers health().
+  const queues = new Map<string, DeviceQueue>();
+  const queueDepth = (queue: DeviceQueue): number => queue.blocking.length + queue.normal.length;
+
+  // Live Activity pushes get their own lanes, keyed the same way but never
+  // sharing a queue with the alerts above.  `queues` drops the oldest entry
+  // when a phone's lane is full, and it is specified to drop a report before
+  // an approval — a rule that says nothing about islands, and one that would
+  // silently discard a start.  Depth is deliberately NOT reported to health:
+  // `tokensRegistered` counts the phones on `tokensForDisconnected`, and a
+  // second token type counted there would count every phone twice against the
+  // unreachable/off thresholds.
+  const liveQueues = new Map<string, LiveDeviceQueue>();
+  /** How many starts one phone may have waiting.  An island is a summary, not
+   * a transcript: past this the newest one says everything the backlog did. */
+  const maxLiveQueued = Math.max(1, options.maxQueuedLiveActivities ?? APNS_MAX_QUEUED_LIVE_ACTIVITIES);
+
+  const health = createHealthTracker(
+    () => options.tokensForDisconnected().length,
+    () => new Map([...queues].map(([deviceId, queue]) => [deviceId, queueDepth(queue)])),
+    () => now(),
+  );
 
   // An explicit null means "this process does not send pushes" — the desktop
   // saying so, or a test.  Honour it without holding a stream open.
@@ -542,6 +2335,11 @@ export function watchHarnessNotifications(options: {
   }
 
   const send = options.send ?? sendApnsAlert;
+  const sendLiveActivity = options.sendLiveActivity ?? sendApnsLiveActivity;
+  // The harness SSE stream is HTTP/1.1 loopback; native `fetch` is the
+  // right choice for it.  APNs pushes go through the http2 path inside
+  // `sendApnsAlert`, not here — the watcher never calls `fetch` against
+  // an APNs host.
   const fetchImpl = options.fetchImpl ?? fetch;
   let stopped = false;
   let timer: ReturnType<typeof setTimeout> | null = null;
@@ -550,7 +2348,7 @@ export function watchHarnessNotifications(options: {
   let discovered: ApnsConfig | null = fixed ?? null;
   let discoveredStamp: string | null = null;
   let warnedMissing = false;
-  /** Set when Apple refused the key itself.  Only a different key file
+  /** Set when Apple refused the key itself.  Only a different signing key
    * clears it — a fresh signature from the same one earns the same answer. */
   let keyFault = false;
   /** The newest SSE id seen, so a reconnect resumes rather than silently
@@ -559,6 +2357,26 @@ export function watchHarnessNotifications(options: {
   /** One line per device and failure, so a phone with a dead token does not
    * write a log line for every notification the fleet ever sends. */
   const loggedFailures = new Set<string>();
+  /** APNs host → the key fingerprint (sha256[:16] of the .p8) we last
+   * built an http2 session with.  Used to rebuild the session when the
+   * watcher reloads a rotated key — a TLS session tied to the old key is
+   * not safe to reuse, even with the same keyId. */
+  const sessionFingerprints = new Map<string, string>();
+  /** What each phone's circuit has already been announced for, so a
+   * 60-second blip does not log a warning every drain iteration.  The key is
+   * the device and the CAUSE and nothing else: it used to carry the failure
+   * count, which only ever resets on success, so no key ever matched twice,
+   * a warning was logged on every trip, and the set grew without bound. */
+  const loggedCircuitOpen = new Set<string>();
+  /** Phones whose full backlog has already been reported once. */
+  const loggedQueueFull = new Set<string>();
+  /** Per phone: the transport failure being lived through right now, so a
+   * broken link writes one line for the state change and then one summary
+   * line every ten minutes instead of one line per attempt forever. */
+  const transportLogs = new Map<string, { key: string; count: number; since: number; lastLoggedAt: number }>();
+  /** Per phone: cancel the pending retry of a lane held behind an open
+   * circuit, so stop() leaves no timer behind. */
+  const circuitRetries = new Map<string, () => void>();
 
   if (fixed) health.setConfigured(fixed);
 
@@ -569,41 +2387,202 @@ export function watchHarnessNotifications(options: {
     return true;
   };
 
-  const onKeyFault = (reason: string) => {
+  /** One line when a phone's transport starts failing, and one summary line
+   * every ten minutes while it keeps failing the same way.  Keyed on the
+   * device and the failure shape, so a link that changes its mind (a DNS
+   * failure becoming a GOAWAY) still says so once. */
+  const noteTransportFailure = (deviceId: string, at: number, result: ApnsSendResult) => {
+    const kind = result.failureKind ?? "transport";
+    const key = `${kind}:${result.errorCode ?? result.reason ?? ""}`;
+    const entry = transportLogs.get(deviceId);
+    if (!entry || entry.key !== key) {
+      transportLogs.set(deviceId, { key, count: 1, since: at, lastLoggedAt: at });
+      console.warn(
+        `companion: APNs ${kind}${result.errorCode ? ` (${result.errorCode})` : ""} — a phone's push connection is failing.  ` +
+          `Further identical failures are summarised every ${APNS_TRANSPORT_SUMMARY_MS / 60_000} minutes.`,
+      );
+      return;
+    }
+    entry.count += 1;
+    if (at - entry.lastLoggedAt < APNS_TRANSPORT_SUMMARY_MS) return;
+    entry.lastLoggedAt = at;
+    console.warn(
+      `companion: APNs ${entry.key} — ${entry.count} transport failures for one phone over ` +
+        `${Math.max(1, Math.round((at - entry.since) / 60_000))} min.  Still retrying.`,
+    );
+  };
+
+  /** A phone's link came back.  Say so once if it had been failing, and
+   * forget every key that was deduping its failures — otherwise the next
+   * outage would be silent, which is the opposite mistake. */
+  const clearTransportLog = (deviceId: string) => {
+    const entry = transportLogs.get(deviceId);
+    if (!entry) return;
+    transportLogs.delete(deviceId);
+    if (entry.count > 1) {
+      console.log(`companion: APNs delivery recovered for a phone after ${entry.count} transport failures`);
+    }
+  };
+
+  /** Everything a phone's success should make us forget. */
+  const forgetFailureLogs = (deviceId: string) => {
+    clearTransportLog(deviceId);
+    loggedCircuitOpen.delete(`${deviceId}:transport`);
+    loggedCircuitOpen.delete(`${deviceId}:http2_protocol`);
+    loggedCircuitOpen.delete(`${deviceId}:defer`);
+    loggedQueueFull.delete(deviceId);
+  };
+
+  const onKeyFault = async (config: ApnsConfig, reason: string, errorTimestamp?: number) => {
     if (keyFault) return;
     keyFault = true;
-    discovered = null;
-    health.rejectKey(now(), reason);
-    console.warn(`companion: APNs refused the signing key (${reason}); pushes are off until the key file changes`);
+    // `discovered` is deliberately kept.  Nulling it here is what used to
+    // make a later rotation skip the key-identity comparison in
+    // `refreshConfig`, so the replacement .p8 was signed against the
+    // provider token cached for the key Apple had just refused — and was
+    // refused in turn, permanently.  The refused key's token and its TLS
+    // sessions are worthless either way, so drop them now, before the await
+    // below, so nothing can reuse them in the meantime.
+    invalidateProviderToken(config);
+    dropHttp2Sessions();
+    sessionFingerprints.clear();
+    const at = now();
+    health.rejectKey(at, reason, errorTimestamp);
+    // Pin the verdict to the key in hand right now: only a DIFFERENT key
+    // clears it, here and across restarts.  The read is served from the
+    // four-minute cache the key check just refreshed, so this await is a
+    // microtask, not a vault round-trip.
+    const stamp = await keyStamp();
+    if (stamp !== null) discoveredStamp = stamp;
+    keyFaultStore?.save({ reason, at, keyStamp: discoveredStamp, errorTimestamp });
+    // Rule 43:  name the refused key by its masked preview, so an operator
+    // tailing the log can tell WHICH key Apple rejected.  The key itself is
+    // never printed.  The remedy names the real source:  the key lives in
+    // the vault, so "until the key file changes" points an operator at a
+    // local .p8 that is no longer read, and replacing it would not clear
+    // the verdict.  The persisted-fault message below names the source the
+    // same way.
+    console.warn(
+      `companion: APNs refused the signing key (${reason}; preview ${keyPreview(config.p8)}); ` +
+        `pushes are off until ${apnsKeySource()} is replaced`,
+    );
     // Leave the stream so the pump re-enters the key check rather than
     // sending the same doomed request for every notification that follows.
     abort?.abort();
   };
 
-  /** Look at the key file and reload when it has changed.  Runs on a timer
+  /** Open one phone's circuit breaker.  Called when that phone's transport
+   * failures exceed the threshold OR when its http2_protocol errors cluster
+   * — a hot loop burning provider-token re-signs against an unreachable
+   * gateway is what we are guarding against.  Logged once per phone per
+   * cause, and that key is cleared by the phone's next success. */
+  const tripCircuit = (deviceId: string, host: string, cause: "transport" | "http2_protocol", detail: string) => {
+    health.openCircuit(deviceId, now(), APNS_CIRCUIT_WINDOW_MS);
+    const key = `${deviceId}:${cause}`;
+    if (loggedCircuitOpen.has(key)) return;
+    loggedCircuitOpen.add(key);
+    console.warn(`companion: APNs circuit open for ${APNS_CIRCUIT_WINDOW_MS / 1000}s after ${detail} on ${host}`);
+  };
+
+  /** Come back to a lane that is holding alerts behind an open circuit.
+   * Without this the backlog would wait for an unrelated notification to
+   * that same phone — which for a blocking approval is exactly the delay
+   * the lane exists to prevent. */
+  const scheduleCircuitRetry = (deviceId: string, ms: number) => {
+    if (circuitRetries.has(deviceId)) return;
+    const cancel = scheduleRetry(() => {
+      circuitRetries.delete(deviceId);
+      const queue = queues.get(deviceId);
+      if (stopped || !queue || queue.running || queueDepth(queue) === 0) return;
+      void drain(deviceId, queue);
+    }, ms);
+    circuitRetries.set(deviceId, cancel);
+  };
+
+  // A key fault Apple has already delivered survives this process.  Without
+  // this, every Electron relaunch resumed full-rate sends against a key
+  // Apple had refused days earlier — and every surface, including the
+  // phone's own settings row, went on reporting pushes as on.
+  const persistedFault = keyFaultStore?.load() ?? null;
+  /** Whether the persisted fault has already been weighed against the key on
+   * disk.  The weighing needs a stamp, and the stamp needs the vault, so it
+   * happens inside the first `refreshConfig` — which the pump awaits before
+   * it sends anything.  Checking it at construction would have meant either a
+   * blocking read on the event loop or a window where a push goes out against
+   * a key Apple already refused. */
+  let persistedFaultChecked = persistedFault === null;
+
+  /** Look at the signing key and reload when it has changed.  Runs on a timer
    * rather than only when the stream reconnects: a sidecar whose harness
    * stays up for days never reconnects, and a key dropped in or rotated
    * under it would otherwise go unnoticed for exactly as long. */
-  const refreshConfig = (): ApnsConfig | null => {
-    if (fixed) return keyFault ? null : fixed;
-    const stamp = keyStamp();
+  const refreshConfig = async (): Promise<ApnsConfig | null> => {
+    const stamp = await keyStamp();
+    if (!persistedFaultChecked) {
+      persistedFaultChecked = true;
+      if (persistedFault) {
+        if (stamp !== null && stamp === persistedFault.keyStamp) {
+          keyFault = true;
+          discoveredStamp = stamp;
+          health.rejectKey(persistedFault.at, persistedFault.reason, persistedFault.errorTimestamp);
+          // Rule 43:  a rejected provider key is identified by a masked
+          // first-8/last-4 preview, never by its value.  The key in hand is
+          // the one Apple refused — the stamp above matched it — and it is
+          // already in the vault cache, so this is not a second round trip.
+          const rejected = await loadConfig();
+          console.warn(
+            `companion: APNs pushes stay off — Apple refused this signing key (${persistedFault.reason}; ` +
+              `preview ${keyPreview(rejected?.p8)}) and the key has not changed since.  ` +
+              `Replace ${apnsKeySource()} to turn them back on.`,
+          );
+        } else {
+          // A different key, or no key at all: the verdict was about a key we
+          // no longer hold, so it has nothing left to say.
+          keyFaultStore?.save(null);
+        }
+      }
+    }
     if (keyFault) {
-      // Apple refuses what is on disk.  Only a different file can help.
+      // Apple refuses the key in hand.  Only a different key can help.
       if (stamp === null || stamp === discoveredStamp) return null;
       keyFault = false;
-    } else if (discovered && stamp !== null && stamp === discoveredStamp) {
-      // The same file as last time: keep the config, and the provider token
+      keyFaultStore?.save(null);
+      console.log("companion: the APNs signing key changed; closed-app phone wake is being tried again");
+      if (fixed) {
+        // A pinned config cannot be reloaded, but the key under it changed:
+        // the cached provider token and the TLS sessions that were built
+        // for the refused key must not be reused against the new one.
+        health.setConfigured(fixed);
+        invalidateProviderToken(fixed);
+        dropHttp2Sessions();
+        sessionFingerprints.clear();
+        resumeIdleQueues();
+      }
+    }
+    if (fixed) {
+      discoveredStamp = stamp;
+      return fixed;
+    }
+    if (discovered && stamp !== null && stamp === discoveredStamp) {
+      // The same key as last time: keep the config, and the provider token
       // cached against it.
       return discovered;
     }
-    const loaded = loadConfig();
-    // Whatever is on disk now may not be what the cached token was signed
-    // with.  Compare key identity rather than the file stamp: a .p8 rewritten
+    const loaded = await loadConfig();
+    // Whatever the key is now may not be what the cached token was signed
+    // with.  Compare key identity rather than the stamp: a key rewritten
     // with identical bytes — a secrets sync, a backup restore — is the same
     // key, and throwing away its cached provider token would spend one of
     // Apple's once-per-twenty-minutes re-signs for nothing.
-    if (discovered && (!loaded || providerTokenKey(discovered) !== providerTokenKey(loaded))) {
-      invalidateProviderToken(discovered);
+    const previousKey = discovered ? providerTokenKey(discovered) : null;
+    const nextKey = loaded ? providerTokenKey(loaded) : null;
+    if (previousKey && nextKey && previousKey !== nextKey) {
+      // The key changed.  Forget the cached provider token and force the
+      // http2 session cache to rebuild on the next send — a TLS session
+      // tied to the old key is not safe to reuse against the new one.
+      invalidateProviderToken(discovered!);
+      dropHttp2Sessions();
+      sessionFingerprints.clear();
     }
     discovered = loaded;
     discoveredStamp = stamp;
@@ -629,7 +2608,7 @@ export function watchHarnessNotifications(options: {
   };
 
   const keyTimer = setInterval(() => {
-    refreshConfig();
+    void refreshConfig();
   }, recheckMs);
   keyTimer.unref?.();
 
@@ -643,9 +2622,6 @@ export function watchHarnessNotifications(options: {
       }, ms);
     });
 
-  // One queue per device, drained on its own chain.  A phone Apple is rate
-  // limiting sleeps out its own Retry-After without holding up any other
-  // phone, and each phone still sees its notifications in order.
   interface QueuedAlert {
     token: string;
     alert: ApnsAlert;
@@ -658,17 +2634,151 @@ export function watchHarnessNotifications(options: {
     normal: QueuedAlert[];
     running: boolean;
   }
-  const queues = new Map<string, DeviceQueue>();
 
-  const queueDepth = (queue: DeviceQueue): number => queue.blocking.length + queue.normal.length;
+  interface QueuedLiveActivity {
+    token: string;
+    push: LiveActivityPush;
+  }
 
+  /** One phone's island lane.  Separate from `DeviceQueue` so a full alert
+   * backlog can never decide whether an island starts, and so nothing here is
+   * read by the health snapshot. */
+  interface LiveDeviceQueue {
+    pending: QueuedLiveActivity[];
+    running: boolean;
+  }
+
+  /** Send one island push and do the bookkeeping that is safe for it.
+   *
+   * Deliberately narrower than `recordOutcome`: no sent/failed counter, no
+   * circuit run, no per-device health row.  This is a second surface for the
+   * same phones, and counting it there would double every phone on the health
+   * page and let an island's failures trip a breaker the alert queue is
+   * already using.  What it does share is the two verdicts that are about the
+   * sender rather than the phone: a refused key is the same key fault, and a
+   * dead token is still a dead token. */
+  const sendLiveOne = async (config: ApnsConfig, deviceId: string, token: string, push: LiveActivityPush) => {
+    let result: ApnsSendResult;
+    try {
+      result = await sendLiveActivity(config, token, push);
+    } catch (err) {
+      const info = inspectTransportError(err);
+      console.warn(
+        `companion: Live Activity push failed (${classifyTransportError(info)}` +
+          `${info.code ? ` ${info.code}` : ""}); the banner for that phone is unaffected`,
+      );
+      return;
+    }
+    try {
+      recordLiveOutcome(config, deviceId, token, result);
+    } catch {
+      console.warn("companion: Live Activity bookkeeping after a send failed");
+    }
+  };
+
+  const recordLiveOutcome = (
+    config: ApnsConfig,
+    deviceId: string,
+    token: string,
+    result: ApnsSendResult,
+  ) => {
+    if (result.ok) return;
+    // The key, not the phone — exactly the alert path's reading, down to the
+    // rotation guard, because it IS the same key.
+    if (result.reason === INVALID_PROVIDER_TOKEN) {
+      const current = fixed ?? discovered;
+      if (current !== null && providerTokenKey(config) === providerTokenKey(current)) {
+        void onKeyFault(config, result.reason, result.errorTimestamp);
+      }
+      return;
+    }
+    // The registry holds this token separately, so it needs its own forget:
+    // `clearPushToken` compares against the alert token and would no-op.
+    if (tokenIsDead(result.status, result.reason)) {
+      options.forgetLiveActivityToken?.(deviceId, token);
+      if (firstTime(`${deviceId}:dead-live:${result.reason ?? result.status}`)) {
+        console.warn(
+          `companion: APNs ${result.status}${result.reason ? ` ${result.reason}` : ""} — dropped that phone's ` +
+            "Live Activity token; it will register a new one",
+        );
+      }
+      return;
+    }
+    if (isTransportFailure(result.failureKind ?? "transport") || result.status === 0) return;
+    if (firstTime(`${deviceId}:live:${result.status}:${result.reason ?? ""}`)) {
+      console.warn(
+        `companion: Live Activity push ${result.status}${result.reason ? ` ${result.reason}` : ""} — ` +
+          "the banner for that phone is unaffected",
+      );
+    }
+  };
+
+  const drainLive = async (deviceId: string, queue: LiveDeviceQueue) => {
+    queue.running = true;
+    try {
+      while (!stopped) {
+        const config = activeConfig();
+        if (!config) break;
+        if (queue.pending.length === 0) break;
+        // An open circuit means Apple is unreachable.  An island is a summary
+        // of right now, so this one is dropped rather than held: an approval
+        // that starts its activity three hours late is worse than no island.
+        if (health.circuitIsOpen(deviceId, now())) {
+          if (firstTime(`${deviceId}:live-defer`)) {
+            console.warn(
+              `companion: APNs is unreachable — skipping ${queue.pending.length} Live Activity start(s) for a phone`,
+            );
+          }
+          queue.pending.length = 0;
+          break;
+        }
+        const next = queue.pending.shift();
+        if (!next) break;
+        await sendLiveOne(config, deviceId, next.token, next.push);
+      }
+    } catch {
+      console.warn("companion: Live Activity queue drain failed");
+    } finally {
+      queue.running = false;
+      if (queue.pending.length === 0) liveQueues.delete(deviceId);
+    }
+  };
+
+  /** Put one island push on that phone's lane and start draining it. */
+  const enqueueLiveActivity = (deviceId: string, token: string, push: LiveActivityPush) => {
+    let queue = liveQueues.get(deviceId);
+    if (!queue) {
+      queue = { pending: [], running: false };
+      liveQueues.set(deviceId, queue);
+    }
+    queue.pending.push({ token, push });
+    // Newest wins: an island that starts with an hour-old approval says
+    // something untrue about what is waiting now.
+    while (queue.pending.length > maxLiveQueued) queue.pending.shift();
+    if (!queue.running) void drainLive(deviceId, queue);
+  };
+
+  // The circuit is checked by `drain` BEFORE it takes an alert off a lane,
+  // not here: this function is only reached for an alert that is already
+  // detached from its queue, and skipping it there is what used to destroy
+  // a backlog — including a blocking approval — in a single loop.
   const sendOne = async (config: ApnsConfig, deviceId: string, token: string, alert: ApnsAlert) => {
+    const at = now();
     let result: ApnsSendResult;
     try {
       result = await send(config, token, alert);
-    } catch {
-      health.recordError(now(), 0, TRANSPORT_FAILURE_REASON);
-      console.warn("companion: APNs send failed");
+    } catch (err) {
+      const info = inspectTransportError(err);
+      const kind = classifyTransportError(info);
+      health.recordError(deviceId, at, 0, TRANSPORT_FAILURE_REASON, kind, info.code || undefined);
+      noteTransportFailure(deviceId, at, {
+        ok: false,
+        status: 0,
+        reason: TRANSPORT_FAILURE_REASON,
+        attempts: 0,
+        failureKind: kind,
+        errorCode: info.code || undefined,
+      });
       return;
     }
     // Everything below is bookkeeping, and some of it writes to disk:
@@ -685,10 +2795,36 @@ export function watchHarnessNotifications(options: {
 
   const recordOutcome = (config: ApnsConfig, deviceId: string, token: string, result: ApnsSendResult) => {
     if (result.ok) {
-      health.recordSent(now());
+      health.recordSent(deviceId, now());
+      forgetFailureLogs(deviceId);
       return;
     }
-    health.recordError(now(), result.status, result.reason);
+    const at = now();
+    const host = config.production ? "api.push.apple.com" : "api.sandbox.push.apple.com";
+    health.recordError(
+      deviceId,
+      at,
+      result.status,
+      result.reason,
+      result.failureKind,
+      result.errorCode,
+      result.errorTimestamp,
+    );
+    // Trip THIS phone's circuit when the failure shape is what we open on.
+    // Counted after recording, so the run below includes the failure that
+    // tripped it.  `http2_protocol` is part of the transport family here:
+    // excluding it from the branch meant a GOAWAY landing on the twentieth
+    // failure of a run skipped the trip and started the count again.
+    const kind = result.failureKind ?? "transport";
+    if (isTransportFailure(kind)) {
+      const transportRun = health.transportFailureRun(deviceId);
+      const protocolRun = health.protocolFailureRun(deviceId);
+      if (transportRun >= APNS_TRANSPORT_THRESHOLD) {
+        tripCircuit(deviceId, host, "transport", `${transportRun} transport failures in a row`);
+      } else if (kind === "http2_protocol" && protocolRun >= APNS_HTTP2_PROTOCOL_THRESHOLD) {
+        tripCircuit(deviceId, host, "http2_protocol", `${protocolRun} HTTP/2 protocol errors in a row`);
+      }
+    }
 
     // The key, not the phone: every device is about to fail the same way.
     if (result.reason === INVALID_PROVIDER_TOKEN) {
@@ -696,16 +2832,16 @@ export function watchHarnessNotifications(options: {
       // A rotation can land while a request signed with the old key is in
       // flight, and reading that request's rejection as a verdict on the
       // replacement would disable the replacement — then hold it disabled,
-      // because the fault only clears for a key file that differs from the
-      // recorded stamp and the file on disk is already the replacement.
+      // because the fault only clears for a key that differs from the
+      // recorded stamp and the key in hand is already the replacement.
       //
       // Key identity, not object identity: `refreshConfig` builds a fresh
-      // config object whenever the file's mtime or size changes, so an
-      // identity check would read a .p8 rewritten with the same bytes as a
+      // config object whenever the key's source or digest changes, so an
+      // identity check would read a key rewritten with the same bytes as a
       // rotation and wave through a rejection of the key still in use.
       const current = fixed ?? discovered;
       if (current !== null && providerTokenKey(config) === providerTokenKey(current)) {
-        onKeyFault(result.reason);
+        void onKeyFault(config, result.reason, result.errorTimestamp);
       } else if (!keyFault) {
         console.warn("companion: APNs refused a signing key that has since been replaced; the replacement stands");
       }
@@ -737,6 +2873,14 @@ export function watchHarnessNotifications(options: {
     if (result.status === 400 || result.status === 403) {
       if (!firstTime(`${deviceId}:${result.status}:${result.reason ?? ""}`)) return;
     }
+    // A transport failure never reached Apple, so there is no verdict to
+    // report and no reason to report the same weather every forty seconds.
+    // This was the one outcome class that fell through to an unconditional
+    // log line, and on a link that stayed down it wrote 6,003 of them.
+    if (isTransportFailure(kind) || result.status === 0) {
+      noteTransportFailure(deviceId, at, result);
+      return;
+    }
     console.warn(`companion: APNs ${result.status}${result.reason ? ` ${result.reason}` : ""}`);
   };
 
@@ -753,6 +2897,30 @@ export function watchHarnessNotifications(options: {
         // swallow whatever was queued behind it — uncounted, and unsent.
         const config = activeConfig();
         if (!config) break;
+        // Nothing left is the ordinary way out, and it comes before the
+        // circuit check so an empty lane never reports itself as held.
+        if (queueDepth(queue) === 0) break;
+        // The circuit, also before the shift, and for the same reason.  An
+        // open circuit is Apple being briefly unreachable; every alert stays
+        // exactly where it is and goes out when the circuit closes.  Taking
+        // them off the lane and discarding them emptied a whole backlog in
+        // one loop, and a blocking approval caught by that was never
+        // delivered at all.
+        const at = now();
+        if (health.circuitIsOpen(deviceId, at)) {
+          health.recordCircuitDeferred();
+          const until = health.circuitClosesAt(deviceId) ?? at;
+          if (!loggedCircuitOpen.has(`${deviceId}:defer`)) {
+            loggedCircuitOpen.add(`${deviceId}:defer`);
+            console.warn(
+              `companion: APNs is unreachable — holding ${queueDepth(queue)} notification(s) for a phone ` +
+                `until ${new Date(until).toISOString()}`,
+            );
+          }
+          scheduleCircuitRetry(deviceId, Math.max(1, until - at));
+          break;
+        }
+        loggedCircuitOpen.delete(`${deviceId}:defer`);
         const next = queue.blocking.shift() ?? queue.normal.shift();
         if (!next) break;
         await sendOne(config, deviceId, next.token, next.alert);
@@ -778,26 +2946,23 @@ export function watchHarnessNotifications(options: {
   };
 
   const deliver = (
-    notification: {
-      title?: string;
-      body?: string;
-      kind?: string;
-      threadId?: string;
-      botId?: string;
-      requestId?: string;
-      tool?: string;
-    },
+    // Raw JSON, honestly typed: the frame is whatever `JSON.parse` handed
+    // back, and a field in it is a `JsonValue` until something says
+    // otherwise.  Both consumers below decode their own — the alert reads
+    // strings through `frameString`, the island through
+    // `parseLiveActivitySource`.
+    notification: JsonObject,
     seq?: number,
   ) => {
     const connected = new Set(options.connectedIds());
     const alert: ApnsAlert = {
-      title: notification.title ?? "BotFleet",
-      body: notification.body ?? "",
-      kind: notification.kind,
-      threadId: notification.threadId,
-      botId: notification.botId,
-      requestId: notification.requestId,
-      tool: notification.tool,
+      title: frameString(notification, "title") ?? "BotFleet",
+      body: frameString(notification, "body") ?? "",
+      kind: frameString(notification, "kind"),
+      threadId: frameString(notification, "threadId"),
+      botId: frameString(notification, "botId"),
+      requestId: frameString(notification, "requestId"),
+      tool: frameString(notification, "tool"),
       seq,
     };
     const blocking = alertIsBlocking(alert.kind);
@@ -812,19 +2977,57 @@ export function watchHarnessNotifications(options: {
       if (queueDepth(queue) > maxQueued) {
         // Drop a report before an approval, whatever the order they arrived
         // in.  A stale report is worth nothing; a dropped approval leaves a
-        // bot waiting on an answer nobody was ever asked for.
+        // bot waiting on an answer nobody was ever asked for.  This cap is
+        // what keeps a lane holding alerts through an outage bounded: the
+        // count lands on that phone's own row on the health page.
         const lane = queue.normal.length ? queue.normal : queue.blocking;
         lane.shift();
-        health.recordDropped();
-        console.warn("companion: APNs backlog for a phone is full; dropped its oldest notification");
+        health.recordDropped(row.deviceId);
+        if (!loggedQueueFull.has(row.deviceId)) {
+          loggedQueueFull.add(row.deviceId);
+          console.warn(
+            `companion: APNs backlog for a phone is full at ${maxQueued}; dropping its oldest notifications`,
+          );
+        }
       }
       if (!queue.running) void drain(row.deviceId, queue);
+    }
+
+    // The island, for the same phones and only for the kinds a person is
+    // actually blocked on.  A phone that is streaming gets the banner over
+    // the socket already, so it is skipped by the same filter as the alerts
+    // above — and it gets BOTH surfaces when it is not, which is the point:
+    // the banner is history, the island is the thing you answer from.
+    //
+    // The frame is parsed first, and only here: the alert above is unchanged
+    // and still lands, because a banner built from the same frame is worth
+    // more than a rejected island and costs nothing to send.  A malformed
+    // frame is dropped here rather than indexed.
+    if (blocking && options.liveActivityTokensForDisconnected) {
+      const parsed = parseLiveActivitySource(notification);
+      if (!parsed.ok) {
+        if (firstTime(`liveactivity-frame:${parsed.error}`)) {
+          console.warn(`companion: notify frame not used for Live Activities — ${parsed.error}`);
+        }
+        return;
+      }
+      const content = liveActivityContent(parsed.source, now());
+      for (const row of options.liveActivityTokensForDisconnected()) {
+        if (connected.has(row.deviceId)) continue;
+        enqueueLiveActivity(row.deviceId, row.token, {
+          event: "start",
+          attributes: content.attributes,
+          state: content.state,
+          alert: content.alert,
+          timestamp: Math.floor(now() / 1000),
+        });
+      }
     }
   };
 
   const pump = async () => {
     while (!stopped) {
-      const config = refreshConfig();
+      const config = await refreshConfig();
       if (!config) {
         await pause(recheckMs);
         continue;
@@ -863,15 +3066,10 @@ export function watchHarnessNotifications(options: {
               resumed?: boolean;
               /** The stream position of this frame, stamped by `broadcast`. */
               seq?: number;
-              notification?: {
-                title?: string;
-                body?: string;
-                kind?: string;
-                threadId?: string;
-                botId?: string;
-                requestId?: string;
-                tool?: string;
-              };
+              /** A notify frame, still raw: whatever `JSON.parse` returned.
+               *  `deliver` decodes it — the banner reads strings, the Live
+               * Activity builder parses the whole frame. */
+              notification?: JsonObject;
             };
             try {
               // SAFETY: the frame came off the harness's own loopback stream
@@ -920,11 +3118,22 @@ export function watchHarnessNotifications(options: {
       if (timer) clearTimeout(timer);
       clearInterval(keyTimer);
       retry?.();
+      for (const cancel of circuitRetries.values()) cancel();
+      circuitRetries.clear();
+      transportLogs.clear();
+      loggedCircuitOpen.clear();
+      loggedQueueFull.clear();
       for (const queue of queues.values()) {
         queue.blocking.length = 0;
         queue.normal.length = 0;
       }
       queues.clear();
+      for (const queue of liveQueues.values()) queue.pending.length = 0;
+      liveQueues.clear();
+      // Close the persistent http2 session on the way out.  Tests do not
+      // expect open sockets across runs.
+      dropHttp2Sessions();
+      sessionFingerprints.clear();
     },
     health: health.snapshot,
   };

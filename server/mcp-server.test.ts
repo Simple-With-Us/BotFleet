@@ -741,17 +741,17 @@ describe("MCP fleet tools", () => {
     const fetcher = vi.fn(async (path: string, options?: RequestInit) => {
       if (path === "/api/routines") return {
         routines: [
-          { id: "r1", name: "Tidy", botId: "bot-1", runOn: "maus", enabled: true, schedule: { type: "daily", time: "09:00", weekdays: [1] }, durationMinutes: 30, nextRunAt: 99, createdAt: 1, updatedAt: 2, prompt: "p".repeat(1_500) },
+          { id: "r1", name: "Tidy", botId: "bot-1", runOn: "bot", enabled: true, schedule: { type: "daily", time: "09:00", weekdays: [1] }, durationMinutes: 30, nextRunAt: 99, createdAt: 1, updatedAt: 2, prompt: "p".repeat(1_500) },
           { id: "r2", name: "Other", botId: "bot-2", runOn: "cloud", enabled: false, schedule: { type: "once", at: 5 }, durationMinutes: 10, nextRunAt: null, createdAt: 1, updatedAt: 1, prompt: "short" },
         ],
         runs: [
-          { id: "run-old", routineId: "r1", routineName: "Tidy", botId: "bot-1", runOn: "maus", scheduledFor: 1, status: "completed", manual: false, createdAt: 10, output: "o".repeat(900), seenAt: 11 },
-          { id: "run-new", routineId: "r1", routineName: "Tidy", botId: "bot-1", runOn: "maus", scheduledFor: 2, status: "failed", manual: true, createdAt: 20, error: "provider unavailable", threadId: "task-9" },
+          { id: "run-old", routineId: "r1", routineName: "Tidy", botId: "bot-1", runOn: "bot", scheduledFor: 1, status: "completed", manual: false, createdAt: 10, output: "o".repeat(900), seenAt: 11 },
+          { id: "run-new", routineId: "r1", routineName: "Tidy", botId: "bot-1", runOn: "bot", scheduledFor: 2, status: "failed", manual: true, createdAt: 20, error: "provider unavailable", threadId: "task-9" },
           { id: "run-other", routineId: "r2", routineName: "Other", botId: "bot-2", runOn: "cloud", scheduledFor: 3, status: "queued", manual: false, createdAt: 30 },
         ],
       };
       if (path === "/api/routines/r1/run" && options?.method === "POST") {
-        return { run: { id: "run-now", routineId: "r1", routineName: "Tidy", botId: "bot-1", runOn: "maus", scheduledFor: 4, status: "queued", manual: true, createdAt: 40 } };
+        return { run: { id: "run-now", routineId: "r1", routineName: "Tidy", botId: "bot-1", runOn: "bot", scheduledFor: 4, status: "queued", manual: true, createdAt: 40 } };
       }
       if (path === "/api/routines/missing/run") return { error: "no such routine" };
       throw new Error(`unexpected path ${path}`);
@@ -777,7 +777,7 @@ describe("MCP fleet tools", () => {
   it("lists webhooks without secrets, endpoint ids, or captured payloads", async () => {
     const fetcher = vi.fn(async () => ({
       webhooks: [{
-        id: "wh-1", endpointId: "wh_abc", name: "Deploy done", prompt: "Check the deploy", botId: "bot-1", runOn: "maus", enabled: true,
+        id: "wh-1", endpointId: "wh_abc", name: "Deploy done", prompt: "Check the deploy", botId: "bot-1", runOn: "bot", enabled: true,
         createdAt: 1, updatedAt: 2, deliveryCount: 3, verificationPending: false, verifiedAt: 5, eventTypes: ["deploy"],
         secretHash: "deadbeef", verificationSample: { receivedAt: 4, preview: "token=whsec_secret" },
       }],

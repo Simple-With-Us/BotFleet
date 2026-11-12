@@ -1,7 +1,25 @@
 {
-  "images" : [
-    { "idiom" : "universal", "filename" : "minimax.svg" }
+  "images": [
+    {
+      "idiom": "universal",
+      "filename": "minimax.svg"
+    },
+    {
+      "idiom": "universal",
+      "filename": "minimax-dark.svg",
+      "appearances": [
+        {
+          "appearance": "luminosity",
+          "value": "dark"
+        }
+      ]
+    }
   ],
-  "info" : { "author" : "xcode", "version" : 1 },
-  "properties" : { "preserves-vector-representation" : true }
+  "info": {
+    "author": "xcode",
+    "version": 1
+  },
+  "properties": {
+    "preserves-vector-representation": true
+  }
 }

@@ -27,12 +27,32 @@ final class ProfileRoutinePolicyTests: XCTestCase {
 
         let ready = RoutineRunAvailability(config: configured, instances: available)
         XCTAssertTrue(ready.cloudReady)
-        XCTAssertTrue(ready.canSelect(.cloud, preserving: .maus))
+        XCTAssertTrue(ready.canSelect(.cloud, preserving: .bot))
 
         let offline = RoutineRunAvailability(config: configured, instances: unavailable)
-        XCTAssertFalse(offline.canSelect(.cloud, preserving: .maus))
+        XCTAssertFalse(offline.canSelect(.cloud, preserving: .bot))
         XCTAssertTrue(offline.canSelect(.cloud, preserving: .cloud), "an existing cloud routine must not silently move")
-        XCTAssertTrue(offline.canSelect(.maus, preserving: .cloud))
+        XCTAssertTrue(offline.canSelect(.bot, preserving: .cloud))
+    }
+
+    func testEngineStatusLabelKeepsAmbiguousProbeFailuresUnavailable() {
+        func label(_ state: String, _ reason: String? = nil, authenticated: Bool? = nil) -> String {
+            ProviderSnapshot(state: state, reason: reason, authenticated: authenticated, version: nil).engineStatusLabel
+        }
+        XCTAssertEqual(label("available"), "Ready")
+        XCTAssertEqual(label("available", authenticated: false), "Sign in")
+        // Claude/Codex reuse "CLI not found" for timeout / nonzero exit too —
+        // that text alone cannot mean "Not installed".
+        XCTAssertEqual(label("unavailable", "`claude` CLI not found"), "Unavailable")
+        XCTAssertEqual(label("unavailable", "no API key — set MINIMAX_API_KEY or add it to the instance config"), "Unavailable")
+        XCTAssertEqual(label("unavailable", "Update Claude Code to 2.0 or newer"), "Unavailable")
+        XCTAssertEqual(label("unavailable", "provider probe exploded"), "Unavailable")
+        XCTAssertEqual(label("unavailable", "Disabled in settings"), "Unavailable")
+        XCTAssertEqual(label("unavailable"), "Unavailable", "no reason is not proof the binary is missing")
+        XCTAssertFalse(
+            ProviderSnapshot(state: "unavailable", reason: "`claude` CLI not found", authenticated: nil, version: nil).isMissingBinary,
+            "no structured missing-binary signal yet"
+        )
     }
 
     func testAgentVoiceWorksWithoutANonexistentWorkspaceDefault() throws {
@@ -47,43 +67,27 @@ final class ProfileRoutinePolicyTests: XCTestCase {
         XCTAssertTrue(withDefault.canSpeak(agentVoice: nil))
     }
 
-    func testOnlyTheEngineTheServerNamesGetsItsOwnExplanation() throws {
-        // The built-in engine is the reason "configured" stopped meaning "a
-        // key is on file" — so the copy that explains a false has to know
-        // which engine it is talking about.
+    func testVoiceProviderClassificationMatchesServerDefault() throws {
         XCTAssertEqual(try decodeConfig(#"{"tts":{"configured":false,"provider":"system"}}"#).voiceProvider, .system)
-
-        // Everything else is ElevenLabs: `voiceProvider(cfg)` in
-        // `server/tts/index.ts` matches that one exact string and falls back
-        // for the rest. Each case is asserted on its own, because a rule that
-        // merely matched "system" loosely would still pass the assertion
-        // above while explaining someone's ElevenLabs setup as a Mac voice.
+        XCTAssertEqual(try decodeConfig(#"{"tts":{"configured":true,"provider":"elevenlabs"}}"#).voiceProvider, .elevenlabs)
+        XCTAssertEqual(try decodeConfig(#"{"tts":{"configured":false,"provider":"minimax"}}"#).voiceProvider, .minimax)
         XCTAssertEqual(
-            try decodeConfig(#"{"tts":{"configured":true,"ready":true,"voice":"v"}}"#).voiceProvider, .elevenlabs,
-            "a computer older than the choice does not send the field at all"
+            try decodeConfig(#"{"tts":{"configured":true,"ready":true,"voice":"v"}}"#).voiceProvider, .minimax,
+            "a missing provider uses the server's MiniMax default"
         )
         XCTAssertEqual(
-            try decodeConfig(#"{"tts":{"configured":true,"provider":"elevenlabs"}}"#).voiceProvider, .elevenlabs
+            try decodeConfig("{}").voiceProvider, .minimax,
+            "a missing voice block also uses the server's MiniMax default"
         )
         XCTAssertEqual(
-            try decodeConfig(#"{"tts":{"configured":false,"provider":"System"}}"#).voiceProvider, .elevenlabs,
-            "only the exact string the server writes selects the built-in engine"
+            try decodeConfig(#"{"tts":{"configured":false,"provider":"cartesia"}}"#).voiceProvider, .unknown,
+            "a future provider must not borrow MiniMax or ElevenLabs setup copy"
         )
         XCTAssertEqual(
-            try decodeConfig(#"{"tts":{"configured":false,"provider":"cartesia"}}"#).voiceProvider, .elevenlabs,
-            "an engine this build has never heard of must not borrow another engine's copy"
-        )
-        XCTAssertEqual(
-            try decodeConfig(#"{"tts":{"configured":false,"provider":"system-voices"}}"#).voiceProvider, .elevenlabs,
-            "a future engine whose name merely contains the old one is still unknown: matching loosely would explain it with Mac-voice copy and a Mac-voice remedy"
-        )
-        XCTAssertEqual(
-            try decodeConfig("{}").voiceProvider, .elevenlabs,
-            "no voice block at all is not the built-in engine either"
+            try decodeConfig(#"{"tts":{"configured":false,"provider":"System"}}"#).voiceProvider, .unknown,
+            "provider matching follows the server's exact wire values"
         )
 
-        // The flag itself stays provider-neutral: the meaning of a true moved,
-        // not its shape, and nothing above may quietly change who can speak.
         XCTAssertTrue(try decodeConfig(#"{"tts":{"configured":true,"provider":"system","voice":"Albert"}}"#).canSpeak(agentVoice: nil))
         XCTAssertFalse(try decodeConfig(#"{"tts":{"configured":false,"provider":"system","voice":"Albert"}}"#).canSpeak(agentVoice: nil))
     }
@@ -94,7 +98,7 @@ final class ProfileRoutinePolicyTests: XCTestCase {
             name: "Brief",
             prompt: "Summarize",
             botId: "bot-1",
-            runOn: "maus",
+            runOn: "bot",
             enabled: false,
             schedule: schedule,
             durationMinutes: 30,

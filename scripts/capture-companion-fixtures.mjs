@@ -53,7 +53,16 @@ const write = (name, value) => {
 const start = (label, args, env) => {
   const child = spawn(process.execPath, args, {
     cwd: ROOT,
-    env: { ...(process.env.PATH ? { PATH: process.env.PATH } : {}), ...env },
+    env: {
+      ...(process.env.PATH ? { PATH: process.env.PATH } : {}),
+      ...env,
+      // The harness runs against a throwaway HOME but shares the machine's
+      // container runtime; keep it from ever touching the owner's real Local VM
+      // (server/container-runtime-guard.ts).
+      BOTFLEET_DISABLE_CONTAINER_RUNTIME: "1",
+      DOCKER_HOST: "unix:///nonexistent.sock",
+      CONTAINER_HOST: "unix:///nonexistent.sock",
+    },
     stdio: ["ignore", "ignore", "pipe"],
   });
   child.stderr.on("data", (c) => (child.err = (child.err ?? "") + c));
@@ -61,11 +70,15 @@ const start = (label, args, env) => {
   return child;
 };
 
-const waitFor = async (url, label, child) => {
+/** `requireReady` for the harness: it answers health from the moment its port
+ * binds, before the boot work, and 503s every other route until that work is
+ * done — so "answered" and "ready to capture from" are two questions now. */
+const waitFor = async (url, label, child, requireReady = false) => {
   const deadline = Date.now() + 30_000;
   for (;;) {
     try {
-      if ((await fetch(url)).ok) return;
+      const res = await fetch(url);
+      if (res.ok && (!requireReady || (await res.json().catch(() => null))?.ready !== false)) return;
     } catch {
       /* not up yet */
     }
@@ -141,7 +154,7 @@ async function main() {
     // to do with this but makes the log noisy
     OMB_WEBHOOK_PORT: String(base + 1),
   });
-  await waitFor(`${HARNESS}/api/health`, "harness", harness);
+  await waitFor(`${HARNESS}/api/health`, "harness", harness, true);
 
   // ── the sidecar, up front, because it is what the phone talks to ───────
   //

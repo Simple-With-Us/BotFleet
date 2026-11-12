@@ -1,12 +1,12 @@
 import type { RoutineOutcomeCode, RoutineFailurePhase } from "../../shared/routine-outcomes";
+import type { RoutineRunOn } from "../../shared/run-on";
+export type { RoutineRunOn } from "../../shared/run-on";
 
 export type RoutineSchedule =
   | { type: "once"; at: number }
   | { type: "daily"; time: string; weekdays: number[]; timeZone?: string };
 
-export type RoutineRunOn = "maus" | "cloud";
-
-export type RoutineRunTrigger = "schedule" | "manual" | "webhook" | "resource";
+export type RoutineRunTrigger = "schedule" | "manual" | "webhook" | "resource" | "imessage";
 
 export type RoutineRunStatus =
   | "queued"
@@ -27,6 +27,7 @@ export interface Routine {
   schedule: RoutineSchedule;
   scheduleTimeZoneSource?: "stored" | "host";
   durationMinutes: number;
+  oneShotWake?: boolean;
   nextRunAt: number | null;
   createdAt: number;
   updatedAt: number;
@@ -47,6 +48,7 @@ export interface RoutineRun {
   webhookId?: string;
   deliveryId?: string;
   threadId?: string;
+  ownerThreadId?: string;
   startedAt?: number;
   finishedAt?: number;
   output?: string;
@@ -56,6 +58,10 @@ export interface RoutineRun {
   createdAt: number;
   seenAt?: number;
   coalescedInto?: string;
+  /** Why this run is sitting QUEUED instead of dispatching.  Absent when the run
+   *  is simply not due, or when nothing is holding it — a queued run with no
+   *  explanation is indistinguishable from a stuck scheduler. */
+  holdReason?: string;
   outcomeCode?: RoutineOutcomeCode;
   failurePhase?: RoutineFailurePhase;
   engineId?: string;

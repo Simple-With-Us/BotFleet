@@ -1,31 +1,105 @@
 import { generateKeyPairSync } from "node:crypto";
-import { beforeEach, describe, expect, it } from "vitest";
+import { EventEmitter } from "node:events";
+import { constants as http2Constants, type ClientHttp2Session } from "node:http2";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   alertIsBlocking,
   apnsJwt,
+  APNS_VAULT_CACHE_MS,
+  APNS_VAULT_RETRY_MS,
+  apnsKeySource,
+  apnsKeyStamp,
+  loadApnsConfig,
+  resetApnsKeyCache,
+  SHARED_APNS_KEY_ID,
+  APNS_VAULT_READ_BUDGET_MS,
+  APNS_VAULT_READ_TIMEOUT_MS,
   apnsPayload,
+  classifyHttpResponse,
+  classifyTransportError,
+  createApnsHttp2Fetch,
   deliveryForKind,
+  diskKeyFaultStore,
+  dropHttp2Sessions,
+  getOrOpenSession,
+  inspectTransportError,
+  isTransportFailure,
+  keyPreview,
+  liveActivityContent,
+  liveActivityPayload,
+  liveActivityTopic,
+  parseLiveActivitySource,
   providerToken,
   resetProviderTokens,
   retryAfterMs,
   sendApnsAlert,
+  sendApnsLiveActivity,
+  startHttp2PingKeepalive,
   tokenIsDead,
   watchHarnessNotifications,
+  APNS_CIRCUIT_WINDOW_MS,
+  APNS_TRANSPORT_SUMMARY_MS,
+  APNS_TRANSPORT_THRESHOLD,
+  APPLE_REFERENCE_DATE_OFFSET,
+  DEFAULT_LIVE_ACTIVITY_COLOR,
+  LIVE_ACTIVITY_ATTRIBUTES_TYPE,
   type ApnsConfig,
+  type ApnsSendOptions,
   type ApnsPayload,
+  type Http2ApnsSession,
+  type Http2SessionFactory,
+  type KeyFaultStore,
+  type PersistedKeyFault,
+  watchHttp2SessionLifecycle,
 } from "./apns.ts";
+
+// The default key source reads Infisical through the fleet CLI.  A test must
+// never reach the real vault, so the binary points at nothing unless a test
+// installs its own fake.
+beforeEach(() => {
+  process.env.FLEET_SECRETS_BIN = "/nonexistent/fleet-bin";
+  resetApnsKeyCache();
+});
 
 function testP8(): string {
   const { privateKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
   return privateKey.export({ type: "pkcs8", format: "pem" }).toString();
 }
 
+function asApnsSession(raw: EventEmitter): Http2ApnsSession {
+  // SAFETY: HTTP/2 unit tests only touch `raw` fields production reads
+  // (request, close, destroyed, ping, events) — never real TLS or framing.
+  return { raw: raw as ClientHttp2Session };
+}
+
+function asClientHttp2Session(raw: EventEmitter): ClientHttp2Session {
+  // SAFETY: lifecycle wiring only registers event listeners on the stand-in.
+  return raw as ClientHttp2Session;
+}
+
+type PingCallback = (err: Error | null, duration?: number, payload?: Buffer) => void;
+type ApnsPingHolder = { session: ClientHttp2Session; pings: PingCallback[] };
+
+function attachPingHolder(raw: EventEmitter): ApnsPingHolder {
+  const pings: PingCallback[] = [];
+  // SAFETY: keepalive only calls `.ping()` on the stand-in session.
+  const session = raw as EventEmitter & { ping: (cb: PingCallback) => boolean };
+  session.ping = (cb) => {
+    pings.push(cb);
+    return true;
+  };
+  return { session: asClientHttp2Session(session), pings };
+}
+
 function testConfig(overrides: Partial<ApnsConfig> = {}): ApnsConfig {
   return {
     keyId: "ABC123",
     teamId: "TEAMID1",
-    bundleId: "app.botfleet",
+    bundleId: "app.botfleet.ios",
     p8: testP8(),
     production: true,
     ...overrides,
@@ -46,6 +120,14 @@ function recordingSleep() {
 const rejection = (status: number, reason: string, headers: Record<string, string> = {}): Response =>
   new Response(JSON.stringify({ reason }), { status, headers });
 
+/** Top-level frame helpers — the in-describe definitions are scoped, so the
+ * failure-classification + circuit-breaker tests reuse these. */
+const moduleNotifyFrame = (kind: string, body = "done") =>
+  `data: ${JSON.stringify({
+    kind: "notify",
+    notification: { kind, title: "Scout finished", body, threadId: "t1", botId: "b1" },
+  })}\n\n`;
+
 /** A promise someone else finishes.  The resolver lives on the object
  * because a `let` only ever assigned inside a callback is narrowed to
  * `never` by the time the test tries to call it. */
@@ -60,6 +142,39 @@ function deferred() {
   });
   return gate;
 }
+
+/** Spin until the condition holds or the budget runs out.  Returns what the
+ * condition said last, so a caller can assert on it rather than on a
+ * timeout. */
+async function waitFor(condition: () => boolean, budgetMs = 3000): Promise<boolean> {
+  const started = Date.now();
+  while (!condition() && Date.now() - started < budgetMs) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  return condition();
+}
+
+/** A key-fault store that lives in memory, so a test never writes one and
+ * never inherits another test's. */
+function memoryKeyFaultStore(initial: PersistedKeyFault | null = null): KeyFaultStore & { current: PersistedKeyFault | null } {
+  const store = {
+    current: initial,
+    load: () => store.current,
+    save: (fault: PersistedKeyFault | null) => {
+      store.current = fault;
+    },
+  };
+  return store;
+}
+
+const transportFailure = (errorCode = "ECONNRESET") => ({
+  ok: false as const,
+  status: 0,
+  reason: "SendFailed",
+  attempts: 1,
+  failureKind: "transport" as const,
+  errorCode,
+});
 
 beforeEach(() => {
   resetProviderTokens();
@@ -209,10 +324,10 @@ describe("sendApnsAlert", () => {
         },
       },
     );
-    expect(result).toEqual({ ok: true, status: 200, attempts: 1 });
+    expect(result).toEqual({ ok: true, status: 200, attempts: 1, failureKind: "none" });
     expect(url).toBe(`https://api.push.apple.com/3/device/${token}`);
     expect(headers?.get("apns-push-type")).toBe("alert");
-    expect(headers?.get("apns-topic")).toBe("app.botfleet");
+    expect(headers?.get("apns-topic")).toBe("app.botfleet.ios");
     expect(body.aps?.alert).toEqual({ title: "Scout finished", body: "done" });
     expect(body.aps?.["content-available"]).toBe(1);
     expect(body.aps?.category).toBe("BOTFLEET_UPDATE");
@@ -280,7 +395,7 @@ describe("sendApnsAlert", () => {
 
   it("does not re-sign for InvalidProviderToken — the key itself is refused", async () => {
     // Expiry is worth a fresh signature.  An invalid token means Apple
-    // refuses the KEY — wrong team, revoked, a .p8 that does not match its
+    // refuses the KEY — wrong team, revoked, a key that does not match its
     // key id — and every new signature earns the identical rejection.
     const config = testConfig();
     const { waits, sleep } = recordingSleep();
@@ -299,7 +414,14 @@ describe("sendApnsAlert", () => {
     );
     expect(calls).toBe(1);
     expect(waits).toEqual([]);
-    expect(result).toEqual({ ok: false, status: 403, reason: "InvalidProviderToken", attempts: 1 });
+    expect(result).toEqual({
+      ok: false,
+      status: 403,
+      reason: "InvalidProviderToken",
+      attempts: 1,
+      failureKind: "key_fault",
+      errorTimestamp: undefined,
+    });
   });
 
   it("retries a 429 after the Retry-After Apple asked for", async () => {
@@ -319,7 +441,7 @@ describe("sendApnsAlert", () => {
         },
       },
     );
-    expect(result).toEqual({ ok: true, status: 200, attempts: 2 });
+    expect(result).toEqual({ ok: true, status: 200, attempts: 2, failureKind: "none" });
     expect(waits).toEqual([7000]);
   });
 
@@ -340,7 +462,15 @@ describe("sendApnsAlert", () => {
     );
     expect(calls).toBe(3);
     expect(waits).toEqual([1000, 2000]);
-    expect(result).toEqual({ ok: false, status: 503, reason: "ServiceUnavailable", attempts: 3 });
+    expect(result).toEqual({
+      ok: false,
+      status: 503,
+      reason: "ServiceUnavailable",
+      attempts: 3,
+      failureKind: "rate_limit",
+      errorCode: undefined,
+      errorTimestamp: undefined,
+    });
   });
 
   it("retries a thrown fetch inside the attempt budget, the same as a 503", async () => {
@@ -363,7 +493,7 @@ describe("sendApnsAlert", () => {
         },
       },
     );
-    expect(result).toEqual({ ok: true, status: 200, attempts: 3 });
+    expect(result).toEqual({ ok: true, status: 200, attempts: 3, failureKind: "none" });
     expect(waits).toEqual([1000, 2000]);
   });
 
@@ -380,7 +510,15 @@ describe("sendApnsAlert", () => {
         },
       },
     );
-    expect(result).toEqual({ ok: false, status: 0, reason: "SendFailed", attempts: 3 });
+    expect(result).toEqual({
+      ok: false,
+      status: 0,
+      reason: "SendFailed",
+      attempts: 3,
+      failureKind: "transport",
+      errorCode: undefined,
+      errorTimestamp: undefined,
+    });
     expect(waits).toEqual([1000, 2000]);
   });
 
@@ -401,7 +539,14 @@ describe("sendApnsAlert", () => {
     );
     expect(calls).toBe(1);
     expect(waits).toEqual([]);
-    expect(result).toEqual({ ok: false, status: 400, reason: "BadDeviceToken", attempts: 1 });
+    expect(result).toEqual({
+      ok: false,
+      status: 400,
+      reason: "BadDeviceToken",
+      attempts: 1,
+      failureKind: "bad_token",
+      errorTimestamp: undefined,
+    });
   });
 
   it("returns a 410 with its reason so the caller can drop the token", async () => {
@@ -418,7 +563,13 @@ describe("sendApnsAlert", () => {
       },
     );
     expect(calls).toBe(1);
-    expect(result).toEqual({ ok: false, status: 410, reason: "Unregistered", attempts: 1 });
+    expect(result).toEqual({
+      ok: false,
+      status: 410,
+      reason: "Unregistered",
+      attempts: 1,
+      failureKind: "bad_token",
+    });
   });
 });
 
@@ -750,7 +901,7 @@ describe("watchHarnessNotifications", () => {
     expect(health.configured).toBe(false);
   });
 
-  it("picks up a rotated key file and forgets the one it replaced", async () => {
+  it("picks up a rotated signing key and forgets the one it replaced", async () => {
     let stamp = "key-v1";
     let loads = 0;
     const watch = watchHarnessNotifications({
@@ -921,7 +1072,7 @@ describe("watchHarnessNotifications", () => {
 
   it("notices a rotated key while the stream stays open", async () => {
     // The re-check used to ride on the reconnect, so a sidecar whose harness
-    // stays up for days never looked at the key file again.
+    // stays up for days never looked at the signing key again.
     let stamp = "key-v1";
     let loads = 0;
     const watch = watchHarnessNotifications({
@@ -994,8 +1145,8 @@ describe("watchHarnessNotifications", () => {
     // A rotation can land while a request signed with the old key is still
     // in flight.  Reading that request's answer as a verdict on the new key
     // disables the new key, and keeps it disabled: the fault clears only for
-    // a key file that differs from the recorded stamp, and the file on disk
-    // is already the new one.
+    // a key that differs from the recorded stamp, and the key in hand is
+    // already the new one.
     const keyA = testConfig({ keyId: "KEYAAA" });
     const keyB = testConfig({ keyId: "KEYBBB" });
     let stamp = "key-a";
@@ -1125,8 +1276,8 @@ describe("watchHarnessNotifications", () => {
   });
 
   it("treats a key rewritten with the same bytes as the same key, not a rotation", async () => {
-    // A secrets sync or a backup restore rewrites the .p8 with identical
-    // contents: the file stamp changes and so does the config object, but
+    // A secrets sync or a backup restore rewrites the key with identical
+    // contents: the stamp changes and so does the config object, but
     // the KEY does not.  Comparing objects rather than keys read Apple's
     // verdict on the key still in use as a verdict on a key already
     // replaced, waved it through, and went on signing with a key Apple
@@ -1183,8 +1334,10 @@ describe("watchHarnessNotifications", () => {
     // read-only disk it used to become an unhandled rejection — and Node's
     // default `--unhandled-rejections=throw` turns that into an exit of the
     // proxy every paired phone depends on.
-    const rejections: unknown[] = [];
-    const onRejection = (reason: unknown) => rejections.push(reason);
+    const rejections: Error[] = [];
+    const onRejection: NodeJS.UnhandledRejectionListener = (reason) => {
+      rejections.push(reason instanceof Error ? reason : new Error(String(reason)));
+    };
     process.on("unhandledRejection", onRejection);
     const delivered: string[] = [];
     const frames = notifyFrameWithBody("approval", "one") + notifyFrameWithBody("approval", "two");
@@ -1271,5 +1424,2266 @@ describe("watchHarnessNotifications", () => {
     expect(watch.health().configured).toBe(false);
     expect(watch.health().production).toBeNull();
     watch.stop();
+  });
+
+  // Live Activity pushes: the island a phone wears, not the banner it hears.
+  // These pin the JSON contract against `BotActivityAttributes` in
+  // ios/Shared/BotActivity.swift — the widget decodes it, so a renamed key is
+  // an island that quietly stops updating.
+  it("starts a Live Activity with the attributes type, an alert, and a Date as a number", () => {
+    const since = Date.UTC(2026, 9, 11, 22, 0, 0);
+    const body = liveActivityPayload(
+      "start",
+      { botId: "b1", threadId: "t1", name: "Scout", color: "coral" },
+      {
+        face: "thinking",
+        kind: "needsYou",
+        headline: "Forge needs you",
+        line: "Run rm -rf ./build",
+        requestId: "req-7",
+        options: ["Allow", "Deny"],
+        isPermission: true,
+        since: (since - APPLE_REFERENCE_DATE_OFFSET * 1000) / 1000,
+      },
+      { title: "Forge needs you", body: "Run rm -rf ./build" },
+      { timestamp: 1_800_000_000 },
+    );
+    expect(body.aps["attributes-type"]).toBe(LIVE_ACTIVITY_ATTRIBUTES_TYPE);
+    expect(body.aps["attributes-type"]).toBe("BotActivityAttributes");
+    expect(body.aps.attributes).toEqual({ botId: "b1", threadId: "t1", name: "Scout", color: "coral" });
+    expect(body.aps.alert).toEqual({ title: "Forge needs you", body: "Run rm -rf ./build" });
+    expect(body.aps.event).toBe("start");
+    expect(body.aps.timestamp).toBe(1_800_000_000);
+    // A Swift `Date` decodes from seconds since the Apple reference date, so
+    // the number here is the Unix time MINUS 978307200 — never an ISO string.
+    expect(body.aps["content-state"].since).toBe(since / 1000 - APPLE_REFERENCE_DATE_OFFSET);
+    expect(Number.isFinite(body.aps["content-state"].since)).toBe(true);
+    expect(JSON.stringify(body)).not.toContain("T00:00");
+  });
+
+  it("gives a start an alert even when the caller has none to give", () => {
+    // Apple rejects a start with no alert, so the builder never emits one.
+    const body = liveActivityPayload(
+      "start",
+      { botId: "b1", threadId: "t1", name: "Scout", color: "coral" },
+      {
+        face: "thinking",
+        kind: "needsYou",
+        headline: "Forge needs you",
+        line: "Run rm -rf ./build",
+        options: [],
+        isPermission: false,
+        since: 800_000_000,
+      },
+      undefined,
+      { timestamp: 1 },
+    );
+    expect(body.aps.alert).toEqual({ title: "Forge needs you", body: "Run rm -rf ./build" });
+  });
+
+  it("sends attributes on the start alone, and leaves requestId out when there is none", () => {
+    const attributes = { botId: "b1", threadId: "t1", name: "Scout", color: "coral" };
+    const state = {
+      face: "thinking",
+      kind: "needsYou",
+      headline: "Forge needs you",
+      line: "Run rm -rf ./build",
+      options: ["Allow", "Deny"],
+      isPermission: true,
+      since: 800_000_000,
+    };
+    for (const event of ["update", "end"] as const) {
+      const body = liveActivityPayload(event, attributes, state, undefined, { timestamp: 2 });
+      expect(body.aps.event).toBe(event);
+      expect(body.aps.attributes).toBeUndefined();
+      expect(body.aps["attributes-type"]).toBeUndefined();
+      expect(body.aps.alert).toBeUndefined();
+      expect(body.aps.timestamp).toBe(2);
+      // requestId is `String?` in Swift; an absent optional decodes as nil,
+      // and a literal null is what a hand-written encoder would have sent.
+      expect("requestId" in body.aps["content-state"]).toBe(false);
+      expect(JSON.stringify(body)).not.toContain("null");
+    }
+    const dismissal = liveActivityPayload("end", attributes, state, undefined, { timestamp: 3, dismissalDate: 4 });
+    expect(dismissal.aps["dismissal-date"]).toBe(4);
+  });
+
+  it("addresses Live Activity pushes to the bundle's own channel", () => {
+    // Derived, not spelled out: a build that moves between sandbox and
+    // production moves both channels together.
+    expect(liveActivityTopic("app.botfleet.ios")).toBe("app.botfleet.ios.push-type.liveactivity");
+    expect(liveActivityTopic("app.botfleet.ios")).not.toBe("app.botfleet.ios");
+  });
+
+  it("posts a liveactivity push with its own topic, type and start priority", async () => {
+    const seen: { topic: string | null; pushType: string | null; priority: string | null; auth: string | null; body: string }[] = [];
+    // Typed by assignment, not asserted: the stand-in IS a fetch.
+    const fetchImpl: NonNullable<ApnsSendOptions["fetchImpl"]> = async (_input, init) => {
+      const headers = new Headers(init?.headers);
+      seen.push({
+        topic: headers.get("apns-topic"),
+        pushType: headers.get("apns-push-type"),
+        priority: headers.get("apns-priority"),
+        auth: headers.get("authorization"),
+        body: String(init?.body),
+      });
+      return new Response("", { status: 200 });
+    };
+    const result = await sendApnsLiveActivity(
+      testConfig(),
+      "ab".repeat(32),
+      {
+        event: "start",
+        attributes: { botId: "b1", threadId: "t1", name: "Scout", color: "coral" },
+        state: {
+          face: "thinking",
+          kind: "needsYou",
+          headline: "Scout needs you",
+          line: "done",
+          options: [],
+          isPermission: false,
+          since: 812_345_678.5,
+        },
+        timestamp: 1_800_000_000,
+      },
+      { fetchImpl },
+    );
+    expect(result.ok).toBe(true);
+    expect(seen).toHaveLength(1);
+    expect(seen[0].pushType).toBe("liveactivity");
+    expect(seen[0].topic).toBe("app.botfleet.ios.push-type.liveactivity");
+    // 10 is what creates the island; an update could not use it.
+    expect(seen[0].priority).toBe("10");
+    expect(seen[0].auth).toMatch(/^bearer /);
+    expect(JSON.parse(seen[0].body).aps["content-state"].since).toBe(812_345_678.5);
+  });
+
+  it("gives an update or an end the power-friendly priority", async () => {
+    const priorities: (string | null)[] = [];
+    const config = testConfig();
+    const fetchImpl: NonNullable<ApnsSendOptions["fetchImpl"]> = async (_input, init) => {
+      priorities.push(new Headers(init?.headers).get("apns-priority"));
+      return new Response("", { status: 200 });
+    };
+    const state = {
+      face: "thinking",
+      kind: "needsYou",
+      headline: "Scout needs you",
+      line: "done",
+      options: [],
+      isPermission: false,
+      since: 1,
+    };
+    const attributes = { botId: "b1", threadId: "t1", name: "Scout", color: "coral" };
+    await sendApnsLiveActivity(config, "ab".repeat(32), { event: "update", attributes, state }, { fetchImpl });
+    await sendApnsLiveActivity(config, "ab".repeat(32), { event: "end", attributes, state }, { fetchImpl });
+    expect(priorities).toEqual(["5", "5"]);
+  });
+
+  it("refuses a malformed Live Activity token before it reaches Apple", async () => {
+    let called = 0;
+    const fetchImpl: NonNullable<ApnsSendOptions["fetchImpl"]> = async () => {
+      called += 1;
+      return new Response("", { status: 200 });
+    };
+    const result = await sendApnsLiveActivity(
+      testConfig(),
+      "not-hex",
+      {
+        event: "start",
+        attributes: { botId: "b1", threadId: "t1", name: "Scout", color: "coral" },
+        state: { face: "idle", kind: "working", headline: "h", line: "l", options: [], isPermission: false, since: 1 },
+      },
+      { fetchImpl },
+    );
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe(400);
+    expect(result.reason).toBe("BadDeviceToken");
+    expect(called).toBe(0);
+  });
+
+  it("degrades a frame from an older harness instead of refusing it", () => {
+    // The harness that predates botName/color/options/isPermission sends none
+    // of them, and the island should still start rather than be skipped.
+    const content = liveActivityContent(
+      { kind: "approval", title: "Forge needs you", body: "Run rm -rf ./build", threadId: "t1", botId: "b1", requestId: "req-7" },
+      Date.UTC(2026, 9, 11, 22, 0, 0),
+    );
+    expect(content.attributes.name).toBe("Forge needs you");
+    expect(content.attributes.color).toBe(DEFAULT_LIVE_ACTIVITY_COLOR);
+    expect(content.state.kind).toBe("needsYou");
+    expect(content.state.face).toBe("thinking");
+    expect(content.state.isPermission).toBe(true);
+    // A permission card offers the verdict; a question wants an answer typed.
+    expect(content.state.options).toEqual(["Allow", "Deny"]);
+    expect(content.state.requestId).toBe("req-7");
+    expect(content.state.since).toBe(Date.UTC(2026, 9, 11, 22, 0, 0) / 1000 - APPLE_REFERENCE_DATE_OFFSET);
+
+    const question = liveActivityContent({ kind: "question", title: "Forge asks", body: "Which branch?" }, 0);
+    expect(question.state.isPermission).toBe(false);
+    expect(question.state.options).toEqual([]);
+    expect(question.state.requestId).toBeUndefined();
+
+    // No fields at all still builds: the widget degrades one field at a time.
+    const bare = liveActivityContent({}, 0);
+    expect(bare.attributes).toEqual({ botId: "", threadId: "", name: "BotFleet", color: "gray" });
+    expect(bare.state.headline).toBe("BotFleet is working");
+    expect(bare.state.kind).toBe("working");
+  });
+
+  it("refuses a frame whose fields are the wrong shape, rather than coercing them", () => {
+    // An absent field falls back; a field of the wrong TYPE never reaches the
+    // widget at all, because the widget decodes it strictly.
+    expect(parseLiveActivitySource({ kind: "approval", title: 42 })).toEqual({
+      ok: false,
+      error: "title must be string, got number",
+    });
+    expect(parseLiveActivitySource({ kind: "approval", options: { a: 1 } })).toEqual({
+      ok: false,
+      error: "options must be string[], got an object",
+    });
+    expect(parseLiveActivitySource({ kind: "approval", options: ["Allow", 7] }).ok).toBe(false);
+    expect(parseLiveActivitySource({ isPermission: "yes" }).ok).toBe(false);
+    expect(parseLiveActivitySource({ since: "now" }).ok).toBe(false);
+    expect(parseLiveActivitySource("not an object").ok).toBe(false);
+    expect(parseLiveActivitySource(null).ok).toBe(false);
+    // A field nobody here reads is not a reason to refuse the frame: the
+    // harness sends `avatarUrl` on any bot with a profile picture.
+    expect(parseLiveActivitySource({ kind: "approval", avatarUrl: "https://x/y.png" }).ok).toBe(true);
+    // `null` reads as absent rather than as a malformed value.
+    expect(parseLiveActivitySource({ color: null })).toEqual({ ok: true, source: {} });
+  });
+
+  it("parses a sparse-but-valid frame, and keeps every fallback", () => {
+    // The degraded path must survive validation: a harness that predates the
+    // Live Activity work sends none of the new fields, and that is a valid
+    // frame, not a broken one.
+    const parsed = parseLiveActivitySource({ kind: "approval", title: "Forge needs you", body: "rm -rf", botId: "b1" });
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(Object.keys(parsed.source).sort()).toEqual(["body", "botId", "kind", "title"]);
+    const content = liveActivityContent(parsed.source, 0);
+    expect(content.attributes.color).toBe(DEFAULT_LIVE_ACTIVITY_COLOR);
+    expect(content.state.options).toEqual(["Allow", "Deny"]);
+    expect(content.state.requestId).toBeUndefined();
+  });
+
+  it("prefers the widened harness fields when the frame carries them", () => {
+    const content = liveActivityContent(
+      {
+        kind: "question",
+        title: "Forge asks",
+        body: "Which branch?",
+        botName: "Forge",
+        color: "coral",
+        options: ["main", "dev"],
+        isPermission: true,
+        since: (800_000_000 + APPLE_REFERENCE_DATE_OFFSET) * 1000,
+      },
+      0,
+    );
+    expect(content.attributes).toEqual({ botId: "", threadId: "", name: "Forge", color: "coral" });
+    expect(content.state.options).toEqual(["main", "dev"]);
+    expect(content.state.isPermission).toBe(true);
+    expect(content.state.since).toBe(800_000_000);
+  });
+
+  it("starts an island on a blocking frame for a disconnected phone that registered one", async () => {
+    const sent: { token: string; event: string; headline?: string }[] = [];
+    const banners: string[] = [];
+    const watch = watchHarnessNotifications({
+      harnessPort: 1,
+      connectedIds: () => ["streaming"],
+      tokensForDisconnected: () => [{ deviceId: "banner", token: "aa".repeat(32) }],
+      liveActivityTokensForDisconnected: () => [
+        { deviceId: "streaming", token: "11".repeat(32) },
+        { deviceId: "island", token: "22".repeat(32) },
+      ],
+      config: testConfig(),
+      fetchImpl: async () =>
+        new Response(notifyFrame("approval"), {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        }),
+      send: async (_config, token) => {
+        banners.push(token);
+        return { ok: true, status: 200, attempts: 1 };
+      },
+      sendLiveActivity: async (_config, token, push) => {
+        sent.push({ token, event: push.event, headline: push.state.headline });
+        return { ok: true, status: 200, attempts: 1 };
+      },
+    });
+    expect(await waitFor(() => sent.length > 0 && banners.length > 0)).toBe(true);
+    watch.stop();
+    // Both surfaces, as intended: the banner for a closed app and the island
+    // to answer from.  A phone already streaming gets no island — the socket
+    // is the banner, and a second copy would be noise.
+    expect(sent).toEqual([{ token: "22".repeat(32), event: "start", headline: "Scout finished needs you" }]);
+    expect(banners).toEqual(["aa".repeat(32)]);
+  });
+
+  it("drops a malformed frame from the island and still sends the banner", async () => {
+    // The whole point of the parse: `title` arrives as a number.  Nothing may
+    // start an island from it — and nothing may be lost either, because the
+    // banner is the same frame on a path that was already its own business.
+    const islands: string[] = [];
+    const banners: string[] = [];
+    const malformed = `data: ${JSON.stringify({
+      kind: "notify",
+      notification: { kind: "approval", title: 42, body: "done", threadId: "t1", botId: "b1" },
+    })}\n\n`;
+    const watch = watchHarnessNotifications({
+      harnessPort: 1,
+      connectedIds: () => [],
+      tokensForDisconnected: () => [{ deviceId: "banner", token: "aa".repeat(32) }],
+      liveActivityTokensForDisconnected: () => [{ deviceId: "island", token: "22".repeat(32) }],
+      config: testConfig(),
+      fetchImpl: async () => new Response(malformed, { status: 200, headers: { "content-type": "text/event-stream" } }),
+      send: async (_config, token) => {
+        banners.push(token);
+        return { ok: true, status: 200, attempts: 1 };
+      },
+      sendLiveActivity: async (_config, token) => {
+        islands.push(token);
+        return { ok: true, status: 200, attempts: 1 };
+      },
+    });
+    expect(await waitFor(() => banners.length > 0)).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    watch.stop();
+    expect(islands).toEqual([]);
+    expect(banners).toEqual(["aa".repeat(32)]);
+  });
+
+  it("still starts an island from a sparse frame the harness actually sent", async () => {
+    const islands: { token: string; color: string; options: string[] }[] = [];
+    const sparse = `data: ${JSON.stringify({
+      kind: "notify",
+      notification: { kind: "question", title: "Forge asks", body: "Which branch?", threadId: "t1", botId: "b1" },
+    })}\n\n`;
+    const watch = watchHarnessNotifications({
+      harnessPort: 1,
+      connectedIds: () => [],
+      tokensForDisconnected: () => [],
+      liveActivityTokensForDisconnected: () => [{ deviceId: "island", token: "22".repeat(32) }],
+      config: testConfig(),
+      fetchImpl: async () => new Response(sparse, { status: 200, headers: { "content-type": "text/event-stream" } }),
+      send: async () => ({ ok: true, status: 200, attempts: 1 }),
+      sendLiveActivity: async (_config, token, push) => {
+        islands.push({ token, color: push.attributes.color, options: push.state.options });
+        return { ok: true, status: 200, attempts: 1 };
+      },
+    });
+    expect(await waitFor(() => islands.length > 0)).toBe(true);
+    watch.stop();
+    // No color, no options, no requestId in the frame — the island goes out
+    // anyway, with the documented fallbacks rather than nothing.
+    expect(islands).toEqual([{ token: "22".repeat(32), color: DEFAULT_LIVE_ACTIVITY_COLOR, options: [] }]);
+  });
+
+  it("starts no island for a frame nobody is blocked on", async () => {
+    const sent: string[] = [];
+    const watch = watchHarnessNotifications({
+      harnessPort: 1,
+      connectedIds: () => [],
+      tokensForDisconnected: () => [],
+      liveActivityTokensForDisconnected: () => [{ deviceId: "island", token: "22".repeat(32) }],
+      config: testConfig(),
+      fetchImpl: async () =>
+        new Response(notifyFrame("done"), { status: 200, headers: { "content-type": "text/event-stream" } }),
+      send: async () => ({ ok: true, status: 200, attempts: 1 }),
+      sendLiveActivity: async (_config, token) => {
+        sent.push(token);
+        return { ok: true, status: 200, attempts: 1 };
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    watch.stop();
+    expect(sent).toEqual([]);
+  });
+
+  it("does not count a Live Activity token in the health page's phone totals", async () => {
+    const watch = watchHarnessNotifications({
+      harnessPort: 1,
+      connectedIds: () => [],
+      // One phone, two tokens.  Health counts the phones on the alert list
+      // only, or every phone reads as two against the trip thresholds.
+      tokensForDisconnected: () => [{ deviceId: "island", token: "22".repeat(32) }],
+      liveActivityTokensForDisconnected: () => [{ deviceId: "island", token: "33".repeat(32) }],
+      config: testConfig(),
+      fetchImpl: async () =>
+        new Response(notifyFrame("approval"), {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        }),
+      send: async () => ({ ok: true, status: 200, attempts: 1 }),
+      sendLiveActivity: async () => ({ ok: true, status: 200, attempts: 1 }),
+    });
+    expect(await waitFor(() => watch.health().sent > 0)).toBe(true);
+    const health = watch.health();
+    watch.stop();
+    expect(health.tokensRegistered).toBe(1);
+  });
+
+  it("drops a Live Activity token Apple has retired, through its own forget path", async () => {
+    const forgotten: Array<[string, string]> = [];
+    const alerts: string[] = [];
+    const watch = watchHarnessNotifications({
+      harnessPort: 1,
+      connectedIds: () => [],
+      tokensForDisconnected: () => [],
+      liveActivityTokensForDisconnected: () => [{ deviceId: "stale", token: "cc".repeat(32) }],
+      config: testConfig(),
+      fetchImpl: async () =>
+        new Response(notifyFrame("approval"), {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        }),
+      send: async (_config, token) => {
+        alerts.push(token);
+        return { ok: true, status: 200, attempts: 1 };
+      },
+      forgetToken: () => {
+        throw new Error("the alert path's forget must not be reached");
+      },
+      sendLiveActivity: async () => ({ ok: false, status: 410, reason: "Unregistered", attempts: 1 }),
+      forgetLiveActivityToken: (deviceId, token) => forgotten.push([deviceId, token]),
+    });
+    expect(await waitFor(() => forgotten.length > 0)).toBe(true);
+    watch.stop();
+    expect(forgotten).toEqual([["stale", "cc".repeat(32)]]);
+    expect(alerts).toEqual([]);
+  });
+
+  it("treats a refused key on the Live Activity channel as the key fault it is", async () => {
+    const store = memoryKeyFaultStore();
+    const watch = watchHarnessNotifications({
+      harnessPort: 1,
+      connectedIds: () => [],
+      tokensForDisconnected: () => [],
+      liveActivityTokensForDisconnected: () => [{ deviceId: "island", token: "33".repeat(32) }],
+      config: testConfig(),
+      keyStamp: () => "stamp-1",
+      keyFaultStore: store,
+      fetchImpl: async () =>
+        new Response(notifyFrame("approval"), {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        }),
+      send: async () => ({ ok: true, status: 200, attempts: 1 }),
+      sendLiveActivity: async () => ({
+        ok: false,
+        status: 403,
+        reason: "InvalidProviderToken",
+        attempts: 1,
+        failureKind: "key_fault",
+      }),
+    });
+    expect(await waitFor(() => store.current !== null)).toBe(true);
+    expect(store.current?.reason).toBe("InvalidProviderToken");
+    watch.stop();
+  });
+});
+
+// --- Failure classification + circuit breaker -----------------------------
+//
+// The native `fetch` HTTP/2 path swallows every transport error under a
+// generic "fetch failed" message.  These tests pin down the bucketed shape
+// the health page renders: a DNS blip is `transport`, an HTTP/2 GOAWAY is
+// `http2_protocol`, a 410 is `bad_token`.  They also pin down the
+// consecutive-failure run that opens the circuit and the skip-while-open
+// behaviour that keeps a hot loop from burning provider-token re-signs.
+
+describe("inspectTransportError", () => {
+  it("reads every field Node attaches to a thrown error", () => {
+    const info = inspectTransportError(
+      Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET", name: "Error" }),
+    );
+    expect(info.code).toBe("ECONNRESET");
+    expect(info.message).toContain("ECONNRESET");
+    expect(info.name).toBe("Error");
+  });
+
+  it("falls back to a string when the error is not an object", () => {
+    const info = inspectTransportError("socket hang up");
+    expect(info.message).toBe("socket hang up");
+    expect(info.code).toBe("");
+  });
+});
+
+describe("classifyTransportError", () => {
+  it("buckets an HTTP/2 GOAWAY as http2_protocol", () => {
+    const kind = classifyTransportError({
+      name: "Error",
+      code: "ERR_HTTP2_GOAWAY",
+      message: "http2: received GOAWAY",
+    });
+    expect(kind).toBe("http2_protocol");
+  });
+
+  it("buckets a TCP RST as socket_closed", () => {
+    const kind = classifyTransportError({
+      name: "Error",
+      code: "ECONNRESET",
+      message: "read ECONNRESET",
+    });
+    expect(kind).toBe("socket_closed");
+  });
+
+  it("buckets a DNS failure as transport", () => {
+    const kind = classifyTransportError({
+      name: "Error",
+      code: "ENOTFOUND",
+      message: "getaddrinfo ENOTFOUND api.push.apple.com",
+    });
+    expect(kind).toBe("transport");
+  });
+
+  it("buckets the request deadline (ETIMEDOUT / TimeoutError) as timeout, not transport", () => {
+    expect(classifyTransportError({ name: "TimeoutError", code: "ETIMEDOUT", message: "deadline" })).toBe("timeout");
+    expect(classifyTransportError({ name: "Error", code: "ETIMEDOUT", message: "connect ETIMEDOUT" })).toBe("timeout");
+    expect(classifyTransportError({ name: "TimeoutError", code: "", message: "timed out" })).toBe("timeout");
+  });
+
+  it("buckets a cancelled PING and a session EOF as timeout, not http2_protocol", () => {
+    expect(classifyTransportError({ name: "Error", code: "ERR_HTTP2_PING_CANCEL", message: "ping cancelled" })).toBe("timeout");
+    expect(classifyTransportError({ name: "Error", code: "ERR_HTTP2_SESSION_EOF", message: "session closed" })).toBe("timeout");
+    // Real protocol errors still land in the protocol bucket.
+    expect(classifyTransportError({ name: "Error", code: "ERR_HTTP2_STREAM_ERROR", message: "stream error" })).toBe("http2_protocol");
+  });
+});
+
+describe("classifyHttpResponse", () => {
+  it("maps 410 to bad_token", () => {
+    expect(classifyHttpResponse(410, "Unregistered")).toBe("bad_token");
+  });
+  it("maps 400 BadDeviceToken to bad_token", () => {
+    expect(classifyHttpResponse(400, "BadDeviceToken")).toBe("bad_token");
+  });
+  it("maps 403 ExpiredProviderToken to expired_token", () => {
+    expect(classifyHttpResponse(403, "ExpiredProviderToken")).toBe("expired_token");
+  });
+  it("maps 403 InvalidProviderToken to key_fault", () => {
+    expect(classifyHttpResponse(403, "InvalidProviderToken")).toBe("key_fault");
+  });
+  it("maps 429 to rate_limit", () => {
+    expect(classifyHttpResponse(429, undefined)).toBe("rate_limit");
+  });
+  it("maps a 503 to rate_limit", () => {
+    expect(classifyHttpResponse(503, undefined)).toBe("rate_limit");
+  });
+  it("maps a generic 500 to server", () => {
+    expect(classifyHttpResponse(500, undefined)).toBe("server");
+  });
+});
+
+describe("sendApnsAlert — transport error capture", () => {
+  it("maps ECONNRESET to failureKind=socket_closed and surfaces the code", async () => {
+    const result = await sendApnsAlert(testConfig(), "aa".repeat(32), { title: "t", body: "b" }, {
+      maxAttempts: 1,
+      fetchImpl: async () => {
+        throw Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET", name: "Error" });
+      },
+    });
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe(0);
+    expect(result.reason).toBe("SendFailed");
+    expect(result.attempts).toBe(1);
+    expect(result.failureKind).toBe("socket_closed");
+    expect(result.errorCode).toBe("ECONNRESET");
+  });
+
+  it("maps an HTTP/2 GOAWAY stream error to failureKind=http2_protocol", async () => {
+    const result = await sendApnsAlert(testConfig(), "aa".repeat(32), { title: "t", body: "b" }, {
+      maxAttempts: 1,
+      fetchImpl: async () => {
+        throw Object.assign(new Error("http2: received GOAWAY"), {
+          code: "ERR_HTTP2_GOAWAY",
+          name: "Error",
+        });
+      },
+    });
+    expect(result.failureKind).toBe("http2_protocol");
+    expect(result.errorCode).toBe("ERR_HTTP2_GOAWAY");
+  });
+
+  it("clears a stale transport code once an HTTP response arrives", async () => {
+    let calls = 0;
+    const result = await sendApnsAlert(testConfig(), "aa".repeat(32), { title: "t", body: "b" }, {
+      sleep: async () => {},
+      fetchImpl: async () => {
+        calls += 1;
+        if (calls === 1) {
+          throw Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET", name: "Error" });
+        }
+        return new Response(JSON.stringify({ reason: "ServiceUnavailable" }), { status: 503 });
+      },
+    });
+    expect(result.status).toBe(503);
+    expect(result.failureKind).toBe("rate_limit");
+    expect(result.errorCode).toBeUndefined();
+  });
+
+  it("parses Apple's timestamp field from a 403 InvalidProviderToken body", async () => {
+    const result = await sendApnsAlert(testConfig(), "aa".repeat(32), { title: "t", body: "b" }, {
+      maxAttempts: 1,
+      fetchImpl: async () =>
+        new Response(JSON.stringify({ reason: "InvalidProviderToken", timestamp: 1_700_000_000_000 }), {
+          status: 403,
+        }),
+    });
+    expect(result.reason).toBe("InvalidProviderToken");
+    expect(result.errorTimestamp).toBe(1_700_000_000_000);
+  });
+
+  it("falls back to undefined timestamp when Apple omits the field", async () => {
+    const result = await sendApnsAlert(testConfig(), "aa".repeat(32), { title: "t", body: "b" }, {
+      maxAttempts: 1,
+      fetchImpl: async () =>
+        new Response(JSON.stringify({ reason: "InvalidProviderToken" }), { status: 403 }),
+    });
+    expect(result.errorTimestamp).toBeUndefined();
+  });
+
+  it("parses Apple's invalidation timestamp from a 410 Unregistered body", async () => {
+    const result = await sendApnsAlert(testConfig(), "aa".repeat(32), { title: "t", body: "b" }, {
+      maxAttempts: 1,
+      fetchImpl: async () =>
+        new Response(JSON.stringify({ reason: "Unregistered", timestamp: 1_700_000_000_000 }), { status: 410 }),
+    });
+    expect(result.status).toBe(410);
+    expect(result.failureKind).toBe("bad_token");
+    expect(result.errorTimestamp).toBe(1_700_000_000_000);
+  });
+});
+
+describe("HTTP/2 session cache", () => {
+  beforeEach(() => {
+    dropHttp2Sessions();
+  });
+
+  const fakeSession = (): Http2ApnsSession =>
+    asApnsSession(
+      Object.assign(new EventEmitter(), {
+        closed: false,
+        destroyed: false,
+        close() {},
+      }),
+    );
+  const fakeFactory = (): Http2SessionFactory => () => fakeSession();
+
+  it("reuses a session while the keyId is unchanged", () => {
+    const f = fakeFactory();
+    const sessionA = getOrOpenSession("api.push.apple.com", "K1", f);
+    const sessionB = getOrOpenSession("api.push.apple.com", "K1", f);
+    expect(sessionA).toBe(sessionB);
+    dropHttp2Sessions();
+  });
+
+  it("drops the cached session when the keyId rotates", () => {
+    const f = fakeFactory();
+    const sessionA = getOrOpenSession("api.push.apple.com", "K1", f);
+    const sessionB = getOrOpenSession("api.push.apple.com", "K2", f);
+    expect(sessionA).not.toBe(sessionB);
+    dropHttp2Sessions();
+  });
+});
+
+describe("createApnsHttp2Fetch", () => {
+  beforeEach(() => {
+    dropHttp2Sessions();
+  });
+
+  /** A fake ClientHttp2Stream: an EventEmitter with the methods `sendOver`
+   * calls.  It emits nothing unless the test drives it, which is exactly
+   * the stalled-stream shape the request deadline exists for. */
+  const fakeStream = () => {
+    // SAFETY: sendOver only calls setEncoding, end, close, and listens on
+    // response/data/end/close — all wired on this EventEmitter stand-in.
+    const stream = new EventEmitter() as EventEmitter & {
+      setEncoding: (enc: string) => void;
+      end: (body?: string) => void;
+      close: (code?: number) => void;
+      closedWith?: number;
+      rstCode?: number;
+    };
+    stream.setEncoding = () => {};
+    stream.end = () => {};
+    stream.close = (code?: number) => {
+      stream.closedWith = code;
+    };
+    return stream;
+  };
+
+  const fakeSessionFor = (stream: ReturnType<typeof fakeStream>): Http2ApnsSession =>
+    asApnsSession(
+      Object.assign(new EventEmitter(), {
+        closed: false,
+        destroyed: false,
+        close() {},
+        request: () => stream,
+      }),
+    );
+
+  const respond200 = (stream: ReturnType<typeof fakeStream>) => {
+    stream.emit("response", { ":status": 200 });
+    stream.emit("data", "");
+    stream.emit("end");
+  };
+
+  it("keys sessions by keyId, not by the device token in the URL", async () => {
+    let factoryCalls = 0;
+    const stream = fakeStream();
+    const factory: Http2SessionFactory = () => {
+      factoryCalls += 1;
+      return fakeSessionFor(stream);
+    };
+    const fetchImpl = createApnsHttp2Fetch({ keyId: "K1", factory });
+    const first = fetchImpl(`https://api.push.apple.com/3/device/${"aa".repeat(32)}`, { method: "POST", body: "{}" });
+    respond200(stream);
+    expect((await first).status).toBe(200);
+    const second = fetchImpl(`https://api.push.apple.com/3/device/${"bb".repeat(32)}`, { method: "POST", body: "{}" });
+    respond200(stream);
+    expect((await second).status).toBe(200);
+    // One session served both phones; the device token in the URL must not
+    // force a fresh TLS handshake per push.
+    expect(factoryCalls).toBe(1);
+  });
+
+  it("cancels a stalled stream at the request deadline and rejects as a timeout", async () => {
+    const stream = fakeStream(); // never responds
+    const factory: Http2SessionFactory = () => fakeSessionFor(stream);
+    const fetchImpl = createApnsHttp2Fetch({ keyId: "K1", factory, requestDeadlineMs: 20 });
+    await expect(
+      fetchImpl(`https://api.push.apple.com/3/device/${"aa".repeat(32)}`, { method: "POST", body: "{}" }),
+    ).rejects.toMatchObject({ code: "ETIMEDOUT", name: "TimeoutError" });
+    expect(stream.closedWith).not.toBeUndefined();
+  });
+
+  it("sendApnsAlert opens its default transport through options.http2SessionFactory", async () => {
+    let factoryCalls = 0;
+    let seenKeyId = "";
+    const stream = fakeStream();
+    const factory: Http2SessionFactory = (_host, keyId) => {
+      factoryCalls += 1;
+      seenKeyId = keyId;
+      return fakeSessionFor(stream);
+    };
+    const pending = sendApnsAlert(testConfig(), "aa".repeat(32), { title: "t", body: "b" }, {
+      maxAttempts: 1,
+      http2SessionFactory: factory,
+    });
+    respond200(stream);
+    const result = await pending;
+    expect(result.ok).toBe(true);
+    expect(factoryCalls).toBe(1);
+    // The factory received the signing key id, never the device token.
+    expect(seenKeyId).toBe("ABC123");
+  });
+
+  /** A fake session that emits error / goaway / close like a real one and
+   * runs the production lifecycle wiring, so the per-session pending sweep
+   * is exercised end to end. */
+  const lifecycleSession = (host: string, stream: ReturnType<typeof fakeStream>) => {
+    // SAFETY: lifecycle tests only wire request/close/destroy and events.
+    const raw = new EventEmitter() as EventEmitter & {
+      closed: boolean;
+      destroyed: boolean;
+      close: () => void;
+      destroy: () => void;
+      request: () => ReturnType<typeof fakeStream>;
+    };
+    raw.closed = false;
+    raw.destroyed = false;
+    raw.close = () => {};
+    raw.destroy = () => {
+      raw.destroyed = true;
+    };
+    raw.request = () => stream;
+    watchHttp2SessionLifecycle(host, asClientHttp2Session(raw));
+    return raw;
+  };
+
+  const DEVICE_URL = `https://api.push.apple.com/3/device/${"aa".repeat(32)}`;
+
+  it("a replacement session's failure does not reject the evicted session's draining streams", async () => {
+    const streamA = fakeStream();
+    const streamB = fakeStream();
+    const sessions: ReturnType<typeof lifecycleSession>[] = [];
+    const factory: Http2SessionFactory = (host) => {
+      const raw = lifecycleSession(host, sessions.length === 0 ? streamA : streamB);
+      sessions.push(raw);
+      return asApnsSession(raw);
+    };
+    const fetchImpl = createApnsHttp2Fetch({ keyId: "K1", factory, requestDeadlineMs: 5_000 });
+    const onA = fetchImpl(DEVICE_URL, { method: "POST", body: "{}" });
+    // Apple sends GOAWAY on A: evicted, but its stream keeps draining.
+    sessions[0].emit("goaway");
+    const onB = fetchImpl(DEVICE_URL, { method: "POST", body: "{}" });
+    expect(sessions.length).toBe(2);
+    // The replacement dies.  Only its own send may reject.
+    sessions[1].emit("error", Object.assign(new Error("boom"), { code: "ECONNRESET" }));
+    await expect(onB).rejects.toMatchObject({ code: "ECONNRESET" });
+    let settledA = false;
+    void onA.then(() => {
+      settledA = true;
+    }, () => {
+      settledA = true;
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(settledA).toBe(false);
+    // A's stream then finishes normally — one delivery, no retry.
+    respond200(streamA);
+    expect((await onA).status).toBe(200);
+  });
+
+  it("an evicted session's own close still rejects its pending streams", async () => {
+    const streamA = fakeStream();
+    const streamB = fakeStream();
+    const sessions: ReturnType<typeof lifecycleSession>[] = [];
+    const factory: Http2SessionFactory = (host) => {
+      const raw = lifecycleSession(host, sessions.length === 0 ? streamA : streamB);
+      sessions.push(raw);
+      return asApnsSession(raw);
+    };
+    const fetchImpl = createApnsHttp2Fetch({ keyId: "K1", factory, requestDeadlineMs: 5_000 });
+    const onA = fetchImpl(DEVICE_URL, { method: "POST", body: "{}" });
+    sessions[0].emit("goaway");
+    // A replacement is now cached and serving; A is no longer the cached session.
+    const onB = fetchImpl(DEVICE_URL, { method: "POST", body: "{}" });
+    // A closes with its stream still open: that send must fail now, not
+    // wait out the deadline.
+    sessions[0].emit("close");
+    await expect(onA).rejects.toMatchObject({ code: "ERR_HTTP2_SESSION_EOF" });
+    // B is untouched and still completes.
+    respond200(streamB);
+    expect((await onB).status).toBe(200);
+  });
+
+  /** Like `lifecycleSession`, but every request gets its own stream so
+   * several sends can be in flight on one session at once. */
+  const multiStreamSession = (host: string) => {
+    const streams: ReturnType<typeof fakeStream>[] = [];
+    // SAFETY: multi-stream tests only wire request/close/destroy and events.
+    const raw = new EventEmitter() as EventEmitter & {
+      closed: boolean;
+      destroyed: boolean;
+      destroyCalls: number;
+      close: () => void;
+      destroy: () => void;
+      request: () => ReturnType<typeof fakeStream>;
+    };
+    raw.closed = false;
+    raw.destroyed = false;
+    raw.destroyCalls = 0;
+    raw.close = () => {};
+    raw.destroy = () => {
+      raw.destroyCalls += 1;
+      raw.destroyed = true;
+    };
+    raw.request = () => {
+      const stream = fakeStream();
+      streams.push(stream);
+      return stream;
+    };
+    watchHttp2SessionLifecycle(host, asClientHttp2Session(raw));
+    return { raw, streams };
+  };
+
+  it("evicts and destroys a session whose request hit the deadline, so the next send opens a fresh one", async () => {
+    const sessions: ReturnType<typeof multiStreamSession>[] = [];
+    const factory: Http2SessionFactory = (host) => {
+      const s = multiStreamSession(host);
+      sessions.push(s);
+      return asApnsSession(s.raw);
+    };
+    const fetchImpl = createApnsHttp2Fetch({ keyId: "K1", factory, requestDeadlineMs: 20 });
+    // Half-open connection: the stream never answers.
+    await expect(fetchImpl(DEVICE_URL, { method: "POST", body: "{}" })).rejects.toMatchObject({
+      code: "ETIMEDOUT",
+      name: "TimeoutError",
+    });
+    expect(sessions.length).toBe(1);
+    expect(sessions[0].raw.destroyCalls).toBe(1);
+    // The retry must not be written to the dead session.
+    const retry = fetchImpl(DEVICE_URL, { method: "POST", body: "{}" });
+    expect(sessions.length).toBe(2);
+    expect(sessions[0].streams.length).toBe(1);
+    respond200(sessions[1].streams[0]);
+    expect((await retry).status).toBe(200);
+  });
+
+  it("a deadline expiry fails the other sends pending on that session, never the replacement's", async () => {
+    const sessions: ReturnType<typeof multiStreamSession>[] = [];
+    const factory: Http2SessionFactory = (host) => {
+      const s = multiStreamSession(host);
+      sessions.push(s);
+      return asApnsSession(s.raw);
+    };
+    // Same key and factory, so both transports share the cached session;
+    // only the deadlines differ.
+    const slow = createApnsHttp2Fetch({ keyId: "K1", factory, requestDeadlineMs: 5_000 });
+    const fast = createApnsHttp2Fetch({ keyId: "K1", factory, requestDeadlineMs: 20 });
+    const started = Date.now();
+    const bystander = slow(DEVICE_URL, { method: "POST", body: "{}" });
+    const expiring = fast(DEVICE_URL, { method: "POST", body: "{}" });
+    expect(sessions.length).toBe(1);
+    expect(sessions[0].streams.length).toBe(2);
+    await expect(expiring).rejects.toMatchObject({ code: "ETIMEDOUT" });
+    // The bystander is on the same dead connection: it fails now, with the
+    // eviction, instead of waiting out its own 5s deadline.
+    await expect(bystander).rejects.toMatchObject({ code: "ETIMEDOUT", name: "TimeoutError" });
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(sessions[0].raw.destroyCalls).toBe(1);
+    // A send on the replacement is untouched by the old session's sweep,
+    // including the late close the destroyed session emits.
+    const onReplacement = slow(DEVICE_URL, { method: "POST", body: "{}" });
+    expect(sessions.length).toBe(2);
+    sessions[0].raw.emit("close");
+    let settled = false;
+    void onReplacement.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+    await new Promise((r) => setTimeout(r, 10));
+    expect(settled).toBe(false);
+    respond200(sessions[1].streams[0]);
+    expect((await onReplacement).status).toBe(200);
+  });
+
+  it("a stream reset before any response rejects as a protocol error, and the retry reuses the healthy session", async () => {
+    const sessions: ReturnType<typeof multiStreamSession>[] = [];
+    const factory: Http2SessionFactory = (host) => {
+      const s = multiStreamSession(host);
+      sessions.push(s);
+      return asApnsSession(s.raw);
+    };
+    const fetchImpl = createApnsHttp2Fetch({ keyId: "K1", factory, requestDeadlineMs: 5_000 });
+    const started = Date.now();
+    const first = fetchImpl(DEVICE_URL, { method: "POST", body: "{}" });
+    // APNs sends RST_STREAM ahead of any headers: the send fails now, not
+    // after the full request deadline.
+    sessions[0].streams[0].rstCode = http2Constants.NGHTTP2_REFUSED_STREAM;
+    sessions[0].streams[0].emit("close");
+    const err = await first.catch((e) => e);
+    expect(err).toMatchObject({ code: "ERR_HTTP2_STREAM_ERROR", name: "HTTP2StreamError" });
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(classifyTransportError(inspectTransportError(err))).toBe("http2_protocol");
+    // An RST_STREAM kills one stream, not the connection: no eviction, no
+    // destroy, and the retry is written to this same session.
+    expect(sessions[0].raw.destroyCalls).toBe(0);
+    const retry = fetchImpl(DEVICE_URL, { method: "POST", body: "{}" });
+    expect(sessions.length).toBe(1);
+    expect(sessions[0].streams.length).toBe(2);
+    respond200(sessions[0].streams[1]);
+    expect((await retry).status).toBe(200);
+  });
+
+  it("a stream that closes with no response and no RST_STREAM rejects as a dropped socket", async () => {
+    const sessions: ReturnType<typeof multiStreamSession>[] = [];
+    const factory: Http2SessionFactory = (host) => {
+      const s = multiStreamSession(host);
+      sessions.push(s);
+      return asApnsSession(s.raw);
+    };
+    const fetchImpl = createApnsHttp2Fetch({ keyId: "K1", factory, requestDeadlineMs: 5_000 });
+    const first = fetchImpl(DEVICE_URL, { method: "POST", body: "{}" });
+    // rstCode stays NO_ERROR: the stream went away without a reset frame.
+    sessions[0].streams[0].emit("close");
+    const err = await first.catch((e) => e);
+    expect(err).toMatchObject({ code: "ECONNRESET" });
+    expect(classifyTransportError(inspectTransportError(err))).toBe("socket_closed");
+    // No evidence the connection is dead either, so the session survives.
+    expect(sessions[0].raw.destroyCalls).toBe(0);
+  });
+
+  it("sendApnsAlert retries a pre-response reset right away on the same session", async () => {
+    const sessions: ReturnType<typeof multiStreamSession>[] = [];
+    const factory: Http2SessionFactory = (host) => {
+      const s = multiStreamSession(host);
+      sessions.push(s);
+      return asApnsSession(s.raw);
+    };
+    const started = Date.now();
+    const pending = sendApnsAlert(testConfig(), "aa".repeat(32), { title: "t", body: "b" }, {
+      maxAttempts: 2,
+      sleep: async () => {},
+      http2SessionFactory: factory,
+    });
+    await waitFor(() => sessions.length > 0 && sessions[0].streams.length > 0);
+    sessions[0].streams[0].rstCode = http2Constants.NGHTTP2_REFUSED_STREAM;
+    sessions[0].streams[0].emit("close");
+    // The retry lands on the same session — the reset never evicted it.
+    await waitFor(() => sessions[0].streams.length > 1);
+    respond200(sessions[0].streams[1]);
+    const result = await pending;
+    expect(result.ok).toBe(true);
+    expect(result.attempts).toBe(2);
+    expect(sessions.length).toBe(1);
+    expect(sessions[0].raw.destroyCalls).toBe(0);
+    expect(Date.now() - started).toBeLessThan(2_000);
+  });
+
+  /** A multi-stream session that also answers `ping`, running the
+   * production PING keepalive on short timers.  Each PING's callback is
+   * held so the test decides whether it succeeds, fails, or never returns. */
+  const pingingSession = (host: string, deadlineMs: number) => {
+    const s = multiStreamSession(host);
+    const { session, pings } = attachPingHolder(s.raw);
+    const stop = startHttp2PingKeepalive(host, session, {
+      intervalMs: 10,
+      deadlineMs,
+    });
+    return { ...s, pings, stop };
+  };
+
+  const waitFor = async (cond: () => boolean, ms = 2_000) => {
+    const started = Date.now();
+    while (!cond() && Date.now() - started < ms) await new Promise((r) => setTimeout(r, 5));
+  };
+
+  it("an error delivered to the PING callback evicts and destroys the session and fails its pending sends", async () => {
+    const sessions: ReturnType<typeof pingingSession>[] = [];
+    const factory: Http2SessionFactory = (host) => {
+      const s = pingingSession(host, 5_000);
+      sessions.push(s);
+      return asApnsSession(s.raw);
+    };
+    const fetchImpl = createApnsHttp2Fetch({ keyId: "K1", factory, requestDeadlineMs: 5_000 });
+    const started = Date.now();
+    const pending = fetchImpl(DEVICE_URL, { method: "POST", body: "{}" });
+    await waitFor(() => sessions[0].pings.length > 0);
+    expect(sessions[0].pings.length).toBe(1);
+    sessions[0].pings[0](Object.assign(new Error("ping failed"), { code: "ERR_HTTP2_PING_CANCEL" }));
+    // The send on the dead session fails now, not after its 5s deadline.
+    await expect(pending).rejects.toMatchObject({ code: "ERR_HTTP2_PING_CANCEL" });
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(sessions[0].raw.destroyCalls).toBe(1);
+    // The next send opens a fresh session instead of reusing the dead one.
+    const next = fetchImpl(DEVICE_URL, { method: "POST", body: "{}" });
+    expect(sessions.length).toBe(2);
+    respond200(sessions[1].streams[0]);
+    expect((await next).status).toBe(200);
+    sessions[1].stop();
+  });
+
+  it("an unanswered PING hits its deadline: the idle session is evicted and destroyed before the next send", async () => {
+    const sessions: ReturnType<typeof pingingSession>[] = [];
+    const factory: Http2SessionFactory = (host) => {
+      const s = pingingSession(host, 20);
+      sessions.push(s);
+      return asApnsSession(s.raw);
+    };
+    const fetchImpl = createApnsHttp2Fetch({ keyId: "K1", factory, requestDeadlineMs: 5_000 });
+    const first = fetchImpl(DEVICE_URL, { method: "POST", body: "{}" });
+    respond200(sessions[0].streams[0]);
+    expect((await first).status).toBe(200);
+    // The session is idle and cached.  Its PING never comes back.
+    await waitFor(() => sessions[0].raw.destroyCalls > 0);
+    expect(sessions[0].raw.destroyCalls).toBe(1);
+    // One PING at a time: the keepalive did not stack PINGs while one was out.
+    expect(sessions[0].pings.length).toBe(1);
+    // The next send goes straight to a fresh session instead of burning a
+    // full request deadline on the half-open one.
+    const started = Date.now();
+    const next = fetchImpl(DEVICE_URL, { method: "POST", body: "{}" });
+    expect(sessions.length).toBe(2);
+    expect(sessions[0].streams.length).toBe(1);
+    respond200(sessions[1].streams[0]);
+    expect((await next).status).toBe(200);
+    expect(Date.now() - started).toBeLessThan(2_000);
+    sessions[1].stop();
+  });
+
+  it("a PING deadline fails only that session's pending sends, as a timeout", async () => {
+    const sessions: ReturnType<typeof pingingSession>[] = [];
+    const factory: Http2SessionFactory = (host) => {
+      const s = pingingSession(host, 20);
+      sessions.push(s);
+      return asApnsSession(s.raw);
+    };
+    const fetchImpl = createApnsHttp2Fetch({ keyId: "K1", factory, requestDeadlineMs: 5_000 });
+    const pending = fetchImpl(DEVICE_URL, { method: "POST", body: "{}" });
+    await expect(pending).rejects.toMatchObject({ code: "ETIMEDOUT", name: "TimeoutError" });
+    expect(classifyTransportError(inspectTransportError(await pending.catch((e) => e)))).toBe("timeout");
+    // The replacement is untouched, including by the destroyed session's late close.
+    const onReplacement = fetchImpl(DEVICE_URL, { method: "POST", body: "{}" });
+    expect(sessions.length).toBe(2);
+    sessions[1].stop();
+    sessions[0].raw.emit("close");
+    let settled = false;
+    void onReplacement.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+    await new Promise((r) => setTimeout(r, 10));
+    expect(settled).toBe(false);
+    respond200(sessions[1].streams[0]);
+    expect((await onReplacement).status).toBe(200);
+  });
+
+  it("an answered PING keeps the session cached and the keepalive running", async () => {
+    const sessions: ReturnType<typeof pingingSession>[] = [];
+    const factory: Http2SessionFactory = (host) => {
+      const s = pingingSession(host, 50);
+      sessions.push(s);
+      return asApnsSession(s.raw);
+    };
+    const fetchImpl = createApnsHttp2Fetch({ keyId: "K1", factory, requestDeadlineMs: 5_000 });
+    const first = fetchImpl(DEVICE_URL, { method: "POST", body: "{}" });
+    respond200(sessions[0].streams[0]);
+    expect((await first).status).toBe(200);
+    for (let i = 0; i < 3; i += 1) {
+      await waitFor(() => sessions[0].pings.length > i);
+      sessions[0].pings[i](null, 1, Buffer.alloc(8));
+    }
+    expect(sessions[0].pings.length).toBeGreaterThanOrEqual(3);
+    expect(sessions[0].raw.destroyCalls).toBe(0);
+    const next = fetchImpl(DEVICE_URL, { method: "POST", body: "{}" });
+    expect(sessions.length).toBe(1);
+    respond200(sessions[0].streams[1]);
+    expect((await next).status).toBe(200);
+    sessions[0].stop();
+  });
+
+  it("the PING keepalive stops when the session closes", async () => {
+    const s = pingingSession("api.push.apple.com", 5_000);
+    await waitFor(() => s.pings.length > 0);
+    s.pings[0](null, 1, Buffer.alloc(8));
+    s.raw.emit("close");
+    const count = s.pings.length;
+    await new Promise((r) => setTimeout(r, 50));
+    expect(s.pings.length).toBe(count);
+    expect(s.raw.destroyCalls).toBe(0);
+  });
+});
+
+describe("watchHarnessNotifications — circuit breaker", () => {
+  beforeEach(() => {
+    dropHttp2Sessions();
+  });
+
+  it("opens the circuit after 20 consecutive transport failures and holds the rest on the lane", async () => {
+    let clock = 1_700_000_000_000;
+    const sent: number[] = [];
+    const frames = Array.from({ length: 30 }, (_, i) => moduleNotifyFrame("done", String(i))).join("");
+    const watch = watchHarnessNotifications({
+      harnessPort: 1,
+      connectedIds: () => [],
+      tokensForDisconnected: () => [{ deviceId: "offline", token: "aa".repeat(32) }],
+      config: testConfig(),
+      now: () => clock,
+      maxQueuedPerDevice: 32,
+      // A fake clock never reaches the end of the window, so the retry must
+      // never fire on its own here.
+      scheduleRetry: () => () => {},
+      fetchImpl: async () =>
+        new Response(frames, { status: 200, headers: { "content-type": "text/event-stream" } }),
+      send: async () => {
+        sent.push(clock);
+        return transportFailure();
+      },
+    });
+    expect(await waitFor(() => watch.health().circuitOpenUntil !== null, 5000)).toBe(true);
+    const h = watch.health();
+    expect(sent.length).toBe(20);
+    expect(h.consecutiveTransportFailures).toBe(20);
+    expect(h.circuitOpenUntil).toBe(clock + APNS_CIRCUIT_WINDOW_MS);
+    expect(h.failureKind).toBe("transport");
+    expect(h.lastErrorCode).toBe("ECONNRESET");
+    // Pushes are off, and the health says so in the one word the phone can
+    // render without guessing from `lastSentAt`.
+    expect(h.pushesOff).toBe(true);
+    expect(h.pushesOffReason).toBe("unreachable");
+
+    // The ten notifications behind the trip are HELD, not destroyed: the
+    // drain leaves them on the lane and stops rather than shifting each one
+    // off and discarding it, which used to empty a whole backlog — blocking
+    // approvals included — in a single loop.
+    expect(await waitFor(() => (watch.health().devices[0]?.queued ?? 0) === 10)).toBe(true);
+    const final = watch.health();
+    expect(final.devices).toHaveLength(1);
+    expect(final.devices[0].deviceId).toBe("offline");
+    expect(final.devices[0].queued).toBe(10);
+    expect(final.devices[0].circuitOpenUntil).toBe(clock + APNS_CIRCUIT_WINDOW_MS);
+    // An open circuit is Apple being unreachable, not a full local queue:
+    // nothing may land on the queue-full counter.
+    expect(final.dropped).toBe(0);
+    expect(final.devices[0].dropped).toBe(0);
+    // The hold path does not increment `failed` — the 20 sends did.
+    expect(final.failed).toBe(20);
+    // And it does not send anything more: the circuit is what stops the hot
+    // loop burning provider-token re-signs against an unreachable gateway.
+    expect(final.circuitDropped).toBeGreaterThanOrEqual(1);
+    expect(sent.length).toBe(20);
+    watch.stop();
+  });
+
+  const failingWatch = (count: number, failureKind: "timeout" | "http2_protocol", errorCode: string) => {
+    const frames = Array.from({ length: count }, (_, i) => moduleNotifyFrame("done", String(i))).join("");
+    let sends = 0;
+    const watch = watchHarnessNotifications({
+      harnessPort: 1,
+      connectedIds: () => [],
+      tokensForDisconnected: () => [{ deviceId: "offline", token: "aa".repeat(32) }],
+      config: testConfig(),
+      maxQueuedPerDevice: 32,
+      fetchImpl: async () =>
+        new Response(frames, { status: 200, headers: { "content-type": "text/event-stream" } }),
+      send: async () => {
+        sends += 1;
+        return { ok: false, status: 0, reason: "SendFailed", attempts: 1, failureKind, errorCode };
+      },
+    });
+    return { watch, sends: () => sends };
+  };
+
+  it("timeouts do not trip the 5-strike HTTP/2 protocol breaker", async () => {
+    const { watch, sends } = failingWatch(8, "timeout", "ERR_HTTP2_PING_CANCEL");
+    const started = Date.now();
+    while (watch.health().failed + watch.health().circuitDropped < 8 && Date.now() - started < 3000) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    const h = watch.health();
+    expect(sends()).toBe(8);
+    expect(h.failureKind).toBe("timeout");
+    expect(h.circuitOpenUntil).toBeNull();
+    expect(h.circuitDropped).toBe(0);
+    watch.stop();
+  });
+
+  it("five HTTP/2 protocol errors in a row still trip the protocol breaker", async () => {
+    const { watch, sends } = failingWatch(8, "http2_protocol", "ERR_HTTP2_STREAM_ERROR");
+    expect(await waitFor(() => watch.health().circuitOpenUntil !== null)).toBe(true);
+    const h = watch.health();
+    expect(sends()).toBe(5);
+    expect(h.circuitOpenUntil).not.toBeNull();
+    // The drain stops at the trip and holds what is left, so the hold is
+    // counted once per stopped pass — not once per notification, because no
+    // notification was skipped.
+    expect(h.circuitDropped).toBeGreaterThanOrEqual(1);
+    expect(h.devices[0].queued).toBe(3);
+    expect(h.dropped).toBe(0);
+    watch.stop();
+  });
+
+  it("counts an HTTP/2 protocol error toward the transport threshold", async () => {
+    // `http2_protocol` incremented the shared run and was then excluded from
+    // the branch that trips, so a GOAWAY landing on the twentieth failure of
+    // a run skipped the trip entirely.  Nineteen socket drops and one GOAWAY
+    // is that exact shape.
+    expect(isTransportFailure("http2_protocol")).toBe(true);
+    let sends = 0;
+    const frames = Array.from({ length: 24 }, (_, i) => moduleNotifyFrame("done", String(i))).join("");
+    const watch = watchHarnessNotifications({
+      harnessPort: 1,
+      connectedIds: () => [],
+      tokensForDisconnected: () => [{ deviceId: "offline", token: "aa".repeat(32) }],
+      config: testConfig(),
+      maxQueuedPerDevice: 32,
+      scheduleRetry: () => () => {},
+      fetchImpl: async () =>
+        new Response(frames, { status: 200, headers: { "content-type": "text/event-stream" } }),
+      send: async () => {
+        sends += 1;
+        // Nineteen socket drops, then a GOAWAY as the twentieth.  Neither
+        // alone reaches the 5-strike protocol threshold.
+        return sends === 20
+          ? { ok: false as const, status: 0, reason: "SendFailed", attempts: 1, failureKind: "http2_protocol" as const, errorCode: "ERR_HTTP2_GOAWAY" }
+          : { ok: false as const, status: 0, reason: "SendFailed", attempts: 1, failureKind: "socket_closed" as const, errorCode: "ECONNRESET" };
+      },
+    });
+    expect(await waitFor(() => watch.health().circuitOpenUntil !== null)).toBe(true);
+    expect(sends).toBe(20);
+    expect(watch.health().devices[0].consecutiveTransportFailures).toBe(20);
+    watch.stop();
+  });
+
+  it("resets consecutiveTransportFailures on a successful send", async () => {
+    let nextOk = true;
+    const watch = watchHarnessNotifications({
+      harnessPort: 1,
+      connectedIds: () => [],
+      tokensForDisconnected: () => [{ deviceId: "offline", token: "aa".repeat(32) }],
+      config: testConfig(),
+      fetchImpl: async () =>
+        new Response(moduleNotifyFrame("done"), { status: 200, headers: { "content-type": "text/event-stream" } }),
+      send: async () => {
+        if (nextOk) return { ok: true, status: 200, attempts: 1, failureKind: "none" };
+        return {
+          ok: false,
+          status: 0,
+          reason: "SendFailed",
+          attempts: 1,
+          failureKind: "transport",
+          errorCode: "ECONNRESET",
+        };
+      },
+    });
+    // First frame → ok; counter never increments.
+    const started = Date.now();
+    while (watch.health().sent === 0 && Date.now() - started < 2000) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(watch.health().consecutiveTransportFailures).toBe(0);
+    expect(watch.health().failureKind).toBe("none");
+    expect(watch.health().lastErrorCode).toBeNull();
+
+    // Now let the next frame fail — counter should climb to 1.
+    nextOk = false;
+    const watch2 = watchHarnessNotifications({
+      harnessPort: 1,
+      connectedIds: () => [],
+      tokensForDisconnected: () => [{ deviceId: "offline", token: "aa".repeat(32) }],
+      config: testConfig(),
+      fetchImpl: async () =>
+        new Response(moduleNotifyFrame("done"), { status: 200, headers: { "content-type": "text/event-stream" } }),
+      send: async () => ({
+        ok: false,
+        status: 0,
+        reason: "SendFailed",
+        attempts: 1,
+        failureKind: "transport",
+        errorCode: "ECONNRESET",
+      }),
+    });
+    const started2 = Date.now();
+    while (watch2.health().failed === 0 && Date.now() - started2 < 2000) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(watch2.health().consecutiveTransportFailures).toBeGreaterThanOrEqual(1);
+    expect(watch2.health().failureKind).toBe("transport");
+    expect(watch2.health().lastErrorCode).toBe("ECONNRESET");
+    watch.stop();
+    watch2.stop();
+  });
+
+  it("surfaces Apple's timestamp on the health page after a key fault", async () => {
+    const watch = watchHarnessNotifications({
+      harnessPort: 1,
+      connectedIds: () => [],
+      tokensForDisconnected: () => [{ deviceId: "offline", token: "aa".repeat(32) }],
+      config: testConfig(),
+      fetchImpl: async () =>
+        new Response(moduleNotifyFrame("done"), { status: 200, headers: { "content-type": "text/event-stream" } }),
+      send: async () => ({
+        ok: false,
+        status: 403,
+        reason: "InvalidProviderToken",
+        attempts: 1,
+        failureKind: "key_fault",
+        errorTimestamp: 1_700_000_000_000,
+      }),
+    });
+    const started = Date.now();
+    while (watch.health().failed === 0 && Date.now() - started < 2000) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    const h = watch.health();
+    expect(h.keyRejected).toBe("InvalidProviderToken");
+    expect(h.lastError).toContain("timestamp=1700000000000");
+    watch.stop();
+  });
+});
+
+describe("watchHarnessNotifications — transport failure noise", () => {
+  const frames = (count: number) =>
+    Array.from({ length: count }, (_, i) => moduleNotifyFrame("done", String(i))).join("");
+
+  it("says a link is failing once, not once per attempt", async () => {
+    // The harness log held 6,003 identical `APNs 0 SendFailed` lines over two
+    // days — one every forty seconds — because transport failures were the
+    // one outcome class that fell through `recordOutcome` with no dedupe.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const watch = watchHarnessNotifications({
+        harnessPort: 1,
+        connectedIds: () => [],
+        tokensForDisconnected: () => [{ deviceId: "offline", token: "aa".repeat(32) }],
+        config: testConfig(),
+        now: () => 1_700_000_000_000,
+        maxQueuedPerDevice: 32,
+        scheduleRetry: () => () => {},
+        fetchImpl: async () =>
+          new Response(frames(15), { status: 200, headers: { "content-type": "text/event-stream" } }),
+        send: async () => transportFailure(),
+      });
+      expect(await waitFor(() => watch.health().failed >= 15)).toBe(true);
+      watch.stop();
+      const lines = warn.mock.calls.map((call) => String(call[0]));
+      expect(lines.filter((line) => line.includes("push connection is failing"))).toHaveLength(1);
+      // And nothing else wrote a line per failure either.
+      expect(lines.filter((line) => line.includes("APNs"))).toHaveLength(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("summarises a link that keeps failing, with the count, every ten minutes", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      let clock = 1_700_000_000_000;
+      const watch = watchHarnessNotifications({
+        harnessPort: 1,
+        connectedIds: () => [],
+        tokensForDisconnected: () => [{ deviceId: "offline", token: "aa".repeat(32) }],
+        config: testConfig(),
+        now: () => clock,
+        maxQueuedPerDevice: 32,
+        scheduleRetry: () => () => {},
+        fetchImpl: async () =>
+          new Response(frames(5), { status: 200, headers: { "content-type": "text/event-stream" } }),
+        send: async () => {
+          clock += APNS_TRANSPORT_SUMMARY_MS + 1;
+          return transportFailure();
+        },
+      });
+      expect(await waitFor(() => watch.health().failed >= 5)).toBe(true);
+      watch.stop();
+      const summaries = warn.mock.calls
+        .map((call) => String(call[0]))
+        .filter((line) => line.includes("transport failures for one phone"));
+      // One line for the state change, then one summary per elapsed window.
+      expect(summaries).toHaveLength(4);
+      expect(summaries[summaries.length - 1]).toContain("5 transport failures");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("says so once when the link comes back, and is ready to complain again", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      let sends = 0;
+      const watch = watchHarnessNotifications({
+        harnessPort: 1,
+        connectedIds: () => [],
+        tokensForDisconnected: () => [{ deviceId: "offline", token: "aa".repeat(32) }],
+        config: testConfig(),
+        maxQueuedPerDevice: 32,
+        scheduleRetry: () => () => {},
+        fetchImpl: async () =>
+          new Response(frames(6), { status: 200, headers: { "content-type": "text/event-stream" } }),
+        send: async () => {
+          sends += 1;
+          // Three failures, then the link comes back.
+          return sends <= 3
+            ? transportFailure()
+            : { ok: true as const, status: 200, attempts: 1, failureKind: "none" as const };
+        },
+      });
+      expect(await waitFor(() => watch.health().sent >= 1)).toBe(true);
+      watch.stop();
+      const recovered = log.mock.calls
+        .map((call) => String(call[0]))
+        .filter((line) => line.includes("delivery recovered"));
+      expect(recovered).toHaveLength(1);
+      expect(recovered[0]).toContain("3 transport failures");
+      expect(
+        warn.mock.calls.map((call) => String(call[0])).filter((line) => line.includes("push connection is failing")),
+      ).toHaveLength(1);
+    } finally {
+      warn.mockRestore();
+      log.mockRestore();
+    }
+  });
+});
+
+describe("watchHarnessNotifications — the breaker is per device", () => {
+  it("one phone's dead token does not zero another phone's transport run", async () => {
+    // `deliver` fans every notification out to every disconnected phone, so
+    // a single shared counter was reset by any other phone's 400 before it
+    // could ever reach twenty.  That is why a breaker that shipped in #525
+    // never opened while the link was down for two days.
+    const frames = Array.from({ length: 20 }, (_, i) => moduleNotifyFrame("done", String(i))).join("");
+    const watch = watchHarnessNotifications({
+      harnessPort: 1,
+      connectedIds: () => [],
+      tokensForDisconnected: () => [
+        { deviceId: "broken-link", token: "aa".repeat(32) },
+        { deviceId: "dead-token", token: "bb".repeat(32) },
+      ],
+      config: testConfig(),
+      maxQueuedPerDevice: 32,
+      scheduleRetry: () => () => {},
+      forgetToken: () => {},
+      fetchImpl: async () =>
+        new Response(frames, { status: 200, headers: { "content-type": "text/event-stream" } }),
+      send: async (_config, token) =>
+        token === "aa".repeat(32)
+          ? transportFailure()
+          : { ok: false as const, status: 400, reason: "BadDeviceToken", attempts: 1, failureKind: "bad_token" as const },
+    });
+    expect(await waitFor(() => watch.health().circuitOpenUntil !== null, 5000)).toBe(true);
+    const h = watch.health();
+    const broken = h.devices.find((device) => device.deviceId === "broken-link");
+    const dead = h.devices.find((device) => device.deviceId === "dead-token");
+    expect(broken?.consecutiveTransportFailures).toBe(20);
+    expect(broken?.circuitOpenUntil).not.toBeNull();
+    // The other phone's verdict is about its token, not about the link.
+    expect(dead?.consecutiveTransportFailures).toBe(0);
+    expect(dead?.circuitOpenUntil).toBeNull();
+    // One broken phone is not the fleet: pushes are still on for the rest.
+    expect(h.pushesOff).toBe(false);
+    watch.stop();
+  });
+
+  it("logs the open circuit once per phone, and again only after a success", async () => {
+    // The dedupe key used to embed the failure count, which only resets on
+    // success — so no key ever matched, a warning was logged on every trip,
+    // and the Set grew for as long as the link stayed down.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const frames = Array.from({ length: 40 }, (_, i) => moduleNotifyFrame("done", String(i))).join("");
+      let clock = 1_700_000_000_000;
+      const retries: (() => void)[] = [];
+      const watch = watchHarnessNotifications({
+        harnessPort: 1,
+        connectedIds: () => [],
+        tokensForDisconnected: () => [{ deviceId: "offline", token: "aa".repeat(32) }],
+        config: testConfig(),
+        now: () => clock,
+        maxQueuedPerDevice: 64,
+        scheduleRetry: (run) => {
+          retries.push(run);
+          return () => {};
+        },
+        fetchImpl: async () =>
+          new Response(frames, { status: 200, headers: { "content-type": "text/event-stream" } }),
+        send: async () => transportFailure(),
+      });
+      expect(await waitFor(() => watch.health().circuitOpenUntil !== null, 5000)).toBe(true);
+      // Let the window lapse five times over.  The failure run survives the
+      // window, so the first send after each one trips the circuit again —
+      // five more trips, each with a different count, which is exactly the
+      // shape the old key could not dedupe.
+      let seen = watch.health().failed;
+      for (let round = 0; round < 5; round += 1) {
+        clock += APNS_CIRCUIT_WINDOW_MS + 1;
+        retries.splice(0).forEach((run) => run());
+        expect(await waitFor(() => watch.health().failed > seen)).toBe(true);
+        seen = watch.health().failed;
+      }
+      watch.stop();
+      expect(seen).toBeGreaterThanOrEqual(25);
+      const opens = warn.mock.calls
+        .map((call) => String(call[0]))
+        .filter((line) => line.includes("circuit open"));
+      expect(opens).toHaveLength(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
+
+describe("watchHarnessNotifications — an open circuit defers, it does not drop", () => {
+  it("holds a blocking approval through the window and delivers it after", async () => {
+    let clock = 1_700_000_000_000;
+    const retries: { run: () => void; ms: number }[] = [];
+    const attempted: string[] = [];
+    let failing = true;
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      start(c) {
+        controller = c;
+      },
+    });
+    const watch = watchHarnessNotifications({
+      harnessPort: 1,
+      connectedIds: () => [],
+      tokensForDisconnected: () => [{ deviceId: "phone", token: "aa".repeat(32) }],
+      config: testConfig(),
+      now: () => clock,
+      maxQueuedPerDevice: 32,
+      scheduleRetry: (run, ms) => {
+        retries.push({ run, ms });
+        return () => {};
+      },
+      fetchImpl: async () =>
+        new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } }),
+      send: async (_config, _token, alert) => {
+        attempted.push(alert.body);
+        return failing
+          ? transportFailure()
+          : { ok: true as const, status: 200, attempts: 1, failureKind: "none" as const };
+      },
+    });
+    controller.enqueue(
+      encoder.encode(Array.from({ length: 20 }, (_, i) => moduleNotifyFrame("done", `report-${i}`)).join("")),
+    );
+    expect(await waitFor(() => watch.health().circuitOpenUntil !== null, 5000)).toBe(true);
+
+    // The approval arrives while Apple is unreachable.  This is the one that
+    // must not be lost: a bot is blocked on the answer.
+    controller.enqueue(encoder.encode(moduleNotifyFrame("approval", "approve me")));
+    expect(await waitFor(() => (watch.health().devices[0]?.queued ?? 0) === 1)).toBe(true);
+    expect(attempted).not.toContain("approve me");
+    expect(watch.health().dropped).toBe(0);
+    expect(retries.length).toBeGreaterThan(0);
+    // The retry is scheduled for the rest of the window, not for "never".
+    expect(retries[0].ms).toBeLessThanOrEqual(APNS_CIRCUIT_WINDOW_MS);
+
+    // The window passes and the link comes back.
+    clock += APNS_CIRCUIT_WINDOW_MS + 1;
+    failing = false;
+    retries[retries.length - 1].run();
+    expect(await waitFor(() => attempted.includes("approve me"))).toBe(true);
+    const h = watch.health();
+    expect(h.sent).toBe(1);
+    expect(h.dropped).toBe(0);
+    expect(h.circuitOpenUntil).toBeNull();
+    expect(h.pushesOff).toBe(false);
+    watch.stop();
+  });
+
+  it("caps a held lane and counts what it drops, per phone", async () => {
+    // Holding is not hoarding: a window that outlasts the backlog cap drops
+    // the oldest of what is waiting, and says how many, per phone.
+    let clock = 1_700_000_000_000;
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      start(c) {
+        controller = c;
+      },
+    });
+    const watch = watchHarnessNotifications({
+      harnessPort: 1,
+      connectedIds: () => [],
+      tokensForDisconnected: () => [{ deviceId: "phone", token: "aa".repeat(32) }],
+      config: testConfig(),
+      now: () => clock,
+      maxQueuedPerDevice: 4,
+      scheduleRetry: () => () => {},
+      fetchImpl: async () =>
+        new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } }),
+      send: async () => transportFailure(),
+    });
+    // One at a time, so the lane never overflows before the circuit opens —
+    // the cap is what is under test afterwards, not before.
+    for (let i = 0; i < APNS_TRANSPORT_THRESHOLD; i += 1) {
+      controller.enqueue(encoder.encode(moduleNotifyFrame("done", `report-${i}`)));
+      expect(await waitFor(() => watch.health().failed >= i + 1, 5000)).toBe(true);
+    }
+    expect(watch.health().circuitOpenUntil).not.toBeNull();
+
+    // Thirteen more arrive while Apple is unreachable.  Four are held; the
+    // other nine are dropped, counted, and reported against this phone.
+    controller.enqueue(
+      encoder.encode(
+        Array.from({ length: 12 }, (_, i) => moduleNotifyFrame("done", `held-${i}`)).join("") +
+          moduleNotifyFrame("approval", "approve me"),
+      ),
+    );
+    expect(await waitFor(() => watch.health().dropped === 9, 5000)).toBe(true);
+    const h = watch.health();
+    expect(h.devices[0].queued).toBe(4);
+    expect(h.devices[0].dropped).toBe(9);
+    expect(h.devices[0].dropped).toBe(h.dropped);
+    // Held, not sent: nothing went out while the circuit was open.
+    expect(h.failed).toBe(APNS_TRANSPORT_THRESHOLD);
+    watch.stop();
+  });
+});
+
+describe("watchHarnessNotifications — a refused key survives a restart", () => {
+  const notify = moduleNotifyFrame("approval");
+
+  const faultingWatch = (store: KeyFaultStore, stamp: () => string | null, onSend: () => void) =>
+    watchHarnessNotifications({
+      harnessPort: 1,
+      connectedIds: () => [],
+      tokensForDisconnected: () => [{ deviceId: "phone", token: "aa".repeat(32) }],
+      loadConfig: () => testConfig(),
+      keyStamp: stamp,
+      keyRecheckMs: 10,
+      keyFaultStore: store,
+      fetchImpl: async () =>
+        new Response(notify, { status: 200, headers: { "content-type": "text/event-stream" } }),
+      send: async () => {
+        onSend();
+        return {
+          ok: false as const,
+          status: 403,
+          reason: "InvalidProviderToken",
+          attempts: 1,
+          failureKind: "key_fault" as const,
+          errorTimestamp: 1_700_000_000_000,
+        };
+      },
+    });
+
+  it("writes the verdict, and the next process does not send at all", async () => {
+    const store = memoryKeyFaultStore();
+    let firstRun = 0;
+    const watch = faultingWatch(store, () => "key-v1", () => {
+      firstRun += 1;
+    });
+    expect(await waitFor(() => watch.health().keyRejected !== null)).toBe(true);
+    watch.stop();
+    expect(firstRun).toBe(1);
+    expect(store.current?.reason).toBe("InvalidProviderToken");
+    expect(store.current?.keyStamp).toBe("key-v1");
+    expect(store.current?.errorTimestamp).toBe(1_700_000_000_000);
+
+    // A relaunch.  Nothing about the signing key changed, so Apple's answer has
+    // not changed either — and the old build resumed full-rate sends here.
+    let secondRun = 0;
+    const restarted = faultingWatch(store, () => "key-v1", () => {
+      secondRun += 1;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    const h = restarted.health();
+    restarted.stop();
+    expect(secondRun).toBe(0);
+    expect(h.keyRejected).toBe("InvalidProviderToken");
+    expect(h.configured).toBe(false);
+    expect(h.pushesOff).toBe(true);
+    expect(h.pushesOffReason).toBe("key-rejected");
+  });
+
+  it("names the refused key by a masked preview, never by its value", async () => {
+    // Rule 43:  a rejected provider key is identified by its masked
+    // first-8/last-4 preview.  The operator has to be able to tell WHICH key
+    // Apple refused, and the key itself must never reach the log.
+    const store = memoryKeyFaultStore({
+      reason: "InvalidProviderToken",
+      at: 1_700_000_000_000,
+      keyStamp: "key-v1",
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const p8 = testP8();
+    const key = testConfig({ p8 });
+    const watch = watchHarnessNotifications({
+      harnessPort: 1,
+      connectedIds: () => [],
+      tokensForDisconnected: () => [{ deviceId: "phone", token: "aa".repeat(32) }],
+      loadConfig: () => key,
+      keyStamp: () => "key-v1",
+      keyRecheckMs: 10,
+      keyFaultStore: store,
+      fetchImpl: async () =>
+        new Response(notify, { status: 200, headers: { "content-type": "text/event-stream" } }),
+      send: async () => ({
+        ok: false as const,
+        status: 403,
+        reason: "InvalidProviderToken",
+        attempts: 1,
+        failureKind: "key_fault" as const,
+      }),
+    });
+    let line = "";
+    try {
+      await waitFor(() => {
+        line = warn.mock.calls.map((call) => String(call[0])).find((text) => text.includes("pushes stay off")) ?? "";
+        return line !== "";
+      });
+    } finally {
+      // Restore the spy:  a console.warn left mocked here stays a no-op for
+      // every test that follows in this file and hides the sidecar's own
+      // warnings.
+      warn.mockRestore();
+      watch.stop();
+    }
+    const material = p8.replace(/-----(?:BEGIN|END) PRIVATE KEY-----/g, "").trim();
+    expect(line).toContain(`${material.slice(0, 8)}…${material.slice(-4)}`);
+    // The key itself, in any form, is not in the line.
+    expect(line).not.toContain(material);
+    expect(line).not.toContain(p8);
+  });
+
+  it("names the live refusal by a masked preview too, never by its value", async () => {
+    // The persisted-fault warning names the refused key by its masked preview.
+    // The LIVE refusal — the line printed the moment Apple refuses the key —
+    // must name it the same way, or the common case is the one warning with
+    // no way to tell which key Apple rejected.
+    const store = memoryKeyFaultStore();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const p8 = testP8();
+    const key = testConfig({ p8 });
+    const watch = watchHarnessNotifications({
+      harnessPort: 1,
+      connectedIds: () => [],
+      tokensForDisconnected: () => [{ deviceId: "phone", token: "aa".repeat(32) }],
+      loadConfig: () => key,
+      keyStamp: () => "key-v1",
+      keyRecheckMs: 10,
+      keyFaultStore: store,
+      fetchImpl: async () =>
+        new Response(notify, { status: 200, headers: { "content-type": "text/event-stream" } }),
+      send: async () => ({
+        ok: false as const,
+        status: 403,
+        reason: "InvalidProviderToken",
+        attempts: 1,
+        failureKind: "key_fault" as const,
+      }),
+    });
+    let line = "";
+    try {
+      await waitFor(() => {
+        line = warn.mock.calls.map((call) => String(call[0])).find((text) => text.includes("refused the signing key")) ?? "";
+        return line !== "";
+      });
+    } finally {
+      warn.mockRestore();
+      watch.stop();
+    }
+    const material = p8.replace(/-----(?:BEGIN|END) PRIVATE KEY-----/g, "").trim();
+    expect(line).toContain(`${material.slice(0, 8)}…${material.slice(-4)}`);
+    expect(line).not.toContain(material);
+    expect(line).not.toContain(p8);
+    // The remedy names the source the key actually lives in.  "Until the key
+    // file changes" points an operator at a local .p8 that is no longer
+    // read, and replacing it would not clear the verdict.
+    expect(line).toContain(apnsKeySource());
+  });
+
+  it("refuses to preview a key too short to mask, rather than printing it whole", () => {
+    // The mask shows the first eight and the last four characters, so a
+    // material of twelve characters or fewer is COVERED by it:  the two
+    // pieces hand back every character of the key, just in two halves.  A
+    // preview that prints the secret it exists to hide is worse than no
+    // preview, so the short case previews as "unavailable".
+    expect(keyPreview("ABCDEFGH")).toBe("unavailable");
+    expect(keyPreview("ABCDEFGHIJKL")).toBe("unavailable");
+    // One character past the mask width is still maskable.
+    expect(keyPreview("ABCDEFGHIJKLM")).not.toBe("unavailable");
+  });
+
+  it("never prints a key too short to mask, not even in the refused-key warning", async () => {
+    // The guard above only proves the helper refuses.  The regression it
+    // exists to prevent is a SHORT key reaching the log through the
+    // refused-key warning, so the warning path itself has to be driven:  a
+    // future change that prints the key material straight into the
+    // live-refusal line would leave the helper untouched and still pass a
+    // helper-only test.
+    const store = memoryKeyFaultStore();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const material = "ABCDEFGH";
+    const key = testConfig({ p8: material });
+    const watch = watchHarnessNotifications({
+      harnessPort: 1,
+      connectedIds: () => [],
+      tokensForDisconnected: () => [{ deviceId: "phone", token: "aa".repeat(32) }],
+      loadConfig: () => key,
+      keyStamp: () => "key-v1",
+      keyRecheckMs: 10,
+      keyFaultStore: store,
+      fetchImpl: async () =>
+        new Response(notify, { status: 200, headers: { "content-type": "text/event-stream" } }),
+      send: async () => ({
+        ok: false as const,
+        status: 403,
+        reason: "InvalidProviderToken",
+        attempts: 1,
+        failureKind: "key_fault" as const,
+      }),
+    });
+    let line = "";
+    try {
+      await waitFor(() => {
+        line = warn.mock.calls.map((call) => String(call[0])).find((text) => text.includes("refused the signing key")) ?? "";
+        return line !== "";
+      });
+    } finally {
+      warn.mockRestore();
+      watch.stop();
+    }
+    // The warning says the key could not be previewed, and never the value.
+    expect(line).toContain("unavailable");
+    expect(line).not.toContain(material);
+  });
+
+  it("clears the verdict when the signing key fingerprint changes", async () => {
+    const store = memoryKeyFaultStore({
+      reason: "InvalidProviderToken",
+      at: 1_700_000_000_000,
+      keyStamp: "key-v1",
+    });
+    let sends = 0;
+    const watch = faultingWatch(store, () => "key-v2", () => {
+      sends += 1;
+    });
+    // A different key: the verdict was about a key this process no longer
+    // holds, so it is forgotten and the replacement gets its chance.
+    expect(await waitFor(() => sends > 0)).toBe(true);
+    watch.stop();
+    expect(sends).toBeGreaterThan(0);
+  });
+
+  it("drops the refused key's provider token and http2 sessions, so a rotation is not signed against them", async () => {
+    // The fault used to null `discovered`, so the key-identity comparison in
+    // refreshConfig saw no previous key, skipped invalidateProviderToken and
+    // dropHttp2Sessions, and signed the replacement key against the cached
+    // token minted for the key Apple had just refused.
+    dropHttp2Sessions();
+    const key = testConfig({ keyId: "ROTATE1" });
+    const cached = providerToken(key, 1_000);
+    const planted = getOrOpenSession(
+      "api.push.apple.com",
+      "ROTATE1",
+      () =>
+        asApnsSession(
+          Object.assign(new EventEmitter(), {
+            closed: false,
+            destroyed: false,
+            close() {},
+          }),
+        ),
+    );
+    const store = memoryKeyFaultStore();
+    const watch = watchHarnessNotifications({
+      harnessPort: 1,
+      connectedIds: () => [],
+      tokensForDisconnected: () => [{ deviceId: "phone", token: "aa".repeat(32) }],
+      loadConfig: () => key,
+      keyStamp: () => "key-v1",
+      keyRecheckMs: 10,
+      keyFaultStore: store,
+      fetchImpl: async () =>
+        new Response(notify, { status: 200, headers: { "content-type": "text/event-stream" } }),
+      send: async () => ({
+        ok: false as const,
+        status: 403,
+        reason: "InvalidProviderToken",
+        attempts: 1,
+        failureKind: "key_fault" as const,
+      }),
+    });
+    expect(await waitFor(() => watch.health().keyRejected !== null)).toBe(true);
+    watch.stop();
+    // Same key, same clock: a surviving cache entry would hand back the very
+    // same JWT.  A fresh signature is the proof it was dropped.
+    expect(providerToken(key, 1_000)).not.toBe(cached);
+    const rebuilt = getOrOpenSession(
+      "api.push.apple.com",
+      "ROTATE1",
+      () =>
+        asApnsSession(
+          Object.assign(new EventEmitter(), {
+            closed: false,
+            destroyed: false,
+            close() {},
+          }),
+        ),
+    );
+    expect(rebuilt).not.toBe(planted);
+    dropHttp2Sessions();
+  });
+});
+
+describe("diskKeyFaultStore", () => {
+  it("round-trips a fault through a file, and forgets it on request", () => {
+    const dir = mkdtempSync(join(tmpdir(), "apns-fault-"));
+    try {
+      const store = diskKeyFaultStore(dir);
+      expect(store.load()).toBeNull();
+      store.save({ reason: "InvalidProviderToken", at: 42, keyStamp: "/k.p8:1:2", errorTimestamp: 7 });
+      expect(store.load()).toEqual({
+        reason: "InvalidProviderToken",
+        at: 42,
+        keyStamp: "/k.p8:1:2",
+        errorTimestamp: 7,
+      });
+      // Nothing that could be turned back into a signing key is written.
+      store.save(null);
+      expect(store.load()).toBeNull();
+      // A second clear is not an error: the file is already gone.
+      store.save(null);
+      expect(store.load()).toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("reads a half-written or hand-edited file as no fault at all", () => {
+    const dir = mkdtempSync(join(tmpdir(), "apns-fault-"));
+    try {
+      const store = diskKeyFaultStore(dir);
+      store.save({ reason: "InvalidProviderToken", at: 1, keyStamp: null });
+      // A fault with no stamp can never match a key, so it can never
+      // hold pushes off — which is the safe direction for a torn file.
+      expect(store.load()?.keyStamp).toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("APNs signing key source (AFC-359: the retired secrets folder is never read)", () => {
+  const saved = { ...process.env };
+  let dir = "";
+
+  function fakeFleetSecrets(body: string): string {
+    const bin = join(dir, "fleet-secrets");
+    writeFileSync(bin, `#!/bin/sh\n${body}\n`);
+    chmodSync(bin, 0o755);
+    return bin;
+  }
+
+  function pemScript(pem: string): string {
+    return `cat <<'PEM'\n${pem}PEM`;
+  }
+
+  beforeEach(() => {
+    process.env = { ...saved };
+    delete process.env.APNS_P8;
+    delete process.env.APNS_P8_PATH;
+    delete process.env.APNS_KEY_ID;
+    dir = mkdtempSync(join(tmpdir(), "apns-key-"));
+    resetApnsKeyCache();
+  });
+
+  afterEach(() => {
+    process.env = { ...saved };
+    rmSync(dir, { recursive: true, force: true });
+    resetApnsKeyCache();
+  });
+
+  it.skipIf(process.platform === "win32")("previews a signing key as a masked first-8/last-4, and never its value", () => {
+    // Rule 43:  a key is identified by its masked preview.  The preview is of
+    // the key MATERIAL, so the PEM armour is not part of what is shown.
+    const p8 = testP8();
+    const material = p8.replace(/-----(?:BEGIN|END) PRIVATE KEY-----/g, "").trim();
+    expect(keyPreview(p8)).toBe(`${material.slice(0, 8)}…${material.slice(-4)}`);
+    expect(keyPreview(p8)).not.toContain(material);
+    // Nothing to preview says so plainly, rather than showing an empty one.
+    expect(keyPreview(null)).toBe("unavailable");
+    expect(keyPreview("")).toBe("unavailable");
+  });
+
+  it.skipIf(process.platform === "win32")("reads AUTHKEY_<KEY_ID> through fleet-secrets and never a file under the home folder", async () => {
+    const argsFile = join(dir, "args");
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(`echo "$@" > '${argsFile}'\n${pemScript(testP8())}`);
+    process.env.APNS_KEY_ID = "KEY1234567";
+    const config = await loadApnsConfig();
+    expect(config?.keyId).toBe("KEY1234567");
+    expect(config?.p8).toContain("BEGIN PRIVATE KEY");
+    expect(readFileSync(argsFile, "utf8").trim()).toBe("get AUTHKEY_KEY1234567");
+    expect(apnsKeySource()).toBe("Infisical AUTHKEY_KEY1234567");
+  });
+
+  it.skipIf(process.platform === "win32")("reads the shared key from APNS_KEY_P8 and its id from APNS_KEY_ID by default", async () => {
+    const argsFile = join(dir, "args");
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(
+      `echo "$@" >> '${argsFile}'\ncase "$2" in\n  APNS_KEY_ID) echo ROTATED001 ;;\n  APNS_KEY_P8) ${pemScript(testP8())}\n ;;\n  *) exit 3 ;;\nesac`,
+    );
+    const config = await loadApnsConfig();
+    expect(config?.keyId).toBe("ROTATED001");
+    expect(config?.p8).toContain("BEGIN PRIVATE KEY");
+    expect(readFileSync(argsFile, "utf8").trim().split("\n")).toEqual(["get APNS_KEY_P8", "get APNS_KEY_ID"]);
+    expect(apnsKeySource()).toBe("Infisical APNS_KEY_P8");
+  });
+
+  it.skipIf(process.platform === "win32")("falls back to the shared key id when Infisical has no usable APNS_KEY_ID", async () => {
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(
+      `case "$2" in\n  APNS_KEY_P8) ${pemScript(testP8())}\n ;;\n  *) exit 3 ;;\nesac`,
+    );
+    expect((await loadApnsConfig())?.keyId).toBe(SHARED_APNS_KEY_ID);
+    expect(SHARED_APNS_KEY_ID).toBe("HSJ98QN95V");
+  });
+
+  // The read ceiling is the difference between "the vault answered" and "the
+  // sidecar turned pushes off".  A ceiling below the vault's own latency does
+  // not slow the sidecar down, it removes the key:  the read is killed, the
+  // failure looks like "no key", and APNs stays off.  These three tests pin
+  // the ceiling above the measured worst case, the override that widens it,
+  // and the refusal to honour a nonsense override.
+  it.skipIf(process.platform === "win32")("keeps the read ceiling above the slowest measured vault read", async () => {
+    // Measured on the fleet Mac:  3.6-5.3 s warm, 16.6 s cold cache.  The
+    // ceiling is derived from the measurement, and this asserts the ordering
+    // that keeps it true if either number is retuned:  a ceiling at or below
+    // the budget is the defect, not a style choice.
+    expect(APNS_VAULT_READ_TIMEOUT_MS).toBeGreaterThanOrEqual(2 * APNS_VAULT_READ_BUDGET_MS);
+    expect(APNS_VAULT_READ_TIMEOUT_MS).toBeGreaterThan(16_600);
+  });
+
+  it.skipIf(process.platform === "win32")("honours a narrowed read ceiling from the environment", async () => {
+    // A ceiling of 1 ms kills the read before the fake can answer, which is
+    // exactly how a slow vault looks to the sidecar.  The fake has to be
+    // slower than the ceiling for that to hold on every machine:  a fake
+    // that answers inside the ceiling makes this test pass on a slow fork
+    // and fail on a fast one, which is how it was green on a Mac and red in
+    // CI.  The fake now waits, so the ceiling always wins.
+    process.env.APNS_VAULT_READ_TIMEOUT_MS = "1";
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(`sleep 2\n${pemScript(testP8())}`);
+    // The read is async now, so a read started by an earlier test can still be
+    // in flight.  The cache is cleared here as well as in `beforeEach` so this
+    // test never depends on the order the suite happens to run in.
+    resetApnsKeyCache();
+    expect(await loadApnsConfig()).toBeNull();
+  });
+
+  it.skipIf(process.platform === "win32")("keeps the cached answer when the key id read is slower than the retry window", async () => {
+    // The id read is part of the read.  An entry stamped before that read
+    // finished is already expired by the time it is stored when the id read
+    // takes longer than the retry window — and the raised ceiling allows
+    // exactly that — so the next caller runs a second full vault round trip
+    // instead of taking the cached answer.  The id read here takes half a
+    // second against a 200 ms retry window, so the two cases differ.
+    const calls = join(dir, "calls");
+    const pem = testP8();
+    process.env.APNS_VAULT_RETRY_MS = "200";
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(
+      `echo "$@" >> '${calls}'\ncase "$2" in\n  APNS_KEY_P8) ${pemScript(pem)}\n ;;\n  APNS_KEY_ID) sleep 0.5; exit 3 ;;\n  *) exit 3 ;;\nesac`,
+    );
+    resetApnsKeyCache();
+    expect((await loadApnsConfig())?.p8).toContain("BEGIN PRIVATE KEY");
+    // The next caller, well inside the retry window, must be served from the
+    // cache:  one read of the PEM and one of the id, not twice that.
+    expect((await loadApnsConfig())?.p8).toContain("BEGIN PRIVATE KEY");
+    expect(readFileSync(calls, "utf8").trim().split("\n")).toHaveLength(2);
+  });
+
+  it.skipIf(process.platform === "win32")("does not block the event loop while the vault answers", async () => {
+    // The read takes 400 ms.  A synchronous read freezes the event loop for
+    // that whole window, so a timer scheduled alongside it cannot fire until
+    // the read has already finished — which is exactly the stall the raised
+    // ceiling made five times worse.  The read is async, so the timer fires
+    // while the read is still running.
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(`sleep 0.4\nexit 3`);
+    resetApnsKeyCache();
+    let fired = false;
+    const timer = setTimeout(() => {
+      fired = true;
+    }, 50);
+    await loadApnsConfig();
+    clearTimeout(timer);
+    expect(fired).toBe(true);
+  });
+
+  it.skipIf(process.platform === "win32")("runs one vault read when two callers miss the cache together", async () => {
+    // The read is async now, so two callers can reach the vault at once.  A
+    // synchronous read could not be interleaved; an async one can, and two
+    // concurrent reads would double the wall time of the slow case.
+    const calls = join(dir, "calls");
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(`echo "$@" >> '${calls}'\nsleep 0.3\nexit 3`);
+    resetApnsKeyCache();
+    await Promise.all([loadApnsConfig(), apnsKeyStamp()]);
+    expect(readFileSync(calls, "utf8").trim().split("\n")).toHaveLength(1);
+  });
+
+  it.skipIf(process.platform === "win32")("ignores a read ceiling that is not a positive number", async () => {
+    // `Number("-1")` is a number, so a negative override would otherwise
+    // become a ceiling that fires instantly — the failure this ceiling
+    // exists to remove, reintroduced through the override.
+    for (const bad of ["0", "-1", "-5000", "not-a-number", ""]) {
+      process.env.APNS_VAULT_READ_TIMEOUT_MS = bad;
+      resetApnsKeyCache();
+      process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(pemScript(testP8()));
+      expect((await loadApnsConfig())?.p8).toContain("BEGIN PRIVATE KEY");
+    }
+  });
+
+  it.skipIf(process.platform === "win32")("ignores a read ceiling that is not a whole number of milliseconds", async () => {
+    // Node's execFileSync rejects a fractional timeout with ERR_OUT_OF_RANGE:
+    // the read throws, the catch swallows it, and the key silently vanishes
+    // — the same "no key" outcome the ceiling exists to prevent.
+    for (const bad of ["0.5", "1.5", "30000.25"]) {
+      process.env.APNS_VAULT_READ_TIMEOUT_MS = bad;
+      resetApnsKeyCache();
+      process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(pemScript(testP8()));
+      expect((await loadApnsConfig())?.p8).toContain("BEGIN PRIVATE KEY");
+    }
+  });
+
+  it.skipIf(process.platform === "win32")("does not read the vault again straight after a slow failed read", async () => {
+    // The failure is cached from the moment the read FINISHED.  A read that
+    // outlasts the retry window used to leave an already-expired entry
+    // behind, so the next caller — `refreshConfig` asks for the stamp and
+    // then the config — ran a second full blocking read instead of the
+    // cached answer.
+    const calls = join(dir, "calls");
+    process.env.APNS_VAULT_RETRY_MS = "100";
+    process.env.APNS_VAULT_READ_TIMEOUT_MS = "300";
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(`echo "$@" >> '${calls}'\nsleep 1\nexit 3`);
+    expect(await loadApnsConfig()).toBeNull();
+    expect(await apnsKeyStamp()).toBeNull();
+    expect(readFileSync(calls, "utf8").trim().split("\n")).toHaveLength(1);
+  });
+
+  it.skipIf(process.platform === "win32")("keeps the last good key id when only the id read fails, and stamps the id", async () => {
+    const pem = testP8();
+    const ok = `case "$2" in\n  APNS_KEY_ID) echo ROTATED001 ;;\n  APNS_KEY_P8) ${pemScript(pem)}\n ;;\n  *) exit 3 ;;\nesac`;
+    const noId = `case "$2" in\n  APNS_KEY_P8) ${pemScript(pem)}\n ;;\n  *) exit 3 ;;\nesac`;
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(ok);
+    const good = await apnsKeyStamp();
+    expect((await loadApnsConfig())?.keyId).toBe("ROTATED001");
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(noId);
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(Date.now() + APNS_VAULT_CACHE_MS + 1);
+      expect((await loadApnsConfig())?.keyId).toBe("ROTATED001");
+      expect(await apnsKeyStamp()).toBe(good);
+      // A cold start with no id falls back to the built-in id, and the stamp
+      // differs, so a fault recorded under it does not outlive the real id.
+      resetApnsKeyCache();
+      expect((await loadApnsConfig())?.keyId).toBe(SHARED_APNS_KEY_ID);
+      expect(await apnsKeyStamp()).not.toBe(good);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("uses the shared key id with an injected APNS_P8 and no pinned id", async () => {
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets("exit 3");
+    process.env.APNS_P8 = testP8();
+    expect((await loadApnsConfig())?.keyId).toBe("HSJ98QN95V");
+  });
+
+  it.skipIf(process.platform === "win32")("stamps the key with a digest, so a rotated key changes the stamp", async () => {
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(pemScript(testP8()));
+    const first = await apnsKeyStamp();
+    expect(first).toMatch(/^Infisical APNS_KEY_P8:[0-9a-f]{16}$/);
+    resetApnsKeyCache();
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(pemScript(testP8()));
+    expect(await apnsKeyStamp()).not.toBe(first);
+  });
+
+  it.skipIf(process.platform === "win32")("keeps the last good key through a transient fleet-secrets failure", async () => {
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(pemScript(testP8()));
+    const good = await loadApnsConfig();
+    expect(good?.p8).toContain("BEGIN PRIVATE KEY");
+    // Fail every later read and let the retry window pass.
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets("exit 3");
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(Date.now() + APNS_VAULT_CACHE_MS + 1);
+      expect((await loadApnsConfig())?.p8).toBe(good?.p8);
+      vi.setSystemTime(Date.now() + APNS_VAULT_RETRY_MS + 1);
+      expect((await loadApnsConfig())?.p8).toBe(good?.p8);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reads as no key when fleet-secrets fails", async () => {
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets("exit 3");
+    expect(await loadApnsConfig()).toBeNull();
+    expect(await apnsKeyStamp()).toBeNull();
+  });
+
+  it("prefers APNS_P8 and then APNS_P8_PATH over Infisical", async () => {
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets("exit 3");
+    process.env.APNS_P8 = testP8();
+    expect((await loadApnsConfig())?.p8).toContain("BEGIN PRIVATE KEY");
+    delete process.env.APNS_P8;
+    const file = join(dir, "AuthKey.p8");
+    writeFileSync(file, testP8(), { mode: 0o600 });
+    process.env.APNS_P8_PATH = file;
+    expect((await loadApnsConfig())?.p8).toContain("BEGIN PRIVATE KEY");
+    expect(apnsKeySource()).toBe(file);
   });
 });

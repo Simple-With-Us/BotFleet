@@ -9,6 +9,36 @@ struct SettingsView: View {
     @State private var enablingNotifications = false
     @State private var confirmSimpleMerge = false
     @State private var refreshingPushHealth = false
+    @State private var engines: [Instance] = []
+    @State private var loadingEngines = false
+    @State private var engineSheet: Instance?
+    @State private var profileName = ""
+    @State private var profileEmail = ""
+    @State private var roomTimeoutText = "5"
+    @State private var roomTimeoutError = ""
+    @State private var savingRoomTimeout = false
+    // Server values the drafts were last seeded from or saved as.  Departure
+    // saves only fire after a successful load, and only for fields that
+    // differ from these, so placeholders never PATCH over real settings.
+    @State private var settingsLoaded = false
+    @State private var settingsLoadFailed = false
+    @State private var savedProfileName = ""
+    @State private var savedProfileEmail = ""
+    @State private var savedRoomTimeout = 5
+    @FocusState private var focusedProfileField: ProfileField?
+
+    private enum ProfileField: Hashable { case name, email }
+
+    /// DEBUG `-store-preview -preview-voice -open-settings`: the Voice
+    /// section comes first, so the screenshot harness can see it without
+    /// scrolling (the same rule AgentProfileView uses).
+    private static var voiceSectionFirst: Bool {
+#if DEBUG
+        ProcessInfo.processInfo.arguments.contains("-preview-voice")
+#else
+        false
+#endif
+    }
     private let onConnect: (() -> Void)?
 
     init(onConnect: (() -> Void)? = nil) {
@@ -17,6 +47,9 @@ struct SettingsView: View {
 
     var body: some View {
         Form {
+            if Self.voiceSectionFirst, session.connection != nil {
+                WorkspaceVoiceSection()
+            }
             Section("Computer") {
                 if let connection = session.connection {
                     NavigationLink {
@@ -64,7 +97,7 @@ struct SettingsView: View {
                     .accessibilityHint(notificationAccessibilityHint)
                 }
             } footer: {
-                Text("Alerts arrive while BotFleet is open or was recently in the background. Closed-app delivery is not available yet.")
+                Text("Alerts reach this iPhone while BotFleet is open or in the background.\u{00A0} Closed-app delivery needs push set up on your computer, and the section below says whether it is working.")
             }
 
             if session.connection != nil {
@@ -99,6 +132,45 @@ struct SettingsView: View {
                         }
                     }
 
+                    NavigationLink {
+                        FleetModelsView()
+                    } label: {
+                        Label {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Models")
+                                Text("Every bot's primary and fallbacks")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        } icon: {
+                            SettingsIcon(symbol: "cpu", color: .green)
+                        }
+                    }
+
+                    NavigationLink {
+                        UsageView()
+                    } label: {
+                        Label {
+                            Text("Usage & Cost")
+                        } icon: {
+                            SettingsIcon(symbol: "chart.bar.xaxis", color: .green)
+                        }
+                    }
+
+                    NavigationLink {
+                        SharedMemoryView()
+                    } label: {
+                        HStack {
+                            Label {
+                                Text("Shared Memory")
+                            } icon: {
+                                SettingsIcon(symbol: "memorychip", color: .pink)
+                            }
+                            Spacer()
+                            SharedMemoryStateText()
+                        }
+                    }
+
                     Picker(selection: Binding(
                         get: { session.config?.isProjectsMode == true ? "projects" : "simple" },
                         set: { mode in
@@ -113,11 +185,32 @@ struct SettingsView: View {
                         Text("Projects").tag("projects")
                     } label: {
                         Label {
-                            Text("Workspace Layout")
+                            Text("Workspace Arrangement")
                         } icon: {
                             SettingsIcon(symbol: "square.grid.2x2", color: .teal)
                         }
                     }
+                    .disabled(!settingsLoaded)
+
+                    Picker(selection: Binding(
+                        get: {
+                            let raw = session.config?.busySendDefault?.lowercased() ?? "queue"
+                            return raw == "queue" ? "queue" : "steer"
+                        },
+                        set: { mode in
+                            Task { _ = await session.updateBusySendDefault(mode) }
+                        }
+                    )) {
+                        Text("Steer").tag("steer")
+                        Text("Queue").tag("queue")
+                    } label: {
+                        Label {
+                            Text("Busy Sends")
+                        } icon: {
+                            SettingsIcon(symbol: "arrow.triangle.branch", color: .orange)
+                        }
+                    }
+                    .disabled(!settingsLoaded)
 
                     Picker(selection: Binding(
                         get: { session.config?.terminology ?? "channels" },
@@ -150,13 +243,137 @@ struct SettingsView: View {
                             SettingsIcon(symbol: "text.bubble", color: .indigo)
                         }
                     }
+                    .disabled(!settingsLoaded)
                     if session.config?.terminology == "custom" {
-                        CustomRoomTermFields(session: session)
+                        CustomRoomTermFields(session: session, editable: settingsLoaded)
                     }
+
+                    Toggle(isOn: showToolCallsBinding) {
+                        Label {
+                            Text("Show Tool Calls")
+                        } icon: {
+                            SettingsIcon(symbol: "wrench.and.screwdriver", color: .purple)
+                        }
+                    }
+                    .disabled(!settingsLoaded)
+
+                    Toggle(isOn: summarizeToolCallsBinding) {
+                        Label {
+                            Text("Summarize Bot Tasks")
+                        } icon: {
+                            SettingsIcon(symbol: "rectangle.stack", color: .mint)
+                        }
+                    }
+                    .disabled(!settingsLoaded)
                 } header: {
                     Text("Workspace")
                 } footer: {
                     Text(workspaceFooter)
+                }
+
+                if !Self.voiceSectionFirst {
+                    WorkspaceVoiceSection()
+                }
+
+                Section {
+                    HStack {
+                        Label {
+                            Text("\(roomTerm) Turn Timeout")
+                        } icon: {
+                            SettingsIcon(symbol: "timer", color: .orange)
+                        }
+                        Spacer()
+                        TextField("5", text: $roomTimeoutText)
+                            .keyboardType(.numberPad)
+                            .multilineTextAlignment(.trailing)
+                            .frame(maxWidth: 72)
+                            .disabled(savingRoomTimeout || !settingsLoaded)
+                            .onSubmit { Task { await saveRoomTimeout() } }
+                        Text("min")
+                            .foregroundStyle(.secondary)
+                        Button("Save") {
+                            Task { await saveRoomTimeout() }
+                        }
+                        .disabled(savingRoomTimeout || !settingsLoaded)
+                    }
+                    if !roomTimeoutError.isEmpty {
+                        Text(roomTimeoutError)
+                            .font(.footnote)
+                            .foregroundStyle(.red)
+                    }
+                } header: {
+                    Text(roomTermPlural)
+                } footer: {
+                    Text("How long a \(roomTerm.lowercased()) turn can run before it stops.")
+                }
+
+                Section {
+                    TextField("Name", text: $profileName)
+                        .textContentType(.name)
+                        .autocorrectionDisabled()
+                        .focused($focusedProfileField, equals: .name)
+                        .disabled(!settingsLoaded)
+                        .onSubmit { focusedProfileField = nil }
+                    TextField("Email", text: $profileEmail)
+                        .textContentType(.emailAddress)
+                        .keyboardType(.emailAddress)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .focused($focusedProfileField, equals: .email)
+                        .disabled(!settingsLoaded)
+                        .onSubmit { focusedProfileField = nil }
+                    if settingsLoadFailed && !settingsLoaded {
+                        HStack {
+                            Text("Could not load settings.")
+                                .font(.footnote)
+                                .foregroundStyle(.red)
+                            Spacer()
+                            Button("Retry") {
+                                Task { await loadSettingsExtras() }
+                            }
+                            .font(.footnote)
+                        }
+                    }
+                } header: {
+                    Text("You")
+                } footer: {
+                    Text(
+                        settingsLoaded
+                            ? "Shown in the sidebar.  Saved when you leave a field."
+                            : "Settings load from your computer before you can edit workspace, name, email, or the channel turn timeout."
+                    )
+                }
+
+                Section {
+                    if loadingEngines && engines.isEmpty {
+                        HStack {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("Loading engines…")
+                                .foregroundStyle(.secondary)
+                        }
+                    } else if engines.isEmpty {
+                        Text("No engines yet.  Finish setup in the Mac app.")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 10) {
+                                ForEach(engines) { engine in
+                                    Button {
+                                        engineSheet = engine
+                                    } label: {
+                                        EngineChip(instance: engine)
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                            .padding(.vertical, 4)
+                        }
+                    }
+                } header: {
+                    Text("Engines")
+                } footer: {
+                    Text("Tap an engine to finish setup on Mac.")
                 }
             }
         }
@@ -170,7 +387,75 @@ struct SettingsView: View {
             // every background/foreground and the sidecar updates only on
             // an actual send anyway).
             if session.connection != nil {
+                // Enter engine loading before push-health / config preflight
+                // so an empty cache does not flash "No engines yet" for up
+                // to ~20s per request.
+                loadingEngines = true
                 await session.refreshPushSenderHealth()
+                await loadSettingsExtras()
+            }
+        }
+        .onChange(of: session.connection?.id) { _, _ in
+            Task { await loadSettingsExtras() }
+        }
+        .onChange(of: session.cachedInstances) { _, roster in
+            // A background probe settled and the harness pushed the new roster:
+            // an engine shown as "Checking" now says what it found.
+            guard session.connection != nil, !roster.isEmpty else { return }
+            engines = settingsEngines(from: roster)
+        }
+        .onChange(of: focusedProfileField) { previous, next in
+            // Save when a profile field loses focus (return key, tapping
+            // elsewhere, keyboard dismissal, or moving to the other field)
+            // so the edit is not held until the view disappears.
+            guard previous != nil, previous != next, profileIsDirty else { return }
+            Task { await saveProfile() }
+        }
+        .onChange(of: session.config?.profile?.name) { _, name in
+            let server = name ?? ""
+            let previous = savedProfileName
+            savedProfileName = server
+            profileName = SettingsDraftPreservation.text(
+                draft: profileName,
+                previousSaved: previous,
+                server: server
+            )
+        }
+        .onChange(of: session.config?.profile?.email) { _, email in
+            let server = email ?? ""
+            let previous = savedProfileEmail
+            savedProfileEmail = server
+            profileEmail = SettingsDraftPreservation.text(
+                draft: profileEmail,
+                previousSaved: previous,
+                server: server
+            )
+        }
+        .onChange(of: session.config?.rooms?.turnTimeoutMinutes) { _, minutes in
+            guard let minutes else { return }
+            let previous = savedRoomTimeout
+            savedRoomTimeout = minutes
+            guard !savingRoomTimeout else { return }
+            roomTimeoutText = SettingsDraftPreservation.timeoutMinutes(
+                draft: roomTimeoutText,
+                previousSaved: previous,
+                server: minutes
+            )
+        }
+        .sheet(item: $engineSheet) { engine in
+            EngineSetupSheet(instance: engine)
+        }
+        .onDisappear {
+            // Only persist drafts the user actually changed after the real
+            // values loaded.  Leaving before `loadSettingsExtras()` finishes
+            // must not PATCH the "" / "" / "5" placeholders.
+            guard settingsLoaded else { return }
+            let profileDirty = profileIsDirty
+            let timeoutDirty = roomTimeoutIsDirty
+            guard profileDirty || timeoutDirty else { return }
+            Task {
+                if profileDirty { await saveProfile() }
+                if timeoutDirty { await saveRoomTimeout() }
             }
         }
         .refreshable {
@@ -192,13 +477,157 @@ struct SettingsView: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Simple is one conversation per bot.\u{00A0} Merge extra threads into that conversation, or keep them saved but hidden.")
+            Text("Simple is one conversation per bot.\u{00A0} Merge extra threads into that conversation, or keep them saved but hidden.\u{00A0} If some belong to different Apps or folders, nothing is merged and this arrangement stays.")
         }
     }
 
+    private var showToolCallsBinding: Binding<Bool> {
+        Binding(
+            get: { session.config?.features?.showsToolCalls ?? true },
+            set: { next in
+                Task { _ = await session.updateFeatures(showToolCalls: next) }
+            }
+        )
+    }
+
+    private var summarizeToolCallsBinding: Binding<Bool> {
+        Binding(
+            get: { session.config?.features?.summarizesToolCalls ?? true },
+            set: { next in
+                Task { _ = await session.updateFeatures(summarizeToolCalls: next) }
+            }
+        )
+    }
+
+    private func loadSettingsExtras() async {
+        // Do not flip settingsLoaded false on every reload — that would re-open
+        // the placeholder-save hole while a refresh is in flight.  First open
+        // already starts with false; only set true after a successful seed.
+        guard session.connection != nil else {
+            engines = []
+            loadingEngines = false
+            // Leave drafts alone so typing during disconnect is not wiped.
+            return
+        }
+        // Mark loading before configStatus (and any caller-side preflight) so
+        // an empty engines cache is not shown as "No engines yet".
+        loadingEngines = true
+        if let status = await session.configStatus() {
+            let serverName = status.profile?.name ?? ""
+            let serverEmail = status.profile?.email ?? ""
+            let serverTimeout = status.rooms?.turnTimeoutMinutes ?? 5
+
+            let previousName = savedProfileName
+            let previousEmail = savedProfileEmail
+            let previousTimeout = savedRoomTimeout
+
+            // Always refresh baselines from the server for dirty detection.
+            savedProfileName = serverName
+            savedProfileEmail = serverEmail
+            savedRoomTimeout = serverTimeout
+
+            // Only replace drafts that still match the previous baseline.
+            profileName = SettingsDraftPreservation.text(
+                draft: profileName,
+                previousSaved: previousName,
+                server: serverName
+            )
+            profileEmail = SettingsDraftPreservation.text(
+                draft: profileEmail,
+                previousSaved: previousEmail,
+                server: serverEmail
+            )
+            roomTimeoutText = SettingsDraftPreservation.timeoutMinutes(
+                draft: roomTimeoutText,
+                previousSaved: previousTimeout,
+                server: serverTimeout
+            )
+            settingsLoaded = true
+            settingsLoadFailed = false
+        } else if !settingsLoaded {
+            settingsLoadFailed = true
+        }
+        engines = settingsEngines(from: await session.instances())
+        loadingEngines = false
+    }
+
+    /// The engines Settings lists.
+    private func settingsEngines(from fetched: [Instance]) -> [Instance] {
+        fetched.filter { inst in
+            // DeepSeek is Harness only: filter out standalone/legacy direct deepseek driver
+            if inst.driverKind == "deepseek" || inst.driverKind == "deepseekAgent" || inst.id == "deepseek" {
+                return false
+            }
+            // An optional integration nobody has set up stays out of the list, as on the Mac.
+            return inst.isEnabled && inst.isListed()
+        }
+    }
+
+    private var roomTerm: String { session.config?.roomTerminologyLabel ?? "Channel" }
+    private var roomTermPlural: String { session.config?.roomTerminologyPlural ?? "Channels" }
+    private var roomTermLowered: String { session.config?.roomTerminologyLabelLowered ?? "channel" }
+
+    private var normalizedProfileName: String {
+        profileName.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var normalizedProfileEmail: String {
+        profileEmail.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    private var profileIsDirty: Bool {
+        normalizedProfileName != savedProfileName
+            || normalizedProfileEmail != savedProfileEmail.lowercased()
+    }
+
+    private var roomTimeoutIsDirty: Bool {
+        let trimmed = roomTimeoutText.trimmingCharacters(in: .whitespacesAndNewlines)
+        return Int(trimmed) != savedRoomTimeout
+    }
+
+    private func saveProfile() async {
+        // Never write drafts that were not seeded from the server.
+        guard settingsLoaded else { return }
+        let name = normalizedProfileName
+        let email = normalizedProfileEmail
+        let nameChanged = name != savedProfileName
+        let emailChanged = email != savedProfileEmail.lowercased()
+        guard nameChanged || emailChanged else { return }
+        // PATCH only dirty fields so a concurrent Mac edit of the sibling
+        // is not overwritten with a stale value from initial load.
+        if await session.updateProfile(
+            name: nameChanged ? name : nil,
+            email: emailChanged ? email : nil
+        ) != nil {
+            if nameChanged { savedProfileName = name }
+            if emailChanged { savedProfileEmail = email }
+        }
+    }
+
+    private func saveRoomTimeout() async {
+        guard settingsLoaded else { return }
+        let trimmed = roomTimeoutText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let minutes = Int(trimmed), minutes >= 1, minutes <= 1_440 else {
+            roomTimeoutError = "Enter a whole number from 1 to 1,440."
+            return
+        }
+        roomTimeoutError = ""
+        savingRoomTimeout = true
+        if await session.updateRoomTurnTimeout(minutes: minutes) == nil {
+            roomTimeoutError = "Could not save the \(roomTerm.lowercased()) turn limit."
+        } else {
+            roomTimeoutText = String(minutes)
+            savedRoomTimeout = minutes
+        }
+        savingRoomTimeout = false
+    }
+
     private var workspaceFooter: String {
-        session.config?.isProjectsMode == true
-            ? "Projects hides named bots.  That word is a category that any number of threads can sit under."
+        guard settingsLoaded else {
+            return "Workspace arrangement, terminology, and tool toggles unlock after settings load from your computer."
+        }
+        return session.config?.isProjectsMode == true
+            ? "Any number of threads under each bot and \(roomTermLowered).\u{00A0} A thread can be tied to one \(roomTermLowered) on your computer."
             : "Simple is one conversation per bot.  That word is a group thread invited bots and you can all write in."
     }
 
@@ -304,10 +733,10 @@ private struct ComputerSettingsRow: View {
         HStack(spacing: 12) {
             ZStack {
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(MausPalette.color("blue").opacity(0.14))
+                    .fill(BotPalette.color("blue").opacity(0.14))
                     .frame(width: 38, height: 38)
                 Image(systemName: "laptopcomputer")
-                    .foregroundStyle(MausPalette.color("blue"))
+                    .foregroundStyle(BotPalette.color("blue"))
             }
             .accessibilityHidden(true)
 
@@ -331,7 +760,8 @@ private struct ComputerSettingsRow: View {
     }
 }
 
-private struct SettingsIcon: View {
+/// Shared with WorkspaceVoiceSettings.swift, so the Voice rows match.
+struct SettingsIcon: View {
     let symbol: String
     let color: Color
 
@@ -484,6 +914,8 @@ struct ConnectionSecurityView: View {
             return "BotFleet is trying the saved connection automatically."
         case let .offline(reason):
             return reason
+        case .macOffline:
+            return "Your Mac is not running BotFleet.  Open the app on your computer, then retry."
         case .unauthorized:
             return "This phone was removed from the computer. Pair it again to reconnect."
         case .unpaired:
@@ -506,6 +938,7 @@ private extension Session.Status {
         case .unpaired: return "Not paired"
         case .unauthorized: return "Needs pairing"
         case .offline: return "Offline"
+        case .macOffline: return "Mac offline"
         }
     }
 }
@@ -517,6 +950,7 @@ private extension Session.Status {
 /// so the ordinary case is still one word to type.
 struct CustomRoomTermFields: View {
     @ObservedObject var session: Session
+    var editable: Bool = true
     @State private var singular = ""
     @State private var plural = ""
     @State private var pluralEdited = false
@@ -530,6 +964,7 @@ struct CustomRoomTermFields: View {
                 TextField("App", text: $singular)
                     .textFieldStyle(.roundedBorder)
                     .autocorrectionDisabled()
+                    .disabled(!editable)
                     .onChange(of: singular) { _, next in
                         if !pluralEdited { plural = Self.suggestPlural(next) }
                     }
@@ -537,11 +972,12 @@ struct CustomRoomTermFields: View {
                 TextField("Apps", text: $plural)
                     .textFieldStyle(.roundedBorder)
                     .autocorrectionDisabled()
+                    .disabled(!editable)
                     .onChange(of: plural) { _, _ in pluralEdited = true }
                     .onSubmit(save)
             }
             Button("Save", action: save)
-                .disabled(singular.trimmingCharacters(in: .whitespaces).isEmpty)
+                .disabled(!editable || singular.trimmingCharacters(in: .whitespaces).isEmpty)
         }
         .onAppear {
             singular = session.config?.roomLabels?.singular ?? ""
@@ -551,6 +987,7 @@ struct CustomRoomTermFields: View {
     }
 
     private func save() {
+        guard editable else { return }
         let one = singular.trimmingCharacters(in: .whitespaces)
         guard !one.isEmpty else { return }
         let many = plural.trimmingCharacters(in: .whitespaces)
@@ -577,5 +1014,71 @@ struct CustomRoomTermFields: View {
         if lower.hasSuffix("fe") { return word.dropLast(2) + suffix("ves") }
         if lower.hasSuffix("f"), !lower.hasSuffix("ff") { return word.dropLast() + suffix("ves") }
         return word + suffix("s")
+    }
+}
+
+private struct EngineChip: View {
+    let instance: Instance
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(instance.settingsDisplayName)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+            Text(instance.snapshot.engineStatusLabel)
+                .font(.caption)
+                .foregroundStyle(statusColor)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color(.secondarySystemGroupedBackground))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.06), lineWidth: 1)
+        )
+        .accessibilityElement(children: .combine)
+    }
+
+    private var statusColor: Color {
+        switch instance.snapshot.engineStatusLabel {
+        case "Ready": return .green
+        case "Sign in": return .orange
+        default: return .secondary
+        }
+    }
+}
+
+private struct EngineSetupSheet: View {
+    let instance: Instance
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            VStack(alignment: .leading, spacing: 16) {
+                Text(instance.settingsDisplayName)
+                    .font(.title2.weight(.semibold))
+                Text(instance.snapshot.engineStatusLabel)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                Text("Finish setup in the Mac app.")
+                    .font(.body)
+                    .foregroundStyle(.primary)
+                Spacer()
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(24)
+            .navigationTitle("Engine")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Close") { dismiss() }
+                }
+            }
+        }
+        .presentationDetents([.medium])
     }
 }

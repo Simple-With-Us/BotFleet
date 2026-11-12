@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { matchesLocalAutoConsent, requiresLocalAutoConsent } from "./local-auto-consent";
+import { hostAwareAllowedComputers, matchesLocalAutoConsent, requiresLocalAutoConsent } from "./local-auto-consent";
 
 describe("fleet local Auto consent", () => {
   const bots = [{ id: "a", name: "Ada" }, { id: "b", name: "Lin" }];
@@ -48,5 +48,31 @@ describe("fleet local Auto consent", () => {
       hostPlatform: "darwin",
       providerSupportsLocal: true,
     })).toBe(false);
+  });
+
+  it("narrows the host allowlist by the This Computer provider toggle", () => {
+    const on = { asciiBox: true, selfHostedVps: false, localVm: true, localMac: true };
+    const off = { ...on, localMac: false };
+    // No provider record yet: the legacy allowlist is the whole answer.
+    expect(hostAwareAllowedComputers(null, undefined)).toBeNull();
+    expect(hostAwareAllowedComputers(["cloud", "local"], undefined)).toEqual(["cloud", "local"]);
+    // Provider on: unchanged.  Provider off: Local drops even when the legacy
+    // allowlist is unrestricted, the same rule resolveGrants applies.
+    expect(hostAwareAllowedComputers(null, on)).toBeNull();
+    expect(hostAwareAllowedComputers(null, off)).toEqual(["cloud", "vm"]);
+    expect(hostAwareAllowedComputers(["cloud", "local"], off)).toEqual(["cloud"]);
+    // A provider record without the key reads as off (fail-closed).
+    expect(hostAwareAllowedComputers(null, { asciiBox: true })).toEqual(["cloud", "vm"]);
+    // The legacy allowlist still wins when it already blocks Local.
+    expect(hostAwareAllowedComputers(["cloud"], on)).toEqual(["cloud"]);
+  });
+
+  it("sees flipping only localMac false->true as a new automatic host grant", () => {
+    const darwin = { hostPlatform: "darwin", providerSupportsLocal: true };
+    const providers = { asciiBox: true, selfHostedVps: false, localVm: true, localMac: false };
+    const before = hostAwareAllowedComputers(null, providers);
+    const after = hostAwareAllowedComputers(null, { ...providers, localMac: true });
+    expect(requiresLocalAutoConsent(undefined, [], before, darwin)).toBe(false);
+    expect(requiresLocalAutoConsent(undefined, [], after, darwin)).toBe(true);
   });
 });

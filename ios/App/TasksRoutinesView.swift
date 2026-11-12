@@ -7,7 +7,14 @@ struct TasksRoutinesView: View {
     @State private var runs: [RoutineRun] = []
     @State private var editor: RoutineEditorTarget?
     @State private var deleting: Routine?
+    @State private var confirmingMarkAllSeen = false
     @State private var loading = true
+
+    /// Failed or missed runs nobody has acknowledged yet — the same set the
+    /// harness's "mark every failure seen" sweep clears.
+    private var unseenFailureCount: Int {
+        runs.filter(\.needsAcknowledgement).count
+    }
 
     var body: some View {
         List {
@@ -60,8 +67,13 @@ struct TasksRoutinesView: View {
                     Text("Completed, waiting, failed, and manually started runs appear here.")
                         .foregroundStyle(.secondary)
                 }
+                if unseenFailureCount > 0 {
+                    Button("Mark All Seen (\(unseenFailureCount))", systemImage: "checkmark.circle") {
+                        confirmingMarkAllSeen = true
+                    }
+                }
                 ForEach(runs.sorted(by: { $0.scheduledFor > $1.scheduledFor }).prefix(50)) { run in
-                    RoutineRunRow(run: run, bot: session.state.bot(run.botId))
+                    RoutineRunRow(run: run, bot: session.state.bot(run.botId)) { await reload() }
                 }
             }
 
@@ -100,6 +112,19 @@ struct TasksRoutinesView: View {
         } message: {
             Text("Past run receipts remain available.")
         }
+        .confirmationDialog(
+            "Mark \(unseenFailureCount) \(unseenFailureCount == 1 ? "Failure" : "Failures") Seen?",
+            isPresented: $confirmingMarkAllSeen,
+            titleVisibility: .visible
+        ) {
+            Button("Mark All Seen") {
+                Task {
+                    if await session.markAllRoutineRunsSeen() { await reload() }
+                }
+            }
+        } message: {
+            Text("They stay in the run receipts with their errors.\u{00A0} This only clears the badge, and the next failure brings it back.")
+        }
     }
 
     private func reload() async {
@@ -136,7 +161,9 @@ private struct RoutineRow: View {
     var body: some View {
         let canToggle = routine.canToggle()
         HStack(spacing: 12) {
-            if let bot { BotAvatarView(bot: bot, size: 42, state: routine.enabled ? .idle : .sleeping, animated: false) }
+            if let bot {
+                BotAvatarWithProviderBadge(bot: bot, size: 42, state: routine.enabled ? .idle : .sleeping, animated: false)
+            }
             else { Image(systemName: "calendar.badge.exclamationmark").frame(width: 42, height: 42) }
             VStack(alignment: .leading, spacing: 3) {
                 Text(routine.name).font(.headline)
@@ -156,7 +183,10 @@ private struct RoutineRow: View {
 private struct RoutineRunRow: View {
     let run: RoutineRun
     let bot: Bot?
+    /// Reloads the receipts after a run is stopped or marked seen.
+    let onChanged: () async -> Void
     @EnvironmentObject private var session: Session
+    @State private var working = false
 
     var body: some View {
         DisclosureGroup {
@@ -169,6 +199,33 @@ private struct RoutineRunRow: View {
                     Button("Open task", systemImage: "arrow.up.right.square") {
                         Task { await session.openNotification(target) }
                     }
+                    .buttonStyle(.borderless)
+                }
+                // Only where the harness will act: a settled run answers 404
+                // to Cancel, and a run already marked seen has nothing to mark.
+                if run.canCancel {
+                    Button("Cancel Run", systemImage: "xmark.circle", role: .destructive) {
+                        working = true
+                        Task {
+                            _ = await session.cancelRoutineRun(run)
+                            await onChanged()
+                            working = false
+                        }
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(working)
+                }
+                if run.needsAcknowledgement {
+                    Button("Mark Seen", systemImage: "checkmark.circle") {
+                        working = true
+                        Task {
+                            _ = await session.markRoutineRunSeen(run)
+                            await onChanged()
+                            working = false
+                        }
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(working)
                 }
             }
             .font(.subheadline)
@@ -214,7 +271,7 @@ private struct RoutineEditorView: View {
         _name = State(initialValue: routine?.name ?? "")
         _prompt = State(initialValue: routine?.prompt ?? "")
         _botId = State(initialValue: routine?.botId ?? "")
-        _runOn = State(initialValue: routine?.runLocation ?? .maus)
+        _runOn = State(initialValue: routine?.runLocation ?? .bot)
         _runAvailability = State(initialValue: nil)
         _availabilityLoaded = State(initialValue: false)
         _kind = State(initialValue: routine?.schedule.type ?? .daily)
@@ -250,7 +307,7 @@ private struct RoutineEditorView: View {
                 Section {
                     Picker("Run location", selection: $runOn) {
                         Label("This computer", systemImage: "laptopcomputer")
-                            .tag(RoutineRunLocation.maus)
+                            .tag(RoutineRunLocation.bot)
                         Label("Cloud desktop", systemImage: "cloud")
                             .tag(RoutineRunLocation.cloud)
                             .selectionDisabled(!cloudSelectable)
@@ -266,7 +323,7 @@ private struct RoutineEditorView: View {
                 } header: {
                     Text("Where does it run?")
                 } footer: {
-                    if runOn == .maus {
+                    if runOn == .bot {
                         Text("Uses this agent's selected model and computer setting on the paired computer.")
                     } else if runAvailability?.cloudReady == true {
                         Text("Runs the agent and its tools inside its Box virtual machine. The VM wakes automatically for each run; keep BotFleet running so its scheduler can launch the job.")
@@ -381,7 +438,7 @@ private struct RoutineEditorView: View {
 private extension RoutineRunLocation {
     var label: String {
         switch self {
-        case .maus: "This computer"
+        case .bot: "This computer"
         case .cloud: "Cloud desktop"
         }
     }

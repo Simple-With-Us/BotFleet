@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { botUsage, cachedInput, costCaption, formatTokens, formatUsd, sumUsage, usageChip, usageDetail } from "./usage";
+import { botUsage, botUsageByModel, cachedInput, costCaption, formatTokens, formatUsd, sumUsage, usageChip, usageDetail } from "./usage";
 
 describe("usage formatting", () => {
   it("formats token counts compactly", () => {
@@ -82,5 +82,137 @@ describe("usage formatting", () => {
     expect(costCaption("subscription")).toMatch(/not billed/);
     expect(costCaption("metered")).toMatch(/API key/);
     expect(costCaption(undefined)).toMatch(/reported/);
+  });
+
+  describe("botUsageByModel", () => {
+    it("breaks down usage by model with accurate turns, tokens, and costs", () => {
+      const bot = {
+        modelSelection: { instanceId: "claude", model: "claude-3-7-sonnet" },
+        tasks: [
+          {
+            threadId: "task-1",
+            title: "Task 1",
+            createdAt: 100,
+            usage: { input: 1000, output: 200, cachedInput: 500, costUsd: 0.05, turns: 5 },
+            usageByInstance: {
+              claude: {
+                input: 1000,
+                output: 200,
+                costUsd: 0.05,
+                turns: 5,
+                byModel: {
+                  "claude-3-7-sonnet": { input: 600, output: 120, cachedInput: 300, costUsd: 0.03, turns: 3 },
+                  "claude-3-5-haiku": { input: 400, output: 80, cachedInput: 200, costUsd: 0.02, turns: 2 },
+                },
+              },
+            },
+          },
+        ],
+      };
+
+      const breakdown = botUsageByModel(bot);
+      expect(breakdown).toHaveLength(2);
+      expect(breakdown[0]).toEqual({
+        model: "claude-3-7-sonnet",
+        usage: { input: 600, output: 120, cachedInput: 300, costUsd: 0.03, turns: 3 },
+        perTurnCost: 0.01,
+      });
+      expect(breakdown[1]).toEqual({
+        model: "claude-3-5-haiku",
+        usage: { input: 400, output: 80, cachedInput: 200, costUsd: 0.02, turns: 2 },
+        perTurnCost: 0.01,
+      });
+
+      // Verify the sum equals botUsage(bot)
+      const totalFromModels = sumUsage(breakdown.map((m) => m.usage));
+      expect(totalFromModels).toEqual(botUsage(bot));
+    });
+
+    it("attributes unbanked legacy turns to configured model", () => {
+      const bot = {
+        modelSelection: { instanceId: "minimax", model: "MiniMax-M3" },
+        tasks: [
+          {
+            threadId: "legacy-task",
+            title: "Legacy Task",
+            createdAt: 100,
+            usage: { input: 800, output: 100, cachedInput: 400, costUsd: 0.04, turns: 4 },
+            modelSelection: { instanceId: "minimax", model: "MiniMax-M3" },
+          },
+        ],
+      };
+
+      const breakdown = botUsageByModel(bot);
+      expect(breakdown).toHaveLength(1);
+      expect(breakdown[0].model).toBe("MiniMax-M3");
+      expect(breakdown[0].usage).toEqual({
+        input: 800,
+        output: 100,
+        cachedInput: 400,
+        costUsd: 0.04,
+        turns: 4,
+      });
+      expect(breakdown[0].perTurnCost).toBe(0.01);
+      expect(sumUsage(breakdown.map((m) => m.usage))).toEqual(botUsage(bot));
+    });
+
+    it("separates MiniMax-M3 from DeepSeek models in DSH usage", () => {
+      const bot = {
+        modelSelection: { instanceId: "dsh", model: "deepseek-chat" },
+        tasks: [
+          {
+            threadId: "dsh-task",
+            title: "DSH Multi-Model Task",
+            createdAt: 100,
+            usage: { input: 1500, output: 300, cachedInput: 600, costUsd: 0.03, turns: 3 },
+            usageByInstance: {
+              dsh: {
+                engineId: "deepseek-harness",
+                input: 1500,
+                output: 300,
+                costUsd: 0.03,
+                turns: 3,
+                byModel: {
+                  "MiniMax-M3": { input: 1000, output: 200, cachedInput: 400, costUsd: 0.02, turns: 2 },
+                  "deepseek-chat": { input: 500, output: 100, cachedInput: 200, costUsd: 0.01, turns: 1 },
+                },
+              },
+            },
+          },
+        ],
+      };
+
+      const breakdown = botUsageByModel(bot);
+      expect(breakdown).toHaveLength(2);
+      expect(breakdown.map((m) => m.model)).toEqual(["MiniMax-M3", "deepseek-chat"]);
+      expect(breakdown[0].usage.turns).toBe(2);
+      expect(breakdown[1].usage.turns).toBe(1);
+      expect(sumUsage(breakdown.map((m) => m.usage))).toEqual(botUsage(bot));
+    });
+
+    it("includes shared room turns and attributes byModel", () => {
+      const bot = {
+        modelSelection: { instanceId: "minimax", model: "MiniMax-M3" },
+        tasks: [],
+        roomUsageByInstance: {
+          minimax: {
+            input: 300,
+            output: 50,
+            costUsd: 0.01,
+            turns: 2,
+            lastAt: 200,
+            byModel: {
+              "MiniMax-M3": { input: 300, output: 50, costUsd: 0.01, turns: 2 },
+            },
+          },
+        },
+      };
+
+      const breakdown = botUsageByModel(bot);
+      expect(breakdown).toHaveLength(1);
+      expect(breakdown[0].model).toBe("MiniMax-M3");
+      expect(breakdown[0].usage.turns).toBe(2);
+      expect(sumUsage(breakdown.map((m) => m.usage))).toEqual(botUsage(bot));
+    });
   });
 });

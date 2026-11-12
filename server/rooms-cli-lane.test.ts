@@ -4,7 +4,7 @@
 // `runGroupMemberTurn` used to assign exactly four integrations — agents,
 // phone, composio and qdrant — and nothing else.  `integrations.computer`,
 // `integrations.computers` and `integrations.localComputer` were never set,
-// so a Claude, Codex, Antigravity, pi or ACP bot holding Cua, a Box, a Local
+// so a Claude, Codex, Antigravity, pi or ACP bot holding CUA, a Box, a Local
 // VM or a VPS in a direct chat lost every one of them the moment it spoke in
 // a room.  The HTTP lane in that same room kept host `bash`, because the
 // function did compute `hasHostComputer` and hand it to `buildTurnTools` —
@@ -19,7 +19,7 @@
 // `mcpServers` array it was handed at `session/new`; the computer is a
 // managed container reached through a fake `docker` on OMB_EXTRA_PATH, the
 // same fixture `server/vps-routing.test.ts` uses for the 1:1 lane.  A host
-// Cua mount would have been simpler and is deliberately not used: reading a
+// CUA mount would have been simpler and is deliberately not used: reading a
 // real connection descriptor is macOS-only in practice, and these tests have
 // to run on Ubuntu too.
 import type { ChildProcess } from "node:child_process";
@@ -28,6 +28,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { boxGatewayUrl, mintBoxGatewayGrant } from "./box-gateway-grant.ts";
 
 import {
   applyComputerMounts,
@@ -54,6 +55,7 @@ import {
 } from "./vps-computer.ts";
 import { removeTempDir, spawnDetached, waitForExit } from "./testing/cleanup.ts";
 import { freePortBlock } from "./testing/ports.ts";
+import { harnessReady } from "./testing/harness-ready.ts";
 
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
 const FAKE_CLI = join(SERVER_DIR, "testing", "fake-acp-cli.ts");
@@ -63,7 +65,7 @@ const posixOnly = describe.skipIf(process.platform === "win32");
 
 /* ── the policy, with every seam injected ─────────────────────────────── */
 
-/** A Cua Driver descriptor shaped like the real one, with nothing behind it.
+/** A CUA Driver descriptor shaped like the real one, with nothing behind it.
  * The resolver only ever passes it through. */
 const HOST_STDIO: NonNullable<ComputerMount["stdio"]> = {
   command: "/fake/cua-driver",
@@ -102,6 +104,9 @@ function stubDeps(
     },
     vpsLeases: { claim: () => ({ id: "lease" }), release: () => {} },
     controlIntegration: () => ({ url: "http://127.0.0.1:1/", token: "fake-control-value" }),
+    // The real implementation, not a stub: this lane asserts what actually
+    // reaches a child, and a stub would let the production wiring be wrong.
+    boxGateway: { url: boxGatewayUrl, mint: mintBoxGatewayGrant },
     broadcast: () => {},
     notice: (name) => notices.push(name),
     checkpoint: async () => true,
@@ -231,6 +236,129 @@ describe("the grant a turn resolves is the same on both lanes", () => {
       }),
     ).rejects.toThrow("refused the connection");
     expect(released).toEqual([lease]);
+  });
+
+  it("keeps the caught VPS error when an Auto lookup throws and nothing mounts", async () => {
+    // A chat turn keeps going when the VPS cannot be reached.  The SSH
+    // error stays in the note, instead of a generic "could not be reached"
+    // and instead of failing the turn.
+    const deps = stubDeps({
+      readHostConnection: () => null,
+      vps: {
+        vpsDriverError: () => null,
+        vpsComputerAction: async () => ({ ready: false }),
+        inspectVpsForAuto: async () => {
+          throw new Error("ssh: connect to host vps-1 port 22: Operation timed out");
+        },
+        vpsComputerMcp: () => ({ command: "", args: [], env: {} }),
+        vpsComputerScreenshot: async () => ({ png: "", format: "png" }),
+      },
+    });
+    const run = resolveTurnComputerMounts({
+      bot: { id: "bot-auto-vps", name: "Auto", cloudBackend: "vps" },
+      cfg: EMPTY_CONFIG,
+      engine: ACP_ENGINE,
+      threadId: "thread-auto-vps",
+      dispatchId: 1,
+      allowed: null,
+      deps,
+    });
+    const resolved = await run;
+    expect(resolved.mounts).toEqual([]);
+    expect(resolved.unavailableNote).toContain("ssh: connect to host vps-1 port 22: Operation timed out");
+  });
+
+  describe("per-provider toggles are enforced on the cloud backend a bot resolves to", () => {
+    // The legacy allowlist only says "cloud", which cannot tell ASCII.dev Box
+    // from the Self-Hosted VPS.  Turning one of them off must still keep bots
+    // off it at runtime, without taking the other one away.
+    const providers = (over: Partial<Record<"asciiBox" | "selfHostedVps" | "localVm" | "localMac", boolean>>) =>
+      ({
+        botDefaults: {
+          computerProviders: { asciiBox: true, selfHostedVps: true, localVm: true, localMac: true, ...over },
+        },
+      }) as AppConfig;
+
+    it("mounts nothing for an explicit VPS bot when the VPS provider is off", async () => {
+      // stubDeps makes every VPS call throw, so reaching the VPS fails the test.
+      const deps = stubDeps();
+      const resolved = await resolveTurnComputerMounts({
+        bot: { id: "bot-vps-off", name: "Remote", computers: ["cloud"], cloudBackend: "vps" },
+        cfg: providers({ selfHostedVps: false }),
+        engine: ACP_ENGINE,
+        threadId: "thread-vps-off",
+        dispatchId: 1,
+        allowed: ["cloud", "vm", "local"],
+        deps,
+      });
+      expect(resolved.mounts).toEqual([]);
+    });
+
+    it("mounts nothing for an explicit Box bot when the Box provider is off, instead of provisioning", async () => {
+      const deps = stubDeps({
+        box: {
+          boxConfigured: () => true,
+          findBox: async () => {
+            throw new Error("the Box should not have been reached");
+          },
+          provisionBox: async () => {
+            throw new Error("the Box should not have been provisioned");
+          },
+          readyBox: async () => null,
+          screenshotBox: async () => ({ png: "", format: "png" }),
+        },
+      });
+      const resolved = await resolveTurnComputerMounts({
+        bot: { id: "bot-box-off", name: "Boxed", computers: ["cloud"], cloudBackend: "box" },
+        cfg: providers({ asciiBox: false }),
+        engine: ACP_ENGINE,
+        threadId: "thread-box-off",
+        dispatchId: 1,
+        allowed: null,
+        deps,
+      });
+      expect(resolved.mounts).toEqual([]);
+    });
+
+    it("still routes a VPS bot to the VPS when only the Box provider is off", async () => {
+      const deps = stubDeps({
+        vps: {
+          vpsDriverError: () => null,
+          vpsComputerAction: async () => {
+            throw new Error("reached the VPS");
+          },
+          inspectVpsForAuto: async () => ({ ready: false }),
+          vpsComputerMcp: () => ({ command: "", args: [], env: {} }),
+          vpsComputerScreenshot: async () => ({ png: "", format: "png" }),
+        },
+      });
+      await expect(
+        resolveTurnComputerMounts({
+          bot: { id: "bot-vps-on", name: "Remote", computers: ["cloud"], cloudBackend: "vps" },
+          cfg: providers({ asciiBox: false }),
+          engine: ACP_ENGINE,
+          threadId: "thread-vps-on",
+          dispatchId: 1,
+          allowed: null,
+          deps,
+        }),
+      ).rejects.toThrow("reached the VPS");
+    });
+
+    it("keeps an Auto bot's discovery off a disabled backend but leaves the host fallback", async () => {
+      // inspectVpsForAuto throws in stubDeps: auto must not look at the VPS.
+      const deps = stubDeps();
+      const resolved = await resolveTurnComputerMounts({
+        bot: { id: "bot-auto", name: "Auto", cloudBackend: "vps" },
+        cfg: providers({ selfHostedVps: false }),
+        engine: ACP_ENGINE,
+        threadId: "thread-auto",
+        dispatchId: 1,
+        allowed: null,
+        deps,
+      });
+      expect(resolved.mounts.map((m) => m.kind)).toEqual(["local"]);
+    });
   });
 
   it("stops when a newer dispatch has taken the thread", async () => {
@@ -501,6 +629,9 @@ posixOnly("room turns carry the same computers as a direct chat", () => {
       USERPROFILE: home,
       OMB_PORT: String(port),
       OMB_EXTRA_PATH: fakeBin,
+      // spawnDetached switches container runtimes off; this fake `docker` is
+      // the one runtime the harness may run, by absolute path.
+      BOTFLEET_CONTAINER_RUNTIME_FIXTURE_DIR: fakeBin,
       FAKE_DOCKER_DIR: fakeBin,
       FAKE_DOCKER_LOG: dockerLog,
     };
@@ -516,7 +647,7 @@ posixOnly("room turns carry the same computers as a direct chat", () => {
     const deadline = Date.now() + 20_000;
     for (;;) {
       try {
-        if ((await fetch(`${base}/api/health`)).ok) break;
+        if (await harnessReady(base)) break;
       } catch {
         /* not up yet */
       }

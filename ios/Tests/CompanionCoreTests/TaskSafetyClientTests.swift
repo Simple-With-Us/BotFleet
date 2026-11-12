@@ -144,6 +144,24 @@ final class TaskSafetyClientTests: XCTestCase {
         ])
     }
 
+    func testRecordedSendLinksWAVAndOriginalTranscriptToTheTask() async throws {
+        let recording = IncomingRecording(path: "/api/attachments/one.wav", transcript: "original")
+        _ = try await client.send(
+            text: "original", toBot: "bot-1", threadId: "task-visible",
+            idempotencyKey: "pending-recorded", recording: recording
+        )
+        let request = try XCTUnwrap(TaskSafetyRequestStub.captured().only)
+        XCTAssertEqual(request.path, "/api/bots/bot-1/messages")
+        let raw = try XCTUnwrap(request.body)
+        let body = try XCTUnwrap(JSONSerialization.jsonObject(with: raw) as? [String: Any])
+        XCTAssertEqual(body["text"] as? String, "original")
+        XCTAssertEqual(body["threadId"] as? String, "task-visible")
+        let linked = try XCTUnwrap(body["recording"] as? [String: String])
+        XCTAssertEqual(linked["path"], "/api/attachments/one.wav")
+        XCTAssertEqual(linked["transcript"], "original")
+        XCTAssertEqual(linked["engine"], "apple-on-device")
+    }
+
     func testInterruptBindsTheDisplayedTask() async throws {
         try await client.interrupt(botId: "bot-1", threadId: "task-visible")
 

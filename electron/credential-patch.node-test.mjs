@@ -37,7 +37,9 @@ describe("desktop credential:set patches (CREDENTIAL_PATCH)", () => {
     for (const name of names) assert.equal(typeof patch[name], "function", `${name} is not a function`);
   });
 
-  it("every patch builder yields { section: { field: value } } and passes the value through unchanged", () => {
+  it("every patch builder yields { section: { ... } } and passes the value through unchanged", () => {
+    // ttsKey pins the selected provider alongside the key.
+    const multiField = new Set(["ttsKey"]);
     for (const name of names) {
       const sentinel = `sentinel-${name}`;
       const result = patch[name](sentinel);
@@ -45,9 +47,13 @@ describe("desktop credential:set patches (CREDENTIAL_PATCH)", () => {
       assert.equal(sections.length, 1, `${name} must patch exactly one config section, got ${sections.join(", ")}`);
       const [section] = sections;
       const fields = Object.keys(result[section]);
-      assert.equal(fields.length, 1, `${name} must patch exactly one field of "${section}", got ${fields.join(", ")}`);
-      const [field] = fields;
-      assert.equal(result[section][field], sentinel, `${name} did not pass its value through unchanged`);
+      if (multiField.has(name)) {
+        assert.ok(fields.length >= 1, `${name} must patch at least one field of "${section}", got ${fields.join(", ")}`);
+      } else {
+        assert.equal(fields.length, 1, `${name} must patch exactly one field of "${section}", got ${fields.join(", ")}`);
+      }
+      const primaryField = multiField.has(name) ? "key" : fields[0];
+      assert.equal(result[section][primaryField], sentinel, `${name} did not pass its value through unchanged`);
     }
   });
 
@@ -66,5 +72,37 @@ describe("desktop credential:set patches (CREDENTIAL_PATCH)", () => {
   it("wires the Infisical machine-identity secret into config.infisical.clientSecret", () => {
     assert.ok(Object.hasOwn(patch, "infisicalClientSecret"), "CREDENTIAL_PATCH is missing infisicalClientSecret");
     assert.deepEqual(patch.infisicalClientSecret("shh"), { infisical: { clientSecret: "shh" } });
+  });
+
+  it("wires both primary Infisical service tokens through the encrypted credential route", () => {
+    assert.ok(Object.hasOwn(patch, "infisicalReadToken"), "CREDENTIAL_PATCH is missing infisicalReadToken");
+    assert.ok(Object.hasOwn(patch, "infisicalWriteToken"), "CREDENTIAL_PATCH is missing infisicalWriteToken");
+    assert.deepEqual(patch.infisicalReadToken("read-token"), { infisical: { token: "read-token" } });
+    assert.deepEqual(patch.infisicalWriteToken("write-token"), { infisical: { writeToken: "write-token" } });
+  });
+
+  it("can store a key for every provider the voice panels offer", () => {
+    // The STS settings panel names Gemini beside xAI and tells the user to add
+    // the key when one is missing.  That is only true if the panel's providers
+    // and this table agree: a provider with no CREDENTIAL_PATCH row was rejected
+    // by `credential:set` with "Unsupported credential", so the panel named a
+    // key the app could never accept.
+    for (const [name, section] of [
+      ["xaiApiKey", "xai"],
+      ["geminiApiKey", "gemini"],
+    ]) {
+      assert.ok(Object.hasOwn(patch, name), `CREDENTIAL_PATCH is missing ${name}`);
+      assert.deepEqual(patch[name](`${section}-key`), { [section]: { key: `${section}-key` } });
+    }
+  });
+
+  it("pins the selected voice engine on each key save, including new installations", () => {
+    // A fresh MiniMax save must carry the explicit provider field so the
+    // config reader always knows which voice engine to use without guessing.
+    // This is tested at the CREDENTIAL_PATCH level because packaged Electron
+    // saves route through CREDENTIAL_PATCH rather than the shared helper.
+    assert.ok(Object.hasOwn(patch, "ttsKey"), "CREDENTIAL_PATCH is missing ttsKey");
+    assert.deepEqual(patch.ttsKey("sk-fresh"), { tts: { key: "sk-fresh", provider: "minimax" } });
+    assert.deepEqual(patch.ttsKey("sk-eleven", "elevenlabs"), { tts: { key: "sk-eleven", provider: "elevenlabs" } });
   });
 });

@@ -161,12 +161,44 @@ describe("redactSecretsInText", () => {
       [`aws ${"AKIA" + "IOSFODNN7EXAMPLE"} and more`, /IOSFODNN7EXAMPLE/],
       [`google ${"AIza" + "SyA-"}${alpha.slice(0, 32)}`, /AIza/],
       [`npm ${"npm" + "_"}${alpha}`, /npm_[a-z]/],
+      // xAI ships as a BotFleet engine, so a Grok key is a credential this
+      // product hands its own users; Groq and Hugging Face ride along.
+      [`XAI_API_KEY ${"xai" + "-"}${alpha}${alpha}`, /xai-[a-z]/],
+      [`groq ${"gsk" + "_"}${alpha}${alpha.slice(0, 16)}`, /gsk_[a-z]/],
+      [`hugging face ${"hf" + "_"}${alpha}`, /hf_[a-z]/],
+      // S13: shapes BotFleet itself issues or stores (underscore Stripe
+      // forms, webhook secrets, Google OAuth access tokens, GitLab PATs).
+      [`stripe live ${"sk_" + "live_"}${alpha}`, /sk_live_/],
+      [`stripe test ${"sk_" + "test_"}${alpha}`, /sk_test_/],
+      [`webhook ${"wh" + "sec_"}${alpha}`, /whsec_/],
+      [`generic ${"ak" + "_"}${alpha}`, /ak_[a-z]/],
+      [`google oauth ${"ya29" + "."}${alpha}${alpha.slice(0, 10)}`, /ya29\./],
+      [`gitlab ${"glpat" + "-"}${alpha.slice(0, 20)}`, /glpat-/],
     ];
     for (const [input, leak] of cases) {
       const out = redactSecretsInText(input);
       expect(out, input).not.toMatch(leak);
       expect(out).toMatch(/«redacted \d+ chars»/);
     }
+  });
+
+  it("masks an xAI key pasted into a tool result, and says how long it was", () => {
+    // The shape that reaches the canonical log: a bot pastes its own engine
+    // key into a command it is asking permission to run.
+    const key = `${"xai" + "-"}${"abcdefghijklmnopqrstuvwxyz0123456789".repeat(2)}`;
+    const out = redactSecretsInText(`running: curl -H "x-api-key: ${key}" https://api.x.ai/v1/models`);
+    expect(out).not.toContain(key);
+    expect(out).toContain(`«redacted ${key.length} chars»`);
+    // The command around it still reads, which is what a bug report is for.
+    expect(out).toContain("https://api.x.ai/v1/models");
+  });
+
+  it("leaves a mask alone on a second pass over a masked engine key", () => {
+    // Redaction runs twice by design; the second pass must report the
+    // secret's length, not the marker's.
+    const key = `${"xai" + "-"}${"abcdefghijklmnopqrstuvwxyz0123456789".repeat(2)}`;
+    const once = redactSecretsInText(`key ${key}`);
+    expect(redactSecretsInText(once)).toBe(once);
   });
 
   it("masks JWTs, PEM private key blocks, and bearer tokens", () => {

@@ -12,6 +12,12 @@ import {
   readLocalQuotaSnapshot,
 } from "./local-usage-monitor.ts";
 
+const planMetadata = {
+  detectedPlanName: "Ultra", userPlanName: "My Pro", userCostUsd: "20.00",
+  userRenewalDateText: "Next Friday", userSubtitle: "Work account",
+  showCostAndRenewal: true, hasMismatch: true,
+};
+
 const now = Date.parse("2026-09-13T08:00:00Z");
 const row = (provider = "openai", extra = {}) => ({
   id: "short", provider, providerKey: provider, label: "5h window", remainingPercent: 42,
@@ -70,6 +76,15 @@ describe("native Usage Monitor handoff", () => {
     expect(result[1].status).toBe("near_cap");
   });
 
+  it("retains both plan sources without changing the detected legacy name", () => {
+    const parsed = parseLocalQuotaSnapshot(payload([
+      row("cursor", { planName: "Ultra", planMetadata: { ...planMetadata, token: "refused" } }),
+    ]), now);
+    expect(parsed[0].planName).toBe("Ultra");
+    expect(parsed[0].planMetadata).toEqual(planMetadata);
+    expect(parseLocalQuotaSnapshot(payload(), now)[0].planMetadata).toBeUndefined();
+  });
+
   it("drops an unusable absolute figure without dropping the window", () => {
     const result = parseLocalQuotaSnapshot(payload([
       row("cursor", { absoluteRemaining: -5, absoluteLimit: "400", quotaUnit: "USD", planName: "ultra" }),
@@ -93,10 +108,10 @@ describe("native Usage Monitor handoff", () => {
   it("carries the producer and its per-provider read failures, capped and as plain text", () => {
     const hostile = `<script>alert("quota")</script> ${"a long unhelpful reason ".repeat(20)}`;
     const parsed = parseLocalQuotaPayload(payload([row()], {
-      producer: "agent-bar",
+      producer: "codecaps",
       issues: { claude: "Sign in again to refresh quota", kimi: "no BotFleet engine", cursor: hostile },
     }), now);
-    expect(parsed.producer).toBe("agent-bar");
+    expect(parsed.producer).toBe("codecaps");
     // Provider keys are canonicalized, so the producer may spell a provider
     // either way; a provider BotFleet has no engine for is dropped.
     expect(parsed.issues.anthropic).toBe("Sign in again to refresh quota");

@@ -1,4 +1,5 @@
 import SwiftUI
+import CompanionCore
 
 /// A small brand mark for the provider driving a bot's current model — the
 /// Claude, Grok, OpenAI, etc. logo.  Mirrors `ProviderMark(driverKind:)` in
@@ -11,7 +12,16 @@ import SwiftUI
 /// never becomes an empty placeholder.
 struct ProviderMarkView: View {
     let driverKind: String
-    var size: CGFloat = 15
+    var model: String? = nil
+    var size: CGFloat = 20
+
+    static func resolvedDriverKind(for driverKind: String, model: String?) -> String {
+        ProviderMarkRouting.resolvedDriverKind(for: driverKind, model: model)
+    }
+
+    private var effectiveDriverKind: String {
+        Self.resolvedDriverKind(for: driverKind, model: model)
+    }
 
     private enum Mark {
         /// Full-color brand asset, rendered as-is.
@@ -20,18 +30,24 @@ struct ProviderMarkView: View {
         /// it stays visible on both light and dark headers.
         case templateAsset(String)
         /// A generic SF Symbol standing in for a mark that has no brand
-        /// artwork of its own (e.g. the "computer" driver).
+        /// artwork of its own (e.g. the ASCII.dev Box driver).
         case symbol(String)
         /// No art shipped for this driver kind — fall back to a monogram.
         case monogram
     }
 
     private var mark: Mark {
-        switch driverKind {
+        switch effectiveDriverKind {
         case "claude", "claudeAgent":
             return .asset("ProviderMarkClaude")
         case "grok", "grokAgent":
             return .templateAsset("ProviderMarkGrok")
+        case "grok-bot":
+            // The bot variant of the Grok mark — same X-shape with a small
+            // filled dot in the upper-right corner so a row of "Grok / Grok
+            // Bot" reads as related but distinguishable.  Mirrors the
+            // grok-bot.svg in CodeCaps' ProviderMarks folder.
+            return .templateAsset("ProviderMarkGrokBot")
         case "deepseek", "deepseekAgent", "dsh", "dshAgent":
             return .asset("ProviderMarkDeepSeek")
         case "codex":
@@ -45,10 +61,10 @@ struct ProviderMarkView: View {
             return .asset("ProviderMarkGemini")
         case "cursor", "cursorAgent":
             return .templateAsset("ProviderMarkCursor")
-        case "minimax", "minimaxAgent":
+        case "minimax", "minimaxAgent", "mcode", "mcodeAgent":
             return .asset("ProviderMarkMiniMax")
         case "boxAgent":
-            return .symbol("desktopcomputer")
+            return .symbol("shippingbox")
         // No source art shipped for these — they render on the monogram
         // fallback below, which is expected and fine.
         case "droid", "droidAgent", "kimi", "kimiAgent", "qwenAgent",
@@ -61,35 +77,42 @@ struct ProviderMarkView: View {
 
     /// Human-readable provider name for VoiceOver — this mark is identity,
     /// not decoration, so it must never read as silent chrome.
-    private var displayName: String { Self.displayName(for: driverKind) }
+    private var displayName: String { Self.displayName(for: driverKind, model: model) }
 
     /// Shared so the chat-header profile button can fold the provider into
     /// its own accessibility label (SwiftUI replaces child labels on a
     /// Button with an explicit `.accessibilityLabel`).
-    static func displayName(for driverKind: String) -> String {
-        switch driverKind {
+    static func displayName(for driverKind: String, model: String? = nil) -> String {
+        let effective = resolvedDriverKind(for: driverKind, model: model)
+        switch effective {
         case "claude", "claudeAgent": return "Claude"
         case "grok", "grokAgent": return "Grok"
-        case "deepseek", "deepseekAgent", "dsh", "dshAgent": return "DeepSeek"
+        case "grok-bot": return "Grok Bot"
+        case "deepseek", "deepseekAgent": return "DeepSeek"
+        case "dsh", "dshAgent": return "Clutch"
         case "codex": return "Codex"
         case "openai-compat", "openai": return "OpenAI"
-        case "gemini", "geminiAgent", "antigravity", "antigravityAgent": return "Gemini"
+        case "gemini", "geminiAgent": return "Gemini"
+        case "antigravity", "antigravityAgent": return "Antigravity"
         case "cursor", "cursorAgent": return "Cursor"
         case "minimax", "minimaxAgent": return "MiniMax"
-        case "boxAgent": return "Computer"
+        // mcode is the same subscription read as a coding CLI, so it keeps the
+        // MiniMax mark but announces as its own product name.
+        case "mcode", "mcodeAgent": return "MiniMax Code"
+        case "boxAgent": return "ASCII.dev Box"
         case "kimi", "kimiAgent": return "Kimi"
         case "droid", "droidAgent": return "Droid"
         case "qwenAgent": return "Qwen"
         case "opencodeGo": return "OpenCode"
         case "hermesAgent": return "Hermes"
         case "piAgent": return "Pi"
-        default: return driverKind
+        default: return effective
         }
     }
 
     /// Mirrors the web fallback exactly: `driverKind.replace(/Agent$/i, "").slice(0, 1).toUpperCase()`.
     private var monogram: String {
-        var stripped = driverKind
+        var stripped = effectiveDriverKind
         if stripped.lowercased().hasSuffix("agent") {
             stripped = String(stripped.dropLast(5))
         }
@@ -124,8 +147,59 @@ struct ProviderMarkView: View {
         .frame(width: size, height: size)
         .background(Circle().fill(Color(uiColor: .systemBackground)))
         .clipShape(Circle())
-        .overlay(Circle().strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5))
+        .overlay(Circle().strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.75))
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(displayName)
+    }
+}
+
+// MARK: - The mark on an avatar
+
+extension View {
+    /// The provider mark at an avatar's lower-right corner, the treatment the
+    /// chat header and message rows use, for a bot answering in its own
+    /// thread.  Draws nothing when the engine is unknown (a cold roster), so
+    /// the avatar is left as it was.  Apply it to every bot avatar.
+    func providerBadge(for bot: Bot, inThread threadId: String? = nil, avatarSize: CGFloat) -> some View {
+        modifier(ProviderBadge(bot: bot, threadId: threadId ?? bot.threadId, avatarSize: avatarSize))
+    }
+
+    /// A chat's avatar: a bot gets the mark, a room (many bots, no single
+    /// model) gets nothing.
+    func providerBadge(for chat: Chat?, avatarSize: CGFloat) -> some View {
+        modifier(ProviderBadge(bot: chat?.bot, threadId: chat?.threadId, avatarSize: avatarSize))
+    }
+}
+
+private extension Chat {
+    var bot: Bot? {
+        if case let .bot(bot) = self { return bot }
+        return nil
+    }
+}
+
+private struct ProviderBadge: ViewModifier {
+    let bot: Bot?
+    /// The conversation thread whose task override applies, not always
+    /// `bot.threadId` when navigation holds a task thread open.
+    let threadId: String?
+    let avatarSize: CGFloat
+    @EnvironmentObject private var session: Session
+
+    /// The header's 21pt on a 36pt avatar and a message row's 16pt on a 28pt
+    /// one, held to the same proportion; capped so a hero avatar's badge
+    /// stays a badge.
+    private var diameter: CGFloat { min(30, max(14, (avatarSize * 0.57).rounded())) }
+
+    func body(content: Content) -> some View {
+        content.overlay(alignment: .bottomTrailing) {
+            if let bot,
+               let threadId,
+               let selection = MessageRow.modelSelection(of: bot, inThread: threadId),
+               let driverKind = session.instanceDriverKinds[selection.instanceId] {
+                ProviderMarkView(driverKind: driverKind, model: selection.model, size: diameter)
+                    .offset(x: 3, y: 3)
+            }
+        }
     }
 }

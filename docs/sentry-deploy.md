@@ -8,7 +8,7 @@ npx @sentry/cli releases deploys "$VERSION" new -e production
 ```
 
 - `VERSION` = full 40-char git SHA (`workflow_run.head_sha`)
-- `SENTRY_ORG=jays-services`, `SENTRY_PROJECT=botfleet`
+- `SENTRY_ORG=simple-with-us`, `SENTRY_PROJECT=botfleet`
 - Does **not** call `releases new` (no second release creator)
 - Soft-fail: warn + exit 0
 

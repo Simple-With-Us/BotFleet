@@ -3,6 +3,10 @@ export interface ChiefTeamMember {
   name: string;
   title?: string;
   description?: string;
+  /** Accepted and deliberately IGNORED by the roster: see the note on
+   *  chiefOfStaffSystemPrompt.  Callers hand this function whole bot rows,
+   *  and keeping the field declared is what makes "we chose not to print
+   *  it" readable at the call site instead of looking like an omission. */
   busy?: boolean;
   hidden?: boolean;
   section?: string;
@@ -27,6 +31,18 @@ const sectionKey = (section?: string): string => section?.trim() || "";
  * It names the current team on every turn, while list_bots remains the
  * authoritative tool for IDs and live availability at delegation time.
  *
+ * DELIBERATELY ABSENT: each teammate's live `busy` state.  This string
+ * reaches the driver as `turn.system`, and the Claude driver passes it as
+ * `--append-system-prompt`, which is part of the spawn fingerprint it
+ * compares before handing the next turn to the warm process (`argsKey` in
+ * drivers/claude.ts).  Interpolating availability here meant any teammate
+ * starting or finishing a turn changed the Chief's fingerprint and tore its
+ * CLI down for a `--resume` respawn, so the one bot BotFleet is built
+ * around got the least benefit from session reuse.  The roster is
+ * MEMBERSHIP — names, roles, about.  Availability is a live fact, and
+ * list_bots is the tool that reports it freshly at the moment the Chief is
+ * actually about to delegate.
+ *
  * `availableAgentTools` is the tool-NAME set this Chief's turn actually has
  * — not a boolean — so a driver that can reach ask_bot but not create_bot /
  * delegate_bot (today's MiniMax, whose HTTP catalog stops at the registry's
@@ -36,6 +52,8 @@ export function chiefOfStaffSystemPrompt(
   chiefId: string,
   bots: ChiefTeamMember[],
   availableAgentTools: readonly string[],
+  /** @deprecated Prefer the volatile `botfleet-status` prompt section at the
+   *  harness call site (BF-1358) instead of passing status here. */
   trustedBotFleetStatus = "",
 ): string {
   const chief = bots.find((bot) => bot.id === chiefId);
@@ -52,22 +70,23 @@ export function chiefOfStaffSystemPrompt(
           const name = clip(bot.name, ROSTER_NAME_MAX);
           const role = clip(bot.title?.trim() || "General assistant", ROSTER_ROLE_MAX);
           const about = bot.description?.trim();
-          const availability = bot.busy ? "working right now" : "available";
-          return `- ${name} — ${role}${about ? `: ${clip(about, ROSTER_ABOUT_MAX)}` : ""} (${availability})`;
+          return `- ${name} — ${role}${about ? `: ${clip(about, ROSTER_ABOUT_MAX)}` : ""}`;
         })
         .join("\n") + (overflow > 0 ? `\n- …and ${overflow} more (use list_bots for the full roster).` : "")
     : "- No other visible bots are available yet.";
 
-  const canAskBot = availableAgentTools.includes("ask_bot");
-  const canBuildTeam = canAskBot && availableAgentTools.includes("create_bot") && availableAgentTools.includes("delegate_bot");
-  const delegation = canAskBot
+  const canCoordinate = availableAgentTools.includes("coordinate_bots");
+  const canBuildTeam = canCoordinate && availableAgentTools.includes("create_bot");
+  const delegation = canCoordinate
     ? [
-        "Use list_bots to confirm the live roster and IDs. Use ask_bot when a teammate is better suited to part of the request.",
+        "Use list_bots to confirm the live roster, IDs, and who is busy right now — this prompt lists who is on the team, not who is free. Use coordinate_bots when a teammate is better suited to part of the request.",
         canBuildTeam
-          ? "When the user asks you to assemble a team, use create_bot for each genuinely useful specialist. Give each one a clear role and instructions, then use delegate_bot to assign its work. Do not create duplicate or unnecessary bots."
+          ? "When the user asks you to assemble a team, use create_bot for each genuinely useful specialist. Give each one a clear role and instructions, then use coordinate_bots to assign its work. Do not create duplicate or unnecessary bots."
           : undefined,
-        "Delegate with a clear, self-contained brief and wait for the teammate's actual reply before claiming its work is complete.",
-        "You may consult more than one teammate when the request genuinely benefits, then combine their results into one coherent answer.",
+        "coordinate_bots records the handoff and returns immediately.  The default reply is resume, so the result comes back on this conversation when the work finishes.  Use reply none when nothing should come back, and assignment_status to read a handoff without waiting.",
+        "A peer that is busy waits.  It is not cancelled, and you do not invent its result.",
+        "Delegate with a clear, self-contained brief.  Do not claim the work is complete until the result has come back.",
+        "You may hand work to more than one teammate when the request genuinely benefits, then combine their results into one coherent answer.",
       ]
         .filter(Boolean)
         .join(" ")

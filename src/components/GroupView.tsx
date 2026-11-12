@@ -16,7 +16,7 @@ import {
   type GroupDefaultResponder,
   type Message,
 } from "@/state/store";
-import { MausAvatar } from "./Avatar";
+import { BotMascot } from "./Avatar";
 import { TurnPresence } from "./TurnPresence";
 import { showToolCallsEnabled, summarizeToolCallsEnabled } from "@/lib/feature-flags";
 import { normalizeState } from "@/lib/mascot";
@@ -24,21 +24,26 @@ import { effectiveDefaultResponder, groupResponseHint } from "@/lib/group-routin
 import { ChatMarkdown } from "./ChatMarkdown";
 import { MentionText } from "./MentionText";
 import { Composer } from "./Composer";
+import { UpdateDrainNotice } from "./UpdateDrainNotice";
 import { ErrorRow, TurnErrorAnnouncement, latestTurnErrorMessage } from "./ErrorRow";
 import { ChatFindBar } from "./ChatFindBar";
 import { GroupThreadTabs } from "./ThreadTabs";
 import { ReplyQuote } from "./ReplyQuote";
 import { ConnectorCard } from "./ConnectorCard";
 import { SecretRequestCard } from "./SecretRequestCard";
+import { SignInRequestCard } from "./SignInRequestCard";
 import { AttachedFileChips, AttachedImageGallery } from "./AttachmentPreview";
 import { GroupCallButton, GroupCallOverlay } from "./GroupCallView";
 import { ReactionBar, ReactionChips } from "./Reactions";
 import { CopyButton } from "./CopyButton";
 import { ApprovalCard } from "./ApprovalCard";
 import { ManageMembersPanel } from "./ManageMembersPanel";
-import { groupActivityRuns } from "@/lib/activity-runs";
+import { groupActivityRuns, nestHelperSteps } from "@/lib/activity-runs";
 import { ActivityRun } from "./ActivityRun";
+import { HelperCard } from "./HelperCard";
+import { isHelperRow, runningHelperCount } from "../../shared/helpers";
 import { ToolLine } from "./ToolLine";
+import { JobFinishedRow, JobsMenu } from "./JobsMenu";
 import { useDesktopCapabilities } from "./DesktopCapabilities";
 import { cn } from "@/lib/cn";
 import { useFocusMessage } from "@/lib/focus-message";
@@ -46,6 +51,7 @@ import { shortPath } from "@/lib/short-path";
 import { BOTTOM_FOLLOW_THRESHOLD, shouldResumeBottomFollow } from "@/lib/bottom-follow";
 import { showWorkingDots } from "@/lib/turn-tail";
 import { liveActivityLabel } from "@/lib/live-activity";
+import { botActivityLocation } from "@/lib/sidebar-activity";
 import { modelChip } from "@/lib/model-chip";
 import { splitAttachedImages } from "@/lib/composer-attachments";
 import {
@@ -73,14 +79,15 @@ function dayLabel(at: number): string {
  * The sender is already named by the cluster label above it. */
 function RoomToolChip({ message }: { message: Message }) {
   if (!message.tool) return null;
+  if (isHelperRow(message)) return <HelperCard message={message} />;
   return <ToolLine message={message} actor={message.from?.name} />;
 }
 
-/** 16px maus + name, shown once per sender cluster. */
+/** 16px bot + name, shown once per sender cluster. */
 function ClusterLabel({ bot, name, color }: { bot?: Bot; name: string; color: string }) {
   return (
     <div className="mt-1 flex items-center gap-1.5 pl-0.5">
-      <MausAvatar
+      <BotMascot
         color={(bot?.color ?? color) as Bot["color"]}
         state={normalizeState(bot?.mascotExpression) ?? "happy"}
         size={16}
@@ -132,7 +139,7 @@ function GroupTextRow({
   onReply: (message: Message) => void;
   attachedImages: ReturnType<typeof splitAttachedImages> | null;
 }) {
-  const { dispatch } = useStore();
+  const { state, dispatch } = useStore();
   const [copied, setCopied] = useState(false);
   const copyContent = attachedImages?.display ?? m.text ?? "";
   const requestId = m.card?.requestId;
@@ -243,12 +250,18 @@ function GroupTextRow({
             <div className="flex items-center text-[11px] text-ink-secondary/70 opacity-0 transition-opacity group-hover:opacity-100 px-1">
               {formatHoverTime(m.at)}
               {m.from?.botId && (() => {
-                const bot = members.find(b => b.id === m.from?.botId);
-                return bot?.modelSelection ? (
-                  <span className="ml-1.5 flex items-center" title={bot.modelSelection.model}>
-                    <ProviderMark driverKind={bot.modelSelection.instanceId.includes('claude') ? 'claude' : bot.modelSelection.instanceId.includes('antigravity') ? 'antigravity' : bot.modelSelection.instanceId.includes('dsh') || bot.modelSelection.instanceId.includes('deepseek') ? 'dsh' : bot.modelSelection.instanceId.includes('grok') ? 'grok' : bot.modelSelection.instanceId.includes('codex') ? 'codex' : bot.modelSelection.instanceId.includes('cursor') ? 'cursor' : 'openai'} size={12} />
+                const bot = members.find((b) => b.id === m.from?.botId);
+                const currentSelection = bot?.modelSelection;
+                if (!currentSelection) return null;
+                const instance = state.instances.find((i) => i.instanceId === currentSelection.instanceId);
+                const modelOption = instance?.models.options.find((o) => o.id === currentSelection.model);
+                const modelName = modelOption?.label || currentSelection.model;
+                const title = instance ? `${modelName} (${instance.displayName || instance.driverKind})` : currentSelection.model;
+                return (
+                  <span className="ml-1.5 flex items-center" title={title}>
+                    <ProviderMark driverKind={instance?.driverKind ?? currentSelection.instanceId} model={currentSelection.model} size={12} />
                   </span>
-                ) : null;
+                );
               })()}
             </div>
           </div>
@@ -283,10 +296,11 @@ const Transcript = memo(function Transcript({
   const memberOf = (id?: string) => members.find((b) => b.id === id);
   // Several bots working at once turn a room into a wall of chips; fold the
   // finished ones when summarizeToolCalls is enabled.
-  const items = useMemo(
-    () => (summarizeToolCalls ? groupActivityRuns(messages) : messages.map((m) => ({ kind: "message" as const, message: m }))),
-    [messages, summarizeToolCalls],
-  );
+  const items = useMemo(() => {
+    // a helper's steps sit under the row that started the helper
+    const ordered = nestHelperSteps(messages);
+    return summarizeToolCalls ? groupActivityRuns(ordered) : ordered.map((m) => ({ kind: "message" as const, message: m }));
+  }, [messages, summarizeToolCalls]);
   const focus = state.focusMessage;
   const focusedId = focus && !focus.consumed && focus.threadId === group.threadId ? focus.messageId : null;
   return (
@@ -332,12 +346,18 @@ const Transcript = memo(function Transcript({
           // Allow the broker rejects
           m.kind === "secret" && m.secret && m.from?.botId ? (
             <SecretRequestCard botId={m.from.botId} threadId={group.threadId} message={m} />
+          ) : m.kind === "sign-in" && m.signIn && m.from?.botId ? (
+            <SignInRequestCard botId={m.from.botId} threadId={group.threadId} message={m} />
           ) : m.kind === "connector" && m.connector && m.from?.botId ? (
             <ConnectorCard botId={m.from.botId} threadId={group.threadId} message={m} />
           ) : m.kind === "options" && m.card?.requestId && m.card.tool ? (
             <div className="flex justify-start">
               <ApprovalCard bot={memberOf(m.from?.botId)} message={m} />
             </div>
+          ) : m.kind === "activity" && m.job ? (
+            <JobFinishedRow job={m.job} />
+          ) : m.kind === "activity" && isHelperRow(m) ? (
+            <HelperCard message={m} />
           ) : m.kind === "activity" && m.tool ? (
             m.tool.name.startsWith("error:") ? (
               <div className="flex justify-start max-w-full">
@@ -543,7 +563,7 @@ function RoomWorkingFolder({ group }: { group: Group }) {
 
         {extraCwds.length === 0 ? (
           <div className="mt-2 text-[12px] text-ink-secondary">
-            No secondary repositories attached. Add more folders (e.g. Fleet Ops) so channel bots have full multi-repo context.
+            No secondary repositories attached.{"\u00a0 "}Add more folders (e.g. Fleet Ops) so channel bots have full multi-repo context.
           </div>
         ) : (
           <div className="mt-2 flex flex-col gap-1.5">
@@ -841,7 +861,7 @@ function RoomSetup({ group, members }: { group: Group; members: Bot[] }) {
                             selected ? "bg-accent/10" : "hover:bg-raised",
                           )}
                         >
-                          <MausAvatar
+                          <BotMascot
                             color={member.color}
                             state={normalizeState(member.mascotExpression) ?? "happy"}
                             size={24}
@@ -968,6 +988,14 @@ function formatHoverTime(at: number) {
 
 export function GroupView({ group }: { group: Group }) {
   const { state, dispatch } = useStore();
+  const { capabilities } = useDesktopCapabilities();
+  const macInset = capabilities.windowChrome === "mac-inset";
+  const dragStyle: (React.CSSProperties & { WebkitAppRegion: "drag" }) | undefined = macInset
+    ? { WebkitAppRegion: "drag" }
+    : undefined;
+  const noDragStyle: (React.CSSProperties & { WebkitAppRegion: "no-drag" }) | undefined = macInset
+    ? { WebkitAppRegion: "no-drag" }
+    : undefined;
   const stream = useStreaming();
   const streaming = stream.streaming[group.threadId];
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -1018,6 +1046,7 @@ export function GroupView({ group }: { group: Group }) {
   );
   const speaker = members.find((b) => b.id === group.busyBotId);
   const setupPending = roomNeedsSetup(group);
+  const helperCount = useMemo(() => runningHelperCount(group.messages), [group.messages]);
 
   // Mascot stays while a member works; the finished reply pops in above it.
   const lastGroupMessage = group.messages.at(-1);
@@ -1220,28 +1249,50 @@ export function GroupView({ group }: { group: Group }) {
     }
   };
 
-  // Static mauses: one per member, stacked with overlap and a counter pill when large.
-  const maxVisibleMauses = 5;
-  const visibleMembers = members.slice(0, maxVisibleMauses);
-  const hiddenMemberCount = members.length - maxVisibleMauses;
+  // Static bots: one per member, stacked with overlap and a counter pill when large.
+  const maxVisibleBots = 5;
+  const visibleMembers = members.slice(0, maxVisibleBots);
+  const hiddenMemberCount = members.length - maxVisibleBots;
 
-  const memberMauses = (
+  const memberBots = (
     <div className="flex items-center -space-x-1.5">
-      {visibleMembers.map((b) => (
-        <span
-          key={b.id}
-          title={`${b.name}${group.busyBotId === b.id ? " — working…" : ""}`}
-          className={cn(
-            "relative inline-flex rounded-full ring-2 ring-app",
-            group.busyBotId === b.id && "ring-accent/70",
-          )}
-        >
-          <MausAvatar color={b.color} state={normalizeState(b.mascotExpression) ?? "happy"} size={22} animated={false} />
-          {group.busyBotId === b.id && (
-            <span className="absolute -right-0.5 -top-0.5 size-2 rounded-full border border-app bg-accent" />
-          )}
-        </span>
-      ))}
+      {visibleMembers.map((b) => {
+        const isWorkingHere = group.busyBotId === b.id;
+        const busyLocation = !isWorkingHere && b.busy ? botActivityLocation(b, state.groups) : null;
+        const isBusyElsewhere = Boolean(busyLocation);
+        return (
+          <span
+            key={b.id}
+            title={
+              isWorkingHere
+                ? `${b.name} — working in this channel…`
+                : isBusyElsewhere
+                ? `${b.name} — ${busyLocation?.kind === "group" ? `busy in #${busyLocation.name}` : `busy on ${busyLocation?.title}`}…`
+                : b.busy
+                ? `${b.name} — busy…`
+                : b.name
+            }
+            className={cn(
+              "relative inline-flex rounded-full ring-2 ring-app",
+              isWorkingHere && "ring-accent",
+              isBusyElsewhere && "ring-amber-500/70",
+            )}
+          >
+            <BotMascot
+              color={b.color}
+              state={isWorkingHere ? "working" : normalizeState(b.mascotExpression) ?? "happy"}
+              size={22}
+              animated={isWorkingHere}
+            />
+            {isWorkingHere && (
+              <span className="absolute -right-0.5 -top-0.5 size-2 rounded-full border border-app bg-accent animate-pulse" />
+            )}
+            {isBusyElsewhere && (
+              <span className="absolute -right-0.5 -top-0.5 size-2 rounded-full border border-app bg-amber-500" />
+            )}
+          </span>
+        );
+      })}
       {hiddenMemberCount > 0 && (
         <span className="relative flex size-[22px] items-center justify-center rounded-full border border-hairline/60 bg-raised text-[10px] font-semibold text-ink-secondary ring-2 ring-app">
           +{hiddenMemberCount}
@@ -1258,13 +1309,14 @@ export function GroupView({ group }: { group: Group }) {
       )}
       {/* Header: responsive container so chips fold gracefully */}
       <div
+        style={dragStyle}
         className={cn(
           "@container/chathead flex items-center justify-between gap-3 px-5 py-3",
           // Room for the drawer button, which overlays this corner below md.
           "pl-11 md:pl-5",
         )}
       >
-        <div className="flex shrink-0 min-w-0 max-w-[45%] items-center gap-2">
+        <div style={noDragStyle} className="flex shrink-0 min-w-0 max-w-[45%] items-center gap-2">
           <button
             type="button"
             onClick={() => dispatch({ type: "toggleSettings", open: true })}
@@ -1286,14 +1338,23 @@ export function GroupView({ group }: { group: Group }) {
             ) : (
               <div className="flex size-7 shrink-0 items-center justify-center -space-x-2 rounded-full bg-control p-0.5">
                 {members.slice(0, 2).map((b) => (
-                  <MausAvatar key={b.id} color={b.color} state="happy" size={14} animated={false} />
+                  <BotMascot key={b.id} color={b.color} state="happy" size={14} animated={false} />
                 ))}
               </div>
             )}
             <span className="truncate min-w-[80px] text-[15px] font-semibold text-ink" title={group.name}>{group.name}</span>
           </button>
+          {speaker && (
+            <div
+              className="flex shrink-0 items-center gap-1.5 rounded-full border border-accent/30 bg-accent/10 px-2.5 py-1 text-[12px] font-medium text-accent"
+              title={`${speaker.name} is working in ${group.name}`}
+            >
+              <span className="size-2 rounded-full bg-accent animate-pulse" />
+              <span className="truncate max-w-[160px]">{speaker.name} is working…</span>
+            </div>
+          )}
         </div>
-        <div className="flex shrink-0 items-center gap-1.5 md:gap-2">
+        <div style={noDragStyle} className="flex shrink-0 items-center gap-1.5 md:gap-2">
           <button
             type="button"
             onClick={() => setFindOpen((open) => !open)}
@@ -1307,11 +1368,13 @@ export function GroupView({ group }: { group: Group }) {
           >
             <Search size={18} />
           </button>
+          {/* Members' background jobs on this room's thread: notices only, never a wake. */}
+          <JobsMenu threadId={group.threadId} room helperCount={helperCount} />
           <GroupCallButton group={group} members={members} />
           {!setupPending && !group.dm && <RoomWorkingFolderChip group={group} onToggle={() => setFolderOpen((open) => !open)} />}
           {!setupPending && !group.dm && <DefaultResponderSelect group={group} members={members} />}
           {group.dm ? (
-            memberMauses
+            memberBots
           ) : (
             // The roster lives where you already look to see who is in the
             // room; a dashed + says the row is editable without shouting.
@@ -1323,7 +1386,7 @@ export function GroupView({ group }: { group: Group }) {
               aria-label={`Manage members — ${members.length} ${members.length === 1 ? "bot" : "bots"} in this channel`}
               className="flex items-center gap-1.5 rounded-full py-0.5 pl-1 pr-1.5 hover:bg-raised/60"
             >
-              {memberMauses}
+              {memberBots}
               <span className="flex size-[18px] items-center justify-center rounded-full border border-dashed border-hairline/70 text-ink-secondary">
                 <Plus size={11} />
               </span>
@@ -1477,7 +1540,7 @@ export function GroupView({ group }: { group: Group }) {
             <div className="flex flex-1 flex-col items-center justify-center gap-3 py-24 text-center">
               <div className="flex -space-x-2">
                 {members.slice(0, 3).map((b) => (
-                  <MausAvatar
+                  <BotMascot
                     key={b.id}
                     color={b.color}
                     state="happy"
@@ -1529,8 +1592,9 @@ export function GroupView({ group }: { group: Group }) {
           )}
           {(speaker || presenceVisible) && (
             <TurnPresence
+              actorName={presenceSpeaker?.name}
               avatar={
-                <MausAvatar
+                <BotMascot
                   color={presenceSpeaker?.color ?? "green"}
                   state={toolInFlight ? "working" : "thinking"}
                   size={36}
@@ -1540,9 +1604,10 @@ export function GroupView({ group }: { group: Group }) {
                 />
               }
               visible={presenceVisible}
+              startedAt={presenceSpeaker?.activityStartedAt}
               label={activityLabel}
               answering={popping !== null}
-              modelMark={presenceModel ? <ProviderMark driverKind={presenceModel.driverKind} size={14} /> : undefined}
+              modelMark={presenceModel ? <ProviderMark driverKind={presenceModel.driverKind} model={presenceModel.model} size={14} /> : undefined}
               modelName={presenceModel?.name}
             >
               {popping ? (
@@ -1580,6 +1645,7 @@ export function GroupView({ group }: { group: Group }) {
         </button>
       )}
       <div className="w-full">
+      <UpdateDrainNotice />
       <Composer
         key={group.threadId}
         group={group}
@@ -1587,6 +1653,7 @@ export function GroupView({ group }: { group: Group }) {
         locked={setupPending}
         replyTo={replyTo}
         onClearReply={() => setReplyTo(null)}
+        onRestoreReply={(message) => setReplyTo((current) => current ?? message)}
       />
       </div>
       </div>

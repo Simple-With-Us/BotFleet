@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   RoutineRequestError,
   RoutineRequestService,
+  routineApprovalApplied,
   routineRequestFingerprint,
   type RoutineProposalInput,
   type RoutineRequestMessage,
@@ -332,7 +333,7 @@ describe("RoutineRequestService", () => {
     await service.propose({
       botId: "bot-a",
       threadId: "thread-a",
-      proposal: { action: "update", routineId: routine.id, changes: { runOn: "maus" } },
+      proposal: { action: "update", routineId: routine.id, changes: { runOn: "bot" } },
     });
     await service.propose({
       botId: "bot-a",
@@ -444,7 +445,7 @@ describe("RoutineRequestService", () => {
       botId: "bot-a",
       name: "Morning brief",
       prompt: "Summarize the overnight support queue.",
-      runOn: "maus",
+      runOn: "bot",
       enabled: true,
       schedule: { type: "daily", time: "09:00", weekdays: [1, 3], timeZone: "Asia/Kolkata" },
       durationMinutes: 30,
@@ -662,6 +663,48 @@ describe("RoutineRequestService", () => {
     })).toMatchObject({ claimed: true, state: "invalid", status: 409 });
     expect(routines.listRoutines()[0]).toMatchObject({ name: "Changed elsewhere", enabled: true });
     expect(store.messagesFor("thread-a")[0]!.card?.held).toMatch(/changed after this confirmation card/);
+  });
+
+  it("counts an Approve All answer only when it applied, never when the card stayed pending", async () => {
+    const { service, routines, store } = harness();
+    const routine = routines.create({
+      botId: "bot-a",
+      name: "Mutable routine",
+      prompt: "Original instructions",
+      schedule: { type: "daily", time: "10:00", weekdays: [1] },
+    });
+    const answer = (requestId: string) =>
+      service.resolve({ botId: "bot-a", threadId: "thread-a", requestId, behavior: "allow" });
+
+    // A card whose routine changed after it was shown is invalid, stays pending
+    // with `held` set, and must not be reported as approved.
+    const stale = await service.propose({
+      botId: "bot-a",
+      threadId: "thread-a",
+      proposal: { action: "pause", routineId: routine.id },
+    });
+    routines.update(routine.id, { name: "Changed elsewhere" });
+    const invalid = answer(stale.requestId);
+    expect(invalid).toMatchObject({ claimed: true, state: "invalid" });
+    expect(routineApprovalApplied(invalid)).toBe(false);
+    expect(store.messagesFor("thread-a")[0]!.card?.answered).toBeUndefined();
+
+    // A fresh card for the current routine applies, and answering it again
+    // settles nothing new.
+    const fresh = await service.propose({
+      botId: "bot-a",
+      threadId: "thread-a",
+      proposal: { action: "pause", routineId: routine.id },
+    });
+    const applied = answer(fresh.requestId);
+    expect(applied.state).toBe("applied");
+    expect(routineApprovalApplied(applied)).toBe(true);
+    const duplicate = answer(fresh.requestId);
+    expect(duplicate).toMatchObject({ claimed: true, state: "already_settled" });
+    expect(routineApprovalApplied(duplicate)).toBe(false);
+
+    expect(routineApprovalApplied({ claimed: false, state: "not_found" })).toBe(false);
+    expect(routineApprovalApplied({ claimed: true, state: "denied" })).toBe(false);
   });
 
   it("settles manage cards whose requested mutation already committed before a crash", async () => {

@@ -202,7 +202,7 @@ export function AndroidDevicePanel({ status }: { status: AndroidDeviceStatus }) 
               <Smartphone size={16} className="text-success" /> {deviceLabel(selected)}
             </div>
             <div className="mt-1 text-[12px] leading-relaxed text-ink-secondary">
-              Connected directly over USB. The screen and controls stay on this computer.
+              Connected directly over USB.{"\u00a0 "}The screen and controls stay on this computer.
             </div>
           </div>
           <span className="flex shrink-0 items-center gap-1 text-[11px] text-success">
@@ -340,7 +340,7 @@ export function AndroidDevicePanel({ status }: { status: AndroidDeviceStatus }) 
           wireless pairing is needed.
         </div>
         <div className="mt-2 rounded-lg bg-inset px-3 py-2 text-[11px] leading-relaxed text-ink-secondary">
-          Once connected, ask any compatible Maus to open an Android app or complete a task on your phone. The
+          Once connected, ask any compatible Bot to open an Android app or complete a task on your phone.  The
           bundled Phone Harness skill loads automatically for phone requests.
         </div>
       </div>

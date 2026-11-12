@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { loadLocalMiniMaxConfig } from "./drivers/minimax.ts";
+import { quotaCooldowns, type QuotaCooldownRegistry } from "./model-fallback.ts";
 
 // Reads the user's MiniMax account balance / Token Plan quota and serves it
 // to the Settings → Usage UI. A peer of deepseek-balance.ts, same cache and
@@ -460,6 +461,98 @@ export async function getMiniMaxBalance(key: string | undefined, url: string | u
 
 export function invalidateMiniMaxBalance(): void {
   cacheByHash.clear();
+}
+
+/** Instance id the registry/botfleet wiring uses for the reserved
+ *  MiniMax entry (mirrors `RESERVED_INSTANCE_ID` in drivers/minimax.ts
+ *  but kept as a local literal to avoid a cross-module dependency on
+ *  the driver module — both files agree because `instanceConfigs()` in
+ *  server/config.ts's `DEFAULT_FLEET` declares it under this name). */
+const MINIMAX_INSTANCE_ID = "minimax";
+
+/** Marker the registry uses to attribute a broadcast cooldown to this
+ *  module. Reuses the convention `antigravity-quota.ts`'s source string
+ *  established, so a caller asking "which publishers are still claiming
+ *  this cap?" sees a uniform shape across both engines. */
+const MINIMAX_ACCOUNT_SOURCE = "minimax-account-balance";
+
+/** True iff the snapshot says the SHARED account (wallet empty, or
+ *  every quota pool below 1%) cannot place a chat call. Per
+ *  server/harness/registry.ts's own `walletExhausted` verdict:
+ *  a pay-as-you-go account that returns `status: "capped"` with no
+ *  `general` pool is a wallet that cannot pay for any catalog turn;
+ *  a Token Plan whose `general` row reads 0% on both windows is the
+ *  chat quota that runs every chat call. Either verdict means the
+ *  whole instance is dark. */
+function isAccountLevelCap(snapshot: MiniMaxBalanceSnapshot): boolean {
+  if (snapshot.status !== "capped") return false;
+  if (snapshot.source === "account-balance") return true;
+  // Token Plan: only the "general" pool governs chat calls; an
+  // exhausted "video" pool must not mislabel chat models (see
+  // server/harness/registry.ts). Cap on `general` means the whole
+  // instance is dark; cap on anything else is a no-op here.
+  const general = snapshot.models?.general;
+  if (!general) return false;
+  const interval = general.remainingPercent;
+  const weekly = general.secondaryRemainingPercent;
+  const intervalCap = interval != null && interval <= 0;
+  const weeklyCap = weekly != null && weekly <= 0;
+  return intervalCap || weeklyCap;
+}
+
+/** Broadcast a MiniMax account-level cap to every bot that reaches for
+ *  the instance, so an exhausted wallet on bot A is not re-paged by bot
+ *  B five seconds later. Mirrors `applyAntigravityUsageToRegistry`'s
+ *  contract (server/antigravity-quota.ts): the registry's `get()` falls
+ *  back to `*:instance:model` after the per-bot row, so a single
+ *  wildcard write covers every caller without a per-bot record.
+ *
+ *  Returns the model rows still flagged as capped for callers that
+ *  want to publish them on `ProviderSnapshot.quota.models`. Never
+ *  throws: a registry write failure is logged and swallowed, since
+ *  reading balance must not regress to a hard error.
+ *
+ *  Clears prior `minimax-account-balance` rows first so a recovered
+ *  balance (status flipped back to `ok`/`near_cap`) lifts the cap
+ *  immediately, instead of waiting out the registry's TTL. */
+export function applyMiniMaxBalanceToRegistry(
+  snapshot: MiniMaxBalanceSnapshot,
+  registry: QuotaCooldownRegistry = quotaCooldowns,
+): { capped: boolean } {
+  const previouslyCappedModels = registry.list()
+    .filter((cd) => cd.instanceId === MINIMAX_INSTANCE_ID && cd.source === MINIMAX_ACCOUNT_SOURCE)
+    .map((cd) => cd.model);
+  // Drop the prior broadcast (any model — see wildcard branch below) so
+  // a recovered balance releases the cap without waiting on TTL.
+  for (const model of previouslyCappedModels) {
+    registry.clearWhere((cd) =>
+      cd.instanceId === MINIMAX_INSTANCE_ID
+      && cd.source === MINIMAX_ACCOUNT_SOURCE
+      && cd.model === model,
+    );
+  }
+  if (!isAccountLevelCap(snapshot)) return { capped: false };
+  const resetsAt = pickResetsAt(snapshot);
+  registry.recordInstanceCap(MINIMAX_INSTANCE_ID, "*", {
+    resetsAt,
+    error: snapshot.source === "account-balance"
+      ? "MiniMax account balance exhausted"
+      : "MiniMax Token Plan exhausted",
+    source: MINIMAX_ACCOUNT_SOURCE,
+  });
+  return { capped: true };
+}
+
+function pickResetsAt(snapshot: MiniMaxBalanceSnapshot): number | null {
+  if (snapshot.source === "account-balance") return null;
+  const general = snapshot.models?.general;
+  if (!general) return null;
+  const interval = general.intervalResetsAt ?? general.resetsAt ?? null;
+  const weekly = general.weeklyResetsAt ?? null;
+  if (interval != null && weekly != null) return Math.min(interval, weekly);
+  if (interval != null) return interval;
+  if (weekly != null) return weekly;
+  return null;
 }
 
 type LocalMiniMaxConfig = ReturnType<typeof loadLocalMiniMaxConfig>;
