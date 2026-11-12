@@ -143,6 +143,34 @@ public enum BotExecutionPolicy {
         !BotComputers.holdsThisMac(computers)
     }
 
+    /// What the sheet shows for the second switch.
+    ///
+    /// Turning it on is the computer's when the bot can use This Mac, the same
+    /// 403 the profile route answers.  Turning it off is always the phone's,
+    /// including then, so a switch the computer turned on is not stuck on.
+    /// While Bypass itself is off and this switch is off, there is nothing to
+    /// switch: the row says so instead of a control that does nothing.
+    public enum LocalBypassControl: Equatable {
+        case toggle
+        case macOnly
+        case needsBypass
+    }
+
+    public static func localBypassControl(
+        computers: [String]?,
+        bypassOn: Bool,
+        localBypassOn: Bool
+    ) -> LocalBypassControl {
+        if localBypassOn { return .toggle }
+        if !mayTurnOnLocalBypass(computers: computers) { return .macOnly }
+        if !bypassOn { return .needsBypass }
+        return .toggle
+    }
+
+    /// The computer's own refusal, plus the half the phone still owns.
+    public static let localBypassMacOnlyNote =
+        "Bypass Including This Mac can only be turned on in BotFleet on your computer for a bot that can use This Mac.\u{00A0} Turning it off works from here."
+
     public static let localBypassTitle = "Enable Bypass Including This Mac?"
 
     public static let localBypassConfirmButton = "Enable Bypass Including This Mac"

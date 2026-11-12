@@ -258,19 +258,19 @@ const AGENT_MARKER = new RegExp(`\\[\\s*(?:ag|${AGENT_NAMES})\\s*\\]`, "gi");
 // so the final rendered-body assertion tests for that form specifically.
 const AGENT_NAME_DENY = new RegExp(`(?:\\b(?:${AGENT_NAMES})\\b|\\[\\s*ag\\s*\\])`, "i");
 
-function centralTimestamp(now = new Date()) {
-  // FLEET-PROTOCOL renders "Mon, Aug 12, 2026 at 1:15 AM CT". One combined
-  // Intl call yields "Mon, Aug 12, 2026, 1:15 AM" (comma, not "at"), so build
-  // the two halves separately. America/Chicago handles CDT/CST automatically.
+export function centralTimestamp(now = new Date()) {
+  // TestFlight "Released:" line: owner's clock in America/Chicago, 12-hour
+  // lowercase am/pm, zone never named (Usage-Monitor #1693).
   const d = new Intl.DateTimeFormat("en-US", {
     timeZone: "America/Chicago",
     weekday: "short", month: "short", day: "numeric", year: "numeric"
   }).format(now);
-  const t = new Intl.DateTimeFormat("en-US", {
+  let t = new Intl.DateTimeFormat("en-US", {
     timeZone: "America/Chicago",
     hour: "numeric", minute: "2-digit", hour12: true
   }).format(now);
-  return `${d} at ${t} CT`;
+  t = t.replace(/\u202F/g, "").replace(/\s*(AM|PM)\s*$/i, (_, ap) => ap.toLowerCase());
+  return `${d} at ${t}`;
 }
 
 function gitSubjects(repoRoot, prevSha) {

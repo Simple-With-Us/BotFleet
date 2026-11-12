@@ -125,22 +125,33 @@ public struct KaraokeDisplay: Equatable, Sendable {
 /// What one block shows of the karaoke frame, in the block's own UTF-16
 /// offsets.  Equatable, so a block whose paint did not change is left alone.
 public struct KaraokeBlockPaint: Equatable, Sendable {
-    /// The current word's part already spoken ("rolling in").
+    /// The whole word being spoken. The peak of the emphasis window.
+    public var peak: Range<Int>?
+    /// The part of that word already spoken ("rolling in").
     public var lit: Range<Int>?
-    /// Words just spoken, fading back to normal ink; level 0 is strongest.
+    /// Words just ahead, easing off; level 0 is the next word.
+    public var lead: [Lead] = []
+    /// Words just spoken, easing off; level 0 is the nearest.
     public var trail: [Trail] = []
+
+    public struct Lead: Equatable, Sendable {
+        public let range: Range<Int>
+        public let level: Int
+    }
 
     public struct Trail: Equatable, Sendable {
         public let range: Range<Int>
         public let level: Int
     }
 
-    public init(lit: Range<Int>? = nil, trail: [Trail] = []) {
+    public init(peak: Range<Int>? = nil, lit: Range<Int>? = nil, lead: [Lead] = [], trail: [Trail] = []) {
+        self.peak = peak
         self.lit = lit
+        self.lead = lead
         self.trail = trail
     }
 
-    public var isEmpty: Bool { lit == nil && trail.isEmpty }
+    public var isEmpty: Bool { peak == nil && lit == nil && lead.isEmpty && trail.isEmpty }
 }
 
 extension KaraokeDisplay {
@@ -151,7 +162,14 @@ extension KaraokeDisplay {
         if frame.current >= 0, frame.current < places.count, frame.lit > 0 {
             let place = places[frame.current]
             let end = min(place.end, place.start + frame.lit)
+            out[place.block, default: KaraokeBlockPaint()].peak = place.start..<place.end
             out[place.block, default: KaraokeBlockPaint()].lit = place.start..<end
+        }
+        for lead in frame.lead where lead.index >= 0 && lead.index < places.count {
+            let place = places[lead.index]
+            out[place.block, default: KaraokeBlockPaint()].lead.append(
+                KaraokeBlockPaint.Lead(range: place.start..<place.end, level: lead.level)
+            )
         }
         for trail in frame.trail where trail.index >= 0 && trail.index < places.count {
             let place = places[trail.index]
