@@ -439,6 +439,10 @@ export interface SendTurnInput {
      * Completions API expects.  Default is an empty object schema. */
     parameters?: { type: "object"; properties?: Record<string, unknown>; required?: string[] };
   }>;
+  /** Characters of a tool result kept in replayed history after the round
+   *  that saw the full text.  Absent uses 8,000.  `0` leaves every result
+   *  whole.  See server/tool-result-history.ts. */
+  toolResultHistoryChars?: number;
   /** Per-bot integrations the driver may hand to the agent as tools. */
   integrations?: {
     /** A local stdio bridge owns the remote Composio transport. Keeping the
@@ -779,6 +783,11 @@ export interface ProviderAdapter {
    * correct implementation always returns `[]` — a non-empty return is a bug
    * report, which is exactly why it is worth the six lines. */
   sweepStuckTurns?(olderThanMs: number): Promise<ThreadId[]>;
+  /** Threads whose provider request is in flight and was proven alive within
+   * the last probe interval (bytes arrived or a liveness probe answered).  The
+   * stall watchdog counts these as activity, so a slow local model that emits
+   * no events is not stopped before its own configured wait. */
+  liveTurnThreadIds?(): ThreadId[];
   onEvent(listener: RuntimeEventListener): () => void;
 }
 

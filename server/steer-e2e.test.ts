@@ -96,7 +96,7 @@ posixOnly("mid-turn steering e2e", () => {
       await waitFor(async () => (await getBot(created.id)).busy === true, "the turn to start");
       // the fake pauses after its tool result; this lands inside that gap
       await waitFor(async () => (await getBot(created.id)).messages.some((m: any) => m.kind === "activity"), "the tool chip");
-      const second = await api("POST", `/api/bots/${created.id}/messages`, { text: "and also this" });
+      const second = await api("POST", `/api/bots/${created.id}/messages`, { text: "and also this", busyDelivery: "steer" });
       expect(second.status).toBe(202);
       expect(second.body.steered).toBe(true);
 

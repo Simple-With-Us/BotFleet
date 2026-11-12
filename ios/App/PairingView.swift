@@ -54,11 +54,11 @@ struct PairingView: View {
                 .frame(maxWidth: .infinity)
             }
             .background(Color(uiColor: .systemGroupedBackground).ignoresSafeArea())
-            .navigationTitle("Connect computer")
+            .navigationTitle("Connect Computer")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Not now", action: onCancel)
+                    Button("Not Now", action: onCancel)
                         .disabled(!submission.allowsNavigation)
                 }
             }
@@ -80,7 +80,7 @@ struct PairingView: View {
             .fullScreenCover(isPresented: $showingScanner) {
                 PairingScannerSheet { payload in
                     guard let url = URL(string: payload), let invite = PairingInvite.parse(url) else {
-                        return "That isn't an BotFleet pairing QR code."
+                        return "That isn’t a BotFleet pairing QR code."
                     }
                     accept(invite)
                     return nil
@@ -103,10 +103,10 @@ struct PairingView: View {
             .accessibilityHidden(true)
 
             VStack(spacing: 8) {
-                Text("Connect to your computer")
+                Text("Connect to Your Computer")
                     .font(.title.bold())
                     .multilineTextAlignment(.center)
-                Text("Scan the QR code in BotFleet. We'll securely choose the best way to connect.")
+                Text("Scan the QR code in BotFleet.\u{00A0} We'll securely choose the best way to connect.")
                     .font(.body)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
@@ -122,7 +122,7 @@ struct PairingView: View {
                 failure = nil
                 showingScanner = true
             } label: {
-                Label("Scan QR code", systemImage: "qrcode.viewfinder")
+                Label("Scan QR Code", systemImage: "qrcode.viewfinder")
                     .font(.headline)
                     .frame(maxWidth: .infinity)
             }
@@ -148,13 +148,13 @@ struct PairingView: View {
                         manualEntry
                             .padding(.top, 12)
                     } label: {
-                        Label("Enter address and code", systemImage: "keyboard")
+                        Label("Enter Address and Code", systemImage: "keyboard")
                             .font(.subheadline.weight(.semibold))
                     }
                 }
                 .padding(.top, 18)
             } label: {
-                Text("Other ways to connect")
+                Text("Other Ways to Connect")
                     .font(.headline)
             }
         }
@@ -167,7 +167,7 @@ struct PairingView: View {
     private var discoveredComputers: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Label("Nearby computers", systemImage: "desktopcomputer")
+                Label("Nearby Computers", systemImage: "desktopcomputer")
                     .font(.subheadline.weight(.semibold))
                 Spacer()
                 if discovery.browsing && discovery.found.isEmpty {
@@ -232,7 +232,7 @@ struct PairingView: View {
                 Haptics.selection()
                 failure = nil
                 guard let connection = Self.parse(manualAddress) else {
-                    failure = "That address doesn't look right. Copy it from Phone settings and try again."
+                    failure = "That address doesn’t look right.\u{00A0} Copy it from Phone settings and try again."
                     return
                 }
                 choiceGeneration += 1
@@ -288,7 +288,7 @@ struct PairingView: View {
 
             if let credential = scannedCredential {
                 if !connectionIsProtected(connection) {
-                    Text("Only continue on a network you trust. Local connections are authenticated but are not encrypted by BotFleet.")
+                    Text("Only continue on a network you trust.\u{00A0} Local connections are authenticated but are not encrypted by BotFleet.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
@@ -342,7 +342,7 @@ struct PairingView: View {
                 }
             }
 
-            Button("Choose a different computer") {
+            Button("Choose a Different Computer") {
                 Haptics.selection()
                 chosen = nil
                 code = ""

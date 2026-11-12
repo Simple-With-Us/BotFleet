@@ -140,6 +140,19 @@ test("every protected check stays present and takes the same fail-closed scope o
   assert.doesNotMatch(source, /paths-ignore:/);
 });
 
+test("the application checkout keeps full history while filtering blobs within the job ceiling", () => {
+  const workflow = parse(readFileSync(join(ROOT, ".github/workflows/ci.yml"), "utf8"));
+  const job = workflow.jobs.test;
+  const checkout = job.steps.find((step) => String(step.uses ?? "").startsWith("actions/checkout@"));
+
+  assert.ok(checkout, "application checkout");
+  assert.equal(checkout.with.filter, "blob:none");
+  assert.equal(checkout.with["fetch-depth"], 0);
+  assert.equal(Object.hasOwn(checkout.with, "persist-credentials"), false);
+  assert.equal(job["timeout-minutes"], "${{ matrix.os == 'macos-15' && 35 || 25 }}");
+  assert.equal(job.steps.some((step) => step.run === "pnpm test"), true);
+});
+
 test("the scope is the pull request's own changes,  and both jobs use the one script", () => {
   const workflow = parse(readFileSync(join(ROOT, ".github/workflows/ci.yml"), "utf8"));
   const scopeScript = readFileSync(join(ROOT, "scripts/ci-scope-diff.sh"), "utf8");
@@ -367,6 +380,9 @@ test("the weekly full run is registered with the Sentry cron reporter", () => {
   const schedule = workflow.on.schedule[0].cron;
   const testJob = workflow.jobs.test;
   const testMatrix = testJob.strategy.matrix.include;
+  // TEMP BF-2066/BF-2627: both required check names run on ubuntu-latest while
+  // hosted macos runners stay unallocated.  Budget is 25 for both until the
+  // macos-15 matrix leg returns.
   const testTimeoutExpression = "${{ matrix.os == 'macos-15' && 35 || 25 }}";
   const matrixBudgets = testMatrix.map(({ os, check }) => [
     check,
@@ -374,7 +390,7 @@ test("the weekly full run is registered with the Sentry cron reporter", () => {
   ]);
   assert.equal(testJob["timeout-minutes"], testTimeoutExpression);
   assert.deepEqual(matrixBudgets, [
-    ["macos-latest", 35],
+    ["macos-latest", 25],
     ["ubuntu-latest", 25],
   ]);
   const otherJobTimeouts = Object.values(workflow.jobs)
@@ -415,8 +431,10 @@ test("every host runs the canonical complete test chain without masking failures
   // allocate a runner (BF-2066) and macos-14 is retiring (BF-2587), so
   // the mac leg runs on macos-15.  Ubuntu keeps its own label.
   assert.equal(job.name, "typecheck + test (${{ matrix.check }})");
+  // TEMP BF-2066/BF-2627: required "macos-latest" context runs on ubuntu until
+  // hosted macos-15 runners allocate again.  Check names stay required by ruleset.
   assert.deepEqual(job.strategy.matrix.include, [
-    { os: "macos-15", check: "macos-latest" },
+    { os: "ubuntu-latest", check: "macos-latest" },
     { os: "ubuntu-latest", check: "ubuntu-latest" },
   ]);
   assert.match(String(job["runs-on"]), /matrix\.os/);

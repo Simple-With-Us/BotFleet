@@ -8,6 +8,7 @@
 // stop nesting.
 import type { Message } from "./store.ts";
 import type { ToolKind } from "../shared/tool-activity.ts";
+import { reconcileLifecycleToolOk } from "../shared/lifecycle-tool.ts";
 import { redactSecretsInText } from "./redact.ts";
 
 export type ToolRow = NonNullable<Message["tool"]>;
@@ -52,9 +53,11 @@ export function completedToolRow(
   event: { ok: boolean; detail?: string; title?: string },
   durationMs: number | undefined,
 ): ToolRow {
+  const title = event.title ?? existing?.name;
+  const ok = reconcileLifecycleToolOk(event.ok, title, event.detail ?? existing?.detail);
   return {
     name: redactToolTitle(event.title) ?? existing?.name ?? "tool",
-    ok: event.ok,
+    ok,
     spoken: existing?.spoken,
     target: existing?.target,
     kind: existing?.kind,

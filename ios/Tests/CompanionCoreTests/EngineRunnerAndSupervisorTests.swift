@@ -326,7 +326,6 @@ struct EngineRunnerAndSupervisorTests {
             arguments: ["-c", "echo 'READY'; /bin/sleep 30"]
         )
 
-        let startNanos = DispatchTime.now().uptimeNanoseconds
         let stream = try await supervisor.runSupervisedTurnStream(
             spec: crashSpec,
             threadId: "thread-sigkill",
@@ -339,15 +338,20 @@ struct EngineRunnerAndSupervisorTests {
         }
 
         var receivedEvents: [TurnEvent] = []
+        var killedAt: UInt64?
         for await event in stream {
             receivedEvents.append(event)
             if event == .textDelta("READY") {
-                if let pid = await supervisor.activePID(forThread: "thread-sigkill") {
-                    _ = Darwin.kill(pid, SIGKILL)
-                }
+                let activePID = await supervisor.activePID(forThread: "thread-sigkill")
+                let pid = try #require(activePID)
+                // Measure post-signal recovery, excluding process launch and readiness scheduling.
+                let signalAt = DispatchTime.now().uptimeNanoseconds
+                try #require(Darwin.kill(pid, SIGKILL) == 0)
+                killedAt = signalAt
             }
         }
 
+        let startNanos = try #require(killedAt)
         let elapsedSeconds = Double(DispatchTime.now().uptimeNanoseconds - startNanos) / 1_000_000_000.0
         #expect(elapsedSeconds < 2.0, "Expected SIGKILL recovery in < 2.0s, took \(elapsedSeconds)s")
         #expect(receivedEvents.first == .textDelta("READY"))

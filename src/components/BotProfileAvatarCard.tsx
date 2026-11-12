@@ -90,12 +90,12 @@ export function BotProfileAvatarCard({
       // follows the file.  Anything else keeps the crop an upload would
       // have had, which is what stops a plain picture from being left in a
       // crop that cannot draw it.
-      // A pack that carries a manifest is flagged recolorable.  Nothing draws
+      // Manifest packs are shell-recolourable (TV-Face bezel).  Nothing draws
       // that recolor yet, so the Color row stays off for the animated crop.
       onPatch({
         avatarUrl,
         avatarCrop: carriesManifest ? "animated" : avatarCropAfterUpload(latestCrop),
-        recolorable: carriesManifest,
+        recolorable: carriesManifest ? "shell" : "none",
       });
     } catch (uploadError) {
       setError(uploadError instanceof Error ? uploadError.message : String(uploadError));
@@ -107,7 +107,7 @@ export function BotProfileAvatarCard({
 
   const removeImage = () => {
     setError(null);
-    onPatch({ avatarUrl: null, avatarCrop: "mascot", recolorable: false });
+    onPatch({ avatarUrl: null, avatarCrop: "mascot", recolorable: "none" });
   };
 
   return (
@@ -120,7 +120,7 @@ export function BotProfileAvatarCard({
               avatarCrop: "mascot",
               color: "green",
               mascotExpression: null,
-              recolorable: false,
+              recolorable: "none",
             })
           }
           className="rounded-md px-2 py-1.5 text-[13px] text-ink-secondary hover:bg-control hover:text-ink"

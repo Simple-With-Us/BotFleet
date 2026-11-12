@@ -13,10 +13,11 @@
  *  refused with the current pair, the same fence every placement message
  *  crosses.
  *
- *  What this slice does not do:  nothing reads the record yet.  The registry
- *  bridge (slice T4) is the reader, so until it lands a written mode changes
- *  no behaviour and `acknowledged` is a statement about the record alone, never
- *  about what this server runs.  All sixteen placement assertions stay false. */
+ *  What this slice does not do:  read the record back.  The registry bridge
+ *  (slice T4) is the reader, and it has landed, so a written mode changes
+ *  behaviour now.  `acknowledged` is still a statement about the record alone,
+ *  never about what this server runs.  All sixteen placement assertions stay
+ *  false. */
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
@@ -265,8 +266,9 @@ export interface PlacementModeBody {
   serverId: string | null;
   allowOverflowToThisMac: boolean;
   /** The controller holds the record at the fence above.  It is not a claim
-   *  about what this server runs:  nothing reads the record until the
-   *  registry bridge lands. */
+   *  about what this server runs:  it says the controller holds the record at
+   *  the fence, and nothing more.  The registry bridge reads the record since
+   *  T4, so the mode reaches the registry. */
   acknowledged: boolean;
   appliedAt: number | null;
   reason: string | null;

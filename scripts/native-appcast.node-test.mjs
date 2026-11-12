@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createPrivateKey, createPublicKey, sign } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -14,6 +15,10 @@ import {
 import { verifyNativeRelease } from "./verify-native-release.mjs";
 
 const VERSION = "1.0.2200";
+const privateKey = createPrivateKey({ key: Buffer.concat([
+  Buffer.from("302e020100300506032b657004220420", "hex"), Buffer.alloc(32, 77),
+]), format: "der", type: "pkcs8" });
+const publicKey = createPublicKey(privateKey).export({ format: "der", type: "spki" }).subarray(-32).toString("base64");
 
 function fixture({ signed = false } = {}) {
   const directory = mkdtempSync(join(tmpdir(), "botfleet-native-release-"));
@@ -23,7 +28,7 @@ function fixture({ signed = false } = {}) {
   if (signed) {
     writeFileSync(
       join(directory, `${zip}.edsig`),
-      "c2lnbmF0dXJlLWJ5dGVzLWZvci10aGUtc3RhcGxlZC16aXAtMDAxMjM0NTY3ODk=",
+      sign(null, readFileSync(join(directory, zip)), privateKey).toString("base64"),
     );
   }
   return directory;
@@ -57,7 +62,7 @@ test("a signed sidecar lands in the enclosure and satisfies the signature gate",
     const { signed } = generateAppcast({ releaseDir: directory, version: VERSION });
     assert.equal(signed, true);
     assert.doesNotThrow(() =>
-      verifyNativeRelease(directory, VERSION, { requireSignature: true }),
+      verifyNativeRelease(directory, VERSION, { requireSignature: true, publicKey }),
     );
   } finally {
     rmSync(directory, { recursive: true, force: true });

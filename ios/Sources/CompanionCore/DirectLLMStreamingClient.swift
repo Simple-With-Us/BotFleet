@@ -273,7 +273,7 @@ public final class DirectLLMStreamingClient: Sendable {
             resolvedSecret = try await resolver.resolveSecret(forKey: secretKey)
         } catch let error as InfisicalResolverError {
             switch error {
-            case .missingMachineIdentity, .secretNotFound:
+            case .integrationDisabled, .missingMachineIdentity, .secretNotFound:
                 throw DirectLLMStreamError.missingAPIKey(secretKey: secretKey)
             default:
                 throw error

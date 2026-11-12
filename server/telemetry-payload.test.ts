@@ -690,6 +690,9 @@ describe("provider naming stays inside Usage Monitor's canon", () => {
     // instance's traffic; the zcode engine is attributed by providerForEngine.
     expect(inferProviderAndService("openrouter", "glm-4.6", "openai-compat").provider).toBe("openai-compat");
     expect(inferProviderAndService("zcode", "GLM-5.3", "zcode").provider).toBe("zcode");
+    // The ACP bridge kind bills the same GLM Coding Plan, so it names the
+    // same provider as the headless CLI.
+    expect(inferProviderAndService("zcodeAcp", "GLM-5.3", "zcodeAcp").provider).toBe("zcode");
   });
 
   it("keeps the two-argument form working exactly as before", () => {

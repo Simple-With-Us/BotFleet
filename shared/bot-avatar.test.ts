@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 
-import { botAvatarRecolorableSchema,
+import {
+  botAvatarRecolorableSchema,
+  isAvatarRecolorable,
+  normalizeAvatarRecolorable,
   avatarCropAfterUpload,
   BOT_AVATAR_CROPS,
   GROUP_AVATAR_CROPS,
@@ -43,12 +46,24 @@ describe("the crop lists behind the shape selectors", () => {
 });
 
 describe("botAvatarRecolorableSchema", () => {
-  it("takes a boolean or nothing, and refuses anything else", () => {
-    expect(botAvatarRecolorableSchema.safeParse(true).success).toBe(true);
-    expect(botAvatarRecolorableSchema.safeParse(false).success).toBe(true);
+  it("accepts none/shell/full, legacy booleans, and nothing", () => {
+    expect(botAvatarRecolorableSchema.safeParse("none").success).toBe(true);
+    expect(botAvatarRecolorableSchema.safeParse("shell").success).toBe(true);
+    expect(botAvatarRecolorableSchema.safeParse("full").success).toBe(true);
+    expect(botAvatarRecolorableSchema.safeParse(true).data).toBe("shell");
+    expect(botAvatarRecolorableSchema.safeParse(false).data).toBe("none");
     expect(botAvatarRecolorableSchema.safeParse(undefined).success).toBe(true);
-    for (const value of ["true", 1, null, {}]) {
+    for (const value of ["true", 1, null, {}, "partial"]) {
       expect(botAvatarRecolorableSchema.safeParse(value).success).toBe(false);
     }
+  });
+
+  it("normalises and reports whether Color can recolour", () => {
+    expect(normalizeAvatarRecolorable(true)).toBe("shell");
+    expect(normalizeAvatarRecolorable(false)).toBe("none");
+    expect(normalizeAvatarRecolorable("full")).toBe("full");
+    expect(isAvatarRecolorable("shell")).toBe(true);
+    expect(isAvatarRecolorable("none")).toBe(false);
+    expect(isAvatarRecolorable(true)).toBe(true);
   });
 });

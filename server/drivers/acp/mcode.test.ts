@@ -9,6 +9,8 @@ import type { ModelCatalog, ProviderInstance } from "../../contracts.ts";
 import { removeTempDir } from "../../testing/cleanup.ts";
 import { recordEvents, type EventRecorder } from "../../testing/events.ts";
 import {
+  botNameFromPersona,
+  mcodePromptPrefix,
   MCODE_EFFORT_CONFIG_ID,
   MCODE_M31_EFFORT_LEVELS,
   McodeAgentDriver,
@@ -717,5 +719,51 @@ describe("MiniMax Code reasoning effort over ACP", () => {
     await create();
 
     expect(instance!.adapter.capabilities?.effortLevels).toEqual(["low", "medium", "high", "xhigh", "max"]);
+  });
+});
+
+describe("botNameFromPersona", () => {
+  it("reads the name the harness persona opens with", () => {
+    const persona = "You are Fixer (display: Fixer), a bot in BotFleet. Role: Engineer.";
+    expect(botNameFromPersona(persona)).toBe("Fixer");
+  });
+
+  it("reads it out of the room persona too", () => {
+    const persona = 'You are Deployer (display: Deployer), a bot in the room "Ops" in BotFleet.';
+    expect(botNameFromPersona(persona)).toBe("Deployer");
+  });
+
+  it("is null for anything that is not a BotFleet persona", () => {
+    expect(botNameFromPersona(undefined)).toBeNull();
+    expect(botNameFromPersona("")).toBeNull();
+    expect(botNameFromPersona("Summarise this file.")).toBeNull();
+    // A leading preamble defeats the anchored read on purpose: better no
+    // marker than a marker naming the wrong thing.
+    expect(botNameFromPersona("Note: You are Fixer (display: Fixer).")).toBeNull();
+  });
+});
+
+describe("mcodePromptPrefix", () => {
+  const persona = (name: string) => `You are ${name} (display: ${name}), a bot in BotFleet.`;
+
+  it("is the bot's configured name, exactly as written, for a new session", () => {
+    for (const name of ["Plumber", "Team Scout", "Zed-9 Prime", "ab-cd Name", "BF-Plumber", "BF Plumber", "BF-BF-Plumber", "GB-Plumber"]) {
+      expect(mcodePromptPrefix({ system: persona(name) }, { newSession: true })).toBe(`[${name}]\n\n`);
+    }
+  });
+
+  it("shows a name that already carries a prefix exactly once, unchanged", () => {
+    const marker = mcodePromptPrefix({ system: persona("BF-Plumber") }, { newSession: true });
+    expect(marker).toBe("[BF-Plumber]\n\n");
+    expect(marker?.match(/BF/g)).toHaveLength(1);
+  });
+
+  it("is absent for a session that already has its marker", () => {
+    expect(mcodePromptPrefix({ system: persona("Plumber") }, { newSession: false })).toBeUndefined();
+  });
+
+  it("is absent without a BotFleet persona", () => {
+    expect(mcodePromptPrefix({}, { newSession: true })).toBeUndefined();
+    expect(mcodePromptPrefix({ system: "Be brief." }, { newSession: true })).toBeUndefined();
   });
 });
