@@ -38,7 +38,15 @@
 // box / Local VM / VPS / local computer) is mounted by upserting keys into the
 // global `~/.gemini/config/mcp_config.json` before each spawn — see
 // ensureAntigravityMcp below.
-import { describeSpawnFailure, execCli, killCliTree, spawnCli } from "../procs.ts";
+import {
+  classifyVersionProbeFailure,
+  describeSpawnFailure,
+  execCli,
+  killCliTree,
+  LastKnownAnswer,
+  logProbeFailure,
+  spawnCli,
+} from "../procs.ts";
 import { classifyError, computeBackoff, interruptibleDelay, RETRY_MAX_ATTEMPTS } from "./retry.ts";
 import { stderrExcerpt } from "../stderr-excerpt.ts";
 import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
@@ -51,6 +59,8 @@ import { DATA_DIR, stripWorkspaceCredentialEnv } from "../config.ts";
 import { computerProxyEnv } from "../container-computer.ts";
 import { augmentedPath } from "../env-path.ts";
 import { toolFields } from "../tool-fields.ts";
+import { describeResult } from "../../shared/tool-activity.ts";
+import { captureInput, captureOutput } from "../../shared/item-io.ts";
 import { SPAWNED_PROXIES } from "../proxy-paths.ts";
 import { injectedApiModel, mergeLocalInject } from "./local-inject.ts";
 
@@ -65,6 +75,7 @@ import type {
   SendTurnInput,
 } from "../contracts.ts";
 import { newEventId, newId } from "../contracts.ts";
+import { cliLoginEnvironment, launchedChildEnvironment, primeCliLogin } from "../cli-logins.ts";
 import { appendNative } from "./native.ts";
 
 const DRIVER_KIND = "antigravityAgent";
@@ -346,7 +357,7 @@ const mcpConfigFileSchema = z.looseObject({
 /** The computer MCP server for this turn, or null when the turn has none.
  * Cloud boxes go through BotFleet's REST-to-MCP adapter (the same spec
  * claude.ts and codex.ts build); Local VM and VPS connections arrive as a
- * ready-made Cua Driver stdio command and pass through unchanged. */
+ * ready-made CUA Driver stdio command and pass through unchanged. */
 export function antigravityMcpServers(
   integrations: SendTurnInput["integrations"],
 ): Record<string, { command: string; args: string[]; env: Record<string, string> }> {
@@ -363,6 +374,7 @@ export function antigravityMcpServers(
           env: {
             ELECTRON_RUN_AS_NODE: "1",
             OGB_BOX_ID: proxyEnv.OGB_BOX_ID ?? "",
+            OGB_BOX_API: proxyEnv.OGB_BOX_API ?? "",
             OGB_BOX_TOKEN: proxyEnv.OGB_BOX_TOKEN ?? "",
             OMB_CONTROL_URL: proxyEnv.OMB_CONTROL_URL ?? "",
             OMB_CONTROL_TOKEN: proxyEnv.OMB_CONTROL_TOKEN ?? "",
@@ -638,7 +650,12 @@ export function antigravityTurnErrorMessage(result: AntigravityTurnResult): stri
 
 export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
   driverKind: DRIVER_KIND,
-  metadata: { displayName: "Antigravity", supportsMultipleInstances: true },
+  metadata: {
+    displayName: "Antigravity",
+    supportsMultipleInstances: true,
+    // Mirrors the `capabilities` block in `create` below.
+    channelWiring: { agentsMcp: true, computerMcp: true, composioMcp: true, localComputerMcp: true, images: true },
+  },
   install: {
     command: {
       darwin: "curl -fsSL https://antigravity.google/cli/install.sh | bash",
@@ -718,6 +735,11 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
     const sendTurn = async (turn: SendTurnInput) => {
       const { threadId } = turn;
       if (disposed) throw new Error("Antigravity instance is disposed");
+      // The seat's CLI login is read in the BACKGROUND, and the read is started
+      // here, before the guard:  the guard and the registration that follows it
+      // have to stay free of `await`, or a second turn on this thread would walk
+      // through the guard the first one already passed.
+      primeCliLogin(turn.launchIdentity?.seat);
       if (active.has(threadId) || pending.has(threadId)) throw new Error("a turn is already running on this thread");
       pending.add(threadId);
       const turnId = newId();
@@ -751,9 +773,18 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       // bot-level autoApprove flag flip fullAuto for sandbox/cloud/VM turns
       // would silently promote an engine-level security gate the owner never
       // switched on.  Non-host turns keep exactly what config.fullAuto says.
+      //
+      // Bypass Permissions is the other per-bot switch, and the one the
+      // person turned on precisely to have nothing ask.  Print mode has no
+      // broker to carry it, so it is this driver's to apply, to the turns
+      // where it is safe to: never one that controls This Mac, the same line
+      // the broker draws (`autoVerdict` never answers a `local-computer`
+      // request in bypass), and, like the broker's bypass, even an unattended
+      // turn.  A host turn keeps exactly the rule above.
+      const isBypassed = turn.bypassPermissions === true && !controlsHost;
       const turnConfig: AntigravityConfig = {
         ...config,
-        fullAuto: controlsHost ? isAutoApproved : config.fullAuto,
+        fullAuto: controlsHost ? isAutoApproved : config.fullAuto || isBypassed,
       };
 
       // Default cwd to a per-thread workspace under DATA_DIR — deliberately
@@ -914,7 +945,9 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       try {
         child = spawnCli(config.cli, args, {
           cwd,
-          env,
+          // `env` is built once per instance and shared by every turn; the
+          // launch identity is this bot's and this turn's, applied to a copy.
+          env: launchedChildEnvironment(env, turn.launchIdentity, cliLoginEnvironment(turn.launchIdentity?.seat)),
           stdio: [useStdin ? "pipe" : "ignore", "pipe", "pipe"],
         });
         if (useStdin && child.stdin) {
@@ -1141,6 +1174,12 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
               const itemId = `${conversationId ?? o.conversation_id ?? "conv"}:${payload.step_index}`;
               // a tool is running, or has run: a relaunch would repeat it
               sawOutput = true;
+              const rawInput =
+                payload.tool_info?.parameters ??
+                payload.tool_input ??
+                payload.input ??
+                payload.args ??
+                payload.parameters;
               if (payload.state === "ACTIVE") {
                 activeTools.add(itemId);
                 emit({
@@ -1149,17 +1188,50 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
                   itemType: "tool",
                   itemId,
                   title: payload.tool_name,
-                  ...toolFields(payload.tool_name, payload.tool_input ?? payload.input ?? payload.args),
+                  ...toolFields(payload.tool_name, rawInput, { cwd: turn.cwd }),
+                  ...captureInput(rawInput),
                 });
               } else {
                 // Any state other than ACTIVE means the step is no longer
                 // running (CANCELED included), so the longer tool window
                 // must not outlive it.
                 activeTools.delete(itemId);
+                const rawDetail =
+                  payload.output ??
+                  payload.tool_info?.output ??
+                  payload.result ??
+                  payload.tool_info?.result ??
+                  payload.tool_info?.error ??
+                  payload.error ??
+                  payload.content;
+                const detail = describeResult(rawDetail);
+                const outputIo = captureOutput(rawDetail);
+                const durationMs =
+                  typeof payload.duration_seconds === "number" && Number.isFinite(payload.duration_seconds)
+                    ? Math.round(payload.duration_seconds * 1000)
+                    : undefined;
                 if (payload.state === "DONE") {
-                  emit({ ...base(threadId, turnId), type: "item.completed", itemType: "tool", itemId, ok: true });
+                  emit({
+                    ...base(threadId, turnId),
+                    type: "item.completed",
+                    itemType: "tool",
+                    itemId,
+                    ok: true,
+                    ...(detail ? { detail } : {}),
+                    ...(durationMs ? { durationMs } : {}),
+                    ...outputIo,
+                  });
                 } else if (payload.state === "ERROR") {
-                  emit({ ...base(threadId, turnId), type: "item.completed", itemType: "tool", itemId, ok: false });
+                  emit({
+                    ...base(threadId, turnId),
+                    type: "item.completed",
+                    itemType: "tool",
+                    itemId,
+                    ok: false,
+                    ...(detail ? { detail } : {}),
+                    ...(durationMs ? { durationMs } : {}),
+                    ...outputIo,
+                  });
                 }
               }
             } else if (payload.step_type === "agent_response") {
@@ -1454,13 +1526,36 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       return { turnId };
     };
 
+    const lastKnownVersion = new LastKnownAnswer<string>();
     const snapshot = async (): Promise<ProviderSnapshot> => {
-      const version = await new Promise<string | null>((resolve) => {
-        execCli(config.cli, ["--version"], { timeout: 8000, env }, (err, stdout) =>
-          resolve(err ? null : stdout.trim()),
-        );
+      // Its place among overlapping probes: taken before the process starts,
+      // so a slow older probe cannot replace what a newer one remembered.
+      const versionOrder = lastKnownVersion.begin();
+      const startedAt = Date.now();
+      const probed = await new Promise<{ version: string | null; error: Error | null }>((resolve) => {
+        execCli(config.cli, ["--version"], { timeout: 20000, env }, (err, stdout) => {
+          resolve({ version: err ? null : stdout.trim() || null, error: err });
+        });
       });
-      if (!version) return { state: "unavailable", reason: `\`${config.cli}\` CLI not found` };
+      let version = probed.version;
+      if (version) {
+        lastKnownVersion.record(version, versionOrder);
+      } else {
+        const elapsed = Date.now() - startedAt;
+        logProbeFailure(instanceId, `${config.cli} --version`, probed.error, elapsed);
+        const failure = classifyVersionProbeFailure(probed.error, config.cli, input.displayName || "Antigravity", elapsed, 20000);
+        const remembered = failure.kind === "transient" ? lastKnownVersion.get() : null;
+        if (remembered) {
+          // Only a probe that gave no answer may stand on the last good
+          // version.  A missing or crashing binary is a verdict.
+          version = remembered;
+        } else {
+          if (failure.kind !== "transient") lastKnownVersion.forget(versionOrder);
+          return failure.kind === "transient"
+            ? { state: "unavailable", transient: true, reason: failure.reason }
+            : { state: "unavailable", reason: failure.reason };
+        }
+      }
       // No auth field: agy auth is keyring-backed with no reliable file marker
       // (~/.gemini/antigravity-cli/ exists after first run even when logged
       // out), so any file heuristic would overstate "signed in". Leave undefined.
@@ -1501,6 +1596,14 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
           composioMcp: true,
           phoneMcp: true,
           qdrantMcp: true,
+          // Jobs matrix: BotFleet jobs are gated until their fixtures pass
+          // (P2b).  `invoke_subagent` is the tool name on the row, and the
+          // chat draws that row as a named helper card (jobs P3).
+          backgroundJobs: "none",
+          helpers: "named",
+          // Print mode has no permission hook (see the header), but every
+          // step streams as a tool_use event, so review can watch it.
+          reviewHook: "after",
         },
         sendTurn,
         interruptTurn: async (threadId) => active.get(threadId)?.stop(),

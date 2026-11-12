@@ -15,6 +15,7 @@ import { isQuotaOrCapText, parseQuotaResetTime } from "../model-fallback.ts";
 import type { ProviderInstance } from "../contracts.ts";
 import { SPAWNED_PROXIES } from "../proxy-paths.ts";
 import { recordEvents, type EventRecorder } from "../testing/events.ts";
+import { expectLaunchedAs, inheritHarnessIdentity, readEngineDump } from "../testing/launch-identity.ts";
 import { buildTurnEvents } from "../telemetry.ts";
 import {
   ANTIGRAVITY_COMPUTER_MCP_KEY,
@@ -260,11 +261,10 @@ describe("Antigravity turns (fake CLI)", () => {
       outputTokens: completed.usage?.output,
       cachedInputTokens: completed.usage?.cachedInput,
     });
-    expect(events.map((event) => [event.metadata.tokenType, event.quantity])).toEqual([
-      ["input", 100],
-      ["cacheRead", 5],
-      ["output", 20],
-    ]);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ quantity: 125, requests: 1, unit: "token" });
+    expect(events[0]!.ai?.tokens).toEqual({ input: 100, cacheRead: 5, output: 20 });
+    expect(events[0]!.metadata).not.toHaveProperty("tokenType");
     expect(events.reduce((total, event) => total + event.quantity, 0)).toBe(125);
   });
 
@@ -405,6 +405,42 @@ describe("Antigravity turns (fake CLI)", () => {
   it("respondToRequest resolves `unavailable` — no interactive permission channel, so the caller denies", async () => {
     await create();
     await expect(instance.adapter.respondToRequest("t-happy", "req-1", { behavior: "allow" })).resolves.toBe("unavailable");
+  });
+
+  it("launches each bot's agy with its own seat and none of the harness's identity, from one shared instance", async () => {
+    const restore = inheritHarnessIdentity();
+    const dir = mkdtempSync(join(tmpdir(), "omb-agy-launch-"));
+    const dump = join(dir, "dump.json");
+    const inst = await AntigravityDriver.create({
+      instanceId: "agy-launch",
+      displayName: undefined,
+      // an instance-level identity must not survive either
+      environment: { FAKE_AGY_DUMP: dump, AGENT_SEAT: "CODEX", ZULIP_API_KEY: "instance-api-key" },
+      enabled: true,
+      config: AntigravityDriver.decodeConfig({ cli: FAKE_CLI }),
+    });
+    const rec = recordEvents(inst.adapter);
+    const seenFor = async (threadId: string, launchIdentity: { seat: string | null; session: string } | undefined) => {
+      const started = await inst.adapter.sendTurn({ threadId, text: "hi", launchIdentity });
+      await rec.until((e) => e.type === "turn.completed" && e.turnId === started.turnId);
+      return readEngineDump(dump).env;
+    };
+    try {
+      const plumber = await seenFor("t-agy-plumber", { seat: "BF-PLUMBER", session: "t-agy-plumber" });
+      const fixer = await seenFor("t-agy-fixer", { seat: "BF-FIXER", session: "t-agy-fixer" });
+      const none = await seenFor("t-agy-none", { seat: null, session: "t-agy-none" });
+      const bare = await seenFor("t-agy-bare", undefined);
+      expectLaunchedAs(plumber, { seat: "BF-PLUMBER", session: "t-agy-plumber" });
+      expectLaunchedAs(fixer, { seat: "BF-FIXER", session: "t-agy-fixer" });
+      expectLaunchedAs(none, { seat: null, session: "t-agy-none" });
+      expectLaunchedAs(bare, { seat: null });
+      expect(JSON.stringify([plumber, fixer, none, bare])).not.toContain("instance-api-key");
+    } finally {
+      rec.stop();
+      await inst.dispose();
+      restore();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("spawns agy with --mode accept-edits by default, and the bypass only when opted in", async () => {
@@ -715,7 +751,8 @@ describe("Antigravity computer MCP config", () => {
     computer: {
       kind: "box" as const,
       boxId: "bx_1",
-      token: "box-tok",
+      token: "box-grant",
+      gatewayUrl: "http://127.0.0.1:8799/api/local/box-gateway",
       control: { url: "http://127.0.0.1:9/control", token: "ctl-tok" },
     },
   };
@@ -727,8 +764,9 @@ describe("Antigravity computer MCP config", () => {
       args: [SPAWNED_PROXIES.computer],
       env: {
         ELECTRON_RUN_AS_NODE: "1",
+        OGB_BOX_API: "http://127.0.0.1:8799/api/local/box-gateway",
         OGB_BOX_ID: "bx_1",
-        OGB_BOX_TOKEN: "box-tok",
+        OGB_BOX_TOKEN: "box-grant",
         OMB_CONTROL_URL: "http://127.0.0.1:9/control",
         OMB_CONTROL_TOKEN: "ctl-tok",
       },
@@ -892,6 +930,12 @@ describe("Antigravity computer MCP config", () => {
       expect(acceptEdits.adapter.capabilities.computerMcp).toBe(true);
       expect(acceptEdits.adapter.capabilities.localComputerMcp).toBe(true);
       expect(acceptEdits.adapter.capabilities.agentsMcp).toBe(true);
+      // No permission hook in print mode, in either mode: auto-review can
+      // only watch each step as it streams, and no turn can be held.
+      for (const instance of [fullAuto, acceptEdits]) {
+        expect(instance.adapter.capabilities.reviewHook).toBe("after");
+        expect(instance.adapter.capabilities.asksWhenHeld).toBeUndefined();
+      }
     } finally {
       await fullAuto.dispose();
       await acceptEdits.dispose();
@@ -1291,6 +1335,7 @@ describe("Antigravity host control", () => {
     beforeDispose?: () => Promise<void>,
     autoApprove?: boolean,
     unattended?: boolean,
+    bypassPermissions?: boolean,
   ) => {
     const dump = join(home, `${name}.json`);
     const instance = await AntigravityDriver.create({
@@ -1302,7 +1347,14 @@ describe("Antigravity host control", () => {
     });
     const recorder = recordEvents(instance.adapter);
     try {
-      await instance.adapter.sendTurn({ threadId: `t-host-${name}`, text: "hi", integrations, autoApprove, unattended });
+      await instance.adapter.sendTurn({
+        threadId: `t-host-${name}`,
+        text: "hi",
+        integrations,
+        autoApprove,
+        unattended,
+        bypassPermissions,
+      });
       await recorder.until((e) => e.type === "turn.completed");
       if (beforeDispose) await beforeDispose();
       return {
@@ -1348,6 +1400,43 @@ describe("Antigravity host control", () => {
     expect(sandbox.argv).not.toContain("--dangerously-skip-permissions");
     const mode = sandbox.argv.indexOf("--mode");
     expect(sandbox.argv.slice(mode, mode + 2)).toEqual(["--mode", "accept-edits"]);
+  });
+
+  it("carries a bot's Bypass Permissions to a turn that does not control this computer", async () => {
+    // Print mode has no approval cards, so the bot's own switch is the only
+    // way it can reach the engine's skip-permissions mode.  Without it a bot
+    // the person put in bypass had its shell commands refused by agy and
+    // nothing to approve them.
+    const sandbox = await runTurn("sandbox-bypass", false, sandboxIntegrations, {}, undefined, false, false, true);
+    expect(sandbox.argv).toContain("--dangerously-skip-permissions");
+    expect(sandbox.argv).not.toContain("--mode");
+
+    const plain = await runTurn("plain-bypass", false, undefined, {}, undefined, false, false, true);
+    expect(plain.argv).toContain("--dangerously-skip-permissions");
+
+    // Off stays off: only the bot's switch (or the engine's) turns it on.
+    const off = await runTurn("sandbox-no-bypass", false, sandboxIntegrations, {}, undefined, false, false, false);
+    expect(off.argv).not.toContain("--dangerously-skip-permissions");
+  });
+
+  it("never lets Bypass Permissions reach a turn that controls this computer", async () => {
+    // The broker draws the same line: a bot in bypass is still asked about
+    // anything that controls This Mac.  Here there is no broker, so the
+    // bypass is dropped and the host-control notice says why.
+    const host = await runTurn("host-bypass", false, hostIntegrations, {}, undefined, false, false, true);
+    expect(host.argv).not.toContain("--dangerously-skip-permissions");
+    const mode = host.argv.indexOf("--mode");
+    expect(host.argv.slice(mode, mode + 2)).toEqual(["--mode", "accept-edits"]);
+
+    const viaComputers = await runTurn("host-computers-bypass", false, hostComputersIntegrations, {}, undefined, false, false, true);
+    expect(viaComputers.argv).not.toContain("--dangerously-skip-permissions");
+  });
+
+  it("applies Bypass Permissions to an unattended turn, as the broker's bypass does", async () => {
+    // Unlike autoApprove (withheld below), bypass is the person's standing
+    // choice to have nothing ask, webhook turns included.
+    const sandbox = await runTurn("sandbox-bypass-unattended", false, sandboxIntegrations, {}, undefined, false, true, true);
+    expect(sandbox.argv).toContain("--dangerously-skip-permissions");
   });
 
   it("withholds the bypass for an unattended host-control turn even with autoApprove", async () => {
@@ -1642,4 +1731,62 @@ describe("Antigravity host control", () => {
       host.events.some((e) => (e as any).title === ANTIGRAVITY_HOST_CONTROL_NOTICE),
     ).toBe(false);
   });
+});
+
+/** A CLI whose `--version` answers while `ok` exists and otherwise dies the
+ *  way the test asks (`mode`: exit or crash), so a test can take an engine
+ *  from working to broken between two snapshots. */
+function switchableCli(dir: string): { cli: string; setWorking: (working: boolean) => void; setMode: (mode: "exit" | "crash") => void } {
+  const cli = join(dir, "switchable-cli");
+  writeFileSync(
+    cli,
+    [
+      // A node-shebang script: env-path resolves it to `node <script>` on
+      // Windows, where a `#!/bin/sh` fixture cannot run at all.
+      "#!/usr/bin/env node",
+      'const fs = require("node:fs");',
+      `const dir = ${JSON.stringify(dir)};`,
+      'if (fs.existsSync(dir + "/ok")) { console.log("9.9.9"); process.exit(0); }',
+      'if (fs.readFileSync(dir + "/mode", "utf8") === "crash") process.kill(process.pid, "SIGSEGV");',
+      "process.exit(3)",
+      "",
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+  writeFileSync(join(dir, "mode"), "exit");
+  return {
+    cli,
+    setWorking: (working) => {
+      if (working) writeFileSync(join(dir, "ok"), "");
+      else rmSync(join(dir, "ok"), { force: true });
+    },
+    setMode: (mode) => writeFileSync(join(dir, "mode"), mode),
+  };
+}
+
+describe("Antigravity version reuse", () => {
+  // A SIGSEGV crash has no Windows equivalent: POSIX only.
+  for (const mode of (process.platform === "win32" ? (["exit"] as const) : (["exit", "crash"] as const))) {
+    it(`does not keep reporting the last version once the binary ${mode === "crash" ? "crashes" : "fails"} definitively`, async () => {
+      const dir = mkdtempSync(join(tmpdir(), "omb-switch-"));
+      const cli = switchableCli(dir);
+      const instance = await AntigravityDriver.create({
+        instanceId: `switch-${mode}`,
+        displayName: undefined,
+        environment: {},
+        enabled: true,
+        config: { cli: cli.cli, fullAuto: true },
+      });
+      cli.setWorking(true);
+      await instance.snapshot();
+      cli.setWorking(false);
+      cli.setMode(mode);
+      const second = await instance.snapshot();
+      expect(second.state).toBe("unavailable");
+      expect(second.transient).toBeUndefined();
+      expect(second.version).toBeUndefined();
+      await instance.dispose();
+      rmSync(dir, { recursive: true, force: true });
+    });
+  }
 });

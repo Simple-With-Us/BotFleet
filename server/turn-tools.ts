@@ -33,6 +33,12 @@ export function buildTurnTools(
     workspace?: unknown;
     recall?: unknown;
     phone?: unknown;
+    linq?: unknown;
+    /** The background job tools are mounted (jobs P1).  The dispatch derives
+     *  it once and hands the SAME value to the tool host. */
+    jobs?: unknown;
+    /** The bot's Zulip identity is connected (server/zulip/hub.ts). */
+    zulip?: unknown;
   },
   gate?: Partial<ToolGateContext>,
 ): ToolDefinition[] {
@@ -47,6 +53,9 @@ export function buildTurnTools(
     // wire catalog must derive it the same way host.ts's gate does, or the
     // two would disagree about whether github_* tools exist this turn.
     github: Boolean(integrations.localComputer),
+    linq: Boolean(integrations.linq ?? gate?.linq),
+    jobs: Boolean(integrations.jobs),
+    zulip: Boolean(integrations.zulip),
     commsDepth: 0,
     // The caller's own depth gate already ran; without explicit numbers the
     // registry ceiling must not subtract a second time.

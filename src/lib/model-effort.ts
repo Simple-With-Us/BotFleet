@@ -10,6 +10,7 @@ export interface ModelEffortSubject {
 export interface ModelOptionEffortSubject {
   id?: string;
   effortLevels?: readonly EffortLevel[];
+  defaultEffort?: EffortLevel;
   supportsEffort?: boolean;
 }
 
@@ -41,7 +42,10 @@ export function modelEffortLevels(
   const driverKind = (engine?.driverKind ?? "").toLowerCase();
 
   // Known engine + model rules:
-  // 1. DSH / DeepSeek Harness: MiniMax models do not support reasoning effort.
+  // 1. DSH / Harness: MiniMax rows without their own list do not support
+  //    reasoning effort.  A row that does declare one (MiniMax M3.1 once the
+  //    install's settings.yaml declares its reasoningEfforts) already returned
+  //    above, so only list-less rows such as M2.7 Highspeed reach this.
   if ((driverKind.includes("dsh") || driverKind.includes("deepseek")) && lowerId.includes("minimax")) {
     return [];
   }
@@ -74,3 +78,37 @@ export function modelSupportsEffort(
 ): boolean {
   return modelEffortLevels(engine, modelOption, modelId).length > 0;
 }
+
+/** The word a person reads for an effort level, shared by every control that
+ *  offers one so the chat picker and Settings cannot drift.  No level means the
+ *  bot sends none and the engine uses its own default. */
+export function effortLabel(level: EffortLevel | undefined): string {
+  if (level === undefined) return "Default";
+  // "xhigh" would otherwise read "Xhigh".
+  if (level === "xhigh") return "X-High";
+  return level.charAt(0).toUpperCase() + level.slice(1);
+}
+
+/**
+ * Returns the default reasoning effort level for a model on an engine when one
+ * is defined, or undefined when the engine/model has no explicit default.
+ */
+export function modelDefaultEffort(
+  _engine: ModelEffortSubject | null | undefined,
+  modelOption: ModelOptionEffortSubject | null | undefined,
+  modelId?: string,
+): EffortLevel | undefined {
+  if (modelOption && modelOption.effortLevels !== undefined && modelOption.effortLevels.length === 0) {
+    return undefined;
+  }
+  if (modelOption?.defaultEffort !== undefined) {
+    return modelOption.defaultEffort;
+  }
+  const effectiveId = (modelOption?.id ?? modelId ?? "").trim().toLowerCase();
+  if (effectiveId.includes("m3.1")) {
+    return "max";
+  }
+  return undefined;
+}
+
+

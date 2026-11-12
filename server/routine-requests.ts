@@ -232,6 +232,16 @@ export type ResolveRoutineRequestResult =
       resultId: string;
     };
 
+/**
+ * True when an "allow" answer actually carried the proposal out.  Approve All
+ * counts these and nothing else: a proposal whose subject changed after the card
+ * was shown comes back `invalid`, stays pending with `held` set and still owns
+ * the composer, and a duplicate or unknown answer settled nothing new.
+ */
+export function routineApprovalApplied(result: ResolveRoutineRequestResult): boolean {
+  return result.claimed && result.state === "applied";
+}
+
 export class RoutineRequestError extends Error {
   readonly status: number;
 

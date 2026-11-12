@@ -5,7 +5,7 @@
 //
 // The fake CLI is a shebang script Windows cannot exec directly; spawnCli
 // resolves it to `node <script>`, so these run everywhere.
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,6 +14,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ensureDirs } from "../config.ts";
 import type { ProviderInstance } from "../contracts.ts";
 import { recordEvents, type EventRecorder } from "../testing/events.ts";
+import { expectLaunchedAs, inheritHarnessIdentity } from "../testing/launch-identity.ts";
 import { encodeInjectId, localHost } from "./local-inject.ts";
 import {
   applyPiLocalCatalog,
@@ -108,17 +109,29 @@ describe("buildMcpServers", () => {
       threadId: "t",
       text: "hi",
       integrations: {
-        computer: { kind: "box", boxId: "b1", token: "tok", control: { url: "http://c", token: "ct" } },
+        computer: {
+          kind: "box",
+          boxId: "b1",
+          token: "tok",
+          gatewayUrl: "http://127.0.0.1:8799/api/local/box-gateway",
+          control: { url: "http://c", token: "ct" },
+        },
       },
     });
     expect(servers?.computer).toMatchObject({
       command: process.execPath,
       args: [expect.stringContaining("computer-proxy")],
-      env: expect.objectContaining({ OGB_BOX_ID: "b1", OGB_BOX_TOKEN: "tok" }),
+      env: expect.objectContaining({
+        OGB_BOX_ID: "b1",
+        OGB_BOX_TOKEN: "tok",
+        // The gateway base travels with the grant: a child holding only the
+        // token would fall back to the provider and present an account key.
+        OGB_BOX_API: "http://127.0.0.1:8799/api/local/box-gateway",
+      }),
     });
   });
 
-  it("passes a local computer (Cua/VPS) through as a direct stdio server", () => {
+  it("passes a local computer (CUA/VPS) through as a direct stdio server", () => {
     const servers = buildMcpServers({
       threadId: "t",
       text: "hi",
@@ -402,6 +415,12 @@ describe("PiDriver turns (fake CLI)", () => {
     expect(instance.adapter.capabilities.effortLevels).toEqual(["none", "low", "medium", "high", "xhigh", "max"]);
   });
 
+  it("tells auto-review it can only watch: pi runs its own tools without a card", async () => {
+    await create();
+    expect(instance.adapter.capabilities.reviewHook).toBe("after");
+    expect(instance.adapter.capabilities.asksWhenHeld).toBeUndefined();
+  });
+
   it("declares the shared-memory mount the dispatcher gates on", async () => {
     // The dispatcher only builds the qdrant integration for a driver that
     // says it can mount it, so the flag and the mount above stand or fall
@@ -489,6 +508,39 @@ describe("PiDriver turns (fake CLI)", () => {
     expect(JSON.stringify(rows)).not.toContain("openai-secret-value");
   });
 
+  it("launches each bot's turn with its own seat and none of the harness's identity", async () => {
+    const restore = inheritHarnessIdentity();
+    const dir = mkdtempSync(join(tmpdir(), "omb-pi-launch-"));
+    const dump = join(dir, "dump.jsonl");
+    try {
+      // an instance-level identity must not survive either
+      await create(undefined, { FAKE_PI_DUMP: dump, AGENT_SEAT: "CODEX", ZULIP_API_KEY: "instance-api-key" });
+      const identityRows = () =>
+        (existsSync(dump) ? readFileSync(dump, "utf8").trim().split("\n").filter(Boolean) : [])
+          .map((line) => JSON.parse(line))
+          // one row per spawn carries the environment; the rest record prompts and settings
+          .filter((row) => row.identityEnv !== undefined);
+      const seenFor = async (threadId: string, launchIdentity: { seat: string | null; session: string } | undefined) => {
+        const before = identityRows().length;
+        const started = await instance.adapter.sendTurn({ threadId, text: "hi", launchIdentity });
+        await recorder.until((e) => e.type === "turn.completed" && e.turnId === started.turnId);
+        // the turn's child is the row added by this turn; model probes are other rows
+        return identityRows().slice(before).at(-1)!.identityEnv;
+      };
+      const plumber = await seenFor("t-pi-plumber", { seat: "BF-PLUMBER", session: "t-pi-plumber" });
+      const fixer = await seenFor("t-pi-fixer", { seat: "BF-FIXER", session: "t-pi-fixer" });
+      const none = await seenFor("t-pi-none", { seat: null, session: "t-pi-none" });
+      const bare = await seenFor("t-pi-bare", undefined);
+      expectLaunchedAs(plumber, { seat: "BF-PLUMBER", session: "t-pi-plumber" });
+      expectLaunchedAs(fixer, { seat: "BF-FIXER", session: "t-pi-fixer" });
+      expectLaunchedAs(none, { seat: null, session: "t-pi-none" });
+      expectLaunchedAs(bare, { seat: null });
+    } finally {
+      restore();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("mounts integrations as stdio MCP servers and loads the pi-mcp-extension", async () => {
     const dir = mkdtempSync(join(tmpdir(), "omb-pi-mcp-dump-"));
     const dump = join(dir, "dump.jsonl");
@@ -498,7 +550,13 @@ describe("PiDriver turns (fake CLI)", () => {
       text: "hi",
       integrations: {
         composio: { command: "node", args: ["connector-proxy.js"], env: { COMPOSIO_KEY: "ck" } },
-        computer: { kind: "box", boxId: "b1", token: "bt", control: { url: "http://c", token: "ct" } },
+        computer: {
+          kind: "box",
+          boxId: "b1",
+          token: "bt",
+          gatewayUrl: "http://127.0.0.1:8799/api/local/box-gateway",
+          control: { url: "http://c", token: "ct" },
+        },
       },
     });
     await recorder.until((e) => e.type === "turn.completed" && e.turnId === turnId);
@@ -608,13 +666,13 @@ describe("PiDriver turns (fake CLI)", () => {
     await expect(instance.adapter.respondToRequest("t-none", "nope", { behavior: "allow" })).resolves.toBe("unavailable");
   });
 
-  it("interruptTurn cancels a running turn", async () => {
+  it("interruptTurn settles a running turn interrupted, not as a success", async () => {
     await create("permission");
     await instance.adapter.sendTurn({ threadId: "t-interrupt", text: "go" });
     await recorder.until((e) => e.type === "request.opened");
     await instance.adapter.interruptTurn("t-interrupt");
     const done = await recorder.until((e) => e.type === "turn.completed");
-    expect(done).toMatchObject({ ok: true, stopReason: "cancelled" });
+    expect(done).toMatchObject({ ok: false, stopReason: "interrupted" });
   });
 
   it("writes models.json and set_model for a host::model inject pick", async () => {
@@ -810,6 +868,68 @@ describe("applyPiLocalCatalog", () => {
     expect(catalog.options.some((o) => o.id === "omlx/MiniMax-M3-4bit")).toBe(false);
     expect(catalog.options.some((o) => o.id === "openai/gpt-4o")).toBe(true);
   });
+});
+
+
+/** A CLI whose `--version` answers while `ok` exists and otherwise dies the
+ *  way the test asks (`mode`: exit or crash).  Lets a test take an engine from
+ *  working to broken between two snapshots without any real engine. */
+function switchableCli(dir: string): { cli: string; setWorking: (working: boolean) => void; setMode: (mode: "exit" | "crash") => void } {
+  const cli = join(dir, "switchable-cli");
+  writeFileSync(
+    cli,
+    [
+      // A node-shebang script: env-path resolves it to `node <script>` on
+      // Windows, where a `#!/bin/sh` fixture cannot run at all.
+      "#!/usr/bin/env node",
+      'const fs = require("node:fs");',
+      `const dir = ${JSON.stringify(dir)};`,
+      'if (fs.existsSync(dir + "/ok")) { console.log("9.9.9"); process.exit(0); }',
+      'if (fs.readFileSync(dir + "/mode", "utf8") === "crash") process.kill(process.pid, "SIGSEGV");',
+      "process.exit(3)",
+      "",
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+  writeFileSync(join(dir, "mode"), "exit");
+  return {
+    cli,
+    setWorking: (working) => {
+      if (working) writeFileSync(join(dir, "ok"), "");
+      else rmSync(join(dir, "ok"), { force: true });
+    },
+    setMode: (mode) => writeFileSync(join(dir, "mode"), mode),
+  };
+}
+
+describe("PiDriver version reuse", () => {
+  // A SIGSEGV crash has no Windows equivalent: POSIX only.
+  for (const mode of (process.platform === "win32" ? (["exit"] as const) : (["exit", "crash"] as const))) {
+    it(`does not keep reporting the last version once the binary ${mode === "crash" ? "crashes" : "fails"} definitively`, async () => {
+      const dir = mkdtempSync(join(tmpdir(), "omb-pi-switch-"));
+      const cli = switchableCli(dir);
+      const home = mkdtempSync(join(tmpdir(), "omb-pi-switch-home-"));
+      const instance = await PiDriver.create({
+        instanceId: `pi-switch-${mode}`,
+        displayName: undefined,
+        environment: { HOME: home, USERPROFILE: home },
+        enabled: true,
+        config: { cli: cli.cli, fullAuto: false },
+      });
+      cli.setWorking(true);
+      const first = await instance.snapshot();
+      expect(first.state).toBe("available");
+      expect(first.version).toBe("9.9.9");
+      cli.setWorking(false);
+      cli.setMode(mode);
+      const second = await instance.snapshot();
+      expect(second.state).toBe("unavailable");
+      expect(second.transient).toBeUndefined();
+      expect(second.version).toBeUndefined();
+      await instance.dispose();
+      rmSync(dir, { recursive: true, force: true });
+    });
+  }
 });
 
 describe("PiDriver snapshot", () => {

@@ -2,9 +2,10 @@
 // errors. The command has one inline copy action and one primary next step;
 // unusable model lists stay out of the way until the engine is ready.
 import { useState } from "react";
-import { Check, Copy, Download, ExternalLink, KeyRound, LogIn, TerminalSquare } from "lucide-react";
+import { Check, Copy, Download, ExternalLink, KeyRound, Loader2, LogIn, TerminalSquare } from "lucide-react";
 import type { EngineInstall, InstanceInfo } from "@/state/store";
 import { cn } from "@/lib/cn";
+import { isCheckingEngine } from "@/lib/engine-status";
 
 type Platform = "darwin" | "win32" | "linux";
 
@@ -29,9 +30,21 @@ export function needsSignIn(instance: InstanceInfo | undefined): boolean {
 }
 
 /** The engine CLI itself is absent. Local-model injection needs the CLI but
- * does not need its cloud account to be signed in. */
+ * does not need its cloud account to be signed in.  An engine whose probe
+ * just did not answer in time is being checked, not missing. */
 export function needsCli(instance: InstanceInfo | undefined): boolean {
-  return instance?.snapshot.state !== "available";
+  return instance?.snapshot.state !== "available" && !isCheckingEngine(instance);
+}
+
+/** Title and body for an engine whose last probe gave no answer. */
+export function engineCheckingCopy(instance: InstanceInfo) {
+  const reason = instance.snapshot.reason?.replace(/\.$/, "") || `${instance.displayName} did not answer in time`;
+  return {
+    title: `Checking ${instance.displayName}`,
+    // U+00A0 + space: the two-space sentence gap survives HTML whitespace
+    // collapsing.
+    description: `${reason}.\u00a0 BotFleet is checking again and will update this on its own.`,
+  };
 }
 
 /** No CLI, no interactive login — this driver reads a bare API key from the
@@ -176,6 +189,25 @@ export function EngineSetup({
   const command = signInOnly ? signInCommand : installCommand;
   const { title, description } = engineSetupCopy(instance, intent);
 
+  // A probe that timed out is not a setup problem: no install command, no
+  // sign-in — just say it is being checked.
+  if (isCheckingEngine(instance)) {
+    const checking = engineCheckingCopy(instance);
+    return (
+      <div className={cn("rounded-xl border border-hairline/40 bg-control/30 p-3", className)}>
+        <div className="flex items-start gap-2.5">
+          <span className="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-lg bg-inset text-ink-secondary">
+            <Loader2 size={14} className="animate-spin" />
+          </span>
+          <div className="min-w-0">
+            <div className="text-[13px] font-semibold text-ink">{checking.title}</div>
+            <p className="mt-0.5 text-[12px] leading-relaxed text-ink-secondary">{checking.description}</p>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   // Some engines are configured elsewhere (for example, a cloud computer
   // token) and intentionally have no install descriptor.
   if (!install) {
@@ -209,7 +241,7 @@ export function EngineSetup({
         />
       ) : (
         <p className="mt-3 rounded-lg bg-inset px-2.5 py-2 text-[12px] leading-relaxed text-ink-secondary">
-          There isn’t a one-line installer for this platform. Use the setup guide below.
+          There isn’t a one-line installer for this platform.{"\u00a0 "}Use the setup guide below.
         </p>
       )}
 

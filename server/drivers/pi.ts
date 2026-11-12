@@ -30,7 +30,15 @@ import { hostToolPrefix, turnComputerMounts } from "../computer-grants.ts";
 import { augmentedPath } from "../env-path.ts";
 import { toolFields } from "../tool-fields.ts";
 import { describeResult } from "../../shared/tool-activity.ts";
-import { describeSpawnFailure, killCliTree, spawnCli } from "../procs.ts";
+import { captureInput, captureOutput } from "../../shared/item-io.ts";
+import {
+  classifyVersionProbeFailure,
+  describeSpawnFailure,
+  killCliTree,
+  LastKnownAnswer,
+  logProbeFailure,
+  spawnCli,
+} from "../procs.ts";
 import { SPAWNED_PROXIES } from "../proxy-paths.ts";
 import { STDERR_EXCERPT_HEAD, STDERR_EXCERPT_TAIL, stderrExcerpt } from "../stderr-excerpt.ts";
 import { readHostLoad, resolveInitDeadline } from "./acp/init-deadline.ts";
@@ -47,6 +55,7 @@ import type {
   SendTurnInput,
 } from "../contracts.ts";
 import { EFFORT_LEVELS, newEventId, newId } from "../contracts.ts";
+import { cliLoginEnvironment, launchedChildEnvironment, primeCliLogin } from "../cli-logins.ts";
 import {
   decodeInjectId,
   encodeInjectId,
@@ -449,7 +458,13 @@ function piEnvironment(source: Record<string, string | undefined>): Record<strin
 
 export const PiDriver: ProviderDriver<PiConfig> = {
   driverKind: DRIVER_KIND,
-  metadata: { displayName: "pi", supportsMultipleInstances: true, access: "custom" },
+  metadata: {
+    displayName: "pi",
+    supportsMultipleInstances: true,
+    access: "custom",
+    // Mirrors the `capabilities` block in `create` below.
+    channelWiring: { agentsMcp: true, computerMcp: true, composioMcp: true, localComputerMcp: true, images: true },
+  },
   install: {
     command: {
       darwin: "npm install -g @earendil-works/pi-coding-agent",
@@ -507,6 +522,11 @@ export const PiDriver: ProviderDriver<PiConfig> = {
 
     const sendTurn = async (turn: SendTurnInput) => {
       const { threadId } = turn;
+      // The seat's CLI login is read in the BACKGROUND, and the read is started
+      // here, before the guard:  the guard and the registration that follows it
+      // have to stay free of `await`, or a second turn on this thread would walk
+      // through the guard the first one already passed.
+      primeCliLogin(turn.launchIdentity?.seat);
       if (active.has(threadId)) throw new Error("a turn is already running on this thread");
       // Host control always routes through the permission card: the
       // pi-mcp-extension gates every `local-computer` scoped call behind
@@ -550,16 +570,22 @@ export const PiDriver: ProviderDriver<PiConfig> = {
       // spawnCli can throw synchronously (unresolvable CLI); if it does, the
       // 0600 temp file with the box token / composio key / comms token must
       // not be left on disk — settle() never runs because no child existed.
-      const child = (() => {
+      // The IIFE is async because the seat's CLI login is read before the
+      // spawn; the try still covers the spawn itself.
+      const child = await (async () => {
         try {
           return spawnCli(config.cli, childArgs, {
             stdio: ["pipe", "pipe", "pipe"],
             cwd: turn.cwd,
-            env: piEnvironment({
-              ...process.env,
-              ...input.environment,
-              ...(mcpServers && mcpTempDir ? { OMB_MCP_CONFIG: join(mcpTempDir, "mcp.json") } : {}),
-            }),
+            env: launchedChildEnvironment(
+              piEnvironment({
+                ...process.env,
+                ...input.environment,
+                ...(mcpServers && mcpTempDir ? { OMB_MCP_CONFIG: join(mcpTempDir, "mcp.json") } : {}),
+              }),
+              turn.launchIdentity,
+              cliLoginEnvironment(turn.launchIdentity?.seat),
+            ),
           });
         } catch (err) {
           if (mcpTempDir) {
@@ -691,7 +717,9 @@ export const PiDriver: ProviderDriver<PiConfig> = {
         } catch {
           /* ignore */
         }
-        settle(true, "cancelled");
+        // A person stopped this turn: interrupted, not a success (audit
+        // E6, #647 convention).
+        settle(false, "interrupted");
       };
       active.set(threadId, { stop, turnId, pending, child });
 
@@ -731,6 +759,7 @@ export const PiDriver: ProviderDriver<PiConfig> = {
               itemId: evt.toolCallId,
               title: String(evt.toolName ?? "tool").slice(0, 80),
               ...toolFields(evt.toolName, evt.args ?? evt.input ?? evt.arguments),
+              ...captureInput(evt.args ?? evt.input ?? evt.arguments),
             });
             return;
           }
@@ -742,6 +771,7 @@ export const PiDriver: ProviderDriver<PiConfig> = {
               itemId: evt.toolCallId,
               ok: !evt.isError,
               detail: describeResult(evt.result ?? evt.output ?? evt.content ?? evt.error),
+              ...captureOutput(evt.result ?? evt.output ?? evt.content ?? evt.error),
             });
             return;
           }
@@ -920,13 +950,33 @@ export const PiDriver: ProviderDriver<PiConfig> = {
       return { turnId };
     };
 
+    // Last good `--version`, so one probe that runs out of time on a busy
+    // Mac does not flip a working pi to "not installed".
+    const lastKnownVersion = new LastKnownAnswer<string>();
     const snapshot = async (): Promise<ProviderSnapshot> => {
-      const version = await new Promise<string | null>((resolve) => {
-        const child = spawnCli(config.cli, ["--version"], {
-          stdio: ["ignore", "pipe", "pipe"],
-          env: piEnvironment({ ...process.env, ...input.environment }),
-        });
+      // Its place among overlapping probes: taken before the process starts,
+      // so a slow older probe cannot replace what a newer one remembered.
+      const versionOrder = lastKnownVersion.begin();
+      const startedAt = Date.now();
+      const probed = await new Promise<{ version: string | null; error: Error | null }>((resolve) => {
+        let child: ReturnType<typeof spawnCli>;
+        try {
+          child = spawnCli(config.cli, ["--version"], {
+            stdio: ["ignore", "pipe", "pipe"],
+            env: piEnvironment({ ...process.env, ...input.environment }),
+          });
+        } catch (error) {
+          resolve({ version: null, error: error as Error });
+          return;
+        }
         let out = "";
+        let settled = false;
+        const settle = (value: { version: string | null; error: Error | null }) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve(value);
+        };
         child.stdout?.setEncoding("utf8");
         child.stdout?.on("data", (c: string) => (out += c));
         child.stderr?.resume();
@@ -936,19 +986,39 @@ export const PiDriver: ProviderDriver<PiConfig> = {
           } catch {
             /* ignore */
           }
-          resolve(null);
-        }, 8000);
+          settle({
+            version: null,
+            error: Object.assign(new Error(`\`${config.cli}\` did not exit within 20000ms`), { timedOut: true }),
+          });
+        }, 20000);
         timer.unref?.();
-        child.on("error", () => {
-          clearTimeout(timer);
-          resolve(null);
-        });
-        child.on("close", () => {
-          clearTimeout(timer);
-          resolve(out.trim() || null);
-        });
+        child.on("error", (error) => settle({ version: null, error }));
+        child.on("close", (code) =>
+          settle({
+            version: out.trim() || null,
+            error: out.trim() ? null : Object.assign(new Error(`exit ${code}`), { code }),
+          }),
+        );
       });
-      if (!version) return { state: "unavailable", reason: `\`${config.cli}\` CLI not found` };
+      let version = probed.version;
+      if (version) {
+        lastKnownVersion.record(version, versionOrder);
+      } else {
+        const elapsed = Date.now() - startedAt;
+        logProbeFailure(instanceId, `${config.cli} --version`, probed.error, elapsed);
+        const failure = classifyVersionProbeFailure(probed.error, config.cli, input.displayName || "pi", elapsed, 20000);
+        const remembered = failure.kind === "transient" ? lastKnownVersion.get() : null;
+        if (remembered) {
+          // Only a probe that gave no answer may stand on the last good
+          // version.  A missing or broken binary is a verdict.
+          version = remembered;
+        } else {
+          if (failure.kind !== "transient") lastKnownVersion.forget(versionOrder);
+          return failure.kind === "transient"
+            ? { state: "unavailable", transient: true, reason: failure.reason }
+            : { state: "unavailable", reason: failure.reason };
+        }
+      }
       // pi keeps its credentials in its own data root; there is no sign-in
       // subcommand to probe, so read the file it writes.  Reporting a
       // hardcoded `true` meant an installed-but-unauthenticated pi looked
@@ -998,6 +1068,18 @@ export const PiDriver: ProviderDriver<PiConfig> = {
           // xhigh/max only land on models that expose them; pi rejects an
           // unsupported level and the turn keeps the engine default.
           effortLevels: EFFORT_LEVELS,
+          // pi core runs its own bash/edit/write without asking, in every
+          // mode (fullAuto changes nothing here); only host-control MCP calls
+          // reach a card, and auto-review never answers those.  Its steps do
+          // arrive as tool_execution_start, so review can watch them.
+          reviewHook: "after",
+          // Jobs matrix: BotFleet's own job tools arrive through the same
+          // pi-mcp-extension that already carries ask_bot, and the chain is
+          // proven end to end in server/drivers/pi-jobs.test.ts — the real
+          // extension, the real agents-proxy, jobs mounted, reaching the
+          // harness.  Helpers are still unverified and stay `none`.
+          backgroundJobs: "emulated",
+          helpers: "none",
         },
         sendTurn,
         interruptTurn: async (threadId) => active.get(threadId)?.stop(),

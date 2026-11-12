@@ -50,12 +50,12 @@ export const IMPORT_BUTTON_LABEL = "Import Skill Folder…";
 export const OPEN_SKILL_LABEL = "Open SKILL.md";
 export const WARNINGS_HEADING = "Before you enable this";
 
-/** A bot on the Computer engine runs its turn on box.ascii.dev, not on this
+/** A bot on the ASCII.dev Box engine runs its turn on box.ascii.dev, not on this
  * machine, so it has no workspace for a skill to live in.  Saying so here
  * is cheaper than letting someone import a skill that can never load. */
 export function skillsEngineNote(driverKind: string | undefined): string | null {
   if (driverKind !== "boxAgent") return null;
-  return `This bot runs on the Computer engine, so it has no workspace on this computer.${GAP}Imported skills never reach it.`;
+  return `This bot runs on the ASCII.dev Box engine, so it has no workspace on this computer.${GAP}Imported skills never reach it.`;
 }
 
 /** GET /api/bots/:id/skills also reports `notIndexed`: enabled skills the

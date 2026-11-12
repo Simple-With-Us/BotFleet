@@ -18,6 +18,40 @@ export function findRecallCli(): string | null {
   return candidates.find((candidate): candidate is string => Boolean(candidate && existsSync(candidate))) ?? null;
 }
 
+/** Can a turn actually be given the recall tools?
+ *
+ *  This was `Boolean(settings && (settings.url || findRecallCli()))` inline at
+ *  the dispatch site, which meant the rule that decides whether a bot is
+ *  handed a memory tool had no test at all — and the state it produces is the
+ *  one that hid itself.  With `url` and `collection` both empty and a `recall`
+ *  binary on this computer, the tools went live and answered from a corpus the
+ *  owner never pointed the app at, while `/api/qdrant/status` said
+ *  `configured: true`.
+ *
+ *  Being able to serve the tools is deliberately NOT a statement about WHICH
+ *  corpus.  Availability is the transport; `configuredTarget` on the status is
+ *  the corpus, and only one of the two is an answer to "is this set up the way
+ *  I meant".
+ *
+ *  Parameters are passed rather than probed so the rule is testable without a
+ *  binary on the machine running the tests — `findRecallCli()` reads PATH and
+ *  $HOME, which is exactly the kind of environment truth that makes a test
+ *  pass on one laptop and fail on another. */
+export function recallAvailableForTurn(
+  settings: { url?: string; collection?: string } | null | undefined,
+  usesDriverToolLoop: boolean,
+  cliAvailable: boolean | (() => string | null),
+): boolean {
+  if (!usesDriverToolLoop) return false;
+  if (!settings) return false;
+  // `url` short-circuits the CLI probe, so a configured service never touches
+  // the filesystem. The probe is LAZY for the other order: passing
+  // `findRecallCli` by value would evaluate its synchronous existsSync calls
+  // on every dispatch, including the many where recall is off entirely.
+  if (settings.url) return true;
+  return typeof cliAvailable === "function" ? Boolean(cliAvailable()) : Boolean(cliAvailable);
+}
+
 /** An explicitly selected service is never bypassed by another local corpus. */
 export function selectRecallTransport(url: string, cli: string | null): RecallStatus["source"] {
   return url ? "recall-service" : cli ? "recall-cli" : "unconfigured";
@@ -159,6 +193,21 @@ export interface RecallStatus {
   backendOk?: boolean;
   embedderHealthy?: boolean;
   accessGated?: boolean;
+  /** Whether this is the corpus the OWNER chose, or the local CLI answering
+   *  from its own defaults.
+   *
+   *  `configured` above only says a transport resolved, and with no Service
+   *  URL set the local `recall` CLI satisfies that: the probe goes green, the
+   *  panel says configured, and the recall tools reach a corpus the owner
+   *  never pointed the app at.  That is the state this repo was found in —
+   *  `url` and `collection` both empty, `configured: true`, tools live, and
+   *  nothing anywhere saying the corpus was not the intended one.
+   *
+   *  `configuredTarget` is false whenever a Service URL or collection is
+   *  missing and the CLI is therefore supplying them, so the panel can say
+   *  which corpus it is actually talking to instead of showing one confident
+   *  green for two very different setups. */
+  configuredTarget?: boolean;
   /** Whether the Cloudflare Access service token is whole.  Reported even on
    * a healthy probe, because half a pair sends no Access headers at all and
    * the panel needs to say so before the operator meets a login page. */
@@ -180,6 +229,15 @@ export function recallStatus(settings: RecallSettings, timeoutMs = RECALL_STATUS
   const run = async (): Promise<RecallStatus> => {
     const base = { source, configured: source !== "unconfigured", url: settings.url || null,
       collection: settings.collection || null, checkedAt: Date.now(), lastSuccessAt: lastSuccesses.get(key) ?? null,
+      // A resolved transport is not the same as the intended corpus.  With no
+      // URL the CLI supplies its own endpoint, and with no collection it
+      // supplies its own name — so say so rather than reporting one green for
+      // "working as configured" and "working by accident".
+      configuredTarget: source === "recall-service"
+        ? Boolean(settings.url && settings.collection)
+        : source === "recall-cli"
+          ? Boolean(settings.url || settings.collection)
+          : false,
       accessTokenState: accessTokenState(settings.accessClientId, settings.accessClientSecret) };
     if (source === "unconfigured") return { ...base, ready: false, state: "unconfigured",
       error: "Bot RAG is not configured — set a Service URL in Settings" };

@@ -12,7 +12,6 @@ import {
   Crown,
   ExternalLink,
   FolderOpen,
-  Github,
   Loader2,
   MessageSquare,
   Plug,
@@ -23,6 +22,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { GithubMark } from "./GithubMark";
 
 const MAX_TEAM_FILE_BYTES = 1_000_000;
 
@@ -470,7 +470,7 @@ export function TeamLibraryPanel({
                 className="flex items-center gap-1.5 rounded-lg px-2.5 py-2 text-[12.5px] text-ink-secondary hover:bg-raised hover:text-ink"
                 title="Open the community teams repository"
               >
-                <Github size={16} />
+                <GithubMark size={16} />
                 <span className="max-sm:hidden">Community Repo</span>
                 <ExternalLink size={12} />
               </button>
@@ -727,7 +727,7 @@ export function TeamLibraryPanel({
                     </button>
 
                     <div className="flex min-h-56 flex-col justify-center rounded-2xl bg-raised/25 px-6">
-                      <Github size={25} className="text-ink-secondary" />
+                      <GithubMark size={25} className="text-ink-secondary" />
                       <h3 className="mt-3 text-[14px] font-medium text-ink">Load from GitHub</h3>
                       <p className="mt-1 text-[12.5px] leading-relaxed text-ink-secondary">Paste a public repo or a direct team JSON link.</p>
                       <div className="mt-4 flex gap-2">

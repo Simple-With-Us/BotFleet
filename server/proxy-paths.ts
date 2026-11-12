@@ -41,9 +41,13 @@ export const SPAWNED_PROXIES = {
   agents: resolveProxy("drivers/agents-proxy"),
   dweb: resolveProxy("drivers/dweb-proxy"),
   connectors: resolveProxy("connector-proxy"),
+  mcpGate: resolveProxy("mcp-gate"),
+  mcpRemote: resolveProxy("mcp-remote-proxy"),
   phone: resolveProxy("drivers/phone-proxy"),
   qdrant: resolveProxy("drivers/qdrant-proxy"),
   dshAcpBridge: resolveProxy("drivers/dsh-acp-bridge"),
+  // One sandboxed child per enabled plugin (server/plugin-loader.ts).
+  pluginSandbox: resolveProxy("plugin-sandbox-child"),
   // Loaded by the external `pi` process via `-e`, not by this server — but
   // resolved through the same single source of truth so the packaged layout
   // check can assert it ships.

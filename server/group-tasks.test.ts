@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { TaskWorkspaceContext } from "../shared/task-workspace-context.ts";
 
 let home: string;
 
@@ -12,6 +13,21 @@ async function freshStore() {
   vi.stubEnv("USERPROFILE", home);
   const { Store, UNTITLED_TASK } = await import("./store.ts");
   return { store: new Store(() => ({ instanceId: "claude", model: "m" })), Store, UNTITLED_TASK };
+}
+
+function context(groupId: string, cwd: string): TaskWorkspaceContext {
+  return {
+    kind: "local",
+    appRef: { kind: "group", id: groupId },
+    cwd,
+    capturedAt: 1_700_000_000_000,
+  };
+}
+
+function expectConflict(run: () => void): void {
+  let error: unknown;
+  try { run(); } catch (caught) { error = caught; }
+  expect(error).toMatchObject({ status: 409 });
 }
 
 afterEach(async () => {
@@ -101,6 +117,54 @@ describe("channel tasks", () => {
     const texts = store.messagesFor(first).map((message) => message.text);
     expect(texts).toContain("room inbox");
     expect(texts).toContain("research note");
+  });
+
+  it("preserves an App binding through bot and group transfers and a group reload", async () => {
+    const { store, Store } = await freshStore();
+    const originBot = store.createBot();
+    const otherBot = store.createBot();
+    const app = store.createGroup("Project App", [originBot.id, otherBot.id]);
+    const otherGroup = store.createGroup("Archive", [originBot.id]);
+    const snapshot = context(app.id, join(home, "checkout", "package"));
+    const task = store.createTask(originBot.id, "Bound work", false, undefined, snapshot)!;
+    store.appendMessage(task.threadId, { role: "user", kind: "text", text: "Keep this history" });
+
+    expect(store.moveTaskToBot(originBot.id, task.threadId, otherBot.id)).not.toBeNull();
+    expect(store.taskByThread(otherBot.id, task.threadId)?.workspaceContext).toEqual(snapshot);
+    expectConflict(() => store.moveTaskToGroup(otherBot.id, task.threadId, otherGroup.id));
+    expect(store.taskByThread(otherBot.id, task.threadId)?.workspaceContext).toEqual(snapshot);
+
+    expect(store.moveTaskToGroup(otherBot.id, task.threadId, app.id)).not.toBeNull();
+    expect(store.groupTaskByThread(app.id, task.threadId)?.workspaceContext).toEqual(snapshot);
+    const reloaded = new Store(() => ({ instanceId: "claude", model: "m" }));
+    expect(reloaded.groupTaskByThread(app.id, task.threadId)?.workspaceContext).toEqual(snapshot);
+
+    expectConflict(() => store.moveGroupTask(app.id, task.threadId, otherGroup.id));
+    expect(store.groupTaskByThread(app.id, task.threadId)?.workspaceContext).toEqual(snapshot);
+    expect(store.groupTaskByThread(otherGroup.id, task.threadId)).toBeUndefined();
+    expect(store.moveGroupTaskToBot(app.id, task.threadId, originBot.id)).not.toBeNull();
+    expect(store.taskByThread(originBot.id, task.threadId)?.workspaceContext).toEqual(snapshot);
+    expect(store.messagesFor(task.threadId).some((message) => message.text === "Keep this history")).toBe(true);
+  });
+
+  it("refuses to merge group tasks bound to different App directories without changing history", async () => {
+    const { store } = await freshStore();
+    const bot = store.createBot();
+    const app = store.createGroup("Project App", [bot.id]);
+    const first = store.createTask(bot.id, "Package A", false, undefined, context(app.id, join(home, "a")))!;
+    const second = store.createTask(bot.id, "Package B", false, undefined, context(app.id, join(home, "b")))!;
+    store.appendMessage(first.threadId, { role: "user", kind: "text", text: "First package" });
+    store.appendMessage(second.threadId, { role: "user", kind: "text", text: "Second package" });
+    expect(store.moveTaskToGroup(bot.id, first.threadId, app.id)).not.toBeNull();
+    expect(store.moveTaskToGroup(bot.id, second.threadId, app.id)).not.toBeNull();
+    const beforeFirst = structuredClone(store.messagesFor(first.threadId));
+    const beforeSecond = structuredClone(store.messagesFor(second.threadId));
+    const threadIds = store.groupTasks(app.id).map((task) => task.threadId);
+
+    expectConflict(() => store.mergeGroupTasks(app.id, second.threadId, first.threadId));
+    expect(store.groupTasks(app.id).map((task) => task.threadId)).toEqual(threadIds);
+    expect(store.messagesFor(first.threadId)).toEqual(beforeFirst);
+    expect(store.messagesFor(second.threadId)).toEqual(beforeSecond);
   });
 
   it("adopts a legacy channel thread without losing its folder or pin", async () => {

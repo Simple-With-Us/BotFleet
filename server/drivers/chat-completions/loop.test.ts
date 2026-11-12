@@ -13,6 +13,7 @@ import type {
   TurnToolOutcome,
 } from "../../contracts.ts";
 import { ProviderError } from "../../contracts.ts";
+import { DEFAULT_MAX_TOOL_ROUNDS } from "../../../shared/bot-profile.ts";
 import { RETRY_AFTER_CAP_MS, httpErrorFor } from "./errors.ts";
 import {
   DEFAULT_TURN_LOOP_BUDGET,
@@ -25,6 +26,7 @@ import {
   type TurnLoopExit,
   type TurnRoundResult,
 } from "./loop.ts";
+import { ToolResultArtifactStore } from "../../tool-result-history.ts";
 
 type TerminalEvent = RuntimeEventBase & {
   type: "turn.completed";
@@ -76,6 +78,8 @@ interface Harness {
     emit?: (event: RuntimeEvent) => void;
     computeCost?: (usage: { input: number; output: number; cachedInput?: number }) => number | null;
     tools?: ReadonlyArray<{ name: string; timeoutMs?: number }>;
+    toolResultHistoryChars?: number;
+    toolResultArtifacts?: ToolResultArtifactStore;
     requestApproval?: (ask: {
       tool: string;
       summary: string;
@@ -159,6 +163,8 @@ function harness(rounds: ScriptedRound[]): Harness {
         retryDelayScale: over?.retryDelayScale,
         computeCost: over?.computeCost,
         tools: over?.tools,
+        toolResultHistoryChars: over?.toolResultHistoryChars,
+        toolResultArtifacts: over?.toolResultArtifacts,
         runRound: async (roundMessages, opts) => {
           roundsSeen.push(roundMessages.map((m) => ({ ...m })));
           attempts.push({ round: opts.round, attempt: opts.attempt });
@@ -381,6 +387,83 @@ describe("runTurnLoop — the turn is settled by exactly one place", () => {
     const exit = await h.run();
     expect(exit).toBe("interrupted");
     expect(h.roundsSeen).toHaveLength(0);
+    expect(terminals(h.events)).toHaveLength(1);
+  });
+
+  it("settles the tool host once, before the terminal event, on a clean finish and on Stop (jobs P0)", async () => {
+    // The host's settle is the lost-job detector: whatever a tool started and
+    // left running is stopped with the turn, before anything can dispatch
+    // the next one from its turn.completed.
+    for (const stop of [false, true]) {
+      const h = harness([wantsTools([call("c1", "bash")]), answer("done")]);
+      const settledAt: number[] = [];
+      await h.run({
+        toolHost: {
+          execute: async () => {
+            if (stop) h.abort.abort();
+            return { kind: "result", content: "ok" } as TurnToolOutcome;
+          },
+          settle: () => {
+            settledAt.push(h.events.length);
+          },
+        },
+      });
+      expect(settledAt).toHaveLength(1);
+      const terminalIndex = h.events.findIndex((e) => e.type === "turn.completed");
+      expect(settledAt[0]).toBeLessThanOrEqual(terminalIndex);
+    }
+  });
+
+  it("hands the model a job notice between rounds, once, as an appended user message (jobs P1)", async () => {
+    // A background job that ends mid-turn reaches the model before its next
+    // call, so it does not start the same work again.  Appended after the
+    // tool results — the prefix the provider already saw never changes.
+    const h = harness([wantsTools([call("c1", "bash")]), wantsTools([call("c2", "bash")]), answer("done")]);
+    const queued = [["Background job job_x `pnpm test` finished: exit code 0 after 4m 12s."], [], []];
+    let drains = 0;
+    const exit = await h.run({
+      toolHost: {
+        execute: async () => ({ kind: "result", content: "ok" }),
+        drainNotices: () => queued[drains++] ?? [],
+      },
+    });
+    expect(exit).toBe("settled");
+    const round2 = h.roundsSeen[1]!;
+    expect(round2.at(-2)).toMatchObject({ role: "tool", tool_call_id: "c1" });
+    expect(round2.at(-1)).toEqual({
+      role: "user",
+      content: "[BotFleet notice]\nBackground job job_x `pnpm test` finished: exit code 0 after 4m 12s.",
+    });
+    // round 2's prefix is round 1's, untouched; the notice never repeats
+    expect(round2.slice(0, h.roundsSeen[0]!.length)).toEqual(h.roundsSeen[0]);
+    expect(h.roundsSeen[2]!.filter((m) => m.content.startsWith("[BotFleet notice]"))).toHaveLength(1);
+    expect(drains).toBe(2);
+  });
+
+  it("keeps looping when a notice drain throws", async () => {
+    const h = harness([wantsTools([call("c1", "bash")]), answer("done")]);
+    const exit = await h.run({
+      toolHost: {
+        execute: async () => ({ kind: "result", content: "ok" }),
+        drainNotices: () => {
+          throw new Error("drain exploded");
+        },
+      },
+    });
+    expect(exit).toBe("settled");
+  });
+
+  it("still emits its one terminal event when the tool host's settle throws", async () => {
+    const h = harness([answer("done")]);
+    const exit = await h.run({
+      toolHost: {
+        execute: async () => ({ kind: "result", content: "unused" }),
+        settle: () => {
+          throw new Error("settle exploded");
+        },
+      },
+    });
+    expect(exit).toBe("settled");
     expect(terminals(h.events)).toHaveLength(1);
   });
 });
@@ -648,6 +731,23 @@ describe("runTurnLoop — tool results are real", () => {
     expect(started.map((e) => e.itemId)).toEqual(["c2"]);
   });
 
+  it("attaches the whole result the model was told to a finished tool, beside the clipped detail", async () => {
+    const h = harness([wantsTools([call("c1")]), answer("ok")]);
+    const whole = `first line\n${"r".repeat(600)}\nlast line`;
+    await h.run({ toolHost: hostReturning({ kind: "result", content: whole, detail: "first line" }) });
+    const done = h.events.find((e) => e.type === "item.completed" && e.itemType === "tool")!;
+    expect(done).toMatchObject({ itemId: "c1", ok: true, detail: "first line" });
+    expect(done.io?.output).toEqual({ text: whole, truncated: false, length: whole.length });
+  });
+
+  it("files a failing tool's message the same way", async () => {
+    const h = harness([wantsTools([call("c1")]), answer("ok")]);
+    await h.run({ toolHost: hostReturning({ kind: "error", content: "Tool bash failed: boom", detail: "boom" }) });
+    const done = h.events.find((e) => e.type === "item.completed" && e.itemType === "tool")!;
+    expect(done).toMatchObject({ ok: false, detail: "boom" });
+    expect(done.io?.output?.text).toBe("Tool bash failed: boom");
+  });
+
   it("closes the chips of tools that never finished when the turn is stopped", async () => {
     const h = harness([wantsTools([call("c1"), call("c2")])]);
     await h.run({
@@ -688,6 +788,64 @@ describe("runTurnLoop — rounds", () => {
     const toolMessages = h.messages.filter((m) => m.role === "tool");
     expect(toolMessages.map((m) => m.tool_call_id)).toEqual(["slow", "fast"]);
     expect(toolMessages.map((m) => m.content)).toEqual(["slow result", "fast result"]);
+  });
+
+  it("keeps an oversized tool result whole for the round that receives it, then stores a head and tail", async () => {
+    const marker = "MIDDLE-MARKER-2664";
+    const huge = `${"H".repeat(20_000)}${marker}${"T".repeat(20_000)}`;
+    const store = new ToolResultArtifactStore();
+    const h = harness([
+      wantsTools([call("c1", "bash")]),
+      wantsTools([call("c2", "bash")]),
+      answer("done"),
+    ]);
+    await h.run({
+      toolHost: hostReturning({ kind: "result", content: huge }),
+      toolResultHistoryChars: 8_000,
+      toolResultArtifacts: store,
+    });
+    const toolAt = (round: number, id: string) =>
+      h.roundsSeen[round].find((message) => message.role === "tool" && message.tool_call_id === id);
+    expect(toolAt(1, "c1")?.content).toBe(huge);
+    const stored = toolAt(2, "c1");
+    const storedId = stored?.content.match(/artifact_id "([^"]+)"/)?.[1] ?? "";
+    expect(stored?.content.length).toBeLessThanOrEqual(8_000);
+    expect(storedId.startsWith("tr_")).toBe(true);
+    expect(stored?.content).toContain("H".repeat(32));
+    expect(stored?.content.endsWith("T".repeat(32))).toBe(true);
+    expect(stored?.content).not.toContain(marker);
+    expect(toolAt(2, "c2")?.content).toBe(huge);
+    expect(store.get(storedId)).toBe(huge);
+    expect(h.messages.find((message) => message.tool_call_id === "c1")?.content).not.toContain(marker);
+    expect(h.messages.find((message) => message.tool_call_id === "c2")?.content.length).toBeLessThanOrEqual(8_000);
+  });
+
+  it("truncates a tool result carried in from an earlier turn before the first request", async () => {
+    const huge = "Q".repeat(10_000);
+    const store = new ToolResultArtifactStore();
+    const h = harness([answer("done")]);
+    h.messages.push(
+      { role: "assistant", content: "", tool_calls: [call("old")] },
+      { role: "tool", tool_call_id: "old", content: huge },
+    );
+    await h.run({ toolResultArtifacts: store });
+    const prior = h.roundsSeen[0].find((message) => message.tool_call_id === "old");
+    const priorId = prior?.content.match(/artifact_id "([^"]+)"/)?.[1] ?? "";
+    expect(prior?.content.length).toBeLessThanOrEqual(8_000);
+    expect(prior?.content).not.toBe(huge);
+    expect(priorId.startsWith("tr_")).toBe(true);
+    expect(store.get(priorId)).toBe(huge);
+  });
+
+  it("leaves tool results whole when the history threshold is turned off", async () => {
+    const huge = "Z".repeat(12_000);
+    const h = harness([wantsTools([call("c1")]), answer("done")]);
+    await h.run({
+      toolHost: hostReturning({ kind: "result", content: huge }),
+      toolResultHistoryChars: 0,
+    });
+    expect(h.roundsSeen[1].find((message) => message.role === "tool")?.content).toBe(huge);
+    expect(h.messages.find((message) => message.role === "tool")?.content).toBe(huge);
   });
 
   it("only ever APPENDS to the messages array, so each round re-sends a byte-identical prefix", async () => {
@@ -817,7 +975,13 @@ describe("runTurnLoop — rounds", () => {
 describe("the shipped budget", () => {
   it("is the one the design signed off on", () => {
     expect(DEFAULT_TURN_LOOP_BUDGET).toEqual({
-      maxRounds: 12,
+      // Not a literal.  The unset-bot round budget lives in
+      // shared/bot-profile.ts as DEFAULT_MAX_TOOL_ROUNDS because that is the
+      // same number the turn's prompt names and the settings copy shows; the
+      // hard stop is derived from it so the three cannot disagree.  Pinning a
+      // literal here is exactly what let the prompt say 40 while the loop
+      // stopped at 12.
+      maxRounds: DEFAULT_MAX_TOOL_ROUNDS,
       requestTimeoutMs: 600_000,
       requestIdleMs: 120_000,
       toolTimeoutMs: 90_000,
@@ -825,6 +989,12 @@ describe("the shipped budget", () => {
       toolConcurrency: 4,
       maxRequestAttempts: 3,
     });
+  });
+
+  it("spends a real budget on an unset turn, not a token twelve", () => {
+    // A turn that runs out of rounds dies with its work undone and nobody
+    // watching, so the floor has to leave room for a multi-step change.
+    expect(DEFAULT_TURN_LOOP_BUDGET.maxRounds).toBeGreaterThanOrEqual(20);
   });
 });
 
@@ -895,11 +1065,17 @@ describe("runTurnLoop — the round's idle clock and hard ceiling", () => {
       const h = harness([
         async (opts) =>
           new Promise<TurnRoundResult>((_resolve, reject) => {
-            // live for 100s, then silent forever
+            // live for 100s, then silent forever.  The last chunk is a
+            // setTimeout, not the 100s interval tick: Vitest 5 can fire
+            // clearInterval first when both are due at the same instant.
             const ticker = setInterval(() => opts.onChunk?.(), 10_000);
-            setTimeout(() => clearInterval(ticker), 100_000);
+            const stop = setTimeout(() => {
+              clearInterval(ticker);
+              opts.onChunk?.();
+            }, 100_000);
             opts.signal.addEventListener("abort", () => {
               clearInterval(ticker);
+              clearTimeout(stop);
               reject(new DOMException("aborted", "AbortError"));
             });
           }),

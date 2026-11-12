@@ -67,7 +67,7 @@ Then: type line (`Completion` / `Plan` / `Review` / `Design` / `Handoff` / `Roll
 
 Order: `Needs owner` first when applicable, then Problem → What was done → Decisions → Next steps.
 
-Two ASCII spaces between sentences in the body file you pass the helper.
+A real U+00A0 plus a normal space between sentences in the body file you pass the helper (owner ruling 2026-10-23).  Never write the `&nbsp;` entity yourself.
 
 ## Layout (owner 2026-08-21 — binding)
 
@@ -88,7 +88,7 @@ Do not pass a packed markdown blob.  If you use the plain-body MD path, put a bl
 
 Do Notes: plans, design docs, reviews, handoffs, rollouts, **Completion / work-complete** for anything the owner might ask about.
 
-Skip: pure `#agent-sync` chatter, effort-board row edits, routine commit messages, peer-only PR nits.
+Skip: pure `#Work-In-Progress` chatter, effort-board row edits, routine commit messages, peer-only PR nits.
 
 Open a living work note when substantial work starts.  Always Completion at the end.  Update in place; unpin stale Completion notes when the lane closes (`--unpin-only`).
 
@@ -96,7 +96,7 @@ Background-jobs inventory note is `⭐️ Background Jobs Master List` — refre
 
 ## Canon
 
-- `/Users/jay/apps/AGENT-SYNC.md` § Apple Notes
+- `/Users/jay/apps/FLEET-PROTOCOL.md` § Apple Notes
 - Skills: `closeout`, `owner-copy`
 
 ### Handoff Reports (Immediate & Living)

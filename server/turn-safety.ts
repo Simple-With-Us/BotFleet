@@ -27,6 +27,9 @@ export interface ActiveTurnOwner {
   selection: ModelSelection;
   fallbackPolicy: ModelSelection;
   computerInputs?: TurnComputerInputs;
+  /** What started the turn when nobody typed it: `job` is a background
+   *  job's wake, whose cost is counted on its own (server/jobs/wake-usage.ts). */
+  automationSource?: string;
   /** Set when a settings change took away a provider this dispatch holds or
    * could reach.  A dispatch that has not reached its provider yet has no
    * session to interrupt, so its own pre-dispatch checks must see this and
@@ -78,6 +81,11 @@ export class ActiveTurnOwners {
     if (!owners) return undefined;
     if (providerInstanceId) return owners.get(providerInstanceId);
     return owners.size === 1 ? owners.values().next().value : undefined;
+  }
+
+  /** The provider instances with a live dispatch on this thread. */
+  instancesOn(threadId: string): string[] {
+    return [...(this.byThread.get(threadId)?.keys() ?? [])];
   }
 
   current(threadId: string): ActiveTurnOwner | undefined {
@@ -158,8 +166,8 @@ export interface ExactTurnLease {
   readonly threadId: string;
   readonly dispatchId: number;
   /** The resource this lease guards.  When set, mutual exclusion is keyed
-   *  by targetKey rather than botId so two bots sharing the same target
-   *  (shared VPS mode) cannot both hold a lease. */
+   *  by targetKey rather than botId — typically one occupancy key per bot
+   *  on a shared VPS container so several bots can run concurrently. */
   readonly targetKey?: string;
 }
 
@@ -167,9 +175,9 @@ export interface ExactTurnLease {
  * same bot and thread before an older asynchronous finalizer finishes, so a
  * thread id alone is not an ownership token.
  *
- * When `targetKey` is provided, mutual exclusion is by target rather than by
- * bot — two different bots trying to use the same shared desktop are refused
- * the same way two dispatches on one bot used to be. */
+ * When `targetKey` is provided, mutual exclusion is by that key rather than
+ * by bot id alone — two different bots sharing one occupancy key are refused,
+ * while distinct per-bot keys on one shared container can coexist. */
 export class ExactTurnLeases {
   private readonly byBot = new Map<string, ExactTurnLease>();
   private readonly byTarget = new Map<string, ExactTurnLease>();
@@ -327,7 +335,20 @@ export interface AutoFallbackCandidate {
     };
   };
   driverKind?: string;
-  capabilities?: { effortLevels?: readonly string[] };
+  capabilities?: {
+    effortLevels?: readonly string[];
+    computerMcp?: boolean;
+    localComputerMcp?: boolean;
+    composioMcp?: boolean;
+    agentsMcp?: boolean;
+    phoneMcp?: boolean;
+    images?: boolean;
+    queueing?: boolean;
+    toolLoop?: boolean;
+  };
+  /** Which computer destinations this engine can be given at all, shipped by
+   *  the registry's describe() so failover filters instead of restating it. */
+  computerReach?: Partial<Record<"box" | "vps" | "vm" | "local", boolean>>;
   models: {
     default: string;
     options?: ReadonlyArray<{ id: string; effortLevels?: readonly EffortLevel[]; supportsEffort?: boolean }>;
@@ -365,10 +386,16 @@ export function eligibleAutoFallbackChain(
     botId: string;
     currentInstanceId: string;
     effort?: EffortLevel;
+    /** Computer destinations the failing turn holds; a fallback that cannot
+     *  reach every one of them would lose the turn's computer tools, so it
+     *  is not a fallback at all (E5).  A candidate without a shipped reach
+     *  predates the field and stays eligible, matching the old behavior. */
+    requires?: Partial<Record<"box" | "vps" | "vm" | "local", boolean>>;
     isCooling: (botId: string, instanceId: string, model: string) => boolean;
     priority: readonly string[];
   },
 ): ModelSelection[] {
+  const needed = (["box", "vps", "vm", "local"] as const).filter((kind) => input.requires?.[kind] === true);
   const viable = candidates
     .map((candidate, order) => ({ candidate, order }))
     .filter(({ candidate }) => {
@@ -381,7 +408,8 @@ export function eligibleAutoFallbackChain(
         candidate.snapshot.quota?.capped !== true &&
         candidate.snapshot.quota?.models?.[model]?.capped !== true &&
         Boolean(model) &&
-        !input.isCooling(input.botId, candidate.instanceId, model)
+        !input.isCooling(input.botId, candidate.instanceId, model) &&
+        needed.every((kind) => candidate.computerReach?.[kind] !== false)
       );
     })
     .sort((a, b) => {
@@ -473,6 +501,22 @@ export function inspectThreadOwners(
     }
   }
   return { owners, inspectionFailed };
+}
+
+/** How far an auto-review stop reaches (server/index.ts
+ * `stopTurnForReview`).  `instance` stops only the engine that took the
+ * refused step and closes only its cards: another engine is live on the same
+ * thread, which is a room running two members at once, and stopping the
+ * thread would stop a member the reviewer never refused.  `thread` is the
+ * person's own Stop, which also settles in-process asks and peer approvals:
+ * the step's engine has the thread to itself, or the step did not say which
+ * engine took it, so the only safe stop is all of it. */
+export function reviewStopScope(args: {
+  instanceId: string | undefined;
+  liveInstanceIds: readonly string[];
+}): "instance" | "thread" {
+  if (!args.instanceId) return "thread";
+  return args.liveInstanceIds.some((id) => id !== args.instanceId) ? "instance" : "thread";
 }
 
 export async function interruptThreadOwners(

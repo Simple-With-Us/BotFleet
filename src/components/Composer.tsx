@@ -1,10 +1,19 @@
+import { createSTTSession, disposeAppleSTTSession, type STTSession } from "@/lib/call-stt";
+import { sessionKeyterms } from "@/lib/stt-keyterms";
+import { acceptComposerTranscript } from "@/lib/composer-dictation";
+import { mergeCloudSttCapabilities } from "@/lib/cloud-stt-capabilities";
+import { pickSTTProvider } from "@/lib/transcription-provider";
+import { useTranscriptionAvailability } from "@/lib/use-transcription-availability";
 import { track } from "@/lib/analytics";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowUp, Check, Clock, Hand, Mic, Paperclip, ShieldCheck, Square, Users, X, Zap, Hash, AppWindow } from "lucide-react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentProps } from "react";
+import { currentCall, useOnCall } from "@/lib/call";
+import { ArrowUp, Check, Clock, Hand, Mic, Paperclip, ShieldCheck, Square, Users, Zap, Hash, AppWindow, MessageSquare, Pencil, Trash2, Terminal } from "lucide-react";
 import { useStore, visibleMessages, type Bot, type Group, type Message } from "@/state/store";
+import { botSupportsImageAttachments } from "@/lib/model-images";
 import { cn } from "@/lib/cn";
-import { useComposerDraft } from "@/lib/drafts";
+import { botThreadDraftId, foldSentDrafts, getDraft, getDraftAttachments, getStore, migrateThreadDraft, useComposerDraft, useFailedSendRestore, type SentDraft } from "@/lib/drafts";
 import { BotMascot } from "./Avatar";
+import { BotOffComposer } from "./BotOffComposer";
 import { ComposerAttachments, pathForFile } from "./ComposerAttachments";
 import { LocalComputerAutoWarning } from "./LocalComputerAutoWarning";
 import {
@@ -24,8 +33,14 @@ import { PendingApprovalActions, PendingApprovalPanel, pendingApprovals } from "
 import { useDesktopCapabilities } from "./DesktopCapabilities";
 import { ReplyQuote } from "./ReplyQuote";
 import { instanceSupportsLocalComputer } from "@/lib/local-computer";
+import { queuedChipLabel, useUpdateDrain } from "@/lib/update-control";
 import { requiresLocalAutoConsent } from "../../shared/local-auto-consent";
 import { resolveRoomLabels } from "../../shared/terminology";
+import {
+  parseBusySendDefault,
+  shouldInterruptForBusySteer,
+  type BusySendDefault,
+} from "../../shared/busy-send-default.ts";
 import { readCachedInventory } from "@/lib/connected-apps-cache";
 import {
   autocompleteQueryAt,
@@ -33,6 +48,11 @@ import {
   applyAutocomplete,
   type AutocompleteChoice,
 } from "@/lib/composer-autocomplete";
+import {
+  botCommandAutocompleteChoices,
+  fetchBotCommands,
+} from "@/lib/bot-commands-client";
+import type { BotCommandsResponse } from "../../shared/bot-commands.ts";
 
 function PermissionModeSelector({ bot, onSetAuto }: { bot: Bot; onSetAuto: (auto: boolean) => void }) {
   const [open, setOpen] = useState(false);
@@ -65,10 +85,11 @@ function PermissionModeSelector({ bot, onSetAuto }: { bot: Bot; onSetAuto: (auto
         type="button"
         aria-haspopup="menu"
         aria-expanded={open}
+        aria-label={label}
         onClick={() => setOpen((current) => !current)}
         className="flex h-8 items-center gap-1.5 whitespace-nowrap rounded-full border border-hairline/20 bg-transparent px-3 text-[13px] text-ink-secondary hover:bg-raised hover:text-ink"
       >
-        <Icon size={14} className="opacity-70" />
+        <Icon size={14} className="opacity-70" aria-hidden="true" />
         {label}
       </button>
 
@@ -92,11 +113,11 @@ function PermissionModeSelector({ bot, onSetAuto }: { bot: Bot; onSetAuto: (auto
               }}
               className="flex items-start gap-3 px-4 py-3 text-left hover:bg-raised-hover"
             >
-              <Hand size={16} className="mt-0.5 shrink-0 opacity-70" />
+              <Hand size={16} className="mt-0.5 shrink-0 opacity-70" aria-hidden="true" />
               <div className="flex w-full flex-col gap-0.5">
                 <div className="flex items-center justify-between text-[14px] text-ink">
                   Ask for Approval
-                  {mode === "ask" && <Check size={14} />}
+                  {mode === "ask" && <Check size={14} aria-hidden="true" />}
                 </div>
                 <div className="text-[13px] text-ink-secondary">Ask before actions that need your permission</div>
               </div>
@@ -111,11 +132,11 @@ function PermissionModeSelector({ bot, onSetAuto }: { bot: Bot; onSetAuto: (auto
               }}
               className="flex items-start gap-3 px-4 py-3 text-left hover:bg-raised-hover"
             >
-              <ShieldCheck size={16} className="mt-0.5 shrink-0 opacity-70" />
+              <ShieldCheck size={16} className="mt-0.5 shrink-0 opacity-70" aria-hidden="true" />
               <div className="flex w-full flex-col gap-0.5">
                 <div className="flex items-center justify-between text-[14px] text-ink">
                   Approve for Me
-                  {mode === "auto" && <Check size={14} />}
+                  {mode === "auto" && <Check size={14} aria-hidden="true" />}
                 </div>
                 <div className="text-[13px] text-ink-secondary">
                   Keep going automatically; destructive and sensitive actions still ask
@@ -129,14 +150,41 @@ function PermissionModeSelector({ bot, onSetAuto }: { bot: Bot; onSetAuto: (auto
   );
 }
 
-/** Renders the editable message composer and its pending attachments. */
-export function Composer({
+/** Renders the editable message composer and its pending attachments.
+ *
+ *  A 1:1 bot that is switched Off (shared/bot-power.ts) gets the disabled
+ *  state instead: the harness refuses every new turn for it, so offering an
+ *  input would only collect a message that can never send.  The chat above
+ *  stays as it was, and the draft survives (it is keyed by bot, not by this
+ *  component).  Rooms keep their composer: a message there still lands in the
+ *  transcript, and an Off member is skipped with a notice. */
+export function Composer(props: ComponentProps<typeof ComposerInner>) {
+  const { state: store, dispatch: send } = useStore();
+  const bot = props.bot;
+  if (bot && !props.group && bot.off === true) {
+    // Read the live record, not the prop, so a Turn On from another window
+    // swaps the real composer back in without a remount of the whole chat.
+    const live = store.bots.find((candidate) => candidate.id === bot.id) ?? bot;
+    if (live.off === true) {
+      return (
+        <BotOffComposer
+          botName={live.name}
+          onTurnOn={() => send({ type: "updateBot", botId: live.id, patch: { off: false } })}
+        />
+      );
+    }
+  }
+  return <ComposerInner {...props} />;
+}
+
+function ComposerInner({
   bot,
   group,
   members,
   onEditLast,
   replyTo,
   onClearReply,
+  onRestoreReply,
   locked = false,
 }: {
   bot?: Bot;
@@ -145,11 +193,25 @@ export function Composer({
   onEditLast?: () => void;
   replyTo?: Message | null;
   onClearReply?: () => void;
+  /** A send the server refused: put the message it replied to back. */
+  onRestoreReply?: (message: Message) => void;
   /** New rooms keep the composer inert until their setup is saved or skipped. */
   locked?: boolean;
 }) {
   const { state, dispatch } = useStore();
   const { capabilities } = useDesktopCapabilities();
+  const cloudConfigured = useTranscriptionAvailability();
+  const cloudStt = useMemo(
+    () => mergeCloudSttCapabilities(state.config?.callStt?.cloud, cloudConfigured),
+    [state.config?.callStt?.cloud, cloudConfigured],
+  );
+  const dictationAvailable = pickSTTProvider({
+    cloudStt,
+    appleSpeechAvailable: capabilities.dictation.available && Boolean(window.ogb?.speechStart),
+    platform: window.ogb?.platform ?? "unknown",
+    explicitPreference: state.config?.callStt?.provider ?? undefined,
+    ladder: state.config?.callStt?.ladder,
+  }).provider !== null;
   // Unified target: a 1:1 bot thread or a room. In a room the @ picker
   // offers members plus @everyone; explicit mentions override the room's
   // configured default responder.
@@ -173,9 +235,39 @@ export function Composer({
     : (bot?.name ?? "The bot");
   // Per-thread draft: switching bots unmounts this component, so both the
   // text and its attachment chips have to outlive it (see lib/drafts).
-  const [text, setText, attachments, setAttachments] = useComposerDraft(
-    group ? `group:${group.id}:${group.threadId}` : `bot:${bot?.id ?? ""}`,
-  );
+  // A browsed non-active thread drafts under its own key; the active
+  // thread keeps the legacy per-bot key.
+  const draftId = group
+    ? `group:${group.id}:${group.threadId}`
+    : botThreadDraftId(
+        bot?.id ?? "",
+        bot?.threadId ?? "",
+        state.bots.find((candidate) => candidate.id === bot?.id)?.threadId ?? bot?.threadId ?? "",
+      );
+  const [text, setText, attachments, setAttachments] = useComposerDraft(draftId);
+  // A thread typed while browsed drafts under its per-thread key; when
+  // that thread becomes the active one this composer resolves the legacy
+  // per-bot key instead.  Carry the text across so Switch keeps what was
+  // typed — scoped to this bot going active on the migrated thread, so
+  // closing a view or switching bots never moves text between threads.
+  const prevDraftId = useRef(draftId);
+  useEffect(() => {
+    const previous = prevDraftId.current;
+    prevDraftId.current = draftId;
+    if (!bot || group || previous === draftId) return;
+    const perThread = previous.match(/^bot:([^:]+):(.+)$/);
+    const [, migratedBotId, migratedThreadId] = perThread ?? [];
+    if (!migratedBotId || !migratedThreadId || `bot:${migratedBotId}` !== draftId || migratedBotId !== bot.id) return;
+    const liveThreadId = state.bots.find((candidate) => candidate.id === bot.id)?.threadId;
+    if (liveThreadId !== migratedThreadId) return;
+    const store = getStore();
+    migrateThreadDraft(store, previous, draftId);
+    setText(getDraft(store, draftId));
+    setAttachments(getDraftAttachments(store, draftId));
+  }, [bot, group, draftId, state.bots, setText, setAttachments]);
+  // The composer clears the moment a message goes out; a send the server
+  // refuses, or cannot be reached for, hands it all back through this.
+  const restoreFailedSend = useFailedSendRestore<Message>(threadId, onRestoreReply);
   const addAttachments = useCallback(
     (next: Attachment[]) => setAttachments((prev) => [...prev, ...next]),
     [setAttachments],
@@ -202,6 +294,12 @@ export function Composer({
     [text, setText, setAttachments],
   );
   const [recording, setRecording] = useState(false);
+  const onCall = useOnCall();
+  // Stop the independent composer microphone before the call overlay starts
+  // its own session. Keep the draft, but never resume capture implicitly.
+  useLayoutEffect(() => {
+    if (onCall && recording) setRecording(false);
+  }, [onCall, recording]);
   const [speechError, setSpeechError] = useState<string | null>(null);
   const [caret, setCaret] = useState(0);
   const [highlight, setHighlight] = useState(0);
@@ -209,15 +307,16 @@ export function Composer({
   const inputRef = useRef<HTMLTextAreaElement>(null);
   // what was typed before the mic went on — partials append after it
   const baseText = useRef("");
+  // Long-lived STT session for push-to-talk dictation. Created lazily on
+  // first mic-on so the cloud-side assemblyai session only spins up when a
+  // user explicitly opts into dictation. Composer is much simpler than
+  // CallView: no queue, no approvals, just one ongoing capture turn at a time.
+  const sttSessionRef = useRef<STTSession | null>(null);
 
   // image paste is offered only when every bot that will actually answer
   // can open one. sendGroup routes to mentions, else the room default —
   // `members.some` would let a mixed room send <attached-image> to Grok.
-  const botSupportsImages = (candidate?: Bot) =>
-    Boolean(
-      candidate &&
-        state.instances.find((i) => i.instanceId === candidate.modelSelection.instanceId)?.capabilities?.images,
-    );
+  const botSupportsImages = (candidate?: Bot) => botSupportsImageAttachments(state.instances, candidate);
   const imageTargetsSupport = (message: string) => {
     if (!group) return botSupportsImages(bot);
     const responders = roomRespondersForComposer(message, members ?? [], group);
@@ -225,10 +324,37 @@ export function Composer({
   };
   const engineSupportsImages = imageTargetsSupport(text);
 
-  // ── Autocomplete picker (@ for bots, # for apps/channels/etc) ──
+  // ── Autocomplete picker (@ bots, # apps/channels, / slash commands) ──
+  const [botCommands, setBotCommands] = useState<BotCommandsResponse | null>(null);
+  useEffect(() => {
+    if (!bot || group) {
+      setBotCommands(null);
+      return;
+    }
+    const botId = bot.id;
+    const threadId = bot.threadId;
+    setBotCommands(null);
+    let cancelled = false;
+    void fetchBotCommands(botId, threadId)
+      .then((menu) => {
+        if (cancelled) return;
+        setBotCommands(menu);
+      })
+      .catch(() => {
+        if (!cancelled) setBotCommands(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [bot?.id, bot?.threadId, group]);
+
   const triggerInfo = autocompleteQueryAt(text, caret);
   const candidates = useMemo(() => {
     if (!triggerInfo || triggerInfo.start === dismissedAt) return [];
+    if (triggerInfo.trigger === "/") {
+      if (!bot || group || !botCommands) return [];
+      return botCommandAutocompleteChoices(botCommands, triggerInfo.query);
+    }
     const connectedApps = readCachedInventory()?.services;
     const terminology = resolveRoomLabels(state.config?.terminology);
     return getAutocompleteCandidates(triggerInfo, {
@@ -241,10 +367,36 @@ export function Composer({
       members,
       terminologySingular: terminology.singular,
     });
-  }, [triggerInfo, dismissedAt, state.bots, state.groups, state.routines, state.config?.terminology, bot?.id, group, members]);
+  }, [
+    triggerInfo,
+    dismissedAt,
+    state.bots,
+    state.groups,
+    state.routines,
+    state.config?.terminology,
+    bot?.id,
+    group,
+    members,
+    botCommands,
+  ]);
   const pickerOpen = candidates.length > 0;
+  const pickerLabel =
+    triggerInfo?.trigger === "@"
+      ? "Tag a Bot"
+      : triggerInfo?.trigger === "/"
+        ? "Slash Commands"
+        : "Link an App or Channel";
+  const pickerHeading =
+    triggerInfo?.trigger === "@"
+      ? "Bots"
+      : triggerInfo?.trigger === "/"
+        ? "Commands"
+        : "Apps & Channels";
 
-  useEffect(() => setHighlight(0), [triggerInfo?.start, triggerInfo?.query]);
+  useEffect(() => {
+    const firstPickable = candidates.findIndex((candidate) => !candidate.disabled);
+    setHighlight(firstPickable >= 0 ? firstPickable : 0);
+  }, [triggerInfo?.start, triggerInfo?.query, candidates]);
 
   // one line at rest, then grow with the draft — hard cap at six lines
   useEffect(() => {
@@ -257,7 +409,7 @@ export function Composer({
   }, [text]);
 
   const pickCandidate = (choice: AutocompleteChoice) => {
-    if (!triggerInfo) return;
+    if (!triggerInfo || choice.disabled) return;
     const { text: nextText, caret: newCaret } = applyAutocomplete(text, caret, triggerInfo, choice);
     setText(nextText);
     setCaret(newCaret);
@@ -273,10 +425,103 @@ export function Composer({
   // the moment the room settles. 1:1 mid-turn sends still POST (the harness
   // queue), but stay off the transcript until drain — the chip here is the
   // pending row so they cannot become the active leaf mid-turn.
-  const [queued, setQueued] = useState<{ text: string; replyToId?: string } | null>(null);
-  const pendingChip = group
-    ? queued?.text
-    : (bot ? state.pendingQueued?.[bot.threadId]?.at(-1)?.text : undefined);
+  const [queued, setQueued] = useState<{ text: string; replyToId?: string; sent: SentDraft<Message> } | null>(null);
+  const pendingItems = useMemo(() => {
+    if (group) {
+      // The room's held message is one client-side entry, so the pill's entry
+      // is built here rather than read from pendingQueued.  It carries the
+      // same shape the bot branch gets, attachments included, so handleEditQueued
+      // has one contract instead of two.
+      return queued
+        ? [{
+            queueId: "group-queued",
+            text: queued.text,
+            at: Date.now(),
+            reply: queued.sent.reply,
+            attachments: queued.sent.attachments,
+          }]
+        : [];
+    }
+    if (!bot) return [];
+    return state.pendingQueued?.[bot.threadId] ?? [];
+  }, [group, queued, bot, state.pendingQueued]);
+
+  /** Focus the composer and put the caret at the end of whatever it now holds.
+ * Not entry.text: on a restore the box is the merged draft, which can be a
+ * different length from the composed text the pill was showing. */
+const focusCaretToEnd = useCallback(() => {
+  requestAnimationFrame(() => {
+    const input = inputRef.current;
+    if (!input) return;
+    input.focus();
+    const end = input.value.length;
+    input.setSelectionRange(end, end);
+  });
+}, []);
+
+const handleEditQueued = useCallback((entry: { queueId: string; text: string; rawText?: string; reply?: Message; attachments: Attachment[] }) => {
+    if (group && queued) {
+      // The held message carries more than its text: the draft it took, which
+      // is where the attachment chips live, and the reply it was aimed at.
+      // Putting only entry.text back would leave the attachments stranded on
+      // a queued item that no longer exists and drop the reply target, so the
+      // restore path is the one a refused send already uses.
+      const { sent } = queued;
+      setQueued(null);
+      restoreFailedSend(sent);
+      return;
+    }
+    if (bot) {
+      // The bot's queued entry carries reply (the Message, not just the id)
+      // and the attachments, because the server only sees replyToId: putting
+      // only entry.text back would drop the reply quote and the attachment
+      // chips on the floor.  Restore through the same path a refused send
+      // uses so the quote and the chips come back with the text.
+      const sent: SentDraft<Message> = {
+        draftId,
+        threadId,
+        text: entry.rawText ?? entry.text,
+        attachments: entry.attachments,
+        reply: entry.reply,
+      };
+      dispatch({
+        type: "cancelQueued",
+        botId: bot.id,
+        queueId: entry.queueId,
+        // Restore only once the harness has taken the queued message, and
+        // only when it did: a fast resend while the DELETE is in flight sends
+        // the original and the copy together, and restoring on failure leaves
+        // the draft sitting beside a message that is still going to be sent.
+        // A refusal keeps the pill and the error, and the person can edit
+        // again.  The caret moves with the restore, because on this path the
+        // box is still empty until the DELETE answers.
+        onSettled: () => {
+          restoreFailedSend(sent);
+          focusCaretToEnd();
+        },
+      });
+      return;
+    }
+  }, [group, bot, queued, draftId, threadId, dispatch, restoreFailedSend, focusCaretToEnd]);
+
+  const handleCancelQueued = useCallback((queueId: string) => {
+    if (group) {
+      setQueued(null);
+    } else if (bot) {
+      dispatch({ type: "cancelQueued", botId: bot.id, queueId });
+    }
+  }, [group, bot, dispatch]);
+
+  const handleSteerQueued = useCallback(() => {
+    if (group) {
+      dispatch({ type: "interruptGroup", groupId: group.id });
+    } else if (bot) {
+      dispatch({ type: "interrupt", botId: bot.id });
+    }
+  }, [group, bot, dispatch]);
+  // While an update holds new work, a queued send waits for the restart and
+  // not for the bot, which may be idle.  The chip says so.
+  const updateHolding = useUpdateDrain() !== null;
   // a chip on its own is a message: the send control has to appear for it
   const fileInput = useRef<HTMLInputElement>(null);
   const [autoWarn, setAutoWarn] = useState(false);
@@ -317,20 +562,32 @@ export function Composer({
   };
 
   const hasContent = Boolean(text.trim()) || attachments.length > 0;
-  const send = (opts?: { steerNow?: boolean }) => {
+  const busySendDefault = parseBusySendDefault(state.config?.busySendDefault);
+  const send = (opts?: { steerNow?: boolean; queueOnly?: boolean }) => {
     if (locked) return;
-    if (attachments.some((attachment) => attachment.kind === "image") && !imageTargetsSupport(text)) {
-      dispatch({ type: "error", message: "The selected responder does not support image attachments." });
-      return;
+    if (attachments.some((attachment) => attachment.kind === "image")) {
+      if (!imageTargetsSupport(text)) {
+        dispatch({ type: "error", message: "The selected responder does not support image attachments." });
+        return;
+      }
+      // The server knows the active task's model override and updates that
+      // task (or the bot only when it inherits the default) before dispatch.
+      // A composer-side bot patch would overwrite an unrelated default.
     }
     const t = composeMessage(text, attachments);
     if (!t) return;
+    const sent: SentDraft<Message> = { draftId, threadId, text, attachments, reply: replyTo ?? undefined };
+    const onError = () => restoreFailedSend(sent);
     if (busy && group) {
       if (opts?.steerNow) {
         dispatch({ type: "interruptGroup", groupId: group.id });
-        dispatch({ type: "sendGroup", groupId: group.id, text: t, replyToId: replyTo?.id });
+        dispatch({ type: "sendGroup", groupId: group.id, text: t, replyToId: replyTo?.id, onError });
       } else {
-        setQueued({ text: t, replyToId: replyTo?.id });
+        // one message is held at a time: a second joins it, never replaces it
+        setQueued((held) => {
+          const merged = held ? foldSentDrafts(held.sent, sent) : sent;
+          return { text: composeMessage(merged.text, merged.attachments), replyToId: merged.reply?.id, sent: merged };
+        });
       }
       setText("");
       setAttachments([]);
@@ -338,14 +595,34 @@ export function Composer({
       return;
     }
     if (group) {
-      dispatch({ type: "sendGroup", groupId: group.id, text: t, replyToId: replyTo?.id });
+      dispatch({ type: "sendGroup", groupId: group.id, text: t, replyToId: replyTo?.id, onError });
       track("message_sent", { room: true });
     } else if (bot) {
-      dispatch({ type: "send", botId: bot.id, text: t, replyToId: replyTo?.id });
-      if (busy && opts?.steerNow) {
+      let busyDelivery: BusySendDefault | undefined;
+      if (opts?.queueOnly) busyDelivery = "queue";
+      else if (opts?.steerNow) busyDelivery = "steer";
+      else if (busy) busyDelivery = busySendDefault;
+      const interruptForSteer = shouldInterruptForBusySteer(busy, busyDelivery, canSteer);
+      dispatch({
+        type: "send",
+        botId: bot.id,
+        text: t,
+        // Composer text before compose.  Queued edit restores this, not the wire prompt.
+        rawText: text,
+        replyToId: replyTo?.id,
+        reply: replyTo ?? undefined,
+        attachments,
+        onError,
+        busyDelivery,
+      });
+      if (interruptForSteer) {
         dispatch({ type: "interrupt", botId: bot.id });
       }
-      track("message_sent", { driver: bot.modelSelection?.instanceId, queued: busy && !canSteer, steerNow: opts?.steerNow });
+      track("message_sent", {
+        driver: bot.modelSelection?.instanceId,
+        queued: busy && busyDelivery === "queue",
+        steerNow: busyDelivery === "steer" && interruptForSteer,
+      });
     }
     setText("");
     setAttachments([]);
@@ -356,51 +633,141 @@ export function Composer({
     if (group) {
       if (queued.text.includes("<attached-image ") && !imageTargetsSupport(queued.text)) {
         dispatch({ type: "error", message: "The selected responder does not support image attachments." });
+        restoreFailedSend(queued.sent);
         setQueued(null);
         return;
       }
-      dispatch({ type: "sendGroup", groupId: group.id, text: queued.text, replyToId: queued.replyToId });
+      dispatch({
+        type: "sendGroup",
+        groupId: group.id,
+        text: queued.text,
+        replyToId: queued.replyToId,
+        onError: () => restoreFailedSend(queued.sent),
+      });
       track("message_sent", { room: true, queued: true });
     }
     setQueued(null);
-  }, [busy, queued, group, members, state.instances, dispatch]);
+  }, [busy, queued, group, members, state.instances, dispatch, restoreFailedSend]);
 
   // native dictation: partials stream into the input while the Swift
   // helper runs; the final transcript stays in the box, ready to edit/send
   useEffect(() => {
-    if (!recording) return;
+    if (!recording || onCall) return;
+    let detached = false;
+    let finalizing = false;
+    let offTranscript: () => void = () => {};
+    let offEnd: () => void = () => {};
     const bridge = window.ogb;
     if (!bridge) {
       setRecording(false);
       return;
     }
     setSpeechError(null);
-    const offTranscript = bridge.onSpeechTranscript((line) => {
-      if (typeof line.text === "string") {
+    let session: STTSession | null = sttSessionRef.current;
+
+    const handleTranscript = (line: { text: string; partial: boolean; error?: string }) => {
+      if (acceptComposerTranscript(detached, finalizing, Boolean(currentCall())) && line.text) {
         const base = baseText.current;
         setText(base ? `${base} ${line.text}` : line.text);
       }
-    });
-    const offEnd = bridge.onSpeechEnd(({ code }) => {
+    };
+    const handleEnd = ({ code, reason }: { code: number; reason?: string }) => {
       setRecording(false);
       if (code === 2) {
-        setSpeechError("Dictation is only available on macOS for now.");
+        setSpeechError(
+          reason === "no-provider"
+            ? "Add an AssemblyAI API key in Settings to use dictation on this computer."
+            : "Dictation needs a working provider.\u00A0 Add an AssemblyAI key, or install the desktop app for macOS.",
+        );
       } else if (code === 1) {
         setSpeechError(
-          "Dictation needs Microphone + Speech Recognition access — System Settings → Privacy & Security.",
+          session?.provider === "assemblyai"
+            ? "Cloud dictation stopped.\u00A0 Check the AssemblyAI key, connection, and microphone access."
+            : reason === "helper-build-failed"
+              ? "The dictation helper couldn't be built.\u00A0 Install Apple's Command Line Tools and try again."
+              : "Dictation needs Microphone + Speech Recognition access — System Settings → Privacy & Security.",
         );
       }
-    });
-    void bridge.speechStart();
-    return () => {
-      offTranscript();
-      offEnd();
-      void bridge.speechStop();
     };
-  }, [recording]);
+
+    const wireExisting = async () => {
+      if (!session) {
+        const status = await bridge.transcription?.status?.().catch(() => undefined);
+        const hostPlatform = bridge.platform ?? "unknown";
+        const choice = pickSTTProvider({
+          cloudStt: mergeCloudSttCapabilities(state.config?.callStt?.cloud, Boolean(status?.configured)),
+          appleSpeechAvailable: hostPlatform === "darwin" && capabilities.dictation.available,
+          platform: hostPlatform,
+          explicitPreference: state.config?.callStt?.provider ?? undefined,
+          ladder: state.config?.callStt?.ladder,
+        });
+        if (choice.provider === null) {
+          if (!detached) {
+            setRecording(false);
+            setSpeechError(
+              choice.missing === "cloud-stt-key"
+                ? "Add an AssemblyAI API key in Settings to use dictation on this computer."
+                : "Dictation isn't available in this app build.",
+            );
+          }
+          return;
+        }
+        if (detached) return;
+        try {
+          session = createSTTSession(choice.provider);
+          sttSessionRef.current = session;
+        } catch (error) {
+          if (!detached) {
+            setRecording(false);
+            setSpeechError(error instanceof Error ? error.message : String(error));
+          }
+          return;
+        }
+      }
+      if (detached || currentCall()) return;
+      offTranscript = session.onTranscript(handleTranscript);
+      offEnd = session.onEnd(handleEnd);
+      session.start({ keyterms: sessionKeyterms([...(bot ? [bot.name] : []), ...(members?.map((member) => member.name) ?? [])], state.config?.callStt?.keyterms ?? []) }).catch(() => {
+        if (!detached) {
+          setRecording(false);
+          setSpeechError(session?.provider === "assemblyai"
+            ? "Cloud dictation couldn't start.\u00A0 Check the AssemblyAI key, connection, and microphone access."
+            : "The microphone couldn't start.\u00A0 Check Microphone and Speech Recognition access.");
+        }
+      });
+    };
+    void wireExisting();
+
+    return () => {
+      detached = true;
+      // A call takes the microphone, so drop the composer listener at once
+      // and close its cloud socket without a final hidden draft update.
+      const callStarted = Boolean(currentCall());
+      finalizing = !callStarted && session?.provider === "assemblyai";
+      if (callStarted) {
+        offTranscript();
+        offEnd();
+      }
+      // An ordinary mic-off still drains the last formatted cloud turn.
+      void (async () => {
+        try {
+          if (session?.provider === "assemblyai" && !callStarted) await session.finish();
+          else await session?.stop();
+        } catch {
+          // A provider can close during navigation; still detach listeners.
+        } finally {
+          finalizing = false;
+          offTranscript();
+          offEnd();
+          if (session?.provider === "apple") disposeAppleSTTSession(session);
+          if (sttSessionRef.current === session) sttSessionRef.current = null;
+        }
+      })();
+    };
+  }, [recording, onCall]);
 
   const toggleMic = () => {
-    if (!capabilities.dictation.available || !window.ogb) {
+    if (onCall || !dictationAvailable || !window.ogb) {
       setSpeechError("Dictation isn't available in this build.");
       return;
     }
@@ -439,12 +806,17 @@ export function Composer({
 
   useEffect(() => {
     const onGlobalPaste = (e: ClipboardEvent) => {
-      // 2026-09-26 BF-FIXER fix: the previous early-return for INPUT/TEXTAREA/contenteditable
-      // skipped file-intake for any paste that landed inside the composer textarea. The textarea's
-      // own onPaste (below) only handles text -- it never reads clipboardData.files, so screenshot
-      // and other file pastes were silently dropped. Drop the early-return entirely; filesFromClipboard
-      // returns [] for text-only pastes, so we won't double-intake text. The textarea onPaste comment
-      // ("rely on onGlobalPaste for files to prevent double-intake") now matches reality.
+      // Skip other editables (Search, Settings, CommandPalette, etc.) so file paste stays local.
+      // Composer textarea (inputRef) and pastes outside any text field still run file intake;
+      // filesFromClipboard returns [] for text-only clips, so text paste stays in textarea onPaste.
+      const target = e.target as HTMLElement | null;
+      if (
+        target &&
+        target !== inputRef.current &&
+        (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)
+      ) {
+        return;
+      }
       const files = filesFromClipboard(e.clipboardData);
       if (files.length > 0) {
         e.preventDefault();
@@ -476,65 +848,92 @@ export function Composer({
           {speechError}
         </div>
       )}
-        {pendingChip && (
-          <div className="mb-2 flex items-center gap-2 rounded-lg border border-hairline/40 bg-panel px-3 py-2 text-[12.5px] text-ink-secondary">
-            <Clock size={13} className="shrink-0" />
-            <span className="min-w-0 flex-1 truncate" title={`Queued — sends when ${busyName} finishes: “${pendingChip}”`}>
-              Queued — sends when {busyName} finishes: “{pendingChip}”
-            </span>
-            <button
-              type="button"
-              onClick={() => {
-                if (group) {
-                  dispatch({ type: "interruptGroup", groupId: group.id });
-                } else if (bot) {
-                  dispatch({ type: "interrupt", botId: bot.id });
-                }
-              }}
-              className="rounded px-2 py-0.5 text-[11.5px] font-medium text-accent hover:bg-raised hover:underline"
-              title="Interrupt current turn and send queued messages immediately"
-            >
-              Steer Now
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                if (group) {
-                  setQueued(null);
-                  return;
-                }
-                if (!bot) return;
-                for (const entry of state.pendingQueued?.[bot.threadId] ?? []) {
-                  dispatch({ type: "cancelQueued", botId: bot.id, queueId: entry.queueId });
-                }
-              }}
-              aria-label="Cancel Queued Message"
-              title="Cancel Queued Message"
-              className="flex size-5 shrink-0 items-center justify-center rounded text-ink-secondary hover:bg-raised hover:text-ink"
-            >
-              <X size={13} strokeWidth={2.5} />
-            </button>
+        {pendingItems.length > 0 && (
+          <div className="mb-2 flex flex-col gap-1.5 max-h-36 overflow-y-auto pr-0.5">
+            {pendingItems.map((entry) => (
+              <div
+                key={entry.queueId}
+                className="flex items-center gap-2 rounded-xl border border-hairline/40 bg-panel px-3 py-1.5 text-[12.5px] text-ink shadow-xs transition-colors hover:border-hairline"
+              >
+                <MessageSquare size={13} className="shrink-0 text-ink-secondary" aria-hidden="true" />
+                <span
+                  className="min-w-0 flex-1 truncate font-normal"
+                  title={queuedChipLabel({ text: entry.text, busyName, draining: updateHolding })}
+                >
+                  {queuedChipLabel({ text: entry.text, busyName, draining: updateHolding })}
+                </span>
+                {/* Labeled actions, not bare glyphs: three 24px icons in a row were
+                    easy to mis-tap, and "Steer" beside "Cancel" says which one
+                    ends the wait.  The order is Steer, Edit, Cancel — Edit sits in
+                    the middle so neither neighbour reads as its default.  The
+                    accessible names stay the ones the screen readers and the
+                    tests already use. */}
+                <div className="flex shrink-0 items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={handleSteerQueued}
+                    className={cn(
+                      "inline-flex h-6 items-center gap-1 whitespace-nowrap rounded-md border px-2 text-[11.5px] font-medium leading-none transition-colors",
+                      "border-accent/30 bg-accent/10 text-accent hover:bg-accent/15",
+                    )}
+                    title="Stops the current turn and sends this now."
+                    aria-label="Steer Now"
+                  >
+                    <ArrowUp size={12} strokeWidth={2.5} aria-hidden="true" />
+                    Steer
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleEditQueued(entry)}
+                    className={cn(
+                      "inline-flex h-6 items-center gap-1 whitespace-nowrap rounded-md border px-2 text-[11.5px] font-medium leading-none transition-colors",
+                      "border-hairline/40 bg-inset/30 text-ink-secondary hover:bg-raised hover:text-ink",
+                    )}
+                    title="Puts the message back in the composer to edit."
+                    aria-label="Edit Queued Message"
+                  >
+                    <Pencil size={12} strokeWidth={2} aria-hidden="true" />
+                    Edit
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleCancelQueued(entry.queueId)}
+                    className={cn(
+                      "inline-flex h-6 items-center gap-1 whitespace-nowrap rounded-md border px-2 text-[11.5px] font-medium leading-none transition-colors",
+                      "border-hairline/40 bg-inset/30 text-ink-secondary hover:bg-raised hover:text-danger",
+                    )}
+                    title="Cancel Queued Message"
+                    aria-label="Cancel Queued Message"
+                  >
+                    <Trash2 size={12} strokeWidth={2} aria-hidden="true" />
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            ))}
           </div>
         )}
         {pickerOpen && (
           <div
             role="listbox"
-            aria-label={triggerInfo?.trigger === "@" ? "Tag a Bot" : "Link an App or Channel"}
+            aria-label={pickerLabel}
             className="absolute bottom-full left-2 z-20 mb-2 w-80 max-h-72 overflow-y-auto rounded-xl border border-hairline/40 bg-raised shadow-lg"
           >
             <div className="border-b border-hairline/20 px-3 py-1.5 text-[11px] font-medium uppercase tracking-wider text-ink-secondary">
-              {triggerInfo?.trigger === "@" ? "Bots" : "Apps & Channels"}
+              {pickerHeading}
             </div>
             {candidates.map((item, i) => (
               <button
                 key={item.id}
                 role="option"
                 aria-selected={i === highlight}
+                disabled={item.disabled}
                 onClick={() => pickCandidate(item)}
                 onMouseEnter={() => setHighlight(i)}
                 className={cn(
                   "flex w-full items-center gap-2.5 px-3 py-2 text-left transition-colors",
                   i === highlight ? "bg-raised-hover" : "",
+                  item.disabled ? "cursor-not-allowed opacity-50" : "",
                 )}
               >
                 {item.kind === "bot" ? (
@@ -557,6 +956,10 @@ export function Composer({
                   <span className="flex size-6 shrink-0 items-center justify-center rounded-full bg-raised text-accent">
                     <Zap size={14} aria-hidden="true" />
                   </span>
+                ) : item.kind === "command" ? (
+                  <span className="flex size-6 shrink-0 items-center justify-center rounded-full bg-raised text-accent">
+                    <Terminal size={14} aria-hidden="true" />
+                  </span>
                 ) : (
                   <span className="flex size-6 shrink-0 items-center justify-center rounded-full bg-raised text-accent">
                     <AppWindow size={14} aria-hidden="true" />
@@ -565,7 +968,9 @@ export function Composer({
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-1.5">
                     <span className="truncate text-[14px] font-medium text-ink" title={item.name}>
-                      {triggerInfo?.trigger}{item.name}
+                      {item.kind === "command" && item.command
+                        ? item.command.label
+                        : `${triggerInfo?.trigger ?? ""}${item.name}`}
                     </span>
                   </div>
                   {item.description && (
@@ -585,11 +990,17 @@ export function Composer({
             can type again, so a waiting bot is impossible to miss. */}
         {approval && (
           <div className="mb-2 overflow-hidden rounded-2xl border border-accent/40 bg-card">
-            <PendingApprovalPanel pending={approval} count={approvals.length} index={0} />
+            <PendingApprovalPanel
+              pending={approval}
+              count={approvals.length}
+              index={0}
+              bypassActive={Boolean(approvalBot?.bypassPermissions)}
+            />
             <PendingApprovalActions
               pending={approval}
               threadId={threadId}
               bot={approvalBot}
+              totalCount={approvals.length}
               onCancelTurn={() => {
                 if (group) dispatch({ type: "interruptGroup", groupId: group.id });
                 else if (bot) dispatch({ type: "interrupt", botId: bot.id });
@@ -636,7 +1047,7 @@ export function Composer({
                 title="Attach a File"
                 className="flex size-8 shrink-0 items-center justify-center rounded-full text-ink-secondary hover:bg-control hover:text-ink"
               >
-                <Paperclip size={17} />
+                <Paperclip size={17} aria-hidden="true" />
               </button>
               {autoBot && <PermissionModeSelector bot={autoBot} onSetAuto={setAuto} />}
             </div>
@@ -681,13 +1092,24 @@ export function Composer({
               if (e.key === "ArrowDown" || e.key === "ArrowUp") {
                 e.preventDefault();
                 const delta = e.key === "ArrowDown" ? 1 : -1;
-                setHighlight((h) => (h + delta + candidates.length) % candidates.length);
+                if (candidates.length === 0) return;
+                let next = highlight;
+                for (let step = 0; step < candidates.length; step += 1) {
+                  next = (next + delta + candidates.length) % candidates.length;
+                  if (!candidates[next]?.disabled) {
+                    setHighlight(next);
+                    break;
+                  }
+                }
                 return;
               }
               if (e.key === "Enter" || e.key === "Tab") {
-                e.preventDefault();
-                pickCandidate(candidates[highlight]);
-                return;
+                const choice = candidates[highlight];
+                if (choice && !choice.disabled) {
+                  e.preventDefault();
+                  pickCandidate(choice);
+                  return;
+                }
               }
               if (e.key === "Escape") {
                 e.preventDefault();
@@ -701,11 +1123,18 @@ export function Composer({
               onEditLast();
               return;
             }
+            // When queued messages exist and input is empty, Cmd/Ctrl+Enter steers all queued messages
+            if (pendingItems.length > 0 && !hasContent && (e.metaKey || e.ctrlKey) && e.key === "Enter") {
+              e.preventDefault();
+              handleSteerQueued();
+              return;
+            }
             // Shift+Enter inserts a newline; plain Enter sends; Alt/Cmd+Enter steers immediately when busy
             if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
               e.preventDefault();
-              if (busy && !canSteer && (e.altKey || e.metaKey)) {
-                send({ steerNow: true });
+              if (busy && (e.altKey || e.metaKey)) {
+                if (group) send({ steerNow: true });
+                else send(busySendDefault === "queue" ? { steerNow: true } : { queueOnly: true });
               } else {
                 send();
               }
@@ -720,12 +1149,16 @@ export function Composer({
               ? "Answer the approval above to continue"
               : recording
               ? "Listening…"
-              : busy && canSteer
+              : pendingItems.length > 0
+              ? "Cmd/Ctrl+Enter steers all queued messages"
+              : busy && busySendDefault === "steer" && canSteer
                 ? `${busyName} is working — Enter sends this into the running turn`
               : busy
                 ? group
                   ? `${busyName} is working — Enter queues your message`
-                  : `${busyName} is working — sends when this turn finishes`
+                  : busySendDefault === "steer"
+                    ? `${busyName} is working — Enter steers after stopping the turn`
+                    : `${busyName} is working — sends when this turn finishes`
                 : group
                   ? `Message ${group.name} — ${groupComposerHint(group, members ?? [])}`
                   : `Message ${bot?.name ?? ""}`
@@ -744,10 +1177,10 @@ export function Composer({
             className="flex size-8 shrink-0 items-center justify-center rounded-full text-ink-secondary hover:bg-raised hover:text-ink"
             title="Stop"
           >
-            <Square size={14} className="fill-current" />
+            <Square size={14} className="fill-current" aria-hidden="true" />
           </button>
         )}
-        {!locked && !busy && !hasContent && capabilities.dictation.available && (
+        {!locked && !busy && !hasContent && !onCall && dictationAvailable && (
           <button
             onClick={toggleMic}
             aria-label={recording ? "Stop Dictation" : "Start Dictation"}
@@ -759,10 +1192,10 @@ export function Composer({
             )}
             title={recording ? "Stop Dictation (Esc)" : "Dictate"}
           >
-            <Mic size={18} />
+            <Mic size={18} aria-hidden="true" />
           </button>
         )}
-        {hasContent && !locked && busy && !canSteer && (
+        {hasContent && !locked && busy && busySendDefault === "queue" && (
           <button
             type="button"
             onClick={() => send({ steerNow: true })}
@@ -770,7 +1203,7 @@ export function Composer({
             title="Steer Now — send message and interrupt current turn immediately (Alt+Enter)"
             className="flex h-8 items-center gap-1 rounded-full bg-accent px-2.5 text-[12px] font-medium text-white shadow-sm hover:brightness-110"
           >
-            <Zap size={13} className="fill-current" />
+            <Zap size={13} className="fill-current" aria-hidden="true" />
             <span>Steer Now</span>
           </button>
         )}
@@ -778,20 +1211,37 @@ export function Composer({
           <button
             type="button"
             onClick={(e) => {
-              if (busy && !canSteer && e.altKey) {
-                send({ steerNow: true });
+              if (busy && e.altKey) {
+                if (group) send({ steerNow: true });
+                else send(busySendDefault === "queue" ? { steerNow: true } : { queueOnly: true });
               } else {
                 send();
               }
             }}
-            aria-label={busy && canSteer ? "Send into the running turn" : busy ? "Queue Message (Alt+Click to Steer Now)" : "Send Message"}
-            title={busy && canSteer ? "Send into the running turn" : busy ? "Sends when the current turn finishes (Alt+Click to Steer Now)" : "Send"}
+            aria-label={
+              busy && busySendDefault === "steer" && canSteer
+                ? "Send into the running turn"
+                : busy
+                  ? busySendDefault === "queue"
+                    ? "Queue Message (Alt+Click to Steer Now)"
+                    : "Steer after stopping the turn (Alt+Click to queue)"
+                  : "Send Message"
+            }
+            title={
+              busy && busySendDefault === "steer" && canSteer
+                ? "Send into the running turn"
+                : busy
+                  ? busySendDefault === "queue"
+                    ? "Sends when the current turn finishes (Alt+Click to Steer Now)"
+                    : "Stops the turn and sends now (Alt+Click to queue)"
+                  : "Send"
+            }
             className={cn(
               "flex size-8 shrink-0 items-center justify-center rounded-full text-white",
-              busy && !canSteer ? "bg-raised text-ink-secondary hover:bg-raised-hover" : "bg-accent hover:brightness-110",
+              busy && busySendDefault === "queue" ? "bg-raised text-ink-secondary hover:bg-raised-hover" : "bg-accent hover:brightness-110",
             )}
           >
-            {busy && !canSteer ? <Clock size={15} /> : <ArrowUp size={17} />}
+            {busy && busySendDefault === "queue" ? <Clock size={15} aria-hidden="true" /> : <ArrowUp size={17} aria-hidden="true" />}
           </button>
         )}
           </div>

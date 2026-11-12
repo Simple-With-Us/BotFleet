@@ -26,4 +26,18 @@ describe("RenameTitle", () => {
 
     expect(markup).toContain("Open Maus&#x27;s Profile");
   });
+
+  it("omits role=button and tabIndex when embedded in an outer row", () => {
+    const markup = renderToStaticMarkup(createElement(RenameTitle, {
+      value: "Fixer",
+      onCommit: vi.fn(),
+      onActivate: vi.fn(),
+      embedded: true,
+    }));
+
+    expect(markup).not.toContain('role="button"');
+    expect(markup).not.toContain("tabindex");
+    expect(markup).toContain("cursor-pointer");
+    expect(markup).toContain("Fixer");
+  });
 });
