@@ -152,6 +152,10 @@ async function spawnHoldingMarker(marker, t) {
       return false;
     })(),
     once(child, "exit").then(() => false),
+    new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(false), 5_000);
+      timer.unref?.();
+    }),
   ]);
   return { child, opened };
 }

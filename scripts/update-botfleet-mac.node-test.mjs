@@ -114,7 +114,8 @@ async function readFirstLineFromStream(stream, { timeoutMs = 10_000 } = {}) {
       if (!buffer.includes("\n")) return;
       stream.off("data", onData);
       clearTimeout(timer);
-      resolve(Number(buffer.trim()));
+      const line = buffer.slice(0, buffer.indexOf("\n")).trim();
+      resolve(Number(line));
     };
     stream.on("data", onData);
     const timer = setTimeout(() => {
