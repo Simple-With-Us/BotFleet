@@ -59,8 +59,8 @@ export interface ResourceTriggerInput {
 export const METRIC_LABEL: Record<ResourceMetric, string> = {
   disk_free_gb: "Disk free (GB)",
   disk_used_pct: "Disk used (%)",
-  ram_used_pct: "RAM used (%)",
+  ram_used_pct: "Memory used (%)",
   swap_used_pct: "Swap used (%)",
   swap_used_gb: "Swap used (GB)",
-  load_1m: "CPU load (1m)",
+  load_1m: "Processor load (1 min)",
 };

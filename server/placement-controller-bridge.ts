@@ -9,8 +9,9 @@
 //     controller's own queue, where the record is written as `queued` and
 //     the controller places it.
 //   * A server mode on a host that does not hold the controller:  the start
-//     is refused with a reason.  Forwarding has no route yet, and a local
-//     waiting list would be a second queue outside the authoritative one
+//     is forwarded to the controller if a forwarder is configured; otherwise
+//     refused with a reason.  Forwarding sends `enqueue` to the authoritative
+//     controller so a local waiting list does not become a second queue
 //     (`docs/plans/2026-10-29-native-server-mode.md`).
 //
 // The bridge never writes the mode record:  only the person writes the mode,
@@ -73,10 +74,14 @@ export interface PlacementBridgeDeps {
   view: () => PlacementBridgeView;
   /** The controller's own queue:  admit one job, idempotent on its id. */
   enqueue: (message: EnqueueMessage) => PlacementEnqueueResult;
-  /** Why a queued job waits, read from the queue's own record. */
+  /** Why a queued job waits, read from the queue's own record.  Used when
+   *  this host is the controller.  A forwarded admission uses the reason on
+   *  the controller's reply instead, because this host does not own the job. */
   queuedReason: (jobId: string) => string | undefined;
   /** The authority's unreachable sweep:  the jobs whose worker went quiet. */
   sweepUnreachable: () => string[];
+  /** Optional forwarder to the controller when this host does not hold the controller. */
+  forward?: (message: EnqueueMessage) => PlacementEnqueueResult;
 }
 
 /** How often the unreachable sweep runs when nothing else says. */
@@ -90,6 +95,24 @@ export const DEFAULT_PLACEMENT_HEARTBEAT_SECONDS = 15;
  *  service's own default, so a host with no knob placed behaves exactly as
  *  it did before the knobs existed. */
 export const DEFAULT_PLACEMENT_UNREACHABLE_AFTER_SECONDS = 30;
+
+/** The wait text an admission shows when the controller named none. */
+const FORWARDED_QUEUE_REASON = "waiting for an eligible host";
+
+/** A thrown forwarder is the controller link failing.  `admit` has to turn
+ *  that into a refusal: `JobRegistry.start` does not catch it.  `detail` is
+ *  the Error message, already taken off the thrown value, or empty. */
+function forwardLinkRefusal(detail: string): string {
+  const clipped = detail.replace(/\s+/g, " ").trim().slice(0, 200);
+  const why = clipped.length > 0 ? ` (${clipped})` : "";
+  return `The controller could not be reached${why}, so no job is admitted.  Run the command with bash if it is short, or switch to This Mac Only in Settings.`;
+}
+
+function admissionQueuedReason(reply: EnqueueReply, local: string | undefined): string {
+  if (reply.queuedReason && reply.queuedReason.length > 0) return reply.queuedReason;
+  if (local && local.length > 0) return local;
+  return FORWARDED_QUEUE_REASON;
+}
 
 export class PlacementControllerBridge {
   private readonly deps: PlacementBridgeDeps;
@@ -123,6 +146,42 @@ export class PlacementControllerBridge {
     }
     if (view.mode === "localOnly") return { kind: "local" };
     if (view.controllerId !== this.deps.hostId) {
+      if (this.deps.forward) {
+        if (!view.acknowledged) {
+          return {
+            kind: "refused",
+            reason: `The placement mode record is not held at the current fence (epoch ${view.epoch}), so no job is admitted.  Re-apply the mode in Settings, or switch to This Mac Only.`,
+          };
+        }
+        const message: EnqueueMessage = {
+          version: PLACEMENT_WIRE_VERSION,
+          controllerId: view.controllerId,
+          epoch: view.epoch,
+          jobId: request.jobId,
+          botId: request.botId,
+          threadId: request.threadId,
+          command: request.command,
+          cwd: request.cwd,
+          timeoutMs: request.timeoutMs,
+        };
+        // The forwarder is the network hop.  A throw is that hop failing,
+        // and it has to come back as a refusal rather than escape `admit`.
+        let result: PlacementEnqueueResult;
+        try {
+          result = this.deps.forward(message);
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : "";
+          return { kind: "refused", reason: forwardLinkRefusal(detail) };
+        }
+        if (!result.ok) return { kind: "refused", reason: result.reason };
+        const reply = result.reply;
+        if (!reply.accepted) {
+          return { kind: "refused", reason: reply.reason ?? "The controller did not admit the job." };
+        }
+        // The job record is on the controller.  Its reply carries the wait
+        // text; this host's queue does not have the job.
+        return this.queuedAdmission(reply, admissionQueuedReason(reply, undefined));
+      }
       return {
         kind: "refused",
         reason: `This computer runs in ${view.mode}, and the controller is ${view.controllerId} at epoch ${view.epoch}, so this computer does not admit jobs of its own.  Run the command with bash if it is short, or switch to This Mac Only in Settings.`,
@@ -150,10 +209,14 @@ export class PlacementControllerBridge {
     if (!reply.accepted) {
       return { kind: "refused", reason: reply.reason ?? "The controller did not admit the job." };
     }
+    return this.queuedAdmission(reply, admissionQueuedReason(reply, this.deps.queuedReason(reply.jobId)));
+  }
+
+  private queuedAdmission(reply: EnqueueReply, queuedReason: string): PlacementAdmission {
     return {
       kind: "queued",
       jobId: reply.jobId,
-      queuedReason: this.deps.queuedReason(reply.jobId) ?? "waiting for an eligible host",
+      queuedReason,
       controllerId: reply.controllerId,
       epoch: reply.epoch,
       duplicate: reply.duplicate === true,
