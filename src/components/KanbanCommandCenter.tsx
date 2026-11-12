@@ -86,6 +86,11 @@ const COLLAPSIBLE_RUN_STATUSES: ReadonlySet<RoutineRunStatus> = new Set<RoutineR
  *  attention module's trigger key, so a webhook or resource trigger can never
  *  merge with a scheduled routine, and a manual run folds into the routine it
  *  belongs to. */
+function repeatKey(run: RoutineRun): string {
+  const kind = run.status === "waiting" ? "approval" : "failure";
+  return `${kind}:${triggerAttentionKey(run) ?? `routine:${run.routineId}`}`;
+}
+
 /** Every field a person might type into the kanban search box for one card. */
 export function cardSearchText(card: KanbanCardItem): string {
   const parts: string[] = [card.title];
@@ -100,11 +105,6 @@ export function cardSearchText(card: KanbanCardItem): string {
     if (run.output) parts.push(run.output);
   }
   return parts.join(" ");
-}
-
-function repeatKey(run: RoutineRun): string {
-  const kind = run.status === "waiting" ? "approval" : "failure";
-  return `${kind}:${triggerAttentionKey(run) ?? `routine:${run.routineId}`}`;
 }
 
 /** One card per routine for runs that need a person.  A routine that breaks on
@@ -153,7 +153,7 @@ export function collapseAttentionCards(cards: KanbanCardItem[]): KanbanCardItem[
       if (member === group.newest) continue;
       const text = cardSearchText(member);
       if (!text) continue;
-      // Keep only what the standing card does not already show in title or subtitle.
+      // An older run with the same searchable text adds nothing the standing card lacks.
       if (visibleText && text.toLowerCase() === visibleText) continue;
       foldedBits.push(text);
     }

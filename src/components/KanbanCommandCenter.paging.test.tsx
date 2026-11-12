@@ -87,10 +87,10 @@ afterEach(() => {
   host = undefined;
 });
 
-function mount(
+function renderBoard(
   runs: RoutineRun[],
-  handlers: { onSelectBotInApp?: (botId: string, appId: string) => void } = {},
   filterAppId?: string | null,
+  handlers: { onSelectBotInApp?: (botId: string, appId: string) => void } = {},
 ) {
   const value = {
     state: { ...initialState, bots: [bot], groups: [app], routineRuns: runs },
@@ -98,9 +98,6 @@ function mount(
     flushBotPatches: async () => {},
     refreshInstances: async () => {},
   };
-  host = document.createElement("div");
-  document.body.appendChild(host);
-  root = createRoot(host);
   act(() => {
     root!.render(
       createElement(
@@ -116,6 +113,17 @@ function mount(
       ),
     );
   });
+}
+
+function mount(
+  runs: RoutineRun[],
+  handlers: { onSelectBotInApp?: (botId: string, appId: string) => void } = {},
+  filterAppId?: string | null,
+) {
+  host = document.createElement("div");
+  document.body.appendChild(host);
+  root = createRoot(host);
+  renderBoard(runs, filterAppId, handlers);
   return host;
 }
 
@@ -209,6 +217,17 @@ describe("KanbanCommandCenter Show More", () => {
     expect(showMoreButton(container, "completed")).toBeUndefined();
     // Completed paging did not touch the Attention Queue.
     expect(cards(container, "attention")).toHaveLength(COLUMN_VISIBLE_CAP);
+  });
+
+  it("resets expanded columns when the app filter changes", () => {
+    const container = mount(failingRuns(40));
+    click(showMoreButton(container, "attention")!);
+    expect(cards(container, "attention")).toHaveLength(COLUMN_VISIBLE_CAP * 2);
+
+    renderBoard(failingRuns(40), "app-1");
+    expect(cards(container, "attention")).toHaveLength(COLUMN_VISIBLE_CAP);
+    expect(showMoreButton(container, "attention")?.textContent).toBe("Show 15 More");
+    expect(container.textContent).toContain("Filtered to Ops Console");
   });
 
   it("resets expanded columns when the search filter changes", async () => {
