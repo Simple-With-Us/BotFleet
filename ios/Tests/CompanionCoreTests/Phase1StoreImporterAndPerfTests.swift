@@ -554,8 +554,12 @@ struct Phase1StoreImporterAndPerfTests {
         // Nothing was dropped, so there is no receipt gap to report.
         #expect(report.warnings.contains { $0.contains("routine request receipt") } == false)
 
-        // The manual snooze has no native column either, and says so.
-        #expect(report.warnings.contains { $0.contains("bot snooze") })
+        // The manual snooze is migrated into the native bots table (BF-2651).
+        let bots = try await db.loadBots()
+        let snoozedBot = bots.first { $0.id == "bot-1" }
+        #expect(snoozedBot?.snoozedUntil == 1_700_000_900)
+        #expect(report.warnings.contains { $0.contains("bot snooze") } == false)
+        #expect(report.isFullyVerified == true)
     }
 
     // MARK: - Review Fix: a cross-thread message id fails the import in the importer's own words
@@ -1507,5 +1511,83 @@ struct Phase1StoreImporterAndPerfTests {
         ]
         let commentOnlyReport = MacPerformanceHarness.verifyVisualParity(macAppSources: commentOnlySources)
         #expect(commentOnlyReport.appSurfaceVerified == false)
+    }
+
+    // MARK: - BF-2651: Manual Bot Snooze Column & Migration
+
+    @Test("The native store migrates manual bot snoozes into the bots table with schema upgrade and warns on unmapped bots (BF-2651)")
+    func testManualBotSnoozeMigrationAndSchemaUpgrade() async throws {
+        let tempDir = try makeTempDir("bot-snooze-test")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        try populateSourceFixture(in: tempDir)
+
+        // Write routines.json with one mapped snooze and one unmapped snooze.
+        let routinesJson = """
+        {
+          "routines": [
+            {
+              "id": "routine-1",
+              "name": "Nightly Check",
+              "botId": "bot-1",
+              "enabled": true,
+              "createdAt": 1700000010000,
+              "updatedAt": 1700000020000
+            }
+          ],
+          "runs": [],
+          "botSnoozes": {
+            "bot-1": 1700000950000,
+            "bot-ghost": 1700000850000
+          },
+          "routineRequestReceipts": []
+        }
+        """
+        try Data(routinesJson.utf8).write(to: tempDir.appendingPathComponent("routines.json"))
+
+        // Create an older SQLite database with the pre-migration bots schema (no snoozed_until column).
+        let dbPath = tempDir.appendingPathComponent("native.sqlite").path
+        var rawDb: OpaquePointer?
+        #expect(sqlite3_open(dbPath, &rawDb) == SQLITE_OK)
+        let oldBotsSchema = """
+        CREATE TABLE bots (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            thread_id TEXT,
+            created_at REAL NOT NULL,
+            raw_json TEXT NOT NULL
+        );
+        """
+        #expect(sqlite3_exec(rawDb, oldBotsSchema, nil, nil, nil) == SQLITE_OK)
+        sqlite3_close(rawDb)
+
+        // Opening via DatabaseService must migrate the bots table and add snoozed_until column cleanly.
+        let db = try DatabaseService(path: dbPath)
+        let importer = StoreImporter(batchSize: 10)
+        let report = try await importer.importStore(from: tempDir, into: db)
+
+        // Mapped snooze migrated to bot-1 in bots table.
+        let bots = try await db.loadBots()
+        let snoozedBot = bots.first { $0.id == "bot-1" }
+        #expect(snoozedBot?.snoozedUntil == 1_700_000_950)
+
+        // Unmapped snooze is warned rather than dropping silently.
+        #expect(report.warnings.contains { $0.contains("1 manual bot snooze(s) name a bot not in bots.json") })
+        #expect(report.isParityVerified == true)
+        #expect(report.isFullyVerified == false)
+
+        // Upserting a bot with a manual snooze updates the column.
+        let updatedBot = StoredBotRecord(
+            id: "bot-1",
+            name: "Updated Bot",
+            threadId: nil,
+            createdAt: 1_700_000_000,
+            snoozedUntil: 1_700_001_000,
+            rawJSON: "{}"
+        )
+        try await db.upsertBot(updatedBot)
+        let reloadedBots = try await db.loadBots()
+        let reloadedBot = reloadedBots.first { $0.id == "bot-1" }
+        #expect(reloadedBot?.snoozedUntil == 1_700_001_000)
     }
 }
