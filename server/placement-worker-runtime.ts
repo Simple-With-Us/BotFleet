@@ -26,7 +26,6 @@ import {
   type ReportReply,
 } from "../shared/placement.ts";
 import type {
-  PlacementWorkerClient,
   WorkerCallOutcome,
   PayloadReply,
   StopReceiptReply,
