@@ -186,6 +186,10 @@ const SAFE_EVENT_KEYS = [
   "windowEnd",
   "occurredAt",
   "providerRequestId",
+  // The canonical AI usage block (UM-1592): model ids, token counts, timing
+  // and a seat tag, never prompt text, so it is safe to persist and it must
+  // survive a retry or the receiver prices the replay as an unlabelled event.
+  "ai",
 ] as const;
 
 const SAFE_METADATA_KEYS = new Set([
@@ -193,7 +197,21 @@ const SAFE_METADATA_KEYS = new Set([
   "inputTokens",
   "outputTokens",
   "cachedInputTokens",
+  "cacheWriteTokens",
+  "cacheWriteOneHourTokens",
+  "reasoningTokens",
   "latencyMs",
+  "ttftMs",
+  "servedModel",
+  "seat",
+  "usageGap",
+  "stopReason",
+  // Non-turn spend (TTS, avatar images, speech summaries, voice-call
+  // sessions): flat counts and a surface name.
+  "kind",
+  "characters",
+  "characterSource",
+  "images",
   "success",
   "tokenType",
   "model",
@@ -201,6 +219,18 @@ const SAFE_METADATA_KEYS = new Set([
   "usageReported",
   "roomId",
   "estimatedCostUsd",
+  // De-duplication keys against a child harness's own telemetry: an engine
+  // id, an opaque native session id and a timestamp, never prompt text.
+  // The queued batch is what gets sent, so a key missing here never arrives.
+  "childHarness",
+  "childSessionId",
+  "turnStartedAt",
+  "billedCallProofVersion",
+  "billedCallId",
+  "billedCallModel",
+  "billedCallOutput",
+  "billedCallCacheRead",
+  "billedCallCacheWrite",
 ]);
 
 export function usageTelemetryDestinationHash(endpoint: string): string {

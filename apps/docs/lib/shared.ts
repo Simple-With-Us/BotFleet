@@ -4,7 +4,7 @@ export const docsContentRoute = '/llms.mdx/docs';
 export const appName = 'BotFleet Docs';
 
 export const gitConfig = {
-  user: 'jaywedgeworth22',
+  user: 'Simple-With-Us',
   repo: 'BotFleet',
   branch: 'main',
 };

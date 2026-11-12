@@ -2,6 +2,13 @@
 // file dropped onto the window. Chips fold back into a normal prompt on
 // send, so every driver receives the same message shape.
 import { formatByteSize as formatSize } from "../../shared/text-format.ts";
+import {
+  isFiniteJsonNumber,
+  isJsonObject,
+  isJsonString,
+  type JsonObject,
+  type JsonValue,
+} from "../../server/schema.ts";
 
 export type PasteAttachment = {
   kind: "paste";
@@ -30,39 +37,39 @@ export type ImageAttachment = {
 
 export type Attachment = PasteAttachment | FileAttachment | ImageAttachment;
 
-export function isAttachment(value: unknown): value is Attachment {
-  if (!value || typeof value !== "object") return false;
-  const attachment = value as Record<string, unknown>;
-  if (typeof attachment.id !== "string" || !validSize(attachment.size)) return false;
+export function isAttachment(value: JsonValue | undefined): value is Attachment {
+  if (!isJsonObject(value)) return false;
+  const attachment: JsonObject = value;
+  if (!isJsonString(attachment.id) || !validSize(attachment.size)) return false;
   if (attachment.kind === "paste") {
     return (
-      typeof attachment.text === "string" &&
-      typeof attachment.lines === "number" &&
+      isJsonString(attachment.text) &&
+      isFiniteJsonNumber(attachment.lines) &&
       Number.isInteger(attachment.lines) &&
       attachment.lines >= 1
     );
   }
   if (attachment.kind === "file") {
     return (
-      typeof attachment.path === "string" &&
+      isJsonString(attachment.path) &&
       attachment.path.length > 0 &&
-      typeof attachment.name === "string"
+      isJsonString(attachment.name)
     );
   }
   if (attachment.kind === "image") {
     return (
-      typeof attachment.path === "string" &&
+      isJsonString(attachment.path) &&
       attachment.path.length > 0 &&
-      typeof attachment.name === "string" &&
-      typeof attachment.mime === "string" &&
+      isJsonString(attachment.name) &&
+      isJsonString(attachment.mime) &&
       attachment.mime.startsWith("image/")
     );
   }
   return false;
 }
 
-function validSize(value: unknown): value is number {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0;
+function validSize(value: JsonValue | undefined): value is number {
+  return isFiniteJsonNumber(value) && value >= 0;
 }
 
 /** Past this, a paste stops reading as typing and becomes an attachment.
@@ -240,7 +247,7 @@ export async function previewableImageFile(file: {
   const globals = globalThis as typeof globalThis & ImageTranscodeGlobals;
   const createBitmap = globals.createImageBitmap;
   const doc = globals.document;
-  if (typeof createBitmap !== "function" || !doc) return file;
+  if (!createBitmap || !doc) return file;
   try {
     const blob = new Blob([await file.arrayBuffer()], { type: mime || "application/octet-stream" });
     const bitmap = await createBitmap(blob);
@@ -280,9 +287,11 @@ export async function imageAttachmentFromFile(file: {
   if (!isImageFile(prepared)) return null;
   if (prepared.size > IMAGE_MAX_BYTES) throw Object.assign(new Error(`${attachmentLabel(file)} exceeds 10 MB`), { status: 413 });
   const bytes = new Uint8Array(await prepared.arrayBuffer());
+  const contentType =
+    prepared.type || file.type || guessImageMime(file) || "application/octet-stream";
   const response = await fetch("/api/attachments", {
     method: "POST",
-    headers: { "content-type": prepared.type || file.type },
+    headers: { "content-type": contentType },
     body: bytes,
   });
   if (!response.ok) {
@@ -346,9 +355,10 @@ export type DroppedFile = Pick<File, "name" | "size" | "type" | "text"> & {
 export async function attachmentsFromDroppedFiles<T extends DroppedFile>(
   files: readonly T[],
   getPath: (file: T) => string,
-  opts: { allowImages?: boolean } = {},
+  opts: { allowImages?: boolean; onUploadFailure?: (failure: Error) => void } = {},
 ): Promise<{ attachments: Attachment[]; rejectedNames: string[] }> {
   const allowImages = opts.allowImages !== false;
+  const onUploadFailure = opts.onUploadFailure;
   const results = await Promise.all(
     files.map(async (file) => {
       let path = "";
@@ -367,8 +377,8 @@ export async function attachmentsFromDroppedFiles<T extends DroppedFile>(
             arrayBuffer: file.arrayBuffer,
           });
           if (image) return { attachment: image };
-        } catch {
-          // Fall through to generic upload or reject.
+        } catch (caught) {
+          onUploadFailure?.(caught instanceof Error ? caught : new Error(String(caught)));
         }
       }
       if (isInlineText(file) && file.size <= INLINE_DROP_LIMIT) {
@@ -392,8 +402,8 @@ export async function attachmentsFromDroppedFiles<T extends DroppedFile>(
             }
             return { attachment: uploaded };
           }
-        } catch {
-          // Named below as rejected.
+        } catch (caught) {
+          onUploadFailure?.(caught instanceof Error ? caught : new Error(String(caught)));
         }
       }
       return { rejectedName: attachmentLabel(file) };
@@ -532,6 +542,10 @@ export async function intakeFiles<T extends DroppedFile & { type: string }>(
   const attachments: Attachment[] = [];
   const rejectedNames: string[] = [];
   const imageErrors: string[] = [];
+  const uploadFailures: string[] = [];
+  const recordUploadFailure = (file: T, failure: Error) => {
+    uploadFailures.push(`${attachmentLabel(file)}: ${failure.message}`);
+  };
   // Finish each selected file in sequence so the chips retain the order in
   // which the user chose or dropped them.
   for (const file of files) {
@@ -539,12 +553,16 @@ export async function intakeFiles<T extends DroppedFile & { type: string }>(
       try {
         const attachment = await uploadImage(file);
         if (attachment) attachments.push(attachment);
+        else imageErrors.push(`${attachmentLabel(file)}: could not be uploaded`);
       } catch (err) {
         imageErrors.push(`${attachmentLabel(file)}: ${err instanceof Error ? err.message : "upload failed"}`);
       }
       continue;
     }
-    const result = await attachmentsFromDroppedFiles([file], getPath, { allowImages });
+    const result = await attachmentsFromDroppedFiles([file], getPath, {
+      allowImages,
+      onUploadFailure: (failure) => recordUploadFailure(file, failure),
+    });
     attachments.push(...result.attachments);
     rejectedNames.push(...result.rejectedNames);
   }
@@ -552,8 +570,10 @@ export async function intakeFiles<T extends DroppedFile & { type: string }>(
     ? `${rejectedNames.join(", ")} could not be attached.  Paste, drop, or pick a supported file (images, PDF, Office, zip, audio, video, or text).`
     : null;
   const failed = imageErrors.length ? imageErrors.join("; ") : null;
+  const uploaded = uploadFailures.length ? uploadFailures.join("; ") : null;
+  const detail = [failed, uploaded].filter(Boolean).join("; ") || null;
   return {
     attachments,
-    notice: pathless && failed ? `${pathless} (${failed})` : (pathless ?? failed),
+    notice: pathless && detail ? `${pathless} (${detail})` : (pathless ?? detail),
   };
 }

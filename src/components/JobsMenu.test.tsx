@@ -7,6 +7,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 
 import { initialState, reducer } from "@/state/store";
+import { workPillLabel } from "../../shared/helpers";
 import { jobEndedBadly, jobExitChip, jobWakeSubtitle, type JobSnapshot } from "../../shared/jobs";
 import {
   JOB_FAILED_RED_MS,
@@ -74,6 +75,17 @@ const lost = job({
 const render = (props: Parameters<typeof JobsMenuView>[0]) => renderToStaticMarkup(createElement(JobsMenuView, props));
 
 describe("the jobs pill", () => {
+  it("counts a running helper beside the jobs, and shows a helper on its own", () => {
+    const html = render({ threadId: "thread-1", jobs: [running], helperCount: 1, now: NOW });
+    expect(html).toContain("1 Job · 1 Helper");
+    expect(html).toContain('aria-label="Background Jobs: 1 running, 1 helper running"');
+    expect(workPillLabel(2, 1)).toBe("2 Jobs · 1 Helper");
+    const only = render({ threadId: "thread-1", jobs: [], helperCount: 1, now: NOW });
+    expect(only).toContain("1 Helper");
+    expect(only).toContain('aria-label="Helpers: 1 helper running"');
+    expect(only).not.toContain('aria-haspopup="dialog"');
+  });
+
   it("is hidden when the thread has no jobs, or only ones that ended long ago", () => {
     expect(render({ threadId: "thread-1", jobs: [], now: NOW })).toBe("");
     const stale = job({ id: "job_01JSTALE000000000000000000", status: "completed", exitCode: 0, endedAt: NOW - 3 * 3600_000 });

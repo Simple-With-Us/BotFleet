@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { z } from "zod";
 import { removeTempDir, spawnDetached, waitForExit } from "./testing/cleanup.ts";
 import { harnessReady } from "./testing/harness-ready.ts";
 
@@ -33,6 +34,21 @@ interface Msg {
   /** steer-queue: waiting to auto-send when the live turn settles */
   queued?: boolean;
 }
+
+// One line of native/<threadId>.ndjson.  appendNative writes at, dir, source
+// and msg; msg is the ACP JSON-RPC object.  The envelope is closed.  Extra
+// keys on msg (jsonrpc, id) are stripped, and method plus params stay.
+const NativeEventSchema = z
+  .object({
+    at: z.string(),
+    dir: z.enum(["in", "out"]),
+    source: z.string(),
+    msg: z.object({
+      method: z.string(),
+      params: z.unknown(),
+    }),
+  })
+  .strict();
 
 /** Client-side view of the active branch: walk parentId links from the leaf. */
 function activePath(messages: Msg[], leafId: string | null): Msg[] {
@@ -286,15 +302,42 @@ posixOnly("conversation branching e2e (fake ACP fleet)", () => {
       }, "the reply after switching back");
 
       // the fake's reply is fixed, so the proof lives in the native protocol
-      // tee: the prompt each engine received must carry the history it lacks
+      // tee: the prompt each engine received must carry the history it lacks.
+      // appendNative queues the line and writes it later, so the reply can be
+      // visible before session/prompt reaches disk.  A loaded macOS runner
+      // read the file in that gap and saw two prompts (run 38613821975).
       const bot = await getBot(created.id);
-      const log = readFileSync(join(home, ".botfleet", "native", `${bot.threadId}.ndjson`), "utf8");
-      const prompts = log
-        .split("\n")
-        .filter(Boolean)
-        .map((line) => JSON.parse(line))
-        .filter((e) => e.dir === "out" && e.msg?.method === "session/prompt")
-        .map((e) => JSON.stringify(e.msg.params));
+      const promptLines = (): string[] => {
+        let log: string;
+        try {
+          log = readFileSync(join(home, ".botfleet", "native", `${bot.threadId}.ndjson`), "utf8");
+        } catch {
+          return [];
+        }
+        const prompts: string[] = [];
+        for (const line of log.split("\n")) {
+          if (!line) continue;
+          // a line still being appended is not valid JSON yet
+          let event: unknown;
+          try {
+            event = JSON.parse(line);
+          } catch {
+            continue;
+          }
+          const parsed = NativeEventSchema.safeParse(event);
+          if (!parsed.success) continue;
+          if (parsed.data.dir === "out" && parsed.data.msg.method === "session/prompt") {
+            prompts.push(JSON.stringify(parsed.data.msg.params));
+          }
+        }
+        return prompts;
+      };
+      await waitFor(
+        async () => promptLines().length >= 3,
+        "three session/prompt records in the native tee",
+        15_000,
+      );
+      const prompts = promptLines();
       expect(prompts).toHaveLength(3);
       // first engine, first turn: no replay wrapper
       expect(prompts[0]).not.toContain("joining this conversation");

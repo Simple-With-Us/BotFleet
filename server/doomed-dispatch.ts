@@ -81,6 +81,14 @@ export interface DoomedEntry {
   openedAt: number;
   lastFailureAt: number;
   lastError?: string;
+  /** Whether this entry is REFUSING dispatches right now.
+   *
+   *  `list()` deliberately returns more than this: a sub-threshold counter is
+   *  still accumulating toward the threshold, and an expired entry is the
+   *  half-open probe that is allowed through.  Both dispatch normally, so a
+   *  caller that says "is being held" about everything in `list()` reports a
+   *  healthy engine as held after a single transient failure. */
+  open?: boolean;
 }
 
 const key = (botId: string, instanceId: string) => `${botId}:${instanceId}`;

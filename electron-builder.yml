@@ -6,19 +6,19 @@ protocols:
   - name: BotFleet package install
     schemes: [botfleet]
 
-# In-app auto-update reads latest-mac.yml + the .zip (macOS) or latest.yml +
-# the NSIS .exe (Windows) from this repository's own GitHub Releases:
-# jaywedgeworth22/BotFleet, the only place BotFleet releases exist (owner
-# rule, 2026-09-02: one repository per app; no separate releases repo).
+# In-app auto-update reads latest-mac.yml + the .zip (macOS) from this
+# repository's own GitHub Releases: Simple-With-Us/BotFleet, the only place
+# BotFleet releases exist (owner rule, 2026-09-02: one repository per app; no
+# separate releases repo).
 # The repo is public, so no token ever reaches a user's machine. Baked into
-# app-update.yml; both metadata files are emitted here even with
-# --publish never, and must be uploaded to the GitHub release alongside the
-# artifacts — a release missing latest-mac.yml or latest.yml leaves every
-# install stranded on its installed version. Exactly one provider entry:
-# electron-updater reads the first and a duplicate only invites drift.
+# app-update.yml; latest-mac.yml is emitted here even with --publish never,
+# and must be uploaded to the GitHub release alongside the artifacts — a
+# release missing it leaves every install stranded on its installed version.
+# Exactly one provider entry: electron-updater reads the first and a duplicate
+# only invites drift.
 publish:
   - provider: github
-    owner: jaywedgeworth22
+    owner: Simple-With-Us
     repo: BotFleet
 
 directories:
@@ -36,15 +36,24 @@ afterPack: ./scripts/after-pack.mjs
 # ELECTRON_RUN_AS_NODE (the agentcal-hq pattern).
 files:
   - electron/**
+  # The shared STS token module, compiled by `pnpm build:shared` (esbuild
+  # bundle, zod inlined -- the asar carries no node_modules).  Mapped to
+  # `shared/` so the asar layout matches the `../shared/sts-tokens.js`
+  # import in electron/sts-tokens.mjs exactly; a `dist-shared/**` glob
+  # would preserve the build-dir name and land the bundle where nothing
+  # imports it from.  The packaged Electron main process is launched by
+  # Electron itself, never with --experimental-strip-types, so only the
+  # compiled .js ships -- the .ts source would be dead weight no runtime
+  # can load.  dist-shared holds only sts-tokens.js, so no filter is
+  # needed; the .d.ts lives in dist-shared-types and never ships.
+  - from: dist-shared
+    to: shared
   - "!electron/**/*.test.*"
-  - "!electron/resources/speech-helper"
-  - "!electron/resources/speech-helper.swift"
-  - "!electron/resources/speech-helper-Info.plist"
+  - "!electron/resources/speech-helper*"
+  - "!electron/resources/recorder-helper*"
   - "!electron/resources/BotFleet Speech.app/**"
-  - "!electron/resources/recorder-helper"
-  - "!electron/resources/recorder-helper.swift"
-  - "!electron/resources/recorder-helper-Info.plist"
   - "!electron/resources/BotFleet Recorder.app/**"
+  - "!electron/resources/BotFleet Control.app/**"
   - "!**/node_modules/**"
   - package.json
 
@@ -94,6 +103,8 @@ extraResources:
     to: companion
   - from: skills
     to: skills
+  - from: bots
+    to: bots
   - from: dist-native/android-platform-tools
     to: android-platform-tools
 
@@ -121,10 +132,12 @@ mac:
   entitlementsInherit: build/entitlements.mac.inherit.plist
   # the dictation helper is a signed background app — Windows and Linux never see it
   extraResources:
-    - from: electron/resources/BotFleet Speech.app
+    - from: native/helpers/BotFleet Speech.app
       to: BotFleet Speech.app
-    - from: electron/resources/BotFleet Recorder.app
+    - from: native/helpers/BotFleet Recorder.app
       to: BotFleet Recorder.app
+    - from: electron/resources/BotFleet Control.app
+      to: BotFleet Control.app
     # CUA must live outside ASAR. prepare-cua stages the signed executable and
     # a self-contained JS/native SDK bundle selected for macOS arm64.
     # ${arch} resolves per built arch — each bundle carries its own natives
@@ -135,8 +148,10 @@ mac:
     - from: dist-native/cloudflared/darwin-${arch}/cloudflared
       to: cloudflared/cloudflared
   extendInfo:
+    NSAppleEventsUsageDescription: BotFleet asks Control to quit safely when you choose Update Control.
     NSMicrophoneUsageDescription: BotFleet uses the microphone for voice dictation into the composer.
     NSSpeechRecognitionUsageDescription: BotFleet transcribes your voice on-device to type messages for you.
+    NSSpeechSynthesisUsageDescription: BotFleet uses your Apple Personal Voice to speak aloud during calls and voice replies.
     NSAccessibilityUsageDescription: BotFleet uses Accessibility when you let a bot control this Mac.
     NSScreenCaptureUsageDescription: BotFleet uses Screen Recording so bots can see this Mac before acting.
   # Notarization runs manually after the build (notarytool + staple),

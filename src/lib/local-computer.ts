@@ -60,20 +60,20 @@ export function localComputerDisabledReason({
   if (capabilities.localComputer.available) return null;
   if (capabilities.host.platform === "linux") {
     if (capabilities.localComputer.reasonCode === "linux-wayland-seat-safety-blocked") {
-      return "Local computer control is not available on Wayland yet. Sign out and choose Ubuntu on Xorg to use This computer.";
+      return "Local computer control is not available on Wayland yet.  Sign out and choose Ubuntu on Xorg to use This Computer.";
     }
     if (capabilities.localComputer.reasonCode === "wayland-compositor-unsupported") {
-      return "Wayland local control is currently limited to GNOME. Xorg remains available on supported desktops.";
+      return "Wayland local control is currently limited to GNOME.  Xorg remains available on supported desktops.";
     }
     if (!capabilities.localComputer.enabled) {
-      return "Enable the local control beta and complete the Cua Driver checks first.";
+      return "Enable the local control beta and complete the Computer Driver checks first.";
     }
-    return capabilities.localComputer.message ?? "Cua Driver is not ready for local control.";
+    return capabilities.localComputer.message ?? "Computer Driver is not ready for local control.";
   }
   if (capabilities.host.label === "Browser") {
     return "Local computer control requires the desktop app.";
   }
-  return "CUA Driver is not ready for local computer control.";
+  return "Computer Driver is not ready for local computer control.";
 }
 
 export function linuxAutoDescription(): string {
@@ -181,6 +181,6 @@ export function computerDestinationDisabledReason(
   const engine = instances.find((candidate) => candidate.instanceId === bot.modelSelection.instanceId);
   const name = engine?.displayName ?? "This engine";
   return mode === "vm"
-    ? `${name} cannot drive a Local VM.  Choose Claude or an ACP engine, or another destination.`
-    : `${name} cannot drive a remote desktop.  Choose Claude or an ACP engine, or another destination.`;
+    ? `${name} cannot drive a Local VM.\u00A0 Choose Claude or an ACP engine, or another destination.`
+    : `${name} cannot drive a remote desktop.\u00A0 Choose Claude or an ACP engine, or another destination.`;
 }

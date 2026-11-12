@@ -295,3 +295,44 @@ it did not build a second proxy, and it did not re-decide any of the rulings.
   the real `agents-proxy` with `OMB_JOBS=1`, reaching a stub harness — the
   model's `agents_job_start` arrives and the harness's words come back.  The
   driver half is pinned too, so `buildMcpServers` cannot drop the `agents` entry.
+
+## P3 Implementation Notes
+
+Where P3 settled a detail the design above leaves open.  The registry, the
+header jobs dropdown, and the MCP lane were already on main (P1 and P2).  This
+phase is the helper card.
+
+- **One tracker, not a second helper runtime.**  Drivers stamp `subagentId` on
+  the steps a helper owns.  `HelperTracker` turns those into `subagent.updated`,
+  at most once a second while the helper runs and immediately when it finishes.
+  A later bus subscriber patches `helper` onto the transcript row, so the card
+  survives a reload.  Before that patch lands, the row still draws from the
+  tool name.
+- **Which tools are cards.**  After case and separators are folded, Task, Agent,
+  and `spawn_agent` are typed.  `invoke_subagent` and `spawn_subagent` are
+  named.  `task_list` is not a helper.  A helper started by another helper is
+  typed, and one depth deeper.
+- **What the card shows.**  The label, Working, Done, or Failed, the latest
+  step, the tool count, the helper's own tokens, and the duration.  Claude's
+  helper prose stays off the bot bubble, as P0 required.  That usage is an
+  `item.updated` on the helper, and it does not enter
+  `thread.token-usage.updated`.
+- **Capabilities.**  Claude was already `typed`.  Codex is `typed`, because the
+  driver already nests `spawn_agent` steps.  ACP and Antigravity are `named`,
+  so a matching tool title becomes a card.  HTTP engines, pi, grok, and
+  boxagent stay `none`.
+- **The three-at-once cap stays the CLI's, and it stays advisory.**  P3 does
+  not add a second cap.  The card shows the helpers that started.
+- **The header pill.**  It reads "2 Jobs · 1 Helper" and counts a helper only
+  while it runs.  It hides when there is nothing to show.  A failed job still
+  turns the dot red.  A helper-only pill does not open the jobs dialog.
+- **Delegation.**  The live line is derived in the client from the rows after
+  the delegation card, until the next thing a person sent.  A busy bot reads
+  "Working · last step · N tools".  A settled turn that answered reads
+  "Done · N tools".
+- **Not in this phase.**  P4 (the iOS pill and sheet, Mac notifications,
+  swimlanes, and the All Jobs panel) is unchanged.  Background helpers stay off.
+- **A restart settles a running card.**  The tracker lives in memory.  At boot
+  a helper still marked running is stored as failed, with its end at the boot
+  time, so the card stops ticking.  A turn ending settles only the helpers
+  that turn started.  Claude counts each assistant message's usage once.

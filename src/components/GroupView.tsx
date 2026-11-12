@@ -24,12 +24,14 @@ import { effectiveDefaultResponder, groupResponseHint } from "@/lib/group-routin
 import { ChatMarkdown } from "./ChatMarkdown";
 import { MentionText } from "./MentionText";
 import { Composer } from "./Composer";
+import { UpdateDrainNotice } from "./UpdateDrainNotice";
 import { ErrorRow, TurnErrorAnnouncement, latestTurnErrorMessage } from "./ErrorRow";
 import { ChatFindBar } from "./ChatFindBar";
 import { GroupThreadTabs } from "./ThreadTabs";
 import { ReplyQuote } from "./ReplyQuote";
 import { ConnectorCard } from "./ConnectorCard";
 import { SecretRequestCard } from "./SecretRequestCard";
+import { SignInRequestCard } from "./SignInRequestCard";
 import { AttachedFileChips, AttachedImageGallery } from "./AttachmentPreview";
 import { GroupCallButton, GroupCallOverlay } from "./GroupCallView";
 import { ReactionBar, ReactionChips } from "./Reactions";
@@ -38,6 +40,8 @@ import { ApprovalCard } from "./ApprovalCard";
 import { ManageMembersPanel } from "./ManageMembersPanel";
 import { groupActivityRuns, nestHelperSteps } from "@/lib/activity-runs";
 import { ActivityRun } from "./ActivityRun";
+import { HelperCard } from "./HelperCard";
+import { isHelperRow, runningHelperCount } from "../../shared/helpers";
 import { ToolLine } from "./ToolLine";
 import { JobFinishedRow, JobsMenu } from "./JobsMenu";
 import { useDesktopCapabilities } from "./DesktopCapabilities";
@@ -75,6 +79,7 @@ function dayLabel(at: number): string {
  * The sender is already named by the cluster label above it. */
 function RoomToolChip({ message }: { message: Message }) {
   if (!message.tool) return null;
+  if (isHelperRow(message)) return <HelperCard message={message} />;
   return <ToolLine message={message} actor={message.from?.name} />;
 }
 
@@ -341,6 +346,8 @@ const Transcript = memo(function Transcript({
           // Allow the broker rejects
           m.kind === "secret" && m.secret && m.from?.botId ? (
             <SecretRequestCard botId={m.from.botId} threadId={group.threadId} message={m} />
+          ) : m.kind === "sign-in" && m.signIn && m.from?.botId ? (
+            <SignInRequestCard botId={m.from.botId} threadId={group.threadId} message={m} />
           ) : m.kind === "connector" && m.connector && m.from?.botId ? (
             <ConnectorCard botId={m.from.botId} threadId={group.threadId} message={m} />
           ) : m.kind === "options" && m.card?.requestId && m.card.tool ? (
@@ -349,6 +356,8 @@ const Transcript = memo(function Transcript({
             </div>
           ) : m.kind === "activity" && m.job ? (
             <JobFinishedRow job={m.job} />
+          ) : m.kind === "activity" && isHelperRow(m) ? (
+            <HelperCard message={m} />
           ) : m.kind === "activity" && m.tool ? (
             m.tool.name.startsWith("error:") ? (
               <div className="flex justify-start max-w-full">
@@ -554,7 +563,7 @@ function RoomWorkingFolder({ group }: { group: Group }) {
 
         {extraCwds.length === 0 ? (
           <div className="mt-2 text-[12px] text-ink-secondary">
-            No secondary repositories attached. Add more folders (e.g. Fleet Ops) so channel bots have full multi-repo context.
+            No secondary repositories attached.{"\u00a0 "}Add more folders (e.g. Fleet Ops) so channel bots have full multi-repo context.
           </div>
         ) : (
           <div className="mt-2 flex flex-col gap-1.5">
@@ -979,6 +988,14 @@ function formatHoverTime(at: number) {
 
 export function GroupView({ group }: { group: Group }) {
   const { state, dispatch } = useStore();
+  const { capabilities } = useDesktopCapabilities();
+  const macInset = capabilities.windowChrome === "mac-inset";
+  const dragStyle: (React.CSSProperties & { WebkitAppRegion: "drag" }) | undefined = macInset
+    ? { WebkitAppRegion: "drag" }
+    : undefined;
+  const noDragStyle: (React.CSSProperties & { WebkitAppRegion: "no-drag" }) | undefined = macInset
+    ? { WebkitAppRegion: "no-drag" }
+    : undefined;
   const stream = useStreaming();
   const streaming = stream.streaming[group.threadId];
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -1029,6 +1046,7 @@ export function GroupView({ group }: { group: Group }) {
   );
   const speaker = members.find((b) => b.id === group.busyBotId);
   const setupPending = roomNeedsSetup(group);
+  const helperCount = useMemo(() => runningHelperCount(group.messages), [group.messages]);
 
   // Mascot stays while a member works; the finished reply pops in above it.
   const lastGroupMessage = group.messages.at(-1);
@@ -1291,13 +1309,14 @@ export function GroupView({ group }: { group: Group }) {
       )}
       {/* Header: responsive container so chips fold gracefully */}
       <div
+        style={dragStyle}
         className={cn(
           "@container/chathead flex items-center justify-between gap-3 px-5 py-3",
           // Room for the drawer button, which overlays this corner below md.
           "pl-11 md:pl-5",
         )}
       >
-        <div className="flex shrink-0 min-w-0 max-w-[45%] items-center gap-2">
+        <div style={noDragStyle} className="flex shrink-0 min-w-0 max-w-[45%] items-center gap-2">
           <button
             type="button"
             onClick={() => dispatch({ type: "toggleSettings", open: true })}
@@ -1335,7 +1354,7 @@ export function GroupView({ group }: { group: Group }) {
             </div>
           )}
         </div>
-        <div className="flex shrink-0 items-center gap-1.5 md:gap-2">
+        <div style={noDragStyle} className="flex shrink-0 items-center gap-1.5 md:gap-2">
           <button
             type="button"
             onClick={() => setFindOpen((open) => !open)}
@@ -1350,7 +1369,7 @@ export function GroupView({ group }: { group: Group }) {
             <Search size={18} />
           </button>
           {/* Members' background jobs on this room's thread: notices only, never a wake. */}
-          <JobsMenu threadId={group.threadId} room />
+          <JobsMenu threadId={group.threadId} room helperCount={helperCount} />
           <GroupCallButton group={group} members={members} />
           {!setupPending && !group.dm && <RoomWorkingFolderChip group={group} onToggle={() => setFolderOpen((open) => !open)} />}
           {!setupPending && !group.dm && <DefaultResponderSelect group={group} members={members} />}
@@ -1626,6 +1645,7 @@ export function GroupView({ group }: { group: Group }) {
         </button>
       )}
       <div className="w-full">
+      <UpdateDrainNotice />
       <Composer
         key={group.threadId}
         group={group}

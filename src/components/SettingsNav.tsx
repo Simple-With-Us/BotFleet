@@ -3,7 +3,7 @@
 // Split out of SettingsModal so the rail is a stateless view that a test can
 // render on its own.  The modal owns the query and the section; this owns how
 // they look.
-import { Activity, Coins, Globe, KeyRound, Layers, Monitor, Search, Smartphone, Terminal, User, X } from "lucide-react";
+import { Activity, Coins, Gauge, Globe, KeyRound, Layers, Monitor, Search, Smartphone, Terminal, User, X } from "lucide-react";
 import type { AppSettingsSection } from "@/state/store";
 import type { SettingsSearchResult } from "@/lib/settings-search";
 import { cn } from "@/lib/cn";
@@ -30,6 +30,7 @@ export const SETTINGS_SECTIONS: SettingsSectionEntry[] = [
   { id: "usage", label: "Usage", icon: Coins, keywords: ["tokens", "cost", "billing"] },
   { id: "observability", label: "Observability", icon: Activity, keywords: ["sentry", "errors", "crashes", "traces", "logs", "diagnostics"] },
   { id: "secrets", label: "Secrets", icon: KeyRound, keywords: ["infisical", "vault", "credentials", "secret", "provenance"] },
+  { id: "resources", label: "Resources", icon: Gauge, keywords: ["resources", "host", "cpu", "memory", "ram", "swap", "disk", "inodes", "capacity", "admission", "thresholds", "headroom", "reserved"] },
 ];
 
 /** Width of the rail.  EngineCapabilitiesMatrix derives its width budget from

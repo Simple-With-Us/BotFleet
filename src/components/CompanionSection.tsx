@@ -289,14 +289,14 @@ export function CompanionSection({ profileEmail = "" }: { profileEmail?: string 
                   <div>
                     <div className="text-[13px] text-ink">Tailscale Pairing</div>
                     <div className="mt-0.5 text-[11.5px] leading-relaxed text-ink-secondary">
-                      Keep pairing on your private tailnet, even when a secure hosted route is available.
+                      Keep pairing on your private Tailscale network, even when a secure hosted route is available.
                     </div>
                   </div>
                 </div>
                 <button
                   disabled={c.busy || c.accountBusy}
                   onClick={c.useTailscale}
-                  className="mt-3 rounded-lg border border-hairline/40 px-3 py-1.5 text-[12px] text-ink hover:bg-control disabled:opacity-40"
+                  className="mt-3 min-h-11 rounded-lg border border-hairline/40 px-3 py-2 text-[12px] text-ink hover:bg-control disabled:opacity-40"
                 >
                   Pair over Tailscale
                 </button>
@@ -314,7 +314,7 @@ export function CompanionSection({ profileEmail = "" }: { profileEmail?: string 
             <button
               disabled={c.busy || c.accountBusy}
               onClick={c.useLocal}
-              className="mt-3 rounded-lg border border-hairline/40 px-3 py-1.5 text-[12px] text-ink hover:bg-control disabled:opacity-40"
+              className="mt-3 min-h-11 rounded-lg border border-hairline/40 px-3 py-2 text-[12px] text-ink hover:bg-control disabled:opacity-40"
             >
               Pair on this Wi-Fi
             </button>
@@ -322,7 +322,7 @@ export function CompanionSection({ profileEmail = "" }: { profileEmail?: string 
 
           {state.enabled && !hosted && state.tailscale && !state.tailnetName && (
             <div className="rounded-lg bg-warning/10 px-3 py-2 text-[11.5px] leading-relaxed text-ink-secondary">
-              Tailscale is connected, but its device name could not be read. Check MagicDNS in Tailscale or use the secure account above.
+              Tailscale is connected, but its device name could not be read.{"\u00a0 "}Check MagicDNS in Tailscale or use the secure account above.
             </div>
           )}
           {state.enabled && !hosted && !state.tailscale && (

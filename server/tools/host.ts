@@ -29,6 +29,7 @@ import { isAbsolute, resolve } from "node:path";
 
 import { looksSensitive } from "../auto-approve.ts";
 import type {
+  LaunchIdentity,
   RequestOutcome,
   ToolArguments,
   TurnToolCall,
@@ -42,6 +43,7 @@ import {
   type AgentToolDeps,
   type AgentToolExecutor,
 } from "./agents.ts";
+import { launchEnvironment } from "../launch-identity.ts";
 import { createComputerTools } from "./computer.ts";
 import { createJobTools, jobCommandRefusal, type JobToolsOptions } from "./jobs.ts";
 import { TurnProcessGroups } from "./process-group.ts";
@@ -49,7 +51,9 @@ import { createGithubTools } from "./github.ts";
 import { createPhoneTools } from "./phone.ts";
 import { createRecallTools } from "./recall.ts";
 import { createLinqTools, type LinqToolDeps } from "./linq.ts";
+import { createZulipTools, type ZulipToolSend } from "./zulip.ts";
 import type { RecallSettings } from "../recall-transport.ts";
+import { readToolResultArtifact } from "../tool-result-history.ts";
 import { harnessTool, toolsFor, type ToolApproval, type ToolGateContext } from "./registry.ts";
 
 export type { AgentBot as TurnToolBot } from "./agents.ts";
@@ -79,6 +83,10 @@ export interface TurnToolHostContext {
   workspace?: boolean;
   /** Working directory for file and shell operations. */
   cwd?: string;
+  /** Who BotFleet says this bot is for this turn (server/launch-identity.ts).
+   *  `bash` runs with it in its environment.  Absent, the shell is still
+   *  marked as launched, with no seat. */
+  launchIdentity?: LaunchIdentity;
   /** When set, the file tools refuse any path whose realpath escapes this
    *  workspace root.  Passed straight through to `createComputerTools`'s
    *  `confinement` option.  A bot with a workspace but no This Computer
@@ -104,11 +112,19 @@ export interface TurnToolHostContext {
    *  the dispatch offered them in the catalog — the same one boolean feeds
    *  both, so a job tool the model was not offered finds no executor here. */
   jobs?: Pick<JobToolsOptions, "registry" | "onComplete" | "wakes" | "maxWaitSeconds">;
+  /** This bot's Zulip identity is connected, so `zulip_reply` and
+   *  `zulip_post` are offered.  `send` is the hub's, bound by the dispatch;
+   *  the host hands it this turn's identity, never the model's arguments. */
+  zulip?: { send: ZulipToolSend };
   /** Job notices waiting for this turn (server/steer-queue.ts): the driver's
    *  tool loop drains them between model rounds. */
   drainNotices?: () => string[];
   /** Ceiling on model-to-tool rounds; absent = the driver's default. */
   maxRounds?: number;
+  /** Offer `read_tool_result` for artifacts this turn's tool loop stored.
+   *  The catalog gate uses the same flag, so the model is only told about
+   *  a tool this host will run. */
+  toolResultArchive?: boolean;
   /** The harness's permission broker, already bound to this turn's bot and
    *  thread.  Absent = no broker mounted, and an ask-policy tool is refused
    *  rather than run — fail-closed, because "nobody could be asked" must
@@ -177,6 +193,30 @@ function approvalArgs(
  *  `server/tools/*.ts` file from importing an `index.ts` to keep the
  *  cycle that previously duplicated the `list_bots` filter out. */
 
+function integerArg(args: ToolArguments, key: string): number | undefined {
+  const value = args[key];
+  if (value === undefined) return undefined;
+  if (Number.isInteger(value)) return Number(value);
+  const text = stringArg(value);
+  if (/^-?\d+$/.test(text)) return Number(text);
+  return Number.NaN;
+}
+
+/** `read_tool_result` body.  The full text lives in the process store the
+ *  tool loop filled when it shortened a result for later rounds. */
+async function readStoredToolResult(call: TurnToolCall): Promise<TurnToolOutcome> {
+  const id = stringArg(call.arguments.artifact_id).trim();
+  if (!id) return failed("artifact_id must be a non-empty string.", "invalid_argument");
+  const offset = integerArg(call.arguments, "offset");
+  const limit = integerArg(call.arguments, "limit");
+  if (Number.isNaN(offset) || Number.isNaN(limit)) {
+    return failed("offset and limit must be integers.", "invalid_argument");
+  }
+  const read = readToolResultArtifact(id, { offset, limit });
+  if (!read.ok) return failed(read.message, "not_found");
+  return { kind: "result", content: read.text, detail: `${read.chars} characters` };
+}
+
 /** Build the tool host for ONE turn.  The returned host closes over the
  *  caller's identity, so nothing downstream can forge it. */
 export function createTurnToolHost(ctx: TurnToolHostContext): TurnToolHost {
@@ -184,7 +224,12 @@ export function createTurnToolHost(ctx: TurnToolHostContext): TurnToolHost {
   // Every process group this turn's `bash` calls start; what is still alive
   // when the turn ends is stopped by `settle` below.
   const processGroups = new TurnProcessGroups();
-  const computerTools = createComputerTools({ cwd: ctx.cwd, confinement: ctx.confinement, processGroups });
+  const computerTools = createComputerTools({
+    cwd: ctx.cwd,
+    confinement: ctx.confinement,
+    processGroups,
+    launchEnv: launchEnvironment(ctx.launchIdentity),
+  });
   const executors = new Map<string, AgentToolExecutor>([
     ...Object.entries(createAgentTools(ctx.deps)),
     ...Object.entries(computerTools),
@@ -229,6 +274,8 @@ export function createTurnToolHost(ctx: TurnToolHostContext): TurnToolHost {
           ),
         )
       : []),
+    ...(ctx.zulip ? Object.entries(createZulipTools({ send: ctx.zulip.send })) : []),
+    ["read_tool_result", readStoredToolResult],
   ]);
   const gate: ToolGateContext = {
     // The dispatch only builds a host when the agents integration is
@@ -254,6 +301,8 @@ export function createTurnToolHost(ctx: TurnToolHostContext): TurnToolHost {
     github: Boolean(ctx.localComputer),
     linq: Boolean(ctx.linq),
     jobs: Boolean(ctx.jobs),
+    zulip: Boolean(ctx.zulip),
+    toolResultArchive: Boolean(ctx.toolResultArchive),
   };
   // The same gate the catalog handed the model.  A hallucinated name, or a
   // real name the model was not offered this turn, finds no executor.

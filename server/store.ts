@@ -4,23 +4,37 @@
 // one). messages-<threadId>.json holds the folded transcript.
 import { existsSync, readFileSync, mkdirSync, rmSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
+import { z } from "zod";
 
 import { isDelegationMessage } from "../shared/delegation-message.ts";
 import { writeFileAtomic } from "./atomic.ts";
 import { peerAllowKey, type PeerAction } from "./peer-approval-key.ts";
 import { DATA_DIR } from "./config.ts";
+import { rosterIsOnHold } from "./data-faults.ts";
 import * as mdb from "./message-db.ts";
+import type { JsonValue } from "./schema.ts";
+import { interpretRecordList, loadGuarded, logRefusedSave } from "./store-guard.ts";
 import { workspaceDir } from "./workspace.ts";
 import { newId, type CloudBackend, type ModelSelection, type ThreadId, type TurnBillingMode } from "./contracts.ts";
 import { pickBotName } from "./names.ts";
 import { redactSecretsInText } from "./redact.ts";
-import { botAvatarProfile, type BotAvatarCrop } from "../shared/bot-avatar.ts";
+import { botAvatarProfile, type BotAvatarCrop, type BotAvatarRecolorable } from "../shared/bot-avatar.ts";
 import { isSnoozeExpired, SNOOZE_UNTIL_ACTIVITY } from "../shared/thread-snooze.ts";
 import { withoutNestedFallbacks } from "../shared/model-limits.ts";
+import type { BotVoices } from "../shared/bot-voice.ts";
+import type { SignInRequestCardData } from "../shared/sign-in-request.ts";
 import type { ConnectorToolGrant } from "../shared/connector-tools.ts";
 import type { RoutineRequestCardData } from "../shared/routine-request.ts";
+import { interruptedHelper, type HelperTranscript } from "../shared/helpers.ts";
 import type { ToolKind } from "../shared/tool-activity.ts";
 import type { ContextInjectionRef } from "../shared/context-injection.ts";
+import {
+  simpleMergeConflicts,
+  simpleMergeRefusal,
+  taskWorkspaceContextsMatch,
+  taskWorkspaceMergeSkipReason,
+  type TaskWorkspaceContext,
+} from "../shared/task-workspace-context.ts";
 import {
   applyOwnerDirective,
   classifyModel,
@@ -34,6 +48,7 @@ import {
 import { mergeTaskStats, type TurnStatsSample } from "./turn-stats.ts";
 import { rewriteModelSelection } from "./retired-model-ids.ts";
 import { automationRolloverSeedText } from "./automation-rollover.ts";
+import type { ToolPolicy } from "./tool-policy.ts";
 
 export type BotColor =
   | "green"
@@ -45,7 +60,9 @@ export type BotColor =
   | "pink"
   | "yellow"
   | "teal"
-  | "coral";
+  | "coral"
+  | "white"
+  | "black";
 
 /**
  * The face a bot rests on, as one of the engine's state names. Kept as a plain
@@ -74,6 +91,8 @@ export interface OptionCardData {
   held?: string;
   /** the narrow grant "always allow" remembers, e.g. "Bash:git" */
   allowKey?: string;
+  /** When true, always-allow on this card needs an extra write-tool warning. */
+  allowKeyWarnWrite?: boolean;
   /** Local actions never share remembered grants with cloud/tool approvals. */
   approvalScope?: "local-computer" | "disposable-computer";
   /** A durable chat-created routine proposal. The scheduler only applies it
@@ -120,15 +139,30 @@ export interface Message {
    * and instead of collapsing every non-webhook/imessage system message
    * into a generic "Routine" label regardless of what actually triggered
    * it. */
-  automationSource?: "schedule" | "manual" | "webhook" | "resource" | "delegation" | "imessage" | "job";
-  kind: "text" | "options" | "activity" | "screen" | "connector" | "secret";
+  automationSource?: "schedule" | "manual" | "webhook" | "resource" | "delegation" | "imessage" | "job" | "zulip";
+  /** On a routine's prompt message:  the routine's command allowlist
+   *  (server/tool-policy.ts), so a re-dispatch of this message is held to it. */
+  toolPolicy?: ToolPolicy;
+  kind: "text" | "options" | "activity" | "screen" | "connector" | "secret" | "sign-in";
   text?: string;
   /** The model that actually generated this reply; absent on legacy rows. */
   modelSelection?: { instanceId: string; model: string };
-  /** Persisted audio clips for this exact reply, in playback order. */
+  /** Persisted audio clips for this exact reply, in playback order.  They
+   * belong to `audioVoice`, or to the owner's shared voice on rows written
+   * before audioVoice existed (server/tts/message-audio.ts). */
   audio?: Array<{ path: string; mime: string }>;
-  /** Distilled speech-friendly text generated for TTS synthesis. */
+  /** The voice `audio` was synthesized with. */
+  audioVoice?: string;
+  /** Clips for a device voice that differs from the owner's shared voice,
+   * keyed by voice id, so a Mac and an iPhone with different hosted voices
+   * do not overwrite (and re-bill) each other's clips. */
+  audioByVoice?: Record<string, Array<{ path: string; mime: string }>>;
+  /** The text this reply's voice reads, and its stored clips were made from. */
   voiceText?: string;
+  /** What voiceText is: "written" (the reply as written, the "off" mode) or
+   * "summary" (the distiller path, the default).  Absent on rows from before
+   * karaoke, whose voiceText is reused as a summary (shared/spoken-script.ts). */
+  voiceTextKind?: "written" | "summary";
   /** Original incoming microphone recording and recognizer output never change. */
   recording?: { path: string; mime: "audio/wav"; transcript: string; engine: "apple-on-device" };
   /** Corrections are annotations, not edits to the audio or original transcript. */
@@ -138,6 +172,8 @@ export interface Message {
   card?: OptionCardData;
   connector?: ConnectorCardData;
   secret?: SecretRequestCardData;
+  /** A website sign-in the person completes on the computer.  Never a password. */
+  signIn?: SignInRequestCardData;
   /** activity messages: tool name + outcome. `spoken` is the same chip as
    * a phrase a voice can read ("reading a file") — computed once here so
    * call mode never has to re-derive it from the raw tool name, and absent
@@ -171,6 +207,9 @@ export interface Message {
      * interleaving parallel helpers' steps with the bot's own. */
     parentItemId?: string;
   };
+  /** The helper card for the row that started an engine-native helper
+   * (jobs P3).  Absent on an ordinary step. */
+  helper?: HelperTranscript;
   /** What the harness put in front of the model for THIS turn that the person
    * did not type — memory, selected skills, a quoted reply, a replayed
    * conversation (shared/context-injection.ts).  One short record each: a
@@ -185,6 +224,21 @@ export interface Message {
   /** screen messages: a frame of the bot's computer (base64 image) */
   png?: string;
   mime?: string;
+  /** Marks a row that belongs to a slash command rather than to the
+   * conversation.  `id` ties together the rows of one invocation: the
+   * `invocation` (what was typed), the `reply` (what BotFleet answered) and the
+   * `output` (what the engine's own command printed).  A marked row is drawn as
+   * a command chip or card, and is never replayed to a model: it is left out of
+   * the transcript a turn is built from.  Clients that predate the marker show
+   * a plain bubble. */
+  command?: {
+    id: string;
+    name: string;
+    source: "botfleet" | "engine";
+    role: "invocation" | "reply" | "output";
+    surface: "desktop" | "ios" | "imessage" | "linq";
+    ok?: boolean;
+  };
   at: number;
   /** the message this one follows; null = thread root. Edited messages
    * share a parentId with the version they replace — that's a fork. */
@@ -229,6 +283,8 @@ export interface GroupTaskRecord {
   createdAt: number;
   pinnedCwd?: string | null;
   pinnedMessageId?: string;
+  /** Explicit App binding preserved when a private task moves into a room. */
+  workspaceContext?: TaskWorkspaceContext;
 }
 
 /** A room: a shared thread where several bots + the user talk. Plain
@@ -303,12 +359,15 @@ export interface TaskRecord {
    *  before the field existed; those attribute whole-task, by the
    *  configured selection. */
   usageByInstance?: Record<string, InstanceUsage>;
-  /** the folder this task's turns run in, pinned on its first turn from
-   * the bot's `cwd` at that moment. Pinned, not read live: Claude keeps
-   * sessions per project directory and Codex threads carry their cwd, so
-   * a folder that moved under a live session would break resume. `null`
-   * = pinned to the default (home); absent = not pinned yet. */
+  /** the folder this task's turns run in.  New tasks snapshot a bot-specific
+   * `cwd` when present; otherwise dispatch can still apply its workspace
+   * fallback.  Pinned, not read live: Claude keeps sessions per project
+   * directory and Codex threads carry their cwd, so a folder that moved
+   * under a live session would break resume.  `null` = explicitly pinned to
+   * the default (home); absent = not pinned yet. */
   cwd?: string | null;
+  /** Creation-time App and local checkout snapshot, independent of bot defaults. */
+  workspaceContext?: TaskWorkspaceContext;
   /** Optional engine for this conversation.  Absent means the bot's own
    * modelSelection.  Used in Projects mode so a thread is not a named bot. */
   modelSelection?: ModelSelection;
@@ -344,6 +403,14 @@ export interface TaskUsage {
    * written by builds before cost existed lack the field; read as null. */
   costUsd: number | null;
   turns: number;
+  /** The input tokens of the most recent settled turn that reported any, which
+   * is how full the model's context window was after it (cache reads count:
+   * they fill the window).  Unlike `input`, it is not a running total.  Absent
+   * until a turn reports input. */
+  lastInput?: number;
+  /** The context window the engine reported with that turn (`usage_update.size`).
+   * Absent when the engine did not send one.  Not a catalog guess. */
+  contextWindow?: number;
 }
 
 /** Running timing aggregate for one task, banked at each settled turn from
@@ -525,6 +592,13 @@ function redactBotAuthored<T extends Omit<Message, "id" | "at"> & { at?: number 
       error: out.secret.error ? redactSecretsInText(out.secret.error) : undefined,
     };
   }
+  if (out.signIn) {
+    out.signIn = {
+      ...out.signIn,
+      reason: redactSecretsInText(out.signIn.reason),
+      error: out.signIn.error ? redactSecretsInText(out.signIn.error) : undefined,
+    };
+  }
   return out;
 }
 
@@ -541,6 +615,7 @@ export const ACTIVITY_BUSY: ReadonlySet<BotActivity> = new Set(["working", "wait
 
 export type StoreChange =
   | { type: "message"; threadId: string; message: Message }
+  | { type: "messages"; threadId: string; messages: Message[] }
   | { type: "message.patch"; threadId: string; message: Message }
   | { type: "thread"; threadId: string; activeLeafId: string }
   | { type: "thread.deleted"; threadId: string }
@@ -578,6 +653,8 @@ export interface BotRecord {
   avatarUrl?: string;
   /** Mascot, or the crop applied to avatarUrl. */
   avatarCrop?: BotAvatarCrop;
+  /** none | shell | full — how much of the avatar the Color row may recolour. */
+  recolorable?: BotAvatarRecolorable;
   unread: boolean;
   modelSelection: ModelSelection;
   /** The model selection that actually ran on the most recent turn (post-fallback). */
@@ -595,21 +672,42 @@ export interface BotRecord {
   /** where NEW tasks run their shell tools; each task pins its own copy
    * on its first turn (TaskRecord.cwd). Absent = the home folder. */
   cwd?: string;
+  /** When true, each turn with a Git project folder runs in an isolated
+   * worktree.  When false, opts out even if the workspace feature flag is on. */
+  gitWorktreeLeases?: boolean;
   /** Auto mode: the bot approves its own tool permissions and keeps
    * working instead of stopping to ask. Questions it asks YOU still come
    * through, and a short list of destructive commands still stops it. */
   autoApprove?: boolean;
+  /** Permission bypass mode: automatically approve all tools, commands,
+   * and routines without halting for approval cards or unattended blocks. */
+  bypassPermissions?: boolean;
+  /** Bypass, including the requests that control the person's real desktop.
+   * Off by default, so bypass alone keeps stopping at that edge.  Means
+   * nothing without `bypassPermissions`. */
+  bypassLocalComputer?: boolean;
   /** Optional model review of otherwise undecided, attended approval cards.
    * Unknown persisted values are treated as off by the review boundary. */
   autoReview?: "off" | "shadow" | "enforce";
   /** Tools this bot may always use without asking, even outside auto mode
    * (set by "Always allow" on an approval card). */
   alwaysAllow?: string[];
+  /** Optional subset of config `mcpServers` this bot may mount; absent = all enabled. */
+  mcpServers?: string[];
   /** Ceiling on model→tool rounds for HTTP toolLoop engines (MiniMax / Grok
    * HTTP / openai-compat). Unset = DEFAULT_MAX_TOOL_ROUNDS (shared/bot-profile.ts),
    * which DEFAULT_TURN_LOOP_BUDGET.maxRounds is derived from.
    * Integer 1..200; invalid values are treated as absent at dispatch. */
   maxToolRounds?: number;
+  /** Cap on replayed history turns in a budgeted prompt (ACP engines):
+   * older turns are dropped and summarized even when the byte budget would
+   * fit them.  Unset keeps every turn the byte budget fits.
+   * Integer 0..MAX_HISTORY_TURNS; invalid values are treated as absent. */
+  maxHistoryTurns?: number;
+  /** When true, dropped history turns are summarized by the bot's model
+   * (cached and rolled forward), falling back to the extractive note on
+   * error.  Absent or false is the extractive default. */
+  historySummaryModel?: boolean;
   /** Speak this bot's replies aloud as they settle, without being asked.
    * Off by default: a hosted voice costs money per character, so speaking
    * is something you turn on, never something that happens to you. */
@@ -619,6 +717,10 @@ export interface BotRecord {
   /** This bot's own voice id, so a room of bots doesn't sound like one
    * person. Falls back to the app-wide voice in config. */
   voice?: string;
+  /** Per-device overrides of `voice` (shared/bot-voice.ts): an Apple
+   * Personal Voice only exists on the device that made it, so the Mac and
+   * the iPhone each pick their own.  A device without one uses `voice`. */
+  voices?: BotVoices;
   /** Whether to post-process bot answers with DeepSeek V4.1 Flash for TTS.
    * "on_demand" (default/opt-in) runs only on manual speak; "always" runs on every turn. */
   voiceSummaryMode?: "off" | "on_demand" | "always";
@@ -628,6 +730,14 @@ export interface BotRecord {
   rewound?: boolean;
   pinned?: boolean;
   hidden?: boolean;
+  /** The bot's On/Off switch (shared/bot-power.ts).  Absent or false = on.
+   *  While true, no NEW turn starts for this bot from any source — chat from
+   *  every channel, routines, webhooks, resource triggers, room fan-out,
+   *  peer delegation, resumes — but the chat stays visible and a turn that was
+   *  already running finishes.  Unlike `hidden` (an archive) it keeps the bot
+   *  in the roster, and unlike a routine-manager "stop" no message clears it:
+   *  only an explicit Turn On does.  Persisted with the roster. */
+  off?: boolean;
   /** Optional labeled divider used to organize this bot in the sidebar. */
   section?: string;
   /** the one message pinned to the top of this bot's active thread; a pin
@@ -696,6 +806,15 @@ const BOTS_FILE = join(DATA_DIR, "bots.json");
 /** Which one-time model-lineage migrations this data dir has had. */
 const MODEL_LINEAGE_MARKER = "model-lineage.json";
 const GROUPS_FILE = join(DATA_DIR, "groups.json");
+/** The least a bots.json entry must be before the Store's own migrations can run on it.  Anything
+ * else in the entry is left to those migrations, as it always was: a stricter test here would set
+ * aside a roster an older build wrote. */
+const botEntrySchema = z.looseObject({ id: z.string().min(1) });
+/** The same for rooms.  Every non-channel room reads `memberIds` before anything else. */
+const groupEntrySchema = z.looseObject({ id: z.string().min(1), memberIds: z.array(z.string()) });
+const isBotEntry = (candidate: JsonValue): candidate is JsonValue & BotRecord => botEntrySchema.safeParse(candidate).success;
+const isGroupEntry = (candidate: JsonValue): candidate is JsonValue & GroupRecord =>
+  groupEntrySchema.safeParse(candidate).success;
 /** How long a burst of saveBots() calls coalesces into one atomic write. */
 const BOTS_SAVE_DEBOUNCE_MS = 250;
 const messagesFile = (threadId: string) => join(DATA_DIR, `messages-${threadId}.json`);
@@ -711,6 +830,8 @@ const COLORS: BotColor[] = [
   "yellow",
   "teal",
   "coral",
+  "white",
+  "black",
 ];
 
 /** Sections are persisted as display labels, so exact trimmed labels are
@@ -722,9 +843,9 @@ export const sectionKey = (section?: string | null): string => section?.trim() |
  * "New Bot"), names match case-insensitively, longest name wins (so
  * "@New Bot 2" never half-matches "New Bot"), hidden bots skipped, results
  * deduped. Callers pre-filter the sender out of `peers`. */
-export function mentionedBots<T extends { name: string; hidden?: boolean }>(text: string, peers: T[]): T[] {
+export function mentionedBots<T extends { name: string; hidden?: boolean; off?: boolean }>(text: string, peers: T[]): T[] {
   const candidates = peers
-    .filter((p) => !p.hidden && p.name.trim())
+    .filter((p) => !p.hidden && !p.off && p.name.trim())
     .sort((a, b) => b.name.length - a.name.length);
   const lower = text.toLowerCase();
   const found: T[] = [];
@@ -792,12 +913,13 @@ export function normalizeGroupDefaultResponder(
 
 /** Resolve the bots invoked by a human room message. Explicit targets win;
  * otherwise the room policy chooses one member, everyone, or nobody. */
-export function roomResponders<T extends { id: string; name: string; hidden?: boolean }>(
+export function roomResponders<T extends { id: string; name: string; hidden?: boolean; off?: boolean }>(
   text: string,
   members: T[],
   defaultResponder: GroupDefaultResponder,
 ): T[] {
-  const available = members.filter((member) => !member.hidden);
+  // An Off member cannot speak, so it is skipped exactly like an archived one.
+  const available = members.filter((member) => !member.hidden && !member.off);
   if (/(?:^|\s)@everyone\b/i.test(text)) return available;
   const mentioned = mentionedBots(text, available);
   if (mentioned.length) return mentioned;
@@ -831,17 +953,30 @@ interface ThreadState {
  * the next read just re-hydrates from sqlite. */
 const DEFAULT_THREAD_CACHE_LIMIT = 64;
 
+/** …and how many messages, in total, those warm threads may retain. The
+ * count alone is NOT a memory bound: it bounds how many threads are warm,
+ * never how big one is. A long bot thread carries inline base64 screen
+ * captures, so 64 fully-hydrated threads measured 74 GB RSS over one
+ * working day — which on a 16 GB Mac drove swap until the disk was full
+ * (BF-2424). Bounding retained messages bounds the heap, whatever route
+ * or call site did the hydrating. */
+const DEFAULT_THREAD_CACHE_MAX_MESSAGES = 20_000;
+
 /** A bounded LRU over per-thread message caches. `get` touches (moves the
  * entry to the most-recently-used end); `set` evicts the least-recently-
- * used entries past `limit`. Backed by a plain Map: insertion order is
- * Map's own iteration order, so "delete then re-set" is enough to move a
- * key to the MRU end, and `.keys().next()` is always the LRU key. */
+ * used entries past `limit` OR until the retained message count is back
+ * under `maxMessages`. Backed by a plain Map: insertion order is Map's own
+ * iteration order, so "delete then re-set" is enough to move a key to the
+ * MRU end, and `.keys().next()` is always the LRU key. */
 class ThreadCache {
   private map = new Map<string, ThreadState>();
   private limit: number;
+  private maxMessages: number;
+  private retained = 0;
 
-  constructor(limit: number) {
+  constructor(limit: number, maxMessages: number = DEFAULT_THREAD_CACHE_MAX_MESSAGES) {
     this.limit = limit;
+    this.maxMessages = maxMessages;
   }
 
   get(threadId: string): ThreadState | undefined {
@@ -854,17 +989,49 @@ class ThreadCache {
   }
 
   set(threadId: string, state: ThreadState): void {
+    const previous = this.map.get(threadId);
+    if (previous) this.retained -= previous.messages.length;
     this.map.delete(threadId);
     this.map.set(threadId, state);
-    while (this.map.size > this.limit) {
+    this.retained += state.messages.length;
+    this.evict();
+  }
+
+  /** Drop the least-recently-used threads until BOTH bounds hold. A single
+   * thread larger than the whole budget still gets cached — evicting it
+   * inside `set` would return `undefined` to a caller expecting the state
+   * it just wrote — but it is the first thing the next `set` evicts. */
+  private evict(): void {
+    while (this.map.size > this.limit || this.retained > this.maxMessages) {
       const oldest = this.map.keys().next().value;
       if (oldest === undefined) break;
+      const victim = this.map.get(oldest);
+      if (victim) this.retained -= victim.messages.length;
+      this.map.delete(oldest);
+    }
+  }
+
+  recordAppend(threadId: string): void {
+    if (!this.map.has(threadId)) return;
+    this.retained += 1;
+    while (this.map.size > 1 && (this.map.size > this.limit || this.retained > this.maxMessages)) {
+      const oldest = this.map.keys().next().value;
+      if (oldest === undefined || oldest === threadId) break;
+      const victim = this.map.get(oldest);
+      if (victim) this.retained -= victim.messages.length;
       this.map.delete(oldest);
     }
   }
 
   delete(threadId: string): void {
+    const existing = this.map.get(threadId);
+    if (existing) this.retained -= existing.messages.length;
     this.map.delete(threadId);
+  }
+
+  clear(): void {
+    this.map.clear();
+    this.retained = 0;
   }
 
   /** Membership only — deliberately does not touch LRU order, so a test
@@ -880,11 +1047,18 @@ export class Store {
   private threads: ThreadCache;
   private defaultSelection: () => ModelSelection;
   private listeners = new Set<(change: StoreChange) => void>();
-  /** true when no bots.json existed at load — the one time the roster is seeded */
+  /** true when no bots.json existed at load — the one time the roster is seeded.  Never true while
+   * a set-aside bots.json is waiting beside it: that is a roster to restore, not a fresh install. */
   private firstRun = false;
-  /** true when bots.json existed but did not parse — do not treat an empty
-   * in-memory roster as "every room member was deleted". */
+  /** true when the roster may be incomplete — bots.json could not be read, was set aside, lost
+   * entries, or has a set-aside copy waiting from an earlier run.  An empty or short in-memory
+   * roster is then not evidence that "every room member was deleted", and must not drive any
+   * migration or prune that treats it as the truth.  Read from disk on every boot. */
   private botsLoadFailed = false;
+  /** true when saving would destroy the only copy of something: the file could not be read, or
+   * could not be moved aside.  The only case in which a store stops saving; logged and shown. */
+  private botsWritesRefused = false;
+  private groupsWritesRefused = false;
   /** Coalesces bursts of saveBots() calls — a single startTurn used to fire
    * at least three full-roster fsynced rewrites — into one atomic write.
    * Fires a fixed delay after the first dirty call in a burst rather than
@@ -899,25 +1073,38 @@ export class Store {
 
   /** `opts.threadCacheLimit` only exists so tests can force evictions
    * without creating dozens of real threads; production always takes the
-   * default. */
-  constructor(defaultSelection: () => ModelSelection, opts: { threadCacheLimit?: number } = {}) {
+   * default. `opts.threadCacheMaxMessages` is the same idea for the size
+   * bound: the thread-COUNT limit alone lets 64 huge threads sit resident
+   * (BF-2424), so tests that need to prove the size bound holds can shrink
+   * it instead of writing tens of thousands of messages. */
+  constructor(
+    defaultSelection: () => ModelSelection,
+    opts: { threadCacheLimit?: number; threadCacheMaxMessages?: number } = {},
+  ) {
     this.defaultSelection = defaultSelection;
-    this.threads = new ThreadCache(opts.threadCacheLimit ?? DEFAULT_THREAD_CACHE_LIMIT);
+    this.threads = new ThreadCache(
+      opts.threadCacheLimit ?? DEFAULT_THREAD_CACHE_LIMIT,
+      opts.threadCacheMaxMessages ?? DEFAULT_THREAD_CACHE_MAX_MESSAGES,
+    );
     mkdirSync(DATA_DIR, { recursive: true });
-    try {
-      this.bots = JSON.parse(readFileSync(BOTS_FILE, "utf8"));
-    } catch (error) {
-      this.bots = [];
-      // Only a missing bots.json is a first run. A file that exists but will
-      // not parse must not be silently replaced with a fresh default roster.
-      this.firstRun = (error as NodeJS.ErrnoException)?.code === "ENOENT";
-      this.botsLoadFailed = !this.firstRun;
-    }
-    try {
-      this.groups = JSON.parse(readFileSync(GROUPS_FILE, "utf8"));
-    } catch {
-      this.groups = [];
-    }
+    // Only a missing bots.json is a first run.  A file that exists but cannot be used is moved aside
+    // (never deleted) and reported; see store-guard.ts.  Wrong-typed JSON used to throw out of this
+    // constructor, so the server would not even start.
+    const botsLoad = loadGuarded<BotRecord[]>(BOTS_FILE, (parsed) =>
+      interpretRecordList(parsed, isBotEntry, { one: "bot", many: "bots" }),
+    );
+    this.bots = botsLoad.value ?? [];
+    this.botsWritesRefused = botsLoad.writesRefused;
+    // Asked after the load, so a file it just set aside counts, and so does one set aside by an
+    // earlier run: bots.json is then simply missing, which on its own would read as a fresh install.
+    const rosterOnHold = rosterIsOnHold(DATA_DIR);
+    this.firstRun = botsLoad.status === "missing" && !rosterOnHold;
+    this.botsLoadFailed = rosterOnHold || botsLoad.status === "unreadable" || botsLoad.writesRefused;
+    const groupsLoad = loadGuarded<GroupRecord[]>(GROUPS_FILE, (parsed) =>
+      interpretRecordList(parsed, isGroupEntry, { one: "room", many: "rooms" }),
+    );
+    this.groups = groupsLoad.value ?? [];
+    this.groupsWritesRefused = groupsLoad.writesRefused;
     // busy never survives a restart — no turn does either. Rooms saved
     // before default responders existed adopt their first member as lead.
     let botsMigrated = false;
@@ -1110,7 +1297,9 @@ export class Store {
     ]);
     for (const threadId of knownThreads) {
       const legacyFile = messagesFile(threadId);
-      if (existsSync(legacyFile)) mdb.readThread(threadId, legacyFile);
+      // Only a thread with no rows can need importing; readThread on an
+      // already-migrated thread hydrated the whole transcript for nothing.
+      if (existsSync(legacyFile) && mdb.countMessages(threadId) === 0) mdb.readThread(threadId, legacyFile);
     }
   }
 
@@ -1148,6 +1337,12 @@ export class Store {
       this.saveBotsTimer = null;
     }
     if (!this.botsDirty) return;
+    if (this.botsWritesRefused) {
+      // `botsDirty` stays set on purpose: it is cleared only after a write lands, so a refused
+      // write leaves the pending change marked and a later flush still tries to persist it.
+      logRefusedSave(BOTS_FILE);
+      return;
+    }
     // busy/activity never survive a restart (reset on load above) and
     // change on every turn transition, so they are excluded here rather
     // than debounced — nothing to coalesce for state nobody reads back.
@@ -1156,6 +1351,10 @@ export class Store {
   }
 
   private saveGroups() {
+    if (this.groupsWritesRefused) {
+      logRefusedSave(GROUPS_FILE);
+      return;
+    }
     writeFileAtomic(GROUPS_FILE, JSON.stringify(this.groups.map(({ busyBotId, ...g }) => g), null, 2));
   }
 
@@ -1262,7 +1461,9 @@ export class Store {
     for (const file of [messagesFile(threadId), `${messagesFile(threadId)}.imported`]) {
       try {
         unlinkSync(file);
-      } catch {}
+      } catch {
+        // the legacy file may not exist; the DB rows are already gone
+      }
     }
     this.emit({ type: "thread.deleted", threadId });
   }
@@ -1270,6 +1471,14 @@ export class Store {
   deleteGroup(id: string): boolean {
     const group = this.group(id);
     if (!group) return false;
+    // Deleting a room also deletes its threads' message rows, and that is not undoable.  A save
+    // that was refused leaves this removal only in memory, so the room would come back on the next
+    // boot pointing at transcripts that are already gone.  Nothing is deleted until the roster is
+    // known to be writable.
+    if (this.groupsWritesRefused) {
+      logRefusedSave(GROUPS_FILE);
+      return false;
+    }
     this.groups = this.groups.filter((g) => g.id !== id);
     this.saveGroups();
     for (const threadId of new Set([group.threadId, ...(group.tasks ?? []).map((task) => task.threadId)])) {
@@ -1357,6 +1566,9 @@ export class Store {
     if (!from.tasks || from.tasks.length < 2) return null;
     const task = from.tasks.find((entry) => entry.threadId === threadId);
     if (!task) return null;
+    if (task.workspaceContext && task.workspaceContext.appRef.id !== toGroupId) {
+      throw Object.assign(new Error("this conversation belongs to another App — move it to its original App group"), { status: 409 });
+    }
 
     from.tasks = from.tasks.filter((entry) => entry.threadId !== threadId);
     if (from.threadId === threadId) {
@@ -1419,19 +1631,24 @@ export class Store {
     const from = bot.tasks.find((entry) => entry.threadId === fromThreadId);
     const into = bot.tasks.find((entry) => entry.threadId === intoThreadId);
     if (!from || !into) return null;
+    if (!taskWorkspaceContextsMatch(from.workspaceContext, into.workspaceContext)) {
+      throw Object.assign(new Error("these conversations have different App bindings — keep them separate"), { status: 409 });
+    }
 
     const incoming = this.messagesFor(fromThreadId);
     if (incoming.length > 0) {
       const label = from.title?.trim() || "Merged thread";
-      this.appendMessage(intoThreadId, {
-        role: "user",
-        kind: "text",
-        text: `Merged “${label}” into this thread.`,
-      });
-      for (const message of incoming) {
-        const { id: _id, parentId: _parent, ...rest } = message;
-        this.appendMessage(intoThreadId, rest);
-      }
+      // The divider and the copied messages land as one write and one
+      // frame.  A conversation that holds thousands of messages would
+      // otherwise mean thousands of commits and thousands of redraws on
+      // every client watching it.
+      this.appendMessages(intoThreadId, [
+        { role: "user", kind: "text", text: `Merged “${label}” into this thread.` },
+        ...incoming.map((message) => {
+          const { id: _id, parentId: _parent, ...rest } = message;
+          return rest;
+        }),
+      ]);
     }
 
     // The source task's automation key (and any it already collected from
@@ -1463,27 +1680,41 @@ export class Store {
     const from = group.tasks.find((entry) => entry.threadId === fromThreadId);
     const into = group.tasks.find((entry) => entry.threadId === intoThreadId);
     if (!from || !into) return null;
+    if (!taskWorkspaceContextsMatch(from.workspaceContext, into.workspaceContext)) {
+      throw Object.assign(new Error("these conversations have different App bindings — keep them separate"), { status: 409 });
+    }
 
     const incoming = this.messagesFor(fromThreadId);
     if (incoming.length > 0) {
       const label = from.title?.trim() || "Merged thread";
-      this.appendMessage(intoThreadId, {
-        role: "user",
-        kind: "text",
-        text: `Merged “${label}” into this thread.`,
-      });
-      for (const message of incoming) {
-        const { id: _id, parentId: _parent, ...rest } = message;
-        this.appendMessage(intoThreadId, rest);
-      }
+      // The divider and the copied messages land as one write and one
+      // frame.  A conversation that holds thousands of messages would
+      // otherwise mean thousands of commits and thousands of redraws on
+      // every client watching it.
+      this.appendMessages(intoThreadId, [
+        { role: "user", kind: "text", text: `Merged “${label}” into this thread.` },
+        ...incoming.map((message) => {
+          const { id: _id, parentId: _parent, ...rest } = message;
+          return rest;
+        }),
+      ]);
     }
 
     return this.deleteGroupTask(groupId, fromThreadId);
   }
 
   /** Fold every extra bot and room conversation into the active thread.
-   * Used when switching the workspace to Simple with merge opted in. */
+   * Used when switching the workspace to Simple with merge opted in.
+   *
+   * A conversation that cannot merge blocks the whole switch.  Simple would
+   * hide it, and folding only the rest would look like every conversation
+   * had been combined.  Nothing is moved, and the error names what stayed
+   * separate so the settings card can say so before the person commits. */
   mergeAllExtraThreads(): { bots: number; groups: number; threads: number } {
+    const blocked = simpleMergeConflicts([...this.bots, ...this.groups]);
+    if (blocked.length > 0) {
+      throw Object.assign(new Error(simpleMergeRefusal(blocked)), { status: 409 });
+    }
     let bots = 0;
     let groups = 0;
     let threads = 0;
@@ -1513,6 +1744,85 @@ export class Store {
     return { bots, groups, threads };
   }
 
+  /** Fold every other conversation of ONE bot into the chosen destination.
+   *
+   * Scoped to a single bot, and unlike the workspace-wide
+   * `mergeAllExtraThreads`, a source that cannot merge does not abort the
+   * rest: a thread bound to a different App is left alone and reported, so
+   * a person sees exactly what stayed behind instead of a refusal that
+   * merged nothing.  The workspace switch refuses outright, because Simple
+   * would hide a conversation the merge had to leave separate.
+   *
+   * Sources fold oldest first, so the destination's own transcript stays at
+   * the front and the merged text reads in chronological order. */
+  mergeAllBotTasks(botId: string, intoThreadId: string): {
+    bot: BotRecord | null;
+    merged: string[];
+    skipped: Array<{ threadId: string; title: string; reason: string }>;
+  } | null {
+    const bot = this.bot(botId);
+    if (!bot || !bot.tasks || bot.tasks.length < 2) return null;
+    const into = bot.tasks.find((entry) => entry.threadId === intoThreadId);
+    if (!into) return null;
+
+    const merged: string[] = [];
+    const skipped: Array<{ threadId: string; title: string; reason: string }> = [];
+    // Each source's start is read ONCE, before the sort: a comparator that
+    // reads it hydrates the whole transcript — base64 captures included —
+    // again and again, and a long conversation is the case that hurts most.
+    const sources = bot.tasks
+      .filter((task) => task.threadId !== intoThreadId)
+      .map((task) => ({ task, start: this.threadStart(task) }))
+      .sort((a, b) => a.start - b.start || a.task.createdAt - b.task.createdAt)
+      .map((entry) => entry.task);
+
+    // The bot's live conversation must not move while the fold runs:
+    // `deleteTask` hands the active thread to whatever is left first, so
+    // without this the bot would briefly point at another conversation and
+    // every frame the client receives mid-merge would name the wrong one.
+    bot.threadId = intoThreadId;
+
+    for (const source of sources) {
+      if (!taskWorkspaceContextsMatch(source.workspaceContext, into.workspaceContext)) {
+        skipped.push({
+          threadId: source.threadId,
+          title: source.title || UNTITLED_TASK,
+          reason: taskWorkspaceMergeSkipReason(source.workspaceContext, into.workspaceContext),
+        });
+        continue;
+      }
+      if (this.mergeBotTasks(botId, source.threadId, intoThreadId)) merged.push(source.threadId);
+      // The merge deletes the source, and a deletion can hand the active
+      // thread to another conversation; the destination is the one that
+      // has to stay live.
+      bot.threadId = intoThreadId;
+    }
+
+    // Deleting a task can move the bot's active thread, so the destination
+    // is set explicitly: the merged conversation is the one to read next.
+    const fresh = this.bot(botId);
+    if (fresh && fresh.tasks?.some((task) => task.threadId === intoThreadId)) {
+      const destination = fresh.tasks.find((task) => task.threadId === intoThreadId)!;
+      fresh.threadId = intoThreadId;
+      fresh.resumeCursors = { ...destination.resumeCursors };
+      this.saveBots();
+      this.emit({ type: "bot", botId: fresh.id });
+    }
+    return { bot: fresh ?? null, merged, skipped };
+  }
+
+  /** When a conversation started, for ordering a merge.  The first message is
+   * the honest start; the task's own creation time stands in for a thread
+   * that has not spoken yet, and breaks a tie between two that did.
+   *
+   * The timestamp is read at the SQL boundary, not through the transcript:
+   * a long conversation would otherwise be pulled into memory — with every
+   * base64 capture in it — just to learn when it began. */
+  private threadStart(task: TaskRecord): number {
+    const first = mdb.firstMessageAt(task.threadId, messagesFile(task.threadId));
+    return first ?? task.createdAt;
+  }
+
   /** Move one of a bot's conversations into a channel, where the channel's
    * members answer it from then on. */
   moveTaskToGroup(fromBotId: string, threadId: string, groupId: string): {
@@ -1524,6 +1834,9 @@ export class Store {
     if (!bot || !group || group.dm || !bot.tasks || bot.tasks.length < 2) return null;
     const task = bot.tasks.find((entry) => entry.threadId === threadId);
     if (!task) return null;
+    if (task.workspaceContext && task.workspaceContext.appRef.id !== groupId) {
+      throw Object.assign(new Error("this conversation belongs to another App — move it to its original App group"), { status: 409 });
+    }
 
     bot.tasks = bot.tasks.filter((entry) => entry.threadId !== threadId);
     if (bot.threadId === threadId) {
@@ -1531,15 +1844,14 @@ export class Store {
       bot.threadId = next.threadId;
       bot.resumeCursors = {};
     }
-    group.tasks = [
-      {
-        threadId: task.threadId,
-        title: task.title,
-        createdAt: task.createdAt,
-        ...(task.cwd === undefined ? {} : { pinnedCwd: task.cwd }),
-      },
-      ...(group.tasks ?? []),
-    ];
+    const moved: GroupTaskRecord = {
+      threadId: task.threadId,
+      title: task.title,
+      createdAt: task.createdAt,
+    };
+    if (task.cwd !== undefined) moved.pinnedCwd = task.cwd;
+    if (task.workspaceContext) moved.workspaceContext = structuredClone(task.workspaceContext);
+    group.tasks = [moved, ...(group.tasks ?? [])];
 
     this.saveBots();
     this.saveGroups();
@@ -1566,16 +1878,15 @@ export class Store {
       group.pinnedCwd = next.pinnedCwd;
       group.pinnedMessageId = next.pinnedMessageId;
     }
-    bot.tasks = [
-      {
-        threadId: task.threadId,
-        title: task.title,
-        createdAt: task.createdAt,
-        resumeCursors: {},
-        ...(task.pinnedCwd === undefined ? {} : { cwd: task.pinnedCwd }),
-      },
-      ...(bot.tasks ?? []),
-    ];
+    const moved: TaskRecord = {
+      threadId: task.threadId,
+      title: task.title,
+      createdAt: task.createdAt,
+      resumeCursors: {},
+    };
+    if (task.pinnedCwd !== undefined) moved.cwd = task.pinnedCwd;
+    if (task.workspaceContext) moved.workspaceContext = structuredClone(task.workspaceContext);
+    bot.tasks = [moved, ...(bot.tasks ?? [])];
 
     this.saveGroups();
     this.saveBots();
@@ -1644,6 +1955,32 @@ export class Store {
     return this.thread(threadId).messages;
   }
 
+  /** The full transcript for a read-only response, WITHOUT pinning the thread
+   *  in the LRU. `messagesFor` caches every thread it hydrates, and
+   *  GET /api/bots without `?messages=` calls it for every bot AND every
+   *  group in one request — so a single unpaginated poll pulled the whole
+   *  database into the heap and kept it there. The LRU bounds the thread
+   *  COUNT, not a thread's size: 64 fully-hydrated threads with inline
+   *  base64 captures measured 74 GB RSS over one working day, which on this
+   *  16 GB Mac drove swap until the disk was full (BF-2424).
+   *
+   *  An already-warm thread serves straight from memory; a cold one is read,
+   *  returned, and left to the GC — the response is byte-identical either
+   *  way. Mutating callers keep using `messagesFor`, which must stay cached. */
+  messagesForTransient(threadId: string): Message[] {
+    const warm = this.threads.get(threadId);
+    if (warm) return warm.messages;
+    const { messages } = mdb.readThread(threadId, messagesFile(threadId));
+    // legacy rows carry no parentId — chain them in array order, the same
+    // fixup cacheThread() applies, so the response matches a cached read
+    let prev: string | null = null;
+    for (const m of messages) {
+      if (m.parentId === undefined) m.parentId = prev;
+      prev = m.id;
+    }
+    return messages;
+  }
+
   /** A bounded page of a thread's newest messages, for callers that only
    * need a display page — the GET /api/bots hydrate and a fresh
    * scrollback view. Reads just `limit` rows at the SQL boundary instead
@@ -1706,6 +2043,7 @@ export class Store {
     const full: Message = { id: newId(), at: Date.now(), parentId: t.activeLeafId, ...redactBotAuthored(message) };
     mdb.appendMessage(threadId, full);
     t.messages.push(full);
+    this.threads.recordAppend(threadId);
     t.activeLeafId = full.id;
     if (full.kind === "screen") {
       for (const pruned of this.pruneScreenFrames(t)) {
@@ -1727,6 +2065,57 @@ export class Store {
     // bubble for them) — a thread that opens with one of those should not
     // leave the onboarding card stuck forever either.
     if ((full.role === "user" || full.role === "system") && full.kind === "text") this.dismissOnboardingCard(threadId);
+    return full;
+  }
+
+  /** Append a WHOLE transcript to a thread in one write and one frame.
+   *
+   * Folding a long conversation into another copies every message it holds.
+   * One transaction per message meant thousands of commits, and one frame
+   * per message meant a client redrawing the conversation thousands of
+   * times; both are the wrong shape for a bulk copy.  The rows land
+   * together, the branch head moves to the last one, and the client gets
+   * the batch in a single piece. */
+  appendMessages(
+    threadId: string,
+    messages: Array<Omit<Message, "id" | "at" | "parentId"> & { id?: string; at?: number; parentId?: string }>,
+  ): Message[] {
+    const t = this.thread(threadId);
+    const full: Message[] = [];
+    let parentId = t.activeLeafId;
+    for (const message of messages) {
+      const { id, at, parentId: wanted, ...rest } = message;
+      const entry: Message = {
+        id: id ?? newId(),
+        at: at ?? Date.now(),
+        parentId: wanted ?? parentId,
+        ...redactBotAuthored(rest),
+      };
+      parentId = entry.id;
+      full.push(entry);
+    }
+    if (full.length === 0) return full;
+    mdb.appendMessages(threadId, full);
+    t.messages.push(...full);
+    this.threads.recordAppend(threadId);
+    t.activeLeafId = full[full.length - 1]!.id;
+    // The first-run quiz is not a live ask, and talking past it hides it.
+    // A bulk copy carries the same user or system text a single message
+    // would, so it talks past it too — otherwise a merged conversation that
+    // starts with the greeting leaves the quiz on screen forever.
+    if (full.some((message) => (message.role === "user" || message.role === "system") && message.kind === "text")) {
+      this.dismissOnboardingCard(threadId);
+    }
+    if (full.some((message) => message.kind === "screen")) {
+      for (const pruned of this.pruneScreenFrames(t)) {
+        mdb.updateMessage(threadId, pruned);
+        this.emit({ type: "message.patch", threadId, message: pruned });
+      }
+    }
+    this.emit({ type: "messages", threadId, messages: full });
+    // A bulk copy is activity on the thread, same as a message that arrived
+    // on its own, so an until-activity snooze waits on it too.
+    if (this.threadsAwaitingActivity.has(threadId)) this.wakeThreadOnActivity(threadId);
     return full;
   }
 
@@ -1781,6 +2170,8 @@ export class Store {
       parentId: source.parentId ?? null,
       replyToId: source.replyToId,
       automationSource: source.automationSource,
+      // an edit or retry of a routine's prompt is still that routine's turn
+      toolPolicy: source.toolPolicy,
       from: source.from ? { ...source.from } : undefined,
       comm: source.comm && source.automationSource !== "delegation" &&
         !isDelegationMessage({ role: source.role, text: source.text, automationSource: source.automationSource })
@@ -1788,6 +2179,7 @@ export class Store {
     };
     mdb.appendMessage(threadId, full);
     t.messages.push(full);
+    this.threads.recordAppend(threadId);
     t.activeLeafId = full.id;
     this.emit({ type: "message", threadId, message: full });
     return full;
@@ -1808,6 +2200,43 @@ export class Store {
     mdb.setActiveLeaf(threadId, cur);
     this.emit({ type: "thread", threadId, activeLeafId: cur });
     return cur;
+  }
+
+  /** A restart drops the in-memory helper tracker.  Any card still marked
+   * running is settled failed, so the header stops counting it and the
+   * duration stops ticking. */
+  settleInterruptedHelpers(now = Date.now()): number {
+    let settled = 0;
+    for (const row of mdb.runningHelperRows()) {
+      if (!row.message.helper) continue;
+      const helper = interruptedHelper(row.message.helper, now);
+      if (!helper) continue;
+      // A warm thread patches in place; a cold one patches its single row
+      // by id so boot never hydrates a large thread to settle one card.
+      if (this.threads.has(row.threadId)) {
+        if (this.patchMessage(row.threadId, row.message.id, { helper })) settled += 1;
+        continue;
+      }
+      const updated: Message = { ...row.message, helper };
+      mdb.updateMessage(row.threadId, updated);
+      this.emit({ type: "message.patch", threadId: row.threadId, message: updated });
+      settled += 1;
+    }
+    return settled;
+  }
+
+  /** Whether one message exists, without hydrating its thread when cold —
+   * the held-work restore at boot only needs this lookup by id. A cold
+   * thread with no rows yet may still hold the message in its legacy JSON
+   * file, so only that case falls back to the hydrating read (which imports
+   * the file once); a thread with rows keeps the bounded by-id lookup. */
+  hasMessage(threadId: string, messageId: string): boolean {
+    const warm = this.threads.get(threadId);
+    if (warm) return warm.messages.some((m) => m.id === messageId);
+    if (!mdb.hasThreadRows(threadId)) {
+      return this.thread(threadId).messages.some((m) => m.id === messageId);
+    }
+    return mdb.readMessageById(threadId, messageId) !== null;
   }
 
   patchMessage(threadId: string, messageId: string, patch: Partial<Message>): Message | null {
@@ -1875,6 +2304,16 @@ export class Store {
   deleteBot(id: string): boolean {
     const bot = this.bot(id);
     if (!bot) return false;
+    // A bot's threads, transcripts and workspace all go with it, and none of that comes back.  The
+    // roster edit is debounced, so a delete cannot be made durable first without reordering the
+    // write path; what it can do is stop while the roster is known to be unwritable, so a refused
+    // save never ends in a workspace that is gone for good and a bot that returns on the next boot
+    // still pointing at it.
+    if (this.botsWritesRefused || this.groupsWritesRefused) {
+      if (this.botsWritesRefused) logRefusedSave(BOTS_FILE);
+      if (this.groupsWritesRefused) logRefusedSave(GROUPS_FILE);
+      return false;
+    }
     this.bots = this.bots.filter((b) => b.id !== id);
     // Rooms keep their own roster.  Strip the deleted id so memberIds and
     // defaultResponder never point at a ghost.  A remaining member becomes
@@ -1899,7 +2338,9 @@ export class Store {
     // transcripts: deleting a bot deletes what it knew
     try {
       rmSync(workspaceDir(id), { recursive: true, force: true });
-    } catch {}
+    } catch (error) {
+      console.error(`store: could not remove workspace for deleted bot ${id}`, error);
+    }
     this.saveBots();
     this.emit({ type: "bot.deleted", botId: id });
     return true;
@@ -2054,6 +2495,8 @@ export class Store {
       input?: number;
       output?: number;
       cachedInput?: number;
+      /** The window the engine reported on this turn, when it reported one. */
+      contextWindow?: number;
       costUsd: number | null;
       billingMode?: TurnBillingMode;
       /** This turn's timing, banked in the same write so the task reaches
@@ -2065,7 +2508,16 @@ export class Store {
   ): TaskUsage | null {
     const task = this.taskByThread(botId, threadId);
     if (!task) return null;
+    const previousLastInput = task.usage?.lastInput;
+    const previousContextWindow = task.usage?.contextWindow;
     task.usage = mergeTaskUsage(task.usage, turn);
+    // Context fullness is the LAST turn's input, not a running sum.  A turn
+    // that reports no input says nothing about it, so the earlier figure stands.
+    if (turn.input !== undefined && Number.isFinite(turn.input) && turn.input >= 0) task.usage.lastInput = Math.trunc(turn.input);
+    else if (previousLastInput !== undefined) task.usage.lastInput = previousLastInput;
+    if (turn.contextWindow !== undefined && Number.isFinite(turn.contextWindow) && turn.contextWindow > 0) {
+      task.usage.contextWindow = Math.trunc(turn.contextWindow);
+    } else if (previousContextWindow !== undefined) task.usage.contextWindow = previousContextWindow;
     if (turn.stats) task.stats = mergeTaskStats(task.stats, turn.stats);
     if (instanceId) {
       const byInstance = (task.usageByInstance ??= {});
@@ -2105,6 +2557,11 @@ export class Store {
     const bot = this.bot(botId);
     const task = bot ? this.taskByThread(botId, threadId) : undefined;
     if (!bot || !task) return null;
+    if (task.workspaceContext) {
+      if (opts.none) throw new Error("a local App task cannot discard its working folder");
+      if (task.cwd !== task.workspaceContext.cwd) throw new Error("inconsistent App task working folder");
+      return task.workspaceContext.cwd;
+    }
     if (opts.none) {
       if (task.cwd !== null) {
         task.cwd = null;
@@ -2143,6 +2600,10 @@ export class Store {
       }
       return group.pinnedCwd;
     }
+    if (task.workspaceContext) {
+      if (task.pinnedCwd !== task.workspaceContext.cwd) throw new Error("inconsistent App task working folder");
+      return task.workspaceContext.cwd;
+    }
     if (task.pinnedCwd === undefined) {
       task.pinnedCwd = group.cwd ?? null;
       if (group.threadId === task.threadId) group.pinnedCwd = task.pinnedCwd;
@@ -2155,8 +2616,8 @@ export class Store {
   // ── tasks ─────────────────────────────────────────────────────────────
   /** The first thing the human asked in a thread — a task's natural name. */
   private firstUserLine(threadId: string): string | null {
-    const first = this.messagesFor(threadId).find((m) => m.role === "user" && m.kind === "text" && m.text?.trim());
-    return first?.text ? titleFromMessage(first.text) : null;
+    const text = mdb.firstUserText(threadId, messagesFile(threadId));
+    return text ? titleFromMessage(text) : null;
   }
 
   tasks(botId: string): TaskRecord[] {
@@ -2254,7 +2715,7 @@ export class Store {
     const title = opts?.title?.trim() || previous?.title || "Automation";
     const activate = opts?.activate ?? true;
     // createTask reunites on a matching key — we already cleared it.
-    const neu = this.createTask(botId, title, activate, automationKey);
+    const neu = this.createTask(botId, title, activate, automationKey, previous?.workspaceContext);
     if (!neu) return null;
     if (previousThreadId) {
       this.appendMessage(neu.threadId, {
@@ -2274,7 +2735,13 @@ export class Store {
   /** A fresh context on the same bot: new thread, new session, same
    * persona/tools/computer. Becomes the active task.  A matching
    * `automationKey` returns the existing task instead of minting another. */
-  createTask(botId: string, title?: string, activate = true, automationKey?: string): TaskRecord | null {
+  createTask(
+    botId: string,
+    title?: string,
+    activate = true,
+    automationKey?: string,
+    workspaceContext?: TaskWorkspaceContext,
+  ): TaskRecord | null {
     const bot = this.bot(botId);
     if (!bot) return null;
     if (automationKey) {
@@ -2291,6 +2758,10 @@ export class Store {
       resumeCursors: {},
       ...(automationKey ? { automationKey } : {}),
     };
+    if (workspaceContext) {
+      task.cwd = workspaceContext.cwd;
+      task.workspaceContext = structuredClone(workspaceContext);
+    } else if (bot.cwd !== undefined) task.cwd = bot.cwd;
     bot.tasks = [task, ...(bot.tasks ?? [])];
     if (activate) {
       bot.threadId = task.threadId;
@@ -2401,7 +2872,13 @@ export class Store {
             if (Array.isArray(keys)) pendingById[id] = keys.filter((key): key is string => typeof key === "string");
           }
         }
-      } catch {
+      } catch (error) {
+        // ENOENT is the first boot before any marker exists; anything else
+        // reads as "directive never applied" and would re-run the migration.
+        // SAFETY: a failed `readFileSync` throws an errno exception carrying `code`.
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+          console.error("model-lineage: could not read the migration marker; treating the directive as unapplied", error);
+        }
         applied = [];
         pendingById = {};
       }
@@ -2532,7 +3009,8 @@ export class Store {
         let botId: unknown;
         try {
           [botId] = JSON.parse(key) as unknown[];
-        } catch {
+        } catch (error) {
+          console.error("model-lineage: dropping a malformed pending migration key", error);
           continue;
         }
         if (typeof botId === "string" && !visited.has(botId) && this.bots.some((bot) => bot.id === botId)) {

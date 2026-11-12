@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { createBotPatchQueue, type BotUpdatePatch } from "./bot-patch-queue";
+import { applyBotPatch, createBotPatchQueue, mergeBotPatches, type BotUpdatePatch } from "./bot-patch-queue";
 import type { Bot, BotAnnouncement } from "./store";
 
 const bot = (overrides: Partial<Bot> = {}): Bot => ({
@@ -43,7 +43,7 @@ describe("bot patch queue", () => {
     const queue = createBotPatchQueue({
       send: async (_botId, patch) => {
         sent.push(patch);
-        return bot({ ...patch });
+        return applyBotPatch(bot(), patch);
       },
       reconcile: async () => bot(),
       onAuthoritative: authoritative,
@@ -242,5 +242,62 @@ describe("bot patch queue", () => {
     await vi.advanceTimersByTimeAsync(400);
     await queue.flush("bot-1");
     expect(sent).toEqual([{ title: "still saves" }]);
+  });
+
+  it("sends a Mac voice and an iPhone voice made inside one debounce window together", async () => {
+    const sent: BotUpdatePatch[] = [];
+    const authoritative = vi.fn();
+    const queue = createBotPatchQueue({
+      send: async (_botId, patch) => {
+        sent.push(patch);
+        return applyBotPatch(bot({ voices: { iphone: "stored-iphone" } }), patch);
+      },
+      reconcile: async () => bot(),
+      onAuthoritative: authoritative,
+      onError: vi.fn(),
+    });
+
+    queue.enqueue("bot-1", { voices: { mac: "personal:mac-voice" } }, bot());
+    await vi.advanceTimersByTimeAsync(100);
+    queue.enqueue("bot-1", { voices: { iphone: "minimax-warm" } }, bot());
+    // Pending edits overlay per device, not as one replaced object.
+    expect(queue.overlayFor("bot-1")).toEqual({ voices: { mac: "personal:mac-voice", iphone: "minimax-warm" } });
+    await vi.advanceTimersByTimeAsync(400);
+
+    expect(sent).toEqual([{ voices: { mac: "personal:mac-voice", iphone: "minimax-warm" } }]);
+    expect(authoritative).toHaveBeenLastCalledWith(
+      expect.objectContaining({ voices: { mac: "personal:mac-voice", iphone: "minimax-warm" } }),
+      {},
+    );
+  });
+});
+
+describe("per-device voice patches", () => {
+  it("keeps the device a patch does not name", () => {
+    const stored = bot({ voices: { mac: "personal:mac-voice", iphone: "minimax-warm" } });
+    expect(applyBotPatch(stored, { voices: { iphone: "minimax-cool" } }).voices).toEqual({
+      mac: "personal:mac-voice",
+      iphone: "minimax-cool",
+    });
+  });
+
+  it("clears one device with null and drops the field when none is left", () => {
+    const stored = bot({ voices: { mac: "personal:mac-voice" } });
+    expect(applyBotPatch(stored, { voices: { mac: null } }).voices).toBeNull();
+    expect(applyBotPatch(bot({ voices: null }), { voices: { iphone: "minimax-warm" } }).voices).toEqual({ iphone: "minimax-warm" });
+  });
+
+  it("leaves voices alone when the patch does not carry them, and strips the consent flag", () => {
+    const stored = bot({ voices: { mac: "personal:mac-voice" } });
+    const next = applyBotPatch(stored, { name: "Renamed", acknowledgeLocalAuto: true });
+    expect(next.voices).toEqual({ mac: "personal:mac-voice" });
+    expect(next.name).toBe("Renamed");
+    expect(next).not.toHaveProperty("acknowledgeLocalAuto");
+  });
+
+  it("coalesces voices per device and every other field last-write-wins", () => {
+    expect(
+      mergeBotPatches({ voices: { mac: "a" }, voice: "shared-1" }, { voices: { mac: null, iphone: "b" }, voice: "shared-2" }),
+    ).toEqual({ voices: { mac: null, iphone: "b" }, voice: "shared-2" });
   });
 });

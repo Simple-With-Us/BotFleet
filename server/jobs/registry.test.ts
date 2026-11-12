@@ -113,6 +113,41 @@ function fakeSpawn() {
 const start = (h: Harness, command: string, threadId = "thread-a", botId = "bot-a", extra: { timeoutMinutes?: number } = {}) =>
   h.registry.start({ botId, threadId, command, cwd: h.dir, onComplete: "wake", ...extra });
 
+it("keeps a placement rollback registry passive across recovery, timers, stop and shutdown", async () => {
+  const spawn = fakeSpawn();
+  const original = harness({ spawn: spawn.spawnFn });
+  const started = start(original, "printf bridge-must-never-rerun");
+  expect(started.ok).toBe(true);
+  original.registry.dispose();
+  const before = readFileSync(join(original.dir, "jobs", "jobs.json"));
+  const files = readdirSync(join(original.dir, "jobs")).sort();
+  const passive = harness({ passive: true, spawn: () => { throw new Error("passive registry spawned"); }, listProcesses: async () => { throw new Error("passive registry scanned processes"); } }, original.dir);
+  expect(passive.registry.list()).toEqual(original.registry.list());
+  expect(start(passive, "printf forbidden")).toMatchObject({ ok: false, error: expect.stringMatching(/read-only/) });
+  expect(await passive.registry.adopt()).toEqual({ settled: 0, lost: 0 });
+  passive.registry.startTimers(1);
+  passive.registry.drainQueue(); passive.registry.tick(); passive.registry.checkLogs();
+  expect(await passive.registry.sweep()).toBe(0);
+  const id = passive.registry.list()[0]!.id;
+  expect(await passive.registry.kill(id, "owner")).toMatchObject({ ok: false, error: expect.stringMatching(/read-only/) });
+  expect(await passive.registry.killWhere(() => true, "removed", { forget: true })).toBe(0);
+  passive.registry.markNoticesDelivered([id]);
+  expect(await passive.registry.quiesce()).toBe(0);
+  passive.registry.shutdownSync();
+  expect(passive.registry.list()).toEqual(original.registry.list());
+  expect(readFileSync(join(original.dir, "jobs", "jobs.json"))).toEqual(before);
+  expect(readdirSync(join(original.dir, "jobs")).sort()).toEqual(files);
+  passive.registry.dispose();
+});
+
+it("does not create a jobs or pending-command directory for a passive registry", () => {
+  const root = mkdtempSync(join(tmpdir(), "omb-jobs-passive-"));
+  const passive = harness({ passive: true }, root);
+  expect(existsSync(join(root, "jobs"))).toBe(false);
+  expect(start(passive, "true")).toMatchObject({ ok: false });
+  expect(existsSync(join(root, "jobs"))).toBe(false);
+});
+
 async function until<T>(read: () => T | undefined | null | false, ms = 15_000): Promise<T> {
   const deadline = Date.now() + ms;
   for (;;) {
@@ -144,6 +179,46 @@ describe("settings", () => {
   it("does not trip the default swap gate at the 90-94% this Mac sits at", () => {
     expect(resolveJobsSettings(undefined).admission.maxSwapPercent).toBeGreaterThan(95);
   });
+  it("leaves every headroom gate unset unless the owner set the knob", () => {
+    const admission = resolveJobsSettings(undefined).admission;
+    expect(admission.reservedCpuCores).toBeUndefined();
+    expect(admission.reservedRamBytes).toBeUndefined();
+    expect(admission.minMemoryAvailablePercent).toBeUndefined();
+    expect(Object.keys(admission).sort()).toEqual(["maxSwapPercent", "minFreeDiskBytes"]);
+  });
+  it("resolves set headroom knobs, converting RAM to bytes and clamping", () => {
+    const admission = resolveJobsSettings({ admission: { reservedCpuCores: 99, reservedRamMb: 4096, minMemoryAvailablePercent: 150 } }).admission;
+    expect(admission.reservedCpuCores).toBe(64);
+    expect(admission.reservedRamBytes).toBe(4096 * 1024 * 1024);
+    expect(admission.minMemoryAvailablePercent).toBe(100);
+  });
+});
+
+describe("local placement identity", () => {
+  it("records both host ids before spawning and carries them through storage and frames", async () => {
+    const fake = fakeSpawn();
+    const h = harness({ spawn: (spec) => {
+      const record = stored(h.dir)[0]!;
+      expect(record.host).toBe(record.controllerHostId);
+      expect(record.host).toBe(readFileSync(join(h.dir, "host-id"), "utf8").trim());
+      return fake.spawnFn(spec);
+    } });
+    const result = start(h, "echo local");
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.job.host).toMatch(/^mac:/);
+    expect(result.job.controllerHostId).toBe(result.job.host);
+    expect(result.job.placedReason).toBe("Running on this Mac");
+    expect(result.job.leaseId).toBeUndefined();
+    expect(result.job.epoch).toBeUndefined();
+    await until(() => h.frames.length > 0);
+    expect(h.frames[0]!.jobs[0]).toEqual(result.job);
+    fake.children[0]!.child.emit("exit", 0, null);
+    h.registry.dispose();
+    const restarted = harness({ spawn: fake.spawnFn }, h.dir);
+    expect(restarted.registry.get(result.job.id)?.host).toBe(result.job.host);
+    expect(restarted.registry.get(result.job.id)?.controllerHostId).toBe(result.job.host);
+  });
 });
 
 // Windows refuses every job (no process groups to stop), so every block that
@@ -154,6 +229,41 @@ describe("on Windows", () => {
     const refused = start(h, "echo hi");
     expect(refused.ok).toBe(false);
     if (!refused.ok) expect(refused.error).toContain("not available on Windows");
+  });
+});
+
+posix("launch environment", () => {
+  it("gives a job's shell the launch variables of the bot and thread that started it, over the minimal environment", () => {
+    const { spawnFn, children } = fakeSpawn();
+    const seen: Array<[string, string]> = [];
+    const h = harness({
+      spawn: spawnFn,
+      launchEnv: (botId, threadId) => {
+        seen.push([botId, threadId]);
+        return { AGENT_LAUNCHER: "botfleet", AGENT_LAUNCH_SEAT: "BF-MONITOR", AGENT_SESSION: threadId };
+      },
+    });
+    process.env.AGENT_SEAT = "CLAUDE";
+    try {
+      expect(start(h, "echo hi", "thread-m", "bot-m").ok).toBe(true);
+    } finally {
+      delete process.env.AGENT_SEAT;
+    }
+    expect(seen).toEqual([["bot-m", "thread-m"]]);
+    const env = children[0]!.spec.env;
+    expect(env.AGENT_LAUNCHER).toBe("botfleet");
+    expect(env.AGENT_LAUNCH_SEAT).toBe("BF-MONITOR");
+    expect(env.AGENT_SESSION).toBe("thread-m");
+    expect(env.BOTFLEET_JOB_ID).toMatch(/\S/);
+    // the harness's own seat is not in the allowlisted base
+    expect(env.AGENT_SEAT).toBeUndefined();
+  });
+
+  it("starts a job with the minimal environment alone when no launcher is wired", () => {
+    const { spawnFn, children } = fakeSpawn();
+    const h = harness({ spawn: spawnFn });
+    expect(start(h, "echo hi").ok).toBe(true);
+    expect(children[0]!.spec.env.AGENT_LAUNCHER).toBeUndefined();
   });
 });
 
@@ -193,19 +303,25 @@ posix("caps", () => {
 });
 
 posix("admission", () => {
-  it("refuses on high swap, low disk, or a tripped spend ceiling — and never on load", () => {
+  it("queues on high swap or low disk, refuses on a tripped spend ceiling — and never on load", () => {
     const h = harness({ spawn: fakeSpawn().spawnFn });
+    // Memory and storage pressure queue in every mode (the pressure-gate
+    // queue, slice 8a); only the spend ceiling still refuses.
     h.host.swap = 99;
     const swap = start(h, "true");
-    expect(swap.ok).toBe(false);
-    if (!swap.ok) expect(swap.error).toContain("short on memory");
+    expect(swap.ok).toBe(true);
+    if (!swap.ok) throw new Error("expected pressure to queue, not refuse");
+    expect(swap.job.status).toBe("queued");
+    expect(swap.job.queuedReason).toContain("short on memory");
     h.host.swap = 94;
     expect(start(h, "true", "t2").ok).toBe(true);
     h.host.swap = null;
     h.host.disk = 100 * 1024 * 1024;
     const disk = start(h, "true", "t3");
-    expect(disk.ok).toBe(false);
-    if (!disk.ok) expect(disk.error).toContain("short on disk space");
+    expect(disk.ok).toBe(true);
+    if (!disk.ok) throw new Error("expected pressure to queue, not refuse");
+    expect(disk.job.status).toBe("queued");
+    expect(disk.job.queuedReason).toContain("short on disk space");
     h.host.disk = null;
     h.host.spend = true;
     const spend = start(h, "true", "t4");
@@ -900,7 +1016,7 @@ posix("before boot finishes", () => {
   });
 });
 
-describe("refusing before the ask", () => {
+posix("refusing before the ask", () => {
   it("names every refusal that does not depend on the command", () => {
     const { spawnFn } = fakeSpawn();
     const h = harness({ spawn: spawnFn });
@@ -908,7 +1024,12 @@ describe("refusing before the ask", () => {
     for (let i = 0; i < 3; i++) start(h, `job ${i}`);
     expect(h.registry.refusal({ botId: "bot-a", threadId: "thread-a" })).toContain("3 jobs running");
     h.host.disk = 1024;
-    expect(h.registry.refusal({ botId: "bot-b", threadId: "thread-b" })).toContain("short on disk space");
+    // Pressure queues instead of refusing, so it never blocks the ask.
+    expect(h.registry.refusal({ botId: "bot-b", threadId: "thread-b" })).toBeNull();
+    const pressured = start(h, "queued by pressure", "thread-b", "bot-b");
+    if (!pressured.ok) throw new Error(pressured.error);
+    expect(pressured.job.status).toBe("queued");
+    expect(pressured.job.queuedReason).toContain("short on disk space");
     expect(harness({ platform: "win32" }).registry.refusal({ botId: "bot-a", threadId: "thread-a" })).toContain("not available on Windows");
   });
 });

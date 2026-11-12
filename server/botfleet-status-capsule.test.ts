@@ -16,10 +16,12 @@ import { z } from "zod";
 import { botFleetStatusSystemPrompt, readBotFleetStatus } from "./botfleet-status-capsule.ts";
 import type { JsonObject, JsonValue } from "./schema.ts";
 
-const NOW = new Date("2026-08-22T06:30:00Z");
+export const BOTFLEET_STATUS_FIXTURE_NOW = new Date("2026-08-22T06:30:00Z");
+const NOW = BOTFLEET_STATUS_FIXTURE_NOW;
 const OLD_SINGLE_VIEW_SHA = `sha256:${"1".repeat(64)}`;
 const DUAL_VIEW_SHA = `sha256:${"2".repeat(64)}`;
-const roots: string[] = [];
+export const botfleetStatusCacheRoots: string[] = [];
+const roots = botfleetStatusCacheRoots;
 const jsonObjectSchema = z.record(z.string(), z.custom<JsonValue>());
 const posixOnly = describe.skipIf(process.getuid === undefined);
 
@@ -75,7 +77,7 @@ function ui(twoUp: boolean): JsonObject {
   };
 }
 
-function successCapsule(options: {
+export function successCapsule(options: {
   source?: string | null;
   expected?: string | null;
   twoUp?: boolean;
@@ -140,7 +142,7 @@ function failedCapsule(
   });
 }
 
-function cachePath(capsule: TestCapsule): string {
+export function cachePath(capsule: TestCapsule): string {
   const root = mkdtempSync(join(tmpdir(), "botfleet-status-"));
   roots.push(root);
   const parent = join(root, "botfleet");

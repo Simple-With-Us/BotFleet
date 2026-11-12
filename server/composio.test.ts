@@ -163,7 +163,7 @@ afterAll(async () => {
   await new Promise<void>((resolve) => api.close(() => resolve()));
 });
 
-describe.sequential("Composio Sessions", () => {
+describe("Composio Sessions", { concurrent: false }, () => {
   it("rejects broker URL components and invalid tokens from the environment", () => {
     process.env.OMB_COMPOSIO_BROKER_TOKEN = "a".repeat(64);
     try {

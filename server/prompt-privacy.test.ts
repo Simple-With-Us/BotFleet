@@ -29,6 +29,19 @@ function shippedSources(): Array<[string, string]> {
   return out;
 }
 
+/** Operator fleet seat prompts ship as markdown beside the server bundle. */
+function shippedSeatPromptMarkdown(): Array<[string, string]> {
+  const root = fileURLToPath(new URL("..", import.meta.url));
+  const botsDir = join(root, "bots");
+  const out: Array<[string, string]> = [];
+  for (const entry of readdirSync(botsDir)) {
+    if (!entry.endsWith(".md")) continue;
+    const full = join(botsDir, entry);
+    out.push([`bots/${entry}`, readFileSync(full, "utf8")]);
+  }
+  return out;
+}
+
 /**
  * One operator's private fleet protocol used to be part of every bot's system
  * prompt in a publicly shipped app: a private Slack channel, a private task
@@ -37,6 +50,8 @@ function shippedSources(): Array<[string, string]> {
  * business in shipped source, and the cheapest guard is to fail the build when
  * it comes back.
  */
+// The markers are spelled literally.  This file is a `.test.` file, which
+// the scan above skips, so the guard never trips on its own list.
 const PRIVATE_FLEET_MARKERS = [
   "#agent-sync",
   "BF-${",
@@ -57,6 +72,23 @@ describe("shipped source carries no operator-private fleet protocol", () => {
   for (const marker of PRIVATE_FLEET_MARKERS) {
     it(`no source file mentions ${marker}`, () => {
       const offenders = sources
+        .filter(([, text]) => text.includes(marker))
+        .map(([path]) => path);
+      expect(offenders).toEqual([]);
+    });
+  }
+});
+
+describe("shipped seat prompt markdown carries no banned private markers", () => {
+  const prompts = shippedSeatPromptMarkdown();
+
+  it("scans every bots/*.md file", () => {
+    expect(prompts.length).toBeGreaterThan(5);
+  });
+
+  for (const marker of PRIVATE_FLEET_MARKERS) {
+    it(`no bots markdown mentions ${marker}`, () => {
+      const offenders = prompts
         .filter(([, text]) => text.includes(marker))
         .map(([path]) => path);
       expect(offenders).toEqual([]);

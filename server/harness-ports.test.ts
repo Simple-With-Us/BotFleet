@@ -6,6 +6,9 @@ import {
   formatListenInUse,
   isListenInUse,
   listenErrorDisposition,
+  resolveHarnessPort,
+  resolvePort,
+  resolveWebhookPort,
 } from "./harness-ports.ts";
 
 describe("foreign loopback ports", () => {
@@ -36,5 +39,32 @@ describe("foreign loopback ports", () => {
     expect(listenErrorDisposition({ code: "EADDRINUSE" })).toBe("named-exit");
     expect(listenErrorDisposition({ code: "EACCES" })).toBe("capture-and-exit");
     expect(listenErrorDisposition({ code: "EMFILE" })).toBe("capture-and-exit");
+  });
+});
+
+describe("port env resolution", () => {
+  it("falls back on non-numeric, fractional, and out-of-range values", () => {
+    expect(resolvePort(undefined, 8799)).toBe(8799);
+    expect(resolvePort("", 8799)).toBe(8799);
+    expect(resolvePort("abc", 8799)).toBe(8799);
+    expect(resolvePort("8799.5", 8799)).toBe(8799);
+    expect(resolvePort("0", 8799)).toBe(8799);
+    expect(resolvePort("65536", 8799)).toBe(8799);
+    expect(resolvePort("9000", 8799)).toBe(9000);
+    expect(resolvePort("0x1F90", 8799)).toBe(8799);
+    expect(resolvePort("1e3", 8799)).toBe(8799);
+    expect(resolvePort("+9000", 8799)).toBe(8799);
+    expect(resolvePort(" 9000 ", 8799)).toBe(9000);
+  });
+
+  it("resolves the harness and webhook ports from env", () => {
+    expect(resolveHarnessPort({})).toBe(8799);
+    expect(resolveHarnessPort({ OMB_PORT: "9100" })).toBe(9100);
+    expect(resolveHarnessPort({ OGB_PORT: "9200" })).toBe(9200);
+    expect(resolveHarnessPort({ OMB_PORT: "nope", OGB_PORT: "9200" })).toBe(9200);
+    expect(resolveWebhookPort({}, 8799)).toBe(8800);
+    expect(resolveWebhookPort({ OMB_WEBHOOK_PORT: "9900" }, 8799)).toBe(9900);
+    expect(resolveWebhookPort({ OMB_WEBHOOK_PORT: "nope" }, 8799)).toBe(8800);
+    expect(resolveWebhookPort({}, 65535)).toBe(65534);
   });
 });

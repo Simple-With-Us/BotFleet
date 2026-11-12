@@ -9,7 +9,7 @@ import {
 describe("Settings Search Engine", () => {
   it("returns all items when query is empty", () => {
     const result = searchSettings("");
-    expect(result.matchingSectionIds.size).toBe(10);
+    expect(result.matchingSectionIds.size).toBe(11);
     expect(result.matchingItemIds.size).toBe(SETTINGS_SEARCH_ITEMS.length);
     expect(result.matchingItems.length).toBe(SETTINGS_SEARCH_ITEMS.length);
     expect(result.totalMatches).toBe(SETTINGS_SEARCH_ITEMS.length);
@@ -37,6 +37,11 @@ describe("Settings Search Engine", () => {
     expect(label("models:fleet")).toBe("Models");
     expect(label("computers:defaults")).toBe("Default Bot Settings");
     expect(label("secrets:infisical")).toBe("Secret Store");
+    expect(label("general:conversationMode")).toBe("Workspace Arrangement");
+
+    const modeItem = SETTINGS_SEARCH_ITEMS.find((i) => i.id === "general:conversationMode");
+    expect(modeItem?.badge).toBe("Arrangement");
+    expect(modeItem?.subtitle).toContain("\u00a0");
   });
 
   it("keeps the Usage body visible when a query matches only a sub-item", () => {
@@ -87,6 +92,16 @@ describe("Settings Search Engine", () => {
     const result = searchSettings("dark mode");
     expect(result.matchingSectionIds.has("general")).toBe(true);
     expect(result.matchingItemIds.has("general:skin")).toBe(true);
+  });
+
+  it("finds workspace arrangement by title or keywords", () => {
+    const byArrangement = searchSettings("arrangement");
+    expect(byArrangement.matchingSectionIds.has("general")).toBe(true);
+    expect(byArrangement.matchingItemIds.has("general:conversationMode")).toBe(true);
+
+    const byTitle = searchSettings("Workspace Arrangement");
+    expect(byTitle.matchingSectionIds.has("general")).toBe(true);
+    expect(byTitle.matchingItemIds.has("general:conversationMode")).toBe(true);
   });
 
   it("finds both Shared VPS VM and Local VM by sandbox or vm", () => {
@@ -152,6 +167,13 @@ describe("Settings Search Engine", () => {
     const result = searchSettings("vault");
     expect(result.matchingSectionIds.has("secrets")).toBe(true);
     expect(result.matchingItemIds.has("secrets:infisical")).toBe(true);
+  });
+
+  it("finds Resources admission thresholds by admission", () => {
+    const result = searchSettings("admission");
+    expect(result.matchingSectionIds.has("resources")).toBe(true);
+    expect(result.matchingItemIds.has("resources:thresholds")).toBe(true);
+    expect(sectionBodyHasVisibleItem("resources", result.matchingItemIds)).toBe(true);
   });
 
   it("reports 0 matches for non-existent nonsense query", () => {
