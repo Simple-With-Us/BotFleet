@@ -95,6 +95,119 @@ final class MarkdownTests: XCTestCase {
         XCTAssertEqual(Markdown.blocks("3.14 is pi"), [.paragraph("3.14 is pi")])
     }
 
+    func testTaskLists() {
+        XCTAssertEqual(
+            Markdown.blocks("- [ ] todo\n- [x] done\n- [X] also"),
+            [
+                .task(indent: 0, checked: false, number: nil, text: "todo"),
+                .task(indent: 0, checked: true, number: nil, text: "done"),
+                .task(indent: 0, checked: true, number: nil, text: "also"),
+            ]
+        )
+    }
+
+    func testTaskListMarkersAndNesting() {
+        XCTAssertEqual(
+            Markdown.blocks("* [ ] star\n+ [x] plus\n- [ ] parent\n  - [x] child"),
+            [
+                .task(indent: 0, checked: false, number: nil, text: "star"),
+                .task(indent: 0, checked: true, number: nil, text: "plus"),
+                .task(indent: 0, checked: false, number: nil, text: "parent"),
+                .task(indent: 1, checked: true, number: nil, text: "child"),
+            ]
+        )
+    }
+
+    func testOrderedTaskListsKeepTheirNumbers() {
+        XCTAssertEqual(
+            Markdown.blocks("1. [ ] first\n2. [x] second"),
+            [
+                .task(indent: 0, checked: false, number: 1, text: "first"),
+                .task(indent: 0, checked: true, number: 2, text: "second"),
+            ]
+        )
+    }
+
+    /// The label is inline markdown. The checkbox marker is structure, the
+    /// same way a bullet's dash is, so emphasis has to survive the split.
+    func testTaskLabelKeepsInlineMarkdown() {
+        XCTAssertEqual(
+            Markdown.blocks("- [ ] **bold** and `code` and [link](https://x.test)"),
+            [.task(
+                indent: 0, checked: false, number: nil,
+                text: "**bold** and `code` and [link](https://x.test)"
+            )]
+        )
+    }
+
+    func testEmptyTaskItem() {
+        XCTAssertEqual(
+            Markdown.blocks("- [ ]\n- [x]"),
+            [
+                .task(indent: 0, checked: false, number: nil, text: ""),
+                .task(indent: 0, checked: true, number: nil, text: ""),
+            ]
+        )
+    }
+
+    /// A box is only a box once the marker is complete and set off from the
+    /// label. A half-typed marker mid-stream, a missing space, or a bracket
+    /// note stays the characters the model has sent.
+    func testIncompleteOrOrdinaryBracketsAreNotTasks() {
+        XCTAssertEqual(Markdown.blocks("- ["), [.bullet(indent: 0, text: "[")])
+        XCTAssertEqual(Markdown.blocks("- [x"), [.bullet(indent: 0, text: "[x")])
+        XCTAssertEqual(Markdown.blocks("- [x]ship"), [.bullet(indent: 0, text: "[x]ship")])
+        XCTAssertEqual(Markdown.blocks("- [x]\tship"), [.task(indent: 0, checked: true, number: nil, text: "ship")])
+        XCTAssertEqual(Markdown.blocks("- [note] read this"), [.bullet(indent: 0, text: "[note] read this")])
+        XCTAssertEqual(Markdown.blocks("see [x] later"), [.paragraph("see [x] later")])
+    }
+
+    func testTaskListInsideFenceIsUntouched() {
+        XCTAssertEqual(
+            Markdown.blocks("```\n- [x] not a box\n```"),
+            [.code(language: nil, text: "- [x] not a box")]
+        )
+    }
+
+    /// A task list and a table in one reply stay two blocks. The table path
+    /// is unchanged: columns, alignment, and cells.
+    func testTaskListBesideATable() {
+        XCTAssertEqual(
+            Markdown.blocks("- [x] done\n- [ ] left\n\n| Name | Score |\n| --- | ---: |\n| Ada | 3 |"),
+            [
+                .task(indent: 0, checked: true, number: nil, text: "done"),
+                .task(indent: 0, checked: false, number: nil, text: "left"),
+                .table(
+                    header: ["Name", "Score"],
+                    alignments: [.leading, .trailing],
+                    rows: [["Ada", "3"]]
+                ),
+            ]
+        )
+    }
+
+    /// Once the label starts arriving, none of it may disappear into the
+    /// checkbox marker. The marker itself is structure, like the dash.
+    func testTaskLabelIsNotDroppedWhileStreaming() {
+        let label = "ship the fix"
+        let reply = "- [x] \(label)"
+        let labelStart = reply.distance(from: reply.startIndex, to: reply.range(of: label)!.lowerBound)
+        for length in 1...reply.count {
+            let partial = String(reply.prefix(length))
+            let shown = Markdown.blocks(partial).map(text).joined()
+            let sentLabel = length <= labelStart ? "" : String(label.prefix(length - labelStart))
+            XCTAssertTrue(
+                shown.contains(sentLabel),
+                "lost \(sentLabel.debugDescription) at \(length) from \(shown.debugDescription)"
+            )
+        }
+    }
+
+    func testTaskCheckboxVoiceOverLabels() {
+        XCTAssertEqual(Markdown.taskAccessibilityLabel(checked: true), "checked")
+        XCTAssertEqual(Markdown.taskAccessibilityLabel(checked: false), "not checked")
+    }
+
     /// Inline emphasis is Foundation's job, not this one — the splitter must
     /// hand the markers through untouched or the view has nothing to render.
     func testInlineSyntaxSurvivesTheSplit() {
@@ -295,6 +408,9 @@ final class MarkdownTests: XCTestCase {
         case let .paragraph(text): return text
         case let .bullet(_, text): return text
         case let .ordered(_, number, text): return "\(number)" + text
+        case let .task(_, _, number, text):
+            let prefix = number.map { String($0) } ?? ""
+            return prefix + text
         case let .heading(_, text): return text
         case let .code(language, text): return (language ?? "") + text
         case let .quote(text): return text

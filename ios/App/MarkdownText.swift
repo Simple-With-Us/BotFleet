@@ -82,6 +82,9 @@ struct MarkdownText: View {
         case let .ordered(indent, number, text):
             marker("\(number).", indent: indent, text: text, tail: tail)
 
+        case let .task(indent, checked, number, text):
+            taskRow(indent: indent, checked: checked, number: number, text: text, tail: tail)
+
         case let .quote(text):
             HStack(alignment: .top, spacing: 8) {
                 RoundedRectangle(cornerRadius: 1.5)
@@ -110,6 +113,32 @@ struct MarkdownText: View {
                 .font(.scaled(17, relativeTo: .body))
                 .foregroundStyle(Color.secondary)
                 .frame(minWidth: 16, alignment: .trailing)
+            inline(text, tail: tail).font(.scaled(17, relativeTo: .body))
+        }
+        .padding(.leading, CGFloat(indent) * 14)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    /// A GFM checkbox beside its label. The symbol is an image, not a
+    /// button, so VoiceOver can read the state and the reader cannot toggle
+    /// it. It uses the same scaled body font as the label, and primary text,
+    /// so it follows Dynamic Type and Dark Mode with the rest of the bubble.
+    private func taskRow(indent: Int, checked: Bool, number: Int?, text: String, tail: Bool) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            if let number {
+                Text("\(number).")
+                    .font(.scaled(17, relativeTo: .body))
+                    .foregroundStyle(Color.secondary)
+                    .frame(minWidth: 16, alignment: .trailing)
+            }
+            Image(systemName: checked ? "checkmark.square" : "square")
+                .font(.scaled(17, relativeTo: .body))
+                .foregroundStyle(Color.primary)
+                .frame(minWidth: 16, alignment: .center)
+                .accessibilityLabel(Markdown.taskAccessibilityLabel(checked: checked))
+                .accessibilityAddTraits(.isStaticText)
+                .accessibilityRemoveTraits(.isImage)
+                .accessibilityRespondsToUserInteraction(false)
             inline(text, tail: tail).font(.scaled(17, relativeTo: .body))
         }
         .padding(.leading, CGFloat(indent) * 14)

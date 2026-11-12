@@ -33,7 +33,8 @@ public struct MacRenderedMarkdownBlock: Equatable, Identifiable, Sendable {
         case .heading(let level, _):
             self.codePage = nil
             self.estimatedHeight = level <= 2 ? 36.0 : 28.0
-        case .paragraph(let text), .quote(let text), .bullet(_, let text), .ordered(_, _, let text):
+        case .paragraph(let text), .quote(let text), .bullet(_, let text),
+             .ordered(_, _, let text), .task(_, _, _, let text):
             self.codePage = nil
             let approxLines = max(1, (text.count + 69) / 70)
             self.estimatedHeight = Double(approxLines) * 20.0 + 12.0

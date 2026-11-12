@@ -42,7 +42,7 @@ extension MarkdownBlock {
             return text
         case let .heading(_, text), let .bullet(_, text):
             return text
-        case let .ordered(_, _, text):
+        case let .ordered(_, _, text), let .task(_, _, _, text):
             return text
         case .code, .rule, .table:
             return nil

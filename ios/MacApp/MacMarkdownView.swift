@@ -63,6 +63,24 @@ public struct MarkdownText: View {
             }
             .padding(.leading, CGFloat(indent) * 14)
 
+        case .task(let indent, let checked, let number, let text):
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                if let number {
+                    Text("\(number).")
+                        .foregroundColor(.secondary)
+                        .monospacedDigit()
+                }
+                Image(systemName: checked ? "checkmark.square" : "square")
+                    .font(.body)
+                    .accessibilityLabel(Markdown.taskAccessibilityLabel(checked: checked))
+                    .accessibilityAddTraits(.isStaticText)
+                    .accessibilityRemoveTraits(.isImage)
+                    .accessibilityRespondsToUserInteraction(false)
+                inlineText(text)
+                    .font(.body)
+            }
+            .padding(.leading, CGFloat(indent) * 14)
+
         case .quote(let text):
             HStack(spacing: 8) {
                 Rectangle()

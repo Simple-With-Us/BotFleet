@@ -13,9 +13,9 @@
 // and the view draws each one, handing the inline run back to Foundation.
 //
 // Deliberately not a full CommonMark implementation. It covers what a model
-// actually emits into a chat bubble — paragraphs, lists, headings, fences,
-// quotes, rules, tables — and treats anything it does not recognise as text,
-// which is the failure mode that loses nothing.
+// actually emits into a chat bubble — paragraphs, lists, task lists,
+// headings, fences, quotes, rules, tables — and treats anything it does not
+// recognise as text, which is the failure mode that loses nothing.
 import Foundation
 
 /// How a table column lines up, from the colons in its delimiter cell:
@@ -32,6 +32,10 @@ public enum MarkdownBlock: Equatable, Sendable {
     /// `indent` is nesting depth, 0 for a top-level item.
     case bullet(indent: Int, text: String)
     case ordered(indent: Int, number: Int, text: String)
+    /// A GFM task-list item. `checked` is true for `[x]` and `[X]`.
+    /// `number` is set for `1. [ ]` and nil for `-`, `*`, and `+`.
+    /// The label is inline markdown. The checkbox is read-only.
+    case task(indent: Int, checked: Bool, number: Int?, text: String)
     case heading(level: Int, text: String)
     /// A fenced block. `language` is whatever followed the opening fence.
     case code(language: String?, text: String)
@@ -46,6 +50,12 @@ public enum MarkdownBlock: Equatable, Sendable {
 }
 
 public enum Markdown {
+    /// VoiceOver name for a task checkbox. The box does not toggle, so the
+    /// name is the state itself.
+    public static func taskAccessibilityLabel(checked: Bool) -> String {
+        checked ? "checked" : "not checked"
+    }
+
     /// Split into blocks. Never throws and never drops input: an unparseable
     /// line ends up in a paragraph, which is what the reader wanted anyway.
     public static func blocks(_ source: String) -> [MarkdownBlock] {
@@ -172,7 +182,11 @@ public enum Markdown {
         let trimmed = line.trimmingCharacters(in: .whitespaces)
 
         for marker in ["- ", "* ", "+ "] where trimmed.hasPrefix(marker) {
-            return .bullet(indent: indent, text: String(trimmed.dropFirst(2)))
+            let body = String(trimmed.dropFirst(2))
+            if let task = taskItem(body) {
+                return .task(indent: indent, checked: task.checked, number: nil, text: task.text)
+            }
+            return .bullet(indent: indent, text: body)
         }
 
         // "1. " / "12) "
@@ -180,10 +194,41 @@ public enum Markdown {
         if !digits.isEmpty, digits.count <= 9 {
             let rest = trimmed.dropFirst(digits.count)
             if rest.hasPrefix(". ") || rest.hasPrefix(") ") {
-                return .ordered(indent: indent, number: Int(digits) ?? 1, text: String(rest.dropFirst(2)))
+                let body = String(rest.dropFirst(2))
+                if let task = taskItem(body) {
+                    return .task(
+                        indent: indent, checked: task.checked, number: Int(digits) ?? 1, text: task.text
+                    )
+                }
+                return .ordered(indent: indent, number: Int(digits) ?? 1, text: body)
             }
         }
         return nil
+    }
+
+    /// A GFM task marker at the start of a list item: `[ ]`, `[x]`, or `[X]`,
+    /// then the end of the line or whitespace. `[x]ship` and `[note]` stay
+    /// ordinary list text, and a half-typed box mid-stream keeps the
+    /// characters already sent.
+    private static func taskItem(_ body: String) -> (checked: Bool, text: String)? {
+        let trimmed = body.drop(while: { $0 == " " || $0 == "\t" })
+        guard trimmed.count >= 3 else { return nil }
+        let start = trimmed.startIndex
+        let mark = trimmed.index(after: start)
+        let close = trimmed.index(after: mark)
+        guard trimmed[start] == "[", trimmed[close] == "]" else { return nil }
+        let checked: Bool
+        switch trimmed[mark] {
+        case "x", "X":
+            checked = true
+        default:
+            guard trimmed[mark].isWhitespace else { return nil }
+            checked = false
+        }
+        let rest = trimmed[trimmed.index(after: close)...]
+        if rest.isEmpty { return (checked, "") }
+        guard rest.first?.isWhitespace == true else { return nil }
+        return (checked, String(rest.drop(while: \.isWhitespace)))
     }
 
     /// The header and alignments when `delimiter` is a delimiter row for
