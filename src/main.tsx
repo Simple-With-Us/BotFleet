@@ -443,6 +443,17 @@ if (fixtureParam === "tv-face") {
       </StrictMode>,
     );
   });
+} else if (fixtureParam === "usage-monitor-quota-grid") {
+  // Visual-spec harness (tests/e2e/usage-monitor-quota-grid.visual.spec.ts):
+  // Settings → Usage quota cells with plan metadata and reset countdowns.
+  void import("./components/UsageMonitorQuotaGridVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
 } else if (fixtureParam === "bypass-local-computer") {
   // Visual-spec harness (tests/e2e/bypass-local-computer.visual.spec.ts):
   // Bypass Including This Mac, off, on, disabled, and its warning.
