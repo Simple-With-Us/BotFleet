@@ -53,3 +53,13 @@ Creating or publishing a release, then checking, downloading, verifying, and ins
 ## Cleanup
 
 The test removes its staging directories.  No manual cleanup is needed.
+
+## Resources Guard, Recovery Clear, Status And Recover
+
+These checks run in an isolated fixture.  They do not touch `/Applications/BotFleet.app` or a live harness.
+
+```sh
+node --test --test-name-pattern "Resources tree|pending-recovery markers|status reports|recover restores|ubf status prints" scripts/update-botfleet-mac.node-test.mjs
+```
+
+A passing run shows a dirty Resources tree refused until `--force` writes a backup, pending-recovery markers removed only after `live-ok`, `ubf status` printing the fixture, and `ubf recover` restoring once and then reporting that the install already matches.
