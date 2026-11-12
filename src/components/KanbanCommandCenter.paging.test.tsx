@@ -231,7 +231,7 @@ describe("KanbanCommandCenter Show More", () => {
 
     await typeSearch(container, "first docker miss");
     expect(cards(container, "attention")).toHaveLength(1);
-    expect(column(container, "attention").textContent).toContain("+2 older (search match)");
+    expect(column(container, "attention").textContent).toContain("+2 older, matches your search");
   });
 
   it("keeps a card click opening the bot in its app, and the paging control out of that path", () => {

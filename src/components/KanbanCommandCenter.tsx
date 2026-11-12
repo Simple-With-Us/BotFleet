@@ -697,7 +697,7 @@ export function KanbanCommandCenter({
                         title={`${card.olderRuns} older ${card.olderRuns === 1 ? "run" : "runs"} of this routine are folded into this card.`}
                       >
                         {foldedSearchMatches(card)
-                          ? `+${card.olderRuns} older (search match)`
+                          ? `+${card.olderRuns} older, matches your search`
                           : `+${card.olderRuns} older`}
                       </p>
                     ) : null}
