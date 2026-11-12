@@ -93,6 +93,41 @@ import {
   waitForStableApplication,
   waitForStartup,
 } from "./update-botfleet-mac.mjs";
+import { readShellSource } from "./shell-source.mjs";
+
+const scripts = dirname(fileURLToPath(import.meta.url));
+
+async function waitUntil(predicate, { timeoutMs = 10_000, stepMs = 10 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await predicate()) return;
+    await delay(stepMs);
+  }
+  throw new Error(`condition not met within ${timeoutMs}ms`);
+}
+
+async function readFirstLineFromStream(stream, { timeoutMs = 10_000 } = {}) {
+  return new Promise((resolve, reject) => {
+    let buffer = "";
+    const onData = (chunk) => {
+      buffer += chunk;
+      if (!buffer.includes("\n")) return;
+      stream.off("data", onData);
+      clearTimeout(timer);
+      const line = buffer.slice(0, buffer.indexOf("\n")).trim();
+      resolve(Number(line));
+    };
+    stream.on("data", onData);
+    const timer = setTimeout(() => {
+      stream.off("data", onData);
+      reject(new Error(`timed out waiting for a complete line (got ${JSON.stringify(buffer)})`));
+    }, timeoutMs);
+    stream.once("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+  });
+}
 
 test("desktop update establishes verified packaged ownership before starting the source watchdog", async () => {
   const calls = [];
@@ -151,8 +186,6 @@ test("desktop startup respects component ownership, no-open and the pre-rollback
   assert.equal(shouldStartDesktop({ updateApp: true, wasRunning: false }), false);
   assert.equal(shouldStartDesktop({ updateApp: true, openApplication: true, wasRunning: true }), true);
 });
-
-const scripts = dirname(fileURLToPath(import.meta.url));
 
 /** Wrapper tests must not read ~/.botfleet or /Applications/BotFleet.app. */
 function wrapperFixtureEnv(checkout, fixture) {
@@ -464,7 +497,7 @@ test("safeStorage export runs only when the installed app is the legacy identity
 });
 
 test("the stable wrapper bootstraps updater policy from the fetched target", async () => {
-  const source = await readFile(join(scripts, "update-botfleet-policy.sh"), "utf8");
+  const source = await readShellSource(join(scripts, "update-botfleet-policy.sh"));
   assert.match(source, /BOOTSTRAP_REF="\$\{BOTFLEET_UPDATE_TARGET:-origin\/main\}"/);
   assert.match(source, /elif \[\[ "\$arg" == "--target" \]\]/);
   assert.match(source, /elif \[\[ "\$arg" == --target=\* \]\]/);
@@ -496,7 +529,7 @@ test("the stable wrapper bootstraps updater policy from the fetched target", asy
 });
 
 test("forced updates refresh the selected bootstrap ref before archiving it", async () => {
-  const source = await readFile(join(scripts, "update-botfleet-policy.sh"), "utf8");
+  const source = await readShellSource(join(scripts, "update-botfleet-policy.sh"));
   const forceCheck = source.indexOf('if [[ "${BOTFLEET_FORCE:-}" == "1" ]]');
   const targetSelection = source.indexOf('BOOTSTRAP_REF="${BOTFLEET_UPDATE_TARGET:-origin/main}"');
   const targetOverride = source.indexOf('BOOTSTRAP_REF="$arg"');
@@ -517,7 +550,7 @@ test("forced updates refresh the selected bootstrap ref before archiving it", as
 });
 
 test("the stable wrapper enforces origin/main ancestry before archiving or executing the bootstrap target", async () => {
-  const source = await readFile(join(scripts, "update-botfleet-policy.sh"), "utf8");
+  const source = await readShellSource(join(scripts, "update-botfleet-policy.sh"));
   const fetch = source.indexOf('git -C "$BOTFLEET_CHECKOUT" fetch --quiet origin "$BOOTSTRAP_FETCH_REF"');
   const mainRefresh = source.indexOf('git -C "$BOTFLEET_CHECKOUT" fetch --quiet origin main', fetch);
   const resolve = source.indexOf('BOOTSTRAP_COMMIT="$(git -C "$BOTFLEET_CHECKOUT" rev-parse --verify "${BOOTSTRAP_REF}^{commit}"', fetch);
@@ -846,7 +879,7 @@ test("resolveTarget accepts a full commit SHA on main", async () => {
 });
 
 test("the stable wrapper expands UPDATER_ARGS with the bash 3.2 safe form", async () => {
-  const source = await readFile(join(scripts, "update-botfleet-policy.sh"), "utf8");
+  const source = await readShellSource(join(scripts, "update-botfleet-policy.sh"));
   // Stock macOS /bin/bash is 3.2, where expanding an EMPTY array under
   // `set -u` fails with "unbound variable". That kills the no-argument
   // in-app update path (electron/updater.mjs spawns the wrapper with no
@@ -1044,13 +1077,13 @@ test("the up-to-date shortcut only swallows a plain update to origin/main", { sk
 });
 
 test("the stable wrapper does not test for a .git directory to find the checkout", async () => {
-  const source = await readFile(join(scripts, "update-botfleet-policy.sh"), "utf8");
+  const source = await readShellSource(join(scripts, "update-botfleet-policy.sh"));
   assert.doesNotMatch(source, /-d "\$BOTFLEET_CHECKOUT\/\.git"/);
   assert.match(source, /git -C "\$BOTFLEET_CHECKOUT" rev-parse --git-dir/);
 });
 
 test("the up-to-date runtime probe prefers BOTFLEET_OWNER_NONCE and falls back to the live owner record", async () => {
-  const wrapper = await readFile(join(scripts, "update-botfleet-policy.sh"), "utf8");
+  const wrapper = await readShellSource(join(scripts, "update-botfleet-policy.sh"));
   const helper = await readFile(join(scripts, "update-botfleet-runtime-commit.mjs"), "utf8");
   assert.match(wrapper, /update-botfleet-runtime-commit\.mjs/);
   assert.match(wrapper, /BOTFLEET_OWNER_NONCE/);
@@ -1630,16 +1663,12 @@ test("the process list match for the installed bundle skips rows in a zombie sta
 test("a real unreaped child is a zombie: kill -0 still succeeds, processIsAlive says exited, and quiesce passes it", { skip: process.platform === "win32" ? "ps and sh semantics differ on win32" : false }, async () => {
   const parent = spawn("/bin/sh", ["-c", "/bin/sleep 0 & echo $!; exec /bin/sleep 30"], { stdio: ["ignore", "pipe", "ignore"] });
   try {
-    let stdout = "";
     parent.stdout.setEncoding("utf8");
-    parent.stdout.on("data", (chunk) => { stdout += chunk; });
-    const deadline = Date.now() + 10_000;
-    while (!stdout.includes("\n") && Date.now() < deadline) await delay(25);
-    const zombiePid = Number(stdout.trim());
-    assert.ok(Number.isInteger(zombiePid) && zombiePid > 0, `the shell reported a pid, got ${JSON.stringify(stdout)}`);
+    const zombiePid = await readFirstLineFromStream(parent.stdout);
+    assert.ok(Number.isInteger(zombiePid) && zombiePid > 0, `the shell reported a pid, got ${JSON.stringify(zombiePid)}`);
     // The pid keeps answering kill -0 until the parent reaps it, which is the
     // premise of the bug; processIsAlive must see through it once it has exited.
-    while (await processIsAlive(zombiePid) && Date.now() < deadline) await delay(25);
+    await waitUntil(async () => !(await processIsAlive(zombiePid)));
     assert.equal(await processIsAlive(zombiePid), false, "an unreaped, exited child reads as exited");
     assert.doesNotThrow(() => process.kill(zombiePid, 0), "kill -0 alone still reports the zombie as present");
     assert.equal(await processIsAlive(parent.pid), true, "the parent that never reaped it is a live process");
@@ -2819,7 +2848,7 @@ test("an explanation left in the caller's environment is not believed", wrapperO
 });
 
 test("the selection runs after the tip is fetched and before anything is archived for execution", async () => {
-  const source = (await readFile(join(scripts, "update-botfleet-policy.sh"), "utf8")).replace(/\r\n/g, "\n");
+  const source = await readShellSource(join(scripts, "update-botfleet-policy.sh"));
   const bootstrapDir = source.indexOf('BOOTSTRAP_DIR="$(mktemp -d');
   const selection = source.indexOf('SELECT_NEWEST_GREEN=0');
   const tipFetch = source.indexOf('fetch --quiet origin main 2>/dev/null; then\n      SELECT_TIP');
@@ -2899,7 +2928,7 @@ test("the selection gives up long before the harness decides a run never started
   const grace = Number(/const LAUNCH_GRACE_MS = ([\d_]+)/.exec(control)?.[1]?.replaceAll("_", ""));
   assert.ok(grace > 0, "the harness's launch grace is still where this test looks for it");
 
-  const wrapper = (await readFile(join(scripts, "update-botfleet-policy.sh"), "utf8")).replace(/\r\n/g, "\n");
+  const wrapper = await readShellSource(join(scripts, "update-botfleet-policy.sh"));
   const watchdog = Number(/\}, (\d+)\);\n\s+try \{/.exec(wrapper)?.[1]);
   assert.ok(watchdog > 0 && watchdog <= grace / 2, `the wrapper's watchdog (${watchdog}ms) must be at most half of ${grace}ms`);
 
