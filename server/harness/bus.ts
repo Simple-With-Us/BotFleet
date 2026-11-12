@@ -45,8 +45,17 @@ interface TeeEntry {
   carriesWarning: boolean;
 }
 
+/** A driver's announcement of its own slash commands, stamped with the
+ *  instance that sent it. */
+export type EngineCommandsEvent = Extract<RuntimeEvent, { type: "engine.commands" }>;
+export type EngineCommandsListener = (event: EngineCommandsEvent) => void;
+
 export class EventBus {
   private listeners = new Set<RuntimeEventListener>();
+  /** Who hears `engine.commands`.  Those events are bookkeeping about an
+   *  engine, not part of any conversation, so they take this path instead of
+   *  `publish`: no event-log line, no stream frame, no transcript fold. */
+  private engineCommandListeners = new Set<EngineCommandsListener>();
   private unsubscribes = new Map<string, () => void>();
   private pendingLogWarnings = new Map<string, RuntimeEvent>();
   /** Threads whose pending marker is already inside a queued entry.  Without
@@ -102,6 +111,16 @@ export class EventBus {
           console.error(`bus: dropped cross-driver event from ${instance.instanceId}`);
           return;
         }
+        if (event.type === "engine.commands") {
+          for (const listener of this.engineCommandListeners) {
+            try {
+              listener({ ...event, providerInstanceId: instance.instanceId });
+            } catch (e) {
+              console.error("bus: engine.commands listener threw", e);
+            }
+          }
+          return;
+        }
         // Second hard invariant: exactly one terminal event per turn.  Every
         // consumer of turn.completed — the watchdog, the Sentry span closer,
         // the routine receipt, the repeat detector, the room waiter, the
@@ -120,6 +139,12 @@ export class EventBus {
       });
       this.unsubscribes.set(instance.instanceId, unsub);
     }
+  }
+
+  /** Hear every instance's announcement of its slash commands. */
+  onEngineCommands(listener: EngineCommandsListener): () => void {
+    this.engineCommandListeners.add(listener);
+    return () => this.engineCommandListeners.delete(listener);
   }
 
   detach(instanceId: string) {

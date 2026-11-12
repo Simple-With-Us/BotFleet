@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 import { basename, dirname, join, win32 } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
@@ -18,6 +19,7 @@ import {
   releasePath,
   releasesRoot,
   resolveCurrent,
+  stageRelease,
   stagingPath,
   stagingRoot,
   validateReleaseManifest,
@@ -840,4 +842,239 @@ test("retention breaks ties on directory mtime, not commit name", async (t) => {
   await swapCurrent({ commit: A, env });
   const listed = await listReleases(env);
   assert.deepEqual(listed, [B, A], "same promotedAt must order by mtime, not SHA");
+});
+
+/**
+ * A tiny git repository with one commit, used to prove that staging reads a
+ * commit without touching a working tree.
+ */
+async function sourceRepo(t, { files = { "server/index.ts": "export const ok = true;\n" } } = {}) {
+  const repo = await mkdtemp(join(tmpdir(), "bf-release-source-"));
+  t.after(async () => { await rm(repo, { recursive: true, force: true }); });
+  await run("git", ["init", "-q", repo]);
+  await run("git", ["-C", repo, "config", "user.email", "release@example.invalid"]);
+  await run("git", ["-C", repo, "config", "user.name", "Release Test"]);
+  for (const [name, content] of Object.entries(files)) {
+    const target = join(repo, name);
+    await mkdir(dirname(target), { recursive: true });
+    await writeFile(target, content);
+  }
+  await run("git", ["-C", repo, "add", "-A"]);
+  await run("git", ["-C", repo, "commit", "-q", "-m", "source"]);
+  const { stdout } = await run("git", ["-C", repo, "rev-parse", "HEAD"]);
+  return { repo, commit: stdout.trim() };
+}
+
+test("staging exports a commit and leaves the source repository untouched", async (t) => {
+  const { env } = await store(t);
+  const { repo, commit } = await sourceRepo(t, {
+    files: { "server/index.ts": "export const staged = true;\n", "package.json": "{}\n" },
+  });
+  const before = await run("git", ["-C", repo, "status", "--porcelain"]);
+  const staging = await stageRelease({ commit, repo, env, install: false });
+  assert.equal(staging, stagingPath(commit, env));
+  // Line endings are the platform's business: git applies the checkout's
+  // eol conversion when it exports, so a Windows runner hands back CRLF for
+  // the same content.  The export is about the CONTENT, so the comparison
+  // normalizes the ending instead of pinning one platform's convention.
+  const exported = await readFile(join(staging, "server/index.ts"), "utf8");
+  assert.equal(exported.replace(/\r\n/g, "\n"), "export const staged = true;\n");
+  // The export must not have left a working tree behind, and the source
+  // repository must be exactly as it was.
+  const after = await run("git", ["-C", repo, "status", "--porcelain"]);
+  assert.equal(after.stdout, before.stdout);
+  assert.equal(after.stdout.trim(), "");
+  // No archive left behind in the staged tree.
+  assert.equal((await readdir(staging)).some((name) => name.endsWith(".tar")), false);
+});
+
+test("staging refuses anything that is not a full commit", async (t) => {
+  const { env } = await store(t);
+  for (const bad of ["main", "abc1234", "HEAD", ""]) {
+    await assert.rejects(
+      () => stageRelease({ commit: bad, repo: "/tmp", env, install: false }),
+      /non-commit|Refusing/,
+      `"${bad}" must be refused`,
+    );
+  }
+});
+
+test("staging names the reason when the commit is not in the source repository", async (t) => {
+  const { env } = await store(t);
+  const { repo } = await sourceRepo(t);
+  await assert.rejects(
+    () => stageRelease({ commit: "d".repeat(40), repo, env, install: false }),
+    /Could not export/,
+  );
+});
+
+test("a staged commit promotes into an immutable release and the pointer moves to it", async (t) => {
+  const { env } = await store(t);
+  const { repo, commit } = await sourceRepo(t);
+  await stageRelease({ commit, repo, env, install: false });
+  const promoted = await promoteStaging({ commit, env });
+  assert.equal(promoted, releasePath(commit, env));
+  assert.equal(await isReleaseDirectory(promoted), true);
+  await swapCurrent({ commit, env });
+  assert.equal(await currentCommit(env), commit);
+  // resolveCurrent answers the PHYSICAL path by design: the fingerprint and
+  // bundle-identity checks refuse a symlinked root, so the pointer is a
+  // launchd-level indirection and everything that reasons about the tree
+  // resolves it first.
+  assert.equal(await resolveCurrent(env), await realpath(promoted));
+});
+
+test("staging refuses a commit that is already a release, before installing anything", async (t) => {
+  const { env } = await store(t);
+  const { repo, commit } = await sourceRepo(t);
+  await stageRelease({ commit, repo, env, install: false });
+  await promoteStaging({ commit, env });
+  // The install is the expensive part, so the refusal has to come before it:
+  // promoting an already-released commit would fail only AFTER a full
+  // dependency install, and would leave a staging tree behind.
+  await assert.rejects(
+    () => stageRelease({ commit, repo, env, install: false }),
+    /already a release/,
+  );
+  // And no staging tree is left behind by the refusal.
+  await assert.rejects(() => stat(stagingPath(commit, env)), /ENOENT/);
+});
+
+
+test("the CLI names the job that runs the store it acted on", async (t) => {
+  // The restart hint must follow the STORE, not the presence of a flag: an
+  // explicit `--store <harness store>` is still the harness, and telling an
+  // operator to restart the sidecar's job for it would send them to the
+  // wrong program.
+  const dir = await mkdtemp(join(tmpdir(), "bf-release-cli-"));
+  t.after(async () => {
+    // A promoted release is read-only, so the tree cannot be removed
+    // directly: the store's own discard path restores write permission
+    // first, which is the same thing an operator does to reclaim disk.
+    for (const root of [
+      join(dir, "botfleet-companion"),
+      join(dir, "botfleet"),
+      join(dir, "mixed", "BotFleet-Companion"),
+      join(dir, "dotted", ".botfleet-companion"),
+    ]) {
+      const env = { ...process.env, BOTFLEET_RELEASES_ROOT: root };
+      for (const commit of await listReleases(env)) {
+        await discardRelease(commit, env).catch(() => {});
+      }
+    }
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const runCli = (args, env = {}) =>
+    run(process.execPath, [join(dirname(fileURLToPath(import.meta.url)), "harness-release.mjs"), ...args], {
+      encoding: "utf8",
+      env: { ...process.env, ...env },
+    });
+
+  // A store named for the companion is the companion's.
+  const companionRoot = join(dir, "botfleet-companion");
+  const companionEnv = { BOTFLEET_RELEASES_ROOT: companionRoot };
+  const { repo, commit } = await sourceRepo(t);
+  await stageRelease({ commit, repo, env: { ...process.env, ...companionEnv }, install: false });
+  await promoteStaging({ commit, env: { ...process.env, ...companionEnv } });
+  const companion = await runCli(["swap", commit, "--store", companionRoot]);
+  assert.match(companion.stdout, /app\.botfleet\.companion/);
+
+  // The default store is the harness's, with or without an explicit flag.
+  const harnessRoot = join(dir, "botfleet");
+  const harnessEnv = { BOTFLEET_RELEASES_ROOT: harnessRoot };
+  await stageRelease({ commit, repo, env: { ...process.env, ...harnessEnv }, install: false });
+  await promoteStaging({ commit, env: { ...process.env, ...harnessEnv } });
+  const harness = await runCli(["swap", commit, "--store", harnessRoot]);
+  assert.match(harness.stdout, /app\.botfleet\.server/);
+
+  // Case-folded: a case-insensitive volume can hold the store under a
+  // different case, and that is still the companion's store.  It lives
+  // under its own parent, because on a case-insensitive filesystem a
+  // directory that differs only in case is the SAME directory.
+  const mixedRoot = join(dir, "mixed", "BotFleet-Companion");
+  const mixedEnv = { BOTFLEET_RELEASES_ROOT: mixedRoot };
+  await stageRelease({ commit, repo, env: { ...process.env, ...mixedEnv }, install: false });
+  await promoteStaging({ commit, env: { ...process.env, ...mixedEnv } });
+  const mixed = await runCli(["swap", commit, "--store", mixedRoot]);
+  assert.match(mixed.stdout, /app\.botfleet\.companion/);
+
+  // The real store roots are DOT-PREFIXED (~/.botfleet,
+  // ~/.botfleet-companion), so the comparison has to strip the leading
+  // dots.  Without that, the companion's own store reads as the harness's
+  // and the hint names the wrong job.
+  const dotted = join(dir, "dotted", ".botfleet-companion");
+  const dottedEnv = { BOTFLEET_RELEASES_ROOT: dotted };
+  await stageRelease({ commit, repo, env: { ...process.env, ...dottedEnv }, install: false });
+  await promoteStaging({ commit, env: { ...process.env, ...dottedEnv } });
+  const dottedOut = await runCli(["swap", commit, "--store", dotted]);
+  assert.match(dottedOut.stdout, /app\.botfleet\.companion/);
+});
+
+test("the restart hint says stop before start, because the launcher will not start a second harness", async (t) => {
+  // The launcher probes the port and exits 0 when a harness is already
+  // answering, so a kickstart on its own leaves the OLD release serving.
+  // An operator told only "kickstart" would believe an update applied
+  // when it did not, so the hint has to say stop-then-start.
+  const dir = await mkdtemp(join(tmpdir(), "bf-release-hint-"));
+  const root = join(dir, "botfleet");
+  const env = { ...process.env, BOTFLEET_RELEASES_ROOT: root };
+  t.after(async () => {
+    // A promoted release is read-only, so the store's own discard path
+    // restores write permission before the tree is removed.
+    for (const commit of await listReleases(env)) {
+      await discardRelease(commit, env).catch(() => {});
+    }
+    await rm(dir, { recursive: true, force: true });
+  });
+  const { repo, commit } = await sourceRepo(t);
+  await stageRelease({ commit, repo, env, install: false });
+  await promoteStaging({ commit, env });
+  const { stdout } = await run(process.execPath, [join(dirname(fileURLToPath(import.meta.url)), "harness-release.mjs"), "swap", commit, "--store", root], {
+    encoding: "utf8",
+    env,
+  });
+  assert.match(stdout, /stop the running harness/i);
+  assert.match(stdout, /kickstart/);
+});
+
+test("the manifest records the version the deployer validated, defaulting to the tree's own", async (t) => {
+  // The runtime in a release reports the manifest's version when there is one,
+  // so the post-apply check compares against the number the deployer verified.
+  // With no deployer version, the staged package.json is the truth the same
+  // code would report anyway.
+  const dir = await mkdtemp(join(tmpdir(), "botfleet-manifest-version-"));
+  t.after(() => forceRemove(dir));
+  const env = { HOME: dir };
+  const staging = stagingPath(A, env);
+  await mkdir(staging, { recursive: true });
+  await writeFile(join(staging, "package.json"), JSON.stringify({ name: "botfleet", version: "1.0.42" }));
+
+  await promoteStaging({ commit: A, env });
+  const withDefault = validateReleaseManifest(
+    JSON.parse(await readFile(join(releasePath(A, env), ".botfleet-release.json"), "utf8")));
+  assert.equal(withDefault.version, "1.0.42", "no explicit version records the tree's package.json version");
+
+  const stagingB = stagingPath(B, env);
+  await mkdir(stagingB, { recursive: true });
+  await writeFile(join(stagingB, "package.json"), JSON.stringify({ name: "botfleet", version: "1.0.42" }));
+  await promoteStaging({ commit: B, env, version: "1.0.202611030400", build: "202611030400" });
+  const stamped = validateReleaseManifest(
+    JSON.parse(await readFile(join(releasePath(B, env), ".botfleet-release.json"), "utf8")));
+  assert.equal(stamped.version, "1.0.202611030400", "an explicit version wins");
+  assert.equal(stamped.build, "202611030400");
+
+  const stagingC = stagingPath(C, env);
+  await mkdir(stagingC, { recursive: true });
+  await promoteStaging({ commit: C, env });
+  const withoutPackage = validateReleaseManifest(
+    JSON.parse(await readFile(join(releasePath(C, env), ".botfleet-release.json"), "utf8")));
+  assert.equal(withoutPackage.version, undefined, "no package.json records no version rather than inventing one");
+});
+
+test("version and build are typed manifest fields", async () => {
+  const valid = { schemaVersion: 1, commit: A, promotedAt: "2026-11-03T00:00:00.000Z" };
+  assert.ok(validateReleaseManifest({ ...valid, version: "1.0.42", build: "42" }));
+  assert.equal(validateReleaseManifest({ ...valid, version: 42 }), null, "a numeric version is rejected");
+  assert.equal(validateReleaseManifest({ ...valid, build: { n: 1 } }), null, "a non-string build is rejected");
 });

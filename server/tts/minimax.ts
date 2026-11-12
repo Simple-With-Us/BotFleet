@@ -20,11 +20,11 @@
 // An error response surfaces base_resp.status_msg verbatim.
 
 import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 
 import type { Audio, VerifyResult, Voice } from "./types.ts";
 import { recordSpeechUsage } from "./usage.ts";
+import { dataDir } from "../data-dir.ts";
 
 // ── Re-export shared types ────────────────────────────────────────────────────
 export type { Audio, VerifyResult, Voice };
@@ -33,7 +33,7 @@ const API = process.env.MINIMAX_API_URL || "https://api.minimax.io";
 const MODEL = process.env.MINIMAX_SPEECH_MODEL || "speech-2.8-turbo";
 const MAX_CHARS = 10_000;
 
-const DATA_DIR = process.env.OMB_DATA_DIR ?? join(homedir(), ".botfleet");
+const DATA_DIR = dataDir();
 const CLONED_VOICES_FILE = join(DATA_DIR, "tts-cloned-voices.json");
 
 // ── Documented starter voices ────────────────────────────────────────────────
@@ -393,7 +393,7 @@ export async function synthesize(
     },
     audio_setting: {
       sample_rate: options.sampleRate ?? 24_000,
-      bitrate: options.bitrate ?? 128_000,
+      bitrate: options.bitrate ?? 64_000,
       format: options.format ?? "mp3",
       channel: 1,
     },
@@ -420,6 +420,6 @@ export async function synthesize(
   const format = parsed.extra_info?.audio_format ?? body.audio_setting.format;
   const mime = format === "wav" ? "audio/wav" : format === "pcm" ? "audio/pcm" : "audio/mpeg";
   if (bytes.length) recordSpeechUsage("minimax", parsed.extra_info?.usage_characters ?? trimmed.length,
-    Number.isSafeInteger(parsed.extra_info?.usage_characters) ? "provider" : "submitted");
+    Number.isSafeInteger(parsed.extra_info?.usage_characters) ? "provider" : "submitted", { service: MODEL });
   return { bytes, mime };
 }

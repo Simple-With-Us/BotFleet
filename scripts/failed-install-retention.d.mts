@@ -10,6 +10,8 @@ export declare function failedInstallBundlesToPrune(
   keep?: number,
 ): string[];
 
+export type FailedInstallPruneFailure = { path: string; error: unknown };
+
 export declare function pruneFailedInstallBundles(
   appPath: string,
   options?: {
@@ -17,4 +19,4 @@ export declare function pruneFailedInstallBundles(
     listNames: (directory: string) => string[];
     remove: (path: string) => void;
   },
-): string[];
+): { removed: string[]; failures: FailedInstallPruneFailure[] };

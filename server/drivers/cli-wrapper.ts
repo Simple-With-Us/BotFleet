@@ -15,7 +15,7 @@ import type {
   TurnStartResult,
 } from "../contracts.ts";
 import { newEventId, newId } from "../contracts.ts";
-import { applyLaunchIdentity } from "../launch-identity.ts";
+import { cliLoginEnvironment, launchedChildEnvironment, primeCliLogin } from "../cli-logins.ts";
 import { PROVIDER_CREDENTIAL_ENV, stripWorkspaceCredentialEnv } from "../config.ts";
 import { augmentedPath } from "../env-path.ts";
 import { describeSpawnFailure, execCli, isProbeTimeout, killCliTree, spawnCli } from "../procs.ts";
@@ -215,6 +215,12 @@ export const CliWrapperDriver: ProviderDriver<CliWrapperConfig> = {
           threadId,
         });
 
+        // The seat's CLI login is read in the BACKGROUND, and the read is
+        // started here, before the guard:  the guard and the registration
+        // that follows it have to stay free of `await`, or a second turn on
+        // this thread would walk through the guard the first one already
+        // passed.
+        primeCliLogin(turnInput.launchIdentity?.seat);
         if (children.has(threadId)) throw new Error("a turn is already running on this thread");
 
         // Every driver opens its turn here, and sentry-ai.ts opens the
@@ -260,7 +266,7 @@ export const CliWrapperDriver: ProviderDriver<CliWrapperConfig> = {
           // handler that keeps a dead child's EPIPE from killing the harness.
           child = spawnCli(config.command, args, {
             cwd: turnInput.cwd ?? homedir(),
-            env: applyLaunchIdentity(childEnv(), turnInput.launchIdentity),
+            env: launchedChildEnvironment(childEnv(), turnInput.launchIdentity, cliLoginEnvironment(turnInput.launchIdentity?.seat)),
             stdio: ["pipe", "pipe", "pipe"],
           });
         } catch (err) {

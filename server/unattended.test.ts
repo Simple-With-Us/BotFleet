@@ -175,7 +175,10 @@ posixOnly("unattended turns keep asking", () => {
     };
     if (process.env.PATH) childEnv.PATH = process.env.PATH;
     if (process.env.SystemRoot) childEnv.SystemRoot = process.env.SystemRoot;
-    child = spawnDetached(process.execPath, [join(SERVER_DIR, "index.ts")], {
+    // This suite checks permission propagation, not host admission. A busy
+    // runner can defer a webhook for 20 minutes, longer than these assertions.
+    // Keep real production admission unchanged; isolate only this child.
+    child = spawnDetached(process.execPath, ["--import", join(SERVER_DIR, "testing", "cool-host-loader.mjs"), join(SERVER_DIR, "index.ts")], {
       cwd: join(SERVER_DIR, ".."),
       env: childEnv,
       stdio: ["ignore", "pipe", "pipe"],

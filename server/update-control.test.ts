@@ -702,6 +702,9 @@ describe("the launcher", () => {
     expect(args[10]).toContain("export PATH='/opt/homebrew/bin'");
     expect(args[10]).toContain("--progress '/tmp/state/runs/run_one.progress.json'");
     expect(args[10]).toContain("--run-id 'run_one'");
+    expect(args[10]).not.toContain("exec /bin/bash");
+    expect(args[10]).toContain("result=$?");
+    expect(args[10]).toMatch(/exit 0$/);
   });
 
   it("sources harness bearer credentials from a launch env file, not the -c string", () => {
@@ -811,6 +814,7 @@ describe("reconcile on boot", () => {
     const paths = rig();
     writeCurrentRun(paths, "run_prior");
     writeProgress(paths, "run_prior", { step: "startHarness", progress: 0.8 });
+    mkdirSync(join(paths.stateDirectory, "runs"), { recursive: true });
     writeFileSync(join(paths.stateDirectory, "runs", "run_prior.log"), "Prepared bbbbbbbbbbbb\nstarting harness\n");
     const status = build(paths).control.status();
     expect(status.running).toMatchObject({
@@ -1191,6 +1195,19 @@ describe("a run that settles takes its launchd label with it", () => {
     const late = build(never, { now: () => new Date("2026-09-13T12:05:00.000Z") });
     expect(late.control.status().lastRun?.message).toContain("never started");
     expect(late.ran).toHaveLength(1);
+  });
+
+  it("surfaces an import failure from an old wrapper with no progress record", () => {
+    const paths = rig();
+    writeCurrentRun(paths, "run_prior");
+    mkdirSync(join(paths.stateDirectory, "runs"), { recursive: true });
+    writeFileSync(join(paths.stateDirectory, "runs", "run_prior.log"),
+      "node:internal/modules/esm/resolve:241\nError [ERR_MODULE_NOT_FOUND]: Cannot find module failed-install-retention.mjs\n");
+    const harness = build(paths, { now: () => new Date("2026-09-13T12:05:00.000Z") });
+    expect(harness.control.status().lastRun?.message).toContain("ERR_MODULE_NOT_FOUND");
+    expect(harness.ran).toContainEqual({ command: "/bin/launchctl", args: ["remove", "com.jay.botfleet-update"] });
+    harness.control.status();
+    expect(harness.ran).toHaveLength(1);
   });
 
   it("leaves launchctl alone for a detached fallback run, and off macOS", () => {

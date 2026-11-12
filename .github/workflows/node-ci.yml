@@ -1,5 +1,9 @@
 name: Node CI
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 on:
   push:
     branches: [main]
@@ -22,10 +26,11 @@ jobs:
           # (refs/pull/<n>/merge).  Do not pin ref to the branch head.
           # A branch that is only behind the base must be linted as merged,
           # or the ratchet false-fails and seats regenerate the baseline.
+          filter: blob:none
           fetch-depth: 0
       - uses: actions/setup-node@v7
         with:
-          node-version: "24"
+          node-version: "26"
       - name: Enable pnpm
         run: corepack enable && corepack prepare pnpm@10.33.0 --activate
       - run: pnpm install --frozen-lockfile

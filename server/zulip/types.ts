@@ -24,7 +24,7 @@ export type ZulipOrigin =
   | { kind: "dm"; userId: number };
 
 /** One message the bot was woken for, as it is persisted and handed to the
- *  model.  `owner` is the listener's own verdict (user id AND a human
+ *  model.  `owner` is the Zulip hub's own verdict (user id AND a human
  *  client), never the message's claim about itself. */
 export interface ZulipInboundItem {
   id: number;
@@ -39,6 +39,10 @@ export interface ZulipInboundItem {
   /** Why it woke the bot: an @-mention, a 1:1 DM, or a new message in a
    *  topic the bot follows.  Absent on units saved before follows existed. */
   via?: "mention" | "dm" | "followed";
+  /** Plugin-platform routing hint for the dispatcher turn, and the role
+   *  that routed it.  Untrusted input; the prompt wraps it as such. */
+  pluginHint?: string;
+  routedFrom?: string;
 }
 
 /** One unit of work: every message for one origin that arrived before the
@@ -54,6 +58,16 @@ export interface ZulipWorkUnit {
   attempts: number;
   /** Earliest ms the next attempt may run. */
   notBefore: number;
+}
+
+export interface ZulipCredentialFieldSource {
+  /** Name of an `infisical.readSources` entry.  That entry's token is
+   * scoped to its own project and environment, so there is no per-field
+   * project/environment override: it could not be honoured. */
+  source: string;
+  /** Key template with `{ROLE}` and (for login fields) `{FIELD}`. */
+  keyPattern?: string;
+  path?: string;
 }
 
 /** The `zulip` section of ~/.botfleet/config.json. */
@@ -86,6 +100,11 @@ export interface ZulipSettings {
   /** The environment slug that folder is in (`prod`).  Unset or empty: the
    *  harness's own environment. */
   infisicalEnv?: string;
+  /** Per-field vault sources. Absent: the single-folder behaviour above. */
+  credentialSources?: {
+    login?: ZulipCredentialFieldSource;
+    outgoing?: ZulipCredentialFieldSource;
+  };
   /** BotFleet bot id -> its Zulip role (the file code, e.g. "BF-Plumber"). */
   bots?: Record<string, { role: string; enabled?: boolean }>;
   /** Channels a bot may post to outside the conversation it was woken by. */

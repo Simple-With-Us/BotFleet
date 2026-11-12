@@ -27,7 +27,7 @@
 // one that does not honor the setting, gets an explanation and a way out —
 // not a vanished control.
 
-import { DEFAULT_MAX_TOOL_ROUNDS, toolRoundsCaption } from "../../shared/bot-profile";
+import { DEFAULT_MAX_TOOL_ROUNDS, historyTurnsCaption, maxHistoryTurnsSchema, toolRoundsCaption } from "../../shared/bot-profile";
 import {
   DEFAULT_MAX_REVIEWS_PER_TURN,
   effectiveReviewHook,
@@ -44,7 +44,7 @@ import type { Bot, InstanceInfo } from "@/state/store";
 
 /** The smallest bot shape these gates need.  Kept structural so tests can pass
  *  a literal instead of a whole `Bot`. */
-export type GateBot = Pick<Bot, "modelSelection" | "activeModelSelection" | "maxToolRounds">;
+export type GateBot = Pick<Bot, "modelSelection" | "activeModelSelection" | "maxToolRounds" | "maxHistoryTurns" | "historySummaryModel">;
 
 /** The engine a turn will be dispatched to first: the configured selection.
  *
@@ -170,6 +170,65 @@ export function toolRoundsGate(
     editable: false,
     caption,
     note: `${reason}${rolloverNote} It applies again if a turn lands on an engine that uses the app's loop. Clear it to stop carrying it.`,
+  };
+}
+
+/** What the History Compression controls should do for this bot.  Same
+ *  shape as ToolRoundsGate, for the same reason: never let a saved value be
+ *  invisible, and never let an unanswered question be answered "no". */
+export interface HistorySummaryGate {
+  visible: boolean;
+  editable: boolean;
+  caption: string;
+  note: string | null;
+}
+
+/** Whether this engine drops and summarizes replayed history under its own
+ *  prompt budget, and so honors `maxHistoryTurns` and `historySummaryModel`.
+ *  Mirrors the `historySummary` flag the ACP core declares. */
+export function honorsHistorySummary(engine: InstanceInfo | undefined): boolean {
+  return engine?.capabilities?.historySummary === true;
+}
+
+/** The History Compression controls for one bot.  The cases are
+ *  toolRoundsGate's: editable where honored, read-only with the reason where
+ *  a saved value outlives the engine that honored it, hidden when there is
+ *  nothing to say and nothing to set.  A saved cap of 0 IS a value — it
+ *  drops every replayed turn — so only null/undefined reads as unset. */
+const savedMaxHistoryTurnsSchema = maxHistoryTurnsSchema;
+
+export function historySummaryGate(
+  instances: InstanceInfo[],
+  bot: GateBot,
+): HistorySummaryGate {
+  const caption = historyTurnsCaption();
+  const engine = configuredEngine(instances, bot);
+  const saved = savedMaxHistoryTurnsSchema.safeParse(bot.maxHistoryTurns).success || bot.historySummaryModel === true;
+
+  if (honorsHistorySummary(engine)) {
+    return { visible: true, editable: true, caption, note: null };
+  }
+
+  if (!saved) {
+    return { visible: false, editable: false, caption, note: null };
+  }
+
+  const name = engine?.displayName ?? "This engine";
+  const reason = engine
+    ? `${name} keeps its own history, so these settings do not apply to it.`
+    : "This engine has not reported its capabilities yet, so these settings may not apply to it.";
+  const { engine: running, rolledOver } = activeEngine(instances, bot);
+  // Rendered copy:  each sentence gap is U+00A0 plus a space, written as an
+  // escape so the source stays ASCII.  Two typed spaces collapse in HTML.
+  const rolloverNote = rolledOver
+    ? `\u00A0 A turn last ran on ${running?.displayName ?? "another engine"} instead.`
+    : "";
+
+  return {
+    visible: true,
+    editable: false,
+    caption,
+    note: `${reason}${rolloverNote}\u00A0 They apply again if a turn lands on an engine that budgets its prompt.\u00A0 Clear them to stop carrying them.`,
   };
 }
 

@@ -194,9 +194,11 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(recorder.events.filter((e) => e.type === "turn.completed")).toHaveLength(1);
     expect(done).toMatchObject({ turnId, ok: true, usage: { input: 7, output: 3, cachedInput: 4 } });
     const text = JSON.stringify(recorder.events);
-    for (const marker of ["HELPER DELTA", "HELPER TEXT", "HELPER ERROR", "HELPER FAILED", "9999"]) {
+    for (const marker of ["HELPER DELTA", "HELPER TEXT", "HELPER ERROR", "HELPER FAILED"]) {
       expect(text).not.toContain(marker);
     }
+    // Helper fixture uses inputTokens 9999; a random main-thread turnId must not trip this.
+    expect(text).not.toContain('"inputTokens":9999');
     // the main thread's own turn is intact, in order, with the helper's one
     // host step nested under the spawn_agent row
     expect(recorder.events.map((e) => e.type)).toEqual([
@@ -1037,6 +1039,21 @@ describe("CodexDriver turns (fake app-server)", () => {
     await recorder.until((e) => e.type === "request.opened");
     await expect(instance.adapter.sendTurn({ threadId: "t-busy", text: "two" })).rejects.toThrow(/already running/);
     await instance.adapter.interruptTurn("t-busy");
+    await recorder.until((e) => e.type === "turn.completed");
+  });
+
+  it("refuses a second turn that arrives while the first is still claiming the thread", async () => {
+    // The two turns are started together, so the second one reaches the
+    // guard while the first is still claiming the thread.  A vault read
+    // between the guard and the registration would let both through, so the
+    // seat's CLI login is read BEFORE the guard, never after it.
+    await create({ mode: "approval" });
+    const first = instance.adapter.sendTurn({ threadId: "t-race", text: "one" });
+    const second = instance.adapter.sendTurn({ threadId: "t-race", text: "two" });
+    await expect(second).rejects.toThrow(/already running/);
+    await first;
+    await recorder.until((e) => e.type === "request.opened");
+    await instance.adapter.interruptTurn("t-race");
     await recorder.until((e) => e.type === "turn.completed");
   });
 

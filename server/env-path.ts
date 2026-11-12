@@ -86,6 +86,36 @@ let cached: string | null = null;
 let probed = false;
 let loginShellPath: string | null = null;
 
+/** Test hook — the well-known install dirs the merge adds, replaced wholesale
+ *  so a test can point the merge at its own fixture dirs.  `null` restores the
+ *  real list, and nothing but a test ever sets it.  Without it a host that has
+ *  a CLI installed in one of the real dirs (/usr/local/bin carries a `dsh` and
+ *  an `mcode` on some machines) answers a lookup that means to exercise a
+ *  fixture, and the suite's result depends on what the machine has installed
+ *  rather than on what the test planted. */
+let knownDirsOverride: readonly string[] | null = null;
+
+/** Point the merged PATH's known install dirs at `dirs` (or restore the real
+ *  list with `null`).  Test hook, like `resetPathCacheForTests` below:  the
+ *  cache is dropped with it, so the next `augmentedPath()` rebuilds the merge
+ *  from the new list. */
+export function setKnownDirsForTests(dirs: readonly string[] | null): void {
+  knownDirsOverride = dirs;
+  // The cache is dropped here and not through resetPathCacheForTests(),  which
+  // also drops the override:  setting the override and then resetting would
+  // cancel the setting.
+  clearPathCache();
+}
+
+/** Drop the memoized PATH and the login-shell probe.  The known install dirs
+ *  are not part of it:  they are an override,  and only the test hook and the
+ *  test reset touch them. */
+function clearPathCache(): void {
+  cached = null;
+  probed = false;
+  loginShellPath = null;
+}
+
 /** Drop the memoized PATH so the next augmentedPath() rescans. Called when
  * the app re-probes engines, so "check again" can find something installed
  * since launch instead of answering from the PATH we booted with. `probed`
@@ -112,7 +142,7 @@ export function augmentedPath(): string {
       // Both platforms scan their standard install locations; only the
       // login-shell probe below stays unix-only, since Windows has no
       // equivalent rc file to source.
-      ...(process.platform === "win32" ? windowsKnownDirs() : knownDirs()).filter((d) => existsSync(d)),
+      ...(knownDirsOverride ?? (process.platform === "win32" ? windowsKnownDirs() : knownDirs())).filter((d) => existsSync(d)),
     ]);
   }
   // belt-and-braces: fold in the login shell's PATH once, in the
@@ -225,9 +255,12 @@ function probeLoginShellPath(): void {
 
 /** Test hook — the cache is process-wide otherwise. */
 export function resetPathCacheForTests(): void {
-  cached = null;
-  probed = false;
-  loginShellPath = null;
+  clearPathCache();
+  // The known install dirs are an override,  and an override that outlives
+  // the case that set it redirects every later lookup in the process:  the
+  // global afterEach calls this function,  so clearing the override here is
+  // what makes one test's choice unable to become another test's environment.
+  knownDirsOverride = null;
 }
 
 /** A command name is searchable when it is a bare name: a path is already a
@@ -290,11 +323,11 @@ const CLI_ALIAS_LIMIT = 64;
  * tarball) collapse to one row: the picker shows one row for the actual binary
  * the user has.
  *
- * A path-shaped HEAD is echoed back exactly as the scalar form has always
- * echoed it, list or no list — `?name=/opt/dsh` must answer with that path
- * whether or not an alias widened the query.  Later path-shaped entries are
- * dropped instead: the caller asked about command names, and a row the user
- * cannot re-pick is worse than no row. */
+ * A head that is already a location is echoed back exactly as the scalar form
+ * has always echoed it, list or no list — `?name=/opt/dsh` must answer with
+ * that path whether or not an alias widened the query.  Later entries that
+ * are already locations are dropped instead: the caller asked about command
+ * names, and a row the user cannot re-pick is worse than no row. */
 export function findCliCandidates(name: string | string[]): string[] {
   const exts = candidateExts();
   if (Array.isArray(name)) {
@@ -416,7 +449,9 @@ function nodeExe(near: string): string | null {
   // make a stray node.cmd hide the real node.exe beside it.
   const onPath = whichWin("node.exe");
   if (onPath && extname(onPath).toLowerCase() === ".exe") return onPath;
-  return (process.versions as Record<string, string | undefined>).electron ? null : process.execPath;
+  // SAFETY: `process.versions.electron` is set only when this process is Electron, not plain Node.
+  const versions = process.versions as Record<string, string | undefined>;
+  return versions.electron ? null : process.execPath;
 }
 
 /** npm/pnpm .cmd shims all spell their target as "%dp0%\..." (or

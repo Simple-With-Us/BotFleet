@@ -15,6 +15,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { ensureDirs } from "../config.ts";
 import type { ProviderInstance, RuntimeEvent } from "../contracts.ts";
+import { awaitCliLogin, primeCliLogin, resetCliLoginCache, setCliLoginVault } from "../cli-logins.ts";
 import { recordEvents, type EventRecorder } from "../testing/events.ts";
 import { expectLaunchedAs, inheritHarnessIdentity, readEngineDump } from "../testing/launch-identity.ts";
 import {
@@ -240,6 +241,9 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     delete process.env.FAKE_CLAUDE_PROMPTS;
     delete process.env.FAKE_CLAUDE_LIFECYCLE;
     delete process.env.FAKE_CLAUDE_RESULT_MARK;
+    delete process.env.FAKE_CLAUDE_CACHE_WRITE;
+    delete process.env.FAKE_CLAUDE_PROOF;
+    delete process.env.FAKE_CLAUDE_SERVED_MODEL;
     delete process.env.FAKE_CLAUDE_GATE;
     delete process.env.FAKE_CLAUDE_COST_DIR;
     delete process.env.ANTHROPIC_API_KEY;
@@ -250,6 +254,9 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     delete process.env.OMB_TTS_KEY;
     delete process.env.OMB_CLAUDE_SESSION_IDLE_MS;
     delete process.env.OMB_CLAUDE_SESSION_IDLE_MIN_MS;
+    delete process.env.GH_TOKEN;
+    setCliLoginVault(null);
+    resetCliLoginCache();
     recorder?.stop();
     await instance?.dispose();
     await removeTempDir(scratch);
@@ -290,6 +297,60 @@ describe("ClaudeDriver turns (fake CLI)", () => {
       usage: { input: 12, output: 5, cachedInput: 2 },
     });
     expect(instance.adapter.hasSession("t-happy")).toBe(false);
+    expect(done).not.toHaveProperty("billedCall");
+  });
+
+  it("emits a reconciled single-call receipt only for lifecycle-owned exact usage", async () => {
+    process.env.FAKE_CLAUDE_PROOF = "1";
+    process.env.FAKE_CLAUDE_SERVED_MODEL = "claude-test";
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-single-proof", text: "hi", model: "claude-test" });
+    await recorder.until((e) => e.type === "turn.completed");
+    expect(recorder.events.at(-1)).toMatchObject({
+      type: "turn.completed",
+      billedCall: { id: "msg-single-call", model: "claude-test", input: 10, output: 5, cacheRead: 2, cacheWrite: 0 },
+    });
+  });
+
+  it("names the cache writes by TTL and the served model, inside an input that still reads whole", async () => {
+    process.env.FAKE_CLAUDE_CACHE_WRITE = "ttl";
+    process.env.FAKE_CLAUDE_SERVED_MODEL = "claude-sonnet-5-20261001";
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-cache-ttl", text: "hi", model: "claude-sonnet-5" });
+    await recorder.until((e) => e.type === "turn.completed");
+    // 10 plain + 2 cache read + 7 cache write = 19 context tokens; the writes
+    // stay inside `input` (the context meter) and are named for telemetry
+    expect(recorder.events.at(-1)).toMatchObject({
+      type: "turn.completed",
+      usage: { input: 19, output: 5, cachedInput: 2, cacheWrite5m: 3, cacheWrite1h: 4 },
+      servedModel: "claude-sonnet-5-20261001",
+    });
+  });
+
+  it("keeps the writes inside input when a CLI sends only the TTL split and no flat total", async () => {
+    process.env.FAKE_CLAUDE_CACHE_WRITE = "split";
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-cache-split", text: "hi", model: "claude-sonnet-5" });
+    await recorder.until((e) => e.type === "turn.completed");
+    // 10 plain + 2 cache read + (3 + 4) cache write: without the writes in
+    // `input`, telemetry would subtract them from an input that never held them
+    expect((recorder.events.at(-1) as Extract<RuntimeEvent, { type: "turn.completed" }>).usage).toEqual({
+      input: 19,
+      output: 5,
+      cachedInput: 2,
+      cacheWrite5m: 3,
+      cacheWrite1h: 4,
+    });
+  });
+
+  it("files a flat cache-creation figure from an older CLI under the 5 minute cache", async () => {
+    process.env.FAKE_CLAUDE_CACHE_WRITE = "flat";
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-cache-flat", text: "hi", model: "claude-sonnet-5" });
+    await recorder.until((e) => e.type === "turn.completed");
+    const done = recorder.events.at(-1) as Extract<RuntimeEvent, { type: "turn.completed" }>;
+    expect(done.usage).toEqual({ input: 19, output: 5, cachedInput: 2, cacheWrite5m: 7 });
+    expect(done.servedModel).toBeUndefined();
   });
 
   it("attaches a step's whole input and output to its events, and leaves the headline the row shows alone", async () => {
@@ -446,6 +507,88 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     expect(seen.env.XAI_API_KEY).toBeUndefined();
     expect(seen.env.BOX_TOKEN).toBeUndefined();
     expect(seen.env.OMB_TTS_KEY).toBeUndefined();
+  });
+
+  it("gives the launched child the seat's CLI login, and nobody else's", async () => {
+    await create();
+    const dump = join(scratch, "dump-login.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+    // The harness process may hold a login of its own.  A child must never
+    // inherit it:  the seat's own login replaces it, and a child with no
+    // seat gets none at all.
+    process.env.GH_TOKEN = "harness-login-not-real";
+    const asked: Array<{ project: string; secretPath: string }> = [];
+    setCliLoginVault({
+      async readProjectPath(project, secretPath) {
+        asked.push({ project, secretPath });
+        return new Map([["GH_TOKEN", "seat-login-not-real"]]);
+      },
+    });
+    // The login is read in the background, so it is primed and awaited
+    // before the turn:  a turn that starts with a cold cache runs without
+    // the login, and the turns after it have one.
+    primeCliLogin("BF-ORACLE");
+    await awaitCliLogin("BF-ORACLE");
+
+    await instance.adapter.sendTurn({
+      threadId: "t-cli-login",
+      text: "hi",
+      launchIdentity: { seat: "BF-ORACLE", session: "session-1" },
+    });
+    await recorder.until((e) => e.type === "turn.completed");
+
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    expect(seen.env.GH_TOKEN).toBe("seat-login-not-real");
+    expect(seen.env.AGENT_LAUNCH_SEAT).toBe("BF-ORACLE");
+    // The seat's own folder, in the fleet's project.
+    expect(asked).toEqual([{ project: "fleet-ops", secretPath: "/cli-logins/BF-ORACLE" }]);
+  });
+
+  it("takes the harness's own login away from a child with no seat", async () => {
+    await create();
+    const dump = join(scratch, "dump-no-seat.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+    process.env.GH_TOKEN = "harness-login-not-real";
+    const asked: string[] = [];
+    setCliLoginVault({
+      async readProjectPath(_project, secretPath) {
+        asked.push(secretPath);
+        return new Map();
+      },
+    });
+
+    await instance.adapter.sendTurn({ threadId: "t-no-seat", text: "hi" });
+    await recorder.until((e) => e.type === "turn.completed");
+
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    expect(seen.env.GH_TOKEN).toBeUndefined();
+    // A bot with no seat has no folder, so nothing is read.
+    expect(asked).toEqual([]);
+  });
+
+  it("starts the seat's login read for a turn that names a seat", async () => {
+    await create();
+    const dump = join(scratch, "dump-prime.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+    const asked: string[] = [];
+    setCliLoginVault({
+      async readProjectPath(_project, secretPath) {
+        asked.push(secretPath);
+        return new Map();
+      },
+    });
+
+    await instance.adapter.sendTurn({
+      threadId: "t-prime",
+      text: "hi",
+      launchIdentity: { seat: "BF-MONITOR", session: "session-2" },
+    });
+    await recorder.until((e) => e.type === "turn.completed");
+    await awaitCliLogin("BF-MONITOR");
+
+    // The turn itself starts the read, so the turns after it have the
+    // login even when the first one ran with a cold cache.
+    expect(asked).toEqual(["/cli-logins/BF-MONITOR"]);
   });
 
   it("uses instance credentials when launching an injected local model", async () => {

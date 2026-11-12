@@ -23,11 +23,12 @@ test("pruneFailedInstallBundles removes only names this updater owns", () => {
   for (const name of names) {
     mkdirSync(join(root, name));
   }
-  const removed = pruneFailedInstallBundles(appPath, {
+  const { removed, failures } = pruneFailedInstallBundles(appPath, {
     keep: 2,
     listNames: (dir) => readdirSync(dir),
     remove: (path) => rmSync(path, { recursive: true, force: true }),
   });
+  assert.deepEqual(failures, []);
   assert.deepEqual(
     removed.map((path) => path.split("/").at(-1)).sort(),
     ["BotFleet.app.failed-1000", "BotFleet.app.failed-2000"].sort(),

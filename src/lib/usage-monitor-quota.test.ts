@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   antigravityQuotaHeadlines,
@@ -15,6 +15,26 @@ import {
 } from "./usage-monitor-quota";
 import { headlinesExhausted, windowHeadlines } from "./quota-display";
 import { parseLocalQuotaSnapshot } from "../../server/local-usage-monitor";
+
+// A reset countdown is rendered from the live clock, so the clock is pinned
+// for the whole file.  Left on the wall clock, the fixture's reset and the
+// clock that reads it were two different instants, and the expected
+// "resets in 1h" depended on how long the test itself took to run.
+//
+// The Date clock is faked rather than only the clock function, so a date
+// built with no argument reads the same pinned instant the clock function
+// does.  A spy on the function alone would leave the other read on the wall
+// clock, and the two would drift apart across a minute boundary.  Only Date
+// is faked, so the timers this file waits on keep their real behaviour.
+const NOW = Date.parse("2026-09-13T12:00:00.000Z");
+
+beforeEach(() => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(NOW);
+});
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 function window(overrides: Partial<UsageMonitorQuotaWindow>): UsageMonitorQuotaWindow {
   return {
@@ -63,9 +83,9 @@ describe("Usage Monitor BotFleet quota integration", () => {
     ]);
 
     expect(rows.map((row) => `${row.label}:${row.window}`)).toEqual([
-      "Gemini Models · 5-hour:5h",
+      "Gemini Models · 5-Hour:5h",
       "Gemini Models · Weekly:weekly",
-      "Third-Party Models · 5-hour:5h",
+      "Third-Party Models · 5-Hour:5h",
       "Third-Party Models · Weekly:weekly",
     ]);
     expect(antigravityQuotaLines(rows).map((line) => line.value)).toEqual(["80%", "75%", "20%", "not reported"]);
@@ -88,9 +108,9 @@ describe("Usage Monitor BotFleet quota integration", () => {
     ]);
 
     expect(rows.map((row) => `${row.label}:${row.remainingPercent}`)).toEqual([
-      "Gemini Models · 5-hour:null",
+      "Gemini Models · 5-Hour:null",
       "Gemini Models · Weekly:null",
-      "Third-Party Models · 5-hour:35",
+      "Third-Party Models · 5-Hour:35",
       "Third-Party Models · Weekly:55",
     ]);
     expect(rows.map((row) => row.label).join(" ")).not.toMatch(/claude|gpt/i);
@@ -125,14 +145,14 @@ describe("Usage Monitor BotFleet quota integration", () => {
   });
 
   it("uses the selected window reset in the headline without changing pool identity", () => {
-    const resetAt = new Date(Date.now() + 3_660_000).toISOString();
+    const resetAt = new Date(NOW + 3_600_000).toISOString();
     const lines = antigravityQuotaHeadlines([
       window({ label: "Gemini Models · 5-hour", window: "5h", remainingPercent: 80, resetAt }),
       window({ label: "Third-Party Models · Weekly", window: "weekly", remainingPercent: 20 }),
     ]);
 
     expect(lines).toHaveLength(4);
-    expect(lines[0]).toContain("Gemini Models · 5-hour 80% available");
+    expect(lines[0]).toContain("Gemini Models · 5-Hour 80% available");
     expect(lines[0]).toContain("resets in 1h");
   });
 

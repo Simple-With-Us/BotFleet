@@ -21,9 +21,9 @@ export type QueuedSendBody = z.infer<typeof QueuedSendBodySchema>;
 //
 // A busy conversation holds what the person typed but could not send yet, and
 // each held message gets its own row above the composer: a MessageSquare
-// glyph, the queued text as `queuedChipLabel` words it, and three actions —
-// edit, cancel, steer now.  The rows stack instead of collapsing into one
-// chip, so the layout that matters here is "many rows, composer still
+// glyph, the queued text as `queuedChipLabel` words it, and three labeled
+// actions — steer, edit, cancel.  The rows stack instead of collapsing into
+// one chip, so the layout that matters here is "many rows, composer still
 // reachable", which no behavioural assertion would catch.
 //
 // The harness is the real app against a mocked server, the way
@@ -277,7 +277,7 @@ test('visual: one queued steer pill carries its label and three actions', async 
     page.getByText(`Queued — sends when ${bot.name} finishes`, { exact: false }),
   ).toBeVisible();
 
-  // Three actions ride the row: undo the queue, drop it, or send it now.
+  // Three actions ride the row: send it now, undo the queue, or drop it.
   await expect(page.getByRole('button', { name: 'Edit Queued Message' })).toHaveCount(1);
   await expect(page.getByRole('button', { name: 'Cancel Queued Message' })).toHaveCount(1);
   await expect(page.getByRole('button', { name: 'Steer Now' })).toHaveCount(1);
@@ -287,6 +287,14 @@ test('visual: one queued steer pill carries its label and three actions', async 
   // span is a direct child of the row, so one level up from it is the row
   // itself — glyph, words and all three actions.
   const pillRow = page.locator('span[title^="Queued"]').first().locator('xpath=..');
+
+  // The three actions are labeled text buttons, not bare glyphs: a row of
+  // 24px icons was easy to mis-tap.  The order is the product decision —
+  // Steer, Edit, Cancel, with Edit in the middle — and the accessible names
+  // above still answer to the old ones, so the visible words and the spoken
+  // names are separate things and both are pinned here.
+  await expect(pillRow.locator('button')).toHaveText(['Steer', 'Edit', 'Cancel']);
+
   await expect(pillRow).toHaveScreenshot('composer-queued-pill.png', {
     ...stableShot,
     maxDiffPixelRatio: 0.02,

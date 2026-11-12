@@ -19,6 +19,19 @@ describe("clipRuntimeEvent", () => {
     expect(clipped.itemId).toBe("i1");
   });
 
+  it("clips a terminal tool title on the trajectory path", () => {
+    const event: RuntimeEvent = {
+      ...base,
+      type: "item.completed",
+      itemType: "tool",
+      ok: false,
+      title: "hookRun: failed",
+    };
+    // SAFETY: this fixture is a tool completion, and clipping preserves its discriminants.
+    const clipped = clipRuntimeEvent(event, 9) as Extract<RuntimeEvent, { type: "item.completed"; itemType: "tool" }>;
+    expect(clipped.title).toBe("hookRun:…");
+  });
+
   it("clips a result detail, assistant text, a request summary, and an error message", () => {
     const long = "y".repeat(5_000);
     const detail = clipRuntimeEvent({ ...base, type: "item.completed", itemType: "tool", ok: false, detail: long }) as { detail: string };

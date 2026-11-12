@@ -28,6 +28,14 @@ public struct PendingChatAttachment: Sendable, Identifiable, Equatable, Hashable
         ChatAttachments.isImageMIME(mime) ? .image : .file
     }
 
+    /// Bytes the composer can draw as a thumbnail.  Nil for a file, an empty
+    /// payload, or an image outside the formats the phone can show, so the
+    /// strip keeps a document or photo icon instead of a broken picture.
+    public var previewImageData: Data? {
+        guard kind == .image, ChatAttachments.isDisplayImageMIME(mime), !data.isEmpty else { return nil }
+        return data
+    }
+
     public var size: Int { data.count }
 
     public static func == (left: PendingChatAttachment, right: PendingChatAttachment) -> Bool {
@@ -78,7 +86,9 @@ public enum ChatAttachments {
         "image/bmp", "image/svg+xml",
         "application/pdf", "text/plain", "text/markdown", "text/csv",
         "application/json", "application/zip", "application/gzip",
-        "audio/mpeg", "audio/wav", "video/mp4",
+        "audio/mpeg", "audio/wav", "audio/ogg", "audio/opus",
+        "audio/mp4", "audio/x-m4a", "audio/aac", "audio/webm",
+        "video/mp4",
         "application/msword",
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         "application/vnd.ms-excel",
@@ -155,6 +165,11 @@ public enum ChatAttachments {
         case "gz", "gzip": return "application/gzip"
         case "mp3": return "audio/mpeg"
         case "wav": return "audio/wav"
+        case "ogg": return "audio/ogg"
+        case "opus": return "audio/opus"
+        case "m4a": return "audio/mp4"
+        case "aac": return "audio/aac"
+        case "webm": return "audio/webm"
         case "mp4": return "video/mp4"
         case "doc": return "application/msword"
         case "docx": return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"

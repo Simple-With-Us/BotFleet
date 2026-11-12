@@ -7,11 +7,11 @@ import { useTranscriptionAvailability } from "@/lib/use-transcription-availabili
 import { track } from "@/lib/analytics";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentProps } from "react";
 import { currentCall, useOnCall } from "@/lib/call";
-import { ArrowUp, Check, Clock, Hand, Mic, Paperclip, ShieldCheck, Square, Users, Zap, Hash, AppWindow, MessageSquare, Pencil, Trash2 } from "lucide-react";
+import { ArrowUp, Check, Clock, Hand, Mic, Paperclip, ShieldCheck, Square, Users, Zap, Hash, AppWindow, MessageSquare, Pencil, Trash2, Terminal } from "lucide-react";
 import { useStore, visibleMessages, type Bot, type Group, type Message } from "@/state/store";
 import { botSupportsImageAttachments } from "@/lib/model-images";
 import { cn } from "@/lib/cn";
-import { foldSentDrafts, useComposerDraft, useFailedSendRestore, type SentDraft } from "@/lib/drafts";
+import { botThreadDraftId, foldSentDrafts, getDraft, getDraftAttachments, getStore, migrateThreadDraft, useComposerDraft, useFailedSendRestore, type SentDraft } from "@/lib/drafts";
 import { BotMascot } from "./Avatar";
 import { BotOffComposer } from "./BotOffComposer";
 import { ComposerAttachments, pathForFile } from "./ComposerAttachments";
@@ -48,6 +48,11 @@ import {
   applyAutocomplete,
   type AutocompleteChoice,
 } from "@/lib/composer-autocomplete";
+import {
+  botCommandAutocompleteChoices,
+  fetchBotCommands,
+} from "@/lib/bot-commands-client";
+import type { BotCommandsResponse } from "../../shared/bot-commands.ts";
 
 function PermissionModeSelector({ bot, onSetAuto }: { bot: Bot; onSetAuto: (auto: boolean) => void }) {
   const [open, setOpen] = useState(false);
@@ -80,10 +85,11 @@ function PermissionModeSelector({ bot, onSetAuto }: { bot: Bot; onSetAuto: (auto
         type="button"
         aria-haspopup="menu"
         aria-expanded={open}
+        aria-label={label}
         onClick={() => setOpen((current) => !current)}
         className="flex h-8 items-center gap-1.5 whitespace-nowrap rounded-full border border-hairline/20 bg-transparent px-3 text-[13px] text-ink-secondary hover:bg-raised hover:text-ink"
       >
-        <Icon size={14} className="opacity-70" />
+        <Icon size={14} className="opacity-70" aria-hidden="true" />
         {label}
       </button>
 
@@ -107,11 +113,11 @@ function PermissionModeSelector({ bot, onSetAuto }: { bot: Bot; onSetAuto: (auto
               }}
               className="flex items-start gap-3 px-4 py-3 text-left hover:bg-raised-hover"
             >
-              <Hand size={16} className="mt-0.5 shrink-0 opacity-70" />
+              <Hand size={16} className="mt-0.5 shrink-0 opacity-70" aria-hidden="true" />
               <div className="flex w-full flex-col gap-0.5">
                 <div className="flex items-center justify-between text-[14px] text-ink">
                   Ask for Approval
-                  {mode === "ask" && <Check size={14} />}
+                  {mode === "ask" && <Check size={14} aria-hidden="true" />}
                 </div>
                 <div className="text-[13px] text-ink-secondary">Ask before actions that need your permission</div>
               </div>
@@ -126,11 +132,11 @@ function PermissionModeSelector({ bot, onSetAuto }: { bot: Bot; onSetAuto: (auto
               }}
               className="flex items-start gap-3 px-4 py-3 text-left hover:bg-raised-hover"
             >
-              <ShieldCheck size={16} className="mt-0.5 shrink-0 opacity-70" />
+              <ShieldCheck size={16} className="mt-0.5 shrink-0 opacity-70" aria-hidden="true" />
               <div className="flex w-full flex-col gap-0.5">
                 <div className="flex items-center justify-between text-[14px] text-ink">
                   Approve for Me
-                  {mode === "auto" && <Check size={14} />}
+                  {mode === "auto" && <Check size={14} aria-hidden="true" />}
                 </div>
                 <div className="text-[13px] text-ink-secondary">
                   Keep going automatically; destructive and sensitive actions still ask
@@ -229,8 +235,36 @@ function ComposerInner({
     : (bot?.name ?? "The bot");
   // Per-thread draft: switching bots unmounts this component, so both the
   // text and its attachment chips have to outlive it (see lib/drafts).
-  const draftId = group ? `group:${group.id}:${group.threadId}` : `bot:${bot?.id ?? ""}`;
+  // A browsed non-active thread drafts under its own key; the active
+  // thread keeps the legacy per-bot key.
+  const draftId = group
+    ? `group:${group.id}:${group.threadId}`
+    : botThreadDraftId(
+        bot?.id ?? "",
+        bot?.threadId ?? "",
+        state.bots.find((candidate) => candidate.id === bot?.id)?.threadId ?? bot?.threadId ?? "",
+      );
   const [text, setText, attachments, setAttachments] = useComposerDraft(draftId);
+  // A thread typed while browsed drafts under its per-thread key; when
+  // that thread becomes the active one this composer resolves the legacy
+  // per-bot key instead.  Carry the text across so Switch keeps what was
+  // typed — scoped to this bot going active on the migrated thread, so
+  // closing a view or switching bots never moves text between threads.
+  const prevDraftId = useRef(draftId);
+  useEffect(() => {
+    const previous = prevDraftId.current;
+    prevDraftId.current = draftId;
+    if (!bot || group || previous === draftId) return;
+    const perThread = previous.match(/^bot:([^:]+):(.+)$/);
+    const [, migratedBotId, migratedThreadId] = perThread ?? [];
+    if (!migratedBotId || !migratedThreadId || `bot:${migratedBotId}` !== draftId || migratedBotId !== bot.id) return;
+    const liveThreadId = state.bots.find((candidate) => candidate.id === bot.id)?.threadId;
+    if (liveThreadId !== migratedThreadId) return;
+    const store = getStore();
+    migrateThreadDraft(store, previous, draftId);
+    setText(getDraft(store, draftId));
+    setAttachments(getDraftAttachments(store, draftId));
+  }, [bot, group, draftId, state.bots, setText, setAttachments]);
   // The composer clears the moment a message goes out; a send the server
   // refuses, or cannot be reached for, hands it all back through this.
   const restoreFailedSend = useFailedSendRestore<Message>(threadId, onRestoreReply);
@@ -290,10 +324,37 @@ function ComposerInner({
   };
   const engineSupportsImages = imageTargetsSupport(text);
 
-  // ── Autocomplete picker (@ for bots, # for apps/channels/etc) ──
+  // ── Autocomplete picker (@ bots, # apps/channels, / slash commands) ──
+  const [botCommands, setBotCommands] = useState<BotCommandsResponse | null>(null);
+  useEffect(() => {
+    if (!bot || group) {
+      setBotCommands(null);
+      return;
+    }
+    const botId = bot.id;
+    const threadId = bot.threadId;
+    setBotCommands(null);
+    let cancelled = false;
+    void fetchBotCommands(botId, threadId)
+      .then((menu) => {
+        if (cancelled) return;
+        setBotCommands(menu);
+      })
+      .catch(() => {
+        if (!cancelled) setBotCommands(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [bot?.id, bot?.threadId, group]);
+
   const triggerInfo = autocompleteQueryAt(text, caret);
   const candidates = useMemo(() => {
     if (!triggerInfo || triggerInfo.start === dismissedAt) return [];
+    if (triggerInfo.trigger === "/") {
+      if (!bot || group || !botCommands) return [];
+      return botCommandAutocompleteChoices(botCommands, triggerInfo.query);
+    }
     const connectedApps = readCachedInventory()?.services;
     const terminology = resolveRoomLabels(state.config?.terminology);
     return getAutocompleteCandidates(triggerInfo, {
@@ -306,10 +367,36 @@ function ComposerInner({
       members,
       terminologySingular: terminology.singular,
     });
-  }, [triggerInfo, dismissedAt, state.bots, state.groups, state.routines, state.config?.terminology, bot?.id, group, members]);
+  }, [
+    triggerInfo,
+    dismissedAt,
+    state.bots,
+    state.groups,
+    state.routines,
+    state.config?.terminology,
+    bot?.id,
+    group,
+    members,
+    botCommands,
+  ]);
   const pickerOpen = candidates.length > 0;
+  const pickerLabel =
+    triggerInfo?.trigger === "@"
+      ? "Tag a Bot"
+      : triggerInfo?.trigger === "/"
+        ? "Slash Commands"
+        : "Link an App or Channel";
+  const pickerHeading =
+    triggerInfo?.trigger === "@"
+      ? "Bots"
+      : triggerInfo?.trigger === "/"
+        ? "Commands"
+        : "Apps & Channels";
 
-  useEffect(() => setHighlight(0), [triggerInfo?.start, triggerInfo?.query]);
+  useEffect(() => {
+    const firstPickable = candidates.findIndex((candidate) => !candidate.disabled);
+    setHighlight(firstPickable >= 0 ? firstPickable : 0);
+  }, [triggerInfo?.start, triggerInfo?.query, candidates]);
 
   // one line at rest, then grow with the draft — hard cap at six lines
   useEffect(() => {
@@ -322,7 +409,7 @@ function ComposerInner({
   }, [text]);
 
   const pickCandidate = (choice: AutocompleteChoice) => {
-    if (!triggerInfo) return;
+    if (!triggerInfo || choice.disabled) return;
     const { text: nextText, caret: newCaret } = applyAutocomplete(text, caret, triggerInfo, choice);
     setText(nextText);
     setCaret(newCaret);
@@ -579,7 +666,7 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
     let session: STTSession | null = sttSessionRef.current;
 
     const handleTranscript = (line: { text: string; partial: boolean; error?: string }) => {
-      if (acceptComposerTranscript(detached, finalizing, Boolean(currentCall())) && typeof line.text === "string") {
+      if (acceptComposerTranscript(detached, finalizing, Boolean(currentCall())) && line.text) {
         const base = baseText.current;
         setText(base ? `${base} ${line.text}` : line.text);
       }
@@ -775,33 +862,51 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
                 >
                   {queuedChipLabel({ text: entry.text, busyName, draining: updateHolding })}
                 </span>
-                <div className="flex shrink-0 items-center gap-1">
+                {/* Labeled actions, not bare glyphs: three 24px icons in a row were
+                    easy to mis-tap, and "Steer" beside "Cancel" says which one
+                    ends the wait.  The order is Steer, Edit, Cancel — Edit sits in
+                    the middle so neither neighbour reads as its default.  The
+                    accessible names stay the ones the screen readers and the
+                    tests already use. */}
+                <div className="flex shrink-0 items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={handleSteerQueued}
+                    className={cn(
+                      "inline-flex h-6 items-center gap-1 whitespace-nowrap rounded-md border px-2 text-[11.5px] font-medium leading-none transition-colors",
+                      "border-accent/30 bg-accent/10 text-accent hover:bg-accent/15",
+                    )}
+                    title="Stops the current turn and sends this now."
+                    aria-label="Steer Now"
+                  >
+                    <ArrowUp size={12} strokeWidth={2.5} aria-hidden="true" />
+                    Steer
+                  </button>
                   <button
                     type="button"
                     onClick={() => handleEditQueued(entry)}
-                    className="flex size-6 items-center justify-center rounded-md text-ink-secondary hover:bg-raised hover:text-ink transition-colors"
+                    className={cn(
+                      "inline-flex h-6 items-center gap-1 whitespace-nowrap rounded-md border px-2 text-[11.5px] font-medium leading-none transition-colors",
+                      "border-hairline/40 bg-inset/30 text-ink-secondary hover:bg-raised hover:text-ink",
+                    )}
                     title="Puts the message back in the composer to edit."
                     aria-label="Edit Queued Message"
                   >
-                    <Pencil size={12} strokeWidth={2} />
+                    <Pencil size={12} strokeWidth={2} aria-hidden="true" />
+                    Edit
                   </button>
                   <button
                     type="button"
                     onClick={() => handleCancelQueued(entry.queueId)}
-                    className="flex size-6 items-center justify-center rounded-md text-ink-secondary hover:bg-raised hover:text-danger transition-colors"
+                    className={cn(
+                      "inline-flex h-6 items-center gap-1 whitespace-nowrap rounded-md border px-2 text-[11.5px] font-medium leading-none transition-colors",
+                      "border-hairline/40 bg-inset/30 text-ink-secondary hover:bg-raised hover:text-danger",
+                    )}
                     title="Cancel Queued Message"
                     aria-label="Cancel Queued Message"
                   >
-                    <Trash2 size={12} strokeWidth={2} />
-                  </button>
-                  <button
-                    type="button"
-                    onClick={handleSteerQueued}
-                    className="flex size-6 items-center justify-center rounded-md text-accent hover:bg-accent/15 transition-colors"
-                    title="Stops the current turn and sends this now."
-                    aria-label="Steer Now"
-                  >
-                    <ArrowUp size={13} strokeWidth={2.5} />
+                    <Trash2 size={12} strokeWidth={2} aria-hidden="true" />
+                    Cancel
                   </button>
                 </div>
               </div>
@@ -811,22 +916,24 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
         {pickerOpen && (
           <div
             role="listbox"
-            aria-label={triggerInfo?.trigger === "@" ? "Tag a Bot" : "Link an App or Channel"}
+            aria-label={pickerLabel}
             className="absolute bottom-full left-2 z-20 mb-2 w-80 max-h-72 overflow-y-auto rounded-xl border border-hairline/40 bg-raised shadow-lg"
           >
             <div className="border-b border-hairline/20 px-3 py-1.5 text-[11px] font-medium uppercase tracking-wider text-ink-secondary">
-              {triggerInfo?.trigger === "@" ? "Bots" : "Apps & Channels"}
+              {pickerHeading}
             </div>
             {candidates.map((item, i) => (
               <button
                 key={item.id}
                 role="option"
                 aria-selected={i === highlight}
+                disabled={item.disabled}
                 onClick={() => pickCandidate(item)}
                 onMouseEnter={() => setHighlight(i)}
                 className={cn(
                   "flex w-full items-center gap-2.5 px-3 py-2 text-left transition-colors",
                   i === highlight ? "bg-raised-hover" : "",
+                  item.disabled ? "cursor-not-allowed opacity-50" : "",
                 )}
               >
                 {item.kind === "bot" ? (
@@ -849,6 +956,10 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
                   <span className="flex size-6 shrink-0 items-center justify-center rounded-full bg-raised text-accent">
                     <Zap size={14} aria-hidden="true" />
                   </span>
+                ) : item.kind === "command" ? (
+                  <span className="flex size-6 shrink-0 items-center justify-center rounded-full bg-raised text-accent">
+                    <Terminal size={14} aria-hidden="true" />
+                  </span>
                 ) : (
                   <span className="flex size-6 shrink-0 items-center justify-center rounded-full bg-raised text-accent">
                     <AppWindow size={14} aria-hidden="true" />
@@ -857,7 +968,9 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-1.5">
                     <span className="truncate text-[14px] font-medium text-ink" title={item.name}>
-                      {triggerInfo?.trigger}{item.name}
+                      {item.kind === "command" && item.command
+                        ? item.command.label
+                        : `${triggerInfo?.trigger ?? ""}${item.name}`}
                     </span>
                   </div>
                   {item.description && (
@@ -934,7 +1047,7 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
                 title="Attach a File"
                 className="flex size-8 shrink-0 items-center justify-center rounded-full text-ink-secondary hover:bg-control hover:text-ink"
               >
-                <Paperclip size={17} />
+                <Paperclip size={17} aria-hidden="true" />
               </button>
               {autoBot && <PermissionModeSelector bot={autoBot} onSetAuto={setAuto} />}
             </div>
@@ -979,13 +1092,24 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
               if (e.key === "ArrowDown" || e.key === "ArrowUp") {
                 e.preventDefault();
                 const delta = e.key === "ArrowDown" ? 1 : -1;
-                setHighlight((h) => (h + delta + candidates.length) % candidates.length);
+                if (candidates.length === 0) return;
+                let next = highlight;
+                for (let step = 0; step < candidates.length; step += 1) {
+                  next = (next + delta + candidates.length) % candidates.length;
+                  if (!candidates[next]?.disabled) {
+                    setHighlight(next);
+                    break;
+                  }
+                }
                 return;
               }
               if (e.key === "Enter" || e.key === "Tab") {
-                e.preventDefault();
-                pickCandidate(candidates[highlight]);
-                return;
+                const choice = candidates[highlight];
+                if (choice && !choice.disabled) {
+                  e.preventDefault();
+                  pickCandidate(choice);
+                  return;
+                }
               }
               if (e.key === "Escape") {
                 e.preventDefault();
@@ -1053,7 +1177,7 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
             className="flex size-8 shrink-0 items-center justify-center rounded-full text-ink-secondary hover:bg-raised hover:text-ink"
             title="Stop"
           >
-            <Square size={14} className="fill-current" />
+            <Square size={14} className="fill-current" aria-hidden="true" />
           </button>
         )}
         {!locked && !busy && !hasContent && !onCall && dictationAvailable && (
@@ -1068,7 +1192,7 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
             )}
             title={recording ? "Stop Dictation (Esc)" : "Dictate"}
           >
-            <Mic size={18} />
+            <Mic size={18} aria-hidden="true" />
           </button>
         )}
         {hasContent && !locked && busy && busySendDefault === "queue" && (
@@ -1079,7 +1203,7 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
             title="Steer Now — send message and interrupt current turn immediately (Alt+Enter)"
             className="flex h-8 items-center gap-1 rounded-full bg-accent px-2.5 text-[12px] font-medium text-white shadow-sm hover:brightness-110"
           >
-            <Zap size={13} className="fill-current" />
+            <Zap size={13} className="fill-current" aria-hidden="true" />
             <span>Steer Now</span>
           </button>
         )}
@@ -1117,7 +1241,7 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
               busy && busySendDefault === "queue" ? "bg-raised text-ink-secondary hover:bg-raised-hover" : "bg-accent hover:brightness-110",
             )}
           >
-            {busy && busySendDefault === "queue" ? <Clock size={15} /> : <ArrowUp size={17} />}
+            {busy && busySendDefault === "queue" ? <Clock size={15} aria-hidden="true" /> : <ArrowUp size={17} aria-hidden="true" />}
           </button>
         )}
           </div>

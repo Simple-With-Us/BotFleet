@@ -8,6 +8,7 @@ import {
   Bug,
   Clock,
   Crown,
+  Eye,
   Folder,
   ListTree,
   Loader2,
@@ -50,6 +51,7 @@ import { showWorkingDots } from "@/lib/turn-tail";
 import { liveActivityLabel } from "@/lib/live-activity";
 import { modelChip } from "@/lib/model-chip";
 import { ChatMarkdown } from "./ChatMarkdown";
+import { recordChatViewBody, recordMessagesListBody } from "./chatViewRenderProbe";
 import { splitVoiceSummary, stripVoiceSummaryTags, writtenReply } from "../../shared/voice-summary";
 import { useMessageKaraoke } from "@/lib/tts/useMessageKaraoke";
 import { MentionText } from "./MentionText";
@@ -67,6 +69,13 @@ import { AttachedFileChips, AttachedImageGallery } from "./AttachmentPreview";
 import { ModelPicker } from "./ModelPicker";
 import { RenameTitle } from "./RenameTitle";
 import { ThreadStatsBar } from "./ThreadStatsBar";
+import {
+  CompactSessionRow,
+  ContextNote,
+  ContextUsageStrip,
+  contextMeterFor,
+  useContextSession,
+} from "./ContextUsage";
 import { ThreadTabs } from "./ThreadTabs";
 import { ThreadViewSwitch } from "./ThreadViewSwitch";
 import { TrajectoryView } from "./TrajectoryView";
@@ -103,6 +112,7 @@ import {
   resolveTranscriptWindow,
   tailDisplayWindowStart,
 } from "@/lib/transcript-window";
+import { speakAloudLabel } from "@/lib/chat-accessibility";
 import { timelineEvents } from "@/lib/taskTimeline";
 import { useDesktopCapabilities } from "./DesktopCapabilities";
 
@@ -143,8 +153,8 @@ function TaskTimeline({ messages, busy }: { messages: Message[]; busy: boolean }
         aria-expanded={open}
         className="flex w-full items-center justify-between rounded-lg px-2 py-1.5 text-left text-[12.5px] text-ink-secondary hover:bg-raised/50 hover:text-ink"
       >
-        <span className="flex items-center gap-1.5"><ListTree size={14} /> Execution timeline{busy ? " · running" : ""}</span>
-        <ChevronDown size={14} className={cn("transition-transform", open && "rotate-180")} />
+        <span className="flex items-center gap-1.5"><ListTree size={14} aria-hidden="true" /> Execution timeline{busy ? " · running" : ""}</span>
+        <ChevronDown size={14} aria-hidden="true" className={cn("transition-transform", open && "rotate-180")} />
       </button>
       {open && (
         <ol className="ml-2 border-l border-hairline/40 pb-2 pl-3">
@@ -425,7 +435,7 @@ function Bubble({
             className="rounded-md p-1.5 text-ink-secondary opacity-0 transition-opacity hover:bg-raised hover:text-ink focus-visible:opacity-100 group-hover:opacity-100 group-focus-within:opacity-100"
             title="Reply"
           >
-            <MessageSquareReply size={17} />
+            <MessageSquareReply size={17} aria-hidden="true" />
           </button>
 
           <button
@@ -444,7 +454,7 @@ function Bubble({
                 : "Pin this message to the top of the thread"
             }
           >
-            {bot.pinnedMessageId === message.id ? <PinOff size={17} /> : <Pin size={17} />}
+            {bot.pinnedMessageId === message.id ? <PinOff size={17} aria-hidden="true" /> : <Pin size={17} aria-hidden="true" />}
           </button>
 
           {isLastBotText && !bot.busy && onRegenerate && (
@@ -454,7 +464,7 @@ function Bubble({
               title="Regenerate Response"
               className="rounded-md p-1.5 text-ink-secondary opacity-0 transition-opacity hover:bg-raised hover:text-ink focus-visible:opacity-100 group-hover:opacity-100 group-focus-within:opacity-100"
             >
-              <RefreshCw size={17} />
+              <RefreshCw size={17} aria-hidden="true" />
             </button>
           )}
         </div>
@@ -548,7 +558,7 @@ function Bubble({
                       : "Pin this message to the top of the thread"
                   }
                 >
-                  {bot.pinnedMessageId === message.id ? <PinOff size={17} /> : <Pin size={17} />}
+                  {bot.pinnedMessageId === message.id ? <PinOff size={17} aria-hidden="true" /> : <Pin size={17} aria-hidden="true" />}
                 </button>
               </div>
             </div>
@@ -669,9 +679,10 @@ function Bubble({
             onClick={() => switchTo(versions[versionIndex - 1])}
             disabled={versionIndex <= 0 || bot.busy}
             className="rounded p-0.5 hover:bg-raised hover:text-ink disabled:opacity-30 disabled:hover:bg-transparent"
+            aria-label="Previous Version"
             title="Previous Version"
           >
-            <ChevronLeft size={14} />
+            <ChevronLeft size={14} aria-hidden="true" />
           </button>
           <span className="tabular-nums">
             {versionIndex + 1}/{versions.length}
@@ -680,9 +691,10 @@ function Bubble({
             onClick={() => switchTo(versions[versionIndex + 1])}
             disabled={versionIndex >= versions.length - 1 || bot.busy}
             className="rounded p-0.5 hover:bg-raised hover:text-ink disabled:opacity-30 disabled:hover:bg-transparent"
+            aria-label="Next Version"
             title="Next Version"
           >
-            <ChevronRight size={14} />
+            <ChevronRight size={14} aria-hidden="true" />
           </button>
         </div>
       )}
@@ -694,6 +706,10 @@ function Bubble({
 /** One shared empty queue.  See the note at its use site: identity, not
  * contents, is what this is for. */
 const NO_QUEUE: ReadonlyArray<{ queueId: string; text: string }> = [];
+
+/** Shared empty transcript for a browsed thread whose first page has
+ * not landed yet.  Same identity reasoning as NO_QUEUE above. */
+const NO_MESSAGES: Message[] = [];
 
 function ActivityChip({ bot, message }: { bot: Bot, message: Message }) {
   const { dispatch } = useStore();
@@ -817,6 +833,7 @@ const MessagesList = memo(function MessagesList({
   onRegenerate: () => void;
   onReply: (message: Message) => void;
 }) {
+  recordMessagesListBody();
   const { state, dispatch } = useStore();
   const showToolCalls = showToolCallsEnabled(state.config);
   const summarizeToolCalls = summarizeToolCallsEnabled(state.config);
@@ -923,6 +940,13 @@ const MessagesList = memo(function MessagesList({
               return src ? <ScreenFrame src={src} /> : null;
             }
             default: {
+              if (m.command?.name === "compact" && m.role === "user") {
+                const index = transcript.findIndex((row) => row.id === m.id);
+                const settled = index >= 0 && transcript.slice(index + 1).some((later) =>
+                  later.role === "bot" && later.kind === "text" && later.command?.name !== "compact",
+                );
+                return <CompactSessionRow settled={settled} />;
+              }
               // Auto-delivered instructions (routine / webhook / resource) are
               // stored as role=system.  Older webhook rows still used
               // role=user; keep those off the blue bubble too.
@@ -974,7 +998,7 @@ const MessagesList = memo(function MessagesList({
                           aria-label="Previous Version"
                           title="Previous Version"
                         >
-                          <ChevronLeft size={14} />
+                          <ChevronLeft size={14} aria-hidden="true" />
                         </button>
                         <span className="tabular-nums">
                           {systemVersionIndex + 1}/{systemVersions.length}
@@ -993,7 +1017,7 @@ const MessagesList = memo(function MessagesList({
                           aria-label="Next Version"
                           title="Next Version"
                         >
-                          <ChevronRight size={14} />
+                          <ChevronRight size={14} aria-hidden="true" />
                         </button>
                       </div>
                     )}
@@ -1110,7 +1134,7 @@ function PinnedBanner({
   return (
     <div className="w-full px-5">
       <div className="mb-2 flex items-center gap-2 rounded-lg border border-accent/25 bg-accent/[0.07] px-3 py-1.5">
-        <Pin size={12} className="shrink-0 text-accent" />
+        <Pin size={12} className="shrink-0 text-accent" aria-hidden="true" />
         <button
           onClick={() => onJump(pinned.id)}
           className="flex min-w-0 flex-1 items-baseline gap-2 text-left"
@@ -1125,7 +1149,7 @@ function PinnedBanner({
           title="Unpin"
           className="shrink-0 rounded p-0.5 text-ink-secondary hover:bg-raised hover:text-ink"
         >
-          <X size={13} />
+          <X size={13} aria-hidden="true" />
         </button>
       </div>
     </div>
@@ -1142,17 +1166,36 @@ function formatHoverTime(at: number) {
 }
 
 export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; explicitThreadId?: string }) {
-  // A pin onto a different thread for App views.  Memoized so the derived
-  // object keeps a stable identity across renders and effects don't churn
-  // when the pin isn't shadowing anything.
+  recordChatViewBody();
+  const { state, dispatch } = useStore();
+  // A pin onto a different thread for App views and busy-time browsing.
+  // The derived bot reads that thread's own cached transcript — never
+  // the active thread's messages under the viewed thread's id.
+  // Memoized so the derived object keeps a stable identity across
+  // renders and effects don't churn when the pin isn't shadowing anything.
+  const viewingOther = Boolean(explicitThreadId && explicitThreadId !== originalBot.threadId);
+  const viewedMessages = explicitThreadId ? state.threadTranscripts[explicitThreadId] : undefined;
+  const viewedLoading = explicitThreadId ? Boolean(state.loadingThread[explicitThreadId]) : false;
+  // A failed page stays failed until the reader opens the thread again:
+  // without this, clearing `loadingThread` re-arms the fetch below and a
+  // persistently failing route refetches without bound.
+  const viewedFailed = explicitThreadId ? state.threadTranscriptErrors[explicitThreadId] : undefined;
   const bot = useMemo(
     () =>
-      explicitThreadId && explicitThreadId !== originalBot.threadId
-        ? { ...originalBot, threadId: explicitThreadId }
+      viewingOther && explicitThreadId
+        ? { ...originalBot, threadId: explicitThreadId, messages: viewedMessages ?? NO_MESSAGES }
         : originalBot,
-    [originalBot, explicitThreadId],
+    [originalBot, explicitThreadId, viewingOther, viewedMessages],
   );
-  const { state, dispatch } = useStore();
+  // First open of a retained thread fetches its page; later frames keep
+  // the cache live through the reducer.  The store wrapper dedupes
+  // concurrent fetches for the same thread, and a recorded failure
+  // blocks re-dispatch until the reader opens the thread again.
+  useEffect(() => {
+    if (viewingOther && explicitThreadId && !viewedMessages && !viewedLoading && !viewedFailed) {
+      dispatch({ type: "viewThread", botId: originalBot.id, threadId: explicitThreadId });
+    }
+  }, [viewingOther, explicitThreadId, viewedMessages, viewedLoading, viewedFailed, originalBot.id, dispatch]);
   const { capabilities } = useDesktopCapabilities();
   const macInset = capabilities.windowChrome === "mac-inset";
   const dragStyle: (React.CSSProperties & { WebkitAppRegion: "drag" }) | undefined = macInset
@@ -1164,6 +1207,23 @@ export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; exp
   const scrollRef = useRef<HTMLDivElement>(null);
   // the open thread's task: its banked usage and timing feed the footer chips
   const activeTask = bot.tasks?.find((t) => t.threadId === bot.threadId);
+  const activeSelection = activeTask?.modelSelection ?? bot.modelSelection;
+  const catalogWindow = state.instances
+    .find((instance) => instance.instanceId === activeSelection.instanceId)
+    ?.models.options.find((option) => option.id === activeSelection.model)?.contextWindow;
+  const contextMeter = contextMeterFor({
+    used: activeTask?.usage?.lastInput,
+    reportedWindow: activeTask?.usage?.contextWindow,
+    catalogWindow,
+  });
+  const contextSession = useContextSession({
+    botId: bot.id,
+    threadId: bot.threadId,
+    used: contextMeter.used,
+    window: contextMeter.window,
+    busy: Boolean(bot.busy),
+    viewingOther,
+  });
   // Chat or Trajectory, remembered per thread.  The chat pane below stays
   // mounted (just not shown) in Trajectory, so its scroll position, draft and
   // streaming state are exactly where they were when the person switches back.
@@ -1529,14 +1589,16 @@ export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; exp
             title="Open Bot Profile"
             aria-label={`Open ${bot.name}'s Profile`}
           >
-            <BotAvatar
-              bot={bot}
-              state={stateForBot({ ...bot, messages })}
-              size={28}
-              motion={mascotMotion?.kind ?? "none"}
-              motionKey={mascotMotion?.nonce ?? 0}
-              animated={Boolean(bot.busy) && pageVisible}
-            />
+            <span aria-hidden="true" className="flex">
+              <BotAvatar
+                bot={bot}
+                state={stateForBot({ ...bot, messages })}
+                size={28}
+                motion={mascotMotion?.kind ?? "none"}
+                motionKey={mascotMotion?.nonce ?? 0}
+                animated={Boolean(bot.busy) && pageVisible}
+              />
+            </span>
           </button>
           <RenameTitle
             value={bot.name}
@@ -1547,13 +1609,23 @@ export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; exp
             inputClassName="max-w-[220px] rounded bg-inset px-1.5 py-0.5 text-[15px] font-semibold"
           />
           {bot.chiefOfStaff && (
-            <span className="flex shrink-0 items-center gap-1 rounded-full bg-accent/12 px-2 py-0.5 text-[11px] font-medium text-accent">
-              <Crown size={11} />
-              <span className="@max-2xl/chathead:hidden">Chief of Staff</span>
+            <span
+              role="img"
+              aria-label="Chief of Staff"
+              title="Chief of Staff"
+              className="flex shrink-0 items-center gap-1 rounded-full bg-accent/12 px-2 py-0.5 text-[11px] font-medium text-accent"
+            >
+              <Crown size={11} aria-hidden="true" />
+              <span className="@max-2xl/chathead:hidden" aria-hidden="true">Chief of Staff</span>
             </span>
           )}
           {bot.off === true && <BotOffBadge />}
-          {bot.busy && <Loader2 size={14} className="shrink-0 animate-spin text-ink-secondary" />}
+          {bot.busy && (
+            <span className="inline-flex shrink-0">
+              <span className="sr-only">Working</span>
+              <Loader2 size={14} className="animate-spin text-ink-secondary" aria-hidden="true" />
+            </span>
+          )}
         </div>
         <div style={noDragStyle} className="ml-auto flex min-w-0 max-w-full flex-wrap items-center justify-end gap-1.5 md:gap-2">
           <ThreadViewSwitch view={threadView} onChange={setThreadView} />
@@ -1569,7 +1641,7 @@ export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; exp
             )}
             title={trajectoryOpen ? "Search Steps (⌘F)" : "Find in Conversation (⌘F)"}
           >
-            <Search size={18} />
+            <Search size={18} aria-hidden="true" />
           </button>
           {/* Background jobs, left of Stop.  Stop ends the turn, never a job. */}
           <JobsMenu threadId={bot.threadId} helperCount={helperCount} />
@@ -1580,9 +1652,10 @@ export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; exp
                 "flex items-center gap-1.5 rounded-full border border-hairline/40 bg-raised/60 px-2.5 py-1 text-[13px] text-ink-secondary hover:bg-raised hover:text-ink",
                 COMPACT_BUBBLE,
               )}
+              aria-label="Stop This Turn"
               title="Stop this turn"
             >
-              <Square size={12} className="fill-current" />
+              <Square size={12} className="fill-current" aria-hidden="true" />
               <span className="@max-4xl/chathead:hidden">Stop</span>
             </button>
           )}
@@ -1597,12 +1670,13 @@ export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; exp
             )}
             title={
               (bot.speechDevices ? bot.speechDevices.includes("mac") : bot.speakReplies)
-                ? "Speak replies aloud is ON (click to turn off)"
-                : "Speak replies aloud is OFF (click to turn on)"
+                ? "Speak replies aloud is on. Turn it off."
+                : "Speak replies aloud is off. Turn it on."
             }
           >
             <input
               type="checkbox"
+              aria-label={speakAloudLabel(Boolean(bot.speechDevices ? bot.speechDevices.includes("mac") : bot.speakReplies))}
               checked={Boolean(bot.speechDevices ? bot.speechDevices.includes("mac") : bot.speakReplies)}
               onChange={(e) => {
                 const next = e.target.checked;
@@ -1632,7 +1706,47 @@ export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; exp
         </div>
       </div>
 
-      <ThreadTabs bot={bot} />
+      <ThreadTabs bot={originalBot} />
+
+      {/* Browsing a retained thread is read-only: the bot keeps working
+          in its active thread, and becoming the execution target stays
+          gated on the turn finishing, exactly as tab switching was. */}
+      {viewingOther && explicitThreadId && (
+        <div
+          role="status"
+          className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-hairline/40 bg-raised/40 px-4 py-1.5 text-[12.5px] text-ink-secondary"
+        >
+          <span className="flex min-w-0 items-center gap-1.5">
+            <Eye size={13} className="shrink-0" aria-hidden="true" />
+            <span className="truncate">
+              Viewing “{originalBot.tasks?.find((task) => task.threadId === explicitThreadId)?.title || "Untitled"}”
+              {viewedLoading && !viewedMessages ? " — loading…" : ""}
+              {" · "}
+              {originalBot.busy
+                ? `${originalBot.name} is working in “${originalBot.tasks?.find((task) => task.threadId === originalBot.threadId)?.title || "Untitled"}”.`
+                : `The active thread is “${originalBot.tasks?.find((task) => task.threadId === originalBot.threadId)?.title || "Untitled"}”.`}
+            </span>
+          </span>
+          <span className="ml-auto flex shrink-0 items-center gap-2">
+            <button
+              type="button"
+              disabled={Boolean(originalBot.busy)}
+              title={originalBot.busy ? "Let this turn finish first" : "Make this the active thread"}
+              onClick={() => dispatch({ type: "switchTask", botId: originalBot.id, threadId: explicitThreadId })}
+              className="rounded-full border border-hairline/40 px-2.5 py-0.5 text-ink hover:bg-raised disabled:opacity-40"
+            >
+              Switch to this thread
+            </button>
+            <button
+              type="button"
+              onClick={() => dispatch({ type: "viewThread", botId: originalBot.id, threadId: null })}
+              className="rounded-full border border-hairline/40 px-2.5 py-0.5 text-ink hover:bg-raised"
+            >
+              Back to active thread
+            </button>
+          </span>
+        </div>
+      )}
 
       {findOpen && !trajectoryOpen && <ChatFindBar threadId={bot.threadId} onClose={() => setFindOpen(false)} />}
 
@@ -1744,6 +1858,13 @@ export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; exp
             onRegenerate={regenerate}
             onReply={setReplyTo}
           />
+          {laterCount === 0 && contextSession.note.show ? (
+            <ContextNote
+              pending={contextSession.pending}
+              disabledReason={contextSession.offer.state === "disabled" ? contextSession.offer.reason : null}
+              onCompact={contextSession.compact}
+            />
+          ) : null}
           {laterCount > 0 && (
             <div className="flex justify-center">
               <button
@@ -1819,9 +1940,10 @@ export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; exp
         </div>
       </div>
 
-      {/* keyed by bot: a draft belongs to the conversation it was typed in,
-          so switching bots starts from an empty composer instead of carrying
-          the previous bot's half-written message over. ArrowUp-to-edit is
+      {/* keyed by bot and shown thread: a draft belongs to the conversation
+          it was typed in, so switching bots — or browsing a retained
+          thread — starts from that thread's composer instead of carrying
+          the previous thread's half-written message over. ArrowUp-to-edit is
           gated on busy like the pencil button — editing rewinds the thread,
           which a live turn forbids (the server 409s it). */}
       <div
@@ -1834,18 +1956,31 @@ export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; exp
           aria-label="Jump to Latest Messages"
           className="animate-pop-in relative z-10 mb-2 flex items-center gap-1.5 rounded-full border border-hairline/40 bg-raised px-3 py-1.5 text-[12.5px] text-ink shadow-lg hover:bg-raised-hover"
         >
-          <ArrowDown size={13} /> Jump to Latest
+          <ArrowDown size={13} aria-hidden="true" /> Jump to Latest
         </button>
       )}
       <div className="w-full">
       <UpdateDrainNotice />
       <Composer
-        key={bot.id}
+        key={`${bot.id}:${bot.threadId}`}
         bot={bot}
         replyTo={replyTo}
         onClearReply={() => setReplyTo(null)}
         onRestoreReply={(message) => setReplyTo((current) => current ?? message)}
         onEditLast={lastUserMessage && !bot.busy ? () => setEditingId(lastUserMessage.id) : undefined}
+        // Browsing is read-only while the bot works: a send from here
+        // would auto-switch the execution target to the viewed thread
+        // mid-turn (and steer onto it), defeating the busy gate the tabs
+        // and the banner above enforce.  The reader switches first, then
+        // sends — the Switch button unlocks when the turn finishes.
+        locked={viewingOther && originalBot.busy}
+      />
+      <ContextUsageStrip
+        meter={contextMeter}
+        offer={contextSession.offer}
+        pending={contextSession.pending}
+        error={contextSession.error}
+        onCompact={contextSession.compact}
       />
       <ThreadStatsBar stats={activeTask?.stats} usage={activeTask?.usage} />
       </div>
@@ -1896,9 +2031,11 @@ function ChatHeaderOverflowMenu({ bot }: { bot: Bot }) {
           "flex size-8 items-center justify-center rounded-md text-ink-secondary hover:bg-raised hover:text-ink",
           open && "bg-raised text-ink",
         )}
+        aria-haspopup="true"
+        aria-label="More Actions"
         title="More Actions"
       >
-        <MoreHorizontal size={18} />
+        <MoreHorizontal size={18} aria-hidden="true" />
       </button>
 
       {open && (
@@ -1912,7 +2049,7 @@ function ChatHeaderOverflowMenu({ bot }: { bot: Bot }) {
             }}
             className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[13px] text-ink hover:bg-raised/60"
           >
-            <Folder size={15} className="shrink-0 text-ink-secondary" />
+            <Folder size={15} className="shrink-0 text-ink-secondary" aria-hidden="true" />
             <div className="min-w-0 flex-1">
               <div className="text-[12.5px] font-medium">Working Folder</div>
               <div className="truncate font-mono text-[11px] text-ink-secondary" title={folderName ?? "Private bot workspace"}>
@@ -1931,7 +2068,7 @@ function ChatHeaderOverflowMenu({ bot }: { bot: Bot }) {
               }}
               className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[13px] text-ink hover:bg-raised/60"
             >
-              <Coins size={15} className="shrink-0 text-ink-secondary" />
+              <Coins size={15} className="shrink-0 text-ink-secondary" aria-hidden="true" />
               <div className="min-w-0 flex-1">
                 <div className="text-[12.5px] font-medium">Session Usage</div>
                 <div className="text-[11px] text-ink-secondary">
@@ -1950,12 +2087,13 @@ function ChatHeaderOverflowMenu({ bot }: { bot: Bot }) {
               setOpen(false);
               dispatch({ type: "toggleComputer" });
             }}
+            aria-pressed={state.computerOpen}
             className="flex w-full items-center justify-between rounded-lg px-2.5 py-2 text-left text-[13px] text-ink hover:bg-raised/60"
           >
             <span className="flex items-center gap-2.5">
-              <Monitor size={15} className="text-ink-secondary" /> Bot's Computer
+              <Monitor size={15} className="text-ink-secondary" aria-hidden="true" /> Bot's Computer
             </span>
-            {state.computerOpen && <span className="size-1.5 rounded-full bg-accent" />}
+            {state.computerOpen && <span className="size-1.5 rounded-full bg-accent" aria-hidden="true" />}
           </button>
 
           {/* Inspector Toggle */}
@@ -1965,12 +2103,13 @@ function ChatHeaderOverflowMenu({ bot }: { bot: Bot }) {
               setOpen(false);
               dispatch({ type: "toggleInspector" });
             }}
+            aria-pressed={state.inspectorOpen}
             className="flex w-full items-center justify-between rounded-lg px-2.5 py-2 text-left text-[13px] text-ink hover:bg-raised/60"
           >
             <span className="flex items-center gap-2.5">
-              <Bug size={15} className="text-ink-secondary" /> Inspector
+              <Bug size={15} className="text-ink-secondary" aria-hidden="true" /> Inspector
             </span>
-            {state.inspectorOpen && <span className="size-1.5 rounded-full bg-accent" />}
+            {state.inspectorOpen && <span className="size-1.5 rounded-full bg-accent" aria-hidden="true" />}
           </button>
 
           <div className="my-1 border-t border-hairline/30" />
@@ -1984,7 +2123,7 @@ function ChatHeaderOverflowMenu({ bot }: { bot: Bot }) {
             }}
             className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[13px] text-ink hover:bg-raised/60"
           >
-            <SlidersHorizontal size={15} className="shrink-0 text-ink-secondary" />
+            <SlidersHorizontal size={15} className="shrink-0 text-ink-secondary" aria-hidden="true" />
             <span>Bot Profile &amp; Settings</span>
           </button>
         </div>

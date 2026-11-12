@@ -1,7 +1,7 @@
 # Chat Message Grouping — Shared Spec (Mac + iOS)
 
 **Date:** Sun, Oct 11, 2026 · **Seat:** MM · **Board:** `4904f628`
-**Follows:** [2026-10-11-ios-chat-library-options.md](2026-10-11-ios-chat-library-options.md) open follow-up 3
+**Follows:** [2026-10-11-ios-chat-library-options.md](../decisions/2026-10-11-ios-chat-library-options.md) open follow-up 3
 
 Grouping is the one confirmed gap from the chat-surface survey.  This is the contract both
 platforms implement, written before the spike so the spike implements a spec rather than
