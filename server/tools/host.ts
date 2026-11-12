@@ -196,16 +196,16 @@ function approvalArgs(
 function integerArg(args: ToolArguments, key: string): number | undefined {
   const value = args[key];
   if (value === undefined) return undefined;
-  if (typeof value === "number" && Number.isInteger(value)) return value;
-  if (typeof value === "string" && /^-?\d+$/.test(value)) return Number(value);
+  if (Number.isInteger(value)) return Number(value);
+  const text = stringArg(value);
+  if (/^-?\d+$/.test(text)) return Number(text);
   return Number.NaN;
 }
 
 /** `read_tool_result` body.  The full text lives in the process store the
  *  tool loop filled when it shortened a result for later rounds. */
 async function readStoredToolResult(call: TurnToolCall): Promise<TurnToolOutcome> {
-  const raw = call.arguments.artifact_id;
-  const id = typeof raw === "string" ? raw.trim() : "";
+  const id = stringArg(call.arguments.artifact_id).trim();
   if (!id) return failed("artifact_id must be a non-empty string.", "invalid_argument");
   const offset = integerArg(call.arguments, "offset");
   const limit = integerArg(call.arguments, "limit");

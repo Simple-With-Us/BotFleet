@@ -191,15 +191,18 @@ function originatingCall(messages: DeliveredToolMessage[], toolCallId: string | 
 
 function artifactIdFromArguments(raw: string | undefined): string {
   if (!raw) return "";
-  let parsed: unknown;
+  let parsed: { artifact_id?: string | number | boolean | null } | null;
   try {
     parsed = JSON.parse(raw);
   } catch {
     return "";
   }
-  if (typeof parsed !== "object" || parsed === null || !("artifact_id" in parsed)) return "";
+  if (parsed === null) return "";
   const id = parsed.artifact_id;
-  return typeof id === "string" ? id.trim() : "";
+  if (id === null || id === undefined) return "";
+  const text = String(id);
+  if (text !== id) return "";
+  return text.trim();
 }
 
 /** Replace tool results in `messages[0, deliveredUntil)` that are over the
