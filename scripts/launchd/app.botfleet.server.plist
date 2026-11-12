@@ -24,6 +24,21 @@
   path: it probes :8799 and, when healthy, logs and exits 0 without
   starting a second harness.  So the periodic run is a cheap health
   check, not a restart loop, and the two settings compose safely.
+
+  The runtime root is the release store's pointer, not a git checkout.
+  BOTFLEET_SERVER_ROOT points the launcher at ~/.botfleet/current, which
+  resolves physically to ~/.botfleet/releases/<commit> — an immutable
+  directory named by the commit it holds.  A checkout is a mutable
+  working tree: an update used to rewrite it under a live server, a
+  seat's branch could delete files the harness still imported, and the
+  janitor could remove its node_modules from under a serving process.
+  The pointer is the only thing that changes when the harness moves to a
+  new version, and the previous release stays on disk as the rollback.
+
+  WorkingDirectory is the store root rather than the pointer: launchd
+  refuses to start a job whose working directory does not exist, and a
+  missing pointer must fail inside the launcher (with its own message)
+  rather than silently keeping the job unloaded.
 -->
 <plist version="1.0">
 <dict>
@@ -33,6 +48,8 @@
 		<string>/Users/jay</string>
 		<key>PATH</key>
 		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/Users/jay/.grok/bin:/Users/jay/.local/bin</string>
+		<key>BOTFLEET_SERVER_ROOT</key>
+		<string>/Users/jay/.botfleet/current</string>
 	</dict>
 	<key>KeepAlive</key>
 	<dict>
@@ -60,6 +77,6 @@
 	<key>ThrottleInterval</key>
 	<integer>5</integer>
 	<key>WorkingDirectory</key>
-	<string>/Users/jay/apps/botfleet-server</string>
+	<string>/Users/jay/.botfleet</string>
 </dict>
 </plist>

@@ -18,8 +18,14 @@ enum SentryTelemetry {
                 $0.sessionSampleRate = 0.1
                 $0.lifecycle = .trace
             }
-            options.enableAppHangTracking = true
-            options.appHangTimeoutInterval = 2.0
+            // BOTFLEET-W is a fully blocking launch hang above 2 seconds.
+            // The threshold stays here, sourced from CompanionLaunchSchedule,
+            // so a later edit cannot raise it or turn tracking off to hide
+            // the stall.  start() stays on this thread: sentry-cocoa replays
+            // an off-main start onto the main thread asynchronously, and the
+            // launch window would then go unwatched.
+            options.enableAppHangTracking = CompanionLaunchSchedule.tracksFullyBlockingAppHangs
+            options.appHangTimeoutInterval = CompanionLaunchSchedule.appHangTimeoutInterval
             options.enableCaptureFailedRequests = true
             options.failedRequestStatusCodes = [HttpStatusCodeRange(min: 500, max: 599)]
             options.attachScreenshot = false

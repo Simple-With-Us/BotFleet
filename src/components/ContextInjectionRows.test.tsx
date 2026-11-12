@@ -126,5 +126,8 @@ describe("the Compressing Context row", () => {
     expect(html).toContain('aria-expanded="true"');
     expect(html).toContain("Sections dropped: memory");
     expect(html).toContain("older context was cut");
+    // The second sentence must keep its gap when rendered: a plain ASCII
+    // pair collapses to one space in HTML, so the source carries NBSP.
+    expect(html).toContain("was sent.\u00A0 Sizes and names only.");
   });
 });

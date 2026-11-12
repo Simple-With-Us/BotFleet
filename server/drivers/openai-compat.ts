@@ -17,12 +17,22 @@ import type {
   RuntimeEventListener,
   SendTurnInput,
 } from "../contracts.ts";
+import { isIP } from "node:net";
+import { Agent, fetch as undiciFetch, type RequestInit as UndiciRequestInit } from "undici";
+import { z } from "zod";
 import { newEventId, newId } from "../contracts.ts";
 import type { ReviewPrompt } from "../../shared/auto-review.ts";
 import { appendNative } from "./native.ts";
 import { splitChatPrompt } from "./prompt-split.ts";
 import { formatGenAiMessages, withChatSpan } from "../sentry-ai.ts";
-import { runTurnLoop, type ChatMessage, type TurnLoopDeps, type TurnUsage } from "./chat-completions/loop.ts";
+import {
+  DEFAULT_TURN_LOOP_BUDGET,
+  runTurnLoop,
+  type ChatMessage,
+  type TurnLoopBudget,
+  type TurnLoopDeps,
+  type TurnUsage,
+} from "./chat-completions/loop.ts";
 
 import { httpErrorFor } from "./chat-completions/errors.ts";
 import { toTurnUsage } from "./chat-completions/usage.ts";
@@ -36,6 +46,186 @@ const DRIVER_KIND = "openai-compat";
 // loop's hard ceiling instead.  generateText, which has no loop around it,
 // still uses it as a plain ceiling.
 const REQUEST_TIMEOUT_MS = 120_000;
+const DEFAULT_LOCAL_REPLY_WAIT_MS = 180_000;
+const NODE_FETCH_NO_BYTE_TIMEOUT_MS = 300_000;
+
+export const MAX_REPLY_WAIT_MINUTES = 60;
+export const ReplyWaitMinutesSchema = z.number().int().min(5).max(MAX_REPLY_WAIT_MINUTES);
+export type ReplyWaitMinutes = z.infer<typeof ReplyWaitMinutesSchema>;
+export const REPLY_WAIT_RANGE_MESSAGE = `replyWaitMinutes must be a whole number from 5 to ${MAX_REPLY_WAIT_MINUTES}`;
+
+// Only the fields read before building a Response; extra fields pass through.
+const UpstreamResponseSchema = z.object({
+  status: z.number().int().min(200).max(599),
+  statusText: z.string(),
+});
+const LOCAL_MODEL_PROBE_INTERVAL_MS = 30_000;
+const LOCAL_MODEL_PROBE_TIMEOUT_MS = 5_000;
+const LOCAL_MODEL_PROBE_MISSES = 3;
+const LOCAL_REPLY_REQUEST_HEADROOM_MS = 300_000;
+const LOCAL_REPLY_TURN_HEADROOM_MS = 900_000;
+let noByteTimeoutAgent: Agent | undefined;
+
+/** OpenAI-compatible servers on this machine or a private network. */
+export function isLocalModelEndpoint(url: string): boolean {
+  let host: string;
+  try {
+    host = new URL(url).hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  } catch {
+    return false;
+  }
+  if (host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local") || host === "::1") return true;
+  const mappedIPv4 = host.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i);
+  const ipv4 = isIP(host) === 4
+    ? host
+    : mappedIPv4
+      ? (() => {
+          const high = Number.parseInt(mappedIPv4[1]!, 16);
+          const low = Number.parseInt(mappedIPv4[2]!, 16);
+          return `${high >>> 8}.${high & 0xff}.${low >>> 8}.${low & 0xff}`;
+        })()
+      : null;
+  if (ipv4) {
+    const [a, b] = ipv4.split(".").map(Number);
+    return a === 10 || a === 127 || a === 192 && b === 168 || a === 172 && b >= 16 && b <= 31 || a === 169 && b === 254;
+  }
+  return /^f[cd][0-9a-f]{2}:/i.test(host) || /^fe[89ab][0-9a-f]:/i.test(host);
+}
+
+export function replyWaitTimeoutMs(url: string, replyWaitMinutes?: number): number {
+  if (!isLocalModelEndpoint(url)) return REQUEST_TIMEOUT_MS;
+  return replyWaitMinutes === undefined ? DEFAULT_LOCAL_REPLY_WAIT_MS : replyWaitMinutes * 60_000;
+}
+
+export function replyWaitTurnBudget(url: string, replyWaitMinutes?: number): Partial<TurnLoopBudget> {
+  const requestIdleMs = replyWaitTimeoutMs(url, replyWaitMinutes);
+  const budget: Partial<TurnLoopBudget> = { requestIdleMs };
+  if (isLocalModelEndpoint(url) && replyWaitMinutes !== undefined) {
+    budget.requestTimeoutMs = Math.max(
+      DEFAULT_TURN_LOOP_BUDGET.requestTimeoutMs,
+      requestIdleMs + LOCAL_REPLY_REQUEST_HEADROOM_MS,
+    );
+    budget.wallClockMs = Math.max(
+      DEFAULT_TURN_LOOP_BUDGET.wallClockMs,
+      requestIdleMs + LOCAL_REPLY_TURN_HEADROOM_MS,
+    );
+  }
+  return budget;
+}
+
+export const NODE_FETCH_NO_BYTE_LIMIT_MS = NODE_FETCH_NO_BYTE_TIMEOUT_MS;
+
+export function usesUnboundedFetchForReplyWait(url: string, waitMs: number): boolean {
+  return isLocalModelEndpoint(url) && waitMs >= NODE_FETCH_NO_BYTE_TIMEOUT_MS;
+}
+
+function fetchWithoutNodeNoByteTimeout(url: string, init: RequestInit): Promise<Response> {
+  noByteTimeoutAgent ??= new Agent({ headersTimeout: 0, bodyTimeout: 0 });
+  const requestHeaders: Array<[string, string]> = [];
+  new Headers(init.headers).forEach((value, key) => requestHeaders.push([key, value]));
+  const options: UndiciRequestInit = {
+    method: init.method,
+    headers: requestHeaders,
+    body: z.string().optional().parse(init.body ?? undefined),
+    signal: init.signal,
+    dispatcher: noByteTimeoutAgent,
+  };
+  return undiciFetch(url, options).then((upstream) => {
+    const meta = UpstreamResponseSchema.parse(upstream);
+    const headers = new Headers();
+    upstream.headers.forEach((value, key) => headers.append(key, value));
+    // SAFETY: Undici's response body is a Node stream type for the same WHATWG
+    // ReadableStream consumed by this driver; only its ambient declarations differ.
+    const body = upstream.body as ConstructorParameters<typeof Response>[0];
+    return new Response(body, {
+      status: meta.status,
+      statusText: meta.statusText,
+      headers,
+    });
+  });
+}
+
+export function watchLocalModelServer(
+  url: string,
+  apiKey: string,
+  stop: AbortController,
+  intervalMs = LOCAL_MODEL_PROBE_INTERVAL_MS,
+  /** When the last response byte arrived.  A probe is only needed once the
+   *  stream has been silent for a whole interval; bytes already prove life. */
+  lastByteAt?: () => number,
+  /** Called whenever the server is proven alive (bytes or an HTTP answer). */
+  onAlive?: () => void,
+): () => void {
+  if (!isLocalModelEndpoint(url)) return () => undefined;
+  let misses = 0;
+  let checking = false;
+  let stopped = false;
+  let activeProbe: AbortController | undefined;
+  let probeTimeout: ReturnType<typeof setTimeout> | undefined;
+  const abortProbe = () => activeProbe?.abort(stop.signal.reason);
+  const timer = setInterval(() => {
+    if (checking || stopped || stop.signal.aborted) return;
+    if (lastByteAt && Date.now() - lastByteAt() < intervalMs) {
+      misses = 0;
+      onAlive?.();
+      return;
+    }
+    checking = true;
+    const probe = new AbortController();
+    activeProbe = probe;
+    let timedOut = false;
+    probeTimeout = setTimeout(() => {
+      timedOut = true;
+      probe.abort(new DOMException("Local model liveness probe timed out", "TimeoutError"));
+    }, Math.min(intervalMs / 2, LOCAL_MODEL_PROBE_TIMEOUT_MS));
+    (async () => {
+      try {
+        const headers = new Headers();
+        if (apiKey) headers.set("authorization", `Bearer ${apiKey}`);
+        const response = await fetch(`${url}/models`, {
+          headers,
+          signal: probe.signal,
+        });
+        // Any HTTP response proves the server is alive; auth and model-list
+        // status are unrelated to whether its chat endpoint is progressing.
+        misses = 0;
+        onAlive?.();
+        await response.body?.cancel().catch(() => undefined);
+      } catch (error) {
+        // A slow probe says nothing about an active generation.  Only
+        // connection-level failures count toward the dead-server threshold.
+        if (!stopped && !stop.signal.aborted && !timedOut && error instanceof Error && isDefinitiveLocalProbeFailure(error) && ++misses >= LOCAL_MODEL_PROBE_MISSES) {
+          let host = "the local server";
+          try { host = new URL(url).host; } catch { /* URL was validated before driver creation. */ }
+          stop.abort(new Error(`The model server at ${host} stopped answering, so the reply was stopped.`));
+        }
+      } finally {
+        if (probeTimeout) clearTimeout(probeTimeout);
+        probeTimeout = undefined;
+        if (activeProbe === probe) activeProbe = undefined;
+        checking = false;
+      }
+    })().catch((error) => {
+      // Backstop so a probe can never raise an unhandled rejection.  Only the
+      // error name is logged: no key, URL or payload.
+      console.warn(`[openai-compat] local liveness probe failed (${error instanceof Error ? error.name : "unknown"})`);
+    });
+  }, intervalMs);
+  stop.signal.addEventListener("abort", abortProbe);
+  timer.unref?.();
+  return () => {
+    stopped = true;
+    clearInterval(timer);
+    if (probeTimeout) clearTimeout(probeTimeout);
+    stop.signal.removeEventListener("abort", abortProbe);
+    activeProbe?.abort(new DOMException("Local model liveness watcher stopped", "AbortError"));
+    activeProbe = undefined;
+  };
+}
+
+function isDefinitiveLocalProbeFailure(error: Error): boolean {
+  return error instanceof TypeError;
+}
 
 // Default catalog — overwritten by /models when the endpoint answers.
 // Free-tier-friendly defaults so the picker is never empty.
@@ -58,6 +248,8 @@ export interface OpenAICompatConfig {
   models?: Array<string | { id: string; label?: string }>;
   /** Custom icon URL or data URL (SVG, PNG, etc.) */
   iconUrl?: string;
+  /** Per-server idle wait, in whole minutes. Absent keeps the local default. */
+  replyWaitMinutes?: ReplyWaitMinutes;
 }
 
 // Sentry's gen_ai.provider.name for whoever is actually answering.  Every
@@ -78,8 +270,31 @@ export function sentryProviderForUrl(url: string): string {
   return "openai-compat";
 }
 
+/** The output-limit field a KNOWN endpoint documents, or null when the
+ *  endpoint is unrecognized and no field may be sent (a generic
+ *  OpenAI-compatible server is under no obligation to accept either name).
+ *
+ *  Sources (fetched 2026-10-21):
+ *   - OpenAI: `max_completion_tokens`; `max_tokens` deprecated
+ *     (openai-node completions.ts, mirroring platform.openai.com docs).
+ *   - Groq: `max_completion_tokens`; `max_tokens` deprecated
+ *     (https://console.groq.com/docs/api-reference#chat-create).
+ *   - OpenRouter: `max_tokens`
+ *     (https://openrouter.ai/docs/api-reference/chat-completion).
+ */
+export function maxOutputParamForUrl(url: string): "max_tokens" | "max_completion_tokens" | null {
+  const provider = sentryProviderForUrl(url);
+  if (provider === "openai" || provider === "groq") return "max_completion_tokens";
+  if (provider === "openrouter") return "max_tokens";
+  return null;
+}
+
 function decodeConfig(raw: unknown): OpenAICompatConfig {
   const o = (raw ?? {}) as Record<string, unknown>;
+  const parsedReplyWait = ReplyWaitMinutesSchema.optional().safeParse(o.replyWaitMinutes);
+  if (!parsedReplyWait.success) {
+    throw new Error(REPLY_WAIT_RANGE_MESSAGE);
+  }
   const envUrl = process.env.OPENAI_COMPAT_URL;
   const rawModels = Array.isArray(o.models) ? o.models : undefined;
   const models: Array<string | { id: string; label?: string }> = [];
@@ -96,7 +311,7 @@ function decodeConfig(raw: unknown): OpenAICompatConfig {
     }
   }
 
-  return {
+  const decoded: OpenAICompatConfig = {
     url:
       typeof o.url === "string" && o.url
         ? o.url.replace(/\/+$/, "")
@@ -108,6 +323,8 @@ function decodeConfig(raw: unknown): OpenAICompatConfig {
     models: models && models.length > 0 ? models : undefined,
     iconUrl: typeof o.iconUrl === "string" && o.iconUrl.trim() ? o.iconUrl.trim() : undefined,
   };
+  if (parsedReplyWait.data !== undefined) decoded.replyWaitMinutes = parsedReplyWait.data;
+  return decoded;
 }
 
 export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
@@ -141,6 +358,8 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
 
   async create(input: DriverCreateInput<OpenAICompatConfig>): Promise<ProviderInstance> {
     const { instanceId, config } = input;
+    const localEndpoint = isLocalModelEndpoint(config.url);
+    const effectiveReplyWaitMs = replyWaitTimeoutMs(config.url, config.replyWaitMinutes);
     // process.env is process-wide, not per-instance: syncCredentialEnv copies
     // the workspace's openaiCompat.key into process.env.OPENAI_COMPAT_API_KEY
     // (and config.apiKeyEnv usually resolves to that same var) the moment it
@@ -160,15 +379,22 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
         : (process.env[config.apiKeyEnv] ?? process.env["OPENAI_COMPAT_API_KEY"])) ??
       "";
     const listeners = new Set<RuntimeEventListener>();
-    const active = new Map<string, { abort: AbortController; turnId: string; startedAt: number }>();
-    let catalog = DEFAULT_MODELS;
+    const active = new Map<string, { abort: AbortController; turnId: string; startedAt: number; aliveAt: number; maxMs: number }>();
+    // The output-limit field is endpoint-level for the providers above, so
+    // every option of a recognized endpoint carries supportsMaxOutput; an
+    // unrecognized endpoint's catalog stays unmarked and the picker hides
+    // the control.
+    const maxOutputParam = maxOutputParamForUrl(config.url);
+    const stampMaxOutput = (c: ModelCatalog): ModelCatalog =>
+      maxOutputParam === null ? c : { ...c, options: c.options.map((option) => ({ ...option, supportsMaxOutput: true })) };
+    let catalog = stampMaxOutput(DEFAULT_MODELS);
     if (config.models && config.models.length > 0) {
       const options: ModelCatalog["options"] = config.models.map((m) => {
         const id = typeof m === "string" ? m : m.id;
         const label = typeof m === "object" && m.label ? m.label : id;
         return { id, label, custom: true };
       });
-      catalog = { default: options[0].id, options };
+      catalog = stampMaxOutput({ default: options[0].id, options });
     }
 
     const emit = (event: RuntimeEvent) => {
@@ -190,8 +416,13 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
         signal?: AbortSignal;
         tools?: any[];
         onChunk?: () => void;
+        /** The local server answered a liveness probe or sent bytes. */
+        onAlive?: () => void;
         onDelta?: (d: string, streamKind?: "assistant_text" | "reasoning_text") => void;
         onUsage?: (usage: TurnUsage) => void;
+        /** The bot's optional output limit, sent under the field this
+         *  endpoint documents (maxOutputParamForUrl).  Absent sends nothing. */
+        maxOutputTokens?: number;
       },
     ): Promise<{
       text: string;
@@ -203,14 +434,34 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
       if (opts.tools && opts.tools.length > 0) {
         bodyPayload.tools = opts.tools;
       }
+      if (maxOutputParam !== null && opts.maxOutputTokens !== undefined) {
+        bodyPayload[maxOutputParam] = opts.maxOutputTokens;
+      }
       const headers: Record<string, string> = {
         "content-type": "application/json",
       };
       if (apiKey) {
         headers.authorization = `Bearer ${apiKey}`;
       }
-      const signal = opts.signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS);
-      const request = () => fetch(`${config.url}/chat/completions`, {
+      const requestSignal = opts.signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+      const livenessAbort = new AbortController();
+      let lastByteAt = Date.now();
+      const noteByte = () => {
+        lastByteAt = Date.now();
+        opts.onAlive?.();
+        opts.onChunk?.();
+      };
+      const stopWatching = localEndpoint && opts.stream
+        ? watchLocalModelServer(config.url, apiKey, livenessAbort, LOCAL_MODEL_PROBE_INTERVAL_MS, () => lastByteAt, opts.onAlive)
+        : () => undefined;
+      try {
+      const signal = localEndpoint && opts.stream
+        ? AbortSignal.any([requestSignal, livenessAbort.signal])
+        : requestSignal;
+      const send = opts.stream && usesUnboundedFetchForReplyWait(config.url, effectiveReplyWaitMs)
+        ? fetchWithoutNodeNoByteTimeout
+        : fetch;
+      const request = () => send(`${config.url}/chat/completions`, {
         method: "POST",
         headers,
         body: JSON.stringify(bodyPayload),
@@ -218,19 +469,50 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
       });
       let res = await request();
       if (!res.ok && opts.stream && (res.status === 400 || res.status === 422)) {
-        // Some compatible endpoints reject this optional OpenAI field.  Retry
-        // only an explicit validation rejection, before any stream or tools
-        // can run, and keep the original cancellation/deadline budget.
-        const rejection = await res.text().catch(() => "");
+        // Some compatible endpoints reject these optional OpenAI fields.
+        // Retry only an explicit validation rejection, before any stream or
+        // tools can run, and keep the original cancellation/deadline budget.
+        const unsupportedField =
+          /unsupported|not supported|does not support|doesn't support|do not support|cannot support|can't support|not permitted|unrecognized|unknown|unexpected|extra_forbidden/i;
+        let rejection = await res.text().catch(() => "");
+        // One recovery per optional field, in either order: whichever field
+        // the endpoint names first, the retry can surface the other one, so
+        // each recovery re-reads the rejection for the next check.
+        const dropUnsupportedField = async (field: RegExp, strip: () => void): Promise<boolean> => {
+          if (!field.test(rejection) || !unsupportedField.test(rejection)) return false;
+          strip();
+          res = await request();
+          rejection = !res.ok && (res.status === 400 || res.status === 422) ? await res.text().catch(() => "") : "";
+          return true;
+        };
         // Providers phrase the same 400 differently, so the wording check has to
         // cover active voice ("does not support") as well as the adjective and
         // passive forms ("unsupported", "not supported").  Matching only the
         // latter left a plain "This endpoint does not support stream_options"
         // rejection with no retry at all.
-        if (/stream_options/i.test(rejection) &&
-            /unsupported|not supported|does not support|doesn't support|do not support|cannot support|can't support|not permitted|unrecognized|unknown|unexpected|extra_forbidden/i.test(rejection)) {
+        await dropUnsupportedField(/stream_options/i, () => {
           delete bodyPayload.stream_options;
-          res = await request();
+        });
+        // The output-limit field this driver sends is optional too: an
+        // endpoint that rejects max_tokens/max_completion_tokens gets the
+        // same recovery instead of failing the whole turn.
+        if (maxOutputParam !== null && bodyPayload[maxOutputParam] !== undefined) {
+          // The stream_options pass below runs only after a max-output
+          // retry actually fired, so a persistent single-field rejection
+          // still costs exactly one retry.
+          if (
+            await dropUnsupportedField(/max_(completion_)?tokens/i, () => {
+              delete bodyPayload[maxOutputParam];
+            })
+          ) {
+            // The max-output retry can surface a stream_options rejection
+            // the first pass never saw, when the endpoint names the fields
+            // one at a time.  The recovery order must not depend on which
+            // field it reports first.
+            await dropUnsupportedField(/stream_options/i, () => {
+              delete bodyPayload.stream_options;
+            });
+          }
         }
       }
       if (!res.ok) {
@@ -239,7 +521,7 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
         throw httpErrorFor(res.status, "");
       }
       // headers are progress too: the socket answered
-      opts.onChunk?.();
+      noteByte();
       if (!opts.stream) {
         const json: any = await res.json();
         const msg = json.choices?.[0]?.message;
@@ -323,7 +605,7 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
           }
           // Any bytes at all keep the round's idle clock alive, parsed
           // into a delta or not.
-          opts.onChunk?.();
+          noteByte();
           buf += decoder.decode(value, { stream: true });
           let nl;
           while ((nl = buf.indexOf("\n")) !== -1) {
@@ -337,6 +619,9 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
         reader.releaseLock();
       }
       return { text, reasoning, usage, tool_calls: streamToolCalls.length > 0 ? streamToolCalls : undefined };
+      } finally {
+        stopWatching();
+      }
     };
 
     const fetchModels = async (): Promise<void> => {
@@ -369,7 +654,7 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
           options.push({ id, label });
         }
         if (options.length) {
-          catalog = { default: options[0].id, options };
+          catalog = stampMaxOutput({ default: options[0].id, options });
         }
       } catch {
         // keep DEFAULT_MODELS — never fail the instance on a catalog miss
@@ -394,7 +679,8 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
       }
       const turnId = newId();
       const abort = new AbortController();
-      active.set(threadId, { abort, turnId, startedAt: Date.now() });
+      const turnBudget = { ...DEFAULT_TURN_LOOP_BUDGET, ...replyWaitTurnBudget(config.url, config.replyWaitMinutes) };
+      active.set(threadId, { abort, turnId, startedAt: Date.now(), aliveAt: 0, maxMs: turnBudget.wallClockMs });
 
       const openAiTools = turn.tools && turn.tools.length > 0
         ? turn.tools.map((t) => ({
@@ -477,7 +763,12 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
               stream: true,
               signal: opts.signal,
               tools: openAiTools,
+              maxOutputTokens: turn.maxOutputTokens,
               onChunk: opts.onChunk,
+              onAlive: () => {
+                const entry = active.get(threadId);
+                if (entry) entry.aliveAt = Date.now();
+              },
               // `onPublished` before the emit: from here this round can
               // never be retried, because a replay would show the person
               // text they already read.  It also feeds the idle clock.
@@ -527,6 +818,7 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
         // Only `timeoutMs` is read from this; the provider payload is built
         // separately above from name/description/parameters.
         tools: turn.tools,
+        toolResultHistoryChars: turn.toolResultHistoryChars,
         toolHost: turn.toolHost,
         requestApproval: turn.toolHost?.requestApproval
           ? (ask) => turn.toolHost!.requestApproval!(ask)
@@ -535,7 +827,7 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
         // 120s of SILENCE ends a request, as it always has for this driver;
         // a stream that keeps delivering bytes now runs to the loop's hard
         // ceiling instead of being cut off at 120s mid-answer.
-        budget: { requestIdleMs: REQUEST_TIMEOUT_MS },
+        budget: replyWaitTurnBudget(config.url, config.replyWaitMinutes),
         onSettled: () => active.delete(threadId),
       });
 
@@ -595,10 +887,17 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
           const stuck: string[] = [];
           for (const [threadId, entry] of active) {
             if (entry.startedAt > cutoff) continue;
+            // A configured local wait owns its own wall clock; the loop ends
+            // the turn there.  Only sweep it once that has clearly passed.
+            if (Date.now() - entry.startedAt < entry.maxMs + 60_000) continue;
             stuck.push(threadId);
             entry.abort.abort();
           }
           return stuck;
+        },
+        liveTurnThreadIds: () => {
+          const now = Date.now();
+          return [...active].filter(([, entry]) => now - entry.aliveAt < 2 * LOCAL_MODEL_PROBE_INTERVAL_MS).map(([threadId]) => threadId);
         },
         respondToRequest: async () => "unavailable" as const,
         hasSession: (threadId) => active.has(threadId),

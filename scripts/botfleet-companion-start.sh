@@ -18,6 +18,40 @@
 set -euo pipefail
 
 ROOT="${BOTFLEET_COMPANION_ROOT:-$HOME/apps/botfleet-companion}"
+# The runtime root is the release store's pointer, not a git checkout.
+#
+# A checkout is a mutable working tree: a seat's branch can delete files the
+# sidecar still imports, and an update rewrites the tree under a running
+# process.  A promoted release is immutable and named by the commit it holds,
+# and the pointer at ~/.botfleet/current is the only thing that moves when
+# the sidecar changes version.  The pointer wins when it exists;
+# BOTFLEET_COMPANION_ROOT still overrides it, and the legacy checkout path
+# stays the fallback for a machine that has never promoted a release.
+if [ -z "${BOTFLEET_COMPANION_ROOT:-}" ]; then
+  # The COMPANION's own store, not the harness's.  The two version
+  # independently: one pointer would mean swapping the server's release
+  # changes what the sidecar runs, and vice versa, with no way to roll one
+  # back without the other.
+  COMPANION_STORE_POINTER="$HOME/.botfleet-companion/current"
+  if [ -e "$COMPANION_STORE_POINTER" ] || [ -L "$COMPANION_STORE_POINTER" ]; then
+    ROOT="$COMPANION_STORE_POINTER"
+  fi
+fi
+# The published runtime claim, at the path electron/managed-companion-runtime.mjs
+# writes (`managedCompanionRuntimePath`): the supervisor publishes its verified
+# identity there so the desktop app can adopt the sidecar.  `--stop` removes it,
+# mirroring `clearManagedCompanionRuntime` in that module.
+RUNTIME_CLAIM="$HOME/.botfleet-companion/runtime/supervisor.json"
+# The fleet's park marker.  The harness's own start script reads this same
+# file and stays down while it is present,  so a fleet that was shut down on
+# purpose does not come back at the next login.  The companion reads it too:
+# before this gate the companion was the one process here that came back
+# anyway,  and it is the one process here that listens off-machine.
+#
+# The marker is the harness's signal and the harness's script is what clears
+# it.  This script never deletes it,  and a companion-only Start does not
+# clear it either:  the app refuses it,  and the server's Start clears it.
+SHUTDOWN_MARKER="${BOTFLEET_SHUTDOWN_MARKER:-${OMB_DATA_DIR:-$HOME/.botfleet}/stopped.marker}"
 PORT="${BOTFLEET_COMPANION_PORT:-8810}"
 CONTROL_PORT="${BOTFLEET_COMPANION_CONTROL_PORT:-8811}"
 HARNESS_PORT="${BOTFLEET_HARNESS_PORT:-8799}"
@@ -61,7 +95,35 @@ elif [ "$#" -gt 0 ]; then
 fi
 
 if [ "$STOP" = true ]; then
-  log "stop requested"
+  # Remove the published runtime claim, mirroring clearManagedCompanionRuntime:
+  # only the exact regular file the supervisor publishes, never a symlink or
+  # anything else at that path.  An absent claim is already the stopped state,
+  # so a second --stop is a no-op rather than an error.  A symlink or
+  # non-regular file there is not a claim any reader would accept either, so
+  # leave it alone and say so instead of removing a file we did not publish.
+  if [ -L "$RUNTIME_CLAIM" ]; then
+    log "stop requested; $RUNTIME_CLAIM is a symlink, not a published runtime claim; leaving it alone"
+  elif [ -f "$RUNTIME_CLAIM" ] && [ ! -O "$RUNTIME_CLAIM" ]; then
+    log "stop requested; $RUNTIME_CLAIM is not owned by the current user, so it is not a claim this user published; leaving it alone"
+  elif [ -f "$RUNTIME_CLAIM" ]; then
+    rm -f "$RUNTIME_CLAIM"
+    log "stop requested; removed the published runtime claim at $RUNTIME_CLAIM"
+  elif [ -e "$RUNTIME_CLAIM" ]; then
+    log "stop requested; $RUNTIME_CLAIM is not a regular file, so it is not a published runtime claim; leaving it alone"
+  else
+    log "stop requested; no published runtime claim at $RUNTIME_CLAIM"
+  fi
+  exit 0
+fi
+
+# A parked fleet stays parked.  Exit 0 rather than 1,  because the
+# companion's launchd job has KeepAlive and a non-zero exit would be a
+# failed start to restart-loop against.  Nothing is started and nothing is
+# stopped:  the marker means "do not start",  and a companion that is
+# already running is not this script's business.
+if [ -f "$SHUTDOWN_MARKER" ]; then
+  log "stopped.marker present ($SHUTDOWN_MARKER); the fleet was shut down on purpose and the companion stays down."
+  log "Start the BotFleet Server to clear the deliberate stop, or delete that file, to let the companion come back."
   exit 0
 fi
 

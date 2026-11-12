@@ -120,11 +120,11 @@ posixOnly("Zulip source e2e", () => {
         return status.bots.some((bot: any) => bot.botId === created.id && bot.state === "connected");
       }, "the Zulip session to connect");
 
-      fake.postStream(JAY, "agent-sync", "BF e2e tunnel", "@**BF-Plumber** is the tunnel up?", "website");
+      fake.postStream(JAY, "Work-In-Progress", "BF e2e tunnel", "@**BF-Plumber** is the tunnel up?", "website");
 
       await waitFor(() => fake.postsBy(PLUMBER).length > 0, "the reply on Zulip");
       const post = fake.postsBy(PLUMBER)[0]!;
-      expect(post.display_recipient).toBe("agent-sync");
+      expect(post.display_recipient).toBe("Work-In-Progress");
       expect(post.subject).toBe("BF e2e tunnel");
       expect(post.content).toBe("[BF-PLUMBER] Tunnel is up.");
 
@@ -132,7 +132,7 @@ posixOnly("Zulip source e2e", () => {
       // The turn ran in a task of its own for this conversation, never in
       // the owner's active thread, and that task was not switched to.
       expect(bot.messages.some((m: any) => m.automationSource === "zulip")).toBe(false);
-      const task = bot.tasks.find((t: any) => t.title === "Zulip #agent-sync > BF e2e tunnel");
+      const task = bot.tasks.find((t: any) => t.title === "Zulip #Work-In-Progress > BF e2e tunnel");
       expect(task).toBeDefined();
       expect(task.threadId).not.toBe(bot.threadId);
       const thread = (await api("GET", `/api/threads/${task.threadId}/messages`)).body.messages;
@@ -155,7 +155,7 @@ posixOnly("Zulip source e2e", () => {
       const replayed = await fetch(`${BASE}/api/internal/zulip/post`, {
         method: "POST",
         headers: { authorization: ["Bearer", grant].join(" "), "content-type": "application/json" },
-        body: JSON.stringify({ channel: "agent-sync", topic: "BF e2e replay", content: "late" }),
+        body: JSON.stringify({ channel: "Work-In-Progress", topic: "BF e2e replay", content: "late" }),
       });
       expect(replayed.status).toBe(403);
       expect(fake.postsBy(PLUMBER)).toHaveLength(1);
@@ -169,18 +169,18 @@ posixOnly("Zulip source e2e", () => {
       expect(botId).not.toBe("");
       // Followed from the Zulip app (the tool's call is covered in hub.test):
       // the session learns it from the user_topic event.
-      fake.followTopic(PLUMBER, "agent-sync", "BF e2e watch");
+      fake.followTopic(PLUMBER, "Work-In-Progress", "BF e2e watch");
       await waitFor(async () => {
         const status = (await api("GET", "/api/zulip/status")).body;
         return status.bots.some((bot: any) => bot.botId === botId && bot.following === 1);
       }, "the follow to reach the session");
       const before = fake.postsBy(PLUMBER).length;
       // no mention: only the follow makes this a wake
-      fake.postStream(JAY, "agent-sync", "BF e2e watch", "deploy 4326 finished", "website");
+      fake.postStream(JAY, "Work-In-Progress", "BF e2e watch", "deploy 4326 finished", "website");
       let threadId = "";
       await waitFor(async () => {
         const bot = (await api("GET", "/api/bots")).body.bots.find((b: any) => b.id === botId);
-        const task = bot?.tasks.find((t: any) => t.title === "Zulip #agent-sync > BF e2e watch");
+        const task = bot?.tasks.find((t: any) => t.title === "Zulip #Work-In-Progress > BF e2e watch");
         if (!task) return false;
         threadId = task.threadId;
         const thread = (await api("GET", `/api/threads/${threadId}/messages`)).body.messages;

@@ -6,11 +6,11 @@ import {
 } from "./retired-model-ids.ts";
 
 describe("rewriteRetiredModelId", () => {
-  it("maps MiniMax-M3 onto the live Flash Preview id", () => {
-    expect(rewriteRetiredModelId("MiniMax-M3")).toBe("MiniMax-M3.1-Flash-Preview");
+  it("maps MiniMax-M3 onto the live Flash id", () => {
+    expect(rewriteRetiredModelId("MiniMax-M3")).toBe("MiniMax-M3.1-Flash");
   });
 
-  it("maps plain MiniMax-M2.7 onto highspeed, not the Preview row", () => {
+  it("maps plain MiniMax-M2.7 onto highspeed, not the Flash row", () => {
     expect(rewriteRetiredModelId("MiniMax-M2.7")).toBe("MiniMax-M2.7-highspeed");
   });
 
@@ -28,20 +28,45 @@ describe("rewriteRetiredModelId", () => {
     expect(rewriteRetiredModelId("DeepSeek-V4-Pro")).toBe("DeepSeek-V4-Pro");
   });
 
+  it("migrates a saved MiniMax-M3.1 Flash Preview id onto the live Flash id", () => {
+    // MiniMax dropped the `-Preview` suffix, and every engine that serves M3.1
+    // now answers to `MiniMax-M3.1-Flash`, so a bot saved against the old
+    // spelling must be migrated rather than sent a dead id.
+    expect(rewriteRetiredModelId("MiniMax-M3.1-Flash-Preview")).toBe("MiniMax-M3.1-Flash");
+    expect(isRetiredModelId("MiniMax-M3.1-Flash-Preview")).toBe(true);
+  });
+
+  it("migrates a saved MiniMax-M3.1 Flash Preview 1M id onto the live 1M id", () => {
+    // The 1M row has its own id, so the exact-match index needs its own entry
+    // rather than folding onto the 512K row.
+    expect(rewriteRetiredModelId("MiniMax-M3.1-Flash-Preview-1M")).toBe("MiniMax-M3.1-Flash-1M");
+    expect(isRetiredModelId("MiniMax-M3.1-Flash-Preview-1M")).toBe(true);
+  });
+
+  it("migrates a saved mcode thinking id onto the live thinking id", () => {
+    // The mcode picker ids carry the same suffix, so they need their own
+    // entries: an exact-match index cannot fold one into another.
+    expect(rewriteRetiredModelId("MiniMax-M3.1-Flash-Preview-thinking")).toBe("MiniMax-M3.1-Flash-thinking");
+    expect(rewriteRetiredModelId("MiniMax-M3.1-Flash-Preview-thinking-1M")).toBe("MiniMax-M3.1-Flash-thinking-1M");
+    expect(isRetiredModelId("MiniMax-M3.1-Flash-Preview-thinking")).toBe(true);
+  });
+
   it("leaves live catalog ids alone, including near-miss stems", () => {
-    expect(rewriteRetiredModelId("MiniMax-M3.1-Flash-Preview")).toBe("MiniMax-M3.1-Flash-Preview");
+    expect(rewriteRetiredModelId("MiniMax-M3.1-Flash")).toBe("MiniMax-M3.1-Flash");
+    expect(rewriteRetiredModelId("MiniMax-M3.1-Flash-1M")).toBe("MiniMax-M3.1-Flash-1M");
     expect(rewriteRetiredModelId("MiniMax-M2.7-highspeed")).toBe("MiniMax-M2.7-highspeed");
     expect(rewriteRetiredModelId("DeepSeek-V4.1-Flash")).toBe("DeepSeek-V4.1-Flash");
-    expect(rewriteRetiredModelId("MiniMax-M3.1-Flash-Preview-thinking")).toBe(
-      "MiniMax-M3.1-Flash-Preview-thinking",
-    );
+    expect(rewriteRetiredModelId("MiniMax-M3.1-Flash-thinking")).toBe("MiniMax-M3.1-Flash-thinking");
   });
 });
 
 describe("isRetiredModelId", () => {
   it("flags only exact retired spellings", () => {
     expect(isRetiredModelId("MiniMax-M3")).toBe(true);
-    expect(isRetiredModelId("MiniMax-M3.1-Flash-Preview")).toBe(false);
+    expect(isRetiredModelId("MiniMax-M3.1-Flash-Preview")).toBe(true);
+    expect(isRetiredModelId("MiniMax-M3.1-Flash")).toBe(false);
+    expect(isRetiredModelId("MiniMax-M3.1-Flash-1M")).toBe(false);
+    expect(isRetiredModelId("MiniMax-M3.1-Flash-thinking")).toBe(false);
   });
 });
 
@@ -58,9 +83,10 @@ describe("rewriteModelSelection", () => {
     expect(changed).toBe(true);
     expect(selection).toEqual({
       instanceId: "dsh",
-      model: "MiniMax-M3.1-Flash-Preview",
+      // Every engine that serves M3.1 spells it the same way now.
+      model: "MiniMax-M3.1-Flash",
       fallbacks: [
-        { instanceId: "minimax", model: "MiniMax-M3.1-Flash-Preview" },
+        { instanceId: "minimax", model: "MiniMax-M3.1-Flash" },
         { instanceId: "grok", model: "grok-4.6" },
       ],
     });
@@ -86,12 +112,36 @@ describe("rewriteModelSelection", () => {
     });
   });
 
+  it("moves a saved M3.1 Flash Preview selection onto the id every engine offers (BOTFLEET-4E)", () => {
+    const { selection, changed } = rewriteModelSelection({
+      instanceId: "dsh",
+      model: "MiniMax-M3.1-Flash-Preview",
+      effort: "high",
+      fallbacks: [
+        { instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview" },
+        { instanceId: "minimax", model: "MiniMax-M3.1-Flash-Preview" },
+        { instanceId: "mcode", model: "MiniMax-M3.1-Flash-Preview-thinking" },
+      ],
+    });
+    expect(changed).toBe(true);
+    expect(selection).toEqual({
+      instanceId: "dsh",
+      model: "MiniMax-M3.1-Flash",
+      effort: "high",
+      fallbacks: [
+        { instanceId: "dsh", model: "MiniMax-M3.1-Flash" },
+        { instanceId: "minimax", model: "MiniMax-M3.1-Flash" },
+        { instanceId: "mcode", model: "MiniMax-M3.1-Flash-thinking" },
+      ],
+    });
+  });
+
   it("preserves effort and reports unchanged when nothing is retired", () => {
     const input = {
       instanceId: "mcode",
-      model: "MiniMax-M3.1-Flash-Preview-thinking",
+      model: "MiniMax-M3.1-Flash-thinking",
       effort: "high" as const,
-      fallbacks: [{ instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview" }],
+      fallbacks: [{ instanceId: "minimax", model: "MiniMax-M3.1-Flash" }],
     };
     const { selection, changed } = rewriteModelSelection(input);
     expect(changed).toBe(false);
