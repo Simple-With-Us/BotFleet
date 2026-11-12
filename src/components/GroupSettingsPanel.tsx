@@ -16,7 +16,7 @@ import { useStore, getRoomTerminology, type Group, type GroupDefaultResponder } 
 import { effectiveDefaultResponder } from "@/lib/group-routing";
 import { imageAttachmentFromFile } from "@/lib/composer-attachments";
 import { botAvatarUrlFromStoredPath } from "../../shared/bot-avatar";
-import { MausAvatar } from "./Avatar";
+import { BotMascot } from "./Avatar";
 import { cn } from "@/lib/cn";
 import { railAsideClass } from "@/lib/layout-rails";
 
@@ -177,7 +177,7 @@ export function GroupSettingsPanel({ group }: { group: Group }) {
               ) : (
                 <div className="flex size-24 items-center justify-center -space-x-3 rounded-full bg-control p-2 shadow-inner">
                   {members.slice(0, 3).map((b) => (
-                    <MausAvatar
+                    <BotMascot
                       key={b.id}
                       color={b.color}
                       state="happy"
@@ -470,7 +470,7 @@ export function GroupSettingsPanel({ group }: { group: Group }) {
                     )}
                   >
                     <div className="flex min-w-0 items-center gap-2.5">
-                      <MausAvatar color={bot.color} state="happy" size={24} animated={false} />
+                      <BotMascot color={bot.color} state="happy" size={24} animated={false} />
                       <div className="min-w-0">
                         <div className="truncate text-[13px] font-medium text-ink" title={bot.name}>{bot.name}</div>
                         {bot.title && <div className="truncate text-[11px] text-ink-secondary" title={bot.title}>{bot.title}</div>}
@@ -496,7 +496,7 @@ export function GroupSettingsPanel({ group }: { group: Group }) {
               <AlertTriangle size={15} /> Delete Channel
             </div>
             <p className="text-[11.5px] text-ink-secondary">
-              Deleting this channel removes its transcript and task history. Bot definitions are preserved.
+              Deleting this channel removes its transcript and task history.{"\u00a0 "}Bot definitions are preserved.
             </p>
             {confirmDelete ? (
               <div className="mt-2 flex items-center gap-2">

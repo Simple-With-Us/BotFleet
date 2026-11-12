@@ -30,6 +30,13 @@ final class DecodingTests: XCTestCase {
         try JSONDecoder().decode(type, from: try fixture(name))
     }
 
+    func testVoiceClipsDecodeWithOlderMessagesAndNewerReplies() throws {
+        let plain = try JSONDecoder().decode(Message.self, from: Data(#"{"id":"old","role":"bot","kind":"text","at":1,"text":"Hi"}"#.utf8))
+        XCTAssertNil(plain.audio)
+        let voiced = try JSONDecoder().decode(Message.self, from: Data(#"{"id":"new","role":"bot","kind":"text","at":2,"text":"Hi","audio":[{"path":"/api/attachments/clip.mp3","mime":"audio/mpeg"}]}"#.utf8))
+        XCTAssertEqual(voiced.audio?.first?.path, "/api/attachments/clip.mp3")
+    }
+
     // MARK: - Hydration
 
     func testDecodesThePagedFleet() throws {
@@ -564,6 +571,12 @@ final class DecodingTests: XCTestCase {
 
         let config = try decode(ConfigStatus.self, "config")
         XCTAssertEqual(config.profile?.name, "Ada Lovelace")
+        XCTAssertEqual(config.profile?.email, "ada@example.com")
+        XCTAssertEqual(config.rooms?.turnTimeoutMinutes, 5)
+        XCTAssertEqual(config.features?.showToolCalls, true)
+        XCTAssertEqual(config.features?.summarizeToolCalls, true)
+        XCTAssertTrue(config.features?.showsToolCalls ?? false)
+        XCTAssertTrue(config.features?.summarizesToolCalls ?? false)
         XCTAssertEqual(config.box?.configured, false)
         XCTAssertNil(config.conversationMode)
         XCTAssertFalse(config.isProjectsMode)
@@ -590,6 +603,25 @@ final class DecodingTests: XCTestCase {
             from: Data(#"{"instanceId":"legacy","driverKind":"legacy","snapshot":{"state":"available"},"models":{"default":"default","options":[]}}"#.utf8)
         )
         XCTAssertNil(old.capabilities)
+        XCTAssertNotEqual(old.capabilities?.toolLoop, true)
+
+        let loop = try JSONDecoder().decode(
+            Instance.self,
+            from: Data(#"{"instanceId":"grok","driverKind":"grok","snapshot":{"state":"available"},"models":{"default":"grok","options":[]},"capabilities":{"toolLoop":true}}"#.utf8)
+        )
+        XCTAssertEqual(loop.capabilities?.toolLoop, true)
+
+        let capped = try JSONDecoder().decode(
+            Bot.self,
+            from: Data(#"{"id":"b","threadId":"t","name":"N","title":"","description":"","notifications":true,"color":"blue","unread":false,"modelSelection":{"instanceId":"grok","model":"grok"},"createdAt":1,"maxToolRounds":40}"#.utf8)
+        )
+        XCTAssertEqual(capped.maxToolRounds, 40)
+
+        let unset = try JSONDecoder().decode(
+            Bot.self,
+            from: Data(#"{"id":"b2","threadId":"t2","name":"N","title":"","description":"","notifications":true,"color":"blue","unread":false,"modelSelection":{"instanceId":"grok","model":"grok"},"createdAt":1}"#.utf8)
+        )
+        XCTAssertNil(unset.maxToolRounds)
     }
 
     // MARK: - Frames
@@ -638,6 +670,25 @@ final class DecodingTests: XCTestCase {
             return XCTFail("expected .unknown, got \(frame.frame)")
         }
         XCTAssertEqual(kind, "routine.run")
+    }
+
+    func testDecodesAnInstancesFrame() throws {
+        let json = #"{"kind":"instances","seq":4,"describedAt":1,"instances":[]}"#
+        let frame = try JSONDecoder().decode(StreamFrame.self, from: Data(json.utf8))
+        guard case let .instances(list, describedAt) = frame.frame else {
+            return XCTFail("expected .instances, got \(frame.frame)")
+        }
+        XCTAssertTrue(list.isEmpty)
+        XCTAssertEqual(describedAt, 1)
+        XCTAssertEqual(frame.seq, 4)
+    }
+
+    func testDecodesAHiddenEngineSnapshot() throws {
+        let json = #"{"state":"unavailable","hidden":true,"reason":"no Box token"}"#
+        let snapshot = try JSONDecoder().decode(ProviderSnapshot.self, from: Data(json.utf8))
+        XCTAssertTrue(snapshot.isHidden)
+        let plain = try JSONDecoder().decode(ProviderSnapshot.self, from: Data(#"{"state":"available"}"#.utf8))
+        XCTAssertFalse(plain.isHidden)
     }
 
     func testDecodesANotifyFrame() throws {

@@ -57,8 +57,8 @@ test("check() resolves { ok: false } when checkForUpdates rejects and is not sup
   const { updater, coordinator } = harness();
   updater.checkForUpdates = () => Promise.reject(new Error("offline"));
 
-  assert.deepEqual(await coordinator.check(), { ok: false });
-  assert.deepEqual(await coordinator.check(true), { ok: false });
+  assert.deepEqual(await coordinator.check(), { ok: false, errorClass: "Error" });
+  assert.deepEqual(await coordinator.check(true), { ok: false, errorClass: "Error" });
 });
 
 test("check() resolves { ok: false } on a synchronous checkForUpdates throw", async () => {
@@ -67,7 +67,29 @@ test("check() resolves { ok: false } on a synchronous checkForUpdates throw", as
     throw new Error("check threw");
   };
 
-  assert.deepEqual(await coordinator.check(true), { ok: false });
+  assert.deepEqual(await coordinator.check(true), { ok: false, errorClass: "Error" });
+});
+
+// updater.mjs's automatic-failure backoff (electron/updater-throttle.mjs's
+// nextAutoCheckFailureStreak) groups consecutive failures by this field, so
+// electron-updater's actual HttpError shape (name + statusCode, from
+// builder-util-runtime) must classify as one stable, comparable string.
+test("check() classifies a rejection's error class for the automatic-failure streak", async () => {
+  const { updater, coordinator } = harness();
+  const httpError = Object.assign(new Error("HTTP error: 404 https://…/latest-mac.yml"), {
+    name: "HttpError",
+    statusCode: 404,
+  });
+  updater.checkForUpdates = () => Promise.reject(httpError);
+
+  assert.deepEqual(await coordinator.check(), { ok: false, errorClass: "HttpError:404" });
+});
+
+test("check() classifies a rejection with no status as just its name", async () => {
+  const { updater, coordinator } = harness();
+  updater.checkForUpdates = () => Promise.reject(new TypeError("network down"));
+
+  assert.deepEqual(await coordinator.check(), { ok: false, errorClass: "TypeError" });
 });
 
 test("manual check rejection is handled as a user-visible error", async () => {

@@ -6,6 +6,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   attachFeedbackEventDetails,
   buildFallbackIssueUrl,
+  captureException,
+  captureMessage,
   initSentry,
   initSentryFromRuntime,
   isSentryFeedbackAvailable,
@@ -13,11 +15,13 @@ import {
   resetSentryForTests,
   setActiveFeedbackDetailsForTests,
   setObservabilityReaderForTests,
+  setSentryModuleLoaderForTests,
   setSentryPortForTests,
   type ObservabilityReader,
   type RuntimeObservability,
   type SentryBrowserPort,
   type SentryClientOptions,
+  type SentryModule,
 } from "./sentry";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -88,25 +92,30 @@ function fakeHarness(): FakeHarness {
 }
 
 describe("browser Sentry", () => {
-  it("keeps Replay 100% on error / 10% session, Feedback, and mask-all privacy", () => {
+  it("keeps Replay opt-in (100% on error / 10% session when on), Feedback, and mask-all privacy", () => {
     const src = readFileSync(join(ROOT, "src/lib/sentry.ts"), "utf8");
     expect(src).toMatch(/VITE_SENTRY_DSN/);
+    expect(src).toMatch(/replayOptedIn\(\)/);
+    expect(src).toMatch(/\/\^\(true\|1\|on\|yes\)\$\/i/);
     expect(src).toMatch(/replaysSessionSampleRate[\s\S]*\?\? "0\.1"/);
     expect(src).toMatch(/replaysOnErrorSampleRate[\s\S]*\?\? "1\.0"/);
     expect(src).toMatch(/maskAllText:\s*true/);
     expect(src).toMatch(/blockAllMedia:\s*true/);
     expect(src).toMatch(/feedbackIntegration\(/);
     expect(src).toMatch(/autoInject:\s*false/);
-    expect(src).toMatch(/enableLogs:\s*true/);
-    expect(src).toMatch(/sendDefaultPii:\s*false/);
+    expect(src).toMatch(/urlQueryParams:\s*false/);
+    expect(src).not.toMatch(/sendDefaultPii/);
     expect(src).toMatch(/genAI:\s*\{\s*inputs:\s*false,\s*outputs:\s*false/);
+    expect(src).toMatch(/VITE_SENTRY_RELEASE/);
+    expect(src).toMatch(/release:\s*options\.release/);
   });
 
   it("iOS Cocoa reads SENTRY_DSN from Info.plist only", () => {
     const swift = readFileSync(join(ROOT, "ios/App/SentryTelemetry.swift"), "utf8");
     expect(swift).toMatch(/forInfoDictionaryKey: "SENTRY_DSN"/);
-    expect(swift).toMatch(/profilesSampleRate = 0\.1/);
-    expect(swift).toMatch(/sessionReplay\.onErrorSampleRate = 1\.0/);
+    // sentry-cocoa 9 replaced profilesSampleRate with configureProfiling.
+    expect(swift).toMatch(/configureProfiling = \{[^}]*sessionSampleRate = 0\.1/);
+    expect(swift).toMatch(/sessionReplay\.onErrorSampleRate = 0\.1/);
     expect(swift).not.toMatch(/ingest\.sentry\.io/);
     expect(swift).not.toMatch(/\?\? "https:\/\//);
     const yml = readFileSync(join(ROOT, "ios/project.yml"), "utf8");
@@ -158,6 +167,23 @@ describe("renderer diagnostics refresh", () => {
       dsn: ROTATED_DSN,
       environment: "staging",
       tracesSampleRate: 0.5,
+    });
+  });
+
+  it("prefers uiTracesSampleRate over tracesSampleRate when reported by the runtime", async () => {
+    harness.answer({
+      enabled: true,
+      dsn: RUNTIME_DSN,
+      environment: "production",
+      tracesSampleRate: 0.2,
+      uiTracesSampleRate: 0.05,
+    });
+    await initSentryFromRuntime();
+    expect(sentry.record.inits).toHaveLength(1);
+    expect(sentry.record.inits[0]).toMatchObject({
+      dsn: RUNTIME_DSN,
+      environment: "production",
+      tracesSampleRate: 0.05,
     });
   });
 
@@ -255,6 +281,53 @@ describe("renderer diagnostics refresh", () => {
     expect(harness.calls()).toBe(4);
   });
 
+  // BF-2466: Replay must stay off unless a build explicitly opts in, on
+  // both the packaged path and a runtime-DSN client started later.
+  it("keeps Replay off by default on the packaged and runtime paths", async () => {
+    vi.stubEnv("VITE_SENTRY_DSN", BUILD_DSN);
+    initSentry();
+    expect(sentry.record.inits).toHaveLength(1);
+    expect(sentry.record.inits[0]).toMatchObject({
+      dsn: BUILD_DSN,
+      replayEnabled: false,
+      replaysSessionSampleRate: 0,
+      replaysOnErrorSampleRate: 0,
+    });
+
+    harness.answer({ enabled: true, dsn: RUNTIME_DSN, environment: "production", tracesSampleRate: 0.2 });
+    await refreshSentryFromRuntime();
+    expect(sentry.record.inits).toHaveLength(2);
+    expect(sentry.record.inits[1]).toMatchObject({
+      dsn: RUNTIME_DSN,
+      replayEnabled: false,
+      replaysSessionSampleRate: 0,
+      replaysOnErrorSampleRate: 0,
+    });
+  });
+
+  it("enables Replay at 10% session / 100% on error only on explicit opt-in", async () => {
+    vi.stubEnv("VITE_SENTRY_DSN", BUILD_DSN);
+    vi.stubEnv("VITE_SENTRY_REPLAY_ENABLED", "true");
+    initSentry();
+    expect(sentry.record.inits).toHaveLength(1);
+    expect(sentry.record.inits[0]).toMatchObject({
+      dsn: BUILD_DSN,
+      replayEnabled: true,
+      replaysSessionSampleRate: 0.1,
+      replaysOnErrorSampleRate: 1.0,
+    });
+
+    harness.answer({ enabled: true, dsn: RUNTIME_DSN, environment: "production", tracesSampleRate: 0.2 });
+    await refreshSentryFromRuntime();
+    expect(sentry.record.inits).toHaveLength(2);
+    expect(sentry.record.inits[1]).toMatchObject({
+      dsn: RUNTIME_DSN,
+      replayEnabled: true,
+      replaysSessionSampleRate: 0.1,
+      replaysOnErrorSampleRate: 1.0,
+    });
+  });
+
   it("does not start the packaged client before the saved opt-out is known", async () => {
     vi.stubEnv("VITE_SENTRY_DSN", BUILD_DSN);
     let finishBoot: ((value: RuntimeObservability) => void) | undefined;
@@ -335,7 +408,7 @@ describe("renderer diagnostics refresh", () => {
     const hugeMessageWithEmoji = "Error: 🔥 something crashed 🚨 " + "x".repeat(10000) + " 💥";
     const url = buildFallbackIssueUrl("Error in Bot", hugeMessageWithEmoji, 2000);
     expect(url.length).toBeLessThanOrEqual(2000);
-    expect(url).toContain("https://github.com/jaywedgeworth22/BotFleet/issues/new?title=");
+    expect(url).toContain("https://github.com/Simple-With-Us/BotFleet/issues/new?title=");
     expect(url).toContain("Error%20in%20Bot");
     // Verify decodeURIComponent does not throw (meaning surrogate pairs were not split)
     expect(() => decodeURIComponent(url)).not.toThrow();
@@ -347,15 +420,19 @@ describe("renderer diagnostics refresh", () => {
     expect(() => decodeURIComponent(loneUrl)).not.toThrow();
 
     // Verify without native toWellFormed (Safari < 16.4 fallback path)
-    const orig = (String.prototype as unknown as Record<string, unknown>).toWellFormed;
+    interface StringPrototypeWithWellFormed {
+      toWellFormed?: () => string;
+    }
+    const patched = String.prototype as unknown as StringPrototypeWithWellFormed;
+    const orig = patched.toWellFormed;
     try {
-      delete (String.prototype as unknown as Record<string, unknown>).toWellFormed;
+      delete patched.toWellFormed;
       const fallbackUrl = buildFallbackIssueUrl("Fallback \uD800", "Lone \uDC00 and pair \uD83D\uDE00");
       expect(() => decodeURIComponent(fallbackUrl)).not.toThrow();
       expect(fallbackUrl).toContain(encodeURIComponent("\uFFFD"));
       expect(fallbackUrl).toContain(encodeURIComponent("😀"));
     } finally {
-      (String.prototype as unknown as Record<string, unknown>).toWellFormed = orig;
+      patched.toWellFormed = orig;
     }
   });
 
@@ -386,5 +463,92 @@ describe("renderer diagnostics refresh", () => {
     setActiveFeedbackDetailsForTests(null);
     const clearedFeedback = attachFeedbackEventDetails({ type: "feedback" } as import("@sentry/react").Event);
     expect(clearedFeedback.contexts).toBeUndefined();
+  });
+
+  // UI3: @sentry/react is a dynamic import now, so a capture made before
+  // anything ever asked to load it (no init() this session) must not throw
+  // and must not pretend an event was sent.
+  it("captureException/captureMessage drop and report nothing when the SDK was never asked to load", () => {
+    expect(captureException(new Error("boom"))).toBeUndefined();
+    expect(captureMessage("boom")).toBeUndefined();
+  });
+});
+
+// The capture functions and the init/close race below drive the REAL
+// browserPort (sentryPort is left as its default), with the dynamic
+// `import("@sentry/react")` itself swapped for a stand-in — so these cover
+// the loader-and-queue behavior UI3 added without ever loading the real SDK,
+// the same non-goal the fakeSentryPort suite above already keeps.
+describe("browser Sentry capture gate and queue", () => {
+  // Kept as separate typed vi.fn() references, asserted on directly — a
+  // fake cast through `as unknown as SentryModule` would re-type these
+  // members as the real SDK's plain function signatures on the way out,
+  // losing the Mock-only matchers (toHaveBeenCalled, toHaveBeenCalledWith).
+  let fakeInit: ReturnType<typeof vi.fn>;
+  let fakeCaptureException: ReturnType<typeof vi.fn>;
+  let fakeModule: SentryModule;
+  let resolveLoad: ((module: SentryModule) => void) | undefined;
+
+  beforeEach(() => {
+    resetSentryForTests();
+    vi.stubGlobal("window", {});
+    resolveLoad = undefined;
+    fakeInit = vi.fn();
+    fakeCaptureException = vi.fn(() => "fake-event-id");
+    fakeModule = {
+      init: fakeInit,
+      close: () => Promise.resolve(true),
+      getClient: () => undefined,
+      browserTracingIntegration: () => ({}),
+      feedbackIntegration: () => ({}),
+      replayIntegration: () => ({}),
+      ErrorBoundary: () => null,
+      captureException: fakeCaptureException,
+      captureMessage: vi.fn(() => "fake-event-id"),
+      addEventProcessor: vi.fn(),
+      getFeedback: () => undefined,
+    } as unknown as SentryModule;
+    setSentryModuleLoaderForTests(() => new Promise((resolve) => { resolveLoad = resolve; }));
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+    setSentryModuleLoaderForTests(null);
+    resetSentryForTests();
+  });
+
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  it("queues a capture made while the SDK is loading and delivers it once init() resolves", async () => {
+    vi.stubEnv("VITE_SENTRY_DSN", "https://fake@o0.ingest.sentry.io/1");
+    initSentry(); // real browserPort.init() — routed through the fake loader above, not a network import
+
+    const eventId = captureException(new Error("boom"));
+    expect(eventId).toBeUndefined(); // nothing to hand back yet — queued, not sent
+    expect(fakeCaptureException).not.toHaveBeenCalled();
+
+    resolveLoad?.(fakeModule);
+    await settle();
+
+    expect(fakeInit).toHaveBeenCalledTimes(1); // the client actually started
+    expect(fakeCaptureException).toHaveBeenCalledWith(expect.any(Error), undefined);
+  });
+
+  it("cancels a pending init() when an opt-out closes the client before the load resolves", async () => {
+    vi.stubEnv("VITE_SENTRY_DSN", "https://fake@o0.ingest.sentry.io/1");
+    setObservabilityReaderForTests(async () => ({ requestedEnabled: false, enabled: false, dsn: null }));
+
+    initSentry(); // begins loading via the fake loader; sets runtimeIdentity synchronously
+    // requestedEnabled: false → applyRuntimeObservability → closeClient() →
+    // the real browserPort.close(), which bumps the generation synchronously.
+    await refreshSentryFromRuntime();
+
+    resolveLoad?.(fakeModule);
+    await settle();
+
+    // The import resolved AFTER close() asked to cancel it — init() must
+    // never reach the real SDK, or a "closed" client would silently return.
+    expect(fakeInit).not.toHaveBeenCalled();
   });
 });

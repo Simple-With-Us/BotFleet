@@ -1,13 +1,16 @@
 // The bus is the seam every client depends on: events must arrive
 // stamped with their instanceId, cross-driver leaks must be dropped, and
 // neither logging nor a broken listener may take down the stream.
-import { appendFileSync, existsSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { EVENTS_DIR, ensureDirs } from "../config.ts";
 import type { RuntimeEvent } from "../contracts.ts";
+import { LOG_TEE_MAX_STRING_CHARS } from "../redact.ts";
 import { makeFakeDriver } from "../testing/fake-driver.ts";
+import type { ItemIoCapture } from "../../shared/item-io.ts";
+import type { AppendWriter } from "../transcript-retention.ts";
 import { EventBus } from "./bus.ts";
 
 const testEvent = (over: Partial<RuntimeEvent> = {}): RuntimeEvent =>
@@ -33,14 +36,28 @@ async function liveInstance() {
 }
 
 describe("EventBus", () => {
+  // The tee is queued rather than written on the publish path, so a test that
+  // publishes and returns leaves a write in flight.  Every bus a test makes is
+  // drained before the next one resets the directory underneath it.
+  const buses: EventBus[] = [];
+  const makeBus = (...args: ConstructorParameters<typeof EventBus>) => {
+    const bus = new EventBus(...args);
+    buses.push(bus);
+    return bus;
+  };
+
   beforeEach(() => {
     rmSync(EVENTS_DIR, { recursive: true, force: true });
     ensureDirs();
   });
 
+  afterEach(async () => {
+    await Promise.all(buses.splice(0).map((bus) => bus.flush()));
+  });
+
   it("stamps events from an attached adapter with the instanceId", async () => {
     const { instance, emit } = await liveInstance();
-    const bus = new EventBus();
+    const bus = makeBus();
     bus.attach([instance]);
     const seen: RuntimeEvent[] = [];
     bus.subscribe((e) => seen.push(e));
@@ -52,7 +69,7 @@ describe("EventBus", () => {
 
   it("drops events claiming a different driver kind (cross-driver invariant)", async () => {
     const { instance, emit } = await liveInstance();
-    const bus = new EventBus();
+    const bus = makeBus();
     bus.attach([instance]);
     const seen: RuntimeEvent[] = [];
     bus.subscribe((e) => seen.push(e));
@@ -61,9 +78,10 @@ describe("EventBus", () => {
     expect(seen).toHaveLength(0);
   });
 
-  it("tees every published event to the per-thread NDJSON log", () => {
-    const bus = new EventBus();
+  it("tees every published event to the per-thread NDJSON log", async () => {
+    const bus = makeBus();
     bus.publish(testEvent({ threadId: "log-me" }));
+    await bus.flush();
 
     const logged = readFileSync(join(EVENTS_DIR, "log-me.ndjson"), "utf8")
       .trim()
@@ -73,54 +91,154 @@ describe("EventBus", () => {
     expect(logged[0].type).toBe("turn.started");
   });
 
-  it("redacts credential-shaped content before writing the NDJSON log", () => {
+  it("never writes to disk on the publish path — the tee is queued and drained", async () => {
+    const bus = makeBus();
+    const file = join(EVENTS_DIR, "async-tee.ndjson");
+
+    bus.publish(testEvent({ threadId: "async-tee" }));
+    bus.publish(testEvent({ eventId: "ev-2", threadId: "async-tee" }));
+    // The publisher's own stack is where every other bot's turn, the SSE
+    // fan-out and /api/health used to wait for a multi-megabyte append.
+    expect(existsSync(file)).toBe(false);
+    // One write in flight, one still queued behind it.
+    expect(bus.teeStats().pending).toBe(1);
+
+    await bus.flush();
+    expect(existsSync(file)).toBe(true);
+    expect(bus.teeStats().pending).toBe(0);
+  });
+
+  it("writes queued records in publish order, one file and many", async () => {
+    const bus = makeBus();
+    for (let i = 0; i < 25; i += 1) {
+      bus.publish(testEvent({ eventId: `ev-${i}`, threadId: i % 2 === 0 ? "order-a" : "order-b" }));
+    }
+    await bus.flush();
+
+    const idsIn = (threadId: string) =>
+      readFileSync(join(EVENTS_DIR, `${threadId}.ndjson`), "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line).eventId);
+    expect(idsIn("order-a")).toEqual(["ev-0", "ev-2", "ev-4", "ev-6", "ev-8", "ev-10", "ev-12", "ev-14", "ev-16", "ev-18", "ev-20", "ev-22", "ev-24"]);
+    expect(idsIn("order-b")).toEqual(["ev-1", "ev-3", "ev-5", "ev-7", "ev-9", "ev-11", "ev-13", "ev-15", "ev-17", "ev-19", "ev-21", "ev-23"]);
+  });
+
+  it("drops the oldest queued records under write pressure instead of blocking or growing", async () => {
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    let release = () => undefined as void;
+    const blocked = new Promise<void>((resolve) => {
+      release = () => resolve();
+    });
+    let started = false;
+    const append: AppendWriter = async () => {
+      if (started) return;
+      started = true;
+      await blocked;
+    };
+    // A cap of a few hundred bytes is a few events; the point is the shape,
+    // not the size.
+    const bus = makeBus(append, { maxQueuedBytes: 600 });
+    const seen: RuntimeEvent[] = [];
+    bus.subscribe((event) => seen.push(event));
+
+    for (let i = 0; i < 40; i += 1) bus.publish(testEvent({ eventId: `ev-${i}`, threadId: "pressure" }));
+
+    const stats = bus.teeStats();
+    expect(stats.dropped).toBeGreaterThan(5);
+    expect(stats.pendingBytes).toBeLessThanOrEqual(600);
+    // Live delivery never notices: that is the whole point of dropping.
+    expect(seen.filter((event) => event.eventId.startsWith("ev-"))).toHaveLength(40);
+    // A gap in the canonical log is reported in the log itself, once.
+    expect(seen.filter((event) => event.type === "runtime.error")).toHaveLength(1);
+
+    release();
+    await bus.flush();
+    // Summary lines, not one line per dropped record: a log that floods under
+    // pressure is the failure it is reporting.
+    const summaries = errors.mock.calls.filter((call) => String(call[0]).includes("append-queue: dropped"));
+    expect(summaries.length).toBeGreaterThan(0);
+    expect(summaries.length).toBeLessThan(stats.dropped);
+    expect(String(summaries[0][0])).toMatch(/dropped \d+ entr(?:y|ies) \(\d+ bytes\)/);
+    errors.mockRestore();
+  });
+
+  it("redacts credential-shaped content before writing the NDJSON log", async () => {
     const key = `sk-ant-api03-${"abcdefghijklmnopqrstuvwxyz0123456789"}`;
-    const bus = new EventBus();
+    const bus = makeBus();
     bus.publish(testEvent({
       threadId: "redacted-log",
       type: "runtime.error",
       message: `provider returned ${key}`,
     }));
+    await bus.flush();
 
     const logged = readFileSync(join(EVENTS_DIR, "redacted-log.ndjson"), "utf8");
     expect(logged).not.toContain(key);
     expect(logged).toContain("«redacted");
   });
 
-  it("reports an incomplete log once while continuing live delivery", () => {
+  it("elides the tail of a huge string so redaction never scans megabytes", async () => {
+    // The shape that made this the hottest path in the harness: a tool result
+    // carrying a whole file, with a credential in it.
+    const key = `sk-ant-api03-${"abcdefghijklmnopqrstuvwxyz0123456789"}`;
+    const tail = "TAIL-MARKER-THAT-MUST-NOT-REACH-THE-LOG";
+    const message = `read_file returned ${key} then ${"x".repeat(5 * 1024 * 1024)}${tail}`;
+    const bus = makeBus();
+    bus.publish(testEvent({ threadId: "huge", type: "runtime.error", message }));
+    await bus.flush();
+
+    const logged = readFileSync(join(EVENTS_DIR, "huge.ndjson"), "utf8");
+    // The head is still redacted …
+    expect(logged).not.toContain(key);
+    expect(logged).toContain("«redacted");
+    // … the tail is gone rather than unredacted, and says so …
+    expect(logged).not.toContain(tail);
+    expect(logged).toMatch(/\[… \d+ characters elided from log\]/);
+    // … and the record is bounded by the cap rather than by the tool result.
+    expect(logged.length).toBeLessThan(LOG_TEE_MAX_STRING_CHARS + 4096);
+  });
+
+  it("reports an incomplete log once while continuing live delivery", async () => {
     rmSync(EVENTS_DIR, { recursive: true, force: true });
-    const bus = new EventBus();
+    const bus = makeBus();
     const seen: RuntimeEvent[] = [];
     bus.subscribe((e) => seen.push(e));
 
     bus.publish(testEvent());
     bus.publish(testEvent({ eventId: "ev-2", type: "turn.completed", ok: true }));
+    await bus.flush();
 
-    expect(seen).toHaveLength(3);
-    expect(seen[0]).toMatchObject({
+    // Live delivery is synchronous and unaffected by the state of the disk;
+    // the warning follows once the failed write is observed.
+    expect(seen.map((event) => event.eventId).slice(0, 2)).toEqual(["ev-1", "ev-2"]);
+    expect(seen.filter((event) => event.type === "runtime.error")).toHaveLength(1);
+    expect(seen.at(-1)).toMatchObject({
       type: "runtime.error",
       threadId: "thread-1",
       message: expect.stringContaining("event history is incomplete"),
     });
-    expect(seen.slice(1).map((event) => event.eventId)).toEqual(["ev-1", "ev-2"]);
     expect(existsSync(EVENTS_DIR)).toBe(false);
   });
 
-  it("writes the incomplete marker before the first event after logging recovers", () => {
+  it("writes the incomplete marker before the first event after logging recovers", async () => {
     let failing = true;
     const writes: string[] = [];
-    const append: typeof appendFileSync = vi.fn((...args: Parameters<typeof appendFileSync>) => {
+    const append: AppendWriter = vi.fn((_file: string, data: string) => {
       if (failing) throw new Error("disk full");
-      writes.push(String(args[1]));
+      writes.push(data);
     });
-    const bus = new EventBus(append);
+    const bus = makeBus(append);
     const seen: RuntimeEvent[] = [];
     bus.subscribe((event) => seen.push(event));
 
     bus.publish(testEvent());
+    await bus.flush();
     failing = false;
     bus.publish(testEvent({ eventId: "ev-2", type: "turn.completed", ok: true }));
+    await bus.flush();
     bus.publish(testEvent({ eventId: "ev-3" }));
+    await bus.flush();
 
     const recovered = writes[0].trim().split("\n").map((line) => JSON.parse(line));
     expect(recovered.map((event) => event.type)).toEqual(["runtime.error", "turn.completed"]);
@@ -130,7 +248,7 @@ describe("EventBus", () => {
   });
 
   it("a throwing listener does not starve the others", () => {
-    const bus = new EventBus();
+    const bus = makeBus();
     const seen: RuntimeEvent[] = [];
     bus.subscribe(() => {
       throw new Error("bad listener");
@@ -144,7 +262,7 @@ describe("EventBus", () => {
   it("drops a SECOND turn.completed for the same turn (one terminal event per turn)", async () => {
     const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const { instance, emit } = await liveInstance();
-    const bus = new EventBus();
+    const bus = makeBus();
     bus.attach([instance]);
     const seen: RuntimeEvent[] = [];
     bus.subscribe((e) => seen.push(e));
@@ -164,7 +282,7 @@ describe("EventBus", () => {
 
   it("delivers a terminal event for a DIFFERENT turn on the same thread", async () => {
     const { instance, emit } = await liveInstance();
-    const bus = new EventBus();
+    const bus = makeBus();
     bus.attach([instance]);
     const seen: RuntimeEvent[] = [];
     bus.subscribe((e) => seen.push(e));
@@ -177,7 +295,7 @@ describe("EventBus", () => {
 
   it("never guesses: a terminal event with no turnId is always delivered", async () => {
     const { instance, emit } = await liveInstance();
-    const bus = new EventBus();
+    const bus = makeBus();
     bus.attach([instance]);
     const seen: RuntimeEvent[] = [];
     bus.subscribe((e) => seen.push(e));
@@ -190,7 +308,7 @@ describe("EventBus", () => {
 
   it("unsubscribe and detachAll stop delivery", async () => {
     const { instance, emit } = await liveInstance();
-    const bus = new EventBus();
+    const bus = makeBus();
     bus.attach([instance]);
     const seen: RuntimeEvent[] = [];
     const unsub = bus.subscribe((e) => seen.push(e));
@@ -219,7 +337,7 @@ describe("EventBus", () => {
     });
     const inst2 = fake2.created.get("inst-2")!;
 
-    const bus = new EventBus();
+    const bus = makeBus();
     bus.attach([inst1.instance, inst2.instance]);
     const seen: RuntimeEvent[] = [];
     bus.subscribe((e) => seen.push(e));
@@ -230,5 +348,190 @@ describe("EventBus", () => {
 
     expect(seen).toHaveLength(1);
     expect(seen[0].providerInstanceId).toBe("inst-2");
+  });
+});
+
+describe("EventBus tool input and output capture", () => {
+  const buses: EventBus[] = [];
+  const makeBus = (...args: ConstructorParameters<typeof EventBus>) => {
+    const bus = new EventBus(...args);
+    buses.push(bus);
+    return bus;
+  };
+  const recorder = () => {
+    const writes: Array<{ threadId: string; write: { itemId: string; turnId?: string; at?: string; io: ItemIoCapture } }> = [];
+    return { writes, record: (threadId: string, write: (typeof writes)[number]["write"]) => void writes.push({ threadId, write }) };
+  };
+  const logFor = (threadId: string) => {
+    const file = join(EVENTS_DIR, `${threadId}.ndjson`);
+    return existsSync(file) ? readFileSync(file, "utf8") : "";
+  };
+
+  beforeEach(() => {
+    rmSync(EVENTS_DIR, { recursive: true, force: true });
+    ensureDirs();
+  });
+
+  afterEach(async () => {
+    await Promise.all(buses.splice(0).map((bus) => bus.flush()));
+  });
+
+  const started = (over: Partial<RuntimeEvent> = {}) =>
+    testEvent({ type: "item.started", itemType: "tool", itemId: "toolu_1", turnId: "turn-1", title: "Bash", ...over } as Partial<RuntimeEvent>);
+
+  it("hands a driver's capture to the store and strips it from everything downstream", async () => {
+    const sink = recorder();
+    const bus = makeBus(undefined, { itemIo: sink });
+    const seen: RuntimeEvent[] = [];
+    bus.subscribe((event) => seen.push(event));
+    const io: ItemIoCapture = { output: { text: "WHOLE-RESULT-MARKER", truncated: false, length: 19 } };
+    bus.publish(started({ io }));
+    await bus.flush();
+    expect(sink.writes).toEqual([
+      { threadId: "thread-1", write: expect.objectContaining({ itemId: "toolu_1", turnId: "turn-1", io }) },
+    ]);
+    // the wire and the subscribers never see it...
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).not.toHaveProperty("io");
+    expect(JSON.stringify(seen)).not.toContain("WHOLE-RESULT-MARKER");
+    // ...and neither does the event log
+    expect(logFor("thread-1")).not.toContain("WHOLE-RESULT-MARKER");
+    expect(logFor("thread-1")).toContain("toolu_1");
+  });
+
+  it("strips a capture even when no store is attached", async () => {
+    const bus = makeBus();
+    const seen: RuntimeEvent[] = [];
+    bus.subscribe((event) => seen.push(event));
+    bus.publish(started({ io: { input: { text: "x", truncated: false, length: 1 } } }));
+    await bus.flush();
+    expect(seen[0]).not.toHaveProperty("io");
+    expect(logFor("thread-1")).not.toContain('"io"');
+  });
+
+  it("derives the input from an HTTP engine's full JSON arguments", () => {
+    const sink = recorder();
+    const bus = makeBus(undefined, { itemIo: sink });
+    bus.publish(started({ arguments: '{"path":"a.ts"}' } as Partial<RuntimeEvent>));
+    expect(sink.writes).toHaveLength(1);
+    expect(sink.writes[0].write.io.input?.text).toBe('{\n  "path": "a.ts"\n}');
+    expect(sink.writes[0].write.io.output).toBeUndefined();
+  });
+
+  it("files the settled arguments and the result of a completed tool together", () => {
+    const sink = recorder();
+    const bus = makeBus(undefined, { itemIo: sink });
+    bus.publish(
+      testEvent({
+        type: "item.completed",
+        itemType: "tool",
+        itemId: "call_1",
+        ok: true,
+        arguments: '{"n":1}',
+        io: { output: { text: "done", truncated: false, length: 4 } },
+      } as Partial<RuntimeEvent>),
+    );
+    expect(sink.writes[0].write.io.input?.text).toBe('{\n  "n": 1\n}');
+    expect(sink.writes[0].write.io.output?.text).toBe("done");
+  });
+
+  const completedTool = (over: Partial<RuntimeEvent> = {}) =>
+    testEvent({
+      type: "item.completed",
+      itemType: "tool",
+      itemId: "toolu_1",
+      turnId: "turn-1",
+      ok: true,
+      io: { output: { text: "done", truncated: false, length: 4 } },
+      ...over,
+    } as Partial<RuntimeEvent>);
+
+  it("files the same arguments once when a step starts and completes with the same string", () => {
+    const sink = recorder();
+    const bus = makeBus(undefined, { itemIo: sink });
+    bus.publish(started({ arguments: '{"path":"a.ts"}' } as Partial<RuntimeEvent>));
+    bus.publish(completedTool({ arguments: '{"path":"a.ts"}' } as Partial<RuntimeEvent>));
+    // the input is written with the start; the completion adds only the result
+    expect(sink.writes.map((entry) => [entry.write.io.input?.text, entry.write.io.output?.text])).toEqual([
+      ['{\n  "path": "a.ts"\n}', undefined],
+      [undefined, "done"],
+    ]);
+  });
+
+  it("files the settled arguments again when they changed since the step started", () => {
+    const sink = recorder();
+    const bus = makeBus(undefined, { itemIo: sink });
+    // a streamed engine announces the call off its first fragment
+    bus.publish(started({ arguments: '{"pa' } as Partial<RuntimeEvent>));
+    bus.publish(completedTool({ arguments: '{"path":"a.ts"}' } as Partial<RuntimeEvent>));
+    expect(sink.writes).toHaveLength(2);
+    expect(sink.writes[0].write.io.input?.text).toBe('{"pa');
+    expect(sink.writes[1].write.io.input?.text).toBe('{\n  "path": "a.ts"\n}');
+    expect(sink.writes[1].write.io.output?.text).toBe("done");
+  });
+
+  it("keeps steps of different threads and ids apart, and forgets a step once it completes", () => {
+    const sink = recorder();
+    const bus = makeBus(undefined, { itemIo: sink });
+    const args = { arguments: '{"n":1}' } as Partial<RuntimeEvent>;
+    bus.publish(started({ ...args, threadId: "thread-a" }));
+    // the same item id on another thread was never announced there
+    bus.publish(completedTool({ ...args, threadId: "thread-b" }));
+    expect(sink.writes.map((entry) => entry.threadId)).toEqual(["thread-a", "thread-b"]);
+    expect(sink.writes[1].write.io.input?.text).toBe('{\n  "n": 1\n}');
+    // a finished step is dropped from the memory: an id the engine reuses is filed afresh
+    bus.publish(completedTool({ ...args, threadId: "thread-a" }));
+    bus.publish(started({ ...args, threadId: "thread-a" }));
+    const inputs = sink.writes.filter((entry) => entry.threadId === "thread-a" && entry.write.io.input);
+    expect(inputs).toHaveLength(2);
+  });
+
+  it("does not record an event with nothing to record, or no item id to key it by", () => {
+    const sink = recorder();
+    const bus = makeBus(undefined, { itemIo: sink });
+    bus.publish(started());
+    bus.publish(started({ itemId: undefined, io: { output: { text: "x", truncated: false, length: 1 } } }));
+    bus.publish(testEvent({ type: "content.delta", streamKind: "assistant_text", delta: "hi" } as Partial<RuntimeEvent>));
+    expect(sink.writes).toEqual([]);
+  });
+
+  it("carries an injected context record's full text to the store and only its preview on the event", async () => {
+    const sink = recorder();
+    const bus = makeBus(undefined, { itemIo: sink });
+    const seen: RuntimeEvent[] = [];
+    bus.subscribe((event) => seen.push(event));
+    bus.publish(
+      testEvent({
+        type: "context.injected",
+        itemId: "ctx-1",
+        source: "memory",
+        preview: "likes tea",
+        bytes: 900,
+        io: { text: { text: "FULL-INJECTED-TEXT", truncated: false, length: 18 } },
+      } as Partial<RuntimeEvent>),
+    );
+    await bus.flush();
+    expect(sink.writes[0].write.io.text?.text).toBe("FULL-INJECTED-TEXT");
+    expect(JSON.stringify(seen)).not.toContain("FULL-INJECTED-TEXT");
+    expect(logFor("thread-1")).toContain("likes tea");
+    expect(logFor("thread-1")).not.toContain("FULL-INJECTED-TEXT");
+  });
+
+  it("delivers the event even when the store throws", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const bus = makeBus(undefined, {
+      itemIo: {
+        record: () => {
+          throw new Error("store down");
+        },
+      },
+    });
+    const seen: RuntimeEvent[] = [];
+    bus.subscribe((event) => seen.push(event));
+    bus.publish(started({ io: { output: { text: "x", truncated: false, length: 1 } } }));
+    await bus.flush();
+    expect(seen).toHaveLength(1);
+    expect(error).toHaveBeenCalled();
+    error.mockRestore();
   });
 });

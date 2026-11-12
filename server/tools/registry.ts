@@ -81,6 +81,27 @@ export interface ToolGateContext {
    *  "act on a git repo" only has to change what callers pass in, not this
    *  interface or the registry records. */
   github?: boolean;
+  /** The Linq partner-API is bound to this bot's phone number for this turn.
+   *  When true, `send_voice_message` is offered; false/undefined removes it
+   *  from the catalog entirely.  Set only when the operator opted this bot
+   *  into Linq, has a workspace bot number configured, AND enabled voice
+   *  (`imessageLinq.allowVoiceByDefault`). */
+  linq?: boolean;
+  /** The background job tools (job_start, job_output, job_list, job_kill)
+   *  are mounted this turn: the engine runs BotFleet's emulated jobs
+   *  (`capabilities.backgroundJobs === "emulated"`), the bot holds This
+   *  Computer, and the owner has not switched jobs off.  Deliberately
+   *  independent of `agents` and the comms depth: a job is the bot's own
+   *  work, not a hop to a peer. */
+  jobs?: boolean;
+  /** This bot holds a connected Zulip identity (server/zulip/hub.ts), so
+   *  `zulip_reply` and `zulip_post` are offered.  Independent of `agents`
+   *  and the comms depth: posting as yourself is not a hop to a peer. */
+  zulip?: boolean;
+  /** The HTTP tool loop is storing oversized tool results as artifacts.
+   *  `read_tool_result` is offered only together with some other tool that
+   *  can produce a result. */
+  toolResultArchive?: boolean;
 }
 
 /** How a tool asks a person before it runs.  Consumed by the permission
@@ -90,6 +111,23 @@ export interface ToolApproval {
   policy: "never" | "ask";
   /** One line for the card, built from the model's arguments. */
   summary(args: Record<string, unknown>): string;
+  /** A narrower ask: this tool needs a card ONLY when the condition holds.
+   *
+   *  A read tool is normally silent — that is the point of a read tool, and
+   *  `list_bots` must not put a card in front of anyone.  But reading the
+   *  one file that holds every provider key is not the same act as reading
+   *  `src/index.ts`, so `read_file` carries a condition rather than a
+   *  blanket ask.  A tool with a condition is still an `ask` tool: the
+   *  condition narrows WHEN, and the guards behind the broker (auto mode,
+   *  always-allow, the sensitive list, the unattended block) still decide
+   *  the answer.
+   *
+   *  The condition is a NAME rather than a predicate because this file
+   *  imports nothing (see the header: `agents-proxy` renders the catalog
+   *  from it inside a bare child process) — and because the host, not the
+   *  catalog, is the layer that knows the turn's working directory, which
+   *  is what resolving a relative path needs. */
+  condition?: "sensitive-file-path";
 }
 
 /** A wire shape one lane is pinned to and the other is not.
@@ -119,6 +157,16 @@ export interface HarnessTool {
   /** The sentence the system prompt may use to introduce this tool.  It is a
    *  FIELD ON THE TOOL so prompt copy cannot outlive the tool it describes. */
   promptFragment?: string;
+  /** How long the driver tool loop may let THIS tool run, overriding the
+   *  loop's uniform per-tool ceiling.
+   *
+   *  The uniform clock exists to catch a call that has hung, and 90s is right
+   *  for a file read or a shell command.  It is wrong for a tool whose whole
+   *  job is to wait on something slower — `ask_bot` runs a peer's entire turn
+   *  and was being cut off well under the three minutes the fleet already
+   *  documents for a peer reply.  Declared here, next to the tool it bounds,
+   *  so the number cannot drift away from the behaviour that needs it. */
+  timeoutMs?: number;
   approval?: ToolApproval;
   wire?: Partial<Record<ToolSurface, ToolWireDeviation>>;
 }
@@ -136,6 +184,11 @@ export interface HttpToolDefinition {
   name: string;
   description: string;
   parameters: JsonSchemaObject;
+  /** Per-tool run ceiling, honoured by the chat-completions loop.  Absent
+   *  means the loop's uniform `toolTimeoutMs`.  Drivers pick `name`,
+   *  `description`, and `parameters` explicitly when they build the provider
+   *  payload, so this never reaches the wire. */
+  timeoutMs?: number;
 }
 
 const peerComms = (ctx: ToolGateContext) => ctx.agents && ctx.commsDepth < ctx.maxCommsDepth;
@@ -146,7 +199,7 @@ const LIST_BOTS: HarnessTool = {
   // already see.  The HTTP lane used to say something different and less
   // true (it did not mention `busy`, which it now reports).
   description:
-    "List the other bots (agents) in your BotFleet section you can message, with their model and whether they're busy. Call this before ask_bot to discover who's available.",
+    "List the other bots (agents) in your BotFleet section you can message, with their model and whether they're busy. Call this before coordinate_bots to discover who's available.",
   schema: { type: "object", properties: {} },
   surfaces: { mcp: true, http: true },
   gate: peerComms,
@@ -156,54 +209,73 @@ const LIST_BOTS: HarnessTool = {
     "Use list_bots to see the other bots in your section, with their model and whether they are busy.",
 };
 
-const ASK_BOT: HarnessTool = {
-  name: "ask_bot",
+const COORDINATE_BOTS: HarnessTool = {
+  name: "coordinate_bots",
   description:
-    "Send a message to another bot in your section and wait for its reply. Use it to delegate a subtask to a specialist bot or ask a peer a question. The other bot runs a full turn under its own model and permissions; the reply is returned to you as text. Returns promptly with a note if that bot is busy.",
+    "Hand work to one or more bots in your section.  Returns as soon as the handoff is recorded.  The peers run after this turn, under their own models and permissions, and a reply of \"resume\" brings their results back to this conversation.  Use assignment_status to read a handoff without waiting.",
   schema: {
     type: "object",
     properties: {
-      bot_id: { type: "string", description: "The target bot's id (from list_bots)." },
-      message: { type: "string", description: "What to say / ask the bot." },
+      bot_ids: {
+        type: "array",
+        items: { type: "string" },
+        description: "Target bot ids or @names from list_bots.",
+      },
+      message: { type: "string", description: "The task or question, self-contained." },
+      reason: { type: "string", description: "Optional one-line reason, shown to the user as a chip." },
+      rework: { type: "boolean", description: "Run the same brief again even if this turn already handed it to that bot." },
+      thread: {
+        type: "string",
+        enum: ["standing", "new"],
+        description: "standing keeps the peer's current conversation.  new opens a separate thread.  Default standing.",
+      },
+      reply: {
+        type: "string",
+        enum: ["resume", "none"],
+        description: "resume wakes this conversation with the result.  none sends the work and nothing comes back.  Default resume.",
+      },
+      consult: { type: "boolean", description: "Ask the peer to answer from what it knows and act on nothing." },
+      done_when: { type: "string", description: "Optional completion criterion the peer should meet." },
     },
-    required: ["bot_id", "message"],
+    required: ["bot_ids", "message"],
   },
   surfaces: { mcp: true, http: true },
   gate: peerComms,
   sideEffect: "write",
   settles: "immediate",
   promptFragment:
-    "Use ask_bot to send a peer a task and wait for its reply; pass the bot's id or @name from list_bots.",
-  // Starting a peer's turn spends that bot's tokens under its own model and
-  // permissions, so it is the one registry tool a person may want to see
-  // first.  The verdict itself is NOT decided here: the ask goes through
-  // the same fold a CLI engine's does, so this bot's existing auto-approve,
-  // always-allow and unattended settings decide it — no per-tool switch.
+    "Use coordinate_bots to hand work to peers from list_bots.  It returns immediately.  reply \"resume\" (the default) brings the result back to this conversation when the work finishes; reply \"none\" does not.  Use assignment_status to check a handoff.  A peer that is busy waits.  Do not invent a result you have not been given.",
   approval: {
     policy: "ask",
     summary: (args) => {
-      const target = typeof args.bot_id === "string" ? args.bot_id : "another bot";
-      const raw = typeof args.task === "string" ? args.task : typeof args.message === "string" ? args.message : "";
+      const ids = Array.isArray(args.bot_ids)
+        ? args.bot_ids.map((id) => String(id)).filter(Boolean).join(", ")
+        : typeof args.bot_id === "string"
+          ? args.bot_id
+          : "another bot";
+      const raw = typeof args.message === "string" ? args.message : "";
       const text = raw.replace(/\s+/g, " ").trim();
-      return text ? `ask ${target}: ${text.slice(0, 160)}` : `ask ${target}`;
+      return text ? `hand to ${ids}: ${text.slice(0, 120)}` : `hand to ${ids}`;
     },
   },
-  wire: {
-    http: {
-      reason:
-        "The HTTP lane shipped this argument as `task`, and renaming it on the wire would break in-flight MiniMax and OpenRouter turns whose transcripts already contain the old spelling.  The executor accepts both names, so the two lanes run one body; only the advertised name differs.",
-      description:
-        "Send a message to another bot in your section and wait for its reply.  The other bot runs a full turn under its own model and permissions; the reply is returned to you as text.  Pass either the bot's id or `@name` from list_bots.",
-      schema: {
-        type: "object",
-        properties: {
-          bot_id: { type: "string", description: "The target bot's id (from list_bots) or `@name`." },
-          task: { type: "string", description: "What to say / ask the bot." },
-        },
-        required: ["bot_id", "task"],
-      },
+};
+
+const ASSIGNMENT_STATUS: HarnessTool = {
+  name: "assignment_status",
+  description:
+    "Read durable handoffs for this conversation.  Pass an assignment id for that one handoff and its children, or omit it for everything this conversation is still waiting on.  This does not start, stop, or change any work.",
+  schema: {
+    type: "object",
+    properties: {
+      id: { type: "string", description: "Optional assignment id from coordinate_bots." },
     },
   },
+  surfaces: { mcp: true, http: true },
+  gate: peerComms,
+  sideEffect: "read",
+  settles: "immediate",
+  promptFragment:
+    "Use assignment_status to read a handoff you already recorded.  It never starts or stops work.",
 };
 
 /** Only a chief may build a team, and it is still a peer-comms-shaped
@@ -218,46 +290,10 @@ const chiefOnly = (ctx: ToolGateContext) => ctx.agents && ctx.chiefOfStaff;
  *  routines. */
 const anyAgentsBot = (ctx: ToolGateContext) => ctx.agents;
 
-const DELEGATE_BOT: HarnessTool = {
-  name: "delegate_bot",
-  description:
-    "Hand a task to another bot ASYNCHRONOUSLY: returns immediately and the peer runs after your current turn finishes. Use this when you want to keep working or hand off a long-running subtask without waiting. The user sees the peer's reply as its own turn; you do NOT receive the reply inline.",
-  schema: {
-    type: "object",
-    properties: {
-      bot_id: { type: "string", description: "The target bot's id (from list_bots)." },
-      message: { type: "string", description: "What the peer should do / answer." },
-      reason: {
-        type: "string",
-        description: "Optional one-line reason for the delegation (shown to the user as a chip).",
-      },
-    },
-    required: ["bot_id", "message"],
-  },
-  surfaces: { mcp: true, http: true },
-  gate: peerComms,
-  sideEffect: "write",
-  settles: "immediate",
-  promptFragment:
-    "Use delegate_bot to hand a task to a peer asynchronously when you do not need its reply inline; the user sees the peer's reply as its own turn.",
-  // Starting a peer's turn spends its tokens, same as ask_bot — and unlike
-  // ask_bot, this one runs after the current turn ends, so a denied
-  // delegation must never have been queued in the first place.
-  approval: {
-    policy: "ask",
-    summary: (args) => {
-      const target = typeof args.bot_id === "string" ? args.bot_id : "another bot";
-      const raw = typeof args.message === "string" ? args.message : "";
-      const text = raw.replace(/\s+/g, " ").trim();
-      return text ? `delegate to ${target}: ${text.slice(0, 120)}` : `delegate to ${target}`;
-    },
-  },
-};
-
 const CREATE_BOT: HarnessTool = {
   name: "create_bot",
   description:
-    "Create a specialist bot in your section. Only a section's Chief of Staff may use this. The new bot inherits the Chief's engine, starts with connected apps and automatic approvals disabled, and can then receive work through delegate_bot. Create only the smallest useful team (maximum four per turn).",
+    "Create a specialist bot in your section. Only a section's Chief of Staff may use this. The new bot inherits the Chief's engine, starts with connected apps and automatic approvals disabled, and can then receive work through coordinate_bots. Create only the smallest useful team (maximum four per turn).",
   schema: {
     type: "object",
     properties: {
@@ -275,7 +311,7 @@ const CREATE_BOT: HarnessTool = {
   sideEffect: "write",
   settles: "immediate",
   promptFragment:
-    "If you are the Chief of Staff, use create_bot to add a specialist to your team (up to four per turn), then delegate_bot to assign it work.",
+    "If you are the Chief of Staff, use create_bot to add a specialist to your team (up to four per turn), then coordinate_bots to assign it work.",
 };
 
 /** Mirrors `CREDENTIAL_TARGETS` in `shared/credential-request.ts`.
@@ -319,6 +355,32 @@ const REQUEST_CREDENTIAL: HarnessTool = {
   settles: "suspend",
   promptFragment:
     "If a supported API key is missing, use request_credential to show the secure in-app card. Never ask the user to paste credentials into chat.",
+};
+
+const REQUEST_SIGN_IN: HarnessTool = {
+  name: "request_sign_in",
+  description:
+    "Ask the person to sign in to a website on the computer where you work. Use this instead of asking them to paste a password or one-time code into chat. One Sign in needed card is shown. After calling this tool, end the turn; BotFleet resumes after they press Done or Cancel. You never receive the password.",
+  schema: {
+    type: "object",
+    properties: {
+      site: {
+        type: "string",
+        description: "The site hostname, for example example.com. Not a password, not a username, and not a URL with a path.",
+      },
+      reason: {
+        type: "string",
+        description: "Optional short, non-sensitive explanation of why the task needs the sign-in.",
+      },
+    },
+    required: ["site"],
+  },
+  surfaces: { mcp: true, http: true },
+  gate: anyAgentsBot,
+  sideEffect: "write",
+  settles: "suspend",
+  promptFragment:
+    "When a task needs a website sign-in, use request_sign_in. Never ask the person to paste a password or one-time code into chat.",
 };
 
 const WEEKDAYS_ENUM = [
@@ -385,8 +447,8 @@ const ROUTINE_FIELDS_SCHEMA = {
   schedule: ROUTINE_SCHEDULE_SCHEMA,
   run_on: {
     type: "string",
-    enum: ["maus", "cloud"],
-    description: "Where the routine runs. Defaults to maus (this BotFleet setup).",
+    enum: ["bot", "cloud", "maus"],
+    description: "Where the routine runs. Defaults to bot (this BotFleet setup). Legacy value maus is accepted and stored as bot.",
   },
   duration_minutes: {
     type: "integer",
@@ -448,8 +510,18 @@ const PROPOSE_ROUTINE_ACTION: HarnessTool = {
 const LIST_ROUTINES: HarnessTool = {
   name: "list_routines",
   description:
-    "List routines owned by this bot, including their ids, schedules, status, and next run. The result includes the computer's authoritative current time and timezone; use those when interpreting relative dates. Only call this when the user asks about routines or wants to change one.",
-  schema: { type: "object", additionalProperties: false, properties: {} },
+    "List routines owned by this bot with ids, schedules, status, next run, and short instruction previews.  The result includes the computer's authoritative current time and timezone; use those when interpreting relative dates.  To retrieve full instructions for one routine, call list_routines with its routine_id from the list.  Only call this when the user asks about routines or wants to change one.",
+  schema: {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      routine_id: {
+        type: "string",
+        minLength: 1,
+        description: "Optional routine id from the list; returns full instructions for only that routine.",
+      },
+    },
+  },
   surfaces: { mcp: true, http: true },
   // Not a peer hop, so the recursion ceiling does not apply: a bot four
   // hops deep can still be asked what it has scheduled.  It rides the
@@ -458,7 +530,7 @@ const LIST_ROUTINES: HarnessTool = {
   sideEffect: "read",
   settles: "immediate",
   promptFragment:
-    "Use list_routines to read this bot's scheduled work, and treat the current time it returns as authoritative for relative dates.",
+    "Use list_routines to read this bot's scheduled work, and treat the current time it returns as authoritative for relative dates.  The list contains short instruction previews; pass a routine_id from the list to retrieve that routine's full instructions.",
 };
 
 /** The `create_bot` per-turn cap, shared so the two lanes cannot drift on
@@ -484,6 +556,49 @@ const phoneEnabled = (ctx: ToolGateContext) => Boolean(ctx.phone);
 // so a future caller can grant one without the other by changing what it
 // passes in, without touching this predicate or these records.
 const githubEnabled = (ctx: ToolGateContext) => Boolean(ctx.github);
+const toolResultArchive = (ctx: ToolGateContext) =>
+  ctx.toolResultArchive === true &&
+  Boolean(
+    ctx.agents ||
+      ctx.localComputer ||
+      ctx.workspace ||
+      ctx.recall ||
+      ctx.phone ||
+      ctx.linq ||
+      ctx.jobs ||
+      ctx.zulip ||
+      ctx.github,
+  );
+
+const READ_TOOL_RESULT: HarnessTool = {
+  name: "read_tool_result",
+  description:
+    "Read the full text of a tool result that later rounds only kept as a head, a tail, and an artifact id. Pass the artifact_id from the truncation notice. offset and limit read a character window when the full text is larger than you need.",
+  schema: {
+    type: "object",
+    properties: {
+      artifact_id: {
+        type: "string",
+        description: "The artifact id named in the truncated tool result.",
+      },
+      offset: {
+        type: "integer",
+        minimum: 0,
+        description: "Optional character offset into the stored text. Defaults to the start.",
+      },
+      limit: {
+        type: "integer",
+        minimum: 1,
+        description: "Optional maximum number of characters to return. Omit to return the full stored text.",
+      },
+    },
+    required: ["artifact_id"],
+  },
+  surfaces: { mcp: false, http: true },
+  gate: toolResultArchive,
+  sideEffect: "read",
+  settles: "immediate",
+};
 
 const BASH: HarnessTool = {
   name: "bash",
@@ -518,7 +633,7 @@ const BASH: HarnessTool = {
 const READ_FILE: HarnessTool = {
   name: "read_file",
   description:
-    "Read the text content of a file on the host computer. Optionally specify offset (1-based line number) and limit (number of lines to read) for large files.",
+    "Read the text content of a file on the host computer, returned with 1-based line numbers.  limit defaults to 400 lines when omitted, and the result is capped at 64 KB even for a larger explicit limit, so one call can never return an unbounded amount of text.  When the result is truncated it ends with a notice naming the exact offset to pass next — call read_file again with that offset to page through the rest of the file.",
   schema: {
     type: "object",
     properties: {
@@ -529,12 +644,14 @@ const READ_FILE: HarnessTool = {
       offset: {
         type: "integer",
         minimum: 1,
-        description: "Optional 1-based line number to start reading from.",
+        description:
+          "Optional 1-based line number to start reading from.  Use this to page through a file: when a read_file result is truncated (by the 400-line default limit or the 64 KB cap), pass offset=<next line> from the truncation notice to continue.",
       },
       limit: {
         type: "integer",
         minimum: 1,
-        description: "Optional maximum number of lines to read.",
+        description:
+          "Optional maximum number of lines to read.  Defaults to 400 when omitted.  The result is also capped at 64 KB regardless of limit, so a very large explicit limit can still be cut short by the byte cap.  If the response is truncated it says so and names the offset to pass next.",
       },
     },
     required: ["path"],
@@ -543,7 +660,22 @@ const READ_FILE: HarnessTool = {
   gate: workspaceOrHostComputer,
   sideEffect: "read",
   settles: "immediate",
-  promptFragment: "Use read_file to inspect files in the workspace.",
+  promptFragment:
+    "Use read_file to inspect files in the workspace; it returns 400 lines at most by default, and a truncated result names the offset to pass next.",
+  // A read is silent — except when the file being read IS a credential store.
+  // `.ssh/id_ed25519` and BotFleet's own `~/.botfleet/config.json` were both
+  // readable with no card at all, in auto mode and out of it. The host
+  // resolves the path against this turn's working directory and asks only
+  // when the resolved absolute path hits the same sensitive list the
+  // destructive guard uses, so `read_file src/index.ts` stays free.
+  approval: {
+    policy: "ask",
+    condition: "sensitive-file-path",
+    summary: (args) => {
+      const p = typeof args.path === "string" ? args.path : "file";
+      return `read file ${p}`;
+    },
+  },
 };
 
 const WRITE_FILE: HarnessTool = {
@@ -1017,15 +1149,279 @@ const GITHUB_ISSUE_LIST: HarnessTool = {
   settles: "immediate",
 };
 
+/** The Linq voice-message tool is offered only when the dispatch bound the
+ *  current bot to a Linq phone number — turning a hosted TTS transcription
+ *  into an iMessage audio attachment is too billing-sensitive to be on by
+ *  default.  The first-party hosted TTS driver (`server/tts/index.ts`)
+ *  reads the workspace's voice config; the synthesized bytes cross the
+ *  partner API as an mp3 attachment because that is the smallest universal
+ *  audio container Linq accepts. */
+const linqEnabled = (ctx: ToolGateContext) => Boolean(ctx.linq);
+
+const LINQ_VOICE_MESSAGE: HarnessTool = {
+  name: "send_voice_message",
+  description:
+    "Synthesize a spoken reply with the workspace's hosted TTS and ship it as an iMessage audio attachment to a Linq-bound bot's caller. Use this when text would land poorly — quick voice notes, hands-busy replies, or persona-driven announcements — and only when the operator opted the bot into voice. Refuses silently when the bot has no Linq binding; check the bot's transport setting before invoking.",
+  schema: {
+    type: "object",
+    properties: {
+      chat_id: {
+        type: "string",
+        description:
+          "The Linq chat id the inbound arrived on. Pass it back unchanged so the audio lands in the same thread that triggered the reply. Omit it when the server already bound this turn to the inbound chat — the runtime fills it in from the turn's binding.",
+      },
+      text: {
+        type: "string",
+        description:
+          "What the voice note should say. Keep it under 30 seconds of speech (~600 characters) unless the operator asked for longer; longer is fine but consumes TTS quota.",
+      },
+      voice: {
+        type: "string",
+        description:
+          "Optional voice id override; defaults to the workspace's configured voice. Use the operator's chosen voice rather than picking freely — they curate this choice.",
+      },
+    },
+    required: ["text"],
+  },
+  surfaces: { mcp: false, http: true },
+  gate: linqEnabled,
+  sideEffect: "write",
+  settles: "immediate",
+  promptFragment:
+    "Use send_voice_message to ship a spoken reply as an iMessage audio attachment; only when the operator opted the bot into Linq voice.",
+  approval: {
+    policy: "ask",
+    summary: (args) => {
+      const chat = typeof args.chat_id === "string" ? args.chat_id : "linq chat";
+      const text = typeof args.text === "string" ? args.text.replace(/\s+/g, " ").trim() : "";
+      return text ? `voice note to ${chat}: ${text.slice(0, 140)}` : `voice note to ${chat}`;
+    },
+  },
+};
+
+// ── Zulip (docs/zulip.md) ──
+// Offered only to a bot whose Zulip session is connected.  No Zulip tool
+// carries an approval record, and that is deliberate: every rule that makes
+// a post safe is enforced by the harness, not asked of a person — the reply
+// target is the conversation that woke the turn and the model cannot move
+// it, an off-origin post must name a channel the owner allowed, a DM may go
+// only to the owner, a bot, or the person whose DM started the turn (and DMs
+// out are rate limited per bot), and text that looks like a secret is
+// refused (server/zulip/outbound.ts).  A card would only stall an unattended
+// Zulip turn.
+
+const zulipEnabled = (ctx: ToolGateContext) => Boolean(ctx.zulip);
+
+const ZULIP_REPLY: HarnessTool = {
+  name: "zulip_reply",
+  description:
+    "Answer the Zulip message that woke this turn: posts in the same channel topic, or answers the direct message, as your own Zulip bot with your role tag added. Only works on a turn started from Zulip. Never include secrets, keys or tokens: the post is refused.",
+  schema: {
+    type: "object",
+    properties: {
+      content: {
+        type: "string",
+        description: "The reply, in Zulip markdown. Do not add your [BF-...] tag; the harness adds it.",
+      },
+    },
+    required: ["content"],
+  },
+  surfaces: { mcp: true, http: true },
+  gate: zulipEnabled,
+  sideEffect: "write",
+  settles: "immediate",
+  promptFragment: "Use zulip_reply to answer a Zulip message in the conversation it came from.",
+};
+
+const ZULIP_POST: HarnessTool = {
+  name: "zulip_post",
+  description:
+    "Post to Zulip as your own bot. A channel post needs a channel AND a topic: one topic per unit of work, at most 58 characters, never your own name. Only the channel that woke you (any topic there) or a channel the owner allowed is accepted. dm_user_id sends a direct message instead: to the owner, to another bot, or to the person whose DM started this turn; never to an integration, a deactivated user, or a person who is not the owner, and only a few an hour. Never include secrets, keys or tokens: the post is refused.",
+  schema: {
+    type: "object",
+    properties: {
+      channel: { type: "string", description: "Channel name without the #, for example Work-In-Progress." },
+      topic: { type: "string", description: "The topic (thread) to post in. Required with channel." },
+      dm_user_id: {
+        type: "integer",
+        description: "Zulip user id to direct-message: the owner, another bot, or the sender of the DM that started this turn.",
+      },
+      content: {
+        type: "string",
+        description: "The message, in Zulip markdown. Do not add your [BF-...] tag; the harness adds it.",
+      },
+    },
+    required: ["content"],
+  },
+  surfaces: { mcp: true, http: true },
+  gate: zulipEnabled,
+  sideEffect: "write",
+  settles: "immediate",
+  promptFragment: "Use zulip_post to post in an allowed Zulip channel topic.",
+};
+
+const ZULIP_FOLLOW_TOPIC: HarnessTool = {
+  name: "zulip_follow_topic",
+  description:
+    "Follow or stop following a Zulip topic as your own bot. While you follow a topic, every new message in it wakes you as an @-mention does (never your own posts), and that wake is not auto-replied: answer only when the conversation needs you. The channel must be one your bot is subscribed to. Posts nothing.",
+  schema: {
+    type: "object",
+    properties: {
+      channel: { type: "string", description: "Channel name without the #, for example Work-In-Progress." },
+      topic: { type: "string", description: "The topic (thread) to follow or stop following." },
+      follow: { type: "boolean", description: "true to follow the topic, false to stop following it." },
+    },
+    required: ["channel", "topic", "follow"],
+  },
+  surfaces: { mcp: true, http: true },
+  gate: zulipEnabled,
+  sideEffect: "write",
+  settles: "immediate",
+  promptFragment: "Use zulip_follow_topic to follow a Zulip topic whose new messages should wake you, and to stop following it.",
+};
+
+// ── background jobs (P1, docs/plans/2026-10-01-background-jobs-and-subagents-decision.md) ──
+// HTTP lane only in P1: a CLI engine reaches them over MCP in P2.  The
+// numbers below (16 KB, 75 s) are literals because this file imports
+// nothing; registry.test.ts pins them to shared/jobs.ts.
+
+const jobsEnabled = (ctx: ToolGateContext) => Boolean(ctx.jobs);
+
+/** Longest command text an approval card carries whole.  `job_start` refuses
+ *  a longer command before any card is shown (server/tools/jobs.ts), so a
+ *  person never clicks Allow on a hidden tail.  That refusal is the whole
+ *  guard: a bot in full auto starts its jobs without a card
+ *  (server/auto-approve.ts), so the length limit holds for it as well. */
+export const JOB_SUMMARY_MAX_CHARS = 2000;
+
+/** A job's command as an approval card shows it: every run of whitespace
+ *  folded to one space.  The card cuts it at JOB_SUMMARY_MAX_CHARS, so this
+ *  is also the length a command is held to. */
+export function jobCommandForCard(raw: string): string {
+  return raw.replace(/\s+/g, " ").trim();
+}
+
+// The run limits (the default and the longest a bot may ask for) are the
+// owner's to change (`jobs.defaultMinutes`, `jobs.maxMinutes`), so neither
+// description states them: the system prompt's jobs section does, from the
+// live settings (server/jobs/prompt.ts), and job_start's own reply says the
+// limit the job got.
+const JOB_START: HarnessTool = {
+  name: "job_start",
+  description:
+    "Start a long-running shell command in the background on the host computer and return at once. Use it for builds, test suites, dev servers and anything that may take longer than a minute; use bash for quick commands. The job runs in its own process group at low priority with a run limit (the default and the longest allowed are in your instructions; set timeout_minutes to change it). You are told when it ends, so do not poll it, and do not start the same work again while it runs.",
+  schema: {
+    type: "object",
+    properties: {
+      command: {
+        type: "string",
+        description: `The shell command to run, exactly as you would type it, at most ${JOB_SUMMARY_MAX_CHARS} characters: it is shown whole to whoever approves it. For anything longer, write a script file and run that.`,
+      },
+      timeout_minutes: {
+        type: "integer",
+        description: "Run limit in minutes. Leave it out for the default; a number above the longest allowed is lowered to it. The job is stopped when it runs this long.",
+      },
+    },
+    required: ["command"],
+  },
+  surfaces: { mcp: true, http: true },
+  gate: jobsEnabled,
+  sideEffect: "write",
+  settles: "immediate",
+  promptFragment:
+    "Use job_start for commands that may run longer than a minute (builds, test suites, servers): it returns at once and you are told when the job ends, so never poll it.",
+  approval: {
+    policy: "ask",
+    summary: (args) => {
+      const raw = typeof args.command === "string" ? args.command : "";
+      const command = jobCommandForCard(raw);
+      if (!command) return "job";
+      const clipped = command.length > JOB_SUMMARY_MAX_CHARS ? `${command.slice(0, JOB_SUMMARY_MAX_CHARS - 1)}…` : command;
+      return `job: ${clipped}`;
+    },
+  },
+};
+
+const JOB_OUTPUT: HarnessTool = {
+  name: "job_output",
+  description:
+    "Read what one of your background jobs printed since you last read it: at most 16 KB, ending with the job's status line, for example [status: completed, exit code: 1, 4m 12s]. wait_seconds (at most 75) waits for the job to end first. Call it when you need the output now, not to check on a job: you are told when it ends.",
+  schema: {
+    type: "object",
+    properties: {
+      job_id: { type: "string", description: "The job's id, from job_start or job_list." },
+      wait_seconds: {
+        type: "integer",
+        description: "Wait up to this many seconds (at most 75) for the job to end before reading. Defaults to 0.",
+      },
+    },
+    required: ["job_id"],
+  },
+  surfaces: { mcp: true, http: true },
+  gate: jobsEnabled,
+  sideEffect: "read",
+  settles: "immediate",
+  // the 75-second wait plus the read, under the loop's own 90-second ceiling
+  timeoutMs: 90_000,
+  // The MCP lane waits longer (jobs P2): an MCP call has no in-process round
+  // loop to pay for between rounds, so the wait is all the bot spends.  The
+  // HTTP ceiling above is the loop's own 90-second budget and cannot move, so
+  // the deviation is per-surface rather than one raised number.
+  wire: {
+    mcp: {
+      reason: "jobs P2: the MCP lane has no in-process round loop, so a 120 s wait costs the bot only the wait; the HTTP lane's 75 s sits under a 90 s round budget that cannot move.",
+      description:
+        "Read what one of your background jobs printed since you last read it: at most 16 KB, ending with the job's status line, for example [status: completed, exit code: 1, 4m 12s]. wait_seconds (at most 120) waits for the job to end first. Call it when you need the output now, not to check on a job: you are told when it ends.",
+      schema: {
+        type: "object",
+        properties: {
+          job_id: { type: "string", description: "The job's id, from job_start or job_list." },
+          wait_seconds: {
+            type: "integer",
+            description: "Wait up to this many seconds (at most 120) for the job to end before reading. Defaults to 0.",
+          },
+        },
+        required: ["job_id"],
+      },
+    },
+  },
+};
+
+const JOB_LIST: HarnessTool = {
+  name: "job_list",
+  description: "List your background jobs: running ones first, then finished ones, newest first, with each one's status and how long it ran.",
+  schema: { type: "object", properties: {} },
+  surfaces: { mcp: true, http: true },
+  gate: jobsEnabled,
+  sideEffect: "read",
+  settles: "immediate",
+};
+
+const JOB_KILL: HarnessTool = {
+  name: "job_kill",
+  description:
+    "Stop one of your background jobs and every process it started (SIGTERM, then SIGKILL after 5 seconds). You are not sent a notice for a job you stop yourself.",
+  schema: {
+    type: "object",
+    properties: { job_id: { type: "string", description: "The job's id, from job_start or job_list." } },
+    required: ["job_id"],
+  },
+  surfaces: { mcp: true, http: true },
+  gate: jobsEnabled,
+  sideEffect: "write",
+  settles: "immediate",
+};
+
 /** Every tool the registry owns, in the order the MCP lane publishes them —
  *  spelled out here, not derived, so reordering this array is a deliberate
  *  edit rather than something that silently reorders the MCP wire list. */
 export const HARNESS_TOOLS: readonly HarnessTool[] = [
   LIST_BOTS,
-  ASK_BOT,
-  DELEGATE_BOT,
+  COORDINATE_BOTS,
+  ASSIGNMENT_STATUS,
   CREATE_BOT,
   REQUEST_CREDENTIAL,
+  REQUEST_SIGN_IN,
   LIST_ROUTINES,
   PROPOSE_ROUTINE,
   PROPOSE_ROUTINE_ACTION,
@@ -1056,6 +1452,15 @@ export const HARNESS_TOOLS: readonly HarnessTool[] = [
   GITHUB_ISSUE_CREATE,
   GITHUB_ISSUE_VIEW,
   GITHUB_ISSUE_LIST,
+  LINQ_VOICE_MESSAGE,
+  JOB_START,
+  JOB_OUTPUT,
+  JOB_LIST,
+  JOB_KILL,
+  ZULIP_REPLY,
+  ZULIP_POST,
+  ZULIP_FOLLOW_TOPIC,
+  READ_TOOL_RESULT,
 ];
 
 const BY_NAME = new Map(HARNESS_TOOLS.map((tool) => [tool.name, tool]));
@@ -1094,5 +1499,6 @@ export function httpToolDefinitions(ctx: ToolGateContext): HttpToolDefinition[] 
     name: tool.name,
     description: descriptionFor(tool, "http"),
     parameters: schemaFor(tool, "http"),
+    ...(tool.timeoutMs === undefined ? {} : { timeoutMs: tool.timeoutMs }),
   }));
 }

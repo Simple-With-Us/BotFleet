@@ -46,6 +46,7 @@
 import { randomUUID } from "node:crypto";
 import {
   closeSync,
+  existsSync,
   fsyncSync,
   mkdirSync,
   openSync,
@@ -125,6 +126,25 @@ function leaseMarginMs(staleMs) {
 
 function isPlainObject(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** An object literal or `JSON.parse` result, as opposed to a Map, Set, Date
+ * or class instance.  `JSON.stringify` turns a Map into `{}`, which written
+ * over config.json would erase every setting without a single error, so the
+ * write guard asks for this stricter shape than the lock-record reader does. */
+function isJsonObject(value) {
+  if (!isPlainObject(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+/** What a rejected `mutate` result was, for the error message: a type name,
+ * never the value, because config.json holds API keys. */
+function describeKind(value) {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "an array";
+  if (typeof value === "object") return "an object that is not a plain JSON object";
+  return `a ${typeof value}`;
 }
 
 function readLockRecord(lockPath) {
@@ -413,16 +433,96 @@ export function withConfigFileLock(configPath, fn, options = {}) {
   }
 }
 
+/** Drop a leading byte-order mark, which some editors add when a person
+ * fixes a file by hand.  Mirrors stripBom in server/store-guard.ts. */
+function stripBom(text) {
+  return text.startsWith("\uFEFF") ? text.slice(1) : text;
+}
+
+/** Why JSON.parse failed, safe to log: only a position, never the text
+ * around it, because config.json holds API keys and the parser's own
+ * message quotes the source.  Mirrors jsonFailureReason in
+ * server/store-guard.ts, which the packaged app cannot import. */
+function jsonFailureReason(error, length) {
+  const message = String(error?.message ?? "");
+  if (/end of JSON input|unterminated/i.test(message)) return "it ends early (it looks cut short)";
+  const at = /position (\d+)/.exec(message)?.[1];
+  if (at && length !== undefined && Number(at) >= length) return "it ends early (it looks cut short)";
+  return at ? `it is not valid JSON (near character ${at})` : "it is not valid JSON";
+}
+
+/** Read `configPath` and say whether what is there can be used.
+ * `disk` is the parsed object, or `{}` when there is nothing usable.
+ * `unusable` is null for a file that is missing, empty or healthy, and
+ * otherwise the reason a file that DOES hold something could not be used
+ * (not JSON, not an object, unreadable) -- that file is somebody's settings
+ * and must not be written over without being kept.
+ *
+ * This checks the ENVELOPE only -- readable, JSON, one object at the top --
+ * and deliberately not the sections inside it.  The lock never reads a field:
+ * it hands `disk` to a caller's `mutate`, which owns the shape of the few
+ * sections it touches, and writes back what `mutate` returns.  Everything
+ * else in the file must come back as it went in, so this is
+ * a pass-through boundary and not a strict one: a schema that rejected or
+ * stripped keys it does not know would drop a newer build's settings, and one
+ * that sent a file with one bad section to `unusable` would set aside every
+ * good section along with it (`mutate` would see `{}`).  The section schema is
+ * zod, in server/config.ts, where zod can run -- `appConfigSchema.partial()` on
+ * every patch in `saveConfig`, `parseStoredConfig` and `salvageStoredConfig`
+ * on load (per section, and per engine under `instances`), and
+ * `jsonObjectSchema` on the merge.  It cannot move here: the packaged app
+ * ships no node_modules (electron-builder.yml `files`; the same wall as
+ * scripts/bundle-server.mjs), so an `import "zod"` in electron/ fails the
+ * packaged boot with ERR_MODULE_NOT_FOUND.  The write side is guarded the same
+ * way, by `updateConfigFile`: it refuses anything but a plain object. */
+function inspectConfigFile(configPath) {
+  let text;
+  try {
+    text = readFileSync(configPath, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") return { disk: {}, unusable: null };
+    return { disk: {}, unusable: `it could not be read (${error?.code ?? "unknown error"})` };
+  }
+  const body = stripBom(text);
+  if (body.trim() === "") return { disk: {}, unusable: null };
+  let parsed;
+  try {
+    parsed = JSON.parse(body);
+  } catch (error) {
+    return { disk: {}, unusable: jsonFailureReason(error, body.length) };
+  }
+  if (!isPlainObject(parsed)) return { disk: {}, unusable: "it does not hold a JSON object" };
+  return { disk: parsed, unusable: null };
+}
+
 /** The parsed config object on disk, or `{}` when the file is missing or
  * not a JSON object -- the state of a fresh install, not an error.  Every
- * writer treats that the same way, so it lives here once. */
+ * writer treats that the same way, so it lives here once.  A file that holds
+ * something unusable also reads as `{}`, but `updateConfigFile` sets it aside
+ * before it would be replaced. */
 export function readConfigFile(configPath) {
+  return inspectConfigFile(configPath).disk;
+}
+
+/** Rename an unusable `configPath` to `<name>.corrupt-<epoch ms>` beside it.
+ * Never overwrites an existing name and never deletes; the rename keeps the
+ * file's private mode.  Returns where it went, or null if another process
+ * had already moved it.  Throws if it cannot be moved. */
+function setConfigFileAside(configPath, now) {
+  let target = `${configPath}.corrupt-${now}`;
+  for (let n = 1; existsSync(target); n += 1) target = `${configPath}.corrupt-${now}-${n}`;
   try {
-    const parsed = JSON.parse(readFileSync(configPath, "utf8"));
-    return isPlainObject(parsed) ? parsed : {};
-  } catch {
-    return {};
+    renameSync(configPath, target);
+  } catch (error) {
+    // ENOENT means "another process got there first" only while the file is
+    // really gone.  Windows reports a target name that is too long as ENOENT
+    // as well; trusting it would let the write that follows replace a file
+    // that was never set aside.  (Found by the windows-latest run of the
+    // refuses-to-overwrite test, which saw no throw and no set-aside file.)
+    if (error?.code === "ENOENT" && !existsSync(configPath)) return null;
+    throw error;
   }
+  return target;
 }
 
 /** Durable, atomic file replace: write a sibling temp file, fsync it, rename
@@ -471,29 +571,69 @@ export function writeFileAtomic(path, data, options = {}) {
  * already right and must not be rewritten.  It must be synchronous: the
  * lock is held for the duration of this call and released on the way out,
  * success or throw.  Returns the object now on disk.  Throws without
- * replacing the file if the lease expired or a peer took the lock over by
- * the time the staged write is about to be renamed into place. */
+ * replacing the file if `mutate` returns anything but a plain object (an
+ * array, a string, a Map), or if the lease expired or a peer took the lock
+ * over by the time the staged write is about to be renamed into place.
+ *
+ * Keys the caller did not touch round-trip as they are: unknown ones from a
+ * newer build, and sections of the wrong shape alike.  Validating a section
+ * is the caller's job (see inspectConfigFile for why it is not this one's). */
 export function updateConfigFile(configPath, mutate, options = {}) {
   return withConfigFileLock(
     configPath,
     (lock) => {
-      const disk = readConfigFile(configPath);
+      const { disk, unusable } = inspectConfigFile(configPath);
       const next = mutate(disk);
       if (next && typeof next.then === "function") {
         throw new TypeError("updateConfigFile: mutate must be synchronous");
       }
       if (next === null) return disk;
       const toWrite = next === undefined ? disk : next;
+      // The one thing the lock can and must check about what it is about to
+      // persist: that it is a plain JSON object.  A mutate that returns an
+      // array, a string or a Map would otherwise be written over the file as
+      // `[]`, `"x"` or `{}`: the first two make the next read set a healthy
+      // file aside as unusable, and the Map empties every setting without an
+      // error.  Refuse before anything is staged: the file stays byte-for-byte
+      // as it was and the lock is released on the way out.
+      if (!isJsonObject(toWrite)) {
+        throw new TypeError(
+          `updateConfigFile: mutate must return a plain object, null or nothing, not ${describeKind(toWrite)}; ${configPath} was not changed`,
+        );
+      }
       // Fence, immediately before the rename: refuse to replace the file if
       // this lease ran out or a peer took the lock over while `mutate`, the
       // temp-file write or the fsync ran.  The staged temp file is dropped,
       // the peer's file stays intact, and the caller sees an error instead.
+      //
+      // A file that held something unusable is set aside in the same
+      // breath, after the fence and just before the rename that replaces
+      // it, so the write that follows can never destroy it.  If it cannot be
+      // moved, the throw drops the staged file and the original stays put.
       writeFileAtomic(configPath, JSON.stringify(toWrite, null, 2), {
         mode: options.mode ?? 0o600,
-        beforeRename: () => lock.assertHeld(),
+        beforeRename: () => {
+          lock.assertHeld();
+          if (unusable === null) return;
+          let setAsidePath;
+          try {
+            setAsidePath = setConfigFileAside(configPath, options.now ?? Date.now());
+          } catch (error) {
+            throw new Error(
+              `${configPath} could not be used because ${unusable}, and it could not be moved aside (${error?.code ?? "unknown error"}), so it was not overwritten`,
+            );
+          }
+          (options.onSetAside ?? reportSetAside)({ path: configPath, setAsidePath, reason: unusable });
+        },
       });
       return toWrite;
     },
     options,
+  );
+}
+
+function reportSetAside({ path, setAsidePath, reason }) {
+  console.warn(
+    `config: ${path} could not be used because ${reason}.  ${setAsidePath ? `Moved it to ${setAsidePath}` : "It was already moved aside"} and wrote a new file.  Nothing was deleted.`,
   );
 }

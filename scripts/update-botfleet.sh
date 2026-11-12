@@ -1,112 +1,62 @@
 #!/usr/bin/env bash
-# On-demand Mac updater entrypoint.  The transaction implementation stays in
-# the tracked BotFleet checkout so the installed helper and its tests cannot
-# drift apart.  A machine copy of this file lives at ~/apps/update-botfleet.sh.
-#
-# When Electron spawns this script from a packaged .app, PATH is reduced to
-# /usr/bin:/bin:/usr/sbin:/sbin, which does not include Homebrew or nvm.
-# Prepend the common node locations so `node` resolves regardless of how this
-# script is invoked.
-#
-# `ubf` is a no-op when the local BotFleet checkout is already at origin/main.
-# Override with BOTFLEET_FORCE=1 to reinstall anyway.  The transaction inside
-# update-botfleet-mac.mjs has no built-in "already current" short circuit; the
-# skip happens here so a second `ubf` an hour later is sub-second instead of a
-# 2-minute interruption.
+# Stable protocol-v1 entrypoint. No transaction policy or module list lives on
+# the machine. Load its complete helper from immutable, fetched main objects.
+# Initial migration from a pre-v1 machine copy is a separate rollout action.
 set -euo pipefail
-
-# Extend PATH with every place node is commonly found on macOS (Homebrew Apple
-# Silicon, Homebrew Intel, nvm default, fnm default, local pnpm node, and
-# Volta).  Already-present entries are harmless duplicates.
-export PATH=\
-"/opt/homebrew/bin"\
-":/usr/local/bin"\
-":${HOME}/.nvm/versions/node/$(ls "${HOME}/.nvm/versions/node/" 2>/dev/null | sort -V | tail -1)/bin"\
-":${HOME}/.fnm/node-versions/$(ls "${HOME}/.fnm/node-versions/" 2>/dev/null | sort -V | tail -1)/installation/bin"\
-":${HOME}/.local/share/pnpm"\
-":${HOME}/.local/bin"\
-":${HOME}/.volta/bin"\
-":${PATH}"
-
-# Resolve the node binary explicitly so a missing one produces a clear message
-# rather than a confusing "exec: node: not found" (exit 127) after the script
-# was supposed to work.
-NODE_BIN=""
-for candidate in \
-    "$(command -v node 2>/dev/null || true)" \
-    /opt/homebrew/bin/node \
-    /usr/local/bin/node; do
-  if [[ -x "$candidate" ]]; then
-    NODE_BIN="$candidate"
-    break
-  fi
+exec 3>&2
+export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH"
+CHECKOUT="${BOTFLEET_CHECKOUT:-$HOME/apps/botfleet-server}"
+CACHE="${BOTFLEET_HELPER_CACHE:-$HOME/Library/Caches/BotFleet/helper}"
+NODE="$(command -v node || true)"
+if [[ -z "$NODE" ]]; then echo 'BotFleet bootstrap: Node.js is missing.' >&2; exit 127; fi
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/botfleet-loader.XXXXXX")"
+COMMAND=update
+case "${1:-}" in prepare|apply|unquiesce|update|status|recover) COMMAND="$1" ;; esac
+PROGRESS=""; RUN_ID=""; EXPECT=""
+for arg in "$@"; do
+  if [[ "$EXPECT" == progress ]]; then PROGRESS="$arg"; EXPECT=""; continue; fi
+  if [[ "$EXPECT" == run ]]; then RUN_ID="$arg"; EXPECT=""; continue; fi
+  case "$arg" in --progress) EXPECT=progress ;; --run-id) EXPECT=run ;; esac
 done
-if [[ -z "$NODE_BIN" ]]; then
-  echo "BotFleet updater: node not found.  Install Node.js via Homebrew: brew install node" >&2
-  exit 127
-fi
-
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-LOCAL_IMPL="$SCRIPT_DIR/update-botfleet-mac.mjs"
-TRACKED_IMPL="${BOTFLEET_UPDATER_IMPL:-$HOME/apps/botfleet-server/scripts/update-botfleet-mac.mjs}"
-
-# launchd provides a minimal PATH. Ensure node/pnpm/git are found for source builds.
-export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.asdf/shims:$PATH"
-if [[ -d "$HOME/.nvm/versions/node" ]]; then
-  LATEST_NODE="$(ls -t "$HOME/.nvm/versions/node" 2>/dev/null | head -n 1 || true)"
-  if [[ -n "$LATEST_NODE" ]]; then
-    export PATH="$HOME/.nvm/versions/node/$LATEST_NODE/bin:$PATH"
+# Preserve a transaction's terminal record. If import/bootstrap failed before
+# that writer existed, atomically report its actual stderr instead of making
+# the harness infer "never started". The controller is a second fallback.
+finish() {
+  code=$?
+  trap - EXIT
+  [[ ! -f "$TMP/error.log" ]] || cat "$TMP/error.log" >&3
+  if [[ "$code" != 0 && -n "$PROGRESS" && -n "$RUN_ID" ]]; then
+    "$NODE" - "$PROGRESS" "$RUN_ID" "$TMP/error.log" "$COMMAND" 2>&3 <<'JS'
+const fs = require('node:fs'), path = require('node:path');
+const [file, runId, log, command] = process.argv.slice(2);
+try {
+ let old; try { old = JSON.parse(fs.readFileSync(file, 'utf8')); } catch {}
+ if (!(old?.runId === runId && old.finishedAt && old.outcome)) {
+  const now = new Date().toISOString();
+  const tail = fs.existsSync(log) ? fs.readFileSync(log, 'utf8').slice(-4000) : '';
+  const detail = tail.split('\n').find(line => /Error|failed|fatal:|refusing/i.test(line)) || tail.trim().split('\n').pop() || 'See the updater log.';
+  fs.mkdirSync(path.dirname(file), {recursive:true, mode:0o700});
+  const temporary = file+'.'+process.pid+'.tmp';
+  fs.writeFileSync(temporary, JSON.stringify({schemaVersion:1,runId,command,pid:process.pid,startedAt:old?.startedAt || now,updatedAt:now,finishedAt:now,outcome:'failed',step:'bootstrap',message:'Updater bootstrap failed: '+detail.slice(0,800)})+'\n',{mode:0o600});
+  fs.renameSync(temporary,file);
+ }
+} catch (error) { console.error('Could not record bootstrap failure: '+error.message); }
+JS
   fi
-fi
-if [[ -s "$HOME/.nvm/nvm.sh" ]]; then
-  export NVM_DIR="$HOME/.nvm"
-  \. "$NVM_DIR/nvm.sh"
-fi
-if [[ -s "$HOME/.bun/bin/bun" ]]; then
-  export PATH="$HOME/.bun/bin:$PATH"
-fi
-
-# Skip the close / rebuild / relaunch dance when the local BotFleet checkout is
-# already at origin/main.  Override the check with BOTFLEET_FORCE=1 or by
-# passing --force / -f.  Override the checkout location with BOTFLEET_CHECKOUT
-# (defaults to the parent of the tracked implementation).
-# --force / -f mirrors the env-var override; recognised here so the documented
-# flag does what its name says.
-if [[ -z "${BOTFLEET_FORCE:-}" ]]; then
-  for arg in "$@"; do
-    case "$arg" in
-      --force|-f) BOTFLEET_FORCE=1 ;;
-    esac
-  done
-fi
-if [[ -z "${BOTFLEET_CHECKOUT:-}" ]]; then
-  # Defensive: `set -e` is on, but the parent of $TRACKED_IMPL may not exist
-  # yet (first run, custom $BOTFLEET_UPDATER_IMPL, etc.).  Swallow the cd
-  # failure and let the next test fall through to the updater.
-  BOTFLEET_CHECKOUT="$(cd "$(dirname "$(dirname "$TRACKED_IMPL")")" 2>/dev/null && pwd)" || BOTFLEET_CHECKOUT=""
-fi
-if [[ "${BOTFLEET_FORCE:-}" == "1" ]]; then
-  echo "⚠️  BOTFLEET_FORCE=1 — running updater even if $BOTFLEET_CHECKOUT is already at origin/main."
-elif [[ -n "$BOTFLEET_CHECKOUT" && -d "$BOTFLEET_CHECKOUT/.git" ]]; then
-  if git -C "$BOTFLEET_CHECKOUT" fetch --quiet origin main 2>/dev/null; then
-    LOCAL_HEAD=$(git -C "$BOTFLEET_CHECKOUT" rev-parse HEAD)
-    REMOTE_HEAD=$(git -C "$BOTFLEET_CHECKOUT" rev-parse origin/main)
-    if [[ "$LOCAL_HEAD" == "$REMOTE_HEAD" ]]; then
-      CURRENT=$(git -C "$BOTFLEET_CHECKOUT" log --oneline -1)
-      echo "✅ Already at $CURRENT.  Nothing to update.  (Set BOTFLEET_FORCE=1 or pass --force to reinstall anyway.)"
-      exit 0
-    fi
-  else
-    echo "⚠️  Could not fetch origin/main from $BOTFLEET_CHECKOUT; running updater anyway."
-  fi
-fi
-
-if [[ -f "$LOCAL_IMPL" ]]; then
-  exec "$NODE_BIN" "$LOCAL_IMPL" "$@" </dev/null
-fi
-if [[ -f "$TRACKED_IMPL" ]]; then
-  exec "$NODE_BIN" "$TRACKED_IMPL" "$@" </dev/null
-fi
-
-echo "BotFleet updater implementation is missing.  Expected $TRACKED_IMPL" >&2
-exit 1
+  rm -rf "$TMP"
+  # Old harnesses use launchctl submit with keep-alive-on-failure. A managed
+  # run reports failure in its progress/log channel, never by retrying itself.
+  if [[ -n "$PROGRESS" && -n "$RUN_ID" ]]; then exit 0; fi
+  exit "$code"
+}
+trap finish EXIT
+# No caller-controlled branch supplies loader code. Policy handles an explicit
+# target after validating its ancestry independently, including prepared stages.
+{
+ git -C "$CHECKOUT" fetch --quiet origin main
+ COMMIT="$(git -C "$CHECKOUT" rev-parse --verify 'origin/main^{commit}')"
+ [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]]
+ git -C "$CHECKOUT" merge-base --is-ancestor "$COMMIT" origin/main
+ git -C "$CHECKOUT" show "$COMMIT:scripts/update-botfleet-bootstrap.mjs" > "$TMP/loader.mjs"
+ "$NODE" "$TMP/loader.mjs" "$CHECKOUT" "$COMMIT" "$CACHE" "$@"
+} 2> "$TMP/error.log"

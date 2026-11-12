@@ -36,6 +36,8 @@
     "maxInstances": 2
   },
   "features": {
-    "skillRecorder": false
+    "skillRecorder": false,
+    "showToolCalls": true,
+    "summarizeToolCalls": true
   }
 }

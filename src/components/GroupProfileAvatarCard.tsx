@@ -6,20 +6,23 @@ import { imageAttachmentFromFile } from "@/lib/composer-attachments";
 import { cn } from "@/lib/cn";
 import { productErrorHeadline } from "@/lib/product-error";
 import {
-  BOT_AVATAR_CROPS,
+  GROUP_AVATAR_CROPS,
   botAvatarUrlFromStoredPath,
-  type BotAvatarCrop,
 } from "../../shared/bot-avatar";
 import { GroupAvatar } from "./Avatar";
 
 type AvatarPatch = Partial<Pick<Group, "avatarCrop" | "avatarUrl">>;
 
+// Only the crops a group can actually pick.  A group carries no expression
+// and no color, so it has nothing to animate: the mascot, the TV-Face pack
+// and a one-file animated avatar are all bot-only, and typing the record
+// against the group's own list keeps a crop from being added to one side
+// and forgotten on the other.
 const CROP_LABEL = {
-  mascot: "Mascot", // We won't show mascot option for groups
   circle: "Circle",
   rounded: "Rounded",
   square: "Square",
-} satisfies Record<BotAvatarCrop, string>;
+} satisfies Record<(typeof GROUP_AVATAR_CROPS)[number], string>;
 
 export function GroupProfileAvatarCard({
   group,
@@ -60,7 +63,7 @@ export function GroupProfileAvatarCard({
   };
 
   // Group crops: exclude mascot
-  const availableCrops = BOT_AVATAR_CROPS.filter(c => c !== "mascot");
+  const availableCrops = GROUP_AVATAR_CROPS;
 
   return (
     <div className="overflow-hidden rounded-xl border border-hairline/40 bg-card">

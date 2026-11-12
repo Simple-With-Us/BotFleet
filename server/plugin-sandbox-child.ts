@@ -1,0 +1,336 @@
+// Plugin sandbox child.  Spawned by server/plugin-loader.ts as its own OS
+// process, one per enabled plugin, with:
+//   * an empty environment (no provider keys, session tokens, or
+//     NODE_OPTIONS reach this process),
+//   * the Node permission model: read access to this script and the
+//     plugin's own folder only, no filesystem writes, no child processes,
+//     no worker threads, no native addons, no WASI, no inspector,
+//   * outbound network denied unless the parent seals an explicit
+//     host:port allowlist from the plugin manifest's `needs.network`,
+//   * a small V8 heap cap, and a per-call deadline enforced by the parent,
+//     which kills this process when a handler overruns.
+//
+// This file must not import anything at runtime except Node built-ins:
+// under the permission model it cannot read node_modules, and the
+// packaged build bundles it as its own entry point.  Type-only imports
+// are erased before execution.
+//
+// The plugin talks to BotFleet only through the host object built here.
+// That host answers from a per-call snapshot the parent already filtered
+// through the manifest's capabilities and the secret-key redaction.
+// Plugin log text and thrown error messages never leave this process;
+// the parent receives levels, lengths, and stable reason codes.
+import type { JsonValue } from "../shared/plugin-manifest.ts";
+import type {
+  ChildToParentMessage,
+  ParentToChildMessage,
+  PluginLogLevel,
+  PluginRefusal,
+  SandboxHostSnapshot,
+} from "./plugin-sandbox-protocol.ts";
+import type { PluginHost } from "./plugin-types.ts";
+import { installPluginNetworkGuard } from "./plugin-net-guard.ts";
+
+/** Installed before any plugin code runs.  The allowlist stays empty
+ *  until the parent's load message seals it. */
+const networkGuard = installPluginNetworkGuard();
+
+/** What a plugin handler may hand back.  The child re-serializes it, so
+ *  the parent only ever receives JSON. */
+type PluginReturn = JsonValue | undefined;
+type CardHandler = (args: { cardId: string; host: PluginHost }) => PluginReturn | Promise<PluginReturn>;
+type CommandHandler = (args: { command: string; args: string; host: PluginHost }) => PluginReturn | Promise<PluginReturn>;
+type EventHandler = (args: { event: JsonValue; host: PluginHost }) => PluginReturn | Promise<PluginReturn>;
+type HealthHandler = (args: { host: PluginHost }) => PluginReturn | Promise<PluginReturn>;
+
+/** The four exports the host looks for on an imported module.  Their
+ *  values are unverified until exportedHandler checks them. */
+interface PluginNamespace {
+  getCardData?: JsonValue | Function;
+  runCommand?: JsonValue | Function;
+  onEvent?: JsonValue | Function;
+  getHealth?: JsonValue | Function;
+}
+
+let handlers: {
+  getCardData: CardHandler | null;
+  runCommand: CommandHandler | null;
+  onEvent: EventHandler | null;
+  getHealth: HealthHandler | null;
+} | null = null;
+let loadStarted = false;
+
+function send(message: ChildToParentMessage): void {
+  process.send?.(message);
+}
+
+/** A namespace export is callable, or it is absent.  Anything else is a
+ *  contract failure.  `instanceof Function` covers sync and async
+ *  functions alike. */
+function exportedHandler(namespace: PluginNamespace, name: keyof PluginNamespace): Function | null | "invalid" {
+  const value = namespace[name];
+  if (value === undefined) return null;
+  return value instanceof Function ? value : "invalid";
+}
+
+/** Copy a JSON value so the plugin cannot keep a reference to the
+ *  snapshot between calls. */
+function cloneJson(value: JsonValue): JsonValue {
+  return JSON.parse(JSON.stringify(value));
+}
+
+const LOG_LEVELS: readonly PluginLogLevel[] = ["info", "warn", "error"];
+
+function createHost(snapshot: SandboxHostSnapshot): PluginHost {
+  const refused = new Set<PluginRefusal>();
+  const refuse = (capability: PluginRefusal) => {
+    if (refused.has(capability)) return;
+    refused.add(capability);
+    send({ type: "refused", capability });
+  };
+  const config: PluginHost["config"] = Object.freeze({
+    get: <T = unknown>(key: string): T | undefined => {
+      if (snapshot.configKeys === null) {
+        refuse("read.config");
+        return undefined;
+      }
+      if (!Object.prototype.hasOwnProperty.call(snapshot.config, key)) {
+        refuse("config.allowlist");
+        return undefined;
+      }
+      const value = snapshot.config[key];
+      // SAFETY: the plugin names T; the host promises only a redacted JSON copy and does not validate it against T, same contract as the in-process host it replaces.
+      return (value === undefined ? undefined : cloneJson(value)) as T | undefined;
+    },
+    listKeys: () => {
+      if (snapshot.configKeys === null) {
+        refuse("read.config");
+        return [];
+      }
+      return [...snapshot.configKeys];
+    },
+  });
+  const host: PluginHost = {
+    version: 2,
+    log: (level, message) => {
+      const safeLevel = LOG_LEVELS.find((candidate) => candidate === level) ?? "info";
+      // Only the length crosses the boundary.  String() keeps a non-string
+      // argument from throwing; its text still never leaves this process.
+      send({ type: "log", level: safeLevel, length: String(message ?? "").length });
+    },
+    getBots: () => {
+      if (snapshot.bots === null) {
+        refuse("read.bots");
+        return [];
+      }
+      if (!snapshot.statusAllowed) refuse("read.status");
+      return snapshot.bots.map((bot) => ({ ...bot }));
+    },
+    config,
+    settings: Object.freeze({
+      get: <T = unknown>(key: string): T | undefined => {
+        const value = snapshot.settings[key];
+        // SAFETY: same contract as config.get above; these are the
+        // plugin's own validated non-secret settings.
+        return (value === undefined ? undefined : cloneJson(value)) as T | undefined;
+      },
+      listKeys: () => Object.keys(snapshot.settings),
+    }),
+  };
+  return Object.freeze(host);
+}
+
+async function load(entryUrl: string, networkAllow: readonly string[]): Promise<void> {
+  // Seal before import.  Top-level plugin code runs during import, and a
+  // second seal (a fake load message emitted by the plugin) is ignored.
+  networkGuard.seal(networkAllow);
+  let namespace: PluginNamespace;
+  try {
+    namespace = await import(entryUrl);
+  } catch {
+    send({ type: "load_failed", reason: "import_failed" });
+    return;
+  }
+  const card = exportedHandler(namespace, "getCardData");
+  const command = exportedHandler(namespace, "runCommand");
+  const event = exportedHandler(namespace, "onEvent");
+  const health = exportedHandler(namespace, "getHealth");
+  if (card === "invalid" || command === "invalid" || event === "invalid" || health === "invalid") {
+    send({ type: "load_failed", reason: "invalid_exports" });
+    return;
+  }
+  handlers = {
+    // SAFETY: exportedHandler confirmed a callable export; the plugin contract (docs/plugins/DESIGN.md § Host API) names this signature, and the result is re-serialized and schema-checked by the parent.
+    getCardData: card as CardHandler | null,
+    // SAFETY: same as above for the runCommand export.
+    runCommand: command as CommandHandler | null,
+    // SAFETY: same as above for the onEvent export.
+    onEvent: event as EventHandler | null,
+    // SAFETY: same as above for the getHealth export.
+    getHealth: health as HealthHandler | null,
+  };
+  send({
+    type: "ready",
+    exports: {
+      getCardData: card !== null,
+      runCommand: command !== null,
+      onEvent: event !== null,
+      getHealth: health !== null,
+    },
+  });
+}
+
+async function runHandler(message: Extract<ParentToChildMessage, { type: "invoke" }>): Promise<PluginReturn | "not_implemented"> {
+  const host = createHost(message.host);
+  if (message.handler === "getCardData") {
+    if (!handlers?.getCardData) return "not_implemented";
+    return handlers.getCardData({ cardId: message.cardId, host });
+  }
+  if (message.handler === "onEvent") {
+    if (!handlers?.onEvent) return "not_implemented";
+    // SAFETY: the event crossed as JSON and was shape-checked on receipt;
+    // the host re-validates the plugin's return, never this input.
+    return handlers.onEvent({ event: message.event as JsonValue, host });
+  }
+  if (message.handler === "getHealth") {
+    if (!handlers?.getHealth) return "not_implemented";
+    return handlers.getHealth({ host });
+  }
+  if (!handlers?.runCommand) return "not_implemented";
+  return handlers.runCommand({ command: message.command, args: message.args, host });
+}
+
+async function invoke(message: Extract<ParentToChildMessage, { type: "invoke" }>): Promise<void> {
+  const { id } = message;
+  if (!handlers) {
+    send({ type: "call_failed", id, reason: "bad_request" });
+    return;
+  }
+  let value: PluginReturn | "not_implemented";
+  try {
+    value = await runHandler(message);
+  } catch {
+    send({ type: "call_failed", id, reason: "handler_threw" });
+    return;
+  }
+  if (value === "not_implemented") {
+    send({ type: "call_failed", id, reason: "not_implemented" });
+    return;
+  }
+  let json: JsonValue;
+  try {
+    const text = JSON.stringify(value);
+    if (text === undefined) throw new Error("undefined result");
+    json = JSON.parse(text);
+  } catch {
+    send({ type: "call_failed", id, reason: "result_not_serializable" });
+    return;
+  }
+  send({ type: "result", id, value: json });
+}
+
+/** Runtime shape check mirroring ParentToChildMessageSchema without
+ *  importing zod (this process cannot read node_modules under the
+ *  permission model when the .ts entry is strip-typed in dev). */
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- type guard at the IPC boundary
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- type guard at the IPC boundary
+function isHostSnapshot(value: unknown): value is SandboxHostSnapshot {
+  if (!isPlainObject(value)) return false;
+  if (typeof value.statusAllowed !== "boolean") return false;
+  if (value.bots !== null) {
+    if (!Array.isArray(value.bots)) return false;
+    for (const bot of value.bots) {
+      if (!isPlainObject(bot)) return false;
+      if (typeof bot.id !== "string" || typeof bot.name !== "string") return false;
+      if (typeof bot.status !== "string" || typeof bot.driver !== "string") return false;
+    }
+  }
+  if (value.configKeys !== null) {
+    if (!Array.isArray(value.configKeys) || value.configKeys.some((k) => typeof k !== "string")) return false;
+  }
+  if (!isPlainObject(value.config)) return false;
+  if (!isPlainObject(value.settings)) return false;
+  return true;
+}
+
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- parser for the untrusted IPC message
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- shape check for the load message's allowlist
+function parseNetworkAllow(value: unknown): string[] | null {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > 32) return null;
+  const entries: string[] = [];
+  for (const entry of value) {
+    if (Object.prototype.toString.call(entry) !== "[object String]") return null;
+    const text = String(entry);
+    if (text.length > 300) return null;
+    entries.push(text);
+  }
+  return entries;
+}
+
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- IPC parent messages are untyped; every field is validated before use.
+function parseParentMessage(raw: unknown): ParentToChildMessage | null {
+  if (!isPlainObject(raw) || typeof raw.type !== "string") return null;
+  if (raw.type === "load") {
+    if (typeof raw.entryUrl !== "string") return null;
+    const networkAllow = parseNetworkAllow(raw.networkAllow);
+    if (!networkAllow) return null;
+    return { type: "load", entryUrl: raw.entryUrl, networkAllow };
+  }
+  if (raw.type !== "invoke") return null;
+  if (typeof raw.id !== "number" || !Number.isInteger(raw.id) || raw.id < 1) return null;
+  if (!isHostSnapshot(raw.host)) return null;
+  if (raw.handler === "getCardData") {
+    if (typeof raw.cardId !== "string") return null;
+    return { type: "invoke", id: raw.id, handler: "getCardData", cardId: raw.cardId, host: raw.host };
+  }
+  if (raw.handler === "runCommand") {
+    if (typeof raw.command !== "string" || typeof raw.args !== "string") return null;
+    return { type: "invoke", id: raw.id, handler: "runCommand", command: raw.command, args: raw.args, host: raw.host };
+  }
+  if (raw.handler === "onEvent") {
+    // The parent builds the event from the shared envelope schema; the
+    // child's return is what gets strict validation.  Keep this check
+    // shallow so envelope growth never breaks the parser.
+    if (!isPlainObject(raw.event) || typeof raw.event.eventId !== "string" || typeof raw.event.type !== "string") {
+      return null;
+    }
+    // SAFETY: parseParentMessage checked eventId and type are strings above;
+    // the parent built this event from the shared envelope schema, and the
+    // child's return is what gets strict validation.
+    return { type: "invoke", id: raw.id, handler: "onEvent", event: raw.event as { eventId: string; type: string }, host: raw.host };
+  }
+  if (raw.handler === "getHealth") {
+    return { type: "invoke", id: raw.id, handler: "getHealth", host: raw.host };
+  }
+  return null;
+}
+
+// Messages on this channel come from the trusted parent.  Still reject
+// anything that fails the shape check before dispatch.
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- IPC message handler; shape-checked by parseParentMessage
+process.on("message", (raw: unknown) => {
+  const message = parseParentMessage(raw);
+  if (!message) {
+    process.exit(70);
+    return;
+  }
+  if (message.type === "load") {
+    if (loadStarted) return;
+    loadStarted = true;
+    void load(message.entryUrl, message.networkAllow);
+    return;
+  }
+  void invoke(message);
+});
+
+// A plugin that crashes asynchronously takes only its own process down.
+// The parent sees the exit and fails the pending calls.
+process.on("uncaughtException", () => process.exit(70));
+process.on("unhandledRejection", () => process.exit(70));
+// The parent going away closes the IPC channel; do not linger.
+process.on("disconnect", () => process.exit(0));

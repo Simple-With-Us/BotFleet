@@ -1,10 +1,12 @@
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   DATA_DIR,
+  migrateComputerProvidersConfig,
+  migrateLegacyElevenLabsTtsProvider,
   allowedBotComputers,
   filterAllowedComputers,
   instanceConfigs,
@@ -29,11 +31,20 @@ import {
   AUTO_UPDATE_THROTTLE_MS,
   publicIngressUrl,
   publicIngressUrlEffective,
+  webhookPublicIngressUrl,
+  webhookPublicIngressUrlEffective,
   isSentryDsn,
   observabilityEnabled,
   observabilitySettings,
+  computerCallSettings,
+  claudeSessionIdleMs,
+  DEFAULT_COMPUTER_PERSON_AWAY_MS,
+  DEFAULT_CLAUDE_SESSION_IDLE_MS,
   sentryDsnConfigured,
   DEFAULT_SENTRY_TRACES_SAMPLE_RATE,
+  DEFAULT_SENTRY_AI_TRACES_SAMPLE_RATE,
+  DEFAULT_SENTRY_HTTP_TRACES_SAMPLE_RATE,
+  DEFAULT_SENTRY_UI_TRACES_SAMPLE_RATE,
   MAX_OBSERVABILITY_ENVIRONMENT_LENGTH,
   DEFAULT_INFISICAL_ENVIRONMENT,
   DEFAULT_INFISICAL_REFRESH_MINUTES,
@@ -42,8 +53,15 @@ import {
   infisicalConfigured,
   infisicalEnabled,
   infisicalSettings,
+  validateInfisicalConfigPatch,
+  agentProxyEnabled,
+  agentProxySettings,
+  applyAgentProxyEnv,
+  DEFAULT_AGENT_PROXY_ADDRESS,
   isHttpsUrl,
+  clampPlacementWindow,
   type AppConfig,
+  type InfisicalReadSource,
 } from "./config.ts";
 import { isSentryDsn as isBrowserSentryDsn } from "../src/lib/observability-config.ts";
 
@@ -52,6 +70,31 @@ import { isSentryDsn as isBrowserSentryDsn } from "../src/lib/observability-conf
 const SENTINEL_DSN = "https://abc123@o0.ingest.sentry.io/1";
 
 describe("configuration boundaries", () => {
+  it("accepts voice provider fields and rejects unknown keys in those schemas", () => {
+    expect(parseConfigPatch({
+      tts: { provider: "xai" },
+      callStt: { provider: "meta" },
+      azureSpeech: { region: "westus" },
+      metaSpeech: {},
+      groq: {},
+      assemblyai: {},
+    })).toEqual({
+      tts: { provider: "xai" },
+      callStt: { provider: "meta" },
+      azureSpeech: { region: "westus" },
+      metaSpeech: {},
+      groq: {},
+      assemblyai: {},
+    });
+
+    expect(() => parseConfigPatch({ tts: { provider: "xai", typo: true } })).toThrow(/Unrecognized key/);
+    expect(() => parseConfigPatch({ callStt: { provider: "meta", typo: true } })).toThrow(/Unrecognized key/);
+    expect(() => parseConfigPatch({ azureSpeech: { region: "westus", typo: true } })).toThrow(/Unrecognized key/);
+    expect(() => parseConfigPatch({ metaSpeech: { typo: true } })).toThrow(/Unrecognized key/);
+    expect(() => parseConfigPatch({ groq: { typo: true } })).toThrow(/Unrecognized key/);
+    expect(() => parseConfigPatch({ assemblyai: { typo: true } })).toThrow(/Unrecognized key/);
+  });
+
   it("keeps supported stored settings and drops unrelated top-level data", () => {
     expect(
       parseStoredConfig({
@@ -79,6 +122,32 @@ describe("configuration boundaries", () => {
       usage: { ingestUrl: "https://usage.example.com", ingestToken: "tok" },
     });
     expect(parseConfigPatch({ usage: { ingestUrl: "" } })).toEqual({ usage: { ingestUrl: "" } });
+  });
+
+  it("accepts another Infisical project and environment for the Zulip keys, and refuses a malformed one", () => {
+    expect(
+      parseConfigPatch({
+        zulip: {
+          credentialSource: "infisical",
+          infisicalProjectId: " 9bf7417a-fbbb-42ca-870c-2b45207233f5 ",
+          infisicalEnv: "prod",
+          infisicalPath: "/zulip",
+        },
+      }),
+    ).toEqual({
+      zulip: {
+        credentialSource: "infisical",
+        infisicalProjectId: "9bf7417a-fbbb-42ca-870c-2b45207233f5",
+        infisicalEnv: "prod",
+        infisicalPath: "/zulip",
+      },
+    });
+    // empty clears it back to the harness's own project and environment
+    expect(parseConfigPatch({ zulip: { infisicalProjectId: "", infisicalEnv: "" } })).toEqual({
+      zulip: { infisicalProjectId: "", infisicalEnv: "" },
+    });
+    expect(() => parseConfigPatch({ zulip: { infisicalProjectId: "../other" } })).toThrow("zulip.infisicalProjectId");
+    expect(() => parseConfigPatch({ zulip: { infisicalEnv: "prod/zulip" } })).toThrow("zulip.infisicalEnv");
   });
 
   it("accepts only a simple VPS SSH config alias and exposes no credentials", () => {
@@ -117,6 +186,14 @@ describe("configuration boundaries", () => {
     expect(localVmMaxInstances({ localVm: { maxInstances: 3 } })).toBe(3);
   });
 
+  it("accepts localVm shareCliCredentials and allowHostTerminal patches", () => {
+    expect(
+      parseConfigPatch({ localVm: { shareCliCredentials: true, allowHostTerminal: true } }),
+    ).toEqual({
+      localVm: { shareCliCredentials: true, allowHostTerminal: true },
+    });
+  });
+
   it("keeps experimental features off by default and accepts an explicit opt-in", () => {
     expect(skillRecorderEnabled({})).toBe(false);
     expect(parseConfigPatch({ features: { skillRecorder: true } })).toEqual({
@@ -126,6 +203,11 @@ describe("configuration boundaries", () => {
     expect(() => parseConfigPatch({ features: { skillRecorder: "yes" } })).toThrow(
       "features.skillRecorder",
     );
+  });
+
+  it("accepts busySendDefault queue or steer", () => {
+    expect(parseConfigPatch({ busySendDefault: "queue" })).toEqual({ busySendDefault: "queue" });
+    expect(() => parseConfigPatch({ busySendDefault: "hold" })).toThrow("busySendDefault");
   });
 
   it("shows tool steps by default and accepts an explicit opt-out", () => {
@@ -171,6 +253,16 @@ describe("default fleet", () => {
     expect(map.minimax).toEqual({ driver: "minimax", environment: {} });
     const existing = instanceConfigs({ instances: { claude: { driver: "claudeAgent" } } });
     expect(existing.minimax?.driver).toBe("minimax");
+  });
+
+  it("ships MiniMax Code as its own default-fleet engine", () => {
+    const map = instanceConfigs({});
+    expect(map.mcode).toEqual({ driver: "mcodeAgent", environment: {} });
+    // The reserved instance id is the engine's own name, so the row is not
+    // mistaken for one the operator added.
+    expect(map.minimax?.driver).toBe("minimax");
+    const existing = instanceConfigs({ instances: { claude: { driver: "claudeAgent" } } });
+    expect(existing.mcode?.driver).toBe("mcodeAgent");
   });
 
   it("carries the saved OpenAI-compatible URL into the live default instance", () => {
@@ -510,6 +602,33 @@ describe("Instance CLI override", () => {
   });
 });
 
+describe("OpenAI-compatible reply wait override", () => {
+  it("stores and clears minutes on only that instance config", () => {
+    const cfg: AppConfig = {
+      instances: {
+        "custom-ollama": {
+          driver: "openai-compat",
+          config: { url: "http://127.0.0.1:11434/v1", models: ["fixture"], key: "synthetic-key" },
+        },
+      },
+    };
+    const set = patchInstanceConfig(cfg, "custom-ollama", { replyWaitMinutes: 20 });
+    expect(set.config.instances!["custom-ollama"].config).toEqual({
+      url: "http://127.0.0.1:11434/v1",
+      models: ["fixture"],
+      key: "synthetic-key",
+      replyWaitMinutes: 20,
+    });
+    const cleared = patchInstanceConfig(set.config, "custom-ollama", { replyWaitMinutes: null });
+    expect(cleared.config.instances!["custom-ollama"].config).toEqual({
+      url: "http://127.0.0.1:11434/v1",
+      models: ["fixture"],
+      key: "synthetic-key",
+    });
+    expect(cfg.instances!["custom-ollama"].config).not.toHaveProperty("replyWaitMinutes");
+  });
+});
+
 describe("general config patch schema", () => {
   it("keeps deleteInstance out of PATCH /api/config — only the dedicated DELETE route may delete an engine", () => {
     // PATCH /api/config has none of DELETE /api/instances/:id's
@@ -697,7 +816,7 @@ describe("credential env preference", () => {
     expect(cfg.xai).toEqual({ key: "env-xai", url: "https://api.example.test/v1" });
     expect(cfg.box).toEqual({ token: "env-box" });
     expect(cfg.opencodeGo).toEqual({ apiKey: "env-ocg" });
-    expect(cfg.tts).toEqual({ key: "env-tts", voice: "narrator" });
+    expect(cfg.tts).toEqual({ key: "env-tts", voice: "narrator", provider: "minimax" });
     expect(cfg.imageGen).toEqual({ key: "env-image" });
     expect(cfg.deepseek).toEqual({ key: "env-deepseek", url: "https://env.example.test" });
   });
@@ -715,6 +834,7 @@ describe("credential env preference", () => {
     const cfg = loadConfig();
     expect(cfg.xai?.key).toBe("file-xai");
     expect(cfg.tts?.key).toBe("file-tts");
+    expect(cfg.tts?.provider).toBe("minimax");
     expect(cfg.imageGen?.key).toBe("file-image");
     expect(cfg.deepseek?.key).toBe("file-deepseek");
   });
@@ -768,13 +888,78 @@ describe("credential env preference", () => {
   });
 });
 
-describe("saveConfig section merge", () => {
+describe("the placement knobs", () => {
   beforeEach(() => {
     mkdirSync(DATA_DIR, { recursive: true });
     rmSync(join(DATA_DIR, "config.json"), { force: true });
   });
   afterEach(() => {
     rmSync(join(DATA_DIR, "config.json"), { force: true });
+  });
+
+  it("keeps the unreachable window longer than the heartbeat period", () => {
+    // A worker that has not said so for less than one period is healthy, so
+    // an inverted pair would mark a healthy worker unreachable.
+    const clamped = parseStoredConfig({ placement: { heartbeatSeconds: 60, unreachableAfterSeconds: 30 } });
+    expect(clamped.placement).toEqual({ heartbeatSeconds: 60, unreachableAfterSeconds: 61 });
+  });
+
+  it("leaves a pair that already holds the order alone", () => {
+    const kept = parseStoredConfig({ placement: { heartbeatSeconds: 15, unreachableAfterSeconds: 30 } });
+    expect(kept.placement).toEqual({ heartbeatSeconds: 15, unreachableAfterSeconds: 30 });
+  });
+
+  it("raises the window after the vault resolves an inverted pair", () => {
+    expect(clampPlacementWindow({ heartbeatSeconds: 120, unreachableAfterSeconds: 60 })).toEqual({
+      heartbeatSeconds: 120,
+      unreachableAfterSeconds: 121,
+    });
+    expect(clampPlacementWindow({ heartbeatSeconds: 120, unreachableAfterSeconds: 300 })).toEqual({
+      heartbeatSeconds: 120,
+      unreachableAfterSeconds: 300,
+    });
+    expect(clampPlacementWindow({ unreachableAfterSeconds: 30 })).toEqual({ unreachableAfterSeconds: 30 });
+  });
+
+  it("persists the section, so a save of a knob reaches the file", () => {
+    saveConfig({ placement: { heartbeatSeconds: 20, unreachableAfterSeconds: 45 } });
+    const stored = JSON.parse(readFileSync(join(DATA_DIR, "config.json"), "utf8"));
+    expect(stored.placement).toMatchObject({ heartbeatSeconds: 20, unreachableAfterSeconds: 45 });
+    expect(loadConfig().placement).toMatchObject({ heartbeatSeconds: 20, unreachableAfterSeconds: 45 });
+  });
+});
+
+describe("saveConfig section merge", () => {
+  beforeEach(() => {
+    mkdirSync(DATA_DIR, { recursive: true });
+    rmSync(join(DATA_DIR, "config.json"), { force: true });
+    rmSync(join(DATA_DIR, "persist-on-exit.policy"), { force: true });
+  });
+  afterEach(() => {
+    rmSync(join(DATA_DIR, "config.json"), { force: true });
+    rmSync(join(DATA_DIR, "persist-on-exit.policy"), { force: true });
+  });
+
+  it("persists server quit policy and retains it through another server setting", () => {
+    saveConfig({ server: { persistOnExit: false } });
+    expect(loadConfig().server?.persistOnExit).toBe(false);
+    expect(readFileSync(join(DATA_DIR, "persist-on-exit.policy"), "utf8")).toBe("false\n");
+
+    saveConfig({ server: { allowRemoteDesktopLaunch: true } });
+    expect(loadConfig().server).toMatchObject({ persistOnExit: false, allowRemoteDesktopLaunch: true });
+  });
+
+  it("uses the strict offline policy and replaces it on an online save", () => {
+    saveConfig({ server: { persistOnExit: true } });
+    writeFileSync(join(DATA_DIR, "persist-on-exit.policy"), "false\n");
+    expect(loadConfig().server?.persistOnExit).toBe(false);
+
+    saveConfig({ server: { persistOnExit: true } });
+    expect(readFileSync(join(DATA_DIR, "persist-on-exit.policy"), "utf8")).toBe("true\n");
+    expect(loadConfig().server?.persistOnExit).toBe(true);
+
+    writeFileSync(join(DATA_DIR, "persist-on-exit.policy"), "true\ntrailing");
+    expect(loadConfig().server?.persistOnExit).toBe(true);
   });
 
   it("persists usage URL and token, and a later URL-only patch keeps the token", () => {
@@ -965,6 +1150,55 @@ describe("operator-level computer allowlist", () => {
   });
 });
 
+describe("headroom null-clear (slice 7b)", () => {
+  it("accepts null for the three headroom knobs and rejects it elsewhere in admission", () => {
+    expect(parseConfigPatch({ jobs: { admission: { reservedCpuCores: null, reservedRamMb: null, minMemoryAvailablePercent: null } } })).toEqual({
+      jobs: { admission: { reservedCpuCores: null, reservedRamMb: null, minMemoryAvailablePercent: null } },
+    });
+    expect(() => parseConfigPatch({ jobs: { admission: { maxSwapPercent: null } } })).toThrow();
+    expect(() => parseConfigPatch({ jobs: { admission: { minFreeInodes: null } } })).toThrow();
+  });
+
+  it("deletes a stored headroom knob on null instead of persisting the null", () => {
+    mkdirSync(DATA_DIR, { recursive: true });
+    rmSync(join(DATA_DIR, "config.json"), { force: true });
+    try {
+      saveConfig({ jobs: { admission: { maxSwapPercent: 98, minFreeDiskMb: 2048, reservedCpuCores: 2, reservedRamMb: 512 } } });
+      expect(loadConfig().jobs?.admission?.reservedCpuCores).toBe(2);
+
+      // The headroom clients always send the complete admission object (the
+      // shallow jobs merge replaces it wholesale — see buildHeadroomPatch),
+      // so the clear rides with the carried-forward siblings.
+      saveConfig(parseConfigPatch({ jobs: { admission: { maxSwapPercent: 98, minFreeDiskMb: 2048, reservedCpuCores: null, reservedRamMb: 512 } } }));
+      const after = loadConfig();
+      expect(after.jobs?.admission?.reservedCpuCores).toBeUndefined();
+      // and only that knob is cleared — the sibling knobs and gates stand.
+      expect(after.jobs?.admission?.reservedRamMb).toBe(512);
+      expect(after.jobs?.admission?.maxSwapPercent).toBe(98);
+      expect("reservedCpuCores" in (after.jobs?.admission ?? {})).toBe(false);
+    } finally {
+      rmSync(join(DATA_DIR, "config.json"), { force: true });
+    }
+  });
+
+  it("leaves a stored headroom knob alone when the admission section is absent", () => {
+    // Admission merges wholesale at the section level, so "absent leaves
+    // alone" holds at the section boundary: an unrelated save never touches
+    // the stored knobs.  Only an explicit null deletes.
+    mkdirSync(DATA_DIR, { recursive: true });
+    rmSync(join(DATA_DIR, "config.json"), { force: true });
+    try {
+      saveConfig({ jobs: { admission: { maxSwapPercent: 98, minMemoryAvailablePercent: 20 } } });
+      saveConfig(parseConfigPatch({ profile: { name: "Jay" } }));
+      const after = loadConfig();
+      expect(after.jobs?.admission?.minMemoryAvailablePercent).toBe(20);
+      expect(after.jobs?.admission?.maxSwapPercent).toBe(98);
+    } finally {
+      rmSync(join(DATA_DIR, "config.json"), { force: true });
+    }
+  });
+});
+
 describe("autoUpdate throttle", () => {
   it("treats the first run as due when no lastCheckMs is recorded and the toggle is on", () => {
     const now = 1_700_000_000_000;
@@ -1049,9 +1283,111 @@ describe("public ingress URL", () => {
     ).toBe("https://hooks.example.com");
     expect(publicIngressUrlEffective({})).toBeNull();
   });
+
+  it("webhookPublicIngressUrl prefers dedicated webhookPublicUrl over publicUrl", () => {
+    expect(
+      webhookPublicIngressUrl({
+        ingress: {
+          publicUrl: "https://botfleet.jays.services",
+          webhookPublicUrl: "https://agents.jays.services",
+        },
+      }),
+    ).toBe("https://agents.jays.services");
+    expect(
+      webhookPublicIngressUrl({
+        ingress: {
+          publicUrl: "https://botfleet.jays.services",
+        },
+      }),
+    ).toBe("https://botfleet.jays.services");
+    expect(
+      webhookPublicIngressUrl({
+        ingress: {
+          publicUrl: "https://botfleet.jays.services",
+          webhookPublicUrl: "invalid-url",
+        },
+      }),
+    ).toBe("https://botfleet.jays.services");
+    expect(
+      webhookPublicIngressUrlEffective({
+        ingress: {
+          publicUrl: "https://botfleet.jays.services",
+          webhookPublicUrl: "https://agents.jays.services",
+          enabled: false,
+        },
+      }),
+    ).toBeNull();
+    expect(
+      webhookPublicIngressUrlEffective({
+        ingress: {
+          publicUrl: "https://botfleet.jays.services",
+          webhookPublicUrl: "https://agents.jays.services",
+          enabled: true,
+        },
+      }),
+    ).toBe("https://agents.jays.services");
+  });
+});
+
+describe("knob-backed env migrations", () => {
+  let savedEnv: Record<string, string | undefined>;
+  const ENV_NAMES = [
+    "OMB_COMPUTER_CALL_WAIT_MS",
+    "OMB_COMPUTER_CALL_ACT_WITHIN_MS",
+    "OMB_COMPUTER_WAIT_MAX_MS",
+    "OMB_CLAUDE_SESSION_IDLE_MS",
+    "OMB_CLAUDE_SESSION_IDLE_MIN_MS",
+  ] as const;
+
+  beforeEach(() => {
+    savedEnv = Object.fromEntries(ENV_NAMES.map((name) => [name, process.env[name]]));
+    for (const name of ENV_NAMES) delete process.env[name];
+  });
+  afterEach(() => {
+    for (const name of ENV_NAMES) {
+      if (savedEnv[name] === undefined) delete process.env[name];
+      else process.env[name] = savedEnv[name];
+    }
+  });
+
+  it("resolves the computer-call waits to the pre-knob defaults when nothing is set", () => {
+    expect(computerCallSettings({})).toEqual({
+      waitMs: 45_000,
+      actWithinMs: 5_000,
+      personAwayMs: DEFAULT_COMPUTER_PERSON_AWAY_MS,
+    });
+  });
+
+  it("keeps the legacy env names working underneath the config fields", () => {
+    process.env.OMB_COMPUTER_CALL_WAIT_MS = "2000";
+    process.env.OMB_COMPUTER_CALL_ACT_WITHIN_MS = "250";
+    process.env.OMB_COMPUTER_WAIT_MAX_MS = "90000";
+    expect(computerCallSettings({})).toEqual({ waitMs: 2_000, actWithinMs: 250, personAwayMs: 90_000 });
+    // A stored (or vault-resolved) field wins over the env name.
+    expect(computerCallSettings({ computerCall: { waitMs: 3_000 } }).waitMs).toBe(3_000);
+  });
+
+  it("clamps the computer-call waits to the gate's bounds", () => {
+    expect(computerCallSettings({ computerCall: { waitMs: 10, actWithinMs: 999_999 } })).toMatchObject({
+      waitMs: 500,
+      actWithinMs: 5_000,
+    });
+  });
+
+  it("resolves the Muse session idle window with its floor, cfg over env over default", () => {
+    expect(claudeSessionIdleMs({})).toBe(DEFAULT_CLAUDE_SESSION_IDLE_MS);
+    process.env.OMB_CLAUDE_SESSION_IDLE_MIN_MS = "10";
+    process.env.OMB_CLAUDE_SESSION_IDLE_MS = "50";
+    expect(claudeSessionIdleMs({})).toBe(50);
+    expect(claudeSessionIdleMs({ claudeSession: { idleMs: 120_000 } })).toBe(120_000);
+    // The floor holds even when the configured window is below it.
+    expect(claudeSessionIdleMs({ claudeSession: { idleMs: 5, idleMinMs: 2_000 } })).toBe(2_000);
+    expect(claudeSessionIdleMs({ claudeSession: { idleMs: 9_999_999_999 } })).toBe(2_147_483_647);
+  });
 });
 
 describe("observability settings", () => {
+
   let savedEnv: Record<string, string | undefined>;
   const ENV_NAMES = ["SENTRY_ENV", "SENTRY_TRACES_SAMPLE_RATE", "NODE_ENV"] as const;
 
@@ -1135,6 +1471,9 @@ describe("observability settings", () => {
     expect(parseConfigPatch({ observability: { sentryDsn: "" } })).toEqual({
       observability: { sentryDsn: "" },
     });
+    expect(() => parseConfigPatch({ observability: { sentryFleetDsn: "http://abc123@o0.ingest.sentry.io/1" } })).toThrow(
+      "observability.sentryFleetDsn must be a Sentry https:// DSN",
+    );
     expect(
       parseConfigPatch({
         observability: { sentryDsn: SENTINEL_DSN, enabled: false, tracesSampleRate: 0, logsEnabled: false },
@@ -1176,9 +1515,13 @@ describe("observability settings", () => {
   it("defaults the environment, sample rate, and log forwarding", () => {
     expect(observabilitySettings({})).toEqual({
       dsn: null,
+      fleetDsn: null,
       enabled: true,
       environment: "production",
       tracesSampleRate: DEFAULT_SENTRY_TRACES_SAMPLE_RATE,
+      aiTracesSampleRate: DEFAULT_SENTRY_AI_TRACES_SAMPLE_RATE,
+      httpTracesSampleRate: DEFAULT_SENTRY_HTTP_TRACES_SAMPLE_RATE,
+      uiTracesSampleRate: DEFAULT_SENTRY_UI_TRACES_SAMPLE_RATE,
       logsEnabled: true,
     });
   });
@@ -1186,14 +1529,40 @@ describe("observability settings", () => {
   it("prefers a saved value over the long-standing env names", () => {
     process.env.SENTRY_ENV = "from-env";
     process.env.SENTRY_TRACES_SAMPLE_RATE = "0.9";
-    expect(observabilitySettings({})).toMatchObject({ environment: "from-env", tracesSampleRate: 0.9 });
+    process.env.SENTRY_AI_TRACES_SAMPLE_RATE = "0.75";
+    process.env.SENTRY_HTTP_TRACES_SAMPLE_RATE = "0.05";
+    process.env.SENTRY_UI_TRACES_SAMPLE_RATE = "0.02";
+    expect(observabilitySettings({})).toMatchObject({
+      environment: "from-env",
+      tracesSampleRate: 0.9,
+      aiTracesSampleRate: 0.75,
+      httpTracesSampleRate: 0.05,
+      uiTracesSampleRate: 0.02,
+    });
     expect(
-      observabilitySettings({ observability: { environment: "operator", tracesSampleRate: 0.05 } }),
-    ).toMatchObject({ environment: "operator", tracesSampleRate: 0.05 });
+      observabilitySettings({
+        observability: {
+          environment: "operator",
+          tracesSampleRate: 0.05,
+          aiTracesSampleRate: 1.0,
+          httpTracesSampleRate: 0.2,
+          uiTracesSampleRate: 0.15,
+        },
+      }),
+    ).toMatchObject({
+      environment: "operator",
+      tracesSampleRate: 0.05,
+      aiTracesSampleRate: 1.0,
+      httpTracesSampleRate: 0.2,
+      uiTracesSampleRate: 0.15,
+    });
   });
 
   it("keeps an explicit zero sample rate instead of defaulting it away", () => {
     expect(observabilitySettings({ observability: { tracesSampleRate: 0 } }).tracesSampleRate).toBe(0);
+    expect(observabilitySettings({ observability: { aiTracesSampleRate: 0 } }).aiTracesSampleRate).toBe(0);
+    expect(observabilitySettings({ observability: { httpTracesSampleRate: 0 } }).httpTracesSampleRate).toBe(0);
+    expect(observabilitySettings({ observability: { uiTracesSampleRate: 0 } }).uiTracesSampleRate).toBe(0);
     expect(observabilitySettings({ observability: { logsEnabled: false } }).logsEnabled).toBe(false);
   });
 });
@@ -1214,6 +1583,9 @@ describe("the secret-store section", () => {
     "INFISICAL_DOMAIN",
     "INFISICAL_ENVIRONMENT",
     "INFISICAL_SECRET_PATH",
+    "INFISICAL_READ_SOURCES",
+    "INFISICAL_TOKEN",
+    "INFISICAL_WRITE_TOKEN",
   ] as const;
   let saved: Record<string, string | undefined>;
 
@@ -1256,6 +1628,54 @@ describe("the secret-store section", () => {
     expect(infisicalEnabled(loadConfig())).toBe(false);
   });
 
+  it("persists the pronunciation list beside the voice, the way the STT vocabulary is kept", () => {
+    saveConfig({ tts: { key: "sentinel-tts-key", voice: "jay-wedgeworth-001" } });
+    const list = [{ term: "SQL", say: "sequel" }, { term: "C#", say: "C sharp" }];
+    saveConfig(parseConfigPatch({ tts: { pronunciations: list } }));
+    // A section merge: the list never drops the key or the default voice.
+    expect(loadConfig().tts).toMatchObject({ key: "sentinel-tts-key", voice: "jay-wedgeworth-001", pronunciations: list });
+    saveConfig(parseConfigPatch({ tts: { voice: "English_Graceful_Lady" } }));
+    expect(loadConfig().tts).toMatchObject({ voice: "English_Graceful_Lady", pronunciations: list });
+    // A saved empty list stays empty, so the defaults do not come back.
+    saveConfig(parseConfigPatch({ tts: { pronunciations: [] } }));
+    expect(loadConfig().tts?.pronunciations).toEqual([]);
+  });
+
+  it("validates the pronunciation list with the shared rules, and canonicalizes it", () => {
+    expect(parseConfigPatch({ tts: { pronunciations: [{ term: " SQL ", say: " se   quel " }] } }).tts?.pronunciations).toEqual([
+      { term: "SQL", say: "se quel" },
+    ]);
+    expect(() => parseConfigPatch({ tts: { pronunciations: [{ term: "SQL", say: "a" }, { term: "sql", say: "b" }] } }))
+      .toThrow("sql is on the list twice.");
+    expect(() => parseConfigPatch({ tts: { pronunciations: [{ term: "two words", say: "x" }] } })).toThrow();
+    expect(() => parseConfigPatch({ tts: { pronunciations: [{ term: "SQL", say: "my SQL" }] } })).toThrow();
+    expect(() => parseConfigPatch({ tts: { pronunciations: "SQL=sequel" } })).toThrow();
+  });
+
+  it("keeps every other setting when a hand-edited pronunciation list is bad", () => {
+    const stored = parseStoredConfig({
+      profile: { name: "Jay" },
+      tts: {
+        voice: "jay-wedgeworth-001",
+        pronunciations: [{ term: "SQL", say: "sequel" }, { term: "sql", say: "dup" }, { term: "", say: "x" }, 7],
+      },
+    });
+    expect(stored.profile?.name).toBe("Jay");
+    expect(stored.tts).toEqual({ voice: "jay-wedgeworth-001", pronunciations: [{ term: "SQL", say: "sequel" }] });
+    // Not a list at all reads as never saved, which means the defaults.
+    expect(parseStoredConfig({ tts: { voice: "v", pronunciations: "nope" } }).tts).toEqual({ voice: "v" });
+  });
+
+  it("persists call STT vocabulary and clears an explicit provider on Auto", () => {
+    const terms = Array.from({ length: 100 }, (_, index) => `term-${index}`);
+    const patch = parseConfigPatch({ callStt: { provider: "assemblyai", keyterms: terms } });
+    saveConfig(patch);
+    expect(loadConfig().callStt).toEqual({ provider: "assemblyai", keyterms: terms });
+    saveConfig(parseConfigPatch({ callStt: { provider: null } }));
+    expect(loadConfig().callStt).toEqual({ keyterms: terms });
+    expect(() => parseConfigPatch({ callStt: { keyterms: [...terms, "overflow"] } })).toThrow();
+  });
+
   it("persists a DeepSeek key, which the allowlist used to drop on the floor", () => {
     // The key is in the schema, in the API Keys panel and in the tombstone
     // list, so a save reported success while nothing reached disk.
@@ -1281,10 +1701,22 @@ describe("the secret-store section", () => {
       projectId: PROJECT_ID,
       secretPath: "/botfleet",
     });
-    expect(infisicalConfigured(cfg)).toBe(true);
+    expect(infisicalConfigured(cfg)).toBe(false);
+    expect(infisicalConfigured({ ...cfg, infisical: { ...cfg.infisical, authMethod: "machine-identity" } })).toBe(true);
 
     delete process.env.INFISICAL_CLIENT_ID;
     expect(loadConfig().infisical?.clientId).toBe("from-alias");
+  });
+
+  it("reads read sources from INFISICAL_READ_SOURCES JSON", () => {
+    process.env.INFISICAL_READ_SOURCES = JSON.stringify([{ name: "env-source", tokenEnv: "FAKE_ENV_TOK", projectId: "env-proj" }]);
+    try {
+      expect(infisicalSettings(loadConfig()).readSources).toEqual([
+        { name: "env-source", tokenFile: "", tokenEnv: "FAKE_ENV_TOK", projectId: "env-proj", environment: "prod", secretPath: "/" },
+      ]);
+    } finally {
+      delete process.env.INFISICAL_READ_SOURCES;
+    }
   });
 
   it("stays inert with no project id and no identity", () => {
@@ -1302,6 +1734,7 @@ describe("the secret-store section", () => {
 
   it("defaults the site, environment, path, cadence, and write-through", () => {
     expect(infisicalSettings({})).toEqual({
+      authMethod: "service-token",
       enabled: true,
       writeThrough: false,
       siteUrl: DEFAULT_INFISICAL_SITE_URL,
@@ -1310,6 +1743,9 @@ describe("the secret-store section", () => {
       secretPath: DEFAULT_INFISICAL_SECRET_PATH,
       clientId: "",
       clientSecret: "",
+      token: "",
+      writeToken: "",
+      readSources: [],
       refreshMinutes: DEFAULT_INFISICAL_REFRESH_MINUTES,
     });
     expect(
@@ -1320,6 +1756,134 @@ describe("the secret-store section", () => {
     expect(infisicalSettings({ infisical: { refreshMinutes: 0 } }).refreshMinutes).toBe(5);
     expect(infisicalSettings({ infisical: { refreshMinutes: 99_999 } }).refreshMinutes).toBe(1440);
     expect(infisicalSettings({ infisical: { writeThrough: true } }).writeThrough).toBe(true);
+  });
+
+  it("treats a service token as an identity, with or without the machine identity", () => {
+    // A token alone is enough to read the store: that is the shape every
+    // non-agent consumer runs with.
+    expect(infisicalConfigured({ infisical: { projectId: "p", token: "st.read" } })).toBe(true);
+    expect(infisicalConfigured({ infisical: { projectId: "p" } })).toBe(false);
+    expect(
+      infisicalConfigured({ infisical: { projectId: "p", clientId: "id", clientSecret: "secret" } }),
+    ).toBe(false);
+    expect(infisicalConfigured({ infisical: { authMethod: "machine-identity", projectId: "p", clientId: "id", clientSecret: "secret" } })).toBe(true);
+    expect(
+      infisicalSettings({ infisical: { projectId: "p", token: " st.read ", writeToken: " st.write " } }),
+    ).toMatchObject({ token: "st.read", writeToken: "st.write" });
+  });
+
+  it("accepts multiple read sources and defaults their environment and path", () => {
+    const settings = infisicalSettings({
+      infisical: {
+        projectId: "main-proj",
+        token: "st.main-not-real",
+        readSources: [
+          { name: "fleetops-zulip", tokenFile: "/tmp/fake-fleetops-token", projectId: "fleet-proj", environment: "prod", secretPath: "/zulip" },
+          { name: "afc-zulip", tokenEnv: "FAKE_AFC_TOKEN", projectId: "afc-proj" },
+          { name: "fleetops-zulip", tokenEnv: "FAKE_DUP", projectId: "dup-proj" },
+          { name: "Bad Name", tokenEnv: "FAKE_BAD", projectId: "bad-proj" },
+        ],
+      },
+    });
+    expect(settings.token).toBe("st.main-not-real");
+    expect(settings.readSources).toEqual([
+      { name: "fleetops-zulip", tokenFile: "/tmp/fake-fleetops-token", tokenEnv: "", projectId: "fleet-proj", environment: "prod", secretPath: "/zulip" },
+      { name: "afc-zulip", tokenFile: "", tokenEnv: "FAKE_AFC_TOKEN", projectId: "afc-proj", environment: "prod", secretPath: "/" },
+    ]);
+    expect(parseConfigPatch({ infisical: { readSources: [{ name: "a-source", projectId: "p1", tokenEnv: "FAKE_TOK" }] } })).toMatchObject({
+      infisical: { readSources: [{ name: "a-source", projectId: "p1" }] },
+    });
+    expect(() => parseConfigPatch({ infisical: { readSources: [{ name: "Bad Name", projectId: "p1" }] } })).toThrow("readSources");
+    expect(() => parseConfigPatch({ infisical: { readSources: [{ name: "ok", projectId: "../x" }] } })).toThrow("readSources");
+    expect(() => parseConfigPatch({ zulip: { credentialSources: { login: { source: "fleetops-zulip", keyPattern: "{ROLE}_ZULIP_{FIELD}" } } } })).not.toThrow();
+    expect(() => parseConfigPatch({ zulip: { credentialSources: { login: { source: "Bad Source" } } } })).toThrow("credentialSources");
+    // A pattern without {ROLE} would resolve every role to the same
+    // secret; the login pattern also needs {FIELD}.
+    expect(() => parseConfigPatch({ zulip: { credentialSources: { login: { source: "fleetops-zulip", keyPattern: "ZULIP_{FIELD}" } } } })).toThrow("credentialSources");
+    expect(() => parseConfigPatch({ zulip: { credentialSources: { login: { source: "fleetops-zulip", keyPattern: "{ROLE}_ZULIP_API_KEY" } } } })).toThrow("credentialSources");
+    expect(() => parseConfigPatch({ zulip: { credentialSources: { outgoing: { source: "afc-zulip", keyPattern: "ZULIP_OUTGOING_TOKEN" } } } })).toThrow("credentialSources");
+    expect(() => parseConfigPatch({ zulip: { credentialSources: { outgoing: { source: "afc-zulip", keyPattern: "ZULIP_OUTGOING_{ROLE}_TOKEN" } } } })).not.toThrow();
+    // `{FIELD}` in an outgoing pattern expands to "" (there is no field),
+    // so it must be rejected rather than produce a double-underscore name.
+    expect(() => parseConfigPatch({ zulip: { credentialSources: { outgoing: { source: "afc-zulip", keyPattern: "ZULIP_OUTGOING_{ROLE}_{FIELD}_TOKEN" } } } })).toThrow("credentialSources");
+    expect(() => parseConfigPatch({ zulip: { credentialSources: { outgoing: { source: "afc-zulip", keyPattern: "ZULIP_OUTGOING_{FIELD}_TOKEN" } } } })).toThrow("credentialSources");
+    // A per-field project/environment cannot be honoured (the named
+    // source's token is scoped to its own project/env), so it is dropped.
+    expect(parseConfigPatch({ zulip: { credentialSources: { login: { source: "fleetops-zulip", keyPattern: "{ROLE}_ZULIP_{FIELD}", projectId: "other-proj", environment: "dev" } } } })).toEqual({
+      zulip: { credentialSources: { login: { source: "fleetops-zulip", keyPattern: "{ROLE}_ZULIP_{FIELD}" } } },
+    });
+    // Stored read-source paths are normalized the same way requests are.
+    expect(
+      infisicalSettings({ infisical: { projectId: "main-proj", readSources: [{ name: "a-source", tokenEnv: "FAKE_TOK", projectId: "p1", secretPath: "/zulip/" }] } }).readSources[0]?.secretPath,
+    ).toBe("/zulip");
+  });
+
+  it("drops one bad readSources entry and keeps the main infisical settings and the valid entries", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      writeFileSync(
+        join(DATA_DIR, "config.json"),
+        JSON.stringify({
+          infisical: {
+            projectId: "main-proj",
+            clientId: "fake-client-id",
+            clientSecret: "fake-client-secret-not-real",
+            token: "st.main-not-real",
+            readSources: [
+              { name: "fleetops-zulip", tokenFile: "/tmp/fake-fleetops-token", projectId: "fleet-proj", environment: "prod", secretPath: "/zulip" },
+              { name: "Bad Name", tokenEnv: "FAKE_BAD_TOKEN_VALUE", projectId: "../bad" },
+              { name: "afc-zulip", tokenEnv: "FAKE_AFC_TOKEN", projectId: "afc-proj" },
+            ],
+          },
+          zulip: {
+            enabled: true,
+            credentialSources: {
+              login: { source: "fleetops-zulip", keyPattern: "{ROLE}_ZULIP_{FIELD}" },
+              outgoing: { source: "Bad Source" },
+            },
+          },
+          profile: { name: "Ada" },
+        }),
+      );
+      const cfg = loadConfig();
+      expect(cfg.profile?.name).toBe("Ada");
+      expect(cfg.infisical).toMatchObject({ projectId: "main-proj", clientId: "fake-client-id", token: "st.main-not-real" });
+      expect(infisicalSettings(cfg).readSources.map((s) => s.name)).toEqual(["fleetops-zulip", "afc-zulip"]);
+      expect(cfg.zulip?.enabled).toBe(true);
+      expect(cfg.zulip?.credentialSources).toEqual({ login: { source: "fleetops-zulip", keyPattern: "{ROLE}_ZULIP_{FIELD}" } });
+      const text = warn.mock.calls.flat().join(" ");
+      expect(text).toContain("infisical.readSources.1");
+      expect(text).toContain("Bad Name");
+      expect(text).toContain("zulip.credentialSources.outgoing");
+      expect(text).not.toContain("FAKE_BAD_TOKEN_VALUE");
+      expect(text).not.toContain("st.main-not-real");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("keeps a service token that arrives in the config file or in a patch", () => {
+    // The schema strips the keys it does not know, so a token the schema
+    // does not mention is dropped on the floor: the file looks configured
+    // and the server falls back to the machine identity.  This pins the
+    // file route and the patch route, because both go through the schema.
+    writeFileSync(
+      join(DATA_DIR, "config.json"),
+      JSON.stringify({
+        infisical: {
+          projectId: "fixture-project-id",
+          token: "st.file-read-token",
+          writeToken: "st.file-write-token",
+        },
+      }),
+    );
+    const cfg = loadConfig();
+    expect(cfg.infisical?.token).toBe("st.file-read-token");
+    expect(cfg.infisical?.writeToken).toBe("st.file-write-token");
+
+    const patch = parseConfigPatch({ infisical: { token: "st.patched-token" } });
+    expect(patch).toMatchObject({ infisical: { token: "st.patched-token" } });
+    rmSync(join(DATA_DIR, "config.json"), { force: true });
   });
 
   it("rejects a site URL, path, environment, or project id that cannot be trusted in a query", () => {
@@ -1392,6 +1956,192 @@ describe("the secret-store section", () => {
     expect(process.env.INFISICAL_CLIENT_SECRET).toBeUndefined();
   });
 
+  it("persists explicit auth and independent source write locators without inline source credentials", () => {
+    const patch = parseConfigPatch({ infisical: {
+      authMethod: "service-token", projectId: "main", readSources: [{
+        name: "staging-settings", projectId: "other", environment: "staging", secretPath: "/settings/",
+        tokenEnv: "BF_TEST_READ", writeTokenEnv: "BF_TEST_WRITE",
+      }],
+    } });
+    saveConfig(patch);
+    expect(infisicalSettings(loadConfig()).readSources[0]).toMatchObject({ secretPath: "/settings", writeTokenEnv: "BF_TEST_WRITE" });
+    expect(() => parseConfigPatch({ infisical: { readSources: [{
+      name: "scope", projectId: "p", tokenEnv: "BF_TEST_READ", token: "must-be-rejected",
+    }] } })).toThrow("readSources");
+    expect(() => parseConfigPatch({ infisical: { authMethod: "auto" } })).toThrow();
+    expect(() => parseConfigPatch({ infisical: { readSources: [{ name: "bad", projectId: "p", writeTokenFile: "relative" }] } })).toThrow();
+  });
+
+  it("rejects unknown Infisical request keys while preserving stored-file compatibility", () => {
+    expect(() => parseConfigPatch({ infisical: { writeThru: true } })).toThrow("infisical");
+    expect(() => parseConfigPatch({ infisical: { readSources: [{
+      name: "scope", projectId: "p", tokenEn: "BF_TEST_READ",
+    }] } })).toThrow("readSources");
+    expect(parseStoredConfig({ infisical: {
+      enabled: false, futureOption: true, readSources: [{
+        name: "scope", projectId: "p", tokenEnv: "BF_TEST_READ", futureLocatorOption: true,
+      }],
+    } }).infisical).toEqual({ enabled: false, readSources: [{
+      name: "scope", projectId: "p", tokenEnv: "BF_TEST_READ",
+    }] });
+  });
+
+  it.each([
+    ["tokenFile", `/${"x".repeat(4095)}`, `/${"x".repeat(4096)}`],
+    ["writeTokenFile", `/${"x".repeat(4095)}`, `/${"x".repeat(4096)}`],
+    ["tokenEnv", "X".repeat(256), "X".repeat(257)],
+    ["writeTokenEnv", "X".repeat(256), "X".repeat(257)],
+  ])("bounds source locator %s in requests and bootstrap resolution", (field, allowed, oversized) => {
+    const source = { name: "scope", projectId: "p", [field]: allowed };
+    expect(() => parseConfigPatch({ infisical: { readSources: [source] } })).not.toThrow();
+    expect(() => parseConfigPatch({ infisical: { readSources: [{ ...source, [field]: oversized }] } })).toThrow("readSources");
+    process.env.INFISICAL_READ_SOURCES = JSON.stringify([{ ...source, [field]: oversized }]);
+    expect(infisicalSettings(loadConfig()).readSources).toEqual([]);
+  });
+
+  it("strips dedicated source credential environment names from bot children", () => {
+    saveConfig({ infisical: { readSources: [{ name: "scope", projectId: "p", tokenEnv: "BF_TEST_READ", writeTokenEnv: "BF_TEST_WRITE" }] } });
+    loadConfig();
+    const childEnv = { PATH: "/usr/bin", BF_TEST_READ: "fake-read", BF_TEST_WRITE: "fake-write" };
+    stripWorkspaceCredentialEnv(childEnv);
+    expect(childEnv).toEqual({ PATH: "/usr/bin" });
+    saveConfig({ infisical: { readSources: [] } });
+    loadConfig();
+    const laterChild = { PATH: "/usr/bin", BF_TEST_READ: "old-read", BF_TEST_WRITE: "old-write" };
+    stripWorkspaceCredentialEnv(laterChild);
+    expect(laterChild).toEqual({ PATH: "/usr/bin" });
+  });
+
+  it("drops malformed source routing instead of defaulting it into another environment or folder", () => {
+    expect(infisicalSettings({ infisical: { readSources: [
+      { name: "bad-env", projectId: "p", environment: "../prod", tokenEnv: "BF_TEST_READ" },
+      { name: "bad-path", projectId: "p", secretPath: "relative", tokenEnv: "BF_TEST_READ" },
+      { name: "bad-token-env", projectId: "p", tokenEnv: "not a variable" },
+    ] } }).readSources).toEqual([]);
+  });
+
+  it("strips valid credential env names from malformed routes and retains them after route removal", () => {
+    process.env.INFISICAL_READ_SOURCES = JSON.stringify([{
+      name: "bad name", projectId: "../other", environment: "../prod", secretPath: "relative",
+      tokenEnv: " BF_MALFORMED_ROUTE_READ ", writeTokenEnv: " BF_MALFORMED_ROUTE_WRITE ",
+    }]);
+    expect(infisicalSettings(loadConfig()).readSources).toEqual([]);
+    const child = { PATH: "/usr/bin", BF_MALFORMED_ROUTE_READ: "fake-read", BF_MALFORMED_ROUTE_WRITE: "fake-write" };
+    stripWorkspaceCredentialEnv(child);
+    expect(child).toEqual({ PATH: "/usr/bin" });
+    process.env.INFISICAL_READ_SOURCES = "[]";
+    loadConfig();
+    const laterChild = { PATH: "/usr/bin", BF_MALFORMED_ROUTE_READ: "old-read", BF_MALFORMED_ROUTE_WRITE: "old-write" };
+    stripWorkspaceCredentialEnv(laterChild);
+    expect(laterChild).toEqual({ PATH: "/usr/bin" });
+  });
+
+  it("syncs saved primary tokens and clears identity aliases instead of resurrecting them", () => {
+    process.env.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID = "fake-old-id";
+    process.env.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET = "fake-old-secret";
+    syncCredentialEnv({ infisical: { token: "fake-read", writeToken: "fake-write", clientId: "", clientSecret: "", projectId: "new-project" } });
+    expect(process.env.INFISICAL_TOKEN).toBe("fake-read");
+    expect(process.env.INFISICAL_WRITE_TOKEN).toBe("fake-write");
+    expect(process.env.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID).toBeUndefined();
+    expect(process.env.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET).toBeUndefined();
+    expect(process.env.INFISICAL_PROJECT_ID).toBe("new-project");
+  });
+
+  it("reuses one read/write reference pair across project folders and environments", () => {
+    const sources = ["/one", "/two"].flatMap((secretPath) => ["prod", "staging"].map((environment, index) => ({
+      name: `${secretPath.slice(1)}-${index}`, projectId: "p", environment, secretPath,
+      tokenEnv: "SCOPE_READ", writeTokenEnv: "SCOPE_WRITE",
+    })));
+    expect(infisicalSettings({ infisical: { readSources: sources } }).configurationError).toBeUndefined();
+    expect(() => saveConfig({ infisical: { readSources: sources } })).not.toThrow();
+  });
+
+  it("caps primary and secondary credential references per project without leaking values", () => {
+    const cfg = { infisical: { projectId: "p", token: "fake-primary-read", writeToken: "fake-primary-write" } };
+    const extra = { name: "extra", projectId: "p", secretPath: "/extra", tokenEnv: "ANOTHER_READ" };
+    expect(() => validateInfisicalConfigPatch(cfg, { infisical: { readSources: [extra] } })).toThrow(/one read token reference/);
+    expect(() => validateInfisicalConfigPatch(cfg, { infisical: { readSources: [{ ...extra, tokenEnv: "INFISICAL_TOKEN", writeTokenEnv: "ANOTHER_WRITE" }] } })).toThrow(/one write token reference/);
+    expect(() => validateInfisicalConfigPatch(cfg, { infisical: { readSources: [{ ...extra, tokenEnv: "INFISICAL_TOKEN", writeTokenEnv: "INFISICAL_WRITE_TOKEN" }] } })).not.toThrow();
+    expect(() => validateInfisicalConfigPatch(cfg, { infisical: { readSources: [{ ...extra, secretPath: "/", tokenEnv: "NEW_READ", writeTokenEnv: "NEW_WRITE" }] } })).not.toThrow();
+    saveConfig(cfg);
+    expect(() => saveConfig({ infisical: { readSources: [extra] } })).toThrow(/one read token reference/);
+    expect(loadConfig().infisical?.readSources).toBeUndefined();
+  });
+
+  it("deduplicates file paths and applies the cap to environment JSON overlays", () => {
+    expect(infisicalSettings({ infisical: { readSources: [
+      { name: "first", projectId: "p", secretPath: "/one", tokenFile: "/fixture/dir/../read" },
+      { name: "second", projectId: "p", secretPath: "/two", tokenFile: "/fixture/read" },
+    ] } }).configurationError).toBeUndefined();
+    process.env.INFISICAL_PROJECT_ID = "p";
+    process.env.INFISICAL_TOKEN = "fake-primary-read";
+    process.env.INFISICAL_READ_SOURCES = JSON.stringify([
+      { name: "extra", projectId: "p", secretPath: "/extra", tokenEnv: "ANOTHER_READ" },
+    ]);
+    const cfg = loadConfig();
+    expect(infisicalSettings(cfg).configurationError).toMatch(/one read token reference/);
+    expect(() => validateInfisicalConfigPatch(cfg, { infisical: { refreshMinutes: 20 } })).toThrow(/one read token reference/);
+    expect(infisicalSettings(cfg).configurationError).not.toContain("fake-primary-read");
+  });
+
+  it.each(["read", "write"] as const)("locked saves include the effective bootstrap primary %s token", (mode) => {
+    saveConfig({ infisical: { projectId: "disk-project", enabled: false } });
+    process.env.INFISICAL_PROJECT_ID = "bootstrap-project";
+    process.env.INFISICAL_TOKEN = "fake-bootstrap-read";
+    process.env.INFISICAL_WRITE_TOKEN = "fake-bootstrap-write";
+    const source: InfisicalReadSource = { name: "extra", projectId: "bootstrap-project", secretPath: "/extra",
+      tokenEnv: mode === "read" ? "ANOTHER_READ" : "INFISICAL_TOKEN",
+    };
+    if (mode === "write") source.writeTokenEnv = "ANOTHER_WRITE";
+    const patch = { infisical: { readSources: [source] } };
+    const before = readFileSync(join(DATA_DIR, "config.json"), "utf8");
+    expect(() => validateInfisicalConfigPatch(loadConfig(), patch)).toThrow(/token reference/);
+    expect(() => saveConfig(patch)).toThrow(/token reference/);
+    expect(readFileSync(join(DATA_DIR, "config.json"), "utf8")).toBe(before);
+  });
+
+  it("locked metadata saves include environment source routes rather than just disk routes", () => {
+    saveConfig({ infisical: { projectId: "p", token: "fake-file-primary" } });
+    process.env.INFISICAL_READ_SOURCES = JSON.stringify([
+      { name: "extra", projectId: "p", secretPath: "/extra", tokenEnv: "ANOTHER_READ" },
+    ]);
+    const patch = { infisical: { refreshMinutes: 20 } };
+    const before = readFileSync(join(DATA_DIR, "config.json"), "utf8");
+    expect(() => validateInfisicalConfigPatch(loadConfig(), patch)).toThrow(/token reference/);
+    expect(() => saveConfig(patch)).toThrow(/token reference/);
+    expect(readFileSync(join(DATA_DIR, "config.json"), "utf8")).toBe(before);
+  });
+
+  it("locked saves allow shared bootstrap references without persisting their values", () => {
+    process.env.INFISICAL_PROJECT_ID = "p";
+    process.env.INFISICAL_TOKEN = "fake-bootstrap-read";
+    process.env.INFISICAL_WRITE_TOKEN = "fake-bootstrap-write";
+    const readSources = ["/one", "/two"].map((secretPath, index) => ({
+      name: `scope-${index}`, projectId: "p", secretPath,
+      tokenEnv: "INFISICAL_TOKEN", writeTokenEnv: "INFISICAL_WRITE_TOKEN",
+    }));
+    expect(() => saveConfig({ infisical: { readSources } })).not.toThrow();
+    const disk = JSON.parse(readFileSync(join(DATA_DIR, "config.json"), "utf8"));
+    expect(disk.infisical).toEqual({ readSources });
+    expect(infisicalSettings(loadConfig()).configurationError).toBeUndefined();
+  });
+
+  it("locked save validation lets explicit patch fields replace bootstrap values", () => {
+    process.env.INFISICAL_PROJECT_ID = "p";
+    process.env.INFISICAL_TOKEN = "fake-bootstrap-read";
+    process.env.INFISICAL_READ_SOURCES = JSON.stringify([
+      { name: "old", projectId: "p", secretPath: "/extra", tokenEnv: "OLD_READ" },
+    ]);
+    const patch = { infisical: { token: "", readSources: [
+      { name: "replacement", projectId: "p", secretPath: "/extra", tokenEnv: "NEW_READ" },
+    ] } };
+    expect(() => validateInfisicalConfigPatch(loadConfig(), patch)).not.toThrow();
+    expect(() => saveConfig(patch)).not.toThrow();
+    syncCredentialEnv(patch);
+    expect(infisicalSettings(loadConfig()).configurationError).toBeUndefined();
+    expect(loadConfig().infisical?.readSources?.[0]?.name).toBe("replacement");
+  });
+
   it("strips the machine identity from a child environment", () => {
     // It can read every name in the project, so of everything on the strip
     // list this is the pair that must never reach a spawned engine CLI.
@@ -1451,3 +2201,369 @@ describe("the secret-store section", () => {
     }
   });
 });
+
+describe("imessageLinq config section", () => {
+  beforeEach(() => {
+    mkdirSync(DATA_DIR, { recursive: true });
+    rmSync(join(DATA_DIR, "config.json"), { force: true });
+  });
+  afterEach(() => {
+    rmSync(join(DATA_DIR, "config.json"), { force: true });
+  });
+
+  it("defaults to absent and lets bots opt in via per-bot imessagePerBot", () => {
+    writeFileSync(join(DATA_DIR, "config.json"), JSON.stringify({}));
+    const cfg = loadConfig();
+    expect(cfg.imessageLinq).toBeUndefined();
+    expect(cfg.botDefaults?.imessagePerBot).toBeUndefined();
+  });
+
+  it("parses an imessageLinq block with botNumber and voice toggle, and a separate perBot map under botDefaults", () => {
+    writeFileSync(
+      join(DATA_DIR, "config.json"),
+      JSON.stringify({
+        imessageLinq: {
+          botNumber: "+14158707772",
+          ignoredSenders: ["+15555550100"],
+          allowedSenders: [],
+          allowVoiceByDefault: true,
+        },
+        botDefaults: {
+          computers: [],
+          cloudBackend: "box",
+          allowedComputers: null,
+          imessagePerBot: { director: "linq", other: "off" },
+        },
+      }),
+    );
+    const cfg = loadConfig();
+    expect(cfg.imessageLinq?.botNumber).toBe("+14158707772");
+    expect(cfg.imessageLinq?.allowVoiceByDefault).toBe(true);
+    expect(cfg.botDefaults?.imessagePerBot?.director).toBe("linq");
+    expect(cfg.imessageLinq?.ignoredSenders).toEqual(["+15555550100"]);
+  });
+
+  it("rejects an unknown transport choice", () => {
+    const stored = {
+      botDefaults: { imessagePerBot: { director: "sms" } },
+    };
+    expect(() => parseStoredConfig(stored)).toThrow();
+  });
+
+  it("`PUT /api/config { imessageLinq }` persists per-bot transport choices", () => {
+    writeFileSync(join(DATA_DIR, "config.json"), JSON.stringify({}));
+    saveConfig({
+      imessageLinq: {
+        botNumber: "+14158707772",
+        allowVoiceByDefault: true,
+      },
+      botDefaults: {
+        imessagePerBot: { director: "linq", sidekick: "off" },
+      },
+    });
+    const cfg = loadConfig();
+    expect(cfg.imessageLinq?.botNumber).toBe("+14158707772");
+    expect(cfg.botDefaults?.imessagePerBot).toEqual({ director: "linq", sidekick: "off" });
+  });
+
+  it("migrates without overwriting an existing perBot map", () => {
+    writeFileSync(
+      join(DATA_DIR, "config.json"),
+      JSON.stringify({
+        botDefaults: {
+          computers: [],
+          cloudBackend: "box",
+          allowedComputers: null,
+          imessagePerBot: { director: "linq" },
+        },
+      }),
+    );
+    saveConfig({
+      imessageLinq: { botNumber: "+14158707772" },
+    });
+    const next = loadConfig();
+    expect(next.botDefaults?.imessagePerBot).toEqual({ director: "linq" });
+    expect(next.imessageLinq?.botNumber).toBe("+14158707772");
+  });
+});
+
+describe("migrateComputerProvidersConfig", () => {
+  // The next provider save back-fills `allowedComputers` from whatever this
+  // migration writes, so a wrong mapping here becomes a real grant change.
+  it("keeps an explicit deny-all ([]) as every provider off", () => {
+    const cfg: AppConfig = { botDefaults: { allowedComputers: [] } };
+    expect(migrateComputerProvidersConfig(cfg)).toBe(true);
+    expect(cfg.botDefaults?.computerProviders).toEqual({
+      asciiBox: false,
+      selfHostedVps: false,
+      localVm: false,
+      localMac: false,
+    });
+    expect(cfg.botDefaults?.vpsMode).toBeNull();
+    expect(allowedBotComputers(cfg)).toEqual([]);
+  });
+
+  it("maps a null allowlist (legacy unrestricted) to every provider on", () => {
+    const cfg: AppConfig = { botDefaults: { allowedComputers: null } };
+    expect(migrateComputerProvidersConfig(cfg)).toBe(true);
+    expect(cfg.botDefaults?.computerProviders).toEqual({
+      asciiBox: true,
+      selfHostedVps: true,
+      localVm: true,
+      localMac: true,
+    });
+    expect(cfg.botDefaults?.vpsMode).toBe("shared");
+  });
+
+  it("maps an absent allowlist (legacy unrestricted) to every provider on", () => {
+    const cfg: AppConfig = { botDefaults: { computers: ["local"] } };
+    expect(migrateComputerProvidersConfig(cfg)).toBe(true);
+    expect(cfg.botDefaults?.computerProviders).toEqual({
+      asciiBox: true,
+      selfHostedVps: true,
+      localVm: true,
+      localMac: true,
+    });
+    expect(cfg.botDefaults?.computers).toEqual(["local"]);
+  });
+
+  it("maps a narrowed allowlist onto just the named providers", () => {
+    const cfg: AppConfig = { botDefaults: { allowedComputers: ["vm", "local"] } };
+    expect(migrateComputerProvidersConfig(cfg)).toBe(true);
+    expect(cfg.botDefaults?.computerProviders).toEqual({
+      asciiBox: false,
+      selfHostedVps: false,
+      localVm: true,
+      localMac: true,
+    });
+    expect(cfg.botDefaults?.vpsMode).toBeNull();
+  });
+
+  it("leaves an already-migrated config alone", () => {
+    const providers = { asciiBox: true, selfHostedVps: false, localVm: false, localMac: true };
+    const cfg: AppConfig = { botDefaults: { allowedComputers: [], computerProviders: { ...providers }, vpsMode: null } };
+    expect(migrateComputerProvidersConfig(cfg)).toBe(false);
+    expect(cfg.botDefaults?.computerProviders).toEqual(providers);
+
+  });
+});
+
+
+describe("legacy voice provider migration", () => {
+  it("loads an explicitly marked legacy provider before strict validation without losing other settings", () => {
+    const stored = { profile: { name: "Ada" }, tts: { provider: "elevenlabs", key: "legacy-key", voice: "legacy-voice" } };
+    expect(parseStoredConfig(stored)).toEqual({
+      profile: { name: "Ada" }, tts: { provider: "minimax", key: "legacy-key", voice: "legacy-voice" },
+    });
+    expect(stored.tts.provider).toBe("elevenlabs");
+    expect(() => parseConfigPatch({ tts: { provider: "elevenlabs" } })).toThrow("tts.provider");
+  });
+
+  it("pins an unmarked key-only install, without persisting a keychain secret to config.json", () => {
+    const cfg: AppConfig = { tts: { key: "old-eleven-key" } };
+    expect(migrateLegacyElevenLabsTtsProvider(cfg)).toBe(true);
+    expect(cfg.tts?.provider).toBe("minimax");
+    expect(migrateLegacyElevenLabsTtsProvider(cfg)).toBe(false);
+  });
+
+  it("retains explicitly selected MiniMax and system providers", () => {
+    for (const provider of ["minimax", "system"] as const) {
+      const cfg: AppConfig = { tts: { key: "marked-key", provider } };
+      expect(migrateLegacyElevenLabsTtsProvider(cfg)).toBe(false);
+      expect(cfg.tts?.provider).toBe(provider);
+    }
+  });
+
+  it("waits for the encrypted-store key overlay before selecting the legacy provider", () => {
+    const cfg: AppConfig = { tts: { key: "", voice: "legacy voice" } };
+    expect(migrateLegacyElevenLabsTtsProvider(cfg)).toBe(false);
+    cfg.tts!.key = "from-keychain";
+    expect(migrateLegacyElevenLabsTtsProvider(cfg)).toBe(true);
+    expect(cfg.tts?.provider).toBe("minimax");
+  });
+
+  it("does not infer an old provider from voice alone or an empty key", () => {
+    for (const tts of [{ voice: "Rachel" }, { key: "   ", voice: "Rachel" }]) {
+      const cfg: AppConfig = { tts };
+      expect(migrateLegacyElevenLabsTtsProvider(cfg)).toBe(false);
+      expect(cfg.tts?.provider).toBeUndefined();
+    }
+  });
+});
+
+describe("agentProxy settings and environment", () => {
+  it("defaults to disabled", () => {
+    expect(agentProxyEnabled({})).toBe(false);
+    expect(agentProxyEnabled({ agentProxy: {} })).toBe(false);
+    expect(agentProxyEnabled({ agentProxy: { enabled: false } })).toBe(false);
+    expect(agentProxyEnabled({ agentProxy: { enabled: true } })).toBe(true);
+  });
+
+  it("resolves defaults and falls back to infisical project settings when unconfigured", () => {
+    const defaultSettings = agentProxySettings({});
+    expect(defaultSettings).toEqual({
+      enabled: false,
+      address: DEFAULT_AGENT_PROXY_ADDRESS,
+      projectId: "",
+      environment: "prod",
+      secretPath: "/",
+      caCertPath: undefined,
+    });
+
+    const withInfisical = agentProxySettings({
+      infisical: { projectId: "proj-inf-99", environment: "staging", secretPath: "/backend" },
+    });
+    expect(withInfisical.projectId).toBe("proj-inf-99");
+    expect(withInfisical.environment).toBe("staging");
+    expect(withInfisical.secretPath).toBe("/backend");
+
+    const explicit = agentProxySettings({
+      infisical: { projectId: "proj-inf-99" },
+      agentProxy: {
+        enabled: true,
+        address: "proxy.local:18000",
+        projectId: "custom-proj",
+        environment: "dev",
+        secretPath: "/agents",
+        caCertPath: "/tmp/proxy-ca.crt",
+      },
+    });
+    expect(explicit).toEqual({
+      enabled: true,
+      address: "proxy.local:18000",
+      projectId: "custom-proj",
+      environment: "dev",
+      secretPath: "/agents",
+      caCertPath: "/tmp/proxy-ca.crt",
+    });
+  });
+
+  it("returns base environment untouched when agent proxy is disabled", () => {
+    const baseEnv = { FOO: "bar" };
+    expect(applyAgentProxyEnv({}, baseEnv)).toBe(baseEnv);
+    expect(applyAgentProxyEnv({ agentProxy: { enabled: false } }, baseEnv)).toBe(baseEnv);
+    expect(applyAgentProxyEnv({}, undefined)).toBeUndefined();
+  });
+
+  it("injects proxy environment variables when enabled", () => {
+    const cfg: AppConfig = {
+      agentProxy: {
+        enabled: true,
+        address: "127.0.0.1:17322",
+        projectId: "proj-xyz",
+        environment: "prod",
+        secretPath: "/app",
+        caCertPath: "/certs/proxy.pem",
+      },
+    };
+    const env = applyAgentProxyEnv(cfg, { EXISTING: "true" });
+    expect(env).toMatchObject({
+      EXISTING: "true",
+      HTTP_PROXY: "http://127.0.0.1:17322",
+      HTTPS_PROXY: "http://127.0.0.1:17322",
+      http_proxy: "http://127.0.0.1:17322",
+      https_proxy: "http://127.0.0.1:17322",
+      ALL_PROXY: "http://127.0.0.1:17322",
+      all_proxy: "http://127.0.0.1:17322",
+      NO_PROXY: "localhost,127.0.0.1",
+      no_proxy: "localhost,127.0.0.1",
+      INFISICAL_AGENT_PROXY_ADDRESS: "127.0.0.1:17322",
+      INFISICAL_PROJECT_ID: "proj-xyz",
+      INFISICAL_ENVIRONMENT: "prod",
+      INFISICAL_SECRET_PATH: "/app",
+      SSL_CERT_FILE: "/certs/proxy.pem",
+      NODE_EXTRA_CA_CERTS: "/certs/proxy.pem",
+    });
+  });
+
+  it("preserves explicitly set proxy variables when injecting", () => {
+    const cfg: AppConfig = {
+      agentProxy: {
+        enabled: true,
+        address: "127.0.0.1:17322",
+      },
+    };
+    const env = applyAgentProxyEnv(cfg, {
+      HTTP_PROXY: "http://corp-proxy:8080",
+      NO_PROXY: "intranet.example.com",
+    });
+    expect(env?.HTTP_PROXY).toBe("http://corp-proxy:8080");
+    expect(env?.NO_PROXY).toBe("intranet.example.com");
+    expect(env?.HTTPS_PROXY).toBe("http://127.0.0.1:17322");
+  });
+
+  it("lets explicitly configured routing and CA settings win over inherited INFISICAL_* and TLS variables", () => {
+    const cfg: AppConfig = {
+      agentProxy: {
+        enabled: true,
+        address: "proxy.local:18000",
+        projectId: "explicit-proj",
+        environment: "dev",
+        secretPath: "/agents",
+        caCertPath: "/certs/proxy.pem",
+      },
+    };
+    const env = applyAgentProxyEnv(cfg, {
+      INFISICAL_AGENT_PROXY_ADDRESS: "stale.local:1",
+      INFISICAL_PROJECT_ID: "ambient-proj",
+      INFISICAL_ENVIRONMENT: "ambient-env",
+      INFISICAL_SECRET_PATH: "/ambient",
+      SSL_CERT_FILE: "/etc/ssl/ambient.pem",
+      NODE_EXTRA_CA_CERTS: "/etc/ssl/ambient-extra.pem",
+    });
+    expect(env).toMatchObject({
+      HTTPS_PROXY: "http://proxy.local:18000",
+      INFISICAL_AGENT_PROXY_ADDRESS: "proxy.local:18000",
+      INFISICAL_PROJECT_ID: "explicit-proj",
+      INFISICAL_ENVIRONMENT: "dev",
+      INFISICAL_SECRET_PATH: "/agents",
+      SSL_CERT_FILE: "/certs/proxy.pem",
+      NODE_EXTRA_CA_CERTS: "/certs/proxy.pem",
+    });
+  });
+
+  it("keeps an inherited routing id when the proxy only fell back to BotFleet's own Infisical settings", () => {
+    const cfg: AppConfig = {
+      infisical: { projectId: "fallback-proj", environment: "staging", secretPath: "/backend" },
+      agentProxy: { enabled: true },
+    };
+    const inherited = applyAgentProxyEnv(cfg, {
+      INFISICAL_PROJECT_ID: "ambient-proj",
+      INFISICAL_ENVIRONMENT: "ambient-env",
+      INFISICAL_SECRET_PATH: "/ambient",
+    });
+    expect(inherited).toMatchObject({
+      INFISICAL_PROJECT_ID: "ambient-proj",
+      INFISICAL_ENVIRONMENT: "ambient-env",
+      INFISICAL_SECRET_PATH: "/ambient",
+    });
+    const bare = applyAgentProxyEnv(cfg, {});
+    expect(bare).toMatchObject({
+      INFISICAL_PROJECT_ID: "fallback-proj",
+      INFISICAL_ENVIRONMENT: "staging",
+      INFISICAL_SECRET_PATH: "/backend",
+    });
+  });
+
+  it("rejects unknown agentProxy keys at the config boundary", () => {
+    expect(() => parseConfigPatch({ agentProxy: { enabled: true, typo: true } })).toThrow(/Unrecognized key/);
+    expect(() => parseConfigPatch({ agentProxy: { allowReadableBrokeredSecrets: true } })).toThrow(/Unrecognized key/);
+  });
+
+  it("persists agentProxy in saveConfig and merges correctly", () => {
+    saveConfig({
+      agentProxy: {
+        enabled: true,
+        address: "127.0.0.1:17322",
+        projectId: "saved-project",
+      },
+    });
+    const loaded = loadConfig();
+    expect(loaded.agentProxy).toMatchObject({
+      enabled: true,
+      address: "127.0.0.1:17322",
+      projectId: "saved-project",
+    });
+  });
+});
+

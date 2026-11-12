@@ -4,7 +4,7 @@
 // BotFleet threw the payload away and kept the name.  A transcript of seven
 // `read_file` chips tells the reader nothing: not which files, not whether
 // the bot was going in circles, not where the twenty seconds went.  The
-// harnesses people compare us to (DeepSeek Harness, Claude Code, Codex) all
+// harnesses people compare us to (Harness, Claude Code, Codex) all
 // render one dense line per step — a verb, the thing it touched, and how
 // long it took — and that line is what makes a long turn skimmable.
 //
@@ -185,17 +185,32 @@ export function clip(value: string, limit: number): string {
  * and the command is the thing worth reading. */
 const TARGET_FIELDS = [
   "command",
+  "CommandLine",
+  "commandLine",
+  "cmd",
   "file_path",
   "filePath",
+  "FilePath",
   "path",
+  "Path",
+  "AbsolutePath",
+  "absolutePath",
+  "target_file",
+  "TargetFile",
+  "targetFile",
+  "file",
   "notebook_path",
   "abs_path",
-  "target_file",
   "pattern",
+  "Pattern",
   "query",
+  "Query",
   "url",
+  "Url",
   "prompt",
+  "Prompt",
   "description",
+  "Description",
   "old_string",
   "content",
 ] as const;
@@ -243,6 +258,15 @@ export function describeTarget(
   for (const field of TARGET_FIELDS) {
     const found = firstString(record[field]);
     if (found && found.trim()) return clip(shortenPath(found, options.home, options.cwd), limit);
+  }
+
+  // Common target names case-insensitively (e.g. commandline, absolutepath, etc.)
+  for (const [key, val] of Object.entries(record)) {
+    const k = key.toLowerCase().replace(/[^a-z0-9]/g, "");
+    if (/^(command|cmd|commandline|filepath|path|absolutepath|targetfile|file|query|url|pattern)$/.test(k)) {
+      const found = firstString(val);
+      if (found && found.trim()) return clip(shortenPath(found, options.home, options.cwd), limit);
+    }
   }
 
   // nothing named — a single scalar argument is still better than silence

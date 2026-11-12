@@ -49,10 +49,38 @@ public struct CompanionState: Sendable {
     public var pendingQueued: [String: [QueuedSend]] = [:]
     /// queueIds whose drain frame beat the POST continuation. One-shot.
     public var consumedQueueIds: Set<String> = []
+    /// The thread open for reading when it is not its bot's active
+    /// (execution) thread, with the bot that owns it. Viewing is passive:
+    /// it never moves `Bot.threadId`, so the running turn keeps its target.
+    /// Fed by `GET /api/threads/:threadId/messages`, like scrollback, and
+    /// kept live by the same message frames, applied by threadId.
+    public var viewedBotId: String?
+    public var viewedThreadId: String?
+    /// Viewed threads whose first transcript page is still in flight.
+    public var loadingThread: [String: Bool] = [:]
+    /// Viewed threads whose first transcript page has been fetched. Frames
+    /// that land on a retained thread before any open only buffer into
+    /// `messages[]` — they never set this, so opening the thread later
+    /// still fetches full history and merges those frames after the page.
+    public var loadedThread: [String: Bool] = [:]
     /// The paired Mac's update status, from the last fetch or `update.status`
     /// event.  `nil` until the first of either arrives — not the same as "up
     /// to date", which is a real answer this has to wait for.
     public var macUpdateStatus: MacUpdateStatus?
+    /// Background jobs by conversation (thread id), from `jobs` frames and
+    /// `GET /api/jobs`.  A thread with none has no entry, so the header can ask
+    /// "does this have a pill" with one lookup.
+    public private(set) var jobsByThread: [String: [JobSnapshot]] = [:] {
+        didSet {
+            var index: [String: JobSnapshot] = [:]
+            for jobs in jobsByThread.values {
+                for job in jobs { index[job.id] = job }
+            }
+            jobIndex = index
+        }
+    }
+    /// Every job by id, rebuilt whenever `jobsByThread` changes (see `job(id:)`).
+    private var jobIndex: [String: JobSnapshot] = [:]
     /// Monotonic reducer position used to reject snapshots fetched before a
     /// newer stream frame was folded.
     private let hydrationStateID = UUID()
@@ -75,9 +103,18 @@ public struct CompanionState: Sendable {
     /// The active branch of a bot conversation. Rooms and legacy linear
     /// threads return their full transcript.
     public func visibleTranscript(forThread threadId: String) -> [Message] {
+        visibleTranscript(forThread: threadId, activeLeafId: bot(forThread: threadId)?.activeLeafId)
+    }
+
+    /// `visibleTranscript(forThread:)` with the owning bot's leaf already
+    /// resolved, so callers that already hold the bot skip the roster scan.
+    /// Pass `nil` for rooms. Whole-roster passes (the chat list) must use
+    /// this: `bot(forThread:)` walks every bot and task, and calling it per
+    /// thread hung the main thread for ~35s on large fleets (BOTFLEET-3R).
+    public func visibleTranscript(forThread threadId: String, activeLeafId: String?) -> [Message] {
         let all = transcript(forThread: threadId)
         let branch: [Message]
-        if let leafId = bot(forThread: threadId)?.activeLeafId {
+        if let leafId = activeLeafId {
             let byId = Dictionary(all.map { ($0.id, $0) }, uniquingKeysWith: { _, newest in newest })
             if var current = byId[leafId] {
                 var visible: [Message] = []
@@ -96,9 +133,8 @@ public struct CompanionState: Sendable {
         }
         let pending = pendingQueued[threadId] ?? []
         guard !pending.isEmpty else { return branch }
-        let now = Date().timeIntervalSince1970 * 1000
         let queued = pending.map { entry -> Message in
-            var message = Message(id: entry.queueId, role: .user, kind: .text, at: now)
+            var message = Message(id: entry.queueId, role: .user, kind: .text, at: entry.at)
             message.text = entry.text
             message.queueId = entry.queueId
             message.queued = entry.queued ? true : nil
@@ -107,20 +143,48 @@ public struct CompanionState: Sendable {
         return branch + queued
     }
 
-    public mutating func rememberPendingQueued(threadId: String, queueId: String, text: String) {
-        rememberPendingSend(threadId: threadId, id: queueId, text: text, queued: true)
+    public mutating func rememberPendingQueued(
+        threadId: String,
+        queueId: String,
+        text: String,
+        rawText: String? = nil,
+        attachments: [PendingChatAttachment] = []
+    ) {
+        rememberPendingSend(
+            threadId: threadId,
+            id: queueId,
+            text: text,
+            queued: true,
+            rawText: rawText,
+            attachments: attachments
+        )
     }
 
     /// Show the user's own line immediately.  Idle sends stay until the
     /// matching user `message` frame lands; busy 202s stay until drain.
-    public mutating func rememberPendingSend(threadId: String, id: String, text: String, queued: Bool) {
+    public mutating func rememberPendingSend(
+        threadId: String,
+        id: String,
+        text: String,
+        queued: Bool,
+        rawText: String? = nil,
+        attachments: [PendingChatAttachment] = []
+    ) {
         if queued, consumedQueueIds.contains(id) {
             consumedQueueIds.remove(id)
             return
         }
         var list = pendingQueued[threadId] ?? []
         if list.contains(where: { $0.queueId == id }) { return }
-        list.append(QueuedSend(queueId: id, text: text, queued: queued))
+        list.append(
+            QueuedSend(
+                queueId: id,
+                text: text,
+                rawText: rawText,
+                attachments: attachments,
+                queued: queued
+            )
+        )
         pendingQueued[threadId] = list
     }
 
@@ -141,6 +205,9 @@ public struct CompanionState: Sendable {
 
     public mutating func consumePendingMatchingText(threadId: String, text: String) {
         let prev = pendingQueued[threadId] ?? []
+        // Idle optimistic sends only.  Busy (202) chips must wait for their
+        // queueId-tagged drain — same-text matching would steal an older
+        // queued line when another client steers an identical prompt.
         guard let index = prev.firstIndex(where: { $0.text == text && !$0.queued }) else { return }
         var rest = prev
         rest.remove(at: index)
@@ -170,24 +237,117 @@ public struct CompanionState: Sendable {
         bots.first { $0.id == id }
     }
 
+    /// The thread open for reading on this bot, when it is not the active
+    /// one. Nil on the active thread, for an unknown bot, and for a thread
+    /// the bot does not own — a pin that outlived its task reads as no pin.
+    public func viewingThreadId(forBotId botId: String) -> String? {
+        guard viewedBotId == botId, let threadId = viewedThreadId else { return nil }
+        guard let bot = bot(botId), bot.threadId != threadId,
+              bot.tasks?.contains(where: { $0.threadId == threadId }) == true
+        else { return nil }
+        return threadId
+    }
+
+    /// Open a thread for reading without making it the execution target.
+    /// `nil` (or the bot's active thread) returns to the active thread.
+    /// Returns whether the caller should fetch the first page: true only on
+    /// a cache miss, so concurrent opens share one request.
+    /// Drop the pin for one bot, and the loading flag of the thread it
+    /// pointed at — a cleared pin must never leave a fetch flag behind
+    /// that blocks the next open from fetching.
+    private mutating func clearViewedThread(forBotId botId: String) {
+        if viewedBotId == botId {
+            if let viewed = viewedThreadId { loadingThread.removeValue(forKey: viewed) }
+            viewedBotId = nil
+            viewedThreadId = nil
+        }
+    }
+
+    @discardableResult
+    public mutating func viewThread(botId: String, threadId: String?) -> Bool {
+        hydrationRevision &+= 1
+        guard let threadId, let bot = bot(botId) else {
+            clearViewedThread(forBotId: botId)
+            return false
+        }
+        // The active thread needs no pin and no fetch: it already lives on
+        // the bot. A thread the bot does not own is never opened.
+        if threadId == bot.threadId {
+            clearViewedThread(forBotId: botId)
+            return false
+        }
+        guard bot.tasks?.contains(where: { $0.threadId == threadId }) == true else { return false }
+        viewedBotId = botId
+        viewedThreadId = threadId
+        // Only a fetched first page counts as held. Frames that landed on
+        // a retained thread before any open are buffered, not loaded, so
+        // opening it later still fetches full history; an unopened one
+        // always does.
+        guard loadedThread[threadId] != true else { return false }
+        if loadingThread[threadId] == true { return false }
+        loadingThread[threadId] = true
+        return true
+    }
+
+    /// Merge a viewed thread's first page into the pages already held.
+    /// Frames that landed while the page was in flight are newer than
+    /// anything the page holds; they are kept after the page.
+    public mutating func threadTranscriptLoaded(threadId: String, messages page: [Message], hasMore more: Bool?) {
+        hydrationRevision &+= 1
+        loadingThread.removeValue(forKey: threadId)
+        loadedThread[threadId] = true
+        if let existing = messages[threadId], !existing.isEmpty {
+            let known = Set(page.map(\.id))
+            let extras = existing.filter { !known.contains($0.id) }
+            messages[threadId] = page + extras
+        } else {
+            messages[threadId] = page
+        }
+        if let more { hasMore[threadId] = more }
+    }
+
+    /// Drop the loading flag when the first page fails. The pin stays, so
+    /// reopening the thread retries the fetch.
+    public mutating func threadTranscriptFailed(threadId: String) {
+        hydrationRevision &+= 1
+        loadingThread.removeValue(forKey: threadId)
+    }
+
     public func bot(forThread threadId: String) -> Bot? {
-        bots.first { $0.threadId == threadId }
+        bots.first { $0.threadId == threadId || $0.tasks?.contains(where: { $0.threadId == threadId }) == true }
     }
 
     public func room(forThread threadId: String) -> Room? {
         rooms.first { $0.threadId == threadId }
     }
 
+    /// Whether the harness would refuse to create, switch, rename or delete one
+    /// of this room's tasks right now (`channelTaskBlocked` in
+    /// server/index.ts): a turn is running, or a request is waiting on an
+    /// answer.  Only the open thread's transcript is loaded here, so a request
+    /// waiting in another task still answers 409 — and the harness's own
+    /// sentence reaches the person.
+    public func roomTaskChangesBlocked(_ room: Room) -> Bool {
+        room.isWorking || transcript(forThread: room.threadId).contains { $0.card?.isPending == true }
+    }
+
     /// Every unanswered approval or question, newest first. This is the
     /// screen the whole companion exists for.
     public var pendingApprovals: [(threadId: String, message: Message)] {
+        // Read on every chat-list render, so it must stay cheap: resolve each
+        // bot's leaf from the bot we are already iterating (no per-thread
+        // `bot(forThread:)` scan or Bot copy), and skip the branch walk for
+        // threads holding no pending card at all — queued sends never do.
         var out: [(threadId: String, message: Message)] = []
-        let activeThreads = bots.map(\.threadId) + rooms.map(\.threadId)
-        for threadId in activeThreads {
-            for message in visibleTranscript(forThread: threadId) where message.card?.isPending == true {
+        func collect(_ threadId: String, activeLeafId: String?) {
+            guard transcript(forThread: threadId).contains(where: { $0.card?.isPending == true }) else { return }
+            for message in visibleTranscript(forThread: threadId, activeLeafId: activeLeafId)
+            where message.card?.isPending == true {
                 out.append((threadId: threadId, message: message))
             }
         }
+        for bot in bots { collect(bot.threadId, activeLeafId: bot.activeLeafId) }
+        for room in rooms { collect(room.threadId, activeLeafId: nil) }
         return out.sorted { $0.message.at > $1.message.at }
     }
 
@@ -198,30 +358,106 @@ public struct CompanionState: Sendable {
 
     // MARK: - Hydrating
 
-    /// Replace everything from a `GET /api/bots` response.
+    /// Refresh the roster from a `GET /api/bots` response, merging its
+    /// message page into whatever scrollback each thread already holds
+    /// rather than discarding it.
+    ///
+    /// The harness has no wire concept yet of "this thread's history was
+    /// reset", so the one hard signal a hydrate carries today is a thread
+    /// disappearing from the roster entirely — a deleted bot or room really
+    /// is gone, and its scrollback goes with it.  Every thread that is
+    /// still present merges: wiping ten pages of scrollback a person
+    /// already paged in, just because a foreground refresh re-fetched the
+    /// newest 50 messages, was the bug (IO12).
     public mutating func hydrate(_ fleet: Fleet) {
         hydrationRevision &+= 1
         bots = fleet.bots
         rooms = fleet.groups
-        messages.removeAll()
-        hasMore.removeAll()
+        let liveThreadIds = Set(fleet.bots.map(\.threadId) + fleet.groups.map(\.threadId))
+        // A pin that outlived its task reads as no pin everywhere else
+        // (`viewingThreadId(forBotId:)` refuses threads the owner bot no
+        // longer lists), so the hydrate drops it instead of leaking it past
+        // the conversation — with its cached page, exactly like the
+        // bot-frame prune. A pin on a thread that is active again needs no
+        // pin: the merge below owns that transcript.
+        if let viewed = viewedThreadId, let owner = viewedBotId {
+            if liveThreadIds.contains(viewed) {
+                viewedBotId = nil
+                viewedThreadId = nil
+            } else if fleet.bots.first(where: { $0.id == owner })?.tasks?.contains(where: { $0.threadId == viewed }) != true {
+                viewedBotId = nil
+                viewedThreadId = nil
+                messages.removeValue(forKey: viewed)
+                hasMore.removeValue(forKey: viewed)
+                loadingThread.removeValue(forKey: viewed)
+                loadedThread.removeValue(forKey: viewed)
+            }
+        }
+        for staleThreadId in Array(messages.keys) where !liveThreadIds.contains(staleThreadId) {
+            // A hydrate replaces every active transcript from the server; a
+            // viewed retained thread keeps its page instead of refetching it.
+            // The pin above already guarantees the viewed thread is still
+            // owned, so this skip can no longer outlive the conversation.
+            if staleThreadId == viewedThreadId { continue }
+            messages.removeValue(forKey: staleThreadId)
+            hasMore.removeValue(forKey: staleThreadId)
+            // A dropped page must never leave its fetch flag behind: the
+            // next open would read the stale flag as a page still in flight
+            // and return without fetching, pinning a thread that loads never.
+            loadingThread.removeValue(forKey: staleThreadId)
+            loadedThread.removeValue(forKey: staleThreadId)
+        }
         for bot in fleet.bots {
-            messages[bot.threadId] = bot.messages ?? []
-            hasMore[bot.threadId] = bot.hasMore ?? false
+            mergeHydratedPage(bot.messages, hasMore: bot.hasMore, threadId: bot.threadId)
         }
         for room in fleet.groups {
-            messages[room.threadId] = room.messages ?? []
-            hasMore[room.threadId] = room.hasMore ?? false
+            mergeHydratedPage(room.messages, hasMore: room.hasMore, threadId: room.threadId)
         }
         // Drain or an idle send may have landed while we were disconnected.
-        // Retire chips whose queueId or text is now a real transcript row.
+        // Retire chips whose queueId is now a real transcript row; only idle
+        // (non-202) chips may also retire by text, as in
+        // `consumePendingMatchingText` — a busy line waits for its queueId.
         for (threadId, entries) in pendingQueued {
             let thread = messages[threadId] ?? []
             let landedIds = Set(thread.compactMap(\.queueId))
             let landedTexts = Set(thread.filter { $0.role == .user }.compactMap(\.text))
-            for entry in entries where landedIds.contains(entry.queueId) || landedTexts.contains(entry.text) {
+            for entry in entries where landedIds.contains(entry.queueId) || (!entry.queued && landedTexts.contains(entry.text)) {
                 consumePendingQueued(threadId: threadId, queueId: entry.queueId)
             }
+        }
+    }
+
+    /// Merge one hydrated page into a thread's held scrollback instead of
+    /// discarding pages already paged in.  Overlapping ids take the fresh
+    /// copy — the harness may have patched a message since the last
+    /// hydrate — and everything else the phone already held survives,
+    /// oldest pages included.
+    ///
+    /// `nil` means the response carried no messages for this thread at all
+    /// (a bot/room with nothing loaded yet); never treat that as "empty",
+    /// or a payload shape that omits the field would erase scrollback for
+    /// no reason.
+    private mutating func mergeHydratedPage(_ page: [Message]?, hasMore newHasMore: Bool?, threadId: String) {
+        guard let page else { return }
+        let existing = messages[threadId] ?? []
+        guard !existing.isEmpty else {
+            messages[threadId] = page
+            hasMore[threadId] = newHasMore ?? false
+            return
+        }
+        var byId = Dictionary(uniqueKeysWithValues: existing.map { ($0.id, $0) })
+        for message in page { byId[message.id] = message }
+        messages[threadId] = byId.values.sorted {
+            $0.at == $1.at ? $0.id < $1.id : $0.at < $1.at
+        }
+        // Only let the fresh page's `hasMore` win when it actually describes
+        // the whole held scrollback.  A person who already paged further
+        // back than this window resolved that boundary themselves; a
+        // 50-message re-hydrate must not un-learn it.
+        let existingOldest = existing.map(\.at).min() ?? .greatestFiniteMagnitude
+        let freshOldest = page.map(\.at).min() ?? .greatestFiniteMagnitude
+        if existingOldest >= freshOldest {
+            hasMore[threadId] = newHasMore ?? false
         }
     }
 
@@ -232,6 +468,36 @@ public struct CompanionState: Sendable {
         guard hydrationStateID == token.stateID, hydrationRevision == token.revision else { return false }
         hydrate(fleet)
         return true
+    }
+
+    // MARK: - Background jobs
+
+    /// Replace one conversation's jobs.  An empty set removes the entry, so a
+    /// thread with nothing to show has no pill.
+    public mutating func setJobs(_ jobs: [JobSnapshot], forThread threadId: String) {
+        if jobs.isEmpty {
+            jobsByThread.removeValue(forKey: threadId)
+        } else {
+            jobsByThread[threadId] = jobs
+        }
+    }
+
+    /// One job by id, wherever it lives.  A single lookup in an index kept in
+    /// step with `jobsByThread`, so a screen that watches one job does not
+    /// scan every conversation on each redraw.
+    public func job(id: String) -> JobSnapshot? {
+        jobIndex[id]
+    }
+
+    /// Replace every conversation's jobs with what `GET /api/jobs` answered.
+    /// Separate from `hydrate(_:)`: jobs ride their own request, and a failed
+    /// jobs read must not make a good fleet snapshot look like it failed.
+    public mutating func hydrateJobs(_ jobs: [JobSnapshot]) {
+        var next: [String: [JobSnapshot]] = [:]
+        for job in jobs {
+            next[job.threadId, default: []].append(job)
+        }
+        jobsByThread = next
     }
 
     /// Prepend an older page fetched for scrollback.
@@ -278,7 +544,7 @@ public struct CompanionState: Sendable {
         switch frame {
         case .message, .messagePatch, .thread, .bot, .botDeleted, .room, .roomDeleted:
             hydrationRevision &+= 1
-        case .hello, .notify, .screen, .computer, .config, .runtime, .updateStatus, .unknown:
+        case .hello, .notify, .screen, .computer, .config, .instances, .runtime, .updateStatus, .jobs, .unknown:
             break
         }
         switch frame {
@@ -348,6 +614,24 @@ public struct CompanionState: Sendable {
                     merged.activeLeafId = bot.activeLeafId ?? previous.activeLeafId
                 }
                 bots[index] = merged
+                // The pin points at a thread; the active thread just moved, so
+                // the pin is stale. A viewed thread that the bot no longer
+                // lists has no readable future, so its cached page goes with
+                // it instead of outliving the conversation.
+                if viewedBotId == bot.id, let viewed = viewedThreadId {
+                    let tasks = merged.tasks ?? previous.tasks
+                    if merged.threadId != previous.threadId || merged.threadId == viewed {
+                        viewedBotId = nil
+                        viewedThreadId = nil
+                    } else if let tasks, !tasks.contains(where: { $0.threadId == viewed }) {
+                        viewedBotId = nil
+                        viewedThreadId = nil
+                        messages.removeValue(forKey: viewed)
+                        hasMore.removeValue(forKey: viewed)
+                        loadingThread.removeValue(forKey: viewed)
+                        loadedThread.removeValue(forKey: viewed)
+                    }
+                }
             } else {
                 bots.append(bot)
                 if messages[bot.threadId] == nil {
@@ -368,13 +652,41 @@ public struct CompanionState: Sendable {
                 // was the last event that could ever mention this id.
                 clearStream(threadId)
                 clearScreen(botId)
+                jobsByThread.removeValue(forKey: threadId)
+                // A viewed retained thread dies with its bot: the pin and its
+                // cached page go too, like the active transcript above.
+                if viewedBotId == botId, let viewed = viewedThreadId {
+                    messages.removeValue(forKey: viewed)
+                    hasMore.removeValue(forKey: viewed)
+                    loadingThread.removeValue(forKey: viewed)
+                    loadedThread.removeValue(forKey: viewed)
+                    viewedBotId = nil
+                    viewedThreadId = nil
+                }
                 bots.remove(at: index)
             }
 
         case let .room(room):
             if let index = rooms.firstIndex(where: { $0.id == room.id }) {
                 var merged = room
-                merged.messages = rooms[index].messages
+                let previous = rooms[index]
+                if previous.threadId != room.threadId, let replacement = room.messages {
+                    // A channel task was created, switched to, or deleted down
+                    // to another one.  The room names a different thread now,
+                    // and the answer to that call carries its transcript, which
+                    // is authoritative — same as a bot's task switch above.
+                    // An ordinary frame keeps the transcript it already has.
+                    messages[room.threadId] = replacement
+                    hasMore[room.threadId] = room.hasMore ?? false
+                    merged.messages = replacement
+                    clearStream(previous.threadId)
+                    clearStream(room.threadId)
+                } else if previous.threadId == room.threadId {
+                    merged.messages = previous.messages
+                }
+                // A frame that moved the room to another thread without
+                // carrying its transcript leaves `merged.messages` empty
+                // rather than naming the old thread's messages as the new one's.
                 rooms[index] = merged
             } else {
                 rooms.append(room)
@@ -391,6 +703,7 @@ public struct CompanionState: Sendable {
                 // Same reasoning as a deleted bot: the thread is gone, so the
                 // half-written reply streaming into it has nowhere to land.
                 clearStream(threadId)
+                jobsByThread.removeValue(forKey: threadId)
                 rooms.remove(at: index)
             }
 
@@ -409,9 +722,12 @@ public struct CompanionState: Sendable {
         case let .updateStatus(status):
             macUpdateStatus = status
 
+        case let .jobs(threadId, jobs):
+            setJobs(jobs, forThread: threadId)
+
         // Nothing to fold: config and provisioning state are not part of
         // this client's job yet.
-        case .computer, .config, .unknown:
+        case .computer, .config, .instances, .unknown:
             break
         }
     }

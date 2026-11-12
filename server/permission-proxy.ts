@@ -18,6 +18,9 @@ const socketPath = process.argv[2] ?? "";
 
 const waiting = new Map<string, (msg: any) => void>();
 const conn = connect(socketPath);
+// Both streams below carry JSON lines that can be larger than one read.
+// Decoding as a stream keeps a character split across two reads whole.
+conn.setEncoding("utf8");
 
 interface AllowPermissionResult {
   behavior: "allow";
@@ -119,7 +122,15 @@ async function handle(msg: any) {
       if (conn.destroyed) return dead();
       const ask = isQuestion
         ? { t: "ask", id: askId, kind: "question", tool: "ask_user", input: { question: args.question, choices: args.choices } }
-        : { t: "ask", id: askId, tool: args.tool_name, input: args.input };
+        : {
+          t: "ask",
+          id: askId,
+          tool: args.tool_name,
+          input: args.input,
+          // which tool_use this is about: the harness matches it to the
+          // step it already showed, so auto-review never judges it twice
+          toolUseId: String(args.tool_use_id ?? "") || undefined,
+        };
       try {
         conn.write(JSON.stringify(ask) + "\n");
       } catch {
@@ -145,6 +156,7 @@ async function handle(msg: any) {
 }
 
 let inBuf = "";
+process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
   inBuf += chunk;
   let nl;

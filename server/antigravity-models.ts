@@ -1,6 +1,19 @@
 import type { ModelCatalog } from "./contracts.ts";
 
-// model catalog from `agy models` (agy 1.1.23)
+// Static FALLBACK catalog for the Antigravity driver — never the primary
+// source.  readAntigravityModelCatalog() reads the person's own `agy`
+// settings first and only lands here when that read fails, and
+// mergeLocalInject() layers any host::model routes on top.
+//
+// Aligned 2026-09-24 with the `agy` build the driver itself documents and was
+// measured against, 1.1.26 (see the header of drivers/antigravity.ts).  The
+// list below is every model id the driver and its tests name today: the
+// `gemini-3.8-flash-high` default, the `gemini-3.6-flash-low` the snapshot
+// probe spawns, and the ids antigravityQuotaCatalogId() has to resolve back
+// to catalog identities.  The September 18 refresh (PR #485) updated four
+// driver catalogs and missed this one, which is how the header came to claim
+// 1.1.23 — whoever refreshes the fleet's catalogs next, this file is the
+// fifth, and the version in this note moves with it.
 export const STATIC_ANTIGRAVITY_MODELS: ModelCatalog = {
   default: "gemini-3.8-flash-high",
   options: [

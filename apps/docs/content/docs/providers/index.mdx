@@ -23,6 +23,7 @@ BotFleet does not proxy every message through its own model account. It starts s
 | Qwen | Qwen CLI login | ACP integration |
 | Hermes | Hermes CLI login | ACP integration |
 | Pi | Pi CLI login | Native driver |
+| MiniMax Code | `mcode login --region global` | MiniMax coding CLI on the same Token Plan, driven over ACP |
 | MiniMax | MiniMax API key | HTTP driver, no CLI — see [Connecting MiniMax](/docs/providers/minimax) |
 
 Additional driver instances can be declared in local configuration, and the engines that accept an endpoint and a key — OpenAI-compatible and MiniMax — can be added from **Settings → Engines** directly.  Unavailable engines remain visible with a reason instead of crashing the provider fleet.

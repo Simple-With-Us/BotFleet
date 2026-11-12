@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "node build.mjs"
+    "build": "node build.mjs && node verify-output.mjs",
+    "verify": "node verify-output.mjs"
   }
 }

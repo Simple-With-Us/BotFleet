@@ -5,7 +5,7 @@
 import { useEffect, useState } from "react";
 import { GitBranch, Wrench } from "lucide-react";
 import { api, useStore, formatTime } from "@/state/store";
-import { MausAvatar } from "./Avatar";
+import { BotMascot } from "./Avatar";
 import { cn } from "@/lib/cn";
 import { productErrorHeadline } from "@/lib/product-error";
 import type { SearchHit } from "@/lib/search-hit";
@@ -31,14 +31,19 @@ export function SearchResults({ query, onLanded }: { query: string; onLanded: ()
     setHits(null);
     setError(null);
     let alive = true;
+    const controller = new AbortController();
     const t = setTimeout(() => {
-      api(`/api/search?q=${encodeURIComponent(q)}&limit=40`)
+      api(`/api/search?q=${encodeURIComponent(q)}&limit=40`, { signal: controller.signal })
         .then((r: { hits: SearchHit[] }) => alive && (setHits(r.hits), setError(null)))
-        .catch((e: unknown) => alive && setError(e instanceof Error ? e.message : String(e)));
+        .catch((e: unknown) => {
+          if (!alive || controller.signal.aborted) return;
+          setError(e instanceof Error ? e.message : String(e));
+        });
     }, DEBOUNCE_MS);
     return () => {
       alive = false;
       clearTimeout(t);
+      controller.abort();
     };
   }, [q]);
 
@@ -72,7 +77,7 @@ export function SearchResults({ query, onLanded }: { query: string; onLanded: ()
             className="flex w-full items-start gap-2.5 rounded-lg px-3 py-2 text-left hover:bg-raised/60"
           >
             {bot ? (
-              <MausAvatar color={bot.color} state="idle" size={26} animated={false} />
+              <BotMascot color={bot.color} state="idle" size={26} animated={false} />
             ) : (
               <span className="flex size-[26px] shrink-0 items-center justify-center rounded-full bg-raised text-[11px] text-ink-secondary">#</span>
             )}

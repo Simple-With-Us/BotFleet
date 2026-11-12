@@ -36,16 +36,43 @@ Live ids are merged into the main cloud rail (not the local-models pane). A
 failed listing keeps the last usable catalog (then the static fallback) rather
 than emptying the rail.
 
-`--model <id>` is passed as a global CLI flag before `acp`. When the running
-CLI also implements ACP `session/set_model`, BotFleet pins the same id over
-the wire. If that method is missing (`-32601`), the argv pin is left to stand
-and the turn continues.
+`--model <id>` is passed as a global CLI flag before `acp`. Current CLIs
+(checked with 2026.09.28) ignore that flag in ACP sessions: every session
+starts on `default[]` (Auto). The pick only lands through ACP
+`session/set_model`, which accepts only the parameterised ids the session
+advertises, such as `grok-4.7[context=256k,reasoning_effort=high,fast=true]`.
+BotFleet maps the picker slug onto that list: `auto` to `default[]`, a
+plain slug to its Standard variant, `-fast` to `fast=true`, and an effort
+slug such as `grok-4.7-high-fast` to the variant with that effort. The
+session advertises one variant per base, so a slug with another effort
+(`grok-4.7-medium-fast`) gets that variant and a notice in the conversation.
+
+If `session/set_model` is missing (`-32601`), the argv pin is left to stand
+and the turn continues. If Cursor refuses the id (`-32602`), the turn also
+continues, on the model the session started with, and the conversation shows
+a notice that names it.
 
 ## Autonomy
 
 Instance `fullAuto: true` adds `--force` (the CLI's documented auto-approve
 switch). BotFleet still answers ACP `session/request_permission` itself:
 full-auto selects an allow option when the CLI offered one.
+
+## Turn deadlines
+
+Every ACP engine's `session/prompt` call — not just Cursor's — is bounded by
+two deadlines instead of one wall clock. A renewable idle deadline
+(`promptIdleMs`, default 180 s) resets on every `session/update` (message
+chunk, thought chunk, tool call, or tool result) and on every permission
+request, so a turn that is legitimately busy — streaming, running tools,
+waiting on a person to answer an ask — is never cut off; only total silence
+trips it. Underneath that, a hard ceiling (`promptTimeoutMs`, default 18
+min) still fires regardless of streaming activity, as a backstop against an
+agent that streams filler forever without ever finishing. Either one
+cancels the prompt, tears the child down the same way an interrupt does,
+and settles the turn as a failure — `prompt_stall` for the idle guard,
+`prompt_timeout` for the hard ceiling — without retrying, because a wedged
+agent must not be relaunched into the same hang.
 
 ## What this driver does not do yet
 

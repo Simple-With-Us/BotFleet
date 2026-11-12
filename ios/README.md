@@ -57,7 +57,7 @@ ios/
     Session.swift                connection, lifecycle, actions
     Discovery.swift              NWBrowser for _botfleet._tcp
     Keychain.swift               the device token
-    MausAvatar.swift             the mascot face, in the desktop's palette
+    BotMascot.swift             the mascot face, in the desktop's palette
     PairingView.swift            QR handoff, discovery, address and code fallback
     PairingScanner.swift         native QR camera, permission and recovery UI
     Glass.swift                  the one material the chrome is made of (Liquid Glass on 26+)
@@ -85,9 +85,13 @@ swift test
 The app needs Xcode. The `.xcodeproj` is generated rather than committed:
 
 ```sh
-brew install xcodegen
+bash scripts/ios-install-xcodegen.sh
 cd ios && xcodegen generate && open BotFleet.xcodeproj
 ```
+
+`xcodegen generate` runs `scripts/ios-xcodegen-post.sh` via `postGenCommand` so
+the generated project uses the Xcode 27.0 document format (objectVersion 100).  XcodeGen
+2.45+ is required; 2.46+ is what hosted CI installs.
 
 **Re-run `xcodegen generate` after pulling any change that adds a file to
 `App/`.** The spec says `sources: App`, but XcodeGen resolves that to explicit
@@ -168,7 +172,7 @@ the host computer remain unreachable through the companion.
 - **Messaging-app shape, not settings-list shape.** Mascot faces at roster size,
   the bot's role as a chip beside its name, timestamps that say "Yesterday"
   rather than a date, and a gap-based separator in the transcript instead of a
-  stamp on every message. The palette in `MausAvatar.swift` is copied verbatim
+  stamp on every message. The palette in `BotMascot.swift` is copied verbatim
   from `src/lib/mascot.ts`: a bot the user knows as "the orange one" should be
   the same orange on both screens.
 - **Return inserts a newline.**  Send is the arrow button in the composer, not
