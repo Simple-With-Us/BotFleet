@@ -131,6 +131,16 @@ describe("parseKnobValue", () => {
     expect(parseKnobValue(spec("jobs.webhookHotDeferMinutes"), "9999")).toBe(720);
   });
 
+  it("clamps the webhook payload dedupe window and applies it from the vault", () => {
+    expect(parseKnobValue(spec("jobs.webhookPayloadDedupeSeconds"), "120")).toBe(120);
+    expect(parseKnobValue(spec("jobs.webhookPayloadDedupeSeconds"), "0")).toBe(0);
+    expect(parseKnobValue(spec("jobs.webhookPayloadDedupeSeconds"), "-5")).toBe(0);
+    expect(parseKnobValue(spec("jobs.webhookPayloadDedupeSeconds"), "99999")).toBe(3600);
+    const cfg: AppConfig = { jobs: { webhookHotDeferMinutes: 20 } };
+    resolveKnobFields(cfg, new Map([["BOTFLEET_WEBHOOK_PAYLOAD_DEDUPE_SECONDS", "30"]]));
+    expect(cfg.jobs).toEqual({ webhookHotDeferMinutes: 20, webhookPayloadDedupeSeconds: 30 });
+  });
+
   it("clamps the auto-review limit per turn and applies it from the vault", () => {
     expect(parseKnobValue(spec("autoReview.maxReviewsPerTurn"), "50")).toBe(50);
     expect(parseKnobValue(spec("autoReview.maxReviewsPerTurn"), "0")).toBe(1);

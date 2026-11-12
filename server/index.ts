@@ -184,6 +184,7 @@ import {
 } from "./turn-worktree-admission.ts";
 import { RoomTurnDeadline, RoomTurnStallRegistry, roomTurnTimeoutMessage } from "./room-turn-timeout.ts";
 import { buildSystemPrompt, ownerNotesPrompt } from "./system-prompt.ts";
+import { arrangeUnattendedWakePrompt, logReportedCachedTokens, unattendedCurrentWakeIsStandingText } from "./wake-prompt.ts";
 import { telemetry, turnUsageDetail } from "./telemetry.ts";
 import { usageQuotaPoller } from "./usage-quota.ts";
 import { getDeepSeekBalance } from "./deepseek-balance.ts";
@@ -515,7 +516,7 @@ import { credentialFingerprint, SECRET_FIELDS, secretProvenance, secretSource, v
 import { KNOB_FIELDS, clearedHeadroomKnobs, knobSource, readKnobField } from "./knob-map.ts";
 import { patchChangesInfisicalConnection, writeThroughKnobs } from "./knob-write-through.ts";
 import { configureTurnIdentity, observeRuntimeEvent } from "./sentry-ai.ts";
-import { checkInRoutineFinish, checkInRoutineStart } from "./sentry-crons.ts";
+import { checkInRoutineFinish, checkInRoutineStart, releaseRoutineMonitor } from "./sentry-crons.ts";
 import { ProviderRegistry, type DescribedInstance } from "./harness/registry.ts";
 import { cancelPeerApprovalsFor, cancelPeerApprovalsForThread, dismissStalePeerCards, resolvePeerComms, type ApprovalBus } from "./peer-approval.ts";
 import {
@@ -680,6 +681,7 @@ import {
   type CommandSurface,
 } from "../shared/bot-commands.ts";
 import { memberTurnSelection } from "./member-turn.ts";
+import { DEFAULT_WEBHOOK_PAYLOAD_DEDUPE_MS } from "./webhook-payload-dedupe.ts";
 import { WebhookManager } from "./webhooks.ts";
 import { ResourceTriggerManager } from "./resource-triggers.ts";
 import { readHostDispatchHoldReason, readHostDispatchHot } from "./host-dispatch-hot.ts";
@@ -4408,7 +4410,7 @@ configureTurnIdentity((threadId) => {
 // The latest running token totals for the turn in flight on each thread.
 // Providers report cumulative-within-turn numbers; the final value is folded
 // into the task's tally when the turn settles.
-const turnUsage = new Map<string, { input: number; output?: number; cachedInput?: number }>();
+const turnUsage = new Map<string, { input: number; output?: number; cachedInput?: number; contextWindow?: number }>();
 
 // Where each 1:1 turn in flight is spending its wall time (model, tools, or
 // waiting on a person).  Folded into the task's `stats` aggregate at
@@ -6036,11 +6038,29 @@ bus.subscribe((event: RuntimeEvent) => {
       if (event.setup && bot) store.setActivity(bot.id, "dead");
       break;
     }
-    case "thread.token-usage.updated":
+    case "thread.token-usage.updated": {
       // running totals for the turn in flight; folded into the task's
-      // tally at turn.completed (below) so retries never double-count
-      turnUsage.set(event.threadId, { input: event.input, output: event.output, cachedInput: event.cachedInput });
+      // tally at turn.completed (below) so retries never double-count.
+      // A later tick that omits the window keeps the size already reported.
+      logReportedCachedTokens(event);
+      const previous = turnUsage.get(event.threadId);
+      const contextWindow = event.contextWindow ?? previous?.contextWindow;
+      if (contextWindow === undefined) {
+        turnUsage.set(event.threadId, {
+          input: event.input,
+          output: event.output,
+          cachedInput: event.cachedInput,
+        });
+      } else {
+        turnUsage.set(event.threadId, {
+          input: event.input,
+          output: event.output,
+          cachedInput: event.cachedInput,
+          contextWindow,
+        });
+      }
       break;
+    }
     case "turn.completed": {
       const completionToken = Symbol(event.turnId);
       const completionFold = (async () => {
@@ -6364,6 +6384,7 @@ bus.subscribe((event: RuntimeEvent) => {
           input: tokens?.input,
           output: tokens?.output,
           cachedInput: tokens?.cachedInput,
+          contextWindow: lastReported?.contextWindow,
           costUsd: event.cost ?? null,
           billingMode: event.billingMode,
           // No live entry (a repeated completion, a turn from before a
@@ -7985,8 +8006,8 @@ async function startTurn(
           ? { localComputer: hasHostComputer, workspace: worksInWorkspace }
           : { ...integrations, localComputer: hasHostComputer, workspace: worksInWorkspace, recall: hasRecall, phone: hasPhone, linq: hasLinq, jobs: jobsForTurn, zulip: zulipMounted },
         oneShot
-          ? { chiefOfStaff: false }
-          : { chiefOfStaff: Boolean(bot.chiefOfStaff), linq: hasLinq },
+          ? { chiefOfStaff: false, toolResultArchive: usesDriverToolLoop }
+          : { chiefOfStaff: Boolean(bot.chiefOfStaff), linq: hasLinq, toolResultArchive: usesDriverToolLoop },
       );
       const httpToolPrompt = usesDriverToolLoop
         ? httpCatalogPromptFor(
@@ -8034,7 +8055,7 @@ async function startTurn(
                 : opts?.automationSource === "schedule"
                   ? scheduleAutomationNote(zulipMounted, oneShot)
                   : "";
-      const prompt = buildSystemPrompt(oneShot ? ephemeralPromptSections({ persona, automationNote }) : [
+      let prompt = buildSystemPrompt(oneShot ? ephemeralPromptSections({ persona, automationNote }) : [
         { id: "persona", label: "Identity", text: persona },
         ...(fleetSeat ? [{ id: "fleet-seat", label: "Fleet seat", text: fleetSeat.text }] : []),
         { id: "voice-summary", label: "Speech-friendly summaries", text: cfg.tts?.optimizedSummary ? VOICE_SUMMARY_PROMPT : "" },
@@ -8122,6 +8143,43 @@ async function startTurn(
             : "",
         },
       ]);
+      // Webhook and schedule wakes keep a byte-identical prefix: standing
+      // system sections, then tool schemas, then saved instructions.  The
+      // per-wake tail (timestamps, payloads, run ids) follows that prefix.
+      const cacheFriendlyWake =
+        (opts?.automationSource === "webhook" || opts?.automationSource === "schedule") &&
+        opts?.command === undefined &&
+        !oneShot;
+      let wakeUserText = turnText;
+      let wakeRecoveryText = recoveryText;
+      let wakeHoisted = false;
+      if (cacheFriendlyWake) {
+        const arranged = arrangeUnattendedWakePrompt({
+          sections: prompt.sections,
+          toolSchemas: turnTools.map((tool) => ({
+            name: tool.name,
+            description: tool.description,
+            parameters: tool.parameters,
+          })),
+          wakeText: turnText,
+          // HTTP tool-loop drivers cache the catalog in the prefix.  CLI
+          // lanes discover tools at runtime and must not get a second copy.
+          inlineToolSchemas: usesDriverToolLoop,
+        });
+        prompt = {
+          text: arranged.system,
+          stable: arranged.systemStable,
+          volatile: arranged.systemVolatile,
+          volatileDigest: arranged.volatileDigest,
+          sections: arranged.sections,
+          bytes: arranged.bytes,
+        };
+        wakeUserText = arranged.userText;
+        wakeHoisted = arranged.hoisted;
+        if (recoveryText !== undefined && turnText.length > 0 && recoveryText.endsWith(turnText)) {
+          wakeRecoveryText = recoveryText.slice(0, recoveryText.length - turnText.length) + arranged.userText;
+        }
+      }
       turnPromptBytes.set(threadId, prompt.bytes);
       // Where a turn's context-injection records go: a `context.injected` event
       // for the Trajectory, and a short list on the message the chat hangs the
@@ -8160,6 +8218,22 @@ async function startTurn(
       // A command takes nothing in front of it, so the notices wait for the next turn.
       const jobReminder = opts?.command ? { text: "", items: [] } : jobTurnReminder(bot.id, threadId, jobsMounted);
       jobNoticeItems = jobReminder.items;
+      // A job reminder names live jobs, so it is volatile.  On a wake whose
+      // user text is still the saved routine, it follows that text.  A hoisted
+      // wake's user text is already the per-wake tail, and the reminder stays
+      // in front of that tail.  A payload-only webhook is not hoisted, and
+      // the reminder stays in front of that untrusted body too.
+      const remindedWakeText = (body: string): string => {
+        if (!jobReminder.text) return body;
+        // Saved standing text is stable, so a live job reminder follows it.
+        // Every other turn keeps the reminder in front, including a hoisted
+        // wake whose body is already the volatile tail, and a webhook whose
+        // body is a payload-derived task or untrusted event block.
+        if (cacheFriendlyWake && !wakeHoisted && unattendedCurrentWakeIsStandingText(body)) {
+          return `${body}\n\n${jobReminder.text}`;
+        }
+        return `${jobReminder.text}\n\n${body}`;
+      };
       // The replayed-history cap and the model-written summary toggle.
       // Only a driver that budgets the prompt (ACP) honours them; the
       // rest ignore what they do not know.
@@ -8173,7 +8247,7 @@ async function startTurn(
       if (bot.historySummaryModel === true) historySettings.historySummaryModel = true;
       const turnInput = {
         threadId,
-        text: jobReminder.text ? `${jobReminder.text}\n\n${turnText}` : turnText,
+        text: remindedWakeText(wakeUserText),
         model,
         effort,
         // Only a cap this model's row offers reaches a driver; a stale value
@@ -8197,7 +8271,7 @@ async function startTurn(
         // the active task's own session — another task's cursor would
         // resume the wrong conversation and defeat the context bubble
         resumeCursor: resume ? task.resumeCursors[instanceId] : undefined,
-        recoveryText: recoveryText !== undefined && jobReminder.text ? `${jobReminder.text}\n\n${recoveryText}` : recoveryText,
+        recoveryText: wakeRecoveryText !== undefined ? remindedWakeText(wakeRecoveryText) : undefined,
         ...(recoveryText !== undefined && recoveryText !== turnText ? { recoveryIsReplay: true } : {}),
         ...historySettings,
         // A driver whose provider lost its session sends `recoveryText` in place
@@ -8276,6 +8350,7 @@ async function startTurn(
               // the chiefOfStaff check both live there), independent of
               // whatever the model was actually offered this turn.
               chiefOfStaff: Boolean(bot.chiefOfStaff),
+              toolResultArchive: true,
               // The same `jobsForTurn` the catalog above was built from.
               jobs: jobsForTurn
                 ? { registry: jobRegistry, onComplete: "wake", wakes: jobSettings().wake, maxWaitSeconds: JOB_OUTPUT_WAIT_MAX_SECONDS_HTTP }
@@ -8666,6 +8741,7 @@ routines = new RoutineManager({
   },
   checkInStart: checkInRoutineStart,
   checkInFinish: checkInRoutineFinish,
+  releaseMonitor: releaseRoutineMonitor,
 });
 // Catch up retained durable receipts after restart; delivery IDs deduplicate states.
 for (const run of routines.listRuns()) webhookRequestLog.routineSubscriber({ kind: "routine.run", run });
@@ -8864,6 +8940,12 @@ const webhooks = new WebhookManager({
   pendingRuns: (webhookId) => routines!.activeWebhookRunCount(webhookId),
   canCoalesce: (webhookId, botId) => routines!.canCoalesceWebhook(webhookId, botId),
   runStatus: (runId) => routines!.runStatus(runId),
+  // Live read so an Infisical refresh applies on the next delivery, with 120 seconds when the knob is absent.
+  payloadDedupeWindowMs: () => {
+    const seconds = cfg.jobs?.webhookPayloadDedupeSeconds;
+    if (seconds === undefined || !Number.isFinite(seconds) || seconds < 0) return DEFAULT_WEBHOOK_PAYLOAD_DEDUPE_MS;
+    return seconds * 1000;
+  },
 });
 webhookEphemeralSource = (webhookId) => {
   const hook = webhooks.list().find((candidate) => candidate.id === webhookId);
@@ -10511,7 +10593,7 @@ async function runGroupMemberTurn(
             phone: hasRoomPhone,
             jobs: roomJobs,
           },
-          { chiefOfStaff: Boolean(bot.chiefOfStaff) },
+          { chiefOfStaff: Boolean(bot.chiefOfStaff), toolResultArchive: true },
         )
       : [];
   // `commsDepth: hop` — the room's own hop, not zero.  The catalog above
@@ -10535,6 +10617,7 @@ async function runGroupMemberTurn(
           confinement: confinementForRoom,
           cwd: cwd ?? bot.cwd ?? undefined,
           chiefOfStaff: Boolean(bot.chiefOfStaff),
+          toolResultArchive: true,
           jobs: roomJobs
             ? { registry: jobRegistry, onComplete: "notice", maxWaitSeconds: JOB_OUTPUT_WAIT_MAX_SECONDS_HTTP }
             : undefined,

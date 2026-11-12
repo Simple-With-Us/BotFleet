@@ -206,30 +206,36 @@ public struct EngineInitDeadline: Equatable, Sendable {
     }
 }
 
-/// Failure modes for `opencode models` catalog probes (`BF-2488`).
+/// Failure modes for `opencode models` catalog probes (`BF-2488`, user copy `BF-2666`).
 public enum OpenCodeProbeFailureKind: Equatable, Sendable {
     case timedOut(deadline: EngineInitDeadline)
     case stoppedBySignal(signal: String?)
     case emptyOutput(verboseError: String?)
     case cliError(message: String)
 
-    /// Exact human-facing sentence for the Engines status row (`server/drivers/acp/opencode-go.ts`).
+    private static let sentenceGap = "\u{00A0} "
+
+    private static let modelsLoadFailed =
+        "BotFleet couldn't load OpenCode's models.\(sentenceGap)Try again in a moment."
+    private static let modelsTimedOutBusy =
+        "BotFleet couldn't load OpenCode's models.\(sentenceGap)It timed out while your computer was busy."
+    private static let modelsStoppedEarly =
+        "BotFleet couldn't load OpenCode's models.\(sentenceGap)OpenCode stopped before it could answer."
+
+    /// Human-facing sentence for the Engines status row (`shared/opencode-model-probe.ts`).
     public var statusSentence: String {
         switch self {
-        case .timedOut(let deadline):
-            return "OpenCode's model probe timed out \(deadline.deadlineDescription)"
-        case .stoppedBySignal(let signal):
-            if let signal, !signal.isEmpty {
-                return "OpenCode's model probe was stopped by \(signal) before it answered"
-            }
-            return "OpenCode's model probe was stopped before it answered"
+        case .timedOut:
+            return Self.modelsTimedOutBusy
+        case .stoppedBySignal:
+            return Self.modelsStoppedEarly
         case .emptyOutput(let verboseError):
             if let verboseError, !verboseError.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                return "opencode models listed nothing (\(verboseError))"
+                return "OpenCode listed no models."
             }
-            return "opencode models answered nothing"
-        case .cliError(let message):
-            return message
+            return "OpenCode answered but listed no models."
+        case .cliError:
+            return Self.modelsLoadFailed
         }
     }
 }

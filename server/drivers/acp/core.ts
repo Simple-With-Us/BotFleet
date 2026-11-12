@@ -24,6 +24,7 @@ import { cliProbeEnvironment } from "../../cli-probe-env.ts";
 import { decodeInjectId } from "../local-inject.ts";
 import { toolFields } from "../../tool-fields.ts";
 import { describeResult } from "../../../shared/tool-activity.ts";
+import { reconcileLifecycleToolOk } from "../../../shared/lifecycle-tool.ts";
 import { capturePreparedBoth, capturePreparedInput, prepareInput, textSignature } from "../../../shared/item-io.ts";
 import {
   classifyVersionProbeFailure,
@@ -1159,6 +1160,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         // fingerprint is held (never the text, which can be a whole file), and
         // it is dropped as the call ends.
         const toolInputs = new Map<string, string>();
+        const toolTitles = new Map<string, string>();
         // Adapters may repeat a terminal update after an initially terminal
         // tool_call. Keep bounded IDs for this prompt so duplicates cannot
         // create a second completion row.
@@ -1736,6 +1738,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 if (isTerminal) {
                   openToolCalls.delete(toolCallId);
                   toolInputs.delete(toolCallId);
+                  toolTitles.delete(toolCallId);
                 } else {
                   openToolCalls.add(toolCallId);
                   if (announced !== undefined) toolInputs.set(toolCallId, textSignature(announced.text));
@@ -1752,12 +1755,14 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               // title.  Folding all of it into one 80-char title was what left
               // the transcript showing `read_file` seven times with no paths;
               // the name and the thing it acted on are separate columns now.
+              const startedTitle = String(titleText ?? commandText ?? "tool").slice(0, 80);
+              if (toolCallId !== undefined) toolTitles.set(toolCallId, startedTitle);
               emit({
                 ...base(threadId, turnId),
                 type: "item.started",
                 itemType: "tool",
                 itemId: toolCallId,
-                title: String(titleText ?? commandText ?? "tool").slice(0, 80),
+                title: startedTitle,
                 ...toolFields(titleText ?? commandText, u.rawInput, {
                   hint: kindText,
                   locations: u.locations,
@@ -1768,13 +1773,15 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               if (isTerminal) {
                 const output = u.content ?? u.rawOutput;
                 const parsedTerminalTitle = z.string().max(256).safeParse(u.title);
+                const terminalTitle = parsedTerminalTitle.success ? parsedTerminalTitle.data : titleText;
+                const detail = describeResult(output);
                 emit({
                   ...base(threadId, turnId),
                   type: "item.completed",
                   itemType: "tool",
                   itemId: toolCallId,
-                  ok: u.status === "completed",
-                  detail: describeResult(output),
+                  ok: reconcileLifecycleToolOk(u.status === "completed", terminalTitle, detail),
+                  detail,
                   title: parsedTerminalTitle.success ? parsedTerminalTitle.data : undefined,
                   ...capturePreparedBoth(undefined, output),
                 });
@@ -1795,19 +1802,24 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               const newInput = settled !== undefined && toolCallId !== undefined && toolInputs.get(toolCallId) !== settledSignature ? settled : undefined;
               if (newInput !== undefined && settledSignature !== undefined && toolCallId !== undefined) toolInputs.set(toolCallId, settledSignature);
               if (u.status === "completed" || u.status === "failed") {
+                const parsedTerminalTitle = z.string().max(256).safeParse(u.title);
+                const terminalTitle = parsedTerminalTitle.success ? parsedTerminalTitle.data : undefined;
+                const lifecycleTitle = terminalTitle
+                  ?? (toolCallId !== undefined ? toolTitles.get(toolCallId) : undefined);
                 if (toolCallId !== undefined) {
                   openToolCalls.delete(toolCallId);
                   toolInputs.delete(toolCallId);
+                  toolTitles.delete(toolCallId);
                   rememberSettledToolCall(toolCallId);
                 }
-                const parsedTerminalTitle = z.string().max(256).safeParse(u.title);
+                const detail = describeResult(u.content ?? u.rawOutput);
                 emit({
                   ...base(threadId, turnId),
                   type: "item.completed",
                   itemType: "tool",
                   itemId: toolCallId,
-                  ok: u.status !== "failed",
-                  detail: describeResult(u.content ?? u.rawOutput),
+                  ok: reconcileLifecycleToolOk(u.status !== "failed", lifecycleTitle, detail),
+                  detail,
                   title: parsedTerminalTitle.success ? parsedTerminalTitle.data : undefined,
                   ...capturePreparedBoth(newInput, u.content ?? u.rawOutput),
                 });

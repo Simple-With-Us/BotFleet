@@ -182,6 +182,16 @@ export const KNOB_FIELDS: readonly KnobFieldSpec[] = [
     max: 720,
   },
   {
+    id: "jobs.webhookPayloadDedupeSeconds",
+    label: "Webhook payload dedupe window",
+    section: "jobs",
+    path: ["webhookPayloadDedupeSeconds"],
+    infisicalName: "BOTFLEET_WEBHOOK_PAYLOAD_DEDUPE_SECONDS",
+    kind: "int",
+    min: 0,
+    max: 3600,
+  },
+  {
     // The placement transport's own two knobs (server/placement-controller-bridge.ts).
     // `heartbeatSeconds` is how often a worker says it is alive, and the
     // controller's sweep runs at the same cadence.  The other one is how

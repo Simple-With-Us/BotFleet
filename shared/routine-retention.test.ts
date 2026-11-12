@@ -1,5 +1,11 @@
 import { expect, it } from "vitest";
-import { boundPromptSnapshot, boundStalePromptSnapshots, retainRoutineRuns } from "./routine-retention";
+import {
+  boundPromptSnapshot,
+  boundStalePromptSnapshots,
+  parseRoutineRunRetentionDays,
+  retainRoutineRuns,
+  routineRunRetentionMaxAgeMs,
+} from "./routine-retention";
 
 it("keeps an old active execution and its receipts beyond 2,000 newer terminal records", () => {
   const owner = { id: "owner", status: "running", createdAt: 1 };
@@ -57,6 +63,63 @@ it("drops oldest terminal runs within a single routine exactly as global oldest-
   }));
   expect(retainRoutineRuns(runs, 3).map((run) => run.id)).toEqual(["run-2", "run-3", "run-4"]);
   expect(runs).toHaveLength(5);
+});
+
+it("drops terminal runs older than the retention window and keeps newer ones", () => {
+  const day = routineRunRetentionMaxAgeMs(1);
+  const now = 10 * day;
+  const runs = [
+    { id: "stale", status: "completed", createdAt: now - 3 * day, finishedAt: now - 2 * day },
+    { id: "fresh", status: "failed", createdAt: now - day, finishedAt: now - day / 2 },
+    { id: "edge", status: "cancelled", createdAt: now - day, finishedAt: now - day + 1 },
+  ];
+  expect(retainRoutineRuns(runs, 10_000, [], { maxAgeMs: day, nowMs: now }).map((run) => run.id)).toEqual([
+    "fresh",
+    "edge",
+  ]);
+});
+
+it("applies the safety cap after the time window", () => {
+  const now = 1_000_000;
+  const runs = Array.from({ length: 5 }, (_, i) => ({
+    id: `run-${i}`,
+    status: "completed",
+    createdAt: now - 100 + i,
+    finishedAt: now - 100 + i,
+  }));
+  expect(retainRoutineRuns(runs, 2, [], { maxAgeMs: 1_000_000, nowMs: now }).map((run) => run.id)).toEqual([
+    "run-3",
+    "run-4",
+  ]);
+});
+
+it("protects receipt-target runs from time and count pruning", () => {
+  const now = 500;
+  const runs = [
+    { id: "receipt-run", status: "completed", createdAt: 100, finishedAt: 100 },
+    { id: "old", status: "completed", createdAt: 200, finishedAt: 480 },
+    { id: "new", status: "completed", createdAt: 300, finishedAt: 495 },
+  ];
+  expect(
+    retainRoutineRuns(runs, 1, ["receipt-run"], { maxAgeMs: 50, nowMs: now }).map((run) => run.id),
+  ).toEqual(["receipt-run", "new"]);
+});
+
+it("keeps non-terminal runs when the time window would evict everything else", () => {
+  const now = 1_000;
+  const runs = [
+    { id: "active", status: "running", createdAt: 1 },
+    { id: "ancient", status: "completed", createdAt: 1, finishedAt: 1 },
+  ];
+  expect(retainRoutineRuns(runs, 1, [], { maxAgeMs: 1, nowMs: now }).map((run) => run.id)).toEqual(["active"]);
+});
+
+it("parseRoutineRunRetentionDays falls back for empty and invalid input", () => {
+  expect(parseRoutineRunRetentionDays(undefined)).toBe(7);
+  expect(parseRoutineRunRetentionDays("")).toBe(7);
+  expect(parseRoutineRunRetentionDays("not-a-number")).toBe(7);
+  expect(parseRoutineRunRetentionDays("-3")).toBe(7);
+  expect(parseRoutineRunRetentionDays("14")).toBe(14);
 });
 
 it("preserves a referenced owner and every queued or waiting receipt without expanding admission", () => {
