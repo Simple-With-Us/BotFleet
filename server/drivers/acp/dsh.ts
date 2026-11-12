@@ -21,6 +21,8 @@ import {
   dshSpawnArgs as clutchDshSpawnArgs,
   dshSupport as clutchDshSupport,
   dshVersionCompatibilityReason,
+  parseAdvertisedDshModels,
+  type DshAdvertisedModel,
 } from "clutch/dsh/acp";
 
 import type { ModelCatalog, ProviderErrorCode, SendTurnInput } from "../../contracts.ts";
@@ -35,11 +37,11 @@ import { dshWrapSpawn } from "./dsh-mcp.ts";
 export { dshWrapSpawn, isDshEngineCli, isStockDshCli } from "./dsh-mcp.ts";
 /** BotFleet DSH model catalog.  The Clutch package still publishes
  * MiniMax-M2.7, but it is dropped here per the product decision (M3.1 Flash
- * Preview dominates on context and is the canonical DSH-hosted MiniMax row). */
+ * dominates on context and is the canonical DSH-hosted MiniMax row). */
 /** BotFleet DSH model catalog.
  *
  *  Owner-facing list (2026-09-27): DeepSeek V4 Pro, DeepSeek V4 Flash, then
- *  MiniMax M3.1 Flash Preview and M2.7 Highspeed.  DeepSeek's catalog is
+ *  MiniMax M3.1 Flash and M2.7 Highspeed.  DeepSeek's catalog is
  *  only two models — `deepseek-flash` IS the image+video model, billed at the
  *  same rate as text (its image tokens bill "together with your text tokens"),
  *  so there is deliberately no third DeepSeek row for the multimodal variant.
@@ -59,9 +61,9 @@ export { dshWrapSpawn, isDshEngineCli, isStockDshCli } from "./dsh-mcp.ts";
  *  onto it through `RETIRED_MODEL_REPLACEMENTS` so saved bots keep working.
  *
  *  `MiniMax-M2.7` and `MiniMax-M3` are dropped per the product decision (M3.1
- *  Flash Preview dominates on context and is the canonical DSH-hosted MiniMax
- *  row); both sit in `DSH_EXCLUDED_MODEL_IDS` so the live-catalog union with
- *  an older settings file cannot re-add them.
+ *  Flash dominates on context and is the canonical DSH-hosted MiniMax row);
+ *  both sit in `DSH_EXCLUDED_MODEL_IDS` so the live-catalog union with an
+ *  older settings file cannot re-add them.
  *
  *  Badges are price/speed facts the picker renders as chips, so the cost
  *  tradeoff is visible before a model is picked. */
@@ -81,11 +83,17 @@ export const DSH_DEEPSEEK_FLASH_MODEL = "DeepSeek-V4.1-Flash";
  *  the `-Preview` suffix (it now declares `minimax/MiniMax-M3.1-Flash`), and
  *  Clutch's model matching has no MiniMax alias family, so sending the old
  *  `MiniMax-M3.1-Flash-Preview` spelling failed every turn with "unknown
- *  model".  The retired spelling is excluded below and saved dsh selections
- *  are rewritten onto this id by `retired-model-ids.ts`.  mcode and the native
- *  MiniMax HTTP driver still use the Preview id and are untouched. */
+ *  model".  The retired spelling is excluded below and saved selections are
+ *  rewritten onto this id by `retired-model-ids.ts`.  Every engine that
+ *  serves M3.1 now spells it this way, the native MiniMax HTTP driver
+ *  included. */
 export const DSH_MINIMAX_M31_FLASH_MODEL = "MiniMax-M3.1-Flash";
-/** The pre-rename spelling of {@link DSH_MINIMAX_M31_FLASH_MODEL}. */
+/** The pre-rename spelling of {@link DSH_MINIMAX_M31_FLASH_MODEL}.
+ *
+ *  Still needed in two places, neither of them a catalog row: the exclusion
+ *  list below drops a stale settings entry that declares it, and the Clutch
+ *  package keys its per-model effort table by it, so the settings view below
+ *  has to present the live entry under that id for Clutch to answer. */
 export const DSH_RETIRED_MINIMAX_M31_PREVIEW_MODEL = "MiniMax-M3.1-Flash-Preview";
 
 export const STATIC_DSH_MODELS: ModelCatalog = {
@@ -395,6 +403,27 @@ export function dshSpawnArgs(config: AcpConfig, turn: Pick<SendTurnInput, "integ
   return clutchDshSpawnArgs(config, turn);
 }
 
+const DSH_FLASH_WIRE_MODEL_ID = "deepseek-flash";
+const dshSelectModel = clutchDshSupport.selectModel;
+
+/** Switch a resolved model value whose id is a non-canonical spelling of
+ * DeepSeek Flash (for example the settings alias `deepseek-v4.1-flash`) to the
+ * stock `deepseek-flash` option, but only when the session advertises that
+ * option on the same provider route.  dsh refuses any option it did not
+ * advertise ("unknown model option"), so a session that offers only the alias
+ * keeps the declared value.  Without an advertisement Clutch already builds the
+ * stock wire id, so the value is returned unchanged. */
+export function dshCanonicalFlashWireValue(value: string, advertised: readonly DshAdvertisedModel[] | null): string {
+  const resolved = advertised?.find((entry) => entry.value === value);
+  if (!resolved || resolved.id === DSH_FLASH_WIRE_MODEL_ID || !dshSameModel(resolved.id, DSH_FLASH_WIRE_MODEL_ID)) {
+    return value;
+  }
+  const canonical = advertised?.find(
+    (entry) => entry.provider === resolved.provider && entry.id === DSH_FLASH_WIRE_MODEL_ID,
+  );
+  return canonical?.value ?? value;
+}
+
 /**
  * The Clutch package's error codes include "unknown"; BotFleet's
  * ProviderErrorCode does not — an unrecognized Clutch code is the same as
@@ -426,6 +455,18 @@ export const dshSupport = {
   images: true,
   models: STATIC_DSH_MODELS,
   resolveModels: (environment) => readDshModelCatalog(environment),
+  // The installed settings can declare Flash as `deepseek-v4.1-flash`, but
+  // DeepSeek's API accepts only the stock `deepseek-flash` id.  Resolve every
+  // model through Clutch first, so the advertised route and the not-offered
+  // check (DshModelNotOfferedError) still apply, then prefer the advertised
+  // `deepseek-flash` option on the same route when the session offers it.
+  selectModel: dshSelectModel && {
+    ...dshSelectModel,
+    valueForModel: (model, advertised) => {
+      const value = dshSelectModel.valueForModel?.(model, advertised);
+      return value ? dshCanonicalFlashWireValue(value, parseAdvertisedDshModels(advertised)) : value;
+    },
+  },
   loginNote: clutchDshSupport.loginNote ?? "DSH CLI auth missing — add ~/.dsh/.credentials.yaml",
   resumeMethod: "session/resume" as const,
   spawnArgs: dshSpawnArgs,

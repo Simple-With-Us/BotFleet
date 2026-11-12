@@ -7,9 +7,14 @@ import {
 } from "./busy-send-default.ts";
 
 describe("busy-send-default", () => {
-  it("defaults unset values to steer for backward compatibility", () => {
-    expect(parseBusySendDefault(undefined)).toBe(DEFAULT_BUSY_SEND_DEFAULT);
-    expect(parseBusySendDefault("nope")).toBe(DEFAULT_BUSY_SEND_DEFAULT);
+  it("defaults unset values to queue so a reply finishes before the next send", () => {
+    expect(DEFAULT_BUSY_SEND_DEFAULT).toBe("queue");
+    expect(parseBusySendDefault(undefined)).toBe("queue");
+    expect(parseBusySendDefault("nope")).toBe("queue");
+  });
+
+  it("keeps a workspace that explicitly chose steer on steer", () => {
+    expect(parseBusySendDefault("steer")).toBe("steer");
   });
 
   it("accepts queue and steer", () => {

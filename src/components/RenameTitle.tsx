@@ -108,7 +108,7 @@ export function RenameTitle({
           title="Rename Bot"
           className="flex size-10 shrink-0 items-center justify-center rounded text-ink-secondary opacity-70 hover:bg-raised hover:text-ink hover:opacity-100"
         >
-          <Pencil size={12} />
+          <Pencil size={12} aria-hidden="true" />
         </button>
       </span>
     );

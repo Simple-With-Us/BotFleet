@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFileSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -9,7 +9,7 @@ import { createReceipt, validateReceipt } from './sentry-testflight-receipt.mjs'
 import { reportTestFlight } from './sentry-report-testflight.mjs';
 const sha = 'a'.repeat(40);
 const fixture = () => ({ archive: { bundleId:'app.botfleet.ios', marketingVersion:'1.0.79', buildNumber:'2126' },
-  readiness:{ok:true,version:'2126',buildId:'asc-build-123',internalBuildState:'IN_BETA_TESTING'},
+  readiness:{ok:true,version:'2126',buildId:'asc-build-123',internalBuildState:'IN_BETA_TESTING',externalInstallPath:true},
   sourceCommit:sha,expectedCommit:sha,bundleId:'app.botfleet.ios',marketingVersion:'1.0.79',buildNumber:'2126',now:new Date('2026-10-06T02:30:00.000Z') });
 const receipt = () => createReceipt(fixture());
 const root = new URL('../', import.meta.url);
@@ -20,7 +20,13 @@ const shellPath = path => path.replaceAll('\\', '/');
 
 test('receipt matches Cocoa SDK identity and exact archive, source, ASC build', () => {
   assert.equal(receipt().release, 'app.botfleet.ios@1.0.79+2126');
-  assert.equal(receipt().milestone, 'testflight-ready');
+  assert.equal(receipt().milestone, 'testflight-processed');
+  assert.equal(receipt().externalInstallPath, true);
+  // The receipt carries the app-level install path predicate it was gated on;
+  // a readiness file without it is not deployment evidence.
+  for (const bad of [false, null, undefined]) {
+    const f = fixture(); f.readiness.externalInstallPath = bad; assert.throws(() => createReceipt(f));
+  }
   for (const field of ['bundleId','marketingVersion','buildNumber']) {
     const f = fixture(); f.archive[field] = 'different'; assert.throws(() => createReceipt(f));
   }
@@ -43,6 +49,49 @@ test('receipt rejects wrong app, forged release, SHA and output injection', () =
   }
 });
 
+// Every app moved to the fixed marketing version 0.1.0 with a 12-digit Central
+// Time merge stamp as the build (owner, Oct 29 2026).  The old /^1\.0\.\d+$/
+// literal rejected 0.1.0, so every BotFleet ship after the switch uploaded and
+// then went red in report-sentry-deployment (runs 40858792579, 40962361179).
+test('receipt accepts the fixed 0.1.0 marketing version with a merge-stamp build', () => {
+  const stamp = { archive:{ bundleId:'app.botfleet.ios', marketingVersion:'0.1.0', buildNumber:'202610291639' },
+    readiness:{...fixture().readiness, version:'202610291639'}, marketingVersion:'0.1.0', buildNumber:'202610291639' };
+  const r = createReceipt({...fixture(), ...stamp});
+  assert.equal(r.release, 'app.botfleet.ios@0.1.0+202610291639');
+  assert.deepEqual(validateReceipt(r), r);
+  assert.doesNotThrow(() => validateReceipt({...r, marketingVersion:'1.1.2', release:'app.botfleet.ios@1.1.2+202610291639'}));
+  for (const marketingVersion of ['0.1','01.1.0','0.1.0.1','v0.1.0','0.1.0\n']) {
+    assert.throws(() => validateReceipt({...r, marketingVersion, release:`app.botfleet.ios@${marketingVersion}+202610291639`}), /marketingVersion/);
+  }
+});
+
+test('a receipt failure names the fields that disagreed', () => {
+  const f = fixture(); f.archive.buildNumber = '2127'; f.readiness.version = '2125'; f.expectedCommit = 'b'.repeat(40);
+  assert.throws(() => createReceipt(f), (error) =>
+    /archive CFBundleVersion "2127" != build number "2126"/.test(error.message) &&
+    /App Store Connect build "2125" != build number "2126"/.test(error.message) &&
+    /source commit \(HEAD\) "a{40}" != archived commit "b{40}"/.test(error.message) &&
+    !/CFBundleShortVersionString/.test(error.message));
+  assert.throws(() => createReceipt({...fixture(), readiness:{...fixture().readiness, ok:false, internalBuildState:'PROCESSING'}}),
+    /readiness file: ok is false, expected true; internalBuildState "PROCESSING"/);
+  assert.throws(() => validateReceipt({...receipt(), ascBuildId:'x\n::error::forged'}), (error) =>
+    error.message.includes('ascBuildId "x\\n::error::forged"') && !error.message.includes('\n'));
+});
+
+test('the receipt CLI prints why it failed instead of a bare error', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sentry-receipt-cli-'));
+  try {
+    const out = join(dir, 'out'); writeFileSync(out, '');
+    const script = fileURLToPath(new URL('./sentry-testflight-receipt.mjs', import.meta.url));
+    const result = spawnSync(process.execPath, [script], { encoding:'utf8', env:{ PATH:process.env.PATH,
+      SENTRY_ARCHIVE_PATH:join(dir,'missing.xcarchive'), SENTRY_READY_FILE:join(dir,'missing.json'), SENTRY_REPO_ROOT:dir,
+      SENTRY_ARCHIVE_COMMIT:sha, SENTRY_BUNDLE_ID:'app.botfleet.ios', SENTRY_MARKETING_VERSION:'0.1.0', SENTRY_BUILD_NUMBER:'202610291639', GITHUB_OUTPUT:out } });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /::error::Could not verify TestFlight release receipt;.*Reason: Could not read ApplicationProperties:CFBundleIdentifier/);
+    assert.equal(readFileSync(out, 'utf8'), '');
+  } finally { rmSync(dir, { recursive:true, force:true }); }
+});
+
 function fakeAPI({exists=false, duplicate=false, failAt=0, failStatus=403, ref=sha}={}) {
   const calls=[];
   const fetchImpl=async (url,options) => {
@@ -63,7 +112,7 @@ test('report uses exact Cocoa release, source refs, scoped project and honest di
   const api=fakeAPI();
   const result=await reportTestFlight(receipt(), {token:'fixture-value',runId:'123',fetchImpl:api.fetchImpl});
   assert.equal(result.deployId,'123'); assert.equal(api.calls.length,4);
-  assert.deepEqual(api.calls[1].body.refs,[{repository:'jaywedgeworth22/BotFleet',commit:sha}]);
+  assert.deepEqual(api.calls[1].body.refs,[{repository:'Simple-With-Us/BotFleet',commit:sha}]);
   assert.equal(api.calls[1].body.version,receipt().release);
   assert.match(api.calls[0].url,/app.botfleet.ios%401.0.79%2B2126/);
   assert.deepEqual(api.calls[3].body.projects,['botfleet']);
@@ -96,20 +145,97 @@ test('API/transport failures are loud and never retry an ambiguous write or prin
   await assert.rejects(reportTestFlight(receipt(),{token:'fixture-value',runId:'123',fetchImpl:()=>{throw Error('secret bearer value');}}),error=>!error.message.includes('secret bearer'));
 });
 
+// A stale repository name is not a syntax error: Sentry accepts the request and
+// rejects the whole write with HTTP 400 {"refs":["Invalid repository names: ..."]},
+// which turned every main push red while the TestFlight upload itself succeeded.
+// Pin the one name Sentry has registered, and pin the single-constant shape, so a
+// future transfer cannot reintroduce a second spelling behind a stale comment.
+test('refs carry exactly the repository name Sentry has registered, with no second spelling', async () => {
+  const api=fakeAPI();
+  await reportTestFlight(receipt(), {token:'fixture-value',runId:'123',fetchImpl:api.fetchImpl});
+  const refs=api.calls[1].body.refs;
+  assert.equal(refs.length,1);
+  assert.equal(refs[0].repository,'Simple-With-Us/BotFleet');
+  assert.ok(!/jaywedgeworth22\//.test(JSON.stringify(api.calls[1].body)),'no pre-transfer repository name may reach Sentry');
+  const source=read('scripts/sentry-report-testflight.mjs');
+  assert.ok(!source.includes('SENTRY_REPOSITORY'),'a second repository constant is how the two names drifted apart');
+});
+
+// Discarding the response body is what cost three fixes: each cleared one layer
+// and the same bare "HTTP 400" hid the next.  Sentry's own validation error must
+// be visible -- but a non-JSON body (gateway page, proxy string) is the shape
+// that can echo something sensitive, so it stays suppressed.
+test('a failed write reports the JSON reason Sentry gave, with credentials scrubbed', async () => {
+  const token='sntr_fixture_token_value';
+  const jsonFailure=async (url,options)=>{
+    if (options.method==='GET'&&url.endsWith('/deploys/')) return Response.json([]);
+    if (options.method==='GET') return Response.json({ref:null,projects:[{slug:'botfleet'}]});
+    return new Response(JSON.stringify({refs:[`Invalid repository names: ${token}`],detail:`token ${token}`}),
+      {status:400,headers:{'Content-Type':'application/json'}});
+  };
+  await assert.rejects(
+    reportTestFlight(receipt(),{token,runId:'123',fetchImpl:jsonFailure}),
+    error=>/HTTP 400/.test(error.message)
+      &&/Invalid repository names/.test(error.message)
+      &&!error.message.includes(token),
+  );
+
+  const opaqueBody='<html>upstream failed for token '+token+'</html>';
+  const opaqueFailure=async (url,options)=>{
+    if (options.method==='GET'&&url.endsWith('/deploys/')) return Response.json([]);
+    if (options.method==='GET') return Response.json({ref:null,projects:[{slug:'botfleet'}]});
+    return new Response(opaqueBody,{status:400});
+  };
+  await assert.rejects(
+    reportTestFlight(receipt(),{token,runId:'123',fetchImpl:opaqueFailure}),
+    error=>/HTTP 400/.test(error.message)
+      &&!error.message.includes(token)
+      &&!error.message.includes('upstream failed'),
+  );
+
+  // A JSON array (or scalar) body is not the object shape Sentry documents:
+  // the plain-object gate must keep it out of the error the same way (Kody
+  // review, PR #1252) - nothing fails today if the schema weakens to z.unknown().
+  const arrayFailure=async (url,options)=>{
+    if (options.method==='GET'&&url.endsWith('/deploys/')) return Response.json([]);
+    if (options.method==='GET') return Response.json({ref:null,projects:[{slug:'botfleet'}]});
+    return new Response(JSON.stringify([`Invalid repository names: ${token}`]),
+      {status:400,headers:{'Content-Type':'application/json'}});
+  };
+  await assert.rejects(
+    reportTestFlight(receipt(),{token,runId:'123',fetchImpl:arrayFailure}),
+    error=>/HTTP 400/.test(error.message)
+      &&!error.message.includes(token)
+      &&!/Invalid repository names/.test(error.message),
+  );
+});
+
 test('ship receipt follows recorded success only after exact ASC readiness; skipped states produce none', () => {
   const source=read('scripts/ios-fleet/ship-testflight.sh');
+  const rcSh=read('scripts/ios-fleet/tf-ready-rc.sh');
+  const prefix=source.slice(source.indexOf('# shellcheck source=scripts/ios-fleet/tf-ready-rc.sh'),source.indexOf('TF_READY_CONFIRMED=0'));
   const ensure=source.slice(source.indexOf('TF_READY_CONFIRMED=0'),source.indexOf('SENTRY_ARCHIVE_COMMIT="$(repo_head_sha)"'));
-  const emit=source.slice(source.indexOf('emit_sentry_deployment_receipt() {'),source.indexOf('\nacquire_archive_lock\nlog "archiving..."'));
+  const emit=source.slice(source.indexOf('write_deferred_sentry_ship_context() {'),source.indexOf('\nacquire_archive_lock\nlog "archiving..."'));
   const dir=mkdtempSync(join(tmpdir(),'sentry-testflight-'));
+  const fleetDir=join(dir,'fleet');
   try {
+    mkdirSync(fleetDir);
+    writeFileSync(join(fleetDir,'tf-ready-rc.sh'),rcSh);
     for (const [status, receiptStatus] of [[0,0],[0,1],[2,0],[3,0],[4,0]]) {
       const out=join(dir,`out-${status}-${receiptStatus}`); writeFileSync(out,'');
-      const script=`set -euo pipefail\nlog(){ :; }\nnode(){ if [[ "$1" == *asc-api.mjs ]]; then printf '{"ok":true}'; return ${status}; elif [[ ${receiptStatus} == 1 ]]; then return 1; else echo emitted >> "$GITHUB_OUTPUT"; fi; }\n${ensure}\n${emit}\nensure_tf_ready\nemit_sentry_deployment_receipt\n`;
+      const script=`set -euo pipefail\nlog(){ :; }\nnode(){ if [[ "$1" == *asc-api.mjs ]]; then printf '{"ok":true,"buildId":"b1","version":"2126","internalBuildState":"IN_BETA_TESTING","externalInstallPath":true}'; return ${status}; elif [[ ${receiptStatus} == 1 ]]; then return 1; else echo emitted >> "$GITHUB_OUTPUT"; fi; }\n${prefix}\n${ensure}\n${emit}\nensure_tf_ready\nemit_sentry_deployment_receipt\n`;
       const scriptFile=join(dir,'fixture.sh'); writeFileSync(scriptFile,script);
-      const result=spawnSync('bash',[shellPath(scriptFile)],{env:{PATH:process.env.PATH,APP_KEY:'botfleet',GITHUB_OUTPUT:shellPath(out),BUNDLE_ID:'app.botfleet.ios',BUILD_NUM:'2126',MARKETING:'1.0.79',REPO_ROOT:shellPath(dir),PREV_SHIP_SHA:sha,DISPLAY_NAME:'BotFleet',IOS_PATH_PREFIX:'ios',FLEET_DIR:shellPath(dir),LOG_DIR:shellPath(dir),ARCHIVE_PATH:shellPath(dir),SENTRY_ARCHIVE_COMMIT:sha},encoding:'utf8'});
+      const result=spawnSync('bash',[shellPath(scriptFile)],{env:{PATH:process.env.PATH,APP_KEY:'botfleet',GITHUB_OUTPUT:shellPath(out),BUNDLE_ID:'app.botfleet.ios',BUILD_NUM:'2126',MARKETING:'1.0.79',REPO_ROOT:shellPath(dir),PREV_SHIP_SHA:sha,DISPLAY_NAME:'BotFleet',IOS_PATH_PREFIX:'ios',FLEET_DIR:shellPath(fleetDir),LOG_DIR:shellPath(dir),ARCHIVE_PATH:shellPath(dir),SENTRY_ARCHIVE_COMMIT:sha,IOS_DEFER_SENTRY_RECEIPT:'0'},encoding:'utf8'});
       assert.equal(result.status,0,result.stderr);
       assert.equal(readFileSync(out,'utf8'),status!==0?'':receiptStatus===0?'emitted\n':'sentry_receipt_error=true\n');
     }
+    const deferOut=join(dir,'defer-out'); writeFileSync(deferOut,'');
+    const deferScript=`set -euo pipefail\nlog(){ :; }\nnode(){ if [[ "$1" == *asc-api.mjs ]]; then printf '{"ok":true}'; return 0; else return 1; fi; }\n${prefix}\n${ensure}\n${emit}\nensure_tf_ready\nemit_sentry_deployment_receipt\n`;
+    writeFileSync(join(dir,'defer.sh'),deferScript);
+    const defer=spawnSync('bash',[shellPath(join(dir,'defer.sh'))],{env:{PATH:process.env.PATH,APP_KEY:'botfleet',GITHUB_OUTPUT:shellPath(deferOut),BUNDLE_ID:'app.botfleet.ios',BUILD_NUM:'2126',MARKETING:'1.0.79',REPO_ROOT:shellPath(dir),PREV_SHIP_SHA:sha,DISPLAY_NAME:'BotFleet',IOS_PATH_PREFIX:'ios',FLEET_DIR:shellPath(fleetDir),LOG_DIR:shellPath(dir),ARCHIVE_PATH:shellPath(dir),SENTRY_ARCHIVE_COMMIT:sha,IOS_DEFER_SENTRY_RECEIPT:'1'},encoding:'utf8'});
+    assert.equal(defer.status,0,defer.stderr);
+    assert.match(readFileSync(deferOut,'utf8'),/ios_ship_archive_path=/);
+    assert.doesNotMatch(readFileSync(deferOut,'utf8'),/sentry_receipt=/);
   } finally { rmSync(dir,{recursive:true,force:true}); }
   assert.equal((source.match(/record_successful_ship\n\s*emit_sentry_deployment_receipt/g)||[]).length,2);
   assert.equal((source.match(/TF_READY_CONFIRMED=1/g)||[]).length,1);
@@ -122,8 +248,10 @@ test('ship receipt follows recorded success only after exact ASC readiness; skip
   assert.match(workflow,/receipt.sourceCommit !== process.env.GITHUB_SHA/);
   assert.match(workflow,/SENTRY_RECEIPT_ERROR === "true"\) throw new Error/);
   const ship=read('.github/workflows/ios-ship.yml');
-  assert.match(ship,/needs.ship.outputs.sentry_receipt != ''/);
-  assert.match(ship,/needs.ship.outputs.sentry_receipt_error == 'true'/);
+  assert.match(ship,/needs\.ship\.outputs\.sentry_receipt != ''/);
+  assert.match(ship,/needs\.ship\.outputs\.sentry_receipt_error == 'true'/);
+  assert.match(ship,/steps\.post_sync_tf\.outputs\.sentry_receipt/);
+  assert.match(ship,/ios-post-sync-tf-ready\.sh/);
   assert.match(ship,/uses: .\/.github\/workflows\/sentry-testflight.yml/);
   // The reporter is part of the ship, so an edit to any of its files must run the ship (the only way to exercise it).
   const shipPaths=ship.slice(ship.indexOf('paths:'),ship.indexOf('workflow_dispatch:'));
@@ -167,18 +295,23 @@ test('CLI malformed JSON error does not echo provided input or token', () => {
 
 test('a confirmed upload survives receipt failure and the same source is not uploaded again', () => {
   const source=read('scripts/ios-fleet/ship-testflight.sh');
+  const rcSh=read('scripts/ios-fleet/tf-ready-rc.sh');
   const stateFunctions=source.slice(source.indexOf('ship_state_path() {'),source.indexOf('\nwhile [[ $# -gt 0 ]]'));
+  const prefix=source.slice(source.indexOf('# shellcheck source=scripts/ios-fleet/tf-ready-rc.sh'),source.indexOf('TF_READY_CONFIRMED=0'));
   const ensure=source.slice(source.indexOf('TF_READY_CONFIRMED=0'),source.indexOf('SENTRY_ARCHIVE_COMMIT="$(repo_head_sha)"'));
-  const emit=source.slice(source.indexOf('emit_sentry_deployment_receipt() {'),source.indexOf('\nacquire_archive_lock\nlog "archiving..."'));
+  const emit=source.slice(source.indexOf('write_deferred_sentry_ship_context() {'),source.indexOf('\nacquire_archive_lock\nlog "archiving..."'));
   const dir=mkdtempSync(join(tmpdir(),'sentry-ship-state-'));
+  const fleetDir=join(dir,'fleet');
   const out=join(dir,'outputs'); writeFileSync(out,'');
   try {
+    mkdirSync(fleetDir);
+    writeFileSync(join(fleetDir,'tf-ready-rc.sh'),rcSh);
     // Only local fixture builtins replace time/permissions/publication; the
     // production state writer, duplicate-upload gate, and receipt guard run.
-    const script=`set -euo pipefail\nlog(){ :; }\njson_get(){ :; }\ndate(){ echo 1791280000; }\nmkdir(){ :; }\nchmod(){ :; }\nbash(){ return 1; }\n${stateFunctions}\nrepo_head_sha(){ echo ${sha}; }\nnode(){ if [[ "$1" == *asc-api.mjs ]]; then printf '{"ok":true}'; else return 1; fi; }\n${ensure}\n${emit}\nprintf uploaded > "$STATE_DIR/uploaded"\nensure_tf_ready\nrecord_successful_ship\nemit_sentry_deployment_receipt\nevaluate_ship_gate\nprintf '%s' "$SHIP_GATE_DECISION"\n`;
+    const script=`set -euo pipefail\nlog(){ :; }\njson_get(){ :; }\ndate(){ echo 1791280000; }\nmkdir(){ :; }\nchmod(){ :; }\nbash(){ return 1; }\n${stateFunctions}\nrepo_head_sha(){ echo ${sha}; }\nnode(){ if [[ "$1" == *asc-api.mjs ]]; then printf '{"ok":true,"buildId":"b1","version":"2126","internalBuildState":"IN_BETA_TESTING","externalInstallPath":true}'; return 0; else return 1; fi; }\n${prefix}\n${ensure}\n${emit}\nprintf uploaded > "$STATE_DIR/uploaded"\nensure_tf_ready\nrecord_successful_ship\nemit_sentry_deployment_receipt\nevaluate_ship_gate\nprintf '%s' "$SHIP_GATE_DECISION"\n`;
     // A file avoids Windows/Git Bash inline-command length and quoting limits.
     const scriptFile=join(dir,'fixture.sh'); writeFileSync(scriptFile,script);
-    const result=spawnSync('bash',[shellPath(scriptFile)],{env:{PATH:process.env.PATH,APP_KEY:'botfleet',GITHUB_OUTPUT:shellPath(out),STATE_DIR:shellPath(dir),FORCE_SHIP:'0',EXPORT_ONLY:'0',DEFAULT_MIN_INTERVAL_SEC:'3600',BUNDLE_ID:'app.botfleet.ios',BUILD_NUM:'2126',MARKETING:'1.0.79',REPO_ROOT:shellPath(dir),PREV_SHIP_SHA:'',DISPLAY_NAME:'BotFleet',IOS_PATH_PREFIX:'ios',FLEET_DIR:shellPath(dir),LOG_DIR:shellPath(dir),ARCHIVE_PATH:shellPath(dir),SENTRY_ARCHIVE_COMMIT:sha},encoding:'utf8'});
+    const result=spawnSync('bash',[shellPath(scriptFile)],{env:{PATH:process.env.PATH,APP_KEY:'botfleet',GITHUB_OUTPUT:shellPath(out),STATE_DIR:shellPath(dir),FORCE_SHIP:'0',EXPORT_ONLY:'0',DEFAULT_MIN_INTERVAL_SEC:'3600',BUNDLE_ID:'app.botfleet.ios',BUILD_NUM:'2126',MARKETING:'1.0.79',REPO_ROOT:shellPath(dir),PREV_SHIP_SHA:'',DISPLAY_NAME:'BotFleet',IOS_PATH_PREFIX:'ios',FLEET_DIR:shellPath(fleetDir),LOG_DIR:shellPath(dir),ARCHIVE_PATH:shellPath(dir),SENTRY_ARCHIVE_COMMIT:sha,IOS_DEFER_SENTRY_RECEIPT:'0'},encoding:'utf8'});
     assert.equal(result.status,0,result.stderr);
     assert.equal(result.stdout,'skip');
     assert.equal(readFileSync(join(dir,'uploaded'),'utf8'),'uploaded');
@@ -196,4 +329,11 @@ test('the actual reporting validation fails the explicit error indicator before 
   assert.equal(result.status,1);
   assert.match(result.stderr,/upload succeeded but receipt verification failed/);
   assert.ok(workflow.indexOf('Validate the distribution receipt') < workflow.indexOf('Load the required Sentry auth token'));
+});
+
+test("receipt errors stay single-line for values JSON cannot render", () => {
+  assert.throws(
+    () => validateReceipt({ bundleId: 10n, marketingVersion: Symbol("a\nb") }),
+    (error) => error instanceof Error && !(error instanceof TypeError) && /bundleId 10 is not a string/.test(error.message) && /marketingVersion Symbol\(a b\) is not a string/.test(error.message) && !/[\r\n]/.test(error.message),
+  );
 });

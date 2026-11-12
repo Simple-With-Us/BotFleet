@@ -286,6 +286,9 @@ export interface DescribedInstance {
     bypassCoverage?: BypassCoverage;
     /** True when this engine runs the harness HTTP tool loop. */
     toolLoop: boolean;
+    /** True when this engine drops and summarizes replayed history under its
+     *  own prompt budget (ACP), so the per-bot history settings apply. */
+    historySummary?: boolean;
   };
   /** Which computer destinations this engine can be given at all — the ONE
    *  answer, derived from the adapter's own flags in `computer-capability.ts`
@@ -1191,6 +1194,7 @@ export class ProviderRegistry {
           agentsMcp: false,
           localComputerMcp: false,
           toolLoop: false,
+          historySummary: false,
           bypassCoverage: bypassCoverage(entry.shadow.driverKind),
         },
         // A shadow has no adapter to ask, so the derivation is fed the same
@@ -1237,6 +1241,7 @@ export class ProviderRegistry {
         reviewHook: inst.adapter.capabilities.reviewHook ?? "none",
         asksWhenHeld: inst.adapter.capabilities.asksWhenHeld === true,
         toolLoop: inst.adapter.capabilities.toolLoop === true,
+        historySummary: inst.adapter.capabilities.historySummary === true,
         bypassCoverage: bypassCoverage(inst.driverKind),
       },
       // Derived here, on the one wire where adapter capabilities already

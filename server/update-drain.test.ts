@@ -10,6 +10,7 @@ import {
   HELD_SENDS_MAX_AGE_MS,
   inFlightCounts,
   partitionByAge,
+  routineRunCounts,
   takeHeldWork,
   UPDATE_DRAIN_DEFAULT_TIMEOUT_MS,
   UPDATE_DRAIN_LEASE_GRACE_MS,
@@ -188,6 +189,45 @@ describe("what a drain waits for", () => {
     // waiting for about six minutes.
     expect(inFlightCounts({ turns: 1, queuedRooms: 2, groupOperations: 1 }, { queuedRoutineRuns: 0 }))
       .toEqual({ turns: 1, queuedRooms: 0, groupOperations: 1 });
+  });
+});
+
+describe("the routine runs a drain and a stop wait for", () => {
+  const off = (botId: string) => botId === "bot_off";
+
+  it("counts the queued runs of bots that are on, and not those of bots that are off", () => {
+    // A queued run for a bot that is switched Off will be dropped or refused,
+    // never run:  it is neither work in flight nor work that is held.
+    const runs = [
+      { botId: "bot_on", status: "queued" },
+      { botId: "bot_off", status: "queued" },
+      { botId: "bot_on", status: "running" },
+    ];
+    const counts = routineRunCounts(runs, { allowCredentialQueues: false, isBotOff: off });
+    expect(counts.inFlight).toBe(2);
+    expect(counts.queued).toBe(1);
+  });
+
+  it("does not let the queued run of an off bot hide a routine run that is running", () => {
+    // The bug this guards:  the runtime count left the queued run of the off
+    // bot out, and the discount took it in anyway, so the subtraction took
+    // more than the count held.  The count fell to zero while a routine run
+    // was still running, and the wait ended early.
+    const runs = [
+      { botId: "bot_off", status: "queued" },
+      { botId: "bot_on", status: "running" },
+    ];
+    const { inFlight, queued } = routineRunCounts(runs, { allowCredentialQueues: false, isBotOff: off });
+    expect(inFlightCounts({ routineRuns: inFlight }, { queuedRoutineRuns: queued })).toEqual({ routineRuns: 1 });
+  });
+
+  it("does not count the runs that are waiting on a credential when the drain holds them", () => {
+    const runs = [
+      { botId: "bot_on", status: "queued" },
+      { botId: "bot_on", status: "waiting" },
+      { botId: "bot_on", status: "running" },
+    ];
+    expect(routineRunCounts(runs, { allowCredentialQueues: true, isBotOff: off })).toEqual({ inFlight: 2, queued: 0 });
   });
 });
 

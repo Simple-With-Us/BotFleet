@@ -85,7 +85,7 @@ Never put `COOLIFY_AGENTS` into Infisical as app `COOLIFY_API_TOKEN`.  Prefer en
 Do not declare a Cloudflare credential dead without a real resource call.
 
 1. `/user/tokens/verify` only understands **user-owned** tokens.  Account-owned tokens 401 there by design — use `/accounts/{id}/tokens/verify` or `GET /zones`.
-2. Global API Key "9103 Unknown X-Auth-Key" can mean the **wrong email**, not a dead key.  This fleet has multiple Cloudflare logins.  Try the pairing in AGENT-SYNC / the CLOUDFLARE names from `fleet-secrets names` before concluding.
+2. Global API Key "9103 Unknown X-Auth-Key" can mean the **wrong email**, not a dead key.  This fleet has multiple Cloudflare logins.  Try the pairing in FLEET-PROTOCOL / the CLOUDFLARE names from `fleet-secrets names` before concluding.
 
 Empty `success:true` on a filtered Bearer call means "valid, not scoped to that filter," not dead.  Prefer `CLOUDFLARE_FLEET_API_TOKEN` for ordinary work.
 
@@ -99,6 +99,6 @@ Empty `success:true` on a filtered Bearer call means "valid, not scoped to that 
 
 ## Canon
 
-- `/Users/jay/apps/AGENT-SYNC.md` § Secret handoff, Infisical, Coolify, grep trap, leak response
+- `/Users/jay/apps/FLEET-PROTOCOL.md` § Secret handoff, Infisical, Coolify, grep trap, leak response
 - `~/.claude/skills/secret-safety/SKILL.md`
 - Coordinator `docs/rollouts/2026-08-15-secret-file-grep-ban.md`

@@ -1021,7 +1021,7 @@ describe("Sentry provider vocabulary", () => {
   });
 
   it("corrects a multi-provider engine from the model id", () => {
-    expect(genAiProvider("dshAgent", "MiniMax-M3.1-Flash-Preview")).toBe("minimax");
+    expect(genAiProvider("dshAgent", "MiniMax-M3.1-Flash")).toBe("minimax");
     expect(genAiProvider("dshAgent", "DeepSeek-V4.1-Flash")).toBe("deepseek");
     expect(genAiProvider("dshAgent")).toBe("deepseek");
   });
@@ -1305,7 +1305,7 @@ describe("runtime error text is redacted before it reaches the sink", () => {
 
 describe("catalog cost fallback", () => {
   it("stamps gen_ai.usage.cost from the MiniMax catalog when the agent reported none", () => {
-    configureTurnIdentity(() => ({ model: "MiniMax-M3.1-Flash-Preview" }));
+    configureTurnIdentity(() => ({ model: "MiniMax-M3.1-Flash" }));
     const { sink, spans } = recordingSink();
     observeRuntimeEvent(base({ type: "turn.started", provider: "mcodeAgent" }), sink);
     observeRuntimeEvent(
@@ -1313,7 +1313,7 @@ describe("catalog cost fallback", () => {
         type: "session.started",
         provider: "mcodeAgent",
         sessionId: "s",
-        model: "MiniMax-M3.1-Flash-Preview",
+        model: "MiniMax-M3.1-Flash",
       }),
       sink,
     );
@@ -1339,7 +1339,7 @@ describe("catalog cost fallback", () => {
   it("mirrors a completed catalog-priced turn to the fleet sink", () => {
     const captured: FleetCapture[] = [];
     setFleetSinkForTests({ capture: (event) => captured.push(event) });
-    configureTurnIdentity(() => ({ model: "MiniMax-M3.1-Flash-Preview", botName: "Coder" }));
+    configureTurnIdentity(() => ({ model: "MiniMax-M3.1-Flash", botName: "Coder" }));
     const { sink } = recordingSink();
     observeRuntimeEvent(base({ type: "turn.started", provider: "mcodeAgent" }), sink);
     observeRuntimeEvent(
@@ -1479,10 +1479,10 @@ describe("opt-in prompt capture", () => {
   });
 
   it("stamps system and model on recordExecutedTools when identity has a model", () => {
-    configureTurnIdentity(() => ({ model: "MiniMax-M3.1-Flash-Preview" }));
+    configureTurnIdentity(() => ({ model: "MiniMax-M3.1-Flash" }));
     const { sink, spans } = recordingSink();
     recordExecutedTools("thread-1", ["read_file"], sink, "turn-1");
-    expect(spans[0].attributes["gen_ai.request.model"]).toBe("MiniMax-M3.1-Flash-Preview");
+    expect(spans[0].attributes["gen_ai.request.model"]).toBe("MiniMax-M3.1-Flash");
     expect(spans[0].attributes["gen_ai.system"]).toBe("minimax");
   });
 });
