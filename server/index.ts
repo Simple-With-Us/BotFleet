@@ -8146,7 +8146,9 @@ async function startTurn(
       // system sections, then tool schemas, then saved instructions.  The
       // per-wake tail (timestamps, payloads, run ids) follows that prefix.
       const cacheFriendlyWake =
-        (opts?.automationSource === "webhook" || opts?.automationSource === "schedule") && opts?.command === undefined;
+        (opts?.automationSource === "webhook" || opts?.automationSource === "schedule") &&
+        opts?.command === undefined &&
+        !oneShot;
       let wakeUserText = turnText;
       let wakeRecoveryText = recoveryText;
       let wakeHoisted = false;
@@ -8159,6 +8161,9 @@ async function startTurn(
             parameters: tool.parameters,
           })),
           wakeText: turnText,
+          // HTTP tool-loop drivers cache the catalog in the prefix.  CLI
+          // lanes discover tools at runtime and must not get a second copy.
+          inlineToolSchemas: usesDriverToolLoop,
         });
         prompt = {
           text: arranged.system,

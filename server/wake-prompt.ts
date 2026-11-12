@@ -59,9 +59,41 @@ function isVolatileLine(line: string): boolean {
 }
 
 const UNTRUSTED_OPEN = /^\[UNTRUSTED (?:WEBHOOK EVENT DATA|RESOURCE SAMPLE)\]/;
+const AUTHENTICATED_TASK_OPEN = /^\[AUTHENTICATED WEBHOOK TASK\]/;
+const WEBHOOK_INSTRUCTION_OPEN = /^\[(?:USER-CONFIGURED WEBHOOK INSTRUCTIONS|DEFAULT WEBHOOK INSTRUCTIONS|AUTHENTICATED WEBHOOK TASK)\]/;
 
 function untrustedOpen(line: string): boolean {
   return UNTRUSTED_OPEN.test(line.trim());
+}
+
+function payloadBoundary(line: string): boolean {
+  const trimmed = line.trim();
+  return untrustedOpen(trimmed) || AUTHENTICATED_TASK_OPEN.test(trimmed);
+}
+
+/** Byte offset of the first payload/untrusted boundary, or -1. */
+function payloadBoundaryOffset(text: string): number {
+  const lines = text.split("\n");
+  let offset = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i] ?? "";
+    if (payloadBoundary(line)) return offset;
+    offset += line.length + (i < lines.length - 1 ? 1 : 0);
+  }
+  return -1;
+}
+
+/** Start of the last webhook instruction or payload-task block, or -1. */
+function lastWebhookBlockStart(text: string): number {
+  const lines = text.split("\n");
+  let offset = 0;
+  let found = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i] ?? "";
+    if (WEBHOOK_INSTRUCTION_OPEN.test(line.trim())) found = offset;
+    offset += line.length + (i < lines.length - 1 ? 1 : 0);
+  }
+  return found;
 }
 
 /** Split one wake body into saved instructions and the per-wake tail.
@@ -75,7 +107,7 @@ export function splitUnattendedWakeText(text: string) {
   const lines = text.split("\n");
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i] ?? "";
-    if (untrustedOpen(line)) {
+    if (payloadBoundary(line)) {
       volatile.push(lines.slice(i).join("\n"));
       break;
     }
@@ -130,8 +162,16 @@ export function arrangeUnattendedWakePrompt(input: {
   inlineToolSchemas?: boolean;
 }): ArrangedWakePrompt {
   const inline = input.inlineToolSchemas !== false;
-  const { head, body } = replaySplit(input.wakeText);
-  const split = splitUnattendedWakeText(body);
+  // Replay cues inside a webhook payload must not cut the body;  only cues
+  // before the current wake's payload/task block are real mid-thread joins.
+  const currentStart = lastWebhookBlockStart(input.wakeText);
+  const current = currentStart < 0 ? input.wakeText : input.wakeText.slice(currentStart);
+  const payloadAt = payloadBoundaryOffset(current);
+  const replayEnd =
+    currentStart >= 0 && payloadAt >= 0 ? currentStart + payloadAt : input.wakeText.length;
+  const { head, body } = replaySplit(input.wakeText.slice(0, replayEnd));
+  const remainder = input.wakeText.slice(replayEnd);
+  const split = splitUnattendedWakeText(`${body}${remainder}`);
   const hoisted = split.stableContext.length > 0 && split.volatileTail.length > 0;
   const schemaBlock = inline ? canonicalToolSchemaBlock(input.toolSchemas ?? []) : "";
   const stable = input.sections.filter((section) => !section.volatile);
