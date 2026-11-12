@@ -137,8 +137,10 @@ export function checkInRoutineStart(run: RoutineRun, routine: Routine): string |
     );
     // The check-in just upserted this routine's live schedule onto the slug,
     // so an earlier retirement no longer holds and a later pause or delete
-    // must be allowed to retire it again.
-    releasedMonitorSlugs.delete(monitorSlug);
+    // must be allowed to retire it again.  Only the routine's frozen slug is
+    // cleared: a run slug that differs from it names an obsolete monitor
+    // that must stay retired.
+    if (monitorSlug === routine.sentryMonitorSlug) releasedMonitorSlugs.delete(monitorSlug);
     // The SDK fabricates a uuid when the client is missing or closed; never
     // store that as a real Crons check-in id on the run record.
     if (!checkInId || !isSentryActive()) return undefined;

@@ -279,10 +279,19 @@ const routineEntrySchema = z.looseObject({ id: z.string().min(1) });
  * routines.json can carry a routine with no name, or a run with no routineName
  * or routineId.  Those slug as "routine" and "0" instead of throwing inside the
  * constructor and failing the boot. */
-const legacySlugSourceSchema = z.object({
+export const legacySlugSourceSchema = z.object({
   routineId: z.string().catch(""),
   routineName: z.string().catch(""),
 });
+export type LegacySlugSource = z.infer<typeof legacySlugSourceSchema>;
+/** The legacy slug a run opened, or undefined when the run no longer carries
+ * a usable routineId and routineName.  Without them the formula falls back to
+ * placeholders ("routine", "0") and would name a monitor no run ever opened,
+ * such as botfleet-routine-0, so there is nothing safe to release. */
+function legacyRunMonitorSlug(run: unknown): string | undefined {
+  const source: LegacySlugSource = legacySlugSourceSchema.parse(run);
+  return source.routineId && source.routineName ? legacyRoutineMonitorSlug(source) : undefined;
+}
 /** A stored monitor slug read from disk; anything that is not a string is
  * treated as absent and re-derived from the legacy formula. */
 const storedMonitorSlugSchema = z.string().catch("");
@@ -664,9 +673,21 @@ export class RoutineManager {
       if (sentryMonitorSlug !== routine.sentryMonitorSlug) slugMigrated = true;
       return { ...routine, runOn, sentryMonitorSlug };
     });
+    const frozenSlugs = new Map(this.routines.map((routine) => [routine.id, routine.sentryMonitorSlug]));
     this.runs = rawRuns.map((run) => {
       const runOn = normalizeRunOn(run.runOn);
       if ((run as { runOn?: unknown }).runOn !== runOn) runOnMigrated = true;
+      // A run queued before the slug was frozen carries no slug of its own,
+      // so its start would fall back to the name-based legacy slug.  After a
+      // rename that is a monitor the boot pass below retires, and starting
+      // on it would put the live crontab back on it.  It has not opened a
+      // check-in yet, so give it the routine's frozen slug instead.
+      const storedRunSlug = storedMonitorSlugSchema.parse(run.sentryMonitorSlug);
+      const frozen = frozenSlugs.get(run.routineId);
+      if (run.status === "queued" && !run.sentryCheckInId && !isRoutineMonitorSlug(storedRunSlug) && frozen) {
+        slugMigrated = true;
+        return { ...run, runOn, sentryMonitorSlug: frozen };
+      }
       return { ...run, runOn };
     });
     this.routineRequestReceipts = Array.isArray(disk.routineRequestReceipts)
@@ -777,7 +798,7 @@ export class RoutineManager {
       if (run.triggerSource && run.triggerSource !== "schedule") continue;
       const historical = run.sentryMonitorSlug && isRoutineMonitorSlug(run.sentryMonitorSlug)
         ? run.sentryMonitorSlug
-        : legacyRoutineMonitorSlug(legacySlugSourceSchema.parse(run));
+        : legacyRunMonitorSlug(run);
       if (known.has(run.routineId) && historical === this.routines.find((routine) => routine.id === run.routineId)?.sentryMonitorSlug) {
         continue;
       }
@@ -1058,7 +1079,7 @@ export class RoutineManager {
         if (run.triggerSource && run.triggerSource !== "schedule") return false;
         const historical = run.sentryMonitorSlug && isRoutineMonitorSlug(run.sentryMonitorSlug)
           ? run.sentryMonitorSlug
-          : legacyRoutineMonitorSlug(legacySlugSourceSchema.parse(run));
+          : legacyRunMonitorSlug(run);
         return historical === oldLegacy;
       });
       if (used && oldLegacy !== routine.sentryMonitorSlug) this.options.releaseMonitor?.(oldLegacy);

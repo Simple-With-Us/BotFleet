@@ -143,6 +143,16 @@ describe("routineMonitorSlug", () => {
       sentryMonitorSlug: slug,
     }))).toBe(slug);
   });
+
+  it("rejects a trailing-hyphen slug shorter than the legacy 50-character slice", () => {
+    expect(isRoutineMonitorSlug("botfleet-mac-coolify-")).toBe(false);
+    const theRun = run({
+      routineId: "79c6c49d-1111-2222-3333-444444444444",
+      routineName: "Mac Coolify Health",
+      sentryMonitorSlug: "botfleet-mac-coolify-",
+    });
+    expect(routineMonitorSlug(theRun)).toBe(legacyRoutineMonitorSlug(theRun));
+  });
 });
 
 describe("routineMonitorConfig", () => {
@@ -246,12 +256,24 @@ describe("checkInRoutineStart / checkInRoutineFinish", () => {
     expect(releaseRoutineMonitor("not a slug")).toBe(false);
   });
 
+  it("keeps an obsolete run slug retired when a start opens on it", async () => {
+    await activateFakeSentry();
+    const obsolete = "botfleet-mac-hetzner-health-21-00-79c6c49d";
+    expect(releaseRoutineMonitor(obsolete)).toBe(true);
+    checkInRoutineStart(
+      run({ sentryMonitorSlug: obsolete }),
+      routine({ sentryMonitorSlug: "botfleet-mac-coolify-health-21-00-79c6c49d" }),
+    );
+    // Only the routine's frozen slug has its retirement cleared.
+    expect(releaseRoutineMonitor(obsolete)).toBe(false);
+  });
+
   it("retires a slug again after a resumed routine checks in on it", async () => {
     const checkIns = await activateFakeSentry();
     const stored = "botfleet-spend-downs-slack-digest-1f8addcb";
     expect(releaseRoutineMonitor(stored)).toBe(true);
     expect(releaseRoutineMonitor(stored)).toBe(false);
-    checkInRoutineStart(run({ sentryMonitorSlug: stored }), routine());
+    checkInRoutineStart(run({ sentryMonitorSlug: stored }), routine({ sentryMonitorSlug: stored }));
     expect(checkIns[1].checkIn).toMatchObject({ monitorSlug: stored, status: "in_progress" });
     expect(releaseRoutineMonitor(stored)).toBe(true);
     expect(checkIns[2].checkIn).toMatchObject({ monitorSlug: stored, status: "ok" });

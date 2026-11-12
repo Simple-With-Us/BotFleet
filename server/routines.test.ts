@@ -3118,7 +3118,84 @@ describe("bot on/off switch", () => {
     });
     restarted.flushNow();
     expect(routinesOnDisk(h.options.file!).routines[0]?.sentryMonitorSlug).toBe("botfleet-routine-79c6c49d");
-    expect(released).toEqual(["botfleet-routine-gonerout"]);
+    // The run has no routineName, so its legacy slug would be a guess no
+    // check-in ever opened; nothing is released for it.
+    expect(released).toEqual([]);
+  });
+
+  it("does not retire the placeholder botfleet-routine-0 for a run with no routineId", () => {
+    const h = harness();
+    writeFileSync(h.options.file!, JSON.stringify({
+      routines: [],
+      runs: [{
+        id: "orphan-run",
+        routineName: "Mac Hetzner Health 21:00",
+        botId: "sweeper",
+        runOn: "bot",
+        scheduledFor: 1,
+        status: "completed",
+        manual: false,
+        triggerSource: "schedule",
+        sentryCheckInId: "check-in-old",
+        createdAt: 1,
+      }],
+    }));
+    const released: string[] = [];
+    new RoutineManager({ ...h.options, releaseMonitor: (slug) => released.push(slug) }).flushNow();
+    expect(released).toEqual([]);
+  });
+
+  it("starts a run queued before the freeze on the routine's frozen slug, not the retired name slug", async () => {
+    const h = harness();
+    const id = "79c6c49d-1111-2222-3333-444444444444";
+    const now = h.options.now!();
+    writeFileSync(h.options.file!, JSON.stringify({
+      routines: [{
+        id,
+        name: "Mac Coolify Health 21:00",
+        prompt: "check the host",
+        botId: "sweeper",
+        runOn: "bot",
+        enabled: true,
+        schedule: { type: "daily", time: "21:00", weekdays: [0, 1, 2, 3, 4, 5, 6] },
+        durationMinutes: 30,
+        nextRunAt: now + 86_400_000,
+        createdAt: 1,
+        updatedAt: 1,
+      }],
+      runs: [{
+        id: "old-run",
+        routineId: id,
+        routineName: "Mac Hetzner Health 21:00",
+        botId: "sweeper",
+        runOn: "bot",
+        scheduledFor: 1,
+        status: "completed",
+        manual: false,
+        triggerSource: "schedule",
+        sentryCheckInId: "check-in-old",
+        createdAt: 1,
+      }, {
+        id: "queued-run",
+        routineId: id,
+        routineName: "Mac Hetzner Health 21:00",
+        prompt: "check the host",
+        durationMinutes: 30,
+        botId: "sweeper",
+        runOn: "bot",
+        scheduledFor: now,
+        status: "queued",
+        manual: false,
+        triggerSource: "schedule",
+        createdAt: now,
+      }],
+    }));
+    const released: string[] = [];
+    const restarted = new RoutineManager({ ...h.options, releaseMonitor: (slug) => released.push(slug) });
+    expect(released).toEqual(["botfleet-mac-hetzner-health-21-00-79c6c49d"]);
+    const queued = restarted.listRuns().find((run) => run.id === "queued-run");
+    expect(queued?.sentryMonitorSlug).toBe("botfleet-mac-coolify-health-21-00-79c6c49d");
+    restarted.flushNow();
   });
 
   it("retires a deleted daily monitor only after a schedule check-in was opened", async () => {

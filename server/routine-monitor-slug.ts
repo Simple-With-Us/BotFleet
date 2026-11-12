@@ -33,12 +33,15 @@ export function stableRoutineMonitorSlug(routineId: string): string {
 
 /** A slug this process is willing to send to Sentry.
  *
- *  A trailing hyphen is allowed on purpose.  The legacy formula slices the
- *  whole string to 50 characters, so a long routine name can end the slug on
- *  a hyphen, and that exact string is the monitor Sentry already holds.
- *  Rejecting it would leave that monitor on its daily crontab forever. */
+ *  A trailing hyphen is allowed only at exactly 50 characters.  The legacy
+ *  formula slices the whole string to 50, so a long routine name can end the
+ *  slug on a hyphen, and that exact string is the monitor Sentry already
+ *  holds.  A shorter slug ending in a hyphen is not something the formula can
+ *  produce, so accepting it would freeze a new monitor identity and orphan
+ *  the one the routine actually used. */
 export function isRoutineMonitorSlug(slug: string): boolean {
-  return /^botfleet-[a-z0-9-]{1,41}$/.test(slug) && slug.length <= MONITOR_SLUG_MAX;
+  if (!/^botfleet-[a-z0-9-]{1,41}$/.test(slug) || slug.length > MONITOR_SLUG_MAX) return false;
+  return !slug.endsWith("-") || slug.length === MONITOR_SLUG_MAX;
 }
 
 /** Slug for a check-in.  A slug stored on the run wins, so the start and the
