@@ -392,11 +392,15 @@ public struct CompanionClient: Sendable {
 
     // MARK: - Requests
 
-    private func makeRequest(_ method: String, _ path: String, query: [URLQueryItem] = [], body: [String: Any]? = nil) throws -> URLRequest {
+    private func makeRequest(_ method: String, _ path: String, query: [URLQueryItem] = [], body: [String: Any]? = nil, percentEncodedPath: Bool = false) throws -> URLRequest {
         guard let base = connection.baseURL,
               var components = URLComponents(url: base, resolvingAgainstBaseURL: false)
         else { throw APIError.badURL }
-        components.path = path
+        if percentEncodedPath {
+            components.percentEncodedPath = path
+        } else {
+            components.path = path
+        }
         components.queryItems = query.isEmpty ? nil : query
         guard let url = components.url else { throw APIError.badURL }
         if let hostOrigin, !hostOrigin.contains(url) { throw SavedHostError.differentOrigin }
@@ -425,9 +429,10 @@ public struct CompanionClient: Sendable {
     private func makeRequest<Body: Encodable>(
         _ method: String,
         _ path: String,
-        encodedBody body: Body
+        encodedBody body: Body,
+        percentEncodedPath: Bool = false
     ) throws -> URLRequest {
-        var request = try makeRequest(method, path)
+        var request = try makeRequest(method, path, percentEncodedPath: percentEncodedPath)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONEncoder().encode(body)
         return request
@@ -733,11 +738,12 @@ public struct CompanionClient: Sendable {
         }
         let request = try makeRequest(
             "GET",
-            "/api/bots/\(botId)/commands",
+            commandsPath(botId),
             query: [
                 URLQueryItem(name: "surface", value: surface),
                 URLQueryItem(name: "threadId", value: threadId),
-            ]
+            ],
+            percentEncodedPath: true
         )
         let menu = try await send(request, as: Wire.self)
         return menu.groups.flatMap { group in
@@ -761,9 +767,17 @@ public struct CompanionClient: Sendable {
         }
         try await send(try makeRequest(
             "POST",
-            "/api/bots/\(botId)/commands",
-            encodedBody: Body(id: id, threadId: threadId, surface: surface)
+            commandsPath(botId),
+            encodedBody: Body(id: id, threadId: threadId, surface: surface),
+            percentEncodedPath: true
         ))
+    }
+
+    /// One path segment.  A slash stays inside the id instead of leaving `/api/bots/`.
+    private func commandsPath(_ botId: String) -> String {
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
+        let encoded = botId.addingPercentEncoding(withAllowedCharacters: allowed) ?? botId
+        return "/api/bots/\(encoded)/commands"
     }
 
     public func config() async throws -> ConfigStatus {

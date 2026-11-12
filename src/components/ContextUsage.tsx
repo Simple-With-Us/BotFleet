@@ -172,7 +172,9 @@ export function useContextSession(input: {
     compactReady,
     memory,
   });
-  memoryRef.current.set(input.threadId, note.memory);
+  useEffect(() => {
+    memoryRef.current.set(input.threadId, note.memory);
+  }, [input.threadId, note.memory]);
 
   const compact = () => {
     if (shown.state !== "ready" || pending) return;
@@ -182,6 +184,9 @@ export function useContextSession(input: {
     void runBotCommand(input.botId, { id: commandId, threadId: input.threadId }).then((result) => {
       setPending(false);
       if (!result.ok) setError(result.error);
+    }).catch(() => {
+      setPending(false);
+      setError("That did not start.");
     });
   };
 

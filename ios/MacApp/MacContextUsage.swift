@@ -26,10 +26,15 @@ struct MacContextMeterStrip: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 6)
+        .task(id: "\(bot.id)|\(threadId)") {
+            let task = bot.tasks?.first { $0.threadId == threadId }
+            let selection = task?.modelSelection ?? bot.modelSelection
+            if session.catalogWindow(instanceId: selection.instanceId, model: selection.model) == nil {
+                await session.refreshModelWindows()
+            }
+        }
         .task(id: "\(bot.id)|\(threadId)|\(bot.busy == true)") {
-            async let menu = session.contextCommands(botId: bot.id, threadId: threadId)
-            await session.refreshModelWindows()
-            commands = await menu
+            commands = await session.contextCommands(botId: bot.id, threadId: threadId)
         }
     }
 
