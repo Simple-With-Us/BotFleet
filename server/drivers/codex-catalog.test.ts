@@ -68,9 +68,13 @@ describe("readCodexModelCatalog", () => {
     // the catalog `codex app-server` returns from an empty home.  No Codex
     // catalog offered gpt-6-sol, gpt-6-luna or gpt-5.3-codex-spark, so a turn
     // sent to one of them is rejected: they are not listed on a guess.
-    expect(STATIC_CODEX_MODELS.default).toBe("gpt-5.6-luna");
+    expect(STATIC_CODEX_MODELS.default).toBe("gpt-6-luna");
     expect(STATIC_CODEX_MODELS.options.map((option) => option.id)).toEqual([
+      "gpt-6.1-sol",
+      "gpt-6.1-terra",
       "gpt-6-astra",
+      "gpt-6-sol",
+      "gpt-6-luna",
       "gpt-5.6-sol",
       "gpt-5.6-terra",
       "gpt-5.6-luna",
@@ -287,7 +291,7 @@ name = "oMLX"
     const catalog = await readCodexModelCatalog({ HOME: home });
     // The static default is Luna (the owner-facing default most owners reach
     // for first), on the id Codex serves; Astra still appears as an option.
-    expect(catalog.default).toBe("gpt-5.6-luna");
+    expect(catalog.default).toBe("gpt-6-luna");
     expect(catalog.options.every((option) => !option.custom)).toBe(true);
   });
 });
