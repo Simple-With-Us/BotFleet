@@ -469,6 +469,22 @@ export function localQuotaStatusLine(freshness: LocalQuotaFreshnessView | null |
   return `${producer}'s quota file could not be read`;
 }
 
+export type QuotaGridPlaceholderVariant = "loading" | "empty";
+
+/** One plain line under an engine row when the usage grid has no cells yet,
+ *  so an empty panel is not mistaken for a broken or still-loading one. */
+export function quotaGridPlaceholderLine(
+  variant: QuotaGridPlaceholderVariant,
+  engineName?: string | null,
+): string {
+  const name = (engineName ?? "").trim();
+  const forEngine = name ? ` for ${name}` : "";
+  if (variant === "loading") {
+    return `Loading usage limits${forEngine}…`;
+  }
+  return `No usage limits reported yet${forEngine}.`;
+}
+
 /** "Claude: sign in again to refresh quota (from CodeCaps)" — the reason a
  *  provider reported nothing, attributed to the app that measured it.  The
  *  reason is the producer's own user-safe text: rendered as plain text,
