@@ -240,13 +240,25 @@ export function createControlPlaneClient({
   return {
     origin,
 
+    // The gate is the exact JSON identity, nothing looser: a plain-text
+    // "OK", a 204, or any other 2xx from an unrelated host must read as
+    // "no control plane here", never as healthy.
     async health() {
-      const { payload } = await request("/healthz", { allowEmpty: true,
-        deadlineMs: Math.min(timeoutMs, healthTimeoutMs),
-      });
+      let payload;
+      try {
+        ({ payload } = await request("/healthz", {
+          deadlineMs: Math.min(timeoutMs, healthTimeoutMs),
+        }));
+      } catch (error) {
+        if (error instanceof ControlPlaneError && error.code === "invalid_response") {
+          throw new ControlPlaneError("control_plane_unavailable");
+        }
+        throw error;
+      }
       if (
-        payload && (payload.ok !== true ||
-        payload.service !== "botfleet-control-plane")
+        !plainObject(payload) ||
+        payload.ok !== true ||
+        payload.service !== "botfleet-control-plane"
       ) {
         throw new ControlPlaneError("control_plane_unavailable");
       }

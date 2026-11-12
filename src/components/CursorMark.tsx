@@ -11,7 +11,7 @@ export function CursorMark({ size = 16, className }: IconProps) {
       src="/cursor-mark.png" 
       width={size} 
       height={size} 
-      className={cn("object-contain", className)} 
+      className={cn("object-contain dark:invert", className)}
       alt="Cursor"
       aria-hidden
     />

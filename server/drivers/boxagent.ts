@@ -21,6 +21,9 @@ import type {
 } from "../contracts.ts";
 import { newEventId, newId } from "../contracts.ts";
 import { appendNative } from "./native.ts";
+import { toolFields } from "../tool-fields.ts";
+import { captureInput } from "../../shared/item-io.ts";
+import { isFiniteJsonNumber, isJsonObject, type JsonObject, type JsonValue } from "../schema.ts";
 
 const DRIVER_KIND = "boxAgent";
 const BOX_API = "https://ascii.dev/api/box/v1";
@@ -41,13 +44,22 @@ export interface BoxAgentConfig {
 }
 
 function decodeConfig(raw: unknown): BoxAgentConfig {
-  const o = (raw ?? {}) as Record<string, unknown>;
-  return { pollMs: typeof o.pollMs === "number" ? o.pollMs : 2500 };
+  const parsed = raw as JsonValue;
+  const o: JsonObject = isJsonObject(parsed) ? parsed : {};
+  return { pollMs: isFiniteJsonNumber(o.pollMs) ? o.pollMs : 2500 };
 }
 
 export const BoxAgentDriver: ProviderDriver<BoxAgentConfig> = {
   driverKind: DRIVER_KIND,
-  metadata: { displayName: "Computer", supportsMultipleInstances: false },
+  metadata: {
+    displayName: "ASCII.dev Box",
+    supportsMultipleInstances: false,
+    // The instance's `capabilities` block declares no MCP channel and no image
+    // input at all — it is a remote sandbox reached over its own API, not a
+    // CLI BotFleet can hand channels to.  Mirrored here so the capability
+    // matrix can say so with a citation instead of a shrug.
+    channelWiring: { agentsMcp: false, computerMcp: false, composioMcp: false, localComputerMcp: false, images: false },
+  },
   models: MODELS,
   decodeConfig,
   defaultConfig: () => decodeConfig({}),
@@ -145,6 +157,32 @@ export const BoxAgentDriver: ProviderDriver<BoxAgentConfig> = {
           pendingText += delta;
           emit({ ...base(threadId, turnId), type: "content.delta", streamKind: "assistant_text", delta });
         };
+        /** Box tool steps that have opened but not settled.  Box announces a
+         * step and usually never a matching result, so a step settles when the
+         * next one opens or when the turn ends.  Without this every Box tool
+         * row — and every Sentry execute_tool span — stretched to the end of
+         * the turn no matter how briefly the tool actually ran. */
+        const openTools = new Set<string>();
+        /** One bounded line of what went wrong.  Never the payload. */
+        const failureDetail = (ev: any): string | undefined => {
+          const raw = ev?.error?.message ?? ev?.error ?? ev?.data?.error;
+          const text = raw === undefined || raw === null ? "" : String(raw).trim();
+          // A payload object stringifies to nothing a reader can use.
+          return text && text !== "[object Object]" ? text.slice(0, 200) : undefined;
+        };
+        const settleOpenTools = (ok: boolean, detail?: string) => {
+          for (const toolId of openTools) {
+            openTools.delete(toolId);
+            emit({
+              ...base(threadId, turnId),
+              type: "item.completed",
+              itemType: "tool",
+              itemId: toolId,
+              ok,
+              detail,
+            });
+          }
+        };
         try {
           for (;;) {
             if (cancelled) break;
@@ -167,13 +205,25 @@ export const BoxAgentDriver: ProviderDriver<BoxAgentConfig> = {
                 ingest(text);
               } else if (/tool|command|exec|browse/i.test(kind)) {
                 flushAssistantText();
-                emit({
-                  ...base(threadId, turnId),
-                  type: "item.started",
-                  itemType: "tool",
-                  itemId: id,
-                  title: String(ev.title ?? ev.command ?? kind).slice(0, 80),
-                });
+                const toolFailed = /fail|error/i.test(kind) || Boolean(ev.error ?? ev.data?.error);
+                if (/result|output|complete|finish|done|fail|error/i.test(kind) && openTools.size > 0) {
+                  // This event IS the result of the step already open, so it
+                  // settles that row rather than opening a second one for the
+                  // same tool call.
+                  settleOpenTools(!toolFailed, toolFailed ? failureDetail(ev) : undefined);
+                } else {
+                  settleOpenTools(true);
+                  openTools.add(id);
+                  emit({
+                    ...base(threadId, turnId),
+                    type: "item.started",
+                    itemType: "tool",
+                    itemId: id,
+                    title: String(ev.title ?? ev.command ?? kind).slice(0, 80),
+                    ...toolFields(ev.title ?? kind, ev.command ?? ev.input ?? ev.args),
+                    ...captureInput(ev.command ?? ev.input ?? ev.args),
+                  });
+                }
               }
               // shape-drift backstop: without a promptId the status poll
               // below can never see a terminal state, so settle off the
@@ -182,6 +232,7 @@ export const BoxAgentDriver: ProviderDriver<BoxAgentConfig> = {
                 active.delete(threadId);
                 flushAssistantText();
                 const failed = /fail|error/i.test(kind);
+                settleOpenTools(!failed);
                 emit({ ...base(threadId, turnId), type: "turn.completed", ok: !failed, stopReason: failed ? kind : null, cost: null });
                 return;
               }
@@ -200,12 +251,14 @@ export const BoxAgentDriver: ProviderDriver<BoxAgentConfig> = {
                 }
                 if (!pendingText.trim() && !lastText.trim()) pendingText = "(finished)";
                 flushAssistantText();
+                settleOpenTools(true);
                 active.delete(threadId);
                 emit({ ...base(threadId, turnId), type: "turn.completed", ok: true, stopReason: null, cost: null });
                 return;
               }
               if (/failed|error|cancelled|interrupted/i.test(state)) {
                 flushAssistantText();
+                settleOpenTools(false);
                 active.delete(threadId);
                 emit({ ...base(threadId, turnId), type: "turn.completed", ok: false, stopReason: state, cost: null });
                 return;
@@ -217,10 +270,15 @@ export const BoxAgentDriver: ProviderDriver<BoxAgentConfig> = {
           }
           // cancelled
           flushAssistantText();
+          settleOpenTools(false);
           active.delete(threadId);
           emit({ ...base(threadId, turnId), type: "turn.completed", ok: false, stopReason: "interrupted", cost: null });
         } catch (e) {
           flushAssistantText();
+          // SAFETY: everything thrown on this path is an Error — the fetch
+          // client, the JSON parse, and the abort all reject with one — and
+          // the same assertion already reads it two lines below.
+          settleOpenTools(false, (e as Error).message.slice(0, 200));
           active.delete(threadId);
           emit({ ...base(threadId, turnId), type: "runtime.error", message: (e as Error).message });
           emit({ ...base(threadId, turnId), type: "turn.completed", ok: false, stopReason: "error", cost: null });
@@ -232,7 +290,13 @@ export const BoxAgentDriver: ProviderDriver<BoxAgentConfig> = {
 
     const snapshot = async (): Promise<ProviderSnapshot> => {
       if (!token) {
-        return { state: "unavailable", reason: 'no Box token — add {"box":{"token":"…"}} to ~/.botfleet/config.json' };
+        // Never set up: stay registered (a token added later just works) but
+        // out of every engine list until then.
+        return {
+          state: "unavailable",
+          hidden: true,
+          reason: 'no Box token — add {"box":{"token":"…"}} to ~/.botfleet/config.json',
+        };
       }
       try {
         await api("/me");
@@ -251,7 +315,11 @@ export const BoxAgentDriver: ProviderDriver<BoxAgentConfig> = {
       snapshot,
       adapter: {
         provider: DRIVER_KIND,
-        capabilities: { sessionModelSwitch: "in-session" },
+        // Jobs matrix: remote, opaque and without MCP — neither jobs nor
+        // helpers reach this engine.
+        // The agent runs on the box and asks nothing here, but its work
+        // events arrive as tool steps, so auto-review can watch them.
+        capabilities: { sessionModelSwitch: "in-session", backgroundJobs: "none", helpers: "none", reviewHook: "after" },
         sendTurn,
         interruptTurn: async (threadId) => active.get(threadId)?.cancel(),
         respondToRequest: async () => "unavailable" as const, // this engine has no asks to answer

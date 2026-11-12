@@ -2,9 +2,10 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { z } from "zod";
 
 import { parseJson, type JsonValue } from "./schema.ts";
+import { getSentry, isSentryActive } from "./sentry.ts";
 import type { WebhookManager } from "./webhooks.ts";
 
-export const MAX_WEBHOOK_BODY_BYTES = 256 * 1024;
+export const MAX_WEBHOOK_BODY_BYTES = 1024 * 1024;
 const statusErrorSchema = z.object({ status: z.number().int().optional() });
 const serverAddressSchema = z.object({ port: z.number().int().min(1).max(65_535) });
 
@@ -26,7 +27,9 @@ function json(res: ServerResponse, status: number, body: JsonValue): void {
 
 function readRawBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
-    let raw = "";
+    // Buffer chunks and decode once: concatenating per-chunk strings
+    // corrupts multi-byte UTF-8 sequences that split across TCP chunks.
+    const chunks: Buffer[] = [];
     let bytes = 0;
     let done = false;
     const fail = (status: number, message: string) => {
@@ -36,14 +39,14 @@ function readRawBody(req: IncomingMessage): Promise<string> {
     };
     req.on("data", (chunk) => {
       if (done) return;
-      bytes += Buffer.byteLength(chunk);
+      bytes += typeof chunk === "string" ? Buffer.byteLength(chunk) : chunk.length;
       if (bytes > MAX_WEBHOOK_BODY_BYTES) return fail(413, "Webhook body is too large");
-      raw += chunk;
+      chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
     });
     req.on("end", () => {
       if (done) return;
       done = true;
-      resolve(raw);
+      resolve(Buffer.concat(chunks).toString("utf8"));
     });
     req.on("error", () => fail(400, "Could not read webhook body"));
   });
@@ -76,16 +79,25 @@ function bearerSecret(req: IncomingMessage): string {
 }
 
 function deliveryId(req: IncomingMessage): string | undefined {
-  return (
+  const explicit = (
     header(req, "idempotency-key") ??
     header(req, "x-webhook-id") ??
     header(req, "x-github-delivery") ??
     header(req, "webhook-id")
   )?.trim() || undefined;
+  if (explicit) return explicit;
+  // The configured Sentry custom integration identifies issue deliveries
+  // with Request-ID.  A generic proxy request ID is not an event identity.
+  const requestId = header(req, "request-id")?.trim();
+  if (header(req, "sentry-hook-resource") === "issue" && requestId && /^[a-f0-9]{32}$/i.test(requestId)) {
+    return `sentry:${requestId.toLowerCase()}`;
+  }
+  return undefined;
 }
 
 function eventName(req: IncomingMessage): string | undefined {
   return (
+    header(req, "x-botfleet-event") ??
     header(req, "x-github-event") ??
     header(req, "x-webhook-event") ??
     header(req, "x-event-type") ??
@@ -93,18 +105,77 @@ function eventName(req: IncomingMessage): string | undefined {
   )?.trim() || undefined;
 }
 
-export function createWebhookIngressHandler(manager: WebhookManager) {
+/** A fixed-path POST receiver mounted on the webhook-only listener, for
+ * partners (e.g. Linq) that sign their own deliveries instead of using a
+ * `/hooks/<endpoint>/<secret>` capability URL.  The handler owns body
+ * reading, signature checks, and the response. */
+export type WebhookIngressRoute = (req: IncomingMessage, res: ServerResponse) => Promise<void>;
+
+/** A fixed route that authenticates before it wants update admission.
+ *  The ingress handler runs `handler` WITHOUT acquiring admission first;
+ *  the handler must acquire (and release) it itself after auth succeeds,
+ *  so a slow or forged POST cannot hold update quiescing hostage. */
+export interface DeferredAdmissionRoute {
+  handler: WebhookIngressRoute;
+  deferAdmission: true;
+}
+
+export function createWebhookIngressHandler(
+  manager: WebhookManager,
+  beginAdmission: () => (() => void) | null = () => () => {},
+  routes: Readonly<Record<string, WebhookIngressRoute | DeferredAdmissionRoute>> = {},
+) {
   return async (req: IncomingMessage, res: ServerResponse) => {
-    const url = new URL(req.url ?? "/", "http://localhost");
+    let url: URL;
+    try {
+      url = new URL(req.url ?? "/", "http://localhost");
+    } catch {
+      // A request target like `//host` is protocol-relative, so the WHATWG
+      // parser throws instead of yielding a pathname.  Answer 400 rather than
+      // letting the throw escape the receiver and hang the connection.
+      return json(res, 400, { error: "Malformed request URL" });
+    }
+    const entry = Object.prototype.hasOwnProperty.call(routes, url.pathname)
+      ? routes[url.pathname]
+      : !url.search && !url.hash && /^\/zulip\/outgoing\/[A-Z0-9][A-Z0-9_-]{0,47}$/.test(url.pathname)
+        ? routes["/zulip/outgoing/*"]
+        : undefined;
+    if (entry) {
+      if (req.method !== "POST") return json(res, 405, { error: "Webhooks accept POST requests" });
+      const route = typeof entry === "function" ? entry : entry.handler;
+      // Auth-first routes acquire admission themselves after verifying the
+      // request; everyone else is admitted up front as before.
+      const deferAdmission = typeof entry !== "function" && entry.deferAdmission === true;
+      const release = deferAdmission ? null : beginAdmission();
+      if (!deferAdmission && !release) return json(res, 503, { error: "BotFleet is quiescing for an update" });
+      try {
+        await route(req, res);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (isSentryActive()) {
+          getSentry()?.captureException(error instanceof Error ? error : new Error(message), {
+            tags: { component: "webhook-ingress", route: url.pathname },
+          });
+        }
+        if (!res.headersSent) json(res, 500, { error: "Webhook receiver failed" });
+      } finally {
+        release?.();
+      }
+      return;
+    }
     if (req.method === "GET" && url.pathname === "/health") {
-      return json(res, 200, { app: "botfleet-webhooks", ready: true });
+      return json(res, 200, {
+        app: "botfleet-webhooks",
+        ready: true,
+        payloadDedupeSkips: manager.payloadDedupeSkipCount(),
+      });
     }
     if (req.method === "GET" && url.pathname === "/.well-known/apple-app-site-association") {
       return json(res, 200, {
         applinks: {
           details: [
             {
-              appIDs: ["CC8UTF7ATG.app.botfleet.ios", "CC8UTF7ATG.app.botfleet.macos"],
+              appIDs: ["CC8UTF7ATG.app.botfleet", "CC8UTF7ATG.app.botfleet.ios", "CC8UTF7ATG.app.botfleet.macos"],
               components: [{ "/": "/*" }],
             },
           ],
@@ -115,8 +186,29 @@ export function createWebhookIngressHandler(manager: WebhookManager) {
     if (!match) return json(res, 404, { error: "Unknown webhook endpoint" });
     if (req.method !== "POST") return json(res, 405, { error: "Webhooks accept POST requests" });
 
+    let releaseAdmission: (() => void) | null = null;
     try {
-      const pathSecret = match[2] ? decodeURIComponent(match[2]) : "";
+      // A malformed percent-encoding is a caller error, never a receiver
+      // failure: decoding it unguarded threw a URIError that the catch below
+      // reported as a 500 and captured to Sentry, so an unauthenticated
+      // `POST /hooks/wh_x/%E0%A4%A` could both pollute the error pipeline and
+      // fill the rejected-delivery log.  Fail closed with the same answer an
+      // invalid secret gets, before any body is read and before Sentry sees
+      // anything, and keep the throttled rejection row so the attempt is
+      // still visible.
+      let pathSecret = "";
+      if (match[2]) {
+        try {
+          pathSecret = decodeURIComponent(match[2]);
+        } catch {
+          manager.recordRejected(match[1], 400, "Malformed webhook URL encoding", {
+            contentType: header(req, "content-type"),
+            eventName: eventName(req),
+            deliveryId: deliveryId(req),
+          });
+          return json(res, 400, { error: "Malformed webhook URL encoding" });
+        }
+      }
       const secret = pathSecret || bearerSecret(req);
       // Reject bad capability URLs before buffering or parsing attacker input.
       if (!manager.authorize(match[1], secret)) {
@@ -127,13 +219,25 @@ export function createWebhookIngressHandler(manager: WebhookManager) {
         });
         return json(res, 401, { error: "Invalid webhook URL or secret" });
       }
+      const event = eventName(req);
+      if (manager.isEventIgnoredAtEdge?.(match[1], event)) {
+        req.resume();
+        const result = manager.recordIgnoredAtEdge(match[1], {
+          eventName: event,
+          contentType: header(req, "content-type"),
+          deliveryId: deliveryId(req),
+        });
+        return json(res, 202, { accepted: true, ...result });
+      }
+      releaseAdmission = beginAdmission();
+      if (!releaseAdmission) return json(res, 503, { error: "BotFleet is quiescing for an update" });
       const raw = await readRawBody(req);
       const contentType = header(req, "content-type")?.split(";")[0]?.trim().toLowerCase() ?? "text/plain";
       const payload = parsePayload(raw, contentType);
       const result = manager.receive(match[1], secret, {
         payload,
         contentType,
-        eventName: eventName(req),
+        eventName: event,
         userAgent: header(req, "user-agent"),
         deliveryId: deliveryId(req),
       });
@@ -152,17 +256,38 @@ export function createWebhookIngressHandler(manager: WebhookManager) {
           deliveryId: deliveryId(req),
         });
       }
+      // A 500-class failure is the receiver breaking, not a caller sending
+      // rubbish, so it is the one branch worth an Issue.  The body is
+      // untrusted and can carry credentials, so these explicit tags carry
+      // neither the body nor the endpoint id.  That promise covers only the
+      // tags below: the SDK also attaches the request itself (URL, culprit,
+      // transaction name), and the path's secret segment is kept out of
+      // those by `scrubSentryPayload` in server/sentry.ts, not by anything
+      // in this file.  The `/hooks/*` filter there drops only the incoming
+      // server span; a span started under the request still carries it.
+      if (status >= 500 && isSentryActive()) {
+        getSentry()?.captureException(error instanceof Error ? error : new Error(message), {
+          tags: { component: "webhook-ingress", "http.status_code": String(status) },
+        });
+      }
       return json(res, status, { error: message });
+    } finally {
+      releaseAdmission?.();
     }
   };
 }
 
 export async function listenWebhookIngress(
   manager: WebhookManager,
-  options: { host?: string; port: number },
+  options: {
+    host?: string;
+    port: number;
+    beginAdmission?: () => (() => void) | null;
+    routes?: Readonly<Record<string, WebhookIngressRoute | DeferredAdmissionRoute>>;
+  },
 ): Promise<WebhookIngress> {
   const host = options.host ?? "127.0.0.1";
-  const server = createServer(createWebhookIngressHandler(manager));
+  const server = createServer(createWebhookIngressHandler(manager, options.beginAdmission, options.routes));
   await new Promise<void>((resolve, reject) => {
     const onError = (error: Error) => reject(error);
     server.once("error", onError);

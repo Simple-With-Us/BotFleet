@@ -6,7 +6,7 @@
 // Three public/runtime sockets, and one optional private managed origin. The
 // split between them is the whole security model:
 //
-//   :8810  0.0.0.0    devices     token required, allowlisted, scrubbed
+//   :8810  loopback  devices     token required, allowlisted, scrubbed
 //   :8811  127.0.0.1  you         pairing and revocation — never off-machine
 //   :8799  127.0.0.1  the harness spoken to as this machine, unmodified
 //   UDS/pipe            one Electron-owned sidecar generation, never TCP
@@ -16,9 +16,20 @@
 // app this is a sidecar to. Ten clear of the harness leaves it room to add
 // another adjacent listener without taking this one out again.
 //
-// Running this process *is* the opt-in. There is no toggle, because a toggle
-// inside a process you chose to start would be ceremony: stopping it is the
-// off switch, and it is a more honest one than a flag in a file.
+// :8810 is plain HTTP, which is the whole reason it binds loopback and not
+// 0.0.0.0.  A device port on the LAN hands every paired phone's bearer token
+// and every transcript frame to whoever is on the same wifi, and the
+// allowlist on the far side of that socket cannot help: it runs after the
+// first bytes are already on the wire.  A phone reaches a paired computer over
+// the hosted HTTPS route instead, whose connector lands on this very port.
+// Set OMB_COMPANION_ALLOW_CLEARTEXT_LAN=1 to reopen the port on a network
+// you control — see `lan-policy.ts` for the threat model and the honest
+// default.
+//
+// Running this process *is* the opt-in for the control plane: there is no
+// toggle for that surface, because a toggle inside a process you chose to
+// start would be ceremony.  Stopping the process is the off switch, and it is
+// a more honest one than a flag in a file.
 import { createServer } from "node:http";
 
 import { createAddressWatcher } from "./advertise-watch.ts";
@@ -26,33 +37,56 @@ import { createControlServer, hostCandidates } from "./control.ts";
 import { createConnectedDeviceTracker } from "./connected-devices.ts";
 import { DeviceRegistry } from "./devices.ts";
 import { companionEndpointCandidates, hostedCompanionUrl } from "./endpoints.ts";
+import {
+  advertisesOnLan,
+  lanPolicyAdvice,
+  lanPolicySummary,
+  readLanPolicy,
+} from "./lan-policy.ts";
 import { lanAddresses, refreshTailnetName, tailnetName, tailscaleAddress } from "./listener.ts";
 import {
   advertisableAddresses,
   clampBytes,
   defaultHostName,
   dnsLabel,
+  LEGACY_SERVICE_TYPES,
   MdnsResponder,
+  SERVICE_TYPE,
   type ServiceInfo,
 } from "./mdns.ts";
 import { createProxyHandler } from "./proxy.ts";
+import { diskKeyFaultStore, watchHarnessNotifications } from "./apns.ts";
 import { companionOriginSocket, listenCompanionOrigin } from "./origin.ts";
 
 /** A port from the environment, or the default. Anything that is not a whole
  * number in range is the default — a typo'd port must not become port 0. */
 const num = (value: string | undefined, fallback: number): number => {
   const parsed = Number(value);
-  return Number.isInteger(parsed) && parsed > 0 && parsed < 65536 ? parsed : fallback;
+  if (Number.isInteger(parsed) && parsed > 0 && parsed < 65536) return parsed;
+  if (value !== undefined && value !== "") {
+    console.warn(`companion: ignoring invalid port ${JSON.stringify(value)}; using ${fallback}`);
+  }
+  return fallback;
 };
 
 const HARNESS_PORT = num(process.env.OMB_PORT, 8799);
 const WEBHOOK_PORT = num(process.env.OMB_WEBHOOK_PORT, HARNESS_PORT + 1);
 const COMPANION_PORT = num(process.env.OMB_COMPANION_PORT, 8810);
 const CONTROL_PORT = num(process.env.OMB_CONTROL_PORT, 8811);
-const SERVICE_TYPE = "_botfleet._tcp";
-const LEGACY_SERVICE_TYPE = "_openmausbot._tcp";
 let hostedUrl = hostedCompanionUrl(process.env.OMB_COMPANION_HOSTED_URL);
 const PRIVATE_ORIGIN = companionOriginSocket(process.env.OMB_COMPANION_INTERNAL_ORIGIN);
+
+/** Whether the device port may leave this machine at all, and in what form.
+ *
+ * The default is loopback, and that is the whole of S11: `:8810` is plain
+ * HTTP, so anything it serves crosses the network in the clear — the pairing
+ * credential on the way in, the device's bearer token and every transcript
+ * frame on the way out.  The device allowlist and the token check on the far
+ * side of that socket are real, and they do not help: they run after the
+ * conversation is already on the wire.  See `lan-policy.ts` for the threat
+ * model and for why a pinned self-signed certificate needs an iOS change
+ * before it can be the default. */
+const lanPolicy = readLanPolicy();
 
 /** Ports the harness takes for itself, and what it uses each for.
  *
@@ -124,7 +158,7 @@ const service = (): ServiceInfo => ({
   // one DNS label: no dots, and inside the 63-byte limit
   name: dnsLabel(machineName()),
   type: SERVICE_TYPE,
-  legacyTypes: [LEGACY_SERVICE_TYPE],
+  legacyTypes: [...LEGACY_SERVICE_TYPES],
   port: COMPANION_PORT,
   host: defaultHostName(),
   addresses: advertisableAddresses(),
@@ -135,6 +169,29 @@ const service = (): ServiceInfo => ({
 });
 
 const connectedDevices = createConnectedDeviceTracker();
+// Started before the proxy so both servers can report the sender's health:
+// the pairing page shows it to whoever is at the computer, and the phone
+// reads it to explain why a closed-app notification never arrived.
+const pushWatch = watchHarnessNotifications({
+  harnessPort: HARNESS_PORT,
+  connectedIds: connectedDevices.ids,
+  tokensForDisconnected: () => devices.pushTokens(),
+  forgetToken: (id, token) => {
+    devices.clearPushToken(id, token);
+  },
+  // Its own list, its own lanes, its own token: a phone can hold both, and
+  // neither the health totals nor the alert queue may be asked to tell them
+  // apart.
+  liveActivityTokensForDisconnected: () => devices.liveActivityTokens(),
+  forgetLiveActivityToken: (id, token) => {
+    devices.clearLiveActivityToken(id, token);
+  },
+  // A key Apple has refused stays refused across relaunches.  Without this
+  // the sidecar came back up sending at full rate against a .p8 that had
+  // been rejected days earlier, once every forty seconds, while every
+  // surface reported pushes as on.
+  keyFaultStore: diskKeyFaultStore(),
+});
 const proxy = createProxyHandler({
     harnessPort: HARNESS_PORT,
     // `authenticate` also stamps lastSeenAt, which is what makes the control
@@ -145,9 +202,12 @@ const proxy = createProxyHandler({
     // Recomputed per pairing rather than cached: addresses change when the
     // machine joins another network, and a pairing is exactly the moment the
     // list has to be right.
-    hosts: () => hostCandidates(),
-    endpoints: () => companionEndpointCandidates(COMPANION_PORT, undefined, undefined, hostedUrl),
+    hosts: () => hostCandidates(undefined, undefined, lanPolicy),
+    endpoints: () => companionEndpointCandidates(COMPANION_PORT, undefined, undefined, hostedUrl, undefined, lanPolicy),
     connected: connectedDevices.open,
+    setPushToken: (id, token) => devices.setPushToken(id, token),
+    setLiveActivityToken: (id, token) => devices.setLiveActivityToken(id, token),
+    pushHealth: pushWatch.health,
   });
 const companion = createServer(proxy);
 const managedOrigin = PRIVATE_ORIGIN ? createServer(proxy) : null;
@@ -162,6 +222,8 @@ const control = createControlServer({
   discovery: () => ({ advertising: mdns.advertising, name: service().name }),
   connectedDeviceIds: connectedDevices.ids,
   disconnectDevice: connectedDevices.disconnect,
+  pushHealth: pushWatch.health,
+  lanPolicy,
 });
 
 /** Bind a server, turning a bind failure into a sentence rather than a stack
@@ -225,7 +287,7 @@ async function main(): Promise<void> {
   }
 
   await listen(control, CONTROL_PORT, "127.0.0.1");
-  await listen(companion, COMPANION_PORT, "0.0.0.0");
+  await listen(companion, COMPANION_PORT, lanPolicy.deviceBindHost);
   if (managedOrigin && PRIVATE_ORIGIN) {
     await listenCompanionOrigin(managedOrigin, PRIVATE_ORIGIN);
   }
@@ -249,15 +311,26 @@ async function main(): Promise<void> {
   // before wifi associates has no addresses yet, and addresses change under
   // a running sidecar. The first check advertises (or says why not), and the
   // interval re-advertises on every change after that.
-  await watcher.check();
-  watcher.start();
+  //
+  // Skipped entirely when the device port is bound to loopback. Multicast DNS
+  // is a LAN protocol with no way to say "only this interface", so a record
+  // published here would name a port that answers no connection a phone could
+  // make — and discovery that finds a computer and then cannot reach it is
+  // worse than a phone that never heard of it.
+  if (advertisesOnLan(lanPolicy)) {
+    await watcher.check();
+    watcher.start();
+  }
 
   const addresses = lanAddresses();
   const tailscale = tailscaleAddress(addresses);
   const reach = tailnetName() ?? tailscale ?? addresses[0];
-  console.log(`companion  http://0.0.0.0:${COMPANION_PORT}  →  harness 127.0.0.1:${HARNESS_PORT}`);
+  console.log(`companion  http://${lanPolicy.deviceBindHost}:${COMPANION_PORT}  →  harness 127.0.0.1:${HARNESS_PORT}`);
   console.log(`pair here  http://127.0.0.1:${CONTROL_PORT}`);
-  if (reach) console.log(`on your phone, enter  ${reach}:${COMPANION_PORT}`);
+  console.log(lanPolicySummary(lanPolicy, COMPANION_PORT));
+  for (const line of lanPolicyAdvice(lanPolicy, hostedUrl)) console.log(`  ${line}`);
+  if (hostedUrl) console.log(`on your phone, enter  ${hostedUrl}`);
+  else if (lanPolicy.allowCleartextLan && reach) console.log(`on your phone, enter  ${reach}:${COMPANION_PORT}`);
   if (tailscale && !tailnetName()) {
     // Do not tell someone to turn on MagicDNS when they may well have it on
     // already — say what was actually tried, so the difference between "off"
@@ -274,6 +347,9 @@ const shutdown = async (signal: string): Promise<void> => {
   // the watcher first, or a tick could re-advertise the record the next
   // line just withdrew
   watcher.stop();
+  // The push sender holds its own SSE stream to the harness and a retry
+  // timer; without this, stop means stopped everywhere except here.
+  pushWatch.stop();
   await mdns.stop().catch(() => {});
   // close() waits for open connections, and an SSE stream never ends on its
   // own — drop the sockets so "stop" means stopped, now.
@@ -290,6 +366,27 @@ const shutdown = async (signal: string): Promise<void> => {
 
 process.on("SIGINT", () => void shutdown("SIGINT"));
 process.on("SIGTERM", () => void shutdown("SIGTERM"));
+
+// Opt-in parent-death watchdog, used only by the launchd supervisor.
+//
+// "Supervision" has two halves: the supervisor must keep this process alive,
+// and this process must not outlive its supervisor. A SIGKILLed supervisor
+// cannot run cleanup and cannot signal its children, so without this the
+// sidecar survives as an orphan still holding :8810 — the app then finds a
+// port it cannot account for and refuses to start a companion of its own.
+//
+// The mechanism is the same parent-death pipe the managed connector guardian
+// already uses: the supervisor holds the write end of our stdin open for as
+// long as it is alive, so EOF means it is gone. Opt-in because Electron's
+// `utilityProcess.fork` runs us with stdin closed, where EOF is immediate and
+// unconditional — treating that as parent death would kill every in-app
+// sidecar on launch.
+if (process.env.OMB_COMPANION_PARENT_STDIN === "1") {
+  process.stdin.on("end", () => void shutdown("stdin EOF"));
+  process.stdin.on("close", () => void shutdown("stdin EOF"));
+  process.stdin.on("error", () => void shutdown("stdin EOF"));
+  process.stdin.resume();
+}
 
 main().catch((error: unknown) => {
   console.error(error instanceof Error ? error.message : String(error));

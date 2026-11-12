@@ -1,6 +1,7 @@
 import SwiftUI
 import PhotosUI
 import CompanionCore
+import UIKit
 
 struct GroupProfileView: View {
     let room: Room
@@ -9,13 +10,28 @@ struct GroupProfileView: View {
 
     @State private var name = ""
     @State private var bulletin = ""
-    @State private var avatarCrop: AvatarCrop = .circle
+    @State private var avatarCrop: AvatarCrop = .rounded
     @State private var cwd = ""
     @State private var extraCwdsText = ""
+    @State private var responderKind = "everyone"
+    @State private var leadBotId = ""
+    @State private var memberIds: Set<String> = []
     @State private var photo: PhotosPickerItem? = nil
     @State private var busy = false
+    /// Set while the delete confirmation is up.
+    @State private var deleteTarget: Chat?
+    /// The harness's refusal of a delete, shown in this sheet.
+    @State private var deleteError: String?
 
-    var currentRoom: CompanionCore.Room {
+    private var roomTerm: String {
+        session.config?.roomTerminologyLabel ?? "Channel"
+    }
+
+    private var availableBots: [Bot] {
+        session.state.bots
+    }
+
+    private var currentRoom: CompanionCore.Room {
         var r = room
         r.name = name
         r.bulletin = bulletin
@@ -23,7 +39,20 @@ struct GroupProfileView: View {
         r.avatarCrop = avatarCrop
         r.cwd = cwd.isEmpty ? nil : cwd
         r.extraCwds = extraCwdsText.isEmpty ? nil : extraCwdsText.components(separatedBy: .newlines).filter({ !$0.trimmingCharacters(in: .whitespaces).isEmpty })
+        // Server vocabulary (server/index.ts checkedGroupResponder): everyone | mentions | member+botId.
+        r.defaultResponder = GroupResponder(kind: responderKind, botId: responderKind == "member" ? (leadBotId.isEmpty ? nil : leadBotId) : nil)
+        r.memberIds = liveMemberIds
         return r
+    }
+
+    /// Live bots only, original order then newly checked.  Ghost ids from a
+    /// deleted bot stay in `room.memberIds` on the wire until a save; the
+    /// Members toggles never show them, so they must not go back in the PATCH.
+    private var liveMemberIds: [String] {
+        let known = Set(availableBots.map(\.id))
+        let kept = room.memberIds.filter { memberIds.contains($0) && known.contains($0) }
+        let added = availableBots.map(\.id).filter { memberIds.contains($0) && !kept.contains($0) }
+        return kept + added
     }
 
     var body: some View {
@@ -68,13 +97,64 @@ struct GroupProfileView: View {
                     }
                 }
 
-                Section("Channel Details") {
+                Section("\(roomTerm) Details") {
                     TextField("Name", text: $name)
                         .disabled(busy)
                         .autocorrectionDisabled()
-                    TextField("Bulletin (Instructions for the team)", text: $bulletin, axis: .vertical)
+                    TextField("Bulletin (Shared Brief for the team)", text: $bulletin, axis: .vertical)
                         .disabled(busy)
                         .lineLimit(2...6)
+                }
+
+                if room.dm != true {
+                Section("Default Responder") {
+                    Picker("Responder Mode", selection: $responderKind) {
+                        Text("Everyone responds").tag("everyone")
+                        Text("Lead bot").tag("member")
+                        Text("Only when mentioned").tag("mentions")
+                    }
+
+                    if responderKind == "member" {
+                        Picker("Lead Bot", selection: $leadBotId) {
+                            Text("Select lead bot").tag("")
+                            ForEach(availableBots.filter { memberIds.contains($0.id) }) { bot in
+                                Text(bot.name).tag(bot.id)
+                            }
+                        }
+                    }
+                }
+
+                Section("Members") {
+                    ForEach(availableBots) { bot in
+                        Toggle(isOn: Binding(
+                            get: { memberIds.contains(bot.id) },
+                            set: { isMember in
+                                if isMember {
+                                    memberIds.insert(bot.id)
+                                    if leadBotId.isEmpty { leadBotId = bot.id }
+                                } else {
+                                    memberIds.remove(bot.id)
+                                    if leadBotId == bot.id {
+                                        leadBotId = memberIds.sorted().first ?? ""
+                                    }
+                                }
+                            }
+                        )) {
+                            HStack(spacing: 10) {
+                                BotAvatarWithProviderBadge(bot: bot, size: 28)
+                                VStack(alignment: .leading) {
+                                    Text(bot.name)
+                                        .font(.body)
+                                    if !bot.title.isEmpty {
+                                        Text(bot.title)
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 }
 
                 Section("Working Directory") {
@@ -92,41 +172,102 @@ struct GroupProfileView: View {
                         .lineLimit(3...8)
                 }
 
-                Section {
-                    Button("Save profile") { Task { await save() } }
-                        .disabled(busy || name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                // Bot-to-bot chats stay out of user management, as on the desktop.
+                if room.dm != true {
+                    deleteSection
                 }
             }
-            .navigationTitle("Group profile")
+            .navigationTitle("\(roomTerm) Settings")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } }
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("Save") {
+                        Task {
+                            if await save() { dismiss() }
+                        }
+                    }
+                    .fontWeight(.semibold)
+                    .disabled(busy || name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Discard") {
+                        dismiss()
+                    }
+                }
             }
             .overlay { if busy { ProgressView().controlSize(.large) } }
             .onAppear {
                 name = room.name
                 bulletin = room.bulletin
-                avatarCrop = room.avatarCrop ?? .circle
+                avatarCrop = room.avatarCrop ?? .rounded
                 cwd = room.cwd ?? ""
                 extraCwdsText = room.extraCwds?.joined(separator: "\n") ?? ""
+                let known = Set(availableBots.map(\.id))
+                memberIds = Set(room.memberIds.filter { known.contains($0) })
+                responderKind = room.defaultResponder.kind
+                let lead = room.defaultResponder.botId ?? ""
+                if memberIds.contains(lead) {
+                    leadBotId = lead
+                } else {
+                    leadBotId = memberIds.sorted().first ?? ""
+                    if responderKind == "member" && leadBotId.isEmpty { responderKind = "everyone" }
+                }
             }
             .onChange(of: photo) { _, item in
                 guard let item else { return }
                 Task { await upload(item) }
             }
+            .modifier(DeleteChatAlert(target: $deleteTarget, roomTerm: roomTerm, onConfirm: { _ in
+                Task { await deleteRoom() }
+            }))
+            .modifier(InlineErrorAlert(message: $deleteError, title: "Could Not Delete"))
         }
     }
 
-    private func save() async {
+    /// Last in the form, behind a confirmation that names the room and what
+    /// is lost.
+    private var deleteSection: some View {
+        Section {
+            Button(
+                BotOrganize.deleteRoomConfirmation(name: room.name, roomTerm: roomTerm).confirmLabel,
+                systemImage: "trash",
+                role: .destructive
+            ) {
+                deleteTarget = .room(session.state.rooms.first(where: { $0.id == room.id }) ?? room)
+            }
+            .disabled(busy)
+        } footer: {
+            Text("Deleting removes every conversation in this \(roomTerm.lowercased()) for good.\u{00A0} Its bots stay.")
+        }
+    }
+
+    /// The chat screen under this sheet closes itself once the room is gone.
+    private func deleteRoom() async {
         busy = true
         defer { busy = false }
-        await session.updateRoom(
+        do {
+            try await session.deleteRoom(room)
+            dismiss()
+        } catch {
+            if !session.isCancellation(error) {
+                deleteError = error.localizedDescription
+            }
+        }
+    }
+
+    private func save() async -> Bool {
+        busy = true
+        defer { busy = false }
+        return await session.updateRoom(
             id: room.id,
             name: name,
             bulletin: bulletin,
             avatarCrop: avatarCrop,
             cwd: currentRoom.cwd,
-            extraCwds: currentRoom.extraCwds
+            extraCwds: currentRoom.extraCwds,
+            // Direct-message rooms cannot change members or responder (server 400s).
+            defaultResponder: room.dm == true ? nil : currentRoom.defaultResponder,
+            memberIds: room.dm == true ? nil : liveMemberIds
         )
     }
 
@@ -140,7 +281,7 @@ struct GroupProfileView: View {
         busy = true
         defer { busy = false; photo = nil }
         guard let data = try? await item.loadTransferable(type: Data.self),
-              let mime = imageMIME(data)
+              let mime = ChatAttachments.sniffImageMIME(data)
         else {
             session.actionError = "Choose a PNG, JPEG, GIF, or WebP image."
             return
@@ -149,17 +290,16 @@ struct GroupProfileView: View {
             session.actionError = "That image is larger than 10 MB."
             return
         }
-        await session.uploadRoomAvatar(id: room.id, data: data, mime: mime)
-    }
-
-    private func imageMIME(_ data: Data) -> String? {
-        let bytes = [UInt8](data.prefix(12))
-        if bytes.starts(with: [0x89, 0x50, 0x4e, 0x47]) { return "image/png" }
-        if bytes.starts(with: [0xff, 0xd8, 0xff]) { return "image/jpeg" }
-        if bytes.starts(with: Array("GIF8".utf8)) { return "image/gif" }
-        if bytes.count >= 12,
-           String(bytes: bytes[0..<4], encoding: .ascii) == "RIFF",
-           String(bytes: bytes[8..<12], encoding: .ascii) == "WEBP" { return "image/webp" }
-        return nil
+        var uploadData = data
+        var uploadMIME = mime
+        if !ChatAttachments.isDisplayImageMIME(mime) {
+            guard let image = UIImage(data: data), let jpeg = image.jpegData(compressionQuality: 0.9) else {
+                session.actionError = "That image could not be converted to PNG, JPEG, GIF, or WebP."
+                return
+            }
+            uploadData = jpeg
+            uploadMIME = "image/jpeg"
+        }
+        await session.uploadRoomAvatar(id: room.id, data: uploadData, mime: uploadMIME)
     }
 }

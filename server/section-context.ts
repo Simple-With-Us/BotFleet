@@ -4,7 +4,7 @@
 // its own notebook; section context is the user's team brief. Keeping those
 // ownership boundaries separate avoids a compromised or mistaken bot
 // persisting instructions into every teammate's future turns.
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
 
@@ -47,19 +47,48 @@ export function sectionContextLabel(section?: string | null): string {
   return sectionContextKey(section) || "General";
 }
 
+let cachedFile: SectionContextFile | null = null;
+let cachedFilePath: string | null = null;
+let cachedMtimeMs: number | null = null;
+
 function loadFile(): SectionContextFile {
-  if (!existsSync(SECTION_CONTEXTS_FILE)) return emptyFile();
+  const filePath = SECTION_CONTEXTS_FILE;
+  const stat = statSync(filePath, { throwIfNoEntry: false });
+  const mtimeMs = stat?.mtimeMs ?? null;
+
+  if (cachedFile && cachedFilePath === filePath && cachedMtimeMs === mtimeMs) {
+    return cachedFile;
+  }
+
+  if (!stat) {
+    cachedFile = emptyFile();
+    cachedFilePath = filePath;
+    cachedMtimeMs = null;
+    return cachedFile;
+  }
+
   try {
-    const candidate = sectionContextFileSchema.safeParse(JSON.parse(readFileSync(SECTION_CONTEXTS_FILE, "utf8")));
-    if (!candidate.success) return emptyFile();
+    const candidate = sectionContextFileSchema.safeParse(JSON.parse(readFileSync(filePath, "utf8")));
+    if (!candidate.success) {
+      cachedFile = emptyFile();
+      cachedFilePath = filePath;
+      cachedMtimeMs = mtimeMs;
+      return cachedFile;
+    }
     const contexts: Record<string, SectionContextRecord> = {};
     for (const [key, record] of Object.entries(candidate.data.contexts)) {
       if (Buffer.byteLength(record.text, "utf8") > SECTION_CONTEXT_MAX_BYTES) continue;
       contexts[sectionContextKey(key)] = { text: record.text, updatedAt: record.updatedAt };
     }
-    return { version: 1, contexts };
+    cachedFile = { version: 1, contexts };
+    cachedFilePath = filePath;
+    cachedMtimeMs = mtimeMs;
+    return cachedFile;
   } catch {
-    return emptyFile();
+    cachedFile = emptyFile();
+    cachedFilePath = filePath;
+    cachedMtimeMs = mtimeMs;
+    return cachedFile;
   }
 }
 
@@ -76,14 +105,18 @@ export function writeSectionContext(section: string | null | undefined, text: st
   }
   const data = loadFile();
   const key = sectionContextKey(section);
+  const nextContexts = { ...data.contexts };
   if (!text.trim()) {
-    delete data.contexts[key];
+    delete nextContexts[key];
   } else {
-    data.contexts[key] = { text, updatedAt: now };
+    nextContexts[key] = { text, updatedAt: now };
   }
+  const nextData: SectionContextFile = { version: 1, contexts: nextContexts };
   mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
-  writeFileAtomic(SECTION_CONTEXTS_FILE, JSON.stringify(data, null, 2), { mode: 0o600 });
-  return data.contexts[key] ? { ...data.contexts[key] } : null;
+  writeFileAtomic(SECTION_CONTEXTS_FILE, JSON.stringify(nextData, null, 2), { mode: 0o600 });
+  cachedFile = null;
+  cachedMtimeMs = null;
+  return nextData.contexts[key] ? { ...nextData.contexts[key] } : null;
 }
 
 /** A bounded, explicitly lower-priority reference block. It contains no file

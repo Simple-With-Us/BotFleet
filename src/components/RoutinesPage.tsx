@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { z } from "zod";
 import {
   CalendarClock,
   CalendarDays,
@@ -6,6 +7,7 @@ import {
   ChevronLeft,
   ChevronRight,
   CircleAlert,
+  PauseCircle,
   Cloud,
   ExternalLink,
   Gauge,
@@ -20,87 +22,133 @@ import {
 } from "lucide-react";
 
 import { BotAvatar } from "@/components/Avatar";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { MiniMonth } from "@/components/routines/MiniMonth";
 import { stateForBot } from "@/lib/mascot";
 import { WebhooksPanel } from "@/components/WebhooksPanel";
 import { ResourceTriggersPanel } from "@/components/ResourceTriggersPanel";
 import { cn } from "@/lib/cn";
-import { MAUS_COLORS, type MausState } from "@/lib/mascot";
-import type { Routine, RoutineInput, RoutineRun, RoutineRunOn, RoutineRunStatus } from "@/lib/routines";
+import { convertSlackReferenceToZulip, hasSlackReference } from "@/lib/collaboration-copy-audit";
+import { BOT_COLORS, type BotState } from "@/lib/mascot";
+import {
+  attentionRuns,
+  attentionSettledAt,
+  attentionSourcesTooltip,
+  attentionTriggerLabel,
+  attentionWindowLabel,
+  relativeRunTime,
+  summarizeAttention,
+  type AttentionSummary,
+} from "@/lib/routine-attention";
+import { useNow } from "@/lib/use-now";
+import type { Routine, RoutineInput, RoutineRun, RoutineRunOn, RoutineRunStatus, RoutineSchedule } from "@/lib/routines";
+import type { WebhookTrigger } from "@/lib/webhooks";
+import {
+  CENTRAL_TIME_ZONE,
+  DAY_NAMES,
+  calendarDayLabel,
+  calendarMinuteOfDay,
+  editedDailySchedule,
+  groupOverlappingCalendarItems,
+  niceCalendarDate,
+  niceCalendarTime,
+  projectedRoutineItems,
+  routineScheduleLabel,
+  timeZoneLabel,
+  type CalendarItem,
+  type CalendarItemGroup,
+} from "@/lib/routine-calendar";
 import { api, useStore, type Bot } from "@/state/store";
+import { routineOutcomeCode, routineOutcomeSummary, ROUTINE_OUTCOME_LABELS } from "../../shared/routine-outcomes";
+import { useDesktopCapabilities } from "./DesktopCapabilities";
+import {
+  addDaysInTimeZone,
+  epochFromInputDateTime,
+  inputDateTimeInTimeZone,
+  nextWholeHourInTimeZone,
+  shortTimeZoneName,
+  startOfDayInTimeZone,
+  startOfWeekInTimeZone,
+} from "../../shared/time-zone";
+
+const routineScheduleResponse = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("once"), at: z.number() }).strict(),
+  z.object({ type: z.literal("daily"), time: z.string(), weekdays: z.array(z.number()), timeZone: z.string().optional() }).strict(),
+]);
+// Mirrors server/tool-policy.ts's allowlist.  The routine object is strict, so
+// a command allowlist has to be named here or a successful PATCH of a routine
+// that has one throws and the panel shows a schema trace.
+const routineToolPolicyResponse = z.object({
+  mode: z.literal("allowlist"),
+  commands: z.array(z.object({
+    argv0: z.string(),
+    sub: z.array(z.string()).optional(),
+    flags: z.record(z.string(), z.object({ value: z.string() }).catchall(z.unknown())).optional(),
+    args: z.array(z.object({ value: z.string() }).catchall(z.unknown())).optional(),
+    positionals: z.number().optional(),
+  }).strict()),
+  writePaths: z.array(z.string()),
+  readPaths: z.array(z.string()),
+}).strict();
+const routineResponse = z.object({
+  routine: z.object({
+    id: z.string(), name: z.string(), prompt: z.string(), botId: z.string(),
+    runOn: z.enum(["bot", "cloud"]), enabled: z.boolean(), schedule: routineScheduleResponse,
+    scheduleTimeZoneSource: z.enum(["stored", "host"]).optional(), durationMinutes: z.number(),
+    oneShotWake: z.boolean().optional(), toolPolicy: routineToolPolicyResponse.optional(),
+    nextRunAt: z.number().nullable(), createdAt: z.number(), updatedAt: z.number(),
+  }).strict(),
+}).strict();
+const webhookResponse = z.object({
+  webhook: z.object({
+    id: z.string(), endpointId: z.string(), name: z.string(), prompt: z.string(), botId: z.string(),
+    runOn: z.enum(["bot", "cloud"]), enabled: z.boolean(), createdAt: z.number(), updatedAt: z.number(),
+    lastReceivedAt: z.number().optional(), lastRunId: z.string().optional(), deliveryCount: z.number(),
+    verificationPending: z.boolean().optional(), verifiedAt: z.number().optional(),
+    verificationSample: z.object({ receivedAt: z.number(), eventName: z.string().optional(), contentType: z.string().optional(), preview: z.string() }).strict().optional(),
+    eventTypes: z.array(z.string()).optional(), minGapMinutes: z.number().optional(), oneShotWake: z.boolean().optional(),
+    actions: z.array(z.string()).optional(), requiredLabels: z.array(z.string()).optional(), conclusions: z.array(z.string()).optional(),
+    defaultBranchOnly: z.boolean().optional(), minSentryLevel: z.enum(["debug", "info", "warning", "error", "fatal"]).optional(),
+    excludeSentryProjects: z.array(z.string()).optional(), pagerdutyUrgency: z.enum(["high", "low"]).optional(),
+    mergedPullRequestsOnly: z.boolean().optional(), ignoredCount: z.number().optional(), lastIgnoredAt: z.number().optional(),
+  }).strict(),
+}).strict();
 
 const HOUR_HEIGHT = 68;
-const DAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-
-type CalendarItem = {
-  id: string;
-  at: number;
-  routine: Routine | null;
-  run: RoutineRun | null;
-};
 
 function startOfDay(at: number) {
-  const date = new Date(at);
-  date.setHours(0, 0, 0, 0);
-  return date.getTime();
+  return startOfDayInTimeZone(at, CENTRAL_TIME_ZONE);
 }
 
 function addDays(at: number, days: number) {
-  const date = new Date(at);
-  date.setDate(date.getDate() + days);
-  return date.getTime();
+  return addDaysInTimeZone(at, days, CENTRAL_TIME_ZONE);
 }
 
 function startOfWeek(at: number) {
-  const date = new Date(startOfDay(at));
-  const offset = (date.getDay() + 6) % 7;
-  date.setDate(date.getDate() - offset);
-  return date.getTime();
-}
-
-function atLocalTime(day: number, time: string) {
-  const [hour, minute] = time.split(":").map(Number);
-  const date = new Date(day);
-  date.setHours(hour, minute, 0, 0);
-  return date.getTime();
+  return startOfWeekInTimeZone(at, CENTRAL_TIME_ZONE);
 }
 
 function toInputDateTime(at: number) {
-  const date = new Date(at - new Date(at).getTimezoneOffset() * 60_000);
-  return date.toISOString().slice(0, 16);
+  return inputDateTimeInTimeZone(at, CENTRAL_TIME_ZONE);
 }
 
 function niceDate(at: number, includeWeekday = true) {
-  return new Date(at).toLocaleDateString([], {
-    weekday: includeWeekday ? "long" : undefined,
-    month: "short",
-    day: "numeric",
-    year: new Date(at).getFullYear() !== new Date().getFullYear() ? "numeric" : undefined,
-  });
+  return niceCalendarDate(at, includeWeekday);
 }
 
 function niceTime(at: number) {
-  return new Date(at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  return niceCalendarTime(at);
 }
 
 function scheduleLabel(routine: Routine) {
-  if (routine.schedule.type === "once") {
-    return `${niceDate(routine.schedule.at)}, ${niceTime(routine.schedule.at)}`;
-  }
-  const days = routine.schedule.weekdays;
-  const dayLabel =
-    days.length === 7
-      ? "Every day"
-      : days.join(",") === "1,2,3,4,5"
-        ? "Weekdays"
-        : days.map((day) => DAY_NAMES[day]).join(", ");
-  return `${dayLabel} at ${niceTime(atLocalTime(Date.now(), routine.schedule.time))}`;
+  return routineScheduleLabel(routine);
 }
 
 function canToggleRoutine(routine: Routine) {
   return routine.schedule.type === "daily" || routine.schedule.at > Date.now();
 }
 
-function statusState(status: RoutineRunStatus): MausState {
+function statusState(status: RoutineRunStatus): BotState {
   switch (status) {
     case "queued":
       return "drowsy";
@@ -135,9 +183,7 @@ function statusTone(status: RoutineRunStatus) {
 }
 
 function nextHour() {
-  const date = new Date(Date.now() + 60 * 60_000);
-  date.setMinutes(0, 0, 0);
-  return date.getTime();
+  return nextWholeHourInTimeZone(Date.now(), CENTRAL_TIME_ZONE);
 }
 
 function webhookPromptParts(prompt?: string) {
@@ -147,43 +193,9 @@ function webhookPromptParts(prompt?: string) {
   return instructions && eventData ? { instructions, eventData } : null;
 }
 
-function projectedItems(routines: Routine[], runs: RoutineRun[], from: number, to: number): CalendarItem[] {
-  const items: CalendarItem[] = runs
-    .filter((run) => run.scheduledFor >= from && run.scheduledFor < to)
-    .map((run) => ({
-      id: `run-${run.id}`,
-      at: run.scheduledFor,
-      routine: routines.find((routine) => routine.id === run.routineId) ?? null,
-      run,
-    }));
-
-  const hasReceipt = (routineId: string, at: number) =>
-    runs.some((run) => run.routineId === routineId && Math.abs(run.scheduledFor - at) < 60_000);
-
-  for (const routine of routines) {
-    if (!routine.enabled) continue;
-    if (routine.schedule.type === "once") {
-      const at = routine.schedule.at;
-      if (at >= from && at < to && !hasReceipt(routine.id, at)) {
-        items.push({ id: `next-${routine.id}-${at}`, at, routine, run: null });
-      }
-      continue;
-    }
-    for (let day = startOfDay(from); day < to; day = addDays(day, 1)) {
-      const date = new Date(day);
-      if (!routine.schedule.weekdays.includes(date.getDay())) continue;
-      const at = atLocalTime(day, routine.schedule.time);
-      if (at >= from && at < to && at >= routine.createdAt && !hasReceipt(routine.id, at)) {
-        items.push({ id: `next-${routine.id}-${at}`, at, routine, run: null });
-      }
-    }
-  }
-  return items.sort((a, b) => a.at - b.at);
-}
-
 function RoutineCard({ item, bot, compact, onOpen }: { item: CalendarItem; bot: Bot; compact: boolean; onOpen: () => void }) {
   const status = item.run?.status;
-  const color = MAUS_COLORS[bot.color];
+  const color = BOT_COLORS[bot.color];
   const title = item.routine?.name ?? item.run?.routineName ?? "Routine";
   const animated = status === "running" || status === "waiting";
   return (
@@ -196,7 +208,7 @@ function RoutineCard({ item, bot, compact, onOpen }: { item: CalendarItem; bot: 
         status === "cancelled" && "opacity-55",
       )}
       style={{
-        top: `${((new Date(item.at).getHours() * 60 + new Date(item.at).getMinutes()) / 60) * HOUR_HEIGHT}px`,
+        top: `${(calendarMinuteOfDay(item.at) / 60) * HOUR_HEIGHT}px`,
         minHeight: item.run?.triggerSource === "webhook" || item.run?.triggerSource === "resource"
           ? "48px"
           : `${Math.max(48, ((item.routine?.durationMinutes ?? item.run?.durationMinutes ?? 30) / 60) * HOUR_HEIGHT)}px`,
@@ -213,7 +225,7 @@ function RoutineCard({ item, bot, compact, onOpen }: { item: CalendarItem; bot: 
           label={`${bot.name} — ${title}`}
         />
         <div className="min-w-0 flex-1">
-          <div className="truncate text-[12px] font-semibold text-white">{title}</div>
+          <div className="truncate text-[12px] font-semibold text-white" title={title}>{title}</div>
           <div className="mt-0.5 flex items-center gap-1.5 truncate text-[10.5px] text-white/70">
             {animated && <Loader2 size={10} className="animate-spin" />}
             <span>{niceTime(item.at)}</span>
@@ -232,7 +244,157 @@ function RoutineCard({ item, bot, compact, onOpen }: { item: CalendarItem; bot: 
   );
 }
 
-function CalendarGrid({
+function itemTitle(item: CalendarItem) {
+  return item.routine?.name ?? item.run?.routineName ?? "Routine";
+}
+
+function itemBot(item: CalendarItem, bots: Bot[]) {
+  return bots.find((candidate) => candidate.id === (item.routine?.botId ?? item.run?.botId));
+}
+
+function RoutineStackCard({ group, bots, onOpen }: { group: CalendarItemGroup; bots: Bot[]; onOpen: () => void }) {
+  const visible = group.items.slice(0, 2);
+  const failed = group.items.filter((item) => item.run?.status === "failed" || item.run?.status === "missed").length;
+  const colors = [...new Set(group.items.map((item) => itemBot(item, bots)).filter(Boolean).map((bot) => BOT_COLORS[bot!.color]))].slice(0, 5);
+  const spanMinutes = Math.max(45, Math.round((group.endAt - group.startAt) / 60_000));
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      data-testid="routine-collision-stack"
+      className="group absolute left-1.5 right-1.5 z-10 overflow-hidden rounded-xl border border-hairline/70 bg-raised/95 px-2.5 py-2 text-left shadow-xl shadow-black/15 backdrop-blur transition hover:z-20 hover:-translate-y-0.5 hover:border-accent/45"
+      style={{
+        top: `${(calendarMinuteOfDay(group.startAt) / 60) * HOUR_HEIGHT}px`,
+        minHeight: "54px",
+        height: `${Math.max(54, Math.min(104, (spanMinutes / 60) * HOUR_HEIGHT))}px`,
+      }}
+    >
+      <div className="flex min-w-0 items-start gap-2">
+        <span className="mt-0.5 flex shrink-0 -space-x-1" aria-hidden="true">
+          {colors.map((color, index) => <span key={`${color}-${index}`} className="size-3 rounded-full border-2 border-raised" style={{ backgroundColor: color }} />)}
+        </span>
+        <span className="min-w-0 flex-1">
+          <span className="flex items-center gap-1.5 text-[11.5px] font-semibold text-ink">
+            <span>{group.items.length} Overlapping</span>
+            {failed > 0 && <span className="rounded-full bg-danger/15 px-1.5 py-0.5 text-[9px] text-danger">{failed} failed</span>}
+          </span>
+          <span className="mt-0.5 block truncate text-[10px] text-ink-secondary">{niceTime(group.startAt)}–{niceTime(group.endAt)}</span>
+          <span className="mt-1 block truncate text-[10.5px] text-ink-secondary">
+            {visible.map(itemTitle).join(" · ")}{group.items.length > visible.length ? ` · +${group.items.length - visible.length} more` : ""}
+          </span>
+        </span>
+      </div>
+    </button>
+  );
+}
+
+function RoutineStackPanel({ group, bots, onClose, onOpen }: { group: CalendarItemGroup; bots: Bot[]; onClose: () => void; onOpen: (item: CalendarItem) => void }) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/65 p-5 backdrop-blur-sm" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+      <div data-testid="routine-collision-panel" className="flex max-h-[82vh] w-full max-w-[620px] flex-col overflow-hidden rounded-2xl border border-hairline/60 bg-panel shadow-2xl">
+        <div className="flex items-start justify-between border-b border-hairline/45 px-5 py-4">
+          <div>
+            <div className="text-[17px] font-semibold text-ink">{group.items.length} Overlapping Items</div>
+            <div className="mt-1 text-[12px] text-ink-secondary">{niceDate(group.startAt)} · {niceTime(group.startAt)}–{niceTime(group.endAt)}</div>
+          </div>
+          <button type="button" onClick={onClose} aria-label="Close Overlapping Items" className="rounded-lg p-2 text-ink-secondary hover:bg-raised hover:text-ink"><X size={18} /></button>
+        </div>
+        <div className="min-h-0 flex-1 overflow-y-auto p-3">
+          {group.items.map((item) => {
+            const bot = itemBot(item, bots);
+            const status = item.run?.status;
+            return (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => onOpen(item)}
+                className="flex w-full min-w-0 items-center gap-3 rounded-xl border border-transparent px-3 py-2.5 text-left hover:border-hairline/55 hover:bg-raised"
+              >
+                {bot ? <BotAvatar bot={bot} state={status ? statusState(status) : "idle"} size={38} animated={false} /> : <span className="size-[38px] rounded-xl bg-inset" />}
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate text-[12.5px] font-medium text-ink">{itemTitle(item)}</span>
+                  <span className="mt-0.5 block truncate text-[10.5px] text-ink-secondary">{niceTime(item.at)} · {bot?.name ?? "Unknown bot"}{item.run?.triggerSource ? ` · ${item.run.triggerSource}` : ""}</span>
+                </span>
+                <span className={cn("shrink-0 text-[10.5px] capitalize", status ? statusTone(status) : "text-ink-secondary")}>{status?.replace("waiting", "needs you") ?? "Scheduled"}</span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function CollaborationCopyReviewPanel({ routines, webhooks, onClose }: { routines: Routine[]; webhooks: WebhookTrigger[]; onClose: () => void }) {
+  const { dispatch } = useStore();
+  const [working, setWorking] = useState<string | null>(null);
+  const [error, setError] = useState("");
+  const entries = [
+    ...routines.filter((routine) => hasSlackReference(routine.name, routine.prompt)).map((routine) => ({ kind: "routine" as const, value: routine })),
+    ...webhooks.filter((webhook) => hasSlackReference(webhook.name, webhook.prompt)).map((webhook) => ({ kind: "webhook" as const, value: webhook })),
+  ];
+
+  const convert = async (entry: (typeof entries)[number]) => {
+    const key = `${entry.kind}:${entry.value.id}`;
+    setWorking(key);
+    setError("");
+    try {
+      const response = await api(`/api/${entry.kind === "routine" ? "routines" : "webhooks"}/${entry.value.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          name: convertSlackReferenceToZulip(entry.value.name),
+          prompt: convertSlackReferenceToZulip(entry.value.prompt),
+        }),
+      });
+      if (entry.kind === "routine") dispatch({ type: "routinePatched", routine: routineResponse.parse(response).routine });
+      else dispatch({ type: "webhookPatched", webhook: webhookResponse.parse(response).webhook });
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setWorking(null);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/65 p-5 backdrop-blur-sm" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+      <div className="flex max-h-[82vh] w-full max-w-[700px] flex-col overflow-hidden rounded-2xl border border-hairline/60 bg-panel shadow-2xl">
+        <div className="flex items-start justify-between border-b border-hairline/45 px-5 py-4">
+          <div>
+            <div className="text-[17px] font-semibold text-ink">Review Collaboration Copy</div>
+            <div className="mt-1 max-w-[560px] text-[12px] leading-relaxed text-ink-secondary">These saved workflows mention Slack.{"\u00a0 "}Slack is still a valid connected app, so BotFleet will only change a workflow when you choose Use Zulip.</div>
+          </div>
+          <button type="button" onClick={onClose} aria-label="Close Collaboration Copy Review" className="rounded-lg p-2 text-ink-secondary hover:bg-raised hover:text-ink"><X size={18} /></button>
+        </div>
+        <div className="min-h-0 flex-1 space-y-2 overflow-y-auto p-3">
+          {entries.length === 0 ? (
+            <div className="flex items-center gap-2 rounded-xl bg-success/10 px-4 py-4 text-[12.5px] text-success"><CheckCircle2 size={16} />No saved routines or webhooks mention Slack.</div>
+          ) : entries.map((entry) => {
+            const key = `${entry.kind}:${entry.value.id}`;
+            const canConvert = convertSlackReferenceToZulip(entry.value.name) !== entry.value.name
+              || convertSlackReferenceToZulip(entry.value.prompt) !== entry.value.prompt;
+            return (
+              <div key={key} className="flex min-w-0 items-center gap-3 rounded-xl border border-hairline/45 bg-inset/35 px-3.5 py-3">
+                <span className="min-w-0 flex-1">
+                  <span className="flex items-center gap-2">
+                    <span className="truncate text-[12.5px] font-medium text-ink">{entry.value.name}</span>
+                    <span className="shrink-0 rounded-full bg-warning/10 px-2 py-0.5 text-[9.5px] font-medium text-warning">{entry.kind === "routine" ? "Routine" : "Webhook"}</span>
+                  </span>
+                  <span className="mt-1 block truncate text-[10.5px] text-ink-secondary" title={entry.value.prompt}>{entry.value.prompt || "Slack appears in the saved name."}</span>
+                </span>
+                <button type="button" disabled={working !== null || !canConvert} title={canConvert ? "Replace retired fleet collaboration wording" : "URLs and identifiers require manual review"} onClick={() => void convert(entry)} className="flex shrink-0 items-center gap-1.5 rounded-lg border border-accent/30 bg-accent/10 px-3 py-2 text-[11px] font-medium text-accent hover:bg-accent/15 disabled:opacity-45">
+                  {working === key && <Loader2 size={12} className="animate-spin" />}Use Zulip
+                </button>
+              </div>
+            );
+          })}
+          {error && <div className="rounded-xl border border-danger/30 bg-danger/10 px-3.5 py-3 text-[12px] text-danger">{error}</div>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export function CalendarGrid({
   anchor,
   days,
   items,
@@ -246,6 +408,7 @@ function CalendarGrid({
   onOpen: (item: CalendarItem) => void;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
+  const [openGroup, setOpenGroup] = useState<CalendarItemGroup | null>(null);
   const today = startOfDay(Date.now());
   const starts = Array.from({ length: days }, (_, index) => addDays(anchor, index));
   const minDayWidth = days === 7 ? 110 : days === 3 ? 180 : 300;
@@ -261,11 +424,11 @@ function CalendarGrid({
         <div className="border-b border-r border-hairline/40" />
         {starts.map((start) => {
           const isToday = start === today;
-          const date = new Date(start);
+          const label = calendarDayLabel(start);
           return (
             <div key={start} className="border-b border-r border-hairline/40 px-3 py-2.5 text-center last:border-r-0">
-              <div className="text-[10px] font-medium uppercase tracking-[0.14em] text-ink-secondary">{DAY_NAMES[date.getDay()]}</div>
-              <div className={cn("mx-auto mt-1 flex size-7 items-center justify-center rounded-full text-[14px] font-semibold", isToday ? "bg-accent text-white" : "text-ink")}>{date.getDate()}</div>
+              <div className="text-[10px] font-medium uppercase tracking-[0.14em] text-ink-secondary">{label.weekday}</div>
+              <div className={cn("mx-auto mt-1 flex size-7 items-center justify-center rounded-full text-[14px] font-semibold", isToday ? "bg-accent text-white" : "text-ink")}>{label.day}</div>
             </div>
           );
         })}
@@ -274,14 +437,14 @@ function CalendarGrid({
         <div className="relative border-r border-hairline/40">
           {Array.from({ length: 24 }, (_, hour) => (
             <div key={hour} className="absolute right-2 -translate-y-1/2 text-[10px] tabular-nums text-ink-secondary/65" style={{ top: hour * HOUR_HEIGHT }}>
-              {hour === 0 ? "" : new Date(2000, 0, 1, hour).toLocaleTimeString([], { hour: "numeric" })}
+              {hour === 0 ? "" : new Intl.DateTimeFormat(undefined, { hour: "numeric", timeZone: "UTC" }).format(Date.UTC(2000, 0, 1, hour))}
             </div>
           ))}
         </div>
         {starts.map((start) => {
-          const dayItems = items.filter((item) => startOfDay(item.at) === start);
-          const now = new Date();
-          const nowTop = ((now.getHours() * 60 + now.getMinutes()) / 60) * HOUR_HEIGHT;
+          const dayItems = items.filter((item) => startOfDay(item.at) === start && itemBot(item, bots));
+          const itemGroups = groupOverlappingCalendarItems(dayItems);
+          const nowTop = (calendarMinuteOfDay(Date.now()) / 60) * HOUR_HEIGHT;
           return (
             <div key={start} className="relative border-r border-hairline/40 last:border-r-0">
               {Array.from({ length: 24 }, (_, hour) => (
@@ -293,14 +456,17 @@ function CalendarGrid({
                   <span className="h-px flex-1 bg-danger/80" />
                 </div>
               )}
-              {dayItems.map((item) => {
-                const bot = bots.find((candidate) => candidate.id === (item.routine?.botId ?? item.run?.botId));
+              {itemGroups.map((group) => {
+                if (group.items.length > 1) return <RoutineStackCard key={group.id} group={group} bots={bots} onOpen={() => setOpenGroup(group)} />;
+                const item = group.items[0]!;
+                const bot = itemBot(item, bots);
                 return bot ? <RoutineCard key={item.id} item={item} bot={bot} compact={days === 7} onOpen={() => onOpen(item)} /> : null;
               })}
             </div>
           );
         })}
       </div>
+      {openGroup && <RoutineStackPanel group={openGroup} bots={bots} onClose={() => setOpenGroup(null)} onOpen={(item) => { setOpenGroup(null); onOpen(item); }} />}
     </div>
   );
 }
@@ -322,12 +488,15 @@ export function RoutineEditor({
   const [name, setName] = useState(routine?.name ?? "");
   const [prompt, setPrompt] = useState(routine?.prompt ?? "");
   const [botId, setBotId] = useState(lockedBotId ?? routine?.botId ?? bots[0]?.id ?? "");
-  const [runOn, setRunOn] = useState<RoutineRunOn>(routine?.runOn ?? defaultRunOn ?? "maus");
+  const [runOn, setRunOn] = useState<RoutineRunOn>(routine?.runOn ?? defaultRunOn ?? "bot");
   const [kind, setKind] = useState<"once" | "daily">(routine?.schedule.type ?? "daily");
   const [at, setAt] = useState(
     toInputDateTime(routine?.schedule.type === "once" ? routine.schedule.at : nextHour()),
   );
   const [time, setTime] = useState(routine?.schedule.type === "daily" ? routine.schedule.time : "09:00");
+  const [timeZone] = useState(
+    routine?.schedule.type === "daily" ? routine.schedule.timeZone ?? CENTRAL_TIME_ZONE : CENTRAL_TIME_ZONE,
+  );
   const [weekdays, setWeekdays] = useState(
     routine?.schedule.type === "daily" ? routine.schedule.weekdays : [1, 2, 3, 4, 5],
   );
@@ -336,23 +505,35 @@ export function RoutineEditor({
   const [error, setError] = useState("");
   const cloudInstance = state.instances.find((instance) => instance.driverKind === "boxAgent");
   const cloudReady = Boolean(state.config?.box.configured && cloudInstance?.snapshot.state === "available");
+  // MiniMonth preview of the schedule being edited — null while the "once"
+  // date/time field is mid-edit and momentarily unparseable, same guard
+  // `save()` needs around `epochFromInputDateTime`.
+  const schedulePreview = useMemo<RoutineSchedule | null>(() => {
+    try {
+      return kind === "once"
+        ? { type: "once", at: epochFromInputDateTime(at, CENTRAL_TIME_ZONE) }
+        : { type: "daily", time, weekdays, timeZone };
+    } catch {
+      return null;
+    }
+  }, [kind, at, time, weekdays, timeZone]);
 
   const save = async () => {
-    const input: RoutineInput = {
-      name,
-      prompt,
-      botId,
-      runOn,
-      enabled: routine ? undefined : true,
-      durationMinutes,
-      schedule:
-        kind === "once"
-          ? { type: "once", at: new Date(at).getTime() }
-          : { type: "daily", time, weekdays },
-    };
     setSaving(true);
     setError("");
     try {
+      const input: RoutineInput = {
+        name,
+        prompt,
+        botId,
+        runOn,
+        enabled: routine ? undefined : true,
+        durationMinutes,
+        schedule:
+          kind === "once"
+            ? { type: "once", at: epochFromInputDateTime(at, CENTRAL_TIME_ZONE) }
+            : editedDailySchedule(routine, time, weekdays, timeZone),
+      };
       const response = await api(routine ? `/api/routines/${routine.id}` : "/api/routines", {
         method: routine ? "PATCH" : "POST",
         body: JSON.stringify(input),
@@ -371,14 +552,14 @@ export function RoutineEditor({
       <div className="max-h-[90vh] w-full max-w-[620px] overflow-y-auto rounded-2xl border border-hairline/60 bg-panel shadow-2xl">
         <div className="sticky top-0 z-10 flex items-center justify-between border-b border-hairline/40 bg-panel/95 px-5 py-4 backdrop-blur">
           <div>
-            <div className="text-[17px] font-semibold text-ink">{routine ? "Edit routine" : "New routine"}</div>
-            <div className="mt-0.5 text-[12px] text-ink-secondary">Each run starts a fresh task for this agent. No cron syntax required.</div>
+            <div className="text-[17px] font-semibold text-ink">{routine ? "Edit Routine" : "New Routine"}</div>
+            <div className="mt-0.5 text-[12px] text-ink-secondary">Later runs of the same routine continue the previous task.  No cron syntax required.</div>
           </div>
           <button onClick={onClose} className="rounded-lg p-2 text-ink-secondary hover:bg-raised hover:text-ink"><X size={18} /></button>
         </div>
         <div className="space-y-5 p-5">
           <label className="block">
-            <span className="mb-1.5 block text-[12px] font-medium text-ink-secondary">Routine name</span>
+            <span className="mb-1.5 block text-[12px] font-medium text-ink-secondary">Routine Name</span>
             <input autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="Morning research brief" className="w-full rounded-xl border border-hairline/60 bg-inset px-3.5 py-2.5 text-[14px] text-ink outline-none placeholder:text-ink-secondary/60 focus:border-accent/70" />
           </label>
           <div>
@@ -386,13 +567,13 @@ export function RoutineEditor({
             <div className="grid grid-cols-2 gap-2">
               <button
                 type="button"
-                onClick={() => setRunOn("maus")}
+                onClick={() => setRunOn("bot")}
                 className={cn(
                   "rounded-xl border p-3 text-left transition",
-                  runOn === "maus" ? "border-accent/70 bg-accent/10" : "border-hairline/50 bg-inset hover:bg-raised/60",
+                  runOn === "bot" ? "border-accent/70 bg-accent/10" : "border-hairline/50 bg-inset hover:bg-raised/60",
                 )}
               >
-                <div className="flex items-center gap-2 text-[13px] font-medium text-ink"><Laptop size={15} />This computer</div>
+                <div className="flex items-center gap-2 text-[13px] font-medium text-ink"><Laptop size={15} />This Computer</div>
                 <div className="mt-1 text-[11px] leading-relaxed text-ink-secondary">Uses this bot's selected model and computer setting.</div>
               </button>
               <button
@@ -404,7 +585,7 @@ export function RoutineEditor({
                   runOn === "cloud" ? "border-accent/70 bg-accent/10" : "border-hairline/50 bg-inset hover:bg-raised/60",
                 )}
               >
-                <div className="flex items-center gap-2 text-[13px] font-medium text-ink"><Cloud size={15} />Cloud VM</div>
+                <div className="flex items-center gap-2 text-[13px] font-medium text-ink"><Cloud size={15} />ASCII.dev Box</div>
                 <div className="mt-1 text-[11px] leading-relaxed text-ink-secondary">Runs the bot and its tools inside its Box virtual machine.</div>
               </button>
             </div>
@@ -412,7 +593,7 @@ export function RoutineEditor({
               <div className={cn("mt-2 rounded-lg px-3 py-2 text-[11.5px] leading-relaxed", cloudReady ? "bg-accent/10 text-ink-secondary" : "border border-warning/25 bg-warning/10 text-warning")}>
                 {cloudReady
                   ? "The VM wakes automatically for each run. Keep BotFleet running so its scheduler can launch the job."
-                  : "Cloud VM needs a working Box API key in App Settings before this routine can run."}
+                  : "ASCII.dev Box needs a working Box API key in App Settings before this routine can run."}
               </div>
             )}
           </div>
@@ -422,7 +603,7 @@ export function RoutineEditor({
               {bots.map((bot) => (
                 <button key={bot.id} type="button" disabled={Boolean(lockedBotId)} onClick={() => setBotId(bot.id)} className={cn("flex min-w-0 items-center gap-2 rounded-xl border px-3 py-2 text-left", botId === bot.id ? "border-accent/70 bg-accent/10" : "border-hairline/50 bg-inset hover:bg-raised/60")}>
                   <BotAvatar bot={bot} state={botId === bot.id ? "happy" : stateForBot(bot)} size={38} animated={false} />
-                  <span className="min-w-0 flex-1 truncate text-[13px] font-medium text-ink">{bot.name}</span>
+                  <span className="min-w-0 flex-1 truncate text-[13px] font-medium text-ink" title={bot.name}>{bot.name}</span>
                   {lockedBotId && <span className="text-[11px] text-ink-secondary">Assigned from Computer</span>}
                 </button>
               ))}
@@ -440,7 +621,10 @@ export function RoutineEditor({
               ))}
             </div>
             {kind === "once" ? (
-              <input type="datetime-local" value={at} onChange={(event) => setAt(event.target.value)} className="block rounded-xl border border-hairline/60 bg-inset px-3.5 py-2.5 text-[14px] text-ink outline-none focus:border-accent/70 [color-scheme:dark]" />
+              <div className="space-y-2">
+                <input type="datetime-local" value={at} onChange={(event) => setAt(event.target.value)} className="block rounded-xl border border-hairline/60 bg-inset px-3.5 py-2.5 text-[14px] text-ink outline-none focus:border-accent/70 [color-scheme:dark]" />
+                <p className="text-[11.5px] text-ink-secondary">Date and time use {timeZoneLabel(CENTRAL_TIME_ZONE)}.</p>
+              </div>
             ) : (
               <div className="space-y-3">
                 <input type="time" value={time} onChange={(event) => setTime(event.target.value)} className="rounded-xl border border-hairline/60 bg-inset px-3.5 py-2.5 text-[14px] text-ink outline-none focus:border-accent/70 [color-scheme:dark]" />
@@ -449,11 +633,21 @@ export function RoutineEditor({
                     <button key={label} type="button" onClick={() => setWeekdays((current) => current.includes(day) ? (current.length === 1 ? current : current.filter((value) => value !== day)) : [...current, day].sort())} className={cn("size-10 rounded-xl border text-[11px] font-medium", weekdays.includes(day) ? "border-accent bg-accent text-white" : "border-hairline/50 bg-inset text-ink-secondary hover:text-ink")}>{label.slice(0, 2)}</button>
                   ))}
                 </div>
+                <p className="text-[11.5px] text-ink-secondary">Time zone: {timeZoneLabel(timeZone, routine?.nextRunAt ?? Date.now())}.{'  '}Existing routines keep their saved zone.</p>
+              </div>
+            )}
+            {schedulePreview && (
+              <div className="mt-3 overflow-hidden rounded-xl border border-hairline/40 bg-inset">
+                <MiniMonth
+                  anchor={schedulePreview.type === "once" ? schedulePreview.at : Date.now()}
+                  schedule={schedulePreview}
+                  timeZone={timeZone}
+                />
               </div>
             )}
           </div>
           <label className="block">
-            <span className="mb-1.5 block text-[12px] font-medium text-ink-secondary">Calendar block</span>
+            <span className="mb-1.5 block text-[12px] font-medium text-ink-secondary">Calendar Block</span>
             <select value={durationMinutes} onChange={(event) => setDurationMinutes(Number(event.target.value))} className="rounded-xl border border-hairline/60 bg-inset px-3.5 py-2.5 text-[14px] text-ink outline-none focus:border-accent/70">
               {[15, 30, 45, 60, 90, 120].map((minutes) => <option key={minutes} value={minutes}>{minutes < 60 ? `${minutes} minutes` : `${minutes / 60} ${minutes === 60 ? "hour" : "hours"}`}</option>)}
             </select>
@@ -463,7 +657,7 @@ export function RoutineEditor({
         <div className="sticky bottom-0 flex justify-end gap-2 border-t border-hairline/40 bg-panel/95 px-5 py-4 backdrop-blur">
           <button onClick={onClose} className="rounded-xl px-4 py-2 text-[13px] text-ink-secondary hover:bg-raised hover:text-ink">Cancel</button>
           <button onClick={save} disabled={saving || !name.trim() || !prompt.trim() || !botId} className="flex items-center gap-2 rounded-xl bg-accent px-4 py-2 text-[13px] font-medium text-white hover:brightness-110 disabled:opacity-40">
-            {saving && <Loader2 size={14} className="animate-spin" />}{routine ? "Save changes" : "Create routine"}
+            {saving && <Loader2 size={14} className="animate-spin" />}{routine ? "Save Changes" : "Create Routine"}
           </button>
         </div>
       </div>
@@ -471,15 +665,25 @@ export function RoutineEditor({
   );
 }
 
-function RoutineDetails({ item, bot, onClose, onEdit }: { item: CalendarItem; bot: Bot; onClose: () => void; onEdit: (routine: Routine) => void }) {
-  const { dispatch } = useStore();
+// Exported for the visual fixture (src/components/RoutineHoldVisualFixture.tsx),
+// which mounts this panel in its hold state.  The app only ever renders it from
+// RoutinesPage below.
+export function RoutineDetails({ item, bot, onClose, onEdit }: { item: CalendarItem; bot: Bot; onClose: () => void; onEdit: (routine: Routine) => void }) {
+  const { state, dispatch } = useStore();
   const routine = item.routine;
   const run = item.run;
   const [working, setWorking] = useState(false);
   const [error, setError] = useState("");
+  const [confirmDelete, setConfirmDelete] = useState(false);
   const title = routine?.name ?? run?.routineName ?? "Routine";
   const webhookParts = run?.triggerSource === "webhook" ? webhookPromptParts(run.prompt) : null;
   const visibleInstructions = webhookParts?.instructions ?? routine?.prompt ?? run?.prompt;
+  const outcome = run ? routineOutcomeCode(run) : undefined;
+  const history = state.routineRuns.filter((candidate) => candidate.routineId === (routine?.id ?? run?.routineId));
+  const summary = routineOutcomeSummary(history, Date.now());
+  const outcomeTime = (at: number | null) => at === null ? "None recorded" : new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/Chicago", month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "short",
+  }).format(at);
 
   const invoke = async (path: string, method = "POST") => {
     setWorking(true);
@@ -497,14 +701,14 @@ function RoutineDetails({ item, bot, onClose, onEdit }: { item: CalendarItem; bo
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-5 backdrop-blur-sm" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <div className="w-full max-w-[520px] overflow-hidden rounded-2xl border border-hairline/60 bg-panel shadow-2xl">
-        <div className="relative overflow-hidden border-b border-hairline/40 px-5 py-5" style={{ background: `linear-gradient(135deg, color-mix(in srgb, ${MAUS_COLORS[bot.color]} 28%, #111), #111)` }}>
-          <button onClick={onClose} className="absolute right-3 top-3 rounded-lg p-2 text-white/60 hover:bg-white/10 hover:text-white"><X size={18} /></button>
+      <div data-testid="routine-details" className="w-full max-w-[520px] overflow-hidden rounded-2xl border border-hairline/60 bg-panel shadow-2xl">
+        <div className="relative overflow-hidden border-b border-hairline/40 px-5 py-5" style={{ background: `linear-gradient(135deg, color-mix(in srgb, ${BOT_COLORS[bot.color]} 28%, #111), #111)` }}>
+          <button onClick={onClose} aria-label="Close Routine Details" className="absolute right-3 top-3 rounded-lg p-2 text-white/60 hover:bg-white/10 hover:text-white"><X size={18} /></button>
           <div className="flex items-center gap-4 pr-10">
             <BotAvatar bot={bot} state={run ? statusState(run.status) : stateForBot(bot)} size={72} animated={run?.status === "running" || run?.status === "waiting"} label={bot.name} />
             <div className="min-w-0">
-              <div className="truncate text-[20px] font-semibold text-white">{title}</div>
-              <div className="mt-1 flex items-center gap-2 text-[13px] text-white/65"><span>{bot.name}</span><span>·</span><span>{niceDate(item.at)}, {niceTime(item.at)}</span></div>
+              <div className="truncate text-[20px] font-semibold text-white" title={title}>{title}</div>
+              <div className="mt-1 flex items-center gap-2 text-[13px] text-white/65"><span>{bot.name}</span><span>·</span><span>{niceDate(item.at)}, {niceTime(item.at)} {shortTimeZoneName(item.at, CENTRAL_TIME_ZONE)}</span></div>
               <div className={cn("mt-2 inline-flex items-center gap-1.5 rounded-full bg-black/25 px-2.5 py-1 text-[11px] font-medium capitalize", run ? statusTone(run.status) : "text-white/70")}>
                 {run?.status === "running" && <Loader2 size={11} className="animate-spin" />}
                 {run?.status === "completed" && <CheckCircle2 size={11} />}
@@ -514,48 +718,92 @@ function RoutineDetails({ item, bot, onClose, onEdit }: { item: CalendarItem; bo
           </div>
         </div>
         <div className="max-h-[55vh] space-y-4 overflow-y-auto p-5">
+          {run?.coalescedInto && <p className="text-[12px] text-ink-secondary">Combined with another delivery in this turn.{'\u00a0 '}All combined deliveries share its final outcome and cancellation.</p>}
+          {outcome && outcome !== "completed" && <p className="text-[12px] font-medium text-ink">{ROUTINE_OUTCOME_LABELS[outcome]}{run?.failurePhase ? ` · ${run.failurePhase}` : ""}</p>}
+          {run?.engineId && <p className="text-[12px] text-ink-secondary">Engine: {run.engineId}{run.model ? ` · ${run.model}` : ""}</p>}
+          {run?.holdReason && (
+            // The reason is only rendered while it is true, and it is cleared
+            // wherever the run stops being queued, so this cannot outlive the
+            // wait it describes.  A run still showing "queued" with nothing
+            // under it is the exact state this whole change set removed.
+            <div className="flex items-start gap-2 rounded-xl border border-hairline/25 bg-inset/40 px-3.5 py-3 text-[13px] leading-relaxed text-ink-secondary">
+              <PauseCircle size={16} className="mt-0.5 shrink-0" />
+              <span>
+                <span className="font-medium text-ink">Holding</span>{"\u00a0\u00a0"}
+                {run.holdReason}
+              </span>
+            </div>
+          )}
+          {run?.error && <div className="flex items-start gap-2 rounded-xl border border-danger/30 bg-danger/10 px-3.5 py-3 text-[13px] text-danger"><CircleAlert size={16} className="mt-0.5 shrink-0" /><span>{run.error}</span></div>}
           {routine && (
             <div className="grid grid-cols-2 gap-3">
               <div className="rounded-xl bg-inset p-3"><div className="text-[10px] uppercase tracking-wider text-ink-secondary">Schedule</div><div className="mt-1 text-[13px] text-ink">{scheduleLabel(routine)}</div></div>
-              <div className="rounded-xl bg-inset p-3"><div className="text-[10px] uppercase tracking-wider text-ink-secondary">Runs on</div><div className="mt-1 flex items-center gap-1.5 text-[13px] text-ink">{routine.runOn === "cloud" ? <Cloud size={13} /> : <Laptop size={13} />}{routine.runOn === "cloud" ? "Cloud VM" : "Local setup"}</div></div>
+              <div className="rounded-xl bg-inset p-3"><div className="text-[10px] uppercase tracking-wider text-ink-secondary">Runs on</div><div className="mt-1 flex items-center gap-1.5 text-[13px] text-ink">{routine.runOn === "cloud" ? <Cloud size={13} /> : <Laptop size={13} />}{routine.runOn === "cloud" ? "ASCII.dev Box" : "Local setup"}</div></div>
               <div className="rounded-xl bg-inset p-3"><div className="text-[10px] uppercase tracking-wider text-ink-secondary">Duration</div><div className="mt-1 text-[13px] text-ink">{routine.durationMinutes} minutes</div></div>
             </div>
           )}
           {run?.triggerSource === "webhook" && (
             <div className="grid grid-cols-2 gap-3">
               <div className="rounded-xl bg-inset p-3"><div className="text-[10px] uppercase tracking-wider text-ink-secondary">Triggered by</div><div className="mt-1 flex items-center gap-1.5 text-[13px] text-ink"><Webhook size={13} />Webhook</div></div>
-              <div className="rounded-xl bg-inset p-3"><div className="text-[10px] uppercase tracking-wider text-ink-secondary">Runs on</div><div className="mt-1 flex items-center gap-1.5 text-[13px] text-ink">{run.runOn === "cloud" ? <Cloud size={13} /> : <Laptop size={13} />}{run.runOn === "cloud" ? "Cloud VM" : "Local setup"}</div></div>
-              {run.deliveryId && <div className="col-span-2 rounded-xl bg-inset p-3"><div className="text-[10px] uppercase tracking-wider text-ink-secondary">Delivery ID</div><div className="mt-1 truncate font-mono text-[11.5px] text-ink">{run.deliveryId}</div></div>}
+              <div className="rounded-xl bg-inset p-3"><div className="text-[10px] uppercase tracking-wider text-ink-secondary">Runs on</div><div className="mt-1 flex items-center gap-1.5 text-[13px] text-ink">{run.runOn === "cloud" ? <Cloud size={13} /> : <Laptop size={13} />}{run.runOn === "cloud" ? "ASCII.dev Box" : "Local setup"}</div></div>
+              {run.deliveryId && (
+                <details className="col-span-2 rounded-xl bg-inset p-3">
+                  <summary className="cursor-pointer text-[10px] font-medium uppercase tracking-wider text-ink-secondary">Technical Details</summary>
+                  <div className="mt-2 text-[10px] uppercase tracking-wider text-ink-secondary">Delivery Reference</div>
+                  <div className="mt-1 truncate font-mono text-[11.5px] text-ink" title={run.deliveryId}>{run.deliveryId}</div>
+                </details>
+              )}
             </div>
           )}
-          {visibleInstructions && <div><div className="mb-1.5 text-[11px] font-medium uppercase tracking-wider text-ink-secondary">Instructions</div><div className="whitespace-pre-wrap rounded-xl border border-hairline/40 bg-inset px-3.5 py-3 text-[13px] leading-relaxed text-ink">{visibleInstructions}</div></div>}
+          {visibleInstructions && <div><div className="mb-1.5 text-[11px] font-medium uppercase tracking-wider text-ink-secondary">Brief</div><div className="whitespace-pre-wrap rounded-xl border border-hairline/40 bg-inset px-3.5 py-3 text-[13px] leading-relaxed text-ink">{visibleInstructions}</div></div>}
           {webhookParts?.eventData && <div><div className="mb-1.5 text-[11px] font-medium uppercase tracking-wider text-ink-secondary">Webhook event data</div><pre className="max-h-56 overflow-auto whitespace-pre-wrap rounded-xl border border-accent/15 bg-accent/5 px-3.5 py-3 font-mono text-[11.5px] leading-relaxed text-ink-secondary">{webhookParts.eventData}</pre></div>}
           {run?.output && <div><div className="mb-1.5 text-[11px] font-medium uppercase tracking-wider text-ink-secondary">Last output</div><div className="max-h-48 overflow-y-auto whitespace-pre-wrap rounded-xl border border-success/20 bg-success/5 px-3.5 py-3 text-[13px] leading-relaxed text-ink">{run.output}</div></div>}
-          {run?.error && <div className="flex items-start gap-2 rounded-xl border border-danger/30 bg-danger/10 px-3.5 py-3 text-[13px] text-danger"><CircleAlert size={16} className="mt-0.5 shrink-0" /><span>{run.error}</span></div>}
+          <section aria-label="Routine outcomes" className="rounded-xl border border-hairline/40 bg-inset p-3.5 text-[12px] text-ink-secondary">
+            <h3 className="mb-2 text-[13px] font-semibold text-ink">Last 7 Days</h3>
+            <p>{summary.completed} completed · {summary.failed} failed · {summary.pending} pending</p>
+            <p className="mt-1">{summary.successRate === null ? "No finished executions" : `${Math.round(summary.successRate * 1000) / 10}% completed executions`}</p>
+            <p className="mt-1">{summary.cancelled} cancelled · {summary.denied} denied · {summary.missed} missed · {summary.combined} combined {summary.combined === 1 ? "delivery" : "deliveries"}</p>
+            <dl className="mt-3 grid gap-1"><div><dt className="inline">Last Completed: </dt><dd className="inline text-ink">{outcomeTime(summary.lastSuccessAt)}</dd></div><div><dt className="inline">Last Failed: </dt><dd className="inline text-ink">{outcomeTime(summary.lastFailureAt)}</dd></div></dl>
+            <p className="mt-2 text-[11px]">Based on retained history.{'\u00a0 '}Combined deliveries count once per execution; cancellations and denials are excluded from the completion rate.</p>
+          </section>
           {error && <div className="flex items-start gap-2 rounded-xl border border-danger/30 bg-danger/10 px-3.5 py-3 text-[13px] text-danger"><CircleAlert size={16} className="mt-0.5 shrink-0" /><span>{error}</span></div>}
-          {run?.status === "waiting" && <div className="rounded-xl border border-warning/30 bg-warning/10 px-3.5 py-3 text-[13px] text-warning">This bot needs your answer. Open its task to continue the run.</div>}
+          {run?.status === "waiting" && <div className="rounded-xl border border-warning/30 bg-warning/10 px-3.5 py-3 text-[13px] text-warning">This bot needs your answer.{"\u00a0 "}Open its task to continue the run.</div>}
         </div>
         <div className="flex flex-wrap items-center gap-2 border-t border-hairline/40 px-5 py-4">
-          {routine && <button disabled={working} onClick={() => void invoke(`/api/routines/${routine.id}/run`)} className="flex items-center gap-2 rounded-xl bg-accent px-3.5 py-2 text-[13px] font-medium text-white hover:brightness-110 disabled:opacity-40"><Play size={14} />Run now</button>}
-          {run?.threadId && <button onClick={() => { dispatch({ type: "select", id: bot.id }); dispatch({ type: "switchTask", botId: bot.id, threadId: run.threadId! }); onClose(); }} className="flex items-center gap-2 rounded-xl bg-raised px-3.5 py-2 text-[13px] text-ink hover:bg-raised-hover"><ExternalLink size={14} />Open task</button>}
-          {run && ["queued", "running", "waiting"].includes(run.status) && <button disabled={working} onClick={() => void invoke(`/api/routine-runs/${run.id}/cancel`)} className="flex items-center gap-2 rounded-xl bg-raised px-3.5 py-2 text-[13px] text-ink hover:bg-raised-hover disabled:opacity-40"><X size={14} />Cancel run</button>}
+          {routine && <button disabled={working} onClick={() => void invoke(`/api/routines/${routine.id}/run`)} className="flex items-center gap-2 rounded-xl bg-accent px-3.5 py-2 text-[13px] font-medium text-white hover:brightness-110 disabled:opacity-40"><Play size={14} />Run Now</button>}
+          {run?.threadId && <button onClick={() => { dispatch({ type: "select", id: bot.id }); dispatch({ type: "switchTask", botId: bot.id, threadId: run.threadId! }); onClose(); }} className="flex items-center gap-2 rounded-xl bg-raised px-3.5 py-2 text-[13px] text-ink hover:bg-raised-hover"><ExternalLink size={14} />Open Task</button>}
+          {run && ["queued", "running", "waiting"].includes(run.status) && <button disabled={working} onClick={() => void invoke(`/api/routine-runs/${run.id}/cancel`)} className="flex items-center gap-2 rounded-xl bg-raised px-3.5 py-2 text-[13px] text-ink hover:bg-raised-hover disabled:opacity-40"><X size={14} />Cancel Run</button>}
           <div className="flex-1" />
           {routine && canToggleRoutine(routine) && <button disabled={working} onClick={async () => { setWorking(true); setError(""); try { const response = await api(`/api/routines/${routine.id}`, { method: "PATCH", body: JSON.stringify({ enabled: !routine.enabled }) }); dispatch({ type: "routinePatched", routine: response.routine }); } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); } finally { setWorking(false); } }} className="flex items-center gap-1.5 rounded-xl px-3 py-2 text-[13px] text-ink-secondary hover:bg-raised hover:text-ink disabled:opacity-40">{routine.enabled ? <Pause size={14} /> : <Play size={14} />}{routine.enabled ? "Pause" : "Resume"}</button>}
           {routine && <button onClick={() => onEdit(routine)} className="rounded-xl px-3 py-2 text-[13px] text-ink-secondary hover:bg-raised hover:text-ink">Edit</button>}
-          {routine && <button onClick={() => { if (!window.confirm(`Delete “${routine.name}”? Its past run receipts will stay in the calendar.`)) return; dispatch({ type: "deleteRoutine", routineId: routine.id }); onClose(); }} className="rounded-xl p-2 text-ink-secondary hover:bg-danger/10 hover:text-danger" title="Delete routine"><Trash2 size={16} /></button>}
+          {routine && <button onClick={() => setConfirmDelete(true)} className="rounded-xl p-2 text-ink-secondary hover:bg-danger/10 hover:text-danger" title="Delete Routine"><Trash2 size={16} /></button>}
         </div>
       </div>
+      {routine && (
+        <ConfirmDialog
+          open={confirmDelete}
+          title="Delete Routine?"
+          body={`Delete “${routine.name}”?  Its past run receipts will stay in the calendar.`}
+          confirmLabel="Delete Routine"
+          onCancel={() => setConfirmDelete(false)}
+          onConfirm={() => {
+            dispatch({ type: "deleteRoutine", routineId: routine.id });
+            onClose();
+          }}
+        />
+      )}
     </div>
   );
 }
 
 function PausedRoutines({ routines, bots, onClose, onEdit }: { routines: Routine[]; bots: Bot[]; onClose: () => void; onEdit: (routine: Routine) => void }) {
   const { dispatch } = useStore();
+  const [pendingDelete, setPendingDelete] = useState<Routine | null>(null);
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-5 backdrop-blur-sm" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
       <div className="w-full max-w-[560px] overflow-hidden rounded-2xl border border-hairline/60 bg-panel shadow-2xl">
         <div className="flex items-center justify-between border-b border-hairline/40 px-5 py-4">
-          <div><div className="text-[17px] font-semibold text-ink">Paused routines</div><div className="mt-0.5 text-[12px] text-ink-secondary">They keep their history and will not create new runs.</div></div>
+          <div><div className="text-[17px] font-semibold text-ink">Paused Routines</div><div className="mt-0.5 text-[12px] text-ink-secondary">They keep their history and will not create new runs.</div></div>
           <button onClick={onClose} className="rounded-lg p-2 text-ink-secondary hover:bg-raised hover:text-ink"><X size={18} /></button>
         </div>
         <div className="max-h-[60vh] space-y-2 overflow-y-auto p-4">
@@ -564,21 +812,151 @@ function PausedRoutines({ routines, bots, onClose, onEdit }: { routines: Routine
             return (
               <div key={routine.id} className="flex items-center gap-3 rounded-xl border border-hairline/40 bg-inset p-3">
                 {bot ? <BotAvatar bot={bot} state="sleeping" size={44} animated={false} label={bot.name} /> : <div className="flex size-11 items-center justify-center rounded-xl bg-raised text-ink-secondary"><CalendarClock size={20} /></div>}
-                <div className="min-w-0 flex-1"><div className="truncate text-[14px] font-semibold text-ink">{routine.name}</div><div className="mt-0.5 truncate text-[11.5px] text-ink-secondary">{bot?.name ?? "Deleted bot"} · {scheduleLabel(routine)}</div></div>
+                <div className="min-w-0 flex-1"><div className="truncate text-[14px] font-semibold text-ink" title={routine.name}>{routine.name}</div><div className="mt-0.5 truncate text-[11.5px] text-ink-secondary" title={`${bot?.name ?? "Deleted bot"} · ${scheduleLabel(routine)}`}>{bot?.name ?? "Deleted bot"} · {scheduleLabel(routine)}</div></div>
                 {bot && <button onClick={() => dispatch({ type: "updateRoutine", routineId: routine.id, patch: { enabled: true } })} className="flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-[12px] font-medium text-white hover:brightness-110"><Play size={12} />Resume</button>}
                 <button onClick={() => onEdit(routine)} className="rounded-lg px-2 py-1.5 text-[12px] text-ink-secondary hover:bg-raised hover:text-ink">Edit</button>
-                <button onClick={() => { if (!window.confirm(`Delete “${routine.name}”?`)) return; dispatch({ type: "deleteRoutine", routineId: routine.id }); }} className="rounded-lg p-2 text-ink-secondary hover:bg-danger/10 hover:text-danger" title="Delete routine"><Trash2 size={15} /></button>
+                <button onClick={() => setPendingDelete(routine)} className="rounded-lg p-2 text-ink-secondary hover:bg-danger/10 hover:text-danger" title="Delete Routine"><Trash2 size={15} /></button>
               </div>
             );
           })}
         </div>
       </div>
+      <ConfirmDialog
+        open={Boolean(pendingDelete)}
+        title="Delete Routine?"
+        body={`Delete “${pendingDelete?.name ?? "this routine"}”?  Its past run receipts will stay in the calendar.`}
+        confirmLabel="Delete Routine"
+        onCancel={() => setPendingDelete(null)}
+        onConfirm={() => {
+          if (pendingDelete) dispatch({ type: "deleteRoutine", routineId: pendingDelete.id });
+          setPendingDelete(null);
+        }}
+      />
+    </div>
+  );
+}
+
+/** Hover card for the badge: a bare count cannot be acted on, so the number
+ *  arrives with its recency and with the routines and triggers feeding it. */
+function AttentionTooltip({ summary }: { summary: AttentionSummary }) {
+  const sources = summary.sources.slice(0, 6);
+  return (
+    <span
+      role="tooltip"
+      title={attentionSourcesTooltip(summary)}
+      className="pointer-events-none absolute right-0 top-full z-40 mt-2 hidden w-[300px] rounded-xl border border-hairline/60 bg-panel p-3 text-left shadow-xl group-hover:block group-focus-within:block"
+    >
+      <div className="text-[11.5px] font-medium text-ink">{attentionWindowLabel(summary)}</div>
+      <div className="mt-2 space-y-1">
+        {sources.map((source) => (
+          <div key={`${source.label}:${source.name}`} className="flex items-baseline justify-between gap-2 text-[11px] text-ink-secondary">
+            <span className="min-w-0 truncate text-ink" title={source.name}>{source.name}</span>
+            <span className="shrink-0">{source.label} · {source.count}</span>
+          </div>
+        ))}
+      </div>
+      {summary.sources.length > sources.length && <div className="mt-1.5 text-[10.5px] text-ink-secondary">and {summary.sources.length - sources.length} more</div>}
+    </span>
+  );
+}
+
+/** Every failure that has not been looked at, newest first.
+ *
+ *  The badge was the only surface, and a count like 421 told the owner nothing
+ *  they could act on: it could not be selected, there was no way to clear a
+ *  historic backlog, and every trigger still looked healthy.  This is the step
+ *  that names the runs, shows how recent they are, and lets each one be
+ *  acknowledged on its own or all at once. */
+function AttentionPanel({ summary, runs, bots, onClose, onOpenRun }: {
+  summary: AttentionSummary;
+  runs: RoutineRun[];
+  bots: Bot[];
+  onClose: () => void;
+  onOpenRun: (run: RoutineRun) => void;
+}) {
+  const { dispatch } = useStore();
+  const [pendingDismiss, setPendingDismiss] = useState(false);
+  const now = Date.now();
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-5 backdrop-blur-sm" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+      <div className="flex max-h-[82vh] w-full max-w-[640px] flex-col overflow-hidden rounded-2xl border border-hairline/60 bg-panel shadow-2xl">
+        <div className="flex items-start justify-between gap-3 border-b border-hairline/40 px-5 py-4">
+          <div className="min-w-0">
+            <div className="text-[17px] font-semibold text-ink">Needs Attention</div>
+            <div className="mt-0.5 text-[12px] text-ink-secondary">{attentionWindowLabel(summary)}</div>
+          </div>
+          <div className="flex shrink-0 items-center gap-2">
+            <button onClick={() => setPendingDismiss(true)} className="rounded-lg border border-hairline/50 bg-inset px-3 py-1.5 text-[12px] font-medium text-ink hover:bg-raised">Acknowledge All {summary.total}</button>
+            <button onClick={onClose} className="rounded-lg p-2 text-ink-secondary hover:bg-raised hover:text-ink"><X size={18} /></button>
+          </div>
+        </div>
+        <div className="min-h-0 flex-1 space-y-2 overflow-y-auto p-4">
+          {runs.length === 0 && (
+            // Reachable by acknowledging the last row one at a time, and the
+            // moment after Acknowledge All closes the panel.
+            <div className="flex flex-col items-center gap-2 px-6 py-10 text-center">
+              <CheckCircle2 size={26} className="text-accent" />
+              <div className="text-[14px] font-semibold text-ink">All Caught Up</div>
+              <div className="text-[12px] leading-relaxed text-ink-secondary">Nothing is waiting.  The next failure shows up here and raises the badge again.</div>
+            </div>
+          )}
+          {runs.map((run) => {
+            const bot = bots.find((candidate) => candidate.id === run.botId);
+            const code = routineOutcomeCode(run);
+            const detail = (run.error || run.output || "").replace(/\s+/g, " ").trim();
+            return (
+              <div key={run.id} className="rounded-xl border border-hairline/40 bg-inset p-3">
+                <div className="flex items-start gap-3">
+                  {bot ? <BotAvatar bot={bot} state="crash" size={40} animated={false} label={bot.name} /> : <div className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-raised text-ink-secondary"><CircleAlert size={18} /></div>}
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-baseline gap-2">
+                      <span className="truncate text-[14px] font-semibold text-ink" title={run.routineName}>{run.routineName}</span>
+                      <span className="shrink-0 rounded-full bg-raised px-1.5 py-0.5 text-[10px] text-ink-secondary">{attentionTriggerLabel(run.triggerSource)}</span>
+                    </div>
+                    <div className="mt-0.5 truncate text-[11.5px] text-ink-secondary" title={`${bot?.name ?? "Deleted bot"} · ${relativeRunTime(attentionSettledAt(run), now)}`}>
+                      {bot?.name ?? "Deleted bot"} · {relativeRunTime(attentionSettledAt(run), now)}{code ? ` · ${ROUTINE_OUTCOME_LABELS[code]}` : ""}
+                    </div>
+                    {detail && <div className="mt-1 line-clamp-2 font-mono text-[10.5px] text-ink-secondary/85" title={detail}>{detail}</div>}
+                  </div>
+                  <div className="flex shrink-0 items-center gap-1">
+                    <button onClick={() => onOpenRun(run)} className="rounded-lg px-2 py-1.5 text-[12px] text-ink-secondary hover:bg-raised hover:text-ink">View</button>
+                    <button onClick={() => dispatch({ type: "markRoutineRunSeen", runId: run.id })} className="rounded-lg p-2 text-ink-secondary hover:bg-raised hover:text-ink" title="Acknowledge This Run"><CheckCircle2 size={15} /></button>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        <div className="border-t border-hairline/40 px-5 py-3 text-[11.5px] leading-relaxed text-ink-secondary">
+          Acknowledging keeps every run in the calendar with its error.  It only clears the badge, and the next failure brings it back.
+        </div>
+      </div>
+      <ConfirmDialog
+        open={pendingDismiss}
+        title={`Acknowledge ${summary.total} ${summary.total === 1 ? "Failure" : "Failures"}?`}
+        body="They stay in the calendar with their errors.  This only clears the badge, and the next failure brings it back."
+        confirmLabel="Acknowledge All"
+        onCancel={() => setPendingDismiss(false)}
+        onConfirm={() => {
+          dispatch({ type: "acknowledgeAllAttention" });
+          setPendingDismiss(false);
+          onClose();
+        }}
+      />
     </div>
   );
 }
 
 export function RoutinesPage() {
   const { state, dispatch } = useStore();
+  const { capabilities } = useDesktopCapabilities();
+  const macInset = capabilities.windowChrome === "mac-inset";
+  const dragStyle: (React.CSSProperties & { WebkitAppRegion: "drag" }) | undefined = macInset
+    ? { WebkitAppRegion: "drag" }
+    : undefined;
+  const noDragStyle: (React.CSSProperties & { WebkitAppRegion: "no-drag" }) | undefined = macInset
+    ? { WebkitAppRegion: "no-drag" }
+    : undefined;
   const [section, setSection] = useState<"calendar" | "webhooks" | "resources">("calendar");
   const [viewDays, setViewDays] = useState<1 | 3 | 7>(7);
   const [anchor, setAnchor] = useState(() => startOfWeek(Date.now()));
@@ -586,11 +964,13 @@ export function RoutinesPage() {
   const [editor, setEditor] = useState<Routine | "new" | null>(null);
   const [selected, setSelected] = useState<CalendarItem | null>(null);
   const [pausedOpen, setPausedOpen] = useState(false);
+  const [attentionOpen, setAttentionOpen] = useState(false);
+  const [copyReviewOpen, setCopyReviewOpen] = useState(false);
   const visibleBots = state.bots.filter((bot) => !bot.hidden);
   const rangeStart = viewDays === 7 ? startOfWeek(anchor) : startOfDay(anchor);
   const rangeEnd = addDays(rangeStart, viewDays);
   const items = useMemo(
-    () => projectedItems(state.routines, state.routineRuns, rangeStart, rangeEnd).filter((item) => botFilter === "all" || (item.routine?.botId ?? item.run?.botId) === botFilter),
+    () => projectedRoutineItems(state.routines, state.routineRuns, rangeStart, rangeEnd).filter((item) => botFilter === "all" || (item.routine?.botId ?? item.run?.botId) === botFilter),
     [state.routines, state.routineRuns, rangeStart, rangeEnd, botFilter],
   );
   const liveSelected = selected
@@ -603,9 +983,15 @@ export function RoutinesPage() {
   const selectedBot = liveSelected
     ? state.bots.find((bot) => bot.id === (liveSelected.routine?.botId ?? liveSelected.run?.botId))
     : undefined;
-  const unseenFailures = state.routineRuns.filter((run) => ["failed", "missed"].includes(run.status) && !run.seenAt).length;
+  const attentionNow = useNow();
+  // The recency windows derive from Date.now(), so the clock is a
+  // real dependency: without it the counts freeze until run state changes.
+  const attention = useMemo(() => summarizeAttention(state.routineRuns, attentionNow), [state.routineRuns, attentionNow]);
+  const pendingAttention = useMemo(() => attentionRuns(state.routineRuns), [state.routineRuns]);
   const running = state.routineRuns.filter((run) => ["queued", "running", "waiting"].includes(run.status)).length;
   const paused = state.routines.filter((routine) => !routine.enabled && canToggleRoutine(routine));
+  const copyReviewCount = state.routines.filter((routine) => hasSlackReference(routine.name, routine.prompt)).length
+    + state.webhooks.filter((webhook) => hasSlackReference(webhook.name, webhook.prompt)).length;
   useEffect(() => {
     if (pausedOpen && paused.length === 0) setPausedOpen(false);
   }, [pausedOpen, paused.length]);
@@ -633,56 +1019,81 @@ export function RoutinesPage() {
     }
   };
 
+  /** Jump the calendar to a run from the attention list, so "View" lands on
+   *  the day it ran instead of an unrelated week. */
+  const openAttentionRun = (run: RoutineRun) => {
+    setAttentionOpen(false);
+    setViewDays(1);
+    setAnchor(startOfDay(run.scheduledFor));
+    setSelected({
+      id: run.id,
+      at: run.scheduledFor,
+      routine: state.routines.find((routine) => routine.id === run.routineId) ?? null,
+      run,
+    });
+    dispatch({ type: "markRoutineRunSeen", runId: run.id });
+  };
+
   return (
     <main className="flex h-full min-w-0 flex-1 flex-col bg-app">
       <header
+        style={dragStyle}
         className={cn(
           "shrink-0 px-5 pb-4 pt-4",
           // Room for the drawer button, which overlays this corner below md.
           "pl-11 md:pl-5",
         )}
       >
-        <div className="flex flex-wrap items-start justify-between gap-3">
+        <div style={noDragStyle} className="flex flex-wrap items-start justify-between gap-3">
           <div>
-            <div className="flex items-center gap-2.5">{section === "calendar" ? <CalendarDays size={21} className="text-accent" /> : section === "resources" ? <Gauge size={21} className="text-accent" /> : <Webhook size={21} className="text-accent" />}<h1 className="text-[20px] font-semibold tracking-tight text-ink">Tasks &amp; routines</h1></div>
-            <p className="mt-1 text-[12.5px] text-ink-secondary">{section === "calendar" ? "Routines start fresh agent tasks on a schedule." : section === "resources" ? "Resource triggers start a bot when disk, RAM, or CPU crosses a threshold." : "Webhooks start fresh agent tasks when an event arrives."}</p>
+            <div className="flex items-center gap-2.5">{section === "calendar" ? <CalendarDays size={21} className="text-accent" /> : section === "resources" ? <Gauge size={21} className="text-accent" /> : <Webhook size={21} className="text-accent" />}<h1 className="text-[20px] font-semibold tracking-tight text-ink">Tasks &amp; Routines</h1></div>
+            <p className="mt-1 text-[12.5px] text-ink-secondary">{section === "calendar" ? "Routines start fresh bot tasks on a schedule." : section === "resources" ? "Resource triggers start a bot when disk, memory, or processor use crosses a line." : "Webhooks start fresh bot tasks when an event arrives."}</p>
           </div>
-          <div className="flex items-center gap-2">
+          <div style={noDragStyle} className="flex items-center gap-2">
             {running > 0 && <span className="flex items-center gap-1.5 rounded-full border border-accent/25 bg-accent/10 px-2.5 py-1.5 text-[11px] text-accent"><Loader2 size={12} className="animate-spin" />{running} active</span>}
-            {unseenFailures > 0 && <span className="flex items-center gap-1.5 rounded-full border border-danger/25 bg-danger/10 px-2.5 py-1.5 text-[11px] text-danger"><CircleAlert size={12} />{unseenFailures} need attention</span>}
+            {attention.total > 0 && (
+              <div className="group relative">
+                <button onClick={() => setAttentionOpen(true)} className="flex items-center gap-1.5 rounded-full border border-danger/25 bg-danger/10 px-2.5 py-1.5 text-[11px] text-danger hover:bg-danger/20">
+                  <CircleAlert size={12} />{attention.total} need attention
+                </button>
+                <AttentionTooltip summary={attention} />
+              </div>
+            )}
             {paused.length > 0 && <button onClick={() => setPausedOpen(true)} className="flex items-center gap-1.5 rounded-full border border-hairline/50 bg-panel px-2.5 py-1.5 text-[11px] text-ink-secondary hover:bg-raised hover:text-ink"><Pause size={12} />{paused.length} paused</button>}
-            {section === "calendar" && <button onClick={() => setEditor("new")} disabled={visibleBots.length === 0} className="flex items-center gap-2 rounded-xl bg-accent px-3.5 py-2 text-[13px] font-medium text-white shadow-lg shadow-accent/10 hover:brightness-110 disabled:opacity-40"><Plus size={15} />New routine</button>}
+            {copyReviewCount > 0 && <button onClick={() => setCopyReviewOpen(true)} className="flex items-center gap-1.5 rounded-full border border-warning/25 bg-warning/10 px-2.5 py-1.5 text-[11px] text-warning hover:bg-warning/15"><CircleAlert size={12} />{copyReviewCount} copy review{copyReviewCount === 1 ? "" : "s"}</button>}
+            {section === "calendar" && <button onClick={() => setEditor("new")} disabled={visibleBots.length === 0} className="flex items-center gap-2 rounded-xl bg-accent px-3.5 py-2 text-[13px] font-medium text-white shadow-lg shadow-accent/10 hover:brightness-110 disabled:opacity-40"><Plus size={15} />New Routine</button>}
           </div>
         </div>
-        <div className="mt-4 flex items-center gap-1 rounded-xl bg-panel p-1 sm:w-fit">
+        <div style={noDragStyle} className="mt-4 flex items-center gap-1 rounded-xl bg-panel p-1 sm:w-fit">
           <button onClick={() => setSection("calendar")} className={cn("flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-[12px] font-medium", section === "calendar" ? "bg-raised text-ink shadow" : "text-ink-secondary hover:text-ink")}><CalendarDays size={13} />Routines</button>
           <button onClick={() => setSection("webhooks")} className={cn("flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-[12px] font-medium", section === "webhooks" ? "bg-raised text-ink shadow" : "text-ink-secondary hover:text-ink")}><Webhook size={13} />Webhooks{state.webhooks.length > 0 && <span className="rounded-full bg-accent/15 px-1.5 text-[10px] text-accent">{state.webhooks.length}</span>}</button>
           <button onClick={() => setSection("resources")} className={cn("flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-[12px] font-medium", section === "resources" ? "bg-raised text-ink shadow" : "text-ink-secondary hover:text-ink")}><Gauge size={13} />Resources{state.resourceTriggers.length > 0 && <span className="rounded-full bg-accent/15 px-1.5 text-[10px] text-accent">{state.resourceTriggers.length}</span>}</button>
         </div>
         <div className="mt-3 rounded-xl border border-hairline/45 bg-panel/70 px-3.5 py-2.5 text-[11.5px] leading-relaxed text-ink-secondary">
           {section === "calendar" ? (
-            <><strong className="font-medium text-ink">Task</strong> = one conversation and result. <strong className="font-medium text-ink">Routine</strong> = a reusable schedule that creates a fresh task each run, using that agent's model, tools, permissions, computer, and connected apps.</>
+            <><strong className="font-medium text-ink">Task</strong> = one conversation and result.{'\u00A0 '}<strong className="font-medium text-ink">Routine</strong> = a reusable schedule.{'\u00A0 '}Later runs of the same routine continue the previous task thread, using that bot's model, tools, permissions, computer, and connected apps.</>
           ) : section === "resources" ? (
-            <><strong className="font-medium text-ink">Resource trigger</strong> = a local disk, RAM/swap, or CPU threshold that creates a fresh task. BotFleet must be running to sample this computer. A Mac launchd watch can also POST the Housekeeper webhook if you want coverage while the app is closed.</>
+            <><strong className="font-medium text-ink">Resource trigger</strong> = a disk, memory, or processor limit that starts a fresh task.{'\u00A0 '}BotFleet has to be open to watch this computer.</>
           ) : (
-            <><strong className="font-medium text-ink">Webhook</strong> = an event endpoint that creates a fresh task. Connected services can call it when something happens; the receiving agent keeps its existing tools and permissions.</>
+            <><strong className="font-medium text-ink">Webhook</strong> = an event endpoint that creates a fresh task. Connected services can call it when something happens; the receiving bot keeps its existing tools and permissions.</>
           )}
         </div>
-        {section === "calendar" && <div className="mt-3 flex flex-wrap items-center gap-2">
+        {section === "calendar" && <div style={noDragStyle} className="mt-3 flex flex-wrap items-center gap-2">
           <div className="flex items-center rounded-xl border border-hairline/50 bg-panel p-0.5">
-            <button onClick={() => move(-1)} className="rounded-lg p-2 text-ink-secondary hover:bg-raised hover:text-ink" aria-label="Previous dates"><ChevronLeft size={16} /></button>
+            <button onClick={() => move(-1)} className="inline-flex size-11 items-center justify-center rounded-lg text-ink-secondary hover:bg-raised hover:text-ink" aria-label="Previous Dates"><ChevronLeft size={18} /></button>
             <button onClick={goToday} className="px-2.5 py-1.5 text-[12px] font-medium text-ink hover:text-accent">Today</button>
-            <button onClick={() => move(1)} className="rounded-lg p-2 text-ink-secondary hover:bg-raised hover:text-ink" aria-label="Next dates"><ChevronRight size={16} /></button>
+            <button onClick={() => move(1)} className="inline-flex size-11 items-center justify-center rounded-lg text-ink-secondary hover:bg-raised hover:text-ink" aria-label="Next Dates"><ChevronRight size={18} /></button>
           </div>
           <div className="min-w-[190px] px-2 text-[14px] font-semibold text-ink">
-            {new Date(rangeStart).toLocaleDateString([], { month: "long", year: "numeric" })}
+            {new Intl.DateTimeFormat(undefined, { timeZone: CENTRAL_TIME_ZONE, month: "long", year: "numeric" }).format(rangeStart)}
+            <span className="ml-2 text-[10.5px] font-medium text-ink-secondary">Central Time</span>
           </div>
           <select value={botFilter} onChange={(event) => setBotFilter(event.target.value)} className="rounded-xl border border-hairline/50 bg-panel px-3 py-2 text-[12px] text-ink outline-none focus:border-accent/60">
             <option value="all">All bots</option>
             {visibleBots.map((bot) => <option key={bot.id} value={bot.id}>{bot.name}</option>)}
           </select>
-          <div className="ml-auto flex rounded-xl bg-panel p-1">
-            {([1, 3, 7] as const).map((days) => <button key={days} onClick={() => { setViewDays(days); setAnchor(days === 7 ? startOfWeek(anchor) : startOfDay(anchor)); }} className={cn("rounded-lg px-3 py-1.5 text-[11px] font-medium", viewDays === days ? "bg-raised text-ink shadow" : "text-ink-secondary hover:text-ink")}>{days === 1 ? "Day" : days === 3 ? "3 days" : "Week"}</button>)}
+          <div className="flex w-full rounded-xl bg-panel p-1 sm:ml-auto sm:w-auto">
+            {([1, 3, 7] as const).map((days) => <button key={days} onClick={() => { setViewDays(days); setAnchor(days === 7 ? startOfWeek(anchor) : startOfDay(anchor)); }} className={cn("min-h-11 flex-1 rounded-lg px-3 py-1.5 text-[12px] font-medium sm:flex-none", viewDays === days ? "bg-raised text-ink shadow" : "text-ink-secondary hover:text-ink")}>{days === 1 ? "Day" : days === 3 ? "3 Days" : "Week"}</button>)}
           </div>
         </div>}
       </header>
@@ -698,9 +1109,9 @@ export function RoutinesPage() {
               {visibleBots.slice(0, 3).map((bot, index) => <div key={bot.id} className="-ml-3 first:ml-0" style={{ transform: `translateY(${Math.abs(index - 1) * 9}px) rotate(${(index - 1) * 5}deg)` }}><BotAvatar bot={bot} state={index === 1 ? "excited" : stateForBot(bot)} size={84} /></div>)}
               {visibleBots.length === 0 && <CalendarClock size={58} className="text-ink-secondary/40" />}
             </div>
-            <h2 className="text-[18px] font-semibold text-ink">Put your bot fleet on a rhythm</h2>
-            <p className="mt-2 text-[13px] leading-relaxed text-ink-secondary">Plan research briefs, daily check-ins, recurring reviews, or one-time work. Every run becomes a separate task with its own result.</p>
-            <button onClick={() => setEditor("new")} disabled={visibleBots.length === 0} className="mt-5 inline-flex items-center gap-2 rounded-xl bg-accent px-4 py-2.5 text-[13px] font-medium text-white hover:brightness-110 disabled:opacity-40"><Plus size={15} />Create your first routine</button>
+            <h2 className="text-[18px] font-semibold text-ink">Put Your Bot Fleet on a Rhythm</h2>
+            <p className="mt-2 text-[13px] leading-relaxed text-ink-secondary">Plan research briefs, daily check-ins, recurring reviews, or one-time work.{"\u00a0 "}Every run becomes a separate task with its own result.</p>
+            <button onClick={() => setEditor("new")} disabled={visibleBots.length === 0} className="mt-5 inline-flex items-center gap-2 rounded-xl bg-accent px-4 py-2.5 text-[13px] font-medium text-white hover:brightness-110 disabled:opacity-40"><Plus size={15} />Create Your First Routine</button>
             {visibleBots.length === 0 && <p className="mt-3 text-[12px] text-warning">Create a bot first, then come back to schedule it.</p>}
           </div>
         </div>
@@ -711,6 +1122,8 @@ export function RoutinesPage() {
       {editor && <RoutineEditor routine={editor === "new" ? undefined : editor} bots={visibleBots} onClose={() => setEditor(null)} />}
       {liveSelected && selectedBot && <RoutineDetails item={liveSelected} bot={selectedBot} onClose={() => setSelected(null)} onEdit={(routine) => { setSelected(null); setEditor(routine); }} />}
       {pausedOpen && <PausedRoutines routines={paused} bots={state.bots} onClose={() => setPausedOpen(false)} onEdit={(routine) => { setPausedOpen(false); setEditor(routine); }} />}
+      {attentionOpen && <AttentionPanel summary={attention} runs={pendingAttention} bots={state.bots} onClose={() => setAttentionOpen(false)} onOpenRun={openAttentionRun} />}
+      {copyReviewOpen && <CollaborationCopyReviewPanel routines={state.routines} webhooks={state.webhooks} onClose={() => setCopyReviewOpen(false)} />}
     </main>
   );
 }

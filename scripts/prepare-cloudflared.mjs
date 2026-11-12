@@ -14,39 +14,58 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 
-export const CLOUDFLARED_VERSION = "2026.8.2";
+import {
+  NATIVE_PROBE_ATTEMPTS,
+  NATIVE_PROBE_TIMEOUT_MS,
+  classifyNativeProbe,
+  nativeProbeFailureMessage,
+  probeNativeVersion,
+} from "./native-version-probe.mjs";
+
+/** One slow download beats three fast failures.  Mirrors the timeout,
+ * attempt count, and delay `prepare-android-tools.mjs` picked up in PR #446
+ * for the same class of incident (the Sep 17 update outage traced to this
+ * script's single 120s attempt with no retry). */
+export const DOWNLOAD_TIMEOUT_MS = 10 * 60 * 1000;
+export const DOWNLOAD_ATTEMPTS = 3;
+export const DOWNLOAD_RETRY_DELAY_MS = 5_000;
+
+const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
+
+export const CLOUDFLARED_VERSION = "2026.10.3";
 
 export const CLOUDFLARED_ASSETS = Object.freeze({
   "darwin-arm64": Object.freeze({
     name: "cloudflared-darwin-arm64.tgz",
-    sha256: "9042c2c5d8b2de78e60f313d5fb31b6c5c1cebde787a3caf1f2c9588084ac442",
-    binarySha256: "b61054d3d6326ea558cb49826eebf5676e0d0a36d51b546975096ca3e0e3c89d",
+    sha256: "1165d14b6f6360a3b8c283d7d1100024d6ec7cd9bc9e32519e96150645f3ec55",
+    binarySha256: "f249139e0541fa589c987397d867cc16c83ab1236d31eb6782f2e4552ee9cf80",
     archive: true,
   }),
   "darwin-x64": Object.freeze({
     name: "cloudflared-darwin-amd64.tgz",
-    sha256: "f1727723c586500e2092368ae21871b3df7ddfd2cb097f22d81bee4a9c458bb4",
-    binarySha256: "b0f770e1e0b281399a57219b840fd8eef1cc25387a404124248157ea2073727a",
+    sha256: "81b7b85f2376815c4f59b1aa323887b62e16ce8b67555c2e1577dc23f2a82000",
+    binarySha256: "947e2942d6a59922d80190d23b12f3ade8da16e23e3bd937182a48993b7c00db",
     archive: true,
   }),
   "linux-x64": Object.freeze({
     name: "cloudflared-linux-amd64",
-    sha256: "fcfb02b575a52ca1af2e3267af4e1517bcdeb30ac48c834c69abaed3c0576ad2",
-    binarySha256: "fcfb02b575a52ca1af2e3267af4e1517bcdeb30ac48c834c69abaed3c0576ad2",
+    sha256: "053b80b0a23031a038fdbf3c073f59f82b8f1f152aa67971d7383ffafc0dbab0",
+    binarySha256: "053b80b0a23031a038fdbf3c073f59f82b8f1f152aa67971d7383ffafc0dbab0",
     archive: false,
   }),
   "win32-x64": Object.freeze({
     name: "cloudflared-windows-amd64.exe",
-    sha256: "c29eee2b121f5436a642eed69fd9767da7e7b8c510fa50aaa130337f931357b5",
-    binarySha256: "c29eee2b121f5436a642eed69fd9767da7e7b8c510fa50aaa130337f931357b5",
+    sha256: "76b2805253d0d6ffacb092a7acfbee99e7af6917835c0c5410e23f3ef5052da2",
+    binarySha256: "76b2805253d0d6ffacb092a7acfbee99e7af6917835c0c5410e23f3ef5052da2",
     archive: false,
   }),
 });
@@ -161,24 +180,69 @@ function targetRunsOnHost(target, platform = process.platform, arch = process.ar
   return target === `${platform}-${arch}`;
 }
 
-function executableHasPinnedVersion(binary, target) {
+/** `cloudflared version` runs a local, already-checksum-verified executable and
+ * prints in ~0.2s warm / ~1.5s cold, so 10s looked generous.  It is not: on
+ * Oct 1, 2026 a `package:mac:local` inside `~/apps/update-botfleet.sh` died at
+ * a host load average in the 400-700s with the swap nearly full, where a child
+ * process can miss its 10s slice while waiting for a CPU, and the failure was
+ * reported as a version mismatch -- sending the reader after a corrupt
+ * download instead of a saturated machine.  Sixty seconds with a single retry
+ * keeps the warm path instant and spends patience only where a timeout is
+ * actually the answer.  The probe itself now lives in `native-version-probe.mjs`
+ * so the CUA driver packaging step cannot reintroduce a smaller copy of the
+ * same bug; these two names stay as the cloudflared-facing spelling. */
+export const VERSION_PROBE_TIMEOUT_MS = NATIVE_PROBE_TIMEOUT_MS;
+export const VERSION_PROBE_ATTEMPTS = NATIVE_PROBE_ATTEMPTS;
+
+/** `spawnSync` reports a timeout as `error.code === "ETIMEDOUT"` with the
+ * child killed, so `status` is null and `signal` is set -- none of which the
+ * single boolean this replaced could distinguish from a real version
+ * mismatch.  Classify the four ways the probe can fail so the thrown message
+ * names the cause a person can act on.  The matched version is dropped on
+ * purpose: it is a constant for cloudflared, so returning it would only give
+ * callers a second way to spell the answer already carried by `ok`. */
+function matchCloudflaredVersionLine(output) {
+  const line = String(output ?? "")
+    .split("\n")
+    .map((entry) => entry.trim())
+    .find((entry) => entry.startsWith(`cloudflared version ${CLOUDFLARED_VERSION} `));
+  return line ? CLOUDFLARED_VERSION : null;
+}
+
+export function classifyVersionProbe(result = {}) {
+  const probe = classifyNativeProbe(result, matchCloudflaredVersionLine);
+  return { ok: probe.ok, reason: probe.reason };
+}
+
+/** Ask the staged executable for its version, retrying only a timeout.  A
+ * missing or non-executable binary and a non-zero exit are deterministic and
+ * would just make the second attempt fail the same way one second later. */
+export function probePinnedVersion(binary, options = {}) {
+  return probeNativeVersion(binary, {
+    ...options,
+    args: ["version"],
+    matchVersion: matchCloudflaredVersionLine,
+  });
+}
+
+/** The original sentence is kept verbatim so existing logs and board history
+ * still match, with the probe's own evidence appended. */
+export function versionProbeFailureMessage(target, probe = {}) {
+  return nativeProbeFailureMessage(
+    `${target} executable did not identify as cloudflared ${CLOUDFLARED_VERSION}`,
+    probe,
+    { causes: { version: () => "it ran but did not report the pinned version" } },
+  );
+}
+
+export function verifyCloudflaredExecutable(binary, target, options = {}) {
+  verifyPinnedBinary(readFileSync(binary), target);
   // A dual-architecture macOS package is prepared in one invocation. Do not
   // assume Rosetta is installed or attempt to execute the other architecture;
   // its executable bytes are still pinned and its Mach-O header is checked.
-  if (!targetRunsOnHost(target)) return true;
-  const result = spawnSync(binary, ["version"], {
-    encoding: "utf8",
-    windowsHide: true,
-    timeout: 10_000,
-  });
-  return result.status === 0 && `${result.stdout}\n${result.stderr}`.includes(CLOUDFLARED_VERSION);
-}
-
-export function verifyCloudflaredExecutable(binary, target) {
-  verifyPinnedBinary(readFileSync(binary), target);
-  if (!executableHasPinnedVersion(binary, target)) {
-    throw new Error(`${target} executable did not identify as cloudflared ${CLOUDFLARED_VERSION}`);
-  }
+  if (!targetRunsOnHost(target)) return;
+  const probe = probePinnedVersion(binary, options);
+  if (!probe.ok) throw new Error(versionProbeFailureMessage(target, probe));
 }
 
 function executableIsCurrent(binary, manifestFile, target) {
@@ -197,15 +261,93 @@ function extractionFailure(result) {
   return result.error?.message ?? String(result.stderr || result.stdout || `exit status ${result.status}`).trim();
 }
 
+/** A network failure a person can act on: "timed out" and "getaddrinfo
+ * ENOTFOUND" are different problems with different fixes. */
+export function describeDownloadFailure(error, timeoutMs = DOWNLOAD_TIMEOUT_MS) {
+  if (error instanceof Error) {
+    if (error.name === "TimeoutError" || error.name === "AbortError") {
+      return `the download timed out after ${Math.round(timeoutMs / 1000)}s`;
+    }
+    return error.message || "the download failed";
+  }
+  const message = String(error ?? "");
+  return message || "the download failed";
+}
+
+/**
+ * Fetch a release asset, with retries.  A slow link drops one transfer and
+ * completes the next, so a single attempt (the prior behaviour: one 120s
+ * fetch, no retry) reports a permanent failure for something that is merely
+ * intermittent -- the Sep 17 update outage traced to exactly this.
+ */
+export async function downloadRelease(url, label, options = {}) {
+  const {
+    fetchImpl = fetch,
+    attempts = DOWNLOAD_ATTEMPTS,
+    timeoutMs = DOWNLOAD_TIMEOUT_MS,
+    retryDelayMs = DOWNLOAD_RETRY_DELAY_MS,
+    wait = sleep,
+    log = console.error,
+  } = options;
+  let failure = "the download failed";
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      const response = await fetchImpl(url, { redirect: "follow", signal: AbortSignal.timeout(timeoutMs) });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return Buffer.from(await response.arrayBuffer());
+    } catch (error) {
+      failure = describeDownloadFailure(error, timeoutMs);
+      if (attempt < attempts) {
+        log(`${label} download attempt ${attempt} failed: ${failure} — retrying`);
+        await wait(retryDelayMs);
+      }
+    }
+  }
+  throw new Error(`could not download ${label}: ${failure}`);
+}
+
+/** Where a successfully downloaded release archive is kept for the next
+ * `stageTarget` call to reuse, across dev runs and packaging jobs alike.
+ * `OMB_CLOUDFLARED_ARCHIVE_DIR` (documented in third_party/cloudflared/README.md)
+ * still wins when set; nothing set it by default before this, so the cache
+ * was always empty and every run re-downloaded. */
+export function cloudflaredArchiveCacheDirectory({
+  platform = process.platform,
+  env = process.env,
+  home = homedir(),
+} = {}) {
+  if (env.OMB_CLOUDFLARED_ARCHIVE_DIR) return env.OMB_CLOUDFLARED_ARCHIVE_DIR;
+  if (platform === "darwin") return join(home, "Library", "Caches", "BotFleet", "cloudflared-archives");
+  if (platform === "win32") {
+    const local = env.LOCALAPPDATA || join(home, "AppData", "Local");
+    return join(local, "BotFleet", "Cache", "cloudflared-archives");
+  }
+  return join(env.XDG_CACHE_HOME || join(home, ".cache"), "botfleet", "cloudflared-archives");
+}
+
 async function releaseBytes(asset) {
-  const cacheDirectory = process.env.OMB_CLOUDFLARED_ARCHIVE_DIR;
-  const cached = cacheDirectory ? join(cacheDirectory, asset.name) : "";
-  if (cached && existsSync(cached)) return readFileSync(cached);
+  const cacheDirectory = cloudflaredArchiveCacheDirectory();
+  const cached = join(cacheDirectory, asset.name);
+  if (existsSync(cached)) {
+    const bytes = readFileSync(cached);
+    if (sha256(bytes) === asset.sha256) return bytes;
+    console.error(`cached ${asset.name} failed checksum verification — re-downloading`);
+  }
 
   const url = `https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/${asset.name}`;
-  const response = await fetch(url, { redirect: "follow", signal: AbortSignal.timeout(120_000) });
-  if (!response.ok) throw new Error(`could not download ${asset.name}: HTTP ${response.status}`);
-  return Buffer.from(await response.arrayBuffer());
+  const bytes = await downloadRelease(url, asset.name);
+
+  try {
+    mkdirSync(cacheDirectory, { recursive: true });
+    const staged = join(cacheDirectory, `.${asset.name}-${process.pid}-${Date.now()}`);
+    writeFileSync(staged, bytes, { mode: 0o600 });
+    renameSync(staged, cached);
+  } catch (error) {
+    // A cache write is an optimization, not a requirement -- the download
+    // already succeeded and its checksum is verified by the caller.
+    console.error(`could not cache ${asset.name} at ${cacheDirectory}: ${error?.message ?? error}`);
+  }
+  return bytes;
 }
 
 async function stageTarget(root, target) {
@@ -281,6 +423,29 @@ export async function prepareCloudflared({
   }
 }
 
-if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
-  await prepareCloudflared(parsePrepareCloudflaredArgs(process.argv.slice(2)));
+/** The Mac self-updater always packages `--arm64 --dir` for the machine
+ * running the update (`update-botfleet-mac.mjs` -> `pnpm package:mac:local`),
+ * so staging both darwin targets there downloads darwin-x64 only to throw it
+ * away every run.  `package:mac:local` has no CLI surface to add `--current`
+ * to (`build:cloudflared` is shared with `package:mac:release`, which must
+ * keep building both architectures for the actual release), so the updater
+ * sets this environment variable instead. */
+export function currentOnlyFromEnv(env = process.env) {
+  return env.OMB_CLOUDFLARED_CURRENT === "1";
+}
+
+// Compare physical paths.  Node's ESM loader realpaths the entry module, so an
+// invocation through a symlinked directory (macOS /var -> /private/var) never
+// matches process.argv[1] when compared as text.
+function isEntryModule() {
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (isEntryModule()) {
+  const args = parsePrepareCloudflaredArgs(process.argv.slice(2));
+  await prepareCloudflared({ current: args.current || currentOnlyFromEnv() });
 }

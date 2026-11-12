@@ -25,6 +25,12 @@ export function ActivityRun({
   const running = messages.some((message) => message.tool?.ok === undefined);
   const [open, setOpen] = useState(failed || forceOpen);
 
+  const firstAt = messages[0]?.at;
+  const lastAt = messages[messages.length - 1]?.at;
+  const durationSec = firstAt && lastAt && lastAt - firstAt >= 1000
+    ? Math.round((lastAt - firstAt) / 1000)
+    : 0;
+
   useEffect(() => {
     if (failed || forceOpen) setOpen(true);
   }, [failed, forceOpen]);
@@ -41,6 +47,11 @@ export function ActivityRun({
           >
             <ChevronDown size={14} className="text-ink-secondary" />
             <span>{describeRun(messages)}</span>
+            {durationSec > 0 && (
+              <span className="text-[11px] text-ink-secondary/70 font-mono font-normal">
+                · {durationSec}s
+              </span>
+            )}
           </button>
           <button
             type="button"
@@ -63,7 +74,7 @@ export function ActivityRun({
         type="button"
         onClick={() => setOpen(true)}
         aria-expanded={false}
-        title="Show all steps"
+        title="Show All Steps"
         className={cn(
           "group flex items-center gap-2.5 rounded-xl border border-hairline/40 bg-panel px-3.5 py-2 text-[13px] transition-all hover:bg-raised hover:border-hairline/80 shadow-xs",
           failed ? "border-danger/30 text-danger bg-danger/5" : "text-ink-secondary",
@@ -78,7 +89,12 @@ export function ActivityRun({
             <Check size={13} className="text-success" />
           )}
         </div>
-        <span className="max-w-[480px] font-medium text-ink truncate">{describeRun(messages)}</span>
+        <span className="max-w-[480px] font-medium text-ink truncate" title={describeRun(messages)}>{describeRun(messages)}</span>
+        {durationSec > 0 && (
+          <span className="text-[11px] text-ink-secondary/70 font-mono font-normal shrink-0">
+            {durationSec}s
+          </span>
+        )}
         <div className="flex items-center gap-1 text-[11px] font-medium text-accent opacity-90 group-hover:opacity-100">
           <span>Show {messages.length}</span>
           <ChevronRight size={13} />

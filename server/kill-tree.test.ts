@@ -41,15 +41,34 @@ describe("killCliTree", () => {
         `const c = require("node:child_process").spawn(process.execPath, ["-e", ${JSON.stringify(IDLE)}], { stdio: "ignore" });` +
           `console.log(c.pid); ${IDLE}`,
       ],
-      { stdio: ["ignore", "pipe", "ignore"], detached: true },
+      {
+        stdio: ["ignore", "pipe", "ignore"],
+        detached: true,
+        // Node 26 prints "NO_COLOR is ignored due to FORCE_COLOR" on stdout
+        // when both are set, which used to make Number(first-chunk) NaN.
+        env: (() => {
+          const env = { ...process.env };
+          delete env.FORCE_COLOR;
+          delete env.NO_COLOR;
+          return env;
+        })(),
+      },
     );
     let grandchild = 0;
     try {
       grandchild = await new Promise<number>((resolve, reject) => {
         const timer = setTimeout(() => reject(new Error("helper did not report its pid")), 5_000);
-        parent.stdout!.once("data", (chunk) => {
-          clearTimeout(timer);
-          resolve(Number(String(chunk).trim()));
+        let buf = "";
+        parent.stdout!.on("data", (chunk) => {
+          buf += String(chunk);
+          for (const line of buf.split(/\r?\n/)) {
+            const pid = Number(line.trim());
+            if (Number.isInteger(pid) && pid > 0) {
+              clearTimeout(timer);
+              resolve(pid);
+              return;
+            }
+          }
         });
       });
       expect(grandchild).toBeGreaterThan(0);

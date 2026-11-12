@@ -1,0 +1,73 @@
+name: Infisical secrets
+description: >-
+  Fetch named secrets from Infisical using a dedicated service token,
+  mask them, and export them into $GITHUB_ENV -- falling
+  back to a same-named GH_FALLBACK_<NAME> step env var and warning (or
+  failing, for a name listed in `required`) when a name stays empty
+  everywhere.  Wraps scripts/infisical-fetch.mjs, a dependency-free Node
+  script, instead of the Infisical CLI: the CLI's only install path
+  (`brew install infisical/get-cli/infisical`) is macOS-only, and this
+  action also runs on windows-latest and ubuntu-24.04.
+  Values are never printed except immediately after the `::add-mask::`
+  workflow command for that exact value, which is what scrubs it from the
+  rendered log from that point on.
+
+  NOTE: Usage-Monitor carries a parallel, not-yet-deduplicated copy of this
+  fetch inlined in its own .github/workflows/ios-ship.yml (lines 151-185 at
+  authoring time).  This action does not solve that cross-repo duplication
+  -- a shared action would need its own repository, which the fleet's
+  no-new-GitHub-repos rule does not permit today.
+
+inputs:
+  names:
+    description: Space- or comma-separated Infisical secret names to fetch.
+    required: true
+  required:
+    description: >-
+      Space- or comma-separated subset of `names` that must resolve (from
+      the vault or its GH_FALLBACK_<NAME>) or the action fails the job.
+      Leave empty when every name is best-effort.
+    required: false
+    default: ""
+  project-id:
+    description: Infisical project (workspace) id.
+    required: true
+  environment:
+    description: Infisical environment slug.
+    required: false
+    default: prod
+  secret-path:
+    description: Infisical secret path.
+    required: false
+    default: /
+  token:
+    description: >-
+      Dedicated read-only Infisical service token scoped to this use case,
+      project, environment and exact folders, including approved reference
+      targets; no machine identity fallback is available.
+    required: false
+    default: ""
+  site-url:
+    description: Infisical site URL.
+    required: false
+    default: https://app.infisical.com
+
+runs:
+  using: composite
+  steps:
+    # A GH_FALLBACK_<NAME> value for each requested name is passed by the
+    # calling step's own `env:` block -- not an input here, since the set of
+    # names differs per caller and Actions has no way to declare "one input
+    # per entry of another input".  Those env vars are visible to this run
+    # step because they were set on the very step that invokes this action.
+    - name: Fetch Infisical secrets (with GitHub secret fallback)
+      shell: bash
+      env:
+        INFISICAL_NAMES: ${{ inputs.names }}
+        INFISICAL_REQUIRED: ${{ inputs.required }}
+        INFISICAL_PROJECT_ID: ${{ inputs.project-id }}
+        INFISICAL_ENVIRONMENT: ${{ inputs.environment }}
+        INFISICAL_SECRET_PATH: ${{ inputs.secret-path }}
+        INFISICAL_TOKEN: ${{ inputs.token }}
+        INFISICAL_SITE_URL: ${{ inputs.site-url }}
+      run: node "$GITHUB_ACTION_PATH/../../../scripts/infisical-fetch.mjs"

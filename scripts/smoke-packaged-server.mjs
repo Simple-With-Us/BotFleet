@@ -11,29 +11,82 @@
 // test passes on a build that would be dead in the field — which is precisely
 // how the bug escaped. The copy is the whole point; do not "simplify" it away.
 import { execFile, spawn } from "node:child_process";
-import { cpSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { assertRuntimeExecutable, resolveRuntime } from "./smoke-runtime-mode.mjs";
+import { packagedSmokeConfig } from "./smoke-packaged-fixture.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+const port = 21000 + Math.floor(Math.random() * 9000);
+
+// BF-1991: run the gate on the runtime production uses.  OMB_SMOKE_RUNTIME
+// names the packaged binary, and it is booted with ELECTRON_RUN_AS_NODE=1
+// exactly the way the shipped harness boots it.  An unnamed runtime is a
+// bundle check against the runner's Node, and it is labelled as one.  A NAMED
+// runtime that cannot be executed is an error, never a fallback: silently
+// falling back would let a bundle check's result pass as a runtime pass.
+//
+// Resolved BEFORE the copy, so a broken runtime fails the gate without
+// leaving a staging tree behind, and before the spawn, so the mode is in the
+// log even when the gate fails.
+const runtime = (() => {
+  try {
+    const resolved = resolveRuntime(process.env.OMB_SMOKE_RUNTIME);
+    console.log(`smoke mode: ${resolved.mode} (${resolved.label})`);
+    console.log(`smoke gate kind: ${resolved.kind}`);
+    console.log(`smoke runtime: ${resolved.command}`);
+    if (resolved.mode === "runtime") {
+      // Existence and the executable bit are not enough -- a binary built for
+      // another architecture exists, is executable, and still dies with "Bad
+      // CPU type in executable".  Exec it once before the gate claims
+      // anything about it.
+      assertRuntimeExecutable(resolved.command, { env: resolved.env });
+    }
+    return resolved;
+  } catch (error) {
+    console.error(`packaged server smoke failed: ${error.message}`);
+    process.exit(1);
+  }
+})();
+
 const staging = mkdtempSync(join(tmpdir(), "omb-smoke-"));
 const home = mkdtempSync(join(tmpdir(), "omb-smoke-home-"));
-const port = 21000 + Math.floor(Math.random() * 9000);
+const dataDir = join(home, ".botfleet");
+mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+// Keep package validation independent of host CLI discovery and authentication.
+writeFileSync(
+  join(dataDir, "config.json"),
+  JSON.stringify(packagedSmokeConfig(home)),
+  { mode: 0o600 },
+);
 
 // OMB_SMOKE_DIST lets the release workflow aim this at a packaged app's
 // Resources/server tree instead of the repo build.
 cpSync(process.env.OMB_SMOKE_DIST ?? join(root, "dist-server"), join(staging, "server"), { recursive: true });
 
-const child = spawn(process.execPath, [join(staging, "server", "index.js")], {
+const child = spawn(runtime.command, [join(staging, "server", "index.js")], {
   cwd: staging,
   env: {
     ...(process.env.PATH ? { PATH: process.env.PATH } : {}),
     ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
+    ...runtime.env,
     HOME: home,
     USERPROFILE: home,
     OMB_PORT: String(port),
+    // The smoke boots a real harness against a throwaway HOME, but container
+    // runtimes are machine-wide and the Local VM container name follows the OS
+    // username, so the boot-time probe would inspect the owner's real
+    // container.  Switch them off (server/container-runtime-guard.ts).
+    BOTFLEET_DISABLE_CONTAINER_RUNTIME: "1",
+    DOCKER_HOST: "unix:///nonexistent.sock",
+    CONTAINER_HOST: "unix:///nonexistent.sock",
+    // This fake loopback DSN exercises SDK loading without contacting the
+    // owner's Sentry project.  The staged server has no node_modules.
+    SENTRY_DSN: "https://0123456789abcdef0123456789abcdef@127.0.0.1:1/1",
+    SENTRY_TRACES_SAMPLE_RATE: "0",
   },
   stdio: ["ignore", "pipe", "pipe"],
 });
@@ -58,13 +111,18 @@ const cleanup = () => {
   }
 };
 
-const deadline = Date.now() + 45_000;
+// Match the packaged desktop's owned-child boot allowance in electron/main.mjs.
+// This remains a readiness and packaging check, not a startup performance benchmark.
+const deadline = Date.now() + 60_000;
 let listening = false;
 while (Date.now() < deadline) {
   if (child.exitCode !== null) break;
   try {
     const res = await fetch(`http://127.0.0.1:${port}/api/health`);
-    if (res.ok) {
+    // Health answers from the moment the port binds, which is before the boot
+    // work is done — the checks below all hit routes that 503 until it is, so
+    // wait for `ready` rather than for the first answer.
+    if (res.ok && (await res.json().catch(() => null))?.ready !== false) {
       listening = true;
       break;
     }
@@ -72,6 +130,40 @@ while (Date.now() < deadline) {
     /* not up yet */
   }
   await new Promise((resolve) => setTimeout(resolve, 300));
+}
+
+// Authenticated identity must describe the copied package, and the public
+// health response must not disclose the private owner nonce or build data.
+if (listening) {
+  const owner = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8"));
+  const expected = JSON.parse(readFileSync(join(staging, "server", "build-identity.json"), "utf8"));
+  const publicHealth = await (await fetch(`http://127.0.0.1:${port}/api/health`)).json();
+  const denied = await fetch(`http://127.0.0.1:${port}/api/runtime`);
+  const diagnostic = await fetch(`http://127.0.0.1:${port}/api/runtime`, {
+    headers: { authorization: `Bearer ${owner.nonce}` },
+  });
+  const actual = await diagnostic.json();
+  if (denied.status !== 401 || !diagnostic.ok || actual.pid !== child.pid ||
+      actual.sourceCommit !== expected.sourceCommit || actual.apiVersion !== expected.apiVersion ||
+      actual.dataOwner?.pid !== child.pid || actual.dataOwner?.port !== port ||
+      typeof actual.safeToRestart !== "boolean" || JSON.stringify(publicHealth).includes(owner.nonce) ||
+      publicHealth.sourceCommit !== undefined || JSON.stringify(actual).includes(owner.nonce)) {
+    cleanup();
+    throw new Error("Packaged runtime identity, authentication, or redaction contract failed");
+  }
+
+  // Health can pass even if the optional SDK failed to load.  Assert its
+  // actual packaged initialization path without emitting a test event.
+  const observabilityResponse = await fetch(`http://127.0.0.1:${port}/api/observability`, {
+    headers: { authorization: `Bearer ${owner.nonce}` },
+  });
+  const observability = observabilityResponse.ok ? await observabilityResponse.json() : null;
+  if (!observabilityResponse.ok || !observability?.configured || !observability?.enabled ||
+      observability?.source !== "env" || observability?.lastError !== null ||
+      observability?.host !== "127.0.0.1:1" || observability?.projectId !== "1") {
+    cleanup();
+    throw new Error("Packaged Sentry SDK did not initialize from the synthetic loopback DSN");
+  }
 }
 
 // Serving /api/health is necessary but nowhere near sufficient. Bundling
@@ -94,7 +186,13 @@ writeFileSync(
 
 let proxyReport = null;
 try {
-  const { stdout } = await promisify(execFile)(process.execPath, [probe], { cwd: staging });
+  const { stdout } = await promisify(execFile)(runtime.command, [probe], {
+    cwd: staging,
+    // The same runtime the server booted on.  The probe asks where the server
+    // would resolve its siblings, so it has to answer from the same tree AND
+    // the same runtime that resolved them.
+    env: { ...process.env, ...runtime.env },
+  });
   proxyReport = JSON.parse(stdout);
 } catch (error) {
   proxyReport = { error: String((error && error.message) || error) };
@@ -105,11 +203,12 @@ try {
 // dependencies and that shutdown lets the final JSON-RPC frame drain.
 let mcpReport = null;
 if (listening) {
-  const mcp = spawn(process.execPath, [join(staging, "server", "mcp-server.js")], {
+  const mcp = spawn(runtime.command, [join(staging, "server", "mcp-server.js")], {
     cwd: staging,
     env: {
       ...(process.env.PATH ? { PATH: process.env.PATH } : {}),
       ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
+      ...runtime.env,
       HOME: home,
       USERPROFILE: home,
       OMB_PORT: String(port),
@@ -197,3 +296,4 @@ const count = Object.keys(proxyReport.resolved).length;
 console.log(`packaged server started with no node_modules in reach (port ${port}) ✓`);
 console.log(`all ${count} spawned proxy paths resolve inside the packaged server dir ✓`);
 console.log("packaged MCP stdio server reached the API and flushed its final frames ✓");
+console.log(`smoke gate result: ${runtime.mode} (${runtime.label}) on ${runtime.command}`);

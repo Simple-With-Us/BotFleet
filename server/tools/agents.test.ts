@@ -1,0 +1,611 @@
+// One implementation, two lanes.
+//
+// A CLI bot reaches `list_bots` over the loopback + COMMS_TOKEN hop into
+// `GET /api/internal/agents`; a MiniMax bot reaches it in-process through
+// the turn tool host.  Both must run the SAME code, because the moment they
+// do not, they drift — and they did: the old executor filtered on section
+// and `!hidden` only, so it offered a bot its own row and never told it a
+// peer was busy, which cost a wasted round every time.
+//
+// These tests pin the join.  `listAgentsResponse` is the endpoint body that
+// `index.ts` exports as `executeListAgentsRequest`; the host receives that
+// same function as a dependency, so asserting the host's rows equal
+// `listAgentsResponse`'s rows is asserting there is one implementation.
+import { describe, expect, it, vi } from "vitest";
+
+import {
+  createAgentTools,
+  listAgentsResponse,
+  selectPeerBots,
+  type AgentBot,
+  type AgentRequestResult,
+  type AgentToolCallContext,
+  type AgentToolDeps,
+  type CoordinateBotsRequestInput,
+  type CreateBotRequestInput,
+  type AssignmentStatusRequestInput,
+  type RequestCredentialRequestInput,
+  type RoutineRequestInput,
+} from "./agents.ts";
+
+const bots: AgentBot[] = [
+  { id: "bot-self", name: "self", section: "ops", modelSelection: { model: "m" }, title: "self title" },
+  { id: "bot-peer", name: "peer", section: "ops", modelSelection: { model: "m" }, title: "peer title" },
+  { id: "bot-busy", name: "busy", section: "ops", modelSelection: { model: "m" }, busy: true },
+  { id: "bot-hidden", name: "hidden", section: "ops", modelSelection: { model: "m" }, hidden: true },
+  { id: "bot-other", name: "other", section: "research", modelSelection: { model: "m" } },
+];
+
+const routinesBody = {
+  now: "2026-09-12T10:00:00.000Z",
+  timeZone: "America/Chicago",
+  routines: [{ id: "routine-1", name: "Morning brief" }],
+};
+
+const deps = (over: Partial<AgentToolDeps> = {}): AgentToolDeps => ({
+  // The real endpoint body, bound to a fixed roster instead of the live
+  // store — the same function `index.ts` binds to `store.bots`.
+  executeListAgentsRequest: ({ selfId }) => listAgentsResponse(selfId, bots),
+  executeCoordinateBotsRequest: vi.fn(
+    async (_input: CoordinateBotsRequestInput): Promise<AgentRequestResult> => ({
+      status: 200,
+      body: { message: "Handed off.", assignments: [{ id: "asg-1" }] },
+    }),
+  ),
+  executeListRoutinesRequest: () => ({ status: 200, body: { ...routinesBody } }),
+  executeAssignmentStatusRequest: vi.fn(
+    async (_input: AssignmentStatusRequestInput): Promise<AgentRequestResult> => ({
+      status: 200,
+      body: { assignments: [] },
+    }),
+  ),
+  executeCreateBotRequest: vi.fn(
+    async (_input: CreateBotRequestInput): Promise<AgentRequestResult> => ({
+      status: 201,
+      body: { id: "bot-new", name: "Pixel", section: "Work" },
+    }),
+  ),
+  executeRequestCredentialRequest: vi.fn(
+    async (_input: RequestCredentialRequestInput): Promise<AgentRequestResult> => ({
+      status: 201,
+      body: { messageId: "msg-1", label: "OpenCode API key" },
+    }),
+  ),
+  executeRequestSignInRequest: vi.fn(
+    async (): Promise<AgentRequestResult> => ({
+      status: 201,
+      body: { messageId: "msg-sign", site: "example.com" },
+    }),
+  ),
+  executeRoutineRequestRequest: vi.fn(
+    async (_input: RoutineRequestInput): Promise<AgentRequestResult> => ({
+      status: 201,
+      body: { requestId: "req-1", summary: "Weekdays at 09:00" },
+    }),
+  ),
+  ...over,
+});
+
+const ctx = (over: Partial<AgentToolCallContext> = {}): AgentToolCallContext => ({
+  botId: "bot-self",
+  threadId: "thread-1",
+  commsDepth: 0,
+  ...over,
+});
+
+const runtime = {
+  signal: new AbortController().signal,
+  requestApproval: async () => "unavailable" as const,
+};
+
+const call = (name: string, args: Record<string, unknown> = {}) => ({ id: "1", name, arguments: args });
+
+describe("selectPeerBots is the only peer filter", () => {
+  it("excludes the caller, hidden bots and other sections, and reports busy", () => {
+    const rows = selectPeerBots("bot-self", bots)!;
+    expect(rows.map((r) => r.id)).toEqual(["bot-peer", "bot-busy"]);
+    expect(rows.find((r) => r.id === "bot-busy")?.busy).toBe(true);
+    expect(rows.find((r) => r.id === "bot-peer")?.busy).toBe(false);
+    expect(rows.find((r) => r.id === "bot-peer")?.title).toBe("peer title");
+  });
+
+  it("refuses an unknown sender rather than leaking the whole roster", () => {
+    expect(selectPeerBots("gone", bots)).toBeNull();
+    expect(listAgentsResponse("gone", bots)).toEqual({ status: 403, body: { error: "unknown sender" } });
+  });
+});
+
+describe("list_bots is the same implementation on both lanes", () => {
+  it("returns exactly the rows the /api/internal/agents body returns", async () => {
+    const tools = createAgentTools(deps());
+    const outcome = await tools.list_bots(call("list_bots"), ctx(), runtime);
+    expect(outcome.kind).toBe("result");
+    // The MCP lane serves `body.bots` verbatim over the hop; the host
+    // serialises the same array.  Equality here IS the parity assertion.
+    expect(JSON.parse(outcome.content).bots).toEqual(listAgentsResponse("bot-self", bots).body.bots);
+  });
+
+  it("still carries `section`, which the pre-registry payload had", async () => {
+    // Regression: the refactor out of `host.ts` dropped `section` from the
+    // payload.  It is wire-visible — in-flight conversations quote it back —
+    // so `{ section, bots }` is the shape, not `{ bots }`.
+    const tools = createAgentTools(deps());
+    const outcome = await tools.list_bots(call("list_bots"), ctx(), runtime);
+    const payload = JSON.parse(outcome.content);
+    expect(payload.section).toBe("ops");
+    expect(payload.section).toBe(listAgentsResponse("bot-self", bots).body.section);
+    expect(Object.keys(payload)).toEqual(["section", "bots"]);
+  });
+
+  it("excludes the caller — a bot asking itself for help is a wasted round", async () => {
+    const tools = createAgentTools(deps());
+    const outcome = await tools.list_bots(call("list_bots"), ctx(), runtime);
+    const ids = JSON.parse(outcome.content).bots.map((b: { id: string }) => b.id);
+    expect(ids).not.toContain("bot-self");
+    expect(ids).toContain("bot-peer");
+  });
+
+  it("reports busy identically, so the model does not ask a peer that cannot answer", async () => {
+    const tools = createAgentTools(deps());
+    const outcome = await tools.list_bots(call("list_bots"), ctx(), runtime);
+    const rows: Array<{ id: string; busy: boolean }> = JSON.parse(outcome.content).bots;
+    expect(rows.find((b) => b.id === "bot-busy")?.busy).toBe(true);
+    expect(rows.find((b) => b.id === "bot-peer")?.busy).toBe(false);
+  });
+
+  it("surfaces the endpoint's own refusal when the caller no longer exists", async () => {
+    const tools = createAgentTools(deps());
+    const outcome = await tools.list_bots(call("list_bots"), ctx({ botId: "gone" }), runtime);
+    expect(outcome.kind).toBe("error");
+    expect(JSON.parse(outcome.content).error).toBe("unknown sender");
+  });
+});
+
+describe("coordinate_bots goes through executeCoordinateBotsRequest", () => {
+  it("passes the turn's own identity, never the model's", async () => {
+    const executeCoordinateBotsRequest = vi.fn(
+      async (): Promise<AgentRequestResult> => ({
+        status: 200,
+        body: { message: "Handed to @peer.", assignments: [{ id: "asg-1" }] },
+      }),
+    );
+    const tools = createAgentTools(deps({ executeCoordinateBotsRequest }));
+    const outcome = await tools.coordinate_bots(
+      call("coordinate_bots", { bot_ids: ["@peer"], message: "summarize", fromBotId: "bot-other" }),
+      ctx({ commsDepth: 1 }),
+      runtime,
+    );
+    expect(executeCoordinateBotsRequest).toHaveBeenCalledWith({
+      fromBotId: "bot-self",
+      botIds: ["bot-peer"],
+      message: "summarize",
+      depth: 1,
+      fromThreadId: "thread-1",
+    });
+    expect(outcome.kind).toBe("result");
+    expect(outcome.content).toContain("Handed to @peer.");
+  });
+
+  it("accepts a single bot_id and the old task spelling", async () => {
+    const executeCoordinateBotsRequest = vi.fn(
+      async (_input: CoordinateBotsRequestInput): Promise<AgentRequestResult> => ({
+        status: 200,
+        body: { message: "Handed off.", assignments: [] },
+      }),
+    );
+    const tools = createAgentTools(deps({ executeCoordinateBotsRequest }));
+    await tools.coordinate_bots(call("coordinate_bots", { bot_id: "bot-peer", message: "x" }), ctx(), runtime);
+    await tools.coordinate_bots(call("coordinate_bots", { bot_ids: ["bot-peer"], task: "y" }), ctx(), runtime);
+    expect(executeCoordinateBotsRequest.mock.calls.map(([input]) => input.message)).toEqual(["x", "y"]);
+  });
+
+  it("resolves a target only against the roster the model was shown", async () => {
+    const executeCoordinateBotsRequest = vi.fn(
+      async (): Promise<AgentRequestResult> => ({ status: 200, body: { message: "ok", assignments: [] } }),
+    );
+    const tools = createAgentTools(deps({ executeCoordinateBotsRequest }));
+    for (const target of ["bot-hidden", "bot-other", "bot-self"]) {
+      const outcome = await tools.coordinate_bots(call("coordinate_bots", { bot_ids: [target], message: "x" }), ctx(), runtime);
+      expect(outcome.kind, target).toBe("error");
+      expect(JSON.parse(outcome.content).error).toMatch(/no bot matches/);
+    }
+    expect(executeCoordinateBotsRequest).not.toHaveBeenCalled();
+  });
+
+  it("names every token that matched no peer, so one retry can fix them all", async () => {
+    const executeCoordinateBotsRequest = vi.fn(
+      async (): Promise<AgentRequestResult> => ({ status: 200, body: { message: "ok", assignments: [] } }),
+    );
+    const tools = createAgentTools(deps({ executeCoordinateBotsRequest }));
+    // "@peer" is on the roster; the other three are a hidden bot, another section's bot and the caller itself,
+    // and "bot-hidden" is said twice.
+    const outcome = await tools.coordinate_bots(
+      call("coordinate_bots", { bot_ids: ["bot-hidden", "@peer", "bot-other", "bot-hidden", "bot-self"], message: "x" }),
+      ctx(),
+      runtime,
+    );
+    expect(outcome.kind).toBe("error");
+    const expected = "no bot matches bot-hidden; no bot matches bot-other; no bot matches bot-self";
+    expect(JSON.parse(outcome.content).error).toBe(expected);
+    expect(outcome.detail).toBe(expected);
+    expect(executeCoordinateBotsRequest).not.toHaveBeenCalled();
+  });
+
+  it("passes a refusal that names several bots straight through", async () => {
+    const tools = createAgentTools(
+      deps({
+        executeCoordinateBotsRequest: async () => ({
+          status: 200,
+          body: { error: "Sleepy is switched off; Archived is hidden" },
+        }),
+      }),
+    );
+    const outcome = await tools.coordinate_bots(call("coordinate_bots", { bot_ids: ["@peer", "@busy"], message: "x" }), ctx(), runtime);
+    expect(outcome.kind).toBe("error");
+    expect(JSON.parse(outcome.content).error).toBe("Sleepy is switched off; Archived is hidden");
+    expect(outcome.detail).toBe("Sleepy is switched off; Archived is hidden");
+  });
+
+  it("shows the model which bots were not handed the work when only some took it", async () => {
+    const body = {
+      message: "Handed to @peer.  The result comes back on this conversation when the work finishes.  Not handed off: busy is switched off.",
+      assignments: [{ id: "asg-1" }],
+      errors: ["busy is switched off"],
+    };
+    const tools = createAgentTools(deps({ executeCoordinateBotsRequest: async () => ({ status: 200, body }) }));
+    const outcome = await tools.coordinate_bots(call("coordinate_bots", { bot_ids: ["@peer", "@busy"], message: "x" }), ctx(), runtime);
+    expect(outcome.kind).toBe("result");
+    expect(JSON.parse(outcome.content)).toEqual(body);
+    expect(outcome.detail).toBe(body.message);
+  });
+
+  it("requires bot_ids and message", async () => {
+    const tools = createAgentTools(deps());
+    const outcome = await tools.coordinate_bots(call("coordinate_bots", { bot_ids: ["@peer"] }), ctx(), runtime);
+    expect(outcome.kind).toBe("error");
+    expect(JSON.parse(outcome.content).error).toMatch(/requires/);
+  });
+
+  it("passes the peer path's own refusal straight through", async () => {
+    const tools = createAgentTools(
+      deps({ executeCoordinateBotsRequest: async () => ({ status: 200, body: { error: "denied by user" } }) }),
+    );
+    const outcome = await tools.coordinate_bots(call("coordinate_bots", { bot_ids: ["@peer"], message: "x" }), ctx(), runtime);
+    expect(JSON.parse(outcome.content).error).toBe("denied by user");
+  });
+});
+
+describe("list_routines", () => {
+  it("reports the endpoint's routines with its authoritative clock", async () => {
+    const tools = createAgentTools(deps());
+    const outcome = await tools.list_routines(call("list_routines"), ctx(), runtime);
+    expect(outcome.kind).toBe("result");
+    expect(JSON.parse(outcome.content)).toEqual(routinesBody);
+    expect(outcome.detail).toBe("1 routine");
+  });
+
+  it("passes the turn's own thread, which the endpoint checks ownership of", async () => {
+    const executeListRoutinesRequest = vi.fn(() => ({ status: 200, body: { routines: [] } }));
+    const tools = createAgentTools(deps({ executeListRoutinesRequest }));
+    await tools.list_routines(
+      call("list_routines", { fromBotId: "bot-other", fromThreadId: "thread-9", routine_id: "routine-7" }),
+      ctx(),
+      runtime,
+    );
+    expect(executeListRoutinesRequest).toHaveBeenCalledWith({
+      fromBotId: "bot-self",
+      fromThreadId: "thread-1",
+      routineId: "routine-7",
+    });
+  });
+
+  it("keeps the omitted-routine count so a trimmed list does not read as complete", async () => {
+    const body = { now: "2026-09-24T20:00:00.000Z", timeZone: "America/Chicago", routines: [{ id: "r1" }], routinesOmitted: 4 };
+    const tools = createAgentTools(deps({ executeListRoutinesRequest: () => ({ status: 200, body }) }));
+    const outcome = await tools.list_routines(call("list_routines"), ctx(), runtime);
+    expect(JSON.parse(outcome.content)).toEqual(body);
+    expect(outcome.detail).toBe("1 routine (+4 omitted)");
+  });
+
+  it("hands the endpoint's refusal to the model rather than an empty list", async () => {
+    const tools = createAgentTools(
+      deps({
+        executeListRoutinesRequest: () => ({
+          status: 403,
+          body: { error: "source conversation does not belong to sender" },
+        }),
+      }),
+    );
+    const outcome = await tools.list_routines(call("list_routines"), ctx(), runtime);
+    expect(outcome.kind).toBe("error");
+    expect(JSON.parse(outcome.content).error).toMatch(/does not belong to sender/);
+  });
+});
+
+describe("assignment_status", () => {
+  it("reads with the turn's own identity", async () => {
+    const executeAssignmentStatusRequest = vi.fn(
+      async (): Promise<AgentRequestResult> => ({ status: 200, body: { assignments: [] } }),
+    );
+    const tools = createAgentTools(deps({ executeAssignmentStatusRequest }));
+    const outcome = await tools.assignment_status(call("assignment_status", { id: "asg-1" }), ctx(), runtime);
+    expect(executeAssignmentStatusRequest).toHaveBeenCalledWith({
+      fromBotId: "bot-self",
+      fromThreadId: "thread-1",
+      id: "asg-1",
+    });
+    expect(outcome.kind).toBe("result");
+  });
+});
+
+describe("coordinate_bots refusals", () => {
+  it("surfaces a one-hop refusal as an error the model can act on", async () => {
+    const tools = createAgentTools(
+      deps({
+        executeCoordinateBotsRequest: async () => ({
+          status: 200,
+          body: { error: "delegation chains are limited to one hop — do this one yourself" },
+        }),
+      }),
+    );
+    const outcome = await tools.coordinate_bots(
+      call("coordinate_bots", { bot_ids: ["bot-peer"], message: "x" }),
+      ctx(),
+      runtime,
+    );
+    expect(outcome.kind).toBe("error");
+    expect(JSON.parse(outcome.content).error).toMatch(/one hop/);
+  });
+});
+
+describe("create_bot enforces its per-turn cap in this closure", () => {
+  it("creates a bot and reports its section", async () => {
+    const tools = createAgentTools(deps());
+    const outcome = await tools.create_bot(
+      call("create_bot", { name: "Pixel", role: "Designer", instructions: "Do design work." }),
+      ctx(),
+      runtime,
+    );
+    expect(outcome).toMatchObject({ kind: "result" });
+    expect(outcome.content).toContain("Created @Pixel in Work");
+  });
+
+  it("requires name, role and instructions", async () => {
+    const tools = createAgentTools(deps());
+    const outcome = await tools.create_bot(call("create_bot", { name: "Pixel" }), ctx(), runtime);
+    expect(outcome.kind).toBe("error");
+    expect(JSON.parse(outcome.content).error).toMatch(/needs name, role/);
+  });
+
+  it("stops at MAX_CREATED_BOTS_PER_TURN within one createAgentTools call", async () => {
+    let created = 0;
+    const executeCreateBotRequest = vi.fn(async (): Promise<AgentRequestResult> => {
+      created += 1;
+      return { status: 201, body: { id: `bot-${created}`, name: `Bot${created}`, section: "Work" } };
+    });
+    const tools = createAgentTools(deps({ executeCreateBotRequest }));
+    const args = { name: "N", role: "R", instructions: "I" };
+    for (let i = 0; i < 4; i++) {
+      const outcome = await tools.create_bot(call("create_bot", args), ctx(), runtime);
+      expect(outcome.kind, `create #${i + 1}`).toBe("result");
+    }
+    const fifth = await tools.create_bot(call("create_bot", args), ctx(), runtime);
+    expect(fifth.kind).toBe("error");
+    expect(JSON.parse(fifth.content).error).toMatch(/at most 4 bots/);
+    // The cap ran BEFORE the fifth network call, not after a rejection from it.
+    expect(executeCreateBotRequest).toHaveBeenCalledTimes(4);
+  });
+
+  it("gives a fresh cap to a new createAgentTools call — a new turn's host", async () => {
+    const executeCreateBotRequest = vi.fn(
+      async (): Promise<AgentRequestResult> => ({ status: 201, body: { id: "bot-x", name: "X", section: "Work" } }),
+    );
+    const args = { name: "N", role: "R", instructions: "I" };
+    const firstTurnTools = createAgentTools(deps({ executeCreateBotRequest }));
+    for (let i = 0; i < 4; i++) {
+      await firstTurnTools.create_bot(call("create_bot", args), ctx(), runtime);
+    }
+    expect((await firstTurnTools.create_bot(call("create_bot", args), ctx(), runtime)).kind).toBe("error");
+
+    // A second `createAgentTools` call — what a second HTTP turn's host
+    // does — must not remember the first turn's count.
+    const secondTurnTools = createAgentTools(deps({ executeCreateBotRequest }));
+    const outcome = await secondTurnTools.create_bot(call("create_bot", args), ctx(), runtime);
+    expect(outcome.kind).toBe("result");
+  });
+
+  it("does not increment the cap on a failed create", async () => {
+    const executeCreateBotRequest = vi.fn(
+      async (): Promise<AgentRequestResult> => ({ status: 403, body: { error: "only a section's Chief of Staff can create operator bots" } }),
+    );
+    const tools = createAgentTools(deps({ executeCreateBotRequest }));
+    const args = { name: "N", role: "R", instructions: "I" };
+    for (let i = 0; i < 5; i++) {
+      const outcome = await tools.create_bot(call("create_bot", args), ctx(), runtime);
+      expect(outcome.kind).toBe("error");
+      expect(JSON.parse(outcome.content).error).toMatch(/Chief of Staff/);
+    }
+    // Every one of the five reached the endpoint — none were cap-refused,
+    // because none of them ever succeeded.
+    expect(executeCreateBotRequest).toHaveBeenCalledTimes(5);
+  });
+});
+
+describe("request_sign_in", () => {
+  it("shows a sign-in card and suspends without asking for a password", async () => {
+    const tools = createAgentTools(deps());
+    const outcome = await tools.request_sign_in(
+      call("request_sign_in", { site: "example.com", reason: "the inbox" }),
+      ctx(),
+      runtime,
+    );
+    expect(outcome.kind).toBe("suspend");
+    expect(outcome.content).toContain("example.com");
+    expect(outcome.content).toContain("Never ask them to paste a password");
+  });
+
+  it("refuses a password field and does not repeat the value", async () => {
+    const executeRequestSignInRequest = vi.fn();
+    const tools = createAgentTools(deps({ executeRequestSignInRequest }));
+    const outcome = await tools.request_sign_in(
+      call("request_sign_in", { site: "example.com", reason: "the inbox", password: "nope" }),
+      ctx(),
+      runtime,
+    );
+    expect(outcome.kind).toBe("error");
+    expect(outcome.content).not.toContain("nope");
+    expect(outcome.detail ?? "").not.toContain("nope");
+    expect(executeRequestSignInRequest).not.toHaveBeenCalled();
+  });
+
+  it("refuses a call with no site", async () => {
+    const tools = createAgentTools(deps());
+    const outcome = await tools.request_sign_in(call("request_sign_in", {}), ctx(), runtime);
+    expect(outcome.kind).toBe("error");
+  });
+});
+
+describe("request_credential", () => {
+  it("shows a secure card and suspends the turn", async () => {
+    const tools = createAgentTools(deps());
+    const outcome = await tools.request_credential(
+      call("request_credential", { credential_id: "opencodeGoApiKey", reason: "needed" }),
+      ctx(),
+      runtime,
+    );
+    expect(outcome.kind).toBe("suspend");
+    expect(outcome).toMatchObject({ stopReason: "awaiting_human" });
+    expect(outcome.content).toContain("OpenCode API key");
+    expect(outcome.content).toContain("End this turn");
+  });
+
+  it("continues the turn instead of suspending when already configured", async () => {
+    const tools = createAgentTools(
+      deps({
+        executeRequestCredentialRequest: async () => ({
+          status: 200,
+          body: { alreadyConfigured: true, label: "OpenCode API key" },
+        }),
+      }),
+    );
+    const outcome = await tools.request_credential(
+      call("request_credential", { credential_id: "opencodeGoApiKey" }),
+      ctx(),
+      runtime,
+    );
+    expect(outcome.kind).toBe("result");
+    expect(outcome.content).toContain("already configured");
+  });
+
+  it("requires a credential_id", async () => {
+    const tools = createAgentTools(deps());
+    const outcome = await tools.request_credential(call("request_credential", {}), ctx(), runtime);
+    expect(outcome.kind).toBe("error");
+  });
+
+  it("surfaces the endpoint's allowlist refusal", async () => {
+    const tools = createAgentTools(
+      deps({
+        executeRequestCredentialRequest: async () => ({ status: 400, body: { error: "unsupported credential id" } }),
+      }),
+    );
+    const outcome = await tools.request_credential(
+      call("request_credential", { credential_id: "not-a-real-one" }),
+      ctx(),
+      runtime,
+    );
+    expect(outcome.kind).toBe("error");
+    expect(JSON.parse(outcome.content).error).toBe("unsupported credential id");
+  });
+});
+
+describe("propose_routine and propose_routine_action settle suspend", () => {
+  it("normalises the schedule and suspends with a confirmation card", async () => {
+    const executeRoutineRequestRequest = vi.fn(
+      async (): Promise<AgentRequestResult> => ({ status: 201, body: { summary: "Weekdays at 09:00" } }),
+    );
+    const tools = createAgentTools(deps({ executeRoutineRequestRequest }));
+    const outcome = await tools.propose_routine(
+      call("propose_routine", {
+        name: "Morning brief",
+        instructions: "Summarize priorities.",
+        schedule: { type: "daily", time: "09:00" },
+      }),
+      ctx(),
+      runtime,
+    );
+    expect(outcome.kind).toBe("suspend");
+    expect(outcome).toMatchObject({ stopReason: "awaiting_human" });
+    expect(outcome.content).toContain("has not been applied");
+    expect(executeRoutineRequestRequest).toHaveBeenCalledWith({
+      fromBotId: "bot-self",
+      fromThreadId: "thread-1",
+      action: "create",
+      routine: {
+        name: "Morning brief",
+        instructions: "Summarize priorities.",
+        schedule: { type: "weekly", time: "09:00", weekdays: ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"] },
+      },
+    });
+  });
+
+  it("rejects an unsupported schedule before calling the endpoint", async () => {
+    const executeRoutineRequestRequest = vi.fn();
+    const tools = createAgentTools(deps({ executeRoutineRequestRequest }));
+    const outcome = await tools.propose_routine(
+      call("propose_routine", { name: "N", instructions: "I", schedule: { type: "hourly" } }),
+      ctx(),
+      runtime,
+    );
+    expect(outcome.kind).toBe("error");
+    expect(JSON.parse(outcome.content).error).toMatch(/sub-day intervals/);
+    expect(executeRoutineRequestRequest).not.toHaveBeenCalled();
+  });
+
+  it("propose_routine_action forwards the action and routine id", async () => {
+    const executeRoutineRequestRequest = vi.fn(
+      async (): Promise<AgentRequestResult> => ({ status: 201, body: {} }),
+    );
+    const tools = createAgentTools(deps({ executeRoutineRequestRequest }));
+    const outcome = await tools.propose_routine_action(
+      call("propose_routine_action", { routine_id: "routine-1", action: "pause" }),
+      ctx(),
+      runtime,
+    );
+    expect(outcome.kind).toBe("suspend");
+    expect(executeRoutineRequestRequest).toHaveBeenCalledWith({
+      fromBotId: "bot-self",
+      fromThreadId: "thread-1",
+      action: "pause",
+      routineId: "routine-1",
+    });
+  });
+
+  it("requires at least one field in changes for an update", async () => {
+    const tools = createAgentTools(deps());
+    const outcome = await tools.propose_routine_action(
+      call("propose_routine_action", { routine_id: "routine-1", action: "update", changes: {} }),
+      ctx(),
+      runtime,
+    );
+    expect(outcome.kind).toBe("error");
+  });
+
+  it("surfaces the endpoint's refusal", async () => {
+    const tools = createAgentTools(
+      deps({
+        executeRoutineRequestRequest: async () => ({
+          status: 409,
+          body: { error: "confirm or cancel an existing routine proposal first" },
+        }),
+      }),
+    );
+    const outcome = await tools.propose_routine(
+      call("propose_routine", { name: "N", instructions: "I", schedule: { type: "once", at: "2026-09-01T09:00:00Z" } }),
+      ctx(),
+      runtime,
+    );
+    expect(outcome.kind).toBe("error");
+    expect(JSON.parse(outcome.content).error).toMatch(/confirm or cancel/);
+  });
+});

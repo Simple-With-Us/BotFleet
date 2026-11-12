@@ -5,33 +5,68 @@
 // Verified against agy 1.1.12.
 //
 // Unlike claude, print mode has NO interactive permission hook: there is no
-// per-action broker here. `--mode accept-edits` allows file edits but
-// auto-denies shell (`run_command` comes back as a tool ERROR); the default
-// `request-review` auto-denies; `--dangerously-skip-permissions` (fullAuto)
-// approves everything. Real per-action approval cards are a future path via
+// per-action broker here.  `--dangerously-skip-permissions` (fullAuto)
+// approves everything.  Real per-action approval cards are a future path via
 // native ACP (agy issue #31), which would reuse acp/core.ts like grok/gemini.
 //
+// `--mode` is NOT the permission switch, and an earlier version of this file
+// said it was.  agy 1.1.26 `--help` lists "--mode  Set the agent execution
+// mode for this session (accept-edits, plan)" and, separately, "--sandbox
+// Run in a sandbox with terminal restrictions enabled".  Whether a terminal
+// command needs approval is agy's own Tool Execution Policy — a global
+// setting this driver does not pass and cannot override, reported per session
+// as `permission_mode` on the init event.  Measured on this Mac with agy
+// 1.1.26: `--mode accept-edits` with no bypass reports `always-proceed` and
+// then RUNS `run_command`.  Under agy's shipped default the same spawn is
+// refused — a probe with a config-free HOME reported `request-review` and
+// agy's own stderr said the tool "required the \"command\" permission that
+// headless mode cannot prompt for, so it was auto-denied", ending the turn
+// CANCELED (2026-09-18).
+//
+// So a turn that holds host control — the person's own desktop — is spawned
+// WITHOUT the bypass however the instance is configured, AND is stopped at
+// the init event unless agy reports a policy that asks.  Nothing in print
+// mode can put a card in front of anyone, so a turn that does not start is
+// the only guarantee this engine can actually keep.
+//
+// fullAuto is OFF unless the person turns it on in Settings › Engines.  The
+// bypass skips BotFleet's permission broker entirely — no card, no
+// destructive/sensitive guard, no decision-log row — so it is an opt-in the
+// Engines row spells out, never a default a fresh bot inherits.
+//
 // Computer use: agy has no per-turn MCP flag, so the bot's computer (cloud
-// box / Local VM / VPS) is mounted by upserting one key into the global
-// `~/.gemini/config/mcp_config.json` before each spawn — see
-// ensureAntigravityComputerMcp below. Full-auto instances only; the host
-// desktop stays off (no approval channel in print mode, ever).
-import { describeSpawnFailure, execCli, killCliTree, spawnCli } from "../procs.ts";
+// box / Local VM / VPS / local computer) is mounted by upserting keys into the
+// global `~/.gemini/config/mcp_config.json` before each spawn — see
+// ensureAntigravityMcp below.
+import {
+  classifyVersionProbeFailure,
+  describeSpawnFailure,
+  execCli,
+  killCliTree,
+  LastKnownAnswer,
+  logProbeFailure,
+  spawnCli,
+} from "../procs.ts";
+import { classifyError, computeBackoff, interruptibleDelay, RETRY_MAX_ATTEMPTS } from "./retry.ts";
+import { stderrExcerpt } from "../stderr-excerpt.ts";
 import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { z } from "zod";
 
+import { hostToolPrefix, turnComputerMounts } from "../computer-grants.ts";
 import { DATA_DIR, stripWorkspaceCredentialEnv } from "../config.ts";
 import { computerProxyEnv } from "../container-computer.ts";
 import { augmentedPath } from "../env-path.ts";
+import { toolFields } from "../tool-fields.ts";
+import { describeResult } from "../../shared/tool-activity.ts";
+import { captureInput, captureOutput } from "../../shared/item-io.ts";
 import { SPAWNED_PROXIES } from "../proxy-paths.ts";
 import { injectedApiModel, mergeLocalInject } from "./local-inject.ts";
 
 import type { ChildProcess } from "node:child_process";
 import type {
   DriverCreateInput,
-  ModelCatalog,
   ProviderDriver,
   ProviderInstance,
   ProviderSnapshot,
@@ -40,6 +75,7 @@ import type {
   SendTurnInput,
 } from "../contracts.ts";
 import { newEventId, newId } from "../contracts.ts";
+import { cliLoginEnvironment, launchedChildEnvironment, primeCliLogin } from "../cli-logins.ts";
 import { appendNative } from "./native.ts";
 
 const DRIVER_KIND = "antigravityAgent";
@@ -47,26 +83,70 @@ const DRIVER_KIND = "antigravityAgent";
 export interface AntigravityConfig {
   cli: string;
   fullAuto: boolean;
+  /** Hard ceiling on one logical turn, relaunches included, however busy
+   * agy stays.  Validated exactly like acp/core.ts's field of the same name. */
+  promptTimeoutMs?: number;
+  /** Renewable silence window while no tool step is running: any stdout line
+   * restarts it, so only a turn that has gone completely quiet trips it. */
+  promptIdleMs?: number;
+  /** The same window while a tool step is ACTIVE.  A build or a test run can
+   * legitimately print nothing for minutes, so it gets a longer leash. */
+  promptToolIdleMs?: number;
 }
 
-// model catalog from `agy models` (agy 1.1.12)
-export const STATIC_ANTIGRAVITY_MODELS: ModelCatalog = {
-  default: "gemini-3.1-pro-high",
-  options: [
-    { id: "gemini-3.1-pro-high", label: "Gemini 3.1 Pro (High)" },
-    { id: "gemini-3.1-pro-low", label: "Gemini 3.1 Pro (Low)" },
-    // 3.7 ids confirmed against the agy 1.1.12 binary's own model table
-    { id: "gemini-3.7-flash-high", label: "Gemini 3.7 Flash (High)" },
-    { id: "gemini-3.7-flash-medium", label: "Gemini 3.7 Flash (Medium)" },
-    { id: "gemini-3.7-flash-low", label: "Gemini 3.7 Flash (Low)" },
-    { id: "gemini-3.6-flash-high", label: "Gemini 3.6 Flash (High)" },
-    { id: "gemini-3.6-flash-medium", label: "Gemini 3.6 Flash (Medium)" },
-    { id: "gemini-3.6-flash-low", label: "Gemini 3.6 Flash (Low)" },
-    { id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6 (Thinking)" },
-    { id: "claude-opus-4-6-thinking", label: "Claude Opus 4.6 (Thinking)" },
-    { id: "gpt-oss-120b-medium", label: "GPT-OSS 120B (Medium)" },
-  ],
-};
+/** Said once, at the start of any turn that can act on the person's own
+ * desktop.  agy has no interactive permission hook in print mode, so there is
+ * no card to put in front of anyone; what BotFleet can do instead is read the
+ * policy agy reports and refuse to run the turn under one that would not ask.
+ * A person who mounted this Mac expects to be asked, so the chip says plainly
+ * which of those two things they are getting. */
+export const ANTIGRAVITY_HOST_CONTROL_NOTICE =
+  "Antigravity has no approval cards, so BotFleet checks its tool execution policy instead.  A policy that would run shell commands on this computer unasked stops the turn.";
+
+/** agy's Tool Execution Policy values that pause for a human.  From agy
+ * 1.1.26's embedded manual: "**Tool Execution Policy**: Controls whether
+ * terminal commands require approval before running (`always-proceed`,
+ * `request-review`, `strict`, `proceed-in-sandbox`)."  Its changelog confirms
+ * the first is the one that does not ask — "always-proceed auto-approve tool
+ * confirmation" — while "Fixed commands being auto-approved while the session
+ * was in request-review or strict permission mode" and "Added `request-review`
+ * (default) mode" establish the other two as asking modes and `request-review`
+ * as the shipped default.  `proceed-in-sandbox` "Auto-approves terminal
+ * commands that run inside the secure sandbox, requesting manual approval only
+ * when a command attempts to bypass the sandbox".  That value is deliberately
+ * NOT in the set below: what it does on the host depends on agy's separate
+ * enableTerminalSandbox setting, which this driver never reads and never
+ * forces (it does not pass `--sandbox`), and nobody has measured it with the
+ * sandbox off.  Until someone does, it is refused like any other value whose
+ * behaviour on this computer is not known.
+ *
+ * Do not confuse these with Artifact Review Mode, whose values in the same
+ * manual are (`always-proceed`, `agent-decides`, `asks-for-review`); only the
+ * Tool Execution Policy gates `run_command`. */
+const ANTIGRAVITY_ASKING_POLICIES = new Set(["request-review", "strict"]);
+
+/** Why a host-control turn was stopped before it ran.  The `always-proceed`
+ * wording is the measured case; an unreported or unrecognized value gets the
+ * same remedy but does not claim to know what the policy would do, because
+ * claiming more than we know is the bug this whole check exists to fix. */
+export function antigravityHostPolicyRefusal(reported: string | null): string {
+  const remedy =
+    "  Set the policy to request-review or strict in Antigravity, or remove this computer from the bot.";
+  if (reported === "always-proceed") {
+    return (
+      "Antigravity's tool execution policy is always-proceed, which would run shell commands on this computer with nobody able to approve." +
+      remedy
+    );
+  }
+  const named = reported ? `is ${reported}` : "was not reported";
+  return (
+    `Antigravity's tool execution policy ${named}, so BotFleet cannot tell whether shell commands on this computer would run with nobody able to approve.` +
+    remedy
+  );
+}
+
+export { STATIC_ANTIGRAVITY_MODELS } from "../antigravity-models.ts";
+import { STATIC_ANTIGRAVITY_MODELS } from "../antigravity-models.ts";
 
 function antigravityEnvironment(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env, PATH: augmentedPath(), ...overrides };
@@ -130,28 +210,139 @@ export function readAntigravityModelCatalog(env: Record<string, string | undefin
 // failing the turn (the ensureOpenCodeInjectModel discipline).
 export const ANTIGRAVITY_COMPUTER_MCP_KEY = "botfleet-computer";
 
+/** Every key this harness owns in agy's global file starts with this; nothing
+ *  else in it is ours to add, replace, or remove. */
+export const BOTFLEET_MCP_PREFIX = "botfleet-";
+
 export interface AntigravityComputerMcpServer {
   command: string;
   args: string[];
   env: Record<string, string>;
 }
 
-// agy's MCP file is machine-global. Hold this lease for the complete child
-// lifetime so two Antigravity turns cannot see each other's computer tokens.
-let antigravityComputerMcpLease: Promise<void> = Promise.resolve();
+// ── the mount lease (DR4) ───────────────────────────────────────────────
+//
+// agy's MCP file is machine-global, so a turn that MOUNTS a computer into it
+// must exclude every other Antigravity turn for its child's whole lifetime —
+// otherwise a second turn's agy could pick up the first turn's tools and, in
+// their env, its box or control tokens.  That part has not changed.
+//
+// What changed is who has to wait.  The lease used to be one module-global
+// promise taken unconditionally, so a turn with NO computer at all — the
+// overwhelming majority — still serialized behind whatever else was running,
+// for as long as that other turn lasted, which could be up to 11 minutes.
+// Two bots on Antigravity could not answer at the same time.
+//
+// It is a reader/writer lease now, per config path:
+//   • a turn that mounts nothing and has nothing of ours to strip takes the
+//     SHARED side — any number of those run at once, because none of them
+//     writes the file and none of them can inherit a mount that does not
+//     exist;
+//   • a turn that mounts a computer, or that has to strip a leftover
+//     `botfleet-*` key, takes the EXCLUSIVE side: it waits for the readers
+//     already running to finish AND locks everyone else out until its child
+//     is gone.
+//
+// That keeps today's isolation guarantee intact.  The obvious cheaper fixes
+// do not: releasing the lease once the child has "read" the config assumes a
+// read time nobody has measured (agy may start an MCP server lazily, at the
+// first tool call), and skipping the lease outright for computer-less turns
+// would let one start WHILE a mount is installed, which is exactly the
+// token-crossing this lease exists to prevent.
+//
+// TODO(DR4): a MOUNTING turn still holds the file for its child's whole
+// lifetime — up to the turn's hard ceiling (`promptTimeoutMs`, 11 minutes by
+// default), though a silent child is now stopped by the idle windows long
+// before that and a timeout is never relaunched.  Shortening that needs one
+// measured fact nobody has yet: WHEN does `agy` read
+// `~/.gemini/config/mcp_config.json`?  If it reads once at
+// startup, the exclusive hold can end at the init event and mounting turns
+// would stop excluding each other for minutes.  If it re-reads lazily — say,
+// the first time the model calls a computer tool — an early release would
+// hand one turn another turn's tools and box token, so the hold must stay.
+// Measure it against a real `agy` (watch the file with fs events across a
+// turn that calls a tool late) before changing anything here.  Neither the
+// code, the comments below, nor agy 1.1.26's embedded docs answer it.
+interface AntigravityMcpLease {
+  /** Chain of exclusive holders; a reader waits on it while one is active. */
+  writers: Promise<void>;
+  /** True from the moment an exclusive holder starts until it releases. */
+  writing: boolean;
+  /** Shared holders running right now. */
+  readers: number;
+  /** Exclusive holders parked until `readers` reaches zero. */
+  drained: Array<() => void>;
+}
 
-async function acquireAntigravityComputerMcpLease(): Promise<() => void> {
-  const previous = antigravityComputerMcpLease;
+const antigravityMcpLeases = new Map<string, AntigravityMcpLease>();
+
+/** The machine-global file agy actually reads.  Derived from the turn's own
+ *  env so two instances pointed at different HOMEs get different leases —
+ *  they are different files and have no reason to wait on each other. */
+export function antigravityMcpConfigPath(env: Record<string, string | undefined> = process.env): string {
+  const home = env.HOME || env.USERPROFILE || homedir();
+  return join(home, ".gemini", "config", "mcp_config.json");
+}
+
+function leaseFor(path: string): AntigravityMcpLease {
+  const existing = antigravityMcpLeases.get(path);
+  if (existing) return existing;
+  const lease: AntigravityMcpLease = { writers: Promise.resolve(), writing: false, readers: 0, drained: [] };
+  antigravityMcpLeases.set(path, lease);
+  return lease;
+}
+
+/** Does the file already carry one of our keys?  A turn that would have to
+ *  remove one is a WRITER even though it mounts nothing.  An unreadable file
+ *  answers `true` on purpose: "we cannot tell" must take the safe side. */
+export function antigravityConfigHasBotfleetServers(path: string): boolean {
+  try {
+    if (!existsSync(path)) return false;
+    const parsed = mcpConfigFileSchema.safeParse(JSON.parse(readFileSync(path, "utf8")));
+    if (!parsed.success) return false;
+    return Object.keys(parsed.data.mcpServers ?? {}).some((key) => key.startsWith(BOTFLEET_MCP_PREFIX));
+  } catch {
+    return true;
+  }
+}
+
+/** Take the mount lease for one turn and return its release.
+ *
+ *  `exclusive` turns hold the file; shared turns only promise not to touch
+ *  it.  Both hold until the child is gone, because that is the window in
+ *  which agy might still read the file. */
+export async function acquireAntigravityComputerMcpLease(
+  path: string,
+  exclusive: boolean,
+): Promise<() => void> {
+  const lease = leaseFor(path);
+  let released = false;
+  if (!exclusive) {
+    // Re-checked after every wait: a writer that became active while this
+    // turn was parked must not be overtaken.  When no writer is active this
+    // loop does not await at all, which is the point — the common turn pays
+    // nothing.
+    while (lease.writing) await lease.writers;
+    lease.readers++;
+    return () => {
+      if (released) return;
+      released = true;
+      if (--lease.readers === 0) for (const wake of lease.drained.splice(0)) wake();
+    };
+  }
+  const previous = lease.writers;
   let unlock: (() => void) | undefined;
   const current = new Promise<void>((resolve) => {
     unlock = resolve;
   });
-  antigravityComputerMcpLease = previous.then(() => current);
+  lease.writers = previous.then(() => current);
   await previous;
-  let released = false;
+  lease.writing = true;
+  if (lease.readers > 0) await new Promise<void>((resolve) => lease.drained.push(resolve));
   return () => {
     if (released) return;
     released = true;
+    lease.writing = false;
     unlock?.();
   };
 }
@@ -166,7 +357,7 @@ const mcpConfigFileSchema = z.looseObject({
 /** The computer MCP server for this turn, or null when the turn has none.
  * Cloud boxes go through BotFleet's REST-to-MCP adapter (the same spec
  * claude.ts and codex.ts build); Local VM and VPS connections arrive as a
- * ready-made Cua Driver stdio command and pass through unchanged. */
+ * ready-made CUA Driver stdio command and pass through unchanged. */
 export function antigravityMcpServers(
   integrations: SendTurnInput["integrations"],
 ): Record<string, { command: string; args: string[]; env: Record<string, string> }> {
@@ -183,6 +374,7 @@ export function antigravityMcpServers(
           env: {
             ELECTRON_RUN_AS_NODE: "1",
             OGB_BOX_ID: proxyEnv.OGB_BOX_ID ?? "",
+            OGB_BOX_API: proxyEnv.OGB_BOX_API ?? "",
             OGB_BOX_TOKEN: proxyEnv.OGB_BOX_TOKEN ?? "",
             OMB_CONTROL_URL: proxyEnv.OMB_CONTROL_URL ?? "",
             OMB_CONTROL_TOKEN: proxyEnv.OMB_CONTROL_TOKEN ?? "",
@@ -204,8 +396,7 @@ export function ensureAntigravityMcp(
   servers: Record<string, { command: string; args: string[]; env: Record<string, string> }>,
   env: Record<string, string | undefined> = process.env,
 ): () => void {
-  const home = env.HOME || env.USERPROFILE || homedir();
-  const path = join(home, ".gemini", "config", "mcp_config.json");
+  const path = antigravityMcpConfigPath(env);
   const existed = existsSync(path);
   const original = existed ? readFileSync(path, "utf8") : null;
   let config: any = {};
@@ -218,7 +409,7 @@ export function ensureAntigravityMcp(
   let hasChanges = false;
   
   for (const key of Object.keys(currentServers)) {
-    if (key.startsWith("botfleet-")) {
+    if (key.startsWith(BOTFLEET_MCP_PREFIX)) {
       delete currentServers[key];
       hasChanges = true;
     }
@@ -265,7 +456,7 @@ export function ensureAntigravityMcp(
       const cleanupServers = { ...cleanupConfig.mcpServers };
       let changed = false;
       for (const key of Object.keys(cleanupServers)) {
-        if (key.startsWith("botfleet-")) {
+        if (key.startsWith(BOTFLEET_MCP_PREFIX)) {
           delete cleanupServers[key];
           changed = true;
         }
@@ -277,7 +468,7 @@ export function ensureAntigravityMcp(
            const origParsed = mcpConfigFileSchema.safeParse(JSON.parse(original));
            if (origParsed.success && origParsed.data.mcpServers) {
              for (const [k, v] of Object.entries(origParsed.data.mcpServers)) {
-               if (k.startsWith("botfleet-")) {
+               if (k.startsWith(BOTFLEET_MCP_PREFIX)) {
                  cleanupServers[k] = v;
                  changed = true;
                }
@@ -296,8 +487,83 @@ export function ensureAntigravityMcp(
   };
 }
 
+/** Remove lingering botfleet-* MCP servers from ~/.gemini/config/mcp_config.json.
+ * Called on engine creation / harness startup so stale entries from crashed
+ * or interrupted runs cannot leak into the user's sessions or surface 401s. */
+export function cleanStaleAntigravityMcp(
+  env: Record<string, string | undefined> = process.env,
+): void {
+  const path = antigravityMcpConfigPath(env);
+  if (!existsSync(path)) return;
+  try {
+    const raw = readFileSync(path, "utf8");
+    const parsed = mcpConfigFileSchema.safeParse(JSON.parse(raw));
+    if (!parsed.success) return;
+    const currentServers = { ...parsed.data.mcpServers };
+    let hasChanges = false;
+    for (const key of Object.keys(currentServers)) {
+      if (key.startsWith(BOTFLEET_MCP_PREFIX)) {
+        delete currentServers[key];
+        hasChanges = true;
+      }
+    }
+    if (hasChanges) {
+      const newConfig = { ...parsed.data, mcpServers: currentServers };
+      writeFileSync(path, JSON.stringify(newConfig, null, 2), { mode: 0o600 });
+      try { chmodSync(path, 0o600); } catch {}
+    }
+  } catch {}
+}
+
+// ── turn deadlines ──────────────────────────────────────────────────────
+// The turn used to have exactly one clock: an 11-minute wall-clock watchdog
+// that killed a busy turn and a wedged one alike, and told nobody it was
+// coming.  It is now two renewable silence windows plus a hard ceiling, the
+// same shape acp/core.ts uses: a turn that keeps printing is never cut off
+// by the idle windows, and one that goes quiet is stopped long before the
+// ceiling.  The bounds match acp/core.ts so a setting means the same thing
+// on every engine.
+const DEFAULT_PROMPT_MAX_MS = 11 * 60_000;
+const DEFAULT_PROMPT_IDLE_MS = 180_000;
+const DEFAULT_PROMPT_TOOL_IDLE_MS = 8 * 60_000;
+const MIN_PROMPT_WINDOW_MS = 1_000;
+const MAX_PROMPT_WINDOW_MS = 20 * 60_000;
+/** How far into a live window the "still waiting" notice appears. */
+const DEADLINE_WARN_FRACTION = 0.8;
+
+function decodeWindowMs(value: unknown): number | undefined {
+  return typeof value === "number" &&
+    Number.isFinite(value) &&
+    Number.isInteger(value) &&
+    value >= MIN_PROMPT_WINDOW_MS &&
+    value <= MAX_PROMPT_WINDOW_MS
+    ? value
+    : undefined;
+}
+
+/** "3 minutes" for a whole number of minutes, "N s" otherwise (short test
+ *  windows included).  Only ever used in the text a person reads. */
+function describeWindow(ms: number): string {
+  // A minute or more reads in minutes ("about 2 minutes", not "132 s").
+  if (ms >= 60_000) {
+    const minutes = Math.round(ms / 60_000);
+    const about = ms % 60_000 === 0 ? "" : "about ";
+    return `${about}${minutes} minute${minutes === 1 ? "" : "s"}`;
+  }
+  return `${Math.max(1, Math.round(ms / 1000))} s`;
+}
+
+/** agy's own `--print-timeout`, always a whole minute ABOVE our ceiling so
+ *  agy never kills a still-streaming turn before this driver decides to. */
+export function antigravityPrintTimeout(maxMs: number): string {
+  return `${Math.ceil(maxMs / 60_000) + 1}m`;
+}
+
 function decodeConfig(raw: unknown): AntigravityConfig {
   const o = (raw ?? {}) as Record<string, unknown>;
+  const promptTimeoutMs = decodeWindowMs(o.promptTimeoutMs);
+  const promptIdleMs = decodeWindowMs(o.promptIdleMs);
+  const promptToolIdleMs = decodeWindowMs(o.promptToolIdleMs);
   if (o.cli !== undefined && typeof o.cli !== "string") {
     throw new Error(`antigravity: invalid cli ${JSON.stringify(o.cli)}`);
   }
@@ -306,18 +572,90 @@ function decodeConfig(raw: unknown): AntigravityConfig {
   }
   return {
     cli: typeof o.cli === "string" ? o.cli : "agy",
-    // Default fullAuto to TRUE: agy's headless print harness invokes tools even
-    // for trivial prompts and, with no interactive approval channel, auto-denies
-    // them — producing no output, so a non-fullAuto bot's turns frequently fail.
-    // Default to fullAuto for a usable bot; per-action consent returns with the
-    // ACP v2 path. Still throws above on a non-boolean fullAuto.
-    fullAuto: o.fullAuto === undefined ? true : o.fullAuto === true,
+    // Default fullAuto to FALSE.  `--dangerously-skip-permissions` runs every
+    // tool on this computer with nothing standing in for the permission
+    // broker, which is the consent layer SECURITY.md promises.  Without it,
+    // print mode runs `--mode accept-edits`: file edits go through and shell
+    // commands come back as tool errors — a less capable bot, but one whose
+    // reach the person chose.  Turning the bypass on is an explicit opt-in
+    // on the Engines settings row, and the toggle there reflects this value.
+    // Still throws above on a non-boolean fullAuto.
+    fullAuto: o.fullAuto === true,
+    // An out-of-range or malformed window falls back to the default rather
+    // than throwing: a stale setting must not take the engine offline.
+    ...(promptTimeoutMs === undefined ? {} : { promptTimeoutMs }),
+    ...(promptIdleMs === undefined ? {} : { promptIdleMs }),
+    ...(promptToolIdleMs === undefined ? {} : { promptToolIdleMs }),
   };
+}
+
+/** How long stdout may keep draining after agy's own process exit before the
+ * turn is finished on the exit alone.  Long enough for a final `result` line
+ * to arrive, short enough that a grandchild holding the pipe cannot strand
+ * the bot in "Thinking". */
+const EXIT_DRAIN_GRACE_MS = 2_000;
+
+/** How much of agy's own error text survives into the chip.  Kept well under
+ * model-fallback.ts's 500-character quota-chip ceiling so a provider cap is
+ * still recognised as one after the `error: ` prefix the harness adds. */
+const AGY_ERROR_MAX = 300;
+
+/** agy's cap message carries its own reset window ("Resets in 44h3m45s."). */
+const AGY_RESET_CLAUSE = /\bresets?(?:\s+(?:in|at))?\s+[^.\n]{1,48}/i;
+
+/** The terminal half of agy's `result` event. Parsed rather than duck-typed:
+ * a turn's success and its only error text both come from here, and a shape
+ * drift that silently widened either one is how a failed turn goes quiet. */
+const agyTurnResultSchema = z.looseObject({
+  status: z.string().nullish().catch(null),
+  error: z.string().nullish().catch(null),
+});
+
+export type AntigravityTurnResult = z.infer<typeof agyTurnResultSchema>;
+
+/** Never throws: an unrecognised payload still has to end the turn. */
+export function parseAntigravityTurnResult(payload: unknown): AntigravityTurnResult {
+  return agyTurnResultSchema.safeParse(payload).data ?? { status: null, error: null };
+}
+
+/**
+ * The message BotFleet shows when a turn ends badly.
+ *
+ * agy reports every terminal failure the same way — one `result` event with
+ * `status: "ERROR"` and a human-readable `result.error` — and that is the only
+ * place a provider quota ever surfaces.  Observed against agy 1.1.12–1.1.25:
+ *
+ *   "Individual quota reached. Please upgrade your subscription to increase
+ *    your limits. Resets in 44h3m45s."
+ *   "Eligibility check failed: Post \"https://…\": read: connection reset by peer"
+ *   "timeout waiting for response"
+ *
+ * The text is passed through so model-fallback.ts can classify it (the quota
+ * wording matches QUOTA_OR_CAP, and "Resets in 44h…" parses as a reset time),
+ * prefixed with the engine name so the person reading the chip knows which
+ * provider ran out.  A long message is trimmed, but never at the cost of the
+ * reset window — that is the actionable half.
+ */
+export function antigravityTurnErrorMessage(result: AntigravityTurnResult): string {
+  const text = result.error?.trim() ?? "";
+  if (!text) {
+    const label = result.status?.trim() || "ERROR";
+    return `Antigravity: the turn ended with status ${label} and no reply`;
+  }
+  let body = text.length > AGY_ERROR_MAX ? `${text.slice(0, AGY_ERROR_MAX).trimEnd()}…` : text;
+  const reset = text.match(AGY_RESET_CLAUSE)?.[0]?.trim();
+  if (reset && !body.includes(reset)) body = `${body} ${reset.endsWith(".") ? reset : `${reset}.`}`;
+  return `Antigravity: ${body}`;
 }
 
 export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
   driverKind: DRIVER_KIND,
-  metadata: { displayName: "Antigravity", supportsMultipleInstances: true },
+  metadata: {
+    displayName: "Antigravity",
+    supportsMultipleInstances: true,
+    // Mirrors the `capabilities` block in `create` below.
+    channelWiring: { agentsMcp: true, computerMcp: true, composioMcp: true, localComputerMcp: true, images: true },
+  },
   install: {
     command: {
       darwin: "curl -fsSL https://antigravity.google/cli/install.sh | bash",
@@ -344,11 +682,23 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       }
     };
     await refreshModels();
+    cleanStaleAntigravityMcp(catalogEnv);
     const listeners = new Set<RuntimeEventListener>();
     // one active turn per thread; a second send while busy is a caller bug
     const active = new Map<string, { stop: () => void; turnId: string }>();
     const pending = new Set<string>();
     let disposed = false;
+    // Retry bookkeeping lives PER THREAD, not per sendTurn call: a relaunch
+    // re-enters sendTurn, and the budget has to survive that hop or every
+    // attempt would look like the first.  claude.ts owns the same shape.
+    // `startedAt` is when the LOGICAL turn's first child launched, so the hard
+    // ceiling covers every relaunch together instead of restarting with each
+    // one.  Time spent queued for the mount lease is not part of it.
+    const retryState = new Map<string, { attempt: number; cancelled: boolean; startedAt: number }>();
+    // A relaunch waits real seconds; the fake agy in antigravity.test.ts
+    // scales that down.  The `turn.retrying` event still reports the REAL
+    // policy delay, so a test asserts the policy without paying for it.
+    const retryScale = Number(process.env.FAKE_AGY_RETRY_SCALE ?? "1");
     // every live agy child, tracked independently of `active`: a child can
     // hang AFTER emitting `result` (so it's already removed from `active`), and
     // dispose()/stopAll() must still be able to reap it. Removed on process exit.
@@ -385,9 +735,57 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
     const sendTurn = async (turn: SendTurnInput) => {
       const { threadId } = turn;
       if (disposed) throw new Error("Antigravity instance is disposed");
+      // The seat's CLI login is read in the BACKGROUND, and the read is started
+      // here, before the guard:  the guard and the registration that follows it
+      // have to stay free of `await`, or a second turn on this thread would walk
+      // through the guard the first one already passed.
+      primeCliLogin(turn.launchIdentity?.seat);
       if (active.has(threadId) || pending.has(threadId)) throw new Error("a turn is already running on this thread");
       pending.add(threadId);
       const turnId = newId();
+      // Carried across a relaunch (see maybeRetry): `attempt` counts the
+      // transient failures this logical turn has already absorbed, and
+      // `cancelled` is how a stop during the backoff reaches the pending
+      // relaunch instead of letting it spawn a child nobody wants.
+      const retry = retryState.get(threadId) ?? { attempt: 0, cancelled: false, startedAt: Date.now() };
+      retry.cancelled = false;
+      retryState.set(threadId, retry);
+      const retryAbort = new AbortController();
+
+      // Host control means the user's real desktop — the Local VM and a VPS
+      // also arrive as `localComputer`, but they are isolated and carry no
+      // scope, so `hostToolPrefix` is what tells them apart.  acp/core.ts runs
+      // exactly this guard (see its sendTurn) and then lets every ask reach
+      // the harness broker.  agy print mode has no ask to route, so this
+      // driver drops the bypass for the turn and then, at the init event,
+      // checks the policy agy actually reports — dropping the bypass alone
+      // proves nothing, because the Tool Execution Policy is a separate axis
+      // that can auto-approve shell regardless (see the file header).  A
+      // full-auto instance keeps its switch for every other turn.
+      const controlsHost = hostToolPrefix(turnComputerMounts(turn.integrations)) !== null;
+      // Auto Mode is for turns a person is present for.  A webhook/resource
+      // turn begins with nobody watching, so it must not inherit the
+      // permission bypass even when the bot has autoApprove on — the broker
+      // path enforces this in autoVerdict ("unattended-block"), and print
+      // mode has no broker, so the driver enforces it here instead.
+      const isAutoApproved = turn.autoApprove === true && turn.unattended !== true;
+      // The per-bot override is scoped to host-control turns only: letting a
+      // bot-level autoApprove flag flip fullAuto for sandbox/cloud/VM turns
+      // would silently promote an engine-level security gate the owner never
+      // switched on.  Non-host turns keep exactly what config.fullAuto says.
+      //
+      // Bypass Permissions is the other per-bot switch, and the one the
+      // person turned on precisely to have nothing ask.  Print mode has no
+      // broker to carry it, so it is this driver's to apply, to the turns
+      // where it is safe to: never one that controls This Mac, the same line
+      // the broker draws (`autoVerdict` never answers a `local-computer`
+      // request in bypass), and, like the broker's bypass, even an unattended
+      // turn.  A host turn keeps exactly the rule above.
+      const isBypassed = turn.bypassPermissions === true && !controlsHost;
+      const turnConfig: AntigravityConfig = {
+        ...config,
+        fullAuto: controlsHost ? isAutoApproved : config.fullAuto || isBypassed,
+      };
 
       // Default cwd to a per-thread workspace under DATA_DIR — deliberately
       // NOT homedir(): a bot running unattended should not get the whole home
@@ -401,6 +799,9 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
         mkdirSync(workspace, { recursive: true });
       } catch (error) {
         pending.delete(threadId);
+        // nothing launched, so nothing may outlive this call — a stale entry
+        // would hand its start time to the thread's next turn
+        retryState.delete(threadId);
         throw error;
       }
       const cwd = turn.cwd ?? workspace;
@@ -414,10 +815,33 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       const resumeCursor = typeof turn.resumeCursor === "string" ? turn.resumeCursor : null;
 
       let settled = false;
-      // backstop watchdog: if agy hangs without emitting `result` and without
-      // exiting, the bot would stay busy forever (agy's own --print-timeout 10m
-      // is the only other net). Assigned just below; settle() always clears it.
-      let watchdog: ReturnType<typeof setTimeout> | undefined;
+      // Set once a relaunch is scheduled: the failed child is still dying and
+      // its close event must not also terminate a turn that is coming back.
+      let retryScheduled = false;
+      // The replay-safety gate, and it is PROTOCOL state rather than a
+      // reading of the error text: it flips the moment this child put
+      // something on the bus a relaunch would duplicate — a tool step, a
+      // streamed token, a refusal.  Before that, a transient failure is a
+      // failure to START, and starting over costs nothing.
+      let sawOutput = false;
+      // The backstops for a child that neither emits `result` nor exits.  The
+      // exit/close handlers below cover a child that dies; these cover one
+      // that is alive and wedged, which would otherwise leave the bot busy
+      // forever.  Armed once the child exists; settle() and a scheduled
+      // relaunch always clear them.
+      const maxMs = config.promptTimeoutMs ?? DEFAULT_PROMPT_MAX_MS;
+      const idleMs = config.promptIdleMs ?? DEFAULT_PROMPT_IDLE_MS;
+      const toolIdleMs = config.promptToolIdleMs ?? DEFAULT_PROMPT_TOOL_IDLE_MS;
+      let idleTimer: ReturnType<typeof setTimeout> | undefined;
+      let idleWarnTimer: ReturnType<typeof setTimeout> | undefined;
+      let maxTimer: ReturnType<typeof setTimeout> | undefined;
+      let maxWarnTimer: ReturnType<typeof setTimeout> | undefined;
+      const clearDeadlines = () => {
+        clearTimeout(idleTimer);
+        clearTimeout(idleWarnTimer);
+        clearTimeout(maxTimer);
+        clearTimeout(maxWarnTimer);
+      };
       // Assigned once the child exists. A child can emit `result` and then
       // hang, so settling must still arrange for process and MCP cleanup.
       let armPostSettleCleanup = () => {};
@@ -425,44 +849,62 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
         ok: boolean,
         stopReason: string | null,
         cost: number | null = null,
-        usage?: { input: number; output: number },
+        usage?: { input: number; output: number; cachedInput?: number },
       ) => {
-        if (settled) return;
+        if (settled || retryScheduled) return;
         settled = true;
-        clearTimeout(watchdog);
+        retryState.delete(threadId);
+        clearDeadlines();
         active.delete(threadId);
         armPostSettleCleanup();
         emit({ ...base(threadId, turnId), type: "turn.completed", ok, stopReason, cost, ...(usage ? { usage } : {}) });
       };
 
-      // agy's print mode is argv-only, so a prompt beyond ARG_MAX would fail the
-      // spawn with E2BIG. Reject oversized prompts up front with a clear error
-      // instead of a cryptic spawn failure.
-      if (Buffer.byteLength(prompt) > 256 * 1024) {
+      // agy accepts prompts either via `--print <prompt>` on argv or via stdin.
+      // Prompts <= 64KB pass on argv for backward compatibility with CLI stubs;
+      // larger prompts pipe via stdin to avoid OS ARG_MAX / E2BIG limits.
+      const MAX_PROMPT_BYTES = 20 * 1024 * 1024; // 20MB safety ceiling
+      if (Buffer.byteLength(prompt) > MAX_PROMPT_BYTES) {
         emit({
           ...base(threadId, turnId),
           type: "runtime.error",
-          message: `prompt too large for Antigravity's argv-only print mode (${Buffer.byteLength(prompt)} bytes)`,
+          message: `prompt too large (${Buffer.byteLength(prompt)} bytes, max ${MAX_PROMPT_BYTES} bytes)`,
         });
         settle(false, "prompt_too_large");
         pending.delete(threadId);
         return { turnId };
       }
+      const useStdin = Buffer.byteLength(prompt) > 64 * 1024;
 
-      // agy's config is global, so every turn — including one without a
-      // computer — owns the mount for its complete child lifetime. This keeps
-      // overlapping turns from inheriting, replacing, or removing each
-      // other's tools and credentials.
-      const releaseMcpLease = await acquireAntigravityComputerMcpLease();
+      // agy's config is global, so a turn that WRITES it owns the mount for
+      // its complete child lifetime — that is what keeps overlapping turns
+      // from inheriting, replacing, or removing each other's tools and
+      // credentials.  A turn that neither mounts anything nor has a leftover
+      // key to strip writes nothing, so it takes the shared side and runs
+      // alongside its peers instead of queueing behind them (DR4).
+      //
+      // Both reads happen in this one synchronous stretch, and the acquire
+      // below claims its side before its first await, so a mounting turn can
+      // never slip in between deciding and claiming.
+      const mcpServers = antigravityMcpServers(turn.integrations);
+      const mcpConfigPath = antigravityMcpConfigPath(env);
+      const mountsComputer = Object.keys(mcpServers).length > 0;
+      const ownsMcpFile = mountsComputer || antigravityConfigHasBotfleetServers(mcpConfigPath);
+      const releaseMcpLease = await acquireAntigravityComputerMcpLease(mcpConfigPath, ownsMcpFile);
       if (disposed) {
         releaseMcpLease();
         pending.delete(threadId);
         settle(false, "disposed");
         return { turnId };
       }
+      // The ceiling's clock starts here, once the lease is held, not when
+      // sendTurn was entered: a turn queued behind another mounting turn must
+      // not arrive with its 11 minutes already spent.  A relaunch keeps the
+      // first launch's start, so the ceiling still spans every attempt.
+      if (retry.attempt === 0) retry.startedAt = Date.now();
       let restoreMcp = () => {};
       try {
-        restoreMcp = ensureAntigravityMcp(antigravityMcpServers(turn.integrations), env);
+        restoreMcp = ensureAntigravityMcp(mcpServers, env);
       } catch (error) {
         releaseMcpLease();
         pending.delete(threadId);
@@ -478,15 +920,22 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       }
 
       const args = [
-        "--print", prompt, // print mode reads the prompt from this argv value
         "--output-format", "stream-json",
-        "--print-timeout", "10m",
+        "--print-timeout", antigravityPrintTimeout(maxMs),
         "--add-dir", cwd,
-        // fullAuto approves everything; otherwise accept-edits allows file
-        // edits but auto-denies shell (no interactive channel in print mode)
-        config.fullAuto ? "--dangerously-skip-permissions" : "--mode",
+        // fullAuto approves everything.  accept-edits is the execution mode,
+        // NOT a permission setting: it auto-approves file edits and leaves
+        // terminal commands to agy's Tool Execution Policy, which is why a
+        // host-control turn also has to check `permission_mode` on init.
+        // turnConfig, not config: a host-control turn never takes the bypass.
+        turnConfig.fullAuto ? "--dangerously-skip-permissions" : "--mode",
       ];
-      if (!config.fullAuto) args.push("accept-edits");
+      if (!turnConfig.fullAuto) args.push("accept-edits");
+      if (!useStdin) {
+        args.unshift("--print", prompt);
+      } else {
+        args.unshift("--print", "-");
+      }
       if (turn.model) args.push("--model", injectedApiModel(turn.model) ?? turn.model);
       if (resumeCursor) args.push("--conversation", resumeCursor);
 
@@ -496,9 +945,15 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       try {
         child = spawnCli(config.cli, args, {
           cwd,
-          env,
-          stdio: ["ignore", "pipe", "pipe"], // prompt is on argv; stdin is unused
+          // `env` is built once per instance and shared by every turn; the
+          // launch identity is this bot's and this turn's, applied to a copy.
+          env: launchedChildEnvironment(env, turn.launchIdentity, cliLoginEnvironment(turn.launchIdentity?.seat)),
+          stdio: [useStdin ? "pipe" : "ignore", "pipe", "pipe"],
         });
+        if (useStdin && child.stdin) {
+          child.stdin.on("error", () => {});
+          child.stdin.end(prompt);
+        }
       } catch (error) {
         try {
           restoreMcp();
@@ -568,11 +1023,101 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
         postSettleReaper.unref?.();
       };
 
+      /** Absorb a transient failure by relaunching the turn, or report false
+       *  and let the caller settle it (DR2).
+       *
+       *  Antigravity had no retry at all: a single 429 or a connection reset
+       *  failed the whole turn and pushed the bot's fallback chain into a
+       *  cooldown one more attempt would have avoided.  The conditions are
+       *  claude.ts's, for claude.ts's reasons — transient by the shared
+       *  classifier, not stopped by the person, budget left, and nothing yet
+       *  put on the bus by this child.
+       *
+       *  A timeout is transient to the shared classifier but never relaunched
+       *  here: agy's own "timeout waiting for response" means the provider
+       *  already hung once on this exact prompt, and relaunching into the same
+       *  hang is how one turn used to occupy a bot for half an hour.  Nor is
+       *  anything relaunched once the turn's hard ceiling has passed. */
+      const maybeRetry = (failure: Parameters<typeof classifyError>[0]): boolean => {
+        if (settled || retryScheduled || sawOutput) return false;
+        if (retry.cancelled || disposed) return false;
+        if (retry.attempt >= RETRY_MAX_ATTEMPTS - 1) return false;
+        if (Date.now() - retry.startedAt >= maxMs) return false;
+        const verdict = classifyError(failure);
+        if (!verdict.transient || verdict.reason === "timeout") return false;
+
+        retryScheduled = true;
+        clearDeadlines();
+        retry.attempt++;
+        const delayMs = computeBackoff(retry.attempt - 1);
+        emit({
+          ...base(threadId, turnId),
+          type: "turn.retrying",
+          attempt: retry.attempt,
+          delayMs,
+          reason: verdict.reason,
+        });
+        // The thread STAYS claimed through the backoff — that entry is what
+        // makes a stop during the wait reach this turn rather than racing a
+        // relaunch nobody can see yet.
+        const cancelRetry = () => {
+          retry.cancelled = true;
+          retryAbort.abort();
+        };
+        active.set(threadId, { stop: cancelRetry, turnId });
+        void (async () => {
+          const wait = interruptibleDelay(delayMs * retryScale, retryAbort.signal);
+          await wait.promise;
+          active.delete(threadId);
+          if (retry.cancelled || disposed) {
+            retryState.delete(threadId);
+            emit({
+              ...base(threadId, turnId),
+              type: "turn.completed",
+              ok: false,
+              stopReason: retry.cancelled ? "interrupted" : "disposed",
+              cost: null,
+            });
+            return;
+          }
+          try {
+            // The SAME turn: a relaunch keeps the cursor it arrived with, so
+            // it resumes the thread's real conversation rather than the one
+            // this attempt created and abandoned.
+            await sendTurn(turn);
+          } catch (error) {
+            retryState.delete(threadId);
+            emit({
+              ...base(threadId, turnId),
+              type: "runtime.error",
+              message: error instanceof Error ? error.message : String(error),
+            });
+            emit({
+              ...base(threadId, turnId),
+              type: "turn.completed",
+              ok: false,
+              stopReason: "exit_before_result",
+              cost: null,
+            });
+          }
+        })();
+        return true;
+      };
+
       // conversation_id from the init event → the resumeCursor (session.started
       // is what the harness persists as the cursor). Also seeds tool item ids.
       let conversationId: string | null = null;
+      let streamedAssistantText = "";
+      // Set when a host-control turn is stopped over agy's tool execution
+      // policy.  The child is killed, but lines already in the pipe would
+      // otherwise keep emitting steps into a turn the person was told ended.
+      let hostPolicyRefused = false;
+      // Tool steps agy has reported ACTIVE and not yet DONE or ERROR.  While
+      // any is open the silence window is the longer tool window.
+      const activeTools = new Set<string>();
 
       const handleLine = (line: string) => {
+        if (settled || retryScheduled || hostPolicyRefused) return;
         let o: any;
         try {
           o = JSON.parse(line);
@@ -590,53 +1135,192 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
               sessionId: conversationId,
               model: turn.model ?? null,
             });
+            // The init event is the only place agy states the Tool Execution
+            // Policy this session is running under, and it is the setting that
+            // decides whether `run_command` asks — `--mode accept-edits` does
+            // not (file header).  On the person's own desktop, a policy that
+            // does not ask means arbitrary shell with no card and nobody to
+            // show one to, so the turn ends here rather than running.  An
+            // unreported or unrecognized value is treated the same way: this
+            // check exists because the driver used to assume a refusal it
+            // never verified, and a default of "probably fine" would repeat
+            // exactly that.  `proceed-in-sandbox` is refused too: its effect on the
+            // host turns on a second agy setting this driver does not read.
+            if (controlsHost && !isAutoApproved) {
+              const reported =
+                typeof payload.permission_mode === "string"
+                  ? payload.permission_mode
+                  : typeof o.permission_mode === "string"
+                    ? o.permission_mode
+                    : null;
+              if (reported === null || !ANTIGRAVITY_ASKING_POLICIES.has(reported)) {
+                hostPolicyRefused = true;
+                // a refusal is a verdict the person is shown; never re-run it
+                sawOutput = true;
+                emit({
+                  ...base(threadId, turnId),
+                  type: "runtime.error",
+                  message: antigravityHostPolicyRefusal(reported),
+                });
+                stop();
+                settle(false, "host_control_policy");
+                return;
+              }
+            }
             break;
           }
           case "step_update": {
             if (payload.step_type === "tool") {
               const itemId = `${conversationId ?? o.conversation_id ?? "conv"}:${payload.step_index}`;
+              // a tool is running, or has run: a relaunch would repeat it
+              sawOutput = true;
+              const rawInput =
+                payload.tool_info?.parameters ??
+                payload.tool_input ??
+                payload.input ??
+                payload.args ??
+                payload.parameters;
               if (payload.state === "ACTIVE") {
-                emit({ ...base(threadId, turnId), type: "item.started", itemType: "tool", itemId, title: payload.tool_name });
-              } else if (payload.state === "DONE") {
-                emit({ ...base(threadId, turnId), type: "item.completed", itemType: "tool", itemId, ok: true });
-              } else if (payload.state === "ERROR") {
-                emit({ ...base(threadId, turnId), type: "item.completed", itemType: "tool", itemId, ok: false });
+                activeTools.add(itemId);
+                emit({
+                  ...base(threadId, turnId),
+                  type: "item.started",
+                  itemType: "tool",
+                  itemId,
+                  title: payload.tool_name,
+                  ...toolFields(payload.tool_name, rawInput, { cwd: turn.cwd }),
+                  ...captureInput(rawInput),
+                });
+              } else {
+                // Any state other than ACTIVE means the step is no longer
+                // running (CANCELED included), so the longer tool window
+                // must not outlive it.
+                activeTools.delete(itemId);
+                const rawDetail =
+                  payload.output ??
+                  payload.tool_info?.output ??
+                  payload.result ??
+                  payload.tool_info?.result ??
+                  payload.tool_info?.error ??
+                  payload.error ??
+                  payload.content;
+                const detail = describeResult(rawDetail);
+                const outputIo = captureOutput(rawDetail);
+                const durationMs =
+                  typeof payload.duration_seconds === "number" && Number.isFinite(payload.duration_seconds)
+                    ? Math.round(payload.duration_seconds * 1000)
+                    : undefined;
+                if (payload.state === "DONE") {
+                  emit({
+                    ...base(threadId, turnId),
+                    type: "item.completed",
+                    itemType: "tool",
+                    itemId,
+                    ok: true,
+                    ...(detail ? { detail } : {}),
+                    ...(durationMs ? { durationMs } : {}),
+                    ...outputIo,
+                  });
+                } else if (payload.state === "ERROR") {
+                  emit({
+                    ...base(threadId, turnId),
+                    type: "item.completed",
+                    itemType: "tool",
+                    itemId,
+                    ok: false,
+                    ...(detail ? { detail } : {}),
+                    ...(durationMs ? { durationMs } : {}),
+                    ...outputIo,
+                  });
+                }
               }
-            } else if (payload.step_type === "agent_response" && payload.usage) {
-              emit({
-                ...base(threadId, turnId),
-                type: "thread.token-usage.updated",
-                input: (payload.usage.input_tokens || 0) + (payload.usage.cache_read_tokens || 0),
-                output: payload.usage.output_tokens || 0,
-              });
+            } else if (payload.step_type === "agent_response") {
+              if (typeof payload.text_delta === "string" && payload.text_delta.length > 0) {
+                streamedAssistantText += payload.text_delta;
+                // words the person has already read — see maybeRetry
+                sawOutput = true;
+                emit({ ...base(threadId, turnId), type: "content.delta", streamKind: "assistant_text", delta: payload.text_delta });
+              }
+              if (payload.usage) {
+                const cacheRead = payload.usage.cache_read_tokens;
+                emit({
+                  ...base(threadId, turnId),
+                  type: "thread.token-usage.updated",
+                  input: (payload.usage.input_tokens || 0) + (payload.usage.cache_read_tokens || 0),
+                  output: payload.usage.output_tokens || 0,
+                  ...(typeof cacheRead === "number" && Number.isFinite(cacheRead) && cacheRead >= 0
+                    ? { cachedInput: cacheRead }
+                    : {}),
+                });
+              }
             }
             break;
           }
           case "result": {
-            // agy delivers the assistant text in result.response (not streamed)
-            const response = typeof payload.response === "string" ? payload.response : "";
-            if (response) {
+            const response = typeof payload.response === "string" ? payload.response : streamedAssistantText;
+            // agy has no error event: a provider 429 or a dropped connection
+            // arrives as an ERROR result like everything else.  One that
+            // carries no answer and followed no tool step is a failure to
+            // START, so it gets the same relaunch a dead child would.
+            if (!response && !sawOutput) {
+              const early = parseAntigravityTurnResult(payload);
+              if (early.status !== "SUCCESS" && maybeRetry({ text: antigravityTurnErrorMessage(early) })) {
+                stop(); // the child has said all it is going to
+                return;
+              }
+            }
+            if (response && !streamedAssistantText) {
               emit({ ...base(threadId, turnId), type: "content.delta", streamKind: "assistant_text", delta: response });
+            }
+            if (response) {
               emit({ ...base(threadId, turnId), type: "item.completed", itemType: "assistant_text", text: response });
             }
             if (payload.usage) {
+              const cacheRead = payload.usage.cache_read_tokens;
               emit({
                 ...base(threadId, turnId),
                 type: "thread.token-usage.updated",
                 input: (payload.usage.input_tokens || 0) + (payload.usage.cache_read_tokens || 0),
                 output: payload.usage.output_tokens || 0,
+                ...(typeof cacheRead === "number" && Number.isFinite(cacheRead) && cacheRead >= 0
+                  ? { cachedInput: cacheRead }
+                  : {}),
               });
             }
-            // result.usage is the turn total (the per-step agent_response
-            // figures above are its parts, not additions to it)
+            // agy has no separate error event: a provider quota, a failed
+            // eligibility check, and its own "timeout waiting for response"
+            // all arrive as this one `result` with status ERROR and a
+            // human-readable `error`.  Surfacing it is the whole difference
+            // between a red chip the person can act on and a turn that just
+            // stops with nothing where the answer should be.
+            const result = parseAntigravityTurnResult(payload);
+            const ok = result.status === "SUCCESS";
+            // A person who pressed Stop gets a stopped turn, not a crash: agy
+            // may still flush a CANCELED or ERROR result on its way out, and
+            // that is the stop they asked for, not a failure to report.
+            if (!ok && retry.cancelled) {
+              settle(false, "interrupted");
+              break;
+            }
+            if (!ok) {
+              emit({
+                ...base(threadId, turnId),
+                type: "runtime.error",
+                message: antigravityTurnErrorMessage(result),
+              });
+            }
             settle(
-              payload.status === "SUCCESS",
-              payload.status ?? null,
+              ok,
+              result.status ?? null,
               null,
               payload.usage
                 ? {
                     input: (payload.usage.input_tokens || 0) + (payload.usage.cache_read_tokens || 0),
                     output: payload.usage.output_tokens || 0,
+                    ...(typeof payload.usage.cache_read_tokens === "number" &&
+                    Number.isFinite(payload.usage.cache_read_tokens) && payload.usage.cache_read_tokens >= 0
+                      ? { cachedInput: payload.usage.cache_read_tokens }
+                      : {}),
                   }
                 : undefined,
             );
@@ -645,16 +1329,100 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
         }
       };
 
+      // ── deadlines ────────────────────────────────────────────────────────
+      // Said once the window is 80 % spent, on the same `notice` chip the
+      // host-control warning uses, so a stop never arrives unannounced.
+      let noticeCount = 0;
+      // One idle warning per turn: a long quiet spell that then resumes must
+      // not leave a fresh chip in the transcript every time it recurs.
+      let idleWarned = false;
+      const deadlineNotice = (title: string) => {
+        if (settled || retryScheduled) return;
+        const itemId = `${turnId}:deadline-notice-${++noticeCount}`;
+        emit({ ...base(threadId, turnId), type: "item.started", itemType: "tool", itemId, title, toolKind: "notice" });
+        emit({ ...base(threadId, turnId), type: "item.completed", itemType: "tool", itemId, ok: true });
+      };
+      const tripDeadline = (stopReason: "prompt_stall" | "prompt_timeout", message: string) => {
+        // A person already stopped this turn: the child's close settles it
+        // as interrupted, and a deadline firing in that gap is not a stall.
+        if (settled || retryScheduled || retry.cancelled) return;
+        emit({ ...base(threadId, turnId), type: "runtime.error", message });
+        stop();
+        // prompt_stall and prompt_timeout are the stop reasons index.ts
+        // already treats as a possibly wedged session: the next turn starts a
+        // fresh conversation instead of resuming this one.
+        settle(false, stopReason);
+      };
+      const armIdle = () => {
+        if (settled || retryScheduled) return;
+        clearTimeout(idleTimer);
+        clearTimeout(idleWarnTimer);
+        const toolRunning = activeTools.size > 0;
+        const windowMs = toolRunning ? toolIdleMs : idleMs;
+        const warnMs = Math.round(windowMs * DEADLINE_WARN_FRACTION);
+        if (!idleWarned) {
+          idleWarnTimer = setTimeout(() => {
+            idleWarned = true;
+            deadlineNotice(
+              `Antigravity has gone quiet${toolRunning ? " while a tool runs" : ""}.  If nothing arrives in the next ${describeWindow(windowMs - warnMs)}, BotFleet stops the turn as stalled.`,
+            );
+          }, warnMs);
+          idleWarnTimer.unref?.();
+        }
+        idleTimer = setTimeout(
+          () =>
+            tripDeadline(
+              "prompt_stall",
+              `Antigravity sent nothing for ${describeWindow(windowMs)}${toolRunning ? " while a tool ran" : ""} and was stopped.`,
+            ),
+          windowMs,
+        );
+        idleTimer.unref?.();
+      };
+      // The hard ceiling runs from the start of the LOGICAL turn, so a
+      // relaunch inherits what is left of it rather than a fresh budget.
+      const armMax = () => {
+        const elapsed = Date.now() - retry.startedAt;
+        const warnIn = Math.round(maxMs * DEADLINE_WARN_FRACTION) - elapsed;
+        if (warnIn > 0) {
+          maxWarnTimer = setTimeout(
+            () =>
+              deadlineNotice(
+                `This turn is close to Antigravity's ${describeWindow(maxMs)} limit.  BotFleet stops it in ${describeWindow(maxMs - Math.round(maxMs * DEADLINE_WARN_FRACTION))} if it has not finished.`,
+              ),
+            warnIn,
+          );
+          maxWarnTimer.unref?.();
+        }
+        maxTimer = setTimeout(
+          () =>
+            tripDeadline(
+              "prompt_timeout",
+              `Antigravity ran past its ${describeWindow(maxMs)} limit and was stopped.`,
+            ),
+          Math.max(0, maxMs - elapsed),
+        );
+        maxTimer.unref?.();
+      };
+
       let buf = "";
       child.stdout.setEncoding("utf8"); // decode multibyte across chunk splits
       child.stdout.on("data", (chunk) => {
         buf += chunk;
         let nl;
+        let sawLine = false;
         while ((nl = buf.indexOf("\n")) !== -1) {
           const line = buf.slice(0, nl);
           buf = buf.slice(nl + 1);
-          if (line.trim()) handleLine(line);
+          if (line.trim()) {
+            handleLine(line);
+            sawLine = true;
+          }
         }
+        // Any complete line is proof of life.  Re-armed AFTER the lines are
+        // handled, so a step that just went ACTIVE (or DONE) picks the
+        // window that matches it.
+        if (sawLine) armIdle();
       });
 
       let stderr = "";
@@ -668,48 +1436,126 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
         settle(false, "spawn_error");
       });
 
-      child.on("close", (code) => {
+      // The turn must end when the child does, however it goes: a clean exit
+      // with no `result`, a crash, a kill, or a wedged process the idle or
+      // ceiling deadline reaps.  Anything that leaves this unsettled leaves
+      // the bot busy with nothing on screen — the stuck-forever bug, of which
+      // a silently dropped quota was only the trigger.
+      let exitDrain: ReturnType<typeof setTimeout> | undefined;
+      const finishOnChildGone = (code: number | null, signal: NodeJS.Signals | null) => {
         childClosed = true;
-        children.delete(child); // close is the true process-exit signal
+        children.delete(child);
         clearTimeout(postSettleReaper);
         clearTimeout(terminationEscalation);
+        clearTimeout(exitDrain);
         finalizeMcp();
-        if (!settled) {
-          emit({
-            ...base(threadId, turnId),
-            type: "runtime.error",
-            message: `agy exited ${code} before result${stderr ? `: ${stderr.trim().slice(-300)}` : ""}`,
-          });
-          settle(false, "exit_before_result");
+        if (settled || retryScheduled) return;
+        // Stop is not a crash.  The person (or a forced quiesce) asked for
+        // this child to die, so its SIGTERM is the expected ending: settle
+        // as interrupted, with no runtime.error for Sentry to page on.
+        if (retry.cancelled) {
+          settle(false, "interrupted");
+          return;
         }
+        const how = code === null && signal ? `was killed by ${signal}` : `exited ${code}`;
+        const message = `agy ${how} before result${stderr ? `: ${stderrExcerpt(stderr)}` : ""}`;
+        // The mount lease is already released above, so the relaunch queues
+        // for it honestly instead of deadlocking on a lease this turn still
+        // holds.
+        if (maybeRetry({ exitCode: code, stderr: message })) return;
+        emit({ ...base(threadId, turnId), type: "runtime.error", message });
+        settle(false, "exit_before_result");
+      };
+
+      child.on("close", (code, signal) => finishOnChildGone(code, signal));
+
+      // `close` waits for every stdio pipe to reach EOF, and agy's own MCP
+      // servers are grandchildren that inherited those pipes — one of them
+      // outliving agy holds `close` back indefinitely even though agy itself
+      // is gone. `exit` is the process's own death, so it is the honest
+      // signal; give stdout a short grace to drain a trailing `result` line
+      // (which settles the turn properly), then finish on the exit alone.
+      child.on("exit", (code, signal) => {
+        if (childClosed || exitDrain) return;
+        exitDrain = setTimeout(() => finishOnChildGone(code, signal), EXIT_DRAIN_GRACE_MS);
+        exitDrain.unref?.();
       });
 
-      active.set(threadId, { stop, turnId });
+      // Wrapped, not bare: a person who stops this turn has stopped the WHOLE
+      // turn, and the child's close must not then read as a transient failure
+      // worth relaunching.  `stop` stays unwrapped for the driver's own use.
+      active.set(threadId, {
+        stop: () => {
+          retry.cancelled = true;
+          retryAbort.abort();
+          clearDeadlines();
+          stop();
+        },
+        turnId,
+      });
       pending.delete(threadId);
 
-      // 11 min — just above agy's own 10m --print-timeout, so agy normally
-      // settles first; this is the backstop for a fully wedged child.
-      watchdog = setTimeout(() => {
-        if (!settled) {
-          emit({ ...base(threadId, turnId), type: "runtime.error", message: "agy watchdog timeout" });
-          stop();
-          settle(false, "timeout");
-        }
-      }, 11 * 60_000);
-      watchdog.unref?.();
+      armIdle();
+      armMax();
 
       emit({ ...base(threadId, turnId), type: "turn.started" });
+
+      if (controlsHost && !isAutoApproved) {
+        // Not a step the model took — the harness saying what this turn
+        // cannot do, on the same `notice` chip a model fallback uses.  It
+        // opens and settles in one breath because there is nothing to wait
+        // for; an unsettled tool row would spin for the whole turn.
+        const noticeItemId = `${turnId}:host-control-notice`;
+        emit({
+          ...base(threadId, turnId),
+          type: "item.started",
+          itemType: "tool",
+          itemId: noticeItemId,
+          title: ANTIGRAVITY_HOST_CONTROL_NOTICE,
+          toolKind: "notice",
+        });
+        emit({
+          ...base(threadId, turnId),
+          type: "item.completed",
+          itemType: "tool",
+          itemId: noticeItemId,
+          ok: true,
+        });
+      }
 
       return { turnId };
     };
 
+    const lastKnownVersion = new LastKnownAnswer<string>();
     const snapshot = async (): Promise<ProviderSnapshot> => {
-      const version = await new Promise<string | null>((resolve) => {
-        execCli(config.cli, ["--version"], { timeout: 8000, env }, (err, stdout) =>
-          resolve(err ? null : stdout.trim()),
-        );
+      // Its place among overlapping probes: taken before the process starts,
+      // so a slow older probe cannot replace what a newer one remembered.
+      const versionOrder = lastKnownVersion.begin();
+      const startedAt = Date.now();
+      const probed = await new Promise<{ version: string | null; error: Error | null }>((resolve) => {
+        execCli(config.cli, ["--version"], { timeout: 20000, env }, (err, stdout) => {
+          resolve({ version: err ? null : stdout.trim() || null, error: err });
+        });
       });
-      if (!version) return { state: "unavailable", reason: `\`${config.cli}\` CLI not found` };
+      let version = probed.version;
+      if (version) {
+        lastKnownVersion.record(version, versionOrder);
+      } else {
+        const elapsed = Date.now() - startedAt;
+        logProbeFailure(instanceId, `${config.cli} --version`, probed.error, elapsed);
+        const failure = classifyVersionProbeFailure(probed.error, config.cli, input.displayName || "Antigravity", elapsed, 20000);
+        const remembered = failure.kind === "transient" ? lastKnownVersion.get() : null;
+        if (remembered) {
+          // Only a probe that gave no answer may stand on the last good
+          // version.  A missing or crashing binary is a verdict.
+          version = remembered;
+        } else {
+          if (failure.kind !== "transient") lastKnownVersion.forget(versionOrder);
+          return failure.kind === "transient"
+            ? { state: "unavailable", transient: true, reason: failure.reason }
+            : { state: "unavailable", reason: failure.reason };
+        }
+      }
       // No auth field: agy auth is keyring-backed with no reliable file marker
       // (~/.gemini/antigravity-cli/ exists after first run even when logged
       // out), so any file heuristic would overstate "signed in". Leave undefined.
@@ -728,24 +1574,36 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       snapshot,
       adapter: {
         provider: DRIVER_KIND,
+        // `localComputerMcp` stays true, and sendTurn is what earns it.  A
+        // turn holding host control is spawned WITHOUT the bypass, so agy runs
+        // `--mode accept-edits`: file edits go through, and a shell ask is
+        // auto-DENIED rather than surfaced — `run_command` comes back to the
+        // model as a tool error.  So a shell command on this computer is
+        // refused, never run silently, which is the property contracts.ts is
+        // protecting; what is still missing is the card that would let someone
+        // say yes.  `respondToRequest` is "unavailable" for the same reason:
+        // print mode opens no ask, so there is nothing to answer.  Real
+        // per-action approval arrives when agy exposes native ACP (agy issue
+        // #31) and this driver moves onto acp/core.ts's broker; the
+        // alternative until then is setting this flag false, which would take
+        // the desktop away from every Antigravity bot that has it today.
         capabilities: {
           sessionModelSwitch: "in-session",
           images: true,
-          // Cloud box, Local VM, and VPS computers all mount through the
-          // global mcp_config.json above. Only full-auto instances advertise
-          // it: print mode has no interactive approval channel, and outside
-          // --dangerously-skip-permissions agy auto-denies tools that would
-          // prompt (the accept-edits shell behavior in the header comment),
-          // so a non-fullAuto mount could never fire. localComputerMcp stays
-          // unset on purpose — the host desktop requires per-action human
-          // approval (see contracts.ts), which print mode cannot deliver in
-          // any mode; that returns with the native ACP path (agy issue #31).
-          computerMcp: config.fullAuto,
-          localComputerMcp: !config.fullAuto,
-          // The same approval limitation applies to bot-to-bot calls. The
-          // harness only injects the short-lived agents proxy when this flag
-          // is true, so safe-mode turns never expose a token they cannot use.
-          agentsMcp: config.fullAuto,
+          computerMcp: true,
+          localComputerMcp: true,
+          agentsMcp: true,
+          composioMcp: true,
+          phoneMcp: true,
+          qdrantMcp: true,
+          // Jobs matrix: BotFleet jobs are gated until their fixtures pass
+          // (P2b).  `invoke_subagent` is the tool name on the row, and the
+          // chat draws that row as a named helper card (jobs P3).
+          backgroundJobs: "none",
+          helpers: "named",
+          // Print mode has no permission hook (see the header), but every
+          // step streams as a tool_use event, so review can watch it.
+          reviewHook: "after",
         },
         sendTurn,
         interruptTurn: async (threadId) => active.get(threadId)?.stop(),

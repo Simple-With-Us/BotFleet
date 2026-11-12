@@ -1,7 +1,14 @@
 import { z } from "zod";
 
-import { botAvatarCropSchema, botAvatarUrlSchema } from "../shared/bot-avatar.ts";
-import { BOT_PROFILE_LIMITS } from "../shared/bot-profile.ts";
+import { BOT_AVATAR_CROPS, botAvatarCropSchema, botAvatarUrlSchema } from "../shared/bot-avatar.ts";
+import { BOT_PROFILE_LIMITS, MAX_TOOL_ROUNDS, maxHistoryTurnsSchema } from "../shared/bot-profile.ts";
+import { mergeBotVoices, type BotVoices } from "../shared/bot-voice.ts";
+import {
+  CONNECTOR_SLUGS_MAX,
+  CONNECTOR_SLUG_PATTERN,
+  CONNECTOR_TOOLS_PER_SERVICE_MAX,
+  CONNECTOR_TOOL_NAME_PATTERN,
+} from "../shared/connector-tools.ts";
 
 import type { BotRecord } from "./store.ts";
 
@@ -13,9 +20,104 @@ export const BOT_PROFILE_PATCH_FIELDS = [
   "avatarUrl",
   "avatarCrop",
   "voice",
+  "voices",
   "speakReplies",
+  "speechDevices",
+  "voiceSummaryMode",
   "modelSelection",
+  "chiefOfStaff",
+  "approvePeerComms",
+  "autoApprove",
+  "bypassPermissions",
+  "bypassLocalComputer",
+  "autoReview",
+  "composio",
+  "off",
+  "connectorTools",
+  "cloudBackend",
+  "autoStartVps",
+  "cwd",
+  "extraCwds",
+  "userNotes",
+  "effort",
+  "computers",
+  "maxToolRounds",
+  "maxHistoryTurns",
+  "historySummaryModel",
 ] as const;
+
+/** One service's grant, `{ tools: "*" }` for every tool Composio offers on
+ * it or `{ tools: [...] }` for an exact list — never an empty list; a
+ * service that should reach no tools is left out of the record entirely,
+ * which parseBotProfilePatch normalizes to `undefined` from a null clear. */
+const connectorToolGrantSchema = z
+  .object({
+    tools: z.union(
+      [
+        z.literal("*"),
+        z
+          .array(
+            z.string().regex(CONNECTOR_TOOL_NAME_PATTERN, {
+              error: "connectorTools tool names must be Composio tool names like GMAIL_SEND_EMAIL",
+            }),
+          )
+          .min(1, { error: 'connectorTools.<service>.tools must be "*" or a non-empty list (omit the service to grant it no tools)' })
+          .max(CONNECTOR_TOOLS_PER_SERVICE_MAX, {
+            error: `connectorTools may list at most ${CONNECTOR_TOOLS_PER_SERVICE_MAX} tools per service`,
+          }),
+      ],
+      { error: 'connectorTools.<service> must be a grant like { tools: "*" } or { tools: ["TOOL_NAME"] }' },
+    ),
+  })
+  .strict();
+
+const connectorToolsSchema = z
+  .record(
+    z.string().regex(CONNECTOR_SLUG_PATTERN, { error: "connectorTools service slugs must be lowercase slugs" }),
+    connectorToolGrantSchema,
+  )
+  .refine((value) => Object.keys(value).length <= CONNECTOR_SLUGS_MAX, {
+    error: `connectorTools may name at most ${CONNECTOR_SLUGS_MAX} services`,
+  });
+
+
+/** One device's voice override: a voice id, or null / "" to clear it. */
+const deviceVoiceSchema = (device: "mac" | "iphone") =>
+  z
+    .string({ error: `voices.${device} must be a voice id or null` })
+    .max(BOT_PROFILE_LIMITS.voice, { error: `voices.${device} must be at most ${BOT_PROFILE_LIMITS.voice} characters` })
+    .nullable()
+    .optional();
+
+/** Per-device voices (shared/bot-voice.ts).  A PATCH names only the devices
+ * it changes; the merge with the stored record happens in
+ * parseBotProfilePatch so a phone saving its own voice cannot wipe the
+ * Mac's.  `null` clears every override. */
+const voicesSchema = z
+  .object(
+    { mac: deviceVoiceSchema("mac"), iphone: deviceVoiceSchema("iphone") },
+    { error: "voices must be an object with mac and iphone voice ids" },
+  )
+  .strict()
+  .nullable();
+
+const maxToolRoundsValueSchema = z.number().int().min(1).max(MAX_TOOL_ROUNDS);
+
+/** Integer 1..MAX_TOOL_ROUNDS, else absent. Empty/null/invalid all mean unset. */
+export function resolveMaxToolRounds(
+  value: string | number | boolean | null | undefined,
+): number | undefined {
+  const parsed = maxToolRoundsValueSchema.safeParse(value);
+  return parsed.success ? parsed.data : undefined;
+}
+
+/** Integer 0..MAX_HISTORY_TURNS, else absent. Empty/null/invalid all mean unset. */
+export function resolveMaxHistoryTurns(
+  value: string | number | boolean | null | undefined,
+): number | undefined {
+  const parsed = maxHistoryTurnsSchema.safeParse(value);
+  return parsed.success ? parsed.data : undefined;
+}
 
 const profilePatchSchema = z.object({
   name: z
@@ -34,7 +136,7 @@ const profilePatchSchema = z.object({
   notifications: z.boolean({ error: "notifications must be true or false" }).optional(),
   avatarUrl: z
     .union([botAvatarUrlSchema, z.literal(""), z.null()], {
-      error: "avatarUrl must be a stored PNG, JPEG, GIF, or WebP attachment",
+      error: "avatarUrl must be a stored image attachment",
     })
     .optional(),
   avatarCrop: botAvatarCropSchema.optional(),
@@ -42,8 +144,43 @@ const profilePatchSchema = z.object({
     .string({ error: "voice must be a string" })
     .max(BOT_PROFILE_LIMITS.voice, { error: "voice must be at most 200 characters" })
     .optional(),
+  voices: voicesSchema.optional(),
   speakReplies: z.boolean({ error: "speakReplies must be true or false" }).optional(),
+  speechDevices: z.array(z.enum(["mac", "iphone"])).max(2).refine((v) => new Set(v).size === v.length, "speechDevices must not repeat a device").optional(),
+  voiceSummaryMode: z.enum(["off", "on_demand", "always"], { error: "voiceSummaryMode must be off, on_demand, or always" }).optional(),
   modelSelection: z.any().optional(),
+  chiefOfStaff: z.boolean({ error: "chiefOfStaff must be true or false" }).optional(),
+  approvePeerComms: z.boolean({ error: "approvePeerComms must be true or false" }).optional(),
+  autoApprove: z.boolean({ error: "autoApprove must be true or false" }).optional(),
+  bypassPermissions: z.boolean({ error: "bypassPermissions must be true or false" }).optional(),
+  // Owner's second switch, 2026-10-14.  Bypass alone deliberately stops at the
+  // edge of the person's real desktop, which made it *weaker* than Auto Mode,
+  // since Auto already answers those requests.  This is the named, opt-in way
+  // to say so, so the default boundary keeps standing rather than being
+  // quietly removed.  It means nothing without `bypassPermissions`.
+  bypassLocalComputer: z.boolean({ error: "bypassLocalComputer must be true or false" }).optional(),
+  autoReview: z.enum(["off", "shadow", "enforce"], { error: "autoReview must be off, shadow, or enforce" }).optional(),
+  composio: z.boolean({ error: "composio must be true or false" }).optional(),
+  // The bot's On/Off switch (shared/bot-power.ts).  Writable from a paired
+  // phone as well as the desktop: turning a bot Off only ever STOPS work, and
+  // the phone has to be able to turn it back On.  Same validation both ways.
+  off: z.boolean({ error: "off must be true or false" }).optional(),
+  connectorTools: z.union([connectorToolsSchema, z.null()]).optional(),
+  cloudBackend: z.enum(["box", "vps"], { error: "cloudBackend must be box or vps" }).optional(),
+  autoStartVps: z.boolean({ error: "autoStartVps must be true or false" }).optional(),
+  cwd: z.union([z.string(), z.literal(""), z.null()]).optional(),
+  extraCwds: z.array(z.string()).optional(),
+  userNotes: z.string().max(20000).optional(),
+  effort: z.string().max(50).optional(),
+  computers: z.array(z.enum(["cloud", "vm", "local"])).optional(),
+  // Integer 1..MAX_TOOL_ROUNDS kept; null/"" /invalid → undefined (absent).
+  maxToolRounds: z.any().optional(),
+  // Integer 0..MAX_HISTORY_TURNS kept; null/"" /invalid → undefined (absent).
+  // Arrays, objects and oversized strings never reach the resolver:  they
+  // fail the patch schema itself and take the API's validation-failure 4xx
+  // path instead of being accepted and silently clearing the setting.
+  maxHistoryTurns: z.union([z.string().max(64), z.number(), z.boolean(), z.null()]).optional(),
+  historySummaryModel: z.boolean({ error: "historySummaryModel must be true or false" }).optional(),
 });
 
 export type BotProfilePatchInput = z.input<typeof profilePatchSchema>;
@@ -51,9 +188,38 @@ export type BotProfilePatchInput = z.input<typeof profilePatchSchema>;
 export type BotProfilePatch = Partial<
   Pick<
     BotRecord,
-    "name" | "title" | "description" | "notifications" | "avatarUrl" | "avatarCrop" | "voice" | "speakReplies" | "modelSelection"
+    | "name"
+    | "title"
+    | "description"
+    | "notifications"
+    | "avatarUrl"
+    | "avatarCrop"
+    | "voice"
+    | "voices"
+    | "speakReplies"
+    | "speechDevices"
+    | "modelSelection"
+    | "activeModelSelection"
+    | "chiefOfStaff"
+    | "approvePeerComms"
+    | "autoApprove"
+    | "bypassPermissions"
+    | "bypassLocalComputer"
+    | "autoReview"
+    | "composio"
+    | "off"
+    | "connectorTools"
+    | "cloudBackend"
+    | "autoStartVps"
+    | "cwd"
+    | "extraCwds"
+    | "userNotes"
+    | "computers"
+    | "maxToolRounds"
+    | "maxHistoryTurns"
+    | "historySummaryModel"
   >
->;
+> & { effort?: string };
 
 export type BotProfilePatchResult =
   | { ok: true; patch: BotProfilePatch }
@@ -64,26 +230,79 @@ export type BotProfilePatchResult =
  * PATCH passes strict=false; paired clients use strict=true so a future bot
  * field cannot silently become remotely writable.
  *
+ * The execution-policy fields (`autoApprove`, `autoReview`,
+ * `approvePeerComms`, `bypassPermissions`) pass in both modes since the
+ * owner's 2026-10-09 ruling that a paired phone may set them.  Validating the
+ * VALUE is all this file does.  Which switches a particular bot may have
+ * turned on from a phone is decided where the stored bot is, in the profile
+ * route of server/index.ts:  Auto Mode never for a bot that can use This Mac,
+ * and `bypassLocalComputer` follows Auto rather than plain Bypass, because
+ * both name the same act — unattended control of the real desktop.
+ *
  * avatarUrl deliberately uses `undefined` as the normalized clear value.
  * Store persistence already omits undefined fields, while wireBot sends null
  * back to clients so Codable and object-spread clients both clear stale data.
+ *
+ * `current` is the stored bot, when there is one.  `voices` is merged into
+ * its existing overrides (an absent device is left alone), so the returned
+ * patch carries the complete record to store, or `undefined` to drop it.
  */
-export function parseBotProfilePatch(input: BotProfilePatchInput, strict = false): BotProfilePatchResult {
+export function parseBotProfilePatch(
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- validation boundary: the wire patch is untrusted and safeParse-checked before any field is read
+  input: unknown,
+  strict = false,
+  current?: { voices?: BotVoices } | null,
+): BotProfilePatchResult {
   const parsed = (strict ? profilePatchSchema.strict() : profilePatchSchema).safeParse(input);
   if (!parsed.success) {
     const unsupported = parsed.error.issues.find((issue) => issue.code === "unrecognized_keys");
     if (unsupported?.code === "unrecognized_keys") {
+      if (unsupported.path[0] === "voices") {
+        return { ok: false, error: `voices only accepts mac and iphone, not ${unsupported.keys[0] ?? "unknown"}` };
+      }
       return { ok: false, error: `unsupported profile field: ${unsupported.keys[0] ?? "unknown"}` };
     }
     const issue = parsed.error.issues[0];
     if (issue?.path[0] === "avatarCrop") {
-      return { ok: false, error: "avatarCrop must be mascot, circle, rounded, or square" };
+      // The message lists the crops a bot can actually pick.  It used to omit
+      // TV-Face, and it would have gone on omitting the animated crop, so it
+      // is built from the list the schema uses instead of being written out
+      // by hand.
+      return {
+        ok: false,
+        error: `avatarCrop must be ${BOT_AVATAR_CROPS.join(", ")}`,
+      };
     }
     return { ok: false, error: issue?.message ?? "invalid profile patch" };
   }
 
-  const { avatarUrl, ...fields } = parsed.data;
+  const {
+    avatarUrl,
+    cwd,
+    connectorTools,
+    voices,
+    maxToolRounds: _maxToolRounds,
+    maxHistoryTurns: _maxHistoryTurns,
+    ...fields
+  } = parsed.data;
   const patch: BotProfilePatch = fields;
+  if (voices !== undefined) patch.voices = mergeBotVoices(current?.voices, voices);
   if (avatarUrl !== undefined) patch.avatarUrl = avatarUrl || undefined;
+  if (cwd !== undefined) patch.cwd = cwd || undefined;
+  // null is the API-edge clear (matches avatarUrl/cwd): it returns the bot
+  // to legacy all-tools behavior. undefined here (the key was absent from
+  // the request) leaves any existing grants alone — patchBot only touches
+  // keys actually present on the patch object.
+  if (connectorTools !== undefined) patch.connectorTools = connectorTools === null ? undefined : connectorTools;
+  // maxToolRounds: key present → resolve (null/"" /invalid become undefined
+  // clear); key absent → leave existing value alone.
+  if (Object.prototype.hasOwnProperty.call(parsed.data, "maxToolRounds")) {
+    patch.maxToolRounds = resolveMaxToolRounds(parsed.data.maxToolRounds);
+  }
+  // maxHistoryTurns: same rule — key present resolves (null/"" /invalid
+  // clear), key absent leaves the stored cap alone.
+  if (Object.prototype.hasOwnProperty.call(parsed.data, "maxHistoryTurns")) {
+    patch.maxHistoryTurns = resolveMaxHistoryTurns(parsed.data.maxHistoryTurns);
+  }
   return { ok: true, patch };
 }

@@ -10,7 +10,7 @@
 //   3. an unattended block writes its row — the audit row that says "this
 //      would have auto-approved, and only the block stood in the way"
 //   4. GET /api/decisions pages newest-last with ?limit=
-import { spawn, type ChildProcess } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -18,7 +18,8 @@ import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import type { DecisionRow } from "./decision-log.ts";
-import { removeTempDir, waitForExit } from "./testing/cleanup.ts";
+import { removeTempDir, spawnDetached, waitForExit } from "./testing/cleanup.ts";
+import { harnessReady } from "./testing/harness-ready.ts";
 
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
 const FAKE_CLI = join(SERVER_DIR, "testing", "fake-acp-cli.ts");
@@ -128,7 +129,12 @@ posixOnly("authorization decisions are logged", () => {
         },
       }),
     );
-    child = spawn(process.execPath, [join(SERVER_DIR, "index.ts")], {
+    // This suite checks permission wiring, not host admission.  A busy
+    // runner defers a webhook wake for 20 minutes, longer than these
+    // assertions wait, so the webhook run stays queued and the test reads
+    // that as "the webhook never started a task".  Keep real production
+    // admission unchanged; isolate only this child.
+    child = spawnDetached(process.execPath, ["--import", join(SERVER_DIR, "testing", "cool-host-loader.mjs"), join(SERVER_DIR, "index.ts")], {
       cwd: join(SERVER_DIR, ".."),
       env: {
         ...(process.env.PATH ? { PATH: process.env.PATH } : {}),
@@ -143,7 +149,7 @@ posixOnly("authorization decisions are logged", () => {
     const deadline = Date.now() + 20_000;
     for (;;) {
       try {
-        if ((await fetch(`${BASE}/api/health`)).ok) break;
+        if (await harnessReady(BASE)) break;
       } catch {
         /* not up yet */
       }
@@ -230,13 +236,13 @@ posixOnly("authorization decisions are logged", () => {
       // Auto mode on AND the exact key granted: an attended turn would sail
       // straight through, so the only thing carding this one is the
       // unattended block — which is precisely what the row must say.
-      const bot = await makePermissionBot({ name: "Nightshift", autoApprove: true, alwaysAllow: ["shell:echo"] });
+      const bot = await makePermissionBot({ name: "Nightshift", autoApprove: true, computers: [], alwaysAllow: ["shell:echo"] });
 
       const hook = await api("POST", "/api/webhooks", {
         name: "Nightly build",
         prompt: "Handle the incoming build event",
         botId: bot.id,
-        runOn: "maus",
+        runOn: "bot",
       });
       expect(hook.status).toBe(201);
       const delivered = await fetch(hook.body.credential.url, {

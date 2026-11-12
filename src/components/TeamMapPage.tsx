@@ -14,6 +14,8 @@ import {
   type TeamMapSnapshot,
 } from "@/lib/team-map";
 import { cn } from "@/lib/cn";
+import { ConfirmDialog } from "./ConfirmDialog";
+import { productErrorHeadline } from "@/lib/product-error";
 
 const statusTone = {
   success: "bg-success",
@@ -40,10 +42,10 @@ function BotNode({ bot, chief = false }: { bot: Bot; chief?: boolean }) {
       />
       <span className="min-w-0 flex-1">
         <span className="flex items-center gap-1.5">
-          <span className="truncate text-[13.5px] font-semibold text-ink">{bot.name}</span>
+          <span className="truncate text-[13.5px] font-semibold text-ink" title={bot.name}>{bot.name}</span>
           {chief && <Crown size={12} className="shrink-0 text-warning" aria-label="Chief of Staff" />}
         </span>
-        <span className="block truncate text-[11.5px] text-ink-secondary">{bot.title || bot.modelSelection.model}</span>
+        <span className="block truncate text-[11.5px] text-ink-secondary" title={bot.title || bot.modelSelection.model}>{bot.title || bot.modelSelection.model}</span>
       </span>
       <span className="flex shrink-0 items-center gap-1.5 text-[10.5px] text-ink-secondary">
         <span className={cn("size-1.5 rounded-full", statusTone[status.tone], status.label === "Working" && "animate-pulse")} />
@@ -65,11 +67,11 @@ function EdgeRow({ edge, bots }: { edge: TeamMapEdge; bots: Bot[] }) {
       className="flex w-full items-center gap-3 rounded-xl border border-hairline/40 bg-card px-3 py-2.5 text-left transition hover:bg-raised/50"
     >
       <div className="flex min-w-0 flex-1 items-center gap-2">
-        <span className="truncate text-[13px] font-medium text-ink">{source.name}</span>
+        <span className="truncate text-[13px] font-medium text-ink" title={source.name}>{source.name}</span>
         <ArrowRight size={13} className={cn("shrink-0", live ? "text-accent" : "text-ink-secondary")} />
-        <span className="truncate text-[13px] font-medium text-ink">{target.name}</span>
+        <span className="truncate text-[13px] font-medium text-ink" title={target.name}>{target.name}</span>
       </div>
-      {edge.reason && <span className="max-w-[220px] truncate text-[11.5px] text-ink-secondary">{edge.reason}</span>}
+      {edge.reason && <span className="max-w-[220px] truncate text-[11.5px] text-ink-secondary" title={edge.reason}>{edge.reason}</span>}
       <span
         className={cn(
           "rounded-full px-2 py-0.5 text-[10.5px] font-medium",
@@ -107,6 +109,7 @@ function SectionContextDialog({ section, label, onClose }: { section: string; la
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [confirmDiscard, setConfirmDiscard] = useState(false);
   const dirty = text !== savedText;
   const bytes = useMemo(() => new TextEncoder().encode(text).byteLength, [text]);
   onCloseRef.current = onClose;
@@ -115,7 +118,10 @@ function SectionContextDialog({ section, label, onClose }: { section: string; la
 
   const requestClose = useCallback(() => {
     if (savingRef.current) return;
-    if (dirtyRef.current && !window.confirm("Discard unsaved changes to this shared context?")) return;
+    if (dirtyRef.current) {
+      setConfirmDiscard(true);
+      return;
+    }
     onCloseRef.current();
   }, []);
 
@@ -201,6 +207,7 @@ function SectionContextDialog({ section, label, onClose }: { section: string; la
   };
 
   return createPortal(
+    <>
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4 backdrop-blur-[2px] sm:p-6"
       onMouseDown={(event) => event.target === event.currentTarget && requestClose()}
@@ -222,13 +229,13 @@ function SectionContextDialog({ section, label, onClose }: { section: string; la
               </h2>
             </div>
             <p className="mt-1.5 max-w-[520px] text-[12.5px] leading-relaxed text-ink-secondary">
-              A team brief shown to every bot in this section at the start of each turn. Only you can edit it.
+              A team brief shown to every bot in this section at the start of each turn.{"\u00a0 "}Only you can edit it.
             </p>
           </div>
           <button
             onClick={requestClose}
             disabled={saving}
-            aria-label="Close shared context"
+            aria-label="Close Shared Context"
             className="flex size-9 shrink-0 items-center justify-center rounded-lg text-ink-secondary hover:bg-raised hover:text-ink disabled:opacity-40"
           >
             <X size={19} />
@@ -261,7 +268,7 @@ function SectionContextDialog({ section, label, onClose }: { section: string; la
               </div>
             </>
           )}
-          {error && <div className="mt-3 rounded-lg border border-danger/30 bg-danger/10 px-3 py-2 text-[12px] text-danger">{error}</div>}
+          {error && <div className="mt-3 rounded-lg border border-danger/30 bg-danger/10 px-3 py-2 text-[12px] text-danger" title={error}>{productErrorHeadline(error)}</div>}
         </div>
 
         <footer className="flex items-center justify-end gap-2 border-t border-hairline/40 px-6 py-4 sm:px-8">
@@ -278,7 +285,19 @@ function SectionContextDialog({ section, label, onClose }: { section: string; la
           </button>
         </footer>
       </div>
-    </div>,
+    </div>
+    <ConfirmDialog
+      open={confirmDiscard}
+      title="Discard Unsaved Changes?"
+      body="Discard unsaved changes to this shared context?  This cannot be undone."
+      confirmLabel="Discard Changes"
+      onCancel={() => setConfirmDiscard(false)}
+      onConfirm={() => {
+        setConfirmDiscard(false);
+        onCloseRef.current();
+      }}
+    />
+    </>,
     document.body,
   );
 }
@@ -322,7 +341,7 @@ export function TeamMapPage() {
         <div>
           <div className="flex items-center gap-2.5">
             <Network size={20} className="text-accent" />
-            <h1 className="text-[18px] font-semibold">Team map</h1>
+            <h1 className="text-[18px] font-semibold">Team Map</h1>
             <span className="flex items-center gap-1 rounded-full bg-success/10 px-2 py-0.5 text-[10.5px] font-medium text-success">
               <Radio size={10} /> Live
             </span>
@@ -335,7 +354,7 @@ export function TeamMapPage() {
           onClick={() => void refresh(true)}
           disabled={refreshing}
           className="rounded-lg border border-hairline/50 bg-card p-2 text-ink-secondary hover:bg-raised hover:text-ink disabled:opacity-50"
-          aria-label="Refresh team map"
+          aria-label="Refresh Team Map"
           title="Refresh"
         >
           <RefreshCw size={15} className={refreshing ? "animate-spin" : ""} />
@@ -356,7 +375,7 @@ export function TeamMapPage() {
           ))}
         </div>
 
-        {error && <div className="mb-4 rounded-xl border border-danger/30 bg-danger/10 px-3 py-2 text-[12px] text-danger">{error}</div>}
+        {error && <div className="mb-4 rounded-xl border border-danger/30 bg-danger/10 px-3 py-2 text-[12px] text-danger" title={error}>{productErrorHeadline(error)}</div>}
 
         <div className="grid grid-cols-[repeat(auto-fit,minmax(300px,1fr))] gap-4">
           {sections.map((section) => (
@@ -392,7 +411,7 @@ export function TeamMapPage() {
 
         <section className="mt-6 max-w-[900px]">
           <div className="mb-2.5 flex items-center justify-between">
-            <h2 className="text-[12px] font-semibold uppercase tracking-[0.08em] text-ink-secondary">Agent handoffs</h2>
+            <h2 className="text-[12px] font-semibold uppercase tracking-[0.08em] text-ink-secondary">Bot Handoffs</h2>
             <span className="text-[11px] text-ink-secondary">Running and queued first</span>
           </div>
           <div className="space-y-2">
@@ -401,7 +420,7 @@ export function TeamMapPage() {
             ))}
             {edges.length === 0 && (
               <div className="rounded-xl border border-dashed border-hairline bg-panel px-4 py-6 text-center text-[12.5px] text-ink-secondary">
-                No bot-to-bot handoffs yet. Ask a Chief of Staff to delegate a task and it will appear here live.
+                No bot-to-bot handoffs yet.{"\u00a0 "}Ask a Chief of Staff to delegate a task and it will appear here live.
               </div>
             )}
           </div>
@@ -415,5 +434,17 @@ export function TeamMapPage() {
         />
       )}
     </main>
+  );
+}
+
+/** Visual-spec harness for tests/e2e/team-map-context.visual.spec.ts.
+ *  Mounts the real shared-context dialog.  The spec fulfills
+ *  GET /api/section-context with a fixed payload so the dialog can leave
+ *  its loading state.  That route is served by the bot server, which this
+ *  lane does not run.  The sentence in the dialog header is this component's
+ *  own JSX. */
+export function TeamMapSharedContextVisualFixture() {
+  return (
+    <SectionContextDialog section="ops" label="Operations" onClose={() => {}} />
   );
 }

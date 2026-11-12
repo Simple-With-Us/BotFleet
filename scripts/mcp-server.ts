@@ -2,6 +2,23 @@
 // Model Context Protocol (MCP) Server for BotFleet
 // Standard JSON-RPC 2.0 stdio transport for external agent orchestration (Hermes, Claude Desktop, Cursor, etc.).
 import readline from "node:readline";
+import { initSentry } from "../server/sentry.ts";
+import { withMcpToolCallSpan } from "../server/sentry-mcp.ts";
+
+function isLoopbackHostname(hostname: string): boolean {
+  const bare = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  return bare === "127.0.0.1" || bare === "localhost" || bare === "::1";
+}
+
+/** True when `origin` points at this computer — the only place `open_app`
+ * is allowed to act. */
+export function isLoopbackOrigin(origin: string): boolean {
+  try {
+    return isLoopbackHostname(new URL(origin).hostname);
+  } catch {
+    return false;
+  }
+}
 
 export function validateBaseUrl(url: string): string {
   const trimmed = url.replace(/\/+$/, "");
@@ -20,9 +37,7 @@ export function validateBaseUrl(url: string): string {
   if ((parsed.pathname !== "/" && parsed.pathname !== "") || parsed.search || parsed.hash) {
     throw new Error("BotFleet URL must be an origin without a path, query, or fragment");
   }
-  const hostname = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  const isLoopback = hostname === "127.0.0.1" || hostname === "localhost" || hostname === "::1";
-  if (parsed.protocol === "http:" && !isLoopback && process.env.ALLOW_INSECURE_HTTP !== "true") {
+  if (parsed.protocol === "http:" && !isLoopbackHostname(parsed.hostname) && process.env.ALLOW_INSECURE_HTTP !== "true") {
     throw new Error(
       `Insecure cleartext HTTP origin '${parsed.origin}' is rejected. Use https:// or set ALLOW_INSECURE_HTTP=true.`,
     );
@@ -49,6 +64,16 @@ export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 function requestTimeoutMs(): number {
   const raw = Number(process.env.BOTFLEET_MCP_TIMEOUT_MS || process.env.OPENMAUSBOT_MCP_TIMEOUT_MS);
   return Number.isFinite(raw) && raw >= 1_000 && raw <= 120_000 ? Math.floor(raw) : DEFAULT_REQUEST_TIMEOUT_MS;
+}
+
+export const DEFAULT_DRAIN_GRACE_MS = 130_000;
+
+/** How long calls still in flight may keep running after stdin closes.
+ * Covers the longest wait_for_conversation plus one HTTP timeout, so a
+ * one-shot pipe driver gets every answer it asked for. */
+export function drainGraceMs(): number {
+  const raw = Number(process.env.BOTFLEET_MCP_DRAIN_MS);
+  return Number.isFinite(raw) && raw >= 0 && raw <= 600_000 ? Math.floor(raw) : DEFAULT_DRAIN_GRACE_MS;
 }
 
 function requestHeaders(options: RequestInit): NonNullable<RequestInit["headers"]> {
@@ -174,13 +199,14 @@ export const TOOLS: McpToolDefinition[] = [
   },
   {
     name: "send_bot_message",
-    description: "Send an instruction to a bot's active task. Optionally name the expected task to prevent cross-task races. This may cause the bot to use external tools.",
+    description: "Send an instruction to a bot's active task and learn whether it started a turn, was steered into the live one, or was queued behind it. Optionally name the expected task to prevent cross-task races. This may cause the bot to use external tools.",
     inputSchema: {
       type: "object",
       properties: {
         bot_id: { type: "string", description: "The ID of the bot to message." },
         task_id: { type: "string", description: "Optional expected active task/thread ID." },
         text: { type: "string", description: "The message content/instruction to send." },
+        idempotency_key: { type: "string", description: "Optional client key (letters, digits, dot, colon, underscore, dash). A retry with the same key within ten minutes replays the first outcome instead of sending twice." },
       },
       required: ["bot_id", "text"],
       additionalProperties: false,
@@ -257,6 +283,7 @@ export const TOOLS: McpToolDefinition[] = [
         channel_id: { type: "string", description: "The ID of the channel." },
         task_id: { type: "string", description: "Optional expected active task/thread ID." },
         text: { type: "string", description: "The message content to post." },
+        idempotency_key: { type: "string", description: "Optional client key (letters, digits, dot, colon, underscore, dash). A retry with the same key within ten minutes replays the first outcome instead of posting twice." },
       },
       required: ["channel_id", "text"],
       additionalProperties: false,
@@ -426,6 +453,96 @@ export const TOOLS: McpToolDefinition[] = [
       additionalProperties: false,
     },
     annotations: DESTRUCTIVE,
+  },
+  {
+    name: "list_pending_approvals",
+    description: "List approval and question cards still waiting for a person across active bot and channel tasks. Each entry carries the task_id and request_id that answer_approval needs.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        bot_id: { type: "string", description: "Optional: inspect only this bot's active task." },
+        channel_id: { type: "string", description: "Optional: inspect only this channel's active task." },
+        limit: { type: "integer", minimum: 1, maximum: 200, description: "Newest messages inspected per task (default: 50, max: 200)." },
+      },
+      additionalProperties: false,
+    },
+    annotations: READ_ONLY,
+  },
+  {
+    name: "answer_approval",
+    description: "Answer one pending approval or question card the way the desktop does: allow or deny it once, or reply to a question. Grants are never remembered. Allowing may cause the bot to use external tools.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        task_id: { type: "string", description: "The task/thread that holds the card." },
+        request_id: { type: "string", description: "The card's request ID from list_pending_approvals." },
+        behavior: { type: "string", enum: ["allow", "deny", "answer"] },
+        message: { type: "string", description: "The reply for answer (required), or an optional reason for deny." },
+      },
+      required: ["task_id", "request_id", "behavior"],
+      additionalProperties: false,
+    },
+    annotations: AGENT_ACTION,
+  },
+  {
+    name: "list_routines",
+    description: "List scheduled routines and their newest runs without loading transcripts. Prompts and outputs are bounded.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        bot_id: { type: "string", description: "Optional: only this bot's routines and runs." },
+        run_limit: { type: "integer", minimum: 0, maximum: 200, description: "Newest runs to include (default: 20, max: 200)." },
+      },
+      additionalProperties: false,
+    },
+    annotations: READ_ONLY,
+  },
+  {
+    name: "run_routine",
+    description: "Queue one existing routine to run now on its bot. This may cause the bot to use external tools.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        routine_id: { type: "string", description: "The routine ID from list_routines." },
+      },
+      required: ["routine_id"],
+      additionalProperties: false,
+    },
+    annotations: AGENT_ACTION,
+  },
+  {
+    name: "list_webhooks",
+    description: "List webhook triggers and the ingress they listen on. Secrets and capability URLs are never returned.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      additionalProperties: false,
+    },
+    annotations: READ_ONLY,
+  },
+  {
+    name: "read_decision_log",
+    description: "Read the newest authorization decisions: which tool calls were auto-approved, shown as a card, allowed, or denied, and by which rule.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        bot_id: { type: "string", description: "Optional: only decisions for this bot." },
+        task_id: { type: "string", description: "Optional: only decisions in this task/thread." },
+        limit: { type: "integer", minimum: 1, maximum: 500, description: "Newest rows to return (default: 50, max: 500)." },
+      },
+      additionalProperties: false,
+    },
+    annotations: READ_ONLY,
+  },
+  {
+    name: "open_app",
+    description: "Bring the BotFleet desktop app to the front on the computer that runs it. Works only over loopback and only on macOS.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      additionalProperties: false,
+    },
+    annotations: MUTATING,
   },
 ];
 
@@ -636,6 +753,147 @@ function projectMessage(message: Record<string, any>) {
   };
 }
 
+function boundedText(value: unknown, max: number): { text: string; truncated: boolean } | undefined {
+  if (typeof value !== "string") return undefined;
+  return value.length > max ? { text: value.slice(0, max), truncated: true } : { text: value, truncated: false };
+}
+
+function idempotencyKeyArg(args: Record<string, unknown>): string | undefined {
+  if (args.idempotency_key === undefined) return undefined;
+  const value = stringArg(args, "idempotency_key", { max: 200 });
+  if (!/^[\w.:-]+$/.test(value)) {
+    throw new ToolInputError("idempotency_key may contain only letters, digits, dot, colon, underscore, and dash");
+  }
+  return value;
+}
+
+/** What the harness did with a send — started a turn, steered the live one,
+ * or queued behind it — and whether this reply replays an earlier attempt
+ * made under the same idempotency key. */
+function sendOutcome(accepted: unknown) {
+  const body = isRecord(accepted) ? accepted : {};
+  return {
+    outcome: body.steered ? "steered" : body.queued ? "queued" : "started",
+    ...(typeof body.queueId === "string" ? { queueId: body.queueId } : {}),
+    replayed: Boolean(body.replayed),
+  };
+}
+
+function projectRoutine(routine: Record<string, any>) {
+  const prompt = boundedText(routine.prompt, 1_000);
+  return {
+    id: routine.id,
+    name: routine.name,
+    botId: routine.botId,
+    runOn: routine.runOn,
+    enabled: Boolean(routine.enabled),
+    schedule: routine.schedule,
+    durationMinutes: routine.durationMinutes,
+    nextRunAt: routine.nextRunAt ?? null,
+    createdAt: routine.createdAt,
+    updatedAt: routine.updatedAt,
+    prompt: prompt?.text,
+    promptTruncated: Boolean(prompt?.truncated),
+  };
+}
+
+function projectRun(run: Record<string, any>) {
+  const output = boundedText(run.output, 500);
+  const error = boundedText(run.error, 500);
+  return {
+    id: run.id,
+    routineId: run.routineId,
+    routineName: run.routineName,
+    botId: run.botId,
+    runOn: run.runOn,
+    status: run.status,
+    manual: Boolean(run.manual),
+    triggerSource: run.triggerSource ?? (run.manual ? "manual" : "schedule"),
+    scheduledFor: run.scheduledFor,
+    startedAt: run.startedAt ?? null,
+    finishedAt: run.finishedAt ?? null,
+    taskId: run.threadId ?? null,
+    ...(output ? { outputPreview: output.text, outputTruncated: output.truncated } : {}),
+    ...(error ? { error: error.text } : {}),
+    cost: run.cost ?? null,
+    seen: Boolean(run.seenAt),
+  };
+}
+
+function projectWebhook(webhook: Record<string, any>) {
+  const prompt = boundedText(webhook.prompt, 1_000);
+  return {
+    id: webhook.id,
+    name: webhook.name,
+    botId: webhook.botId,
+    runOn: webhook.runOn,
+    enabled: Boolean(webhook.enabled),
+    createdAt: webhook.createdAt,
+    updatedAt: webhook.updatedAt,
+    lastReceivedAt: webhook.lastReceivedAt ?? null,
+    lastRunId: webhook.lastRunId ?? null,
+    deliveryCount: webhook.deliveryCount ?? 0,
+    verificationPending: Boolean(webhook.verificationPending),
+    verifiedAt: webhook.verifiedAt ?? null,
+    eventTypes: Array.isArray(webhook.eventTypes) ? webhook.eventTypes : [],
+    prompt: prompt?.text,
+    promptTruncated: Boolean(prompt?.truncated),
+  };
+}
+
+function projectDecision(row: Record<string, any>) {
+  return {
+    at: row.at,
+    taskId: row.threadId,
+    requestId: row.requestId,
+    botId: row.botId,
+    botName: row.botName,
+    tool: row.tool,
+    summary: row.summary,
+    decision: row.decision,
+    source: row.source,
+    rule: row.rule,
+    unattended: Boolean(row.unattended),
+  };
+}
+
+function pendingCard(message: Record<string, any>): Record<string, any> | null {
+  const card = message.card;
+  if (!isRecord(card) || typeof card.requestId !== "string" || !card.requestId) return null;
+  if (card.answered || card.dismissed) return null;
+  return card;
+}
+
+/** A card still waiting on a person, with the ids answer_approval needs.
+ * The remembered-grant key stays private: this surface can allow once,
+ * never "always". */
+function projectPendingApproval(
+  message: Record<string, any>,
+  card: Record<string, any>,
+  owner: { kind: "bot" | "channel"; record: Record<string, any> },
+  botsById: Map<string, Record<string, any>>,
+) {
+  const from = isRecord(message.from) ? message.from : undefined;
+  const askerId = owner.kind === "bot" ? owner.record.id : owner.record.busyBotId ?? from?.botId ?? null;
+  const asker = typeof askerId === "string" ? botsById.get(askerId) : undefined;
+  return {
+    requestId: card.requestId,
+    taskId: owner.record.threadId,
+    messageId: message.id,
+    at: message.at,
+    kind: card.routineRequest ? "routine" : card.tool ? "permission" : "question",
+    botId: askerId ?? null,
+    botName: asker?.name ?? from?.name ?? null,
+    ...(owner.kind === "channel" ? { channelId: owner.record.id, channelName: owner.record.name } : {}),
+    tool: card.tool ?? null,
+    title: card.title,
+    summary: card.subtitle,
+    options: Array.isArray(card.options) ? card.options : [],
+    held: card.held ?? null,
+    waitingOnYou: asker?.activity === "waiting-on-you",
+  };
+}
+
 async function fleet(fetcher: (path: string, options?: RequestInit) => Promise<any>) {
   return fetcher("/api/bots?messages=0");
 }
@@ -655,7 +913,12 @@ function messageNeedsInput(message: Record<string, any>): boolean {
 }
 
 function dispatchFailedAfterLatestUser(messages: Array<Record<string, any>>): boolean {
-  const lastUser = messages.findLastIndex((message) => message.role === "user");
+  // A turn starts with a person's message OR an auto-delivered
+  // routine/webhook/resource instruction stored as role="system" — scanning
+  // only "user" made a reused automation-only thread look at its whole
+  // fetched tail, so an earlier successful firing's reply could mask this
+  // firing's failure.
+  const lastUser = messages.findLastIndex((message) => message.role === "user" || message.role === "system");
   const turnMessages = messages.slice(lastUser + 1);
   if (turnMessages.some((message) => message.role === "bot" && message.kind === "text" && message.text?.trim())) {
     return false;
@@ -797,11 +1060,12 @@ export async function handleToolCall(
       if (busyChannel) {
         throw new Error(`Bot '${botId}' is working in channel '${busyChannel.id}'; send to or interrupt that channel instead`);
       }
-      await fetcher(`/api/bots/${encodeURIComponent(botId)}/messages`, {
+      const idempotencyKey = idempotencyKeyArg(args);
+      const accepted = await fetcher(`/api/bots/${encodeURIComponent(botId)}/messages`, {
         method: "POST",
-        body: JSON.stringify({ text, threadId: taskId }),
+        body: JSON.stringify({ text, threadId: taskId, ...(idempotencyKey ? { idempotencyKey } : {}) }),
       });
-      return { success: true, botId, taskId };
+      return { success: true, botId, taskId, ...sendOutcome(accepted), ...(idempotencyKey ? { idempotencyKey } : {}) };
     }
 
     case "create_bot": {
@@ -883,11 +1147,12 @@ export async function handleToolCall(
       if (channel.threadId !== taskId) {
         throw new Error(`Task '${taskId}' is not active for channel '${channelId}'; switch to it before sending`);
       }
-      await fetcher(`/api/groups/${encodeURIComponent(channelId)}/messages`, {
+      const idempotencyKey = idempotencyKeyArg(args);
+      const accepted = await fetcher(`/api/groups/${encodeURIComponent(channelId)}/messages`, {
         method: "POST",
-        body: JSON.stringify({ text, threadId: taskId }),
+        body: JSON.stringify({ text, threadId: taskId, ...(idempotencyKey ? { idempotencyKey } : {}) }),
       });
-      return { success: true, channelId, taskId };
+      return { success: true, channelId, taskId, ...sendOutcome(accepted), ...(idempotencyKey ? { idempotencyKey } : {}) };
     }
 
     case "create_channel": {
@@ -1113,15 +1378,37 @@ export async function handleToolCall(
     case "list_available_models": {
       const res = await fetcher("/api/instances");
       return {
-        instances: records(res.instances).map((instance) => ({
-          instanceId: instance.instanceId,
-          driverKind: instance.driverKind,
-          displayName: instance.displayName,
-          snapshot: { state: instance.snapshot?.state },
-          models: instance.models,
-          capabilities: instance.capabilities,
-          access: instance.access,
-        })),
+        instances: records(res.instances).map((instance) => {
+          const quota = instance.snapshot?.quota;
+          const cappedIds = new Set(
+            Object.entries((quota?.models ?? {}) as Record<string, { capped?: boolean }>)
+              .filter(([, row]) => row?.capped)
+              .map(([id]) => id),
+          );
+          const options = Array.isArray(instance.models?.options) ? instance.models.options : [];
+          const availableOptions = cappedIds.size
+            ? options.filter((option: { id?: string }) => !cappedIds.has(String(option.id)))
+            : options;
+          const defaultId = instance.models?.default;
+          const nextDefault = cappedIds.has(String(defaultId))
+            ? (availableOptions[0]?.id ?? defaultId)
+            : defaultId;
+          const models = cappedIds.size && availableOptions.length > 0
+            ? { default: nextDefault, options: availableOptions }
+            : instance.models;
+          return {
+            instanceId: instance.instanceId,
+            driverKind: instance.driverKind,
+            displayName: instance.displayName,
+            snapshot: {
+              state: instance.snapshot?.state,
+              ...(quota ? { quota } : {}),
+            },
+            models,
+            capabilities: instance.capabilities,
+            access: instance.access,
+          };
+        }),
       };
     }
 
@@ -1150,6 +1437,134 @@ export async function handleToolCall(
       return { success: true, targetType, targetId, taskId };
     }
 
+    case "list_pending_approvals": {
+      const botFilter = args.bot_id === undefined ? undefined : idArg(args, "bot_id");
+      const channelFilter = args.channel_id === undefined ? undefined : idArg(args, "channel_id");
+      const limit = parsePositiveLimit(args.limit, 50, 200);
+      const state = await fleet(fetcher);
+      const bots = records(state.bots);
+      const channels = records(state.groups);
+      const botsById = new Map(bots.map((bot) => [String(bot.id), bot]));
+      const owners: Array<{ kind: "bot" | "channel"; record: Record<string, any> }> = [];
+      if (botFilter) {
+        const bot = botsById.get(botFilter);
+        if (!bot) throw new Error(`Bot not found: ${botFilter}`);
+        owners.push({ kind: "bot", record: bot });
+      }
+      if (channelFilter) {
+        const channel = channels.find((candidate) => candidate.id === channelFilter);
+        if (!channel) throw new Error(`Channel not found: ${channelFilter}`);
+        owners.push({ kind: "channel", record: channel });
+      }
+      if (!botFilter && !channelFilter) {
+        owners.push(...bots.map((record) => ({ kind: "bot" as const, record })));
+        owners.push(...channels.map((record) => ({ kind: "channel" as const, record })));
+      }
+      // Only an active task can hold a live ask, so each owner costs one
+      // bounded tail read; historical tasks are never scanned.
+      const approvals: Array<ReturnType<typeof projectPendingApproval>> = [];
+      for (const owner of owners) {
+        if (typeof owner.record.threadId !== "string") continue;
+        const page = await fetcher(`/api/threads/${encodeURIComponent(owner.record.threadId)}/messages?limit=${limit}`);
+        for (const message of records(page.messages)) {
+          const card = pendingCard(message);
+          if (card) approvals.push(projectPendingApproval(message, card, owner, botsById));
+        }
+      }
+      approvals.sort((a, b) => (Number(a.at) || 0) - (Number(b.at) || 0));
+      return { approvals, tasksInspected: owners.length };
+    }
+
+    case "answer_approval": {
+      const taskId = idArg(args, "task_id");
+      const requestId = stringArg(args, "request_id", { max: 200 });
+      const behavior = args.behavior;
+      if (behavior !== "allow" && behavior !== "deny" && behavior !== "answer") {
+        throw new ToolInputError("behavior must be allow, deny, or answer");
+      }
+      const message = optionalStringArg(args, "message", { trim: false, max: 4_000 });
+      if (behavior === "answer" && message === undefined) {
+        throw new ToolInputError("message is required when behavior is answer");
+      }
+      // The same route and body the desktop sends, minus the "always allow"
+      // branch: this surface can grant once, never remember.
+      const result = await fetcher(`/api/threads/${encodeURIComponent(taskId)}/respond`, {
+        method: "POST",
+        body: JSON.stringify({ requestId, behavior, ...(message !== undefined ? { message } : {}) }),
+      });
+      const outcome = typeof result?.outcome === "string" ? result.outcome : "unknown";
+      return {
+        taskId,
+        requestId,
+        behavior,
+        outcome,
+        // `unavailable` is the harness being honest: the request was no longer
+        // open, so nothing ran and the card was closed instead.
+        delivered: outcome !== "unavailable" && outcome !== "unknown",
+        ...(result?.alreadySettled ? { alreadySettled: true } : {}),
+        ...(typeof result?.routineAction === "string"
+          ? {
+              routineAction: result.routineAction,
+              ...(typeof result.resultId === "string" ? { routineResultId: result.resultId } : {}),
+            }
+          : {}),
+      };
+    }
+
+    case "list_routines": {
+      const botId = args.bot_id === undefined ? undefined : idArg(args, "bot_id");
+      const runLimit = args.run_limit === undefined ? 20 : Math.max(0, Math.min(200, Math.floor(Number(args.run_limit))));
+      const res = await fetcher("/api/routines");
+      const routines = records(res.routines).filter((routine) => !botId || routine.botId === botId).map(projectRoutine);
+      const runs = records(res.runs)
+        .filter((run) => !botId || run.botId === botId)
+        .sort((a, b) => (Number(b.createdAt) || 0) - (Number(a.createdAt) || 0))
+        .slice(0, runLimit)
+        .map(projectRun);
+      return { routines, runs };
+    }
+
+    case "run_routine": {
+      const routineId = idArg(args, "routine_id");
+      const result = await fetcher(`/api/routines/${encodeURIComponent(routineId)}/run`, { method: "POST", body: "{}" });
+      if (!isRecord(result?.run)) throw new Error("BotFleet did not return the queued run");
+      return { success: true, routineId, run: projectRun(result.run) };
+    }
+
+    case "list_webhooks": {
+      const res = await fetcher("/api/webhooks");
+      const ingress = isRecord(res.ingress) ? res.ingress : {};
+      return {
+        webhooks: records(res.webhooks).map(projectWebhook),
+        ingress: {
+          available: Boolean(ingress.available),
+          ...(typeof ingress.baseUrl === "string" ? { baseUrl: ingress.baseUrl } : {}),
+          ...(typeof ingress.error === "string" ? { error: ingress.error } : {}),
+        },
+      };
+    }
+
+    case "read_decision_log": {
+      const limit = parsePositiveLimit(args.limit, 50, 500);
+      const params = new URLSearchParams({ limit: String(limit) });
+      if (args.bot_id !== undefined) params.set("botId", idArg(args, "bot_id"));
+      if (args.task_id !== undefined) params.set("threadId", idArg(args, "task_id"));
+      const res = await fetcher(`/api/decisions?${params.toString()}`);
+      return { decisions: records(res.decisions).map(projectDecision) };
+    }
+
+    case "open_app": {
+      // The harness only honors this over a loopback socket, and this process
+      // only asks when it is itself talking to loopback: a remote MCP client
+      // cannot raise a window it will never see.
+      const endpoint = discoveredBaseUrl ?? OMB_BASE_URL;
+      if (!isLoopbackOrigin(endpoint)) {
+        throw new Error(`open_app only works when this MCP server runs on the computer that hosts BotFleet; the endpoint is ${endpoint}`);
+      }
+      const result = await fetcher("/api/desktop/open", { method: "POST", body: "{}" });
+      return { success: true, opened: Boolean(result?.ok), endpoint };
+    }
+
     default:
       throw new ToolInputError(`Unknown tool: ${name}`);
   }
@@ -1174,6 +1589,7 @@ const activeMcpControllers = new Set<AbortController>();
 export async function processMcpMessage(
   raw: string,
   toolHandler: typeof handleToolCall = handleToolCall,
+  sessionId?: string,
 ): Promise<string | null> {
   const trimmed = raw.trim();
   if (!trimmed) return null;
@@ -1212,7 +1628,8 @@ export async function processMcpMessage(
       if (isRecord(params)) {
         const requestId = params.requestId;
         if (typeof requestId === "string" || typeof requestId === "number") {
-          activeMcpRequests.get(requestId)?.abort(new DOMException("Request cancelled", "AbortError"));
+          const requestKey = sessionId ? `${sessionId}:${requestId}` : requestId;
+          activeMcpRequests.get(requestKey)?.abort(new DOMException("Request cancelled", "AbortError"));
         }
       }
       return null;
@@ -1244,9 +1661,9 @@ export async function processMcpMessage(
         },
         serverInfo: {
           name: "botfleet-mcp",
-          version: "1.1.0",
+          version: "1.2.0",
         },
-        instructions: "Use bounded read tools before mutating the BotFleet team. Approval grants, deletion, and computer lifecycle are intentionally unavailable.",
+        instructions: "Use bounded read tools before mutating the BotFleet team. Read a pending card with list_pending_approvals before answering it with answer_approval, which allows once and never remembers a grant. Always-allow grants, deletion, and computer lifecycle are intentionally unavailable.",
       });
     }
 
@@ -1283,14 +1700,19 @@ export async function processMcpMessage(
       }
       const controller = new AbortController();
       activeMcpControllers.add(controller);
-      if (!isNotification) activeMcpRequests.set(id as string | number, controller);
+      const requestKey = sessionId ? `${sessionId}:${id}` : id;
+      if (!isNotification) activeMcpRequests.set(requestKey as string | number, controller);
       let result: unknown;
       try {
-        result = await toolHandler(name, toolArgs, request, controller.signal);
+        const toolName = typeof name === "string" ? name : "tool";
+        result = await withMcpToolCallSpan(
+          { toolName, requestId: isNotification ? null : id },
+          () => toolHandler(name, toolArgs, request, controller.signal),
+        );
       } finally {
         activeMcpControllers.delete(controller);
-        if (!isNotification && activeMcpRequests.get(id as string | number) === controller) {
-          activeMcpRequests.delete(id as string | number);
+        if (!isNotification && activeMcpRequests.get(requestKey as string | number) === controller) {
+          activeMcpRequests.delete(requestKey as string | number);
         }
       }
       if (isNotification) return null;
@@ -1330,8 +1752,37 @@ export async function processMcpMessage(
   }
 }
 
+/** Let calls that are already running finish after stdin closes, then abort
+ * only what is still running once `graceMs` runs out.  Returns how many
+ * were cut short. */
+export async function drainInFlight(
+  requests: Iterable<Promise<unknown>>,
+  controllers: Iterable<AbortController>,
+  graceMs: number,
+): Promise<{ aborted: number }> {
+  const pending = Array.from(requests);
+  if (pending.length === 0) return { aborted: 0 };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const settled = Promise.allSettled(pending).then(() => true);
+  const expired = new Promise<boolean>((resolve) => {
+    timer = setTimeout(() => resolve(false), Math.max(0, graceMs));
+  });
+  const drained = await Promise.race([settled, expired]);
+  if (timer) clearTimeout(timer);
+  if (drained) return { aborted: 0 };
+  let aborted = 0;
+  for (const controller of controllers) {
+    if (controller.signal.aborted) continue;
+    controller.abort(new DOMException("Request cancelled", "AbortError"));
+    aborted += 1;
+  }
+  await Promise.allSettled(pending);
+  return { aborted };
+}
+
 // Start stdio interface when executed directly
 if (process.argv[1] && (process.argv[1].endsWith("mcp-server.ts") || process.argv[1].endsWith("mcp-server.js"))) {
+  await initSentry();
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
@@ -1357,17 +1808,17 @@ if (process.argv[1] && (process.argv[1].endsWith("mcp-server.ts") || process.arg
     });
   });
 
-  rl.on("close", async () => {
-    for (const controller of activeMcpControllers) {
-      controller.abort(new DOMException("Request cancelled", "AbortError"));
-    }
-    if (activeRequests.size > 0) {
-      await Promise.allSettled(Array.from(activeRequests));
-    }
-    // Do not force an exit here: stdout may still be flushing the final
-    // JSON-RPC frame. With stdin and readline closed, Node exits naturally
-    // once that buffered write has drained.
-    process.exitCode = 0;
+  rl.on("close", () => {
+    // A one-shot driver writes its requests and closes stdin at once.  Every
+    // call it queued still gets its answer; only what is still running when
+    // the grace runs out is aborted.
+    void drainInFlight(activeRequests, activeMcpControllers, drainGraceMs()).then(({ aborted }) => {
+      if (aborted) log(`stdin closed: aborted ${aborted} call(s) still running after ${drainGraceMs()} ms`);
+      // Do not force an exit here: stdout may still be flushing the final
+      // JSON-RPC frame. With stdin and readline closed, Node exits naturally
+      // once that buffered write has drained.
+      process.exitCode = 0;
+    });
   });
 
   log("BotFleet MCP server running on stdio");

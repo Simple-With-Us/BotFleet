@@ -1,4 +1,7 @@
-// swift-tools-version: 5.9
+// swift-tools-version: 6.4
+// 6.4 is the first PackageDescription with `.iOS(.v27)` (Xcode 27.0).
+// swiftLanguageModes keeps the Swift 5 language mode the package had under
+// tools 5.9, so the bump does not also switch on Swift 6 strict concurrency.
 import PackageDescription
 
 // CompanionCore is everything the phone knows that is not a view: the wire
@@ -9,19 +12,64 @@ import PackageDescription
 // from a real harness.
 let package = Package(
     name: "CompanionCore",
-    // macOS 13 rather than 14: the core needs nothing newer than
-    // URLSession.bytes (macOS 12), and `swift test` should run on whatever
-    // Mac is to hand. The app's iOS 17 floor lives in project.yml.
-    platforms: [.iOS(.v17)],
+    // Raised from macOS 13 to macOS 14 per Phase 1 Foundation scope so
+    // ScreenCaptureKit and native macOS actors need no legacy @available guards.
+    // The app's iOS 27 floor lives in project.yml.
+    platforms: [.iOS(.v27), .macOS(.v14)],
     products: [
-        .library(name: "CompanionCore", targets: ["CompanionCore"])
+        .library(name: "CompanionCore", targets: ["CompanionCore"]),
+        .executable(name: "CodeBlockLayoutProbe", targets: ["CodeBlockLayoutProbe"]),
+        .executable(name: "MacPerfHarness", targets: ["MacPerfHarness"]),
+        .executable(name: "BotFleetNativeHost", targets: ["BotFleetNativeHost"]),
     ],
     targets: [
         .target(name: "CompanionCore"),
+        .executableTarget(name: "BotFleetNativeHost", dependencies: ["CompanionCore"], path: "Scripts/BotFleetNativeHost"),
         .testTarget(
             name: "CompanionCoreTests",
             dependencies: ["CompanionCore"],
             resources: [.copy("Fixtures")]
         ),
-    ]
+        // Timing probe.  `swift test` compiles it.  Run the measurement with
+        // `swift run --package-path ios CodeBlockLayoutProbe`.
+        .executableTarget(
+            name: "CodeBlockLayoutProbe",
+            dependencies: ["CompanionCore"],
+            path: "Scripts/CodeBlockLayoutProbe"
+        ),
+        // Repeatable performance budget and visual parity harness (BF-2496).
+        // Run with `swift run --package-path ios MacPerfHarness`.
+        .executableTarget(
+            name: "MacPerfHarness",
+            dependencies: ["CompanionCore"],
+            path: "Scripts/MacPerfHarness"
+        ),
+        // The import parity probe (BF-2648).  It imports an Electron-era Node
+        // store into the native store and writes the parity report the
+        // decommission evidence bundle reads.  The importer computes the
+        // verdict and a `Codable` struct does not carry a computed property,
+        // so the probe writes the verdict into the report itself.
+        // Run with
+        // `swift run --package-path ios StoreImportParityProbe -- --source <node-store> --out <report.json>`.
+        .executableTarget(
+            name: "StoreImportParityProbe",
+            dependencies: ["CompanionCore"],
+            path: "Scripts/StoreImportParityProbe"
+        ),
+        // The replay parity probe (BF-2647).  It replays each engine's
+        // recorded turns through the native drivers and writes the
+        // per-engine report the decommission evidence bundle reads.  The
+        // engine list comes from the bundle request, so the probe and the
+        // receipt cannot disagree about which engines are in scope, and an
+        // engine with no replay family behind it earns a failing check with
+        // the reason named rather than a passing one.
+        // Run with
+        // `swift run --package-path ios EngineReplayParityProbe -- --request <bundle-request.json> --out <report.json>`.
+        .executableTarget(
+            name: "EngineReplayParityProbe",
+            dependencies: ["CompanionCore"],
+            path: "Scripts/EngineReplayParityProbe"
+        ),
+    ],
+    swiftLanguageModes: [.v5]
 )

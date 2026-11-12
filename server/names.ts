@@ -1,6 +1,6 @@
 // Bot name generator — a curated local list beats a naming API: instant,
 // offline, and every name is on-brand (short, friendly, a little pet-like,
-// which suits the Maus). Picks avoid names already in use; when the pool is
+// which suits a Bot). Picks avoid names already in use; when the pool is
 // exhausted it falls back to "Name 2", "Name 3", …
 const NAMES = [
   "Scout", "Pixel", "Atlas", "Nova", "Juno", "Koda", "Miso", "Mochi",

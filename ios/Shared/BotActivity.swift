@@ -1,15 +1,16 @@
 // The Live Activity's contract — compiled into both the app and the widget
 // extension, so the two agree on what a bot's island says.
 //
-// One activity per bot that is doing something: needs you, or working.
-// Quiet bots have no activity, the same rule as the Updates pill.
+// One activity per bot that is doing something: needs you, working, or
+// has an unread message. Quiet, already-read bots have no activity.
+#if canImport(ActivityKit) && !os(macOS)
 import ActivityKit
 import AppIntents
 import Foundation
 
 struct BotActivityAttributes: ActivityAttributes {
     public struct ContentState: Codable, Hashable {
-        /// `MausState.rawValue` — the face to wear.
+        /// `BotState.rawValue` — the face to wear.
         var face: String
         /// "needsYou" | "working" | "toReview"
         var kind: String
@@ -29,7 +30,7 @@ struct BotActivityAttributes: ActivityAttributes {
     var botId: String
     var threadId: String
     var name: String
-    /// MausPalette colour name.
+    /// BotPalette colour name.
     var color: String
 }
 
@@ -61,3 +62,5 @@ struct AnswerApprovalIntent: LiveActivityIntent {
         return .result()
     }
 }
+#endif
+

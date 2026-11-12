@@ -7,10 +7,14 @@
 // fence is very likely complete), then highlights and caches — so the settled
 // bubble, a fresh component instance, mounts straight from cache instead of
 // popping from plain to highlighted.
-import { memo, useEffect, useState, type ReactNode } from "react";
+import { isValidElement, memo, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Check, Copy } from "lucide-react";
+import { isDarkSkin, useResolvedSkin } from "@/lib/skins";
+import { remarkMentions } from "@/lib/mentions";
+import { MermaidBlock } from "./MermaidBlock";
+import { hash, STREAM_SETTLE_MS } from "@/lib/stream-settle";
 
 // tiny highlight cache so revisiting a thread doesn't re-tokenize settled
 // blocks; keys are content-hashed and capped. Streamed partials may land here
@@ -19,18 +23,6 @@ import { Check, Copy } from "lucide-react";
 // makes the settled bubble render highlighted on mount.
 const highlightCache = new Map<string, string>();
 const CACHE_MAX = 200;
-// how long a streaming block's content must be unchanged before we spend a
-// tokenize on it — long enough to skip per-token churn mid-fence, short
-// enough that the highlight lands before the stream settles
-const STREAM_SETTLE_MS = 250;
-const hash = (s: string) => {
-  let h = 0x811c9dc5;
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 0x01000193);
-  }
-  return (h >>> 0).toString(36);
-};
 
 // A markdown link whose target is a file on this machine: bots hand over
 // bot-created documents as absolute paths or file:// URLs. Web links stay
@@ -60,9 +52,14 @@ const localFilePath = (href?: string): string | null => {
 function CodeBlock({ code, lang, streaming }: { code: string; lang: string; streaming: boolean }) {
   const [html, setHtml] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  // The fence sits on `bg-inset`, which is light on 9 of 11 skins — a single
+  // dark Shiki theme reads as near-invisible on those (a11y-theme-copy:
+  // code-fence-dark-shiki-on-light-default). Pick per resolved skin, and
+  // re-render live if the user switches skins with this block on screen.
+  const dark = isDarkSkin(useResolvedSkin());
 
   useEffect(() => {
-    const key = `${lang}:${hash(code)}`;
+    const key = `${lang}:${dark ? "dark" : "light"}:${hash(code)}`;
     const cached = highlightCache.get(key);
     if (cached) return setHtml(cached);
     let alive = true;
@@ -72,7 +69,7 @@ function CodeBlock({ code, lang, streaming }: { code: string; lang: string; stre
         .then((shiki) =>
           shiki.codeToHtml(code, {
             lang: lang || "text",
-            theme: "github-dark-default",
+            theme: dark ? "github-dark-default" : "github-light-default",
           }),
         )
         .then((out) => {
@@ -102,7 +99,7 @@ function CodeBlock({ code, lang, streaming }: { code: string; lang: string; stre
       alive = false;
       if (timer !== undefined) clearTimeout(timer);
     };
-  }, [code, lang, streaming]);
+  }, [code, lang, streaming, dark]);
 
   const copy = () => {
     void navigator.clipboard?.writeText(code);
@@ -112,12 +109,13 @@ function CodeBlock({ code, lang, streaming }: { code: string; lang: string; stre
 
   return (
     <div className="my-2 overflow-hidden rounded-lg border border-hairline/40 bg-inset">
-      <div className="flex items-center justify-between border-b border-hairline/30 px-3 py-1">
+      {/* The language label is chrome, not reply text: karaoke skips it. */}
+      <div data-karaoke-skip className="flex items-center justify-between border-b border-hairline/30 px-3 py-1">
         <span className="text-[11px] uppercase tracking-wide text-ink-secondary">{lang || "code"}</span>
         <button
           onClick={copy}
           className="rounded p-1 text-ink-secondary hover:bg-raised hover:text-ink"
-          title="Copy code"
+          title="Copy Code"
         >
           {copied ? <Check size={13} className="text-success" /> : <Copy size={13} />}
         </button>
@@ -272,8 +270,8 @@ function Spoiler({ children }: { children?: ReactNode }) {
         </span>
         <button
           type="button"
-          aria-label="Reveal spoiler"
-          title="Reveal spoiler"
+          aria-label="Reveal Spoiler"
+          title="Reveal Spoiler"
           onClick={() => setRevealed(true)}
           className="absolute inset-0 rounded bg-raised/90"
         />
@@ -285,8 +283,8 @@ function Spoiler({ children }: { children?: ReactNode }) {
       {children}
       <button
         type="button"
-        aria-label="Hide spoiler"
-        title="Hide spoiler"
+        aria-label="Hide Spoiler"
+        title="Hide Spoiler"
         onClick={() => setRevealed(false)}
         className="ml-1 rounded px-0.5 text-[11px] text-ink-secondary hover:text-ink"
       >
@@ -296,113 +294,186 @@ function Spoiler({ children }: { children?: ReactNode }) {
   );
 }
 
+const REMARK_PLUGINS = [remarkGfm, remarkMentions];
+
+/* oxlint-disable anti-slop/no-runtime-typeof -- Flatten React node children into text for code blocks. */
+const flattenCodeChildren = (n: ReactNode): string =>
+  typeof n === "string"
+    ? n
+    : typeof n === "number"
+      ? String(n)
+      : Array.isArray(n)
+        ? n.map(flattenCodeChildren).join("")
+        : isValidElement<{ children?: ReactNode }>(n)
+          ? flattenCodeChildren(n.props.children)
+          : "";
+/* oxlint-enable anti-slop/no-runtime-typeof */
+
+const STATIC_MARKDOWN_COMPONENTS = {
+  img({ src, alt }: { src?: string; alt?: string }) {
+    // Bot text is untrusted. Remote images fetch on display and can
+    // encode private context in their URLs; render a link requiring
+    // an explicit click instead of making the request automatically.
+    if (src && /^https?:\/\//i.test(src)) {
+      return <a href={src} target="_blank" rel="noopener noreferrer">{alt || "Open external image"}</a>;
+    }
+    if (!src || !/^(?:\/|blob:|data:image\/(?:png|jpeg|gif|webp);base64,)/i.test(src)) {
+      return <span>{alt || "Image unavailable"}</span>;
+    }
+    return (
+      <img
+        src={src}
+        alt={alt ?? ""}
+        loading="lazy"
+        className="max-h-96 max-w-full rounded-lg border border-hairline/30"
+      />
+    );
+  },
+  code({ children }: { children?: ReactNode }) {
+    return (
+      <code className="rounded bg-inset px-1 py-px text-[13px]">{children}</code>
+    );
+  },
+  a({ href, children }: { href?: string; children?: ReactNode }) {
+    const localPath = localFilePath(href);
+    if (localPath) return <LocalFileLink filePath={localPath}>{children}</LocalFileLink>;
+    const handleClick = (e: React.MouseEvent) => {
+      if (href && window.ogb?.openExternal) {
+        e.preventDefault();
+        void window.ogb.openExternal(href);
+      }
+    };
+    return (
+      <a
+        href={href}
+        target="_blank"
+        rel="noreferrer"
+        onClick={handleClick}
+        className="break-words text-accent underline decoration-accent/40 hover:decoration-accent"
+      >
+        {children}
+      </a>
+    );
+  },
+  table({ children }: { children?: ReactNode }) {
+    return (
+      <div className="overflow-x-auto">
+        <table className="w-full border-collapse text-[13.5px]">{children}</table>
+      </div>
+    );
+  },
+  th({ children }: { children?: ReactNode }) {
+    return (
+      <th className="border-b border-hairline/40 px-2 py-1.5 text-left font-semibold">{children}</th>
+    );
+  },
+  td({ children }: { children?: ReactNode }) {
+    return <td className="border-b border-hairline/20 px-2 py-1.5 align-top">{children}</td>;
+  },
+  ul({ children }: { children?: ReactNode }) {
+    return <ul className="list-disc space-y-1 pl-5">{children}</ul>;
+  },
+  ol({ children }: { children?: ReactNode }) {
+    return <ol className="list-decimal space-y-1 pl-5">{children}</ol>;
+  },
+  h1({ children }: { children?: ReactNode }) {
+    return <div className="mt-2 text-[16px] font-semibold">{children}</div>;
+  },
+  h2({ children }: { children?: ReactNode }) {
+    return <div className="mt-2 text-[15.5px] font-semibold">{children}</div>;
+  },
+  h3({ children }: { children?: ReactNode }) {
+    return <div className="mt-1.5 font-semibold">{children}</div>;
+  },
+  h4({ children }: { children?: ReactNode }) {
+    return <div className="mt-1.5 font-semibold">{children}</div>;
+  },
+  h5({ children }: { children?: ReactNode }) {
+    return <div className="mt-1.5 text-[14px] font-semibold">{children}</div>;
+  },
+  h6({ children }: { children?: ReactNode }) {
+    return <div className="mt-1.5 text-[13.5px] font-semibold text-ink-secondary">{children}</div>;
+  },
+  blockquote({ children }: { children?: ReactNode }) {
+    return (
+      <blockquote className="border-l-2 border-hairline pl-3 text-ink-secondary">{children}</blockquote>
+    );
+  },
+  del({ children }: { children?: ReactNode }) {
+    return <Spoiler>{children}</Spoiler>;
+  },
+  hr() {
+    return <hr className="border-hairline/40" />;
+  },
+};
+
+const STREAMING_THROTTLE_MS = 64;
+
+/**
+ * Throttle streaming Markdown text updates at 64 ms intervals so rapid token deltas
+ * do not re-run markdown AST parsing on every animation frame.  Static text or initial
+ * renders update immediately with zero latency.
+ */
+function useThrottledStreamingText(text: string, streaming: boolean): string {
+  const [renderedText, setRenderedText] = useState(text);
+  const lastRenderedTimeRef = useRef(Date.now());
+  const pendingTextRef = useRef(text);
+  pendingTextRef.current = text;
+
+  useEffect(() => {
+    if (!streaming) {
+      setRenderedText(text);
+      lastRenderedTimeRef.current = Date.now();
+      return;
+    }
+
+    const elapsed = Date.now() - lastRenderedTimeRef.current;
+    if (elapsed >= STREAMING_THROTTLE_MS) {
+      setRenderedText(text);
+      lastRenderedTimeRef.current = Date.now();
+      return;
+    }
+
+    const timeout = setTimeout(() => {
+      setRenderedText(pendingTextRef.current);
+      lastRenderedTimeRef.current = Date.now();
+    }, STREAMING_THROTTLE_MS - elapsed);
+
+    return () => clearTimeout(timeout);
+  }, [text, streaming]);
+
+  return streaming ? renderedText : text;
+}
+
 function ChatMarkdownComponent({ text, streaming = false }: { text: string; streaming?: boolean }) {
+  const displayText = useThrottledStreamingText(text, streaming);
+  const content = displayText.replace(/&nbsp;/g, "\u00A0");
+  const components = useMemo(
+    () => ({
+      ...STATIC_MARKDOWN_COMPONENTS,
+      pre({ children }: { children?: ReactNode }) {
+        // fenced code arrives as <pre><code class="language-x">…</code></pre>
+        const first = Array.isArray(children) ? children[0] : children;
+        const child = isValidElement<{ className?: string; children?: ReactNode }>(first) ? first : null;
+        const className = child?.props.className ?? "";
+        const lang = /language-([\w-]+)/.exec(className)?.[1] ?? "";
+        // children can be a string OR an array of strings/nodes — flatten
+        // strings only, so String() never comma-joins an array
+        const code = flattenCodeChildren(child?.props.children).replace(/\n$/, "");
+        // a mermaid fence is a picture, not a program: hand it to the
+        // diagram renderer instead of the highlighter
+        if (lang.toLowerCase() === "mermaid") {
+          return <MermaidBlock code={code} streaming={streaming} />;
+        }
+        return <CodeBlock code={code} lang={lang} streaming={streaming} />;
+      },
+    }),
+    [streaming],
+  );
   return (
     <div className="chat-md min-w-0 [&>*+*]:mt-2">
-      <Markdown
-        remarkPlugins={[remarkGfm]}
-        components={{
-          pre({ children }: { children?: ReactNode }) {
-            // fenced code arrives as <pre><code class="language-x">…</code></pre>
-            const child: any = Array.isArray(children) ? children[0] : children;
-            const className: string = child?.props?.className ?? "";
-            const lang = /language-([\w-]+)/.exec(className)?.[1] ?? "";
-            // children can be a string OR an array of strings/nodes — flatten
-            // strings only, so String() never comma-joins an array
-            const flat = (n: any): string =>
-              typeof n === "string" ? n : Array.isArray(n) ? n.map(flat).join("") : (n?.props?.children ? flat(n.props.children) : "");
-            const code = flat(child?.props?.children).replace(/\n$/, "");
-            return <CodeBlock code={code} lang={lang} streaming={streaming} />;
-          },
-          img({ src, alt }: { src?: string; alt?: string }) {
-            return (
-              <img
-                src={src}
-                alt={alt ?? ""}
-                loading="lazy"
-                className="max-h-96 max-w-full rounded-lg border border-hairline/30"
-              />
-            );
-          },
-          code({ children }: { children?: ReactNode }) {
-            return (
-              <code className="rounded bg-inset px-1 py-px text-[13px]">{children}</code>
-            );
-          },
-          a({ href, children }: { href?: string; children?: ReactNode }) {
-            const localPath = localFilePath(href);
-            if (localPath) return <LocalFileLink filePath={localPath}>{children}</LocalFileLink>;
-            const handleClick = (e: React.MouseEvent) => {
-              if (href && window.ogb?.openExternal) {
-                e.preventDefault();
-                void window.ogb.openExternal(href);
-              }
-            };
-            return (
-              <a
-                href={href}
-                target="_blank"
-                rel="noreferrer"
-                onClick={handleClick}
-                className="break-words text-accent underline decoration-accent/40 hover:decoration-accent"
-              >
-                {children}
-              </a>
-            );
-          },
-          table({ children }: { children?: ReactNode }) {
-            return (
-              <div className="overflow-x-auto">
-                <table className="w-full border-collapse text-[13.5px]">{children}</table>
-              </div>
-            );
-          },
-          th({ children }: { children?: ReactNode }) {
-            return (
-              <th className="border-b border-hairline/40 px-2 py-1.5 text-left font-semibold">{children}</th>
-            );
-          },
-          td({ children }: { children?: ReactNode }) {
-            return <td className="border-b border-hairline/20 px-2 py-1.5 align-top">{children}</td>;
-          },
-          ul({ children }: { children?: ReactNode }) {
-            return <ul className="list-disc space-y-1 pl-5">{children}</ul>;
-          },
-          ol({ children }: { children?: ReactNode }) {
-            return <ol className="list-decimal space-y-1 pl-5">{children}</ol>;
-          },
-          h1({ children }: { children?: ReactNode }) {
-            return <div className="mt-2 text-[16px] font-semibold">{children}</div>;
-          },
-          h2({ children }: { children?: ReactNode }) {
-            return <div className="mt-2 text-[15.5px] font-semibold">{children}</div>;
-          },
-          h3({ children }: { children?: ReactNode }) {
-            return <div className="mt-1.5 font-semibold">{children}</div>;
-          },
-          h4({ children }: { children?: ReactNode }) {
-            return <div className="mt-1.5 font-semibold">{children}</div>;
-          },
-          h5({ children }: { children?: ReactNode }) {
-            return <div className="mt-1.5 text-[14px] font-semibold">{children}</div>;
-          },
-          h6({ children }: { children?: ReactNode }) {
-            return <div className="mt-1.5 text-[13.5px] font-semibold text-ink-secondary">{children}</div>;
-          },
-          blockquote({ children }: { children?: ReactNode }) {
-            return (
-              <blockquote className="border-l-2 border-hairline pl-3 text-ink-secondary">{children}</blockquote>
-            );
-          },
-          del({ children }: { children?: ReactNode }) {
-            return <Spoiler>{children}</Spoiler>;
-          },
-          hr() {
-            return <hr className="border-hairline/40" />;
-          },
-        }}
-      >
-        {text}
+      <Markdown remarkPlugins={REMARK_PLUGINS} components={components}>
+        {content}
       </Markdown>
     </div>
   );

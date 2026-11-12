@@ -13,6 +13,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Bug, ChevronDown, ChevronRight, RefreshCw, X } from "lucide-react";
 import { useStore, type Bot } from "@/state/store";
 import { cn } from "@/lib/cn";
+import { railAsideClass } from "@/lib/layout-rails";
 import { formatTime, toRows, type InspectorEntry, type InspectorPage, type InspectorRow } from "@/lib/inspector";
 import type { RuntimeEvent } from "../../server/contracts.ts";
 
@@ -118,7 +119,7 @@ export function InspectorPanel({ bot }: { bot: Bot }) {
   const total = lens === "raw" ? (page?.total.native ?? 0) : (page?.total.runtime ?? 0);
 
   return (
-    <aside className="animate-panel-in flex h-full w-[460px] shrink-0 flex-col border-l border-hairline/40 bg-panel">
+    <aside className={railAsideClass("w-[460px]")}>
       <div className="flex items-center justify-between px-4 py-3">
         <span className="flex items-center gap-2 text-[15px] font-semibold text-ink">
           <Bug size={16} className="text-ink-secondary" /> Inspector
@@ -151,7 +152,7 @@ export function InspectorPanel({ bot }: { bot: Bot }) {
         <span className="ml-auto text-[11px] text-ink-secondary">
           {page ? (shown < total ? `last ${shown} of ${total}` : `${shown} entries`) : "loading…"}
         </span>
-        <button onClick={() => void load()} className="rounded-md p-1 text-ink-secondary hover:bg-raised hover:text-ink" title="Reload from disk">
+        <button onClick={() => void load()} className="rounded-md p-1 text-ink-secondary hover:bg-raised hover:text-ink" title="Reload from Disk">
           <RefreshCw size={14} />
         </button>
       </div>
@@ -192,7 +193,12 @@ function Row({ row, open, onToggle }: { row: InspectorRow; open: boolean; onTogg
           {row.tag}
           {row.count > 1 ? ` ×${row.count}` : ""}
         </span>
-        <span className={cn("min-w-0 flex-1 truncate", row.tone === "error" ? "text-danger" : "text-ink")}>{row.summary}</span>
+        <span
+          className={cn("min-w-0 flex-1 truncate", row.tone === "error" ? "text-danger" : "text-ink")}
+          title={row.summary}
+        >
+          {row.summary}
+        </span>
       </button>
       {open && (
         <pre className="max-h-[50vh] overflow-auto whitespace-pre-wrap break-all border-t border-hairline/20 bg-app px-3 py-2 text-[11px] leading-relaxed text-ink">

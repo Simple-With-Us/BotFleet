@@ -1,0 +1,4194 @@
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import assert from "node:assert/strict";
+import { chmod, copyFile, mkdtemp, mkdir, readFile, readdir, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { downloadBuiltBundle, ResolutionError } from "./ci-build-resolver.mjs";
+import { stagingPath } from "./harness-release-store.mjs";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { setTimeout as delay } from "node:timers/promises";
+import test from "node:test";
+import {
+  startDesktopBeforeWatchdog,
+  restoreDesktopBeforeWatchdogs,
+  shouldStartDesktop,
+  applicationAttachmentError,
+  captureProcessIdentities,
+  exactAppPidsFromPs,
+  isZombieState,
+  processIsAlive,
+  processStates,
+  withoutExitedPids,
+  applicationIdentitiesCanTransition,
+  classifySmokeFailure,
+  SAFE_STORAGE_EXPORT_FLAG,
+  shouldExportSafeStorageBeforeRename,
+  authenticatedRuntimeError,
+  clearStoreIdentityError,
+  createOperations,
+  deployStoreReleaseIfBacked,
+  installReferenceDeps,
+  prepareStoreReleaseDeploy,
+  storeHarnessState,
+  bootOutHarnessForQuiesce,
+  credentialPreparationReceiptPath,
+  DEFAULT_PORTS,
+  DEFAULT_STARTUP_TIMEOUT_MS,
+  dependencyFingerprint,
+  effectiveLockDocument,
+  reportCheckoutDrift,
+  describeLaunchdExit,
+  isRecoverableResolutionFailure,
+  parseLaunchdJob,
+  designatedRequirementFromOutput,
+  fenceRuntimeAdmission,
+  healthTopologyResult,
+  harnessBootstrapPlist,
+  harnessLaunchdLabel,
+  isExpectedBotFleetProcess,
+  isMacSystemBundleInspector,
+  launchAgentPlistLabel,
+  launchdExitReason,
+  loadPrepared,
+  main,
+  parseArguments,
+  resolveUpdateComponentFlags,
+  swapDependencyTree,
+  parseHealthBody,
+  pendingRecoveryReceiptPath,
+  LIVE_OK,
+  liveHealthMark,
+  sealedResourceRules,
+  inspectInstalledResourceDrift,
+  resourceDriftAction,
+  guardInstalledResources,
+  clearPendingRecoveryAfterLiveOk,
+  collectUpdateStatus,
+  renderUpdateStatus,
+  newestBackup,
+  recoverFromLatestBackup,
+  resourceBackupRoot,
+  quiesceBootoutLabels,
+  rollbackHarnessBootoutLabels,
+  rollbackHarnessBootstrapPlists,
+  rollbackReadinessError,
+  resolveHarnessBearerCredential,
+  run,
+  runStagedSmokeTest,
+  runtimePreflight,
+  settledRunOutcome,
+  signalProcess,
+  smokeFailureMessage,
+  smokeTestEnabled,
+  stableApplicationProcessError,
+  startedHarnessLabel,
+  startupProgress,
+  swapPreparedFiles,
+  terminateVerified,
+  validateBuiltBundle,
+  waitForLaunchdBootout,
+  waitForStableApplication,
+  waitForStartup,
+} from "./update-botfleet-mac.mjs";
+
+test("desktop update establishes verified packaged ownership before starting the source watchdog", async () => {
+  const calls = [];
+  await startDesktopBeforeWatchdog({
+    desktop: true,
+    open: async () => { calls.push("open"); },
+    verify: async () => { calls.push("verified packaged owner"); },
+    bootstrap: async () => { calls.push("watchdog"); },
+  });
+  assert.deepEqual(calls, ["open", "verified packaged owner", "watchdog"]);
+});
+
+test("failed packaged startup cannot start a competing source owner", async () => {
+  let bootstrapped = false;
+  await assert.rejects(startDesktopBeforeWatchdog({
+    desktop: true,
+    open: async () => {},
+    verify: async () => { throw new Error("expected manifest did not match"); },
+    bootstrap: async () => { bootstrapped = true; },
+  }), /expected manifest did not match/);
+  assert.equal(bootstrapped, false);
+});
+
+test("server-only and no-open startup retain the existing watchdog route", async () => {
+  let bootstrapped = false;
+  await startDesktopBeforeWatchdog({
+    desktop: false,
+    open: async () => { assert.fail("desktop must remain closed"); },
+    verify: async () => { assert.fail("no packaged owner requested"); },
+    bootstrap: async () => { bootstrapped = true; },
+  });
+  assert.equal(bootstrapped, true);
+});
+
+test("rollback attempts every watchdog after desktop verification and individual bootstrap failures", async () => {
+  const calls = [];
+  const errors = [];
+  await restoreDesktopBeforeWatchdogs({
+    desktop: true,
+    open: async () => { calls.push("open restored app"); },
+    verify: async () => { calls.push("verify restored app"); throw new Error("app failed"); },
+    bootstraps: [
+      async () => { calls.push("first watchdog"); throw new Error("first plist failed"); },
+      async () => { calls.push("second watchdog"); },
+    ],
+    record: async (operation) => { try { await operation(); } catch (error) { errors.push(error.message); } },
+  });
+  assert.deepEqual(calls, ["open restored app", "verify restored app", "first watchdog", "second watchdog"]);
+  assert.deepEqual(errors, ["app failed", "first plist failed"]);
+});
+
+test("desktop startup respects component ownership, no-open and the pre-rollback application state", () => {
+  assert.equal(shouldStartDesktop({ updateApp: true }), true);
+  assert.equal(shouldStartDesktop({ updateApp: false }), false);
+  assert.equal(shouldStartDesktop({ updateApp: true, openApplication: false }), false);
+  assert.equal(shouldStartDesktop({ updateApp: true, wasRunning: false }), false);
+  assert.equal(shouldStartDesktop({ updateApp: true, openApplication: true, wasRunning: true }), true);
+});
+
+const scripts = dirname(fileURLToPath(import.meta.url));
+
+/** Wrapper tests must not read ~/.botfleet or /Applications/BotFleet.app. */
+function wrapperFixtureEnv(checkout, fixture) {
+  return {
+    BOTFLEET_CHECKOUT: checkout,
+    BOTFLEET_DATA_DIR: join(fixture, "data"),
+    BOTFLEET_APP_PATH: join(fixture, "no-app.app"),
+  };
+}
+
+// A real 40-char commit, so the resolver is driven with a target it will accept.
+const COMMIT = "c".repeat(40);
+
+
+test("a detached run is given a progress file and a run id to report under", () => {
+  const parsed = parseArguments(["update", "--progress", "/tmp/state/run.json", "--run-id", "run_one"]);
+  assert.equal(parsed.command, "update");
+  // Resolved, like every other path option: the detached run is launched from
+  // a working directory nobody chose, so a relative --progress would land
+  // somewhere unpredictable.  `resolve` is what makes this assertion true on
+  // Windows CI too, where the same absolute POSIX path gains a drive letter.
+  assert.equal(parsed.progress, resolve("/tmp/state/run.json"));
+  assert.equal(parsed.runId, "run_one");
+  // A run id with nothing to write it to is a caller mistake, not a default.
+  assert.throws(() => parseArguments(["update", "--run-id", "run_one"]), /--run-id requires --progress/);
+  assert.throws(() => parseArguments(["update", "--progress", "/tmp/p", "--run-id", "../escape"]), /short identifier/);
+  // The recovery action still takes nothing at all.
+  assert.throws(() => parseArguments(["unquiesce", "--progress", "/tmp/p"]), /accepts no options/);
+});
+
+test("prepare and apply expose an explicit reusable stage", () => {
+  assert.deepEqual(
+    parseArguments(["prepare", "--target=abc", "--source", "/tmp/source", "--stage", "/tmp/stage"]),
+    {
+      command: "prepare",
+      target: "abc",
+      source: resolve("/tmp/source"),
+      stage: resolve("/tmp/stage"),
+      bundle: undefined,
+      dependencies: undefined,
+      openApplication: true,
+      components: "both",
+      progress: undefined,
+      runId: undefined,
+    },
+  );
+  assert.deepEqual(parseArguments(["apply", "--stage", "/tmp/stage", "--no-open"]), {
+    command: "apply",
+    target: "origin/main",
+    source: undefined,
+    stage: resolve("/tmp/stage"),
+    bundle: undefined,
+    dependencies: undefined,
+    components: "both",
+    openApplication: false,
+    progress: undefined,
+    runId: undefined,
+  });
+  assert.equal(parseArguments(["update", "--server-only"]).components, "server");
+  assert.equal(parseArguments(["update", "--components", "server"]).components, "server");
+  assert.throws(() => parseArguments(["update", "--components", "app"]), /--components app/);
+  assert.deepEqual(resolveUpdateComponentFlags("server"), { mode: "server", updateServer: true, updateApp: false });
+  assert.throws(() => parseArguments(["apply"]), /requires --stage/);
+  assert.throws(() => parseArguments(["update", "--unknown"]), /Unknown option/);
+  assert.throws(() => parseArguments(["prepare", "--bundle", "/tmp/app"]), /supplied together/);
+  assert.equal(parseArguments(["unquiesce"]).command, "unquiesce");
+  assert.throws(() => parseArguments(["unquiesce", "--no-open"]), /accepts no options/);
+  assert.throws(
+    () => parseArguments(["prepare", "--bundle", "/tmp/app", "--dependencies", "/tmp/deps"]),
+    /requires its exact --source/,
+  );
+  assert.equal(
+    parseArguments([
+      "prepare",
+      "--source", "/tmp/source",
+      "--bundle", "/tmp/source/release/BotFleet.app",
+      "--dependencies", "/tmp/source/node_modules",
+    ]).bundle,
+    resolve("/tmp/source/release/BotFleet.app"),
+  );
+});
+
+test("prepared stages reject symlink directories", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "botfleet-update-stage-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const stage = join(root, "stage");
+  const link = join(root, "stage-link");
+  await mkdir(stage, { mode: 0o700 });
+  await symlink(stage, link);
+  await assert.rejects(loadPrepared(link), /must be a real directory/);
+});
+
+test("prepared stages reject public manifests", { skip: process.platform === "win32" ? "Mac updater requires POSIX ownership and modes" : false }, async (t) => {
+  const stage = await mkdtemp(join(tmpdir(), "botfleet-update-stage-"));
+  t.after(() => rm(stage, { recursive: true, force: true }));
+  const manifest = join(stage, "prepared.json");
+  await writeFile(manifest, "{}\n", { mode: 0o600 });
+  await chmod(manifest, 0o644);
+  await assert.rejects(loadPrepared(stage), /must not be accessible by group or other users/);
+});
+
+test("transition release loads stages prepared for either accepted bundle ID and rejects any other", { skip: process.platform === "win32" ? "Mac updater requires POSIX ownership and modes" : false }, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "botfleet-update-stage-ids-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const writePreparedStage = async (name, bundleIdentifier) => {
+    const stage = join(root, name);
+    await mkdir(stage, { mode: 0o700 });
+    await writeFile(join(stage, "prepared.json"), `${JSON.stringify({
+      schemaVersion: 2,
+      sourceCommit: "a".repeat(40),
+      version: "1.0.0",
+      apiVersion: 1,
+      uiHash: "b".repeat(64),
+      teamIdentifier: "CC8UTF7ATG",
+      bundleIdentifier,
+      designatedRequirement: "requirement",
+      bundleName: "BotFleet.app",
+      dependenciesName: "node_modules",
+      dependencyFingerprint: "c".repeat(64),
+    })}\n`, { mode: 0o600 });
+    return stage;
+  };
+  // main still builds com.botfleet.app until the rename PR lands.
+  assert.equal((await loadPrepared(await writePreparedStage("legacy", "com.botfleet.app"))).bundleIdentifier, "com.botfleet.app");
+  assert.equal((await loadPrepared(await writePreparedStage("renamed", "app.botfleet.macos"))).bundleIdentifier, "app.botfleet.macos");
+  await assert.rejects(loadPrepared(await writePreparedStage("other", "com.example.other")), /invalid identity/);
+});
+
+test("bundle validation rejects a symlink before trusting its contents", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "botfleet-update-bundle-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const bundle = join(root, "BotFleet.app");
+  const link = join(root, "BotFleet-link.app");
+  await mkdir(bundle);
+  await symlink(bundle, link);
+  await assert.rejects(validateBuiltBundle(link, "b".repeat(40)), /must be a real directory/);
+});
+
+test("dependency fingerprints cover package contents and symlink targets", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "botfleet-update-dependencies-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const dependencies = join(root, "node_modules");
+  await mkdir(join(dependencies, ".pnpm"), { recursive: true });
+  await mkdir(join(dependencies, "package"));
+  await writeFile(join(dependencies, ".modules.yaml"), "layoutVersion: 5\n");
+  await writeFile(join(dependencies, ".pnpm/lock.yaml"), "lockfileVersion: '9.0'\n");
+  await writeFile(join(dependencies, "package/index.js"), "export const value = 1;\n");
+  await symlink("package", join(dependencies, "package-link"));
+
+  const original = await dependencyFingerprint(dependencies);
+  await writeFile(join(dependencies, "package/index.js"), "export const value = 2;\n");
+  const contentChanged = await dependencyFingerprint(dependencies);
+  assert.notEqual(contentChanged, original);
+
+  await rm(join(dependencies, "package-link"));
+  await symlink("other-package", join(dependencies, "package-link"));
+  assert.notEqual(await dependencyFingerprint(dependencies), contentChanged);
+});
+
+// The always-on checkout is supposed to be a detached origin/main checkout and
+// the updater leaves it there on apply.  When a seat switched it to a working
+// branch instead, the harness served that branch for days with nothing on
+// screen saying so.  Advisory only: it must never fail an update.
+test("checkout drift is reported, and only when it is real", async () => {
+  const { mkdtemp, writeFile } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const run = promisify(execFile);
+  const root = await mkdtemp(join(tmpdir(), "omb-checkout-drift-"));
+  const repo = join(root, "repo");
+  await run("git", ["init", "-q", repo]);
+  await run("git", ["-C", repo, "config", "user.email", "t@example.invalid"]);
+  await run("git", ["-C", repo, "config", "user.name", "T"]);
+  await writeFile(join(repo, "f"), "1");
+  await run("git", ["-C", repo, "add", "f"]);
+  await run("git", ["-C", repo, "commit", "-qm", "one"]);
+  // A real origin/main ref, because that is what the drift check compares
+  // against — without one, "not origin/main" is indistinguishable from "no
+  // origin", and the check stays quiet on every checkout.
+  await run("git", ["-C", repo, "update-ref", "refs/remotes/origin/main", "HEAD"]);
+
+  // At origin/main: silent, because there is nothing to say.
+  assert.equal(await reportCheckoutDrift(repo), null);
+
+  // A branch at the SAME commit is not drift: the harness would be serving
+  // identical code, so there is nothing worth a warning.
+  await run("git", ["-C", repo, "checkout", "-q", "-b", "seat-work"]);
+  assert.equal(await reportCheckoutDrift(repo), null);
+
+  // A branch with its own commit IS drift, and it names itself — this is the
+  // shape that let a seat's working branch serve the harness for days.
+  await writeFile(join(repo, "f"), "2");
+  await run("git", ["-C", repo, "commit", "-qam", "two"]);
+  const drifted = await reportCheckoutDrift(repo);
+  assert.ok(drifted, "drift on a branch should be reported");
+  assert.match(drifted, /seat-work/);
+
+  // A path that is not a checkout reports nothing rather than failing an update.
+  assert.equal(await reportCheckoutDrift(join(root, "not-a-repo")), null);
+});
+
+// The first version of this fix tested only the document helper and left the
+// gate calling `.equals()` on a STRING, which throws a TypeError and surfaces
+// as an unexplained updater crash.  These cases drive the comparison the gate
+// actually performs, so a type slip cannot pass again.
+test("the gate comparison is byte-wise and type-correct", async () => {
+  const lock = "lockfileVersion: '9.0'\n\nimporters:\n  .: {}\n";
+  const stream = `---\nlockfileVersion: '9.0'\n\nimporters:\n  .:\n    packageManagerDependencies:\n      pnpm:\n        specifier: 12.10.1\n---\n${lock}`;
+  // Exactly the expression assertDependenciesMatchSource runs.
+  const gate = (sourceLock, installedLock) =>
+    Buffer.from(effectiveLockDocument(sourceLock.toString("utf8")), "utf8").equals(installedLock);
+
+  assert.equal(gate(Buffer.from(stream), Buffer.from(lock)), true);
+  assert.equal(gate(Buffer.from(lock), Buffer.from(lock)), true);
+  assert.equal(gate(Buffer.from(stream), Buffer.from(`${lock}\n# drift\n`)), false);
+  assert.equal(gate(Buffer.from(lock), Buffer.from(stream)), false);
+});
+
+// The dependency gate compared the whole project lockfile against pnpm's
+// internal copy.  Since pnpm 12 those are different BYTE LENGTHS by design —
+// the project file is a two-document stream carrying `packageManagerDependencies`
+// and pnpm writes only the real lockfile — so the gate rejected every install
+// on every Mac while `pnpm install --frozen-lockfile` kept working, and the
+// only symptom was "update failed" at the moment someone tried to update.
+test("the dependency gate compares the document pnpm wrote, not the whole stream", () => {
+  const lock = "lockfileVersion: '9.0'\n\nimporters:\n  .: {}\n";
+  // pnpm 12: a leading document for the self-hosted package manager, then the
+  // real lockfile after a second `---`.
+  const stream = `---\nlockfileVersion: '9.0'\n\nimporters:\n  .:\n    packageManagerDependencies:\n      pnpm:\n        specifier: 12.10.1\n        version: 12.10.1\n---\n${lock}`;
+  assert.equal(effectiveLockDocument(stream), lock);
+  assert.notEqual(stream, lock);
+
+  // pnpm < 12: one document, no separator.  A leading marker alone is not a
+  // document boundary, so the content comes back unchanged.
+  assert.equal(effectiveLockDocument(lock), lock);
+  assert.equal(effectiveLockDocument(`---\n${lock}`), lock);
+
+  // A real drift still fails: different dependency content is not equal.
+  assert.notEqual(effectiveLockDocument(stream), `${lock}\n# drift\n`);
+});
+
+test("command results wait for output pipes to close", async () => {
+  const script = `
+    const { spawn } = require("node:child_process");
+    spawn(process.execPath, ["-e", "setTimeout(() => process.stdout.write('late\\\\n'), 40)"], { stdio: ["ignore", 1, 2] });
+    process.stdout.write("early\\n");
+  `;
+  const result = await run(process.execPath, ["-e", script]);
+  assert.equal(result.stdout, "early\nlate\n");
+});
+
+test("designated requirement comparison excludes the bundle-specific executable path", () => {
+  const requirement = 'designated => identifier "app.botfleet.macos" and certificate leaf[subject.OU] = CC8UTF7ATG';
+  const installed = `Executable=/Applications/BotFleet.app/Contents/MacOS/BotFleet\n${requirement}\n`;
+  const candidate = `Executable=/Applications/.BotFleet.update-123.app/Contents/MacOS/BotFleet\n${requirement}\n`;
+  assert.equal(designatedRequirementFromOutput(installed), requirement);
+  assert.equal(designatedRequirementFromOutput(candidate), requirement);
+});
+
+test("application identity transition accepts only the signed legacy app as the installed predecessor", () => {
+  const current = {
+    teamIdentifier: "CC8UTF7ATG",
+    bundleIdentifier: "app.botfleet.macos",
+    designatedRequirement: "current-requirement",
+  };
+  const legacy = {
+    teamIdentifier: "CC8UTF7ATG",
+    bundleIdentifier: "com.botfleet.app",
+    designatedRequirement: "legacy-requirement",
+  };
+  assert.equal(applicationIdentitiesCanTransition(legacy, current), true);
+  assert.equal(applicationIdentitiesCanTransition(current, current), true);
+  assert.equal(applicationIdentitiesCanTransition({ ...legacy, teamIdentifier: "ATTACKER" }, current), false);
+  assert.equal(applicationIdentitiesCanTransition({ ...legacy, bundleIdentifier: "com.example.other" }, current), false);
+  assert.equal(applicationIdentitiesCanTransition(legacy, { ...current, bundleIdentifier: "com.botfleet.app" }), false);
+  assert.equal(applicationIdentitiesCanTransition(current, { ...current, designatedRequirement: "changed" }), false);
+});
+
+test("transition release still accepts main's legacy-ID candidate over a legacy install, and never downgrades", () => {
+  const legacy = {
+    teamIdentifier: "CC8UTF7ATG",
+    bundleIdentifier: "com.botfleet.app",
+    designatedRequirement: "legacy-requirement",
+  };
+  const current = {
+    teamIdentifier: "CC8UTF7ATG",
+    bundleIdentifier: "app.botfleet.macos",
+    designatedRequirement: "current-requirement",
+  };
+  // Until the rename lands, main builds com.botfleet.app: an ordinary
+  // main-to-main update keeps the pre-transition same-requirement rule.
+  assert.equal(applicationIdentitiesCanTransition(legacy, legacy), true);
+  assert.equal(applicationIdentitiesCanTransition(legacy, { ...legacy, designatedRequirement: "changed" }), false);
+  assert.equal(applicationIdentitiesCanTransition(legacy, { ...legacy, teamIdentifier: "ATTACKER" }), false);
+  // A renamed install is never replaced by a legacy-ID candidate.
+  assert.equal(applicationIdentitiesCanTransition(current, { ...legacy, designatedRequirement: current.designatedRequirement }), false);
+  assert.equal(applicationIdentitiesCanTransition(current, legacy), false);
+  // Any other bundle ID is rejected as a candidate.
+  assert.equal(applicationIdentitiesCanTransition(legacy, { ...legacy, bundleIdentifier: "com.example.other" }), false);
+});
+
+test("safeStorage export runs only when the installed app is the legacy identity", () => {
+  assert.equal(shouldExportSafeStorageBeforeRename("com.botfleet.app", "app.botfleet.macos"), true);
+  assert.equal(shouldExportSafeStorageBeforeRename("app.botfleet.macos", "app.botfleet.macos"), false);
+  assert.equal(shouldExportSafeStorageBeforeRename("com.botfleet.app", "com.botfleet.app"), false);
+  assert.equal(SAFE_STORAGE_EXPORT_FLAG, "--export-safe-storage-migration");
+});
+
+test("the stable wrapper bootstraps updater policy from the fetched target", async () => {
+  const source = await readFile(join(scripts, "update-botfleet-policy.sh"), "utf8");
+  assert.match(source, /BOOTSTRAP_REF="\$\{BOTFLEET_UPDATE_TARGET:-origin\/main\}"/);
+  assert.match(source, /elif \[\[ "\$arg" == "--target" \]\]/);
+  assert.match(source, /elif \[\[ "\$arg" == --target=\* \]\]/);
+  assert.match(source, /BOOTSTRAP_REF="\$arg"/);
+  assert.match(source, /UPDATER_ARGS\+=\(--target "\$BOTFLEET_UPDATE_TARGET"\)/);
+  assert.ok(
+    source.indexOf('BOOTSTRAP_REF="$arg"') < source.indexOf('git -C "$BOTFLEET_CHECKOUT" archive "$BOOTSTRAP_COMMIT"'),
+    "--target must select updater policy before the target graph is archived",
+  );
+  assert.match(source, /git -C "\$BOTFLEET_CHECKOUT" archive "\$BOOTSTRAP_COMMIT"/);
+  for (const path of [
+    "scripts/update-botfleet-mac.mjs",
+    "scripts/mac-update-transaction.mjs",
+    "scripts/harness-release-store.mjs",
+    "scripts/release-provenance.mjs",
+    "scripts/ci-build-resolver.mjs",
+    "scripts/stage-entries.mjs",
+    "scripts/failed-install-retention.mjs",
+    "scripts/update-progress.mjs",
+    "electron/update-credential-preparation.mjs",
+  ]) {
+    assert.match(source, new RegExp(path.replaceAll("/", "\\/")));
+  }
+  assert.match(source, /"\$NODE_BIN" "\$BOOTSTRAP_DIR\/scripts\/update-botfleet-mac.mjs"/);
+  assert.ok(
+    source.indexOf("git -C \"$BOTFLEET_CHECKOUT\" archive") < source.indexOf('if [[ -f "$LOCAL_IMPL" ]]'),
+    "the target updater must run before either installed implementation",
+  );
+});
+
+test("forced updates refresh the selected bootstrap ref before archiving it", async () => {
+  const source = await readFile(join(scripts, "update-botfleet-policy.sh"), "utf8");
+  const forceCheck = source.indexOf('if [[ "${BOTFLEET_FORCE:-}" == "1" ]]');
+  const targetSelection = source.indexOf('BOOTSTRAP_REF="${BOTFLEET_UPDATE_TARGET:-origin/main}"');
+  const targetOverride = source.indexOf('BOOTSTRAP_REF="$arg"');
+  const fetch = source.indexOf('git -C "$BOTFLEET_CHECKOUT" fetch --quiet origin "$BOOTSTRAP_FETCH_REF"');
+  const archive = source.indexOf('git -C "$BOTFLEET_CHECKOUT" archive "$BOOTSTRAP_COMMIT"');
+
+  assert.ok(forceCheck >= 0, "the regression must exercise the forced-update path");
+  assert.ok(targetSelection > forceCheck, "bootstrap selection happens after the force skip");
+  assert.ok(targetOverride > targetSelection, "--target keeps precedence over the environment");
+  assert.ok(fetch > targetOverride, "the final selected ref must be known before fetching");
+  assert.ok(archive > fetch, "the selected ref must be refreshed before it can be archived");
+  assert.match(source, /BOOTSTRAP_FETCH_REF="\$\{BOOTSTRAP_REF#origin\/\}"/);
+  assert.match(
+    source,
+    /if git -C "\$BOTFLEET_CHECKOUT" fetch --quiet origin "\$BOOTSTRAP_FETCH_REF" 2>\/dev\/null; then[\s\S]*?git -C "\$BOTFLEET_CHECKOUT" archive "\$BOOTSTRAP_COMMIT"/,
+    "a failed refresh must not fall through to a stale local archive",
+  );
+});
+
+test("the stable wrapper enforces origin/main ancestry before archiving or executing the bootstrap target", async () => {
+  const source = await readFile(join(scripts, "update-botfleet-policy.sh"), "utf8");
+  const fetch = source.indexOf('git -C "$BOTFLEET_CHECKOUT" fetch --quiet origin "$BOOTSTRAP_FETCH_REF"');
+  const mainRefresh = source.indexOf('git -C "$BOTFLEET_CHECKOUT" fetch --quiet origin main', fetch);
+  const resolve = source.indexOf('BOOTSTRAP_COMMIT="$(git -C "$BOTFLEET_CHECKOUT" rev-parse --verify "${BOOTSTRAP_REF}^{commit}"', fetch);
+  const ancestry = source.indexOf('merge-base --is-ancestor "$BOOTSTRAP_COMMIT" origin/main', fetch);
+  const archive = source.indexOf('git -C "$BOTFLEET_CHECKOUT" archive "$BOOTSTRAP_COMMIT"');
+  const exec = source.indexOf('"$NODE_BIN" "$BOOTSTRAP_DIR/scripts/update-botfleet-mac.mjs"');
+  assert.ok(fetch >= 0, "the bootstrap target is fetched");
+  assert.ok(mainRefresh > fetch, "origin/main is refreshed after the target fetch, as resolveTarget() does");
+  assert.ok(resolve > mainRefresh, "the fetched commit is resolved before it is checked");
+  assert.ok(ancestry > resolve, "the resolved commit is checked against origin/main");
+  assert.ok(archive > ancestry, "no target code is archived before the ancestry check");
+  assert.ok(exec > ancestry, "no target code is executed before the ancestry check");
+  // Fail closed: rejection must exit, not fall through to an installed
+  // implementation whose resolveTarget() may predate the ancestry rule.
+  const rejection = source.indexOf("is not reachable from origin/main", ancestry);
+  const rejectExit = source.indexOf("exit 1", ancestry);
+  assert.ok(rejection > ancestry && rejection < archive, "an unmerged target is rejected with resolveTarget()'s reason");
+  assert.ok(rejectExit > ancestry && rejectExit < archive, "rejection exits before any archive or exec of the target");
+  assert.match(source, /\^\[0-9a-f\]\{40\}\$/);
+});
+
+test("the stable wrapper rejects an unmerged --target before running any of its code", { skip: process.platform === "win32" ? "the stable wrapper requires bash" : false }, async (t) => {
+  const fixture = await mkdtemp(join(tmpdir(), "ubf-bootstrap-"));
+  t.after(() => rm(fixture, { recursive: true, force: true }));
+  const remote = join(fixture, "remote");
+  const checkout = join(fixture, "checkout");
+  const marker = join(fixture, "executed");
+  await mkdir(remote, { recursive: true });
+  const git = (cwd, args) => run("git", ["-C", cwd, ...args]);
+  const writeUpdater = async (cwd, text) => {
+    for (const path of [
+      "scripts/update-botfleet-mac.mjs",
+      "scripts/mac-update-transaction.mjs",
+    "scripts/harness-release-store.mjs",
+    "scripts/release-provenance.mjs",
+      "scripts/ci-build-resolver.mjs",
+    "scripts/stage-entries.mjs",
+      "scripts/failed-install-retention.mjs",
+      "scripts/update-progress.mjs",
+      "electron/update-credential-preparation.mjs",
+    ]) {
+      await mkdir(dirname(join(cwd, path)), { recursive: true });
+      await writeFile(join(cwd, path), path.endsWith("update-botfleet-mac.mjs") ? text : "// placeholder\n");
+    }
+  };
+  const updater = (label) => `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(marker)}, ${JSON.stringify(label)});\n`;
+  await git(fixture, ["init", "-b", "main", "remote"]);
+  await git(remote, ["config", "user.email", "test@example.com"]);
+  await git(remote, ["config", "user.name", "Test"]);
+  await writeUpdater(remote, updater("main"));
+  await git(remote, ["add", "."]);
+  await git(remote, ["commit", "-m", "main"]);
+  // An unmerged ref: its updater code is not reachable from origin/main.
+  await git(remote, ["checkout", "-b", "evil"]);
+  await writeUpdater(remote, updater("evil"));
+  await git(remote, ["add", "."]);
+  await git(remote, ["commit", "-m", "evil"]);
+  await git(remote, ["checkout", "main"]);
+  await git(fixture, ["clone", "remote", "checkout"]);
+  await git(checkout, ["config", "user.email", "test@example.com"]);
+  await git(checkout, ["config", "user.name", "Test"]);
+
+  const env = { BOTFLEET_CHECKOUT: checkout, BOTFLEET_FORCE: "1" };
+  const rejected = await run("bash", [join(scripts, "update-botfleet-policy.sh"), "--target", "origin/evil"], { env, allowFailure: true });
+  assert.equal(rejected.code, 1, "an unmerged --target must be rejected");
+  assert.match(rejected.stderr, /not reachable from origin\/main/);
+  const mainCommit = (await run("git", ["-C", checkout, "rev-parse", "origin/main"])).stdout.trim();
+  const evilCommit = (await run("git", ["-C", checkout, "rev-parse", "origin/evil"])).stdout.trim();
+  assert.notEqual(evilCommit, mainCommit);
+  const merged = await run("git", ["-C", checkout, "merge-base", "--is-ancestor", evilCommit, "origin/main"], { allowFailure: true });
+  assert.notEqual(merged.code, 0, "the fixture's evil ref must actually be unmerged");
+  assert.equal(await readFile(marker, "utf8").catch(() => null), null, "no archived updater code ran");
+
+  const accepted = await run("bash", [join(scripts, "update-botfleet-policy.sh"), "--target", "origin/main"], { env, allowFailure: true });
+  assert.equal(accepted.code, 0, `a merged --target still bootstraps: ${accepted.stderr}`);
+  assert.equal(await readFile(marker, "utf8"), "main", "the archived updater from the merged target ran");
+});
+
+test("the stable wrapper resolves a revision-expression --target instead of fetching it as a refspec", { skip: process.platform === "win32" ? "the stable wrapper requires bash" : false }, async (t) => {
+  const fixture = await mkdtemp(join(tmpdir(), "ubf-revexpr-"));
+  t.after(() => rm(fixture, { recursive: true, force: true }));
+  const remote = join(fixture, "remote");
+  const checkout = join(fixture, "checkout");
+  const marker = join(fixture, "executed.json");
+  await mkdir(remote, { recursive: true });
+  const git = (cwd, args) => run("git", ["-C", cwd, ...args]);
+  const writeUpdater = async (cwd, label) => {
+    for (const path of [
+      "scripts/update-botfleet-mac.mjs",
+      "scripts/mac-update-transaction.mjs",
+    "scripts/harness-release-store.mjs",
+    "scripts/release-provenance.mjs",
+      "scripts/ci-build-resolver.mjs",
+    "scripts/stage-entries.mjs",
+      "scripts/failed-install-retention.mjs",
+      "scripts/update-progress.mjs",
+      "electron/update-credential-preparation.mjs",
+    ]) {
+      await mkdir(dirname(join(cwd, path)), { recursive: true });
+      await writeFile(join(cwd, path), path.endsWith("update-botfleet-mac.mjs")
+        ? `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(marker)}, JSON.stringify({ label: ${JSON.stringify(label)}, args: process.argv.slice(2) }));\n`
+        : "// placeholder\n");
+    }
+  };
+  await git(fixture, ["init", "-b", "main", "remote"]);
+  await git(remote, ["config", "user.email", "test@example.com"]);
+  await git(remote, ["config", "user.name", "Test"]);
+  await writeUpdater(remote, "older");
+  await git(remote, ["add", "."]);
+  await git(remote, ["commit", "-m", "older"]);
+  await writeUpdater(remote, "newer");
+  await git(remote, ["add", "."]);
+  await git(remote, ["commit", "-m", "newer"]);
+  await git(fixture, ["clone", "remote", "checkout"]);
+  const olderCommit = (await git(remote, ["rev-parse", "main~1"])).stdout.trim();
+  const newerCommit = (await git(remote, ["rev-parse", "main"])).stdout.trim();
+
+  const wrapper = join(scripts, "update-botfleet-policy.sh");
+  const env = { BOTFLEET_CHECKOUT: checkout, BOTFLEET_FORCE: "1" };
+  // origin/main~1 is not a fetchable refspec.  Fetching it verbatim fails and
+  // falls through to the checkout's installed (newer) updater; the wrapper must
+  // instead fetch main and run the target's own (older) updater policy.
+  const parent = await run("bash", [wrapper, "--target", "origin/main~1"], { env, allowFailure: true });
+  assert.equal(parent.code, 0, `origin/main~1 bootstraps: ${parent.stderr}`);
+  assert.doesNotMatch(parent.stderr, /using the installed implementation/);
+  assert.deepEqual(JSON.parse(await readFile(marker, "utf8")), { label: "older", args: ["--target", olderCommit] });
+
+  await rm(marker, { force: true });
+  const peeled = await run("bash", [wrapper, "--target=origin/main^{commit}"], { env, allowFailure: true });
+  assert.equal(peeled.code, 0, `origin/main^{commit} bootstraps: ${peeled.stderr}`);
+  assert.doesNotMatch(peeled.stderr, /using the installed implementation/);
+  assert.deepEqual(JSON.parse(await readFile(marker, "utf8")), { label: "newer", args: ["--target", newerCommit] });
+});
+
+test("unquiesce ignores update targets and bootstraps the recovery from origin/main", { skip: process.platform === "win32" ? "the stable wrapper requires bash" : false }, async (t) => {
+  const fixture = await mkdtemp(join(tmpdir(), "ubf-unquiesce-target-"));
+  t.after(() => rm(fixture, { recursive: true, force: true }));
+  const remote = join(fixture, "remote");
+  const checkout = join(fixture, "checkout");
+  const marker = join(fixture, "executed.json");
+  await mkdir(remote, { recursive: true });
+  const git = (cwd, args) => run("git", ["-C", cwd, ...args]);
+  const writeUpdater = async (cwd, label) => {
+    for (const path of [
+      "scripts/update-botfleet-mac.mjs",
+      "scripts/mac-update-transaction.mjs",
+    "scripts/harness-release-store.mjs",
+    "scripts/release-provenance.mjs",
+      "scripts/ci-build-resolver.mjs",
+    "scripts/stage-entries.mjs",
+      "scripts/failed-install-retention.mjs",
+      "scripts/update-progress.mjs",
+      "electron/update-credential-preparation.mjs",
+    ]) {
+      await mkdir(dirname(join(cwd, path)), { recursive: true });
+      await writeFile(join(cwd, path), path.endsWith("update-botfleet-mac.mjs")
+        ? `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(marker)}, JSON.stringify({ label: ${JSON.stringify(label)}, args: process.argv.slice(2) }));\n`
+        : "// placeholder\n");
+    }
+  };
+  await git(fixture, ["init", "-b", "main", "remote"]);
+  await git(remote, ["config", "user.email", "test@example.com"]);
+  await git(remote, ["config", "user.name", "Test"]);
+  await writeUpdater(remote, "main");
+  await git(remote, ["add", "."]);
+  await git(remote, ["commit", "-m", "main"]);
+  // An unmerged ref, left over as BOTFLEET_UPDATE_TARGET from an interrupted
+  // targeted update; the ancestry check refuses its updater code.
+  await git(remote, ["checkout", "-b", "fenced"]);
+  await writeUpdater(remote, "fenced");
+  await git(remote, ["add", "."]);
+  await git(remote, ["commit", "-m", "fenced"]);
+  await git(remote, ["checkout", "main"]);
+  await git(fixture, ["clone", "remote", "checkout"]);
+
+  const wrapper = join(scripts, "update-botfleet-policy.sh");
+  const env = { BOTFLEET_CHECKOUT: checkout, BOTFLEET_FORCE: "1", BOTFLEET_UPDATE_TARGET: "origin/fenced" };
+  // The recovery action must release admission even while the environment
+  // names the unmerged ref: it bootstraps origin/main's updater instead.
+  const recovered = await run("bash", [wrapper, "unquiesce"], { env, allowFailure: true });
+  assert.equal(recovered.code, 0, `unquiesce recovers: ${recovered.stderr}`);
+  assert.deepEqual(JSON.parse(await readFile(marker, "utf8")), {
+    label: "main",
+    args: ["unquiesce"],
+  }, "unquiesce bootstraps origin/main's updater and stays option-free");
+
+  for (const command of ["status", "recover"]) {
+    await rm(marker, { force: true });
+    const local = await run("bash", [wrapper, command], { env, allowFailure: true });
+    assert.equal(local.code, 0, `${command} recovers from origin/main: ${local.stderr}`);
+    assert.deepEqual(JSON.parse(await readFile(marker, "utf8")), {
+      label: "main",
+      args: [command],
+    }, `${command} bootstraps origin/main's updater and stays option-free`);
+  }
+
+  // The same env target still gates a plain update run.
+  await rm(marker, { force: true });
+  const rejected = await run("bash", [wrapper], { env, allowFailure: true });
+  assert.equal(rejected.code, 1, "an unmerged env target is still refused for updates");
+  assert.match(rejected.stderr, /not reachable from origin\/main/);
+  assert.equal(await readFile(marker, "utf8").catch(() => null), null, "no updater code ran for the refused target");
+});
+
+
+test("the stable wrapper resolves env and equals-form targets to the pinned validated commit", { skip: process.platform === "win32" ? "the stable wrapper requires bash" : false }, async (t) => {
+  const fixture = await mkdtemp(join(tmpdir(), "ubf-target-passthrough-"));
+  t.after(() => rm(fixture, { recursive: true, force: true }));
+  const remote = join(fixture, "remote");
+  const checkout = join(fixture, "checkout");
+  const marker = join(fixture, "executed.json");
+  await mkdir(remote, { recursive: true });
+  const git = (cwd, args) => run("git", ["-C", cwd, ...args]);
+  const writeUpdater = async (cwd, label) => {
+    for (const path of [
+      "scripts/update-botfleet-mac.mjs",
+      "scripts/mac-update-transaction.mjs",
+    "scripts/harness-release-store.mjs",
+    "scripts/release-provenance.mjs",
+      "scripts/ci-build-resolver.mjs",
+    "scripts/stage-entries.mjs",
+      "scripts/failed-install-retention.mjs",
+      "scripts/update-progress.mjs",
+      "electron/update-credential-preparation.mjs",
+    ]) {
+      await mkdir(dirname(join(cwd, path)), { recursive: true });
+      await writeFile(join(cwd, path), path.endsWith("update-botfleet-mac.mjs")
+        ? `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(marker)}, JSON.stringify({ label: ${JSON.stringify(label)}, args: process.argv.slice(2) }));\n`
+        : "// placeholder\n");
+    }
+  };
+  await git(fixture, ["init", "-b", "main", "remote"]);
+  await git(remote, ["config", "user.email", "test@example.com"]);
+  await git(remote, ["config", "user.name", "Test"]);
+  await writeUpdater(remote, "env-target");
+  await git(remote, ["add", "."]);
+  await git(remote, ["commit", "-m", "env target"]);
+  await git(remote, ["branch", "env-target"]);
+  await writeUpdater(remote, "main");
+  await git(remote, ["add", "."]);
+  await git(remote, ["commit", "-m", "main advances"]);
+  await git(fixture, ["clone", "remote", "checkout"]);
+  const envTargetCommit = (await git(checkout, ["rev-parse", "origin/env-target"])).stdout.trim();
+  const mainCommit = (await git(checkout, ["rev-parse", "origin/main"])).stdout.trim();
+  const wrapper = join(scripts, "update-botfleet-policy.sh");
+  const env = { BOTFLEET_CHECKOUT: checkout, BOTFLEET_FORCE: "1", BOTFLEET_UPDATE_TARGET: "origin/env-target" };
+
+  const envRun = await run("bash", [wrapper], { env, allowFailure: true });
+  assert.equal(envRun.code, 0, envRun.stderr);
+  assert.deepEqual(JSON.parse(await readFile(marker, "utf8")), {
+    label: "env-target",
+    args: ["--target", envTargetCommit],
+  });
+
+  const equalsRun = await run("bash", [wrapper, "--target=origin/main"], { env, allowFailure: true });
+  assert.equal(equalsRun.code, 0, equalsRun.stderr);
+  assert.deepEqual(JSON.parse(await readFile(marker, "utf8")), {
+    label: "main",
+    args: ["--target", mainCommit],
+  });
+});
+
+test("the stable wrapper builds the commit it validated, even when main moves mid-run", { skip: process.platform === "win32" ? "the stable wrapper requires bash" : false }, async (t) => {
+  const fixture = await mkdtemp(join(tmpdir(), "ubf-pinned-target-"));
+  t.after(() => rm(fixture, { recursive: true, force: true }));
+  const remote = join(fixture, "remote");
+  const checkout = join(fixture, "checkout");
+  const marker = join(fixture, "executed.json");
+  await mkdir(remote, { recursive: true });
+  const git = (cwd, args) => run("git", ["-C", cwd, ...args]);
+  for (const path of [
+    "scripts/update-botfleet-mac.mjs",
+    "scripts/mac-update-transaction.mjs",
+    "scripts/harness-release-store.mjs",
+    "scripts/release-provenance.mjs",
+    "scripts/ci-build-resolver.mjs",
+    "scripts/stage-entries.mjs",
+    "scripts/failed-install-retention.mjs",
+    "scripts/update-progress.mjs",
+    "electron/update-credential-preparation.mjs",
+  ]) {
+    await mkdir(dirname(join(remote, path)), { recursive: true });
+    await writeFile(join(remote, path), path.endsWith("update-botfleet-mac.mjs")
+      ? `import { execFileSync } from "node:child_process";\nimport { writeFileSync } from "node:fs";\nexecFileSync("git", ["-C", process.env.UBF_FIXTURE_REMOTE, "commit", "--allow-empty", "-m", "raced"]);\nexecFileSync("git", ["-C", process.env.BOTFLEET_CHECKOUT, "fetch", "--quiet", "origin", "main"]);\nconst moved = execFileSync("git", ["-C", process.env.BOTFLEET_CHECKOUT, "rev-parse", "origin/main"], { encoding: "utf8" }).trim();\nwriteFileSync(${JSON.stringify(marker)}, JSON.stringify({ label: "main", args: process.argv.slice(2), moved }));\n`
+      : "// placeholder\n");
+  }
+  await git(fixture, ["init", "-b", "main", "remote"]);
+  await git(remote, ["config", "user.email", "test@example.com"]);
+  await git(remote, ["config", "user.name", "Test"]);
+  await git(remote, ["add", "."]);
+  await git(remote, ["commit", "-m", "updater"]);
+  const validatedCommit = (await git(remote, ["rev-parse", "HEAD"])).stdout.trim();
+  await git(fixture, ["clone", "remote", "checkout"]);
+  const wrapper = join(scripts, "update-botfleet-policy.sh");
+  // The stub updater advances origin/main and re-fetches it, exactly the
+  // window in which resolveTarget() would resolve a newer main than the
+  // policy the wrapper archived.  The run must still build the validated
+  // commit.
+  const env = { BOTFLEET_CHECKOUT: checkout, BOTFLEET_FORCE: "1", UBF_FIXTURE_REMOTE: remote };
+  const result = await run("bash", [wrapper], { env, allowFailure: true });
+  assert.equal(result.code, 0, result.stderr);
+  const executed = JSON.parse(await readFile(marker, "utf8"));
+  assert.equal(executed.label, "main", "policy came from the validated commit");
+  assert.notEqual(executed.moved, validatedCommit, "the fixture must actually move origin/main mid-run");
+  assert.deepEqual(executed.args, ["--target", validatedCommit], "the candidate is pinned to the validated commit, not the moved origin/main");
+
+  // A full commit SHA is itself a valid --target: it resolves locally and
+  // passes the same origin/main ancestry check.
+  await rm(marker, { force: true });
+  const shaRun = await run("bash", [wrapper, "--target", validatedCommit], { env, allowFailure: true });
+  assert.equal(shaRun.code, 0, shaRun.stderr);
+  assert.deepEqual(JSON.parse(await readFile(marker, "utf8")).args, ["--target", validatedCommit]);
+});
+
+test("resolveTarget accepts a full commit SHA on main", async () => {
+  const source = await readFile(join(scripts, "update-botfleet-mac.mjs"), "utf8");
+  const resolveTarget = source.indexOf("resolveTarget: async (plan) => {");
+  assert.ok(resolveTarget >= 0);
+  const body = source.slice(resolveTarget, source.indexOf("prepareSource:", resolveTarget));
+  // It fetches origin/main, never the target ref: a bare SHA needs no fetch
+  // of its own, resolves locally, and passes the same ancestry check.
+  assert.match(body, /\["fetch", "origin", "main"\]/);
+  assert.doesNotMatch(body, /\["fetch", "origin", plan\.target\]/);
+  assert.match(body, /rev-parse", "--verify", `\$\{plan\.target\}\^\{commit\}`/);
+  assert.match(body, /merge-base", "--is-ancestor", commit, "origin\/main"/);
+});
+
+test("the stable wrapper expands UPDATER_ARGS with the bash 3.2 safe form", async () => {
+  const source = await readFile(join(scripts, "update-botfleet-policy.sh"), "utf8");
+  // Stock macOS /bin/bash is 3.2, where expanding an EMPTY array under
+  // `set -u` fails with "unbound variable". That kills the no-argument
+  // in-app update path (electron/updater.mjs spawns the wrapper with no
+  // args and no BOTFLEET_UPDATE_TARGET, leaving UPDATER_ARGS empty), so
+  // every expansion must carry the `${UPDATER_ARGS[@]+...}` guard. CI bash
+  // is newer and cannot reproduce the 3.2 failure, so this asserts the
+  // guarded form directly instead of observing the error.
+  assert.doesNotMatch(source, /(?<!\+)"\$\{UPDATER_ARGS\[@\]\}"/);
+  assert.match(source, /\$\{UPDATER_ARGS\[@\]\+"\$\{UPDATER_ARGS\[@\]\}"\}/);
+});
+
+test("the stable wrapper runs with no arguments and no update target", { skip: process.platform === "win32" ? "the stable wrapper requires bash" : false }, async (t) => {
+  const fixture = await mkdtemp(join(tmpdir(), "ubf-no-args-"));
+  t.after(() => rm(fixture, { recursive: true, force: true }));
+  const remote = join(fixture, "remote");
+  const checkout = join(fixture, "checkout");
+  const marker = join(fixture, "executed.json");
+  await mkdir(remote, { recursive: true });
+  const git = (cwd, args) => run("git", ["-C", cwd, ...args]);
+  for (const path of [
+    "scripts/update-botfleet-mac.mjs",
+    "scripts/mac-update-transaction.mjs",
+    "scripts/harness-release-store.mjs",
+    "scripts/release-provenance.mjs",
+    "scripts/ci-build-resolver.mjs",
+    "scripts/stage-entries.mjs",
+    "scripts/failed-install-retention.mjs",
+    "scripts/update-progress.mjs",
+    "electron/update-credential-preparation.mjs",
+  ]) {
+    await mkdir(dirname(join(remote, path)), { recursive: true });
+    await writeFile(join(remote, path), path.endsWith("update-botfleet-mac.mjs")
+      ? `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(marker)}, JSON.stringify({ args: process.argv.slice(2) }));\n`
+      : "// placeholder\n");
+  }
+  await git(fixture, ["init", "-b", "main", "remote"]);
+  await git(remote, ["config", "user.email", "test@example.com"]);
+  await git(remote, ["config", "user.name", "Test"]);
+  await git(remote, ["add", "."]);
+  await git(remote, ["commit", "-m", "updater"]);
+  await git(fixture, ["clone", "remote", "checkout"]);
+  const mainCommit = (await git(checkout, ["rev-parse", "origin/main"])).stdout.trim();
+  // No positional arguments and no BOTFLEET_UPDATE_TARGET: UPDATER_ARGS
+  // stays empty, the exact shape electron/updater.mjs spawns for the
+  // no-argument in-app update. On bash >= 4.4 this passes even without the
+  // guarded expansion; on bash 3.2 it exercises the path that used to exit
+  // with "unbound variable" before the updater ran.  The bootstrapped
+  // updater receives the validated commit, not the symbolic origin/main.
+  const result = await run("bash", [join(scripts, "update-botfleet-policy.sh")], {
+    env: { BOTFLEET_CHECKOUT: checkout, BOTFLEET_FORCE: "1" },
+    allowFailure: true,
+  });
+  assert.equal(result.code, 0, result.stderr);
+  assert.deepEqual(JSON.parse(await readFile(marker, "utf8")), { args: ["--target", mainCommit] });
+});
+
+test("the stable wrapper detects a linked worktree checkout, where .git is a file", { skip: process.platform === "win32" ? "the stable wrapper requires bash" : false }, async (t) => {
+  const fixture = await mkdtemp(join(tmpdir(), "ubf-worktree-"));
+  t.after(() => rm(fixture, { recursive: true, force: true }));
+  const remote = join(fixture, "remote");
+  const primary = join(fixture, "primary");
+  const checkout = join(fixture, "checkout");
+  const marker = join(fixture, "executed.json");
+  await mkdir(remote, { recursive: true });
+  const git = (cwd, args) => run("git", ["-C", cwd, ...args]);
+  for (const path of [
+    "scripts/update-botfleet-mac.mjs",
+    "scripts/mac-update-transaction.mjs",
+    "scripts/harness-release-store.mjs",
+    "scripts/release-provenance.mjs",
+    "scripts/ci-build-resolver.mjs",
+    "scripts/stage-entries.mjs",
+    "scripts/failed-install-retention.mjs",
+    "scripts/update-progress.mjs",
+    "electron/update-credential-preparation.mjs",
+  ]) {
+    await mkdir(dirname(join(remote, path)), { recursive: true });
+    await writeFile(join(remote, path), path.endsWith("update-botfleet-mac.mjs")
+      ? `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(marker)}, JSON.stringify({ label: "bootstrapped", args: process.argv.slice(2) }));\n`
+      : "// placeholder\n");
+  }
+  await git(fixture, ["init", "-b", "main", "remote"]);
+  await git(remote, ["config", "user.email", "test@example.com"]);
+  await git(remote, ["config", "user.name", "Test"]);
+  await git(remote, ["add", "."]);
+  await git(remote, ["commit", "-m", "updater"]);
+  await git(fixture, ["clone", "remote", "primary"]);
+  // The owner's checkout is a linked worktree of another clone, so its .git
+  // is a gitdir pointer file rather than a directory.
+  await git(primary, ["worktree", "add", "--detach", checkout, "origin/main"]);
+  assert.ok((await stat(join(checkout, ".git"))).isFile(), "the fixture checkout's .git must be a file");
+  const wrapper = join(scripts, "update-botfleet-policy.sh");
+
+  // Up-to-date check: the worktree is already at origin/main, so an unforced
+  // run must short-circuit instead of running any updater.
+  const current = await run("bash", [wrapper], { env: wrapperFixtureEnv(checkout, fixture), allowFailure: true });
+  assert.equal(current.code, 0, current.stderr);
+  assert.match(current.stdout, /Already at .*Nothing to update/);
+  assert.equal(await readFile(marker, "utf8").catch(() => null), null, "an up-to-date worktree runs no updater");
+
+  // Bootstrap: a forced run must archive and run the target's updater from
+  // the worktree, not fall back to the installed implementation.
+  const forced = await run("bash", [wrapper], { env: { ...wrapperFixtureEnv(checkout, fixture), BOTFLEET_FORCE: "1" }, allowFailure: true });
+  assert.equal(forced.code, 0, forced.stderr);
+  assert.doesNotMatch(forced.stderr, /using the installed implementation/);
+  const mainCommit = (await git(checkout, ["rev-parse", "origin/main"])).stdout.trim();
+  assert.deepEqual(JSON.parse(await readFile(marker, "utf8")), { label: "bootstrapped", args: ["--target", mainCommit] });
+});
+
+test("the up-to-date shortcut only swallows a plain update to origin/main", { skip: process.platform === "win32" ? "the stable wrapper requires bash" : false }, async (t) => {
+  const fixture = await mkdtemp(join(tmpdir(), "ubf-shortcut-"));
+  t.after(() => rm(fixture, { recursive: true, force: true }));
+  const remote = join(fixture, "remote");
+  const checkout = join(fixture, "checkout");
+  const marker = join(fixture, "executed.json");
+  await mkdir(remote, { recursive: true });
+  const git = (cwd, args) => run("git", ["-C", cwd, ...args]);
+  const writeUpdater = async (label) => {
+    for (const path of [
+      "scripts/update-botfleet-mac.mjs",
+      "scripts/mac-update-transaction.mjs",
+    "scripts/harness-release-store.mjs",
+    "scripts/release-provenance.mjs",
+      "scripts/ci-build-resolver.mjs",
+    "scripts/stage-entries.mjs",
+      "scripts/failed-install-retention.mjs",
+      "scripts/update-progress.mjs",
+      "electron/update-credential-preparation.mjs",
+    ]) {
+      await mkdir(dirname(join(remote, path)), { recursive: true });
+      await writeFile(join(remote, path), path.endsWith("update-botfleet-mac.mjs")
+        ? `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(marker)}, JSON.stringify({ label: ${JSON.stringify(label)}, args: process.argv.slice(2) }));\n`
+        : "// placeholder\n");
+    }
+  };
+  await git(fixture, ["init", "-b", "main", "remote"]);
+  await git(remote, ["config", "user.email", "test@example.com"]);
+  await git(remote, ["config", "user.name", "Test"]);
+  // An older commit that is still reachable from main: a legitimate non-main
+  // target the ancestry rule accepts.
+  await writeUpdater("older");
+  await git(remote, ["add", "."]);
+  await git(remote, ["commit", "-m", "older"]);
+  await git(remote, ["branch", "older"]);
+  await writeUpdater("main");
+  await git(remote, ["add", "."]);
+  await git(remote, ["commit", "-m", "main"]);
+  await git(fixture, ["clone", "remote", "checkout"]);
+  const mainCommit = (await git(checkout, ["rev-parse", "origin/main"])).stdout.trim();
+  const olderCommit = (await git(checkout, ["rev-parse", "origin/older"])).stdout.trim();
+  assert.equal((await git(checkout, ["rev-parse", "HEAD"])).stdout.trim(), mainCommit, "the fixture checkout must be at origin/main");
+  const stage = join(fixture, "stage");
+  await mkdir(stage, { recursive: true });
+  await writeFile(join(stage, "prepared.json"), JSON.stringify({ sourceCommit: mainCommit }));
+  const wrapper = join(scripts, "update-botfleet-policy.sh");
+  // No BOTFLEET_FORCE anywhere below: every run sees HEAD == origin/main.
+  const invoke = async (args, extraEnv = {}) => {
+    await rm(marker, { force: true });
+    const result = await run("bash", [wrapper, ...args], { env: { ...wrapperFixtureEnv(checkout, fixture), ...extraEnv }, allowFailure: true });
+    const executed = await readFile(marker, "utf8").then(JSON.parse, () => null);
+    return { ...result, executed };
+  };
+
+  for (const args of [[], ["update"], ["update", "--no-open"], ["--target", "origin/main"], ["--target=origin/main"]]) {
+    const result = await invoke(args);
+    assert.equal(result.code, 0, `${JSON.stringify(args)}: ${result.stderr}`);
+    assert.match(result.stdout, /Already at .*Nothing to update/, `${JSON.stringify(args)} is a plain update and should short-circuit`);
+    assert.equal(result.executed, null, `${JSON.stringify(args)} ran an updater`);
+  }
+
+  // Commands that resolve a candidate get it pinned to the commit the
+  // wrapper validated; apply keeps its stage manifest target and unquiesce
+  // stays option-free.
+  const mustRun = [
+    // The admission recovery action must release the fence even when current.
+    { args: ["unquiesce"], expected: { label: "main", args: ["unquiesce"] } },
+    { args: ["prepare"], expected: { label: "main", args: ["prepare", "--target", mainCommit] } },
+    { args: ["apply", "--stage", stage], expected: { label: "main", args: ["apply", "--stage", stage] } },
+    { args: ["--target", "origin/older"], expected: { label: "older", args: ["--target", olderCommit] } },
+    { args: ["--target=origin/older"], expected: { label: "older", args: ["--target", olderCommit] } },
+    { args: [], env: { BOTFLEET_UPDATE_TARGET: "origin/older" }, expected: { label: "older", args: ["--target", olderCommit] } },
+    // The harness's detached run needs the updater's progress record.
+    {
+      args: ["update", "--progress", join(fixture, "run.json"), "--run-id", "run_one"],
+      expected: { label: "main", args: ["update", "--progress", join(fixture, "run.json"), "--run-id", "run_one", "--target", mainCommit] },
+    },
+  ];
+  for (const { args, env = {}, expected } of mustRun) {
+    const label = `${JSON.stringify(args)} ${JSON.stringify(env)}`;
+    const result = await invoke(args, env);
+    assert.equal(result.code, 0, `${label}: ${result.stderr}`);
+    assert.doesNotMatch(result.stdout, /Already at/, `${label} must not short-circuit at origin/main`);
+    assert.deepEqual(result.executed, expected, `${label} must reach the bootstrapped updater`);
+  }
+});
+
+test("the stable wrapper does not test for a .git directory to find the checkout", async () => {
+  const source = await readFile(join(scripts, "update-botfleet-policy.sh"), "utf8");
+  assert.doesNotMatch(source, /-d "\$BOTFLEET_CHECKOUT\/\.git"/);
+  assert.match(source, /git -C "\$BOTFLEET_CHECKOUT" rev-parse --git-dir/);
+});
+
+test("the up-to-date runtime probe prefers BOTFLEET_OWNER_NONCE and falls back to the live owner record", async () => {
+  const wrapper = await readFile(join(scripts, "update-botfleet-policy.sh"), "utf8");
+  const helper = await readFile(join(scripts, "update-botfleet-runtime-commit.mjs"), "utf8");
+  assert.match(wrapper, /update-botfleet-runtime-commit\.mjs/);
+  assert.match(wrapper, /BOTFLEET_OWNER_NONCE/);
+  assert.doesNotMatch(wrapper, /\|\| RUNTIME_COMMIT=""/);
+  assert.doesNotMatch(wrapper, /owner\.nonce/);
+  assert.doesNotMatch(wrapper, /console\.log\(.*nonce/);
+  assert.match(helper, /process\.env\.BOTFLEET_OWNER_NONCE/);
+  assert.match(helper, /owner\.nonce/);
+  assert.match(helper, /BOTFLEET_OWNER_NONCE is required when a harness owner record exists/);
+  assert.match(helper, /res\.statusCode === 401 \|\| res\.statusCode === 403/);
+  assert.match(helper, /maskedCredentialEnvRef/);
+});
+
+test("the mac updater prefers BOTFLEET_OWNER_NONCE and falls back to the live owner record", async () => {
+  const source = await readFile(join(scripts, "update-botfleet-mac.mjs"), "utf8");
+  assert.match(source, /requireHarnessBearerCredential/);
+  assert.match(source, /resolveHarnessBearerCredential/);
+  assert.match(source, /process\.env\.BOTFLEET_OWNER_NONCE/);
+  assert.doesNotMatch(source, /Authorization: `Bearer \$\{owner\.nonce\}`/);
+});
+
+test("resolveHarnessBearerCredential falls back to the live owner record for old launchers", () => {
+  const owner = { version: 1, pid: 42, port: 8799, nonce: "c".repeat(64) };
+  const previous = process.env.BOTFLEET_OWNER_NONCE;
+  try {
+    delete process.env.BOTFLEET_OWNER_NONCE;
+    assert.equal(resolveHarnessBearerCredential(owner), owner.nonce);
+    assert.throws(() => resolveHarnessBearerCredential(null), /BOTFLEET_OWNER_NONCE is required/);
+    process.env.BOTFLEET_OWNER_NONCE = "d".repeat(64);
+    assert.equal(resolveHarnessBearerCredential(owner), "d".repeat(64));
+    process.env.BOTFLEET_OWNER_NONCE = "short";
+    assert.throws(() => resolveHarnessBearerCredential(owner), /not a valid harness bearer credential/);
+  } finally {
+    if (previous === undefined) delete process.env.BOTFLEET_OWNER_NONCE;
+    else process.env.BOTFLEET_OWNER_NONCE = previous;
+  }
+});
+
+test("apply bootstraps the updater recorded in the stage manifest, not a newer origin/main", { skip: process.platform === "win32" ? "the stable wrapper requires bash" : false }, async (t) => {
+  const fixture = await mkdtemp(join(tmpdir(), "ubf-stage-bootstrap-"));
+  t.after(() => rm(fixture, { recursive: true, force: true }));
+  const remote = join(fixture, "remote");
+  const checkout = join(fixture, "checkout");
+  const marker = join(fixture, "executed");
+  await mkdir(remote, { recursive: true });
+  const git = (cwd, args) => run("git", ["-C", cwd, ...args]);
+  const writeUpdater = async (cwd, label) => {
+    for (const path of [
+      "scripts/update-botfleet-mac.mjs",
+      "scripts/mac-update-transaction.mjs",
+    "scripts/harness-release-store.mjs",
+    "scripts/release-provenance.mjs",
+      "scripts/ci-build-resolver.mjs",
+    "scripts/stage-entries.mjs",
+      "scripts/failed-install-retention.mjs",
+      "scripts/update-progress.mjs",
+      "electron/update-credential-preparation.mjs",
+    ]) {
+      await mkdir(dirname(join(cwd, path)), { recursive: true });
+      await writeFile(join(cwd, path), path.endsWith("update-botfleet-mac.mjs")
+        ? `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(marker)}, ${JSON.stringify(label)});\n`
+        : "// placeholder\n");
+    }
+  };
+  const commit = async (cwd, label) => {
+    await writeUpdater(cwd, label);
+    await git(cwd, ["add", "."]);
+    await git(cwd, ["commit", "-m", label]);
+    return (await git(cwd, ["rev-parse", "HEAD"])).stdout.trim();
+  };
+  const writeStage = async (name, manifest) => {
+    const stage = join(fixture, name);
+    await mkdir(stage, { recursive: true, mode: 0o700 });
+    await writeFile(join(stage, "prepared.json"), typeof manifest === "string" ? manifest : JSON.stringify(manifest), { mode: 0o600 });
+    return stage;
+  };
+  await git(fixture, ["init", "-b", "main", "remote"]);
+  await git(remote, ["config", "user.email", "test@example.com"]);
+  await git(remote, ["config", "user.name", "Test"]);
+  // The stage is prepared at X ...
+  const preparedCommit = await commit(remote, "prepared");
+  await git(fixture, ["clone", "remote", "checkout"]);
+  const stage = await writeStage("stage", { schemaVersion: 2, sourceCommit: preparedCommit });
+  // ... and main moves past X before apply runs.
+  const advancedCommit = await commit(remote, "advanced");
+  await git(remote, ["checkout", "-b", "evil"]);
+  const evilCommit = await commit(remote, "evil");
+  await git(remote, ["checkout", "main"]);
+  assert.notEqual(advancedCommit, preparedCommit);
+
+  const env = { BOTFLEET_CHECKOUT: checkout, BOTFLEET_FORCE: "1", BOTFLEET_UPDATE_TARGET: "" };
+  const wrapper = join(scripts, "update-botfleet-policy.sh");
+  const applied = await run("bash", [wrapper, "apply", "--stage", stage], { env, allowFailure: true });
+  assert.equal(applied.code, 0, `apply bootstraps: ${applied.stderr}`);
+  assert.equal(
+    (await git(checkout, ["rev-parse", "origin/main"])).stdout.trim(),
+    advancedCommit,
+    "the wrapper refreshed origin/main past the prepared commit",
+  );
+  assert.equal(await readFile(marker, "utf8"), "prepared", "apply ran the prepared commit's updater, not advanced main's");
+
+  // Same ancestry rule as --target: a manifest naming an unmerged commit
+  // never supplies updater policy.
+  await rm(marker, { force: true });
+  await git(checkout, ["fetch", "--quiet", "origin", "evil"]);
+  const evilStage = await writeStage("evil-stage", { schemaVersion: 2, sourceCommit: evilCommit });
+  const rejected = await run("bash", [wrapper, "apply", "--stage", evilStage], { env, allowFailure: true });
+  assert.equal(rejected.code, 1, "an unmerged stage commit must be rejected");
+  assert.match(rejected.stderr, /not reachable from origin\/main/);
+  assert.equal(await readFile(marker, "utf8").catch(() => null), null, "no updater code ran for the unmerged stage");
+
+  // A stage without a readable source commit fails closed instead of falling
+  // back to origin/main or the installed implementation.
+  const brokenStage = await writeStage("broken-stage", "{ not json");
+  const broken = await run("bash", [wrapper, "apply", "--stage", brokenStage], { env, allowFailure: true });
+  assert.equal(broken.code, 1, "an unreadable manifest must be rejected");
+  assert.match(broken.stderr, /does not record a full source commit/);
+  assert.equal(await readFile(marker, "utf8").catch(() => null), null, "no updater code ran for the unreadable stage");
+});
+
+test("rollback boots out the legacy label when startHarness bootstrapped the legacy plist", () => {
+  const config = {
+    label: "app.botfleet.server",
+    plist: "/Users/test/Library/LaunchAgents/app.botfleet.server.plist",
+    legacyLabel: "com.jay.botfleet-server",
+    legacyPlist: "/Users/test/Library/LaunchAgents/com.jay.botfleet-server.plist",
+  };
+  // Legacy-only Mac: the fallback bootstraps the legacy-named plist.  Its job
+  // may run under either label (a Mac migrated in place declares the renamed
+  // one in that file); the path mapping assumes the legacy label, and rollback
+  // boots out the renamed label regardless, so both are covered.
+  const started = harnessBootstrapPlist(config, { plistExists: false, legacyPlistExists: true });
+  assert.equal(started, config.legacyPlist);
+  assert.equal(harnessLaunchdLabel(config, started), config.legacyLabel);
+  // If verification then fails, rollback must boot out that label too, or
+  // its KeepAlive restarts the failed replacement mid-rollback.
+  const previous = { launchdLoaded: false, legacyLaunchdLoaded: true, startedHarnessLabel: harnessLaunchdLabel(config, started) };
+  assert.deepEqual(rollbackHarnessBootoutLabels(config, previous), [config.label, config.legacyLabel]);
+  // The renamed plist starts the renamed label; nothing extra to boot out.
+  assert.equal(harnessLaunchdLabel(config, config.plist), config.label);
+  assert.deepEqual(rollbackHarnessBootoutLabels(config, { startedHarnessLabel: config.label }), [config.label]);
+  // Failure before startHarness: only the renamed label, as before.
+  assert.deepEqual(rollbackHarnessBootoutLabels(config, {}), [config.label]);
+  // Quiesce can throw while booting out the legacy label, before startHarness
+  // records startedHarnessLabel.  Rollback must still retry the legacy
+  // bootout from the recorded launchd state, or the legacy job's KeepAlive
+  // restarts the harness mid-rollback.
+  assert.deepEqual(
+    rollbackHarnessBootoutLabels(config, { launchdLoaded: true, legacyLaunchdLoaded: true }),
+    [config.label, config.legacyLabel],
+  );
+  assert.deepEqual(
+    rollbackHarnessBootoutLabels(config, { launchdLoaded: false, legacyLaunchdLoaded: true }),
+    [config.label, config.legacyLabel],
+  );
+});
+
+test("startHarness records the Label a custom startup plist declares, not the path mapping", async () => {
+  const config = {
+    label: "app.botfleet.server",
+    plist: "/Users/test/custom/botfleet.plist",
+    customPlist: true,
+    legacyLabel: "com.jay.botfleet-server",
+    legacyPlist: "/Users/test/Library/LaunchAgents/com.jay.botfleet-server.plist",
+  };
+  const reads = [];
+  const declares = (label) => async (plist) => { reads.push(plist); return label; };
+  // A custom BOTFLEET_LAUNCH_AGENT_PLIST carrying the legacy Label starts
+  // com.jay.botfleet-server even though its path maps to the renamed label.
+  assert.equal(harnessLaunchdLabel(config, config.plist), config.label);
+  const started = await startedHarnessLabel(config, config.plist, declares(config.legacyLabel));
+  assert.equal(started, config.legacyLabel);
+  assert.deepEqual(reads, [config.plist]);
+  // With that label not loaded at capture, rollback must still boot it out,
+  // or its KeepAlive restarts the failed replacement mid-rollback.
+  assert.deepEqual(
+    rollbackHarnessBootoutLabels(config, { launchdLoaded: false, legacyLaunchdLoaded: false, startedHarnessLabel: started }),
+    [config.label, config.legacyLabel],
+  );
+  // A custom plist declaring the renamed label records the renamed label.
+  assert.equal(await startedHarnessLabel(config, config.plist, declares(config.label)), config.label);
+  // An unreadable Label falls back to the path mapping.
+  assert.equal(await startedHarnessLabel(config, config.plist, declares(null)), config.label);
+  // The legacy fallback plist is not custom; it keeps the legacy label without a read.
+  reads.length = 0;
+  assert.equal(await startedHarnessLabel(config, config.legacyPlist, declares("unexpected")), config.legacyLabel);
+  assert.deepEqual(reads, []);
+  // Without a custom plist the path mapping stands and nothing is read.
+  const defaults = { ...config, customPlist: false, plist: "/Users/test/Library/LaunchAgents/app.botfleet.server.plist" };
+  assert.equal(await startedHarnessLabel(defaults, defaults.plist, declares(config.legacyLabel)), config.label);
+  assert.deepEqual(reads, []);
+});
+
+test("quiesce boots out each loaded label exactly once, even when the renamed label is the legacy label", () => {
+  const config = { label: "app.botfleet.server", legacyLabel: "com.jay.botfleet-server" };
+  assert.deepEqual(quiesceBootoutLabels(config, { launchdLoaded: true, legacyLaunchdLoaded: true }), [config.label, config.legacyLabel]);
+  assert.deepEqual(quiesceBootoutLabels(config, { launchdLoaded: true, legacyLaunchdLoaded: false }), [config.label]);
+  assert.deepEqual(quiesceBootoutLabels(config, { launchdLoaded: false, legacyLaunchdLoaded: true }), [config.legacyLabel]);
+  assert.deepEqual(quiesceBootoutLabels(config, { launchdLoaded: false, legacyLaunchdLoaded: false }), []);
+  // BOTFLEET_LAUNCH_AGENT_LABEL may name the legacy label itself; the
+  // bootout must still run, exactly once, or the update installs over a live
+  // harness.
+  const aliased = { label: "com.jay.botfleet-server", legacyLabel: "com.jay.botfleet-server" };
+  assert.deepEqual(quiesceBootoutLabels(aliased, { launchdLoaded: true, legacyLaunchdLoaded: true }), ["com.jay.botfleet-server"]);
+  assert.deepEqual(quiesceBootoutLabels(aliased, { launchdLoaded: false, legacyLaunchdLoaded: true }), ["com.jay.botfleet-server"]);
+});
+
+test("rollback confirms a bootout label is absent, retrying a slow teardown within a bounded window", async () => {
+  // Already gone: launchctl print exits nonzero on the first probe.
+  assert.equal(await waitForLaunchdBootout("gui/501", "app.botfleet.server", { probe: async () => ({ code: 1 }) }), true);
+  // Still loaded, then torn down: retry until print fails.
+  let probes = 0;
+  const waits = [];
+  const cleared = await waitForLaunchdBootout("gui/501", "app.botfleet.server", {
+    probe: async () => { probes += 1; return { code: probes < 3 ? 0 : 1 }; },
+    wait: async (ms) => { waits.push(ms); },
+  });
+  assert.equal(cleared, true);
+  assert.equal(probes, 3);
+  assert.equal(waits.length, 2, "no wait after the probe that confirms absence");
+  // Never torn down: the window stays bounded and reports failure.
+  let stuckProbes = 0;
+  const stuck = await waitForLaunchdBootout("gui/501", "com.jay.botfleet-server", {
+    attempts: 4,
+    probe: async () => { stuckProbes += 1; return { code: 0 }; },
+    wait: async () => {},
+  });
+  assert.equal(stuck, false);
+  assert.equal(stuckProbes, 4, "a surviving job is retried, not awaited forever");
+});
+
+// A process table for terminateVerified.  Each entry is { command, cwd, alive }
+// plus optional hooks: exitDuringPs and exitDuringLsof end the process while
+// that inspection is still running, which is the window a loaded Mac (load
+// average 200-400) leaves open for seconds; ignoresTerm survives SIGTERM and
+// killError makes the signal itself fail.
+function processTable(entries) {
+  const table = new Map(Object.entries(entries).map(([pid, entry]) => [Number(pid), { alive: true, ...entry }]));
+  const signals = [];
+  const deps = {
+    isAlive: (pid) => table.get(pid)?.alive === true,
+    commandOf: async (pid) => {
+      const entry = table.get(pid);
+      if (!entry?.alive) return "";
+      if (entry.exitDuringPs) { entry.alive = false; return ""; }
+      return entry.command;
+    },
+    cwdOf: async (pid) => {
+      const entry = table.get(pid);
+      if (!entry?.alive) return "";
+      if (entry.exitDuringLsof) entry.alive = false;
+      return entry.cwd;
+    },
+    txtPathsOf: async () => [],
+    kill: (pid, signal) => {
+      const entry = table.get(pid);
+      if (entry?.killError) throw entry.killError;
+      if (!entry?.alive) throw Object.assign(new Error("kill ESRCH"), { code: "ESRCH", errno: -3, syscall: "kill" });
+      signals.push([pid, signal]);
+      if (signal === "SIGTERM" && !entry.ignoresTerm) {
+        // zombieOnTerm: the process exits on SIGTERM but its parent never
+        // reaps it, so the pid stays (kill -0 still succeeds) in state Z.
+        if (entry.zombieOnTerm) entry.zombie = true;
+        else entry.alive = false;
+      }
+    },
+    wait: async () => {},
+  };
+  return { table, signals, deps };
+}
+
+// The real zombie-aware liveness check over a process table: `kill -0` answers
+// for every pid still in the table, and the `ps` state column says Z for the
+// ones marked zombie.  A zombie entry keeps `alive: true` because that is
+// exactly what kill -0 reports for one.
+function zombieAwareIsAlive(table) {
+  return (pid) => processIsAlive(pid, {
+    exists: (target) => table.get(target)?.alive === true,
+    statesOf: async (targets) => new Map(targets.map((target) => [target, table.get(target)?.zombie ? "Z" : "S"])),
+  });
+}
+
+const quiesceConfig = {
+  appPath: "/Applications/BotFleet.app",
+  checkout: "/Users/test/apps/botfleet-server",
+  gracefulExitMs: 0,
+  termExitMs: 0,
+};
+const electronMain = "/Applications/BotFleet.app/Contents/MacOS/BotFleet";
+const electronHelper = "/Applications/BotFleet.app/Contents/Frameworks/BotFleet Helper.app/Contents/MacOS/BotFleet Helper --type=utility";
+const checkoutHarness = "node --import tsx server/index.ts";
+
+test("signalProcess reports an already-exited process as gone and still throws every other failure", async () => {
+  const esrch = Object.assign(new Error("kill ESRCH"), { code: "ESRCH" });
+  assert.equal(signalProcess(4242, "SIGTERM", () => { throw esrch; }), false);
+  const sent = [];
+  assert.equal(signalProcess(4242, "SIGTERM", (pid, signal) => { sent.push([pid, signal]); }), true);
+  assert.deepEqual(sent, [[4242, "SIGTERM"]]);
+  const eperm = Object.assign(new Error("kill EPERM"), { code: "EPERM" });
+  assert.throws(
+    () => signalProcess(4242, "SIGTERM", () => { throw eperm; }),
+    (error) => /Could not send SIGTERM to BotFleet process 4242: kill EPERM/.test(error.message) && error.cause === eperm,
+  );
+  // The real process.kill: a reaped child's pid answers ESRCH.  Signal 0 only
+  // probes, so nothing is ever delivered to anyone even if the pid is reused.
+  const child = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+  await once(child, "exit");
+  assert.equal(signalProcess(child.pid, 0), false);
+  assert.equal(signalProcess(process.pid, 0), true);
+});
+
+test("quiesce treats a process that exits between verification and SIGTERM as stopped, not as kill ESRCH", async () => {
+  // 2026-10-02 apply: SIGTERM reached the Electron main process, its quit took
+  // the companion and helpers down with it, and the next helper in the loop
+  // had passed ps and lsof but was gone by the time the updater signalled it.
+  const { table, signals, deps } = processTable({
+    501: { command: electronMain, cwd: "/" },
+    // Verified by ps and lsof, then gone before the signal: kill would ESRCH.
+    502: { command: electronHelper, cwd: "/", exitDuringLsof: true },
+    503: { command: electronHelper, cwd: "/" },
+  });
+  const previous = { runtimePids: [501], appPids: [501, 502, 503], processCommands: {}, processCwds: {} };
+  await terminateVerified([501, 502, 503], previous, quiesceConfig, { current: [501, 502, 503], ...deps });
+  assert.deepEqual(signals, [[501, "SIGTERM"], [503, "SIGTERM"]], "the gone helper is skipped and the rest still get SIGTERM");
+  assert.equal([...table.values()].some((entry) => entry.alive), false);
+  // Rollback calls the strict form with no `current`; the same race must not
+  // fail it either, or a quiesce failure turns into a failed rollback.
+  const strict = processTable({
+    501: { command: electronMain, cwd: "/" },
+    502: { command: electronHelper, cwd: "/", exitDuringLsof: true },
+  });
+  await terminateVerified([501, 502], previous, quiesceConfig, strict.deps);
+  assert.deepEqual(strict.signals, [[501, "SIGTERM"]]);
+});
+
+// quiesce helpers shell out to lsof, which is unavailable on win32 CI hosts.
+test("quiesce skips a process that exits while ps is describing it instead of calling it foreign", { skip: process.platform === "win32" ? "the quiesce helpers shell out to lsof" : false }, async () => {
+  const { signals, deps } = processTable({
+    501: { command: electronMain, cwd: "/", exitDuringPs: true },
+    16529: { command: checkoutHarness, cwd: quiesceConfig.checkout },
+  });
+  const previous = { runtimePids: [], appPids: [], processCommands: {}, processCwds: {} };
+  // Strict: 501 was resolved as a current holder, but an empty identity from a
+  // process that no longer exists is not a foreign executable.
+  await terminateVerified([501, 16529], previous, quiesceConfig, deps);
+  assert.deepEqual(signals, [[16529, "SIGTERM"]]);
+});
+
+// quiesce helpers shell out to lsof, which is unavailable on win32 CI hosts.
+test("quiesce re-resolves the harness when its pid changed between capture and quiesce", { skip: process.platform === "win32" ? "the quiesce helpers shell out to lsof" : false }, async () => {
+  // Capture recorded harness pid 233.  By quiesce that harness is gone, 233
+  // names an unrelated process, and the replacement harness 16529 holds the
+  // database and answers port 8799.
+  const { table, signals, deps } = processTable({
+    233: { command: "/usr/libexec/unrelated-daemon --serve", cwd: "/" },
+    16529: { command: checkoutHarness, cwd: quiesceConfig.checkout },
+  });
+  const previous = {
+    runtimePids: [233],
+    appPids: [],
+    processCommands: { 233: checkoutHarness },
+    processCwds: { 233: quiesceConfig.checkout },
+  };
+  await terminateVerified([...previous.runtimePids, 16529], previous, quiesceConfig, { current: [16529], ...deps });
+  assert.deepEqual(signals, [[16529, "SIGTERM"]], "the replacement is stopped and the recycled pid is never signalled");
+  assert.equal(table.get(233).alive, true, "the unrelated process is left alone and not waited on");
+  // A captured pid that has simply exited is dropped by the liveness filter.
+  const exited = processTable({ 16529: { command: checkoutHarness, cwd: quiesceConfig.checkout } });
+  await terminateVerified([233, 16529], previous, quiesceConfig, { current: [16529], ...exited.deps });
+  assert.deepEqual(exited.signals, [[16529, "SIGTERM"]]);
+  // No false success: a process resolved NOW as holding BotFleet state must
+  // still verify, whether quiesce names it current or rollback calls strictly.
+  const holder = processTable({ 233: { command: "/usr/libexec/unrelated-daemon --serve", cwd: "/" } });
+  await assert.rejects(
+    terminateVerified([233], previous, quiesceConfig, { current: [233], ...holder.deps }),
+    /Process 233 still holds BotFleet state but its executable is not an expected BotFleet path/,
+  );
+  await assert.rejects(
+    terminateVerified([233], previous, quiesceConfig, holder.deps),
+    /Process 233 still holds BotFleet state/,
+  );
+  assert.deepEqual(holder.signals, []);
+});
+
+test("quiesce still refuses a process that rejects or survives SIGTERM, and never escalates to SIGKILL", async () => {
+  const eperm = Object.assign(new Error("kill EPERM"), { code: "EPERM" });
+  const refused = processTable({ 501: { command: electronMain, cwd: "/", killError: eperm } });
+  await assert.rejects(
+    terminateVerified([501], { processCommands: {}, processCwds: {} }, quiesceConfig, { current: [501], ...refused.deps }),
+    /Could not send SIGTERM to BotFleet process 501: kill EPERM/,
+  );
+  const stubborn = processTable({ 501: { command: electronMain, cwd: "/", ignoresTerm: true } });
+  await assert.rejects(
+    terminateVerified([501], { processCommands: {}, processCwds: {} }, quiesceConfig, { current: [501], ...stubborn.deps }),
+    /BotFleet did not exit after graceful quit and SIGTERM \(pid 501\); refusing SIGKILL/,
+  );
+  assert.deepEqual(stubborn.signals, [[501, "SIGTERM"]]);
+});
+
+// 2026-10-08 apply: "BotFleet did not exit after graceful quit and SIGTERM
+// (pid 61872, 89539); refusing SIGKILL".  Both pids were `cua-driver`
+// processes that had already exited, state Z, parent a grok CLI that never
+// reaped them.  kill -0 succeeds on a zombie, so the old probe counted them as
+// running forever and the apply rolled back.
+const cuaDriver = "/Applications/BotFleet.app/Contents/Resources/cua-driver mcp";
+
+test("processIsAlive treats a zombie as exited, and any doubt as alive", async () => {
+  const exists = () => true;
+  assert.equal(isZombieState("Z"), true);
+  assert.equal(isZombieState("Z+"), true);
+  assert.equal(isZombieState(" Zs \n"), true);
+  for (const state of ["S", "Ss", "R+", "U", "T", "I", "", undefined]) {
+    assert.equal(isZombieState(state), false, `state ${JSON.stringify(state)} is not a zombie`);
+  }
+  const statesOf = (state) => async (pids) => new Map(pids.map((pid) => [pid, state]));
+  assert.equal(await processIsAlive(61872, { exists, statesOf: statesOf("Z") }), false);
+  assert.equal(await processIsAlive(61872, { exists, statesOf: statesOf("Z+") }), false);
+  assert.equal(await processIsAlive(61872, { exists, statesOf: statesOf("Ss") }), true);
+  // ESRCH is still the proof of absence, and ps is not even consulted.
+  let asked = 0;
+  assert.equal(await processIsAlive(61872, { exists: () => false, statesOf: async () => { asked += 1; return new Map(); } }), false);
+  assert.equal(asked, 0);
+  // A ps that prints nothing for the pid, or fails, proves nothing: the process
+  // is treated as running, so the swap never proceeds under a live BotFleet
+  // because of a ps hiccup on a loaded Mac.
+  assert.equal(await processIsAlive(61872, { exists, statesOf: async () => new Map() }), true);
+  assert.equal(await processIsAlive(61872, { exists, statesOf: statesOf("") }), true);
+  assert.equal(await processIsAlive(61872, { exists, statesOf: async () => { throw new Error("spawn ps EAGAIN"); } }), true);
+});
+
+test("withoutExitedPids awaits an asynchronous verdict instead of treating every Promise as alive", async () => {
+  assert.deepEqual(await withoutExitedPids([1, 2, 3], { isAlive: async (pid) => pid === 2 }), [2]);
+  assert.deepEqual(await withoutExitedPids([1, 2, 3], { isAlive: (pid) => pid !== 2 }), [1, 3]);
+  assert.deepEqual(await withoutExitedPids([], { isAlive: async () => true }), []);
+});
+
+test("withoutExitedPids reads every state with one ps spawn per poll, not one per pid", async () => {
+  // A quiesce polls every 250 ms for up to 20 s: one spawn per pid per tick
+  // would burn the budget on a loaded Mac before any process exits.
+  const seen = [];
+  const states = new Map([[10, "Ss"], [11, "Z"], [12, "R+"], [13, "Z+"]]);
+  const options = {
+    exists: (pid) => pid !== 14,
+    statesOf: async (pids) => { seen.push([...pids]); return states; },
+  };
+  assert.deepEqual(await withoutExitedPids([10, 11, 12, 13, 14], options), [10, 12]);
+  assert.deepEqual(seen, [[10, 11, 12, 13]], "one lookup for the four pids kill -0 still sees; the gone pid never reaches ps");
+  // Nothing left after kill -0: no spawn at all.
+  assert.deepEqual(await withoutExitedPids([14], options), []);
+  assert.equal(seen.length, 1);
+  // A pid with no ps row stays alive, and a failed lookup keeps every pid.
+  assert.deepEqual(await withoutExitedPids([10, 11, 12], { ...options, statesOf: async () => new Map([[11, "Z"]]) }), [10, 12]);
+  assert.deepEqual(await withoutExitedPids([10, 11], { ...options, statesOf: async () => { throw new Error("spawn ps EAGAIN"); } }), [10, 11]);
+});
+
+test("processStates parses one real ps row per pid and ignores a pid that is not there", { skip: process.platform === "win32" ? "ps is not available on win32" : false }, async () => {
+  // A reaped child's pid is a real pid that no longer exists.
+  const child = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+  await once(child, "exit");
+  const states = await processStates([process.pid, child.pid]);
+  assert.equal(states.has(process.pid), true);
+  assert.equal(isZombieState(states.get(process.pid)), false);
+  assert.equal(states.has(child.pid), false, "a pid with no row is absent, and does not hide the others");
+  assert.equal((await processStates([])).size, 0);
+});
+
+test("quiesce treats a zombie as exited: it is never waited on, inspected or signalled", async () => {
+  const { table, signals, deps } = processTable({
+    61872: { command: cuaDriver, cwd: "/", zombie: true },
+    89539: { command: cuaDriver, cwd: "/", zombie: true },
+  });
+  const inspected = [];
+  const previous = {
+    runtimePids: [],
+    appPids: [61872, 89539],
+    processCommands: { 61872: cuaDriver, 89539: cuaDriver },
+    processCwds: { 61872: "/", 89539: "/" },
+  };
+  const zombieDeps = {
+    ...deps,
+    isAlive: zombieAwareIsAlive(table),
+    commandOf: async (pid) => { inspected.push(pid); return deps.commandOf(pid); },
+  };
+  await terminateVerified([61872, 89539], previous, quiesceConfig, { current: [61872, 89539], ...zombieDeps });
+  await terminateVerified([61872, 89539], previous, quiesceConfig, zombieDeps);
+  assert.deepEqual(signals, [], "no signal reaches a zombie, and nothing is sent to its parent");
+  assert.deepEqual(inspected, []);
+
+  // The same table under the old kill -0 probe is the 2026-10-08 failure.
+  const naive = processTable({
+    61872: { command: cuaDriver, cwd: "/", ignoresTerm: true },
+    89539: { command: cuaDriver, cwd: "/", ignoresTerm: true },
+  });
+  await assert.rejects(
+    terminateVerified([61872, 89539], previous, quiesceConfig, { current: [61872, 89539], ...naive.deps }),
+    /BotFleet did not exit after graceful quit and SIGTERM \(pid 61872, 89539\); refusing SIGKILL/,
+  );
+});
+
+test("quiesce waits for a process that exits on SIGTERM but is never reaped, because the zombie has already exited", async () => {
+  // The likely production sequence: BotFleet's helper is live when quiesce
+  // starts, exits on SIGTERM, and its parent leaves it defunct.
+  const { table, signals, deps } = processTable({
+    501: { command: electronMain, cwd: "/", zombieOnTerm: true },
+  });
+  await terminateVerified([501], { processCommands: {}, processCwds: {} }, quiesceConfig, {
+    current: [501],
+    ...deps,
+    isAlive: zombieAwareIsAlive(table),
+  });
+  assert.deepEqual(signals, [[501, "SIGTERM"]]);
+  assert.equal(table.get(501).zombie, true);
+});
+
+test("quiesce ignores a zombie yet still refuses a live process that ignores SIGTERM, naming only the live pid", async () => {
+  const { table, signals, deps } = processTable({
+    61872: { command: cuaDriver, cwd: "/", zombie: true },
+    501: { command: electronMain, cwd: "/", ignoresTerm: true },
+  });
+  const previous = { runtimePids: [], appPids: [], processCommands: {}, processCwds: {} };
+  await assert.rejects(
+    terminateVerified([61872, 501], previous, quiesceConfig, { current: [61872, 501], ...deps, isAlive: zombieAwareIsAlive(table) }),
+    (error) => error.message.endsWith("(pid 501); refusing SIGKILL") && !error.message.includes("61872"),
+  );
+  assert.deepEqual(signals, [[501, "SIGTERM"]], "only the live process is signalled, and never with SIGKILL");
+});
+
+// quiesce helpers shell out to lsof, which is unavailable on win32 CI hosts.
+test("capture skips zombies instead of recording or verifying them, and still refuses a live foreign process", { skip: process.platform === "win32" ? "the quiesce helpers shell out to lsof" : false }, async () => {
+  const { table, deps } = processTable({
+    501: { command: electronMain, cwd: "/" },
+    // A zombie's command line and working directory are gone or unreliable:
+    // verifying it would refuse the whole update with "owns BotFleet state".
+    61872: { command: "(cua-driver)", cwd: "", zombie: true },
+    89539: { command: "", cwd: "", zombie: true },
+  });
+  const captured = await captureProcessIdentities([61872, 501, 89539, 501], quiesceConfig, {
+    isAlive: zombieAwareIsAlive(table),
+    commandOf: deps.commandOf,
+    cwdOf: deps.cwdOf,
+  });
+  assert.deepEqual(captured.pids, [501], "duplicates collapse and zombies are dropped");
+  assert.deepEqual(captured.processCommands, { 501: electronMain });
+  assert.deepEqual(captured.processCwds, { 501: "/" });
+
+  // A live process that is not BotFleet is still a refusal, not a skip.
+  const foreign = processTable({ 987654: { command: "/usr/libexec/unrelated-daemon --serve", cwd: "/" } });
+  await assert.rejects(
+    captureProcessIdentities([987654], quiesceConfig, {
+      isAlive: zombieAwareIsAlive(foreign.table),
+      commandOf: foreign.deps.commandOf,
+      cwdOf: foreign.deps.cwdOf,
+    }),
+    /Process 987654 owns BotFleet state but does not match an expected BotFleet executable/,
+  );
+});
+
+test("the process list match for the installed bundle skips rows in a zombie state", () => {
+  const executable = "/Applications/BotFleet.app/Contents/MacOS/BotFleet";
+  const psOutput = [
+    `  501 Ss   ${executable}`,
+    `  502 Z    ${executable}`,
+    `  503 S+   ${executable} --flag value`,
+    `  504 Z+   ${executable} --flag value`,
+    "  505 S    /usr/libexec/unrelated-daemon --serve",
+    `  506 S    ${executable}-other`,
+    "",
+  ].join("\n");
+  assert.deepEqual(exactAppPidsFromPs(psOutput, executable), [501, 503]);
+  assert.deepEqual(exactAppPidsFromPs("", executable), []);
+});
+
+// A real zombie, made the way the grok CLI made them: a child that has exited
+// whose parent never calls wait().  The shell backgrounds a `sleep 0`, prints
+// its pid, then execs into a `sleep` that never reaps it.  Only this test's
+// own child is ever signalled, and only to clean up.
+test("a real unreaped child is a zombie: kill -0 still succeeds, processIsAlive says exited, and quiesce passes it", { skip: process.platform === "win32" ? "ps and sh semantics differ on win32" : false }, async () => {
+  const parent = spawn("/bin/sh", ["-c", "/bin/sleep 0 & echo $!; exec /bin/sleep 30"], { stdio: ["ignore", "pipe", "ignore"] });
+  try {
+    let stdout = "";
+    parent.stdout.setEncoding("utf8");
+    parent.stdout.on("data", (chunk) => { stdout += chunk; });
+    const deadline = Date.now() + 10_000;
+    while (!stdout.includes("\n") && Date.now() < deadline) await delay(25);
+    const zombiePid = Number(stdout.trim());
+    assert.ok(Number.isInteger(zombiePid) && zombiePid > 0, `the shell reported a pid, got ${JSON.stringify(stdout)}`);
+    // The pid keeps answering kill -0 until the parent reaps it, which is the
+    // premise of the bug; processIsAlive must see through it once it has exited.
+    while (await processIsAlive(zombiePid) && Date.now() < deadline) await delay(25);
+    assert.equal(await processIsAlive(zombiePid), false, "an unreaped, exited child reads as exited");
+    assert.doesNotThrow(() => process.kill(zombiePid, 0), "kill -0 alone still reports the zombie as present");
+    assert.equal(await processIsAlive(parent.pid), true, "the parent that never reaped it is a live process");
+    assert.equal(await processIsAlive(process.pid), true);
+    const previous = { runtimePids: [], appPids: [zombiePid], processCommands: {}, processCwds: {} };
+    await terminateVerified([zombiePid], previous, { ...quiesceConfig, gracefulExitMs: 1_000, termExitMs: 1_000 }, { current: [zombiePid] });
+  } finally {
+    parent.kill("SIGKILL");
+    await once(parent, "exit");
+  }
+});
+
+test("quiesce confirms a harness bootout with launchctl print and boots out a job loaded since capture", async () => {
+  const config = {
+    domain: "gui/501",
+    label: "app.botfleet.server",
+    legacyLabel: "com.jay.botfleet-server",
+    plist: "/Users/test/Library/LaunchAgents/app.botfleet.server.plist",
+    legacyPlist: "/Users/test/Library/LaunchAgents/com.jay.botfleet-server.plist",
+  };
+  const launchctl = (loadedNow, { absentAfterBootout = true } = {}) => {
+    const booted = [];
+    return {
+      booted,
+      deps: {
+        print: async (label) => ({ code: loadedNow.includes(label) ? 0 : 113 }),
+        // bootout exits nonzero even when it worked or the job was already gone.
+        bootout: async (label) => { booted.push(label); return { code: 5 }; },
+        confirmAbsent: async () => absentAfterBootout,
+      },
+    };
+  };
+  // Captured loaded, already gone by quiesce: a nonzero bootout is not a refusal.
+  const gone = launchctl([]);
+  const capturedLoaded = { launchdLoaded: true, legacyLaunchdLoaded: false };
+  await bootOutHarnessForQuiesce(config, capturedLoaded, gone.deps);
+  assert.deepEqual(gone.booted, [config.label]);
+  // Still loaded after bootout: refuse rather than install under KeepAlive.
+  const stuck = launchctl([config.label], { absentAfterBootout: false });
+  await assert.rejects(
+    bootOutHarnessForQuiesce(config, { launchdLoaded: true, legacyLaunchdLoaded: false }, stuck.deps),
+    /Could not boot out app\.botfleet\.server before install: gui\/501\/app\.botfleet\.server is still loaded/,
+  );
+  // Not loaded at capture, bootstrapped since (a watchdog restart): booted out
+  // now, and recorded so rollback restores it like a captured job.
+  const restarted = launchctl([config.label]);
+  const capturedStopped = { launchdLoaded: false, legacyLaunchdLoaded: false };
+  await bootOutHarnessForQuiesce(config, capturedStopped, restarted.deps);
+  assert.deepEqual(restarted.booted, [config.label]);
+  assert.equal(capturedStopped.launchdLoaded, true);
+  assert.deepEqual(
+    rollbackHarnessBootstrapPlists(config, capturedStopped, { plistExists: true, legacyPlistExists: true }),
+    [config.plist],
+  );
+  // The aliased configuration still boots its one label out exactly once.
+  const aliased = { ...config, label: config.legacyLabel };
+  const once = launchctl([config.legacyLabel]);
+  await bootOutHarnessForQuiesce(aliased, { launchdLoaded: false, legacyLaunchdLoaded: false }, once.deps);
+  assert.deepEqual(once.booted, [config.legacyLabel]);
+});
+
+test("quiesce re-resolves current holders, bundle processes and port owners before signalling", async () => {
+  const source = await readFile(join(scripts, "update-botfleet-mac.mjs"), "utf8");
+  const quiesce = source.indexOf("quiesce: async (previous) => {");
+  const assertQuiesced = source.indexOf("assertQuiesced: async (previous) => {", quiesce);
+  assert.ok(quiesce >= 0 && assertQuiesced > quiesce);
+  const body = source.slice(quiesce, assertQuiesced);
+  assert.match(body, /await bootOutHarnessForQuiesce\(config, previous\)/);
+  assert.match(body, /Promise\.all\(config\.ports\.map\(\(port\) => probeHealth\(port, \{ dataDirectory: config\.dataDirectory \}\)\)\)/);
+  assert.match(body, /ownedRuntimePids\(\{ holders: currentHolders, bundlePids: currentBundlePids, health \}\)/);
+  assert.match(body, /\{ current \}/);
+});
+
+test("rollback verifies each bootout with launchctl print before restoring files", async () => {
+  const source = await readFile(join(scripts, "update-botfleet-mac.mjs"), "utf8");
+  const rollback = source.indexOf("rollback: async (prepared, previous, originalError) => {");
+  assert.ok(rollback >= 0, "the transaction has a rollback step");
+  const restore = source.indexOf("Restore only from copies THIS run put at the rollback paths", rollback);
+  assert.ok(restore > rollback);
+  const bootout = source.indexOf("for (const label of rollbackHarnessBootoutLabels(config, previous))", rollback);
+  const verify = source.indexOf("waitForLaunchdBootout(config.domain, label)", bootout);
+  assert.ok(bootout > rollback && verify > bootout && verify < restore,
+    "every bootout label is confirmed absent before any file is restored");
+  const stopCheck = source.indexOf("if (stopErrors.length) throw new AggregateError(", rollback);
+  assert.ok(verify < stopCheck && stopCheck < restore,
+    "a label that survives bootout aborts the rollback before the restore");
+});
+
+test("startHarness records the started label before bootstrap and rollback boots it out before restoring files", async () => {
+  const source = await readFile(join(scripts, "update-botfleet-mac.mjs"), "utf8");
+  const start = source.indexOf("startHarness: async (prepared, previous) => {");
+  assert.ok(start >= 0, "startHarness receives the transaction's previous state");
+  const recordLabel = source.indexOf("previous.startedHarnessLabel = await startedHarnessLabel(config, plist)", start);
+  const bootstrap = source.indexOf('run("launchctl", ["bootstrap", config.domain, plist])', start);
+  assert.ok(recordLabel > start && recordLabel < bootstrap, "the started label is recorded before the bootstrap can fail");
+  const rollback = source.indexOf("rollback: async (prepared, previous, originalError) => {");
+  const bootout = source.indexOf("for (const label of rollbackHarnessBootoutLabels(config, previous))", rollback);
+  const restore = source.indexOf("Restore only from copies THIS run put at the rollback paths", rollback);
+  assert.ok(bootout > rollback && bootout < restore, "rollback boots out every started label before restoring files");
+  assert.doesNotMatch(
+    source.slice(rollback, restore),
+    /\["bootout", `\$\{config\.domain\}\/\$\{config\.label\}`\]/,
+    "rollback no longer boots out only the renamed label",
+  );
+});
+
+test("production updater has no force-kill or unrelated desktop-process cleanup", async () => {
+  const source = await readFile(join(scripts, "update-botfleet-mac.mjs"), "utf8");
+  for (const forbidden of ["pkill", "killall", '"Dock"', '"Finder"', '"System Settings"']) {
+    assert.equal(source.includes(forbidden), false, `must not contain ${forbidden}`);
+  }
+  assert.doesNotMatch(source, /process\.kill\([^\n]+"SIGKILL"/);
+  assert.doesNotMatch(source, /signalProcess\([^\n]+"SIGKILL"/);
+  assert.match(source, /signalProcess\(pid, "SIGTERM", kill\)/);
+  assert.match(source, /kill = \(target, name\) => process\.kill\(target, name\)/);
+  assert.match(source, /runtime\.safeToRestart !== true/);
+  assert.match(source, /runtime\.sourceCommit !== expectedBuild\.targetCommit/);
+  assert.match(source, /Database ownership is ambiguous/);
+  assert.match(source, /manual first adoption is required/);
+  assert.match(source, /rollback was deferred without interrupting it/);
+  assert.doesNotMatch(source, /legacyPreflight/);
+  assert.match(source, /LEGACY_LAUNCH_AGENT_LABEL = "com\.jay\.botfleet-server"/);
+  assert.match(source, /legacyLaunchdLoaded: legacyLaunchd\.code === 0/);
+  assert.match(source, /for \(const label of quiesceBootoutLabels\(config, previous\)\)/);
+  assert.match(source, /previous\.legacyLaunchdLoaded[\s\S]*bootstrap[\s\S]*config\.legacyPlist/);
+  assert.match(source, /POST/);
+  assert.match(source, /update-botfleet\.sh unquiesce/);
+});
+
+test("desktop local-update UI does not report normal packaging latency as failure", async () => {
+  const source = await readFile(join(scripts, "../electron/updater.mjs"), "utf8");
+  assert.match(source, /LOCAL_UPDATE_PROGRESS_MS = 2 \* 60 \* 1000/);
+  assert.match(source, /LOCAL_UPDATE_LONG_RUNNING_MS = 60 \* 60 \* 1000/);
+  assert.match(source, /still preparing/);
+  assert.match(source, /updater lock before retrying/);
+  assert.match(source, /still preparing\.\\u00A0 Do not start another update/);
+  assert.match(source, /expected\.\\u00A0 Check its updater lock/);
+  assert.match(source, /status: "installing",\r?\n\s+message: "The local updater is taking longer/);
+  assert.doesNotMatch(source, /did not finish\. Quit the app and try again/);
+});
+
+test("process verification binds relative server commands to the live checkout cwd", async () => {
+  const config = { appPath: "/Applications/BotFleet.app", checkout: "/Users/test/apps/botfleet-server" };
+  assert.equal(
+    await isExpectedBotFleetProcess("/opt/homebrew/bin/node --experimental-strip-types server/index.ts", config.checkout, config),
+    true,
+  );
+  assert.equal(
+    await isExpectedBotFleetProcess("/opt/homebrew/bin/node --experimental-strip-types server/index.ts", "/tmp/decoy", config),
+    false,
+  );
+  assert.equal(await isExpectedBotFleetProcess("/usr/bin/python3 server/index.ts", config.checkout, config), false);
+  assert.equal(await isExpectedBotFleetProcess("/Applications/Other.app/Contents/MacOS/BotFleet", "/", config), false);
+  assert.equal(await isExpectedBotFleetProcess("/Applications/BotFleet.app/Contents/MacOS/BotFleet", "/", config), true);
+});
+
+test("the updater covers every desktop harness fallback port", () => {
+  assert.deepEqual(DEFAULT_PORTS, [8799, 18799, 28799]);
+});
+
+test("unused foreign fallback ports do not hide one valid BotFleet owner", () => {
+  const owner = { kind: "botfleet", pid: 42, port: 18799, static: false };
+  assert.deepEqual(
+    healthTopologyResult([{ kind: "foreign" }, owner, { kind: "none" }]),
+    { safe: true, pid: 42, pids: [42], port: 18799, health: [owner] },
+  );
+  assert.match(healthTopologyResult([{ kind: "foreign" }, { kind: "none" }]).reason, /No BotFleet harness/);
+  assert.equal(healthTopologyResult([{ kind: "http", status: 404 }, owner]).safe, true);
+  assert.match(healthTopologyResult([owner, { kind: "unavailable" }]).reason, /unavailable or ambiguous/);
+});
+
+test("a post-fence ownership exception releases runtime admission", async (t) => {
+  const releases = [];
+  const owner = { version: 1, pid: 42, port: 8799, nonce: "a".repeat(64) };
+  const previousNonce = process.env.BOTFLEET_OWNER_NONCE;
+  process.env.BOTFLEET_OWNER_NONCE = owner.nonce;
+  t.after(() => {
+    if (previousNonce === undefined) delete process.env.BOTFLEET_OWNER_NONCE;
+    else process.env.BOTFLEET_OWNER_NONCE = previousNonce;
+  });
+  const result = await fenceRuntimeAdmission(
+    { dataDirectory: "/private/data", ports: [8799] },
+    {
+      readOwner: async () => owner,
+      requestJson: async () => ({ kind: "ok", status: 200, body: {
+        app: "botfleet", pid: 42, dataOwner: { pid: 42, port: 8799 },
+        sourceCommit: "b".repeat(40), sourceDirty: false,
+        safeToRestart: true, activeWorkCount: 0, quiescing: true,
+      } }),
+      healthTopology: async () => { throw new Error("injected topology failure"); },
+      sqliteHolders: async () => [42],
+      releaseRuntimeAdmission: async (config) => releases.push(config),
+    },
+  );
+  assert.equal(result.safe, false);
+  assert.match(result.reason, /could not be verified after the admission fence/);
+  assert.equal(releases.length, 1);
+});
+
+test("desktop verification requires one stable installed-application process after open", () => {
+  assert.equal(stableApplicationProcessError([41], [41], true), null);
+  assert.match(stableApplicationProcessError([], [], true), /did not remain running/);
+  assert.match(stableApplicationProcessError([41], [42], true), /did not remain running/);
+  assert.equal(stableApplicationProcessError([], [], false), null);
+});
+
+test("a Mac with only the legacy LaunchAgent plist still bootstraps the updated harness", () => {
+  const config = {
+    label: "app.botfleet.server",
+    plist: "/Users/test/Library/LaunchAgents/app.botfleet.server.plist",
+    legacyLabel: "com.jay.botfleet-server",
+    legacyPlist: "/Users/test/Library/LaunchAgents/com.jay.botfleet-server.plist",
+  };
+  // The first automatic update on a renamed install: only the legacy plist
+  // exists, and bootstrapping the missing renamed one used to roll the
+  // transaction back.  The legacy plist launches the same advanced checkout.
+  assert.equal(
+    harnessBootstrapPlist(config, { plistExists: false, legacyPlistExists: true }),
+    config.legacyPlist,
+  );
+  // Once the migration materializes the renamed plist, it wins.
+  assert.equal(
+    harnessBootstrapPlist(config, { plistExists: true, legacyPlistExists: true }),
+    config.plist,
+  );
+  assert.equal(
+    harnessBootstrapPlist(config, { plistExists: true, legacyPlistExists: false }),
+    config.plist,
+  );
+  // Neither plist on disk keeps the original loud failure against the
+  // renamed path instead of silently starting nothing.
+  assert.equal(
+    harnessBootstrapPlist(config, { plistExists: false, legacyPlistExists: false }),
+    config.plist,
+  );
+});
+
+test("rollback restores a new-label harness from its legacy-named plist", () => {
+  const config = {
+    label: "app.botfleet.server",
+    plist: "/Users/test/Library/LaunchAgents/app.botfleet.server.plist",
+    legacyLabel: "com.jay.botfleet-server",
+    legacyPlist: "/Users/test/Library/LaunchAgents/com.jay.botfleet-server.plist",
+  };
+  assert.deepEqual(
+    rollbackHarnessBootstrapPlists(
+      config,
+      { launchdLoaded: true, legacyLaunchdLoaded: false },
+      { plistExists: false, legacyPlistExists: true },
+    ),
+    [config.legacyPlist],
+  );
+});
+
+test("rollback restores an aliased legacy-label harness once, from its configured plist", () => {
+  // BOTFLEET_LAUNCH_AGENT_LABEL names the legacy label and
+  // BOTFLEET_LAUNCH_AGENT_PLIST points at a custom plist: capture sees one
+  // job as both launchdLoaded and legacyLaunchdLoaded.
+  const config = {
+    label: "com.jay.botfleet-server",
+    plist: "/Users/test/custom/botfleet-server.plist",
+    legacyLabel: "com.jay.botfleet-server",
+    legacyPlist: "/Users/test/Library/LaunchAgents/com.jay.botfleet-server.plist",
+  };
+  const both = { launchdLoaded: true, legacyLaunchdLoaded: true };
+  // Custom plist present, legacy plist missing: restore only the custom one,
+  // never the missing legacy path.
+  assert.deepEqual(
+    rollbackHarnessBootstrapPlists(config, both, { plistExists: true, legacyPlistExists: false }),
+    [config.plist],
+  );
+  // Both present: one bootstrap of the configured plist, not a second
+  // bootstrap of the already-loaded label from the legacy path.
+  assert.deepEqual(
+    rollbackHarnessBootstrapPlists(config, both, { plistExists: true, legacyPlistExists: true }),
+    [config.plist],
+  );
+  // Custom plist missing: fall back to the legacy plist exactly once.
+  assert.deepEqual(
+    rollbackHarnessBootstrapPlists(config, both, { plistExists: false, legacyPlistExists: true }),
+    [config.legacyPlist],
+  );
+  // Only the legacy flag recorded still restores the one job.
+  assert.deepEqual(
+    rollbackHarnessBootstrapPlists(config, { launchdLoaded: false, legacyLaunchdLoaded: true }, { plistExists: true, legacyPlistExists: false }),
+    [config.plist],
+  );
+  assert.deepEqual(
+    rollbackHarnessBootstrapPlists(config, { launchdLoaded: false, legacyLaunchdLoaded: false }, { plistExists: true, legacyPlistExists: true }),
+    [],
+  );
+});
+
+test("rollback restores a legacy-label harness from a configured custom plist", () => {
+  // BOTFLEET_LAUNCH_AGENT_PLIST points at a custom plist on a pre-transition
+  // Mac: the only job runs under the legacy label while config.label keeps
+  // the renamed default, so the job used to be restored from the hardcoded
+  // legacy path -- a file this Mac never had, leaving the harness down.
+  const config = {
+    label: "app.botfleet.server",
+    plist: "/Users/test/custom/botfleet-server.plist",
+    customPlist: true,
+    legacyLabel: "com.jay.botfleet-server",
+    legacyPlist: "/Users/test/Library/LaunchAgents/com.jay.botfleet-server.plist",
+  };
+  // The legacy job comes back from the configured plist it was loaded from,
+  // not the missing hardcoded legacy path.
+  assert.deepEqual(
+    rollbackHarnessBootstrapPlists(config, { launchdLoaded: false, legacyLaunchdLoaded: true }, { plistExists: true, legacyPlistExists: false }),
+    [config.plist],
+  );
+  // Both distinct labels recorded: the custom plist can only carry one of
+  // them, so the renamed job comes back from it and the legacy job from the
+  // legacy plist -- two bootstraps, not one deduped entry.
+  assert.deepEqual(
+    rollbackHarnessBootstrapPlists(config, { launchdLoaded: true, legacyLaunchdLoaded: true }, { plistExists: true, legacyPlistExists: true }),
+    [config.plist, config.legacyPlist],
+  );
+  // A configured plist that vanished mid-transaction falls back to the
+  // legacy path that does exist.
+  assert.deepEqual(
+    rollbackHarnessBootstrapPlists(config, { launchdLoaded: false, legacyLaunchdLoaded: true }, { plistExists: false, legacyPlistExists: true }),
+    [config.legacyPlist],
+  );
+  // Without a configured plist the legacy job still comes from the hardcoded
+  // legacy path, exactly as before.
+  const stock = { ...config, customPlist: false };
+  assert.deepEqual(
+    rollbackHarnessBootstrapPlists(stock, { launchdLoaded: false, legacyLaunchdLoaded: true }, { plistExists: true, legacyPlistExists: false }),
+    [stock.legacyPlist],
+  );
+});
+
+test("rollback restores both distinct loaded labels when a custom plist exists", () => {
+  // Both the renamed and the legacy label were loaded before the
+  // transaction and BOTFLEET_LAUNCH_AGENT_PLIST points at a custom plist.
+  // Both flags used to resolve to config.plist, the Set deduped them, and
+  // only one job came back.
+  const config = {
+    label: "app.botfleet.server",
+    plist: "/Users/test/custom/botfleet-server.plist",
+    customPlist: true,
+    legacyLabel: "com.jay.botfleet-server",
+    legacyPlist: "/Users/test/Library/LaunchAgents/com.jay.botfleet-server.plist",
+  };
+  const both = { launchdLoaded: true, legacyLaunchdLoaded: true };
+  // Custom plist declares the renamed label: legacy job from the legacy plist.
+  assert.deepEqual(
+    rollbackHarnessBootstrapPlists(config, both, { plistExists: true, legacyPlistExists: true, plistLabel: config.label }),
+    [config.plist, config.legacyPlist],
+  );
+  // Label unreadable: still two distinct restores.
+  assert.deepEqual(
+    rollbackHarnessBootstrapPlists(config, both, { plistExists: true, legacyPlistExists: true, plistLabel: null }),
+    [config.plist, config.legacyPlist],
+  );
+  // Custom plist missing: renamed job falls back to the legacy plist, which
+  // is also the legacy job's plist, so it is bootstrapped once.
+  assert.deepEqual(
+    rollbackHarnessBootstrapPlists(config, both, { plistExists: false, legacyPlistExists: true }),
+    [config.legacyPlist],
+  );
+  // Only the legacy job loaded and the custom plist declares the legacy
+  // label: it is restored from the custom plist.
+  assert.deepEqual(
+    rollbackHarnessBootstrapPlists(config, { launchdLoaded: false, legacyLaunchdLoaded: true }, { plistExists: true, legacyPlistExists: false, plistLabel: config.legacyLabel }),
+    [config.plist],
+  );
+  // Only the legacy job loaded but the custom plist declares the renamed
+  // label: it cannot be the legacy job's source.
+  assert.deepEqual(
+    rollbackHarnessBootstrapPlists(config, { launchdLoaded: false, legacyLaunchdLoaded: true }, { plistExists: true, legacyPlistExists: true, plistLabel: config.label }),
+    [config.legacyPlist],
+  );
+});
+
+test("launchAgentPlistLabel reads the plist Label and tolerates failures", async () => {
+  const calls = [];
+  const ok = async (command, args) => { calls.push([command, args]); return { code: 0, stdout: "com.jay.botfleet-server\n", stderr: "" }; };
+  assert.equal(await launchAgentPlistLabel("/tmp/x.plist", ok), "com.jay.botfleet-server");
+  assert.deepEqual(calls, [["plutil", ["-extract", "Label", "raw", "-o", "-", "/tmp/x.plist"]]]);
+  assert.equal(await launchAgentPlistLabel("/tmp/x.plist", async () => ({ code: 1, stdout: "", stderr: "no Label" })), null);
+  assert.equal(await launchAgentPlistLabel("/tmp/x.plist", async () => { throw new Error("spawn ENOENT"); }), null);
+});
+
+test("desktop attachment requires a static harness or a second same-owner UI endpoint", () => {
+  assert.equal(applicationAttachmentError({ health: [{ port: 8799, static: true }] }, true), null);
+  assert.equal(applicationAttachmentError({ health: [{ port: 8799 }, { port: 18799 }] }, true), null);
+  assert.match(applicationAttachmentError({ health: [{ port: 8799, static: false }] }, true), /did not expose its bundled UI/);
+  assert.equal(applicationAttachmentError({ health: [{ port: 8799, static: false }] }, false), null);
+});
+
+test("rollback refuses to interrupt an active or unprovable replacement", () => {
+  assert.equal(rollbackReadinessError(0, { safe: false, reason: "no runtime" }), null);
+  assert.equal(rollbackReadinessError(1, { safe: true }), null);
+  assert.equal(rollbackReadinessError(1, { safe: false, reason: "1 active operation" }), "1 active operation");
+  assert.match(pendingRecoveryReceiptPath({ stageDirectory: "/private/stage" }), /pending-recovery\.json$/);
+  assert.equal(
+    credentialPreparationReceiptPath({ stageDirectory: "/private/stage" }),
+    join("/private/stage", "credential-migration.json"),
+  );
+});
+
+test("post-start identity accepts new work while the pre-install readiness gate still refuses it", () => {
+  const owner = { pid: 42, port: 8799 };
+  const prepared = {
+    targetCommit: "b".repeat(40),
+    version: "1.0.30",
+    apiVersion: 1,
+    uiHash: "c".repeat(64),
+  };
+  const runtime = {
+    app: "botfleet",
+    pid: owner.pid,
+    dataOwner: owner,
+    sourceCommit: prepared.targetCommit,
+    sourceDirty: false,
+    version: prepared.version,
+    apiVersion: prepared.apiVersion,
+    uiHash: null,
+    safeToRestart: false,
+    activeWorkCount: 1,
+  };
+  assert.match(authenticatedRuntimeError(runtime, owner, prepared, { requireIdle: true }), /active operations/);
+  assert.equal(authenticatedRuntimeError(runtime, owner, prepared, { requireIdle: false }), null);
+  assert.match(
+    authenticatedRuntimeError({ ...runtime, uiHash: "d".repeat(64) }, owner, prepared, { requireIdle: false }),
+    /does not match the prepared application build/,
+  );
+});
+
+// A crashed or booted-out harness leaves harness-owner.json behind naming a pid
+// that is gone.  That is a stopped app, not a machine that has never adopted
+// this build, and the refusal has to say so: the old text sent an operator
+// looking for a first-adoption procedure that does not exist for a crash.
+// Skipped on Windows like the other owner-record tests here: assertPrivateRegularFile
+// compares st_uid against process.getuid(), which is undefined there, so it throws
+// before the classification under test is ever reached.
+test("preflight names a stale owner record as a stopped harness, not a first adoption", { skip: process.platform === "win32" ? "Mac updater requires POSIX ownership and modes" : false }, async (t) => {
+  const dead = spawn(process.execPath, ["-e", ""]);
+  const deadPid = dead.pid;
+  await once(dead, "exit");
+
+  const dataDirectory = await mkdtemp(join(tmpdir(), "ubf-stale-owner-"));
+  await chmod(dataDirectory, 0o700);
+  t.after(() => rm(dataDirectory, { recursive: true, force: true }));
+  const record = join(dataDirectory, "harness-owner.json");
+  await writeFile(record, JSON.stringify({ version: 1, pid: deadPid, port: 8799, nonce: "a".repeat(64) }));
+  await chmod(record, 0o600);
+
+  const stale = await runtimePreflight({ dataDirectory }, null);
+  assert.equal(stale.safe, false);
+  assert.match(stale.reason, new RegExp(`harness \\(pid ${deadPid}\\) is not running`));
+  assert.doesNotMatch(stale.reason, /first adoption/);
+  // Descriptive only.  applyPreparedUpdate starts the harness and then polls
+  // it, so this text reaches an operator at a moment when the updater has
+  // already started the app; an imperative would contradict that.
+  assert.doesNotMatch(stale.reason, /start the app/i);
+
+  // With no record at all the genuine first-adoption text still applies, so the
+  // fix narrows the message instead of replacing it.
+  await rm(record);
+  const absent = await runtimePreflight({ dataDirectory }, null);
+  assert.equal(absent.safe, false);
+  assert.match(absent.reason, /first adoption/);
+
+  // A record carrying a field the owner contract does not define is refused
+  // rather than partially believed.  Extra keys used to pass validation and
+  // were then ignored downstream, so nothing was exploitable; refusing them
+  // means a malformed or tampered record cannot be half-honoured.
+  await writeFile(record, JSON.stringify({ version: 1, pid: deadPid, port: 8799, nonce: "a".repeat(64), extra: 1 }));
+  await chmod(record, 0o600);
+  await assert.rejects(
+    () => runtimePreflight({ dataDirectory }, null),
+    /Harness owner record is invalid/,
+  );
+});
+
+test("packaged identity comes from the build output rather than an ambient label", async () => {
+  const source = await readFile(join(scripts, "update-botfleet-mac.mjs"), "utf8");
+  const builder = await readFile(join(scripts, "../electron-builder.yml"), "utf8");
+  assert.match(source, /Contents\/Resources\/server\/build-identity\.json/);
+  assert.match(source, /build\.sourceDirty !== false/);
+  assert.match(source, /EXPECTED_SIGN_IDENTITY = "Developer ID Application: Jay Wedgeworth, LLC \(CC8UTF7ATG\)"/);
+  assert.match(source, /BUILDER_SIGN_SELECTOR = "Jay Wedgeworth, LLC \(CC8UTF7ATG\)"/);
+  assert.match(source, /PREPARED_SCHEMA_VERSION = 2/);
+  assert.match(builder, /identity: "Jay Wedgeworth, LLC \(CC8UTF7ATG\)"/);
+  assert.doesNotMatch(builder, /identity: "Developer ID Application:/);
+  assert.doesNotMatch(source, /BOTFLEET_SOURCE_COMMIT:/);
+});
+
+async function swapFixture(t) {
+  const root = await mkdtemp(join(tmpdir(), "botfleet-update-swap-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const paths = {
+    appPath: join(root, "BotFleet.app"),
+    candidateApp: join(root, ".candidate.app"),
+    rollbackApp: join(root, ".rollback.app"),
+    liveDependencies: join(root, "node_modules"),
+    candidateDependencies: join(root, ".candidate-node_modules"),
+    rollbackDependencies: join(root, ".rollback-node_modules"),
+  };
+  for (const [path, marker] of [
+    [paths.appPath, "old-app"],
+    [paths.candidateApp, "new-app"],
+    [paths.liveDependencies, "old-deps"],
+    [paths.candidateDependencies, "new-deps"],
+  ]) {
+    await mkdir(path);
+    await writeFile(join(path, "marker"), marker);
+  }
+  return paths;
+}
+
+test("the app and dependency tree swap together while retaining both prior copies", async (t) => {
+  const paths = await swapFixture(t);
+  await swapPreparedFiles(paths);
+  assert.equal(await readFile(join(paths.appPath, "marker"), "utf8"), "new-app");
+  assert.equal(await readFile(join(paths.liveDependencies, "marker"), "utf8"), "new-deps");
+  assert.equal(await readFile(join(paths.rollbackApp, "marker"), "utf8"), "old-app");
+  assert.equal(await readFile(join(paths.rollbackDependencies, "marker"), "utf8"), "old-deps");
+});
+
+test("a server-only run swaps only the dependency tree and keeps the installed app", async (t) => {
+  const paths = await swapFixture(t);
+  await swapDependencyTree({
+    liveDependencies: paths.liveDependencies,
+    candidateDependencies: paths.candidateDependencies,
+    rollbackDependencies: paths.rollbackDependencies,
+  });
+  assert.equal(await readFile(join(paths.appPath, "marker"), "utf8"), "old-app");
+  assert.equal(await readFile(join(paths.liveDependencies, "marker"), "utf8"), "new-deps");
+  assert.equal(await readFile(join(paths.rollbackDependencies, "marker"), "utf8"), "old-deps");
+});
+
+test("a dependency install rename failure restores the old app and dependencies", async (t) => {
+  const paths = await swapFixture(t);
+  let calls = 0;
+  await assert.rejects(
+    swapPreparedFiles(paths, async (from, to) => {
+      calls += 1;
+      if (calls === 4) throw new Error("injected dependency rename failure");
+      await rename(from, to);
+    }),
+    /injected dependency rename failure/,
+  );
+  assert.equal(await readFile(join(paths.appPath, "marker"), "utf8"), "old-app");
+  assert.equal(await readFile(join(paths.liveDependencies, "marker"), "utf8"), "old-deps");
+  assert.equal(await readFile(join(paths.candidateApp, "marker"), "utf8"), "new-app");
+  assert.equal(await readFile(join(paths.candidateDependencies, "marker"), "utf8"), "new-deps");
+});
+
+test("a settled run id is recognised, and a different run's outcome is not", () => {
+  const finished = {
+    schemaVersion: 1,
+    runId: "run_one",
+    startedAt: "2026-09-16T11:00:00.000Z",
+    finishedAt: "2026-09-16T11:04:00.000Z",
+    outcome: "failed",
+    message: "The update could not be packaged.",
+  };
+  assert.deepEqual(settledRunOutcome(finished, "run_one"), {
+    outcome: "failed",
+    message: "The update could not be packaged.",
+  });
+  // A run still going is not settled, and neither is one that never wrote an
+  // outcome - those are the two cases a relaunch is allowed to resume rather
+  // than skip.
+  assert.equal(settledRunOutcome({ ...finished, finishedAt: null, outcome: null }, "run_one"), null);
+  assert.equal(settledRunOutcome({ ...finished, outcome: null }, "run_one"), null);
+  // Another run's record says nothing about this one.
+  assert.equal(settledRunOutcome(finished, "run_two"), null);
+  assert.equal(settledRunOutcome(finished, undefined), null);
+  // Anything torn, missing or the wrong shape is not evidence of a finish.
+  assert.equal(settledRunOutcome(null, "run_one"), null);
+  assert.equal(settledRunOutcome("{}", "run_one"), null);
+  assert.equal(settledRunOutcome([finished], "run_one"), null);
+});
+
+test("a relaunch of a finished run does nothing and exits successfully", async (t) => {
+  // launchd keeps a `submit`ted job alive on failure, so a run that fails is
+  // relaunched under the SAME run id and progress file.  The harness removes
+  // the label when it sees the run settle; this is the guard for a relaunch
+  // that beats the removal.
+  const root = await mkdtemp(join(tmpdir(), "bf-update-relaunch-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const progressPath = join(root, "run.progress.json");
+  const record = {
+    schemaVersion: 1,
+    runId: "run_one",
+    command: "update",
+    pid: 4321,
+    startedAt: "2026-09-16T11:00:00.000Z",
+    updatedAt: "2026-09-16T11:04:00.000Z",
+    step: "buildBundle",
+    progress: 0.4,
+    targetCommit: "b".repeat(40),
+    receiptPath: null,
+    finishedAt: "2026-09-16T11:04:00.000Z",
+    outcome: "failed",
+    message: "The update could not be packaged.",
+  };
+  const written = `${JSON.stringify(record, null, 2)}\n`;
+  await writeFile(progressPath, written);
+
+  // Everything the config would resolve points at scratch, so a guard that
+  // regressed cannot reach this machine's real checkout, lock or app.
+  const scratch = {
+    BOTFLEET_UPDATE_ALLOW_NON_DARWIN: "1",
+    BOTFLEET_CHECKOUT: join(root, "checkout"),
+    BOTFLEET_APP_PATH: join(root, "BotFleet.app"),
+    BOTFLEET_DATA_DIR: join(root, "data"),
+    BOTFLEET_UPDATE_LOCK: join(root, "update.lock"),
+    BOTFLEET_UPDATE_ROOT: join(root, "updates"),
+  };
+  const restore = Object.fromEntries(Object.keys(scratch).map((key) => [key, process.env[key]]));
+  Object.assign(process.env, scratch);
+  t.after(() => {
+    for (const [key, value] of Object.entries(restore)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  });
+
+  await main(["update", "--progress", progressPath, "--run-id", "run_one"]);
+  // Untouched: the recorder rewrites this file the moment it is created, so
+  // an unchanged record is proof nothing started.
+  assert.equal(await readFile(progressPath, "utf8"), written);
+  assert.equal(process.exitCode, undefined);
+});
+
+// The wrapper bootstraps the updater into `mktemp -d "${TMPDIR}/..."`.  On
+// macOS TMPDIR is under /var/folders and /var is a symlink to /private/var.
+// Node's ESM loader realpaths the entry module, so import.meta.url named
+// /private/var/... while process.argv[1] kept /var/..., the entry guard was
+// false, main() never ran, and every ubf run exited 0 without a word.  This
+// test reproduces that with an explicit symlinked directory so it fails on any
+// platform that can create one, not only on a Mac.
+async function symlinkedCopy(t, files) {
+  const root = await mkdtemp(join(tmpdir(), "botfleet-entry-guard-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const physical = join(root, "physical");
+  const linked = join(root, "linked");
+  for (const file of files) {
+    const target = join(physical, file);
+    await mkdir(dirname(target), { recursive: true });
+    await copyFile(join(scripts, "..", file), target);
+  }
+  // "junction" is ignored on POSIX and lets Windows create the link without
+  // elevated privileges.
+  await symlink(physical, linked, "junction");
+  // Guard the premise: the two spellings must really differ.
+  assert.notEqual(await realpath(linked), linked);
+  return { linked, root };
+}
+
+test("the updater runs its entry point when invoked through a symlinked directory", async (t) => {
+  // Exactly the files the wrapper archives into its bootstrap directory, laid
+  // out the same way.  Keeping the list here also proves the entry module
+  // stays self-contained: a new import would fail to resolve in this copy.
+  const { linked, root } = await symlinkedCopy(t, [
+    "scripts/update-botfleet-mac.mjs",
+    "scripts/mac-update-transaction.mjs",
+    "scripts/harness-release-store.mjs",
+    "scripts/release-provenance.mjs",
+    "scripts/ci-build-resolver.mjs",
+    "scripts/stage-entries.mjs",
+    "scripts/failed-install-retention.mjs",
+    "scripts/update-progress.mjs",
+    "scripts/harness-release-store.mjs",
+    "scripts/release-provenance.mjs",
+    "electron/update-credential-preparation.mjs",
+    "electron/desktop-startup-receipt.mjs",
+  ]);
+  // --help returns before any configuration, lock, network or data directory
+  // is touched.  HOME and the BotFleet paths still point at scratch so a
+  // regression elsewhere cannot reach this machine's real checkout or app.
+  const result = await run(process.execPath, [join(linked, "scripts", "update-botfleet-mac.mjs"), "--help"], {
+    env: {
+      HOME: join(root, "home"),
+      BOTFLEET_UPDATE_ALLOW_NON_DARWIN: "1",
+      BOTFLEET_CHECKOUT: join(root, "checkout"),
+      BOTFLEET_APP_PATH: join(root, "BotFleet.app"),
+      BOTFLEET_DATA_DIR: join(root, "data"),
+      BOTFLEET_UPDATE_LOCK: join(root, "update.lock"),
+      BOTFLEET_UPDATE_ROOT: join(root, "updates"),
+    },
+    allowFailure: true,
+  });
+  assert.equal(result.code, 0, result.stderr);
+  // A silent exit 0 is the bug, so the exit code alone proves nothing.
+  assert.match(result.stdout, /^Usage:/m, "main() must run and print the usage text");
+  assert.match(result.stdout, /pending-update-resume\.json/, "usage must say what --force interrupts");
+});
+
+test("another script with the same entry guard runs through a symlinked directory", async (t) => {
+  const { linked } = await symlinkedCopy(t, ["scripts/verify-release-tag.mjs"]);
+  const result = await run(process.execPath, [join(linked, "scripts", "verify-release-tag.mjs")], {
+    env: { GH_TOKEN: "" },
+    allowFailure: true,
+  });
+  // Reaching the token check proves the guard fired.  It never gets as far as
+  // a network request without a token.
+  assert.notEqual(result.code, 0);
+  assert.match(result.stderr, /GH_TOKEN is required to verify the release tag/);
+});
+
+// --- Pre-activation smoke test ------------------------------------------------
+//
+// The Sep 17 and Oct 1 outages were both a healthy binary plus a starved CPU,
+// and the first version of this gate would have called both of them a corrupt
+// build.  These cases exist to keep that mistake from returning: a timeout and
+// a real failure must stay distinguishable, and only a timeout may be retried.
+// The diagnosis is not re-derived here either — fleet recall ("busy host update
+// timeout classified as corrupt artifact not a failure", 2026-10-04) returns the
+// Oct 1 cloudflared probe incident (PR #780, board fd1736f8) and the open board
+// sweep for the same failure in six other probes.
+test("the smoke test is on unless it is explicitly switched off", () => {
+  assert.equal(smokeTestEnabled({}), true);
+  assert.equal(smokeTestEnabled({ BOTFLEET_UPDATE_SMOKE: "1" }), true);
+  for (const value of ["0", "off", "FALSE", "no", " off "]) {
+    assert.equal(smokeTestEnabled({ BOTFLEET_UPDATE_SMOKE: value }), false, `${value} should disable the probe`);
+  }
+});
+
+test("a boot that never became ready is a busy host, not a corrupt candidate", () => {
+  assert.equal(classifySmokeFailure({ exitCode: null, signal: null }), "server-never-ready");
+  assert.equal(classifySmokeFailure({ spawnTimedOut: true }), "sqlite-probe-timed-out");
+  const timeoutMessage = smokeFailureMessage({
+    cause: "server-never-ready",
+    exitCode: null,
+    signal: null,
+    targetCommit: "b".repeat(40),
+  });
+  assert.match(timeoutMessage, /too busy/);
+  assert.match(timeoutMessage, /commit=b{12}\b/);
+  // The whole point: a starved host must not be reported as a broken build.
+  assert.doesNotMatch(timeoutMessage, /corrupt|invalid|bad build/i);
+});
+
+test("a candidate that exits or cannot spawn is named as a real failure", () => {
+  assert.equal(classifySmokeFailure({ exitCode: 1, signal: null }), "server-exited");
+  assert.equal(classifySmokeFailure({ exitCode: null, signal: "SIGSEGV" }), "server-killed-SIGSEGV");
+  assert.equal(classifySmokeFailure({ spawnError: new Error("ENOENT") }), "spawn-failed");
+  const exited = smokeFailureMessage({
+    cause: "server-exited",
+    exitCode: 1,
+    signal: null,
+    targetCommit: "b".repeat(40),
+    output: "Error: Cannot find package 'zod'",
+  });
+  assert.match(exited, /exited during boot/);
+  assert.match(exited, /exit=1/);
+  assert.match(exited, /Cannot find package/);
+  assert.match(smokeFailureMessage({ cause: "spawn-failed", spawnError: "EACCES", targetCommit: "b".repeat(40) }), /spawn=EACCES/);
+});
+
+test("candidate output is capped in the failure message", () => {
+  const message = smokeFailureMessage({
+    cause: "server-exited",
+    exitCode: 1,
+    targetCommit: "b".repeat(40),
+    output: "x".repeat(50_000),
+  });
+  assert.ok(message.length < 4_000, `message should stay small, got ${message.length}`);
+});
+
+const smokeOk = { ready: true, output: "", sqlite: { ok: true, timedOut: false, detail: null } };
+const smokeNeverReady = { ready: false, output: "", exitCode: null, signal: null };
+const smokeExited = { ready: false, output: "boom", exitCode: 1, signal: null };
+
+test("a candidate that starts and initializes SQLite passes without a retry", async () => {
+  let calls = 0;
+  const result = await runStagedSmokeTest({
+    builtBundle: "/stage/BotFleet.app",
+    targetCommit: "b".repeat(40),
+    smokeImpl: async () => {
+      calls += 1;
+      return smokeOk;
+    },
+  });
+  assert.deepEqual(result, { ok: true, attempts: 1 });
+  assert.equal(calls, 1);
+});
+
+test("a readiness timeout is retried once, and a second timeout is reported as a busy host", async () => {
+  let calls = 0;
+  const retries = [];
+  await assert.rejects(
+    runStagedSmokeTest({
+      builtBundle: "/stage/BotFleet.app",
+      targetCommit: "b".repeat(40),
+      smokeImpl: async () => {
+        calls += 1;
+        return smokeNeverReady;
+      },
+      onRetry: (event) => retries.push(event),
+    }),
+    /too busy/,
+  );
+  assert.equal(calls, 2, "exactly one retry, never a loop");
+  assert.deepEqual(retries, [{ attempt: 1, attempts: 2 }]);
+});
+
+test("a busy first attempt followed by a healthy candidate succeeds", async () => {
+  let calls = 0;
+  const result = await runStagedSmokeTest({
+    builtBundle: "/stage/BotFleet.app",
+    targetCommit: "b".repeat(40),
+    smokeImpl: async () => {
+      calls += 1;
+      return calls === 1 ? smokeNeverReady : smokeOk;
+    },
+  });
+  assert.deepEqual(result, { ok: true, attempts: 2 });
+  assert.equal(calls, 2);
+});
+
+test("a candidate that exits is never retried, because waiting cannot change the answer", async () => {
+  let calls = 0;
+  await assert.rejects(
+    runStagedSmokeTest({
+      builtBundle: "/stage/BotFleet.app",
+      targetCommit: "b".repeat(40),
+      smokeImpl: async () => {
+        calls += 1;
+        return smokeExited;
+      },
+    }),
+    /exited during boot/,
+  );
+  assert.equal(calls, 1);
+});
+
+test("a missing node:sqlite binding is a real failure, not a slow host", async () => {
+  let calls = 0;
+  await assert.rejects(
+    runStagedSmokeTest({
+      builtBundle: "/stage/BotFleet.app",
+      targetCommit: "b".repeat(40),
+      smokeImpl: async () => {
+        calls += 1;
+        return { ready: true, output: "", sqlite: { ok: false, timedOut: false, detail: "node:sqlite did not initialize (exit=1)" } };
+      },
+    }),
+    /node:sqlite did not initialize/,
+  );
+  assert.equal(calls, 1);
+});
+
+test("a probe-reported cause wins over the busy-host default", async () => {
+  // A live child that never reported readiness would normally classify as
+  // "too busy" and be retried.  When the probe knows better — the owner record
+  // named a different pid — that is a real defect, and saying "too busy" would
+  // send the operator after the wrong problem entirely.
+  let calls = 0;
+  await assert.rejects(
+    runStagedSmokeTest({
+      builtBundle: "/stage/BotFleet.app",
+      targetCommit: "b".repeat(40),
+      smokeImpl: async () => {
+        calls += 1;
+        return {
+          ready: false,
+          cause: "owner-mismatch",
+          output: "owner record pid 1 does not match the staged server pid 2",
+          exitCode: null,
+          signal: null,
+        };
+      },
+    }),
+    /owner record naming a different process/,
+  );
+  assert.equal(calls, 1, "a real defect must not be retried as a slow host");
+});
+
+test("only a well-formed health body establishes readiness", () => {
+  // `body?.ready !== false` accepts every one of these, because each is "not
+  // false" — including a truncated body, an HTML error page, and a bare `{}`.
+  // Any of them would have declared a candidate ready.
+  assert.equal(parseHealthBody({ app: "botfleet", ready: true }), true);
+  assert.equal(parseHealthBody({ app: "botfleet", ready: false }), false);
+  for (const body of [null, undefined, "ready", 42, [], {}, { ready: true }, { app: "botfleet" },
+    { app: "botfleet", ready: "true" }, { app: "botfleet", ready: 1 }]) {
+    assert.equal(parseHealthBody(body), false, `${JSON.stringify(body)} must not establish readiness`);
+  }
+});
+
+test("only an expected cancellation justifies packaging on this Mac", async () => {
+  // The real class: the check is an instanceof, so a stand-in would make the
+  // test pass for the wrong reason.
+
+  // The `auto` policy exists for "this commit was not built".  A build that
+  // actually FAILED is a signal — its signature gate, tests, or packaging step
+  // rejected the commit — and quietly building it locally for 15 minutes would
+  // turn a broken pipeline into a deceptively successful install.
+  // This used to construct a `ResolutionError("x")` and hand-assign `cause` and
+  // `conclusion` onto it — which is a restatement of the function's own body.
+  // It would still pass if ci-build-resolver.mjs were deleted outright, so it
+  // could not catch the bug it was written for: the resolver reporting
+  // "still running" while the consumer tests for "in_progress".
+  //
+  // So the error is produced by the RESOLVER, from a real workflow status, and
+  // the assertion is on the value the consumer actually reads — not on the
+  // prose, which is identical for "in_progress" and "still running".
+  const fromResolver = async (status, conclusion) => {
+    const fetchImpl = async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        workflow_runs: [{ id: 1, head_sha: COMMIT, status, conclusion, event: "push" }],
+      }),
+    });
+    try {
+      await downloadBuiltBundle({ commit: COMMIT, destination: "/tmp/unused-by-this-test", fetchImpl });
+    } catch (error) {
+      return error;
+    }
+    throw new Error(`expected the resolver to refuse a run with status=${status}`);
+  };
+
+  // Sanity: the run really is refused, with the cause the consumer branches on.
+  const stillRunning = await fromResolver("in_progress", null);
+  assert.equal(stillRunning.cause, "build-failed");
+  // THE BUG.  The prose says "still running"; the value is the raw status.
+  assert.equal(stillRunning.conclusion, "in_progress",
+    "the resolver must carry the raw workflow status, because the consumer compares against that literal");
+  assert.equal(isRecoverableResolutionFailure(stillRunning), true, "a build still running is worth a moment");
+
+  const cancelled = await fromResolver("completed", "cancelled");
+  assert.equal(cancelled.conclusion, "cancelled");
+  assert.equal(isRecoverableResolutionFailure(cancelled), true, "a superseded build is expected, not a failure");
+
+  const failed = await fromResolver("completed", "failure");
+  assert.equal(isRecoverableResolutionFailure(failed), false,
+    "a build that actually rejected the commit must surface, not fall back to a local package");
+  assert.equal(isRecoverableResolutionFailure(await fromResolver("completed", "timed_out")), false);
+
+  assert.equal(isRecoverableResolutionFailure(new ResolutionError("x", "no-build")), true,
+    "the commit predates the workflow");
+  for (const cause of ["network-failed", "network-timed-out", "rate-limited", "checksum-mismatch", "bad-manifest", "bad-response", "unauthorized", "pointer-lost"]) {
+    assert.equal(
+      isRecoverableResolutionFailure(new ResolutionError("x", cause)),
+      false,
+      `${cause} must surface rather than fall back`,
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// With no target named, the wrapper installs the newest commit with a green
+// hosted build instead of main's tip (whose build is usually still running or
+// was cancelled by the next push).  The selection itself is covered in
+// ci-build-resolver.node-test.mjs; these tests cover what the wrapper does with
+// an answer.
+// ---------------------------------------------------------------------------
+
+const wrapperOnly = { skip: process.platform === "win32" ? "the stable wrapper requires bash" : false };
+
+/**
+ * A remote whose main has two commits, each carrying its own stub updater
+ * ("older" and "tip") and a stand-in for ci-build-resolver.mjs whose answer the
+ * test dictates through the environment.  The wrapper runs the TIP's resolver,
+ * so the stand-in is identical in both.  The stub updater records the label of
+ * the commit it was archived from, its arguments, and the hand-off variable.
+ */
+async function newestGreenFixture(t, { resolver, receiptHelper = false } = {}) {
+  const fixture = await mkdtemp(join(tmpdir(), "ubf-newest-green-"));
+  t.after(() => rm(fixture, { recursive: true, force: true }));
+  const remote = join(fixture, "remote");
+  const checkout = join(fixture, "checkout");
+  const marker = join(fixture, "executed.json");
+  const selectLog = join(fixture, "selection.log");
+  await mkdir(remote, { recursive: true });
+  const git = (cwd, args) => run("git", ["-C", cwd, ...args]);
+  const fakeResolver = resolver ?? [
+    'import { appendFileSync } from "node:fs";',
+    "export async function selectUpdateTarget(options) {",
+    '  appendFileSync(process.env.UBF_SELECT_LOG, JSON.stringify({ checkout: options.checkout, appPath: options.appPath }) + "\\n");',
+    "  if (process.env.UBF_SELECT_THROW) throw new Error(process.env.UBF_SELECT_THROW);",
+    "  return { status: process.env.UBF_SELECT_STATUS, commit: process.env.UBF_SELECT_COMMIT, message: process.env.UBF_SELECT_MESSAGE };",
+    "}",
+    "",
+  ].join("\n");
+  const writeCommit = async (label) => {
+    for (const path of [
+      "scripts/update-botfleet-mac.mjs",
+      "scripts/mac-update-transaction.mjs",
+    "scripts/harness-release-store.mjs",
+    "scripts/release-provenance.mjs",
+      "scripts/ci-build-resolver.mjs",
+      "scripts/stage-entries.mjs",
+      "scripts/failed-install-retention.mjs",
+      "scripts/update-progress.mjs",
+      "electron/update-credential-preparation.mjs",
+      ...(receiptHelper ? ["electron/desktop-startup-receipt.mjs"] : []),
+    ]) {
+      await mkdir(dirname(join(remote, path)), { recursive: true });
+      let text = "// placeholder\n";
+      if (path.endsWith("update-botfleet-mac.mjs")) {
+        text = `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(marker)}, JSON.stringify({ label: ${JSON.stringify(label)}, args: process.argv.slice(2), hint: process.env.BOTFLEET_UPDATE_SELECTION_FAILURE ?? null }));\n`;
+        if (receiptHelper) text = `import { receiptMarker } from "../electron/desktop-startup-receipt.mjs";\nif (receiptMarker !== "present") throw new Error("Missing startup receipt helper");\n${text}`;
+      } else if (path.endsWith("ci-build-resolver.mjs")) {
+        text = fakeResolver;
+      } else if (path.endsWith("desktop-startup-receipt.mjs")) {
+        text = 'export const receiptMarker = "present";\n';
+      }
+      await writeFile(join(remote, path), text);
+    }
+  };
+  await git(fixture, ["init", "-b", "main", "remote"]);
+  await git(remote, ["config", "user.email", "test@example.com"]);
+  await git(remote, ["config", "user.name", "Test"]);
+  await writeCommit("older");
+  await git(remote, ["add", "."]);
+  await git(remote, ["commit", "-m", "older"]);
+  const older = (await git(remote, ["rev-parse", "HEAD"])).stdout.trim();
+  // A commit that never reached main, for the ancestry rule.
+  await git(remote, ["checkout", "-b", "evil"]);
+  await writeCommit("evil");
+  await git(remote, ["add", "."]);
+  await git(remote, ["commit", "-m", "evil"]);
+  const evil = (await git(remote, ["rev-parse", "HEAD"])).stdout.trim();
+  await git(remote, ["checkout", "main"]);
+  await writeCommit("tip");
+  await git(remote, ["add", "."]);
+  await git(remote, ["commit", "-m", "tip"]);
+  const tip = (await git(remote, ["rev-parse", "HEAD"])).stdout.trim();
+  await git(fixture, ["clone", "remote", "checkout"]);
+  const wrapper = join(scripts, "update-botfleet-policy.sh");
+  const invoke = async (args, env = {}) => {
+    await rm(marker, { force: true });
+    await rm(selectLog, { force: true });
+    const result = await run("bash", [wrapper, ...args], {
+      env: {
+        BOTFLEET_CHECKOUT: checkout,
+        BOTFLEET_FORCE: "1",
+        BOTFLEET_APP_PATH: join(fixture, "BotFleet.app"),
+        UBF_SELECT_LOG: selectLog,
+        UBF_SELECT_STATUS: "",
+        UBF_SELECT_COMMIT: "",
+        UBF_SELECT_MESSAGE: "",
+        UBF_SELECT_THROW: "",
+        BOTFLEET_UPDATE_TARGET: "",
+        BOTFLEET_UPDATE_SELECTION_FAILURE: "",
+        ...env,
+      },
+      allowFailure: true,
+    });
+    const executed = await readFile(marker, "utf8").then(JSON.parse, () => null);
+    const consulted = await readFile(selectLog, "utf8").then((text) => text.trim().split("\n").map((line) => JSON.parse(line)), () => []);
+    return { ...result, executed, consulted };
+  };
+  return { fixture, checkout, older, evil, tip, invoke };
+}
+
+test("the wrapper archives a current target's imported desktop startup receipt helper", wrapperOnly, async (t) => {
+  const { older, invoke } = await newestGreenFixture(t, { receiptHelper: true });
+  const result = await invoke(["--target", older]);
+  assert.equal(result.code, 0, result.stderr);
+  assert.deepEqual(result.executed, { label: "older", args: ["--target", older], hint: null });
+});
+
+test("with no target the wrapper installs the chosen commit, using that commit's own updater", wrapperOnly, async (t) => {
+  const { fixture, checkout, older, tip, invoke } = await newestGreenFixture(t);
+  const message = `Updating to ${older.slice(0, 12)} (main is 1 commit ahead; its build was cancelled)`;
+  const chosen = { UBF_SELECT_STATUS: "selected", UBF_SELECT_COMMIT: older, UBF_SELECT_MESSAGE: message };
+
+  const plain = await invoke([], chosen);
+  assert.equal(plain.code, 0, plain.stderr);
+  // The updater policy comes from the commit being installed, not from the tip.
+  assert.deepEqual(plain.executed, { label: "older", args: ["--target", older], hint: null });
+  assert.match(plain.stdout, new RegExp(escapeRegExp(message)));
+  assert.notEqual(older, tip);
+  // The selection saw this checkout and this app, not defaults.
+  assert.deepEqual(plain.consulted, [{ checkout, appPath: join(fixture, "BotFleet.app") }]);
+
+  const prepare = await invoke(["prepare"], chosen);
+  assert.deepEqual(prepare.executed, { label: "older", args: ["prepare", "--target", older], hint: null });
+
+  // The harness's detached run: its flags are forwarded untouched, ahead of the pin.
+  const progress = join(fixture, "run.json");
+  const detached = await invoke(["--progress", progress, "--run-id", "run_one"], chosen);
+  assert.deepEqual(detached.executed, {
+    label: "older",
+    args: ["--progress", progress, "--run-id", "run_one", "--target", older],
+    hint: null,
+  });
+});
+
+test("when nothing newer is green the explanation reaches the tip's updater, which fails with it", wrapperOnly, async (t) => {
+  const { tip, invoke } = await newestGreenFixture(t);
+  const message = "No newer hosted build to install.  The installed build is 111111111111.  Main is at 222222222222, 2 commits ahead, and its build is still running.";
+  const result = await invoke([], { UBF_SELECT_STATUS: "none", UBF_SELECT_MESSAGE: message });
+  assert.equal(result.code, 0, result.stderr);
+  // The wrapper does not end the run itself: a run that ends in the wrapper
+  // writes no progress record, and the harness reports it as never started.
+  assert.deepEqual(result.executed, { label: "tip", args: ["--target", tip], hint: message });
+});
+
+test("any doubt in the selection installs main's tip exactly as before", wrapperOnly, async (t) => {
+  const { tip, older, invoke } = await newestGreenFixture(t);
+  const expected = { label: "tip", args: ["--target", tip], hint: null };
+  for (const [label, env] of [
+    ["skip", { UBF_SELECT_STATUS: "skip", UBF_SELECT_MESSAGE: "the installed build is already main's tip" }],
+    ["an unknown status", { UBF_SELECT_STATUS: "banana", UBF_SELECT_COMMIT: older }],
+    ["a selection with no commit", { UBF_SELECT_STATUS: "selected", UBF_SELECT_MESSAGE: "Updating to nothing" }],
+    ["a selection naming something that is not a full commit", { UBF_SELECT_STATUS: "selected", UBF_SELECT_COMMIT: "abc1234" }],
+  ]) {
+    const result = await invoke([], env);
+    assert.equal(result.code, 0, `${label}: ${result.stderr}`);
+    assert.deepEqual(result.executed, expected, label);
+    assert.doesNotMatch(result.stdout, /Updating to/, label);
+  }
+
+  // A lookup that blows up is a warning, and the update goes on with the tip.
+  const thrown = await invoke([], { UBF_SELECT_THROW: "GitHub is unreachable" });
+  assert.equal(thrown.code, 0, thrown.stderr);
+  assert.deepEqual(thrown.executed, expected);
+  assert.match(thrown.stderr, /WARNING:.*Could not choose among the hosted builds \(GitHub is unreachable\)\..*origin\/main's tip/);
+});
+
+test("a resolver that predates the selection is skipped without a word", wrapperOnly, async (t) => {
+  const { tip, invoke } = await newestGreenFixture(t, { resolver: "// placeholder\n" });
+  const result = await invoke([]);
+  assert.equal(result.code, 0, result.stderr);
+  assert.deepEqual(result.executed, { label: "tip", args: ["--target", tip], hint: null });
+  assert.doesNotMatch(result.stderr, /WARNING/);
+  assert.deepEqual(result.consulted, []);
+});
+
+test("an explicit target, apply, unquiesce and imported sources are never second-guessed", wrapperOnly, async (t) => {
+  const { fixture, older, tip, invoke } = await newestGreenFixture(t);
+  const stage = join(fixture, "stage");
+  await mkdir(stage, { recursive: true });
+  await writeFile(join(stage, "prepared.json"), JSON.stringify({ sourceCommit: tip }));
+  // A selection that would change every one of these if it were consulted.
+  const tempting = { UBF_SELECT_STATUS: "selected", UBF_SELECT_COMMIT: older, UBF_SELECT_MESSAGE: "Updating to the wrong commit" };
+  for (const { args, env = {}, expected } of [
+    { args: ["--target", "origin/main"], expected: { label: "tip", args: ["--target", tip], hint: null } },
+    { args: ["--target=origin/main"], expected: { label: "tip", args: ["--target", tip], hint: null } },
+    { args: ["--target", tip], expected: { label: "tip", args: ["--target", tip], hint: null } },
+    { args: ["--target", "origin/main~1"], expected: { label: "older", args: ["--target", older], hint: null } },
+    { args: [], env: { BOTFLEET_UPDATE_TARGET: "origin/main" }, expected: { label: "tip", args: ["--target", tip], hint: null } },
+    { args: [], env: { BOTFLEET_UPDATE_TARGET: "origin/main~1" }, expected: { label: "older", args: ["--target", older], hint: null } },
+    { args: ["unquiesce"], expected: { label: "tip", args: ["unquiesce"], hint: null } },
+    { args: ["status"], expected: { label: "tip", args: ["status"], hint: null } },
+    { args: ["recover"], expected: { label: "tip", args: ["recover"], hint: null } },
+    { args: ["apply", "--stage", stage], expected: { label: "tip", args: ["apply", "--stage", stage], hint: null } },
+    { args: ["--source", fixture], expected: { label: "tip", args: ["--source", fixture, "--target", tip], hint: null } },
+    { args: ["--help"], expected: { label: "tip", args: ["--help", "--target", tip], hint: null } },
+  ]) {
+    const label = `${JSON.stringify(args)} ${JSON.stringify(env)}`;
+    const result = await invoke(args, { ...tempting, ...env });
+    assert.equal(result.code, 0, `${label}: ${result.stderr}`);
+    assert.deepEqual(result.consulted, [], `${label} must not consult the selection`);
+    assert.deepEqual(result.executed, expected, label);
+    assert.doesNotMatch(result.stdout, /Updating to the wrong commit/, label);
+  }
+});
+
+test("a chosen commit that is not on origin/main is refused before any of its code runs", wrapperOnly, async (t) => {
+  const { evil, invoke } = await newestGreenFixture(t);
+  const result = await invoke([], { UBF_SELECT_STATUS: "selected", UBF_SELECT_COMMIT: evil, UBF_SELECT_MESSAGE: "Updating to evil" });
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /not reachable from origin\/main/);
+  assert.equal(result.executed, null, "no archived updater code ran");
+});
+
+test("an explanation left in the caller's environment is not believed", wrapperOnly, async (t) => {
+  const { tip, invoke } = await newestGreenFixture(t);
+  const result = await invoke([], {
+    BOTFLEET_UPDATE_SELECTION_FAILURE: "No newer hosted build to install.  (planted)",
+    UBF_SELECT_STATUS: "skip",
+  });
+  assert.deepEqual(result.executed, { label: "tip", args: ["--target", tip], hint: null });
+});
+
+test("the selection runs after the tip is fetched and before anything is archived for execution", async () => {
+  const source = (await readFile(join(scripts, "update-botfleet-policy.sh"), "utf8")).replace(/\r\n/g, "\n");
+  const bootstrapDir = source.indexOf('BOOTSTRAP_DIR="$(mktemp -d');
+  const selection = source.indexOf('SELECT_NEWEST_GREEN=0');
+  const tipFetch = source.indexOf('fetch --quiet origin main 2>/dev/null; then\n      SELECT_TIP');
+  const resolverArchive = source.indexOf('show "$SELECT_TIP:scripts/ci-build-resolver.mjs"');
+  const chosen = source.indexOf('BOOTSTRAP_REF="$SELECTION_COMMIT"');
+  const fetch = source.indexOf('git -C "$BOTFLEET_CHECKOUT" fetch --quiet origin "$BOOTSTRAP_FETCH_REF"');
+  const ancestry = source.indexOf('merge-base --is-ancestor "$BOOTSTRAP_COMMIT" origin/main');
+  const archive = source.indexOf('git -C "$BOTFLEET_CHECKOUT" archive "$BOOTSTRAP_COMMIT"');
+  assert.ok(bootstrapDir >= 0 && selection > bootstrapDir, "the scratch directory exists before the resolver is archived into it");
+  assert.ok(tipFetch > selection && resolverArchive > tipFetch, "the tip is refreshed before its resolver is read");
+  assert.ok(chosen > resolverArchive && chosen < fetch, "the choice replaces the ref before it is fetched, resolved and checked");
+  assert.ok(ancestry > chosen && archive > ancestry, "a chosen commit meets the same origin/main ancestry rule before its updater is archived");
+  // Only a plain update or prepare with no target of any kind is eligible.
+  assert.match(source, /if \[\[ "\$HAS_BOOTSTRAP_TARGET" == "0" && -z "\$\{BOTFLEET_UPDATE_TARGET:-\}" \]\]; then/);
+  assert.match(source, /apply\|unquiesce\|status\|recover\) ;;/);
+  // Nothing new is passed to the updater as an argument: the chosen commit may
+  // predate this feature, and an unknown option would stop it.
+  assert.doesNotMatch(source, /PINNED_ARGS\+=\(--(?!target)/);
+});
+
+test("the updater hands the wrapper's explanation back as a failure the progress record keeps", { skip: process.platform === "win32" ? "the updater reads the POSIX user id (process.getuid) when it builds its configuration" : false }, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "botfleet-no-green-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const progressPath = join(root, "run.json");
+  const explanation = "No newer hosted build to install.  The installed build is 111111111111.  Main is at 222222222222, 2 commits ahead, and its build is still running.";
+  const scratch = {
+    BOTFLEET_UPDATE_ALLOW_NON_DARWIN: "1",
+    BOTFLEET_CHECKOUT: join(root, "checkout"),
+    BOTFLEET_APP_PATH: join(root, "BotFleet.app"),
+    BOTFLEET_DATA_DIR: join(root, "data"),
+    BOTFLEET_UPDATE_LOCK: join(root, "update.lock"),
+    BOTFLEET_UPDATE_ROOT: join(root, "updates"),
+    BOTFLEET_UPDATE_SELECTION_FAILURE: explanation,
+  };
+  const restore = Object.fromEntries(Object.keys(scratch).map((key) => [key, process.env[key]]));
+  Object.assign(process.env, scratch);
+  t.after(() => {
+    for (const [key, value] of Object.entries(restore)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  });
+
+  await assert.rejects(
+    main(["update", "--progress", progressPath, "--run-id", "run_none", "--target", "2".repeat(40)]),
+    (error) => {
+      assert.ok(error instanceof ResolutionError);
+      assert.equal(error.cause, "no-green-build");
+      assert.equal(error.message, explanation);
+      return true;
+    },
+  );
+  const record = JSON.parse(await readFile(progressPath, "utf8"));
+  assert.equal(record.runId, "run_none");
+  assert.equal(record.outcome, "failed");
+  assert.equal(record.message, explanation, "the harness, the desktop app and the phone read this line");
+  assert.equal(record.steps.at(-1).name, "resolveTarget");
+  assert.equal(record.steps.at(-1).ok, false);
+  assert.ok(!record.steps.some((step) => step.name === "prepareSource"), "nothing was staged");
+});
+
+test("resolveTarget raises the wrapper's explanation before it touches git", async () => {
+  const source = await readFile(join(scripts, "update-botfleet-mac.mjs"), "utf8");
+  const resolveTarget = source.indexOf("resolveTarget: async (plan) => {");
+  const body = source.slice(resolveTarget, source.indexOf("prepareSource:", resolveTarget));
+  const hint = body.indexOf("BOTFLEET_UPDATE_SELECTION_FAILURE");
+  assert.ok(hint > 0, "resolveTarget reads the hand-off variable");
+  assert.ok(hint < body.indexOf('["fetch", "origin", "main"]'), "the explanation is raised before any fetch");
+  assert.match(body, /new ResolutionError\(nothingNewer, "no-green-build"\)/);
+});
+
+test("the selection gives up long before the harness decides a run never started", async () => {
+  // The selection runs before the updater writes its first progress record.  The
+  // harness settles a run with no record after LAUNCH_GRACE_MS and removes its
+  // launchd job, so a slow GitHub must not be able to outlast that.
+  const control = await readFile(join(scripts, "..", "server/update-control.ts"), "utf8");
+  const grace = Number(/const LAUNCH_GRACE_MS = ([\d_]+)/.exec(control)?.[1]?.replaceAll("_", ""));
+  assert.ok(grace > 0, "the harness's launch grace is still where this test looks for it");
+
+  const wrapper = (await readFile(join(scripts, "update-botfleet-policy.sh"), "utf8")).replace(/\r\n/g, "\n");
+  const watchdog = Number(/\}, (\d+)\);\n\s+try \{/.exec(wrapper)?.[1]);
+  assert.ok(watchdog > 0 && watchdog <= grace / 2, `the wrapper's watchdog (${watchdog}ms) must be at most half of ${grace}ms`);
+
+  const resolver = await readFile(join(scripts, "ci-build-resolver.mjs"), "utf8");
+  const selection = resolver.slice(resolver.indexOf("Choosing WHICH commit to install"));
+  const requests = selection.match(/requestJson\(/g)?.length ?? 0;
+  const bounded = selection.match(/timeoutMs: SELECTION_REQUEST_TIMEOUT_MS/g)?.length ?? 0;
+  assert.ok(requests >= 3, "the selection still makes its Actions requests");
+  assert.equal(bounded, requests, "every Actions request the selection makes carries the short timeout");
+  assert.match(selection, /const SELECTION_REQUEST_TIMEOUT_MS = 10_000;/);
+});
+
+// ---------------------------------------------------------------------------
+// A slow boot is not a failure.  On 2026-10-09 a good build was rolled back
+// because the new harness logged "booting" and was still working through its
+// start-up when the old 90-second window closed (load averages of 150 to 900),
+// and the restored build then needed about two minutes of its own.
+// ---------------------------------------------------------------------------
+
+function fakeClock() {
+  let time = 0;
+  return { now: () => time, wait: async (ms) => { time += ms; }, at: () => time };
+}
+
+const notYet = { safe: false, reason: "Authenticated runtime readiness could not be verified" };
+
+test("the start-up wait is long by default and still overridable", async () => {
+  assert.ok(DEFAULT_STARTUP_TIMEOUT_MS >= 10 * 60_000 && DEFAULT_STARTUP_TIMEOUT_MS <= 15 * 60_000,
+    "a slow boot under load gets 10 to 15 minutes");
+  const source = await readFile(join(scripts, "update-botfleet-mac.mjs"), "utf8");
+  assert.match(source, /startupTimeoutMs: environmentMs\("BOTFLEET_STARTUP_TIMEOUT_MS", DEFAULT_STARTUP_TIMEOUT_MS\)/);
+  assert.doesNotMatch(source, /BOTFLEET_STARTUP_TIMEOUT_MS \|\| 90_000/);
+  // Both waits that follow a start go through the shared wait, so neither can
+  // quietly keep a fixed window of its own.
+  const verify = source.indexOf("verifyHarness: async");
+  assert.match(source.slice(verify, source.indexOf("startApplication:", verify)), /waitForStartup\(/);
+  const restored = source.indexOf("Restored BotFleet runtime did not regain safe single ownership");
+  assert.match(source.slice(restored - 900, restored), /waitForStartup\(/);
+});
+
+const OWN_APP_PID = [4242];
+
+test("an app that never produces a process times out with the timeout message, not a pid-stability one", async () => {
+  const clock = fakeClock();
+  await assert.rejects(
+    waitForStableApplication({
+      samplePids: async () => [],
+      attachmentError: async () => { throw new Error("nothing to attach to"); },
+      timeoutMs: 5 * 60_000,
+      now: clock.now,
+      wait: clock.wait,
+    }),
+    (error) => error.message === "Timeout waiting for application to stabilize",
+  );
+  assert.ok(clock.at() >= 5 * 60_000, "a slow launch is waited out for the whole window");
+});
+
+test("an app that starts late, settles to one process and attaches passes", async () => {
+  const clock = fakeClock();
+  const reports = [];
+  await waitForStableApplication({
+    samplePids: async () => (clock.at() >= 3 * 60_000 ? OWN_APP_PID : []),
+    attachmentError: async () => null,
+    timeoutMs: DEFAULT_STARTUP_TIMEOUT_MS,
+    report: (line) => reports.push(line),
+    now: clock.now,
+    wait: clock.wait,
+  });
+  assert.ok(clock.at() >= 3 * 60_000 && clock.at() < 4 * 60_000);
+  assert.deepEqual(reports, [
+    "Waiting for the app to start, 1 min so far",
+    "Waiting for the app to start, 2 min so far",
+    "Waiting for the app to start, 3 min so far",
+  ]);
+});
+
+test("an app that was running and vanished fails at once, and an unstable one reports its pids", async () => {
+  const gone = fakeClock();
+  await assert.rejects(
+    waitForStableApplication({
+      samplePids: async () => (gone.at() < 3_000 ? OWN_APP_PID : []),
+      attachmentError: async () => "not attached yet",
+      timeoutMs: DEFAULT_STARTUP_TIMEOUT_MS,
+      now: gone.now,
+      wait: gone.wait,
+    }),
+    (error) => error.message === "The updated application exited after it had started",
+  );
+  assert.ok(gone.at() < 10_000, `failed after ${gone.at()}ms`);
+
+  const unstable = fakeClock();
+  await assert.rejects(
+    waitForStableApplication({
+      samplePids: async () => [1, 2],
+      attachmentError: async () => null,
+      timeoutMs: 10_000,
+      now: unstable.now,
+      wait: unstable.wait,
+    }),
+    (error) => /did not remain running as one exact installed-bundle process/.test(error.message),
+  );
+
+  // Running and stable but never attaching ends with the attachment reason.
+  const detached = fakeClock();
+  await assert.rejects(
+    waitForStableApplication({
+      samplePids: async () => OWN_APP_PID,
+      attachmentError: async () => "Updated application did not attach to the authenticated single data owner",
+      timeoutMs: 10_000,
+      now: detached.now,
+      wait: detached.wait,
+    }),
+    (error) => error.message === "Updated application did not attach to the authenticated single data owner",
+  );
+});
+
+test("a slow but successful boot passes, and says how long it has been waiting", async () => {
+  const clock = fakeClock();
+  const reports = [];
+  const snapshot = await waitForStartup({
+    attempt: async () => (clock.at() >= 4 * 60_000 ? { safe: true, mode: "authenticated" } : notYet),
+    crashed: async () => null,
+    timeoutMs: DEFAULT_STARTUP_TIMEOUT_MS,
+    what: "the new version",
+    fallback: "never reached",
+    report: (line) => reports.push(line),
+    now: clock.now,
+    wait: clock.wait,
+  });
+  assert.equal(snapshot.safe, true);
+  assert.ok(clock.at() >= 4 * 60_000 && clock.at() < 5 * 60_000, `waited ${clock.at()}ms`);
+  assert.deepEqual(reports, [
+    "Waiting for the new version to start, 1 min so far",
+    "Waiting for the new version to start, 2 min so far",
+    "Waiting for the new version to start, 3 min so far",
+  ]);
+});
+
+test("a boot that crashed fails promptly with the reason, not after the whole window", async () => {
+  const clock = fakeClock();
+  let asked = 0;
+  await assert.rejects(
+    waitForStartup({
+      attempt: async () => ({ safe: false, reason: "BotFleet harness (pid 4242) is not running" }),
+      crashed: async () => (++asked >= 3 ? "launchd job app.botfleet.server: its process exited with code 1" : null),
+      timeoutMs: DEFAULT_STARTUP_TIMEOUT_MS,
+      what: "the new version",
+      fallback: "never reached",
+      now: clock.now,
+      wait: clock.wait,
+    }),
+    (error) => {
+      assert.match(error.message, /^The new version stopped before it was ready: launchd job app\.botfleet\.server: its process exited with code 1\./);
+      assert.match(error.message, /Last check: BotFleet harness \(pid 4242\) is not running/);
+      return true;
+    },
+  );
+  assert.ok(clock.at() < 5_000, `failed after ${clock.at()}ms, not after ${DEFAULT_STARTUP_TIMEOUT_MS}ms`);
+});
+
+test("a build that came up is never called crashed, and a boot that never finishes ends at the deadline", async () => {
+  const clock = fakeClock();
+  const up = await waitForStartup({
+    attempt: async () => ({ safe: true }),
+    crashed: async () => { throw new Error("must not be asked once the build is up"); },
+    timeoutMs: 1_000,
+    what: "the new version",
+    fallback: "never reached",
+    now: clock.now,
+    wait: clock.wait,
+  });
+  assert.equal(up.safe, true);
+
+  const late = fakeClock();
+  await assert.rejects(
+    waitForStartup({
+      attempt: async () => notYet,
+      timeoutMs: 120_000,
+      what: "the restored version",
+      fallback: "never reached",
+      now: late.now,
+      wait: late.wait,
+    }),
+    (error) => error.message === notYet.reason,
+  );
+  assert.equal(late.at(), 120_000, "the wait runs to the deadline and no further");
+});
+
+test("progress is quiet for the first minute and then reports once a minute", () => {
+  const clock = fakeClock();
+  const lines = [];
+  const tick = startupProgress("the app", { report: (line) => lines.push(line), now: clock.now });
+  // Elapsed: 0:30 (quiet), 1:00 (1 min), 1:59 (quiet), 2:00 (2 min), 3:00 (3 min).
+  // wait() is async but synchronous in effect for this clock.
+  for (const step of [30_000, 30_000, 59_000, 1_000, 60_000]) {
+    clock.wait(step);
+    tick();
+  }
+  assert.deepEqual(lines, [
+    "Waiting for the app to start, 1 min so far",
+    "Waiting for the app to start, 2 min so far",
+    "Waiting for the app to start, 3 min so far",
+  ]);
+});
+
+const LAUNCHD_RUNNING = `gui/501/app.botfleet.server = {
+\tactive count = 4
+\tpath = /Users/jay/Library/LaunchAgents/app.botfleet.server.plist
+\ttype = LaunchAgent
+\tstate = running
+
+\tprogram = /bin/bash
+\trun interval = 0 seconds
+\truns = 1
+\tpid = 62210
+\tlast exit code = (never exited)
+
+\tevent triggers = {
+\t}
+\tsubmitted by = launchd
+\tproperties = runatload | inferred program
+}`;
+
+test("only a launchd job that has exited counts as a crash; one that is still booting does not", async () => {
+  assert.deepEqual(parseLaunchdJob(LAUNCHD_RUNNING), { state: "running", runs: 1, lastExit: "(never exited)", signal: undefined });
+  assert.equal(describeLaunchdExit(parseLaunchdJob(LAUNCHD_RUNNING)), null);
+
+  const exited = LAUNCHD_RUNNING.replace("state = running", "state = not running").replace("(never exited)", "1").replace("\tpid = 62210\n", "");
+  assert.equal(describeLaunchdExit(parseLaunchdJob(exited)), "its process exited with code 1");
+
+  const signalled = `${LAUNCHD_RUNNING.replace("(never exited)", "9")}\n\tlast terminating signal = Segmentation fault: 11`;
+  assert.match(describeLaunchdExit(parseLaunchdJob(signalled)), /killed by a signal \(Segmentation fault: 11\)/);
+
+  const zeroSignal = `${LAUNCHD_RUNNING}\n\tlast terminating signal = 0\n`;
+  assert.equal(describeLaunchdExit(parseLaunchdJob(zeroSignal)), null,
+    "signal 0 is launchd's no-signal sentinel, not a crash; the trailing newline must be trimmed");
+
+  const restarted = LAUNCHD_RUNNING.replace("runs = 1", "runs = 3");
+  assert.equal(describeLaunchdExit(parseLaunchdJob(restarted)), "launchd has had to start it 3 times");
+
+  const prints = { "app.botfleet.server": { code: 0, stdout: exited }, "com.jay.botfleet-server": { code: 113, stdout: "" } };
+  const print = async (label) => prints[label];
+  assert.equal(
+    await launchdExitReason(["com.jay.botfleet-server", "app.botfleet.server"], { print }),
+    "launchd job app.botfleet.server: its process exited with code 1",
+    "a label launchd does not know is skipped, not a crash",
+  );
+  assert.equal(
+    await launchdExitReason(["app.botfleet.server"], { print: async () => ({ code: 0, stdout: LAUNCHD_RUNNING }) }),
+    null,
+  );
+  assert.equal(await launchdExitReason(["app.botfleet.server"], { print: async () => ({ code: 1, stdout: "" }) }), null,
+    "a print that fails says nothing; the timeout is the backstop");
+});
+
+test("isMacSystemBundleInspector recognizes /System/Library/ XPC services like ThemeWidgetControlViewService", () => {
+  assert.equal(
+    isMacSystemBundleInspector(
+      "/System/Library/Frameworks/AppKit.framework/Versions/C/XPCServices/ThemeWidgetControlViewService.xpc/Contents/MacOS/ThemeWidgetControlViewService",
+    ),
+    true,
+  );
+  assert.equal(isMacSystemBundleInspector("/Applications/BotFleet.app/Contents/MacOS/BotFleet"), false);
+  assert.equal(isMacSystemBundleInspector("/usr/libexec/unrelated-daemon"), false);
+  assert.equal(isMacSystemBundleInspector(""), false);
+});
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+
+// --- Release-store provenance in the update path ------------------------------
+//
+// A store-backed harness cannot always prove its own identity (its runtime
+// predates release reporting, or it could not verify itself at boot).  The
+// updater then proves it EXTERNALLY: the owner process's real root must be a
+// manifest-bound release whose bytes verify against the commit's git objects.
+
+function makeStoreFixture(t) {
+  return mkdtemp(join(tmpdir(), "botfleet-store-preflight-")).then(async (home) => {
+    t.after(() => rm(home, { recursive: true, force: true }));
+    return { home, config: { home, checkout: join(home, "checkout") } };
+  });
+}
+
+const COMMIT_A = "a".repeat(40);
+const COMMIT_B = "b".repeat(40);
+
+async function makeRelease(home, commit, files = { "package.json": '{"name":"botfleet","version":"1.0.31"}' }) {
+  const root = join(home, ".botfleet", "releases", commit);
+  await mkdir(root, { recursive: true });
+  for (const [name, content] of Object.entries(files)) await writeFile(join(root, name), content);
+  await writeFile(join(root, ".botfleet-release.json"), JSON.stringify({
+    schemaVersion: 1, commit, promotedAt: "2026-11-03T00:00:00.000Z",
+  }));
+  return root;
+}
+
+test("storeHarnessState follows the launcher's root order: override, pointer, checkout", async (t) => {
+  const { home, config } = await makeStoreFixture(t);
+  assert.equal((await storeHarnessState(config)).mode, "checkout", "no pointer is a checkout-backed host");
+  const root = await makeRelease(home, COMMIT_A);
+  await symlink(root, join(home, ".botfleet", "current"));
+  assert.equal((await storeHarnessState(config)).mode, "release", "a pointer makes the host store-backed");
+  const override = process.env.BOTFLEET_SERVER_ROOT;
+  process.env.BOTFLEET_SERVER_ROOT = join(home, "elsewhere");
+  try {
+    assert.equal((await storeHarnessState(config)).mode, "checkout", "BOTFLEET_SERVER_ROOT overrides the pointer, as in the launcher");
+  } finally {
+    if (override === undefined) delete process.env.BOTFLEET_SERVER_ROOT;
+    else process.env.BOTFLEET_SERVER_ROOT = override;
+  }
+});
+
+async function makeCaptureFixture(t) {
+  const { home, config } = await makeStoreFixture(t);
+  config.parsed = {};
+  config.appPath = join(home, "BotFleet.app");
+  await mkdir(config.checkout, { recursive: true });
+  const git = (...args) => execFileSync("git", ["-C", config.checkout, ...args], { stdio: "pipe" });
+  git("init", "-q", "-b", "main");
+  git("config", "user.email", "test@example.invalid");
+  git("config", "user.name", "Test");
+  await writeFile(join(config.checkout, "file.txt"), "x\n");
+  git("add", "-A");
+  git("commit", "-q", "-m", "init");
+  return { home, config };
+}
+
+test("capturePrevious refuses a store-backed host whose release pointer is unresolvable", async (t) => {
+  const { home, config } = await makeCaptureFixture(t);
+  // A dangling pointer still lstat()s, so the host reads as store-backed, but
+  // no commit can be resolved from it.  Capturing nothing here would let a
+  // later rollback restore the checkout while the failed release kept serving.
+  await mkdir(join(home, ".botfleet"), { recursive: true });
+  await symlink(join(home, ".botfleet", "releases", "g".repeat(40)), join(home, ".botfleet", "current"));
+  await assert.rejects(
+    () => createOperations(config).capturePrevious({ stageDirectory: join(home, "stage") }),
+    /pointer is present but unresolvable/,
+  );
+});
+
+test("capturePrevious accepts a resolvable release pointer and a checkout-backed host", async (t) => {
+  const { home, config } = await makeCaptureFixture(t);
+  const ops = createOperations(config);
+  // No pointer: checkout-backed, nothing to restore - the capture proceeds
+  // past the pointer guard and refuses only on the missing fixture app.
+  await assert.rejects(
+    () => ops.capturePrevious({ stageDirectory: join(home, "stage") }),
+    /Installed BotFleet app is missing/,
+  );
+  // A manifest-bound release the pointer resolves to: also past the guard.
+  const root = await makeRelease(home, COMMIT_A);
+  await symlink(root, join(home, ".botfleet", "current"));
+  await assert.rejects(
+    () => ops.capturePrevious({ stageDirectory: join(home, "stage") }),
+    /Installed BotFleet app is missing/,
+  );
+});
+
+test("clearStoreIdentityError only ever clears the two identity refusals", async (t) => {
+  const { config } = await makeStoreFixture(t);
+  const runtime = { version: "1.0.31", apiVersion: 1, uiHash: null };
+  assert.equal(
+    await clearStoreIdentityError(config, { pid: 1 }, runtime, null, "Authenticated runtime identity does not match the data owner"),
+    "Authenticated runtime identity does not match the data owner",
+    "an ownership failure is never overridden",
+  );
+  assert.equal(
+    await clearStoreIdentityError(config, { pid: 1 }, runtime, null, "3 active operations prevent update"),
+    "3 active operations prevent update",
+    "work in flight is never overridden",
+  );
+});
+
+test("clearStoreIdentityError leaves checkout-backed hosts on the original refusal", async (t) => {
+  const { config } = await makeStoreFixture(t);
+  const refusal = "Authenticated runtime reports a dirty or unknown source checkout";
+  assert.equal(await clearStoreIdentityError(config, { pid: 1 }, {}, null, refusal), refusal);
+});
+
+test("clearStoreIdentityError refuses a harness that is not running from a bound release", async (t) => {
+  const { home, config } = await makeStoreFixture(t);
+  const root = await makeRelease(home, COMMIT_A);
+  await symlink(root, join(home, ".botfleet", "current"));
+  const refusal = await clearStoreIdentityError(
+    config, { pid: 4242 }, {}, null,
+    "Authenticated runtime reports a dirty or unknown source checkout", {},
+    { runningRoot: () => join(home, "somewhere-else") },
+  );
+  assert.match(refusal, /not a manifest-bound store release/);
+});
+
+test("clearStoreIdentityError clears a byte-verified running release, with the manifest's commit as truth", async (t) => {
+  const { home, config } = await makeStoreFixture(t);
+  const root = await makeRelease(home, COMMIT_A);
+  await symlink(root, join(home, ".botfleet", "current"));
+  const runtime = { version: "1.0.31", apiVersion: 1, uiHash: null };
+  const cleared = await clearStoreIdentityError(
+    config, { pid: 4242 }, runtime, null,
+    "Authenticated runtime did not report an exact source commit", {},
+    { runningRoot: () => root, verify: () => ({ ok: true, checked: 2, dependencies: "verified" }) },
+  );
+  assert.equal(cleared, null, "externally verified bytes clear the self-report refusal");
+});
+
+test("clearStoreIdentityError turns drift into a refusal that says what moved", async (t) => {
+  const { home, config } = await makeStoreFixture(t);
+  const root = await makeRelease(home, COMMIT_A);
+  await symlink(root, join(home, ".botfleet", "current"));
+  const refusal = await clearStoreIdentityError(
+    config, { pid: 4242 }, {}, null,
+    "Authenticated runtime reports a dirty or unknown source checkout", {},
+    { runningRoot: () => root, verify: () => ({ ok: false, reason: "drift", detail: "1 modified (server/index.ts)" }) },
+  );
+  assert.match(refusal, /not the commit it names/);
+  assert.match(refusal, /server\/index\.ts/);
+});
+
+test("clearStoreIdentityError enforces the prepared commit and build on a verified release", async (t) => {
+  const { home, config } = await makeStoreFixture(t);
+  const root = await makeRelease(home, COMMIT_A);
+  await symlink(root, join(home, ".botfleet", "current"));
+  const adapters = { runningRoot: () => root, verify: () => ({ ok: true, checked: 2, dependencies: "verified" }) };
+  const runtime = { version: "1.0.31", apiVersion: 1, uiHash: null };
+  const prepared = { targetCommit: COMMIT_A, version: "1.0.31", apiVersion: 1, uiHash: null };
+  assert.equal(
+    await clearStoreIdentityError(config, { pid: 4242 }, runtime, prepared,
+      "Authenticated runtime reports a dirty or unknown source checkout", {}, adapters),
+    null,
+    "a verified release at the prepared commit and build clears",
+  );
+  const wrongCommit = await clearStoreIdentityError(config, { pid: 4242 }, runtime,
+    { ...prepared, targetCommit: COMMIT_B },
+    "Authenticated runtime reports a dirty or unknown source checkout", {}, adapters);
+  assert.match(wrongCommit, new RegExp(`running ${COMMIT_A.slice(0, 12)}, expected ${COMMIT_B.slice(0, 12)}`));
+  const wrongVersion = await clearStoreIdentityError(config, { pid: 4242 }, { ...runtime, version: "1.0.30" }, prepared,
+    "Authenticated runtime reports a dirty or unknown source checkout", {}, adapters);
+  assert.match(wrongVersion, /does not match the prepared application build/);
+});
+
+test("clearStoreIdentityError runs the real byte verification against a real repository", async (t) => {
+  // No injected verifier: the release on disk must hash equal to the commit's
+  // tree objects, which is the property the whole design rests on.
+  const home = await mkdtemp(join(tmpdir(), "botfleet-store-real-"));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const repo = join(home, "checkout");
+  await mkdir(repo, { recursive: true });
+  const git = (...args) => run("git", ["-C", repo, ...args]);
+  await git("init", "-q", "-b", "main");
+  await git("config", "user.email", "test@example.invalid");
+  await git("config", "user.name", "Test");
+  await writeFile(join(repo, "package.json"), '{"name":"botfleet","version":"1.0.31"}\n');
+  await git("add", "-A");
+  await git("commit", "-q", "-m", "tree");
+  const commit = (await git("rev-parse", "HEAD")).stdout.trim();
+  const root = join(home, ".botfleet", "releases", commit);
+  await mkdir(join(home, ".botfleet", "releases"), { recursive: true });
+  await run("git", ["-C", repo, "archive", "--format=tar", "--output", join(home, "tree.tar"), commit]);
+  await mkdir(root, { recursive: true });
+  await run("tar", ["-xf", join(home, "tree.tar"), "-C", root]);
+  await writeFile(join(root, ".botfleet-release.json"), JSON.stringify({
+    schemaVersion: 1, commit, promotedAt: "2026-11-03T00:00:00.000Z",
+  }));
+  await symlink(root, join(home, ".botfleet", "current"));
+  const config = { home, checkout: repo };
+  const runtime = { version: "1.0.31", apiVersion: 1, uiHash: null };
+  const cleared = await clearStoreIdentityError(config, { pid: 4242 }, runtime,
+    { targetCommit: commit, version: "1.0.31", apiVersion: 1, uiHash: null },
+    "Authenticated runtime did not report an exact source commit", {},
+    { runningRoot: () => root });
+  assert.equal(cleared, null, "real bytes against real git objects clear the refusal");
+  await writeFile(join(root, "package.json"), '{"name":"botfleet","version":"1.0.32"}\n');
+  const drift = await clearStoreIdentityError(config, { pid: 4242 }, runtime,
+    { targetCommit: commit, version: "1.0.31", apiVersion: 1, uiHash: null },
+    "Authenticated runtime did not report an exact source commit", {},
+    { runningRoot: () => root });
+  assert.match(drift, /not the commit it names/, "an edited release is drift, not identity");
+});
+
+test("clearStoreIdentityError re-runs the idleness gate after clearing identity", async (t) => {
+  // authenticatedRuntimeError checks idleness AFTER the identity fields, so a
+  // cleared identity refusal must not skip it: a busy harness stays refused.
+  const { home, config } = await makeStoreFixture(t);
+  const root = await makeRelease(home, COMMIT_A);
+  await symlink(root, join(home, ".botfleet", "current"));
+  const busy = { version: "1.0.31", apiVersion: 1, uiHash: null, safeToRestart: false, activeWorkCount: 4 };
+  const refusal = await clearStoreIdentityError(
+    config, { pid: 4242 }, busy, null,
+    "Authenticated runtime reports a dirty or unknown source checkout",
+    { requireIdle: true },
+    { runningRoot: () => root, verify: () => ({ ok: true, checked: 2, dependencies: "verified" }) },
+  );
+  assert.match(refusal, /4 active operations prevent update/);
+});
+
+test("clearStoreIdentityError demands whole-runtime proof at every gate, pre- and post-apply", async (t) => {
+  // The pre-apply source-only clear relaxed a gate nobody approved relaxing.
+  // Unknown executable bytes are never cleared on a source-only claim: with
+  // the dependency scope unverified, BOTH gates refuse.
+  const { home, config } = await makeStoreFixture(t);
+  const root = await makeRelease(home, COMMIT_A);
+  await symlink(root, join(home, ".botfleet", "current"));
+  const runtime = { version: "1.0.31", apiVersion: 1, uiHash: null };
+  const unverified = { runningRoot: () => root, verify: () => ({ ok: true, checked: 2, dependencies: "unverified" }) };
+  const preApply = await clearStoreIdentityError(
+    config, { pid: 4242 }, runtime, null,
+    "Authenticated runtime reports a dirty or unknown source checkout", {}, unverified,
+  );
+  assert.match(preApply, /dependency tree cannot be verified/, "pre-apply, unknown executable deps refuse");
+  const postApply = await clearStoreIdentityError(
+    config, { pid: 4242 }, runtime,
+    { targetCommit: COMMIT_A, version: "1.0.31", apiVersion: 1, uiHash: null },
+    "Authenticated runtime reports a dirty or unknown source checkout", {}, unverified,
+  );
+  assert.match(postApply, /dependency tree cannot be verified/, "post-apply, unknown executable deps refuse");
+});
+
+test("clearStoreIdentityError refuses a running root outside the store's own release directory", async (t) => {
+  // A manifest-bound tree SOMEWHERE ELSE is not the store's release: the
+  // association between the running process and the store is part of identity.
+  const { home, config } = await makeStoreFixture(t);
+  const root = await makeRelease(home, COMMIT_A);
+  await symlink(root, join(home, ".botfleet", "current"));
+  // A copy of the release at a foreign path, manifest included.
+  const foreign = join(home, "foreign", COMMIT_A);
+  await mkdir(join(home, "foreign"), { recursive: true });
+  await run("cp", ["-R", root, foreign]);
+  const refusal = await clearStoreIdentityError(
+    config, { pid: 4242 }, { version: "1.0.31", apiVersion: 1, uiHash: null }, null,
+    "Authenticated runtime reports a dirty or unknown source checkout", {},
+    { runningRoot: () => foreign, verify: () => ({ ok: true, checked: 2, dependencies: "verified" }) },
+  );
+  assert.match(refusal, /not the store's release/);
+});
+
+// Full-transaction reuse proof over REAL git objects: the reference install
+// is injected only to skip pnpm (mirroring the stageRelease tests); the
+// source verification, the dependency-scope fingerprinting, and the pointer
+// behaviour are all real.
+async function makeRealStoreRepo(t) {
+  const home = await mkdtemp(join(tmpdir(), "botfleet-reuse-real-"));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const repo = join(home, "checkout");
+  await mkdir(repo, { recursive: true });
+  const git = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
+  git("init", "-q", "-b", "main");
+  git("config", "user.email", "test@example.invalid");
+  git("config", "user.name", "Test");
+  await writeFile(join(repo, "package.json"), '{"name":"botfleet","version":"1.0.31"}');
+  await mkdir(join(repo, "server"), { recursive: true });
+  await writeFile(join(repo, "server", "index.ts"), "// server\n");
+  git("add", "-A");
+  git("commit", "-q", "-m", "initial");
+  const commit = git("rev-parse", "HEAD");
+  // The "existing release": a faithful export of the commit's tree, with a
+  // dependency tree an earlier run installed (custody unknown to this run).
+  const release = join(home, ".botfleet", "releases", commit);
+  execFileSync("git", ["-C", repo, "archive", "--format=tar", "--output", join(home, "export.tar"), commit]);
+  await mkdir(release, { recursive: true });
+  execFileSync("tar", ["-xf", join(home, "export.tar"), "-C", release]);
+  await rm(join(home, "export.tar"), { force: true });
+  await mkdir(join(release, "node_modules", "dep"), { recursive: true });
+  await writeFile(join(release, "node_modules", "dep", "index.js"), "module.exports = 1;\n");
+  await writeFile(join(release, ".botfleet-release.json"), JSON.stringify({
+    schemaVersion: 1, commit, promotedAt: "2026-11-03T00:00:00.000Z",
+  }));
+  // The host is store-backed (the launcher resolves the pointer first).
+  await mkdir(join(home, ".botfleet"), { recursive: true });
+  await symlink(release, join(home, ".botfleet", "current"));
+  // The fresh trusted reference for THIS run: same layout, same bytes.
+  const reference = join(home, "reference-tree");
+  await mkdir(join(reference, "node_modules", "dep"), { recursive: true });
+  await writeFile(join(reference, "node_modules", "dep", "index.js"), "module.exports = 1;\n");
+  return { home, repo, commit, release, reference };
+}
+
+test("reuse deploy proves the existing release against a fresh reference over real git objects", async (t) => {
+  const { home, repo, commit, release, reference } = await makeRealStoreRepo(t);
+  const config = { home, checkout: repo };
+  const previous = {};
+  const preparedOk = await prepareStoreReleaseDeploy(config, { targetCommit: commit, version: "1.0.31" }, previous, {
+    installReference: async () => reference,
+  });
+  assert.equal(preparedOk, true, "the existing release is proven outside the boundary");
+  const deployed = await deployStoreReleaseIfBacked(config, { targetCommit: commit, version: "1.0.31" }, previous, {
+    installReference: async () => reference,
+  });
+  assert.equal(deployed, true, "a byte-proven existing release deploys without restaging");
+  assert.equal(await realpath(join(home, ".botfleet", "current")), await realpath(release), "pointer moved onto the proven release");
+  assert.ok(previous.releaseDepsFingerprint, "the run keeps the trusted dependency custody for the post-apply gate");
+});
+
+test("reuse deploy refuses an existing release whose dependency scope is not the fresh reference, and never moves the pointer", async (t) => {
+  const { home, repo, commit, reference } = await makeRealStoreRepo(t);
+  const config = { home, checkout: repo };
+  // The existing release's dependency tree has drifted since whoever staged it.
+  await writeFile(join(home, ".botfleet", "releases", commit, "node_modules", "injected.js"), "require('child_process')\n");
+  // The host currently serves an OLD release; the refusal must leave it there.
+  const oldRelease = join(home, ".botfleet", "releases", "0".repeat(40));
+  await mkdir(oldRelease, { recursive: true });
+  await rm(join(home, ".botfleet", "current"), { force: true });
+  await symlink(oldRelease, join(home, ".botfleet", "current"));
+  await assert.rejects(
+    prepareStoreReleaseDeploy(config, { targetCommit: commit, version: "1.0.31" }, {}, {
+      installReference: async () => reference,
+    }),
+    /cannot be trusted/,
+  );
+  assert.equal(await realpath(join(home, ".botfleet", "current")), await realpath(oldRelease), "the pointer never moved onto unproven bytes");
+});
+
+
+// ---------------------------------------------------------------------------
+// Release-store preparation: the slow, failure-rich halves (staging, source
+// verification, the dependency install, trusted references) run BEFORE the
+// interruption window; the boundary itself only swaps the pointer.
+// ---------------------------------------------------------------------------
+
+
+/** Remove a temp tree even when it contains read-only store files. */
+async function rmWritableTree(dir) {
+  async function chmodTree(current) {
+    const entries = await readdir(current, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      const child = join(current, entry.name);
+      if (entry.isDirectory() && !entry.isSymbolicLink()) await chmodTree(child);
+      else await chmod(child, 0o644).catch(() => {});
+    }
+    await chmod(current, 0o755).catch(() => {});
+  }
+  await chmodTree(dir);
+  await rm(dir, { recursive: true, force: true });
+}
+
+test("prepareStoreReleaseDeploy proves the staged export before any install hook runs, and again after", async (t) => {
+  const { home, config } = await makeStoreFixture(t);
+  await makeRelease(home, COMMIT_A); // host currently serves COMMIT_A
+  await symlink(join(home, ".botfleet", "releases", COMMIT_A), join(home, ".botfleet", "current"));
+  const calls = [];
+  const previous = {};
+  const prepared = await prepareStoreReleaseDeploy(config, { targetCommit: COMMIT_B, version: "1.0.32" }, previous, {
+    stageRelease: async ({ commit, env, install }) => {
+      assert.equal(commit, COMMIT_B);
+      assert.equal(install, false, "staging never installs: hooks run only after the source is proven");
+      calls.push("stage");
+      const staging = stagingPath(commit, env);
+      await mkdir(staging, { recursive: true });
+      await writeFile(join(staging, "package.json"), '{"name":"botfleet","version":"1.0.32"}');
+    },
+    verifyRelease: ({ releaseRoot }) => {
+      calls.push(releaseRoot.endsWith(join(".botfleet", "staging", COMMIT_B)) ? "verify-staging" : "verify-other");
+      return { ok: true, checked: 1, dependencies: calls.includes("install") ? "absent" : "absent" };
+    },
+    install: async (dir) => {
+      calls.push("install");
+      await mkdir(join(dir, "node_modules", "dep"), { recursive: true });
+      await writeFile(join(dir, "node_modules", "dep", "index.js"), "module.exports = 1;\n");
+    },
+  });
+  assert.equal(prepared, true);
+  assert.deepEqual(calls, ["stage", "verify-staging", "install", "verify-staging"],
+    "stage, prove the source, install, prove the hooks left it alone - in that order");
+  const releaseDir = join(home, ".botfleet", "releases", COMMIT_B);
+  assert.equal((await stat(releaseDir)).isDirectory(), true, "promoted after both proofs");
+  assert.equal(previous.storeDeployPrepared, COMMIT_B, "the boundary knows preparation covered this commit");
+  assert.ok(previous.releaseDepsFingerprint, "dependency custody captured outside the boundary");
+  await rmWritableTree(releaseDir);
+});
+
+test("prepareStoreReleaseDeploy never runs install hooks against an unproven export", async (t) => {
+  const { home, config } = await makeStoreFixture(t);
+  await makeRelease(home, COMMIT_A);
+  await symlink(join(home, ".botfleet", "releases", COMMIT_A), join(home, ".botfleet", "current"));
+  const calls = [];
+  await assert.rejects(
+    prepareStoreReleaseDeploy(config, { targetCommit: COMMIT_B, version: "1.0.32" }, {}, {
+      stageRelease: async ({ commit, env }) => {
+        calls.push("stage");
+        const staging = stagingPath(commit, env);
+        await mkdir(staging, { recursive: true });
+        await writeFile(join(staging, "package.json"), '{"name":"botfleet","version":"1.0.32"}');
+      },
+      verifyRelease: () => {
+        calls.push("verify");
+        return { ok: false, detail: "server/index.ts differs" };
+      },
+      install: async () => {
+        calls.push("install");
+      },
+    }),
+    /not the commit's tree before install: server\/index\.ts differs/,
+  );
+  assert.deepEqual(calls, ["stage", "verify"], "the install hook never ran against unproven bytes");
+  await rm(stagingPath(COMMIT_B, (await storeHarnessState(config)).env), { recursive: true, force: true });
+});
+
+test("prepareStoreReleaseDeploy refuses to promote when the install mutated the staged source", async (t) => {
+  const { home, config } = await makeStoreFixture(t);
+  await makeRelease(home, COMMIT_A);
+  await symlink(join(home, ".botfleet", "releases", COMMIT_A), join(home, ".botfleet", "current"));
+  let verifies = 0;
+  await assert.rejects(
+    prepareStoreReleaseDeploy(config, { targetCommit: COMMIT_B, version: "1.0.32" }, {}, {
+      stageRelease: async ({ commit, env }) => {
+        const staging = stagingPath(commit, env);
+        await mkdir(staging, { recursive: true });
+        await writeFile(join(staging, "package.json"), '{"name":"botfleet","version":"1.0.32"}');
+      },
+      verifyRelease: () => {
+        verifies += 1;
+        return verifies === 1
+          ? { ok: true, checked: 1, dependencies: "absent" }
+          : { ok: false, detail: "postinstall rewrote server/index.ts" };
+      },
+      install: async (dir) => {
+        await mkdir(join(dir, "node_modules"), { recursive: true });
+      },
+    }),
+    /Dependency install mutated the staged source.*postinstall rewrote server\/index\.ts/,
+  );
+  await assert.rejects(stat(join(home, ".botfleet", "releases", COMMIT_B)), /ENOENT/, "never promoted");
+  await rm(stagingPath(COMMIT_B, (await storeHarnessState(config)).env), { recursive: true, force: true });
+});
+
+test("deployStoreReleaseIfBacked inside the boundary swaps the pointer and nothing else", async (t) => {
+  const { home, config } = await makeStoreFixture(t);
+  const root = await makeRelease(home, COMMIT_A);
+  await symlink(root, join(home, ".botfleet", "current"));
+  const previous = { storeDeployPrepared: COMMIT_A, releaseDepsFingerprint: "custody" };
+  const deployed = await deployStoreReleaseIfBacked(config, { targetCommit: COMMIT_A, version: "1.0.31" }, previous, {
+    stageRelease: async () => {
+      throw new Error("staging must never run inside the boundary");
+    },
+    install: async () => {
+      throw new Error("install must never run inside the boundary");
+    },
+    installReference: async () => {
+      throw new Error("reference builds must never run inside the boundary");
+    },
+  });
+  assert.equal(deployed, true);
+  assert.equal(await realpath(join(home, ".botfleet", "current")), await realpath(root), "pointer swap is the whole boundary");
+});
+
+test("the boundary op performs no install: a prepared advanceCheckout swaps and serves", async (t) => {
+  // createOperations is the real wiring: materializeCandidate prepares the
+  // store deploy (asserted by the preparer injection below), so by the time
+  // advanceCheckout runs inside the fence, any install attempt would hit the
+  // real pnpm path and fail in this fixture.  Success proves swap-only.
+  const { home, repo, commit, release } = await makeRealStoreRepo(t);
+  const config = { home, checkout: repo, parsed: { components: "server" } };
+  const ops = createOperations(config);
+  const previous = { storeDeployPrepared: commit, releaseDepsFingerprint: "custody" };
+  await ops.advanceCheckout({ targetCommit: commit }, previous);
+  assert.equal(await realpath(join(home, ".botfleet", "current")), await realpath(release));
+});
+
+test("materializeCandidate prepares the store deploy and rollback-target custody before the fence", { skip: process.platform !== "darwin" ? "candidate copy uses APFS clonefile" : false }, async (t) => {
+  const { home, config } = await makeStoreFixture(t);
+  await makeRelease(home, COMMIT_A);
+  await symlink(join(home, ".botfleet", "releases", COMMIT_A), join(home, ".botfleet", "current"));
+  const calls = [];
+  config.parsed = { components: "server" };
+  config.storeDeployPreparer = async (cfg, prepared, previous) => {
+    calls.push(["prepare", prepared.targetCommit]);
+    previous.storeDeployPrepared = prepared.targetCommit;
+    return true;
+  };
+  config.storeAdapters = {
+    expectedDepsFingerprintFor: async (commit) => {
+      calls.push(["custody", commit]);
+      return "reference-custody";
+    },
+  };
+  const sourceDeps = join(home, "prepared-node_modules");
+  await mkdir(sourceDeps, { recursive: true });
+  await writeFile(join(sourceDeps, "marker"), "deps");
+  const ops = createOperations(config);
+  const previous = {
+    candidateDependencies: join(home, ".candidate-node_modules"),
+    releaseCommit: COMMIT_A,
+  };
+  const prepared = {
+    targetCommit: COMMIT_B,
+    dependenciesPath: sourceDeps,
+    dependencyFingerprint: await dependencyFingerprint(sourceDeps),
+  };
+  await ops.materializeCandidate(prepared, previous);
+  assert.deepEqual(calls, [["prepare", COMMIT_B], ["custody", COMMIT_A]],
+    "the target's deploy is prepared and the CURRENT release's custody is ready for a rollback, all pre-fence");
+  assert.equal(previous.storeDeployPrepared, COMMIT_B);
+});
+
+test("reuse preparation refuses malformed stamped versions before proof or pointer changes", async (t) => {
+  for (const version of ["", "release-next", "1.0", "1.0.31 private detail"]) {
+    await t.test(version || "empty", async (context) => {
+      const { home, config } = await makeStoreFixture(context);
+      const current = await makeRelease(home, COMMIT_B);
+      const release = await makeRelease(home, COMMIT_A);
+      const manifestPath = join(release, ".botfleet-release.json");
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+      await writeFile(manifestPath, JSON.stringify({ ...manifest, version }));
+      const pointer = join(home, ".botfleet", "current");
+      await symlink(current, pointer);
+      const previous = { sentinel: "untouched" };
+      let proofCalls = 0;
+      await assert.rejects(
+        prepareStoreReleaseDeploy(config, { targetCommit: COMMIT_A, version }, previous, {
+          installReference: async () => { proofCalls++; throw new Error("unexpected reference install"); },
+          verifyRelease: () => { proofCalls++; throw new Error("unexpected byte proof"); },
+        }),
+        /cannot be trusted: its stamped runtime version is invalid\./,
+      );
+      assert.equal(proofCalls, 0);
+      assert.deepEqual(previous, { sentinel: "untouched" });
+      assert.equal(await realpath(pointer), await realpath(current));
+    });
+  }
+});
+
+test("materializeCandidate retains trusted custody when adapters are replaced after initialization", { skip: process.platform !== "darwin" ? "candidate copy uses APFS clonefile" : false }, async (t) => {
+  for (const replacement of ["missing", "registration-only"]) {
+    await t.test(replacement, async (context) => {
+      const { home, config } = await makeStoreFixture(context);
+      const root = await makeRelease(home, COMMIT_A);
+      await symlink(root, join(home, ".botfleet", "current"));
+      config.parsed = { components: "server" };
+      config.storeDeployPreparer = async (_cfg, prepared, previous) => { previous.storeDeployPrepared = prepared.targetCommit; return true; };
+      const sourceDeps = join(home, "prepared-node_modules");
+      await mkdir(sourceDeps);
+      await writeFile(join(sourceDeps, "marker"), "deps");
+      const ops = createOperations(config);
+      const register = config.storeAdapters.registerTrustedFingerprint;
+      register(COMMIT_A, "previously verified custody");
+      config.storeAdapters = replacement === "missing" ? undefined : { registerTrustedFingerprint: register };
+      const previous = { candidateDependencies: join(home, ".candidate-node_modules"), releaseCommit: COMMIT_A };
+      await ops.materializeCandidate({ targetCommit: COMMIT_B, dependenciesPath: sourceDeps, dependencyFingerprint: await dependencyFingerprint(sourceDeps) }, previous);
+      assert.equal(previous.storeDeployPrepared, COMMIT_B);
+    });
+  }
+});
+
+test("reuse preparation controls package-version failures before proof or pointer changes", async (t) => {
+  const cases = [
+    ["missing package", undefined],
+    ["unreadable package path", "directory"],
+    ["malformed JSON", "{"],
+    ["null package", "null"],
+    ["array package", "[]"],
+    ["missing version", '{"name":"botfleet"}'],
+    ["numeric version", '{"version":42}'],
+    ["null version", '{"version":null}'],
+    ["object version", '{"version":{}}'],
+    ["empty version", '{"version":""}'],
+    ["invalid version syntax", '{"version":"release-next"}'],
+    ["incomplete version", '{"version":"1.0"}'],
+  ];
+  for (const [name, contents] of cases) {
+    await t.test(name, async (context) => {
+      const { home, config } = await makeStoreFixture(context);
+      const current = await makeRelease(home, COMMIT_B);
+      const root = await makeRelease(home, COMMIT_A, {});
+      const packagePath = join(root, "package.json");
+      if (contents === "directory") await mkdir(packagePath);
+      else if (contents !== undefined) await writeFile(packagePath, contents);
+      const pointer = join(home, ".botfleet", "current");
+      await symlink(current, pointer);
+      const previous = { sentinel: "untouched" };
+      let proofCalls = 0;
+      config.storeAdapters = { registerTrustedFingerprint: () => { proofCalls++; } };
+      await assert.rejects(
+        prepareStoreReleaseDeploy(config, { targetCommit: COMMIT_A, version: "1.0.31" }, previous, {
+          installReference: async () => { proofCalls++; throw new Error("unexpected reference install"); },
+          verifyRelease: () => { proofCalls++; throw new Error("unexpected byte proof"); },
+        }),
+        (error) => {
+          assert.match(error.message, /^Existing release a{12} cannot be trusted: package\.json is missing, unreadable or has an invalid runtime version\./);
+          assert.match(error.message, /Discard and re-stage/);
+          assert.equal(error.code, undefined, "no raw filesystem error escapes");
+          return true;
+        },
+      );
+      assert.equal(proofCalls, 0, "invalid package data reaches no reference install, proof or custody registration");
+      assert.deepEqual(previous, { sentinel: "untouched" });
+      assert.equal(await realpath(pointer), await realpath(current), "the previous release remains active");
+    });
+  }
+});
+
+test("reuse preparation keeps the runtime's accepted package-version formats", async (t) => {
+  for (const version of ["0.1.0", "1.0.31", "1.0.202611030400", "1.0.31-beta.1", "1.0.31+build.42", "01.02.003", "1.0.31-beta_build"]) {
+    await t.test(version, async (context) => {
+      const { home, config } = await makeStoreFixture(context);
+      const current = await makeRelease(home, COMMIT_B);
+      const release = await makeRelease(home, COMMIT_A, { "package.json": JSON.stringify({ name: "botfleet", version }) });
+      const pointer = join(home, ".botfleet", "current");
+      await symlink(current, pointer);
+      const reference = join(home, "reference-tree");
+      await mkdir(reference);
+      const previous = {};
+      assert.equal(await prepareStoreReleaseDeploy(config, { targetCommit: COMMIT_A, version }, previous, {
+        installReference: async () => reference,
+        verifyRelease: () => ({ ok: true, checked: 1, dependencies: "absent" }),
+      }), true);
+      assert.equal(await realpath(pointer), await realpath(current), "preparation alone never activates a release");
+      assert.equal(await deployStoreReleaseIfBacked(config, { targetCommit: COMMIT_A, version }, previous), true);
+      assert.equal(await realpath(pointer), await realpath(release), "a proven version still deploys");
+    });
+  }
+});
+
+test("deployStoreReleaseIfBacked refuses to reuse a release whose version is not the prepared one", async (t) => {
+  const { home, config } = await makeStoreFixture(t);
+  const root = await makeRelease(home, COMMIT_A); // unstamped manifest -> package.json version 1.0.31
+  await symlink(root, join(home, ".botfleet", "current"));
+  await assert.rejects(
+    prepareStoreReleaseDeploy(config, { targetCommit: COMMIT_A, version: "1.0.202611030400" }, null),
+    /carries version 1\.0\.31, but this update prepared 1\.0\.202611030400/,
+  );
+  // And the pointer must NOT have moved onto the mismatched release by the refusal.
+  const reference = join(home, "reference-tree");
+  await mkdir(join(reference, "node_modules", "dep"), { recursive: true });
+  await writeFile(join(reference, "node_modules", "dep", "index.js"), "module.exports = 1;\n");
+  const previous = {};
+  await prepareStoreReleaseDeploy(config, { targetCommit: COMMIT_A, version: "1.0.31" }, previous, {
+    installReference: async () => reference,
+    verifyRelease: () => ({ ok: true, checked: 1, dependencies: "verified" }),
+  });
+  const matching = await deployStoreReleaseIfBacked(config, { targetCommit: COMMIT_A, version: "1.0.31" }, previous);
+  assert.equal(matching, true, "a version-matching existing release deploys without restaging once proven");
+  assert.equal(await realpath(join(home, ".botfleet", "current")), await realpath(root));
+});
+
+
+test("installReferenceDeps proves the exported source before install hooks and again after", async (t) => {
+  // The trusted reference gets the same pre/post-install source proofs as
+  // the staged candidate: hooks never run against unproven bytes, and a
+  // hook that mutates the source poisons nothing.
+  const { home, repo, commit } = await makeRealStoreRepo(t);
+  const config = { home, checkout: repo };
+  const calls = [];
+  const dir = await installReferenceDeps(config, commit, {}, {
+    verifyRelease: () => {
+      calls.push("verify");
+      return { ok: true, checked: 2, dependencies: "absent" };
+    },
+    install: async (target) => {
+      calls.push("install");
+      await mkdir(join(target, "node_modules", "dep"), { recursive: true });
+      await writeFile(join(target, "node_modules", "dep", "index.js"), "module.exports = 1;\n");
+    },
+  });
+  t.after(() => rmWritableTree(dir));
+  assert.deepEqual(calls, ["verify", "install", "verify"], "prove, install, prove again - in that order");
+  assert.equal((await stat(join(dir, "node_modules", "dep", "index.js"))).isFile(), true);
+});
+
+test("installReferenceDeps never runs hooks against an unproven export, and refuses a hook-mutated source", async (t) => {
+  const { home, repo, commit } = await makeRealStoreRepo(t);
+  const config = { home, checkout: repo };
+  let installs = 0;
+  await assert.rejects(
+    installReferenceDeps(config, commit, {}, {
+      verifyRelease: () => ({ ok: false, detail: "pnpm-lock.yaml differs" }),
+      install: async () => {
+        installs += 1;
+      },
+    }),
+    /not the commit's tree before install: pnpm-lock\.yaml differs/,
+  );
+  assert.equal(installs, 0, "no hook ran against unproven bytes");
+  let verifies = 0;
+  await assert.rejects(
+    installReferenceDeps(config, commit, {}, {
+      verifyRelease: () => {
+        verifies += 1;
+        return verifies === 1
+          ? { ok: true, checked: 2, dependencies: "absent" }
+          : { ok: false, detail: "postinstall rewrote server/index.ts" };
+      },
+      install: async (target) => {
+        await mkdir(join(target, "node_modules"), { recursive: true });
+      },
+    }),
+    /[Dd]ependency install mutated the reference source.*postinstall rewrote server\/index\.ts/,
+  );
+});
+
+test("installReferenceDeps refuses an export that already carries a dependency scope before install", async (t) => {
+  const { home, repo, commit } = await makeRealStoreRepo(t);
+  const config = { home, checkout: repo };
+  let installs = 0;
+  await assert.rejects(
+    installReferenceDeps(config, commit, {}, {
+      verifyRelease: () => ({ ok: true, checked: 2, dependencies: "unverified" }),
+      install: async () => {
+        installs += 1;
+      },
+    }),
+    /already carries a dependency scope before install/,
+  );
+  assert.equal(installs, 0);
+});
+
+test("deployStoreReleaseIfBacked fails closed unprepared: zero install, zero staging, pointer unmoved", async (t) => {
+  // Reviewer: the boundary must NEVER fall back to preparing inside the
+  // fence.  An unprepared commit is a hard refusal; nothing runs.
+  const { home, config } = await makeStoreFixture(t);
+  const oldRoot = await makeRelease(home, COMMIT_A);
+  await makeRelease(home, COMMIT_B);
+  await symlink(oldRoot, join(home, ".botfleet", "current"));
+  const forbidden = async () => {
+    throw new Error("no install, staging, or reference build may run inside the boundary");
+  };
+  await assert.rejects(
+    deployStoreReleaseIfBacked(config, { targetCommit: COMMIT_B, version: "1.0.32" }, {}, {
+      stageRelease: forbidden,
+      install: forbidden,
+      installReference: forbidden,
+    }),
+    /was not prepared outside the boundary by this run/,
+  );
+  await assert.rejects(
+    deployStoreReleaseIfBacked(config, { targetCommit: COMMIT_B, version: "1.0.32" }, null),
+    /was not prepared outside the boundary by this run/,
+    "a null previous is still a refusal, not a silent prepare",
+  );
+  assert.equal(await realpath(join(home, ".botfleet", "current")), await realpath(oldRoot), "the serving release is untouched");
+});
+
+function sha256Base64(bytes) {
+  return createHash("sha256").update(bytes).digest("base64");
+}
+
+function resourceSeal(rules) {
+  const body = rules.map((rule) => {
+    if (rule.symlink !== undefined) {
+      return `<key>${rule.path}</key><dict><key>symlink</key><string>${rule.symlink}</string></dict>`;
+    }
+    return `<key>${rule.path}</key><dict><key>hash2</key><data>${rule.hash2}</data></dict>`;
+  }).join("");
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>files2</key><dict>${body}</dict></dict></plist>
+`;
+}
+
+async function writeSealedApp(root, { commit, note = "sealed\n" } = {}) {
+  const app = join(root, "BotFleet.app");
+  const resources = join(app, "Contents", "Resources", "server");
+  await mkdir(resources, { recursive: true });
+  const identity = `${JSON.stringify({ sourceCommit: commit, version: "0.1.0", build: "202611120028" })}\n`;
+  await writeFile(join(resources, "build-identity.json"), identity);
+  await writeFile(join(resources, "note.txt"), note);
+  await symlink("note.txt", join(resources, "link"));
+  const seal = resourceSeal([
+    { path: "Resources/server/build-identity.json", hash2: sha256Base64(identity) },
+    { path: "Resources/server/note.txt", hash2: sha256Base64(note) },
+    { path: "Resources/server/link", symlink: "note.txt" },
+  ]);
+  await mkdir(join(app, "Contents", "_CodeSignature"), { recursive: true });
+  await writeFile(join(app, "Contents", "_CodeSignature", "CodeResources"), seal);
+  return app;
+}
+
+test("status and recover accept no options, and a clean Resources tree is not drift", async () => {
+  assert.equal(parseArguments(["status"]).command, "status");
+  assert.equal(parseArguments(["recover"]).command, "recover");
+  assert.throws(() => parseArguments(["status", "--force"]), /status accepts no options/);
+  assert.throws(() => parseArguments(["recover", "--stage", "/tmp/stage"]), /recover accepts no options/);
+  assert.equal(liveHealthMark({ safe: true, health: [{ kind: "botfleet", pid: 1 }] }), LIVE_OK);
+  assert.equal(liveHealthMark({ safe: false, health: [{ kind: "botfleet", pid: 1 }] }), "not-live");
+  assert.equal(sealedResourceRules("not a plist"), null);
+  assert.equal(sealedResourceRules("<plist version=\"1.0\"><dict></dict></plist>"), null);
+
+  const root = await mkdtemp(join(tmpdir(), "ubf-resources-"));
+  const app = await writeSealedApp(root, { commit: "a".repeat(40) });
+  const clean = await inspectInstalledResourceDrift(app);
+  assert.equal(clean.checked, true);
+  assert.deepEqual(clean.findings, []);
+  assert.equal(resourceDriftAction({ updateApp: true, force: false, drift: clean }), "skip");
+
+  await writeFile(join(app, "Contents", "Resources", ".DS_Store"), "finder\n");
+  const noise = await inspectInstalledResourceDrift(app);
+  assert.deepEqual(noise.findings, [], "Finder metadata is not a local Resources change");
+
+  await writeFile(join(app, "Contents", "Resources", "server", "note.txt"), "edited\n");
+  await writeFile(join(app, "Contents", "Resources", "server", "extra.txt"), "leftover\n");
+  const helper = join(app, "Contents", "Resources", "BotFleet Recorder.app", "Contents", "MacOS");
+  await mkdir(helper, { recursive: true });
+  await writeFile(join(helper, "recorder-helper"), "helper\n");
+  const sealedHelper = await inspectInstalledResourceDrift(app);
+  assert.ok(sealedHelper.findings.some((item) => item.path.endsWith("recorder-helper") && item.reason === "leftover"));
+  const sealPath = join(app, "Contents", "_CodeSignature", "CodeResources");
+  const seal = await readFile(sealPath, "utf8");
+  await writeFile(sealPath, seal.replace(
+    "<key>files2</key><dict>",
+    "<key>files2</key><dict><key>Resources/BotFleet Recorder.app</key><dict><key>cdhash</key><data>qqqqqqqqqqqqqqqqqqqqqqqqqqq=</data></dict>",
+  ));
+  const nested = await inspectInstalledResourceDrift(app);
+  assert.ok(!nested.findings.some((item) => item.path.includes("BotFleet Recorder.app")), "a cdhash helper is not leftover drift");
+  const dirty = await inspectInstalledResourceDrift(app);
+  assert.deepEqual(dirty.findings.map((item) => item.reason), ["leftover", "modified"]);
+  const updates = join(root, "updates");
+  await assert.rejects(
+    guardInstalledResources({ appPath: app, updatesDirectory: updates, updateApp: true, force: false }),
+    (error) => {
+      assert.equal(error.name, "UpdateRefusedError");
+      assert.match(error.message, /Re-run with --force/);
+      assert.match(error.message, /Resources\/server\/extra\.txt/);
+      assert.match(error.message, /Resources\/server\/note\.txt/);
+      return true;
+    },
+  );
+  assert.equal(resourceDriftAction({ updateApp: false, force: false, drift: dirty }), "skip");
+  const forced = await guardInstalledResources({
+    appPath: app,
+    updatesDirectory: updates,
+    updateApp: true,
+    force: true,
+    now: new Date("2026-11-12T06:28:00.000Z"),
+  });
+  assert.equal(forced.skipSealVerify, true);
+  const manifest = JSON.parse(await readFile(join(forced.backupPath, "manifest.json"), "utf8"));
+  assert.equal(manifest.kind, "resources");
+  assert.equal(await readFile(join(forced.backupPath, "Resources", "server", "extra.txt"), "utf8"), "leftover\n");
+  assert.equal(await readFile(join(app, "Contents", "Resources", "server", "extra.txt"), "utf8"), "leftover\n");
+  await rm(root, { recursive: true, force: true });
+});
+
+test("pending-recovery markers clear only after live-ok", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ubf-recovery-"));
+  const receipt = join(root, "stage", "pending-recovery.json");
+  await mkdir(dirname(receipt), { recursive: true });
+  await writeFile(receipt, "{\"status\":\"pending-recovery\"}\n");
+  assert.deepEqual(await clearPendingRecoveryAfterLiveOk({ updatesDirectory: root, liveMark: "not-live" }), []);
+  assert.equal(await readFile(receipt, "utf8"), "{\"status\":\"pending-recovery\"}\n");
+  const cleared = await clearPendingRecoveryAfterLiveOk({ updatesDirectory: root, liveMark: LIVE_OK });
+  assert.deepEqual(cleared, [receipt]);
+  assert.equal(await readFile(receipt, "utf8").catch(() => null), null);
+  assert.deepEqual(await clearPendingRecoveryAfterLiveOk({ updatesDirectory: root, liveMark: LIVE_OK }), []);
+  await rm(root, { recursive: true, force: true });
+});
+
+test("status reports the install, stage, recovery, backups and last result", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ubf-status-"));
+  const app = await writeSealedApp(join(root, "Applications"), { commit: "a".repeat(40) });
+  const updates = join(root, "updates");
+  const stage = join(updates, "staged");
+  await mkdir(stage, { recursive: true });
+  await writeFile(join(stage, "prepared.json"), JSON.stringify({
+    sourceCommit: "b".repeat(40),
+    version: "0.1.0",
+    createdAt: "2026-11-12T05:00:00.000Z",
+  }));
+  await writeFile(join(stage, "pending-recovery.json"), JSON.stringify({ reason: "work still running" }));
+  const backup = join(resourceBackupRoot(updates), "1");
+  await mkdir(backup, { recursive: true });
+  await writeFile(join(backup, "manifest.json"), JSON.stringify({
+    schemaVersion: 1,
+    kind: "resources",
+    createdAt: "2026-11-12T04:00:00.000Z",
+    findings: [{ path: "Resources/server/extra.txt", reason: "leftover" }],
+  }));
+  const rollback = join(root, "Applications", `.BotFleet.rollback-1-${"c".repeat(12)}.app`);
+  await writeSealedApp(join(root, "Applications", "rollback-holder"), { commit: "c".repeat(40) });
+  await rename(join(root, "Applications", "rollback-holder", "BotFleet.app"), rollback);
+  await writeFile(`${rollback}.json`, JSON.stringify({
+    schemaVersion: 1,
+    previousCommit: "c".repeat(40),
+    previousInstalledCommit: "c".repeat(40),
+    replacementCommit: "a".repeat(40),
+    rollbackBundle: rollback,
+    rollbackDependencies: join(root, "node_modules.rollback"),
+    installedAt: "2026-11-12T03:00:00.000Z",
+    appPath: app,
+    status: "verified",
+  }));
+  await writeFile(join(updates, "last-result.json"), JSON.stringify({
+    schemaVersion: 1,
+    outcome: "verified",
+    live: LIVE_OK,
+    message: "Updated BotFleet to bbbbbbbbbbbb.",
+  }));
+  const config = { appPath: app, updatesDirectory: updates, checkout: join(root, "checkout"), lockDirectory: join(root, "lock") };
+  const status = await collectUpdateStatus(config);
+  const text = renderUpdateStatus(status);
+  assert.match(text, /Installed: 0\.1\.0 build 202611120028 \(aaaaaaaaaaaa\)/);
+  assert.match(text, new RegExp(`Staged update: ${stage} bbbbbbbbbbbb`));
+  assert.match(text, /Pending recovery: .*pending-recovery\.json \(work still running\)/);
+  assert.match(text, /Backup: .* \(1 files\)/);
+  assert.match(text, new RegExp(`Backup: ${rollback.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+  assert.match(text, /Last result: verified live-ok Updated BotFleet to bbbbbbbbbbbb\./);
+  assert.equal(newestBackup(status.backups).kind, "resources");
+  await rm(root, { recursive: true, force: true });
+});
+
+test("recover restores the newest backup and does nothing the second time", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ubf-recover-"));
+  const applications = join(root, "Applications");
+  const app = await writeSealedApp(applications, { commit: "a".repeat(40) });
+  const updates = join(root, "updates");
+  await mkdir(updates, { recursive: true });
+  const rollbackHolder = join(root, "rollback-src");
+  const rollbackApp = await writeSealedApp(rollbackHolder, { commit: "b".repeat(40) });
+  const rollback = join(applications, `.BotFleet.rollback-9-${"b".repeat(12)}.app`);
+  await rename(rollbackApp, rollback);
+  await writeFile(`${rollback}.json`, JSON.stringify({
+    schemaVersion: 1,
+    previousCommit: "b".repeat(40),
+    previousInstalledCommit: "b".repeat(40),
+    replacementCommit: "a".repeat(40),
+    rollbackBundle: rollback,
+    rollbackDependencies: join(root, "deps"),
+    installedAt: "2026-11-12T02:00:00.000Z",
+    appPath: app,
+    status: "verified",
+  }));
+  const config = { appPath: app, updatesDirectory: updates, checkout: join(root, "checkout"), lockDirectory: join(root, "lock") };
+  const busy = await recoverFromLatestBackup(config, { holders: async () => [42] }).then(() => null, (error) => error);
+  assert.match(busy.message, /still running \(pid 42\)/);
+  assert.match(busy.message, /Quit it before ubf recover/);
+  assert.equal(JSON.parse(await readFile(join(app, "Contents", "Resources", "server", "build-identity.json"), "utf8")).sourceCommit, "a".repeat(40));
+
+  const first = await recoverFromLatestBackup(config, { holders: async () => [] });
+  assert.equal(first.restored, true);
+  assert.equal(JSON.parse(await readFile(join(app, "Contents", "Resources", "server", "build-identity.json"), "utf8")).sourceCommit, "b".repeat(40));
+  assert.equal(JSON.parse(await readFile(join(rollback, "Contents", "Resources", "server", "build-identity.json"), "utf8")).sourceCommit, "b".repeat(40));
+  const second = await recoverFromLatestBackup(config, { holders: async () => [99] });
+  assert.equal(second.restored, false);
+  assert.equal(second.reason, "already");
+
+  const resourceRoot = await mkdtemp(join(tmpdir(), "ubf-recover-files-"));
+  const resourceApp = await writeSealedApp(join(resourceRoot, "Applications"), { commit: "c".repeat(40) });
+  const resourceUpdates = join(resourceRoot, "updates");
+  const resourceBackup = join(resourceBackupRoot(resourceUpdates), "9");
+  await mkdir(join(resourceBackup, "Resources", "server"), { recursive: true });
+  await writeFile(join(resourceBackup, "Resources", "server", "extra.txt"), "kept\n");
+  await writeFile(join(resourceBackup, "manifest.json"), JSON.stringify({
+    schemaVersion: 1,
+    kind: "resources",
+    createdAt: "2026-11-12T07:00:00.000Z",
+    findings: [{ path: "Resources/server/extra.txt", reason: "leftover" }],
+  }));
+  const resourceConfig = {
+    appPath: resourceApp,
+    updatesDirectory: resourceUpdates,
+    checkout: join(resourceRoot, "checkout"),
+    lockDirectory: join(resourceRoot, "lock"),
+  };
+  const restored = await recoverFromLatestBackup(resourceConfig, { holders: async () => [] });
+  assert.equal(restored.restored, true);
+  assert.equal(await readFile(join(resourceApp, "Contents", "Resources", "server", "extra.txt"), "utf8"), "kept\n");
+  assert.equal(await readFile(join(resourceBackup, "Resources", "server", "extra.txt"), "utf8"), "kept\n");
+  const repeated = await recoverFromLatestBackup(resourceConfig, { holders: async () => [7] });
+  assert.equal(repeated.reason, "already");
+  const none = await recoverFromLatestBackup({
+    appPath: join(resourceRoot, "missing", "BotFleet.app"),
+    updatesDirectory: join(resourceRoot, "empty-updates"),
+    checkout: join(resourceRoot, "checkout"),
+    lockDirectory: join(resourceRoot, "lock"),
+  });
+  assert.equal(none.reason, "none");
+  await rm(root, { recursive: true, force: true });
+  await rm(resourceRoot, { recursive: true, force: true });
+});
+
+test("ubf status prints the fixture and does not require a target", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ubf-status-cli-"));
+  const app = await writeSealedApp(join(root, "Applications"), { commit: "d".repeat(40) });
+  const updater = join(scripts, "update-botfleet-mac.mjs");
+  const result = await run(process.execPath, [updater, "status"], {
+    env: {
+      BOTFLEET_UPDATE_ALLOW_NON_DARWIN: "1",
+      BOTFLEET_APP_PATH: app,
+      BOTFLEET_UPDATE_ROOT: join(root, "updates"),
+      BOTFLEET_UPDATE_LOCK: join(root, "lock"),
+      BOTFLEET_CHECKOUT: join(root, "checkout"),
+      BOTFLEET_DATA_DIR: join(root, "data"),
+    },
+    allowFailure: true,
+  });
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /BotFleet updater status/);
+  assert.match(result.stdout, /Installed: 0\.1\.0 build 202611120028 \(dddddddddddd\)/);
+  assert.match(result.stdout, /Staged update: none/);
+  assert.match(result.stdout, /Pending recovery: none/);
+  assert.match(result.stdout, /Last result: none/);
+  await rm(root, { recursive: true, force: true });
+});

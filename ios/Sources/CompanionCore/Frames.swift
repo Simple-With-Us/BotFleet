@@ -16,9 +16,22 @@ public struct NotificationFrame: Codable, Hashable, Sendable {
     public var threadId: String
     public var title: String
     public var body: String
+    /// The pending request this notification answers.  Set only for
+    /// approval/question kinds by a harness new enough to send it; an older
+    /// harness omits it, and Approve/Deny falls back to resolving the
+    /// thread's current pending card instead.
+    public var requestId: String?
+    /// The tool name, display/telemetry only — nothing depends on it.
+    public var tool: String?
 
     /// A bot blocked on you, as opposed to one reporting in.
     public var isBlocking: Bool { kind == "approval" || kind == "question" }
+
+    /// Foreground banners for the thread already on screen are noise.
+    /// The card or bubble is in the transcript; a banner on top of it is not.
+    public static func shouldPresentBanner(threadId: String, viewingThreadId: String?) -> Bool {
+        viewingThreadId != threadId
+    }
 }
 
 /// A canonical runtime event. The server has already folded these into
@@ -45,20 +58,32 @@ public enum Frame: Sendable {
     case roomDeleted(groupId: String)
     /// Something worth interrupting for.
     case notify(NotificationFrame)
-    /// A live frame of a bot's computer (base64). Only sent to clients that
-    /// did not pass `screens=off`.
+    /// A live frame of a bot's computer (base64).  Only sent to clients that
+    /// explicitly pass `screens=on` for this bot.
     case screen(botId: String, png: String, mime: String)
     /// The bot's cloud computer is being provisioned.
     case computer(botId: String, state: String)
     case config
+    /// A describe finished behind a stale-while-revalidate answer; the harness
+    /// pushes the fresh roster (`{ kind: "instances", instances, describedAt }`).
+    case instances([Instance], describedAt: Double?)
     case runtime(RuntimeEvent)
+    /// The paired Mac's update status changed — a check completed, an
+    /// install started, its progress moved, or it finished.  Carries the same
+    /// shape as `GET /api/update/status` so a client never has to follow this
+    /// with a fetch just to see what changed.
+    case updateStatus(MacUpdateStatus)
+    /// Every background job of one conversation, debounced by the harness.  A
+    /// full set rather than a diff, so a frame that was missed is put right by
+    /// the next one: folding it replaces that conversation's jobs.
+    case jobs(threadId: String, jobs: [JobSnapshot])
     case unknown(kind: String)
 }
 
 extension Frame: Decodable {
     private enum CodingKeys: String, CodingKey {
         case kind, cursor, resumed, threadId, message, activeLeafId
-        case bot, botId, group, groupId, notification, png, mime, state, event
+        case bot, botId, group, groupId, notification, png, mime, state, event, status, instances, describedAt, jobs
     }
 
     public init(from decoder: Decoder) throws {
@@ -109,8 +134,50 @@ extension Frame: Decodable {
             )
         case "config":
             self = .config
+        case "instances":
+            self = .instances(
+                try container.decode([Instance].self, forKey: .instances),
+                describedAt: try container.decodeIfPresent(Double.self, forKey: .describedAt)
+            )
         case "runtime":
             self = .runtime(try container.decode(RuntimeEvent.self, forKey: .event))
+        case "update.status":
+            // Confirmed shape: `{ kind: "update.status", status: <MacUpdateStatus> }`
+            // — `server/index.ts`'s `emit: (status) => broadcast({ kind: "update.status", status })`.
+            // The flat fallback costs nothing and keeps this decoding if a
+            // future harness ever spreads the fields instead, the way
+            // `screen` and `computer` are shaped.  Both attempts are
+            // `try?` — a `Frame` this build cannot make sense of must fold
+            // to `.unknown`, the same as any other kind it does not
+            // recognise, rather than throwing out of this initializer.
+            // `StreamFrame` decodes every frame with its own `try?` in
+            // `eventStream(request:session:)`, so an uncaught throw here
+            // would not merely drop this one frame — while the server-side
+            // contract for this event was still being finalized, a
+            // genuinely malformed payload threw all the way out, and the
+            // stream reader read that as the connection itself failing,
+            // showing "Lost the connection" for a socket that was fine.
+            if let status = try? container.decode(MacUpdateStatus.self, forKey: .status) {
+                self = .updateStatus(status)
+            } else if let status = try? MacUpdateStatus(from: decoder) {
+                self = .updateStatus(status)
+            } else {
+                self = .unknown(kind: kind)
+            }
+        case "jobs":
+            // `{ kind: "jobs", threadId, jobs: [...] }`.  Both reads are `try?`
+            // for the reason the update frame's are: a frame this build cannot
+            // make sense of folds to `.unknown` rather than throwing out of the
+            // initializer, which the stream reader would take for the
+            // connection failing.  And a set with one unreadable job is not
+            // folded at all, because a full set is a replacement and a partial
+            // one would silently drop a running job from the pill.
+            if let threadId = try? container.decode(String.self, forKey: .threadId),
+               let jobs = try? container.decode([JobSnapshot].self, forKey: .jobs) {
+                self = .jobs(threadId: threadId, jobs: jobs)
+            } else {
+                self = .unknown(kind: kind)
+            }
         default:
             // routines, and whatever the harness adds next
             self = .unknown(kind: kind)

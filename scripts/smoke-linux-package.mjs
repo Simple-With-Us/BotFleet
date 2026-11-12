@@ -117,7 +117,7 @@ const metadata = {
   mcp_protocol_version: "2025-06-18",
   pid: process.pid,
   embedded: true,
-  host_bundle_id: "com.botfleet.app",
+  host_bundle_id: "app.botfleet.macos",
 };
 const tools = ["click", "get_window_state", "list_apps", "type_text"].map((name) => ({ name }));
 const toolManifest = { schema_version: "1", capability_version: "1", tools };
@@ -208,7 +208,7 @@ let smokeResult = null;
 // The smoke runs with a disposable HOME and no interactive keyring. Keep
 // Electron's credential backend inside that sandbox so a GNOME Keyring unlock
 // prompt cannot block the headless renderer before did-finish-load.
-const electronArgs = ["--password-store=basic"];
+const electronArgs = ["--password-store=basic", "--no-sandbox"];
 if (wayland) electronArgs.push("--ozone-platform=x11");
 const child = spawn(executable, electronArgs, {
   cwd: root,
@@ -349,9 +349,23 @@ try {
       `[smoke-linux-package] OK (${wayland ? "GNOME/Wayland" : path.basename(executable)}): slow optional broker did not block first paint and Wayland CUA failed closed`,
     );
   } else if (bundled) {
-    if (signalShutdown) child.kill("SIGTERM");
+    if (signalShutdown) {
+      try {
+        process.kill(-child.pid, "SIGTERM");
+      } catch {
+        child.kill("SIGTERM");
+      }
+    }
     await waitForExit();
-    const staleHealth = await fetch(new URL("/api/health", location)).catch(() => null);
+    await stopProcess();
+    await delay(500);
+    let staleHealth = null;
+    const drainDeadline = Date.now() + 5_000;
+    while (Date.now() < drainDeadline) {
+      staleHealth = await fetch(new URL("/api/health", location)).catch(() => null);
+      if (!staleHealth?.ok) break;
+      await delay(250);
+    }
     if (staleHealth?.ok) throw new Error("embedded harness remained reachable after Electron quit");
     const appImage = executable.endsWith(".AppImage");
     if (cuaCrashReason !== null || cuaRetryStatus !== null) {
@@ -491,7 +505,7 @@ try {
 
     let restartOutput = "";
     let restartResult = null;
-    const restart = spawn(executable, wayland ? ["--ozone-platform=x11"] : [], {
+    const restart = spawn(executable, electronArgs, {
       cwd: root,
       detached: true,
       env: { ...desktopEnv, OMB_SMOKE_KEEP_OPEN: "0" },

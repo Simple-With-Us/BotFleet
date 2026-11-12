@@ -437,7 +437,7 @@ function LocalVmPane({
             title="Pause only this bot and enable keyboard and pointer input in this pane"
           >
             {controlPending ? <Loader2 size={13} className="animate-spin" /> : <Hand size={13} />}
-            {heldElsewhere ? "Held elsewhere" : "Take control"}
+            {heldElsewhere ? "Held elsewhere" : "Take Control"}
           </button>
         ) : null}
       </div>
@@ -504,7 +504,7 @@ export function LocalVmWorkspace({
 }: LocalVmWorkspaceProps) {
   const { state, dispatch } = useStore();
   const eligibleBots = useMemo(
-    () => state.bots.filter((bot) => bot.computer === "vm" && !bot.hidden),
+    () => state.bots.filter((bot) => (bot.computers ?? []).includes("vm") && !bot.hidden),
     [state.bots],
   );
   const [slots, setSlots] = useState<LocalVmWorkspaceSlots>(() =>
@@ -732,7 +732,7 @@ export function LocalVmWorkspace({
           onClick={() => void closeWorkspace()}
           disabled={controlPending}
           className="rounded-md p-1.5 text-ink-secondary hover:bg-raised hover:text-ink disabled:opacity-50"
-          aria-label="Close Local VM workspace"
+          aria-label="Close Local VM Workspace"
         >
           <X size={18} />
         </button>

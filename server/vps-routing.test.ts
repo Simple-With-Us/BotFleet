@@ -11,12 +11,13 @@
 // fake ACP CLI in echo-gated mode (see steer-queue.test.ts), whose echo
 // reply carries the FULL prompt and whose gate file gives a deterministic
 // busy window — no sleeps anywhere.
-import { spawn, type ChildProcess } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { VPS_DEFAULT_CPUS, VPS_DEFAULT_MEMORY_GIB } from "./config.ts";
 
 import {
   BASE_IMAGE_DIGEST,
@@ -28,7 +29,8 @@ import {
   MANAGED_LABEL,
 } from "./container-computer.ts";
 import { VPS_CONTAINER_LABEL, VPS_IMAGE, VPS_MANAGED_LABEL, VPS_VIEWER_LABEL } from "./vps-computer.ts";
-import { removeTempDir, waitForExit } from "./testing/cleanup.ts";
+import { removeTempDir, spawnDetached, waitForExit } from "./testing/cleanup.ts";
+import { harnessReady } from "./testing/harness-ready.ts";
 
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
 const FAKE_CLI = join(SERVER_DIR, "testing", "fake-acp-cli.ts");
@@ -85,9 +87,13 @@ function containerInspectTemplate(): string {
         NetworkMode: "bridge",
         PortBindings: {},
         PublishAllPorts: false,
-        Memory: 4 * 1024 * 1024 * 1024,
-        MemorySwap: 4 * 1024 * 1024 * 1024,
-        NanoCpus: 2_000_000_000,
+        // Derived from the configured VPS budget, not the Local VM's numbers:
+        // a fake inspect that claims a size the runtime would never build gets
+        // graded unsafe, the container is refused, and the turn never mounts a
+        // computer — which surfaces here as "the echoed turn never happened".
+        Memory: VPS_DEFAULT_MEMORY_GIB * 1024 * 1024 * 1024,
+        MemorySwap: VPS_DEFAULT_MEMORY_GIB * 1024 * 1024 * 1024,
+        NanoCpus: VPS_DEFAULT_CPUS * 1_000_000_000,
         PidsLimit: 512,
         CapDrop: ["ALL"],
         CapAdd: ["CAP_SETUID", "CAP_SETGID"],
@@ -196,12 +202,15 @@ posixOnly("VPS turn routing e2e (fake ACP fleet + fake docker over SSH)", () => 
       USERPROFILE: home,
       OMB_PORT: String(PORT),
       OMB_EXTRA_PATH: fakeBin,
+      // spawnDetached switches container runtimes off; this fake `docker` is
+      // the one runtime the harness may run, by absolute path.
+      BOTFLEET_CONTAINER_RUNTIME_FIXTURE_DIR: fakeBin,
       FAKE_DOCKER_DIR: fakeBin,
       FAKE_DOCKER_LOG: dockerLog,
     };
     if (process.env.PATH) env.PATH = process.env.PATH;
     if (process.env.SystemRoot) env.SystemRoot = process.env.SystemRoot;
-    child = spawn(process.execPath, [join(SERVER_DIR, "index.ts")], {
+    child = spawnDetached(process.execPath, [join(SERVER_DIR, "index.ts")], {
       cwd: join(SERVER_DIR, ".."),
       env,
       stdio: ["ignore", "pipe", "pipe"],
@@ -211,7 +220,7 @@ posixOnly("VPS turn routing e2e (fake ACP fleet + fake docker over SSH)", () => 
     const deadline = Date.now() + 20_000;
     for (;;) {
       try {
-        if ((await fetch(`${BASE}/api/health`)).ok) break;
+        if (await harnessReady(BASE)) break;
       } catch {
         /* not up yet */
       }
@@ -255,6 +264,7 @@ posixOnly("VPS turn routing e2e (fake ACP fleet + fake docker over SSH)", () => 
       let snapshot: any;
       await until(async () => {
         snapshot = await botById(bot.id);
+        if (!snapshot?.busy) console.log("SNAPSHOT_DEBUG:", snapshot.messages);
         return (
           snapshot?.busy === false &&
           snapshot.messages.some((m: any) => m.kind === "text" && m.text?.startsWith("echo: "))

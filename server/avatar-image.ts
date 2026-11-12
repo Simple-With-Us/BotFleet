@@ -1,10 +1,25 @@
 import { z } from "zod";
 
 import type { BotRecord } from "./store.ts";
+import { telemetry } from "./telemetry.ts";
 
 export const AVATAR_DIRECTION_MAX_CHARS = 400;
 export const AVATAR_IMAGE_TIMEOUT_MS = 120_000;
 const MAX_UPSTREAM_RESPONSE_BYTES = 15 * 1024 * 1024;
+
+/** Which model+endpoint family to call.  MiniMax is the default: cheaper
+ *  for the operator, OpenAI-compatible request shape, and the same shape
+ *  fits a future MiniMax-M-image native endpoint without changing this
+ *  function's contract.  OpenAI remains a fallback for users who already
+ *  configured a key under the legacy `openaiImageApiKey` label. */
+export type AvatarImageProvider = "minimax" | "openai";
+
+const MINIMAX_IMAGE_API = process.env.OMB_MINIMAX_IMAGE_API || "https://api.minimax.io/v1";
+const MINIMAX_IMAGE_MODEL = "image-01";
+const MINIMAX_IMAGE_ENDPOINT = `${MINIMAX_IMAGE_API}/image_generation`;
+const OPENAI_IMAGE_API = "https://api.openai.com/v1";
+const OPENAI_IMAGE_MODEL = "gpt-image-2";
+const OPENAI_IMAGE_ENDPOINT = `${OPENAI_IMAGE_API}/images/generations`;
 
 export const avatarGenerationRequestSchema = z.object({
   prompt: z.string().trim().max(AVATAR_DIRECTION_MAX_CHARS).default(""),
@@ -12,6 +27,14 @@ export const avatarGenerationRequestSchema = z.object({
 
 const generatedImageResponseSchema = z.object({
   data: z.array(z.object({ b64_json: z.string().min(1) })).min(1),
+});
+/** MiniMax's `image-01` with `response_format: "base64"` returns an array of
+ * base64 PNG strings nested under `data.image_base64` (not OpenAI's flat
+ * `image_base64`, not OpenAI's `data[].b64_json`). Accept the documented
+ * MiniMax shape first, then the two OpenAI-shaped fallbacks so a future
+ * MiniMax response tweak doesn't 502 every existing call. */
+const minimaxBase64ImageResponseSchema = z.object({
+  data: z.object({ image_base64: z.array(z.string().min(1)).min(1) }),
 });
 
 type AvatarIdentity = Pick<BotRecord, "name" | "title" | "description">;
@@ -51,7 +74,7 @@ export function avatarGenerationPrompt(bot: AvatarIdentity, direction: string): 
 
 export interface GeneratedAvatarImage {
   bytes: Buffer;
-  mime: "image/webp";
+  mime: "image/png" | "image/webp";
 }
 
 /**
@@ -95,31 +118,63 @@ export async function generateAvatarImage(
   direction: string,
   fetchImpl: typeof fetch = fetch,
   timeoutMs = AVATAR_IMAGE_TIMEOUT_MS,
+  provider: AvatarImageProvider = "minimax",
 ): Promise<GeneratedAvatarImage> {
-  if (!apiKey.trim()) throw Object.assign(new Error("Add an OpenAI image API key first"), { status: 409 });
+  if (!apiKey.trim()) {
+    throw Object.assign(
+      new Error(
+        provider === "minimax"
+          ? "Add a MiniMax API key in Settings to generate a custom avatar."
+          : "Add an OpenAI image API key first",
+      ),
+      { status: 409 },
+    );
+  }
 
+  // Two genuinely different surfaces: MiniMax's `image-01` lives at
+  // `/v1/image_generation` with `response_format: "base64"` and returns an
+  // array of base64 PNG strings; OpenAI's `gpt-image-2` lives at
+  // `/v1/images/generations` with `output_format: "webp"` and returns the
+  // `data[].b64_json` webp payload.  Each path keeps its native body and
+  // response parser so a wrong endpoint or model would surface as a 502
+  // upstream error, not a silent 0-byte image.
+  const isMiniMax = provider === "minimax";
+  const url = isMiniMax ? MINIMAX_IMAGE_ENDPOINT : OPENAI_IMAGE_ENDPOINT;
+  const model = isMiniMax ? MINIMAX_IMAGE_MODEL : OPENAI_IMAGE_MODEL;
+  const errorPrefix = isMiniMax ? "MiniMax" : "OpenAI";
+  const body = isMiniMax
+    ? JSON.stringify({
+        model,
+        prompt: avatarGenerationPrompt(bot, direction),
+        response_format: "base64",
+        image_size: "1024x1024",
+        n: 1,
+      })
+    : JSON.stringify({
+        model,
+        prompt: avatarGenerationPrompt(bot, direction),
+        size: "1024x1024",
+        quality: "low",
+        output_format: "webp",
+      });
+
+  const startedAt = Date.now();
   const timeoutSignal = AbortSignal.timeout(timeoutMs);
   let response: Response;
   try {
-    response = await fetchImpl("https://api.openai.com/v1/images/generations", {
+    response = await fetchImpl(url, {
       method: "POST",
       headers: {
         authorization: `Bearer ${apiKey.trim()}`,
         "content-type": "application/json",
       },
-      body: JSON.stringify({
-        model: "gpt-image-2",
-        prompt: avatarGenerationPrompt(bot, direction),
-        size: "1024x1024",
-        quality: "low",
-        output_format: "webp",
-      }),
+      body,
       signal: timeoutSignal,
     });
   } catch (error) {
     const timedOut = timeoutSignal.aborted || (error instanceof Error && error.name === "TimeoutError");
     throw Object.assign(
-      new Error(timedOut ? "Avatar generation timed out" : "Could not reach OpenAI image generation"),
+      new Error(timedOut ? "Avatar generation timed out" : `Could not reach ${errorPrefix} image generation`),
       { status: 502 },
     );
   }
@@ -137,7 +192,7 @@ export async function generateAvatarImage(
     throw error;
   }
   if (!response.ok) {
-    let message = `OpenAI image generation failed (HTTP ${response.status})`;
+    let message = `${errorPrefix} image generation failed (HTTP ${response.status})`;
     try {
       const parsed = z.object({ error: z.object({ message: z.string() }) }).safeParse(JSON.parse(text));
       if (parsed.success) message = parsed.data.error.message.slice(0, 500);
@@ -151,19 +206,56 @@ export async function generateAvatarImage(
   try {
     parsedJson = JSON.parse(text);
   } catch {
-    throw Object.assign(new Error("OpenAI returned an invalid image response"), { status: 502 });
+    throw Object.assign(new Error(`${errorPrefix} returned an invalid image response`), { status: 502 });
   }
-  const parsed = generatedImageResponseSchema.safeParse(parsedJson);
-  if (!parsed.success) {
-    throw Object.assign(new Error("OpenAI returned no generated image"), { status: 502 });
+  // MiniMax returns PNG when `response_format: "base64"` (image-01's native
+  // format); OpenAI's gpt-image-2 with `output_format: "webp"` returns WebP.
+  // The MIME in the response must match the actual bytes — serving PNG with
+  // `Content-Type: image/webp` is rejected by browsers that sniff by magic.
+  let encoded: string;
+  let mime: "image/png" | "image/webp";
+  if (isMiniMax) {
+    const parsedMm = minimaxBase64ImageResponseSchema.safeParse(parsedJson);
+    const encodedMm = parsedMm.success
+      ? parsedMm.data.data.image_base64[0]!
+      : (() => {
+          // Defensive fallback: OpenAI-shaped `data[].b64_json` from a
+          // hypothetical future MiniMax response tweak still decodes, but
+          // the MIME stays PNG because that's what image-01 actually emits.
+          const parsedFallback = generatedImageResponseSchema.safeParse(parsedJson);
+          return parsedFallback.success ? parsedFallback.data.data[0]!.b64_json : null;
+        })();
+    if (!encodedMm) {
+      throw Object.assign(new Error(`${errorPrefix} returned no generated image`), { status: 502 });
+    }
+    encoded = encodedMm;
+    mime = "image/png";
+  } else {
+    const parsed = generatedImageResponseSchema.safeParse(parsedJson);
+    if (!parsed.success) {
+      throw Object.assign(new Error(`${errorPrefix} returned no generated image`), { status: 502 });
+    }
+    encoded = parsed.data.data[0]!.b64_json;
+    mime = "image/webp";
   }
-  const encoded = parsed.data.data[0]!.b64_json;
   if (!/^[A-Za-z0-9+/]+={0,2}$/.test(encoded) || encoded.length % 4 !== 0) {
-    throw Object.assign(new Error("OpenAI returned invalid image data"), { status: 502 });
+    throw Object.assign(new Error(`${errorPrefix} returned invalid image data`), { status: 502 });
   }
   const bytes = Buffer.from(encoded, "base64");
   if (bytes.byteLength === 0) {
-    throw Object.assign(new Error("OpenAI returned an empty image"), { status: 502 });
+    throw Object.assign(new Error(`${errorPrefix} returned an empty image`), { status: 502 });
   }
-  return { bytes, mime: "image/webp" };
+  // A generated image is billed per image, and neither provider reports a
+  // price in the response, so Usage Monitor hears one request for one image
+  // and prices it from its catalog (BF-2435).  Reported only once an image
+  // exists: a failed or empty response produced nothing.
+  telemetry.trackAux({
+    kind: "avatar-image",
+    provider: isMiniMax ? "minimax" : "openai",
+    service: model,
+    label: "BotFleet avatar image",
+    latencyMs: Date.now() - startedAt,
+    metadata: { images: 1 },
+  });
+  return { bytes, mime };
 }

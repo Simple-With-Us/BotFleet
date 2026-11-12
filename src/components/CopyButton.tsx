@@ -9,6 +9,9 @@ export interface CopyButtonProps {
   className?: string;
   copied?: boolean;
   onCopy?: () => void;
+  /** Icon size in px.  The message chrome renders these larger than the
+   * default so its stacked rows read at a comparable weight. */
+  iconSize?: number;
 }
 
 export function CopyButton({
@@ -18,6 +21,7 @@ export function CopyButton({
   className,
   copied: externalCopied,
   onCopy,
+  iconSize = 14,
 }: CopyButtonProps) {
   const [copiedType, setCopiedType] = useState<"text" | "id" | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
@@ -73,6 +77,18 @@ export function CopyButton({
     setMenuOpen((prev) => !prev);
   };
 
+  /* Right-click is a mouse-only way into the ID menu, so keyboard and screen
+   * reader users had no route to Request/Message ID at all — and the old
+   * aria-label even instructed them to right-click. Shift+Enter opens the same
+   * menu; plain Enter keeps the default copy-text behaviour. */
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLButtonElement>) => {
+    if (!effectiveId) return;
+    if (e.key === "Enter" && e.shiftKey) {
+      e.preventDefault();
+      setMenuOpen((prev) => !prev);
+    }
+  };
+
   return (
     <div className="relative inline-flex items-center">
       <button
@@ -80,15 +96,20 @@ export function CopyButton({
         type="button"
         onClick={copyText}
         onContextMenu={handleContextMenu}
-        aria-label={effectiveId ? "Copy message text (right-click for ID)" : "Copy message"}
+        onKeyDown={handleKeyDown}
+        aria-haspopup={effectiveId ? "menu" : undefined}
+        aria-expanded={effectiveId ? menuOpen : undefined}
+        aria-label={
+          effectiveId ? "Copy Message Text. Right-click or Shift+Enter for ID." : "Copy Message"
+        }
         title={
           isCopied
             ? copiedType === "id"
               ? "Copied ID to clipboard!"
               : "Copied to clipboard!"
             : effectiveId
-              ? "Copy message (Right-click for Request ID)"
-              : "Copy message"
+              ? "Copy Message (Right-click or Shift+Enter for Request ID)"
+              : "Copy Message"
         }
         className={cn(
           "rounded-md p-1.5 text-ink-secondary opacity-0 transition-opacity hover:bg-raised hover:text-ink focus-visible:opacity-100 group-hover:opacity-100 group-focus-within:opacity-100",
@@ -97,7 +118,7 @@ export function CopyButton({
           className,
         )}
       >
-        {isCopied ? <Check size={14} className="text-success" /> : <Copy size={14} />}
+        {isCopied ? <Check size={iconSize} className="text-success" /> : <Copy size={iconSize} />}
       </button>
 
       {menuOpen && (
@@ -122,7 +143,7 @@ export function CopyButton({
               <Hash size={13} className="text-ink-secondary" />
               <div className="flex min-w-0 flex-col">
                 <span>{requestId ? "Copy Request ID" : "Copy Message ID"}</span>
-                <span className="truncate font-mono text-[10px] text-ink-secondary">{effectiveId}</span>
+                <span className="truncate font-mono text-[10px] text-ink-secondary" title={effectiveId}>{effectiveId}</span>
               </div>
             </button>
           )}

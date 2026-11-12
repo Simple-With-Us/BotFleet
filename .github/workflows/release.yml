@@ -1,7 +1,12 @@
-# One-button releases: builds macOS (arm64 + x64, signed, notarized, stapled),
-# Windows, and Ubuntu from ONE commit, assembles a complete draft on
-# botfleet-releases with verified feeds, and publishes after a human
-# approves the draft.
+# One-button release staging: builds macOS (arm64 + x64, signed, notarized,
+# stapled) from ONE commit, then verifies one complete artifact set.  The
+# default run only uploads a private Actions artifact.
+# Draft creation and publication are separate, explicit inputs.
+#
+# Publish target = the built-in GITHUB_TOKEN.  The job's `contents: write`
+# (set just below) is the only extra scope the release steps need, and
+# nothing in this repo listens for `released` events, so a fine-grained PAT
+# adds rotation without buying anything.  Decision on 2026-09-18.
 #
 # Every gate below exists because its absence shipped (or nearly shipped) a
 # broken build from a laptop:
@@ -14,10 +19,10 @@
 #                                 electron-updater reject every update
 #   - blockmap regeneration    -> stale differential maps waste every updater's
 #                                 bandwidth silently
-#   - assemble-then-publish    -> 0.1.24 sat as an invisible draft; a mac-only
-#                                 publish 404s the README's other buttons
+#   - assemble-then-publish    -> 0.1.24 sat as an invisible draft; a partial
+#                                 publish leaves the feed without its zips
 #
-# One-time setup (repo secrets) is documented in docs/releasing.md.
+# One-time signing setup is documented in docs/releasing.md.
 name: Release
 
 on:
@@ -28,66 +33,165 @@ on:
         required: false
         type: string
       publish:
-        description: "Publish immediately after assembly (otherwise leave a draft for review)"
+        description: "Publish immediately after assembly (also creates/updates the draft)"
+        required: false
+        type: boolean
+        default: false
+      draft:
+        description: "Create or update a GitHub draft release after artifact verification"
         required: false
         type: boolean
         default: false
 
 permissions:
-  contents: read
+  contents: write
+
+env:
+  # The one and only publish target. Must match electron-builder.yml
+  # `publish`, or installed apps check a feed no release ever lands on.
+  RELEASES_REPO: Simple-With-Us/BotFleet
 
 jobs:
   prepare:
     name: Pin the release commit
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     outputs:
       sha: ${{ steps.pin.outputs.sha }}
       version: ${{ steps.pin.outputs.version }}
+      marketing_version: ${{ steps.pin.outputs.marketing_version }}
+      build: ${{ steps.pin.outputs.build }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref || github.ref }}
+          # fetch-depth: 0 is REQUIRED, not a preference. The build number is
+          # the committer date of the commit being released, and on the default
+          # depth-1 clone the merge stamp cannot be proven. The stamp script
+          # refuses a shallow clone; this is what lets it not.
+          fetch-depth: 0
           persist-credentials: false
+      # The shared planner consults App Store Connect, so this job loads
+      # the ASC key with INFISICAL_IOS_SHIP_READ_TOKEN (BF-2588).
+      - name: Load the App Store Connect credentials
+        uses: ./.github/actions/infisical-secrets
+        with:
+          names: APPLE_API_KEY_ID APPLE_API_ISSUER_ID APPLE_API_KEY_P8_BASE64
+          required: APPLE_API_KEY_ID APPLE_API_ISSUER_ID APPLE_API_KEY_P8_BASE64
+          project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
+          token: ${{ secrets.INFISICAL_IOS_SHIP_READ_TOKEN }}
       - id: pin
         run: |
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+          # Plan BEFORE the overwrite guard below, or the guard would compare
+          # the hand-typed version against what was published and approve a
+          # release whose artifacts are numbered something else entirely.
+          #
+          # The shared planner answers three values (BF-2588):  the fixed
+          # marketing version 0.1.0, the commit's Central merge stamp as the
+          # build, and the app version the Electron updater orders releases
+          # by, which carries that build in its patch.  It exits 1 when it
+          # cannot plan, and `echo "$(...)"` would return echo's status and
+          # publish an EMPTY version, which then fails much later with an
+          # unrelated error.
+          plan="$(node scripts/electron-release-version.mjs --repo-root . --sha "$(git rev-parse HEAD)")" || exit 1
+          app_version="$(printf '%s\n' "$plan" | sed -n 's/^app_version=//p')"
+          marketing_version="$(printf '%s\n' "$plan" | sed -n 's/^version=//p')"
+          build="$(printf '%s\n' "$plan" | sed -n 's/^build=//p')"
+          if [ -z "$app_version" ] || [ -z "$marketing_version" ] || [ -z "$build" ]; then
+            echo "::error::the shared planner returned no app version, marketing version and build"
+            exit 1
+          fi
+          echo "version=$app_version" >> "$GITHUB_OUTPUT"
+          echo "marketing_version=$marketing_version" >> "$GITHUB_OUTPUT"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
       - name: Refuse to overwrite a published release
+        if: ${{ inputs.draft || inputs.publish }}
         env:
-          GH_TOKEN: ${{ secrets.RELEASES_PAT }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          v="v$(node -p "require('./package.json').version")"
-          for repo in milind-soni/botfleet-releases milind-soni/openmausbot-releases; do
-            if gh release view "$v" --repo "$repo" --json isDraft --jq .isDraft 2>/dev/null | grep -q false; then
-              echo "::error::$v is already published on $repo — bump the version first"
-              exit 1
-            fi
-          done
+          # steps.pin.outputs.version, NOT needs.prepare.outputs.version.  This
+          # step runs INSIDE the prepare job, and the needs context there holds
+          # the jobs prepare depends on -- which is none of them, because
+          # prepare is the first job.  The needs expression rendered as an empty
+          # string, so the guard compared the literal tag "v", which matches no
+          # release, so the gate never fired: a release already published under
+          # this version would have been overwritten instead of stopping the run.
+          v="v${{ steps.pin.outputs.version }}"
+          if gh release view "$v" --repo "$RELEASES_REPO" --json isDraft --jq .isDraft 2>/dev/null | grep -q false; then
+            echo "::error::$v is already published on $RELEASES_REPO — bump the version first"
+            exit 1
+          fi
 
   mac:
-    name: macOS arm64 + x64 (sign, notarize, staple)
+    name: macOS ${{ matrix.arch }} (sign, notarize, staple)
     needs: prepare
-    runs-on: macos-14
+    runs-on: macos-26
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            app: release/mac-arm64/BotFleet.app
+            package_script: package:mac:arm64:release
+            cloudflared_arch: arm64
+          - arch: x64
+            app: release/mac/BotFleet.app
+            package_script: package:mac:x64:release
+            cloudflared_arch: x86_64
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.prepare.outputs.sha }}
           persist-credentials: false
-      - uses: pnpm/action-setup@ff378ebe6b225b0680b81c1ad4498ae0d1d3a5e3 # v6.0.10
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      # One version for the whole release, computed once in `prepare`. This job
+      # never edits package.json: the provenance gate refuses a dirty checkout,
+      # so the value is handed to electron-builder and the server bundler instead.
+      # GITHUB_ENV, not a step env: the packaging step that needs this runs
+      # later in the job, and a step-scoped value would not reach it.
+      #
+      # Two values are pinned, not one (BF-2588):  the app version, which
+      # carries the build in its patch because the Electron updater orders
+      # releases by semver on it, and the marketing version, which is the
+      # version a person sees and the one the app's own Info.plist carries.
+      - name: Resolve the pinned version
+        run: |
+          echo "BOTFLEET_BUILD_VERSION=${{ needs.prepare.outputs.version }}" >> "$GITHUB_ENV"
+          echo "BOTFLEET_MARKETING_VERSION=${{ needs.prepare.outputs.marketing_version }}" >> "$GITHUB_ENV"
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 24
+          node-version: 26
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - name: Clean generated output
         run: rm -rf dist dist-server dist-native release
 
+      # Prefer Infisical values from the dedicated release read token
+      # (INFISICAL_RELEASE_READ_TOKEN) and accept same-named GitHub secrets as a
+      # migration fallback; a release without both values cannot be signed, so
+      # fail here with the missing names.
+      # (Not optional: with them empty the import step below would decode an
+      # empty .p12 and die inside `security import`, and the signature gate
+      # after packaging would fail anyway -- a still-empty vault cannot make
+      # this job green, so stop early with a message that names the secrets.
+      # scripts/release-workflow.node-test.mjs asserts this `required:` line.)
+      - name: Load the Developer ID certificate
+        uses: ./.github/actions/infisical-secrets
+        with:
+          names: MAC_CERT_P12_BASE64 MAC_CERT_PASSWORD
+          required: MAC_CERT_P12_BASE64 MAC_CERT_PASSWORD
+          project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
+          token: ${{ secrets.INFISICAL_RELEASE_READ_TOKEN }}
+        env:
+          GH_FALLBACK_MAC_CERT_P12_BASE64: ${{ secrets.MAC_CERT_P12_BASE64 }}
+          GH_FALLBACK_MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+
       - name: Import the Developer ID certificate into a throwaway keychain
         env:
-          MAC_CERT_P12_BASE64: ${{ secrets.MAC_CERT_P12_BASE64 }}
-          MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+          MAC_CERT_P12_BASE64: ${{ env.MAC_CERT_P12_BASE64 }}
+          MAC_CERT_PASSWORD: ${{ env.MAC_CERT_PASSWORD }}
         run: |
           KEYCHAIN="$RUNNER_TEMP/release.keychain-db"
           KEYCHAIN_PASSWORD="$(uuidgen)"
@@ -101,36 +205,102 @@ jobs:
           security list-keychains -d user -s "$KEYCHAIN" login.keychain
           rm "$RUNNER_TEMP/cert.p12"
 
-      - name: Package both architectures
-        run: pnpm package:mac
+      - name: Resolve the Sentry DSN
+        uses: ./.github/actions/infisical-secrets
+        with:
+          names: SENTRY_DSN VITE_SENTRY_DSN SENTRY_AUTH_TOKEN
+          project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
+          token: ${{ secrets.INFISICAL_RELEASE_READ_TOKEN }}
+        env:
+          GH_FALLBACK_SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          GH_FALLBACK_SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+
+      # Vite inlines VITE_SENTRY_DSN at build time, so it must be in the
+      # environment before the package step runs.  Infisical/GitHub hold no
+      # separate VITE_SENTRY_DSN today, so the Cocoa/Electron DSN doubles as
+      # the web one -- the behavior this replaces, preserved here.  Never
+      # fail the build over a missing DSN -- an inert Sentry beats a red
+      # release.
+      - name: Default VITE_SENTRY_DSN to SENTRY_DSN when unset
+        if: env.VITE_SENTRY_DSN == ''
+        shell: bash
+        env:
+          SENTRY_DSN: ${{ env.SENTRY_DSN }}
+        run: |
+          if [ -n "${SENTRY_DSN:-}" ]; then
+            echo "::add-mask::$SENTRY_DSN"
+            {
+              echo "VITE_SENTRY_DSN<<VITE_SENTRY_DSN_EOF"
+              printf '%s\n' "$SENTRY_DSN"
+              echo "VITE_SENTRY_DSN_EOF"
+            } >> "$GITHUB_ENV"
+          else
+            echo "::warning::SENTRY_DSN and VITE_SENTRY_DSN are both empty after the Infisical prod export and the GitHub secret fallback.  This build packages with Sentry inert."
+          fi
+
+      # The build number reaches electron-builder as extraMetadata, never as an
+      # edit to package.json: the provenance gate refuses a dirty checkout.
+      #
+      # The bundle's own Info.plist carries the two halves the policy splits:
+      # CFBundleShortVersionString is the marketing version 0.1.0, and
+      # CFBundleVersion is the build number, the commit's merge stamp (BF-2588).
+      - name: Package ${{ matrix.arch }}
+        run: |
+          pnpm ${{ matrix.package_script }} \
+            -c.extraMetadata.version="$BOTFLEET_BUILD_VERSION" \
+            -c.mac.bundleShortVersion="$BOTFLEET_MARKETING_VERSION" \
+            -c.mac.bundleVersion="${{ needs.prepare.outputs.build }}"
 
       - name: "Gate: the signature must verify BEFORE notarization"
         run: |
-          for app in release/mac-arm64/BotFleet.app release/mac/BotFleet.app; do
-            codesign --verify --deep --strict "$app"
-            bin="$app/Contents/Resources/cloudflared/cloudflared"
-            test -x "$bin" || { echo "::error::missing executable $bin"; exit 1; }
-            test -f "$app/Contents/Resources/licenses/cloudflared-LICENSE.txt" \
-              || { echo "::error::missing cloudflared license in $app"; exit 1; }
-            test -f "$app/Contents/Resources/licenses/cloudflared-README.md" \
-              || { echo "::error::missing cloudflared provenance in $app"; exit 1; }
-            codesign --verify --strict "$bin"
-            app_team=$(codesign -dv --verbose=4 "$app" 2>&1 | sed -n 's/^TeamIdentifier=//p')
-            bin_team=$(codesign -dv --verbose=4 "$bin" 2>&1 | sed -n 's/^TeamIdentifier=//p')
-            test -n "$app_team" && test "$bin_team" = "$app_team" || {
-              echo "::error::cloudflared is not signed by the app's Developer ID team in $app"; exit 1; }
-            echo "ok: $app"
-          done
+          app="${{ matrix.app }}"
+          codesign --verify --deep --strict "$app"
+          bin="$app/Contents/Resources/cloudflared/cloudflared"
+          test -x "$bin" || { echo "::error::missing executable $bin"; exit 1; }
+          test -f "$app/Contents/Resources/licenses/cloudflared-LICENSE.txt" \
+            || { echo "::error::missing cloudflared license in $app"; exit 1; }
+          test -f "$app/Contents/Resources/licenses/cloudflared-README.md" \
+            || { echo "::error::missing cloudflared provenance in $app"; exit 1; }
+          codesign --verify --strict "$bin"
+          app_team=$(codesign -dv --verbose=4 "$app" 2>&1 | sed -n 's/^TeamIdentifier=//p')
+          bin_team=$(codesign -dv --verbose=4 "$bin" 2>&1 | sed -n 's/^TeamIdentifier=//p')
+          test -n "$app_team" && test "$bin_team" = "$app_team" || {
+            echo "::error::cloudflared is not signed by the app's Developer ID team in $app"; exit 1; }
+          echo "ok: $app"
 
-      - name: "Gate: both packaged servers start and every helper path resolves"
+      # BF-2531: the feed orders by the app version, the Control update by the
+      # bundled Control's Info.plist, and the handshake by the server's
+      # build-identity.json.  The three are stamped in three places, so prove
+      # the packaged bytes agree with the pinned release before notarization:
+      # a stale Control (or server) riding inside a new release would outlive
+      # its server with every other gate green.
+      - name: "Gate: the bundled Control and server carry the pinned release"
         run: |
-          for app in release/mac-arm64/BotFleet.app release/mac/BotFleet.app; do
-            res="$app/Contents/Resources"
-            # the server tree is plain JS — runnable on the runner's node
-            # regardless of the app binary's arch
-            OMB_SMOKE_DIST="$res/server" node scripts/smoke-packaged-server.mjs \
-              || { echo "::error::packaged server in $app failed to start"; exit 1; }
-            node --input-type=module - "$res/server" <<'EOF'
+          node scripts/verify-packaged-versions.mjs "${{ matrix.app }}" \
+            --version "${{ needs.prepare.outputs.version }}" \
+            --build "${{ needs.prepare.outputs.build }}"
+
+      - name: "Gate: the packaged server starts and every helper path resolves (runtime pass or bundle check)"
+        env:
+          MAC_APP: ${{ matrix.app }}
+          CLOUDFLARED_ARCH: ${{ matrix.cloudflared_arch }}
+        run: |
+          app="$MAC_APP"
+          res="$app/Contents/Resources"
+          # BF-1991: the server tree is plain JS, so it starts on the runner's
+          # Node whatever the app binary's arch -- but that is a BUNDLE CHECK,
+          # not a runtime pass.  When this host can exec the packaged binary
+          # (the arm64 entry on an arm64 runner) the gate boots it under
+          # ELECTRON_RUN_AS_NODE=1, which is the runtime the shipped app uses.
+          # The x64 entry cannot exec its own binary here, so it runs and is
+          # LABELLED a bundle check.  Never read a bundle check as a runtime
+          # pass.
+          node scripts/smoke-runtime-mode.mjs gate \
+            --app "$app" \
+            --dist "$res/server" \
+            --summary "$GITHUB_STEP_SUMMARY" \
+            || { echo "::error::packaged server in $app failed to start"; exit 1; }
+          node --input-type=module - "$res/server" <<'EOF'
           import { existsSync } from "node:fs";
           import { pathToFileURL } from "node:url";
           const server = process.argv[2];
@@ -142,29 +312,43 @@ jobs:
           }
           console.log(`ok: ${Object.keys(SPAWNED_PROXIES).length} proxies resolve in ${server}`);
           EOF
-            for bin in "$res/cua-driver" "$res/BotFleet Speech.app/Contents/MacOS/speech-helper"; do
-              lipo -archs "$bin" | grep -q "x86_64" || { echo "::error::$bin lacks x86_64"; exit 1; }
-              lipo -archs "$bin" | grep -q "arm64" || { echo "::error::$bin lacks arm64"; exit 1; }
-            done
-            cloudflared="$res/cloudflared/cloudflared"
-            expected_arch=x86_64
-            case "$app" in *mac-arm64*) expected_arch=arm64 ;; esac
-            test "$(lipo -archs "$cloudflared")" = "$expected_arch" || {
-              echo "::error::$cloudflared is not the expected $expected_arch executable"; exit 1; }
-            if [ "$(uname -m)" = "$expected_arch" ]; then
-              "$cloudflared" version | grep -Fq "cloudflared version 2026.8.2 " || {
-                echo "::error::$cloudflared has the wrong version"; exit 1; }
-            fi
+          for bin in "$res/cua-driver" "$res/BotFleet Speech.app/Contents/MacOS/speech-helper"; do
+            lipo -archs "$bin" | grep -q "x86_64" || { echo "::error::$bin lacks x86_64"; exit 1; }
+            lipo -archs "$bin" | grep -q "arm64" || { echo "::error::$bin lacks arm64"; exit 1; }
           done
+          cloudflared="$res/cloudflared/cloudflared"
+          expected_arch="$CLOUDFLARED_ARCH"
+          test "$(lipo -archs "$cloudflared")" = "$expected_arch" || {
+            echo "::error::$cloudflared is not the expected $expected_arch executable"; exit 1; }
+          if [ "$(uname -m)" = "$expected_arch" ]; then
+            "$cloudflared" version | grep -Fq "cloudflared version 2026.8.2 " || {
+              echo "::error::$cloudflared has the wrong version"; exit 1; }
+          fi
 
-      - name: Notarize all four artifacts
+      # All three names are required -- with GH_FALLBACK_* covering the
+      # cutover while the vault copies are confirmed (orchestrator step 3).
+      - name: Load the notarization credentials
+        uses: ./.github/actions/infisical-secrets
+        with:
+          names: APPLE_API_KEY_P8_BASE64 APPLE_API_KEY_ID APPLE_API_ISSUER_ID
+          required: APPLE_API_KEY_P8_BASE64 APPLE_API_KEY_ID APPLE_API_ISSUER_ID
+          project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
+          token: ${{ secrets.INFISICAL_RELEASE_READ_TOKEN }}
         env:
-          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
-          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
-          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          GH_FALLBACK_APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+          GH_FALLBACK_APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          GH_FALLBACK_APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+
+      - name: Notarize this architecture's DMG and ZIP
+        env:
+          MAC_ARCH: ${{ matrix.arch }}
+          APPLE_API_KEY_P8_BASE64: ${{ env.APPLE_API_KEY_P8_BASE64 }}
+          APPLE_API_KEY_ID: ${{ env.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ env.APPLE_API_ISSUER_ID }}
         run: |
           echo "$APPLE_API_KEY_P8_BASE64" | base64 --decode > "$RUNNER_TEMP/notary.p8"
-          for f in release/*.dmg release/*.zip; do
+          v="${{ needs.prepare.outputs.version }}"
+          for f in "release/BotFleet-$v-$MAC_ARCH.dmg" "release/BotFleet-$v-$MAC_ARCH.zip"; do
             out=$(xcrun notarytool submit "$f" \
               --key "$RUNNER_TEMP/notary.p8" \
               --key-id "$APPLE_API_KEY_ID" \
@@ -175,242 +359,218 @@ jobs:
           done
           rm "$RUNNER_TEMP/notary.p8"
 
-      - name: Staple, re-zip, regenerate blockmaps and the feed
+      - name: Staple, re-zip, and regenerate blockmaps
+        env:
+          MAC_APP: ${{ matrix.app }}
+          MAC_ARCH: ${{ matrix.arch }}
         run: |
-          xcrun stapler staple release/BotFleet-*-arm64.dmg
-          xcrun stapler staple release/BotFleet-*-x64.dmg
-          xcrun stapler staple release/mac-arm64/BotFleet.app
-          xcrun stapler staple release/mac/BotFleet.app
-          v=$(node -p "require('./package.json').version")
-          rm -f "release/BotFleet-$v-arm64.zip" "release/BotFleet-$v-x64.zip"
-          ditto -c -k --sequesterRsrc --keepParent release/mac-arm64/BotFleet.app "release/BotFleet-$v-arm64.zip"
-          ditto -c -k --sequesterRsrc --keepParent release/mac/BotFleet.app "release/BotFleet-$v-x64.zip"
+          v="${{ needs.prepare.outputs.version }}"
+          xcrun stapler staple "release/BotFleet-$v-$MAC_ARCH.dmg"
+          xcrun stapler staple "$MAC_APP"
+          rm -f "release/BotFleet-$v-$MAC_ARCH.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$MAC_APP" "release/BotFleet-$v-$MAC_ARCH.zip"
           node scripts/regenerate-blockmaps.mjs \
-            "release/BotFleet-$v-arm64.zip" "release/BotFleet-$v-x64.zip" \
-            "release/BotFleet-$v-arm64.dmg" "release/BotFleet-$v-x64.dmg"
-          # refreshes every hash from the post-staple bytes and refuses to
-          # finish unless the feed matches the files on disk
-          node scripts/regenerate-mac-feed.mjs
+            "release/BotFleet-$v-$MAC_ARCH.zip" "release/BotFleet-$v-$MAC_ARCH.dmg"
 
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mac-release-${{ matrix.arch }}
+          path: |
+            release/BotFleet-*-${{ matrix.arch }}.dmg
+            release/BotFleet-*-${{ matrix.arch }}.zip
+            release/BotFleet-*-${{ matrix.arch }}.dmg.blockmap
+            release/BotFleet-*-${{ matrix.arch }}.zip.blockmap
+          if-no-files-found: error
+          retention-days: 7
+
+  mac-merge:
+    name: macOS updater feed and stable aliases
+    needs: [prepare, mac]
+    if: always() && !cancelled() && needs.prepare.result == 'success'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+      # One version for the whole release, computed once in `prepare`. This job
+      # never edits package.json: the provenance gate refuses a dirty checkout,
+      # so the value is handed to electron-builder and the server bundler instead.
+      # GITHUB_ENV, not a step env: the packaging step that needs this runs
+      # later in the job, and a step-scoped value would not reach it.
+      - name: Resolve the pinned version
+        run: echo "BOTFLEET_BUILD_VERSION=${{ needs.prepare.outputs.version }}" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        continue-on-error: true
+        with:
+          name: mac-release-arm64
+          path: release
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        continue-on-error: true
+        with:
+          name: mac-release-x64
+          path: release
+      - name: Require at least one signed mac artifact set
+        run: |
+          shopt -s nullglob
+          files=(release/BotFleet-*.dmg)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::no mac release artifacts were produced"
+            exit 1
+          fi
+          echo "mac artifacts: ${files[*]}"
+      - name: Regenerate latest-mac.yml when both architectures built
+        run: |
+          v="${{ needs.prepare.outputs.version }}"
+          if [ -f "release/BotFleet-$v-arm64.dmg" ] && [ -f "release/BotFleet-$v-x64.dmg" ]; then
+            # Pass the pinned version explicitly.  The script's fallback is
+            # package.json's version, which is the FLOOR of the stamp scheme
+            # (1.0.31) and the version already installed on the owner's Mac:
+            # the first unified release died looking for a 1.0.31 artifact that
+            # the 1.0.2193 build had never made.
+            node scripts/regenerate-mac-feed.mjs release/latest-mac.yml "$v"
+          else
+            echo "::warning::skipping latest-mac.yml — not every mac architecture built"
+          fi
       - name: Stable-named copies for the README's /latest/download links
         run: |
-          v=$(node -p "require('./package.json').version")
-          cp "release/BotFleet-$v-arm64.dmg" release/BotFleet.dmg
-          cp "release/BotFleet-$v-x64.dmg" release/BotFleet-intel.dmg
-
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+          v="${{ needs.prepare.outputs.version }}"
+          if [ -f "release/BotFleet-$v-arm64.dmg" ]; then
+            cp "release/BotFleet-$v-arm64.dmg" release/BotFleet.dmg
+          fi
+          if [ -f "release/BotFleet-$v-x64.dmg" ]; then
+            cp "release/BotFleet-$v-x64.dmg" release/BotFleet-intel.dmg
+          fi
+      - name: Stage merged mac artifacts for upload
+        run: |
+          mkdir -p mac-upload
+          shopt -s nullglob
+          for f in release/BotFleet-*.dmg release/BotFleet-*.zip release/BotFleet-*.blockmap \
+            release/BotFleet.dmg release/BotFleet-intel.dmg release/latest-mac.yml; do
+            [ -e "$f" ] && cp "$f" mac-upload/
+          done
+          ls -la mac-upload/
+          test "$(find mac-upload -type f | wc -l)" -gt 0
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: mac-release
-          path: |
-            release/*.dmg
-            release/*.zip
-            release/*.blockmap
-            release/latest-mac.yml
-          if-no-files-found: error
-          retention-days: 7
-
-  windows:
-    name: Windows x64
-    needs: prepare
-    runs-on: windows-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ needs.prepare.outputs.sha }}
-          persist-credentials: false
-      - uses: pnpm/action-setup@ff378ebe6b225b0680b81c1ad4498ae0d1d3a5e3 # v6.0.10
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: 24
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - name: Clean generated output
-        shell: bash
-        run: rm -rf dist dist-server release
-      - run: pnpm package:win
-      - name: Verify the packaged tree and start the packaged server
-        shell: bash
-        run: |
-          res=release/win-unpacked/resources
-          [ -f "$res/server/index.js" ] || { echo "::error::missing server/index.js"; exit 1; }
-          [ -f "$res/ui/index.html" ] || { echo "::error::missing ui/index.html"; exit 1; }
-          [ -f "$res/cloudflared/cloudflared.exe" ] || { echo "::error::missing cloudflared.exe"; exit 1; }
-          [ -f "$res/licenses/cloudflared-LICENSE.txt" ] || { echo "::error::missing cloudflared license"; exit 1; }
-          [ -f "$res/licenses/cloudflared-README.md" ] || { echo "::error::missing cloudflared provenance"; exit 1; }
-          expected=c29eee2b121f5436a642eed69fd9767da7e7b8c510fa50aaa130337f931357b5
-          actual=$(sha256sum "$res/cloudflared/cloudflared.exe" | cut -d' ' -f1)
-          [ "$actual" = "$expected" ] || { echo "::error::cloudflared hash is $actual"; exit 1; }
-          "$res/cloudflared/cloudflared.exe" version | grep -Fq "cloudflared version 2026.8.2 " || {
-            echo "::error::cloudflared has the wrong version"; exit 1; }
-          [ -f "$res/app-update.yml" ] || { echo "::error::missing app-update.yml"; exit 1; }
-          grep -q "botfleet-releases" "$res/app-update.yml" || { echo "::error::wrong update repo"; exit 1; }
-          if grep -q "publisherName" "$res/app-update.yml"; then
-            echo "::error::publisherName on an unsigned build breaks every update"; exit 1
-          fi
-          HOME="$RUNNER_TEMP/smoke" USERPROFILE="$RUNNER_TEMP/smoke" OMB_PORT=21987 \
-            node "$res/server/index.js" > "$RUNNER_TEMP/server.log" 2>&1 &
-          pid=$!
-          for _ in $(seq 1 90); do
-            curl -fsS --max-time 2 http://127.0.0.1:21987/api/health >/dev/null 2>&1 && { kill $pid; exit 0; }
-            kill -0 $pid 2>/dev/null || break
-            sleep 1
-          done
-          echo "::error::the packaged server never served /api/health"
-          cat "$RUNNER_TEMP/server.log" || true
-          exit 1
-      - name: Stable-named copy
-        shell: bash
-        run: |
-          v=$(node -p "require('./package.json').version")
-          cp "release/BotFleet-$v-setup.exe" release/BotFleet-setup.exe
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: windows-release
-          path: |
-            release/*.exe
-            release/*.exe.blockmap
-            release/latest.yml
-          if-no-files-found: error
-          retention-days: 7
-
-  linux:
-    name: Ubuntu 24.04 x64
-    needs: prepare
-    runs-on: ubuntu-24.04
-    timeout-minutes: 40
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ needs.prepare.outputs.sha }}
-          persist-credentials: false
-      - uses: pnpm/action-setup@ff378ebe6b225b0680b81c1ad4498ae0d1d3a5e3 # v6.0.10
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: 24
-          cache: pnpm
-      - name: Install package validation and native smoke tools
-        run: >-
-          sudo apt-get update && sudo apt-get install -y
-          at-spi2-core dbus-x11 desktop-file-utils libxi6 libxkbcommon0 squashfs-tools x11-utils xdotool xvfb
-      - run: pnpm install --frozen-lockfile
-      - name: Clean generated output
-        run: pnpm clean
-      - name: Stage the pinned CUA runtime
-        run: pnpm build:cua:linux
-      - name: Prove overlay-free X11 input routing
-        run: dbus-run-session -- xvfb-run -a pnpm smoke:cua-x11-input
-      - run: pnpm package:linux
-      - name: Verify package contents and metadata
-        run: node scripts/verify-linux-package.mjs
-      - name: Match a normal Ubuntu package parent on the ephemeral runner
-        run: |
-          test ! -L /opt
-          test "$(stat -c '%F %U:%G' /opt)" = "directory root:root"
-          case "$(stat -c '%a' /opt)" in
-            755) ;;
-            775|777) sudo chmod 0755 /opt ;;
-            *) echo "Unexpected /opt mode: $(stat -c '%a' /opt)" >&2; exit 1 ;;
-          esac
-          test "$(stat -c '%U:%G %a' /opt)" = "root:root 755"
-      - name: Reproduce and verify an in-place DEB upgrade
-        run: |
-          deb=(release/*.deb)
-          test "${#deb[@]}" -eq 1
-          sudo --preserve-env=CI,RUNNER_TEMP node scripts/smoke-deb-upgrade.mjs "${deb[0]}"
-      - name: Configure Chromium sandbox for the unpacked app
-        run: |
-          sudo chown root:root release/linux-unpacked/chrome-sandbox
-          sudo chmod 4755 release/linux-unpacked/chrome-sandbox
-          test "$(stat -c '%U:%G %a' release/linux-unpacked/chrome-sandbox)" = "root:root 4755"
-      - name: Smoke the packages
-        env:
-          OMB_KEEP_SMOKE_DIR: "1"
-          OMB_SMOKE_INSTALLED_DEB: "1"
-        run: pnpm smoke:linux-package
-      - name: Remove the installed upgrade fixture
-        if: always()
-        run: sudo dpkg --purge botfleet || true
-      - name: Stable-named copies and checksums
-        run: |
-          v=$(node -p "require('./package.json').version")
-          cp "release/BotFleet-$v-amd64.deb" release/BotFleet-amd64.deb
-          cp "release/BotFleet-$v-x86_64.AppImage" release/BotFleet.AppImage
-          (cd release && sha256sum BotFleet-$v-amd64.deb BotFleet-$v-x86_64.AppImage > SHA256SUMS-ubuntu-x64.txt)
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: linux-release
-          path: |
-            release/*.deb
-            release/*.AppImage
-            release/SHA256SUMS-ubuntu-x64.txt
-            release/latest-linux.yml
+          path: mac-upload/
           if-no-files-found: error
           retention-days: 7
 
   assemble:
-    name: Assemble the draft and verify every feed
-    needs: [prepare, mac, windows, linux]
-    runs-on: ubuntu-24.04
+    name: Assemble and verify every feed
+    needs: [prepare, mac-merge]
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+      # One version for the whole release, computed once in `prepare`. This job
+      # never edits package.json: the provenance gate refuses a dirty checkout,
+      # so the value is handed to electron-builder and the server bundler instead.
+      # GITHUB_ENV, not a step env: the packaging step that needs this runs
+      # later in the job, and a step-scoped value would not reach it.
+      - name: Resolve the pinned version
+        run: echo "BOTFLEET_BUILD_VERSION=${{ needs.prepare.outputs.version }}" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: assets
           merge-multiple: true
       - name: Verify every feed hash against the actual bytes
-        run: |
-          cd assets
-          node --input-type=module - <<'EOF'
-          import { createHash } from "node:crypto";
-          import { readFileSync, readdirSync, statSync, existsSync } from "node:fs";
-          const sha512 = (f) => createHash("sha512").update(readFileSync(f)).digest("base64");
-          let bad = 0;
-          for (const feed of ["latest-mac.yml", "latest.yml", "latest-linux.yml"]) {
-            if (!existsSync(feed)) continue;
-            const text = readFileSync(feed, "utf8");
-            for (const [, url, hash, size] of text.matchAll(/url:\s+(\S+)[\s\S]*?sha512:\s+(\S+)\n\s+size:\s+(\d+)/g)) {
-              if (!existsSync(url)) { console.error(`MISSING ${url} (listed in ${feed})`); bad++; continue; }
-              const okHash = sha512(url) === hash;
-              const okSize = statSync(url).size === Number(size);
-              if (!okHash || !okSize) { console.error(`MISMATCH ${url} in ${feed}`); bad++; }
-              else console.log(`ok ${url}`);
-            }
-          }
-          if (bad) process.exit(1);
-          console.log(`\nall feeds verified; ${readdirSync(".").length} assets staged`);
-          EOF
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: node scripts/verify-release-assets.mjs assets "$VERSION"
+      - name: Preserve the complete verified release set
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: botfleet-release-${{ needs.prepare.outputs.version }}-${{ needs.prepare.outputs.sha }}
+          path: assets
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Create the GitHub release
+    if: ${{ inputs.draft || inputs.publish }}
+    needs: [prepare, assemble]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    concurrency:
+      group: release-${{ needs.prepare.outputs.version }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+      # One version for the whole release, computed once in `prepare`. This job
+      # never edits package.json: the provenance gate refuses a dirty checkout,
+      # so the value is handed to electron-builder and the server bundler instead.
+      # GITHUB_ENV, not a step env: the packaging step that needs this runs
+      # later in the job, and a step-scoped value would not reach it.
+      - name: Resolve the pinned version
+        run: echo "BOTFLEET_BUILD_VERSION=${{ needs.prepare.outputs.version }}" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: botfleet-release-${{ needs.prepare.outputs.version }}-${{ needs.prepare.outputs.sha }}
+          path: assets
       - name: Create or update the draft with the complete asset set
         env:
-          GH_TOKEN: ${{ secrets.RELEASES_PAT }}
+          GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.prepare.outputs.version }}
           SHA: ${{ needs.prepare.outputs.sha }}
         run: |
+          node scripts/verify-release-tag.mjs
           cd assets
           tag="v$VERSION"
-          notes="Draft assembled by the release workflow from milind-soni/BotFleet@$SHA. Edit these notes, then publish."
-          # Predecessor installs read app-update.yml from openmausbot-releases.
-          for repo in milind-soni/botfleet-releases milind-soni/openmausbot-releases; do
-            if ! gh release view "$tag" --repo "$repo" > /dev/null 2>&1; then
-              gh release create "$tag" --repo "$repo" \
-                --draft --title "BotFleet $VERSION" \
-                --notes "$notes"
+          notes="Draft assembled by the release workflow from $RELEASES_REPO@$SHA.  Edit these notes, then publish."
+          if existing=$(gh api "repos/$RELEASES_REPO/releases/tags/$tag" 2>/dev/null); then
+            is_draft=$(jq -r .draft <<< "$existing")
+            existing_target=$(jq -r .target_commitish <<< "$existing")
+            if [ "$is_draft" != true ]; then
+              echo "::error::$tag is already published; refusing to replace its assets"
+              exit 1
             fi
-            for f in *; do
-              gh release upload "$tag" "$f" --repo "$repo" --clobber
-            done
-            echo "$repo asset count: $(gh release view "$tag" --repo "$repo" --json assets --jq '.assets | length')"
+            if [ "$existing_target" != "$SHA" ]; then
+              echo "::error::$tag existing draft targets $existing_target, not pinned $SHA"
+              exit 1
+            fi
+          else
+            gh release create "$tag" --repo "$RELEASES_REPO" \
+              --draft --target "$SHA" --title "BotFleet $VERSION" \
+              --notes "$notes"
+          fi
+          while IFS= read -r old_asset; do
+            if [ ! -f "$old_asset" ]; then
+              gh release delete-asset "$tag" "$old_asset" --repo "$RELEASES_REPO" --yes
+            fi
+          done < <(gh release view "$tag" --repo "$RELEASES_REPO" --json assets --jq '.assets[].name')
+          for f in *; do
+            gh release upload "$tag" "$f" --repo "$RELEASES_REPO" --clobber
           done
+          echo "$RELEASES_REPO asset count: $(gh release view "$tag" --repo "$RELEASES_REPO" --json assets --jq '.assets | length')"
+
+      - name: Download and verify the uploaded draft bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          mkdir uploaded
+          gh release download "v$VERSION" --repo "$RELEASES_REPO" --dir uploaded
+          node scripts/verify-release-assets.mjs uploaded "$VERSION"
 
       - name: Publish (only when asked to)
         if: ${{ inputs.publish }}
         env:
-          GH_TOKEN: ${{ secrets.RELEASES_PAT }}
+          GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          for repo in milind-soni/botfleet-releases milind-soni/openmausbot-releases; do
-            gh release edit "v$VERSION" --repo "$repo" --draft=false --latest
-            # a draft that LOOKS published is the 0.1.24 failure mode — verify
-            gh release view "v$VERSION" --repo "$repo" --json isDraft --jq .isDraft | grep -q false
-            echo "v$VERSION is live on $repo"
-          done
+          gh release edit "v$VERSION" --repo "$RELEASES_REPO" --draft=false --latest
+          # a draft that LOOKS published is the 0.1.24 failure mode — verify
+          gh release view "v$VERSION" --repo "$RELEASES_REPO" --json isDraft --jq .isDraft | grep -q false
+          echo "v$VERSION is live on $RELEASES_REPO"

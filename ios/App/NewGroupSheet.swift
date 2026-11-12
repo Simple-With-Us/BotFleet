@@ -1,7 +1,4 @@
-// Make a room from the phone: a name, and which bots are in it.
-//
-// The harness names it after the first member if the name is left blank,
-// which is what the desktop's dialog does too — one rule, two screens.
+// Make a room from the phone: a name, working directory, bulletin, responder, and members.
 import SwiftUI
 import CompanionCore
 
@@ -10,25 +7,61 @@ struct NewGroupSheet: View {
     @EnvironmentObject private var session: Session
     @Environment(\.dismiss) private var dismiss
     @State private var name = ""
+    @State private var cwd = ""
+    @State private var bulletin = ""
+    @State private var responderKind = "everyone"
+    @State private var leadBotId = ""
     @State private var members = Set<String>()
     @State private var creating = false
 
     private var bots: [Bot] { session.state.bots.filter { $0.hidden != true } }
+    private var roomTerm: String { session.config?.roomTerminologyLabel ?? "Channel" }
 
     var body: some View {
         NavigationStack {
             List {
-                Section {
-                    TextField("Group name (optional)", text: $name)
+                Section("\(roomTerm) Details") {
+                    TextField("\(roomTerm) name (optional)", text: $name)
                         .autocorrectionDisabled()
+                    TextField("Working directory path on host (optional)", text: $cwd)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                    TextField("Bulletin (Shared Brief for the team)", text: $bulletin, axis: .vertical)
+                        .lineLimit(2...5)
                 }
+
+                Section("Default Responder") {
+                    Picker("Responder Mode", selection: $responderKind) {
+                        Text("Everyone responds").tag("everyone")
+                        Text("Lead bot").tag("member")
+                        Text("Only when mentioned").tag("mentions")
+                    }
+
+                    if responderKind == "member" {
+                        Picker("Lead Bot", selection: $leadBotId) {
+                            Text("Select lead bot").tag("")
+                            ForEach(bots.filter { members.contains($0.id) }) { bot in
+                                Text(bot.name).tag(bot.id)
+                            }
+                        }
+                    }
+                }
+
                 Section("Bots") {
                     ForEach(bots) { bot in
                         Button {
-                            if members.contains(bot.id) { members.remove(bot.id) } else { members.insert(bot.id) }
+                            if members.contains(bot.id) {
+                                members.remove(bot.id)
+                                if leadBotId == bot.id {
+                                    leadBotId = bots.map(\.id).first(where: members.contains) ?? ""
+                                }
+                            } else {
+                                members.insert(bot.id)
+                                if leadBotId.isEmpty { leadBotId = bot.id }
+                            }
                         } label: {
                             HStack(spacing: 12) {
-                                BotAvatarView(bot: bot, size: 36, state: .idle, animated: false)
+                                BotAvatarWithProviderBadge(bot: bot, size: 36, state: .idle, animated: false)
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(bot.name).font(.system(size: 16, weight: .semibold)).foregroundStyle(Color.primary)
                                     if !bot.title.isEmpty {
@@ -38,14 +71,14 @@ struct NewGroupSheet: View {
                                 Spacer()
                                 Image(systemName: members.contains(bot.id) ? "checkmark.circle.fill" : "circle")
                                     .font(.system(size: 22))
-                                    .foregroundStyle(members.contains(bot.id) ? MausPalette.color(bot.color) : Color.secondary.opacity(0.4))
+                                    .foregroundStyle(members.contains(bot.id) ? BotPalette.color(bot.color) : Color.secondary.opacity(0.4))
                             }
                         }
                         .buttonStyle(.plain)
                     }
                 }
             }
-            .navigationTitle("New group")
+            .navigationTitle("New \(roomTerm.lowercased())")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -55,10 +88,25 @@ struct NewGroupSheet: View {
                     Button("Create") {
                         creating = true
                         Task {
-                            // members in roster order, so the room's name (if
-                            // it defaults) follows the first bot you picked
                             let ordered = bots.map(\.id).filter(members.contains)
-                            if let room = await session.createRoom(name: name, memberIds: ordered) {
+                            // One request, so a refusal leaves no room behind.
+                            // The folder, bulletin and responder used to follow
+                            // the create in a PATCH: a folder this computer
+                            // would not let a phone choose (403) then left a
+                            // half-made room, and the message about it, behind.
+                            let responder: GroupResponder? = responderKind == "everyone"
+                                ? nil
+                                : GroupResponder(
+                                    kind: responderKind,
+                                    botId: responderKind == "member" ? (leadBotId.isEmpty ? nil : leadBotId) : nil
+                                )
+                            if let room = await session.createRoom(
+                                name: name,
+                                memberIds: ordered,
+                                cwd: cwd,
+                                bulletin: bulletin,
+                                defaultResponder: responder
+                            ) {
                                 created(room)
                             }
                             creating = false

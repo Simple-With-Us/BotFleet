@@ -13,16 +13,19 @@ export function RenameTitle({
   onEditingChange,
   onActivate,
   showEditButton = false,
+  embedded = false,
   className,
   inputClassName,
 }: {
   value: string;
   onCommit: (next: string) => void;
   onEditingChange?: (editing: boolean) => void;
-  /** Optional single-click action for locations where the title opens a profile. */
+  /** Optional single-click action for locations where the title opens a profile or selects. */
   onActivate?: () => void;
   /** Preserve deliberate inline rename beside an onActivate title. */
   showEditButton?: boolean;
+  /** When embedded inside an outer interactive row or button, avoid nested role="button"/tabIndex. */
+  embedded?: boolean;
   className?: string;
   inputClassName?: string;
 }) {
@@ -87,24 +90,42 @@ export function RenameTitle({
           <button
             type="button"
             onClick={onActivate}
-            aria-label={`Open ${value}'s profile`}
+            aria-label={`Open ${value}'s Profile`}
             className={cn("min-w-0 truncate text-left", className)}
-            title="Open agent profile"
+            // callers pass a truncating className, so the hover has to carry
+            // the whole name as well as the action
+            title={`${value} · Open Bot Profile`}
           >
             {value}
           </button>
         ) : (
-          <span className={cn("min-w-0 truncate", className)}>{value}</span>
+          <span className={cn("min-w-0 truncate", className)} title={value}>{value}</span>
         )}
         <button
           type="button"
           onClick={startRename}
           aria-label={`Rename ${value}`}
-          title="Rename agent"
+          title="Rename Bot"
           className="flex size-10 shrink-0 items-center justify-center rounded text-ink-secondary opacity-70 hover:bg-raised hover:text-ink hover:opacity-100"
         >
-          <Pencil size={12} />
+          <Pencil size={12} aria-hidden="true" />
         </button>
+      </span>
+    );
+  }
+
+  if (embedded) {
+    return (
+      <span
+        className={cn("cursor-pointer select-none", className)}
+        title={`${value} · Double-click to rename`}
+        onClick={(e) => {
+          e.stopPropagation();
+          onActivate?.();
+        }}
+        onDoubleClick={startRename}
+      >
+        {value}
       </span>
     );
   }
@@ -112,7 +133,7 @@ export function RenameTitle({
   return (
     <span
       className={cn("cursor-text", className)}
-      title="Double-click to rename"
+      title={`${value} · Double-click to rename`}
       tabIndex={0}
       role="button"
       aria-label={`Rename ${value}`}

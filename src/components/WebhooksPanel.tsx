@@ -19,6 +19,7 @@ import {
 } from "lucide-react";
 
 import { BotAvatar } from "@/components/Avatar";
+import { TriggerErrorBadge } from "@/components/TriggerErrorBadge";
 import { stateForBot } from "@/lib/mascot";
 import { cn } from "@/lib/cn";
 import type { RoutineRun, RoutineRunOn } from "@/lib/routines";
@@ -85,8 +86,9 @@ function WebhookEditor({ webhook, bots, onClose, onCredential }: { webhook?: Web
   const [botId, setBotId] = useState(webhook?.botId ?? bots[0]?.id ?? "");
   const [name, setName] = useState(webhook?.name ?? "");
   const [prompt, setPrompt] = useState(webhook?.prompt ?? "");
-  const [runOn, setRunOn] = useState<RoutineRunOn>(webhook?.runOn ?? "maus");
+  const [runOn, setRunOn] = useState<RoutineRunOn>(webhook?.runOn ?? "bot");
   const [eventTypes, setEventTypes] = useState((webhook?.eventTypes ?? []).join(", "));
+  const [minGap, setMinGap] = useState(String(webhook?.minGapMinutes ?? 0));
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const cloudInstance = state.instances.find((instance) => instance.driverKind === "boxAgent");
@@ -94,7 +96,7 @@ function WebhookEditor({ webhook, bots, onClose, onCredential }: { webhook?: Web
 
   const save = async () => {
     const bot = bots.find((candidate) => candidate.id === botId);
-    const input: WebhookTriggerInput = { name: name.trim() || suggestedName(prompt, bot), prompt: prompt.trim(), botId, runOn, ...webhookActivationDefaults(webhook), eventTypes: eventTypes.split(",").map((value) => value.trim()).filter(Boolean) };
+    const input: WebhookTriggerInput = { name: name.trim() || suggestedName(prompt, bot), prompt: prompt.trim(), botId, runOn, ...webhookActivationDefaults(webhook), eventTypes: eventTypes.split(",").map((value) => value.trim()).filter(Boolean), minGapMinutes: Math.max(0, Math.min(1440, Math.round(Number(minGap) || 0))) };
     setSaving(true);
     setError("");
     try {
@@ -112,22 +114,23 @@ function WebhookEditor({ webhook, bots, onClose, onCredential }: { webhook?: Web
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-5 backdrop-blur-sm" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
       <div className="flex max-h-[90vh] w-full max-w-[590px] flex-col overflow-hidden rounded-2xl border border-hairline/60 bg-panel shadow-2xl">
-        <div className="flex items-start justify-between border-b border-hairline/40 px-5 py-4"><div><div className="text-[17px] font-semibold text-ink">{webhook ? "Edit webhook" : "New local webhook"}</div><div className="mt-1 text-[12px] text-ink-secondary">Each request starts a new task in the bot's chat.</div></div><button onClick={onClose} className="rounded-lg p-2 text-ink-secondary hover:bg-raised hover:text-ink"><X size={18} /></button></div>
+        <div className="flex items-start justify-between border-b border-hairline/40 px-5 py-4"><div><div className="text-[17px] font-semibold text-ink">{webhook ? "Edit Webhook" : "New Local Webhook"}</div><div className="mt-1 text-[12px] text-ink-secondary">Each request starts a new task in the bot's chat.</div></div><button type="button" onClick={onClose} aria-label="Close" className="inline-flex size-11 items-center justify-center rounded-lg text-ink-secondary hover:bg-raised hover:text-ink"><X size={18} /></button></div>
         <div className="min-h-0 flex-1 space-y-5 overflow-y-auto p-5">
-          <div><div className="mb-2 text-[12px] font-medium text-ink-secondary">Who receives the tasks?</div><div className="grid grid-cols-2 gap-2 sm:grid-cols-3">{bots.map((bot) => <button key={bot.id} type="button" onClick={() => setBotId(bot.id)} className={cn("flex min-w-0 items-center gap-2 rounded-xl border px-3 py-2 text-left", botId === bot.id ? "border-accent/70 bg-accent/10" : "border-hairline/50 bg-inset hover:bg-raised/60")}><BotAvatar bot={bot} state={botId === bot.id ? "happy" : stateForBot(bot)} size={38} animated={false} /><span className="min-w-0 flex-1 truncate text-[13px] font-medium text-ink">{bot.name}</span></button>)}</div></div>
+          <div><div className="mb-2 text-[12px] font-medium text-ink-secondary">Who receives the tasks?</div><div className="grid grid-cols-2 gap-2 sm:grid-cols-3">{bots.map((bot) => <button key={bot.id} type="button" onClick={() => setBotId(bot.id)} className={cn("flex min-w-0 items-center gap-2 rounded-xl border px-3 py-2 text-left", botId === bot.id ? "border-accent/70 bg-accent/10" : "border-hairline/50 bg-inset hover:bg-raised/60")}><BotAvatar bot={bot} state={botId === bot.id ? "happy" : stateForBot(bot)} size={38} animated={false} /><span className="min-w-0 flex-1 truncate text-[13px] font-medium text-ink" title={bot.name}>{bot.name}</span></button>)}</div></div>
           <div className="rounded-xl border border-accent/20 bg-accent/5 px-3.5 py-3 text-[11.5px] leading-relaxed text-ink-secondary">Send the task in the request: <code className="text-ink">{`{"task":"Check the failed build"}`}</code>. The bot keeps its model, tools, permissions, and computer setup.</div>
           <details className="group rounded-xl border border-hairline/45 bg-inset/45 px-4 py-3" open={Boolean(webhook)}>
-            <summary className="cursor-pointer text-[12.5px] font-medium text-ink">Advanced options</summary>
+            <summary className="cursor-pointer text-[12.5px] font-medium text-ink">Advanced Options</summary>
             <div className="mt-4 space-y-4">
               <label className="block"><span className="mb-1.5 block text-[11.5px] font-medium text-ink-secondary">Name <span className="font-normal">· optional</span></span><input value={name} onChange={(event) => setName(event.target.value)} placeholder={suggestedName(prompt, bots.find((bot) => bot.id === botId))} className="w-full rounded-xl border border-hairline/60 bg-panel px-3.5 py-2.5 text-[13px] text-ink outline-none placeholder:text-ink-secondary/60 focus:border-accent/70" /></label>
-              <label className="block"><span className="mb-1.5 block text-[11.5px] font-medium text-ink-secondary">Default instructions <span className="font-normal">· optional</span></span><textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} rows={3} placeholder="For every event, summarize what happened and suggest the next step…" className="w-full resize-y rounded-xl border border-hairline/60 bg-panel px-3.5 py-3 text-[13px] leading-relaxed text-ink outline-none placeholder:text-ink-secondary/60 focus:border-accent/70" /><span className="mt-1.5 block text-[10.5px] leading-relaxed text-ink-secondary">Use this only when every event needs the same handling rule. Otherwise the request’s task is used.</span></label>
-              <div><div className="mb-2 text-[11.5px] font-medium text-ink-secondary">Run on</div><div className="grid grid-cols-2 gap-2"><button type="button" onClick={() => setRunOn("maus")} className={cn("rounded-xl border p-3 text-left", runOn === "maus" ? "border-accent/70 bg-accent/10" : "border-hairline/50 bg-panel hover:bg-raised/60")}><div className="flex items-center gap-2 text-[12.5px] font-medium text-ink"><Laptop size={14} />This computer</div></button><button type="button" disabled={!cloudReady && runOn !== "cloud"} onClick={() => setRunOn("cloud")} className={cn("rounded-xl border p-3 text-left disabled:cursor-not-allowed disabled:opacity-45", runOn === "cloud" ? "border-accent/70 bg-accent/10" : "border-hairline/50 bg-panel hover:bg-raised/60")}><div className="flex items-center gap-2 text-[12.5px] font-medium text-ink"><Cloud size={14} />Cloud VM</div></button></div></div>
+              <label className="block"><span className="mb-1.5 block text-[11.5px] font-medium text-ink-secondary">Handling Rule <span className="font-normal">· optional</span></span><textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} rows={3} placeholder="For every event, summarize what happened and suggest the next step…" className="w-full resize-y rounded-xl border border-hairline/60 bg-panel px-3.5 py-3 text-[13px] leading-relaxed text-ink outline-none placeholder:text-ink-secondary/60 focus:border-accent/70" /><span className="mt-1.5 block text-[10.5px] leading-relaxed text-ink-secondary">Use this only when every event needs the same handling rule.{'\u00A0 '}Otherwise the request’s task is used.</span></label>
+              <div><div className="mb-2 text-[11.5px] font-medium text-ink-secondary">Run On</div><div className="grid grid-cols-2 gap-2"><button type="button" onClick={() => setRunOn("bot")} className={cn("rounded-xl border p-3 text-left", runOn === "bot" ? "border-accent/70 bg-accent/10" : "border-hairline/50 bg-panel hover:bg-raised/60")}><div className="flex items-center gap-2 text-[12.5px] font-medium text-ink"><Laptop size={14} />This Computer</div></button><button type="button" disabled={!cloudReady && runOn !== "cloud"} onClick={() => setRunOn("cloud")} className={cn("rounded-xl border p-3 text-left disabled:cursor-not-allowed disabled:opacity-45", runOn === "cloud" ? "border-accent/70 bg-accent/10" : "border-hairline/50 bg-panel hover:bg-raised/60")}><div className="flex items-center gap-2 text-[12.5px] font-medium text-ink"><Cloud size={14} />ASCII.dev Box</div></button></div></div>
               <label className="block"><span className="mb-1.5 block text-[11.5px] font-medium text-ink-secondary">Only accept event types <span className="font-normal">· optional</span></span><input value={eventTypes} onChange={(event) => setEventTypes(event.target.value)} placeholder="push, workflow_run" className="w-full rounded-xl border border-hairline/60 bg-panel px-3.5 py-2.5 text-[13px] text-ink outline-none placeholder:text-ink-secondary/60 focus:border-accent/70" /><span className="mt-1.5 block text-[10.5px] text-ink-secondary">Comma-separated values from the sender’s event-type header.</span></label>
+              <label className="block"><span className="mb-1.5 block text-[11.5px] font-medium text-ink-secondary">Wait between activations <span className="font-normal">· optional</span></span><div className="flex items-center gap-2"><input type="number" min={0} max={1440} value={minGap} onChange={(event) => setMinGap(event.target.value)} className="w-24 rounded-xl border border-hairline/60 bg-panel px-3.5 py-2.5 text-[13px] text-ink outline-none focus:border-accent/70" /><span className="text-[12px] text-ink-secondary">minutes</span></div><span className="mt-1.5 block text-[12px] leading-relaxed text-ink-secondary">After this webhook runs, it stays quiet this long.{'\u00A0 '}Requests that arrive meanwhile are not dropped.{'\u00A0 '}They wait and go into one task when the time is up.{'\u00A0 '}Use 0 to run every request as it arrives.</span></label>
             </div>
           </details>
           {error && <div className="rounded-xl border border-danger/30 bg-danger/10 px-3.5 py-3 text-[12px] text-danger">{error}</div>}
         </div>
-        <div className="flex justify-end gap-2 border-t border-hairline/40 px-5 py-4"><button onClick={onClose} className="rounded-xl px-4 py-2 text-[13px] text-ink-secondary hover:bg-raised hover:text-ink">Cancel</button><button disabled={saving || !botId} onClick={() => void save()} className="flex items-center gap-2 rounded-xl bg-accent px-4 py-2 text-[13px] font-medium text-white hover:brightness-110 disabled:opacity-40">{saving && <Loader2 size={14} className="animate-spin" />}{webhook ? "Save changes" : "Create local webhook"}</button></div>
+        <div className="flex justify-end gap-2 border-t border-hairline/40 px-5 py-4"><button onClick={onClose} className="rounded-xl px-4 py-2 text-[13px] text-ink-secondary hover:bg-raised hover:text-ink">Cancel</button><button disabled={saving || !botId} onClick={() => void save()} className="flex items-center gap-2 rounded-xl bg-accent px-4 py-2 text-[13px] font-medium text-white hover:brightness-110 disabled:opacity-40">{saving && <Loader2 size={14} className="animate-spin" />}{webhook ? "Save Changes" : "Create Local Webhook"}</button></div>
       </div>
     </div>
   );
@@ -242,17 +245,17 @@ export function WebhooksPanel({ bots }: { bots: Bot[] }) {
           <div>
             <div className="flex items-center gap-2">
               <h2 className="text-[17px] font-semibold text-ink">Webhooks</h2>
-              <span className="rounded-md bg-accent/10 px-1.5 py-0.5 text-[9px] font-medium uppercase tracking-wider text-accent">Local beta</span>
+              <span className="rounded-md bg-accent/10 px-2 py-0.5 text-[11px] font-medium text-accent">Local Beta</span>
             </div>
             <p className="mt-1 text-[12px] text-ink-secondary">Send a task to a bot when another tool reports an event.</p>
           </div>
           <div className="flex items-center gap-3">
             <div className={cn("hidden items-center gap-1.5 text-[10.5px] sm:flex", ingress?.available ? "text-success" : "text-danger")}>
               <span className={cn("size-1.5 rounded-full", ingress?.available ? "bg-success" : "bg-danger")} />
-              {ingress?.available ? "Receiver running" : ingress?.error ?? "Receiver unavailable"}
+              {ingress?.available ? "Ready to receive" : ingress?.error ?? "Not ready to receive"}
             </div>
             <button onClick={() => setEditor("new")} disabled={bots.length === 0} className="flex items-center gap-2 rounded-xl bg-accent px-3.5 py-2 text-[12.5px] font-medium text-white hover:brightness-110 disabled:opacity-40">
-              <Plus size={15} />New webhook
+              <Plus size={15} />New Webhook
             </button>
           </div>
         </header>
@@ -262,9 +265,9 @@ export function WebhooksPanel({ bots }: { bots: Bot[] }) {
         {state.webhooks.length === 0 ? (
           <div className="border-t border-hairline/40 px-6 py-16 text-center">
             <div className="mx-auto mb-4 flex size-12 items-center justify-center rounded-2xl bg-accent/10 text-accent"><Send size={23} /></div>
-            <h3 className="text-[16px] font-semibold text-ink">Create your first webhook</h3>
-            <p className="mx-auto mt-2 max-w-[420px] text-[12.5px] leading-relaxed text-ink-secondary">Choose a bot, copy one command, and every request becomes a new task in its chat.</p>
-            <button onClick={() => setEditor("new")} disabled={bots.length === 0} className="mt-5 inline-flex items-center gap-2 rounded-xl bg-accent px-4 py-2.5 text-[13px] font-medium text-white hover:brightness-110 disabled:opacity-40"><Plus size={15} />Create local webhook</button>
+            <h3 className="text-[16px] font-semibold text-ink">No Guided Setup Yet</h3>
+            <p className="mx-auto mt-2 max-w-[420px] text-[13px] leading-relaxed text-ink-secondary">Send a task to a bot when another app reports an event.{'\u00A0 '}Pick a bot, copy one command, and each request starts a new task in that chat.{'\u00A0 '}Setup guides for specific apps are not here yet.</p>
+            <button onClick={() => setEditor("new")} disabled={bots.length === 0} className="mt-5 inline-flex items-center gap-2 rounded-xl bg-accent px-4 py-2.5 text-[13px] font-medium text-white hover:brightness-110 disabled:opacity-40"><Plus size={15} />Create Local Webhook</button>
             {bots.length === 0 && <p className="mt-3 text-[12px] text-warning">Create a bot first, then come back here.</p>}
           </div>
         ) : selected && (
@@ -279,13 +282,17 @@ export function WebhooksPanel({ bots }: { bots: Bot[] }) {
                   const bot = bots.find((candidate) => candidate.id === webhook.botId);
                   const status = statusFor(webhook);
                   return (
-                    <button key={webhook.id} onClick={() => { setSelectedId(webhook.id); setTab("setup"); setError(""); }} className={cn("flex min-w-[210px] items-center gap-2.5 rounded-xl px-2.5 py-2.5 text-left transition-colors md:w-full md:min-w-0", webhook.id === selected.id ? "bg-raised text-ink shadow-sm" : "text-ink-secondary hover:bg-raised/55 hover:text-ink")}>
-                      {bot ? <BotAvatar bot={bot} state={webhook.enabled ? stateForBot(bot) : "sleeping"} size={36} animated={false} label={bot.name} /> : <div className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-raised text-ink-secondary"><Webhook size={16} /></div>}
-                      <span className="min-w-0 flex-1">
-                        <span className="block truncate text-[12.5px] font-medium">{webhook.name}</span>
-                        <span className="mt-0.5 flex items-center gap-1.5 text-[10px]"><span className={cn("size-1.5 rounded-full", status.dot)} /><span className={status.tone}>{status.label}</span></span>
-                      </span>
-                    </button>
+                    <div key={webhook.id} className="flex min-w-[210px] items-center gap-1 md:w-full md:min-w-0">
+                      <button onClick={() => { setSelectedId(webhook.id); setTab("setup"); setError(""); }} className={cn("flex min-w-0 flex-1 items-center gap-2.5 rounded-xl px-2.5 py-2.5 text-left transition-colors", webhook.id === selected.id ? "bg-raised text-ink shadow-sm" : "text-ink-secondary hover:bg-raised/55 hover:text-ink")}>
+                        {bot ? <BotAvatar bot={bot} state={webhook.enabled ? stateForBot(bot) : "sleeping"} size={36} animated={false} label={bot.name} /> : <div className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-raised text-ink-secondary"><Webhook size={16} /></div>}
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate text-[12.5px] font-medium" title={webhook.name}>{webhook.name}</span>
+                          <span className="mt-0.5 flex items-center gap-1.5 text-[10px]"><span className={cn("size-1.5 rounded-full", status.dot)} /><span className={status.tone}>{status.label}</span></span>
+                        </span>
+                      </button>
+                      {/* A sibling rather than a child: the row above is a button, and a button inside a button is not a button. */}
+                      <TriggerErrorBadge triggerId={webhook.id} name={webhook.name} source="webhook" />
+                    </div>
                   );
                 })}
               </nav>
@@ -296,13 +303,13 @@ export function WebhooksPanel({ bots }: { bots: Bot[] }) {
                 <div className="flex min-w-0 items-center gap-3">
                   {selectedBot ? <BotAvatar bot={selectedBot} state={selected.enabled ? stateForBot(selectedBot) : "sleeping"} size={44} animated={false} label={selectedBot.name} /> : <div className="flex size-11 items-center justify-center rounded-xl bg-raised text-ink-secondary"><Webhook size={18} /></div>}
                   <div className="min-w-0">
-                    <h3 className="truncate text-[17px] font-semibold text-ink">{selected.name}</h3>
-                    <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[10.5px] text-ink-secondary"><span>{selectedBot?.name ?? "Deleted bot"}</span><span>·</span><span>{selected.runOn === "cloud" ? "Cloud VM" : "This computer"}</span></div>
+                    <h3 className="truncate text-[17px] font-semibold text-ink" title={selected.name}>{selected.name}</h3>
+                    <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[10.5px] text-ink-secondary"><span>{selectedBot?.name ?? "Deleted bot"}</span><span>·</span><span>{selected.runOn === "cloud" ? "ASCII.dev Box" : "This computer"}</span></div>
                   </div>
                 </div>
                 <div className="flex items-center gap-2">
                   {!selected.verificationPending && <button disabled={Boolean(working)} onClick={() => void invoke(selected, "toggle")} className={cn("flex items-center gap-1.5 rounded-lg px-3 py-2 text-[11.5px] font-medium", selected.enabled ? "bg-raised text-ink-secondary hover:text-ink" : "bg-accent text-white hover:brightness-110")}>{selected.enabled ? <Pause size={13} /> : <Play size={13} />}{selected.enabled ? "Pause" : "Enable"}</button>}
-                  <details className="relative"><summary className="list-none rounded-lg p-2 text-ink-secondary hover:bg-raised hover:text-ink"><MoreHorizontal size={17} /></summary><div className="absolute right-0 top-full z-20 mt-1 w-[180px] rounded-xl border border-hairline/50 bg-card p-1.5 shadow-2xl"><button onClick={() => setEditor(selected)} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-[12px] text-ink hover:bg-raised">Edit settings</button><button onClick={() => void invoke(selected, "delete")} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-[12px] text-danger hover:bg-danger/10"><Trash2 size={13} />Delete</button></div></details>
+                  <details className="relative"><summary aria-label="More Actions" className="inline-flex size-11 list-none items-center justify-center rounded-lg text-ink-secondary hover:bg-raised hover:text-ink"><MoreHorizontal size={17} /></summary><div className="absolute right-0 top-full z-20 mt-1 w-[180px] rounded-xl border border-hairline/50 bg-card p-1.5 shadow-2xl"><button onClick={() => setEditor(selected)} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-[12px] text-ink hover:bg-raised">Edit Settings</button><button onClick={() => void invoke(selected, "delete")} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-[12px] text-danger hover:bg-danger/10"><Trash2 size={13} />Delete</button></div></details>
                 </div>
               </div>
 
@@ -314,40 +321,40 @@ export function WebhooksPanel({ bots }: { bots: Bot[] }) {
               {tab === "setup" ? (
                 <div className="px-5 py-6 md:px-7">
                   <div className="max-w-[720px]">
-                    <h4 className="text-[14px] font-semibold text-ink">Send a task</h4>
+                    <h4 className="text-[14px] font-semibold text-ink">Send a Task</h4>
                     <p className="mt-1 text-[11.5px] leading-relaxed text-ink-secondary">Copy this command into Terminal and press Return. It starts a real task in {selectedBot?.name ?? "this bot"}&apos;s chat; edit the task text for whatever you want done.</p>
                     {credential ? (
                       <div className="mt-4 overflow-hidden rounded-xl border border-hairline/45 bg-inset">
-                        <div className="flex items-center justify-between border-b border-hairline/45 px-3.5 py-2"><span className="text-[9.5px] font-medium uppercase tracking-wider text-ink-secondary">Terminal</span><div className="flex items-center gap-1"><button onClick={() => void createAndCopyCommand(selected)} className="flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-[10.5px] font-medium text-ink-secondary hover:bg-raised hover:text-ink">{copiedId === selected.id ? <Check size={12} className="text-success" /> : <Copy size={12} />}{copiedId === selected.id ? "Copied" : "Copy command"}</button><button onClick={() => void createAndCopyCommand(selected, true)} className="rounded-lg p-1.5 text-ink-secondary hover:bg-raised hover:text-ink" title="Rotate private URL"><RotateCw size={12} /></button></div></div>
+                        <div className="flex items-center justify-between border-b border-hairline/45 px-3.5 py-2"><span className="text-[9.5px] font-medium uppercase tracking-wider text-ink-secondary">Terminal</span><div className="flex items-center gap-1"><button onClick={() => void createAndCopyCommand(selected)} className="flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-[10.5px] font-medium text-ink-secondary hover:bg-raised hover:text-ink">{copiedId === selected.id ? <Check size={12} className="text-success" /> : <Copy size={12} />}{copiedId === selected.id ? "Copied" : "Copy Command"}</button><button type="button" onClick={() => void createAndCopyCommand(selected, true)} className="inline-flex size-11 items-center justify-center rounded-lg text-ink-secondary hover:bg-raised hover:text-ink" aria-label="Replace Private URL"><RotateCw size={16} /></button></div></div>
                         <pre className="overflow-x-auto p-4 font-mono text-[11px] leading-relaxed whitespace-pre-wrap break-all text-ink-secondary">{command}</pre>
                       </div>
                     ) : (
                       <div className="mt-4">
-                        <p className="max-w-[560px] text-[10.5px] leading-relaxed text-ink-secondary">The private URL is shown once. Generate a replacement to copy your webhook command; any older command for this webhook will stop working.</p>
-                        <button disabled={Boolean(working) || !ingress?.available} onClick={() => void createAndCopyCommand(selected)} className="mt-3 flex items-center gap-2 rounded-xl bg-accent px-3.5 py-2.5 text-[12px] font-medium text-white hover:brightness-110 disabled:opacity-40">{working === `${selected.id}:command` ? <Loader2 size={14} className="animate-spin" /> : <RotateCw size={14} />}Generate new private URL</button>
+                        <p className="max-w-[560px] text-[10.5px] leading-relaxed text-ink-secondary">The private URL is shown once.{"\u00a0 "}Generate a replacement to copy your webhook command; any older command for this webhook will stop working.</p>
+                        <button disabled={Boolean(working) || !ingress?.available} onClick={() => void createAndCopyCommand(selected)} className="mt-3 flex items-center gap-2 rounded-xl bg-accent px-3.5 py-2.5 text-[12px] font-medium text-white hover:brightness-110 disabled:opacity-40">{working === `${selected.id}:command` ? <Loader2 size={14} className="animate-spin" /> : <RotateCw size={14} />}Generate New Private URL</button>
                       </div>
                     )}
-                    <div className="mt-3 flex items-start gap-2 text-[10.5px] leading-relaxed text-ink-secondary"><Laptop size={12} className="mt-0.5 shrink-0" /><span>Local only for now. Keep BotFleet open while sending the request.</span></div>
+                    <div className="mt-3 flex items-start gap-2 text-[10.5px] leading-relaxed text-ink-secondary"><Laptop size={12} className="mt-0.5 shrink-0" /><span>Local only for now.{"\u00a0 "}Keep BotFleet open while sending the request.</span></div>
 
-                    {selected.verificationSample && !selected.enabled && <div className="mt-5 flex flex-wrap items-center justify-between gap-3 border-y border-success/20 bg-success/5 px-3.5 py-3"><div><div className="flex items-center gap-2 text-[11.5px] font-medium text-success"><Check size={13} />Request received</div><p className="mt-1 max-w-[520px] truncate font-mono text-[10px] text-ink-secondary">{selected.verificationSample.preview || "Empty payload"}</p></div><button disabled={Boolean(working)} onClick={() => void invoke(selected, "toggle")} className="flex items-center gap-1.5 rounded-lg bg-accent px-3 py-2 text-[11px] font-medium text-white hover:brightness-110"><Play size={12} />Turn on</button></div>}
+                    {selected.verificationSample && !selected.enabled && <div className="mt-5 flex flex-wrap items-center justify-between gap-3 border-y border-success/20 bg-success/5 px-3.5 py-3"><div><div className="flex items-center gap-2 text-[11.5px] font-medium text-success"><Check size={13} />Request received</div><p className="mt-1 max-w-[520px] truncate font-mono text-[10px] text-ink-secondary" title={selected.verificationSample.preview || "No message text"}>{selected.verificationSample.preview || "No message text"}</p></div><button disabled={Boolean(working)} onClick={() => void invoke(selected, "toggle")} className="flex items-center gap-1.5 rounded-lg bg-accent px-3 py-2 text-[11px] font-medium text-white hover:brightness-110"><Play size={12} />Turn On</button></div>}
 
                     <div className="mt-7 border-t border-hairline/35 pt-5">
-                      <div className="grid gap-4 text-[11.5px] sm:grid-cols-2"><div><div className="text-[10px] uppercase tracking-wider text-ink-secondary">Tasks go to</div><div className="mt-1.5 font-medium text-ink">{selectedBot?.name ?? "Deleted bot"}</div></div><div><div className="text-[10px] uppercase tracking-wider text-ink-secondary">Runs on</div><div className="mt-1.5 font-medium text-ink">{selected.runOn === "cloud" ? "Cloud VM" : "This computer"}</div></div></div>
+                      <div className="grid gap-4 text-[11.5px] sm:grid-cols-2"><div><div className="text-[10px] uppercase tracking-wider text-ink-secondary">Tasks go to</div><div className="mt-1.5 font-medium text-ink">{selectedBot?.name ?? "Deleted bot"}</div></div><div><div className="text-[10px] uppercase tracking-wider text-ink-secondary">Runs on</div><div className="mt-1.5 font-medium text-ink">{selected.runOn === "cloud" ? "ASCII.dev Box" : "This computer"}</div></div></div>
                     </div>
 
-                    <details className="group mt-5 border-t border-hairline/35 pt-4"><summary className="flex cursor-pointer list-none items-center justify-between text-[11.5px] font-medium text-ink"><span>Advanced</span><ChevronDown size={14} className="text-ink-secondary transition-transform group-open:rotate-180" /></summary><div className="mt-4 space-y-3 text-[10.5px] leading-relaxed text-ink-secondary">{selected.prompt ? <p><span className="font-medium text-ink">Default instruction:</span> {selected.prompt}</p> : <p>The task or message sent with each request becomes the bot instruction.</p>}{selected.eventTypes?.length ? <p><span className="font-medium text-ink">Accepted events:</span> {selected.eventTypes.join(", ")}</p> : <p>All event types are accepted.</p>}<button onClick={() => setEditor(selected)} className="rounded-lg border border-hairline/50 px-3 py-2 text-[11px] font-medium text-ink hover:bg-raised">Edit settings</button></div></details>
+                    <details className="group mt-5 border-t border-hairline/35 pt-4"><summary className="flex cursor-pointer list-none items-center justify-between text-[11.5px] font-medium text-ink"><span>Advanced</span><ChevronDown size={14} className="text-ink-secondary transition-transform group-open:rotate-180" /></summary><div className="mt-4 space-y-3 text-[10.5px] leading-relaxed text-ink-secondary">{selected.prompt ? <p><span className="font-medium text-ink">Default instruction:</span> {selected.prompt}</p> : <p>The task or message sent with each request becomes the bot instruction.</p>}{selected.eventTypes?.length ? <p><span className="font-medium text-ink">Accepted events:</span> {selected.eventTypes.join(", ")}</p> : <p>All event types are accepted.</p>}<button onClick={() => setEditor(selected)} className="rounded-lg border border-hairline/50 px-3 py-2 text-[11px] font-medium text-ink hover:bg-raised">Edit Settings</button></div></details>
                   </div>
                 </div>
               ) : (
                 <div className="px-5 py-5 md:px-7">
-                  <div className="mb-3"><h4 className="text-[13px] font-semibold text-ink">Recent deliveries</h4><p className="mt-1 text-[10.5px] text-ink-secondary">Accepted and rejected requests update automatically.</p></div>
+                  <div className="mb-3"><h4 className="text-[13px] font-semibold text-ink">Recent Deliveries</h4><p className="mt-1 text-[10.5px] text-ink-secondary">Accepted and rejected requests update automatically.</p></div>
                   <div className="border-t border-hairline/35">
-                    {activity.length === 0 ? <div className="px-2 py-12 text-center text-[11.5px] text-ink-secondary">No requests yet. Use the command in Setup to send one.</div> : activity.map((item) => (
+                    {activity.length === 0 ? <div className="px-2 py-12 text-center text-[11.5px] text-ink-secondary">No requests yet.{"\u00a0 "}Use the command in Setup to send one.</div> : activity.map((item) => (
                       <div key={item.id} className="flex items-center gap-2.5 border-b border-hairline/25 px-1 py-3.5">
                         <span className={cn("size-2 shrink-0 rounded-full", item.outcome === "rejected" || item.run?.status === "failed" ? "bg-danger" : item.run && ["queued", "running", "waiting"].includes(item.run.status) ? "animate-pulse bg-accent" : item.outcome === "ignored" || item.outcome === "duplicate" ? "bg-ink-secondary/50" : "bg-success")} />
-                        <div className="min-w-0 flex-1"><div className="flex items-center gap-1.5 text-[11.5px]"><span className="truncate font-medium text-ink">{item.eventName}</span><span className="shrink-0 text-ink-secondary">· {relativeTime(item.at)}</span></div><div className="mt-0.5 truncate font-mono text-[10px] text-ink-secondary/85">{item.reason || item.preview || "Empty payload"}</div></div>
+                        <div className="min-w-0 flex-1"><div className="flex items-center gap-1.5 text-[11.5px]"><span className="truncate font-medium text-ink" title={item.eventName}>{item.eventName}</span><span className="shrink-0 text-ink-secondary">· {relativeTime(item.at)}</span></div><div className="mt-0.5 truncate font-mono text-[10px] text-ink-secondary/85" title={item.reason || item.preview || "No message text"}>{item.reason || item.preview || "No message text"}</div></div>
                         <span className={cn("shrink-0 text-[10px] font-medium", outcomeTone(item.outcome, item.run))}>{outcomeLabel(item.outcome, item.run)}</span>
-                        {item.run?.threadId && selectedBot && <button onClick={() => { dispatch({ type: "select", id: selectedBot.id }); dispatch({ type: "switchTask", botId: selectedBot.id, threadId: item.run!.threadId! }); }} className="flex shrink-0 items-center gap-1 rounded-lg px-2 py-1 text-[10.5px] text-ink-secondary hover:bg-raised hover:text-ink" title="Open this execution in the bot's chat"><ExternalLink size={11} />Open chat</button>}
+                        {item.run?.threadId && selectedBot && <button onClick={() => { dispatch({ type: "select", id: selectedBot.id }); dispatch({ type: "switchTask", botId: selectedBot.id, threadId: item.run!.threadId! }); }} className="flex shrink-0 items-center gap-1 rounded-lg px-2 py-1 text-[10.5px] text-ink-secondary hover:bg-raised hover:text-ink" title="Open this execution in the bot's chat"><ExternalLink size={11} />Open Chat</button>}
                       </div>
                     ))}
                   </div>

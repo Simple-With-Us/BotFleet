@@ -1,0 +1,59 @@
+{
+  "name": "zulip-wake",
+  "version": "1.0.0",
+  "description": "Route qualifying Zulip DMs and mentions to the dispatcher inbox.",
+  "author": "BotFleet",
+  "license": "Apache-2.0",
+  "botfleet": ">=1",
+  "entry": "plugin.mjs",
+  "capabilities": [
+    "events.subscribe",
+    "chat.read",
+    "dispatch.wake"
+  ],
+  "contributes": {
+    "eventSubscriptions": [
+      {
+        "id": "zulip-inbox",
+        "source": "zulip",
+        "kinds": ["message"],
+        "includeContent": true,
+        "includeChats": true,
+        "maxChats": 10
+      }
+    ],
+    "commands": [
+      {
+        "name": "zulip-health",
+        "description": "Report Zulip wake routing health.",
+        "args": []
+      }
+    ]
+  },
+  "settings": [
+    {
+      "key": "dispatcherBotId",
+      "label": "Dispatcher bot id",
+      "type": "string",
+      "required": true,
+      "description": "Bot whose inbox receives qualifying messages (usually the Director bot id)."
+    },
+    {
+      "key": "allowPeerWakes",
+      "label": "Route peer messages",
+      "type": "boolean",
+      "required": false,
+      "default": true,
+      "description": "When off, only owner messages route to the dispatcher."
+    },
+    {
+      "key": "routeFollowedTopics",
+      "label": "Route followed topics",
+      "type": "boolean",
+      "required": false,
+      "default": true,
+      "description": "When off, followed-topic messages do not wake the dispatcher."
+    }
+  ],
+  "settingsVersion": 1
+}

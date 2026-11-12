@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   connectedInventoryCopy,
+  connectedReadinessCopy,
   connectorActionLabel,
   disconnectAccountConfirmation,
   mergeCompleteConnectorStatus,
@@ -9,6 +10,7 @@ import {
   requiresAccountAlias,
   onlyLatestConnectorResponses,
   type ConnectorStatus,
+  type ConnectorReadiness,
 } from "./PluginsPanel";
 
 describe("connected-app status races", () => {
@@ -152,7 +154,7 @@ describe("connected-app status races", () => {
       canContinue: false,
       hasAccounts: true,
       failed: false,
-    })).toBe("Add account");
+    })).toBe("Add Account");
     expect(connectorActionLabel("error", {
       busy: false,
       included: false,
@@ -187,5 +189,34 @@ describe("an answer the server was not sure about", () => {
   it("treats a missing authority flag as authoritative, preserving today's behaviour", () => {
     const merged = mergeCompleteConnectorStatus(connectedGmail, {}, new Map(), new Map());
     expect(merged.gmail.connected).toBe(false);
+  });
+
+  it("names the actual readiness failure and the last verified Central time", () => {
+    const degraded: ConnectorReadiness = {
+      ready: false,
+      configured: true,
+      state: "degraded",
+      checkedAt: Date.UTC(2026, 8, 12, 18, 30),
+      lastSuccessAt: Date.UTC(2026, 8, 12, 17, 15),
+      failure: { kind: "network", message: "BotFleet could not reach the connected-apps service." },
+    };
+    expect(connectedReadinessCopy(degraded)).toBe(
+      "BotFleet could not reach the connected-apps service.\u00a0 Showing the last verified account list from Sep 12, 12:15 PM CDT.",
+    );
+  });
+
+  it("distinguishes credential restoration from an unreadable credential", () => {
+    const base = { ready: false, configured: true, checkedAt: 1, lastSuccessAt: null };
+    expect(connectedReadinessCopy({
+      ...base,
+      state: "credential_pending",
+      failure: { kind: "credential_pending", message: "Connected Apps is waiting for its encrypted credential." },
+    })).toContain("Restoring the encrypted Connected Apps credential");
+    expect(connectedReadinessCopy({
+      ...base,
+      configured: false,
+      state: "credential_unreadable",
+      failure: { kind: "credential_unreadable", message: "BotFleet could not read the encrypted Connected Apps credential." },
+    })).toContain("could not read the encrypted Connected Apps credential");
   });
 });

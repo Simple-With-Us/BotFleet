@@ -1,0 +1,7 @@
+{
+  "images" : [
+    { "idiom" : "universal", "filename" : "gemini.svg" }
+  ],
+  "info" : { "author" : "xcode", "version" : 1 },
+  "properties" : { "preserves-vector-representation" : true }
+}

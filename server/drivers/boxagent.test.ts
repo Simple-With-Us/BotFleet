@@ -140,6 +140,7 @@ describe("BoxAgentDriver turns (fake API)", () => {
       "item.started",
       "content.delta",
       "item.completed", // after — must not be sliced to ""
+      "item.completed", // the tool step settles with the turn, not after it
       "turn.completed",
     ]);
     const texts = recorder.events
@@ -200,5 +201,116 @@ describe("BoxAgentDriver turns (fake API)", () => {
       .filter((e) => e.type === "item.completed" && (e as { itemType: string }).itemType === "assistant_text")
       .map((e) => (e as { text: string }).text);
     expect(texts).toEqual(["half"]);
+  });
+  it("settles every tool step it opened, with the same item id", async () => {
+    restoreFetch = installFakeBox([
+      {
+        events: [{ id: "e1", type: "tool", title: "run ls" }],
+        status: { promptRun: { status: "running" } },
+      },
+      {
+        events: [
+          { id: "e1", type: "tool", title: "run ls" },
+          { id: "e2", type: "tool", title: "browse docs" },
+        ],
+        status: { promptRun: { status: "running" } },
+      },
+      {
+        events: [
+          { id: "e1", type: "tool", title: "run ls" },
+          { id: "e2", type: "tool", title: "browse docs" },
+        ],
+        status: { promptRun: { status: "finished", result: "done" } },
+      },
+    ]);
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-tools", text: "go", integrations: { computer } });
+    const done = await recorder.until((e) => e.type === "turn.completed");
+
+    const toolRows = recorder.events.filter(
+      (e) => (e.type === "item.started" || e.type === "item.completed") && e.itemType === "tool",
+    );
+    expect(toolRows.map((e) => `${e.type}:${e.itemId}`)).toEqual([
+      "item.started:e1",
+      "item.completed:e1",
+      "item.started:e2",
+      "item.completed:e2",
+    ]);
+    for (const row of toolRows) {
+      if (row.type === "item.completed" && row.itemType === "tool") expect(row.ok).toBe(true);
+      // Every step settles before the turn does, so no span runs to turn end.
+      expect(recorder.events.indexOf(row)).toBeLessThan(recorder.events.indexOf(done));
+    }
+  });
+
+  it("settles an open tool step as failed when the run fails", async () => {
+    restoreFetch = installFakeBox([
+      {
+        events: [{ id: "e1", type: "tool", title: "run ls" }],
+        status: { promptRun: { status: "running" } },
+      },
+      {
+        events: [{ id: "e1", type: "tool", title: "run ls" }],
+        status: { promptRun: { status: "failed" } },
+      },
+    ]);
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-toolfail", text: "go", integrations: { computer } });
+    const done = await recorder.until((e) => e.type === "turn.completed");
+    expect(done).toMatchObject({ ok: false, stopReason: "failed" });
+    const settled = recorder.events.find(
+      (e) => e.type === "item.completed" && e.itemType === "tool",
+    );
+    expect(settled).toMatchObject({ itemId: "e1", ok: false });
+  });
+});
+
+// Owner request: the ASCII.dev Box engine (instance "computer", box.ascii.dev) stays out of every
+// engine list until a Box token is configured — but stays registered, so a
+// token added later just works.
+describe("BoxAgentDriver snapshot without a Box token", () => {
+  it("is unavailable and hidden from engine lists", async () => {
+    const env = process.env;
+    const previous = env.BOX_TOKEN;
+    delete env.BOX_TOKEN;
+    const instance = await BoxAgentDriver.create({
+      instanceId: "computer",
+      displayName: "ASCII.dev Box",
+      environment: {},
+      enabled: true,
+      config: { pollMs: 0 },
+    });
+    try {
+      expect(await instance.snapshot()).toMatchObject({
+        state: "unavailable",
+        hidden: true,
+        reason: expect.stringContaining("no Box token"),
+      });
+      // the agent runs on the box and asks nothing here; auto-review can
+      // only watch the work events it reports
+      expect(instance.adapter.capabilities.reviewHook).toBe("after");
+    } finally {
+      await instance.dispose();
+      if (previous !== undefined) env.BOX_TOKEN = previous;
+    }
+  });
+
+  it("is listed again once a token is configured", async () => {
+    const restore = installFakeBox([{ events: [] }]);
+    const instance = await BoxAgentDriver.create({
+      instanceId: "computer",
+      displayName: "ASCII.dev Box",
+      environment: { BOX_TOKEN: "box-test-token" },
+      enabled: true,
+      config: { pollMs: 0 },
+    });
+    try {
+      const snapshot = await instance.snapshot();
+      expect(snapshot.state).toBe("available");
+      expect(snapshot.hidden).toBeUndefined();
+    } finally {
+      await instance.dispose();
+      restore();
+    }
   });
 });

@@ -15,17 +15,18 @@ export interface CommsBus {
 }
 
 /** Find or create the bot⇄bot channel for the pair. The channel keeps
- * the pair's full exchange, lives in the sidebar like any room, and the
- * user can open it to chip in. */
+ * the pair's full exchange.  It is a DM, not a user room — it must not
+ * inherit the sender's Apps/Work/Channels section, or every new thread
+ * lands in that roster instead of Bot Chats. */
 export function getOrCreateChannel(store: Store, from: BotRecord, target: BotRecord): GroupRecord {
   const existing = store.dmGroup(from.id, target.id);
   if (existing) {
-    if (sectionKey(existing.section) !== sectionKey(from.section)) {
-      return store.patchGroup(existing.id, { section: from.section }) ?? existing;
+    if (sectionKey(existing.section)) {
+      return store.patchGroup(existing.id, { section: "" }) ?? existing;
     }
     return existing;
   }
-  return store.createGroup(`${from.name} ⇄ ${target.name}`, [from.id, target.id], true, from.section);
+  return store.createGroup(`${from.name} ⇄ ${target.name}`, [from.id, target.id], true);
 }
 
 /** Mirror `from`'s outgoing message into the channel, drop chips into
@@ -75,7 +76,7 @@ export function mirrorExchange(
 }
 
 /** Mirror `target`'s reply into the channel so the channel stays the
- * single authoritative record of the exchange. The 1:1 threads already
+ * single authoritative record of the exchange.  The 1:1 threads already
  * carry their own chips from `mirrorExchange`. */
 export function mirrorReply(
   bus: CommsBus,

@@ -9,7 +9,9 @@ import {
   COMPANION_CLIENT_INSTANCE_FIELD,
   COMPANION_INSTALLATION_CREDENTIAL_FIELD,
   COMPANION_INSTALLATION_ID_FIELD,
+  DEFAULT_COMPANION_CONTROL_PLANE_URL,
   createCompanionAccountService,
+  isFleetControlPlaneURL,
   resolveCompanionControlPlaneURL,
 } from "./companion-account-service.mjs";
 import {
@@ -25,7 +27,7 @@ const DUPLICATE_INSTALLATION_ID = "33333333-3333-4333-8333-333333333333";
 const ACCOUNT_TOKEN = `signed.${"a".repeat(80)}`;
 const INSTALLATION_CREDENTIAL = `omb_install_${"b".repeat(22)}.${"c".repeat(43)}`;
 const CONNECTOR_TOKEN = `eyJ${"d".repeat(100)}`;
-const ENDPOINT = "https://c-opaque.botfleet.com";
+const ENDPOINT = "https://c-opaque.botfleet.app";
 
 function credentialStore(initial = {}) {
   let document = structuredClone(initial);
@@ -104,23 +106,52 @@ function signedCredentials(overrides = {}) {
 }
 
 describe("Companion account service", () => {
-  it("uses the packaged hosted default and only explicit safe development origins", () => {
-    expect(resolveCompanionControlPlaneURL({ isPackaged: true, environment: {} })).toBe(
-      "https://accounts.botfleet.com",
-    );
+  it("ships no hosted default and only accepts a control plane on the fleet domain", () => {
+    // No build may quietly trust a host the project does not own.
+    expect(DEFAULT_COMPANION_CONTROL_PLANE_URL).toBe("");
+    expect(resolveCompanionControlPlaneURL({ isPackaged: true, environment: {} })).toBe("");
+    expect(resolveCompanionControlPlaneURL({ isPackaged: false, environment: {} })).toBe("");
+    expect(resolveCompanionControlPlaneURL({
+      isPackaged: true,
+      environment: { OMB_CONTROL_PLANE_URL: "https://accounts.botfleet.app/" },
+    })).toBe("https://accounts.botfleet.app");
     expect(resolveCompanionControlPlaneURL({
       isPackaged: false,
       environment: { OMB_CONTROL_PLANE_URL: "http://127.0.0.1:8787/" },
     })).toBe("http://127.0.0.1:8787");
+    // The old third-party default is refused even as an explicit override.
     expect(resolveCompanionControlPlaneURL({
       isPackaged: true,
-      environment: { OMB_CONTROL_PLANE_URL: "http://accounts.botfleet.com" },
+      environment: { OMB_CONTROL_PLANE_URL: "https://accounts.botfleet.com" },
     })).toBe("");
     expect(resolveCompanionControlPlaneURL({
       isPackaged: true,
-      environment: { OMB_CONTROL_PLANE_URL: new String("https://accounts.botfleet.com") },
+      environment: { OMB_CONTROL_PLANE_URL: "http://accounts.botfleet.app" },
     })).toBe("");
-    expect(resolveCompanionControlPlaneURL({ isPackaged: false, environment: {} })).toBe("");
+    expect(resolveCompanionControlPlaneURL({
+      isPackaged: true,
+      environment: { OMB_CONTROL_PLANE_URL: new String("https://accounts.botfleet.app") },
+    })).toBe("");
+    expect(isFleetControlPlaneURL("https://botfleet.app")).toBe(true);
+    expect(isFleetControlPlaneURL("https://accounts.botfleet.app")).toBe(true);
+    expect(isFleetControlPlaneURL("https://botfleet.app.evil.example")).toBe(false);
+    expect(isFleetControlPlaneURL("https://evilbotfleet.app")).toBe(false);
+    expect(isFleetControlPlaneURL("http://localhost:8787")).toBe(true);
+    expect(isFleetControlPlaneURL("not a url")).toBe(false);
+  });
+
+  it("reports hosted access as absent, not broken, when no control plane is configured", async () => {
+    const { service } = serviceFixture({ client: null });
+    await expect(service.state()).resolves.toEqual({
+      available: false,
+      configured: false,
+      status: "signed-out",
+      message: "Secure access is not configured in this build. Pair on the same Wi-Fi or over Tailscale instead.",
+    });
+    await expect(service.requestCode("ada@example.com")).rejects.toThrow(/not configured in this build/);
+    await expect(service.verifyCode("ada@example.com", "12345678")).rejects.toThrow(/not configured in this build/);
+    // restore() must not reach for the network when nothing is configured.
+    await expect(service.restore()).resolves.toMatchObject({ available: false, configured: false });
   });
 
   it("does not coerce boxed credential fields into an account", async () => {

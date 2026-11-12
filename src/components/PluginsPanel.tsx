@@ -6,6 +6,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Check, Loader2, RefreshCw, Search, TriangleAlert, X } from "lucide-react";
 import { api, useStore } from "@/state/store";
 import { cn } from "@/lib/cn";
+import { ConfirmDialog } from "./ConfirmDialog";
+import { productErrorHeadline } from "@/lib/product-error";
 import { readCachedInventory, writeCachedInventory } from "@/lib/connected-apps-cache";
 
 interface ToolkitCard {
@@ -33,15 +35,58 @@ export interface ConnectorStatus {
 // as disconnected while a fresh secure status check runs in the background.
 let cachedConnectorStatus: Record<string, ConnectorStatus> | null = null;
 let cachedConnectorStatusAt = 0;
+/** Last time we stored a verified inventory.  Separate from cache-expiry. */
+let cachedConnectorVerifiedAt = 0;
 let cachedConnectorStatusAuthoritative = true;
+let cachedConnectorReadiness: ConnectorReadiness | null = null;
 let connectorStatusRequest: Promise<ConnectorInventory> | null = null;
 const CONNECTOR_STATUS_CACHE_MS = 30_000;
 
+export type ConnectorFailureKind =
+  | "authentication"
+  | "credential_pending"
+  | "credential_unreadable"
+  | "invalid_response"
+  | "network"
+  | "permission"
+  | "rate_limited"
+  | "timeout"
+  | "upstream"
+  | "unknown";
+
+export interface ConnectorReadiness {
+  ready: boolean;
+  configured: boolean;
+  state: "credential_pending" | "credential_unreadable" | "degraded" | "ready" | "unconfigured";
+  checkedAt: number;
+  lastSuccessAt: number | null;
+  failure?: { kind: ConnectorFailureKind; message: string };
+}
+
 export interface ConnectorInventory {
   services: Record<string, ConnectorStatus>;
-  /** false when the server could not read the credential store: the list is
-   * then "we do not know", and nothing may be cleared on the strength of it */
+  /** false when the server could not verify the upstream inventory: the list
+   * then means "we do not know", and may not clear a prior known-good list */
   authoritative: boolean;
+  readiness: ConnectorReadiness;
+}
+
+function legacyReadiness(response: any, checkedAt: number): ConnectorReadiness {
+  if (response?.credentialStore === "unavailable") return {
+    ready: false,
+    configured: false,
+    state: "credential_unreadable",
+    checkedAt,
+    lastSuccessAt: null,
+    failure: {
+      kind: "credential_unreadable",
+      message: "BotFleet could not read the encrypted Connected Apps credential.",
+    },
+  };
+  if (response?.configured === false) return {
+    ready: false, configured: false, state: "unconfigured", checkedAt, lastSuccessAt: null,
+  };
+  return { ready: true, configured: true, state: "ready", checkedAt, lastSuccessAt: checkedAt };
 }
 
 /** Warm the account inventory once the app server is ready. Concurrent panel
@@ -51,24 +96,63 @@ export function preloadConnectedApps(force = false): Promise<ConnectorInventory>
     return Promise.resolve({
       services: cachedConnectorStatus,
       authoritative: cachedConnectorStatusAuthoritative,
+      readiness: cachedConnectorReadiness ?? {
+        ready: cachedConnectorStatusAuthoritative,
+        configured: true,
+        state: cachedConnectorStatusAuthoritative ? "ready" : "degraded",
+        checkedAt: cachedConnectorStatusAt,
+        lastSuccessAt: cachedConnectorVerifiedAt || (cachedConnectorStatusAuthoritative ? cachedConnectorStatusAt : null),
+        ...(cachedConnectorStatusAuthoritative ? {} : {
+          failure: { kind: "unknown" as const, message: "BotFleet could not verify connected apps." },
+        }),
+      },
     });
   }
   if (connectorStatusRequest) return connectorStatusRequest;
   connectorStatusRequest = api("/api/connectors/connected")
     .then((response) => {
+      const checkedAt = Date.now();
+      const readiness: ConnectorReadiness = response.readiness ?? legacyReadiness(response, checkedAt);
       const services: Record<string, ConnectorStatus> = response.services ?? {};
-      // An unreadable credential store tells us nothing about what is
-      // connected. Keep the last inventory we were sure about instead.
-      if (response.credentialStore === "unavailable") {
-        return { services: readCachedInventory()?.services ?? {}, authoritative: false };
+      const authoritative = response.authoritative ?? (response.credentialStore !== "unavailable");
+      // A failed upstream or credential read tells us nothing about what is
+      // connected.  Keep the last inventory we were sure about instead.
+      if (!authoritative) {
+        const cached = readCachedInventory();
+        const lastSuccessAt = (cached?.at ?? cachedConnectorVerifiedAt) || null;
+        cachedConnectorReadiness = { ...readiness, lastSuccessAt };
+        cachedConnectorStatusAuthoritative = false;
+        cachedConnectorStatusAt = checkedAt;
+        return {
+          services: cached?.services ?? cachedConnectorStatus ?? {},
+          authoritative: false,
+          readiness: cachedConnectorReadiness,
+        };
       }
       cachedConnectorStatus = services;
-      cachedConnectorStatusAt = Date.now();
+      cachedConnectorStatusAt = checkedAt;
+      cachedConnectorVerifiedAt = checkedAt;
       cachedConnectorStatusAuthoritative = true;
-      writeCachedInventory(services, Date.now());
-      return { services, authoritative: true };
+      cachedConnectorReadiness = readiness;
+      writeCachedInventory(services, checkedAt);
+      return { services, authoritative: true, readiness };
     })
-    .catch(() => ({ services: readCachedInventory()?.services ?? {}, authoritative: false }))
+    .catch(() => {
+      const checkedAt = Date.now();
+      const cached = readCachedInventory();
+      const readiness: ConnectorReadiness = {
+        ready: false,
+        configured: true,
+        state: "degraded",
+        checkedAt,
+        lastSuccessAt: cached?.at || null,
+        failure: { kind: "network", message: "BotFleet could not reach the connected-apps service." },
+      };
+      cachedConnectorReadiness = readiness;
+      cachedConnectorStatusAuthoritative = false;
+      cachedConnectorStatusAt = checkedAt;
+      return { services: cached?.services ?? cachedConnectorStatus ?? {}, authoritative: false, readiness };
+    })
     .finally(() => {
       connectorStatusRequest = null;
     });
@@ -98,7 +182,7 @@ export function connectorActionLabel(
   if (phase === "loading") return "Checking…";
   if (phase === "error") return "Unavailable";
   if (state.canContinue) return "Continue";
-  if (state.hasAccounts) return "Add account";
+  if (state.hasAccounts) return "Add Account";
   if (state.failed) return "Retry";
   return "Connect";
 }
@@ -116,6 +200,30 @@ export function connectedInventoryCopy(phase: ConnectorInventoryPhase) {
     title: "No connected apps yet",
     description: "Connect an app from Marketplace and it will appear here.",
   };
+}
+
+function verifiedAtLabel(at: number | null): string | null {
+  if (!at) return null;
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/Chicago",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    timeZoneName: "short",
+  }).format(new Date(at));
+}
+
+export function connectedReadinessCopy(readiness: ConnectorReadiness | null, cachedAt = 0): string | null {
+  if (!readiness || readiness.state === "ready" || readiness.state === "unconfigured") return null;
+  const lastVerified = verifiedAtLabel(readiness.lastSuccessAt ?? cachedAt);
+  const retained = lastVerified
+    ? ` Showing the last verified account list from ${lastVerified}.`
+    : " Account status is unavailable until verification succeeds.";
+  if (readiness.state === "credential_pending") {
+    return `Restoring the encrypted Connected Apps credential.\u00A0${retained}`;
+  }
+  return `${readiness.failure?.message ?? "BotFleet could not verify connected apps."}\u00A0${retained}`;
 }
 
 export function mergeCurrentConnectorStatus(
@@ -197,6 +305,9 @@ export function PluginsPanel() {
   const [source, setSource] = useState<"api" | "curated">("curated");
   const [configured, setConfigured] = useState(true);
   const [mode, setMode] = useState<"managed" | "self-hosted" | "unavailable">("unavailable");
+  const [managedSetup, setManagedSetup] = useState<
+    { status: "unconfigured" | "ready" | "failed"; message?: string } | null
+  >(null);
   // Paint what we last knew before any request goes out: the module cache if
   // this window already fetched, otherwise the inventory saved on disk. An
   // empty panel is never the first thing a connected user sees.
@@ -207,6 +318,8 @@ export function PluginsPanel() {
   const [stale, setStale] = useState(
     cachedConnectorStatus !== null && !cachedConnectorStatusAuthoritative,
   );
+  const [readiness, setReadiness] = useState<ConnectorReadiness | null>(cachedConnectorReadiness);
+  const [rememberedInventoryAt] = useState(() => readCachedInventory()?.at ?? cachedConnectorStatusAt);
   const [pendingUrls, setPendingUrls] = useState<Record<string, string>>({});
   const [aliasSlug, setAliasSlug] = useState<string | null>(null);
   const [aliasDraft, setAliasDraft] = useState("");
@@ -216,6 +329,7 @@ export function PluginsPanel() {
     cachedConnectorStatus === null ? "loading" : "ready",
   );
   const [error, setError] = useState<string | null>(null);
+  const [pendingDisconnect, setPendingDisconnect] = useState<null | { slug: string; account: { id: string; alias?: string }; label: string }>(null);
   const [search, setSearch] = useState("");
   const [tab, setTab] = useState<"marketplace" | "connected">("marketplace");
 
@@ -261,12 +375,14 @@ export function PluginsPanel() {
       .catch(() => ({}));
   }, []);
 
-  const refreshConnectedStatus = useCallback((force = false): Promise<Record<string, ConnectorStatus>> => {
+  const refreshConnectedStatus = useCallback((force = false): Promise<ConnectorInventory> => {
     const requestGenerations = new Map(statusGenerations.current);
     setRefreshing(true);
     return preloadConnectedApps(force)
-      .then(({ services, authoritative }) => {
+      .then((inventory) => {
+        const { services, authoritative } = inventory;
         setStale(!authoritative);
+        setReadiness(inventory.readiness);
         setStatus((current) => mergeCompleteConnectorStatus(
           current,
           services,
@@ -283,7 +399,7 @@ export function PluginsPanel() {
             return next;
           });
         }
-        return services;
+        return inventory;
       })
       .finally(() => setRefreshing(false));
   }, []);
@@ -293,9 +409,13 @@ export function PluginsPanel() {
     if (!hadCachedInventory) setInventoryPhase("loading");
     setError(null);
     return refreshConnectedStatus(force)
-      .then((services) => {
-        setInventoryPhase("ready");
-        return services;
+      .then((inventory) => {
+        setInventoryPhase(
+          ["credential_pending", "credential_unreadable", "degraded"].includes(inventory.readiness.state)
+            ? "error"
+            : "ready",
+        );
+        return inventory.services;
       })
       .catch((cause) => {
         if (!hadCachedInventory) setInventoryPhase("error");
@@ -314,7 +434,8 @@ export function PluginsPanel() {
     cachedConnectorStatus = status;
     cachedConnectorStatusAt = Date.now();
     cachedConnectorStatusAuthoritative = !stale;
-  }, [inventoryPhase, stale, status]);
+    cachedConnectorReadiness = readiness;
+  }, [inventoryPhase, readiness, stale, status]);
 
   useEffect(() => {
     let alive = true;
@@ -326,6 +447,7 @@ export function PluginsPanel() {
         setSource(r.source ?? "curated");
         setConfigured(Boolean(r.configured));
         setMode(r.mode ?? "unavailable");
+        setManagedSetup(r.managedSetup ?? null);
       })
       .catch((e) => {
         if (!alive) return;
@@ -465,6 +587,7 @@ export function PluginsPanel() {
   );
   const connectedCount = Object.values(status).filter((service) => service.connected || service.accounts?.length).length;
   const connectedEmptyCopy = connectedInventoryCopy(inventoryPhase);
+  const readinessNotice = connectedReadinessCopy(readiness, rememberedInventoryAt);
   const close = () => dispatch({ type: "togglePlugins", open: false });
 
   return (
@@ -482,21 +605,21 @@ export function PluginsPanel() {
       >
         <header className="flex items-start justify-between gap-4 px-6 pb-3 pt-6 sm:px-8 sm:pt-7">
           <div>
-            <h2 id="connected-apps-title" className="text-[22px] font-semibold tracking-[-0.01em] text-ink">Connected apps</h2>
-            <p className="mt-1 text-[13px] text-ink-secondary">Connect the apps your bots can use.</p>
+            <h2 id="connected-apps-title" className="text-[22px] font-semibold tracking-[-0.01em] text-ink">Connected Apps via Composio</h2>
+            <p className="mt-1 text-[13px] text-ink-secondary">Connect third-party accounts (Google, Slack, GitHub, and more) via Composio for your bots to use.</p>
           </div>
           <div className="flex items-center gap-1">
             <button
               onClick={() => void loadConnectionInventory(true)}
               disabled={refreshing}
               className="rounded-lg p-2 text-ink-secondary hover:bg-raised hover:text-ink disabled:opacity-50"
-              title="Refresh connection status"
+              title="Refresh Connection Status"
             >
               <RefreshCw size={17} className={cn(refreshing && "animate-spin")} />
             </button>
             <button
               onClick={close}
-              aria-label="Close connected apps"
+              aria-label="Close Connected Apps via Composio"
               className="rounded-lg p-2 text-ink-secondary hover:bg-raised hover:text-ink"
             >
               <X size={21} />
@@ -504,20 +627,15 @@ export function PluginsPanel() {
           </div>
         </header>
 
-        {stale && (
-          // Say which of the two things is true. Silence here is what makes a
-          // remembered list indistinguishable from a confirmed one.
+        {readinessNotice && (
           <div className="mx-6 mb-1 flex items-start gap-2 rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-[12.5px] text-warning sm:mx-8">
             <TriangleAlert size={14} className="mt-px shrink-0" />
-            <span>
-              Showing what was connected last time — this Mac's credential store could not be opened just now, so these
-              could not be re-checked. Your apps are still connected; restarting BotFleet usually clears this.
-            </span>
+            <span>{readinessNotice}</span>
           </div>
         )}
 
         <div className="flex flex-col gap-3 px-6 pb-4 pt-5 sm:flex-row sm:items-center sm:justify-between sm:px-8">
-          <div className="flex w-fit rounded-xl bg-raised/70 p-1" role="tablist" aria-label="Connected apps view">
+          <div className="flex w-fit rounded-xl bg-raised/70 p-1" role="tablist" aria-label="Connected Apps via Composio view">
             <button
               role="tab"
               aria-selected={tab === "marketplace"}
@@ -547,18 +665,21 @@ export function PluginsPanel() {
               value={search}
               onChange={(event) => setSearch(event.target.value)}
               placeholder="Search apps"
-              aria-label="Search apps"
+              aria-label="Search Apps"
               className="min-w-0 flex-1 bg-transparent text-[14px] text-ink placeholder:text-ink-secondary focus:outline-none"
             />
           </label>
         </div>
 
         {/* Two notices about the same fact is one too many: the stale banner
-            above already explains this launch, and "configure your own
-            connection service" is advice for someone who never set one up. */}
-        {!configured && !stale && (
-          <div className="mx-6 mb-1 rounded-xl bg-warning/10 px-4 py-3 text-[13px] text-warning sm:mx-8">
-            Connected apps are temporarily unavailable. You can retry after restarting, or configure your own connection service.{" "}
+            above already explains this launch. Say WHY connected apps are off:
+            a broker that failed its identity check is a different situation
+            from a build that never had one. */}
+        {!configured && !readinessNotice && (
+          <div role="status" className="mx-6 mb-1 rounded-xl bg-warning/10 px-4 py-3 text-[13px] text-warning sm:mx-8">
+            {managedSetup?.status === "failed"
+              ? `${managedSetup.message ?? "Connected apps could not be set up."}\u00a0 Check the connected-apps service address, or add your own Composio project key.`
+              : "Connected apps are not configured in this build.\u00a0 Add your own Composio project key to use them."}{" "}
             <button
               className="font-medium underline underline-offset-2"
               onClick={() => {
@@ -585,7 +706,7 @@ export function PluginsPanel() {
             for the full catalog.
           </div>
         )}
-        {error && <div role="alert" className="mx-6 mt-2 rounded-lg bg-danger/10 px-3 py-2 text-[12px] text-danger sm:mx-8">{error}</div>}
+        {error && <div role="alert" className="mx-6 mt-2 rounded-lg bg-danger/10 px-3 py-2 text-[12px] text-danger sm:mx-8" title={error}>{productErrorHeadline(error)}</div>}
 
         <div className="min-h-0 flex-1 overflow-y-auto px-6 pb-7 pt-5 sm:px-8">
           {cards === null ? (
@@ -595,7 +716,7 @@ export function PluginsPanel() {
           ) : (
             <div>
               <div className="mb-3 text-[12px] font-medium text-ink-secondary">
-                {tab === "connected" ? "Your connections" : search ? "Search results" : "Available apps"}
+                {tab === "connected" ? "Your Connections" : search ? "Search Results" : "Available Apps"}
               </div>
               <div className="grid grid-cols-1 gap-x-10 md:grid-cols-2">
               {visible.map((card) => {
@@ -618,8 +739,11 @@ export function PluginsPanel() {
                   <div className="flex items-center gap-3">
                     <ServiceIcon card={card} />
                     <div className="min-w-0 flex-1">
-                      <div className="truncate text-[14px] font-medium text-ink">{card.label}</div>
-                      <div className="mt-0.5 truncate text-[12.5px] text-ink-secondary">
+                      <div className="truncate text-[14px] font-medium text-ink" title={card.label}>{card.label}</div>
+                      <div
+                        className="mt-0.5 truncate text-[12.5px] text-ink-secondary"
+                        title={pending ? "Finish setup in your browser" : failed && !accounts.length ? "Authorization expired — try again" : card.blurb}
+                      >
                         {pending ? "Finish setup in your browser" : failed && !accounts.length ? "Authorization expired — try again" : card.blurb}
                       </div>
                     </div>
@@ -659,9 +783,12 @@ export function PluginsPanel() {
                             <div className="min-w-0 flex-1">
                               <div className="flex items-center gap-1.5 text-[12.5px] font-medium text-ink">
                                 {active && <Check size={13} className="shrink-0 text-success" />}
-                                <span className="truncate">{account.alias || account.id}</span>
+                                <span className="truncate" title={account.alias || account.id}>{account.alias || account.id}</span>
                               </div>
-                              <div className="mt-0.5 truncate text-[10.5px] text-ink-secondary">
+                              <div
+                                className="mt-0.5 truncate text-[10.5px] text-ink-secondary"
+                                title={`${account.alias ? `${account.id} · ` : ""}${account.status.toLowerCase()}`}
+                              >
                                 {account.alias ? `${account.id} · ` : ""}{account.status.toLowerCase()}
                               </div>
                             </div>
@@ -669,8 +796,7 @@ export function PluginsPanel() {
                               type="button"
                               disabled={busy}
                               onClick={() => {
-                                if (!window.confirm(disconnectAccountConfirmation(card.label, account))) return;
-                                disconnectAccount(card.slug, account.id);
+                                setPendingDisconnect({ slug: card.slug, account, label: card.label });
                               }}
                               className="rounded-md px-2 py-1 text-[11px] text-ink-secondary transition-colors hover:bg-danger/10 hover:text-danger disabled:opacity-40"
                               aria-label={`Disconnect ${account.alias || account.id} from ${card.label}`}
@@ -742,6 +868,17 @@ export function PluginsPanel() {
           )}
         </div>
       </div>
+      <ConfirmDialog
+        open={Boolean(pendingDisconnect)}
+        title="Disconnect Account?"
+        body={pendingDisconnect ? disconnectAccountConfirmation(pendingDisconnect.label, pendingDisconnect.account) : ""}
+        confirmLabel="Disconnect"
+        onCancel={() => setPendingDisconnect(null)}
+        onConfirm={() => {
+          if (pendingDisconnect) disconnectAccount(pendingDisconnect.slug, pendingDisconnect.account.id);
+          setPendingDisconnect(null);
+        }}
+      />
     </div>
   );
 }

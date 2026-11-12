@@ -1,13 +1,15 @@
 import { createServer, type Server } from "node:http";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 import type { AppConfig } from "./config.ts";
 import {
   applyManagedBrokerMessage,
   authorizeService,
+  connectedInventoryStatus,
   connectedServices,
   connectionMode,
   connectionStatus,
+  managedSetup,
   mcpIntegration,
   normalizeAccountAlias,
   prepareProjectSession,
@@ -21,6 +23,7 @@ let base = "";
 const calls: Array<{ method: string; path: string; query: string; body: any }> = [];
 let malformedConnectedAccounts = false;
 let connectedAccountsUnavailable = false;
+let connectedAccountsStatus: number | null = null;
 // The project's own auth configs, and the ones the stub Session was created
 // with — a Session only knows the configs named at its creation, which is
 // the whole reason #509 happened.
@@ -103,6 +106,10 @@ beforeAll(async () => {
         res.writeHead(403, { "content-type": "application/json" });
         return res.end(JSON.stringify({ error: "connected-account read not granted" }));
       }
+      if (connectedAccountsStatus !== null) {
+        res.writeHead(connectedAccountsStatus, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ error: "temporary connected-account failure" }));
+      }
       res.writeHead(200, { "content-type": "application/json" });
       if (malformedConnectedAccounts) return res.end(JSON.stringify({ items: {} }));
       if (url.searchParams.get("cursor") === "accounts-page-2") {
@@ -156,7 +163,7 @@ afterAll(async () => {
   await new Promise<void>((resolve) => api.close(() => resolve()));
 });
 
-describe.sequential("Composio Sessions", () => {
+describe("Composio Sessions", { concurrent: false }, () => {
   it("rejects broker URL components and invalid tokens from the environment", () => {
     process.env.OMB_COMPOSIO_BROKER_TOKEN = "a".repeat(64);
     try {
@@ -205,6 +212,63 @@ describe.sequential("Composio Sessions", () => {
     expect(applyManagedBrokerMessage({ type: messageType, access: null })).toBe(true);
     expect(connectionMode({})).toBe("unavailable");
   });
+  it("carries the desktop's setup outcome so the UI can say why connected apps are off", () => {
+    const messageType = "botfleet:managed-composio";
+    expect(managedSetup()).toEqual({ status: "unconfigured" });
+
+    expect(applyManagedBrokerMessage({
+      type: messageType,
+      access: null,
+      setup: { status: "failed", message: "Connected apps could not be set up: the connected-apps service answered HTTP 404." },
+    })).toBe(true);
+    expect(connectionMode({})).toBe("unavailable");
+    expect(managedSetup()).toEqual({
+      status: "failed",
+      message: "Connected apps could not be set up: the connected-apps service answered HTTP 404.",
+    });
+
+    // Working access wins over a stale failure, and never leaks the token.
+    expect(applyManagedBrokerMessage({
+      type: messageType,
+      access: { url: "http://127.0.0.1:3210/", token: "a".repeat(64) },
+      setup: { status: "ready" },
+    })).toBe(true);
+    expect(managedSetup()).toEqual({ status: "ready" });
+
+    // Garbage in the setup field degrades to "unconfigured", not a crash.
+    expect(applyManagedBrokerMessage({ type: messageType, access: null, setup: { status: "exploded", token: "x" } })).toBe(true);
+    expect(managedSetup()).toEqual({ status: "unconfigured" });
+    setManagedBrokerAccess(null);
+  });
+  it("preserves the last verified inventory across identical managed credential sync", async () => {
+    const fetchStub = vi.spyOn(globalThis, "fetch");
+    const access = { url: "https://broker.example/root/", token: "a".repeat(64) };
+    const cfg: AppConfig = {};
+    try {
+      setManagedBrokerAccess(access);
+      fetchStub.mockResolvedValueOnce(new Response(JSON.stringify({ services: {} }), {
+        headers: { "content-type": "application/json" },
+      }));
+      const verified = await connectedInventoryStatus(cfg);
+      expect(verified.readiness.ready).toBe(true);
+      expect(verified.readiness.lastSuccessAt).not.toBeNull();
+      // Reconnection can repeat the same credential with an equivalent URL.
+      setManagedBrokerAccess({ ...access, url: "https://broker.example/root" });
+      fetchStub.mockRejectedValueOnce(new TypeError("fetch failed"));
+      const degraded = await connectedInventoryStatus(cfg);
+      expect(degraded.readiness).toMatchObject({
+        state: "degraded", lastSuccessAt: verified.readiness.lastSuccessAt,
+      });
+      setManagedBrokerAccess({ ...access, token: "b".repeat(64) });
+      fetchStub.mockRejectedValueOnce(new TypeError("fetch failed"));
+      const changed = await connectedInventoryStatus(cfg);
+      expect(changed.readiness.lastSuccessAt).toBeNull();
+    } finally {
+      fetchStub.mockRestore();
+      setManagedBrokerAccess(null);
+    }
+  });
+
   it("accepts only project API keys", async () => {
     await expect(prepareProjectSession("old_key")).rejects.toThrow(/start with ak_/i);
     await expect(prepareProjectSession("ak_wrong")).rejects.toThrow(/invalid project key/i);
@@ -349,7 +413,11 @@ describe.sequential("Composio Sessions", () => {
       args: [expect.stringContaining("connector-proxy")],
       env: {
         OMB_CONNECTOR_UPSTREAM_URL: "http://127.0.0.1:8799/api/internal/connectors/mcp",
-        OMB_CONNECTOR_UPSTREAM_HEADERS: JSON.stringify({ authorization: "Bearer secret" }),
+        OMB_CONNECTOR_UPSTREAM_HEADERS: JSON.stringify({
+          authorization: "Bearer secret",
+          "x-botfleet-bot-id": "bot-1",
+          "x-botfleet-thread-id": "thread-1",
+        }),
         OMB_HARNESS_URL: "http://127.0.0.1:8799",
         OMB_COMMS_TOKEN: "secret",
         OMB_BOT_ID: "bot-1",
@@ -476,6 +544,28 @@ describe.sequential("Composio Sessions", () => {
       });
     } finally {
       connectedAccountsUnavailable = false;
+    }
+  });
+
+  it("reports account inventory failures instead of turning them into an empty success", async () => {
+    const cfg: AppConfig = {
+      composio: { apiKey: "ak_test", userId: "botfleet_existing", sessionId: "trs_test" },
+    };
+    connectedAccountsStatus = 503;
+    try {
+      await expect(connectedInventoryStatus(cfg)).resolves.toMatchObject({
+        authoritative: false,
+        readiness: {
+          ready: false,
+          state: "degraded",
+          failure: {
+            kind: "upstream",
+            message: "The connected-apps service is temporarily unavailable.",
+          },
+        },
+      });
+    } finally {
+      connectedAccountsStatus = null;
     }
   });
 

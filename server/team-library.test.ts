@@ -1,13 +1,17 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
-  TEAM_LIBRARY_CATALOG_URL,
-  TEAM_LIBRARY_RAW_ROOT,
+  TEAM_LIBRARY_NOT_CONFIGURED,
   fetchGithubTeam,
   fetchLibraryTeam,
+  fetchTeamCatalog,
   githubManifestUrls,
   parseTeamCatalog,
+  parseTeamLibraryRepository,
+  teamLibrarySource,
 } from "./team-library.ts";
+
+const source = parseTeamLibraryRepository("https://github.com/acme/botfleet-teams")!;
 
 const manifest = {
   format: "botfleet.team",
@@ -52,25 +56,67 @@ function response(value: unknown, status = 200): Response {
 }
 
 describe("team library", () => {
-  it("validates catalog paths and adds the trusted repository URL", () => {
-    const parsed = parseTeamCatalog(catalog);
-    expect(parsed.repositoryUrl).toBe("https://github.com/milind-soni/botfleet-teams");
+  it("has no built-in catalog host and only accepts a public GitHub repository", () => {
+    // The repository this build used to name does not exist; nothing may be
+    // fetched from a guessed host.
+    expect(teamLibrarySource({})).toBeNull();
+    expect(teamLibrarySource({ OMB_TEAM_LIBRARY_REPOSITORY: "" })).toBeNull();
+    expect(parseTeamLibraryRepository("https://github.com/acme/botfleet-teams")).toEqual({
+      repositoryUrl: "https://github.com/acme/botfleet-teams",
+      rawRoot: "https://raw.githubusercontent.com/acme/botfleet-teams/main",
+      catalogUrl: "https://raw.githubusercontent.com/acme/botfleet-teams/main/catalog.json",
+    });
+    expect(parseTeamLibraryRepository("https://github.com/acme/botfleet-teams.git/#release/v2")?.rawRoot).toBe(
+      "https://raw.githubusercontent.com/acme/botfleet-teams/release/v2",
+    );
+    for (const bad of [
+      "http://github.com/acme/botfleet-teams",
+      "https://gitlab.com/acme/botfleet-teams",
+      "https://github.com/acme",
+      "https://github.com/acme/teams/tree/main",
+      "https://user:pw@github.com/acme/teams",
+      "https://github.com/acme/teams#../../evil",
+    ]) {
+      expect(parseTeamLibraryRepository(bad)).toBeNull();
+    }
+  });
+
+  it("fails soft when the library is not configured", async () => {
+    const fetcher = vi.fn() as unknown as typeof fetch;
+    await expect(fetchTeamCatalog(fetcher, null)).resolves.toEqual({
+      format: "botfleet.catalog",
+      version: 1,
+      repositoryUrl: "",
+      configured: false,
+      teams: [],
+    });
+    await expect(fetchLibraryTeam("engineering", fetcher, null)).rejects.toMatchObject({
+      message: TEAM_LIBRARY_NOT_CONFIGURED,
+      status: 404,
+    });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("validates catalog paths and adds the configured repository URL", () => {
+    const parsed = parseTeamCatalog(catalog, source.repositoryUrl);
+    expect(parsed.repositoryUrl).toBe("https://github.com/acme/botfleet-teams");
+    expect(parsed.configured).toBe(true);
     expect(parsed.teams[0]).toMatchObject({ slug: "engineering", members: 1 });
 
     const unsafe = structuredClone(catalog);
     unsafe.teams[0]!.manifest = "../private.json";
-    expect(() => parseTeamCatalog(unsafe)).toThrow("safe catalog path");
+    expect(() => parseTeamCatalog(unsafe, source.repositoryUrl)).toThrow("safe catalog path");
   });
 
-  it("loads only the manifest selected by the trusted catalog", async () => {
+  it("loads only the manifest selected by the configured catalog", async () => {
     const fetcher = vi.fn(async (url: string | URL | Request) => {
       const target = String(url);
-      if (target === TEAM_LIBRARY_CATALOG_URL) return response(catalog);
-      if (target === `${TEAM_LIBRARY_RAW_ROOT}/teams/engineering/team.mausteam.json`) return response(manifest);
+      if (target === source.catalogUrl) return response(catalog);
+      if (target === `${source.rawRoot}/teams/engineering/team.mausteam.json`) return response(manifest);
       return response({}, 404);
     }) as unknown as typeof fetch;
 
-    const loaded = await fetchLibraryTeam("engineering", fetcher);
+    const loaded = await fetchLibraryTeam("engineering", fetcher, source);
     if (loaded.format !== "botfleet.team") throw new Error("expected a legacy team");
     expect(loaded.team.name).toBe("Engineering");
     expect(fetcher).toHaveBeenCalledTimes(2);

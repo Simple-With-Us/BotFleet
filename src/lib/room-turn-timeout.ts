@@ -1,6 +1,12 @@
 export const MIN_ROOM_TURN_TIMEOUT_MINUTES = 1;
 export const MAX_ROOM_TURN_TIMEOUT_MINUTES = 1_440;
 export const ROOM_TURN_TIMEOUT_INPUT_ERROR = "Enter a whole number from 1 to 1,440.";
+/** The band most bot turns should sit in: short enough that a runaway
+ * turn cannot lock a channel for an hour, long enough that a real multi-step
+ * task has time to finish.  Surfaces in the Settings copy so the user has a
+ * default to read off, not just the raw numeric bounds. */
+export const RECOMMENDED_TURN_TIMEOUT_MIN_MINUTES = 5;
+export const RECOMMENDED_TURN_TIMEOUT_MAX_MINUTES = 60;
 
 export type RoomTurnTimeoutInput =
   | { ok: true; minutes: number }

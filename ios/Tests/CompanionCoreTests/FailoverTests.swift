@@ -28,7 +28,7 @@ final class FailoverTests: XCTestCase {
             url: "http://mac.tail1234.ts.net:8810", kind: .tailnet, priority: 100
         ))
         let bonjour = try XCTUnwrap(CompanionEndpoint(
-            url: "http://openmausbot-aa.local:8810", kind: .bonjour, priority: 200
+            url: "http://botfleet-aa.local:8810", kind: .bonjour, priority: 200
         ))
         var rotation = CandidateRotation(endpoints: [local, tailnet, bonjour])
 
@@ -104,6 +104,24 @@ final class FailoverTests: XCTestCase {
         XCTAssertEqual(rotation.endpoints, [hosted])
     }
 
+    func testIsGatewayStatusCodeCoversBothTunnelRangesAndNothingElse() {
+        for code in [502, 503, 504, 520, 521, 522, 523, 524, 525, 526, 527, 528, 529, 530] {
+            XCTAssertTrue(ConnectionAdvice.isGatewayStatusCode(code), "expected HTTP \(code) to be a gateway status")
+        }
+        for code in [200, 400, 401, 403, 404, 409, 500, 501, 505, 519, 531, 600] {
+            XCTAssertFalse(ConnectionAdvice.isGatewayStatusCode(code), "expected HTTP \(code) not to be a gateway status")
+        }
+    }
+
+    func testIsGatewayOutageOnlyMatchesAPIStatusErrorsNotURLErrors() {
+        XCTAssertTrue(ConnectionAdvice.isGatewayOutage(APIError.status(code: 502, message: nil)))
+        XCTAssertFalse(ConnectionAdvice.isGatewayOutage(APIError.status(code: 500, message: nil)))
+        // An address-shaped URLError is a route problem, not a gateway
+        // response, even though `shouldTryAnotherRoute` also moves the dial
+        // for it.
+        XCTAssertFalse(ConnectionAdvice.isGatewayOutage(URLError(.cannotConnectToHost)))
+    }
+
     func testAuthenticationFailureDoesNotAdvanceTheRoute() throws {
         let hosted = try XCTUnwrap(CompanionEndpoint(
             url: "https://mac.companion.example",
@@ -176,9 +194,9 @@ final class FailoverTests: XCTestCase {
             name: "Mac",
             host: "192.168.1.42",
             port: 8810,
-            hosts: ["mac.tail1234.ts.net", "192.168.1.42", "openmausbot-aa.local"]
+            hosts: ["mac.tail1234.ts.net", "192.168.1.42", "botfleet-aa.local"]
         )
-        XCTAssertEqual(connection.orderedHosts, ["192.168.1.42", "mac.tail1234.ts.net", "openmausbot-aa.local"])
+        XCTAssertEqual(connection.orderedHosts, ["192.168.1.42", "mac.tail1234.ts.net", "botfleet-aa.local"])
     }
 
     func testOrderedHostsFallsBackToTheSingleStoredHost() {
@@ -206,11 +224,11 @@ final class FailoverTests: XCTestCase {
             name: "Mac",
             host: "mac.tail1234.ts.net",
             port: 8810,
-            hosts: ["mac.tail1234.ts.net", "192.168.1.42", "openmausbot-aa.local"]
+            hosts: ["mac.tail1234.ts.net", "192.168.1.42", "botfleet-aa.local"]
         )
         connection.promote("192.168.1.42")
         XCTAssertEqual(connection.host, "192.168.1.42")
-        XCTAssertEqual(connection.hosts, ["192.168.1.42", "mac.tail1234.ts.net", "openmausbot-aa.local"])
+        XCTAssertEqual(connection.hosts, ["192.168.1.42", "mac.tail1234.ts.net", "botfleet-aa.local"])
 
         // A hand-typed address the list has never seen joins at the front —
         // the stored fallbacks remain worth walking behind it.
@@ -365,7 +383,7 @@ final class FailoverTests: XCTestCase {
             name: "Mac",
             host: "mac.tail1234.ts.net",
             port: 8810,
-            hosts: ["mac.tail1234.ts.net", "192.168.1.42", "openmausbot-aa.local"]
+            hosts: ["mac.tail1234.ts.net", "192.168.1.42", "botfleet-aa.local"]
         )
         let lan = try XCTUnwrap(CompanionEndpoint.direct(
             host: "192.168.1.42",
@@ -377,7 +395,7 @@ final class FailoverTests: XCTestCase {
 
         XCTAssertNil(connection.endpoints)
         XCTAssertEqual(connection.orderedEndpoints.map(\.host), [
-            "192.168.1.42", "mac.tail1234.ts.net", "openmausbot-aa.local",
+            "192.168.1.42", "mac.tail1234.ts.net", "botfleet-aa.local",
         ])
     }
 

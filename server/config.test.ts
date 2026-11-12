@@ -1,17 +1,21 @@
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   DATA_DIR,
+  migrateComputerProvidersConfig,
+  migrateLegacyElevenLabsTtsProvider,
+  allowedBotComputers,
+  filterAllowedComputers,
   instanceConfigs,
   isValidSshAlias,
   loadConfig,
   localVmMaxInstances,
-  localVmMode,
   parseConfigPatch,
   parseStoredConfig,
+  saveConfig,
   roomTurnTimeoutMinutes,
   showToolCallsEnabled,
   summarizeToolCallsEnabled,
@@ -20,11 +24,77 @@ import {
   syncCredentialEnv,
   vpsSshAlias,
   patchInstanceConfig,
+  persistableInstanceConfigs,
+  stripInjectedDefaults,
   WORKSPACE_CREDENTIAL_ENV,
+  autoUpdateDue,
+  AUTO_UPDATE_THROTTLE_MS,
+  publicIngressUrl,
+  publicIngressUrlEffective,
+  webhookPublicIngressUrl,
+  webhookPublicIngressUrlEffective,
+  isSentryDsn,
+  observabilityEnabled,
+  observabilitySettings,
+  computerCallSettings,
+  claudeSessionIdleMs,
+  DEFAULT_COMPUTER_PERSON_AWAY_MS,
+  DEFAULT_CLAUDE_SESSION_IDLE_MS,
+  sentryDsnConfigured,
+  DEFAULT_SENTRY_TRACES_SAMPLE_RATE,
+  DEFAULT_SENTRY_AI_TRACES_SAMPLE_RATE,
+  DEFAULT_SENTRY_HTTP_TRACES_SAMPLE_RATE,
+  DEFAULT_SENTRY_UI_TRACES_SAMPLE_RATE,
+  MAX_OBSERVABILITY_ENVIRONMENT_LENGTH,
+  DEFAULT_INFISICAL_ENVIRONMENT,
+  DEFAULT_INFISICAL_REFRESH_MINUTES,
+  DEFAULT_INFISICAL_SECRET_PATH,
+  DEFAULT_INFISICAL_SITE_URL,
+  infisicalConfigured,
+  infisicalEnabled,
+  infisicalSettings,
+  validateInfisicalConfigPatch,
+  agentProxyEnabled,
+  agentProxySettings,
+  applyAgentProxyEnv,
+  DEFAULT_AGENT_PROXY_ADDRESS,
+  isHttpsUrl,
+  clampPlacementWindow,
   type AppConfig,
+  type InfisicalReadSource,
 } from "./config.ts";
+import { isSentryDsn as isBrowserSentryDsn } from "../src/lib/observability-config.ts";
+
+// Obviously fake, and never sent anywhere: these exist so the assertions
+// below have a DSN-shaped string to work on.
+const SENTINEL_DSN = "https://abc123@o0.ingest.sentry.io/1";
 
 describe("configuration boundaries", () => {
+  it("accepts voice provider fields and rejects unknown keys in those schemas", () => {
+    expect(parseConfigPatch({
+      tts: { provider: "xai" },
+      callStt: { provider: "meta" },
+      azureSpeech: { region: "westus" },
+      metaSpeech: {},
+      groq: {},
+      assemblyai: {},
+    })).toEqual({
+      tts: { provider: "xai" },
+      callStt: { provider: "meta" },
+      azureSpeech: { region: "westus" },
+      metaSpeech: {},
+      groq: {},
+      assemblyai: {},
+    });
+
+    expect(() => parseConfigPatch({ tts: { provider: "xai", typo: true } })).toThrow(/Unrecognized key/);
+    expect(() => parseConfigPatch({ callStt: { provider: "meta", typo: true } })).toThrow(/Unrecognized key/);
+    expect(() => parseConfigPatch({ azureSpeech: { region: "westus", typo: true } })).toThrow(/Unrecognized key/);
+    expect(() => parseConfigPatch({ metaSpeech: { typo: true } })).toThrow(/Unrecognized key/);
+    expect(() => parseConfigPatch({ groq: { typo: true } })).toThrow(/Unrecognized key/);
+    expect(() => parseConfigPatch({ assemblyai: { typo: true } })).toThrow(/Unrecognized key/);
+  });
+
   it("keeps supported stored settings and drops unrelated top-level data", () => {
     expect(
       parseStoredConfig({
@@ -41,7 +111,43 @@ describe("configuration boundaries", () => {
   it("rejects malformed stored instances and API patches", () => {
     expect(() => parseStoredConfig({ instances: { claude: { driver: 42 } } })).toThrow("instances.claude.driver");
     expect(() => parseConfigPatch({ opencodeGo: { apiKey: 42 } })).toThrow("opencodeGo.apiKey");
+    expect(() => parseConfigPatch({ xai: { credentialStorage: "external" } })).toThrow(
+      "xai.credentialStorage is managed by the desktop credential store",
+    );
     expect(() => parseConfigPatch({ profile: [] })).toThrow("profile");
+    expect(() => parseConfigPatch({ usage: { ingestUrl: "usage.example.com" } })).toThrow(
+      "usage.ingestUrl must be an absolute http(s) URL",
+    );
+    expect(parseConfigPatch({ usage: { ingestUrl: "https://usage.example.com", ingestToken: "tok" } })).toEqual({
+      usage: { ingestUrl: "https://usage.example.com", ingestToken: "tok" },
+    });
+    expect(parseConfigPatch({ usage: { ingestUrl: "" } })).toEqual({ usage: { ingestUrl: "" } });
+  });
+
+  it("accepts another Infisical project and environment for the Zulip keys, and refuses a malformed one", () => {
+    expect(
+      parseConfigPatch({
+        zulip: {
+          credentialSource: "infisical",
+          infisicalProjectId: " 9bf7417a-fbbb-42ca-870c-2b45207233f5 ",
+          infisicalEnv: "prod",
+          infisicalPath: "/zulip",
+        },
+      }),
+    ).toEqual({
+      zulip: {
+        credentialSource: "infisical",
+        infisicalProjectId: "9bf7417a-fbbb-42ca-870c-2b45207233f5",
+        infisicalEnv: "prod",
+        infisicalPath: "/zulip",
+      },
+    });
+    // empty clears it back to the harness's own project and environment
+    expect(parseConfigPatch({ zulip: { infisicalProjectId: "", infisicalEnv: "" } })).toEqual({
+      zulip: { infisicalProjectId: "", infisicalEnv: "" },
+    });
+    expect(() => parseConfigPatch({ zulip: { infisicalProjectId: "../other" } })).toThrow("zulip.infisicalProjectId");
+    expect(() => parseConfigPatch({ zulip: { infisicalEnv: "prod/zulip" } })).toThrow("zulip.infisicalEnv");
   });
 
   it("accepts only a simple VPS SSH config alias and exposes no credentials", () => {
@@ -72,14 +178,20 @@ describe("configuration boundaries", () => {
     },
   );
 
-  it("preserves shared Local VM behavior by default and accepts bounded per-bot mode", () => {
-    expect(localVmMode({})).toBe("shared");
+  it("accepts localVm maxInstances patch", () => {
     expect(localVmMaxInstances({})).toBe(2);
-    expect(parseConfigPatch({ localVm: { mode: "per-bot", maxInstances: 4 } })).toEqual({
-      localVm: { mode: "per-bot", maxInstances: 4 },
+    expect(parseConfigPatch({ localVm: { maxInstances: 4 } })).toEqual({
+      localVm: { maxInstances: 4 },
     });
-    expect(localVmMode({ localVm: { mode: "per-bot" } })).toBe("per-bot");
     expect(localVmMaxInstances({ localVm: { maxInstances: 3 } })).toBe(3);
+  });
+
+  it("accepts localVm shareCliCredentials and allowHostTerminal patches", () => {
+    expect(
+      parseConfigPatch({ localVm: { shareCliCredentials: true, allowHostTerminal: true } }),
+    ).toEqual({
+      localVm: { shareCliCredentials: true, allowHostTerminal: true },
+    });
   });
 
   it("keeps experimental features off by default and accepts an explicit opt-in", () => {
@@ -93,11 +205,19 @@ describe("configuration boundaries", () => {
     );
   });
 
-  it("keeps tool-call chips off by default and accepts an explicit opt-in", () => {
-    expect(showToolCallsEnabled({})).toBe(false);
-    expect(parseConfigPatch({ features: { showToolCalls: true } })).toEqual({
-      features: { showToolCalls: true },
+  it("accepts busySendDefault queue or steer", () => {
+    expect(parseConfigPatch({ busySendDefault: "queue" })).toEqual({ busySendDefault: "queue" });
+    expect(() => parseConfigPatch({ busySendDefault: "hold" })).toThrow("busySendDefault");
+  });
+
+  it("shows tool steps by default and accepts an explicit opt-out", () => {
+    // they carry the file, the command and the duration now — see
+    // shared/tool-activity.ts for why that flipped the default
+    expect(showToolCallsEnabled({})).toBe(true);
+    expect(parseConfigPatch({ features: { showToolCalls: false } })).toEqual({
+      features: { showToolCalls: false },
     });
+    expect(showToolCallsEnabled({ features: { showToolCalls: false } })).toBe(false);
     expect(showToolCallsEnabled({ features: { showToolCalls: true } })).toBe(true);
   });
 
@@ -128,11 +248,33 @@ describe("default fleet", () => {
     expect(map.cursor).toEqual({ driver: "cursorAgent", environment: {} });
   });
 
+  it("ships MiniMax CLI as a default-fleet engine", () => {
+    const map = instanceConfigs({});
+    expect(map.minimax).toEqual({ driver: "minimax", environment: {} });
+    const existing = instanceConfigs({ instances: { claude: { driver: "claudeAgent" } } });
+    expect(existing.minimax?.driver).toBe("minimax");
+  });
+
+  it("ships MiniMax Code as its own default-fleet engine", () => {
+    const map = instanceConfigs({});
+    expect(map.mcode).toEqual({ driver: "mcodeAgent", environment: {} });
+    // The reserved instance id is the engine's own name, so the row is not
+    // mistaken for one the operator added.
+    expect(map.minimax?.driver).toBe("minimax");
+    const existing = instanceConfigs({ instances: { claude: { driver: "claudeAgent" } } });
+    expect(existing.mcode?.driver).toBe("mcodeAgent");
+  });
+
   it("carries the saved OpenAI-compatible URL into the live default instance", () => {
     const map = instanceConfigs({
       openaiCompat: { key: "secret", url: "https://models.example.test/v1" },
     });
-    expect(map.openaiCompat.config).toEqual({ url: "https://models.example.test/v1" });
+    expect(map.openaiCompat.config).toEqual({
+      url: "https://models.example.test/v1",
+      // Stamped so the persist paths can tell a resolved fallback from a
+      // typed endpoint without comparing the two values.
+      urlSource: "workspace",
+    });
     expect(map.openaiCompat.environment).toEqual({
       OPENAI_COMPAT_API_KEY: "secret",
       OPENAI_COMPAT_URL: "https://models.example.test/v1",
@@ -165,10 +307,12 @@ describe("default fleet", () => {
 
     expect(instanceConfigs(config).custom.config).toEqual({
       url: "https://first.example.test/v1",
+      urlSource: "workspace",
     });
     config.openaiCompat = { url: "https://second.example.test/v1" };
     expect(instanceConfigs(config).custom.config).toEqual({
       url: "https://second.example.test/v1",
+      urlSource: "workspace",
     });
     expect(config.instances?.custom.config).toBeUndefined();
   });
@@ -245,6 +389,318 @@ describe("Instance CLI override", () => {
     const kept = patchInstanceConfig(custom, "claude", { cli: "/x" });
     expect(kept.config.instances!.claude.environment).toEqual({ MY_FLAG: "1" });
   });
+
+  it("never injects the shared OpenAI-compatible key into a user-added custom instance", () => {
+    // "openaiCompat" is the one reserved instance id backed by the
+    // workspace-wide openaiCompat.key. A user-added custom instance shares
+    // the same driver but points at whatever endpoint the user just typed
+    // in — injecting the shared key there too would hand that arbitrary
+    // endpoint the workspace's real OpenRouter/Groq credential.
+    const cfg: AppConfig = {
+      openaiCompat: { key: "SECRET-SHARED-KEY", url: "https://openrouter.ai/api/v1" },
+      instances: {
+        openaiCompat: { driver: "openai-compat" },
+        "custom-ollama": { driver: "openai-compat", config: { url: "http://localhost:11434/v1" } },
+      },
+    };
+    const map = instanceConfigs(cfg);
+    expect(map.openaiCompat.environment).toMatchObject({ OPENAI_COMPAT_API_KEY: "SECRET-SHARED-KEY" });
+    expect(map["custom-ollama"].environment ?? {}).not.toHaveProperty("OPENAI_COMPAT_API_KEY");
+    expect(map["custom-ollama"].environment ?? {}).not.toHaveProperty("OPENAI_COMPAT_URL");
+  });
+
+  it("gives the reserved MiniMax instance the workspace key and base URL", () => {
+    // The MiniMax driver resolves its key from the instance environment
+    // first (resolveMinimaxCredentials) and its endpoint from config.url
+    // first (decodeMinimaxConfig), so those are the two channels a value
+    // saved in Settings or held in the vault has to travel through.
+    const map = instanceConfigs({
+      minimax: { key: "SECRET-MINIMAX", url: "https://api.minimaxi.com/v1" },
+    });
+    expect(map.minimax.environment).toEqual({ MINIMAX_API_KEY: "SECRET-MINIMAX" });
+    expect(map.minimax.config).toEqual({ url: "https://api.minimaxi.com/v1", urlSource: "workspace" });
+  });
+
+  it("never injects the workspace MiniMax key into a second MiniMax connection", () => {
+    // Same rule, same reason, as the openai-compat case above: an added
+    // connection points at whatever endpoint the operator typed in, so the
+    // workspace key may only reach the reserved `minimax` instance.
+    const cfg: AppConfig = {
+      minimax: { key: "SECRET-WORKSPACE-MINIMAX", url: "https://api.minimax.io/v1" },
+      instances: {
+        minimax: { driver: "minimax" },
+        "custom-minimax-cn": {
+          driver: "minimax",
+          config: { url: "https://api.minimaxi.com/v1", key: "SECRET-CN-ONLY" },
+        },
+        "custom-minimax-keyless": { driver: "minimax" },
+      },
+    };
+    const map = instanceConfigs(cfg);
+    expect(map.minimax.environment).toEqual({ MINIMAX_API_KEY: "SECRET-WORKSPACE-MINIMAX" });
+    // Its own key, never the workspace one.
+    expect(map["custom-minimax-cn"].environment).toEqual({ MINIMAX_API_KEY: "SECRET-CN-ONLY" });
+    expect(map["custom-minimax-cn"].config).toEqual({
+      url: "https://api.minimaxi.com/v1",
+      key: "SECRET-CN-ONLY",
+    });
+    // No key of its own means no key at all — not a borrowed one.
+    expect(map["custom-minimax-keyless"].environment ?? {}).not.toHaveProperty("MINIMAX_API_KEY");
+  });
+
+  it("keeps a per-instance MiniMax key out of the persisted environment, even when it changes", () => {
+    // The injected copy exists only for the live driver. Persisting it would
+    // write the key to config.json twice, and the stale copy would shadow a
+    // rotation for the rest of that instance's life.
+    const cfg: AppConfig = {
+      minimax: { key: "SECRET-WORKSPACE-MINIMAX" },
+      instances: {
+        minimax: { driver: "minimax" },
+        "custom-minimax-cn": { driver: "minimax", config: { url: "https://api.minimaxi.com/v1", key: "OLD-KEY" } },
+      },
+    };
+    const rotated = patchInstanceConfig(cfg, "custom-minimax-cn", { key: "NEW-KEY" });
+    expect(rotated.ok).toBe(true);
+    const persisted = rotated.config.instances!;
+    expect(persisted["custom-minimax-cn"].config).toEqual({
+      url: "https://api.minimaxi.com/v1",
+      key: "NEW-KEY",
+    });
+    for (const entry of Object.values(persisted)) {
+      expect(JSON.stringify(entry.environment ?? {})).not.toContain("KEY");
+      expect(entry.environment ?? {}).toEqual({});
+    }
+  });
+
+  it("keeps a typed endpoint that happens to equal the workspace one", () => {
+    // The repro: two connections, one deliberately pointed at the SAME
+    // endpoint the workspace uses.  Deciding provenance by comparing values
+    // could not tell it apart from a resolved fallback, so it was stripped —
+    // and the next workspace change silently re-pointed it somewhere the
+    // operator never chose.
+    const cfg: AppConfig = {
+      minimax: { url: "https://api.minimax.io/v1" },
+      instances: {
+        minimax: { driver: "minimax" },
+        "custom-same": {
+          driver: "minimax",
+          config: { url: "https://api.minimax.io/v1", urlSource: "instance", key: "K1" },
+        },
+        "custom-other": {
+          driver: "minimax",
+          config: { url: "https://gateway.example.test/v1", urlSource: "instance", key: "K2" },
+        },
+      },
+    };
+    // Patching an unrelated instance must not rewrite either of the others.
+    const patched = patchInstanceConfig(cfg, "minimax", { enabled: false });
+    expect(patched.ok).toBe(true);
+    const after = patched.config.instances!;
+    expect(after["custom-same"].config).toEqual({
+      url: "https://api.minimax.io/v1",
+      urlSource: "instance",
+      key: "K1",
+    });
+    expect(after["custom-other"].config).toEqual({
+      url: "https://gateway.example.test/v1",
+      urlSource: "instance",
+      key: "K2",
+    });
+
+    // Move the workspace endpoint: the typed one stays where it was typed,
+    // and only the instance that never had one follows.
+    const moved: AppConfig = { minimax: { url: "https://api.minimaxi.com/v1" }, instances: after };
+    const live = instanceConfigs(moved);
+    expect(live["custom-same"].config).toMatchObject({ url: "https://api.minimax.io/v1" });
+    expect(live["custom-other"].config).toMatchObject({ url: "https://gateway.example.test/v1" });
+    expect(live.minimax.config).toEqual({
+      url: "https://api.minimaxi.com/v1",
+      urlSource: "workspace",
+    });
+  });
+
+  it("never persists a workspace endpoint onto the instance that only falls back to it", () => {
+    // The workspace endpoint is a FALLBACK, resolved at load time.  Baking
+    // the resolved value into the entry turns it into a per-instance
+    // override, and the NEXT change to the workspace endpoint then stops
+    // reaching the instance it was set for.
+    const cfg: AppConfig = { minimax: { url: "https://api.minimax.io/v1" } };
+    const patched = patchInstanceConfig(cfg, "minimax", { enabled: false });
+    expect(patched.ok).toBe(true);
+    expect(patched.config.instances!.minimax.config).toBeUndefined();
+
+    // …and the fallback still resolves, now against the NEW workspace value.
+    const moved: AppConfig = { minimax: { url: "https://api.minimaxi.com/v1" }, instances: patched.config.instances };
+    expect(instanceConfigs(moved).minimax.config).toEqual({
+      url: "https://api.minimaxi.com/v1",
+      urlSource: "workspace",
+    });
+
+    // A per-instance override the operator really typed survives untouched.
+    const overridden: AppConfig = {
+      minimax: { url: "https://api.minimax.io/v1" },
+      instances: { minimax: { driver: "minimax", config: { url: "https://gateway.example.test/v1" } } },
+    };
+    const keptOverride = patchInstanceConfig(overridden, "minimax", { enabled: false });
+    expect(keptOverride.config.instances!.minimax.config).toEqual({ url: "https://gateway.example.test/v1" });
+    // A url written before the marker existed is left alone rather than
+    // guessed at — the strip only removes what THIS load materialised.
+    const legacy: AppConfig = {
+      minimax: { url: "https://api.minimax.io/v1" },
+      instances: { minimax: { driver: "minimax", config: { url: "https://api.minimax.io/v1" } } },
+    };
+    expect(patchInstanceConfig(legacy, "minimax", { enabled: false }).config.instances!.minimax.config)
+      .toEqual({ url: "https://api.minimax.io/v1" });
+  });
+
+  it("keeps the fallback out of the persistable base on a default install", () => {
+    // persistableInstanceConfigs() is what a newly added engine is merged
+    // onto before saveConfig, so a fallback baked in here reaches disk for
+    // every instance at once.
+    const cfg: AppConfig = { openaiCompat: { url: "https://openrouter.ai/api/v1" } };
+    const base = persistableInstanceConfigs(cfg);
+    expect(base.openaiCompat.config).toBeUndefined();
+  });
+
+  it("strips a driver's injected credential only from the instance entitled to it (stripInjectedDefaults)", () => {
+    const cfg: AppConfig = {
+      openaiCompat: { key: "SECRET-SHARED-KEY" },
+    };
+    const map = instanceConfigs({
+      ...cfg,
+      instances: {
+        openaiCompat: { driver: "openai-compat" },
+        "custom-x": { driver: "openai-compat", config: { url: "https://third-party.example.test/v1" } },
+      },
+    });
+    const stripped = stripInjectedDefaults(cfg, map);
+    expect(stripped.openaiCompat.environment ?? {}).toEqual({});
+    expect(stripped["custom-x"].environment ?? {}).toEqual({});
+  });
+
+  it("builds the persisted instances base without copying live credentials on a default install", () => {
+    // The exact scenario that leaked secrets: cfg.instances absent (a
+    // default install) plus every credential-consuming driver configured.
+    // persistableInstanceConfigs(cfg) is what a new custom engine gets
+    // merged onto before saveConfig — it must never carry a live secret.
+    const cfg: AppConfig = {
+      xai: { key: "SECRET-XAI" },
+      box: { token: "SECRET-BOX" },
+      opencodeGo: { apiKey: "SECRET-OCG" },
+      openaiCompat: { key: "SECRET-OPENAI-COMPAT" },
+    };
+    const base = persistableInstanceConfigs(cfg);
+    expect(Object.keys(base).length).toBeGreaterThan(0);
+    for (const entry of Object.values(base)) {
+      expect(entry.environment ?? {}).toEqual({});
+    }
+  });
+
+  it("reuses cfg.instances as-is once it is already set", () => {
+    const cfg: AppConfig = { instances: { claude: { driver: "claudeAgent" } } };
+    expect(persistableInstanceConfigs(cfg)).toBe(cfg.instances);
+  });
+});
+
+describe("OpenAI-compatible reply wait override", () => {
+  it("stores and clears minutes on only that instance config", () => {
+    const cfg: AppConfig = {
+      instances: {
+        "custom-ollama": {
+          driver: "openai-compat",
+          config: { url: "http://127.0.0.1:11434/v1", models: ["fixture"], key: "synthetic-key" },
+        },
+      },
+    };
+    const set = patchInstanceConfig(cfg, "custom-ollama", { replyWaitMinutes: 20 });
+    expect(set.config.instances!["custom-ollama"].config).toEqual({
+      url: "http://127.0.0.1:11434/v1",
+      models: ["fixture"],
+      key: "synthetic-key",
+      replyWaitMinutes: 20,
+    });
+    const cleared = patchInstanceConfig(set.config, "custom-ollama", { replyWaitMinutes: null });
+    expect(cleared.config.instances!["custom-ollama"].config).toEqual({
+      url: "http://127.0.0.1:11434/v1",
+      models: ["fixture"],
+      key: "synthetic-key",
+    });
+    expect(cfg.instances!["custom-ollama"].config).not.toHaveProperty("replyWaitMinutes");
+  });
+});
+
+describe("general config patch schema", () => {
+  it("keeps deleteInstance out of PATCH /api/config — only the dedicated DELETE route may delete an engine", () => {
+    // PATCH /api/config has none of DELETE /api/instances/:id's
+    // protections (protected-engine check, busy-bot check, atomic
+    // reassignment). A deleteInstance key in the patch body must be
+    // silently dropped, never honored.
+    const patch = parseConfigPatch({ deleteInstance: "claude", box: { token: "tok" } });
+    expect(patch).not.toHaveProperty("deleteInstance");
+    expect((patch as { box?: { token?: string } }).box).toEqual({ token: "tok" });
+  });
+});
+
+describe("Instance enable/disable", () => {
+  it("sets enabled=false on a default-fleet instance", () => {
+    const cfg: AppConfig = {};
+    const result = patchInstanceConfig(cfg, "claude", { enabled: false });
+    expect(result.ok).toBe(true);
+    expect(result.config.instances!.claude.enabled).toBe(false);
+  });
+
+  it("re-enabling clears the flag entirely so it round-trips like a fresh install", () => {
+    const cfg: AppConfig = { instances: { claude: { driver: "claudeAgent", enabled: false } } };
+    const result = patchInstanceConfig(cfg, "claude", { enabled: true });
+    expect(result.ok).toBe(true);
+    // The field is GONE on disk after re-enable, not `enabled: true` —
+    // matches `entry.enabled !== false` in registry.load.
+    expect(result.config.instances!.claude.enabled).toBeUndefined();
+  });
+
+  it("preserves a per-instance CLI override when toggling enabled", () => {
+    const cfg: AppConfig = {
+      instances: { claude: { driver: "claudeAgent", config: { cli: "/opt/claude" } } },
+    };
+    const off = patchInstanceConfig(cfg, "claude", { enabled: false });
+    expect(off.config.instances!.claude.config).toEqual({ cli: "/opt/claude" });
+    expect(off.config.instances!.claude.enabled).toBe(false);
+
+    const back = patchInstanceConfig(off.config, "claude", { enabled: true });
+    expect(back.config.instances!.claude.config).toEqual({ cli: "/opt/claude" });
+    expect(back.config.instances!.claude.enabled).toBeUndefined();
+  });
+
+  it("rejects an unknown instance", () => {
+    const cfg: AppConfig = {};
+    expect(patchInstanceConfig(cfg, "nope", { enabled: false }).ok).toBe(false);
+  });
+
+  it("clears a stale enabled:false on disk after a re-enable, through the real saveConfig merge", () => {
+    // patchInstanceConfig's own return value looks right either way (`delete
+    // entry.enabled` and `entry.enabled = undefined` both read back as
+    // `undefined`), so this only fails through the actual persistence path:
+    // saveConfig's instances merge is per-key (mergeConfigPatch does
+    // Object.assign(merged, entry) onto the EXISTING disk entry), so a key
+    // simply absent from the patch is invisible to it — re-enabling must
+    // write an explicit `enabled: undefined` (which JSON.stringify then
+    // drops), not just omit the key, or a stale `enabled: false` already on
+    // disk survives the "re-enable" forever.
+    mkdirSync(DATA_DIR, { recursive: true });
+    rmSync(join(DATA_DIR, "config.json"), { force: true });
+    try {
+      saveConfig({ instances: { claude: { driver: "claudeAgent", enabled: false } } });
+      expect(loadConfig().instances!.claude.enabled).toBe(false);
+
+      const reEnabled = patchInstanceConfig(loadConfig(), "claude", { enabled: true });
+      expect(reEnabled.ok).toBe(true);
+      saveConfig({ instances: reEnabled.config.instances });
+
+      expect(loadConfig().instances!.claude.enabled).not.toBe(false);
+    } finally {
+      rmSync(join(DATA_DIR, "config.json"), { force: true });
+    }
+  });
 });
 
 describe("OpenCode Go configuration", () => {
@@ -316,6 +772,8 @@ describe("credential env preference", () => {
     "OMB_TTS_KEY",
     "OMB_OPENAI_IMAGE_KEY",
     "COMPOSIO_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "DEEPSEEK_URL",
   ] as const;
   let saved: Record<string, string | undefined>;
 
@@ -352,23 +810,33 @@ describe("credential env preference", () => {
     process.env.OPENCODE_API_KEY = "env-ocg";
     process.env.OMB_TTS_KEY = "env-tts";
     process.env.OMB_OPENAI_IMAGE_KEY = "env-image";
+    process.env.DEEPSEEK_API_KEY = "env-deepseek";
+    process.env.DEEPSEEK_URL = "https://env.example.test";
     const cfg = loadConfig();
     expect(cfg.xai).toEqual({ key: "env-xai", url: "https://api.example.test/v1" });
     expect(cfg.box).toEqual({ token: "env-box" });
     expect(cfg.opencodeGo).toEqual({ apiKey: "env-ocg" });
-    expect(cfg.tts).toEqual({ key: "env-tts", voice: "narrator" });
+    expect(cfg.tts).toEqual({ key: "env-tts", voice: "narrator", provider: "minimax" });
     expect(cfg.imageGen).toEqual({ key: "env-image" });
+    expect(cfg.deepseek).toEqual({ key: "env-deepseek", url: "https://env.example.test" });
   });
 
   it("falls back to the config file when the env var is unset (dev mode)", () => {
     writeFileSync(
       join(DATA_DIR, "config.json"),
-      JSON.stringify({ xai: { key: "file-xai" }, tts: { key: "file-tts" }, imageGen: { key: "file-image" } }),
+      JSON.stringify({
+        xai: { key: "file-xai" },
+        tts: { key: "file-tts" },
+        imageGen: { key: "file-image" },
+        deepseek: { key: "file-deepseek" },
+      }),
     );
     const cfg = loadConfig();
     expect(cfg.xai?.key).toBe("file-xai");
     expect(cfg.tts?.key).toBe("file-tts");
+    expect(cfg.tts?.provider).toBe("minimax");
     expect(cfg.imageGen?.key).toBe("file-image");
+    expect(cfg.deepseek?.key).toBe("file-deepseek");
   });
 
   it("treats a blanked file field as absent when env supplies the secret", () => {
@@ -379,14 +847,27 @@ describe("credential env preference", () => {
     expect(loadConfig().xai?.key).toBe("env-xai");
   });
 
+  it("round-trips a DeepSeek key through the packaged app's external-secret tombstone", () => {
+    // Mirrors the exact index.ts externalSecretStorage flow: the desktop
+    // shell commits the key to credentials.bin, config.json gets the empty
+    // tombstone, and syncCredentialEnv is the only thing standing between
+    // that "" and configStatus.deepseek.configured reading false forever.
+    process.env.DEEPSEEK_API_KEY = "boot-injected";
+    writeFileSync(join(DATA_DIR, "config.json"), JSON.stringify({ deepseek: { key: "" } }));
+    syncCredentialEnv({ deepseek: { key: "just-saved" } });
+    expect(loadConfig().deepseek?.key).toBe("just-saved");
+  });
+
   it("syncCredentialEnv keeps process.env in step with a credential save", () => {
     process.env.XAI_API_KEY = "boot-injected";
     process.env.BOX_TOKEN = "boot-injected";
     process.env.COMPOSIO_API_KEY = "boot-injected";
+    process.env.DEEPSEEK_API_KEY = "boot-injected";
     syncCredentialEnv({
       xai: { key: "just-saved" },
       composio: { apiKey: "ak_just_saved" },
       box: { token: "" },
+      deepseek: { key: "ds-just-saved" },
       profile: { name: "Ada" },
     });
     // a saved value replaces the boot-time one; a cleared value drops it;
@@ -395,6 +876,177 @@ describe("credential env preference", () => {
     expect(process.env.COMPOSIO_API_KEY).toBe("ak_just_saved");
     expect(process.env.BOX_TOKEN).toBeUndefined();
     expect(process.env.OMB_TTS_KEY).toBeUndefined();
+    expect(process.env.DEEPSEEK_API_KEY).toBe("ds-just-saved");
+  });
+
+  it("syncCredentialEnv keeps the DeepSeek URL in step, clearing it on an explicit blank", () => {
+    process.env.DEEPSEEK_URL = "https://boot.example.test";
+    syncCredentialEnv({ deepseek: { url: "https://just-saved.example.test" } });
+    expect(process.env.DEEPSEEK_URL).toBe("https://just-saved.example.test");
+    syncCredentialEnv({ deepseek: { url: "" } });
+    expect(process.env.DEEPSEEK_URL).toBeUndefined();
+  });
+});
+
+describe("the placement knobs", () => {
+  beforeEach(() => {
+    mkdirSync(DATA_DIR, { recursive: true });
+    rmSync(join(DATA_DIR, "config.json"), { force: true });
+  });
+  afterEach(() => {
+    rmSync(join(DATA_DIR, "config.json"), { force: true });
+  });
+
+  it("keeps the unreachable window longer than the heartbeat period", () => {
+    // A worker that has not said so for less than one period is healthy, so
+    // an inverted pair would mark a healthy worker unreachable.
+    const clamped = parseStoredConfig({ placement: { heartbeatSeconds: 60, unreachableAfterSeconds: 30 } });
+    expect(clamped.placement).toEqual({ heartbeatSeconds: 60, unreachableAfterSeconds: 61 });
+  });
+
+  it("leaves a pair that already holds the order alone", () => {
+    const kept = parseStoredConfig({ placement: { heartbeatSeconds: 15, unreachableAfterSeconds: 30 } });
+    expect(kept.placement).toEqual({ heartbeatSeconds: 15, unreachableAfterSeconds: 30 });
+  });
+
+  it("raises the window after the vault resolves an inverted pair", () => {
+    expect(clampPlacementWindow({ heartbeatSeconds: 120, unreachableAfterSeconds: 60 })).toEqual({
+      heartbeatSeconds: 120,
+      unreachableAfterSeconds: 121,
+    });
+    expect(clampPlacementWindow({ heartbeatSeconds: 120, unreachableAfterSeconds: 300 })).toEqual({
+      heartbeatSeconds: 120,
+      unreachableAfterSeconds: 300,
+    });
+    expect(clampPlacementWindow({ unreachableAfterSeconds: 30 })).toEqual({ unreachableAfterSeconds: 30 });
+  });
+
+  it("persists the section, so a save of a knob reaches the file", () => {
+    saveConfig({ placement: { heartbeatSeconds: 20, unreachableAfterSeconds: 45 } });
+    const stored = JSON.parse(readFileSync(join(DATA_DIR, "config.json"), "utf8"));
+    expect(stored.placement).toMatchObject({ heartbeatSeconds: 20, unreachableAfterSeconds: 45 });
+    expect(loadConfig().placement).toMatchObject({ heartbeatSeconds: 20, unreachableAfterSeconds: 45 });
+  });
+});
+
+describe("saveConfig section merge", () => {
+  beforeEach(() => {
+    mkdirSync(DATA_DIR, { recursive: true });
+    rmSync(join(DATA_DIR, "config.json"), { force: true });
+    rmSync(join(DATA_DIR, "persist-on-exit.policy"), { force: true });
+  });
+  afterEach(() => {
+    rmSync(join(DATA_DIR, "config.json"), { force: true });
+    rmSync(join(DATA_DIR, "persist-on-exit.policy"), { force: true });
+  });
+
+  it("persists server quit policy and retains it through another server setting", () => {
+    saveConfig({ server: { persistOnExit: false } });
+    expect(loadConfig().server?.persistOnExit).toBe(false);
+    expect(readFileSync(join(DATA_DIR, "persist-on-exit.policy"), "utf8")).toBe("false\n");
+
+    saveConfig({ server: { allowRemoteDesktopLaunch: true } });
+    expect(loadConfig().server).toMatchObject({ persistOnExit: false, allowRemoteDesktopLaunch: true });
+  });
+
+  it("uses the strict offline policy and replaces it on an online save", () => {
+    saveConfig({ server: { persistOnExit: true } });
+    writeFileSync(join(DATA_DIR, "persist-on-exit.policy"), "false\n");
+    expect(loadConfig().server?.persistOnExit).toBe(false);
+
+    saveConfig({ server: { persistOnExit: true } });
+    expect(readFileSync(join(DATA_DIR, "persist-on-exit.policy"), "utf8")).toBe("true\n");
+    expect(loadConfig().server?.persistOnExit).toBe(true);
+
+    writeFileSync(join(DATA_DIR, "persist-on-exit.policy"), "true\ntrailing");
+    expect(loadConfig().server?.persistOnExit).toBe(true);
+  });
+
+  it("persists usage URL and token, and a later URL-only patch keeps the token", () => {
+    saveConfig({ usage: { ingestUrl: "https://usage.example.com", ingestToken: "tok_abc" } });
+    expect(loadConfig().usage).toMatchObject({
+      ingestUrl: "https://usage.example.com",
+      ingestToken: "tok_abc",
+    });
+
+    saveConfig({ usage: { ingestUrl: "https://usage.example.com/app" } });
+    expect(loadConfig().usage).toMatchObject({
+      ingestUrl: "https://usage.example.com/app",
+      ingestToken: "tok_abc",
+    });
+  });
+
+  it("persists qdrant URL and api key the same way", () => {
+    saveConfig({
+      qdrant: { url: "https://qdrant.example.com", apiKey: "qk", collection: "fleet-agents" },
+    });
+    expect(loadConfig().qdrant).toMatchObject({
+      url: "https://qdrant.example.com",
+      apiKey: "qk",
+      collection: "fleet-agents",
+    });
+
+    saveConfig({ qdrant: { collection: "other" } });
+    expect(loadConfig().qdrant).toMatchObject({
+      url: "https://qdrant.example.com",
+      apiKey: "qk",
+      collection: "other",
+    });
+  });
+
+  it("persists the observability section, and a toggle-only patch keeps the DSN", () => {
+    saveConfig({ observability: { sentryDsn: SENTINEL_DSN, environment: "operator" } });
+    expect(loadConfig().observability).toMatchObject({
+      sentryDsn: SENTINEL_DSN,
+      environment: "operator",
+    });
+
+    // the kill switch and the sample rate are edited on their own in
+    // Settings; neither may wipe the stored key on the way through
+    saveConfig({ observability: { enabled: false, tracesSampleRate: 0 } });
+    expect(loadConfig().observability).toMatchObject({
+      sentryDsn: SENTINEL_DSN,
+      environment: "operator",
+      enabled: false,
+      tracesSampleRate: 0,
+    });
+    expect(sentryDsnConfigured(loadConfig())).toBe(SENTINEL_DSN);
+    expect(observabilityEnabled(loadConfig())).toBe(false);
+
+    saveConfig({ observability: { environment: "" } });
+    expect(loadConfig().observability?.environment).toBe("");
+    expect(observabilitySettings(loadConfig()).environment).toBe(process.env.NODE_ENV || "production");
+
+    // and clearing is explicit: an empty string is the documented remove path
+    saveConfig({ observability: { sentryDsn: "" } });
+    expect(sentryDsnConfigured(loadConfig())).toBeNull();
+  });
+
+  it("persists the ingress URL, and an explicit empty string clears it", () => {
+    saveConfig({ ingress: { publicUrl: "https://agents.example.com", enabled: true } });
+    expect(loadConfig().ingress).toMatchObject({
+      publicUrl: "https://agents.example.com",
+      enabled: true,
+    });
+
+    // toggling the switch on its own must not wipe the stored URL -- same
+    // rule as observability's kill switch above
+    saveConfig({ ingress: { enabled: false } });
+    expect(loadConfig().ingress).toMatchObject({
+      publicUrl: "https://agents.example.com",
+      enabled: false,
+    });
+    expect(publicIngressUrl(loadConfig())).toBe("https://agents.example.com");
+
+    // clearing is explicit: the client sends the trimmed field including ""
+    // (never `undefined`, which JSON.stringify drops from the request body
+    // entirely and saveConfig's `Object.assign(merged, section)` merge then
+    // reads as "field not present in this patch, leave the old value").
+    // Regression: the client used to send `publicUrl: trimmed || undefined`,
+    // so clearing the Settings input silently kept serving the old URL.
+    saveConfig({ ingress: { publicUrl: "", enabled: true } });
+    expect(loadConfig().ingress).toMatchObject({ publicUrl: "", enabled: true });
+    expect(publicIngressUrl(loadConfig())).toBeNull();
   });
 });
 
@@ -419,3 +1071,1499 @@ describe("workspace credential env strip", () => {
     expect(WORKSPACE_CREDENTIAL_ENV).toContain("DEEPSEEK_URL");
   });
 });
+
+describe("operator-level computer allowlist", () => {
+  it("returns null when the allowlist is absent, so legacy installs pass through", () => {
+    // The shipped default: every destination is allowed, and the runtime
+    // never sees the allowlist at all.  This is what an upgraded install
+    // looks like until the operator narrows the toggle.
+    expect(allowedBotComputers({})).toBeNull();
+    expect(allowedBotComputers({ botDefaults: { computers: ["cloud", "local"] } })).toBeNull();
+  });
+
+  it("de-duplicates the allowlist while preserving the operator's order", () => {
+    expect(
+      allowedBotComputers({ botDefaults: { allowedComputers: ["local", "vm", "local", "cloud"] } }),
+    ).toEqual(["local", "vm", "cloud"]);
+  });
+
+  it("treats an empty allowlist as a real, persisted nothing-is-allowed", () => {
+    expect(allowedBotComputers({ botDefaults: { allowedComputers: [] } })).toEqual([]);
+  });
+
+  it("filters a granted set through the allowlist and keeps the input order", () => {
+    // A bot granted [local, vm, cloud] with the operator's allowlist set to
+    // [cloud, vm] should land on [vm, cloud] — the allowlist does not
+    // re-order, it only drops.
+    expect(filterAllowedComputers(["local", "vm", "cloud"], ["cloud", "vm"])).toEqual([
+      "vm",
+      "cloud",
+    ]);
+  });
+
+  it("passes everything through when the allowlist is null", () => {
+    expect(filterAllowedComputers(["local", "vm", "cloud"], null)).toEqual(["local", "vm", "cloud"]);
+  });
+
+  it("returns an empty list when nothing in the grant is allowed", () => {
+    expect(filterAllowedComputers(["local", "vm"], ["cloud"])).toEqual([]);
+  });
+
+  it("persists allowedComputers through the schema and the round-trip", () => {
+    expect(parseConfigPatch({ botDefaults: { allowedComputers: ["local"] } })).toEqual({
+      botDefaults: { allowedComputers: ["local"] },
+    });
+    expect(() => parseConfigPatch({ botDefaults: { allowedComputers: ["box"] } })).toThrow(
+      "botDefaults.allowedComputers",
+    );
+  });
+
+  it("accepts null as the not-narrowed allowlist, which every fresh install sends", () => {
+    // The settings panel carries the whole botDefaults block on every save,
+    // so an install that has never narrowed the allowlist sent null with each
+    // unrelated change — and the schema answered 400, which made changing the
+    // New Bots default or the cloud backend impossible on a fresh install.
+    expect(parseConfigPatch({ botDefaults: { allowedComputers: null } })).toEqual({
+      botDefaults: { allowedComputers: null },
+    });
+    expect(allowedBotComputers({ botDefaults: { allowedComputers: null } })).toBeNull();
+  });
+
+  it("clears a stored allowlist on null instead of merging it forward", () => {
+    // Omitting the key would not do this: the section merge keeps whatever is
+    // on disk, so re-enabling the last destination would appear to work and
+    // come back narrowed on the next load.
+    mkdirSync(DATA_DIR, { recursive: true });
+    rmSync(join(DATA_DIR, "config.json"), { force: true });
+    try {
+      saveConfig({ botDefaults: { computers: ["cloud"], allowedComputers: ["cloud"] } });
+      expect(allowedBotComputers(loadConfig())).toEqual(["cloud"]);
+
+      saveConfig({ botDefaults: { allowedComputers: null } });
+      const after = loadConfig();
+      expect(allowedBotComputers(after)).toBeNull();
+      // and only the allowlist is cleared — the workspace default stands.
+      expect(after.botDefaults?.computers).toEqual(["cloud"]);
+    } finally {
+      rmSync(join(DATA_DIR, "config.json"), { force: true });
+    }
+  });
+});
+
+describe("headroom null-clear (slice 7b)", () => {
+  it("accepts null for the three headroom knobs and rejects it elsewhere in admission", () => {
+    expect(parseConfigPatch({ jobs: { admission: { reservedCpuCores: null, reservedRamMb: null, minMemoryAvailablePercent: null } } })).toEqual({
+      jobs: { admission: { reservedCpuCores: null, reservedRamMb: null, minMemoryAvailablePercent: null } },
+    });
+    expect(() => parseConfigPatch({ jobs: { admission: { maxSwapPercent: null } } })).toThrow();
+    expect(() => parseConfigPatch({ jobs: { admission: { minFreeInodes: null } } })).toThrow();
+  });
+
+  it("deletes a stored headroom knob on null instead of persisting the null", () => {
+    mkdirSync(DATA_DIR, { recursive: true });
+    rmSync(join(DATA_DIR, "config.json"), { force: true });
+    try {
+      saveConfig({ jobs: { admission: { maxSwapPercent: 98, minFreeDiskMb: 2048, reservedCpuCores: 2, reservedRamMb: 512 } } });
+      expect(loadConfig().jobs?.admission?.reservedCpuCores).toBe(2);
+
+      // The headroom clients always send the complete admission object (the
+      // shallow jobs merge replaces it wholesale — see buildHeadroomPatch),
+      // so the clear rides with the carried-forward siblings.
+      saveConfig(parseConfigPatch({ jobs: { admission: { maxSwapPercent: 98, minFreeDiskMb: 2048, reservedCpuCores: null, reservedRamMb: 512 } } }));
+      const after = loadConfig();
+      expect(after.jobs?.admission?.reservedCpuCores).toBeUndefined();
+      // and only that knob is cleared — the sibling knobs and gates stand.
+      expect(after.jobs?.admission?.reservedRamMb).toBe(512);
+      expect(after.jobs?.admission?.maxSwapPercent).toBe(98);
+      expect("reservedCpuCores" in (after.jobs?.admission ?? {})).toBe(false);
+    } finally {
+      rmSync(join(DATA_DIR, "config.json"), { force: true });
+    }
+  });
+
+  it("leaves a stored headroom knob alone when the admission section is absent", () => {
+    // Admission merges wholesale at the section level, so "absent leaves
+    // alone" holds at the section boundary: an unrelated save never touches
+    // the stored knobs.  Only an explicit null deletes.
+    mkdirSync(DATA_DIR, { recursive: true });
+    rmSync(join(DATA_DIR, "config.json"), { force: true });
+    try {
+      saveConfig({ jobs: { admission: { maxSwapPercent: 98, minMemoryAvailablePercent: 20 } } });
+      saveConfig(parseConfigPatch({ profile: { name: "Jay" } }));
+      const after = loadConfig();
+      expect(after.jobs?.admission?.minMemoryAvailablePercent).toBe(20);
+      expect(after.jobs?.admission?.maxSwapPercent).toBe(98);
+    } finally {
+      rmSync(join(DATA_DIR, "config.json"), { force: true });
+    }
+  });
+});
+
+describe("autoUpdate throttle", () => {
+  it("treats the first run as due when no lastCheckMs is recorded and the toggle is on", () => {
+    const now = 1_700_000_000_000;
+    expect(autoUpdateDue({ autoUpdate: { enabled: true } }, now)).toBe(true);
+    expect(autoUpdateDue({ autoUpdate: { enabled: true, lastCheckMs: -1 } }, now)).toBe(true);
+    expect(autoUpdateDue({ autoUpdate: { enabled: true, lastCheckMs: Number.NaN } }, now)).toBe(true);
+  });
+
+  it("refuses to run when the toggle is off, even if no lastCheckMs is recorded", () => {
+    const now = 1_700_000_000_000;
+    // no autoUpdate at all = the user has not opted in
+    expect(autoUpdateDue({}, now)).toBe(false);
+    expect(autoUpdateDue({ autoUpdate: {} }, now)).toBe(false);
+    expect(autoUpdateDue({ autoUpdate: { enabled: undefined } }, now)).toBe(false);
+  });
+
+  it("blocks a run inside the 6-hour window", () => {
+    const now = 1_700_000_000_000;
+    expect(autoUpdateDue({ autoUpdate: { enabled: true, lastCheckMs: now - 1 } }, now)).toBe(false);
+    expect(
+      autoUpdateDue(
+        { autoUpdate: { enabled: true, lastCheckMs: now - (AUTO_UPDATE_THROTTLE_MS - 1) } },
+        now,
+      ),
+    ).toBe(false);
+  });
+
+  it("allows a run at or after the 6-hour mark", () => {
+    const now = 1_700_000_000_000;
+    expect(
+      autoUpdateDue({ autoUpdate: { enabled: true, lastCheckMs: now - AUTO_UPDATE_THROTTLE_MS } }, now),
+    ).toBe(true);
+    expect(
+      autoUpdateDue(
+        { autoUpdate: { enabled: true, lastCheckMs: now - (AUTO_UPDATE_THROTTLE_MS + 60_000) } },
+        now,
+      ),
+    ).toBe(true);
+  });
+
+  it("refuses to run when the autoUpdate toggle is off", () => {
+    const now = 1_700_000_000_000;
+    expect(autoUpdateDue({ autoUpdate: { enabled: false, lastCheckMs: now - 60_000 } }, now)).toBe(false);
+  });
+
+  it("round-trips the new fields through the patch parser", () => {
+    const parsed = parseConfigPatch({ autoUpdate: { enabled: true, lastCheckMs: 1700000000000, lastAppFingerprint: "1.0.30:abc123" } });
+    expect(parsed.autoUpdate).toEqual({
+      enabled: true,
+      lastCheckMs: 1700000000000,
+      lastAppFingerprint: "1.0.30:abc123",
+    });
+  });
+
+  it("rejects a negative lastCheckMs so a corrupt value cannot pin the throttle open", () => {
+    expect(() =>
+      parseConfigPatch({ autoUpdate: { lastCheckMs: -5 } }),
+    ).toThrow();
+  });
+});
+
+describe("public ingress URL", () => {
+  it("returns the trimmed URL on the raw helper and null when disabled", () => {
+    expect(publicIngressUrl({ ingress: { publicUrl: "https://hooks.example.com/" } })).toBe(
+      "https://hooks.example.com",
+    );
+    expect(publicIngressUrl({ ingress: { publicUrl: "  https://hooks.example.com/abc/  " } })).toBe(
+      "https://hooks.example.com/abc",
+    );
+    expect(publicIngressUrl({})).toBeNull();
+    expect(publicIngressUrl({ ingress: { publicUrl: "not-a-url" } })).toBeNull();
+  });
+
+  it("publicIngressUrlEffective returns null when the URL is disabled, even if saved", () => {
+    expect(
+      publicIngressUrlEffective({ ingress: { publicUrl: "https://hooks.example.com", enabled: false } }),
+    ).toBeNull();
+    // an absent flag defaults to on, so a config written by an older build
+    // keeps applying its URL
+    expect(
+      publicIngressUrlEffective({ ingress: { publicUrl: "https://hooks.example.com" } }),
+    ).toBe("https://hooks.example.com");
+    expect(publicIngressUrlEffective({})).toBeNull();
+  });
+
+  it("webhookPublicIngressUrl prefers dedicated webhookPublicUrl over publicUrl", () => {
+    expect(
+      webhookPublicIngressUrl({
+        ingress: {
+          publicUrl: "https://botfleet.jays.services",
+          webhookPublicUrl: "https://agents.jays.services",
+        },
+      }),
+    ).toBe("https://agents.jays.services");
+    expect(
+      webhookPublicIngressUrl({
+        ingress: {
+          publicUrl: "https://botfleet.jays.services",
+        },
+      }),
+    ).toBe("https://botfleet.jays.services");
+    expect(
+      webhookPublicIngressUrl({
+        ingress: {
+          publicUrl: "https://botfleet.jays.services",
+          webhookPublicUrl: "invalid-url",
+        },
+      }),
+    ).toBe("https://botfleet.jays.services");
+    expect(
+      webhookPublicIngressUrlEffective({
+        ingress: {
+          publicUrl: "https://botfleet.jays.services",
+          webhookPublicUrl: "https://agents.jays.services",
+          enabled: false,
+        },
+      }),
+    ).toBeNull();
+    expect(
+      webhookPublicIngressUrlEffective({
+        ingress: {
+          publicUrl: "https://botfleet.jays.services",
+          webhookPublicUrl: "https://agents.jays.services",
+          enabled: true,
+        },
+      }),
+    ).toBe("https://agents.jays.services");
+  });
+});
+
+describe("knob-backed env migrations", () => {
+  let savedEnv: Record<string, string | undefined>;
+  const ENV_NAMES = [
+    "OMB_COMPUTER_CALL_WAIT_MS",
+    "OMB_COMPUTER_CALL_ACT_WITHIN_MS",
+    "OMB_COMPUTER_WAIT_MAX_MS",
+    "OMB_CLAUDE_SESSION_IDLE_MS",
+    "OMB_CLAUDE_SESSION_IDLE_MIN_MS",
+  ] as const;
+
+  beforeEach(() => {
+    savedEnv = Object.fromEntries(ENV_NAMES.map((name) => [name, process.env[name]]));
+    for (const name of ENV_NAMES) delete process.env[name];
+  });
+  afterEach(() => {
+    for (const name of ENV_NAMES) {
+      if (savedEnv[name] === undefined) delete process.env[name];
+      else process.env[name] = savedEnv[name];
+    }
+  });
+
+  it("resolves the computer-call waits to the pre-knob defaults when nothing is set", () => {
+    expect(computerCallSettings({})).toEqual({
+      waitMs: 45_000,
+      actWithinMs: 5_000,
+      personAwayMs: DEFAULT_COMPUTER_PERSON_AWAY_MS,
+    });
+  });
+
+  it("keeps the legacy env names working underneath the config fields", () => {
+    process.env.OMB_COMPUTER_CALL_WAIT_MS = "2000";
+    process.env.OMB_COMPUTER_CALL_ACT_WITHIN_MS = "250";
+    process.env.OMB_COMPUTER_WAIT_MAX_MS = "90000";
+    expect(computerCallSettings({})).toEqual({ waitMs: 2_000, actWithinMs: 250, personAwayMs: 90_000 });
+    // A stored (or vault-resolved) field wins over the env name.
+    expect(computerCallSettings({ computerCall: { waitMs: 3_000 } }).waitMs).toBe(3_000);
+  });
+
+  it("clamps the computer-call waits to the gate's bounds", () => {
+    expect(computerCallSettings({ computerCall: { waitMs: 10, actWithinMs: 999_999 } })).toMatchObject({
+      waitMs: 500,
+      actWithinMs: 5_000,
+    });
+  });
+
+  it("resolves the Muse session idle window with its floor, cfg over env over default", () => {
+    expect(claudeSessionIdleMs({})).toBe(DEFAULT_CLAUDE_SESSION_IDLE_MS);
+    process.env.OMB_CLAUDE_SESSION_IDLE_MIN_MS = "10";
+    process.env.OMB_CLAUDE_SESSION_IDLE_MS = "50";
+    expect(claudeSessionIdleMs({})).toBe(50);
+    expect(claudeSessionIdleMs({ claudeSession: { idleMs: 120_000 } })).toBe(120_000);
+    // The floor holds even when the configured window is below it.
+    expect(claudeSessionIdleMs({ claudeSession: { idleMs: 5, idleMinMs: 2_000 } })).toBe(2_000);
+    expect(claudeSessionIdleMs({ claudeSession: { idleMs: 9_999_999_999 } })).toBe(2_147_483_647);
+  });
+});
+
+describe("observability settings", () => {
+
+  let savedEnv: Record<string, string | undefined>;
+  const ENV_NAMES = ["SENTRY_ENV", "SENTRY_TRACES_SAMPLE_RATE", "NODE_ENV"] as const;
+
+  beforeEach(() => {
+    savedEnv = Object.fromEntries(ENV_NAMES.map((name) => [name, process.env[name]]));
+    for (const name of ENV_NAMES) delete process.env[name];
+  });
+  afterEach(() => {
+    for (const name of ENV_NAMES) {
+      if (savedEnv[name] === undefined) delete process.env[name];
+      else process.env[name] = savedEnv[name];
+    }
+  });
+
+  it("accepts a real DSN and rejects the shapes the SDK would silently ignore", () => {
+    expect(isSentryDsn(SENTINEL_DSN)).toBe(true);
+    // http, no public key, and no project id each leave the SDK inert
+    expect(isSentryDsn("http://abc123@o0.ingest.sentry.io/1")).toBe(false);
+    expect(isSentryDsn("https://o0.ingest.sentry.io/1")).toBe(false);
+    expect(isSentryDsn("https://abc123@o0.ingest.sentry.io")).toBe(false);
+    expect(isSentryDsn("")).toBe(false);
+    expect(isSentryDsn("not a url")).toBe(false);
+    expect(isSentryDsn("   ")).toBe(false);
+  });
+
+  // @sentry/core matches a DSN against its own `DSN_REGEX` — public key
+  // `\w+`, host `[\w.-]+` or a bracketed IPv6 literal — and answers a string
+  // that fails it by printing the WHOLE DSN, public key included, through
+  // `console.error` before returning nothing.  `Sentry.init` does not throw
+  // on that; it builds a client holding no DSN and captures nothing.  So a
+  // shape this check waves through is both a credential in the harness log
+  // on every boot and a fleet that reports itself watched while it is not.
+  it("rejects the shapes @sentry/core's own parser would print and then discard", () => {
+    // a UUID-shaped public key: hyphens fail `\w+`
+    expect(isSentryDsn("https://a1b2c3d4-e5f6-47a8-9b0c-1d2e3f4a5b6c@o123.ingest.sentry.io/456")).toBe(false);
+    // a dotted key fails it too
+    expect(isSentryDsn("https://abc.123@o0.ingest.sentry.io/1")).toBe(false);
+    // `validateDsn` insists the project id is all digits
+    expect(isSentryDsn("https://abc123@o0.ingest.sentry.io/not-a-project")).toBe(false);
+    // and the shapes that stay legal
+    expect(isSentryDsn("https://abc123@o0.ingest.sentry.io:9000/1")).toBe(true);
+    expect(isSentryDsn("https://abc123@sentry.example.com/sentry/42")).toBe(true);
+    expect(isSentryDsn("https://abc_123@o0.ingest.sentry.io/1")).toBe(true);
+  });
+
+  // The renderer cannot import a server module, so `src/lib/observability-config.ts`
+  // carries its own copy of the grammar.  Two copies that disagree put the
+  // Settings card and the harness on different rules, which is how a DSN the
+  // card accepted gets refused (or, worse, printed) at the other end.
+  it("keeps the browser copy of the rule byte-for-byte in agreement", () => {
+    const cases = [
+      SENTINEL_DSN,
+      "https://abc_123@o0.ingest.sentry.io/1",
+      "https://abc123@o0.ingest.sentry.io:9000/1",
+      "https://abc123@sentry.example.com/sentry/42",
+      "https://a1b2c3d4-e5f6-47a8-9b0c-1d2e3f4a5b6c@o123.ingest.sentry.io/456",
+      "https://abc.123@o0.ingest.sentry.io/1",
+      "https://abc123@o0.ingest.sentry.io/not-a-project",
+      "http://abc123@o0.ingest.sentry.io/1",
+      "https://o0.ingest.sentry.io/1",
+      "https://abc123@o0.ingest.sentry.io",
+      "not a url",
+      "",
+      "   ",
+    ];
+    for (const value of cases) {
+      expect([value, isBrowserSentryDsn(value)]).toEqual([value, isSentryDsn(value)]);
+    }
+  });
+
+  it("rejects a patch that is not a DSN and treats an empty one as a clear", () => {
+    expect(() => parseConfigPatch({ observability: { sentryDsn: "http://abc123@o0.ingest.sentry.io/1" } })).toThrow(
+      "observability.sentryDsn must be a Sentry https:// DSN",
+    );
+    expect(() => parseConfigPatch({ observability: { sentryDsn: "https://o0.ingest.sentry.io/1" } })).toThrow(
+      "observability.sentryDsn must be a Sentry https:// DSN",
+    );
+    expect(() => parseConfigPatch({ observability: { sentryDsn: "https://abc123@o0.ingest.sentry.io" } })).toThrow(
+      "observability.sentryDsn must be a Sentry https:// DSN",
+    );
+    expect(parseConfigPatch({ observability: { sentryDsn: "" } })).toEqual({
+      observability: { sentryDsn: "" },
+    });
+    expect(() => parseConfigPatch({ observability: { sentryFleetDsn: "http://abc123@o0.ingest.sentry.io/1" } })).toThrow(
+      "observability.sentryFleetDsn must be a Sentry https:// DSN",
+    );
+    expect(
+      parseConfigPatch({
+        observability: { sentryDsn: SENTINEL_DSN, enabled: false, tracesSampleRate: 0, logsEnabled: false },
+      }),
+    ).toEqual({
+      observability: { sentryDsn: SENTINEL_DSN, enabled: false, tracesSampleRate: 0, logsEnabled: false },
+    });
+  });
+
+  it("rejects an over-long environment name and a sample rate outside 0..1", () => {
+    const tooLong = "e".repeat(MAX_OBSERVABILITY_ENVIRONMENT_LENGTH + 1);
+    expect(() => parseConfigPatch({ observability: { environment: tooLong } })).toThrow(
+      `observability.environment must be ${MAX_OBSERVABILITY_ENVIRONMENT_LENGTH} characters or fewer`,
+    );
+    expect(
+      parseConfigPatch({ observability: { environment: "e".repeat(MAX_OBSERVABILITY_ENVIRONMENT_LENGTH) } }),
+    ).toEqual({ observability: { environment: "e".repeat(MAX_OBSERVABILITY_ENVIRONMENT_LENGTH) } });
+    expect(() => parseConfigPatch({ observability: { tracesSampleRate: 1.5 } })).toThrow(
+      "observability.tracesSampleRate",
+    );
+    expect(() => parseConfigPatch({ observability: { tracesSampleRate: -0.1 } })).toThrow(
+      "observability.tracesSampleRate",
+    );
+  });
+
+  it("keeps the kill switch explicit: absent means diagnostics are on", () => {
+    expect(observabilityEnabled({})).toBe(true);
+    expect(observabilityEnabled({ observability: {} })).toBe(true);
+    expect(observabilityEnabled({ observability: { enabled: true } })).toBe(true);
+    expect(observabilityEnabled({ observability: { enabled: false } })).toBe(false);
+  });
+
+  it("returns a stored DSN without pre-validating it, leaving validation to the runtime", () => {
+    expect(sentryDsnConfigured({ observability: { sentryDsn: ` ${SENTINEL_DSN} ` } })).toBe(SENTINEL_DSN);
+    expect(sentryDsnConfigured({ observability: { sentryDsn: "https://o0.ingest.sentry.io/1" } })).toBe("https://o0.ingest.sentry.io/1");
+    expect(sentryDsnConfigured({})).toBeNull();
+  });
+
+  it("defaults the environment, sample rate, and log forwarding", () => {
+    expect(observabilitySettings({})).toEqual({
+      dsn: null,
+      fleetDsn: null,
+      enabled: true,
+      environment: "production",
+      tracesSampleRate: DEFAULT_SENTRY_TRACES_SAMPLE_RATE,
+      aiTracesSampleRate: DEFAULT_SENTRY_AI_TRACES_SAMPLE_RATE,
+      httpTracesSampleRate: DEFAULT_SENTRY_HTTP_TRACES_SAMPLE_RATE,
+      uiTracesSampleRate: DEFAULT_SENTRY_UI_TRACES_SAMPLE_RATE,
+      logsEnabled: true,
+    });
+  });
+
+  it("prefers a saved value over the long-standing env names", () => {
+    process.env.SENTRY_ENV = "from-env";
+    process.env.SENTRY_TRACES_SAMPLE_RATE = "0.9";
+    process.env.SENTRY_AI_TRACES_SAMPLE_RATE = "0.75";
+    process.env.SENTRY_HTTP_TRACES_SAMPLE_RATE = "0.05";
+    process.env.SENTRY_UI_TRACES_SAMPLE_RATE = "0.02";
+    expect(observabilitySettings({})).toMatchObject({
+      environment: "from-env",
+      tracesSampleRate: 0.9,
+      aiTracesSampleRate: 0.75,
+      httpTracesSampleRate: 0.05,
+      uiTracesSampleRate: 0.02,
+    });
+    expect(
+      observabilitySettings({
+        observability: {
+          environment: "operator",
+          tracesSampleRate: 0.05,
+          aiTracesSampleRate: 1.0,
+          httpTracesSampleRate: 0.2,
+          uiTracesSampleRate: 0.15,
+        },
+      }),
+    ).toMatchObject({
+      environment: "operator",
+      tracesSampleRate: 0.05,
+      aiTracesSampleRate: 1.0,
+      httpTracesSampleRate: 0.2,
+      uiTracesSampleRate: 0.15,
+    });
+  });
+
+  it("keeps an explicit zero sample rate instead of defaulting it away", () => {
+    expect(observabilitySettings({ observability: { tracesSampleRate: 0 } }).tracesSampleRate).toBe(0);
+    expect(observabilitySettings({ observability: { aiTracesSampleRate: 0 } }).aiTracesSampleRate).toBe(0);
+    expect(observabilitySettings({ observability: { httpTracesSampleRate: 0 } }).httpTracesSampleRate).toBe(0);
+    expect(observabilitySettings({ observability: { uiTracesSampleRate: 0 } }).uiTracesSampleRate).toBe(0);
+    expect(observabilitySettings({ observability: { logsEnabled: false } }).logsEnabled).toBe(false);
+  });
+});
+
+describe("the secret-store section", () => {
+  // Obviously fake, and never sent anywhere.
+  const SENTINEL_CLIENT_SECRET = "sentinel-client-secret-not-real";
+  // A fixture id, not a real workspace: the shape is all these tests need,
+  // and a real project id in a public repo is fleet infrastructure disclosure.
+  const PROJECT_ID = "test-project-0000";
+  const VARS = [
+    "INFISICAL_CLIENT_ID",
+    "INFISICAL_UNIVERSAL_AUTH_CLIENT_ID",
+    "INFISICAL_CLIENT_SECRET",
+    "INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET",
+    "INFISICAL_PROJECT_ID",
+    "INFISICAL_SITE_URL",
+    "INFISICAL_DOMAIN",
+    "INFISICAL_ENVIRONMENT",
+    "INFISICAL_SECRET_PATH",
+    "INFISICAL_READ_SOURCES",
+    "INFISICAL_TOKEN",
+    "INFISICAL_WRITE_TOKEN",
+  ] as const;
+  let saved: Record<string, string | undefined>;
+
+  beforeEach(() => {
+    saved = Object.fromEntries(VARS.map((name) => [name, process.env[name]]));
+    for (const name of VARS) delete process.env[name];
+    mkdirSync(DATA_DIR, { recursive: true });
+    rmSync(join(DATA_DIR, "config.json"), { force: true });
+  });
+  afterEach(() => {
+    for (const name of VARS) {
+      if (saved[name] === undefined) delete process.env[name];
+      else process.env[name] = saved[name];
+    }
+    rmSync(join(DATA_DIR, "config.json"), { force: true });
+  });
+
+  it("persists the section, and a toggle-only patch keeps the identity", () => {
+    saveConfig({
+      infisical: {
+        projectId: PROJECT_ID,
+        clientId: "sentinel-client-id",
+        clientSecret: SENTINEL_CLIENT_SECRET,
+        environment: "prod",
+      },
+    });
+    expect(loadConfig().infisical).toMatchObject({
+      projectId: PROJECT_ID,
+      clientId: "sentinel-client-id",
+      environment: "prod",
+    });
+
+    saveConfig({ infisical: { enabled: false, writeThrough: true } });
+    expect(loadConfig().infisical).toMatchObject({
+      projectId: PROJECT_ID,
+      clientId: "sentinel-client-id",
+      enabled: false,
+      writeThrough: true,
+    });
+    expect(infisicalEnabled(loadConfig())).toBe(false);
+  });
+
+  it("persists the pronunciation list beside the voice, the way the STT vocabulary is kept", () => {
+    saveConfig({ tts: { key: "sentinel-tts-key", voice: "jay-wedgeworth-001" } });
+    const list = [{ term: "SQL", say: "sequel" }, { term: "C#", say: "C sharp" }];
+    saveConfig(parseConfigPatch({ tts: { pronunciations: list } }));
+    // A section merge: the list never drops the key or the default voice.
+    expect(loadConfig().tts).toMatchObject({ key: "sentinel-tts-key", voice: "jay-wedgeworth-001", pronunciations: list });
+    saveConfig(parseConfigPatch({ tts: { voice: "English_Graceful_Lady" } }));
+    expect(loadConfig().tts).toMatchObject({ voice: "English_Graceful_Lady", pronunciations: list });
+    // A saved empty list stays empty, so the defaults do not come back.
+    saveConfig(parseConfigPatch({ tts: { pronunciations: [] } }));
+    expect(loadConfig().tts?.pronunciations).toEqual([]);
+  });
+
+  it("validates the pronunciation list with the shared rules, and canonicalizes it", () => {
+    expect(parseConfigPatch({ tts: { pronunciations: [{ term: " SQL ", say: " se   quel " }] } }).tts?.pronunciations).toEqual([
+      { term: "SQL", say: "se quel" },
+    ]);
+    expect(() => parseConfigPatch({ tts: { pronunciations: [{ term: "SQL", say: "a" }, { term: "sql", say: "b" }] } }))
+      .toThrow("sql is on the list twice.");
+    expect(() => parseConfigPatch({ tts: { pronunciations: [{ term: "two words", say: "x" }] } })).toThrow();
+    expect(() => parseConfigPatch({ tts: { pronunciations: [{ term: "SQL", say: "my SQL" }] } })).toThrow();
+    expect(() => parseConfigPatch({ tts: { pronunciations: "SQL=sequel" } })).toThrow();
+  });
+
+  it("keeps every other setting when a hand-edited pronunciation list is bad", () => {
+    const stored = parseStoredConfig({
+      profile: { name: "Jay" },
+      tts: {
+        voice: "jay-wedgeworth-001",
+        pronunciations: [{ term: "SQL", say: "sequel" }, { term: "sql", say: "dup" }, { term: "", say: "x" }, 7],
+      },
+    });
+    expect(stored.profile?.name).toBe("Jay");
+    expect(stored.tts).toEqual({ voice: "jay-wedgeworth-001", pronunciations: [{ term: "SQL", say: "sequel" }] });
+    // Not a list at all reads as never saved, which means the defaults.
+    expect(parseStoredConfig({ tts: { voice: "v", pronunciations: "nope" } }).tts).toEqual({ voice: "v" });
+  });
+
+  it("persists call STT vocabulary and clears an explicit provider on Auto", () => {
+    const terms = Array.from({ length: 100 }, (_, index) => `term-${index}`);
+    const patch = parseConfigPatch({ callStt: { provider: "assemblyai", keyterms: terms } });
+    saveConfig(patch);
+    expect(loadConfig().callStt).toEqual({ provider: "assemblyai", keyterms: terms });
+    saveConfig(parseConfigPatch({ callStt: { provider: null } }));
+    expect(loadConfig().callStt).toEqual({ keyterms: terms });
+    expect(() => parseConfigPatch({ callStt: { keyterms: [...terms, "overflow"] } })).toThrow();
+  });
+
+  it("persists a DeepSeek key, which the allowlist used to drop on the floor", () => {
+    // The key is in the schema, in the API Keys panel and in the tombstone
+    // list, so a save reported success while nothing reached disk.
+    saveConfig({ deepseek: { key: "sentinel-deepseek-key" } });
+    expect(loadConfig().deepseek).toMatchObject({ key: "sentinel-deepseek-key" });
+
+    saveConfig({ deepseek: { url: "https://api.deepseek.example" } });
+    expect(loadConfig().deepseek).toMatchObject({
+      key: "sentinel-deepseek-key",
+      url: "https://api.deepseek.example",
+    });
+  });
+
+  it("reads the machine identity from the environment, first alias wins", () => {
+    process.env.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID = "from-alias";
+    process.env.INFISICAL_CLIENT_ID = "from-primary";
+    process.env.INFISICAL_CLIENT_SECRET = SENTINEL_CLIENT_SECRET;
+    process.env.INFISICAL_PROJECT_ID = PROJECT_ID;
+    process.env.INFISICAL_SECRET_PATH = "/botfleet";
+    const cfg = loadConfig();
+    expect(cfg.infisical).toMatchObject({
+      clientId: "from-primary",
+      projectId: PROJECT_ID,
+      secretPath: "/botfleet",
+    });
+    expect(infisicalConfigured(cfg)).toBe(false);
+    expect(infisicalConfigured({ ...cfg, infisical: { ...cfg.infisical, authMethod: "machine-identity" } })).toBe(true);
+
+    delete process.env.INFISICAL_CLIENT_ID;
+    expect(loadConfig().infisical?.clientId).toBe("from-alias");
+  });
+
+  it("reads read sources from INFISICAL_READ_SOURCES JSON", () => {
+    process.env.INFISICAL_READ_SOURCES = JSON.stringify([{ name: "env-source", tokenEnv: "FAKE_ENV_TOK", projectId: "env-proj" }]);
+    try {
+      expect(infisicalSettings(loadConfig()).readSources).toEqual([
+        { name: "env-source", tokenFile: "", tokenEnv: "FAKE_ENV_TOK", projectId: "env-proj", environment: "prod", secretPath: "/" },
+      ]);
+    } finally {
+      delete process.env.INFISICAL_READ_SOURCES;
+    }
+  });
+
+  it("stays inert with no project id and no identity", () => {
+    expect(infisicalConfigured(loadConfig())).toBe(false);
+    expect(infisicalConfigured({ infisical: { projectId: PROJECT_ID } })).toBe(false);
+    expect(infisicalConfigured({ infisical: { projectId: PROJECT_ID, clientId: "id" } })).toBe(false);
+  });
+
+  it("keeps the kill switch explicit: absent means on once it is configured", () => {
+    expect(infisicalEnabled({})).toBe(true);
+    expect(infisicalEnabled({ infisical: {} })).toBe(true);
+    expect(infisicalEnabled({ infisical: { enabled: true } })).toBe(true);
+    expect(infisicalEnabled({ infisical: { enabled: false } })).toBe(false);
+  });
+
+  it("defaults the site, environment, path, cadence, and write-through", () => {
+    expect(infisicalSettings({})).toEqual({
+      authMethod: "service-token",
+      enabled: true,
+      writeThrough: false,
+      siteUrl: DEFAULT_INFISICAL_SITE_URL,
+      projectId: "",
+      environment: DEFAULT_INFISICAL_ENVIRONMENT,
+      secretPath: DEFAULT_INFISICAL_SECRET_PATH,
+      clientId: "",
+      clientSecret: "",
+      token: "",
+      writeToken: "",
+      readSources: [],
+      refreshMinutes: DEFAULT_INFISICAL_REFRESH_MINUTES,
+    });
+    expect(
+      infisicalSettings({ infisical: { siteUrl: " https://vault.example.test/ ", refreshMinutes: 60 } }),
+    ).toMatchObject({ siteUrl: "https://vault.example.test", refreshMinutes: 60 });
+    // Out-of-range cadences are clamped rather than obeyed: a one-minute
+    // refresh would hammer the store, and a stored zero would never fire.
+    expect(infisicalSettings({ infisical: { refreshMinutes: 0 } }).refreshMinutes).toBe(5);
+    expect(infisicalSettings({ infisical: { refreshMinutes: 99_999 } }).refreshMinutes).toBe(1440);
+    expect(infisicalSettings({ infisical: { writeThrough: true } }).writeThrough).toBe(true);
+  });
+
+  it("treats a service token as an identity, with or without the machine identity", () => {
+    // A token alone is enough to read the store: that is the shape every
+    // non-agent consumer runs with.
+    expect(infisicalConfigured({ infisical: { projectId: "p", token: "st.read" } })).toBe(true);
+    expect(infisicalConfigured({ infisical: { projectId: "p" } })).toBe(false);
+    expect(
+      infisicalConfigured({ infisical: { projectId: "p", clientId: "id", clientSecret: "secret" } }),
+    ).toBe(false);
+    expect(infisicalConfigured({ infisical: { authMethod: "machine-identity", projectId: "p", clientId: "id", clientSecret: "secret" } })).toBe(true);
+    expect(
+      infisicalSettings({ infisical: { projectId: "p", token: " st.read ", writeToken: " st.write " } }),
+    ).toMatchObject({ token: "st.read", writeToken: "st.write" });
+  });
+
+  it("accepts multiple read sources and defaults their environment and path", () => {
+    const settings = infisicalSettings({
+      infisical: {
+        projectId: "main-proj",
+        token: "st.main-not-real",
+        readSources: [
+          { name: "fleetops-zulip", tokenFile: "/tmp/fake-fleetops-token", projectId: "fleet-proj", environment: "prod", secretPath: "/zulip" },
+          { name: "afc-zulip", tokenEnv: "FAKE_AFC_TOKEN", projectId: "afc-proj" },
+          { name: "fleetops-zulip", tokenEnv: "FAKE_DUP", projectId: "dup-proj" },
+          { name: "Bad Name", tokenEnv: "FAKE_BAD", projectId: "bad-proj" },
+        ],
+      },
+    });
+    expect(settings.token).toBe("st.main-not-real");
+    expect(settings.readSources).toEqual([
+      { name: "fleetops-zulip", tokenFile: "/tmp/fake-fleetops-token", tokenEnv: "", projectId: "fleet-proj", environment: "prod", secretPath: "/zulip" },
+      { name: "afc-zulip", tokenFile: "", tokenEnv: "FAKE_AFC_TOKEN", projectId: "afc-proj", environment: "prod", secretPath: "/" },
+    ]);
+    expect(parseConfigPatch({ infisical: { readSources: [{ name: "a-source", projectId: "p1", tokenEnv: "FAKE_TOK" }] } })).toMatchObject({
+      infisical: { readSources: [{ name: "a-source", projectId: "p1" }] },
+    });
+    expect(() => parseConfigPatch({ infisical: { readSources: [{ name: "Bad Name", projectId: "p1" }] } })).toThrow("readSources");
+    expect(() => parseConfigPatch({ infisical: { readSources: [{ name: "ok", projectId: "../x" }] } })).toThrow("readSources");
+    expect(() => parseConfigPatch({ zulip: { credentialSources: { login: { source: "fleetops-zulip", keyPattern: "{ROLE}_ZULIP_{FIELD}" } } } })).not.toThrow();
+    expect(() => parseConfigPatch({ zulip: { credentialSources: { login: { source: "Bad Source" } } } })).toThrow("credentialSources");
+    // A pattern without {ROLE} would resolve every role to the same
+    // secret; the login pattern also needs {FIELD}.
+    expect(() => parseConfigPatch({ zulip: { credentialSources: { login: { source: "fleetops-zulip", keyPattern: "ZULIP_{FIELD}" } } } })).toThrow("credentialSources");
+    expect(() => parseConfigPatch({ zulip: { credentialSources: { login: { source: "fleetops-zulip", keyPattern: "{ROLE}_ZULIP_API_KEY" } } } })).toThrow("credentialSources");
+    expect(() => parseConfigPatch({ zulip: { credentialSources: { outgoing: { source: "afc-zulip", keyPattern: "ZULIP_OUTGOING_TOKEN" } } } })).toThrow("credentialSources");
+    expect(() => parseConfigPatch({ zulip: { credentialSources: { outgoing: { source: "afc-zulip", keyPattern: "ZULIP_OUTGOING_{ROLE}_TOKEN" } } } })).not.toThrow();
+    // `{FIELD}` in an outgoing pattern expands to "" (there is no field),
+    // so it must be rejected rather than produce a double-underscore name.
+    expect(() => parseConfigPatch({ zulip: { credentialSources: { outgoing: { source: "afc-zulip", keyPattern: "ZULIP_OUTGOING_{ROLE}_{FIELD}_TOKEN" } } } })).toThrow("credentialSources");
+    expect(() => parseConfigPatch({ zulip: { credentialSources: { outgoing: { source: "afc-zulip", keyPattern: "ZULIP_OUTGOING_{FIELD}_TOKEN" } } } })).toThrow("credentialSources");
+    // A per-field project/environment cannot be honoured (the named
+    // source's token is scoped to its own project/env), so it is dropped.
+    expect(parseConfigPatch({ zulip: { credentialSources: { login: { source: "fleetops-zulip", keyPattern: "{ROLE}_ZULIP_{FIELD}", projectId: "other-proj", environment: "dev" } } } })).toEqual({
+      zulip: { credentialSources: { login: { source: "fleetops-zulip", keyPattern: "{ROLE}_ZULIP_{FIELD}" } } },
+    });
+    // Stored read-source paths are normalized the same way requests are.
+    expect(
+      infisicalSettings({ infisical: { projectId: "main-proj", readSources: [{ name: "a-source", tokenEnv: "FAKE_TOK", projectId: "p1", secretPath: "/zulip/" }] } }).readSources[0]?.secretPath,
+    ).toBe("/zulip");
+  });
+
+  it("drops one bad readSources entry and keeps the main infisical settings and the valid entries", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      writeFileSync(
+        join(DATA_DIR, "config.json"),
+        JSON.stringify({
+          infisical: {
+            projectId: "main-proj",
+            clientId: "fake-client-id",
+            clientSecret: "fake-client-secret-not-real",
+            token: "st.main-not-real",
+            readSources: [
+              { name: "fleetops-zulip", tokenFile: "/tmp/fake-fleetops-token", projectId: "fleet-proj", environment: "prod", secretPath: "/zulip" },
+              { name: "Bad Name", tokenEnv: "FAKE_BAD_TOKEN_VALUE", projectId: "../bad" },
+              { name: "afc-zulip", tokenEnv: "FAKE_AFC_TOKEN", projectId: "afc-proj" },
+            ],
+          },
+          zulip: {
+            enabled: true,
+            credentialSources: {
+              login: { source: "fleetops-zulip", keyPattern: "{ROLE}_ZULIP_{FIELD}" },
+              outgoing: { source: "Bad Source" },
+            },
+          },
+          profile: { name: "Ada" },
+        }),
+      );
+      const cfg = loadConfig();
+      expect(cfg.profile?.name).toBe("Ada");
+      expect(cfg.infisical).toMatchObject({ projectId: "main-proj", clientId: "fake-client-id", token: "st.main-not-real" });
+      expect(infisicalSettings(cfg).readSources.map((s) => s.name)).toEqual(["fleetops-zulip", "afc-zulip"]);
+      expect(cfg.zulip?.enabled).toBe(true);
+      expect(cfg.zulip?.credentialSources).toEqual({ login: { source: "fleetops-zulip", keyPattern: "{ROLE}_ZULIP_{FIELD}" } });
+      const text = warn.mock.calls.flat().join(" ");
+      expect(text).toContain("infisical.readSources.1");
+      expect(text).toContain("Bad Name");
+      expect(text).toContain("zulip.credentialSources.outgoing");
+      expect(text).not.toContain("FAKE_BAD_TOKEN_VALUE");
+      expect(text).not.toContain("st.main-not-real");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("keeps a service token that arrives in the config file or in a patch", () => {
+    // The schema strips the keys it does not know, so a token the schema
+    // does not mention is dropped on the floor: the file looks configured
+    // and the server falls back to the machine identity.  This pins the
+    // file route and the patch route, because both go through the schema.
+    writeFileSync(
+      join(DATA_DIR, "config.json"),
+      JSON.stringify({
+        infisical: {
+          projectId: "fixture-project-id",
+          token: "st.file-read-token",
+          writeToken: "st.file-write-token",
+        },
+      }),
+    );
+    const cfg = loadConfig();
+    expect(cfg.infisical?.token).toBe("st.file-read-token");
+    expect(cfg.infisical?.writeToken).toBe("st.file-write-token");
+
+    const patch = parseConfigPatch({ infisical: { token: "st.patched-token" } });
+    expect(patch).toMatchObject({ infisical: { token: "st.patched-token" } });
+    rmSync(join(DATA_DIR, "config.json"), { force: true });
+  });
+
+  it("rejects a site URL, path, environment, or project id that cannot be trusted in a query", () => {
+    expect(() => parseConfigPatch({ infisical: { siteUrl: "http://vault.example.test" } })).toThrow(
+      "infisical.siteUrl must be an absolute https:// URL",
+    );
+    expect(() => parseConfigPatch({ infisical: { siteUrl: "vault.example.test" } })).toThrow(
+      "infisical.siteUrl",
+    );
+    expect(() => parseConfigPatch({ infisical: { secretPath: "botfleet" } })).toThrow(
+      "infisical.secretPath must start with /",
+    );
+    expect(() => parseConfigPatch({ infisical: { environment: "e".repeat(80) } })).toThrow(
+      "infisical.environment",
+    );
+    expect(() => parseConfigPatch({ infisical: { environment: "Prod" } })).toThrow("infisical.environment");
+    expect(() => parseConfigPatch({ infisical: { projectId: "test-project/../other" } })).toThrow(
+      "infisical.projectId",
+    );
+    expect(() => parseConfigPatch({ infisical: { refreshMinutes: 1 } })).toThrow("infisical.refreshMinutes");
+  });
+
+  it("accepts a valid patch, and an empty string as the documented clear", () => {
+    expect(
+      parseConfigPatch({
+        infisical: {
+          enabled: true,
+          writeThrough: false,
+          siteUrl: "https://app.infisical.com",
+          projectId: PROJECT_ID,
+          environment: "prod",
+          secretPath: "/",
+          refreshMinutes: 15,
+        },
+      }),
+    ).toEqual({
+      infisical: {
+        enabled: true,
+        writeThrough: false,
+        siteUrl: "https://app.infisical.com",
+        projectId: PROJECT_ID,
+        environment: "prod",
+        secretPath: "/",
+        refreshMinutes: 15,
+      },
+    });
+    expect(
+      parseConfigPatch({ infisical: { siteUrl: "", projectId: "", environment: "", secretPath: "" } }),
+    ).toEqual({ infisical: { siteUrl: "", projectId: "", environment: "", secretPath: "" } });
+  });
+
+  it("holds the store to TLS", () => {
+    expect(isHttpsUrl("https://app.infisical.com")).toBe(true);
+    expect(isHttpsUrl("http://app.infisical.com")).toBe(false);
+    expect(isHttpsUrl("https://user:pass@app.infisical.com")).toBe(false);
+    expect(isHttpsUrl("app.infisical.com")).toBe(false);
+    expect(isHttpsUrl("")).toBe(false);
+    expect(isHttpsUrl(undefined)).toBe(false);
+  });
+
+  it("keeps a saved identity from being shadowed by an injected one", () => {
+    process.env.INFISICAL_CLIENT_ID = "boot-injected";
+    process.env.INFISICAL_CLIENT_SECRET = "boot-injected";
+    syncCredentialEnv({ infisical: { clientId: "just-saved", clientSecret: SENTINEL_CLIENT_SECRET } });
+    expect(process.env.INFISICAL_CLIENT_ID).toBe("just-saved");
+    expect(process.env.INFISICAL_CLIENT_SECRET).toBe(SENTINEL_CLIENT_SECRET);
+
+    syncCredentialEnv({ infisical: { clientId: "", clientSecret: "" } });
+    expect(process.env.INFISICAL_CLIENT_ID).toBeUndefined();
+    expect(process.env.INFISICAL_CLIENT_SECRET).toBeUndefined();
+  });
+
+  it("persists explicit auth and independent source write locators without inline source credentials", () => {
+    const patch = parseConfigPatch({ infisical: {
+      authMethod: "service-token", projectId: "main", readSources: [{
+        name: "staging-settings", projectId: "other", environment: "staging", secretPath: "/settings/",
+        tokenEnv: "BF_TEST_READ", writeTokenEnv: "BF_TEST_WRITE",
+      }],
+    } });
+    saveConfig(patch);
+    expect(infisicalSettings(loadConfig()).readSources[0]).toMatchObject({ secretPath: "/settings", writeTokenEnv: "BF_TEST_WRITE" });
+    expect(() => parseConfigPatch({ infisical: { readSources: [{
+      name: "scope", projectId: "p", tokenEnv: "BF_TEST_READ", token: "must-be-rejected",
+    }] } })).toThrow("readSources");
+    expect(() => parseConfigPatch({ infisical: { authMethod: "auto" } })).toThrow();
+    expect(() => parseConfigPatch({ infisical: { readSources: [{ name: "bad", projectId: "p", writeTokenFile: "relative" }] } })).toThrow();
+  });
+
+  it("rejects unknown Infisical request keys while preserving stored-file compatibility", () => {
+    expect(() => parseConfigPatch({ infisical: { writeThru: true } })).toThrow("infisical");
+    expect(() => parseConfigPatch({ infisical: { readSources: [{
+      name: "scope", projectId: "p", tokenEn: "BF_TEST_READ",
+    }] } })).toThrow("readSources");
+    expect(parseStoredConfig({ infisical: {
+      enabled: false, futureOption: true, readSources: [{
+        name: "scope", projectId: "p", tokenEnv: "BF_TEST_READ", futureLocatorOption: true,
+      }],
+    } }).infisical).toEqual({ enabled: false, readSources: [{
+      name: "scope", projectId: "p", tokenEnv: "BF_TEST_READ",
+    }] });
+  });
+
+  it.each([
+    ["tokenFile", `/${"x".repeat(4095)}`, `/${"x".repeat(4096)}`],
+    ["writeTokenFile", `/${"x".repeat(4095)}`, `/${"x".repeat(4096)}`],
+    ["tokenEnv", "X".repeat(256), "X".repeat(257)],
+    ["writeTokenEnv", "X".repeat(256), "X".repeat(257)],
+  ])("bounds source locator %s in requests and bootstrap resolution", (field, allowed, oversized) => {
+    const source = { name: "scope", projectId: "p", [field]: allowed };
+    expect(() => parseConfigPatch({ infisical: { readSources: [source] } })).not.toThrow();
+    expect(() => parseConfigPatch({ infisical: { readSources: [{ ...source, [field]: oversized }] } })).toThrow("readSources");
+    process.env.INFISICAL_READ_SOURCES = JSON.stringify([{ ...source, [field]: oversized }]);
+    expect(infisicalSettings(loadConfig()).readSources).toEqual([]);
+  });
+
+  it("strips dedicated source credential environment names from bot children", () => {
+    saveConfig({ infisical: { readSources: [{ name: "scope", projectId: "p", tokenEnv: "BF_TEST_READ", writeTokenEnv: "BF_TEST_WRITE" }] } });
+    loadConfig();
+    const childEnv = { PATH: "/usr/bin", BF_TEST_READ: "fake-read", BF_TEST_WRITE: "fake-write" };
+    stripWorkspaceCredentialEnv(childEnv);
+    expect(childEnv).toEqual({ PATH: "/usr/bin" });
+    saveConfig({ infisical: { readSources: [] } });
+    loadConfig();
+    const laterChild = { PATH: "/usr/bin", BF_TEST_READ: "old-read", BF_TEST_WRITE: "old-write" };
+    stripWorkspaceCredentialEnv(laterChild);
+    expect(laterChild).toEqual({ PATH: "/usr/bin" });
+  });
+
+  it("drops malformed source routing instead of defaulting it into another environment or folder", () => {
+    expect(infisicalSettings({ infisical: { readSources: [
+      { name: "bad-env", projectId: "p", environment: "../prod", tokenEnv: "BF_TEST_READ" },
+      { name: "bad-path", projectId: "p", secretPath: "relative", tokenEnv: "BF_TEST_READ" },
+      { name: "bad-token-env", projectId: "p", tokenEnv: "not a variable" },
+    ] } }).readSources).toEqual([]);
+  });
+
+  it("strips valid credential env names from malformed routes and retains them after route removal", () => {
+    process.env.INFISICAL_READ_SOURCES = JSON.stringify([{
+      name: "bad name", projectId: "../other", environment: "../prod", secretPath: "relative",
+      tokenEnv: " BF_MALFORMED_ROUTE_READ ", writeTokenEnv: " BF_MALFORMED_ROUTE_WRITE ",
+    }]);
+    expect(infisicalSettings(loadConfig()).readSources).toEqual([]);
+    const child = { PATH: "/usr/bin", BF_MALFORMED_ROUTE_READ: "fake-read", BF_MALFORMED_ROUTE_WRITE: "fake-write" };
+    stripWorkspaceCredentialEnv(child);
+    expect(child).toEqual({ PATH: "/usr/bin" });
+    process.env.INFISICAL_READ_SOURCES = "[]";
+    loadConfig();
+    const laterChild = { PATH: "/usr/bin", BF_MALFORMED_ROUTE_READ: "old-read", BF_MALFORMED_ROUTE_WRITE: "old-write" };
+    stripWorkspaceCredentialEnv(laterChild);
+    expect(laterChild).toEqual({ PATH: "/usr/bin" });
+  });
+
+  it("syncs saved primary tokens and clears identity aliases instead of resurrecting them", () => {
+    process.env.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID = "fake-old-id";
+    process.env.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET = "fake-old-secret";
+    syncCredentialEnv({ infisical: { token: "fake-read", writeToken: "fake-write", clientId: "", clientSecret: "", projectId: "new-project" } });
+    expect(process.env.INFISICAL_TOKEN).toBe("fake-read");
+    expect(process.env.INFISICAL_WRITE_TOKEN).toBe("fake-write");
+    expect(process.env.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID).toBeUndefined();
+    expect(process.env.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET).toBeUndefined();
+    expect(process.env.INFISICAL_PROJECT_ID).toBe("new-project");
+  });
+
+  it("reuses one read/write reference pair across project folders and environments", () => {
+    const sources = ["/one", "/two"].flatMap((secretPath) => ["prod", "staging"].map((environment, index) => ({
+      name: `${secretPath.slice(1)}-${index}`, projectId: "p", environment, secretPath,
+      tokenEnv: "SCOPE_READ", writeTokenEnv: "SCOPE_WRITE",
+    })));
+    expect(infisicalSettings({ infisical: { readSources: sources } }).configurationError).toBeUndefined();
+    expect(() => saveConfig({ infisical: { readSources: sources } })).not.toThrow();
+  });
+
+  it("caps primary and secondary credential references per project without leaking values", () => {
+    const cfg = { infisical: { projectId: "p", token: "fake-primary-read", writeToken: "fake-primary-write" } };
+    const extra = { name: "extra", projectId: "p", secretPath: "/extra", tokenEnv: "ANOTHER_READ" };
+    expect(() => validateInfisicalConfigPatch(cfg, { infisical: { readSources: [extra] } })).toThrow(/one read token reference/);
+    expect(() => validateInfisicalConfigPatch(cfg, { infisical: { readSources: [{ ...extra, tokenEnv: "INFISICAL_TOKEN", writeTokenEnv: "ANOTHER_WRITE" }] } })).toThrow(/one write token reference/);
+    expect(() => validateInfisicalConfigPatch(cfg, { infisical: { readSources: [{ ...extra, tokenEnv: "INFISICAL_TOKEN", writeTokenEnv: "INFISICAL_WRITE_TOKEN" }] } })).not.toThrow();
+    expect(() => validateInfisicalConfigPatch(cfg, { infisical: { readSources: [{ ...extra, secretPath: "/", tokenEnv: "NEW_READ", writeTokenEnv: "NEW_WRITE" }] } })).not.toThrow();
+    saveConfig(cfg);
+    expect(() => saveConfig({ infisical: { readSources: [extra] } })).toThrow(/one read token reference/);
+    expect(loadConfig().infisical?.readSources).toBeUndefined();
+  });
+
+  it("deduplicates file paths and applies the cap to environment JSON overlays", () => {
+    expect(infisicalSettings({ infisical: { readSources: [
+      { name: "first", projectId: "p", secretPath: "/one", tokenFile: "/fixture/dir/../read" },
+      { name: "second", projectId: "p", secretPath: "/two", tokenFile: "/fixture/read" },
+    ] } }).configurationError).toBeUndefined();
+    process.env.INFISICAL_PROJECT_ID = "p";
+    process.env.INFISICAL_TOKEN = "fake-primary-read";
+    process.env.INFISICAL_READ_SOURCES = JSON.stringify([
+      { name: "extra", projectId: "p", secretPath: "/extra", tokenEnv: "ANOTHER_READ" },
+    ]);
+    const cfg = loadConfig();
+    expect(infisicalSettings(cfg).configurationError).toMatch(/one read token reference/);
+    expect(() => validateInfisicalConfigPatch(cfg, { infisical: { refreshMinutes: 20 } })).toThrow(/one read token reference/);
+    expect(infisicalSettings(cfg).configurationError).not.toContain("fake-primary-read");
+  });
+
+  it.each(["read", "write"] as const)("locked saves include the effective bootstrap primary %s token", (mode) => {
+    saveConfig({ infisical: { projectId: "disk-project", enabled: false } });
+    process.env.INFISICAL_PROJECT_ID = "bootstrap-project";
+    process.env.INFISICAL_TOKEN = "fake-bootstrap-read";
+    process.env.INFISICAL_WRITE_TOKEN = "fake-bootstrap-write";
+    const source: InfisicalReadSource = { name: "extra", projectId: "bootstrap-project", secretPath: "/extra",
+      tokenEnv: mode === "read" ? "ANOTHER_READ" : "INFISICAL_TOKEN",
+    };
+    if (mode === "write") source.writeTokenEnv = "ANOTHER_WRITE";
+    const patch = { infisical: { readSources: [source] } };
+    const before = readFileSync(join(DATA_DIR, "config.json"), "utf8");
+    expect(() => validateInfisicalConfigPatch(loadConfig(), patch)).toThrow(/token reference/);
+    expect(() => saveConfig(patch)).toThrow(/token reference/);
+    expect(readFileSync(join(DATA_DIR, "config.json"), "utf8")).toBe(before);
+  });
+
+  it("locked metadata saves include environment source routes rather than just disk routes", () => {
+    saveConfig({ infisical: { projectId: "p", token: "fake-file-primary" } });
+    process.env.INFISICAL_READ_SOURCES = JSON.stringify([
+      { name: "extra", projectId: "p", secretPath: "/extra", tokenEnv: "ANOTHER_READ" },
+    ]);
+    const patch = { infisical: { refreshMinutes: 20 } };
+    const before = readFileSync(join(DATA_DIR, "config.json"), "utf8");
+    expect(() => validateInfisicalConfigPatch(loadConfig(), patch)).toThrow(/token reference/);
+    expect(() => saveConfig(patch)).toThrow(/token reference/);
+    expect(readFileSync(join(DATA_DIR, "config.json"), "utf8")).toBe(before);
+  });
+
+  it("locked saves allow shared bootstrap references without persisting their values", () => {
+    process.env.INFISICAL_PROJECT_ID = "p";
+    process.env.INFISICAL_TOKEN = "fake-bootstrap-read";
+    process.env.INFISICAL_WRITE_TOKEN = "fake-bootstrap-write";
+    const readSources = ["/one", "/two"].map((secretPath, index) => ({
+      name: `scope-${index}`, projectId: "p", secretPath,
+      tokenEnv: "INFISICAL_TOKEN", writeTokenEnv: "INFISICAL_WRITE_TOKEN",
+    }));
+    expect(() => saveConfig({ infisical: { readSources } })).not.toThrow();
+    const disk = JSON.parse(readFileSync(join(DATA_DIR, "config.json"), "utf8"));
+    expect(disk.infisical).toEqual({ readSources });
+    expect(infisicalSettings(loadConfig()).configurationError).toBeUndefined();
+  });
+
+  it("locked save validation lets explicit patch fields replace bootstrap values", () => {
+    process.env.INFISICAL_PROJECT_ID = "p";
+    process.env.INFISICAL_TOKEN = "fake-bootstrap-read";
+    process.env.INFISICAL_READ_SOURCES = JSON.stringify([
+      { name: "old", projectId: "p", secretPath: "/extra", tokenEnv: "OLD_READ" },
+    ]);
+    const patch = { infisical: { token: "", readSources: [
+      { name: "replacement", projectId: "p", secretPath: "/extra", tokenEnv: "NEW_READ" },
+    ] } };
+    expect(() => validateInfisicalConfigPatch(loadConfig(), patch)).not.toThrow();
+    expect(() => saveConfig(patch)).not.toThrow();
+    syncCredentialEnv(patch);
+    expect(infisicalSettings(loadConfig()).configurationError).toBeUndefined();
+    expect(loadConfig().infisical?.readSources?.[0]?.name).toBe("replacement");
+  });
+
+  it("strips the machine identity from a child environment", () => {
+    // It can read every name in the project, so of everything on the strip
+    // list this is the pair that must never reach a spawned engine CLI.
+    expect(WORKSPACE_CREDENTIAL_ENV).toContain("INFISICAL_CLIENT_ID");
+    expect(WORKSPACE_CREDENTIAL_ENV).toContain("INFISICAL_CLIENT_SECRET");
+    const env = {
+      PATH: "/usr/bin",
+      INFISICAL_CLIENT_ID: "id",
+      INFISICAL_CLIENT_SECRET: SENTINEL_CLIENT_SECRET,
+    };
+    stripWorkspaceCredentialEnv(env);
+    expect(env).toEqual({ PATH: "/usr/bin" });
+  });
+
+  it("strips the universal-auth aliases too, so an engine never inherits either spelling", () => {
+    // loadConfig accepts INFISICAL_UNIVERSAL_AUTH_CLIENT_ID / _SECRET as
+    // equals of the canonical pair — that is how a headless install and the
+    // iOS ship workflow authenticate — so a strip list that named only the
+    // canonical spelling would leave a fully usable, project-wide identity
+    // riding into every spawned bot CLI through `...process.env`.
+    expect(WORKSPACE_CREDENTIAL_ENV).toContain("INFISICAL_UNIVERSAL_AUTH_CLIENT_ID");
+    expect(WORKSPACE_CREDENTIAL_ENV).toContain("INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET");
+    const env = {
+      PATH: "/usr/bin",
+      INFISICAL_UNIVERSAL_AUTH_CLIENT_ID: "alias-id",
+      INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET: SENTINEL_CLIENT_SECRET,
+      // Pointers, not credentials: they authenticate nothing on their own and
+      // stay, so a bot that legitimately talks to the same project can still
+      // be told which one it is.
+      INFISICAL_PROJECT_ID: "proj-1",
+      INFISICAL_SITE_URL: "https://app.infisical.example",
+    };
+    stripWorkspaceCredentialEnv(env);
+    expect(env).toEqual({
+      PATH: "/usr/bin",
+      INFISICAL_PROJECT_ID: "proj-1",
+      INFISICAL_SITE_URL: "https://app.infisical.example",
+    });
+    expect(JSON.stringify(env)).not.toContain(SENTINEL_CLIENT_SECRET);
+  });
+
+  it("resolves the identity from the alias pair alone, which is why both spellings are stripped", () => {
+    // The load side of the same fact: with only the aliases exported, the
+    // store is fully configured.  If this ever stops being true the strip
+    // entries above are dead weight; while it is true they are load-bearing.
+    delete process.env.INFISICAL_CLIENT_ID;
+    delete process.env.INFISICAL_CLIENT_SECRET;
+    process.env.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID = "alias-id";
+    process.env.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET = SENTINEL_CLIENT_SECRET;
+    try {
+      const cfg = loadConfig();
+      expect(cfg.infisical?.clientId).toBe("alias-id");
+      expect(cfg.infisical?.clientSecret).toBe(SENTINEL_CLIENT_SECRET);
+    } finally {
+      delete process.env.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID;
+      delete process.env.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET;
+    }
+  });
+});
+
+describe("imessageLinq config section", () => {
+  beforeEach(() => {
+    mkdirSync(DATA_DIR, { recursive: true });
+    rmSync(join(DATA_DIR, "config.json"), { force: true });
+  });
+  afterEach(() => {
+    rmSync(join(DATA_DIR, "config.json"), { force: true });
+  });
+
+  it("defaults to absent and lets bots opt in via per-bot imessagePerBot", () => {
+    writeFileSync(join(DATA_DIR, "config.json"), JSON.stringify({}));
+    const cfg = loadConfig();
+    expect(cfg.imessageLinq).toBeUndefined();
+    expect(cfg.botDefaults?.imessagePerBot).toBeUndefined();
+  });
+
+  it("parses an imessageLinq block with botNumber and voice toggle, and a separate perBot map under botDefaults", () => {
+    writeFileSync(
+      join(DATA_DIR, "config.json"),
+      JSON.stringify({
+        imessageLinq: {
+          botNumber: "+14158707772",
+          ignoredSenders: ["+15555550100"],
+          allowedSenders: [],
+          allowVoiceByDefault: true,
+        },
+        botDefaults: {
+          computers: [],
+          cloudBackend: "box",
+          allowedComputers: null,
+          imessagePerBot: { director: "linq", other: "off" },
+        },
+      }),
+    );
+    const cfg = loadConfig();
+    expect(cfg.imessageLinq?.botNumber).toBe("+14158707772");
+    expect(cfg.imessageLinq?.allowVoiceByDefault).toBe(true);
+    expect(cfg.botDefaults?.imessagePerBot?.director).toBe("linq");
+    expect(cfg.imessageLinq?.ignoredSenders).toEqual(["+15555550100"]);
+  });
+
+  it("rejects an unknown transport choice", () => {
+    const stored = {
+      botDefaults: { imessagePerBot: { director: "sms" } },
+    };
+    expect(() => parseStoredConfig(stored)).toThrow();
+  });
+
+  it("`PUT /api/config { imessageLinq }` persists per-bot transport choices", () => {
+    writeFileSync(join(DATA_DIR, "config.json"), JSON.stringify({}));
+    saveConfig({
+      imessageLinq: {
+        botNumber: "+14158707772",
+        allowVoiceByDefault: true,
+      },
+      botDefaults: {
+        imessagePerBot: { director: "linq", sidekick: "off" },
+      },
+    });
+    const cfg = loadConfig();
+    expect(cfg.imessageLinq?.botNumber).toBe("+14158707772");
+    expect(cfg.botDefaults?.imessagePerBot).toEqual({ director: "linq", sidekick: "off" });
+  });
+
+  it("migrates without overwriting an existing perBot map", () => {
+    writeFileSync(
+      join(DATA_DIR, "config.json"),
+      JSON.stringify({
+        botDefaults: {
+          computers: [],
+          cloudBackend: "box",
+          allowedComputers: null,
+          imessagePerBot: { director: "linq" },
+        },
+      }),
+    );
+    saveConfig({
+      imessageLinq: { botNumber: "+14158707772" },
+    });
+    const next = loadConfig();
+    expect(next.botDefaults?.imessagePerBot).toEqual({ director: "linq" });
+    expect(next.imessageLinq?.botNumber).toBe("+14158707772");
+  });
+});
+
+describe("migrateComputerProvidersConfig", () => {
+  // The next provider save back-fills `allowedComputers` from whatever this
+  // migration writes, so a wrong mapping here becomes a real grant change.
+  it("keeps an explicit deny-all ([]) as every provider off", () => {
+    const cfg: AppConfig = { botDefaults: { allowedComputers: [] } };
+    expect(migrateComputerProvidersConfig(cfg)).toBe(true);
+    expect(cfg.botDefaults?.computerProviders).toEqual({
+      asciiBox: false,
+      selfHostedVps: false,
+      localVm: false,
+      localMac: false,
+    });
+    expect(cfg.botDefaults?.vpsMode).toBeNull();
+    expect(allowedBotComputers(cfg)).toEqual([]);
+  });
+
+  it("maps a null allowlist (legacy unrestricted) to every provider on", () => {
+    const cfg: AppConfig = { botDefaults: { allowedComputers: null } };
+    expect(migrateComputerProvidersConfig(cfg)).toBe(true);
+    expect(cfg.botDefaults?.computerProviders).toEqual({
+      asciiBox: true,
+      selfHostedVps: true,
+      localVm: true,
+      localMac: true,
+    });
+    expect(cfg.botDefaults?.vpsMode).toBe("shared");
+  });
+
+  it("maps an absent allowlist (legacy unrestricted) to every provider on", () => {
+    const cfg: AppConfig = { botDefaults: { computers: ["local"] } };
+    expect(migrateComputerProvidersConfig(cfg)).toBe(true);
+    expect(cfg.botDefaults?.computerProviders).toEqual({
+      asciiBox: true,
+      selfHostedVps: true,
+      localVm: true,
+      localMac: true,
+    });
+    expect(cfg.botDefaults?.computers).toEqual(["local"]);
+  });
+
+  it("maps a narrowed allowlist onto just the named providers", () => {
+    const cfg: AppConfig = { botDefaults: { allowedComputers: ["vm", "local"] } };
+    expect(migrateComputerProvidersConfig(cfg)).toBe(true);
+    expect(cfg.botDefaults?.computerProviders).toEqual({
+      asciiBox: false,
+      selfHostedVps: false,
+      localVm: true,
+      localMac: true,
+    });
+    expect(cfg.botDefaults?.vpsMode).toBeNull();
+  });
+
+  it("leaves an already-migrated config alone", () => {
+    const providers = { asciiBox: true, selfHostedVps: false, localVm: false, localMac: true };
+    const cfg: AppConfig = { botDefaults: { allowedComputers: [], computerProviders: { ...providers }, vpsMode: null } };
+    expect(migrateComputerProvidersConfig(cfg)).toBe(false);
+    expect(cfg.botDefaults?.computerProviders).toEqual(providers);
+
+  });
+});
+
+
+describe("legacy voice provider migration", () => {
+  it("loads an explicitly marked legacy provider before strict validation without losing other settings", () => {
+    const stored = { profile: { name: "Ada" }, tts: { provider: "elevenlabs", key: "legacy-key", voice: "legacy-voice" } };
+    expect(parseStoredConfig(stored)).toEqual({
+      profile: { name: "Ada" }, tts: { provider: "minimax", key: "legacy-key", voice: "legacy-voice" },
+    });
+    expect(stored.tts.provider).toBe("elevenlabs");
+    expect(() => parseConfigPatch({ tts: { provider: "elevenlabs" } })).toThrow("tts.provider");
+  });
+
+  it("pins an unmarked key-only install, without persisting a keychain secret to config.json", () => {
+    const cfg: AppConfig = { tts: { key: "old-eleven-key" } };
+    expect(migrateLegacyElevenLabsTtsProvider(cfg)).toBe(true);
+    expect(cfg.tts?.provider).toBe("minimax");
+    expect(migrateLegacyElevenLabsTtsProvider(cfg)).toBe(false);
+  });
+
+  it("retains explicitly selected MiniMax and system providers", () => {
+    for (const provider of ["minimax", "system"] as const) {
+      const cfg: AppConfig = { tts: { key: "marked-key", provider } };
+      expect(migrateLegacyElevenLabsTtsProvider(cfg)).toBe(false);
+      expect(cfg.tts?.provider).toBe(provider);
+    }
+  });
+
+  it("waits for the encrypted-store key overlay before selecting the legacy provider", () => {
+    const cfg: AppConfig = { tts: { key: "", voice: "legacy voice" } };
+    expect(migrateLegacyElevenLabsTtsProvider(cfg)).toBe(false);
+    cfg.tts!.key = "from-keychain";
+    expect(migrateLegacyElevenLabsTtsProvider(cfg)).toBe(true);
+    expect(cfg.tts?.provider).toBe("minimax");
+  });
+
+  it("does not infer an old provider from voice alone or an empty key", () => {
+    for (const tts of [{ voice: "Rachel" }, { key: "   ", voice: "Rachel" }]) {
+      const cfg: AppConfig = { tts };
+      expect(migrateLegacyElevenLabsTtsProvider(cfg)).toBe(false);
+      expect(cfg.tts?.provider).toBeUndefined();
+    }
+  });
+});
+
+describe("agentProxy settings and environment", () => {
+  it("defaults to disabled", () => {
+    expect(agentProxyEnabled({})).toBe(false);
+    expect(agentProxyEnabled({ agentProxy: {} })).toBe(false);
+    expect(agentProxyEnabled({ agentProxy: { enabled: false } })).toBe(false);
+    expect(agentProxyEnabled({ agentProxy: { enabled: true } })).toBe(true);
+  });
+
+  it("resolves defaults and falls back to infisical project settings when unconfigured", () => {
+    const defaultSettings = agentProxySettings({});
+    expect(defaultSettings).toEqual({
+      enabled: false,
+      address: DEFAULT_AGENT_PROXY_ADDRESS,
+      projectId: "",
+      environment: "prod",
+      secretPath: "/",
+      caCertPath: undefined,
+    });
+
+    const withInfisical = agentProxySettings({
+      infisical: { projectId: "proj-inf-99", environment: "staging", secretPath: "/backend" },
+    });
+    expect(withInfisical.projectId).toBe("proj-inf-99");
+    expect(withInfisical.environment).toBe("staging");
+    expect(withInfisical.secretPath).toBe("/backend");
+
+    const explicit = agentProxySettings({
+      infisical: { projectId: "proj-inf-99" },
+      agentProxy: {
+        enabled: true,
+        address: "proxy.local:18000",
+        projectId: "custom-proj",
+        environment: "dev",
+        secretPath: "/agents",
+        caCertPath: "/tmp/proxy-ca.crt",
+      },
+    });
+    expect(explicit).toEqual({
+      enabled: true,
+      address: "proxy.local:18000",
+      projectId: "custom-proj",
+      environment: "dev",
+      secretPath: "/agents",
+      caCertPath: "/tmp/proxy-ca.crt",
+    });
+  });
+
+  it("returns base environment untouched when agent proxy is disabled", () => {
+    const baseEnv = { FOO: "bar" };
+    expect(applyAgentProxyEnv({}, baseEnv)).toBe(baseEnv);
+    expect(applyAgentProxyEnv({ agentProxy: { enabled: false } }, baseEnv)).toBe(baseEnv);
+    expect(applyAgentProxyEnv({}, undefined)).toBeUndefined();
+  });
+
+  it("injects proxy environment variables when enabled", () => {
+    const cfg: AppConfig = {
+      agentProxy: {
+        enabled: true,
+        address: "127.0.0.1:17322",
+        projectId: "proj-xyz",
+        environment: "prod",
+        secretPath: "/app",
+        caCertPath: "/certs/proxy.pem",
+      },
+    };
+    const env = applyAgentProxyEnv(cfg, { EXISTING: "true" });
+    expect(env).toMatchObject({
+      EXISTING: "true",
+      HTTP_PROXY: "http://127.0.0.1:17322",
+      HTTPS_PROXY: "http://127.0.0.1:17322",
+      http_proxy: "http://127.0.0.1:17322",
+      https_proxy: "http://127.0.0.1:17322",
+      ALL_PROXY: "http://127.0.0.1:17322",
+      all_proxy: "http://127.0.0.1:17322",
+      NO_PROXY: "localhost,127.0.0.1",
+      no_proxy: "localhost,127.0.0.1",
+      INFISICAL_AGENT_PROXY_ADDRESS: "127.0.0.1:17322",
+      INFISICAL_PROJECT_ID: "proj-xyz",
+      INFISICAL_ENVIRONMENT: "prod",
+      INFISICAL_SECRET_PATH: "/app",
+      SSL_CERT_FILE: "/certs/proxy.pem",
+      NODE_EXTRA_CA_CERTS: "/certs/proxy.pem",
+    });
+  });
+
+  it("preserves explicitly set proxy variables when injecting", () => {
+    const cfg: AppConfig = {
+      agentProxy: {
+        enabled: true,
+        address: "127.0.0.1:17322",
+      },
+    };
+    const env = applyAgentProxyEnv(cfg, {
+      HTTP_PROXY: "http://corp-proxy:8080",
+      NO_PROXY: "intranet.example.com",
+    });
+    expect(env?.HTTP_PROXY).toBe("http://corp-proxy:8080");
+    expect(env?.NO_PROXY).toBe("intranet.example.com");
+    expect(env?.HTTPS_PROXY).toBe("http://127.0.0.1:17322");
+  });
+
+  it("lets explicitly configured routing and CA settings win over inherited INFISICAL_* and TLS variables", () => {
+    const cfg: AppConfig = {
+      agentProxy: {
+        enabled: true,
+        address: "proxy.local:18000",
+        projectId: "explicit-proj",
+        environment: "dev",
+        secretPath: "/agents",
+        caCertPath: "/certs/proxy.pem",
+      },
+    };
+    const env = applyAgentProxyEnv(cfg, {
+      INFISICAL_AGENT_PROXY_ADDRESS: "stale.local:1",
+      INFISICAL_PROJECT_ID: "ambient-proj",
+      INFISICAL_ENVIRONMENT: "ambient-env",
+      INFISICAL_SECRET_PATH: "/ambient",
+      SSL_CERT_FILE: "/etc/ssl/ambient.pem",
+      NODE_EXTRA_CA_CERTS: "/etc/ssl/ambient-extra.pem",
+    });
+    expect(env).toMatchObject({
+      HTTPS_PROXY: "http://proxy.local:18000",
+      INFISICAL_AGENT_PROXY_ADDRESS: "proxy.local:18000",
+      INFISICAL_PROJECT_ID: "explicit-proj",
+      INFISICAL_ENVIRONMENT: "dev",
+      INFISICAL_SECRET_PATH: "/agents",
+      SSL_CERT_FILE: "/certs/proxy.pem",
+      NODE_EXTRA_CA_CERTS: "/certs/proxy.pem",
+    });
+  });
+
+  it("keeps an inherited routing id when the proxy only fell back to BotFleet's own Infisical settings", () => {
+    const cfg: AppConfig = {
+      infisical: { projectId: "fallback-proj", environment: "staging", secretPath: "/backend" },
+      agentProxy: { enabled: true },
+    };
+    const inherited = applyAgentProxyEnv(cfg, {
+      INFISICAL_PROJECT_ID: "ambient-proj",
+      INFISICAL_ENVIRONMENT: "ambient-env",
+      INFISICAL_SECRET_PATH: "/ambient",
+    });
+    expect(inherited).toMatchObject({
+      INFISICAL_PROJECT_ID: "ambient-proj",
+      INFISICAL_ENVIRONMENT: "ambient-env",
+      INFISICAL_SECRET_PATH: "/ambient",
+    });
+    const bare = applyAgentProxyEnv(cfg, {});
+    expect(bare).toMatchObject({
+      INFISICAL_PROJECT_ID: "fallback-proj",
+      INFISICAL_ENVIRONMENT: "staging",
+      INFISICAL_SECRET_PATH: "/backend",
+    });
+  });
+
+  it("rejects unknown agentProxy keys at the config boundary", () => {
+    expect(() => parseConfigPatch({ agentProxy: { enabled: true, typo: true } })).toThrow(/Unrecognized key/);
+    expect(() => parseConfigPatch({ agentProxy: { allowReadableBrokeredSecrets: true } })).toThrow(/Unrecognized key/);
+  });
+
+  it("persists agentProxy in saveConfig and merges correctly", () => {
+    saveConfig({
+      agentProxy: {
+        enabled: true,
+        address: "127.0.0.1:17322",
+        projectId: "saved-project",
+      },
+    });
+    const loaded = loadConfig();
+    expect(loaded.agentProxy).toMatchObject({
+      enabled: true,
+      address: "127.0.0.1:17322",
+      projectId: "saved-project",
+    });
+  });
+});
+

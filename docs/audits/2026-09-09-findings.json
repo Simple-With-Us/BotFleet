@@ -1,0 +1,733 @@
+{
+  "reviewDate": "2026-09-09",
+  "timezone": "America/Chicago",
+  "sourceCommit": "121cb85aa3ebb85cb2d5b9233bc69838979a88f7",
+  "parentIssue": "https://github.com/Simple-With-Us/BotFleet/issues/263",
+  "auditBoardId": "55bff4ee870442cb8aea8a0a6597c901",
+  "scope": "Source audit and read-only live metadata; no paid inference, physical-phone acceptance or production changes.",
+  "findings": [
+    {
+      "id": "D1",
+      "severity": "P1",
+      "title": "Packaged fallback can create a second harness against the shared data root",
+      "description": "probeHarness treats a refused, reset, or over-two-second /api/health response as kind:none (electron/server-boot-probe.mjs:121-140), and resolvePackagedServer immediately spawns on kind:none while walking 8799, 18799, and 28799 (electron/server-boot-probe.mjs:177-204).  The packaged child does not set OMB_DATA_DIR (electron/main.mjs:713-731), so server/config.ts:735-739 defaults both owners to ~/.botfleet.  The intended no-fork rule is documented at electron/server-boot-probe.mjs:93-102 but has no owner lock or post-bind reconciliation.  Exact live evidence: PID 93951 listened on 127.0.0.1:8799 and PID 97812 (BotFleet Helper NodeService) listened on 127.0.0.1:18799; curl health identified 93951 as static:false and 97812 as static:true.  lsof showed both PIDs with /Users/jay/.botfleet/messages.db, messages.db-wal, and messages.db-shm open simultaneously.  Safe runtime snapshots showed both with 12 bots but divergent configuration/provider state and webhook totals (8799 five; 18799 six).",
+      "fix": "Enforce one owner per data directory with an atomic lock or authenticated Unix-socket/token handshake.  Before any fallback spawn, re-probe all candidate ports; after child bind, verify no other BotFleet owner appeared.  Fold the health-handshake identity check into the same owner protocol: app, PID, and static are not sufficient authentication because a local process can spoof them.  Add a test where an existing BotFleet probe transiently returns kind:none and fallback spawn is attempted.",
+      "confidence": "high",
+      "evidence": [
+        "electron/server-boot-probe.mjs:93-140,164-206",
+        "electron/main.mjs:713-731,781-827",
+        "server/config.ts:735-739",
+        "server/index.ts:7360-7365",
+        "Live lsof/curl: PID 93951 on 8799 and PID 97812 on 18799; both opened messages.db, messages.db-wal, messages.db-shm under the default BotFleet data directory",
+        "Safe runtime snapshot: both runtimes 12 bots; 8799 five webhooks versus 18799 six"
+      ],
+      "issueNumber": 264,
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/264",
+      "boardId": "f781c56d",
+      "boardUrl": "https://mac.jays.services/board"
+    },
+    {
+      "id": "D2",
+      "severity": "P2",
+      "title": "Static harness attachment has no build or API compatibility check",
+      "description": "When a health response reports static:true, Electron uses the attached harness as the renderer origin (electron/main.mjs:799-805).  The health payload contains only app, pid, and static (server/index.ts:7360-7365), with no source version, UI hash, API capability set, or minimum-compatible version.  A stale static harness from another checkout can therefore serve an older React bundle against the current API while the packaged app reports successful startup.",
+      "fix": "Include a build/API compatibility descriptor tied to the authenticated owner in the owner handshake and reject or fall back to bundled UI when the attached static build is incompatible.  Log the selected PID, port, build, and mode in the desktop diagnostics surface.",
+      "confidence": "high",
+      "evidence": [
+        "electron/main.mjs:799-805",
+        "server/index.ts:7360-7365",
+        "electron/server-boot-probe.node-test.mjs:259-277 tests static attachment but not compatibility"
+      ],
+      "issueNumber": 265,
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/265",
+      "boardId": "e4190ce1cd5e473eb5fee2957db86fc9",
+      "boardUrl": "https://mac.jays.services/board"
+    },
+    {
+      "id": "D3",
+      "severity": "P2",
+      "title": "Initial renderer hydration swallows all REST failures",
+      "description": "The initial loadAll Promise catches and discards failures for bots, instances, config, routines, webhooks, and resource triggers (src/state/store.tsx:2304-2340).  EventSource onopen only marks connected true (src/state/store.tsx:2380-2385).  A transient /api/bots failure can therefore leave the sidebar and chat empty with no state error or retry affordance while the connection indicator becomes healthy; a resumable hello does not necessarily trigger another full hydrate.",
+      "fix": "Track hydration failure separately from transport connectivity, retain the last known snapshot when possible, and expose a bounded retry or error state.  Add a test for partial REST failure followed by a resumable SSE hello.",
+      "confidence": "high",
+      "evidence": [
+        "src/state/store.tsx:2301-2340",
+        "src/state/store.tsx:2342-2385",
+        "docs/audits/2026-08-31-full-stack-audit.md:139 notes broad empty catches; docs/audits/2026-08-31-full-stack-audit.md:66 covered a different hydrate patch-overlay race"
+      ],
+      "issueNumber": 266,
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/266",
+      "boardId": "62a567333ee945999c908620023e0318",
+      "boardUrl": "https://mac.jays.services/board"
+    },
+    {
+      "id": "D4",
+      "severity": "P2",
+      "title": "Automatic-update setting gives no failed-save or HTTP-status feedback",
+      "description": "The UpdatesRow checkbox PUTs /api/config, parses JSON, dispatches the result, and enables the updater without checking response.ok or handling rejection (src/components/SettingsModal.tsx:384-400).  A JSON 4xx/5xx error can therefore be dispatched as config and still invoke setEnabled.  Network rejection has no inline error or retry state.  Persisted configuration and updater behavior can diverge.",
+      "fix": "Check response.ok, show a local save error, and roll the checkbox back unless the server confirms the persisted setting.  Add a focused rejected-PUT test.",
+      "confidence": "high",
+      "evidence": [
+        "src/components/SettingsModal.tsx:361-410",
+        "docs/releasing.md:27-33,102 describes feed behavior but not this config-save failure path",
+        "Board b9d541e9ec1d48308a9bc9504f9d75e7 covers the broader settings lane"
+      ],
+      "issueNumber": 267,
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/267",
+      "boardId": "1ca6cb49c1404ffb901e390d29345353",
+      "boardUrl": "https://mac.jays.services/board"
+    },
+    {
+      "id": "D5",
+      "severity": "P3",
+      "title": "Validate desktop reconnect cleanup and accessible failure announcements",
+      "description": "Two smaller source risks are suitable for one bounded follow-up: attached-ui-shim.mjs retries an idempotent upstream request after downstream close without checking res.destroyed or res.writableEnded (electron/attached-ui-shim.mjs:97-129), and ErrorRow is a visual container without role=alert or its own aria-live region (src/components/ErrorRow.tsx:85-91) inside a polite chat log (src/components/ChatView.tsx:1325-1327).  The shim race can create a request against an already-closed response during reconnect churn; the error row may not be announced promptly by VoiceOver.  These need targeted regression/assistive-technology validation before escalation.",
+      "fix": "Guard retry timers with downstream response state and add an abort/retry assertion to the shim test.  Give critical turn failures an explicit accessible announcement and test with VoiceOver.  As a roadmap suggestion, expose selected harness PID/port/mode and hydration/updater last-success status in a non-secret desktop diagnostics view.",
+      "confidence": "validation required",
+      "evidence": [
+        "electron/attached-ui-shim.mjs:97-135",
+        "electron/attached-ui-shim.node-test.mjs:124-137 covers abort no-hang but not no-retry",
+        "src/components/ErrorRow.tsx:85-91",
+        "src/components/ChatView.tsx:1325-1327",
+        "docs/audits/2026-08-31-full-stack-audit.md:77 covered missing computer recovery cards, a separate issue"
+      ],
+      "issueNumber": 268,
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/268",
+      "boardId": "5ee62380f70740bd9284702031f1e731",
+      "boardUrl": "https://mac.jays.services/board"
+    },
+    {
+      "id": "R1",
+      "severity": "P1",
+      "title": "Repair PagerDuty delivery to the authenticated webhook ingress",
+      "description": "The active PagerDuty subscription P6MLZQI targets a /api/webhooks/ID/SECRET URL on botfleet.jays.services.  A read-only GET to that configured target returned HTTP302 to a Cloudflare Access login host.  The actual webhook receiver recognizes /hooks/wh_ID/SECRET, not the management API path.  Both live harnesses show zero PagerDuty deliveries.  The Sentry-to-PagerDuty workflow3930764 is enabled with an active PagerDuty action, so that separate route must not be mistaken for PagerDuty-to-BotFleet delivery proof.",
+      "fix": "Point the existing subscription at the intended /hooks ingress, configure a machine-authenticated edge route without widening unrelated API access, and validate receipt-to-run correlation with a controlled test.  Preserve the existing subscription and avoid duplicate paging rules.",
+      "confidence": "high",
+      "evidence": [
+        "server/webhook-ingress.ts:91-139",
+        "server/index.ts:5065-5097",
+        "Live PagerDuty subscription metadata and non-mutating target GET; no incident generated"
+      ],
+      "issueNumber": 269,
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/269",
+      "boardId": "0dd2ce223de84582934edc4518f8fc4e",
+      "boardUrl": "https://mac.jays.services/board"
+    },
+    {
+      "id": "R2",
+      "severity": "P1",
+      "title": "Restore Composio connectivity and report configured versus usable status separately",
+      "description": "The desktop harness reports Composio configured in self-hosted mode, but repeated GET /api/connectors/connected returns HTTP500 with fetch failed.  The always-on harness reports unconfigured, tracked separately under dual-runtime finding f781c56d.  Credential presence is not proof that connected accounts or tools can be reached.  No external tool action or OAuth grant was attempted.",
+      "fix": "Diagnose the configured upstream network/session path, retain typed failure and last successful account-sync status, and verify account listing plus a read-only tool through each supported engine.  Do not label fetch failed as invalid credentials without a resource-level test.",
+      "confidence": "high",
+      "evidence": [
+        "server/index.ts:8350-8385",
+        "server/composio.ts:339-347,457-474",
+        "Live desktop18799 /api/connectors/connected returns500; fetch failed"
+      ],
+      "issueNumber": 270,
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/270",
+      "boardId": "0ade868cdc2a4593be27ce1e6c1e46dd",
+      "boardUrl": "https://mac.jays.services/board"
+    },
+    {
+      "id": "R3",
+      "severity": "P1",
+      "title": "Bound fleet RAG fallback and honor explicitly selected service routes",
+      "description": "With Tailscale not in use, live desktop RAG status succeeded via recall-cli in 3.79s with 40,429 points and a healthy embedder, while always-on 8799 timed out at 30.58s.  Both the status handler and MCP proxy prefer the local CLI even when a service URL is configured, so an explicit URL can be bypassed.  Resolve per-process environment and credential routing and expose the actual selected route rather than extending timeouts alone.",
+      "fix": "Unify probe and execution transport selection; honor explicit URL/collection and fall back intentionally; show configured/degraded/ready separately with last success and timeout reason.  Verify semantic search on the same selected route under CF-only connectivity and add offline/Tailscale-down coverage.",
+      "confidence": "high",
+      "evidence": [
+        "server/index.ts:441-464,7452-7535",
+        "server/cli-failure.ts:7-15",
+        "server/drivers/qdrant-proxy.ts:294-324,414-430",
+        "Live paired runtime RAG status comparison"
+      ],
+      "issueNumber": 271,
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/271",
+      "boardId": "2d627f55",
+      "boardUrl": "https://mac.jays.services/board"
+    },
+    {
+      "id": "R4",
+      "severity": "P2",
+      "title": "Do not report RAG ready when backend or protected-route checks fail",
+      "description": "recallRouteGate returns null for500/404 and caught request failures.  The caller then returns ready:true after /health succeeds, even if healthData.backend_ok is false.  A reachable public health route can therefore produce a green connection while the protected recall route or backend is unusable.",
+      "fix": "Require a successful validated protected response for readiness, propagate backend_ok:false and transient failures as degraded, and distinguish unsupported health schema from successful search capability.  Cover401/403/404/500/timeouts and backend_ok:false with an HTTP fixture.",
+      "confidence": "high",
+      "evidence": [
+        "server/index.ts:410-436",
+        "server/index.ts:7540-7571"
+      ],
+      "issueNumber": 272,
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/272",
+      "boardId": "432930fc31424d8dabd0ef77f004c5f3",
+      "boardUrl": "https://mac.jays.services/board"
+    },
+    {
+      "id": "R5",
+      "severity": "P3",
+      "title": "Validate Sentry redelivery identity and preserve existing PagerDuty deduplication",
+      "description": "The ingress already extracts x-webhook-id and deduplicates repeated recognized delivery IDs.  PagerDuty deliveries with that stable header are therefore already covered and do not require a separate event.id adapter for retry deduplication.  The remaining validation is to capture a sanitized fixture for the actual Sentry webhook mode and determine whether it supplies a stable recognized header.  Headerless receives get fresh UUIDs, but no real Sentry duplicate execution was reproduced during this audit.",
+      "fix": "Replay a PagerDuty V3 fixture with a stable x-webhook-id to preserve the existing one-enqueue contract.  Capture only safe header names and opaque test event IDs for the configured Sentry webhook mode; add provider-specific fallback identity only if that fixture proves the current headers insufficient.  Preserve distinct event/action identities, capability authentication and durable retry handling.  Close the validation item without new runtime logic if existing headers satisfy the contract.",
+      "confidence": "source-confirmed generic header deduplication; Sentry-specific validation required",
+      "evidence": [
+        "server/webhook-ingress.ts:79-87",
+        "server/webhooks.ts:575-610",
+        "server/webhook-ingress.test.ts",
+        "https://support.pagerduty.com/main/docs/webhooks",
+        "https://sentry.zendesk.com/hc/en-us/articles/27232675871771-Webhook-Request-is-Missing-Headers"
+      ],
+      "issueNumber": 273,
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/273",
+      "boardId": "d141ec97b302409d93f316514478fcb0",
+      "boardUrl": "https://mac.jays.services/board"
+    },
+    {
+      "id": "R6",
+      "severity": "P2",
+      "title": "Add an operator acceptance matrix for builds engines and integration health",
+      "description": "A product-wide acceptance surface should distinguish installed, configured, authenticated, probe healthy, tool capable, and end-to-end verified.  Current health reports app/pid/static, while engine and connection cards can overstate readiness.  This audit found an enabled but unavailable Cursor on8799, unauthenticated Cursor on18799, and disabled Kimi.  No synthetic paid turns were run, so all engines still need a controlled repeatable acceptance plan.",
+      "fix": "Add a sanitized diagnostics export and opt-in EngineProbe suite covering text/tool/approval/cancel/resume/failover on each engine plus phone reconnect, Composio, RAG and alert receipt.  Include active owner/build/API/data-root identity, test time, cost ceiling and pass/fail evidence.  Keep inference tests explicit and budgeted.",
+      "confidence": "recommendation",
+      "evidence": [
+        "server/index.ts:7363-7365,7693-7708",
+        "Live sanitized instance matrix",
+        "docs/audits/2026-09-09-end-to-end-audit.md"
+      ],
+      "issueNumber": 274,
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/274",
+      "boardId": "7e582b82679442faa5f8563a0ee3ae4a",
+      "boardUrl": "https://mac.jays.services/board"
+    },
+    {
+      "id": "EN-01",
+      "severity": "P1",
+      "title": "Fallback outcomes mutate the primary engine's cooldown and attribution",
+      "description": "Cross-instance fallbacks are per-turn overrides, but completion clears/records quota cooldown and emits instance/model telemetry from the bot's persisted primary selection.",
+      "fix": "Track the actual selection per active turn or use providerInstanceId plus the emitted model consistently for cooldown, usage, and telemetry.",
+      "confidence": "high; verified source path",
+      "evidence": [
+        "server/index.ts:1120-1130",
+        "server/index.ts:1865-1878",
+        "server/index.ts:1943-1967",
+        "server/harness/bus.ts:35-59"
+      ],
+      "issueNumber": 275,
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/275",
+      "boardId": "46f08797c6e146469e9ed768aaf064c0",
+      "boardUrl": "https://mac.jays.services/board"
+    },
+    {
+      "id": "EN-02",
+      "severity": "P1",
+      "title": "Stall cancellation targets the original engine after failover",
+      "description": "The user Stop path finds the real session owner, but the stall watchdog resolves the adapter from the persisted primary selection and then releases the bot after six seconds.",
+      "fix": "Use interruptThreadEverywhere for watchdog stalls and retain ownership if every real owner refuses or fails to stop.",
+      "confidence": "high; verified source path",
+      "evidence": [
+        "server/index.ts:1125-1152",
+        "server/index.ts:1161-1180",
+        "server/index.ts:1266-1270",
+        "server/index.ts:1289-1312"
+      ],
+      "issueNumber": 276,
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/276",
+      "boardId": "fbef84b20ea14ef68ff47322c0ae5add",
+      "boardUrl": "https://mac.jays.services/board"
+    },
+    {
+      "id": "EN-03",
+      "severity": "P1",
+      "title": "Automatic failover is ordered, not healthy",
+      "description": "The automatic chain filters only enabled registered instances and does not check availability, explicit authentication failure, or cooldown before dispatch.",
+      "fix": "Build the chain from a recent registry description, remove unavailable, authenticated-false, and cooling candidates, then preserve stable priority among viable instances.",
+      "confidence": "high; verified source plus redacted live snapshot",
+      "evidence": [
+        "server/index.ts:2049-2064",
+        "server/index.ts:2379-2443",
+        "Sanitized read-only runtime snapshot, summarized in the audit report."
+      ],
+      "issueNumber": 277,
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/277",
+      "boardId": "adae362e0a544da7a5669d771af4f17d",
+      "boardUrl": "https://mac.jays.services/board"
+    },
+    {
+      "id": "EN-04",
+      "severity": "P1",
+      "title": "Claude silently grants every globally configured MCP server to every bot",
+      "description": "After honoring per-bot integrations, the Claude driver imports all global Claude MCP servers except the literal name computer and adds them to allowedTools.",
+      "fix": "Require an explicit per-bot allowlist or opt-in integration for global MCP servers.",
+      "confidence": "high; verified source path",
+      "evidence": [
+        "server/drivers/claude.ts:602-617",
+        "server/drivers/claude.ts:619-673",
+        "server/drivers/claude.ts:686-707"
+      ],
+      "issueNumber": 278,
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/278",
+      "boardId": "5344a9835c2648b5b96cb58bec81f122",
+      "boardUrl": "https://mac.jays.services/board"
+    },
+    {
+      "id": "EN-05",
+      "severity": "P1",
+      "title": "Grok API duplicates the entire request context",
+      "description": "The direct Grok API driver initializes messages with transcript and prompt, then appends the same transcript and prompt again.  This is the direct Grok API path; the live Grok selection uses ACP, so this defect is latent for the current fleet.",
+      "fix": "Keep one message construction path and add a fetch-body assertion for multi-turn tool history.",
+      "confidence": "high; verified source path",
+      "evidence": [
+        "server/drivers/grok.ts:183-219"
+      ],
+      "issueNumber": 279,
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/279",
+      "boardId": "93839dda22d84857932b4bebff31f01c",
+      "boardUrl": "https://mac.jays.services/board"
+    },
+    {
+      "id": "EN-06",
+      "severity": "P2",
+      "title": "Failed ACP or Codex resume silently drops conversation history",
+      "description": "Drivers silently start a fresh provider session after resume failure, while the harness already suppressed inline transcript replay because a cursor existed.",
+      "fix": "Signal resume_failed_fresh and replay the capped active transcript before prompting the replacement provider session.",
+      "confidence": "high; verified source path",
+      "evidence": [
+        "server/drivers/acp/core.ts:682-700",
+        "server/drivers/acp/core.ts:763-771",
+        "server/turn-context.ts:29-67",
+        "server/drivers/codex.ts:534-557"
+      ],
+      "issueNumber": 280,
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/280",
+      "boardId": "89a631729bf444f9bfe8da8b079bc55f",
+      "boardUrl": "https://mac.jays.services/board"
+    },
+    {
+      "id": "EN-07",
+      "severity": "P2",
+      "title": "ACP prompts have no driver-level deadline",
+      "description": "ACP setup requests have deadlines, but session/prompt can remain unresolved until the generic 20-minute inactivity watchdog.",
+      "fix": "Add a configurable prompt or wall-clock deadline that cancels, kills, and emits one terminal event.",
+      "confidence": "high; verified source path",
+      "evidence": [
+        "server/drivers/acp/core.ts:662-768",
+        "server/index.ts:1234-1240"
+      ],
+      "issueNumber": 281,
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/281",
+      "boardId": "689d0f4eb3984292a441940f34ab52cd",
+      "boardUrl": "https://mac.jays.services/board"
+    },
+    {
+      "id": "EN-08",
+      "severity": "P2",
+      "title": "Cost telemetry treats subscription-equivalent Claude cost as actual spend",
+      "description": "Claude documents total_cost_usd as hypothetical API-equivalent under subscription billing, but common telemetry marks every non-null cost as actual.",
+      "fix": "Propagate billing semantics with the turn and classify equivalent subscription cost as estimated metadata, outside actual-spend totals.",
+      "confidence": "high; verified source path",
+      "evidence": [
+        "server/drivers/claude.ts:1098-1110",
+        "server/telemetry.ts:380-398",
+        "server/index.ts:1949-1967"
+      ],
+      "issueNumber": 282,
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/282",
+      "boardId": "ad5536b6440f42c69152443fa5a4d432",
+      "boardUrl": "https://mac.jays.services/board"
+    },
+    {
+      "id": "EN-09",
+      "severity": "P1",
+      "title": "DSH is first-class in defaults but source main cannot launch its ACP backend",
+      "description": "Fresh config enables DSH, but main spawns the stock dsh binary even though it has no ACP entry point; live succeeds only through an external dsh-acp override and exposes no MCP.  Stock-CLI protocol capability is supported by current source and the cited prior audit; no new live stock-CLI probe was run.",
+      "fix": "Complete the owned DSH first-class lane: ship/reach a real bridge, honest setup and copy, model/resume/usage, and truthful MCP semantics.",
+      "confidence": "high; verified source, prior audit, and redacted live snapshot",
+      "evidence": [
+        "server/config.ts:1117-1143",
+        "server/drivers/acp/dsh.ts:17-27",
+        "server/drivers/acp/dsh.ts:91-107",
+        "docs/audits/2026-09-02-dsh-first-tier-integration-report.md:149-167",
+        "Sanitized read-only runtime snapshot, summarized in the audit report."
+      ],
+      "issueNumber": 188,
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/188",
+      "boardId": "2784c3c7",
+      "boardUrl": "https://mac.jays.services/board"
+    },
+    {
+      "id": "EN-10",
+      "severity": "P1",
+      "title": "Antigravity quota keys cannot drive catalog-level routing",
+      "description": "Upstream quota ids are stored verbatim and joined to catalog models by exact id, but the live payload exposes placeholder/category identifiers rather than catalog slugs.  Display grouping was completed by PR #246 and predecessor board 2bf6c493; the separate open routing follow-up is canonical here.",
+      "fix": "Normalize quota payloads to Gemini and Third Party groups and make routing consult group cooldowns instead of exact model ids.",
+      "confidence": "high on live condition; verify active lane includes routing, not only display",
+      "evidence": [
+        "server/antigravity-quota.ts:78-123",
+        "server/antigravity-quota.ts:141-203",
+        "server/harness/registry.ts:230-241",
+        "src/components/ModelPicker.tsx:226-234",
+        "server/drivers/antigravity.ts:60-73",
+        "Sanitized read-only runtime snapshot, summarized in the audit report."
+      ],
+      "issueNumber": 283,
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/283",
+      "boardId": "09d689cb4a6f46bbb6e4988fecd7c284",
+      "boardUrl": "https://mac.jays.services/board"
+    },
+    {
+      "id": "R7",
+      "severity": "P1",
+      "title": "Investigate routine failures and expose reliable execution outcomes",
+      "description": "Read-only audit of the public-route harness found 101 routine runs in the preceding 24 hours: 47 failed, 53 completed, and 1 cancelled.  The preceding seven days had 668 runs: 347 failed, 318 completed, and 3 cancelled.  These are recorded outcomes, not proof all historical causes remain present.  Two concurrent harness owners complicate attribution (#264).  A coarse audit classifier could not classify 44 of the 47 recent failures; product diagnostics need stable structured reasons rather than raw transcript inspection.",
+      "fix": "First resolve single data-root ownership.  Classify each recent failure by engine, task, phase, and stable safe error code; distinguish operator cancellation, expected capability denial, and execution failure.  Add per-routine last-success/last-failure and rolling success metrics; verify recovery with bounded fixtures or separately approved acceptance runs.  Preserve failure history and avoid automatic unlimited retries.",
+      "confidence": "high for observed metadata; investigation required",
+      "evidence": [
+        "Read-only /api/routines and /api/routine-runs snapshot on September 9, 2026; 24-hour and 7-day windows computed from run creation time.",
+        "No prompts or raw user output are included.  Follow-up depends on #264."
+      ],
+      "issueNumber": 284,
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/284",
+      "boardId": "c0f364eab041404aa6bba35afc9a5bbf",
+      "boardUrl": "https://mac.jays.services/board"
+    },
+    {
+      "id": "R8",
+      "severity": "P2",
+      "title": "Restore a complete macOS updater feed and reconcile shipped build identities",
+      "description": "The latest published GitHub release is v0.1.38 (August 31), while source and the installed Mac app identify as 1.0.30.  That release contains four DMG assets and no latest-mac.yml or ZIP update payload.  The latest desktop Release workflow run, 33822154040, failed.  Existing board 5a2b2e02 tracks release credentials; its comments already supersede the original missing Apple API key claim.  Current secret readiness was not re-tested.",
+      "fix": "Complete the existing release lane with the authorized signing credentials, publish the full updater feed and architecture-specific payloads, and verify check/download/signature/install on a disposable or explicitly approved device.  Expose app version, renderer build, harness commit, data owner, and API compatibility separately.  Do not infer release state from source version or CI success.",
+      "confidence": "high for observed metadata; investigation required",
+      "evidence": [
+        "https://github.com/Simple-With-Us/BotFleet/releases/tag/v0.1.38",
+        "https://github.com/Simple-With-Us/BotFleet/actions/runs/33822154040",
+        "electron-builder.yml; electron/updater.mjs; existing board 5a2b2e02 comments."
+      ],
+      "issueNumber": 285,
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/285",
+      "boardId": "5a2b2e02bf5c4debbc0559d2009032d0",
+      "boardUrl": "https://mac.jays.services/board"
+    },
+    {
+      "id": "R9",
+      "severity": "P2",
+      "title": "Reconcile duplicate and stale board effort rows without losing ownership",
+      "description": "The initial BotFleet board snapshot contained 157 open/in-progress rows, including paired agent-report and effort-row entries for the same Sentry findings.  Some in-progress rows describe work already merged or deployed, including MiniMax PR3 and older Sentry/iOS rollout states.  The repo effort mirror also differs from the live effort log.  This makes counts and ownership unreliable and encourages duplicate work.",
+      "fix": "Define one canonical board item per root cause with linked GitHub issue, PR, deployment evidence, and derivative effort rows.  Reconcile state from verified GitHub/build evidence while preserving peer ownership and history.  Add an audit-only dry run that flags duplicates, stale completed text, missing links, and merge-versus-deploy mismatches before writeback.",
+      "confidence": "high for observed metadata; investigation required",
+      "evidence": [
+        "Initial September 9 board list: 157 open/in-progress BotFleet items.",
+        "Sentry agent-report 13008da2 and derivative effort row 2b49eaa7; agent-report a5688de7 and derivative row a9c5b528.",
+        "Live BOTFLEET-EFFORT-LOG.md versus source docs/EFFORT-LOG.md at 121cb85a."
+      ],
+      "issueNumber": 286,
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/286",
+      "boardId": "66958de400b04f9892a2bc9a14c71a09",
+      "boardUrl": "https://mac.jays.services/board"
+    },
+    {
+      "id": "BF-IOS-001",
+      "severity": "P1",
+      "title": "Paired profile PATCH crosses its documented trust boundary",
+      "description": "A valid paired-phone bearer can PATCH autoApprove, autoReview, composio, computer destinations, cloud controls, cwd, extraCwds, userNotes, and model settings even though the sidecar documents the route as identity/avatar/notifications/voice only.  A stolen token can widen autonomous execution and redirect host workspace access before sending instructions.",
+      "fix": "Enforce a dedicated companion profile schema and deny autonomous execution, connector, computer, and host-directory fields unless a separately authenticated elevation flow is introduced.",
+      "confidence": "high-static",
+      "evidence": [
+        "companion/src/routes.ts:84-87",
+        "server/bot-profile.ts:8-30,58-70",
+        "server/index.ts:6298-6324",
+        "ios/App/AgentProfileView.swift:230-299,453-480"
+      ],
+      "issueNumber": 93,
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/93",
+      "boardId": "6ff6f3559eb242e5ada21d28e2143d7d",
+      "boardUrl": "https://mac.jays.services/board"
+    },
+    {
+      "id": "BF-IOS-002",
+      "severity": "P2",
+      "title": "Always Allow is offered by iOS but denied by the sidecar",
+      "description": "Permission cards offer a standing grant and call /api/bots/:id/always-allow, but the companion allowlist deliberately omits the route.  The standing grant fails and the code then allows only the current request, which can mislead the user about persistence.",
+      "fix": "Remove or disable the iOS standing-grant affordance for companion connections, or add an explicit elevated authorization flow while preserving default deny.",
+      "confidence": "high-static",
+      "evidence": [
+        "ios/Sources/CompanionCore/Models.swift:61-67",
+        "ios/App/ChatView.swift:1697-1739",
+        "ios/App/Session.swift:741-750,773-779",
+        "ios/Sources/CompanionCore/Client.swift:972-975",
+        "companion/src/routes.ts:73-78"
+      ],
+      "issueNumber": 93,
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/93",
+      "boardId": "9af28de9bea9442db1ae0f1c01c78cca",
+      "boardUrl": "https://mac.jays.services/board"
+    },
+    {
+      "id": "BF-IOS-003",
+      "severity": "P1",
+      "title": "Background APNs delivery navigates and can switch the Mac task without a tap",
+      "description": "The content-available APNs callback invokes both wake and navigation. openNotification can POST switchTask and ChatListView automatically opens notificationChat, so background receipt alone can change the active Mac task and future iOS destination.",
+      "fix": "Use background delivery only to reconnect and hydrate.  Call openNotification solely from the UNNotificationResponse tap callback.",
+      "confidence": "high-static-runtime-unverified",
+      "evidence": [
+        "companion/src/apns.ts:50-80",
+        "ios/App/CompanionApp.swift:33-38,80-89",
+        "ios/App/Session.swift:1196-1236",
+        "ios/App/Notifications.swift:71-79",
+        "ios/App/ChatListView.swift:75-85"
+      ],
+      "issueNumber": 287,
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/287",
+      "boardId": "39f7be5ceb2e44a5afb58d12cb50eb32",
+      "boardUrl": "https://mac.jays.services/board"
+    },
+    {
+      "id": "BF-IOS-004",
+      "severity": "P2",
+      "title": "Background fetch reports completion before reconnect or hydration completes",
+      "description": "didReceiveRemoteNotification starts connection and navigation work, then immediately calls completionHandler(.newData). iOS can suspend the process before the promised reconnect/hydrate completes.",
+      "fix": "Await one bounded async refresh operation before reporting newData, noData, or failed.",
+      "confidence": "high-static-runtime-unverified",
+      "evidence": [
+        "companion/src/apns.ts:74-76",
+        "ios/App/CompanionApp.swift:33-38,80-89"
+      ],
+      "issueNumber": 288,
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/288",
+      "boardId": "18341d8cf54140edb2383eb3f2165219",
+      "boardUrl": "https://mac.jays.services/board"
+    },
+    {
+      "id": "BF-IOS-005",
+      "severity": "P1",
+      "title": "Send and Stop omit the server task-binding guard",
+      "description": "iOS omits threadId from bot/room sends and interrupt even though the server implements thread-aware 409 guards.  A concurrent desktop task switch can route a send or Stop to work other than the conversation shown on the phone.",
+      "fix": "Pass the displayed chat.threadId through bot and room send and interrupt, then refresh on a 409 task-changed response.",
+      "confidence": "high-static",
+      "evidence": [
+        "ios/Sources/CompanionCore/Client.swift:945-959,1071-1072",
+        "server/index.ts:6118-6133,6159-6173,6790-6805,6994-7010,7028-7047"
+      ],
+      "issueNumber": 289,
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/289",
+      "boardId": "118caef55b844c8dad0103894058c59f",
+      "boardUrl": "https://mac.jays.services/board"
+    },
+    {
+      "id": "BF-IOS-006",
+      "severity": "P1",
+      "title": "iOS does not use the server send idempotency contract",
+      "description": "iOS creates a local pending UUID but sends only text.  If the server commits a message and the response is lost, retrying the restored draft can execute the instruction twice despite server support for idempotencyKey.",
+      "fix": "Send the pending UUID as idempotencyKey and reuse it across transport retries until stream reconciliation or a definitive response.",
+      "confidence": "high-static",
+      "evidence": [
+        "ios/App/Session.swift:675-700",
+        "ios/Sources/CompanionCore/Client.swift:945-959",
+        "server/index.ts:6150-6157,6825-6862"
+      ],
+      "issueNumber": 290,
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/290",
+      "boardId": "4505f828facf4e179ee341a8b21b0c5c",
+      "boardUrl": "https://mac.jays.services/board"
+    },
+    {
+      "id": "BF-IOS-007",
+      "severity": "P2",
+      "title": "Accepted image formats cannot be read through the companion route",
+      "description": "The client accepts HEIC, HEIF, AVIF, BMP, and SVG for avatars and treats them as renderable, while the sidecar GET route permits only PNG, JPEG, GIF, and WebP.  Successful uploads can therefore yield unfetchable avatar or transcript URLs.",
+      "fix": "Normalize uploaded display images to a GET-supported format or safely unify and expand the shared upload/render contract.",
+      "confidence": "high-static",
+      "evidence": [
+        "ios/Sources/CompanionCore/Client.swift:800-815",
+        "ios/Sources/CompanionCore/ChatAttachments.swift:65-78,106-121,226-242",
+        "companion/src/routes.ts:110-113"
+      ],
+      "issueNumber": 291,
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/291",
+      "boardId": "ced11b511edd4cc7acac4496029e90e4",
+      "boardUrl": "https://mac.jays.services/board"
+    },
+    {
+      "id": "BF-IOS-008",
+      "severity": "P2",
+      "title": "Editing an engine selection silently clears reasoning effort",
+      "description": "The server model contract carries effort and engine capabilities expose supported levels, but Swift ModelSelection and Instance omit both.  Saving any changed model selection reconstructs it without primary or fallback effort values.",
+      "fix": "Add effort and instance capabilities to CompanionCore, preserve current values, and expose only the selected engine's declared levels.",
+      "confidence": "high-static",
+      "evidence": [
+        "server/contracts.ts:35-55,345-372",
+        "server/harness/registry.ts:255-263",
+        "ios/Sources/CompanionCore/Models.swift:193-202,518-525",
+        "ios/App/AgentProfileView.swift:220-225,453-468"
+      ],
+      "issueNumber": 292,
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/292",
+      "boardId": "1e36bd92d91447af8a7576cc9068c5f1",
+      "boardUrl": "https://mac.jays.services/board"
+    },
+    {
+      "id": "BF-IOS-009",
+      "severity": "P2",
+      "title": "Bot Settings dismisses after a failed save",
+      "description": "The Save task always dismisses. updateProfile returns nil and stores a global error on offline, validation, conflict, or server failure, so the editor closes and loses the recoverable form state.",
+      "fix": "Return success from save and dismiss only after a successful update, matching GroupProfileView.",
+      "confidence": "high-static",
+      "evidence": [
+        "ios/App/AgentProfileView.swift:397-406,483-489",
+        "ios/App/Session.swift:992-1003",
+        "ios/App/GroupProfileView.swift:173-177"
+      ],
+      "issueNumber": 293,
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/293",
+      "boardId": "f16194b9a2284a3dadd4d47e4a80ade1",
+      "boardUrl": "https://mac.jays.services/board"
+    },
+    {
+      "id": "BF-IOS-010",
+      "severity": "P3",
+      "title": "Live Activities are explicitly stale while the app is suspended",
+      "description": "Live Activities use pushType nil and the implementation states updates are foreground-only.  Lock-screen and Dynamic Island state can remain stale after the bot changes until relaunch or system dismissal.",
+      "fix": "Implement ActivityKit push-token updates/end events, or end activities on backgrounding and rely on normal APNs until remote activity updates exist.",
+      "confidence": "high-static; product enhancement with device validation outstanding",
+      "evidence": [
+        "ios/App/LiveActivities.swift:1-9,87-99",
+        "ios/project.yml:110-144"
+      ],
+      "issueNumber": 294,
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/294",
+      "boardId": "699ea1ae62564711992ff91ac5a75887",
+      "boardUrl": "https://mac.jays.services/board"
+    },
+    {
+      "id": "R10",
+      "severity": "P2",
+      "title": "Remediate vulnerable Electron packaging dependencies and verify generated artifacts",
+      "description": "GitHub reports 11 open Dependabot alerts in pnpm-lock.yaml: eight high and three moderate.  All are tagged development scope and trace through Electron Builder 24.13.3/app-builder-lib: builder-util-runtime 9.2.4, tar 6.2.1 and xmldom 0.8.13.  The updater separately resolves fixed builder-util-runtime 9.7.0.  Development scope does not prove harmlessness: build/archive tooling runs with developer/CI privileges, and the app-builder-lib advisory affects generated Linux AppImage runtime search paths.  No exploit against this Mac or iOS app was established.",
+      "fix": "Upgrade the compatible Electron Builder toolchain and regenerate the lockfile to resolve all listed advisories, including app-builder-lib >=26.15.0, builder-util-runtime >=9.7.0, tar >=7.5.18, and xmldom >=0.8.15 as of this audit.  Run typecheck/tests and Mac/Linux/Windows package/update smoke checks; inspect the packaged dependency boundary and generated launcher scripts rather than assuming devDependencies cannot affect shipped artifacts.  Confirm Dependabot alerts are resolved before the next release.",
+      "confidence": "high for dependency graph/advisories; installed artifact exploitability not tested",
+      "evidence": [
+        "package.json:98-115",
+        "pnpm-lock.yaml:5845-5875,6022-6048,8117-8125,5770",
+        "electron-builder.yml:32-36",
+        "https://github.com/electron-userland/electron-builder/security/advisories/GHSA-7g7r-gx96-252g",
+        "https://github.com/electron-userland/electron-builder/security/advisories/GHSA-p2f4-r6v6-j797"
+      ],
+      "boardId": "2c27a6351b18472993007b0a9f86d24d",
+      "boardUrl": "https://mac.jays.services/board",
+      "issueNumber": 296,
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/296"
+    }
+  ],
+  "dependencyAlerts": [
+    {
+      "alertid": 15,
+      "package": "@xmldom/xmldom",
+      "vulnerableRange": ">= 0.7.0, <= 0.8.14",
+      "fixedVersion": "0.8.15",
+      "severity": "moderate",
+      "manifestPath": "pnpm-lock.yaml",
+      "summary": "xmldom: XML fragment injection via invalid EntityReference.nodeName during requireWellFormed serialization",
+      "advisoryURL": "https://github.com/xmldom/xmldom/security/advisories/GHSA-6gmq-8vp8-gcm6"
+    },
+    {
+      "alertid": 13,
+      "package": "builder-util-runtime",
+      "vulnerableRange": "< 9.7.0",
+      "fixedVersion": "9.7.0",
+      "severity": "high",
+      "manifestPath": "pnpm-lock.yaml",
+      "summary": "electron-updater: Cross-origin redirect leaks PRIVATE-TOKEN and mixed-case Authorization credentials in builder-util-runtime",
+      "advisoryURL": "https://github.com/electron-userland/electron-builder/security/advisories/GHSA-p2f4-r6v6-j797"
+    },
+    {
+      "alertid": 12,
+      "package": "app-builder-lib",
+      "vulnerableRange": "< 26.15.0",
+      "fixedVersion": "26.15.0",
+      "severity": "high",
+      "manifestPath": "pnpm-lock.yaml",
+      "summary": "electron-updater: Uncontrolled search path elements within AppImage built by app-builder-lib",
+      "advisoryURL": "https://github.com/electron-userland/electron-builder/security/advisories/GHSA-7g7r-gx96-252g"
+    },
+    {
+      "alertid": 11,
+      "package": "tar",
+      "vulnerableRange": "<= 7.5.17",
+      "fixedVersion": "7.5.18",
+      "severity": "moderate",
+      "manifestPath": "pnpm-lock.yaml",
+      "summary": "node-tar: Process crash via PAX numeric path type confusion",
+      "advisoryURL": "https://github.com/isaacs/node-tar/security/advisories/GHSA-w8wr-v893-vjvp"
+    },
+    {
+      "alertid": 7,
+      "package": "tar",
+      "vulnerableRange": "<= 7.5.15",
+      "fixedVersion": "7.5.16",
+      "severity": "moderate",
+      "manifestPath": "pnpm-lock.yaml",
+      "summary": "node-tar applies PAX size override to intermediary GNU long-name/long-link headers, causing tar parser interpretation differential",
+      "advisoryURL": "https://github.com/isaacs/node-tar/security/advisories/GHSA-vmf3-w455-68vh"
+    },
+    {
+      "alertid": 6,
+      "package": "tar",
+      "vulnerableRange": "<= 7.5.10",
+      "fixedVersion": "7.5.11",
+      "severity": "high",
+      "manifestPath": "pnpm-lock.yaml",
+      "summary": "node-tar Symlink Path Traversal via Drive-Relative Linkpath",
+      "advisoryURL": "https://github.com/isaacs/node-tar/security/advisories/GHSA-9ppj-qmqm-q256"
+    },
+    {
+      "alertid": 5,
+      "package": "tar",
+      "vulnerableRange": "<= 7.5.9",
+      "fixedVersion": "7.5.10",
+      "severity": "high",
+      "manifestPath": "pnpm-lock.yaml",
+      "summary": "tar has Hardlink Path Traversal via Drive-Relative Linkpath",
+      "advisoryURL": "https://github.com/isaacs/node-tar/security/advisories/GHSA-qffp-2rhf-9h96"
+    },
+    {
+      "alertid": 4,
+      "package": "tar",
+      "vulnerableRange": "< 7.5.8",
+      "fixedVersion": "7.5.8",
+      "severity": "high",
+      "manifestPath": "pnpm-lock.yaml",
+      "summary": "node-tar: Arbitrary File Read/Write via Hardlink Target Escape Through Symlink Chain",
+      "advisoryURL": "https://github.com/isaacs/node-tar/security/advisories/GHSA-83g3-92jg-28cx"
+    },
+    {
+      "alertid": 3,
+      "package": "tar",
+      "vulnerableRange": "< 7.5.7",
+      "fixedVersion": "7.5.7",
+      "severity": "high",
+      "manifestPath": "pnpm-lock.yaml",
+      "summary": "node-tar: Arbitrary File Creation/Overwrite via Hardlink Path Traversal",
+      "advisoryURL": "https://github.com/isaacs/node-tar/security/advisories/GHSA-34x7-hfp2-rc4v"
+    },
+    {
+      "alertid": 2,
+      "package": "tar",
+      "vulnerableRange": "<= 7.5.3",
+      "fixedVersion": "7.5.4",
+      "severity": "high",
+      "manifestPath": "pnpm-lock.yaml",
+      "summary": "node-tar: Race Condition in Path Reservations via Unicode Ligature Collisions on macOS APFS",
+      "advisoryURL": "https://github.com/isaacs/node-tar/security/advisories/GHSA-r6q2-hw4h-h46w"
+    },
+    {
+      "alertid": 1,
+      "package": "tar",
+      "vulnerableRange": "<= 7.5.2",
+      "fixedVersion": "7.5.3",
+      "severity": "high",
+      "manifestPath": "pnpm-lock.yaml",
+      "summary": "node-tar: Arbitrary File Overwrite and Symlink Poisoning via Insufficient Path Sanitization",
+      "advisoryURL": "https://github.com/isaacs/node-tar/security/advisories/GHSA-8qq5-rm4j-mr97"
+    }
+  ]
+}

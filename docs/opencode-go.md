@@ -36,6 +36,21 @@ successful catalog is used, followed by a small anonymous-model fallback.
 Before every prompt, ACP receives `session/set_config_option` with
 `configId: "model"` and the exact selected provider-qualified model ID.
 
+## Sign-in check
+
+Before a turn starts, BotFleet asks whether OpenCode can run it:  an
+`OPENCODE_API_KEY`, a stored login in `auth.json`, or an `opencode models`
+that lists at least one model.  If the CLI answers and none of those holds,
+the turn is refused with "OpenCode has no usable models".
+
+`opencode models` gets 20 seconds on an idle host, stretched up to 60 seconds
+as the host's load average passes its core count (the same rule as the ACP
+initialize deadline).  A probe that runs out of time or is killed has not
+answered, so it is not read as signed out:  the turn goes to the CLI, which
+answers for itself, and the engine is not marked "not signed in".  A list is
+remembered for ten minutes, an empty answer for thirty seconds, and a timeout
+not at all.
+
 ## Testing
 
 Normal unit and ACP protocol tests do not require a subscription. Live tests

@@ -1,33 +1,104 @@
 // The profile patch parser is the boundary that keeps paired clients from
-// writing anything but identity fields. The strict half is the one that
-// matters: a privileged bot field arriving here must be refused by NAME,
-// so a future field cannot silently become remotely writable.
+// writing a bot field nobody ruled on. The strict half is the one that
+// matters: a field arriving here that is not in the schema must be refused by
+// NAME, so a future field cannot silently become remotely writable.  The
+// execution-policy fields are in the schema since the owner's 2026-10-09
+// ruling that a paired phone may set them; which bots may have Auto or Bypass
+// switched on from a phone is decided in the profile route (see
+// companion/test/proxy.test.ts), where the stored bot is.
 import { describe, expect, it } from "vitest";
 
-import { parseBotProfilePatch } from "./bot-profile.ts";
+import { parseBotProfilePatch, resolveMaxToolRounds } from "./bot-profile.ts";
 
 describe("parseBotProfilePatch (strict — the paired boundary)", () => {
-  it("refuses every privilege-bearing bot field by name", () => {
-    for (const field of ["autoApprove", "autoReview", "alwaysAllow", "computer", "cwd", "composio", "chiefOfStaff", "acknowledgeLocalAuto"]) {
-      const result = parseBotProfilePatch({ name: "Mira", [field]: true } as never, true);
-      expect(result.ok, field).toBe(false);
-      if (!result.ok) expect(result.error).toContain(field);
+  it("refuses unknown keys — strict means the allowlist IS the contract", () => {
+    const result = parseBotProfilePatch({ color: "red" } as never, true);
+    expect(result).toEqual({ ok: false, error: "unsupported profile field: color" });
+    const result2 = parseBotProfilePatch({ unknownProperty: true } as never, true);
+    expect(result2).toEqual({ ok: false, error: "unsupported profile field: unknownProperty" });
+  });
+
+  it("accepts the execution-policy switches on the paired boundary, in strict mode too", () => {
+    // Owner ruling 2026-10-09: bots get Bypass Permissions, Auto-Approve, Auto
+    // Review and peer-contact approval from the phone.  Strict mode used to
+    // refuse bypassPermissions by name (AG, #870).
+    for (const strict of [true, false]) {
+      expect(parseBotProfilePatch({ bypassPermissions: true }, strict)).toEqual({
+        ok: true,
+        patch: { bypassPermissions: true },
+      });
+      expect(parseBotProfilePatch({ bypassPermissions: false }, strict)).toEqual({
+        ok: true,
+        patch: { bypassPermissions: false },
+      });
+      expect(
+        parseBotProfilePatch(
+          { autoApprove: true, autoReview: "enforce", approvePeerComms: false, bypassPermissions: true },
+          strict,
+        ),
+      ).toEqual({
+        ok: true,
+        patch: { autoApprove: true, autoReview: "enforce", approvePeerComms: false, bypassPermissions: true },
+      });
     }
   });
 
-  it("refuses unknown cosmetic keys too — strict means the allowlist IS the contract", () => {
-    const result = parseBotProfilePatch({ color: "red" } as never, true);
-    expect(result).toEqual({ ok: false, error: "unsupported profile field: color" });
+  it("still validates each switch's value, so a stray string or number writes nothing", () => {
+    // Parsed from JSON the way a request body arrives, so the wrong types are
+    // the wire's and need no cast.
+    const wire = (json: string) => parseBotProfilePatch(JSON.parse(json), true);
+    expect(wire('{"bypassPermissions":"true"}')).toEqual({
+      ok: false,
+      error: "bypassPermissions must be true or false",
+    });
+    expect(wire('{"autoApprove":1}')).toEqual({
+      ok: false,
+      error: "autoApprove must be true or false",
+    });
+    expect(wire('{"approvePeerComms":null}')).toEqual({
+      ok: false,
+      error: "approvePeerComms must be true or false",
+    });
+    expect(wire('{"autoReview":"always"}')).toEqual({
+      ok: false,
+      error: "autoReview must be off, shadow, or enforce",
+    });
   });
 
-  it("accepts the full identity surface", () => {
+  it("accepts the full identity and configuration surface", () => {
     const result = parseBotProfilePatch(
-      { name: "Mira", title: "Lead", description: "plans", notifications: true, voice: "vx", speakReplies: false },
+      {
+        name: "Mira",
+        title: "Lead",
+        description: "plans",
+        notifications: true,
+        voice: "vx",
+        speakReplies: false,
+        chiefOfStaff: true,
+        autoApprove: true,
+        autoReview: "shadow",
+        composio: true,
+        cloudBackend: "box",
+        cwd: "/Users/test/Code",
+      },
       true,
     );
     expect(result).toEqual({
       ok: true,
-      patch: { name: "Mira", title: "Lead", description: "plans", notifications: true, voice: "vx", speakReplies: false },
+      patch: {
+        name: "Mira",
+        title: "Lead",
+        description: "plans",
+        notifications: true,
+        voice: "vx",
+        speakReplies: false,
+        chiefOfStaff: true,
+        autoApprove: true,
+        autoReview: "shadow",
+        composio: true,
+        cloudBackend: "box",
+        cwd: "/Users/test/Code",
+      },
     });
   });
 });
@@ -38,15 +109,74 @@ describe("parseBotProfilePatch (both modes)", () => {
     expect(result).toEqual({ ok: true, patch: { name: "Mira" } });
   });
 
+  it("restricts voice playback to distinct known devices", () => {
+    expect(parseBotProfilePatch({ speechDevices: ["mac", "iphone"] }, true)).toEqual({
+      ok: true, patch: { speechDevices: ["mac", "iphone"] },
+    });
+    expect(parseBotProfilePatch({ speechDevices: [] }, true)).toEqual({ ok: true, patch: { speechDevices: [] } });
+    for (const speechDevices of [["mac", "mac"], ["ipad"], ["iphone", "mac", "iphone"]]) {
+      expect(parseBotProfilePatch({ speechDevices } as never, true).ok).toBe(false);
+    }
+  });
+
+  it("accepts per-device voices on both boundaries and merges them into the stored record", () => {
+    for (const strict of [true, false]) {
+      expect(parseBotProfilePatch({ voices: { iphone: "English_Graceful_Lady" } }, strict)).toEqual({
+        ok: true,
+        patch: { voices: { iphone: "English_Graceful_Lady" } },
+      });
+      // A phone saving its own voice keeps the Mac's.
+      const merged = parseBotProfilePatch({ voices: { iphone: "vx" } }, strict, { voices: { mac: "personal:mac" } });
+      expect(merged).toEqual({ ok: true, patch: { voices: { mac: "personal:mac", iphone: "vx" } } });
+    }
+  });
+
+  it("clears one device with null or an empty string, and every device with voices: null", () => {
+    const current = { voices: { mac: "personal:mac", iphone: "vx" } };
+    expect(parseBotProfilePatch({ voices: { mac: null } }, true, current)).toEqual({ ok: true, patch: { voices: { iphone: "vx" } } });
+    expect(parseBotProfilePatch({ voices: { iphone: "" } }, true, current)).toEqual({ ok: true, patch: { voices: { mac: "personal:mac" } } });
+    const cleared = parseBotProfilePatch({ voices: null }, true, current);
+    expect(cleared.ok && "voices" in cleared.patch && cleared.patch.voices === undefined).toBe(true);
+    const lastCleared = parseBotProfilePatch({ voices: { mac: null, iphone: null } }, true, current);
+    expect(lastCleared.ok && "voices" in lastCleared.patch && lastCleared.patch.voices === undefined).toBe(true);
+  });
+
+  it("leaves voices alone when a PATCH does not name them", () => {
+    const result = parseBotProfilePatch({ name: "Mira" }, true, { voices: { mac: "personal:mac" } });
+    expect(result.ok && "voices" in result.patch).toBe(false);
+  });
+
+  it("rejects malformed per-device voices", () => {
+    // SAFETY: deliberately malformed input; parseBotProfilePatch validates at runtime.
+    expect(parseBotProfilePatch({ voices: { ipad: "vx" } } as never, true)).toEqual({
+      ok: false,
+      error: "voices only accepts mac and iphone, not ipad",
+    });
+    // SAFETY: deliberately malformed input; parseBotProfilePatch validates at runtime.
+    expect(parseBotProfilePatch({ voices: { mac: 7 } } as never, true)).toEqual({ ok: false, error: "voices.mac must be a voice id or null" });
+    expect(parseBotProfilePatch({ voices: { iphone: "v".repeat(201) } }, true)).toEqual({
+      ok: false,
+      error: "voices.iphone must be at most 200 characters",
+    });
+    for (const voices of ["vx", ["vx"], 3]) {
+      // SAFETY: deliberately malformed input; parseBotProfilePatch validates at runtime.
+      expect(parseBotProfilePatch({ voices } as never, true)).toEqual({
+        ok: false,
+        error: "voices must be an object with mac and iphone voice ids",
+      });
+    }
+  });
+
   it("rejects a blank or oversized name", () => {
     expect(parseBotProfilePatch({ name: "   " }, true).ok).toBe(false);
     expect(parseBotProfilePatch({ name: "x".repeat(101) }, true).ok).toBe(false);
   });
 
   it("only stored-attachment avatar URLs pass; clears normalize to undefined", () => {
-    for (const bad of ["https://example.com/a.png", "data:image/png;base64,AAAA", "/api/attachments/../config.json", "/api/attachments/a.svg"]) {
+    for (const bad of ["https://example.com/a.png", "data:image/png;base64,AAAA", "/api/attachments/../config.json", "/api/attachments/a.exe"]) {
       expect(parseBotProfilePatch({ avatarUrl: bad } as never, true).ok, bad).toBe(false);
     }
+    expect(parseBotProfilePatch({ avatarUrl: "/api/attachments/a.svg" } as never, true).ok).toBe(true);
     const cleared = parseBotProfilePatch({ avatarUrl: "" }, true);
     expect(cleared).toEqual({ ok: true, patch: { avatarUrl: undefined } });
     const nulled = parseBotProfilePatch({ avatarUrl: null }, true);
@@ -56,7 +186,172 @@ describe("parseBotProfilePatch (both modes)", () => {
   it("maps an avatarCrop issue to the readable message", () => {
     expect(parseBotProfilePatch({ avatarCrop: "hexagon" } as never, true)).toEqual({
       ok: false,
-      error: "avatarCrop must be mascot, circle, rounded, or square",
+      // The message names every crop the schema accepts, so it cannot drift
+      // away from the list again when a crop is added.
+      error: "avatarCrop must be mascot, tvface, animated, circle, rounded, square",
     });
+  });
+});
+
+// connectorTools (Finding 1a/1d): per-bot Composio tool grants, validated at
+// this same boundary so a malformed PATCH — from either surface — never
+// reaches the store. See server/connector-verdict.ts for how it is enforced.
+describe("parseBotProfilePatch (connectorTools)", () => {
+  it("accepts a star grant, an explicit tool list, and multiple services", () => {
+    const result = parseBotProfilePatch(
+      { connectorTools: { gmail: { tools: "*" }, slack: { tools: ["SLACK_POST_MESSAGE"] } } },
+      true,
+    );
+    expect(result).toEqual({
+      ok: true,
+      patch: { connectorTools: { gmail: { tools: "*" }, slack: { tools: ["SLACK_POST_MESSAGE"] } } },
+    });
+  });
+
+  it("accepts the empty record — denies every connected-app tool without touching composio", () => {
+    expect(parseBotProfilePatch({ connectorTools: {} }, true)).toEqual({ ok: true, patch: { connectorTools: {} } });
+  });
+
+  it("null clears a bot back to legacy all-tools, the same shape as avatarUrl/cwd", () => {
+    expect(parseBotProfilePatch({ connectorTools: null }, true)).toEqual({ ok: true, patch: { connectorTools: undefined } });
+  });
+
+  it("omitting the field entirely leaves it out of the patch — existing grants are untouched", () => {
+    const result = parseBotProfilePatch({ name: "Mira" }, true);
+    expect(result.ok).toBe(true);
+    expect(result.ok && "connectorTools" in result.patch).toBe(false);
+  });
+
+  it("rejects malformed grants", () => {
+    for (const bad of [
+      { connectorTools: "gmail" },
+      { connectorTools: { Gmail: { tools: "*" } } }, // slug must be lowercase
+      { connectorTools: { gmail: "*" } }, // must be a { tools } object
+      { connectorTools: { gmail: { tools: "*", extra: 1 } } }, // no extra keys
+      { connectorTools: { gmail: { tools: [] } } }, // empty list — omit the service instead
+      { connectorTools: { gmail: { tools: ["gmail_send_email"] } } }, // must be upper-snake
+      { connectorTools: { gmail: { tools: [42] } } },
+      { connectorTools: { gmail: { tools: "everything" } } },
+    ]) {
+      const result = parseBotProfilePatch(bad as never, true);
+      expect(result.ok, JSON.stringify(bad)).toBe(false);
+    }
+  });
+
+  it("rejects more services or tools than the caps allow", () => {
+    const tooManyServices: Record<string, { tools: "*" }> = {};
+    for (let i = 0; i < 65; i++) tooManyServices[`svc${i}`] = { tools: "*" };
+    expect(parseBotProfilePatch({ connectorTools: tooManyServices } as never, true).ok).toBe(false);
+
+    const tooManyTools = Array.from({ length: 501 }, (_, i) => `GMAIL_TOOL_${i}`);
+    expect(parseBotProfilePatch({ connectorTools: { gmail: { tools: tooManyTools } } } as never, true).ok).toBe(false);
+  });
+
+  it("validates identically in lenient mode — the desktop's broad PATCH shares this boundary", () => {
+    expect(parseBotProfilePatch({ connectorTools: { gmail: "*" } } as never, false).ok).toBe(false);
+    expect(parseBotProfilePatch({ connectorTools: { gmail: { tools: "*" } } }, false)).toEqual({
+      ok: true,
+      patch: { connectorTools: { gmail: { tools: "*" } } },
+    });
+  });
+});
+
+describe("parseBotProfilePatch (maxToolRounds)", () => {
+  it("keeps an integer in 1..200", () => {
+    expect(parseBotProfilePatch({ maxToolRounds: 2 }, true)).toEqual({
+      ok: true,
+      patch: { maxToolRounds: 2 },
+    });
+    expect(parseBotProfilePatch({ maxToolRounds: 200 }, true)).toEqual({
+      ok: true,
+      patch: { maxToolRounds: 200 },
+    });
+    expect(parseBotProfilePatch({ maxToolRounds: 1 }, false)).toEqual({
+      ok: true,
+      patch: { maxToolRounds: 1 },
+    });
+  });
+
+  it("treats null, empty string, and invalid values as absent (clear)", () => {
+    for (const bad of [null, "", 0, -1, 201, 1.5, "12", true, {}, []]) {
+      expect(parseBotProfilePatch({ maxToolRounds: bad } as never, true), String(bad)).toEqual({
+        ok: true,
+        patch: { maxToolRounds: undefined },
+      });
+    }
+  });
+
+  it("omitting the field leaves it out of the patch — existing values stay", () => {
+    const result = parseBotProfilePatch({ name: "Mira" }, true);
+    expect(result.ok).toBe(true);
+    expect(result.ok && "maxToolRounds" in result.patch).toBe(false);
+  });
+});
+
+describe("parseBotProfilePatch (maxHistoryTurns and historySummaryModel)", () => {
+  it("keeps an integer in 0..500", () => {
+    expect(parseBotProfilePatch({ maxHistoryTurns: 0 }, true)).toEqual({
+      ok: true,
+      patch: { maxHistoryTurns: 0 },
+    });
+    expect(parseBotProfilePatch({ maxHistoryTurns: 25 }, true)).toEqual({
+      ok: true,
+      patch: { maxHistoryTurns: 25 },
+    });
+    expect(parseBotProfilePatch({ maxHistoryTurns: 500 }, false)).toEqual({
+      ok: true,
+      patch: { maxHistoryTurns: 500 },
+    });
+  });
+
+  it("treats null, empty string, and invalid values as absent (clear)", () => {
+    for (const bad of [null, "", -1, 501, 1.5, "25", true]) {
+      // SAFETY: the test feeds deliberately invalid values to prove they are
+      // cleared; the patch input type excludes them, hence the cast.
+      expect(parseBotProfilePatch({ maxHistoryTurns: bad } as never, true), String(bad)).toEqual({
+        ok: true,
+        patch: { maxHistoryTurns: undefined },
+      });
+    }
+  });
+
+  it("rejects arrays, objects, and oversized strings on the 4xx path", () => {
+    for (const bad of [{}, [], ["1"], "x".repeat(100)]) {
+      // SAFETY: shape-malformed values must fail validation itself (so the
+      // route answers 4xx) instead of being accepted and silently clearing
+      // the setting.
+      // The boundary takes unknown and the Zod parse inside rejects these;
+      // no cast means the test cannot drift from what the route will see.
+      expect(parseBotProfilePatch({ maxHistoryTurns: bad }, true).ok, String(bad)).toBe(false);
+    }
+  });
+
+  it("passes the model-written toggle through, strict included", () => {
+    expect(parseBotProfilePatch({ historySummaryModel: true }, true)).toEqual({
+      ok: true,
+      patch: { historySummaryModel: true },
+    });
+    expect(parseBotProfilePatch({ historySummaryModel: false }, true)).toEqual({
+      ok: true,
+      patch: { historySummaryModel: false },
+    });
+  });
+
+  it("omitting both fields leaves them out of the patch — existing values stay", () => {
+    const result = parseBotProfilePatch({ name: "Mira" }, true);
+    expect(result.ok).toBe(true);
+    expect(result.ok && "maxHistoryTurns" in result.patch).toBe(false);
+    expect(result.ok && "historySummaryModel" in result.patch).toBe(false);
+  });
+});
+
+describe("resolveMaxToolRounds", () => {
+  it("accepts 1..200 integers and rejects everything else", () => {
+    expect(resolveMaxToolRounds(2)).toBe(2);
+    expect(resolveMaxToolRounds(12)).toBe(12);
+    expect(resolveMaxToolRounds(200)).toBe(200);
+    for (const bad of [undefined, null, "", 0, -3, 201, 2.5, "2", NaN, Infinity]) {
+      expect(resolveMaxToolRounds(bad), String(bad)).toBeUndefined();
+    }
   });
 });

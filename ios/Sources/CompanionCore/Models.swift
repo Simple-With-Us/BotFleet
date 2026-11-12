@@ -12,6 +12,37 @@
 import Foundation
 
 // MARK: - Messages
+public struct IncomingRecording: Codable, Hashable, Sendable {
+    public var path: String
+    public var mime: String
+    public var transcript: String
+    public var engine: String
+
+    public init(path: String, transcript: String) {
+        self.path = path
+        self.mime = "audio/wav"
+        self.transcript = transcript
+        self.engine = "apple-on-device"
+    }
+}
+
+public struct RecordingReview: Codable, Hashable, Sendable {
+    public var correction: String?
+    public var comment: String?
+    public var updatedAt: Double
+}
+
+public struct SavedTranslation: Codable, Hashable, Sendable {
+    public var language: String
+    public var text: String
+    public var provider: String
+}
+
+public struct VoiceClip: Codable, Hashable, Sendable {
+    public var path: String
+    public var mime: String
+}
+
 
 public struct OptionCard: Codable, Hashable, Sendable {
     public var title: String
@@ -37,6 +68,25 @@ public struct OptionCard: Codable, Hashable, Sendable {
     /// Permission cards carry a tool; questions do not.
     public var isPermission: Bool { tool != nil }
 
+    /// Whether the choices should be stacked full-width instead of laid
+    /// out as equal-width capsules in one row.  A permission card's
+    /// Allow/Deny pair always fits the row, so only questions stack — when
+    /// there are more than two choices, or any one of them is too long to
+    /// survive being squeezed into a share of the row.
+    public var prefersStackedChoices: Bool {
+        Self.prefersStackedChoices(options: options, isPermission: isPermission)
+    }
+
+    /// The longest choice a two-across capsule row can show before the
+    /// text is crushed past reading.
+    public static let stackedChoiceLength = 18
+
+    public static func prefersStackedChoices(options: [String], isPermission: Bool) -> Bool {
+        guard !isPermission else { return false }
+        if options.count > 2 { return true }
+        return options.contains { $0.count > stackedChoiceLength }
+    }
+
     /// The wire API accepts an approval behavior rather than the button's
     /// display text. Treat the one refusal as deny and every other offered
     /// permission choice as allow: providers may say "Approve", "Yes", or
@@ -58,12 +108,13 @@ public struct OptionCard: Codable, Hashable, Sendable {
             .caseInsensitiveCompare("Deny") == .orderedSame
     }
 
-    /// A provider may include the standing grant as an option of its own.
-    /// Only remember it when the server supplied the narrow grant key.
-    public func shouldRememberPermission(for choice: String) -> Bool {
-        guard isPermission, allowKey != nil else { return false }
+    /// A provider can call its positive choice "Always allow", but the paired
+    /// route supports only the current request.  Keep the provider's wire
+    /// choice for the response while giving every phone surface honest copy.
+    public func displayChoice(for choice: String) -> String {
+        guard isPermission else { return choice }
         let normalized = choice.trimmingCharacters(in: .whitespacesAndNewlines)
-        return normalized.caseInsensitiveCompare("Always allow") == .orderedSame
+        return normalized.caseInsensitiveCompare("Always allow") == .orderedSame ? "Allow once" : choice
     }
 }
 
@@ -74,6 +125,14 @@ public struct ToolActivity: Codable, Hashable, Sendable {
     public var spoken: String?
     /// Marks an error fixed by installing something, not by retrying.
     public var setup: Bool?
+    public var target: String?
+    public var kind: String?
+    public var detail: String?
+    public var durationMs: Int?
+    /// The harness id for this step.  A child step points at the step that
+    /// started it with `parentItemId`.
+    public var itemId: String? = nil
+    public var parentItemId: String? = nil
 }
 
 public struct Sender: Codable, Hashable, Sendable {
@@ -92,6 +151,13 @@ public struct CommChip: Codable, Hashable, Sendable {
     public var withBotId: String
     public var withName: String
     public var withColor: String
+}
+
+public struct MessageCommand: Codable, Hashable, Equatable, Sendable {
+    public var id: String
+    public var name: String
+    public var source: String
+    public var role: String
 }
 
 public struct Message: Codable, Hashable, Identifiable, Sendable {
@@ -117,6 +183,10 @@ public struct Message: Codable, Hashable, Identifiable, Sendable {
 
     public enum Role: String, Codable, Sendable {
         case bot, user
+        /// Auto-delivered instructions (routine, webhook, resource).  Never
+        /// a person typing.  Older phones that lack this case fall through
+        /// the decoder to `.bot`, which is left-aligned and not blue.
+        case system
 
         /// Same reasoning, and `bot` rather than a third case: an unplaceable
         /// message drawn as yours would be the phone claiming you said
@@ -132,6 +202,16 @@ public struct Message: Codable, Hashable, Identifiable, Sendable {
     public var kind: Kind
     public var at: Double
     public var text: String?
+    public var audio: [VoiceClip]?
+    public var recording: IncomingRecording?
+    public var recordingReview: RecordingReview?
+    public var translation: SavedTranslation?
+    /// For a `role == .system` message: what actually fired it —
+    /// "schedule", "manual", "webhook", or "resource". Raw string (not an
+    /// enum) so an older phone that predates a new trigger kind still
+    /// decodes the message; absent on rows persisted before this field
+    /// existed.
+    public var automationSource: String? = nil
     public var card: OptionCard?
     public var tool: ToolActivity?
     /// The message this one follows; nil at the thread root. Two messages
@@ -147,8 +227,67 @@ public struct Message: Codable, Hashable, Identifiable, Sendable {
     /// Screen messages in the full shape: base64 pixels, inline.
     public var png: String?
     public var mime: String?
+    /// Identity of a steer-queue entry. The 202 busy-send body carries this
+    /// as `queueId`; drain stamps the same value on the real user line so
+    /// the pending chip can retire. Absent on ordinary messages.
+    public var queueId: String? = nil
+    /// Client-only: this row is still waiting in the in-memory steer-queue
+    /// and has not been appended to the transcript yet.
+    public var queued: Bool? = nil
+    /// User line that landed inside a running turn (server `steered: true`).
+    /// Shown as the "Sent mid-turn" chip; distinct from the pending queue.
+    public var steered: Bool? = nil
+    /// Set when this row is an engine command, such as compacting the session.
+    public var command: MessageCommand? = nil
 
     public var date: Date { Date(timeIntervalSince1970: at / 1000) }
+}
+
+/// One send the phone is holding until the stream appends it.
+///
+/// Busy-bot 202 rows use `queued == true` and keep the clock chip.
+/// Ordinary sends use `queued == false` so the user's own bubble is on
+/// screen the moment they tap send, without claiming the steer-queue.
+public struct QueuedSend: Hashable, Sendable {
+    public var queueId: String
+    /// Wire prompt (`composeMessage`), shown on the pill and sent to the harness.
+    public var text: String
+    /// Composer text before attachment tags were folded in; used when editing
+    /// a queued line so markers are not duplicated on resend.
+    public var rawText: String?
+    /// Attachment chips the composer held at send time, restored on edit.
+    public var attachments: [PendingChatAttachment]
+    public var queued: Bool
+    /// Epoch milliseconds when the phone first showed this line.  Stamped
+    /// once at remember-time so `visibleTranscript` never remints "now" on
+    /// every re-render (which made stuck or slow-drain chips look newly sent).
+    public var at: Double
+
+    public init(
+        queueId: String,
+        text: String,
+        rawText: String? = nil,
+        attachments: [PendingChatAttachment] = [],
+        queued: Bool = true,
+        at: Double = Date().timeIntervalSince1970 * 1000
+    ) {
+        self.queueId = queueId
+        self.text = text
+        self.rawText = rawText
+        self.attachments = attachments
+        self.queued = queued
+        self.at = at
+    }
+}
+
+/// Body of `POST /api/bots/:id/messages`. A live send is `{ok:true}`; a
+/// busy bot is `{ok:true, queued:true, queueId, threadId}`.
+public struct SendMessageResult: Codable, Hashable, Sendable {
+    public var ok: Bool?
+    public var queued: Bool?
+    public var steered: Bool?
+    public var queueId: String?
+    public var threadId: String?
 }
 
 // MARK: - Bots and rooms
@@ -156,12 +295,62 @@ public struct Message: Codable, Hashable, Identifiable, Sendable {
 public struct ModelSelection: Codable, Hashable, Sendable {
     public var instanceId: String
     public var model: String
+    /// Kept as a string so a newer server's saved value still round-trips
+    /// through an older phone until the person explicitly changes it.
+    public var effort: String?
+    /// A model class this entry floats on ("Latest Sonnet" is `latest: "sonnet"`).
+    public var latest: String?
     public var fallbacks: [ModelSelection]?
 
-    public init(instanceId: String, model: String, fallbacks: [ModelSelection]? = nil) {
+    public init(
+        instanceId: String,
+        model: String,
+        effort: String? = nil,
+        latest: String? = nil,
+        fallbacks: [ModelSelection]? = nil
+    ) {
         self.instanceId = instanceId
         self.model = model
+        self.effort = effort
+        self.latest = latest
         self.fallbacks = fallbacks
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case instanceId
+        case model
+        case effort
+        case latest
+        case fallbacks
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.instanceId = try container.decode(String.self, forKey: .instanceId)
+        let rawModel = try container.decode(String.self, forKey: .model)
+        self.effort = try container.decodeIfPresent(String.self, forKey: .effort)
+        let rawLatest = try container.decodeIfPresent(String.self, forKey: .latest)
+        self.fallbacks = try container.decodeIfPresent([ModelSelection].self, forKey: .fallbacks)
+
+        if let rawLatest, !rawLatest.isEmpty {
+            self.latest = rawLatest
+            self.model = rawModel
+        } else if let alias = ModelLineage.detectAlias(from: rawModel) {
+            self.latest = alias
+            self.model = rawModel
+        } else {
+            self.latest = nil
+            self.model = rawModel
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(instanceId, forKey: .instanceId)
+        try container.encode(model, forKey: .model)
+        try container.encodeIfPresent(effort, forKey: .effort)
+        try container.encodeIfPresent(latest, forKey: .latest)
+        try container.encodeIfPresent(fallbacks, forKey: .fallbacks)
     }
 }
 
@@ -171,13 +360,46 @@ public struct TaskUsage: Codable, Hashable, Sendable {
     public var cachedInput: Int?
     public var costUsd: Double?
     public var turns: Int
+    /// Input tokens of the latest settled turn.  How full the window was.
+    public var lastInput: Int? = nil
+    /// Window size the engine reported with that turn, when it reported one.
+    public var contextWindow: Int? = nil
 }
 
 public struct BotTask: Codable, Hashable, Sendable {
     public var threadId: String
     public var title: String
     public var createdAt: Double
+    /// Last message in this task's thread. Absent on older harnesses.
+    public var lastActivity: Double?
+    public var lastMessage: Message?
     public var usage: TaskUsage?
+    /// `usage` split by the engine instance that ran each turn, with a
+    /// per-model split inside.  Decoded so that a bucket this build cannot read
+    /// costs that figure and never the bot (`UsageBuckets`).  Absent on older
+    /// harnesses.
+    public var usageByInstance: UsageBuckets?
+    public var modelSelection: ModelSelection?
+    public var activeModelSelection: ModelSelection?
+    /// Asleep until: `0` is the until-activity sentinel and sleeps until the
+    /// thread does anything again, a timestamp sleeps until that moment, and
+    /// nil means awake.  Expired deadlines heal against the harness clock,
+    /// so a snapshot is authoritative; a live frame is never refreshed
+    /// afterwards, which is why `isSnoozed` reads a clock too.  See
+    /// `shared/thread-snooze.ts`.
+    public var snoozedUntil: Double?
+
+    /// Asleep right now.  Narrower than the bot-wide snooze: the bot keeps
+    /// working its other threads while this one is quiet.
+    public func isSnoozed(now: Date = Date()) -> Bool {
+        ThreadSnooze.isSnoozed(snoozedUntil, now: now)
+    }
+
+    /// "Until activity" or the resolved deadline, for the badge under a
+    /// thread's title.  Nil while the thread is awake.
+    public func snoozeLabel(now: Date = Date()) -> String? {
+        ThreadSnooze.label(snoozedUntil, now: now)
+    }
 }
 
 public struct Bot: Codable, Hashable, Identifiable, Sendable {
@@ -195,30 +417,81 @@ public struct Bot: Codable, Hashable, Identifiable, Sendable {
     public var avatarCrop: AvatarCrop?
     public var unread: Bool
     public var modelSelection: ModelSelection
+    public var activeModelSelection: ModelSelection?
+    /// HTTP tool-loop ceiling. Nil uses `DEFAULT_MAX_TOOL_ROUNDS` (shared/bot-profile.ts).
+    /// Only a toolLoop engine honors it.
+    public var maxToolRounds: Int? = nil
     public var createdAt: Double
     public var busy: Bool?
     public var pinned: Bool?
     public var hidden: Bool?
+    /// The bot's On/Off switch (`shared/bot-power.ts`).  True means Off:
+    /// nothing new starts for it, but its chat stays readable and a turn
+    /// already running finishes.  Absent (older harnesses included) or false
+    /// means on.  The harness sends an explicit `false` after turning it on.
+    public var off: Bool?
     public var chiefOfStaff: Bool?
+    public var approvePeerComms: Bool?
+    public var section: String?
     public var autoApprove: Bool?
+    public var autoReview: String?
+    /// Auto-answers every request the engine raises, guards included, except
+    /// ones that control This Mac (`server/auto-approve.ts`).  Nil on a
+    /// harness that predates it, which reads as off.
+    public var bypassPermissions: Bool?
+    /// Bypass, extended to the requests that control This Mac.  Nil on a
+    /// harness that predates it, which reads as off.
+    public var bypassLocalComputer: Bool?
     public var alwaysAllow: [String]?
-    public var computer: String?
-    /// Which cloud computer backs `computer == "cloud"`. Absent (older
-    /// harnesses included) means the hosted Box; "vps" means the user's own
-    /// server, which has no interactive desktop to offer a phone.
+    public var composio: Bool?
+    /// Which computers this bot may run on: "local", "cloud", and/or "vm".
+    /// Absent means the harness predates multi-computer bots.
+    public var computers: [String]?
+    /// Which cloud computer backs a bot whose `computers` include "cloud".
+    /// Absent (older harnesses included) means the hosted Box; "vps" means
+    /// the user's own server, which has no interactive desktop to offer a
+    /// phone.
     public var cloudBackend: String?
+    /// The backend this bot really uses once the workspace default has filled
+    /// in for an unpinned one.  `cloudBackend` stays the raw stored value; this
+    /// is the answer the join route gives.  Absent on a harness that predates
+    /// it, where `cloudDesktopAvailability` falls back to `cloudBackend`.
+    public var effectiveCloudBackend: String?
+    public var autoStartVps: Bool?
+    public var cwd: String?
+    public var extraCwds: [String]?
+    public var userNotes: String?
     public var speakReplies: Bool?
+    public var speechDevices: [String]?
+    /// The shared voice.  Read it through `voice(for:)`, which applies the
+    /// per-device override in `voices`.
     public var voice: String?
+    /// Per-device overrides (`shared/bot-voice.ts`).  Nil on a harness that
+    /// predates them, and on the wire as `null` when neither device has one.
+    public var voices: BotVoices? = nil
     public var mascotExpression: String?
     public var tasks: [BotTask]?
+    /// Shared-room turns this bot spoke, banked per engine instance.  Room
+    /// threads are not bot tasks, so they cannot live on the task ledger; a
+    /// bot's usage total includes them (`UsageMath.botUsage`).
+    public var roomUsageByInstance: UsageBuckets?
     public var messages: [Message]?
     public var activeLeafId: String?
     /// Paged responses only: there is more transcript above what you got.
     public var hasMore: Bool?
+    /// The one message pinned above this bot's transcript.  Absent when
+    /// nothing is pinned, and on a harness that predates pins.  The id is not
+    /// checked against the transcript, so a pin whose message is gone simply
+    /// resolves to nothing (`BotOrganize.pinnedMessage`).
+    public var pinnedMessageId: String? = nil
+
+    /// Whether this bot is switched Off.  Total over a missing field, so a
+    /// payload from an older harness reads as on.
+    public var isOff: Bool { off == true }
 }
 
 public enum AvatarCrop: String, Codable, CaseIterable, Hashable, Sendable {
-    case mascot, circle, rounded, square
+    case mascot, tvface, circle, rounded, square
 
     /// The desktop may gain crop modes before this app updates. Falling back
     /// keeps the complete bot/fleet payload decodable and guarantees a safe,
@@ -237,6 +510,13 @@ public enum AvatarCrop: String, Codable, CaseIterable, Hashable, Sendable {
 public struct GroupResponder: Codable, Hashable, Sendable {
     public var kind: String
     public var botId: String?
+
+    // Memberwise initializers are internal to the module; the App target
+    // builds a responder from its picker state, so expose one publicly.
+    public init(kind: String, botId: String? = nil) {
+        self.kind = kind
+        self.botId = botId
+    }
 }
 
 public struct Room: Codable, Hashable, Identifiable, Sendable {
@@ -250,12 +530,27 @@ public struct Room: Codable, Hashable, Identifiable, Sendable {
     public var createdAt: Double
     public var dm: Bool?
     public var avatarUrl: String?
+    public var section: String?
     public var avatarCrop: AvatarCrop?
     public var cwd: String?
     public var extraCwds: [String]?
     public var busyBotId: String?
+    /// Covers the whole room operation, including setup and handoff windows
+    /// where no individual responder owns the provider turn yet.
+    public var working: Bool?
     public var messages: [Message]?
     public var hasMore: Bool?
+    /// Nested conversations in this channel. Absent on DMs and older harnesses.
+    public var tasks: [BotTask]?
+    /// The one message pinned above this room's transcript.  Absent when
+    /// nothing is pinned, and on a harness that predates pins.
+    public var pinnedMessageId: String? = nil
+
+    /// Older harnesses expose only `busyBotId`; current ones send `working`.
+    public var isWorking: Bool { working ?? (busyBotId != nil) }
+
+    /// Bot-to-bot DMs are not user rooms.  They belong under Bot Chats.
+    public var isBotToBot: Bool { dm == true }
 }
 
 // MARK: - Responses
@@ -303,6 +598,10 @@ public struct SearchHit: Codable, Hashable, Identifiable, Sendable {
     public var botId: String?
     public var groupId: String?
     public var name: String
+    /// Attribution for the hit (e.g. "Scheduled Run" for system/automation
+    /// starters).  Absent on older servers; Codable ignores unknown keys and
+    /// older clients ignore this field.
+    public var from: String?
     public var task: String?
     public var onActivePath: Bool
 
@@ -444,13 +743,56 @@ public struct ProviderSnapshot: Codable, Hashable, Sendable {
     public var reason: String?
     public var authenticated: Bool?
     public var version: String?
+    /// An optional integration nobody has set up (the ASCII.dev Box engine with
+    /// no Box token): the harness keeps it registered but out of every engine list.
+    public var hidden: Bool?
+    /// The probe gave no answer yet (a slow CLI on a busy Mac) and nothing
+    /// definitive stood in: the engine is being checked, not missing or signed out.
+    public var transient: Bool?
+    /// How the engine bills: `metered` (a charge to an API key) or
+    /// `subscription` (a flat plan, so a cost figure is an equivalent, not a
+    /// charge).  A raw string so a new mode from a newer harness still decodes.
+    /// Absent means the engine did not say.
+    public var billing: String?
 
     public var isAvailable: Bool { state == "available" }
+    public var isHidden: Bool { hidden == true }
+    public var isChecking: Bool { transient == true }
+
+    /// Phone Settings strip labels.  Mac owns setup, so these never deep-link
+    /// into key entry or a CLI path — they only say what is true right now.
+    public var engineStatusLabel: String {
+        // A probe still in flight is neither "Unavailable" nor "Sign in": say so.
+        if isChecking { return "Checking" }
+        if isAvailable, authenticated == false { return "Sign in" }
+        if !isAvailable { return "Unavailable" }
+        return "Ready"
+    }
+
+    /// Reserved for a structured missing-binary signal on `ProviderSnapshot`.
+    /// Claude/Codex currently map every `execCli` `--version` failure (timeout,
+    /// nonzero exit, ENOENT) to the same "`<cli>` CLI not found" reason, so
+    /// matching that text would mislabel installed-but-unresponsive CLIs as
+    /// "Not installed".  Until the wire format carries an unambiguous signal,
+    /// keep the general "Unavailable" label.
+    var isMissingBinary: Bool { false }
 }
 
 public struct ModelOption: Codable, Hashable, Identifiable, Sendable {
     public var id: String
     public var label: String
+    public var effortLevels: [String]?
+    public var supportsEffort: Bool?
+    /// Published window for this model, in tokens.  Absent when unknown.
+    public var contextWindow: Int? = nil
+
+    public init(id: String, label: String, effortLevels: [String]? = nil, supportsEffort: Bool? = nil, contextWindow: Int? = nil) {
+        self.id = id
+        self.label = label
+        self.effortLevels = effortLevels
+        self.supportsEffort = supportsEffort
+        self.contextWindow = contextWindow
+    }
 }
 
 public struct ModelCatalog: Codable, Hashable, Sendable {
@@ -458,32 +800,140 @@ public struct ModelCatalog: Codable, Hashable, Sendable {
     public var options: [ModelOption]
 }
 
+public struct InstanceCapabilities: Codable, Hashable, Sendable {
+    public var effortLevels: [String]?
+    /// True when this engine runs the harness HTTP tool loop.
+    public var toolLoop: Bool? = nil
+    /// True when this engine can answer a bounded review prompt, which is
+    /// what Auto Review needs.  Nil means the computer did not say.
+    public var approvalReview: Bool? = nil
+    /// True when this engine can contact other bots through the harness's
+    /// coordination tools.  A Chief of Staff needs it, so Make Chief Of Staff
+    /// stays off for any other engine, as on the desktop.  Nil means the
+    /// computer did not say, which reads as no.
+    public var agentsMcp: Bool? = nil
+    /// What a bot's Bypass Permissions switch does on this engine: "asks",
+    /// "native" or "none" (`shared/bypass-coverage.ts`).  Read it through
+    /// `BypassCoverage(wire:)`; nil is a computer that predates it.
+    public var bypassCoverage: String? = nil
+}
+
 public struct Instance: Codable, Hashable, Identifiable, Sendable {
     public var instanceId: String
     public var driverKind: String
     public var displayName: String?
+    /// Absent means enabled.  A false value is a Mac-side hide — the phone
+    /// strip only shows engines that are still on.
+    public var enabled: Bool?
     public var snapshot: ProviderSnapshot
     public var models: ModelCatalog
+    public var capabilities: InstanceCapabilities?
 
     public var id: String { instanceId }
+
+    public var isEnabled: Bool { enabled != false }
+
+    /// A user-facing engine name: the Mac-side display name when set,
+    /// otherwise the provider name for its driver — never the raw instance id.
+    public var settingsDisplayName: String {
+        if let name = displayName?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty {
+            return name
+        }
+        switch driverKind {
+        case "dsh", "dshAgent": return "Clutch"
+        case "mcode", "mcodeAgent": return "MiniMax Code"
+        case "deepseek", "deepseekAgent": return "DeepSeek"
+        case "claude", "claudeAgent": return "Claude"
+        case "grok", "grokAgent": return "Grok"
+        case "codex": return "Codex"
+        case "antigravity", "antigravityAgent": return "Antigravity"
+        case "cursor", "cursorAgent": return "Cursor"
+        case "minimax", "minimaxAgent": return "MiniMax"
+        case "kimi": return "Kimi"
+        case "droid": return "Droid"
+        case "qwenAgent": return "Qwen"
+        case "opencodeGo": return "OpenCode Go"
+        case "hermesAgent": return "Hermes"
+        case "piAgent": return "Pi"
+        case "grok-bot": return "Grok Bot"
+        case "boxAgent": return "ASCII.dev Box"
+        case "openai-compat", "openai": return "OpenAI"
+        case "gemini", "geminiAgent": return "Gemini"
+        default: return displayName ?? instanceId
+        }
+    }
+
+    public func effortLevels(for modelId: String) -> [String] {
+        guard let engineLevels = capabilities?.effortLevels, !engineLevels.isEmpty else {
+            return []
+        }
+        let option = models.options.first(where: { $0.id == modelId })
+        if let optionLevels = option?.effortLevels {
+            return optionLevels
+        }
+        if option?.supportsEffort == false {
+            return []
+        }
+        let lowerModel = modelId.lowercased()
+        let lowerDriver = driverKind.lowercased()
+        if (lowerDriver.contains("dsh") || lowerDriver.contains("deepseek")) && lowerModel.contains("minimax") {
+            return []
+        }
+        if lowerDriver.contains("claude") && lowerModel.contains("haiku") {
+            return []
+        }
+        if lowerDriver.contains("codex") {
+            if lowerModel.hasPrefix("gpt-4o") || lowerModel.hasPrefix("gpt-4-") || lowerModel == "gpt-4" || lowerModel.hasPrefix("gpt-3.5") || lowerModel.contains("chatgpt-4o") {
+                return []
+            }
+        }
+        return engineLevels
+    }
 }
 
 public struct InstanceList: Codable, Sendable {
     public var instances: [Instance]
+    /// When the harness's describe finished; a later push or fetch with a smaller
+    /// value is older than what the phone already holds.
+    public var describedAt: Double?
 }
 
 /// Which engine actually speaks — `VoiceProvider` in `server/tts/index.ts`.
 /// Derived from `ConfigFlag.provider`, never decoded straight off the wire.
 public enum VoiceProvider: Hashable, Sendable {
+    case minimax
     case elevenlabs
     case system
+    case personal
+    /// A provider this phone build does not know yet. Keep its setup copy
+    /// generic rather than sending the person toward the wrong credential.
+    case unknown
+}
+
+/// One entry of the workspace pronunciation list (`shared/pronunciations.ts`):
+/// a term the voice keeps saying wrong, and how to say it.
+public struct Pronunciation: Codable, Hashable, Sendable, Identifiable {
+    public var term: String
+    public var say: String
+
+    public var id: String { term.lowercased() }
+
+    public init(term: String, say: String) {
+        self.term = term
+        self.say = say
+    }
 }
 
 public struct ConfigFlag: Codable, Hashable, Sendable {
     public var configured: Bool
     public var apiKeyConfigured: Bool?
     public var ready: Bool?
+    /// On the `tts` section: the workspace default voice id, what every bot
+    /// without a voice of its own speaks with.  Empty or absent is none.
     public var voice: String?
+    /// On the `tts` section: the pronunciation list in force, the seeded
+    /// defaults included.  Absent from a computer older than the list.
+    public var pronunciations: [Pronunciation]?
     /// The voice engine, absent on a computer that predates the choice. Read
     /// it through `ConfigStatus.voiceProvider`, which applies the server's own
     /// fallback; nothing should compare this string directly.
@@ -495,12 +945,163 @@ public struct Profile: Codable, Hashable, Sendable {
     public var email: String
 }
 
+/// What this person calls a room, in both forms.  The harness resolves the
+/// pair — including a custom word — so the phone never has to guess a plural.
+public struct RoomLabels: Codable, Hashable, Sendable {
+    public var singular: String
+    public var plural: String
+
+    public init(singular: String, plural: String) {
+        self.singular = singular
+        self.plural = plural
+    }
+}
+
+public struct ConfigFeatures: Codable, Hashable, Sendable {
+    public var skillRecorder: Bool?
+    public var showToolCalls: Bool?
+    public var summarizeToolCalls: Bool?
+
+    /// Matches `showToolCallsEnabled` on the Mac: on unless explicitly off.
+    public var showsToolCalls: Bool { showToolCalls != false }
+
+    /// Matches `summarizeToolCallsEnabled` on the Mac: on unless explicitly off.
+    public var summarizesToolCalls: Bool { summarizeToolCalls != false }
+}
+
+public struct ConfigRooms: Codable, Hashable, Sendable {
+    public var turnTimeoutMinutes: Int?
+}
+
+/// Which speech-to-speech providers a computer can reach.
+///
+/// Booleans and a choice, never a key: the permanent provider credentials
+/// stay on the computer, which mints a short-lived token instead.  Every
+/// field is optional because every one of them is absent on a computer too
+/// old to have the route, and "I do not know" has to stay distinguishable
+/// from "no key" — the first sends you to Settings, the second does not.
+public struct StsStatus: Codable, Sendable {
+    public var xai: Bool?
+    public var gemini: Bool?
+    /// The provider a call would actually use, after the user's preference
+    /// and the auto fallback have both been applied on the computer.
+    public var provider: String?
+
+    public init(xai: Bool? = nil, gemini: Bool? = nil, provider: String? = nil) {
+        self.xai = xai
+        self.gemini = gemini
+        self.provider = provider
+    }
+
+    /// False only when the computer said so.  `nil` is "unknown", and an
+    /// unknown must not be drawn as "no" — that would tell someone to add a
+    /// key they already have.
+    public func isConfigured(_ candidate: String) -> Bool? {
+        switch candidate {
+        case "xai": return xai
+        case "gemini": return gemini
+        default: return nil
+        }
+    }
+
+    /// Whether the computer told us anything at all.
+    public var isKnown: Bool { xai != nil || gemini != nil }
+
+    /// The provider to use, or nil when none is configured.  Mirrors the
+    /// computer's own `pickStsProvider` so the phone's idea and the computer's
+    /// cannot disagree about which one a call would take.
+    public var usableProvider: String? {
+        guard isKnown else { return nil }
+        if let provider, isConfigured(provider) == true { return provider }
+        if xai == true { return "xai" }
+        if gemini == true { return "gemini" }
+        return nil
+    }
+}
+
+/// One short-lived, single-session call token.  Spent opening a realtime
+/// session; it is not a credential for anything else, and it is not the
+/// provider's permanent key.
+public struct StsSessionToken: Codable, Sendable {
+    public var token: String
+    public var expiresInSeconds: Int
+
+    public init(token: String, expiresInSeconds: Int) {
+        self.token = token
+        self.expiresInSeconds = expiresInSeconds
+    }
+}
+
 public struct ConfigStatus: Codable, Sendable {
     public var composio: ConfigFlag?
     public var box: ConfigFlag?
     public var tts: ConfigFlag?
     public var imageGen: ConfigFlag?
     public var profile: Profile?
+    public var features: ConfigFeatures?
+    public var rooms: ConfigRooms?
+    public var terminology: String?
+    /// The finished words, resolved by the harness so every client agrees.
+    /// Absent only when talking to a harness older than this feature.
+    public var roomLabels: RoomLabels?
+    /// `simple` or `projects`.  Absent means simple.  A leftover `fleet`
+    /// value is treated as projects.
+    public var conversationMode: String?
+    /// `queue` or `steer`.  Absent means steer-first (legacy harness behavior).
+    public var busySendDefault: String?
+    public var sidebarSectionOrder: [String]?
+    /// Enable Automatic Update Checks.  Absent on a harness that predates
+    /// the desktop updater, which is not the same as off.
+    public var autoUpdate: ConfigAutoUpdate?
+
+    public var isProjectsMode: Bool {
+        let raw = conversationMode?.lowercased()
+        return raw == "projects" || raw == "fleet"
+    }
+
+    public var allowsMultipleBotThreads: Bool { isProjectsMode }
+
+    public var primarySingular: String { isProjectsMode ? "Thread" : "Bot" }
+    public var primaryPlural: String { isProjectsMode ? "Threads" : "Bots" }
+    /// The create control always mints a bot record, even in projects mode
+    /// where that bot is painted as a thread.  It names what it makes.
+    public var newPrimaryLabel: String { "New Bot" }
+
+    public var roomTerminologyLabel: String {
+        roomLabels?.singular ?? Self.presetLabels(terminology).singular
+    }
+
+    public var roomTerminologyPlural: String {
+        roomLabels?.plural ?? Self.presetLabels(terminology).plural
+    }
+
+    /// The singular room word for the middle of a sentence ("move to another
+    /// channel").  Mirrors `lowerRoomLabels` in shared/terminology.ts, which the
+    /// Mac uses:  a custom label that is an acronym, such as HUB, keeps its
+    /// capitals, and any other word loses only the capital of its first letter.
+    public var roomTerminologyLabelLowered: String {
+        Self.loweredRoomWord(roomTerminologyLabel)
+    }
+
+    static func loweredRoomWord(_ word: String) -> String {
+        let letters = word.filter { $0.isASCII && $0.isLetter }
+        if letters.count > 1, letters == letters.uppercased() { return word }
+        guard let first = word.first else { return word }
+        return first.lowercased() + word.dropFirst()
+    }
+
+    /// The fallback for an older harness that sends only the key.  A word it
+    /// has never heard of still renders as Channels rather than as nothing.
+    static func presetLabels(_ terminology: String?) -> RoomLabels {
+        switch terminology?.lowercased() {
+        case "groups": return RoomLabels(singular: "Group", plural: "Groups")
+        case "projects": return RoomLabels(singular: "Project", plural: "Projects")
+        case "apps": return RoomLabels(singular: "App", plural: "Apps")
+        case "topics": return RoomLabels(singular: "Topic", plural: "Topics")
+        case "repos": return RoomLabels(singular: "Repo", plural: "Repos")
+        default: return RoomLabels(singular: "Channel", plural: "Channels")
+        }
+    }
 
     /// Whether synthesis is available on the paired computer. Deliberately
     /// provider-neutral: under ElevenLabs this is a key on file, while under
@@ -519,19 +1120,33 @@ public struct ConfigStatus: Codable, Sendable {
         !(tts?.voice?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
     }
 
+    /// The workspace default voice id, or "" when none is picked.
+    public var workspaceDefaultVoice: String { hasWorkspaceDefaultVoice ? (tts?.voice ?? "") : "" }
+
+    /// The pronunciation list in force, or nil from a computer that predates
+    /// it (the list cannot be edited there).
+    public var pronunciations: [Pronunciation]? { tts?.pronunciations }
+
     public func canSpeak(agentVoice: String?) -> Bool {
+        if PersonalVoiceContract.isPersonalVoice(agentVoice) {
+            return true
+        }
         let hasAgentVoice = !(agentVoice?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
         return isTTSConfigured && (hasAgentVoice || hasWorkspaceDefaultVoice)
     }
 
-    /// `voiceProvider(cfg)` in `server/tts/index.ts`: only the exact string
-    /// `"system"` selects the built-in engine. A missing field — a computer
-    /// older than the choice — and an engine this build has never heard of
-    /// both fall back to ElevenLabs, which is the server's own rule and what
-    /// keeps an unrecognised engine from being explained to the user with
-    /// copy written for a different one.
+    /// Mirrors `voiceProvider(cfg)` in `server/tts/index.ts`: a missing
+    /// provider is MiniMax because that is the server default. Known values
+    /// get provider-specific setup copy; an engine this phone build has never
+    /// heard of stays unknown rather than borrowing another provider's copy.
     public var voiceProvider: VoiceProvider {
-        tts?.provider == "system" ? .system : .elevenlabs
+        switch tts?.provider {
+        case nil, "minimax": return .minimax
+        case "elevenlabs": return .elevenlabs
+        case "system": return .system
+        case "personal", "apple-personal": return .personal
+        default: return .unknown
+        }
     }
 }
 
@@ -548,8 +1163,26 @@ public struct BotProfilePatch: Encodable, Sendable {
     public var avatarUrl: AvatarURL?
     public var avatarCrop: AvatarCrop?
     public var voice: String?
+    /// Per-device voice overrides.  Only the device keys it carries are sent;
+    /// the type cannot express `voices: null`, which would clear both.
+    public var voices: VoicesPatch?
     public var speakReplies: Bool?
+    public var speechDevices: [String]?
     public var modelSelection: ModelSelection?
+    public var section: SectionString?
+    /// `nil` leaves the stored ceiling alone. `.clear` sends JSON null so the
+    /// harness drops it and the turn uses the shared default.
+    public var maxToolRounds: MaxToolRounds?
+
+    public enum MaxToolRounds: Equatable, Sendable {
+        case set(Int)
+        case clear
+    }
+
+    public enum SectionString: Equatable, Sendable {
+        case set(String)
+        case clear
+    }
 
     /// `avatarUrl` needs three wire states: omitted, a stored path, or JSON
     /// null to clear. A nested optional would technically represent that, but
@@ -557,6 +1190,70 @@ public struct BotProfilePatch: Encodable, Sendable {
     public enum AvatarURL: Equatable, Sendable {
         case set(String)
         case clear
+    }
+
+    /// The execution policy, which the owner put on the phone on 2026-10-09
+    /// (`companion/src/routes.ts`; #323 had kept it on the computer).  Each is
+    /// sent only when the person changed it.  The computer still refuses to
+    /// turn `autoApprove` or `bypassPermissions` ON for a bot that can use This
+    /// Mac (a 403 with its own sentence), so the sheet does not offer that.
+    public var autoApprove: Bool?
+    public var autoReview: AutoReviewMode?
+    public var approvePeerComms: Bool?
+    public var bypassPermissions: Bool?
+    /// The owner's second switch, 2026-10-14.  Bypass alone stops at the edge
+    /// of the real desktop, which made it weaker than Auto Mode.  The computer
+    /// refuses to turn THIS one on from the phone for a bot that can use This
+    /// Mac, exactly as it refuses Auto Mode, so the sheet does not offer it.
+    public var bypassLocalComputer: Bool?
+    /// `BotComputers.updated` builds this: the sandboxed destinations only,
+    /// with This Mac carried through as the computer has it.
+    public var computers: [String]?
+    /// A folder on the computer.  The harness confines it from a phone to
+    /// folders a bot or room there already uses, and answers 403 otherwise.
+    public var cwd: CwdString?
+    /// The On/Off switch.  `nil` leaves it alone, like every other field, so a
+    /// profile save that never touched it cannot flip a bot another device just
+    /// turned off.
+    public var off: Bool?
+
+    public enum CwdString: Equatable, Sendable {
+        case set(String)
+        case clear
+    }
+
+    /// One device's voice override: a voice id, or `.clear` (JSON null) to go
+    /// back to the bot's shared voice.  A device left nil is not sent.
+    public struct VoicesPatch: Equatable, Sendable {
+        public enum Value: Equatable, Sendable {
+            case set(String)
+            case clear
+        }
+
+        public var mac: Value?
+        public var iphone: Value?
+
+        public init(mac: Value? = nil, iphone: Value? = nil) {
+            self.mac = mac
+            self.iphone = iphone
+        }
+
+        public var isEmpty: Bool { mac == nil && iphone == nil }
+
+        public subscript(device: SpeechDevice) -> Value? {
+            get {
+                switch device {
+                case .mac: return mac
+                case .iphone: return iphone
+                }
+            }
+            set {
+                switch device {
+                case .mac: mac = newValue
+                case .iphone: iphone = newValue
+                }
+            }
+        }
     }
 
     public init(
@@ -567,8 +1264,20 @@ public struct BotProfilePatch: Encodable, Sendable {
         avatarUrl: AvatarURL? = nil,
         avatarCrop: AvatarCrop? = nil,
         voice: String? = nil,
+        voices: VoicesPatch? = nil,
         speakReplies: Bool? = nil,
-        modelSelection: ModelSelection? = nil
+        speechDevices: [String]? = nil,
+        modelSelection: ModelSelection? = nil,
+        section: SectionString? = nil,
+        maxToolRounds: MaxToolRounds? = nil,
+        autoApprove: Bool? = nil,
+        autoReview: AutoReviewMode? = nil,
+        approvePeerComms: Bool? = nil,
+        bypassPermissions: Bool? = nil,
+        bypassLocalComputer: Bool? = nil,
+        computers: [String]? = nil,
+        cwd: CwdString? = nil,
+        off: Bool? = nil
     ) {
         self.name = name
         self.title = title
@@ -577,13 +1286,27 @@ public struct BotProfilePatch: Encodable, Sendable {
         self.avatarUrl = avatarUrl
         self.avatarCrop = avatarCrop
         self.voice = voice
+        self.voices = voices
         self.speakReplies = speakReplies
+        self.speechDevices = speechDevices
         self.modelSelection = modelSelection
+        self.section = section
+        self.maxToolRounds = maxToolRounds
+        self.autoApprove = autoApprove
+        self.autoReview = autoReview
+        self.approvePeerComms = approvePeerComms
+        self.bypassPermissions = bypassPermissions
+        self.bypassLocalComputer = bypassLocalComputer
+        self.computers = computers
+        self.cwd = cwd
+        self.off = off
     }
 
     private enum CodingKeys: String, CodingKey {
-        case name, title, description, notifications, avatarUrl, avatarCrop, voice, speakReplies, modelSelection
+        case name, title, description, notifications, avatarUrl, avatarCrop, voice, voices, speakReplies, speechDevices, modelSelection, section, maxToolRounds, autoApprove, autoReview, approvePeerComms, bypassPermissions, bypassLocalComputer, computers, cwd, off
     }
+
+    private enum DeviceKeys: String, CodingKey { case mac, iphone }
 
     public func encode(to encoder: Encoder) throws {
         var values = encoder.container(keyedBy: CodingKeys.self)
@@ -599,8 +1322,44 @@ public struct BotProfilePatch: Encodable, Sendable {
         }
         try values.encodeIfPresent(avatarCrop, forKey: .avatarCrop)
         try values.encodeIfPresent(voice, forKey: .voice)
+        if let voices, !voices.isEmpty {
+            var devices = values.nestedContainer(keyedBy: DeviceKeys.self, forKey: .voices)
+            for (device, key) in [(SpeechDevice.mac, DeviceKeys.mac), (.iphone, .iphone)] {
+                switch voices[device] {
+                case let .set(id)?: try devices.encode(id, forKey: key)
+                case .clear?: try devices.encodeNil(forKey: key)
+                case nil: break
+                }
+            }
+        }
         try values.encodeIfPresent(speakReplies, forKey: .speakReplies)
+        try values.encodeIfPresent(speechDevices, forKey: .speechDevices)
         try values.encodeIfPresent(modelSelection, forKey: .modelSelection)
+        if let section {
+            switch section {
+            case let .set(val): try values.encode(val, forKey: .section)
+            case .clear: try values.encodeNil(forKey: .section)
+            }
+        }
+        if let maxToolRounds {
+            switch maxToolRounds {
+            case let .set(rounds): try values.encode(rounds, forKey: .maxToolRounds)
+            case .clear: try values.encodeNil(forKey: .maxToolRounds)
+            }
+        }
+        try values.encodeIfPresent(autoApprove, forKey: .autoApprove)
+        try values.encodeIfPresent(autoReview?.rawValue, forKey: .autoReview)
+        try values.encodeIfPresent(approvePeerComms, forKey: .approvePeerComms)
+        try values.encodeIfPresent(bypassPermissions, forKey: .bypassPermissions)
+        try values.encodeIfPresent(bypassLocalComputer, forKey: .bypassLocalComputer)
+        try values.encodeIfPresent(computers, forKey: .computers)
+        try values.encodeIfPresent(off, forKey: .off)
+        if let cwd {
+            switch cwd {
+            case let .set(val): try values.encode(val, forKey: .cwd)
+            case .clear: try values.encodeNil(forKey: .cwd)
+            }
+        }
     }
 }
 
@@ -608,6 +1367,14 @@ public struct Voice: Codable, Hashable, Identifiable, Sendable {
     public var id: String
     public var label: String
     public var description: String?
+    public var isPersonalVoice: Bool?
+
+    public init(id: String, label: String, description: String? = nil, isPersonalVoice: Bool? = nil) {
+        self.id = id
+        self.label = label
+        self.description = description
+        self.isPersonalVoice = isPersonalVoice
+    }
 }
 
 public struct RoutineSchedule: Codable, Hashable, Sendable {
@@ -631,14 +1398,64 @@ public struct RoutineSchedule: Codable, Hashable, Sendable {
     public var at: Double?
     public var time: String?
     public var weekdays: [Int]?
+    public var timeZone: String?
+
+    public init(
+        type: Kind,
+        at: Double? = nil,
+        time: String? = nil,
+        weekdays: [Int]? = nil,
+        timeZone: String? = nil
+    ) {
+        self.type = type
+        self.at = at
+        self.time = time
+        self.weekdays = weekdays
+        self.timeZone = timeZone
+    }
 
     public static func once(at: Date) -> Self {
-        .init(type: .once, at: at.timeIntervalSince1970 * 1_000, time: nil, weekdays: nil)
+        .init(type: .once, at: at.timeIntervalSince1970 * 1_000)
     }
 
-    public static func daily(time: String, weekdays: [Int]) -> Self {
-        .init(type: .daily, at: nil, time: time, weekdays: weekdays)
+    public static func daily(time: String, weekdays: [Int], timeZone: String? = nil) -> Self {
+        .init(type: .daily, time: time, weekdays: weekdays, timeZone: timeZone)
     }
+}
+
+public func routineEditorTimeDate(_ value: String?, in timeZone: TimeZone) -> Date {
+    let parts = (value ?? "09:00").split(separator: ":").compactMap { Int($0) }
+    var calendar = Calendar(identifier: .gregorian)
+    calendar.timeZone = timeZone
+    // A time-only picker needs an arbitrary backing day.  Using today can
+    // normalize a stored 02:30 to 03:00 on a spring-forward day and an
+    // untouched save then changes every future occurrence.
+    let components = DateComponents(
+        timeZone: timeZone,
+        year: 2001,
+        month: 1,
+        day: 15,
+        hour: parts.first ?? 9,
+        minute: parts.count > 1 ? parts[1] : 0,
+        second: 0
+    )
+    return calendar.date(from: components) ?? Date(timeIntervalSince1970: 978_307_200)
+}
+
+public func routineTimeZoneForUpdate(
+    effectiveTimeZone: String?,
+    source: String?,
+    existingScheduleType: RoutineSchedule.Kind?
+) -> String? {
+    source == "host" && existingScheduleType == .daily ? nil : effectiveTimeZone
+}
+
+public func routineEditorTimeZoneIdentifier(
+    effectiveTimeZone: String?,
+    existingScheduleType: RoutineSchedule.Kind?,
+    currentTimeZone: TimeZone = .current
+) -> String? {
+    effectiveTimeZone ?? (existingScheduleType == .daily ? nil : currentTimeZone.identifier)
 }
 
 public struct Routine: Codable, Hashable, Identifiable, Sendable {
@@ -649,6 +1466,7 @@ public struct Routine: Codable, Hashable, Identifiable, Sendable {
     public var runOn: String
     public var enabled: Bool
     public var schedule: RoutineSchedule
+    public var scheduleTimeZoneSource: String? = nil
     public var durationMinutes: Int
     public var nextRunAt: Double?
     public var createdAt: Double
@@ -674,6 +1492,20 @@ public struct RoutineRun: Codable, Hashable, Identifiable, Sendable {
     public var error: String?
     public var createdAt: Double
     public var seenAt: Double?
+
+    /// Runs the harness will still stop.  Mirrors `cancelRun` in
+    /// server/routines.ts and the desktop's "Cancel Run" button, so a run
+    /// that has already settled never shows a button that answers 404.
+    public var canCancel: Bool {
+        status == "queued" || status == "running" || status == "waiting"
+    }
+
+    /// Failures that raise the badge until someone acknowledges them
+    /// (`ROUTINE_ATTENTION_STATUSES` in shared/routine-outcomes.ts), and have
+    /// not been yet.
+    public var needsAcknowledgement: Bool {
+        (status == "failed" || status == "missed") && seenAt == nil
+    }
 }
 
 public struct RoutineInput: Encodable, Sendable {
@@ -686,7 +1518,7 @@ public struct RoutineInput: Encodable, Sendable {
     public var durationMinutes: Int
 
     public init(
-        name: String, prompt: String, botId: String, runOn: String = "maus",
+        name: String, prompt: String, botId: String, runOn: String = "bot",
         enabled: Bool? = nil, schedule: RoutineSchedule, durationMinutes: Int = 30
     ) {
         self.name = name
@@ -700,8 +1532,26 @@ public struct RoutineInput: Encodable, Sendable {
 }
 
 public enum RoutineRunLocation: String, CaseIterable, Codable, Hashable, Sendable {
-    case maus
+    case bot
     case cloud
+
+    public init?(rawValue: String) {
+        switch rawValue {
+        case "bot", "maus": self = .bot
+        case "cloud": self = .cloud
+        default: return nil
+        }
+    }
+
+    public init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = RoutineRunLocation(rawValue: raw) ?? .bot
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
 }
 
 /// Desktop-equivalent run-location availability, derived only from paired-safe
@@ -722,13 +1572,13 @@ public struct RoutineRunAvailability: Equatable, Sendable {
     public var cloudReady: Bool { cloudConfigured && cloudInstanceAvailable }
 
     public func canSelect(_ location: RoutineRunLocation, preserving current: RoutineRunLocation) -> Bool {
-        location == .maus || cloudReady || current == .cloud
+        location == .bot || cloudReady || current == .cloud
     }
 }
 
 public extension Routine {
     var runLocation: RoutineRunLocation {
-        RoutineRunLocation(rawValue: runOn) ?? .maus
+        RoutineRunLocation(rawValue: runOn) ?? .bot
     }
 
     /// Mirrors the desktop `canToggleRoutine` policy. A one-time routine has
@@ -748,18 +1598,48 @@ public extension Routine {
 public struct NotificationTarget: Equatable, Sendable {
     public let botId: String
     public let threadId: String
+    /// The pending request this notification answers, when the harness sent
+    /// one (see `NotificationFrame.requestId`).  Nil for an older harness,
+    /// or for a notification that never carried one to begin with.
+    public let requestId: String?
+    /// approval · question · done · routine-failed — carried through so
+    /// Approve/Deny can tell a permission card from a free-text question
+    /// without a network round trip.
+    public let kind: String?
 
-    public init?(botId: String?, threadId: String?) {
+    public init?(botId: String?, threadId: String?, requestId: String? = nil, kind: String? = nil) {
         guard let botId, let threadId,
               !botId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               !threadId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         else { return nil }
         self.botId = botId
         self.threadId = threadId
+        self.requestId = requestId?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ? requestId : nil
+        self.kind = kind
     }
 
     public init?(payload: [String: String]) {
         self.init(botId: payload["botId"], threadId: payload["threadId"])
+    }
+
+    /// Local banners store flat string keys.  APNs also nests `thread-id`
+    /// under `aps`.  Either shape must open the same bot and task — and,
+    /// when present, answer the same pending request.
+    public static func fromRemoteUserInfo(_ userInfo: [AnyHashable: Any]) -> NotificationTarget? {
+        func string(from value: Any?) -> String? {
+            guard let value = value as? String else { return nil }
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        let botId = string(from: userInfo["botId"])
+        let nested = userInfo["aps"] as? [AnyHashable: Any]
+        let threadId = string(from: userInfo["threadId"]) ?? string(from: nested?["thread-id"])
+        return NotificationTarget(
+            botId: botId,
+            threadId: threadId,
+            requestId: string(from: userInfo["requestId"]),
+            kind: string(from: userInfo["kind"])
+        )
     }
 
     public func requiresTaskSwitch(activeThreadId: String) -> Bool {
@@ -811,21 +1691,19 @@ public struct ConnectorStatuses: Codable, Sendable {
     /// field. Read it through `isAuthoritative`; nothing should compare it
     /// directly.
     public var credentialStore: String?
+    /// Explicit inventory authority from current servers.  Older computers
+    /// omit it; then `credentialStore` is the only signal.
+    public var authoritative: Bool?
 
     /// Whether `services` is an inventory or an admission of ignorance.
     ///
-    /// `server/index.ts` answers an unreadable Composio credential store with
-    /// an empty map *and* `credentialStore: "unavailable"`, because failing to
-    /// read the store means we do not know what is connected — which is not
-    /// the same as knowing nothing is. An empty map arriving that way must
-    /// never be shown as "nothing is connected": every account may still be
-    /// live on the computer.
-    ///
-    /// Only that exact string withdraws the claim. `"ok"` is authoritative,
-    /// and so is a missing field — a computer old enough not to send it would
-    /// otherwise have every answer treated as unknowable.
+    /// Current servers send `authoritative: false` on a 200 when the
+    /// credential is pending or an upstream check failed.  Those must not
+    /// replace a previously verified list.  Older computers omit the field;
+    /// then only `credentialStore == "unavailable"` withdraws the claim.
     public var isAuthoritative: Bool {
-        credentialStore != "unavailable"
+        if let authoritative { return authoritative }
+        return credentialStore != "unavailable"
     }
 }
 
@@ -879,10 +1757,10 @@ struct VoiceListResponse: Codable, Sendable {
     var error: String?
 }
 
-struct AttachmentResponse: Codable, Sendable {
-    var path: String
-    var mime: String
-    var bytes: Int
+public struct AttachmentResponse: Codable, Sendable {
+    public var path: String
+    public var mime: String
+    public var bytes: Int
 }
 
 struct GeneratedAvatarResponse: Codable, Sendable {
@@ -897,6 +1775,7 @@ struct RoutinesResponse: Codable, Sendable {
 
 struct RoutineResponse: Codable, Sendable { var routine: Routine }
 struct RoutineRunResponse: Codable, Sendable { var run: RoutineRun }
+struct MarkedRoutineRunsResponse: Codable, Sendable { var acknowledged: Int?; var runs: [RoutineRun] }
 
 struct ConnectorAuthorizationResponse: Codable, Sendable {
     var url: String
@@ -909,6 +1788,12 @@ public struct RoomPatch: Encodable, Sendable {
     public var avatarCrop: AvatarCrop?
     public var cwd: String?
     public var extraCwds: [String]?
+    public var defaultResponder: GroupResponder?
+    public var memberIds: [String]?
+    public var section: BotProfilePatch.SectionString?
+    /// Pin Message.  `nil` leaves the pin alone, `.set` pins that message,
+    /// and `.clear` sends JSON null, which unpins.
+    public var pinnedMessageId: MessagePin?
 
     public init(
         name: String? = nil,
@@ -916,7 +1801,11 @@ public struct RoomPatch: Encodable, Sendable {
         avatarUrl: BotProfilePatch.AvatarURL? = nil,
         avatarCrop: AvatarCrop? = nil,
         cwd: String? = nil,
-        extraCwds: [String]? = nil
+        extraCwds: [String]? = nil,
+        defaultResponder: GroupResponder? = nil,
+        memberIds: [String]? = nil,
+        section: BotProfilePatch.SectionString? = nil,
+        pinnedMessageId: MessagePin? = nil
     ) {
         self.name = name
         self.bulletin = bulletin
@@ -924,10 +1813,15 @@ public struct RoomPatch: Encodable, Sendable {
         self.avatarCrop = avatarCrop
         self.cwd = cwd
         self.extraCwds = extraCwds
+        self.defaultResponder = defaultResponder
+        self.memberIds = memberIds
+        self.section = section
+        self.pinnedMessageId = pinnedMessageId
     }
 
     private enum CodingKeys: String, CodingKey {
-        case name, bulletin, avatarUrl, avatarCrop, cwd, extraCwds
+        case name, bulletin, avatarUrl, avatarCrop, cwd, extraCwds, defaultResponder, memberIds, section
+        case pinnedMessageId
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -943,5 +1837,412 @@ public struct RoomPatch: Encodable, Sendable {
         try values.encodeIfPresent(avatarCrop, forKey: .avatarCrop)
         try values.encodeIfPresent(cwd, forKey: .cwd)
         try values.encodeIfPresent(extraCwds, forKey: .extraCwds)
+        try values.encodeIfPresent(defaultResponder, forKey: .defaultResponder)
+        try values.encodeIfPresent(memberIds, forKey: .memberIds)
+        if let section {
+            switch section {
+            case let .set(val): try values.encode(val, forKey: .section)
+            case .clear: try values.encodeNil(forKey: .section)
+            }
+        }
+        if let pinnedMessageId {
+            switch pinnedMessageId {
+            case let .set(id): try values.encode(id, forKey: .pinnedMessageId)
+            case .clear: try values.encodeNil(forKey: .pinnedMessageId)
+            }
+        }
     }
+}
+
+// MARK: - Mac update
+//
+// `GET/POST /api/update/*` on the harness — a companion-only view onto the
+// same on-demand transaction `scripts/update-botfleet-mac.mjs` runs from the
+// desktop.  The phone never drives the transaction directly; it only reads
+// this status and asks the harness to check or run it.
+
+/// The Mac's own running build, as the harness sees it right now.
+public struct MacInstalledBuild: Codable, Hashable, Sendable {
+    /// Absent on a harness that predates version stamping — a short commit
+    /// is still worth showing when there is no marketing version to pair it with.
+    public var version: String?
+    public var sourceCommit: String
+    public var installedAt: String?
+
+    public init(version: String? = nil, sourceCommit: String, installedAt: String? = nil) {
+        self.version = version
+        self.sourceCommit = sourceCommit
+        self.installedAt = installedAt
+    }
+}
+
+/// One commit between the installed build and what is available, newest first.
+public struct MacUpdateCommit: Codable, Hashable, Sendable {
+    public var sha: String
+    public var subject: String
+
+    public init(sha: String, subject: String) {
+        self.sha = sha
+        self.subject = subject
+    }
+}
+
+/// What `origin/main` has that the installed build does not.
+public struct MacAvailableUpdate: Codable, Hashable, Sendable {
+    public var sourceCommit: String
+    public var version: String?
+    public var aheadBy: Int
+    public var commits: [MacUpdateCommit]
+
+    public init(sourceCommit: String, version: String? = nil, aheadBy: Int, commits: [MacUpdateCommit] = []) {
+        self.sourceCommit = sourceCommit
+        self.version = version
+        self.aheadBy = aheadBy
+        self.commits = commits
+    }
+}
+
+/// An update transaction while it is still running, mirroring the updater's
+/// own step names rather than inventing a client-side vocabulary for them.
+public struct MacUpdateRun: Codable, Hashable, Sendable {
+    public var runId: String
+    public var startedAt: String
+    public var step: String
+    /// What the step is waiting on ("Waiting for 3 bots to finish"), when the
+    /// updater says.  Absent from a harness that predates it, and most of the
+    /// time on one that does not.
+    public var detail: String?
+    public var progress: Double?
+    public var logTail: [String]
+
+    public init(
+        runId: String,
+        startedAt: String,
+        step: String,
+        detail: String? = nil,
+        progress: Double? = nil,
+        logTail: [String] = []
+    ) {
+        self.runId = runId
+        self.startedAt = startedAt
+        self.step = step
+        self.detail = detail
+        self.progress = progress
+        self.logTail = logTail
+    }
+
+    /// The wait's own words when there is one, else the step.  The same choice
+    /// the desktop makes (`runningLabel` in src/lib/update-control.ts).
+    public var headline: String {
+        if let detail, !detail.isEmpty { return detail }
+        return step
+    }
+
+    /// Whether `progress` means anything beside this step.  It is the run's own
+    /// step count and does not move while a step waits on something outside it
+    /// (bots finishing, a process letting go of BotFleet's files), so a bar or
+    /// a percent beside a wait detail would sit still for a minute and read as
+    /// stuck.  The desktop drops it by the same rule (`runningShowsPercent`).
+    public var showsPercent: Bool {
+        guard progress != nil else { return false }
+        return detail?.isEmpty ?? true
+    }
+}
+
+/// The hold an update has on new work while bots finish: `drain` on the
+/// `GET /api/update/status` answer and the `update.status` event.  While it
+/// lasts, a message sent to the paired Mac is accepted and kept; it runs after
+/// the restart.  Counts and times only, in epoch milliseconds on the Mac's clock.
+public struct MacUpdateDrain: Codable, Hashable, Sendable {
+    public struct Held: Codable, Hashable, Sendable {
+        public var sends: Int
+        public var rooms: Int
+        public var routineRuns: Int
+
+        public init(sends: Int = 0, rooms: Int = 0, routineRuns: Int = 0) {
+            self.sends = sends
+            self.rooms = rooms
+            self.routineRuns = routineRuns
+        }
+    }
+
+    public var startedAt: Double
+    /// The latest the restart begins: the end of the updater's own window.
+    public var windowEndsAt: Double
+    /// When the Mac gives the hold up by itself.  Past it, a phone still
+    /// showing the hold is showing a Mac that went away mid-update.
+    public var deadline: Double
+    /// Bots mid-turn: what the update is waiting for.
+    public var bots: Int
+    /// Live room turns, which an update will not interrupt.
+    public var rooms: Int
+    public var held: Held
+
+    public init(
+        startedAt: Double,
+        windowEndsAt: Double,
+        deadline: Double,
+        bots: Int = 0,
+        rooms: Int = 0,
+        held: Held = Held()
+    ) {
+        self.startedAt = startedAt
+        self.windowEndsAt = windowEndsAt
+        self.deadline = deadline
+        self.bots = bots
+        self.rooms = rooms
+        self.held = held
+    }
+
+    /// The wide gap between sentences: a no-break space, then a space.
+    static let gap = "\u{00A0} "
+
+    private static func milliseconds(_ date: Date) -> Double {
+        date.timeIntervalSince1970 * 1000
+    }
+
+    /// Still worth showing at `now`.  A hold past its lease belongs to a Mac
+    /// that went away mid-update.
+    public func isActive(at now: Date) -> Bool {
+        Self.milliseconds(now) < deadline
+    }
+
+    /// Messages saved for after the restart: a send waiting in a bot's queue,
+    /// or a room round waiting for its bots to speak.
+    public var heldMessageCount: Int {
+        held.sends + held.rooms
+    }
+
+    /// How long to expect to wait, as a person would say it: "about 40
+    /// seconds", "about 4 minutes", or nil when it is nearly over.  Rounded up
+    /// on purpose; a wait that ends early costs nobody anything.
+    public static func waitPhrase(milliseconds: Double) -> String? {
+        guard milliseconds.isFinite, milliseconds > 5_000 else { return nil }
+        if milliseconds < 90_000 {
+            return "about \(Int((milliseconds / 10_000).rounded(.up)) * 10) seconds"
+        }
+        return "about \(Int((milliseconds / 60_000).rounded(.up))) minutes"
+    }
+
+    private func restartTiming(at now: Date) -> String {
+        if let phrase = Self.waitPhrase(milliseconds: windowEndsAt - Self.milliseconds(now)) {
+            return "The restart begins within \(phrase)."
+        }
+        return "The restart begins shortly."
+    }
+
+    /// What a chat says while the Mac holds new work.  The counts are the whole
+    /// Mac's, not this thread's, so it says what happens to the message being
+    /// typed and claims nothing about one already sent.
+    public func noticeText(at now: Date) -> String {
+        "BotFleet is updating.\(Self.gap)Messages you send now are saved and will run after the restart.\(Self.gap)\(restartTiming(at: now))"
+    }
+
+    /// What the update card says beside the step: how many messages are saved,
+    /// and when the restart begins.
+    public func summaryText(at now: Date) -> String {
+        let count = heldMessageCount
+        let saved = count > 0
+            ? "\(count) \(count == 1 ? "message is" : "messages are") saved and will run after the restart."
+            : "New messages are saved and will run after the restart."
+        return "\(saved)\(Self.gap)\(restartTiming(at: now))"
+    }
+}
+
+/// How the most recently finished transaction ended.
+public enum MacUpdateOutcome: String, Codable, Hashable, Sendable {
+    case verified
+    case rolledBack = "rolled-back"
+    case failed
+    case refused
+    /// An outcome this build has never heard of.  The card still has a
+    /// finished run to report; guessing "failed" would claim something the
+    /// harness never said.
+    case unknown
+
+    public init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = MacUpdateOutcome(rawValue: raw) ?? .unknown
+    }
+}
+
+/// The most recent update transaction to finish, whether or not one is
+/// running again now.
+public struct MacUpdateLastRun: Codable, Hashable, Sendable {
+    public var runId: String
+    public var startedAt: String
+    public var finishedAt: String
+    public var outcome: MacUpdateOutcome
+    public var message: String
+    public var receiptPath: String?
+
+    public init(
+        runId: String,
+        startedAt: String,
+        finishedAt: String,
+        outcome: MacUpdateOutcome,
+        message: String,
+        receiptPath: String? = nil
+    ) {
+        self.runId = runId
+        self.startedAt = startedAt
+        self.finishedAt = finishedAt
+        self.outcome = outcome
+        self.message = message
+        self.receiptPath = receiptPath
+    }
+}
+
+/// What this paired device is allowed to do right now.  The card disables its
+/// own buttons from this rather than inferring it from `running`/`lastRun` —
+/// the harness may refuse for reasons that are its own to know and explain,
+/// such as another client already updating or a dirty checkout.
+public struct MacUpdateCapabilities: Codable, Hashable, Sendable {
+    public var canCheck: Bool
+    public var canRun: Bool
+    public var reasons: [String]
+
+    public init(canCheck: Bool, canRun: Bool, reasons: [String] = []) {
+        self.canCheck = canCheck
+        self.canRun = canRun
+        self.reasons = reasons
+    }
+}
+
+/// `GET /api/update/status`, `POST /api/update/check`, and the `update.status`
+/// stream event all answer with this same shape.
+public struct MacUpdateStatus: Codable, Hashable, Sendable {
+    public var installed: MacInstalledBuild
+    public var available: MacAvailableUpdate?
+    /// `null` before this Mac has ever checked — distinct from a real,
+    /// long-ago timestamp, and worth its own "Not checked yet" copy rather
+    /// than folding it into `available == nil`.
+    public var checkedAt: String?
+    /// Why the last check produced no answer, `nil` when it produced one.
+    ///
+    /// A failed `git fetch` leaves the Mac's `origin/main` ref exactly where
+    /// the last good fetch left it, so the comparison behind `available`
+    /// would report a computer that has been offline for a week as up to
+    /// date.  The harness deliberately does not move `checkedAt` in that
+    /// case and sets this instead, so the card can say the check failed
+    /// rather than repeat a stale answer as if it were fresh.  Absent on a
+    /// harness that predates the field, which decodes as `nil` — the same
+    /// as a check that worked.
+    public var checkError: String?
+    public var running: MacUpdateRun?
+    public var lastRun: MacUpdateLastRun?
+    public var capabilities: MacUpdateCapabilities
+    /// Present only while an update holds new work for bots to finish, whether
+    /// or not the Mac started the run itself (an updater launched from a
+    /// terminal holds work too).  Absent from a harness that predates it.
+    public var drain: MacUpdateDrain?
+
+    public init(
+        installed: MacInstalledBuild,
+        available: MacAvailableUpdate? = nil,
+        checkedAt: String? = nil,
+        checkError: String? = nil,
+        running: MacUpdateRun? = nil,
+        lastRun: MacUpdateLastRun? = nil,
+        capabilities: MacUpdateCapabilities,
+        drain: MacUpdateDrain? = nil
+    ) {
+        self.installed = installed
+        self.available = available
+        self.checkedAt = checkedAt
+        self.checkError = checkError
+        self.running = running
+        self.lastRun = lastRun
+        self.capabilities = capabilities
+        self.drain = drain
+    }
+}
+
+/// Parses the ISO-8601 timestamps a `MacUpdateStatus` carries as strings.
+///
+/// Both spellings have to work.  The harness stamps `checkedAt` with
+/// JavaScript's `Date.prototype.toISOString()` (`server/update-control.ts`),
+/// which always emits milliseconds — `2026-09-14T08:46:09.123Z` — while a
+/// default `ISO8601DateFormatter` rejects fractional seconds outright,
+/// because `formatOptions` defaults to `.withInternetDateTime` alone.  So
+/// the fractional spelling is tried first and the whole-second one second:
+/// an `available.json` restored from disk, a hand-written fixture, and any
+/// future harness may carry either, and a parse that fails leaves the card
+/// showing the user a raw ISO string.
+///
+/// Lives here rather than in the card so `swift test` can cover it — the
+/// app target is not built by `swift test --package-path ios` at all.
+public enum MacUpdateTimestamp {
+    public static func date(from text: String) -> Date? {
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = fractional.date(from: text) { return date }
+        let wholeSecond = ISO8601DateFormatter()
+        wholeSecond.formatOptions = [.withInternetDateTime]
+        return wholeSecond.date(from: text)
+    }
+}
+
+/// `POST /api/update/run`'s 202 body: the run it just started, plus the
+/// status right after starting it — the phone renders progress from this
+/// without a follow-up GET.
+public struct MacUpdateRunStarted: Codable, Hashable, Sendable {
+    public var runId: String
+    public var status: MacUpdateStatus
+
+    public init(runId: String, status: MacUpdateStatus) {
+        self.runId = runId
+        self.status = status
+    }
+}
+
+/// `POST /api/update/check`'s 502 body — why the harness could not reach
+/// the update source, plus the same status shape a 200 would have carried.
+struct MacUpdateCheckFailureBody: Decodable, Sendable {
+    var error: String
+    var status: MacUpdateStatus
+}
+
+/// A check the harness could not complete.  Not an `APIError.status` for the
+/// same reason `MacUpdateRunRefusal` is not: the 502 body carries a full
+/// `MacUpdateStatus`, and the card needs that as much as the sentence — the
+/// installed build and the capabilities are still current, only the
+/// comparison is missing.  Modelled as a throw rather than a field on a
+/// returned status so a caller cannot mistake a failed check for a
+/// successful one just by ignoring `checkError`.
+public struct MacUpdateCheckFailure: Error, LocalizedError, Sendable {
+    public var message: String
+    public var status: MacUpdateStatus
+
+    public init(message: String, status: MacUpdateStatus) {
+        self.message = message
+        self.status = status
+    }
+
+    public var errorDescription: String? { message }
+}
+
+/// `POST /api/update/run`'s 409 body — the harness's reason plus the same
+/// status a 202 would have carried, so `CompanionClient.runUpdate()` can
+/// hand both to the caller instead of only an error string.
+struct MacUpdateRunRefusalBody: Decodable, Sendable {
+    var error: String
+    var status: MacUpdateStatus
+}
+
+/// A refused `runUpdate()` — a run already in progress, or one of
+/// `capabilities.reasons` — carrying both the harness's own reason and the
+/// status right now.  Kept apart from `APIError` because that type's
+/// `.status(code:message:)` case has no room for the status object every
+/// other caller of `runUpdate()` also needs.
+public struct MacUpdateRunRefusal: Error, LocalizedError, Sendable {
+    public var message: String
+    public var status: MacUpdateStatus
+
+    public init(message: String, status: MacUpdateStatus) {
+        self.message = message
+        self.status = status
+    }
+
+    public var errorDescription: String? { message }
 }

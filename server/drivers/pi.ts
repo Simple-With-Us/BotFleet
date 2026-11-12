@@ -26,9 +26,22 @@ import { join } from "node:path";
 
 import { PROVIDER_CREDENTIAL_ENV, stripWorkspaceCredentialEnv } from "../config.ts";
 import { computerProxyEnv } from "../container-computer.ts";
+import { hostToolPrefix, turnComputerMounts } from "../computer-grants.ts";
 import { augmentedPath } from "../env-path.ts";
-import { describeSpawnFailure, killCliTree, spawnCli } from "../procs.ts";
+import { toolFields } from "../tool-fields.ts";
+import { describeResult } from "../../shared/tool-activity.ts";
+import { captureInput, captureOutput } from "../../shared/item-io.ts";
+import {
+  classifyVersionProbeFailure,
+  describeSpawnFailure,
+  killCliTree,
+  LastKnownAnswer,
+  logProbeFailure,
+  spawnCli,
+} from "../procs.ts";
 import { SPAWNED_PROXIES } from "../proxy-paths.ts";
+import { STDERR_EXCERPT_HEAD, STDERR_EXCERPT_TAIL, stderrExcerpt } from "../stderr-excerpt.ts";
+import { readHostLoad, resolveInitDeadline } from "./acp/init-deadline.ts";
 
 import type {
   DriverCreateInput,
@@ -42,6 +55,7 @@ import type {
   SendTurnInput,
 } from "../contracts.ts";
 import { EFFORT_LEVELS, newEventId, newId } from "../contracts.ts";
+import { cliLoginEnvironment, launchedChildEnvironment, primeCliLogin } from "../cli-logins.ts";
 import {
   decodeInjectId,
   encodeInjectId,
@@ -68,25 +82,34 @@ export function piThinkingLevel(effort: EffortLevel): (typeof EFFORT_LEVELS)[num
 export function buildMcpServers(turn: SendTurnInput): Record<string, unknown> | null {
   const servers: Record<string, unknown> = {};
   if (turn.integrations?.composio) servers.composio = { ...turn.integrations.composio };
-  if (turn.integrations?.computer) {
-    servers.computer = {
-      command: process.execPath,
-      args: [SPAWNED_PROXIES.computer],
-      env: { ...NODE_ENV_FLAG, ...computerProxyEnv(turn.integrations.computer) },
-    };
-  } else if (turn.integrations?.localComputer) {
-    const local = turn.integrations.localComputer;
-    servers.computer = {
-      command: local.command,
-      args: local.args,
-      env: local.env,
-      // Host control carries scope so the extension gates every call behind
-      // a permission card; isolated computers deliberately omit it.
-      ...(local.scope ? { scope: local.scope } : {}),
-    };
+  // Every computer the bot was granted, each under its own server name. This
+  // was an if/else if, so a bot holding both a remote desktop and this machine
+  // only ever received one of them — whichever the harness happened to set.
+  for (const mount of turnComputerMounts(turn.integrations)) {
+    if (mount.box) {
+      servers[mount.name] = {
+        command: process.execPath,
+        args: [SPAWNED_PROXIES.computer],
+        env: { ...NODE_ENV_FLAG, ...computerProxyEnv(mount.box) },
+      };
+    } else if (mount.stdio) {
+      const local = mount.stdio;
+      servers[mount.name] = {
+        command: local.command,
+        args: local.args,
+        env: local.env,
+        // Host control carries scope so the extension gates every call behind
+        // a permission card; isolated computers deliberately omit it.
+        ...(local.scope ? { scope: local.scope } : {}),
+      };
+    }
   }
   if (turn.integrations?.agents) servers.agents = { ...turn.integrations.agents };
   if (turn.integrations?.phone) servers.phone = { ...turn.integrations.phone };
+  // The shared-memory (recall) proxy rides the same stdio path every other
+  // integration here does; it was simply never added, so pi bots had no
+  // corpus at all while twelve other engines did.
+  if (turn.integrations?.qdrant) servers.qdrant = { ...turn.integrations.qdrant };
   if (turn.integrations?.dweb) {
     servers.dweb = {
       command: process.execPath,
@@ -182,6 +205,15 @@ export async function applyPiLocalCatalog(
 
 function piAgentDir(env: Record<string, string | undefined>): string {
   return join(env.HOME || env.USERPROFILE || homedir(), ".pi", "agent");
+}
+
+/** Has pi been signed in, or does it have a key to work with?
+ *
+ * Env-aware on purpose: an instance can carry its own HOME, and probing the
+ * server process's home instead would report another account's login. */
+function piAuthenticated(env: Record<string, string | undefined>): boolean {
+  if (env.PI_API_KEY?.trim()) return true;
+  return existsSync(join(piAgentDir(env), "auth.json"));
 }
 
 /** Upsert a live local host into ~/.pi/agent/models.json so `set_model`
@@ -290,6 +322,9 @@ export async function fetchPiModels(
   env: Record<string, string | undefined>,
 ): Promise<ModelCatalog> {
   const child = spawnCli(cli, PI_ARGS, { stdio: ["pipe", "pipe", "pipe"], env });
+  // nothing reads the probe's stderr; drain it so a chatty pi cannot fill
+  // the pipe and block before it answers
+  child.stderr?.resume();
   return new Promise((resolve) => {
     let buf = "";
     let done = false;
@@ -332,6 +367,29 @@ export async function fetchPiModels(
   });
 }
 
+/** How much of a turn child's stderr is kept at each end.  The middle of a
+ *  long log is dropped as it arrives; only its length is counted. */
+const PI_STDERR_KEEP = 4_096;
+
+/** A readable excerpt of a child's stderr from its kept head and tail and
+ *  the total length seen, in the same head … omitted … tail shape as
+ *  `stderrExcerpt`, with the omitted count taken from the real total. */
+export function summarizeStderr(head: string, tail: string, total: number): string {
+  if (total <= head.length + tail.length) return stderrExcerpt(head + tail);
+  const start = head.trimStart().slice(0, STDERR_EXCERPT_HEAD);
+  const end = tail.trimEnd().slice(-STDERR_EXCERPT_TAIL);
+  return `${start}\n… ${Math.max(0, total - start.length - end.length)} characters omitted …\n${end}`;
+}
+
+/** pi-ai's terminal stop reason → the harness vocabulary.  `length` is a
+ *  reply cut off by the output-token limit, which reads as a finished turn
+ *  unless it is named. */
+export function piStopReason(stopReason: string | undefined): string {
+  if (stopReason === "cancelled" || stopReason === "aborted") return "cancelled";
+  if (stopReason === "length") return "max_tokens";
+  return "end_turn";
+}
+
 export interface PiConfig {
   cli: string;
   /** Full-auto: never ask before an action. Host control is unavailable in
@@ -367,6 +425,15 @@ interface PiEvent {
   toolCallId?: string;
   toolName?: string;
   isError?: boolean;
+  /** the step's payload and its result — pi names these inconsistently
+   * across versions, so the transcript row reads whichever arrived */
+  args?: unknown;
+  input?: unknown;
+  arguments?: unknown;
+  result?: unknown;
+  output?: unknown;
+  content?: unknown;
+  error?: unknown;
   // turn_end / message_end
   message?: { stopReason?: string; errorMessage?: string; usage?: { input?: number; output?: number } };
   usage?: { input?: number; output?: number };
@@ -391,7 +458,13 @@ function piEnvironment(source: Record<string, string | undefined>): Record<strin
 
 export const PiDriver: ProviderDriver<PiConfig> = {
   driverKind: DRIVER_KIND,
-  metadata: { displayName: "pi", supportsMultipleInstances: true, access: "custom" },
+  metadata: {
+    displayName: "pi",
+    supportsMultipleInstances: true,
+    access: "custom",
+    // Mirrors the `capabilities` block in `create` below.
+    channelWiring: { agentsMcp: true, computerMcp: true, composioMcp: true, localComputerMcp: true, images: true },
+  },
   install: {
     command: {
       darwin: "npm install -g @earendil-works/pi-coding-agent",
@@ -449,14 +522,18 @@ export const PiDriver: ProviderDriver<PiConfig> = {
 
     const sendTurn = async (turn: SendTurnInput) => {
       const { threadId } = turn;
+      // The seat's CLI login is read in the BACKGROUND, and the read is started
+      // here, before the guard:  the guard and the registration that follows it
+      // have to stay free of `await`, or a second turn on this thread would walk
+      // through the guard the first one already passed.
+      primeCliLogin(turn.launchIdentity?.seat);
       if (active.has(threadId)) throw new Error("a turn is already running on this thread");
-      // Host control always routes through the permission card; full-auto must
-      // never get unapproved hands on the user's machine (same guard as the
-      // Claude and ACP drivers).
-      const controlsHost = turn.integrations?.localComputer?.scope === "local-computer";
-      if (controlsHost && config.fullAuto) {
-        throw new Error("local computer control requires the interactive approval broker");
-      }
+      // Host control always routes through the permission card: the
+      // pi-mcp-extension gates every `local-computer` scoped call behind
+      // ctx.ui.confirm, which reaches the harness as request.opened whatever
+      // the instance's fullAuto says — so a full-auto bot can mount the
+      // desktop and the bot's Auto policy still decides each action.
+      const controlsHost = hostToolPrefix(turnComputerMounts(turn.integrations)) !== null;
       const turnId = newId();
       const pending = new Map<string, (decision: { behavior: "allow" | "deny" | "answer"; message?: string }) => void>();
       let settled = false;
@@ -493,16 +570,22 @@ export const PiDriver: ProviderDriver<PiConfig> = {
       // spawnCli can throw synchronously (unresolvable CLI); if it does, the
       // 0600 temp file with the box token / composio key / comms token must
       // not be left on disk — settle() never runs because no child existed.
-      const child = (() => {
+      // The IIFE is async because the seat's CLI login is read before the
+      // spawn; the try still covers the spawn itself.
+      const child = await (async () => {
         try {
           return spawnCli(config.cli, childArgs, {
             stdio: ["pipe", "pipe", "pipe"],
             cwd: turn.cwd,
-            env: piEnvironment({
-              ...process.env,
-              ...input.environment,
-              ...(mcpServers && mcpTempDir ? { OMB_MCP_CONFIG: join(mcpTempDir, "mcp.json") } : {}),
-            }),
+            env: launchedChildEnvironment(
+              piEnvironment({
+                ...process.env,
+                ...input.environment,
+                ...(mcpServers && mcpTempDir ? { OMB_MCP_CONFIG: join(mcpTempDir, "mcp.json") } : {}),
+              }),
+              turn.launchIdentity,
+              cliLoginEnvironment(turn.launchIdentity?.seat),
+            ),
           });
         } catch (err) {
           if (mcpTempDir) {
@@ -517,6 +600,27 @@ export const PiDriver: ProviderDriver<PiConfig> = {
       })();
       let buf = "";
       let assistantText = "";
+      // Drain stderr into a bounded head + tail.  Nothing read stderr before,
+      // so a pi that logged more than a pipe buffer (64 KB) blocked on its
+      // own write and never exited: the turn hung until the harness's
+      // 20-minute stall watchdog, and a crash said nothing about why.
+      let stderrHead = "";
+      let stderrTail = "";
+      let stderrTotal = 0;
+      child.stderr?.setEncoding("utf8");
+      child.stderr?.on("data", (chunk: string) => {
+        stderrTotal += chunk.length;
+        if (stderrHead.length < PI_STDERR_KEEP) {
+          const room = PI_STDERR_KEEP - stderrHead.length;
+          stderrHead += chunk.slice(0, room);
+          chunk = chunk.slice(room);
+        }
+        if (chunk) stderrTail = (stderrTail + chunk).slice(-PI_STDERR_KEEP);
+      });
+      const stderrSummary = () => summarizeStderr(stderrHead, stderrTail, stderrTotal);
+      // true once the child is gone, so a later RPC fails at once instead of
+      // waiting out its whole response timeout on a dead pipe
+      let exited = false;
       // resolve one-shot RPC responses (new_session / switch_session / set_model)
       const responseWaiters = new Map<string, { resolve: (data: unknown) => void; reject: (err: Error) => void; timer: NodeJS.Timeout }>();
       const rejectWaiters = (err: Error) => {
@@ -526,8 +630,12 @@ export const PiDriver: ProviderDriver<PiConfig> = {
         }
         responseWaiters.clear();
       };
-      const awaitResponse = (command: string, timeoutMs = 20_000) =>
-        new Promise<unknown>((resolve, reject) => {
+      const awaitResponse = (command: string, timeoutMs = 20_000) => {
+        const response = new Promise<unknown>((resolve, reject) => {
+          if (exited) {
+            reject(new Error("pi process exited before replying"));
+            return;
+          }
           const timer = setTimeout(() => {
             responseWaiters.delete(command);
             reject(new Error(`pi ${command} timed out`));
@@ -535,6 +643,13 @@ export const PiDriver: ProviderDriver<PiConfig> = {
           timer.unref?.();
           responseWaiters.set(command, { resolve, reject, timer });
         });
+        // Each waiter is created before its request is sent.  If the send
+        // throws, the turn fails through the catch below and nothing awaits
+        // this promise; mark it handled so its later rejection cannot crash
+        // the harness as an unhandled rejection.  Awaiting it still throws.
+        response.catch(() => undefined);
+        return response;
+      };
       child.stdin.on("error", () => rejectWaiters(new Error("pi stdin closed")));
       const send = (obj: Record<string, unknown>) => {
         appendNative(threadId, { dir: "out", source: "pi.rpc", msg: obj });
@@ -580,6 +695,17 @@ export const PiDriver: ProviderDriver<PiConfig> = {
         active.delete(threadId);
       };
 
+      /** Fail the turn with a reason the person can read.  Once the turn is
+       *  in `active`, every failure goes through here rather than a throw:
+       *  the harness's sendTurn catch never calls interruptTurn, so a throw
+       *  left the entry behind and every later turn on the thread answered
+       *  "a turn is already running". */
+      const fail = (stopReason: string, message: string) => {
+        if (settled) return;
+        emit({ ...base(threadId, turnId), type: "runtime.error", message: message.slice(0, 2_000) });
+        settle(false, stopReason);
+      };
+
       const stop = () => {
         try {
           send({ type: "abort" });
@@ -591,7 +717,9 @@ export const PiDriver: ProviderDriver<PiConfig> = {
         } catch {
           /* ignore */
         }
-        settle(true, "cancelled");
+        // A person stopped this turn: interrupted, not a success (audit
+        // E6, #647 convention).
+        settle(false, "interrupted");
       };
       active.set(threadId, { stop, turnId, pending, child });
 
@@ -604,7 +732,10 @@ export const PiDriver: ProviderDriver<PiConfig> = {
               responseWaiters.delete(evt.command);
               clearTimeout(waiter.timer);
               if (evt.success) waiter.resolve(evt.data);
-              else waiter.reject(new Error(`pi ${evt.command} failed`));
+              else {
+                const detail = typeof evt.error === "string" && evt.error.trim() ? `: ${evt.error.trim().slice(0, 500)}` : "";
+                waiter.reject(new Error(`pi ${evt.command} failed${detail}`));
+              }
             }
             return;
           }
@@ -627,6 +758,8 @@ export const PiDriver: ProviderDriver<PiConfig> = {
               itemType: "tool",
               itemId: evt.toolCallId,
               title: String(evt.toolName ?? "tool").slice(0, 80),
+              ...toolFields(evt.toolName, evt.args ?? evt.input ?? evt.arguments),
+              ...captureInput(evt.args ?? evt.input ?? evt.arguments),
             });
             return;
           }
@@ -637,6 +770,8 @@ export const PiDriver: ProviderDriver<PiConfig> = {
               itemType: "tool",
               itemId: evt.toolCallId,
               ok: !evt.isError,
+              detail: describeResult(evt.result ?? evt.output ?? evt.content ?? evt.error),
+              ...captureOutput(evt.result ?? evt.output ?? evt.content ?? evt.error),
             });
             return;
           }
@@ -663,6 +798,7 @@ export const PiDriver: ProviderDriver<PiConfig> = {
                 requestType: isQuestion ? "question" : "permission",
                 tool: String(evt.title ?? "pi"),
                 summary: String(evt.title ?? "pi wants confirmation"),
+                approvalScope: controlsHost ? "local-computer" : undefined,
               });
             }
             return;
@@ -683,7 +819,7 @@ export const PiDriver: ProviderDriver<PiConfig> = {
               settle(false, "failed", usage);
               return;
             }
-            settle(true, sr === "cancelled" || sr === "aborted" ? "cancelled" : "end_turn", usage);
+            settle(true, piStopReason(sr), usage);
             return;
           }
           default:
@@ -707,107 +843,192 @@ export const PiDriver: ProviderDriver<PiConfig> = {
         }
       });
       child.on("error", (err) => {
-        const fail = describeSpawnFailure(err as NodeJS.ErrnoException, config.cli);
-        rejectWaiters(new Error(fail.message));
-        emit({ ...base(threadId, turnId), type: "runtime.error", message: fail.message, setup: fail.setup });
+        exited = true;
+        const spawnFailure = describeSpawnFailure(err as NodeJS.ErrnoException, config.cli);
+        rejectWaiters(new Error(spawnFailure.message));
+        if (settled) return;
+        emit({ ...base(threadId, turnId), type: "runtime.error", message: spawnFailure.message, setup: spawnFailure.setup });
         settle(false);
       });
-      child.on("close", () => {
-        // a clean close without a terminal event is a failed turn, never a hang
+      child.on("close", (code, signal) => {
+        exited = true;
+        // a close without a terminal event is a failed turn, never a hang;
+        // "close" fires after stderr has drained, so the excerpt is whole
         rejectWaiters(new Error("pi process exited before replying"));
-        settle(false);
+        const excerpt = stderrSummary();
+        fail("exit_before_result", `pi exited ${code ?? signal ?? "unexpectedly"} before agent_end${excerpt ? `: ${excerpt}` : ""}`);
       });
 
       emit({ ...base(threadId, turnId), type: "turn.started" });
 
-      // handshake: resume the remembered session or start a fresh one. The
-      // harness persists session.started.sessionId as the resumeCursor and
-      // hands it back next turn, so that id IS the resume handle — pi's
-      // sessionFile, which switch_session expects as `sessionPath`.
-      const sessionPath = typeof turn.resumeCursor === "string" ? turn.resumeCursor : null;
-      let sessionFile = sessionPath;
       try {
-        const command = sessionPath ? "switch_session" : "new_session";
-        const hsPromise = awaitResponse(command);
-        send(sessionPath ? { type: "switch_session", sessionPath } : { type: "new_session" });
-        const hs = (await hsPromise) as { sessionFile?: string; sessionId?: string } | undefined;
-        if (hs?.sessionFile) sessionFile = hs.sessionFile;
-        emit({
-          ...base(threadId, turnId),
-          type: "session.started",
-          sessionId: sessionFile ?? hs?.sessionId ?? null,
-          model: turn.model ?? null,
-        });
-      } catch {
-        // without a session we can still try a bare prompt; pi --no-session
-        // accepts a prompt without an explicit session.
-      }
-
-      // pin the chosen model (composite id or host::model inject → provider + modelId)
-      const chosen = typeof turn.model === "string" ? splitPiModel(turn.model) : null;
-      if (chosen) {
+        // handshake: resume the remembered session or start a fresh one. The
+        // harness persists session.started.sessionId as the resumeCursor and
+        // hands it back next turn, so that id IS the resume handle — pi's
+        // sessionFile, which switch_session expects as `sessionPath`.
+        const sessionPath = typeof turn.resumeCursor === "string" ? turn.resumeCursor : null;
+        let sessionFile = sessionPath;
         try {
+          // Loading a saved session reads its whole file, which stretches
+          // with host load the way a cold boot does; scale the deadline the
+          // same way the ACP initialize deadline is scaled.
+          const hsPromise = sessionPath
+            ? awaitResponse("switch_session", resolveInitDeadline({ engineBaseMs: 20_000, load: readHostLoad() }).timeoutMs)
+            : awaitResponse("new_session");
+          send(sessionPath ? { type: "switch_session", sessionPath } : { type: "new_session" });
+          const hs = (await hsPromise) as { sessionFile?: string; sessionId?: string } | undefined;
+          if (hs?.sessionFile) sessionFile = hs.sessionFile;
+          emit({
+            ...base(threadId, turnId),
+            type: "session.started",
+            sessionId: sessionFile ?? hs?.sessionId ?? null,
+            model: turn.model ?? null,
+          });
+        } catch (error) {
+          if (settled) return { turnId };
+          if (sessionPath) {
+            // Prompting now would run on the empty --no-session context: the
+            // bot answers with no memory of the thread while the person
+            // believes it has one.  Fail instead; resume_failed tells the
+            // harness to drop the dead cursor so the next turn starts fresh.
+            fail(
+              "resume_failed",
+              `The saved pi session could not be resumed: ${error instanceof Error ? error.message : String(error)}`,
+            );
+            return { turnId };
+          }
+          // a fresh turn without a session can still try a bare prompt; pi
+          // --no-session accepts a prompt without an explicit session.
+        }
+        if (settled) return { turnId };
+
+        // Pin the chosen model (composite id or host::model inject → provider +
+        // modelId), and FAIL the turn if the pin does not take.
+        //
+        // This used to swallow the rejection and keep going on whatever model
+        // pi had, while session.started had already told the UI and the usage
+        // ledger which model was running.  A turn billed to one model and
+        // reported as another is worse than a turn that refuses: the person
+        // reads an answer believing a model they did not get produced it.
+        // Same rule the ACP core states for session/set_model.
+        const chosen = typeof turn.model === "string" ? splitPiModel(turn.model) : null;
+        if (chosen) {
           const modelPromise = awaitResponse("set_model");
           send({ type: "set_model", provider: chosen.provider, modelId: chosen.modelId });
-          await modelPromise;
-        } catch {
-          /* keep going on the default model */
+          try {
+            await modelPromise;
+          } catch (error) {
+            fail(
+              "model_refused",
+              `pi refused the model ${chosen.provider}/${chosen.modelId}: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+            return { turnId };
+          }
         }
-      }
 
-      // pin reasoning effort after the model (the supported level set is
-      // model-dependent); a rejection keeps the engine default
-      if (turn.effort) {
-        try {
-          const levelPromise = awaitResponse("set_thinking_level");
-          send({ type: "set_thinking_level", level: piThinkingLevel(turn.effort) });
-          await levelPromise;
-        } catch {
-          /* keep going on the engine default */
+        // pin reasoning effort after the model (the supported level set is
+        // model-dependent); a rejection keeps the engine default
+        if (turn.effort) {
+          try {
+            const levelPromise = awaitResponse("set_thinking_level");
+            send({ type: "set_thinking_level", level: piThinkingLevel(turn.effort) });
+            await levelPromise;
+          } catch {
+            /* keep going on the engine default */
+          }
         }
-      }
+        if (settled) return { turnId };
 
-      const message = turn.system ? `${turn.system}\n\n${turn.text}` : turn.text;
-      try {
+        const message = turn.system ? `${turn.system}\n\n${turn.text}` : turn.text;
         send({ type: "prompt", message });
-      } catch {
-        settle(false);
+      } catch (error) {
+        fail("failed", `pi turn setup failed: ${error instanceof Error ? error.message : String(error)}`);
       }
 
       return { turnId };
     };
 
+    // Last good `--version`, so one probe that runs out of time on a busy
+    // Mac does not flip a working pi to "not installed".
+    const lastKnownVersion = new LastKnownAnswer<string>();
     const snapshot = async (): Promise<ProviderSnapshot> => {
-      const version = await new Promise<string | null>((resolve) => {
-        const child = spawnCli(config.cli, ["--version"], {
-          stdio: ["ignore", "pipe", "pipe"],
-          env: piEnvironment({ ...process.env, ...input.environment }),
-        });
+      // Its place among overlapping probes: taken before the process starts,
+      // so a slow older probe cannot replace what a newer one remembered.
+      const versionOrder = lastKnownVersion.begin();
+      const startedAt = Date.now();
+      const probed = await new Promise<{ version: string | null; error: Error | null }>((resolve) => {
+        let child: ReturnType<typeof spawnCli>;
+        try {
+          child = spawnCli(config.cli, ["--version"], {
+            stdio: ["ignore", "pipe", "pipe"],
+            env: piEnvironment({ ...process.env, ...input.environment }),
+          });
+        } catch (error) {
+          resolve({ version: null, error: error as Error });
+          return;
+        }
         let out = "";
+        let settled = false;
+        const settle = (value: { version: string | null; error: Error | null }) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve(value);
+        };
         child.stdout?.setEncoding("utf8");
         child.stdout?.on("data", (c: string) => (out += c));
+        child.stderr?.resume();
         const timer = setTimeout(() => {
           try {
             killCliTree(child);
           } catch {
             /* ignore */
           }
-          resolve(null);
-        }, 8000);
+          settle({
+            version: null,
+            error: Object.assign(new Error(`\`${config.cli}\` did not exit within 20000ms`), { timedOut: true }),
+          });
+        }, 20000);
         timer.unref?.();
-        child.on("error", () => {
-          clearTimeout(timer);
-          resolve(null);
-        });
-        child.on("close", () => {
-          clearTimeout(timer);
-          resolve(out.trim() || null);
-        });
+        child.on("error", (error) => settle({ version: null, error }));
+        child.on("close", (code) =>
+          settle({
+            version: out.trim() || null,
+            error: out.trim() ? null : Object.assign(new Error(`exit ${code}`), { code }),
+          }),
+        );
       });
-      if (!version) return { state: "unavailable", reason: `\`${config.cli}\` CLI not found` };
-      // pi manages its own credentials (~/.pi/agent/auth.json); there is no
-      // separate sign-in step the harness can probe, so treat it as authed.
-      return { state: "available", version, authenticated: true };
+      let version = probed.version;
+      if (version) {
+        lastKnownVersion.record(version, versionOrder);
+      } else {
+        const elapsed = Date.now() - startedAt;
+        logProbeFailure(instanceId, `${config.cli} --version`, probed.error, elapsed);
+        const failure = classifyVersionProbeFailure(probed.error, config.cli, input.displayName || "pi", elapsed, 20000);
+        const remembered = failure.kind === "transient" ? lastKnownVersion.get() : null;
+        if (remembered) {
+          // Only a probe that gave no answer may stand on the last good
+          // version.  A missing or broken binary is a verdict.
+          version = remembered;
+        } else {
+          if (failure.kind !== "transient") lastKnownVersion.forget(versionOrder);
+          return failure.kind === "transient"
+            ? { state: "unavailable", transient: true, reason: failure.reason }
+            : { state: "unavailable", reason: failure.reason };
+        }
+      }
+      // pi keeps its credentials in its own data root; there is no sign-in
+      // subcommand to probe, so read the file it writes.  Reporting a
+      // hardcoded `true` meant an installed-but-unauthenticated pi looked
+      // ready and the setup affordance never appeared — the user found out
+      // when a turn failed instead.
+      return {
+        state: "available",
+        version,
+        authenticated: piAuthenticated({ ...process.env, ...input.environment }),
+      };
     };
 
     return {
@@ -831,11 +1052,14 @@ export const PiDriver: ProviderDriver<PiConfig> = {
           computerMcp: true,
           composioMcp: true,
           phoneMcp: true,
+          // Shared memory (recall) mounts through the same extension, so the
+          // dispatcher may hand this engine the proxy.
+          qdrantMcp: true,
           // Host control (the user's real Mac) rides the pi-native permission
           // card (`ctx.ui.confirm` → extension_ui_request) gated in the
-          // extension, so it is offered exactly when the other engines offer
-          // it: enabled unless the bot is in full-auto.
-          localComputerMcp: !config.fullAuto,
+          // extension regardless of fullAuto, so it is offered in every mode
+          // like the other brokered engines.
+          localComputerMcp: true,
           // Images ride the ordinary prompt as <attached-image path> refs the
           // agent opens with its read tool — no native image blocks needed,
           // same as every other CLI engine.
@@ -844,6 +1068,18 @@ export const PiDriver: ProviderDriver<PiConfig> = {
           // xhigh/max only land on models that expose them; pi rejects an
           // unsupported level and the turn keeps the engine default.
           effortLevels: EFFORT_LEVELS,
+          // pi core runs its own bash/edit/write without asking, in every
+          // mode (fullAuto changes nothing here); only host-control MCP calls
+          // reach a card, and auto-review never answers those.  Its steps do
+          // arrive as tool_execution_start, so review can watch them.
+          reviewHook: "after",
+          // Jobs matrix: BotFleet's own job tools arrive through the same
+          // pi-mcp-extension that already carries ask_bot, and the chain is
+          // proven end to end in server/drivers/pi-jobs.test.ts — the real
+          // extension, the real agents-proxy, jobs mounted, reaching the
+          // harness.  Helpers are still unverified and stay `none`.
+          backgroundJobs: "emulated",
+          helpers: "none",
         },
         sendTurn,
         interruptTurn: async (threadId) => active.get(threadId)?.stop(),

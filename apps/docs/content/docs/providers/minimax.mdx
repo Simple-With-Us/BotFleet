@@ -1,0 +1,52 @@
+---
+title: Connecting MiniMax
+description: Where the MiniMax key comes from, and how to run more than one MiniMax connection.
+icon: Plug
+---
+
+MiniMax is an HTTP engine, not a CLI.  There is nothing to install and no interactive sign-in: it needs an API key and, optionally, an endpoint to send it to.  Get a key at [platform.minimax.io](https://platform.minimax.io).
+
+## Where the Key Can Come From
+
+BotFleet looks in several places.  The first one that holds a value wins, and a connection you added in the app uses its own key ahead of all of them.
+
+| Source | How to set it | When to use it |
+|---|---|---|
+| Secret store | Add `MINIMAX_API_KEY` to the Infisical project BotFleet is pointed at | A fleet of machines that should rotate one key together |
+| Environment | Export `MINIMAX_API_KEY` before launching BotFleet | A development shell, a launch agent, a container |
+| Settings | **Settings → API Keys → MiniMax API key**, or `{"minimax": {"key": "…", "url": "…"}}` in `~/.botfleet/config.json` | One machine, one key, no vault to run |
+| The connection itself | Paste a key into **Add Engine** when you add a MiniMax connection | A second account or endpoint, keyed separately from the workspace |
+| `mmx` CLI | `mmx auth login --api-key YOUR_MINIMAX_API_KEY`, which writes `~/.mmx/config.json` | You already use the `mmx` CLI for other work |
+
+**Settings → Secrets** names the source the value in use actually came from, so a key exported in a shell and a key held in the vault are never confused for each other.  A key that lives only in `~/.mmx/config.json` is named there too — that file is read by the driver itself rather than managed by BotFleet, so the card shows the path instead of a managed source.
+
+The base URL follows the same ladder under the name `MINIMAX_BASE_URL` (`minimax.url` in `config.json`), and sits under the key in the same Settings row.  Set it to `https://api.minimaxi.com/v1` for the China host, to `https://api.minimax.io/v1` to pin the global host, or to a gateway or proxy of your own.
+
+Leave it blank and the built-in connection follows `~/.mmx/config.json` when that file names a `region` or a `base_url`, and MiniMax's global host otherwise.  **Settings → API Keys** marks the endpoint as read from that file whenever that is the host in effect, the same way the key beside it is marked, so a blank field never claims a destination the turns do not use.  A host you set yourself always wins: an endpoint typed in Settings is never overridden by that file, not even when you type the very global host it would otherwise fall back to.  Connections you add in the app do not read that file at all — a machine-wide profile is a workspace default, and it reaches only the built-in connection, exactly as the key beside it does.
+
+On the desktop app the key you type in Settings goes into the operating system's encrypted credential store and never reaches `~/.botfleet/config.json`; the endpoint beside it is configuration, not a credential, so it stays readable in the file.  Running in a browser against a local harness there is no such store, and the key is saved in the config file instead, the same way every other locally-configured credential is.
+
+<Callout type="info" title="A blank key field never clears a saved key">
+  Settings never shows a key back to you, so the field is blank on every visit.  Saving with it blank changes only the endpoint.  To remove a saved key, leave the field blank and press **Clear**.
+</Callout>
+
+<Callout type="info" title="Cost is reported only for MiniMax's own hosts">
+  Spend is computed from MiniMax's published pay-as-you-go rates, which describe the global and China hosts.  Point a connection at a gateway or a reseller and turns still run, but their cost is reported blank rather than guessed at a tariff that may not apply.
+</Callout>
+
+## More Than One MiniMax Connection
+
+One BotFleet workspace can hold several MiniMax connections, each with its own key and endpoint — a global account and a China account, a personal key and a team key, or a direct connection alongside one that goes through a gateway.
+
+1. Open **Settings → Engines** and choose **Add Engine**.
+2. Pick **MiniMax** as the engine type.
+3. Name the connection something you will recognize in the model picker, set its endpoint, and paste its key.
+4. Save.  There is no model list to fill in: MiniMax publishes its own catalog, and every connection offers the same models.
+
+Each bot picks its connection in the model picker like any other engine.  The connections are independent: a key rotated on one does not touch the other, and a connection you added can be deleted from its row, while the built-in one cannot.
+
+**Settings → API Keys** holds the workspace key and endpoint — the built-in connection's, and only its.  A connection you added carries its own key, and there is no per-connection key field: to change or replace one, delete that connection from its row in **Settings → Engines** and add it again with the new key.
+
+<Callout type="warn" title="A key is never shared between connections">
+  The workspace key reaches only the built-in MiniMax connection.  A connection you added gets the key you entered for it and nothing else, so pointing one at a gateway can never hand that gateway your real MiniMax credential.
+</Callout>

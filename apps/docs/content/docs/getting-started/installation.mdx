@@ -6,17 +6,18 @@ icon: Download
 
 ## Download a released build
 
-Choose your computer below. Each link always downloads the latest published build.
+Choose your computer below.  Each macOS link always downloads the latest published build from the
+[BotFleet Releases page](https://github.com/Simple-With-Us/BotFleet/releases).
 
 | Platform | Recommended package | Notes |
 |---|---|---|
-| macOS Apple silicon | [Download `.dmg`](https://github.com/milind-soni/botfleet-releases/releases/latest/download/BotFleet.dmg) | Signed and notarized. Drag to Applications. |
-| macOS Intel | [Download `.dmg`](https://github.com/milind-soni/botfleet-releases/releases/latest/download/BotFleet-intel.dmg) | Signed and notarized. |
-| Windows x64 | [Download installer](https://github.com/milind-soni/botfleet-releases/releases/latest/download/BotFleet-setup.exe) | Per-user installer; Windows signing is not yet available. |
-| Ubuntu 24.04 x64 | [Download `.deb`](https://github.com/milind-soni/botfleet-releases/releases/latest/download/BotFleet-amd64.deb) · [AppImage](https://github.com/milind-soni/botfleet-releases/releases/latest/download/BotFleet.AppImage) | The `.deb` is recommended; the AppImage is portable. |
+| macOS Apple silicon | [Download `.dmg`](https://github.com/Simple-With-Us/BotFleet/releases/latest/download/BotFleet.dmg) | Signed with the BotFleet Developer ID.  Drag to Applications. |
+| macOS Intel | [Download `.dmg`](https://github.com/Simple-With-Us/BotFleet/releases/latest/download/BotFleet-intel.dmg) | Same app, built for Intel Macs. |
+| Windows x64 | Not published | CI and the release workflow no longer build a Windows installer (BF-2500).  Build from source below. |
+| Ubuntu 24.04 x64 | Not published | CI and the release workflow no longer build a `.deb` or an AppImage (BF-2500).  Build from source below. |
 
-<Callout type="warn" title="Windows SmartScreen">
-  The Windows installer is not code-signed yet. Windows may show “Unknown publisher.” Verify that you downloaded it from the official BotFleet releases repository before choosing **More info → Run anyway**.
+<Callout type="info" title="Updates are manual for now">
+  In-app **Check for updates** reads a `latest-mac.yml` feed that the current release does not carry yet.  Until the release workflow publishes a full asset set, install a newer build by downloading it from the releases repository.
 </Callout>
 
 ## Install an agent CLI
@@ -35,7 +36,7 @@ See [Agent engines](../providers/index.mdx) for the complete list and explicit p
 Requirements: Node.js 24 or newer, pnpm 10.33.0, and at least one authenticated agent CLI.
 
 ```bash
-git clone https://github.com/milind-soni/BotFleet.git
+git clone https://github.com/Simple-With-Us/BotFleet.git
 cd BotFleet
 corepack enable
 pnpm install --frozen-lockfile

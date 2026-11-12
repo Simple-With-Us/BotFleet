@@ -2,9 +2,44 @@ import { parseJson, type JsonValue } from "./schema.ts";
 import { isBotPackage, parseBotPackage, type ParsedBotPackage } from "./bot-package.ts";
 import { parseTeamManifest, type ParsedTeamManifest } from "./team-manifest.ts";
 
-export const TEAM_LIBRARY_REPOSITORY = "https://github.com/milind-soni/botfleet-teams";
-export const TEAM_LIBRARY_RAW_ROOT = "https://raw.githubusercontent.com/milind-soni/botfleet-teams/main";
-export const TEAM_LIBRARY_CATALOG_URL = `${TEAM_LIBRARY_RAW_ROOT}/catalog.json`;
+/** Where the built-in "Community teams" browse tab reads its catalog. There
+ * is no default: the repository this build used to name does not exist, so
+ * the library is off until OMB_TEAM_LIBRARY_REPOSITORY names a public GitHub
+ * repository (https://github.com/<owner>/<repo>, optionally #<branch>) that
+ * publishes a catalog.json in the botfleet.catalog format. Importing a team
+ * from a file or a pasted GitHub link never depends on this. */
+export const TEAM_LIBRARY_REPOSITORY_ENV = "OMB_TEAM_LIBRARY_REPOSITORY";
+export const TEAM_LIBRARY_NOT_CONFIGURED = "Team library is not configured for this build";
+
+export interface TeamLibrarySource {
+  repositoryUrl: string;
+  rawRoot: string;
+  catalogUrl: string;
+}
+
+const GITHUB_REPOSITORY = /^https:\/\/(?:www\.)?github\.com\/([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))\/([A-Za-z0-9._-]{1,100})\/?(?:#([A-Za-z0-9._\/-]{1,200}))?$/;
+
+/** Accept only a plain public GitHub repository URL; anything else means
+ * "not configured" rather than a fetch to an arbitrary host. */
+export function parseTeamLibraryRepository(value: string | undefined): TeamLibrarySource | null {
+  const match = GITHUB_REPOSITORY.exec(value?.trim() ?? "");
+  if (!match) return null;
+  const [, owner, rawRepo, branch = "main"] = match;
+  const repo = rawRepo.replace(/\.git$/, "");
+  if (!repo || repo === "." || repo === ".." || branch.split("/").some((part) => !part || part === "." || part === "..")) {
+    return null;
+  }
+  const rawRoot = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}`;
+  return {
+    repositoryUrl: `https://github.com/${owner}/${repo}`,
+    rawRoot,
+    catalogUrl: `${rawRoot}/catalog.json`,
+  };
+}
+
+export function teamLibrarySource(env: NodeJS.ProcessEnv = process.env): TeamLibrarySource | null {
+  return parseTeamLibraryRepository(env[TEAM_LIBRARY_REPOSITORY_ENV]);
+}
 
 const MAX_CATALOG_BYTES = 256_000;
 const MAX_MANIFEST_BYTES = 1_000_000;
@@ -28,8 +63,16 @@ export interface TeamCatalogEntry {
 export interface TeamCatalog {
   format: "botfleet.catalog";
   version: 1;
-  repositoryUrl: typeof TEAM_LIBRARY_REPOSITORY;
+  /** Empty when the library is not configured. */
+  repositoryUrl: string;
+  /** False when no repository is configured; the renderer says so honestly
+   * instead of showing a failed fetch. */
+  configured: boolean;
   teams: TeamCatalogEntry[];
+}
+
+export function unconfiguredTeamCatalog(): TeamCatalog {
+  return { format: "botfleet.catalog", version: 1, repositoryUrl: "", configured: false, teams: [] };
 }
 
 type Fetcher = typeof fetch;
@@ -64,7 +107,7 @@ function stringList(value: unknown, field: string, maxItems: number): string[] {
 }
 
 /** Validate the remotely maintained index before any of it reaches the renderer. */
-export function parseTeamCatalog(value: unknown): TeamCatalog {
+export function parseTeamCatalog(value: unknown, repositoryUrl: string): TeamCatalog {
   if (!isRecord(value) || value.format !== "botfleet.catalog" || value.version !== 1) {
     throw new Error("The team library catalog is not supported");
   }
@@ -112,7 +155,8 @@ export function parseTeamCatalog(value: unknown): TeamCatalog {
   return {
     format: "botfleet.catalog",
     version: 1,
-    repositoryUrl: TEAM_LIBRARY_REPOSITORY,
+    repositoryUrl,
+    configured: true,
     teams,
   };
 }
@@ -152,8 +196,12 @@ async function fetchText(url: string, maxBytes: number, fetcher: Fetcher): Promi
   return raw;
 }
 
-export async function fetchTeamCatalog(fetcher: Fetcher = fetch): Promise<TeamCatalog> {
-  return parseTeamCatalog(await fetchJson(TEAM_LIBRARY_CATALOG_URL, MAX_CATALOG_BYTES, fetcher));
+export async function fetchTeamCatalog(
+  fetcher: Fetcher = fetch,
+  source: TeamLibrarySource | null = teamLibrarySource(),
+): Promise<TeamCatalog> {
+  if (!source) return unconfiguredTeamCatalog();
+  return parseTeamCatalog(await fetchJson(source.catalogUrl, MAX_CATALOG_BYTES, fetcher), source.repositoryUrl);
 }
 
 export type ParsedShareableTeam = ParsedTeamManifest | ParsedBotPackage;
@@ -169,12 +217,17 @@ async function fetchShareable(url: string, fetcher: Fetcher): Promise<ParsedShar
     : parseShareable(await fetchJson(url, MAX_MANIFEST_BYTES, fetcher));
 }
 
-export async function fetchLibraryTeam(slug: string, fetcher: Fetcher = fetch): Promise<ParsedShareableTeam> {
+export async function fetchLibraryTeam(
+  slug: string,
+  fetcher: Fetcher = fetch,
+  source: TeamLibrarySource | null = teamLibrarySource(),
+): Promise<ParsedShareableTeam> {
   if (!/^[a-z0-9][a-z0-9-]*$/.test(slug)) throw new Error("That team name is invalid");
-  const catalog = await fetchTeamCatalog(fetcher);
+  if (!source) throw Object.assign(new Error(TEAM_LIBRARY_NOT_CONFIGURED), { status: 404 });
+  const catalog = await fetchTeamCatalog(fetcher, source);
   const entry = catalog.teams.find((team) => team.slug === slug);
   if (!entry) throw Object.assign(new Error("That library team was not found"), { status: 404 });
-  return fetchShareable(`${TEAM_LIBRARY_RAW_ROOT}/${entry.package ?? entry.manifest}`, fetcher);
+  return fetchShareable(`${source.rawRoot}/${entry.package ?? entry.manifest}`, fetcher);
 }
 
 function safeSegment(value: string): boolean {

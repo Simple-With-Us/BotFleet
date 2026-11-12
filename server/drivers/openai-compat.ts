@@ -17,10 +17,215 @@ import type {
   RuntimeEventListener,
   SendTurnInput,
 } from "../contracts.ts";
+import { isIP } from "node:net";
+import { Agent, fetch as undiciFetch, type RequestInit as UndiciRequestInit } from "undici";
+import { z } from "zod";
 import { newEventId, newId } from "../contracts.ts";
+import type { ReviewPrompt } from "../../shared/auto-review.ts";
 import { appendNative } from "./native.ts";
+import { splitChatPrompt } from "./prompt-split.ts";
+import { formatGenAiMessages, withChatSpan } from "../sentry-ai.ts";
+import {
+  DEFAULT_TURN_LOOP_BUDGET,
+  runTurnLoop,
+  type ChatMessage,
+  type TurnLoopBudget,
+  type TurnLoopDeps,
+  type TurnUsage,
+} from "./chat-completions/loop.ts";
+
+import { httpErrorFor } from "./chat-completions/errors.ts";
+import { toTurnUsage } from "./chat-completions/usage.ts";
+import { capReplayedTranscript } from "./chat-completions/replay-cap.ts";
 
 const DRIVER_KIND = "openai-compat";
+// How long a request may go without a byte before it is abandoned.  This was
+// the whole-request ceiling, which cut off a slow-but-live stream at 120s;
+// it is now the turn loop's IDLE clock (see `requestIdleMs` in
+// chat-completions/loop.ts), so a stream still delivering bytes runs to the
+// loop's hard ceiling instead.  generateText, which has no loop around it,
+// still uses it as a plain ceiling.
+const REQUEST_TIMEOUT_MS = 120_000;
+const DEFAULT_LOCAL_REPLY_WAIT_MS = 180_000;
+const NODE_FETCH_NO_BYTE_TIMEOUT_MS = 300_000;
+
+export const MAX_REPLY_WAIT_MINUTES = 60;
+export const ReplyWaitMinutesSchema = z.number().int().min(5).max(MAX_REPLY_WAIT_MINUTES);
+export type ReplyWaitMinutes = z.infer<typeof ReplyWaitMinutesSchema>;
+export const REPLY_WAIT_RANGE_MESSAGE = `replyWaitMinutes must be a whole number from 5 to ${MAX_REPLY_WAIT_MINUTES}`;
+
+// Only the fields read before building a Response; extra fields pass through.
+const UpstreamResponseSchema = z.object({
+  status: z.number().int().min(200).max(599),
+  statusText: z.string(),
+});
+const LOCAL_MODEL_PROBE_INTERVAL_MS = 30_000;
+const LOCAL_MODEL_PROBE_TIMEOUT_MS = 5_000;
+const LOCAL_MODEL_PROBE_MISSES = 3;
+const LOCAL_REPLY_REQUEST_HEADROOM_MS = 300_000;
+const LOCAL_REPLY_TURN_HEADROOM_MS = 900_000;
+let noByteTimeoutAgent: Agent | undefined;
+
+/** OpenAI-compatible servers on this machine or a private network. */
+export function isLocalModelEndpoint(url: string): boolean {
+  let host: string;
+  try {
+    host = new URL(url).hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  } catch {
+    return false;
+  }
+  if (host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local") || host === "::1") return true;
+  const mappedIPv4 = host.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i);
+  const ipv4 = isIP(host) === 4
+    ? host
+    : mappedIPv4
+      ? (() => {
+          const high = Number.parseInt(mappedIPv4[1]!, 16);
+          const low = Number.parseInt(mappedIPv4[2]!, 16);
+          return `${high >>> 8}.${high & 0xff}.${low >>> 8}.${low & 0xff}`;
+        })()
+      : null;
+  if (ipv4) {
+    const [a, b] = ipv4.split(".").map(Number);
+    return a === 10 || a === 127 || a === 192 && b === 168 || a === 172 && b >= 16 && b <= 31 || a === 169 && b === 254;
+  }
+  return /^f[cd][0-9a-f]{2}:/i.test(host) || /^fe[89ab][0-9a-f]:/i.test(host);
+}
+
+export function replyWaitTimeoutMs(url: string, replyWaitMinutes?: number): number {
+  if (!isLocalModelEndpoint(url)) return REQUEST_TIMEOUT_MS;
+  return replyWaitMinutes === undefined ? DEFAULT_LOCAL_REPLY_WAIT_MS : replyWaitMinutes * 60_000;
+}
+
+export function replyWaitTurnBudget(url: string, replyWaitMinutes?: number): Partial<TurnLoopBudget> {
+  const requestIdleMs = replyWaitTimeoutMs(url, replyWaitMinutes);
+  const budget: Partial<TurnLoopBudget> = { requestIdleMs };
+  if (isLocalModelEndpoint(url) && replyWaitMinutes !== undefined) {
+    budget.requestTimeoutMs = Math.max(
+      DEFAULT_TURN_LOOP_BUDGET.requestTimeoutMs,
+      requestIdleMs + LOCAL_REPLY_REQUEST_HEADROOM_MS,
+    );
+    budget.wallClockMs = Math.max(
+      DEFAULT_TURN_LOOP_BUDGET.wallClockMs,
+      requestIdleMs + LOCAL_REPLY_TURN_HEADROOM_MS,
+    );
+  }
+  return budget;
+}
+
+export const NODE_FETCH_NO_BYTE_LIMIT_MS = NODE_FETCH_NO_BYTE_TIMEOUT_MS;
+
+export function usesUnboundedFetchForReplyWait(url: string, waitMs: number): boolean {
+  return isLocalModelEndpoint(url) && waitMs >= NODE_FETCH_NO_BYTE_TIMEOUT_MS;
+}
+
+function fetchWithoutNodeNoByteTimeout(url: string, init: RequestInit): Promise<Response> {
+  noByteTimeoutAgent ??= new Agent({ headersTimeout: 0, bodyTimeout: 0 });
+  const requestHeaders: Array<[string, string]> = [];
+  new Headers(init.headers).forEach((value, key) => requestHeaders.push([key, value]));
+  const options: UndiciRequestInit = {
+    method: init.method,
+    headers: requestHeaders,
+    body: z.string().optional().parse(init.body ?? undefined),
+    signal: init.signal,
+    dispatcher: noByteTimeoutAgent,
+  };
+  return undiciFetch(url, options).then((upstream) => {
+    const meta = UpstreamResponseSchema.parse(upstream);
+    const headers = new Headers();
+    upstream.headers.forEach((value, key) => headers.append(key, value));
+    // SAFETY: Undici's response body is a Node stream type for the same WHATWG
+    // ReadableStream consumed by this driver; only its ambient declarations differ.
+    const body = upstream.body as ConstructorParameters<typeof Response>[0];
+    return new Response(body, {
+      status: meta.status,
+      statusText: meta.statusText,
+      headers,
+    });
+  });
+}
+
+export function watchLocalModelServer(
+  url: string,
+  apiKey: string,
+  stop: AbortController,
+  intervalMs = LOCAL_MODEL_PROBE_INTERVAL_MS,
+  /** When the last response byte arrived.  A probe is only needed once the
+   *  stream has been silent for a whole interval; bytes already prove life. */
+  lastByteAt?: () => number,
+  /** Called whenever the server is proven alive (bytes or an HTTP answer). */
+  onAlive?: () => void,
+): () => void {
+  if (!isLocalModelEndpoint(url)) return () => undefined;
+  let misses = 0;
+  let checking = false;
+  let stopped = false;
+  let activeProbe: AbortController | undefined;
+  let probeTimeout: ReturnType<typeof setTimeout> | undefined;
+  const abortProbe = () => activeProbe?.abort(stop.signal.reason);
+  const timer = setInterval(() => {
+    if (checking || stopped || stop.signal.aborted) return;
+    if (lastByteAt && Date.now() - lastByteAt() < intervalMs) {
+      misses = 0;
+      onAlive?.();
+      return;
+    }
+    checking = true;
+    const probe = new AbortController();
+    activeProbe = probe;
+    let timedOut = false;
+    probeTimeout = setTimeout(() => {
+      timedOut = true;
+      probe.abort(new DOMException("Local model liveness probe timed out", "TimeoutError"));
+    }, Math.min(intervalMs / 2, LOCAL_MODEL_PROBE_TIMEOUT_MS));
+    (async () => {
+      try {
+        const headers = new Headers();
+        if (apiKey) headers.set("authorization", `Bearer ${apiKey}`);
+        const response = await fetch(`${url}/models`, {
+          headers,
+          signal: probe.signal,
+        });
+        // Any HTTP response proves the server is alive; auth and model-list
+        // status are unrelated to whether its chat endpoint is progressing.
+        misses = 0;
+        onAlive?.();
+        await response.body?.cancel().catch(() => undefined);
+      } catch (error) {
+        // A slow probe says nothing about an active generation.  Only
+        // connection-level failures count toward the dead-server threshold.
+        if (!stopped && !stop.signal.aborted && !timedOut && error instanceof Error && isDefinitiveLocalProbeFailure(error) && ++misses >= LOCAL_MODEL_PROBE_MISSES) {
+          let host = "the local server";
+          try { host = new URL(url).host; } catch { /* URL was validated before driver creation. */ }
+          stop.abort(new Error(`The model server at ${host} stopped answering, so the reply was stopped.`));
+        }
+      } finally {
+        if (probeTimeout) clearTimeout(probeTimeout);
+        probeTimeout = undefined;
+        if (activeProbe === probe) activeProbe = undefined;
+        checking = false;
+      }
+    })().catch((error) => {
+      // Backstop so a probe can never raise an unhandled rejection.  Only the
+      // error name is logged: no key, URL or payload.
+      console.warn(`[openai-compat] local liveness probe failed (${error instanceof Error ? error.name : "unknown"})`);
+    });
+  }, intervalMs);
+  stop.signal.addEventListener("abort", abortProbe);
+  timer.unref?.();
+  return () => {
+    stopped = true;
+    clearInterval(timer);
+    if (probeTimeout) clearTimeout(probeTimeout);
+    stop.signal.removeEventListener("abort", abortProbe);
+    activeProbe?.abort(new DOMException("Local model liveness watcher stopped", "AbortError"));
+    activeProbe = undefined;
+  };
+}
+
+function isDefinitiveLocalProbeFailure(error: Error): boolean {
+  return error instanceof TypeError;
+}
 
 // Default catalog — overwritten by /models when the endpoint answers.
 // Free-tier-friendly defaults so the picker is never empty.
@@ -39,12 +244,74 @@ export interface OpenAICompatConfig {
   apiKeyEnv: string;
   /** Direct API key if configured */
   key?: string;
+  /** Custom configured models list (IDs or objects) */
+  models?: Array<string | { id: string; label?: string }>;
+  /** Custom icon URL or data URL (SVG, PNG, etc.) */
+  iconUrl?: string;
+  /** Per-server idle wait, in whole minutes. Absent keeps the local default. */
+  replyWaitMinutes?: ReplyWaitMinutes;
+}
+
+// Sentry's gen_ai.provider.name for whoever is actually answering.  Every
+// endpoint here speaks the OpenAI wire shape, so the URL is the only thing
+// that says whether a span belongs to OpenAI, OpenRouter, or Groq — calling
+// them all "openai" put four vendors in one Sentry bucket.
+export function sentryProviderForUrl(url: string): string {
+  let host = "";
+  try {
+    host = new URL(url).hostname.toLowerCase();
+  } catch {
+    return "openai-compat";
+  }
+  const hostMatches = (domain: string) => host === domain || host.endsWith(`.${domain}`);
+  if (hostMatches("openrouter.ai")) return "openrouter";
+  if (hostMatches("groq.com")) return "groq";
+  if (hostMatches("api.openai.com")) return "openai";
+  return "openai-compat";
+}
+
+/** The output-limit field a KNOWN endpoint documents, or null when the
+ *  endpoint is unrecognized and no field may be sent (a generic
+ *  OpenAI-compatible server is under no obligation to accept either name).
+ *
+ *  Sources (fetched 2026-10-21):
+ *   - OpenAI: `max_completion_tokens`; `max_tokens` deprecated
+ *     (openai-node completions.ts, mirroring platform.openai.com docs).
+ *   - Groq: `max_completion_tokens`; `max_tokens` deprecated
+ *     (https://console.groq.com/docs/api-reference#chat-create).
+ *   - OpenRouter: `max_tokens`
+ *     (https://openrouter.ai/docs/api-reference/chat-completion).
+ */
+export function maxOutputParamForUrl(url: string): "max_tokens" | "max_completion_tokens" | null {
+  const provider = sentryProviderForUrl(url);
+  if (provider === "openai" || provider === "groq") return "max_completion_tokens";
+  if (provider === "openrouter") return "max_tokens";
+  return null;
 }
 
 function decodeConfig(raw: unknown): OpenAICompatConfig {
   const o = (raw ?? {}) as Record<string, unknown>;
+  const parsedReplyWait = ReplyWaitMinutesSchema.optional().safeParse(o.replyWaitMinutes);
+  if (!parsedReplyWait.success) {
+    throw new Error(REPLY_WAIT_RANGE_MESSAGE);
+  }
   const envUrl = process.env.OPENAI_COMPAT_URL;
-  return {
+  const rawModels = Array.isArray(o.models) ? o.models : undefined;
+  const models: Array<string | { id: string; label?: string }> = [];
+  if (rawModels) {
+    for (const m of rawModels) {
+      if (typeof m === "string" && m.trim()) {
+        models.push(m.trim());
+      } else if (typeof m === "object" && m !== null && typeof (m as any).id === "string" && (m as any).id.trim()) {
+        const id = String((m as any).id).trim();
+        const label = typeof (m as any).label === "string" && (m as any).label.trim() ? String((m as any).label).trim() : undefined;
+        models.push(label ? { id, label } : { id });
+      }
+      if (models.length >= 15) break;
+    }
+  }
+
+  const decoded: OpenAICompatConfig = {
     url:
       typeof o.url === "string" && o.url
         ? o.url.replace(/\/+$/, "")
@@ -53,7 +320,11 @@ function decodeConfig(raw: unknown): OpenAICompatConfig {
           : "https://openrouter.ai/api/v1",
     apiKeyEnv: typeof o.apiKeyEnv === "string" && o.apiKeyEnv ? o.apiKeyEnv : "OPENAI_COMPAT_API_KEY",
     key: typeof o.key === "string" && o.key ? o.key : undefined,
+    models: models && models.length > 0 ? models : undefined,
+    iconUrl: typeof o.iconUrl === "string" && o.iconUrl.trim() ? o.iconUrl.trim() : undefined,
   };
+  if (parsedReplyWait.data !== undefined) decoded.replyWaitMinutes = parsedReplyWait.data;
+  return decoded;
 }
 
 export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
@@ -62,11 +333,15 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
     displayName: "OpenAI-compatible (OpenRouter / Groq)",
     supportsMultipleInstances: true,
     access: "custom",
+    // Mirrors the `capabilities` block in `create` below: agents and this
+    // computer, with no Composio, screen channel, or image input.
+    channelWiring: { agentsMcp: true, computerMcp: false, composioMcp: false, localComputerMcp: true, images: false },
   },
   models: DEFAULT_MODELS,
   // No CLI to install — the "install" is getting a free API key.
   install: {
     docsUrl: "https://openrouter.ai/keys",
+    apiKeyOnly: true,
     signInCommand:
       "add {\"openaiCompat\":{\"key\":\"sk-or-v1-…\"}} to ~/.botfleet/config.json (or set OPENAI_COMPAT_API_KEY)",
     command: {
@@ -83,16 +358,44 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
 
   async create(input: DriverCreateInput<OpenAICompatConfig>): Promise<ProviderInstance> {
     const { instanceId, config } = input;
+    const localEndpoint = isLocalModelEndpoint(config.url);
+    const effectiveReplyWaitMs = replyWaitTimeoutMs(config.url, config.replyWaitMinutes);
+    // process.env is process-wide, not per-instance: syncCredentialEnv copies
+    // the workspace's openaiCompat.key into process.env.OPENAI_COMPAT_API_KEY
+    // (and config.apiKeyEnv usually resolves to that same var) the moment it
+    // is saved, so every openai-compat instance's process.env lookup would
+    // otherwise see it — including a custom instance pointed at an arbitrary
+    // keyless endpoint. Only the single reserved `openaiCompat` instance may
+    // fall back to process.env; a user-added custom instance gets a key only
+    // via its own config.key or its isolated instance environment (matching
+    // injectedEnvironment()'s instance-id gate in config.ts).
+    const isCustomInstance = instanceId !== "openaiCompat";
     const apiKey =
       config.key ??
       input.environment[config.apiKeyEnv] ??
       input.environment["OPENAI_COMPAT_API_KEY"] ??
-      process.env[config.apiKeyEnv] ??
-      process.env["OPENAI_COMPAT_API_KEY"] ??
+      (isCustomInstance
+        ? undefined
+        : (process.env[config.apiKeyEnv] ?? process.env["OPENAI_COMPAT_API_KEY"])) ??
       "";
     const listeners = new Set<RuntimeEventListener>();
-    const active = new Map<string, { abort: AbortController; turnId: string }>();
-    let catalog = DEFAULT_MODELS;
+    const active = new Map<string, { abort: AbortController; turnId: string; startedAt: number; aliveAt: number; maxMs: number }>();
+    // The output-limit field is endpoint-level for the providers above, so
+    // every option of a recognized endpoint carries supportsMaxOutput; an
+    // unrecognized endpoint's catalog stays unmarked and the picker hides
+    // the control.
+    const maxOutputParam = maxOutputParamForUrl(config.url);
+    const stampMaxOutput = (c: ModelCatalog): ModelCatalog =>
+      maxOutputParam === null ? c : { ...c, options: c.options.map((option) => ({ ...option, supportsMaxOutput: true })) };
+    let catalog = stampMaxOutput(DEFAULT_MODELS);
+    if (config.models && config.models.length > 0) {
+      const options: ModelCatalog["options"] = config.models.map((m) => {
+        const id = typeof m === "string" ? m : m.id;
+        const label = typeof m === "object" && m.label ? m.label : id;
+        return { id, label, custom: true };
+      });
+      catalog = stampMaxOutput({ default: options[0].id, options });
+    }
 
     const emit = (event: RuntimeEvent) => {
       for (const l of [...listeners]) l(event);
@@ -112,34 +415,113 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
         stream: boolean;
         signal?: AbortSignal;
         tools?: any[];
+        onChunk?: () => void;
+        /** The local server answered a liveness probe or sent bytes. */
+        onAlive?: () => void;
         onDelta?: (d: string, streamKind?: "assistant_text" | "reasoning_text") => void;
-        onToolCallDelta?: (index: number, id: string | undefined, name: string | undefined, args: string | undefined) => void;
+        onUsage?: (usage: TurnUsage) => void;
+        /** The bot's optional output limit, sent under the field this
+         *  endpoint documents (maxOutputParamForUrl).  Absent sends nothing. */
+        maxOutputTokens?: number;
       },
     ): Promise<{
       text: string;
       reasoning: string;
       tool_calls?: any[];
-      usage: { input: number; output: number } | null;
+      usage: TurnUsage | null;
     }> => {
-      const bodyPayload: any = { model, messages, stream: opts.stream };
+      const bodyPayload: any = { model, messages, stream: opts.stream, ...(opts.stream ? { stream_options: { include_usage: true } } : {}) };
       if (opts.tools && opts.tools.length > 0) {
         bodyPayload.tools = opts.tools;
       }
-      const res = await fetch(`${config.url}/chat/completions`, {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${apiKey}`,
-          "content-type": "application/json",
-        },
-        body: JSON.stringify(bodyPayload),
-        signal: opts.signal ?? AbortSignal.timeout(120_000),
-      });
-      if (!res.ok) {
-        const body = await res.text().catch(() => "");
-        throw new Error(
-          `upstream HTTP ${res.status}${body ? `: ${body.slice(0, 200)}` : ""}`,
-        );
+      if (maxOutputParam !== null && opts.maxOutputTokens !== undefined) {
+        bodyPayload[maxOutputParam] = opts.maxOutputTokens;
       }
+      const headers: Record<string, string> = {
+        "content-type": "application/json",
+      };
+      if (apiKey) {
+        headers.authorization = `Bearer ${apiKey}`;
+      }
+      const requestSignal = opts.signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+      const livenessAbort = new AbortController();
+      let lastByteAt = Date.now();
+      const noteByte = () => {
+        lastByteAt = Date.now();
+        opts.onAlive?.();
+        opts.onChunk?.();
+      };
+      const stopWatching = localEndpoint && opts.stream
+        ? watchLocalModelServer(config.url, apiKey, livenessAbort, LOCAL_MODEL_PROBE_INTERVAL_MS, () => lastByteAt, opts.onAlive)
+        : () => undefined;
+      try {
+      const signal = localEndpoint && opts.stream
+        ? AbortSignal.any([requestSignal, livenessAbort.signal])
+        : requestSignal;
+      const send = opts.stream && usesUnboundedFetchForReplyWait(config.url, effectiveReplyWaitMs)
+        ? fetchWithoutNodeNoByteTimeout
+        : fetch;
+      const request = () => send(`${config.url}/chat/completions`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(bodyPayload),
+        signal,
+      });
+      let res = await request();
+      if (!res.ok && opts.stream && (res.status === 400 || res.status === 422)) {
+        // Some compatible endpoints reject these optional OpenAI fields.
+        // Retry only an explicit validation rejection, before any stream or
+        // tools can run, and keep the original cancellation/deadline budget.
+        const unsupportedField =
+          /unsupported|not supported|does not support|doesn't support|do not support|cannot support|can't support|not permitted|unrecognized|unknown|unexpected|extra_forbidden/i;
+        let rejection = await res.text().catch(() => "");
+        // One recovery per optional field, in either order: whichever field
+        // the endpoint names first, the retry can surface the other one, so
+        // each recovery re-reads the rejection for the next check.
+        const dropUnsupportedField = async (field: RegExp, strip: () => void): Promise<boolean> => {
+          if (!field.test(rejection) || !unsupportedField.test(rejection)) return false;
+          strip();
+          res = await request();
+          rejection = !res.ok && (res.status === 400 || res.status === 422) ? await res.text().catch(() => "") : "";
+          return true;
+        };
+        // Providers phrase the same 400 differently, so the wording check has to
+        // cover active voice ("does not support") as well as the adjective and
+        // passive forms ("unsupported", "not supported").  Matching only the
+        // latter left a plain "This endpoint does not support stream_options"
+        // rejection with no retry at all.
+        await dropUnsupportedField(/stream_options/i, () => {
+          delete bodyPayload.stream_options;
+        });
+        // The output-limit field this driver sends is optional too: an
+        // endpoint that rejects max_tokens/max_completion_tokens gets the
+        // same recovery instead of failing the whole turn.
+        if (maxOutputParam !== null && bodyPayload[maxOutputParam] !== undefined) {
+          // The stream_options pass below runs only after a max-output
+          // retry actually fired, so a persistent single-field rejection
+          // still costs exactly one retry.
+          if (
+            await dropUnsupportedField(/max_(completion_)?tokens/i, () => {
+              delete bodyPayload[maxOutputParam];
+            })
+          ) {
+            // The max-output retry can surface a stream_options rejection
+            // the first pass never saw, when the endpoint names the fields
+            // one at a time.  The recovery order must not depend on which
+            // field it reports first.
+            await dropUnsupportedField(/stream_options/i, () => {
+              delete bodyPayload.stream_options;
+            });
+          }
+        }
+      }
+      if (!res.ok) {
+        // Provider bodies can echo prompts or credentials.  Only the status
+        // and its typed classification are safe to surface in diagnostics.
+        throw httpErrorFor(res.status, "");
+      }
+      // headers are progress too: the socket answered
+      noteByte();
       if (!opts.stream) {
         const json: any = await res.json();
         const msg = json.choices?.[0]?.message;
@@ -149,77 +531,107 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
           text: mainContent,
           reasoning: reasoningContent,
           tool_calls: msg?.tool_calls,
-          usage: json.usage
-            ? {
-                input: json.usage.prompt_tokens ?? 0,
-                output: json.usage.completion_tokens ?? 0,
-              }
-            : null,
+          usage: json.usage ? toTurnUsage(json.usage) : null,
         };
       }
       let text = "";
       let reasoning = "";
-      let usage: { input: number; output: number } | null = null;
+      let usage: TurnUsage | null = null;
       let streamToolCalls: any[] = [];
       const reader = res.body!.getReader();
       const decoder = new TextDecoder();
       let buf = "";
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
-        let nl;
-        while ((nl = buf.indexOf("\n")) !== -1) {
-          const line = buf.slice(0, nl).trim();
-          buf = buf.slice(nl + 1);
-          if (!line.startsWith("data:")) continue;
-          const data = line.slice(5).trim();
-          if (data === "[DONE]") continue;
-          let chunk: any;
-          try {
-            chunk = JSON.parse(data);
-          } catch {
-            continue;
-          }
-          const delta = chunk.choices?.[0]?.delta;
-          const contentDelta = typeof delta?.content === "string" ? delta.content : undefined;
-          const reasoningDelta = typeof delta?.reasoning_content === "string" ? delta.reasoning_content : undefined;
-          const toolCallsDelta = Array.isArray(delta?.tool_calls) ? delta.tool_calls : undefined;
-          
-          if (reasoningDelta) {
-            reasoning += reasoningDelta;
-            opts.onDelta?.(reasoningDelta, "reasoning_text");
-          }
-          if (contentDelta) {
-            text += contentDelta;
-            opts.onDelta?.(contentDelta, "assistant_text");
-          }
-          if (toolCallsDelta) {
-            for (const tc of toolCallsDelta) {
-              const tcIndex = tc.index ?? 0;
-              if (!streamToolCalls[tcIndex]) streamToolCalls[tcIndex] = { id: "", function: { name: "", arguments: "" } };
-              if (tc.id) streamToolCalls[tcIndex].id += tc.id;
-              if (tc.function?.name) streamToolCalls[tcIndex].function.name += tc.function.name;
-              if (tc.function?.arguments) streamToolCalls[tcIndex].function.arguments += tc.function.arguments;
-              opts.onToolCallDelta?.(tcIndex, tc.id, tc.function?.name, tc.function?.arguments);
+      const takeSseLine = (line: string) => {
+        if (!line.startsWith("data:")) return;
+        const data = line.slice(5).trim();
+        if (data === "[DONE]") return;
+        let chunk: any;
+        try {
+          chunk = JSON.parse(data);
+        } catch {
+          return;
+        }
+        const delta = chunk.choices?.[0]?.delta;
+        const contentDelta = typeof delta?.content === "string" ? delta.content : undefined;
+        const reasoningDelta = typeof delta?.reasoning_content === "string" ? delta.reasoning_content : undefined;
+        const toolCallsDelta = Array.isArray(delta?.tool_calls) ? delta.tool_calls : undefined;
+
+        if (reasoningDelta) {
+          reasoning += reasoningDelta;
+          opts.onDelta?.(reasoningDelta, "reasoning_text");
+        }
+        if (contentDelta) {
+          text += contentDelta;
+          opts.onDelta?.(contentDelta, "assistant_text");
+        }
+        if (toolCallsDelta) {
+          for (const tc of toolCallsDelta) {
+            const tcIndex = tc.index ?? 0;
+            if (!streamToolCalls[tcIndex]) {
+              streamToolCalls[tcIndex] = { id: "", type: "function", function: { name: "", arguments: "" } };
             }
-          }
-          if (chunk.usage) {
-            usage = {
-              input: chunk.usage.prompt_tokens ?? 0,
-              output: chunk.usage.completion_tokens ?? 0,
-            };
+            // Only the arguments stream in fragments.  A provider that
+            // repeats the id and the name on every chunk — several do — used
+            // to accumulate `call_acall_acall_a` and `bashbashbash`, so the
+            // settled call could never be matched to the step it opened.
+            if (tc.id && !streamToolCalls[tcIndex].id) streamToolCalls[tcIndex].id = tc.id;
+            if (tc.function?.name && !streamToolCalls[tcIndex].function.name) {
+              streamToolCalls[tcIndex].function.name = tc.function.name;
+            }
+            if (tc.function?.arguments) streamToolCalls[tcIndex].function.arguments += tc.function.arguments;
           }
         }
+        if (chunk.usage) {
+          usage = toTurnUsage(chunk.usage);
+          opts.onUsage?.(usage);
+        }
+        if (chunk.error) {
+          const status = chunk.error.code ?? chunk.error.status;
+          // Error frames may contain request material.  Keep the status,
+          // never the upstream body, in the user-visible failure.
+          if (typeof status === "number" && Number.isInteger(status) && status >= 400 && status <= 599) {
+            throw httpErrorFor(status, "");
+          }
+          throw new Error("upstream reported a streaming error");
+        }
+      };
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) {
+            buf += decoder.decode();
+            if (buf.trim()) takeSseLine(buf.trim());
+            break;
+          }
+          // Any bytes at all keep the round's idle clock alive, parsed
+          // into a delta or not.
+          noteByte();
+          buf += decoder.decode(value, { stream: true });
+          let nl;
+          while ((nl = buf.indexOf("\n")) !== -1) {
+            const line = buf.slice(0, nl).trim();
+            buf = buf.slice(nl + 1);
+            takeSseLine(line);
+          }
+        }
+      } finally {
+        await reader.cancel().catch(() => {});
+        reader.releaseLock();
       }
       return { text, reasoning, usage, tool_calls: streamToolCalls.length > 0 ? streamToolCalls : undefined };
+      } finally {
+        stopWatching();
+      }
     };
 
     const fetchModels = async (): Promise<void> => {
-      if (!apiKey) return;
+      if (config.models && config.models.length > 0) return;
+      if (!apiKey && !isCustomInstance) return;
       try {
+        const headers: Record<string, string> = {};
+        if (apiKey) headers.authorization = `Bearer ${apiKey}`;
         const res = await fetch(`${config.url}/models`, {
-          headers: { authorization: `Bearer ${apiKey}` },
+          headers,
           signal: AbortSignal.timeout(8_000),
         });
         if (!res.ok) return;
@@ -242,17 +654,22 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
           options.push({ id, label });
         }
         if (options.length) {
-          catalog = { default: options[0].id, options };
+          catalog = stampMaxOutput({ default: options[0].id, options });
         }
       } catch {
         // keep DEFAULT_MODELS — never fail the instance on a catalog miss
       }
     };
-    if (apiKey) void fetchModels();
+    if (apiKey || isCustomInstance) void fetchModels();
 
     const sendTurn = async (turn: SendTurnInput) => {
       const { threadId } = turn;
-      if (!apiKey) {
+      // Validation rejects sendTurn before the loop exists, so startTurn's
+      // catch settles the dispatch exactly as it does
+      // for a CLI driver — error chip, watchdog settled, bot idle, all three
+      // queue drains.  A rejection here must never become a resolved turn
+      // that nothing ever settles.
+      if (!apiKey && !isCustomInstance) {
         throw new Error(
           `no API key — set ${config.apiKeyEnv} or add it to the instance config`,
         );
@@ -262,27 +679,43 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
       }
       const turnId = newId();
       const abort = new AbortController();
-      active.set(threadId, { abort, turnId });
+      const turnBudget = { ...DEFAULT_TURN_LOOP_BUDGET, ...replyWaitTurnBudget(config.url, config.replyWaitMinutes) };
+      active.set(threadId, { abort, turnId, startedAt: Date.now(), aliveAt: 0, maxMs: turnBudget.wallClockMs });
 
-      const openAiTools = (turn as any).tools ? (turn as any).tools.map((t: any) => ({
-        type: "function",
-        function: {
-          name: t.name,
-          description: t.description,
-          parameters: t.parameters ?? { type: "object", properties: {}, required: [] },
-        },
-      })) : undefined;
+      const openAiTools = turn.tools && turn.tools.length > 0
+        ? turn.tools.map((t) => ({
+            type: "function",
+            function: {
+              name: t.name,
+              description: t.description,
+              parameters: t.parameters ?? { type: "object", properties: {}, required: [] },
+            },
+          }))
+        : undefined;
 
-      const messages = [
-        ...(turn.system ? [{ role: "system", content: turn.system }] : []),
-        ...(turn.transcript ?? []).flatMap((m: any) => {
-          const res = [];
+      const model = turn.model || catalog.default;
+      // Round 1's prefix.  The loop owns this array from here and only ever
+      // APPENDS to it, so rounds 2..N re-send a byte-identical prefix and the
+      // endpoint's prompt cache stays reachable.  The transcript is byte- and
+      // entry-count-capped first so a long thread cannot grow past the
+      // model's prompt window or the provider's per-request size — see
+      // chat-completions/replay-cap.ts.
+      const cappedTranscript = capReplayedTranscript(turn.transcript);
+      // Only the stable half of the prompt heads the request; the volatile
+      // half rides the newest user message, every request, so the resent
+      // prefix stays byte-identical across a memory write (see
+      // prompt-split.ts splitChatPrompt).
+      const chat = splitChatPrompt(turn);
+      const messages: ChatMessage[] = [
+        ...(chat.system ? [{ role: "system" as const, content: chat.system }] : []),
+        ...cappedTranscript.flatMap((m): ChatMessage[] => {
+          const res: ChatMessage[] = [];
           if (m.role === "assistant") {
-            const assistantMsg: any = { role: "assistant", content: m.text || "" };
+            const assistantMsg: ChatMessage = { role: "assistant", content: m.text || "" };
             if (m.toolCalls && m.toolCalls.length > 0) {
-              assistantMsg.tool_calls = m.toolCalls.map((tc: any) => ({
+              assistantMsg.tool_calls = m.toolCalls.map((tc) => ({
                 id: tc.id,
-                type: "function",
+                type: "function" as const,
                 function: { name: tc.name, arguments: tc.arguments },
               }));
             }
@@ -290,11 +723,7 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
           } else {
             if (m.toolResults && m.toolResults.length > 0) {
               for (const tr of m.toolResults) {
-                res.push({
-                  role: "tool",
-                  tool_call_id: tr.id,
-                  content: tr.result,
-                });
+                res.push({ role: "tool", tool_call_id: tr.id, content: tr.result });
               }
             } else {
               res.push({ role: "user", content: m.text });
@@ -302,114 +731,122 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
           }
           return res;
         }),
-        { role: "user", content: turn.text },
+        ...(chat.text ? [{ role: "user" as const, content: chat.text }] : []),
       ];
-      appendNative(threadId, {
-        dir: "out",
-        source: "openai-compat.chat.completions",
-        // Native logs are diagnostic artifacts users commonly attach to
-        // issues. Keep routing metadata, not prompts or transcript content.
-        msg: { model: turn.model ?? catalog.default, messageCount: messages.length },
-      });
 
       emit({ ...base(threadId, turnId), type: "turn.started" });
       emit({
         ...base(threadId, turnId),
         type: "session.started",
         sessionId: null,
-        model: turn.model ?? catalog.default,
+        model,
       });
 
-      (async () => {
-        try {
-          const { text, reasoning, tool_calls, usage } = await complete(
-            messages,
-            turn.model || catalog.default,
-            {
+      const runRound: TurnLoopDeps["runRound"] = async (roundMessages, opts) => {
+        appendNative(threadId, {
+          dir: "out",
+          source: "openai-compat.chat.completions",
+          // Native logs are diagnostic artifacts users commonly attach to
+          // issues. Keep routing metadata, not prompts or transcript content.
+          msg: { model, messageCount: roundMessages.length, round: opts.round },
+        });
+        const { text, reasoning, tool_calls, usage } = await withChatSpan(
+          {
+            model,
+            conversationId: threadId,
+            taskId: turnId,
+            provider: sentryProviderForUrl(config.url),
+            input: formatGenAiMessages(roundMessages),
+          },
+          ({ recordUsage }) =>
+            complete(roundMessages, model, {
               stream: true,
-              signal: abort.signal,
+              signal: opts.signal,
               tools: openAiTools,
-              onDelta: (delta, streamKind = "assistant_text") =>
+              maxOutputTokens: turn.maxOutputTokens,
+              onChunk: opts.onChunk,
+              onAlive: () => {
+                const entry = active.get(threadId);
+                if (entry) entry.aliveAt = Date.now();
+              },
+              // `onPublished` before the emit: from here this round can
+              // never be retried, because a replay would show the person
+              // text they already read.  It also feeds the idle clock.
+              onDelta: (delta, streamKind = "assistant_text") => {
+                opts.onPublished?.();
                 emit({
                   ...base(threadId, turnId),
                   type: "content.delta",
                   streamKind,
                   delta,
-                }),
-              onToolCallDelta: (index, id, name, args) => {
-                emit({
-                  ...base(threadId, turnId),
-                  type: "tool_call.delta",
-                  index,
-                  toolCallId: id,
-                  name,
-                  args,
-                } as any);
-              }
-            },
-          );
-          appendNative(threadId, {
-            dir: "in",
-            source: "openai-compat.chat.completions",
-            msg: { textLength: text.length, reasoningLength: reasoning.length, toolCallsLength: tool_calls?.length ?? 0, usage },
-          });
-          const replyText = text.trim() ? text : reasoning;
-          if (replyText.trim() || (tool_calls && tool_calls.length > 0)) {
-            emit({
-              ...base(threadId, turnId),
-              type: "item.completed",
-              itemType: "assistant_text",
-              text: replyText,
-              toolCalls: tool_calls,
-            } as any);
-          }
-          if (usage) {
-            emit({
-              ...base(threadId, turnId),
-              type: "thread.token-usage.updated",
-              ...usage,
-            });
-          }
-          active.delete(threadId);
-          emit({
-            ...base(threadId, turnId),
-            type: "turn.completed",
-            ok: true,
-            stopReason: null,
-            cost: null,
-            ...(usage ? { usage } : {}),
-          });
-        } catch (e) {
-          active.delete(threadId);
-          const aborted = (e as Error).name === "AbortError";
-          if (!aborted) {
-            emit({
-              ...base(threadId, turnId),
-              type: "runtime.error",
-              message: (e as Error).message,
-            });
-          }
-          emit({
-            ...base(threadId, turnId),
-            type: "turn.completed",
-            ok: false,
-            stopReason: aborted ? "interrupted" : "error",
-            cost: null,
-          });
-        }
-      })();
+                });
+              },
+              // Forwarded straight to the loop's own live channel, so a
+              // round that errors mid-stream after several chunks still gets
+              // its usage folded into the terminal event instead of
+              // reporting zero.
+              onUsage: (u) => {
+                recordUsage(u);
+                opts.onUsage?.(u);
+              },
+            }),
+        );
+        appendNative(threadId, {
+          dir: "in",
+          source: "openai-compat.chat.completions",
+          msg: { textLength: text.length, reasoningLength: reasoning.length, toolCallsLength: tool_calls?.length ?? 0, usage, round: opts.round },
+        });
+        // A reply that is entirely reasoning (no assistant text) still needs
+        // to render as something — fall back to the reasoning text rather
+        // than settling a silently empty turn.  The loop is what turns a
+        // non-empty `text` into the `item.completed` event and into the next
+        // round's assistant-message prefix, so folding the fallback in here
+        // is what makes both of those honour it too.
+        const replyText = text.trim() ? text : reasoning;
+        return { text: replyText, usage, toolCalls: tool_calls };
+      };
+
+      // Detached, exactly as every CLI driver runs its turn: sendTurn
+      // resolves at DISPATCH so markTaskDispatched and the rewind clear are
+      // not deferred to the end of the loop.  runTurnLoop never rejects — it
+      // emits one turn.completed on every exit and resolves with which one.
+      void runTurnLoop({
+        base: () => base(threadId, turnId),
+        emit,
+        runRound,
+        messages,
+        // Only `timeoutMs` is read from this; the provider payload is built
+        // separately above from name/description/parameters.
+        tools: turn.tools,
+        toolResultHistoryChars: turn.toolResultHistoryChars,
+        toolHost: turn.toolHost,
+        requestApproval: turn.toolHost?.requestApproval
+          ? (ask) => turn.toolHost!.requestApproval!(ask)
+          : undefined,
+        signal: abort.signal,
+        // 120s of SILENCE ends a request, as it always has for this driver;
+        // a stream that keeps delivering bytes now runs to the loop's hard
+        // ceiling instead of being cut off at 120s mid-answer.
+        budget: replyWaitTurnBudget(config.url, config.replyWaitMinutes),
+        onSettled: () => active.delete(threadId),
+      });
 
       return { turnId };
     };
 
     const snapshot = async (): Promise<ProviderSnapshot> => {
-      if (!apiKey) {
+      if (!apiKey && !isCustomInstance) {
         return {
           state: "unavailable",
           reason: `no API key — set ${config.apiKeyEnv} or add it to the instance config`,
         };
       }
-      return { state: "available", authenticated: true, version: null, billing: "metered" };
+      return {
+        state: "available",
+        authenticated: Boolean(apiKey || isCustomInstance),
+        version: null,
+        ...(apiKey ? { billing: "metered" as const } : {}),
+      };
     };
 
     return {
@@ -417,6 +854,7 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
       driverKind: DRIVER_KIND,
       displayName: input.displayName,
       enabled: input.enabled,
+      iconUrl: config.iconUrl,
       get models() {
         return catalog;
       },
@@ -424,9 +862,43 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
       snapshot,
       adapter: {
         provider: DRIVER_KIND,
-        capabilities: { sessionModelSwitch: "in-session", localComputerMcp: true },
+        // no MCP server is mounted in this file and respondToRequest answers
+        // The driver owns both transcript replay and model-to-tool rounds.
+        // localComputerMcp runs host computer tools through the toolLoop host.
+        // Jobs matrix: BotFleet's job tools join this loop in P1; helpers
+        // stay `delegate_bot`.
+        capabilities: {
+          sessionModelSwitch: "in-session",
+          agentsMcp: true,
+          toolLoop: true,
+          localComputerMcp: true,
+          replaysTranscript: true,
+          // BotFleet's own job tools run in this loop (jobs P1).
+          backgroundJobs: "emulated",
+          helpers: "none",
+          // Every tool with an `ask` policy opens a card on the in-process
+          // permission broker (server/tools/approvals.ts) before it runs.
+          reviewHook: "before",
+        },
         sendTurn,
         interruptTurn: async (threadId) => active.get(threadId)?.abort.abort(),
+        sweepStuckTurns: async (olderThanMs: number) => {
+          const cutoff = Date.now() - olderThanMs;
+          const stuck: string[] = [];
+          for (const [threadId, entry] of active) {
+            if (entry.startedAt > cutoff) continue;
+            // A configured local wait owns its own wall clock; the loop ends
+            // the turn there.  Only sweep it once that has clearly passed.
+            if (Date.now() - entry.startedAt < entry.maxMs + 60_000) continue;
+            stuck.push(threadId);
+            entry.abort.abort();
+          }
+          return stuck;
+        },
+        liveTurnThreadIds: () => {
+          const now = Date.now();
+          return [...active].filter(([, entry]) => now - entry.aliveAt < 2 * LOCAL_MODEL_PROBE_INTERVAL_MS).map(([threadId]) => threadId);
+        },
         respondToRequest: async () => "unavailable" as const,
         hasSession: (threadId) => active.has(threadId),
         stopAll: async () => {
@@ -444,6 +916,21 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
           { stream: false },
         );
         return text.trim() ? text : reasoning;
+      },
+      // Auto-review on this same endpoint: one chat-completions call with no
+      // `tools`, the brief as the system message and the action as the user
+      // message (never argv), cancelled by the reviewer's own deadline.  Only the answer text is returned, never
+      // the reasoning: a verdict has to be the model's actual reply.
+      reviewPermission: async (prompt: ReviewPrompt, signal?: AbortSignal) => {
+        const { text } = await complete(
+          [
+            { role: "system", content: prompt.system },
+            { role: "user", content: prompt.data },
+          ],
+          catalog.default,
+          { stream: false, signal },
+        );
+        return text;
       },
       dispose: async () => {
         for (const { abort } of active.values()) abort.abort();

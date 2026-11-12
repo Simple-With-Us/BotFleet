@@ -4,10 +4,12 @@ import UIKit
 
 /// Account-aware Composio inventory for a paired phone.
 ///
-/// The companion may list accounts and start authorization, but revocation
-/// deliberately remains on the Mac. That keeps a lost phone from removing a
-/// workspace integration while still giving mobile users explicit Work,
-/// Personal, and client-account choices.
+/// Full parity with the computer: list, authorize, and detach an account.
+/// Authorization and detaching used to stay on the Mac, but the Connect
+/// button shipped here regardless, so the policy read to a person as an
+/// option that failed at the tap.  Detaching removes ONE account; removing a
+/// whole connected app is still done on the computer, which is the line the
+/// companion's allowlist draws.
 struct ConnectedAppsView: View {
     @EnvironmentObject private var session: Session
     @Environment(\.scenePhase) private var scenePhase
@@ -43,11 +45,11 @@ struct ConnectedAppsView: View {
                     Label("Accounts could not be re-checked", systemImage: "exclamationmark.triangle")
                         .foregroundStyle(.orange)
                     if statuses == nil {
-                        Text("Your computer could not open its credential store, so it cannot say which accounts are connected. Nothing has been disconnected — restarting OpenMausBot on your computer usually clears this.")
+                        Text("Your computer could not open its credential store, so it cannot say which accounts are connected. Nothing has been disconnected — restarting BotFleet on your computer usually clears this.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     } else {
-                        Text("Showing what was connected last time. Your computer could not open its credential store just now, so these could not be re-checked. Nothing has been disconnected — restarting OpenMausBot on your computer usually clears this.")
+                        Text("Showing what was connected last time. Your computer could not open its credential store just now, so these could not be re-checked. Nothing has been disconnected — restarting BotFleet on your computer usually clears this.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -154,6 +156,11 @@ struct ConnectedAppsView: View {
                         Image(systemName: account.isActive ? "checkmark.circle.fill" : "clock")
                             .foregroundStyle(account.isActive ? .green : .secondary)
                     }
+                    .swipeActions(edge: .trailing) {
+                        Button("Disconnect", systemImage: "minus.circle", role: .destructive) {
+                            Task { await disconnect(card, account: account) }
+                        }
+                    }
                 }
 
                 Button("Add another account", systemImage: "person.crop.circle.badge.plus") {
@@ -194,6 +201,14 @@ struct ConnectedAppsView: View {
         // guessing on the user's behalf.
         guard response.isAuthoritative else { return }
         statuses = response.services
+    }
+
+    /// Detach one account, then re-read the inventory so the row disappears
+    /// because the computer says it is gone — not because this view assumed
+    /// the call worked.
+    private func disconnect(_ card: ConnectorCard, account: ConnectorAccount) async {
+        guard await session.removeConnectorAccount(card.slug, accountId: account.id) else { return }
+        await refreshStatuses(showProgress: true)
     }
 
     private func authorize(_ card: ConnectorCard, alias: String?) async {

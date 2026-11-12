@@ -22,7 +22,20 @@ import { join } from "node:path";
 
 /** OMB_COMPANION_DIR isolates a test rig from a real paired fleet. */
 export const DATA_DIR = process.env.OMB_COMPANION_DIR ?? join(homedir(), ".botfleet-companion");
-const LEGACY_COMPANION_DIRS = [".openmausbot-companion", ".opengrokbot-companion"] as const;
+
+/** Where earlier builds kept the same paired fleet, newest first.  The
+ * product was OpenMausBot before it was BotFleet, and OpenGrokBot before
+ * that; an upgrade has to find its phones where the previous build left
+ * them.  The current directory's own name never belongs here — a list that
+ * names itself migrates nothing, which is how the rename to BotFleet
+ * silently unpaired every phone. */
+export const LEGACY_COMPANION_DIRS = [".openmausbot-companion", ".opengrokbot-companion"] as const;
+
+/** The location a fresh install uses.  Only this one inherits a
+ * predecessor's fleet: a directory chosen through OMB_COMPANION_DIR is a
+ * deliberate rig, and reaching out of it into the home folder would be a
+ * surprise. */
+const defaultDataDir = () => join(homedir(), ".botfleet-companion");
 
 /** 0700 on the directory, 0600 on the files it holds.
  *
@@ -35,18 +48,30 @@ const LEGACY_COMPANION_DIRS = [".openmausbot-companion", ".opengrokbot-companion
 const DIR_MODE = 0o700;
 export const FILE_MODE = 0o600;
 
-export function ensureDataDir(): void {
-  if (!process.env.OMB_COMPANION_DIR && !existsSync(DATA_DIR)) {
-    for (const name of LEGACY_COMPANION_DIRS) {
-      const legacy = join(homedir(), name);
-      if (!existsSync(legacy)) continue;
-      try {
-        renameSync(legacy, DATA_DIR);
-        break;
-      } catch {
-        /* cross-device or busy — try the next predecessor */
-      }
+/** Move the newest predecessor's directory into place, so the fleet paired
+ * under the old product name is the fleet this build boots with.  Only when
+ * `dataDir` does not exist yet: once it does, it is the truth, and an older
+ * directory beside it is left alone rather than merged.  Returns the
+ * directory that was adopted, or null when nothing was. */
+export function adoptLegacyDataDir(dataDir = DATA_DIR, home = homedir()): string | null {
+  if (existsSync(dataDir)) return null;
+  for (const name of LEGACY_COMPANION_DIRS) {
+    const legacy = join(home, name);
+    if (!existsSync(legacy)) continue;
+    try {
+      renameSync(legacy, dataDir);
+      return legacy;
+    } catch {
+      /* cross-device or busy — try the next predecessor */
     }
+  }
+  return null;
+}
+
+export function ensureDataDir(): void {
+  if (DATA_DIR === defaultDataDir()) {
+    const adopted = adoptLegacyDataDir(DATA_DIR);
+    if (adopted) console.log(`companion: paired devices moved from ${adopted} to ${DATA_DIR}`);
   }
   mkdirSync(DATA_DIR, { recursive: true, mode: DIR_MODE });
   // mkdirSync's mode applies only to a directory it creates — `recursive`

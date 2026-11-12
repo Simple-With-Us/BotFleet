@@ -9,9 +9,9 @@ describe("cloud computer lifecycle", () => {
   const botId = "browser-session-test";
 
   beforeAll(async () => {
-    const hash = createHash("sha256").update(botId).digest("hex").slice(0, 6);
-    const prefix = botId.slice(0, 8).toLowerCase().replace(/[^a-z0-9]/g, "");
-    const machineName = `ogb-${prefix}-${hash}`;
+    // Same pool-slot derivation as boxNameFor in box.ts (#117 hetzner pooling).
+    const poolIndex = createHash("sha256").update(botId).digest()[0] % 4;
+    const machineName = `ogb-pool-${poolIndex}`;
     api = createServer((req, res) => {
       const url = new URL(req.url ?? "/", "http://box.test");
       let body = "";

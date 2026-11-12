@@ -97,6 +97,23 @@ describe("control-plane desktop client", () => {
     expect(timeoutSignal).toHaveBeenNthCalledWith(1, 3_000);
   });
 
+  it("treats a plain-text or empty 2xx from /healthz as no control plane at all", async () => {
+    // accounts.botfleet.com (a host the project does not own) answers 200
+    // "OK" as text/plain; earlier it answered 204. Neither is a BotFleet
+    // control plane and neither may unlock hosted sign-in.
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(new Response("OK", { status: 200, headers: { "content-type": "text/plain" } }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(jsonResponse([]))
+      .mockResolvedValueOnce(jsonResponse({ ok: true }));
+    const client = createControlPlaneClient({ baseURL: "https://accounts.botfleet.app", fetchImpl });
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      await expect(client.health()).rejects.toMatchObject({ code: "control_plane_unavailable" });
+    }
+    expect(fetchImpl).toHaveBeenCalledTimes(4);
+  });
+
   it("uses the signed Better Auth bearer header, never its raw JSON token", async () => {
     const fetchImpl = vi.fn(async (_url, init) => {
       expect(JSON.parse(init.body)).toEqual({

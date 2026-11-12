@@ -6,12 +6,15 @@
 // falls back to the server-side queue.
 //
 // POSIX-gated like the other CLI e2es (the fakes are shebang scripts).
-import { spawn, type ChildProcess } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+
+import { spawnDetached, waitForExit } from "./testing/cleanup.ts";
+import { harnessReady } from "./testing/harness-ready.ts";
 
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
 const FAKE_CLAUDE = join(SERVER_DIR, "testing", "fake-claude-cli.ts");
@@ -57,16 +60,16 @@ posixOnly("mid-turn steering e2e", () => {
         },
       }),
     );
-    child = spawn(process.execPath, [join(SERVER_DIR, "index.ts")], {
+    child = spawnDetached(process.execPath, [join(SERVER_DIR, "index.ts")], {
       cwd: join(SERVER_DIR, ".."),
-      env: { ...(process.env.PATH ? { PATH: process.env.PATH } : {}), HOME: home, USERPROFILE: home, OMB_PORT: String(PORT) },
+      env: { PATH: process.env.PATH ?? "", HOME: home, USERPROFILE: home, OMB_PORT: String(PORT) },
       stdio: ["ignore", "pipe", "pipe"],
     });
     child.stderr!.on("data", (c) => (stderr += c));
     const deadline = Date.now() + 20_000;
     for (;;) {
       try {
-        if ((await fetch(`${BASE}/api/health`)).ok) break;
+        if (await harnessReady(BASE)) break;
       } catch {
         /* not up yet */
       }
@@ -77,12 +80,7 @@ posixOnly("mid-turn steering e2e", () => {
   }, 30_000);
 
   afterAll(async () => {
-    child?.kill("SIGTERM");
-    await new Promise<void>((resolve) => {
-      if (!child || child.exitCode !== null) return resolve();
-      child.on("close", () => resolve());
-      setTimeout(() => (child.kill("SIGKILL"), resolve()), 5_000).unref?.();
-    });
+    await waitForExit(child, { signal: "SIGTERM" });
     rmSync(home, { recursive: true, force: true });
   });
 
@@ -98,7 +96,7 @@ posixOnly("mid-turn steering e2e", () => {
       await waitFor(async () => (await getBot(created.id)).busy === true, "the turn to start");
       // the fake pauses after its tool result; this lands inside that gap
       await waitFor(async () => (await getBot(created.id)).messages.some((m: any) => m.kind === "activity"), "the tool chip");
-      const second = await api("POST", `/api/bots/${created.id}/messages`, { text: "and also this" });
+      const second = await api("POST", `/api/bots/${created.id}/messages`, { text: "and also this", busyDelivery: "steer" });
       expect(second.status).toBe(202);
       expect(second.body.steered).toBe(true);
 
@@ -120,6 +118,28 @@ posixOnly("mid-turn steering e2e", () => {
     },
     40_000,
   );
+
+  it("busyDelivery queue skips mid-turn steer even when the engine could steer", async () => {
+    const created = (await api("POST", "/api/bots")).body.bot;
+    await api("PATCH", `/api/bots/${created.id}`, { modelSelection: { instanceId: "claude", model: "claude-fake" } });
+    expect((await api("POST", `/api/bots/${created.id}/messages`, { text: "first" })).status).toBe(202);
+    await waitFor(async () => (await getBot(created.id)).busy === true, "the turn to start");
+    await waitFor(async () => (await getBot(created.id)).messages.some((m: any) => m.kind === "activity"), "the tool chip");
+    const queued = await api("POST", `/api/bots/${created.id}/messages`, {
+      text: "hold this",
+      busyDelivery: "queue",
+    });
+    expect(queued.status).toBe(202);
+    expect(queued.body.queued).toBe(true);
+    expect((await getBot(created.id)).messages.some((m: any) => m.text === "hold this")).toBe(false);
+    await api("POST", `/api/bots/${created.id}/interrupt`);
+    await waitFor(
+      async () => (await getBot(created.id)).messages.some((m: any) => m.text === "hold this"),
+      "the queued message to begin its turn",
+    );
+    await api("POST", `/api/bots/${created.id}/interrupt`);
+    await waitFor(async () => (await getBot(created.id)).busy === false, "the queued turn to settle");
+  }, 40_000);
 
   it("an engine without a live session preserves the message in the server-side queue", async () => {
     const created = (await api("POST", "/api/bots")).body.bot;

@@ -1,0 +1,196 @@
+# BotFleet Native macOS Rewrite — Port Inventory (BF-2502)
+
+Source of truth for what happens to every Node subsystem when the harness goes
+native. Gated-by reference for **BF-2514** (Phase 5 single-writer cutover and
+`app.botfleet.server` LaunchAgent retirement) and **BF-2515** (Phase 6 Node
+decommission): neither lands until every row below has a Swift owner or a
+retired reason.
+
+Surveyed at commit `c7902d63` (2026-10-21), re-counted 2026-10-25:
+`server/` 374 non-test files, ~142,800 lines · `companion/src/` 17 files,
+~11,330 lines · `shared/` 58 non-test files, ~11,050 lines (zero `node:`
+imports in source — only the three `*.test.ts` files reach for `node:fs`, so
+the portable set really is portable) · `electron/` 122 `.mjs`/`.cjs` files,
+135 tracked in total.
+
+Phases (reconstructed from the rewrite issue texts; `*` = no covering issue
+yet, file a follow-up before Phase 5):
+Phase 1 — foundation: storage, importer, perf budget, this inventory,
+fixtures. Phase 2 — engine runtime port. Phase 3 — native shell, Electron off,
+device endpoints. Phase 4 — Swift service layer (comms, routines, credentials).
+Phase 5 — cutover (BF-2514). Phase 6 — decommission (BF-2515, BF-2485, BF-2486,
+BF-2500).
+
+Owner modules: `DatabaseService` (BF-2480), `ImportTool` (BF-2495),
+`PerfBudget` (BF-2496), `ReplayHarness` (BF-2503), `EngineDriver` /
+`EngineCoordinator` (BF-2504), `ACPActor` (BF-2505),
+`InfisicalResolver` (BF-2506), remaining drivers (BF-2507), native runners
+(BF-2482), per-bot switch (BF-2508), `CUAEngine` (BF-2509), `ZulipEventActor` +
+Linear sync (BF-2512), `LinqEventActor` (BF-2617), `RoutinesScheduler` (BF-2513),
+`CostLedgerService` (BF-2619), `PluginSandboxHost` & `RecallClient` (BF-2620),
+iOS endpoint decision
+(BF-2510) and build (BF-2511), `MenuBarExtra` (BF-2484), `VoiceService`
+(BF-2483), `ScreenCaptureService` (BF-2481), `LifecycleService` (BF-2497),
+`TextKitTranscript` (BF-2501), `UpdateService`/Sparkle (BF-2486), daily-driver
+cutover (BF-2498), signing/TCC (BF-2499).
+
+## 1. Engine drivers → Phase 2
+
+| Node file(s) | Swift owner |
+|---|---|
+| `server/drivers/claude.ts`, `codex.ts`, `pi.ts`, `antigravity.ts`, `droid` (acp), `cursor` (acp), `kimi` (acp), `qwen` (acp), `hermes` (acp), `deepseek` (acp) | Native runners BF-2482; quirks actors BF-2505 |
+| `server/drivers/acp/core.ts`, `init-deadline.ts`, `prompt-budget.ts`, `turn-mcp.ts`, `dsh-acp-bridge.ts`, `opencode-go.ts`, `muse-msp-bridge.ts`, `muse.ts` (acp), `mcode.ts` (acp), `grok.ts` (acp), `dsh.ts`, `dsh-mcp.ts`, `native.ts` | `ACPActor` BF-2505 |
+| `server/drivers/minimax.ts`, `openai-compat.ts`, `model-discovery.ts`, `chat-completions/{credentials,errors,loop,pricing,replay-cap,usage}.ts`, `local-inject.ts`, `grok.ts` (chat-completions replay), `boxagent.ts` | Direct LLM clients BF-2506; chat-completions loop → `EngineDriver` BF-2504 |
+| `server/drivers/antigravity-models.ts`, `claude-models.ts`, `codex-catalog.ts`, `engine-command-{allowlists,discovery,commands,cache}.ts`, `cursor-engine-commands.ts`, `prompt-split.ts`, `retry.ts`, `builtIn.ts` | `EngineDriver` support BF-2504; catalogs → model metadata BF-2507 |
+| `server/drivers/{agents-proxy,dweb-proxy,phone-proxy,qdrant-proxy}.ts` | MCP-lane proxies → `EngineDriver` tool lane BF-2504; `phone-proxy` (Android USB) retired, no Mac story |
+| `server/drivers/cli-wrapper.ts` | Generic CLI wrapper → `EngineDriver` BF-2507 |
+| `server/harness/{bus,append-queue,registry}.ts` | Turn event bus → `EngineCoordinator` BF-2504 |
+| `server/helpers/tracker.ts` | Helper progress → `EngineCoordinator` BF-2504 |
+| `server/procs.ts`, `server/tools/process-group.ts` | Process-group spawn/kill → `EngineDriver` supervision BF-2504 |
+| `server/permission-proxy.ts`, `server/computer-proxy.ts`, `server/mcp-bridge.ts`, `server/mcp-remote-proxy.ts` | Per-turn MCP/permission proxies → `EngineDriver` BF-2504 |
+| `server/launch-identity.ts`, `server/contracts.ts`, `server/schema.ts`, `server/names.ts` | Launch contract + canonical types → `EngineDriver` BF-2504; contracts port as Swift protocols |
+| `server/tool-fields.ts`, `server/turn-tools.ts`, `server/tools/{agents,computer,github,host,jobs,phone,prompts,recall,shell-env,zulip}.ts`, `server/tools/registry.ts`, `schedule.ts` | Tool catalog + executors → `EngineDriver` tool lane BF-2504 (HTTP-lane tools fold into actor methods) |
+| `server/capability-profile.ts`, `server/computer-capability.ts`, `server/doomed-dispatch.ts`, `server/turn-safety.ts`, `server/turn-worktree-admission.ts` + wiring test | Dispatch gates → `EngineCoordinator` BF-2504 |
+| `server/model-{context-windows,fallback,lineage,default-slots,rejections}.ts`, `server/retired-model-ids.ts`, `server/instance-models.ts`, `server/claude-models.ts`, `server/antigravity-models.ts` | Model metadata + fallback chains → BF-2507 (data tables port with `shared/model-lineage.ts`) |
+| `server/engine-command-cache.ts` | Engine slash-command cache → `EngineDriver` BF-2504 |
+| `server/system-prompt.ts`, `server/context-injection.ts`, `server/turn-context.ts`, `server/tool-row.ts`, `server/tool-result-history.ts` | Prompt assembly → `EngineDriver` BF-2504 (pure logic, port with fixtures); oversized tool-result artifacts stay in this lane |
+| `server/seat-prompt.ts`, `bots/_shared.md`, `bots/*.md` (11 seats) | Seat prompts → app resources, `LifecycleService` BF-2497 |
+| `server/chief-of-staff.ts`, `server/botfleet-status-capsule.ts` | Roster/status capsule → `TurnDispatcherActor` input BF-2512 |
+| `server/turn-{stats,watchdog}.ts`, `server/thread-wedge-guard.ts`, `server/repeat-detector.ts`, `server/mcode-lock-contention.ts`, `server/provider-route-activity.ts` | Turn and provider-route health → `EngineCoordinator` BF-2504 |
+| `server/resume-recovery.ts`, `server/turn-worktree-admission.ts` | Resume/rebuild → `EngineDriver` BF-2504 + per-bot switch BF-2508 |
+| `server/checkpoints.ts` | Per-turn workspace snapshots → `EngineDriver` BF-2504 (git-based, reimplement with libgit2 or `git` CLI) |
+| `server/worktree-leases.ts` | Lease queue → `EngineDriver` BF-2504 |
+| `server/testing/*` (28 fakes/harness files) | Retired; replaced by `ReplayHarness` fixtures BF-2503 |
+| `server/provider-reload-order.test.ts` | Guards the module-scope provider reload fence in `server/index.ts` (the temporal-dead-zone read that surfaced as `provider_error`) → `EngineCoordinator` BF-2504, where the fence becomes actor state; the test retires with the file in BF-2515 |
+| `server/index.ts` (composition root: routes, boot wiring, harness entry) | Wiring collapses into `LifecycleService` BF-2497 and the Phase 5 actors; the file itself retires BF-2515 |
+| `server/cli-failure.ts`, `server/cli-probe-env.ts`, `server/stderr-excerpt.ts`, `server/host-dispatch-hot.ts` | Engine support (failure wording, credential-free probe env, shared host probe) → `EngineDriver` BF-2504 |
+| `server/attachments.ts` | Composer attachment staging → `EngineDriver` tool lane BF-2504 |
+| `server/bot-desktop-session.ts` | Shared-desktop identity → `CUAEngine` BF-2509, beside the `local-vm-*` rows |
+| `server/cloud-backend.ts` | Cloud-backend switch guard → per-bot switch BF-2508 |
+| `server/data-dir.ts`, `server/harness-ports.ts` | Data-root and port-ladder rules → app startup BF-2497 (twins of `electron/app-paths.mjs` and the `main.mjs` ladder) |
+| `server/idempotency.ts` | Retry-safe POST outcomes → companion endpoint BF-2511 and `RoutinesScheduler` BF-2513 |
+| `server/companion-writes.ts`, `server/named-tunnel-gate.ts` | Phone-write shapes and tunnel gate → the BF-2510 endpoint, built by BF-2511 |
+| `server/replies.ts` | Reply excerpt rendering → `TextKitTranscript` BF-2501 (pure logic port) |
+| `server/*-wiring.test.ts`, `server/*-e2e.test.ts`, `server/boot-*.test.ts`, `server/agent-docs-linear-board.test.ts`, `server/branching.test.ts`, `server/comms.test.ts`, `server/composer-attachments.test.ts`, `server/delete-refusal-routes.test.ts`, `server/drafts.test.ts`, `server/external-credential-startup.test.ts`, `server/fallback-tiers.test.ts`, `server/group-tasks.test.ts`, `server/harness-trust-boundary.test.ts`, `server/kill-tree.test.ts`, `server/max-tool-rounds.test.ts`, `server/mcp-server*.test.ts`, `server/mcp-sse*.test.ts`, `server/mcp-strict-handshake.test.ts`, `server/no-owner-defaults.test.ts`, `server/prompt-privacy.test.ts`, `server/retention-hold.test.ts`, `server/room-drain.test.ts`, `server/rooms-*.test.ts`, `server/secret-persistence.test.ts`, `server/task-*.test.ts`, `server/tasks.test.ts`, `server/unattended.test.ts`, `server/update-held-boot.test.ts`, `server/zulip-*.test.ts`, `server/bot-off*.test.ts` | Cross-cutting wiring, boot and lane tests.  Each ports with the subsystem it exercises (owners above); the corpus retires Phase 6 and replay coverage is BF-2503 |
+| `server/test-parent-watchdog.ts` | Test harness; retired with `server/testing/*`, replaced by BF-2503 fixtures |
+| `companion/README.md` | Pointer doc for the retired sidecar tree; deleted with it in BF-2515 |
+| `electron/error-page.test.mjs`, `electron/sentry-desktop.node-test.mjs`, `electron/sts-packaging.node-test.mjs`, `server/sts-launch.node-test.mjs` | Boot-page, Sentry and STS packaging tests.  Each retires with its subject (`LifecycleService` BF-2497 boot page, Sentry Cocoa follow-up, BF-2489 STS) in BF-2485/BF-2515 |
+
+## 2. Secrets and config → Phase 4 (BF-2506) unless noted
+
+| Node file(s) | Swift owner |
+|---|---|
+| `server/infisical.ts`, `infisical-client.ts`, `secret-map.ts` | `InfisicalResolver` BF-2506 |
+| `server/cli-logins.ts` | Seat-scoped CLI login read for one launched child (the fleet project's `/cli-logins/<SEAT>` folder) → `InfisicalResolver` BF-2506 for the vault read, with the launch identity's seat carried by `EngineDriver` BF-2504; the optional Linux server retains the read under the Linux preservation gate. |
+| `server/knob-map.ts`, `knob-write-through.ts`, `config.ts`, `instance-patch.ts`, `config-reload-keys.ts`, `server/feature-flags.ts` + `feature-flags.json` | `InfisicalResolver` + app settings BF-2506; flags migrate to native settings store; instance PATCH validation stays with the settings owner (BF-2640 reply-wait knob rides it) |
+| `server/peer-approval-key.ts`, `permission-allow-key.ts`, `provider-tool-allow.ts`, `peer-approval.ts`, `server/tools/approvals.ts`, `server/auto-approve.ts`, `command-guard.ts`, `path-containment.ts`, `tool-policy.ts`, `review-watch.ts`, `auto-review.ts` | Approval/permission policy → `EngineDriver` turn lane BF-2504 (policy tables port as data) |
+| `server/env-path.ts` | GUI-launch PATH augmentation → app startup BF-2497 (Finder-launch env) |
+| `server/proxy-paths.ts`, `server/runtime-identity.ts` | Runtime path/identity → app startup BF-2497 |
+| `server/atomic.ts`, `server/store-guard.ts` | Atomic writes + corrupt-store guard → `DatabaseService` BF-2480 (SQLite transactions subsume both) |
+| `server/host-id.ts`, `server/placement-identity.ts`, `shared/placement.ts` | Stable host identity and placement contracts → native host store / Swift worker under BF-2559 before Mac-local Node retirement; the optional Linux server retains its own identity and shared contract source under the Linux preservation gate.  Foundation fields and Swift job decoding land in BF-2596; `placement-evidence` stays human-only and unmet until the complete recipes pass. |
+| `server/placement-leases.ts`, `server/placement-store.ts`, `server/placement-payloads.ts`, `server/placement-readonly.ts`, `server/placement-worker-auth.ts`, `server/placement-worker-routes.ts`, `server/placement-worker-client.ts`, `server/placement-report-spool.ts`, `server/placement-worker-runtime.ts`, `shared/placement-worker-http.mjs`, `shared/mac-only-capabilities.ts` | Controller lease book, local SQLite authority, private payload foundation, scoped worker verifier, worker routes behind an optional transport, the worker transport client, the worker runtime and durable report spool and the Mac-only command table → native host store / Swift worker under BF-2559; the optional Linux server retains its own authority, payload, verifier, routes, worker client, worker runtime, report spool and capability source under the Linux preservation gate.  Enqueue, issuing leases, final reports, deduplication and controller epochs have a durable source foundation, but first activation and worker transport remain gated; `placement-evidence` stays unmet until the complete recipes pass. |
+| `server/opened-file.ts` | Root-owned path aliases and opened-file inode verification → native file-store validation alongside the BF-2559 host store; retained by the optional Linux server and placement evidence reader until replacement is verified. |
+| `server/placement-mode-store.ts` | The server's durable placement mode record (mode, controller epoch, server identity and overflow permission) → native host store / Swift worker under BF-2559; the optional Linux server retains its own mode record under the Linux preservation gate.  The mode record has a durable source foundation and the registry bridge now reads it, but first activation remains gated; `placement-evidence` stays unmet until the complete recipes pass. |
+| `server/placement-controller-bridge.ts` | The registry's admission path into the controller's queue, and the production caller of the unreachable sweep → native host store / Swift worker under BF-2559; the optional Linux server retains its own bridge under the Linux preservation gate.  A job start in a server mode becomes an enqueue on the controller, a host without the controller refuses with a reason and keeps no local waiting list, and the sweep timer starts; the durable SQLite authority and the worker transport are still gated, and `placement-evidence` stays unmet until the complete recipes pass. |
+| `server/host-resources.ts` | Current host resource/enforcement report → native host-resource transport and Swift worker under BF-2559; the optional Linux server retains its own cgroup read-back and admission-probe source.  BF-2598 adds the Node report; it proves no placement, per-job enforcement or retirement acceptance by itself.  P-BF-6 B7 adds unset-by-default headroom knobs (`jobs.admission.reservedCpuCores` / `reservedRamMb` / `minMemoryAvailablePercent` in `server/knob-map.ts`, resolved in `server/jobs/registry.ts`) and the knob-gated Mac `memory_pressure` probe in `server/jobs/admission.ts` feeding this report's available-memory readings only while a memory-headroom knob is set; the native port must carry the same unset-means-no-gate semantics. |
+| `server/storage-device.ts` | Deployed-server boot and sampled device identity checks → native host storage guard under BF-2559; optional Linux deployment retains this source and the private-volume service scaffold.  BF-2600 does not assert live mount isolation or placement recipe 12. |
+| `electron/infisical-read.mjs`, `electron/server-target.mjs`, `electron/remote-credential-guard.mjs` + their `.node-test.mjs` twins | Out-of-harness vault read, the `local`/`remote` server target, and the remote-mode credential refusal (BF-2544) → `InfisicalResolver` + app settings BF-2506; BF-2599 supplies the saved-host, origin-bound credential and read-only handshake library; BF-2603 composes Settings › Servers and exact local connection routing, while remote execution activation and the remote credential guard remain later slices |
+| `electron/startup-enrollment.mjs` + its `.node-test.mjs` twin | The nonsecret startup choice (`local` or `remote`) that gates the Infisical bootstrap at launch; an unreadable choice stops startup instead of reaching the vault (BF-2636) → app settings BF-2506; owner is the same slice as the server target above |
+| `ios/Sources/CompanionCore/SavedHosts.swift`, `ServerHandshake.swift`, `Client.swift`, `SSE.swift` + saved-host/handshake fixtures | BF-2599 supplies the native metadata, protected credential and handshake library; BF-2603 composes Servers Settings and local connections; remote execution and mode selection remain later slices |
+
+## 3. Storage → Phase 1 (BF-2480, BF-2495)
+
+| Node file(s) | Swift owner |
+|---|---|
+| `server/store.ts` (bots/threads), `message-db.ts`, `item-io-store.ts` | `DatabaseService` BF-2480 |
+| `server/routines.ts`, `routine-requests.ts`, `server/runtime/store.ts`, `server/jobs/registry.ts`, `server/zulip/state.ts`, `server/zulip/outgoing-spool.ts`, `server/decision-log.ts`, `server/telemetry-outbox.ts`, `server/mcp-oauth-store.ts`, `server/plugin-registry.ts`, `server/workspace.ts`, `server/section-context.ts` | Flat-file stores → `DatabaseService` tables BF-2480; live rows migrate via `ImportTool` BF-2495 |
+| `server/bot-package.ts`, `package-export.ts`, `team-manifest.ts`, `installed-playbooks.ts`, `playbook-install.ts`, `team-library.ts` | Package import/export → `ImportTool` BF-2495 (bot definitions ride the same importer) |
+| `server/thread-events.ts`, `server/transcript-retention.ts`, per-thread `events/*.ndjson` + `native/*.ndjson` logs | Retention bounds → `DatabaseService` BF-2480; live frames feed `ReplayHarness` fixtures BF-2503 before the tee stops |
+| `server/bot-cwd.ts`, `bot-directory.ts`, `bot-profile.ts`, `project-scout.ts`, `room-cwd.ts`, `task-workspace-context.ts`, `workspace-settings.ts` (shared) | Workspace/profile domain → `DatabaseService` schema BF-2480 + `shared/` Swift ports |
+
+## 4. Comms and automation → Phase 4
+
+| Node file(s) | Swift owner |
+|---|---|
+| `server/zulip/*` (23 files: client, hub, router, outbound, webhook, wire, credentials, format, mount, state, sentence-gap, outgoing-spool, types and their siblings) + `server/tools/zulip.ts` | `ZulipEventActor` + Linear sync BF-2512 |
+| `server/webhooks.ts`, `webhook-ingress.ts`, `webhook-payload.ts`, `server/routes/linq-webhook.ts` | Webhook ingress → `RoutinesScheduler` BF-2513 |
+| `server/request-log.ts`, `server/routes/github-request-log.ts`, `scripts/github-request-log-{runner,reconcile}.mjs` + their `.test.ts`/`.node-test.mjs` twins, `docs/operations/github-request-log.md` | GitHub request log: metadata-only Markdown consumer of webhook attempts (durable spool, HMAC GitHub route mirroring the Linq route, GET-only reconciler; ops tooling prepared, not installed) → `RoutinesScheduler` BF-2513 |
+| `server/routines.ts` (engine), `routine-requests.ts`, `resource-triggers.ts`, `trigger-gap.ts`, `automation-rollover.ts`, `ephemeral-dispatch.ts`, `room-queue.ts`, `room-turn-timeout.ts`, `room-cwd.ts`, `steer-queue.ts`, `member-turn.ts`, `delegations.ts`, `server/runtime/{runtime,envelope,level,tree,invariants,types}.ts`, `server/jobs/{admission,engine-fixtures,engine-lanes,mcp-lane,prompt,runner,sweep,wake,wake-usage}.ts`, `server/job-host.ts`, `server/update-turn-starter.ts`, `server/update-drain.ts`, `server/task-title.ts`, `server/wake-prompt.ts` | Scheduler + delegation runtime → `RoutinesScheduler` BF-2513; `update-drain` admission fence → cutover procedure BF-2514 |
+| `server/linq/{client,dispatch,outbound,types}.ts`, `server/tools/linq.ts` | `LinqEventActor` BF-2617 — the iMessage partner channel (`imessagePerBot: "linq"`), beside `ZulipEventActor` BF-2512:  REST client, webhook-push ingress, turn-scoped chat binding, `send_voice_message` tool;  credential via `InfisicalResolver` BF-2506, TTS via `VoiceService` BF-2483.  `server/routes/linq-webhook.ts` stays with the webhook-ingress row (BF-2513). |
+| `server/notify.ts`, `server/sentry-crons.ts`, `server/routine-monitor-slug.ts`, `server/comms-visibility.ts`, `server/chat-commands.ts`, `command-registry.ts` | Notifications + commands → Phase 4 (BF-2513 scheduler surfaces; command registry → native composer) |
+| `server/sse-broadcast.ts`, `server/serialized-preview.ts` | SSE fan-out → in-process observation (no socket) Phase 4; backpressure tests become unit tests |
+
+## 5. Companion sidecar → Phase 3 decision, Phase 5 cutover
+
+| Node file(s) | Swift owner |
+|---|---|
+| `companion/src/proxy.ts`, `routes.ts`, `wire.ts` | Allowlisted device→harness policy → native `NetworkService` BF-2510 decision (option a: serve in-app; option b: slim companion host) |
+| `companion/src/index.ts`, `listener.ts`, `lan-policy.ts`, `origin.ts` | Sockets/bind policy/private origin → app lifecycle BF-2497 + BF-2514 cutover |
+| `companion/src/devices.ts`, `state.ts`, `control.ts` | Pairing + device registry → Keychain-backed `PairingService` BF-2510/2511 |
+| `companion/src/mdns.ts`, `advertise-watch.ts`, `endpoints.ts`, `connected-devices.ts` | Discovery + presence → `NetworkService` (Network.framework/Bonjour) BF-2511 |
+| `companion/src/apns.ts` | APNs provider → push relay BF-2511 (server-side JWT stays out of the app) |
+| `companion/src/json.ts` | Trivial guards → fold into `NetworkService` |
+| `companion/test/*` (19 files), `scripts/capture-companion-fixtures.mjs` | Retired Phase 6; iOS parity covered by native `XCTest` + BF-2503-style fixtures |
+| `scripts/botfleet-companion-start.sh`, `scripts/launchd/app.botfleet.companion.plist`, `electron/managed-companion-*.mjs`, `electron/companion-*.mjs` | LaunchAgent supervision → retired Phase 5 BF-2514 (app as login item owns its sidecar or none) |
+| `ios/Sources/CompanionCore/*`, `ios/App/*` | Already Swift; endpoint contract follows BF-2510 decision, build per BF-2511 |
+
+## 6. Mac app shell and lifecycle → Phase 3 / Phase 5
+
+| Node file(s) | Swift owner |
+|---|---|
+| `electron/main.mjs`, `server-boot-probe.mjs`, `harness-ownership.mjs`, `attached-ui-shim.mjs`, `single-instance.mjs` | App startup + harness attach/fork → `LifecycleService` BF-2497; shim retired (UI in-process) |
+| `electron/server-controls.mjs`, `mac-control/Sources/BotFleetControlCore/*` (`ControlAPI`, `StartupPolicy`, `PersistencePolicy`, `OfflineDockerVM`, `OfflineVMHelper`) | Start/stop/status → `LifecycleService` BF-2497; the Control surface is already Swift, but its local half calls only `:8799` routes in `server/index.ts`, the LaunchAgents and the wrapper markers, so its post-Node disposition is a Phase 6 gate (`control-disposition`, BF-2583; Decision 1 in `docs/plans/2026-10-29-botfleet-control-after-node.md`) |
+| `scripts/botfleet-server-start.sh`, `scripts/launchd/app.botfleet.server.plist`, `scripts/botfleet-server-healthcheck.sh`, `scripts/launchd/harness-watchdog.node-test.mjs` | Always-on supervision → retired Phase 5 BF-2514 |
+| `server/harness-lifecycle.ts`, `server/boot-recovery.ts`, `server/system-control.ts`, `server/graceful-shutdown.ts`, `server/health-readiness.ts`, `server/process-crash-handler.ts` | Deliberate-stop semantics + boot recovery + health readiness + crash reporting → `LifecycleService` BF-2497, reused by BF-2514 cutover |
+| `server/static-files.ts`, `server/console-timestamps.ts`, `server/log-dedup.ts` | Packaged-UI serving + log hygiene → retired (native UI/logging: `os_log`) Phase 3 |
+| `electron/updater*.mjs`, `server/update-control.ts`, `scripts/update-botfleet*.mjs`, `scripts/update-botfleet*.sh`, `scripts/regenerate-*.mjs`, `scripts/stamp-commit-version.mjs` | Node updater → Sparkle pipeline BF-2486; Node scripts retired Phase 6 BF-2515 |
+| `server/desktop-open.ts`, `server/sts-access.ts`, `server/sts-tokens.ts` (shared), `electron/sts-tokens.mjs` | Remote wake + STS minting → BF-2489 (done) + iOS endpoint BF-2510 |
+| `server/desktop-probe.ts`, `server/screen-poller.ts` | Screen polling → `ScreenCaptureService` BF-2481 |
+| `server/data-faults.ts`, `server/observability.ts`, `server/sentry*.ts`, `server/telemetry*.ts` | Crash/span reporting: Node harness telemetry & Sentry retire in Phase 6 BF-2515 (native crash/span reporting → Sentry Cocoa Phase 3 BF-2541, done); fault banners → native UI view / `TextKitTranscript` BF-2501 (BF-2618) |
+| `server/gen-ai-cost.ts`, `server/rolling-spend.ts`, `server/ai-usage.ts`, `server/usage-quota.ts`, `server/local-usage-monitor.ts`, `server/quota-window-map.ts`, `server/child-session-ids.ts`, `server/claude-billed-call.ts`, `server/antigravity-quota.ts`, `server/deepseek-balance.ts`, `server/grok-quota.ts`, `server/minimax-balance.ts` | Spend/quota ledgers, including exact single-call billing proof → `CostLedgerService` Phase 4 (BF-2619); provider balance and quota probes fold into `EngineDriver` Phase 4 / `InfisicalResolver` BF-2506; Node harness files retire in Phase 6 under BF-2515 |
+| `electron/cua*.mjs/cjs`, `server/local-computer.ts`, `local-routing.ts`, `container-computer.ts`, `container-mcp.ts`, `container-runtime-guard.ts`, `local-vm-*.ts`, `desktop-open` viewers, `electron/desktop-*.cjs`, `screen-preview`, `skin-overlay` | CUA + Local VM → `CUAEngine` BF-2509; viewers → `ScreenCaptureService` BF-2481 |
+| `server/vps-computer.ts`, `vps-container-mcp.ts`, `vps-shared-session.ts`, `server/remote-computer.ts` | BYO-VPS/self-host computers → retired, no Mac story in Option A |
+| `server/box.ts`, `box-gateway-grant.ts` | Cloud-box computer → BF-2509 (confirm Mac story; hosted, no local runtime) |
+| `server/computer-{call-gate,control,grants,observation}.ts`, `server/control-client.ts` | Computer arbitration → `CUAEngine` BF-2509 |
+| `electron/speech*.mjs`, `build-speech-helper.mjs`, `build-recorder-helper.mjs`, `assemblyai.mjs`, `server/tts/*` (12 files), `server/recorded-message.ts`, `server/avatar-image.ts` | Voice pipeline → `VoiceService` BF-2483 (native Speech + AVAudioEngine); cloud TTS providers retire unless BF-2483 claims them |
+| `electron/credential-*.mjs`, `electron/secure-credential*.mjs`, `electron/workspace-credentials.mjs`, `electron/config-file-lock.mjs` | Keychain/credential restore → `InfisicalResolver` + Keychain BF-2506 |
+| `scripts/start-mcp-sse.sh`, `scripts/mcp-server.ts`, `scripts/mcp-sse.ts`, `server/mcp-server-config.ts`, `server/sse-*.ts` (server-side test helpers) | Dev MCP bridges → retired Phase 6 (in-process tools, no seats MCP token) |
+| `server/mcp-{directory,gate,gate-config,registry,trim,probe,oauth,oauth-discovery,oauth-store,http,schema-validator}.ts`, `server/composio*.ts`, `server/connector-proxy.ts`, `connector-verdict.ts` | MCP catalog + OAuth + Composio bridge → `EngineDriver` MCP lane BF-2504; connected-app OAuth follow-up folds into BF-2506* |
+| `server/plugin-*.ts`, `server/plugins.ts`, `server/skill-*.ts`, `server/skills.ts` (recall via `tools/recall.ts`, `recall-*.ts`) | Plugin/skill/recall hosts → `PluginSandboxHost` Phase 4 (BF-2620) beside `EngineDriver` MCP lane (BF-2504), `RecallClient` (BF-2620) reaching fleet recall service; plugin platform follows BF-2517 / BF-2611; Node harness files retire Phase 6 BF-2515 |
+| `server/bot-stop-policy.ts`, `server/turn-safety.ts` dispatch guards, `bot-power.ts` + `conversation-mode.ts` (shared) | Stop/power/mode semantics → `RoutinesScheduler` + UI BF-2513/BF-2501 |
+| `server/redact.ts` → `shared/redact.ts`, `server/tool-activity.ts` (shared), `server/speech-spans.ts`, `spoken-script.ts`, `karaoke-align.ts`, `pronunciations.ts`, `voice-*.ts` (shared) | Portable domain logic → direct Swift ports, no owner issue needed; `redact` + `karaoke-align` are the two biggest algorithm ports |
+| `server/terminology.ts` (shared), `conversation-mode.ts`, `thread-snooze.ts`, `busy-send-default.ts`, `workspace-settings.ts`, `bot-commands.ts`, `bot-avatar.ts`, `bot-profile.ts`, `model-lineage.ts`, `model-safety.ts`, `model-limits.ts`, `local-hosts.ts`, `local-auto-consent.ts`, `tool-scope*.ts`, `bypass-coverage.ts`, `container-runtime-name.ts`, `context-injection.ts`, `credential-request.ts`, `data-fault.ts`, `delegation-message.ts`, `helpers.ts`, `imessage-message.ts`, `item-io.ts`, `jobs.ts`, `outbound.ts`, `peer-refusals.ts`, `plugin-events.ts`, `plugin-manifest.ts`, `plugin-net-allow.ts`, `quota-plan-metadata.ts`, `routine-outcomes.ts`, `routine-request.ts`, `routine-retention.ts`, `run-on.ts`, `sign-in-request.ts`, `sts-tokens.ts`, `task-workspace-context.ts`, `text-format.ts`, `time-zone.ts` | All `shared/*.ts` → Swift value types Phase 1–4 alongside their feature owner; none are Node-blocked |
+
+## 7. Consumers besides the Mac app
+
+| Consumer | Uses | Native fate |
+|---|---|---|
+| iPhone app (`ios/`) | Companion `:8810` allowlisted routes + SSE; never `:8799` | Follows BF-2510 endpoint decision; build per BF-2511 |
+| `BotFleet Control` (`mac-control/`, already Swift) | `:8799` health/control/config + LaunchAgent state + `BF_CONTROL_STARTUP_POLICY_V1` markers | Drives `LifecycleService` BF-2497; the markers, the LaunchAgents and the `:8799` routes it depends on retire at BF-2514, so Control's local half needs its replacement or retirement landed first (gate `control-disposition`, BF-2583) |
+| VM image (`scripts/computer-vm-cli/`, CI `vm-image-build.yml`) | `server/container-computer.ts` Dockerfile + `vm-cli-*.ts` | Keep image build (Local VM is Docker on Mac); thin CLI shims retire with Node Phase 6 |
+| `cloudflare/composio-broker/` | None (no `:8799`/`:8810` calls) | Unaffected; self-host key path re-targets `InfisicalResolver` BF-2506 |
+| `cloudflare/control-plane/` | Stub only, already removed | No action |
+| `scripts/host-inventory.mjs`, `scripts/host-inventory.node-test.mjs`, `docs/verification/host-inventory.md` | Opt-in, read-only developer inventory and injected tests (BF-2601) | Retain as verification tooling for authorized capacity and selected-service observations; it sets no budget and is not runtime enforcement |
+| Dev scripts (`e2e-server`, `smoke-packaged-server`, `bundle-server`, fixture capture, `vite.config.ts` proxy) | Boot harness on throwaway HOME | Retire with Node Phase 6; fixture capture superseded by BF-2503 |
+| `apps/site`, `tools/`, `tv-face/` | None | Unaffected |
+
+## 8. Retired with reason (no Swift owner)
+
+- Windows/Linux desktop builds, NSIS scripts, PowerShell installers, `windows-*` CI jobs — BF-2500, Option A is macOS-only.
+- `server/`, `companion/`, Node-only `shared/` shims (none today — shared is clean), desktop `package.json` build deps, Node CI jobs — BF-2515, after Phase 4 inventory gate (this doc) and Phase 5 cutover.
+- Electron main + helpers + speech/recorder helpers — BF-2485, native shell BF-2479 replaces.
+- Node updater + `update-botfleet*` scripts + feed tooling — BF-2486 Sparkle replaces.
+- LaunchAgent plists + start scripts + healthcheck + watchdog test — BF-2514 retires supervision into the app login item.
+- MCP SSE bridge + seat tokens, `e2e-server`, smoke/bundle scripts, vite dev proxy — Phase 6.  The bridge's runtime surfaces retire with it:  the pm2 application `botfleet-mcp`, the `:8794` listener with its health endpoint, and the public route `botfleetadmin.jays.services` that forwards to it.  Its supervisors retire with it:  BotFleet Control's `McpServerControl`, `FleetServices` and `ProcessMonitor`, the Mac's `mac-process-watch` entry for the application, the tunnel ingress rule that forwards the route, and the register rows.  The route had a third-party iOS client and already answers `502`, and the native MCP surface is a per-turn loopback mount that is never advertised, so nothing in this rewrite replaces that route.
+- VPS/BYO computer paths (`vps-*.ts`, `remote-computer.ts`) — no Mac story in Option A.
+- Android USB phone proxy — no Mac story in Option A.
+- `server/testing/*` fakes — superseded by `ReplayHarness` fixtures BF-2503.
+- Packaged-UI static serving, `attached-ui-shim`, renderer bridge preload surface — in-process native UI, Phase 3.
+- `cloudflare/control-plane` stub — already dead, delete Phase 6.
+
+## 9. Gate statement
+
+BF-2514 and BF-2515 both cite this file as their Phase 4 inventory gate.  Coverage is re-checked by `scripts/audit-node-decommission.mjs` (BF-2515, 2026-10-24): every tracked file under `server/`, `companion/`, `shared/` and `electron/` must be named here or in the Electron inventory, and `scripts/check-decommission-gates.mjs` refuses the deletion until the Phase 5 issues and evidence are green.  `deploy/` is audited as well, and the optional `deploy/linux-server/` server deployment is a documented exception rather than a finding: it ships the same `server/` code and stays, because BotFleet may run with the server as the primary BotFleet server (BF-2544).  Re-survey command for deltas:
+`find server companion/src shared -maxdepth 1 -name '*.ts' ! -name '*.test.ts' | wc -l`
+and per-area `wc -l`. Any new `server/` or `companion/` file after this
+commit must land a row here before Phase 5 starts.

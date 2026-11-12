@@ -9,7 +9,35 @@ import {
   withoutManagedCompanionTunnelAccess,
 } from "./managed-companion-tunnel.mjs";
 
-export const DEFAULT_COMPANION_CONTROL_PLANE_URL = "https://accounts.botfleet.com";
+/** No build has an implicit hosted control plane. Packaged and development
+ * builds alike start without one; "Secure access" stays hidden until a
+ * fleet-owned control plane is configured through OMB_CONTROL_PLANE_URL
+ * on a `*.botfleet.app` origin (or a loopback Worker under development).
+ *
+ * The earlier default pointed at `accounts.botfleet.com`, a domain this
+ * project does not own (parked since 2016, on giantpanda.com nameservers).
+ * That default was removed in board row `43068cd4` along with the
+ * confused-agent `cloudflare/control-plane/` Worker that targeted it. */
+export const DEFAULT_COMPANION_CONTROL_PLANE_URL = "";
+
+/** The only public domain a hosted control plane may live on. Loopback HTTP
+ * remains allowed for a local Worker under development. */
+export const FLEET_CONTROL_PLANE_DOMAIN = "botfleet.app";
+
+const LOOPBACK_HOSTS = ["localhost", "127.0.0.1", "[::1]"];
+
+export function isFleetControlPlaneURL(origin) {
+  let parsed;
+  try {
+    parsed = new URL(origin);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol === "http:") return LOOPBACK_HOSTS.includes(parsed.hostname);
+  if (parsed.protocol !== "https:") return false;
+  const host = parsed.hostname.toLowerCase();
+  return host === FLEET_CONTROL_PLANE_DOMAIN || host.endsWith(`.${FLEET_CONTROL_PLANE_DOMAIN}`);
+}
 
 export const COMPANION_CLIENT_INSTANCE_FIELD = "companionClientInstanceId";
 export const COMPANION_ACCOUNT_TOKEN_FIELD = "companionAccountToken";
@@ -28,18 +56,24 @@ const DEFAULT_HEALTH_CACHE_MS = 30_000;
 const ownString = (document, field) =>
   typeof document?.[field] === "string" ? document[field] : "";
 
-/** Packaged builds have a safe hosted default. Development must opt into an
- * exact HTTPS origin (or HTTP loopback Worker) so a contributor never sends
- * an OTP or bearer to an accidental host. An explicitly invalid override
- * disables the feature instead of silently falling back to production. */
+/** No build has an implicit hosted control plane. Packaged and development
+ * builds alike must opt into an exact origin (OMB_CONTROL_PLANE_URL), and
+ * that origin must be on the fleet domain or a loopback Worker, so neither a
+ * user nor a contributor ever sends an OTP or bearer to a host the project
+ * does not operate. An invalid or off-domain override disables the feature
+ * instead of silently falling back anywhere. */
 export function resolveCompanionControlPlaneURL({
-  isPackaged,
+  // Kept for callers; packaging no longer changes the answer.
+  isPackaged = false,
   environment = process.env,
 } = {}) {
-  if (Object.hasOwn(environment, "OMB_CONTROL_PLANE_URL")) {
-    return normalizeControlPlaneURL(environment.OMB_CONTROL_PLANE_URL);
-  }
-  return isPackaged ? DEFAULT_COMPANION_CONTROL_PLANE_URL : "";
+  void isPackaged;
+  const candidate = Object.hasOwn(environment, "OMB_CONTROL_PLANE_URL")
+    ? environment.OMB_CONTROL_PLANE_URL
+    : DEFAULT_COMPANION_CONTROL_PLANE_URL;
+  const origin = normalizeControlPlaneURL(candidate);
+  if (!origin || !isFleetControlPlaneURL(origin)) return "";
+  return origin;
 }
 
 export function companionAccountCleanupPending(credentials) {
@@ -141,6 +175,7 @@ const FRIENDLY_MESSAGES = Object.freeze({
   endpoint_unavailable: "The secure connection service could not finish setup. Local pairing still works; try again shortly.",
   endpoint_cleanup_pending: "The secure connection is still being removed. Try signing out again shortly.",
   control_plane_unavailable: "Secure access is not available right now. Local pairing still works.",
+  control_plane_unconfigured: "Secure access is not configured in this build. Pair on the same Wi-Fi or over Tailscale instead.",
   internal_error: "The secure connection service had a problem. Local pairing still works; try again.",
   invalid_response: "The secure connection service returned an unexpected response. Try again.",
   request_failed: "The secure connection request could not be completed. Local pairing still works; try again.",
@@ -155,8 +190,11 @@ export function friendlyCompanionAccountError(error) {
   return `${message}${reference}`;
 }
 
-function publicState({ available, status, email, endpoint, message }) {
+function publicState({ available, configured = true, status, email, endpoint, message }) {
   const state = { available: Boolean(available), status };
+  // Present only when hosted access is absent from this build, so the
+  // renderer can hide the sign-in card instead of offering a retry.
+  if (configured === false) state.configured = false;
   const normalizedEmail = normalizeAccountEmail(email);
   if (normalizedEmail) state.email = normalizedEmail;
   const accessEndpoint = (() => {
@@ -249,8 +287,9 @@ export function createCompanionAccountService({
     if (!configured) {
       return publicState({
         available: false,
+        configured: false,
         status: "signed-out",
-        message: FRIENDLY_MESSAGES.control_plane_unavailable,
+        message: FRIENDLY_MESSAGES.control_plane_unconfigured,
       });
     }
     const document = credentials();
@@ -473,7 +512,7 @@ export function createCompanionAccountService({
   };
 
   const requestCode = (rawEmail) => serialize(async () => {
-    if (!configured) throw new Error(FRIENDLY_MESSAGES.control_plane_unavailable);
+    if (!configured) throw new Error(FRIENDLY_MESSAGES.control_plane_unconfigured);
     const email = normalizeAccountEmail(rawEmail);
     let requested;
     try {
@@ -491,7 +530,7 @@ export function createCompanionAccountService({
   });
 
   const verifyCode = (rawEmail, rawCode) => serialize(async () => {
-    if (!configured) throw new Error(FRIENDLY_MESSAGES.control_plane_unavailable);
+    if (!configured) throw new Error(FRIENDLY_MESSAGES.control_plane_unconfigured);
     const email = normalizeAccountEmail(rawEmail);
     phase = { status: "connecting", email };
     let verified;

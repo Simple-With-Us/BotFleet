@@ -1,30 +1,51 @@
-# botfleet-site
+# botfleet-site (apps/site)
 
-The marketing / status site for **[BotFleet.app](https://botfleet.app)**.  A static page listing the add-on features BotFleet has added on top of upstream [OpenMausBot](https://github.com/milind-soni/OpenMausBot), badged **Beta** or **Established** by how far along each one is.
+The marketing / status site for **[BotFleet.app](https://botfleet.app)**.  A static page listing the add-on features BotFleet layered on after forking [OpenMausBot](https://github.com/milind-soni/OpenMausBot) (all of them in testing), then the features OpenMausBot already shipped when we forked.
+
+## Deploy source of truth
+
+This directory (`apps/site` in the `Simple-With-Us/BotFleet` monorepo) is the **only** deploy source for `botfleet.app`.  Builds (`npm run build` → `node build.mjs`) trigger on push to `main` — whatever is committed here is what ships, gated by `vercel-ignore-hourly.sh` (skips previews, skips commits that did not touch site files, production at most once per three hours unless forced).  Hosting credentials and project settings live in the private operations inventory and deployment environment.
+
+This directory is the single source of truth for the site.  Deployment history — including a retired standalone site repository that once deployed to the same domain and fought this build for which version won — is recorded in the private operations inventory rather than here.
 
 ## Stack
 
-Plain static HTML/CSS (no build step), hosted on Vercel.  DNS is a Cloudflare zone (`botfleet.app`) on the Usage.Jays.Services account; the registrar is Namecheap with nameservers pointed at Cloudflare.
+Static HTML/CSS rendered from `features.json` via `node build.mjs`, hosted on Vercel.  DNS is a Cloudflare zone for the product domain; the account, zone ids, registrar and nameserver values live in the private operations inventory.
 
 - `features.json` — the feature list (the only file to edit for content changes).
-- `template.html` + `build.mjs` — render `index.html` from the data.
+- `template.html` + `build.mjs` — render `dist/index.html` from the data.
+- `public-assets.mjs` — the allowlist of files the build copies into `dist/`.  A file is published only if it is listed here.
+- `verify-output.mjs` — fails when `dist/` holds anything outside that allowlist (a `README.md`, a `docs/`, a `*.sh`, a `package.json`, an unlisted file).  Runs as part of `npm run build`, so a leak fails the deploy instead of shipping.
 - `sync-status.mjs` — refreshes each card's PR state from GitHub and reports merged-but-unlisted PRs and promotion candidates; it never moves a card between sections on its own.
-- `logo-256.png` / `icon-1024.png` / `apple-touch-icon.png` / `favicon-64.png` — BotFleet brand assets (from the BotFleet repo's `build/` icons).
-- `vercel.json` — clean URLs.
-- `.github/workflows/deploy.yml` — every push to `main` builds and deploys to Vercel; a daily run also syncs PR states.
+- `logo-256.png` / `icon-1024.png` / `apple-touch-icon.png` — the iOS/macOS app icon (white-background 1024 square).
+- `favicon-64.png` / `icon-transparent-1024.png` — transparent just-bots mark (favicon).
+- `hero-bots.png` / `wide-banner.png` / `wide-banner-transparent.png` — extra site art, white or transparent, as supplied.
+- `.well-known/apple-app-site-association` — associated-domains file for the iOS app's Universal Links (`applinks:botfleet.app`) and shared web credentials (`webcredentials:botfleet.app`); appIDs use Team `CC8UTF7ATG` / bundle `app.botfleet`.  Must stay in sync with `ios/App/BotFleet.entitlements`.
+- `vercel.json` — the build command, `outputDirectory: dist`, clean URLs, plus a header rule that serves the AASA file as `application/json`.
+
+## What is published
+
+`outputDirectory` is `dist/`, and only `dist/` is deployed.  It previously
+was `.` — this folder — which put `README.md`, `docs/EFFORT-LOG.md`,
+`vercel-ignore-hourly.sh`, `sync-status.mjs`, `build.mjs`, `template.html`,
+`features.json`, and `package.json` at `https://botfleet.app/<name>`.
+`node build.mjs` now clears `dist/` and writes only `index.html` plus the
+`public-assets.mjs` allowlist; `node verify-output.mjs` asserts that and
+fails the build if it is untrue.  `index.html` is generated, not committed.
 
 ## Updating the feature list
 
-Edit `features.json`, run `node build.mjs`, commit, push — the Action deploys.  Rules:
+Edit `features.json`, run `node build.mjs` (or `npm run build`), push to
+`main` — Vercel deploys.  Do not commit `dist/` or `index.html`.  Rules:
 
-- Feature statuses: `Established` = merged to BotFleet `main` or deployed and verified; `Beta` = shipped in a branch or open PR.  The builder hides any section with zero features (owner rule for Established).
-- `node sync-status.mjs` after PRs merge; it updates states in `features.json` and prints promotion candidates — moving a card to Established stays a judgment call.
-- Owner copy rules apply: two spaces between sentences (`&nbsp; ` in HTML strings so the gap survives rendering), Title Case headings, light theme.
+- Feature statuses: every BotFleet add-on is **In Testing**.  Do not add an Established section unless the owner asks.  The builder still hides any section with zero features.
+- `node sync-status.mjs` after PRs merge; it updates PR states in `features.json` and prints merged PRs that have no card yet.  Adding a card stays a judgment call.  Do not promote cards out of testing.
+- Owner copy rules apply: two spaces between sentences (a real U+00A0 plus a space in HTML strings — never the `&nbsp;` entity, which can leak as literal text), Title Case headings, light theme.
 - No internal agent seat names on the public site.
 - The bot roster is an example fleet, not a product claim — keep it framed that way.
 
-Manual deploy fallback: `vercel deploy --prod` from the repo root (project `botfleet-site`).
+Manual deploy fallback: `vercel deploy --prod` from `apps/site`.  The project name is in the private operations inventory, not here.
 
 ## Coordination
 
-Fleet coordination happens on THE BOARD and #agent-sync per `/Users/jay/apps/AGENT-SYNC.md`.  This repo mirrors its effort rows in `docs/EFFORT-LOG.md`.
+Fleet coordination happens on THE BOARD and #Work-In-Progress per the maintainer's `FLEET-PROTOCOL.md`.  This directory mirrors its effort rows in `docs/EFFORT-LOG.md`.

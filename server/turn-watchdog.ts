@@ -22,6 +22,16 @@ export interface TurnWatchdogOptions {
   checkMs: number;
   /** Called once per stalled turn, after the entry is removed. */
   onStall: (turn: WatchedTurn) => void;
+  /** Called at the top of every sweep, before the stall scan.  The one
+   * periodic tick the harness already runs, lent to anything that needs a
+   * slow heartbeat — today, asking each driver whether it has stranded a
+   * turn.  Never throws out of the sweep. */
+  onSweep?: () => void;
+  /** Threads whose provider is proven alive right now (a local model server
+   * answering while it generates silently).  Each sweep counts them as
+   * activity before the stall scan.  The provider owns how fresh that proof
+   * must be, and its own request budget still ends a wedged generation. */
+  liveThreadIds?: () => Iterable<string>;
   now?: () => number;
 }
 
@@ -79,12 +89,34 @@ export class TurnWatchdog {
     this.turns.delete(threadId);
   }
 
+  /** Every watched turn is being killed at once (a provider reload disposes
+   * the whole fleet). Forget them all and report which were in flight, so the
+   * caller can settle each one's bookkeeping — a routine receipt, a delegation
+   * watch — instead of letting the entries age into a misleading "no activity"
+   * stall twenty minutes later. */
+  settleAll(): WatchedTurn[] {
+    const turns = [...this.turns.values()];
+    this.turns.clear();
+    return turns;
+  }
+
   watching(threadId: string): boolean {
     return this.turns.has(threadId);
   }
 
   /** Visible for tests; the interval calls this. */
   sweep(): void {
+    try {
+      this.opts.onSweep?.();
+    } catch (e) {
+      // a heartbeat that throws must never stop the stall detector
+      console.error("watchdog: onSweep threw", e);
+    }
+    try {
+      for (const threadId of this.opts.liveThreadIds?.() ?? []) this.touch(threadId);
+    } catch (e) {
+      console.error("watchdog: liveThreadIds threw", e);
+    }
     const at = this.now();
     for (const turn of this.turns.values()) {
       if (turn.waitingOnHuman) continue;

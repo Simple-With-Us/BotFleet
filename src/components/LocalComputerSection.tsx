@@ -1,423 +1,433 @@
-// One-place setup for the isolated Local VM image and its shared/per-bot policy.
-import { useCallback, useEffect, useState } from "react";
+// One-place setup for which computer providers this workspace allows, and
+// a master view of every bot's per-provider grant.  The redesigned
+// Computer settings UI splits "which providers are available" (here)
+// from "how to install the Local VM runtime" (now in
+// `LocalVmRuntimeCard.tsx`); the operator-facing toggle row is the
+// answer to the first, and the runtime card still owns the second.
+//
+// What ships in this file:
+// - `<ComputerProviderToggle>` row per provider (ASCII.dev Box, Self-
+//   Hosted VPS, Local VM, This Computer), each with a caption explaining
+//   the impact of turning it off.
+// - `<BotComputerMatrix>` so every bot's grant is visible in one table,
+//   with a one-click "Apply new default to all" that opens a confirm
+//   dialog.
+// - `<ComputerImpactConfirmModal>` opens before any provider toggle
+//   turns off, listing the bots that would lose a leg of their grant.
+//
+// State lives in `state.config.botDefaults.computerProviders` (and
+// `vpsMode`); writes go through `PUT /api/config` and the legacy
+// `allowedComputers` field is back-filled from the new shape so the
+// server-side allowlist gate keeps working through the cut-over.
+import { useCallback, useMemo, useState } from "react";
+import { ApiError, api, useStore, type Bot, type ConfigStatus } from "@/state/store";
+import { Card } from "./SettingsPrimitives";
+import { ComputerProviderToggle } from "./ComputerProviderToggle";
+import { BotComputerMatrix } from "./BotComputerMatrix";
+import { useDesktopCapabilities } from "./DesktopCapabilities";
+import { engineReachKnown, instanceSupportsLocalComputer } from "@/lib/local-computer";
+import { ComputerImpactConfirmModal } from "./ComputerImpactConfirmModal";
+import { impactedBotsForProvider, mergeServerImpact, revalidateImpact, type ImpactedBot } from "@/lib/computer-impact";
 import {
-  AlertTriangle,
-  Check,
-  Circle,
-  ExternalLink,
-  Loader2,
-  RefreshCw,
-  RotateCcw,
-  Square,
-  Trash2,
-} from "lucide-react";
-import { Card, CommandLine } from "./SettingsPrimitives";
-import { cn } from "@/lib/cn";
+  applyDefaultsBody,
+  autoHostPlatform,
+  impactChangedRefusal,
+  providerControlsLocked,
+  resolveWorkspaceProviders,
+  staleProviderConfig,
+} from "@/lib/workspace-providers";
+import { LocalComputerAutoWarning } from "./LocalComputerAutoWarning";
+import {
+  COMPUTER_PROVIDER_ORDER,
+  DEFAULT_VPS_MODE,
+  type ComputerProviderId,
+  type ComputerProviders,
+  type VpsMode,
+} from "../../shared/local-auto-consent";
 
-type Action = "pull" | "run" | "start" | "stop" | "remove" | "recreate";
-
-interface Status {
-  platform: string;
-  runtime: string | null;
-  available: string[];
-  daemonUp: boolean;
-  image: boolean;
-  imageMatches: boolean;
-  managed: boolean;
-  container: "running" | "stopped" | "missing";
-  network: "loopback" | "unsafe" | "unknown";
-  security: "hardened" | "unsafe" | "unknown";
-  persistence: "durable" | "unsafe" | "unknown";
-  desktopReady: boolean;
-  ready: boolean;
-  problem: string | null;
-  image_ref: string;
-  base_image_ref: string;
-  driver_version: string;
-  container_name: string;
-  workspace_path: string;
-  workspace_guest_path: string;
-  viewer_url: string;
-  idle_timeout_ms: number;
-  mode: "shared" | "per-bot";
-  max_instances: number;
-  commands: {
-    install: string | null;
-    runtimeStart: string | null;
-    pull: string | null;
-    run: string | null;
-    start: string | null;
-    stop: string | null;
-    remove: string | null;
-    view: string;
-  };
-}
-
-function Step({ n, title, done, children }: { n: number; title: string; done: boolean; children?: React.ReactNode }) {
-  return (
-    <div className="flex gap-3">
-      <div
-        className={cn(
-          "mt-0.5 flex size-5 shrink-0 items-center justify-center rounded-full text-[11px]",
-          done ? "bg-success/20 text-success" : "border border-hairline/50 text-ink-secondary",
-        )}
-      >
-        {done ? <Check size={12} /> : n}
-      </div>
-      <div className="min-w-0 flex-1">
-        <div className={cn("text-[14px]", done ? "text-ink-secondary line-through" : "text-ink")}>{title}</div>
-        {!done && children && <div className="mt-2 flex flex-col items-start gap-2 [&>*]:max-w-full">{children}</div>}
-      </div>
-    </div>
-  );
-}
-
-function ActionButton({
-  action,
-  pending,
-  children,
-  onClick,
-  danger = false,
-}: {
-  action: Action;
-  pending: Action | null;
-  children: React.ReactNode;
-  onClick: () => void;
-  danger?: boolean;
-}) {
-  return (
-    <button
-      onClick={onClick}
-      disabled={pending !== null}
-      className={cn(
-        "flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-[12.5px] font-medium disabled:opacity-50",
-        danger ? "bg-danger/15 text-danger hover:bg-danger/20" : "bg-accent text-white hover:brightness-110",
-      )}
-    >
-      {pending === action && <Loader2 size={13} className="animate-spin" />}
-      {children}
-    </button>
-  );
+/** Derive the legacy `allowedComputers: Destination[]` array from the
+ * new per-provider shape so the server-side allowlist gate
+ * (`server/computer-grants.ts`) keeps answering the same question
+ * through the cut-over.  The legacy `"cloud"` destination is
+ * ambiguous between ASCII Box and Self-Hosted VPS; for the cut-over
+ * we keep the legacy field's contract narrow (`["cloud"]` means
+ * "either cloud backend is allowed", `null` means "every legacy
+ * destination is allowed") and rely on `server/computer-grants.ts`'s
+ * later `computerProviders` consult to enforce the per-backend
+ * distinction.  Returns `null` only when ALL four providers are on
+ * AND `selfHostedVps` is on (the only combination where every legacy
+ * destination is meaningfully on). */
+function allowedComputersFromProviders(providers: ComputerProviders): Array<"cloud" | "vm" | "local"> | null {
+  const cloud = providers.asciiBox || providers.selfHostedVps;
+  const vm = providers.localVm;
+  const local = providers.localMac;
+  // Every provider on (the legitimate "null = every destination is
+  // allowed" answer).  Returning null here is correct: it matches the
+  // legacy "no allowlist = every destination is allowed" semantics.
+  if (cloud && vm && local) return null;
+  // Otherwise, write an explicit narrowed array.  A partial-cloud
+  // shape (only one of {asciiBox, selfHostedVps} on) intentionally
+  // serializes `"cloud"` here so the server-side allowlist keeps the
+  // box-vs-vps decision; the later `computerProviders` consult in
+  // server/computer-grants.ts then picks the right backend.
+  const result: Array<"cloud" | "vm" | "local"> = [];
+  if (cloud) result.push("cloud");
+  if (vm) result.push("vm");
+  if (local) result.push("local");
+  return result;
 }
 
 export function LocalComputerSection() {
-  const [status, setStatus] = useState<Status | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [pending, setPending] = useState<Action | null>(null);
+  const { state, dispatch } = useStore();
+  const { capabilities } = useDesktopCapabilities();
+  const resolved = useMemo(() => resolveWorkspaceProviders(state.config), [state.config?.botDefaults]);
+  const providers = resolved.providers;
+  const vpsMode = resolved.vpsMode;
+  const bots = state.bots ?? [];
+  const [saving, setSaving] = useState(false);
+  const [applying, setApplying] = useState(false);
+  const configReady = state.config !== null && state.config !== undefined;
+  const locked = providerControlsLocked(state.config, saving, state.hydration.status);
   const [error, setError] = useState<string | null>(null);
-  const [policyPending, setPolicyPending] = useState(false);
-  const [refreshKey, setRefreshKey] = useState(0);
+  // The provider pending confirmation: set when the user clicks an
+  // enabled provider (would turn it off) and there is at least one bot
+  // that currently uses it.  `null` = no modal open.
+  const [impact, setImpact] = useState<{ provider: ComputerProviderId; impacted: ImpactedBot[] } | null>(null);
+  // Set when the server refuses an apply-defaults with
+  // `needsAcknowledgement`: the named bots would gain Auto with nobody
+  // having seen the warning.  Non-null shows the shared confirm dialog;
+  // confirming resubmits the same defaults with the exact identities
+  // shown in the warning.
+  const [pendingAck, setPendingAck] = useState<{
+    bots: { id: string; name: string }[];
+    request: { path: "/api/config" | "/api/bots/apply-defaults"; method: "PUT" | "POST"; body: unknown };
+  } | null>(null);
 
-  const refresh = useCallback(async (signal?: AbortSignal) => {
-    const response = await fetch("/api/local-computer", { signal });
-    const body = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(body.error ?? `Status request failed (${response.status})`);
-    setStatus(body as Status);
-    setError(null);
-  }, []);
-
-  useEffect(() => {
-    let active = true;
-    let timer: number | undefined;
-    let controller: AbortController | undefined;
-    const poll = async () => {
-      controller = new AbortController();
-      try {
-        await refresh(controller.signal);
-      } catch (e) {
-        if (active && !(e instanceof DOMException && e.name === "AbortError")) {
-          setStatus(null);
-          setError(e instanceof Error ? e.message : String(e));
-        }
-      } finally {
-        if (active) {
-          setLoading(false);
-          timer = window.setTimeout(() => void poll(), 5000);
-        }
-      }
-    };
-    void poll();
-    return () => {
-      active = false;
-      controller?.abort();
-      if (timer !== undefined) window.clearTimeout(timer);
-    };
-  }, [refresh, refreshKey]);
-
-  const post = async (action: Exclude<Action, "recreate">) => {
-    const response = await fetch(`/api/local-computer/${action}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: "{}",
-    });
-    const body = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(body.error ?? `${action} failed`);
-    setStatus(body as Status);
-  };
-
-  const act = async (action: Action) => {
-    if (
-      action === "remove" &&
-      !window.confirm("Delete the Local VM? Files and browser sign-ins in its durable workspace will remain.")
-    ) return;
-    if (
-      action === "recreate" &&
-      !window.confirm("Replace the existing Local VM with the pinned image and safety limits? Files and browser sign-ins in its durable workspace will remain.")
-    ) return;
-    setPending(action);
-    setError(null);
-    try {
-      if (action === "recreate") {
-        await post("remove");
-        await post("run");
-      } else {
-        await post(action);
-      }
-      // The desktop starts after the container process; keep the progress
-      // state honest and let the regular poll mark it Ready a few seconds on.
-      await refresh();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setPending(null);
-    }
-  };
-
-  const savePolicy = async (mode: Status["mode"], maxInstances: number) => {
-    setPolicyPending(true);
-    setError(null);
-    try {
-      const response = await fetch("/api/config", {
-        method: "PATCH",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ localVm: { mode, maxInstances } }),
-      });
-      const body = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(body.error ?? "Could not save the Local VM isolation policy");
-      setStatus((current) => current ? { ...current, mode, max_instances: maxInstances } : current);
-      await refresh();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setPolicyPending(false);
-    }
-  };
-
-  const c = status?.commands;
-  const ready = status?.ready === true;
-  const existing = status?.container !== "missing";
-  const needsRecreate = Boolean(
-    existing &&
-      (status?.container === "stopped" ||
-        !status?.imageMatches ||
-        !status?.managed ||
-        status?.network === "unsafe" ||
-        status?.security === "unsafe" ||
-        status?.persistence === "unsafe"),
+  // The bots that would lose a leg of their grant if the named
+  // provider were disabled.  Used both to gate the toggle (no affected
+  // bots -> commit without a modal) and to populate the modal list.
+  // Auto bots (`computers === undefined`) are included: their grant is
+  // the workspace default, so disabling a provider does effectively
+  // remove a leg of their grant, and the modal must list them so the
+  // operator confirms before that change ships.
+  // The Auto This Computer fallback only mounts on macOS with an
+  // engine that has a local approval channel
+  // (`shouldMountLocalComputer({ requested: undefined, ... })` on the
+  // server).  Resolving the same gate here keeps the matrix and this
+  // impact list from naming bots the runtime would never mount — a
+  // Linux/Windows host or an engine without local reach means no
+  // fallback, so no leg of the grant is lost when the provider turns
+  // off.  While the instance list is still hydrating the engine side
+  // stays fail-open (`undefined`), matching the picker.
+  // The server's platform, not this window's: a browser pointed at a macOS
+  // harness reports "other", which would hide every Auto bot's host grant
+  // and let a This Computer disable skip the affected-bots confirm.
+  const hostPlatform = autoHostPlatform(state.config, capabilities.host.platform);
+  const instances = state.instances ?? [];
+  const reachKnown = engineReachKnown({ instances, hydrationStatus: state.hydration.status });
+  const autoLocalFor = useCallback(
+    (bot: Bot) =>
+      hostPlatform === undefined
+        ? undefined
+        : {
+            hostPlatform,
+            engineSupportsLocal: reachKnown ? instanceSupportsLocalComputer(instances, bot) : undefined,
+          },
+    [hostPlatform, instances, reachKnown],
   );
-  const unavailable = !loading && !status;
-  const host = status?.platform === "darwin" ? "Mac" : "computer";
-  const perBot = status?.mode === "per-bot";
-  const perBotRuntimeUnsupported = perBot && status?.runtime === "container";
-  const headerReady = perBot ? Boolean(status?.daemonUp && status?.image && !perBotRuntimeUnsupported) : ready;
+  // A routine, webhook or resource trigger set to run in the cloud gets the
+  // cloud destination even on a bot whose computers are off (resolveGrants).
+  // The matrix and the impact confirm read the same list.
+  const automations = useMemo(
+    () => ({
+      routines: state.routines,
+      webhooks: state.webhooks,
+      resourceTriggers: state.resourceTriggers,
+    }),
+    [state.routines, state.webhooks, state.resourceTriggers],
+  );
+  const botsUsingProvider = useCallback(
+    (provider: ComputerProviderId): ImpactedBot[] =>
+      impactedBotsForProvider(provider, {
+        bots,
+        workspaceProviders: providers,
+        workspaceCloudBackend: state.config?.botDefaults?.cloudBackend,
+        workspaceDefaultComputers: state.config?.botDefaults?.computers,
+        autoLocalFor,
+        automations,
+      }),
+    [
+      bots,
+      providers,
+      state.config?.botDefaults?.cloudBackend,
+      state.config?.botDefaults?.computers,
+      autoLocalFor,
+      automations,
+    ],
+  );
+
+  // Persist a new providers shape.  Always writes both the new key and
+  // the legacy `allowedComputers` (back-filled from the new shape)
+  // so the server-side allowlist gate stays in lock-step with the
+  // operator-facing toggle.  When the server refuses with
+  // `needsAcknowledgement` (e.g. enabling This Computer would newly
+  // grant local Auto access to an auto-approved bot), the existing
+  // `<LocalComputerAutoWarning>` dialog is opened so the operator can
+  // consent and resubmit; a plain error is not surfaced in that case.
+  const persist = useCallback(
+    (nextProviders: ComputerProviders, nextVpsMode: VpsMode, acknowledgedImpact: readonly string[] = []) => {
+      const body = {
+        botDefaults: {
+          computerProviders: nextProviders,
+          vpsMode: nextVpsMode,
+          allowedComputers: allowedComputersFromProviders(nextProviders),
+        },
+        // What this window showed.  The server refuses the save if the
+        // stored toggles have moved since, so a stale window cannot turn a
+        // provider back on that another window just turned off.
+        expectedComputerProviders: providers,
+        // The bots the confirm named (none when no confirm was needed).  The
+        // server recomputes the impact on its own state and refuses the save
+        // when it finds a bot this list did not name.
+        acknowledgedImpact: [...acknowledgedImpact],
+      };
+      setSaving(true);
+      setError(null);
+      api("/api/config", { method: "PUT", body: JSON.stringify(body) })
+        .then((config: ConfigStatus) => {
+          dispatch({ type: "configStatus", config });
+        })
+        .catch((e) => {
+          if (e instanceof ApiError && Array.isArray(e.body?.needsAcknowledgement) && e.body.needsAcknowledgement.length > 0) {
+            setPendingAck({
+              bots: e.body.needsAcknowledgement,
+              request: { path: "/api/config", method: "PUT", body },
+            });
+            return;
+          }
+          const refusal = impactChangedRefusal(e);
+          if (refusal) {
+            if (refusal.config) dispatch({ type: "configStatus", config: refusal.config });
+            const disabled = COMPUTER_PROVIDER_ORDER.find((id) => providers[id] === true && nextProviders[id] !== true);
+            if (disabled) {
+              setImpact({
+                provider: disabled,
+                impacted: mergeServerImpact(botsUsingProvider(disabled), refusal.impacted, disabled),
+              });
+              return;
+            }
+          }
+          const stale = staleProviderConfig(e);
+          if (stale) dispatch({ type: "configStatus", config: stale });
+          setError(e.message);
+        })
+        .finally(() => setSaving(false));
+    },
+    [dispatch, providers, botsUsingProvider],
+  );
+
+  const handleProviderToggle = (provider: ComputerProviderId, next: boolean) => {
+    if (locked) return;
+    if (!next) {
+      // Disable path.  If any bot currently uses the provider, gate
+      // the change on the modal; otherwise commit immediately.
+      const impacted = botsUsingProvider(provider);
+      if (impacted.length === 0) {
+        const nextProviders = { ...providers, [provider]: false };
+        // Disabling the VPS provider clears its mode.  Other providers
+        // leave the existing mode untouched (the VPS mode is its
+        // question; the cloudBackend for the ASCII Box provider is
+        // unrelated).
+        persist(nextProviders, provider === "selfHostedVps" ? null : vpsMode);
+        return;
+      }
+      setImpact({ provider, impacted });
+      return;
+    }
+    // Enable path: no modal, the only impact is that more bots can use
+    // the provider from this point on.  When re-enabling the VPS
+    // provider after a disable, atomically restore the shipped
+    // default mode so the toggle and the mode control do not
+    // deadlock — the operator would otherwise have to pick a mode
+    // before re-enabling, with no UI path to do either first.
+    const nextProviders = { ...providers, [provider]: true };
+    const nextVpsMode = provider === "selfHostedVps" && vpsMode === null ? DEFAULT_VPS_MODE : vpsMode;
+    persist(nextProviders, nextVpsMode);
+  };
+
+
+
+  // Apply workspace defaults to every bot.  Mirrors the existing
+  // `BotComputerDefaults.tsx` consent handshake: the server may refuse
+  // with `needsAcknowledgement` if any bot would gain This Computer +
+  // Auto with nobody having seen the warning.  The handler stores the
+  // original request (path + method + body) so the acknowledgement
+  // dialog can resubmit to the SAME endpoint — a `PUT /api/config`
+  // toggle must not accidentally route through `/api/bots/apply-defaults`.
+  const submitRequest = (
+    request: { path: "/api/config" | "/api/bots/apply-defaults"; method: "PUT" | "POST"; body: unknown },
+    acknowledgedBots?: { id: string; name: string }[],
+    busySignal?: "apply" | "save",
+  ) => {
+    if (busySignal === "apply") setApplying(true);
+    else if (busySignal === "save") setSaving(true);
+    setError(null);
+    api(request.path, {
+      method: request.method,
+      body: JSON.stringify({
+        ...(request.body as Record<string, unknown>),
+        ...(acknowledgedBots ? { acknowledgeLocalAuto: true, acknowledgedBots } : {}),
+      }),
+    })
+      .then((response: ConfigStatus | { applied: number; config: ConfigStatus }) => {
+        setPendingAck(null);
+        const config = "config" in response ? response.config : response;
+        dispatch({ type: "configStatus", config });
+      })
+      .catch((e) => {
+        if (e instanceof ApiError && Array.isArray(e.body?.needsAcknowledgement) && e.body.needsAcknowledgement.length > 0) {
+          setPendingAck({ bots: e.body.needsAcknowledgement, request });
+        } else {
+          // An acknowledged resubmit carries the same expected toggles, so
+          // it can go stale too; show the current state it was refused for.
+          setPendingAck(null);
+          const refusal = impactChangedRefusal(e);
+          if (refusal) {
+            if (refusal.config) dispatch({ type: "configStatus", config: refusal.config });
+            const sent = (request.body as { botDefaults?: { computerProviders?: ComputerProviders } } | null)
+              ?.botDefaults?.computerProviders;
+            const disabled = sent
+              ? COMPUTER_PROVIDER_ORDER.find((id) => providers[id] === true && sent[id] !== true)
+              : undefined;
+            if (disabled) {
+              setImpact({
+                provider: disabled,
+                impacted: mergeServerImpact(botsUsingProvider(disabled), refusal.impacted, disabled),
+              });
+              return;
+            }
+          }
+          const stale = staleProviderConfig(e);
+          if (stale) dispatch({ type: "configStatus", config: stale });
+          setError(e.message);
+        }
+      })
+      .finally(() => {
+        if (busySignal === "apply") setApplying(false);
+        else if (busySignal === "save") setSaving(false);
+      });
+  };
+
+  const applyToAll = () => {
+    if (!configReady) return;
+    submitRequest(
+      {
+        path: "/api/bots/apply-defaults",
+        method: "POST",
+        body: applyDefaultsBody(state.config?.botDefaults),
+      },
+      undefined,
+      "apply",
+    );
+  };
 
   return (
     <>
       <Card
-        title="Local VM"
-        subtitle={perBot
-          ? `Private Cua Linux desktops on this ${host}, with one container and durable workspace per bot. Distinct bots can work concurrently and idle desktops stop after 8 hours.`
-          : `A shared Cua Linux sandbox on this ${host} for bots to browse and work in — isolated, backed by one durable workspace, and automatically recycled after 8 hours without activity.`}
+        id="setting-computers-providers"
+        title="Providers"
+        subtitle="The computer providers any bot in this workspace is allowed to use.  Disabling a provider here keeps every bot off it, no matter what a bot's own settings say.  Leave the shipped set on to keep the current behavior."
       >
-        <div className="flex flex-wrap items-center gap-2">
-          <span
-            className={cn(
-              "flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[12.5px]",
-              headerReady ? "bg-success/15 text-success" : "bg-control text-ink-secondary",
-            )}
-          >
-            {loading ? <Loader2 size={12} className="animate-spin" /> : headerReady ? <Check size={12} /> : <Circle size={9} />}
-            {loading
-              ? "Checking…"
-              : unavailable
-                ? "Status unavailable"
-                : perBot && headerReady
-                  ? "Ready for per-bot desktops"
-                  : perBotRuntimeUnsupported
-                    ? "Per-bot mode requires Docker or Podman"
-                  : ready
-                    ? "Ready"
-                    : (status?.problem ?? "Not ready")}
-          </span>
-          <button
-            onClick={() => {
-              setLoading(true);
-              setRefreshKey((key) => key + 1);
-            }}
-            disabled={loading || pending !== null}
-            className="flex items-center gap-1.5 rounded-lg border border-hairline/40 px-2.5 py-1 text-[12.5px] text-ink-secondary hover:bg-control hover:text-ink disabled:opacity-40"
-          >
-            <RefreshCw size={12} /> Re-check
-          </button>
-          {ready && !perBot && (
-            <a
-              href={status?.viewer_url ?? c?.view}
-              target="_blank"
-              rel="noreferrer"
-              className="flex items-center gap-1.5 rounded-lg border border-hairline/40 px-2.5 py-1 text-[12.5px] text-ink hover:bg-control"
-            >
-              <ExternalLink size={12} /> Watch screen
-            </a>
-          )}
-        </div>
-        {error && <div className="mt-3 rounded-lg bg-danger/10 px-3 py-2 text-[12px] text-danger">{error}</div>}
-      </Card>
-
-      <Card
-        title="Isolation"
-        subtitle="Shared keeps the original single-desktop behavior. Per bot gives each bot its own container, workspace, viewer port, lease, and idle timer."
-      >
-        <div className="flex overflow-hidden rounded-lg border border-hairline/40">
-          {(["shared", "per-bot"] as const).map((mode, index) => (
-            <button
-              key={mode}
-              type="button"
-              disabled={!status || policyPending}
-              onClick={() => void savePolicy(mode, status?.max_instances ?? 2)}
-              className={cn(
-                "flex-1 px-3 py-2 text-[13px] disabled:opacity-50",
-                index > 0 && "border-l border-hairline/40",
-                status?.mode === mode ? "bg-control text-ink" : "text-ink-secondary hover:text-ink",
-              )}
-            >
-              {mode === "shared" ? "Shared" : "Per bot"}
-            </button>
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          {COMPUTER_PROVIDER_ORDER.map((id) => (
+            <ComputerProviderToggle
+              key={id}
+              provider={id}
+              enabled={providers[id]}
+              busy={locked}
+              onToggle={(next) => handleProviderToggle(id, next)}
+            />
           ))}
         </div>
-        <div className="mt-3 flex items-center justify-between gap-3">
-          <div>
-            <div className="text-[13px] text-ink">Maximum per-bot desktops</div>
-            <div className="text-[11.5px] text-ink-secondary">Limits storage and host resource use; each running desktop may use up to 4 GB and 2 CPUs.</div>
-          </div>
-          <select
-            aria-label="Maximum per-bot desktops"
-            value={status?.max_instances ?? 2}
-            disabled={!status || policyPending}
-            onChange={(event) => void savePolicy(status?.mode ?? "shared", Number(event.target.value))}
-            className="rounded-lg border border-hairline/40 bg-control px-2.5 py-1.5 text-[13px] text-ink disabled:opacity-50"
-          >
-            {[1, 2, 3, 4].map((value) => <option key={value} value={value}>{value}</option>)}
-          </select>
-        </div>
-        {policyPending && <div className="mt-2 flex items-center gap-1.5 text-[12px] text-ink-secondary"><Loader2 size={12} className="animate-spin" /> Saving…</div>}
-      </Card>
-
-      <Card title="Setup" subtitle="Once a container runtime is open, BotFleet prepares Cua and the VM for you.">
-        <div className="flex flex-col gap-4">
-          <Step n={1} title="Install a container runtime" done={Boolean(status?.runtime)}>
-            <div className="text-[13px] leading-relaxed text-ink-secondary">
-              Podman and Colima are free. Docker Desktop may require a paid licence for larger companies and government use.
-            </div>
-            {c?.install ? (
-              <CommandLine command={c.install} />
-            ) : (
-              <a href="https://podman.io/docs/installation" target="_blank" rel="noreferrer" className="text-[13px] text-accent hover:underline">
-                Open the Podman installation guide
-              </a>
-            )}
-          </Step>
-
-          <Step
-            n={2}
-            title={status?.runtime && !status.daemonUp ? `Open and start ${status.runtime}` : "Start the container runtime"}
-            done={Boolean(status?.daemonUp)}
-          >
-            {!status?.runtime ? null : c?.runtimeStart ? (
-              <CommandLine command={c.runtimeStart} />
-            ) : (
-              <div className="text-[13px] text-ink-secondary">Open the installed runtime and start its engine, then re-check.</div>
-            )}
-          </Step>
-
-          <Step n={3} title="Prepare the Cua desktop (one-time download and build)" done={Boolean(status?.image)}>
-            {status?.daemonUp && (
-              <ActionButton action="pull" pending={pending} onClick={() => void act("pull")}>Prepare Cua desktop</ActionButton>
-            )}
-            {c?.pull && <details className="text-[12px] text-ink-secondary"><summary className="cursor-pointer">Show base-image download</summary><div className="mt-2"><CommandLine command={c.pull} /></div></details>}
-          </Step>
-
-          <Step
-            n={4}
-            title={perBot ? "Create a private desktop from each bot's Computer panel" : needsRecreate ? "Replace the older or unsafe VM" : "Create and start the Local VM"}
-            done={!perBot && ready}
-          >
-            {perBot ? (
-              <div className="text-[13px] leading-relaxed text-ink-secondary">
-                {perBotRuntimeUnsupported
-                  ? "Apple container requires an explicit host port, so BotFleet will not guess or expose one. Install or start Docker or Podman for safe per-bot dynamic loopback ports."
-                  : <>
-                      Choose <b className="text-ink">Local VM</b> for a bot, open that bot's Computer panel, then create its desktop there. BotFleet assigns a private workspace and an available loopback viewer port automatically.
-                    </>}
-              </div>
-            ) : needsRecreate ? (
-              <>
-                <div className="flex gap-2 text-[13px] text-warning">
-                  <AlertTriangle size={15} className="mt-0.5 shrink-0" />
-                  <span>{status?.problem}</span>
-                </div>
-                {status?.image ? (
-                  <ActionButton action="recreate" pending={pending} onClick={() => void act("recreate")} danger>
-                    <RotateCcw size={13} /> Delete and recreate
-                  </ActionButton>
-                ) : (
-                  <div className="text-[13px] text-ink-secondary">Prepare the pinned Cua desktop above before replacing this VM.</div>
-                )}
-              </>
-            ) : status?.container === "stopped" ? (
-              <ActionButton action="start" pending={pending} onClick={() => void act("start")}>Start Local VM</ActionButton>
-            ) : status?.container === "running" ? (
-              <div className="flex items-center gap-2 text-[13px] text-ink-secondary"><Loader2 size={13} className="animate-spin" /> Waiting for the desktop…</div>
-            ) : status?.image ? (
-              <ActionButton action="run" pending={pending} onClick={() => void act("run")}>Create Local VM</ActionButton>
-            ) : null}
-            {c?.run && <details className="text-[12px] text-ink-secondary"><summary className="cursor-pointer">Show command</summary><div className="mt-2"><CommandLine command={c.run} /></div></details>}
-          </Step>
-        </div>
-      </Card>
-
-      {unavailable && (
-        <Card>
-          <div className="flex gap-2 text-[13px] text-ink-secondary">
-            <AlertTriangle size={15} className="mt-0.5 shrink-0 text-warning" />
-            <span>BotFleet could not inspect the container runtime. Re-check, or review the app logs.</span>
-          </div>
-        </Card>
-      )}
-
-      <Card
-        title="Safety and storage"
-        subtitle={perBot
-          ? `Cua Driver operates only each VM's desktop. Every bot gets a private host folder mounted at ${status?.workspace_guest_path ?? "/home/cua/workspace"}; its files and browser profile survive VM replacement. Viewers bind only to loopback, and exact bot-derived targets prevent one bot from attaching to another bot's container. Each VM keeps the existing 4 GB, 2 CPU, 512-process and dropped-capability limits. VMs can still reach the internet.`
-          : `Cua Driver operates only the VM's desktop. Exactly one private host folder is mounted at ${status?.workspace_guest_path ?? "/home/cua/workspace"}; files and browser sign-ins there survive VM replacement, while everything elsewhere in the VM remains disposable. The password-protected viewer is available only on this machine. Docker and Podman runs are limited to 4 GB memory, 2 CPUs and 512 processes; all Linux capabilities are dropped except the two the desktop supervisor needs to switch to its unprivileged user. The VM can still reach the internet, and bots share it one at a time.`}
-      >
-        {existing && (
-          <div className="flex flex-wrap gap-2">
-            {status?.container === "running" && (
-              <ActionButton action="stop" pending={pending} onClick={() => void act("stop")}>
-                <Square size={12} /> Stop
-              </ActionButton>
-            )}
-            <ActionButton action="remove" pending={pending} onClick={() => void act("remove")} danger>
-              <Trash2 size={12} /> {perBot ? "Delete legacy shared VM" : "Delete VM"}
-            </ActionButton>
+        {configReady && resolved.resolvedFromLegacy && (
+          <div className="mt-3 rounded-lg bg-warning/10 px-3 py-2 text-[11.5px] text-warning">
+            Loaded from the legacy <code className="font-mono">allowedComputers</code> shape.  The next save will write the new per-provider key alongside it.
           </div>
         )}
-        <div className="mt-3 break-all text-[11px] text-ink-secondary">
-          Durable workspace: {status?.workspace_path ?? "not created"} ·{" "}
-          Cua Driver: {status?.driver_version ?? "0.20.0"} · Local image: {status?.image_ref ?? "not prepared"}
-          {status?.base_image_ref ? <> · Base: {status.base_image_ref}</> : null}
-        </div>
       </Card>
+
+      <Card
+        id="setting-computers-matrix"
+        title="Bots"
+        subtitle="Which providers every bot in this workspace has.  Per-bot edits live in each bot's settings; the matrix is the master view."
+      >
+        <BotComputerMatrix
+          bots={bots}
+          workspaceProviders={providers}
+          workspaceDefaultComputers={state.config?.botDefaults?.computers}
+          workspaceCloudBackend={state.config?.botDefaults?.cloudBackend}
+          hostPlatform={hostPlatform}
+          instances={instances}
+          instancesReady={reachKnown}
+          automations={automations}
+          busy={applying || saving || !configReady}
+          onApplyToAll={applyToAll}
+        />
+      </Card>
+
+      {error && (
+        <div className="rounded-lg bg-danger/10 px-3 py-2 text-[12px] text-danger" title={error}>
+          {error}
+        </div>
+      )}
+
+      <ComputerImpactConfirmModal
+        open={impact !== null}
+        disabledProvider={impact?.provider ?? "asciiBox"}
+        bots={impact?.impacted ?? []}
+        busy={saving}
+        onCancel={() => setImpact(null)}
+        onConfirm={() => {
+          if (!impact) return;
+          // The list was computed when the modal opened.  Bots, grants and
+          // automations can change while it is open, so recompute it now: a
+          // bot the operator never saw listed must not lose the provider on
+          // this click.  If the list grew, show the new one and ask again.
+          const decision = revalidateImpact(impact.impacted, botsUsingProvider(impact.provider));
+          if (decision.kind === "changed") {
+            setImpact({ provider: impact.provider, impacted: decision.impacted });
+            return;
+          }
+          if (locked || providers[impact.provider] !== true) {
+            // Already off (another window saved it) or a save is in flight.
+            setImpact(null);
+            return;
+          }
+          const nextProviders = { ...providers, [impact.provider]: false };
+          setImpact(null);
+          persist(
+            nextProviders,
+            impact.provider === "selfHostedVps" ? null : vpsMode,
+            impact.impacted.map((bot) => bot.id),
+          );
+        }}
+      />
+
+      <LocalComputerAutoWarning
+        open={pendingAck !== null}
+        onCancel={() => setPendingAck(null)}
+        bots={pendingAck?.bots}
+        busy={applying || saving}
+        onConfirm={() => {
+          if (!pendingAck) return;
+          // Resubmit to the SAME endpoint the original request went to.
+          // The acknowledgement dialog is a single consent handshake;
+          // routing a provider toggle through /api/bots/apply-defaults
+          // would unexpectedly reconfigure every bot on confirm.
+          const busySignal = pendingAck.request.path === "/api/bots/apply-defaults" ? "apply" : "save";
+          submitRequest(pendingAck.request, pendingAck.bots, busySignal);
+        }}
+      />
     </>
   );
 }

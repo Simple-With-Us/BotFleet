@@ -1,0 +1,78 @@
+---
+title: Updating a self-hosted Mac
+description: The two update paths, and how to check and install from the app or from your phone.
+icon: RefreshCw
+---
+
+A self-hosted Mac has two ways to reach a newer BotFleet, and they answer different questions.
+
+| Path | Question it answers | Works when |
+| --- | --- | --- |
+| **Release feed** | Has a new version been published? | The app is a packaged, signed build that shipped with its `app-update.yml` release feed. |
+| **This Mac's own checkout** | Is the always-on checkout behind `origin/main`? | macOS, with the harness checkout at `~/apps/botfleet-server` and the updater installed at `~/apps/update-botfleet.sh`. |
+
+A locally built app has no release feed at all, so **Check for Updates** could only fail there.  When the harness reports that this computer can check or install, the Updates card in **Settings → General** and the floating update popup both switch to the second path and the release feed steps aside.
+
+## What the card shows
+
+- The installed build, by version and short commit — two builds of the same version are common on a machine that builds its own.
+- **Update Available: `<version>`, N commits ahead** once a check finds `origin/main` past the installed commit, with the newest commit subjects behind it.  When bots are working, the card says they get a minute to finish and then pause and resume after the update; **Install Update** stays available.
+- Live progress while an update runs: the step the updater is on, what it is waiting for when it is waiting (**Waiting for 3 bots to finish**), and a percentage when it has one.  A percentage is shown only while it is moving: it counts the update's own steps, so it is left off while a step waits for bots, which is when it would sit still.  While new work is held, the card also says how many messages are saved and when the restart begins.  The tail of the updater's own log rides along on the status as `running.logTail` for a client that wants to show it; the card does not.
+- The last run's outcome — verified, rolled back, failed, or refused — with the updater's own sentence.
+- `checkError`, when the last check could not reach the source.  `checkedAt` does not move in that case, so the previous answer and its age both stay honest.
+
+## Starting one from your phone
+
+The paired iOS companion reaches the same three routes through the sidecar, so an update can be started from a pocket:
+
+- `GET /api/update/status` — everything the card shows.
+- `POST /api/update/check` — `git fetch origin main` in the harness checkout, then compare.  Answers `502` with `{ error, status }` when the fetch could not reach the source, rather than a false "up to date": the stale `origin/main` left on disk by the last good fetch would happily produce one.
+- `POST /api/update/run` — start the transactional updater.  Returns `202` with a `runId`, or `409` with the reason it will not start.
+
+The sidecar's allowlist carries exactly those three; the updater's own recovery action stays on the Mac.  `POST /api/update/run` takes an optional JSON body, `{ "force": true }`.
+
+Who may call the two actions: the desktop renderer, a paired phone through the sidecar, and any other process running as you on this Mac.  That is the harness's ordinary loopback trust boundary — the same one `PUT /api/config` writes provider API keys behind — not a separate credential.
+
+Status changes arrive on the existing event stream as `update.status` frames, so the phone and the desktop follow the same run live without polling.
+
+## What happens during a run
+
+The updater cannot be a child of either thing it stops, so it is launched detached as a one-shot launchd job (`com.jay.botfleet-update`) and reports through a progress file.  It then:
+
+1. Builds and signs a candidate from `origin/main` in a throwaway stage under `~/Library/Caches/BotFleet/updates/`, and verifies its signature, Team ID, bundle ID, build identity, and dependency fingerprint.
+2. Asks the harness to hold new work, gives the work already running a short grace to finish on its own, pauses whatever is still running, and lets the harness and the desktop app stop.  See [Busy bots](#busy-bots).
+3. Advances the checkout, installs the new bundle and dependencies with receipts, restarts the harness, verifies its identity and that it is the single owner, and reopens the app.
+
+Any failure after the interruption boundary rolls the previous bundle, dependency tree, and checkout commit back.  Because the harness is restarted partway through, the run outlives it: the next harness reads the same progress file on boot and keeps describing the run it did not start.
+
+## Busy bots
+
+Busy bots never block an update.  On a Mac fed by webhooks and routines there is almost never an idle moment to wait for, so the updater makes one:
+
+1. **Hold new work.**  `POST /api/runtime/quiesce?drain=1` tells the harness to start nothing new.  Routine, webhook and resource runs stay `queued` in `routines.json`; a job wake puts its notice back; a message you send to an idle bot waits in the same queue a busy bot's would; and a room member's reply waits in the room's queue, so a room goes quiet after the turn it is on.  Nothing is refused or dropped, and every route stays open, so approvals, **Stop** and webhook deliveries keep working.
+2. **Grace.**  The work already running gets 60 seconds to finish on its own (`--grace SECONDS`, or `BOTFLEET_UPDATE_GRACE_MS`).  If it does, the update goes ahead without interrupting anything.
+3. **Pause and resume.**  Whatever is still running is interrupted and saved to `pending-update-resume.json`, the forced quiesce `--force` has always used, and it resumes after the restart.  Work is paused at most once per update: if an attempt cannot finish and the updater tries again, what it paused stays paused and saved rather than being restarted and interrupted again.  Held messages and room replies are carried across in `update-held-sends.json` and run after the restart, each when its bot is free and in the order they were held; a message that waited behind a paused bot runs after that bot's own turn resumes.
+
+While the hold lasts, every chat and room, on the desktop and on the phone, says so above the composer: **BotFleet is updating.  Messages you send now are saved and will run after the restart.  The restart begins within about N minutes.**  A message sent then is accepted and kept, never refused, so without that line a bot looks stuck and a room goes quiet.  The line reads the hold from `GET /api/update/status` (its `drain` field), the same status the card and the phone already read, so it shows up whether the update was started from the app, the phone or a terminal.  The time is a ceiling, the end of the updater's own window; the restart usually begins sooner.
+
+A room turn already running is the one thing that is never interrupted, because a room turn cannot be resumed without repeating its prompt.  The updater waits up to 5 more minutes for it to finish (`BOTFLEET_UPDATE_ROOM_WAIT_MS`); since no new room reply starts while the update holds, that is one turn's wait.  If it is still running after that, the updater lets everything go, changes nothing, and the run ends refused with a sentence that says so.
+
+If the updater stops partway (Ctrl-C, a signal, a lost harness), it releases what it holds on its way out, and resumes anything it paused.  If it is killed outright, the harness lets go by itself: the hold a couple of minutes past the updater's window, and the fence three minutes after the updater stops renewing it, so new work is never left waiting.
+
+The updater never leaves BotFleet stopped.  If it finds BotFleet not running when it starts, it starts it first.  Every way an update can end (installed, refused, rolled back, or a rollback it had to defer) finishes with BotFleet running, the new build or the previous one.  Once it has stopped BotFleet, Ctrl-C waits for the install or the rollback to finish.  BotFleet gets up to 3 minutes to quit before the updater gives up, and the updater never force-kills it.
+
+From a terminal, `--wait-for-idle [MINUTES]` is the opt-in that never interrupts anything: it holds new work and waits up to 20 minutes (or `MINUTES`) for the running work to finish, and if it does not, everything held runs and the update stops without changing anything.  `--force` skips the grace and pauses at once.
+
+## When it refuses
+
+`POST /api/update/run` answers `409` rather than starting, and the card shows the same sentence:
+
+- **An update is already running.**
+- **The always-on checkout has uncommitted changes, so the updater would refuse.**  Clean `~/apps/botfleet-server` first — the updater refuses on any `git status --porcelain` output, untracked files included.
+- **BotFleet is already on the newest build.**  Send `{ "force": true }` to build and install the current `origin/main` anyway.
+- **The updater in `~/apps/botfleet-server` predates this build.**  Run it once from a terminal to advance the checkout, after which the button works.
+A busy Mac is not on this list: `capabilities.busy` says bots are working, and the run gives them their grace and then pauses them.  `{ "force": true }` skips the grace.
+
+Two of them also appear in `capabilities.reasons` — **An update is already running.** and **The updater in `~/apps/botfleet-server` predates this build.** — alongside the structural ones (this is not a Mac, the checkout is missing, the updater is not installed), so a client can disable **Install Update** and say why before anyone presses it.
+
+The other two are only decided when a run is actually asked for.  The dirty-checkout state is deliberately kept out of the structural path, and **BotFleet is already on the newest build.** is settled by `git merge-base` against what is installed at that moment.  A client learns both from the `409`.

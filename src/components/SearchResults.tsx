@@ -5,8 +5,9 @@
 import { useEffect, useState } from "react";
 import { GitBranch, Wrench } from "lucide-react";
 import { api, useStore, formatTime } from "@/state/store";
-import { MausAvatar } from "./Avatar";
+import { BotMascot } from "./Avatar";
 import { cn } from "@/lib/cn";
+import { productErrorHeadline } from "@/lib/product-error";
 import type { SearchHit } from "@/lib/search-hit";
 import { landOnSearchHit } from "@/lib/focus-message";
 
@@ -30,14 +31,19 @@ export function SearchResults({ query, onLanded }: { query: string; onLanded: ()
     setHits(null);
     setError(null);
     let alive = true;
+    const controller = new AbortController();
     const t = setTimeout(() => {
-      api(`/api/search?q=${encodeURIComponent(q)}&limit=40`)
+      api(`/api/search?q=${encodeURIComponent(q)}&limit=40`, { signal: controller.signal })
         .then((r: { hits: SearchHit[] }) => alive && (setHits(r.hits), setError(null)))
-        .catch((e: unknown) => alive && setError(e instanceof Error ? e.message : String(e)));
+        .catch((e: unknown) => {
+          if (!alive || controller.signal.aborted) return;
+          setError(e instanceof Error ? e.message : String(e));
+        });
     }, DEBOUNCE_MS);
     return () => {
       alive = false;
       clearTimeout(t);
+      controller.abort();
     };
   }, [q]);
 
@@ -57,7 +63,7 @@ export function SearchResults({ query, onLanded }: { query: string; onLanded: ()
       <div className="px-3 pb-1 text-[11px] font-medium uppercase tracking-wide text-ink-secondary">
         Messages{hits ? ` · ${hits.length}${hits.length === 40 ? "+" : ""}` : ""}
       </div>
-      {error && <div className="px-3 py-2 text-[12.5px] text-danger">couldn't search: {error}</div>}
+      {error && <div className="px-3 py-2 text-[12.5px] text-danger" title={error}>{productErrorHeadline(error)}</div>}
       {hits && hits.length === 0 && !error && <div className="px-3 py-3 text-[13px] text-ink-secondary">No messages match “{q}”</div>}
       {hits?.map((hit) => {
         const bot = hit.botId ? state.bots.find((b) => b.id === hit.botId) : undefined;
@@ -71,17 +77,20 @@ export function SearchResults({ query, onLanded }: { query: string; onLanded: ()
             className="flex w-full items-start gap-2.5 rounded-lg px-3 py-2 text-left hover:bg-raised/60"
           >
             {bot ? (
-              <MausAvatar color={bot.color} state="idle" size={26} animated={false} />
+              <BotMascot color={bot.color} state="idle" size={26} animated={false} />
             ) : (
               <span className="flex size-[26px] shrink-0 items-center justify-center rounded-full bg-raised text-[11px] text-ink-secondary">#</span>
             )}
             <span className="min-w-0 flex-1">
               <span className="flex items-baseline gap-1.5 text-[12px] text-ink-secondary">
-                <span className="truncate font-medium text-ink">{hit.from ?? hit.name}</span>
-                {hit.task ? <span className="truncate">· {hit.task}</span> : null}
+                <span className="truncate font-medium text-ink" title={hit.from ?? hit.name}>{hit.from ?? hit.name}</span>
+                {hit.task ? <span className="truncate" title={hit.task}>· {hit.task}</span> : null}
                 <span className="ml-auto shrink-0 tabular-nums">{formatTime(hit.at)}</span>
               </span>
-              <span className={cn("mt-0.5 line-clamp-2 text-[12.5px] leading-snug", hit.role === "user" ? "text-ink" : "text-ink-secondary")}>
+              <span
+                className={cn("mt-0.5 line-clamp-2 text-[12.5px] leading-snug", hit.role === "user" ? "text-ink" : "text-ink-secondary")}
+                title={hit.snippet}
+              >
                 {hit.kind === "activity" && <Wrench size={11} className="mr-1 inline text-ink-secondary" />}
                 {before}
                 <mark className="rounded-sm bg-accent/25 px-0.5 text-ink">{match}</mark>

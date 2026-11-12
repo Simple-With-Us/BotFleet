@@ -15,6 +15,16 @@ function qwenHome(env: Record<string, string | undefined>): string {
   return join(env.HOME || env.USERPROFILE || homedir(), ".qwen");
 }
 
+/** Is qwen configured enough to run a turn?  Either a key in this instance's
+ * environment or the settings file the CLI writes its providers into. */
+function qwenAuthenticated(env: Record<string, string | undefined>): boolean {
+  for (const name of ["QWEN_API_KEY", "DASHSCOPE_API_KEY", "OPENAI_API_KEY"]) {
+    if (env[name]?.trim()) return true;
+  }
+  const dir = qwenHome(env);
+  return existsSync(join(dir, "settings.json")) || existsSync(join(dir, "oauth_creds.json"));
+}
+
 function envKeyFor(hostId: string): string {
   return `BOTFLEET_QWEN_${hostId.toUpperCase().replace(/[^A-Z0-9]+/g, "_")}_API_KEY`;
 }
@@ -106,7 +116,10 @@ const support: AcpSupport = {
   spawnArgs: (_config, turn) => ["--acp", ...(turn.model ? ["-m", turn.model] : [])],
   pickAuthMethod: () => null,
   authFailure: "continue",
-  isAuthenticated: () => true,
+  // Read what qwen actually wrote, env-aware, instead of answering a
+  // hardcoded `true` — a blanket yes made an installed-but-unconfigured qwen
+  // look ready, so the setup card never appeared.
+  isAuthenticated: (env) => qwenAuthenticated(env),
   buildPromptText: (turn) => (turn.system ? `${turn.system}\n\n${turn.text}` : turn.text),
 };
 

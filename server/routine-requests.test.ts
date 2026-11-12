@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   RoutineRequestError,
   RoutineRequestService,
+  routineApprovalApplied,
   routineRequestFingerprint,
   type RoutineProposalInput,
   type RoutineRequestMessage,
@@ -67,6 +68,7 @@ function harness(
   const routines = new RoutineManager({
     file: join(dir, "routines.json"),
     now: () => clock.now,
+    timeZone: () => "Asia/Kolkata",
     botState: (botId) => (botId === "missing" ? "missing" : "busy"),
     createTask: () => null,
     startTurn: async () => {},
@@ -125,7 +127,7 @@ describe("RoutineRequestService", () => {
     expect(card.options).toEqual(["Confirm", "Cancel"]);
     expect(card.routineRequest?.operation).toMatchObject({
       action: "create",
-      routine: { schedule: { type: "daily", time: "09:00", weekdays: [1, 3] } },
+      routine: { schedule: { type: "daily", time: "09:00", weekdays: [1, 3], timeZone: "Asia/Kolkata" } },
     });
     expect(JSON.stringify(card)).not.toContain(secret);
     expect(JSON.stringify(card)).toContain("redacted");
@@ -144,7 +146,12 @@ describe("RoutineRequestService", () => {
           durationMinutes: routine.durationMinutes,
           schedule: routine.schedule.type === "once"
             ? { at: routine.schedule.at, type: "once" }
-            : { weekdays: [...routine.schedule.weekdays], time: routine.schedule.time, type: "daily" },
+            : {
+                weekdays: [...routine.schedule.weekdays],
+                timeZone: routine.schedule.timeZone,
+                time: routine.schedule.time,
+                type: "daily",
+              },
           instructions: routine.instructions,
           runOn: routine.runOn,
           name: routine.name,
@@ -264,6 +271,15 @@ describe("RoutineRequestService", () => {
       service.propose({
         botId: "bot-a",
         threadId: "thread-a",
+        proposal: createProposal({
+          schedule: { type: "weekly", time: "09:00", weekdays: ["monday"], timeZone: "Mars/Olympus" },
+        }),
+      }),
+    ).rejects.toThrow(/valid IANA timezone/);
+    await expect(
+      service.propose({
+        botId: "bot-a",
+        threadId: "thread-a",
         proposal: createProposal({ name: `${"n".repeat(64)} token=abcdefgh` }),
       }),
     ).rejects.toThrow(/80 characters or fewer after credentials are removed/);
@@ -317,7 +333,7 @@ describe("RoutineRequestService", () => {
     await service.propose({
       botId: "bot-a",
       threadId: "thread-a",
-      proposal: { action: "update", routineId: routine.id, changes: { runOn: "maus" } },
+      proposal: { action: "update", routineId: routine.id, changes: { runOn: "bot" } },
     });
     await service.propose({
       botId: "bot-a",
@@ -429,9 +445,9 @@ describe("RoutineRequestService", () => {
       botId: "bot-a",
       name: "Morning brief",
       prompt: "Summarize the overnight support queue.",
-      runOn: "maus",
+      runOn: "bot",
       enabled: true,
-      schedule: { type: "daily", time: "09:00", weekdays: [1, 3] },
+      schedule: { type: "daily", time: "09:00", weekdays: [1, 3], timeZone: "Asia/Kolkata" },
       durationMinutes: 30,
     }, {
       requestId: proposal.requestId,
@@ -486,7 +502,7 @@ describe("RoutineRequestService", () => {
       botId: "bot-a",
       name: "Old name",
       prompt: "Old instructions",
-      schedule: { type: "daily", time: "10:00", weekdays: [1] },
+      schedule: { type: "daily", time: "10:00", weekdays: [1], timeZone: "America/Chicago" },
       durationMinutes: 30,
     });
 
@@ -508,15 +524,29 @@ describe("RoutineRequestService", () => {
       return { card, result };
     };
 
-    await apply({
+    const update = await apply({
       action: "update",
       routineId: routine.id,
       changes: { name: "New name", instructions: "New instructions", durationMinutes: 45 },
     });
+    expect(update.card.summary).toContain("Monday at 10:00 (America/Chicago)");
     expect(routines.listRoutines()[0]).toMatchObject({
       name: "New name",
       prompt: "New instructions",
       durationMinutes: 45,
+    });
+
+    const rescheduled = await apply({
+      action: "update",
+      routineId: routine.id,
+      changes: { schedule: { type: "weekly", time: "11:30", weekdays: ["tuesday"] } },
+    });
+    expect(rescheduled.card.summary).toContain("Tuesday at 11:30 (America/Chicago)");
+    expect(routines.listRoutines()[0]!.schedule).toEqual({
+      type: "daily",
+      time: "11:30",
+      weekdays: [2],
+      timeZone: "America/Chicago",
     });
 
     await apply({ action: "pause", routineId: routine.id });
@@ -562,6 +592,49 @@ describe("RoutineRequestService", () => {
     expect(routines.listRoutines()).toHaveLength(0);
   });
 
+  it("preserves a legacy recurrence as zone-less when a bot edits its schedule", async () => {
+    const { service, routines, store } = harness();
+    const routine = routines.create({
+      botId: "bot-a",
+      name: "Legacy local clock",
+      prompt: "Run on the harness clock",
+      schedule: { type: "daily", time: "09:00", weekdays: [1] },
+    });
+    expect(routines.storedRoutineTimeZone(routine.id)).toBeUndefined();
+    expect(routines.listRoutines()[0]!.schedule).toMatchObject({ timeZone: "Asia/Kolkata" });
+
+    const proposed = await service.propose({
+      botId: "bot-a",
+      threadId: "thread-a",
+      proposal: {
+        action: "update",
+        routineId: routine.id,
+        changes: { schedule: { type: "weekly", time: "10:30", weekdays: ["tuesday"] } },
+      },
+    });
+    const message = store.messagesFor("thread-a")[0]!;
+    expect(message.card?.routineRequest?.operation).toMatchObject({
+      action: "update",
+      changes: { schedule: { type: "daily", time: "10:30", weekdays: [2] } },
+    });
+    if (message.card?.routineRequest?.operation.action !== "update") throw new Error("Expected update proposal");
+    expect(message.card.routineRequest.operation.changes.schedule).not.toHaveProperty("timeZone");
+
+    expect(service.resolve({
+      botId: "bot-a",
+      threadId: "thread-a",
+      requestId: proposed.requestId,
+      behavior: "allow",
+    }).state).toBe("applied");
+    expect(routines.storedRoutineTimeZone(routine.id)).toBeUndefined();
+    expect(routines.listRoutines()[0]!.schedule).toEqual({
+      type: "daily",
+      time: "10:30",
+      weekdays: [2],
+      timeZone: "Asia/Kolkata",
+    });
+  });
+
   it("captures and enforces the routine revision for every manage confirmation", async () => {
     const { service, routines, store } = harness();
     const routine = routines.create({
@@ -590,6 +663,48 @@ describe("RoutineRequestService", () => {
     })).toMatchObject({ claimed: true, state: "invalid", status: 409 });
     expect(routines.listRoutines()[0]).toMatchObject({ name: "Changed elsewhere", enabled: true });
     expect(store.messagesFor("thread-a")[0]!.card?.held).toMatch(/changed after this confirmation card/);
+  });
+
+  it("counts an Approve All answer only when it applied, never when the card stayed pending", async () => {
+    const { service, routines, store } = harness();
+    const routine = routines.create({
+      botId: "bot-a",
+      name: "Mutable routine",
+      prompt: "Original instructions",
+      schedule: { type: "daily", time: "10:00", weekdays: [1] },
+    });
+    const answer = (requestId: string) =>
+      service.resolve({ botId: "bot-a", threadId: "thread-a", requestId, behavior: "allow" });
+
+    // A card whose routine changed after it was shown is invalid, stays pending
+    // with `held` set, and must not be reported as approved.
+    const stale = await service.propose({
+      botId: "bot-a",
+      threadId: "thread-a",
+      proposal: { action: "pause", routineId: routine.id },
+    });
+    routines.update(routine.id, { name: "Changed elsewhere" });
+    const invalid = answer(stale.requestId);
+    expect(invalid).toMatchObject({ claimed: true, state: "invalid" });
+    expect(routineApprovalApplied(invalid)).toBe(false);
+    expect(store.messagesFor("thread-a")[0]!.card?.answered).toBeUndefined();
+
+    // A fresh card for the current routine applies, and answering it again
+    // settles nothing new.
+    const fresh = await service.propose({
+      botId: "bot-a",
+      threadId: "thread-a",
+      proposal: { action: "pause", routineId: routine.id },
+    });
+    const applied = answer(fresh.requestId);
+    expect(applied.state).toBe("applied");
+    expect(routineApprovalApplied(applied)).toBe(true);
+    const duplicate = answer(fresh.requestId);
+    expect(duplicate).toMatchObject({ claimed: true, state: "already_settled" });
+    expect(routineApprovalApplied(duplicate)).toBe(false);
+
+    expect(routineApprovalApplied({ claimed: false, state: "not_found" })).toBe(false);
+    expect(routineApprovalApplied({ claimed: true, state: "denied" })).toBe(false);
   });
 
   it("settles manage cards whose requested mutation already committed before a crash", async () => {

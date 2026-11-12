@@ -2,7 +2,11 @@ import { describe, expect, it } from "vitest";
 
 import {
   createExclusiveSaveGate,
+  MAX_ROOM_TURN_TIMEOUT_MINUTES,
+  MIN_ROOM_TURN_TIMEOUT_MINUTES,
   parseRoomTurnTimeoutMinutes,
+  RECOMMENDED_TURN_TIMEOUT_MAX_MINUTES,
+  RECOMMENDED_TURN_TIMEOUT_MIN_MINUTES,
   saveRoomTurnTimeoutMinutes,
 } from "./room-turn-timeout";
 
@@ -23,6 +27,27 @@ describe("room turn timeout input", () => {
     ["1440", 1440],
   ])("accepts %s", (value, expected) => {
     expect(parseRoomTurnTimeoutMinutes(value)).toEqual({ ok: true, minutes: expected });
+  });
+
+  it("exposes a recommended band that sits inside the accepted range", () => {
+    expect(RECOMMENDED_TURN_TIMEOUT_MIN_MINUTES).toBeGreaterThanOrEqual(MIN_ROOM_TURN_TIMEOUT_MINUTES);
+    expect(RECOMMENDED_TURN_TIMEOUT_MAX_MINUTES).toBeLessThanOrEqual(MAX_ROOM_TURN_TIMEOUT_MINUTES);
+    expect(RECOMMENDED_TURN_TIMEOUT_MIN_MINUTES).toBeLessThanOrEqual(RECOMMENDED_TURN_TIMEOUT_MAX_MINUTES);
+    // the band is wide enough to be useful — at least a half-hour, not
+    // a single value the user could type in
+    expect(RECOMMENDED_TURN_TIMEOUT_MAX_MINUTES - RECOMMENDED_TURN_TIMEOUT_MIN_MINUTES).toBeGreaterThanOrEqual(30);
+  });
+
+  it("still accepts every value inside the recommended band", () => {
+    for (const minutes of [
+      RECOMMENDED_TURN_TIMEOUT_MIN_MINUTES,
+      RECOMMENDED_TURN_TIMEOUT_MIN_MINUTES + 1,
+      30,
+      RECOMMENDED_TURN_TIMEOUT_MAX_MINUTES - 1,
+      RECOMMENDED_TURN_TIMEOUT_MAX_MINUTES,
+    ]) {
+      expect(parseRoomTurnTimeoutMinutes(String(minutes))).toEqual({ ok: true, minutes });
+    }
   });
 
   it("does not persist invalid input", async () => {

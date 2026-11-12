@@ -22,6 +22,12 @@ export class LocalVmLease {
     return this.record ? { ...this.record } : null;
   }
 
+  /** Take or renew the fence.  Ownership is a TURN — a thread and the bot
+   * running on it — not a conversation.  A 1:1 thread has exactly one bot, so
+   * that lane is unchanged; a room thread is shared by every member, and
+   * comparing the thread alone would have let a second member walk into the
+   * container a first member is already clicking inside, then overwrite the
+   * record's `botId` so the first member's unwind released it mid-turn. */
   claim(
     threadId: string,
     botId: string,
@@ -29,7 +35,7 @@ export class LocalVmLease {
     now = Date.now(),
   ): boolean {
     const current = this.current(isBotBusy, now);
-    if (current && current.threadId !== threadId) return false;
+    if (current && (current.threadId !== threadId || current.botId !== botId)) return false;
     this.record = { threadId, botId, expiresAt: now + this.ttlMs };
     return true;
   }
@@ -42,8 +48,13 @@ export class LocalVmLease {
     if (this.record?.threadId === threadId) this.record.expiresAt = now + this.ttlMs;
   }
 
-  release(threadId: string): void {
-    if (this.record?.threadId === threadId) this.record = null;
+  /** Give the fence back.  With a bot id the match is exact, for the same
+   * reason `claim` compares both: on a shared room thread one member must not
+   * be able to release another member's live claim. */
+  release(threadId: string, botId?: string): void {
+    if (this.record?.threadId !== threadId) return;
+    if (botId !== undefined && this.record.botId !== botId) return;
+    this.record = null;
   }
 }
 

@@ -196,7 +196,7 @@ public struct PairingInvite: Equatable, Sendable {
     }
 
     public static func parse(_ url: URL) -> PairingInvite? {
-        guard url.scheme?.lowercased() == "openmausbot",
+        guard CompanionURLScheme.accepts(url.scheme),
               url.host?.lowercased() == "pair",
               let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
         else { return nil }
@@ -314,7 +314,7 @@ public struct PairingRouteError: Error, LocalizedError, Equatable, Sendable {
 
     public var errorDescription: String? {
         let routes = attemptedHosts.joined(separator: ", ")
-        return "Couldn’t reach this computer through any available route (\(routes)). Keep Phone access turned on in OpenMausBot, then try again."
+        return "Couldn’t reach this computer through any available route (\(routes)). Keep Phone access turned on in BotFleet, then try again."
     }
 }
 
@@ -349,28 +349,61 @@ public enum APIError: Error, LocalizedError, Sendable {
         if case let .status(code, _) = self { return code == 401 }
         return false
     }
+
+    public var isNotFound: Bool {
+        if case let .status(code, _) = self { return code == 404 }
+        return false
+    }
+
+    public var isConflict: Bool {
+        if case let .status(code, _) = self { return code == 409 }
+        return false
+    }
+
+    /// The HTTP status the harness answered with, when it answered at all.
+    public var statusCode: Int? {
+        if case let .status(code, _) = self { return code }
+        return nil
+    }
+
+    public var isCancellation: Bool {
+        if case let .transport(detail) = self {
+            let lower = detail.lowercased()
+            return lower == "cancelled" || lower == "canceled"
+        }
+        return false
+    }
 }
 
 public struct CompanionClient: Sendable {
     public let connection: Connection
     private let token: String?
     private let session: URLSession
+    private let gateCredential: HostGateCredential?
+    private let hostOrigin: HostOrigin?
 
-    public init(connection: Connection, token: String?, session: URLSession = .shared) {
+    public init(connection: Connection, token: String?, session: URLSession = .shared, gateCredential: HostGateCredential? = nil, hostOrigin: HostOrigin? = nil) {
         self.connection = connection
         self.token = token
         self.session = session
+        self.gateCredential = gateCredential
+        self.hostOrigin = hostOrigin ?? gateCredential?.origin
     }
 
     // MARK: - Requests
 
-    private func makeRequest(_ method: String, _ path: String, query: [URLQueryItem] = [], body: [String: Any]? = nil) throws -> URLRequest {
+    private func makeRequest(_ method: String, _ path: String, query: [URLQueryItem] = [], body: [String: Any]? = nil, percentEncodedPath: Bool = false) throws -> URLRequest {
         guard let base = connection.baseURL,
               var components = URLComponents(url: base, resolvingAgainstBaseURL: false)
         else { throw APIError.badURL }
-        components.path = path
+        if percentEncodedPath {
+            components.percentEncodedPath = path
+        } else {
+            components.path = path
+        }
         components.queryItems = query.isEmpty ? nil : query
         guard let url = components.url else { throw APIError.badURL }
+        if let hostOrigin, !hostOrigin.contains(url) { throw SavedHostError.differentOrigin }
 
         var request = URLRequest(url: url)
         request.httpMethod = method
@@ -382,6 +415,7 @@ public struct CompanionClient: Sendable {
         if let token {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
+        if let gateCredential { try gateCredential.authorize(&request) }
         if let body {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
@@ -395,9 +429,10 @@ public struct CompanionClient: Sendable {
     private func makeRequest<Body: Encodable>(
         _ method: String,
         _ path: String,
-        encodedBody body: Body
+        encodedBody body: Body,
+        percentEncodedPath: Bool = false
     ) throws -> URLRequest {
-        var request = try makeRequest(method, path)
+        var request = try makeRequest(method, path, percentEncodedPath: percentEncodedPath)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONEncoder().encode(body)
         return request
@@ -419,10 +454,38 @@ public struct CompanionClient: Sendable {
         try Self.check(response, data)
     }
 
+    /// Only requests carrying an idempotency key use this retry path.  The
+    /// request is constructed once, so the retry cannot acquire a new key
+    /// after the server committed the first attempt but its response was lost.
+    private func sendIdempotent<T: Decodable>(_ request: URLRequest, as type: T.Type) async throws -> T {
+        do {
+            return try await send(request, as: type)
+        } catch let error as APIError {
+            guard case .transport = error else { throw error }
+            try Task.checkCancellation()
+            return try await send(request, as: type)
+        }
+    }
+
+    private func sendIdempotent(_ request: URLRequest) async throws {
+        do {
+            try await send(request)
+        } catch let error as APIError {
+            guard case .transport = error else { throw error }
+            try Task.checkCancellation()
+            try await send(request)
+        }
+    }
+
     private func perform(_ request: URLRequest) async throws -> (Data, URLResponse) {
         do {
-            return try await session.data(for: request)
+            if let hostOrigin, request.url.map(hostOrigin.contains) != true { throw SavedHostError.differentOrigin }
+            return try await session.data(for: request, delegate: hostOrigin.map { HostOriginRedirectPolicy(origin: $0) })
         } catch {
+            if Task.isCancelled || (error as? URLError)?.code == .cancelled || error is CancellationError {
+                throw CancellationError()
+            }
+            if let error = error as? SavedHostError { throw error }
             throw APIError.transport(error.localizedDescription)
         }
     }
@@ -477,7 +540,7 @@ public struct CompanionClient: Sendable {
     /// that exact route is the user's preferred, explicit choice; neither a
     /// pairing credential nor the later bearer token is sprayed onto the
     /// current wifi merely because a private address was once advertised.
-    /// Only the first response that identifies itself as OpenMausBot receives
+    /// Only the first response that identifies itself as BotFleet receives
     /// the one-time pairing POST. The request id makes that redemption safely
     /// replayable by newer desktop builds if its response is lost in transit.
     public static func pairFirstReachable(
@@ -557,6 +620,9 @@ public struct CompanionClient: Sendable {
 
     private struct HealthIdentity: Decodable {
         let app: String
+        // Older sidecars did not include readiness; their 2xx identity was
+        // already the complete health signal.
+        let ready: Bool?
     }
 
     private static func healthy(_ connection: Connection, session: URLSession) async -> Bool {
@@ -567,9 +633,11 @@ public struct CompanionClient: Sendable {
             let (data, response) = try await session.data(for: request)
             guard !Task.isCancelled,
                   let http = response as? HTTPURLResponse,
-                  (200...299).contains(http.statusCode),
-                  try JSONDecoder().decode(HealthIdentity.self, from: data).app == "openmausbot"
+                  (200...299).contains(http.statusCode)
             else { return false }
+            let identity = try JSONDecoder().decode(HealthIdentity.self, from: data)
+            let app = identity.app.lowercased()
+            guard app == "botfleet", identity.ready != false else { return false }
             return true
         } catch {
             return false
@@ -645,11 +713,276 @@ public struct CompanionClient: Sendable {
     }
 
     public func instances() async throws -> [Instance] {
-        try await send(try makeRequest("GET", "/api/instances"), as: InstanceList.self).instances
+        try await instanceList().instances
+    }
+
+    /// The roster with the harness's `describedAt` stamp, for callers that order
+    /// competing answers.
+    public func instanceList() async throws -> InstanceList {
+        try await send(try makeRequest("GET", "/api/instances"), as: InstanceList.self)
+    }
+
+    /// The commands this bot's engine offers, including compact when it has one.
+    public func contextCommands(botId: String, threadId: String, surface: String) async throws -> [ContextMeterMath.Command] {
+        struct Wire: Decodable {
+            struct Group: Decodable {
+                struct Command: Decodable {
+                    var id: String
+                    var name: String
+                    var enabled: Bool
+                    var disabledReason: String?
+                }
+                var commands: [Command]
+            }
+            var groups: [Group]
+        }
+        let request = try makeRequest(
+            "GET",
+            commandsPath(botId),
+            query: [
+                URLQueryItem(name: "surface", value: surface),
+                URLQueryItem(name: "threadId", value: threadId),
+            ],
+            percentEncodedPath: true
+        )
+        let menu = try await send(request, as: Wire.self)
+        return menu.groups.flatMap { group in
+            group.commands.map {
+                ContextMeterMath.Command(
+                    id: $0.id,
+                    name: $0.name,
+                    enabled: $0.enabled,
+                    disabledReason: $0.disabledReason
+                )
+            }
+        }
+    }
+
+    /// Run one command from that menu.  The computer's own sentence is the failure.
+    public func runContextCommand(botId: String, id: String, threadId: String, surface: String) async throws {
+        struct Body: Encodable {
+            var id: String
+            var threadId: String
+            var surface: String
+        }
+        try await send(try makeRequest(
+            "POST",
+            commandsPath(botId),
+            encodedBody: Body(id: id, threadId: threadId, surface: surface),
+            percentEncodedPath: true
+        ))
+    }
+
+    /// One path segment.  A slash stays inside the id instead of leaving `/api/bots/`.
+    private func commandsPath(_ botId: String) -> String {
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
+        let encoded = botId.addingPercentEncoding(withAllowedCharacters: allowed) ?? botId
+        return "/api/bots/\(encoded)/commands"
     }
 
     public func config() async throws -> ConfigStatus {
         try await send(try makeRequest("GET", "/api/config"), as: ConfigStatus.self)
+    }
+
+    /// Rooms are renamed through their own route.  /api/config carries API
+    /// keys and the sidecar refuses every write to it, which is why the old
+    /// call could never succeed from a phone.
+    public func updateConversationMode(_ conversationMode: String, mergeThreads: Bool = false) async throws -> ConfigStatus {
+        struct ConversationModePatch: Encodable {
+            let conversationMode: String
+            let mergeThreads: Bool
+
+            enum CodingKeys: String, CodingKey {
+                case conversationMode
+                case mergeThreads
+            }
+
+            func encode(to encoder: Encoder) throws {
+                var container = encoder.container(keyedBy: CodingKeys.self)
+                try container.encode(conversationMode, forKey: .conversationMode)
+                if mergeThreads {
+                    try container.encode(true, forKey: .mergeThreads)
+                }
+            }
+        }
+        return try await send(
+            try makeRequest(
+                "PATCH",
+                "/api/conversation-mode",
+                encodedBody: ConversationModePatch(conversationMode: conversationMode, mergeThreads: mergeThreads)
+            ),
+            as: ConfigStatus.self
+        )
+    }
+
+    public func updateBusySendDefault(_ busySendDefault: String) async throws -> ConfigStatus {
+        struct Body: Encodable { let busySendDefault: String }
+        return try await send(
+            try makeRequest("PATCH", "/api/busy-send-default", encodedBody: Body(busySendDefault: busySendDefault)),
+            as: ConfigStatus.self
+        )
+    }
+
+    public func updateTerminology(
+        _ terminology: String,
+        custom: RoomLabels? = nil
+    ) async throws -> ConfigStatus {
+        struct TerminologyPatch: Encodable {
+            let terminology: String
+            let terminologyCustom: RoomLabels?
+        }
+        return try await send(
+            try makeRequest(
+                "PATCH",
+                "/api/terminology",
+                encodedBody: TerminologyPatch(terminology: terminology, terminologyCustom: custom)
+            ),
+            as: ConfigStatus.self
+        )
+    }
+
+    /// Show Tool Calls / Summarize Bot Tasks.  Phone-safe narrow route — the
+    /// companion refuses writes to `/api/config` because that path also
+    /// carries API keys.
+    public func updateFeatures(
+        showToolCalls: Bool? = nil,
+        summarizeToolCalls: Bool? = nil
+    ) async throws -> ConfigStatus {
+        struct FeaturesBody: Encodable {
+            let showToolCalls: Bool?
+            let summarizeToolCalls: Bool?
+
+            func encode(to encoder: Encoder) throws {
+                var container = encoder.container(keyedBy: CodingKeys.self)
+                if let showToolCalls { try container.encode(showToolCalls, forKey: .showToolCalls) }
+                if let summarizeToolCalls { try container.encode(summarizeToolCalls, forKey: .summarizeToolCalls) }
+            }
+
+            enum CodingKeys: String, CodingKey {
+                case showToolCalls
+                case summarizeToolCalls
+            }
+        }
+        return try await send(
+            try makeRequest(
+                "PATCH",
+                "/api/features",
+                encodedBody: FeaturesBody(
+                    showToolCalls: showToolCalls,
+                    summarizeToolCalls: summarizeToolCalls
+                )
+            ),
+            as: ConfigStatus.self
+        )
+    }
+
+    /// Which speech-to-speech providers this computer can reach, and which
+    /// one a call would actually use.
+    ///
+    /// Booleans and a choice — never a key.  The keys stay on the computer;
+    /// this is the phone asking what exists so it can say so honestly instead
+    /// of offering a call that cannot start.  A Mac older than the route
+    /// answers 404, which `check` turns into an `APIError`.
+    public func stsStatus() async throws -> StsStatus {
+        try await send(try makeRequest("GET", "/api/sts/status"), as: StsStatus.self)
+    }
+
+    /// One short-lived, single-session token for a voice call.
+    ///
+    /// The permanent provider key never leaves the computer: the harness
+    /// mints this from a credential only it holds, which is the same rule the
+    /// desktop follows over IPC.  The token is spent opening one realtime
+    /// session and is not a credential for anything else.
+    ///
+    /// The harness throttles this, so a caller that loops answers 429.  That
+    /// is a real answer, not an error to retry in a tight loop.
+    public func stsToken(provider: String) async throws -> StsSessionToken {
+        struct Body: Encodable {
+            let provider: String
+        }
+        return try await send(
+            try makeRequest("POST", "/api/sts/token", encodedBody: Body(provider: provider)),
+            as: StsSessionToken.self
+        )
+    }
+
+    /// Room Turn Timeout, in whole minutes.  Same phone-safe pattern as
+    /// terminology — never opens `/api/config` to a paired device.
+    public func updateRoomTurnTimeout(minutes: Int) async throws -> ConfigStatus {
+        struct Body: Encodable {
+            let turnTimeoutMinutes: Int
+        }
+        return try await send(
+            try makeRequest(
+                "PATCH",
+                "/api/room-turn-timeout",
+                encodedBody: Body(turnTimeoutMinutes: minutes)
+            ),
+            as: ConfigStatus.self
+        )
+    }
+
+    /// Enable Automatic Update Checks.  Same phone-safe pattern as the room
+    /// turn timeout: its own route, answering with the full config status,
+    /// so `/api/config` stays write-closed to a paired device.  A Mac older
+    /// than the route answers 404.
+    public func setAutoUpdate(enabled: Bool) async throws -> ConfigStatus {
+        struct Body: Encodable {
+            let enabled: Bool
+        }
+        return try await send(
+            try makeRequest(
+                "PATCH",
+                "/api/auto-update",
+                encodedBody: Body(enabled: enabled)
+            ),
+            as: ConfigStatus.self
+        )
+    }
+
+    /// Set All Bots To Default on the Models screen: one call that writes
+    /// the chosen places to every bot.  Nothing is stored as a default.  A
+    /// bot that cannot take the change (busy, or an empty place before a
+    /// chosen fallback) is left alone and named in `skipped`.  Not retried:
+    /// it is not idempotent against a bot that changed in between.
+    public func applyModelDefaults(
+        primary: DefaultModelSlot?,
+        fallbacks: [DefaultModelSlot?]
+    ) async throws -> ApplyModelDefaultsResult {
+        try await send(
+            try makeRequest(
+                "POST",
+                "/api/bots/apply-model-defaults",
+                encodedBody: DefaultModelSlots.applyModelDefaultsBody(primary: primary, fallbacks: fallbacks)
+            ),
+            as: ApplyModelDefaultsResult.self
+        )
+    }
+
+    /// Profile name + email only.  Skins and avatars stay on the Mac.
+    /// Pass only the field(s) that changed; omitted keys leave the sibling
+    /// alone so a concurrent Mac edit of the other field is not overwritten.
+    public func updateProfile(name: String? = nil, email: String? = nil) async throws -> ConfigStatus {
+        struct Body: Encodable {
+            let name: String?
+            let email: String?
+
+            func encode(to encoder: Encoder) throws {
+                var container = encoder.container(keyedBy: CodingKeys.self)
+                try container.encodeIfPresent(name, forKey: .name)
+                try container.encodeIfPresent(email, forKey: .email)
+            }
+
+            enum CodingKeys: String, CodingKey { case name, email }
+        }
+        return try await send(
+            try makeRequest(
+                "PATCH",
+                "/api/profile",
+                encodedBody: Body(name: name, email: email)
+            ),
+            as: ConfigStatus.self
+        )
     }
 
     public func connectorCatalog() async throws -> ConnectorCatalog {
@@ -687,22 +1020,38 @@ public struct CompanionClient: Sendable {
         let prefix = "/api/attachments/"
         guard path.hasPrefix(prefix) else { return false }
         let name = path.dropFirst(prefix.count)
-        guard let dot = name.lastIndex(of: "."), dot != name.startIndex else { return false }
-        let stem = name[..<dot]
-        let ext = name[name.index(after: dot)...]
-        // Match shared/bot-avatar.ts rather than trusting URL normalization:
-        // one bare ASCII filename, one extension separator, and no dot segment.
-        let validStem = !stem.isEmpty && stem.utf8.allSatisfy { byte in
-            (48...57).contains(byte)
-                || (65...90).contains(byte)
-                || (97...122).contains(byte)
-                || byte == 45
-        }
-        return validStem && ["png", "jpg", "gif", "webp"].contains(String(ext))
+        return ChatAttachments.isRenderableImageName(String(name))
     }
 
     public func voices() async throws -> [Voice] {
         try await send(try makeRequest("GET", "/api/tts/voices"), as: VoiceListResponse.self).voices
+    }
+
+    /// The workspace default voice: what every bot without a voice of its
+    /// own speaks with.  Its own narrow route, so /api/config (which carries
+    /// the voice key) stays closed to writes from a phone.  The harness
+    /// refuses a Personal Voice, which belongs to one device.
+    public func updateDefaultVoice(_ voiceId: String) async throws -> ConfigStatus {
+        struct Body: Encodable {
+            let voice: String
+        }
+        return try await send(
+            try makeRequest("PATCH", "/api/tts/default-voice", encodedBody: Body(voice: voiceId)),
+            as: ConfigStatus.self
+        )
+    }
+
+    /// Replace the workspace pronunciation list.  The harness validates it
+    /// with the same rules as the Mac (`shared/pronunciations.ts`) and
+    /// answers a refusal in words the person can act on.
+    public func updatePronunciations(_ list: [Pronunciation]) async throws -> ConfigStatus {
+        struct Body: Encodable {
+            let pronunciations: [Pronunciation]
+        }
+        return try await send(
+            try makeRequest("PATCH", "/api/tts/pronunciations", encodedBody: Body(pronunciations: list)),
+            as: ConfigStatus.self
+        )
     }
 
     public func routines() async throws -> (routines: [Routine], runs: [RoutineRun]) {
@@ -737,18 +1086,134 @@ public struct CompanionClient: Sendable {
         ).group
     }
 
+    /// Archive, Restore, Pin, Mark As Unread, Make Chief Of Staff, Move To
+    /// Section and Pin Message, through the desktop's bot PATCH.  The sidecar
+    /// refuses any field `BotOrganizePatch` cannot encode, so nothing else
+    /// about the bot can change through this call.
+    public func organizeBot(id: String, patch: BotOrganizePatch) async throws -> Bot {
+        try await send(
+            try makeRequest("PATCH", "/api/bots/\(id)", encodedBody: patch),
+            as: BotResponse.self
+        ).bot
+    }
+
+    /// Delete a bot for good.  The harness stops a running turn, deletes
+    /// every task transcript, removes its computers, and turns off its
+    /// routines, webhooks and triggers.  It refuses with a sentence (409)
+    /// while a Local VM action is running.
+    public func deleteBot(id: String) async throws {
+        try await send(try makeRequest("DELETE", "/api/bots/\(id)"))
+    }
+
+    /// Delete a room and every transcript in it.  Its bots stay.  The harness
+    /// refuses with a sentence (409) while the room is working.
+    public func deleteRoom(id: String) async throws {
+        try await send(try makeRequest("DELETE", "/api/groups/\(id)"))
+    }
+
+    /// Persist an avatar and return the app-owned fetch URL.  Chat prompts
+    /// must use `uploadChatAttachment` and embed the disk `path` instead —
+    /// agents cannot open `/api/attachments/:name`.
     public func uploadAvatar(data: Data, mime: String) async throws -> String {
-        let allowed = ["image/png", "image/jpeg", "image/gif", "image/webp"]
-        guard allowed.contains(mime), data.count <= 10 * 1_024 * 1_024 else {
+        let normalized = ChatAttachments.normalizeMIME(mime)
+        guard ChatAttachments.isDisplayImageMIME(normalized), data.count <= ChatAttachments.imageMaxBytes else {
             throw APIError.transport("Choose a PNG, JPEG, GIF, or WebP image up to 10 MB.")
         }
         var request = try makeRequest("POST", "/api/attachments")
-        request.setValue(mime, forHTTPHeaderField: "Content-Type")
+        request.setValue(normalized, forHTTPHeaderField: "Content-Type")
         request.httpBody = data
         let saved = try await send(request, as: AttachmentResponse.self)
         let name = URL(fileURLWithPath: saved.path).lastPathComponent
         guard !name.isEmpty, !name.contains("/") else { throw APIError.transport("The uploaded image could not be used.") }
         return "/api/attachments/\(name)"
+    }
+
+    /// Persist a chat file and return the harness disk path.  The prompt
+    /// embeds that path in `<attached-image>` / `<attached-file>` tags.
+    public func uploadChatAttachment(
+        data: Data,
+        mime: String,
+        filename: String
+    ) async throws -> (path: String, mime: String, bytes: Int) {
+        let normalized = ChatAttachments.normalizeMIME(mime)
+        guard ChatAttachments.isAllowedMIME(normalized) else {
+            throw APIError.transport("\(filename) is not a type this chat can send.")
+        }
+        let ceiling = ChatAttachments.maxBytes(forMIME: normalized)
+        guard !data.isEmpty else {
+            throw APIError.transport("\(filename) is empty.")
+        }
+        guard data.count <= ceiling else {
+            let megabytes = ceiling / (1_024 * 1_024)
+            throw APIError.transport("\(filename) is larger than \(megabytes) MB.")
+        }
+        var request = try makeRequest("POST", "/api/attachments")
+        request.setValue(normalized, forHTTPHeaderField: "Content-Type")
+        request.httpBody = data
+        if data.count > 2 * 1_024 * 1_024 { request.timeoutInterval = 60 }
+        let saved = try await send(request, as: AttachmentResponse.self)
+        guard !saved.path.isEmpty, !saved.path.contains("\0") else {
+            throw APIError.transport("The uploaded file could not be used.")
+        }
+        return (saved.path, saved.mime, saved.bytes)
+    }
+
+    /// Hand the APNs device token to the sidecar so a killed app can be woken.
+    /// The sidecar stores it per paired device; iOS never sends a push itself.
+    public func registerPushToken(_ hex: String) async throws {
+        let token = hex.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard token.utf8.count >= 64,
+              token.utf8.allSatisfy({
+                  (48...57).contains($0) || (97...102).contains($0)
+              })
+        else {
+            throw APIError.transport("That push token is not usable.")
+        }
+        try await send(
+            try makeRequest("POST", "/api/companion/push-token", body: ["token": token])
+        )
+    }
+
+    /// Hand the sidecar a Live Activity push token.
+    ///
+    /// Two kinds exist and they are not interchangeable.  A push-to-start
+    /// token is per-device and survives every activity, and it is the only one
+    /// that can start an activity while the app is dead; an update token is
+    /// minted per activity and rotates, and can only update or end that one.
+    /// The sidecar stores them separately for that reason, so the kind has to
+    /// travel with the token rather than be inferred.
+    public func registerLiveActivityToken(_ hex: String, kind: LiveActivityTokenKind) async throws {
+        let token = hex.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard token.utf8.count >= 64,
+              token.utf8.allSatisfy({
+                  (48...57).contains($0) || (97...102).contains($0)
+              })
+        else {
+            throw APIError.transport("That Live Activity token is not usable.")
+        }
+        try await send(
+            try makeRequest(
+                "POST",
+                "/api/companion/live-activity-token",
+                body: ["token": token, "kind": kind.rawValue]
+            )
+        )
+    }
+
+    /// What the sidecar knows about the APNs sender right now.
+    ///
+    /// Mirrors `PushSenderHealth` in `companion/src/apns.ts` — counts,
+    /// Apple's own status string, and the moment of the last send or
+    /// error.  Nothing here is derived from the signing key itself.
+    ///
+    /// A 404 here means an older sidecar that does not report the route
+    /// at all; callers should treat that as "not reported by this
+    /// computer" rather than as a health failure.
+    public func pushSenderHealth() async throws -> PushSenderHealth {
+        try await send(
+            try makeRequest("GET", "/api/companion/push-health"),
+            as: PushSenderHealth.self
+        )
     }
 
     public func generateAvatar(botId: String, prompt: String) async throws -> Bot {
@@ -764,6 +1229,54 @@ public struct CompanionClient: Sendable {
             request,
             as: GeneratedAvatarResponse.self
         ).bot
+    }
+
+    /// Ask the computer to voice a reply for `device`.
+    ///
+    /// `device` makes the harness resolve that device's own voice
+    /// (`voiceForDevice`), and the clip GETs must name the same device.
+    /// `progressive` makes it answer once the first clip is ready (or with
+    /// none, still preparing) instead of after every clip, which a long reply
+    /// cannot do inside the companion's 30-second header deadline.  An older
+    /// harness ignores both and answers with every clip, which decodes the
+    /// same way.  `spans` is always asked for (see `MessageVoice.script`);
+    /// an older harness ignores it too.
+    public func messageVoice(
+        threadId: String,
+        messageId: String,
+        device: SpeechDevice,
+        progressive: Bool
+    ) async throws -> MessageVoice {
+        guard Self.validVoiceId(threadId), Self.validVoiceId(messageId) else { throw APIError.badURL }
+        var request = try makeRequest(
+            "POST", "/api/threads/\(threadId)/messages/\(messageId)/audio",
+            // `spans` asks for the script kind and, for a reply read as
+            // written, the source spans karaoke lines the voice up with.
+            body: ["device": device.rawValue, "progressive": progressive, "spans": true]
+        )
+        // A progressive answer arrives within about 20 seconds.  The long
+        // ceiling is for an older harness that still makes every clip first.
+        request.timeoutInterval = 150
+        return try await send(request, as: MessageVoice.self)
+    }
+
+    /// One clip of a reply.  The harness holds the request for up to 15
+    /// seconds while that clip is still being made, then answers 425 with
+    /// Retry-After, so the timeout leaves room for that wait plus the trip.
+    public func voiceClip(threadId: String, messageId: String, index: Int, device: SpeechDevice) async throws -> Data {
+        guard Self.validVoiceId(threadId), Self.validVoiceId(messageId), index >= 0 else { throw APIError.badURL }
+        var request = try makeRequest(
+            "GET", "/api/threads/\(threadId)/messages/\(messageId)/audio/\(index)",
+            query: [URLQueryItem(name: "device", value: device.rawValue)]
+        )
+        request.timeoutInterval = 30
+        let (data, response) = try await perform(request)
+        try Self.check(response, data)
+        return data
+    }
+
+    private static func validVoiceId(_ id: String) -> Bool {
+        !id.isEmpty && id.utf8.allSatisfy { (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) || $0 == 45 || $0 == 95 }
     }
 
     public func previewVoice(text: String, voiceId: String) async throws -> Data {
@@ -811,11 +1324,29 @@ public struct CompanionClient: Sendable {
         try await send(try makeRequest("DELETE", "/api/routines/\(id)"))
     }
 
+    /// Stop a run that is queued, running or waiting.  The harness answers 404
+    /// once the run has already settled.
+    public func cancelRoutineRun(id: String) async throws -> RoutineRun {
+        try await send(try makeRequest("POST", "/api/routine-runs/\(id)/cancel"), as: RoutineRunResponse.self).run
+    }
+
+    /// Acknowledge one run.  It keeps its status and error; it just stops
+    /// counting toward the unseen-failure badge.
+    public func markRoutineRunSeen(id: String) async throws -> RoutineRun {
+        try await send(try makeRequest("POST", "/api/routine-runs/\(id)/seen"), as: RoutineRunResponse.self).run
+    }
+
+    /// Acknowledge every unseen failure at once.  Returns the runs it marked.
+    public func markAllRoutineRunsSeen() async throws -> [RoutineRun] {
+        try await send(try makeRequest("POST", "/api/routine-runs/seen"), as: MarkedRoutineRunsResponse.self).runs
+    }
+
     private static func routineBody(_ input: RoutineInput) -> [String: Any] {
         var schedule: [String: Any] = ["type": input.schedule.type.rawValue]
         if let at = input.schedule.at { schedule["at"] = at }
         if let time = input.schedule.time { schedule["time"] = time }
         if let weekdays = input.schedule.weekdays { schedule["weekdays"] = weekdays }
+        if let timeZone = input.schedule.timeZone { schedule["timeZone"] = timeZone }
         var body: [String: Any] = [
             "name": input.name, "prompt": input.prompt, "botId": input.botId,
             "runOn": input.runOn, "schedule": schedule, "durationMinutes": input.durationMinutes,
@@ -826,18 +1357,122 @@ public struct CompanionClient: Sendable {
 
     /// Make a room. The harness names it after the first member when `name`
     /// is empty, exactly as the desktop's dialog does.
-    public func createRoom(name: String?, memberIds: [String]) async throws -> Room {
-        var body: [String: Any] = ["memberIds": memberIds]
-        if let name, !name.trimmingCharacters(in: .whitespaces).isEmpty { body["name"] = name }
+    ///
+    /// The first settings travel in this one request.  They used to follow in a
+    /// PATCH, so a folder the computer would not let a phone choose (403) left
+    /// a half-made room behind.  Sent here, the computer checks them before it
+    /// creates anything.
+    public func createRoom(
+        name: String?,
+        memberIds: [String],
+        cwd: String? = nil,
+        bulletin: String? = nil,
+        defaultResponder: GroupResponder? = nil
+    ) async throws -> Room {
+        let body = Self.roomCreateBody(
+            name: name,
+            memberIds: memberIds,
+            cwd: cwd,
+            bulletin: bulletin,
+            defaultResponder: defaultResponder
+        )
         return try await send(try makeRequest("POST", "/api/groups", body: body), as: CreatedRoom.self).group
     }
 
-    public func send(text: String, toBot botId: String) async throws {
-        try await send(try makeRequest("POST", "/api/bots/\(botId)/messages", body: ["text": text]))
+    /// The wire body for `createRoom`.  Blank values are left out, so a room
+    /// made with nothing to say about a folder or bulletin sends what it
+    /// always did.
+    static func roomCreateBody(
+        name: String?,
+        memberIds: [String],
+        cwd: String?,
+        bulletin: String?,
+        defaultResponder: GroupResponder?
+    ) -> [String: Any] {
+        var body: [String: Any] = ["memberIds": memberIds]
+        if let name, !name.trimmingCharacters(in: .whitespaces).isEmpty { body["name"] = name }
+        if let cwd, !cwd.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            body["cwd"] = cwd.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if let bulletin, !bulletin.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            body["bulletin"] = bulletin.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if let defaultResponder {
+            var responder: [String: Any] = ["kind": defaultResponder.kind]
+            if let botId = defaultResponder.botId { responder["botId"] = botId }
+            body["defaultResponder"] = responder
+        }
+        return body
     }
 
-    public func send(text: String, toRoom groupId: String) async throws {
-        try await send(try makeRequest("POST", "/api/groups/\(groupId)/messages", body: ["text": text]))
+    @discardableResult
+    public func send(
+        text: String,
+        toBot botId: String,
+        threadId: String,
+        idempotencyKey: String,
+        recording: IncomingRecording? = nil,
+        busyDelivery: String? = nil
+    ) async throws -> SendMessageResult {
+        var body: [String: Any] = ["text": text, "threadId": threadId, "idempotencyKey": idempotencyKey]
+        if let busyDelivery { body["busyDelivery"] = busyDelivery }
+        if let recording {
+            body["recording"] = ["path": recording.path, "mime": recording.mime,
+                                 "transcript": recording.transcript, "engine": recording.engine]
+        }
+        return try await sendIdempotent(
+            try makeRequest("POST", "/api/bots/\(botId)/messages", body: body),
+            as: SendMessageResult.self
+        )
+    }
+
+    /// Save a recorded WAV as bytes, not as a prompt attachment. The message
+    /// send below links the returned path to exactly one conversation row.
+    public func uploadRecording(_ data: Data) async throws -> String {
+        guard data.count >= 44, data.count <= 25 * 1_024 * 1_024 else {
+            throw APIError.transport("Recording must be a WAV smaller than 25 MB.")
+        }
+        var request = try makeRequest("POST", "/api/attachments")
+        request.setValue("audio/wav", forHTTPHeaderField: "Content-Type")
+        request.httpBody = data
+        if data.count > 2 * 1_024 * 1_024 { request.timeoutInterval = 60 }
+        let saved = try await send(request, as: AttachmentResponse.self)
+        guard saved.mime == "audio/wav", saved.path.hasPrefix("/api/attachments/") else {
+            throw APIError.transport("The recording could not be saved.")
+        }
+        return saved.path
+    }
+
+    public func recording(threadId: String, messageId: String) async throws -> Data {
+        let request = try makeRequest("GET", "/api/threads/\(threadId)/messages/\(messageId)/recording")
+        let (data, response) = try await perform(request)
+        try Self.check(response, data)
+        return data
+    }
+
+    public func reviewRecording(threadId: String, messageId: String, correction: String, comment: String) async throws -> Message {
+        try await send(try makeRequest("PATCH", "/api/threads/\(threadId)/messages/\(messageId)/recording-review", body: [
+            "correction": correction, "comment": comment,
+        ]), as: MessageResponse.self).message
+    }
+
+    public func cancelQueued(botId: String, queueId: String) async throws {
+        try await send(try makeRequest("DELETE", "/api/bots/\(botId)/queue/\(queueId)"))
+    }
+
+    public func send(
+        text: String,
+        toRoom groupId: String,
+        threadId: String,
+        idempotencyKey: String,
+        recording: IncomingRecording? = nil
+    ) async throws {
+        var body: [String: Any] = ["text": text, "threadId": threadId, "idempotencyKey": idempotencyKey]
+        if let recording {
+            body["recording"] = ["path": recording.path, "mime": recording.mime,
+                                 "transcript": recording.transcript, "engine": recording.engine]
+        }
+        try await sendIdempotent(try makeRequest("POST", "/api/groups/\(groupId)/messages", body: body))
     }
 
     /// Answer an approval or a question.
@@ -851,10 +1486,17 @@ public struct CompanionClient: Sendable {
         try await send(try makeRequest("POST", "/api/threads/\(threadId)/respond", body: body))
     }
 
-    /// Remember a grant so the same tool stops asking. The harness decides
-    /// the key and puts it on the card; the phone never derives its own.
-    public func alwaysAllow(botId: String, key: String) async throws {
-        try await send(try makeRequest("POST", "/api/bots/\(botId)/always-allow", body: ["allowKey": key]))
+    /// Allow every permission request waiting in a thread (the desktop's
+    /// "Approve All").  Returns how many the harness approved, which can be
+    /// fewer than the card count the phone showed when one was answered
+    /// somewhere else in the meantime.
+    @discardableResult
+    public func approveAll(threadId: String) async throws -> Int {
+        let response = try await send(
+            try makeRequest("POST", "/api/threads/\(threadId)/approve-all"),
+            as: ApproveAllResponse.self
+        )
+        return response.approvedCount ?? 0
     }
 
     /// Starts one more account authorization for a toolkit. Revocation is
@@ -877,6 +1519,28 @@ public struct CompanionClient: Sendable {
               url.host != nil
         else { throw APIError.badURL }
         return url
+    }
+
+    /// Detach one connected account.
+    ///
+    /// The account id is validated here for the same reason the slug is: the
+    /// companion's allowlist matches the harness's own charset, and a value
+    /// outside it should fail as a bad request rather than as a puzzling 404
+    /// from a route that refused to match.
+    public func removeConnectorAccount(slug: String, accountId: String) async throws {
+        guard Self.validConnectorSlug(slug), Self.validAccountId(accountId) else { throw APIError.badURL }
+        try await send(try makeRequest("DELETE", "/api/connectors/\(slug)/accounts/\(accountId)"))
+    }
+
+    /// Matches the harness's `[A-Za-z0-9][A-Za-z0-9_-]{0,127}` account id.
+    private static func validAccountId(_ value: String) -> Bool {
+        let bytes = Array(value.utf8)
+        guard (1...128).contains(bytes.count) else { return false }
+        func alnum(_ b: UInt8) -> Bool {
+            (48...57).contains(b) || (65...90).contains(b) || (97...122).contains(b)
+        }
+        guard alnum(bytes[0]) else { return false }
+        return bytes.dropFirst().allSatisfy { alnum($0) || $0 == 95 || $0 == 45 }
     }
 
     /// Matches the companion's `[\w-]+` toolkit route component. JavaScript
@@ -924,12 +1588,72 @@ public struct CompanionClient: Sendable {
         try await send(try makeRequest("PATCH", "/api/bots/\(botId)/tasks/\(threadId)", body: ["title": title]))
     }
 
+    /// Put one thread to sleep, or wake it: `0` sleeps until the thread's
+    /// next activity, a timestamp in epoch milliseconds until that moment,
+    /// and nil wakes it now.
+    ///
+    /// Waking travels as JSON `null`, not as an omitted field — the harness
+    /// reads an absent key as "leave the snooze alone", which is what lets a
+    /// rename on the same route not disturb one.  `NSNull()` is how that
+    /// null survives `JSONSerialization`.
+    public func snoozeTask(botId: String, threadId: String, snoozedUntil: Double?) async throws {
+        try await send(try makeRequest(
+            "PATCH",
+            "/api/bots/\(botId)/tasks/\(threadId)",
+            body: ["snoozedUntil": snoozedUntil ?? NSNull()]
+        ))
+    }
+
     public func deleteTask(botId: String, threadId: String) async throws -> Bot {
         try await send(try makeRequest("DELETE", "/api/bots/\(botId)/tasks/\(threadId)"), as: BotResponse.self).bot
     }
 
-    public func interrupt(botId: String) async throws {
-        try await send(try makeRequest("POST", "/api/bots/\(botId)/interrupt"))
+    // MARK: - Room tasks
+    //
+    // A channel's separate conversations.  The route answers each of create,
+    // switch and delete with the room as it now stands, transcript included.
+
+    public func createRoomTask(roomId: String, title: String? = nil) async throws -> Room {
+        var body: [String: Any] = [:]
+        if let title, !title.isEmpty { body["title"] = title }
+        return try await send(
+            try makeRequest("POST", "/api/groups/\(roomId)/tasks", body: body),
+            as: CreatedRoom.self
+        ).group
+    }
+
+    public func switchRoomTask(roomId: String, threadId: String) async throws -> Room {
+        try await send(
+            try makeRequest("POST", "/api/groups/\(roomId)/tasks/\(threadId)"),
+            as: CreatedRoom.self
+        ).group
+    }
+
+    public func renameRoomTask(roomId: String, threadId: String, title: String) async throws {
+        try await send(try makeRequest("PATCH", "/api/groups/\(roomId)/tasks/\(threadId)", body: ["title": title]))
+    }
+
+    public func deleteRoomTask(roomId: String, threadId: String) async throws -> Room {
+        try await send(
+            try makeRequest("DELETE", "/api/groups/\(roomId)/tasks/\(threadId)"),
+            as: CreatedRoom.self
+        ).group
+    }
+
+    public func interrupt(botId: String, threadId: String) async throws {
+        try await send(try makeRequest(
+            "POST",
+            "/api/bots/\(botId)/interrupt",
+            body: ["threadId": threadId]
+        ))
+    }
+
+    public func interrupt(groupId: String, threadId: String) async throws {
+        try await send(try makeRequest(
+            "POST",
+            "/api/groups/\(groupId)/interrupt",
+            body: ["threadId": threadId]
+        ))
     }
 
     /// Mint a fresh interactive viewer for an existing cloud computer. The
@@ -949,6 +1673,160 @@ public struct CompanionClient: Sendable {
 
     public func markRead(roomId: String) async throws {
         try await send(try makeRequest("POST", "/api/groups/\(roomId)/read"))
+    }
+
+    // MARK: - Mac desktop
+
+    /// Ask the paired Mac to open or bring to front the BotFleet desktop app.
+    public func openDesktopApp() async throws {
+        try await send(try makeRequest("POST", "/api/desktop/open", body: [:]))
+    }
+
+    // MARK: - Mac update
+
+    /// The paired Mac's current update status: installed build, anything
+    /// newer on `origin/main`, and the last transaction's outcome.
+    public func updateStatus() async throws -> MacUpdateStatus {
+        try await send(try makeRequest("GET", "/api/update/status"), as: MacUpdateStatus.self)
+    }
+
+    /// Ask the harness to look again right now rather than waiting for
+    /// whatever cadence it checks on its own.
+    ///
+    /// The harness's authorization for this route is either the desktop's
+    /// own owner credential or a plain JSON content type — proof the request
+    /// is not a hostile page's cross-origin form submission, since a form
+    /// cannot set `content-type: application/json` without tripping a
+    /// preflight this server never answers.  `body: [:]` is what makes
+    /// `makeRequest` send that header; an empty object is all the harness
+    /// needs to see.
+    ///
+    /// A check that could not reach the update source answers 502 with the
+    /// reason and the status it would have returned anyway, and that is a
+    /// failure rather than "nothing new": the Mac's `origin/main` ref is
+    /// still whatever the last good fetch left behind, so the comparison
+    /// this returns would otherwise pass off a week-old answer as one the
+    /// person just asked for.  `MacUpdateCheckFailure` carries both halves,
+    /// the same way `runUpdate()`'s 409 does.
+    public func checkForUpdates() async throws -> MacUpdateStatus {
+        let request = try makeRequest("POST", "/api/update/check", body: [:])
+        let (data, response) = try await perform(request)
+        if let http = response as? HTTPURLResponse, http.statusCode == 502,
+           let failure = try? JSONDecoder().decode(MacUpdateCheckFailureBody.self, from: data) {
+            throw MacUpdateCheckFailure(message: failure.error, status: failure.status)
+        }
+        try Self.check(response, data)
+        do {
+            return try JSONDecoder().decode(MacUpdateStatus.self, from: data)
+        } catch {
+            throw APIError.transport("The computer sent something this app couldn't read.")
+        }
+    }
+
+    /// Start installing the available update.  The harness answers 202 with
+    /// the run it just started, or 409 with why it refused — a run already
+    /// in progress, or one of `capabilities.reasons`.  Both bodies carry a
+    /// full `MacUpdateStatus`, so this hands it back either way rather than
+    /// making the caller re-fetch just to find out what changed: a success
+    /// throws nothing and returns it on `MacUpdateRunStarted`, a refusal
+    /// throws `MacUpdateRunRefusal` carrying both the reason and the status.
+    /// Anything else (401 unpaired, 5xx, an unreadable body) falls through
+    /// to the ordinary `APIError` path every other write on this client uses.
+    public func runUpdate() async throws -> MacUpdateRunStarted {
+        let request = try makeRequest("POST", "/api/update/run", body: [:])
+        let (data, response) = try await perform(request)
+        if let http = response as? HTTPURLResponse, http.statusCode == 409,
+           let refusal = try? JSONDecoder().decode(MacUpdateRunRefusalBody.self, from: data) {
+            throw MacUpdateRunRefusal(message: refusal.error, status: refusal.status)
+        }
+        try Self.check(response, data)
+        do {
+            return try JSONDecoder().decode(MacUpdateRunStarted.self, from: data)
+        } catch {
+            throw APIError.transport("The computer sent something this app couldn't read.")
+        }
+    }
+
+    // MARK: - Background jobs
+
+    /// Every job the harness knows; the screen sorts for display.  A job the
+    /// phone cannot read is left out rather than failing the list.
+    public func jobs() async throws -> [JobSnapshot] {
+        try await send(try makeRequest("GET", "/api/jobs"), as: JobListResponse.self).jobs
+    }
+
+    /// The newest bytes of one job's log (the harness's default 64 KB).
+    /// Output is never on a frame, so it is read here, on demand.
+    public func jobOutput(id: String) async throws -> JobOutputResponse {
+        try await send(try makeRequest("GET", "/api/jobs/\(id)/output"), as: JobOutputResponse.self)
+    }
+
+    /// The owner's Stop: the job gets SIGTERM, then SIGKILL after five
+    /// seconds, and the bot is told on its next turn without being woken.
+    /// Answered at once; the next `jobs` frame shows `stopping`, then
+    /// `killed`.  A job that already ended answers 409, which is the outcome
+    /// asked for, so it is not an error here.  `body: [:]` sends the JSON
+    /// content type every other bodyless write on this client sends.
+    public func stopJob(id: String) async throws {
+        do {
+            try await send(try makeRequest("POST", "/api/jobs/\(id)/stop", body: [:]))
+        } catch let error as APIError where error.isConflict {
+            return
+        }
+    }
+
+    /// Stop every running job of one conversation.
+    public func stopAllJobs(threadId: String) async throws {
+        do {
+            try await send(try makeRequest("POST", "/api/jobs/stop", body: ["threadId": threadId]))
+        } catch let error as APIError where error.isConflict {
+            // Nothing left to stop is the outcome asked for, the same as
+            // `stopJob(id:)`.
+            return
+        }
+    }
+
+    // MARK: - Usage and cost
+
+    /// Quota windows, rolling per-engine spend and the engines being held.
+    public func quotas() async throws -> QuotasSnapshot {
+        try await send(try makeRequest("GET", "/api/quotas"), as: QuotasSnapshot.self)
+    }
+
+    /// The speech provider's character counts.
+    public func speechUsage() async throws -> SpeechUsage {
+        try await send(try makeRequest("GET", "/api/tts/usage"), as: SpeechUsage.self)
+    }
+
+    // MARK: - Shared memory
+
+    /// Whether the recall corpus bots search is reachable.  Read-only.
+    public func sharedMemoryStatus() async throws -> SharedMemoryStatus {
+        try await send(try makeRequest("GET", "/api/qdrant/status"), as: SharedMemoryStatus.self)
+    }
+
+    // MARK: - Skills
+
+    /// A bot's imported skills.
+    public func botSkills(botId: String) async throws -> SkillsResponse {
+        try await send(try makeRequest("GET", "/api/bots/\(botId)/skills"), as: SkillsResponse.self)
+    }
+
+    /// One skill's SKILL.md, which a person reads before enabling it.
+    public func skillText(botId: String, name: String) async throws -> String {
+        try await send(
+            try makeRequest("GET", "/api/bots/\(botId)/skills/\(name)"),
+            as: SkillTextResponse.self
+        ).text
+    }
+
+    /// Turn one skill on or off.  The only write the phone has on skills:
+    /// importing reads a folder off the computer's disk, and stays there.
+    public func setSkillEnabled(botId: String, name: String, enabled: Bool) async throws -> SkillListing {
+        try await send(
+            try makeRequest("PATCH", "/api/bots/\(botId)/skills/\(name)", body: ["enabled": enabled]),
+            as: SkillResponse.self
+        ).skill
     }
 
     // MARK: - Events
@@ -980,11 +1858,12 @@ public struct CompanionClient: Sendable {
     /// `screens` defaults off, and should stay off unless something is
     /// actually showing them: the harness pushes a base64 desktop capture
     /// every few seconds to every client that asks, which is a poor thing to
-    /// send a phone on cellular. The computer panel turns it on for exactly
-    /// as long as it is open, which costs a reconnect — cheap, because the
-    /// stream resumes from its cursor and loses nothing.
-    public func events(since cursor: String?, screens: Bool = false) throws -> AsyncThrowingStream<StreamFrame, Error> {
+    /// send a phone on cellular.  The computer panel turns it on for exactly
+    /// as long as it is open and names the watched bot.  The stream resumes
+    /// from its cursor after the reconnect, so nothing is missed.
+    public func events(since cursor: String?, screens: Bool = false, screenBotIds: [String] = []) throws -> AsyncThrowingStream<StreamFrame, Error> {
         var query = [URLQueryItem(name: "screens", value: screens ? "on" : "off")]
+        if screens { query += screenBotIds.map { URLQueryItem(name: "botId", value: $0) } }
         if let cursor { query.append(URLQueryItem(name: "since", value: cursor)) }
         var streamRequest = try makeRequest("GET", "/api/events", query: query)
         streamRequest.setValue("text/event-stream", forHTTPHeaderField: "Accept")
@@ -997,6 +1876,7 @@ public struct CompanionClient: Sendable {
         // first quiet gap and reconnect, forever, looking like a flaky network
         // rather than a number in the wrong place.
         streamRequest.timeoutInterval = 90
-        return eventStream(request: streamRequest, session: Self.streaming)
+        if let hostOrigin, streamRequest.url.map(hostOrigin.contains) != true { throw SavedHostError.differentOrigin }
+        return eventStream(request: streamRequest, session: Self.streaming, delegate: hostOrigin.map { HostOriginRedirectPolicy(origin: $0) })
     }
 }

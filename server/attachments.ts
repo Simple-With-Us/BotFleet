@@ -1,20 +1,28 @@
-// Image attachments: pasted/dropped images become files under
-// ~/.botfleet/attachments so every CLI engine can open them by path —
-// the app never ships image bytes through the prompt itself.
+// Chat attachments: pasted/dropped files become paths under
+// ~/.botfleet/attachments so every CLI engine can open them —
+// the app never ships file bytes through the prompt itself.
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, extname } from "node:path";
 import { DATA_DIR } from "./config.ts";
 
 export const ATTACHMENTS_DIR = join(DATA_DIR, "attachments");
 
-/** The spec's ceiling: a screenshot bigger than this is rejected before it
- * is ever buffered, matching the composer's existing size discipline. */
+/** Default retention for audio files in ATTACHMENTS_DIR (1 week).  0 keeps forever. */
+export const DEFAULT_AUDIO_RETENTION_DAYS = 7;
+
+/** Screenshots and photos stay at 10 MB.  Other chat files may be larger. */
 export const IMAGE_MAX_BYTES = 10 * 1024 * 1024;
+export const FILE_MAX_BYTES = 25 * 1024 * 1024;
 
 /** Mimes the endpoint accepts, mapped to the extension stored on disk.
- * Sniffing is not attempted — a lie here only changes the filename. */
-const IMAGE_MIMES: Record<string, string> = {
+ * Sniffing is not attempted — a lie here only changes the filename.
+ * HTML/JS are refused so the serve route cannot become an XSS host.
+ * SVG is allowed as an image (avatars and chat previews use <img>), and
+ * GET serves it with nosniff plus a sandbox CSP. */
+const ATTACHMENT_MIMES: Record<string, string> = {
   "image/png": ".png",
   "image/jpeg": ".jpg",
   "image/gif": ".gif",
@@ -22,11 +30,77 @@ const IMAGE_MIMES: Record<string, string> = {
   "image/heic": ".heic",
   "image/heif": ".heif",
   "image/avif": ".avif",
+  "image/tiff": ".tiff",
+  "image/bmp": ".bmp",
+  "image/x-ms-bmp": ".bmp",
+  "image/svg+xml": ".svg",
+  "application/pdf": ".pdf",
+  "text/plain": ".txt",
+  "text/markdown": ".md",
+  "text/csv": ".csv",
+  "application/json": ".json",
+  "application/zip": ".zip",
+  "application/gzip": ".gz",
+  "audio/mpeg": ".mp3",
+  "audio/wav": ".wav",
+  "audio/ogg": ".ogg",
+  "audio/opus": ".opus",
+  "audio/mp4": ".m4a",
+  "audio/x-m4a": ".m4a",
+  "audio/aac": ".aac",
+  "audio/webm": ".webm",
+  "video/mp4": ".mp4",
+  "application/msword": ".doc",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+  "application/vnd.ms-excel": ".xls",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+  "application/octet-stream": ".bin",
 };
+
+const AUDIO_EXTENSIONS = new Set([".mp3", ".wav", ".ogg", ".opus", ".m4a", ".aac", ".webm"]);
 
 export function extensionForMime(mime: string | undefined): string | null {
   if (!mime) return null;
-  return IMAGE_MIMES[mime.split(";")[0]!.trim().toLowerCase()] ?? null;
+  return ATTACHMENT_MIMES[mime.split(";")[0]!.trim().toLowerCase()] ?? null;
+}
+
+export function isImageMime(mime: string | undefined): boolean {
+  const ext = extensionForMime(mime);
+  return (
+    ext === ".png" ||
+    ext === ".jpg" ||
+    ext === ".gif" ||
+    ext === ".webp" ||
+    ext === ".heic" ||
+    ext === ".heif" ||
+    ext === ".avif" ||
+    ext === ".tiff" ||
+    ext === ".bmp" ||
+    ext === ".svg"
+  );
+}
+
+const TRANSCODE_TO_JPEG = new Set([".heic", ".heif", ".tiff", ".bmp", ".avif"]);
+
+/** Apple formats preview as JPEG so the chat bubble can show them.  macOS only. */
+function jpegFromAppleImage(bytes: Buffer): Buffer | null {
+  if (process.platform !== "darwin") return null;
+  const dir = mkdtempSync(join(tmpdir(), "botfleet-img-"));
+  try {
+    const input = join(dir, "in");
+    const output = join(dir, "out.jpg");
+    writeFileSync(input, bytes);
+    execFileSync("sips", ["-s", "format", "jpeg", input, "--out", output], {
+      timeout: 20_000,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const jpeg = readFileSync(output);
+    return jpeg.byteLength > 0 ? jpeg : null;
+  } catch {
+    return null;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 export function ensureAttachmentsDir(): void {
@@ -43,23 +117,42 @@ export interface SavedAttachment {
  * is never attacker-controlled and never collides; the extension preserves
  * the format the sender claimed. */
 export function saveImage(bytes: Buffer, mime: string): SavedAttachment {
-  const ext = extensionForMime(mime);
-  if (!ext) throw Object.assign(new Error("unsupported image type"), { status: 400 });
-  if (bytes.byteLength === 0) throw Object.assign(new Error("empty image"), { status: 400 });
-  if (bytes.byteLength > IMAGE_MAX_BYTES) {
-    throw Object.assign(new Error(`image exceeds ${IMAGE_MAX_BYTES} bytes`), { status: 413 });
+  return saveAttachment(bytes, mime);
+}
+
+/** Persist a chat file (image or otherwise) under a generated name. */
+export function saveAttachment(bytes: Buffer, mime: string): SavedAttachment {
+  const claimed = (mime || "").split(";")[0]!.trim().toLowerCase();
+  let ext = extensionForMime(claimed);
+  let body = bytes;
+  let storedMime = claimed;
+  if (ext && TRANSCODE_TO_JPEG.has(ext)) {
+    const jpeg = jpegFromAppleImage(bytes);
+    if (jpeg) {
+      body = jpeg;
+      ext = ".jpg";
+      storedMime = "image/jpeg";
+    }
+  }
+  if (!ext) throw Object.assign(new Error("unsupported file type"), { status: 400 });
+  if (body.byteLength === 0) throw Object.assign(new Error("empty file"), { status: 400 });
+  const ceiling = isImageMime(claimed) || storedMime === "image/jpeg" ? IMAGE_MAX_BYTES : FILE_MAX_BYTES;
+  if (body.byteLength > ceiling) {
+    throw Object.assign(new Error(`file exceeds ${ceiling} bytes`), { status: 413 });
   }
   ensureAttachmentsDir();
   const name = `${randomUUID()}${ext}`;
   const path = join(ATTACHMENTS_DIR, name);
-  writeFileSync(path, bytes, { mode: 0o600, flag: "wx" });
-  return { path, mime: mime.split(";")[0]!.trim().toLowerCase(), bytes: bytes.byteLength };
+  writeFileSync(path, body, { mode: 0o600, flag: "wx" });
+  return { path, mime: storedMime, bytes: body.byteLength };
 }
 
 /** Existence check with the same name discipline as readAttachment, without
  * reading up to 10MB of pixels just to learn the file is there. */
+const SAFE_NAME = /^[A-Za-z0-9-]+\.[A-Za-z0-9]{1,8}$/;
+
 export function attachmentExists(name: string): boolean {
-  if (!/^[A-Za-z0-9-]+\.(png|jpg|gif|webp)$/.test(name)) return false;
+  if (!SAFE_NAME.test(name)) return false;
   try {
     return statSync(join(ATTACHMENTS_DIR, name)).isFile();
   } catch {
@@ -71,7 +164,7 @@ export function attachmentExists(name: string): boolean {
  * filename (no separators, no dotfiles) inside ATTACHMENTS_DIR resolve —
  * the route must never become a general file server for the data dir. */
 export function readAttachment(name: string): { bytes: Buffer; mime: string } | null {
-  if (!/^[A-Za-z0-9-]+\.(png|jpg|jpeg|gif|webp)$/.test(name)) return null;
+  if (!SAFE_NAME.test(name)) return null;
   const path = join(ATTACHMENTS_DIR, name);
   if (extname(path) === ".jpeg") return null; // saved as .jpg; .jpeg is not a name we write
   try {
@@ -82,16 +175,55 @@ export function readAttachment(name: string): { bytes: Buffer; mime: string } | 
 }
 
 function mimeForExt(ext: string): string {
-  switch (ext) {
-    case ".png":
-      return "image/png";
-    case ".jpg":
-      return "image/jpeg";
-    case ".gif":
-      return "image/gif";
-    case ".webp":
-      return "image/webp";
-    default:
-      return "application/octet-stream";
+  for (const [mime, mapped] of Object.entries(ATTACHMENT_MIMES)) {
+    if (mapped === ext) return mime;
   }
+  return "application/octet-stream";
+}
+
+export interface AudioAttachmentSweepResult {
+  removedFiles: number;
+  freedBytes: number;
+  dryRun: boolean;
+}
+
+/** Remove audio files in ATTACHMENTS_DIR older than `retentionDays`.  Images,
+ * documents, and non-audio files are never touched.  When `retentionDays <= 0`,
+ * audio files are kept indefinitely. */
+export function sweepExpiredAudioAttachments(
+  retentionDays: number = DEFAULT_AUDIO_RETENTION_DAYS,
+  options: { dir?: string; nowMs?: number; dryRun?: boolean } = {},
+): AudioAttachmentSweepResult {
+  const dryRun = options.dryRun === true;
+  if (!Number.isFinite(retentionDays) || retentionDays <= 0) {
+    return { removedFiles: 0, freedBytes: 0, dryRun };
+  }
+  const dir = options.dir ?? ATTACHMENTS_DIR;
+  const cutoffMs = (options.nowMs ?? Date.now()) - retentionDays * 86_400_000;
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return { removedFiles: 0, freedBytes: 0, dryRun };
+  }
+  let removedFiles = 0;
+  let freedBytes = 0;
+  for (const name of names) {
+    if (!SAFE_NAME.test(name)) continue;
+    const ext = extname(name).toLowerCase();
+    if (!AUDIO_EXTENSIONS.has(ext)) continue;
+    const fullPath = join(dir, name);
+    try {
+      const st = statSync(fullPath);
+      if (!st.isFile() || st.mtimeMs > cutoffMs) continue;
+      if (!dryRun) {
+        unlinkSync(fullPath);
+      }
+      removedFiles += 1;
+      freedBytes += st.size;
+    } catch {
+      // Ignore concurrent removals.
+    }
+  }
+  return { removedFiles, freedBytes, dryRun };
 }

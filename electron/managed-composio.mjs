@@ -1,5 +1,9 @@
 const TOKEN = /^[0-9a-f]{64}$/;
 
+/** The identity a real BotFleet connected-apps broker reports from GET /health. */
+export const MANAGED_COMPOSIO_SERVICE = "botfleet-composio";
+const DEFAULT_PREFLIGHT_TIMEOUT_MS = 5_000;
+
 export function normalizeManagedComposioBrokerUrl(value) {
   if (typeof value !== "string" || !value.trim()) return "";
   let parsed;
@@ -33,19 +37,84 @@ export function managedComposioChildEnvironment(brokerUrl, credentials, environm
   return next;
 }
 
+/** A short identity check before any installation credential leaves this
+ * machine. The broker must answer GET /health with JSON naming itself as the
+ * BotFleet connected-apps service; a wrong host, a renamed Worker, or a
+ * Cloudflare 404 page must never be mistaken for a working broker. Never
+ * throws: the caller decides what to do with a failed preflight. */
+export async function preflightManagedComposioBroker({
+  brokerUrl,
+  fetchImpl = globalThis.fetch,
+  timeoutSignal = (milliseconds) => AbortSignal.timeout(milliseconds),
+  timeoutMs = DEFAULT_PREFLIGHT_TIMEOUT_MS,
+} = {}) {
+  const url = normalizeManagedComposioBrokerUrl(brokerUrl);
+  if (!url) return { ok: false, reason: "no connected-apps service is configured" };
+  let response;
+  try {
+    response = await fetchImpl(`${url}/health`, {
+      headers: { accept: "application/json" },
+      redirect: "error",
+      signal: timeoutSignal(timeoutMs),
+    });
+  } catch (error) {
+    const timedOut = error?.name === "TimeoutError" || error?.name === "AbortError";
+    return {
+      ok: false,
+      reason: timedOut
+        ? "the connected-apps service did not answer in time"
+        : "the connected-apps service could not be reached",
+    };
+  }
+  if (!response.ok) {
+    return { ok: false, reason: `the connected-apps service answered HTTP ${response.status}` };
+  }
+  const body = await response.json().catch(() => null);
+  if (body?.service !== MANAGED_COMPOSIO_SERVICE) {
+    return { ok: false, reason: "that address is not a BotFleet connected-apps service" };
+  }
+  if (body.ready !== true) {
+    return { ok: false, reason: "the connected-apps service is not ready yet" };
+  }
+  return { ok: true, reason: "" };
+}
+
 export async function ensureManagedComposioCredentials({
   brokerUrl,
   credentials,
   fetchImpl = globalThis.fetch,
   saveCredentials,
   log = () => {},
+  // Receives { status: "ready" | "failed", message } so the desktop can show
+  // a visible Connected Apps notice instead of burying the outcome in a log.
+  report = () => {},
   timeoutSignal = (milliseconds) => AbortSignal.timeout(milliseconds),
+  preflightTimeoutMs = DEFAULT_PREFLIGHT_TIMEOUT_MS,
   existingCredentialTimeoutMs = 8_000,
   registrationTimeoutMs = 15_000,
 }) {
   const url = normalizeManagedComposioBrokerUrl(brokerUrl);
   if (!url) {
-    if (brokerUrl) log("connected-apps broker URL rejected: HTTPS or a loopback HTTP URL is required");
+    if (brokerUrl) {
+      log("connected-apps broker URL rejected: HTTPS or a loopback HTTP URL is required");
+      report({
+        status: "failed",
+        message: "The connected-apps service address must be HTTPS or a loopback HTTP URL.",
+      });
+    }
+    return credentials;
+  }
+  const preflight = await preflightManagedComposioBroker({
+    brokerUrl: url,
+    fetchImpl,
+    timeoutSignal,
+    timeoutMs: preflightTimeoutMs,
+  });
+  if (!preflight.ok) {
+    // A failed preflight keeps any existing identity: a broker outage must
+    // not strand already-authorized accounts under a new installation.
+    log(`connected-apps registration skipped: ${preflight.reason}`);
+    report({ status: "failed", message: `Connected apps could not be set up: ${preflight.reason}.` });
     return credentials;
   }
   if (TOKEN.test(credentials.composioBrokerToken ?? "")) {
@@ -55,14 +124,21 @@ export async function ensureManagedComposioCredentials({
         redirect: "error",
         signal: timeoutSignal(existingCredentialTimeoutMs),
       });
-      if (check.ok) return credentials;
+      if (check.ok) {
+        report({ status: "ready" });
+        return credentials;
+      }
       // Only a definitive auth failure rotates the credential. A transient
       // outage keeps the existing identity so reconnecting cannot strand the
       // user's already-authorized accounts under a new installation.
-      if (check.status !== 401) return credentials;
+      if (check.status !== 401) {
+        report({ status: "failed", message: `Connected apps could not be verified: the service answered HTTP ${check.status}.` });
+        return credentials;
+      }
       delete credentials.composioBrokerToken;
       delete credentials.composioInstallationId;
     } catch {
+      report({ status: "failed", message: "Connected apps could not be verified: the service could not be reached." });
       return credentials;
     }
   }
@@ -83,10 +159,13 @@ export async function ensureManagedComposioCredentials({
     credentials.composioInstallationId = body.installationId;
     await saveCredentials(credentials);
     log("connected-apps installation registered");
+    report({ status: "ready" });
   } catch (error) {
     // This operation always settles locally. The caller runs it after first
     // paint, so an optional hosted integration cannot delay desktop readiness.
-    log(`connected-apps registration failed: ${error?.message ?? error}`);
+    const detail = error?.message ?? String(error);
+    log(`connected-apps registration failed: ${detail}`);
+    report({ status: "failed", message: `Connected apps could not be set up: ${detail}.` });
   }
   return credentials;
 }

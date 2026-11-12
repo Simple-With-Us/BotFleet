@@ -50,7 +50,7 @@ describe("peer approval card lifecycle", () => {
     const card = pendingCard(store, from);
     expect(card).toBeTruthy();
 
-    expect(resolvePeerComms(bus, card!.card!.requestId!, "allow")).toBe(true);
+    expect(resolvePeerComms(bus, card!.card!.requestId!, "allow", from.threadId)).toBe(true);
     expect(await verdict).toBe("allow");
 
     // the card the client renders must now be answered — this is the bit
@@ -64,13 +64,27 @@ describe("peer approval card lifecycle", () => {
   it("settles the card on deny too", async () => {
     const verdict = requestPeerApproval(bus, from, target, "ping", "delegate_bot");
     const card = pendingCard(store, from)!;
-    resolvePeerComms(bus, card.card!.requestId!, "deny");
+    resolvePeerComms(bus, card.card!.requestId!, "deny", from.threadId);
     expect(await verdict).toBe("deny");
     expect(store.messagesFor(from.threadId).find((m) => m.id === card.id)?.card?.answered).toBe("deny");
   });
 
   it("answers an unknown requestId as not-ours, so provider cards still route", () => {
-    expect(resolvePeerComms(bus, "not-a-peer-request", "allow")).toBe(false);
+    expect(resolvePeerComms(bus, "not-a-peer-request", "allow", from.threadId)).toBe(false);
+  });
+
+  it("refuses to settle a peer card from a thread that does not own it", async () => {
+    const verdict = requestPeerApproval(bus, from, target, "ping", "ask_bot");
+    const card = pendingCard(store, from)!;
+
+    // Every other answer path checks the thread; this one did not, so a
+    // request id learned anywhere could settle a card owned elsewhere.
+    expect(resolvePeerComms(bus, card.card!.requestId!, "allow", "some-other-thread")).toBe(false);
+    expect(store.messagesFor(from.threadId).find((m) => m.id === card.id)?.card?.answered).toBeFalsy();
+
+    // Still pending, and the owning thread can still answer it.
+    expect(resolvePeerComms(bus, card.card!.requestId!, "deny", from.threadId)).toBe(true);
+    expect(await verdict).toBe("deny");
   });
 
   it("keys persistent grants by target identity, not mutable or duplicate names", async () => {
