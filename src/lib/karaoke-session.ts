@@ -16,7 +16,8 @@
 // - Personal Voice: each reported word is cued as it starts.  Words the voice
 //   skipped (a code block, a URL) are swept through quickly by the cue.
 // - Nothing pulses on at the start: unspoken words keep their normal ink
-//   (dimAhead off), and only the word being spoken rolls in.
+//   (dimAhead off). The spoken word is the boldest, with a short lead ahead
+//   of it and a short trail behind.
 
 import {
   alignSpokenToDisplay,

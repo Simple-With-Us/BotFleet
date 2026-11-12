@@ -115,8 +115,10 @@ set -euo pipefail
 
 # LaunchAgents inherit a tiny PATH (no Homebrew). Node is required for
 # ensure-tf-ready and for the App Store Connect queries. Keep this before any
-# `node` / `xcodegen` call.
-export PATH="/opt/homebrew/bin:/usr/local/bin:${PATH}"
+# `node` / `xcodegen` call. Apple system paths must lead Homebrew so
+# xcodebuild -exportArchive uses openrsync against Apple's rsync, not Homebrew
+# 3.5.x (Usage-Monitor #1691, exportArchive Copy failed).
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin:${PATH}"
 # The node that runs asc-api.mjs.  IOS_FLEET_NODE lets an offline test
 # answer App Store Connect from a stub;  a real ship leaves it unset and
 # uses node from PATH.
