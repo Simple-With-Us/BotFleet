@@ -147,6 +147,44 @@ final class BotExecutionPolicyTests: XCTestCase {
         }
     }
 
+    func testLocalBypassOnThisMacIsReadOnlyUnlessItIsAlreadyOn() {
+        // Off, and the bot can use This Mac: a switch would come back 403.
+        // The row is read-only even when Bypass itself is already on, and the
+        // note is the computer's own sentence.
+        XCTAssertEqual(
+            BotExecutionPolicy.localBypassControl(computers: ["local"], bypassOn: true, localBypassOn: false),
+            .macOnly
+        )
+        XCTAssertEqual(
+            BotExecutionPolicy.localBypassControl(computers: ["cloud", "local"], bypassOn: false, localBypassOn: false),
+            .macOnly
+        )
+        XCTAssertTrue(BotExecutionPolicy.localBypassMacOnlyNote.hasPrefix(
+            "Bypass Including This Mac can only be turned on in BotFleet on your computer for a bot that can use This Mac."
+        ))
+        XCTAssertTrue(BotExecutionPolicy.localBypassMacOnlyNote.contains("Turning it off works from here."))
+
+        // Already on: the phone can turn it off, which the computer accepts.
+        XCTAssertEqual(
+            BotExecutionPolicy.localBypassControl(computers: ["vm", "local"], bypassOn: true, localBypassOn: true),
+            .toggle
+        )
+        XCTAssertEqual(
+            BotExecutionPolicy.localBypassControl(computers: ["local"], bypassOn: false, localBypassOn: true),
+            .toggle
+        )
+
+        // No This Mac: a real switch once Bypass is on, and a note until then.
+        XCTAssertEqual(
+            BotExecutionPolicy.localBypassControl(computers: ["vm"], bypassOn: true, localBypassOn: false),
+            .toggle
+        )
+        XCTAssertEqual(
+            BotExecutionPolicy.localBypassControl(computers: nil, bypassOn: false, localBypassOn: false),
+            .needsBypass
+        )
+    }
+
     func testLocalBypassCopyNeverClaimsItIsASettingOnItsOwn() {
         XCTAssertTrue(BotExecutionPolicy.localBypassNeedsBypass.contains("Bypass Permissions first"))
         let off = BotExecutionPolicy.localBypassSummary(isOn: false)
@@ -169,6 +207,7 @@ final class BotExecutionPolicyTests: XCTestCase {
     private func texts() -> [String] {
         [
             BotExecutionPolicy.thisMacNote,
+            BotExecutionPolicy.localBypassMacOnlyNote,
             BotExecutionPolicy.bypassWarning(botName: "Scout", model: "claude-sonnet-4"),
             BotExecutionPolicy.bypassWarning(botName: "Scout", model: "claude-haiku-4"),
             BotExecutionPolicy.bypassWarning(botName: "Scout", model: nil),

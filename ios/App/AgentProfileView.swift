@@ -831,9 +831,12 @@ struct AgentProfileView: View {
     private var bypassPermissionsSection: some View {
         Section {
             Toggle("Bypass Permissions", isOn: bypassBinding)
-            if mayTurnOnLocalBypass {
+            switch localBypassControl {
+            case .toggle:
                 Toggle("Bypass Including This Mac", isOn: localBypassBinding)
-            } else {
+            case .macOnly:
+                LabeledContent("Bypass Including This Mac", value: "Off")
+            case .needsBypass:
                 Label(BotExecutionPolicy.localBypassNeedsBypass, systemImage: "lock")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
@@ -843,8 +846,11 @@ struct AgentProfileView: View {
         } footer: {
             VStack(alignment: .leading, spacing: 8) {
                 Text(BotExecutionPolicy.bypassSummary(isOn: bypassPermissions))
-                if mayTurnOnLocalBypass {
+                if localBypassControl == .toggle {
                     Text(BotExecutionPolicy.localBypassSummary(isOn: bypassLocalComputer))
+                }
+                if !BotExecutionPolicy.mayTurnOnLocalBypass(computers: current.computers) {
+                    Text(BotExecutionPolicy.localBypassMacOnlyNote)
                 }
                 if let note = BypassCoverage(engine: policyEngine).note {
                     Text(note)
@@ -853,21 +859,25 @@ struct AgentProfileView: View {
         }
     }
 
-    /// The second switch is the Mac's to turn on for a bot that holds This
-    /// Mac, so the phone offers a line that says so rather than a control that
-    /// would come back 403.
-    private var mayTurnOnLocalBypass: Bool {
-        BotExecutionPolicy.mayTurnOnLocalBypass(computers: current.computers)
+    /// Whether the second switch is a control, a read-only Off, or a note
+    /// that Bypass itself is off.  The computer refuses to turn it on for a
+    /// bot that can use This Mac, so that case is never a switch.
+    private var localBypassControl: BotExecutionPolicy.LocalBypassControl {
+        BotExecutionPolicy.localBypassControl(
+            computers: current.computers,
+            bypassOn: bypassPermissions,
+            localBypassOn: bypassLocalComputer
+        )
     }
 
-    /// Switching on asks first, and does nothing at all while Bypass itself is
-    /// off — otherwise it would be a switch over nothing.
+    /// Switching on asks first.  Turning it off does not, and does not require
+    /// Bypass to still be on: an on switch has to be able to come back off.
     private var localBypassBinding: Binding<Bool> {
         Binding(
             get: { bypassLocalComputer },
             set: { wantsOn in
-                guard bypassPermissions else { return }
                 if wantsOn {
+                    guard bypassPermissions, BotExecutionPolicy.mayTurnOnLocalBypass(computers: current.computers) else { return }
                     confirmingLocalBypass = true
                 } else {
                     bypassLocalComputer = false
