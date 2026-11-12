@@ -5,7 +5,7 @@
 // own transcript and its own provider session — so sensitive work, a
 // long job and a quick question can sit side by side under one bot.
 import { useEffect, useRef, useState } from "react";
-import { Check, ChevronDown, Pencil, Plus, Trash2 } from "lucide-react";
+import { Check, ChevronDown, Eye, Pencil, Plus, Trash2 } from "lucide-react";
 import { useStore, formatTime, getConversationMode, type Bot, type Group, type Task } from "@/state/store";
 import { allowsMultipleBotThreads } from "../../shared/conversation-mode";
 import { cn } from "@/lib/cn";
@@ -33,6 +33,23 @@ export function taskPickerPointerIntent(
   return "ignore";
 }
 
+/** What picking a thread row or tab means.  Browsing is passive: while
+ * the bot works, picking another thread only *views* it — becoming the
+ * execution target (`switch`) stays gated on the turn finishing, and
+ * picking the active thread while a view is in effect returns to it
+ * (`viewActive`).  Without a view affordance (`canView` false, e.g.
+ * channels) busy picking stays `none`, exactly as before. */
+export function threadPickIntent(input: {
+  busy: boolean;
+  active: boolean;
+  viewing: boolean;
+  canView: boolean;
+}): "switch" | "view" | "viewActive" | "none" {
+  if (input.active) return input.canView && input.viewing ? "viewActive" : "none";
+  if (input.busy) return input.canView ? "view" : "none";
+  return "switch";
+}
+
 /** Quiet per-task token tally — input+output combined, because one honest
  * total reads faster than a split; the split lives in the hover title. */
 function TaskUsage({ usage }: { usage: Task["usage"] }) {
@@ -57,6 +74,8 @@ function ConversationTaskPicker({
   onSwitch,
   onRename,
   onDelete,
+  viewedThreadId,
+  onView,
 }: {
   threadId: string;
   tasks: PickerTask[];
@@ -65,6 +84,10 @@ function ConversationTaskPicker({
   onSwitch: (threadId: string) => void;
   onRename: (threadId: string, title: string) => void;
   onDelete: (threadId: string) => void;
+  /** The thread open for reading when it is not the active one. */
+  viewedThreadId?: string | null;
+  /** Open a thread for reading only; null returns to the active one. */
+  onView?: (threadId: string | null) => void;
 }) {
   const [open, setOpen] = useState(false);
   const [renaming, setRenaming] = useState<string | null>(null);
@@ -214,12 +237,18 @@ function ConversationTaskPicker({
           <div className="max-h-[320px] overflow-y-auto">
             {tasks.map((task) => {
               const active = task.threadId === threadId;
+              const viewed = Boolean(viewedThreadId && task.threadId === viewedThreadId && !active);
               return (
                 <div
                   key={task.threadId}
+                  data-viewed-thread={viewed ? "true" : undefined}
                   className={cn("group flex items-center gap-2 px-2.5 py-2", active ? "bg-raised/60" : "hover:bg-raised/40")}
                 >
-                  <Check size={13} className={cn("shrink-0", active ? "text-accent" : "opacity-0")} />
+                  {viewed ? (
+                    <Eye size={13} className="shrink-0 text-ink-secondary" />
+                  ) : (
+                    <Check size={13} className={cn("shrink-0", active ? "text-accent" : "opacity-0")} />
+                  )}
                   {renaming === task.threadId ? (
                     <input
                       autoFocus
@@ -250,7 +279,18 @@ function ConversationTaskPicker({
                       type="button"
                       onClick={(e) => {
                         if (taskPickerPointerIntent("click", e.detail) !== "select") return;
-                        if (!active) onSwitch(task.threadId);
+                        const intent = threadPickIntent({
+                          busy,
+                          active,
+                          viewing: Boolean(viewedThreadId && viewedThreadId !== threadId),
+                          canView: Boolean(onView),
+                        });
+                        if (intent === "switch") onSwitch(task.threadId);
+                        else if (intent === "view") onView?.(task.threadId);
+                        else if (intent === "viewActive") onView?.(null);
+                        // intent "none" stays a no-op: without a view
+                        // affordance a busy row must not switch, exactly
+                        // like the tabs, which have no such fallback.
                         queueDismiss();
                       }}
                       onDoubleClick={(e) => {
@@ -270,6 +310,7 @@ function ConversationTaskPicker({
                       <div className="text-[11px] text-ink-secondary">
                         {formatTime(task.createdAt)}
                         <TaskUsage usage={task.usage} />
+                        {viewed ? " · Viewing" : null}
                       </div>
                     </button>
                   )}
@@ -329,6 +370,12 @@ export function TaskPicker({ bot }: { bot: Bot }) {
       onSwitch={(threadId) => dispatch({ type: "switchTask", botId: bot.id, threadId })}
       onRename={(threadId, title) => dispatch({ type: "renameTask", botId: bot.id, threadId, title })}
       onDelete={(threadId) => dispatch({ type: "deleteTask", botId: bot.id, threadId })}
+      viewedThreadId={
+        state.viewedThreadId && (bot.tasks ?? []).some((task) => task.threadId === state.viewedThreadId)
+          ? state.viewedThreadId
+          : null
+      }
+      onView={(threadId) => dispatch({ type: "viewThread", botId: bot.id, threadId })}
     />
   );
 }

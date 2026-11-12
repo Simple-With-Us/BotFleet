@@ -253,6 +253,23 @@ final class ChatAttachmentClientTests: XCTestCase {
         XCTAssertEqual(json["token"] as? String, hex)
     }
 
+    func testAnImageAttachmentKeepsItsBytesForAComposerPreview() {
+        let png = Data([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+        let image = PendingChatAttachment(name: "photo.png", mime: "image/png", data: png)
+        XCTAssertEqual(image.kind, .image)
+        XCTAssertEqual(image.previewImageData, png)
+
+        let file = PendingChatAttachment(name: "notes.txt", mime: "text/plain", data: Data("hi".utf8))
+        XCTAssertNil(file.previewImageData)
+
+        let svg = PendingChatAttachment(name: "mark.svg", mime: "image/svg+xml", data: Data("<svg></svg>".utf8))
+        XCTAssertEqual(svg.kind, .image)
+        XCTAssertNil(svg.previewImageData, "a format the phone cannot draw stays an icon")
+
+        let empty = PendingChatAttachment(name: "blank.jpg", mime: "image/jpeg", data: Data())
+        XCTAssertNil(empty.previewImageData)
+    }
+
     func testUploadChatAttachmentRejectsOversizedImages() async {
         let data = Data(repeating: 1, count: ChatAttachments.imageMaxBytes + 1)
         do {

@@ -39,7 +39,9 @@ const stubDom = () => {
     };
     Object.defineProperty(node, "innerHTML", {
       get: () => written.get(id) ?? "",
-      set: (value: string | null) => written.set(id, value),
+      set: (value: string | null) => {
+        written.set(id, value);
+      },
     });
     nodes.set(id, node);
     return node;

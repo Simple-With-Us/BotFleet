@@ -9,7 +9,7 @@ import {
 describe("Settings Search Engine", () => {
   it("returns all items when query is empty", () => {
     const result = searchSettings("");
-    expect(result.matchingSectionIds.size).toBe(10);
+    expect(result.matchingSectionIds.size).toBe(11);
     expect(result.matchingItemIds.size).toBe(SETTINGS_SEARCH_ITEMS.length);
     expect(result.matchingItems.length).toBe(SETTINGS_SEARCH_ITEMS.length);
     expect(result.totalMatches).toBe(SETTINGS_SEARCH_ITEMS.length);
@@ -167,6 +167,13 @@ describe("Settings Search Engine", () => {
     const result = searchSettings("vault");
     expect(result.matchingSectionIds.has("secrets")).toBe(true);
     expect(result.matchingItemIds.has("secrets:infisical")).toBe(true);
+  });
+
+  it("finds Resources admission thresholds by admission", () => {
+    const result = searchSettings("admission");
+    expect(result.matchingSectionIds.has("resources")).toBe(true);
+    expect(result.matchingItemIds.has("resources:thresholds")).toBe(true);
+    expect(sectionBodyHasVisibleItem("resources", result.matchingItemIds)).toBe(true);
   });
 
   it("reports 0 matches for non-existent nonsense query", () => {

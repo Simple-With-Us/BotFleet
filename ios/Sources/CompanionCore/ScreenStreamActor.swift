@@ -54,6 +54,7 @@ public actor ScreenStreamActor: NSObject, SCStreamOutput, SCStreamDelegate {
 
     private var activeStream: SCStream?
     private var frameHandler: (@Sendable (CVPixelBuffer) -> Void)?
+    public var onStreamStoppedWithError: (@Sendable (Error) -> Void)?
     private let streamQueue = DispatchQueue(label: "app.botfleet.screen-stream", qos: .userInteractive)
 
     public private(set) var isStreaming: Bool = false
@@ -64,6 +65,12 @@ public actor ScreenStreamActor: NSObject, SCStreamOutput, SCStreamDelegate {
 
     public override init() {
         super.init()
+    }
+
+    /// Registers or clears the callback invoked when `SCStream` stops due to a runtime error
+    /// (such as macOS revoking Screen Recording permission mid-stream).
+    public func setOnStreamStoppedWithError(_ handler: (@Sendable (Error) -> Void)?) {
+        self.onStreamStoppedWithError = handler
     }
 
     // MARK: - Content Discovery
@@ -120,6 +127,7 @@ public actor ScreenStreamActor: NSObject, SCStreamOutput, SCStreamDelegate {
         targetWidth: Int? = nil,
         targetHeight: Int? = nil,
         frameRate: Int = 30,
+        onStreamStoppedWithError: (@Sendable (Error) -> Void)? = nil,
         onFrame: @Sendable @escaping (CVPixelBuffer) -> Void
     ) async throws {
         // Claim the re-entrancy guard before any suspension point, including
@@ -134,6 +142,10 @@ public actor ScreenStreamActor: NSObject, SCStreamOutput, SCStreamDelegate {
 
         if isStreaming {
             await stopStreaming()
+        }
+
+        if let onStreamStoppedWithError {
+            self.onStreamStoppedWithError = onStreamStoppedWithError
         }
 
         let content = try await availableContent()
@@ -172,7 +184,11 @@ public actor ScreenStreamActor: NSObject, SCStreamOutput, SCStreamDelegate {
 
     /// Stops the active ScreenCaptureKit stream and releases hardware buffers.
     public func stopStreaming() async {
-        guard let stream = activeStream else { return }
+        guard let stream = activeStream else {
+            self.frameHandler = nil
+            self.isStreaming = false
+            return
+        }
         try? await stream.stopCapture()
         self.activeStream = nil
         self.frameHandler = nil
@@ -196,8 +212,16 @@ public actor ScreenStreamActor: NSObject, SCStreamOutput, SCStreamDelegate {
 
     public nonisolated func stream(_ stream: SCStream, didStopWithError error: Error) {
         Task {
-            await self.stopStreaming()
+            await self.handleStreamStoppedWithError(error)
         }
+    }
+
+    /// Processes a runtime stream stop error (including TCC Screen Recording revocation mid-stream),
+    /// tearing down the capture session and notifying any registered error observer immediately.
+    public func handleStreamStoppedWithError(_ error: Error) async {
+        let errorHandler = self.onStreamStoppedWithError
+        await self.stopStreaming()
+        errorHandler?(error)
     }
 
     private func dispatchFrame(_ pixelBuffer: CVPixelBuffer) {

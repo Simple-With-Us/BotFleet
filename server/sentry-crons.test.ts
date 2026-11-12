@@ -11,9 +11,14 @@ import {
   awaitPendingCheckInCloses,
   checkInRoutineFinish,
   checkInRoutineStart,
+  isRoutineMonitorSlug,
+  legacyRoutineMonitorSlug,
+  releaseRoutineMonitor,
   resetSentryCronsForTests,
+  RETIRED_MONITOR_CRONTAB,
   routineMonitorConfig,
   routineMonitorSlug,
+  stableRoutineMonitorSlug,
 } from "./sentry-crons.ts";
 import type { Routine, RoutineRun } from "./routines.ts";
 
@@ -86,6 +91,68 @@ describe("routineMonitorSlug", () => {
   it("falls back to a safe slug for a blank or unicode-only name", () => {
     expect(routineMonitorSlug(run({ routineName: "" }))).toMatch(/^botfleet-routine-/);
   });
+
+  it("keeps a stored slug so a rename cannot open a second monitor", () => {
+    const stored = "botfleet-mac-coolify-health-21-00-79c6c49d";
+    const slug = routineMonitorSlug(run({
+      routineId: "79c6c49d-1111-2222-3333-444444444444",
+      routineName: "Mac Hetzner Health 21:00",
+      sentryMonitorSlug: stored,
+    }));
+    expect(slug).toBe(stored);
+    expect(slug).not.toBe(legacyRoutineMonitorSlug(run({
+      routineId: "79c6c49d-1111-2222-3333-444444444444",
+      routineName: "Mac Hetzner Health 21:00",
+    })));
+  });
+
+  it("keys a new routine on its id and keeps that id when the name is long", () => {
+    const id = "ABCDEF12-3456-7890-ABCD-EF1234567890";
+    const slug = stableRoutineMonitorSlug(id);
+    expect(slug).toBe("botfleet-abcdef1234567890abcdef1234567890");
+    expect(slug.length).toBeLessThanOrEqual(50);
+    expect(stableRoutineMonitorSlug(id)).toBe(stableRoutineMonitorSlug(id));
+    const renamed = routineMonitorSlug(run({
+      routineId: id,
+      routineName: "Weekly practices token efficiency proposal extra words",
+      sentryMonitorSlug: slug,
+    }));
+    expect(renamed).toBe(slug);
+  });
+
+  it("documents that the legacy formula drops the id when the name is long", () => {
+    const slug = legacyRoutineMonitorSlug(run({
+      routineId: "12345678-aaaa-bbbb-cccc-ddddeeeeffff",
+      routineName: "Weekly practices token efficiency proposal",
+    }));
+    expect(slug.length).toBeLessThanOrEqual(50);
+    expect(slug.endsWith("12345678")).toBe(false);
+  });
+
+  it("accepts a legacy slug the 50-character slice ended on a hyphen", () => {
+    const slug = legacyRoutineMonitorSlug(run({
+      routineId: "12345678-aaaa-bbbb-cccc-ddddeeeeffff",
+      routineName: `${"a".repeat(40)} b`,
+    }));
+    expect(slug).toHaveLength(50);
+    expect(slug.endsWith("-")).toBe(true);
+    expect(isRoutineMonitorSlug(slug)).toBe(true);
+    expect(routineMonitorSlug(run({
+      routineId: "12345678-aaaa-bbbb-cccc-ddddeeeeffff",
+      routineName: "Renamed",
+      sentryMonitorSlug: slug,
+    }))).toBe(slug);
+  });
+
+  it("rejects a trailing-hyphen slug shorter than the legacy 50-character slice", () => {
+    expect(isRoutineMonitorSlug("botfleet-mac-coolify-")).toBe(false);
+    const theRun = run({
+      routineId: "79c6c49d-1111-2222-3333-444444444444",
+      routineName: "Mac Coolify Health",
+      sentryMonitorSlug: "botfleet-mac-coolify-",
+    });
+    expect(routineMonitorSlug(theRun)).toBe(legacyRoutineMonitorSlug(theRun));
+  });
 });
 
 describe("routineMonitorConfig", () => {
@@ -152,6 +219,11 @@ describe("checkInRoutineStart / checkInRoutineFinish", () => {
     return checkIns;
   }
 
+  it("does not retire a slug while Sentry is inactive", () => {
+    expect(isSentryActive()).toBe(false);
+    expect(releaseRoutineMonitor("botfleet-mac-hetzner-health-21-00-79c6c49d")).toBe(false);
+  });
+
   it("upserts a monitor and opens an in_progress check-in for a recurring routine", async () => {
     const checkIns = await activateFakeSentry();
     const theRun = run();
@@ -163,6 +235,51 @@ describe("checkInRoutineStart / checkInRoutineFinish", () => {
       status: "in_progress",
     });
     expect(checkIns[0].monitorConfig).toMatchObject({ schedule: { type: "crontab" } });
+  });
+
+  it("checks a stored slug in and retires an abandoned slug onto a yearly crontab", async () => {
+    const checkIns = await activateFakeSentry();
+    const stored = "botfleet-spend-downs-slack-digest-1f8addcb";
+    const theRun = run({ sentryMonitorSlug: stored, routineName: "Spend Downs and Incidents Digest" });
+    checkInRoutineStart(theRun, routine());
+    expect(checkIns[0].checkIn).toMatchObject({ monitorSlug: stored, status: "in_progress" });
+    expect(releaseRoutineMonitor("botfleet-mac-hetzner-health-21-00-79c6c49d")).toBe(true);
+    expect(releaseRoutineMonitor("botfleet-mac-hetzner-health-21-00-79c6c49d")).toBe(false);
+    expect(checkIns[1].checkIn).toMatchObject({
+      monitorSlug: "botfleet-mac-hetzner-health-21-00-79c6c49d",
+      status: "ok",
+    });
+    expect(checkIns[1].monitorConfig).toMatchObject({
+      schedule: { type: "crontab", value: RETIRED_MONITOR_CRONTAB },
+      timezone: "UTC",
+    });
+    expect(releaseRoutineMonitor("not a slug")).toBe(false);
+  });
+
+  it("keeps an obsolete run slug retired when a start opens on it", async () => {
+    await activateFakeSentry();
+    const obsolete = "botfleet-mac-hetzner-health-21-00-79c6c49d";
+    expect(releaseRoutineMonitor(obsolete)).toBe(true);
+    checkInRoutineStart(
+      run({ sentryMonitorSlug: obsolete }),
+      routine({ sentryMonitorSlug: "botfleet-mac-coolify-health-21-00-79c6c49d" }),
+    );
+    // Only the routine's frozen slug has its retirement cleared.
+    expect(releaseRoutineMonitor(obsolete)).toBe(false);
+  });
+
+  it("retires a slug again after a resumed routine checks in on it", async () => {
+    const checkIns = await activateFakeSentry();
+    const stored = "botfleet-spend-downs-slack-digest-1f8addcb";
+    expect(releaseRoutineMonitor(stored)).toBe(true);
+    expect(releaseRoutineMonitor(stored)).toBe(false);
+    checkInRoutineStart(run({ sentryMonitorSlug: stored }), routine({ sentryMonitorSlug: stored }));
+    expect(checkIns[1].checkIn).toMatchObject({ monitorSlug: stored, status: "in_progress" });
+    expect(releaseRoutineMonitor(stored)).toBe(true);
+    expect(checkIns[2].checkIn).toMatchObject({ monitorSlug: stored, status: "ok" });
+    expect(checkIns[2].monitorConfig).toMatchObject({
+      schedule: { type: "crontab", value: RETIRED_MONITOR_CRONTAB },
+    });
   });
 
   it("opens nothing for a one-off routine even with Sentry active", async () => {
@@ -184,6 +301,18 @@ describe("checkInRoutineStart / checkInRoutineFinish", () => {
       checkInId: "check-in-id-1",
     });
     expect(checkIns[1].checkIn).toMatchObject({ status: "error", checkInId: "check-in-id-1" });
+  });
+
+  it("calculates duration in seconds when startedAt and finishedAt are present", async () => {
+    const checkIns = await activateFakeSentry();
+    const theRun = run({ startedAt: 10_000, finishedAt: 45_000 });
+    checkInRoutineFinish(theRun, "check-in-id-1", true);
+    expect(checkIns).toHaveLength(1);
+    expect(checkIns[0].checkIn).toMatchObject({
+      status: "ok",
+      checkInId: "check-in-id-1",
+      duration: 35,
+    });
   });
 
   it("returns undefined when captureCheckIn would fabricate an id on a disabled client", async () => {
@@ -345,11 +474,151 @@ describe("checkInRoutineFinish close delivery", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
       expect(isSentryActive()).toBe(false);
-      checkInRoutineFinish(run(), "check-in-id-1", true);
+      let settledDelivered: boolean | undefined;
+      checkInRoutineFinish(run(), "check-in-id-1", true, (delivered) => {
+        settledDelivered = delivered;
+      });
       await awaitPendingCheckInCloses();
       expect(warn).not.toHaveBeenCalled();
+      expect(settledDelivered).toBe(false);
     } finally {
       warn.mockRestore();
     }
+  });
+
+  it("confirms delivery and notifies onSettled when afterEnvelope verifies acceptance", async () => {
+    vi.useFakeTimers();
+    type MockEnvelope = [Record<string, string>, Array<[Record<string, string>, Record<string, string>]>];
+    const checkIns: SentryCheckIn[] = [];
+    const listeners: Array<(envelope: MockEnvelope) => void> = [];
+
+    const client = {
+      getDsn: () => ({}),
+      getOptions: () => ({ enabled: true }),
+      getTransport: () => ({}),
+      on(event: string, cb: (envelope: MockEnvelope) => void) {
+        if (event === "afterEnvelope") listeners.push(cb);
+        return () => {
+          const idx = listeners.indexOf(cb);
+          if (idx !== -1) listeners.splice(idx, 1);
+        };
+      },
+    };
+
+    // SAFETY: empty object shell — runtime only calls the members stamped below.
+    const sdk = Object.assign({} as FakeSentrySdk, {
+      init() {},
+      close() { return Promise.resolve(true); },
+      addIntegration() {},
+      consoleLoggingIntegration() { return { name: "ConsoleLogs" }; },
+      getClient() { return client; },
+      captureCheckIn(checkIn: SentryCheckIn) {
+        checkIns.push(checkIn);
+        if ("checkInId" in checkIn) {
+          queueMicrotask(() => {
+            for (const listener of listeners) {
+              listener([{}, [[{ type: "check_in" }, { check_in_id: checkIn.checkInId }]]]);
+            }
+          });
+        }
+        return "check-in-id-1";
+      },
+      async flush() {
+        await Promise.resolve();
+        return true;
+      },
+    });
+
+    setSentryLoaderForTests(sentryTestLoader(sdk));
+    await applySentryConfig({
+      dsn: "https://abc123@o0.ingest.sentry.io/1",
+      enabled: true,
+      environment: "test",
+      tracesSampleRate: 1,
+      logsEnabled: false,
+      source: "config",
+    });
+
+    let settledDelivered: boolean | undefined;
+    checkInRoutineFinish(run(), "check-in-id-1", true, (delivered) => {
+      settledDelivered = delivered;
+    });
+
+    const settled = awaitPendingCheckInCloses();
+    await vi.advanceTimersByTimeAsync(RETRY_BUDGET_MS);
+    await settled;
+
+    expect(checkIns).toHaveLength(1);
+    expect(settledDelivered).toBe(true);
+  });
+
+  it("retries when flush succeeds but afterEnvelope never fires (transport drop)", async () => {
+    vi.useFakeTimers();
+    type MockEnvelope = [Record<string, string>, Array<[Record<string, string>, Record<string, string>]>];
+    const checkIns: SentryCheckIn[] = [];
+    const listeners: Array<(envelope: MockEnvelope) => void> = [];
+    let callCount = 0;
+
+    const client = {
+      getDsn: () => ({}),
+      getOptions: () => ({ enabled: true }),
+      getTransport: () => ({}),
+      on(event: string, cb: (envelope: MockEnvelope) => void) {
+        if (event === "afterEnvelope") listeners.push(cb);
+        return () => {
+          const idx = listeners.indexOf(cb);
+          if (idx !== -1) listeners.splice(idx, 1);
+        };
+      },
+    };
+
+    // SAFETY: empty object shell — runtime only calls the members stamped below.
+    const sdk = Object.assign({} as FakeSentrySdk, {
+      init() {},
+      close() { return Promise.resolve(true); },
+      addIntegration() {},
+      consoleLoggingIntegration() { return { name: "ConsoleLogs" }; },
+      getClient() { return client; },
+      captureCheckIn(checkIn: SentryCheckIn) {
+        checkIns.push(checkIn);
+        callCount++;
+        // Attempt 1 fails to emit afterEnvelope (transport dropped it);
+        // Attempt 2 succeeds and emits afterEnvelope.
+        if (callCount === 2 && "checkInId" in checkIn) {
+          queueMicrotask(() => {
+            for (const listener of listeners) {
+              listener([{}, [[{ type: "check_in" }, { check_in_id: checkIn.checkInId }]]]);
+            }
+          });
+        }
+        return "check-in-id-1";
+      },
+      async flush() {
+        await Promise.resolve();
+        return true;
+      },
+    });
+
+    setSentryLoaderForTests(sentryTestLoader(sdk));
+    await applySentryConfig({
+      dsn: "https://abc123@o0.ingest.sentry.io/1",
+      enabled: true,
+      environment: "test",
+      tracesSampleRate: 1,
+      logsEnabled: false,
+      source: "config",
+    });
+
+    let settledDelivered: boolean | undefined;
+    checkInRoutineFinish(run(), "check-in-id-1", true, (delivered) => {
+      settledDelivered = delivered;
+    });
+
+    const settled = awaitPendingCheckInCloses();
+    await vi.advanceTimersByTimeAsync(RETRY_BUDGET_MS);
+    await settled;
+
+    expect(checkIns).toHaveLength(2);
+    expect(settledDelivered).toBe(true);
   });
 });

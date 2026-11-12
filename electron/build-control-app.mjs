@@ -3,8 +3,9 @@ import { copyFileSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
+import { controlBuildVersion } from "./control-build-version.mjs";
 import { installServerControls } from "./server-controls.mjs";
-import { readSourceBuildIdentity } from "./runtime-identity.mjs";
+import { readSourceBuildIdentity } from "../scripts/source-build-identity.mjs";
 
 const project = fileURLToPath(new URL("../", import.meta.url));
 const bundle = path.join(project, "electron/resources/BotFleet Control.app");
@@ -68,8 +69,16 @@ async function buildControlApp() {
   copyFileSync(path.join(project, "build/icon.icns"), path.join(contents, "Resources", "icon.icns"));
   for (const name of ["LICENSE", "NOTICE"]) copyFileSync(path.join(project, name), path.join(contents, "Resources", name));
   await bundleOfflineVmHelper(path.join(contents, "Resources"));
-  const count = execFileSync("git", ["rev-list", "--count", "HEAD"], { cwd: project, encoding: "utf8" }).trim();
-  if (!/^\d+$/.test(count)) throw new Error("Missing commit-count version");
+  // Control carries the version the workflow pinned in BOTFLEET_BUILD_VERSION
+  // when there is one, which is the app's own, and otherwise the same stamp
+  // the app's release path uses: the commit count with the package.json
+  // floor, never the count of a shallow clone.
+  const { version, build: buildNumber, source } = controlBuildVersion({ repoRoot: project });
+  writeFileSync(path.join(contents, "Resources", "build-identity.json"), JSON.stringify(
+    readSourceBuildIdentity(project, { requireGit: true, version, build: buildNumber }),
+  ) + "\n");
+  writeFileSync(path.join(contents, "Resources", "control-update-protocol.json"), JSON.stringify({ protocolVersion: 1 }) + "\n");
+  console.log(`BotFleet Control version ${version} (${source})`);
   writeFileSync(path.join(contents, "Info.plist"), `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -78,8 +87,8 @@ async function buildControlApp() {
 <key>CFBundleDisplayName</key><string>BotFleet Control</string>
 <key>CFBundleExecutable</key><string>BotFleetControl</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>1.0.${count}</string>
-<key>CFBundleVersion</key><string>${count}</string>
+<key>CFBundleShortVersionString</key><string>${version}</string>
+<key>CFBundleVersion</key><string>${buildNumber}</string>
 <key>CFBundleIconFile</key><string>icon.icns</string>
 <key>LSMinimumSystemVersion</key><string>13.0</string>
 <key>LSUIElement</key><true/>
