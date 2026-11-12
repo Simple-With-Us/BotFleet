@@ -60,7 +60,6 @@ function isVolatileLine(line: string): boolean {
 
 const UNTRUSTED_OPEN = /^\[UNTRUSTED (?:WEBHOOK EVENT DATA|RESOURCE SAMPLE)\]/;
 const AUTHENTICATED_TASK_OPEN = /^\[AUTHENTICATED WEBHOOK TASK\]/;
-const WEBHOOK_INSTRUCTION_OPEN = /^\[(?:USER-CONFIGURED WEBHOOK INSTRUCTIONS|DEFAULT WEBHOOK INSTRUCTIONS|AUTHENTICATED WEBHOOK TASK)\]/;
 
 function untrustedOpen(line: string): boolean {
   return UNTRUSTED_OPEN.test(line.trim());
@@ -83,17 +82,36 @@ function payloadBoundaryOffset(text: string): number {
   return -1;
 }
 
-/** Start of the last webhook instruction or payload-task block, or -1. */
-function lastWebhookBlockStart(text: string): number {
-  const lines = text.split("\n");
-  let offset = 0;
-  let found = -1;
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i] ?? "";
-    if (WEBHOOK_INSTRUCTION_OPEN.test(line.trim())) found = offset;
-    offset += line.length + (i < lines.length - 1 ? 1 : 0);
+/** True when a slice looks like replayed mid-thread history, not a bare wake. */
+function hasReplayRolePrefix(segment: string): boolean {
+  return /(?:^|\n)(?:User|Assistant): /.test(segment);
+}
+
+/** Byte offset where the current wake starts, after the last trusted replay cue.
+ *  A cue after a payload boundary in the current wake is payload text, not a
+ *  harness join.  The first cue may follow history that already contains an
+ *  untrusted block;  those history lines are `User:` / `Assistant:` prefixed. */
+function lastTrustedReplayEnd(text: string): number {
+  let start = 0;
+  let search = 0;
+  let acceptedAny = false;
+  while (true) {
+    const at = text.indexOf(REPLAY_BOUNDARY, search);
+    if (at < 0) break;
+    const segment = text.slice(start, at);
+    if (payloadBoundaryOffset(segment) >= 0) {
+      if (acceptedAny || !hasReplayRolePrefix(segment)) break;
+    }
+    start = at + REPLAY_BOUNDARY.length;
+    search = start;
+    acceptedAny = true;
   }
-  return found;
+  return start;
+}
+
+/** True when the current wake (after any trusted mid-thread cue) has no payload. */
+export function unattendedCurrentWakeIsStandingText(text: string): boolean {
+  return payloadBoundaryOffset(text.slice(lastTrustedReplayEnd(text))) < 0;
 }
 
 /** Split one wake body into saved instructions and the per-wake tail.
@@ -143,13 +161,6 @@ function withBytes(section: WakePromptSection): WakePromptSection & { bytes: num
   return { ...section, bytes: Buffer.byteLength(section.text, "utf8"), volatile: section.volatile };
 }
 
-function replaySplit(wakeText: string) {
-  const at = wakeText.lastIndexOf(REPLAY_BOUNDARY);
-  if (at < 0) return { head: "", body: wakeText };
-  const cut = at + REPLAY_BOUNDARY.length;
-  return { head: wakeText.slice(0, cut), body: wakeText.slice(cut) };
-}
-
 /** Order one unattended wake: stable prefix, then the per-wake tail.
  *  `sections` stay in their relative order inside each half.  Tool schemas
  *  and saved instructions sit after the stable system sections and before
@@ -162,16 +173,11 @@ export function arrangeUnattendedWakePrompt(input: {
   inlineToolSchemas?: boolean;
 }): ArrangedWakePrompt {
   const inline = input.inlineToolSchemas !== false;
-  // Replay cues inside a webhook payload must not cut the body;  only cues
-  // before the current wake's payload/task block are real mid-thread joins.
-  const currentStart = lastWebhookBlockStart(input.wakeText);
-  const current = currentStart < 0 ? input.wakeText : input.wakeText.slice(currentStart);
-  const payloadAt = payloadBoundaryOffset(current);
-  const replayEnd =
-    currentStart >= 0 && payloadAt >= 0 ? currentStart + payloadAt : input.wakeText.length;
-  const { head, body } = replaySplit(input.wakeText.slice(0, replayEnd));
-  const remainder = input.wakeText.slice(replayEnd);
-  const split = splitUnattendedWakeText(`${body}${remainder}`);
+  // Only a harness mid-thread cue starts the current wake.  A cue after the
+  // first payload boundary of that wake is data and stays in the tail.
+  const replayEnd = lastTrustedReplayEnd(input.wakeText);
+  const head = input.wakeText.slice(0, replayEnd);
+  const split = splitUnattendedWakeText(input.wakeText.slice(replayEnd));
   const hoisted = split.stableContext.length > 0 && split.volatileTail.length > 0;
   const schemaBlock = inline ? canonicalToolSchemaBlock(input.toolSchemas ?? []) : "";
   const stable = input.sections.filter((section) => !section.volatile);

@@ -184,7 +184,7 @@ import {
 } from "./turn-worktree-admission.ts";
 import { RoomTurnDeadline, RoomTurnStallRegistry, roomTurnTimeoutMessage } from "./room-turn-timeout.ts";
 import { buildSystemPrompt, ownerNotesPrompt } from "./system-prompt.ts";
-import { arrangeUnattendedWakePrompt, logReportedCachedTokens } from "./wake-prompt.ts";
+import { arrangeUnattendedWakePrompt, logReportedCachedTokens, unattendedCurrentWakeIsStandingText } from "./wake-prompt.ts";
 import { telemetry, turnUsageDetail } from "./telemetry.ts";
 import { usageQuotaPoller } from "./usage-quota.ts";
 import { getDeepSeekBalance } from "./deepseek-balance.ts";
@@ -8220,13 +8220,17 @@ async function startTurn(
       // A job reminder names live jobs, so it is volatile.  On a wake whose
       // user text is still the saved routine, it follows that text.  A hoisted
       // wake's user text is already the per-wake tail, and the reminder stays
-      // in front of that tail.
+      // in front of that tail.  A payload-only webhook is not hoisted, and
+      // the reminder stays in front of that untrusted body too.
       const remindedWakeText = (body: string): string => {
         if (!jobReminder.text) return body;
-        // Saved routine text is stable, so a live job reminder follows it.
+        // Saved standing text is stable, so a live job reminder follows it.
         // Every other turn keeps the reminder in front, including a hoisted
-        // wake whose body is already the volatile tail.
-        if (cacheFriendlyWake && !wakeHoisted) return `${body}\n\n${jobReminder.text}`;
+        // wake whose body is already the volatile tail, and a webhook whose
+        // body is a payload-derived task or untrusted event block.
+        if (cacheFriendlyWake && !wakeHoisted && unattendedCurrentWakeIsStandingText(body)) {
+          return `${body}\n\n${jobReminder.text}`;
+        }
         return `${jobReminder.text}\n\n${body}`;
       };
       // The replayed-history cap and the model-written summary toggle.

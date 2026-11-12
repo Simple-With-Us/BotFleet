@@ -66,7 +66,9 @@ against `cachedInputTokens` to see whether the prefix is actually being cached.
 
 Webhook and schedule turns reorder that assembly before a driver sees it
 (`server/wake-prompt.ts`).  The standing system sections come first, then the
-tool schemas, then the saved instructions when the wake carries a per-wake tail
+tool schemas on HTTP tool-loop lanes, which cache the catalog in the prefix;  the
+Claude, Codex, and ACP lanes discover their tools at runtime.  The saved
+instructions follow when the wake carries a per-wake tail
 (a schedule wake with no tail keeps its saved prompt in the user text).  An
 `AUTHENTICATED WEBHOOK TASK` block is payload-derived, so it stays in the tail
 with timestamps, delivery ids, run ids, folded delivery counts, and untrusted
