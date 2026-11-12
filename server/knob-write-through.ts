@@ -26,6 +26,7 @@ import type { AppConfig } from "./config.ts";
 import {
   KNOB_FIELDS,
   canonicalKnobString,
+  clearedHeadroomKnobs,
   deleteKnobField,
   readKnobField,
   type KnobFieldSpec,
@@ -52,7 +53,7 @@ export interface KnobWriteThroughDeps {
 }
 
 export type KnobWriteThroughResult =
-  | { ok: true; written: string[] }
+  | { ok: true; written: string[]; cleared: string[] }
   | {
       ok: false;
       /** 409 for a policy refusal, 502 for the store failing to answer,
@@ -75,6 +76,10 @@ export type KnobWriteThroughResult =
  * old project before the connection moves.  `refreshMinutes` is a knob
  * itself and is fine.  The route refuses the combination outright. */
 const INFISICAL_CONNECTION_KEYS = new Set([
+  "authMethod",
+  "token",
+  "writeToken",
+  "readSources",
   "projectId",
   "siteUrl",
   "environment",
@@ -107,7 +112,52 @@ export async function writeThroughKnobs(
   deps: KnobWriteThroughDeps,
 ): Promise<KnobWriteThroughResult> {
   const managed: Array<{ spec: KnobFieldSpec; requested: KnobValue }> = [];
+  // Explicit nulls the patch carries for the clearable knobs (slice 7b).
+  // A clear the vault manages is refused outright — the store's own
+  // `writeSecret` refuses clears even with Write Through on, so there is no
+  // vault delete to ride.  A clear nothing manages stays in the patch and
+  // `mergeConfigPatch` deletes the stored key from disk.
+  const clears = new Set(clearedHeadroomKnobs(patch));
+  const cleared: string[] = [];
   for (const spec of KNOB_FIELDS) {
+    if (clears.has(spec.id)) {
+      // Recorded before the disabled check below: with the vault integration
+      // off the clear is a pure file delete and the merge still unsets the
+      // key, so the result must say so.
+      cleared.push(spec.id);
+      if (!deps.enabled) continue;
+      if (deps.unreachable) {
+        return {
+          ok: false,
+          status: 503,
+          error:
+            `Infisical is unreachable, so BotFleet cannot tell whether it manages ${spec.label}.\u00A0 ` +
+            `Try again once it answers, or turn Use Infisical off.`,
+          field: spec.id,
+          infisicalName: spec.infisicalName,
+          written: [],
+          failed: [spec.id],
+        };
+      }
+      const vaultManages = deps.sourceOf(spec.id) === "infisical" || deps.knownNames.has(spec.infisicalName);
+      if (vaultManages) {
+        return {
+          ok: false,
+          status: 409,
+          // NBSP + space, not two ASCII spaces: this string is rendered
+          // inline in a plain <div> by the cards that can hit it, and HTML
+          // collapses a run of ordinary whitespace to one visible space.
+          error:
+            `${spec.label} is managed by Infisical (${deps.environment}).\u00A0 ` +
+            `Clearing it here is not supported — remove ${spec.infisicalName} in Infisical to unset it.`,
+          field: spec.id,
+          infisicalName: spec.infisicalName,
+          written: [],
+          failed: [spec.id],
+        };
+      }
+      continue;
+    }
     const requested = readKnobField(patch, spec);
     if (requested === undefined) continue;
     if (deps.unreachable) {
@@ -181,7 +231,7 @@ export async function writeThroughKnobs(
       }
     }
   }
-  return { ok: true, written };
+  return { ok: true, written, cleared };
 }
 
 /** Delete every empty plain-object child, recursively.  Used only on

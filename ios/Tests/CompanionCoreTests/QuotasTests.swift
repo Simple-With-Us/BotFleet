@@ -30,6 +30,18 @@ private final class QuotasRequestStub: URLProtocol {
 }
 
 final class QuotasTests: XCTestCase {
+    func testSeparatePlanMetadataDecodingAndRoundTrip() throws {
+        let json = #"{"id":"cursor","provider":"cursor","label":"Plan","planName":"Ultra","planMetadata":{"detectedPlanName":"Ultra","userPlanName":"My Pro","userCostUsd":"20.00","userRenewalDateText":"Next Friday","showCostAndRenewal":true,"hasMismatch":true}}"#
+        let window = try JSONDecoder().decode(QuotaWindow.self, from: Data(json.utf8))
+        XCTAssertEqual(window.planName, "Ultra")
+        XCTAssertEqual(window.planMetadata?.detectedPlanName, "Ultra")
+        XCTAssertEqual(window.planMetadata?.userPlanName, "My Pro")
+        XCTAssertTrue(window.planMetadata?.displayLines.contains("Detected and entered plans differ") == true)
+        XCTAssertEqual(try JSONDecoder().decode(QuotaWindow.self, from: JSONEncoder().encode(window)), window)
+        let legacy = try JSONDecoder().decode(QuotaWindow.self, from: Data(#"{"provider":"cursor","label":"Plan"}"#.utf8))
+        XCTAssertNil(legacy.planMetadata)
+    }
+
     private func snapshot(_ json: String) throws -> QuotasSnapshot {
         try JSONDecoder().decode(QuotasSnapshot.self, from: Data(json.utf8))
     }

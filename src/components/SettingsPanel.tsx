@@ -1,6 +1,7 @@
 import { AlertTriangle, Bug, ChevronDown, ChevronLeft, Crown, FolderOpen, X } from "lucide-react";
 import { useState } from "react";
 import { api, useStore, type Bot } from "@/state/store";
+import type { BotUpdatePatch } from "@/state/bot-patch-queue";
 import { stateForBot } from "@/lib/mascot";
 import { CloudBackendPicker } from "./CloudBackendPicker";
 import { BotFallbackModels } from "./BotFallbackModels";
@@ -38,8 +39,9 @@ import { bypassCoverageNote } from "../../shared/bypass-coverage";
 import { VoiceSettings } from "./VoiceSettings";
 import { AutoReviewCard } from "./AutoReviewCard";
 import { BOT_PROFILE_LIMITS } from "../../shared/bot-profile";
-import { botCapabilityGates, toolRoundsGate } from "@/lib/bot-settings-gates";
+import { botCapabilityGates, historySummaryGate, toolRoundsGate } from "@/lib/bot-settings-gates";
 import { MaxToolRoundsField } from "./MaxToolRoundsField";
+import { HistoryCompressionField } from "./HistoryCompressionField";
 import { requiresLocalAutoConsent } from "../../shared/local-auto-consent";
 import { effortLabel } from "@/lib/model-effort";
 import { selectionEffortLevels, selectionWithEffort } from "@/lib/model-pick";
@@ -378,37 +380,16 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
     return null;
   };
   const patch = (
-    p: Partial<
-      Pick<
-        Bot,
-        | "name"
-        | "title"
-        | "description"
-        | "notifications"
-        | "computers"
-        | "cloudBackend"
-        | "autoStartVps"
-        | "color"
-        | "mascotExpression"
-        | "avatarUrl"
-        | "avatarCrop"
-        | "autoApprove"
-        | "autoReview"
-        | "bypassPermissions"
-        | "bypassLocalComputer"
-        | "speakReplies"
-        | "speechDevices"
-        | "voice"
-        | "voiceSummaryMode"
-        | "chiefOfStaff"
-        | "approvePeerComms"
-        | "alwaysAllow"
-        | "composio"
-        | "modelSelection"
-        | "maxToolRounds"
-        | "off"
-      >
-    > & { acknowledgeLocalAuto?: boolean; connectorTools?: Bot["connectorTools"] },
+    p: Partial<BotUpdatePatch> & {
+      // Panel-only fields the broad PATCH boundary (BotUpdatePatch) does not
+      // carry:  everything else derives from the canonical queue type, so a
+      // future whitelist on the queue cannot silently drop a setting the
+      // panel shows as saved.
+      autoReview?: Bot["autoReview"];
+      bypassLocalComputer?: Bot["bypassLocalComputer"];
+      alwaysAllow?: Bot["alwaysAllow"];
+      connectorTools?: Bot["connectorTools"];
+    },
   ) => dispatch({ type: "updateBot", botId: bot.id, patch: p });
   const alwaysAllow = bot.alwaysAllow ?? [];
   const activeState = stateForBot(bot);
@@ -422,6 +403,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
   const engine = gates.engine;
   const { canCoordinate, canUseConnectedApps, canUseVps } = gates;
   const roundsGate = toolRoundsGate(state.instances, bot);
+  const historyGate = historySummaryGate(state.instances, bot);
   // Null when the engine asks and the broker answers, which is the common case.
   const bypassNote = bypassCoverageNote(engine?.capabilities?.bypassCoverage ?? "asks");
   const connectedAppsConfigured = state.config?.composio?.configured === true;
@@ -710,6 +692,16 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
             />
           )}
 
+          {historyGate.visible && (
+            <HistoryCompressionField
+              maxHistoryTurns={bot.maxHistoryTurns}
+              historySummaryModel={bot.historySummaryModel}
+              onMaxHistoryTurns={(maxHistoryTurns) => patch({ maxHistoryTurns })}
+              onHistorySummaryModel={(historySummaryModel) => patch({ historySummaryModel })}
+              gate={historyGate}
+            />
+          )}
+
           <div className="rounded-xl bg-card p-4">
             <div className="text-[15px] font-medium text-ink">Computer</div>
             <div className="mt-0.5 text-[13px] text-ink-secondary">
@@ -787,6 +779,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
                   value={cloudBackend}
                   inherited={cloudBackendInherited(bot)}
                   vpsSupported={canUseVps}
+                  engineName={engine?.displayName}
                   onChange={(backend) => patch({ cloudBackend: backend })}
                 />
                 {!(bot.computers?.length) && cloudBackend === "vps" && (
@@ -973,10 +966,10 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
           <div className="flex items-center justify-between gap-4 rounded-xl bg-card p-4">
             <div>
               <div className="flex items-center gap-2 text-[15px] font-medium text-ink">
-                <Bug size={16} className="text-ink-secondary" /> Developer Inspector
+                <Bug size={16} className="text-ink-secondary" /> Chat Inspector
               </div>
               <div className="mt-0.5 text-[13px] text-ink-secondary">
-                View live runtime events, tool execution payloads, and wire protocol diagnostics for this thread.
+                See this chat’s events, tool results, and connection details.
               </div>
             </div>
             <button

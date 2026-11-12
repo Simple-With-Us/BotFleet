@@ -8,6 +8,7 @@
 // as the import path a dozen server modules already use.
 export {
   LOG_TEE_MAX_STRING_CHARS,
+  LOG_TEE_OVERLAP_CHARS,
   redactSecrets,
   redactSecretsForLog,
   redactSecretsInLogText,

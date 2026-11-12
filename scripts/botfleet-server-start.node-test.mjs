@@ -18,6 +18,9 @@ const SCRIPT = join(ROOT, "scripts/botfleet-server-start.sh");
 
 function makeFixture({ withDependencies = false } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "botfleet-server-start-test-"));
+  const dataDir = join(dir, "data");
+  mkdirSync(dataDir);
+  writeFileSync(join(dataDir, "startup-enrollment.json"), JSON.stringify({ version: 1, mode: "local" }));
   const serverRoot = join(dir, "root");
   mkdirSync(join(serverRoot, "server"), { recursive: true });
   writeFileSync(join(serverRoot, "server", "index.ts"), "// fake entry\n");
@@ -29,10 +32,13 @@ function makeFixture({ withDependencies = false } = {}) {
   // (18799 was tried) collided with something else already listening on
   // it, making health() see a false positive and every test past it fail.
   const port = 20000 + Math.floor(Math.random() * 20000);
-  return { dir, serverRoot, ledger: join(dir, "ledger"), marker: join(dir, "stopped.marker"), port };
+  const node = join(dir, "node-stub");
+  writeFileSync(node, `#!/bin/sh\nif [ "$1" = "--input-type=module" ]; then exec ${JSON.stringify(process.execPath)} "$@"; fi\nprintf '%s\\n' "$*"\n`);
+  chmodSync(node, 0o755);
+  return { dir, dataDir, node, serverRoot, ledger: join(dir, "ledger"), marker: join(dir, "stopped.marker"), disabled: join(dir, "startup-disabled.marker"), enabled: join(dir, "startup-enabled.marker"), session: join(dir, "startup-session"), port };
 }
 
-function run(fixture, { threshold = 20, windowSeconds = 3600, args = [], node = "/bin/echo", xpcServiceName = "" } = {}) {
+function run(fixture, { threshold = 20, windowSeconds = 3600, args = [], node = fixture.node, xpcServiceName = "" } = {}) {
   return spawnSync("bash", [SCRIPT, ...args], {
     encoding: "utf8",
     env: {
@@ -40,6 +46,7 @@ function run(fixture, { threshold = 20, windowSeconds = 3600, args = [], node = 
       BOTFLEET_SERVER_ROOT: fixture.serverRoot,
       BOTFLEET_PORT: String(fixture.port),
       BOTFLEET_NODE: node,
+      OMB_DATA_DIR: fixture.dataDir,
       BOTFLEET_PNPM: join(fixture.dir, "pnpm-does-not-exist"),
       BOTFLEET_HEAL_STAMP: join(fixture.serverRoot, ".botfleet-heal-stamp"),
       BOTFLEET_FAIL_LEDGER: fixture.ledger,
@@ -49,6 +56,10 @@ function run(fixture, { threshold = 20, windowSeconds = 3600, args = [], node = 
       // that could see the owner's actual shutdown sentinel would both read
       // his state and be able to clear it.
       BOTFLEET_SHUTDOWN_MARKER: fixture.marker,
+      BOTFLEET_STARTUP_DISABLED_MARKER: fixture.disabled,
+      BOTFLEET_STARTUP_ENABLED_MARKER: fixture.enabled,
+      BOTFLEET_STARTUP_SESSION: fixture.session,
+      BOTFLEET_BOOT_SESSION_OVERRIDE: "fixture-boot",
       // Explicit rather than inherited: every other test in this file models
       // a person or a generic launchd run, not this specific agent, and an
       // XPC_SERVICE_NAME leaking in from the shell would silently change which
@@ -198,6 +209,11 @@ function runRelease(fixture) {
       BOTFLEET_FAIL_LEDGER: fixture.ledger,
       BOTFLEET_FAIL_STORM_THRESHOLD: "20",
       BOTFLEET_FAIL_WINDOW_SECONDS: "3600",
+      BOTFLEET_SHUTDOWN_MARKER: join(fixture.dir, "stopped.marker"),
+      BOTFLEET_STARTUP_DISABLED_MARKER: join(fixture.dir, "startup-disabled.marker"),
+      BOTFLEET_STARTUP_ENABLED_MARKER: join(fixture.dir, "startup-enabled.marker"),
+      BOTFLEET_STARTUP_SESSION: join(fixture.dir, "startup-session"),
+      BOTFLEET_BOOT_SESSION_OVERRIDE: "fixture-boot",
     },
   });
 }
@@ -285,6 +301,8 @@ function writeIdentityNode(dir) {
     "INFISICAL_CLIENT_SECRET",
     "INFISICAL_UNIVERSAL_AUTH_CLIENT_ID",
     "INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET",
+    "INFISICAL_TOKEN",
+    "INFISICAL_WRITE_TOKEN",
   ];
   // The launcher execs `$NODE --experimental-strip-types -e ...` for the import
   // probe and `$NODE --experimental-strip-types server/index.ts` to boot.  The
@@ -309,7 +327,7 @@ function writeIdentityNode(dir) {
       "writeFileSync(report, lines.join('\\n') + '\\n');",
     ].join("\n"),
   );
-  writeFileSync(stub, "#!/bin/sh\nexec " + JSON.stringify(process.execPath) + " " + JSON.stringify(recorder) + ' "$@"\n');
+  writeFileSync(stub, "#!/bin/sh\nif [ \"$1\" = \"--input-type=module\" ]; then exec " + JSON.stringify(process.execPath) + ' "$@"; fi\nexec ' + JSON.stringify(process.execPath) + " " + JSON.stringify(recorder) + ' "$@"\n');
   chmodSync(stub, 0o755);
   return stub;
 }
@@ -322,10 +340,14 @@ function identityFixture() {
   writeFileSync(join(serverRoot, "server", "index.ts"), "// fake entry\n");
   const home = join(dir, "home");
   mkdirSync(join(home, ".local", "bin"), { recursive: true });
+  const dataDir = join(home, ".botfleet");
+  mkdirSync(dataDir);
+  writeFileSync(join(dataDir, "startup-enrollment.json"), JSON.stringify({ version: 1, mode: "remote" }));
   return {
     dir,
     serverRoot,
     home,
+    dataDir,
     keys: join(dir, "fake-store"),
     bin: join(home, ".local", "bin", "fleet-secrets"),
     report: join(dir, "env-report"),
@@ -353,7 +375,7 @@ function installFakeFleetSecrets(fixture, script) {
   chmodSync(fixture.bin, 0o755);
 }
 
-function runIdentity(fixture, extraEnv = {}) {
+function runIdentity(fixture, extraEnv = {}, { dataDir = fixture.dataDir } = {}) {
   const env = { ...process.env };
   for (const key of Object.keys(env)) {
     if (key.startsWith("INFISICAL_")) delete env[key];
@@ -364,6 +386,7 @@ function runIdentity(fixture, extraEnv = {}) {
       ...env,
       ...extraEnv,
       HOME: fixture.home,
+      OMB_DATA_DIR: dataDir,
       BOTFLEET_ENV_REPORT: fixture.report,
       BOTFLEET_SERVER_ROOT: fixture.serverRoot,
       BOTFLEET_PORT: String(fixture.port),
@@ -374,6 +397,11 @@ function runIdentity(fixture, extraEnv = {}) {
       BOTFLEET_FAIL_LEDGER: fixture.ledger,
       BOTFLEET_FAIL_STORM_THRESHOLD: "20",
       BOTFLEET_FAIL_WINDOW_SECONDS: "3600",
+      BOTFLEET_SHUTDOWN_MARKER: join(fixture.dir, "stopped.marker"),
+      BOTFLEET_STARTUP_DISABLED_MARKER: join(fixture.dir, "startup-disabled.marker"),
+      BOTFLEET_STARTUP_ENABLED_MARKER: join(fixture.dir, "startup-enabled.marker"),
+      BOTFLEET_STARTUP_SESSION: join(fixture.dir, "startup-session"),
+      BOTFLEET_BOOT_SESSION_OVERRIDE: "fixture-boot",
     },
   });
 }
@@ -394,16 +422,119 @@ function identityReport(fixture, result) {
   );
 }
 
+test("local startup bypasses the Infisical helper", () => {
+  const fixture = identityFixture();
+  const called = join(fixture.dir, "helper-called");
+  try {
+    writeFileSync(join(fixture.dataDir, "startup-enrollment.json"), JSON.stringify({ version: 1, mode: "local" }));
+    installFakeFleetSecrets(fixture, `#!/bin/sh\ntouch ${JSON.stringify(called)}\nexit 4`);
+    const got = identityReport(fixture, runIdentity(fixture));
+    assert.equal(existsSync(called), false);
+    assert.equal(got.INFISICAL_TOKEN, "unset");
+    assert.equal(got.INFISICAL_CLIENT_ID, "unset");
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("a host with no identity source and no choice file starts this Mac and reads nothing", () => {
+  const fixture = identityFixture();
+  try {
+    rmSync(join(fixture.dataDir, "startup-enrollment.json"));
+    const result = runIdentity(fixture);
+    assert.equal(result.status, 0);
+    assert.match(result.stdout, /without Infisical bootstrap/);
+    const got = identityReport(fixture, result);
+    assert.equal(got.INFISICAL_TOKEN, "unset");
+    assert.equal(got.INFISICAL_CLIENT_ID, "unset");
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("a host that already had the fleet-secrets helper keeps remote startup without a choice file", () => {
+  const fixture = identityFixture();
+  const called = join(fixture.dir, "helper-called");
+  try {
+    rmSync(join(fixture.dataDir, "startup-enrollment.json"));
+    installFakeFleetSecrets(fixture, `#!/bin/sh\ntouch ${JSON.stringify(called)}\nexit 4`);
+    const result = runIdentity(fixture);
+    assert.equal(result.status, 0);
+    assert.equal(existsSync(called), true);
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("a host already holding an Infisical identity keeps remote startup without a choice file", () => {
+  for (const env of [{ INFISICAL_TOKEN: "st.legacy" }, { INFISICAL_CLIENT_ID: "id", INFISICAL_CLIENT_SECRET: "secret" }]) {
+    const fixture = identityFixture();
+    try {
+      rmSync(join(fixture.dataDir, "startup-enrollment.json"));
+      const result = runIdentity(fixture, env);
+      assert.equal(result.status, 0);
+      assert.doesNotMatch(result.stdout, /startup setup is required/);
+      assert.equal(existsSync(fixture.report), true);
+    } finally {
+      rmSync(fixture.dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("an explicit local choice wins over every legacy identity source", () => {
+  const local = identityFixture();
+  const called = join(local.dir, "helper-called");
+  try {
+    writeFileSync(join(local.dataDir, "startup-enrollment.json"), JSON.stringify({ version: 1, mode: "local" }));
+    installFakeFleetSecrets(local, `#!/bin/sh\ntouch ${JSON.stringify(called)}\nexit 4`);
+    const result = runIdentity(local, { INFISICAL_TOKEN: "st.legacy" });
+    assert.match(result.stdout, /without Infisical bootstrap/);
+    assert.equal(existsSync(called), false);
+  } finally {
+    rmSync(local.dir, { recursive: true, force: true });
+  }
+});
+
+test("the launcher trims the data override like the desktop resolver", () => {
+  const fixture = identityFixture();
+  try {
+    writeFileSync(join(fixture.dataDir, "startup-enrollment.json"), JSON.stringify({ version: 1, mode: "local" }));
+    const got = identityReport(fixture, runIdentity(fixture, {}, { dataDir: `  ${fixture.dataDir}  ` }));
+    assert.equal(got.INFISICAL_TOKEN, "unset");
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("invalid startup preferences fail closed before helper access", () => {
+  const fixture = identityFixture();
+  const called = join(fixture.dir, "helper-called");
+  try {
+    installFakeFleetSecrets(fixture, `#!/bin/sh\ntouch ${JSON.stringify(called)}\nexit 4`);
+    for (const body of ["{", "x".repeat(1025), "null", JSON.stringify({ version: 2, mode: "remote" }),
+      JSON.stringify({ version: 1, mode: "remote", extra: true })]) {
+      writeFileSync(join(fixture.dataDir, "startup-enrollment.json"), body);
+      const result = runIdentity(fixture);
+      assert.equal(result.status, 1);
+      assert.match(result.stderr, /startup choice is invalid/);
+      assert.equal(existsSync(called), false);
+      assert.equal(existsSync(fixture.report), false);
+    }
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
 test("the Infisical identity banner is 7-bit ASCII", () => {
   const line = readFileSync(SCRIPT, "utf8")
     .split("\n")
-    .find((row) => row.includes("the Infisical machine identity"));
+    .find((row) => row.includes("the Infisical service tokens"));
   assert.ok(line, "the identity section banner is missing");
-  assert.match(line, /^# --- the Infisical machine identity/);
+  assert.match(line, /^# --- the Infisical service tokens/);
   assert.equal([...line].some((ch) => ch.charCodeAt(0) > 127), false);
 });
 
-test("documented names are fetched and exported, and nothing else is", () => {
+test("generic machine identity names are never fetched or exported", () => {
   const fixture = identityFixture();
   try {
     writeKeys(
@@ -415,15 +546,59 @@ test("documented names are fetched and exported, and nothing else is", () => {
       ].join("\n"),
     );
     const got = identityReport(fixture, runIdentity(fixture));
-    assert.equal(got.INFISICAL_CLIENT_ID, "fixture-canonical-id");
-    assert.equal(got.INFISICAL_CLIENT_SECRET, "fixture-canonical-secret");
+    assert.equal(got.INFISICAL_CLIENT_ID, "unset");
+    assert.equal(got.INFISICAL_CLIENT_SECRET, "unset");
     assert.equal(got.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID, "unset");
   } finally {
     rmSync(fixture.dir, { recursive: true, force: true });
   }
 });
 
-test("automation file names map onto the env names the harness already resolves", () => {
+test("only dedicated service tokens are fetched, without a machine identity fallback", () => {
+  const fixture = identityFixture();
+  try {
+    writeKeys(
+      fixture,
+      [
+        "BOTFLEET_HARNESS_INFISICAL_READ_TOKEN=fixture-read-token",
+        "BOTFLEET_HARNESS_INFISICAL_WRITE_TOKEN=fixture-write-token",
+        "INFISICAL_CLIENT_ID=fixture-canonical-id",
+        "INFISICAL_CLIENT_SECRET=fixture-canonical-secret",
+      ].join("\n"),
+    );
+    const got = identityReport(fixture, runIdentity(fixture));
+    assert.equal(got.INFISICAL_TOKEN, "fixture-read-token");
+    assert.equal(got.INFISICAL_WRITE_TOKEN, "fixture-write-token");
+    // Dedicated token bootstrap never requests or exports a machine identity.
+    assert.equal(got.INFISICAL_CLIENT_ID, "unset");
+    assert.equal(got.INFISICAL_CLIENT_SECRET, "unset");
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("a token-only host still starts, with no machine identity to fall back to", () => {
+  const fixture = identityFixture();
+  try {
+    writeKeys(
+      fixture,
+      [
+        "BOTFLEET_HARNESS_INFISICAL_READ_TOKEN=fixture-read-token",
+        "BOTFLEET_HARNESS_INFISICAL_WRITE_TOKEN=fixture-write-token",
+      ].join("\n"),
+    );
+    const got = identityReport(fixture, runIdentity(fixture));
+    assert.equal(got.INFISICAL_TOKEN, "fixture-read-token");
+    assert.equal(got.INFISICAL_WRITE_TOKEN, "fixture-write-token");
+    // Nothing to fetch means nothing is exported, and the missing
+    // fallback is not a startup failure.
+    assert.equal(got.INFISICAL_CLIENT_ID, "unset");
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("automation names cannot provision the managed launcher", () => {
   const fixture = identityFixture();
   try {
     writeKeys(
@@ -431,14 +606,14 @@ test("automation file names map onto the env names the harness already resolves"
       ["INFISICAL_AUTOMATION_CLIENT_ID=fixture-auto-id", "INFISICAL_AUTOMATION_CLIENT_SECRET=fixture-auto-secret"].join("\n"),
     );
     const got = identityReport(fixture, runIdentity(fixture));
-    assert.equal(got.INFISICAL_CLIENT_ID, "fixture-auto-id");
-    assert.equal(got.INFISICAL_CLIENT_SECRET, "fixture-auto-secret");
+    assert.equal(got.INFISICAL_CLIENT_ID, "unset");
+    assert.equal(got.INFISICAL_CLIENT_SECRET, "unset");
   } finally {
     rmSync(fixture.dir, { recursive: true, force: true });
   }
 });
 
-test("a documented key wins over the automation name when both are present", () => {
+test("neither generic nor automation names are consulted", () => {
   const fixture = identityFixture();
   try {
     writeKeys(
@@ -451,14 +626,14 @@ test("a documented key wins over the automation name when both are present", () 
       ].join("\n"),
     );
     const got = identityReport(fixture, runIdentity(fixture));
-    assert.equal(got.INFISICAL_CLIENT_ID, "fixture-canonical-id");
-    assert.equal(got.INFISICAL_CLIENT_SECRET, "fixture-canonical-secret");
+    assert.equal(got.INFISICAL_CLIENT_ID, "unset");
+    assert.equal(got.INFISICAL_CLIENT_SECRET, "unset");
   } finally {
     rmSync(fixture.dir, { recursive: true, force: true });
   }
 });
 
-test("a blank documented line falls through to the automation name", () => {
+test("blank generic names never activate automation fallback", () => {
   const fixture = identityFixture();
   try {
     writeKeys(
@@ -471,8 +646,8 @@ test("a blank documented line falls through to the automation name", () => {
       ].join("\n"),
     );
     const got = identityReport(fixture, runIdentity(fixture));
-    assert.equal(got.INFISICAL_CLIENT_ID, "fixture-auto-id");
-    assert.equal(got.INFISICAL_CLIENT_SECRET, "fixture-auto-secret");
+    assert.equal(got.INFISICAL_CLIENT_ID, "unset");
+    assert.equal(got.INFISICAL_CLIENT_SECRET, "unset");
   } finally {
     rmSync(fixture.dir, { recursive: true, force: true });
   }
@@ -584,6 +759,105 @@ test("the launchd tick leaves the marker in place", () => {
   }
 });
 
+test("dependency preparation preserves a deliberate stop and boot policy", () => {
+  const fixture = makeFixture({ withDependencies: true });
+  try {
+    writeFileSync(fixture.marker, "intentionally stopped\n");
+    writeFileSync(fixture.disabled, "");
+    writeFileSync(fixture.session, "previous-boot\n");
+    const result = run(fixture, { args: ["--heal-only"] });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(readFileSync(fixture.marker, "utf8"), "intentionally stopped\n");
+    assert.equal(readFileSync(fixture.session, "utf8"), "previous-boot\n");
+    assert.equal(existsSync(fixture.disabled), true);
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("login-disabled launchd run stays stopped until explicitly started this boot", () => {
+  const fixture = makeFixture();
+  try {
+    writeFileSync(fixture.disabled, "disabled\n");
+    writeFileSync(fixture.marker, "stopped\n");
+    const blocked = run(fixture, { xpcServiceName: "app.botfleet.server" });
+    assert.equal(blocked.status, 0);
+    assert.match(blocked.stdout, /startup is disabled at login/);
+    assert.ok(existsSync(fixture.marker));
+    assert.ok(!existsSync(fixture.session));
+    run(fixture);
+    assert.equal(readFileSync(fixture.session, "utf8").trim(), "fixture-boot");
+    assert.ok(!existsSync(fixture.marker));
+    assert.ok(existsSync(fixture.disabled));
+    const sameBoot = run(fixture, { xpcServiceName: "app.botfleet.server" });
+    assert.doesNotMatch(sameBoot.stdout, /startup is disabled at login/);
+    writeFileSync(fixture.session, "previous-boot\n");
+    const nextBoot = run(fixture, { xpcServiceName: "app.botfleet.server" });
+    assert.match(nextBoot.stdout, /startup is disabled at login/);
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("explicit login enablement starts on the next boot and clears an older stop", () => {
+  const fixture = makeFixture();
+  try {
+    writeFileSync(fixture.enabled, "enabled\n");
+    writeFileSync(fixture.marker, "stopped\n");
+    writeFileSync(fixture.session, "previous-boot\n");
+    const result = run(fixture, { xpcServiceName: "app.botfleet.server" });
+    assert.match(result.stdout, /startup is enabled at login/);
+    assert.ok(!existsSync(fixture.marker));
+    assert.equal(readFileSync(fixture.session, "utf8").trim(), "fixture-boot");
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("a stop during the current boot remains stopped despite login enablement", () => {
+  const fixture = makeFixture();
+  try {
+    writeFileSync(fixture.enabled, "enabled\n");
+    writeFileSync(fixture.marker, "stopped\n");
+    writeFileSync(fixture.session, "fixture-boot\n");
+    const result = run(fixture, { xpcServiceName: "app.botfleet.server" });
+    assert.match(result.stdout, /shut down on purpose/);
+    assert.ok(existsSync(fixture.marker));
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("without explicit login enablement an older stop stays durable", () => {
+  const fixture = makeFixture();
+  try {
+    writeFileSync(fixture.marker, "stopped\n");
+    writeFileSync(fixture.session, "previous-boot\n");
+    const result = run(fixture, { xpcServiceName: "app.botfleet.server" });
+    assert.match(result.stdout, /shut down on purpose/);
+    assert.ok(existsSync(fixture.marker));
+    assert.equal(readFileSync(fixture.session, "utf8").trim(), "previous-boot");
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("disabled login policy wins if both startup markers exist", () => {
+  const fixture = makeFixture();
+  try {
+    writeFileSync(fixture.enabled, "enabled\n");
+    writeFileSync(fixture.disabled, "disabled\n");
+    writeFileSync(fixture.marker, "stopped\n");
+    writeFileSync(fixture.session, "previous-boot\n");
+    const result = run(fixture, { xpcServiceName: "app.botfleet.server" });
+    assert.match(result.stdout, /startup is disabled at login/);
+    assert.ok(existsSync(fixture.marker));
+    assert.equal(readFileSync(fixture.session, "utf8").trim(), "previous-boot");
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
 test("a manual run clears the marker and starts, which is the way back", () => {
   const fixture = makeFixture();
   try {
@@ -593,6 +867,56 @@ test("a manual run clears the marker and starts, which is the way back", () => {
     assert.match(result.stdout + result.stderr, /treating it as a deliberate start/);
   } finally {
     rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("a shell that carries XPC_SERVICE_NAME=0 is still a person, not launchd", () => {
+  // Terminal.app and the agents' command shells set XPC_SERVICE_NAME to the
+  // string 0; launchd sets it to the job's label.  Treating any non-empty
+  // value as launchd classed a manual start from such a shell as a tick, so
+  // the sentinel was never cleared and the server stayed down with nothing
+  // telling the owner why.
+  const fixture = makeFixture();
+  try {
+    writeFileSync(fixture.marker, "stopped on purpose\n");
+    writeFileSync(fixture.disabled, "disabled\n");
+    const result = run(fixture, { xpcServiceName: "0" });
+    assert.ok(!existsSync(fixture.marker), "a person asking for the server must not be blocked by the sentinel");
+    assert.match(result.stdout + result.stderr, /treating it as a deliberate start/);
+    assert.doesNotMatch(result.stdout, /startup is disabled at login/);
+    assert.equal(readFileSync(fixture.session, "utf8").trim(), "fixture-boot");
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("a shell inside a GUI app is still a person, not launchd", () => {
+  // A shell inside VS Code or another GUI app inherits that app's own
+  // launchd name, so "any value but 0" would class it as a tick too.  Only
+  // the BotFleet Server's own job labels are launchd.
+  const fixture = makeFixture();
+  try {
+    writeFileSync(fixture.marker, "stopped on purpose\n");
+    const result = run(fixture, { xpcServiceName: "application.com.microsoft.VSCode.13961144.13961150" });
+    assert.ok(!existsSync(fixture.marker), "a person asking for the server must not be blocked by the sentinel");
+    assert.match(result.stdout + result.stderr, /treating it as a deliberate start/);
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("the job's own labels are launchd, current and legacy", () => {
+  for (const label of ["app.botfleet.server", "com.jay.botfleet-server"]) {
+    const fixture = makeFixture();
+    try {
+      writeFileSync(fixture.marker, "stopped on purpose\n");
+      const result = run(fixture, { xpcServiceName: label });
+      assert.equal(result.status, 0, result.stderr);
+      assert.match(result.stdout + result.stderr, /shut down on purpose/);
+      assert.ok(existsSync(fixture.marker), `${label}: the tick must leave a deliberate stop in place`);
+    } finally {
+      rmSync(fixture.dir, { recursive: true, force: true });
+    }
   }
 });
 
@@ -666,6 +990,10 @@ test("the store pointer is the runtime root when it exists", () => {
       BOTFLEET_HEAL_STAMP: join(dir, "heal-stamp"),
       BOTFLEET_FAIL_LEDGER: join(dir, "ledger"),
       BOTFLEET_SHUTDOWN_MARKER: join(dir, "stopped.marker"),
+      BOTFLEET_STARTUP_DISABLED_MARKER: join(dir, "startup-disabled.marker"),
+      BOTFLEET_STARTUP_ENABLED_MARKER: join(dir, "startup-enabled.marker"),
+      BOTFLEET_STARTUP_SESSION: join(dir, "startup-session"),
+      BOTFLEET_BOOT_SESSION_OVERRIDE: "fixture-boot",
     },
   });
   assert.equal(result.status, 0, result.stderr);
@@ -699,6 +1027,10 @@ test("without a store pointer the legacy checkout path still works", () => {
       BOTFLEET_HEAL_STAMP: join(dir, "heal-stamp"),
       BOTFLEET_FAIL_LEDGER: join(dir, "ledger"),
       BOTFLEET_SHUTDOWN_MARKER: join(dir, "stopped.marker"),
+      BOTFLEET_STARTUP_DISABLED_MARKER: join(dir, "startup-disabled.marker"),
+      BOTFLEET_STARTUP_ENABLED_MARKER: join(dir, "startup-enabled.marker"),
+      BOTFLEET_STARTUP_SESSION: join(dir, "startup-session"),
+      BOTFLEET_BOOT_SESSION_OVERRIDE: "fixture-boot",
     },
   });
   assert.equal(result.status, 0, result.stderr);

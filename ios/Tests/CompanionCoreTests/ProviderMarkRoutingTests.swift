@@ -6,7 +6,7 @@ import XCTest
 final class ProviderMarkRoutingTests: XCTestCase {
     func testHarnessDriversKeepIdentityDespiteModelKeywords() {
         XCTAssertEqual(
-            ProviderMarkRouting.resolvedDriverKind(for: "dshAgent", model: "MiniMax-M3.1-Flash-Preview"),
+            ProviderMarkRouting.resolvedDriverKind(for: "dshAgent", model: "MiniMax-M3.1-Flash"),
             "dshAgent"
         )
         XCTAssertEqual(

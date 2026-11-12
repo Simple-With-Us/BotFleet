@@ -2,13 +2,23 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { z } from "zod";
 
 import type { RuntimeEvent } from "./contracts.ts";
 import type { BotDispatchState } from "../shared/bot-profile.ts";
 import { BOT_OFF_SKIPPED } from "../shared/bot-power.ts";
 import { ROUTINE_ATTENTION_STATUSES } from "../shared/routine-outcomes.ts";
 import { wantsEphemeralDispatch } from "./ephemeral-dispatch.ts";
+import { ROUTINE_RUN_TERMINAL_SAFETY_CAP } from "../shared/routine-retention.ts";
 import { BUSY_DEFER_NOTE, DEFAULT_WEBHOOK_HOT_DEFER_MS, nextOccurrence, RoutineManager, type RoutineManagerOptions, type RoutineRunOn, type RoutineSchedule } from "./routines.ts";
+
+/** routines.json as the manager wrote it, validated before a test reads a field. */
+const routinesOnDiskSchema = z.object({
+  routines: z.array(z.looseObject({ sentryMonitorSlug: z.string().optional() })),
+});
+function routinesOnDisk(file: string): z.infer<typeof routinesOnDiskSchema> {
+  return routinesOnDiskSchema.parse(JSON.parse(readFileSync(file, "utf8")));
+}
 
 type TurnCompletedEvent = Extract<RuntimeEvent, { type: "turn.completed" }>;
 
@@ -52,7 +62,8 @@ function harness(start = new Date(2026, 7, 17, 8, 0, 0).getTime()) {
   const emitted: any[] = [];
   const failed: any[] = [];
   const checkInStarts: Array<{ run: any; routine: any }> = [];
-  const checkInFinishes: Array<{ run: any; checkInId: string; ok: boolean }> = [];
+  const checkInFinishes: Array<{ run: any; checkInId: string; ok: boolean; onSettled?: (delivered: boolean) => void }> = [];
+  const releasedMonitors: string[] = [];
   const ephemeralFlags: boolean[] = [];
   const deliveredEphemeral: Array<{
     ownerThreadId: string;
@@ -98,9 +109,10 @@ function harness(start = new Date(2026, 7, 17, 8, 0, 0).getTime()) {
       checkInStarts.push({ run: { ...run }, routine: { ...routine } });
       return `check-in-${++checkInIdSeq}`;
     },
-    checkInFinish: (run, checkInId, ok) => {
-      checkInFinishes.push({ run: { ...run }, checkInId, ok });
+    checkInFinish: (run, checkInId, ok, onSettled) => {
+      checkInFinishes.push({ run: { ...run }, checkInId, ok, onSettled });
     },
+    releaseMonitor: (slug) => releasedMonitors.push(slug),
   };
   const manager = new RoutineManager(options);
   return {
@@ -115,6 +127,7 @@ function harness(start = new Date(2026, 7, 17, 8, 0, 0).getTime()) {
     failed,
     checkInStarts,
     checkInFinishes,
+    releasedMonitors,
     ephemeralFlags,
     deliveredEphemeral,
     setNow: (value: number) => (now = value),
@@ -130,20 +143,32 @@ afterEach(() => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-it("persists queued receipts while pruning more than 2,000 terminal records", () => {
+it("persists queued receipts while pruning terminal records past the safety cap", () => {
   const h = harness();
   h.setAdmitting(false);
-  const input = { runOn: "bot" as const, webhookId: "retention-hook", webhookName: "Retention", prompt: "Fixture", botId: "bot", receivedAt: 1 };
+  const anchor = new Date(2026, 7, 17, 8, 0, 0).getTime();
+  const input = { runOn: "bot" as const, webhookId: "retention-hook", webhookName: "Retention", prompt: "Fixture", botId: "bot", receivedAt: anchor };
   const queued = h.manager.enqueueWebhook({ ...input, deliveryId: "queued" });
   h.manager.flushNow();
   const disk = JSON.parse(readFileSync(h.options.file!, "utf8"));
-  disk.runs = [queued, ...Array.from({ length: 2001 }, (_, i) => ({ ...queued, id: `history-${i}`, deliveryId: `history-${i}`, status: "completed", createdAt: i + 2, finishedAt: i + 3 }))];
+  const excess = ROUTINE_RUN_TERMINAL_SAFETY_CAP + 1;
+  disk.runs = [
+    queued,
+    ...Array.from({ length: excess }, (_, i) => ({
+      ...queued,
+      id: `history-${i}`,
+      deliveryId: `history-${i}`,
+      status: "completed",
+      createdAt: anchor - excess + i,
+      finishedAt: anchor - excess + i + 1,
+    })),
+  ];
   writeFileSync(h.options.file!, JSON.stringify(disk));
   const reloaded = new RoutineManager(h.options);
   const second = reloaded.enqueueWebhook({ ...input, deliveryId: "new-queued" });
   reloaded.flushNow();
   const persisted = JSON.parse(readFileSync(h.options.file!, "utf8"));
-  expect(persisted.runs).toHaveLength(2002);
+  expect(persisted.runs).toHaveLength(ROUTINE_RUN_TERMINAL_SAFETY_CAP + 2);
   expect(persisted.runs.filter((run: { status: string }) => run.status === "queued").map((run: { id: string }) => run.id)).toEqual([queued.id, second.id]);
   expect(persisted.runs.some((run: { id: string }) => run.id === "history-0")).toBe(false);
 });
@@ -151,13 +176,24 @@ it("persists queued receipts while pruning more than 2,000 terminal records", ()
 it("bounds the prompt snapshot of settled runs older than the newest 100 when it saves", () => {
   const h = harness();
   h.setAdmitting(false);
+  const anchor = new Date(2026, 7, 17, 8, 0, 0).getTime();
   const payload = "p".repeat(20_000);
   const prompt = ["Event: deploy.finished", "[UNTRUSTED WEBHOOK EVENT DATA]", payload, "[/UNTRUSTED WEBHOOK EVENT DATA]"].join("\n");
-  const input = { runOn: "bot" as const, webhookId: "bound-hook", webhookName: "Bound", prompt, botId: "bot", receivedAt: 1 };
+  const input = { runOn: "bot" as const, webhookId: "bound-hook", webhookName: "Bound", prompt, botId: "bot", receivedAt: anchor };
   const queued = h.manager.enqueueWebhook({ ...input, deliveryId: "queued" });
   h.manager.flushNow();
   const disk = JSON.parse(readFileSync(h.options.file!, "utf8"));
-  disk.runs = [queued, ...Array.from({ length: 105 }, (_, i) => ({ ...queued, id: `history-${i}`, deliveryId: `history-${i}`, status: "completed", createdAt: i + 2, finishedAt: i + 3 }))];
+  disk.runs = [
+    queued,
+    ...Array.from({ length: 105 }, (_, i) => ({
+      ...queued,
+      id: `history-${i}`,
+      deliveryId: `history-${i}`,
+      status: "completed",
+      createdAt: anchor - 105 + i,
+      finishedAt: anchor - 105 + i + 1,
+    })),
+  ];
   writeFileSync(h.options.file!, JSON.stringify(disk));
   const reloaded = new RoutineManager(h.options);
   reloaded.enqueueWebhook({ ...input, deliveryId: "new-queued" });
@@ -178,25 +214,35 @@ it("bounds the prompt snapshot of settled runs older than the newest 100 when it
 it("retains the exact result of an unsettled run-now confirmation until its card settles", () => {
   const h = harness();
   h.setAdmitting(false);
+  const anchor = new Date(2026, 7, 17, 8, 0, 0).getTime();
   const routine = h.manager.create({ name: "Fixture", prompt: "Check", botId: "bot", schedule: { type: "daily", time: "09:00", weekdays: [1] } });
   const request = { requestId: "retained-request", messageId: "message", botId: "bot", threadId: "thread", action: "run_now" as const, fingerprintVersion: 1 as const, fingerprint: "a".repeat(64) };
   const committed = h.manager.runNow(routine.id, request)!;
   h.manager.flushNow();
   const disk = JSON.parse(readFileSync(h.options.file!, "utf8"));
-  const terminal = { ...committed, status: "completed", finishedAt: 1 };
-  disk.runs = [terminal, ...Array.from({ length: 2001 }, (_, i) => ({ ...terminal, id: `later-${i}`, createdAt: i + 2, finishedAt: i + 3 }))];
+  const terminal = { ...committed, status: "completed", finishedAt: anchor - 1 };
+  const history = 2001;
+  disk.runs = [
+    terminal,
+    ...Array.from({ length: history }, (_, i) => ({
+      ...terminal,
+      id: `later-${i}`,
+      createdAt: anchor - history + i,
+      finishedAt: anchor - history + i + 1,
+    })),
+  ];
   writeFileSync(h.options.file!, JSON.stringify(disk));
   const reloaded = new RoutineManager(h.options);
   reloaded.update(routine.id, { name: "Prune history" });
   reloaded.flushNow();
   const afterPruning = new RoutineManager(h.options);
   expect(afterPruning.runNow(routine.id, request)).toMatchObject({ id: committed.id, status: "completed" });
-  expect(afterPruning.listRuns()).toHaveLength(2001);
+  expect(afterPruning.listRuns()).toHaveLength(history + 1);
   afterPruning.forgetRoutineRequestReceipt(request);
   afterPruning.flushNow();
   const settled = new RoutineManager(h.options);
-  expect(settled.listRuns()).toHaveLength(2000);
-  expect(settled.listRuns().some((run) => run.id === committed.id)).toBe(false);
+  expect(settled.listRuns()).toHaveLength(history + 1);
+  expect(settled.listRuns().some((run) => run.id === committed.id)).toBe(true);
 });
 
 it("coalesces a burst of saves into one write, and stop() flushes a pending save", () => {
@@ -333,8 +379,10 @@ describe("RoutineManager", () => {
 
   it("measures hot-host defer cap from the first hot tick, not enqueue time", async () => {
     const h = harness();
+    const logs: string[] = [];
     const hostReason = "Host is busy (load 12 per core, swap 91%)";
     const capMs = 5 * 60_000;
+    h.options.log = (line) => logs.push(line);
     h.options.webhookHotDeferMaxMs = () => capMs;
     h.options.hostHot = () => hostReason;
     let busy = true;
@@ -367,6 +415,8 @@ describe("RoutineManager", () => {
     h.setNow(hotAt + capMs);
     await h.manager.tick();
     expect(h.triggerSources).toEqual(["webhook"]);
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toContain("waited 5 min");
   });
 
   it("does not probe the host while no webhook is queued", async () => {
@@ -438,7 +488,8 @@ describe("RoutineManager", () => {
       receivedAt: queuedAt,
     });
     await h.manager.tick();
-    h.setNow(queuedAt + 19 * 60_000);
+    expect(h.started).toHaveLength(0);
+    h.setNow(queuedAt + DEFAULT_WEBHOOK_HOT_DEFER_MS - 1);
     await h.manager.tick();
     expect(h.started).toHaveLength(0);
     h.setNow(queuedAt + DEFAULT_WEBHOOK_HOT_DEFER_MS);
@@ -1928,7 +1979,7 @@ describe("RoutineManager", () => {
       expect(h.started).toHaveLength(0);
     });
 
-    it("closes a Sentry check-in when a scheduled run is skipped because the bot is stopped", async () => {
+    it("opens and closes the Sentry check-in non-ok when a scheduled run is skipped because the bot is stopped (BF-2476)", async () => {
       const h = harness();
       const routine = h.manager.create({
         name: "Housekeeper sweep",
@@ -1939,10 +1990,14 @@ describe("RoutineManager", () => {
       h.manager.snoozeBot("compiler-bot");
       h.setNow(routine.nextRunAt!);
       await h.manager.tick();
+      // A stopped bot is a deliberate pause, never a success: the check-in
+      // opens and closes non-ok (BF-2476).  Emitting nothing would let Sentry
+      // synthesize a `missed` check-in at the deadline with no context.
       expect(h.checkInStarts).toHaveLength(1);
       expect(h.checkInFinishes).toHaveLength(1);
-      expect(h.checkInFinishes[0]).toMatchObject({ checkInId: "check-in-1", ok: true });
+      expect(h.checkInFinishes[0]).toMatchObject({ ok: false });
       expect(h.started).toHaveLength(0);
+      expect(h.manager.listRuns()[0]).toMatchObject({ outcomeCode: "bot_stopped" });
     });
 
     it("cancels all queued, running, and waiting runs for a bot", async () => {
@@ -2223,6 +2278,122 @@ describe("Sentry Crons check-ins", () => {
     expect(reloaded.listRuns()[0]).toMatchObject({ status: "failed", outcomeCode: "runtime_restart" });
     expect(h.checkInFinishes).toHaveLength(1);
     expect(h.checkInFinishes[0]).toMatchObject({ checkInId: "check-in-1", ok: false });
+  });
+
+  it("preserves interrupted scheduler evidence and check-ins in a passive placement bridge", async () => {
+    const h = harness();
+    const routine = h.manager.create({ name: "Held bridge", prompt: "never rerun", botId: "maus-1", schedule: { type: "daily", time: "09:00", weekdays: [1] } });
+    h.setNow(routine.nextRunAt!);
+    await h.manager.tick(); h.manager.flushNow(); h.manager.stop();
+    const before = readFileSync(h.options.file!);
+    const started = h.started.length;
+    const options = { ...h.options, passive: true };
+    const bridge = new RoutineManager(options);
+    options.passive = false;
+    bridge.start(); await bridge.tick(); bridge.stop();
+    expect(bridge.listRuns()[0]).toMatchObject({ status: "running", sentryCheckInId: "check-in-1" });
+    expect(h.started).toHaveLength(started);
+    expect(h.checkInFinishes).toHaveLength(0);
+    expect(readFileSync(h.options.file!)).toEqual(before);
+  });
+
+  it("persists pendingClose until Sentry delivery confirmation, then deletes it", async () => {
+    const h = harness();
+    const routine = h.manager.create({
+      name: "Pending close test",
+      prompt: "do work",
+      botId: "maus-1",
+      schedule: { type: "daily", time: "09:00", weekdays: [1] },
+    });
+    h.setNow(routine.nextRunAt!);
+    await h.manager.tick();
+    const run = h.manager.listRuns()[0]!;
+
+    const base = { eventId: "e", provider: "claude" as const, threadId: run.threadId!, createdAt: new Date().toISOString() };
+    h.manager.handleRuntimeEvent({ ...base, type: "turn.completed", ok: true, stopReason: "end_turn" });
+
+    // pendingClose is set on the completed run immediately
+    const completedRun = h.manager.listRuns()[0]!;
+    expect(completedRun.pendingClose).toEqual({
+      status: "ok",
+      attempts: 0,
+      checkInId: "check-in-1",
+    });
+
+    // When delivery is confirmed, pendingClose is deleted
+    expect(h.checkInFinishes).toHaveLength(1);
+    h.checkInFinishes[0].onSettled?.(true);
+
+    const deliveredRun = h.manager.listRuns()[0]!;
+    expect(deliveredRun.pendingClose).toBeUndefined();
+  });
+
+  it("increments pendingClose attempt count when delivery fails", async () => {
+    const h = harness();
+    const routine = h.manager.create({
+      name: "Pending close retry test",
+      prompt: "do work",
+      botId: "maus-1",
+      schedule: { type: "daily", time: "09:00", weekdays: [1] },
+    });
+    h.setNow(routine.nextRunAt!);
+    await h.manager.tick();
+    const run = h.manager.listRuns()[0]!;
+
+    const base = { eventId: "e", provider: "claude" as const, threadId: run.threadId!, createdAt: new Date().toISOString() };
+    h.manager.handleRuntimeEvent({ ...base, type: "turn.completed", ok: true, stopReason: "end_turn" });
+
+    expect(h.checkInFinishes).toHaveLength(1);
+    // Notify failure
+    h.checkInFinishes[0].onSettled?.(false);
+
+    const failedRun = h.manager.listRuns()[0]!;
+    expect(failedRun.pendingClose).toEqual({
+      status: "ok",
+      attempts: 1,
+      checkInId: "check-in-1",
+    });
+  });
+
+  it("reconciles unclosed check-ins on manager restart", async () => {
+    const h = harness();
+    const routine = h.manager.create({
+      name: "Reconcile test",
+      prompt: "do work",
+      botId: "maus-1",
+      schedule: { type: "daily", time: "09:00", weekdays: [1] },
+    });
+    h.setNow(routine.nextRunAt!);
+    await h.manager.tick();
+    const run = h.manager.listRuns()[0]!;
+
+    const base = { eventId: "e", provider: "claude" as const, threadId: run.threadId!, createdAt: new Date().toISOString() };
+    h.manager.handleRuntimeEvent({ ...base, type: "turn.completed", ok: true, stopReason: "end_turn" });
+
+    // Flush to disk with pendingClose still set (simulating a crash/restart before delivery settled)
+    h.manager.flushNow();
+    expect(h.checkInFinishes).toHaveLength(1);
+
+    // Boot a new RoutineManager from the same disk state
+    const reloadedFinishes: Array<{ run: any; checkInId: string; ok: boolean; onSettled?: (delivered: boolean) => void }> = [];
+    const reloadedOptions = {
+      ...h.options,
+      checkInFinish: (r: any, checkInId: string, ok: boolean, onSettled?: (d: boolean) => void) => {
+        reloadedFinishes.push({ run: { ...r }, checkInId, ok, onSettled });
+      },
+    };
+    const reloaded = new RoutineManager(reloadedOptions);
+
+    // Reconciled the completed run's pendingClose on boot!
+    expect(reloadedFinishes).toHaveLength(1);
+    expect(reloadedFinishes[0]).toMatchObject({
+      checkInId: "check-in-1",
+      ok: true,
+    });
+
+    // Settle delivery on the reloaded manager
+    reloadedFinishes[0].onSettled?.(true);
+    expect(reloaded.listRuns()[0]!.pendingClose).toBeUndefined();
   });
 
   it("never opens a check-in for a webhook, resource, or manual dispatch", async () => {
@@ -2805,7 +2976,7 @@ describe("bot on/off switch", () => {
     expect(run).toMatchObject({ status: "cancelled", outcomeCode: "bot_off", error: BOT_OFF_SKIPPED });
   });
 
-  it("skips a scheduled run, advances the schedule, and closes the Sentry check-in as ok", async () => {
+  it("skips a scheduled run, advances the schedule, and closes the Sentry check-in non-ok (BF-2476)", async () => {
     const h = harness();
     const routine = h.manager.create({ name: "Morning sweep", prompt: "sweep", botId: "sweeper", schedule: daily });
     const due = routine.nextRunAt!;
@@ -2820,9 +2991,234 @@ describe("bot on/off switch", () => {
     // Advanced, so turning the bot on resumes at the NEXT occurrence rather
     // than replaying a backlog.
     expect(h.manager.listRoutines()[0]!.nextRunAt).toBeGreaterThan(due);
+    // BF-2476: a bot that is off never ran, so the check-in opens and
+    // closes non-ok — never `ok`, and never missing (Sentry would
+    // synthesize `missed`).  The start payload carries the populated
+    // `bot_off` outcome so the pause reads as deliberate in Sentry.
+    expect(h.checkInStarts).toHaveLength(1);
+    expect(h.checkInStarts[0].run).toMatchObject({ outcomeCode: "bot_off" });
     expect(h.checkInFinishes).toHaveLength(1);
-    expect(h.checkInFinishes[0]).toMatchObject({ ok: true });
+    expect(h.checkInFinishes[0]).toMatchObject({ ok: false });
     expect(h.failed).toHaveLength(0);
+  });
+
+  it("reports an offline catch-up as an error check-in instead of leaving Sentry to invent missed", async () => {
+    const h = harness();
+    const routine = h.manager.create({
+      name: "Morning sweep",
+      prompt: "sweep",
+      botId: "sweeper",
+      schedule: { type: "daily", time: "09:00", weekdays: [0, 1, 2, 3, 4, 5, 6] },
+    });
+    h.setNow(routine.nextRunAt! + 12 * 60 * 60_000 + 1000);
+    await h.manager.tick();
+    expect(h.started).toHaveLength(0);
+    expect(h.manager.listRuns()[0]).toMatchObject({ outcomeCode: "missed_offline" });
+    expect(h.checkInStarts).toHaveLength(1);
+    expect(h.checkInStarts[0].run.sentryMonitorSlug).toBe(routine.sentryMonitorSlug);
+    expect(h.checkInFinishes[0]).toMatchObject({ ok: false });
+  });
+
+  it("keeps one monitor slug when a daily routine is renamed", async () => {
+    const h = harness();
+    const routine = h.manager.create({
+      name: "Mac Hetzner Health 21:00",
+      prompt: "check the host",
+      botId: "sweeper",
+      schedule: { type: "daily", time: "21:00", weekdays: [0, 1, 2, 3, 4, 5, 6] },
+    });
+    const slug = routine.sentryMonitorSlug;
+    expect(slug).toMatch(/^botfleet-[a-f0-9]+$/);
+    h.setNow(routine.nextRunAt! + 1000);
+    await h.manager.tick();
+    const renamed = h.manager.update(routine.id, { name: "Mac Coolify Health 21:00" });
+    expect(renamed?.sentryMonitorSlug).toBe(slug);
+    expect(h.checkInStarts[0].run.sentryMonitorSlug).toBe(slug);
+    expect(h.releasedMonitors).not.toContain(slug);
+    expect(h.manager.listRoutines()[0]).not.toHaveProperty("sentryMonitorSlug");
+  });
+
+  it("freezes the existing monitor slug and retires only the previous name", () => {
+    const h = harness();
+    const id = "79c6c49d-1111-2222-3333-444444444444";
+    writeFileSync(h.options.file!, JSON.stringify({
+      routines: [{
+        id,
+        name: "Mac Coolify Health 21:00",
+        prompt: "check the host",
+        botId: "sweeper",
+        runOn: "bot",
+        enabled: true,
+        schedule: { type: "daily", time: "21:00", weekdays: [0, 1, 2, 3, 4, 5, 6] },
+        durationMinutes: 30,
+        nextRunAt: 1,
+        createdAt: 1,
+        updatedAt: 1,
+      }],
+      runs: [{
+        id: "old-run",
+        routineId: id,
+        routineName: "Mac Hetzner Health 21:00",
+        botId: "sweeper",
+        runOn: "bot",
+        scheduledFor: 1,
+        status: "completed",
+        manual: false,
+        triggerSource: "schedule",
+        sentryCheckInId: "check-in-old",
+        createdAt: 1,
+      }],
+    }));
+    const released: string[] = [];
+    const restarted = new RoutineManager({
+      ...h.options,
+      releaseMonitor: (slug) => released.push(slug),
+    });
+    restarted.flushNow();
+    const disk = routinesOnDisk(h.options.file!);
+    expect(disk.routines[0]?.sentryMonitorSlug).toBe("botfleet-mac-coolify-health-21-00-79c6c49d");
+    expect(released).toEqual(["botfleet-mac-hetzner-health-21-00-79c6c49d"]);
+    expect(restarted.listRoutines()[0]).not.toHaveProperty("sentryMonitorSlug");
+  });
+
+  it("loads a routine and run with no usable name instead of failing the monitor slug migration", () => {
+    const h = harness();
+    const id = "79c6c49d-1111-2222-3333-444444444444";
+    writeFileSync(h.options.file!, JSON.stringify({
+      routines: [{
+        id,
+        name: null,
+        prompt: "check the host",
+        botId: "sweeper",
+        runOn: "bot",
+        enabled: false,
+        schedule: { type: "daily", time: "21:00", weekdays: [0, 1, 2, 3, 4, 5, 6] },
+        durationMinutes: 30,
+        nextRunAt: 1,
+        createdAt: 1,
+        updatedAt: 1,
+      }],
+      runs: [{
+        id: "old-run",
+        routineId: "gone-routine",
+        botId: "sweeper",
+        runOn: "bot",
+        scheduledFor: 1,
+        status: "completed",
+        manual: false,
+        triggerSource: "schedule",
+        sentryCheckInId: "check-in-old",
+        createdAt: 1,
+      }],
+    }));
+    const released: string[] = [];
+    const restarted = new RoutineManager({
+      ...h.options,
+      releaseMonitor: (slug) => released.push(slug),
+    });
+    restarted.flushNow();
+    expect(routinesOnDisk(h.options.file!).routines[0]?.sentryMonitorSlug).toBe("botfleet-routine-79c6c49d");
+    // The run has no routineName, so its legacy slug would be a guess no
+    // check-in ever opened; nothing is released for it.
+    expect(released).toEqual([]);
+  });
+
+  it("does not retire the placeholder botfleet-routine-0 for a run with no routineId", () => {
+    const h = harness();
+    writeFileSync(h.options.file!, JSON.stringify({
+      routines: [],
+      runs: [{
+        id: "orphan-run",
+        routineName: "Mac Hetzner Health 21:00",
+        botId: "sweeper",
+        runOn: "bot",
+        scheduledFor: 1,
+        status: "completed",
+        manual: false,
+        triggerSource: "schedule",
+        sentryCheckInId: "check-in-old",
+        createdAt: 1,
+      }],
+    }));
+    const released: string[] = [];
+    new RoutineManager({ ...h.options, releaseMonitor: (slug) => released.push(slug) }).flushNow();
+    expect(released).toEqual([]);
+  });
+
+  it("starts a run queued before the freeze on the routine's frozen slug, not the retired name slug", async () => {
+    const h = harness();
+    const id = "79c6c49d-1111-2222-3333-444444444444";
+    const now = h.options.now!();
+    writeFileSync(h.options.file!, JSON.stringify({
+      routines: [{
+        id,
+        name: "Mac Coolify Health 21:00",
+        prompt: "check the host",
+        botId: "sweeper",
+        runOn: "bot",
+        enabled: true,
+        schedule: { type: "daily", time: "21:00", weekdays: [0, 1, 2, 3, 4, 5, 6] },
+        durationMinutes: 30,
+        nextRunAt: now + 86_400_000,
+        createdAt: 1,
+        updatedAt: 1,
+      }],
+      runs: [{
+        id: "old-run",
+        routineId: id,
+        routineName: "Mac Hetzner Health 21:00",
+        botId: "sweeper",
+        runOn: "bot",
+        scheduledFor: 1,
+        status: "completed",
+        manual: false,
+        triggerSource: "schedule",
+        sentryCheckInId: "check-in-old",
+        createdAt: 1,
+      }, {
+        id: "queued-run",
+        routineId: id,
+        routineName: "Mac Hetzner Health 21:00",
+        prompt: "check the host",
+        durationMinutes: 30,
+        botId: "sweeper",
+        runOn: "bot",
+        scheduledFor: now,
+        status: "queued",
+        manual: false,
+        triggerSource: "schedule",
+        createdAt: now,
+      }],
+    }));
+    const released: string[] = [];
+    const restarted = new RoutineManager({ ...h.options, releaseMonitor: (slug) => released.push(slug) });
+    expect(released).toEqual(["botfleet-mac-hetzner-health-21-00-79c6c49d"]);
+    const queued = restarted.listRuns().find((run) => run.id === "queued-run");
+    expect(queued?.sentryMonitorSlug).toBe("botfleet-mac-coolify-health-21-00-79c6c49d");
+    restarted.flushNow();
+  });
+
+  it("retires a deleted daily monitor only after a schedule check-in was opened", async () => {
+    const h = harness();
+    const untouched = h.manager.create({
+      name: "Never ran",
+      prompt: "idle",
+      botId: "sweeper",
+      schedule: { type: "daily", time: "09:00", weekdays: [0, 1, 2, 3, 4, 5, 6] },
+    });
+    h.manager.remove(untouched.id);
+    expect(h.releasedMonitors).toEqual([]);
+    const routine = h.manager.create({
+      name: "Morning sweep",
+      prompt: "sweep",
+      botId: "sweeper",
+      schedule: { type: "daily", time: "09:00", weekdays: [0, 1, 2, 3, 4, 5, 6] },
+    });
+    h.setNow(routine.nextRunAt! + 1000);
+    await h.manager.tick();
+    expect(h.checkInStarts).toHaveLength(1);
+    h.manager.remove(routine.id);
+    expect(h.releasedMonitors).toEqual([routine.sentryMonitorSlug]);
   });
 
   it("is never recorded as missed or failed, so it cannot light the attention badge", async () => {

@@ -20,15 +20,15 @@ describe("MiniMax published rates", () => {
     expect(formatPerMillionUsd(0.6)).toBe("$0.60");
     expect(formatPerMillionUsd(2.4)).toBe("$2.40");
     expect(minimaxPriceRows().map((row) => [row.model, row.input, row.cache, row.output, row.badge])).toEqual([
-      ["MiniMax M3.1 Flash Preview (512K)", "$0.30", "$0.06", "$1.20", "Default · 512K ctx"],
-      ["MiniMax M3.1 Flash Preview (1M)", "$0.30", "$0.06", "$1.20", "1M ctx"],
+      ["MiniMax M3.1 Flash (512K)", "$0.30", "$0.06", "$1.20", "Default · 512K ctx"],
+      ["MiniMax M3.1 Flash (1M)", "$0.30", "$0.06", "$1.20", "1M ctx"],
       ["MiniMax M2.7 Highspeed", "$0.60", "$0.06", "$2.40", "API"],
     ]);
   });
 
-  it("has exactly one row per catalog model id — MiniMax-M3.1-Flash-Preview, MiniMax-M3.1-Flash-Preview-1M, MiniMax-M2.7-highspeed", () => {
+  it("has exactly one row per catalog model id — MiniMax-M3.1-Flash, MiniMax-M3.1-Flash-1M, MiniMax-M2.7-highspeed", () => {
     expect(Object.keys(MINIMAX_PRICE_PER_MILLION).sort()).toEqual(
-      ["MiniMax-M2.7-highspeed", "MiniMax-M3.1-Flash-Preview", "MiniMax-M3.1-Flash-Preview-1M"].sort(),
+      ["MiniMax-M2.7-highspeed", "MiniMax-M3.1-Flash", "MiniMax-M3.1-Flash-1M"].sort(),
     );
     // a coverage test can only force a decision when a model is ADDED to
     // the catalog with no row — it cannot, on its own, detect a model
@@ -52,8 +52,8 @@ describe("MiniMax published rates", () => {
     }
   });
 
-  it("keeps MiniMax-M3.1-Flash-Preview-1M's over-512K tier at double the base rate, with no upper bound of its own", () => {
-    const [base, over] = MINIMAX_PRICE_PER_MILLION["MiniMax-M3.1-Flash-Preview-1M"]!;
+  it("keeps MiniMax-M3.1-Flash-1M's over-512K tier at double the base rate, with no upper bound of its own", () => {
+    const [base, over] = MINIMAX_PRICE_PER_MILLION["MiniMax-M3.1-Flash-1M"]!;
     expect(base.maxInputTokens).toBe(512_000);
     expect(over.maxInputTokens).toBeUndefined();
     expect(over.input).toBeCloseTo(base.input * 2, 10);

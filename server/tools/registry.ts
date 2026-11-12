@@ -98,6 +98,10 @@ export interface ToolGateContext {
    *  `zulip_reply` and `zulip_post` are offered.  Independent of `agents`
    *  and the comms depth: posting as yourself is not a hop to a peer. */
   zulip?: boolean;
+  /** The HTTP tool loop is storing oversized tool results as artifacts.
+   *  `read_tool_result` is offered only together with some other tool that
+   *  can produce a result. */
+  toolResultArchive?: boolean;
 }
 
 /** How a tool asks a person before it runs.  Consumed by the permission
@@ -552,6 +556,49 @@ const phoneEnabled = (ctx: ToolGateContext) => Boolean(ctx.phone);
 // so a future caller can grant one without the other by changing what it
 // passes in, without touching this predicate or these records.
 const githubEnabled = (ctx: ToolGateContext) => Boolean(ctx.github);
+const toolResultArchive = (ctx: ToolGateContext) =>
+  ctx.toolResultArchive === true &&
+  Boolean(
+    ctx.agents ||
+      ctx.localComputer ||
+      ctx.workspace ||
+      ctx.recall ||
+      ctx.phone ||
+      ctx.linq ||
+      ctx.jobs ||
+      ctx.zulip ||
+      ctx.github,
+  );
+
+const READ_TOOL_RESULT: HarnessTool = {
+  name: "read_tool_result",
+  description:
+    "Read the full text of a tool result that later rounds only kept as a head, a tail, and an artifact id. Pass the artifact_id from the truncation notice. offset and limit read a character window when the full text is larger than you need.",
+  schema: {
+    type: "object",
+    properties: {
+      artifact_id: {
+        type: "string",
+        description: "The artifact id named in the truncated tool result.",
+      },
+      offset: {
+        type: "integer",
+        minimum: 0,
+        description: "Optional character offset into the stored text. Defaults to the start.",
+      },
+      limit: {
+        type: "integer",
+        minimum: 1,
+        description: "Optional maximum number of characters to return. Omit to return the full stored text.",
+      },
+    },
+    required: ["artifact_id"],
+  },
+  surfaces: { mcp: false, http: true },
+  gate: toolResultArchive,
+  sideEffect: "read",
+  settles: "immediate",
+};
 
 const BASH: HarnessTool = {
   name: "bash",
@@ -1193,7 +1240,7 @@ const ZULIP_POST: HarnessTool = {
   schema: {
     type: "object",
     properties: {
-      channel: { type: "string", description: "Channel name without the #, for example agent-sync." },
+      channel: { type: "string", description: "Channel name without the #, for example Work-In-Progress." },
       topic: { type: "string", description: "The topic (thread) to post in. Required with channel." },
       dm_user_id: {
         type: "integer",
@@ -1220,7 +1267,7 @@ const ZULIP_FOLLOW_TOPIC: HarnessTool = {
   schema: {
     type: "object",
     properties: {
-      channel: { type: "string", description: "Channel name without the #, for example agent-sync." },
+      channel: { type: "string", description: "Channel name without the #, for example Work-In-Progress." },
       topic: { type: "string", description: "The topic (thread) to follow or stop following." },
       follow: { type: "boolean", description: "true to follow the topic, false to stop following it." },
     },
@@ -1413,6 +1460,7 @@ export const HARNESS_TOOLS: readonly HarnessTool[] = [
   ZULIP_REPLY,
   ZULIP_POST,
   ZULIP_FOLLOW_TOPIC,
+  READ_TOOL_RESULT,
 ];
 
 const BY_NAME = new Map(HARNESS_TOOLS.map((tool) => [tool.name, tool]));

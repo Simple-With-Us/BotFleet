@@ -48,8 +48,8 @@ describe("modelEffortLevels", () => {
     // catalog row its own explicit list, which is what the picker reads.
     const levels = ["low", "medium", "high", "xhigh", "max"] as const;
     const engines = [
-      { name: "mcode", engine: { driverKind: "mcodeAgent", capabilities: { effortLevels: levels } }, m31: "MiniMax-M3.1-Flash-Preview-thinking", m27: "MiniMax-M2.7-highspeed-thinking" },
-      { name: "minimax", engine: { driverKind: "minimax", capabilities: { effortLevels: levels } }, m31: "MiniMax-M3.1-Flash-Preview", m27: "MiniMax-M2.7-highspeed" },
+      { name: "mcode", engine: { driverKind: "mcodeAgent", capabilities: { effortLevels: levels } }, m31: "MiniMax-M3.1-Flash-thinking", m27: "MiniMax-M2.7-highspeed-thinking" },
+      { name: "minimax", engine: { driverKind: "minimax", capabilities: { effortLevels: levels } }, m31: "MiniMax-M3.1-Flash", m27: "MiniMax-M2.7-highspeed" },
     ];
 
     it.each(engines)("offers M3.1's levels and none for M2.7 on $name", ({ engine, m31, m27 }) => {
@@ -71,7 +71,7 @@ describe("modelEffortLevels", () => {
       driverKind: "dsh",
       capabilities: { effortLevels: ["none", "high", "max"] as const },
     };
-    expect(modelEffortLevels(dsh, { id: "MiniMax-M3.1-Flash-Preview" })).toEqual([]);
+    expect(modelEffortLevels(dsh, { id: "MiniMax-M3.1-Flash" })).toEqual([]);
     expect(modelEffortLevels(dsh, { id: "MiniMax-M2.7-highspeed" })).toEqual([]);
   });
 
@@ -118,10 +118,10 @@ describe("modelEffortLevels", () => {
       capabilities: { effortLevels: ["none", "high", "max"] as const },
     };
     const m31Levels = ["low", "medium", "high", "xhigh", "max"] as const;
-    expect(modelEffortLevels(dsh, { id: "MiniMax-M3.1-Flash-Preview", effortLevels: m31Levels })).toEqual(m31Levels);
-    expect(modelSupportsEffort(dsh, { id: "MiniMax-M3.1-Flash-Preview", effortLevels: m31Levels })).toBe(true);
+    expect(modelEffortLevels(dsh, { id: "MiniMax-M3.1-Flash", effortLevels: m31Levels })).toEqual(m31Levels);
+    expect(modelSupportsEffort(dsh, { id: "MiniMax-M3.1-Flash", effortLevels: m31Levels })).toBe(true);
     // An install whose entry declares no levels answers [] and hides it.
-    expect(modelEffortLevels(dsh, { id: "MiniMax-M3.1-Flash-Preview", effortLevels: [] })).toEqual([]);
+    expect(modelEffortLevels(dsh, { id: "MiniMax-M3.1-Flash", effortLevels: [] })).toEqual([]);
     // Other DSH MiniMax rows carry no list and stay hidden by the DSH rule.
     expect(modelEffortLevels(dsh, { id: "MiniMax-M2.7-highspeed" })).toEqual([]);
     // DeepSeek rows keep the engine-wide list.
@@ -135,10 +135,10 @@ describe("modelDefaultEffort", () => {
   });
 
   it("defaults to max for MiniMax M3.1 models", () => {
-    expect(modelDefaultEffort(null, { id: "MiniMax-M3.1-Flash-Preview" })).toBe("max");
-    expect(modelDefaultEffort(null, { id: "MiniMax-M3.1-Flash-Preview-1M" })).toBe("max");
-    expect(modelDefaultEffort(null, { id: "MiniMax-M3.1-Flash-Preview-thinking" })).toBe("max");
-    expect(modelDefaultEffort(null, { id: "MiniMax-M3.1-Flash-Preview-thinking-1M" })).toBe("max");
+    expect(modelDefaultEffort(null, { id: "MiniMax-M3.1-Flash" })).toBe("max");
+    expect(modelDefaultEffort(null, { id: "MiniMax-M3.1-Flash-1M" })).toBe("max");
+    expect(modelDefaultEffort(null, { id: "MiniMax-M3.1-Flash-thinking" })).toBe("max");
+    expect(modelDefaultEffort(null, { id: "MiniMax-M3.1-Flash-thinking-1M" })).toBe("max");
   });
 
   it("returns undefined when effortLevels is empty", () => {

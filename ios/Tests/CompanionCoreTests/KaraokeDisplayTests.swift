@@ -62,13 +62,24 @@ final class KaraokeDisplayTests: XCTestCase {
         let display = KaraokeDisplay(markdown: Self.reply)
         let passed = display.words.firstIndex { $0.text == "passed" }!
         let upload = display.words.firstIndex { $0.text == "upload" }!
-        let frame = KaraokeFrame(current: upload, lit: 2, trail: [KaraokeTrailWord(index: passed, level: 1)])
+        let widget = display.words.firstIndex { $0.text == "Widget" }!
+        let frame = KaraokeFrame(
+            current: upload,
+            lit: 2,
+            lead: [KaraokeLeadWord(index: widget, level: 0)],
+            trail: [KaraokeTrailWord(index: passed, level: 1)]
+        )
         let paints = display.paints(for: frame)
-        XCTAssertEqual(Set(paints.keys), [1, 2])
+        XCTAssertEqual(Set(paints.keys), [1, 2, 3])
         let uploadPlace = display.places[upload]
-        XCTAssertEqual(paints[2], KaraokeBlockPaint(lit: uploadPlace.start..<(uploadPlace.start + 2)))
+        XCTAssertEqual(
+            paints[2],
+            KaraokeBlockPaint(peak: uploadPlace.start..<uploadPlace.end, lit: uploadPlace.start..<(uploadPlace.start + 2))
+        )
         let passedPlace = display.places[passed]
         XCTAssertEqual(paints[1]?.trail, [KaraokeBlockPaint.Trail(range: passedPlace.start..<passedPlace.end, level: 1)])
+        let widgetPlace = display.places[widget]
+        XCTAssertEqual(paints[3]?.lead, [KaraokeBlockPaint.Lead(range: widgetPlace.start..<widgetPlace.end, level: 0)])
         XCTAssertTrue(display.paints(for: .none).isEmpty)
         // A cut past the word's end stays inside the word.
         XCTAssertEqual(display.paints(for: KaraokeFrame(current: upload, lit: 99))[2]?.lit, uploadPlace.start..<uploadPlace.end)
