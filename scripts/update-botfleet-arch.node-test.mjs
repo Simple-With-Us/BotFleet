@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import { dirname, join, posix, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { readShellSource } from "./shell-source.mjs";
 
 // The updater bootstraps itself by archiving a fixed set of files out of the
 // commit it is about to install (scripts/update-botfleet-policy.sh) and running that
@@ -18,7 +19,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const LOCAL_IMPORT = /from\s+"(\.[^"]+)"/g;
 
 async function archivedPaths() {
-  const wrapper = await readFile(join(root, "scripts/update-botfleet-policy.sh"), "utf8");
+  const wrapper = await readShellSource(join(root, "scripts/update-botfleet-policy.sh"));
   const archive = wrapper.match(/git -C "\$BOTFLEET_CHECKOUT" archive[^|]*?--\s*([^|]+)\|\s*tar/);
   assert.ok(archive, "could not find the `git archive` call in scripts/update-botfleet-policy.sh");
   // The paths sit on shell line-continuation lines, so the captured group also
