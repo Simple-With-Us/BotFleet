@@ -1013,6 +1013,9 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
               !hasUsageMonitorAG &&
               instanceWindows.length === 0 &&
               !engineIssue &&
+              // MiniMax and DeepSeek already say their quota or balance in the headline.
+              !minimaxStatus &&
+              !deepseekStatus &&
               !(instance.instanceId === "antigravity" && agGroups.length > 0);
             const usageMonitorGridEmptyLine = expectsUsageMonitorPlaceholder
               ? quotaGridPlaceholderLine(quotasLoaded ? "empty" : "loading", instance.displayName)
