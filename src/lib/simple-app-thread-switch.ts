@@ -48,7 +48,12 @@ export function simpleAppThreadRefusal(title: string, reason: string): string {
  * Projects may make that App conversation the open one, and Simple keeps the
  * open conversation where it is. */
 export function planAppThreadOpen(input: {
-  mode: ConversationMode;
+  /** The loaded workspace arrangement, or null while /api/config has not
+   * delivered one.  The gate protects a KNOWN Simple arrangement; when the
+   * arrangement is unknown the open proceeds as it did before the gate
+   * existed, rather than refusing a Projects user with advice that does not
+   * apply. */
+  mode: ConversationMode | null;
   bot: AppThreadOpenBot | null | undefined;
   appId: string;
 }): AppThreadOpenPlan {
@@ -56,7 +61,7 @@ export function planAppThreadOpen(input: {
   if (!bot) return { action: "show", threadId: undefined, activate: false };
   const threadId = threadIdForApp(bot, input.appId);
   const different = Boolean(threadId && threadId !== bot.threadId);
-  if (!different || allowsMultipleBotThreads(input.mode)) {
+  if (!different || input.mode === null || allowsMultipleBotThreads(input.mode)) {
     return { action: "show", threadId, activate: different };
   }
   const tasks = bot.tasks ?? [];

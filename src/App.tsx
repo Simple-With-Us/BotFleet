@@ -3,6 +3,7 @@ import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react"
 import { Loader2, Menu, X } from "lucide-react";
 import { StoreProvider, useStore, getConversationMode, getRoomTerminology, type AppSettingsSection } from "@/state/store";
 import { eligibleTaskApps } from "@/lib/task-app-context";
+import type { ConversationMode } from "../shared/conversation-mode";
 import { ERROR_RECOVERY_EVENT, type ErrorRecoveryDetail } from "@/components/ErrorRow";
 import { Onboarding } from "@/components/Onboarding";
 import { emailGateDone, initAnalytics } from "@/lib/analytics";
@@ -104,7 +105,15 @@ function Shell() {
   const taskCreationBot = state.bots.find((entry) => entry.id === state.taskCreationBotId);
   const [selectedAppId, setSelectedAppId] = useState<string | null>(() => (group && !group.dm ? group.id : null));
   const [matrixOverviewActive, setMatrixOverviewActive] = useState(false);
-  const [threadRefusal, setThreadRefusal] = useState<{ botId: string; message: string } | null>(null);
+  const [threadRefusal, setThreadRefusal] = useState<{
+    botId: string;
+    message: string;
+    /** Selection and workspace-arrangement epoch when the refusal was shown:
+     *  the banner lives until the user makes a new pick or the arrangement
+     *     changes, whichever comes first. */
+    nonce: number;
+    mode: ConversationMode;
+  } | null>(null);
   const hasApps = state.groups.some((g) => !g.dm);
 
   // The task-switch ack clears the pin, so a null pin means "the bot's active
@@ -157,17 +166,22 @@ function Shell() {
   // engine whose probe has not answered yet is not proof of an empty Mac.
   const noEngines = state.connected && noEngineCanRun(state.instances);
 
+  const conversationMode = getConversationMode(state.config);
   const openBotInApp = useCallback((botId: string, appId: string) => {
     const b = state.bots.find((x) => x.id === botId);
     const plan = planAppThreadOpen({
-      mode: getConversationMode(state.config),
+      // An unloaded config is not a Simple arrangement: pass null so the gate
+      // stays out of the way until the real one is known.
+      mode: state.config ? conversationMode : null,
       bot: b,
       appId,
     });
     switch (plan.action) {
       case "refuse":
-        dispatch({ type: "select", id: botId });
-        setThreadRefusal({ botId, message: plan.message });
+        // The refusal copy says nothing was switched, so nothing is: no
+        // select dispatch, no cleared thread pin, no lost App context.  The
+        // banner anchors to this pick's nonce and mode instead.
+        setThreadRefusal({ botId, message: plan.message, nonce: state.selectionNonce, mode: conversationMode });
         return;
       case "show":
         setThreadRefusal(null);
@@ -181,7 +195,7 @@ function Shell() {
         return _exhaustive;
       }
     }
-  }, [state.bots, state.config, dispatch]);
+  }, [state.bots, state.config, state.selectionNonce, conversationMode, dispatch]);
 
   // App-wide shortcuts: ⌘N new bot · ⌘1–9 jump to bot · ⌘⇧[ / ⌘⇧] prev/next.
   // Kept deliberately small; every panel already closes on Esc.
@@ -221,8 +235,13 @@ function Shell() {
   }, [state.bots, state.selectedId, selectedAppId, appKeyboardRouting, dispatch, openBotInApp]);
 
   useEffect(() => {
-    if (threadRefusal && state.selectedId !== threadRefusal.botId) setThreadRefusal(null);
-  }, [state.selectedId, threadRefusal]);
+    if (
+      threadRefusal
+      && (state.selectionNonce !== threadRefusal.nonce || conversationMode !== threadRefusal.mode)
+    ) {
+      setThreadRefusal(null);
+    }
+  }, [state.selectionNonce, conversationMode, threadRefusal]);
 
   useEffect(() => {
     window.ogb?.setUnreadCount?.(unreadCount);

@@ -56,6 +56,17 @@ describe("planAppThreadOpen", () => {
     });
   });
 
+  it("opens without the gate while the workspace arrangement is unknown", () => {
+    // /api/config has not answered: the gate protects a KNOWN Simple
+    // arrangement, so the App conversation opens the way it did before the
+    // gate existed instead of refusing a Projects user.
+    expect(planAppThreadOpen({ mode: null, bot: bot(), appId: "app-a" })).toEqual({
+      action: "show",
+      threadId: "app-a-chat",
+      activate: true,
+    });
+  });
+
   it("shows the open conversation when it serves the same App and folder as the saved one", () => {
     const samePlace: AppThreadOpenBot = {
       threadId: "app-a-second",
