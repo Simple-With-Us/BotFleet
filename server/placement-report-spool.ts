@@ -195,7 +195,10 @@ function outcomeReason(outcome: WorkerCallOutcome<unknown>): string | undefined 
  *  exact result repeatedly, which is a contradiction worth surfacing, not a
  *  network condition.  Rows past the cap are left in place and reported
  *  exhausted; terminal evidence is never silently dropped. */
-export async function settlePendingReports(spool: PlacementReportSpool, client: PlacementWorkerClient): Promise<SettleOutcome[]> {
+export async function settlePendingReports(
+  spool: PlacementReportSpool,
+  client: Pick<PlacementWorkerClient, "report">,
+): Promise<SettleOutcome[]> {
   const outcomes: SettleOutcome[] = [];
   for (const row of spool.pending()) {
     if (row.attempts >= PLACEMENT_REPORT_MAX_ATTEMPTS) {
