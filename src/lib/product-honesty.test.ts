@@ -17,6 +17,9 @@ describe("product honesty copy", () => {
 
   it("ships an honest Event Triggers empty, not fake wizards (UX-014)", () => {
     const text = readFileSync(join(src, "components/WebhooksPanel.tsx"), "utf8");
-    expect(text).toContain("Generic Webhooks Only — Guided Setup Coming");
+    expect(text).toContain("No Guided Setup Yet");
+    expect(text).toContain("Setup guides for specific apps are not here yet.");
+    expect(text).not.toContain("Generic Webhooks Only");
+    expect(text).not.toContain("webhook POST");
   });
 });
