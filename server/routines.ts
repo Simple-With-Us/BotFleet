@@ -288,7 +288,7 @@ export type LegacySlugSource = z.infer<typeof legacySlugSourceSchema>;
  * a usable routineId and routineName.  Without them the formula falls back to
  * placeholders ("routine", "0") and would name a monitor no run ever opened,
  * such as botfleet-routine-0, so there is nothing safe to release. */
-function legacyRunMonitorSlug(run: unknown): string | undefined {
+function legacyRunMonitorSlug(run: Pick<RoutineRun, "routineId" | "routineName">): string | undefined {
   const source: LegacySlugSource = legacySlugSourceSchema.parse(run);
   return source.routineId && source.routineName ? legacyRoutineMonitorSlug(source) : undefined;
 }
