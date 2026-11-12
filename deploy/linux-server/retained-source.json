@@ -1621,6 +1621,7 @@
     {"path":"server/vps-computer.ts","category":"runtime","reason":"Import from server/index.ts"},
     {"path":"server/vps-container-mcp.ts","category":"runtime-asset","reason":"Declared subprocess in server/proxy-paths.ts"},
     {"path":"server/vps-shared-session.ts","category":"runtime","reason":"Import from server/index.ts"},
+    {"path":"server/wake-prompt.ts","category":"runtime","reason":"Import from server/index.ts"},
     {"path":"server/webhook-ingress.ts","category":"runtime","reason":"Import from server/index.ts"},
     {"path":"server/webhook-payload.ts","category":"runtime","reason":"Import from server/webhooks.ts"},
     {"path":"server/webhooks.ts","category":"runtime","reason":"Import from server/index.ts"},
