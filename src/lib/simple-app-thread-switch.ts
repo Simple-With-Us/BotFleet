@@ -54,10 +54,10 @@ export function simpleAppThreadRefusal(title: string, reason: string): string {
  * open conversation where it is. */
 export function planAppThreadOpen(input: {
   /** The loaded workspace arrangement, or null while /api/config has not
-   * delivered one.  The gate protects a KNOWN Simple arrangement; when the
-   * arrangement is unknown the open proceeds as it did before the gate
-   * existed, rather than refusing a Projects user with advice that does not
-   * apply. */
+   * delivered one (or failed).  While it is unknown the pick shows the bot's
+   * open conversation and switches nothing:  refusing would give a Projects
+   * user advice that does not apply, and activating would let a Simple user
+   * lose the open conversation before the arrangement is known. */
   mode: ConversationMode | null;
   bot: AppThreadOpenBot | null | undefined;
   appId: string;
@@ -66,6 +66,9 @@ export function planAppThreadOpen(input: {
   if (!bot) return { action: "show", threadId: undefined, activate: false };
   const threadId = threadIdForApp(bot, input.appId);
   const different = Boolean(threadId && threadId !== bot.threadId);
+  if (different && input.mode === null) {
+    return { action: "show", threadId: bot.threadId, activate: false };
+  }
   if (!different || input.mode === null || allowsMultipleBotThreads(input.mode)) {
     return { action: "show", threadId, activate: different };
   }

@@ -181,7 +181,8 @@ function Shell() {
         // The refusal copy says nothing was switched, so nothing is: no
         // select dispatch, no cleared thread pin, no lost App context.  The
         // banner anchors to this pick's nonce and mode instead.
-        setThreadRefusal({ botId, message: plan.message, nonce: state.selectionNonce, mode: conversationMode });
+        // The pick no longer brings the bot on screen, so the note names it.
+        setThreadRefusal({ botId, message: `${b?.name ?? botId}: ${plan.message}`, nonce: state.selectionNonce, mode: conversationMode });
         return;
       case "show":
         setThreadRefusal(null);

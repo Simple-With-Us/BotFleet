@@ -56,14 +56,14 @@ describe("planAppThreadOpen", () => {
     });
   });
 
-  it("opens without the gate while the workspace arrangement is unknown", () => {
-    // /api/config has not answered: the gate protects a KNOWN Simple
-    // arrangement, so the App conversation opens the way it did before the
-    // gate existed instead of refusing a Projects user.
+  it("switches nothing and refuses nothing while the workspace arrangement is unknown", () => {
+    // /api/config has not answered (or failed):  refusing would mislead a
+    // Projects user, and activating would move a Simple user's open
+    // conversation, so the bot's open conversation stays on screen.
     expect(planAppThreadOpen({ mode: null, bot: bot(), appId: "app-a" })).toEqual({
       action: "show",
-      threadId: "app-a-chat",
-      activate: true,
+      threadId: bot().threadId,
+      activate: false,
     });
   });
 
