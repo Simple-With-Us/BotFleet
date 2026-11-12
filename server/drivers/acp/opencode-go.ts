@@ -7,10 +7,7 @@ import { join } from "node:path";
 
 import { decodeInjectId, hostApiKey, localHost, mergeLocalInject } from "../local-inject.ts";
 import { createAcpDriver, type AcpSupport } from "./core.ts";
-import {
-  humanizeOpenCodeModelProbeProblem,
-  openCodeModelProbeProblemIsUnknown,
-} from "../../../shared/opencode-model-probe.ts";
+import { humanizeOpenCodeModelProbeProblem } from "../../../shared/opencode-model-probe.ts";
 import {
   describeInitDeadline,
   readHostLoad,
@@ -348,9 +345,8 @@ export async function discoverOpenCodeModels(
     // CLI answered and had nothing to list, and the person needs the sentence
     // that says which of the two it was.
     const raw = error instanceof Error ? error.message : String(error);
-    if (openCodeModelProbeProblemIsUnknown(raw)) {
-      console.warn(`[acp] opencodeGo: opencode models catalog: ${raw}`);
-    }
+    // The row shows the plain sentence;  the log keeps the CLI's own words.
+    console.warn(`[acp] opencodeGo: opencode models catalog: ${raw}`);
     lastProbeProblem = humanizeOpenCodeModelProbeProblem(raw);
     return lastSuccessfulCatalog ?? STATIC_MODELS;
   }
