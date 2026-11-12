@@ -91,13 +91,13 @@ export function readAutoUpdateConfig(configPath) {
  * against a real temp file without an `electron` runtime -- updater.mjs
  * imports `electron` at module scope, which plain `node --test` cannot
  * load, so the disk I/O for the throttle lives here instead of there. */
-export function recordAutomaticCheck(configPath, { fingerprint } = {}) {
+export function recordAutomaticCheck(configPath, { fingerprint, nowMs } = {}) {
   updateConfigFile(configPath, (disk) => {
     const current =
       disk.autoUpdate && typeof disk.autoUpdate === "object" && !Array.isArray(disk.autoUpdate)
         ? disk.autoUpdate
         : {};
-    disk.autoUpdate = nextAutoUpdateRecord(current, { fingerprint });
+    disk.autoUpdate = nextAutoUpdateRecord(current, { fingerprint, nowMs });
   });
 }
 
