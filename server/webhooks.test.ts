@@ -1,7 +1,7 @@
 import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { JsonValue } from "./schema.ts";
 import {
@@ -2091,7 +2091,7 @@ describe("GitHub PR state dedupe for classify wakes", () => {
       botId: "maus-1",
     });
     expect(h.manager.receive(webhook.endpointId, secret, prEvent("pr-notes-1")).runId).toBe("run-1");
-    const second = h.manager.receive(webhook.endpointId, secret, prEvent("pr-notes-2"));
+    const second = h.manager.receive(webhook.endpointId, secret, prEvent("pr-notes-2", { action: "closed" }));
     expect(second).toMatchObject({ duplicate: false, runId: "run-2" });
     expect(second.ignored).toBeUndefined();
     expect(h.queued).toHaveLength(2);
@@ -2299,9 +2299,233 @@ describe("GitHub head state dedupe for Compile gates", () => {
       botId: "maus-1",
     });
     expect(h.manager.receive(webhook.endpointId, secret, workflowEvent("rel-1")).runId).toBe("run-1");
-    const second = h.manager.receive(webhook.endpointId, secret, workflowEvent("rel-2"));
+    const second = h.manager.receive(webhook.endpointId, secret, workflowEvent("rel-2", { conclusion: "success" }));
     expect(second).toMatchObject({ duplicate: false, runId: "run-2" });
     expect(second.ignored).toBeUndefined();
     expect(h.queued).toHaveLength(2);
+  });
+});
+
+describe("identical webhook payload dedupe", () => {
+  const startedAt = Date.parse("2026-08-16T10:00:00.000Z");
+  const lead = (deliveryId: string, payload: JsonValue, eventName = "lead") => ({
+    payload,
+    eventName,
+    deliveryId,
+  });
+
+  it("drops a retry that differs only by delivery id and timestamps, and logs the original run", () => {
+    const h = harness();
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    try {
+      const { webhook, secret } = h.manager.create({ name: "Leads", prompt: "Qualify", botId: "maus-sales" });
+      const firstBody = {
+        task: "review",
+        token: "secret-token-should-not-log",
+        delivery_id: "one",
+        timestamp: "2026-11-12T03:00:00Z",
+      };
+      expect(h.manager.receive(webhook.endpointId, secret, lead("d-1", firstBody))).toMatchObject({
+        duplicate: false,
+        runId: "run-1",
+      });
+      const second = h.manager.receive(webhook.endpointId, secret, lead("d-2", {
+        timestamp: "2026-11-12T03:05:00Z",
+        task: "review",
+        token: "secret-token-should-not-log",
+        "x-github-delivery": "two",
+      }));
+      expect(second).toEqual({ runId: "run-1", deliveryId: "d-2", duplicate: true });
+      expect(h.queued).toHaveLength(1);
+      expect(h.manager.payloadDedupeSkipCount()).toBe(1);
+      expect(h.manager.list()[0]?.deliveryCount).toBe(1);
+      expect(h.manager.listAttempts().at(-1)).toMatchObject({
+        outcome: "duplicate",
+        runId: "run-1",
+        reason: "Duplicate payload ignored; original run run-1",
+      });
+      const line = info.mock.calls.map((call) => String(call[0])).join("\n");
+      expect(line).toContain("skipped delivery d-2");
+      expect(line).toContain("original run run-1");
+      expect(line).not.toContain("secret-token-should-not-log");
+    } finally {
+      info.mockRestore();
+    }
+  });
+
+  it("keeps a distinct record id, a different bot, a different event, and a different webhook", () => {
+    const h = harness();
+    const { webhook, secret } = h.manager.create({ name: "Leads", prompt: "Qualify", botId: "maus-sales" });
+    const other = h.manager.create({ name: "Other", prompt: "Qualify", botId: "maus-sales" });
+    expect(h.manager.receive(webhook.endpointId, secret, lead("id-1", { id: "record-1", task: "review" })).runId).toBe("run-1");
+    expect(h.manager.receive(webhook.endpointId, secret, lead("id-2", { id: "record-2", task: "review" }))).toMatchObject({
+      duplicate: false,
+      runId: "run-2",
+    });
+    expect(h.manager.receive(webhook.endpointId, secret, lead("ev-1", { id: "record-1", task: "review" }, "issues"))).toMatchObject({
+      duplicate: false,
+      runId: "run-3",
+    });
+    const moved = h.manager.create({ name: "Moved", prompt: "Qualify", botId: "maus-other" });
+    expect(h.manager.receive(moved.webhook.endpointId, moved.secret, lead("bot-2", { id: "record-1", task: "review" }))).toMatchObject({
+      duplicate: false,
+      runId: "run-4",
+    });
+    expect(h.manager.receive(other.webhook.endpointId, other.secret, lead("src-2", { id: "record-1", task: "review" }))).toMatchObject({
+      duplicate: false,
+      runId: "run-5",
+    });
+    expect(h.queued).toHaveLength(5);
+    expect(h.manager.payloadDedupeSkipCount()).toBe(0);
+  });
+
+  it("accepts the same payload again after the window, and honors a shorter or disabled window", () => {
+    const h = harness();
+    const { webhook, secret } = h.manager.create({ name: "Leads", prompt: "Qualify", botId: "maus-sales" });
+    const body = { task: "review" };
+    expect(h.manager.receive(webhook.endpointId, secret, lead("w-1", body)).runId).toBe("run-1");
+    h.setNow(startedAt + 119_999);
+    expect(h.manager.receive(webhook.endpointId, secret, lead("w-2", body))).toMatchObject({ duplicate: true, runId: "run-1" });
+    h.setNow(startedAt + 120_000);
+    expect(h.manager.receive(webhook.endpointId, secret, lead("w-3", body))).toMatchObject({ duplicate: false, runId: "run-2" });
+
+    h.options.payloadDedupeWindowMs = () => 5_000;
+    h.setNow(startedAt + 120_000);
+    expect(h.manager.receive(webhook.endpointId, secret, lead("s-1", { task: "short" })).runId).toBe("run-3");
+    h.setNow(startedAt + 125_000);
+    expect(h.manager.receive(webhook.endpointId, secret, lead("s-2", { task: "short" }))).toMatchObject({
+      duplicate: false,
+      runId: "run-4",
+    });
+
+    h.options.payloadDedupeWindowMs = () => 0;
+    expect(h.manager.receive(webhook.endpointId, secret, lead("off-1", { task: "off" })).runId).toBe("run-5");
+    expect(h.manager.receive(webhook.endpointId, secret, lead("off-2", { task: "off" }))).toMatchObject({
+      duplicate: false,
+      runId: "run-6",
+    });
+    expect(h.queued).toHaveLength(6);
+  });
+
+  it("does not spend a rate-limit slot or a pending-run slot on a duplicate", () => {
+    const h = harness();
+    const { webhook, secret } = h.manager.create({ name: "Leads", prompt: "Qualify", botId: "maus-sales" });
+    for (let index = 0; index < 10; index += 1) {
+      h.manager.receive(webhook.endpointId, secret, lead(`rate-${index}`, { n: index }, "push"));
+    }
+    expect(h.manager.receive(webhook.endpointId, secret, lead("rate-dup", { n: 0 }, "push"))).toMatchObject({
+      duplicate: true,
+      runId: "run-1",
+    });
+    expect(() => h.manager.receive(webhook.endpointId, secret, lead("rate-new", { n: 99 }, "push"))).toThrow("rate limit");
+    expect(h.queued).toHaveLength(10);
+
+    const quiet = harness();
+    const created = quiet.manager.create({ name: "Leads", prompt: "Qualify", botId: "maus-sales" });
+    expect(quiet.manager.receive(created.webhook.endpointId, created.secret, lead("pend-1", { task: "hold" })).runId).toBe("run-1");
+    quiet.setPending(3);
+    expect(quiet.manager.receive(created.webhook.endpointId, created.secret, lead("pend-2", { task: "hold" }))).toMatchObject({
+      duplicate: true,
+      runId: "run-1",
+    });
+    expect(() => quiet.manager.receive(created.webhook.endpointId, created.secret, lead("pend-3", { task: "fresh" }))).toThrow(
+      "unfinished tasks",
+    );
+  });
+
+  it("remembers an accepted payload across a restart and a malformed identity does not wipe the file", () => {
+    const h = harness();
+    const { webhook, secret } = h.manager.create({ name: "Leads", prompt: "Qualify", botId: "maus-sales" });
+    h.manager.receive(webhook.endpointId, secret, lead("disk-1", { task: "persist" }));
+    h.manager.flushNow();
+    const reloaded = new WebhookManager(h.options);
+    expect(reloaded.receive(webhook.endpointId, secret, lead("disk-2", { task: "persist" }))).toMatchObject({
+      duplicate: true,
+      runId: "run-1",
+    });
+    expect(h.queued).toHaveLength(1);
+    reloaded.flushNow();
+    expect(new WebhookManager(h.options).payloadDedupeSkipCount()).toBe(1);
+
+    const disk = JSON.parse(readFileSync(h.file, "utf8"));
+    disk.deliveries[0].payloadDedupe = { bad: true };
+    disk.payloadDedupeSkips = "nope";
+    writeFileSync(h.file, JSON.stringify(disk));
+    const salvaged = new WebhookManager(h.options);
+    expect(salvaged.list()).toHaveLength(1);
+    expect(salvaged.payloadDedupeSkipCount()).toBe(0);
+    expect(salvaged.receive(webhook.endpointId, secret, lead("disk-3", { task: "persist" }))).toMatchObject({
+      duplicate: false,
+      runId: "run-2",
+    });
+  });
+
+  it("does not let a cancelled or failed run block the next copy", () => {
+    const h = harness();
+    const receipts = [
+      { id: "skip-1", status: "cancelled" },
+      { id: "run-ok" },
+    ];
+    const cancelled = new WebhookManager({
+      ...h.options,
+      enqueue: (input) => {
+        h.queued.push(input);
+        return receipts.shift()!;
+      },
+    });
+    const created = cancelled.create({ name: "Leads", prompt: "Qualify", botId: "maus-sales" });
+    expect(cancelled.receive(created.webhook.endpointId, created.secret, lead("c-1", { task: "same" })).runId).toBe("skip-1");
+    expect(cancelled.receive(created.webhook.endpointId, created.secret, lead("c-2", { task: "same" }))).toMatchObject({
+      duplicate: false,
+      runId: "run-ok",
+    });
+
+    const statuses = new Map<string, string>();
+    const failed = new WebhookManager({ ...h.options, runStatus: (runId) => statuses.get(runId) });
+    const hook = failed.create({ name: "Retry", prompt: "Qualify", botId: "maus-sales" });
+    const first = failed.receive(hook.webhook.endpointId, hook.secret, lead("f-1", { task: "again" }));
+    statuses.set(first.runId!, "running");
+    expect(failed.receive(hook.webhook.endpointId, hook.secret, lead("f-2", { task: "again" }))).toMatchObject({
+      duplicate: true,
+      runId: first.runId,
+    });
+    statuses.set(first.runId!, "failed");
+    expect(failed.receive(hook.webhook.endpointId, hook.secret, lead("f-3", { task: "again" }))).toMatchObject({
+      duplicate: false,
+    });
+    expect(failed.payloadDedupeSkipCount()).toBe(1);
+  });
+
+  it("keeps payloads that differ only by request id or webhook id, and a manual test does not arm the window", () => {
+    const h = harness();
+    const { webhook, secret } = h.manager.create({ name: "Leads", prompt: "Qualify", botId: "maus-sales" });
+    expect(h.manager.receive(webhook.endpointId, secret, lead("r-1", { requestId: "one", task: "review" })).runId).toBe("run-1");
+    expect(h.manager.receive(webhook.endpointId, secret, lead("r-2", { requestId: "two", task: "review" }))).toMatchObject({
+      duplicate: false,
+      runId: "run-2",
+    });
+    expect(h.manager.receive(webhook.endpointId, secret, lead("hook-1", { webhookId: "hook-a", task: "ping" })).runId).toBe("run-3");
+    expect(h.manager.receive(webhook.endpointId, secret, lead("hook-2", { webhookId: "hook-b", task: "ping" }))).toMatchObject({
+      duplicate: false,
+      runId: "run-4",
+    });
+
+    const firstTest = h.manager.test(webhook.id);
+    const secondTest = h.manager.test(webhook.id);
+    expect(firstTest).toMatchObject({ duplicate: false });
+    expect(secondTest).toMatchObject({ duplicate: false });
+    expect(firstTest?.runId).not.toBe(secondTest?.runId);
+
+    const testerBody = { event: "botfleet.test", message: "Test webhook delivery" };
+    expect(h.manager.receive(webhook.endpointId, secret, lead("after-test", testerBody, "botfleet.test"))).toMatchObject({
+      duplicate: false,
+      runId: "run-7",
+    });
+    expect(h.manager.receive(webhook.endpointId, secret, lead("after-test-again", testerBody, "botfleet.test"))).toMatchObject({
+      duplicate: true,
+      runId: "run-7",
+    });
+    expect(h.manager.test(webhook.id)).toMatchObject({ duplicate: false, runId: "run-8" });
+    expect(h.queued).toHaveLength(8);
   });
 });

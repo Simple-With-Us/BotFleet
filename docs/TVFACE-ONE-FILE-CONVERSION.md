@@ -10,11 +10,12 @@ The one-file player is wired.  `TVFaceAvatar` loads a pack from `public/tv-face/
 
 | File | Role |
 |---|---|
-| `tvface-default.webp` | Orange / default: `*` hold, `working` enter/hold/return, `speaking` hold |
-| `tvface-thinking.webp` | Orange thinking-focused three-part states |
-| `tvface-blue.webp` … `tvface-black.webp` | Color shells of the default frame layout (same ranges) |
+| `tvface-default.webp` | Orange / default expanded: `*`, working, speaking, listening, tools, computer, memory (enter/hold/return where art ships) under 2 MB |
+| `tvface-thinking.webp` | Orange denser pack used only for pure `thinking` |
+| `tvface-blue.webp` … `tvface-black.webp` | Thin color shells (`*`, working, speaking).  Expanded states fall back to multi-GIF until recolored |
 
-Orange and `default` share `tvface-default.webp`.  Thinking/working-class bot states on orange prefer `tvface-thinking.webp`.  Other colors use their color pack (wildcard covers unnamed states).
+Orange and `default` share `tvface-default.webp`.  Pure `thinking` on orange prefers `tvface-thinking.webp`.  Working / tools / computer / memory / listening on orange use the expanded default pack.  Other colors use their color pack for idle/working/speaking; thinking-class expanded states still use multi-GIF until shells are re-expanded.
+
 
 ## Demos Already On Main
 
@@ -37,3 +38,8 @@ Multi-GIF color skins under `public/tv-face/skins/{color}/` remain for desktop b
 ## Size budget (BF-2627)
 
 Every shipped pack under `public/tv-face/packs/` must stay under 2 MB.  Packs that were slightly over were re-encoded lossy at 256×256 (quality ~70) with the same frame count and AVAT ranges re-embedded.  Expanding to the full TVFACE_MANIFEST expression set still requires a Mac seat running `scripts/avatar-build.ts` against the multi-GIF art.
+
+
+## Expanded default (BF-2627)
+
+The default pack now embeds thinking / working / speaking / listening / tools / computer / memory ranges.  Build recipe: `python3 scripts/tv-face-expand-onefile-packs.py --skin public/tv-face/skins/default --out public/tv-face/packs/tvface-default.webp`.  Color shells still need a Mac recolor pass from the expanded frames.

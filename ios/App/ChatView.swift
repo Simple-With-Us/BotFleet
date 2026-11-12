@@ -261,6 +261,9 @@ struct ChatView: View {
     var body: some View {
         VStack(spacing: 0) {
             transcriptColumn
+            if case let .bot(bot) = current {
+                ContextMeterStrip(bot: bot, threadId: displayedThreadId, viewingOther: viewingOther)
+            }
             // While the Mac holds new work for an update, a message sent now
             // is saved and runs after the restart; this says so.
             UpdateHoldNotice()
@@ -565,6 +568,9 @@ struct ChatView: View {
                         // that appends the message, so there is never a beat
                         // where both are on screen.
                         liveRowView(live, after: items)
+                        if case let .bot(bot) = current {
+                            ContextNoteBanner(bot: bot, threadId: displayedThreadId, viewingOther: viewingOther)
+                        }
                     }
                     .padding(.horizontal, 16)
                     .padding(.vertical, 12)
@@ -814,6 +820,7 @@ struct ChatView: View {
                         HStack(spacing: 4) {
                             Image(systemName: "chevron.left")
                                 .font(.system(size: 17, weight: .semibold))
+                                .accessibilityHidden(true)
                             if unreadElsewhere > 0 {
                                 Text("\(unreadElsewhere)")
                                     .font(.footnote.weight(.semibold))
@@ -830,7 +837,8 @@ struct ChatView: View {
                     }
                     .buttonStyle(.plain)
                     .glassCapsule()
-                    .accessibilityLabel("Back")
+                    .accessibilityLabel(unreadElsewhere > 0 ? "Back, \(unreadElsewhere) unread" : "Back")
+                    .accessibilityHint("Returns to your chats")
                 } else {
                     Color.clear.frame(width: 44, height: 44)
                 }
@@ -846,6 +854,7 @@ struct ChatView: View {
                             animated: BotState.forChat(current, in: session.state).showsActivity
                         )
                         .providerBadge(for: current, avatarSize: 36)
+                        .accessibilityHidden(true)
                         VStack(alignment: .leading, spacing: 1) {
                             HStack(spacing: 6) {
                                 // The name is the one thing in this row that
@@ -919,6 +928,7 @@ struct ChatView: View {
                     Image(systemName: "eye")
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(Color.secondary)
+                        .accessibilityHidden(true)
                     Text(
                         "Viewing “\(viewedTask.title.isEmpty ? "Untitled Thread" : viewedTask.title)”\(loading ? " — loading…" : "")"
                     )
@@ -1400,6 +1410,7 @@ struct ChatView: View {
                 Image(systemName: "command")
                     .font(.system(size: 16, weight: .medium))
                     .foregroundStyle(Color.secondary)
+                    .accessibilityHidden(true)
                     .padding(.horizontal, 10)
                     .padding(.vertical, 6)
                     .background(Capsule().fill(Color.secondary.opacity(0.14)))
@@ -1504,6 +1515,7 @@ struct ChatView: View {
                             Image(systemName: "bubble.left")
                                 .font(.system(size: 13, weight: .medium))
                                 .foregroundStyle(Color.secondary)
+                                .accessibilityHidden(true)
                             Text(item.text)
                                 .font(.footnote)
                                 .lineLimit(1)
@@ -1619,6 +1631,7 @@ struct ChatView: View {
                         Image(systemName: "plus")
                             .font(.system(size: 20, weight: .medium))
                             .foregroundStyle(showingPlus ? Color(uiColor: .systemBackground) : Color.primary)
+                            .accessibilityHidden(true)
                             .rotationEffect(.degrees(showingPlus ? 45 : 0))
                             .frame(width: 44, height: 44)
                             .background(Circle().fill(showingPlus ? Color.primary : Color.clear))
@@ -1626,7 +1639,8 @@ struct ChatView: View {
                     }
                     .buttonStyle(.plain)
                     .glassCapsule()
-                    .accessibilityLabel(showingPlus ? "Close" : "More")
+                    .accessibilityLabel(showingPlus ? "Close" : "More Actions")
+                    .accessibilityHint(showingPlus ? "Closes actions" : "Opens actions for this chat")
 
                     ZStack(alignment: .topLeading) {
                         if draft.isEmpty {
@@ -1696,6 +1710,7 @@ struct ChatView: View {
             Image(systemName: dictation.isListening ? "mic.fill" : "mic")
                 .font(.system(size: 16, weight: .semibold))
                 .foregroundStyle(dictation.isListening ? Color.red : Color.secondary)
+                .accessibilityHidden(true)
                 .frame(width: 34, height: 34)
                 .background(
                     Circle().fill(dictation.isListening ? Color.red.opacity(0.18) : Color.clear)
@@ -1728,6 +1743,7 @@ struct ChatView: View {
             Image(systemName: "stop.fill")
                 .font(.system(size: 13, weight: .bold))
                 .foregroundStyle(Color(uiColor: .systemBackground))
+                .accessibilityHidden(true)
                 .frame(width: 34, height: 34)
                 .background(Circle().fill(Color(uiColor: .label)))
                 .contentShape(Circle())
@@ -1735,7 +1751,7 @@ struct ChatView: View {
         .buttonStyle(.plain)
         .frame(minWidth: 44, minHeight: 44)
         .contentShape(Rectangle())
-        .accessibilityLabel("Stop")
+        .accessibilityLabel("Stop This Turn")
         .accessibilityHint("Stops \(current.name)'s current turn")
     }
 
@@ -1745,6 +1761,7 @@ struct ChatView: View {
             Image(systemName: "arrow.up")
                 .font(.system(size: 15, weight: .bold))
                 .foregroundStyle(canSend ? Color.white : Color.secondary)
+                .accessibilityHidden(true)
                 .frame(width: 34, height: 34)
                 .background(
                     Circle().fill(canSend ? BubbleColor.mine : Color.secondary.opacity(0.18))
@@ -1771,6 +1788,7 @@ struct ChatView: View {
             }
         }
         .accessibilityLabel("Send")
+        .accessibilityHint("Sends your message")
     }
 
     /// What replaces the composer while the bot is Off (`shared/bot-power.ts`):
@@ -1797,6 +1815,7 @@ struct ChatView: View {
                 Image(systemName: "plus")
                     .font(.system(size: 17, weight: .semibold))
                     .foregroundStyle(Color.secondary)
+                    .accessibilityHidden(true)
                     .frame(width: 32, height: 32)
                     .background(Circle().fill(Color.secondary.opacity(0.14)))
                     .rotationEffect(.degrees(showingPlus ? 45 : 0))
@@ -1804,7 +1823,8 @@ struct ChatView: View {
                     .contentShape(Circle())
             }
             .buttonStyle(.plain)
-            .accessibilityLabel(showingPlus ? "Close" : "More")
+            .accessibilityLabel(showingPlus ? "Close" : "More Actions")
+            .accessibilityHint(showingPlus ? "Closes actions" : "Opens actions for this chat")
 
             Button {
                 Task { _ = await session.updateProfile(BotProfilePatch(off: false), for: bot) }
@@ -2051,6 +2071,22 @@ private struct PendingAttachmentGlyph: View {
     }
 }
 
+/// Applies a row label only when the row itself should be a VoiceOver stop.
+/// A system instruction keeps the label off so focus lands on the card.
+private struct OptionalAccessibilityLabel: ViewModifier {
+    let enabled: Bool
+    let label: String
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if enabled {
+            content.accessibilityLabel(label)
+        } else {
+            content
+        }
+    }
+}
+
 struct MessageRow: View {
     let chat: Chat
     let message: Message
@@ -2118,6 +2154,27 @@ struct MessageRow: View {
         return hasAudio
             || PersonalVoiceContract.isPersonalVoice(voice)
             || config?.canSpeak(agentVoice: voice) == true
+    }
+
+    /// An instruction card speaks for itself. A second label on the row would
+    /// land first and, for an older webhook stored as something you typed,
+    /// would say "You".
+    private var usesInstructionCard: Bool {
+        guard message.kind == .text else { return false }
+        if DelegationMessageView.parse(
+            message.text,
+            role: message.role,
+            fromName: message.from?.name,
+            automationSource: message.automationSource
+        ) != nil {
+            return true
+        }
+        if message.role == .system { return true }
+        if message.role == .user {
+            if WebhookMessageView.parse(message.text) != nil { return true }
+            if ImessageMessageView.parse(message.text) != nil { return true }
+        }
+        return false
     }
 
     /// Who this message reads as coming from, in the reader's own words.  The
@@ -2289,13 +2346,21 @@ struct MessageRow: View {
                 HStack(spacing: 8) {
                     Button {
                         Task { await session.switchVersion(to: versions[index - 1], for: bot) }
-                    } label: { Image(systemName: "chevron.left") }
+                    } label: {
+                        Image(systemName: "chevron.left")
+                            .accessibilityHidden(true)
+                    }
                     .disabled(index == 0 || bot.busy == true)
+                    .accessibilityLabel("Previous Version")
                     Text("\(index + 1) of \(versions.count)")
                     Button {
                         Task { await session.switchVersion(to: versions[index + 1], for: bot) }
-                    } label: { Image(systemName: "chevron.right") }
+                    } label: {
+                        Image(systemName: "chevron.right")
+                            .accessibilityHidden(true)
+                    }
                     .disabled(index + 1 >= versions.count || bot.busy == true)
+                    .accessibilityLabel("Next Version")
                 }
                 .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(Color.secondary)
@@ -2313,7 +2378,13 @@ struct MessageRow: View {
         // reaction chips and the version switcher into one blob of prose and
         // take every one of them out of the reach of VoiceOver.
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("\(accessibilitySender), \(accessibilityTime)")
+        // A system row is the instruction card. Naming the row as well puts an
+        // extra stop in front of that card, and the card is where the
+        // instruction itself is spoken.
+        .modifier(OptionalAccessibilityLabel(
+            enabled: !usesInstructionCard,
+            label: "\(accessibilitySender), \(accessibilityTime)"
+        ))
         .contextMenu {
             // `at` is epoch milliseconds on the wire, like every other timestamp
             // the harness sends; SwiftUI's time style wants a Date.
@@ -2418,13 +2489,14 @@ struct MessageRow: View {
                     subtitle: delegation.subtitle,
                     payload: delegation.payload,
                     systemImage: "arrow.triangle.branch",
-                    accessibilityName: delegation.headline
+                    accessibilityName: delegation.headline,
+                    spokenWhen: accessibilityTime
                 )
             } else if message.role == .system {
                 if let webhook = WebhookMessageView.parse(message.text) {
-                    WebhookEventCard(view: webhook)
+                    WebhookEventCard(view: webhook, spokenWhen: accessibilityTime)
                 } else if let imessage = ImessageMessageView.parse(message.text) {
-                    ImessageEventCard(view: imessage)
+                    ImessageEventCard(view: imessage, spokenWhen: accessibilityTime)
                 } else {
                     let body = message.text ?? ""
                     // Headline names what actually fired this — accurate per
@@ -2440,16 +2512,29 @@ struct MessageRow: View {
                         subtitle: first.isEmpty || first == "Scheduled Run" ? nil : String(first.prefix(80)),
                         payload: body.isEmpty ? nil : body,
                         systemImage: headline == "Resource Alert" ? "gauge.with.dots.needle.67percent" : "clock.arrow.2.circlepath",
-                        // Headline is already the specific "Scheduled Run" /
-                        // "Run Now" / "Resource Alert" label, so VoiceOver
-                        // should say that — not a generic "Automated Instruction".
-                        accessibilityName: headline
+                        // The headline names what fired. The card also speaks
+                        // the instruction's first line, not a generic badge.
+                        accessibilityName: headline,
+                        spokenWhen: accessibilityTime
                     )
                 }
             } else if message.role == .user, let webhook = WebhookMessageView.parse(message.text) {
-                WebhookEventCard(view: webhook)
+                WebhookEventCard(view: webhook, spokenWhen: accessibilityTime)
             } else if message.role == .user, let imessage = ImessageMessageView.parse(message.text) {
-                ImessageEventCard(view: imessage)
+                ImessageEventCard(view: imessage, spokenWhen: accessibilityTime)
+            } else if message.role == .user, message.command?.name == "compact" {
+                let transcript = session.state.visibleTranscript(forThread: tid)
+                let index = transcript.firstIndex { $0.id == message.id }
+                let settled = index.map { idx in
+                    transcript.dropFirst(idx + 1).contains { later in
+                        later.role == .bot && later.kind == .text && later.command?.name != "compact"
+                    }
+                } ?? false
+                Text(ContextMeterMath.compactCopy(settled: settled))
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 4)
             } else {
                 TextBubble(message: message, chat: chat, tailed: endsRun, showsSpeaker: startsRun)
             }
@@ -2686,6 +2771,7 @@ struct TextBubble: View {
 /// catches those.  That does not mean a person typed it.
 struct WebhookEventCard: View {
     let view: WebhookMessageView
+    var spokenWhen: String? = nil
 
     var body: some View {
         ChannelEventCard(
@@ -2693,7 +2779,8 @@ struct WebhookEventCard: View {
             subtitle: view.subtitle,
             payload: view.payload,
             systemImage: "bolt.horizontal.circle.fill",
-            accessibilityName: "Webhook"
+            accessibilityName: "Webhook",
+            spokenWhen: spokenWhen
         )
     }
 }
@@ -2701,6 +2788,7 @@ struct WebhookEventCard: View {
 /// Incoming iMessage as the same left-edge work card as a webhook trigger.
 struct ImessageEventCard: View {
     let view: ImessageMessageView
+    var spokenWhen: String? = nil
 
     var body: some View {
         ChannelEventCard(
@@ -2708,7 +2796,8 @@ struct ImessageEventCard: View {
             subtitle: view.subtitle,
             payload: view.payload,
             systemImage: "message.fill",
-            accessibilityName: "iMessage"
+            accessibilityName: "iMessage",
+            spokenWhen: spokenWhen
         )
     }
 }
@@ -2719,6 +2808,7 @@ struct ChannelEventCard: View {
     let payload: String?
     let systemImage: String
     let accessibilityName: String
+    var spokenWhen: String? = nil
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isExpanded = false
@@ -2726,6 +2816,12 @@ struct ChannelEventCard: View {
     var body: some View {
         let isDark = colorScheme == .dark
         let expandable = payload != nil
+        let spoken = ChatAccessibility.instructionCardLabel(
+            name: accessibilityName,
+            headline: headline,
+            subtitle: subtitle,
+            when: spokenWhen
+        )
         VStack(alignment: .leading, spacing: 0) {
             Group {
                 if expandable {
@@ -2738,8 +2834,12 @@ struct ChannelEventCard: View {
                         headerRow
                     }
                     .buttonStyle(.plain)
+                    .accessibilityLabel(spoken)
+                    .accessibilityHint(isExpanded ? "Hides the details" : "Shows the details")
                 } else {
                     headerRow
+                        .accessibilityElement(children: .combine)
+                        .accessibilityLabel(spoken)
                 }
             }
 
@@ -2770,10 +2870,6 @@ struct ChannelEventCard: View {
         .shadow(color: Color.black.opacity(isDark ? 0 : 0.04), radius: 0, y: 1)
         .frame(maxWidth: 580, alignment: .leading)
         .padding(.vertical, 2)
-        .accessibilityElement(children: .combine)
-        .accessibilityAddTraits(expandable ? .isButton : [])
-        .accessibilityLabel(accessibilityName == headline ? headline : "\(accessibilityName).  \(headline)")
-        .accessibilityHint(payload == nil ? "" : (isExpanded ? "Hides the details" : "Shows the details"))
     }
 
     private var headerRow: some View {
@@ -2786,6 +2882,7 @@ struct ChannelEventCard: View {
                 Image(systemName: systemImage)
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(Color.secondary)
+                    .accessibilityHidden(true)
             }
 
             VStack(alignment: .leading, spacing: 2) {
@@ -2813,6 +2910,7 @@ struct ChannelEventCard: View {
                     Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
                         .font(.system(size: 10, weight: .bold))
                         .foregroundStyle(Color.accentColor)
+                        .accessibilityHidden(true)
                 }
             }
         }

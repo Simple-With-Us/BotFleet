@@ -77,7 +77,11 @@ describe("webhook-only ingress", () => {
   it("exposes health but nothing from the main BotFleet API", async () => {
     const health = await fetch(`${ingress.baseUrl}/health`);
     expect(health.status).toBe(200);
-    expect(await health.json()).toEqual({ app: "botfleet-webhooks", ready: true });
+    expect(await health.json()).toEqual({
+      app: "botfleet-webhooks",
+      ready: true,
+      payloadDedupeSkips: manager.payloadDedupeSkipCount(),
+    });
     expect((await fetch(`${ingress.baseUrl}/api/bots`)).status).toBe(404);
   });
 
@@ -131,43 +135,57 @@ describe("webhook-only ingress", () => {
     const before = queued.length;
     // Header names and Request-ID shape were verified in the configured
     // internal app's failed-delivery log.  IDs and payload below are synthetic.
-    const send = (requestId: string, action: string) => fetch(credential.url, {
+    const send = (requestId: string, action: string, issueId = "fixture-issue") => fetch(credential.url, {
       method: "POST",
       headers: { "content-type": "application/json", "request-id": requestId, "sentry-hook-resource": "issue" },
-      body: JSON.stringify({ action, data: { issue: { id: "fixture-issue" } } }),
+      body: JSON.stringify({ action, data: { issue: { id: issueId } } }),
     });
     const first = await send("a".repeat(32), "resolved");
     expect(await first.json()).toMatchObject({ accepted: true, duplicate: false });
     expect(await (await send("a".repeat(32), "resolved")).json()).toMatchObject({ accepted: true, duplicate: true });
     expect(await (await send("b".repeat(32), "unresolved")).json()).toMatchObject({ accepted: true, duplicate: false });
-    expect(await (await send("c".repeat(32), "resolved")).json()).toMatchObject({ accepted: true, duplicate: false });
+    expect(await (await send("c".repeat(32), "resolved")).json()).toMatchObject({ accepted: true, duplicate: true });
+    expect(await (await send("d".repeat(32), "resolved", "other-issue")).json()).toMatchObject({ accepted: true, duplicate: false });
     expect(queued).toHaveLength(before + 3);
   });
 
   it("retains PagerDuty x-webhook-id precedence and does not treat generic request IDs as deliveries", async () => {
     const credential = webhookCredential(ingress.baseUrl, endpointId, secret);
     const before = queued.length;
-    const send = (headers: Record<string, string>) => fetch(credential.url, {
-      method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify({ event: { id: "pd-fixture" } }),
+    const send = (headers: Record<string, string>, eventId: string) => fetch(credential.url, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...headers },
+      body: JSON.stringify({ event: { id: eventId } }),
     });
-    expect(await (await send({ "x-webhook-id": "pd-delivery", "request-id": "d".repeat(32) })).json()).toMatchObject({ duplicate: false });
-    expect(await (await send({ "x-webhook-id": "pd-delivery", "request-id": "e".repeat(32) })).json()).toMatchObject({ duplicate: true });
-    expect(await (await send({ "request-id": "f".repeat(32) })).json()).toMatchObject({ duplicate: false });
-    expect(await (await send({ "request-id": "f".repeat(32) })).json()).toMatchObject({ duplicate: false });
+    expect(await (await send({ "x-webhook-id": "pd-delivery", "request-id": "d".repeat(32) }, "pd-1")).json()).toMatchObject({ duplicate: false });
+    expect(await (await send({ "x-webhook-id": "pd-delivery", "request-id": "e".repeat(32) }, "pd-2")).json()).toMatchObject({ duplicate: true });
+    expect(await (await send({ "request-id": "f".repeat(32) }, "pd-3")).json()).toMatchObject({ duplicate: false });
+    expect(await (await send({ "request-id": "f".repeat(32) }, "pd-4")).json()).toMatchObject({ duplicate: false });
     expect(queued).toHaveLength(before + 3);
   });
 
-  it("does not deduplicate separate requests that reuse a generic payload id", async () => {
+  it("keeps distinct events that share a generic payload id and drops a normalized duplicate", async () => {
     const credential = webhookCredential(ingress.baseUrl, endpointId, secret);
     const before = queued.length;
-    const send = () => fetch(credential.url, {
+    const skipsBefore = manager.payloadDedupeSkipCount();
+    const send = (task: string) => fetch(credential.url, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ id: "shared-record", task: "Handle this update" }),
+      body: JSON.stringify({ id: "shared-record", task }),
     });
-    expect((await send()).status).toBe(202);
-    expect((await send()).status).toBe(202);
+    expect((await send("Handle this update")).status).toBe(202);
+    expect((await send("Handle the other update")).status).toBe(202);
+    const duplicate = await send("Handle this update");
+    expect(duplicate.status).toBe(202);
+    expect(await duplicate.json()).toMatchObject({ duplicate: true, runId: expect.any(String) });
     expect(queued).toHaveLength(before + 2);
+    expect(manager.payloadDedupeSkipCount()).toBe(skipsBefore + 1);
+    const health = await fetch(`${ingress.baseUrl}/health`);
+    expect(await health.json()).toMatchObject({
+      app: "botfleet-webhooks",
+      ready: true,
+      payloadDedupeSkips: manager.payloadDedupeSkipCount(),
+    });
   });
 
   it("captures a verification event without queueing work", async () => {

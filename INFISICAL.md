@@ -87,6 +87,7 @@ The read is per seat, cached for 15 minutes, and happens in the BACKGROUND (`ser
 | `BOTFLEET_JOBS_MIN_FREE_DISK_MB` | jobs.admission.minFreeDiskMb | float | ≥ 0 |
 | `BOTFLEET_JOBS_MIN_FREE_INODES` | jobs.admission.minFreeInodes | integer | ≥ 0; unset by default, measured inventory required before selecting a floor |
 | `BOTFLEET_WEBHOOK_HOT_DEFER_MINUTES` | jobs.webhookHotDeferMinutes | int | 1–720 |
+| `BOTFLEET_WEBHOOK_PAYLOAD_DEDUPE_SECONDS` | jobs.webhookPayloadDedupeSeconds | int | 0–3600; absent means 120 seconds, and 0 disables |
 | `BOTFLEET_PLACEMENT_HEARTBEAT_SECONDS` | placement.heartbeatSeconds | int | 1–3600 |
 | `BOTFLEET_PLACEMENT_UNREACHABLE_AFTER_SECONDS` | placement.unreachableAfterSeconds | int | 16–86400; longer than the heartbeat period |
 | `BOTFLEET_TRACES_SAMPLE_RATE` | observability.tracesSampleRate | float | 0–1 |

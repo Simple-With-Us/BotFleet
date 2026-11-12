@@ -270,9 +270,7 @@ private struct CodeBlockView: View {
 
     private func codeScroll(_ source: String, showCaret: Bool) -> some View {
         ScrollView(.horizontal, showsIndicators: false) {
-            (Text(source) + streamingCaret(showCaret))
-                .font(.scaled(14, design: .monospaced, relativeTo: .footnote))
-                .textSelection(.enabled)
+            codeLine(source, showCaret: showCaret)
         }
     }
 }
@@ -431,9 +429,7 @@ private struct CodeBlockReader: View {
             VStack(alignment: .leading, spacing: 12) {
                 ScrollView {
                     ScrollView(.horizontal, showsIndicators: false) {
-                        Text(page.text)
-                            .font(.scaled(14, design: .monospaced, relativeTo: .footnote))
-                            .textSelection(.enabled)
+                        codeLine(page.text, showCaret: false)
                     }
                 }
                 Text(page.caption)
@@ -468,6 +464,22 @@ private struct CodeBlockReader: View {
     }
 }
 
+/// A fence line with its own label color.
+///
+/// Selectable text inside the horizontal scroller does not inherit the
+/// bubble's foreground style, so an unset color stays black and disappears
+/// on a dark bubble.  `Color.primary` is the semantic label, and it
+/// tracks Light, Dark, and Increase Contrast.
+private func codeLine(_ source: String, showCaret: Bool) -> some View {
+    (Text(source) + streamingCaret(showCaret))
+        .font(.scaled(14, design: .monospaced, relativeTo: .footnote))
+        .foregroundStyle(Color.primary)
+        .textSelection(.enabled)
+}
+
 private func streamingCaret(_ on: Bool) -> Text {
-    on ? Text("\u{2007}▍").foregroundStyle(Color.secondary) : Text("")
+    // Secondary label fades into the bubble and the fence fill.  The
+    // same label color as the reply stays readable in Light, Dark, and
+    // Increase Contrast.
+    on ? Text("\u{2007}▍").foregroundStyle(Color.primary) : Text("")
 }
