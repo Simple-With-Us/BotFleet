@@ -283,6 +283,9 @@ const legacySlugSourceSchema = z.object({
   routineId: z.string().catch(""),
   routineName: z.string().catch(""),
 });
+/** A stored monitor slug read from disk; anything that is not a string is
+ * treated as absent and re-derived from the legacy formula. */
+const storedMonitorSlugSchema = z.string().catch("");
 const isRoutineFile = (candidate: JsonValue): candidate is JsonValue & Partial<RoutineFile> =>
   routineFileSchema.safeParse(candidate).success;
 
@@ -654,7 +657,7 @@ export class RoutineManager {
     this.routines = rawRoutines.map((routine) => {
       const runOn = normalizeRunOn(routine.runOn);
       if ((routine as { runOn?: unknown }).runOn !== runOn) runOnMigrated = true;
-      const stored = typeof routine.sentryMonitorSlug === "string" ? routine.sentryMonitorSlug.trim().toLowerCase() : "";
+      const stored = storedMonitorSlugSchema.parse(routine.sentryMonitorSlug).trim().toLowerCase();
       const sentryMonitorSlug = isRoutineMonitorSlug(stored)
         ? stored
         : legacyRoutineMonitorSlug(legacySlugSourceSchema.parse({ routineId: routine.id, routineName: routine.name }));
@@ -695,6 +698,10 @@ export class RoutineManager {
       this.writesRefused = true;
       return;
     }
+    // Read the history as it sits on disk before any save: save() applies the
+    // run retention window, and a migration save would otherwise drop the
+    // old schedule runs that name the monitors this pass has to retire.
+    this.releaseStaleMonitors();
     if (runOnMigrated || slugMigrated) this.save();
     // A local process cannot still own these turns after a full restart.
     const recovered: RoutineRun[] = [];
@@ -739,7 +746,6 @@ export class RoutineManager {
         }
       }
     }
-    this.releaseStaleMonitors();
   }
 
   /** Retire monitors that would otherwise keep reporting a missed check-in
