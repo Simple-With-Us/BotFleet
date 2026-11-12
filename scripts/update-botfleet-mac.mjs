@@ -3242,6 +3242,9 @@ export function sealedResourceRules(plistXml) {
       if (hash2) rule.hash2 = hash2[1].replace(/\s+/g, "");
       if (hash) rule.hash = hash[1].replace(/\s+/g, "");
       if (symlink) rule.symlink = symlink[1];
+      // A nested bundle is sealed by its own signature.  The outer seal names
+      // the bundle (cdhash) and does not list the files inside it.
+      if (/<key>cdhash<\/key>/.test(dict) && !rule.hash2 && !rule.hash && rule.symlink === undefined) rule.nested = true;
     }
     rules.set(match[1], rule);
   }
@@ -3249,12 +3252,23 @@ export function sealedResourceRules(plistXml) {
   return rules;
 }
 
+const NESTED_BUNDLE = /^(.*?\.(?:app|framework|xpc|plugin|bundle|kext|appex))(?:\/|$)/;
+
+function coveredByNestedSeal(rules, resourcePath) {
+  const match = NESTED_BUNDLE.exec(resourcePath);
+  const root = match?.[1];
+  if (!root || root === resourcePath) return false;
+  return rules.get(root)?.nested === true;
+}
+
 export function classifyResourceDrift(rules, entries) {
   const findings = [];
   for (const entry of entries) {
     const rule = rules.get(entry.path);
     if (!rule) {
-      if (!isResourceNoise(entry.path)) findings.push({ path: entry.path, reason: "leftover" });
+      if (!isResourceNoise(entry.path) && !coveredByNestedSeal(rules, entry.path)) {
+        findings.push({ path: entry.path, reason: "leftover" });
+      }
       continue;
     }
     if (rule.symlink !== undefined) {

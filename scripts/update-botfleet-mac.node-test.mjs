@@ -3990,6 +3990,19 @@ test("status and recover accept no options, and a clean Resources tree is not dr
 
   await writeFile(join(app, "Contents", "Resources", "server", "note.txt"), "edited\n");
   await writeFile(join(app, "Contents", "Resources", "server", "extra.txt"), "leftover\n");
+  const helper = join(app, "Contents", "Resources", "BotFleet Recorder.app", "Contents", "MacOS");
+  await mkdir(helper, { recursive: true });
+  await writeFile(join(helper, "recorder-helper"), "helper\n");
+  const sealedHelper = await inspectInstalledResourceDrift(app);
+  assert.ok(sealedHelper.findings.some((item) => item.path.endsWith("recorder-helper") && item.reason === "leftover"));
+  const sealPath = join(app, "Contents", "_CodeSignature", "CodeResources");
+  const seal = await readFile(sealPath, "utf8");
+  await writeFile(sealPath, seal.replace(
+    "<key>files2</key><dict>",
+    "<key>files2</key><dict><key>Resources/BotFleet Recorder.app</key><dict><key>cdhash</key><data>qqqqqqqqqqqqqqqqqqqqqqqqqqq=</data></dict>",
+  ));
+  const nested = await inspectInstalledResourceDrift(app);
+  assert.ok(!nested.findings.some((item) => item.path.includes("BotFleet Recorder.app")), "a cdhash helper is not leftover drift");
   const dirty = await inspectInstalledResourceDrift(app);
   assert.deepEqual(dirty.findings.map((item) => item.reason), ["leftover", "modified"]);
   const updates = join(root, "updates");
