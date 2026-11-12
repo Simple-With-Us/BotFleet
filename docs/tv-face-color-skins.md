@@ -61,3 +61,17 @@ Skips truncated junk (`speaking_hold_preview.png`).
 4. Expand `SHIPPED_SKINS` in `TVFaceAvatar.tsx` to include each folder you fetched.
 
 The player, urgent cuts, and `transitionSpeed` land in code without the binary packs.
+
+## One-File Packs (Player Wiring)
+
+`TVFaceAvatar` prefers one-file WebPs under `public/tv-face/packs/` when
+`tvFaceOneFilePackUrl(color, state)` returns a URL.  The shared
+`AnimatedFileAvatar` player reads the embedded AVAT manifest.
+
+| Color | Pack |
+|-------|------|
+| orange / default | `tvface-default.webp` (thinking states: `tvface-thinking.webp`) |
+| blue … black | `tvface-<color>.webp` (same frame ranges as default) |
+
+Multi-GIF skins under `public/tv-face/skins/` remain as the fallback and for
+desktop bundles that only ship the default skin directory.

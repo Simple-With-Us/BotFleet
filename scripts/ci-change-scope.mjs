@@ -12,7 +12,11 @@ const ROOT_DOCUMENTS = new Set([
 const FULL_CI_DOCUMENTS = new Set(["docs/secrets.md"]);
 
 export function isDocumentationPath(path) {
-  return !FULL_CI_DOCUMENTS.has(path) && (ROOT_DOCUMENTS.has(path) || path.startsWith("docs/"));
+  const marketingMarkdown = path.startsWith("marketing/") && path.endsWith(".md");
+  return (
+    !FULL_CI_DOCUMENTS.has(path) &&
+    (ROOT_DOCUMENTS.has(path) || path.startsWith("docs/") || marketingMarkdown)
+  );
 }
 
 // Per-area path filters feeding the expensive jobs' own `if` gates (mirrors
@@ -23,16 +27,20 @@ export function isDocumentationPath(path) {
 // already tracks (scripts/prepare-*.mjs, scripts/package-*), so a change to
 // just the job's YAML wiring with no script change is rare and low-cost.
 export function isIosPath(path) {
-  // ci.yml is the only place the `ios` job is defined -- there is no
-  // separate ios-ci.yml the way packaging has package-linux.yml -- so a
-  // workflow edit here can change the job itself, not just build scripts.
+  // ci.yml is the only place the `ios` job is defined -- the mac packaging
+  // gate lives in its own workflow file -- so a workflow edit here can
+  // change the job itself, not just build scripts.
   // The required check replays this classifier and scripts/ci-ios-gate.mjs.
-  // Those two files are iOS paths so a change to the proof cannot take the
-  // skip path and approve itself.
+  // Those files are iOS paths so a change to the proof cannot take the skip
+  // path and approve itself.  scripts/ci-scope-diff.sh is the third one:  it
+  // computes the changed-path list every workflow now reads,  so a pull
+  // request that edits only the script could otherwise narrow its own scope
+  // and skip the build it was supposed to trigger.
   return (
     path === ".github/workflows/ci.yml" ||
     path === "scripts/ci-change-scope.mjs" ||
     path === "scripts/ci-ios-gate.mjs" ||
+    path === "scripts/ci-scope-diff.sh" ||
     path.startsWith("ios/") ||
     path.startsWith("scripts/ios-")
   );
@@ -44,6 +52,7 @@ export function isPackagingPath(path) {
     path === "package.json" ||
     path === "pnpm-lock.yaml" ||
     path.startsWith("electron/") ||
+    path.startsWith("native/") ||
     path.startsWith("third_party/") ||
     path.startsWith("scripts/prepare-") ||
     path.startsWith("scripts/package-")
@@ -51,10 +60,9 @@ export function isPackagingPath(path) {
 }
 
 /** The Mac pre-merge packaging gate (scripts/mac-package-gate.mjs) reuses
- * `isPackagingPath` and widens it.  Kept separate from `isPackagingPath` so the
- * Linux package job's existing scope in ci.yml is unchanged — widening a
- * predicate the running workflow already consumes is a behaviour change nobody
- * asked for, and this only needs to be additive.
+ * `isPackagingPath` and widens it.  Kept separate from `isPackagingPath` so a
+ * widening only affects the gate, never the ci.yml jobs that consume the
+ * shared classifier — this only needs to be additive.
  *
  * `mac-package-gate.yml` itself is intentionally absent.  Unlike `ios`, whose
  * job lives inside ci.yml so a workflow edit can change that job, this gate's
@@ -65,6 +73,7 @@ export function isPackagingPath(path) {
 export function isMacPackagingPath(path) {
   return (
     isPackagingPath(path) ||
+    path.startsWith("mac-control/") ||
     // The post-merge build this gate pre-empts.  Changing it changes what the
     // Mac updater consumes, so it deserves the same pre-merge proof.
     path === ".github/workflows/mac-commit-build.yml" ||

@@ -1,1 +1,1 @@
-Seat tag `[BF-DEPLOYER]`.  Deploy and CI lanes only; never merge with red checks.
+Seat tag `[BF-DEPLOYER]`.  Help address whatever blocks pull requests from merging (conflicts, stuck required checks, open review threads, nobody moving them), and do manual post-deploy work such as Cloudflare Worker and Coolify updates.  You may merge a clean pull request (required checks green, no open review threads), but never one labelled `do-not-merge` or `do-not-auto-merge`.  Never merge with red checks.

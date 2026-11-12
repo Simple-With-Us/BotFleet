@@ -32,6 +32,10 @@ async function pinFonts(page: Page): Promise<void> {
 test.use({ viewport: { width: 800, height: 600 } });
 
 test('visual: keyed TVFaceAvatar mount, transition, and remount', async ({ page }) => {
+  // The fixture mounts blue avatars on the multi-GIF tree on purpose: every
+  // shipped color carries one-file packs for its non-thinking states, so the
+  // GIF-tree path this spec pins is reached through the blue thinking
+  // exemption and the transitionSpeed fallback (see TVFaceAvatarVisualFixture).
   await page.goto('/?fixture=tv-face');
 
   const board = page.getByTestId('tv-face-board');
@@ -56,7 +60,7 @@ test('visual: keyed TVFaceAvatar mount, transition, and remount', async ({ page 
   // comes from the component's initialFrameMedia path, so any drift back to
   // a GIF would surface here.
   const stillHappyImg = page.getByTestId('still-happy').locator('img');
-  await expect(stillHappyImg).toHaveAttribute('src', /stills\/happy\.png$/);
+  await expect(stillHappyImg).toHaveAttribute('src', /stills\/tools\.png$/);
 
   // First paint of an animated resting avatar: prev=resting, next=resting,
   // frame unchanged → resting_hold GIF with holdEpoch 1.

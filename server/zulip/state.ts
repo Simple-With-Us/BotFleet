@@ -22,6 +22,7 @@ import { join } from "node:path";
 import { z } from "zod";
 
 import { writeFileAtomic } from "../atomic.ts";
+import { canonicalZulipRole } from "../launch-identity.ts";
 import type { ZulipWorkUnit } from "./types.ts";
 
 export const HANDLED_RING_LIMIT = 2000;
@@ -110,7 +111,9 @@ export class ZulipStateStore {
 
   /** The saved state for this bot, or a fresh one.  A state saved for a
    *  different role (the bot was re-mapped to another Zulip identity) starts
-   *  fresh: the old cursor and ring belong to someone else's mailbox. */
+   *  fresh: the old cursor and ring belong to someone else's mailbox.  The one
+   *  exception is a rename: a file whose canonical fold is this role keeps its
+   *  ledgers, relabelled, so the next save writes the canonical role. */
   load(botId: string, role: string): ZulipBotState {
     let text: string;
     try {
@@ -124,9 +127,13 @@ export class ZulipStateStore {
     } catch {
       return emptyState(role);
     }
-    if (!parsed.success || parsed.data.role !== role) return emptyState(role);
+    if (!parsed.success) return emptyState(role);
+    const savedRole = parsed.data.role;
+    if (savedRole !== role && canonicalZulipRole(savedRole) !== role) {
+      return emptyState(role);
+    }
     const { userId, dms, ...rest } = parsed.data;
-    const state: ZulipBotState = { ...rest, dms: dms ?? [] };
+    const state: ZulipBotState = { ...rest, role, dms: dms ?? [] };
     if (userId !== undefined) state.userId = userId;
     return state;
   }

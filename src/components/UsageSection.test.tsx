@@ -214,7 +214,7 @@ describe("ENGINE_PLAN_OPTIONS & findMatchingPreset", () => {
 
   it("does not claim to auto-detect subscription billing plans from quota windows", () => {
     const windows = [
-      { providerKey: "cursor", planName: "ultra", label: "Cursor Ultra" },
+      { providerKey: "cursor", planName: "ultra", label: "Cursor Ultra", planMetadata: { detectedPlanName: "Ultra", userPlanName: "My Pro", hasMismatch: true } },
       { providerKey: "anthropic", planName: "Max", label: "5-Hour" },
       { providerKey: "openai", planName: "plus", label: "ChatGPT Plus" },
       { providerKey: "xai", planName: "super", label: "xAI SuperGrok" },

@@ -107,6 +107,9 @@ const webhookResponse = z.object({
     verificationPending: z.boolean().optional(), verifiedAt: z.number().optional(),
     verificationSample: z.object({ receivedAt: z.number(), eventName: z.string().optional(), contentType: z.string().optional(), preview: z.string() }).strict().optional(),
     eventTypes: z.array(z.string()).optional(), minGapMinutes: z.number().optional(), oneShotWake: z.boolean().optional(),
+    actions: z.array(z.string()).optional(), requiredLabels: z.array(z.string()).optional(), conclusions: z.array(z.string()).optional(),
+    defaultBranchOnly: z.boolean().optional(), minSentryLevel: z.enum(["debug", "info", "warning", "error", "fatal"]).optional(),
+    excludeSentryProjects: z.array(z.string()).optional(), pagerdutyUrgency: z.enum(["high", "low"]).optional(),
     mergedPullRequestsOnly: z.boolean().optional(), ignoredCount: z.number().optional(), lastIgnoredAt: z.number().optional(),
   }).strict(),
 }).strict();
@@ -1044,7 +1047,7 @@ export function RoutinesPage() {
         <div style={noDragStyle} className="flex flex-wrap items-start justify-between gap-3">
           <div>
             <div className="flex items-center gap-2.5">{section === "calendar" ? <CalendarDays size={21} className="text-accent" /> : section === "resources" ? <Gauge size={21} className="text-accent" /> : <Webhook size={21} className="text-accent" />}<h1 className="text-[20px] font-semibold tracking-tight text-ink">Tasks &amp; Routines</h1></div>
-            <p className="mt-1 text-[12.5px] text-ink-secondary">{section === "calendar" ? "Routines start fresh bot tasks on a schedule." : section === "resources" ? "Resource triggers start a bot when disk, RAM, or CPU crosses a threshold." : "Webhooks start fresh bot tasks when an event arrives."}</p>
+            <p className="mt-1 text-[12.5px] text-ink-secondary">{section === "calendar" ? "Routines start fresh bot tasks on a schedule." : section === "resources" ? "Resource triggers start a bot when disk, memory, or processor use crosses a line." : "Webhooks start fresh bot tasks when an event arrives."}</p>
           </div>
           <div style={noDragStyle} className="flex items-center gap-2">
             {running > 0 && <span className="flex items-center gap-1.5 rounded-full border border-accent/25 bg-accent/10 px-2.5 py-1.5 text-[11px] text-accent"><Loader2 size={12} className="animate-spin" />{running} active</span>}
@@ -1068,18 +1071,18 @@ export function RoutinesPage() {
         </div>
         <div className="mt-3 rounded-xl border border-hairline/45 bg-panel/70 px-3.5 py-2.5 text-[11.5px] leading-relaxed text-ink-secondary">
           {section === "calendar" ? (
-            <><strong className="font-medium text-ink">Task</strong> = one conversation and result. <strong className="font-medium text-ink">Routine</strong> = a reusable schedule. Later runs of the same routine continue the previous task thread, using that bot's model, tools, permissions, computer, and connected apps.</>
+            <><strong className="font-medium text-ink">Task</strong> = one conversation and result.{'\u00A0 '}<strong className="font-medium text-ink">Routine</strong> = a reusable schedule.{'\u00A0 '}Later runs of the same routine continue the previous task thread, using that bot's model, tools, permissions, computer, and connected apps.</>
           ) : section === "resources" ? (
-            <><strong className="font-medium text-ink">Resource trigger</strong> = a local disk, RAM/swap, or CPU threshold that creates a fresh task. BotFleet must be running to sample this computer. A Mac launchd watch can also POST the Housekeeper webhook if you want coverage while the app is closed.</>
+            <><strong className="font-medium text-ink">Resource trigger</strong> = a disk, memory, or processor limit that starts a fresh task.{'\u00A0 '}BotFleet has to be open to watch this computer.</>
           ) : (
             <><strong className="font-medium text-ink">Webhook</strong> = an event endpoint that creates a fresh task. Connected services can call it when something happens; the receiving bot keeps its existing tools and permissions.</>
           )}
         </div>
         {section === "calendar" && <div style={noDragStyle} className="mt-3 flex flex-wrap items-center gap-2">
           <div className="flex items-center rounded-xl border border-hairline/50 bg-panel p-0.5">
-            <button onClick={() => move(-1)} className="rounded-lg p-2 text-ink-secondary hover:bg-raised hover:text-ink" aria-label="Previous Dates"><ChevronLeft size={16} /></button>
+            <button onClick={() => move(-1)} className="inline-flex size-11 items-center justify-center rounded-lg text-ink-secondary hover:bg-raised hover:text-ink" aria-label="Previous Dates"><ChevronLeft size={18} /></button>
             <button onClick={goToday} className="px-2.5 py-1.5 text-[12px] font-medium text-ink hover:text-accent">Today</button>
-            <button onClick={() => move(1)} className="rounded-lg p-2 text-ink-secondary hover:bg-raised hover:text-ink" aria-label="Next Dates"><ChevronRight size={16} /></button>
+            <button onClick={() => move(1)} className="inline-flex size-11 items-center justify-center rounded-lg text-ink-secondary hover:bg-raised hover:text-ink" aria-label="Next Dates"><ChevronRight size={18} /></button>
           </div>
           <div className="min-w-[190px] px-2 text-[14px] font-semibold text-ink">
             {new Intl.DateTimeFormat(undefined, { timeZone: CENTRAL_TIME_ZONE, month: "long", year: "numeric" }).format(rangeStart)}
@@ -1089,8 +1092,8 @@ export function RoutinesPage() {
             <option value="all">All bots</option>
             {visibleBots.map((bot) => <option key={bot.id} value={bot.id}>{bot.name}</option>)}
           </select>
-          <div className="ml-auto flex rounded-xl bg-panel p-1">
-            {([1, 3, 7] as const).map((days) => <button key={days} onClick={() => { setViewDays(days); setAnchor(days === 7 ? startOfWeek(anchor) : startOfDay(anchor)); }} className={cn("rounded-lg px-3 py-1.5 text-[11px] font-medium", viewDays === days ? "bg-raised text-ink shadow" : "text-ink-secondary hover:text-ink")}>{days === 1 ? "Day" : days === 3 ? "3 Days" : "Week"}</button>)}
+          <div className="flex w-full rounded-xl bg-panel p-1 sm:ml-auto sm:w-auto">
+            {([1, 3, 7] as const).map((days) => <button key={days} onClick={() => { setViewDays(days); setAnchor(days === 7 ? startOfWeek(anchor) : startOfDay(anchor)); }} className={cn("min-h-11 flex-1 rounded-lg px-3 py-1.5 text-[12px] font-medium sm:flex-none", viewDays === days ? "bg-raised text-ink shadow" : "text-ink-secondary hover:text-ink")}>{days === 1 ? "Day" : days === 3 ? "3 Days" : "Week"}</button>)}
           </div>
         </div>}
       </header>
@@ -1106,7 +1109,7 @@ export function RoutinesPage() {
               {visibleBots.slice(0, 3).map((bot, index) => <div key={bot.id} className="-ml-3 first:ml-0" style={{ transform: `translateY(${Math.abs(index - 1) * 9}px) rotate(${(index - 1) * 5}deg)` }}><BotAvatar bot={bot} state={index === 1 ? "excited" : stateForBot(bot)} size={84} /></div>)}
               {visibleBots.length === 0 && <CalendarClock size={58} className="text-ink-secondary/40" />}
             </div>
-            <h2 className="text-[18px] font-semibold text-ink">Put your bot fleet on a rhythm</h2>
+            <h2 className="text-[18px] font-semibold text-ink">Put Your Bot Fleet on a Rhythm</h2>
             <p className="mt-2 text-[13px] leading-relaxed text-ink-secondary">Plan research briefs, daily check-ins, recurring reviews, or one-time work.{"\u00a0 "}Every run becomes a separate task with its own result.</p>
             <button onClick={() => setEditor("new")} disabled={visibleBots.length === 0} className="mt-5 inline-flex items-center gap-2 rounded-xl bg-accent px-4 py-2.5 text-[13px] font-medium text-white hover:brightness-110 disabled:opacity-40"><Plus size={15} />Create Your First Routine</button>
             {visibleBots.length === 0 && <p className="mt-3 text-[12px] text-warning">Create a bot first, then come back to schedule it.</p>}

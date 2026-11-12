@@ -1,12 +1,12 @@
 // Voice synthesis is billed by characters, not model tokens. Keep this
 // separate from model-token usage and record only successful syntheses.
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { telemetry } from "../telemetry.ts";
+import { dataDir } from "../data-dir.ts";
 
-const usageFile = () => join(process.env.OMB_DATA_DIR ?? join(homedir(), ".botfleet"), "tts-usage.jsonl");
+const usageFile = () => join(dataDir(), "tts-usage.jsonl");
 export type SpeechProvider = "minimax" | "elevenlabs" | "xai" | "azure";
 export interface SpeechUsage { at: number; provider: SpeechProvider; characters: number; source: "provider" | "submitted" }
 
