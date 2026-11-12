@@ -59,6 +59,16 @@ describe("the transcript row a tool step becomes", () => {
     expect(row.ok).toBe(true);
   });
 
+  it("keeps a lifecycle tool failed when its output says it completed with errors", () => {
+    const started = startedToolRow({ title: "hookRun: inProgress", itemId: "hk-1" }, undefined);
+    const row = completedToolRow(
+      started,
+      { ok: true, title: "hookRun: completed", detail: "completed with errors" },
+      8,
+    );
+    expect(row.ok).toBe(false);
+  });
+
   it("redacts secret-shaped terminal titles before they replace a stored row", () => {
     const secret = "ak9999999999999999999999999999999";
     const row = completedToolRow(

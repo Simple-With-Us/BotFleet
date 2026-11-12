@@ -1001,6 +1001,38 @@ function handle(rawMsg: unknown, resumed = false) {
         complete();
         return;
       }
+      if (mode === "lifecycle-completed-with-errors") {
+        const callId = "lifecycle-completed-with-errors-1";
+        const output = [{ type: "content", content: { type: "text", text: "Hook run completed with errors" } }];
+        out({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            update: {
+              sessionUpdate: "tool_call",
+              toolCallId: callId,
+              title: "hookRun: inProgress",
+              kind: "other",
+              rawInput: { hook: "Run" },
+            },
+          },
+        });
+        out({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            update: {
+              sessionUpdate: "tool_call_update",
+              toolCallId: callId,
+              status: "completed",
+              title: "hookRun: completed",
+              content: output,
+            },
+          },
+        });
+        complete();
+        return;
+      }
       if (mode === "lifecycle-failed-done") {
         const callId = "lifecycle-failed-done-1";
         const output = [{ type: "content", content: { type: "text", text: "Reminder child session main run completed." } }];

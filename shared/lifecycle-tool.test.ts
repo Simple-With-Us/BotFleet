@@ -23,6 +23,18 @@ describe("lifecycle tool completion normalization", () => {
     expect(reconcileLifecycleToolOk(false, "hookRun: completed", "2 errors")).toBe(false);
   });
 
+  it("does not treat text that says completed with errors as done", () => {
+    expect(lifecycleTextSaysCompleted("completed with errors", "hookRun: completed")).toBe(false);
+    expect(lifecycleTextSaysCompleted("Hook run completed with errors", "hookRun: completed")).toBe(false);
+    expect(reconcileLifecycleToolOk(true, "hookRun: completed", "completed with errors")).toBe(false);
+    expect(reconcileLifecycleToolOk(true, "hookRun: completed", "completed with 2 errors")).toBe(false);
+    expect(reconcileLifecycleToolOk(true, "workflow", "finished with failures")).toBe(false);
+    expect(reconcileLifecycleToolOk(true, "hookRun: failed", "completed with errors")).toBe(false);
+    expect(reconcileLifecycleToolOk(false, "hookRun: completed with errors", "Reminder child session main run completed.")).toBe(false);
+    expect(reconcileLifecycleToolOk(true, "hookRun: completed", "hook ran")).toBe(true);
+    expect(reconcileLifecycleToolOk(true, "Bash", "completed with errors")).toBe(true);
+  });
+
   it("does not upgrade a non-lifecycle tool that mentions completed", () => {
     expect(reconcileLifecycleToolOk(false, "Bash", "command completed with exit 1")).toBe(false);
     expect(reconcileLifecycleToolOk(false, "Read", "finished reading file")).toBe(false);
