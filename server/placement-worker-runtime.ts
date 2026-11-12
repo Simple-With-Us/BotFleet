@@ -87,8 +87,14 @@ export interface PlacementWorkerRuntimeDeps {
   spawnJob: (job: { jobId: string; leaseId: string; command: string; cwd?: string; timeoutMs?: number }) => Promise<WorkerSpawnResult>;
   stopJob: (jobId: string, signal?: NodeJS.Signals) => Promise<void>;
   isProcessAlive?: (pid: number) => boolean;
+  /** Exit of a child that outlived the previous process. Without it, a later death is reported lost. */
+  watchProcess?: (pid: number) => Promise<{ exitCode: number | null; signal: NodeJS.Signals | null }>;
   now?: () => number;
   heartbeatIntervalMs?: number;
+  /** Idle assignment pull. Defaults to the heartbeat interval. */
+  assignmentPollIntervalMs?: number;
+  /** How often an adopted pid is checked when `watchProcess` is omitted. */
+  adoptedPollIntervalMs?: number;
   runningCap?: number;
 }
 
@@ -106,6 +112,9 @@ export class PlacementWorkerRuntime {
   private readonly now: () => number;
   private readonly isAlive: (pid: number) => boolean;
   private heartbeatTimer?: NodeJS.Timeout;
+  private assignmentTimer?: NodeJS.Timeout;
+  private pullTail: Promise<void> = Promise.resolve();
+  private draining = false;
   private registered = false;
   private running = false;
 
@@ -160,6 +169,125 @@ export class PlacementWorkerRuntime {
     }
   }
 
+  private spoolTerminal(
+    record: WorkerLocalLeaseRecord,
+    fields: { status: ReportMessage["status"]; exitCode: number | null; signal: string | null; reason?: string },
+  ): void {
+    const report: ReportMessage = {
+      version: PLACEMENT_WIRE_VERSION,
+      controllerId: record.controllerId,
+      epoch: record.epoch,
+      jobId: record.jobId,
+      leaseId: record.leaseId,
+      hostId: this.deps.hostId,
+      status: fields.status,
+      exitCode: fields.exitCode,
+      signal: fields.signal,
+      endedAt: this.now(),
+      reason: fields.reason,
+    };
+    try {
+      this.deps.spool.add(report);
+    } catch {
+      // A different terminal report is already durable.
+    }
+  }
+
+  private enqueuePull<T>(work: () => Promise<T>): Promise<T> {
+    const run = this.pullTail.then(work, work);
+    this.pullTail = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  /** Pull until the controller has nothing eligible or this worker cannot take more. */
+  private async drainAssignments(): Promise<void> {
+    if (this.draining || !this.running) return;
+    this.draining = true;
+    try {
+      while (this.running) {
+        const result = await this.enqueuePull(() => this.pullOne());
+        if (!result.keepPulling) return;
+      }
+    } catch {
+      // The next poll interval retries a thrown call so the worker does not stay idle.
+    } finally {
+      this.draining = false;
+    }
+  }
+
+  private adoptLiveLease(record: WorkerLocalLeaseRecord): void {
+    if (record.pid == null || this.activeJobs.has(record.jobId)) return;
+    this.trackJob(record, this.observePid(record.pid));
+  }
+
+  private observePid(pid: number): Promise<{ exitCode: number | null; signal: NodeJS.Signals | null; observed: boolean }> {
+    const watch = this.deps.watchProcess;
+    if (!watch) return this.pollUntilExit(pid);
+    return watch(pid).then(
+      (exit) => ({ exitCode: exit.exitCode, signal: exit.signal, observed: true }),
+      () => ({ exitCode: null, signal: null, observed: false }),
+    );
+  }
+
+  private pollUntilExit(pid: number): Promise<{ exitCode: number | null; signal: NodeJS.Signals | null; observed: boolean }> {
+    const intervalMs = this.deps.adoptedPollIntervalMs ?? 1000;
+    return new Promise((resolve) => {
+      const timer = setInterval(() => {
+        if (this.isAlive(pid)) return;
+        clearInterval(timer);
+        resolve({ exitCode: null, signal: null, observed: false });
+      }, intervalMs);
+      timer.unref();
+    });
+  }
+
+  private trackJob(
+    record: WorkerLocalLeaseRecord,
+    done: Promise<{ exitCode: number | null; signal: NodeJS.Signals | null; observed: boolean }>,
+  ): void {
+    let resolveSettled!: () => void;
+    const settled = new Promise<void>((resolve) => {
+      resolveSettled = resolve;
+    });
+    const activeJob: ActiveRunningJob = {
+      record,
+      done: done.then(({ exitCode, signal }) => ({ exitCode, signal })),
+      settled,
+    };
+    this.activeJobs.set(record.jobId, activeJob);
+    void done.then(async (exit) => {
+      try {
+        await this.finishJob(record, activeJob, exit);
+      } finally {
+        resolveSettled();
+      }
+    });
+  }
+
+  private async finishJob(
+    record: WorkerLocalLeaseRecord,
+    activeJob: ActiveRunningJob,
+    exit: { exitCode: number | null; signal: NodeJS.Signals | null; observed: boolean },
+  ): Promise<void> {
+    this.activeJobs.delete(record.jobId);
+    const status = activeJob.stopRequested
+      ? "killed"
+      : !exit.observed
+        ? "lost"
+        : exit.exitCode === 0
+          ? "completed"
+          : "failed";
+    const reason = activeJob.stopRequested
+      ? "stopped by controller"
+      : !exit.observed
+        ? "adopted process exited without an observed status"
+        : undefined;
+    this.spoolTerminal(record, { status, exitCode: exit.exitCode, signal: exit.signal, reason });
+    this.removeLeaseRecord(record.jobId);
+    await settlePendingReports(this.deps.spool, this.deps.client);
+    if (this.running) void this.drainAssignments();
+  }
+
   /**
    * Reconciles orphan leases from previous crashes and flushes the report spool.
    * Runs before registration on startup.
@@ -174,25 +302,15 @@ export class PlacementWorkerRuntime {
       const alive = record.pid ? this.isAlive(record.pid) : false;
       if (!alive) {
         // Process is dead; mark as lost and spool report.
-        const report: ReportMessage = {
-          version: PLACEMENT_WIRE_VERSION,
-          controllerId: record.controllerId,
-          epoch: record.epoch,
-          jobId: record.jobId,
-          leaseId: record.leaseId,
-          hostId: this.deps.hostId,
+        this.spoolTerminal(record, {
           status: "lost",
           exitCode: null,
           signal: null,
-          endedAt: this.now(),
           reason: "worker process restarted while lease was active",
-        };
-        try {
-          this.deps.spool.add(report);
-        } catch {
-          // If a different terminal report is already durable, keep that one.
-        }
+        });
         stored.delete(jobId);
+      } else {
+        this.adoptLiveLease(record);
       }
     }
     this.writeStoredLeases(stored);
@@ -243,25 +361,30 @@ export class PlacementWorkerRuntime {
    * If work is returned, records lease locally, spawns process, and monitors exit.
    */
   async pullAssignment(): Promise<{ polled: boolean; jobId?: string }> {
+    const result = await this.enqueuePull(() => this.pullOne());
+    return { polled: result.polled, jobId: result.jobId };
+  }
+
+  private async pullOne(): Promise<{ polled: boolean; jobId?: string; keepPulling: boolean }> {
     const admission = this.deps.admissionProvider();
     if (!admission.admit) {
-      return { polled: false };
+      return { polled: false, keepPulling: false };
     }
     const cap = this.deps.runningCap ?? 10;
     if (this.activeJobs.size >= cap) {
-      return { polled: false };
+      return { polled: false, keepPulling: false };
     }
 
     const outcome = await this.deps.client.assignment();
     if (outcome.outcome !== "accepted" || outcome.reply.accepted !== true) {
-      return { polled: true };
+      return { polled: true, keepPulling: false };
     }
 
     const lease = outcome.reply.lease;
     // Fetch command payload from controller.
     const payloadOutcome = await this.deps.client.payload({ jobId: lease.jobId, leaseId: lease.leaseId });
     if (payloadOutcome.outcome !== "accepted" || !payloadOutcome.reply.command) {
-      return { polled: true };
+      return { polled: true, keepPulling: false };
     }
 
     const { command, cwd, timeoutMs } = payloadOutcome.reply;
@@ -307,64 +430,13 @@ export class PlacementWorkerRuntime {
       this.deps.spool.add(report);
       this.removeLeaseRecord(lease.jobId);
       await settlePendingReports(this.deps.spool, this.deps.client);
-      return { polled: true, jobId: lease.jobId };
+      return { polled: true, jobId: lease.jobId, keepPulling: false };
     }
 
     record.pid = spawnResult.pid;
     this.saveLeaseRecord(record);
-
-    let resolveSettled!: () => void;
-    const settledPromise = new Promise<void>((resolve) => {
-      resolveSettled = resolve;
-    });
-
-    const activeJob: ActiveRunningJob = {
-      record,
-      done: spawnResult.done,
-      settled: settledPromise,
-    };
-    this.activeJobs.set(lease.jobId, activeJob);
-
-    // Attach completion listener.
-    void spawnResult.done.then(async ({ exitCode, signal }) => {
-      try {
-        this.activeJobs.delete(lease.jobId);
-        const status = activeJob.stopRequested
-          ? "killed"
-          : (exitCode === 0 ? "completed" : "failed");
-
-        const report: ReportMessage = {
-          version: PLACEMENT_WIRE_VERSION,
-          controllerId: lease.controllerId,
-          epoch: lease.epoch,
-          jobId: lease.jobId,
-          leaseId: lease.leaseId,
-          hostId: this.deps.hostId,
-          status,
-          exitCode,
-          signal,
-          endedAt: this.now(),
-          reason: activeJob.stopRequested ? "stopped by controller" : undefined,
-        };
-
-        try {
-          this.deps.spool.add(report);
-        } catch {
-          // Report already durable.
-        }
-        this.removeLeaseRecord(lease.jobId);
-        await settlePendingReports(this.deps.spool, this.deps.client);
-
-        // Trigger next work pull if running.
-        if (this.running) {
-          void this.pullAssignment();
-        }
-      } finally {
-        resolveSettled();
-      }
-    });
-
-    return { polled: true, jobId: lease.jobId };
+    this.trackJob(record, spawnResult.done.then((exit) => ({ ...exit, observed: true })));
+    return { polled: true, jobId: lease.jobId, keepPulling: true };
   }
 
   getActiveJob(jobId: string): ActiveRunningJob | undefined {
@@ -391,8 +463,12 @@ export class PlacementWorkerRuntime {
     }, interval);
     this.heartbeatTimer.unref();
 
-    // Pull initial work if capacity allows.
-    void this.pullAssignment();
+    const pollInterval = this.deps.assignmentPollIntervalMs ?? interval;
+    this.assignmentTimer = setInterval(() => {
+      void this.drainAssignments();
+    }, pollInterval);
+    this.assignmentTimer.unref();
+    void this.drainAssignments();
   }
 
   /** Stop background loops and flush remaining state. */
@@ -401,6 +477,10 @@ export class PlacementWorkerRuntime {
     if (this.heartbeatTimer) {
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = undefined;
+    }
+    if (this.assignmentTimer) {
+      clearInterval(this.assignmentTimer);
+      this.assignmentTimer = undefined;
     }
     await settlePendingReports(this.deps.spool, this.deps.client);
   }

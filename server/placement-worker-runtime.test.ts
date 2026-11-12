@@ -278,4 +278,171 @@ describe("PlacementWorkerRuntime", () => {
     const remaining = JSON.parse(readFileSync(leaseFile, "utf8"));
     expect(remaining["job-orphan"]).toBeUndefined();
   });
+
+  it("pulls again after an empty queue or a refused admission", async () => {
+    const { dir, spool, mockClient, now } = fixtureEnv();
+    let admit = false;
+    const runtime = new PlacementWorkerRuntime({
+      client: mockClient,
+      spool,
+      hostId: workerId,
+      capabilities: ["shell"],
+      dataDir: dir,
+      sampleProvider: () => sample,
+      admissionProvider: () => ({ admit }),
+      spawnJob: vi.fn(async () => ({
+        pid: 2222,
+        done: new Promise<{ exitCode: number | null; signal: NodeJS.Signals | null }>(() => undefined),
+      })),
+      stopJob: vi.fn(),
+      now,
+      heartbeatIntervalMs: 60_000,
+      assignmentPollIntervalMs: 30,
+    });
+
+    try {
+      await runtime.start();
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      expect(mockClient.assignment).not.toHaveBeenCalled();
+
+      admit = true;
+      await vi.waitFor(() => expect(mockClient.assignment.mock.calls.length).toBeGreaterThan(0));
+      expect(runtime.getActiveJobs().size).toBe(0);
+
+      const callsAfterEmpty = mockClient.assignment.mock.calls.length;
+      mockClient.assignment.mockResolvedValueOnce({
+        outcome: "accepted",
+        reply: {
+          controllerId, epoch: 1, accepted: true,
+          lease: { controllerId, epoch: 1, leaseId: "lease-later", jobId: "job-later", host: workerId },
+        },
+      });
+      await vi.waitFor(() => expect(runtime.getActiveJobs().has("job-later")).toBe(true));
+      expect(mockClient.assignment.mock.calls.length).toBeGreaterThan(callsAfterEmpty);
+
+      await runtime.stop();
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      const callsAtStop = mockClient.assignment.mock.calls.length;
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      expect(mockClient.assignment.mock.calls.length).toBe(callsAtStop);
+    } finally {
+      await runtime.stop();
+    }
+  });
+
+  it("adopts a surviving process, heartbeats its lease, and settles the observed exit", async () => {
+    const { dir, spool, mockClient, now } = fixtureEnv();
+    const leaseFile = join(dir, "placement", "worker-leases.json");
+    mkdirSync(join(dir, "placement"), { recursive: true });
+    writeFileSync(leaseFile, JSON.stringify({
+      "job-live": {
+        jobId: "job-live",
+        leaseId: "lease-live",
+        controllerId,
+        epoch: 1,
+        command: "run-something",
+        spawnedAt: 500,
+        pid: 4242,
+      },
+    }), "utf8");
+
+    let finishWatch: ((exit: { exitCode: number | null; signal: NodeJS.Signals | null }) => void) | undefined;
+    const watched = new Promise<{ exitCode: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+      finishWatch = resolve;
+    });
+    const stopped: string[] = [];
+
+    const runtime = new PlacementWorkerRuntime({
+      client: mockClient,
+      spool,
+      hostId: workerId,
+      capabilities: ["shell"],
+      dataDir: dir,
+      sampleProvider: () => sample,
+      admissionProvider: () => ({ admit: true }),
+      spawnJob: vi.fn(),
+      stopJob: vi.fn(async (id) => {
+        stopped.push(id);
+        finishWatch?.({ exitCode: null, signal: "SIGTERM" });
+      }),
+      isProcessAlive: () => true,
+      watchProcess: (pid) => {
+        expect(pid).toBe(4242);
+        return watched;
+      },
+      now,
+    });
+
+    await runtime.reconcileRestart();
+    expect(runtime.getActiveJobs().has("job-live")).toBe(true);
+    expect(JSON.parse(readFileSync(leaseFile, "utf8"))["job-live"]).toBeDefined();
+
+    mockClient.heartbeat.mockResolvedValueOnce({
+      outcome: "accepted",
+      reply: { controllerId, epoch: 1, pendingStops: ["job-live"] },
+    });
+    await runtime.tickHeartbeat();
+    expect(mockClient.heartbeat).toHaveBeenCalledWith(expect.objectContaining({
+      leases: ["lease-live"],
+    }));
+    expect(mockClient.stopReceipt).toHaveBeenCalledWith({ jobId: "job-live", leaseId: "lease-live" });
+    expect(stopped).toEqual(["job-live"]);
+
+    await runtime.waitForJob("job-live");
+    expect(runtime.getActiveJobs().has("job-live")).toBe(false);
+    expect(mockClient.report).toHaveBeenCalledWith(expect.objectContaining({
+      jobId: "job-live",
+      leaseId: "lease-live",
+      status: "killed",
+      signal: "SIGTERM",
+    }));
+    expect(JSON.parse(readFileSync(leaseFile, "utf8"))["job-live"]).toBeUndefined();
+  });
+
+  it("reports an adopted process as lost when its exit status was not observed", async () => {
+    const { dir, spool, mockClient, now } = fixtureEnv();
+    const leaseFile = join(dir, "placement", "worker-leases.json");
+    mkdirSync(join(dir, "placement"), { recursive: true });
+    writeFileSync(leaseFile, JSON.stringify({
+      "job-unobserved": {
+        jobId: "job-unobserved",
+        leaseId: "lease-unobserved",
+        controllerId,
+        epoch: 1,
+        command: "run-something",
+        spawnedAt: 500,
+        pid: 5151,
+      },
+    }), "utf8");
+
+    let alive = true;
+    const runtime = new PlacementWorkerRuntime({
+      client: mockClient,
+      spool,
+      hostId: workerId,
+      capabilities: ["shell"],
+      dataDir: dir,
+      sampleProvider: () => sample,
+      admissionProvider: () => ({ admit: true }),
+      spawnJob: vi.fn(),
+      stopJob: vi.fn(),
+      isProcessAlive: () => alive,
+      adoptedPollIntervalMs: 20,
+      now,
+    });
+
+    await runtime.reconcileRestart();
+    expect(runtime.getActiveJobs().has("job-unobserved")).toBe(true);
+    alive = false;
+    await vi.waitFor(() => {
+      expect(mockClient.report).toHaveBeenCalledWith(expect.objectContaining({
+        jobId: "job-unobserved",
+        leaseId: "lease-unobserved",
+        status: "lost",
+        reason: "adopted process exited without an observed status",
+      }));
+    });
+    expect(runtime.getActiveJobs().has("job-unobserved")).toBe(false);
+    expect(JSON.parse(readFileSync(leaseFile, "utf8"))["job-unobserved"]).toBeUndefined();
+  });
 });
