@@ -61,3 +61,14 @@ Each turn books `promptBytes` (UTF-8 bytes of each half) and forwards them to
 Usage Monitor as `metadata.promptStableBytes` and `metadata.promptVolatileBytes`,
 two flat numbers, because the v2 metadata bag accepts only primitives.  Read them
 against `cachedInputTokens` to see whether the prefix is actually being cached.
+
+## Unattended Webhook And Schedule Wakes
+
+Webhook and schedule turns reorder that assembly before a driver sees it
+(`server/wake-prompt.ts`).  The standing system sections come first, then the
+tool schemas, then the saved instructions.  Timestamps, delivery ids, run ids,
+folded delivery counts, and untrusted event blocks follow them.  Two wakes for
+the same bot therefore share one byte-identical prefix.  The stored transcript
+keeps the original wake text.  Model selection is unchanged.  When a provider
+reports `cachedInput` on `thread.token-usage.updated`, the harness logs
+`cachedInputTokens`, `inputTokens`, and `outputTokens`, and nothing else.
