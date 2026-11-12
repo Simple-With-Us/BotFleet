@@ -39,6 +39,7 @@ public final class ServersCoordinator: ObservableObject {
     private let store: any ServersHostStore
     private let credentials: ServersCredentials
     private let handshake: Handshake
+    private let placementClient: PlacementModeClient
     private var generations: [String: UUID] = [:]
     private var tasks: [String: Task<Void, Never>] = [:]
     private var loading: Task<[HostRecord], Error>?
@@ -48,8 +49,10 @@ public final class ServersCoordinator: ObservableObject {
     private var controllerEpochs: [String: Int] = [:]
 
     public init(store: any ServersHostStore, tokens: any HostTokenStore = KeychainHostTokenStore(),
-                handshake: @escaping Handshake = { try await ServerHandshake().test(host: $0, credential: $1) }) {
+                handshake: @escaping Handshake = { try await ServerHandshake().test(host: $0, credential: $1) },
+                placementClient: PlacementModeClient = PlacementModeClient()) {
         self.store = store; self.credentials = ServersCredentials(tokens); self.handshake = handshake
+        self.placementClient = placementClient
     }
 
     public func load() async {
@@ -148,6 +151,57 @@ public final class ServersCoordinator: ObservableObject {
             placement = try await store.settings(); errorMessage = nil
             return true
         } catch { errorMessage = safeMessage(error); return false }
+    }
+
+    /// Puts the saved selection once, using the controller pair the caller
+    /// already holds.  A 409 is retried once with only the pair that refusal
+    /// returned.  Applied state is recorded only when the reply says the
+    /// controller holds the record.  A second 409, a false acknowledgement, or
+    /// a 400, 403, or 503 leaves applied state unchanged.  This does not start
+    /// a worker or open a runtime connection.
+    @discardableResult
+    public func applySavedPlacement(on host: HostRecord, credential: HostGateCredential?, controller: ControllerAcknowledgement) async -> Bool {
+        guard canMutate else { return false }
+        isBusy = true
+        do {
+            let selection = try await store.settings().saved
+            let serverId = try await placedServerId(selection)
+            let body = try await submitPlacement(on: host, credential: credential, selection: selection, serverId: serverId, controller: controller)
+            guard body.acknowledged else { throw SavedHostError.placementUnacknowledged }
+            guard HostRecord.validHostId(body.controllerId), body.epoch >= 0 else { throw SavedHostError.invalidResponse }
+            isBusy = false
+            return await confirmPlacementApplied(selection, acknowledgedBy: ControllerAcknowledgement(controllerId: body.controllerId, epoch: body.epoch))
+        } catch {
+            isBusy = false
+            errorMessage = safeMessage(error)
+            return false
+        }
+    }
+
+    /// The wire `serverId` is the pinned host id, never the saved-record id.
+    /// This Mac Only names no server.  A server mode with no pin is not sent.
+    private func placedServerId(_ selection: PlacementSelection) async throws -> String? {
+        if selection.mode == .localOnly {
+            guard selection.serverID == nil else { throw SavedHostError.invalidRecord }
+            return nil
+        }
+        guard let recordID = selection.serverID else { throw SavedHostError.placementUnacknowledged }
+        let known = try await store.hosts()
+        guard let serverId = known.first(where: { !$0.isLocal && $0.id == recordID })?.hostId,
+              HostRecord.validHostId(serverId) else { throw SavedHostError.placementUnacknowledged }
+        return serverId
+    }
+
+    private func submitPlacement(on host: HostRecord, credential: HostGateCredential?, selection: PlacementSelection, serverId: String?, controller: ControllerAcknowledgement) async throws -> PlacementModeAcknowledgement {
+        guard HostRecord.validHostId(controller.controllerId), controller.epoch >= 0 else { throw SavedHostError.placementUnacknowledged }
+        let first = PlacementModeSubmission(mode: selection.mode, controllerId: controller.controllerId, epoch: controller.epoch, serverId: serverId, allowOverflowToThisMac: selection.allowOverflowToThisMac)
+        do {
+            return try await placementClient.write(first, host: host, credential: credential)
+        } catch let error as PlacementModeTransportError {
+            guard case .staleFence(let controllerId, let epoch) = error else { throw error }
+            let retry = PlacementModeSubmission(mode: selection.mode, controllerId: controllerId, epoch: epoch, serverId: serverId, allowOverflowToThisMac: selection.allowOverflowToThisMac)
+            return try await placementClient.write(retry, host: host, credential: credential)
+        }
     }
 
     public func removalReason(_ host: HostRecord) -> String? {
@@ -260,6 +314,7 @@ public final class ServersCoordinator: ObservableObject {
             if known == .missingPlacementRoutes { return "Update the server: required placement routes are unavailable." }
             return known.localizedDescription
         }
+        if let transport = error as? PlacementModeTransportError { return transport.localizedDescription }
         return "Could not reach this server.\u{00A0} Check its address and try again."
     }
 }
