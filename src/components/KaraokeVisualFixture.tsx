@@ -8,7 +8,7 @@
 // publishes its karaoke feed.  The bubble follows it through the real
 // useMessageKaraoke hook, ChatMarkdown and CSS.highlights.
 //
-// `?fixture=karaoke&t=<seconds>` pins the clip clock (default 4.8: "installer" is rolling in and "the" before it is trailing off);
+// `?fixture=karaoke&t=<seconds>` pins the clip clock (default 4.8: "installer" is the bold word, with a short lead ahead and a short trail behind);
 // `&theme=dark` renders the Midnight skin.  The page marks itself ready once
 // the highlighter has painted, and records the bubble height before and
 // during reading so the spec can check that nothing re-flows.
