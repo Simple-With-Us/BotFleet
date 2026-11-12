@@ -288,6 +288,10 @@ final class Session: ObservableObject {
     /// Bumped on sign-out and on a new pairing so an in-flight restore cannot
     /// publish the previous computer's token afterwards.
     private var launchGeneration = 0
+    /// The decision the in-flight restore last published.  `finishLaunchRestore`
+    /// reads it after `launchRestoreSettled` flips, which is the moment a tap
+    /// that arrived during the read has to be kept or dropped.
+    private var launchRestoreDecision: CompanionLaunchRestoreDecision = .unpaired
     private var launchRestoreTask: Task<Void, Never>?
     private var voiceObserversInstalled = false
     /// A notification can cold-launch the app before protected Keychain data
@@ -524,6 +528,7 @@ final class Session: ObservableObject {
     }
 
     private func applyLaunchDecision(_ decision: CompanionLaunchRestoreDecision) {
+        launchRestoreDecision = decision
         switch decision {
         case .unpaired:
             restorePending = false
@@ -551,12 +556,26 @@ final class Session: ObservableObject {
             restorePending = false
             status = .connecting
         }
+        // Unpaired drops a destination queued while this read was still
+        // running.  Connect and a locked keychain keep it.  `finishLaunchRestore`
+        // clears again, because a tap can still arrive before settle.
+        if !CompanionLaunchRestore.retainsQueuedNotification(decision) {
+            pendingNotification = nil
+        }
     }
 
     private func finishLaunchRestore(generation: Int) {
         guard generation == launchGeneration else { return }
         launchRestoreTask = nil
         launchRestoreSettled = true
+        // A tap can land after `applyLaunchDecision` and before this settle,
+        // while `launchRestoreSettled` is still false and `openNotification`
+        // is still willing to queue.  Clear that queue once the outcome is
+        // unpaired, with no await in between, so the next `pair()` does not
+        // open the stale chat.
+        if !CompanionLaunchRestore.retainsQueuedNotification(launchRestoreDecision) {
+            pendingNotification = nil
+        }
         activateAfterFirstFrame()
         guard connectRequested, client != nil else { return }
         connect()

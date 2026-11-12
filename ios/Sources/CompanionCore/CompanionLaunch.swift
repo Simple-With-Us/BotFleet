@@ -141,4 +141,20 @@ public enum CompanionLaunchRestore {
             return .waitForKeychain(saved, message: shown)
         }
     }
+
+    /// A notification tapped before restore finishes is replayed only when a
+    /// saved pairing can still come back.  Settling unpaired drops it, so the
+    /// next pair does not open a chat from a computer this phone is not
+    /// connected to.  A locked keychain still retains it: that phone is
+    /// paired, and the tap should land once the token can be read.
+    public static func retainsQueuedNotification(
+        _ decision: CompanionLaunchRestoreDecision
+    ) -> Bool {
+        switch decision {
+        case .unpaired:
+            return false
+        case .connect, .waitForKeychain:
+            return true
+        }
+    }
 }

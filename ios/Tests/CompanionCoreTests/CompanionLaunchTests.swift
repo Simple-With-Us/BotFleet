@@ -116,6 +116,19 @@ final class CompanionLaunchTests: XCTestCase {
         XCTAssertEqual(shared.data(forKey: CompanionConnectionStore.connectionKey), data)
     }
 
+    func testUnpairedRestoreDropsAQueuedNotification() {
+        let saved = Connection(id: "conn-1", name: "Mac", host: "mac.tail.ts.net", port: 8810)
+        XCTAssertFalse(CompanionLaunchRestore.retainsQueuedNotification(.unpaired))
+        XCTAssertTrue(
+            CompanionLaunchRestore.retainsQueuedNotification(.connect(saved, token: "device-token"))
+        )
+        XCTAssertTrue(
+            CompanionLaunchRestore.retainsQueuedNotification(
+                .waitForKeychain(saved, message: CompanionLaunchRestore.keychainLockedMessage)
+            )
+        )
+    }
+
     func testRestoreDecisionKeepsALockedKeychainDistinctFromNoToken() {
         let saved = Connection(id: "conn-1", name: "Mac", host: "mac.tail.ts.net", port: 8810)
         XCTAssertEqual(
