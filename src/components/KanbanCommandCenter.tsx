@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   AlertCircle,
   Clock,
@@ -31,6 +31,13 @@ export type KanbanColumnId = "attention" | "in_progress" | "ready" | "completed"
  *  a board that renders every card it can build stops being a board. */
 export const COLUMN_VISIBLE_CAP = 15;
 
+const DEFAULT_KANBAN_VISIBLE_COUNTS = {
+  attention: COLUMN_VISIBLE_CAP,
+  in_progress: COLUMN_VISIBLE_CAP,
+  ready: COLUMN_VISIBLE_CAP,
+  completed: COLUMN_VISIBLE_CAP,
+} satisfies Record<KanbanColumnId, number>;
+
 export interface KanbanCardItem {
   id: string;
   column: KanbanColumnId;
@@ -51,6 +58,9 @@ export interface KanbanCardItem {
   /** Set on a card that stands in for a routine's repeated failures, misses or
    *  approvals:  how many older runs of that routine it replaced. */
   olderRuns?: number;
+  /** Searchable text from the runs folded into this card, excluding what the
+   *  visible title and subtitle already carry. */
+  foldedSearchText?: string;
 }
 
 export function safeAvatarUrl(url?: string | null): string | null {
@@ -76,6 +86,22 @@ const COLLAPSIBLE_RUN_STATUSES: ReadonlySet<RoutineRunStatus> = new Set<RoutineR
  *  attention module's trigger key, so a webhook or resource trigger can never
  *  merge with a scheduled routine, and a manual run folds into the routine it
  *  belongs to. */
+/** Every field a person might type into the kanban search box for one card. */
+export function cardSearchText(card: KanbanCardItem): string {
+  const parts: string[] = [card.title];
+  if (card.subtitle) parts.push(card.subtitle);
+  if (card.appName) parts.push(card.appName);
+  if (card.botName) parts.push(card.botName);
+  const run = card.rawRun;
+  if (run) {
+    if (run.routineName) parts.push(run.routineName);
+    if (run.error) parts.push(run.error);
+    if (run.prompt) parts.push(run.prompt);
+    if (run.output) parts.push(run.output);
+  }
+  return parts.join(" ");
+}
+
 function repeatKey(run: RoutineRun): string {
   const kind = run.status === "waiting" ? "approval" : "failure";
   return `${kind}:${triggerAttentionKey(run) ?? `routine:${run.routineId}`}`;
@@ -89,17 +115,21 @@ function repeatKey(run: RoutineRun): string {
  *  failed, missed or waiting runs pass through untouched, in their original
  *  order. */
 export function collapseAttentionCards(cards: KanbanCardItem[]): KanbanCardItem[] {
-  const groups = new Map<string, { newest: KanbanCardItem; size: number }>();
+  const groups = new Map<
+    string,
+    { newest: KanbanCardItem; size: number; members: KanbanCardItem[] }
+  >();
   for (const card of cards) {
     const run = card.rawRun;
     if (!run || !COLLAPSIBLE_RUN_STATUSES.has(run.status)) continue;
     const key = repeatKey(run);
     const group = groups.get(key);
     if (!group) {
-      groups.set(key, { newest: card, size: 1 });
+      groups.set(key, { newest: card, size: 1, members: [card] });
       continue;
     }
     group.size += 1;
+    group.members.push(card);
     // `>=`: on a tie the card later in the list stands in.
     if (card.timestamp >= group.newest.timestamp) group.newest = card;
   }
@@ -113,7 +143,25 @@ export function collapseAttentionCards(cards: KanbanCardItem[]): KanbanCardItem[
     }
     const group = groups.get(repeatKey(run))!;
     if (group.newest !== card) continue;
-    collapsed.push(group.size > 1 ? { ...card, olderRuns: group.size - 1 } : card);
+    if (group.size <= 1) {
+      collapsed.push(card);
+      continue;
+    }
+    const visibleText = cardSearchText(group.newest).toLowerCase();
+    const foldedBits: string[] = [];
+    for (const member of group.members) {
+      if (member === group.newest) continue;
+      const text = cardSearchText(member);
+      if (!text) continue;
+      // Keep only what the standing card does not already show in title or subtitle.
+      if (visibleText && text.toLowerCase() === visibleText) continue;
+      foldedBits.push(text);
+    }
+    collapsed.push({
+      ...card,
+      olderRuns: group.size - 1,
+      foldedSearchText: foldedBits.length > 0 ? foldedBits.join(" ") : undefined,
+    });
   }
   return collapsed;
 }
@@ -149,13 +197,14 @@ export function KanbanCommandCenter({
   const [searchQuery, setSearchQuery] = useState("");
   // How many cards each column currently shows.  "Show More" adds one page.
   const [visibleCounts, setVisibleCounts] = useState<Record<KanbanColumnId, number>>({
-    attention: COLUMN_VISIBLE_CAP,
-    in_progress: COLUMN_VISIBLE_CAP,
-    ready: COLUMN_VISIBLE_CAP,
-    completed: COLUMN_VISIBLE_CAP,
+    ...DEFAULT_KANBAN_VISIBLE_COUNTS,
   });
   const showMore = (column: KanbanColumnId) =>
     setVisibleCounts((current) => ({ ...current, [column]: current[column] + COLUMN_VISIBLE_CAP }));
+
+  useEffect(() => {
+    setVisibleCounts({ ...DEFAULT_KANBAN_VISIBLE_COUNTS });
+  }, [searchQuery, filterAppId]);
 
   const appMap = useMemo(() => {
     const map = new Map<string, { id: string; name: string; avatarUrl?: string | null; memberIds: string[] }>();
@@ -450,17 +499,23 @@ export function KanbanCommandCenter({
     return collapseAttentionCards(items);
   }, [state.bots, state.routineRuns, appMap, botMap, filterAppId]);
 
+  const searchNeedle = searchQuery.trim().toLowerCase();
+
   const filteredCards = useMemo(() => {
-    if (!searchQuery.trim()) return cards;
-    const q = searchQuery.toLowerCase();
-    return cards.filter(
-      (c) =>
-        c.title.toLowerCase().includes(q) ||
-        (c.subtitle && c.subtitle.toLowerCase().includes(q)) ||
-        (c.appName && c.appName.toLowerCase().includes(q)) ||
-        (c.botName && c.botName.toLowerCase().includes(q))
-    );
-  }, [cards, searchQuery]);
+    if (!searchNeedle) return cards;
+    return cards.filter((c) => {
+      const visible = cardSearchText(c).toLowerCase();
+      if (visible.includes(searchNeedle)) return true;
+      return (c.foldedSearchText?.toLowerCase().includes(searchNeedle) ?? false);
+    });
+  }, [cards, searchNeedle]);
+
+  const foldedSearchMatches = (card: KanbanCardItem): boolean => {
+    if (!searchNeedle || !card.foldedSearchText) return false;
+    const visible = cardSearchText(card).toLowerCase();
+    if (visible.includes(searchNeedle)) return false;
+    return card.foldedSearchText.toLowerCase().includes(searchNeedle);
+  };
 
   // Group into 4 columns, strictly sorted by unblock priority and wait duration
   const columns = useMemo(() => {
@@ -500,6 +555,17 @@ export function KanbanCommandCenter({
     ready: columns.ready.slice(0, visibleCounts.ready),
     completed: columns.completed.slice(0, visibleCounts.completed),
   };
+
+  const matchingCardCount = filteredCards.length;
+  const visibleCardCount =
+    visible.attention.length +
+    visible.in_progress.length +
+    visible.ready.length +
+    visible.completed.length;
+  const headerCardCountLabel =
+    visibleCardCount < matchingCardCount
+      ? `${visibleCardCount} of ${matchingCardCount} Cards`
+      : `${matchingCardCount} Cards`;
 
   const formatWaitTime = (ms?: number) => {
     if (!ms || ms <= 0) return null;
@@ -556,7 +622,7 @@ export function KanbanCommandCenter({
         </div>
 
         <div className="flex items-center gap-2 text-[11px] text-ink-secondary">
-          <span>{filteredCards.length} Cards</span>
+          <span>{headerCardCountLabel}</span>
           <span>•</span>
           <span className="text-warning font-medium">
             {columns.attention.length} Needs Action
@@ -623,10 +689,16 @@ export function KanbanCommandCenter({
 
                     {card.olderRuns ? (
                       <p
-                        className="text-[10px] font-medium text-ink-secondary"
+                        className={
+                          foldedSearchMatches(card)
+                            ? "rounded-sm bg-primary/15 px-1 py-0.5 text-[10px] font-semibold text-primary"
+                            : "text-[10px] font-medium text-ink-secondary"
+                        }
                         title={`${card.olderRuns} older ${card.olderRuns === 1 ? "run" : "runs"} of this routine are folded into this card.`}
                       >
-                        {`+${card.olderRuns} older`}
+                        {foldedSearchMatches(card)
+                          ? `+${card.olderRuns} older (search match)`
+                          : `+${card.olderRuns} older`}
                       </p>
                     ) : null}
 
