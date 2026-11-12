@@ -24,6 +24,7 @@ export const KNOWN_STAGE_ENTRIES = Object.freeze([
   "source",
   "pending-recovery.json",
   "credential-migration.json",
+  "desktop-startup.json",
   // Where a downloaded CI build is unpacked, and where its staged dependency
   // tree lands.  Both are written by the updater itself, on the default path.
   "hosted",

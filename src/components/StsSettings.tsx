@@ -16,7 +16,7 @@
 //    value must render as on.
 
 import { Loader2 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { z } from "zod";
 
 import { cn } from "@/lib/cn";
@@ -67,6 +67,25 @@ export const StsConfigResponseSchema = z
   // `tts`, `vps`, `composio` and the rest.  A bare z.object strips unknown
   // keys, which is not the same thing as tolerating them, so say so.
   .passthrough();
+export type StsConfigResponse = z.infer<typeof StsConfigResponseSchema>;
+
+/**
+ * The trust boundary for `window.ogb.sts.status()`.
+ *
+ * An IPC answer is a boundary like any other, and this one crosses into the
+ * renderer from a preload bridge with no type checking of its own.  Reading
+ * `status.xai` straight off the result let anything that is not a boolean —
+ * a renamed field, a hand-edited stub, a bridge from another build — become
+ * the credential state the whole panel renders from.  Parsing turns that into
+ * the same "could not read the key status" note a failed probe already shows,
+ * which is the truth: if the bridge said something this build cannot read,
+ * its answer is unknown, not "no key".
+ *
+ * Strict, because this object is the whole answer rather than one slice of a
+ * larger document: an extra field means the bridge is not what we think it is.
+ */
+export const StsKeyStatusSchema = z.object({ xai: z.boolean(), gemini: z.boolean() }).strict();
+export type StsKeyStatusPayload = z.infer<typeof StsKeyStatusSchema>;
 
 /**
  * One line the panel can show for a body the schema refused.
@@ -148,6 +167,7 @@ export function StsSettings() {
   const [frontEngine, setFrontEngine] = useState(true);
   const [loaded, setLoaded] = useState(false);
   const [saving, setSaving] = useState(false);
+  const savingRef = useRef(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -158,6 +178,7 @@ export function StsSettings() {
     }
     bridge
       .status()
+      .then((body) => StsKeyStatusSchema.parse(body))
       .then((status) => {
         if (!alive) return;
         setKeys({ xai: status.xai, gemini: status.gemini });
@@ -205,7 +226,13 @@ export function StsSettings() {
   // rather than racing the first PUT.  Reports whether the write landed, so
   // a failed save leaves the shown choice where it was.
   const save = async (patch: StsConfigSlice): Promise<boolean> => {
-    if (saving) return false;
+    // Gated on a ref rather than `saving`: state does not change until React
+    // re-renders, so a second click inside that window still saw `false` and
+    // put a second request to the same slice into flight.  Two writes to one
+    // config slice commit in an indeterminate order, which is worse than the
+    // click being dropped.
+    if (savingRef.current) return false;
+    savingRef.current = true;
     setSaving(true);
     setError(null);
     try {
@@ -220,6 +247,7 @@ export function StsSettings() {
       setError(caught instanceof Error ? caught.message : String(caught));
       return false;
     } finally {
+      savingRef.current = false;
       setSaving(false);
     }
   };
@@ -245,7 +273,7 @@ export function StsSettings() {
             <span className="text-[11px] text-success">
               {configured.length === STS_PROVIDERS.length
                 ? "All keys ready"
-                : `1 key ready`}
+                : `${configured.length} ${configured.length === 1 ? "key" : "keys"} ready`}
             </span>
           )}
         </div>

@@ -8,8 +8,15 @@
 // stop nesting.
 import type { Message } from "./store.ts";
 import type { ToolKind } from "../shared/tool-activity.ts";
+import { reconcileLifecycleToolOk } from "../shared/lifecycle-tool.ts";
+import { redactSecretsInText } from "./redact.ts";
 
 export type ToolRow = NonNullable<Message["tool"]>;
+
+/** A terminal provider title is bot-authored transcript content. */
+export function redactToolTitle(title: string | undefined): string | undefined {
+  return title === undefined || !title.trim() ? undefined : redactSecretsInText(title);
+}
 
 /** What `item.started` reports about a tool step. */
 export interface ToolStartedFields {
@@ -43,12 +50,14 @@ export function startedToolRow(event: ToolStartedFields, spoken: string | undefi
  * replaced, so the fields set at start are carried across. */
 export function completedToolRow(
   existing: ToolRow | undefined,
-  event: { ok: boolean; detail?: string },
+  event: { ok: boolean; detail?: string; title?: string },
   durationMs: number | undefined,
 ): ToolRow {
+  const title = event.title ?? existing?.name;
+  const ok = reconcileLifecycleToolOk(event.ok, title, event.detail ?? existing?.detail);
   return {
-    name: existing?.name ?? "tool",
-    ok: event.ok,
+    name: redactToolTitle(event.title) ?? existing?.name ?? "tool",
+    ok,
     spoken: existing?.spoken,
     target: existing?.target,
     kind: existing?.kind,

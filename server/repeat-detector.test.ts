@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { RepeatDetector, callKey } from "./repeat-detector.ts";
+import { RepeatDetector, callKey, titleCallKey } from "./repeat-detector.ts";
 
 describe("callKey", () => {
   it("keys on tool plus arguments, normalizing whitespace, and ignores a bare tool name", () => {
@@ -11,6 +11,22 @@ describe("callKey", () => {
     // ACP titles that are just the tool name again carry no arguments
     expect(callKey("Bash", "Bash")).toBeNull();
     expect(callKey("Read", "Read src/index.ts")).toBe("Read:Read src/index.ts");
+  });
+
+  it("does not treat Muse lifecycle status titles as repeated call arguments", () => {
+    for (const kind of ["hookRun", "reminderChild", "workflow", "subagent"]) {
+      for (const status of ["inProgress", "in_progress", "completed", "failed", "rejected", "live state unknown"]) {
+        expect(titleCallKey(`${kind}: ${status}`)).toBeNull();
+      }
+    }
+    // Actual commands and arguments remain countable, including a command
+    // whose text happens to resemble one of the lifecycle titles.
+    expect(callKey("Bash", "hookRun: inProgress")).toBe("Bash:hookRun: inProgress");
+    expect(callKey("tool", "workflow: completed")).toBe("tool:workflow: completed");
+    expect(callKey("hookRun: inProgress", '{"command":"npm test"}')).toBe('hookRun: inProgress:{"command":"npm test"}');
+    expect(titleCallKey("Run npm test")).toBe("tool:Run npm test");
+    expect(titleCallKey("workflow: deploy production")).toBe("tool:workflow: deploy production");
+    expect(titleCallKey("Bash")).toBeNull();
   });
 });
 

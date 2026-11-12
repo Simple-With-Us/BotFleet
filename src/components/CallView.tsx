@@ -295,7 +295,7 @@ export function CallTargetButton({
               : "text-ink-secondary hover:bg-raised hover:text-ink",
         )}
       >
-        {active ? <PhoneOff size={17} /> : <Phone size={17} />}
+        {active ? <PhoneOff size={17} aria-hidden="true" /> : <Phone size={17} aria-hidden="true" />}
         {unavailable && (
           <span className="absolute right-1 top-1 size-1.5 rounded-full bg-warning ring-2 ring-app" aria-hidden="true" />
         )}
@@ -775,8 +775,11 @@ function Call({ bot }: { bot: Bot }) {
           });
         } catch (error) {
           if (alive.current && currentCall() === bot.id) {
+            // The overlay stays up on purpose.  `note` renders inside it, so
+            // ending the call here unmounted the one thing that explained the
+            // failure a half-second after it was set.  An STS session cannot be
+            // resumed anyway, and the note already offers ending the call.
             setNote(error instanceof Error ? error.message : String(error));
-            endCall(bot.id);
           }
           return;
         }

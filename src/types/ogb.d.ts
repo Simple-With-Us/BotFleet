@@ -110,11 +110,27 @@ type SkillRecordingPayload = {
     code?: "load-failed" | "renderer-gone";
   }
 
+  /** The build the running process reports.  There is deliberately no build
+   *  number field: the Mac app carries a hand-maintained semver, so its patch
+   *  component is not a build anyone can look up.  `version` is the truth. */
+  interface AppRuntimeInfo {
+    version: string;
+    platform: string;
+    arch: string;
+    electron: string;
+    node: string;
+    packaged: boolean;
+    harness: string | null;
+    /** The same fields on one line, ready to copy into a bug report. */
+    summary: string;
+  }
+
   interface Window {
     ogb?: {
       platform: NodeJS.Platform;
       getCapabilities(): Promise<DesktopCapabilities>;
       onCapabilitiesChanged(cb: (capabilities: DesktopCapabilities) => void): () => void;
+      appInfo?(): Promise<AppRuntimeInfo>;
       companionAccount?: {
         state(): Promise<CompanionAccountState>;
         requestCode(email: string): Promise<CompanionAccountState>;
@@ -246,6 +262,8 @@ type SkillRecordingPayload = {
       openFile?(filePath: string): Promise<boolean>;
       /** Reveal a file in Finder / file manager with the file selected. */
       showInFolder?(filePath: string): Promise<boolean>;
+      /** Reveal a user-chosen absolute file or folder outside ~/.botfleet. */
+      revealLocalPath?(filePath: string): Promise<boolean>;
       /** Asks where to save a bot-created file (inside ~/.botfleet), copies
        * it there and reveals it. Resolves the chosen path, or null if the
        * user cancelled the dialog. */
@@ -255,6 +273,7 @@ type SkillRecordingPayload = {
         name:
           | "composioApiKey"
           | "xaiApiKey"
+          | "geminiApiKey"
           | "openaiCompatApiKey"
           | "minimaxApiKey"
           | "deepseekApiKey"
@@ -262,7 +281,9 @@ type SkillRecordingPayload = {
           | "opencodeGoApiKey"
           | "ttsKey"
           | "openaiImageApiKey"
-          | "infisicalClientSecret",
+          | "infisicalClientSecret"
+          | "infisicalReadToken"
+          | "infisicalWriteToken",
         value: string,
         provider?: "minimax" | "system",
       ): Promise<ConfigStatus>;

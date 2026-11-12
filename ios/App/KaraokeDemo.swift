@@ -12,7 +12,13 @@
 // (clip windows estimated from the text).  With `-karaoke-demo-word`, the
 // clock is pinned partway through the first display word with that text
 // (`-karaoke-demo-fraction`, default 0.5), so a screenshot is the same
-// every time.  Without it, the reply plays through once.
+// every time. The spoken word is the boldest. One or two words ahead of
+// it lead, and two or three behind it trail off. Pin `passed` to see that
+// window in the middle of a sentence:
+//
+//   -karaoke-demo-word passed -karaoke-demo-fraction 0.45
+//
+// Without a pinned word, the reply plays through once.
 //
 // `-karaoke-demo-feed` follows the reply the way a Personal Voice read
 // does instead: it packs the utterances into chunks as the phone does, and

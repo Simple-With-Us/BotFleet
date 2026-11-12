@@ -47,6 +47,8 @@ import { readPluginFolder } from "./plugin-folder.ts";
 import { fetchPluginFromGit, parseGitPluginSource, PluginFetchError } from "./plugin-fetch.ts";
 import {
   invokePlugin,
+  invokePluginEvent,
+  fetchPluginHealth,
   loadPlugin,
   pluginLogId,
   type LoadedPlugin,
@@ -54,7 +56,34 @@ import {
   type PluginHostInputs,
   type PluginLogEvent,
 } from "./plugin-loader.ts";
-import { PluginCardResultSchema, PluginCommandResultSchema } from "./plugin-sandbox-protocol.ts";
+import {
+  PluginCardResultSchema,
+  PluginCommandResultSchema,
+  PluginHealthResultSchema,
+} from "./plugin-sandbox-protocol.ts";
+import {
+  PluginEventBus,
+  type PluginEventTransport,
+} from "./plugin-events.ts";
+import {
+  pluginEventEnvelopeSchema,
+  subscriptionMatchesEvent,
+  type PluginChatSummary,
+  type PluginDeliveryOutcome,
+  type PluginEventEnvelope,
+  type PluginRoutingDecision,
+} from "../shared/plugin-events.ts";
+import {
+  migratePluginSettings,
+  readPluginSettings,
+  validatePluginSettings,
+  writePluginSecret,
+  writePluginSettings,
+  type PluginSettingSpec,
+} from "./plugin-secrets.ts";
+import { parsePluginManifest } from "../shared/plugin-manifest.ts";
+import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join as joinPath } from "node:path";
 
 import type {
   FetchedPlugin,
@@ -72,6 +101,9 @@ export interface PluginRuntimeInputs {
   /** Receives allow-listed structured events only.  No event carries
    *  plugin-supplied text; see PluginLogEvent. */
   logger(event: PluginLogEvent): void;
+  /** Configured Zulip realm origin.  Used only to allow the shipped
+   *  Zulip plugin to reach that host.  Absent when Zulip is not configured. */
+  zulipRealm?(): string | undefined;
 }
 
 let runtimeInputs: PluginRuntimeInputs | null = null;
@@ -101,6 +133,11 @@ export function matchPluginActionRoute(path: string): { name: string; action: Pl
  *  server boot from server/index.ts. */
 export function initPluginRuntime(inputs: PluginRuntimeInputs): void {
   runtimeInputs = inputs;
+}
+
+function zulipRealmOption(): { zulipRealm?: string } {
+  const realm = runtimeInputs?.zulipRealm?.();
+  return realm ? { zulipRealm: realm } : {};
 }
 
 function inputsOrThrow(): PluginHostInputs {
@@ -135,7 +172,7 @@ async function liveSandbox(listing: PluginListing, baseDir: string): Promise<Loa
   if (inflight) return inflight;
   const attempt = (async () => {
     await dropLoaded(listing.name);
-    const result = await loadPlugin(listing, inputsOrThrow(), baseDir);
+    const result = await loadPlugin(listing, inputsOrThrow(), baseDir, zulipRealmOption());
     if ("error" in result) return result;
     loaded.set(listing.name, result);
     return result;
@@ -347,7 +384,7 @@ export async function enablePlugin(
   }
 
   if (!loaded.has(name)) {
-    const loaded_ = await loadPlugin(listing, inputsOrThrow(), baseDir);
+    const loaded_ = await loadPlugin(listing, inputsOrThrow(), baseDir, zulipRealmOption());
     if ("error" in loaded_) return { error: loaded_.error };
     loaded.set(name, loaded_);
   }
@@ -446,9 +483,16 @@ export async function updatePlugin(
 
   const warnings = [...sourceWarnings];
 
+  // Broker files (settings, secrets, event ledger) live beside the plugin
+  // tree but are host state, not plugin code: the tree rewrite below
+  // replaces the whole directory, so stash them and restore after.  A
+  // fetched file with the same name wins — the plugin owns its tree.
+  const brokerStash = stashBrokerFiles(name, fetched.files.map((file) => file.path), baseDir);
+
   // Dispose before rewriting the tree.  On Windows the child holds open
   // handles under the plugin dir; rmSync fails with EPERM until exit.
   const wasEnabled = entry.enabled;
+  const storedSettings = readPluginSettings(baseDir, name);
   await dropLoaded(name);
 
   try {
@@ -459,6 +503,27 @@ export async function updatePlugin(
     }, baseDir);
   } catch (error) {
     return { error: fsErrorMessage("directory could not be written", name, error) };
+  }
+  restoreBrokerFiles(name, brokerStash, baseDir);
+
+  // Settings migration: when the new manifest bumped settingsVersion,
+  // carry declared keys forward, apply new defaults, and drop removed
+  // keys.  Secrets stay keyed in the broker file across upgrades.
+  if (parsed.manifest.settingsVersion > storedSettings.settingsVersion) {
+    const specs = parsed.manifest.settings.map((setting): PluginSettingSpec => ({
+      key: setting.key,
+      label: setting.label,
+      type: setting.type,
+      required: setting.required,
+      description: setting.description,
+    }));
+    try {
+      const { added, dropped } = migratePluginSettingsOnUpdate(specs, baseDir, name, parsed.manifest.settingsVersion);
+      if (added.length) warnings.push(`settings migrated: added ${added.join(", ")}`);
+      if (dropped.length) warnings.push(`settings migrated: dropped ${dropped.join(", ")}`);
+    } catch (error) {
+      warnings.push(`settings migration failed: ${error instanceof Error ? error.message : "unknown"}`);
+    }
   }
 
   const next = rebuildEntryForUpdate({
@@ -476,7 +541,7 @@ export async function updatePlugin(
   if (wasEnabled) {
     const refreshed = listingOrError(name, baseDir);
     if (!("error" in refreshed)) {
-      const loaded_ = await loadPlugin(refreshed, inputsOrThrow(), baseDir);
+      const loaded_ = await loadPlugin(refreshed, inputsOrThrow(), baseDir, zulipRealmOption());
       if ("error" in loaded_) {
         warnPluginEvent("plugins.update.disabled", name, "reload_failed");
         const current = readRegistry(baseDir).plugins[name];
@@ -503,6 +568,7 @@ export async function removePlugin(
   if (!registry.plugins[name]) return { error: `no plugin named "${name}"` };
 
   await dropLoaded(name);
+  pluginEventBus(baseDir).clear(name);
   // Tree first, entry second: a failed rm must leave a still-listed plugin
   // the user can retry, never an orphaned directory with no registry record.
   try {
@@ -524,7 +590,7 @@ export async function reloadPlugin(
   await dropLoaded(name);
   const registry = readRegistry(baseDir);
   if (registry.plugins[name]?.enabled) {
-    const loaded_ = await loadPlugin(listing, inputsOrThrow(), baseDir);
+    const loaded_ = await loadPlugin(listing, inputsOrThrow(), baseDir, zulipRealmOption());
     if ("error" in loaded_) return { error: loaded_.error };
     loaded.set(name, loaded_);
   }
@@ -623,6 +689,319 @@ export async function getPluginCardData(
   return { data: data.data };
 }
 
+// ---------------------------------------------------------------------------
+// Event-driven integration platform (host API v2).
+//
+// The trusted host owns every transport: listeners, credential checks,
+// dedup, budgets, canonical fetches, retries, and wake execution.
+// Plugins subscribe to typed envelopes and return routing decisions;
+// they never bind ports, see tokens, or keep event state.  A plugin
+// process staying alive retains nothing: the ledger below is the state.
+
+/** Scoped conversation summaries for dispatcher routing.  Wired at boot
+ *  to the thread store; tests pass a stub. */
+export interface PluginChatInputs {
+  listChatSummaries(limit: number): PluginChatSummary[];
+}
+
+let chatInputs: PluginChatInputs | null = null;
+
+/** Register the chat-summary provider.  Called once at server boot. */
+export function initPluginChats(inputs: PluginChatInputs): void {
+  chatInputs = inputs;
+}
+
+/** Valid routing decisions arrive here from the bus (first attempt or a
+ *  background retry).  The integrator (server/index.ts) registers the
+ *  executor that validates the target and performs the wake. */
+export type PluginDecisionHandler = (
+  pluginName: string,
+  event: PluginEventEnvelope,
+  decision: PluginRoutingDecision,
+) => void;
+
+let decisionHandler: PluginDecisionHandler | null = null;
+
+/** Register the wake executor.  Called once at server boot. */
+export function initPluginDecisionHandler(handler: PluginDecisionHandler): void {
+  decisionHandler = handler;
+}
+
+const eventBuses = new Map<string, PluginEventBus>();
+
+function readManifestForEvents(name: string, baseDir: string): {
+  capabilities: string[];
+  subscriptions: Array<{ id: string; source: "zulip"; kinds: Array<"message">; includeContent: boolean; includeChats: boolean; maxChats: number }>;
+} | null {
+  const path = joinPath(baseDir, name, "botfleet-plugin.json");
+  if (!existsSync(path)) return null;
+  let value: unknown;
+  try {
+    value = JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    return null;
+  }
+  const parsed = parsePluginManifest(value);
+  if (!parsed.ok) return null;
+  return {
+    capabilities: [...parsed.manifest.capabilities],
+    subscriptions: (parsed.manifest.contributes?.eventSubscriptions ?? []).map((sub) => ({ ...sub })),
+  };
+}
+
+function busTransport(baseDir: string): PluginEventTransport {
+  return {
+    subscribers: (event) => {
+      const registry = readRegistry(baseDir);
+      const out: string[] = [];
+      for (const name of Object.keys(registry.plugins).sort()) {
+        if (!registry.plugins[name]?.enabled) continue;
+        const manifest = readManifestForEvents(name, baseDir);
+        if (!manifest) continue;
+        if (!manifest.capabilities.includes("events.subscribe")) continue;
+        if (manifest.subscriptions.some((sub) => subscriptionMatchesEvent(sub, event))) out.push(name);
+      }
+      return out;
+    },
+    capabilities: (pluginName) => readManifestForEvents(pluginName, baseDir)?.capabilities ?? null,
+    subscriptions: (pluginName) => readManifestForEvents(pluginName, baseDir)?.subscriptions ?? [],
+    scope: (pluginName, subscription, event) => {
+      const capabilities = readManifestForEvents(pluginName, baseDir)?.capabilities ?? [];
+      const scoped: PluginEventEnvelope = { ...event, refs: { ...event.refs }, source: { ...event.source } };
+      if (!subscription.includeContent) delete scoped.content;
+      if (subscription.includeChats && capabilities.includes("chat.read") && chatInputs) {
+        const summaries = chatInputs.listChatSummaries(Math.min(subscription.maxChats, 20));
+        scoped.context = { ...scoped.context, chatSummaries: summaries.slice(0, 20) };
+      } else if (scoped.context.chatSummaries) {
+        const { chatSummaries: _dropped, ...context } = scoped.context;
+        void _dropped;
+        scoped.context = context;
+      }
+      return scoped;
+    },
+    deliver: async (pluginName, event) => {
+      const listing = listingFor(pluginName, baseDir);
+      if ("error" in listing) return { ok: false, reason: "sandbox_exited" };
+      const registry = readRegistry(baseDir);
+      if (!registry.plugins[pluginName]?.enabled) return { ok: false, reason: "bad_request" };
+      const plugin = await liveSandbox(listing, baseDir);
+      if ("error" in plugin) return { ok: false, reason: "sandbox_exited" };
+      if (!plugin.sandbox.exports.onEvent) return { ok: false, reason: "not_implemented" };
+      // The plugin's own non-secret settings ride along; secrets never do.
+      const settings = readPluginSettings(baseDir, pluginName).values;
+      return invokePluginEvent(plugin, event, inputsOrThrow(), settings);
+    },
+    onDecision: (pluginName, event, decision) => {
+      try {
+        decisionHandler?.(pluginName, event, decision);
+      } catch {
+        // The executor is host code; a throw here must not break delivery.
+      }
+    },
+  };
+}
+
+/** The event bus for one registry dir.  Production uses PLUGINS_DIR;
+ *  tests pass a mkdtemp'd dir. */
+export function pluginEventBus(baseDir: string = PLUGINS_DIR): PluginEventBus {
+  const existing = eventBuses.get(baseDir);
+  if (existing) return existing;
+  const bus = new PluginEventBus(busTransport(baseDir), { baseDir });
+  eventBuses.set(baseDir, bus);
+  return bus;
+}
+
+/** Emit one envelope to every enabled subscriber.  Invalid envelopes
+ *  are dropped (no subscriber, no outcome). */
+export async function emitPluginEvent(
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- I/O boundary: the bus schema-parses before any subscriber sees the value.
+  rawEvent: unknown,
+  baseDir: string = PLUGINS_DIR,
+): Promise<PluginDeliveryOutcome[]> {
+  return pluginEventBus(baseDir).emit(rawEvent);
+}
+
+/** Emit one envelope and capture the first valid wake request from the
+ *  first attempts, for callers that must act on the decision now (the
+ *  Zulip hub).  When first attempts land in `retry`, this waits up to
+ *  `settleMs` for the backoff retries to settle so a transient sandbox
+ *  crash does not fork into both a late plugin wake and a legacy wake.
+ *  Late retry decisions still reach the registered decision handler. */
+export async function decidePluginWake(
+  event: PluginEventEnvelope,
+  baseDir: string = PLUGINS_DIR,
+  opts: { settleMs?: number } = {},
+): Promise<{ plugin: string; decision: PluginRoutingDecision } | null> {
+  const bus = pluginEventBus(baseDir);
+  const first = await bus.emitAndDecide(event);
+  if (first.decision) return first.decision;
+  let pending = [...new Set(first.outcomes.filter((o) => o.result === "retry").map((o) => o.plugin))];
+  if (!pending.length) return null;
+  const settleMs = opts.settleMs ?? 15_000;
+  const deadline = Date.now() + settleMs;
+  let won: { plugin: string; decision: PluginRoutingDecision } | null = null;
+  while (pending.length && Date.now() < deadline && !won) {
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    const next: string[] = [];
+    for (const plugin of pending) {
+      const outcomes = await bus.drainPending(plugin, (candidate) => {
+        if (!won && candidate.action === "requestWake") won = { plugin, decision: candidate };
+      });
+      for (const outcome of outcomes) {
+        if (outcome.result === "retry" && outcome.eventId === event.eventId) next.push(plugin);
+      }
+    }
+    pending = [...new Set(next)];
+  }
+  return won;
+}
+
+/** Enabled plugins subscribed to one platform's messages.  The Zulip hub
+ *  uses this to decide whether a message routes through the platform. */
+export function pluginEventSubscribers(platform: string, baseDir: string = PLUGINS_DIR): string[] {
+  const registry = readRegistry(baseDir);
+  const out: string[] = [];
+  for (const name of Object.keys(registry.plugins).sort()) {
+    if (!registry.plugins[name]?.enabled) continue;
+    const manifest = readManifestForEvents(name, baseDir);
+    if (!manifest) continue;
+    if (!manifest.capabilities.includes("events.subscribe")) continue;
+    if (manifest.subscriptions.some((sub) => sub.source === platform)) out.push(name);
+  }
+  return out;
+}
+
+/** Health for one plugin: ledger depths plus recent outcomes (reason
+ *  codes only, never event text) plus the plugin's own report when it
+ *  implements getHealth. */
+export async function getPluginHealth(
+  name: string,
+  baseDir: string = PLUGINS_DIR,
+): Promise<{ ledger: { pending: number; deadLetter: number; recent: PluginDeliveryOutcome[] }; plugin: { status: string; detail: string } } | { error: string }> {
+  const listing = listingFor(name, baseDir);
+  if ("error" in listing) return listing;
+  const ledger = pluginEventBus(baseDir).health(name);
+  let plugin = { status: "unknown", detail: "no health handler" };
+  const registry = readRegistry(baseDir);
+  if (registry.plugins[name]?.enabled) {
+    const loaded_ = await liveSandbox(listing, baseDir);
+    if (!("error" in loaded_) && loaded_.sandbox.exports.getHealth) {
+      try {
+        const settings = readPluginSettings(baseDir, name).values;
+        const result = await fetchPluginHealth(loaded_, inputsOrThrow(), settings);
+        if (result.ok) {
+          const parsed = PluginHealthResultSchema.safeParse(result.value);
+          if (parsed.success) plugin = { ...parsed.data };
+        }
+      } catch {
+        // Best effort: ledger health below still answers.
+      }
+    }
+  }
+  return { ledger, plugin };
+}
+
+/** Build a synthetic test event and run it through matching
+ *  subscriptions.  Exercises validate → scope → deliver → decide
+ *  without touching any real transport. */
+export async function emitPluginTestEvent(
+  name: string,
+  baseDir: string = PLUGINS_DIR,
+): Promise<PluginDeliveryOutcome[] | { error: string }> {
+  const listing = listingFor(name, baseDir);
+  if ("error" in listing) return listing;
+  const registry = readRegistry(baseDir);
+  if (!registry.plugins[name]?.enabled) return { error: `plugin "${name}" is disabled` };
+  const stamp = new Date().toISOString();
+  const messageId = (Date.now() % 2_147_483_647) + 1;
+  const raw = {
+    eventId: `test:${name}:${messageId}`,
+    type: "zulip.message",
+    source: { platform: "zulip", accountId: "test" },
+    occurredAt: stamp,
+    receivedAt: stamp,
+    refs: { messageId, conversationKey: "test" },
+    mentions: [],
+    content: { text: "synthetic test event", format: "text" },
+    context: { botId: name, wakeReason: "mention", senderKind: "peer" },
+  };
+  const parsed = pluginEventEnvelopeSchema.safeParse(raw);
+  if (!parsed.success) return { error: "test event failed to validate" };
+  return pluginEventBus(baseDir).emit(parsed.data);
+}
+
+/** Validate and persist user settings.  Secret values go to the broker
+ *  file and are never echoed back; the reply carries names only. */
+export async function setPluginSettings(
+  name: string,
+  provided: Record<string, JsonValue>,
+  baseDir: string = PLUGINS_DIR,
+): Promise<PluginListing | PluginError> {
+  const listing = listingFor(name, baseDir);
+  if ("error" in listing) return listing;
+  if (!Array.isArray(listing.settings)) return { error: `plugin "${name}" declares no settings` };
+  const specs = listing.settings.map((setting): PluginSettingSpec => ({
+    key: setting.key,
+    label: setting.label,
+    type: setting.type === "secret" ? "secret" : setting.type === "number" ? "number" : setting.type === "boolean" ? "boolean" : "string",
+    required: setting.required,
+    description: setting.description,
+  }));
+  const validated = validatePluginSettings(specs, provided);
+  if (!validated.ok) return { error: "invalid settings", issues: validated.issues.map((issue) => ({ field: issue.field, message: issue.message })) };
+  try {
+    const stored = readPluginSettings(baseDir, name);
+    writePluginSettings(baseDir, name, stored.settingsVersion, { ...stored.values, ...validated.values });
+    for (const [key, value] of Object.entries(validated.secrets)) {
+      writePluginSecret(baseDir, name, key, value);
+    }
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : `plugin "${name}" settings could not be written` };
+  }
+  return listingOrError(name, baseDir);
+}
+
+/** Read non-secret settings values for editing.  Secret keys appear in
+ *  the listing's configuredKeys, never with values. */
+export function getPluginSettings(
+  name: string,
+  baseDir: string = PLUGINS_DIR,
+): { values: Record<string, JsonValue>; settingsVersion: number } | { error: string } {
+  const listing = listingFor(name, baseDir);
+  if ("error" in listing) return listing;
+  return readPluginSettings(baseDir, name);
+}
+
+/** Named migration result for update warnings. */
+export interface PluginSettingsMigrationResult {
+  added: string[];
+  dropped: string[];
+}
+
+/** Migrate stored settings after an upgrade whose manifest bumped
+ *  settingsVersion: carry declared keys, apply new defaults, drop
+ *  removed keys, and report the diff for the caller to surface. */
+export function migratePluginSettingsOnUpdate(
+  specs: readonly PluginSettingSpec[],
+  baseDir: string,
+  name: string,
+  nextSettingsVersion: number,
+): PluginSettingsMigrationResult {
+  const stored = readPluginSettings(baseDir, name);
+  if (stored.settingsVersion >= nextSettingsVersion) return { added: [], dropped: [] };
+  const { values, added, dropped } = migratePluginSettings(specs, stored.values);
+  writePluginSettings(baseDir, name, nextSettingsVersion, values);
+  return { added, dropped };
+}
+
+/** Drain due pending retries for one plugin on the host tick. */
+export async function drainPluginRetries(
+  name: string,
+  baseDir: string = PLUGINS_DIR,
+): Promise<PluginDeliveryOutcome[]> {
+  return pluginEventBus(baseDir).drainPending(name);
+}
+
 /** Boot-time loader: walk every enabled plugin and import its module.
  *  Errors are logged and the plugin is left disabled, never thrown. */
 export async function bootPluginRuntime(baseDir: string = PLUGINS_DIR): Promise<void> {
@@ -641,7 +1020,7 @@ export async function bootPluginRuntime(baseDir: string = PLUGINS_DIR): Promise<
       trySetPluginEntry({ ...entry, enabled: false }, baseDir);
       continue;
     }
-    const result = await loadPlugin(listing, inputsOrThrow(), baseDir);
+    const result = await loadPlugin(listing, inputsOrThrow(), baseDir, zulipRealmOption());
     if ("error" in result) {
       // loadPlugin already logged the sandbox's stable reason code.
       warnPluginEvent("plugins.boot.disabled", name, "load_failed");
@@ -659,7 +1038,53 @@ export async function _resetForTests(): Promise<void> {
   const names = [...loaded.keys()];
   await Promise.all(names.map((name) => dropLoaded(name)));
   loading.clear();
+  eventBuses.clear();
   runtimeInputs = null;
+  chatInputs = null;
+  decisionHandler = null;
+}
+
+/** Host-side broker files that survive tree rewrites.  Anything else in
+ *  the plugin dir belongs to the plugin's fetched tree. */
+const BROKER_KEEP_FILES = new Set(["plugin-settings.json", "plugin-secrets.json", "plugin-events.json"]);
+
+/** Stash broker files before a tree rewrite.  Files the fetched tree
+ *  also ships are left alone: the plugin owns its tree. */
+function stashBrokerFiles(
+  name: string,
+  fetchedPaths: string[],
+  baseDir: string,
+): Map<string, string> {
+  const stash = new Map<string, string>();
+  const fetched = new Set(fetchedPaths);
+  const dir = join(baseDir, name);
+  let entries: string[] = [];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return stash;
+  }
+  for (const entry of entries) {
+    if (!BROKER_KEEP_FILES.has(entry) && !entry.endsWith(".invalid-")) continue;
+    if (fetched.has(entry)) continue;
+    try {
+      stash.set(entry, readFileSync(join(dir, entry), "utf8"));
+    } catch {
+      // Unreadable broker state is dropped, never blocks an update.
+    }
+  }
+  return stash;
+}
+
+function restoreBrokerFiles(name: string, stash: Map<string, string>, baseDir: string): void {
+  const dir = join(baseDir, name);
+  for (const [entry, content] of stash) {
+    try {
+      writeFileSync(join(dir, entry), content, { mode: 0o600 });
+    } catch {
+      // Best effort: settings can be re-entered from the UI.
+    }
+  }
 }
 
 /** Test-only: a snapshot of loaded modules. */

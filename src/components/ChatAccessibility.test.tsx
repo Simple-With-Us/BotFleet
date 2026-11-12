@@ -1,7 +1,9 @@
 import { describe, it, expect } from "vitest";
+import { readFileSync } from "node:fs";
 import { renderToStaticMarkup } from "react-dom/server";
 import { createElement } from "react";
 import { CopyButton } from "./CopyButton";
+import { WebhookCard } from "./WebhookCard";
 
 /**
  * Accessibility regression tests for the Mac chat surface.
@@ -72,5 +74,97 @@ describe("streaming isolation (ChatView)", () => {
     // An anonymous div announces only its prose — no speaker, no time.
     expect(src).toMatch(/role="article"/);
     expect(src).toMatch(/aria-label=\{`\$\{humanTyped \? "You"/);
+  });
+});
+
+describe("automated instruction card", () => {
+  it("names the card by what fired and the instruction's first line", () => {
+    const html = renderToStaticMarkup(
+      createElement(WebhookCard, {
+        view: {
+          headline: "Scheduled Run",
+          subtitle: "Check the nightly deploy",
+          payload: "Check the nightly deploy\n\nfull body",
+        },
+        detailsNoun: "Run Details",
+      }),
+    );
+    expect(html).toContain(`aria-label="Scheduled Run.\u00A0 Check the nightly deploy"`);
+    expect(html).toContain('aria-expanded="false"');
+    expect(html).toContain('title="Show Run Details"');
+    // The chevron is a picture of the disclosure, not a separate control.
+    expect(html).toContain('aria-hidden="true"');
+  });
+
+  it("names a card that does not open", () => {
+    const html = renderToStaticMarkup(
+      createElement(WebhookCard, {
+        view: { headline: "Run Now", subtitle: "Send the digest" },
+      }),
+    );
+    expect(html).toContain('role="article"');
+    expect(html).toContain(`aria-label="Run Now.\u00A0 Send the digest"`);
+    expect(html).not.toContain("aria-expanded");
+  });
+});
+
+describe("chat header and composer names", () => {
+  it("keeps a spoken name on controls whose visible text folds away", () => {
+    const chat = readFileSync(new URL("./ChatView.tsx", import.meta.url), "utf8");
+    const composer = readFileSync(new URL("./Composer.tsx", import.meta.url), "utf8");
+    const picker = readFileSync(new URL("./ModelPicker.tsx", import.meta.url), "utf8");
+    const phone = readFileSync(new URL("../../ios/App/ChatView.swift", import.meta.url), "utf8");
+
+    expect(chat).toContain('aria-label="More Actions"');
+    expect(chat).toContain('aria-label="Stop This Turn"');
+    expect(chat).toContain('aria-label="Chief of Staff"');
+    expect(chat).toContain('className="sr-only">Working');
+    expect(chat).toContain("speakAloudLabel(");
+    expect(picker).toContain("modelControlLabel(");
+    expect(composer).toContain('aria-label="Attach a File"');
+    expect(composer).toContain('aria-label={label}');
+    expect(composer).toContain('aria-label="Stop This Turn"');
+    expect(composer).toContain('aria-label={recording ? "Stop Dictation" : "Start Dictation"}');
+
+    expect(phone).toContain("ChatAccessibility.instructionCardLabel");
+    expect(phone).toContain('accessibilityLabel(showingPlus ? "Close" : "More Actions")');
+    expect(phone).toContain('accessibilityLabel("Stop This Turn")');
+    expect(phone).toContain('accessibilityLabel("Previous Version")');
+    expect(phone).toContain('accessibilityLabel("Next Version")');
+    expect(phone).toContain(".accessibilityHidden(true)");
+  });
+
+  it("tabs the header from the conversation to its actions, then the composer from attach to send", () => {
+    const chat = readFileSync(new URL("./ChatView.tsx", import.meta.url), "utf8");
+    const composer = readFileSync(new URL("./Composer.tsx", import.meta.url), "utf8");
+    const header = [
+      "aria-label={`Open ${bot.name}'s Profile`}",
+      "showEditButton",
+      'aria-label="Chief of Staff"',
+      'className="sr-only">Working',
+      "<ThreadViewSwitch view={threadView}",
+      'aria-label={trajectoryOpen ? "Search Steps" : "Find in Conversation"}',
+      "<JobsMenu threadId=",
+      'aria-label="Stop This Turn"',
+      "speakAloudLabel(",
+      "<ModelPicker bot={bot}",
+      "<CallButton bot={bot}",
+      "<ChatHeaderOverflowMenu",
+    ];
+    let at = -1;
+    for (const marker of header) {
+      const next = chat.indexOf(marker);
+      expect(next).toBeGreaterThan(at);
+      at = next;
+    }
+
+    const attach = composer.indexOf('aria-label="Attach a File"');
+    const field = composer.indexOf("aria-label={`Message");
+    const stop = composer.indexOf('aria-label="Stop This Turn"');
+    const send = composer.indexOf(': "Send Message"');
+    expect(attach).toBeGreaterThan(-1);
+    expect(field).toBeGreaterThan(attach);
+    expect(stop).toBeGreaterThan(field);
+    expect(send).toBeGreaterThan(stop);
   });
 });

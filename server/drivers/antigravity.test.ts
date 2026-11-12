@@ -261,11 +261,10 @@ describe("Antigravity turns (fake CLI)", () => {
       outputTokens: completed.usage?.output,
       cachedInputTokens: completed.usage?.cachedInput,
     });
-    expect(events.map((event) => [event.metadata.tokenType, event.quantity])).toEqual([
-      ["input", 100],
-      ["cacheRead", 5],
-      ["output", 20],
-    ]);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ quantity: 125, requests: 1, unit: "token" });
+    expect(events[0]!.ai?.tokens).toEqual({ input: 100, cacheRead: 5, output: 20 });
+    expect(events[0]!.metadata).not.toHaveProperty("tokenType");
     expect(events.reduce((total, event) => total + event.quantity, 0)).toBe(125);
   });
 

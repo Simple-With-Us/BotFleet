@@ -18,6 +18,8 @@
 // A turn that is already running is never interrupted by switching Off.  The
 // gate is on STARTING work; it finishes what it began and nothing new follows.
 
+import { joinRefusals } from "./peer-refusals.ts";
+
 /** Real U+00A0 plus a space: the repo's sentence gap for copy that a renderer
  *  would otherwise collapse (see src/lib/remote-access.ts `sentenceGapHtml`). */
 const GAP = "  ";
@@ -37,6 +39,55 @@ export const BOT_OFF_REFUSAL = `This bot is off.${GAP}Turn it on to chat.`;
 /** The composer's disabled-state headline and its button. */
 export const BOT_OFF_COMPOSER_NOTICE = BOT_OFF_REFUSAL;
 export const BOT_OFF_TURN_ON_LABEL = "Turn On";
+
+/** Why a handoff to an Off bot was turned away, in the words the bot that
+ *  asked reads.  It names the bot, because one handoff can name several and
+ *  the asker has to tell which of them said no.  It is not `BOT_OFF_REFUSAL`:
+ *  that tells a person to turn the bot on to chat, which a bot cannot do. */
+export function botOffPeerRefusal(name: string): string {
+  return `${name} is switched off`;
+}
+
+/** What coordinate_bots answers when a handoff names Off bots: each of them,
+ *  once.  The refusal covers the whole request and nothing is recorded, so
+ *  when the handoff named other bots too it says none of them was handed the
+ *  work either (`alsoNamedOthers`), and the asker does not read a refusal of
+ *  one bot as a handoff to the rest. */
+export function botOffPeersRefusal(names: readonly string[], alsoNamedOthers: boolean): string {
+  const reasons = joinRefusals(names.map((name) => botOffPeerRefusal(name)));
+  return alsoNamedOthers ? `${reasons}.${GAP}Nothing was handed off.` : reasons;
+}
+
+// ── switching Off a bot that is working ────────────────────────────────
+//
+// A person who flips this switch on a busy bot may mean either of two very
+// different things, and nothing on screen tells them which one they got:
+// stop the work now, or stop it starting from now.  The switch cannot know,
+// so it asks — but only while a turn is actually running, because that is
+// the only state in which the two answers differ.  An idle bot has nothing
+// to stop, so the switch just flips and no one is interrupted by a dialog.
+//
+// The choice stays in the client.  Off alone still never touches a running
+// turn (see `settleWorkForOffBot`), which is what makes "let it finish" a
+// real choice rather than a delayed stop.
+
+/** What the prompt calls the bot it is asking about. */
+export function botOffWhileRunningTitle(name: string): string {
+  return `${name} Is Working`;
+}
+
+/** What turning Off does to the turn that is running right now, and the two
+ *  ways out of that. */
+export function botOffWhileRunningBody(name: string): string {
+  return `Turning ${name} off stops new work, but the turn running now will keep going.${GAP}Stop it now, or let it finish first.`;
+}
+
+/** Stop the running turn and switch Off.  The only answer that interrupts. */
+export const BOT_OFF_STOP_AND_POWER_OFF = "Stop It And Power Off";
+/** Switch Off now, let the running turn finish.  What Off means on its own. */
+export const BOT_OFF_AFTER_TURN = "Power Off After This Turn";
+/** Change nothing: the bot stays on and its turn keeps running. */
+export const BOT_OFF_KEEP_ON = "Keep It On";
 
 /** Run-history entry for a routine, webhook or resource trigger that fired
  *  while the bot was Off.  Skipped, not retried: it is gone, but recorded. */

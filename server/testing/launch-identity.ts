@@ -18,6 +18,7 @@ export const INHERITED_IDENTITY_ENV = {
   AGENT_LAUNCHER: "inherited-launcher",
   AGENT_SYNC_ATTACH: "1",
   AGENT_SYNC_STATE_DIR: "/tmp/inherited-state",
+  SIMPLE_TOOLS_STATE_DIR: "/tmp/inherited-state",
   CLAUDE_CODE_SESSION_ID: "inherited-claude-session",
   ZULIP_RC: "/tmp/inherited-rc",
   ZULIP_EMAIL: "inherited-bot@example.invalid",
@@ -48,7 +49,8 @@ export function expectLaunchedAs(
   expected: { seat: string | null; session?: string },
 ): void {
   expect(env.AGENT_LAUNCHER).toBe("botfleet");
-  expect(env.AGENT_SYNC_ATTACH).toBe("0");
+  expect(env.SIMPLE_TOOLS_ATTACH).toBe("0");
+  expect(env.AGENT_SYNC_ATTACH).toBeUndefined();
   if (expected.seat) {
     expect(env.AGENT_LAUNCH_SEAT).toBe(expected.seat);
     expect(env.AGENT_SEAT).toBe(expected.seat);
@@ -59,6 +61,7 @@ export function expectLaunchedAs(
   expect(env.AGENT_SESSION).toBe(expected.session);
   expect(env.AGENT_TAG).toBeUndefined();
   expect(env.AGENT_SYNC_STATE_DIR).toBeUndefined();
+  expect(env.SIMPLE_TOOLS_STATE_DIR).toBeUndefined();
   expect(env.CLAUDE_CODE_SESSION_ID).toBeUndefined();
   expect(Object.keys(env).filter((name) => name.toUpperCase().startsWith("ZULIP_"))).toEqual([]);
   expect(JSON.stringify(env)).not.toContain("inherited");

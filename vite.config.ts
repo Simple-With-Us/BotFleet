@@ -16,8 +16,48 @@ export default defineConfig({
   },
   build: {
     sourcemap: Boolean(sentryAuthToken),
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (id.includes("node_modules/react/") || id.includes("node_modules/react-dom/") || id.includes("node_modules/scheduler/")) {
+            return "vendor-react";
+          }
+          if (id.includes("node_modules/lucide-react/")) {
+            return "vendor-lucide";
+          }
+          if (id.includes("node_modules/@sentry/")) {
+            return "vendor-sentry";
+          }
+          if (id.includes("node_modules/posthog-js/")) {
+            return "vendor-posthog";
+          }
+          if (
+            id.includes("node_modules/react-markdown/") ||
+            id.includes("node_modules/remark-") ||
+            id.includes("node_modules/unified/") ||
+            id.includes("node_modules/mdast-") ||
+            id.includes("node_modules/micromark")
+          ) {
+            return "vendor-markdown";
+          }
+        },
+      },
+    },
   },
   plugins: [
+    {
+      // Vitest sets the client environment to noExternal, and Vite 8.3 then
+      // tries to bundle node:sqlite out of the shared test setup.  Happy-dom
+      // never opens a transcript database.  The node test environment keeps
+      // the real builtin.
+      name: "happy-dom-node-sqlite-stub",
+      enforce: "pre",
+      resolveId(id) {
+        if (!process.env.VITEST || id !== "node:sqlite") return null;
+        if (this.environment.name !== "client") return null;
+        return fileURLToPath(new URL("./server/testing/node-sqlite-stub.ts", import.meta.url));
+      },
+    },
     react(),
     tailwindcss(),
     sentryVitePlugin({

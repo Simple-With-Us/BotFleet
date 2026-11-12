@@ -31,6 +31,7 @@ export const COMPANION_PROFILE_PATCH_FIELDS = [
   "autoReview",
   "approvePeerComms",
   "bypassPermissions",
+  "bypassLocalComputer",
   "off",
 ] as const;
 
@@ -113,7 +114,7 @@ export function speechDeviceDisabledReason(
   const onPhone = ctx.platform === "ios";
 
   if (!ctx.agentVoiceCanSpeakOnClient) {
-    return "Pick a voice this agent can speak before enabling playback.";
+    return "Pick a voice this bot can speak before enabling playback.";
   }
 
   if (device === "mac" && personal && !onPhone && ctx.personalVoicePlaybackAllowed === false) {

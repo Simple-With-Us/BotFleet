@@ -15,13 +15,15 @@ export { fleetSeatPromptsEnabled };
  *  once in a composed seat prompt.  Keep them stable; they are the contract. */
 export const FLEET_SHARED_RULE_MARKERS = [
   "fleet Zulip coordination channel",
+  "Wakes and @all",
+  "Linear-backed board CLI",
   "Recall CLI fallback",
   "[to iMessage]",
   "Never post unprompted status spam or routine commentary to Zulip",
   "Extra-ship: NO",
 ] as const;
 
-/** Seat ids with a `bots/<id>.md` file (lowercase): the eleven BotFleet roles. */
+/** Seat ids with a `bots/<id>.md` file (lowercase): the twelve BotFleet roles. */
 export const FLEET_SEAT_IDS = BOTFLEET_ROLES.map((role) => role.id);
 
 export type FleetSeatId = KnownBotfleetRole["id"];

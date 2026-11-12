@@ -34,6 +34,9 @@ struct ChatListView: View {
     @FocusState private var searchFocused: Bool
     /// Drives the live-session "Open BotFleet on Mac" header control.
     @State private var isOpeningMacApp = false
+    /// Raising the desktop is a physical action on a computer the person is
+    /// not holding, so it is confirmed before it is sent.
+    @State private var confirmingOpenMacApp = false
     /// The chat a long-press asked to delete, while its confirmation is up.
     @State private var pendingDelete: Chat?
     /// The chat Move To Section is choosing a section for.
@@ -118,6 +121,15 @@ struct ChatListView: View {
         }
 #endif
         .task { _ = await session.configStatus() }
+        // Hydration carries one message per thread; backfill the stub
+        // threads so pending-approval derivation (Approvals, the list's
+        // waiting markers) sees cards that are not a thread's newest
+        // message.  Keyed on live so a reconnect re-runs it for threads
+        // stubbed by the reconnect hydrate.
+        .task(id: sessionIsLive) {
+            guard sessionIsLive else { return }
+            await session.backfillStubThreads()
+        }
         // Warms `session.instanceDriverKinds` before any chat is opened, so
         // the chat header's provider mark resolves synchronously instead of
         // firing a network call per render. Quiet path — offline/cancel must
@@ -150,6 +162,18 @@ struct ChatListView: View {
             }
             Button("Cancel", role: .cancel) {}
         }
+        .confirmationDialog(
+            "Open BotFleet on Mac?",
+            isPresented: $confirmingOpenMacApp,
+            titleVisibility: .visible
+        ) {
+            Button("Open BotFleet") {
+                Task { await openMacApp() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(openMacConfirmationMessage(session.connection?.name))
+        }
         .modifier(rosterManagement)
         .task(id: query) {
             let expected = query
@@ -177,6 +201,15 @@ struct ChatListView: View {
     /// The roster column, shared by the phone stack and the iPad sidebar.
     private var roster: some View {
         GeometryReader { geo in
+            let waiting = waitingChats
+            // Whole-fleet work: build the summaries once per render, never
+            // per row (BOTFLEET-3R).
+            let all = session.state.chatSummaries
+            let roomRows = roomSummaries(in: all)
+            let botRows = botSummaries(in: all)
+            let botChatRows = botChatSummaries(in: all)
+            let matches = chats(in: all)
+            let showingBotChats = query.isEmpty && botChatsExpanded && !botChatRows.isEmpty
             VStack(spacing: 0) {
                 header
                 StatusBanner()
@@ -186,20 +219,20 @@ struct ChatListView: View {
                         if query.isEmpty {
                             sectionToggle(
                                 title: roomTerms.plural,
-                                count: roomSummaries.count,
+                                count: roomRows.count,
                                 expanded: $roomsExpanded
                             )
                             .padding(.top, 2)
                             if roomsExpanded {
-                                ForEach(Array(roomSummaries.enumerated()), id: \.element.id) { index, summary in
+                                ForEach(Array(roomRows.enumerated()), id: \.element.id) { index, summary in
                                     chatOpener(for: summary.chat) {
                                         ChatRow(
                                             chat: summary.chat,
                                             preview: summary.preview,
                                             at: summary.lastActivity,
                                             state: BotState.forChat(summary.chat, in: session.state),
-                                            waiting: waitingChats.contains(summary.chat.id),
-                                            last: index == roomSummaries.count - 1 && !botsExpanded && customSectionNames.isEmpty && !showingBotChats
+                                            waiting: waiting.contains(summary.chat.id),
+                                            last: index == roomRows.count - 1 && !botsExpanded && customSectionNames.isEmpty && !showingBotChats
                                         )
                                     }
                                 }
@@ -214,7 +247,7 @@ struct ChatListView: View {
 
                             sectionToggle(
                                 title: session.config?.primaryPlural ?? "Bots",
-                                count: botSummaries.count,
+                                count: botRows.count,
                                 expanded: $botsExpanded
                             )
                             .padding(.top, 14)
@@ -245,7 +278,7 @@ struct ChatListView: View {
                                 .padding(.bottom, 4)
                         }
 
-                        let rows = query.isEmpty ? (botsExpanded ? botSummaries : []) : chats
+                        let rows = query.isEmpty ? (botsExpanded ? botRows : []) : matches
                         ForEach(Array(rows.enumerated()), id: \.element.id) { index, summary in
                             chatOpener(for: summary.chat) {
                                 ChatRow(
@@ -253,8 +286,9 @@ struct ChatListView: View {
                                     preview: summary.preview,
                                     at: summary.lastActivity,
                                     state: BotState.forChat(summary.chat, in: session.state),
-                                    waiting: waitingChats.contains(summary.chat.id),
-                                    last: index == rows.count - 1 && nestedTasks(for: summary.chat).isEmpty && (query.isEmpty ? customSectionNames.isEmpty && !showingBotChats : true)
+                                    waiting: waiting.contains(summary.chat.id),
+                                    last: index == rows.count - 1 && nestedTasks(for: summary.chat).isEmpty && (query.isEmpty ? customSectionNames.isEmpty && !showingBotChats : true),
+                                    fill: fillLabel(for: summary.chat)
                                 )
                             }
                             if session.config?.allowsMultipleBotThreads == true {
@@ -262,7 +296,7 @@ struct ChatListView: View {
                                     Button {
                                         Task { await openTask(task, in: summary.chat) }
                                     } label: {
-                                        ThreadRow(task: task, active: summary.chat.threadId == task.threadId)
+                                        ThreadRow(task: task, active: summary.chat.threadId == task.threadId, viewed: session.state.viewingThreadId(forBotId: summary.chat.id) == task.threadId, fill: fillLabel(task: task, chat: summary.chat))
                                     }
                                     .buttonStyle(.plain)
                                 }
@@ -271,7 +305,7 @@ struct ChatListView: View {
 
                         if query.isEmpty {
                             ForEach(customSectionNames, id: \.self) { section in
-                                let sectionRows = summaries(forSection: section)
+                                let sectionRows = summaries(forSection: section, in: all)
                                 if !sectionRows.isEmpty {
                                     let isExpanded = sectionBinding(for: section)
                                     sectionToggle(
@@ -288,9 +322,10 @@ struct ChatListView: View {
                                                     chat: summary.chat,
                                                     preview: summary.preview,
                                                     at: summary.lastActivity,
-                                                    state: BotState.forChat(summary.chat, in: session.state),
-                                                    waiting: waitingChats.contains(summary.chat.id),
-                                                    last: index == sectionRows.count - 1 && nestedTasks(for: summary.chat).isEmpty && (section == customSectionNames.last ? !showingBotChats : false)
+                                    state: BotState.forChat(summary.chat, in: session.state),
+                                    waiting: waiting.contains(summary.chat.id),
+                                    last: index == sectionRows.count - 1 && nestedTasks(for: summary.chat).isEmpty && (section == customSectionNames.last ? !showingBotChats : false),
+                                    fill: fillLabel(for: summary.chat)
                                                 )
                                             }
                                             if session.config?.allowsMultipleBotThreads == true {
@@ -298,7 +333,7 @@ struct ChatListView: View {
                                                     Button {
                                                         Task { await openTask(task, in: summary.chat) }
                                                     } label: {
-                                                        ThreadRow(task: task, active: summary.chat.threadId == task.threadId)
+                                                        ThreadRow(task: task, active: summary.chat.threadId == task.threadId, viewed: session.state.viewingThreadId(forBotId: summary.chat.id) == task.threadId, fill: fillLabel(task: task, chat: summary.chat))
                                                     }
                                                     .buttonStyle(.plain)
                                                 }
@@ -309,23 +344,24 @@ struct ChatListView: View {
                             }
                         }
 
-                        if query.isEmpty, !botChatSummaries.isEmpty {
+                        if query.isEmpty, !botChatRows.isEmpty {
                             sectionToggle(
                                 title: "Bot Chats",
-                                count: botChatSummaries.count,
+                                count: botChatRows.count,
                                 expanded: $botChatsExpanded
                             )
                             .padding(.top, 14)
                             if botChatsExpanded {
-                                ForEach(Array(botChatSummaries.enumerated()), id: \.element.id) { index, summary in
+                                ForEach(Array(botChatRows.enumerated()), id: \.element.id) { index, summary in
                                     chatOpener(for: summary.chat) {
                                         ChatRow(
                                             chat: summary.chat,
                                             preview: summary.preview,
                                             at: summary.lastActivity,
                                             state: BotState.forChat(summary.chat, in: session.state),
-                                            waiting: waitingChats.contains(summary.chat.id),
-                                            last: index == botChatSummaries.count - 1
+                                            waiting: waiting.contains(summary.chat.id),
+                                            last: index == botChatRows.count - 1,
+                                            fill: fillLabel(for: summary.chat)
                                         )
                                     }
                                 }
@@ -342,8 +378,8 @@ struct ChatListView: View {
                 .refreshable { await session.refresh() }
                 .overlay {
                     if query.isEmpty
-                        ? botSummaries.isEmpty && roomSummaries.isEmpty && botChatSummaries.isEmpty && searchHits.isEmpty
-                        : chats.isEmpty && searchHits.isEmpty
+                        ? botRows.isEmpty && roomRows.isEmpty && botChatRows.isEmpty && searchHits.isEmpty
+                        : matches.isEmpty && searchHits.isEmpty
                     {
                         ContentUnavailableView(
                             query.isEmpty ? "No chats yet" : "Nothing matches",
@@ -419,25 +455,31 @@ struct ChatListView: View {
             // running, so the phone stays .live and the offline status banner
             // — the action's other home — is hidden.  A live session needs
             // its own entry point.
+            //
+            // The control used to be a bare `macwindow` glyph, which told a
+            // sighted person nothing about what it did; it now carries the
+            // words "Open on Mac", and the words stand in for the confirmation
+            // a tap no longer implies by itself.
             if sessionIsLive, session.connection != nil {
                 Button {
-                    Task { await openMacApp() }
+                    confirmingOpenMacApp = true
                 } label: {
                     Group {
                         if isOpeningMacApp {
-                            ProgressView()
-                                .controlSize(.small)
+                            ProgressView("Opening on Mac…")
+                                .font(.system(size: 13, weight: .medium))
                         } else {
-                            Image(systemName: "macwindow")
-                                .font(.system(size: 18, weight: .medium))
+                            Label("Open on Mac", systemImage: "macwindow")
+                                .font(.system(size: 13, weight: .medium))
                         }
                     }
                     .foregroundStyle(Color.primary)
-                    .frame(width: 44, height: 44)
+                    .padding(.horizontal, 12)
+                    .frame(minHeight: 44)
                 }
                 .buttonStyle(.plain)
                 .glassCapsule()
-                .accessibilityLabel("Open BotFleet on Mac")
+                .accessibilityLabel(isOpeningMacApp ? "Opening BotFleet on Mac" : "Open BotFleet on Mac")
                 .disabled(isOpeningMacApp)
             }
 
@@ -480,7 +522,7 @@ struct ChatListView: View {
             // An unauthorized failure already flips the session to
             // .unauthorized, whose banner explains itself — don't also alert.
             if case .live = session.status {
-                session.actionError = "Could not open BotFleet on Mac.  Check that your Mac is awake and reachable."
+                session.actionError = openMacFailureCopy(error)
             }
         }
     }
@@ -582,9 +624,16 @@ struct ChatListView: View {
 
     // MARK: - Data
 
+    // `chatSummaries` walks every chat's transcripts.  Read it once per render
+    // (see `roster`) and filter that copy — reading it per row, as these
+    // helpers once did, hung the main thread for ~35s (BOTFLEET-3R).
+
     private var chats: [ChatSummary] {
-        let all = session.state.chatSummaries
-        guard !query.isEmpty else { return botSummaries }
+        chats(in: session.state.chatSummaries)
+    }
+
+    private func chats(in all: [ChatSummary]) -> [ChatSummary] {
+        guard !query.isEmpty else { return botSummaries(in: all) }
         return all.filter {
             $0.chat.name.localizedCaseInsensitiveContains(query)
                 || $0.chat.subtitle.localizedCaseInsensitiveContains(query)
@@ -597,16 +646,16 @@ struct ChatListView: View {
         return section.isEmpty
     }
 
-    private var botSummaries: [ChatSummary] {
-        session.state.chatSummaries.filter { 
+    private func botSummaries(in all: [ChatSummary]) -> [ChatSummary] {
+        all.filter { 
             if case .bot = $0.chat { return isUnsectioned($0.chat) }
             return false 
         }
     }
 
     /// User rooms only.  Bot-to-bot DMs sit in Bot Chats, like the Mac sidebar.
-    private var roomSummaries: [ChatSummary] {
-        session.state.chatSummaries.filter {
+    private func roomSummaries(in all: [ChatSummary]) -> [ChatSummary] {
+        all.filter {
             if case .room = $0.chat { return !$0.chat.isBotToBot && isUnsectioned($0.chat) }
             return false
         }
@@ -622,8 +671,8 @@ struct ChatListView: View {
         )
     }
 
-    private func summaries(forSection section: String) -> [ChatSummary] {
-        session.state.chatSummaries.filter {
+    private func summaries(forSection section: String, in all: [ChatSummary]) -> [ChatSummary] {
+        all.filter {
             !$0.chat.isBotToBot && $0.chat.section?.trimmingCharacters(in: .whitespacesAndNewlines) == section
         }
     }
@@ -661,12 +710,34 @@ struct ChatListView: View {
         )
     }
 
-    private var botChatSummaries: [ChatSummary] {
-        session.state.chatSummaries.filter(\.chat.isBotToBot)
+    private func botChatSummaries(in all: [ChatSummary]) -> [ChatSummary] {
+        all.filter(\.chat.isBotToBot)
     }
 
-    private var showingBotChats: Bool {
-        query.isEmpty && botChatsExpanded && !botChatSummaries.isEmpty
+    private func catalogWindow(for selection: ModelSelection) -> Int? {
+        session.cachedInstances
+            .first { $0.instanceId == selection.instanceId }?
+            .models.options.first { $0.id == selection.model }?
+            .contextWindow
+    }
+
+    private func fillLabel(for chat: Chat) -> String? {
+        guard case let .bot(bot) = chat else { return nil }
+        let task = bot.tasks?.first { $0.threadId == bot.threadId }
+        return ContextMeterMath.badge(
+            used: task?.usage?.lastInput,
+            reportedWindow: task?.usage?.contextWindow,
+            catalogWindow: catalogWindow(for: task?.modelSelection ?? bot.modelSelection)
+        )
+    }
+
+    private func fillLabel(task: BotTask, chat: Chat) -> String? {
+        guard case let .bot(bot) = chat else { return nil }
+        return ContextMeterMath.badge(
+            used: task.usage?.lastInput,
+            reportedWindow: task.usage?.contextWindow,
+            catalogWindow: catalogWindow(for: task.modelSelection ?? bot.modelSelection)
+        )
     }
 
     private func nestedTasks(for chat: Chat) -> [BotTask] {
@@ -679,12 +750,41 @@ struct ChatListView: View {
 
     private func openTask(_ task: BotTask, in chat: Chat) async {
         guard case let .bot(bot) = chat else { return }
-        await session.switchTask(task, for: bot)
-        if let live = session.state.bot(bot.id) { open(Chat.bot(live)) }
+        let live = session.state.bot(bot.id) ?? bot
+        // While the bot works, a non-active thread opens for reading only —
+        // becoming the execution target stays gated on the turn finishing,
+        // exactly as the tab switch was.
+        switch threadPickIntent(
+            busy: live.busy == true,
+            active: task.threadId == live.threadId,
+            viewing: session.state.viewingThreadId(forBotId: live.id) != nil,
+            canView: true
+        ) {
+        case .switchTo:
+            await session.switchTask(task, for: live)
+            if let next = session.state.bot(live.id) { open(Chat.bot(next)) }
+        case .view, .viewActive:
+            await session.viewThread(task, for: live)
+            if let next = session.state.bot(live.id) { open(Chat.bot(next)) }
+        case .none:
+            // The active thread with no view pinned: nothing to switch or
+            // view, but the row was tapped from the list, so the active
+            // chat still has to open.
+            open(Chat.bot(live))
+        }
     }
 
+    /// Chats with an unanswered approval. Whole-fleet work: read it once per
+    /// render (see `roster`), never once per row — per-row reads hung the
+    /// main thread past the watchdog on large fleets (BOTFLEET-30).
     private var waitingChats: Set<String> {
-        Set(session.state.pendingApprovals.compactMap { session.state.chat(forThread: $0.threadId)?.id })
+        let state = session.state
+        let threads = Set(state.pendingApprovals.map(\.threadId))
+        guard !threads.isEmpty else { return [] }
+        var ids = Set<String>()
+        for bot in state.bots where threads.contains(bot.threadId) { ids.insert(bot.id) }
+        for room in state.rooms where threads.contains(room.threadId) { ids.insert(room.id) }
+        return ids
     }
 
     private func sectionLabel(_ text: String) -> some View {
@@ -981,21 +1081,38 @@ struct GroupTile: View {
 struct ThreadRow: View {
     let task: BotTask
     var active = false
+    /// Open for reading while another thread runs. The eye says which of
+    /// the non-active rows is on screen; the active row keeps no mark.
+    var viewed = false
+    var fill: String? = nil
 
     var body: some View {
         HStack(spacing: 10) {
-            Image(systemName: "text.bubble")
+            Image(systemName: viewed ? "eye" : "text.bubble")
                 .font(.system(size: 14, weight: .medium))
                 .foregroundStyle(Color.secondary)
                 .frame(width: 22)
             VStack(alignment: .leading, spacing: 1) {
-                Text(task.title.isEmpty ? "Untitled" : task.title)
-                    .font(.system(size: 15, weight: active ? .semibold : .regular))
-                    .foregroundStyle(Color.primary)
-                    .lineLimit(1)
-                Text(RelativeStamp.list(task.lastActivity ?? task.createdAt))
-                    .font(.system(size: 12))
-                    .foregroundStyle(Color.secondary)
+                HStack(spacing: 6) {
+                    Text(task.title.isEmpty ? "Untitled Thread" : task.title)
+                        .font(.system(size: 15, weight: active ? .semibold : .regular))
+                        .foregroundStyle(Color.primary)
+                        .lineLimit(1)
+                    if let fill {
+                        Text(fill)
+                            .font(.system(size: 11, weight: .medium))
+                            .monospacedDigit()
+                            .foregroundStyle(Color.secondary)
+                    }
+                }
+                HStack(spacing: 4) {
+                    Text(RelativeStamp.list(task.lastActivity ?? task.createdAt))
+                    if viewed {
+                        Text("· Viewing")
+                    }
+                }
+                .font(.system(size: 12))
+                .foregroundStyle(Color.secondary)
             }
             Spacer(minLength: 0)
         }
@@ -1003,7 +1120,9 @@ struct ThreadRow: View {
         .padding(.trailing, 16)
         .padding(.vertical, 8)
         .contentShape(Rectangle())
-        .accessibilityLabel(task.title.isEmpty ? "Untitled thread" : task.title)
+        .accessibilityLabel(
+            (task.title.isEmpty ? "Untitled Thread" : task.title) + (viewed ? ", viewing" : "")
+        )
     }
 }
 
@@ -1014,6 +1133,7 @@ struct ChatRow: View {
     var state: BotState = .idle
     var waiting = false
     var last = false
+    var fill: String? = nil
 
     var body: some View {
         HStack(alignment: .top, spacing: 0) {
@@ -1045,6 +1165,17 @@ struct ChatRow: View {
                             .foregroundStyle(Color.primary)
                             .lineLimit(1)
                             .layoutPriority(1)
+
+                        if let fill {
+                            Text(fill)
+                                .font(.system(size: 12, weight: .medium))
+                                .monospacedDigit()
+                                .foregroundStyle(Color.secondary)
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 3)
+                                .background(Capsule().fill(Color.secondary.opacity(0.15)))
+                                .accessibilityLabel("Context \(fill) used")
+                        }
 
                         if chat.isOff {
                             Text("Off")
@@ -1208,6 +1339,9 @@ struct StatusBanner: View {
     @EnvironmentObject private var session: Session
     @State private var isOpening = false
     @State private var openError: String?
+    /// Raising the desktop is a physical action on a computer the person is
+    /// not holding, so it is confirmed before it is sent.
+    @State private var confirmingOpenMac = false
 
     var body: some View {
         Group {
@@ -1223,27 +1357,22 @@ struct StatusBanner: View {
             case let .offline(reason):
                 VStack(spacing: 6) {
                     banner(reason, systemImage: "wifi.slash", tint: .orange)
-
-                    if session.connection != nil {
-                        if isOpening {
-                            banner("Opening BotFleet on Mac…", systemImage: "arrow.triangle.2.circlepath", tint: .secondary)
-                        } else if let openError {
-                            banner(openError, systemImage: "exclamationmark.triangle", tint: .red) {
-                                Task { await openMacApp() }
-                            }
-                        } else {
-                            banner("Open BotFleet on Mac", systemImage: "macwindow", tint: .secondary) {
-                                Task { await openMacApp() }
-                            }
-                        }
-                    }
+                    openMacBanner
                 }
             case .macOffline:
-                // No `openMacApp` follow-up here on purpose: that call goes
-                // through the same paired route that has been failing with
-                // gateway errors, so it would just fail the same way.  The
-                // banner's default tap already retries via `session.refresh()`.
-                banner("Your Mac is not running BotFleet", systemImage: "wifi.slash", tint: .orange)
+                // This used to be deliberately left without an "open on Mac"
+                // follow-up: the call went out over the same route that was
+                // failing with gateway errors, so offering it only produced a
+                // second failure.  That objection no longer holds — the
+                // harness now answers a refused launch with the wording that
+                // names the setting to change, so the button is the way a
+                // person finds out why.  The banner above still refreshes the
+                // connection on a default tap; this second one asks the Mac to
+                // come up.
+                VStack(spacing: 6) {
+                    banner("Your Mac is not running BotFleet", systemImage: "wifi.slash", tint: .orange)
+                    openMacBanner
+                }
             case .unauthorized:
                 banner("This phone was unpaired on the computer.", systemImage: "lock.slash", tint: .red)
             }
@@ -1253,6 +1382,38 @@ struct StatusBanner: View {
         .animation(.default, value: openError)
         .onChange(of: session.status) { _ in
             openError = nil
+        }
+        .confirmationDialog(
+            "Open BotFleet on Mac?",
+            isPresented: $confirmingOpenMac,
+            titleVisibility: .visible
+        ) {
+            Button("Open BotFleet") {
+                Task { await openMacApp() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(openMacConfirmationMessage(session.connection?.name))
+        }
+    }
+
+    /// The launch control's second home, shared by the offline and
+    /// Mac-offline banners.  It confirms rather than sends, and says why a
+    /// launch was refused when the harness says so.
+    @ViewBuilder
+    private var openMacBanner: some View {
+        if session.connection != nil {
+            if isOpening {
+                banner("Opening BotFleet on Mac…", systemImage: "arrow.triangle.2.circlepath", tint: .secondary)
+            } else if let openError {
+                banner(openError, systemImage: "exclamationmark.triangle", tint: .red) {
+                    confirmingOpenMac = true
+                }
+            } else {
+                banner("Open BotFleet on Mac", systemImage: "macwindow", tint: .secondary) {
+                    confirmingOpenMac = true
+                }
+            }
         }
     }
 
@@ -1284,10 +1445,32 @@ struct StatusBanner: View {
             try await session.openDesktopApp()
             await session.refresh()
         } catch {
-            openError = "Could not open BotFleet on Mac.  Check that your Mac is awake and reachable."
+            openError = openMacFailureCopy(error)
         }
         isOpening = false
     }
+}
+
+/// What the confirmation says, wherever it is shown: what will happen, on
+/// which computer, and where the toggle that governs it lives.
+fileprivate func openMacConfirmationMessage(_ computerName: String?) -> String {
+    let computer = computerName ?? "your Mac"
+    return "This will launch the BotFleet desktop window on your Mac (\(computer)).\u{00A0} Remote desktop launch can be managed in Mac settings."
+}
+
+/// One failure string for both call sites, so the header and the offline
+/// banner never disagree.  The harness's own refusal — "Opening the desktop
+/// app from iOS is disabled in Mac settings", or the not-from-this-computer
+/// refusal — is the only copy that names what to change, so it passes
+/// through under a lead-in, the way `Session.swift` already frames a server
+/// message.  Only a failure with no server wording falls back to the generic
+/// transport advice.
+fileprivate func openMacFailureCopy(_ error: Error) -> String {
+    let lead = "Could not open BotFleet on Mac."
+    if let api = error as? APIError, let message = api.errorDescription, !message.isEmpty {
+        return "\(lead)\u{00A0} \(message)"
+    }
+    return "\(lead)\u{00A0} Check that your Mac is awake and reachable."
 }
 
 struct SearchHitRow: View {

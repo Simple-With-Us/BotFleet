@@ -29,15 +29,19 @@ export function ChatFindBar({ threadId, onClose }: { threadId: string; onClose: 
       return;
     }
     setLoading(true);
+    const controller = new AbortController();
     const timer = window.setTimeout(() => {
-      void api(`/api/search?q=${encodeURIComponent(trimmed)}&limit=100&threadId=${encodeURIComponent(threadId)}`)
+      void api(
+        `/api/search?q=${encodeURIComponent(trimmed)}&limit=100&threadId=${encodeURIComponent(threadId)}`,
+        { signal: controller.signal },
+      )
         .then((body) => {
           if (request !== requestRef.current) return;
           setHits(Array.isArray(body?.hits) ? body.hits : []);
           setIndex(0);
         })
         .catch((error) => {
-          if (request !== requestRef.current) return;
+          if (request !== requestRef.current || controller.signal.aborted) return;
           setHits([]);
           dispatch({ type: "error", message: error instanceof Error ? error.message : "Search failed" });
         })
@@ -45,7 +49,10 @@ export function ChatFindBar({ threadId, onClose }: { threadId: string; onClose: 
           if (request === requestRef.current) setLoading(false);
         });
     }, 180);
-    return () => window.clearTimeout(timer);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
   }, [dispatch, query, threadId]);
 
   const land = (next: number) => {

@@ -2,8 +2,9 @@ import { z } from "zod";
 import type { Pronunciation } from "../../shared/pronunciations.ts";
 import { utterancesWithSpans } from "../../shared/speech-spans.ts";
 import { spokenReply, stripVoiceSummaryTags } from "../../shared/voice-summary.ts";
-import { sanitizeForTTS } from "./minimax.ts";
-import { speakable } from "./speech-text.ts";
+import { aiTokensFromChatUsage, ChatUsageSchema } from "../ai-usage.ts";
+import { telemetry } from "../telemetry.ts";
+import { sanitizeForTTSByLine } from "./minimax.ts";
 
 export const DeepSeekChatMessageSchema = z.object({
   role: z.string().optional(),
@@ -22,7 +23,7 @@ export const DeepSeekChatResponseSchema = z.object({
   created: z.number().optional(),
   model: z.string().optional(),
   choices: z.array(DeepSeekChatChoiceSchema).optional(),
-  usage: z.record(z.string(), z.unknown()).optional(),
+  usage: ChatUsageSchema.optional().catch(undefined),
 });
 
 export type DeepSeekChatResponse = z.infer<typeof DeepSeekChatResponseSchema>;
@@ -41,48 +42,61 @@ export function resolveDeepSeekKey(providedKey?: string): string {
   return "";
 }
 
+/** Report one distiller call to Usage Monitor (BF-2435).  Every call that
+ * came back with a usage figure was billed, whether or not its rewrite was
+ * usable, so this runs on the response and not on the verdict.  DeepSeek
+ * reports the cached share as `prompt_cache_hit_tokens`. */
+function reportSummaryUsage(requestedModel: string, data: DeepSeekChatResponse, startedAt: number): void {
+  const tokens = aiTokensFromChatUsage(data.usage);
+  if (Object.keys(tokens).length === 0) return;
+  telemetry.trackAux({
+    kind: "speech-summary",
+    provider: "deepseek",
+    service: data.model || requestedModel,
+    label: "BotFleet speech summary",
+    unit: "token",
+    latencyMs: Date.now() - startedAt,
+    ai: {
+      model: { requested: requestedModel, served: data.model },
+      tokens,
+      durationMs: Date.now() - startedAt,
+      billingMode: "payg",
+    },
+  });
+}
+
 export function completionsUrl(baseUrl?: string): string {
   return normalizeDeepSeekChatUrl(baseUrl);
 }
 
 export const DEEPSEEK_FLASH_TTS_PROMPT = `<system_prompt>
-You are a highly efficient, specialized post-processing model designed to translate raw, agentic LLM responses into perfectly optimized, spoken-word text for real-time Text-to-Speech (TTS) engines (specifically MiniMax speech synthesis).
+You are a specialized post-processing model that prepares agent replies for Apple Personal Voice (on-device AVSpeechSynthesizer).  BotFleet also plays the same script through other engines; the app adapts pause markers per voice.
 <core_directive>
-Distill the incoming raw text into flowing, natural, and conversational prose. Strip out all visual artifacts, structure, and text that cannot or should not be read aloud. Do not add any conversational preamble (e.g., "Sure, here is the text..."). Output ONLY the final spoken-word text.
+Prepare the incoming text for spoken delivery.  Keep every word from the input in the same order.  Do not paraphrase, summarize, shorten, expand, or add facts.  Do not retell lists as narrative prose (no "First," "Next," or "Finally,").  Do not spell out numbers, acronyms, URLs, paths, or codes unless they already appear as words in the input.  Output ONLY the adjusted text, with no preamble.
 </core_directive>
-<rules_for_spoken_prose>
-1. NO MARKDOWN: Remove all asterisks (**), hashtags (#), headers, backticks, and visual delimiters.
-2. NO BULLET POINTS: Convert lists or bullet points into complete, linked spoken sentences using conversational transitions (e.g., "First, ... Next, ... Finally, ...").
-3. NO EMOJIS: Delete all emojis, icons, and special symbols entirely.
-4. PARAGRAPH BREAKS & BREATHING: Keep sentences concise. Long, winding sentences leave voice engines breathless.
-</rules_for_spoken_prose>
+<allowed_changes>
+1. MARKDOWN DELIMITERS ONLY: Remove markdown syntax characters (asterisks, backticks, heading hashes, list markers, table pipes) while keeping the underlying words.  Do not replace a code block or link with a description; leave the words that remain after stripping delimiters.
+2. PUNCTUATION: Fix punctuation so Personal Voice pauses naturally.  Replace em-dashes (—), en-dashes (–), and floating clause hyphens with a comma or a period.  Replace ellipses (...) with a period.  You may end a run-on with a period and capitalize the next word only when splitting an existing sentence, without changing any words.
+3. PAUSE MARKERS: Insert <#0.3#> (brief breath) or <#0.5#> (topic shift) only between two complete sentences, never at the start or end, never two in a row.  The app strips these for on-device voices and turns them into silence; hosted voices may honor them.
+4. PROSODY TAGS: You may insert MiniMax sound tags (breath), (chuckle), or (sighs) at most once per paragraph, only when the input clearly calls for it, written exactly in that form.  Never use other parentheses or brackets.
+5. EMOJI: Delete emoji and pictographic symbols only; do not delete words.
+</allowed_changes>
 <pacing_and_punctuation>
-The TTS engine interprets punctuation strictly:
-1. NO DASHES (EM-DASH, EN-DASH, HYPHENS): NEVER use em-dashes (—), en-dashes (–), or floating hyphens ( - ) between clauses. The TTS engine drops pauses on dashes, running words together breathlessly. Always replace dashes with a comma, a period, or an inline pause tag.
-2. NO ELLIPSES: NEVER use ellipses (...). They cause the speech engine to stall or draw out syllables awkwardly. End completed thoughts cleanly with a period.
-3. INLINE PAUSES: Use natural commas and periods for standard cadence. When a distinct, deliberate breath or topical transition is needed between major thoughts or steps, insert a native pause tag: <#0.3#> (for a brief pause) or <#0.5#> (for a half-second topic shift).
-4. NO PARENTHESES OR BRACKETS: Never put explanatory text inside parentheses ( ) or brackets [ ]. Parentheses are reserved by the voice engine for sound and IPA tags. Unpack parenthetical remarks into separate spoken sentences.
+Apple Personal Voice pauses on punctuation and utterance boundaries, not on dashes:
+1. NO DASHES: Never leave em-dashes, en-dashes, or isolated hyphens between clauses.
+2. NO ELLIPSES: Never leave ellipses in the output.
+3. NO RAW URL SCHEMES: Do not add https:// or new domains.  Leave hostnames and paths that are already in the input.
 </pacing_and_punctuation>
-<text_normalization>
-You must explicitly write out how abbreviations, numbers, and symbols should sound when spoken:
-- NUMBERS & CURRENCY: Convert "$50" to "fifty dollars". Convert "3.5" to "three point five".
-- PHONE NUMBERS & CODES: Write out sequential individual numbers where necessary, or format them clearly (e.g., "one eight hundred, five five five, zero one two three").
-- TIME & DATES: Convert "10:30 PM" to "ten thirty p m". Convert "10/24" to "October twenty-fourth".
-- ACRONYMS & INITIALISMS: Spell out letters with spaces or periods (e.g., "A P I" or "A. P. I.", "U S A", "C P U"), never with hyphens.
-- URLS & EMAILS: Convert "example.com" to "example dot com". Convert "info@site.com" to "info at site dot com".
-- MATH SYMBOLS: Convert "+" to "plus", "=" to "equals", and "%" to "percent".
-</text_normalization>
 <negative_constraints>
-- DO NOT use em-dashes (—), en-dashes (–), or isolated hyphens ( - ).
-- DO NOT use ellipses (...).
-- DO NOT use parentheses ( ) or brackets [ ] around normal text.
-- DO NOT output any thinking blocks, \`<thought>\` tags, or step-by-step reasoning.
-- DO NOT leave technical shorthand raw. If a TTS engine reads it, it must sound human.
-- DO NOT read out raw git commit hashes, SHA fingerprints, or long hex strings. Omit them completely or summarize simply.
+- DO NOT paraphrase, summarize, or omit sentences, list items, paths, hashes, or identifiers.
+- DO NOT spell out numbers, currency, times, dates, acronyms, or URLs.
+- DO NOT convert bullet or numbered lists into flowing prose.
+- DO NOT use parentheses or brackets except the allowed MiniMax sound tags above.
+- DO NOT output thinking blocks, \`<thought>\` tags, or step-by-step reasoning.
 </negative_constraints>
 <example_transformation>
-INPUT: "Here are your options for the flight: * Flight AA2314 -> Departs at 3:15 PM ($250) — fastest option * Flight DL982 -> Departs at 6:00 PM ($310) Check details at https://jetblue.com..."
-OUTPUT: "Here are your options for the flight. <#0.3#> First, American Airlines flight twenty-three fourteen departs at three fifteen p m, costing two hundred and fifty dollars, which is the fastest option. <#0.3#> Next, Delta flight nine eighty-two departs at six p m, costing three hundred and ten dollars. You can check the details at jet blue dot com slash status."
+INPUT: "Here are your options for the flight:\n* Flight AA2314 -> Departs at 3:15 PM ($250) — fastest option\n* Flight DL982 -> Departs at 6:00 PM ($310)\nCheck details at https://jetblue.com/status"
+OUTPUT: "Here are your options for the flight. <#0.3#> Flight AA2314 departs at 3:15 PM ($250), fastest option. <#0.3#> Flight DL982 departs at 6:00 PM ($310). Check details at https://jetblue.com/status"
 </example_transformation>
 </system_prompt>`;
 
@@ -199,7 +213,9 @@ function stripUnclosedFences(text: string): string {
 function cleanSummaryForTTS(summary: string): string {
   const withoutTags = summary.replace(/\[\/?(?:voice_summary|written_answer)\]/gi, "");
   const stripped = stripUnclosedFences(withoutTags);
-  return sanitizeForTTS(speakable(stripped));
+  // Personal Voice distillation keeps the reply's words; acoustic cleanup only.
+  // Preserve newlines so downstream speakable() can split headings and lists.
+  return sanitizeForTTSByLine(stripped.trim());
 }
 
 /**
@@ -288,15 +304,15 @@ export async function summarizeForVoiceDetailed(
     const finish = choice?.finish_reason;
     if (finish === "length") return fallback("truncated");
     if (finish && finish !== "stop") return fallback("incomplete");
-    // A finished rewrite is used however much shorter than the reply it is:
-    // the prompt asks the model to leave out hashes, code and links, so a
-    // condensed rewrite is what it is for, not a sign of lost content.
+    // A finished rewrite may be shorter only when the model dropped markdown
+    // delimiters; paraphrase or summary is a prompt violation, not expected.
     const cleaned = cleanSummaryForTTS(content);
     if (!cleaned) return null;
     return { text: cleaned, source: "summary" };
   };
 
   try {
+    let startedAt = Date.now();
     const response = await fetch(endpoint, {
       method: "POST",
       headers: {
@@ -318,11 +334,13 @@ export async function summarizeForVoiceDetailed(
 
     if (response.ok) {
       const parsed = DeepSeekChatResponseSchema.safeParse(await response.json());
+      if (parsed.success) reportSummaryUsage("deepseek-flash", parsed.data, startedAt);
       const verdict = judge(parsed.success ? parsed.data : null);
       if (verdict) return verdict;
     }
 
     // Fallback: try deepseek-chat if deepseek-flash returned empty or non-200
+    startedAt = Date.now();
     const fallbackResponse = await fetch(endpoint, {
       method: "POST",
       headers: {
@@ -343,6 +361,7 @@ export async function summarizeForVoiceDetailed(
 
     if (fallbackResponse.ok) {
       const parsed = DeepSeekChatResponseSchema.safeParse(await fallbackResponse.json());
+      if (parsed.success) reportSummaryUsage("deepseek-chat", parsed.data, startedAt);
       const verdict = judge(parsed.success ? parsed.data : null);
       if (verdict) return verdict;
     }

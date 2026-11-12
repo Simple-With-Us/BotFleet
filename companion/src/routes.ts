@@ -83,6 +83,12 @@ export function isCloudDesktopJoin(method: string, path: string): boolean {
  *     (server/auto-approve.ts excludes `scope === "local-computer"`), so host
  *     control still asks even on a bot the phone put in bypass, and the phone
  *     may switch it on for any bot.
+ *   - `bypassLocalComputer` is the owner's second switch (2026-10-14): it buys
+ *     that last edge for a bot that does NOT hold This Mac.  Where the bot CAN
+ *     use This Mac it is refused, exactly as `autoApprove` is, because both
+ *     name the same act — unattended control of the real desktop — and the
+ *     warning in front of that is the Mac's.  That per-bot refusal needs the
+ *     stored bot and lives in the harness profile route, not here.
  *   - The This Mac grant itself is still the Mac's alone (see `computers`). */
 export const COMPANION_PROFILE_PATCH_FIELDS = [
   "name",
@@ -109,6 +115,13 @@ export const COMPANION_PROFILE_PATCH_FIELDS = [
   "autoReview",
   "approvePeerComms",
   "bypassPermissions",
+  // Bypass, extended to the requests that control This Mac.  On the list so the
+  // phone can save it for a bot that does NOT hold This Mac, which is the same
+  // shape as `autoApprove` above: allowed here, refused by the harness route
+  // when the value would grant host control.  Turning it back off is always the
+  // phone's, so it has to be here or the person could switch it on from the
+  // desktop and never be able to undo it from their pocket.
+  "bypassLocalComputer",
   // The bot's On/Off switch (shared/bot-power.ts).  It only ever stops or
   // resumes work the person could already start by messaging the bot, grants
   // no capability, and the phone has to be able to turn a bot back On: the
@@ -256,6 +269,7 @@ const ALLOWED: ReadonlyArray<{ method: string; path: RegExp }> = [
   // carries API keys — ever accepting a write from a device.
   { method: "PATCH", path: /^\/api\/terminology$/ },
   { method: "PATCH", path: /^\/api\/conversation-mode$/ },
+  { method: "PATCH", path: /^\/api\/busy-send-default$/ },
   // Display preferences only — never secrets. Mirrors terminology: each
   // setting gets its own narrow route so /api/config stays write-closed.
   { method: "PATCH", path: /^\/api\/features$/ },
@@ -280,6 +294,17 @@ const ALLOWED: ReadonlyArray<{ method: string; path: RegExp }> = [
   // Settings instead of leaving a silent push path looking healthy.  Counts
   // and Apple's own status strings only — never anything about the key.
   { method: "GET", path: /^\/api\/companion\/push-health$/ },
+
+  // Speech-to-speech call tokens.  The phone gets the *token*, never the key:
+  // the harness mints a short-lived single-session token from a credential
+  // only it holds, exactly as the desktop does over IPC.  Two doors rather
+  // than one query parameter, so neither call can be widened into the other —
+  // GET learns only which providers exist (booleans), POST is the only thing
+  // that mints.  This is the one place a paired phone may cause a call to a
+  // paid provider, which is why the harness throttles it; a stolen phone
+  // token buys a rate-limited short-lived token, never a key.
+  { method: "GET", path: /^\/api\/sts\/status$/ },
+  { method: "POST", path: /^\/api\/sts\/token$/ },
 
   // the fleet, and making a bot
   { method: "GET", path: /^\/api\/bots$/ },

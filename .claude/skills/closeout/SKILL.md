@@ -12,7 +12,7 @@ description: Finish a Monet work unit — THE BOARD, effort log, GitHub issue, S
 > Cursor, Grok, Grok Bot, Codex, AG, DeepSeek, Kimi, and Fx have their own skill dirs and must not take identity from here.
 
 
-Start-of-work is a triple claim.  End-of-work is the same three surfaces plus Notes when the owner might ask "what happened?"
+Start-of-work is a Linear claim plus Zulip post.  End-of-work closes Linear and Zulip plus Notes when the owner might ask "what happened?"
 
 ## 1. Truth check
 
@@ -20,36 +20,32 @@ Start-of-work is a triple claim.  End-of-work is the same three surfaces plus No
 - Production verified?  (`deploy-verify`)  Completed ≠ Deployed.
 - Uncommitted files?  Commit or explicitly report why not (failing tests, secrets, owner hold).
 
-## 2. THE BOARD
+## 2. Linear
 
 ```bash
 board status <id> completed --resolution "Landed in #<PR>.  <one line>."
 # or: deployed — only after health verify
 ```
 
-If the item is an `effort-row` / `github-issue`, writeback copies that status to the live effort log and GitHub within ~10 min.  Still land `docs/EFFORT-LOG.md` in the app PR.  A comment is useful context; the 15-min grace window keeps sync from clobbering the status you just set.
+Effort logs are archived — do not edit live `~/apps/*-EFFORT-LOG.md` or repo `docs/EFFORT-LOG.md`.  A Linear comment is useful context for peers.
 
-## 3. Effort board + issues
+## 3. Linear + GitHub
 
-Live board first, then `docs/EFFORT-LOG.md` in the landing commit.
-
-- **Completed** = merged to main.
+- **Completed** = merged to `main` and reflected on the Linear issue.
 - **Deployed** = released and verified (say how).
-- Never delete another row.  Correct in place with `(Monet): …` and the date.
+- If you executed a numbered GitHub issue, comment or close it so it is not abandoned.
+- Cross-app work gets a Linear issue (or explicit comment) on each affected app team.
 
-Board and GitHub issues must match.  Prefer landing the mirror so `effort-issues-sync` closes the issue.  If you executed a numbered issue, comment/close it so it is not abandoned.
-
-Cross-app work gets a row on each affected board.
-
-## 4. Slack
+## 4. Zulip (#Work-In-Progress)
 
 ```bash
-AGENT_TAG="${AGENT_SEAT:?set MONET, CLAUDE, or RENOIR}" /Users/jay/apps/agent-sync-websocket.py --post "[$AGENT_SEAT] sync-N
+printf '%s\n' "[$AGENT_SEAT] sync-N
 repo: <project>
 state: DONE
 pr: #<n>
 board: <id>
-work: <what landed>"
+work: <what landed>" > /tmp/sync-note.md && chmod 600 /tmp/sync-note.md
+AGENT_SEAT="${AGENT_SEAT:?set MONET, CLAUDE, or RENOIR}" simple-chat post --topic "<project> sync" --body-file /tmp/sync-note.md
 ```
 
 Not `FLEET` for a normal closeout.
@@ -74,7 +70,7 @@ If you stop without merge: board stays accurate (`open` or a comment "parked bec
 
 ## Canon
 
-- `/Users/jay/apps/AGENT-SYNC.md` — triple closeout; Apple Notes; Mac local processes; always-commit
+- `/Users/jay/apps/FLEET-PROTOCOL.md` — triple closeout; Apple Notes; Mac local processes; always-commit
 - `/Users/jay/apps/EFFORT-LOG-PROTOCOL.md`
 - Skills: `board-ops`, `apple-notes`, `deploy-verify`, `land-lane`
 
@@ -83,4 +79,4 @@ If you stop without merge: board stays accurate (`open` or a comment "parked bec
 Throughout execution, maintain a brief big-picture outline of task state. When the task is complete, this outline naturally becomes your **Closeout Report** by:
 1. Marking all milestones as completed with commit/PR references.
 2. Replacing in-flight WIP notes with live production deployment verification (`/api/health` 200, build SHA).
-3. If closing out work adopted from a peer, posting a direct `[<SUB_TAG>-><ORIGINAL_TAG>]` Slack notification to `#agent-sync`.
+3. If closing out work adopted from a peer, posting a direct `[<SUB_TAG>-><ORIGINAL_TAG>]` notification to `#Work-In-Progress`.

@@ -58,6 +58,6 @@ export async function synthesize(text: string, voiceId: string, key: string): Pr
     throw new Error(`xAI speech failed (HTTP ${response.status}).`);
   }
   const bytes = new Uint8Array(await response.arrayBuffer());
-  recordSpeechUsage("xai", text.length, "provider");
+  recordSpeechUsage("xai", text.length, "provider", { service: "xai-tts" });
   return { bytes, mime: response.headers.get("content-type")?.split(";")[0]?.trim() || "audio/mpeg" };
 }

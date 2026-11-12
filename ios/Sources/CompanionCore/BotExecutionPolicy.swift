@@ -131,6 +131,69 @@ public enum BotExecutionPolicy {
         }
     }
 
+    // MARK: - Bypass Including This Mac
+
+    /// Whether the phone may ask for Bypass Including This Mac to be turned ON.
+    ///
+    /// The same answer as `mayTurnOnAuto`, and for the same reason: the act
+    /// being authorized is unattended control of the person's real desktop, and
+    /// the warning in front of it is the Mac's.  Plain Bypass is the phone's to
+    /// set (`pairedProfileRefusal`) precisely because on its own it stops there.
+    public static func mayTurnOnLocalBypass(computers: [String]?) -> Bool {
+        !BotComputers.holdsThisMac(computers)
+    }
+
+    /// What the sheet shows for the second switch.
+    ///
+    /// Turning it on is the computer's when the bot can use This Mac, the same
+    /// 403 the profile route answers.  Turning it off is always the phone's,
+    /// including then, so a switch the computer turned on is not stuck on.
+    /// While Bypass itself is off and this switch is off, there is nothing to
+    /// switch: the row says so instead of a control that does nothing.
+    public enum LocalBypassControl: Equatable {
+        case toggle
+        case macOnly
+        case needsBypass
+    }
+
+    public static func localBypassControl(
+        computers: [String]?,
+        bypassOn: Bool,
+        localBypassOn: Bool
+    ) -> LocalBypassControl {
+        if localBypassOn { return .toggle }
+        if !mayTurnOnLocalBypass(computers: computers) { return .macOnly }
+        if !bypassOn { return .needsBypass }
+        return .toggle
+    }
+
+    /// The computer's own refusal, plus the half the phone still owns.
+    public static let localBypassMacOnlyNote =
+        "Bypass Including This Mac can only be turned on in BotFleet on your computer for a bot that can use This Mac.\u{00A0} Turning it off works from here."
+
+    public static let localBypassTitle = "Enable Bypass Including This Mac?"
+
+    public static let localBypassConfirmButton = "Enable Bypass Including This Mac"
+
+    /// What the extra switch actually buys, stated plainly.  Bypass on its own
+    /// stops at the edge of the real desktop, which is why it read as weaker
+    /// than Auto Mode; this is the switch that says so out loud.
+    public static func localBypassWarning(botName: String) -> String {
+        "\(botName) will run commands on this Mac without waiting for approval cards.\u{00A0} Nothing it does here will ask, including destructive actions and credential files, and including while a webhook or alert runs it with nobody watching.\u{00A0} Only turn this on for a bot you would trust with the machine itself."
+    }
+
+    /// The line under the second switch.  It never claims to be a setting of
+    /// its own, because without Bypass it does nothing.
+    public static func localBypassSummary(isOn: Bool) -> String {
+        isOn
+            ? "Bypass now includes this Mac.\u{00A0} Nothing it does here asks."
+            : "Off.\u{00A0} Bypass still stops before anything that controls this Mac."
+    }
+
+    /// Shown in place of the switch while Bypass is off.
+    public static let localBypassNeedsBypass =
+        "Turn on Bypass Permissions first \u{2014} this only extends what Bypass already skips."
+
     // MARK: - What the engine can do
 
     /// Whether the engine can answer a bounded review, which Auto Review

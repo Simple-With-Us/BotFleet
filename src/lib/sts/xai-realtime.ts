@@ -35,6 +35,7 @@ import {
   type StsStartOptions,
   type StsTranscriptLine,
 } from "./types";
+import { xaiRealtimeSubprotocol } from "../../../shared/sts-tokens";
 
 const XAI_REALTIME_ENDPOINT = "wss://api.x.ai/v1/realtime";
 const XAI_REALTIME_MODEL = "grok-voice-latest";
@@ -591,7 +592,11 @@ export function createXaiStsSession(): StsSession {
       }
       const url = new URL(XAI_REALTIME_ENDPOINT);
       url.searchParams.set("model", XAI_REALTIME_MODEL);
-      const ws = new WebSocket(url.toString());
+      // The browser WebSocket API cannot set an Authorization header, so the xAI
+      // ephemeral token travels as the subprotocol.  Without this the socket
+      // connects unauthenticated: it opens, the handshake succeeds, audio flows
+      // up, and the vendor sends nothing back.
+      const ws = new WebSocket(url.toString(), [xaiRealtimeSubprotocol(token)]);
       socket = ws;
       const ready = new Promise<void>((resolve, reject) => {
         handshake = { resolve, reject };

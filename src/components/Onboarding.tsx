@@ -197,7 +197,7 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
             <BotMascot color="green" state="happy" size={72} />
             <h1 className="mt-4 text-[20px] font-semibold text-ink">Welcome to BotFleet</h1>
             <p className="mt-1.5 text-center text-[14px] leading-relaxed text-ink-secondary">
-              Bots that do real work on their own computer. Tell us who you are
+              Bots that do real work on their own computer.{'\u00A0 '}Tell us who you are
               and we&rsquo;ll let you know when big things ship.
             </p>
             <input
@@ -228,7 +228,7 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
                 track("email_skipped");
                 setStep(1);
               }}
-              className="mt-3 text-[12px] text-ink-secondary hover:text-ink"
+              className="mt-3 inline-flex min-h-11 items-center justify-center px-3 text-[13px] text-ink-secondary hover:text-ink"
             >
               Maybe Later
             </button>
@@ -326,7 +326,7 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
             <button onClick={() => setStep(3)} className="mt-5 w-full rounded-lg bg-accent py-2.5 text-[15px] font-medium text-white">
               Continue
             </button>
-            <button onClick={() => setStep(3)} className="mt-3 text-[12px] text-ink-secondary hover:text-ink">
+            <button onClick={() => setStep(3)} className="mt-3 inline-flex min-h-11 items-center justify-center px-3 text-[13px] text-ink-secondary hover:text-ink">
               Skip for Now
             </button>
           </div>

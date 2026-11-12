@@ -1,7 +1,7 @@
 // The Zulip source end to end against a fake Zulip server: real HTTP, real
 // event queues, real files on disk, and a fake `startTurn` standing in for
 // the harness.  Each test boots its own fake realm and its own data folder.
-import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -19,6 +19,9 @@ const PEER = 50;
 const PLUMBER = 101;
 const FIXER = 102;
 const ADMIN = 103;
+const ENGINEER = 104;
+const TRADER = 105;
+const BUILDER = 106;
 const PLUMBER_THREAD = "thread-bot-plumber";
 // Shaped like a Zulip API key (32 mixed-case letters and digits) so the
 // outbound scan fires; built at runtime so no token-shaped literal is in the source.
@@ -138,11 +141,443 @@ afterEach(async () => {
   await fake.stop();
 });
 
+describe("outgoing webhook convergence", () => {
+  it("fetches the authoritative message and deduplicates against the native queue", async () => {
+    const hub = makeHub();
+    await connected(hub);
+    const session = sessionOf(hub);
+    session.creds!.outgoingWebhookToken = "test-outgoing-token";
+    busy.add("bot-plumber");
+    const id = fake.postStream(JAY, "builds", "Outgoing webhook", "@**BF-Plumber** please check this", "website");
+
+    expect(hub.enqueueOutgoingWebhook("BF-Plumber", id)).toBe("accepted");
+    await hub.drain();
+    const authoritative = await session.client!.message(id);
+    hub.handleMessage(session, authoritative); // Native queue can race the webhook fetch.
+    expect(session.state.pending.flatMap((unit) => unit.items.map((item) => item.id))).toEqual([id]);
+    expect(fake.requests.some((request) => request.path === `messages/${id}`)).toBe(true);
+
+    busy.delete("bot-plumber");
+    await hub.drain();
+    await waitFor(() => turns.length === 1, "one turn from converged deliveries");
+    expect(turns[0]?.text).toContain("please check this");
+  });
+
+  it("does not advance the native cursor past lower message IDs when a high webhook ID arrives", async () => {
+    let hub = makeHub();
+    await connected(hub);
+    let session = sessionOf(hub);
+    session.creds!.outgoingWebhookToken = "test-outgoing-token";
+    const initialCursor = session.state.cursor;
+    const highWebhookId = 1300;
+    const higher = {
+      id: highWebhookId, sender_id: JAY, sender_email: "jay@zulip.test", sender_full_name: "Jay Wedgeworth",
+      client: "website", type: "stream", display_recipient: "builds", subject: "Webhook cursor",
+      stream_id: 7, content: "@**BF-Plumber** higher id", timestamp: fake.clock, flags: ["mentioned"],
+    // SAFETY: `higher` supplies every required message field, and this test only varies its known fixture values.
+    } as ZulipMessage;
+
+    busy.add("bot-plumber");
+    hub.handleMessage(session, higher, "webhook");
+    expect(session.state.cursor).toBe(initialCursor);
+    expect(session.state.pending.flatMap((unit) => unit.items.map((item) => item.id))).toEqual([highWebhookId]);
+    await hub.stop(); // Simulate a restart after accepting the webhook row.
+    hub = makeHub();
+    await connected(hub);
+    session = sessionOf(hub);
+    const lowerId = 1200;
+    hub.handleMessage(session, { ...higher, id: lowerId, content: "@**BF-Plumber** lower native id" }, "native");
+    expect(session.state.pending.flatMap((unit) => unit.items.map((item) => item.id))).toEqual([highWebhookId, lowerId]);
+  });
+
+  it("retains a spooled row while its session is missing and routes it once the session rebuilds", async () => {
+    // Quiet intervals: only manual drains run, so each drain below is exact.
+    // The row file itself is the assertion: turns can also arrive over the
+    // native event queue, so only the spool file proves the drain kept it.
+    const hub = makeHub({
+      timings: {
+        coalesceMs: 30,
+        drainIntervalMs: 3_600_000,
+        reconcileIntervalMs: 3_600_000,
+        backoffMs: [30, 60],
+        postSpacingMs: 0,
+        retryBaseMs: 30,
+        eventsTimeoutMs: 5_000,
+      },
+    });
+    await connected(hub);
+    sessionOf(hub).creds!.outgoingWebhookToken = "test-outgoing-token";
+    const id = fake.postStream(JAY, "builds", "Outgoing webhook", "@**BF-Plumber** retained row", "website");
+    expect(hub.enqueueOutgoingWebhook("BF-Plumber", id)).toBe("accepted");
+    const rowFile = join(dataDir, "zulip", "outgoing", `bot-plumber-${id}.json`);
+    expect(existsSync(rowFile)).toBe(true);
+    // Simulate the restart window: the durable row is on disk but no session
+    // exists yet, while settings still want the bot.
+    settings.bots = {};
+    hub.reconcile();
+    expect(hub.sessionFor("bot-plumber")).toBeUndefined();
+    settings.bots = { "bot-plumber": { role: "BF-Plumber" } };
+    await hub.drain();
+    // Zulip already answered 200 so it will not resend: the row must survive
+    // a drain with no session instead of being dropped as unroutable.
+    expect(existsSync(rowFile)).toBe(true);
+    // Once the session rebuilds, the retained row still routes into a turn.
+    await waitFor(() => {
+      hub.reconcile();
+      return hub.sessionFor("bot-plumber") !== undefined;
+    }, "session rebuilt");
+    await connected(hub);
+    sessionOf(hub).creds!.outgoingWebhookToken = "test-outgoing-token";
+    await hub.drain();
+    await waitFor(() => turns.length === 1, "retained row routed after rebuild");
+    expect(turns[0]?.text).toContain("retained row");
+    // The native queue can start the turn before the asynchronous outgoing
+    // drain has persisted its state and removed the spool row. Wait for that
+    // completion instead of racing filesystem latency on Windows.
+    await waitFor(() => !existsSync(rowFile), "retained spool row removed after replay");
+    expect(existsSync(rowFile)).toBe(false);
+  });
+
+  it("decides a sessionless bot once per drain however many rows are spooled", async () => {
+    const botExistsCalls: string[] = [];
+    const hub = makeHub({
+      botExists: (botId) => {
+        botExistsCalls.push(botId);
+        return botId.startsWith("bot-");
+      },
+      timings: {
+        coalesceMs: 30,
+        drainIntervalMs: 3_600_000,
+        reconcileIntervalMs: 3_600_000,
+        backoffMs: [30, 60],
+        postSpacingMs: 0,
+        retryBaseMs: 30,
+        eventsTimeoutMs: 5_000,
+      },
+    });
+    await connected(hub);
+    sessionOf(hub).creds!.outgoingWebhookToken = "test-outgoing-token";
+    const rowFiles: string[] = [];
+    for (const label of ["one", "two", "three"]) {
+      const id = fake.postStream(JAY, "builds", "Outgoing webhook", `@**BF-Plumber** memoized ${label}`, "website");
+      expect(hub.enqueueOutgoingWebhook("BF-Plumber", id)).toBe("accepted");
+      rowFiles.push(join(dataDir, "zulip", "outgoing", `bot-plumber-${id}.json`));
+    }
+    settings.bots = {};
+    hub.reconcile();
+    expect(hub.sessionFor("bot-plumber")).toBeUndefined();
+    settings.bots = { "bot-plumber": { role: "BF-Plumber" } };
+    botExistsCalls.length = 0;
+    await hub.drain();
+    // One lookup for the bot, not one per spooled row, and every row survives.
+    expect(botExistsCalls.filter((botId) => botId === "bot-plumber")).toHaveLength(1);
+    for (const rowFile of rowFiles) expect(existsSync(rowFile)).toBe(true);
+  });
+
+  it("drops a spooled row for a bot removed from settings", async () => {
+    // Quiet intervals: only manual drains run, so each drain below is exact.
+    const hub = makeHub({
+      timings: {
+        coalesceMs: 30,
+        drainIntervalMs: 3_600_000,
+        reconcileIntervalMs: 3_600_000,
+        backoffMs: [30, 60],
+        postSpacingMs: 0,
+        retryBaseMs: 30,
+        eventsTimeoutMs: 5_000,
+      },
+    });
+    await connected(hub);
+    sessionOf(hub).creds!.outgoingWebhookToken = "test-outgoing-token";
+    const id = fake.postStream(JAY, "builds", "Outgoing webhook", "@**BF-Plumber** removed bot", "website");
+    expect(hub.enqueueOutgoingWebhook("BF-Plumber", id)).toBe("accepted");
+    const rowFile = join(dataDir, "zulip", "outgoing", `bot-plumber-${id}.json`);
+    expect(existsSync(rowFile)).toBe(true);
+    // The bot is gone from settings for good: its row can never route.
+    settings.bots = {};
+    hub.reconcile();
+    expect(hub.sessionFor("bot-plumber")).toBeUndefined();
+    await hub.drain();
+    expect(existsSync(rowFile)).toBe(false);
+  });
+});
+
+describe("outgoing webhook role aliases", () => {
+  it("serves a renamed role at its own URL and at the legacy URL, with the target bot's own token", async () => {
+    fake.addUser({ user_id: ENGINEER, full_name: "BF-Engineer", email: "bf-engineer-bot@zulip.test", key: "engineer-test-key" });
+    fake.addUser({ user_id: TRADER, full_name: "BF-Trader", email: "bf-trader-bot@zulip.test", key: "trader-test-key" });
+    writeRc("BF-Engineer", "bf-engineer-bot@zulip.test", "engineer-test-key");
+    writeRc("BF-Trader", "bf-trader-bot@zulip.test", "trader-test-key");
+    settings.bots = {
+      "bot-engineer": { role: "BF-Engineer" },
+      "bot-trader": { role: "BF-Trader" },
+    };
+    const hub = makeHub();
+    await connected(hub, "bot-engineer");
+    await connected(hub, "bot-trader");
+    const engineer = hub.sessionFor("bot-engineer")!;
+    const trader = hub.sessionFor("bot-trader")!;
+    engineer.creds!.outgoingWebhookToken = "engineer-outgoing-token";
+    trader.creds!.outgoingWebhookToken = "trader-outgoing-token";
+
+    // The renamed bot answers at its own URL.
+    expect(hub.outgoingWebhookAvailability("BF-ENGINEER")).toBe("ready");
+    expect(hub.authorizeOutgoingWebhook("BF-ENGINEER", "bf-engineer-bot@zulip.test", "engineer-outgoing-token")).toBe("ok");
+    expect(hub.authorizeOutgoingWebhook("BF-ENGINEER", "bf-engineer-bot@zulip.test", "wrong-token")).toBe("unauthorized");
+    // ...and at the legacy URL Zulip still calls.
+    expect(hub.outgoingWebhookAvailability("BF-BUILDER")).toBe("ready");
+    expect(hub.authorizeOutgoingWebhook("BF-BUILDER", "bf-engineer-bot@zulip.test", "engineer-outgoing-token")).toBe("ok");
+    expect(hub.authorizeOutgoingWebhook("BF-BUILDER", "bf-engineer-bot@zulip.test", "wrong-token")).toBe("unauthorized");
+    // The alias is not a second identity: another bot's token does not pass.
+    expect(hub.authorizeOutgoingWebhook("BF-BUILDER", "bf-trader-bot@zulip.test", "trader-outgoing-token")).toBe("unauthorized");
+    expect(hub.authorizeOutgoingWebhook("BF-BUILDER", "bf-trader-bot@zulip.test", "engineer-outgoing-token")).toBe("unauthorized");
+    const engineerMessage = fake.postStream(JAY, "builds", "Outgoing webhook", "engineer wake", "website");
+    expect(hub.enqueueOutgoingWebhook("BF-BUILDER", engineerMessage)).toBe("accepted");
+    expect(hub.enqueueOutgoingWebhook("BF-ENGINEER", engineerMessage)).toBe("duplicate");
+
+    // A role the alias does not name is untouched.
+    expect(hub.outgoingWebhookAvailability("BF-TRADER")).toBe("ready");
+    expect(hub.authorizeOutgoingWebhook("BF-TRADER", "bf-trader-bot@zulip.test", "trader-outgoing-token")).toBe("ok");
+    expect(hub.authorizeOutgoingWebhook("BF-TRADER", "bf-engineer-bot@zulip.test", "engineer-outgoing-token")).toBe("unauthorized");
+    const traderMessage = fake.postStream(JAY, "builds", "Outgoing webhook", "trader wake", "website");
+    expect(hub.enqueueOutgoingWebhook("BF-TRADER", traderMessage)).toBe("accepted");
+    expect(hub.outgoingWebhookAvailability("BF-PLUMBER")).toBe("unknown");
+  });
+
+  it("binds BF-Builder and BF-Engineer once, under the canonical role", async () => {
+    fake.addUser({ user_id: ENGINEER, full_name: "BF-Engineer", email: "bf-engineer-bot@zulip.test", key: "engineer-test-key" });
+    fake.addUser({ user_id: BUILDER, full_name: "BF-Builder", email: "bf-builder-bot@zulip.test", key: "builder-test-key" });
+    writeRc("BF-Engineer", "bf-engineer-bot@zulip.test", "engineer-test-key");
+    writeRc("BF-Builder", "bf-builder-bot@zulip.test", "builder-test-key");
+    settings.bots = {
+      "bot-engineer": { role: "BF-Engineer" },
+      "bot-builder": { role: "BF-Builder" },
+    };
+    const hub = makeHub();
+    await connected(hub, "bot-engineer");
+    // Both bindings fold to BF-Engineer, so the second is a duplicate, not a
+    // second identity: one session answers, and the legacy webhook URL still
+    // reaches it.
+    expect(hub.sessionFor("bot-builder")).toBeUndefined();
+    expect(logs.some((line) => line.includes("already bound to another bot"))).toBe(true);
+    const engineer = hub.sessionFor("bot-engineer")!;
+    engineer.creds!.outgoingWebhookToken = "engineer-outgoing-token";
+    expect(hub.outgoingWebhookAvailability("BF-BUILDER")).toBe("ready");
+    expect(hub.authorizeOutgoingWebhook("BF-BUILDER", "bf-engineer-bot@zulip.test", "engineer-outgoing-token")).toBe("ok");
+    const message = fake.postStream(JAY, "builds", "Outgoing webhook", "builder alias wake", "website");
+    expect(hub.enqueueOutgoingWebhook("BF-BUILDER", message)).toBe("accepted");
+    expect(existsSync(join(dataDir, "zulip", "outgoing", `bot-engineer-${message}.json`))).toBe(true);
+  });
+});
+
+describe("legacy role bindings", () => {
+  it("posts and wakes a BF-Builder bot as BF-Engineer, on the BF-Builder credential", async () => {
+    fake.addUser({ user_id: BUILDER, full_name: "BF-Builder", email: "bf-builder-bot@zulip.test", key: "builder-test-key" });
+    writeRc("BF-Builder", "bf-builder-bot@zulip.test", "builder-test-key");
+    settings.bots = {
+      "bot-builder": { role: "BF-Builder" },
+    };
+    const hub = makeHub();
+    await connected(hub, "bot-builder");
+    const session = sessionOf(hub, "bot-builder");
+    expect(session.role).toBe("BF-Engineer");
+    expect(session.credentialRole).toBe("BF-Builder");
+    expect(session.creds!.email).toBe("bf-builder-bot@zulip.test");
+
+    // A @BF-Builder mention still wakes it: mention matching is by the Zulip
+    // identity, not the canonical role.
+    fake.postStream(JAY, "builds", "Legacy mention", "@**BF-Builder** check the build", "website");
+    await waitFor(() => turns.length === 1, "a legacy-mention wake");
+    expect(turns[0]!.botId).toBe("bot-builder");
+    expect(turns[0]!.text).toContain("woken on Zulip as BF-Engineer");
+    expect(turns[0]!.text).toContain("[BF-ENGINEER]");
+
+    const result = await hub.send({
+      botId: "bot-builder",
+      threadId: "thread-bot-builder",
+      tool: "reply",
+      args: { content: "Build is green." },
+    });
+    expect(result.ok).toBe(true);
+    expect(result.text).toContain("as BF-Engineer");
+    expect(fake.postsBy(BUILDER).at(-1)!.content).toBe("[BF-ENGINEER] Build is green.");
+  });
+
+  it("matches a late plugin decision's canonical account to a legacy-bound bot", async () => {
+    fake.addUser({ user_id: BUILDER, full_name: "BF-Builder", email: "bf-builder-bot@zulip.test", key: "builder-test-key" });
+    writeRc("BF-Builder", "bf-builder-bot@zulip.test", "builder-test-key");
+    settings.bots = {
+      "bot-plumber": { role: "BF-Plumber" },
+      "bot-builder": { role: "BF-Builder" },
+    };
+    const hub = makeHub();
+    await connected(hub);
+    await connected(hub, "bot-builder");
+    // The mentioned bot is busy, so the native wake waits and the late
+    // decision's route to the plumber is the only turn that can start.
+    busy.add("bot-builder");
+    const id = fake.postStream(JAY, "builds", "Late route", "@**BF-Builder** late decision", "website");
+    await hub.applyLatePluginDecision(
+      {
+        eventId: `zulip:BF-Engineer:${id}`,
+        type: "zulip.message",
+        source: { platform: "zulip", accountId: "BF-Engineer" },
+        occurredAt: "2026-10-28T00:00:00.000Z",
+        receivedAt: "2026-10-28T00:00:01.000Z",
+        refs: { messageId: id, conversationKey: "stream:builds/Late route" },
+        mentions: ["BF-Engineer"],
+        context: { botId: "bot-builder", wakeReason: "mention", senderKind: "owner" },
+      },
+      { targetBotId: "bot-plumber", hint: "the plumber takes the late route" },
+    );
+    await waitFor(() => turns.length === 1, "a late-routed turn");
+    expect(turns[0]!.botId).toBe("bot-plumber");
+    expect(turns[0]!.text).toContain("the plumber takes the late route");
+    expect(turns[0]!.text).toContain("from BF-Engineer");
+  });
+
+  it("matches a late plugin decision's legacy account to a legacy-bound bot", async () => {
+    fake.addUser({ user_id: BUILDER, full_name: "BF-Builder", email: "bf-builder-bot@zulip.test", key: "builder-test-key" });
+    writeRc("BF-Builder", "bf-builder-bot@zulip.test", "builder-test-key");
+    settings.bots = {
+      "bot-plumber": { role: "BF-Plumber" },
+      "bot-builder": { role: "BF-Builder" },
+    };
+    const hub = makeHub();
+    await connected(hub);
+    await connected(hub, "bot-builder");
+    // The mentioned bot is busy, so the native wake waits and the late
+    // decision's route to the plumber is the only turn that can start.
+    busy.add("bot-builder");
+    const id = fake.postStream(JAY, "builds", "Late legacy route", "@**BF-Builder** late legacy decision", "website");
+    // A persisted envelope recovered after the upgrade carries the pre-rename
+    // account id: it still finds its bot.
+    await hub.applyLatePluginDecision(
+      {
+        eventId: `zulip:BF-Builder:${id}`,
+        type: "zulip.message",
+        source: { platform: "zulip", accountId: "BF-Builder" },
+        occurredAt: "2026-10-28T00:00:00.000Z",
+        receivedAt: "2026-10-28T00:00:01.000Z",
+        refs: { messageId: id, conversationKey: "stream:builds/Late legacy route" },
+        mentions: ["BF-Builder"],
+        context: { botId: "bot-builder", wakeReason: "mention", senderKind: "owner" },
+      },
+      { targetBotId: "bot-plumber", hint: "the plumber takes the legacy late route" },
+    );
+    await waitFor(() => turns.length === 1, "a legacy late-routed turn");
+    expect(turns[0]!.botId).toBe("bot-plumber");
+    expect(turns[0]!.text).toContain("the plumber takes the legacy late route");
+    expect(turns[0]!.text).toContain("from BF-Engineer");
+  });
+
+  it("keeps a BF-Builder state file across the canonical fold, relabelled to BF-Engineer", async () => {
+    fake.addUser({ user_id: BUILDER, full_name: "BF-Builder", email: "bf-builder-bot@zulip.test", key: "builder-test-key" });
+    writeRc("BF-Builder", "bf-builder-bot@zulip.test", "builder-test-key");
+    // A state file saved before the rename, under the configured legacy name.
+    mkdirSync(join(dataDir, "zulip"), { recursive: true });
+    writeFileSync(join(dataDir, "zulip", "bot-builder.json"), JSON.stringify({
+      version: 1,
+      role: "BF-Builder",
+      cursor: 123,
+      handled: [11, 12, 13],
+      pending: [{
+        origin: { kind: "stream", channel: "builds", topic: "Before the rename" },
+        items: [{
+          id: 124, senderId: JAY, senderName: "Jay Wedgeworth", senderIsBot: false,
+          owner: true, ownerViaApi: false, content: "@**BF-Builder** finish this", timestamp: 1,
+        }],
+        createdAt: 1, updatedAt: 1, attempts: 0, notBefore: 0,
+      }],
+      wakes: [],
+      chains: {},
+      dms: [],
+    }));
+    settings.bots = {
+      "bot-builder": { role: "BF-Builder" },
+    };
+    // Busy, so the restored pending unit waits instead of starting a turn.
+    busy.add("bot-builder");
+    const hub = makeHub();
+    await connected(hub, "bot-builder");
+    const session = sessionOf(hub, "bot-builder");
+    expect(session.role).toBe("BF-Engineer");
+    expect(session.state.role).toBe("BF-Engineer");
+    expect(session.state.cursor).toBe(123);
+    expect(session.state.handled).toEqual([11, 12, 13]);
+    expect(session.state.pending).toHaveLength(1);
+    // The relabel persists: the next save writes the canonical role.
+    session.save(true);
+    const saved = JSON.parse(readFileSync(join(dataDir, "zulip", "bot-builder.json"), "utf8"));
+    expect(saved.role).toBe("BF-Engineer");
+    expect(saved.cursor).toBe(123);
+    expect(saved.handled).toEqual([11, 12, 13]);
+    expect(saved.pending).toHaveLength(1);
+  });
+
+  it("keeps a BF-Builder state file after the credential migrates to BF-Engineer", async () => {
+    fake.addUser({ user_id: ENGINEER, full_name: "BF-Engineer", email: "bf-engineer-bot@zulip.test", key: "engineer-test-key" });
+    writeRc("BF-Engineer", "bf-engineer-bot@zulip.test", "engineer-test-key");
+    // The owner renamed the bot and its credential; the state file on disk
+    // still carries the pre-rename role.
+    mkdirSync(join(dataDir, "zulip"), { recursive: true });
+    writeFileSync(join(dataDir, "zulip", "bot-engineer.json"), JSON.stringify({
+      version: 1,
+      role: "BF-Builder",
+      cursor: 456,
+      handled: [21, 22],
+      pending: [],
+      wakes: [],
+      chains: {},
+      dms: [],
+    }));
+    settings.bots = {
+      "bot-engineer": { role: "BF-Engineer" },
+    };
+    const hub = makeHub();
+    await connected(hub, "bot-engineer");
+    const session = sessionOf(hub, "bot-engineer");
+    expect(session.role).toBe("BF-Engineer");
+    expect(session.credentialRole).toBe("BF-Engineer");
+    expect(session.state.role).toBe("BF-Engineer");
+    expect(session.state.cursor).toBe(456);
+    expect(session.state.handled).toEqual([21, 22]);
+  });
+
+  it("does not carry a BF-Plumber state file into a BF-Engineer session", async () => {
+    fake.addUser({ user_id: ENGINEER, full_name: "BF-Engineer", email: "bf-engineer-bot@zulip.test", key: "engineer-test-key" });
+    writeRc("BF-Engineer", "bf-engineer-bot@zulip.test", "engineer-test-key");
+    mkdirSync(join(dataDir, "zulip"), { recursive: true });
+    writeFileSync(join(dataDir, "zulip", "bot-engineer.json"), JSON.stringify({
+      version: 1,
+      role: "BF-Plumber",
+      cursor: 999,
+      handled: [7, 8],
+      pending: [],
+      wakes: [],
+      chains: {},
+      dms: [],
+    }));
+    settings.bots = {
+      "bot-engineer": { role: "BF-Engineer" },
+    };
+    const hub = makeHub();
+    await connected(hub, "bot-engineer");
+    const session = sessionOf(hub, "bot-engineer");
+    expect(session.state.role).toBe("BF-Engineer");
+    // Fresh, not carried: the first connection starts the cursor from now
+    // (the fake realm's newest id), and the Plumber ring stays behind.
+    expect(session.state.cursor).not.toBe(999);
+    expect(session.state.handled).toEqual([]);
+    expect(session.state.pending).toEqual([]);
+  });
+});
+
 describe("waking", () => {
   it("wakes the mentioned bot with an untrusted wrapper, and its reply lands in the origin topic", async () => {
     const hub = makeHub();
     await connected(hub);
-    fake.postStream(JAY, "agent-sync", "BF tunnel", "@**BF-Plumber** check the tunnel", "website");
+    fake.postStream(JAY, "Work-In-Progress", "BF tunnel", "@**BF-Plumber** check the tunnel", "website");
     await waitFor(() => turns.length === 1, "a turn");
     expect(turns[0]!.botId).toBe("bot-plumber");
     const text = turns[0]!.text;
@@ -153,7 +588,7 @@ describe("waking", () => {
     const result = await hub.send({ botId: "bot-plumber", threadId: PLUMBER_THREAD, tool: "reply", args: { content: "Tunnel is up." } });
     expect(result.ok).toBe(true);
     const post = fake.postsBy(PLUMBER).at(-1)!;
-    expect(post.display_recipient).toBe("agent-sync");
+    expect(post.display_recipient).toBe("Work-In-Progress");
     expect(post.subject).toBe("BF tunnel");
     expect(post.content).toBe("[BF-PLUMBER] Tunnel is up.");
   });
@@ -161,10 +596,10 @@ describe("waking", () => {
   it("drops its own posts and Jay's account from an API client, and wakes on a peer's mention", async () => {
     const hub = makeHub();
     await connected(hub);
-    fake.postStream(PLUMBER, "agent-sync", "BF tunnel", "@**BF-Plumber** note to self", "BotFleet-Zulip");
-    fake.postStream(JAY, "agent-sync", "BF tunnel", "@**BF-Plumber** from a script", "ZulipPython");
-    fake.postStream(PEER, "agent-sync", "BF tunnel", "no mention here", "ZulipPython");
-    const peerId = fake.postStream(PEER, "agent-sync", "BF other", "@**BF-Plumber** please look", "ZulipPython");
+    fake.postStream(PLUMBER, "Work-In-Progress", "BF tunnel", "@**BF-Plumber** note to self", "BotFleet-Zulip");
+    fake.postStream(JAY, "Work-In-Progress", "BF tunnel", "@**BF-Plumber** from a script", "ZulipPython");
+    fake.postStream(PEER, "Work-In-Progress", "BF tunnel", "no mention here", "ZulipPython");
+    const peerId = fake.postStream(PEER, "Work-In-Progress", "BF other", "@**BF-Plumber** please look", "ZulipPython");
     await waitFor(() => turns.length === 1, "the peer's wake");
     await settle();
     expect(turns).toHaveLength(1);
@@ -192,9 +627,9 @@ describe("waking", () => {
     const hub = makeHub();
     await connected(hub);
     busy.add("bot-plumber");
-    const a1 = fake.postStream(JAY, "agent-sync", "topic A", "@**BF-Plumber** one", "website");
-    const a2 = fake.postStream(JAY, "agent-sync", "topic A", "@**BF-Plumber** two", "website");
-    const b1 = fake.postStream(JAY, "agent-sync", "topic B", "@**BF-Plumber** three", "website");
+    const a1 = fake.postStream(JAY, "Work-In-Progress", "topic A", "@**BF-Plumber** one", "website");
+    const a2 = fake.postStream(JAY, "Work-In-Progress", "topic A", "@**BF-Plumber** two", "website");
+    const b1 = fake.postStream(JAY, "Work-In-Progress", "topic B", "@**BF-Plumber** three", "website");
     await waitFor(() => botStatus(hub, "bot-plumber")?.pending === 2, "two units");
     busy.delete("bot-plumber");
     await waitFor(() => turns.length === 1, "the first turn");
@@ -211,7 +646,7 @@ describe("waking", () => {
     settings.dryRun = true;
     const hub = makeHub();
     await connected(hub);
-    fake.postStream(JAY, "agent-sync", "BF tunnel", "@**BF-Plumber** check", "website");
+    fake.postStream(JAY, "Work-In-Progress", "BF tunnel", "@**BF-Plumber** check", "website");
     await waitFor(() => logs.some((line) => line.includes("dry run")), "the dry-run log");
     await settle();
     expect(turns).toHaveLength(0);
@@ -227,7 +662,7 @@ describe("credentials and identity", () => {
     expect(botStatus(hub, "bot-fixer")!.reason).toMatch(/no credential file/);
     expect(hub.outboundReady("bot-fixer")).toBe(false);
     expect(hub.outboundReady("bot-plumber")).toBe(true);
-    fake.postStream(JAY, "agent-sync", "BF x", "@**BF-Plumber** @**BF-Fixer** both of you", "website");
+    fake.postStream(JAY, "Work-In-Progress", "BF x", "@**BF-Plumber** @**BF-Fixer** both of you", "website");
     await waitFor(() => turns.length === 1, "plumber's wake");
     await settle();
     expect(turns.map((turn) => turn.botId)).toEqual(["bot-plumber"]);
@@ -243,7 +678,7 @@ describe("credentials and identity", () => {
     const hub = makeHub();
     await connected(hub);
     await connected(hub, "bot-fixer");
-    fake.postStream(JAY, "agent-sync", "BF x", "@**BF-Plumber** @**BF-Fixer** both of you", "website");
+    fake.postStream(JAY, "Work-In-Progress", "BF x", "@**BF-Plumber** @**BF-Fixer** both of you", "website");
     await waitFor(() => turns.length === 2, "two wakes");
     expect(turns.map((turn) => turn.botId).sort()).toEqual(["bot-fixer", "bot-plumber"]);
   });
@@ -258,6 +693,91 @@ describe("credentials and identity", () => {
     await waitFor(() => disabledLogs() === 4, "one retry each");
     await settle(400);
     expect(disabledLogs()).toBe(4);
+  });
+
+  it("warns once per folder when the vault refuses the Infisical folder read, however many bots are bound", async () => {
+    settings.credentialDir = undefined;
+    settings.credentialSource = "infisical";
+    settings.bots = { "bot-plumber": { role: "BF-Plumber" }, "bot-fixer": { role: "BF-Fixer" } };
+    const hub = makeHub({
+      vault: async () => {
+        throw Object.assign(new Error("Infisical secrets list failed: HTTP 403"), { statusCode: 403 });
+      },
+    });
+    await waitFor(() => hub.status().bots.filter((bot) => bot.state === "disabled").length === 2, "both disabled");
+    const warns = () => logs.filter((line) => line.includes("Zulip credentials unavailable"));
+    expect(warns()).toEqual([
+      "[zulip] infisical /zulip unreadable with the configured token (403); Zulip credentials unavailable",
+    ]);
+    // the per-bot lines still carry the precise reason, and the status view too
+    expect(botStatus(hub, "bot-plumber")!.reason).toMatch(/cannot read Infisical \/zulip/);
+    expect(botStatus(hub, "bot-fixer")!.reason).toMatch(/cannot read Infisical \/zulip/);
+    // a reconcile retry re-disables both bots but warns no second time
+    hub.reconcile();
+    await waitFor(() => logs.filter((line) => line.includes(": disabled")).length === 4, "one retry each");
+    await settle(300);
+    expect(warns()).toHaveLength(1);
+  });
+
+  it("warns again for a distinct status, after a successful load, and after a settings change", async () => {
+    settings.credentialDir = undefined;
+    settings.credentialSource = "infisical";
+    let vaultStatus: number | null = 403;
+    const hub = makeHub({
+      vault: async () => {
+        if (vaultStatus !== null) {
+          throw Object.assign(new Error(`Infisical secrets list failed: HTTP ${vaultStatus}`), { statusCode: vaultStatus });
+        }
+        return new Map([
+          ["ZULIP_BF_PLUMBER_EMAIL", "bf-plumber-bot@zulip.test"],
+          ["ZULIP_BF_PLUMBER_API_KEY", "plumber-test-key"],
+          ["ZULIP_BF_PLUMBER_SITE", fake.url],
+        ]);
+      },
+    });
+    const warns = () => logs.filter((line) => line.includes("Zulip credentials unavailable"));
+    const disabledLogs = () => logs.filter((line) => line.includes(": disabled")).length;
+    await waitFor(() => botStatus(hub, "bot-plumber")?.state === "disabled", "plumber disabled on 403");
+    expect(warns()).toEqual([
+      "[zulip] infisical /zulip unreadable with the configured token (403); Zulip credentials unavailable",
+    ]);
+    hub.reconcile();
+    await waitFor(() => disabledLogs() === 2, "one 403 retry");
+    await settle(300);
+    expect(warns()).toHaveLength(1);
+    vaultStatus = 404;
+    hub.reconcile();
+    await waitFor(() => warns().length === 2, "404 warns as a distinct outage");
+    expect(warns()[1]).toBe(
+      "[zulip] infisical /zulip unreadable with the configured token (404); Zulip credentials unavailable",
+    );
+    vaultStatus = null;
+    hub.reconcile();
+    await connected(hub);
+    vaultStatus = 403;
+    await hub.stop();
+    hub.start();
+    await waitFor(() => warns().length === 3, "403 warns again after a successful load");
+    expect(warns()[2]).toBe(
+      "[zulip] infisical /zulip unreadable with the configured token (403); Zulip credentials unavailable",
+    );
+    settings.postChannels = ["builds-renamed"];
+    hub.reconcile();
+    await waitFor(() => warns().length === 4, "403 warns again after a settings change");
+    expect(warns()[3]).toBe(
+      "[zulip] infisical /zulip unreadable with the configured token (403); Zulip credentials unavailable",
+    );
+  });
+
+  it("warns once per folder and role when the vault folder holds none of the role's names", async () => {
+    settings.credentialDir = undefined;
+    settings.credentialSource = "infisical";
+    const hub = makeHub({ vault: async () => new Map<string, string>() });
+    await waitFor(() => botStatus(hub, "bot-plumber")?.state === "disabled", "plumber disabled");
+    expect(logs.filter((line) => line.includes("Zulip credentials unavailable"))).toEqual([
+      "[zulip] infisical /zulip has none of BF-Plumber's expected names (ZULIP_BF_PLUMBER_EMAIL, ZULIP_BF_PLUMBER_API_KEY); Zulip credentials unavailable",
+    ]);
+    expect(botStatus(hub, "bot-plumber")!.reason).toMatch(/has no ZULIP_BF_PLUMBER_EMAIL or ZULIP_BF_PLUMBER_API_KEY/);
   });
 
   it("connects with keys from BotFleet's own vault when the Infisical source is chosen", async () => {
@@ -302,7 +822,7 @@ describe("credentials and identity", () => {
       secretPath: "/zulip",
       projectId: "afc-project-id",
       environment: "prod",
-      names: ["ZULIP_BF_PLUMBER_API_KEY", "ZULIP_BF_PLUMBER_EMAIL", "ZULIP_BF_PLUMBER_SITE"],
+      names: ["ZULIP_BF_PLUMBER_API_KEY", "ZULIP_BF_PLUMBER_EMAIL", "ZULIP_BF_PLUMBER_SITE", "ZULIP_OUTGOING_BF_PLUMBER_TOKEN"],
     });
     expect(botStatus(hub, "bot-plumber")?.userId).toBe(PLUMBER);
   });
@@ -332,7 +852,7 @@ describe("restarts and outages", () => {
     await connected(hub);
     fake.expireQueues(PLUMBER);
     // posted while the bot has no queue: only the backfill can see it
-    const missed = fake.postStream(JAY, "agent-sync", "BF tunnel", "@**BF-Plumber** while you were away", "website");
+    const missed = fake.postStream(JAY, "Work-In-Progress", "BF tunnel", "@**BF-Plumber** while you were away", "website");
     await waitFor(() => turns.length === 1, "the backfilled wake");
     expect(turns[0]!.text).toContain(`"id":${missed}`);
     const registers = fake.requests.filter((r) => r.path === "register" && r.userId === PLUMBER);
@@ -344,7 +864,7 @@ describe("restarts and outages", () => {
     busy.add("bot-plumber");
     const first = makeHub();
     await connected(first);
-    const id = fake.postStream(JAY, "agent-sync", "BF tunnel", "@**BF-Plumber** queued across a restart", "website");
+    const id = fake.postStream(JAY, "Work-In-Progress", "BF tunnel", "@**BF-Plumber** queued across a restart", "website");
     await waitFor(() => botStatus(first, "bot-plumber")?.pending === 1, "a queued unit");
     await first.stop();
     expect(turns).toHaveLength(0);
@@ -356,7 +876,7 @@ describe("restarts and outages", () => {
     await finishTurn(second);
     // force a backfill over the same message: it must not wake again
     fake.expireQueues(PLUMBER);
-    const next = fake.postStream(JAY, "agent-sync", "BF tunnel", "@**BF-Plumber** a new one", "website");
+    const next = fake.postStream(JAY, "Work-In-Progress", "BF tunnel", "@**BF-Plumber** a new one", "website");
     await waitFor(() => turns.length === 2, "the new message");
     await settle();
     expect(turns).toHaveLength(2);
@@ -377,15 +897,15 @@ describe("the loop guard", () => {
     });
     await connected(hub);
     for (let n = 1; n <= 2; n++) {
-      fake.postStream(PEER, "agent-sync", "BF chain", `@**BF-Plumber** round ${n}`, "ZulipPython");
+      fake.postStream(PEER, "Work-In-Progress", "BF chain", `@**BF-Plumber** round ${n}`, "ZulipPython");
       await waitFor(() => turns.length === n, `peer wake ${n}`);
     }
-    fake.postStream(PEER, "agent-sync", "BF chain", "@**BF-Plumber** round 3", "ZulipPython");
+    fake.postStream(PEER, "Work-In-Progress", "BF chain", "@**BF-Plumber** round 3", "ZulipPython");
     await waitFor(() => logs.some((line) => line.includes("loop_guard")), "the loop guard");
     await settle();
     expect(turns).toHaveLength(2);
-    fake.postStream(JAY, "agent-sync", "BF chain", "carry on", "website");
-    fake.postStream(PEER, "agent-sync", "BF chain", "@**BF-Plumber** round 4", "ZulipPython");
+    fake.postStream(JAY, "Work-In-Progress", "BF chain", "carry on", "website");
+    fake.postStream(PEER, "Work-In-Progress", "BF chain", "@**BF-Plumber** round 4", "ZulipPython");
     await waitFor(() => turns.length === 3, "a wake after Jay spoke");
   });
 });
@@ -441,7 +961,7 @@ describe("DMs out", () => {
     fake.addUser({ user_id: GONE, full_name: "Gone Bot" });
     const hub = makeHub();
     await connected(hub);
-    fake.postStream(PEER, "agent-sync", "BF keys", "@**BF-Plumber** rotate the deploy key please", "ZulipPython");
+    fake.postStream(PEER, "Work-In-Progress", "BF keys", "@**BF-Plumber** rotate the deploy key please", "ZulipPython");
     await waitFor(() => turns.length === 1, "the peer's wake");
     return hub;
   }
@@ -511,9 +1031,9 @@ describe("followed topics", () => {
   it("follows a topic with zulip_follow_topic, wakes on any new message there, and never auto-replies for it", async () => {
     const hub = makeHub();
     await connected(hub);
-    const streamId = fake.streamId("agent-sync");
-    const followed = await follow(hub, { channel: "#agent-sync", topic: "BF watch", follow: true });
-    expect(followed).toMatchObject({ ok: true, text: expect.stringMatching(/^Following #agent-sync > BF watch\./) });
+    const streamId = fake.streamId("Work-In-Progress");
+    const followed = await follow(hub, { channel: "#Work-In-Progress", topic: "BF watch", follow: true });
+    expect(followed).toMatchObject({ ok: true, text: expect.stringMatching(/^Following #Work-In-Progress > BF watch\./) });
     // as the bot itself, through Zulip's own user_topics endpoint
     const call = fake.requests.find((r) => r.method === "POST" && r.path === "user_topics")!;
     expect(call).toMatchObject({ userId: PLUMBER, params: { stream_id: String(streamId), topic: "BF watch", visibility_policy: "3" } });
@@ -522,7 +1042,7 @@ describe("followed topics", () => {
 
     replies.set("thread-bot-plumber", "Noted.");
     // no mention, another sender, the topic in other case: still the followed topic
-    const id = fake.postStream(PEER, "agent-sync", "bf WATCH", "deploy 4326 finished", "ZulipPython");
+    const id = fake.postStream(PEER, "Work-In-Progress", "bf WATCH", "deploy 4326 finished", "ZulipPython");
     await waitFor(() => turns.length === 1, "the followed topic's wake");
     expect(turns[0]!.text).toContain("new messages in a channel topic you follow");
     expect(turns[0]!.text).toContain(`where no one @-mentioned you: ${id}.`);
@@ -533,26 +1053,26 @@ describe("followed topics", () => {
     expect(fake.postsBy(PLUMBER)).toHaveLength(0);
 
     // its own post there never wakes it
-    fake.postStream(PLUMBER, "agent-sync", "BF watch", "my own note", "BotFleet-Zulip");
+    fake.postStream(PLUMBER, "Work-In-Progress", "BF watch", "my own note", "BotFleet-Zulip");
     await settle();
     expect(turns).toHaveLength(1);
 
-    const unfollowed = await follow(hub, { channel: "agent-sync", topic: "BF watch", follow: "false" });
-    expect(unfollowed).toMatchObject({ ok: true, text: "Stopped following #agent-sync > BF watch." });
+    const unfollowed = await follow(hub, { channel: "Work-In-Progress", topic: "BF watch", follow: "false" });
+    expect(unfollowed).toMatchObject({ ok: true, text: "Stopped following #Work-In-Progress > BF watch." });
     expect(fake.followedBy(PLUMBER)).toEqual([]);
-    fake.postStream(PEER, "agent-sync", "BF watch", "another update", "ZulipPython");
+    fake.postStream(PEER, "Work-In-Progress", "BF watch", "another update", "ZulipPython");
     await settle(400);
     expect(turns).toHaveLength(1);
   });
 
   it("still auto-replies when a mention joins a followed topic's unit", async () => {
-    fake.followTopic(PLUMBER, "agent-sync", "BF watch");
+    fake.followTopic(PLUMBER, "Work-In-Progress", "BF watch");
     replies.set("thread-bot-plumber", "On it.");
     busy.add("bot-plumber");
     const hub = makeHub();
     await connected(hub);
-    fake.postStream(PEER, "agent-sync", "BF watch", "build is red", "ZulipPython");
-    fake.postStream(JAY, "agent-sync", "BF watch", "@**BF-Plumber** can you look?", "website");
+    fake.postStream(PEER, "Work-In-Progress", "BF watch", "build is red", "ZulipPython");
+    fake.postStream(JAY, "Work-In-Progress", "BF watch", "@**BF-Plumber** can you look?", "website");
     await waitFor(() => botStatus(hub, "bot-plumber")?.pending === 1, "one unit for the topic");
     busy.delete("bot-plumber");
     await waitFor(() => turns.length === 1, "the turn");
@@ -562,11 +1082,11 @@ describe("followed topics", () => {
   });
 
   it("loads the topics it follows at register, and applies a follow made in the Zulip app", async () => {
-    fake.followTopic(PLUMBER, "agent-sync", "BF app");
+    fake.followTopic(PLUMBER, "Work-In-Progress", "BF app");
     const hub = makeHub();
     await connected(hub);
     expect(botStatus(hub, "bot-plumber")?.following).toBe(1);
-    const id = fake.postStream(JAY, "agent-sync", "BF app", "heads up, deploying now", "website");
+    const id = fake.postStream(JAY, "Work-In-Progress", "BF app", "heads up, deploying now", "website");
     await waitFor(() => turns.length === 1, "Jay's message in the followed topic");
     expect(turns[0]!.text).toContain(`Owner items: ${id}.`);
     fake.followTopic(PLUMBER, "builds", "BF later");
@@ -574,13 +1094,13 @@ describe("followed topics", () => {
   });
 
   it("backfills a followed topic's messages after the queue expired", async () => {
-    fake.followTopic(PLUMBER, "agent-sync", "BF watch");
+    fake.followTopic(PLUMBER, "Work-In-Progress", "BF watch");
     const hub = makeHub();
     await connected(hub);
     fake.expireQueues(PLUMBER);
     // posted while the bot has no queue, with no mention: only the followed
     // topic's own backfill narrow can see it
-    const missed = fake.postStream(PEER, "agent-sync", "BF watch", "deploy finished while you were away", "ZulipPython");
+    const missed = fake.postStream(PEER, "Work-In-Progress", "BF watch", "deploy finished while you were away", "ZulipPython");
     await waitFor(() => turns.length === 1, "the backfilled wake");
     expect(turns[0]!.text).toContain(`"id":${missed}`);
     expect(
@@ -594,9 +1114,9 @@ describe("followed topics", () => {
     await connected(hub);
     const refused = await follow(hub, { channel: "secret-room", topic: "BF x", follow: true });
     expect(refused).toMatchObject({ ok: false, text: expect.stringMatching(/not subscribed to #secret-room/) });
-    expect((await follow(hub, { channel: "agent-sync", topic: "BF x" })).ok).toBe(false);
-    expect((await follow(hub, { channel: "agent-sync", topic: "   ", follow: true })).ok).toBe(false);
-    expect((await follow(hub, { channel: "agent-sync", topic: "x".repeat(61), follow: true })).text).toMatch(/at most 60/);
+    expect((await follow(hub, { channel: "Work-In-Progress", topic: "BF x" })).ok).toBe(false);
+    expect((await follow(hub, { channel: "Work-In-Progress", topic: "   ", follow: true })).ok).toBe(false);
+    expect((await follow(hub, { channel: "Work-In-Progress", topic: "x".repeat(61), follow: true })).text).toMatch(/at most 60/);
     expect(fake.requests.some((r) => r.path === "user_topics")).toBe(false);
   });
 });
@@ -605,7 +1125,7 @@ describe("posting", () => {
   it("auto-replies with the final message when the bot did not reply itself", async () => {
     const hub = makeHub();
     await connected(hub);
-    fake.postStream(JAY, "agent-sync", "BF tunnel", "@**BF-Plumber** check", "website");
+    fake.postStream(JAY, "Work-In-Progress", "BF tunnel", "@**BF-Plumber** check", "website");
     await waitFor(() => turns.length === 1, "a turn");
     replies.set(PLUMBER_THREAD, "All green on the tunnel.");
     await finishTurn(hub);
@@ -618,7 +1138,7 @@ describe("posting", () => {
   it("sends every outbound text with the sentence gap: reply, channel post, owner DM and auto-reply", async () => {
     const hub = makeHub();
     await connected(hub);
-    fake.postStream(PEER, "agent-sync", "BF tunnel", "@**BF-Plumber** check", "ZulipPython");
+    fake.postStream(PEER, "Work-In-Progress", "BF tunnel", "@**BF-Plumber** check", "ZulipPython");
     await waitFor(() => turns.length === 1, "a turn");
     const send = (tool: "reply" | "post", args: Record<string, string | number>) =>
       hub.send({ botId: "bot-plumber", threadId: PLUMBER_THREAD, tool, args });
@@ -636,7 +1156,7 @@ describe("posting", () => {
     ]);
     await finishTurn(hub);
 
-    fake.postStream(JAY, "agent-sync", "BF other", "@**BF-Plumber** and this?", "website");
+    fake.postStream(JAY, "Work-In-Progress", "BF other", "@**BF-Plumber** and this?", "website");
     await waitFor(() => turns.length === 2, "a second turn");
     replies.set(PLUMBER_THREAD, "Also fine.  Nothing to do.");
     await finishTurn(hub);
@@ -647,12 +1167,12 @@ describe("posting", () => {
   it("does not auto-reply after the bot replied, or after a failed turn", async () => {
     const hub = makeHub();
     await connected(hub);
-    fake.postStream(JAY, "agent-sync", "BF one", "@**BF-Plumber** check", "website");
+    fake.postStream(JAY, "Work-In-Progress", "BF one", "@**BF-Plumber** check", "website");
     await waitFor(() => turns.length === 1, "a turn");
     await hub.send({ botId: "bot-plumber", threadId: PLUMBER_THREAD, tool: "reply", args: { content: "On it." } });
     replies.set(PLUMBER_THREAD, "Final words.");
     await finishTurn(hub);
-    fake.postStream(JAY, "agent-sync", "BF two", "@**BF-Plumber** again", "website");
+    fake.postStream(JAY, "Work-In-Progress", "BF two", "@**BF-Plumber** again", "website");
     await waitFor(() => turns.length === 2, "a second turn");
     await finishTurn(hub, "bot-plumber", false);
     await settle();
@@ -662,7 +1182,7 @@ describe("posting", () => {
   it("withholds an auto-reply that carries a secret, and says so in the thread", async () => {
     const hub = makeHub();
     await connected(hub);
-    fake.postStream(JAY, "agent-sync", "BF tunnel", "@**BF-Plumber** check", "website");
+    fake.postStream(JAY, "Work-In-Progress", "BF tunnel", "@**BF-Plumber** check", "website");
     await waitFor(() => turns.length === 1, "a turn");
     replies.set(PLUMBER_THREAD, "the key is plumber-test-key");
     await finishTurn(hub);
@@ -719,7 +1239,7 @@ describe("posting", () => {
 function streamMessage(over: Partial<ZulipMessage> & Pick<ZulipMessage, "id" | "sender_id" | "content">): ZulipMessage {
   return {
     type: "stream",
-    display_recipient: "agent-sync",
+    display_recipient: "Work-In-Progress",
     subject: "BF order",
     timestamp: Math.floor(Date.now() / 1000),
     client: "website",
@@ -769,9 +1289,9 @@ describe("review fixes: delivery order and races", () => {
       },
     });
     await connected(hub);
-    const first = fake.postStream(JAY, "agent-sync", "BF race", "@**BF-Plumber** first", "website");
+    const first = fake.postStream(JAY, "Work-In-Progress", "BF race", "@**BF-Plumber** first", "website");
     await waitFor(() => turns.length === 1, "the first turn starting");
-    const late = fake.postStream(JAY, "agent-sync", "BF race", "@**BF-Plumber** second", "website");
+    const late = fake.postStream(JAY, "Work-In-Progress", "BF race", "@**BF-Plumber** second", "website");
     const session = sessionOf(hub);
     await waitFor(() => session.state.pending.some((unit) => unit.items.some((item) => item.id === late)), "the late message queued");
     release();
@@ -788,7 +1308,7 @@ describe("review fixes: delivery order and races", () => {
     let held = true;
     const hub = makeHub({ dispatchHeld: () => held });
     await connected(hub);
-    fake.postStream(JAY, "agent-sync", "BF boot", "@**BF-Plumber** after the restart", "website");
+    fake.postStream(JAY, "Work-In-Progress", "BF boot", "@**BF-Plumber** after the restart", "website");
     await waitFor(() => botStatus(hub, "bot-plumber")?.pending === 1, "the queued unit");
     await settle(200);
     expect(turns).toHaveLength(0);
@@ -807,7 +1327,7 @@ describe("a bot switched Off", () => {
       },
     });
     await connected(hub);
-    fake.postStream(JAY, "agent-sync", "BF tunnel", "@**BF-Plumber** check", "website");
+    fake.postStream(JAY, "Work-In-Progress", "BF tunnel", "@**BF-Plumber** check", "website");
     await waitFor(() => logs.some((line) => line.includes("the bot is off")), "the drop");
     await settle(300);
     expect(attempts).toBe(1);
@@ -832,7 +1352,7 @@ describe("review fixes: reconnects", () => {
     await connected(hub);
     const polls = () => fake.requests.filter((r) => r.path === "events" && r.method === "GET" && r.userId === PLUMBER).length;
     await waitFor(() => polls() >= 3, "polls after a timeout");
-    const id = fake.postStream(JAY, "agent-sync", "BF timeout", "@**BF-Plumber** still there?", "website");
+    const id = fake.postStream(JAY, "Work-In-Progress", "BF timeout", "@**BF-Plumber** still there?", "website");
     await waitFor(() => turns.length === 1, "the wake on the same queue");
     expect(turns[0]!.text).toContain(`"id":${id}`);
     expect(fake.requests.filter((r) => r.path === "register" && r.userId === PLUMBER)).toHaveLength(1);
@@ -862,7 +1382,7 @@ describe("review fixes: reconnects", () => {
     await waitFor(() => sleeps.length >= 3, "three backoffs");
     expect(sleeps.slice(0, 3)).toEqual([20, 40, 80]);
     await connected(hub);
-    const id = fake.postStream(JAY, "agent-sync", "BF backoff", "@**BF-Plumber** back?", "website");
+    const id = fake.postStream(JAY, "Work-In-Progress", "BF backoff", "@**BF-Plumber** back?", "website");
     await waitFor(() => turns.length === 1, "a wake after recovery");
     expect(turns[0]!.text).toContain(`"id":${id}`);
     // every failed queue was deleted before the next register
@@ -875,7 +1395,7 @@ describe("review fixes: the reply binding belongs to its own turn", () => {
   it("posts a successful Zulip turn's reply even when the next turn in the thread fails", async () => {
     const hub = makeHub();
     await connected(hub);
-    fake.postStream(JAY, "agent-sync", "BF bind", "@**BF-Plumber** check", "website");
+    fake.postStream(JAY, "Work-In-Progress", "BF bind", "@**BF-Plumber** check", "website");
     await waitFor(() => turns.length === 1, "a turn");
     replies.set(PLUMBER_THREAD, "All green.");
     hub.turnCompleted(PLUMBER_THREAD, true);
@@ -896,7 +1416,7 @@ describe("review fixes: the reply binding belongs to its own turn", () => {
   it("posts nothing for a failed Zulip turn, whatever the next turn in the thread does", async () => {
     const hub = makeHub();
     await connected(hub);
-    fake.postStream(JAY, "agent-sync", "BF bind", "@**BF-Plumber** check", "website");
+    fake.postStream(JAY, "Work-In-Progress", "BF bind", "@**BF-Plumber** check", "website");
     await waitFor(() => turns.length === 1, "a turn");
     replies.set(PLUMBER_THREAD, "half an answer");
     hub.turnCompleted(PLUMBER_THREAD, false);
@@ -912,7 +1432,7 @@ describe("review fixes: the reply binding belongs to its own turn", () => {
     let offset = 0;
     const hub = makeHub({ now: () => Date.now() + offset });
     await connected(hub);
-    fake.postStream(JAY, "agent-sync", "BF long", "@**BF-Plumber** long deploy", "website");
+    fake.postStream(JAY, "Work-In-Progress", "BF long", "@**BF-Plumber** long deploy", "website");
     await waitFor(() => turns.length === 1, "a turn");
     offset = 3 * 3600_000;
     await hub.drain();
@@ -975,7 +1495,7 @@ describe("review fixes: a response of the wrong shape", () => {
     await connected(hub);
     expect(logs.some((line) => line.includes("unexpected shape"))).toBe(true);
     // and the bot still hears what arrives on the new queue
-    fake.postStream(JAY, "agent-sync", "BF shape", "@**BF-Plumber** still there?", "website");
+    fake.postStream(JAY, "Work-In-Progress", "BF shape", "@**BF-Plumber** still there?", "website");
     await waitFor(() => turns.length === 1, "the wake after the retry");
   });
 });
@@ -983,7 +1503,7 @@ describe("review fixes: a response of the wrong shape", () => {
 describe("review fixes: the first connection's cursor", () => {
   it("starts from now when register names no newest message, and a reconnect before anything arrives does not backfill the mailbox", async () => {
     fake.omitMaxMessageId = true;
-    fake.postStream(JAY, "agent-sync", "BF old", "@**BF-Plumber** from long ago", "website");
+    fake.postStream(JAY, "Work-In-Progress", "BF old", "@**BF-Plumber** from long ago", "website");
     const hub = makeHub();
     await connected(hub);
     await settle(150);
@@ -1001,7 +1521,7 @@ describe("review fixes: the first connection's cursor", () => {
     expect(turns).toHaveLength(0);
     expect(sessionOf(hub).state.cursor).toBeNull();
     // the first live message wakes, and sets the cursor
-    const fresh = fake.postStream(JAY, "agent-sync", "BF new", "@**BF-Plumber** now", "website");
+    const fresh = fake.postStream(JAY, "Work-In-Progress", "BF new", "@**BF-Plumber** now", "website");
     await waitFor(() => turns.length === 1, "the live wake");
     expect(turns[0]?.text).not.toContain("from long ago");
     expect(sessionOf(hub).state.cursor).toBe(fresh);
@@ -1024,7 +1544,7 @@ describe("review fixes: the decided-message indexes", () => {
   it("never write the indexes to the state file", async () => {
     const hub = makeHub();
     await connected(hub);
-    fake.postStream(JAY, "agent-sync", "BF index", "@**BF-Plumber** one", "website");
+    fake.postStream(JAY, "Work-In-Progress", "BF index", "@**BF-Plumber** one", "website");
     const saved = () => {
       try {
         return JSON.parse(readFileSync(join(dataDir, "zulip", "bot-plumber.json"), "utf8"));
@@ -1042,7 +1562,7 @@ describe("review fixes: the decided-message indexes", () => {
     let held = true;
     const first = makeHub({ dispatchHeld: () => held });
     await connected(first);
-    const waiting = fake.postStream(JAY, "agent-sync", "BF restart", "@**BF-Plumber** before the restart", "website");
+    const waiting = fake.postStream(JAY, "Work-In-Progress", "BF restart", "@**BF-Plumber** before the restart", "website");
     await waitFor(() => botStatus(first, "bot-plumber")?.pending === 1, "the queued unit");
     await first.stop();
     const second = makeHub({ dispatchHeld: () => held });
@@ -1084,7 +1604,7 @@ describe("a bot stopped in BotFleet", () => {
       },
     });
     await connected(hub);
-    fake.postStream(JAY, "agent-sync", "BF stopped", "@**BF-Plumber** are you there", "website");
+    fake.postStream(JAY, "Work-In-Progress", "BF stopped", "@**BF-Plumber** are you there", "website");
     // unlike an Off bot, a stop can lift (a person starts the bot again), so
     // the work is held and retried rather than dropped on the first refusal
     await waitFor(() => attempts >= 2, "a retry");

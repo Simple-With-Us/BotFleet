@@ -128,6 +128,78 @@ final class BotExecutionPolicyTests: XCTestCase {
         XCTAssertTrue(BotExecutionPolicy.mayTurnOnAuto(computers: nil))
     }
 
+    /// The second switch asks for the same act Auto Mode does, so it is the
+    /// Mac's to turn on wherever Auto Mode's is.  Plain Bypass stays the
+    /// phone's, because on its own it never reaches the desktop.
+    func testLocalBypassIsTheMacsToTurnOnExactlyWhereAutoModeIs() {
+        XCTAssertFalse(BotExecutionPolicy.mayTurnOnLocalBypass(computers: ["local"]))
+        XCTAssertFalse(BotExecutionPolicy.mayTurnOnLocalBypass(computers: ["cloud", "local"]))
+        XCTAssertTrue(BotExecutionPolicy.mayTurnOnLocalBypass(computers: ["cloud", "vm"]))
+        XCTAssertTrue(BotExecutionPolicy.mayTurnOnLocalBypass(computers: []))
+        XCTAssertTrue(BotExecutionPolicy.mayTurnOnLocalBypass(computers: nil))
+
+        // The two answers are the same answer, deliberately.
+        for list in [["local"] as [String], ["cloud", "vm"], [], [String]()] {
+            XCTAssertEqual(
+                BotExecutionPolicy.mayTurnOnLocalBypass(computers: list),
+                BotExecutionPolicy.mayTurnOnAuto(computers: list)
+            )
+        }
+    }
+
+    func testLocalBypassOnThisMacIsReadOnlyUnlessItIsAlreadyOn() {
+        // Off, and the bot can use This Mac: a switch would come back 403.
+        // The row is read-only even when Bypass itself is already on, and the
+        // note is the computer's own sentence.
+        XCTAssertEqual(
+            BotExecutionPolicy.localBypassControl(computers: ["local"], bypassOn: true, localBypassOn: false),
+            .macOnly
+        )
+        XCTAssertEqual(
+            BotExecutionPolicy.localBypassControl(computers: ["cloud", "local"], bypassOn: false, localBypassOn: false),
+            .macOnly
+        )
+        XCTAssertTrue(BotExecutionPolicy.localBypassMacOnlyNote.hasPrefix(
+            "Bypass Including This Mac can only be turned on in BotFleet on your computer for a bot that can use This Mac."
+        ))
+        XCTAssertTrue(BotExecutionPolicy.localBypassMacOnlyNote.contains("Turning it off works from here."))
+
+        // Already on: the phone can turn it off, which the computer accepts.
+        XCTAssertEqual(
+            BotExecutionPolicy.localBypassControl(computers: ["vm", "local"], bypassOn: true, localBypassOn: true),
+            .toggle
+        )
+        XCTAssertEqual(
+            BotExecutionPolicy.localBypassControl(computers: ["local"], bypassOn: false, localBypassOn: true),
+            .toggle
+        )
+
+        // No This Mac: a real switch once Bypass is on, and a note until then.
+        XCTAssertEqual(
+            BotExecutionPolicy.localBypassControl(computers: ["vm"], bypassOn: true, localBypassOn: false),
+            .toggle
+        )
+        XCTAssertEqual(
+            BotExecutionPolicy.localBypassControl(computers: nil, bypassOn: false, localBypassOn: false),
+            .needsBypass
+        )
+    }
+
+    func testLocalBypassCopyNeverClaimsItIsASettingOnItsOwn() {
+        XCTAssertTrue(BotExecutionPolicy.localBypassNeedsBypass.contains("Bypass Permissions first"))
+        let off = BotExecutionPolicy.localBypassSummary(isOn: false)
+        XCTAssertTrue(off.contains("Bypass still stops"))
+        let on = BotExecutionPolicy.localBypassSummary(isOn: true)
+        XCTAssertTrue(on.contains("includes this Mac"))
+        // The warning has to say what is actually being given up: the asking,
+        // not merely "auto approve".
+        let warning = BotExecutionPolicy.localBypassWarning(botName: "Forge")
+        XCTAssertTrue(warning.contains("Forge"))
+        XCTAssertTrue(warning.contains("destructive actions"))
+        XCTAssertTrue(warning.contains("nobody watching"))
+        XCTAssertEqual(BotExecutionPolicy.localBypassConfirmButton, "Enable Bypass Including This Mac")
+    }
+
     // MARK: - What the phone says
 
     private let gap = "\u{00A0} "
@@ -135,6 +207,7 @@ final class BotExecutionPolicyTests: XCTestCase {
     private func texts() -> [String] {
         [
             BotExecutionPolicy.thisMacNote,
+            BotExecutionPolicy.localBypassMacOnlyNote,
             BotExecutionPolicy.bypassWarning(botName: "Scout", model: "claude-sonnet-4"),
             BotExecutionPolicy.bypassWarning(botName: "Scout", model: "claude-haiku-4"),
             BotExecutionPolicy.bypassWarning(botName: "Scout", model: nil),

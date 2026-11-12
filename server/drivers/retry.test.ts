@@ -115,6 +115,13 @@ describe("classifyError", () => {
     });
   });
 
+  it("treats MiniMax Code lock-file contention as a transient connection collision", () => {
+    const msg = "MiniMax Code Runtime failed: Lock file is already being held";
+    expect(classifyError(new Error(msg))).toEqual({ transient: true, reason: "connection_reset" });
+    expect(classifyError({ text: msg })).toEqual({ transient: true, reason: "connection_reset" });
+    expect(classifyError({ exitCode: 1, stderr: msg })).toEqual({ transient: true, reason: "connection_reset" });
+  });
+
   it("keeps a per-minute TPM 429 transient and retryable, not quota", () => {
     // OpenAI's token-per-minute throttle opens with "Rate limit reached" but
     // clears in seconds ("Please try again in 6s").  Only a monthly, billing
@@ -139,6 +146,20 @@ describe("classifyError", () => {
     expect(classifyError(new Error("Rate limit reached: monthly cap hit for this billing cycle"))).toEqual(quota);
     expect(classifyError(new Error("monthly rate limit reached"))).toEqual(quota);
     expect(classifyError({ exitCode: 1, stderr: "Rate limit reached for your plan" })).toEqual(quota);
+  });
+
+  it("retries POSIX SIGTERM/SIGKILL exit statuses from a reaped CLI", () => {
+    expect(classifyError({ exitCode: 143 })).toEqual({ transient: true, reason: "signaled" });
+    expect(classifyError({ exitCode: 137 })).toEqual({ transient: true, reason: "signaled" });
+    expect(classifyError({ exitCode: 143, stderr: "claude exited 143 before result" })).toEqual({
+      transient: true,
+      reason: "signaled",
+    });
+  });
+
+  it("keeps a terminal stderr verdict when the CLI also died with 143/137", () => {
+    expect(classifyError({ exitCode: 143, stderr: "invalid api key" })).toEqual({ transient: false, reason: "auth" });
+    expect(classifyError({ exitCode: 137, stderr: "Unauthorized" })).toEqual({ transient: false, reason: "auth" });
   });
 
   it("prefers the transient reading when stderr carries both shapes", () => {

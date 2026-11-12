@@ -11,16 +11,19 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, expectTypeOf, it, vi } from "vitest";
 import { z } from "zod";
 
 import {
   StsConfigResponseSchema,
+  StsKeyStatusSchema,
   StsSettings,
   describeStsConfigFailure,
   stsEffectiveFrontEngine,
   stsEffectiveProvider,
   stsKeyNotice,
+  type StsConfigResponse,
+  type StsKeyStatusPayload,
 } from "./StsSettings";
 import { STS_PROVIDERS } from "@/lib/sts";
 
@@ -155,6 +158,13 @@ describe("StsSettings", () => {
     const html = render();
     expect(html).not.toContain("&nbsp;");
     expect(html).toContain("\u00A0");
+  });
+});
+
+describe("panel schemas export their inferred types", () => {
+  it("derives the config and key-status types from the parsers", () => {
+    expectTypeOf<StsConfigResponse>().toEqualTypeOf<z.infer<typeof StsConfigResponseSchema>>();
+    expectTypeOf<StsKeyStatusPayload>().toEqualTypeOf<z.infer<typeof StsKeyStatusSchema>>();
   });
 });
 
@@ -308,7 +318,15 @@ describe("StsSettings save path", () => {
 
   it("drops a second save while one is in flight", () => {
     const save = between("const save = async", "const saveProvider");
-    expect(save).toContain("if (saving) return false;");
+    // A ref, not the `saving` state: React does not re-render until the next
+    // tick, so a second click inside that window still read `false` and put a
+    // second PUT to the same config slice into flight.  Pinning the ref here is
+    // what keeps that from coming back — a state-based guard is the bug.
+    expect(save).toContain("if (savingRef.current) return false;");
+    expect(save).toContain("savingRef.current = true;");
+    // And the ref is released on every path out, or the panel would wedge
+    // permanently after one failed save.
+    expect(save).toContain("savingRef.current = false;");
   });
 });
 

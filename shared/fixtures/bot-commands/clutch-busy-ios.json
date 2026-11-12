@@ -1,0 +1,116 @@
+{
+  "schemaVersion": 1,
+  "botId": "b-quill",
+  "threadId": "t-91ab",
+  "surface": "ios",
+  "busy": true,
+  "engine": {
+    "instanceId": "<clutch-instance-id>",
+    "displayName": "Clutch",
+    "model": "DeepSeek-V4.1-Pro",
+    "modelLabel": "DeepSeek V4.1 Pro",
+    "effort": null,
+    "commandSupport": "announced"
+  },
+  "groups": [
+    {
+      "id": "botfleet",
+      "label": "BotFleet",
+      "state": "ready",
+      "note": null,
+      "commands": [
+        {
+          "id": "botfleet:stop",
+          "name": "stop",
+          "label": "/stop",
+          "title": "Stop",
+          "description": "Stop the running turn and clear queued messages.",
+          "source": "botfleet",
+          "invoke": "server",
+          "clientAction": null,
+          "args": null,
+          "availability": "always",
+          "enabled": true,
+          "disabledReason": null,
+          "runsModelTurn": false,
+          "collidesWith": null
+        },
+        {
+          "id": "botfleet:new",
+          "name": "new",
+          "label": "/new",
+          "title": "New Conversation",
+          "description": "Start a fresh conversation; this one stays saved.",
+          "source": "botfleet",
+          "invoke": "server",
+          "clientAction": null,
+          "args": null,
+          "availability": "idle",
+          "enabled": true,
+          "disabledReason": null,
+          "runsModelTurn": false,
+          "collidesWith": null
+        },
+        {
+          "id": "botfleet:status",
+          "name": "status",
+          "label": "/status",
+          "title": "Status",
+          "description": "Engine, model, effort, context and spend.",
+          "source": "botfleet",
+          "invoke": "server",
+          "clientAction": null,
+          "args": null,
+          "availability": "always",
+          "enabled": true,
+          "disabledReason": null,
+          "runsModelTurn": false,
+          "collidesWith": null
+        },
+        {
+          "id": "botfleet:model",
+          "name": "model",
+          "label": "/model",
+          "title": "Model",
+          "description": "Pick a model this engine offers.",
+          "source": "botfleet",
+          "invoke": "client",
+          "clientAction": "model-picker",
+          "args": {
+            "required": false,
+            "hint": "Filter models",
+            "maxLength": 60
+          },
+          "availability": "always",
+          "enabled": true,
+          "disabledReason": null,
+          "runsModelTurn": false,
+          "collidesWith": null
+        },
+        {
+          "id": "botfleet:help",
+          "name": "help",
+          "label": "/help",
+          "title": "Help",
+          "description": "List the commands this bot accepts here.",
+          "source": "botfleet",
+          "invoke": "server",
+          "clientAction": null,
+          "args": null,
+          "availability": "always",
+          "enabled": true,
+          "disabledReason": null,
+          "runsModelTurn": false,
+          "collidesWith": null
+        }
+      ]
+    },
+    {
+      "id": "engine",
+      "label": "Clutch",
+      "state": "pending",
+      "note": "Commands appear after this engine's first reply.",
+      "commands": []
+    }
+  ]
+}

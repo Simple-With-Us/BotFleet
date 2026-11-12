@@ -7,7 +7,14 @@ import { homedir, tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { augmentedPath, findCliCandidates, resetPathCache, resetPathCacheForTests, splitCliString } from "./env-path.ts";
+import {
+  augmentedPath,
+  findCliCandidates,
+  resetPathCache,
+  resetPathCacheForTests,
+  setKnownDirsForTests,
+  splitCliString,
+} from "./env-path.ts";
 import { resolveCli } from "./procs.ts";
 import { removeTempDir } from "./testing/cleanup.ts";
 
@@ -375,18 +382,21 @@ describe("augmentedPath", () => {
     const farmShim = join(symlinkFarm, "mcode");
     const previous = process.env.PATH;
     try {
-      process.env.PATH = [symlinkFarm, ...(previous ?? "").split(delimiter)].join(delimiter);
+      // GUI-launch shape only: the farm dir, no host PATH tail.  Spreading
+      // process.env.PATH leaked a developer Mac's real `mcode` into
+      // augmentedPath(), so execFile below ran the host binary and failed even
+      // when candidates[0] was already the canonical path we planted.
+      process.env.PATH = symlinkFarm;
+      // The merge also carries the well-known install dirs, and a host that
+      // has an `mcode` in one of them (/usr/local/bin carries one on some
+      // machines) answers this lookup instead of the fixture.  The known dirs
+      // are the canonical dir this test planted, and nothing else.
       resetPathCacheForTests();
+      setKnownDirsForTests([installerDir]);
       const candidates = findCliCandidates("mcode");
       expect(candidates[0]).toBe(canonical);
-      // Count only what this test planted.  The inherited PATH on a developer
-      // machine can carry its own real `mcode` — this Mac ships one — and
-      // those are legitimately separate candidates, so asserting a global
-      // total of 1 tested the machine rather than the dedupe.  What this test
-      // actually claims is that the farm symlink and the canonical binary are
-      // one inode and collapse to the canonical path.
-      const planted = candidates.filter((candidate) => candidate === canonical || candidate === farmShim);
-      expect(planted).toEqual([canonical]);
+      expect(candidates).toHaveLength(1);
+      expect(candidates).not.toContain(farmShim);
       const stdout = await new Promise<string>((resolve, reject) => {
         execFile("mcode", [], { env: { PATH: augmentedPath() } }, (err, out) => (err ? reject(err) : resolve(out)));
       });
@@ -394,6 +404,7 @@ describe("augmentedPath", () => {
     } finally {
       if (previous === undefined) delete process.env.PATH;
       else process.env.PATH = previous;
+      setKnownDirsForTests(null);
       resetPathCacheForTests();
     }
   });
@@ -412,6 +423,24 @@ describe("augmentedPath", () => {
       else process.env.LOCALAPPDATA = previous;
       resetPathCacheForTests();
       rmSync(localAppData, { recursive: true, force: true });
+    }
+  });
+
+  it("drops the known-dir override with the cache, so it cannot outlive its case", () => {
+    // The known install dirs are an override,  and an override that outlives
+    // the case that set it redirects every later lookup in the process.  The
+    // global afterEach calls resetPathCacheForTests(),  so that is where the
+    // override has to go with the cache:  a case that forgets its own restore
+    // must not become the next case's environment.
+    const dir = mkdtempSync(join(tmpdir(), "omb-known-dirs-"));
+    try {
+      setKnownDirsForTests([dir]);
+      expect(augmentedPath().split(delimiter)).toContain(dir);
+      resetPathCacheForTests();
+      expect(augmentedPath().split(delimiter)).not.toContain(dir);
+    } finally {
+      resetPathCacheForTests();
+      removeTempDir(dir);
     }
   });
 });
@@ -597,5 +626,167 @@ describe("resolveCli with wrapper commands", () => {
       command: join(bin, "omb"),
       args: ["space", "dir/nope", "two", "words", "--version"],
     });
+  });
+});
+
+describe("findCliCandidates", () => {
+  // setup.ts shares one throwaway home across this file, so a dir a sibling
+  // test planted would otherwise still be on PATH here.
+  const fresh = (...dirs: string[]): void => {
+    for (const d of dirs) {
+      rmSync(d, { recursive: true, force: true });
+      mkdirSync(d, { recursive: true });
+    }
+  };
+
+  // Clutch is the case a list exists for: its driver default is `dsh`, its own
+  // build installs as `clutch`, and only the latter carries Clutch's profiles.
+  // A single-name search could therefore only ever offer the binary that drops
+  // the user out of Clutch's own state home.
+  posixIt("returns the default name's hits before its aliases'", () => {
+    const bin = join(homedir(), "alias-order-bin");
+    fresh(bin);
+    const previous = process.env.PATH;
+    try {
+      process.env.PATH = bin;
+      // No known install dirs:  the merge carries them whatever the inherited
+      // PATH says, and a host with a `dsh` in one of them would answer this
+      // lookup instead of the fixture's own binaries.
+      resetPathCacheForTests();
+      setKnownDirsForTests([]);
+      writeFileSync(join(bin, "dsh"), "#!/bin/sh\n");
+      writeFileSync(join(bin, "clutch"), "#!/bin/sh\n");
+      expect(findCliCandidates(["dsh", "clutch"])).toEqual([join(bin, "dsh"), join(bin, "clutch")]);
+    } finally {
+      if (previous === undefined) delete process.env.PATH;
+      else process.env.PATH = previous;
+      setKnownDirsForTests(null);
+      resetPathCacheForTests();
+    }
+  });
+
+  posixIt("finds an alias that the default name search alone would miss", () => {
+    const bin = join(homedir(), "alias-only-bin");
+    fresh(bin);
+    const previous = process.env.PATH;
+    try {
+      process.env.PATH = bin;
+      resetPathCacheForTests();
+      setKnownDirsForTests([]);
+      writeFileSync(join(bin, "clutch"), "#!/bin/sh\n");
+      // The regression itself: searching the default alone answers empty, so
+      // the picker rendered Clutch as having no binary at all.
+      expect(findCliCandidates("dsh")).toEqual([]);
+      expect(findCliCandidates(["dsh", "clutch"])).toEqual([join(bin, "clutch")]);
+    } finally {
+      if (previous === undefined) delete process.env.PATH;
+      else process.env.PATH = previous;
+      setKnownDirsForTests(null);
+      resetPathCacheForTests();
+    }
+  });
+
+  posixIt("keeps a lone path-ish name echoing back as a location", () => {
+    // The array overload must not swallow the scalar contract: a one-element
+    // list is still the scalar case, and callers rely on getting their path
+    // handed straight back rather than searched for.
+    const cli = "/opt/definitely/not/here";
+    expect(findCliCandidates([cli])).toEqual([cli]);
+    expect(findCliCandidates(cli)).toEqual([cli]);
+  });
+
+  posixIt("drops path-ish and empty entries from a real list", () => {
+    const bin = join(homedir(), "alias-filter-bin");
+    fresh(bin);
+    const previous = process.env.PATH;
+    try {
+      process.env.PATH = bin;
+      resetPathCacheForTests();
+      writeFileSync(join(bin, "clutch"), "#!/bin/sh\n");
+      // The head keeps the echo-back contract, an empty entry and a name
+      // carrying a newline are dropped, and the real alias is still searched.
+      expect(findCliCandidates(["/opt/not/a/command", "", "clutch", "dsh\nclutch"])).toEqual([
+        "/opt/not/a/command",
+        join(bin, "clutch"),
+      ]);
+      expect(findCliCandidates([])).toEqual([]);
+      // A newline in the head is never emitted at all — it is neither a bare
+      // name to search for nor a location to hand back.
+      expect(findCliCandidates(["dsh\nclutch"])).toEqual([]);
+      expect(findCliCandidates(["/opt/not/a/command"])).toEqual(["/opt/not/a/command"]);
+    } finally {
+      if (previous === undefined) delete process.env.PATH;
+      else process.env.PATH = previous;
+      resetPathCacheForTests();
+    }
+  });
+
+  posixIt("collapses two names that resolve to one inode", () => {
+    // dedupeByInode has to run across the whole union, not per name: an alias
+    // that is a symlink to the default's binary is one binary, and two rows
+    // for it would be the same defect the per-name dedupe already prevents.
+    const real = join(homedir(), "alias-inode-real");
+    const link = join(homedir(), "alias-inode-link");
+    fresh(real, link);
+    const previous = process.env.PATH;
+    try {
+      process.env.PATH = [real, link].join(delimiter);
+      resetPathCacheForTests();
+      setKnownDirsForTests([]);
+      const bin = join(real, "dsh");
+      writeFileSync(bin, "#!/bin/sh\n");
+      symlinkSync(bin, join(link, "dsh"));
+      expect(findCliCandidates(["dsh", "dsh"])).toEqual([bin]);
+    } finally {
+      if (previous === undefined) delete process.env.PATH;
+      else process.env.PATH = previous;
+      setKnownDirsForTests(null);
+      resetPathCacheForTests();
+    }
+  });
+
+  posixIt("keeps a path-shaped head when an alias widens the list", () => {
+    // Kody review: routing every entry through isBareName dropped the head, so
+    // ?name=/opt/dsh&aliases=clutch answered differently from ?name=/opt/dsh.
+    // The head is the caller's default binary and may be a configured path, so
+    // it keeps the echo-back contract the scalar form has always had.
+    const bin = join(homedir(), "alias-head-bin");
+    fresh(bin);
+    const previous = process.env.PATH;
+    try {
+      process.env.PATH = bin;
+      resetPathCacheForTests();
+      const clutch = join(bin, "clutch");
+      writeFileSync(clutch, "#!/bin/sh\n");
+      expect(findCliCandidates(["/opt/custom/dsh", "clutch"])).toEqual(["/opt/custom/dsh", clutch]);
+    } finally {
+      if (previous === undefined) delete process.env.PATH;
+      else process.env.PATH = previous;
+      resetPathCacheForTests();
+    }
+  });
+
+  posixIt("caps how many alias names one call will search", () => {
+    // Kody review: every alias is a full PATH walk, so an unbounded list turned
+    // one request into thousands of existsSync calls.  Real engines declare one
+    // or two aliases; the cap is far above any legitimate use.
+    const bin = join(homedir(), "alias-cap-bin");
+    fresh(bin);
+    const previous = process.env.PATH;
+    try {
+      process.env.PATH = bin;
+      resetPathCacheForTests();
+      const planted = Array.from({ length: 70 }, (_, i) => {
+        const p = join(bin, `cap${i}`);
+        writeFileSync(p, "#!/bin/sh\n");
+        return p;
+      });
+      // Head is absent, so only the cap decides how many rows come back.
+      expect(findCliCandidates(["", ...planted.map((_, i) => `cap${i}`)])).toHaveLength(64);
+    } finally {
+      if (previous === undefined) delete process.env.PATH;
+      else process.env.PATH = previous;
+      resetPathCacheForTests();
+    }
   });
 });
