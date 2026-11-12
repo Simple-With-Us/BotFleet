@@ -99,6 +99,11 @@ test("ios-ship.yml targets botfleet / ios on the GitHub-hosted xcode-27 image", 
   // Every group/tester/build mutation is gated on a successful tester listing.
   assert.match(read("scripts/ios-fleet/asc-api.mjs"), /if \(!inGroupRes\.ok\)/);
   assert.match(read("scripts/ios-fleet/ship-testflight.sh"), /sentry_redact/);
+  const shipPath = read("scripts/ios-fleet/ship-testflight.sh");
+  assert.match(
+    shipPath,
+    /export PATH="\/usr\/bin:\/bin:\/usr\/sbin:\/sbin:\/opt\/homebrew\/bin:\/usr\/local\/bin:\$\{PATH\}"/
+  );
   // Sentry org is centralized, not triple-hardcoded: verified 2026-10-09 the
   // botfleet project lives in org simple-with-us while the vault token was
   // still scoped to the retired slug jays-services ("organization not found",
