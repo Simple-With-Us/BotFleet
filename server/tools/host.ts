@@ -193,7 +193,8 @@ function approvalArgs(
  *  `server/tools/*.ts` file from importing an `index.ts` to keep the
  *  cycle that previously duplicated the `list_bots` filter out. */
 
-function integerArg(value: unknown): number | undefined {
+function integerArg(args: ToolArguments, key: string): number | undefined {
+  const value = args[key];
   if (value === undefined) return undefined;
   if (typeof value === "number" && Number.isInteger(value)) return value;
   if (typeof value === "string" && /^-?\d+$/.test(value)) return Number(value);
@@ -206,15 +207,12 @@ async function readStoredToolResult(call: TurnToolCall): Promise<TurnToolOutcome
   const raw = call.arguments.artifact_id;
   const id = typeof raw === "string" ? raw.trim() : "";
   if (!id) return failed("artifact_id must be a non-empty string.", "invalid_argument");
-  const offset = integerArg(call.arguments.offset);
-  const limit = integerArg(call.arguments.limit);
+  const offset = integerArg(call.arguments, "offset");
+  const limit = integerArg(call.arguments, "limit");
   if (Number.isNaN(offset) || Number.isNaN(limit)) {
     return failed("offset and limit must be integers.", "invalid_argument");
   }
-  const read = readToolResultArtifact(id, {
-    ...(offset === undefined ? {} : { offset }),
-    ...(limit === undefined ? {} : { limit }),
-  });
+  const read = readToolResultArtifact(id, { offset, limit });
   if (!read.ok) return failed(read.message, "not_found");
   return { kind: "result", content: read.text, detail: `${read.chars} characters` };
 }
