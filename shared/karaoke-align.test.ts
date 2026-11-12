@@ -111,7 +111,7 @@ describe("alignSpokenToDisplay", () => {
 
   it("attaches words the voice added to the word before them", () => {
     const a = alignSpokenToDisplay({
-      spokenText: "Fixed it. (a TypeScript code block) That's it.",
+      spokenText: "Fixed it. A TypeScript code block. That's it.",
       displayText: "Fixed it:\nThat's it.",
     });
     expect(landed(a)).toEqual(["Fixed", "it", "it", "it", "it", "it", "That's", "it"]);
@@ -323,13 +323,12 @@ describe("timing helpers", () => {
 
 // ── distilled scripts ─────────────────────────────────────────────────────
 //
-// What the default voice reads: the DeepSeek rewrite (server/tts/
+// What the default voice reads: the DeepSeek pass (server/tts/
 // speech-summary.ts DEEPSEEK_FLASH_TTS_PROMPT), against what the Mac renders
 // for the reply (block text joined with "\n", fenced code and its header left
-// out, link labels shown, inline code as text).  Written the way the prompt
-// makes the model write: numbers and codes spelled out, acronyms letter by
-// letter, "dot com", lists retold with "First" and "Next", pause tags, light
-// rewording, code skipped.
+// out, link labels shown, inline code as text).  The prompt keeps the reply's
+// words in order, adjusts punctuation, and inserts pause tags between
+// sentences; it does not spell out numbers or retell lists as prose.
 
 /** The display word the `nth` spoken word reading `text` landed on. */
 function landedOn(a: KaraokeAlignment, text: string, nth = 0): string {
@@ -387,121 +386,113 @@ export const DISTILLED_CASES: Array<{
 }> = [
   {
     name: "distilled: list, decimal, issue number, percent, code skipped, link",
-    // - Bumped the API timeout to 3.5 seconds / - Fixed issue #749 ... / a
-    // ```sh block / Details are in [the rollout doc](https://...).
     display: "The deploy finished.  Here is what changed:\nBumped the API timeout to 3.5 seconds\nFixed issue #749 in the webhook retry loop\nCut memory use by 40%\nRun this to verify:\nDetails are in the rollout doc.",
-    spoken: "The deploy finished. Here is what changed. <#0.3#> First, the A P I timeout was bumped to three point five seconds. <#0.3#> Next, issue seven four nine in the webhook retry loop was fixed. <#0.3#> Finally, memory use was cut by forty percent. You can run a short test command to verify it. <#0.5#> The details are in the rollout doc.",
+    spoken: "The deploy finished. Here is what changed. <#0.3#> Bumped the API timeout to 3.5 seconds. <#0.3#> Fixed issue #749 in the webhook retry loop. <#0.3#> Cut memory use by 40%. Run this to verify: Details are in the rollout doc.",
     followable: true,
     lands: [
-      ["A", 0, "API"], ["P", 0, "API"], ["I", 0, "API"], ["three", 0, "3"], ["point", 0, "3"], ["five", 0, "5"],
-      ["seven", 0, "749"], ["four", 0, "749"], ["nine", 0, "749"], ["forty", 0, "40"], ["percent", 0, "40"],
-      ["webhook", 0, "webhook"], ["rollout", 0, "rollout"], ["doc", 0, "doc"],
+      ["Bumped", 0, "Bumped"], ["timeout", 0, "timeout"], ["749", 0, "749"], ["webhook", 0, "webhook"],
+      ["40", 0, "40"], ["rollout", 0, "rollout"], ["doc", 0, "doc"],
     ],
   },
   {
     name: "distilled: flight codes, times, dates, money",
     display: "Two flights fit your dates:\nAA2314 leaves at 3:15 PM on 10/24 for $250\nDL982 leaves at 6:00 PM for $310\nBook soon, since fares rose 12% this week.",
-    spoken: "Two flights fit your dates. <#0.3#> First, A A two three one four leaves at three fifteen p m on October twenty-fourth for two hundred and fifty dollars. <#0.3#> Next, D L nine eight two leaves at six p m for three hundred and ten dollars. Book soon, since fares rose twelve percent this week.",
+    spoken: "Two flights fit your dates. <#0.3#> AA2314 leaves at 3:15 PM on 10/24 for $250. <#0.3#> DL982 leaves at 6:00 PM for $310. Book soon, since fares rose 12% this week.",
     followable: true,
     lands: [
-      ["A", 0, "AA2314"], ["four", 0, "AA2314"], ["fifteen", 0, "15"], ["p", 0, "PM"], ["m", 0, "PM"],
-      ["twenty", 0, "24"], ["fourth", 0, "24"], ["fifty", 0, "250"], ["dollars", 0, "250"], ["D", 0, "DL982"],
-      ["two", 2, "DL982"], ["six", 0, "6"], ["ten", 0, "310"], ["twelve", 0, "12"],
+      ["AA2314", 0, "AA2314"], ["3", 0, "3"], ["15", 0, "15"], ["PM", 0, "PM"],
+      ["250", 0, "250"], ["DL982", 0, "DL982"], ["12", 0, "12"],
     ],
   },
   {
     name: "distilled: acronyms and spoken URLs",
     display: "I checked CPU and GPU load on the VM.  Both are under 30%.  The dashboard is at grafana.example.com/d/abc123 and the API docs are at docs.example.com.",
-    spoken: "I checked C P U and G P U load on the V M. Both are under thirty percent. The dashboard is at grafana dot example dot com, and the A P I docs are at docs dot example dot com.",
+    spoken: "I checked CPU and GPU load on the VM. Both are under 30%. The dashboard is at grafana.example.com/d/abc123 and the API docs are at docs.example.com.",
     followable: true,
     lands: [
-      ["C", 0, "CPU"], ["U", 1, "GPU"], ["V", 0, "VM"], ["M", 0, "VM"], ["thirty", 0, "30"], ["grafana", 0, "grafana"],
-      ["dot", 0, "grafana"], ["example", 0, "example"], ["com", 0, "com"], ["docs", 1, "docs"], ["com", 1, "com"],
+      ["CPU", 0, "CPU"], ["GPU", 0, "GPU"], ["VM", 0, "VM"], ["30", 0, "30"], ["grafana", 0, "grafana"],
+      ["docs", 1, "docs"], ["example", 0, "example"],
     ],
   },
   {
-    name: "distilled: inline code spelled, code block skipped",
-    // Add a lint script to `package.json`: / ```json ... ``` / Then run
-    // `pnpm lint` and commit the change.
+    name: "distilled: inline code delimiters stripped",
     display: "Add a lint script to package.json:\nThen run pnpm lint and commit the change.",
-    spoken: "Add a lint script to the package dot json file. Then run p n p m lint, and commit the change.",
+    spoken: "Add a lint script to package.json. Then run pnpm lint and commit the change.",
     followable: true,
-    lands: [["package", 0, "package"], ["json", 0, "json"], ["p", 0, "pnpm"], ["m", 0, "pnpm"], ["lint", 1, "lint"], ["commit", 0, "commit"]],
+    lands: [["package", 0, "package"], ["json", 0, "json"], ["pnpm", 0, "pnpm"], ["lint", 1, "lint"], ["commit", 0, "commit"]],
   },
   {
     name: "distilled: plural acronyms, ampersand, Q3, hyphens, thousands",
     display: "R&D signed off on the three new APIs.  Q3 revenue was up 12%, and the sign-up flow now handles 1,200 users per minute.",
-    spoken: "R and D signed off on the three new A P Is. Q three revenue was up twelve percent, and the sign up flow now handles one thousand two hundred users per minute.",
+    spoken: "R&D signed off on the three new APIs. Q3 revenue was up 12%, and the sign-up flow now handles 1,200 users per minute.",
     followable: true,
     lands: [
-      ["R", 0, "R"], ["and", 0, "R"], ["D", 0, "D"], ["Is", 0, "APIs"], ["Q", 0, "Q3"], ["three", 1, "Q3"],
-      ["twelve", 0, "12"], ["sign", 0, "sign"], ["one", 0, "1"], ["hundred", 0, "200"], ["users", 0, "users"],
+      ["APIs", 0, "APIs"], ["Q3", 0, "Q3"], ["12", 0, "12"], ["sign", 0, "sign"],
+      ["200", 0, "200"], ["users", 0, "users"],
     ],
   },
   {
-    name: "distilled: commit hash dropped, path renamed",
+    name: "distilled: commit hash and path kept",
     display: "Merged in a1b2c3d.  The fix is in server/tts/message-audio.ts, and CI is green on all 4 jobs.",
-    spoken: "Merged. The fix is in the message audio file, and C I is green on all four jobs.",
+    spoken: "Merged in a1b2c3d. The fix is in server/tts/message-audio.ts, and CI is green on all 4 jobs.",
     followable: true,
-    lands: [["Merged", 0, "Merged"], ["message", 0, "message"], ["audio", 0, "audio"], ["C", 0, "CI"], ["four", 0, "4"], ["jobs", 0, "jobs"]],
+    lands: [["a1b2c3d", 0, "a1b2c3d"], ["message", 0, "message"], ["audio", 0, "audio"], ["CI", 0, "CI"], ["jobs", 0, "jobs"]],
   },
   {
-    name: "distilled: a list of paths retold in one line",
+    name: "distilled: a list of paths read line by line",
     display: "I changed these files:\nserver/tts/message-audio.ts\nserver/tts/speech-summary.ts\nshared/karaoke-align.ts\nshared/spoken-script.ts\nsrc/lib/tts/index.ts\nsrc/lib/karaoke-session.ts\nios/Sources/CompanionCore/KaraokeAlign.swift\nAll the tests pass.",
-    spoken: "I changed seven files, mostly in the speech and karaoke code. All the tests pass.",
+    spoken: "I changed these files. <#0.3#> server/tts/message-audio.ts. <#0.3#> server/tts/speech-summary.ts. <#0.3#> shared/karaoke-align.ts. <#0.3#> shared/spoken-script.ts. <#0.3#> src/lib/tts/index.ts. <#0.3#> src/lib/karaoke-session.ts. <#0.3#> ios/Sources/CompanionCore/KaraokeAlign.swift. All the tests pass.",
     followable: true,
-    lands: [["changed", 0, "changed"], ["files", 0, "files"], ["tests", 0, "tests"], ["pass", 0, "pass"]],
+    lands: [["karaoke", 0, "karaoke"], ["align", 0, "align"], ["spoken", 0, "spoken"], ["tests", 0, "tests"], ["pass", 0, "pass"]],
   },
   {
-    // Under a tenth of the words on screen pair; the rest are swept.
-    name: "distilled: a list of twelve paths retold in one line",
+    name: "distilled: a list of twelve paths read line by line",
     display: `I changed these files:\n${PATHS.slice(0, 12).join("\n")}\nAll the tests pass.`,
-    spoken: "I changed twelve files, mostly in the speech and karaoke code. All the tests pass.",
+    spoken: `I changed these files. <#0.3#> ${PATHS.slice(0, 12).join(". <#0.3#> ")}. All the tests pass.`,
     followable: true,
-    lands: [["changed", 0, "changed"], ["files", 0, "files"], ["tests", 0, "tests"], ["pass", 0, "pass"]],
+    lands: [["speech", 0, "speech"], ["summary", 0, "summary"], ["KaraokeAlign", 0, "KaraokeAlign"], ["tests", 0, "tests"], ["pass", 0, "pass"]],
   },
   {
-    name: "distilled: a list of twenty-five paths retold in one line",
+    name: "distilled: a list of twenty-five paths read line by line",
     display: `I changed these files:\n${PATHS.join("\n")}\nAll the tests pass.`,
-    spoken: "I changed twenty five files, mostly in the speech and karaoke code. All the tests pass.",
+    spoken: `I changed these files. <#0.3#> ${PATHS.join(". <#0.3#> ")}. All the tests pass.`,
     followable: true,
-    lands: [["changed", 0, "changed"], ["files", 0, "files"], ["tests", 0, "tests"], ["pass", 0, "pass"]],
+    lands: [["VoiceSettings", 0, "VoiceSettings"], ["ChatView", 0, "ChatView"], ["tests", 0, "tests"], ["pass", 0, "pass"]],
   },
   {
-    name: "distilled: a status table retold in one sentence",
+    name: "distilled: a status table read row by row",
     display: STATUS_TABLE,
-    spoken: "Every bot is idle except Builder, which is running, and Reviewer, which failed.",
+    spoken: "Here is where every bot stands. <#0.3#> Bot, State, Last run, Branch. <#0.3#> Scout, idle, 3:15 PM, main. <#0.3#> Builder, running, 3:40 PM, claude/voice-distill-karaoke. <#0.3#> Archivist, idle, 2:05 PM, main. <#0.3#> Reviewer, failed, 3:42 PM, codex/review-sweep. <#0.3#> Courier, idle, 1:10 PM, main. <#0.3#> Janitor, idle, 12:30 PM, main. <#0.3#> Scribe, idle, 11:55 AM, docs/tts-notes. <#0.3#> Watcher, idle, 3:00 PM, main.",
     followable: true,
     lands: [["Builder", 0, "Builder"], ["running", 0, "running"], ["Reviewer", 0, "Reviewer"], ["failed", 0, "failed"]],
   },
   {
-    // This repo's own yyyymmddHHMM build numbers: twelve words, one code.
-    name: "distilled: a twelve-digit build number read digit by digit",
+    name: "distilled: a twelve-digit build number kept as digits",
     display: "The build number is 202610081532.",
-    spoken: "The build number is two zero two six one zero zero eight one five three two.",
+    spoken: "The build number is 202610081532.",
     followable: true,
-    lands: [["number", 0, "number"], ["two", 0, "202610081532"], ["eight", 0, "202610081532"], ["two", 2, "202610081532"]],
+    lands: [["202610081532", 0, "202610081532"], ["build", 0, "build"], ["number", 0, "number"]],
   },
   {
-    name: "distilled: a ten-digit order number read digit by digit",
+    name: "distilled: a ten-digit order number kept as digits",
     display: "Your order number is 4711923856.",
-    spoken: "Your order number is four seven one one nine two three eight five six.",
+    spoken: "Your order number is 4711923856.",
     followable: true,
-    lands: [["order", 0, "order"], ["four", 0, "4711923856"], ["six", 0, "4711923856"]],
+    lands: [["4711923856", 0, "4711923856"], ["order", 0, "order"]],
   },
   {
-    name: "distilled: a nine-character id read character by character",
+    name: "distilled: a nine-character id kept as written",
     display: "The run id is abcdef123.",
-    spoken: "The run id is a b c d e f one two three.",
+    spoken: "The run id is abcdef123.",
     followable: true,
-    lands: [["id", 0, "id"], ["b", 0, "abcdef123"], ["three", 0, "abcdef123"]],
+    lands: [["abcdef123", 0, "abcdef123"], ["id", 0, "id"]],
   },
   {
-    name: "condensed, in order",
+    name: "condensed paraphrase (prompt-forbidden)",
     display: BRIEF_REPLY,
-    spoken: "I tracked down the flaky cache test. Two workers warmed the cache at once. I added a lock and a regression test, and it passes now.",
-    followable: true,
-    lands: [["tracked", 0, "tracked"], ["warmed", 0, "warmed"], ["lock", 0, "lock"], ["regression", 0, "regression"], ["passes", 0, "passes"]],
+    spoken: "Good news: that intermittent problem is solved, and nothing else needs your attention today.",
+    followable: false,
+    lands: [],
   },
   {
     name: "brief summary reusing the reply's words",
@@ -661,7 +652,7 @@ describe("pronunciations", () => {
 const ALIGN_CASES: Array<{ name: string; spoken?: string; display: string; source?: string; pronunciations?: readonly Pronunciation[] }> = [
   { name: "identical", spoken: "The tests pass now.", display: "The tests pass now." },
   { name: "skipped path", spoken: "I changed core.ts today", display: "I changed server/drivers/acp/core.ts today" },
-  { name: "inserted code block", spoken: "Fixed it. (a TypeScript code block) That's it.", display: "Fixed it:\nThat's it." },
+  { name: "inserted code block", spoken: "Fixed it. A TypeScript code block. That's it.", display: "Fixed it:\nThat's it." },
   { name: "digits", spoken: "Flight seven four nine leaves at twenty-three hundred", display: "Flight 749 leaves at 2300" },
   { name: "cardinal", spoken: "version seven hundred and forty nine ships", display: "version 749 ships" },
   { name: "years", spoken: "in twenty twenty six and nineteen eighty four or twenty oh five", display: "in 2026 and 1984 or 2005" },

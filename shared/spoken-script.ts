@@ -2,9 +2,9 @@
 // client for karaoke.
 //
 // The harness projects a reply into utterances (server/tts/message-audio.ts).
-// By default that is the distilled rewrite (server/tts/speech-summary.ts, the
-// owner's choice: numbers, codes, acronyms and links spelled out, code
-// skipped), answered as `script: "summary"` with no spans.  The highlight
+// By default that is the distilled script (server/tts/speech-summary.ts, the
+// owner's choice: same words as the reply, punctuation and pause tags only),
+// answered as `script: "summary"` with no spans.  The highlight
 // still follows the main message: clients align the distilled words to the
 // rendered words without spans (shared/karaoke-align.ts), which tolerates
 // skipped, added and spelled-out words.
@@ -31,7 +31,7 @@
 // - srcStart/srcEnd are UTF-16 offsets into the source text, end exclusive.
 // - kind is 0 for a copy (spoken text equals the source slice) and 1 for an
 //   insert (literal text the rules wrote in place of the source slice, such as
-//   "(a code block)").
+//   "A code block.").
 // All offsets are JavaScript string indices.  The Swift client converts them
 // with SpeechSpans.stringRange(utf16:_:in:).
 
@@ -58,10 +58,24 @@ export type SpokenScriptKind = "written" | "summary";
  * voice would read them out, and the aligner would see the words "0" and "3". */
 export const PAUSE_TAG = /<#[0-9]+(?:\.[0-9]+)?#>/g;
 
+/** MiniMax sound tags the distiller may emit (DEEPSEEK_FLASH_TTS_PROMPT). */
+export const MINIMAX_SOUND_TAG = /\(\s*(?:breath|chuckle|sighs)\s*\)/gi;
+
 /** `text` without pause tags, for a voice that does not understand them. */
 export function stripPauseTags(text: string): string {
   if (!text.includes("<#")) return text;
   return text.replace(PAUSE_TAG, " ").replace(/[ \t]{2,}/g, " ").trim();
+}
+
+/** Remove MiniMax sound tags; Apple voices read them as literal words. */
+export function stripMiniMaxSoundTags(text: string): string {
+  if (!text.includes("(")) return text;
+  return text.replace(MINIMAX_SOUND_TAG, " ").replace(/[ \t]{2,}/g, " ").trim();
+}
+
+/** Pause markers and MiniMax sound tags stripped for on-device speech. */
+export function stripOnDeviceProsodyMarkup(text: string): string {
+  return stripMiniMaxSoundTags(stripPauseTags(text));
 }
 
 /** `text` with every pause tag blanked to spaces of the same UTF-16 length,

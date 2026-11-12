@@ -8,9 +8,9 @@ import Foundation
 /// one speaker inside `groupMessageTimeGap`, so a text turn with two prose
 /// bubbles is a run too, and gets a header and an identity.
 ///
-/// Tool runs keep their extra rules — failures stay enumerated, `error:`
-/// tools and comm rows never fold — because those are about not hiding
-/// something the user needs.
+/// Tool runs keep their extra rules — failures stay enumerated, and a step
+/// that is still running, a child step, an `error:` tool, or a comm row
+/// never folds — because those are about not hiding something the user needs.
 
 /// How long a pause can be and still be the same run.
 ///
@@ -44,9 +44,19 @@ public func messagesShareGroup(_ previous: Message, _ next: Message) -> Bool {
     return next.date.timeIntervalSince(previous.date) <= groupMessageTimeGap
 }
 
-/// True when this message may be folded into a run at all.
-private func isGroupable(_ message: Message) -> Bool {
+/// True when this message is a foldable tool step.
+private func isGroupableTool(_ message: Message) -> Bool {
     message.role != .system && isFoldableActivity(message)
+}
+
+/// True when this message is groupable prose (not a system row, tool chip,
+/// option card, screenshot, or delegation/comm event).
+internal func isGroupableProse(_ message: Message) -> Bool {
+    message.role != .system &&
+        message.kind == .text &&
+        message.comm == nil &&
+        message.card == nil &&
+        !isFoldableActivity(message)
 }
 
 /// Group consecutive same-speaker messages, preserving order and identity.
@@ -64,7 +74,7 @@ public func groupMessageRuns(_ messages: [Message]) -> [TranscriptItem] {
     }
 
     for message in messages {
-        guard let first = run.first else {
+        guard let previous = run.last else {
             // The first message always opens a run.  Emitting it straight to
             // `items` instead is why text messages could never group: the next
             // one would find `run` empty and start over.
@@ -75,9 +85,9 @@ public func groupMessageRuns(_ messages: [Message]) -> [TranscriptItem] {
         // only a run of other prose.  That keeps a text bubble between two
         // tools ending that run rather than being swallowed by it, while
         // still letting a text turn form a group of its own.
-        let bothTools = isGroupable(first) && isGroupable(message)
-        let bothText = !isGroupable(first) && !isGroupable(message)
-        if (bothTools || bothText) && messagesShareGroup(first, message) {
+        let bothTools = isGroupableTool(previous) && isGroupableTool(message)
+        let bothText = isGroupableProse(previous) && isGroupableProse(message)
+        if (bothTools || bothText) && messagesShareGroup(previous, message) {
             run.append(message)
         } else {
             flush()
@@ -93,20 +103,32 @@ public func groupMessageRuns(_ messages: [Message]) -> [TranscriptItem] {
 /// A group is one accessibility element: VoiceOver must not walk its members
 /// one at a time, but the failure count has to survive the fold, because a
 /// run that quietly swallows a failure is how a user misses their deploy broke.
-public func messageRunAccessibilityLabel(_ item: TranscriptItem) -> String {
+public func messageRunAccessibilityLabel(
+    _ item: TranscriptItem,
+    sender: String? = nil,
+    relativeTime: String? = nil
+) -> String {
     let messages = item.messages
     let count = messages.count
-    guard count > 1 else {
-        return "\(count) message"
+    var parts: [String] = []
+    if let sender, !sender.isEmpty {
+        parts.append(sender)
     }
-    let failed = messages.filter { $0.tool?.ok == false }.count
-    var label = "\(count) messages"
-    if messages.contains(where: { $0.tool != nil }) {
-        let (_, summary, _) = describeActivityRun(messages)
-        label += ", \(summary)"
-        if failed > 0 {
-            label += ", \(failed) failed"
+    if count <= 1 {
+        parts.append("\(count) message")
+    } else {
+        let failed = messages.filter { $0.tool?.ok == false }.count
+        parts.append("\(count) messages")
+        if messages.contains(where: { $0.tool != nil }) {
+            let (_, summary, _) = describeActivityRun(messages)
+            parts.append(summary)
+            if failed > 0 {
+                parts.append("\(failed) failed")
+            }
         }
     }
-    return label
+    if let relativeTime, !relativeTime.isEmpty {
+        parts.append(relativeTime)
+    }
+    return parts.joined(separator: ", ")
 }

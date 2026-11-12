@@ -16,12 +16,13 @@
 //   - `dms`      when each outbound DM that was not a reply went out: the
 //                per-bot DM rate limit's ledger.
 
-import { chmodSync, mkdirSync, readFileSync } from "node:fs";
+import { chmodSync, closeSync, fsyncSync, mkdirSync, openSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { z } from "zod";
 
 import { writeFileAtomic } from "../atomic.ts";
+import { canonicalZulipRole } from "../launch-identity.ts";
 import type { ZulipWorkUnit } from "./types.ts";
 
 export const HANDLED_RING_LIMIT = 2000;
@@ -73,6 +74,10 @@ const itemSchema = z.object({
   content: z.string(),
   timestamp: z.number().catch(0),
   via: z.enum(["mention", "dm", "followed"]).optional().catch(undefined),
+  // Plugin-platform routing: the dispatcher's hint and the role that
+  // routed it.  Absent reads as none, so old state files still parse.
+  pluginHint: z.string().max(2000).optional().catch(undefined),
+  routedFrom: z.string().max(128).optional().catch(undefined),
 });
 const unitSchema = z.object({
   origin: originSchema,
@@ -106,7 +111,9 @@ export class ZulipStateStore {
 
   /** The saved state for this bot, or a fresh one.  A state saved for a
    *  different role (the bot was re-mapped to another Zulip identity) starts
-   *  fresh: the old cursor and ring belong to someone else's mailbox. */
+   *  fresh: the old cursor and ring belong to someone else's mailbox.  The one
+   *  exception is a rename: a file whose canonical fold is this role keeps its
+   *  ledgers, relabelled, so the next save writes the canonical role. */
   load(botId: string, role: string): ZulipBotState {
     let text: string;
     try {
@@ -120,9 +127,13 @@ export class ZulipStateStore {
     } catch {
       return emptyState(role);
     }
-    if (!parsed.success || parsed.data.role !== role) return emptyState(role);
+    if (!parsed.success) return emptyState(role);
+    const savedRole = parsed.data.role;
+    if (savedRole !== role && canonicalZulipRole(savedRole) !== role) {
+      return emptyState(role);
+    }
     const { userId, dms, ...rest } = parsed.data;
-    const state: ZulipBotState = { ...rest, dms: dms ?? [] };
+    const state: ZulipBotState = { ...rest, role, dms: dms ?? [] };
     if (userId !== undefined) state.userId = userId;
     return state;
   }
@@ -139,5 +150,9 @@ export class ZulipStateStore {
       /* best effort: the files themselves are 600 */
     }
     writeFileAtomic(join(this.dir, fileName(botId)), `${JSON.stringify(state)}\n`, { mode: 0o600 });
+    if (process.platform !== "win32") {
+      const fd = openSync(this.dir, "r");
+      try { fsyncSync(fd); } finally { closeSync(fd); }
+    }
   }
 }

@@ -80,6 +80,10 @@ final class DefaultModelSlotsTests: XCTestCase {
         let picked = try slotsObject(DefaultModelSlots.applyModelDefaultsBody(primary: slot, fallbacks: []))
         let encoded = try XCTUnwrap(picked["primary"] as? [String: Any])
         XCTAssertEqual(encoded.keys.sorted(), ["instanceId", "model"], "never effort or fallbacks")
+
+        let floatingPick = ModelSelection(instanceId: "cursor", model: "composer-2.5", latest: "composer")
+        let floatingSlot = DefaultModelSlots.slotFromPick(floatingPick)
+        XCTAssertEqual(floatingSlot, DefaultModelSlot(instanceId: "cursor", model: "composer-2.5", latest: "composer"))
     }
 
     func testWithSlotIgnoresOutOfRangePlaces() {

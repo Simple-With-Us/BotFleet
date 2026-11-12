@@ -1,0 +1,91 @@
+name: Infisical binding preflight
+on:
+  pull_request:
+    paths:
+      - .github/workflows/infisical-binding-preflight.yml
+      - scripts/infisical-binding-preflight*
+      - scripts/infisical-audit-fetch.mjs
+  workflow_dispatch:
+    inputs:
+      expected_head_sha:
+        description: Exact protected-main SHA to audit
+        type: string
+        required: true
+permissions:
+  contents: read
+concurrency:
+  group: infisical-binding-preflight-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+jobs:
+  test:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: 26
+          package-manager-cache: false
+      - run: npm install --prefix "$RUNNER_TEMP/audit-deps" --no-package-lock --ignore-scripts yaml@2.8.2 && ln -s "$RUNNER_TEMP/audit-deps/node_modules" node_modules
+      - run: node --test scripts/infisical-binding-preflight.node-test.mjs
+  audit-infisical-bindings:
+    name: Read-only Infisical binding audit
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.ref_protected == true }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Validate dispatch ref and expected commit before credential reads
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          ACTUAL_SHA: ${{ github.sha }}
+          EXPECTED_SHA: ${{ inputs.expected_head_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$EVENT_NAME" == "workflow_dispatch" ]] || exit 1
+          [[ "$REF" == refs/heads/main ]] || exit 1
+          [[ "$REF_PROTECTED" == true ]] || exit 1
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || exit 1
+          actual_sha=$(printf '%s' "$ACTUAL_SHA" | tr '[:upper:]' '[:lower:]')
+          expected_sha=$(printf '%s' "$EXPECTED_SHA" | tr '[:upper:]' '[:lower:]')
+          [[ "$actual_sha" == "$expected_sha" ]] || exit 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26
+          package-manager-cache: false
+      - name: Audit existing read-token bindings without printing values
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REF: ${{ github.ref }}
+          GITHUB_REF_PROTECTED: ${{ github.ref_protected }}
+          EXPECTED_HEAD_SHA: ${{ inputs.expected_head_sha }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_PROJECT_ID }}
+          INFISICAL_IOS_SHIP_READ_TOKEN: ${{ secrets.INFISICAL_IOS_SHIP_READ_TOKEN }}
+          INFISICAL_RELEASE_READ_TOKEN: ${{ secrets.INFISICAL_RELEASE_READ_TOKEN }}
+          INFISICAL_MAC_COMMIT_BUILD_READ_TOKEN: ${{ secrets.INFISICAL_MAC_COMMIT_BUILD_READ_TOKEN }}
+          INFISICAL_NATIVE_RELEASE_READ_TOKEN: ${{ secrets.INFISICAL_NATIVE_RELEASE_READ_TOKEN }}
+          INFISICAL_SENTRY_DEPLOY_READ_TOKEN: ${{ secrets.INFISICAL_SENTRY_DEPLOY_READ_TOKEN }}
+          INFISICAL_SENTRY_CI_REPORT_READ_TOKEN: ${{ secrets.INFISICAL_SENTRY_CI_REPORT_READ_TOKEN }}
+          INFISICAL_SENTRY_TESTFLIGHT_READ_TOKEN: ${{ secrets.INFISICAL_SENTRY_TESTFLIGHT_READ_TOKEN }}
+          GH_FALLBACK_APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID != '' }}
+          GH_FALLBACK_APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID != '' }}
+          GH_FALLBACK_APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 != '' }}
+          GH_FALLBACK_MAC_CERT_P12_BASE64: ${{ secrets.MAC_CERT_P12_BASE64 != '' }}
+          GH_FALLBACK_MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD != '' }}
+          GH_FALLBACK_SENTRY_DSN: ${{ secrets.SENTRY_DSN != '' }}
+          GH_FALLBACK_SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN != '' }}
+          GH_FALLBACK_SENTRY_FLEET_DSN: ${{ secrets.SENTRY_FLEET_DSN != '' }}
+        run: node scripts/infisical-binding-preflight.mjs
+

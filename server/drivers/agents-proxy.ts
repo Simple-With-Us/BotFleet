@@ -161,7 +161,9 @@ async function callTool(name: string, args: Json): Promise<{ text: string; isErr
     const lines = bots.map((b) => {
       const role = b.title ? ` — ${b.title}` : "";
       const about = b.description ? ` (${String(b.description).slice(0, 120)})` : "";
-      return `- ${b.name}${role}${about} [id: ${b.id}, model: ${b.model}${b.busy ? ", busy" : ""}]`;
+      // `off` rides the row only for a bot that is switched Off, exactly as it
+      // does on the HTTP lane, so a peer can tell before it tries a handoff.
+      return `- ${b.name}${role}${about} [id: ${b.id}, model: ${b.model}${b.busy ? ", busy" : ""}${b.off === true ? ", off" : ""}]`;
     });
     return { text: `Other bots you can message with coordinate_bots:\n${lines.join("\n")}` };
   }

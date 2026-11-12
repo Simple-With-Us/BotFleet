@@ -33,6 +33,7 @@ import {
   Crown,
   FolderMinus,
   FolderPlus,
+  GitMerge,
   Library,
   Loader2,
   Moon,
@@ -53,7 +54,7 @@ import {
   Users,
   X,
 } from "lucide-react";
-import { api, useStore, formatTime, visibleMessages, getRoomTerminology, getConversationMode, latestChatActivity, compareBotsByRecentActivity, compareGroupsByRecentActivity, type Bot, type Group, type Message } from "@/state/store";
+import { api, useStore, formatTime, visibleMessages, getRoomTerminology, getConversationMode, latestChatActivity, compareBotsByRecentActivity, compareGroupsByRecentActivity, type Bot, type Group, type InstanceInfo, type Message, type ModelSelection, type Task } from "@/state/store";
 import { botSupportsImageAttachments } from "@/lib/model-images";
 import { roomRespondersForComposer } from "@/lib/group-routing";
 import { allowsMultipleBotThreads, rosterPrimaryLabel } from "../../shared/conversation-mode";
@@ -67,6 +68,7 @@ import {
 
 import { BotAvatar, InitialsAvatar } from "./Avatar";
 import { BotOffBadge } from "./BotOffBadge";
+import { MergeAllThreadsDialog } from "./MergeAllThreadsDialog";
 import { ProviderMark } from "./ProviderIcons";
 import { stateForBot } from "@/lib/mascot";
 import { botActivityLocation, botStatusText, botWaitReason } from "@/lib/sidebar-activity";
@@ -89,6 +91,7 @@ import {
   useSnoozeExpiry,
 } from "@/lib/thread-snooze";
 import { ThreadSnoozeBadge, ThreadWakeButton } from "./SidebarThreadRow";
+import { ContextFillBadge, contextMeterFor } from "./ContextUsage";
 import { imageAttachmentFromFile, intakeFiles } from "@/lib/composer-attachments";
 import { pathForFile } from "./ComposerAttachments";
 import { appendDraftAttachments } from "@/lib/drafts";
@@ -337,7 +340,7 @@ function activityPreview(tool: NonNullable<Message["tool"]>): string {
   return target ? `${verb} · ${target}` : verb;
 }
 
-interface MenuState {
+export interface MenuState {
   botId: string;
   x: number;
   y: number;
@@ -448,7 +451,38 @@ type SidebarThread = {
   createdAt: number;
   lastActivity?: number;
   snoozedUntil?: number;
+  usage?: Task["usage"];
+  modelSelection?: ModelSelection;
 };
+
+function catalogWindow(instances: InstanceInfo[], selection: ModelSelection | undefined): number | undefined {
+  if (!selection) return undefined;
+  return instances
+    .find((instance) => instance.instanceId === selection.instanceId)
+    ?.models.options.find((option) => option.id === selection.model)?.contextWindow;
+}
+
+function threadContextMeter(
+  state: { instances: InstanceInfo[]; bots: Bot[] },
+  owner: ThreadOwner,
+  task: SidebarThread,
+) {
+  const bot = owner.kind === "bot" ? state.bots.find((entry) => entry.id === owner.id) : undefined;
+  return contextMeterFor({
+    used: task.usage?.lastInput,
+    reportedWindow: task.usage?.contextWindow,
+    catalogWindow: catalogWindow(state.instances, task.modelSelection ?? bot?.modelSelection),
+  });
+}
+
+function botContextMeter(state: { instances: InstanceInfo[]; bots: Bot[] }, bot: Bot) {
+  const task = bot.tasks?.find((entry) => entry.threadId === bot.threadId);
+  return contextMeterFor({
+    used: task?.usage?.lastInput,
+    reportedWindow: task?.usage?.contextWindow,
+    catalogWindow: catalogWindow(state.instances, task?.modelSelection ?? bot.modelSelection),
+  });
+}
 
 /** One conversation inside a channel.
  *
@@ -621,6 +655,7 @@ function ThreadListItem({
       >
         <span className="size-1.5 shrink-0 rounded-full bg-current opacity-40" />
         <span className={cn("truncate text-[13px]", asleep && "opacity-60")}>{label}</span>
+        <ContextFillBadge meter={threadContextMeter(state, owner, task)} />
         <ThreadSnoozeBadge threadId={task.threadId} snoozedUntil={task.snoozedUntil} />
       </button>
       {asleep && (
@@ -1663,16 +1698,20 @@ function SectionPicker({
   );
 }
 
-function BotContextMenu({
+// Exported for tests/e2e/sidebar-menu-hover.visual.spec.ts, which mounts the
+// real menu so a change to the hover fill cannot silently regress.
+export function BotContextMenu({
   menu,
   onClose,
   onArchive,
   onMoveToSection,
+  onMergeAll,
 }: {
   menu: MenuState;
   onClose: () => void;
   onArchive: (bot: Bot) => void;
   onMoveToSection: (botId: string) => void;
+  onMergeAll: (botId: string) => void;
 }) {
   const { state, dispatch } = useStore();
   const bot = state.bots.find((b) => b.id === menu.botId);
@@ -1696,6 +1735,7 @@ function BotContextMenu({
   const engine = state.instances.find((instance) => instance.instanceId === bot.modelSelection.instanceId);
   const canCoordinate = engine?.capabilities?.agentsMcp === true;
   const visibleBotCount = state.bots.filter((candidate) => !candidate.hidden).length;
+  const threadCount = bot.tasks?.length ?? 0;
   const archiveBlocked = Boolean(bot.chiefOfStaff) || visibleBotCount <= 1;
   const archiveHint = bot.chiefOfStaff
     ? "Choose another Chief of Staff first"
@@ -1710,7 +1750,7 @@ function BotContextMenu({
     icon: React.ReactNode,
     label: string,
     onClick?: () => void,
-    opts?: { danger?: boolean; disabled?: boolean; hint?: string },
+    opts?: { danger?: boolean; disabled?: boolean; hint?: string; testId?: string },
   ) => (
     <button
       key={label}
@@ -1720,10 +1760,11 @@ function BotContextMenu({
         onClose();
       }}
       title={opts?.hint}
+      data-testid={opts?.testId}
       className={cn(
         "flex w-full items-center gap-3 px-3.5 py-2 text-left text-[14px]",
         opts?.danger ? "text-danger" : "text-ink",
-        opts?.disabled ? "cursor-default opacity-40" : "hover:bg-raised/70",
+        opts?.disabled ? "cursor-default opacity-40" : "hover:bg-raised-hover",
       )}
     >
       {icon}
@@ -1743,6 +1784,7 @@ function BotContextMenu({
           bot.pinned ? <PinOff size={16} className="text-ink-secondary" /> : <Pin size={16} className="text-ink-secondary" />,
           bot.pinned ? "Unpin" : "Pin",
           () => dispatch({ type: "updateBot", botId: bot.id, patch: { pinned: !bot.pinned } }),
+          { testId: "bot-menu-item-pin" },
         ),
         item(
           <Crown size={16} className={bot.chiefOfStaff ? "text-accent" : "text-ink-secondary"} />,
@@ -1751,6 +1793,7 @@ function BotContextMenu({
           {
             disabled: !bot.chiefOfStaff && !canCoordinate,
             hint: !bot.chiefOfStaff && !canCoordinate ? "Choose an engine with coordination first" : undefined,
+            testId: "bot-menu-item-chief",
           },
         ),
         item(<FolderPlus size={16} className="text-ink-secondary" />, "Move to Section", () => {
@@ -1759,6 +1802,19 @@ function BotContextMenu({
         }),
         item(<BellDot size={16} className="text-ink-secondary" />, "Mark as Unread", () =>
           dispatch({ type: "markUnread", botId: bot.id }),
+        ),
+        item(
+          <GitMerge size={16} className="text-ink-secondary" />,
+          "Merge All Threads…",
+          () => {
+            onClose();
+            onMergeAll(bot.id);
+          },
+          {
+            disabled: threadCount < 2,
+            hint: threadCount < 2 ? "This bot has one conversation" : undefined,
+            testId: "bot-menu-item-merge",
+          },
         ),
         divider("d1"),
         item(<Pencil size={16} className="text-ink-secondary" />, "Edit Profile", () => {
@@ -1780,6 +1836,7 @@ function BotContextMenu({
           {
             disabled: archiveBlocked,
             hint: archiveHint,
+            testId: "bot-menu-item-archive",
           },
         ),
         item(<Trash2 size={16} />, "Delete", () => dispatch({ type: "deleteBot", botId: bot.id }), {
@@ -1871,8 +1928,9 @@ export function BotListItem({
           // Motion means something is happening. A resting bot holds a resting
           // pose — N idle rows bobbing at display rate was most of the app's
           // visible-idle CPU (states are keyword-derived, so "working" can be
-          // decorative; busy/unread/motion are the real signals).
-          animated={Boolean(bot.busy) || Boolean(bot.unread) || (mascotMotion?.kind ?? "none") !== "none"}
+          // decorative; busy/motion are the real signals, while unread has its
+          // own badge and would otherwise animate idle background bots forever).
+          animated={Boolean(bot.busy) || (mascotMotion?.kind ?? "none") !== "none"}
         />
         {iconOnly && bot.off === true && <BotOffBadge compact className="absolute -bottom-1 -right-1" />}
         {iconOnly && (
@@ -1922,6 +1980,7 @@ export function BotListItem({
               );
             })()}
             {bot.off === true && <BotOffBadge className="ml-1" />}
+            <ContextFillBadge meter={botContextMeter(state, bot)} />
           </span>
           {selected && activityAt > 0 && !renaming && (
             <span className="shrink-0 text-xs text-ink-secondary transition-opacity group-hover:opacity-0 group-focus-within:opacity-0">
@@ -2274,6 +2333,7 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
   const importReturnRef = useRef<HTMLButtonElement>(null);
   const [menu, setMenu] = useState<MenuState | null>(null);
   const [sectionPicker, setSectionPicker] = useState<MenuState | null>(null);
+  const [mergeAll, setMergeAll] = useState<MenuState | null>(null);
   const [roomMenu, setRoomMenu] = useState<{ groupId: string; x: number; y: number } | null>(null);
   const [roomSectionPicker, setRoomSectionPicker] = useState<{ groupId: string; x: number; y: number } | null>(null);
   const [plusOpen, setPlusOpen] = useState(false);
@@ -3217,6 +3277,13 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
           onClose={() => setMenu(null)}
           onArchive={(bot) => void archiveBot(bot)}
           onMoveToSection={(botId) => setSectionPicker({ botId, x: menu.x, y: menu.y })}
+          onMergeAll={(botId) => setMergeAll({ botId, x: menu.x, y: menu.y })}
+        />
+      )}
+      {mergeAll && state.bots.find((candidate) => candidate.id === mergeAll.botId) && (
+        <MergeAllThreadsDialog
+          bot={state.bots.find((candidate) => candidate.id === mergeAll.botId)!}
+          onClose={() => setMergeAll(null)}
         />
       )}
       {sectionPicker && (

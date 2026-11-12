@@ -6,7 +6,7 @@
 // spelled out ("seven four nine" for 749, "A P I" for API, "example dot com"),
 // code skipped, lists retold with "First" and "Next", light rewording.  In
 // "off" mode, or when the distiller falls back, it is the deterministic
-// script (shared/speech-spans.ts): "(a code block)" instead of the code, "a
+// script (shared/speech-spans.ts): "A code block." instead of the code, "a
 // link" for a bare URL.  The owner's ask is that the highlight follow the main
 // message either way, tolerating skipped and added words the way a person
 // reading aloud would (owner correction, 2026-10-08).  The words on screen come from the

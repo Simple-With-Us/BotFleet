@@ -23,6 +23,21 @@ import {
   type QuotaWindow,
 } from "@/lib/quota-display";
 import { cn } from "@/lib/cn";
+import { engineIdFromDriverKind } from "@/lib/engine-capabilities";
+
+/** Engines whose quota means nothing to the person reading the picker.
+ *
+ *  OpenCode fronts many providers at once and a single account can reach too
+ *  many of them for a percentage to be the thing that decides whether the next
+ *  turn runs, so its meter was noise in a panel whose whole job is answering
+ *  "can this bot run right now". */
+const UNQUOTED_ENGINES = new Set(["opencode"]);
+
+/** Engines that front several providers and therefore report one quota row per
+ *  provider.  Clutch is the case that reaches the picker: three platforms, so
+ *  the always-open block under the header becomes a stack of bars and pushes
+ *  the model list off the panel. */
+const MULTI_PLATFORM_ENGINES = new Set(["deepseek-harness"]);
 
 /** The subset of `InstanceInfo` this panel reads.
  *
@@ -170,6 +185,7 @@ export function EngineQuotasPanel({
   const rows = useMemo(
     () =>
       engines
+        .filter((engine) => !UNQUOTED_ENGINES.has(engineIdFromDriverKind(engine.driverKind) ?? ""))
         .map((engine) => ({ engine, ...engineWindows(engine) }))
         .filter((row) => row.windows.length > 0)
         // The engine closest to its limit leads: it is the one that decides
@@ -184,7 +200,16 @@ export function EngineQuotasPanel({
   // with quota stays behind the disclosure below it, so the header area stays
   // short.
   const activeRow = activeInstanceId ? rows.find((row) => row.engine.instanceId === activeInstanceId) ?? null : null;
-  const otherRows = activeRow ? rows.filter((row) => row !== activeRow) : rows;
+  // A multi-platform harness reports one quota row per platform it fronts, so
+  // the block that normally answers "can this bot run right now" in two bars
+  // becomes six and pushes the model list off the panel.  Those engines stay
+  // behind the disclosure until it is opened.
+  const activeIsWide = activeRow ? MULTI_PLATFORM_ENGINES.has(engineIdFromDriverKind(activeRow.engine.driverKind) ?? "") : false;
+  // Hiding the always-open block for a wide engine only moves its row to the
+  // disclosure -- it must therefore STAY in `otherRows`.  Dropping it here as
+  // well would delete its quota from the panel: invisible in both places, and
+  // with no other engine present the whole panel renders empty.
+  const otherRows = activeRow && !activeIsWide ? rows.filter((row) => row !== activeRow) : rows;
 
   // Worst engine on this Mac, named in the collapsed trigger so the button
   // carries information before it is ever opened.
@@ -203,7 +228,7 @@ export function EngineQuotasPanel({
 
   return (
     <div className={cn("mt-2", className)}>
-      {activeRow && (
+      {activeRow && !activeIsWide && (
         <div
           data-testid="engine-quotas-active"
           className="rounded-lg border border-hairline/40 bg-inset/30 px-3 py-2"
@@ -231,7 +256,7 @@ export function EngineQuotasPanel({
             className="mt-1 flex w-full items-center gap-1.5 rounded px-1 py-1 text-left text-[11.5px] text-ink-secondary hover:text-ink"
           >
             <span className="min-w-0 flex-1 truncate">
-              <strong className="font-medium">{activeRow ? "Other Engines" : "Engine Quotas"}</strong>
+              <strong className="font-medium">{activeRow && !activeIsWide ? "Other Engines" : "Engine Quotas"}</strong>
               {tightest && tightestWindow && (
                 <span className="text-ink-secondary">
                   {" · "}

@@ -1,0 +1,780 @@
+import Foundation
+import XCTest
+@testable import CompanionCore
+
+private actor FixtureResourceHosts: ServersHostStore {
+    var records: [HostRecord] = [.thisMac]
+    var placement = PlacementSettings()
+    var failRead = false
+
+    func configure(records: [HostRecord], failRead: Bool = false) {
+        self.records = records
+        self.failRead = failRead
+    }
+
+    func hosts() throws -> [HostRecord] {
+        if failRead { throw SavedHostError.unreadableStore }
+        return records
+    }
+
+    func settings() throws -> PlacementSettings { placement }
+    func upsert(_ host: HostRecord) throws {
+        if let index = records.firstIndex(where: { $0.id == host.id }) {
+            records[index] = host
+        } else {
+            records.append(host)
+        }
+    }
+    func updateThisMacOrigin(_ origin: HostOrigin) throws { records[0].origin = origin }
+    func remove(id: String, controllerID: String?, leasedHostIDs: Set<String>) throws {
+        records.removeAll { $0.id == id }
+    }
+    func save(_ selection: PlacementSelection) throws {
+        placement.saved = selection
+    }
+    func recordApplied(_ selection: PlacementSelection) throws {
+        placement.applied = selection
+    }
+}
+
+private final class FixtureResourceTokens: HostTokenStore, @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [String: Data] = [:]
+
+    func read(for host: HostRecord) throws -> HostGateCredential? {
+        lock.lock(); defer { lock.unlock() }
+        return try values[host.id].map { try KeychainHostTokenStore.decode($0, for: host) }
+    }
+
+    func write(_ token: RedactedSecret, for host: HostRecord) throws {
+        lock.lock(); defer { lock.unlock() }
+        values[host.id] = try KeychainHostTokenStore.encode(token, for: host)
+    }
+
+    func remove(recordID: String) throws {
+        lock.lock(); defer { lock.unlock() }
+        values[recordID] = nil
+    }
+}
+
+private actor HeldResourceFetch {
+    var shouldHold = false
+    var continuation: CheckedContinuation<HostResourcesReport, Never>?
+
+    func setShouldHold(_ value: Bool) {
+        shouldHold = value
+    }
+
+    func fetchOrWait(defaultReport: HostResourcesReport) async -> HostResourcesReport {
+        guard shouldHold else { return defaultReport }
+        return await withCheckedContinuation { continuation = $0 }
+    }
+
+    func isWaiting() -> Bool { continuation != nil }
+    func resume(with report: HostResourcesReport) {
+        continuation?.resume(returning: report)
+        continuation = nil
+    }
+}
+
+private final class HostResourcesURLProtocol: URLProtocol {
+    static var handler: (URLRequest) -> (Int, Data) = { _ in (500, Data()) }
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        let (status, data) = Self.handler(request)
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: status,
+            httpVersion: nil,
+            headerFields: ["Content-Type": "application/json"]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: data)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+    override func stopLoading() {}
+}
+
+@MainActor
+final class MacResourcesSettingsTests: XCTestCase {
+    private let gb: Double = pow(1024.0, 3.0)
+    // 2026-10-29T19:14:00Z == 2:14 PM CDT
+    private let sampleTimestampMs: Double = 1_793_301_240_000
+
+    private func makeSample(
+        cores: Double? = 10,
+        loadPerCore: Double? = 2.41,
+        ramTotalBytes: Double? = nil,
+        ramAvailableBytes: Double? = nil,
+        memoryPressure: String? = nil,
+        memoryAvailablePercent: Double? = 63,
+        swapTotalBytes: Double? = nil,
+        swapUsedBytes: Double? = nil,
+        diskTotalBytes: Double? = nil,
+        diskFreeBytes: Double? = nil,
+        inodesTotal: Double? = 6_000_000,
+        inodesFree: Double? = 5_000_000,
+        dataVolume: HostDataVolume? = HostDataVolume(device: "8:16", mountPoint: "/mnt/fleet-extra"),
+        rootDiskFreeBytes: Double? = nil,
+        storage: HostStorageState? = HostStorageState(online: true, dataDevice: "8:16", rootDevice: "8:1")
+    ) -> HostCapacitySample {
+        HostCapacitySample(
+            at: sampleTimestampMs,
+            cores: cores,
+            loadPerCore: loadPerCore,
+            ramTotalBytes: ramTotalBytes ?? 32 * gb,
+            ramAvailableBytes: ramAvailableBytes ?? 20 * gb,
+            memoryPressure: memoryPressure,
+            memoryAvailablePercent: memoryAvailablePercent,
+            swapTotalBytes: swapTotalBytes ?? 4 * gb,
+            swapUsedBytes: swapUsedBytes ?? 3 * gb,
+            diskTotalBytes: diskTotalBytes ?? 100 * gb,
+            diskFreeBytes: diskFreeBytes ?? 60 * gb,
+            inodesTotal: inodesTotal,
+            inodesFree: inodesFree,
+            dataVolume: dataVolume,
+            rootDiskFreeBytes: rootDiskFreeBytes ?? 10 * gb,
+            storage: storage
+        )
+    }
+
+    private func makeReport(
+        hostId: String = "mac:12345678-1234-1234-1234-123456789012",
+        version: String? = "1.2.3",
+        platform: String = "darwin",
+        capabilities: [String] = ["shell", "macos", "desktop"],
+        sample: HostCapacitySample? = nil,
+        admission: HostAdmissionThresholds? = nil,
+        enforcement: HostEnforcementMap = HostEnforcementMap(),
+        limitations: [String] = ["Disk is an admission gate; no disk quota is observed"]
+    ) -> HostResourcesReport {
+        HostResourcesReport(
+            hostId: hostId,
+            version: version,
+            platform: platform,
+            capabilities: capabilities,
+            sample: sample ?? makeSample(),
+            storage: (sample ?? makeSample()).storage,
+            admission: admission ?? HostAdmissionThresholds(maxSwapPercent: 98, minFreeDiskBytes: 2 * gb),
+            enforcement: enforcement,
+            observedLimits: [:],
+            limitations: limitations
+        )
+    }
+
+    func testMacSettingsSectionIncludesResourcesAndDeepLinks() {
+        XCTAssertEqual(MacSettingsSection.resources.displayTitle, "Resources")
+        XCTAssertEqual(MacSettingsSection.resources.symbolName, "gauge.with.dots.needle.33percent")
+        XCTAssertEqual(
+            MacSettingsDeepLinkRouter.section(for: URL(string: "botfleet://settings/resources")!),
+            .resources
+        )
+        XCTAssertEqual(
+            MacSettingsDeepLinkRouter.section(for: URL(string: "botfleet://settings?section=resources")!),
+            .resources
+        )
+    }
+
+    func testEnforcementSentenceExactCopyAndNoLimitOrCapOutsideKernelCap() {
+        XCTAssertEqual(
+            HostResourcesPresentation.enforcementSentence(
+                .kernelCap(mechanism: "cgroup v2 memory.max, whole server"),
+                noun: "the server"
+            ),
+            "Enforced by the system (cgroup v2 memory.max, whole server)"
+        )
+        XCTAssertEqual(
+            HostResourcesPresentation.enforcementSentence(.stopWhenOver, noun: "the server"),
+            "Watched: jobs are stopped if they exceed it"
+        )
+        XCTAssertEqual(
+            HostResourcesPresentation.enforcementSentence(.gateOnly, noun: "this Mac"),
+            "Checked before each job starts"
+        )
+        XCTAssertEqual(
+            HostResourcesPresentation.enforcementSentence(.priorityOnly, noun: "this Mac"),
+            "Full speed allowed.\u{00A0} Jobs run at background priority."
+        )
+        XCTAssertEqual(
+            HostResourcesPresentation.enforcementSentence(.unsupported(reason: "No swap is configured"), noun: "this Mac"),
+            "Not enforced on this Mac: No swap is configured"
+        )
+        XCTAssertEqual(
+            HostResourcesPresentation.enforcementSentence(
+                .notApplied(reason: "Disk reading unavailable; admission permits unknown readings", restartRequired: false),
+                noun: "the server"
+            ),
+            "Not applied: Disk reading unavailable; admission permits unknown readings"
+        )
+
+        let nonKernelStates: [HostEnforcementState] = [
+            .stopWhenOver,
+            .gateOnly,
+            .priorityOnly,
+            .unsupported(reason: "No inode admission gate is active"),
+            .notApplied(reason: "Server storage offline; new jobs are refused", restartRequired: false),
+        ]
+        for state in nonKernelStates {
+            let text = HostResourcesPresentation.enforcementSentence(state, noun: "the server").lowercased()
+            XCTAssertFalse(text.contains("limit"), text)
+            XCTAssertFalse(text.contains("cap"), text)
+        }
+    }
+
+    func testFormattersUnitsGroupingCentralTimeAndHostSubtitle() {
+        XCTAssertEqual(HostResourcesPresentation.formatBytes(32 * gb), "32.0 GB")
+        XCTAssertEqual(HostResourcesPresentation.formatBytes(2 * gb), "2.0 GB")
+        XCTAssertEqual(HostResourcesPresentation.formatBytes(512 * 1024 * 1024), "512 MB")
+        XCTAssertEqual(HostResourcesPresentation.formatBytes(0), "0 bytes")
+        XCTAssertEqual(HostResourcesPresentation.formatBytes(nil), "Unknown")
+
+        XCTAssertEqual(HostResourcesPresentation.formatCount(5_000_000, singular: "inode"), "5,000,000 inodes")
+        XCTAssertEqual(HostResourcesPresentation.formatCount(1, singular: "core"), "1 core")
+        XCTAssertEqual(HostResourcesPresentation.formatCount(10, singular: "core"), "10 cores")
+        XCTAssertEqual(HostResourcesPresentation.formatPercent(98), "98%")
+        XCTAssertEqual(HostResourcesPresentation.formatPercent(85.5), "85.5%")
+        XCTAssertEqual(HostResourcesPresentation.formatNumericValue(12.5), "12.5")
+        XCTAssertEqual(HostResourcesPresentation.formatNumericValue(2.0), "2")
+
+        let central = HostResourcesPresentation.formatCentralTime(sampleTimestampMs)
+        XCTAssertTrue(central.contains("2:14 PM"), central)
+        XCTAssertTrue(central.contains("CDT") || central.contains("CST"), central)
+
+        let macReport = makeReport()
+        let linuxReport = makeReport(
+            hostId: "server:12345678-1234-1234-1234-123456789012",
+            platform: "linux"
+        )
+        XCTAssertEqual(HostResourcesPresentation.hostNoun(macReport), "this Mac")
+        XCTAssertEqual(HostResourcesPresentation.hostNoun(linuxReport), "the server")
+        XCTAssertEqual(
+            HostResourcesPresentation.hostSubtitle(for: macReport),
+            "macOS · 1.2.3 · shell, macos, desktop"
+        )
+    }
+
+    func testAdmissionRowsSavedVsAppliedAndEffectiveMemoryEnforcement() {
+        let base = makeReport()
+        let baseByKey = Dictionary(uniqueKeysWithValues: HostResourcesPresentation.admissionRows(for: base).map { ($0.key, $0) })
+        XCTAssertEqual(baseByKey["reservedCpuCores"]?.saved, "Not set")
+        XCTAssertEqual(baseByKey["reservedRam"]?.saved, "Not set")
+        XCTAssertEqual(baseByKey["minMemoryAvailablePercent"]?.saved, "Not set")
+        XCTAssertEqual(baseByKey["minFreeInodes"]?.saved, "Not set")
+        XCTAssertEqual(baseByKey["minFreeInodes"]?.applied, "Not set: no gate")
+        XCTAssertNil(baseByKey["reservedCpuCores"]?.mismatch)
+        XCTAssertEqual(baseByKey["reservedCpuCores"]?.envOverride, "BOTFLEET_JOBS_RESERVED_CPU_CORES")
+
+        // Saved Mac CPU reservation never acts as a gate on macOS.
+        let macCpuReserved = makeReport(
+            admission: HostAdmissionThresholds(maxSwapPercent: 98, minFreeDiskBytes: 2 * gb, reservedCpuCores: 2)
+        )
+        let cpuRow = HostResourcesPresentation.admissionRows(for: macCpuReserved).first { $0.key == "reservedCpuCores" }!
+        XCTAssertEqual(cpuRow.saved, "2 cores")
+        XCTAssertTrue(cpuRow.applied.contains("Not applied on this Mac"))
+        XCTAssertEqual(cpuRow.mismatch, cpuRow.applied)
+
+        // Over-capacity reservation on Linux server shows no-capacity sentence.
+        let overRamServer = makeReport(
+            hostId: "server:12345678-1234-1234-1234-123456789012",
+            platform: "linux",
+            admission: HostAdmissionThresholds(maxSwapPercent: 98, minFreeDiskBytes: 2 * gb, reservedRamBytes: 32 * gb)
+        )
+        let ramRow = HostResourcesPresentation.admissionRows(for: overRamServer).first { $0.key == "reservedRam" }!
+        XCTAssertEqual(ramRow.mismatch, HostResourcesPresentation.noCapacitySentence(platform: "linux"))
+        XCTAssertTrue(ramRow.mismatch!.contains("\u{00A0} "))
+
+        // Swapless host with headroom set keeps memory gate enforced.
+        var swaplessSample = makeSample()
+        swaplessSample.swapTotalBytes = 0
+        swaplessSample.swapUsedBytes = 0
+        let swaplessEnforcement = HostEnforcementMap(
+            cpu: .priorityOnly,
+            memory: .unsupported(reason: "No swap is configured; no RAM budget check is active"),
+            swap: .unsupported(reason: "No swap is configured"),
+            disk: .gateOnly,
+            inodes: .unsupported(reason: "No inode admission gate is active"),
+            io: .unsupported(reason: "No I/O rate enforcement observed")
+        )
+        let swaplessWithHeadroom = makeReport(
+            hostId: "server:12345678-1234-1234-1234-123456789012",
+            platform: "linux",
+            sample: swaplessSample,
+            admission: HostAdmissionThresholds(
+                maxSwapPercent: 98,
+                minFreeDiskBytes: 2 * gb,
+                reservedRamBytes: 1 * gb,
+                minMemoryAvailablePercent: 10
+            ),
+            enforcement: swaplessEnforcement
+        )
+        XCTAssertEqual(HostResourcesPresentation.effectiveMemoryEnforcement(for: swaplessWithHeadroom), .gateOnly)
+        let swaplessByKey = Dictionary(
+            uniqueKeysWithValues: HostResourcesPresentation.admissionRows(for: swaplessWithHeadroom).map { ($0.key, $0) }
+        )
+        XCTAssertEqual(swaplessByKey["reservedRam"]?.applied, "1.0 GB")
+        XCTAssertNil(swaplessByKey["reservedRam"]?.mismatch)
+        XCTAssertEqual(swaplessByKey["minMemoryAvailablePercent"]?.applied, "10%")
+        XCTAssertNil(swaplessByKey["minMemoryAvailablePercent"]?.mismatch)
+        XCTAssertEqual(swaplessByKey["maxSwapPercent"]?.applied, "Not enforced on the server: No swap is configured")
+
+        // Fractional percentages preserve their decimal digits instead of rounding to integers.
+        let fractionalReport = makeReport(
+            admission: HostAdmissionThresholds(
+                maxSwapPercent: 85.5,
+                minFreeDiskBytes: 2 * gb,
+                minMemoryAvailablePercent: 12.5
+            )
+        )
+        let fractionalByKey = Dictionary(
+            uniqueKeysWithValues: HostResourcesPresentation.admissionRows(for: fractionalReport).map { ($0.key, $0) }
+        )
+        XCTAssertEqual(fractionalByKey["maxSwapPercent"]?.saved, "85.5%")
+        XCTAssertEqual(fractionalByKey["maxSwapPercent"]?.applied, "85.5%")
+        XCTAssertEqual(fractionalByKey["minMemoryAvailablePercent"]?.saved, "12.5%")
+        XCTAssertEqual(fractionalByKey["minMemoryAvailablePercent"]?.applied, "12.5%")
+    }
+
+    func testResourceRowsUnknownReadingOfflineStorageAndNullSafety() {
+        var missingDisk = makeSample()
+        missingDisk.diskFreeBytes = nil
+        let missingDiskReport = makeReport(sample: missingDisk)
+        let diskRow = HostResourcesPresentation.resourceRows(for: missingDiskReport).first { $0.key == "disk" }!
+        XCTAssertTrue(diskRow.use.contains("Unknown"))
+        XCTAssertTrue(diskRow.enforcement.contains("not checked before jobs start"))
+        XCTAssertTrue(diskRow.enforcement.contains("2:14 PM"))
+
+        var offlineSample = makeSample()
+        offlineSample.storage = HostStorageState(online: false, dataDevice: nil, rootDevice: "8:1")
+        let offlineReport = makeReport(sample: offlineSample)
+        let offlineDisk = HostResourcesPresentation.resourceRows(for: offlineReport).first { $0.key == "disk" }!
+        XCTAssertNotNil(offlineDisk.alert)
+        XCTAssertTrue(offlineDisk.alert!.contains("/mnt/fleet-extra is not mounted"))
+        XCTAssertTrue(offlineDisk.alert!.contains("\u{00A0} "))
+
+        let cpuRow = HostResourcesPresentation.resourceRows(for: makeReport()).first { $0.key == "cpu" }!
+        XCTAssertEqual(cpuRow.detected, "10 cores")
+        XCTAssertTrue(cpuRow.use.contains("Load 2.41 per core"))
+        XCTAssertEqual(cpuRow.enforcement, "Full speed allowed.\u{00A0} Jobs run at background priority.")
+
+        let nullSample = HostCapacitySample(at: sampleTimestampMs)
+        let nullReport = makeReport(sample: nullSample)
+        for row in HostResourcesPresentation.resourceRows(for: nullReport) where row.key != "io" {
+            XCTAssertFalse(row.detected.contains("0 GB"), row.key)
+            XCTAssertFalse(row.use.contains("0 GB"), row.key)
+        }
+    }
+
+    func testCoordinatorLoadsHostsPreservesReportDuringRefreshAndForwardsGateHeader() async throws {
+        let store = FixtureResourceHosts()
+        let tokens = FixtureResourceTokens()
+        let remoteID = "server:11111111-1111-4111-8111-111111111111"
+        let remoteHost = HostRecord(
+            name: "Hetzner Server",
+            origin: try HostOrigin("https://fixture.test"),
+            hostId: remoteID
+        )
+        await store.configure(records: [.thisMac, remoteHost])
+        try tokens.write(RedactedSecret("fixture-gate-token"), for: remoteHost)
+
+        let held = HeldResourceFetch()
+        let initialReport = makeReport()
+        let remoteReport = makeReport(hostId: remoteID, platform: "linux", capabilities: ["shell"])
+
+        let coordinator = ResourcesCoordinator(
+            store: store,
+            tokens: tokens,
+            fetcher: { host, credential in
+                if !host.isLocal {
+                    XCTAssertNotNil(credential)
+                }
+                let fallback = host.isLocal ? initialReport : remoteReport
+                return await held.fetchOrWait(defaultReport: fallback)
+            }
+        )
+
+        await coordinator.load()
+        XCTAssertEqual(coordinator.hosts, [.thisMac, remoteHost])
+        XCTAssertEqual(coordinator.selectedHostID, HostRecord.localID)
+        XCTAssertEqual(coordinator.state, .ready(initialReport))
+        XCTAssertEqual(coordinator.currentReport, initialReport)
+
+        // Trigger a refresh that stays in-flight and verify the previous report stays visible.
+        await held.setShouldHold(true)
+        let refreshTask = Task { await coordinator.refresh() }
+        for _ in 0..<200 {
+            if await held.isWaiting() { break }
+            await Task.yield()
+        }
+        XCTAssertEqual(coordinator.state, .refreshing(initialReport))
+        XCTAssertTrue(coordinator.state.isRefreshing)
+        XCTAssertEqual(coordinator.currentReport, initialReport)
+
+        var updatedReport = initialReport
+        updatedReport.version = "1.2.4"
+        await held.resume(with: updatedReport)
+        await refreshTask.value
+        XCTAssertEqual(coordinator.state, .ready(updatedReport))
+
+        // Select the remote server and verify it loads cleanly.
+        await held.setShouldHold(false)
+        await coordinator.selectHost(id: remoteHost.id)
+        XCTAssertEqual(coordinator.selectedHostID, remoteHost.id)
+        XCTAssertEqual(coordinator.currentReport?.hostId, remoteID)
+        XCTAssertEqual(coordinator.currentReport?.platform, "linux")
+    }
+
+    func testObserveHostsSyncsServersCoordinatorMutationsAndFallsBackWhenSelectedHostRemoved() async throws {
+        let store = FixtureResourceHosts()
+        let tokens = FixtureResourceTokens()
+        let localReport = makeReport()
+        let servers = ServersCoordinator(store: store, tokens: tokens)
+        let resources = ResourcesCoordinator(
+            store: store,
+            tokens: tokens,
+            fetcher: { _, _ in localReport }
+        )
+        resources.observeHosts(from: servers)
+
+        await servers.load()
+        await resources.load()
+        XCTAssertEqual(resources.hosts, [.thisMac])
+
+        let added = await servers.add(name: "Staging Server", origin: "https://staging.fixture.test")
+        XCTAssertTrue(added)
+        XCTAssertEqual(resources.hosts.count, 2)
+        let stagingHost = try XCTUnwrap(resources.hosts.last)
+        XCTAssertEqual(stagingHost.name, "Staging Server")
+
+        let renamed = await servers.rename(stagingHost, name: "Production Server")
+        XCTAssertTrue(renamed)
+        XCTAssertEqual(resources.hosts.last?.name, "Production Server")
+
+        let renamedHost = try XCTUnwrap(resources.hosts.last)
+        try tokens.write(RedactedSecret("staging-token"), for: renamedHost)
+        await resources.selectHost(id: renamedHost.id)
+        XCTAssertEqual(resources.selectedHostID, renamedHost.id)
+
+        let removed = await servers.remove(renamedHost)
+        XCTAssertTrue(removed)
+        XCTAssertEqual(resources.hosts, [.thisMac])
+        XCTAssertEqual(resources.selectedHostID, HostRecord.localID)
+        XCTAssertNil(resources.statesByHostID[renamedHost.id])
+    }
+
+    func testHostResourcesClientForwardsGateHeaderAndValidatesResponse() async throws {
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [HostResourcesURLProtocol.self]
+        let session = URLSession(configuration: config)
+        addTeardownBlock { session.invalidateAndCancel() }
+
+        let remoteID = "server:11111111-1111-4111-8111-111111111111"
+        let origin = try HostOrigin("https://fixture.test")
+        let host = HostRecord(name: "Remote", origin: origin, hostId: remoteID)
+        let credential = try HostGateCredential(origin: origin, token: RedactedSecret("fixture-gate-token"))
+        let expected = makeReport(hostId: remoteID, platform: "linux", capabilities: ["shell"])
+        let encoded = try JSONEncoder().encode(expected)
+
+        HostResourcesURLProtocol.handler = { request in
+            XCTAssertEqual(request.url?.path, "/api/host/resources")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "x-botfleet-gate-token"), "fixture-gate-token")
+            return (200, encoded)
+        }
+
+        let client = HostResourcesClient(session: session)
+        let decoded = try await client.fetchResources(host: host, credential: credential)
+        XCTAssertEqual(decoded, expected)
+
+        // Missing credential on remote host fails before making a network call.
+        do {
+            _ = try await client.fetchResources(host: host, credential: nil)
+            XCTFail("Remote host without credential must fail")
+        } catch {
+            XCTAssertEqual(error as? SavedHostError, .credentialUnavailable)
+        }
+
+        // HTTP 403 maps to .authentication.
+        HostResourcesURLProtocol.handler = { _ in (403, Data("{}".utf8)) }
+        do {
+            _ = try await client.fetchResources(host: host, credential: credential)
+            XCTFail("HTTP 403 must throw .authentication")
+        } catch {
+            XCTAssertEqual(error as? SavedHostError, .authentication)
+        }
+    }
+
+    func testHeadroomEditParsesLikeTypeScript() {
+        // Numbers for the non-empty boxes.
+        let outcome = HostResourcesPresentation.parseHeadroomEdit(
+            HeadroomEditValues(reservedCpuCores: "2", reservedRamMb: "", minMemoryAvailablePercent: "10.5")
+        )
+        XCTAssertEqual(outcome, .valid(HeadroomParsedEdit(reservedCpuCores: 2, minMemoryAvailablePercent: 10.5)))
+
+        // Refusals mirror the TS messages exactly.
+        let bad: [(HeadroomEditValues, String)] = [
+            (HeadroomEditValues(reservedCpuCores: "abc"), "Enter a number."),
+            (HeadroomEditValues(reservedCpuCores: "1.5"), "Enter a whole number."),
+            (HeadroomEditValues(reservedCpuCores: "65"), "Enter 0–64."),
+            (HeadroomEditValues(reservedRamMb: "-1"), "Enter 0–1000000."),
+            (HeadroomEditValues(minMemoryAvailablePercent: "101"), "Enter 0–100."),
+            (HeadroomEditValues(reservedCpuCores: "0x10"), "Enter a number."),
+            (HeadroomEditValues(reservedCpuCores: "1e3"), "Enter a number."),
+            (HeadroomEditValues(reservedRamMb: "1000001"), "Enter 0–1000000."),
+        ]
+        for (values, message) in bad {
+            let result = HostResourcesPresentation.parseHeadroomEdit(values)
+            guard case .invalid(let errors) = result else {
+                XCTFail("expected invalid for \(values)")
+                continue
+            }
+            XCTAssertEqual(errors.first?.message, message, "\(values)")
+        }
+
+        // An all-empty save over unset knobs is a no-op and is refused.
+        XCTAssertEqual(
+            HostResourcesPresentation.parseHeadroomEdit(HeadroomEditValues()),
+            .invalid([HeadroomFieldError(field: .reservedCpuCores, message: "Enter at least one number to save.")])
+        )
+
+        // An all-empty edit over set knobs is a clear, not a no-op — the last
+        // set knob stays unsettable from the UI.
+        let empty = HeadroomEditValues()
+        XCTAssertEqual(
+            HostResourcesPresentation.parseHeadroomEdit(empty, current: HeadroomCurrentKnobs(reservedCpuCores: 1)),
+            .valid(HeadroomParsedEdit())
+        )
+        XCTAssertEqual(
+            HostResourcesPresentation.parseHeadroomEdit(empty, current: HeadroomCurrentKnobs(reservedRamMb: 512)),
+            .valid(HeadroomParsedEdit())
+        )
+        XCTAssertEqual(
+            HostResourcesPresentation.headroomConfigPatch(
+                for: makeReport(admission: HostAdmissionThresholds(maxSwapPercent: 90, minFreeDiskBytes: 4 * gb, reservedCpuCores: 1)),
+                parsed: HeadroomParsedEdit()
+            )["reservedCpuCores"] is NSNull,
+            true
+        )
+    }
+
+    func testHeadroomConfigPatchCarriesFullAdmissionWithNullClears() {
+        let current = makeReport(
+            admission: HostAdmissionThresholds(
+                maxSwapPercent: 98,
+                minFreeDiskBytes: 2 * gb,
+                minFreeInodes: 1000,
+                reservedCpuCores: 1
+            )
+        )
+        let admission = HostResourcesPresentation.headroomConfigPatch(
+            for: current,
+            parsed: HeadroomParsedEdit(reservedCpuCores: 2, reservedRamMb: 512)
+        )
+        XCTAssertEqual(admission["maxSwapPercent"] as? Double, 98)
+        XCTAssertEqual(admission["minFreeDiskMb"] as? Double, 2048)
+        XCTAssertEqual(admission["minFreeInodes"] as? Double, 1000)
+        XCTAssertEqual(admission["reservedCpuCores"] as? Double, 2)
+        XCTAssertEqual(admission["reservedRamMb"] as? Double, 512)
+        XCTAssertNil(admission["minMemoryAvailablePercent"])
+    }
+
+    func testHeadroomConfigPatchClearsSetKnobsAndOmitsUnsetOnes() {
+        let current = makeReport(
+            admission: HostAdmissionThresholds(
+                maxSwapPercent: 90,
+                minFreeDiskBytes: 4 * gb,
+                reservedRamBytes: 256 * gb,
+                minMemoryAvailablePercent: 20
+            )
+        )
+        let admission = HostResourcesPresentation.headroomConfigPatch(
+            for: current,
+            parsed: HeadroomParsedEdit(reservedCpuCores: 3)
+        )
+        XCTAssertEqual(admission["reservedCpuCores"] as? Double, 3)
+        // Emptied over a set knob: explicit null unsets it on save.
+        XCTAssertTrue(admission["reservedRamMb"] is NSNull)
+        XCTAssertTrue(admission["minMemoryAvailablePercent"] is NSNull)
+
+        let unset = makeReport()
+        let unsetAdmission = HostResourcesPresentation.headroomConfigPatch(
+            for: unset,
+            parsed: HeadroomParsedEdit(reservedCpuCores: 3)
+        )
+        XCTAssertEqual(unsetAdmission["reservedCpuCores"] as? Double, 3)
+        XCTAssertNil(unsetAdmission["reservedRamMb"])
+        XCTAssertNil(unsetAdmission["minMemoryAvailablePercent"])
+    }
+
+    func testHeadroomEditInitialRendersSetAsStringsAndUnsetAsEmpty() {
+        let report = makeReport(
+            admission: HostAdmissionThresholds(maxSwapPercent: 98, minFreeDiskBytes: 2 * gb, reservedCpuCores: 2)
+        )
+        XCTAssertEqual(HostResourcesPresentation.headroomEditInitial(report).reservedCpuCores, "2")
+        XCTAssertEqual(HostResourcesPresentation.headroomEditInitial(report).reservedRamMb, "")
+        let withRam = makeReport(
+            admission: HostAdmissionThresholds(maxSwapPercent: 98, minFreeDiskBytes: 2 * gb, reservedRamBytes: 512 * 1024 * 1024)
+        )
+        XCTAssertEqual(HostResourcesPresentation.headroomEditInitial(withRam).reservedRamMb, "512")
+    }
+
+    private final class CapturedSave: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _host: HostRecord?
+        private var _credential: Bool = false
+        private var _admission: [String: Any]?
+        var calls = 0
+
+        func record(host: HostRecord, credential: HostGateCredential?, admission: [String: Any]) {
+            lock.lock(); defer { lock.unlock() }
+            calls += 1
+            _host = host
+            _credential = credential != nil
+            _admission = admission
+        }
+
+        var host: HostRecord? { lock.lock(); defer { lock.unlock() }; return _host }
+        var hadCredential: Bool { lock.lock(); defer { lock.unlock() }; return _credential }
+        var admission: [String: Any]? { lock.lock(); defer { lock.unlock() }; return _admission }
+    }
+
+    func testCoordinatorSaveHeadroomValidatesSavesAndRefreshes() async throws {
+        let store = FixtureResourceHosts()
+        let tokens = FixtureResourceTokens()
+        let report = makeReport(
+            admission: HostAdmissionThresholds(maxSwapPercent: 98, minFreeDiskBytes: 2 * gb, reservedCpuCores: 1)
+        )
+        let saved = CapturedSave()
+        let coordinator = ResourcesCoordinator(
+            store: store,
+            tokens: tokens,
+            fetcher: { _, _ in report },
+            saver: { host, credential, admission in
+                saved.record(host: host, credential: credential, admission: admission)
+            }
+        )
+        await coordinator.load()
+
+        // All-empty over the set knob is a clear, not a refusal: the saver
+        // receives the null and the save refreshes.
+        try await coordinator.saveHeadroom(values: HeadroomEditValues())
+        XCTAssertEqual(saved.calls, 1)
+        let clearedAdmission = try XCTUnwrap(saved.admission)
+        XCTAssertTrue(clearedAdmission["reservedCpuCores"] is NSNull)
+        XCTAssertEqual(clearedAdmission["maxSwapPercent"] as? Double, 98)
+
+        // All-empty over an unset report is still a no-op refusal, before any
+        // network call.
+        let unsetReport = makeReport()
+        let unsetCoordinator = ResourcesCoordinator(
+            store: FixtureResourceHosts(),
+            tokens: FixtureResourceTokens(),
+            fetcher: { _, _ in unsetReport },
+            saver: { host, credential, admission in
+                saved.record(host: host, credential: credential, admission: admission)
+            }
+        )
+        await unsetCoordinator.load()
+        do {
+            try await unsetCoordinator.saveHeadroom(values: HeadroomEditValues())
+            XCTFail("all-empty save over unset knobs must throw")
+        } catch {
+            XCTAssertEqual(error as? HeadroomSaveError, .invalid("Enter at least one number to save."))
+        }
+        XCTAssertEqual(saved.calls, 1)
+
+        // A typed box saves; the emptied set knob clears via null.
+        try await coordinator.saveHeadroom(
+            values: HeadroomEditValues(reservedCpuCores: "", reservedRamMb: "512", minMemoryAvailablePercent: "")
+        )
+        XCTAssertEqual(saved.calls, 2)
+        XCTAssertEqual(saved.host, .thisMac)
+        XCTAssertFalse(saved.hadCredential)
+        let admission = try XCTUnwrap(saved.admission)
+        XCTAssertEqual(admission["maxSwapPercent"] as? Double, 98)
+        XCTAssertEqual(admission["minFreeDiskMb"] as? Double, 2048)
+        XCTAssertEqual(admission["reservedRamMb"] as? Double, 512)
+        XCTAssertTrue(admission["reservedCpuCores"] is NSNull)
+        XCTAssertNil(admission["minMemoryAvailablePercent"])
+        // The save refreshes, so the card shows what the server stored.
+        XCTAssertEqual(coordinator.currentReport, report)
+    }
+
+    func testSaveHeadroomPutsFullAdmissionWithGateHeaderAndSurfacesRefusal() async throws {
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [HostResourcesURLProtocol.self]
+        let session = URLSession(configuration: config)
+        addTeardownBlock { session.invalidateAndCancel() }
+
+        let remoteID = "server:11111111-1111-4111-8111-111111111111"
+        let origin = try HostOrigin("https://fixture.test")
+        let host = HostRecord(name: "Remote", origin: origin, hostId: remoteID)
+        let credential = try HostGateCredential(origin: origin, token: RedactedSecret("fixture-gate-token"))
+
+        // The wire shape is asserted on the built request: a stubbed session
+        // never delivers the body to a URLProtocol.
+        let sent = try HostResourcesClient.headroomSaveRequest(
+            host: host,
+            credential: credential,
+            admission: ["reservedCpuCores": 2, "minMemoryAvailablePercent": NSNull()]
+        )
+        XCTAssertEqual(sent.url?.path, "/api/config")
+        XCTAssertEqual(sent.httpMethod, "PUT")
+        XCTAssertEqual(sent.value(forHTTPHeaderField: "x-botfleet-gate-token"), "fixture-gate-token")
+        let httpBody = try XCTUnwrap(sent.httpBody)
+        let body = try XCTUnwrap(try JSONSerialization.jsonObject(with: httpBody) as? [String: Any])
+        let sentAdmission = (body["jobs"] as? [String: Any])?["admission"] as? [String: Any]
+        XCTAssertEqual(sentAdmission?["reservedCpuCores"] as? Double, 2)
+        XCTAssertTrue(sentAdmission?["minMemoryAvailablePercent"] is NSNull)
+
+        HostResourcesURLProtocol.handler = { _ in
+            (200, Data("{\"ok\":true}".utf8))
+        }
+        let client = HostResourcesClient(session: session)
+        try await client.saveHeadroom(host: host, credential: credential, admission: ["reservedCpuCores": 2])
+
+        // A vault-managed clear comes back 409 with the vault name to remove.
+        HostResourcesURLProtocol.handler = { _ in
+            (409, Data("{\"error\":\"Job admission reserved CPU cores is managed by Infisical (prod).  Clearing it here is not supported — remove BOTFLEET_JOBS_RESERVED_CPU_CORES in Infisical to unset it.\",\"field\":\"jobs.admission.reservedCpuCores\"}".utf8))
+        }
+        do {
+            try await client.saveHeadroom(host: host, credential: credential, admission: ["reservedCpuCores": NSNull()])
+            XCTFail("HTTP 409 must throw")
+        } catch {
+            guard let saveError = error as? HeadroomSaveError, case .server(let message) = saveError else {
+                XCTFail("expected HeadroomSaveError.server, got \(error)")
+                return
+            }
+            XCTAssertTrue(message.contains("BOTFLEET_JOBS_RESERVED_CPU_CORES"), message)
+        }
+
+        // A specific 403 (loopback/tunnel gate) surfaces its message instead
+        // of masking as a credential failure; a bare "unauthorized" stays
+        // authentication.
+        HostResourcesURLProtocol.handler = { _ in
+            (403, Data("{\"error\":\"forbidden: loopback host required\"}".utf8))
+        }
+        do {
+            try await client.saveHeadroom(host: host, credential: credential, admission: [:])
+            XCTFail("HTTP 403 with a message must throw")
+        } catch {
+            XCTAssertEqual(error as? HeadroomSaveError, .server("forbidden: loopback host required"))
+        }
+        HostResourcesURLProtocol.handler = { _ in
+            (403, Data("{\"error\":\"unauthorized\"}".utf8))
+        }
+        do {
+            try await client.saveHeadroom(host: host, credential: credential, admission: [:])
+            XCTFail("HTTP 403 unauthorized must throw")
+        } catch {
+            XCTAssertEqual(error as? SavedHostError, .authentication)
+        }
+
+        // A remote host without a credential fails before any network call.
+        do {
+            try await client.saveHeadroom(host: host, credential: nil, admission: [:])
+            XCTFail("remote save without credential must fail")
+        } catch {
+            XCTAssertEqual(error as? SavedHostError, .credentialUnavailable)
+        }
+    }
+}

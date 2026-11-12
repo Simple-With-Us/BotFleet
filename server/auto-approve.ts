@@ -375,6 +375,10 @@ export const PERMISSION_BYPASS_RULE = "permission-bypass";
 export interface AutoApprover {
   autoApprove?: boolean;
   bypassPermissions?: boolean;
+  /** The second switch, 2026-10-14: let Bypass answer the requests that
+   * control the person's real desktop too.  Ignored without `bypassPermissions`,
+   * so it can never approve anything on its own. */
+  bypassLocalComputer?: boolean;
   alwaysAllow?: string[];
 }
 
@@ -434,7 +438,17 @@ export function autoVerdict(
   // consent boundary still applies: `localAutoAcknowledgementError` treats
   // bypassPermissions as an auto-approve request and demands
   // acknowledgeLocalAuto before this combination is created.
-  if (bot.bypassPermissions && context?.scope !== "local-computer") {
+  //
+  // Owner ruling 2026-10-14: Bypass on its own stops at the edge of the real
+  // desktop, which made it *weaker* than Auto Mode — Auto already answers
+  // those requests, so "bypass" answering fewer of them than "auto" read as a
+  // broken switch rather than as caution.  `bypassLocalComputer` is the second,
+  // named switch that buys the rest, so the default boundary still stands and
+  // the grant is something the owner asked for by name.
+  if (
+    bot.bypassPermissions &&
+    (context?.scope !== "local-computer" || bot.bypassLocalComputer)
+  ) {
     const key = approvalKey(tool, summary, context?.scope);
     return { approve: `auto-approved ${key} (permission bypass)`, source: "auto-mode", rule: PERMISSION_BYPASS_RULE };
   }

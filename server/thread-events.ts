@@ -476,7 +476,10 @@ function isRuntimeEvent(value: unknown): value is RuntimeEvent {
     case "item.updated":
       return (value.itemType === "tool" || value.itemType === "reasoning") && numberOrNullOrMissing(value.tokens);
     case "item.completed":
-      return value.itemType === "assistant_text" ? typeof value.text === "string" : value.itemType === "tool" && typeof value.ok === "boolean";
+      return value.itemType === "assistant_text"
+        ? typeof value.text === "string"
+        : value.itemType === "tool" && typeof value.ok === "boolean" && stringOrMissing(value.title) &&
+          (value.title === undefined || String(value.title).length <= 256);
     case "content.delta":
       return (value.streamKind === "assistant_text" || value.streamKind === "reasoning_text") && typeof value.delta === "string";
     case "request.opened":
@@ -509,6 +512,23 @@ function isRuntimeEvent(value: unknown): value is RuntimeEvent {
         typeof value.bytes === "number" &&
         Number.isFinite(value.bytes)
       );
+    case "subagent.updated": {
+      const subagent = value.subagent;
+      if (!isRecord(subagent)) return false;
+      const text = [subagent.id, subagent.threadId, subagent.parentItemId, subagent.label];
+      const counts = [subagent.depth, subagent.toolCount, subagent.startedAt];
+      const finite = (item: typeof counts[number]) =>
+        item !== undefined && item !== null && numberOrNullOrMissing(item) && Number.isFinite(item);
+      return (
+        text.every((item) => item !== undefined && stringOrMissing(item)) &&
+        counts.every((item) => finite(item)) &&
+        (subagent.fidelity === "typed" || subagent.fidelity === "named") &&
+        stringOrMissing(subagent.lastActivity) &&
+        (subagent.tokens === undefined || finite(subagent.tokens)) &&
+        (subagent.endedAt === null || finite(subagent.endedAt)) &&
+        (subagent.status === "running" || subagent.status === "completed" || subagent.status === "failed")
+      );
+    }
     default:
       return false;
   }

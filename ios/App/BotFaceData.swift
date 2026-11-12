@@ -9,7 +9,14 @@ enum BotState: String, CaseIterable {
     /// lists animate only for these; a resting bot earns a resting face.
     var showsActivity: Bool {
         switch self {
-        case .listening, .thinking, .searching, .working: return true
+        case .listening, .thinking, .thinkingDots, .searching, .working,
+             .dictating, .writing, .loading, .sending, .receiving, .uploading,
+             .notifying, .alerting, .orbit, .radar, .progress, .spawning,
+             .excited, .celebrate, .angry, .scared, .humming, .dragging, .bouncing,
+             // Grok action faces — always animate when selected
+             .fleet, .crash, .memory, .tools, .routine, .screen, .git,
+             .webhook, .computer, .typing, .speaking, .sneaking:
+            return true
         default: return false
         }
     }
@@ -54,6 +61,19 @@ enum BotState: String, CaseIterable {
     case bouncing = "bouncing"
     case dragging = "dragging"
     case poweringDown = "powering-down"
+    // Grok Actions — super-specific TV-Face sheet faces (parity with web GROK_ACTIONS)
+    case fleet = "fleet"
+    case crash = "crash"
+    case memory = "memory"
+    case tools = "tools"
+    case routine = "routine"
+    case screen = "screen"
+    case git = "git"
+    case webhook = "webhook"
+    case computer = "computer"
+    case typing = "typing"
+    case speaking = "speaking"
+    case sneaking = "sneaking"
 }
 
 struct BotBodyMotion {
@@ -444,6 +464,18 @@ enum BotFaceData {
         .bouncing: [2, 17],
         .dragging: [3, 15, 0],
         .poweringDown: [22, 13],
+        .fleet: [6, 0, 8],
+        .crash: [21, 3],
+        .memory: [20, 15, 9],
+        .tools: [10, 7, 16],
+        .routine: [6, 0, 8],
+        .screen: [20, 15, 9],
+        .git: [10, 7, 16],
+        .webhook: [6, 0, 8],
+        .computer: [10, 7, 16],
+        .typing: [15, 9],
+        .speaking: [1, 10, 19],
+        .sneaking: [2, 17, 11, 8],
     ]
     /// How long a state holds an expression, ms.
     static let expressionCadence: [BotState: (CGFloat, CGFloat)] = [
@@ -487,6 +519,18 @@ enum BotFaceData {
         .bouncing: (3000, 6000),
         .dragging: (1600, 3000),
         .poweringDown: (6000, 9000),
+        .fleet: (4000, 8000),
+        .crash: (2000, 3600),
+        .memory: (2500, 4500),
+        .tools: (1800, 3200),
+        .routine: (4000, 8000),
+        .screen: (2000, 3600),
+        .git: (1800, 3200),
+        .webhook: (2000, 3600),
+        .computer: (1800, 3200),
+        .typing: (1800, 3200),
+        .speaking: (2800, 5000),
+        .sneaking: (2000, 4000),
     ]
     /// Blink cadence, ms; absent = never blinks.
     static let blink: [BotState: (CGFloat, CGFloat)] = [
@@ -555,5 +599,17 @@ enum BotFaceData {
         .bouncing: BotBodyMotion(bob: (12, 560), squash: 0.45),
         .dragging: BotBodyMotion(sway: (2, 900), tilt: -6),
         .poweringDown: BotBodyMotion(tilt: 4, settle: 0.05),
+        .fleet: BotBodyMotion(circle: (6, 3200)),
+        .crash: BotBodyMotion(jitter: (2.2, 75)),
+        .memory: BotBodyMotion(sway: (2.2, 1500), pulse: (0.012, 1500)),
+        .tools: BotBodyMotion(bob: (2.5, 900), squash: 0.22),
+        .routine: BotBodyMotion(pulse: (0.022, 1600)),
+        .screen: BotBodyMotion(sway: (2.2, 1500)),
+        .git: BotBodyMotion(bob: (2.5, 900), squash: 0.22),
+        .webhook: BotBodyMotion(pulse: (0.02, 1200)),
+        .computer: BotBodyMotion(bob: (2.5, 900), squash: 0.22),
+        .typing: BotBodyMotion(bob: (1.6, 1100)),
+        .speaking: BotBodyMotion(bob: (2, 2000)),
+        .sneaking: BotBodyMotion(sway: (3, 1400), tilt: -3),
     ]
 }
