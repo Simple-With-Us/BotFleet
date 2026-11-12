@@ -21,6 +21,7 @@ export function lifecycleTextSaysCompleted(detail: string | undefined, title?: s
   if (/\b(?:not|never|unable to|couldn't|could not)\b.{0,48}\b(?:completed|finished)\b/.test(lower)) return false;
   if (/\b(?:did not|didn't)\s+(?:complete|finish)\b/.test(lower)) return false;
   if (/\bfailed to\b.{0,48}\b(?:complete|finish)\b/.test(lower)) return false;
+  if (/\b(?:\d+\s+)?(?:errors?|failed|failures?)\b/.test(lower)) return false;
   return true;
 }
 

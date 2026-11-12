@@ -18,6 +18,8 @@ describe("lifecycle tool completion normalization", () => {
   it("keeps a real lifecycle failure", () => {
     expect(reconcileLifecycleToolOk(false, "hookRun: failed", "hook rejected")).toBe(false);
     expect(reconcileLifecycleToolOk(false, "reminderChild", "failed to complete the hook run")).toBe(false);
+    expect(reconcileLifecycleToolOk(false, "hookRun", "completed with 2 errors")).toBe(false);
+    expect(reconcileLifecycleToolOk(false, "workflow", "finished, 1 step failed")).toBe(false);
   });
 
   it("does not upgrade a non-lifecycle tool that mentions completed", () => {
