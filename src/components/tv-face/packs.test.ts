@@ -27,20 +27,29 @@ describe("tv-face one-file packs", () => {
     );
   });
 
-  it("prefers the thinking pack for thinking/working on orange", () => {
+  it("prefers the denser thinking pack only for pure thinking on orange", () => {
     expect(tvFaceOneFilePackUrl("orange", "thinking")).toBe(
       tvFacePackPublicPath("tvface-thinking.webp"),
     );
+    // Working and expanded states use the expanded default pack.
     expect(tvFaceOneFilePackUrl("orange", "working")).toBe(
-      tvFacePackPublicPath("tvface-thinking.webp"),
+      tvFacePackPublicPath("tvface-default.webp"),
+    );
+    expect(tvFaceOneFilePackUrl("orange", "tools")).toBe(
+      tvFacePackPublicPath("tvface-default.webp"),
+    );
+    expect(tvFaceOneFilePackUrl("orange", "computer")).toBe(
+      tvFacePackPublicPath("tvface-default.webp"),
+    );
+    expect(tvFaceOneFilePackUrl("orange", "memory")).toBe(
+      tvFacePackPublicPath("tvface-default.webp"),
+    );
+    expect(tvFaceOneFilePackUrl("orange", "listening")).toBe(
+      tvFacePackPublicPath("tvface-default.webp"),
     );
   });
 
-  it("keeps thinking-class states on the GIF tree for colors without a thinking pack", () => {
-    // The color packs' manifests document only the default ranges, so a
-    // thinking-class state on a non-orange color must not collapse to the
-    // color pack's hold loop:  null sends the multi-GIF tree, which carries
-    // the dedicated expression.
+  it("keeps expanded and thinking states on the GIF tree for thin color shells", () => {
     for (const color of [
       "blue",
       "green",
@@ -56,8 +65,13 @@ describe("tv-face one-file packs", () => {
     ] as const) {
       expect(tvFaceOneFilePackUrl(color, "thinking")).toBeNull();
       expect(tvFaceOneFilePackUrl(color, "tools")).toBeNull();
+      expect(tvFaceOneFilePackUrl(color, "computer")).toBeNull();
+      expect(tvFaceOneFilePackUrl(color, "memory")).toBeNull();
+      // Thin color packs still cover idle / working / speaking.
+      expect(tvFaceOneFilePackUrl(color, "working")).toBe(
+        tvFacePackPublicPath(`tvface-${color}.webp`),
+      );
     }
-    // The default family keeps its dedicated thinking pack.
     expect(tvFaceOneFilePackUrl("default", "thinking")).toBe(
       tvFacePackPublicPath("tvface-thinking.webp"),
     );

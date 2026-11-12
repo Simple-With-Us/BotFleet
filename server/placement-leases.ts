@@ -19,6 +19,7 @@ import type { ControllerEpochStore } from "./placement-identity.ts";
 import { commandDigest, issuedLease, placementFingerprint, PLACEMENT_ACTIVE_LIMIT, PLACEMENT_QUEUE_EXPIRED_REASON, PlacementStoreError, type PlacementScope, type PlacementState, type PlacementStore, type StoredPlacementJob, type StoredPlacementLease } from "./placement-store.ts";
 import { PLACEMENT_QUEUE_WINDOW_MS, type PlacementPayloads } from "./placement-payloads.ts";
 import { z } from "zod";
+import { JOB_CAP_PER_BOT, JOB_CAP_PER_THREAD } from "../shared/jobs.ts";
 import { derivedCapability, hostCanRunCommand } from "../shared/mac-only-capabilities.ts";
 import {
   HOST_ID_PATTERN,
@@ -454,7 +455,10 @@ export class PlacementLeaseService {
   /** Admit a job to the one authoritative queue.  Idempotent on job id: an
    *  exact replay answers with the existing record and enqueues nothing
    *  twice, but the same id with a different payload is a conflict (409),
-   *  never a silent drop — the caller must use a new job id for new work. */
+   *  never a silent drop — the caller must use a new job id for new work.
+   *  A new job past the per-thread or per-bot cap is refused here.  A host
+   *  that forwards `job_start` does not hold this queue, so the caps have to
+   *  be counted on the controller or they are not counted at all. */
   enqueue(message: EnqueueMessage): LeaseResult<EnqueueReply> {
     // Commit expiry and finish its cleanup before publishing into a full spool;
     // the fresh admission transaction must independently validate its fence.
@@ -476,8 +480,20 @@ export class PlacementLeaseService {
       if (!samePayload) {
         return this.refused(`job ${message.jobId} is already queued with a different payload; use a new job id for new work`);
       }
-      return { ok: true, reply: { accepted: true, duplicate: true, jobId: existing.jobId, status: existing.status, ...this.current } };
+      return {
+        ok: true,
+        reply: {
+          accepted: true,
+          duplicate: true,
+          jobId: existing.jobId,
+          status: existing.status,
+          ...this.current,
+          queuedReason: existing.queuedReason,
+        },
+      };
     }
+    const capped = this.admissionCapRefusal(message);
+    if (capped) return this.refused(capped);
     if (this.store && [...this.jobs.values()].filter((job) => !TERMINAL.includes(job.status)).length >= PLACEMENT_ACTIVE_LIMIT) {
       return this.refused("The existing unresolved placement record limit is reached; settle work before admitting more");
     }
@@ -501,7 +517,27 @@ export class PlacementLeaseService {
       this.payloads.put(this.storedJob(job), message.command);
     }
     this.jobs.set(job.jobId, job);
-    return { ok: true, reply: { accepted: true, jobId: job.jobId, status: job.status, ...this.current } };
+    return { ok: true, reply: { accepted: true, jobId: job.jobId, status: job.status, ...this.current, queuedReason: job.queuedReason } };
+  }
+
+  /** The per-thread and per-bot caps, counted on this queue.  Terminal and
+   *  hidden records hold no slot.  The same words the registry uses, so a
+   *  refusal looks the same whether this host or the controller said it. */
+  private admissionCapRefusal(message: EnqueueMessage): string | null {
+    let threadJobs = 0;
+    let botJobs = 0;
+    for (const job of this.jobs.values()) {
+      if (job.hidden || TERMINAL.includes(job.status)) continue;
+      if (job.threadId === message.threadId) threadJobs += 1;
+      if (job.botId === message.botId) botJobs += 1;
+    }
+    if (threadJobs >= JOB_CAP_PER_THREAD) {
+      return `This conversation already has ${JOB_CAP_PER_THREAD} jobs running, the most it may.  Wait for one to finish, or stop one with job_kill.`;
+    }
+    if (botJobs >= JOB_CAP_PER_BOT) {
+      return `You already have ${JOB_CAP_PER_BOT} jobs running, the most a bot may.  Wait for one to finish, or stop one with job_kill.`;
+    }
+    return null;
   }
 
   /** The compare-and-set lease: only a `queued` job, only at the current

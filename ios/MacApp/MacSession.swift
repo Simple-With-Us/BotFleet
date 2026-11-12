@@ -139,6 +139,9 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     /// The composer's text.  The session owns it so the menubar can compose
     /// and dictate without a view in the window being the source of truth.
     @Published public var composerDraft: String = ""
+    /// Published model windows, keyed by instance and model.  Empty until a
+    /// conversation asks for them.
+    @Published public private(set) var modelWindows: [String: Int] = [:]
     /// Bumped whenever something asks the composer to take the keyboard.
     @Published public var composerFocusToken: Int = 0
 
@@ -1191,6 +1194,42 @@ public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     /// The emergency-stop confirmation is sticky, so the asynchronous
     /// "stream stopped" update that lands right after an emergency stop cannot
     /// replace the safety message the operator just triggered.
+    func contextCommands(botId: String, threadId: String) async -> [ContextMeterMath.Command]? {
+        guard let client else { return nil }
+        return try? await client.contextCommands(botId: botId, threadId: threadId, surface: "desktop")
+    }
+
+    func catalogWindow(instanceId: String, model: String) -> Int? {
+        modelWindows["\(instanceId)\u{1e}\(model)"]
+    }
+
+    func refreshModelWindows() async {
+        guard let client else { return }
+        guard let list = try? await client.instanceList() else { return }
+        var next: [String: Int] = [:]
+        for instance in list.instances {
+            for option in instance.models.options {
+                if let window = option.contextWindow, window > 0 {
+                    next["\(instance.instanceId)\u{1e}\(option.id)"] = window
+                }
+            }
+        }
+        modelWindows = next
+    }
+
+    /// Nil means compact started.  A string is the reason it did not.
+    func compactSession(botId: String, commandId: String, threadId: String) async -> String? {
+        guard let client else { return ContextMeterMath.unavailable }
+        do {
+            try await client.runContextCommand(botId: botId, id: commandId, threadId: threadId, surface: "desktop")
+            return nil
+        } catch {
+            let message = (error as? LocalizedError)?.errorDescription?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let message, !message.isEmpty { return message }
+            return ContextMeterMath.unavailable
+        }
+    }
+
     private func setCuaStatus(_ status: MacCuaStatus) {
         cuaStatusState.record(status)
         cuaStatusMessage = cuaStatusState.current?.message

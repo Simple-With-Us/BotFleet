@@ -287,7 +287,8 @@ struct ChatListView: View {
                                     at: summary.lastActivity,
                                     state: BotState.forChat(summary.chat, in: session.state),
                                     waiting: waiting.contains(summary.chat.id),
-                                    last: index == rows.count - 1 && nestedTasks(for: summary.chat).isEmpty && (query.isEmpty ? customSectionNames.isEmpty && !showingBotChats : true)
+                                    last: index == rows.count - 1 && nestedTasks(for: summary.chat).isEmpty && (query.isEmpty ? customSectionNames.isEmpty && !showingBotChats : true),
+                                    fill: fillLabel(for: summary.chat)
                                 )
                             }
                             if session.config?.allowsMultipleBotThreads == true {
@@ -295,7 +296,7 @@ struct ChatListView: View {
                                     Button {
                                         Task { await openTask(task, in: summary.chat) }
                                     } label: {
-                                        ThreadRow(task: task, active: summary.chat.threadId == task.threadId, viewed: session.state.viewingThreadId(forBotId: summary.chat.id) == task.threadId)
+                                        ThreadRow(task: task, active: summary.chat.threadId == task.threadId, viewed: session.state.viewingThreadId(forBotId: summary.chat.id) == task.threadId, fill: fillLabel(task: task, chat: summary.chat))
                                     }
                                     .buttonStyle(.plain)
                                 }
@@ -321,9 +322,10 @@ struct ChatListView: View {
                                                     chat: summary.chat,
                                                     preview: summary.preview,
                                                     at: summary.lastActivity,
-                                                    state: BotState.forChat(summary.chat, in: session.state),
-                                                    waiting: waiting.contains(summary.chat.id),
-                                                    last: index == sectionRows.count - 1 && nestedTasks(for: summary.chat).isEmpty && (section == customSectionNames.last ? !showingBotChats : false)
+                                    state: BotState.forChat(summary.chat, in: session.state),
+                                    waiting: waiting.contains(summary.chat.id),
+                                    last: index == sectionRows.count - 1 && nestedTasks(for: summary.chat).isEmpty && (section == customSectionNames.last ? !showingBotChats : false),
+                                    fill: fillLabel(for: summary.chat)
                                                 )
                                             }
                                             if session.config?.allowsMultipleBotThreads == true {
@@ -331,7 +333,7 @@ struct ChatListView: View {
                                                     Button {
                                                         Task { await openTask(task, in: summary.chat) }
                                                     } label: {
-                                                        ThreadRow(task: task, active: summary.chat.threadId == task.threadId, viewed: session.state.viewingThreadId(forBotId: summary.chat.id) == task.threadId)
+                                                        ThreadRow(task: task, active: summary.chat.threadId == task.threadId, viewed: session.state.viewingThreadId(forBotId: summary.chat.id) == task.threadId, fill: fillLabel(task: task, chat: summary.chat))
                                                     }
                                                     .buttonStyle(.plain)
                                                 }
@@ -358,7 +360,8 @@ struct ChatListView: View {
                                             at: summary.lastActivity,
                                             state: BotState.forChat(summary.chat, in: session.state),
                                             waiting: waiting.contains(summary.chat.id),
-                                            last: index == botChatRows.count - 1
+                                            last: index == botChatRows.count - 1,
+                                            fill: fillLabel(for: summary.chat)
                                         )
                                     }
                                 }
@@ -711,6 +714,32 @@ struct ChatListView: View {
         all.filter(\.chat.isBotToBot)
     }
 
+    private func catalogWindow(for selection: ModelSelection) -> Int? {
+        session.cachedInstances
+            .first { $0.instanceId == selection.instanceId }?
+            .models.options.first { $0.id == selection.model }?
+            .contextWindow
+    }
+
+    private func fillLabel(for chat: Chat) -> String? {
+        guard case let .bot(bot) = chat else { return nil }
+        let task = bot.tasks?.first { $0.threadId == bot.threadId }
+        return ContextMeterMath.badge(
+            used: task?.usage?.lastInput,
+            reportedWindow: task?.usage?.contextWindow,
+            catalogWindow: catalogWindow(for: task?.modelSelection ?? bot.modelSelection)
+        )
+    }
+
+    private func fillLabel(task: BotTask, chat: Chat) -> String? {
+        guard case let .bot(bot) = chat else { return nil }
+        return ContextMeterMath.badge(
+            used: task.usage?.lastInput,
+            reportedWindow: task.usage?.contextWindow,
+            catalogWindow: catalogWindow(for: task.modelSelection ?? bot.modelSelection)
+        )
+    }
+
     private func nestedTasks(for chat: Chat) -> [BotTask] {
         guard session.config?.allowsMultipleBotThreads == true else { return [] }
         guard case let .bot(bot) = chat else { return [] }
@@ -1055,6 +1084,7 @@ struct ThreadRow: View {
     /// Open for reading while another thread runs. The eye says which of
     /// the non-active rows is on screen; the active row keeps no mark.
     var viewed = false
+    var fill: String? = nil
 
     var body: some View {
         HStack(spacing: 10) {
@@ -1063,10 +1093,18 @@ struct ThreadRow: View {
                 .foregroundStyle(Color.secondary)
                 .frame(width: 22)
             VStack(alignment: .leading, spacing: 1) {
-                Text(task.title.isEmpty ? "Untitled Thread" : task.title)
-                    .font(.system(size: 15, weight: active ? .semibold : .regular))
-                    .foregroundStyle(Color.primary)
-                    .lineLimit(1)
+                HStack(spacing: 6) {
+                    Text(task.title.isEmpty ? "Untitled Thread" : task.title)
+                        .font(.system(size: 15, weight: active ? .semibold : .regular))
+                        .foregroundStyle(Color.primary)
+                        .lineLimit(1)
+                    if let fill {
+                        Text(fill)
+                            .font(.system(size: 11, weight: .medium))
+                            .monospacedDigit()
+                            .foregroundStyle(Color.secondary)
+                    }
+                }
                 HStack(spacing: 4) {
                     Text(RelativeStamp.list(task.lastActivity ?? task.createdAt))
                     if viewed {
@@ -1095,6 +1133,7 @@ struct ChatRow: View {
     var state: BotState = .idle
     var waiting = false
     var last = false
+    var fill: String? = nil
 
     var body: some View {
         HStack(alignment: .top, spacing: 0) {
@@ -1126,6 +1165,17 @@ struct ChatRow: View {
                             .foregroundStyle(Color.primary)
                             .lineLimit(1)
                             .layoutPriority(1)
+
+                        if let fill {
+                            Text(fill)
+                                .font(.system(size: 12, weight: .medium))
+                                .monospacedDigit()
+                                .foregroundStyle(Color.secondary)
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 3)
+                                .background(Capsule().fill(Color.secondary.opacity(0.15)))
+                                .accessibilityLabel("Context \(fill) used")
+                        }
 
                         if chat.isOff {
                             Text("Off")
