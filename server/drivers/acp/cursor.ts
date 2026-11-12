@@ -112,8 +112,14 @@ export const STATIC_CURSOR_MODELS: ModelCatalog = {
     { id: "auto", label: "Auto" },
     { id: "composer-2.5", label: "Composer 2.5" },
     { id: "composer-2.5-fast", label: "Composer 2.5 Fast" },
-    { id: "gpt-5.3-codex", label: "Codex 5.3" },
+    { id: "gemini-4-hydrogen-high", label: "Gemini 4 Hydrogen High" },
+    { id: "gemini-4-argon-high", label: "Gemini 4 Argon High" },
+    { id: "gemini-4-carbon-high", label: "Gemini 4 Carbon High" },
+    { id: "claude-opus-5-5-high", label: "Claude Opus 5.5 1M High" },
     { id: "claude-sonnet-5-thinking-high", label: "Claude Sonnet 5 1M Thinking" },
+    { id: "grok-4.7-high", label: "Grok 4.7 High" },
+    { id: "gpt-5.6-luna-high", label: "GPT-5.6 Luna 1M High" },
+    { id: "gpt-5.3-codex", label: "Codex 5.3" },
   ],
 };
 
