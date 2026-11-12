@@ -2495,4 +2495,37 @@ describe("identical webhook payload dedupe", () => {
     });
     expect(failed.payloadDedupeSkipCount()).toBe(1);
   });
+
+  it("keeps payloads that differ only by request id or webhook id, and a manual test does not arm the window", () => {
+    const h = harness();
+    const { webhook, secret } = h.manager.create({ name: "Leads", prompt: "Qualify", botId: "maus-sales" });
+    expect(h.manager.receive(webhook.endpointId, secret, lead("r-1", { requestId: "one", task: "review" })).runId).toBe("run-1");
+    expect(h.manager.receive(webhook.endpointId, secret, lead("r-2", { requestId: "two", task: "review" }))).toMatchObject({
+      duplicate: false,
+      runId: "run-2",
+    });
+    expect(h.manager.receive(webhook.endpointId, secret, lead("hook-1", { webhookId: "hook-a", task: "ping" })).runId).toBe("run-3");
+    expect(h.manager.receive(webhook.endpointId, secret, lead("hook-2", { webhookId: "hook-b", task: "ping" }))).toMatchObject({
+      duplicate: false,
+      runId: "run-4",
+    });
+
+    const firstTest = h.manager.test(webhook.id);
+    const secondTest = h.manager.test(webhook.id);
+    expect(firstTest).toMatchObject({ duplicate: false });
+    expect(secondTest).toMatchObject({ duplicate: false });
+    expect(firstTest?.runId).not.toBe(secondTest?.runId);
+
+    const testerBody = { event: "botfleet.test", message: "Test webhook delivery" };
+    expect(h.manager.receive(webhook.endpointId, secret, lead("after-test", testerBody, "botfleet.test"))).toMatchObject({
+      duplicate: false,
+      runId: "run-7",
+    });
+    expect(h.manager.receive(webhook.endpointId, secret, lead("after-test-again", testerBody, "botfleet.test"))).toMatchObject({
+      duplicate: true,
+      runId: "run-7",
+    });
+    expect(h.manager.test(webhook.id)).toMatchObject({ duplicate: false, runId: "run-8" });
+    expect(h.queued).toHaveLength(8);
+  });
 });

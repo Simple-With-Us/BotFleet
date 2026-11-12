@@ -14,8 +14,6 @@ const DELIVERY_ID_KEYS = new Set([
   "xgithubdelivery",
   "idempotencykey",
   "svixid",
-  "webhookid",
-  "requestid",
 ]);
 
 const ALWAYS_TIMESTAMP_KEYS = new Set([

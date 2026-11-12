@@ -19,11 +19,23 @@ describe("webhook payload normalization", () => {
     const right = {
       task: "review",
       "x-github-delivery": "two",
-      meta: { note: "keep", updated_at: 1_700_000_000, "idempotency-key": "zzz" },
+      meta: { note: "keep", requestId: "abc", updated_at: 1_700_000_000, "idempotency-key": "zzz" },
       sent_at: "2026-11-12T04:00:00+00:00",
     };
     expect(webhookPayloadDedupeHash(left)).toBe(webhookPayloadDedupeHash(right));
-    expect(normalizeWebhookPayloadForDedupe(left)).toEqual({ task: "review", meta: { note: "keep" } });
+    expect(normalizeWebhookPayloadForDedupe(left)).toEqual({
+      task: "review",
+      meta: { requestId: "abc", note: "keep" },
+    });
+  });
+
+  it("keeps a request id or webhook id that is the only difference between two events", () => {
+    expect(webhookPayloadDedupeHash({ requestId: "one", task: "review" })).not.toBe(
+      webhookPayloadDedupeHash({ requestId: "two", task: "review" }),
+    );
+    expect(webhookPayloadDedupeHash({ webhookId: "hook-a", task: "review" })).not.toBe(
+      webhookPayloadDedupeHash({ webhookId: "hook-b", task: "review" }),
+    );
   });
 
   it("keeps a record id, an event id, and text that merely mentions a time", () => {

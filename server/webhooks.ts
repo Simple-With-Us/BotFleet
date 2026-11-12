@@ -178,6 +178,8 @@ export interface WebhookEvent {
   eventName?: string;
   userAgent?: string;
   deliveryId?: string;
+  /** Manual tester sends are intentional repeats, so they neither match nor arm payload dedupe. */
+  skipPayloadDedupe?: boolean;
 }
 
 export interface WebhookReceiveResult {
@@ -1744,6 +1746,7 @@ export class WebhookManager {
       eventName,
       userAgent: "BotFleet webhook tester",
       deliveryId: `test-${randomUUID()}`,
+      skipPayloadDedupe: true,
     });
   }
 
@@ -1906,8 +1909,9 @@ export class WebhookManager {
     }
 
     // Payload identity runs after the GitHub state check so a handled state keeps its existing reason.
+    // A manual test leaves the window alone: the same default body must be able to wake again.
     const payloadWindowMs = this.payloadDedupeWindowMs();
-    const payloadIdentity = payloadWindowMs > 0
+    const payloadIdentity = payloadWindowMs > 0 && event.skipPayloadDedupe !== true
       ? webhookPayloadDedupeIdentity(route.botId, trigger.id, event.eventName, event.payload)
       : undefined;
     if (payloadIdentity) {
