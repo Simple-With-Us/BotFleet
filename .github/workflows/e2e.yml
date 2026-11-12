@@ -82,7 +82,7 @@ jobs:
       - run: pnpm exec vite build
       - name: Usage grid visual fixture stays out of the production bundle
         run: |
-          if grep -R --include='*.js' -F -q 'usage-grid-empty-placeholder' dist; then
+          if grep -R --include='*.js' -F -q 'usage-monitor-quota-grid-fixture' dist; then
             echo 'production dist still contains the usage grid visual fixture' >&2
             exit 1
           fi

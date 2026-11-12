@@ -54,7 +54,7 @@ import {
   Users,
   X,
 } from "lucide-react";
-import { api, useStore, formatTime, visibleMessages, getRoomTerminology, getConversationMode, latestChatActivity, compareBotsByRecentActivity, compareGroupsByRecentActivity, type Bot, type Group, type Message } from "@/state/store";
+import { api, useStore, formatTime, visibleMessages, getRoomTerminology, getConversationMode, latestChatActivity, compareBotsByRecentActivity, compareGroupsByRecentActivity, type Bot, type Group, type InstanceInfo, type Message, type ModelSelection, type Task } from "@/state/store";
 import { botSupportsImageAttachments } from "@/lib/model-images";
 import { roomRespondersForComposer } from "@/lib/group-routing";
 import { allowsMultipleBotThreads, rosterPrimaryLabel } from "../../shared/conversation-mode";
@@ -91,6 +91,7 @@ import {
   useSnoozeExpiry,
 } from "@/lib/thread-snooze";
 import { ThreadSnoozeBadge, ThreadWakeButton } from "./SidebarThreadRow";
+import { ContextFillBadge, contextMeterFor } from "./ContextUsage";
 import { imageAttachmentFromFile, intakeFiles } from "@/lib/composer-attachments";
 import { pathForFile } from "./ComposerAttachments";
 import { appendDraftAttachments } from "@/lib/drafts";
@@ -450,7 +451,38 @@ type SidebarThread = {
   createdAt: number;
   lastActivity?: number;
   snoozedUntil?: number;
+  usage?: Task["usage"];
+  modelSelection?: ModelSelection;
 };
+
+function catalogWindow(instances: InstanceInfo[], selection: ModelSelection | undefined): number | undefined {
+  if (!selection) return undefined;
+  return instances
+    .find((instance) => instance.instanceId === selection.instanceId)
+    ?.models.options.find((option) => option.id === selection.model)?.contextWindow;
+}
+
+function threadContextMeter(
+  state: { instances: InstanceInfo[]; bots: Bot[] },
+  owner: ThreadOwner,
+  task: SidebarThread,
+) {
+  const bot = owner.kind === "bot" ? state.bots.find((entry) => entry.id === owner.id) : undefined;
+  return contextMeterFor({
+    used: task.usage?.lastInput,
+    reportedWindow: task.usage?.contextWindow,
+    catalogWindow: catalogWindow(state.instances, task.modelSelection ?? bot?.modelSelection),
+  });
+}
+
+function botContextMeter(state: { instances: InstanceInfo[]; bots: Bot[] }, bot: Bot) {
+  const task = bot.tasks?.find((entry) => entry.threadId === bot.threadId);
+  return contextMeterFor({
+    used: task?.usage?.lastInput,
+    reportedWindow: task?.usage?.contextWindow,
+    catalogWindow: catalogWindow(state.instances, task?.modelSelection ?? bot.modelSelection),
+  });
+}
 
 /** One conversation inside a channel.
  *
@@ -623,6 +655,7 @@ function ThreadListItem({
       >
         <span className="size-1.5 shrink-0 rounded-full bg-current opacity-40" />
         <span className={cn("truncate text-[13px]", asleep && "opacity-60")}>{label}</span>
+        <ContextFillBadge meter={threadContextMeter(state, owner, task)} />
         <ThreadSnoozeBadge threadId={task.threadId} snoozedUntil={task.snoozedUntil} />
       </button>
       {asleep && (
@@ -1947,6 +1980,7 @@ export function BotListItem({
               );
             })()}
             {bot.off === true && <BotOffBadge className="ml-1" />}
+            <ContextFillBadge meter={botContextMeter(state, bot)} />
           </span>
           {selected && activityAt > 0 && !renaming && (
             <span className="shrink-0 text-xs text-ink-secondary transition-opacity group-hover:opacity-0 group-focus-within:opacity-0">
