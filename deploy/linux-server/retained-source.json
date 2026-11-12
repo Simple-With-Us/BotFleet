@@ -1529,6 +1529,7 @@
     {"path":"server/room-turn-timeout.ts","category":"runtime","reason":"Import from server/index.ts"},
     {"path":"server/routes/github-request-log.ts","category":"runtime","reason":"Import from server/index.ts"},
     {"path":"server/routes/linq-webhook.ts","category":"runtime","reason":"Import from server/index.ts"},
+    {"path":"server/routine-monitor-slug.ts","category":"runtime","reason":"Import from server/routines.ts"},
     {"path":"server/routine-requests.ts","category":"runtime","reason":"Import from server/index.ts"},
     {"path":"server/routines.ts","category":"runtime","reason":"Import from server/index.ts"},
     {"path":"server/runtime-identity.ts","category":"runtime","reason":"Import from server/index.ts"},
