@@ -1,0 +1,5 @@
+suggestionControl:
+  severityLevelFilter: low
+  applyFiltersToKodyRules: true
+isRequestChangesActive: true
+pullRequestApprovalActive: true

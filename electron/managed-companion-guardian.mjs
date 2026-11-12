@@ -6,6 +6,7 @@
 // and only then releases port 8812. An orphan connector can therefore never
 // expose whatever process happens to bind a reusable local port later.
 import { spawn } from "node:child_process";
+import { realpathSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -219,8 +220,23 @@ function guardianArguments(argv) {
   return { cloudflaredBinary, tokenFile, target, originPort };
 }
 
-const isDirectExecution =
-  process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
+// Compare physical paths.  Node's ESM loader realpaths the entry module, so an
+// invocation through a symlinked directory (macOS /var -> /private/var) never
+// matches process.argv[1] when compared as text.  The packaged app runs this
+// file from inside app.asar, so keep the resolved-text match first and only
+// fall back to realpath when that misses.
+function isEntryModule() {
+  if (!process.argv[1]) return false;
+  const modulePath = fileURLToPath(import.meta.url);
+  if (path.resolve(process.argv[1]) === path.resolve(modulePath)) return true;
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(modulePath);
+  } catch {
+    return false;
+  }
+}
+
+const isDirectExecution = isEntryModule();
 
 if (isDirectExecution) {
   runManagedCompanionGuardian(guardianArguments(process.argv.slice(2))).then(

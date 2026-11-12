@@ -1,7 +1,7 @@
 // Reads the user's DeepSeek account balance and serves it to the Settings →
-// Usage UI. The key is user-level (not per-instance) and is used ONLY here
+// Usage UI.  The key is user-level (not per-instance) and is used ONLY here
 // — it is never injected into any engine's process environment, so a bot
-// can run on the DeepSeek harness without it.  Cached for five minutes so
+// can run on Clutch without it.  Cached for five minutes so
 // the chip doesn't ping DeepSeek on every page load.
 
 export type DeepSeekBalanceSnapshot = {

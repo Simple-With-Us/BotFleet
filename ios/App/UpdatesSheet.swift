@@ -79,6 +79,7 @@ private struct UpdateRow: View {
         Button(action: open) {
             HStack(alignment: .top, spacing: 12) {
                 ChatAvatarView(chat: update.chat, size: 40, state: BotState.forChat(update.chat, in: session.state))
+                    .providerBadge(for: update.chat, avatarSize: 40)
 
                 VStack(alignment: .leading, spacing: 3) {
                     Text(update.chat.name)

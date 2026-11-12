@@ -1,5 +1,4 @@
-import { createHash } from "node:crypto";
-
+import { botDesktopDigest, botDesktopDisplayFor, botDesktopSession } from "./bot-desktop-session.ts";
 import { CUA_EXECUTABLE, CUA_SOCKET, DISPLAY } from "./container-computer.ts";
 import type { AppConfig } from "./config.ts";
 
@@ -19,7 +18,7 @@ export function isSharedVpsMode(cfg: AppConfig): boolean {
 }
 
 export function perBotOccupancyKey(botId: string): string {
-  return `bot:${createHash("sha256").update(botId).digest("hex")}`;
+  return `bot:${botDesktopDigest(botId)}`;
 }
 
 /** Lease / tunnel / occupancy key for a bot's VPS turn.  Always per-bot —
@@ -28,26 +27,17 @@ export function vpsOccupancyKey(_cfg: AppConfig, botId: string): string {
   return perBotOccupancyKey(botId);
 }
 
-/** Map each bot id to a distinct X display number.  The prior `% 50` slice
- * collided (e.g. bot-11 and bot-16 both landed on `:52`); the full digest
- * is injective for distinct bot ids. */
+/** Map each bot id to a distinct X display number.  Display numbers must be
+ *  bounded (10..50009) so that TCP port 6000 + display does not exceed the
+ *  16-bit unsigned port maximum (65535) or fail X server launch, while
+ *  remaining collision-resistant across bot ids. */
 export function vpsSharedDisplayForBot(botId: string): string {
-  const digest = createHash("sha256").update(botId).digest("hex");
-  const displayNum = 10 + Number.parseInt(digest.slice(0, 8), 16);
-  return `:${displayNum}`;
+  return botDesktopDisplayFor(botId);
 }
 
-/** Deterministic display + Cua socket for one bot on the shared container. */
+/** Deterministic display + CUA socket for one bot on the shared container. */
 export function vpsSharedBotSession(botId: string): VpsSharedBotSession {
-  const digest = createHash("sha256").update(botId).digest("hex");
-  const short = digest.slice(0, 12);
-  return {
-    occupancyKey: perBotOccupancyKey(botId),
-    display: vpsSharedDisplayForBot(botId),
-    socket: `/run/user/1000/botfleet-cua-${short}.sock`,
-    session: `bf-${short}`,
-    screenshotPath: `/tmp/botfleet-vps-${short}.png`,
-  };
+  return { occupancyKey: perBotOccupancyKey(botId), ...botDesktopSession(botId, "vps") };
 }
 
 export function vpsDriverSocket(cfg: AppConfig, botId: string): string {
@@ -90,7 +80,14 @@ export function ensureSharedVpsSessionExecArgs(
     `socket=${session.socket}`,
     `if ${CUA_EXECUTABLE} status --socket "$socket" >/dev/null 2>&1; then exit 0; fi`,
     `if ! DISPLAY="$display" xset q >/dev/null 2>&1; then`,
-    `  Xvfb "$display" -screen 0 1280x720x24 -nolisten tcp >/dev/null 2>&1 &`,
+    `  if command -v Xvfb >/dev/null 2>&1; then`,
+    `    Xvfb "$display" -screen 0 1280x720x24 -nolisten tcp >/dev/null 2>&1 &`,
+    `  elif command -v Xtigervnc >/dev/null 2>&1; then`,
+    `    Xtigervnc "$display" -geometry 1280x720 -depth 24 -SecurityTypes None -rfbport -1 -nolisten tcp >/dev/null 2>&1 &`,
+    `  else`,
+    `    echo "No X server binary found (neither Xvfb nor Xtigervnc)" >&2`,
+    `    exit 1`,
+    `  fi`,
     `  attempt=0`,
     `  until DISPLAY="$display" xset q >/dev/null 2>&1; do`,
     `    attempt=$((attempt + 1))`,
@@ -99,12 +96,12 @@ export function ensureSharedVpsSessionExecArgs(
     `  done`,
     `fi`,
     `rm -f "$socket"`,
-    `nohup env HOME=/home/cua USER=cua DISPLAY="$display" CUA_DRIVER_INSTALL_CHANNEL=python_package CUA_DRIVER_RS_TELEMETRY_ENABLED=0 ${CUA_EXECUTABLE} serve --socket "$socket" --permission-mode standard >/var/log/supervisor/cua-driver-${session.session}.log 2>&1 &`,
+    `nohup env HOME=/home/cua USER=cua DISPLAY="$display" CUA_DRIVER_INSTALL_CHANNEL=python_package CUA_DRIVER_RS_TELEMETRY_ENABLED=0 ${CUA_EXECUTABLE} serve --socket "$socket" --permission-mode standard >/tmp/cua-driver-${session.session}.log 2>&1 &`,
     `for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do`,
     `  ${CUA_EXECUTABLE} status --socket "$socket" >/dev/null 2>&1 && exit 0`,
     `  sleep 0.25`,
     `done`,
-    `echo "Cua Driver did not answer on $socket" >&2`,
+    `echo "CUA Driver did not answer on $socket" >&2`,
     `exit 1`,
   ].join("\n");
   return [

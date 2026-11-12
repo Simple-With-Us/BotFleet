@@ -7,7 +7,7 @@ const state = (over: Partial<Parameters<typeof connectedAppsBlurb>[0]> = {}) =>
 
 describe("connectedAppsBlurb", () => {
   it("names Composio in the heading, so the grant is not read as a BotFleet built-in", () => {
-    expect(CONNECTED_APPS_HEADING).toContain("Composio");
+    expect(CONNECTED_APPS_HEADING).toBe("Connected Apps via Composio");
   });
 
   it("names Composio in the enabled state, because a third party holds those accounts", () => {

@@ -64,6 +64,7 @@ export const QUOTA_PROVIDERS: ReadonlySet<string> = new Set([
   "minimax",
   "deepseek",
   "dsh",
+  "zcode",
 ]);
 
 /** Product and vendor spellings either app can emit, folded onto the
@@ -82,6 +83,11 @@ export const QUOTA_PROVIDER_ALIASES: Readonly<Record<string, string>> = {
   grok: "xai",
   "grok-build": "xai",
   "minimax-code": "minimax",
+  "z.ai": "zcode",
+  "z-ai": "zcode",
+  zai: "zcode",
+  glm: "zcode",
+  "glm-coding": "zcode",
 };
 
 /** Providers a collector somewhere in the fleet reads but BotFleet has no
@@ -133,6 +139,10 @@ const DRIVER_KIND_PROVIDERS: Readonly<Record<string, string>> = {
   deepseek: "deepseek",
   deepseekAgent: "deepseek",
   dshAgent: "dsh",
+  zcodeAgent: "zcode",
+  // The bridge engine spends the same GLM Coding Plan windows as the headless
+  // CLI (mcodeAgent: "minimax" precedent).
+  zcodeAcp: "zcode",
 };
 
 export function quotaProviderForDriver(driverKind: string): string | null {
@@ -203,6 +213,10 @@ export function driverKindsForWindow(window: QuotaWindowMatch): string[] {
   // raw Usage Monitor windows table this PR removed was the only place a
   // Kimi window stayed visible without this mapping.
   if (hay.includes("kimi") || hay.includes("moonshot")) return ["kimiAgent"];
+  // ZCode windows arrive from CodeCaps under providerKey "zcode"; telemetry
+  // (inferProviderAndService) reports the engine under provider "zcode" too,
+  // and a window labeled with the vendor ("z.ai" / "GLM") is the same plan.
+  if (hay.includes("zcode") || hay.includes("z.ai") || hay.includes("glm")) return ["zcodeAgent", "zcodeAcp"];
   if (hay.includes("dsh")) return ["dshAgent"];
   if (hay.includes("deepseek")) return ["deepseekAgent", "deepseek"];
   // Factory is droid's real commercial product/subscription (droid.ts:
@@ -304,9 +318,15 @@ export const MODEL_TYPE_FAMILIES: Readonly<Record<string, string[]>> = {
   deepseek: ["deepseek"],
 };
 
+/** The second Antigravity pool's display name is "Third-Party".  Producers
+ *  that predate the rename ship the pool as "Claude and GPT", "Claude & GPT"
+ *  or "Claude + GPT", and stored or ingested windows keep those labels, so
+ *  every spelling has to resolve to the same pool. */
+const THIRD_PARTY_LABEL = /third[ -]?party|claude\s*(?:and|&|\+)\s*gpt/;
+
 export function familiesForWindow(window: QuotaWindowMatch): string[] {
   const label = window.label.toLowerCase();
-  if (label.includes("claude and gpt") || label.includes("third-party")) return THIRD_PARTY_FAMILIES;
+  if (THIRD_PARTY_LABEL.test(label)) return THIRD_PARTY_FAMILIES;
   if (label.includes("gemini")) return GEMINI_FAMILIES;
   if (label.includes("cursor")) return ["cursor"];
   if (!window.modelType) return [];

@@ -263,17 +263,36 @@ export function companionPairingRoutePin(
 }
 
 /** A pinned secure QR remains valid only while its exact chosen transport is
- * still advertised. Another protected endpoint is not silently substituted:
- * changing transport requires a fresh pairing attempt and credential. */
+ * still advertised.  Another protected endpoint is not silently substituted:
+ * changing transport requires a fresh pairing attempt and credential.  When
+ * pairing over Tailscale, a fallback route derived from `source.tailnetName`
+ * remains valid as long as that tailnet name and port match the pinned route. */
 export function companionPairingRoutePinAvailable(
-  source: Pick<CompanionPairingRouteSource, "endpoints">,
+  source: Pick<CompanionPairingRouteSource, "endpoints"> & {
+    tailnetName?: string;
+    port?: number;
+  },
   pin: CompanionPairingRoutePin,
 ): boolean {
   if (!pin.protectedEndpoint) return true;
-  return qrEndpoints(source.endpoints).some(
+  const matchInEndpoints = qrEndpoints(source.endpoints).some(
     (endpoint) => endpoint.kind === pin.protectedEndpoint?.kind
       && endpoint.url === pin.protectedEndpoint.url,
   );
+  if (matchInEndpoints) return true;
+
+  if (pin.protectedEndpoint.kind === "tailnet") {
+    const port = typeof source.port === "number" ? source.port : pin.route.port;
+    if (
+      source.tailnetName?.trim()
+      && typeof port === "number"
+      && directHTTPOrigin(source.tailnetName.trim(), port) === pin.protectedEndpoint.url
+    ) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 /** URL-safe, unpadded base64 keeps the structured JSON smaller than query

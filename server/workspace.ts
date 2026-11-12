@@ -152,6 +152,12 @@ export function readMemoryTopic(botId: string, name: string): string | null {
  * it has written anything. Content from other bots or imported files must
  * never be recorded as fact — memory is a prompt-injection persistence
  * vector the moment a bot copies untrusted text into it. */
+/** The line that introduces the bot's own MEMORY.md text inside
+ * `memorySystemPrompt`.  Exported so the context-injection record can tell the
+ * memory a bot wrote from the standing guidance around it (which is the same
+ * every turn and not worth a record). */
+export const MEMORY_CONTENT_HEADING = "Your memory (MEMORY.md):\n";
+
 export function memorySystemPrompt(botId: string): string {
   const memory = loadMemory(botId);
   const memoryFile = join(workspaceDir(botId), "MEMORY.md");
@@ -168,7 +174,7 @@ export function memorySystemPrompt(botId: string): string {
   const truncatedNote = memory.truncated
     ? ` [MEMORY.md exceeds the ${MEMORY_MAX_LINES}-line/${MEMORY_MAX_BYTES}-byte budget and was cut off here — trim it.]`
     : "";
-  return `${guidance}\n\nYour memory (MEMORY.md):\n${memory.text}${truncatedNote}`;
+  return `${guidance}\n\n${MEMORY_CONTENT_HEADING}${memory.text}${truncatedNote}`;
 }
 
 // ── Orphan sweep (HS3) ──────────────────────────────────────────────────

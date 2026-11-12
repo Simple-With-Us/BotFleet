@@ -14,9 +14,22 @@ import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { ensureDirs } from "../config.ts";
-import type { ProviderInstance } from "../contracts.ts";
+import type { ProviderInstance, RuntimeEvent } from "../contracts.ts";
+import { awaitCliLogin, primeCliLogin, resetCliLoginCache, setCliLoginVault } from "../cli-logins.ts";
 import { recordEvents, type EventRecorder } from "../testing/events.ts";
-import { ClaudeDriver, permissionSocketPath, withVolatileNote, type ClaudeConfig } from "./claude.ts";
+import { expectLaunchedAs, inheritHarnessIdentity, readEngineDump } from "../testing/launch-identity.ts";
+import {
+  CLAUDE_CONTAINMENT_DISALLOWED_TOOLS,
+  CLAUDE_CONTAINMENT_ENV,
+  CLAUDE_CONTAINMENT_SETTINGS,
+  ClaudeDriver,
+  claudeDisallowedTools,
+  helperUsageDelta,
+  claudeUnsolicitedFrameStats,
+  permissionSocketPath,
+  withVolatileNote,
+  type ClaudeConfig,
+} from "./claude.ts";
 import { VOLATILE_CONTEXT_CLEARED_NOTE, VOLATILE_CONTEXT_NOTE_PREFIX } from "./prompt-split.ts";
 import { removeTempDir } from "../testing/cleanup.ts";
 
@@ -25,6 +38,17 @@ const FAKE_CLI = join(dirname(fileURLToPath(import.meta.url)), "..", "testing", 
 /** Thread ids for the four ask-id-collision tests. Each must truncate to a
  * unique 8-char tag so no two tests share a broker socket/pipe name. */
 const COLLISION_THREAD_IDS = ["t-dup-1", "t-dup-2", "t-dup-3", "t-dup-4"];
+
+/** The inputs the permission-path test sends: the keys of Claude's Write,
+ * Edit, NotebookEdit, Bash and Read tools that matter to it. */
+interface FileToolInput {
+  file_path?: string;
+  notebook_path?: string;
+  content?: string;
+  old_string?: string;
+  new_string?: string;
+  command?: string;
+}
 
 /** Connect to a broker socket and resolve once the connection is live. */
 function connectSocket(path: string): Promise<Socket> {
@@ -71,6 +95,25 @@ function answerQueue(conn: ReturnType<typeof connect>) {
   return () => new Promise<any>((resolve) => waiters.push(resolve));
 }
 
+describe("helper usage", () => {
+  it("counts one assistant message once, and a later increase only as the difference", () => {
+    const seen = new Map<string, number>();
+    expect(helperUsageDelta(seen, "msg-1", 1098)).toBe(1098);
+    expect(helperUsageDelta(seen, "msg-1", 1098)).toBe(0);
+    expect(helperUsageDelta(seen, "msg-1", 1108)).toBe(10);
+    expect(helperUsageDelta(seen, "msg-2", 4)).toBe(4);
+    expect(helperUsageDelta(seen, undefined, 7)).toBe(7);
+    expect(helperUsageDelta(undefined, "msg-3", 3)).toBe(3);
+  });
+
+  it("accepts an engine reset floor before counting the next increase", () => {
+    const seen = new Map<string, number>();
+    expect(helperUsageDelta(seen, "msg-1", 500)).toBe(500);
+    expect(helperUsageDelta(seen, "msg-1", 100)).toBe(0);
+    expect(helperUsageDelta(seen, "msg-1", 150)).toBe(50);
+  });
+});
+
 describe("ClaudeDriver.decodeConfig", () => {
   it("defaults to the claude binary with acceptEdits", () => {
     expect(ClaudeDriver.decodeConfig({})).toEqual({ cli: "claude", permissionMode: "acceptEdits" });
@@ -85,6 +128,19 @@ describe("ClaudeDriver.decodeConfig", () => {
 
   it("throws on an invalid permissionMode (registry downgrades this to a shadow)", () => {
     expect(() => ClaudeDriver.decodeConfig({ permissionMode: "yolo" })).toThrow(/permissionMode/);
+  });
+
+  it("maps the Engines page's autonomous-mode switch (fullAuto) to Claude's bypassPermissions", () => {
+    // Settings > Engines stores `fullAuto: true`; Claude spelled the same
+    // thing `permissionMode`, and the box ticked with no effect on the CLI.
+    expect(ClaudeDriver.decodeConfig({ fullAuto: true }).permissionMode).toBe("bypassPermissions");
+    expect(ClaudeDriver.decodeConfig({ fullAuto: false }).permissionMode).toBe("acceptEdits");
+    expect(ClaudeDriver.decodeConfig({}).permissionMode).toBe("acceptEdits");
+    // Only a real boolean true counts: a stray string is not a YOLO switch.
+    expect(ClaudeDriver.decodeConfig({ fullAuto: "yes" }).permissionMode).toBe("acceptEdits");
+    // An explicit permissionMode is never overridden by the switch.
+    expect(ClaudeDriver.decodeConfig({ fullAuto: true, permissionMode: "acceptEdits" }).permissionMode).toBe("acceptEdits");
+    expect(ClaudeDriver.decodeConfig({ fullAuto: true, permissionMode: "auto" }).permissionMode).toBe("auto");
   });
 
   it("normalizes and deduplicates built-in tool lists", () => {
@@ -167,6 +223,8 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     ensureDirs();
     chmodSync(FAKE_CLI, 0o755);
     scratch = mkdtempSync(join(tmpdir(), "omb-claude-test-"));
+    // the fake's per-session running cost totals live with the test
+    process.env.FAKE_CLAUDE_COST_DIR = join(scratch, "costs");
   });
 
   afterEach(async () => {
@@ -175,11 +233,19 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     delete process.env.FAKE_CLAUDE_TRANSIENTS;
     delete process.env.FAKE_CLAUDE_PARTIAL_FAILS;
     delete process.env.FAKE_CLAUDE_TOOL_FAILS;
+    delete process.env.FAKE_CLAUDE_TOOL_IO;
     delete process.env.FAKE_CLAUDE_STATE;
     delete process.env.FAKE_CLAUDE_RETRY_SCALE;
     delete process.env.FAKE_CLAUDE_HELP;
     delete process.env.FAKE_CLAUDE_HELP_PROBES;
     delete process.env.FAKE_CLAUDE_PROMPTS;
+    delete process.env.FAKE_CLAUDE_LIFECYCLE;
+    delete process.env.FAKE_CLAUDE_RESULT_MARK;
+    delete process.env.FAKE_CLAUDE_CACHE_WRITE;
+    delete process.env.FAKE_CLAUDE_PROOF;
+    delete process.env.FAKE_CLAUDE_SERVED_MODEL;
+    delete process.env.FAKE_CLAUDE_GATE;
+    delete process.env.FAKE_CLAUDE_COST_DIR;
     delete process.env.ANTHROPIC_API_KEY;
     delete process.env.XAI_API_KEY;
     delete process.env.COMPOSIO_API_KEY;
@@ -188,6 +254,9 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     delete process.env.OMB_TTS_KEY;
     delete process.env.OMB_CLAUDE_SESSION_IDLE_MS;
     delete process.env.OMB_CLAUDE_SESSION_IDLE_MIN_MS;
+    delete process.env.GH_TOKEN;
+    setCliLoginVault(null);
+    resetCliLoginCache();
     recorder?.stop();
     await instance?.dispose();
     await removeTempDir(scratch);
@@ -228,6 +297,94 @@ describe("ClaudeDriver turns (fake CLI)", () => {
       usage: { input: 12, output: 5, cachedInput: 2 },
     });
     expect(instance.adapter.hasSession("t-happy")).toBe(false);
+    expect(done).not.toHaveProperty("billedCall");
+  });
+
+  it("emits a reconciled single-call receipt only for lifecycle-owned exact usage", async () => {
+    process.env.FAKE_CLAUDE_PROOF = "1";
+    process.env.FAKE_CLAUDE_SERVED_MODEL = "claude-test";
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-single-proof", text: "hi", model: "claude-test" });
+    await recorder.until((e) => e.type === "turn.completed");
+    expect(recorder.events.at(-1)).toMatchObject({
+      type: "turn.completed",
+      billedCall: { id: "msg-single-call", model: "claude-test", input: 10, output: 5, cacheRead: 2, cacheWrite: 0 },
+    });
+  });
+
+  it("names the cache writes by TTL and the served model, inside an input that still reads whole", async () => {
+    process.env.FAKE_CLAUDE_CACHE_WRITE = "ttl";
+    process.env.FAKE_CLAUDE_SERVED_MODEL = "claude-sonnet-5-20261001";
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-cache-ttl", text: "hi", model: "claude-sonnet-5" });
+    await recorder.until((e) => e.type === "turn.completed");
+    // 10 plain + 2 cache read + 7 cache write = 19 context tokens; the writes
+    // stay inside `input` (the context meter) and are named for telemetry
+    expect(recorder.events.at(-1)).toMatchObject({
+      type: "turn.completed",
+      usage: { input: 19, output: 5, cachedInput: 2, cacheWrite5m: 3, cacheWrite1h: 4 },
+      servedModel: "claude-sonnet-5-20261001",
+    });
+  });
+
+  it("keeps the writes inside input when a CLI sends only the TTL split and no flat total", async () => {
+    process.env.FAKE_CLAUDE_CACHE_WRITE = "split";
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-cache-split", text: "hi", model: "claude-sonnet-5" });
+    await recorder.until((e) => e.type === "turn.completed");
+    // 10 plain + 2 cache read + (3 + 4) cache write: without the writes in
+    // `input`, telemetry would subtract them from an input that never held them
+    expect((recorder.events.at(-1) as Extract<RuntimeEvent, { type: "turn.completed" }>).usage).toEqual({
+      input: 19,
+      output: 5,
+      cachedInput: 2,
+      cacheWrite5m: 3,
+      cacheWrite1h: 4,
+    });
+  });
+
+  it("files a flat cache-creation figure from an older CLI under the 5 minute cache", async () => {
+    process.env.FAKE_CLAUDE_CACHE_WRITE = "flat";
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-cache-flat", text: "hi", model: "claude-sonnet-5" });
+    await recorder.until((e) => e.type === "turn.completed");
+    const done = recorder.events.at(-1) as Extract<RuntimeEvent, { type: "turn.completed" }>;
+    expect(done.usage).toEqual({ input: 19, output: 5, cachedInput: 2, cacheWrite5m: 7 });
+    expect(done.servedModel).toBeUndefined();
+  });
+
+  it("attaches a step's whole input and output to its events, and leaves the headline the row shows alone", async () => {
+    process.env.FAKE_CLAUDE_TOOL_IO = "1";
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-tool-io", text: "hi", model: "claude-sonnet-5" });
+    await recorder.until((e) => e.type === "turn.completed");
+
+    const started = recorder.events.find((e) => e.type === "item.started" && e.itemType === "tool")!;
+    // the headline is what it always was: one clipped target
+    expect(started).toMatchObject({ itemId: "tu-1", title: "Bash", target: "echo hi" });
+    // the capture is the whole argument object, pretty-printed
+    const pretty = '{\n  "command": "echo hi",\n  "stdin": "TAIL-INPUT-MARKER"\n}';
+    expect(started.io?.input).toEqual({ text: pretty, truncated: false, length: pretty.length });
+    expect(started.io?.output).toBeUndefined();
+
+    const done = recorder.events.find((e) => e.type === "item.completed" && e.itemType === "tool")!;
+    // one clipped line for the row; the whole text, past the clip, for the store
+    if (done.type !== "item.completed" || done.itemType !== "tool") throw new Error("not a tool completion");
+    expect(done.detail!.length).toBeLessThanOrEqual(240);
+    expect(done.detail).not.toContain("TAIL-OUTPUT-MARKER");
+    expect(done.io?.output?.text).toContain("TAIL-OUTPUT-MARKER");
+    expect(done.io?.output?.text.startsWith("head line\n")).toBe(true);
+    expect(done.io?.input).toBeUndefined();
+  });
+
+  it("captures nothing for a step that carried no input and returned no text", async () => {
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-no-io", text: "hi", model: "claude-sonnet-5" });
+    await recorder.until((e) => e.type === "turn.completed");
+    for (const event of recorder.events.filter((e) => e.type === "item.started" || e.type === "item.completed")) {
+      if (event.type === "item.completed" && event.itemType === "assistant_text") continue;
+      expect(event.io).toBeUndefined();
+    }
   });
 
   it("reports the CLI's terminal_reason, not a stale stop_reason, on a failed turn", async () => {
@@ -243,6 +400,67 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     await instance.adapter.sendTurn({ threadId: "t-api-error", text: "hi" });
     const done = await recorder.until((e) => e.type === "turn.completed");
     expect(done).toMatchObject({ type: "turn.completed", ok: false, stopReason: "api_error" });
+  });
+
+  describe("a rejected model id", () => {
+    // The CLI answers an unknown model with an assistant-shaped apology and a
+    // 404 result instead of failing the process.  Forwarded as bot text, that
+    // apology counted as real output: the fallback walk stopped on the dead
+    // entry and every later engine in the chain was never tried.
+    const rejected = async (mode: string, threadId: string) => {
+      await create(mode);
+      await instance.adapter.sendTurn({ threadId, text: "hi", model: "claude-3-7-sonnet" });
+      const done = await recorder.until((e) => e.type === "turn.completed");
+      return done;
+    };
+    const expectErrorNotText = () => {
+      const errors = recorder.events.filter((e) => e.type === "runtime.error");
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toMatchObject({
+        message: expect.stringMatching(/claude-3-7-sonnet.*Pick another model in Settings/),
+      });
+      // a rejection is not a setup failure: it must not mark the bot dead
+      expect(errors[0]).not.toHaveProperty("setup");
+      expect(recorder.events.some((e) => e.type === "item.completed" && e.itemType === "assistant_text")).toBe(false);
+      expect(recorder.events.some((e) => e.type === "content.delta")).toBe(false);
+      expect(recorder.events.some((e) => e.type === "turn.retrying")).toBe(false);
+    };
+
+    it("settles unknown_model with an error row and no assistant text (structural frames)", async () => {
+      const done = await rejected("model-not-found", "t-model-rejected");
+      expect(done).toMatchObject({ type: "turn.completed", ok: false, stopReason: "unknown_model" });
+      expectErrorNotText();
+    });
+
+    it("recognizes the rejection from a CLI that drops the error field (text backstop)", async () => {
+      const done = await rejected("model-not-found-text", "t-model-rejected-text");
+      expect(done).toMatchObject({ type: "turn.completed", ok: false, stopReason: "unknown_model" });
+      expectErrorNotText();
+    });
+
+    it("recognizes a bare 404 result with no assistant frame", async () => {
+      const done = await rejected("model-404", "t-model-404");
+      expect(done).toMatchObject({ type: "turn.completed", ok: false, stopReason: "unknown_model" });
+      // the requested id still reaches the message, from the turn itself
+      expectErrorNotText();
+    });
+
+    it("keeps a real reply that merely opens with the same words", async () => {
+      await create("model-lookalike");
+      await instance.adapter.sendTurn({ threadId: "t-model-lookalike", text: "hi", model: "claude-sonnet-5" });
+      const done = await recorder.until((e) => e.type === "turn.completed");
+      expect(done).toMatchObject({ ok: true, stopReason: "end_turn" });
+      expect(recorder.events.some((e) => e.type === "runtime.error")).toBe(false);
+      expect(recorder.events.find((e) => e.type === "item.completed" && e.itemType === "assistant_text")).toMatchObject({
+        text: expect.stringMatching(/^There's an issue with the selected model dropdown/),
+      });
+    });
+
+    it("a 429 api_error is still an api_error, not a model rejection", async () => {
+      const done = await rejected("api-error", "t-not-a-model-problem");
+      expect(done).toMatchObject({ ok: false, stopReason: "api_error" });
+      expect(recorder.events.some((e) => e.type === "runtime.error")).toBe(false);
+    });
   });
 
   it("streams partial-message text deltas without re-emitting the whole message", async () => {
@@ -289,6 +507,88 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     expect(seen.env.XAI_API_KEY).toBeUndefined();
     expect(seen.env.BOX_TOKEN).toBeUndefined();
     expect(seen.env.OMB_TTS_KEY).toBeUndefined();
+  });
+
+  it("gives the launched child the seat's CLI login, and nobody else's", async () => {
+    await create();
+    const dump = join(scratch, "dump-login.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+    // The harness process may hold a login of its own.  A child must never
+    // inherit it:  the seat's own login replaces it, and a child with no
+    // seat gets none at all.
+    process.env.GH_TOKEN = "harness-login-not-real";
+    const asked: Array<{ project: string; secretPath: string }> = [];
+    setCliLoginVault({
+      async readProjectPath(project, secretPath) {
+        asked.push({ project, secretPath });
+        return new Map([["GH_TOKEN", "seat-login-not-real"]]);
+      },
+    });
+    // The login is read in the background, so it is primed and awaited
+    // before the turn:  a turn that starts with a cold cache runs without
+    // the login, and the turns after it have one.
+    primeCliLogin("BF-ORACLE");
+    await awaitCliLogin("BF-ORACLE");
+
+    await instance.adapter.sendTurn({
+      threadId: "t-cli-login",
+      text: "hi",
+      launchIdentity: { seat: "BF-ORACLE", session: "session-1" },
+    });
+    await recorder.until((e) => e.type === "turn.completed");
+
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    expect(seen.env.GH_TOKEN).toBe("seat-login-not-real");
+    expect(seen.env.AGENT_LAUNCH_SEAT).toBe("BF-ORACLE");
+    // The seat's own folder, in the fleet's project.
+    expect(asked).toEqual([{ project: "fleet-ops", secretPath: "/cli-logins/BF-ORACLE" }]);
+  });
+
+  it("takes the harness's own login away from a child with no seat", async () => {
+    await create();
+    const dump = join(scratch, "dump-no-seat.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+    process.env.GH_TOKEN = "harness-login-not-real";
+    const asked: string[] = [];
+    setCliLoginVault({
+      async readProjectPath(_project, secretPath) {
+        asked.push(secretPath);
+        return new Map();
+      },
+    });
+
+    await instance.adapter.sendTurn({ threadId: "t-no-seat", text: "hi" });
+    await recorder.until((e) => e.type === "turn.completed");
+
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    expect(seen.env.GH_TOKEN).toBeUndefined();
+    // A bot with no seat has no folder, so nothing is read.
+    expect(asked).toEqual([]);
+  });
+
+  it("starts the seat's login read for a turn that names a seat", async () => {
+    await create();
+    const dump = join(scratch, "dump-prime.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+    const asked: string[] = [];
+    setCliLoginVault({
+      async readProjectPath(_project, secretPath) {
+        asked.push(secretPath);
+        return new Map();
+      },
+    });
+
+    await instance.adapter.sendTurn({
+      threadId: "t-prime",
+      text: "hi",
+      launchIdentity: { seat: "BF-MONITOR", session: "session-2" },
+    });
+    await recorder.until((e) => e.type === "turn.completed");
+    await awaitCliLogin("BF-MONITOR");
+
+    // The turn itself starts the read, so the turns after it have the
+    // login even when the first one ran with a cold cache.
+    expect(asked).toEqual(["/cli-logins/BF-MONITOR"]);
   });
 
   it("uses instance credentials when launching an injected local model", async () => {
@@ -421,6 +721,27 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     expect(bypassed.mcpConfig?.mcpServers?.botfleet).toBeUndefined();
   });
 
+  it("starts the CLI in bypassPermissions when the Engines page's fullAuto switch is on", async () => {
+    // The end of the mapping decodeConfig does: the flag the CLI really gets.
+    // Built by hand, through decodeConfig the way the registry does it: the
+    // `create` helper above always supplies a permissionMode of its own.
+    instance = await ClaudeDriver.create({
+      instanceId: "claude-full-auto-test",
+      displayName: "Claude Full Auto Test",
+      environment: {},
+      enabled: true,
+      config: ClaudeDriver.decodeConfig({ cli: FAKE_CLI, fullAuto: true }),
+    });
+    recorder = recordEvents(instance.adapter);
+    const dump = join(scratch, "full-auto-switch.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+    await instance.adapter.sendTurn({ threadId: "t-full-auto-switch", text: "hi" });
+    await recorder.until((event) => event.type === "turn.completed" && event.threadId === "t-full-auto-switch");
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    expect(seen.argv[seen.argv.indexOf("--permission-mode") + 1]).toBe("bypassPermissions");
+    expect(seen.argv).not.toContain("--permission-prompt-tool");
+  });
+
   it("passes normalized available and denied built-in tool sets to Claude", async () => {
     await create(undefined, {}, {
       tools: ["Read", "WebFetch"],
@@ -434,7 +755,10 @@ describe("ClaudeDriver turns (fake CLI)", () => {
 
     const seen = JSON.parse(readFileSync(dump, "utf8"));
     expect(seen.argv[seen.argv.indexOf("--tools") + 1]).toBe("Read,WebFetch");
-    expect(seen.argv[seen.argv.indexOf("--disallowedTools") + 1]).toBe("Bash(git *),Edit");
+    // the bot's own denials, then the containment set (jobs P0), always
+    expect(seen.argv[seen.argv.indexOf("--disallowedTools") + 1]).toBe(
+      ["Bash(git *)", "Edit", ...CLAUDE_CONTAINMENT_DISALLOWED_TOOLS].join(","),
+    );
   });
 
   it("passes an explicit empty available set to disable every Claude built-in", async () => {
@@ -447,7 +771,8 @@ describe("ClaudeDriver turns (fake CLI)", () => {
 
     const seen = JSON.parse(readFileSync(dump, "utf8"));
     expect(seen.argv[seen.argv.indexOf("--tools") + 1]).toBe("");
-    expect(seen.argv).not.toContain("--disallowedTools");
+    // denying a tool the empty set never offers is harmless, and keeps one rule
+    expect(seen.argv[seen.argv.indexOf("--disallowedTools") + 1]).toBe(CLAUDE_CONTAINMENT_DISALLOWED_TOOLS.join(","));
   });
 
   it("mounts the dweb proxy from the drivers directory and pre-allows its tools", async () => {
@@ -603,6 +928,57 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     expect(shell.mcpConfig.mcpServers.botfleet).toBeUndefined();
   });
 
+  it("runs a bypassPermissions turn held for auto-review through the broker, so each ask is reviewed first", async () => {
+    await create(undefined, {}, { permissionMode: "bypassPermissions" });
+    expect(instance.adapter.capabilities).toMatchObject({ reviewHook: "after", asksWhenHeld: true });
+    const dump = join(scratch, "bypass-held-dump.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+    await instance.adapter.sendTurn({ threadId: "t-bypass-held", text: "list the files", holdForReview: true });
+    await recorder.until((event) => event.type === "turn.completed" && event.threadId === "t-bypass-held");
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    expect(seen.argv[seen.argv.indexOf("--permission-mode") + 1]).not.toBe("bypassPermissions");
+    expect(seen.argv[seen.argv.indexOf("--permission-prompt-tool") + 1]).toBe("mcp__botfleet__approve");
+    expect(seen.mcpConfig.mcpServers.botfleet).toBeDefined();
+  });
+
+  it("routes connected apps and the phone through the prompt tool on a held turn, so the reviewer sees them first", async () => {
+    await create(undefined, {}, { permissionMode: "bypassPermissions" });
+    const integrations = {
+      composio: { command: process.execPath, args: ["/tmp/connector-proxy.js"], env: {} },
+      phone: { command: process.execPath, args: ["/tmp/phone-proxy.js"], env: {} },
+      agents: { command: process.execPath, args: ["/tmp/agents-proxy.js"], env: {} },
+    };
+    const heldDump = join(scratch, "held-mcp-dump.json");
+    process.env.FAKE_CLAUDE_DUMP = heldDump;
+    await instance.adapter.sendTurn({ threadId: "t-held-mcp", text: "send it", holdForReview: true, integrations });
+    await recorder.until((event) => event.type === "turn.completed" && event.threadId === "t-held-mcp");
+    const held = JSON.parse(readFileSync(heldDump, "utf8"));
+    const heldAllowed = String(held.argv[held.argv.indexOf("--allowedTools") + 1]).split(",");
+    // still mounted, no longer pre-allowed: each call asks, and is reviewed
+    expect(held.mcpConfig.mcpServers.composio).toBeDefined();
+    expect(held.mcpConfig.mcpServers.phone).toBeDefined();
+    expect(heldAllowed).not.toContain("mcp__composio");
+    expect(heldAllowed).not.toContain("mcp__phone");
+    // the harness's own fleet comms stay pre-allowed (each tool is guarded by
+    // the endpoint it calls, and a full-auto bot's job_start must never become
+    // a card); the step watch reviews those calls as they start
+    expect(heldAllowed).toContain("mcp__agents");
+
+    // an unheld bypass turn keeps every pre-allow: nothing asks there
+    const freeDump = join(scratch, "free-mcp-dump.json");
+    process.env.FAKE_CLAUDE_DUMP = freeDump;
+    await instance.adapter.sendTurn({ threadId: "t-free-mcp", text: "send it", integrations });
+    await recorder.until((event) => event.type === "turn.completed" && event.threadId === "t-free-mcp");
+    const free = JSON.parse(readFileSync(freeDump, "utf8"));
+    const freeAllowed = String(free.argv[free.argv.indexOf("--allowedTools") + 1]).split(",");
+    expect(freeAllowed).toEqual(expect.arrayContaining(["mcp__composio", "mcp__phone", "mcp__agents"]));
+  });
+
+  it("asks through the permission-prompt tool when not in bypass, which is where review holds each ask", async () => {
+    await create();
+    expect(instance.adapter.capabilities).toMatchObject({ reviewHook: "before", asksWhenHeld: true });
+  });
+
   it("resumes with --resume when a cursor exists and reports that session id", async () => {
     await create();
     const dump = join(scratch, "dump.json");
@@ -667,6 +1043,71 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     expect(readFileSync(dump, "utf8")).toBe(dumpBefore);
     expect(recorder.events.filter((e) => e.type === "turn.started")).toHaveLength(2);
     expect(recorder.events.filter((e) => e.type === "turn.completed")).toHaveLength(2);
+  });
+
+  describe("launch identity (the launcher contract)", () => {
+    let restore: () => void;
+    beforeEach(() => {
+      restore = inheritHarnessIdentity();
+    });
+    afterEach(() => {
+      restore();
+    });
+
+    const run = async (threadId: string, launchIdentity: { seat: string | null; session: string } | undefined) => {
+      const dump = join(scratch, `dump-${threadId}-${Date.now()}.json`);
+      process.env.FAKE_CLAUDE_DUMP = dump;
+      const started = await instance.adapter.sendTurn({ threadId, text: "hi", launchIdentity });
+      await recorder.until((e) => e.type === "turn.completed" && e.turnId === started.turnId);
+      return readEngineDump(dump);
+    };
+
+    it("gives each bot on one engine instance its own seat and session, and none of the harness's identity", async () => {
+      // The instance's own environment tries to carry a credential too.
+      await create(undefined, { ZULIP_API_KEY: "instance-key", AGENT_SEAT: "CODEX" });
+
+      const plumber = await run("t-plumber", { seat: "BF-PLUMBER", session: "t-plumber" });
+      const fixer = await run("t-fixer", { seat: "BF-FIXER", session: "t-fixer" });
+
+      expectLaunchedAs(plumber.env, { seat: "BF-PLUMBER", session: "t-plumber" });
+      expectLaunchedAs(fixer.env, { seat: "BF-FIXER", session: "t-fixer" });
+      expect(JSON.stringify([plumber.env, fixer.env])).not.toContain("instance-key");
+    });
+
+    it("marks a bot with no role as launched and gives it no seat", async () => {
+      await create();
+      const seen = await run("t-no-role", { seat: null, session: "t-no-role" });
+      expectLaunchedAs(seen.env, { seat: null, session: "t-no-role" });
+    });
+
+    it("fails closed when a caller passes no identity at all", async () => {
+      await create();
+      const seen = await run("t-bare", undefined);
+      expectLaunchedAs(seen.env, { seat: null });
+    });
+
+    it("respawns rather than hand a second seat to the process the first one started", async () => {
+      await create();
+      // A room's members share one thread.
+      const first = await run("t-room", { seat: "BF-PLUMBER", session: "t-room" });
+      const firstDump = process.env.FAKE_CLAUDE_DUMP!;
+
+      // The same identity reuses the warm process: the fake writes its dump once per process.
+      const again = await instance.adapter.sendTurn({
+        threadId: "t-room",
+        text: "again",
+        launchIdentity: { seat: "BF-PLUMBER", session: "t-room" },
+      });
+      await recorder.until((e) => e.type === "turn.completed" && e.turnId === again.turnId);
+      expect(readEngineDump(firstDump).pid).toBe(first.pid);
+
+      // A different seat on the same thread is a new process with its own env.
+      const other = await run("t-room", { seat: "BF-FIXER", session: "t-room" });
+      expect(other.pid).not.toBe(first.pid);
+      expect(first.env.AGENT_LAUNCH_SEAT).toBe("BF-PLUMBER");
+      expect(other.env.AGENT_LAUNCH_SEAT).toBe("BF-FIXER");
+      expect(other.env.AGENT_SEAT).toBe("BF-FIXER");
+    });
   });
 
   it("relaunches the live turn, not the first turn, when a warm process crashes (E3)", async () => {
@@ -1102,6 +1543,15 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     await instance.adapter.sendTurn({ threadId: "t-missing", text: "go" });
     const done = await recorder.until((e) => e.type === "turn.completed");
     expect(done).toMatchObject({ ok: false, stopReason: "spawn_error" });
+    // The real cause is a setup problem: name it and flag it so the doomed
+    // breaker counts the dead binary like any other driver's spawn failure.
+    expect(recorder.events).toContainEqual(
+      expect.objectContaining({
+        type: "runtime.error",
+        message: expect.stringContaining("isn't installed"),
+        setup: true,
+      }),
+    );
 
     expect(await instance.snapshot()).toMatchObject({ state: "unavailable" });
   });
@@ -1138,7 +1588,9 @@ describe("ClaudeDriver turns (fake CLI)", () => {
       conn.on("connect", resolve);
       conn.on("error", reject);
     });
-    conn.write(JSON.stringify({ t: "ask", id: "ask-1", tool: "Bash", input: { command: "rm -rf scratch" } }) + "\n");
+    conn.write(
+      JSON.stringify({ t: "ask", id: "ask-1", tool: "Bash", input: { command: "rm -rf scratch" }, toolUseId: "toolu_rm" }) + "\n",
+    );
 
     const opened = await recorder.until((e) => e.type === "request.opened");
     expect(opened).toMatchObject({
@@ -1146,6 +1598,9 @@ describe("ClaudeDriver turns (fake CLI)", () => {
       tool: "Bash",
       summary: "rm -rf scratch",
       requestId: "ask-1",
+      // the tool_use the CLI asked about, the id its item.started carried,
+      // so the auto-review step watch leaves this step to the card
+      itemId: "toolu_rm",
     });
     // a plain CLI tool never carries the desktop-control approval scope,
     // so the UI can offer a remembered grant for it
@@ -1181,6 +1636,75 @@ describe("ClaudeDriver turns (fake CLI)", () => {
 
     conn.end();
     await instance.adapter.interruptTurn("t-perm-abc");
+    await recorder.until((e) => e.type === "turn.completed");
+  });
+
+  it("carries the raw path and the turn folder of a file-writing ask, and nothing for any other tool", async () => {
+    const folder = mkdtempSync(join(tmpdir(), "omb-claude-paths-"));
+    try {
+      await create("hang");
+      await instance.adapter.sendTurn({ threadId: "t-perm-paths", text: "go", cwd: folder });
+      await recorder.until((e) => e.type === "session.started");
+      const conn = await connectSocket(permissionSocketPath("t-perm-paths"));
+      const ask = (id: string, tool: string, input: FileToolInput) =>
+        conn.write(JSON.stringify({ t: "ask", id, tool, input }) + "\n");
+
+      // the model's own spelling, `~` and `..` untouched: resolving it is the
+      // server's job, against the filesystem
+      ask("w1", "Write", { file_path: "~/.zshrc", content: "export X=1" });
+      ask("w2", "Edit", { file_path: `${folder}/src/../../outside.txt`, old_string: "a", new_string: "b" });
+      ask("w3", "NotebookEdit", { notebook_path: `${folder}/n.ipynb` });
+      // a file tool with no usable path still says so, instead of saying nothing
+      ask("w4", "Write", { content: "no path at all" });
+      ask("b1", "Bash", { command: "git status" });
+      ask("r1", "Read", { file_path: `${folder}/a.ts` });
+      const opened = async (id: string) => recorder.until((e) => e.type === "request.opened" && e.requestId === id);
+
+      expect(await opened("w1")).toMatchObject({ tool: "Write", paths: ["~/.zshrc"], cwd: folder });
+      expect(await opened("w2")).toMatchObject({ tool: "Edit", paths: [`${folder}/src/../../outside.txt`], cwd: folder });
+      expect(await opened("w3")).toMatchObject({ tool: "NotebookEdit", paths: [`${folder}/n.ipynb`], cwd: folder });
+      expect(await opened("w4")).toMatchObject({ tool: "Write", paths: [], cwd: folder });
+      for (const id of ["b1", "r1"]) {
+        const event = await opened(id);
+        expect(event).toHaveProperty("paths", undefined);
+        expect(event).toHaveProperty("cwd", undefined);
+      }
+
+      conn.end();
+      await instance.adapter.interruptTurn("t-perm-paths");
+      await recorder.until((e) => e.type === "turn.completed");
+    } finally {
+      rmSync(folder, { recursive: true, force: true });
+    }
+  });
+
+  it("reads a tool name that is not a string as the generic tool, and keeps serving the socket", async () => {
+    await create("hang");
+    await instance.adapter.sendTurn({ threadId: "t-perm-badtool", text: "go" });
+    await recorder.until((e) => e.type === "session.started");
+    const conn = await connectSocket(permissionSocketPath("t-perm-badtool"));
+    const ask = (id: string, tool: number | string | Record<string, string>) =>
+      conn.write(JSON.stringify({ t: "ask", id, tool, input: { file_path: "/tmp/x" } }) + "\n");
+
+    // The frame is untrusted.  A number used to throw out of the socket
+    // listener (`tool.replace is not a function` in fileWritePaths), after the
+    // ask was already pending, which takes the server process down.
+    ask("bad-number", 123);
+    ask("bad-object", { name: "Write" });
+    ask("bad-empty", "");
+    ask("after", "Write");
+    const opened = async (id: string) => recorder.until((e) => e.type === "request.opened" && e.requestId === id);
+
+    for (const id of ["bad-number", "bad-object", "bad-empty"]) {
+      const event = await opened(id);
+      expect(event).toMatchObject({ tool: "tool" });
+      expect(event).toHaveProperty("paths", undefined);
+    }
+    // the listener survived, and a real file tool afterwards is still read
+    expect(await opened("after")).toMatchObject({ tool: "Write", paths: ["/tmp/x"] });
+
+    conn.end();
+    await instance.adapter.interruptTurn("t-perm-badtool");
     await recorder.until((e) => e.type === "turn.completed");
   });
 
@@ -1472,10 +1996,14 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     await create();
     const dump = join(scratch, "review-isolation.json");
     process.env.FAKE_CLAUDE_DUMP = dump;
-    await expect(instance.reviewPermission?.("review this request")).resolves.toBe("fake generated text");
+    const prompt = { system: "You review one request.", data: "<action_to_review>\nreview this request\n</action_to_review>" };
+    await expect(instance.reviewPermission?.(prompt)).resolves.toBe("fake generated text");
     const seen = JSON.parse(readFileSync(dump, "utf8"));
-    expect(seen.prompt).toBe("review this request");
-    expect(seen.argv).not.toContain("review this request");
+    // the action under review goes on stdin only, never argv
+    expect(seen.prompt).toBe(prompt.data);
+    expect(seen.argv.some((arg: string) => arg.includes("review this request"))).toBe(false);
+    // the fixed brief rides as the system prompt
+    expect(seen.argv[seen.argv.indexOf("--append-system-prompt") + 1]).toBe(prompt.system);
     expect(seen.argv).toContain("--strict-mcp-config");
     expect(JSON.parse(seen.argv[seen.argv.indexOf("--mcp-config") + 1])).toEqual({ mcpServers: {} });
     expect(seen.argv[seen.argv.indexOf("--tools") + 1]).toBe("");
@@ -1493,12 +2021,40 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     });
     expect(recorder.events.filter((e) => e.type === "turn.completed")).toHaveLength(1);
     expect(recorder.events).toContainEqual(expect.objectContaining({ type: "runtime.error", message: expect.stringContaining("Update Claude Code") }));
+    // Negative control: the CLI runs but is too old — not a setup failure,
+    // so the event must NOT carry the setup flag the breaker keys on.
+    expect(
+      recorder.events.filter((e) => e.type === "runtime.error").every((e) => (e as { setup?: unknown }).setup !== true),
+    ).toBe(true);
     expect(recorder.events).toContainEqual(expect.objectContaining({ type: "turn.completed", ok: false, stopReason: "spawn_error" }));
     await expect(instance.generateText?.("title")).rejects.toThrow(/Update Claude Code/);
-    await expect(instance.reviewPermission?.("review")).rejects.toThrow(/Update Claude Code/);
+    await expect(instance.reviewPermission?.({ system: "brief", data: "review" })).rejects.toThrow(/Update Claude Code/);
     expect(existsSync(dump)).toBe(false);
     expect(readFileSync(probes, "utf8")).toBe("probe\n");
   });
+
+  // C2: a `--help` that only ran out of time on a busy Mac says nothing about
+  // the CLI's age, so the turn must not tell the user to update Claude Code.
+  it("fails a turn whose capability check timed out as a slow check, not as an outdated CLI", async () => {
+    process.env.FAKE_CLAUDE_HELP = "hang";
+    process.env.FAKE_CLAUDE_HELP_TIMEOUT_MS = "1500";
+    const dump = join(scratch, "unverified-must-not-dispatch.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+    try {
+      await create();
+      await expect(instance.adapter.sendTurn({ threadId: "t-help-timeout", text: "go" })).resolves.toMatchObject({
+        dispatched: false,
+      });
+      const errors = recorder.events.filter((e) => e.type === "runtime.error") as Array<{ message?: string; setup?: unknown }>;
+      expect(errors).toHaveLength(1);
+      expect(errors[0].message).toMatch(/did not answer in time/);
+      expect(errors[0].message).not.toMatch(/Update Claude Code/);
+      expect(errors[0].setup).not.toBe(true);
+      expect(existsSync(dump)).toBe(false);
+    } finally {
+      delete process.env.FAKE_CLAUDE_HELP_TIMEOUT_MS;
+    }
+  }, 60_000);
 
   it("reuses a successful capability probe across turns and helpers", async () => {
     const probes = join(scratch, "supported-help-probes");
@@ -1507,7 +2063,7 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     await instance.adapter.sendTurn({ threadId: "t-supported", text: "go" });
     await recorder.until((e) => e.type === "turn.completed");
     await instance.generateText?.("title");
-    await instance.reviewPermission?.("review");
+    await instance.reviewPermission?.({ system: "brief", data: "review" });
     expect(readFileSync(probes, "utf8")).toBe("probe\n");
   });
 
@@ -1530,7 +2086,7 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     await create();
     const controller = new AbortController();
     controller.abort();
-    await expect(instance.reviewPermission?.("review this request", controller.signal)).rejects.toThrow(/aborted/);
+    await expect(instance.reviewPermission?.({ system: "brief", data: "review this request" }, controller.signal)).rejects.toThrow(/aborted/);
   });
 
   it("declares the effort levels the CLI accepts", async () => {
@@ -1538,6 +2094,342 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     expect(instance.adapter.capabilities.effortLevels).toEqual([
       "low", "medium", "high", "xhigh", "max",
     ]);
+  });
+
+  describe("containment of engine-started work (jobs P0)", () => {
+    /** Resolves once the driver itself has dropped `count` more unsolicited
+     * frames — the point at which the next sendTurn is guaranteed to see
+     * them, which a marker file written by the fake cannot promise. */
+    const untilDropped = async (before: number, count: number) => {
+      const deadline = Date.now() + 15_000;
+      while (claudeUnsolicitedFrameStats().dropped - before < count) {
+        if (Date.now() > deadline) throw new Error(`only ${claudeUnsolicitedFrameStats().dropped - before} of ${count} unsolicited frames dropped`);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    };
+    const until = async (check: () => boolean, what: string) => {
+      const deadline = Date.now() + 15_000;
+      while (!check()) {
+        if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    };
+    const pidAlive = (pid: number) => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    /** Block this process's event loop until the fake has handed `count`
+     * results to the OS.  Nothing the CLI wrote can be read meanwhile — the
+     * harness on a loaded Mac, stalled for a second or two. */
+    const stallUntilResults = (mark: string, count: number) => {
+      const nap = new Int32Array(new SharedArrayBuffer(4));
+      const deadline = Date.now() + 30_000;
+      while (!existsSync(mark) || readFileSync(mark, "utf8").split("\n").filter(Boolean).length < count) {
+        if (Date.now() > deadline) throw new Error(`the fake never wrote ${count} result(s)`);
+        Atomics.wait(nap, 0, 0, 5);
+      }
+    };
+    const textOf = (events: readonly unknown[]) => JSON.stringify(events);
+    const repliesOf = (turnId: string) =>
+      recorder.events
+        .filter((e) => e.type === "item.completed" && e.itemType === "assistant_text" && e.turnId === turnId)
+        .map((e) => (e as { text: string }).text);
+
+    it("launches with native background work off, helpers capped, peer messages refused and self-starting tools denied", async () => {
+      // an inherited opt-out must not survive: these are a floor, not defaults;
+      // nor may a parent Claude Code session's messaging inbox
+      await create(undefined, {
+        CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "0",
+        CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS: "20",
+        CLAUDE_CODE_MESSAGING_SOCKET: "/tmp/parent-session.sock",
+        CLAUDE_CODE_MESSAGING_TOKEN: "parent-inbox-value",
+      });
+      const dump = join(scratch, "containment.json");
+      process.env.FAKE_CLAUDE_DUMP = dump;
+
+      await instance.adapter.sendTurn({ threadId: "t-contain-env", text: "hi" });
+      await recorder.until((e) => e.type === "turn.completed");
+
+      const seen = JSON.parse(readFileSync(dump, "utf8"));
+      expect(seen.env).toMatchObject(CLAUDE_CONTAINMENT_ENV);
+      expect(seen.env).toMatchObject({
+        CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1",
+        CLAUDE_CODE_DISABLE_CRON: "1",
+        CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS: "3",
+        CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH: "1",
+      });
+      expect(seen.env.CLAUDE_CODE_MESSAGING_SOCKET).toBeUndefined();
+      expect(seen.env.CLAUDE_CODE_MESSAGING_TOKEN).toBeUndefined();
+      const denied = String(seen.argv[seen.argv.indexOf("--disallowedTools") + 1]).split(",");
+      expect(denied).toEqual(["ScheduleWakeup", "CronCreate", "CronDelete", "CronList", "Monitor", "Workflow"]);
+      expect(JSON.parse(String(seen.argv[seen.argv.indexOf("--settings") + 1]))).toEqual({ crossSessionInbound: "refuse" });
+      expect(CLAUDE_CONTAINMENT_SETTINGS).toEqual({ crossSessionInbound: "refuse" });
+    });
+
+    it("denies every self-starting tool whatever the bot's tool list says, `default` included", async () => {
+      expect(claudeDisallowedTools({ disallowedTools: ["Edit"] })).toEqual(["Edit", ...CLAUDE_CONTAINMENT_DISALLOWED_TOOLS]);
+      expect(claudeDisallowedTools({})).toEqual([...CLAUDE_CONTAINMENT_DISALLOWED_TOOLS]);
+      expect(claudeDisallowedTools({ disallowedTools: ["Monitor"] })).toEqual([
+        "Monitor", "ScheduleWakeup", "CronCreate", "CronDelete", "CronList", "Workflow",
+      ]);
+
+      // `--tools default` is every built-in, Monitor and Workflow included
+      await create(undefined, {}, { tools: ["default"] });
+      const dump = join(scratch, "tools-default.json");
+      process.env.FAKE_CLAUDE_DUMP = dump;
+      await instance.adapter.sendTurn({ threadId: "t-tools-default", text: "hi" });
+      await recorder.until((e) => e.type === "turn.completed");
+      const seen = JSON.parse(readFileSync(dump, "utf8"));
+      expect(seen.argv[seen.argv.indexOf("--tools") + 1]).toBe("default");
+      expect(String(seen.argv[seen.argv.indexOf("--disallowedTools") + 1]).split(",")).toEqual(
+        expect.arrayContaining(["Monitor", "Workflow", "ScheduleWakeup"]),
+      );
+    });
+
+    it("reports emulated background jobs and typed helpers", async () => {
+      await create();
+      // jobs P2: BotFleet's own job tools reach Claude over the `agents` MCP
+      // server, so the capability is `emulated` — not Claude's own background
+      // work, which stays contained off (`--disallowedTools` above).
+      expect(instance.adapter.capabilities.backgroundJobs).toBe("emulated");
+      expect(instance.adapter.capabilities.helpers).toBe("typed");
+    });
+
+    it("drops a turn the CLI starts on its own after the turn settled, stops the process, and resumes in a fresh one", async () => {
+      await create("ghost-turn");
+      const prompts = join(scratch, "ghost-prompts.jsonl");
+      const dump = join(scratch, "ghost-relaunch.json");
+      process.env.FAKE_CLAUDE_PROMPTS = prompts;
+      const before = claudeUnsolicitedFrameStats();
+
+      const first = await instance.adapter.sendTurn({ threadId: "t-ghost", text: "start the build" });
+      const firstDone = await recorder.until((e) => e.type === "turn.completed" && e.turnId === first.turnId);
+      await until(() => claudeUnsolicitedFrameStats().turns > before.turns, "the CLI's own turn to be dropped");
+      // hiding the turn is not enough: its tools would still run, so the
+      // process that started it is stopped
+      const firstPid = promptsSent(prompts)[0]!.pid;
+      await until(() => !pidAlive(firstPid), "the CLI that started a turn of its own to stop");
+
+      process.env.FAKE_CLAUDE_DUMP = dump;
+      const announced = (recorder.events.find((e) => e.type === "session.started") as { sessionId: string }).sessionId;
+      const second = await instance.adapter.sendTurn({ threadId: "t-ghost", text: "and now?", resumeCursor: announced });
+      await recorder.until((e) => e.type === "turn.completed" && e.turnId === second.turnId);
+
+      // nothing the CLI said on its own reached the event stream, under any id
+      expect(textOf(recorder.events)).not.toContain("GHOST");
+      expect(textOf(recorder.events)).not.toContain("ghost-tu-1");
+      // and nothing at all between the first turn's end and the second's start:
+      // no event carried the settled turn's id, or any other
+      const firstEnd = recorder.events.indexOf(firstDone);
+      const secondStart = recorder.events.findIndex((e) => e.type === "turn.started" && e.turnId === second.turnId);
+      expect(secondStart).toBeGreaterThan(firstEnd);
+      expect(recorder.events.slice(firstEnd + 1, secondStart)).toEqual([]);
+      expect(recorder.events.filter((e) => e.type === "turn.completed")).toHaveLength(2);
+      const pids = promptsSent(prompts).map((p) => p.pid);
+      expect(pids).toHaveLength(2);
+      expect(pids[1]).not.toBe(pids[0]);
+      const relaunch = JSON.parse(readFileSync(dump, "utf8"));
+      expect(relaunch.argv[relaunch.argv.indexOf("--resume") + 1]).toBe(announced);
+    });
+
+    it("stops a CLI whose own turn is still running, and never writes the next message into it", async () => {
+      await create("ghost-running");
+      const prompts = join(scratch, "ghost-running-prompts.jsonl");
+      process.env.FAKE_CLAUDE_PROMPTS = prompts;
+      const before = claudeUnsolicitedFrameStats();
+
+      const first = await instance.adapter.sendTurn({ threadId: "t-ghost-running", text: "start the build" });
+      await recorder.until((e) => e.type === "turn.completed" && e.turnId === first.turnId);
+      await until(() => claudeUnsolicitedFrameStats().turns > before.turns, "the CLI's own turn to be dropped");
+      const firstPid = promptsSent(prompts)[0]!.pid;
+      await until(() => !pidAlive(firstPid), "the CLI that started a turn of its own to stop");
+
+      const announced = (recorder.events.find((e) => e.type === "session.started") as { sessionId: string }).sessionId;
+      const second = await instance.adapter.sendTurn({ threadId: "t-ghost-running", text: "and now?", resumeCursor: announced });
+      await recorder.until((e) => e.type === "turn.completed" && e.turnId === second.turnId);
+
+      const pids = promptsSent(prompts).map((p) => p.pid);
+      expect(pids).toHaveLength(2);
+      expect(pids[0]).not.toBe(pids[1]);
+      expect(textOf(recorder.events)).not.toContain("GHOST");
+      expect(recorder.events.filter((e) => e.type === "turn.completed")).toHaveLength(2);
+    });
+
+    it("keeps a turn the CLI runs ahead of this turn's message out of it, and bills only this turn's share", async () => {
+      // The race a warm process cannot rule out: the CLI started a turn of
+      // its own just before the next message arrived, so that turn's
+      // frames — and its result, with nothing queued — come first.
+      await create("ghost-ahead");
+      const first = await instance.adapter.sendTurn({ threadId: "t-ghost-ahead", text: "one" });
+      const firstDone = await recorder.until((e) => e.type === "turn.completed" && e.turnId === first.turnId);
+      const before = claudeUnsolicitedFrameStats();
+
+      const second = await instance.adapter.sendTurn({ threadId: "t-ghost-ahead", text: "two" });
+      const secondDone = await recorder.until((e) => e.type === "turn.completed" && e.turnId === second.turnId);
+
+      expect(textOf(recorder.events)).not.toContain("GHOST");
+      expect(textOf(recorder.events)).not.toContain("ghost-tu-1");
+      expect(repliesOf(second.turnId)).toEqual(["hello from fake claude"]);
+      // settled on its own result, not the CLI's: the reply came first
+      const reply = recorder.events.findIndex((e) => e.type === "item.completed" && e.itemType === "assistant_text" && e.turnId === second.turnId);
+      expect(reply).toBeLessThan(recorder.events.indexOf(secondDone));
+      expect(recorder.events.filter((e) => e.type === "turn.completed")).toHaveLength(2);
+      expect(claudeUnsolicitedFrameStats().foreignResults).toBe(before.foreignResults + 1);
+      // the CLI's running total went 0.01 → 0.03 (its own turn) → 0.04
+      expect((firstDone as { cost: number }).cost).toBeCloseTo(0.01, 10);
+      expect((secondDone as { cost: number }).cost).toBeCloseTo(0.01, 10);
+    });
+
+    it("never settles on a result the CLI's own turn wrote, even with nothing queued, on a CLI without lifecycle frames", async () => {
+      process.env.FAKE_CLAUDE_LIFECYCLE = "0";
+      await create("ghost-ahead");
+      const first = await instance.adapter.sendTurn({ threadId: "t-ghost-ahead-old", text: "one" });
+      await recorder.until((e) => e.type === "turn.completed" && e.turnId === first.turnId);
+      const before = claudeUnsolicitedFrameStats();
+
+      const second = await instance.adapter.sendTurn({ threadId: "t-ghost-ahead-old", text: "two" });
+      const secondDone = await recorder.until((e) => e.type === "turn.completed" && e.turnId === second.turnId);
+
+      expect(secondDone).toMatchObject({ ok: true, stopReason: "end_turn" });
+      // its own reply arrived before it settled
+      expect(repliesOf(second.turnId).at(-1)).toBe("hello from fake claude");
+      const reply = recorder.events.findLastIndex((e) => e.type === "item.completed" && e.itemType === "assistant_text");
+      expect(reply).toBeLessThan(recorder.events.indexOf(secondDone));
+      expect(recorder.events.filter((e) => e.type === "turn.completed")).toHaveLength(2);
+      expect(claudeUnsolicitedFrameStats().foreignResults).toBe(before.foreignResults + 1);
+      expect((secondDone as { cost: number }).cost).toBeCloseTo(0.01, 10);
+    });
+
+    it("refuses a permission ask from a turn the CLI runs ahead of this turn's message, without a card", { timeout: 60_000 }, async () => {
+      await create("ghost-ahead-hang");
+      const threadId = "t-ghost-ask";
+      const first = await instance.adapter.sendTurn({ threadId, text: "one" });
+      await recorder.until((e) => e.type === "turn.completed" && e.turnId === first.turnId);
+      const before = claudeUnsolicitedFrameStats();
+
+      await instance.adapter.sendTurn({ threadId, text: "two" });
+      // task_notification, init, delta, assistant: the CLI's own turn is at its tool call
+      await untilDropped(before.dropped, 4);
+      const conn = await connectSocket(permissionSocketPath(threadId));
+      const nextAnswer = answerQueue(conn);
+      conn.write(JSON.stringify({ t: "ask", id: "ghost-ask-1", tool: "Bash", input: { command: "cat /tmp/bg-task-1.output" } }) + "\n");
+      const answer = await nextAnswer();
+
+      expect(answer).toMatchObject({ id: "ghost-ask-1", behavior: "deny" });
+      expect(recorder.events.some((e) => e.type === "request.opened")).toBe(false);
+      conn.end();
+      await instance.adapter.interruptTurn(threadId);
+      await recorder.until((e) => e.type === "turn.completed" && e.turnId !== first.turnId);
+    });
+
+    it("answers a steer written after the CLI wrote the turn's result but before the harness read it", async () => {
+      await create();
+      const mark = join(scratch, "results.mark");
+      process.env.FAKE_CLAUDE_RESULT_MARK = mark;
+      const before = claudeUnsolicitedFrameStats();
+      const threadId = "t-late-steer";
+      const { turnId } = await instance.adapter.sendTurn({ threadId, text: "first" });
+
+      // the whole turn, its result included, now sits unread in the pipe
+      stallUntilResults(mark, 1);
+      await expect(instance.adapter.steer!(threadId, "late steer")).resolves.toBe(true);
+      const done = await recorder.until((e) => e.type === "turn.completed");
+
+      // the CLI ran the steer as a turn of its own after that result; its
+      // reply is this turn's, and the turn stayed open for it
+      expect(repliesOf(turnId)).toEqual(["hello from fake claude", "hello from fake claude"]);
+      expect(done).toMatchObject({ turnId, ok: true });
+      expect((done as { cost: number }).cost).toBeCloseTo(0.02, 10);
+      expect(recorder.events.filter((e) => e.type === "turn.completed")).toHaveLength(1);
+      expect(claudeUnsolicitedFrameStats().turns).toBe(before.turns);
+    });
+
+    for (const lifecycle of ["1", "0"] as const) {
+      it(`keeps a turn open across a steer the CLI queued behind its result, and bills both (lifecycle ${lifecycle})`, async () => {
+        process.env.FAKE_CLAUDE_LIFECYCLE = lifecycle;
+        const prompts = join(scratch, `queued-steer-${lifecycle}.jsonl`);
+        const gate = join(scratch, `queued-steer-${lifecycle}.gate`);
+        process.env.FAKE_CLAUDE_PROMPTS = prompts;
+        process.env.FAKE_CLAUDE_GATE = gate;
+        await create("queued-steer");
+        const threadId = `t-queued-steer-${lifecycle}`;
+        const { turnId } = await instance.adapter.sendTurn({ threadId, text: "first" });
+        await recorder.until((e) => e.type === "session.started");
+        await expect(instance.adapter.steer!(threadId, "second")).resolves.toBe(true);
+        // the CLI has read the steer mid-turn; now let the turn end
+        await until(() => promptsSent(prompts).length === 2, "the fake to read the steer");
+        writeFileSync(gate, "");
+        const done = await recorder.until((e) => e.type === "turn.completed");
+
+        expect(recorder.events.filter((e) => e.type === "turn.completed")).toHaveLength(1);
+        expect(repliesOf(turnId)).toEqual(["reply to: first", "reply to: second"]);
+        expect(done).toMatchObject({ turnId, ok: true, usage: { input: 28, output: 6, cachedInput: 8 } });
+        // running totals 0.01 then 0.02: the turn cost 0.02, not 0.03
+        expect((done as { cost: number }).cost).toBeCloseTo(0.02, 10);
+      });
+    }
+
+    it("bills each turn its own share of the CLI's running total, across warm and resumed processes", async () => {
+      await create();
+      const threadId = "t-running-cost";
+      const one = await instance.adapter.sendTurn({ threadId, text: "one" });
+      const oneDone = await recorder.until((e) => e.type === "turn.completed" && e.turnId === one.turnId);
+      const announced = (recorder.events.find((e) => e.type === "session.started") as { sessionId: string }).sessionId;
+      // warm: the CLI reports 0.02, the turn cost 0.01
+      const two = await instance.adapter.sendTurn({ threadId, text: "two" });
+      const twoDone = await recorder.until((e) => e.type === "turn.completed" && e.turnId === two.turnId);
+      // a new process resumed on the session continues from its saved total: 0.03
+      const three = await instance.adapter.sendTurn({ threadId, text: "three", resumeCursor: announced, effort: "high" });
+      const threeDone = await recorder.until((e) => e.type === "turn.completed" && e.turnId === three.turnId);
+      for (const done of [oneDone, twoDone, threeDone]) expect((done as { cost: number }).cost).toBeCloseTo(0.01, 10);
+
+      // a harness that never saw this session cannot know its earlier total:
+      // the turn's cost is unknown, never the whole conversation's
+      recorder.stop();
+      await instance.dispose();
+      process.env.FAKE_CLAUDE_MODE = "happy";
+      await create();
+      const four = await instance.adapter.sendTurn({ threadId, text: "four", resumeCursor: announced });
+      const fourDone = await recorder.until((e) => e.type === "turn.completed" && e.turnId === four.turnId);
+      expect(fourDone).toMatchObject({ ok: true, cost: null });
+    });
+
+    it("nests a helper's steps under the call that started it and keeps its prose out of the reply", async () => {
+      await create("helpers");
+      await instance.adapter.sendTurn({ threadId: "t-helpers", text: "survey" });
+      await recorder.until((e) => e.type === "turn.completed");
+
+      const started = recorder.events.filter(
+        (e): e is Extract<RuntimeEvent, { type: "item.started" }> =>
+          e.type === "item.started" && e.itemType === "tool",
+      );
+      expect(started.map((e) => e.itemId)).toEqual(["task-1", "helper-read-1"]);
+      expect(started[0]?.parentItemId).toBeUndefined();
+      expect(started[0]?.subagentId).toBeUndefined();
+      expect(started[1]).toMatchObject({ title: "Read", parentItemId: "task-1", subagentId: "task-1" });
+      // the helper's step still completes like any other
+      expect(recorder.events.some((e) => e.type === "item.completed" && e.itemType === "tool" && e.itemId === "helper-read-1")).toBe(true);
+      // the helper talking to its parent is not the bot talking to anyone
+      const replies = recorder.events.filter((e) => e.type === "item.completed" && e.itemType === "assistant_text");
+      expect(replies.map((e) => (e as { text: string }).text)).toEqual(["all done"]);
+      expect(textOf(recorder.events)).not.toContain("HELPER NARRATION");
+      // nor is the helper's context the bot's: no usage report carries it
+      const usage = recorder.events.filter((e) => e.type === "thread.token-usage.updated");
+      expect(usage.some((e) => (e as { input: number }).input === 999)).toBe(false);
+      // the helper's own bill lands on its card, not on the bot's meter.
+      // the fake repeats the assistant frame, and both carry message id
+      // msg-helper-1, so the card is billed once
+      const billed = recorder.events.filter((e) => e.type === "item.updated" && e.itemId === "task-1");
+      expect(billed).toHaveLength(1);
+      expect(billed[0]).toMatchObject({
+        subagentId: "task-1",
+        tokens: 1098,
+      });
+    });
   });
 });
 
@@ -1567,6 +2459,7 @@ describe("ClaudeDriver snapshot auth (fake CLI)", () => {
 
   afterEach(async () => {
     delete process.env.FAKE_CLAUDE_AUTH;
+    delete process.env.FAKE_CLAUDE_AUTH_TIMEOUT_MS;
     delete process.env.FAKE_CLAUDE_HELP;
     delete process.env.FAKE_CLAUDE_HELP_PROBES;
     delete process.env.FAKE_CLAUDE_VERSION;
@@ -1623,4 +2516,93 @@ describe("ClaudeDriver snapshot auth (fake CLI)", () => {
     process.env.ANTHROPIC_API_KEY = "sk-should-not-leak";
     expect(await instance.snapshot()).toMatchObject({ state: "available", authenticated: false });
   });
+
+  // The owner's "Sign in to Claude" callout on a signed-in Mac: `auth status`
+  // ran past its budget under load, and the timeout read as a sign-out.
+  it("keeps the last known sign-in when an auth probe runs out of time", async () => {
+    await create();
+    process.env.FAKE_CLAUDE_AUTH = "in";
+    expect(await instance.snapshot()).toMatchObject({ state: "available", authenticated: true });
+
+    // Only the hanging probe gets the short budget: on a loaded machine the
+    // fake CLI itself can take seconds to start.
+    process.env.FAKE_CLAUDE_AUTH_TIMEOUT_MS = "1500";
+    process.env.FAKE_CLAUDE_AUTH = "hang";
+    const slow = await instance.snapshot();
+    expect(slow).toMatchObject({ state: "available", authenticated: true });
+
+    // A definitive answer still wins over the remembered one.
+    delete process.env.FAKE_CLAUDE_AUTH_TIMEOUT_MS;
+    process.env.FAKE_CLAUDE_AUTH = "out";
+    expect(await instance.snapshot()).toMatchObject({ state: "available", authenticated: false });
+  }, 60_000);
+
+  it("reports sign-in as unknown, never false, when the first auth probe gets no answer", async () => {
+    process.env.FAKE_CLAUDE_AUTH_TIMEOUT_MS = "1500";
+    process.env.FAKE_CLAUDE_AUTH = "hang";
+    await create();
+    const snapshot = await instance.snapshot();
+    expect(snapshot.state).toBe("available");
+    expect(snapshot.authenticated).toBeUndefined();
+  }, 60_000);
+});
+
+/** A CLI whose `--version` answers while `ok` exists and otherwise dies the
+ *  way the test asks (`mode`: exit or crash), so a test can take an engine
+ *  from working to broken between two snapshots. */
+function switchableCli(dir: string): { cli: string; setWorking: (working: boolean) => void; setMode: (mode: "exit" | "crash") => void } {
+  const cli = join(dir, "switchable-cli");
+  writeFileSync(
+    cli,
+    [
+      // A node-shebang script: env-path resolves it to `node <script>` on
+      // Windows, where a `#!/bin/sh` fixture cannot run at all.
+      "#!/usr/bin/env node",
+      'const fs = require("node:fs");',
+      `const dir = ${JSON.stringify(dir)};`,
+      'if (fs.existsSync(dir + "/ok")) { console.log("9.9.9"); process.exit(0); }',
+      'if (fs.readFileSync(dir + "/mode", "utf8") === "crash") process.kill(process.pid, "SIGSEGV");',
+      "process.exit(3)",
+      "",
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+  writeFileSync(join(dir, "mode"), "exit");
+  return {
+    cli,
+    setWorking: (working) => {
+      if (working) writeFileSync(join(dir, "ok"), "");
+      else rmSync(join(dir, "ok"), { force: true });
+    },
+    setMode: (mode) => writeFileSync(join(dir, "mode"), mode),
+  };
+}
+
+describe("Claude version reuse", () => {
+  // A SIGSEGV crash has no Windows equivalent: POSIX only.
+  for (const mode of (process.platform === "win32" ? (["exit"] as const) : (["exit", "crash"] as const))) {
+    it(`does not keep reporting the last version once the binary ${mode === "crash" ? "crashes" : "fails"} definitively`, async () => {
+      const dir = mkdtempSync(join(tmpdir(), "omb-switch-"));
+      const cli = switchableCli(dir);
+      const instance = await ClaudeDriver.create({
+        instanceId: `switch-${mode}`,
+        displayName: undefined,
+        environment: {},
+        enabled: true,
+        config: { cli: cli.cli, permissionMode: "acceptEdits" },
+      });
+      cli.setWorking(true);
+      await instance.snapshot();
+      cli.setWorking(false);
+      cli.setMode(mode);
+      const second = await instance.snapshot();
+      expect(second.state).toBe("unavailable");
+      expect(second.transient).toBeUndefined();
+      expect(second.version).toBeUndefined();
+      // The verdict is the failed version probe itself, not a later step run on a stale version.
+      expect(second.reason).toMatch(/--version/);
+      await instance.dispose();
+      rmSync(dir, { recursive: true, force: true });
+    });
+  }
 });

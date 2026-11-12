@@ -8,18 +8,33 @@
 //   - Composio Sessions (connected apps → tools) over streamable HTTP
 //   - the bot's cloud computer (box.ascii.dev) via server/computer-proxy.ts
 //     — screenshot/exec/open_url, the CUA-on-the-box bridge
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
-import { createServer as createNetServer } from "node:net";
+import { createServer as createNetServer, type Socket } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 
-import { DATA_DIR, stripWorkspaceCredentialEnv } from "../config.ts";
+import { z } from "zod";
+
+import { claudeSessionIdleMs, DATA_DIR, loadConfig, stripWorkspaceCredentialEnv } from "../config.ts";
+import { ClaudeSingleCallLedger } from "../claude-billed-call.ts";
 import { stderrExcerpt } from "../stderr-excerpt.ts";
 import { augmentedPath } from "../env-path.ts";
+import { fileWritePaths } from "../auto-approve.ts";
 import { toolFields } from "../tool-fields.ts";
 import { describeResult } from "../../shared/tool-activity.ts";
-import { brokerSocketPath, describeSpawnFailure, execCli, killCliTree, spawnCli } from "../procs.ts";
+import { captureInput, captureOutput } from "../../shared/item-io.ts";
+import {
+  brokerSocketPath,
+  classifyVersionProbeFailure,
+  describeSpawnFailure,
+  execCli,
+  isProbeTimeout,
+  killCliTree,
+  LastKnownAnswer,
+  logProbeFailure,
+  spawnCli,
+} from "../procs.ts";
 
 import type {
   DriverCreateInput,
@@ -36,6 +51,7 @@ export { STATIC_CLAUDE_MODELS };
 import { computerProxyEnv } from "../container-computer.ts";
 import { hostToolPrefix, turnComputerMounts } from "../computer-grants.ts";
 import { newEventId, newId } from "../contracts.ts";
+import { cliLoginEnvironment, launchedChildEnvironment, primeCliLogin } from "../cli-logins.ts";
 import { classifyError, computeBackoff, interruptibleDelay, RETRY_MAX_ATTEMPTS } from "./retry.ts";
 import {
   applyClaudeInject,
@@ -45,6 +61,7 @@ import {
   resolveInjectId,
 } from "./local-inject.ts";
 import { appendNative } from "./native.ts";
+import { engineCommandText, neutralizeLeadingSlash, normalizeAnnouncedCommands } from "./engine-commands.ts";
 import {
   clearPromptSplitReceipt,
   EMPTY_FINGERPRINT,
@@ -56,6 +73,7 @@ import {
   writePromptSplitReceipt,
   type PromptSplitReceipt,
 } from "./prompt-split.ts";
+import type { ReviewPrompt } from "../../shared/auto-review.ts";
 import { SPAWNED_PROXIES } from "../proxy-paths.ts";
 
 /** How the volatile half of the system prompt (memory, mentions) reaches a
@@ -84,30 +102,227 @@ function sweepReceiptsOnce(): void {
   }
 }
 
-/** Whether `claude` has been signed in.
+/** How long `claude auth status --json` may take: the same budget as
+ * `--version`.  On a busy Mac it measured 5-12 s, past the old 8 s budget, and
+ * every probe that ran out of time used to read as a sign-out. */
+export const CLAUDE_AUTH_TIMEOUT_MS = 20_000;
+
+function claudeAuthTimeoutMs(): number {
+  // Test fixtures shorten the budget so a hanging fake CLI costs a second,
+  // not twenty.
+  const override = Number(process.env.FAKE_CLAUDE_AUTH_TIMEOUT_MS);
+  return Number.isFinite(override) && override > 0 ? override : CLAUDE_AUTH_TIMEOUT_MS;
+}
+
+/** How long `claude --help` may take when checking for --strict-mcp-config. */
+const CLAUDE_HELP_TIMEOUT_MS = 10_000;
+
+function claudeHelpTimeoutMs(): number {
+  // Test fixtures shorten this too, for the same reason.
+  const override = Number(process.env.FAKE_CLAUDE_HELP_TIMEOUT_MS);
+  return Number.isFinite(override) && override > 0 ? override : CLAUDE_HELP_TIMEOUT_MS;
+}
+
+/** `loggedIn` from `claude auth status --json`, or undefined when stdout is
+ * not that document. */
+function parseClaudeLoggedIn(stdout: string | undefined): boolean | undefined {
+  try {
+    const status: unknown = JSON.parse(stdout ?? "");
+    if (typeof status !== "object" || status === null) return undefined;
+    return "loggedIn" in status && status.loggedIn === true;
+  } catch {
+    return undefined;
+  }
+}
+
+/** How often `claudeSignedIn` may attempt to renew an idle 8h access token
+ * via `claude -p "/usage"`.  Matches CodeCaps: renewal is single-flight and at
+ * most once every 10 minutes, avoiding token refresh storms. */
+export const CLAUDE_RENEW_COOLDOWN_MS = 10 * 60_000;
+
+export const CLAUDE_RENEW_ARGS = [
+  "-p",
+  "--settings",
+  '{"disableAllHooks":true}',
+  "--strict-mcp-config",
+  "--no-session-persistence",
+  "--output-format",
+  "json",
+  "/usage",
+] as const;
+
+let lastRenewalAttempt = 0;
+let inFlightRenewal: Promise<boolean> | null = null;
+
+export function resetClaudeRenewalThrottleForTesting(): void {
+  lastRenewalAttempt = 0;
+  inFlightRenewal = null;
+}
+
+/** Checks if the /usage response indicates successful token refresh. */
+export function parseClaudeRenewalSuccess(stdout: string | undefined): boolean {
+  try {
+    const res: unknown = JSON.parse(stdout ?? "");
+    if (typeof res !== "object" || res === null) return false;
+    return "is_error" in res && (res as { is_error: boolean }).is_error === false;
+  } catch {
+    return false;
+  }
+}
+
+function attemptClaudeRenewal(
+  cli: string,
+  env: NodeJS.ProcessEnv,
+  run: typeof execCli,
+  timeoutMs: number,
+): Promise<boolean> {
+  if (inFlightRenewal) return inFlightRenewal;
+  inFlightRenewal = new Promise<boolean>((resolve) => {
+    run(cli, [...CLAUDE_RENEW_ARGS], { timeout: timeoutMs, env }, (err, stdout) => {
+      if (err || !stdout) return resolve(false);
+      resolve(parseClaudeRenewalSuccess(stdout));
+    });
+  }).finally(() => {
+    inFlightRenewal = null;
+  });
+  return inFlightRenewal;
+}
+
+/** Whether `claude` has been signed in: true, false, or undefined when the
+ * probe could not tell.
  *
- * Credential storage is deliberately not inspected here. Claude Code uses the
+ * Credential storage is deliberately not inspected here.  Claude Code uses the
  * macOS Keychain for OAuth, a JSON file on some platforms, and may gain other
- * backends over time. Presence checks also accept stale credentials. The CLI's
+ * backends over time.  Presence checks also accept stale credentials.  The CLI's
  * own machine-readable auth command is the source of truth for every backend.
+ *
+ * The answer is three-valued because a probe that ran out of time is not a
+ * sign-out.  Parsed JSON is definitive whatever the exit code: a genuinely
+ * signed-out CLI exits 1 AND prints `{"loggedIn":false}`.  However, Claude Code's
+ * 8-hour access token expires whenever the CLI sits idle, even while its ~28-day
+ * refresh token remains valid.  Because `claude auth status` does NOT refresh
+ * the token, a raw `auth status` returns `loggedIn:false` on every idle wake.
+ * When `loggedIn:false` is reported, this driver makes Claude Code renew its own
+ * credentials via a zero-cost `claude -p "/usage"` call before concluding that
+ * the user is signed out.
+ *
+ * Only a timeout or kill — no answer at all — is undefined, and the caller
+ * keeps whatever it last knew.
  */
 export function claudeSignedIn(
   cli: string,
   env: NodeJS.ProcessEnv,
   run: typeof execCli = execCli,
-): Promise<boolean> {
+  timeoutMs: number = claudeAuthTimeoutMs(),
+  allowRenew: boolean = true,
+): Promise<boolean | undefined> {
   return new Promise((resolve) => {
-    run(cli, ["auth", "status", "--json"], { timeout: 8000, env }, (_error, stdout) => {
-      try {
-        const status: unknown = JSON.parse(stdout);
-        resolve(
-          typeof status === "object" && status !== null && "loggedIn" in status && status.loggedIn === true,
-        );
-      } catch {
-        resolve(false);
+    const startedAt = Date.now();
+    run(cli, ["auth", "status", "--json"], { timeout: timeoutMs, env }, async (error, stdout) => {
+      const answer = parseClaudeLoggedIn(stdout);
+      if (answer === true) return resolve(true);
+
+      const elapsed = Date.now() - startedAt;
+      if (answer === undefined && (isProbeTimeout(error) || (!stdout?.trim() && elapsed >= timeoutMs))) {
+        logProbeFailure("claude", `${cli} auth status --json`, error, elapsed);
+        return resolve(undefined);
       }
+
+      // If auth status reported false and renewal has not been tried recently,
+      // ask Claude Code to renew its own 8h token using its valid refresh token.
+      if (allowRenew && answer === false && Date.now() - lastRenewalAttempt > CLAUDE_RENEW_COOLDOWN_MS) {
+        lastRenewalAttempt = Date.now();
+        const renewed = await attemptClaudeRenewal(cli, env, run, timeoutMs);
+        if (renewed) {
+          const rechecked = await claudeSignedIn(cli, env, run, timeoutMs, false);
+          return resolve(rechecked ?? true);
+        }
+      }
+
+      resolve(false);
     });
   });
+}
+
+/** Engine-native work that outlives a turn, switched off (background jobs P0,
+ * docs/plans/2026-10-01-background-jobs-and-subagents-decision.md).
+ *
+ * A Claude bot could start a background shell or helper, end its turn, and
+ * have the CLI start a NEW turn on its own when that work finished.  That turn
+ * reached the transcript as a ghost message: no turn record, no watchdog, no
+ * spend accounting, and its approvals auto-denied.  Every name below was read
+ * out of the Claude Code 2.1.284 binary, not guessed, and the tool-list
+ * effects were checked against that build's `init` frame:
+ *
+ * - `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` drops `run_in_background` from the
+ *   Bash and Agent schemas and turns off auto-backgrounding of slow commands.
+ *   It removes no tool from the list.
+ * - `CLAUDE_CODE_DISABLE_CRON` stops the headless runner's scheduler, and
+ *   removes CronCreate, CronDelete and CronList from the tool list.  It does
+ *   NOT remove ScheduleWakeup, Monitor or Workflow: the deny list below does.
+ * - `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH` (default 3; the main thread is
+ *   depth 0 and a spawn is refused once depth >= the cap) holds native
+ *   helpers to one level.  2.1.284 enforces it as set.
+ * - `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS` (default 20) asks for at most 3
+ *   helpers at once.  It is ADVISORY: 2.1.284 skips the check when a
+ *   server-side feature gate (`tengu_amber_kestrel`) or ultracode mode is
+ *   on, and nothing outside the CLI can turn either off.  The helper card
+ *   (P3) shows the ones that did start.  It does not add a second cap:
+ *   the CLI's own check is still the only one, and it stays advisory.
+ *
+ * Forced over any inherited value: these are a safety floor, not defaults. */
+export const CLAUDE_CONTAINMENT_ENV = {
+  CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1",
+  CLAUDE_CODE_DISABLE_CRON: "1",
+  CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS: "3",
+  CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH: "1",
+} as const satisfies Record<string, string>;
+
+/** Settings every turn launches with (`--settings`, which outranks user and
+ * project settings; managed policy may only tighten it).
+ *
+ * `crossSessionInbound: "refuse"`: every Claude Code session on this machine
+ * listens on a messaging socket, and any other local session can send it a
+ * message (SendMessage).  In a headless process that message starts a turn
+ * of its own, with `origin.kind: "peer"`, and in a bypassPermissions
+ * (full-auto) bot it is delivered without any approval.  Probed on 2.1.284:
+ * a peer message to a bypass-mode stream-json process started a turn; the
+ * same message to one launched with this setting started nothing.  A bot
+ * takes work from its owner through BotFleet, never from a stranger's
+ * session. */
+export const CLAUDE_CONTAINMENT_SETTINGS = { crossSessionInbound: "refuse" } as const;
+
+/** Built-ins whose whole job is to start a turn later, with nobody's message
+ * behind it, denied outright:
+ *
+ * - ScheduleWakeup and CronCreate enqueue a prompt into the running process
+ *   when they fire (the headless runner's cron scheduler); CronList and
+ *   CronDelete only manage those jobs.  `CLAUDE_CODE_DISABLE_CRON` already
+ *   removes the three Cron tools; they stay here so a CLI that ignores the
+ *   switch still cannot reach them.
+ * - Monitor streams a background command's output back as notifications, and
+ *   is not gated by the background-tasks switch.
+ * - Workflow runs as a background task that reports back on completion, and
+ *   spawns helpers outside the cap above.
+ *
+ * BotFleet's own job tools (P1) replace all of this with turns it owns. */
+export const CLAUDE_CONTAINMENT_DISALLOWED_TOOLS: readonly string[] = [
+  "ScheduleWakeup",
+  "CronCreate",
+  "CronDelete",
+  "CronList",
+  "Monitor",
+  "Workflow",
+];
+
+/** The `--disallowedTools` list a turn launches with: the bot's own denials,
+ * then the whole containment set, always.  Filtering the set by the bot's
+ * `tools` list would trust that list to be literal names, and it is not:
+ * the CLI reads `--tools default` as every built-in.  Denying a tool the
+ * list does not offer is harmless (checked on 2.1.284 with `--tools ""` and
+ * `--tools Read`). */
+export function claudeDisallowedTools(config: Pick<ClaudeConfig, "disallowedTools">): string[] {
+  return [...new Set([...(config.disallowedTools ?? []), ...CLAUDE_CONTAINMENT_DISALLOWED_TOOLS])];
 }
 
 /** The CLI environment shared by auth probes and real turns.
@@ -124,13 +339,153 @@ function claudeEnvironment(
   const env: NodeJS.ProcessEnv = { ...source, PATH: augmentedPath(), NPM_CONFIG_LOGLEVEL: "error" };
   delete env.CLAUDECODE;
   delete env.CLAUDE_CODE_ENTRYPOINT;
+  // A harness started from inside a Claude Code session inherits that
+  // session's messaging inbox.  A bot's CLI is not that session.
+  delete env.CLAUDE_CODE_MESSAGING_SOCKET;
+  delete env.CLAUDE_CODE_MESSAGING_TOKEN;
   // The harness process may hold workspace credentials (xai/box/voice keys,
   // env-injected at boot); none of them are this CLI's to see.
   stripWorkspaceCredentialEnv(env);
   const applied = applyClaudeInject(env, model);
   if (!applied.injected) delete env.ANTHROPIC_API_KEY;
+  Object.assign(env, CLAUDE_CONTAINMENT_ENV);
   return env;
 }
+
+/** Frames and turns containment kept out of BotFleet's turns, counted for
+ * the harness's lifetime so a test, or a person reading logs, can see that
+ * it fired; never reset.
+ *
+ * - `dropped`: frames of a CLI turn BotFleet did not start.
+ * - `turns`: such turns that began with no BotFleet turn on the process
+ *   (each one stops the process).
+ * - `foreignResults`: such turns that ended while a BotFleet turn waited
+ *   behind them. */
+const unsolicitedFrames = { dropped: 0, turns: 0, foreignResults: 0 };
+export function claudeUnsolicitedFrameStats(): Readonly<typeof unsolicitedFrames> {
+  return { ...unsolicitedFrames };
+}
+
+/** The frames that mean the CLI is running a turn of its own.  Other system
+ * frames (hook progress, state changes, prompt suggestions) and the terminal
+ * lifecycle states of a command that already ran can legitimately follow a
+ * result and say nothing about a new turn. */
+function startsUnsolicitedTurn(frame: { type?: unknown; subtype?: unknown; state?: unknown }): boolean {
+  if (frame.type === "stream_event" || frame.type === "assistant" || frame.type === "user") return true;
+  if (frame.type === "command_lifecycle") return frame.state === "started";
+  return frame.type === "system" && (frame.subtype === "init" || frame.subtype === "task_notification");
+}
+
+type TurnUsage = {
+  input: number;
+  output: number;
+  cachedInput?: number;
+  /** Cache writes (5 minute TTL, or a TTL the CLI did not break down).  Like
+   *  `cachedInput`, a subset of `input`, so `input` still reads as the whole
+   *  context the turn sent. */
+  cacheWrite5m?: number;
+  /** Cache writes to the 1 hour cache; also a subset of `input`. */
+  cacheWrite1h?: number;
+};
+
+/** The slice of the CLI's `usage` object the cache-write split reads. */
+type CliUsage = {
+  cache_creation_input_tokens?: number;
+  cache_creation?: { ephemeral_5m_input_tokens?: number; ephemeral_1h_input_tokens?: number };
+};
+
+/** The cache-write share of one Anthropic `usage` object, split by TTL.
+ * `cache_creation` carries the 5 minute and 1 hour figures.  An older CLI
+ * reports only the flat `cache_creation_input_tokens`, which files under 5
+ * minutes (the shared usage schema's rule for a TTL nobody reported).  Empty
+ * when the usage reported no cache write. */
+export function cacheWritesOf(usage: CliUsage | undefined): { cacheWrite5m?: number; cacheWrite1h?: number } {
+  const count = (value: number | undefined) => (value != null && Number.isFinite(value) && value > 0 ? Math.round(value) : 0);
+  const fiveMinutes = count(usage?.cache_creation?.ephemeral_5m_input_tokens);
+  const oneHour = count(usage?.cache_creation?.ephemeral_1h_input_tokens);
+  const writes: { cacheWrite5m?: number; cacheWrite1h?: number } = {};
+  if (fiveMinutes > 0 || oneHour > 0) {
+    if (fiveMinutes > 0) writes.cacheWrite5m = fiveMinutes;
+    if (oneHour > 0) writes.cacheWrite1h = oneHour;
+    return writes;
+  }
+  const flat = count(usage?.cache_creation_input_tokens);
+  if (flat > 0) writes.cacheWrite5m = flat;
+  return writes;
+}
+
+/** Two reported usages as one, keeping the cache shares when either has them. */
+function sumUsage(a: TurnUsage | undefined, b: TurnUsage | undefined): TurnUsage | undefined {
+  if (!a) return b;
+  if (!b) return a;
+  const usage: TurnUsage = { input: a.input + b.input, output: a.output + b.output };
+  if (a.cachedInput !== undefined || b.cachedInput !== undefined) usage.cachedInput = (a.cachedInput ?? 0) + (b.cachedInput ?? 0);
+  if (a.cacheWrite5m !== undefined || b.cacheWrite5m !== undefined) usage.cacheWrite5m = (a.cacheWrite5m ?? 0) + (b.cacheWrite5m ?? 0);
+  if (a.cacheWrite1h !== undefined || b.cacheWrite1h !== undefined) usage.cacheWrite1h = (a.cacheWrite1h ?? 0) + (b.cacheWrite1h ?? 0);
+  return usage;
+}
+
+/** A short tag for a log line: enough to tell threads apart, never the id. */
+function threadTag(threadId: string): string {
+  return createHash("sha256").update(threadId).digest("hex").slice(0, 8);
+}
+
+/** The few fields containment reads off a raw stream-json frame, each
+ * dropped to undefined when the CLI sent something else.
+ *
+ * - `origin.kind` says where a result came from: `human` for a message on
+ *   stdin, anything else for a turn the CLI started itself
+ *   (`task-notification`, `peer`, `channel`, ...).  Absent on CLIs before
+ *   the field.
+ * - `queued_turn_count` counts user sends still waiting behind a result.
+ * - `total_cost_usd` is the PROCESS's running total, not the turn's.
+ * - `command_uuid` and `state` are a `command_lifecycle` frame's: the uuid
+ *   BotFleet stamped on a message it wrote, and how far the CLI got with it
+ *   (`queued`, `started` when a turn takes it, then one of `completed`,
+ *   `cancelled`, `discarded`, `refused`).
+ * - `user_message_uuid(s)` on a result (and on the first reply frame) name
+ *   the stamped messages that CLI turn consumed.
+ * - `parent_tool_use_id` names the Task/Agent call a helper frame belongs to. */
+const FrameMeta = z
+  .object({
+    subtype: z.string().optional().catch(undefined),
+    origin: z.object({ kind: z.string() }).optional().catch(undefined),
+    queued_turn_count: z.number().optional().catch(undefined),
+    total_cost_usd: z.number().optional().catch(undefined),
+    command_uuid: z.string().min(1).optional().catch(undefined),
+    state: z.string().optional().catch(undefined),
+    user_message_uuid: z.string().min(1).optional().catch(undefined),
+    user_message_uuids: z.array(z.string()).optional().catch(undefined),
+    parent_tool_use_id: z.string().min(1).optional().catch(undefined),
+    // the `system` `init` frame's catalog of the CLI's own slash commands
+    slash_commands: z.array(z.string()).optional().catch(undefined),
+  })
+  // a frame that is not an object at all carries none of them
+  .catch({});
+
+const assistantMessageIdSchema = z.object({ id: z.string().min(1) }).passthrough();
+
+/** How many helper tokens this frame adds.  Frames of one assistant message
+ * repeat a running total, so a later frame with the same id contributes only
+ * the increase.  A frame with no id has nothing to dedupe against. */
+export function helperUsageDelta(seen: Map<string, number> | undefined, messageId: string | undefined, total: number): number {
+  if (total <= 0) return 0;
+  if (!seen || !messageId) return total;
+  const prior = seen.get(messageId) ?? 0;
+  if (total < prior) {
+    // Engine reset: accept the new floor so the next non-decreasing frame
+    // is compared against the post-reset value, not the pre-reset peak.
+    seen.set(messageId, total);
+    return 0;
+  }
+  if (total === prior) return 0;
+  seen.set(messageId, total);
+  return total - prior;
+}
+
+/** Lifecycle states after which a command will never run (it may have run
+ * already, for `completed`). */
+const COMMAND_ENDED_STATES = new Set(["completed", "cancelled", "discarded", "refused"]);
 
 const DRIVER_KIND = "claudeAgent";
 const CLAUDE_ISOLATION_REASON = "Update Claude Code to a version supporting --strict-mcp-config and refresh engines; CLI isolation support could not be verified.";
@@ -235,6 +590,8 @@ interface Ask {
   tool: string;
   input: Record<string, unknown>;
   at: number;
+  /** The CLI's id for the tool_use being asked about, when it sent one. */
+  toolUseId?: string;
 }
 type AskBehavior = "allow" | "deny" | "answer";
 type AskResolutionSource = "user" | "timeout" | "system";
@@ -278,11 +635,21 @@ export function permissionSocketPath(threadId: string) {
   return brokerSocketPath(DATA_DIR, `${prefix}${digest}`);
 }
 
+/** How long an ask may wait for the turn it arrived in to show it is the
+ * BotFleet turn's own work (see `isActive`'s `"wait"`).  The turn's own
+ * frames are written seconds before any tool it calls asks, so this only
+ * covers an event-loop stall that delivers both in one tick. */
+const ASK_ADMISSION_WAIT_MS = 5_000;
+
 function createPermissionBroker(opts: {
   socketPath: string;
   onAsk: (ask: Ask) => void;
   onResolve: (resolved: Ask & { behavior: AskBehavior; source: AskResolutionSource }) => void;
-  isActive?: () => boolean;
+  /** Whether an ask arriving now belongs to a running BotFleet turn: `true`
+   *  opens a card, `false` answers it as ended, and `"wait"` holds it until
+   *  `recheck()` (or ASK_ADMISSION_WAIT_MS) decides — the CLI is running a
+   *  turn, but nothing has shown yet that it is the BotFleet turn's. */
+  isActive?: () => boolean | "wait";
   timeoutMs?: number;
 }) {
   const timeoutMs = opts.timeoutMs ?? 15 * 60_000;
@@ -290,6 +657,8 @@ function createPermissionBroker(opts: {
     string,
     { ask: Ask; finish: (behavior: AskBehavior, message: string | undefined, source: AskResolutionSource) => void }
   >();
+  /** Asks waiting for a `"wait"` verdict to resolve, in arrival order. */
+  const held: Array<{ conn: Socket; msg: any; askId: string; kind: Ask["kind"]; timer: ReturnType<typeof setTimeout> }> = [];
   // server.close() only stops accepting NEW connections — it does not touch
   // a connection that's already open. A still-alive child's MCP proxy can
   // keep sending asks on such a connection after the turn has ended, and
@@ -301,8 +670,84 @@ function createPermissionBroker(opts: {
   try {
     unlinkSync(opts.socketPath);
   } catch {}
+  const answerEnded = (conn: Socket, askId: string, kind: Ask["kind"]) => {
+    try {
+      conn.write(JSON.stringify({ t: "answer", id: askId, ...systemEndedReply(kind) }) + "\n");
+    } catch {}
+  };
+  const admit = (conn: Socket, msg: any, askId: string, kind: Ask["kind"]) => {
+    // `pending` is server-scoped, not per-connection: two asks with the
+    // same id — a buggy/adversarial client, never a legitimate retry
+    // (permission-proxy mints a fresh randomUUID per ask) — would
+    // otherwise let the second `pending.set` silently overwrite the
+    // first, orphaning it as an unanswerable card once the first
+    // resolves and deletes the shared key. Reject before either ask
+    // becomes visible to onAsk.
+    if (pending.has(askId)) {
+      // askId is client-controlled; JSON.stringify escapes newlines and
+      // control characters so it can't corrupt the log line or terminal.
+      console.error(`permission broker on ${opts.socketPath}: duplicate ask id ${JSON.stringify(askId)} — denying`);
+      try {
+        conn.write(JSON.stringify({ t: "answer", id: askId, behavior: "deny", message: DUPLICATE_ASK_ID_NOTE }) + "\n");
+      } catch {}
+      return;
+    }
+    // The frame is untrusted socket input.  A `tool` that is not a string
+    // (`{"t":"ask","tool":123}`) used to reach `fileWritePaths` in `onAsk`,
+    // whose first statement calls `tool.replace`; the throw came out of this
+    // socket listener, after the ask was already pending with a 15-minute
+    // timer, and an uncaught listener exception takes the server down.
+    // An unreadable name falls back to the generic "tool", the same name a
+    // frame with no tool at all has always carried.
+    const toolName = z.string().min(1).safeParse(msg.tool);
+    if (!toolName.success) {
+      console.warn("permission broker: non-string tool name on ask frame", toolName.error.issues);
+    }
+    const tool = toolName.success ? toolName.data : "tool";
+    const ask: Ask = {
+      id: askId,
+      kind,
+      tool,
+      input: msg.input ?? {},
+      at: Date.now(),
+      toolUseId: String(msg.toolUseId ?? "") || undefined,
+    };
+    const finish = (behavior: AskBehavior, message: string | undefined, source: AskResolutionSource) => {
+      if (!pending.delete(askId)) return;
+      clearTimeout(timer);
+      try {
+        conn.write(JSON.stringify({ t: "answer", id: askId, behavior, message }) + "\n");
+      } catch {}
+      opts.onResolve({ ...ask, behavior, source });
+    };
+    const timer = setTimeout(
+      () =>
+        kind === "question"
+          ? finish("answer", QUESTION_TIMEOUT_NOTE, "timeout")
+          : finish("deny", DENY_TIMEOUT_NOTE, "timeout"),
+      timeoutMs,
+    );
+    timer.unref?.();
+    pending.set(askId, { ask, finish });
+    opts.onAsk(ask);
+  };
+  /** Settle every held ask whose verdict is no longer `"wait"`; `force`
+   *  answers the rest as ended. */
+  const recheck = (force = false) => {
+    for (const entry of [...held]) {
+      const verdict = force || closed ? false : opts.isActive ? opts.isActive() : true;
+      if (verdict === "wait") continue;
+      held.splice(held.indexOf(entry), 1);
+      clearTimeout(entry.timer);
+      if (verdict) admit(entry.conn, entry.msg, entry.askId, entry.kind);
+      else answerEnded(entry.conn, entry.askId, entry.kind);
+    }
+  };
   const server = createNetServer((conn) => {
     conn.on("error", () => {});
+    // An ask carries the whole tool input (a Write's file content), so one
+    // line spans many reads. Decode as a stream so no character is split.
+    conn.setEncoding("utf8");
     let buf = "";
     conn.on("data", (chunk) => {
       buf += chunk;
@@ -325,55 +770,31 @@ function createPermissionBroker(opts: {
           // entry or notify onAsk, but always answer an existing connection:
           // permission-proxy.ts only resolves on an explicit answer (or a
           // connection error/close), so a silent drop would hang the tool.
-          try {
-            conn.write(JSON.stringify({ t: "answer", id: askId, ...systemEndedReply(kind) }) + "\n");
-          } catch {}
+          answerEnded(conn, askId, kind);
           continue;
         }
         // A retained Claude process keeps its proxy connection between
         // turns. Late/background asks must still fail closed without opening
-        // a card for a turn that has already settled.
-        if (opts.isActive && !opts.isActive()) {
-          try {
-            conn.write(JSON.stringify({ t: "answer", id: askId, ...systemEndedReply(kind) }) + "\n");
-          } catch {}
+        // a card for a turn that has already settled — and an ask from a
+        // turn the CLI started on its own, while a BotFleet turn waits behind
+        // it, must not become a card on the person's turn.
+        const verdict = opts.isActive ? opts.isActive() : true;
+        if (verdict === false) {
+          answerEnded(conn, askId, kind);
           continue;
         }
-        // `pending` is server-scoped, not per-connection: two asks with the
-        // same id — a buggy/adversarial client, never a legitimate retry
-        // (permission-proxy mints a fresh randomUUID per ask) — would
-        // otherwise let the second `pending.set` silently overwrite the
-        // first, orphaning it as an unanswerable card once the first
-        // resolves and deletes the shared key. Reject before either ask
-        // becomes visible to onAsk.
-        if (pending.has(askId)) {
-          // askId is client-controlled; JSON.stringify escapes newlines and
-          // control characters so it can't corrupt the log line or terminal.
-          console.error(`permission broker on ${opts.socketPath}: duplicate ask id ${JSON.stringify(askId)} — denying`);
-          try {
-            conn.write(JSON.stringify({ t: "answer", id: askId, behavior: "deny", message: DUPLICATE_ASK_ID_NOTE }) + "\n");
-          } catch {}
+        if (verdict === "wait") {
+          const entry = { conn, msg, askId, kind, timer: setTimeout(() => {
+            const at = held.indexOf(entry);
+            if (at === -1) return;
+            held.splice(at, 1);
+            answerEnded(conn, askId, kind);
+          }, ASK_ADMISSION_WAIT_MS) };
+          entry.timer.unref?.();
+          held.push(entry);
           continue;
         }
-        const ask: Ask = { id: askId, kind, tool: msg.tool ?? "tool", input: msg.input ?? {}, at: Date.now() };
-        const finish = (behavior: AskBehavior, message: string | undefined, source: AskResolutionSource) => {
-          if (!pending.delete(askId)) return;
-          clearTimeout(timer);
-          try {
-            conn.write(JSON.stringify({ t: "answer", id: askId, behavior, message }) + "\n");
-          } catch {}
-          opts.onResolve({ ...ask, behavior, source });
-        };
-        const timer = setTimeout(
-          () =>
-            kind === "question"
-              ? finish("answer", QUESTION_TIMEOUT_NOTE, "timeout")
-              : finish("deny", DENY_TIMEOUT_NOTE, "timeout"),
-          timeoutMs,
-        );
-        timer.unref?.();
-        pending.set(askId, { ask, finish });
-        opts.onAsk(ask);
+        admit(conn, msg, askId, kind);
       }
     });
   });
@@ -385,6 +806,7 @@ function createPermissionBroker(opts: {
   });
   server.listen(opts.socketPath);
   const drain = () => {
+    recheck(true);
     for (const p of [...pending.values()]) {
       const { behavior, message } = systemEndedReply(p.ask.kind);
       p.finish(behavior, message, "system");
@@ -397,6 +819,10 @@ function createPermissionBroker(opts: {
       if (p.ask.kind === "question" ? behavior !== "answer" : behavior === "answer") return false;
       p.finish(behavior, message, "user");
       return true;
+    },
+    /** Decide the asks held on `"wait"` now that the turn's state moved. */
+    recheck() {
+      recheck();
     },
     pause() {
       drain();
@@ -439,9 +865,17 @@ function decodeConfig(raw: unknown): ClaudeConfig {
   }
   const tools = decodeToolList(o.tools, "tools");
   const disallowedTools = decodeToolList(o.disallowedTools, "disallowedTools");
+  // Settings > Engines > "Bypass permissions (autonomous mode)" stores
+  // `fullAuto: true` on the instance (server/config.ts patchInstanceConfig),
+  // which is every other CLI engine's native YOLO switch.  Claude had its own
+  // spelling, `permissionMode`, and nothing read `fullAuto`: the box ticked and
+  // the CLI kept running in acceptEdits.  An explicit `permissionMode` still
+  // wins, so a hand-written one is never overridden.  The host-control
+  // downgrade in sendTurn applies to either spelling.
+  const fullAuto = o.fullAuto === true;
   return {
     cli: typeof o.cli === "string" ? o.cli : "claude",
-    permissionMode: (mode as ClaudeConfig["permissionMode"]) ?? "acceptEdits",
+    permissionMode: (mode as ClaudeConfig["permissionMode"]) ?? (fullAuto ? "bypassPermissions" : "acceptEdits"),
     ...(tools !== undefined ? { tools } : {}),
     ...(disallowedTools !== undefined ? { disallowedTools } : {}),
   };
@@ -458,9 +892,49 @@ function firstText(content: unknown): string {
   return "";
 }
 
+// ── model rejection ─────────────────────────────────────────────────────
+// When the CLI cannot use the requested model id it does not fail the process.
+// It answers with a synthetic assistant frame (`model: "<synthetic>"`, zero
+// usage) whose top-level `error` is "model_not_found" and whose text reads
+// "There's an issue with the selected model (...)", then a result frame with
+// `is_error: true`, `terminal_reason: "api_error"` and `api_error_status: 404`.
+// Forwarded as an ordinary assistant reply, that text counted as real output:
+// the fallback walk stopped on the dead entry and the transcript filled with
+// the CLI's own apology (see selectTurnFallback in model-fallback.ts).
+//
+// The structural markers decide.  The text only backs them up for a CLI that
+// drops the `error` field, and only for a short, synthetic, zero-output frame,
+// so a real answer that happens to open with these words is not swallowed.
+const MODEL_REJECTION_ERROR = "model_not_found";
+const MODEL_REJECTION_TEXT = /^There's an issue with the selected model\b/;
+const MODEL_REJECTION_TEXT_MAX = 400;
+
+export function isModelRejectionFrame(frame: any, text: string): boolean {
+  if (frame?.error === MODEL_REJECTION_ERROR || frame?.message?.error === MODEL_REJECTION_ERROR) return true;
+  const message = frame?.message;
+  const synthetic = message?.model === "<synthetic>" || !(Number(message?.usage?.output_tokens) > 0);
+  const trimmed = text.trim();
+  return synthetic && trimmed.length > 0 && trimmed.length < MODEL_REJECTION_TEXT_MAX && MODEL_REJECTION_TEXT.test(trimmed);
+}
+
+function modelRejectionMessage(cliText: string, requested: string | null | undefined): string {
+  // The CLI names the id it rejected in parentheses; the request is the
+  // fallback for a frame that carried no text.
+  const named = /\(([^()\s]{1,120})\)/.exec(cliText)?.[1] ?? requested ?? null;
+  const subject = named ? `the model ${named}` : "the selected model";
+  return `Claude can't use ${subject}.  It may not exist, or this account may not have access to it.  Pick another model in Settings.`;
+}
+
 export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
   driverKind: DRIVER_KIND,
-  metadata: { displayName: "Claude", supportsMultipleInstances: true },
+  metadata: {
+    displayName: "Claude",
+    supportsMultipleInstances: true,
+    // Mirrors the `capabilities` block the instance publishes below, so the
+    // capability matrix can check its cell against the driver rather than
+    // against the comment above that block.
+    channelWiring: { agentsMcp: true, computerMcp: true, composioMcp: true, localComputerMcp: true, images: true },
+  },
   // npm on all three: the one recipe that is genuinely cross-platform. The
   // native installers differ per OS and would need verifying separately.
   install: {
@@ -528,6 +1002,32 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
          *  tools the turn already ran (E2).  Unlike sawStreamDelta, which is
          *  a per-frame dedup hint and resets after each assistant frame. */
         producedOutput: boolean;
+        /** Set when the CLI answered with a model-rejection frame: the
+         *  message already surfaced as an error, and the result frame that
+         *  follows settles the turn `unknown_model`. */
+        modelRejection?: string;
+        /** Every message BotFleet wrote for this turn — its own and each
+         *  steer — by the uuid stamped on it.  A CLI turn that takes one of
+         *  these is this turn's work; any other CLI turn is not. */
+        sends: Set<string>;
+        /** This turn's share of the process's running cost, summed over its
+         *  own CLI results: undefined before the first, null once any share
+         *  is unknown. */
+        cost?: number | null;
+        /** Usage summed over this turn's own CLI results (each result's
+         *  usage is that CLI turn's alone). */
+        usage?: TurnUsage;
+        /** The model the provider says answered (the assistant frame's
+         *  `model`), which can differ from the one requested: an alias, a
+         *  fallback, a dated snapshot.  Last non-helper frame wins. */
+        servedModel?: string;
+        /** Highest helper-token total already counted for one assistant
+         *  message id.  Streamed frames repeat that message's usage. */
+        helperUsage: Map<string, number>;
+        billedCalls: ClaudeSingleCallLedger;
+        /** How this turn's latest own CLI turn ended: what the settle
+         *  reports, once nothing more of the turn is still to run. */
+        outcome?: { ok: boolean; stopReason: string | null };
         input: SendTurnInput;
         retry: { attempt: number; cancelled: boolean };
         retryAbort: AbortController;
@@ -535,14 +1035,47 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       idleTimer: ReturnType<typeof setTimeout> | null;
       closing: boolean;
       stderr: string;
+      /** The CLI reports `command_lifecycle` frames (2.1.284 does), so a
+       *  frame's turn is KNOWN: it belongs to the BotFleet turn only once a
+       *  CLI turn has taken one of that turn's messages (`engaged`).  An
+       *  older CLI is trusted the old way — every frame while a turn runs is
+       *  that turn's. */
+      lifecycle: boolean;
+      /** The CLI turn running now has taken one of the BotFleet turn's
+       *  messages.  Cleared by every result. */
+      engaged: boolean;
+      /** Messages written into this process that no CLI turn has taken yet.
+       *  The BotFleet turn stays open while any is left: each one still gets
+       *  a CLI turn, and that reply is this turn's. */
+      unconsumed: Set<string>;
+      /** The process's running `total_cost_usd` as last reported, or null
+       *  when unknown (a resumed session whose earlier total this harness
+       *  never saw).  A turn's cost is how far its results move it. */
+      costTotal: number | null;
+      /** The CLI started a turn of its own with no BotFleet turn on the
+       *  process (a peer message, a scheduled prompt): its frames are
+       *  dropped and the process is being stopped. */
+      unsolicited: boolean;
+      /** Frames dropped for the unsolicited turn in progress, for its log line. */
+      unsolicitedFrames: number;
+      /** A turn the CLI started on its own is running ahead of the BotFleet
+       *  turn's message; set once per such turn, for its log line. */
+      foreignRunning: boolean;
     }
+    /** The running cost total each CLI session last reported, by the CLI's
+     *  session id.  A process resumed with `--resume` starts from the total
+     *  its transcript saved, so its first result carries every earlier turn:
+     *  this is what that result is measured against. */
+    const cliCostTotals = new Map<string, number>();
     const sessions = new Map<string, Session>();
     sweepReceiptsOnce();
-    const configuredIdleMinimum = Number(process.env.OMB_CLAUDE_SESSION_IDLE_MIN_MS);
-    const sessionIdleMinimum = Number.isFinite(configuredIdleMinimum) && configuredIdleMinimum > 0
-      ? configuredIdleMinimum
-      : 10_000;
-    const SESSION_IDLE_MS = Math.max(sessionIdleMinimum, Number(process.env.OMB_CLAUDE_SESSION_IDLE_MS) || 10 * 60_000);
+    // Resolved from cfg (file, vault knob, legacy env underneath — see
+    // `claudeSessionIdleMs` in server/config.ts) at create time, the same
+    // moment the env names were read before this became a knob.  A
+    // Settings save of `claudeSession` rebuilds the provider fleet, so the
+    // new window applies then; `loadConfig()` here follows the pattern
+    // server/container-computer.ts uses for its own cfg reads.
+    const SESSION_IDLE_MS = claudeSessionIdleMs(loadConfig());
 
     const closeSession = (threadId: string, why: string) => {
       const s = sessions.get(threadId);
@@ -572,17 +1105,39 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       s.idleTimer = setTimeout(() => closeSession(threadId, "idle"), SESSION_IDLE_MS);
       s.idleTimer.unref?.();
     };
-    const writeUser = (s: Session, threadId: string, text: string): Promise<boolean> => {
-      const promptMsg = { type: "user", message: { role: "user", content: text } };
+    /** Write a user message for the running turn.  It is stamped with a uuid
+     *  the CLI reports back (`command_lifecycle`, `user_message_uuids`), and
+     *  recorded as this turn's and as not yet taken BEFORE the write: the
+     *  CLI's answer can only be read after it.
+     *
+     *  This is the only place text reaches the CLI's stdin, so it is also the
+     *  one place a leading slash is shielded (`neutralizeLeadingSlash`): a
+     *  message that starts with "/advisor" or "/model" would otherwise run as
+     *  the CLI's own command and rewrite the owner's global settings.  Only a
+     *  command turn (`bare`) is written as typed. */
+    const writeUser = (s: Session, threadId: string, text: string, bare = false): Promise<boolean> => {
+      const uuid = randomUUID();
+      const promptMsg = { type: "user", uuid, message: { role: "user", content: bare ? text : neutralizeLeadingSlash(text) } };
       if (!s.child.stdin.writable || s.child.stdin.destroyed) return Promise.resolve(false);
+      const turn = s.turn;
+      turn?.sends.add(uuid);
+      s.unconsumed.add(uuid);
+      const forget = () => {
+        turn?.sends.delete(uuid);
+        s.unconsumed.delete(uuid);
+      };
       return new Promise((resolve) => {
         try {
           s.child.stdin.write(JSON.stringify(promptMsg) + "\n", (error) => {
-            if (error) return resolve(false);
+            if (error) {
+              forget();
+              return resolve(false);
+            }
             appendNative(threadId, { dir: "out", source: "claude.sdk.message", msg: promptMsg });
             resolve(true);
           });
         } catch {
+          forget();
           resolve(false);
         }
       });
@@ -604,6 +1159,11 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
 
     const sendTurn = async (turn: SendTurnInput) => {
       const { threadId } = turn;
+      // The seat's CLI login is read in the BACKGROUND, and the read is started
+      // here, before the guard:  the guard and the registration that follows it
+      // have to stay free of `await`, or a second turn on this thread would walk
+      // through the guard the first one already passed.
+      primeCliLogin(turn.launchIdentity?.seat);
       if (active.has(threadId)) throw new Error("a turn is already running on this thread");
       const turnId = newId();
       let preflightCancelled = false;
@@ -625,6 +1185,12 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           emit({
             ...base(threadId, turnId), type: "runtime.error",
             message: preflightError instanceof Error ? preflightError.message : String(preflightError),
+            // A dead CLI binary is a setup problem, not an upgrade nudge:
+            // forward the flag so the doomed breaker counts it like the
+            // spawn paths' describeSpawnFailure failures.
+            ...(preflightError instanceof Error && (preflightError as { setup?: unknown }).setup === true
+              ? { setup: true }
+              : {}),
           });
         }
         emit({
@@ -643,9 +1209,13 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       // but a turn that can click on the user's real desktop runs brokered:
       // the CLI gets acceptEdits plus the permission-prompt tool, so every
       // ask reaches the harness and the bot's Auto policy decides. Nothing
-      // else could make host control safe on a bypass instance.
+      // else could make host control safe on a bypass instance.  A turn the
+      // harness holds for auto-review (`holdForReview`) is brokered the same
+      // way, so the reviewer sees each ask before it runs.
       const permissionMode: ClaudeConfig["permissionMode"] =
-        controlsHost && config.permissionMode === "bypassPermissions" ? "auto" : config.permissionMode;
+        (controlsHost || turn.holdForReview === true) && config.permissionMode === "bypassPermissions"
+          ? "auto"
+          : config.permissionMode;
       const retryAbort = new AbortController();
       const retry = retryState.get(threadId) ?? { attempt: 0, cancelled: false };
       retry.cancelled = false;
@@ -667,9 +1237,8 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         "--permission-mode", permissionMode === "auto" ? "acceptEdits" : permissionMode,
       ];
       if (config.tools !== undefined) args.push("--tools", config.tools.join(","));
-      if (config.disallowedTools?.length) {
-        args.push("--disallowedTools", config.disallowedTools.join(","));
-      }
+      args.push("--disallowedTools", claudeDisallowedTools(config).join(","));
+      args.push("--settings", JSON.stringify(CLAUDE_CONTAINMENT_SETTINGS));
       const turnEnvironment: NodeJS.ProcessEnv = { ...process.env, ...input.environment };
       const turnModel = await resolveClaudeTurnModel(turn.model, turnEnvironment);
       const injected = applyClaudeInject({ ...turnEnvironment }, turnModel);
@@ -689,9 +1258,28 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       const mcpServers: Record<string, unknown> = {};
 
       const allowed: string[] = [];
+      // A turn held for auto-review routes the servers that reach outside
+      // the bot through the permission-prompt tool instead of pre-allowing
+      // them: a connected-app call (an email, a message) and a phone call
+      // then reach the reviewer BEFORE they run, where a pre-allowed call
+      // could only be watched after it had already gone out.  The `agents`
+      // server stays pre-allowed on purpose: it is the harness's own fleet
+      // comms, jobs and Zulip, each guarded by the endpoint it calls (comms
+      // depth, peer approval), and the owner ruled that a full-auto bot's own
+      // `job_start` never becomes a card, which routing it through the broker
+      // would break.  The step watch reviews the ones that change something
+      // as they start (server/review-watch.ts `isWatchedHarnessTool`):
+      // `ask_bot`, `delegate_bot`, `create_bot`, `request_credential`,
+      // `propose_routine`, `propose_routine_action`, `zulip_post`,
+      // `zulip_reply`, `zulip_follow_topic`, `job_start`, `job_kill` — every
+      // MCP tool the registry marks `write`.  A `job_start` is watched, not
+      // carded: a refusal stops the turn, it never becomes a card.  The
+      // server's read tools (`list_bots`, `list_routines`, `job_output`,
+      // `job_list`) are not reviewed.
+      const heldForReview = turn.holdForReview === true && permissionMode !== "bypassPermissions";
       if (turn.integrations?.composio) {
         mcpServers.composio = { ...turn.integrations.composio };
-        allowed.push("mcp__composio");
+        if (!heldForReview) allowed.push("mcp__composio");
       }
       // Every granted computer gets its own server, so the agent can choose
       // per task instead of the harness choosing once for it.
@@ -725,7 +1313,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       }
       if (turn.integrations?.phone) {
         mcpServers.phone = { ...turn.integrations.phone };
-        allowed.push("mcp__phone");
+        if (!heldForReview) allowed.push("mcp__phone");
       }
       if (turn.integrations?.qdrant) {
         mcpServers.qdrant = { ...turn.integrations.qdrant };
@@ -778,13 +1366,30 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       args.push("--mcp-config", mcpConfigPath, "--strict-mcp-config");
       args.push("--allowedTools", allowed.join(","));
 
-      const env = claudeEnvironment(turnModel, turnEnvironment);
+      // The launch identity is per bot and per turn (`turnEnvironment` is the
+      // instance's), and a retained process keeps the env it was spawned with,
+      // so it is part of the contract key below.
+      const env = launchedChildEnvironment(
+        claudeEnvironment(turnModel, turnEnvironment),
+        turn.launchIdentity,
+        cliLoginEnvironment(turn.launchIdentity?.seat),
+      );
       const cwd = turn.cwd ?? homedir();
       // everything that shapes the process, minus session/turn specifics
       // (the --mcp-config file is a fresh temp path each time; its CONTENT
       // is what matters and mcpServers carries that)
       const keyArgs = args.filter((a, i) => a !== "--mcp-config" && args[i - 1] !== "--mcp-config");
-      const argsKey = JSON.stringify({ args: keyArgs, mcpServers, cwd, model: injected.model ?? null, base: env.ANTHROPIC_BASE_URL ?? null });
+      const argsKey = JSON.stringify({
+        args: keyArgs,
+        mcpServers,
+        cwd,
+        model: injected.model ?? null,
+        base: env.ANTHROPIC_BASE_URL ?? null,
+        // A room's members share one thread: a second bot there must not
+        // write into the process spawned for the first one's seat.
+        seat: env.AGENT_LAUNCH_SEAT ?? null,
+        session: env.AGENT_SESSION ?? null,
+      });
 
       // What the user turn carries besides its text.  The volatile half rides
       // as a labelled block when this native session has not carried this
@@ -792,8 +1397,14 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       // receipt this harness never wrote — and on a mention turn, whose note
       // describes this very message.  A legacy unsplit turn goes bare.  The
       // receipt is only pending here; the CLI's first frame commits it.
-      const planTurnText = (sessionKey: string): { text: string; pending: { key: string; receipt: PromptSplitReceipt } | null } => {
-        if (halves.stable === null) return { text: turn.text, pending: null };
+      //
+      // A command turn (`/compact`) is the exception: the CLI parses a slash
+      // command only at the very start of the message, so it is written alone,
+      // with no note and no receipt.  The note rides the next ordinary turn,
+      // which still finds the receipt missing.
+      const planTurnText = (sessionKey: string) => {
+        if (turn.command) return { text: engineCommandText(turn.command), pending: null, bare: true };
+        if (halves.stable === null) return { text: turn.text, pending: null, bare: false };
         const receipt = promptSplitFingerprints(halves.stable, halves.volatile);
         const previous = readPromptSplitReceipt(DRIVER_KIND, sessionKey);
         const carried = previous !== null && previous.volatile === receipt.volatile && !turn.mentionTurn;
@@ -802,16 +1413,22 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
             ? turn.text
             : withVolatileNote(turn.text, halves.volatile, previous !== null && previous.volatile !== EMPTY_FINGERPRINT),
           pending: { key: sessionKey, receipt },
+          bare: false,
         };
       };
 
       // Reuse the live process when it is idle, unchanged, and is the session
       // the harness wants resumed. Anything else: close it and spawn fresh
       // (with --resume, so the conversation continues in the new process).
+      // One user turn announces turn.started exactly once, even when a reused
+      // session fails its stdin write and the turn falls through to a fresh spawn.
+      let turnStartedEmitted = false;
       const live = sessions.get(threadId);
-      if (live && !live.turn && !live.closing && live.child.exitCode === null && live.argsKey === argsKey && (!sessionId || sessionId === live.sessionId)) {
+      if (live && !live.turn && !live.unsolicited && !live.closing && live.child.exitCode === null && live.argsKey === argsKey && (!sessionId || sessionId === live.sessionId)) {
         if (live.idleTimer) clearTimeout(live.idleTimer);
-        live.turn = { turnId, settled: false, sawStreamDelta: false, producedOutput: false, input: turn, retry, retryAbort };
+        live.turn = { turnId, settled: false, sawStreamDelta: false, producedOutput: false, sends: new Set(), helperUsage: new Map(), billedCalls: new ClaudeSingleCallLedger(), input: turn, retry, retryAbort };
+        live.engaged = false;
+        live.foreignRunning = false;
         // stderr feeds the crash message; a warm process still holds turn
         // 1's buffer, which would mislabel turn 2's failure
         live.stderr = "";
@@ -827,25 +1444,30 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           broker: live.broker,
         });
         emit({ ...base(threadId, turnId), type: "turn.started" });
+        turnStartedEmitted = true;
         const plan = planTurnText(live.sessionId ?? sessionId ?? newSessionId!);
         live.pendingReceipt = plan.pending;
-        const written = await writeUser(live, threadId, plan.text);
-        if (!written) {
-          live.pendingReceipt = null;
-          active.delete(threadId);
-          live.turn = null;
-          closeSession(threadId, "stdin write failed");
-          throw new Error("claude session stdin is not writable");
+        const written = await writeUser(live, threadId, plan.text, plan.bare);
+        if (written) {
+          // the MCP config was for the first spawn; nothing to clean here
+          if (mcpConfigPath) {
+            try {
+              rmSync(dirname(mcpConfigPath), { recursive: true, force: true });
+            } catch {}
+          }
+          return { turnId };
         }
-        // the MCP config was for the first spawn; nothing to clean here
-        if (mcpConfigPath) {
-          try {
-            rmSync(dirname(mcpConfigPath), { recursive: true, force: true });
-          } catch {}
-        }
-        return { turnId };
+        // BOTFLEET-S: a retained CLI can report exitCode=null while stdin is
+        // already closed (half-dead after a SessionEnd hook / prior SIGTERM).
+        // Failing the turn here was the whole incident. Drop the dead session
+        // and spawn fresh the way a spawn-contract change already does.
+        live.pendingReceipt = null;
+        active.delete(threadId);
+        live.turn = null;
+        closeSession(threadId, "stdin write failed");
+      } else if (live) {
+        closeSession(threadId, live.unsolicited ? "engine is running its own turn" : "spawn contract changed");
       }
-      if (live) closeSession(threadId, "spawn contract changed");
 
       // Only create a broker for a new process. A compatible retained process
       // keeps its existing proxy connection and broker across turns.
@@ -855,17 +1477,31 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         const askTools = new Map<string, string | undefined>();
         broker = createPermissionBroker({
           socketPath,
-          isActive: () => Boolean(sessions.get(threadId)?.turn),
+          // A turn the CLI started on its own may be running ahead of this
+          // BotFleet turn's message: its asks are not the person's to answer
+          // (see Session.lifecycle), so they wait until the CLI shows which
+          // turn is running, and are refused if it never shows it is ours.
+          isActive: () => {
+            const s = sessions.get(threadId);
+            if (!s?.turn) return false;
+            return !s.lifecycle || s.engaged ? true : "wait";
+          },
           onAsk: (ask) => {
             const eventTurnId = sessions.get(threadId)?.turn?.turnId ?? turnId;
             askTools.set(ask.id, typeof ask.tool === "string" ? ask.tool : undefined);
+            const paths = fileWritePaths(ask.tool, ask.input);
             emit({
               ...base(threadId, eventTurnId),
               type: "request.opened",
               requestId: ask.id,
+              // the tool_use this ask is about, the same id its item.started
+              // carried, so the auto-review step watch leaves it to the card
+              itemId: ask.toolUseId,
               requestType: ask.kind,
               tool: ask.tool,
               summary: askSummary(ask),
+              paths,
+              cwd: paths ? turn.cwd : undefined,
               approvalScope:
                 typeof ask.tool === "string" && hostPrefix !== null && ask.tool.startsWith(hostPrefix)
                   ? "local-computer"
@@ -903,24 +1539,31 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         argsKey,
         sessionId: sessionId ?? newSessionId,
         pendingReceipt: null,
-        turn: { turnId, settled: false, sawStreamDelta: false, producedOutput: false, input: turn, retry, retryAbort },
+        turn: { turnId, settled: false, sawStreamDelta: false, producedOutput: false, sends: new Set(), helperUsage: new Map(), billedCalls: new ClaudeSingleCallLedger(), input: turn, retry, retryAbort },
         idleTimer: null,
         closing: false,
         stderr: "",
+        lifecycle: false,
+        engaged: false,
+        unconsumed: new Set(),
+        // A fresh session starts at zero; a resumed one from the total its
+        // transcript saved, which is the last one this harness saw, if any.
+        costTotal: sessionId ? (cliCostTotals.get(sessionId) ?? null) : 0,
+        unsolicited: false,
+        unsolicitedFrames: 0,
+        foreignRunning: false,
       };
       sessions.set(threadId, session);
 
       // settles the TURN, not the process: the CLI stays for the next
-      // message until it has been quiet for SESSION_IDLE_MS
-      const settle = (
-        ok: boolean,
-        stopReason: string | null,
-        cost: number | null = null,
-        usage?: { input: number; output: number; cachedInput?: number },
-      ) => {
+      // message until it has been quiet for SESSION_IDLE_MS.  The cost and
+      // usage are what the turn's own CLI results added up to.
+      const settle = (ok: boolean, stopReason: string | null) => {
         const t = session.turn;
         if (!t || t.settled) return;
         t.settled = true;
+        const cost = t.cost ?? null;
+        const usage = t.usage;
         // Resolve any ask still open for this turn, but keep the broker
         // listening for the next turn on the retained process. Between turns
         // isActive() rejects late background asks without creating cards.
@@ -935,10 +1578,17 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         }
         active.delete(threadId);
         session.turn = null;
+        session.engaged = false;
+        session.foreignRunning = false;
+        // Normally empty by now; a turn that ended any other way (a crash, a
+        // Stop) leaves nothing a later turn should wait on.
+        session.unconsumed.clear();
         // A settled turn owns no retry budget. Retained CLI sessions may run
         // many later turns on this thread, and each must start fresh.
         retryState.delete(threadId);
-        emit({
+        // Spread as an object or as nothing: absent unless the provider said.
+        const servedModel = t.servedModel ? { servedModel: t.servedModel } : undefined;
+        const completed: RuntimeEvent = {
           ...base(threadId, t.turnId),
           type: "turn.completed",
           ok,
@@ -948,10 +1598,176 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           // total_cost_usd is the equivalent API price, not a cash charge.
           ...(cost != null ? { billingMode: "estimated" as const } : {}),
           ...(usage ? { usage } : {}),
-        });
+          ...servedModel,
+        };
+        const billedCall = t.billedCalls.proof();
+        if (billedCall) completed.billedCall = billedCall;
+        emit(completed);
         if (session.child.exitCode === null && !session.closing) armIdle(threadId);
       };
+      /** The running BotFleet turn's id.  Only called with a turn running:
+       *  handleLine drops every frame that arrives without one, and the
+       *  process handlers check before they emit.  Falling back to the id
+       *  this process was spawned with is what used to stamp an engine's
+       *  own turn with a settled turn's id. */
       const currentTurnId = () => session.turn?.turnId ?? turnId;
+
+      /** Move the process's running cost total to `total` and return how far
+       *  it moved: what the CLI turn that just ended cost, or null when that
+       *  is unknown.  `total_cost_usd` is cumulative for the process (and a
+       *  resumed process starts from its transcript's total), so summing it
+       *  across results would bill every earlier turn again. */
+      const advanceCost = (total: number | undefined): number | null => {
+        if (total === undefined) return null;
+        const previous = session.costTotal;
+        // A crash or startup-error result can carry a zeroed total: it says
+        // nothing about what was spent, and must not reset the baseline.
+        if (total === 0 && previous !== null && previous > 0) return null;
+        session.costTotal = total;
+        if (session.sessionId) cliCostTotals.set(session.sessionId, total);
+        if (previous === null) return null;
+        // A mid-session /clear restarts the running total from zero.
+        return total >= previous ? total - previous : total;
+      };
+      const costLabel = (share: number | null) => (share === null ? "" : `, cost ${share.toFixed(4)}`);
+
+      /** The CLI's turn now running took one of the BotFleet turn's
+       *  messages: what it says from here on is that turn's. */
+      const engage = (uuid?: string) => {
+        if (uuid !== undefined) session.unconsumed.delete(uuid);
+        session.engaged = true;
+        session.foreignRunning = false;
+        session.broker?.recheck();
+      };
+
+      /** The CLI started a turn of its own with no BotFleet turn on this
+       *  process.  Hiding it is not enough: it would run its tools to the end
+       *  — in a full-auto bot with no approval at all — with no turn record,
+       *  watchdog or spend.  The process is stopped; the next turn relaunches
+       *  with --resume. */
+      const stopUnsolicited = (frame: { type?: unknown }, meta: z.infer<typeof FrameMeta>) => {
+        session.unsolicited = true;
+        unsolicitedFrames.turns++;
+        const subtype = meta.subtype ?? meta.state;
+        console.warn(
+          `[claude] thread ${threadTag(threadId)}: the CLI started a turn of its own ` +
+            `(${String(frame.type)}${subtype === undefined ? "" : `/${subtype}`}); dropping it and stopping the process`,
+        );
+        if (sessions.get(threadId) === session) closeSession(threadId, "the CLI started a turn of its own");
+        killCliTree(session.child);
+      };
+
+      /** A frame that arrived with no BotFleet turn on this process.  It is
+       *  never transcript text, never stamped with a settled turn's id, and
+       *  never settles or pauses anything: the turn that owned the broker and
+       *  the thread is gone, and the next one has not been written yet. */
+      const dropUnsolicited = (frame: { type?: unknown; subtype?: unknown; state?: unknown }, meta: z.infer<typeof FrameMeta>) => {
+        if (frame.type === "result") {
+          unsolicitedFrames.dropped++;
+          // its cost is the CLI's, not the next turn's: move the baseline
+          const share = advanceCost(meta.total_cost_usd);
+          console.warn(
+            `[claude] thread ${threadTag(threadId)}: dropped a turn the CLI started on its own ` +
+              `(${session.unsolicitedFrames + 1} frames, origin ${meta.origin?.kind ?? "unknown"}${costLabel(share)})`,
+          );
+          session.unsolicitedFrames = 0;
+          return;
+        }
+        // Hook progress, state changes, prompt suggestions and the end
+        // states of a command that already ran may trail a result; they
+        // start nothing and are nothing to drop.
+        if (!startsUnsolicitedTurn(frame)) return;
+        unsolicitedFrames.dropped++;
+        session.unsolicitedFrames++;
+        if (!session.unsolicited) stopUnsolicited(frame, meta);
+      };
+
+      /** A frame of a CLI turn that has not taken any of the BotFleet turn's
+       *  messages (a turn the CLI started on its own, still running when this
+       *  turn's message arrived): the message waits in the CLI's queue, and
+       *  nothing said before the CLI takes it is this turn's. */
+      const dropForeign = (frame: { type?: unknown; subtype?: unknown }, meta: z.infer<typeof FrameMeta>) => {
+        // a status or hook frame of an idle CLI says nothing about a turn
+        if (!startsUnsolicitedTurn(frame)) return;
+        unsolicitedFrames.dropped++;
+        if (session.foreignRunning) return;
+        session.foreignRunning = true;
+        const subtype = meta.subtype === undefined ? "" : `/${meta.subtype}`;
+        console.warn(
+          `[claude] thread ${threadTag(threadId)}: the CLI is running a turn of its own ahead of this turn's message ` +
+            `(${String(frame.type)}${subtype}); dropping its frames`,
+        );
+      };
+
+      /** Settle once nothing of the turn is left to run: a message of its
+       *  own ended without any CLI turn taking it. */
+      const settleIfDone = (state: string | undefined) => {
+        const t = session.turn;
+        if (!t || session.engaged || session.unconsumed.size > 0) return;
+        if (t.outcome) {
+          settle(t.outcome.ok, t.outcome.stopReason);
+          return;
+        }
+        emit({ ...base(threadId, t.turnId), type: "runtime.error", message: `Claude Code did not run this message (${state ?? "ended"}).` });
+        settle(false, `message_${state ?? "ended"}`);
+      };
+
+      // The CLI accepted the turn just written: this native session now
+      // carries the halves that turn delivered.  Committed on the first
+      // frame after submission, never at write time — a CLI that dies
+      // before reading stdin has carried nothing, and the next turn must
+      // deliver the volatile half again.  Keyed on the id the CLI reports,
+      // which is what the harness resumes with.
+      const commitReceipt = (o?: { type?: unknown; subtype?: unknown; session_id?: unknown }) => {
+        if (!session.pendingReceipt) return;
+        const { key, receipt } = session.pendingReceipt;
+        session.pendingReceipt = null;
+        if (o?.type === "system" && o.subtype === "init" && typeof o.session_id === "string") session.sessionId = o.session_id;
+        try {
+          writePromptSplitReceipt(DRIVER_KIND, session.sessionId ?? key, receipt);
+        } catch {
+          /* the next turn re-delivers the note; nothing else depends on it */
+        }
+      };
+
+      /** `command_lifecycle`: how far the CLI got with a message on stdin.
+       *  For a message BotFleet stamped, `started` (or a fold's `completed`)
+       *  is the moment a CLI turn takes it — from there the CLI's frames are
+       *  the BotFleet turn's. */
+      const onLifecycle = (frame: { type?: unknown; state?: unknown }, meta: z.infer<typeof FrameMeta>) => {
+        session.lifecycle = true;
+        const id = meta.command_uuid;
+        const state = meta.state;
+        const t = session.turn;
+        if (id !== undefined && t?.sends.has(id)) {
+          commitReceipt();
+          if (state === "queued") return;
+          const waiting = session.unconsumed.delete(id);
+          // a fold into a running turn may report `completed` before that
+          // turn's result, with no `started` of its own
+          if (state === "started" || (state === "completed" && waiting)) {
+            engage();
+            return;
+          }
+          if (waiting && state !== undefined && COMMAND_ENDED_STATES.has(state)) settleIfDone(state);
+          return;
+        }
+        // a command BotFleet did not write: with no turn here, a `started`
+        // is the CLI starting a turn of its own
+        if (!t) dropUnsolicited(frame, meta);
+      };
+
+      /** The CLI's slash-command catalog, from its init frame: once per
+       *  process, and again if it ever changes.  Names only; what to show of
+       *  them is decided by the allowlist, not by this text. */
+      let announcedCommands = "";
+      const announceCommands = (raw: readonly string[]) => {
+        const names = normalizeAnnouncedCommands(raw);
+        const key = names.join(",");
+        if (key === announcedCommands) return;
+        announcedCommands = key;
+        emit({ ...base(threadId, currentTurnId()), type: "engine.commands", names, origin: "claude-init" });
+      };
 
       const handleLine = (line: string) => {
         let o: any;
@@ -961,22 +1777,35 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           return;
         }
         appendNative(threadId, { dir: "in", source: "claude.sdk.message", msg: o });
-        // The CLI accepted the turn just written: this native session now
-        // carries the halves that turn delivered.  Committed on the first
-        // frame after submission, never at write time — a CLI that dies
-        // before reading stdin has carried nothing, and the next turn must
-        // deliver the volatile half again.  Keyed on the id the CLI reports,
-        // which is what the harness resumes with.
-        if (session.pendingReceipt) {
-          const { key, receipt } = session.pendingReceipt;
-          session.pendingReceipt = null;
-          if (o.type === "system" && o.subtype === "init" && typeof o.session_id === "string") session.sessionId = o.session_id;
-          try {
-            writePromptSplitReceipt(DRIVER_KIND, session.sessionId ?? key, receipt);
-          } catch {
-            /* the next turn re-delivers the note; nothing else depends on it */
+        // every stream-json frame is an object; anything else says nothing
+        if (o === null || typeof o !== "object") return;
+        const meta = FrameMeta.parse(o);
+        // Read before the turn-ownership gates below: a lifecycle-aware CLI's
+        // init frame can arrive while no BotFleet turn owns the process, and
+        // the gates would drop it before it reached the switch.
+        if (o.type === "system" && meta.subtype === "init" && meta.slash_commands) announceCommands(meta.slash_commands);
+        if (o.type === "command_lifecycle") {
+          onLifecycle(o, meta);
+          return;
+        }
+        if (!session.turn) {
+          dropUnsolicited(o, meta);
+          return;
+        }
+        if (session.lifecycle && !session.engaged) {
+          // The first reply frame of a CLI turn names the message it
+          // answers; a result is judged by the messages it consumed.
+          if (meta.user_message_uuid !== undefined && session.turn.sends.has(meta.user_message_uuid)) engage(meta.user_message_uuid);
+          else if (o.type !== "result") {
+            dropForeign(o, meta);
+            return;
           }
         }
+        if (!session.lifecycle) commitReceipt(o);
+        // A helper (native subagent) frame names the Task/Agent call that
+        // started it.  Its steps nest under that row; its own prose is the
+        // helper talking to its parent, not the bot answering anyone.
+        const helperOf = meta.parent_tool_use_id;
         switch (o.type) {
           case "system":
             if (o.subtype === "init") {
@@ -989,7 +1818,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           case "stream_event": {
             // subagent narration is dropped — N parallel Tasks would
             // interleave their prose into one bubble (upstream-verified bug)
-            if (o.parent_tool_use_id) break;
+            if (helperOf) break;
             const ev = o.event ?? {};
             if (ev.type !== "content_block_delta") break;
             const d = ev.delta ?? {};
@@ -1007,14 +1836,31 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           case "assistant": {
             const msg = o.message ?? {};
             const text = firstText(msg.content);
+            // `<synthetic>` is the CLI's own placeholder for an error reply,
+            // not a model that served anything.
+            if (!helperOf && session.turn && typeof msg.model === "string" && msg.model && msg.model !== "<synthetic>") {
+              session.turn.servedModel = msg.model;
+            }
+            if (!helperOf && session.turn && isModelRejectionFrame(o, text)) {
+              // Not an assistant reply: an error the turn failed on.  It must
+              // reach the transcript as an error row, never as bot text, so
+              // the failover reads "nothing produced" and walks on, and the
+              // next engine does not inherit the apology as history.
+              const message = modelRejectionMessage(text, session.turn.input.model);
+              session.turn.modelRejection = message;
+              emit({ ...base(threadId, currentTurnId()), type: "runtime.error", message });
+              break;
+            }
             if (text.trim()) {
               if (session.turn) session.turn.producedOutput = true;
-              // fallback delta for CLIs/paths that never streamed the block
-              if (!session.turn?.sawStreamDelta) {
-                emit({ ...base(threadId, currentTurnId()), type: "content.delta", streamKind: "assistant_text", delta: text });
+              if (!helperOf) {
+                // fallback delta for CLIs/paths that never streamed the block
+                if (!session.turn?.sawStreamDelta) {
+                  emit({ ...base(threadId, currentTurnId()), type: "content.delta", streamKind: "assistant_text", delta: text });
+                }
+                if (session.turn) session.turn.sawStreamDelta = false;
+                emit({ ...base(threadId, currentTurnId()), type: "item.completed", itemType: "assistant_text", text });
               }
-              if (session.turn) session.turn.sawStreamDelta = false;
-              emit({ ...base(threadId, currentTurnId()), type: "item.completed", itemType: "assistant_text", text });
             }
             for (const b of Array.isArray(msg.content) ? msg.content : []) {
               if (b.type === "tool_use") {
@@ -1029,11 +1875,20 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
                   itemType: "tool",
                   itemId: b.id,
                   title: b.name,
+                  parentItemId: helperOf,
+                  // The helper card keys on this.  The bot's own steps leave
+                  // it unset, so a missing parent is not a helper.
+                  subagentId: helperOf,
                   ...toolFields(b.name, b.input, { cwd: turn.cwd }),
+                  ...captureInput(b.input),
                 });
               }
             }
-            if (msg.usage) {
+            // A helper's usage is ITS context, not the bot's: reported as the
+            // bot's it would swing the context meter on every helper step.
+            // The turn's result frame carries the whole bill either way.
+            if (!helperOf) session.turn?.billedCalls.observe(msg, session.lifecycle && session.engaged);
+            if (msg.usage && !helperOf) {
               emit({
                 ...base(threadId, currentTurnId()),
                 type: "thread.token-usage.updated",
@@ -1043,6 +1898,29 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
                   ? { cachedInput: msg.usage.cache_read_input_tokens }
                   : {}),
               });
+            } else if (msg.usage && helperOf) {
+              // The helper's own bill, for its card.  It is not the bot's
+              // context meter: that path is the branch above.  One assistant
+              // message is streamed as several frames that repeat the same
+              // usage, so only the increase since the last frame of that
+              // message id is new.
+              const tokens =
+                (msg.usage.input_tokens || 0) +
+                (msg.usage.cache_read_input_tokens || 0) +
+                (msg.usage.output_tokens || 0);
+              const parsedMessage = assistantMessageIdSchema.safeParse(msg);
+              const messageId = parsedMessage.success ? parsedMessage.data.id : undefined;
+              const delta = helperUsageDelta(session.turn?.helperUsage, messageId, tokens);
+              if (delta > 0) {
+                emit({
+                  ...base(threadId, currentTurnId()),
+                  type: "item.updated",
+                  itemType: "tool",
+                  itemId: helperOf,
+                  subagentId: helperOf,
+                  tokens: delta,
+                });
+              }
             }
             break;
           }
@@ -1057,13 +1935,62 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
                   itemId: b.tool_use_id,
                   ok: !b.is_error,
                   detail: describeResult(b.content),
+                  subagentId: helperOf,
+                  ...captureOutput(b.content),
                 });
               }
             }
             break;
           case "result": {
-            // result.usage is this invocation's total — one process per turn,
-            // so it is the turn's figure. cache reads count as input: they
+            // The cache writes by TTL (or the flat figure of an older CLI).
+            // `input` takes the sum of whichever form arrived, so a CLI that
+            // sends only the TTL split, with the flat total null or zero, does
+            // not leave the writes out of the context while still naming them.
+            const cacheWrites = o.usage ? cacheWritesOf(o.usage) : {};
+            const cacheWritten = (cacheWrites.cacheWrite5m ?? 0) + (cacheWrites.cacheWrite1h ?? 0);
+            const resultUsage: TurnUsage | undefined = o.usage
+              ? {
+                  input: (o.usage.input_tokens || 0) + (o.usage.cache_read_input_tokens || 0) + cacheWritten,
+                  output: o.usage.output_tokens || 0,
+                  ...(typeof o.usage.cache_read_input_tokens === "number"
+                    ? { cachedInput: o.usage.cache_read_input_tokens }
+                    : {}),
+                  // Cache writes stay inside `input` (the context meter reads
+                  // the whole figure) but are named, so telemetry can bill
+                  // them at the write rate instead of the plain input rate.
+                  ...cacheWrites,
+                }
+              : undefined;
+            const t = session.turn;
+            // Whose CLI turn just ended?  With lifecycle frames: one that took
+            // a message of this turn's (engaged), or whose result says it
+            // consumed one.  Without them (an older CLI), any human-origin
+            // result is this turn's — and a result the CLI's own turn wrote
+            // (`origin` task-notification, peer, ...) never is, whatever the
+            // queue count says.
+            const consumed = [...(meta.user_message_uuids ?? []), ...(meta.user_message_uuid === undefined ? [] : [meta.user_message_uuid])];
+            const claimsOurs = consumed.some((id) => t.sends.has(id));
+            for (const id of consumed) if (t.sends.has(id)) session.unconsumed.delete(id);
+            const origin = meta.origin?.kind;
+            const ours = session.lifecycle
+              ? session.engaged || claimsOurs
+              : claimsOurs || origin === undefined || origin === "human";
+            t.billedCalls.result(o.usage, ours);
+            session.engaged = false;
+            const share = advanceCost(meta.total_cost_usd);
+            if (!ours) {
+              unsolicitedFrames.foreignResults++;
+              session.foreignRunning = false;
+              console.warn(
+                `[claude] thread ${threadTag(threadId)}: a ${origin ?? "foreign"} turn the CLI started on its own ended ` +
+                  `ahead of this turn's message${costLabel(share)}; waiting for this turn's own`,
+              );
+              break;
+            }
+            t.usage = sumUsage(t.usage, resultUsage);
+            t.cost = t.cost === null || share === null ? null : (t.cost ?? 0) + share;
+            // result.usage is this CLI turn's own figure (the CLI resets it per
+            // turn, unlike total_cost_usd). cache reads count as input: they
             // are billed (at the cache rate) and they fill the window — but
             // they are reported separately too, so the UI can show how much
             // of the figure was context re-read rather than new text.
@@ -1081,23 +2008,38 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
             // (the Messages API's own field: end_turn, tool_use, ...) is the
             // right label for a normal completion and stays primary there.
             const isError = o.is_error === true;
-            const stopReason = isError
-              ? (o.terminal_reason ?? o.stop_reason ?? null)
-              : (o.stop_reason ?? o.terminal_reason ?? null);
-            settle(
-              !isError,
-              stopReason,
-              o.total_cost_usd ?? null,
-              o.usage
-                ? {
-                    input: (o.usage.input_tokens || 0) + (o.usage.cache_read_input_tokens || 0) + (o.usage.cache_creation_input_tokens || 0),
-                    output: o.usage.output_tokens || 0,
-                    ...(typeof o.usage.cache_read_input_tokens === "number"
-                      ? { cachedInput: o.usage.cache_read_input_tokens }
-                      : {}),
-                  }
-                : undefined,
-            );
+            // A rejected model id: the frame above named it, or the result
+            // alone reports a 404 before any output.  `unknown_model` is what
+            // retry.ts already classifies as terminal, and what the failover
+            // reads to mark this (bot, model) pair as rejected.
+            const liveTurn = t;
+            const modelRejected =
+              Boolean(liveTurn?.modelRejection) ||
+              (isError && o.api_error_status === 404 && !liveTurn?.producedOutput);
+            if (modelRejected && liveTurn && !liveTurn.modelRejection) {
+              const reported = String(o.result ?? "");
+              const message = modelRejectionMessage(
+                reported.length < MODEL_REJECTION_TEXT_MAX ? reported : "",
+                liveTurn.input.model,
+              );
+              liveTurn.modelRejection = message;
+              emit({ ...base(threadId, currentTurnId()), type: "runtime.error", message });
+            }
+            const stopReason = modelRejected
+              ? "unknown_model"
+              : isError
+                ? (o.terminal_reason ?? o.stop_reason ?? null)
+                : (o.stop_reason ?? o.terminal_reason ?? null);
+            t.outcome = { ok: !isError && !modelRejected, stopReason };
+            // More of this turn is still to run: a message of its own that no
+            // CLI turn has taken yet — a steer that landed after the last
+            // model call, or one written after the CLI wrote this result but
+            // before the harness read it.  Each gets a CLI turn and a result
+            // of its own, and that reply is this turn's: settling here would
+            // drop it.  An older CLI only reports how many sends are queued.
+            const more = session.lifecycle ? session.unconsumed.size > 0 : (meta.queued_turn_count ?? 0) > 0;
+            if (more) break;
+            settle(t.outcome.ok, t.outcome.stopReason);
             break;
           }
         }
@@ -1123,6 +2065,12 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       });
 
       child.on("error", (e) => {
+        // Between turns there is nothing to fail: the close that follows
+        // ends the session, and the next turn spawns a fresh process.
+        if (!session.turn) {
+          console.warn(`[claude] thread ${threadTag(threadId)}: the CLI process failed between turns (${e.message})`);
+          return;
+        }
         emit({ ...base(threadId, currentTurnId()), type: "runtime.error", ...describeSpawnFailure(e, config.cli) });
         settle(false, "spawn_error");
       });
@@ -1139,6 +2087,9 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           const verdict = classifyError({ exitCode: code, stderr: message });
           if (
             !liveTurn.retry.cancelled &&
+            // a command turn is not replayed: relaunching would run `/compact`
+            // a second time on the resumed session
+            !liveTurn.input.command &&
             code !== 0 &&
             verdict.transient &&
             !liveTurn.producedOutput &&
@@ -1248,14 +2199,14 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         killCliTree(child);
       };
       active.set(threadId, { stop, turnId, broker });
-      emit({ ...base(threadId, turnId), type: "turn.started" });
+      if (!turnStartedEmitted) emit({ ...base(threadId, turnId), type: "turn.started" });
 
       // prompt over stdin as a stream-json message — never argv (ARG_MAX).
       // stdin stays OPEN: that is what keeps the session alive for a
       // mid-turn steer or the next turn; closeSession() ends it.
       const plan = planTurnText(sessionId ?? newSessionId!);
       session.pendingReceipt = plan.pending;
-      if (!(await writeUser(session, threadId, plan.text))) {
+      if (!(await writeUser(session, threadId, plan.text, plan.bare))) {
         session.pendingReceipt = null;
         settle(false, "stdin_write_failed");
         closeSession(threadId, "stdin write failed");
@@ -1272,51 +2223,124 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       return writeUser(s, threadId, text);
     };
 
-    // Probe capabilities once per detected version.  Failed probes expire so
-    // a transient timeout does not require a harness restart to recover.
-    let strictMcpProbe: { version: string; expiresAt: number; result: Promise<boolean> } | undefined;
-    const supportsStrictMcp = (version: string, env: NodeJS.ProcessEnv): Promise<boolean> => {
+    // Probe capabilities once per detected version.  A "no" expires after
+    // 30 s so an upgrade is noticed without a restart; a probe that gave no
+    // answer (timeout) is kept only 5 s, and never reads as "too old".
+    type StrictMcpAnswer = "yes" | "no" | "unknown";
+    let strictMcpProbe: { version: string; expiresAt: number; result: Promise<StrictMcpAnswer> } | undefined;
+    const probeStrictMcp = (version: string, env: NodeJS.ProcessEnv): Promise<StrictMcpAnswer> => {
       if (strictMcpProbe?.version === version && strictMcpProbe.expiresAt > Date.now()) {
         return strictMcpProbe.result;
       }
+      const startedAt = Date.now();
+      const helpTimeout = claudeHelpTimeoutMs();
       const probe = {
         version,
         expiresAt: Date.now() + 30_000,
-        result: new Promise<boolean>((resolve) => {
-          execCli(config.cli, ["--help"], { timeout: 3000, env }, (error, stdout) => {
-            resolve(!error && /(?:^|\s)--strict-mcp-config(?:\s|$)/m.test(stdout));
+        result: new Promise<StrictMcpAnswer>((resolve) => {
+          execCli(config.cli, ["--help"], { timeout: helpTimeout, env }, (error, stdout) => {
+            if (!error && /(?:^|\s)--strict-mcp-config(?:\s|$)/m.test(stdout)) return resolve("yes");
+            const elapsed = Date.now() - startedAt;
+            if (isProbeTimeout(error) || (!stdout?.trim() && elapsed >= helpTimeout)) {
+              logProbeFailure(instanceId, `${config.cli} --help`, error, elapsed);
+              return resolve("unknown");
+            }
+            resolve("no");
           });
         }),
       };
       strictMcpProbe = probe;
-      void probe.result.then((supported) => {
-        if (supported) probe.expiresAt = Infinity;
+      void probe.result.then((answer) => {
+        if (answer === "yes") probe.expiresAt = Infinity;
+        // Not an answer: look again soon, but not on every call — each look
+        // is another process on an already busy Mac.
+        else if (answer === "unknown") probe.expiresAt = Date.now() + 5_000;
       });
       return probe.result;
     };
-
     const requireStrictMcp = async (): Promise<void> => {
       const env = claudeEnvironment(undefined, { ...process.env, ...input.environment });
-      if (!(await supportsStrictMcp(strictMcpProbe?.version ?? "unprobed", env))) {
-        throw new Error(CLAUDE_ISOLATION_REASON);
+      const strict = await probeStrictMcp(strictMcpProbe?.version ?? "unprobed", env);
+      if (strict === "yes") return;
+      // `--help` gave no answer in time: nothing says this CLI is too old, so
+      // the turn must not tell the user to update it.  It still cannot run
+      // unverified, so it fails as a slow check the next turn retries.
+      if (strict === "unknown") {
+        throw new Error(`${input.displayName || "Claude"} did not answer in time; try again in a moment`);
       }
+      // A failed probe conflates two very different causes: the CLI is too
+      // old for --strict-mcp-config (upgrade it), or the CLI cannot run at
+      // all (missing or not executable — a setup problem). Both surfaced as
+      // the generic isolation reason with no setup flag, so a dead claude
+      // binary never fed the doomed breaker the way spawn failures do.
+      // Distinguish the causes here, where the cause is knowable.
+      const spawnFailure = await new Promise<ReturnType<typeof describeSpawnFailure> | null>(
+        (resolve) => {
+          execCli(config.cli, ["--version"], { timeout: 10000, env }, (error) => {
+            if (!error) return resolve(null);
+            const failure = describeSpawnFailure(error as NodeJS.ErrnoException, config.cli);
+            resolve(failure.setup ? failure : null);
+          });
+        },
+      );
+      const reason = new Error(spawnFailure?.message ?? CLAUDE_ISOLATION_REASON) as Error & {
+        setup?: boolean;
+      };
+      if (spawnFailure) reason.setup = true;
+      throw reason;
     };
 
+    // Last definitive answers, so one probe that runs out of time on a busy
+    // Mac does not flip a working, signed-in Claude to "not installed" or
+    // "sign-in required".
+    const lastKnownVersion = new LastKnownAnswer<string>();
+    const lastKnownAuth = new LastKnownAnswer<boolean>();
+    const engineLabel = input.displayName || "Claude";
     const snapshot = async (): Promise<ProviderSnapshot> => {
       const env = claudeEnvironment(undefined, { ...process.env, ...input.environment });
-      const version = await new Promise<string | null>((resolve) => {
-        execCli(config.cli, ["--version"], { timeout: 8000, env }, (err, stdout) =>
-          resolve(err ? null : stdout.trim()),
-        );
+      // Its place among overlapping probes: taken before the process starts,
+      // so a slow older probe cannot replace what a newer one remembered.
+      const versionOrder = lastKnownVersion.begin();
+      const startedAt = Date.now();
+      const probed = await new Promise<{ version: string | null; error: Error | null }>((resolve) => {
+        execCli(config.cli, ["--version"], { timeout: 20000, env }, (err, stdout) => {
+          resolve({ version: err ? null : stdout.trim() || null, error: err });
+        });
       });
-      if (!version) return { state: "unavailable", reason: `\`${config.cli}\` CLI not found` };
-      if (!(await supportsStrictMcp(version, env))) {
+      let version = probed.version;
+      if (version) {
+        lastKnownVersion.record(version, versionOrder);
+      } else {
+        const elapsed = Date.now() - startedAt;
+        logProbeFailure(instanceId, `${config.cli} --version`, probed.error, elapsed);
+        const failure = classifyVersionProbeFailure(probed.error, config.cli, engineLabel, elapsed, 20000);
+        const remembered = failure.kind === "transient" ? lastKnownVersion.get() : null;
+        if (remembered) {
+          // Only a probe that gave no answer may stand on the last good
+          // version.  A missing or crashing binary is a verdict.
+          version = remembered;
+        } else {
+          if (failure.kind !== "transient") lastKnownVersion.forget(versionOrder);
+          return failure.kind === "transient"
+            ? { state: "unavailable", transient: true, reason: failure.reason }
+            : { state: "unavailable", reason: failure.reason };
+        }
+      }
+      const strict = await probeStrictMcp(version, env);
+      if (strict === "unknown") {
+        return { state: "unavailable", transient: true, reason: `${engineLabel} did not answer in time`, version };
+      }
+      if (strict === "no") {
         return {
           state: "unavailable",
           reason: CLAUDE_ISOLATION_REASON,
         };
       }
-      const authenticated = await claudeSignedIn(config.cli, env);
+      const authOrder = lastKnownAuth.begin();
+      const probedAuth = await claudeSignedIn(config.cli, env);
+      if (probedAuth !== undefined) lastKnownAuth.record(probedAuth, authOrder);
+      // Only as old as KNOWN_VERSION_MAX_AGE_MS: past that, unknown.
+      const authenticated = probedAuth ?? lastKnownAuth.get() ?? undefined;
       // claudeEnvironment strips ANTHROPIC_API_KEY, so turns run on the
       // CLI's own login (Pro/Max): the cost it reports is what the call
       // WOULD bill, not a charge
@@ -1326,8 +2350,14 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
     /** One-shot Claude call with the prompt on stdin, never argv. Approval
      * summaries can contain paths, commands, or secrets, so the generic
      * `claude -p "prompt"` shape is not safe for review. No tools or MCP
-     * servers are mounted in this isolated process. */
-    const generateReview = async (prompt: string, signal?: AbortSignal): Promise<string> => {
+     * servers are mounted in this isolated process.
+     *
+     * A review (`ReviewPrompt`) puts its brief in the system prompt, through
+     * the same `--append-system-prompt` flag every turn already uses, and
+     * only the action under review on stdin, so text inside the action reads
+     * as data rather than as part of the brief.  The brief is fixed text
+     * with nothing from the action in it, so argv is fine for it. */
+    const generateReview = async (stdin: string, system: string | undefined, signal?: AbortSignal): Promise<string> => {
       if (signal?.aborted) throw new Error("Claude review aborted");
       await requireStrictMcp();
       if (signal?.aborted) throw new Error("Claude review aborted");
@@ -1337,6 +2367,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           [
             "-p", "--model", "claude-haiku-4-5", "--output-format", "text",
             "--tools", "", "--mcp-config", '{"mcpServers":{}}', "--strict-mcp-config",
+            ...(system === undefined ? [] : ["--append-system-prompt", system]),
           ],
           {
             stdio: ["pipe", "pipe", "pipe"],
@@ -1383,7 +2414,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         if (signal?.aborted) onAbort();
         else {
           signal?.addEventListener("abort", onAbort, { once: true });
-          child.stdin.end(prompt);
+          child.stdin.end(stdin);
         }
       });
     };
@@ -1413,6 +2444,21 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           // Offered in every mode: a bypass instance runs a host-control turn
           // through the broker (see sendTurn), so the asks still reach a person.
           localComputerMcp: true,
+          // Native background work is switched off (CLAUDE_CONTAINMENT_ENV);
+          // BotFleet's own job tools reach Claude over MCP in P2, mounted on
+          // the same `agents` server that already carries ask_bot.
+          backgroundJobs: "emulated",
+          // Every helper frame carries parent_tool_use_id, and its steps nest
+          // under the Task/Agent row that started it.  One level deep; the
+          // three-at-once cap is the CLI's and advisory (CLAUDE_CONTAINMENT_ENV).
+          helpers: "typed",
+          // Every ask reaches the permission-prompt tool, except on a bypass
+          // instance, which asks nothing unless a turn is held for review.
+          reviewHook: config.permissionMode === "bypassPermissions" ? "after" : "before",
+          asksWhenHeld: true,
+          // The init frame lists the CLI's slash commands; an allowlisted one
+          // runs as a turn of its own (server/drivers/engine-commands.ts).
+          engineCommands: true,
         },
         sendTurn,
         steer,
@@ -1436,8 +2482,8 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           return () => listeners.delete(listener);
         },
       },
-      generateText: (prompt) => generateReview(prompt),
-      reviewPermission: generateReview,
+      generateText: (prompt) => generateReview(prompt, undefined),
+      reviewPermission: (prompt: ReviewPrompt, signal) => generateReview(prompt.data, prompt.system, signal),
       dispose: async () => {
         for (const { stop } of active.values()) stop();
         for (const threadId of [...sessions.keys()]) closeSession(threadId, "dispose");

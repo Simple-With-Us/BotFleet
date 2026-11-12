@@ -5,7 +5,7 @@ import { parseJson, type JsonValue } from "./schema.ts";
 import { getSentry, isSentryActive } from "./sentry.ts";
 import type { WebhookManager } from "./webhooks.ts";
 
-export const MAX_WEBHOOK_BODY_BYTES = 256 * 1024;
+export const MAX_WEBHOOK_BODY_BYTES = 1024 * 1024;
 const statusErrorSchema = z.object({ status: z.number().int().optional() });
 const serverAddressSchema = z.object({ port: z.number().int().min(1).max(65_535) });
 
@@ -135,7 +135,11 @@ export function createWebhookIngressHandler(
       // letting the throw escape the receiver and hang the connection.
       return json(res, 400, { error: "Malformed request URL" });
     }
-    const entry = Object.prototype.hasOwnProperty.call(routes, url.pathname) ? routes[url.pathname] : undefined;
+    const entry = Object.prototype.hasOwnProperty.call(routes, url.pathname)
+      ? routes[url.pathname]
+      : !url.search && !url.hash && /^\/zulip\/outgoing\/[A-Z0-9][A-Z0-9_-]{0,47}$/.test(url.pathname)
+        ? routes["/zulip/outgoing/*"]
+        : undefined;
     if (entry) {
       if (req.method !== "POST") return json(res, 405, { error: "Webhooks accept POST requests" });
       const route = typeof entry === "function" ? entry : entry.handler;
@@ -160,14 +164,18 @@ export function createWebhookIngressHandler(
       return;
     }
     if (req.method === "GET" && url.pathname === "/health") {
-      return json(res, 200, { app: "botfleet-webhooks", ready: true });
+      return json(res, 200, {
+        app: "botfleet-webhooks",
+        ready: true,
+        payloadDedupeSkips: manager.payloadDedupeSkipCount(),
+      });
     }
     if (req.method === "GET" && url.pathname === "/.well-known/apple-app-site-association") {
       return json(res, 200, {
         applinks: {
           details: [
             {
-              appIDs: ["CC8UTF7ATG.app.botfleet.ios", "CC8UTF7ATG.app.botfleet.macos"],
+              appIDs: ["CC8UTF7ATG.app.botfleet", "CC8UTF7ATG.app.botfleet.ios", "CC8UTF7ATG.app.botfleet.macos"],
               components: [{ "/": "/*" }],
             },
           ],
@@ -211,6 +219,16 @@ export function createWebhookIngressHandler(
         });
         return json(res, 401, { error: "Invalid webhook URL or secret" });
       }
+      const event = eventName(req);
+      if (manager.isEventIgnoredAtEdge?.(match[1], event)) {
+        req.resume();
+        const result = manager.recordIgnoredAtEdge(match[1], {
+          eventName: event,
+          contentType: header(req, "content-type"),
+          deliveryId: deliveryId(req),
+        });
+        return json(res, 202, { accepted: true, ...result });
+      }
       releaseAdmission = beginAdmission();
       if (!releaseAdmission) return json(res, 503, { error: "BotFleet is quiescing for an update" });
       const raw = await readRawBody(req);
@@ -219,7 +237,7 @@ export function createWebhookIngressHandler(
       const result = manager.receive(match[1], secret, {
         payload,
         contentType,
-        eventName: eventName(req),
+        eventName: event,
         userAgent: header(req, "user-agent"),
         deliveryId: deliveryId(req),
       });

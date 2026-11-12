@@ -1,7 +1,11 @@
 import { track } from "@/lib/analytics";
 import {
+  activeDrain,
   availableLabel,
-  installBlockedBusy,
+  drainLabel,
+  HOLDING_COPY,
+  installPausesWork,
+  PAUSES_WORK_COPY,
   installBlockedReason,
   installBlockedReasonDetail,
   mayUseLegacyLocalUpdate,
@@ -29,6 +33,7 @@ import {
   Crown,
   FolderMinus,
   FolderPlus,
+  GitMerge,
   Library,
   Loader2,
   Moon,
@@ -44,11 +49,14 @@ import {
   Sparkles,
   Settings,
   Puzzle,
+  ToyBrick,
   Trash2,
   Users,
   X,
 } from "lucide-react";
-import { api, useStore, formatTime, visibleMessages, getRoomTerminology, getConversationMode, latestChatActivity, compareBotsByRecentActivity, compareGroupsByRecentActivity, type Bot, type Group, type Message } from "@/state/store";
+import { api, useStore, formatTime, visibleMessages, getRoomTerminology, getConversationMode, latestChatActivity, compareBotsByRecentActivity, compareGroupsByRecentActivity, type Bot, type Group, type InstanceInfo, type Message, type ModelSelection, type Task } from "@/state/store";
+import { botSupportsImageAttachments } from "@/lib/model-images";
+import { roomRespondersForComposer } from "@/lib/group-routing";
 import { allowsMultipleBotThreads, rosterPrimaryLabel } from "../../shared/conversation-mode";
 import {
   THREAD_DRAG_TYPE,
@@ -59,9 +67,13 @@ import {
 } from "@/lib/thread-drag";
 
 import { BotAvatar, InitialsAvatar } from "./Avatar";
+import { BotOffBadge } from "./BotOffBadge";
+import { MergeAllThreadsDialog } from "./MergeAllThreadsDialog";
 import { ProviderMark } from "./ProviderIcons";
 import { stateForBot } from "@/lib/mascot";
 import { botActivityLocation, botStatusText, botWaitReason } from "@/lib/sidebar-activity";
+import { attentionWindowLabel, summarizeAttention } from "@/lib/routine-attention";
+import { useNow } from "@/lib/use-now";
 import { useUpdaterState } from "@/lib/updater";
 import { cn } from "@/lib/cn";
 import { plainPreview } from "@/lib/plain-preview";
@@ -79,6 +91,7 @@ import {
   useSnoozeExpiry,
 } from "@/lib/thread-snooze";
 import { ThreadSnoozeBadge, ThreadWakeButton } from "./SidebarThreadRow";
+import { ContextFillBadge, contextMeterFor } from "./ContextUsage";
 import { imageAttachmentFromFile, intakeFiles } from "@/lib/composer-attachments";
 import { pathForFile } from "./ComposerAttachments";
 import { appendDraftAttachments } from "@/lib/drafts";
@@ -174,28 +187,35 @@ function UpdateButton() {
   if (source === "none") return null;
 
   if (harnessStatus) {
-    const busy = local.busy !== null || Boolean(harnessRunning);
+    // An update holding new work counts as running even when the harness did
+    // not start it (an updater launched from a terminal).
+    const hold = activeDrain(harnessStatus, Date.now());
+    const busy = local.busy !== null || Boolean(harnessRunning) || hold !== null;
     // An install affordance that cannot install.  The button used to fall
     // through to a plain check whenever `canRun` was false — a different
     // action under the same label, with no install, no error and no icon
     // change, so it read as dead.  It says why instead, and stays down.
     const blockedReason = installBlockedReason(harnessStatus);
     const blockedReasonDetail = installBlockedReasonDetail(harnessStatus);
-    const isBusyBlocked = installBlockedBusy(harnessStatus);
-    const isBlocked = blockedReason !== null && !isBusyBlocked;
+    const pausesWork = installPausesWork(harnessStatus);
+    const isBlocked = blockedReason !== null;
     const label = harnessRunning
       ? runningLabel(harnessRunning)
-      : harnessAvailable
-        ? `${availableLabel(harnessStatus)} — ${isBusyBlocked ? "pause & install" : (blockedReason ?? "install")}`
-        : upToDate
-          ? "You're up to date"
-          : "Check for Updates";
+      : hold
+        ? HOLDING_COPY
+        : harnessAvailable
+          ? `${availableLabel(harnessStatus)} — ${blockedReason ?? (pausesWork ? "pause & install" : "install")}`
+          : upToDate
+            ? "You're up to date"
+            : "Check for Updates";
     // The harness's own diagnostic sentence behind a mapped reason, for the
     // hover only — the label above stays short.  Falls back to the label
     // itself when there is nothing extra to say.
-    const tooltip = harnessAvailable && (isBusyBlocked ? "Active work will pause and resume after update" : blockedReasonDetail)
-      ? `${availableLabel(harnessStatus)} — ${isBusyBlocked ? "Active work will pause and resume after update" : blockedReasonDetail}`
-      : label;
+    const tooltipReason = blockedReasonDetail ?? (pausesWork ? PAUSES_WORK_COPY : null);
+    const holdLine = drainLabel(hold, Date.now());
+    const tooltip = harnessAvailable && tooltipReason && !hold
+      ? `${availableLabel(harnessStatus)} — ${tooltipReason}`
+      : holdLine ? `${label}\n${holdLine}` : label;
     return (
       // The title rides on the wrapper: a disabled button is not hovered, so
       // its own tooltip never appears, and the reason has to be readable.
@@ -203,7 +223,7 @@ function UpdateButton() {
         <button
           onClick={() => {
             if (harnessRunning) return;
-            if (harnessAvailable) return void local.install({ force: true });
+            if (harnessAvailable) return void local.install();
             setCheckedAt(Date.now());
             void local.check();
           }}
@@ -320,7 +340,7 @@ function activityPreview(tool: NonNullable<Message["tool"]>): string {
   return target ? `${verb} · ${target}` : verb;
 }
 
-interface MenuState {
+export interface MenuState {
   botId: string;
   x: number;
   y: number;
@@ -431,7 +451,38 @@ type SidebarThread = {
   createdAt: number;
   lastActivity?: number;
   snoozedUntil?: number;
+  usage?: Task["usage"];
+  modelSelection?: ModelSelection;
 };
+
+function catalogWindow(instances: InstanceInfo[], selection: ModelSelection | undefined): number | undefined {
+  if (!selection) return undefined;
+  return instances
+    .find((instance) => instance.instanceId === selection.instanceId)
+    ?.models.options.find((option) => option.id === selection.model)?.contextWindow;
+}
+
+function threadContextMeter(
+  state: { instances: InstanceInfo[]; bots: Bot[] },
+  owner: ThreadOwner,
+  task: SidebarThread,
+) {
+  const bot = owner.kind === "bot" ? state.bots.find((entry) => entry.id === owner.id) : undefined;
+  return contextMeterFor({
+    used: task.usage?.lastInput,
+    reportedWindow: task.usage?.contextWindow,
+    catalogWindow: catalogWindow(state.instances, task.modelSelection ?? bot?.modelSelection),
+  });
+}
+
+function botContextMeter(state: { instances: InstanceInfo[]; bots: Bot[] }, bot: Bot) {
+  const task = bot.tasks?.find((entry) => entry.threadId === bot.threadId);
+  return contextMeterFor({
+    used: task?.usage?.lastInput,
+    reportedWindow: task?.usage?.contextWindow,
+    catalogWindow: catalogWindow(state.instances, task?.modelSelection ?? bot.modelSelection),
+  });
+}
 
 /** One conversation inside a channel.
  *
@@ -591,7 +642,7 @@ function ThreadListItem({
             });
           }
         }}
-        title={`${label}\u00a0 — double-click to rename, drag onto a bot to move, onto a thread to merge`}
+        title={`${label}\u00a0 — Double-click to rename, drag onto a bot to move, onto a thread to merge`}
         className={cn(
           "flex w-full min-w-0 items-center gap-2 rounded-lg py-1 pr-2 text-left transition-colors",
           density === "compact" ? "pl-8" : "pl-9",
@@ -604,6 +655,7 @@ function ThreadListItem({
       >
         <span className="size-1.5 shrink-0 rounded-full bg-current opacity-40" />
         <span className={cn("truncate text-[13px]", asleep && "opacity-60")}>{label}</span>
+        <ContextFillBadge meter={threadContextMeter(state, owner, task)} />
         <ThreadSnoozeBadge threadId={task.threadId} snoozedUntil={task.snoozedUntil} />
       </button>
       {asleep && (
@@ -934,8 +986,13 @@ function GroupListItem({
     const files = Array.from(e.dataTransfer?.files ?? []);
     if (!files.length) return;
     dispatch({ type: "select", id: group.id });
+    // A drop becomes a room draft. Use the same default responders as the
+    // composer; mentioning another bot later rechecks the gate at send time.
+    const responders = roomRespondersForComposer("", members, group);
+    const allowImages = responders.length > 0 &&
+      responders.every((member) => botSupportsImageAttachments(state.instances, member));
     const { attachments } = await intakeFiles(files, {
-      allowImages: true,
+      allowImages,
       getPath: pathForFile,
       uploadImage: imageAttachmentFromFile,
     });
@@ -1641,16 +1698,20 @@ function SectionPicker({
   );
 }
 
-function BotContextMenu({
+// Exported for tests/e2e/sidebar-menu-hover.visual.spec.ts, which mounts the
+// real menu so a change to the hover fill cannot silently regress.
+export function BotContextMenu({
   menu,
   onClose,
   onArchive,
   onMoveToSection,
+  onMergeAll,
 }: {
   menu: MenuState;
   onClose: () => void;
   onArchive: (bot: Bot) => void;
   onMoveToSection: (botId: string) => void;
+  onMergeAll: (botId: string) => void;
 }) {
   const { state, dispatch } = useStore();
   const bot = state.bots.find((b) => b.id === menu.botId);
@@ -1674,6 +1735,7 @@ function BotContextMenu({
   const engine = state.instances.find((instance) => instance.instanceId === bot.modelSelection.instanceId);
   const canCoordinate = engine?.capabilities?.agentsMcp === true;
   const visibleBotCount = state.bots.filter((candidate) => !candidate.hidden).length;
+  const threadCount = bot.tasks?.length ?? 0;
   const archiveBlocked = Boolean(bot.chiefOfStaff) || visibleBotCount <= 1;
   const archiveHint = bot.chiefOfStaff
     ? "Choose another Chief of Staff first"
@@ -1688,7 +1750,7 @@ function BotContextMenu({
     icon: React.ReactNode,
     label: string,
     onClick?: () => void,
-    opts?: { danger?: boolean; disabled?: boolean; hint?: string },
+    opts?: { danger?: boolean; disabled?: boolean; hint?: string; testId?: string },
   ) => (
     <button
       key={label}
@@ -1698,10 +1760,11 @@ function BotContextMenu({
         onClose();
       }}
       title={opts?.hint}
+      data-testid={opts?.testId}
       className={cn(
         "flex w-full items-center gap-3 px-3.5 py-2 text-left text-[14px]",
         opts?.danger ? "text-danger" : "text-ink",
-        opts?.disabled ? "cursor-default opacity-40" : "hover:bg-raised/70",
+        opts?.disabled ? "cursor-default opacity-40" : "hover:bg-raised-hover",
       )}
     >
       {icon}
@@ -1721,6 +1784,7 @@ function BotContextMenu({
           bot.pinned ? <PinOff size={16} className="text-ink-secondary" /> : <Pin size={16} className="text-ink-secondary" />,
           bot.pinned ? "Unpin" : "Pin",
           () => dispatch({ type: "updateBot", botId: bot.id, patch: { pinned: !bot.pinned } }),
+          { testId: "bot-menu-item-pin" },
         ),
         item(
           <Crown size={16} className={bot.chiefOfStaff ? "text-accent" : "text-ink-secondary"} />,
@@ -1729,6 +1793,7 @@ function BotContextMenu({
           {
             disabled: !bot.chiefOfStaff && !canCoordinate,
             hint: !bot.chiefOfStaff && !canCoordinate ? "Choose an engine with coordination first" : undefined,
+            testId: "bot-menu-item-chief",
           },
         ),
         item(<FolderPlus size={16} className="text-ink-secondary" />, "Move to Section", () => {
@@ -1737,6 +1802,19 @@ function BotContextMenu({
         }),
         item(<BellDot size={16} className="text-ink-secondary" />, "Mark as Unread", () =>
           dispatch({ type: "markUnread", botId: bot.id }),
+        ),
+        item(
+          <GitMerge size={16} className="text-ink-secondary" />,
+          "Merge All Threads…",
+          () => {
+            onClose();
+            onMergeAll(bot.id);
+          },
+          {
+            disabled: threadCount < 2,
+            hint: threadCount < 2 ? "This bot has one conversation" : undefined,
+            testId: "bot-menu-item-merge",
+          },
         ),
         divider("d1"),
         item(<Pencil size={16} className="text-ink-secondary" />, "Edit Profile", () => {
@@ -1758,6 +1836,7 @@ function BotContextMenu({
           {
             disabled: archiveBlocked,
             hint: archiveHint,
+            testId: "bot-menu-item-archive",
           },
         ),
         item(<Trash2 size={16} />, "Delete", () => dispatch({ type: "deleteBot", botId: bot.id }), {
@@ -1768,7 +1847,7 @@ function BotContextMenu({
   );
 }
 
-function BotListItem({
+export function BotListItem({
   bot,
   density,
   onMenu,
@@ -1786,6 +1865,13 @@ function BotListItem({
   const selected = state.activeView === "chat" && state.selectedId === bot.id;
   const mascotMotion = selected && state.mascotMotion?.botId === bot.id ? state.mascotMotion : null;
   const iconOnly = density === "icons";
+  const isDragging = useRef(false);
+
+  const selectBot = () => {
+    dispatch({ type: "select", id: bot.id });
+    window.dispatchEvent(new CustomEvent("focus-composer"));
+  };
+
   useEffect(() => {
     if (iconOnly) setRenaming(false);
   }, [iconOnly]);
@@ -1796,12 +1882,27 @@ function BotListItem({
   const activityAt = latestChatActivity(bot.tasks, last?.at, bot.createdAt ?? 0);
   const waitReason = botWaitReason(bot, last, state.bots);
   const previewText = preview(bot, last, state.bots, state.groups);
-  // Icon shape ported from upstream's SidebarBotActivity: CircleAlert for
-  // anything needing a person or naming a teammate, a spinning Loader2 as
-  // the fallback for plain busy work, nothing for idle.
-  const StatusIcon = waitReason ? (waitReason.kind === "teammate" ? Clock3 : CircleAlert) : bot.busy ? Loader2 : null;
+  const hasTurnError = last?.kind === "activity" && Boolean(last.tool?.name.startsWith("error:"));
+  const isDead = bot.activity === "dead";
+  const hasError = hasTurnError || isDead;
+  const needsAction = waitReason?.kind === "approval" || bot.activity === "waiting-on-you";
+  // Icon shape ported from upstream's SidebarBotActivity: CircleAlert in red
+  // for turn errors or dead bot, CircleAlert/Clock3 in warning for approvals/questions,
+  // spinning Loader2 as the fallback for plain busy work, nothing for idle.
+  const StatusIcon = hasError
+    ? CircleAlert
+    : waitReason
+      ? (waitReason.kind === "teammate" ? Clock3 : CircleAlert)
+      : bot.busy
+        ? Loader2
+        : null;
+  const displayPreviewText = hasTurnError
+    ? `Error: ${last!.tool!.name.slice(6).trim()}`
+    : isDead
+      ? "Process terminated"
+      : previewText;
   const rowClass = cn(
-    "flex w-full items-center rounded-xl border text-left",
+    "flex w-full items-center rounded-xl border text-left select-none cursor-pointer",
     iconOnly
       ? "justify-center px-1 py-1.5"
       : density === "compact"
@@ -1817,18 +1918,40 @@ function BotListItem({
   );
   const body = (
     <>
-      <BotAvatar
-        bot={bot}
-        state={stateForBot({ ...bot, messages: visible })}
-        size={avatarSize}
-        motion={mascotMotion?.kind ?? "none"}
-        motionKey={mascotMotion?.nonce ?? 0}
-        // Motion means something is happening. A resting bot holds a resting
-        // pose — N idle rows bobbing at display rate was most of the app's
-        // visible-idle CPU (states are keyword-derived, so "working" can be
-        // decorative; busy/unread/motion are the real signals).
-        animated={Boolean(bot.busy) || Boolean(bot.unread) || (mascotMotion?.kind ?? "none") !== "none"}
-      />
+      <div className="shrink-0 pointer-events-none relative data-[off=true]:opacity-50 data-[off=true]:grayscale" data-off={bot.off === true ? "true" : undefined}>
+        <BotAvatar
+          bot={bot}
+          state={stateForBot({ ...bot, messages: visible })}
+          size={avatarSize}
+          motion={mascotMotion?.kind ?? "none"}
+          motionKey={mascotMotion?.nonce ?? 0}
+          // Motion means something is happening. A resting bot holds a resting
+          // pose — N idle rows bobbing at display rate was most of the app's
+          // visible-idle CPU (states are keyword-derived, so "working" can be
+          // decorative; busy/motion are the real signals, while unread has its
+          // own badge and would otherwise animate idle background bots forever).
+          animated={Boolean(bot.busy) || (mascotMotion?.kind ?? "none") !== "none"}
+        />
+        {iconOnly && bot.off === true && <BotOffBadge compact className="absolute -bottom-1 -right-1" />}
+        {iconOnly && (
+          hasError ? (
+            <span
+              title={hasTurnError ? `Turn error: ${last?.tool?.name.slice(6).trim()}` : "Process terminated"}
+              className="absolute -top-0.5 -right-0.5 size-2.5 rounded-full bg-danger ring-2 ring-card"
+            />
+          ) : needsAction ? (
+            <span
+              title={waitReason?.kind === "approval" ? "Waiting for your approval" : "Waiting for your response"}
+              className="absolute -top-0.5 -right-0.5 size-2.5 rounded-full bg-warning ring-2 ring-card"
+            />
+          ) : bot.unread ? (
+            <span
+              title="Unread messages"
+              className="absolute -top-0.5 -right-0.5 size-2.5 rounded-full bg-accent ring-2 ring-card"
+            />
+          ) : null
+        )}
+      </div>
       <div className={cn("min-w-0 flex-1", iconOnly && "hidden")}>
         <div className="flex items-baseline justify-between gap-2">
           <span className="flex min-w-0 items-center gap-1.5 truncate text-[15px] font-semibold text-ink">
@@ -1838,6 +1961,8 @@ function BotListItem({
               value={bot.name}
               onCommit={(name) => dispatch({ type: "updateBot", botId: bot.id, patch: { name } })}
               onEditingChange={setRenaming}
+              onActivate={selectBot}
+              embedded
               className="truncate"
               inputClassName="w-full rounded bg-inset px-1 py-0.5 text-[15px] font-semibold"
             />
@@ -1854,6 +1979,8 @@ function BotListItem({
                 </span>
               );
             })()}
+            {bot.off === true && <BotOffBadge className="ml-1" />}
+            <ContextFillBadge meter={botContextMeter(state, bot)} />
           </span>
           {selected && activityAt > 0 && !renaming && (
             <span className="shrink-0 text-xs text-ink-secondary transition-opacity group-hover:opacity-0 group-focus-within:opacity-0">
@@ -1861,15 +1988,15 @@ function BotListItem({
             </span>
           )}
         </div>
-        <div className="flex items-center justify-between gap-2">
-          <span className="flex min-w-0 items-center gap-1.5 truncate text-[13px] text-ink-secondary">
-            {bot.chiefOfStaff && !bot.busy && !waitReason && (
+        <div className="flex items-center justify-between gap-2 select-none">
+          <span className="flex min-w-0 items-center gap-1.5 truncate text-[13px] text-ink-secondary select-none">
+            {bot.chiefOfStaff && !bot.busy && !waitReason && !hasError && (
               <span className="flex shrink-0 items-center gap-1 text-[11.5px] font-medium text-accent">
                 <Crown size={11} /> Chief of Staff
               </span>
             )}
-            {bot.chiefOfStaff && !bot.busy && !waitReason && previewText && <span className="shrink-0 text-ink-secondary/60">·</span>}
-            {bot.chiefOfStaff && (bot.busy || waitReason) && (
+            {bot.chiefOfStaff && !bot.busy && !waitReason && !hasError && displayPreviewText && <span className="shrink-0 text-ink-secondary/60">·</span>}
+            {bot.chiefOfStaff && (bot.busy || waitReason || hasError) && (
               <span title="Chief of Staff" className="flex shrink-0 items-center">
                 <Crown size={11} className="text-accent" />
               </span>
@@ -1878,16 +2005,35 @@ function BotListItem({
               <StatusIcon
                 size={11}
                 aria-hidden="true"
-                className={cn("shrink-0", waitReason ? "text-warning" : "animate-spin text-success")}
+                className={cn(
+                  "shrink-0",
+                  hasError ? "text-danger" : waitReason ? "text-warning" : "animate-spin text-success",
+                )}
               />
             )}
-            <span className={cn("truncate", (bot.busy || waitReason) && "font-medium text-ink")} title={previewText}>
-              {previewText}
+            <span className={cn("truncate select-none", (bot.busy || waitReason || hasError) && "font-medium text-ink")} title={displayPreviewText}>
+              {displayPreviewText}
             </span>
           </span>
-          {bot.unread && (
-            <span className="size-2 shrink-0 rounded-full bg-accent" />
-          )}
+          {hasError ? (
+            <span
+              title={hasTurnError ? `Turn error: ${last?.tool?.name.slice(6).trim()}` : "Process terminated"}
+              className="size-2 shrink-0 rounded-full bg-danger ring-2 ring-danger/30"
+              aria-label="Error"
+            />
+          ) : needsAction ? (
+            <span
+              title={waitReason?.kind === "approval" ? "Waiting for your approval" : "Waiting for your response"}
+              className="size-2 shrink-0 rounded-full bg-warning ring-2 ring-warning/30"
+              aria-label="Needs Action"
+            />
+          ) : bot.unread ? (
+            <span
+              title="Unread messages"
+              className="size-2 shrink-0 rounded-full bg-accent"
+              aria-label="Unread"
+            />
+          ) : null}
         </div>
       </div>
     </>
@@ -1947,8 +2093,7 @@ function BotListItem({
     const files = Array.from(e.dataTransfer?.files ?? []);
     if (!files.length) return;
     dispatch({ type: "select", id: bot.id });
-    const instance = state.instances.find((i) => i.instanceId === bot.modelSelection?.instanceId);
-    const allowImages = Boolean(instance?.capabilities?.images);
+    const allowImages = botSupportsImageAttachments(state.instances, bot);
     const { attachments } = await intakeFiles(files, {
       allowImages,
       getPath: pathForFile,
@@ -1977,16 +2122,24 @@ function BotListItem({
   return (
     <div
       draggable
+      // A cancelled HTML5 drag may never deliver dragend (Escape or lost
+      // focus). Reset before the next pointer gesture so its click works.
+      onPointerDown={() => { isDragging.current = false; }}
+      onPointerCancel={() => { isDragging.current = false; }}
       onDragStart={(event) => {
+        isDragging.current = true;
         event.dataTransfer.setData(ROSTER_DRAG_TYPE, JSON.stringify({ kind: "bot", id: bot.id }));
         event.dataTransfer.effectAllowed = "move";
+      }}
+      onDragEnd={() => {
+        isDragging.current = false;
       }}
       onDragEnter={onDragEnter}
       onDragLeave={onDragLeave}
       onDragOver={onDragOver}
       onDrop={onDrop}
       className={cn(
-        "group relative rounded-xl transition-all",
+        "group relative rounded-xl transition-all select-none",
         isDragTarget && THREAD_DROP_CLASS,
       )}
       title={iconOnly ? bot.name : undefined}
@@ -1995,14 +2148,20 @@ function BotListItem({
         role="button"
         tabIndex={0}
         aria-label={iconOnly ? bot.name : undefined}
+        onBlur={() => { isDragging.current = false; }}
+        // One dispatch path: click.  #706 dispatched from both pointerup and
+        // click, so every row click selected twice (three times via the title
+        // before its stopPropagation).  A real HTML5 drag sets isDragging in
+        // onDragStart and never produces a click; a micro-move is just a click.
         onClick={() => {
-        dispatch({ type: "select", id: bot.id });
-        window.dispatchEvent(new CustomEvent("focus-composer"));
-      }}
+          if (!isDragging.current) {
+            selectBot();
+          }
+        }}
         onKeyDown={(event) => {
           if (event.key === "Enter" || event.key === " ") {
             event.preventDefault();
-            dispatch({ type: "select", id: bot.id });
+            selectBot();
           }
         }}
         onContextMenu={onContextMenu}
@@ -2174,10 +2333,18 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
   const importReturnRef = useRef<HTMLButtonElement>(null);
   const [menu, setMenu] = useState<MenuState | null>(null);
   const [sectionPicker, setSectionPicker] = useState<MenuState | null>(null);
+  const [mergeAll, setMergeAll] = useState<MenuState | null>(null);
   const [roomMenu, setRoomMenu] = useState<{ groupId: string; x: number; y: number } | null>(null);
   const [roomSectionPicker, setRoomSectionPicker] = useState<{ groupId: string; x: number; y: number } | null>(null);
   const [plusOpen, setPlusOpen] = useState(false);
   const [newRoom, setNewRoom] = useState(false);
+  // Summarizing walks and sorts the whole run history, and this component
+  // re-renders on every store change, so the count is memoized rather than
+  // recomputed per render.
+  const attentionNow = useNow();
+  // The recency windows derive from Date.now(), so the clock is a
+  // real dependency: without it the counts freeze until run state changes.
+  const attention = useMemo(() => summarizeAttention(state.routineRuns, attentionNow), [state.routineRuns, attentionNow]);
   const [threadCount, setThreadCountState] = useState(() => loadSidebarThreadCount());
   const setThreadCount = (next: number) => {
     const clamped = parseSidebarThreadCount(String(next));
@@ -3016,18 +3183,33 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
         >
           <CalendarDays size={20} className={state.activeView === "routines" ? "text-accent" : "text-ink-secondary"} />
           <span className={cn("flex-1 text-[14px]", density === "icons" && "hidden")}>Tasks &amp; Routines</span>
-          {state.routineRuns.some((run) => ["failed", "missed"].includes(run.status) && !run.seenAt) && (
-            <span className="size-2 rounded-full bg-danger" />
+          {attention.total > 0 && (
+            // The same backlog the Tasks & Routines badge counts.  An
+            // unlabelled red dot cannot be read at a glance, so the count and
+            // the recency travel with it.
+            <span
+              className="size-2 shrink-0 rounded-full bg-danger"
+              title={`${attention.total} need attention · ${attentionWindowLabel(attention)}`}
+            />
           )}
         </button>
         <button
           onClick={() => dispatch({ type: "togglePlugins", open: true })}
           className={cn("flex min-h-10 w-full items-center rounded-xl py-2 text-left hover:bg-raised/50", density === "icons" ? "justify-center px-2" : "gap-3 px-3")}
-          aria-label={density === "icons" ? "Connected Apps" : undefined}
-          title={density === "icons" ? "Connected Apps" : undefined}
+          aria-label={density === "icons" ? "Connected Apps via Composio" : undefined}
+          title={density === "icons" ? "Connected Apps via Composio" : undefined}
         >
           <Puzzle size={20} className="text-ink-secondary" />
-          <span className={cn("text-[14px] text-ink", density === "icons" && "hidden")}>Connected Apps</span>
+          <span className={cn("text-[14px] text-ink truncate", density === "icons" && "hidden")} title="Connected Apps via Composio">Connected Apps via Composio</span>
+        </button>
+        <button
+          onClick={() => dispatch({ type: "togglePluginsManager", open: true })}
+          className={cn("flex min-h-10 w-full items-center rounded-xl py-2 text-left hover:bg-raised/50", density === "icons" ? "justify-center px-2" : "gap-3 px-3")}
+          aria-label={density === "icons" ? "Drop-in plugins" : undefined}
+          title={density === "icons" ? "Drop-in plugins" : undefined}
+        >
+          <ToyBrick size={20} className="text-ink-secondary" />
+          <span className={cn("text-[14px] text-ink truncate", density === "icons" && "hidden")} title="Drop-in plugins">Plugins</span>
         </button>
         {density === "icons" && (
           <SidebarPhoneButton
@@ -3095,6 +3277,13 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
           onClose={() => setMenu(null)}
           onArchive={(bot) => void archiveBot(bot)}
           onMoveToSection={(botId) => setSectionPicker({ botId, x: menu.x, y: menu.y })}
+          onMergeAll={(botId) => setMergeAll({ botId, x: menu.x, y: menu.y })}
+        />
+      )}
+      {mergeAll && state.bots.find((candidate) => candidate.id === mergeAll.botId) && (
+        <MergeAllThreadsDialog
+          bot={state.bots.find((candidate) => candidate.id === mergeAll.botId)!}
+          onClose={() => setMergeAll(null)}
         />
       )}
       {sectionPicker && (
@@ -3208,7 +3397,7 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
           )}
           title="Drag to resize sidebar (double-click to reset)"
         >
-          <div className="absolute inset-y-0 -left-1.5 -right-1.5" />
+          <div className="absolute inset-y-0 -left-2.5 -right-2.5" />
         </div>
       )}
     </aside>

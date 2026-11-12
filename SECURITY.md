@@ -4,7 +4,7 @@
 
 Please **do not open a public issue** for security problems.  Use GitHub's private
 vulnerability reporting on this repository:
-[jaywedgeworth22/BotFleet security advisories](https://github.com/jaywedgeworth22/BotFleet/security/advisories/new).
+[Simple-With-Us/BotFleet security advisories](https://github.com/Simple-With-Us/BotFleet/security/advisories/new).
 You will get a response as soon as possible, normally within a few days.
 
 This fork does not publish a security mailbox.  Do not email the upstream OpenMausBot

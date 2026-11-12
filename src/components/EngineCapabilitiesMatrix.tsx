@@ -48,7 +48,8 @@ import {
   type CapabilityState,
   type EngineCapabilityEntry,
 } from "@/lib/engine-capabilities";
-import { PricingModeChip } from "./EngineCallout";
+import { AccessModeChip } from "./EngineCallout";
+import { ProviderMark } from "./ProviderIcons";
 import { cn } from "@/lib/cn";
 import type { InstanceInfo } from "@/state/store";
 
@@ -59,9 +60,9 @@ import type { InstanceInfo } from "@/state/store";
 // ---------------------------------------------------------------------------
 
 /** Usable width of the settings content pane, in CSS pixels:
- *  `max-w-[1100px]` on the dialog, minus the 164px section nav, minus the
+ *  `1292px` on the dialog, minus the 164px section nav, minus the
  *  20px `px-5` gutter on each side of the pane. */
-export const MATRIX_CONTENT_BUDGET_PX = 1100 - 164 - 20 * 2;
+export const MATRIX_CONTENT_BUDGET_PX = 1292 - 164 - 20 * 2;
 
 /** The card's own `p-4` on both sides. */
 export const MATRIX_CARD_PADDING_PX = 16 * 2;
@@ -72,9 +73,8 @@ export const MATRIX_TABLE_BUDGET_PX = MATRIX_CONTENT_BUDGET_PX - MATRIX_CARD_PAD
 /** The sticky engine column. */
 export const MATRIX_ROW_HEADER_PX = 188;
 
-/** One capability column.  Wide enough for the two-word column labels at
- *  10.5px once they wrap onto a second line. */
-export const MATRIX_CAPABILITY_COL_PX = 54;
+/** One capability column.  Comfortable width for column labels at 10.5px. */
+export const MATRIX_CAPABILITY_COL_PX = 68;
 
 // ---------------------------------------------------------------------------
 // Per-state presentation.  `unknown` gets its own dashed, low-contrast
@@ -85,7 +85,6 @@ const CELL_TONE = {
   yes: "text-emerald-700 dark:text-emerald-300 bg-emerald-500/10",
   no: "text-ink-secondary/70 bg-inset/30",
   limited: "text-amber-700 dark:text-amber-300 bg-amber-500/10",
-  "yes-pro-only": "text-violet-700 dark:text-violet-300 bg-violet-500/10",
   unknown: "text-ink-secondary/50 border border-dashed border-hairline/50 bg-transparent",
 } satisfies Record<CapabilityState, string>;
 
@@ -93,10 +92,11 @@ const CELL_TONE = {
  *  from fields the runtime actually provides — `snapshot.state`,
  *  `snapshot.authenticated`, and the presence of the instance — so a row
  *  never invents a reason string nobody reported. */
-export type EngineAvailability = "ready" | "signed-out" | "cli-missing" | "absent";
+export type EngineAvailability = "ready" | "checking" | "signed-out" | "cli-missing" | "absent";
 
 const AVAILABILITY_TONE = {
   ready: "bg-emerald-500",
+  checking: "border border-hairline/60 bg-inset",
   "signed-out": "bg-amber-500",
   "cli-missing": "bg-ink-secondary/50",
   absent: "border border-dashed border-hairline/60 bg-transparent",
@@ -104,6 +104,7 @@ const AVAILABILITY_TONE = {
 
 const AVAILABILITY_LABEL = {
   ready: "Ready",
+  checking: "Checking",
   "signed-out": "Not signed in",
   "cli-missing": "Command-line app not found",
   absent: "Not on this computer",
@@ -120,6 +121,8 @@ export function engineAvailability(
   if (!instances) return "absent";
   const match = instances.find((instance) => engineIdFor(instance) === entry.id);
   if (!match) return "absent";
+  // The last probe did not answer in time: not proof the app is missing.
+  if (match.snapshot.transient === true) return "checking";
   if (match.snapshot.state !== "available") return "cli-missing";
   if (match.snapshot.authenticated === false) return "signed-out";
   return "ready";
@@ -128,12 +131,39 @@ export function engineAvailability(
 function engineIdFor(instance: InstanceInfo): string | null {
   const normalized = instance.driverKind.replace(/Agent$/i, "").toLowerCase();
   if (normalized === "dsh" || normalized === "deepseek") return "deepseek-harness";
+  // The ZCode ACP bridge driver shares the headless zcode engine row.
+  if (normalized === "zcodeacp") return "zcode";
   return ENGINE_CAPABILITIES[normalized] ? normalized : null;
 }
 
 interface ActiveCell {
   engineId: string;
   key: CapabilityKey;
+}
+
+function engineMarkKind(entry: EngineCapabilityEntry): string {
+  switch (entry.id) {
+    case "deepseek-harness":
+      return "dshAgent";
+    case "mcode":
+      return "mcodeAgent";
+    case "muse":
+      return "museAgent";
+    case "opencode":
+      return "opencodeGo";
+    case "box":
+      return "boxAgent";
+    case "cli-wrapper":
+      return "cli-wrapper";
+    case "qwen":
+      return "qwenAgent";
+    case "hermes":
+      return "hermesAgent";
+    case "pi":
+      return "piAgent";
+    default:
+      return entry.id;
+  }
 }
 
 export function EngineCapabilitiesMatrix(props: {
@@ -147,7 +177,8 @@ export function EngineCapabilitiesMatrix(props: {
   // constant without touching the renderer.
   const engines = ENGINE_DISPLAY_ORDER
     .map((id) => ENGINE_CAPABILITIES[id])
-    .filter((entry): entry is EngineCapabilityEntry => Boolean(entry));
+    .filter((entry): entry is EngineCapabilityEntry => Boolean(entry))
+    .filter((entry) => entry.id !== "box");
 
   // Latched, not hovered.  `setActive` is called on mouse enter and on
   // focus and is *never* cleared by leaving — that is the fix.  A global
@@ -224,16 +255,12 @@ export function EngineCapabilitiesMatrix(props: {
                       title={AVAILABILITY_LABEL[availability]}
                       className={cn("size-1.5 shrink-0 rounded-full", AVAILABILITY_TONE[availability])}
                     />
-                    <span
-                      className={cn(
-                        "flex shrink-0 items-center justify-center rounded-md px-1.5 py-0.5 text-[10.5px] font-semibold uppercase tracking-wide",
-                        entry.capabilityBadgeColor,
-                      )}
-                    >
+                    <ProviderMark driverKind={engineMarkKind(entry)} size={16} />
+                    <span className="min-w-0 truncate text-[11.5px] font-medium text-ink">
                       {entry.displayName}
                     </span>
                     <span className="ml-auto shrink-0">
-                      <PricingModeChip entry={entry} />
+                      <AccessModeChip entry={entry} />
                     </span>
                   </span>
                 </th>
@@ -276,14 +303,8 @@ export function EngineCapabilitiesMatrix(props: {
         {activeEntry && active ? (
           <>
             <div className="flex flex-wrap items-center gap-2 text-[12px] font-medium text-ink">
-              <span
-                className={cn(
-                  "flex items-center justify-center rounded-md px-1.5 py-0.5 text-[10.5px] font-semibold uppercase tracking-wide",
-                  activeEntry.capabilityBadgeColor,
-                )}
-              >
-                {activeEntry.displayName}
-              </span>
+              <ProviderMark driverKind={engineMarkKind(activeEntry)} size={16} />
+              <span>{activeEntry.displayName}</span>
               <span className="text-ink-secondary">·</span>
               <span>{CAPABILITY_LABELS[active.key]}</span>
               <span className="text-ink-secondary">·</span>

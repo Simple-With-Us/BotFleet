@@ -20,6 +20,12 @@ describe("plainPreview", () => {
     expect(plainPreview("&notarealentity; stays")).toBe("&notarealentity; stays");
   });
 
+  it("leaves out-of-range and surrogate numeric entities intact instead of throwing RangeError", () => {
+    expect(plainPreview("bad &#1114112; &#x110000; &#999999999999; &#0; &#xd800; ok")).toBe(
+      "bad &#1114112; &#x110000; &#999999999999; &#0; &#xd800; ok",
+    );
+  });
+
   it("keeps the words a heading, quote or list decorated", () => {
     expect(plainPreview("## Status\n> blocked\n- one\n- two")).toBe("Status blocked one two");
     expect(plainPreview("1. first\n2) second")).toBe("first second");

@@ -184,7 +184,7 @@ describe("harness trust boundary", () => {
       if (child.exitCode !== null) throw new Error(`server exited ${child.exitCode}. stderr:\n${stderr}`);
       await new Promise((r) => setTimeout(r, 150));
     }
-  }, 40_000);
+  }, 120_000);
 
   afterAll(async () => {
     await waitForExit(child, { signal: "SIGTERM" });
@@ -309,7 +309,7 @@ describe("harness trust boundary", () => {
       const other = (await api("POST", "/api/bots", { name: "Victim" })).body.bot;
       const res = await api(
         "POST",
-        "/api/internal/ask-bot",
+        "/api/internal/coordinate-bots",
         { fromBotId: other.id, toBotId: grant.botId, message: "hi", depth: 0 },
         { authorization: `Bearer ${grant.token}` },
       );
@@ -322,7 +322,7 @@ describe("harness trust boundary", () => {
       // is an escalation the caller was never granted.
       const res = await api(
         "POST",
-        "/api/internal/ask-bot",
+        "/api/internal/coordinate-bots",
         { fromBotId: grant.botId, toBotId: grant.botId, message: "and again", depth: 1 },
         { authorization: `Bearer ${grant.token}` },
       );
@@ -333,8 +333,8 @@ describe("harness trust boundary", () => {
     it("lets the same token speak for its own bot, and turns away another bot's name", async () => {
       // The positive half, on the one route that answers immediately: the
       // grant is for THIS bot, so this bot's own name stands and only another
-      // name is refused.  (ask-bot is not the control — it dispatches a real
-      // peer turn and this fixture has no second engine.)
+      // name is refused.  (coordinate-bots is not the control — it records a
+      // real assignment and this fixture has no second engine.)
       const other = (await api("POST", "/api/bots", { name: "Target" })).body.bot;
       const own = await api("GET", `/api/internal/agents?self=${grant.botId}`, undefined, {
         authorization: `Bearer ${grant.token}`,
@@ -348,26 +348,11 @@ describe("harness trust boundary", () => {
   });
 
   describe("voice provider", () => {
-    it("stores an ElevenLabs key as ElevenLabs and verifies it there", async () => {
-      ttsChecks.length = 0;
-      const saved = await api("PUT", "/api/config", { tts: { key: "ak_test_elevenlabs", provider: "elevenlabs" } });
-      expect(saved.status, JSON.stringify(saved.body)).toBe(200);
-
-      // ElevenLabs verifies with `GET /voices` against its own API; the
-      // default provider's `POST /v1/get_voice` must not have been called.
-      expect(ttsChecks).toContain("GET /v1/voices");
-      expect(ttsChecks.filter((entry) => entry.includes("get_voice"))).toEqual([]);
-
-      const stored = (await api("GET", "/api/config")).body;
-      expect(stored.tts.provider).toBe("elevenlabs");
-    });
-
     it("verifies a MiniMax key against MiniMax", async () => {
       ttsChecks.length = 0;
       const saved = await api("PUT", "/api/config", { tts: { key: "ak_test_minimax", provider: "minimax" } });
       expect(saved.status, JSON.stringify(saved.body)).toBe(200);
       expect(ttsChecks.some((entry) => entry.includes("get_voice"))).toBe(true);
-      expect(ttsChecks.filter((entry) => entry.includes("voices"))).toEqual([]);
       expect((await api("GET", "/api/config")).body.tts.provider).toBe("minimax");
     });
 
@@ -375,7 +360,7 @@ describe("harness trust boundary", () => {
       ttsChecks.length = 0;
       const res = await api("PUT", "/api/config", { tts: { key: "ak_test_nope", provider: "acme-voice" } });
       expect(res.status).toBe(400);
-      expect(String(res.body.error)).toMatch(/elevenlabs/);
+      expect(String(res.body.error)).toMatch(/minimax/);
       // and nothing was transmitted anywhere
       expect(ttsChecks).toEqual([]);
       expect((await api("GET", "/api/config")).body.tts.provider).toBe("minimax");

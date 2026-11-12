@@ -14,6 +14,7 @@ import {
   ENGINE_DISPLAY_ORDER,
   capabilityCellGlyph,
   capabilityCellLabel,
+  engineAccessLabel,
   capabilityNoteFor,
   engineIdFromDriverKind,
   pricingModeLabel,
@@ -23,6 +24,10 @@ import {
   type PricingMode,
 } from "./engine-capabilities.tsx";
 
+// The engines the matrix describes.  It used to list eight while
+// `BUILT_IN_DRIVERS` carried seventeen: the rest had no row, so they fell
+// through to the "engine not in the registry yet" placeholder.  Keep this in
+// step with `ENGINE_DISPLAY_ORDER` — the test below fails if it drifts.
 const KNOWN_ENGINE_IDS = [
   "grok",
   "cursor",
@@ -32,6 +37,17 @@ const KNOWN_ENGINE_IDS = [
   "deepseek-harness",
   "minimax",
   "mcode",
+  "muse",
+  "kimi",
+  "zcode",
+  "droid",
+  "opencode",
+  "qwen",
+  "hermes",
+  "pi",
+  "openai-compat",
+  "box",
+  "cli-wrapper",
 ];
 
 describe("ENGINE_CAPABILITIES registry", () => {
@@ -50,6 +66,32 @@ describe("ENGINE_CAPABILITIES registry", () => {
     expect(map.get("grok-4.7")).toBe("grok");
     expect(map.get("grok-4.6")).toBe("grok");
     expect(map.get("grok-4.7-build-fast")).toBe("grok");
+  });
+
+  it("attributes grok-build-0.1 to Grok and keeps shared Composer 2.5 off Grok's unique mapping", () => {
+    const map = uniqueModelToEngineId();
+    // Unique to Grok: an xAI id no other engine serves.
+    expect(map.get("grok-build-0.1")).toBe("grok");
+    // Composer 2.5 is Cursor's model and Grok Build serves it too, so both
+    // engines list it and it stays unmapped.  If only Grok listed it, a
+    // metadata-free Composer bucket on a Cursor instance would be credited to
+    // Grok instead of resolving through its own instance (Cursor).
+    expect(ENGINE_CAPABILITIES.grok.defaultModels.map((m) => m.id)).toContain("composer-2.5");
+    expect(ENGINE_CAPABILITIES.cursor.defaultModels.map((m) => m.id)).toContain("composer-2.5");
+    expect(map.has("composer-2.5")).toBe(false);
+    expect(map.get("composer-2.5")).not.toBe("grok");
+    // Existing Cursor attribution is unchanged.
+    expect(map.get("cursor-default")).toBe("cursor");
+  });
+
+  it("labels the Grok Build catalog additions", () => {
+    const labelOf = (engine: string, id: string) =>
+      ENGINE_CAPABILITIES[engine].defaultModels.find((m) => m.id === id)?.display;
+    expect(labelOf("grok", "grok-build-0.1")).toBe("Grok Build 0.1");
+    expect(labelOf("grok", "composer-2.5")).toBe("Composer 2.5");
+    expect(labelOf("cursor", "composer-2.5")).toBe("Composer 2.5");
+    // Grok's lead row and default stay Grok 4.7.
+    expect(ENGINE_CAPABILITIES.grok.defaultModels[0].id).toBe("grok-4.7");
   });
 
   it("exposes one entry for every known engine id", () => {
@@ -81,8 +123,21 @@ describe("ENGINE_CAPABILITIES registry", () => {
     }
   });
 
-  it("has at least one default model per engine", () => {
+  it("has at least one default model per engine, unless its catalog is host-driven", () => {
+    // The Usage tab attributes a legacy task by its model id, so a row wants at
+    // least one id.  An engine whose catalog is whatever local hosts the user
+    // has configured has no fleet-wide id to name — its picker rows are
+    // `host::model` inject ids that depend on the machine.  Those rows declare
+    // `catalogIsHostDriven` and say "no default" out loud rather than shipping
+    // a plausible-looking id that resolves on nobody's setup.
     for (const [id, entry] of Object.entries(ENGINE_CAPABILITIES)) {
+      if (entry.catalogIsHostDriven) {
+        expect(
+          entry.defaultModels.length,
+          `${id} is host-driven, so it must declare no default model rather than an invented one`,
+        ).toBe(0);
+        continue;
+      }
       expect(entry.defaultModels.length, `${id} must declare at least one default model`).toBeGreaterThan(0);
       for (const model of entry.defaultModels) {
         expect(model.id.length).toBeGreaterThan(0);
@@ -213,6 +268,18 @@ describe("ENGINE_CAPABILITIES registry", () => {
     // ACP coding CLI, so the suffix strip has to reach the mcode row.
     expect(engineIdFromDriverKind("mcodeAgent")).toBe("mcode");
     expect(engineIdFromDriverKind("mcode")).toBe("mcode");
+    expect(engineIdFromDriverKind("museAgent")).toBe("muse");
+    // The OpenCode driver keeps its historical `opencodeGo` kind while the
+    // product name expanded, so the mapping needs the alias spelled out.
+    expect(engineIdFromDriverKind("opencodeGo")).toBe("opencode");
+    expect(engineIdFromDriverKind("kimiAgent")).toBe("kimi");
+    expect(engineIdFromDriverKind("droidAgent")).toBe("droid");
+    expect(engineIdFromDriverKind("qwenAgent")).toBe("qwen");
+    expect(engineIdFromDriverKind("hermesAgent")).toBe("hermes");
+    expect(engineIdFromDriverKind("piAgent")).toBe("pi");
+    expect(engineIdFromDriverKind("boxAgent")).toBe("box");
+    expect(engineIdFromDriverKind("openai-compat")).toBe("openai-compat");
+    expect(engineIdFromDriverKind("cli-wrapper")).toBe("cli-wrapper");
     expect(engineIdFromDriverKind("unknown-engine")).toBeNull();
     expect(engineIdFromDriverKind(undefined)).toBeNull();
   });
@@ -223,19 +290,14 @@ describe("ENGINE_CAPABILITIES registry", () => {
     // (server/drivers/claude.ts, codex.ts, antigravity.ts, and the DSH
     // ACP adapter).  A missing key renders as "-", which reads as
     // "engine cannot do this" — the exact underclaim Codex flagged.
-    for (const id of ["claude", "codex", "antigravity", "deepseek-harness"]) {
+    for (const id of ["claude", "codex", "antigravity", "deepseek-harness", "grok", "cursor", "mcode"]) {
       expect(ENGINE_CAPABILITIES[id].capabilities.connectedApps, id).toBe("yes");
     }
   });
 
-  it("marks MiniMax connectedApps as 'no' — the driver has no composioMcp", () => {
-    // Connected Apps is the Composio bridge, and MiniMax's direct
-    // driver declares no composioMcp in server/drivers/minimax.ts
-    // (Claude, Codex, Antigravity, pi, and the DSH ACP adapter all
-    // declare it).  'limited' still implied a partial channel that does
-    // not exist; driving this Mac is the thisComputer row
-    // (localComputerMcp), a different thing.  Pin 'no' so a future edit
-    // cannot silently regress the matrix to overclaim.
+  it("marks MiniMax API connectedApps as 'no' — the direct HTTP driver does not mount composioMcp", () => {
+    // Connected Apps is the Composio bridge, which the ACP/CLI drivers mount
+    // (including MiniMax Code) while the direct HTTP MiniMax driver does not.
     expect(ENGINE_CAPABILITIES.minimax.capabilities.connectedApps).toBe("no");
   });
 
@@ -265,30 +327,21 @@ describe("ENGINE_CAPABILITIES registry", () => {
     // The matrix lists the ids a live mcode session actually advertises, so
     // the engine's declared models and the picker's rows agree.
     expect(mcode.defaultModels.map((m) => m.id)).toEqual([
-      "MiniMax-M3",
-      "MiniMax-M3-thinking",
-      "MiniMax-M3.1-Flash-Preview-thinking",
+      "MiniMax-M3.1-Flash-thinking",
+      "MiniMax-M3.1-Flash-thinking-1M",
       "MiniMax-M2.7-highspeed-thinking",
-      "MiniMax-M2.7-thinking",
     ]);
     // The flash preview tier is the one a current mcode install defaults to,
     // so it must be reachable in the matrix too.  It is deliberately not the
     // first row: a preview id is never what a fresh install hands someone who
     // has not asked for it.
-    expect(mcode.defaultModels[0].id).toBe("MiniMax-M3");
+    expect(mcode.defaultModels[0].id).toBe("MiniMax-M3.1-Flash-thinking");
     expect(
-      mcode.defaultModels.find((m) => m.id === "MiniMax-M3.1-Flash-Preview-thinking")?.ctxTokens,
+      mcode.defaultModels.find((m) => m.id === "MiniMax-M3.1-Flash-thinking")?.ctxTokens,
+    ).toBe(524_288);
+    expect(
+      mcode.defaultModels.find((m) => m.id === "MiniMax-M3.1-Flash-thinking-1M")?.ctxTokens,
     ).toBe(1_000_000);
-  });
-
-  it("leaves MiniMax-M3 unmapped rather than crediting one of its two engines", () => {
-    // The shared flagship model id belongs to both MiniMax engines, so the
-    // unique-model map must not first-win it onto either one.  Engine-tagged
-    // usage still attributes correctly through engineIdFromDriverKind.
-    const map = uniqueModelToEngineId();
-    expect(map.get("MiniMax-M3")).toBeUndefined();
-    expect(engineIdFromDriverKind("minimax")).toBe("minimax");
-    expect(engineIdFromDriverKind("mcodeAgent")).toBe("mcode");
   });
 
   it("pricingModeLabel reads consistently with the pricing block", () => {
@@ -313,7 +366,7 @@ describe("ENGINE_CAPABILITIES registry", () => {
     expect(capabilityCellLabel("yes")).toBe("Available");
     expect(capabilityCellLabel("no")).toBe("Not available");
     expect(capabilityCellLabel("limited")).toBe("Limited");
-    expect(capabilityCellLabel("yes-pro-only")).toBe("Pro plan only");
+    expect(CAPABILITY_STATES).not.toContain("yes-pro-only");
     // A missing key and an explicit "unknown" say the same thing, and
     // neither of them says "not available".
     expect(capabilityCellLabel("unknown")).toBe("Not audited");
@@ -453,8 +506,9 @@ describe("ENGINE_CAPABILITIES user-facing copy", () => {
     expect(pricingModeLabel(pricing).toLowerCase()).not.toContain("bundled");
   });
 
-  it("bills DeepSeek Harness as DeepSeek PAYG, not a Claude Max bundle", () => {
+  it("bills Clutch as DeepSeek PAYG, not a Claude Max bundle", () => {
     const entry = ENGINE_CAPABILITIES["deepseek-harness"];
+    expect(entry.displayName).toBe("Clutch");
     expect(entry.pricing.kind).toBe("api");
     if (entry.pricing.kind !== "api") return;
     expect(entry.pricing.api).toMatchObject({
@@ -463,24 +517,33 @@ describe("ENGINE_CAPABILITIES user-facing copy", () => {
       cachedInputPer1k: 0.00007,
     });
     expect(entry.pricing.notes).toBe(
-      "DeepSeek Harness runs DeepSeek models over the harness ACP bridge.  Billing is DeepSeek pay-as-you-go at the public API catalog.  There is no subscription line on this engine.",
+      "Clutch runs models over the Clutch ACP bridge.  Billing is DeepSeek pay-as-you-go at the public API catalog.  There is no subscription line on this engine.",
     );
     expect(entry.whyThisEngine).toEqual({
-      headline: "DeepSeek models over the harness ACP bridge, billed pay-as-you-go.",
+      headline: "DeepSeek, Muse, and MiniMax models through the Clutch bridge.",
       prose: [
-        "DeepSeek Harness runs DeepSeek models through BotFleet's harness ACP bridge.  Files, terminal, this computer, web access, connected apps, and cross-bot coordination are available.",
-        "Billing is DeepSeek pay-as-you-go.  The rates in Pricing Mode are the public API catalog, not a subscription invoice.",
-        "BotFleet does not support image attachments on DeepSeek Harness yet.",
+        "Clutch runs DeepSeek, Meta Muse, and MiniMax models through BotFleet's Clutch ACP bridge.  Files, terminal, this computer, web access, image attachments, connected apps, and cross-bot coordination are available.  Image attachments remain per model:  DeepSeek-V4.1-Flash accepts images, while DeepSeek-V4-Pro carries a No Vision badge.",
+        "Muse and MiniMax use subscription-backed API-key access.  DeepSeek remains pay-as-you-go; the rates below are its public API catalog, not a subscription invoice.",
       ],
     });
-    expect(entry.capabilities.imageAttachments).toBe("no");
+    expect(entry.providerKinds).toEqual(["deepseekAgent", "muse", "minimax"]);
+    // Clutch reaches DeepSeek, Muse and MiniMax over its own harness CLI, so
+    // access reads CLI.  The API rates asserted below are what the turn is
+    // BILLED at — a separate column, and the reason this test exists.
+    expect(engineAccessLabel(entry)).toBe("CLI");
+    expect(entry.capabilities.imageAttachments).toBe("yes");
+    expect(entry.capabilities.longContext).toBe("yes");
+    expect(entry.defaultModels[0]).toEqual({
+      id: "DeepSeek-V4.1-Flash",
+      display: "DeepSeek-V4.1-Flash",
+      ctxTokens: 1_000_000,
+    });
     const copy = [
       entry.pricing.notes ?? "",
       entry.pricing.api.notes ?? "",
       entry.whyThisEngine.headline,
       ...entry.whyThisEngine.prose,
     ].join("\n");
-    expect(copy).toContain("BotFleet does not support image attachments");
     expect(copy).not.toContain("Bundled with Claude Max");
     expect(copy).not.toContain("Claude Max");
     expect(copy).not.toContain("same Claude Max seat");
@@ -495,4 +558,29 @@ describe("ENGINE_CAPABILITIES user-facing copy", () => {
     expect(pricingModeLabel(entry.pricing)).toBe("API · $0.00027/1k in");
     expect(pricingModeLabel(entry.pricing).toLowerCase()).not.toContain("bundled");
   });
+
+  it("leads Antigravity with Gemini 3.8 Flash and 3.1 Pro and marks longContext on OpenCode, Muse, and Clutch", () => {
+    const ag = ENGINE_CAPABILITIES.antigravity;
+    expect(ag.defaultModels[0]).toEqual({
+      id: "gemini-3.8-flash-high",
+      display: "Gemini 3.8 Flash (High)",
+      ctxTokens: 1_000_000,
+    });
+    expect(ag.defaultModels.map((m) => m.id)).toContain("gemini-3.1-pro-high");
+    expect(ENGINE_CAPABILITIES["deepseek-harness"].capabilities.longContext).toBe("yes");
+    expect(ENGINE_CAPABILITIES.opencode.capabilities.longContext).toBe("yes");
+    expect(ENGINE_CAPABILITIES.muse.capabilities.longContext).toBe("yes");
+    expect(ENGINE_CAPABILITIES.mcode.capabilities.roomCoordination).toBe("yes");
+  });
+
+  it("keeps access separate from billing", () => {
+    // Access names the driver BotFleet ships, so an engine whose only driver
+    // is a harness CLI reads "CLI" even when the vendor also sells an API.
+    expect(engineAccessLabel(ENGINE_CAPABILITIES.grok)).toBe("CLI");
+    expect(engineAccessLabel(ENGINE_CAPABILITIES.minimax)).toBe("API");
+    expect(engineAccessLabel(ENGINE_CAPABILITIES.mcode)).toBe("CLI");
+    expect(engineAccessLabel(ENGINE_CAPABILITIES.muse)).toBe("CLI");
+    expect(pricingModeLabel(ENGINE_CAPABILITIES.minimax.pricing)).toContain("Subscription + API");
+  });
 });
+

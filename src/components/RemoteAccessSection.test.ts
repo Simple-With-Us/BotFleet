@@ -36,6 +36,17 @@ describe("RemoteAccessSection", () => {
     expect(html.toLowerCase()).not.toContain("trycloudflare");
   });
 
+  it("highlights the actual Remote Access card in both configured and setup states", () => {
+    for (const configuredUrl of [CONFIGURED, undefined]) {
+      const html = renderToStaticMarkup(createElement(RemoteAccessSection, {
+        configuredUrl,
+        highlightClass: () => "search-focus-ring",
+      }));
+      expect(html).toContain('id="setting-remote-access"');
+      expect(html).toContain("search-focus-ring");
+    }
+  });
+
   it("renders the setup sentence and no URL or probe button when this install has no address", () => {
     for (const configuredUrl of [undefined, null, "", "   ", "not-a-url"]) {
       const html = renderToStaticMarkup(createElement(RemoteAccessSection, { configuredUrl }));

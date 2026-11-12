@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 import { DEFAULT_MAX_TOOL_ROUNDS, MAX_TOOL_ROUNDS } from "../../shared/bot-profile";
+import { MAX_MODEL_FALLBACKS } from "../../shared/model-limits";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -17,13 +18,16 @@ function source(rel: string): string {
 
 describe("desktop Settings Models layout", () => {
   const settings = source("src/components/SettingsModal.tsx");
+  const nav = source("src/components/SettingsNav.tsx");
   const fleet = source("src/components/FleetModelsSection.tsx");
 
-  it("grows the Settings dialog about 25–30 percent so fleet rows fit", () => {
-    expect(settings).toContain("max-w-[1100px]");
-    // 880px, not 720px: the Engines section opens on the capability matrix
-    // and the reader must not have to scroll before the hover detail appears.
-    expect(settings).toContain("h-[min(880px,calc(100dvh-3rem))]");
+  it("grows the Settings dialog so the capability table and fleet rows fit with user resizability", () => {
+    expect(settings).toContain("DEFAULT_SETTINGS_MODAL_WIDTH_PX = 1292");
+    // 976px (880 + 96, 1 inch taller) and 1292px (1100 + 192, 2 inches wider):
+    // the Engines section opens on the capability matrix and the reader
+    // sees the full table and hover details without cutoffs.
+    expect(settings).toContain("DEFAULT_SETTINGS_MODAL_HEIGHT_PX = 976");
+    expect(settings).toContain("saveSettingsModalSize");
     expect(settings).not.toContain("h-[min(720px,calc(100dvh-3rem))]");
     expect(settings).not.toContain("max-w-[860px]");
     expect(settings).not.toContain("h-[560px]");
@@ -34,7 +38,8 @@ describe("desktop Settings Models layout", () => {
     // EngineCapabilitiesMatrix.MATRIX_CONTENT_BUDGET_PX is derived from
     // these two numbers; widening the nav back would reintroduce the
     // horizontal scroll the transposed matrix was built to remove.
-    expect(settings).toContain("w-[164px]");
+    expect(nav).toContain('SETTINGS_NAV_WIDTH_CLASS = "w-[164px]"');
+    expect(nav).not.toContain("w-[190px]");
     expect(settings).not.toContain("w-[190px]");
   });
 
@@ -53,7 +58,8 @@ describe("desktop Settings Models layout", () => {
 
   it("uses Title Case controls and drops developer-speak on this surface", () => {
     expect(fleet).toContain("Set Default");
-    expect(fleet).toContain("Workspace Default");
+    expect(fleet).toContain("Apply to All Bots");
+    expect(fleet).not.toContain("Workspace Default");
     expect(fleet).toContain("Set All Bots To Default");
     expect(fleet).not.toContain("Set default");
     expect(fleet).not.toContain(">slot<");
@@ -135,6 +141,45 @@ describe("Maximum Tool Rounds", () => {
     expect(panel).not.toContain("engine?.capabilities?.agentsMcp === true");
     expect(panel).not.toContain("engine?.capabilities?.composioMcp === true");
     expect(panel).not.toContain("engine?.capabilities?.approvalReview === true");
+  });
+});
+
+describe("Fallback cap agreement", () => {
+  // The cap was a bare 2 typed in three places that disagreed.  What is pinned
+  // now is AGREEMENT: every surface reads the one shared number, so raising it
+  // is a one-line change that cannot leave a screen behind.
+  const profile = source("ios/App/AgentProfileView.swift");
+  const fleet = source("src/components/FleetModelsSection.tsx");
+  const panel = source("src/components/SettingsPanel.tsx");
+  const panelFallbacks = source("src/components/BotFallbackModels.tsx");
+
+  it("the Models page reads the shared cap and keeps no number of its own", () => {
+    expect(fleet).toContain("shared/model-limits");
+    expect(fleet).toContain("fallbackSlotCount(fallbacks.length)");
+    expect(fleet).toContain("canAddFallback(fallbacks.length)");
+    expect(fleet).not.toContain("MAX_FALLBACKS");
+  });
+
+  it("the per-bot panel gates Add on the shared cap and lists every stored entry", () => {
+    expect(panel).toContain("<BotFallbackModels");
+    expect(panel).not.toMatch(/fallbacks\?\.length \|\| 0\) < \d/);
+    expect(panelFallbacks).toContain("shared/model-limits");
+    expect(panelFallbacks).toContain("canAddFallback(fallbacks.length)");
+    expect(panelFallbacks).toContain("fallbacks.map(");
+    expect(panelFallbacks).not.toMatch(/fallbacks\.length\s*<\s*\d/);
+  });
+
+  it("iOS mirrors the shared cap and lists every stored entry", () => {
+    expect(profile).toContain(`private static let maximumFallbacks = ${MAX_MODEL_FALLBACKS}`);
+    expect(profile).toContain("fallbacks.count < Self.maximumFallbacks");
+    expect(profile).not.toMatch(/fallbacks\.count\s*<\s*\d/);
+    expect(profile).toContain("ForEach(fallbacks.indices");
+  });
+
+  it("the server reads the same cap", () => {
+    const server = source("server/index.ts");
+    expect(server).toContain("shared/model-limits.ts");
+    expect(server).toContain("fallbackCountAllowed(");
   });
 });
 

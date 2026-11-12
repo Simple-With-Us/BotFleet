@@ -27,6 +27,9 @@ export interface ActiveTurnOwner {
   selection: ModelSelection;
   fallbackPolicy: ModelSelection;
   computerInputs?: TurnComputerInputs;
+  /** What started the turn when nobody typed it: `job` is a background
+   *  job's wake, whose cost is counted on its own (server/jobs/wake-usage.ts). */
+  automationSource?: string;
   /** Set when a settings change took away a provider this dispatch holds or
    * could reach.  A dispatch that has not reached its provider yet has no
    * session to interrupt, so its own pre-dispatch checks must see this and
@@ -78,6 +81,11 @@ export class ActiveTurnOwners {
     if (!owners) return undefined;
     if (providerInstanceId) return owners.get(providerInstanceId);
     return owners.size === 1 ? owners.values().next().value : undefined;
+  }
+
+  /** The provider instances with a live dispatch on this thread. */
+  instancesOn(threadId: string): string[] {
+    return [...(this.byThread.get(threadId)?.keys() ?? [])];
   }
 
   current(threadId: string): ActiveTurnOwner | undefined {
@@ -493,6 +501,22 @@ export function inspectThreadOwners(
     }
   }
   return { owners, inspectionFailed };
+}
+
+/** How far an auto-review stop reaches (server/index.ts
+ * `stopTurnForReview`).  `instance` stops only the engine that took the
+ * refused step and closes only its cards: another engine is live on the same
+ * thread, which is a room running two members at once, and stopping the
+ * thread would stop a member the reviewer never refused.  `thread` is the
+ * person's own Stop, which also settles in-process asks and peer approvals:
+ * the step's engine has the thread to itself, or the step did not say which
+ * engine took it, so the only safe stop is all of it. */
+export function reviewStopScope(args: {
+  instanceId: string | undefined;
+  liveInstanceIds: readonly string[];
+}): "instance" | "thread" {
+  if (!args.instanceId) return "thread";
+  return args.liveInstanceIds.some((id) => id !== args.instanceId) ? "instance" : "thread";
 }
 
 export async function interruptThreadOwners(

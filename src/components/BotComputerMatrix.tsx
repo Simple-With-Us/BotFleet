@@ -349,8 +349,8 @@ export function BotComputerMatrix({
                     <td className="px-3 py-2 text-ink">
                       <span className={cn(isOff && "text-ink-secondary")}>{bot.name}</span>
                       {isOff && (
-                        <span className="ml-2 rounded bg-hairline/40 px-1.5 py-0.5 text-[10.5px] uppercase text-ink-secondary">
-                          Off
+                        <span className="ml-2 rounded bg-hairline/40 px-1.5 py-0.5 text-[10.5px] lowercase tracking-normal text-ink-secondary">
+                          (no computer)
                         </span>
                       )}
                     </td>

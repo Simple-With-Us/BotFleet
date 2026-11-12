@@ -74,7 +74,7 @@ export async function fetchProviderModels(input: ModelDiscoveryInput): Promise<M
 export interface MergeModelsOptions {
   /** Ids to drop even when the provider still lists them.  This is how a
    *  product decision is expressed (see `acp/dsh.ts` dropping
-   *  `MiniMax-M2.7` from the Harness catalog). */
+   *  `MiniMax-M2.7` from the Clutch catalog). */
   excludeIds?: readonly string[];
   /** Keep `known.default` when it survived the refresh instead of
    *  resetting to the first row, so a refresh does not silently move a
@@ -134,6 +134,23 @@ export function mergeDiscoveredModels(
   const keepDefault = options.keepDefault ?? true;
   const defaultId = keepDefault && seen.has(known.default) ? known.default : merged[0].id;
   return { default: defaultId, options: merged };
+}
+
+/** The ids out of a `/models` answer, in provider order, duplicates dropped.
+ *  Reuses `readProviderRow`, so the narrowing of an untrusted provider row
+ *  lives in exactly one place instead of once per caller.  Takes the whole
+ *  result rather than the rows array so the untrusted `unknown[]` never
+ *  appears in this module's own signature. */
+export function providerModelIds(result: ModelDiscoveryResult): string[] {
+  const ids: string[] = [];
+  const seen = new Set<string>();
+  for (const row of result.rows ?? []) {
+    const read = readProviderRow(row);
+    if (!read || seen.has(read.id)) continue;
+    seen.add(read.id);
+    ids.push(read.id);
+  }
+  return ids;
 }
 
 /** Memoize a discovery fetch for `ttlMs`.  Drivers used to hand-roll this —

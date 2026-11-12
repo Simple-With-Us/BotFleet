@@ -76,14 +76,17 @@ export function TurnPresence({
       >
         {avatar}
         {showWorking ? (
-          <span className="flex items-center gap-2" aria-live="polite">
-            {actorName ? (
-              <span className="text-[13px] font-semibold text-ink">
-                {actorName}
+          <span className="flex items-center gap-2">
+            <span className="flex items-center gap-2" aria-live="polite">
+              {actorName ? (
+                <span className="text-[13px] font-semibold text-ink">
+                  {actorName}
+                </span>
+              ) : null}
+              <span className="thinking-shimmer animate-shimmer text-[13px] leading-none">
+                {label}
+                {elapsed > 0 ? <span aria-hidden="true">{` · ${elapsed}s`}</span> : null}
               </span>
-            ) : null}
-            <span className="thinking-shimmer animate-shimmer text-[13px] leading-none">
-              {label}{elapsed > 0 ? ` · ${elapsed}s` : ""}
             </span>
             {modelName ? (
               <span className="flex items-center gap-1.5 text-[12px] leading-none text-ink-secondary">

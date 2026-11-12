@@ -672,6 +672,25 @@ final class DecodingTests: XCTestCase {
         XCTAssertEqual(kind, "routine.run")
     }
 
+    func testDecodesAnInstancesFrame() throws {
+        let json = #"{"kind":"instances","seq":4,"describedAt":1,"instances":[]}"#
+        let frame = try JSONDecoder().decode(StreamFrame.self, from: Data(json.utf8))
+        guard case let .instances(list, describedAt) = frame.frame else {
+            return XCTFail("expected .instances, got \(frame.frame)")
+        }
+        XCTAssertTrue(list.isEmpty)
+        XCTAssertEqual(describedAt, 1)
+        XCTAssertEqual(frame.seq, 4)
+    }
+
+    func testDecodesAHiddenEngineSnapshot() throws {
+        let json = #"{"state":"unavailable","hidden":true,"reason":"no Box token"}"#
+        let snapshot = try JSONDecoder().decode(ProviderSnapshot.self, from: Data(json.utf8))
+        XCTAssertTrue(snapshot.isHidden)
+        let plain = try JSONDecoder().decode(ProviderSnapshot.self, from: Data(#"{"state":"available"}"#.utf8))
+        XCTAssertFalse(plain.isHidden)
+    }
+
     func testDecodesANotifyFrame() throws {
         let json = """
         {"kind":"notify","seq":12,"notification":{

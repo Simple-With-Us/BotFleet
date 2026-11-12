@@ -92,24 +92,29 @@ function fakeHarness(): FakeHarness {
 }
 
 describe("browser Sentry", () => {
-  it("keeps Replay 100% on error / 10% session, Feedback, and mask-all privacy", () => {
+  it("keeps Replay opt-in (100% on error / 10% session when on), Feedback, and mask-all privacy", () => {
     const src = readFileSync(join(ROOT, "src/lib/sentry.ts"), "utf8");
     expect(src).toMatch(/VITE_SENTRY_DSN/);
+    expect(src).toMatch(/replayOptedIn\(\)/);
+    expect(src).toMatch(/\/\^\(true\|1\|on\|yes\)\$\/i/);
     expect(src).toMatch(/replaysSessionSampleRate[\s\S]*\?\? "0\.1"/);
     expect(src).toMatch(/replaysOnErrorSampleRate[\s\S]*\?\? "1\.0"/);
     expect(src).toMatch(/maskAllText:\s*true/);
     expect(src).toMatch(/blockAllMedia:\s*true/);
     expect(src).toMatch(/feedbackIntegration\(/);
     expect(src).toMatch(/autoInject:\s*false/);
-    expect(src).toMatch(/enableLogs:\s*true/);
-    expect(src).toMatch(/sendDefaultPii:\s*false/);
+    expect(src).toMatch(/urlQueryParams:\s*false/);
+    expect(src).not.toMatch(/sendDefaultPii/);
     expect(src).toMatch(/genAI:\s*\{\s*inputs:\s*false,\s*outputs:\s*false/);
+    expect(src).toMatch(/VITE_SENTRY_RELEASE/);
+    expect(src).toMatch(/release:\s*options\.release/);
   });
 
   it("iOS Cocoa reads SENTRY_DSN from Info.plist only", () => {
     const swift = readFileSync(join(ROOT, "ios/App/SentryTelemetry.swift"), "utf8");
     expect(swift).toMatch(/forInfoDictionaryKey: "SENTRY_DSN"/);
-    expect(swift).toMatch(/profilesSampleRate = 0\.1/);
+    // sentry-cocoa 9 replaced profilesSampleRate with configureProfiling.
+    expect(swift).toMatch(/configureProfiling = \{[^}]*sessionSampleRate = 0\.1/);
     expect(swift).toMatch(/sessionReplay\.onErrorSampleRate = 0\.1/);
     expect(swift).not.toMatch(/ingest\.sentry\.io/);
     expect(swift).not.toMatch(/\?\? "https:\/\//);
@@ -276,6 +281,53 @@ describe("renderer diagnostics refresh", () => {
     expect(harness.calls()).toBe(4);
   });
 
+  // BF-2466: Replay must stay off unless a build explicitly opts in, on
+  // both the packaged path and a runtime-DSN client started later.
+  it("keeps Replay off by default on the packaged and runtime paths", async () => {
+    vi.stubEnv("VITE_SENTRY_DSN", BUILD_DSN);
+    initSentry();
+    expect(sentry.record.inits).toHaveLength(1);
+    expect(sentry.record.inits[0]).toMatchObject({
+      dsn: BUILD_DSN,
+      replayEnabled: false,
+      replaysSessionSampleRate: 0,
+      replaysOnErrorSampleRate: 0,
+    });
+
+    harness.answer({ enabled: true, dsn: RUNTIME_DSN, environment: "production", tracesSampleRate: 0.2 });
+    await refreshSentryFromRuntime();
+    expect(sentry.record.inits).toHaveLength(2);
+    expect(sentry.record.inits[1]).toMatchObject({
+      dsn: RUNTIME_DSN,
+      replayEnabled: false,
+      replaysSessionSampleRate: 0,
+      replaysOnErrorSampleRate: 0,
+    });
+  });
+
+  it("enables Replay at 10% session / 100% on error only on explicit opt-in", async () => {
+    vi.stubEnv("VITE_SENTRY_DSN", BUILD_DSN);
+    vi.stubEnv("VITE_SENTRY_REPLAY_ENABLED", "true");
+    initSentry();
+    expect(sentry.record.inits).toHaveLength(1);
+    expect(sentry.record.inits[0]).toMatchObject({
+      dsn: BUILD_DSN,
+      replayEnabled: true,
+      replaysSessionSampleRate: 0.1,
+      replaysOnErrorSampleRate: 1.0,
+    });
+
+    harness.answer({ enabled: true, dsn: RUNTIME_DSN, environment: "production", tracesSampleRate: 0.2 });
+    await refreshSentryFromRuntime();
+    expect(sentry.record.inits).toHaveLength(2);
+    expect(sentry.record.inits[1]).toMatchObject({
+      dsn: RUNTIME_DSN,
+      replayEnabled: true,
+      replaysSessionSampleRate: 0.1,
+      replaysOnErrorSampleRate: 1.0,
+    });
+  });
+
   it("does not start the packaged client before the saved opt-out is known", async () => {
     vi.stubEnv("VITE_SENTRY_DSN", BUILD_DSN);
     let finishBoot: ((value: RuntimeObservability) => void) | undefined;
@@ -356,7 +408,7 @@ describe("renderer diagnostics refresh", () => {
     const hugeMessageWithEmoji = "Error: 🔥 something crashed 🚨 " + "x".repeat(10000) + " 💥";
     const url = buildFallbackIssueUrl("Error in Bot", hugeMessageWithEmoji, 2000);
     expect(url.length).toBeLessThanOrEqual(2000);
-    expect(url).toContain("https://github.com/jaywedgeworth22/BotFleet/issues/new?title=");
+    expect(url).toContain("https://github.com/Simple-With-Us/BotFleet/issues/new?title=");
     expect(url).toContain("Error%20in%20Bot");
     // Verify decodeURIComponent does not throw (meaning surrogate pairs were not split)
     expect(() => decodeURIComponent(url)).not.toThrow();
@@ -368,15 +420,19 @@ describe("renderer diagnostics refresh", () => {
     expect(() => decodeURIComponent(loneUrl)).not.toThrow();
 
     // Verify without native toWellFormed (Safari < 16.4 fallback path)
-    const orig = (String.prototype as unknown as Record<string, unknown>).toWellFormed;
+    interface StringPrototypeWithWellFormed {
+      toWellFormed?: () => string;
+    }
+    const patched = String.prototype as unknown as StringPrototypeWithWellFormed;
+    const orig = patched.toWellFormed;
     try {
-      delete (String.prototype as unknown as Record<string, unknown>).toWellFormed;
+      delete patched.toWellFormed;
       const fallbackUrl = buildFallbackIssueUrl("Fallback \uD800", "Lone \uDC00 and pair \uD83D\uDE00");
       expect(() => decodeURIComponent(fallbackUrl)).not.toThrow();
       expect(fallbackUrl).toContain(encodeURIComponent("\uFFFD"));
       expect(fallbackUrl).toContain(encodeURIComponent("😀"));
     } finally {
-      (String.prototype as unknown as Record<string, unknown>).toWellFormed = orig;
+      patched.toWellFormed = orig;
     }
   });
 

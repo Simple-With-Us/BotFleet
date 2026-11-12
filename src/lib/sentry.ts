@@ -8,7 +8,10 @@
  * a failed refresh leaves the current client alone.
  * Completely inert in dev/CI when neither path finds a DSN.
  *
- * Replay stays 100% on error / 10% session with mask-all privacy.
+ * Replay is opt-in and off by default (BF-2466): its rrweb recording
+ * kept an otherwise idle renderer at 14–21% CPU, so only an explicit
+ * `VITE_SENTRY_REPLAY_ENABLED=true` (or 1/on/yes) turns it on.  When on
+ * it stays 100% on error / 10% session with mask-all privacy.
  * User Feedback is the consumer widget.  Agent traces live on the
  * Node harness (`server/sentry.ts`), not this browser bundle.
  */
@@ -34,6 +37,7 @@ export interface SentryClientOptions {
   replayEnabled: boolean;
   replaysSessionSampleRate: number;
   replaysOnErrorSampleRate: number;
+  release?: string;
 }
 
 /** The three things this module does to the browser SDK.  Behind a port so
@@ -97,9 +101,8 @@ const browserPort: SentryBrowserPort = {
         Sentry.init({
           dsn: options.dsn,
           environment: options.environment,
+          release: options.release,
           tracesSampleRate: options.tracesSampleRate,
-          enableLogs: true,
-          sendDefaultPii: false,
           dataCollection: {
             userInfo: false,
             cookies: false,
@@ -183,6 +186,14 @@ function viteEnvText(value: string | undefined): string | undefined {
   return value?.trim() || undefined;
 }
 
+/** Replay records only on an explicit opt-in (BF-2466).  Unset, false-like
+ * and unrecognised values all stay off, so a packaged default can never
+ * silently re-enable the idle recording cost this lane removed. */
+function replayOptedIn(): boolean {
+  const raw = viteEnvText(import.meta.env.VITE_SENTRY_REPLAY_ENABLED);
+  return raw ? /^(true|1|on|yes)$/i.test(raw) : false;
+}
+
 function packagedClientOptions(): SentryClientOptions | null {
   const dsn = viteEnvText(import.meta.env.VITE_SENTRY_DSN);
   if (!dsn) return null;
@@ -190,18 +201,19 @@ function packagedClientOptions(): SentryClientOptions | null {
   const env = viteEnvText(import.meta.env.VITE_SENTRY_ENV) || viteEnvText(import.meta.env.MODE) || "production";
 
   const tracesSampleRate = Number(viteEnvText(import.meta.env.VITE_SENTRY_TRACES_SAMPLE_RATE) ?? "0.2");
-  const replayRaw = viteEnvText(import.meta.env.VITE_SENTRY_REPLAY_ENABLED);
-  const replayDisabled = replayRaw ? /^(false|0|off|no)$/i.test(replayRaw) : false;
+  const replayEnabled = replayOptedIn();
   const replaysSessionSampleRate = Number(viteEnvText(import.meta.env.VITE_SENTRY_REPLAY_SESSION_SAMPLE_RATE) ?? "0.1");
   const replaysOnErrorSampleRate = Number(viteEnvText(import.meta.env.VITE_SENTRY_REPLAY_ERROR_SAMPLE_RATE) ?? "1.0");
 
+  const release = viteEnvText(import.meta.env.VITE_SENTRY_RELEASE);
   return {
     dsn,
     environment: env,
     tracesSampleRate: Number.isFinite(tracesSampleRate) ? Math.min(Math.max(tracesSampleRate, 0), 1) : 0.2,
-    replayEnabled: !replayDisabled,
-    replaysSessionSampleRate: !replayDisabled && Number.isFinite(replaysSessionSampleRate) ? replaysSessionSampleRate : 0,
-    replaysOnErrorSampleRate: !replayDisabled && Number.isFinite(replaysOnErrorSampleRate) ? replaysOnErrorSampleRate : 0,
+    replayEnabled,
+    replaysSessionSampleRate: replayEnabled && Number.isFinite(replaysSessionSampleRate) ? replaysSessionSampleRate : 0,
+    replaysOnErrorSampleRate: replayEnabled && Number.isFinite(replaysOnErrorSampleRate) ? replaysOnErrorSampleRate : 0,
+    release,
   };
 }
 
@@ -532,7 +544,7 @@ export function buildFallbackIssueUrl(
   const points = Array.from(wellFormedTitle);
   const safeTitle = (points.length > 80 ? points.slice(0, 80).join("") + "…" : points.join(""));
   const encodedTitle = encodeURIComponent(safeTitle);
-  const base = `https://github.com/jaywedgeworth22/BotFleet/issues/new?title=${encodedTitle}&body=`;
+  const base = `https://github.com/Simple-With-Us/BotFleet/issues/new?title=${encodedTitle}&body=`;
   const budget = maxTotalLength - base.length - ISSUE_LABEL_SUFFIX.length;
   if (budget <= 0) return base + ISSUE_LABEL_SUFFIX;
 
@@ -702,16 +714,15 @@ function closeClient(): void {
 
 /** Start the browser SDK against a DSN the harness resolved. */
 function startRuntimeClient(dsn: string, environment: string, tracesSampleRate: number): void {
-  const replayRaw = viteEnvText(import.meta.env.VITE_SENTRY_REPLAY_ENABLED);
-  const replayDisabled = replayRaw ? /^(false|0|off|no)$/i.test(replayRaw) : false;
   const replaysSessionSampleRate = Number(viteEnvText(import.meta.env.VITE_SENTRY_REPLAY_SESSION_SAMPLE_RATE) ?? "0.1");
   const replaysOnErrorSampleRate = Number(viteEnvText(import.meta.env.VITE_SENTRY_REPLAY_ERROR_SAMPLE_RATE) ?? "1.0");
-  const replayEnabled = buildTimeOptions?.replayEnabled ?? !replayDisabled;
+  const replayEnabled = buildTimeOptions?.replayEnabled ?? replayOptedIn();
 
   sentryPort.init({
     dsn,
     environment,
     tracesSampleRate,
+    release: buildTimeOptions?.release ?? viteEnvText(import.meta.env.VITE_SENTRY_RELEASE),
     replayEnabled,
     replaysSessionSampleRate: replayEnabled
       ? buildTimeOptions?.replaysSessionSampleRate ?? (Number.isFinite(replaysSessionSampleRate) ? replaysSessionSampleRate : 0)

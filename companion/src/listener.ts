@@ -163,7 +163,10 @@ export async function refreshTailnetName(
           try {
             const dns = JSON.parse(stdout)?.Self?.DNSName;
             // MagicDNS names are fully qualified, trailing dot and all
-            const trimmed = typeof dns === "string" && dns ? dns.replace(/\.$/, "") : null;
+            const trimmed =
+              Object.prototype.toString.call(dns) === "[object String]" && dns
+                ? String(dns).replace(/\.$/, "")
+                : null;
             onAttempt?.(cli, trimmed ? `ok: ${trimmed}` : "ran, but no MagicDNS name in status");
             resolve(trimmed);
           } catch {

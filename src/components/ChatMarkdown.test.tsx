@@ -6,10 +6,12 @@
 // during SSR: the module factory below throws if anything imports it, and
 // since the diagram render only happens inside a `useEffect` — which SSR
 // never runs — a passing render() call is itself the proof.
+import { Window } from "happy-dom";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 
+import { collectDisplayText } from "../lib/karaoke-highlight";
 import { ChatMarkdown } from "./ChatMarkdown";
 
 vi.mock("mermaid", () => {
@@ -55,5 +57,33 @@ describe("bot Markdown images", () => {
     }));
     expect(html).not.toContain("<img");
     expect(html).toContain("status");
+  });
+});
+
+describe("karaoke display text", () => {
+  // The highlighter reads the rendered words.  A code block is not read
+  // aloud, and neither is its language label: a lit "sh" would flash as if
+  // it were reply text (iOS drops the whole block).
+  const displayText = (markdown: string): string => {
+    const win = new Window({ url: "http://127.0.0.1:5199/" });
+    const container = win.document.createElement("div");
+    container.innerHTML = renderToStaticMarkup(createElement(ChatMarkdown, { text: markdown }));
+    win.document.body.appendChild(container);
+    // SAFETY: happy-dom's Element implements the DOM Element members collectDisplayText reads.
+    return collectDisplayText(container as unknown as Element).text;
+  };
+
+  it("skips a fenced block's language label along with its code", () => {
+    const text = displayText("Build passed today.\n\n```sh\npnpm build\n```\n\nTwo things changed.");
+    expect(text).toContain("Build passed today.");
+    expect(text).toContain("Two things changed.");
+    expect(text).not.toMatch(/\bsh\b/);
+    expect(text).not.toContain("pnpm build");
+  });
+
+  it("skips the label of a fence with no language", () => {
+    const text = displayText("Before.\n\n```\nplain\n```\n\nAfter.");
+    expect(text).not.toMatch(/\bcode\b/);
+    expect(text).not.toContain("plain");
   });
 });

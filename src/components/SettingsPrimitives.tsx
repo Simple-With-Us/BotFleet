@@ -1,23 +1,28 @@
 import { useEffect, useRef, useState } from "react";
 import { Check, Copy } from "lucide-react";
+import { cn } from "@/lib/cn";
 
 export function Card({
   title,
   subtitle,
   actions,
   children,
+  id,
+  className,
 }: {
   title?: string;
-  subtitle?: string;
+  subtitle?: React.ReactNode;
   /** Optional right-aligned control area on the header row — used by the
    *  Usage card's "Expand all / Collapse all" toggle.  Slot comes AFTER
    *  title+subtitle so wrapping a long subtitle never pushes the button
    *  off-screen. */
   actions?: React.ReactNode;
   children?: React.ReactNode;
+  id?: string;
+  className?: string;
 }) {
   return (
-    <div className="rounded-xl bg-card p-4">
+    <div id={id} className={className ? cn("rounded-xl bg-card p-4", className) : "rounded-xl bg-card p-4"}>
       {(title || actions) && (
         <div className="flex items-start justify-between gap-3">
           <div className="min-w-0 flex-1">

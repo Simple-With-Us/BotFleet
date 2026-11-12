@@ -23,6 +23,14 @@ import {
 
 const NOW = new Date("2026-09-25T14:30:00").getTime();
 
+/** The short weekday name for an instant in the host's locale — the same
+ *  formatter the label uses — escaped for use inside a pattern. */
+function weekdayPattern(at: number): string {
+  return new Date(at)
+    .toLocaleDateString([], { weekday: "short" })
+    .replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 describe("is a thread asleep", () => {
   it("treats absent as awake and 0 as the until-activity sentinel, not as an empty value", () => {
     expect(isThreadSnoozed(undefined, NOW)).toBe(false);
@@ -116,7 +124,11 @@ describe("what a snoozed row says about itself", () => {
     expect(snoozeLabel(tonight, NOW)).not.toMatch(/mon|tue|wed|thu|fri|sat|sun/i);
 
     const monday = new Date("2026-09-28T08:00:00").getTime();
-    expect(snoozeLabel(monday, NOW)).toMatch(/^until Mon /);
+    // The weekday name follows the host's locale, so the fixture's own day is
+    // pinned and the name comes from the host's own formatter.  A hard-coded
+    // "Mon" only holds on an English host.
+    expect(new Date(monday).getDay()).toBe(1);
+    expect(snoozeLabel(monday, NOW)).toMatch(new RegExp(`^until ${weekdayPattern(monday)} `, "i"));
   });
 });
 

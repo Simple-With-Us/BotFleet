@@ -17,6 +17,7 @@
 // stop-then-steer (queue a correction, hit Stop, the correction runs) is
 // the feature.
 
+import { botOffQueuedNotSent } from "../shared/bot-power.ts";
 import { newId } from "./contracts.ts";
 import type { BotRecord, Message } from "./store.ts";
 
@@ -25,6 +26,22 @@ export interface SteerStore {
   bot(id: string): BotRecord | null;
   appendMessage(threadId: string, message: Omit<Message, "id" | "at">): Message;
   patchMessage(threadId: string, messageId: string, patch: Partial<Message>): Message | null;
+  messagesFor(threadId: string): Message[];
+}
+
+/** A batch already in the transcript: an update committed it for a restart
+ *  (server/update-drain.ts) and it waits here again, after the restart or
+ *  because the restart did not come.  It drains as a turn of its own, in its
+ *  place in line, with nothing appended. */
+export interface CommittedBatch {
+  /** The last line of the batch; the turn answers it. */
+  userMessageId: string;
+  /** Every line of the batch, kept out of transcript replay. */
+  excludeIds: string[];
+  /** Any line came over a relay, so the turn runs unattended (S8). */
+  relayed: boolean;
+  /** When the update first held it, for the carrier's staleness rule. */
+  heldAt: number;
 }
 
 interface QueuedItem {
@@ -36,6 +53,10 @@ interface QueuedItem {
   /** Set when the words came from an outside channel (iMessage relay), so
    * the drained turn keeps running unattended (S8). */
   automationSource?: Message["automationSource"];
+  committed?: CommittedBatch;
+  /** The send came over a relay, so its turn runs unattended and must never
+   * stop to ask the user anything (S8). */
+  relayed?: boolean;
 }
 
 interface QueueEntry {
@@ -46,26 +67,115 @@ interface QueueEntry {
   items: Array<QueuedItem>;
 }
 
-const queues = new Map<string, QueueEntry>(); // threadId → waiting sends
+/** The queue map, reporting every change so a crash journal can follow it.
+ *  Every mutation in this file goes through `set`/`delete`/`clear`. */
+class JournaledQueues extends Map<string, QueueEntry> {
+  override set(key: string, value: QueueEntry): this {
+    super.set(key, value);
+    queueChanged();
+    return this;
+  }
+  override delete(key: string): boolean {
+    const had = super.delete(key);
+    if (had) queueChanged();
+    return had;
+  }
+  override clear(): void {
+    super.clear();
+    queueChanged();
+  }
+}
+
+const queues = new JournaledQueues(); // threadId → waiting sends
+
+let onQueueChanged: (() => void) | null = null;
+/** While a drain pass runs, the journal is written once at its end: a send
+ *  leaves the map before its transcript line is appended, and a journal that
+ *  dropped it in between would lose it to a crash in that gap.  Written after
+ *  the appends, a crash leaves it in the journal AND the thread (boot skips it
+ *  by its `queueId`) rather than in neither. */
+let journalHeld = 0;
+let journalDirty = false;
+function holdJournal(work: () => void): void {
+  journalHeld += 1;
+  try {
+    work();
+  } finally {
+    journalHeld -= 1;
+    if (journalHeld === 0 && journalDirty) {
+      journalDirty = false;
+      queueChanged();
+    }
+  }
+}
+
+function queueChanged(): void {
+  if (journalHeld > 0) {
+    journalDirty = true;
+    return;
+  }
+  try {
+    onQueueChanged?.();
+  } catch (error) {
+    console.warn("[steer-queue] journal observer failed:", error);
+  }
+}
+
+/** Follow every change to the queue (the crash journal).  Null stops it. */
+export function setSteerQueueObserver(observer: (() => void) | null): void {
+  onQueueChanged = observer;
+}
+
+/** The queue as it is now, left in place, for the crash journal. */
+export function snapshotSteerQueue(): SteerQueueSnapshot[] {
+  return [...queues].map(([threadId, entry]) => ({
+    threadId,
+    botId: entry.botId,
+    items: entry.items.map((item) => ({ ...item })),
+  }));
+}
 
 /** Hold a mid-turn send off the transcript until drain. */
 export function queueSteeredMessage(
   bot: BotRecord,
   text: string,
-  options: { prompt?: string; replyToId?: string; linqChatId?: string } = {},
+  options: { prompt?: string; replyToId?: string; linqChatId?: string; threadId?: string; automationSource?: Message["automationSource"]; relayed?: boolean } = {},
 ): { id: string } {
-  const threadId = bot.threadId;
+  // A per-context send holds its words against its own thread, not the
+  // active one: the drain already runs one batch per thread per pass, so a
+  // queued side thread waits its turn without touching bot.threadId.
+  const threadId = options.threadId ?? bot.threadId;
   const id = newId();
   const entry = queues.get(threadId) ?? { botId: bot.id, items: [] };
-  entry.items.push({
+  const item: (typeof entry.items)[number] = {
     messageId: id,
     text,
     prompt: options.prompt ?? text,
     replyToId: options.replyToId,
     linqChatId: options.linqChatId,
-  });
+  };
+  if (options.relayed) item.relayed = true;
+  entry.items.push(item);
   queues.set(threadId, entry);
   return { id };
+}
+
+/** Pending sends at which a drained turn stops guessing an order.  Under it a
+ * backlog is an ordinary run of follow-ups and the bot just works through
+ * them; at or above it the turn asks the user what to take first (BF-2442).
+ * Exported so the line is tunable and directly testable. */
+export const STEER_BACKLOG_THRESHOLD = 3;
+
+/** The instruction a backed-up turn carries, or null while the queue is short
+ * enough to answer in order without bothering the user.  Prepended so it reads
+ * as the governing instruction for the turn rather than as one more ask. */
+export function steerBacklogInstruction(pending: number): string | null {
+  if (pending < STEER_BACKLOG_THRESHOLD) return null;
+  return (
+    `${pending} messages were sent while the bot was busy and are running together as this turn. ` +
+    `Do not guess which one matters most.  List them in one short line each, say which you would ` +
+    `start with and why, and ask the user to confirm or reorder before you do the work.`
+  );
 }
 
 /** Drain every queue whose bot is idle: append the held lines (leaf is now
@@ -75,7 +185,7 @@ export function queueSteeredMessage(
  * so transcript-replay adapters do not also see earlier queued texts.
  * Entries leave the map BEFORE running so a settle racing another settle
  * can never fire the same queue twice. */
-export function drainSteeredMessages(
+function drainSteeredMessagesPass(
   store: SteerStore,
   run: (
     botId: string,
@@ -84,9 +194,15 @@ export function drainSteeredMessages(
     userMessage: Message,
     excludeIds: string[],
     linqChatId?: string,
+    /** Set for a batch that was already committed (`CommittedBatch`). */
+    carried?: CommittedBatch,
   ) => void | Promise<void>,
 ): void {
   const leftovers: Array<[string, QueueEntry]> = [];
+  // One batch per bot per pass.  A bot can have sends waiting on more than
+  // one of its threads, and two starts in one pass would leave the second
+  // refused as "already working"; the next settle runs the next one.
+  const started = new Set<string>();
   // deleting only the entry being visited is safe under Map iteration
   for (const [threadId, entry] of queues) {
     const bot = store.bot(entry.botId);
@@ -95,21 +211,45 @@ export function drainSteeredMessages(
       queues.delete(threadId);
       continue;
     }
-    if (bot.busy) continue; // still working — the next settle tries again
+    if (bot.busy || started.has(entry.botId)) continue; // still working — the next settle tries again
+    // A bot switched Off while these waited gets nothing new: the turn they
+    // were queued behind has finished, and the next one will not start.  They
+    // are the person's own words, so say they were not sent rather than drop
+    // them silently — and never append them to the transcript as if sent.
+    if (bot.off === true) {
+      dropForOffBot(store, threadId, entry);
+      continue;
+    }
     // committed to draining: the entry leaves the map before anything runs,
     // so a settle racing another settle can never fire the same queue twice
     queues.delete(threadId);
-    const firstLinq = entry.items.findIndex((item) => item.linqChatId);
-    const batch = firstLinq === 0
-      ? entry.items.slice(0, 1)
-      : firstLinq > 0
-        ? entry.items.slice(0, firstLinq)
-        : entry.items;
-    const rest = firstLinq === 0
-      ? entry.items.slice(1)
-      : firstLinq > 0
-        ? entry.items.slice(firstLinq)
-        : [];
+    let items = entry.items;
+    // A batch an update already committed runs alone, as the turn it was.
+    // One whose line has gone from the thread has nothing left to answer.
+    let carried: { item: QueuedItem; committed: CommittedBatch; userMessage: Message } | null = null;
+    while (!carried && items.length > 0) {
+      const head = items[0];
+      const committed = head?.committed;
+      if (!head || !committed) break;
+      items = items.slice(1);
+      const userMessage = store.messagesFor(threadId).find((message) => message.id === committed.userMessageId);
+      if (userMessage) carried = { item: head, committed, userMessage };
+    }
+    if (carried) {
+      if (items.length) leftovers.push([threadId, { botId: entry.botId, items }]);
+      started.add(entry.botId);
+      const { item, committed, userMessage } = carried;
+      void run(entry.botId, threadId, item.prompt, userMessage, committed.excludeIds, item.linqChatId, committed);
+      continue;
+    }
+    if (!items.length) continue;
+    const firstLinq = items.findIndex((item) => item.linqChatId);
+    // A committed batch further down is a boundary too: it keeps its place.
+    const firstCommitted = items.findIndex((item) => item.committed);
+    let end = firstLinq === 0 ? 1 : firstLinq > 0 ? firstLinq : items.length;
+    if (firstCommitted > 0) end = Math.min(end, firstCommitted);
+    const batch = items.slice(0, end);
+    const rest = items.slice(end);
     // Requeue after this pass so a same-loop Map insert cannot start the
     // next Linq chat before the current startTurn marks the bot busy.
     if (rest.length) leftovers.push([threadId, { botId: entry.botId, items: rest }]);
@@ -130,7 +270,18 @@ export function drainSteeredMessages(
     }
     const last = appended.at(-1);
     if (!last) continue;
-    const prompt = batch.map((item) => item.prompt).join("\n");
+    started.add(entry.botId);
+    const joined = batch.map((item) => item.prompt).join("\n");
+    // Keyed on THIS batch, not the queue still behind it: the instruction claims
+    // the messages are "running together as this turn", and that is only true
+    // of the batch.  A Linq or committed boundary hands the bot one chat per
+    // turn while a long tail waits — counting the tail would have it claim a
+    // pile it is not answering, and would ask the user to prioritise on every
+    // turn of a sequential pipeline instead of once.
+    // An unattended (relayed) batch has nobody to answer an ask: it keeps doing
+    // the work in order, as it did before the backlog instruction existed.
+    const backlog = batch.some((item) => item.relayed) ? null : steerBacklogInstruction(batch.length);
+    const prompt = backlog ? `${backlog}\n\n${joined}` : joined;
     void run(
       entry.botId,
       threadId,
@@ -148,6 +299,59 @@ export function drainSteeredMessages(
   }
 }
 
+/** Settle a queue whose bot is Off: the entry leaves the map and one
+ *  transcript line says how many messages were not sent. */
+function dropForOffBot(store: SteerStore, threadId: string, entry: QueueEntry): void {
+  queues.delete(threadId);
+  if (entry.items.length === 0) return;
+  store.appendMessage(threadId, {
+    role: "bot",
+    kind: "activity",
+    tool: { name: botOffQueuedNotSent(entry.items.length), ok: false },
+  });
+}
+
+/** The bot was just switched Off while idle: nothing is running for its
+ *  queue to wait behind, so settle every queue it owns now instead of at a
+ *  settle that may never come.  A busy bot's queue is left for
+ *  `drainSteeredMessages`, which settles it when the running turn ends.
+ *  Returns how many messages were dropped. */
+export function dropQueuedForOffBot(store: SteerStore, botId: string): number {
+  let dropped = 0;
+  // deleting only the entry being visited is safe under Map iteration
+  for (const [threadId, entry] of queues) {
+    if (entry.botId !== botId) continue;
+    dropped += entry.items.length;
+    dropForOffBot(store, threadId, entry);
+  }
+  return dropped;
+}
+
+/** Drain every queue whose bot is idle (see `drainSteeredMessagesPass`). */
+export function drainSteeredMessages(
+  store: SteerStore,
+  run: Parameters<typeof drainSteeredMessagesPass>[1],
+): void {
+  holdJournal(() => drainSteeredMessagesPass(store, run));
+}
+
+/** Drain every batch that can drain now, pass after pass, until the queue is
+ *  empty or a pass moves nothing: a bot still busy keeps its queue.  For a
+ *  `run` that starts no turn (an update committing held sends for its
+ *  restart), every idle bot's queue empties completely — one batch per bot per
+ *  pass, however many Linq chats or committed batches it holds.  No pass cap:
+ *  each pass that continues has taken at least one batch, so the loop ends,
+ *  and nothing is ever left behind because a counter ran out.  Whatever is
+ *  left (a busy bot's) is still in the queue for the caller to carry. */
+export function drainEveryReadyBatch(store: SteerStore, run: Parameters<typeof drainSteeredMessages>[1]): void {
+  for (let before = queuedMessageCount(); before > 0;) {
+    drainSteeredMessages(store, run);
+    const after = queuedMessageCount();
+    if (after >= before) return;
+    before = after;
+  }
+}
+
 /** Drop one waiting send so it never drains. Returns false when that
  * queue id was not in the in-memory queue (already drained, or a restart
  * lost the auto-run intent). */
@@ -161,12 +365,176 @@ export function cancelSteeredMessage(threadId: string, messageId: string): boole
   return true;
 }
 
-/** Count pending sends without exposing message text to diagnostics. */
-export function queuedMessageCount(): number {
-  return [...queues.values()].reduce((total, entry) => total + entry.items.length, 0);
+/** One thread's waiting sends, as an update carries them across a restart. */
+export interface SteerQueueSnapshot {
+  threadId: string;
+  botId: string;
+  items: Array<{
+    messageId: string;
+    text: string;
+    prompt: string;
+    replyToId?: string;
+    linqChatId?: string;
+    automationSource?: Message["automationSource"];
+    committed?: CommittedBatch;
+    relayed?: boolean;
+  }>;
+}
+
+/** Take the chosen bots' waiting sends out of the queue, untouched: still off
+ *  the transcript, so a restart can carry them and put them back in the same
+ *  place in line (`restoreSteeredEntries`).  An update uses this for a bot it
+ *  interrupted, whose own turn must resume before these run. */
+export function takeSteeredEntries(pick: (botId: string) => boolean): SteerQueueSnapshot[] {
+  const taken: SteerQueueSnapshot[] = [];
+  for (const [threadId, entry] of queues) {
+    if (!pick(entry.botId)) continue;
+    queues.delete(threadId);
+    taken.push({ threadId, botId: entry.botId, items: entry.items.map((item) => ({ ...item })) });
+  }
+  return taken;
+}
+
+/** Put carried sends back, ahead of anything queued on the thread since. */
+export function restoreSteeredEntries(entries: readonly SteerQueueSnapshot[]): void {
+  for (const entry of entries) {
+    if (entry.items.length === 0) continue;
+    const existing = queues.get(entry.threadId);
+    queues.set(entry.threadId, {
+      botId: entry.botId,
+      items: [...entry.items.map((item) => ({ ...item })), ...(existing?.items ?? [])],
+    });
+  }
+}
+
+/** Count pending sends without exposing message text to diagnostics.
+ *  `ignoreBot` leaves out the queues of bots that will never drain them (an Off
+ *  bot's waiting sends are dropped, not run), so they cannot hold an update. */
+export function queuedMessageCount(ignoreBot?: (botId: string) => boolean): number {
+  return [...queues.values()]
+    .filter((entry) => !ignoreBot?.(entry.botId))
+    .reduce((total, entry) => total + entry.items.length, 0);
+}
+
+/** The ids of the sends waiting on a thread, in arrival order.  The caller
+ * reads them before `dropSteeredMessages` so it can forget what it keyed on
+ * them (a relayed message's unattended mark). */
+export function queuedMessageIds(threadId: string): string[] {
+  return (queues.get(threadId)?.items ?? []).map((item) => item.messageId);
+}
+
+/** How many sends are waiting on a thread. */
+export function queuedMessageCountFor(threadId: string): number {
+  return queues.get(threadId)?.items.length ?? 0;
+}
+
+/** Drop every send waiting on a thread so none of them drains.  A typed /stop
+ * means stop everything, including the corrections queued behind the turn;
+ * the Stop button keeps its stop-then-steer behavior and never calls this.
+ * Returns how many were dropped. */
+export function dropSteeredMessages(threadId: string): number {
+  const entry = queues.get(threadId);
+  if (!entry) return 0;
+  queues.delete(threadId);
+  return entry.items.length;
+}
+
+/** The ids of one bot's waiting sends, across every thread it owns, in no
+ *  particular order.  The caller reads them before `dropSteeredMessagesForBot`
+ *  so it can forget what it keyed on them (a relayed message's unattended mark). */
+export function queuedMessageIdsForBot(botId: string): string[] {
+  const ids: string[] = [];
+  for (const entry of queues.values()) {
+    if (entry.botId !== botId) continue;
+    for (const item of entry.items) ids.push(item.messageId);
+  }
+  return ids;
+}
+
+/** Drop every send waiting behind every thread one bot owns, so none of them
+ *  drains.  Per-context sends queue against their own thread, so a typed /stop
+ *  on the active thread must reach the side threads too — stopping everything
+ *  is the whole point of the typed command.  Returns how many were dropped. */
+export function dropSteeredMessagesForBot(botId: string): number {
+  let dropped = 0;
+  // deleting only the entry being visited is safe under Map iteration
+  for (const [threadId, entry] of queues) {
+    if (entry.botId !== botId) continue;
+    queues.delete(threadId);
+    dropped += entry.items.length;
+  }
+  return dropped;
 }
 
 /** Test helper: how many messages remain queued for a thread. */
 export function _queuedCount(threadId: string): number {
   return queues.get(threadId)?.items.length ?? 0;
+}
+
+// ── job notices for a running turn (background jobs P1) ─────────────────
+// A background job that ends while its bot is mid-turn on the same thread
+// cannot start a turn of its own (one turn per bot), and must not wait for
+// the turn to end: the bot may be about to start the same work again.  Its
+// notice waits here, and the HTTP tool loop drains it between model rounds
+// (server/drivers/chat-completions/loop.ts), so the bot reads it before its
+// next model call.  A notice the turn never drained is delivered by the next
+// turn on the thread: the opening reminder, or a wake turn of its own
+// (server/jobs/wake.ts).
+//
+// Memory-only, like every other queue in this file.  A restart loses it,
+// and that is safe: the jobs registry marks every job that was running at a
+// restart lost, and queues fresh notices for jobs it settles at boot.
+
+/** One job's end, as the bot reads it. */
+export interface JobNoticeItem {
+  jobId: string;
+  botId: string;
+  /** One redacted line: what ended, how, and after how long. */
+  text: string;
+  /** Whether this notice may wake an idle bot (`onComplete: "wake"`). */
+  wake: boolean;
+}
+
+const jobNotices = new Map<string, JobNoticeItem[]>(); // threadId → waiting notices
+
+/** Hold a job's notice until a turn on its thread can carry it.  A second
+ *  notice for the same job replaces the first. */
+export function queueJobNotice(threadId: string, item: JobNoticeItem): void {
+  const items = (jobNotices.get(threadId) ?? []).filter((queued) => queued.jobId !== item.jobId);
+  items.push(item);
+  jobNotices.set(threadId, items);
+}
+
+/** Take every notice waiting on this thread.  The caller delivers them. */
+export function drainJobNotices(threadId: string): JobNoticeItem[] {
+  const items = jobNotices.get(threadId) ?? [];
+  jobNotices.delete(threadId);
+  return items;
+}
+
+/** Put notices back that a dispatch could not deliver (the bot turned out to
+ *  be busy, or the harness was reloading), ahead of anything newer. */
+export function restoreJobNotices(threadId: string, items: readonly JobNoticeItem[]): void {
+  if (items.length === 0) return;
+  const newer = (jobNotices.get(threadId) ?? []).filter((queued) => !items.some((item) => item.jobId === queued.jobId));
+  jobNotices.set(threadId, [...items, ...newer]);
+}
+
+/** The notices waiting on this thread, left in place. */
+export function pendingJobNotices(threadId: string): readonly JobNoticeItem[] {
+  return jobNotices.get(threadId) ?? [];
+}
+
+/** Forget a deleted thread's notices. */
+export function dropJobNotices(threadId: string): void {
+  jobNotices.delete(threadId);
+}
+
+/** Forget a deleted bot's notices on every thread (a room outlives it). */
+export function dropJobNoticesForBot(botId: string): void {
+  for (const [threadId, items] of jobNotices) {
+    const kept = items.filter((item) => item.botId !== botId);
+    if (kept.length === 0) jobNotices.delete(threadId);
+    else if (kept.length !== items.length) jobNotices.set(threadId, kept);
+  }
 }

@@ -1,20 +1,59 @@
 // Compact model picker: providers live on a Cloud/Local rail. Ready engines
 // show a short suggested list with search and an explicit all-models view;
 // engines that need setup show one focused action instead of a disabled wall.
-import { useEffect, useRef, useState, type ReactNode } from "react";
-import { Check, ChevronDown, ChevronLeft, ChevronRight, Search } from "lucide-react";
+// Local models are not a row under each engine: when any are configured the
+// rail grows one "Local Models" entry that lists them all, and when none are
+// there is nothing to show.
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { createPortal } from "react-dom";
+import { Check, ChevronDown, Search } from "lucide-react";
 import { useStore, type Bot, type InstanceInfo, type ModelSelection } from "@/state/store";
 import { filterCustomModels, partitionCustomModels, suggestedModels } from "@/lib/custom-models";
 import { isCustomOnly, splitEngineRail } from "@/lib/engine-rail";
+import {
+  LOCAL_MODELS_DRIVER_KIND,
+  LOCAL_MODELS_RAIL_ID,
+  LOCAL_MODELS_TITLE,
+  collectLocalModels,
+  filterLocalModelGroups,
+  isInjectedLocalModel,
+  localModelCount,
+  opensOnLocalModels,
+  type LocalModelGroup,
+} from "@/lib/local-models";
+import {
+  contextCapLabel,
+  pickedSelection,
+  selectionContextCaps,
+  selectionDefaultEffort,
+  selectionEffortLevels,
+  selectionWithContextCap,
+  parseMaxOutputInput,
+  selectionSupportsMaxOutput,
+  selectionWithEffort,
+  selectionWithMaxOutput,
+} from "@/lib/model-pick";
+import { effortLabel } from "@/lib/model-effort";
+import type { EffortLevel } from "../../server/contracts.ts";
 import { ProviderMark } from "./ProviderIcons";
+import { EngineQuotasPanel } from "./EngineQuotasPanel";
 import { EngineSetup, needsCli, needsSignIn } from "./EngineSetup";
+import { isCheckingEngine, isHiddenEngine } from "@/lib/engine-status";
+import { formatWindowPairLabel } from "@/lib/quota-display";
 import { EngineGroupLabel } from "./EngineGroupLabel";
 import { EngineCallout } from "./EngineCallout";
-import { formatDualQuotaBadge } from "@/lib/quota-display";
 import { cn } from "@/lib/cn";
+import { modelControlLabel } from "@/lib/chat-accessibility";
 import { COMPACT_SQUARE } from "@/lib/compact-chip";
-import { modelEffortLevels } from "@/lib/model-effort";
-import { readableModelLabel } from "@/lib/model-label";
+import {
+  latestRows,
+  modelOptionLabel,
+  offeredOptions,
+  savedModelStatus,
+  selectionChipLabel,
+  type LatestRow,
+  type SavedModelStatus,
+} from "@/lib/model-lineage-view";
 
 type ModelOption = InstanceInfo["models"]["options"][number];
 const COMPACT_MODEL_COUNT = 5;
@@ -22,7 +61,317 @@ const COMPACT_MODEL_COUNT = 5;
 function modelLabel(instance: InstanceInfo | undefined, model: string): string {
   // A saved selection the latest-only picker no longer lists still gets a
   // readable chip instead of its raw id.
-  return instance?.models.options.find((option) => option.id === model)?.label ?? readableModelLabel(model);
+  return modelOptionLabel(instance, model);
+}
+
+/** "Latest Sonnet" rows: the choice that keeps a bot on the newest member
+ *  of a model class.  Each row names the model it runs right now. */
+export function LatestModelRows({
+  rows,
+  currentClass,
+  onPick,
+}: {
+  rows: LatestRow[];
+  /** The class the saved selection floats on for this engine, if any. */
+  currentClass?: string | null;
+  onPick: (row: LatestRow) => void;
+}) {
+  if (!rows.length) return null;
+  return (
+    <>
+      <EngineGroupLabel className="px-2 pb-1 pt-0.5">Latest</EngineGroupLabel>
+      {rows.map((row) => {
+        const current = currentClass === row.classKey;
+        return (
+          <button
+            key={row.classKey}
+            type="button"
+            onClick={() => onPick(row)}
+            title={`${row.label} runs ${row.resolvedLabel} now and moves to each newer version.`}
+            className={cn(
+              "flex w-full items-center justify-between gap-2 rounded-lg px-2.5 py-2 text-left text-[13px] text-ink hover:bg-control/60",
+              current && "bg-control",
+            )}
+          >
+            <span className="flex min-w-0 flex-1 items-center gap-1.5">
+              <span className="min-w-0 break-words">{row.label}</span>
+              <span className="min-w-0 truncate text-[11.5px] text-ink-secondary">{row.resolvedLabel}</span>
+            </span>
+            {current && <Check size={14} className="shrink-0 text-accent" />}
+          </button>
+        );
+      })}
+      <div className="mx-2 my-1.5 border-t border-hairline/40" role="separator" />
+    </>
+  );
+}
+
+/** "Max Input Tokens": how much of the model's window the bot may fill before
+ *  BotFleet compresses the prompt.  Empty is "no limit" (the model's full
+ *  window).  Presets are the caps the model offers, and a custom number is
+ *  accepted up to the window.  It is the one context cap field, stored as
+ *  `modelSelection.contextCap`.  A model with no caps gets no section. */
+export function ContextSection({
+  caps,
+  windowTokens,
+  current,
+  onPick,
+  disabled = false,
+  className,
+}: {
+  caps: readonly number[];
+  /** The model's full window in tokens, when known; a custom value above it is refused. */
+  windowTokens?: number;
+  /** The bot's saved cap; undefined is no limit. */
+  current: number | undefined;
+  onPick: (cap: number | undefined) => void;
+  disabled?: boolean;
+  className?: string;
+}) {
+  const [text, setText] = useState(current === undefined || caps.includes(current) ? "" : String(current));
+  useEffect(() => setText(current === undefined || caps.includes(current) ? "" : String(current)), [current, caps]);
+  if (!caps.length) return null;
+  const parsed = parseMaxOutputInput(text, windowTokens);
+  const invalid = parsed === null;
+  const commitCustom = () => {
+    if (parsed === null || parsed === undefined || parsed === current) return;
+    onPick(parsed);
+  };
+  return (
+    <div
+      role="group"
+      aria-label="Max Input Tokens"
+      data-context-section
+      className={cn("shrink-0 border-t border-hairline/40 px-3 pb-3 pt-2", className)}
+    >
+      <EngineGroupLabel className="px-1 pb-1.5">Max Input Tokens</EngineGroupLabel>
+      <div className="flex flex-wrap gap-1">
+        {[undefined, ...caps].map((cap) => {
+          const checked = current === cap;
+          return (
+            <button
+              key={cap ?? "default"}
+              type="button"
+              aria-pressed={checked}
+              disabled={disabled}
+              onClick={() => onPick(cap)}
+              className={cn(
+                "flex items-center gap-1 rounded-full border px-2.5 py-1 text-[12.5px] disabled:cursor-not-allowed disabled:opacity-60",
+                checked
+                  ? "border-accent/40 bg-control text-ink"
+                  : "border-hairline/40 text-ink-secondary hover:bg-control/60 hover:text-ink disabled:hover:bg-transparent disabled:hover:text-ink-secondary",
+              )}
+            >
+              {checked && <Check size={12} className="shrink-0 text-accent" />}
+              {cap === undefined ? (windowTokens ? `No Limit (${contextCapLabel(windowTokens)})` : "No Limit") : contextCapLabel(cap)}
+            </button>
+          );
+        })}
+      </div>
+      <input
+        type="text"
+        inputMode="numeric"
+        value={text}
+        placeholder="No limit"
+        disabled={disabled}
+        aria-label="Max Input Tokens"
+        aria-invalid={invalid}
+        onChange={(event) => setText(event.target.value)}
+        onBlur={commitCustom}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") commitCustom();
+        }}
+        className={cn(
+          "mt-1.5 w-full rounded-lg border bg-control px-2.5 py-1.5 text-[13px] text-ink placeholder:text-ink-secondary disabled:cursor-not-allowed disabled:opacity-60",
+          invalid ? "border-red-500/60" : "border-hairline/40",
+        )}
+      />
+      <p className="px-1 pt-1.5 text-[12px] text-ink-secondary">
+        {invalid
+          ? windowTokens
+            ? `Enter a whole number up to ${windowTokens.toLocaleString("en-US")}.`
+            : "Enter a whole number."
+          : (disabled ? "Stop the bot to change this.\u00A0 " : "") + "A smaller limit compresses the prompt sooner.\u00A0 Empty is no limit."}
+      </p>
+    </div>
+  );
+}
+
+/** "Max Output Tokens": an optional output limit.  Empty is Default, and
+ *  nothing is sent.  A value commits on Enter or blur; one that is not a whole
+ *  number, or is past the model's window, is flagged and not saved. */
+export function MaxOutputSection({
+  current,
+  windowTokens,
+  onPick,
+  disabled = false,
+  className,
+}: {
+  /** The bot's saved limit; undefined is Default. */
+  current: number | undefined;
+  /** The model's window in tokens, when known; a limit above it is refused. */
+  windowTokens?: number;
+  onPick: (tokens: number | undefined) => void;
+  disabled?: boolean;
+  className?: string;
+}) {
+  const [text, setText] = useState(current === undefined ? "" : String(current));
+  useEffect(() => setText(current === undefined ? "" : String(current)), [current]);
+  const parsed = parseMaxOutputInput(text, windowTokens);
+  const invalid = parsed === null;
+  const commit = () => {
+    if (parsed === null || parsed === current) return;
+    onPick(parsed);
+  };
+  return (
+    <div
+      role="group"
+      aria-label="Max Output Tokens"
+      data-max-output-section
+      className={cn("shrink-0 border-t border-hairline/40 px-3 pb-3 pt-2", className)}
+    >
+      <EngineGroupLabel className="px-1 pb-1.5">Max Output Tokens</EngineGroupLabel>
+      <input
+        type="text"
+        inputMode="numeric"
+        value={text}
+        placeholder="Default"
+        disabled={disabled}
+        aria-invalid={invalid}
+        onChange={(event) => setText(event.target.value)}
+        onBlur={commit}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") commit();
+        }}
+        className={cn(
+          "w-full rounded-lg border bg-control px-2.5 py-1.5 text-[13px] text-ink placeholder:text-ink-secondary disabled:cursor-not-allowed disabled:opacity-60",
+          invalid ? "border-red-500/60" : "border-hairline/40",
+        )}
+      />
+      <p className="px-1 pt-1.5 text-[12px] text-ink-secondary">
+        {invalid
+          ? windowTokens
+            ? `Enter a whole number up to ${windowTokens.toLocaleString("en-US")}.`
+            : "Enter a whole number."
+          : disabled
+            ? "Stop the bot to change this.\u00A0 Empty uses the model default."
+            : "Empty uses the model default."}
+      </p>
+    </div>
+  );
+}
+
+/** "Effort": how hard the selected model thinks.  Default plus the levels the
+ *  model offers, a check on the one the bot has now.  A model with no levels
+ *  gets no section at all.  The choices are plain `aria-pressed` buttons, as in
+ *  Settings' Reasoning control, so each is its own tab stop and a screen reader
+ *  announces the two controls the same way. */
+export function EffortSection({
+  levels,
+  defaultEffort,
+  current,
+  onPick,
+  disabled = false,
+  className,
+}: {
+  levels: readonly EffortLevel[];
+  defaultEffort?: EffortLevel;
+  /** The bot's saved effort; undefined is Default. */
+  current: EffortLevel | undefined;
+  onPick: (level: EffortLevel | undefined) => void;
+  /** The harness refuses a selection change while the bot is working, so the
+   *  choices are held until it stops rather than flipping and snapping back. */
+  disabled?: boolean;
+  className?: string;
+}) {
+  if (!levels.length) return null;
+  const showExplicitDefault = defaultEffort === undefined;
+  const choices = showExplicitDefault ? ([undefined, ...levels] as const) : levels;
+  return (
+    <div
+      role="group"
+      aria-label="Effort"
+      data-effort-section
+      className={cn("shrink-0 border-t border-hairline/40 px-3 pb-3 pt-2", className)}
+    >
+      <EngineGroupLabel className="px-1 pb-1.5">
+        Effort
+        {defaultEffort ? (
+          <span className="normal-case tracking-normal"> (default: {effortLabel(defaultEffort).toLowerCase()})</span>
+        ) : null}
+      </EngineGroupLabel>
+      <div className="flex flex-wrap gap-1">
+        {choices.map((level) => {
+          const checked = current === level || (current === undefined && level === defaultEffort);
+          return (
+            <button
+              key={level ?? "default"}
+              type="button"
+              aria-pressed={checked}
+              disabled={disabled}
+              onClick={() => onPick(level)}
+              className={cn(
+                "flex items-center gap-1 rounded-full border px-2.5 py-1 text-[12.5px] disabled:cursor-not-allowed disabled:opacity-60",
+                checked
+                  ? "border-accent/40 bg-control text-ink"
+                  : "border-hairline/40 text-ink-secondary hover:bg-control/60 hover:text-ink disabled:hover:bg-transparent disabled:hover:text-ink-secondary",
+              )}
+            >
+              {checked && <Check size={12} className="shrink-0 text-accent" />}
+              {effortLabel(level)}
+            </button>
+          );
+        })}
+      </div>
+      {disabled && <p className="px-1 pt-1.5 text-[12px] text-ink-secondary">Stop the bot to change effort.</p>}
+    </div>
+  );
+}
+
+/** Badge for a saved model the catalog no longer offers. */
+function StatusBadge({ status }: { status: SavedModelStatus }) {
+  if (!status.badge) return null;
+  return (
+    <span className="shrink-0 rounded bg-amber-500/15 px-1.5 py-px text-[10px] text-amber-700 dark:text-amber-300">
+      {status.badge}
+    </span>
+  );
+}
+
+/** One-click move off a retired or superseded saved model. */
+export function SavedModelNotice({
+  status,
+  modelName,
+  onSwitch,
+  className,
+}: {
+  status: SavedModelStatus;
+  modelName: string;
+  onSwitch: (selection: ModelSelection) => void;
+  className?: string;
+}) {
+  if (!status.badge) return null;
+  const what =
+    status.kind === "retired"
+      ? `${modelName} is retired.`
+      : status.kind === "superseded"
+        ? `${modelName} has a newer version.`
+        : `${modelName} is not in this engine's catalog.`;
+  return (
+    <div className={cn("flex flex-wrap items-center gap-x-2 gap-y-1 text-[11.5px] text-ink-secondary", className)}>
+      <StatusBadge status={status} />
+      <span>{what}</span>
+      {status.successor && status.successorLabel && (
+        <button
+          type="button"
+          onClick={() => onSwitch(status.successor!)}
+          className="rounded-md px-1.5 py-0.5 font-medium text-accent hover:bg-control/60"
+        >
+          {`Switch To ${status.successorLabel}`}
+        </button>
+      )}
+    </div>
+  );
 }
 
 const CALLOUT_DRIVER_KINDS = new Set([
@@ -38,6 +387,7 @@ const CALLOUT_DRIVER_KINDS = new Set([
   "grokAgent",
   "claudeAgent",
   "mcodeAgent",
+  "museAgent",
 ]);
 
 function WhyThisEngineCallout({ instance }: { instance: InstanceInfo }): ReactNode {
@@ -46,28 +396,80 @@ function WhyThisEngineCallout({ instance }: { instance: InstanceInfo }): ReactNo
     <EngineCallout
       key={instance.instanceId}
       driverKind={instance.driverKind}
-      instanceId={instance.instanceId}
+      models={instance.models.options
+        .filter((model) => !isInjectedLocalModel(model))
+        .map((model) => model.id)}
     />
   );
 }
 
-function engineStatus(instance: InstanceInfo): string {
+export function engineStatus(instance: InstanceInfo): string {
   if (instance.snapshot.quota?.capped) return "Quota Cap";
   const modelCaps = Object.values(instance.snapshot.quota?.models ?? {});
   if (modelCaps.some((row) => row.capped)) return "Partial quota";
   if (instance.snapshot.reason === "Disabled in settings") return "Disabled";
-  if (needsCli(instance)) return "Not installed";
+  // The last probe gave no answer: a slow Mac, not a missing CLI or a
+  // sign-out.  Never "Not installed" or "Sign-in required" for it.
+  if (isCheckingEngine(instance)) return "Checking";
+  if (needsCli(instance)) return isCliMissing(instance) ? "Not installed" : "Unavailable";
   if (needsSignIn(instance)) return "Sign-in required";
   return instance.snapshot.version ?? "Ready";
 }
 
-function ModelRow({
+/** Whether the picker shows the engine's setup card instead of its models.
+ *  An engine whose probe did not answer in time is blocked too: it has no
+ *  models to list yet, and EngineSetup draws its "Checking" card rather than
+ *  leaving an empty pane. */
+export function pickerBlocked(instance: InstanceInfo, pane: "main" | "custom"): boolean {
+  if (isCheckingEngine(instance)) return true;
+  return pane === "custom" ? needsCli(instance) : needsCli(instance) || needsSignIn(instance);
+}
+
+/** Whether an unusable engine's CLI is actually absent.  One that is on this
+ *  Mac but cannot run bots yet (too old, missing a flag BotFleet needs, its
+ *  own check failed) is unavailable, not "not installed" — the reason says
+ *  what to do.  So is an engine that has no CLI at all (MiniMax,
+ *  OpenAI-compatible and other API-key engines): a missing key is not a
+ *  missing install. */
+function isCliMissing(instance: InstanceInfo): boolean {
+  if (/CLI not found/i.test(instance.snapshot.reason ?? "")) return true;
+  if (instance.cliDefault === undefined && instance.cli === undefined) return false;
+  return (instance.cliCandidates?.length ?? 0) === 0;
+}
+
+/** The engines the picker's rail offers.  The selected engine always stays
+ *  so the picker can explain it; otherwise turned-off engines, uninstalled
+ *  custom ones, and optional integrations nobody set up (the ASCII.dev Box engine with no Box
+ *  token) are left out. */
+export function railEngines(instances: InstanceInfo[], selectedInstanceId: string): InstanceInfo[] {
+  return instances.filter((i) => {
+    if (i.enabled === false) return false;
+    const selected = i.instanceId === selectedInstanceId;
+    if (isHiddenEngine(i) && !selected) return false;
+    // A configured `cli` override counts: the registry lists only copies of
+    // the default command, so an absolute override leaves candidates empty.
+    const isInstalledOrSubscription =
+      i.access !== "custom" || Boolean(i.cli) || (i.cliCandidates?.length ?? 0) > 0;
+    if (i.snapshot.state === "unavailable" && !selected && !isInstalledOrSubscription) {
+      return false;
+    }
+    if (i.instanceId === "kimi" && (!i.snapshot.authenticated || i.snapshot.state !== "available") && !selected) return false;
+    return true;
+  });
+}
+
+/** One model row: the name, then whatever tags the catalog attached to it.
+ *
+ *  Exported for the visual fixture (tests/e2e/model-rows.visual.spec.ts): this
+ *  row is where the owner saw names break one character per line, and only a
+ *  fixture that mounts the real component can prove the fix rather than a copy
+ *  of it. */
+export function ModelRow({
   option,
   current,
   defaultId,
   onPick,
   quota,
-  windowsLabel,
 }: {
   option: ModelOption;
   current: boolean;
@@ -79,13 +481,14 @@ function ModelRow({
     secondaryRemainingPercent?: number | null;
     windowsLabel?: string;
   };
-  windowsLabel?: string;
 }) {
-  const badge = formatDualQuotaBadge(
-    quota?.remainingPercent,
-    quota?.secondaryRemainingPercent,
-    { windowsLabel: quota?.windowsLabel ?? windowsLabel },
-  );
+  const contextLabel = option.contextWindow
+    ? option.contextWindow >= 1_000_000
+      ? `${Math.floor(option.contextWindow / 1_000_000)}M`
+      : `${Math.floor(option.contextWindow / 1_000)}K`
+    : null;
+  const normalizedBadge = option.badge?.replace(/^(\d+(?:\.\d+)?[MK])\s+Context$/i, "$1");
+  const badge = normalizedBadge === contextLabel ? null : normalizedBadge;
   return (
     <button
       type="button"
@@ -96,29 +499,56 @@ function ModelRow({
         quota?.capped && "opacity-60",
       )}
     >
-      <span className="flex min-w-0 flex-1 items-center gap-1.5">
-        <span className="min-w-0 flex-1 break-words" title={option.label}>{option.label}</span>
-        {option.id === defaultId && (
-          <span className="shrink-0 rounded bg-inset px-1.5 py-px text-[10px] text-ink-secondary">Default</span>
-        )}
-        {option.loaded && (
-          <span className="shrink-0 rounded bg-accent/10 px-1.5 py-px text-[10px] text-accent">Loaded</span>
-        )}
-        {option.badge && (
-          <span
-            className="shrink-0 rounded bg-amber-500/15 px-1.5 py-px text-[10px] text-amber-700 dark:text-amber-300"
-            title={option.badgeTitle ?? option.badge}
-            aria-label={option.badgeTitle ?? option.badge}
-          >
-            {option.badge}
-          </span>
-        )}
-        {quota?.capped && (
-          <span className="shrink-0 rounded bg-amber-500/15 px-1.5 py-px text-[10px] text-amber-700 dark:text-amber-300">Exhausted</span>
-        )}
-        {!quota?.capped && badge && (
-          <span className="shrink-0 rounded bg-inset px-1.5 py-px text-[10px] text-ink-secondary">{badge}</span>
-        )}
+      <span className="flex min-w-0 flex-1 flex-wrap items-center gap-x-1.5 gap-y-1">
+        {/* The name is the thing being chosen, so it gets the row's slack and
+            the tags take what is left, dropping to their own line when that is
+            not enough.  `mr-auto` rather than `flex-1`: a `flex-1` label grows
+            to fill the line and pushes the tags down every time, even beside a
+            short slug.  The width floor is what stops the reverse failure —
+            without it the label is the only shrinkable item, so it collapses
+            toward zero width under tag pressure and `break-words` breaks it one
+            character per line ("DeepSeek-V" as a column of letters) while
+            `truncate` reduces it to a bare ellipsis.  `min(9rem, 100%)` is
+            wide enough to read a slug and capped so the row can never be
+            forced wider than the pane holding it. */}
+        <span
+          data-testid="model-row-label"
+          className="min-w-[min(9rem,100%)] max-w-full mr-auto truncate"
+          title={option.label}
+        >
+          {option.label}
+        </span>
+        {/* One wrapping unit rather than loose chips: a group of tags that
+            cannot fit beside the name moves below it whole, instead of leaving
+            "Default" beside the slug and "1M" on the line under. */}
+        <span data-testid="model-row-tags" className="flex shrink-0 flex-wrap items-center gap-x-1.5 gap-y-1">
+          {option.id === defaultId && (
+            <span className="shrink-0 rounded bg-inset px-1.5 py-px text-[10px] text-ink-secondary">Default</span>
+          )}
+          {option.loaded && (
+            <span className="shrink-0 rounded bg-accent/10 px-1.5 py-px text-[10px] text-accent">Loaded</span>
+          )}
+          {option.contextWindow && (
+            <span
+              className="shrink-0 rounded bg-inset px-1.5 py-px text-[10px] text-ink-secondary"
+              title={`${option.contextWindow.toLocaleString()} tokens max`}
+            >
+              {contextLabel}
+            </span>
+          )}
+          {badge && (
+            <span
+              className="shrink-0 rounded bg-amber-500/15 px-1.5 py-px text-[10px] text-amber-700 dark:text-amber-300"
+              title={option.badgeTitle ?? badge}
+              aria-label={option.badgeTitle ?? badge}
+            >
+              {badge}
+            </span>
+          )}
+          {quota?.capped && (
+            <span className="shrink-0 rounded bg-amber-500/15 px-1.5 py-px text-[10px] text-amber-700 dark:text-amber-300">Exhausted</span>
+          )}
+        </span>
       </span>
       {current && <Check size={14} className="shrink-0 text-accent" />}
     </button>
@@ -157,35 +587,144 @@ function ModelSearch({
   );
 }
 
+/** The Local Models entry's panel: every configured local model in one list,
+ * grouped under the engine that runs it.  Picking a row goes through the same
+ * `onPick` as any engine's own list. */
+export function LocalModelsPanel({
+  groups,
+  selection,
+  query,
+  onQueryChange,
+  onPick,
+}: {
+  groups: readonly LocalModelGroup[];
+  selection: Pick<ModelSelection, "instanceId" | "model">;
+  query: string;
+  onQueryChange: (value: string) => void;
+  onPick: (instance: InstanceInfo, modelId: string) => void;
+}) {
+  const total = localModelCount(groups);
+  const shown = filterLocalModelGroups(groups, query);
+  return (
+    <>
+      <div className="shrink-0 px-4 pb-2 pt-3.5">
+        <div className="flex items-center justify-between gap-3">
+          <div className="truncate text-[14px] font-semibold text-ink">{LOCAL_MODELS_TITLE}</div>
+          <span className="shrink-0 rounded-full bg-success/10 px-2 py-0.5 text-[10.5px] font-medium text-success">
+            {total} {total === 1 ? "model" : "models"}
+          </span>
+        </div>
+        <div className="mt-0.5 text-[11.5px] text-ink-secondary">
+          Run this bot with a model on this computer or at an endpoint you added.
+        </div>
+      </div>
+      {total > COMPACT_MODEL_COUNT && (
+        <ModelSearch value={query} local onChange={onQueryChange} onEscape={() => onQueryChange("")} />
+      )}
+      <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-2">
+        {shown.map((group) => (
+          <div key={group.instance.instanceId} role="group" aria-label={`Runs on ${group.instance.displayName}`}>
+            <EngineGroupLabel className="px-2 pb-1 pt-2">Runs On {group.instance.displayName}</EngineGroupLabel>
+            {group.options.map((option) => (
+              <ModelRow
+                key={option.id}
+                option={option}
+                current={selection.instanceId === group.instance.instanceId && selection.model === option.id}
+                defaultId=""
+                onPick={() => onPick(group.instance, option.id)}
+                quota={group.instance.snapshot.quota?.models?.[option.id]}
+              />
+            ))}
+          </div>
+        ))}
+        {shown.length === 0 && (
+          <div className="px-2 py-5 text-center text-[12.5px] text-ink-secondary">
+            Nothing matches “{query.trim()}”
+          </div>
+        )}
+      </div>
+    </>
+  );
+}
+
 export function ModelPicker({
   bot,
   className,
   contained = false,
+  widePopover = false,
   label,
   selection: propSelection,
   onChange,
+  initialOpen = false,
+  initialRailId = null,
 }: {
   bot: Bot;
   className?: string;
   /** Expand the menu in-flow under the trigger so it cannot overflow a
    * narrow parent (the Bot profile sidebar). */
   contained?: boolean;
+  /** Fleet-wide cards have room for a menu wider than their trigger. */
+  widePopover?: boolean;
   label?: ReactNode;
   selection?: ModelSelection;
   onChange?: (selection: ModelSelection) => void;
+  /** Start with the menu open on this rail entry.  The picker opens from a
+   * click in the app; tests have no click, so they start it open. */
+  initialOpen?: boolean;
+  initialRailId?: string | null;
 }) {
   const { state, dispatch, refreshInstances } = useStore();
-  const [open, setOpen] = useState(false);
-  const [railId, setRailId] = useState<string | null>(null);
+  const [open, setOpen] = useState(initialOpen);
+  const [railId, setRailId] = useState<string | null>(initialRailId);
   const [pane, setPane] = useState<"main" | "custom">("main");
   const [query, setQuery] = useState("");
   const [showAll, setShowAll] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
+  const [popoverPosition, setPopoverPosition] = useState({ left: 12, top: 12 });
+  // The wide menu is fixed-positioned so a clipping card cannot cut it off.
+  // It mounts inside the nearest modal dialog (Settings) when there is one, so
+  // that dialog's Tab trap still sees its controls, and on the body otherwise.
+  const [popoverHost, setPopoverHost] = useState<HTMLElement | null>(null);
+  useLayoutEffect(() => {
+    if (!open || !widePopover) return;
+    setPopoverHost(rootRef.current?.closest<HTMLElement>('[role="dialog"][aria-modal="true"]') ?? document.body);
+    const align = () => {
+      const root = rootRef.current?.getBoundingClientRect();
+      if (!root) return;
+      const width = Math.min(480, Math.max(0, window.innerWidth - 24));
+      setPopoverPosition({
+        left: Math.max(12, Math.min(root.left, window.innerWidth - 12 - width)),
+        top: root.bottom + 8,
+      });
+    };
+    align();
+    window.addEventListener("resize", align);
+    window.addEventListener("scroll", align, true);
+    return () => {
+      window.removeEventListener("resize", align);
+      window.removeEventListener("scroll", align, true);
+    };
+  }, [open, widePopover]);
+  // Tab from the trigger must land in the menu, which no longer follows the
+  // trigger in document order once it is fixed-positioned and portaled.
+  useLayoutEffect(() => {
+    if (open && widePopover && popoverHost) contentRef.current?.focus({ preventScroll: true });
+  }, [open, widePopover, popoverHost]);
 
   const selection = propSelection || bot.modelSelection;
   const active = state.instances.find((instance) => instance.instanceId === selection.instanceId);
-  const railInstance =
-    state.instances.find((instance) => instance.instanceId === (railId ?? selection.instanceId)) ?? state.instances[0];
+  // Every configured local model.  Empty means the rail shows no Local Models
+  // entry — there is no setup row standing in for it.
+  const localGroups = collectLocalModels(state.instances, selection);
+  // With no rail entry chosen yet, a bot already on a local model opens on the
+  // Local Models entry — an engine's own list does not show that model.
+  const localView =
+    localGroups.length > 0 &&
+    (railId === LOCAL_MODELS_RAIL_ID || (railId === null && opensOnLocalModels(localGroups, active, selection)));
+  const railInstance = localView
+    ? undefined
+    : state.instances.find((instance) => instance.instanceId === (railId ?? selection.instanceId)) ?? state.instances[0];
 
   useEffect(() => {
     if (open) void refreshInstances();
@@ -195,12 +734,11 @@ export function ModelPicker({
     if (!open) return;
     const closeOnOutsideClick = (event: MouseEvent) => {
       const clickedNode = event.target instanceof Node ? event.target : null;
-      if (!rootRef.current?.contains(clickedNode)) setOpen(false);
+      if (!rootRef.current?.contains(clickedNode) && !contentRef.current?.contains(clickedNode)) setOpen(false);
     };
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
       if (query) setQuery("");
-      else if (pane === "custom" && railInstance?.models.options.some((option) => !option.custom)) setPane("main");
       else setOpen(false);
     };
     window.addEventListener("mousedown", closeOnOutsideClick);
@@ -209,7 +747,7 @@ export function ModelPicker({
       window.removeEventListener("mousedown", closeOnOutsideClick);
       window.removeEventListener("keydown", closeOnEscape);
     };
-  }, [open, pane, query, railInstance]);
+  }, [open, query]);
 
   const resetList = () => {
     setQuery("");
@@ -218,10 +756,13 @@ export function ModelPicker({
 
   const openFor = (instance: InstanceInfo | undefined) => {
     const official = instance?.models.options.filter((option) => !option.custom) ?? [];
-    const selectedIsCustom = instance?.models.options.some(
-      (option) => option.id === selection.model && option.custom,
-    );
-    setPane(selectedIsCustom || isCustomOnly(instance) || official.length === 0 ? "custom" : "main");
+    setPane(isCustomOnly(instance) || official.length === 0 ? "custom" : "main");
+    resetList();
+  };
+
+  const selectLocalModels = () => {
+    setRailId(LOCAL_MODELS_RAIL_ID);
+    setPane("main");
     resetList();
   };
 
@@ -232,22 +773,14 @@ export function ModelPicker({
     resetList();
   };
 
-  const pick = (instance: InstanceInfo, model: string) => {
-    const nextSelection: ModelSelection = {
-      instanceId: instance.instanceId,
-      model,
-    };
-    if (selection.effort) {
-      const targetOption = instance.models.options.find((o) => o.id === model);
-      const allowed = modelEffortLevels(instance, targetOption, model);
-      if (allowed.includes(selection.effort)) {
-        nextSelection.effort = selection.effort;
-      }
-    }
-    // Fleet Models passes onChange for the primary pill.  Keep that bot's
-    // fallbacks so picking a new primary does not wipe the chain.
-    if (selection.fallbacks?.length) nextSelection.fallbacks = selection.fallbacks;
+  /** `latest` picks a "Latest <Class>" row; a pinned pick sends `null` so
+   *  the harness does not carry an older float forward onto it. */
+  const pick = (instance: InstanceInfo, model: string, latest?: string) => {
+    commit(pickedSelection(selection, instance, model, latest));
+    setOpen(false);
+  };
 
+  function commit(nextSelection: ModelSelection) {
     if (onChange) {
        onChange(nextSelection);
     } else {
@@ -258,10 +791,27 @@ export function ModelPicker({
          patch: { modelSelection: nextSelection },
        });
     }
+  }
+
+  /** "Switch To …": the saved entry's replacement, keeping the chain. */
+  const switchSaved = (successor: ModelSelection) => {
+    const next: ModelSelection = { ...successor };
+    if (selection.fallbacks?.length) next.fallbacks = selection.fallbacks;
+    commit(next);
     setOpen(false);
   };
 
-  const official = railInstance?.models.options.filter((option) => !option.custom) ?? [];
+  /** Effort changes only the effort: the rest of the selection rides along, so
+   *  a "Latest <Class>" bot keeps floating and its fallbacks stay.  The menu
+   *  stays open so the check visibly moves.  Same save as Settings' Reasoning
+   *  control (`selectionWithEffort`). */
+  const pickEffort = (level: EffortLevel | undefined) => commit(selectionWithEffort(selection, level));
+
+  // Superseded rows are hidden: within a model class only the newest member
+  // is offered, beside the "Latest <Class>" rows.
+  const official = offeredOptions(railInstance).filter((option) => !option.custom);
+  const latest = latestRows(railInstance);
+  const savedStatus = savedModelStatus(active, selection);
   const custom = railInstance?.models.options.filter((option) => option.custom) ?? [];
   const currentModel = selection.instanceId === railInstance?.instanceId ? selection.model : undefined;
   const filteredOfficial = filterCustomModels(official, query);
@@ -271,13 +821,55 @@ export function ModelPicker({
   const shownOfficial = query ? filteredOfficial : showAll ? official : compactOfficial;
   const filteredCustom = filterCustomModels(custom, query);
   const { pinned, rest } = partitionCustomModels(filteredCustom);
-  const blocked = railInstance
-    ? pane === "custom"
-      ? needsCli(railInstance)
-      : needsCli(railInstance) || needsSignIn(railInstance)
-    : false;
-  const canOpenCustom = Boolean(railInstance && !needsCli(railInstance));
-  const canReturnToOfficial = official.length > 0 && !isCustomOnly(railInstance);
+  // Custom rows that are not a local host's model (a cloud provider configured
+  // in Codex, an extra from Claude's settings) stay in their own engine's list.
+  // The local ones are on the Local Models entry.
+  const shownOtherCustom = filterCustomModels(custom.filter((option) => !isInjectedLocalModel(option)), query);
+  const blocked = railInstance ? pickerBlocked(railInstance, pane) : false;
+  const checking = isCheckingEngine(railInstance);
+
+  // The chat picker's Effort section belongs to the model the bot is on, so
+  // it appears only on the panel that lists that model: the bot's own engine,
+  // or Local Models when the bot is on one of those.  Browsing another engine
+  // never shows the current model's effort under that engine's name.  Settings
+  // pickers (`contained`) have the Reasoning control beside them.
+  const effortLevels = contained ? [] : selectionEffortLevels(active, selection);
+  const defaultEffort = contained ? undefined : selectionDefaultEffort(active, selection);
+  const effortApplies = localView
+    ? opensOnLocalModels(localGroups, active, selection)
+    : !blocked && railInstance?.instanceId === selection.instanceId;
+  const effortSection =
+    effortApplies && effortLevels.length > 0 ? (
+      <EffortSection
+        levels={effortLevels}
+        defaultEffort={defaultEffort}
+        current={selection.effort}
+        onPick={pickEffort}
+        disabled={Boolean(bot.busy)}
+      />
+    ) : null;
+  const contextCaps = contained ? [] : selectionContextCaps(active, selection);
+  const contextSection =
+    effortApplies && contextCaps.length > 0 ? (
+      <ContextSection
+        caps={contextCaps}
+        windowTokens={active?.models.options.find((option) => option.id === selection.model)?.contextWindow}
+        current={selection.contextCap ?? undefined}
+        onPick={(cap) => commit(selectionWithContextCap(selection, cap))}
+        disabled={Boolean(bot.busy)}
+      />
+    ) : null;
+  const maxOutputSection =
+    !contained && effortApplies && selectionSupportsMaxOutput(active, selection) ? (
+      <MaxOutputSection
+        current={selection.maxOutputTokens ?? undefined}
+        windowTokens={active?.models.options.find((option) => option.id === selection.model)?.contextWindow}
+        onPick={(tokens) => commit(selectionWithMaxOutput(selection, tokens))}
+        disabled={Boolean(bot.busy)}
+      />
+    ) : null;
+  const chipEffort =
+    !contained && selection.effort && effortLevels.includes(selection.effort) ? selection.effort : undefined;
 
   const windowsLabel =
     railInstance?.snapshot.quota?.windowsLabel ??
@@ -287,11 +879,10 @@ export function ModelPicker({
     <ModelRow
       key={option.id}
       option={option}
-      current={selection.instanceId === railInstance?.instanceId && selection.model === option.id}
+      current={selection.instanceId === railInstance?.instanceId && selection.model === option.id && !selection.latest}
       defaultId={railInstance?.models.default ?? ""}
       onPick={() => railInstance && pick(railInstance, option.id)}
       quota={railInstance?.snapshot.quota?.models?.[option.id]}
-      windowsLabel={windowsLabel}
     />
   );
 
@@ -303,11 +894,16 @@ export function ModelPicker({
     else if (id.includes("hermes")) activeDriverKind = "hermesAgent";
   }
 
+  const modelAriaLabel = modelControlLabel(
+    active ? selectionChipLabel(active, selection, { showLatest: contained }) : selection.model,
+    savedStatus.badge ?? undefined,
+  );
+
   const trigger = (
     <button
       type="button"
       onClick={() => {
-        setRailId(selection.instanceId);
+        setRailId(null);
         setOpen((wasOpen) => {
           const next = !wasOpen;
           if (next) openFor(state.instances.find((instance) => instance.instanceId === selection.instanceId));
@@ -316,24 +912,42 @@ export function ModelPicker({
       }}
       aria-expanded={open}
       aria-haspopup="dialog"
+      aria-label={modelAriaLabel}
       className={cn(
-        "flex max-w-full items-center gap-1.5 rounded-full border border-hairline/40 bg-control/60 py-1 pl-2 pr-2.5 text-[13px] text-ink hover:bg-raised-hover",
+        "flex max-w-full items-center gap-1.5 border border-hairline/40 bg-control/60 py-1 pl-2 pr-2.5 text-[13px] text-ink hover:bg-raised-hover",
+        // The contained trigger now sits on its own line under the label, so
+        // it fills the column and squares its corners. A full-width control
+        // shaped like a chip reads as a button floating in space; the name is
+        // left-aligned so a long model id truncates from the right.
+        contained ? "w-full min-w-0 justify-between rounded-lg py-1.5 pl-2.5 text-left" : "rounded-full",
         // Settings Models chips (no side label) fill their wrap column so
         // long names truncate inside the pill instead of overlapping the next.
-        contained && !label && "w-full min-w-0 justify-between",
+        !contained && "rounded-full",
         // in a narrow chat header fold to a rounded square with just the
         // provider mark; the model name rides the tooltip (a bot with no
         // resolved engine keeps its label — the mark is what would hide it)
         !contained && active && COMPACT_SQUARE,
       )}
-      title={active ? `${active.displayName} · ${modelLabel(active, selection.model)}` : selection.model}
+      title={
+        active
+          ? `${active.displayName} · ${selectionChipLabel(active, selection, { showLatest: true })} (${selection.model})${chipEffort ? ` · ${effortLabel(chipEffort)} effort` : ""}`
+          : selection.model
+      }
     >
       {active && <ProviderMark driverKind={activeDriverKind!} model={selection.model} size={14} />}
       <span className={cn("min-w-0 truncate", !contained && "max-w-[160px]", !contained && active && "@max-4xl/chathead:hidden")}>
-        {modelLabel(active, selection.model)}
+        {/* The chat header names the model that actually runs; settings
+            chips also say when it floats on "Latest <Class>". */}
+        {selectionChipLabel(active, selection, { showLatest: contained })}
       </span>
+      {savedStatus.badge && (
+        <span className={cn(!contained && active && "@max-4xl/chathead:hidden")}>
+          <StatusBadge status={savedStatus} />
+        </span>
+      )}
       <ChevronDown
         size={14}
+        aria-hidden="true"
         className={cn(
           "text-ink-secondary transition-transform",
           open && "rotate-180",
@@ -344,36 +958,51 @@ export function ModelPicker({
   );
 
   return (
-    <div ref={rootRef} className={cn(contained ? "w-full" : "relative", className)}>
+    <div ref={rootRef} className={cn(contained ? "relative w-full" : "relative", className)}>
+      {/* Contained (Settings) stacks: label on its own line, the control
+          full width beneath it.  The row layout this replaced squeezed the
+          label and its subtitle into a narrow column beside the trigger, so
+          "Primary Model" wrapped onto two lines and the subtitle broke into a
+          five-word ribbon.  The bot's Settings panel is narrow enough that
+          this happens on every desktop width, so it is a stacked layout and
+          not a min-width that happens to fit. */}
       {contained ? (
-        <div className="flex items-center justify-between gap-4">
+        <div className="flex flex-col gap-3">
           {label}
           {trigger}
         </div>
       ) : (
         trigger
       )}
+      {contained && !open && (
+        <SavedModelNotice
+          status={savedStatus}
+          modelName={modelLabel(active, selection.model)}
+          onSwitch={switchSaved}
+          className="mt-1.5"
+        />
+      )}
 
-      {open && (
-        <div
+      {open && (() => {
+        const content = <div
+          ref={contentRef}
           data-model-picker-content
           role="dialog"
           aria-label="Choose Model"
+          tabIndex={widePopover ? -1 : undefined}
+          style={widePopover ? { ...popoverPosition, maxHeight: `min(560px, calc(100dvh - ${popoverPosition.top + 12}px))` } : undefined}
           className={cn(
             "flex overflow-hidden rounded-2xl border border-hairline/50 bg-card",
-            contained
+            widePopover
+              ? "fixed z-50 w-[480px] max-w-[calc(100vw-24px)] shadow-2xl shadow-black/50 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+              : contained
               ? "relative mt-3 w-full max-h-[min(420px,50dvh)]"
-              : "absolute right-0 top-full z-30 mt-2 w-[420px] max-h-[min(480px,calc(100dvh-7rem))] shadow-2xl shadow-black/50",
+              : "absolute right-0 top-full z-30 mt-2 w-[420px] min-w-[380px] max-w-[min(640px,calc(100vw-2rem))] max-h-[min(560px,calc(100dvh-7rem))] resize shadow-2xl shadow-black/50",
           )}
         >
           <div className="flex w-14 shrink-0 flex-col gap-1 overflow-y-auto border-r border-hairline/40 bg-panel p-2">
             {(() => {
-              const availableInstances = state.instances.filter((i) => {
-                if (i.enabled === false) return false;
-                if (i.snapshot.state === "unavailable" && i.instanceId !== selection.instanceId) return false;
-                if (i.instanceId === "kimi" && (!i.snapshot.authenticated || i.snapshot.state !== "available") && i.instanceId !== selection.instanceId) return false;
-                return true;
-              });
+              const availableInstances = railEngines(state.instances, selection.instanceId);
               const { subscription, custom: local } = splitEngineRail(availableInstances);
               const railButton = (instance: InstanceInfo) => {
                 const selected = instance.instanceId === railInstance?.instanceId;
@@ -409,8 +1038,23 @@ export function ModelPicker({
                     <EngineGroupLabel className="px-0 pb-0.5 pt-0.5 text-center text-[9px]">Cloud</EngineGroupLabel>
                   )}
                   {subscription.map(railButton)}
-                  {local.length > 0 && (
+                  {(local.length > 0 || localGroups.length > 0) && (
                     <EngineGroupLabel className="px-0 pb-0.5 pt-2 text-center text-[9px]">Local</EngineGroupLabel>
+                  )}
+                  {localGroups.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={selectLocalModels}
+                      aria-label={LOCAL_MODELS_TITLE}
+                      aria-pressed={localView}
+                      title={`${LOCAL_MODELS_TITLE} · ${localModelCount(localGroups)} ${localModelCount(localGroups) === 1 ? "model" : "models"}`}
+                      className={cn(
+                        "relative flex size-9 items-center justify-center rounded-lg",
+                        localView ? "bg-control ring-1 ring-hairline/50" : "hover:bg-control/60",
+                      )}
+                    >
+                      <ProviderMark driverKind={LOCAL_MODELS_DRIVER_KIND} size={18} />
+                    </button>
                   )}
                   {local.map(railButton)}
                 </>
@@ -419,33 +1063,80 @@ export function ModelPicker({
           </div>
 
           <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-            {railInstance ? (
+            {localView ? (
+              <>
+                <LocalModelsPanel
+                  groups={localGroups}
+                  selection={selection}
+                  query={query}
+                  onQueryChange={setQuery}
+                  onPick={pick}
+                />
+                {effortSection}
+                {contextSection}
+                {maxOutputSection}
+              </>
+            ) : railInstance ? (
               <>
                 <div className="shrink-0 px-4 pb-2 pt-3.5">
-                  <div className="flex items-center justify-between gap-3">
-                    <div className="truncate text-[14px] font-semibold text-ink" title={railInstance.displayName}>{railInstance.displayName}</div>
+                  <div className="flex items-center justify-between gap-2">
+                    {/* The engine name is the heading, so it wraps rather than
+                        truncating, and the status pill beside it is capped: a
+                        build-style version ("2026.09.26-dd393fe") used to eat
+                        the row and cut "Cursor" down to "Cu…".  The pill keeps
+                        the full string in its tooltip. */}
+                    <div
+                      className="min-w-0 flex-1 text-[14px] font-semibold leading-snug break-words text-ink"
+                      title={railInstance.displayName}
+                    >
+                      {railInstance.displayName}
+                    </div>
                     <span
                       className={cn(
-                        "shrink-0 rounded-full px-2 py-0.5 text-[10.5px] font-medium",
+                        "max-w-[45%] shrink-0 truncate rounded-full px-2 py-0.5 text-[10.5px] font-medium",
                         railInstance.snapshot.quota?.capped
                           ? "bg-amber-500/10 text-amber-600 dark:text-amber-400"
+                          : checking
+                          ? "bg-inset text-ink-secondary"
                           : blocked
                           ? "bg-warning/10 text-warning"
                           : "bg-success/10 text-success",
                       )}
+                      title={pane === "custom" && !blocked ? "Local models" : engineStatus(railInstance)}
                     >
                       {pane === "custom" && !blocked ? "Local models" : engineStatus(railInstance)}
                     </span>
                   </div>
-                  <div className="mt-0.5 text-[11.5px] text-ink-secondary">
-                    {pane === "custom"
-                      ? "Run this bot with a model already on your machine."
-                      : "Choose a model for this bot."}
-                  </div>
+                  {/* Only the local pane keeps a line here, because "run a
+                      model from your own machine" is the one thing about that
+                      pane the rail button does not already say.  The hosted
+                      pane dropped its line: "Choose a model for this bot"
+                      described the list the person was already looking at. */}
+                  {pane === "custom" && (
+                    <div className="mt-0.5 text-[11.5px] text-ink-secondary">
+                      Run this bot with a model already on your machine.
+                    </div>
+                  )}
+                  {/* Quotas live on the engine, not the model, so they get one
+                      labelled home under the header instead of a cryptic chip
+                      repeated down every row. */}
+                  <EngineQuotasPanel
+                    engines={state.instances}
+                    activeInstanceId={railInstance.instanceId}
+                  />
                   {railInstance.snapshot.quota?.capped && (
                     <div className="mt-2 rounded bg-amber-500/10 px-2.5 py-1.5 text-[11px] leading-relaxed text-amber-700 dark:text-amber-300 border border-amber-500/20">
                       <strong>Usage cap in effect:</strong> {railInstance.snapshot.quota?.error ?? "Session limit or quota reached."} Turns automatically fail over to configured fallbacks until reset.
                     </div>
+                  )}
+
+                  {railInstance.instanceId === selection.instanceId && (
+                    <SavedModelNotice
+                      status={savedStatus}
+                      modelName={modelLabel(active, selection.model)}
+                      onSwitch={switchSaved}
+                      className="mt-2"
+                    />
                   )}
 
                   {railInstance.driverKind === "boxAgent" && (
@@ -456,25 +1147,14 @@ export function ModelPicker({
                   )}
                 </div>
 
-                {pane === "custom" && canReturnToOfficial && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setPane("main");
-                      resetList();
-                    }}
-                    className="mx-2 mb-1 flex shrink-0 items-center gap-1.5 rounded-lg px-2 py-1.5 text-left text-[12px] text-ink-secondary hover:bg-control/60"
-                  >
-                    <ChevronLeft size={13} /> Back to {railInstance.displayName} models
-                  </button>
-                )}
-
                 {blocked ? (
                   <div className="min-h-0 flex-1 overflow-y-auto px-3 pb-3 pt-1">
                     <WhyThisEngineCallout instance={railInstance} />
                     <EngineSetup instance={railInstance} intent={pane === "custom" ? "inject" : "cloud"} />
                     <p className="mt-2 text-center text-[11.5px] text-ink-secondary/70">
-                      {pane === "main" && official.length > 0
+                      {checking
+                        ? "Models will appear as soon as the check finishes."
+                        : pane === "main" && official.length > 0
                         ? `${official.length} ${official.length === 1 ? "model" : "models"} will appear after setup.`
                         : "Local models will appear as soon as the engine is installed."}
                     </p>
@@ -492,7 +1172,6 @@ export function ModelPicker({
                         }}
                         onEscape={() => {
                           if (query) setQuery("");
-                          else if (pane === "custom" && canReturnToOfficial) setPane("main");
                         }}
                       />
                     )}
@@ -503,11 +1182,18 @@ export function ModelPicker({
                       </div>
                       {pane === "main" ? (
                         <>
+                          {!query && (
+                            <LatestModelRows
+                              rows={latest}
+                              currentClass={selection.instanceId === railInstance.instanceId ? selection.latest : null}
+                              onPick={(row) => pick(railInstance, row.resolvedId, row.classKey)}
+                            />
+                          )}
                           <EngineGroupLabel className="px-2 pb-1 pt-0.5">
                             {query ? `${filteredOfficial.length} results` : showAll ? `All models · ${official.length}` : "Suggested"}
                           </EngineGroupLabel>
                           {shownOfficial.map(renderRow)}
-                          {shownOfficial.length === 0 && (
+                          {shownOfficial.length === 0 && shownOtherCustom.length === 0 && (
                             <div className="px-2 py-5 text-center text-[12.5px] text-ink-secondary">
                               Nothing matches “{query.trim()}”
                             </div>
@@ -518,7 +1204,7 @@ export function ModelPicker({
                               onClick={() => setShowAll(true)}
                               className="mt-1 flex w-full items-center justify-between rounded-lg border-t border-hairline/40 px-2.5 py-2 text-[12.5px] font-medium text-ink-secondary hover:bg-control/60 hover:text-ink"
                             >
-                              Show all {official.length} models{windowsLabel ? ` (${windowsLabel})` : ""} <ChevronDown size={13} />
+                              Show all {official.length} models{windowsLabel ? ` (${formatWindowPairLabel(windowsLabel)})` : ""} <ChevronDown size={13} aria-hidden="true" />
                             </button>
                           )}
                           {!query && showAll && official.length > COMPACT_MODEL_COUNT && (
@@ -529,6 +1215,12 @@ export function ModelPicker({
                             >
                               Show suggested only
                             </button>
+                          )}
+                          {shownOtherCustom.length > 0 && (
+                            <>
+                              <EngineGroupLabel className="px-2 pb-1 pt-3">Custom</EngineGroupLabel>
+                              {shownOtherCustom.map(renderRow)}
+                            </>
                           )}
                         </>
                       ) : (
@@ -557,40 +1249,21 @@ export function ModelPicker({
                         </>
                       )}
                     </div>
+                    {effortSection}
+                    {contextSection}
+                    {maxOutputSection}
                   </>
-                )}
-
-                {pane === "main" && (
-                  <button
-                    type="button"
-                    aria-label={
-                      custom.length > 0 ? `Use a Local Model (${custom.length} available)` : "Use a Local Model"
-                    }
-                    disabled={!canOpenCustom}
-                    onClick={() => {
-                      setPane("custom");
-                      resetList();
-                    }}
-                    className="flex w-full shrink-0 items-center justify-between gap-2 border-t border-hairline/40 px-4 py-3 text-left text-[12.5px] font-medium text-ink hover:bg-control/60 disabled:cursor-not-allowed disabled:text-ink-secondary/40 disabled:hover:bg-transparent"
-                  >
-                    <span>Use a Local Model</span>
-                    <span className="flex items-center gap-2">
-                      {custom.length > 0 && (
-                        <span className="rounded-full bg-inset px-2 py-0.5 text-[10.5px] text-ink-secondary">
-                          {custom.length} available
-                        </span>
-                      )}
-                      <ChevronRight size={14} className="text-ink-secondary" />
-                    </span>
-                  </button>
                 )}
               </>
             ) : (
               <div className="px-4 py-5 text-[13px] text-ink-secondary">No model providers are available.</div>
             )}
           </div>
-        </div>
-      )}
+        </div>;
+        if (!widePopover || globalThis.document === undefined) return content;
+        // The host is resolved in a layout effect, so this null never paints.
+        return popoverHost ? createPortal(content, popoverHost) : null;
+      })()}
     </div>
   );
 }

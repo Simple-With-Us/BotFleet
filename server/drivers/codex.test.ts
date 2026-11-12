@@ -5,15 +5,16 @@
 //
 // The fake is a shebang script — the same constraint codex.cmd itself
 // hits on Windows. resolveCliSpawn covers both, so these run everywhere.
-import { chmodSync, mkdtempSync, readFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ProviderInstance } from "../contracts.ts";
 import { recordEvents, type EventRecorder } from "../testing/events.ts";
-import { CodexDriver } from "./codex.ts";
+import { expectLaunchedAs, inheritHarnessIdentity, readEngineDump } from "../testing/launch-identity.ts";
+import { CodexDriver, codexLoginAnswer } from "./codex.ts";
 import { removeTempDir } from "../testing/cleanup.ts";
 
 const FAKE_CLI = join(dirname(fileURLToPath(import.meta.url)), "..", "testing", "fake-codex-app-server.ts");
@@ -83,6 +84,42 @@ describe("CodexDriver turns (fake app-server)", () => {
     await removeTempDir(scratch);
   });
 
+  it("launches each bot's turn with its own seat and none of the harness's identity", async () => {
+    const restore = inheritHarnessIdentity();
+    try {
+      // an instance-level identity must not survive either
+      await create({ environment: { AGENT_SEAT: "CLAUDE", ZULIP_API_KEY: "instance-api-key" } });
+      const dump = join(scratch, "launch-dump.json");
+      process.env.FAKE_CODEX_DUMP = dump;
+      const seenFor = async (threadId: string, launchIdentity: { seat: string | null; session: string } | undefined) => {
+        const started = await instance.adapter.sendTurn({ threadId, text: "hi", launchIdentity });
+        await recorder.until((e) => e.type === "turn.completed" && e.turnId === started.turnId);
+        return readEngineDump(dump);
+      };
+
+      const plumber = await seenFor("t-cx-plumber", { seat: "BF-PLUMBER", session: "t-cx-plumber" });
+      const fixer = await seenFor("t-cx-fixer", { seat: "BF-FIXER", session: "t-cx-fixer" });
+      const none = await seenFor("t-cx-none", { seat: null, session: "t-cx-none" });
+      expectLaunchedAs(plumber.env, { seat: "BF-PLUMBER", session: "t-cx-plumber" });
+      expectLaunchedAs(fixer.env, { seat: "BF-FIXER", session: "t-cx-fixer" });
+      expectLaunchedAs(none.env, { seat: null, session: "t-cx-none" });
+      expect(JSON.stringify([plumber.env, fixer.env, none.env])).not.toContain("instance-api-key");
+
+      // The model's shell runs under Codex's own environment policy, so the
+      // same values ride as `-c` overrides, quoted, for the right bot only.
+      expect(plumber.argv).toContain('shell_environment_policy.set.AGENT_LAUNCH_SEAT="BF-PLUMBER"');
+      expect(plumber.argv).toContain('shell_environment_policy.set.AGENT_SESSION="t-cx-plumber"');
+      expect(plumber.argv).toContain('shell_environment_policy.set.AGENT_LAUNCHER="botfleet"');
+      expect(fixer.argv).toContain('shell_environment_policy.set.AGENT_SEAT="BF-FIXER"');
+      expect(fixer.argv.join(" ")).not.toContain("BF-PLUMBER");
+      expect(none.argv).toContain('shell_environment_policy.set.AGENT_LAUNCHER="botfleet"');
+      expect(none.argv.join(" ")).not.toContain("AGENT_LAUNCH_SEAT");
+      expect(none.argv.join(" ")).not.toContain("ZULIP");
+    } finally {
+      restore();
+    }
+  });
+
   it("runs the handshake and normalizes a full turn", async () => {
     await create();
     const dump = join(scratch, "dump.json");
@@ -143,6 +180,87 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(turnStart.params.input[0].text).toBe("You are Testy.\n\nlist files");
     const threadStart = seen.calls.find((c: { method: string }) => c.method === "thread/start");
     expect(threadStart.params).toMatchObject({ model: "gpt-5.6-sol", modelProvider: "openai" });
+  });
+
+  it("keeps a helper thread's notifications out of the turn, including its turn/completed (jobs P0)", async () => {
+    // A multi_agent helper runs as a thread of its own on the same app-server
+    // connection.  Its turn/completed arrives first and FAILED: without the
+    // thread filter it would settle this turn as failed before the main
+    // thread had said anything, and its text would become the bot's reply.
+    await create({ mode: "multi-agent" });
+    const { turnId } = await instance.adapter.sendTurn({ threadId: "t-multi-agent", text: "list files" });
+    const done = await recorder.until((e) => e.type === "turn.completed");
+
+    expect(recorder.events.filter((e) => e.type === "turn.completed")).toHaveLength(1);
+    expect(done).toMatchObject({ turnId, ok: true, usage: { input: 7, output: 3, cachedInput: 4 } });
+    const text = JSON.stringify(recorder.events);
+    for (const marker of ["HELPER DELTA", "HELPER TEXT", "HELPER ERROR", "HELPER FAILED"]) {
+      expect(text).not.toContain(marker);
+    }
+    // Helper fixture uses inputTokens 9999; a random main-thread turnId must not trip this.
+    expect(text).not.toContain('"inputTokens":9999');
+    // the main thread's own turn is intact, in order, with the helper's one
+    // host step nested under the spawn_agent row
+    expect(recorder.events.map((e) => e.type)).toEqual([
+      "turn.started",
+      "session.started",
+      "item.started",
+      "item.started",
+      "item.started",
+      "item.completed",
+      "item.started",
+      "item.completed",
+      "item.completed",
+      "item.completed",
+      "content.delta",
+      "item.completed",
+      "thread.token-usage.updated",
+      "turn.completed",
+    ]);
+    expect(recorder.events.find((e) => e.type === "item.completed" && e.itemType === "assistant_text")).toMatchObject({
+      text: "done from fake codex",
+    });
+  });
+
+  it("shows a helper's host commands as steps nested under the spawn_agent row (jobs P0)", async () => {
+    // A full-auto bot approves a helper's commands without a card; the row
+    // is the only record that they ran on the host.
+    await create({ mode: "multi-agent" });
+    await instance.adapter.sendTurn({ threadId: "t-multi-agent-rows", text: "list files" });
+    await recorder.until((e) => e.type === "turn.completed");
+
+    const spawn = recorder.events.find((e) => e.type === "item.started" && e.itemId === "spawn-1");
+    expect(spawn).toMatchObject({ title: "spawn_agent", toolKind: "task" });
+    expect((spawn as { parentItemId?: string }).parentItemId).toBeUndefined();
+    const helperStep = recorder.events.find((e) => e.type === "item.started" && e.itemId === "h1");
+    expect(helperStep).toMatchObject({ title: "HELPER COMMAND", parentItemId: "spawn-1", subagentId: "spawn-1" });
+    expect(recorder.events.some((e) => e.type === "item.completed" && e.itemId === "h1")).toBe(true);
+    // the main thread's own steps stay at the margin
+    const own = recorder.events.find((e) => e.type === "item.started" && e.itemId === "i1");
+    expect((own as { parentItemId?: string }).parentItemId).toBeUndefined();
+  });
+
+  it("reports emulated background jobs and typed helpers", async () => {
+    await create();
+    // jobs P2: the job tools ride the MCP server Codex already mounts.  The
+    // job process is spawned by the harness, not by Codex, so it is NOT inside
+    // the codex sandbox — the approval card is what stands between a Codex bot
+    // and a job, and a full-auto Codex bot is under ruling (c) instead.
+    expect(instance.adapter.capabilities.backgroundJobs).toBe("emulated");
+    expect(instance.adapter.capabilities.helpers).toBe("typed");
+  });
+
+  it("files a step's own input (not its outcome fields) for the side store", async () => {
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-tool-io", text: "list files" });
+    await recorder.until((e) => e.type === "turn.completed");
+    const started = recorder.events.find((e) => e.type === "item.started" && e.itemId === "i1")!;
+    const input = JSON.parse(started.io!.input!.text) as Record<string, unknown>;
+    expect(input).toEqual({ type: "commandExecution", command: "ls -la" });
+    // the headline is unchanged
+    expect(started).toMatchObject({ title: "ls -la", target: "ls -la" });
+    // this fake reports no output, so the completion captures none
+    expect(recorder.events.find((e) => e.type === "item.completed" && e.itemId === "i1")?.io).toBeUndefined();
   });
 
   it("keeps the full command when a Windows interpreter prefix is long", async () => {
@@ -392,6 +510,61 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(JSON.stringify(turnStart.params)).toContain("my dog is Biscuit");
   });
 
+  it("tells the harness once when it sends the replay in place of the turn", async () => {
+    await create();
+    process.env.FAKE_CODEX_DUMP = join(scratch, "replay-callback.json");
+    let called = 0;
+    await instance.adapter.sendTurn({
+      threadId: "t-replay-callback",
+      text: "what now?",
+      resumeCursor: "gone-thread",
+      recoveryText: "[rebuild]\n\nUser: my dog is Biscuit\n\nwhat now?",
+      onReplayRecovered: () => {
+        called += 1;
+      },
+    });
+    await recorder.until((e) => e.type === "turn.completed" && e.ok === true);
+    expect(called).toBe(1);
+  });
+
+  it("does not report a replay when there was nothing to rebuild from", async () => {
+    await create();
+    process.env.FAKE_CODEX_DUMP = join(scratch, "replay-callback-none.json");
+    let called = 0;
+    // no recoveryText: the resume failure is terminal and nothing is replayed
+    await instance.adapter.sendTurn({
+      threadId: "t-replay-none",
+      text: "go",
+      resumeCursor: "gone-thread",
+      onReplayRecovered: () => {
+        called += 1;
+      },
+    });
+    await recorder.until((e) => e.type === "turn.completed");
+    expect(called).toBe(0);
+  });
+
+  it("recovers the turn even when the callback throws", async () => {
+    await create();
+    process.env.FAKE_CODEX_DUMP = join(scratch, "replay-callback-throws.json");
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      await instance.adapter.sendTurn({
+        threadId: "t-replay-throws",
+        text: "what now?",
+        resumeCursor: "gone-thread",
+        recoveryText: "[rebuild]\n\nUser: my dog is Biscuit\n\nwhat now?",
+        onReplayRecovered: () => {
+          throw new Error("recorder down");
+        },
+      });
+      await recorder.until((e) => e.type === "turn.completed" && e.ok === true);
+      expect(error).toHaveBeenCalled();
+    } finally {
+      error.mockRestore();
+    }
+  });
+
   it("keeps the rebuilt prompt across a transient failure after missing-session recovery", async () => {
     const dump = join(scratch, "rebuild-retry.json");
     process.env.FAKE_CODEX_DUMP = dump;
@@ -590,6 +763,9 @@ describe("CodexDriver turns (fake app-server)", () => {
     await instance.adapter.sendTurn({ threadId: "t-approve", text: "clean up" });
     const opened = await recorder.until((e) => e.type === "request.opened");
     expect(opened).toMatchObject({ requestType: "permission", tool: "shell", summary: "rm -rf scratch" });
+    // the step the ask is about (legacy `callId`, v2 `itemId`), so the
+    // auto-review step watch leaves this step to the card
+    expect(opened).toHaveProperty("itemId", "call-approve");
 
     await instance.adapter.respondToRequest("t-approve", opened.requestId!, { behavior: "allow" });
     const resolved = await recorder.until((e) => e.type === "request.resolved");
@@ -616,6 +792,27 @@ describe("CodexDriver turns (fake app-server)", () => {
     await instance.adapter.respondToRequest("t-mcp-elicitation", opened.requestId!, { behavior: "allow" });
     await recorder.until((e) => e.type === "turn.completed");
     expect(JSON.parse(readFileSync(dump, "utf8")).decision).toEqual({ action: "accept", content: {} });
+  });
+
+  it("reports a mounted MCP server's job_start by its bare name, so the name alone proves nothing", async () => {
+    // The harness's approval rule for its own job_start therefore comes from
+    // where a request was raised (isOwnJobStartRequest in
+    // server/auto-approve.ts): a request arrives here spelled exactly like
+    // the harness's own.
+    await create({ mode: "mcp-elicitation-job-start" });
+    const dump = join(scratch, "mcp-elicitation-job-start.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+
+    await instance.adapter.sendTurn({ threadId: "t-mcp-job-start", text: "run the ci job" });
+    const opened = await recorder.until((e) => e.type === "request.opened");
+    expect(opened).toMatchObject({
+      requestType: "permission",
+      tool: "job_start",
+      summary: 'Allow the ci MCP server to run tool "job_start"?',
+    });
+
+    await instance.adapter.respondToRequest("t-mcp-job-start", opened.requestId!, { behavior: "deny" });
+    await recorder.until((e) => e.type === "turn.completed");
   });
 
   it("leaves an explicitly remote MCP ask unscoped in a mixed-computer turn", async () => {
@@ -723,6 +920,63 @@ describe("CodexDriver turns (fake app-server)", () => {
     });
   });
 
+  it("brokers a full-auto turn held for auto-review, so the reviewer sees the ask before it runs", async () => {
+    // Auto-review On for a bot on a full-auto Codex instance: the harness
+    // sets `holdForReview` on an attended turn, and the turn is brokered
+    // exactly like a host-control turn, inside workspace-write on-request.
+    await create({ mode: "approval", fullAuto: true });
+    expect(instance.adapter.capabilities).toMatchObject({ reviewHook: "after", asksWhenHeld: true });
+    const dump = join(scratch, "held-dump.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+
+    await instance.adapter.sendTurn({ threadId: "t-held", text: "clean up", holdForReview: true });
+    const opened = await recorder.until((e) => e.type === "request.opened");
+    // an ordinary ask, which auto-review may answer: no host scope on it
+    expect(opened.type === "request.opened" && opened.approvalScope).toBeUndefined();
+    await instance.adapter.respondToRequest("t-held", opened.requestId!, { behavior: "deny" });
+    await recorder.until((e) => e.type === "turn.completed");
+    // SAFETY: FAKE_CODEX_DUMP is written by server/testing/fake-codex-app-server.ts in the FakeDump shape.
+    expect(startParams(JSON.parse(readFileSync(dump, "utf8")) as FakeDump)).toMatchObject({
+      sandbox: "workspace-write",
+      approvalPolicy: "on-request",
+    });
+  });
+
+  it("never resumes a held thread on an unattended turn, which would ask with nobody there", async () => {
+    // A thread started brokered keeps on-request when resumed.  A webhook
+    // turn on a full-auto bot is never held, so it must start fresh in the
+    // instance's own full-auto mode instead of inheriting the held thread's
+    // asks and waiting on a card nobody can answer.
+    await create({ mode: "approval", fullAuto: true });
+    process.env.FAKE_CODEX_DUMP = join(scratch, "held-first.json");
+    await instance.adapter.sendTurn({ threadId: "t-held-then-webhook", text: "first", holdForReview: true });
+    const started = await recorder.until((e) => e.type === "session.started" && e.threadId === "t-held-then-webhook");
+    const heldThread = started.type === "session.started" ? started.sessionId : null;
+    expect(heldThread).toBeTruthy();
+    const opened = await recorder.until((e) => e.type === "request.opened");
+    await instance.adapter.respondToRequest("t-held-then-webhook", opened.requestId!, { behavior: "deny" });
+    await recorder.until((e) => e.type === "turn.completed" && e.threadId === "t-held-then-webhook");
+
+    const dump = join(scratch, "webhook-after-held.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+    await instance.adapter.sendTurn({
+      threadId: "t-held-then-webhook",
+      text: "webhook",
+      resumeCursor: heldThread,
+      unattended: true,
+    });
+    await recorder.until((e) => e.type === "turn.completed" && e.threadId === "t-held-then-webhook" && e.turnId !== opened.turnId);
+    // SAFETY: FAKE_CODEX_DUMP is written by server/testing/fake-codex-app-server.ts in the FakeDump shape.
+    const written = JSON.parse(readFileSync(dump, "utf8")) as FakeDump;
+    expect(written.calls.some((c) => c.method === "thread/resume")).toBe(false);
+    expect(startParams(written)).toMatchObject({ sandbox: "danger-full-access", approvalPolicy: "never" });
+  });
+
+  it("asks before every approval when not full-auto, which is where review holds it", async () => {
+    await create({ mode: "approval" });
+    expect(instance.adapter.capabilities).toMatchObject({ reviewHook: "before", asksWhenHeld: true });
+  });
+
   it("does not broker an isolated computer, which carries no host scope", async () => {
     // The Local VM and a VPS also arrive as `localComputer`, and a full-auto
     // bot is meant to keep running unattended inside them.  Only a mount
@@ -788,6 +1042,21 @@ describe("CodexDriver turns (fake app-server)", () => {
     await recorder.until((e) => e.type === "turn.completed");
   });
 
+  it("refuses a second turn that arrives while the first is still claiming the thread", async () => {
+    // The two turns are started together, so the second one reaches the
+    // guard while the first is still claiming the thread.  A vault read
+    // between the guard and the registration would let both through, so the
+    // seat's CLI login is read BEFORE the guard, never after it.
+    await create({ mode: "approval" });
+    const first = instance.adapter.sendTurn({ threadId: "t-race", text: "one" });
+    const second = instance.adapter.sendTurn({ threadId: "t-race", text: "two" });
+    await expect(second).rejects.toThrow(/already running/);
+    await first;
+    await recorder.until((e) => e.type === "request.opened");
+    await instance.adapter.interruptTurn("t-race");
+    await recorder.until((e) => e.type === "turn.completed");
+  });
+
   it("a missing binary surfaces as a failed turn, and snapshot says unavailable", async () => {
     instance = await CodexDriver.create({
       instanceId: "codex-missing",
@@ -820,12 +1089,41 @@ describe("CodexDriver turns (fake app-server)", () => {
     });
   });
 
+  it("keeps the last known sign-in when `login status` gives no answer it can read", async () => {
+    await create();
+    await expect(instance.snapshot()).resolves.toMatchObject({ state: "available", authenticated: true });
+    // No answer (a probe that ran out of time prints nothing): not a sign-out.
+    process.env.FAKE_CODEX_MODE = "login-silent";
+    await expect(instance.snapshot()).resolves.toMatchObject({ state: "available", authenticated: true });
+    // A definitive answer still wins over the remembered one.
+    process.env.FAKE_CODEX_MODE = "logged-out";
+    await expect(instance.snapshot()).resolves.toMatchObject({ state: "available", authenticated: false });
+  });
+
+  it("reports sign-in as unknown, never false, when the first `login status` gives no answer", async () => {
+    await create({ mode: "login-silent" });
+    const snapshot = await instance.snapshot();
+    expect(snapshot.state).toBe("available");
+    expect(snapshot.authenticated).toBeUndefined();
+  });
+
   it("also accepts login status from older Codex versions that used stdout", async () => {
     await create({ mode: "logged-in-stdout" });
     await expect(instance.snapshot()).resolves.toMatchObject({
       state: "available",
       authenticated: true,
     });
+  });
+
+  it("reads `login status` as three-valued: only an explicit answer is true or false", () => {
+    // A signed-out CLI exits 1 with "Not logged in" on stderr: that text is
+    // the answer whatever the exit code.
+    expect(codexLoginAnswer("\nNot logged in\n")).toBe(false);
+    expect(codexLoginAnswer("Logged in using ChatGPT\n")).toBe(true);
+    expect(codexLoginAnswer("\nLogged in using an API key")).toBe(true);
+    // A probe that timed out printed nothing: unknown, never a sign-out.
+    expect(codexLoginAnswer("\n")).toBeUndefined();
+    expect(codexLoginAnswer("error: something unexpected")).toBeUndefined();
   });
 
   it("marks a Codex 401 as setup so the UI offers sign-in instead of Retry", async () => {
@@ -936,4 +1234,62 @@ describe("CodexDriver turns (fake app-server)", () => {
     const turnStart = seen.calls.find((c: any) => c.method === "turn/start");
     expect(turnStart.params).not.toHaveProperty("effort");
   });
+});
+
+/** A CLI whose `--version` answers while `ok` exists and otherwise dies the
+ *  way the test asks (`mode`: exit or crash), so a test can take an engine
+ *  from working to broken between two snapshots. */
+function switchableCli(dir: string): { cli: string; setWorking: (working: boolean) => void; setMode: (mode: "exit" | "crash") => void } {
+  const cli = join(dir, "switchable-cli");
+  writeFileSync(
+    cli,
+    [
+      // A node-shebang script: env-path resolves it to `node <script>` on
+      // Windows, where a `#!/bin/sh` fixture cannot run at all.
+      "#!/usr/bin/env node",
+      'const fs = require("node:fs");',
+      `const dir = ${JSON.stringify(dir)};`,
+      'if (fs.existsSync(dir + "/ok")) { console.log("9.9.9"); process.exit(0); }',
+      'if (fs.readFileSync(dir + "/mode", "utf8") === "crash") process.kill(process.pid, "SIGSEGV");',
+      "process.exit(3)",
+      "",
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+  writeFileSync(join(dir, "mode"), "exit");
+  return {
+    cli,
+    setWorking: (working) => {
+      if (working) writeFileSync(join(dir, "ok"), "");
+      else rmSync(join(dir, "ok"), { force: true });
+    },
+    setMode: (mode) => writeFileSync(join(dir, "mode"), mode),
+  };
+}
+
+describe("Codex version reuse", () => {
+  // A SIGSEGV crash has no Windows equivalent: POSIX only.
+  for (const mode of (process.platform === "win32" ? (["exit"] as const) : (["exit", "crash"] as const))) {
+    it(`does not keep reporting the last version once the binary ${mode === "crash" ? "crashes" : "fails"} definitively`, async () => {
+      const dir = mkdtempSync(join(tmpdir(), "omb-switch-"));
+      const cli = switchableCli(dir);
+      const instance = await CodexDriver.create({
+        instanceId: `switch-${mode}`,
+        displayName: undefined,
+        environment: {},
+        enabled: true,
+        config: { cli: cli.cli, fullAuto: false },
+      });
+      cli.setWorking(true);
+      await instance.snapshot();
+      cli.setWorking(false);
+      cli.setMode(mode);
+      const second = await instance.snapshot();
+      expect(second.state).toBe("unavailable");
+      expect(second.transient).toBeUndefined();
+      expect(second.version).toBeUndefined();
+      await instance.dispose();
+      rmSync(dir, { recursive: true, force: true });
+    });
+  }
 });

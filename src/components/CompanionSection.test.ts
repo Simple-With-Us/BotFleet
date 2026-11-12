@@ -1,11 +1,15 @@
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 
 import type { CompanionAccountState } from "../types/ogb";
 import {
+  PhoneSetupFlowView,
   companionStateRefreshIsCurrent,
   mutateCompanionBridgeState,
   phonePairingManualCodeMode,
   type CompanionState,
+  type PhoneSetupController,
 } from "./PhoneSetupFlow";
 import {
   companionAccountActionError,
@@ -193,3 +197,86 @@ describe("companion pairing availability", () => {
     expect(companionPairingMode(account("error"), localCompanion(true))).toBe("local-only");
   });
 });
+
+const mockController = (overrides?: Partial<PhoneSetupController>): PhoneSetupController => ({
+  state: {
+    enabled: true,
+    keepAwake: false,
+    port: 8810,
+    devices: [],
+    pairing: null,
+    tailnetName: "test-mac.boa-roygbiv.ts.net",
+    tailscale: "100.64.0.1",
+    lan: "192.168.1.100",
+    endpoints: [{ kind: "hosted", url: "https://agents.botfleet.app", priority: 1 }],
+  },
+  account: { available: true, status: "ready" },
+  phase: "intro",
+  email: "",
+  code: "",
+  codeSent: false,
+  busy: false,
+  accountBusy: false,
+  error: null,
+  accountError: null,
+  pairingLink: null,
+  secondsLeft: 0,
+  address: "192.168.1.100",
+  pairingPort: 8810,
+  hostedReady: true,
+  localFallback: false,
+  tailscaleFallback: false,
+  tailscaleAvailable: true,
+  pairingExpired: false,
+  setupTimedOut: false,
+  setEmail: () => {},
+  setCode: () => {},
+  changeEmail: () => {},
+  start: () => {},
+  useLocal: () => {},
+  useTailscale: () => {},
+  requestCode: () => {},
+  verifyCode: () => {},
+  retryAccount: () => {},
+  cancel: () => {},
+  refreshCode: () => {},
+  finish: () => {},
+  skip: () => {},
+  act: async () => {},
+  accountAct: async () => {},
+  ...overrides,
+});
+
+describe("PhoneSetupFlowView intro variants", () => {
+  it("renders actionable route tiles and omits marketing fluff cards in settings variant", () => {
+    const html = renderToStaticMarkup(createElement(PhoneSetupFlowView, {
+      controller: mockController(),
+      variant: "settings",
+    }));
+
+    expect(html).toContain("Tailscale");
+    expect(html).toContain("Gateway");
+    expect(html).toContain("Local Wi-Fi");
+    expect(html).toContain("Pair over Tailscale");
+    expect(html).toContain("Pair via Gateway");
+    expect(html).toContain("Pair on Wi-Fi");
+    expect(html).toContain("test-mac.boa-roygbiv.ts.net:8810");
+
+    // Marketing fluff cards are omitted in settings
+    expect(html).not.toContain("Your Chats");
+    expect(html).not.toContain("Quick Approvals");
+    expect(html).not.toContain("Private by Default");
+  });
+
+  it("renders value points in onboarding variant", () => {
+    const html = renderToStaticMarkup(createElement(PhoneSetupFlowView, {
+      controller: mockController(),
+      variant: "onboarding",
+    }));
+
+    expect(html).toContain("Your Chats");
+    expect(html).toContain("Quick Approvals");
+    expect(html).toContain("Private by Default");
+  });
+});
+

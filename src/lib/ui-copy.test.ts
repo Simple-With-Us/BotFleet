@@ -34,11 +34,14 @@ const FILES = sourceFiles(SRC).map((path) => ({
 }));
 
 /** JSX text nodes plus the three attributes that reach a person: a tooltip,
- * a screen-reader name, and the grey text inside an empty field. */
+ * a screen-reader name, and the grey text inside an empty field.  String
+ * literals inside a JSX expression ({"..."}) reach a person the same way,
+ * so they are scanned too. */
 function userFacingStrings(text: string): string[] {
   const found: string[] = [];
   for (const match of text.matchAll(/(?:title|aria-label|placeholder)="([^"]+)"/g)) found.push(match[1]!);
   for (const match of text.matchAll(/>\s*([A-Za-z][^<>{}\n]{1,120}?)\s*</g)) found.push(match[1]!);
+  for (const match of text.matchAll(/\{"([^"{}]{2,200})"\}/g)) found.push(match[1]!);
   return found;
 }
 
@@ -80,11 +83,11 @@ describe("Title Case for controls and headings", () => {
     ["components/RoutinesPage.tsx", "Tasks &amp; routines", "Tasks &amp; Routines"],
     ["components/Sidebar.tsx", ">Archived bots<", ">Archived Bots<"],
     ["components/SettingsModal.tsx", 'title="Usage analytics"', 'title="Usage Analytics"'],
-    ["components/SettingsModal.tsx", 'label: "Remote access"', 'label: "Remote Access"'],
+    ["components/SettingsNav.tsx", 'label: "Remote access"', 'label: "Remote"'],
     ["components/UsageSection.tsx", "Test connection", "Test Connection"],
     ["components/FleetModelsSection.tsx", "Set default", "Set Default"],
     ["components/FleetModelsSection.tsx", "Add fallback", "Add Fallback"],
-    ["components/FleetModelsSection.tsx", "Workspace default", "Workspace Default"],
+    ["components/FleetModelsSection.tsx", "Apply to all bots", "Apply to All Bots"],
   ];
 
   for (const [file, wrong, right] of LABELS) {
@@ -98,11 +101,12 @@ describe("Title Case for controls and headings", () => {
 });
 
 describe("Settings Models layout", () => {
-  it("grows the Settings dialog about 25-30 percent", () => {
+  it("grows the Settings dialog so the capability table and fleet rows fit with user resizability", () => {
     const settings = FILES.find((entry) => entry.rel === "components/SettingsModal.tsx");
     expect(settings, "SettingsModal.tsx is missing").toBeDefined();
-    expect(settings!.text).toContain("max-w-[1100px]");
-    expect(settings!.text).toContain("h-[min(880px,calc(100dvh-3rem))]");
+    expect(settings!.text).toContain("DEFAULT_SETTINGS_MODAL_WIDTH_PX = 1292");
+    expect(settings!.text).toContain("DEFAULT_SETTINGS_MODAL_HEIGHT_PX = 976");
+    expect(settings!.text).toContain("saveSettingsModalSize");
     expect(settings!.text).not.toContain("h-[min(720px,calc(100dvh-3rem))]");
     expect(settings!.text).not.toContain("h-[560px]");
     expect(settings!.text).not.toContain("max-w-[860px]");
@@ -118,8 +122,34 @@ describe("Settings Models layout", () => {
     expect(models!.text).toContain("flex-[1_1_16rem]");
     expect(models!.text).not.toContain("grid-cols-[minmax(0,1.1fr)");
     expect(models!.text).not.toContain("&nbsp;");
-    expect(picker!.text).toContain('contained && !label && "w-full min-w-0 justify-between"');
-    expect(picker!.text).toContain("if (selection.fallbacks?.length) nextSelection.fallbacks = selection.fallbacks");
+    // Settings stacks the picker: label on its own line, trigger full width
+    // beneath it. The row layout this replaced squeezed the label and its
+    // subtitle into a narrow column beside the trigger, so "Primary Model"
+    // wrapped to two lines and the subtitle broke into a five-word ribbon at
+    // every desktop width. Assert the STACK, not the old className string, so
+    // the guard survives a restyle of either half.
+    expect(picker!.text).toContain("flex flex-col gap-3");
+    expect(picker!.text).toContain('contained ? "w-full min-w-0 justify-between');
+    expect(picker!.text).not.toContain('flex items-center justify-between gap-4');
+    // picking a new primary keeps the bot's fallback chain: the picker commits
+    // pickedSelection, which builds on selectionForPick and copies the
+    // fallbacks across. The behavior itself is covered in model-pick.test.ts
+    // (pickedSelection "keeps the chain"); these only pin that the picker
+    // still goes through it.
+    const pick = FILES.find((entry) => entry.rel === "lib/model-pick.ts");
+    expect(pick, "model-pick.ts is missing").toBeDefined();
+    expect(picker!.text).toContain("pickedSelection(selection, instance, model, latest)");
+    expect(pick!.text).toContain("...selectionForPick(current, instance, model)");
+    expect(pick!.text).toContain("if (current.fallbacks?.length) next.fallbacks = current.fallbacks");
+  });
+
+  it("seeds Add Fallback through slotFromPick so a floating primary's class carries over", () => {
+    for (const rel of ["components/FleetModelsSection.tsx", "components/BotFallbackModels.tsx"]) {
+      const file = FILES.find((entry) => entry.rel === rel);
+      expect(file, `${rel} is missing`).toBeDefined();
+      expect(file!.text).toContain("slotFromPick(bot.modelSelection)");
+      expect(file!.text).not.toMatch(/\{ instanceId: bot\.modelSelection\.instanceId, model: bot\.modelSelection\.model \}/);
+    }
   });
 
   it("stacks iOS primary and fallback pickers on their own rows", () => {
@@ -140,5 +170,93 @@ describe("Bot Chats sidebar section appears once", () => {
     // name={BOT_CHATS_SECTION} is the SectionDivider prop — duplicate section = duplicate divider.
     const matches = source!.text.match(/name=\{BOT_CHATS_SECTION\}/g) ?? [];
     expect(matches).toHaveLength(1);
+  });
+});
+
+describe("sentence gap outside chat", () => {
+  // Chat bubbles and <pre> panes use whitespace-pre-wrap, so two ASCII
+  // spaces survive there.  Everywhere else the default white-space:normal
+  // collapses them, and styles.css sets no white-space of its own.  A CSS
+  // change cannot turn the single ASCII space these strings ship with into
+  // the sentence gap.  The gap that still renders is NBSP + space, written
+  // {"\u00a0 "} in JSX children.  A quoted attribute does not decode \u,
+  // so attribute copy uses the same marker inside a JS expression: ={"...\u00a0 ..."}.
+  // Assert that marker is present.  A negative-only rule
+  // (not.toMatch(/[a-z0-9)]\. {1,2}[A-Z]/)) stays green when the gap is
+  // deleted outright, which is how #810 shipped a removed gap.
+  const GAPS: Array<[file: string, gap: string]> = [
+    ["components/AndroidDevicePanel.tsx", "USB.{\"\\u00a0 \"}The screen"],
+    ["components/BotProfileAvatarCard.tsx", "aria-label={\"Bot avatar.\\u00a0 Drop"],
+    ["components/CompanionSection.tsx", "read.{\"\\u00a0 \"}Check MagicDNS"],
+    ["components/ComputerPanel.tsx", "Connections.{\"\\u00a0 \"}Auto only"],
+    ["components/ComputerPanel.tsx", "default.{\"\\u00a0 \"}When enabled"],
+    ["components/ComputerPanel.tsx", "Off.{\"\\u00a0 \"}Choose ASCII"],
+    ["components/EngineSetup.tsx", "platform.{\"\\u00a0 \"}Use the setup"],
+    ["components/GroupSettingsPanel.tsx", "history.{\"\\u00a0 \"}Bot definitions"],
+    ["components/GroupView.tsx", "attached.{\"\\u00a0 \"}Add more"],
+    ["components/RoutinesPage.tsx", "answer.{\"\\u00a0 \"}Open its"],
+    ["components/RoutinesPage.tsx", "work.{\"\\u00a0 \"}Every run"],
+    ["components/SettingsModal.tsx", "subtitle={\"Anonymous product events — app opened, which features get used.\\u00a0 Never"],
+    ["components/SettingsModal.tsx", "output.\\u00a0 Your email is only attached if you shared it during setup.\"}"],
+    ["components/SettingsModal.tsx", "tools.{\"\\u00a0 \"}Errors"],
+    ["components/SettingsModal.tsx", "subtitle={\"Early features may change while we test them.\\u00a0 They stay"],
+    ["components/SettingsModal.tsx", "subtitle={\"Versions, configuration on/off state and a redacted server log tail.\\u00a0 Review"],
+    ["components/SettingsModal.tsx", "subtitle={\"Shown in the sidebar.\\u00a0 Saved as you go.\"}"],
+    ["components/SettingsModal.tsx", "subtitle={\"Which binary each engine runs.\\u00a0 Saved as you go.\"}"],
+    ["components/SettingsPanel.tsx", "placeholder={\"Nothing remembered yet.\\u00a0 The bot"],
+    ["components/SharedVpsRuntimeCard.tsx", "subtitle={\"The shared Linux sandbox running on your VPS, with a separate desktop for each bot.\\u00a0 Bots share"],
+    ["components/SkillRecorderPage.tsx", "once.{\"\\u00a0 \"}Let every"],
+    ["components/SkillRecorderPage.tsx", "remain.{\"\\u00a0 \"}The narration"],
+    ["components/TeamMapPage.tsx", "turn.{\"\\u00a0 \"}Only you"],
+    ["components/TeamMapPage.tsx", "yet.{\"\\u00a0 \"}Ask a"],
+    ["components/WebhooksPanel.tsx", "once.{\"\\u00a0 \"}Generate"],
+    ["components/WebhooksPanel.tsx", "now.{\"\\u00a0 \"}Keep BotFleet"],
+    ["components/WebhooksPanel.tsx", "yet.{\"\\u00a0 \"}Use the"],
+    // Search results render the same sentences from this table, not from the modal.
+    ["lib/settings-search.ts", "used.\\u00a0 Never"],
+    ["lib/settings-search.ts", "them.\\u00a0 They stay"],
+    ["lib/settings-search.ts", "tail.\\u00a0 Review"],
+    ["lib/settings-search.ts", "sidebar.\\u00a0 Saved"],
+  ];
+
+  for (const [file, gap] of GAPS) {
+    it(`${file} keeps ${gap.replaceAll("\\u00a0", "NBSP")}`, () => {
+      const source = FILES.find((entry) => entry.rel === file);
+      expect(source, `${file} is missing`).toBeDefined();
+      expect(source!.text).toContain(gap);
+    });
+  }
+});
+
+describe("JSX attribute strings are not JavaScript strings", () => {
+  // A quoted JSX attribute (subtitle="...") is read by the JSX compiler, not
+  // the JavaScript parser, so `\u00a0` inside it is not an escape: it reaches
+  // the screen as the six characters backslash, u, 0, 0, a, 0.  That is how the
+  // Shared VPS card's subtitle printed "bot.\u00a0 Bots share".  The sentence
+  // gap, and any other escape, belongs in a JS expression: ={"...\u00a0 ..."}.
+  const ESCAPE_IN_QUOTED_ATTRIBUTE = /\s([A-Za-z][\w:-]*)="([^"]*\\(?:u[0-9a-fA-F{]|x[0-9a-fA-F]{2})[^"]*)"/g;
+
+  function escapedAttributes(text: string): string[] {
+    return [...text.matchAll(ESCAPE_IN_QUOTED_ATTRIBUTE)].map((match) => `${match[1]}="${match[2]}"`);
+  }
+
+  it("flags the quoted form and accepts the expression form", () => {
+    expect(escapedAttributes('<Card subtitle="One.\\u00a0 Two." />')).toEqual(['subtitle="One.\\u00a0 Two."']);
+    expect(escapedAttributes('<Card subtitle="One.\\x41 Two." />')).toHaveLength(1);
+    expect(escapedAttributes('<Card\n  title="A"\n  subtitle="One.\\u00a0\n  Two."\n/>')).toHaveLength(1);
+    expect(escapedAttributes('<Card subtitle={"One.\\u00a0 Two."} />')).toEqual([]);
+    expect(escapedAttributes("<Card subtitle={`One.\\u00a0 Two.`} />")).toEqual([]);
+    expect(escapedAttributes('<Card title="Plain" className="a b" />')).toEqual([]);
+    // Only an escape is a problem; a regex-looking value without \u or \x is not.
+    expect(escapedAttributes('<input pattern="\\d+" />')).toEqual([]);
+  });
+
+  it("finds no escape inside a quoted JSX attribute anywhere in the renderer", () => {
+    const offenders: string[] = [];
+    for (const { rel, text } of FILES) {
+      if (!rel.endsWith(".tsx") || rel.endsWith(".test.tsx")) continue;
+      for (const attribute of escapedAttributes(text)) offenders.push(`${rel}: ${attribute}`);
+    }
+    expect(offenders).toEqual([]);
   });
 });

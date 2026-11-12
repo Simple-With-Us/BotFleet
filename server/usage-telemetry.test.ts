@@ -614,6 +614,10 @@ describe("ingest acknowledgement accounting", () => {
 describe("harness telemetry wiring", () => {
   const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
   const indexSource = readFileSync(join(ROOT, "server", "index.ts"), "utf8");
+  // Inspect the two submitted telemetry payloads, not unrelated message
+  // provenance objects that also contain an `instanceId` key.
+  const turnPayloads = [...indexSource.matchAll(/telemetry\.trackTurn\(\{([\s\S]*?)\n\s*\}\);/g)]
+    .map((match) => match[1]);
 
   it("reports the engine that ran the turn, never the operator's instance id", () => {
     const fromEngine = indexSource.match(/driverKind:\s*event\.provider\b/g) ?? [];
@@ -622,10 +626,13 @@ describe("harness telemetry wiring", () => {
   });
 
   it("attributes instance and model usage to the per-turn selection", () => {
-    expect(indexSource.match(/instanceId:\s*actualSelection\.instanceId\b/g)?.length).toBeGreaterThanOrEqual(2);
-    expect(indexSource.match(/modelId:\s*actualSelection\.model\b/g)).toHaveLength(2);
-    expect(indexSource).not.toMatch(/instanceId:\s*(?:bot|roomBot)\.modelSelection\.instanceId/);
-    expect(indexSource).not.toMatch(/modelId:\s*(?:bot|roomBot)\.modelSelection\.model/);
+    expect(turnPayloads).toHaveLength(2);
+    for (const payload of turnPayloads) {
+      expect(payload).toMatch(/instanceId:\s*actualSelection\.instanceId\b/);
+      expect(payload).toMatch(/modelId:\s*actualSelection\.model\b/);
+      expect(payload).not.toMatch(/instanceId:\s*(?:bot|roomBot)\.modelSelection\.instanceId/);
+      expect(payload).not.toMatch(/modelId:\s*(?:bot|roomBot)\.modelSelection\.model/);
+    }
   });
 
   it("passes settled latency to both 1:1 and room telemetry calls", () => {
