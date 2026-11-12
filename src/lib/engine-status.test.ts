@@ -4,7 +4,16 @@
 import { describe, expect, it } from "vitest";
 
 import type { InstanceInfo } from "@/state/store";
-import { isCheckingEngine, isHiddenEngine, listedInEnginesSettings, noEngineCanRun } from "./engine-status";
+import { isCheckingEngine, isHiddenEngine, listedInEnginesSettings, noEngineCanRun, showBuiltInOpenAiCompatible } from "./engine-status";
+
+describe("built-in OpenAI-compatible visibility", () => {
+  it("hides an unconfigured endpoint and shows either a configured flag or a URL", () => {
+    expect(showBuiltInOpenAiCompatible(false)).toBe(false);
+    expect(showBuiltInOpenAiCompatible(false, "")).toBe(false);
+    expect(showBuiltInOpenAiCompatible(true)).toBe(true);
+    expect(showBuiltInOpenAiCompatible(false, "https://api.example.test/v1")).toBe(true);
+  });
+});
 
 const snap = (snapshot: InstanceInfo["snapshot"]) => ({ snapshot });
 
@@ -60,9 +69,9 @@ describe("listedInEnginesSettings", () => {
     expect(listedInEnginesSettings({ driverKind: "grok", snapshot: { state: "available" } })).toBe(false);
   });
 
-  it("leaves out the ASCII.dev Box engine until a Box token is set up", () => {
+  it("keeps ASCII.dev Box in Computer settings even when configured", () => {
     const box = { driverKind: "boxAgent", cliDefault: "box", snapshot: { state: "unavailable", hidden: true, reason: "no Box token" } } as const;
     expect(listedInEnginesSettings(box)).toBe(false);
-    expect(listedInEnginesSettings({ ...box, snapshot: { state: "available" } })).toBe(true);
+    expect(listedInEnginesSettings({ ...box, snapshot: { state: "available" } })).toBe(false);
   });
 });

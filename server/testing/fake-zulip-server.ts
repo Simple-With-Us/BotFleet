@@ -3,7 +3,7 @@
 // `node:http` on 127.0.0.1 with a random port.  It implements only the
 // endpoints server/zulip/ uses, checks Basic auth, records every request, and
 // can inject faults (429s, an expired queue).  Its semantics follow the
-// fleet's own fake (AFC scripts/agent_sync/tests/fake_zulip.py), which was
+// fleet's own fake (the AFC Python package's fake_zulip test), which was
 // checked against the live realm:
 //
 //   - POST /register creates a queue; GET /events long-polls it (with a short
@@ -440,9 +440,18 @@ export class FakeZulip {
             return true;
           }),
         )
-        .slice(0, after)
+        // Like Zulip, the anchor itself is the first row when included, so a
+        // fetch of exactly one message asks num_after 0 with include_anchor.
+        .slice(0, after + (include ? 1 : 0))
         .map((message) => this.wireFor(message, user.user_id));
       return send(200, { result: "success", messages: found });
+    }
+    const oneMessage = req.method === "GET" ? /^messages\/(\d+)$/.exec(path) : null;
+    if (oneMessage) {
+      const id = Number(oneMessage[1]);
+      const found = this.messages.find((message) => message.id === id && message.recipients.includes(user.user_id));
+      if (!found) return send(404, { result: "error", msg: "Message not found", code: "MESSAGE_NOT_FOUND" });
+      return send(200, { result: "success", message: this.wireFor(found, user.user_id) });
     }
     if (req.method === "GET" && path === "users/me/subscriptions") {
       const left = this.unsubscribed.get(user.user_id) ?? new Set<string>();

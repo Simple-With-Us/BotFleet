@@ -99,6 +99,31 @@ describe("readThreadEvents", () => {
     expect(page.total).toEqual({ runtime: 3, native: 2 });
   });
 
+  it("accepts a completed tool title and rejects a malformed one", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const completed = (eventId: string, title: string | number) => runtime({
+      eventId,
+      createdAt: eventId,
+      type: "item.completed",
+      itemType: "tool",
+      itemId: "tool-1",
+      ok: false,
+      title,
+    });
+    writeFileSync(
+      join(eventsDir, "t1.ndjson"),
+      line(completed("valid-title", "hookRun: failed")) +
+        line(completed("invalid-title", 42)) +
+        line(completed("unbounded-title", "x".repeat(257))),
+    );
+
+    const page = readThreadEvents({ eventsDir, nativeDir, threadId: "t1" });
+    expect(page.entries.map((entry) => entry.data)).toMatchObject([
+      { eventId: "valid-title", title: "hookRun: failed" },
+    ]);
+  });
+
   it("rejects malformed retry telemetry while retaining a valid retry event", () => {
     const eventsDir = tmp();
     const nativeDir = tmp();
@@ -575,6 +600,36 @@ describe("readThreadEvents", () => {
       writeFileSync(join(eventsDir, "t1.ndjson"), line(started("e1", "000001")));
       expect(readThreadEvents({ eventsDir, nativeDir, threadId: "t1" })).not.toHaveProperty("older");
     });
+  });
+
+  it("reads a subagent.updated record back, and drops one whose snapshot is not a helper", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const helper = runtime({
+      eventId: "h1",
+      type: "subagent.updated",
+      createdAt: "000001",
+      itemId: "task-1",
+      subagent: {
+        id: "task-1",
+        threadId: "t1",
+        parentItemId: "task-1",
+        depth: 1,
+        fidelity: "typed",
+        label: "Survey files",
+        toolCount: 2,
+        tokens: 10,
+        startedAt: 1,
+        endedAt: null,
+        status: "running",
+      },
+    });
+    writeFileSync(
+      join(eventsDir, "t1.ndjson"),
+      line(helper) + line({ ...helper, eventId: "bad", subagent: { id: "task-1" }, createdAt: "000002" }),
+    );
+    const page = readThreadEvents({ eventsDir, nativeDir, threadId: "t1", runtimeOnly: true });
+    expect(page.entries.flatMap((entry) => (entry.kind === "runtime" ? [entry.data.eventId] : []))).toEqual(["h1"]);
   });
 
   it("reads a context.injected record back in both the Trajectory and the Inspector reads", () => {

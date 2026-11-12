@@ -68,6 +68,25 @@ public struct OptionCard: Codable, Hashable, Sendable {
     /// Permission cards carry a tool; questions do not.
     public var isPermission: Bool { tool != nil }
 
+    /// Whether the choices should be stacked full-width instead of laid
+    /// out as equal-width capsules in one row.  A permission card's
+    /// Allow/Deny pair always fits the row, so only questions stack — when
+    /// there are more than two choices, or any one of them is too long to
+    /// survive being squeezed into a share of the row.
+    public var prefersStackedChoices: Bool {
+        Self.prefersStackedChoices(options: options, isPermission: isPermission)
+    }
+
+    /// The longest choice a two-across capsule row can show before the
+    /// text is crushed past reading.
+    public static let stackedChoiceLength = 18
+
+    public static func prefersStackedChoices(options: [String], isPermission: Bool) -> Bool {
+        guard !isPermission else { return false }
+        if options.count > 2 { return true }
+        return options.contains { $0.count > stackedChoiceLength }
+    }
+
     /// The wire API accepts an approval behavior rather than the button's
     /// display text. Treat the one refusal as deny and every other offered
     /// permission choice as allow: providers may say "Approve", "Yes", or
@@ -110,6 +129,10 @@ public struct ToolActivity: Codable, Hashable, Sendable {
     public var kind: String?
     public var detail: String?
     public var durationMs: Int?
+    /// The harness id for this step.  A child step points at the step that
+    /// started it with `parentItemId`.
+    public var itemId: String? = nil
+    public var parentItemId: String? = nil
 }
 
 public struct Sender: Codable, Hashable, Sendable {
@@ -128,6 +151,13 @@ public struct CommChip: Codable, Hashable, Sendable {
     public var withBotId: String
     public var withName: String
     public var withColor: String
+}
+
+public struct MessageCommand: Codable, Hashable, Equatable, Sendable {
+    public var id: String
+    public var name: String
+    public var source: String
+    public var role: String
 }
 
 public struct Message: Codable, Hashable, Identifiable, Sendable {
@@ -207,6 +237,8 @@ public struct Message: Codable, Hashable, Identifiable, Sendable {
     /// User line that landed inside a running turn (server `steered: true`).
     /// Shown as the "Sent mid-turn" chip; distinct from the pending queue.
     public var steered: Bool? = nil
+    /// Set when this row is an engine command, such as compacting the session.
+    public var command: MessageCommand? = nil
 
     public var date: Date { Date(timeIntervalSince1970: at / 1000) }
 }
@@ -218,16 +250,31 @@ public struct Message: Codable, Hashable, Identifiable, Sendable {
 /// screen the moment they tap send, without claiming the steer-queue.
 public struct QueuedSend: Hashable, Sendable {
     public var queueId: String
+    /// Wire prompt (`composeMessage`), shown on the pill and sent to the harness.
     public var text: String
+    /// Composer text before attachment tags were folded in; used when editing
+    /// a queued line so markers are not duplicated on resend.
+    public var rawText: String?
+    /// Attachment chips the composer held at send time, restored on edit.
+    public var attachments: [PendingChatAttachment]
     public var queued: Bool
     /// Epoch milliseconds when the phone first showed this line.  Stamped
     /// once at remember-time so `visibleTranscript` never remints "now" on
     /// every re-render (which made stuck or slow-drain chips look newly sent).
     public var at: Double
 
-    public init(queueId: String, text: String, queued: Bool = true, at: Double = Date().timeIntervalSince1970 * 1000) {
+    public init(
+        queueId: String,
+        text: String,
+        rawText: String? = nil,
+        attachments: [PendingChatAttachment] = [],
+        queued: Bool = true,
+        at: Double = Date().timeIntervalSince1970 * 1000
+    ) {
         self.queueId = queueId
         self.text = text
+        self.rawText = rawText
+        self.attachments = attachments
         self.queued = queued
         self.at = at
     }
@@ -251,13 +298,59 @@ public struct ModelSelection: Codable, Hashable, Sendable {
     /// Kept as a string so a newer server's saved value still round-trips
     /// through an older phone until the person explicitly changes it.
     public var effort: String?
+    /// A model class this entry floats on ("Latest Sonnet" is `latest: "sonnet"`).
+    public var latest: String?
     public var fallbacks: [ModelSelection]?
 
-    public init(instanceId: String, model: String, effort: String? = nil, fallbacks: [ModelSelection]? = nil) {
+    public init(
+        instanceId: String,
+        model: String,
+        effort: String? = nil,
+        latest: String? = nil,
+        fallbacks: [ModelSelection]? = nil
+    ) {
         self.instanceId = instanceId
         self.model = model
         self.effort = effort
+        self.latest = latest
         self.fallbacks = fallbacks
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case instanceId
+        case model
+        case effort
+        case latest
+        case fallbacks
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.instanceId = try container.decode(String.self, forKey: .instanceId)
+        let rawModel = try container.decode(String.self, forKey: .model)
+        self.effort = try container.decodeIfPresent(String.self, forKey: .effort)
+        let rawLatest = try container.decodeIfPresent(String.self, forKey: .latest)
+        self.fallbacks = try container.decodeIfPresent([ModelSelection].self, forKey: .fallbacks)
+
+        if let rawLatest, !rawLatest.isEmpty {
+            self.latest = rawLatest
+            self.model = rawModel
+        } else if let alias = ModelLineage.detectAlias(from: rawModel) {
+            self.latest = alias
+            self.model = rawModel
+        } else {
+            self.latest = nil
+            self.model = rawModel
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(instanceId, forKey: .instanceId)
+        try container.encode(model, forKey: .model)
+        try container.encodeIfPresent(effort, forKey: .effort)
+        try container.encodeIfPresent(latest, forKey: .latest)
+        try container.encodeIfPresent(fallbacks, forKey: .fallbacks)
     }
 }
 
@@ -267,6 +360,10 @@ public struct TaskUsage: Codable, Hashable, Sendable {
     public var cachedInput: Int?
     public var costUsd: Double?
     public var turns: Int
+    /// Input tokens of the latest settled turn.  How full the window was.
+    public var lastInput: Int? = nil
+    /// Window size the engine reported with that turn, when it reported one.
+    public var contextWindow: Int? = nil
 }
 
 public struct BotTask: Codable, Hashable, Sendable {
@@ -342,6 +439,9 @@ public struct Bot: Codable, Hashable, Identifiable, Sendable {
     /// ones that control This Mac (`server/auto-approve.ts`).  Nil on a
     /// harness that predates it, which reads as off.
     public var bypassPermissions: Bool?
+    /// Bypass, extended to the requests that control This Mac.  Nil on a
+    /// harness that predates it, which reads as off.
+    public var bypassLocalComputer: Bool?
     public var alwaysAllow: [String]?
     public var composio: Bool?
     /// Which computers this bot may run on: "local", "cloud", and/or "vm".
@@ -391,7 +491,7 @@ public struct Bot: Codable, Hashable, Identifiable, Sendable {
 }
 
 public enum AvatarCrop: String, Codable, CaseIterable, Hashable, Sendable {
-    case mascot, circle, rounded, square
+    case mascot, tvface, circle, rounded, square
 
     /// The desktop may gain crop modes before this app updates. Falling back
     /// keeps the complete bot/fleet payload decodable and guarantees a safe,
@@ -683,12 +783,15 @@ public struct ModelOption: Codable, Hashable, Identifiable, Sendable {
     public var label: String
     public var effortLevels: [String]?
     public var supportsEffort: Bool?
+    /// Published window for this model, in tokens.  Absent when unknown.
+    public var contextWindow: Int? = nil
 
-    public init(id: String, label: String, effortLevels: [String]? = nil, supportsEffort: Bool? = nil) {
+    public init(id: String, label: String, effortLevels: [String]? = nil, supportsEffort: Bool? = nil, contextWindow: Int? = nil) {
         self.id = id
         self.label = label
         self.effortLevels = effortLevels
         self.supportsEffort = supportsEffort
+        self.contextWindow = contextWindow
     }
 }
 
@@ -870,6 +973,65 @@ public struct ConfigRooms: Codable, Hashable, Sendable {
     public var turnTimeoutMinutes: Int?
 }
 
+/// Which speech-to-speech providers a computer can reach.
+///
+/// Booleans and a choice, never a key: the permanent provider credentials
+/// stay on the computer, which mints a short-lived token instead.  Every
+/// field is optional because every one of them is absent on a computer too
+/// old to have the route, and "I do not know" has to stay distinguishable
+/// from "no key" — the first sends you to Settings, the second does not.
+public struct StsStatus: Codable, Sendable {
+    public var xai: Bool?
+    public var gemini: Bool?
+    /// The provider a call would actually use, after the user's preference
+    /// and the auto fallback have both been applied on the computer.
+    public var provider: String?
+
+    public init(xai: Bool? = nil, gemini: Bool? = nil, provider: String? = nil) {
+        self.xai = xai
+        self.gemini = gemini
+        self.provider = provider
+    }
+
+    /// False only when the computer said so.  `nil` is "unknown", and an
+    /// unknown must not be drawn as "no" — that would tell someone to add a
+    /// key they already have.
+    public func isConfigured(_ candidate: String) -> Bool? {
+        switch candidate {
+        case "xai": return xai
+        case "gemini": return gemini
+        default: return nil
+        }
+    }
+
+    /// Whether the computer told us anything at all.
+    public var isKnown: Bool { xai != nil || gemini != nil }
+
+    /// The provider to use, or nil when none is configured.  Mirrors the
+    /// computer's own `pickStsProvider` so the phone's idea and the computer's
+    /// cannot disagree about which one a call would take.
+    public var usableProvider: String? {
+        guard isKnown else { return nil }
+        if let provider, isConfigured(provider) == true { return provider }
+        if xai == true { return "xai" }
+        if gemini == true { return "gemini" }
+        return nil
+    }
+}
+
+/// One short-lived, single-session call token.  Spent opening a realtime
+/// session; it is not a credential for anything else, and it is not the
+/// provider's permanent key.
+public struct StsSessionToken: Codable, Sendable {
+    public var token: String
+    public var expiresInSeconds: Int
+
+    public init(token: String, expiresInSeconds: Int) {
+        self.token = token
+        self.expiresInSeconds = expiresInSeconds
+    }
+}
+
 public struct ConfigStatus: Codable, Sendable {
     public var composio: ConfigFlag?
     public var box: ConfigFlag?
@@ -885,6 +1047,8 @@ public struct ConfigStatus: Codable, Sendable {
     /// `simple` or `projects`.  Absent means simple.  A leftover `fleet`
     /// value is treated as projects.
     public var conversationMode: String?
+    /// `queue` or `steer`.  Absent means steer-first (legacy harness behavior).
+    public var busySendDefault: String?
     public var sidebarSectionOrder: [String]?
     /// Enable Automatic Update Checks.  Absent on a harness that predates
     /// the desktop updater, which is not the same as off.
@@ -1037,6 +1201,11 @@ public struct BotProfilePatch: Encodable, Sendable {
     public var autoReview: AutoReviewMode?
     public var approvePeerComms: Bool?
     public var bypassPermissions: Bool?
+    /// The owner's second switch, 2026-10-14.  Bypass alone stops at the edge
+    /// of the real desktop, which made it weaker than Auto Mode.  The computer
+    /// refuses to turn THIS one on from the phone for a bot that can use This
+    /// Mac, exactly as it refuses Auto Mode, so the sheet does not offer it.
+    public var bypassLocalComputer: Bool?
     /// `BotComputers.updated` builds this: the sandboxed destinations only,
     /// with This Mac carried through as the computer has it.
     public var computers: [String]?
@@ -1105,6 +1274,7 @@ public struct BotProfilePatch: Encodable, Sendable {
         autoReview: AutoReviewMode? = nil,
         approvePeerComms: Bool? = nil,
         bypassPermissions: Bool? = nil,
+        bypassLocalComputer: Bool? = nil,
         computers: [String]? = nil,
         cwd: CwdString? = nil,
         off: Bool? = nil
@@ -1126,13 +1296,14 @@ public struct BotProfilePatch: Encodable, Sendable {
         self.autoReview = autoReview
         self.approvePeerComms = approvePeerComms
         self.bypassPermissions = bypassPermissions
+        self.bypassLocalComputer = bypassLocalComputer
         self.computers = computers
         self.cwd = cwd
         self.off = off
     }
 
     private enum CodingKeys: String, CodingKey {
-        case name, title, description, notifications, avatarUrl, avatarCrop, voice, voices, speakReplies, speechDevices, modelSelection, section, maxToolRounds, autoApprove, autoReview, approvePeerComms, bypassPermissions, computers, cwd, off
+        case name, title, description, notifications, avatarUrl, avatarCrop, voice, voices, speakReplies, speechDevices, modelSelection, section, maxToolRounds, autoApprove, autoReview, approvePeerComms, bypassPermissions, bypassLocalComputer, computers, cwd, off
     }
 
     private enum DeviceKeys: String, CodingKey { case mac, iphone }
@@ -1180,6 +1351,7 @@ public struct BotProfilePatch: Encodable, Sendable {
         try values.encodeIfPresent(autoReview?.rawValue, forKey: .autoReview)
         try values.encodeIfPresent(approvePeerComms, forKey: .approvePeerComms)
         try values.encodeIfPresent(bypassPermissions, forKey: .bypassPermissions)
+        try values.encodeIfPresent(bypassLocalComputer, forKey: .bypassLocalComputer)
         try values.encodeIfPresent(computers, forKey: .computers)
         try values.encodeIfPresent(off, forKey: .off)
         if let cwd {

@@ -1,9 +1,10 @@
+import type { QuotaPlanMetadata } from "../../shared/quota-plan-metadata";
 // App settings → Usage: what every bot has spent, so "which of my bots is
 // costing me money" is answerable without a provider dashboard. Figures are
 // banked per settled turn on each task (server/store.ts addTaskUsage) and
 // summed here; nothing is fetched.
 import * as React from "react";
-import { Check, CheckCircle, ChevronDown, Loader2, RefreshCw, Sparkles, XCircle } from "lucide-react";
+import { Check, CheckCircle, ChevronDown, Loader2, RefreshCw, XCircle } from "lucide-react";
 import { api, useSecretSources, useStore, type ConfigStatus, type InstanceInfo, type TaskUsage } from "@/state/store";
 import { isCheckingEngine, isHiddenEngine } from "@/lib/engine-status";
 import { cn } from "@/lib/cn";
@@ -18,7 +19,7 @@ import { HeldBotsNotice, RedundantChainsNotice } from "./UsageNotices";
 import { ENGINE_CAPABILITIES, engineIdFromDriverKind, uniqueModelToEngineId } from "@/lib/engine-capabilities";
 import { telemetryBadge, telemetryHost, type TelemetryStatusView } from "@/lib/telemetry-status";
 import { buildUsageConfigPatch } from "@/lib/usage-config";
-import { antigravityGroupSummary, antigravityQuotaLines, formatResetCountdown, headlinesExhausted, headlinesNearCap, isEngineUnconfigured, localQuotaStatusLine, minimaxQuotaLine, providerIssueLine, quotaLinesSummary, usageWindowLines, windowHeadlines, windowsLabelFromHeadlines, type LocalQuotaFreshnessView } from "@/lib/quota-display";
+import { antigravityGroupSummary, antigravityQuotaLines, formatResetCountdown, headlinesExhausted, headlinesNearCap, isEngineUnconfigured, localQuotaStatusLine, minimaxQuotaLine, providerIssueLine, quotaGridPlaceholderLine, quotaLinesSummary, usageWindowLines, windowHeadlines, windowsLabelFromHeadlines, type LocalQuotaFreshnessView } from "@/lib/quota-display";
 import {
   antigravityQuotaCapped,
   antigravityDisplayWindows,
@@ -234,6 +235,47 @@ export function unpricedTurnCount(spend: EngineSpend | undefined): number {
   return (spend?.unpricedTurns5h ?? 0) + (spend?.unpricedTurns7d ?? 0);
 }
 
+export interface UsageDetailLine {
+  label: string;
+  value: string;
+  exhausted: boolean;
+  group: "window" | "external";
+}
+
+/** Construct detail lines for the Clutch row: DeepSeek Remaining Balance and the MiniMax subscription note. */
+export function buildClutchDetailLines(deepseekRow?: {
+  balanceUsd?: number | null;
+  grantedUsd?: number | null;
+  toppedUpUsd?: number | null;
+  availability?: string | null;
+  error?: string | null;
+} | null): UsageDetailLine[] {
+  const lines: UsageDetailLine[] = [];
+  if (deepseekRow && !deepseekRow.error && deepseekRow.balanceUsd != null) {
+    lines.push({
+      label: "DeepSeek Remaining Balance",
+      value: formatUsdBalance(deepseekRow.balanceUsd),
+      exhausted: deepseekRow.availability === "exhausted" || deepseekRow.balanceUsd <= 0,
+      group: "external",
+    });
+  }
+  lines.push({
+    label: "MiniMax (MM & MC)",
+    value: "Subscription (not API)",
+    exhausted: false,
+    group: "external",
+  });
+  if (deepseekRow && !deepseekRow.error && deepseekRow.grantedUsd != null && deepseekRow.toppedUpUsd != null) {
+    lines.push({
+      label: "Granted / Topped Up",
+      value: `$${deepseekRow.grantedUsd.toFixed(2)} granted · $${deepseekRow.toppedUpUsd.toFixed(2)} topped up`,
+      exhausted: false,
+      group: "external",
+    });
+  }
+  return lines;
+}
+
 function formatSpendUsd(amount: number): string {
   if (!amount || amount === 0) return "$0.00";
   if (amount < 0.01) return `<$0.01 ($${amount.toFixed(4)})`;
@@ -305,6 +347,7 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
     modelId?: string | null;
     skipReason?: string | null;
     planName?: string | null;
+    planMetadata?: QuotaPlanMetadata;
     absoluteRemaining?: number | null;
     absoluteLimit?: number | null;
     quotaUnit?: string | null;
@@ -314,6 +357,7 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
     fileSkipReason?: string | null;
   }>>([]);
   const [localQuota, setLocalQuota] = React.useState<LocalQuotaFreshnessView | null>(null);
+  const [quotasLoaded, setQuotasLoaded] = React.useState(false);
   const [expandedQuota, setExpandedQuota] = React.useState<string | null>(null);
   const usageConfig = state.config?.usage;
   const secretSources = useSecretSources();
@@ -377,18 +421,20 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
   }, [usageConfig?.ingestUrl]);
 
   React.useEffect(() => {
-    fetch("/api/telemetry/status")
+    const controller = new AbortController();
+    fetch("/api/telemetry/status", { signal: controller.signal })
       .then((res) => res.json())
       .then((data) => {
         setTelemetryStatus(data && typeof data === "object" ? data : null);
         setTelemetryFetchError(null);
       })
-      .catch(() => {
+      .catch((err) => {
+        if (err instanceof Error && err.name === "AbortError") return;
         setTelemetryFetchError("Failed to fetch telemetry status");
       });
 
     const fetchQuotas = () => {
-      fetch("/api/quotas")
+      fetch("/api/quotas", { signal: controller.signal })
         .then((res) => res.json())
         .then((data) => {
           if (data?.ok && Array.isArray(data.cooldowns)) {
@@ -426,12 +472,21 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
           if (parsedDoomed.success) setDoomed(parsedDoomed.data);
           const parsedChains = RedundantChainArraySchema.safeParse(data?.fallbackChains);
           if (parsedChains.success) setRedundantChains(parsedChains.data);
+          setQuotasLoaded(true);
         })
-        .catch(() => {});
+        .catch(() => {
+          setQuotasLoaded(true);
+        });
     };
     fetchQuotas();
-    const quotaInterval = setInterval(fetchQuotas, 30_000);
-    return () => clearInterval(quotaInterval);
+    const quotaInterval = setInterval(() => {
+      if (globalThis.document?.visibilityState === "hidden") return;
+      fetchQuotas();
+    }, 30_000);
+    return () => {
+      controller.abort();
+      clearInterval(quotaInterval);
+    };
   }, []);
   // `doomed` also carries sub-threshold counters and expired half-open
   // entries, both of which dispatch normally. Rendering every row of it as
@@ -557,11 +612,6 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
   const total = sumUsage(rows.map((r) => r.usage));
   const billings = new Set(rows.map((r) => r.billing));
   const botFleetQuotaWindows = quotaWindows.filter(isBotFleetQuotaWindow);
-  const detectedEnginePlans = React.useMemo(
-    () => autoDetectAllEnginePlans(botFleetQuotaWindows),
-    [botFleetQuotaWindows],
-  );
-  const detectedPlansCount = Object.keys(detectedEnginePlans).length;
   // Why the grid is empty, in the one case where the answer is the native
   // app rather than the engine: nothing to show at all, or a handoff that
   // stopped being refreshed while BotFleet kept rendering the last of it.
@@ -957,6 +1007,21 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
             const engineIssue = !showGenericGrid && !hasUsageMonitorAG && engineProvider
               ? providerIssueLine(instance.displayName, localQuota?.issues?.[engineProvider], localQuota?.producer)
               : null;
+            const expectsUsageMonitorPlaceholder =
+              Boolean(engineProvider) &&
+              instance.instanceId !== "grok" &&
+              !hasUsageMonitorAG &&
+              instanceWindows.length === 0 &&
+              !engineIssue &&
+              // MiniMax and DeepSeek already say their quota or balance in the headline.
+              !minimaxStatus &&
+              !deepseekStatus &&
+              !(instance.instanceId === "antigravity" && agGroups.length > 0);
+            const usageMonitorGridEmptyLine = expectsUsageMonitorPlaceholder
+              ? quotaGridPlaceholderLine(quotasLoaded ? "empty" : "loading", instance.displayName)
+              : null;
+            const showUsageMonitorGrid =
+              hasUsageMonitorAG || showGenericGrid || Boolean(usageMonitorGridEmptyLine);
             const baseDetailLines = hasUsageMonitorAG
               ? []
               : agLines.length > 0
@@ -973,20 +1038,16 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
                 group: "external" as const,
               });
             }
-            if (isDeepSeek && deepseekRow && !deepseekRow.error && deepseekRow.balanceUsd != null) {
-              detailLines.unshift({
-                label: "Remaining Balance",
-                value: formatUsdBalance(deepseekRow.balanceUsd),
-                exhausted: deepseekRow.availability === "exhausted" || deepseekRow.balanceUsd <= 0,
-                group: "external" as const,
-              });
-              if (deepseekRow.grantedUsd != null && deepseekRow.toppedUpUsd != null) {
-                detailLines.push({
-                  label: "Granted / Topped Up",
-                  value: `$${deepseekRow.grantedUsd.toFixed(2)} granted · $${deepseekRow.toppedUpUsd.toFixed(2)} topped up`,
-                  exhausted: false,
-                  group: "external" as const,
-                });
+            if (isDeepSeek) {
+              const clutchLines = buildClutchDetailLines(deepseekRow);
+              const balanceLine = clutchLines.find((l) => l.label === "DeepSeek Remaining Balance");
+              if (balanceLine) {
+                detailLines.unshift(balanceLine);
+              }
+              for (const line of clutchLines) {
+                if (line.label !== "DeepSeek Remaining Balance") {
+                  detailLines.push(line);
+                }
               }
             }
             const unpriced = unpricedTurnCount(spend);
@@ -1029,7 +1090,7 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
                   const value = group.remainingPercent == null
                     ? "not reported"
                     : `${group.remainingPercent}% available`;
-                  return `${group.label}: ${value} (5h window)`;
+                  return `${group.label}: ${value} (5-hour window)`;
                 })
               : [
                   // The wildcard cooldown (Cursor's monthly cap, an exhausted
@@ -1172,8 +1233,12 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
                     />
                   </div>
                 </button>
-                {hasUsageMonitorAG && <UsageMonitorQuotaGrid windows={usageMonitorAGWindows} />}
-                {showGenericGrid && <UsageMonitorQuotaGrid windows={instanceWindows as any} />}
+                {showUsageMonitorGrid && (
+                  <UsageMonitorQuotaGrid
+                    windows={hasUsageMonitorAG ? usageMonitorAGWindows : (instanceWindows as any)}
+                    emptyLine={usageMonitorGridEmptyLine}
+                  />
+                )}
                 {engineIssue && (
                   <div className="ml-9 mt-1.5 rounded-lg border border-hairline/25 bg-inset/30 px-2.5 py-2 text-[11.5px] leading-relaxed text-ink-secondary" title={engineIssue}>
                     {engineIssue}
@@ -1231,33 +1296,6 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
         className={highlightClass?.("setting-usage-pricing")}
         title="Pricing Mode by Engine"
         subtitle={'What you actually pay on each engine.\u00A0 Select your plan or enter a custom monthly cost so the estimate below matches what you pay.'}
-        actions={
-          <button
-            type="button"
-            disabled={detectedPlansCount === 0}
-            onClick={() => {
-              setEnginePlans((prev) => {
-                const next = { ...prev };
-                for (const [engId, detected] of Object.entries(detectedEnginePlans)) {
-                  next[engId] = {
-                    planName: detected.planName,
-                    costPerMonth: detected.costPerMonth,
-                  };
-                }
-                return next;
-              });
-            }}
-            className="flex items-center gap-1.5 rounded-lg border border-hairline/40 bg-control px-2.5 py-1 text-[12px] font-medium text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-40"
-            title={
-              detectedPlansCount > 0
-                ? `Auto-detect ${detectedPlansCount} plan${detectedPlansCount > 1 ? "s" : ""} from live quota windows`
-                : "No engine plans detected from current quota windows"
-            }
-          >
-            <Sparkles size={13} className={detectedPlansCount > 0 ? "text-accent" : "text-ink-secondary"} />
-            Auto-Detect Plans{detectedPlansCount > 0 ? ` (${detectedPlansCount})` : ""}
-          </button>
-        }
       >
         <div className="flex flex-col">
           <div className="grid grid-cols-[1.3fr_1.8fr_1.1fr_0.9fr] gap-x-3 border-b border-hairline/40 pb-2 text-[11.5px] font-medium text-ink-secondary">
@@ -1269,7 +1307,6 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
           {Object.entries(ENGINE_CAPABILITIES).map(([id, entry]) => {
             const currentPlan = enginePlans[id] ?? defaultEnginePlan(id);
             const options = ENGINE_PLAN_OPTIONS[id] ?? [];
-            const detected = detectedEnginePlans[id];
             const sub = entry.pricing.kind === "subscription" || entry.pricing.kind === "subscription+api"
               ? entry.pricing.subscription
               : null;
@@ -1289,7 +1326,7 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
                 <div className="flex min-w-0 flex-col">
                   <span className="truncate font-medium text-ink" title={entry.displayName}>{entry.displayName}</span>
                   <span className="truncate text-[11px] text-ink-secondary/90" title={entry.pricing.notes ?? sub?.notes ?? api?.notes ?? ""}>
-                    {entry.pricing.kind === "api" ? "API pay-as-you-go" : entry.pricing.kind === "free" ? "Free engine" : "Subscription engine"}
+                    {entry.pricing.kind === "api" ? "API pay-as-you-go" : entry.pricing.kind === "free" ? "Free engine" : entry.pricing.kind === "unknown" ? "Pricing unknown" : "Subscription engine"}
                   </span>
                 </div>
                 <div className="flex flex-col gap-1">
@@ -1335,28 +1372,6 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
                       }}
                       className="rounded border border-hairline/40 bg-control px-2 py-0.5 text-[11.5px] text-ink"
                     />
-                  )}
-                  {detected && (!matchingPreset || matchingPreset.planName !== detected.planName) && (
-                    <div className="flex items-center gap-1.5 text-[11px] text-ink-secondary">
-                      <span>Detected: <span className="font-medium text-ink">{detected.label}</span></span>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setEnginePlans((prev) => ({
-                            ...prev,
-                            [id]: { planName: detected.planName, costPerMonth: detected.costPerMonth },
-                          }));
-                        }}
-                        className="text-accent underline hover:opacity-80"
-                      >
-                        Apply
-                      </button>
-                    </div>
-                  )}
-                  {detected && matchingPreset?.planName === detected.planName && (
-                    <span className="text-[10.5px] text-emerald-600 dark:text-emerald-400">
-                      Detected from quota
-                    </span>
                   )}
                 </div>
                 <div className="flex items-center justify-end gap-1">

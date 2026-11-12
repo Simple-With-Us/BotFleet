@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
-import { sharedVpsCardMode } from "./SharedVpsRuntimeCard";
+import { formatBuildElapsed, sharedVpsCardMode, sharedVpsImageAction, sharedVpsStatusLabel } from "./SharedVpsRuntimeCard";
 
 // Card copy renders in plain <div>s, which collapse two ASCII spaces to
 // one. AGENTS.md: the sentence gap is a U+00A0 plus a space.
@@ -52,6 +52,10 @@ describe("the sentence gap is present, not merely not-doubled", () => {
     ["shared subtitle", "subtitle={\"The shared Linux sandbox running on your VPS, with a separate desktop for each bot.\\u00a0 Bots share"],
     ["runtime error", "inspect the VPS runtime.{\"\\u00a0 \"}{error}"],
     ["disabled notice", "in workspace providers.\\u00a0 Turn it on"],
+    ["build progress", "so far.{\"\\u00a0 \"}"],
+    ["prepare hint", "Prepare the new image first.\\u00a0 It builds"],
+    ["switch hint", "The new image is ready.\\u00a0 Switching replaces"],
+    ["switch confirm", "about a minute.\\u00a0 \" +"],
   ];
 
   for (const [label, expected] of boundaries) {
@@ -65,5 +69,50 @@ describe("the sentence gap is present, not merely not-doubled", () => {
     // capital, where the next non-space char is not a tag or expression.
     const offenders = codeLines.filter((line) => /[a-z0-9)][.?!] [A-Z][a-z]/.test(line));
     expect(offenders).toEqual([]);
+  });
+});
+
+describe("a container on an older image", () => {
+  it("is never labelled a clean Running", () => {
+    expect(sharedVpsStatusLabel({ container: "running", imageOutdated: true })).toEqual({
+      label: "Running (outdated image)",
+      tone: "warn",
+    });
+    expect(sharedVpsStatusLabel({ container: "stopped", imageOutdated: true }).label).toBe("Stopped (outdated image)");
+    expect(sharedVpsStatusLabel({ container: "running", imageOutdated: false })).toEqual({ label: "Running", tone: "ok" });
+    // an older harness sends no imageOutdated; that is not outdated
+    expect(sharedVpsStatusLabel({ container: "running" }).label).toBe("Running");
+    expect(sharedVpsStatusLabel({ container: "missing" }).label).toBe("Missing");
+  });
+
+  it("offers Prepare Image, then progress, then Switch to New Image", () => {
+    const base = { container: "running" as const, imageOutdated: true };
+    expect(sharedVpsImageAction({ ...base, image: false })).toBe("prepare");
+    expect(
+      sharedVpsImageAction({ ...base, image: false, imageBuild: { phase: "failed", startedAt: 1, elapsedMs: null, error: "x" } }),
+    ).toBe("prepare");
+    expect(
+      sharedVpsImageAction({ ...base, image: false, imageBuild: { phase: "building", startedAt: 1, elapsedMs: 5, error: null } }),
+    ).toBe("building");
+    expect(sharedVpsImageAction({ ...base, image: true })).toBe("switch");
+    expect(sharedVpsImageAction({ container: "running", image: true, imageOutdated: false })).toBe("none");
+  });
+
+  it("leaves a missing container to the provision flow, showing only a running build", () => {
+    expect(sharedVpsImageAction({ container: "missing", image: false })).toBe("none");
+    expect(
+      sharedVpsImageAction({
+        container: "missing",
+        image: false,
+        imageBuild: { phase: "building", startedAt: 1, elapsedMs: 5, error: null },
+      }),
+    ).toBe("building");
+  });
+
+  it("formats the build's elapsed time", () => {
+    expect(formatBuildElapsed(null)).toBe("0s");
+    expect(formatBuildElapsed(42_000)).toBe("42s");
+    expect(formatBuildElapsed(185_000)).toBe("3m 05s");
+    expect(formatBuildElapsed(3_720_000)).toBe("1h 02m");
   });
 });

@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 /* oxlint-disable anti-slop/no-runtime-typeof -- hand-written env/HTTP boundary parse; zod is unavailable in the updater bootstrap graph. */
 // Query the live harness /api/runtime sourceCommit for the ubf up-to-date
-// shortcut.  The bearer credential is read only from BOTFLEET_OWNER_NONCE; the
-// harness port is read from harness-owner.json via OWNER_FILE_PATH.  Only a
-// 40-hex commit may be written to stdout.
+// shortcut.  Prefer BOTFLEET_OWNER_NONCE and fall back to the live owner
+// record in harness-owner.json via OWNER_FILE_PATH so terminal ubf runs work.
+// Only a 40-hex commit may be written to stdout.
 import { readFileSync } from "node:fs";
 import http from "node:http";
 
 const ownerPath = process.env.OWNER_FILE_PATH;
-const credential = process.env.BOTFLEET_OWNER_NONCE;
+const envCredential = process.env.BOTFLEET_OWNER_NONCE;
 
 function maskedCredentialEnvRef(value) {
   if (typeof value !== "string" || value.length === 0) return "BOTFLEET_OWNER_NONCE";
@@ -20,12 +20,8 @@ if (typeof ownerPath !== "string" || ownerPath.length === 0) {
   process.stderr.write("BotFleet updater: OWNER_FILE_PATH is required.\n");
   process.exit(2);
 }
-if (typeof credential !== "string" || credential.length === 0) {
-  process.stderr.write("BotFleet updater: BOTFLEET_OWNER_NONCE is required.\n");
-  process.exit(2);
-}
-if (!/^[a-f0-9]{64}$/.test(credential)) {
-  process.stderr.write(`BotFleet updater: ${maskedCredentialEnvRef(credential)} is not a valid harness bearer credential.\n`);
+if (typeof envCredential === "string" && envCredential.length > 0 && !/^[a-f0-9]{64}$/.test(envCredential)) {
+  process.stderr.write(`BotFleet updater: ${maskedCredentialEnvRef(envCredential)} is not a valid harness bearer credential.\n`);
   process.exit(2);
 }
 
@@ -34,6 +30,16 @@ try {
   owner = JSON.parse(readFileSync(ownerPath, "utf8"));
 } catch {
   process.exit(1);
+}
+
+const credential = typeof envCredential === "string" && envCredential.length > 0
+  ? envCredential
+  : owner && typeof owner.nonce === "string" && /^[a-f0-9]{64}$/.test(owner.nonce)
+    ? owner.nonce
+    : "";
+if (!credential) {
+  process.stderr.write("BotFleet updater: BOTFLEET_OWNER_NONCE is required when a harness owner record exists.\n");
+  process.exit(2);
 }
 
 const port = owner && owner.port;

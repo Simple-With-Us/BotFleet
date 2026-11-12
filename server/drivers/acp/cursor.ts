@@ -34,24 +34,74 @@ export function resolveCursorAcpModelId(
   available: Array<{ modelId?: string; name?: string }>,
   wanted: string,
 ): string | null {
+  return matchCursorAcpModel(available, wanted)?.modelId ?? null;
+}
+
+const EFFORT_SLUG = /^(.+)-(minimal|low|medium|high|xhigh|max)$/;
+
+/** The `[key=value,...]` parameters of an ACP id, keys and values lowercased. */
+function cursorAcpParams(id: string): Map<string, string> {
+  const params = new Map<string, string>();
+  const body = /\[(.*)\]\s*$/.exec(id)?.[1] ?? "";
+  for (const pair of body.split(",")) {
+    const [key, value] = pair.split("=").map((part) => part?.trim().toLowerCase());
+    if (key && value !== undefined) params.set(key, value);
+  }
+  return params;
+}
+
+/** resolveCursorAcpModelId plus whether the id is the variant the slug names.
+ * `exact` is false only when an effort slug (`grok-4.7-medium-fast`) had to
+ * settle for another variant of its base, because the session advertises one
+ * variant per base and set_model refuses any other parameters. */
+export function matchCursorAcpModel(
+  available: Array<{ modelId?: string; name?: string }>,
+  wanted: string,
+): { modelId: string; exact: boolean } | null {
   const want = wanted.trim().toLowerCase();
   if (!want) return null;
   const ids = available.filter((m) => typeof m?.modelId === "string" && m.modelId);
   if (!ids.length) return null;
   const base = (id: string) => id.split("[")[0].trim().toLowerCase();
+  const found = (modelId: string, exact = true) => ({ modelId, exact });
 
   const exact = ids.find((m) => m.modelId!.toLowerCase() === want);
-  if (exact) return exact.modelId!;
+  if (exact) return found(exact.modelId!);
 
-  const byBase = ids.find((m) => base(m.modelId!) === want);
-  if (byBase) return byBase.modelId!;
+  const isFast = (id: string) => cursorAcpParams(id).get("fast") === "true";
+  const sameBase = ids.filter((m) => base(m.modelId!) === want);
+  const nonFast = sameBase.find((m) => !isFast(m.modelId!));
+  if (nonFast) return found(nonFast.modelId!);
+  const onlyFast = sameBase[0];
+  if (onlyFast) return found(onlyFast.modelId!, false);
+
+  const fastSlug = want.endsWith("-fast");
+  const stem = fastSlug ? want.slice(0, -"-fast".length) : want;
+  if (fastSlug) {
+    const fast = ids.find((m) => base(m.modelId!) === stem && isFast(m.modelId!));
+    if (fast) return found(fast.modelId!);
+  }
+
+  const effortSlug = EFFORT_SLUG.exec(stem);
+  if (effortSlug) {
+    const [, effortBase, effort] = effortSlug;
+    const effortOf = (id: string) => {
+      const params = cursorAcpParams(id);
+      return params.get("reasoning_effort") ?? params.get("effort") ?? params.get("reasoning");
+    };
+    const variants = ids.filter((m) => base(m.modelId!) === effortBase && (!fastSlug || isFast(m.modelId!)));
+    const sameEffort = variants.find((m) => effortOf(m.modelId!) === effort && isFast(m.modelId!) === fastSlug);
+    if (sameEffort) return found(sameEffort.modelId!);
+    const closest = variants.find((m) => isFast(m.modelId!) === fastSlug) ?? variants[0];
+    if (closest) return found(closest.modelId!, false);
+  }
 
   const byName = ids.find((m) => (m.name ?? "").trim().toLowerCase() === want);
-  if (byName) return byName.modelId!;
+  if (byName) return found(byName.modelId!);
 
   if (want === "auto" || want === "default") {
     const dflt = ids.find((m) => base(m.modelId!) === "default");
-    if (dflt) return dflt.modelId!;
+    if (dflt) return found(dflt.modelId!);
   }
   return null;
 }
@@ -452,7 +502,7 @@ const support = (run: typeof execCli): AcpSupport => ({
 
   // Global flags must precede `acp` (cursor.com/docs/cli/reference/parameters).
   // `--force` is the documented auto-approve switch (`--yolo` is an alias);
-  // `--model` is the reliable pin — ACP session/set_model is best-effort below.
+  // ACP sessions use session/set_model below; keep argv for older CLIs.
   spawnArgs: (config, turn) => [
     ...(config.fullAuto ? ["--force"] : []),
     ...(turn.model ? ["--model", turn.model] : []),
@@ -465,24 +515,39 @@ const support = (run: typeof execCli): AcpSupport => ({
   // Prefer the advertised ACP method. An already-signed-in CLI should accept
   // cursor_login without a browser; a missing method rides the ambient login
   // (CURSOR_API_KEY / `cursor-agent login`) instead of failing the turn.
-  pickAuthMethod: (methods) => (methods.some((m) => m.id === "cursor_login") ? "cursor_login" : null),
+  pickAuthMethod: (methods, env) =>
+    nonBlank(env.CURSOR_API_KEY) || nonBlank(env.CURSOR_AUTH_TOKEN)
+      ? null
+      : methods.some((m) => m.id === "cursor_login")
+        ? "cursor_login"
+        : null,
   authFailure: "continue",
   isAuthenticated: (env, config) => probeCursorAuth(config.cli || "cursor-agent", env, run),
   classifyError: classifyCursorError,
 
-  async configureSession({ request, sessionId, turn, sessionModels }) {
+  async configureSession({ request, sessionId, turn, sessionModels, currentModelId, notice }) {
     if (!turn.model) return;
-    // Prefer the id this session actually advertised; fall back to the argv
-    // slug so a CLI that advertises nothing behaves exactly as before.
-    const modelId = resolveCursorAcpModelId(sessionModels ?? [], turn.model) ?? turn.model;
+    const match = matchCursorAcpModel(sessionModels ?? [], turn.model);
+    const modelId = match?.modelId ?? turn.model;
     try {
       await request("session/set_model", { sessionId, modelId });
+      if (match && !match.exact) {
+        notice?.(
+          `Cursor offers ${modelId} rather than ${turn.model} in this session, so this conversation uses ${modelId}.`,
+        );
+      }
     } catch (e) {
       const err = e as Error & { code?: unknown };
-      // -32601 method missing, -32602 id not in this session's namespace. In
-      // both cases spawnArgs already pinned `--model`, so the turn runs the
-      // right model anyway; failing it here would refuse a working request.
-      if (err.code === -32601 || err.code === -32602) return;
+      if (err.code === -32601) return;
+      if (err.code === -32602) {
+        const current = sessionModels?.find((m) => m.modelId === currentModelId);
+        const running = current?.name ?? currentModelId;
+        notice?.(
+          `Cursor did not accept ${turn.model} in this session, so it runs ${running ?? "its default model"}. ` +
+            "Choose another model for this bot to stop seeing this.",
+        );
+        return;
+      }
       throw new Error(
         `Cursor rejected model "${turn.model}" (sent as "${modelId}") via session/set_model: ${err.message}. ` +
           `Check that \`cursor-agent\` is current and that this account can use that model.`,

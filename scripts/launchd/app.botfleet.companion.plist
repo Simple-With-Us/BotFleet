@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  app.botfleet.companion — the supervised Companion sidecar (BF-1339).
+
+  Install to ~/Library/LaunchAgents/app.botfleet.companion.plist, then
+
+      launchctl bootout   gui/$(id -u)/app.botfleet.companion
+      launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/app.botfleet.companion.plist
+
+  Why this file exists at all: the sidecar used to be an Electron
+  utilityProcess. agents.botfleet.app resolves to 127.0.0.1:8810 through the
+  Jay's Tunnel LaunchDaemon, so closing the app killed the only process
+  answering that port and every paired phone got a 502 until the app was
+  reopened. launchd is what turns "the app is open" into "the Mac is serving".
+
+  StartInterval is the same watchdog reasoning as app.botfleet.server.
+  KeepAlive.SuccessfulExit=false only restarts a job that died unsuccessfully,
+  and a clean SIGTERM is a successful exit — reachable whenever the app quits
+  normally — which would leave the Mac serving nothing. With StartInterval the
+  job is invoked periodically, and scripts/botfleet-companion-start.sh already
+  probes :8810 and exits 0 without starting a second sidecar when a companion
+  is answering. So the periodic run is a health check, not a restart loop, and
+  the two settings compose.
+
+  The supervisor keeps the sidecar alive; it does not keep the managed connector
+  alive. The guardian on :8812 stays Electron-owned, with its stdin
+  parent-death pipe, its stop-cloudflared-before-release-port ordering, and its
+  refusal to start without an ownership-verified target. The supervisor
+  publishes the sidecar's identity to
+  ~/.botfleet-companion/runtime/supervisor.json and the app re-proves that
+  identity over the socket before pointing the guardian at it.
+-->
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>BOTFLEET_COMPANION_ROOT</key>
+		<string>/Users/jay/.botfleet-companion/current</string>
+		<key>HOME</key>
+		<string>/Users/jay</string>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/Users/jay/.local/bin</string>
+	</dict>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>Label</key>
+	<string>app.botfleet.companion</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>/Users/jay/apps/botfleet-companion-start.sh</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<!-- Five minutes, matching app.botfleet.server. Long enough that a healthy
+	     probe is nothing, short enough that a phone paired to this Mac is
+	     never left talking to nothing for long. -->
+	<key>StartInterval</key>
+	<integer>300</integer>
+	<key>StandardErrorPath</key>
+	<string>/Users/jay/Library/Logs/botfleet/companion.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/jay/Library/Logs/botfleet/companion.log</string>
+	<key>ThrottleInterval</key>
+	<integer>5</integer>
+	<key>WorkingDirectory</key>
+	<string>/Users/jay/.botfleet-companion</string>
+</dict>
+</plist>

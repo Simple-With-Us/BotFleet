@@ -18,6 +18,9 @@ contextBridge.exposeInMainWorld("ogb", {
   /** Host platform ("darwin" | "win32" | "linux") — for platform-aware UI. */
   platform: process.platform,
   getCapabilities: () => ipcRenderer.invoke("desktop:capabilities"),
+  /** Which build is running right now — version, build number, and the
+   *  Electron/Node/OS the live process reports. */
+  appInfo: () => ipcRenderer.invoke("desktop:app-info"),
   onCapabilitiesChanged: (cb) => {
     const handler = (_event, capabilities) => cb(capabilities);
     ipcRenderer.on("desktop:capabilities-changed", handler);
@@ -122,6 +125,14 @@ contextBridge.exposeInMainWorld("ogb", {
     setKey: (value) => ipcRenderer.invoke("assemblyai:set-key", value),
     streamingToken: () => ipcRenderer.invoke("assemblyai:streaming-token"),
   },
+  /** Speech-to-speech call tokens.  The permanent provider keys stay in the
+   *  encrypted store; the renderer only ever receives one short-lived,
+   *  single-session token, same rule as transcription.streamingToken. */
+  sts: {
+    status: () => ipcRenderer.invoke("sts:status"),
+    xaiToken: () => ipcRenderer.invoke("sts:xai-token"),
+    geminiToken: () => ipcRenderer.invoke("sts:gemini-token"),
+  },
   /** Absolute path of a dropped File — Electron 32 removed File.path, and
    * only the preload can ask. "" when the drag carried no file on disk. */
   getPathForFile: (file) => {
@@ -197,6 +208,8 @@ contextBridge.exposeInMainWorld("ogb", {
   openFile: (filePath) => ipcRenderer.invoke("desktop:open-file", filePath),
   /** Reveal a file in Finder with the file selected. */
   showInFolder: (filePath) => ipcRenderer.invoke("desktop:show-in-folder", filePath),
+  /** Reveal a user-chosen file or folder (e.g. a plugin install source). */
+  revealLocalPath: (filePath) => ipcRenderer.invoke("desktop:reveal-local-path", filePath),
   /** Open a web URL in the default browser. */
   openExternal: (url) => ipcRenderer.invoke("desktop:open-external", url),
   /** Ask where to save a bot-created file (inside ~/.botfleet), copy it

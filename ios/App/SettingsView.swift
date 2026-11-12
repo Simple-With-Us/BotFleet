@@ -193,6 +193,26 @@ struct SettingsView: View {
                     .disabled(!settingsLoaded)
 
                     Picker(selection: Binding(
+                        get: {
+                            let raw = session.config?.busySendDefault?.lowercased() ?? "queue"
+                            return raw == "queue" ? "queue" : "steer"
+                        },
+                        set: { mode in
+                            Task { _ = await session.updateBusySendDefault(mode) }
+                        }
+                    )) {
+                        Text("Steer").tag("steer")
+                        Text("Queue").tag("queue")
+                    } label: {
+                        Label {
+                            Text("Busy Sends")
+                        } icon: {
+                            SettingsIcon(symbol: "arrow.triangle.branch", color: .orange)
+                        }
+                    }
+                    .disabled(!settingsLoaded)
+
+                    Picker(selection: Binding(
                         get: { session.config?.terminology ?? "channels" },
                         set: { newTerm in
                             Task {
@@ -457,7 +477,7 @@ struct SettingsView: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Simple is one conversation per bot.\u{00A0} Merge extra threads into that conversation, or keep them saved but hidden.")
+            Text("Simple is one conversation per bot.\u{00A0} Merge extra threads into that conversation, or keep them saved but hidden.\u{00A0} If some belong to different Apps or folders, nothing is merged and this arrangement stays.")
         }
     }
 

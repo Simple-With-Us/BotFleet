@@ -8,7 +8,9 @@
 import type { Bot, ModelSelection } from "@/state/store";
 import { slotFromPick } from "@/lib/default-model-slots";
 import { canAddFallback } from "../../shared/model-limits";
+import { useStore } from "@/state/store";
 import { ModelPicker } from "./ModelPicker";
+import { ModelSettings } from "./ModelSettings";
 
 export function BotFallbackModels({
   bot,
@@ -18,6 +20,7 @@ export function BotFallbackModels({
   /** Receives the bot's whole model selection with its new fallbacks. */
   onChange: (selection: ModelSelection) => void;
 }) {
+  const { state } = useStore();
   const fallbacks = bot.modelSelection.fallbacks ?? [];
   const save = (next: ModelSelection[]) => onChange({ ...bot.modelSelection, fallbacks: next });
 
@@ -42,6 +45,16 @@ export function BotFallbackModels({
             bot={bot}
             contained
             selection={fallback}
+            onChange={(sel) => {
+              const next = [...fallbacks];
+              next[i] = sel;
+              save(next);
+            }}
+          />
+          <ModelSettings
+            instance={state.instances.find((instance) => instance.instanceId === fallback.instanceId)}
+            selection={fallback}
+            disabled={Boolean(bot.busy)}
             onChange={(sel) => {
               const next = [...fallbacks];
               next[i] = sel;

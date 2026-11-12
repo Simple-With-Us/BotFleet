@@ -46,32 +46,82 @@ concurrency:
 jobs:
   pin:
     name: Pin the build commit
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     outputs:
       sha: ${{ steps.pin.outputs.sha }}
+      version: ${{ steps.pin.outputs.version }}
+      marketing_version: ${{ steps.pin.outputs.marketing_version }}
+      build: ${{ steps.pin.outputs.build }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref || github.ref }}
+          # fetch-depth: 0 is REQUIRED, not a preference.  The build number is
+          # the committer date of the commit being built, and on the default
+          # depth-1 clone the merge stamp cannot be proven.  The stamp script
+          # refuses a shallow clone; this is what lets it not.
+          fetch-depth: 0
           persist-credentials: false
+      # The shared planner consults App Store Connect, so this job loads
+      # the ASC key with INFISICAL_IOS_SHIP_READ_TOKEN (BF-2588).
+      - name: Load the App Store Connect credentials
+        uses: ./.github/actions/infisical-secrets
+        with:
+          names: APPLE_API_KEY_ID APPLE_API_ISSUER_ID APPLE_API_KEY_P8_BASE64
+          required: APPLE_API_KEY_ID APPLE_API_ISSUER_ID APPLE_API_KEY_P8_BASE64
+          project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
+          token: ${{ secrets.INFISICAL_IOS_SHIP_READ_TOKEN }}
       - id: pin
-        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          # The shared planner answers three values (BF-2588):  the fixed
+          # marketing version 0.1.0, the commit's Central merge stamp as the
+          # build, and the app version the Electron updater orders releases
+          # by, which carries that build in its patch.  It exits 1 when it
+          # cannot plan, and `echo "$(...)"` would return echo's status and
+          # publish an EMPTY version, which then fails much later with an
+          # unrelated error.
+          plan="$(node scripts/electron-release-version.mjs --repo-root . --sha "$(git rev-parse HEAD)")" || exit 1
+          app_version="$(printf '%s\n' "$plan" | sed -n 's/^app_version=//p')"
+          marketing_version="$(printf '%s\n' "$plan" | sed -n 's/^version=//p')"
+          build="$(printf '%s\n' "$plan" | sed -n 's/^build=//p')"
+          if [ -z "$app_version" ] || [ -z "$marketing_version" ] || [ -z "$build" ]; then
+            echo "::error::the shared planner returned no app version, marketing version and build"
+            exit 1
+          fi
+          echo "version=$app_version" >> "$GITHUB_OUTPUT"
+          echo "marketing_version=$marketing_version" >> "$GITHUB_OUTPUT"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
 
   mac:
     name: Signed arm64 bundle (${{ needs.pin.outputs.sha }})
     needs: pin
-    runs-on: macos-14
+    runs-on: macos-26
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.pin.outputs.sha }}
+          # Same reason as the pin job: the version is derived from history, and
+          # this job re-checks out independently.
+          fetch-depth: 0
           persist-credentials: false
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - name: Resolve the pinned version
+        # GITHUB_ENV, not a step env: the packaging step that needs this runs
+        # later in the job, and a step-scoped value would not reach it.
+        #
+        # Two values are pinned, not one (BF-2588):  the app version, which
+        # carries the build in its patch because the Electron updater orders
+        # releases by semver on it, and the marketing version, which is the
+        # version a person sees.
+        run: |
+          echo "BOTFLEET_BUILD_VERSION=${{ needs.pin.outputs.version }}" >> "$GITHUB_ENV"
+          echo "BOTFLEET_MARKETING_VERSION=${{ needs.pin.outputs.marketing_version }}" >> "$GITHUB_ENV"
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 24
+          node-version: 26
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       # Stale output is how 0.1.15 shipped as "the app is damaged".
@@ -84,8 +134,7 @@ jobs:
           names: MAC_CERT_P12_BASE64 MAC_CERT_PASSWORD
           required: MAC_CERT_P12_BASE64 MAC_CERT_PASSWORD
           project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
-          client-id: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID || secrets.INFISICAL_CLIENT_ID }}
-          client-secret: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET || secrets.INFISICAL_CLIENT_SECRET }}
+          token: ${{ secrets.INFISICAL_MAC_COMMIT_BUILD_READ_TOKEN }}
         env:
           GH_FALLBACK_MAC_CERT_P12_BASE64: ${{ secrets.MAC_CERT_P12_BASE64 }}
           GH_FALLBACK_MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
@@ -116,9 +165,12 @@ jobs:
         run: |
           pnpm package:mac:local \
             -c.mac.identity="Jay Wedgeworth, LLC (CC8UTF7ATG)" \
-            -c.mac.timestamp=none
+            -c.mac.timestamp=none \
+            -c.extraMetadata.version="$BOTFLEET_BUILD_VERSION" \
+            -c.mac.bundleShortVersion="$BOTFLEET_MARKETING_VERSION" \
+            -c.mac.bundleVersion="${{ needs.pin.outputs.build }}"
 
-      - name: "Gate: signature, team, and a packaged server that starts"
+      - name: "Gate: signature, team, and a packaged server that starts (runtime pass or bundle check)"
         run: |
           app=release/mac-arm64/BotFleet.app
           codesign --verify --deep --strict "$app"
@@ -131,7 +183,16 @@ jobs:
           echo "::notice::signed by ${identity} (team ${team})"
           # The same gate release.yml applies, and the same bug it exists for:
           # 0.1.24 passed every signature check and died on launch.
-          OMB_SMOKE_DIST="$app/Contents/Resources/server" node scripts/smoke-packaged-server.mjs
+          #
+          # BF-1991: the gate boots the PACKAGED binary under
+          # ELECTRON_RUN_AS_NODE=1 -- the runtime the shipped app uses -- when
+          # this host can exec it, and labels the run a bundle check when it
+          # cannot.  The runner's own Node used to be the only runtime here, so
+          # the gate could pass a build that died under the packaged runtime.
+          node scripts/smoke-runtime-mode.mjs gate \
+            --app "$app" \
+            --dist "$app/Contents/Resources/server" \
+            --summary "$GITHUB_STEP_SUMMARY"
 
       - name: Record the build manifest
         id: manifest
@@ -177,7 +238,19 @@ jobs:
           cat build-manifest.json
           echo "artifact=BotFleet-mac-arm64.zip" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      # BF-2531: the Mac updater installs this artifact, and the app it
+      # installs never refreshes Control on its own -- the explicit Update
+      # Control path compares the bundled copy against the installed one, and
+      # the handshake compares the server against the Control bundle.  Prove
+      # the packaged bytes agree with the pinned build before upload, or a
+      # stale Control rides to the Mac inside a newer server.
+      - name: "Gate: the bundled Control and server carry the pinned build"
+        run: |
+          node scripts/verify-packaged-versions.mjs release/mac-arm64/BotFleet.app \
+            --version "${{ needs.pin.outputs.version }}" \
+            --build "${{ needs.pin.outputs.build }}"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           # Commit-keyed so the Mac updater can resolve an exact build rather
           # than "whatever is newest", and 30 days so a Mac that has been off

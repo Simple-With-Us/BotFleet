@@ -379,22 +379,31 @@ public struct CompanionClient: Sendable {
     public let connection: Connection
     private let token: String?
     private let session: URLSession
+    private let gateCredential: HostGateCredential?
+    private let hostOrigin: HostOrigin?
 
-    public init(connection: Connection, token: String?, session: URLSession = .shared) {
+    public init(connection: Connection, token: String?, session: URLSession = .shared, gateCredential: HostGateCredential? = nil, hostOrigin: HostOrigin? = nil) {
         self.connection = connection
         self.token = token
         self.session = session
+        self.gateCredential = gateCredential
+        self.hostOrigin = hostOrigin ?? gateCredential?.origin
     }
 
     // MARK: - Requests
 
-    private func makeRequest(_ method: String, _ path: String, query: [URLQueryItem] = [], body: [String: Any]? = nil) throws -> URLRequest {
+    private func makeRequest(_ method: String, _ path: String, query: [URLQueryItem] = [], body: [String: Any]? = nil, percentEncodedPath: Bool = false) throws -> URLRequest {
         guard let base = connection.baseURL,
               var components = URLComponents(url: base, resolvingAgainstBaseURL: false)
         else { throw APIError.badURL }
-        components.path = path
+        if percentEncodedPath {
+            components.percentEncodedPath = path
+        } else {
+            components.path = path
+        }
         components.queryItems = query.isEmpty ? nil : query
         guard let url = components.url else { throw APIError.badURL }
+        if let hostOrigin, !hostOrigin.contains(url) { throw SavedHostError.differentOrigin }
 
         var request = URLRequest(url: url)
         request.httpMethod = method
@@ -406,6 +415,7 @@ public struct CompanionClient: Sendable {
         if let token {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
+        if let gateCredential { try gateCredential.authorize(&request) }
         if let body {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
@@ -419,9 +429,10 @@ public struct CompanionClient: Sendable {
     private func makeRequest<Body: Encodable>(
         _ method: String,
         _ path: String,
-        encodedBody body: Body
+        encodedBody body: Body,
+        percentEncodedPath: Bool = false
     ) throws -> URLRequest {
-        var request = try makeRequest(method, path)
+        var request = try makeRequest(method, path, percentEncodedPath: percentEncodedPath)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONEncoder().encode(body)
         return request
@@ -468,11 +479,13 @@ public struct CompanionClient: Sendable {
 
     private func perform(_ request: URLRequest) async throws -> (Data, URLResponse) {
         do {
-            return try await session.data(for: request)
+            if let hostOrigin, request.url.map(hostOrigin.contains) != true { throw SavedHostError.differentOrigin }
+            return try await session.data(for: request, delegate: hostOrigin.map { HostOriginRedirectPolicy(origin: $0) })
         } catch {
             if Task.isCancelled || (error as? URLError)?.code == .cancelled || error is CancellationError {
                 throw CancellationError()
             }
+            if let error = error as? SavedHostError { throw error }
             throw APIError.transport(error.localizedDescription)
         }
     }
@@ -709,6 +722,64 @@ public struct CompanionClient: Sendable {
         try await send(try makeRequest("GET", "/api/instances"), as: InstanceList.self)
     }
 
+    /// The commands this bot's engine offers, including compact when it has one.
+    public func contextCommands(botId: String, threadId: String, surface: String) async throws -> [ContextMeterMath.Command] {
+        struct Wire: Decodable {
+            struct Group: Decodable {
+                struct Command: Decodable {
+                    var id: String
+                    var name: String
+                    var enabled: Bool
+                    var disabledReason: String?
+                }
+                var commands: [Command]
+            }
+            var groups: [Group]
+        }
+        let request = try makeRequest(
+            "GET",
+            commandsPath(botId),
+            query: [
+                URLQueryItem(name: "surface", value: surface),
+                URLQueryItem(name: "threadId", value: threadId),
+            ],
+            percentEncodedPath: true
+        )
+        let menu = try await send(request, as: Wire.self)
+        return menu.groups.flatMap { group in
+            group.commands.map {
+                ContextMeterMath.Command(
+                    id: $0.id,
+                    name: $0.name,
+                    enabled: $0.enabled,
+                    disabledReason: $0.disabledReason
+                )
+            }
+        }
+    }
+
+    /// Run one command from that menu.  The computer's own sentence is the failure.
+    public func runContextCommand(botId: String, id: String, threadId: String, surface: String) async throws {
+        struct Body: Encodable {
+            var id: String
+            var threadId: String
+            var surface: String
+        }
+        try await send(try makeRequest(
+            "POST",
+            commandsPath(botId),
+            encodedBody: Body(id: id, threadId: threadId, surface: surface),
+            percentEncodedPath: true
+        ))
+    }
+
+    /// One path segment.  A slash stays inside the id instead of leaving `/api/bots/`.
+    private func commandsPath(_ botId: String) -> String {
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
+        let encoded = botId.addingPercentEncoding(withAllowedCharacters: allowed) ?? botId
+        return "/api/bots/\(encoded)/commands"
+    }
+
     public func config() async throws -> ConfigStatus {
         try await send(try makeRequest("GET", "/api/config"), as: ConfigStatus.self)
     }
@@ -740,6 +811,14 @@ public struct CompanionClient: Sendable {
                 "/api/conversation-mode",
                 encodedBody: ConversationModePatch(conversationMode: conversationMode, mergeThreads: mergeThreads)
             ),
+            as: ConfigStatus.self
+        )
+    }
+
+    public func updateBusySendDefault(_ busySendDefault: String) async throws -> ConfigStatus {
+        struct Body: Encodable { let busySendDefault: String }
+        return try await send(
+            try makeRequest("PATCH", "/api/busy-send-default", encodedBody: Body(busySendDefault: busySendDefault)),
             as: ConfigStatus.self
         )
     }
@@ -794,6 +873,36 @@ public struct CompanionClient: Sendable {
                 )
             ),
             as: ConfigStatus.self
+        )
+    }
+
+    /// Which speech-to-speech providers this computer can reach, and which
+    /// one a call would actually use.
+    ///
+    /// Booleans and a choice — never a key.  The keys stay on the computer;
+    /// this is the phone asking what exists so it can say so honestly instead
+    /// of offering a call that cannot start.  A Mac older than the route
+    /// answers 404, which `check` turns into an `APIError`.
+    public func stsStatus() async throws -> StsStatus {
+        try await send(try makeRequest("GET", "/api/sts/status"), as: StsStatus.self)
+    }
+
+    /// One short-lived, single-session token for a voice call.
+    ///
+    /// The permanent provider key never leaves the computer: the harness
+    /// mints this from a credential only it holds, which is the same rule the
+    /// desktop follows over IPC.  The token is spent opening one realtime
+    /// session and is not a credential for anything else.
+    ///
+    /// The harness throttles this, so a caller that loops answers 429.  That
+    /// is a real answer, not an error to retry in a tight loop.
+    public func stsToken(provider: String) async throws -> StsSessionToken {
+        struct Body: Encodable {
+            let provider: String
+        }
+        return try await send(
+            try makeRequest("POST", "/api/sts/token", encodedBody: Body(provider: provider)),
+            as: StsSessionToken.self
         )
     }
 
@@ -1065,6 +1174,32 @@ public struct CompanionClient: Sendable {
         )
     }
 
+    /// Hand the sidecar a Live Activity push token.
+    ///
+    /// Two kinds exist and they are not interchangeable.  A push-to-start
+    /// token is per-device and survives every activity, and it is the only one
+    /// that can start an activity while the app is dead; an update token is
+    /// minted per activity and rotates, and can only update or end that one.
+    /// The sidecar stores them separately for that reason, so the kind has to
+    /// travel with the token rather than be inferred.
+    public func registerLiveActivityToken(_ hex: String, kind: LiveActivityTokenKind) async throws {
+        let token = hex.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard token.utf8.count >= 64,
+              token.utf8.allSatisfy({
+                  (48...57).contains($0) || (97...102).contains($0)
+              })
+        else {
+            throw APIError.transport("That Live Activity token is not usable.")
+        }
+        try await send(
+            try makeRequest(
+                "POST",
+                "/api/companion/live-activity-token",
+                body: ["token": token, "kind": kind.rawValue]
+            )
+        )
+    }
+
     /// What the sidecar knows about the APNs sender right now.
     ///
     /// Mirrors `PushSenderHealth` in `companion/src/apns.ts` — counts,
@@ -1276,9 +1411,11 @@ public struct CompanionClient: Sendable {
         toBot botId: String,
         threadId: String,
         idempotencyKey: String,
-        recording: IncomingRecording? = nil
+        recording: IncomingRecording? = nil,
+        busyDelivery: String? = nil
     ) async throws -> SendMessageResult {
         var body: [String: Any] = ["text": text, "threadId": threadId, "idempotencyKey": idempotencyKey]
+        if let busyDelivery { body["busyDelivery"] = busyDelivery }
         if let recording {
             body["recording"] = ["path": recording.path, "mime": recording.mime,
                                  "transcript": recording.transcript, "engine": recording.engine]
@@ -1739,6 +1876,7 @@ public struct CompanionClient: Sendable {
         // first quiet gap and reconnect, forever, looking like a flaky network
         // rather than a number in the wrong place.
         streamRequest.timeoutInterval = 90
-        return eventStream(request: streamRequest, session: Self.streaming)
+        if let hostOrigin, streamRequest.url.map(hostOrigin.contains) != true { throw SavedHostError.differentOrigin }
+        return eventStream(request: streamRequest, session: Self.streaming, delegate: hostOrigin.map { HostOriginRedirectPolicy(origin: $0) })
     }
 }

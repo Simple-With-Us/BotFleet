@@ -1,5 +1,7 @@
 import path from "node:path";
-import { resolveSavablePath } from "./save-file.mjs";
+import { resolveLocalRevealPath, resolveSavablePath } from "./save-file.mjs";
+
+export { resolveLocalRevealPath };
 
 const OUTSIDE_MESSAGE = "Only files created by your bots can be opened";
 const INERT_EXTENSIONS = new Set([

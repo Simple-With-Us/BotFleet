@@ -35,7 +35,7 @@ import {
   type BrowserTarget,
   type CropRegion,
 } from "./computer-observation.ts";
-import { CONTROL_REFUSAL, createControlClient } from "./control-client.ts";
+import { controlRefusal, createControlClient } from "./control-client.ts";
 import {
   ensureRemoteCuaCommand,
   REMOTE_CUA_EXECUTABLE,
@@ -803,14 +803,17 @@ async function semanticActAndObserve(
 const OPEN_WHILE_DRIVEN = new Set(["computer_request_help", "computer_status", "observation_metrics"]);
 
 async function call(id: unknown, name: string, args: any) {
-  if (!OPEN_WHILE_DRIVEN.has(name) && (await control.state(true)).held) {
-    return text(id, CONTROL_REFUSAL, true);
+  // Help, status, and metrics only look.  A blocking check would turn a
+  // hand-back that happened during the wait into a brand-new plea.
+  const driving = await control.state(true, !OPEN_WHILE_DRIVEN.has(name));
+  if (!OPEN_WHILE_DRIVEN.has(name) && driving.held) {
+    return text(id, controlRefusal(driving), true);
   }
   if (name === "computer_request_help") {
     if (!control.configured) {
       return text(id, "nobody can be paged for this computer right now — carry on carefully", true);
     }
-    const initial = await control.state(true);
+    const initial = await control.state(true, false);
     // If the person is already driving, don't clobber whatever plea they
     // are reading — just wait for the hand-back.
     const requestId = initial.held ? null : await control.requestHelp(String(args?.reason ?? ""));
@@ -821,7 +824,7 @@ async function call(id: unknown, name: string, args: any) {
     const deadline = Date.now() + CONTROL_WAIT_MS;
     while (Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, CONTROL_POLL_MS));
-      const state = await control.state(true);
+      const state = await control.state(true, false);
       if (state.held) sawHold = true;
       if (!state.held && !state.helpOpen) {
         return text(

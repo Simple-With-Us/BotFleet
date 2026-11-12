@@ -1,0 +1,15 @@
+{
+  "extends": "./tsconfig.server.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "dist-shared",
+    "rootDir": "shared",
+    "rewriteRelativeImportExtensions": true,
+    "declaration": true,
+    "declarationMap": false,
+    "sourceMap": false
+  },
+  "include": [
+    "shared/sts-tokens.ts"
+  ]
+}

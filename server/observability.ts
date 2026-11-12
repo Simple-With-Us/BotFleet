@@ -10,6 +10,7 @@
 // DSN never reaches a log line, a status field, or a broadcast frame; only
 // the ingest host and the project id do.
 import { observabilitySettings, type ObservabilitySettings } from "./config.ts";
+import { runtimeBuildIdentity } from "./runtime-identity.ts";
 import { secretSource } from "./secret-map.ts";
 import {
   applySentryConfig,
@@ -23,6 +24,12 @@ import {
   type SentryRuntimeInput,
   type SentrySource,
 } from "./sentry.ts";
+import {
+  applySentryFleetConfig,
+  resetSentryFleetForTests,
+  resolveSentryFleetDsn,
+  sentryFleetState,
+} from "./sentry-fleet.ts";
 
 export interface ObservabilityStatusView {
   /** Configuration fact: a valid DSN is on file and the kill switch is on.
@@ -47,6 +54,9 @@ export interface ObservabilityStatusView {
   uiTracesSampleRate: number;
   logsEnabled: boolean;
   profilingAvailable: boolean;
+  /** True when `SENTRY_FLEET_DSN` resolved to a valid DSN.  Host only. */
+  fleetExportConfigured: boolean;
+  fleetExportHost: string | null;
   totalCaptured: number;
   lastEventAt: string | null;
   lastError: string | null;
@@ -106,12 +116,14 @@ class ObservabilityManager {
       uiTracesSampleRate: settings.uiTracesSampleRate,
       logsEnabled: settings.logsEnabled,
       source,
+      release: runtimeBuildIdentity.sourceCommit,
     };
   }
 
   /** Re-read the config and bring the Sentry client in line with it. */
   async apply(): Promise<ObservabilityStatusView> {
     await applySentryConfig(this.resolve());
+    applySentryFleetConfig(resolveSentryFleetDsn({ observability: { sentryFleetDsn: this.settings().fleetDsn ?? undefined } }));
     return this.getStatus();
   }
 
@@ -143,6 +155,8 @@ class ObservabilityManager {
       uiTracesSampleRate: input.uiTracesSampleRate ?? 0.1,
       logsEnabled: input.logsEnabled,
       profilingAvailable: runtime.profilingAvailable,
+      fleetExportConfigured: sentryFleetState().configured && sentryFleetState().active,
+      fleetExportHost: sentryFleetState().host,
       totalCaptured: this.totalCaptured,
       lastEventAt: this.lastEventAt,
       // The runtime only knows what the last `apply()` saw; a DSN that has
@@ -216,6 +230,7 @@ class ObservabilityManager {
     this.totalCaptured = 0;
     this.lastEventAt = null;
     this.settingsProvider = null;
+    resetSentryFleetForTests();
   }
 }
 

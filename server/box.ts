@@ -20,9 +20,13 @@ const READY = new Set(["idle", "ready", "running"]);
 const DEFAULT_BOX_TTL_SECONDS = 8 * 60 * 60;
 const TRIAL_BOX_TTL_SECONDS = 2 * 60 * 60;
 
-function boxFetch(cfg: AppConfig, path: string, opts: RequestInit = {}) {
+const BOX_FETCH_TIMEOUT_MS = 30_000;
+
+export async function boxFetch(cfg: AppConfig, path: string, opts: RequestInit = {}): Promise<Response> {
+  const { signal, ...rest } = opts;
   return fetch(`${BOX_API}${path}`, {
-    ...opts,
+    ...rest,
+    signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(BOX_FETCH_TIMEOUT_MS)]) : AbortSignal.timeout(BOX_FETCH_TIMEOUT_MS),
     headers: {
       authorization: `Bearer ${cfg.box?.token}`,
       "content-type": "application/json",

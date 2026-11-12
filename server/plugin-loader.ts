@@ -8,6 +8,16 @@
 //   * the Node permission model: read access to the child script and the
 //     plugin's own folder only, no filesystem writes, no child processes,
 //     no worker threads, no native addons, no WASI, no inspector,
+//   * outbound network denied by default.  A third-party plugin reaches a
+//     destination only when it declares the `net.hosts` capability and
+//     names that exact host:port in `needs.network`.  The shipped Zulip
+//     plugin also receives the configured realm host.  The child seals
+//     the list before importing the plugin.  On Linux an empty list also
+//     enters a network namespace.  On macOS a seatbelt profile denies
+//     the network for that empty list only; a declared destination is
+//     not expressible in a seatbelt remote filter, so the guard enforces
+//     it.  Node 25 and later also withhold `--allow-net` unless the list
+//     is non-empty.
 //   * a capped V8 heap, a start deadline, and a per-call deadline.  A call
 //     that overruns kills the child; the next call respawns it.
 //   * stdio closed, so nothing the plugin prints reaches the server log.
@@ -19,23 +29,31 @@
 // parsed with ChildToParentMessageSchema; an unparseable message kills the
 // child.
 //
-// Residual risk: Node's permission model (as shipped in the Node versions
-// BotFleet runs on) does not restrict outbound network access.  A plugin
-// can still open sockets, but it has no credentials, no environment, and
-// no readable files outside its own folder to send.  Network isolation
-// needs an OS-level mechanism and is tracked in docs/plugins/DESIGN.md §
-// Open Questions.
-import { spawn, type ChildProcess } from "node:child_process";
+import { type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
-import { resolve, sep } from "node:path";
-import { pathToFileURL } from "node:url";
+import { dirname, join, resolve, sep } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { z } from "zod";
 
+import {
+  MAX_ROOM_TURN_TIMEOUT_MINUTES,
+  MIN_ROOM_TURN_TIMEOUT_MINUTES,
+} from "./config.ts";
 import { HOST_API_VERSION, satisfiesBotfleetVersion, type JsonValue } from "../shared/plugin-manifest.ts";
+import type { PluginEventEnvelope } from "../shared/plugin-events.ts";
+import { normalizePluginNetworkAllow } from "../shared/plugin-net-allow.ts";
+import { isShippedZulipPlugin, pluginNetworkAllow } from "./plugin-net-policy.ts";
+import { killPluginProcess, spawnPluginProcess } from "./plugin-net-isolate.ts";
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
 import { PLUGINS_DIR } from "./plugin-registry.ts";
+
+/** Host-owned directory.  A plugin is the shipped Zulip plugin only
+ *  when the registry recorded `<this>/zulip` as the folder it was
+ *  installed from.  The copy under the data directory is not enough,
+ *  and neither is a manifest named `zulip`. */
+export const FIRST_PARTY_PLUGIN_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "plugins", "first-party");
 import {
   ChildToParentMessageSchema,
   MAX_PLUGIN_RESULT_BYTES,
@@ -44,7 +62,7 @@ import {
   type PluginRefusal,
   type SandboxHostSnapshot,
 } from "./plugin-sandbox-protocol.ts";
-import type { PluginExports, PluginListing, PluginSource } from "./plugin-types.ts";
+import type { PluginExports, PluginListing, PluginListingSource } from "./plugin-types.ts";
 
 /** A plugin's bot summary, used by `host.getBots()`.  Kept narrow on
  *  purpose: the plugin does not need the full bot record. */
@@ -78,7 +96,8 @@ export type PluginLogEvent =
 export interface PluginHostInputs {
   listBots: () => PluginHostBotSummary[];
   listConfigKeys: () => readonly string[];
-  readConfig: <T = unknown>(key: string) => T | undefined;
+  /** Returns one allow-listed, schema-validated JSON value, or undefined. */
+  readConfig: (key: string) => JsonValue | undefined;
   logger: (event: PluginLogEvent) => void;
 }
 
@@ -103,7 +122,7 @@ export function isSecretConfigKey(key: string): boolean {
 
 // oxlint-disable-next-line anti-slop/no-unknown-parameters -- type guard over arbitrary host config
 function isRedactableRecord(value: unknown): value is Record<string, unknown> {
-  if (value === null || Array.isArray(value)) return false;
+  if (value === undefined || value === null || Array.isArray(value)) return false;
   const proto = Object.getPrototypeOf(value);
   return proto === Object.prototype || proto === null;
 }
@@ -134,36 +153,65 @@ export function narrowPluginConfigSection(key: string, value: unknown): unknown 
   return redactPluginConfig(value);
 }
 
+/** Strict schemas for each plugin-visible AppConfig section.  Plugins cannot
+ *  probe arbitrary cfg keys: only these shapes cross the host boundary. */
+export const PluginHostRoomsConfigSchema = z.object({
+  turnTimeoutMinutes: z
+    .number()
+    .int()
+    .min(MIN_ROOM_TURN_TIMEOUT_MINUTES)
+    .max(MAX_ROOM_TURN_TIMEOUT_MINUTES),
+}).strict();
+
+export const PluginHostCallSttConfigSchema = z.object({
+  provider: z.enum(["apple", "assemblyai"]).nullable().optional(),
+}).strict();
+
+const PLUGIN_HOST_CONFIG_SCHEMA = {
+  rooms: PluginHostRoomsConfigSchema,
+  callStt: PluginHostCallSttConfigSchema,
+} as const satisfies Record<(typeof PLUGIN_CONFIG_ALLOWLIST)[number], z.ZodType<JsonValue>>;
+
+/** Validate one allow-listed config value for plugin host APIs.  Unknown keys,
+ *  secret-shaped fields, and shapes outside the closed schema are withheld. */
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- AppConfig section values are narrowed and validated by strict Zod schemas before plugins see them
+export function parsePluginHostConfigValue(key: string, value: unknown): JsonValue | undefined {
+  if (key === "rooms") {
+    const narrowed = narrowPluginConfigSection(key, value);
+    const parsed = PLUGIN_HOST_CONFIG_SCHEMA.rooms.safeParse(narrowed);
+    return parsed.success ? parsed.data : undefined;
+  }
+  if (key === "callStt") {
+    const narrowed = narrowPluginConfigSection(key, value);
+    const parsed = PLUGIN_HOST_CONFIG_SCHEMA.callStt.safeParse(narrowed);
+    return parsed.success ? parsed.data : undefined;
+  }
+  return undefined;
+}
+
 /** Short, stable correlation id for a plugin in logs.  The raw name comes
  *  from a downloaded manifest, so logs carry this hash instead. */
 export function pluginLogId(name: string): string {
   return createHash("sha256").update(name).digest("hex").slice(0, 12);
 }
 
-const JSON_VALUE = z.json();
-
-/** Read one allow-listed config value, redact it, and accept it only when
- *  its JSON round-trip parses as a JSON value.  Functions, symbols, and
- *  undefined fields drop out; anything unserializable is withheld. */
+/** Read one allow-listed config value from the host inputs.  The host
+ *  readConfig implementation must already apply parsePluginHostConfigValue;
+ *  this path re-validates so tests cannot bypass the schema with a stub. */
 function redactedConfigValue(inputs: PluginHostInputs, key: string): JsonValue | undefined {
-  const redacted = narrowPluginConfigSection(key, inputs.readConfig(key));
-  if (redacted === undefined) return undefined;
-  let text: string | undefined;
-  try {
-    text = JSON.stringify(redacted);
-  } catch {
-    return undefined;
-  }
-  if (text === undefined) return undefined;
-  const parsed = JSON_VALUE.safeParse(JSON.parse(text));
-  return parsed.success ? parsed.data : undefined;
+  return parsePluginHostConfigValue(key, inputs.readConfig(key));
 }
 
 /** Capture the host data one call may see.  Capabilities the manifest did
  *  not declare are `null`, and the child reports the refusal when the
  *  plugin reaches for them.  Config values are redacted copies of
- *  allow-listed, non-secret keys only. */
-export function buildHostSnapshot(inputs: PluginHostInputs, capabilities: readonly string[]): SandboxHostSnapshot {
+ *  allow-listed, non-secret keys only.  `settings` are the plugin's own
+ *  validated non-secret settings; secret values never appear here. */
+export function buildHostSnapshot(
+  inputs: PluginHostInputs,
+  capabilities: readonly string[],
+  settings: Record<string, JsonValue> = {},
+): SandboxHostSnapshot {
   const allowed = new Set(capabilities);
   const statusAllowed = allowed.has("read.status");
   const bots = allowed.has("read.bots")
@@ -174,20 +222,25 @@ export function buildHostSnapshot(inputs: PluginHostInputs, capabilities: readon
       driver: String(bot.driver),
     }))
     : null;
-  if (!allowed.has("read.config")) return { bots, statusAllowed, configKeys: null, config: {} };
+  if (!allowed.has("read.config")) return { bots, statusAllowed, configKeys: null, config: {}, settings: { ...settings } };
   const configKeys = inputs.listConfigKeys().filter((key) => isPluginConfigKey(key) && !isSecretConfigKey(key));
   const config: Record<string, JsonValue> = {};
   for (const key of configKeys) {
     const value = redactedConfigValue(inputs, key);
     if (value !== undefined) config[key] = value;
   }
-  return { bots, statusAllowed, configKeys: [...configKeys], config };
+  return { bots, statusAllowed, configKeys: [...configKeys], config, settings: { ...settings } };
 }
 
-/** One handler call into the sandbox. */
+/** One handler call into the sandbox.  `onEvent` and `getHealth`
+ *  arrived with host API v2; the event travels as plain JSON and the
+ *  parent validates the plugin's return against the shared envelope
+ *  contract. */
 export type PluginSandboxCall =
   | { handler: "getCardData"; cardId: string }
-  | { handler: "runCommand"; command: string; args: string };
+  | { handler: "runCommand"; command: string; args: string }
+  | { handler: "onEvent"; event: JsonValue }
+  | { handler: "getHealth" };
 
 export type PluginSandboxResult =
   | { ok: true; value: JsonValue }
@@ -208,6 +261,8 @@ export interface PluginSandboxOptions {
   entryPath: string;
   /** The plugin's own folder: the only plugin path the child may read. */
   pluginDir: string;
+  /** Canonical `host:port` tokens.  Empty denies every outbound connection. */
+  networkAllow?: readonly string[];
   pluginId: string;
   logger: (event: PluginLogEvent) => void;
   startTimeoutMs?: number;
@@ -255,7 +310,7 @@ function sandboxEnv(): NodeJS.ProcessEnv {
 }
 
 class ChildPluginSandbox implements PluginSandbox {
-  exports: PluginExports = { getCardData: false, runCommand: false };
+  exports: PluginExports = { getCardData: false, runCommand: false, onEvent: false, getHealth: false };
   private alive = true;
   private nextId = 1;
   private readonly pending = new Map<number, { resolve: (result: PluginSandboxResult) => void; timer: NodeJS.Timeout }>();
@@ -265,10 +320,12 @@ class ChildPluginSandbox implements PluginSandbox {
 
   private readonly child: ChildProcess;
   private readonly options: PluginSandboxOptions;
+  private readonly wrapped: boolean;
 
-  constructor(child: ChildProcess, options: PluginSandboxOptions) {
+  constructor(child: ChildProcess, options: PluginSandboxOptions, wrapped: boolean) {
     this.child = child;
     this.options = options;
+    this.wrapped = wrapped;
     this.exitPromise = new Promise<void>((resolve) => {
       this.resolveExit = resolve;
     });
@@ -290,7 +347,11 @@ class ChildPluginSandbox implements PluginSandbox {
         this.onStart = null;
         resolveStart(result);
       };
-      this.send({ type: "load", entryUrl: pathToFileURL(this.options.entryPath).href });
+      this.send({
+        type: "load",
+        entryUrl: pathToFileURL(this.options.entryPath).href,
+        networkAllow: [...(this.options.networkAllow ?? [])],
+      });
     });
   }
 
@@ -307,7 +368,10 @@ class ChildPluginSandbox implements PluginSandbox {
         this.terminate("timeout");
       }, this.options.callTimeoutMs ?? DEFAULT_CALL_TIMEOUT_MS);
       this.pending.set(id, { resolve: resolveCall, timer });
-      this.send({ type: "invoke", id, host, ...request });
+      // SAFETY: each PluginSandboxCall variant carries exactly the fields
+      // its ParentToChildMessage invoke variant requires; the event payload
+      // is schema-built by the parent and the child re-checks its shape.
+      this.send({ type: "invoke", id, host, ...request } as ParentToChildMessage);
     });
   }
 
@@ -350,7 +414,7 @@ class ChildPluginSandbox implements PluginSandbox {
     if (!this.alive) return;
     this.alive = false;
     if (reason) this.log(reason);
-    this.child.kill("SIGKILL");
+    killPluginProcess(this.child, this.wrapped);
     for (const id of this.pending.keys()) this.settle(id, { ok: false, reason: "sandbox_exited" });
     this.onStart?.(reason ?? "sandbox_exited");
   }
@@ -430,31 +494,51 @@ export async function startPluginSandbox(
     options.logger({ event: "plugin.sandbox", pluginId: options.pluginId, level: "warn", reason: "start_failed" });
     return { reason: "start_failed" };
   }
-  const sandboxOptions: PluginSandboxOptions = { ...options, pluginDir, entryPath };
+  const networkAllow = normalizePluginNetworkAllow(options.networkAllow ?? []);
+  const sandboxOptions: PluginSandboxOptions = { ...options, pluginDir, entryPath, networkAllow };
   const args = [
     flag,
     `--allow-fs-read=${childScript}`,
     `--allow-fs-read=${pluginDir}`,
     `--max-old-space-size=${sandboxOptions.heapMb ?? DEFAULT_HEAP_MB}`,
   ];
-  // The dev tree runs the .ts source; the packaged tree runs the bundled .js.
-  if (childScript.endsWith(".ts")) args.push("--experimental-strip-types", "--no-warnings");
+  // Node 25 and later deny the network under `--permission` unless this
+  // flag is present.  It is all-or-nothing, so it is passed only when the
+  // plugin declared destinations; the child guard then keeps the list.
+  // Older Node builds reject the flag, and their permission model does
+  // not cover the network.
+  if (networkAllow.length > 0 && process.allowedNodeEnvironmentFlags.has("--allow-net")) {
+    args.push("--allow-net");
+  }
+  // The dev tree runs the .ts source, which imports the guard.  The
+  // packaged tree bundles that graph into the child script.
+  if (childScript.endsWith(".ts")) {
+    const serverDir = dirname(childScript);
+    args.push(`--allow-fs-read=${realPath(join(serverDir, "plugin-net-guard.ts"))}`);
+    args.push(`--allow-fs-read=${realPath(join(serverDir, "..", "shared", "plugin-net-allow.ts"))}`);
+    args.push("--experimental-strip-types", "--no-warnings");
+  }
   args.push(childScript);
 
-  let child: ChildProcess;
+  let spawned: ReturnType<typeof spawnPluginProcess>;
   try {
-    child = spawn(process.execPath, args, {
-      cwd: pluginDir,
-      env: sandboxEnv(),
-      stdio: ["ignore", "ignore", "ignore", "ipc"],
-      serialization: "json",
-      windowsHide: true,
+    spawned = spawnPluginProcess({
+      execPath: process.execPath,
+      args,
+      networkAllow,
+      options: {
+        cwd: pluginDir,
+        env: sandboxEnv(),
+        stdio: ["ignore", "ignore", "ignore", "ipc"],
+        serialization: "json",
+        windowsHide: true,
+      },
     });
   } catch {
     options.logger({ event: "plugin.sandbox", pluginId: options.pluginId, level: "warn", reason: "start_failed" });
     return { reason: "start_failed" };
   }
-  const sandbox = new ChildPluginSandbox(child, sandboxOptions);
+  const sandbox = new ChildPluginSandbox(spawned.child, sandboxOptions, spawned.wrapped);
   const failure = await sandbox.start();
   if (failure) {
     await sandbox.dispose();
@@ -469,7 +553,7 @@ export async function startPluginSandbox(
 export interface LoadedPlugin {
   name: string;
   version: string;
-  source: PluginSource;
+  source: PluginListingSource;
   capabilities: readonly string[];
   sandbox: PluginSandbox;
 }
@@ -482,7 +566,10 @@ export async function loadPlugin(
   listing: PluginListing,
   inputs: PluginHostInputs,
   baseDir: string = PLUGINS_DIR,
-  options: Pick<PluginSandboxOptions, "callTimeoutMs" | "startTimeoutMs" | "heapMb"> = {},
+  options: Pick<PluginSandboxOptions, "callTimeoutMs" | "startTimeoutMs" | "heapMb"> & {
+    firstPartyRoot?: string;
+    zulipRealm?: string;
+  } = {},
 ): Promise<LoadedPlugin | { error: string }> {
   if (!satisfiesBotfleetVersion(listing.botfleet, HOST_API_VERSION)) {
     return {
@@ -508,12 +595,23 @@ export async function loadPlugin(
     return { error: `plugin "${listing.name}" failed to load (entry_outside_plugin)` };
   }
 
+  const networkAllow = pluginNetworkAllow({
+    capabilities: listing.capabilities,
+    declared: listing.needs?.network ?? [],
+    shippedZulip: isShippedZulipPlugin(
+      listing.name,
+      listing.source.kind === "folder" ? listing.source.path : null,
+      options.firstPartyRoot ?? FIRST_PARTY_PLUGIN_ROOT,
+    ),
+    zulipRealm: options.zulipRealm,
+  });
   const started = await startPluginSandbox({
     ...options,
     entryPath,
     pluginDir,
     pluginId: pluginLogId(listing.name),
     logger: inputs.logger,
+    networkAllow,
   });
   if ("reason" in started) {
     return { error: `plugin "${listing.name}" failed to load (${started.reason})` };
@@ -536,4 +634,32 @@ export function invokePlugin(
   inputs: PluginHostInputs,
 ): Promise<PluginSandboxResult> {
   return plugin.sandbox.call(request, buildHostSnapshot(inputs, plugin.capabilities));
+}
+
+/** Deliver one typed host event to a loaded plugin's `onEvent` export.
+ *  The caller owns subscription matching, capability gating, content
+ *  scoping, retries, and the ledger; this only runs the sandbox call
+ *  with a fresh snapshot.  A crash or timeout fails this delivery
+ *  alone — the bus in server/plugin-events.ts records it and moves on,
+ *  so one plugin never stops the listener or other plugins. */
+export function invokePluginEvent(
+  plugin: LoadedPlugin,
+  event: PluginEventEnvelope,
+  inputs: PluginHostInputs,
+  settings: Record<string, JsonValue> = {},
+): Promise<PluginSandboxResult> {
+  // SAFETY: the envelope parsed against pluginEventEnvelopeSchema before
+  // this call, so re-serializing it is JSON by construction.
+  const payload = JSON.parse(JSON.stringify(event)) as JsonValue;
+  return plugin.sandbox.call({ handler: "onEvent", event: payload }, buildHostSnapshot(inputs, plugin.capabilities, settings));
+}
+
+/** Ask a loaded plugin for its health snapshot.  Best-effort: any
+ *  failure means "unknown", never an exception to the caller. */
+export function fetchPluginHealth(
+  plugin: LoadedPlugin,
+  inputs: PluginHostInputs,
+  settings: Record<string, JsonValue> = {},
+): Promise<PluginSandboxResult> {
+  return plugin.sandbox.call({ handler: "getHealth" }, buildHostSnapshot(inputs, plugin.capabilities, settings));
 }
