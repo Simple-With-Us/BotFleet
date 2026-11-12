@@ -261,6 +261,9 @@ struct ChatView: View {
     var body: some View {
         VStack(spacing: 0) {
             transcriptColumn
+            if case let .bot(bot) = current {
+                ContextMeterStrip(bot: bot, threadId: displayedThreadId, viewingOther: viewingOther)
+            }
             // While the Mac holds new work for an update, a message sent now
             // is saved and runs after the restart; this says so.
             UpdateHoldNotice()
@@ -565,6 +568,9 @@ struct ChatView: View {
                         // that appends the message, so there is never a beat
                         // where both are on screen.
                         liveRowView(live, after: items)
+                        if case let .bot(bot) = current {
+                            ContextNoteBanner(bot: bot, threadId: displayedThreadId, viewingOther: viewingOther)
+                        }
                     }
                     .padding(.horizontal, 16)
                     .padding(.vertical, 12)
@@ -2450,6 +2456,19 @@ struct MessageRow: View {
                 WebhookEventCard(view: webhook)
             } else if message.role == .user, let imessage = ImessageMessageView.parse(message.text) {
                 ImessageEventCard(view: imessage)
+            } else if message.role == .user, message.command?.name == "compact" {
+                let transcript = session.state.visibleTranscript(forThread: tid)
+                let index = transcript.firstIndex { $0.id == message.id }
+                let settled = index.map { idx in
+                    transcript.dropFirst(idx + 1).contains { later in
+                        later.role == .bot && later.kind == .text && later.command?.name != "compact"
+                    }
+                } ?? false
+                Text(ContextMeterMath.compactCopy(settled: settled))
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 4)
             } else {
                 TextBubble(message: message, chat: chat, tailed: endsRun, showsSpeaker: startsRun)
             }

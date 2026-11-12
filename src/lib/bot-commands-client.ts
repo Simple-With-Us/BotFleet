@@ -176,6 +176,31 @@ export function parseBotCommandsResponseForClient(body: unknown): BotCommandsRes
   };
 }
 
+/** Run one command from the menu by its id.  The server's sentence is the failure. */
+export async function runBotCommand(
+  botId: string,
+  body: { id: string; threadId: string; surface?: "desktop" | "ios" },
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const res = await fetch(`/api/bots/${encodeURIComponent(botId)}/commands`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ id: body.id, threadId: body.threadId, surface: body.surface ?? "desktop" }),
+  });
+  let payload: unknown = null;
+  try {
+    payload = await res.json();
+  } catch {
+    payload = null;
+  }
+  if (!res.ok) {
+    const error = payload && typeof payload === "object" && "error" in payload && typeof payload.error === "string"
+      ? payload.error
+      : "That did not start.";
+    return { ok: false, error };
+  }
+  return { ok: true };
+}
+
 /** Fetch the slash-command menu for one bot thread on desktop. */
 export async function fetchBotCommands(
   botId: string,

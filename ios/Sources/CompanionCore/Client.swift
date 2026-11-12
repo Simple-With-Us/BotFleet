@@ -717,6 +717,55 @@ public struct CompanionClient: Sendable {
         try await send(try makeRequest("GET", "/api/instances"), as: InstanceList.self)
     }
 
+    /// The commands this bot's engine offers, including compact when it has one.
+    public func contextCommands(botId: String, threadId: String, surface: String) async throws -> [ContextMeterMath.Command] {
+        struct Wire: Decodable {
+            struct Group: Decodable {
+                struct Command: Decodable {
+                    var id: String
+                    var name: String
+                    var enabled: Bool
+                    var disabledReason: String?
+                }
+                var commands: [Command]
+            }
+            var groups: [Group]
+        }
+        let request = try makeRequest(
+            "GET",
+            "/api/bots/\(botId)/commands",
+            query: [
+                URLQueryItem(name: "surface", value: surface),
+                URLQueryItem(name: "threadId", value: threadId),
+            ]
+        )
+        let menu = try await send(request, as: Wire.self)
+        return menu.groups.flatMap { group in
+            group.commands.map {
+                ContextMeterMath.Command(
+                    id: $0.id,
+                    name: $0.name,
+                    enabled: $0.enabled,
+                    disabledReason: $0.disabledReason
+                )
+            }
+        }
+    }
+
+    /// Run one command from that menu.  The computer's own sentence is the failure.
+    public func runContextCommand(botId: String, id: String, threadId: String, surface: String) async throws {
+        struct Body: Encodable {
+            var id: String
+            var threadId: String
+            var surface: String
+        }
+        try await send(try makeRequest(
+            "POST",
+            "/api/bots/\(botId)/commands",
+            encodedBody: Body(id: id, threadId: threadId, surface: surface)
+        ))
+    }
+
     public func config() async throws -> ConfigStatus {
         try await send(try makeRequest("GET", "/api/config"), as: ConfigStatus.self)
     }
