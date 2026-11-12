@@ -233,6 +233,18 @@ describe("computer destination eligibility", () => {
     );
     expect(runsOnDisabledNote(note, note, note, false)).toBe(note);
   });
+
+  it("lets the cloud picker explain a Box-only engine, instead of denying every remote desktop", () => {
+    const box = instanceFor(engineFixture("ASCII.dev Box"));
+    const cloudReason = computerDestinationDisabledReason("cloud", box, BOT, "vps");
+    const vmReason = computerDestinationDisabledReason("vm", box, BOT, "vps");
+    const pickerNote = cloudBackendUnavailableNote(box, BOT, true);
+    expect(cloudReason).toContain("cannot drive a remote desktop");
+    expect(pickerNote).toContain("can't run a desktop on your own server");
+    const shown = runsOnDisabledNote(cloudReason, vmReason, pickerNote, true);
+    expect(shown).toBe(vmReason);
+    expect(shown).not.toContain("remote desktop");
+  });
 });
 
 describe("the engine list the eligibility answers rest on", () => {

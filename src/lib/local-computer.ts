@@ -240,18 +240,18 @@ export function cloudBackendUnavailableNote(
 
 /** The one line under Runs On.
  *
- * The cloud-backend picker shows the remote reason itself, so this stays
- * quiet when it would only repeat that sentence. */
+ * The cloud-backend picker owns the remote explanation whenever it is on
+ * screen.  Skipping only an identical string left a Box-only engine with two
+ * sentences: Runs On said it cannot drive a remote desktop, while the picker
+ * correctly said Self-hosted VPS is the part it cannot use. */
 export function runsOnDisabledNote(
   cloudReason: string | null,
   vmReason: string | null,
   pickerNote: string | null,
   pickerVisible: boolean,
 ): string | null {
-  for (const reason of [cloudReason, vmReason]) {
-    if (!reason) continue;
-    if (pickerVisible && reason === pickerNote) continue;
-    return reason;
-  }
+  const pickerOwnsRemote = pickerVisible && Boolean(pickerNote);
+  if (!pickerOwnsRemote && cloudReason) return cloudReason;
+  if (vmReason && !(pickerVisible && vmReason === pickerNote)) return vmReason;
   return null;
 }
