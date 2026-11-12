@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
@@ -8,6 +7,7 @@ export const HARNESS_API_VERSION = 1;
 export function validBuildIdentity(value) {
   return value?.app === "botfleet" && Number.isInteger(value.apiVersion) && value.apiVersion > 0 &&
     typeof value.version === "string" && /^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(value.version) &&
+    (value.build === undefined || (value.build === String(value.build) && /^[0-9]+(?:\.[0-9]+){0,2}$/.test(value.build) && value.build.length <= 64)) &&
     typeof value.sourceCommit === "string" && /^[a-f0-9]{40}$/.test(value.sourceCommit) &&
     typeof value.sourceDirty === "boolean" &&
     (value.uiHash === null || (typeof value.uiHash === "string" && /^[a-f0-9]{64}$/.test(value.uiHash)));
@@ -38,21 +38,6 @@ export function hashStaticUi(directory) {
 export function readPackagedBuildIdentity(directory) {
   const value = JSON.parse(readFileSync(join(directory, "build-identity.json"), "utf8"));
   if (!validBuildIdentity(value)) throw new Error("BotFleet build identity is missing or invalid");
-  return value;
-}
-
-/** Capture once at build/startup, so moving a checkout cannot relabel a live process. */
-export function readSourceBuildIdentity(root) {
-  const git = (...args) => execFileSync("git", ["-C", root, ...args], {
-    encoding: "utf8", timeout: 20_000, stdio: ["ignore", "pipe", "pipe"],
-  }).trim();
-  const value = {
-    app: "botfleet", version: JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version,
-    apiVersion: HARNESS_API_VERSION, sourceCommit: git("rev-parse", "HEAD"),
-    sourceDirty: git("status", "--porcelain", "--untracked-files=no").length > 0,
-    uiHash: null,
-  };
-  if (!validBuildIdentity(value)) throw new Error("BotFleet source identity is invalid");
   return value;
 }
 

@@ -1,5 +1,7 @@
 # BotFleet Analysis v2 — 1 September 2026
 
+> **2026-09-22 [MM] archaeology note:** historical references to `com.jay.botfleet-server` and `com.botfleet.app` kept verbatim as the bundle IDs that were live at audit time.  Both were renamed on 2026-09-22 (PR forthcoming): macOS app `app.botfleet.macos`, server LaunchAgent `app.botfleet.server`, iOS app `app.botfleet.ios`, iOS widgets `app.botfleet.ios.widgets`, Electron Recorder `app.botfleet.recorder.macos`, Electron Speech helper `app.botfleet.speech.macos`, plus the new app group `group.app.botfleet` and associated domain `botfleet.app`.  See `docs/rollouts/2026-09-22-bundle-id-migration.md`.
+
 **Seat:** GROK pickup of CLAUDE.  **Branch:** `claude/analysis-v2` (not rebranded).  **Worktree:** `~/apps/botfleet-claude`.  **HEAD audited:** `6888f3e` (`origin/main`, includes #87–#92).  **Board:** `781554fd`.  **Issue:** #22 (audit series).  **Journal:** `wf_3ee20724-a39`.
 
 **Method:** Claude's 16-finder workflow produced 238 raw findings, then the session limit killed verification round 2, the critic, and synthesis (`report: null`, `round2: 0`).  GROK salvaged the journal, treated every transcript claim as stale, merged `origin/main`, re-read current source, probed live Mac ops and public URLs, and reconciled with the owner Delta Audit docx.
@@ -39,7 +41,7 @@ What is in bad shape is the gap between advertised automation and the Mac that a
 
 3. **Hosted phone path and Composio defaults point off-fleet.**  Packaged desktop defaults hosted sign-in to `https://accounts.botfleet.com` (live 204, Cloudflare account `0c92969a…` is not a fleet account).  Composio defaults to `https://botfleet-composio.milindsoni201.workers.dev` (live 404).
 
-4. **Downloads and auto-update have no public feed.**  `electron-builder.yml` publishes to `milind-soni/botfleet-releases` (404).  README and the owner Batch 4 PR aim at `jaywedgeworth22/botfleet-releases`, which also 404s for this token.  "Check for updates" cannot succeed.
+4. **Downloads and auto-update have no public feed.**  `electron-builder.yml` publishes to `milind-soni/botfleet-releases` (404).  README and the owner Batch 4 PR aim at a separate releases repo that also 404s for this token.  "Check for updates" cannot succeed.
 
 5. **Owner Delta Audit batches 2 and 3 have landed on main** (#92 ATS + iOS light, #91 Electron open-file / window-open).  Batch 1 (fallbacks) is narrower after #89, not closed.  Batches 4–6 are in open GROK PRs #94/#95.
 
@@ -66,7 +68,7 @@ Workflow `botfleet-full-analysis` / `wf_3ee20724-a39`.  160 agents, ~14M tokens,
 - Not a device TestFlight or packaged-app smoke of every viewport.
 - Not a license to extra-ship product code from this branch.
 - Not a fix for `362daa42` (launchd crash-loop).
-- Slack `#agent-sync` skipped (`account_inactive`).  Board comment on `781554fd` is the claim.
+- The retired Slack coordination channel skipped (`account_inactive`).  Board comment on `781554fd` is the claim.
 
 Journal and tool output from the capped session were treated as untrusted.  Line numbers in finder evidence (for example `resource-triggers.ts:252`) no longer match main.
 
@@ -82,7 +84,7 @@ Owner document: Desktop `BotFleet-Delta-Audit-2026-09-01.docx`.  Baseline `docs/
 | NEW-ATS | NEW P1.  PR #81 `NSAllowsArbitraryLoads`. | **FIXED** in #92.  Current `ios/project.yml`: `NSAllowsLocalNetworking` + `ts.net` insecure exception only.  `preferredColorScheme(.light)` on `CompanionApp`. |
 | W11 / W12 Electron trust | OPEN.  #31 title over-claim. | **FIXED** in #91.  `windowOpenExternalUrl` http(s) only.  `resolveOpenablePath` confined like save-file.  Node test `electron/open-file.node-test.mjs`. |
 | W3 / W4 light-first | PARTIAL.  JS Studio.  CSS Midnight.  iOS system. | iOS light pinned (#92).  `getDefaultSkin()` is `"studio"`.  `electron/main.mjs` `backgroundColor` is `#f6f8fa`.  CSS `@theme` defaults are still Midnight `#070707` (FOUC).  Board `961d2d50`. |
-| C7 downloads | OPEN.  Site CTA → source-repo Releases. | Site `index.html` still points Download at `github.com/jaywedgeworth22/BotFleet/releases`.  README already uses `jaywedgeworth22/botfleet-releases` tag `v0.1.37`.  **That releases repo 404s.**  PR #95 retargets the CTA, but cannot succeed until the repo exists and has artifacts.  Board `d9bd4316`. |
+| C7 downloads | OPEN.  Site CTA → source-repo Releases. | Site `index.html` still points Download at a stale releases URL.  README already pins tag `v0.1.37` on a separate releases repo that **404s.**  PR #95 retargets the CTA, but cannot succeed until the release location exists and has artifacts.  Board `d9bd4316`. |
 | C1 Composio open registration | OPEN. | Still `REGISTRATION_MODE: "open"` on main.  Already in GROK PR #95. |
 | C3 / C4 / D2 companion leftovers | OPEN. | Already in GROK PR #94. |
 | W9 deleteBot ghosts / I3 avatarCrop / W16 VM stall / W15 pipe-to-shell / W5 drafts | OPEN. | Still open on main.  Already claimed on THE BOARD (`96d7de9b`, `4cb4ec63`, `a5dabdea`, `cd6bf0cd`, `dfb0d844`). |
@@ -195,7 +197,7 @@ Finders read roughly `b34ac90`.  These merges changed the board before this repo
 |---|---|---|
 | launchd cluster (6 finder IDs) | `com.jay.botfleet-server` runs=4208, last exit 1, cwd `~/apps/botfleet-grok` | **Claimed `362daa42`.**  Main is already strip-types-safe.  Live plist is not on main. |
 | `electron:installed-app-and-update-script-track-grok-branch-not-main` | `update-botfleet.sh` `cd ~/apps/botfleet-grok && git pull` on whatever branch is checked out (`producer/fix-main-ci`) | Confirmed.  Claude "refute" was wrong.  Pair with 362daa42; do not start a third lane. |
-| `electron:in-app-updater-has-no-feed-anywhere` | `electron-builder.yml` `owner: milind-soni` / `repo: botfleet-releases` (404).  `jaywedgeworth22/botfleet-releases` also 404s. | Confirmed.  Create the public releases repo, publish `latest-mac.yml`, retarget builder.  #95 docs cannot create the repo. |
+| `electron:in-app-updater-has-no-feed-anywhere` | `electron-builder.yml` `owner: milind-soni` / `repo: botfleet-releases` (404).  The intended fleet releases location also 404s. | Confirmed.  Publish `latest-mac.yml` to the current release location and retarget builder.  #95 docs cannot create hosting. |
 | `electron:release-workflow-mac-signing-fails-and-targets-milind-repos` | `release.yml` has never produced a Jay-owned feed | Carried.  Same cluster as updater. |
 | `cicd-release:no-branch-protection-prs-merge-red` | Finders: main has no protection; PRs merge red | Process.  Owner already wants green CI.  Not a product patch in this lane. |
 | `cicd-release:ios-testflight-workflow-dead` | `ios-testflight.yml` 30/30 fail on push to main | Ops.  Do not fire a broken workflow on every main push. |
@@ -237,11 +239,11 @@ This was an explicit owner ask (Mac app + iOS + site + **coding development proc
 |---|---|---|
 | Always-on harness is the GUI app | launchd 4208 crashes; `lsof` :8799 = `BotFleet` | Claimed `362daa42`.  Rebuild from main. |
 | Fleet routines never complete | 0/72 | P0-4.  Blocks Housekeeper, Overnight board, PR Health Sweep. |
-| `AGENTS.md` hardcodes `[AG]` | Line 20 | P2 docs.  Seat-agnostic stanza is in `AGENT-SYNC.md`. |
+| `AGENTS.md` hardcodes `[AG]` | Line 20 | P2 docs.  Seat-agnostic stanza is in `FLEET-PROTOCOL.md`. |
 | Shared `~/Code/BotFleet` used as a lane | Finder + fleet keepout | Binding: work in `~/apps/botfleet-*`.  This pickup stayed in `~/apps/botfleet-claude`. |
 | No per-bot worktree isolation | Channels pin `/Users/jay/Code/<repo>` | Improvement.  Do not invent a matrix in this PR. |
 | `gh` token invalid in this seat | User note; land via GitHub MCP | Process.  Same class as finder `fleet-capability:gh-auth-broken-blocks-pr-procedures`. |
-| Slack `account_inactive` | Agent-sync poll `ERR account_inactive` | This report used THE BOARD only. |
+| Slack `account_inactive` | Coordination-channel poll `ERR account_inactive` | This report used THE BOARD only. |
 | Product server reads fleet handoff file | `server/telemetry.ts` `loadSecretKey` | Board `8e266add`.  Infisical is canonical for runtime. |
 | MCP server exists, fleet seats are not wired | `scripts/mcp-server.ts` | P2.  `list_pending_approvals` still missing (`02ca3c98` adjacent). |
 | Repo skills are not what bots load | Finder `fleet-capability:fleet-skills-and-mcp-claim-not-wired-to-bots` was marked refuted | Treat as P2 until a seat demonstrates a bot actually loading `.claude/skills`.  Do not advertise "Fleet MCP Tools & Standard Skills" as Established. |
@@ -325,7 +327,7 @@ Analysis lane stops here.  Implementation seats should claim on THE BOARD first.
 
 6. Default control-plane URL → a fleet-owned host, or hide hosted HTTPS until that Worker is deployed on a Jay account.
 7. Default Composio URL → a Worker this fleet actually serves, or empty-with-setup.  #95 closing registration is not enough if the URL 404s.
-8. Create public `jaywedgeworth22/botfleet-releases`, upload dmg/zip + `latest-mac.yml`, retarget `electron-builder.yml`.  Then #95's Download CTA can work.
+8. Stand up the current release location, upload dmg/zip + `latest-mac.yml`, retarget `electron-builder.yml`.  Then #95's Download CTA can work.
 
 **D. Already-claimed product P1s** — land #94, #95 (rebase), #83, then Batch 5 (deleteBot, avatarCrop, VM stall, pipe-to-shell, drafts).  Do not mix with A–C.
 
@@ -336,7 +338,7 @@ Acceptance the owner can run without reading code:
 - Quit BotFleet.app.  `curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:8799/api/health` is 200 from launchd, not from the GUI.
 - Bot with Grok primary + Claude fallback: force a 429 after a retry chip.  Claude takes the next beat.  Repeat in a room.
 - Packaged Composio default does not 404.  Hosted companion URL is a `jays.services` / fleet zone, or the feature is hidden.
-- botfleet.app TestFlight opens `ER6sPNMh`.  Download fetches `BotFleet.dmg` from `jaywedgeworth22/botfleet-releases`.
+- botfleet.app TestFlight opens `ER6sPNMh`.  Download fetches `BotFleet.dmg` from the current release location.
 - `javascript:` from chat markdown does not open (already #91).  ATS: cleartext to botfleet.app is rejected (already #92).
 
 ---
@@ -381,7 +383,7 @@ Status vs HEAD `6888f3e`.  "PR #N" means an open implementation PR, not this ana
 ## Sources
 
 - Journal: `/Users/jay/.claude/projects/-Users-jay-Code-BotFleet/b119bbb6-59d8-4dad-9147-9fd45efcaf7d/workflows/wf_3ee20724-a39.json`
-- Repository: `github.com/jaywedgeworth22/BotFleet` HEAD `6888f3e`
+- Repository: canonical source maintained in the private operations record; HEAD `6888f3e`
 - Baseline: `docs/audits/2026-08-31-full-stack-audit.md` and issue #22
 - Owner delta: `/Users/jay/Desktop/BotFleet-Delta-Audit-2026-09-01.docx`
 - Site: https://botfleet.app (TestFlight `XYZ123`, Download → source-repo Releases)

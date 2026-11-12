@@ -16,10 +16,12 @@ import { z } from "zod";
 import { botFleetStatusSystemPrompt, readBotFleetStatus } from "./botfleet-status-capsule.ts";
 import type { JsonObject, JsonValue } from "./schema.ts";
 
-const NOW = new Date("2026-08-22T06:30:00Z");
+export const BOTFLEET_STATUS_FIXTURE_NOW = new Date("2026-08-22T06:30:00Z");
+const NOW = BOTFLEET_STATUS_FIXTURE_NOW;
 const OLD_SINGLE_VIEW_SHA = `sha256:${"1".repeat(64)}`;
 const DUAL_VIEW_SHA = `sha256:${"2".repeat(64)}`;
-const roots: string[] = [];
+export const botfleetStatusCacheRoots: string[] = [];
+const roots = botfleetStatusCacheRoots;
 const jsonObjectSchema = z.record(z.string(), z.custom<JsonValue>());
 const posixOnly = describe.skipIf(process.getuid === undefined);
 
@@ -75,7 +77,7 @@ function ui(twoUp: boolean): JsonObject {
   };
 }
 
-function successCapsule(options: {
+export function successCapsule(options: {
   source?: string | null;
   expected?: string | null;
   twoUp?: boolean;
@@ -140,7 +142,7 @@ function failedCapsule(
   });
 }
 
-function cachePath(capsule: TestCapsule): string {
+export function cachePath(capsule: TestCapsule): string {
   const root = mkdtempSync(join(tmpdir(), "botfleet-status-"));
   roots.push(root);
   const parent = join(root, "botfleet");
@@ -298,6 +300,60 @@ posixOnly("readBotFleetStatus", () => {
     expect(
       readBotFleetStatus({ cachePath: join(linkedParent, "latest.json"), now: NOW }).reason,
     ).toBe("missing_or_insecure");
+  });
+});
+
+posixOnly("botFleetStatusSystemPrompt stability", () => {
+  const at = (offsetMs: number) => new Date(NOW.getTime() + offsetMs);
+
+  it("stays byte-identical when only the observation moves", () => {
+    // This string is spliced into a Chief of Staff's `turn.system`, which the
+    // Claude driver passes as `--append-system-prompt` and folds into the
+    // spawn fingerprint it compares before reusing the warm process
+    // (`argsKey`).  A capsule re-observed on its own five-minute clock says
+    // nothing new about what the Chief may do — it only carries a later
+    // timestamp and the receipt hash over it — so it must not cost the bot
+    // its process.
+    const first = successCapsule();
+    const refreshed = sign({
+      ...first,
+      observed_at: "2026-08-22T06:32:30Z",
+      fresh_until: "2026-08-22T06:37:30Z",
+    });
+    expect(refreshed.receipt_sha256).not.toBe(first.receipt_sha256);
+
+    const before = botFleetStatusSystemPrompt({ cachePath: cachePath(first), now: at(1_000) });
+    const after = botFleetStatusSystemPrompt({ cachePath: cachePath(refreshed), now: at(150_000) });
+
+    expect(after).toBe(before);
+    expect(before).not.toContain("observed_at");
+    expect(before).not.toContain("receipt_sha256=");
+    expect(before).not.toContain("ready_count");
+    // the verified-receipt FACT survives; only its moving value is gone
+    expect(before).toContain("receipt=verified");
+  });
+
+  it("still changes when the runtime posture itself changes", () => {
+    const before = botFleetStatusSystemPrompt({ cachePath: cachePath(successCapsule()), now: at(1_000) });
+    const readySlot = (slot: string) => ({
+      slot,
+      container: "running",
+      readiness: "ready",
+      network: "loopback",
+      security: "hardened",
+      persistence: "durable",
+    });
+    const promoted = sign({
+      ...successCapsule(),
+      runtime_state: "ready",
+      ready_count: 2,
+      slots: [readySlot("vm-1"), readySlot("vm-2")],
+    });
+
+    const after = botFleetStatusSystemPrompt({ cachePath: cachePath(promoted), now: at(1_000) });
+
+    expect(after).not.toBe(before);
+    expect(after).toContain("runtime_state=ready");
   });
 });
 

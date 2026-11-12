@@ -14,7 +14,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { freePortBlock } from "./ports.ts";
 
 /** One scripted reply to the next `POST /v1/chat/completions`. */
-export type ScriptedCompletion =
+export type DirectCompletion =
   | { kind: "json"; status?: number; body: unknown }
   /** Accept the request, record it, and never answer — the provider that
    *  simply stops talking. A caller's own abort (an interrupt, a room turn's
@@ -44,6 +44,14 @@ export type ScriptedCompletion =
       omitTrailingNewline?: boolean;
     };
 
+export type ScriptedCompletion =
+  | DirectCompletion
+  /** Hold the request until the test releases the named gate, then answer
+   *  with `then`.  A concurrency test needs two turns in flight at once
+   *  with control over which one finishes first; a FIFO queue alone cannot
+   *  express that.  `close()` still destroys any socket held this way. */
+  | { kind: "gate"; gate: string; then: DirectCompletion };
+
 export interface RecordedRequest {
   method: string;
   url: string;
@@ -64,6 +72,9 @@ export interface FakeOpenAiServer {
   /** Queue one scripted reply for the next matching `POST
    *  /v1/chat/completions`. FIFO — call it once per expected round. */
   queueCompletion(response: ScriptedCompletion): void;
+  /** Answer every request currently held at this gate. Releasing a gate
+   *  with nothing waiting is a no-op. */
+  releaseGate(gate: string): void;
   /** Queue one scripted reply for the next `GET /v1/models`. Defaults to a
    *  small fixed catalog when nothing is queued. */
   queueModels(body: unknown): void;
@@ -110,6 +121,27 @@ export async function startFakeOpenAiServer(): Promise<FakeOpenAiServer> {
   const modelsQueue: unknown[] = [];
   const requests: RecordedRequest[] = [];
   const hung = new Set<ServerResponse>();
+  const gates = new Map<string, Array<{ res: ServerResponse; then: DirectCompletion }>>();
+
+  const answerDirect = (res: ServerResponse, script: DirectCompletion): void => {
+    if (script.kind === "json") {
+      res.writeHead(script.status ?? 200, { "content-type": "application/json" });
+      res.end(JSON.stringify(script.body));
+      return;
+    }
+    if (script.kind === "hang") {
+      hung.add(res);
+      res.on("close", () => hung.delete(res));
+      return;
+    }
+    if (script.kind === "close") {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.flushHeaders();
+      setImmediate(() => res.destroy());
+      return;
+    }
+    sendSse(res, script);
+  };
 
   const server: Server = createServer((req, res) => {
     void (async () => {
@@ -150,15 +182,15 @@ export async function startFakeOpenAiServer(): Promise<FakeOpenAiServer> {
           res.on("close", () => hung.delete(res));
           return;
         }
-        if (script.kind === "close") {
-          res.writeHead(200, { "content-type": "text/event-stream" });
-          // Flush the head so the client has a real 200 in hand, then kill
-          // the socket on the next tick with no frame and no terminator.
-          res.flushHeaders();
-          setImmediate(() => res.destroy());
+        if (script.kind === "gate") {
+          hung.add(res);
+          res.on("close", () => hung.delete(res));
+          const waiters = gates.get(script.gate) ?? [];
+          waiters.push({ res, then: script.then });
+          gates.set(script.gate, waiters);
           return;
         }
-        sendSse(res, script);
+        answerDirect(res, script);
         return;
       }
 
@@ -182,6 +214,14 @@ export async function startFakeOpenAiServer(): Promise<FakeOpenAiServer> {
     url: `http://127.0.0.1:${port}/v1`,
     requests,
     queueCompletion: (response) => completionQueue.push(response),
+    releaseGate: (gate) => {
+      const waiters = gates.get(gate) ?? [];
+      gates.delete(gate);
+      for (const { res, then } of waiters) {
+        hung.delete(res);
+        if (!res.destroyed) answerDirect(res, then);
+      }
+    },
     queueModels: (body) => modelsQueue.push(body),
     close: () =>
       new Promise<void>((resolve, reject) => {

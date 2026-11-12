@@ -3,7 +3,7 @@
 // tests pin the contract: same snapshot shape the antigravity-quota
 // poller exposes, so the future swap to a real reader is a single-file
 // change.
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   GROK_NO_SOURCE_REASON,
@@ -82,5 +82,32 @@ describe("grok-quota", () => {
   it("findGrokBin returns a sensible default when the local CLI is absent", () => {
     const bin = findGrokBin({ HOME: "/nonexistent" }, () => false);
     expect(bin).toBe("grok");
+  });
+
+  // HS14: ticking every 5 minutes to return the same documented constant
+  // bought nothing but a timer.  start() now computes it once.
+  it("start() computes the snapshot once and does not arm a recurring timer", async () => {
+    vi.useFakeTimers();
+    try {
+      let calls = 0;
+      const poller = createGrokQuotaPoller({
+        exec: {
+          snapshot: async () => {
+            calls += 1;
+            return buildNoSourceSnapshot();
+          },
+        },
+      });
+
+      poller.start();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(calls).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      expect(calls).toBe(1);
+      poller.stop();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

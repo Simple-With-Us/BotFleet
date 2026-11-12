@@ -175,3 +175,38 @@ describe("Recall transport credential and process boundaries", () => {
     }
   });
 });
+
+describe("Recall corpus honesty", () => {
+  it("says the corpus is not the configured one when the CLI is supplying it", async () => {
+    // The state this repo was found in: `enabled: true`, `url` and
+    // `collection` both empty.  A transport resolved — the local `recall`
+    // binary — so the probe went green and the panel read "configured", while
+    // the tools were answering from a corpus the owner never pointed the app
+    // at.  `configuredTarget` is the flag that separates those two.
+    const settings = { url: "", collection: "", apiKey: "", accessClientId: "", accessClientSecret: "" };
+    const status = await recallStatus(settings);
+    // Whichever transport the machine running the tests has, the claim is the
+    // point: no url and no collection means the corpus is not the owner's.
+    expect(status.configuredTarget).toBe(false);
+    if (status.source === "unconfigured") expect(status.configured).toBe(false);
+  });
+
+  it("accepts a service transport as the intended corpus only when both fields are set", async () => {
+    const url = await service((req, res) => {
+      json(res, req.url === "/health" ? { backend_ok: true } : valid);
+    });
+    const both = await recallStatus({ url, collection: "selected-corpus", apiKey: "", accessClientId: "", accessClientSecret: "" });
+    expect(both).toMatchObject({ source: "recall-service", configuredTarget: true, ready: true });
+  });
+
+  it("does not call a service transport the intended corpus when the collection is unset", async () => {
+    // A url with no collection leaves the collection name to come from
+    // somewhere else, so this is not the fully-specified setup either.
+    const url = await service((req, res) => {
+      json(res, req.url === "/health" ? { backend_ok: true } : valid);
+    });
+    const partial = await recallStatus({ url, collection: "", apiKey: "", accessClientId: "", accessClientSecret: "" });
+    expect(partial.source).toBe("recall-service");
+    expect(partial.configuredTarget).toBe(false);
+  });
+});

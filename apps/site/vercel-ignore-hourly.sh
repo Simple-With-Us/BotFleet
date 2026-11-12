@@ -5,7 +5,7 @@
 #   - skip every preview
 #   - skip when this commit did not change site files (effort logs / STATUS /
 #     iOS / docs-only merges must not ship the website)
-#   - production at most once per 2 hours (stops agent spam even when they keep
+#   - production at most once per 3 hours (stops agent spam even when they keep
 #     touching CSS/copy)
 # Manual: VERCEL_FORCE_DEPLOY=1, or Dashboard Redeploy with Ignore Build Step unchecked.
 set -euo pipefail
@@ -82,25 +82,37 @@ if ! site_changed; then
   exit 0
 fi
 
-if [[ -n "${VERCEL_TOKEN:-}" && -n "${VERCEL_PROJECT_ID:-}" ]]; then
-  team="${VERCEL_ORG_ID:-}"
-  qs="projectId=${VERCEL_PROJECT_ID}&target=production&state=READY&limit=1"
-  if [[ -n "$team" ]]; then
-    qs="${qs}&teamId=${team}"
-  fi
-  created=$(curl -fsS -H "Authorization: Bearer ${VERCEL_TOKEN}" \
-    "https://api.vercel.com/v6/deployments?${qs}" \
-    | python3 -c "import json,sys
+# Missing credentials or a failed status query must not silently bypass the
+# production cooldown. Vercel treats exit 0 from the ignore step as "skip".
+# Use VERCEL_FORCE_DEPLOY=1 for an intentional manual override.
+if [[ -z "${VERCEL_TOKEN:-}" || -z "${VERCEL_PROJECT_ID:-}" ]]; then
+  echo "skip production: cooldown cannot be checked (missing VERCEL_TOKEN or VERCEL_PROJECT_ID)"
+  exit 0
+fi
+
+team="${VERCEL_ORG_ID:-}"
+qs="projectId=${VERCEL_PROJECT_ID}&target=production&state=READY&limit=1"
+if [[ -n "$team" ]]; then
+  qs="${qs}&teamId=${team}"
+fi
+if ! created=$(curl -fsS -H "Authorization: Bearer ${VERCEL_TOKEN}" \
+  "https://api.vercel.com/v6/deployments?${qs}" \
+  | python3 -c "import json,sys
 d=json.load(sys.stdin)
-deps=d.get('deployments') or []
-print(deps[0]['created'] if deps else 0)" 2>/dev/null || echo 0)
-  now_ms=$(python3 -c "import time; print(int(time.time()*1000))")
-  if [[ "$created" =~ ^[0-9]+$ ]] && [[ "$created" -gt 0 ]]; then
-    age=$(( (now_ms - created) / 1000 ))
-    if [[ "$age" -lt 7200 ]]; then
-      echo "skip production: last deploy ${age}s ago (cap 2/hour)"
-      exit 0
-    fi
+deps=d['deployments']
+if not isinstance(deps,list): raise ValueError('deployments is not a list')
+created=deps[0]['created'] if deps else 0
+if type(created) is not int or created < 0: raise ValueError('invalid deployment time')
+print(created)" 2>/dev/null); then
+  echo "skip production: cooldown cannot be checked (Vercel API failure)"
+  exit 0
+fi
+now_ms=$(python3 -c "import time; print(int(time.time()*1000))")
+if [[ "$created" -gt 0 ]]; then
+  age=$(( (now_ms - created) / 1000 ))
+  if [[ "$age" -lt 10800 ]]; then
+    echo "skip production: last deploy ${age}s ago (one per 3 hours)"
+    exit 0
   fi
 fi
 

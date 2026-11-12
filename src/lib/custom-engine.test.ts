@@ -232,7 +232,14 @@ describe("the Add Engine form's driver choice", () => {
 
     const base = { name: "Second MiniMax", endpoint: "https://api.minimaxi.com/v1", key: SENTINEL_ADD_KEY };
     expect(validateAddEngine({ ...base, driver: "minimax", models: [] })).toBeNull();
-    expect(validateAddEngine({ ...base, driver: "openai-compat", models: [] })).toContain("model ID is required");
+    // An OpenAI-compatible vendor publishes its own list at `{url}/models`, and
+    // the driver already asks for it — naming models by hand is how that probe
+    // used to be switched off.  Blank is allowed, and resolved by discovery.
+    expect(validateAddEngine({ ...base, driver: "openai-compat", models: [] })).toBeNull();
+    // Too many is still refused: the route stores at most 15 per connection.
+    expect(validateAddEngine({ ...base, driver: "openai-compat", models: Array.from({ length: 16 }, (_, i) => `m${i}`) })).toBe(
+      "At most 15 model IDs can be configured",
+    );
     expect(validateAddEngine({ ...base, driver: "minimax", models: [] , name: "" })).toBe("Engine name is required");
     expect(validateAddEngine({ ...base, driver: "minimax", models: [], endpoint: " " })).toBe("Endpoint URL is required");
     // A paid hosted API is given no workspace credential for a connection the
@@ -262,6 +269,14 @@ describe("the Add Engine form's driver choice", () => {
     // The default fleet's own ids, for drivers whose id is not their kind.
     expect(isCustomEngineInstance({ driverKind: "claudeAgent", instanceId: "claude" })).toBe(false);
     expect(isCustomEngineInstance({ driverKind: "boxAgent", instanceId: "computer" })).toBe(false);
+    // MiniMax Code's reserved id is "mcode", not its driver kind — without
+    // the row above it would read as operator-added and offer a delete button
+    // on a default-fleet engine.
+    expect(isCustomEngineInstance({ driverKind: "mcodeAgent", instanceId: "mcode" })).toBe(false);
+    expect(isCustomEngineInstance({ driverKind: "mcodeAgent", instanceId: "mcode-china" })).toBe(true);
+    expect(isCustomEngineInstance({ driverKind: "opencodeGo", instanceId: "opencode" })).toBe(false);
+    expect(isCustomEngineInstance({ driverKind: "opencodeGo", instanceId: "opencodeGo" })).toBe(false);
+    expect(isCustomEngineInstance({ driverKind: "opencodeGo", instanceId: "custom-opencode" })).toBe(true);
     // …and a driver nobody listed fails SAFE: its reserved id is its own
     // kind, so anything else reads as operator-added and offers a delete
     // button, rather than hiding one for an engine that really was added.
@@ -269,6 +284,7 @@ describe("the Add Engine form's driver choice", () => {
     expect(isCustomEngineInstance({ driverKind: "someFutureDriver", instanceId: "custom-x" })).toBe(true);
     // The server's own flag still wins when it is set.
     expect(isCustomEngineInstance({ driverKind: "claudeAgent", instanceId: "claude", isCustom: true })).toBe(true);
+    expect(isCustomEngineInstance({ driverKind: "opencodeGo", instanceId: "opencodeGo", isCustom: false })).toBe(false);
   });
 
   it("names the engine the operator actually added in the row callout", () => {
@@ -279,7 +295,7 @@ describe("the Add Engine form's driver choice", () => {
     // driver's non-reserved id, an extra instance of one of those used to
     // claim a wire shape its endpoint may not speak at all.
     expect(customEngineCalloutTitle("claudeAgent")).toBe("Added Claude Connection.");
-    expect(customEngineCalloutTitle("boxAgent")).toBe("Added Computer Connection.");
+    expect(customEngineCalloutTitle("boxAgent")).toBe("Added ASCII.dev Box Connection.");
     // A driver nobody listed is named after itself rather than mislabelled.
     expect(customEngineCalloutTitle("someFutureDriver")).toBe("Added SomeFutureDriver Connection.");
     expect(customEngineCalloutTitle("nimbus")).toBe("Added Nimbus Connection.");
@@ -287,8 +303,11 @@ describe("the Add Engine form's driver choice", () => {
 
   it("falls back to a humanized driver kind rather than a wrong product name", () => {
     expect(driverDisplayName("minimax")).toBe("MiniMax");
-    expect(driverDisplayName("dshAgent")).toBe("DeepSeek");
+    expect(driverDisplayName("dshAgent")).toBe("Clutch");
     expect(driverDisplayName("piAgent")).toBe("pi");
+    // mcode's own product name, not the humanized "Mcode" the fallback
+    // would hand back from the driver kind alone.
+    expect(driverDisplayName("mcodeAgent")).toBe("MiniMax Code");
     expect(driverDisplayName("widgetAgent")).toBe("Widget");
     expect(driverDisplayName("widget")).toBe("Widget");
     // Never returns an empty label, whatever it is handed.

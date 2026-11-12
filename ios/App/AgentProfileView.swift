@@ -17,12 +17,17 @@ struct AgentProfileView: View {
     @State private var description: String
     @State private var notifications: Bool
     @State private var crop: AvatarCrop
-    @State private var voice: String
-    @State private var speakReplies: Bool
+    /// The voice each device actually uses (`Bot.voice(for:)`).  A save
+    /// turns these back into the shared voice plus overrides.
+    @State private var iphoneVoice: String
+    @State private var macVoice: String
+    @State private var speechDevices: Set<String>
     @State private var instanceId: String
     @State private var modelId: String
     @State private var effort: String?
+    @State private var latest: String?
     @State private var fallbacks: [ModelSelection]
+    @State private var maxToolRoundsText: String
     @State private var photo: PhotosPickerItem?
     @State private var prompt = ""
     @State private var voices: [Voice] = []
@@ -33,8 +38,31 @@ struct AgentProfileView: View {
     @State private var instancesLoaded = false
     @State private var config: ConfigStatus?
     @State private var busy = false
+    @State private var confirmingDuplicate = false
     @State private var player: AVAudioPlayer?
+    @State private var isOff: Bool
+    /// The On/Off switch was flipped while the bot was working, and the
+    /// person has not yet said what should happen to the turn in flight.
+    @State private var powerOffWhileRunning = false
+    /// They said stop it: the switch saves first, then the turn is stopped.
+    @State private var stopRunningTurnOnSave = false
+    @State private var computers: Set<String>
+    @State private var cwd: String
+    /// The execution policy, saved with the rest of the sheet.  Bypass is
+    /// switched on only through `confirmingBypass`, never by the toggle alone.
+    @State private var autoApprove: Bool
+    @State private var autoReview: AutoReviewMode
+    @State private var approvePeerComms: Bool
+    @State private var bypassPermissions: Bool
+    @State private var bypassLocalComputer: Bool
+    @State private var confirmingLocalBypass = false
+    @State private var confirmingBypass = false
     @State private var baseline: ProfileFormSnapshot
+    /// Set while the Delete Bot confirmation is up.
+    @State private var deleteTarget: Chat?
+    /// The harness's refusal of a delete, shown in this sheet.
+    @State private var deleteError: String?
+    @ObservedObject private var personalVoice = PersonalVoiceService.shared
 
     init(bot: Bot) {
         self.bot = bot
@@ -43,12 +71,23 @@ struct AgentProfileView: View {
         _description = State(initialValue: bot.description)
         _notifications = State(initialValue: bot.notifications)
         _crop = State(initialValue: bot.avatarCrop ?? .mascot)
-        _voice = State(initialValue: bot.voice ?? "")
-        _speakReplies = State(initialValue: bot.speakReplies == true)
+        _iphoneVoice = State(initialValue: bot.voice(for: .iphone) ?? "")
+        _macVoice = State(initialValue: bot.voice(for: .mac) ?? "")
+        _speechDevices = State(initialValue: Set(bot.speechDevices ?? (bot.speakReplies == true ? ["mac"] : [])))
         _instanceId = State(initialValue: bot.modelSelection.instanceId)
         _modelId = State(initialValue: bot.modelSelection.model)
         _effort = State(initialValue: bot.modelSelection.effort)
+        _latest = State(initialValue: bot.modelSelection.latest ?? ModelLineage.detectAlias(from: bot.modelSelection.model))
         _fallbacks = State(initialValue: bot.modelSelection.fallbacks ?? [])
+        _maxToolRoundsText = State(initialValue: Self.roundsText(bot.maxToolRounds))
+        _isOff = State(initialValue: bot.isOff)
+        _computers = State(initialValue: Set(bot.computers ?? []))
+        _cwd = State(initialValue: bot.cwd ?? "")
+        _autoApprove = State(initialValue: bot.autoApprove ?? false)
+        _autoReview = State(initialValue: AutoReviewMode(stored: bot.autoReview))
+        _approvePeerComms = State(initialValue: bot.approvePeerComms ?? false)
+        _bypassPermissions = State(initialValue: bot.bypassPermissions ?? false)
+        _bypassLocalComputer = State(initialValue: bot.bypassLocalComputer ?? false)
         _baseline = State(initialValue: ProfileFormSnapshot(bot: bot))
     }
 
@@ -56,7 +95,40 @@ struct AgentProfileView: View {
     private var imageGenerationReady: Bool { config?.imageGen?.configured == true }
     private var voiceConfigured: Bool { config?.isTTSConfigured == true }
     private var hasWorkspaceDefaultVoice: Bool { config?.hasWorkspaceDefaultVoice == true }
-    private var selectedVoiceCanSpeak: Bool { config?.canSpeak(agentVoice: voice) == true }
+    private var iphoneVoiceIsPersonal: Bool { BotVoice.isPersonalVoiceId(iphoneVoice) }
+    private var macVoiceIsPersonal: Bool { BotVoice.isPersonalVoiceId(macVoice) }
+    /// The iPhone is set to a Personal Voice this iPhone does not have.
+    /// Only knowable once Personal Voice is authorized.
+    private var iphoneVoiceMissing: Bool {
+        iphoneVoiceIsPersonal && personalVoice.authorizationStatus == .authorized && !personalVoice.hasVoice(iphoneVoice)
+    }
+    private var hasAvailableVoices: Bool {
+        voiceConfigured || !personalVoice.personalVoices.isEmpty || iphoneVoiceIsPersonal || macVoiceIsPersonal
+    }
+    /// A Personal Voice speaks on its own device without the computer's
+    /// voice engine; anything else needs it.
+    private func voiceCanSpeak(_ voiceId: String, with config: ConfigStatus?) -> Bool {
+        BotVoice.isPersonalVoiceId(voiceId) || config?.canSpeak(agentVoice: voiceId) == true
+    }
+    private var iphoneVoiceCanSpeak: Bool { voiceCanSpeak(iphoneVoice, with: config) }
+    /// The Mac is set to this iPhone's own Personal Voice (an older iPhone
+    /// build wrote it as the shared voice).  The Mac cannot speak it.
+    private var macVoiceIsThisIphones: Bool { macVoiceIsPersonal && personalVoice.hasVoice(macVoice) }
+    private func macVoiceCanSpeak(with config: ConfigStatus?) -> Bool {
+        !macVoiceIsThisIphones && voiceCanSpeak(macVoice, with: config)
+    }
+    private var macVoiceCanSpeak: Bool { macVoiceCanSpeak(with: config) }
+    /// Hosted voices only.  Personal Voices come from the device itself.
+    private var hostedVoices: [Voice] { voices.filter { !BotVoice.isPersonalVoiceId($0.id) } }
+    /// DEBUG `-store-preview -preview-voice`: the voice section comes first,
+    /// for a screenshot of the two pickers.
+    private static var voiceSectionFirst: Bool {
+        #if DEBUG
+        ProcessInfo.processInfo.arguments.contains("-preview-voice")
+        #else
+        false
+        #endif
+    }
     private var voiceProvider: VoiceProvider { config?.voiceProvider ?? .minimax }
 
     private var unavailableVoiceLabel: String {
@@ -64,6 +136,7 @@ struct AgentProfileView: View {
         case .minimax: return "MiniMax voice is not configured"
         case .elevenlabs: return "ElevenLabs is not configured"
         case .system: return "Built-in Mac voices are unavailable"
+        case .personal: return "Apple Personal Voice is not configured"
         case .unknown: return "Voice is not configured"
         }
     }
@@ -71,36 +144,42 @@ struct AgentProfileView: View {
     private var unavailableVoiceGuidance: String {
         switch voiceProvider {
         case .minimax:
-            return "Add the shared MiniMax key in this agent's profile on the computer. The key is never returned to iOS."
+            return "Add the shared MiniMax key in a bot's Voice settings on the computer.\u{00A0} The key is never returned to iOS."
         case .elevenlabs:
-            return "Add the shared ElevenLabs key in this agent's profile on the computer. The key is never returned to iOS."
+            return "Add the shared ElevenLabs key in a bot's Voice settings on the computer.\u{00A0} The key is never returned to iOS."
         case .system:
-            return "Built-in Mac voices need no key, and this computer has none available. Switch the voice engine in this agent's profile on the computer to keep using voice."
+            return "Built-in Mac voices need no key, and this computer has none available.\u{00A0} Switch the voice provider in a bot's Voice settings on the computer to keep using voice."
+        case .personal:
+            return "Apple Personal Voice speaks directly on this iOS device and requires authorization."
         case .unknown:
-            return "Configure the selected voice engine in this agent's profile on the computer. Provider keys are never returned to iOS."
+            return "Configure the selected voice provider in a bot's Voice settings on the computer.\u{00A0} Provider keys are never returned to iOS."
         }
     }
 
     private var missingDefaultVoiceGuidance: String {
         switch voiceProvider {
         case .minimax:
-            return "No workspace default voice is selected. Choose an agent-specific voice above; synthesis still uses the shared MiniMax key on your computer."
+            return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose a voice for each device above; speech still uses the shared MiniMax key on your computer."
         case .elevenlabs:
-            return "No workspace default voice is selected. Choose an agent-specific voice above; synthesis still uses the shared ElevenLabs key on your computer."
+            return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose a voice for each device above; speech still uses the shared ElevenLabs key on your computer."
         case .system:
-            return "No workspace default voice is selected. Choose an agent-specific voice above; synthesis still uses the built-in Mac voices on your computer."
+            return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose a voice for each device above; speech still uses the built-in Mac voices on your computer."
+        case .personal:
+            return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose an Apple Personal Voice for this iPhone above to speak on this device."
         case .unknown:
-            return "No workspace default voice is selected. Choose an agent-specific voice above; synthesis still uses the selected voice engine on your computer."
+            return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose a voice for each device above; speech still uses the selected voice provider on your computer."
         }
     }
 
     var body: some View {
         NavigationStack {
             Form {
+                if Self.voiceSectionFirst { voiceSection }
+
                 Section {
                     HStack {
                         Spacer()
-                        BotAvatarView(bot: current, size: 112, state: .happy, animated: true)
+                        BotAvatarWithProviderBadge(bot: current, size: 112, state: .happy, animated: true)
                         Spacer()
                     }
                     .listRowBackground(Color.clear)
@@ -144,6 +223,31 @@ struct AgentProfileView: View {
                          : "To generate images, configure the shared image provider in BotFleet on your computer. Provider keys cannot be added from a phone.")
                 }
 
+                Section {
+                    Toggle("On", isOn: Binding(get: { !isOff }, set: { turnedOn in
+                    // Switching a working bot off is really two decisions —
+                    // stop the turn now, or stop it starting from now — and a
+                    // switch cannot tell which one was meant.  Hold the flip
+                    // until they answer, and only ask when there is a turn to
+                    // decide about.  The decision lives in CompanionCore so it
+                    // is tested rather than eyeballed: `get` reads `!isOff`,
+                    // so `set` must apply the inverse of what the switch says.
+                    switch botPowerToggleAction(turnedOn: turnedOn, isOff: isOff, isBusy: current.busy == true) {
+                    case .askAboutRunningTurn:
+                        powerOffWhileRunning = true
+                    case .setOff(let next):
+                        isOff = next
+                    }
+                }))
+                } header: {
+                    Text("Power")
+                } footer: {
+                    // Two spaces between sentences, held with a non-breaking space.
+                    Text(isOff
+                         ? "Nothing new starts for this bot.\u{00A0} Chat, routines, webhooks and rooms are skipped, and a turn already running finishes.\u{00A0} Its chat stays visible."
+                         : "This bot answers chat, runs its routines and webhooks, and speaks in rooms.\u{00A0} Turn it off to stop all new work.")
+                }
+
                 Section("Identity") {
                     TextField("Name", text: $name)
                         .textInputAutocapitalization(.words)
@@ -164,40 +268,7 @@ struct AgentProfileView: View {
                         }
                     }
                 } else {
-                    Section("Primary Model") {
-                        Picker("Provider", selection: $instanceId) {
-                            ForEach(availableInstances) { instance in
-                                Text(instance.displayName ?? instance.instanceId).tag(instance.id)
-                            }
-                        }
-                        .pickerStyle(.navigationLink)
-                        .onChange(of: instanceId) { _, newInstanceId in
-                            if let instance = instances.first(where: { $0.id == newInstanceId }) {
-                                if !instance.models.options.contains(where: { $0.id == modelId }) {
-                                    modelId = instance.models.default
-                                }
-                                if let effort, !instance.effortLevels(for: modelId).contains(effort) {
-                                    self.effort = nil
-                                }
-                            }
-                        }
-
-                        if let selectedInstance = instances.first(where: { $0.id == instanceId }) {
-                            Picker("Model", selection: $modelId) {
-                                ForEach(selectedInstance.models.options) { option in
-                                    Text(option.label).tag(option.id)
-                                }
-                            }
-                            .pickerStyle(.navigationLink)
-                            .onChange(of: modelId) { _, newModelId in
-                                if let effort, !selectedInstance.effortLevels(for: newModelId).contains(effort) {
-                                    self.effort = nil
-                                }
-                            }
-
-                            effortPicker(selection: $effort, instance: selectedInstance, modelId: modelId)
-                        }
-                    }
+                    primaryModelSection
 
                     ForEach(fallbacks.indices, id: \.self) { index in
                         Section("Fallback \(index + 1)") {
@@ -206,8 +277,14 @@ struct AgentProfileView: View {
                                 set: { newInstanceId in
                                     fallbacks[index].instanceId = newInstanceId
                                     if let inst = instances.first(where: { $0.id == newInstanceId }) {
-                                        if !inst.models.options.contains(where: { $0.id == fallbacks[index].model }) {
-                                            fallbacks[index].model = inst.models.default
+                                        if let fbLatest = fallbacks[index].latest,
+                                           let resolved = ModelLineage.resolveClass(fbLatest, in: inst) {
+                                            fallbacks[index].model = resolved.resolvedId
+                                        } else {
+                                            fallbacks[index].latest = nil
+                                            if !inst.models.options.contains(where: { $0.id == fallbacks[index].model }) {
+                                                fallbacks[index].model = inst.models.default
+                                            }
                                         }
                                         if let effort = fallbacks[index].effort,
                                            !inst.effortLevels(for: fallbacks[index].model).contains(effort) {
@@ -217,24 +294,54 @@ struct AgentProfileView: View {
                                 }
                             )) {
                                 ForEach(fallbackAvailableInstances(for: fallbacks[index].instanceId)) { instance in
-                                    Text(instance.displayName ?? instance.instanceId).tag(instance.id)
+                                    Text(instance.settingsDisplayName).tag(instance.id)
                                 }
                             }
                             .pickerStyle(.navigationLink)
 
                             if let fallbackInstance = instances.first(where: { $0.id == fallbacks[index].instanceId }) {
                                 Picker("Model", selection: Binding(
-                                    get: { fallbacks[index].model },
-                                    set: { newModel in
-                                        fallbacks[index].model = newModel
+                                    get: {
+                                        if let fbLatest = fallbacks[index].latest, !fbLatest.isEmpty {
+                                            return "latest:\(fbLatest)"
+                                        }
+                                        return fallbacks[index].model
+                                    },
+                                    set: { newTag in
+                                        if newTag.hasPrefix("latest:") {
+                                            let classKey = String(newTag.dropFirst("latest:".count))
+                                            fallbacks[index].latest = classKey
+                                            if let resolved = ModelLineage.resolveClass(classKey, in: fallbackInstance) {
+                                                fallbacks[index].model = resolved.resolvedId
+                                            }
+                                        } else {
+                                            fallbacks[index].latest = nil
+                                            fallbacks[index].model = newTag
+                                        }
                                         if let effort = fallbacks[index].effort,
-                                           !fallbackInstance.effortLevels(for: newModel).contains(effort) {
+                                           !fallbackInstance.effortLevels(for: fallbacks[index].model).contains(effort) {
                                             fallbacks[index].effort = nil
                                         }
                                     }
                                 )) {
-                                    ForEach(fallbackInstance.models.options) { option in
-                                        Text(option.label).tag(option.id)
+                                    let latestOpts = ModelLineage.latestOptions(for: fallbackInstance)
+                                    if !latestOpts.isEmpty {
+                                        Section("Latest") {
+                                            ForEach(latestOpts) { opt in
+                                                VStack(alignment: .leading, spacing: 2) {
+                                                    Text(opt.label)
+                                                    Text(opt.resolvedId)
+                                                        .font(.caption)
+                                                        .foregroundStyle(.secondary)
+                                                }
+                                                .tag("latest:\(opt.classKey)")
+                                            }
+                                        }
+                                    }
+                                    Section("Models") {
+                                        ForEach(fallbackInstance.models.options) { option in
+                                            Text(option.label).tag(option.id)
+                                        }
                                     }
                                 }
                                 .pickerStyle(.navigationLink)
@@ -255,64 +362,54 @@ struct AgentProfileView: View {
                         }
                     }
 
-                    if fallbacks.count < 2 {
+                    if fallbacks.count < Self.maximumFallbacks {
                         Section {
                             Button("Add Fallback", systemImage: "plus.circle") {
-                                let firstInst = instances.first
+                                // An engine the fallback picker would offer, never a hidden
+                                // one that is only here because a saved selection points at it.
+                                let firstInst = fallbackAvailableInstances(for: "").first
+                                    ?? instances.first(where: { $0.isListed() })
                                 let instId = firstInst?.id ?? instanceId
                                 let mdl = firstInst?.models.default ?? modelId
                                 fallbacks.append(ModelSelection(instanceId: instId, model: mdl))
                             }
                         }
                     }
-                }
 
-                Section {
-                    if voiceConfigured {
-                        Picker("Voice", selection: $voice) {
-                            if hasWorkspaceDefaultVoice {
-                                Text("Workspace default").tag("")
-                            } else {
-                                Text("Choose an agent voice").tag("").disabled(true)
-                            }
-                            if !voice.isEmpty, !voices.contains(where: { $0.id == voice }) {
-                                Text("Current agent voice").tag(voice)
-                            }
-                            ForEach(voices) { option in
-                                VStack(alignment: .leading) {
-                                    Text(option.label)
-                                    if let detail = option.description { Text(detail) }
-                                }
-                                .tag(option.id)
-                            }
+                    if toolRoundsVisible {
+                        Section {
+                            TextField(String(Self.defaultToolRounds), text: maxToolRoundsBinding)
+                                .keyboardType(.numberPad)
+                                .multilineTextAlignment(.trailing)
+                                .disabled(!toolRoundsEditable)
+                                .accessibilityLabel("Maximum Tool Rounds")
+                        } header: {
+                            Text("Maximum Tool Rounds")
+                        } footer: {
+                            Text(toolRoundsCaption)
                         }
-                        Toggle("Speak replies", isOn: $speakReplies)
-                            .disabled(!selectedVoiceCanSpeak)
-                        Button("Preview voice", systemImage: "speaker.wave.2") {
-                            Task { await previewVoice() }
-                        }
-                        .disabled(busy || !selectedVoiceCanSpeak)
-
-                        if !hasWorkspaceDefaultVoice, voice.isEmpty {
-                            Label("Pick a voice for this agent before enabling speech.", systemImage: "info.circle")
-                                .font(.footnote)
-                                .foregroundStyle(.secondary)
-                        }
-                    } else {
-                        Label(unavailableVoiceLabel, systemImage: "speaker.slash")
-                            .foregroundStyle(.secondary)
-                    }
-                } header: {
-                    Text("Voice")
-                } footer: {
-                    if !voiceConfigured {
-                        Text(unavailableVoiceGuidance)
-                    } else if !hasWorkspaceDefaultVoice {
-                        Text(missingDefaultVoiceGuidance)
-                    } else {
-                        Text("The voice choice belongs to this agent. Workspace default uses the shared voice selected on your computer.")
                     }
                 }
+
+                automationAndApprovalsSection
+                bypassPermissionsSection
+                computersSection
+                workingDirectorySection
+                skillsSection
+
+                if !Self.voiceSectionFirst { voiceSection }
+
+                Section("Speech to text") {
+                    Label("Apple on-device dictation", systemImage: "waveform")
+                    Text("Recordings you send from this iPhone keep their original audio and transcript on the message. Available languages depend on this device.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                    Text("Cloud fallback and translation are not configured. Siri and iOS 27 speech features still need device testing.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
+                duplicateSection
 
                 if let tasks = current.tasks, !tasks.isEmpty {
                     let totalTurns = tasks.compactMap { $0.usage?.turns }.reduce(0, +)
@@ -343,9 +440,14 @@ struct AgentProfileView: View {
                                         .foregroundStyle(.secondary)
                                 }
                             }
+                            NavigationLink("By Model And Session") {
+                                BotUsageDetailView(botId: current.id)
+                            }
                         }
                     }
                 }
+
+                deleteSection
             }
             .navigationTitle("Agent Settings")
             .navigationBarTitleDisplayMode(.inline)
@@ -366,13 +468,33 @@ struct AgentProfileView: View {
                 }
             }
             .overlay { if busy { ProgressView().controlSize(.large) } }
+            .confirmationDialog("Duplicate Bot?", isPresented: $confirmingDuplicate, titleVisibility: .visible) {
+                Button("Duplicate Bot") { Task { await duplicate() } }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text(BotDuplicate.summary)
+            }
+            .confirmationDialog(
+                "\(current.name) Is Working",
+                isPresented: $powerOffWhileRunning,
+                titleVisibility: .visible
+            ) {
+                Button("Stop It And Power Off", role: .destructive) {
+                    isOff = true
+                    stopRunningTurnOnSave = true
+                }
+                Button("Power Off After This Turn") {
+                    isOff = true
+                    stopRunningTurnOnSave = false
+                }
+                Button("Keep It On", role: .cancel) {}
+            } message: {
+                // Two spaces between sentences, held with a non-breaking space.
+                Text("Turning \(current.name) off stops new work, but the turn running now will keep going.\u{00A0} Stop it now, or let it finish first.")
+            }
             .task {
                 if !session.cachedInstances.isEmpty {
-                    let cached = session.cachedInstances
-                    let usable = cached.filter { inst in
-                        inst.snapshot.isAvailable || inst.id == current.modelSelection.instanceId
-                    }
-                    instances = usable.isEmpty ? cached : usable
+                    instances = profileEngines(from: session.cachedInstances)
                     instancesLoaded = true
                 }
                 async let status = session.configStatus()
@@ -383,35 +505,121 @@ struct AgentProfileView: View {
                 voices = await options
                 let rawInstances = await fetchedInstances
                 if !rawInstances.isEmpty || instances.isEmpty {
-                    let usable = rawInstances.filter { inst in
-                        inst.snapshot.isAvailable || inst.id == current.modelSelection.instanceId
-                    }
-                    // Offering only healthy engines is right, but never at the cost
-                    // of an empty picker: if the computer reports none as available
-                    // the person should still see the list and be able to choose.
-                    instances = usable.isEmpty ? rawInstances : usable
+                    instances = profileEngines(from: rawInstances)
                 }
                 instancesLoaded = true
-                if let loadedConfig, !loadedConfig.canSpeak(agentVoice: voice) {
-                    speakReplies = false
+                // Each device is judged by its own voice.  A Personal Voice
+                // never turns the other device off.
+                if let loadedConfig {
+                    if !voiceCanSpeak(iphoneVoice, with: loadedConfig) { speechDevices.remove("iphone") }
+                    if !macVoiceCanSpeak(with: loadedConfig) { speechDevices.remove("mac") }
                 }
+            }
+            .onChange(of: session.cachedInstances) { _, roster in
+                // A pushed roster (a background probe settled) replaces the
+                // engines this form was opened with.
+                guard !roster.isEmpty else { return }
+                instances = profileEngines(from: roster)
             }
             .onChange(of: photo) { _, item in
                 guard let item else { return }
                 Task { await upload(item) }
             }
+            .modifier(BypassConfirmation(
+                isPresented: $confirmingBypass,
+                botName: current.name,
+                model: modelId,
+                confirm: { bypassPermissions = true }
+            ))
+            .modifier(LocalBypassConfirmation(
+                isPresented: $confirmingLocalBypass,
+                botName: current.name,
+                confirm: { bypassLocalComputer = true }
+            ))
+            .modifier(DeleteChatAlert(target: $deleteTarget, roomTerm: "", onConfirm: { _ in
+                Task { await deleteBot() }
+            }))
+            .modifier(InlineErrorAlert(message: $deleteError, title: "Could Not Delete"))
         }
+    }
+
+    /// Last in the form, away from everything else, behind a confirmation
+    /// that names the bot and what is lost.
+    private var deleteSection: some View {
+        Section {
+            Button("Delete Bot", systemImage: "trash", role: .destructive) {
+                deleteTarget = .bot(current)
+            }
+            .disabled(busy)
+        } footer: {
+            Text("Deleting removes every conversation with this bot for good.\u{00A0} To keep them, archive it instead: long-press it in the chat list.")
+        }
+    }
+
+    /// The chat screen under this sheet closes itself once the bot is gone.
+    private func deleteBot() async {
+        busy = true
+        defer { busy = false }
+        do {
+            try await session.deleteBot(current)
+            dismiss()
+        } catch {
+            if !session.isCancellation(error) {
+                deleteError = error.localizedDescription
+            }
+        }
+    }
+
+    /// Copies the bot as it is saved, not the form: edits not yet saved are
+    /// not part of what gets duplicated.
+    private var duplicateSection: some View {
+        Section {
+            Button("Duplicate Bot", systemImage: "plus.square.on.square") {
+                confirmingDuplicate = true
+            }
+            .disabled(busy)
+        } footer: {
+            Text(BotDuplicate.notCopiedNote)
+        }
+    }
+
+    /// Make the copy, then close this sheet and open it.  If the profile could
+    /// not be copied the session has already said why; the new bot still opens.
+    private func duplicate() async {
+        // Held before the sheet closes: this keeps running after `dismiss()`.
+        let session = self.session
+        busy = true
+        let copy = await session.duplicateBot(current)
+        busy = false
+        guard let copy else { return }
+        dismiss()
+        await session.openChat(botId: copy.id, threadId: copy.threadId)
     }
 
     /// Re-fetch the engine list after a slow or failed load.
     private func reloadInstances() async {
         instancesLoaded = false
-        let raw = await session.instances()
-        let usable = raw.filter { inst in
-            inst.snapshot.isAvailable || inst.id == current.modelSelection.instanceId
-        }
-        instances = usable.isEmpty ? raw : usable
+        instances = profileEngines(from: await session.instances())
         instancesLoaded = true
+    }
+
+    /// The engines this form works from.  Offering only healthy engines is
+    /// right, but never at the cost of an empty picker: if the computer
+    /// reports none as available the person should still see the list and be
+    /// able to choose.  A hidden engine (an integration nobody has set up) is
+    /// left out unless the bot's saved model or one of its fallbacks already
+    /// points at it, so that selection still resolves but nothing new is
+    /// offered it.
+    private func profileEngines(from raw: [Instance]) -> [Instance] {
+        let saved = current.modelSelection
+        let savedIds = Set([saved.instanceId] + (saved.fallbacks ?? []).map(\.instanceId))
+        let listed = raw.listed(keeping: savedIds)
+        // A saved fallback stays like the saved primary: dropping it would leave
+        // its row with a provider no option matches.
+        let usable = listed.filter { inst in
+            inst.snapshot.isAvailable || savedIds.contains(inst.id)
+        }
+        return usable.isEmpty ? listed : usable
     }
 
     @ViewBuilder
@@ -453,13 +661,33 @@ struct AgentProfileView: View {
     }
 
     private func profilePatch() -> BotProfilePatch {
-        let savedSpeakReplies = config.map { $0.canSpeak(agentVoice: voice) && speakReplies } ?? speakReplies
+        let savedDevices = config.map { loaded in
+            speechDevices.filter { device in
+                switch device {
+                case "iphone": return voiceCanSpeak(iphoneVoice, with: loaded)
+                case "mac": return macVoiceCanSpeak(with: loaded)
+                default: return true
+                }
+            }
+        } ?? speechDevices
+        let voiceEdit = BotVoiceEdit.plan(
+            sharedVoice: baseline.sharedVoice,
+            voices: baseline.voices,
+            iphone: iphoneVoice,
+            mac: macVoice
+        )
         let newModelSelection = ModelSelection(
             instanceId: instanceId,
             model: modelId,
             effort: effort,
+            latest: latest,
             fallbacks: fallbacks.isEmpty ? nil : fallbacks
         )
+        let trimmedCwd = cwd.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cwdPatch: BotProfilePatch.CwdString? = {
+            guard cwd != baseline.cwd else { return nil }
+            return trimmedCwd.isEmpty ? .clear : .set(trimmedCwd)
+        }()
         return BotProfilePatch(
             name: name == baseline.name ? nil : name.trimmingCharacters(in: .whitespacesAndNewlines),
             title: title == baseline.title ? nil : title.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -467,19 +695,628 @@ struct AgentProfileView: View {
                 ? nil : description.trimmingCharacters(in: .whitespacesAndNewlines),
             notifications: notifications == baseline.notifications ? nil : notifications,
             avatarCrop: crop == baseline.crop ? nil : crop,
-            voice: voice == baseline.voice ? nil : voice,
-            speakReplies: savedSpeakReplies == baseline.speakReplies ? nil : savedSpeakReplies,
-            modelSelection: newModelSelection == baseline.modelSelection ? nil : newModelSelection
+            voice: voiceEdit.voice,
+            voices: voiceEdit.voices,
+            speechDevices: savedDevices == baseline.speechDevices ? nil : ["mac", "iphone"].filter { savedDevices.contains($0) },
+            modelSelection: newModelSelection == baseline.modelSelection ? nil : newModelSelection,
+            maxToolRounds: maxToolRoundsPatch,
+            autoApprove: autoApprove == baseline.autoApprove ? nil : autoApprove,
+            autoReview: autoReview == baseline.autoReview ? nil : autoReview,
+            approvePeerComms: approvePeerComms == baseline.approvePeerComms ? nil : approvePeerComms,
+            bypassPermissions: bypassPermissions == baseline.bypassPermissions ? nil : bypassPermissions,
+            bypassLocalComputer: bypassLocalComputer == baseline.bypassLocalComputer ? nil : bypassLocalComputer,
+            // The bot as it is now, with only the person's two switches applied,
+            // so This Mac is never part of what this phone asks to change.
+            computers: BotComputers.updated(
+                current: current.computers,
+                baseline: baseline.computers,
+                picks: computers
+            ),
+            cwd: cwdPatch,
+            off: isOff == baseline.isOff ? nil : isOff
         )
+    }
+
+    @ViewBuilder
+    private var primaryModelSection: some View {
+        Section("Primary Model") {
+            Picker("Provider", selection: $instanceId) {
+                ForEach(availableInstances) { instance in
+                    Text(instance.settingsDisplayName).tag(instance.id)
+                }
+            }
+            .pickerStyle(.navigationLink)
+            .onChange(of: instanceId) { _, newInstanceId in
+                if let instance = instances.first(where: { $0.id == newInstanceId }) {
+                    if let curLatest = latest,
+                       let resolved = ModelLineage.resolveClass(curLatest, in: instance) {
+                        modelId = resolved.resolvedId
+                    } else {
+                        latest = nil
+                        if !instance.models.options.contains(where: { $0.id == modelId }) {
+                            modelId = instance.models.default
+                        }
+                    }
+                    if let effort, !instance.effortLevels(for: modelId).contains(effort) {
+                        self.effort = nil
+                    }
+                }
+            }
+
+            if let selectedInstance = instances.first(where: { $0.id == instanceId }) {
+                Picker("Model", selection: Binding(
+                    get: {
+                        if let curLatest = latest, !curLatest.isEmpty {
+                            return "latest:\(curLatest)"
+                        }
+                        return modelId
+                    },
+                    set: { newTag in
+                        if newTag.hasPrefix("latest:") {
+                            let classKey = String(newTag.dropFirst("latest:".count))
+                            latest = classKey
+                            if let resolved = ModelLineage.resolveClass(classKey, in: selectedInstance) {
+                                modelId = resolved.resolvedId
+                            }
+                        } else {
+                            latest = nil
+                            modelId = newTag
+                        }
+                        if let effort, !selectedInstance.effortLevels(for: modelId).contains(effort) {
+                            self.effort = nil
+                        }
+                    }
+                )) {
+                    let latestOpts = ModelLineage.latestOptions(for: selectedInstance)
+                    if !latestOpts.isEmpty {
+                        Section("Latest") {
+                            ForEach(latestOpts) { opt in
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(opt.label)
+                                    Text(opt.resolvedId)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                .tag("latest:\(opt.classKey)")
+                            }
+                        }
+                    }
+                    Section("Models") {
+                        ForEach(selectedInstance.models.options) { option in
+                            Text(option.label).tag(option.id)
+                        }
+                    }
+                }
+                .pickerStyle(.navigationLink)
+
+                effortPicker(selection: $effort, instance: selectedInstance, modelId: modelId)
+            }
+        }
+    }
+
+    /// The execution policy, which the phone owns since the owner's ruling of
+    /// 2026-10-09 (`BotExecutionPolicy` has the history).  The one thing it
+    /// does not offer is turning Auto Mode ON for a bot that holds This Mac:
+    /// the computer would refuse, because that pair's warning is the Mac's.
+    /// Turning Auto Mode off always works, and so does Bypass Permissions.
+    @ViewBuilder
+    private var automationAndApprovalsSection: some View {
+        Section {
+            Toggle("Auto Mode", isOn: $autoApprove)
+                .disabled(!autoApprove && !BotExecutionPolicy.mayTurnOnAuto(computers: current.computers))
+            Picker("Auto Review", selection: $autoReview) {
+                ForEach(autoReviewChoices, id: \.self) { mode in
+                    Text(mode.label).tag(mode)
+                }
+            }
+            .disabled(autoReviewChoices.count < 2)
+            Toggle("Ask Before Contacting Other Bots", isOn: $approvePeerComms)
+                .disabled(!approvePeerComms && !peerCommsSupport.allowsTurningOn)
+        } header: {
+            Text("Automation & Approvals")
+        } footer: {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(BotExecutionPolicy.autoSummary(isOn: autoApprove))
+                Text(BotExecutionPolicy.autoReviewSummary(bypassIsOn: bypassPermissions, support: autoReviewSupport))
+                Text(BotExecutionPolicy.peerCommsSummary(isOn: approvePeerComms, support: peerCommsSupport))
+                Text(BotExecutionPolicy.thisMacNote)
+            }
+        }
+    }
+
+    /// Bypass Permissions has its own section because it is the one switch here
+    /// that drops every approval card, destructive actions included.  Turning
+    /// it on goes through `confirmingBypass`; turning it off does not ask.
+    @ViewBuilder
+    private var bypassPermissionsSection: some View {
+        Section {
+            Toggle("Bypass Permissions", isOn: bypassBinding)
+            switch localBypassControl {
+            case .toggle:
+                Toggle("Bypass Including This Mac", isOn: localBypassBinding)
+            case .macOnly:
+                LabeledContent("Bypass Including This Mac", value: "Off")
+            case .needsBypass:
+                Label(BotExecutionPolicy.localBypassNeedsBypass, systemImage: "lock")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+        } header: {
+            Text("Bypass Permissions")
+        } footer: {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(BotExecutionPolicy.bypassSummary(isOn: bypassPermissions))
+                if localBypassControl == .toggle {
+                    Text(BotExecutionPolicy.localBypassSummary(isOn: bypassLocalComputer))
+                }
+                if !BotExecutionPolicy.mayTurnOnLocalBypass(computers: current.computers) {
+                    Text(BotExecutionPolicy.localBypassMacOnlyNote)
+                }
+                if let note = BypassCoverage(engine: policyEngine).note {
+                    Text(note)
+                }
+            }
+        }
+    }
+
+    /// Whether the second switch is a control, a read-only Off, or a note
+    /// that Bypass itself is off.  The computer refuses to turn it on for a
+    /// bot that can use This Mac, so that case is never a switch.
+    private var localBypassControl: BotExecutionPolicy.LocalBypassControl {
+        BotExecutionPolicy.localBypassControl(
+            computers: current.computers,
+            bypassOn: bypassPermissions,
+            localBypassOn: bypassLocalComputer
+        )
+    }
+
+    /// Switching on asks first.  Turning it off does not, and does not require
+    /// Bypass to still be on: an on switch has to be able to come back off.
+    private var localBypassBinding: Binding<Bool> {
+        Binding(
+            get: { bypassLocalComputer },
+            set: { wantsOn in
+                if wantsOn {
+                    guard bypassPermissions, BotExecutionPolicy.mayTurnOnLocalBypass(computers: current.computers) else { return }
+                    confirmingLocalBypass = true
+                } else {
+                    bypassLocalComputer = false
+                }
+            }
+        )
+    }
+
+    /// Switching on asks first; the toggle stays where it was until the person
+    /// confirms, because `get` reads the unconfirmed state.
+    private var bypassBinding: Binding<Bool> {
+        Binding(
+            get: { bypassPermissions },
+            set: { wantsOn in
+                if wantsOn {
+                    confirmingBypass = true
+                } else {
+                    bypassPermissions = false
+                }
+            }
+        )
+    }
+
+    /// The engine the form is set to, which is what the next turn runs on.
+    private var policyEngine: Instance? {
+        instances.first(where: { $0.id == instanceId })
+    }
+
+    private var autoReviewSupport: EngineSupport { BotExecutionPolicy.autoReviewSupport(policyEngine) }
+    private var peerCommsSupport: EngineSupport { BotExecutionPolicy.peerCommsSupport(policyEngine) }
+
+    /// Off, what is set now, and the others only on an engine that can review,
+    /// the way the desktop disables them.
+    private var autoReviewChoices: [AutoReviewMode] {
+        AutoReviewMode.allCases.filter { mode in
+            mode == .off || mode == autoReview || autoReviewSupport.allowsTurningOn
+        }
+    }
+
+    @ViewBuilder
+    private var computersSection: some View {
+        Section {
+            if current.computers == nil && computers == baseline.computers {
+                // No list stored: the computer picks for this bot.  Showing
+                // that as "(no computer)" would say the opposite.
+                LabeledContent("Assigned computers", value: "Automatic")
+            } else if computers.isEmpty && !BotComputers.holdsThisMac(current.computers) {
+                HStack {
+                    Text("Assigned computers")
+                    Spacer()
+                    Text("(no computer)")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Toggle("Self-hosted VPS / Box", isOn: Binding(
+                get: { computers.contains("cloud") },
+                set: { if $0 { computers.insert("cloud") } else { computers.remove("cloud") } }
+            ))
+            Toggle("Local VM", isOn: Binding(
+                get: { computers.contains("vm") },
+                set: { if $0 { computers.insert("vm") } else { computers.remove("vm") } }
+            ))
+            // Read-only: This Mac is the person's real desktop, so the
+            // computer, not the phone, turns it on or off.  The state shown is
+            // the computer's, live.
+            // An Auto bot has no list: on a Mac the computer may still hand it
+            // this desktop, so "Off" would overstate what is known.
+            LabeledContent(
+                "This Mac",
+                value: current.computers == nil
+                    ? "Automatic"
+                    : (BotComputers.holdsThisMac(current.computers) ? "On" : "Off")
+            )
+        } header: {
+            Text("Computers")
+        } footer: {
+            Text("Controls which execution environments this bot can mount for shell commands, browser tools, and desktop control.\u{00A0} Change On Mac:\u{00A0} This Mac is your real desktop, so it is turned on or off in BotFleet on your computer.")
+        }
+    }
+
+    @ViewBuilder
+    private var workingDirectorySection: some View {
+        Section {
+            TextField("Folder path on host (optional)", text: $cwd)
+                .autocorrectionDisabled()
+                .textInputAutocapitalization(.never)
+        } header: {
+            Text("Working Directory")
+        } footer: {
+            Text("Default repository or workspace folder path on the paired Mac.\u{00A0} From this iPhone, choose a folder that a bot or room on your computer already uses.\u{00A0} Any other folder is chosen in BotFleet on your computer.")
+        }
+    }
+
+    /// The bot's imported Agent Skills: read each one, then turn it on or off.
+    /// Those switches act at once and are not part of this form's Save, the
+    /// same as on the Mac.
+    @ViewBuilder
+    private var skillsSection: some View {
+        Section {
+            NavigationLink {
+                BotSkillsView(bot: current)
+            } label: {
+                Label(SkillsDisplay.title, systemImage: "book.closed")
+            }
+        } footer: {
+            Text("Reference material this bot reads when a task matches.\u{00A0} Read a skill, then turn it on or off.")
+        }
+    }
+
+    @ViewBuilder
+    private var voiceSection: some View {
+        Section {
+            if hasAvailableVoices {
+                Picker("Voice on This iPhone", selection: $iphoneVoice) {
+                    iphoneVoiceOptions
+                }
+                if iphoneVoiceMissing {
+                    Label("That Personal Voice is not on this iPhone.\u{00A0} Choose a voice for this iPhone.", systemImage: "exclamationmark.triangle")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                if personalVoice.authorizationStatus == .notDetermined {
+                    Button {
+                        Task {
+                            _ = await personalVoice.requestAuthorization()
+                        }
+                    } label: {
+                        Label("Use Apple Personal Voice…", systemImage: "person.wave.2")
+                    }
+                }
+                if personalVoice.authorizationStatus == .denied || personalVoice.authorizationStatus == .unsupported {
+                    Text("Personal Voice access is disabled.\u{00A0} You can allow BotFleet in iOS Settings > Accessibility > Personal Voice.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                Button("Preview iPhone Voice", systemImage: "speaker.wave.2") {
+                    Task { await previewVoice() }
+                }
+                .disabled(busy || !iphoneVoiceCanSpeak)
+                Picker("Voice on Mac", selection: $macVoice) {
+                    macVoiceOptions
+                }
+                if macVoiceIsPersonal {
+                    Text(macPersonalVoiceReason)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                speechDeviceToggle(
+                    device: "mac",
+                    title: "Play on Mac",
+                    row: CrossPlatformProfileSettings.speechDeviceRow(
+                        device: "mac",
+                        voice: macVoice,
+                        speechDevices: speechDevices,
+                        agentVoiceCanSpeakOnClient: macVoiceCanSpeak,
+                        personalVoicePlaybackAllowed: true
+                    )
+                )
+                speechDeviceToggle(
+                    device: "iphone",
+                    title: "Play on iPhone (while app is open)",
+                    row: CrossPlatformProfileSettings.speechDeviceRow(
+                        device: "iphone",
+                        voice: iphoneVoice,
+                        speechDevices: speechDevices,
+                        agentVoiceCanSpeakOnClient: iphoneVoiceCanSpeak,
+                        personalVoicePlaybackAllowed: true
+                    )
+                )
+
+                if !hasWorkspaceDefaultVoice, iphoneVoice.isEmpty || macVoice.isEmpty {
+                    Label("Pick a voice for each device before turning on speech.", systemImage: "info.circle")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                Label(unavailableVoiceLabel, systemImage: "speaker.slash")
+                    .foregroundStyle(.secondary)
+                if personalVoice.authorizationStatus == .notDetermined {
+                    Button {
+                        Task {
+                            _ = await personalVoice.requestAuthorization()
+                        }
+                    } label: {
+                        Label("Use Apple Personal Voice…", systemImage: "person.wave.2")
+                    }
+                }
+            }
+        } header: {
+            Text("Voice")
+        } footer: {
+            if !voiceConfigured && !iphoneVoiceIsPersonal && !macVoiceIsPersonal {
+                Text(unavailableVoiceGuidance)
+            } else if !hasWorkspaceDefaultVoice {
+                Text(missingDefaultVoiceGuidance)
+            } else {
+                Text("Each device speaks with its own voice.\u{00A0} A Personal Voice stays on the device that made it and speaks there, with no audio sent over the network.\u{00A0} MiniMax voices work on both.\u{00A0} \(defaultVoiceName) is the workspace default voice; change it in Settings.")
+            }
+        }
+    }
+
+    /// The workspace default voice by name ("Jay Wedgeworth 001").
+    private var defaultVoiceName: String {
+        BotVoice.displayName(config?.workspaceDefaultVoice ?? "", voices: voices)
+    }
+
+    @ViewBuilder
+    private func speechDeviceToggle(
+        device: String,
+        title: String,
+        row: CrossPlatformProfileSettings.SpeechDeviceRow
+    ) -> some View {
+        let displaySelected = row.editable ? row.selected : false
+        Toggle(title, isOn: Binding(
+            get: { displaySelected },
+            set: { enabled in
+                guard row.editable else { return }
+                if enabled { speechDevices.insert(device) } else { speechDevices.remove(device) }
+            }
+        ))
+        .disabled(!row.editable)
+        if let reason = row.disabledReason {
+            Text(reason)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    /// Every picker's first option names the workspace default voice,
+    /// "Jay Wedgeworth 001 (default)", never a bare "(default)".
+    @ViewBuilder
+    private var defaultVoiceOption: some View {
+        if hasWorkspaceDefaultVoice {
+            Text(BotVoice.defaultOptionLabel(config?.workspaceDefaultVoice, voices: voices)).tag("")
+        } else {
+            Text(BotVoice.noDefaultVoice).tag("").disabled(true)
+        }
+    }
+
+    /// This iPhone's Personal Voices and the computer's hosted voices.
+    @ViewBuilder
+    private var iphoneVoiceOptions: some View {
+        defaultVoiceOption
+        if !iphoneVoice.isEmpty,
+           !hostedVoices.contains(where: { $0.id == iphoneVoice }),
+           !personalVoice.personalVoiceOptions.contains(where: { $0.id == iphoneVoice }) {
+            if iphoneVoiceIsPersonal {
+                // Another device's Personal Voice: shown so the current value
+                // reads, but greyed, because it cannot be chosen here.
+                Text(personalVoice.authorizationStatus == .authorized ? "Personal Voice from another device" : "Personal Voice")
+                    .tag(iphoneVoice)
+                    .disabled(true)
+            } else {
+                Text("Current voice").tag(iphoneVoice)
+            }
+        }
+        if !personalVoice.personalVoiceOptions.isEmpty {
+            Section("Apple Personal Voice") {
+                ForEach(personalVoice.personalVoiceOptions) { pv in
+                    Text(pv.label).tag(pv.id)
+                }
+            }
+        }
+        if !hostedVoices.isEmpty {
+            Section(personalVoice.personalVoiceOptions.isEmpty ? "Voices" : "Server & System Voices") {
+                ForEach(hostedVoices) { option in
+                    Text(option.label).tag(option.id)
+                }
+            }
+        }
+    }
+
+    /// Hosted voices only: a Personal Voice is chosen on the device that
+    /// has it, so the Mac's own is shown greyed and this iPhone's are never
+    /// offered for the Mac.
+    @ViewBuilder
+    private var macVoiceOptions: some View {
+        defaultVoiceOption
+        if macVoiceIsPersonal {
+            Text(personalVoice.hasVoice(macVoice) ? "This iPhone's Personal Voice" : "Personal Voice on Mac")
+                .tag(macVoice)
+                .disabled(true)
+        } else if !macVoice.isEmpty, !hostedVoices.contains(where: { $0.id == macVoice }) {
+            Text("Current voice").tag(macVoice)
+        }
+        ForEach(hostedVoices) { option in
+            Text(option.label).tag(option.id)
+        }
+    }
+
+    private var macPersonalVoiceReason: String {
+        if personalVoice.hasVoice(macVoice) {
+            return "This iPhone's Personal Voice cannot speak on the Mac.\u{00A0} Choose a voice for the Mac here, or a Mac Personal Voice on the Mac."
+        }
+        return "Personal Voice from your Mac.\u{00A0} Choose it on the Mac."
+    }
+
+    /// Shared with `shared/model-limits.ts` `MAX_MODEL_FALLBACKS`.  Only the Add
+    /// control is gated on it: every fallback a bot already stores is listed
+    /// and can be removed, however many that is, so a chain written through the
+    /// API before the cap existed is never hidden from its owner.
+    private static let maximumFallbacks = 3
+
+    /// Shared with `shared/bot-profile.ts` `MAX_TOOL_ROUNDS`.
+    private static let maximumToolRoundsCap = 200
+
+    /// Shared with `shared/bot-profile.ts` `DEFAULT_MAX_TOOL_ROUNDS`.  This is
+    /// the number the harness actually stops an unset turn at, and the number
+    /// the turn's own prompt names — the two used to disagree (12 versus 40),
+    /// so a bot was told it had 40 rounds and was cut off at 12.
+    private static let defaultToolRounds = 40
+
+    /// True when this engine runs the harness HTTP tool loop, and so applies
+    /// `maxToolRounds`.  An engine the companion has not heard of is NOT
+    /// treated as "cannot": we do not know yet.
+    private var toolRoundsEngine: Instance? {
+        instances.first(where: { $0.id == instanceId })
+    }
+
+    private var toolRoundsEditable: Bool {
+        toolRoundsEngine?.capabilities?.toolLoop == true
+    }
+
+    /// A saved ceiling stays visible even on an engine that ignores it, so it
+    /// can be read and cleared instead of being stranded on the record.  See
+    /// `src/lib/bot-settings-gates.ts` for the same rule on the desktop.
+    private var toolRoundsVisible: Bool {
+        toolRoundsEditable || !maxToolRoundsText.isEmpty
+    }
+
+    private var toolRoundsCaption: String {
+        let base = "Per turn.  Empty uses \(Self.defaultToolRounds).  Cap is \(Self.maximumToolRoundsCap)."
+        guard !toolRoundsEditable else { return base }
+        // "Does not apply" and "we do not know yet" are different claims, and on
+        // a cold start this view renders before the engine list arrives.  Saying
+        // the ceiling is inapplicable then reads as permanent, when the very
+        // next load may make it editable.  Mirrors toolRoundsGate()'s
+        // engine-presence check on the desktop.
+        if toolRoundsEngine == nil {
+            return base + "  This engine has not reported its capabilities yet, so this ceiling may not apply to it."
+        }
+        return base + "  This engine runs its own tool loop, so this ceiling does not apply to it."
+    }
+
+    private static func roundsText(_ rounds: Int?) -> String {
+        guard let rounds else { return "" }
+        return String(rounds)
+    }
+
+    /// Digits only, 1...200. Empty clears. Anything else is ignored.
+    private var maxToolRoundsBinding: Binding<String> {
+        Binding(
+            get: { maxToolRoundsText },
+            set: { raw in
+                let digits = raw.filter(\.isNumber)
+                if digits.isEmpty {
+                    if raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        maxToolRoundsText = ""
+                    }
+                    return
+                }
+                guard let value = Int(digits), value >= 1, value <= Self.maximumToolRoundsCap else { return }
+                maxToolRoundsText = String(value)
+            }
+        )
+    }
+
+    private var maxToolRoundsPatch: BotProfilePatch.MaxToolRounds? {
+        guard maxToolRoundsText != baseline.maxToolRoundsText else { return nil }
+        if maxToolRoundsText.isEmpty { return .clear }
+        guard let rounds = Int(maxToolRoundsText), (1...Self.maximumToolRoundsCap).contains(rounds) else { return nil }
+        return .set(rounds)
     }
 
     private func save() async -> Bool {
         busy = true
         defer { busy = false }
-        return await ProfileSaveGate.run(
-            save: { await session.updateProfile(profilePatch(), for: current) },
-            accept: synchronizeForm(with:)
+        let saved = await ProfileSaveGate.run(
+            save: {
+                await session.updateProfile(
+                    profilePatch(),
+                    for: current,
+                    withoutDeviceVoices: profilePatchWithoutDeviceVoices()
+                )
+            },
+            accept: synchronizeForm(with:),
+            rejected: revertRefusableFields
         )
+        // Stopping is a second act, after the switch has saved: the Off flag
+        // is what keeps the bot from starting anything new in the gap, and an
+        // interrupt still works on a bot that is already Off because it acts
+        // on the turn in flight rather than on the bot being on.  A save the
+        // computer refused has switched nothing off, so nothing is stopped.
+        if saved, stopRunningTurnOnSave {
+            stopRunningTurnOnSave = false
+            await session.interrupt(bot: current)
+        }
+        return saved
+    }
+
+    /// A refused save puts the fields the computer can say no to back to what
+    /// it holds, so the sheet stops showing a switch or folder as saved after
+    /// the banner says it was not.  The computer's own sentence is the banner
+    /// (`Session.updateProfile` records it).  A name, a voice or a model stays
+    /// as typed for the retry.  Auto Mode is on the list because the computer
+    /// declines it for a bot that can use This Mac; the other three are only
+    /// here because a refused save refuses them all.
+    private func revertRefusableFields() {
+        let held = current
+        computers = Set(held.computers ?? [])
+        baseline.computers = computers
+        cwd = held.cwd ?? ""
+        baseline.cwd = cwd
+        autoApprove = held.autoApprove ?? false
+        baseline.autoApprove = autoApprove
+        autoReview = AutoReviewMode(stored: held.autoReview)
+        baseline.autoReview = autoReview
+        approvePeerComms = held.approvePeerComms ?? false
+        baseline.approvePeerComms = approvePeerComms
+        bypassPermissions = held.bypassPermissions ?? false
+        baseline.bypassPermissions = bypassPermissions
+        bypassLocalComputer = held.bypassLocalComputer ?? false
+        baseline.bypassLocalComputer = bypassLocalComputer
+    }
+
+    /// The same save for a computer that predates per-device voices and so
+    /// keeps one voice per bot.  Nil when the save sends no `voices`.
+    private func profilePatchWithoutDeviceVoices() -> BotProfilePatch? {
+        var patch = profilePatch()
+        guard patch.voices != nil else { return nil }
+        patch.voices = nil
+        patch.voice = BotVoiceEdit.sharedVoiceFallback(
+            sharedVoice: baseline.sharedVoice,
+            voices: baseline.voices,
+            iphone: iphoneVoice,
+            mac: macVoice
+        )
+        return patch
     }
 
     private func clearImage() async {
@@ -517,7 +1354,7 @@ struct AgentProfileView: View {
             uploadData = jpeg
             uploadMIME = "image/jpeg"
         }
-        let intendedCrop = crop == .mascot ? AvatarCrop.circle : crop
+        let intendedCrop = crop == .mascot || crop == .tvface ? AvatarCrop.circle : crop
         if let updated = await session.uploadAvatar(uploadData, mime: uploadMIME, for: current, crop: intendedCrop) {
             crop = updated.avatarCrop ?? intendedCrop
             baseline.crop = crop
@@ -527,7 +1364,7 @@ struct AgentProfileView: View {
     private func generateImage() async {
         busy = true
         defer { busy = false }
-        let intendedCrop = crop == .mascot ? AvatarCrop.circle : crop
+        let intendedCrop = crop == .mascot || crop == .tvface ? AvatarCrop.circle : crop
         guard let generated = await session.generateAvatar(
             prompt: String(prompt.trimmingCharacters(in: .whitespacesAndNewlines).prefix(400)),
             for: current
@@ -542,14 +1379,24 @@ struct AgentProfileView: View {
         }
     }
 
+    /// Previews the voice this iPhone speaks with.
     private func previewVoice() async {
-        guard selectedVoiceCanSpeak else {
-            session.actionError = "Pick an agent voice or configure a workspace default on your computer first."
+        guard iphoneVoiceCanSpeak else {
+            session.actionError = "Pick a voice for this iPhone, or set a workspace default voice on your computer first."
             return
         }
         busy = true
         defer { busy = false }
-        guard let data = await session.previewVoice(voice, for: current) else { return }
+        if iphoneVoiceIsPersonal {
+            let sampleText = "Hello! This is a preview of your Personal Voice with BotFleet."
+            do {
+                try await PersonalVoiceService.shared.speak(text: sampleText, voiceId: iphoneVoice)
+            } catch {
+                session.actionError = error.localizedDescription
+            }
+            return
+        }
+        guard let data = await session.previewVoice(iphoneVoice, for: current) else { return }
         do {
             let audioSession = AVAudioSession.sharedInstance()
             try audioSession.setCategory(.playback, mode: .spokenAudio)
@@ -572,17 +1419,26 @@ struct AgentProfileView: View {
 
     private var availableInstances: [Instance] {
         instances.filter { inst in
-            (inst.snapshot.state == "available" || inst.id == instanceId) &&
-            inst.snapshot.reason != "Disabled in settings" &&
-            (inst.id != "kimi" || (inst.snapshot.state == "available" && inst.snapshot.authenticated != false))
+            // DeepSeek is Harness only: filter out standalone/legacy direct deepseek driver
+            if inst.driverKind == "deepseek" || inst.driverKind == "deepseekAgent" || (inst.id == "deepseek" && inst.driverKind != "dshAgent") {
+                return inst.id == instanceId
+            }
+            return inst.isListed(keeping: [instanceId]) &&
+                (inst.snapshot.state == "available" || inst.id == instanceId) &&
+                inst.snapshot.reason != "Disabled in settings" &&
+                (inst.id != "kimi" || (inst.snapshot.state == "available" && inst.snapshot.authenticated != false))
         }
     }
 
     private func fallbackAvailableInstances(for currentFallbackInstanceId: String) -> [Instance] {
         instances.filter { inst in
-            (inst.snapshot.state == "available" || inst.id == currentFallbackInstanceId) &&
-            inst.snapshot.reason != "Disabled in settings" &&
-            (inst.id != "kimi" || (inst.snapshot.state == "available" && inst.snapshot.authenticated != false))
+            if inst.driverKind == "deepseek" || inst.driverKind == "deepseekAgent" || (inst.id == "deepseek" && inst.driverKind != "dshAgent") {
+                return inst.id == currentFallbackInstanceId
+            }
+            return inst.isListed(keeping: [currentFallbackInstanceId]) &&
+                (inst.snapshot.state == "available" || inst.id == currentFallbackInstanceId) &&
+                inst.snapshot.reason != "Disabled in settings" &&
+                (inst.id != "kimi" || (inst.snapshot.state == "available" && inst.snapshot.authenticated != false))
         }
     }
 
@@ -592,13 +1448,65 @@ struct AgentProfileView: View {
         description = bot.description
         notifications = bot.notifications
         crop = bot.avatarCrop ?? .mascot
-        voice = bot.voice ?? ""
-        speakReplies = bot.speakReplies == true
+        iphoneVoice = bot.voice(for: .iphone) ?? ""
+        macVoice = bot.voice(for: .mac) ?? ""
+        speechDevices = Set(bot.speechDevices ?? (bot.speakReplies == true ? ["mac"] : []))
         instanceId = bot.modelSelection.instanceId
         modelId = bot.modelSelection.model
         effort = bot.modelSelection.effort
         fallbacks = bot.modelSelection.fallbacks ?? []
+        maxToolRoundsText = Self.roundsText(bot.maxToolRounds)
+        isOff = bot.isOff
+        computers = Set(bot.computers ?? [])
+        cwd = bot.cwd ?? ""
+        autoApprove = bot.autoApprove ?? false
+        autoReview = AutoReviewMode(stored: bot.autoReview)
+        approvePeerComms = bot.approvePeerComms ?? false
+        bypassPermissions = bot.bypassPermissions ?? false
+        bypassLocalComputer = bot.bypassLocalComputer ?? false
         baseline = ProfileFormSnapshot(bot: bot)
+    }
+}
+
+/// The question before Bypass Permissions goes on.  A separate modifier so the
+/// sheet's already long body does not carry the alert's closures too.
+private struct BypassConfirmation: ViewModifier {
+    @Binding var isPresented: Bool
+    let botName: String
+    let model: String
+    let confirm: () -> Void
+
+    private var confirmTitle: String {
+        BypassModelRisk.isHighRisk(model: model)
+            ? BotExecutionPolicy.bypassRiskyConfirmButton
+            : BotExecutionPolicy.bypassConfirmButton
+    }
+
+    func body(content: Content) -> some View {
+        content.alert(BotExecutionPolicy.bypassTitle, isPresented: $isPresented) {
+            Button("Cancel", role: .cancel) {}
+            Button(confirmTitle, role: .destructive, action: confirm)
+        } message: {
+            Text(BotExecutionPolicy.bypassWarning(botName: botName, model: model))
+        }
+    }
+}
+
+/// The second switch is the same kind of decision as the first, one step
+/// further: it gives up the asking for the person's real machine.  It asks
+/// before it takes effect, and turning it back off does not.
+private struct LocalBypassConfirmation: ViewModifier {
+    @Binding var isPresented: Bool
+    let botName: String
+    let confirm: () -> Void
+
+    func body(content: Content) -> some View {
+        content.alert(BotExecutionPolicy.localBypassTitle, isPresented: $isPresented) {
+            Button("Cancel", role: .cancel) {}
+            Button(BotExecutionPolicy.localBypassConfirmButton, role: .destructive, action: confirm)
+        } message: {
+            Text(BotExecutionPolicy.localBypassWarning(botName: botName))
+        }
     }
 }
 
@@ -608,9 +1516,20 @@ private struct ProfileFormSnapshot {
     var description: String
     var notifications: Bool
     var crop: AvatarCrop
-    var voice: String
-    var speakReplies: Bool
+    /// The stored shape, which a save plans its voice changes against.
+    var sharedVoice: String?
+    var voices: BotVoices?
+    var speechDevices: Set<String>
     var modelSelection: ModelSelection
+    var maxToolRoundsText: String
+    var isOff: Bool
+    var computers: Set<String>
+    var cwd: String
+    var autoApprove: Bool
+    var autoReview: AutoReviewMode
+    var approvePeerComms: Bool
+    var bypassPermissions: Bool
+    var bypassLocalComputer: Bool
 
     init(bot: Bot) {
         name = bot.name
@@ -618,9 +1537,19 @@ private struct ProfileFormSnapshot {
         description = bot.description
         notifications = bot.notifications
         crop = bot.avatarCrop ?? .mascot
-        voice = bot.voice ?? ""
-        speakReplies = bot.speakReplies == true
+        sharedVoice = bot.voice
+        voices = bot.voices
+        speechDevices = Set(bot.speechDevices ?? (bot.speakReplies == true ? ["mac"] : []))
         modelSelection = bot.modelSelection
+        maxToolRoundsText = bot.maxToolRounds.map(String.init) ?? ""
+        isOff = bot.isOff
+        computers = Set(bot.computers ?? [])
+        cwd = bot.cwd ?? ""
+        autoApprove = bot.autoApprove ?? false
+        autoReview = AutoReviewMode(stored: bot.autoReview)
+        approvePeerComms = bot.approvePeerComms ?? false
+        bypassPermissions = bot.bypassPermissions ?? false
+        bypassLocalComputer = bot.bypassLocalComputer ?? false
     }
 }
 
@@ -628,6 +1557,7 @@ private extension AvatarCrop {
     var label: String {
         switch self {
         case .mascot: "Mascot"
+        case .tvface: "TV Face"
         case .circle: "Circle"
         case .rounded: "Rounded"
         case .square: "Square"

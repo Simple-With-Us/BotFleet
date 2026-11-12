@@ -10,7 +10,7 @@
 //
 // Gated by the caller on the BOTFLEET_TEST_CHILD marker (see
 // server/testing/cleanup.ts's spawnDetached): the always-on launchd harness
-// (com.jay.botfleet-server) never sets it, so this module changes nothing
+// (app.botfleet.server) never sets it, so this module changes nothing
 // about production behavior, where the parent legitimately is launchd for
 // the whole life of the process.
 

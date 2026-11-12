@@ -5,6 +5,7 @@
 // generateText (bot titles, thread names) — upstream's TextGeneration slot.
 import type {
   DriverCreateInput,
+  ModelCatalog,
   ProviderDriver,
   ProviderInstance,
   ProviderSnapshot,
@@ -13,8 +14,15 @@ import type {
   SendTurnInput,
 } from "../contracts.ts";
 import { newEventId, newId } from "../contracts.ts";
+import type { ReviewPrompt } from "../../shared/auto-review.ts";
 import { appendNative } from "./native.ts";
+import { splitChatPrompt } from "./prompt-split.ts";
 import { toolFields } from "../tool-fields.ts";
+import {
+  createModelDiscoveryProbe,
+  discoverModelCatalog,
+  fetchProviderModels,
+} from "./model-discovery.ts";
 
 import { runTurnLoop, type TurnLoopDeps, type TurnUsage } from "./chat-completions/loop.ts";
 import { toTurnUsage } from "./chat-completions/usage.ts";
@@ -26,15 +34,35 @@ const DEFAULT_URL = "https://api.x.ai/v1";
 
 // This is the xAI API catalog, which is separate from Grok Build's
 // subscription CLI catalog in acp/grok.ts. The Build-only fast variant is
-// intentionally absent here.
+// intentionally absent here, and so is Composer 2.5 (Cursor's model, served
+// through the Grok Build CLI, not the xAI API).  grok-build-0.1 is a public
+// xAI API model id (beta since 2026-05-29, https://x.ai/news/grok-build-0-1).
+// Live discovery below keeps this row's label and drops duplicates.  There is
+// no per-model rate table in the repo (the what-if projection prices a whole
+// engine from src/lib/engine-capabilities.tsx), so no rate is recorded here.
+// Every chat-completions model on api.x.ai takes `max_completion_tokens`
+// (endpoint-level per https://docs.x.ai/docs/api-reference#chat-completions:
+// "an upper bound for the number of tokens that can be generated for a
+// completion, only applies to visible output tokens"; `max_tokens` is
+// deprecated there), so the whole catalog carries supportsMaxOutput.
+// Context windows are per xAI's model table (https://docs.x.ai/docs/models,
+// fetched 2026-10-21): the server gate and the picker both bound the bot's
+// output limit against contextWindow, so a row with the flag and no window
+// would let an arbitrary limit reach xAI and fail the whole turn.
 const MODELS = {
   default: "grok-4.7",
   options: [
-    { id: "grok-4.7", label: "Grok 4.7" },
-    { id: "grok-4.6", label: "Grok 4.6" },
-    { id: "grok-4.5", label: "Grok 4.5" },
+    { id: "grok-4.7", label: "Grok 4.7", contextWindow: 500_000, supportsMaxOutput: true },
+    { id: "grok-build-0.1", label: "Grok Build 0.1", contextWindow: 256_000, supportsMaxOutput: true },
+    { id: "grok-4.6", label: "Grok 4.6", contextWindow: 500_000, supportsMaxOutput: true },
+    { id: "grok-4.5", label: "Grok 4.5", contextWindow: 500_000, supportsMaxOutput: true },
   ],
 };
+
+/** How long one `GET /models` answer is reused.  Matches the MiniMax driver's
+ *  60 s: short enough that a newly shipped model shows up in a picker refresh,
+ *  long enough that a burst of describes costs one round trip. */
+const MODEL_DISCOVERY_TTL_MS = 60_000;
 
 export interface GrokConfig {
   url: string;
@@ -56,7 +84,16 @@ export const GrokDriver: ProviderDriver<GrokConfig> = {
   // billed to the user's own XAI_API_KEY — the same shape as openai-compat.
   // Omitting access defaulted to "subscription" and put a BYOK engine above
   // the picker's Custom divider alongside Claude and Codex.
-  metadata: { displayName: "Grok (API)", supportsMultipleInstances: true, access: "custom" },
+  metadata: {
+    displayName: "Grok (API)",
+    supportsMultipleInstances: true,
+    access: "custom",
+    // The direct HTTP driver.  No Composio bridge, no screen channel, no
+    // image input — the image row on the `grok` matrix row is carried by the
+    // Grok Build ACP driver, not by this one, which is why the matrix check
+    // aggregates across every driver that maps to an engine id.
+    channelWiring: { agentsMcp: true, computerMcp: false, composioMcp: false, localComputerMcp: true, images: false },
+  },
   models: MODELS,
   decodeConfig,
   defaultConfig: () => decodeConfig({}),
@@ -81,20 +118,30 @@ export const GrokDriver: ProviderDriver<GrokConfig> = {
     const complete = async (
       messages: any[],
       model: string,
-      opts: { stream: boolean; tools?: any[]; signal?: AbortSignal; onUsage?: (usage: TurnUsage) => void; onDelta?: (d: string, streamKind?: string) => void; onToolCallDelta?: (index: number, id?: string, name?: string, args?: string) => void },
+      opts: { stream: boolean; tools?: any[]; signal?: AbortSignal; onChunk?: () => void; onUsage?: (usage: TurnUsage) => void; onDelta?: (d: string, streamKind?: string) => void; onToolCallDelta?: (index: number, id?: string, name?: string, args?: string) => void; maxOutputTokens?: number },
     ): Promise<{ text: string; tool_calls?: any[]; usage: TurnUsage | null }> => {
       const res = await fetch(`${config.url}/chat/completions`, {
         method: "POST",
         headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
-        body: JSON.stringify({ model, messages, stream: opts.stream, ...(opts.stream ? { stream_options: { include_usage: true } } : {}), ...(opts.tools && opts.tools.length > 0 ? { tools: opts.tools } : {}) }),
-        signal: opts.signal
-          ? AbortSignal.any([opts.signal, AbortSignal.timeout(120_000)])
-          : AbortSignal.timeout(120_000),
+        // max_completion_tokens, never the deprecated max_tokens (xAI docs,
+        // same reference as the catalog note above).  Undefined drops the key.
+        body: JSON.stringify({ model, messages, stream: opts.stream, ...(opts.stream ? { stream_options: { include_usage: true } } : {}), ...(opts.tools && opts.tools.length > 0 ? { tools: opts.tools } : {}), max_completion_tokens: opts.maxOutputTokens }),
+        // The turn loop's signal already carries this round's deadlines
+        // (a hard ceiling plus an idle clock fed by `onChunk`).  A second
+        // timer here used to race them: a fixed 120s under the loop's own
+        // round ceiling cut a slow-but-live reasoning round off, and
+        // because the loop could not see which clock fired it was retried
+        // and then failed as a provider_error, which paged.  Only a caller
+        // with no signal (generateText) needs a ceiling of its own — the
+        // same pattern minimax.ts and openai-compat.ts use.
+        signal: opts.signal ?? AbortSignal.timeout(180_000),
       });
       if (!res.ok) {
         const body = await res.text().catch(() => "");
         throw httpErrorFor(res.status, body ? body.slice(0, 200) : "");
       }
+      // headers are progress too: the socket answered
+      opts.onChunk?.();
       if (!opts.stream) {
         const json: any = await res.json();
         return {
@@ -165,6 +212,10 @@ export const GrokDriver: ProviderDriver<GrokConfig> = {
             if (buf.trim()) takeSseLine(buf.trim());
             break;
           }
+          // Any bytes at all keep the round's idle clock alive — a
+          // reasoning model can stream keep-alives or frames this reader
+          // never turns into a delta for a long time before it answers.
+          opts.onChunk?.();
           buf += decoder.decode(value, { stream: true });
           let nl;
           while ((nl = buf.indexOf("\n")) !== -1) {
@@ -199,8 +250,13 @@ export const GrokDriver: ProviderDriver<GrokConfig> = {
       const retryScale = Number(process.env.FAKE_GROK_RETRY_SCALE ?? "1");
       active.set(threadId, { abort, turnId });
 
+      // Only the stable half of the prompt heads the request; the volatile
+      // half rides the newest user message, every request, so the resent
+      // prefix stays byte-identical across a memory write (see
+      // prompt-split.ts splitChatPrompt).
+      const chat = splitChatPrompt(turn);
       const messages: any[] = [
-        ...(turn.system ? [{ role: "system", content: turn.system }] : []),
+        ...(chat.system ? [{ role: "system", content: chat.system }] : []),
         // Byte-cap and entry-cap the transcript before folding it in so a
         // long thread cannot ship its full history on every round — see
         // chat-completions/replay-cap.ts.
@@ -227,7 +283,7 @@ export const GrokDriver: ProviderDriver<GrokConfig> = {
           }
           return res;
         }),
-        { role: "user", content: turn.text },
+        { role: "user", content: chat.text },
       ];
       appendNative(threadId, { dir: "out", source: "xai.chat.completions", msg: { model: turn.model, messageCount: messages.length } });
 
@@ -247,6 +303,8 @@ export const GrokDriver: ProviderDriver<GrokConfig> = {
           stream: true,
           tools: openAiTools,
           signal: opts.signal,
+          maxOutputTokens: turn.maxOutputTokens,
+          onChunk: opts.onChunk,
           onUsage: (u) => opts.onUsage?.(u),
           onDelta: (delta) => {
             opts.onPublished?.();
@@ -275,6 +333,10 @@ export const GrokDriver: ProviderDriver<GrokConfig> = {
         emit,
         runRound,
         messages,
+        // Only `timeoutMs` is read from this; the provider payload is built
+        // separately above from name/description/parameters.
+        tools: turn.tools,
+        toolResultHistoryChars: turn.toolResultHistoryChars,
         toolHost: turn.toolHost,
         requestApproval: turn.toolHost?.requestApproval
           ? (ask) => turn.toolHost!.requestApproval!(ask)
@@ -287,6 +349,25 @@ export const GrokDriver: ProviderDriver<GrokConfig> = {
       });
 
       return { turnId };
+    };
+
+    // Live catalog.  xAI publishes an OpenAI-compatible `GET {url}/models`,
+    // so the three hand-written rows above are a starting point rather than
+    // the only source of truth: a new Grok appears in the picker when xAI
+    // ships it, not when a human edits this file.  `models` is a per-instance
+    // binding so the merge preserves whatever this instance is currently
+    // showing, not the module-level constant.
+    let models: ModelCatalog = MODELS;
+    const probeModels = createModelDiscoveryProbe(MODEL_DISCOVERY_TTL_MS, () =>
+      fetchProviderModels({ baseUrl: config.url, apiKey }),
+    );
+    const refreshModels = async (): Promise<void> => {
+      if (!apiKey) return;
+      const catalog = await discoverModelCatalog(probeModels, () => models);
+      // null = a miss or an empty list; keep what we had rather than blanking
+      // the picker on a transient xAI hiccup.
+      // The flag is endpoint-level on xAI, so a discovered row carries it too.
+      if (catalog) models = { ...catalog, options: catalog.options.map((option) => ({ ...option, supportsMaxOutput: true })) };
     };
 
     const snapshot = async (): Promise<ProviderSnapshot> => {
@@ -304,7 +385,13 @@ export const GrokDriver: ProviderDriver<GrokConfig> = {
       driverKind: DRIVER_KIND,
       displayName: input.displayName,
       enabled: input.enabled,
-      models: MODELS,
+      // A getter, not a value: `refreshModels` reassigns `models`, and a
+      // captured binding would leave the picker showing the old rows forever.
+      // Same shape as minimax.ts and openai-compat.ts.
+      get models() {
+        return models;
+      },
+      refreshModels,
       snapshot,
       adapter: {
         provider: DRIVER_KIND,
@@ -314,6 +401,13 @@ export const GrokDriver: ProviderDriver<GrokConfig> = {
           toolLoop: true,
           localComputerMcp: true,
           replaysTranscript: true,
+          // Jobs matrix: BotFleet's own job tools run in this loop (P1,
+          // server/tools/jobs.ts); helpers stay `delegate_bot`.
+          backgroundJobs: "emulated",
+          helpers: "none",
+          // Every tool with an `ask` policy opens a card on the in-process
+          // permission broker (server/tools/approvals.ts) before it runs.
+          reviewHook: "before",
         },
         sendTurn,
         interruptTurn: async (threadId) => active.get(threadId)?.abort.abort(),
@@ -329,6 +423,20 @@ export const GrokDriver: ProviderDriver<GrokConfig> = {
       },
       generateText: async (prompt: string) => {
         const { text } = await complete([{ role: "user", content: prompt }], "grok-3-mini", { stream: false });
+        return text;
+      },
+      // Auto-review on this same xAI account: no `tools`, the brief as the
+      // system message and the action as the user message, cancelled by the
+      // reviewer's own deadline.
+      reviewPermission: async (prompt: ReviewPrompt, signal?: AbortSignal) => {
+        const { text } = await complete(
+          [
+            { role: "system", content: prompt.system },
+            { role: "user", content: prompt.data },
+          ],
+          "grok-3-mini",
+          { stream: false, signal },
+        );
         return text;
       },
       dispose: async () => {
