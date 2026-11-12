@@ -1669,6 +1669,7 @@
     {"path":"shared/model-limits.ts","category":"runtime","reason":"Import from server/index.ts"},
     {"path":"shared/model-lineage.ts","category":"runtime","reason":"Import from server/model-lineage.ts"},
     {"path":"shared/model-safety.ts","category":"ui-build","reason":"Import from src/components/SettingsPanel.tsx"},
+    {"path":"shared/opencode-model-probe.ts","category":"runtime","reason":"Import from server/drivers/acp/opencode-go.ts"},
     {"path":"shared/outbound.ts","category":"runtime","reason":"Import from server/permission-allow-key.ts"},
     {"path":"shared/peer-refusals.ts","category":"runtime","reason":"Import from server/job-host.ts"},
     {"path":"shared/placement-worker-http.mjs","category":"runtime","reason":"Import from server/index.ts"},
