@@ -365,6 +365,17 @@ describe("addInjectionRef", () => {
     expect(addInjectionRef(held, { ...row })).toBe(held);
   });
 
+  it("replaces the row in place when the same id reads differently, as a resolving summary does", () => {
+    const held = [row];
+    const resolved = { ...row, preview: "142.0 KiB to 96.1 KiB: dropped 12 earlier turns, 12 summarized", bytes: 47_100 };
+    const next = addInjectionRef(held, resolved);
+    expect(next).toEqual([resolved]);
+    expect(next).not.toBe(held);
+    // position is kept: a later row stays after it
+    const memory: ContextInjectionRef = { id: "ctx-0", source: "memory", preview: "MEMORY.md", bytes: 10 };
+    expect(addInjectionRef([row, memory], resolved).map((entry) => entry.id)).toEqual(["ctx-1", "ctx-0"]);
+  });
+
   it("hands back the same array for a second row that reads the same, as a model fallback produces", () => {
     const held = [row];
     expect(addInjectionRef(held, { ...row, id: "ctx-2" })).toBe(held);

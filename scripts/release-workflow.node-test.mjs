@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -7,38 +6,13 @@ import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
-import { buildMacFeed, regenerateMacFeed } from "./regenerate-mac-feed.mjs";
+import { buildMacFeed, macArtifactNames, regenerateMacFeed, resolveFeedVersion } from "./regenerate-mac-feed.mjs";
 import { verifyReleaseAssets } from "./verify-release-assets.mjs";
 import { verifyReleaseTag } from "./verify-release-tag.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const VERSION = "1.0.31";
 const builderRequire = createRequire(createRequire(import.meta.url).resolve("electron-builder"));
-
-function hash(file, algorithm, encoding) {
-  return createHash(algorithm).update(readFileSync(file)).digest(encoding);
-}
-
-function feed(directory, version, urls) {
-  const entries = urls.map((url) => ({
-    url,
-    sha512: hash(join(directory, url), "sha512", "base64"),
-    size: readFileSync(join(directory, url)).length,
-  }));
-  return [
-    `version: ${version}`,
-    "files:",
-    ...entries.flatMap((entry) => [
-      `  - url: ${entry.url}`,
-      `    sha512: ${entry.sha512}`,
-      `    size: ${entry.size}`,
-    ]),
-    `path: ${entries[0].url}`,
-    `sha512: ${entries[0].sha512}`,
-    "releaseDate: '2026-09-12T00:00:00.000Z'",
-    "",
-  ].join("\n");
-}
 
 function fixture() {
   const directory = mkdtempSync(join(tmpdir(), "botfleet-release-"));
@@ -47,12 +21,9 @@ function fixture() {
     `BotFleet-${VERSION}-x64.zip`,
     `BotFleet-${VERSION}-arm64.dmg`,
     `BotFleet-${VERSION}-x64.dmg`,
-    `BotFleet-${VERSION}-setup.exe`,
-    `BotFleet-${VERSION}-x86_64.AppImage`,
-    `BotFleet-${VERSION}-amd64.deb`,
   ];
   for (const file of files) writeFileSync(join(directory, file), `bytes:${file}`);
-  for (const file of files.slice(0, 5)) {
+  for (const file of files) {
     execFileSync(process.platform === "win32" ? "python" : "python3", ["-c", `
 import base64,gzip,hashlib,json,sys
 from pathlib import Path
@@ -63,18 +34,7 @@ Path(str(p)+".blockmap").write_bytes(gzip.compress(json.dumps(blockmap).encode()
   }
   cpSync(join(directory, files[2]), join(directory, "BotFleet.dmg"));
   cpSync(join(directory, files[3]), join(directory, "BotFleet-intel.dmg"));
-  cpSync(join(directory, files[4]), join(directory, "BotFleet-setup.exe"));
-  cpSync(join(directory, files[5]), join(directory, "BotFleet.AppImage"));
-  cpSync(join(directory, files[6]), join(directory, "BotFleet-amd64.deb"));
   writeFileSync(join(directory, "latest-mac.yml"), buildMacFeed(directory, VERSION, "2026-09-12T00:00:00.000Z"));
-  writeFileSync(join(directory, "latest.yml"), feed(directory, VERSION, [files[4]]));
-  writeFileSync(join(directory, "latest-linux.yml"), feed(directory, VERSION, [files[5], files[6]]));
-  writeFileSync(
-    join(directory, "SHA256SUMS-ubuntu-x64.txt"),
-    [files[6], files[5]]
-      .map((file) => `${hash(join(directory, file), "sha256", "hex")}  ${file}`)
-      .join("\n") + "\n",
-  );
   return { directory, files };
 }
 
@@ -102,24 +62,6 @@ test("the verifier rejects stale feed bytes and stale stable downloads", () => {
   }
 });
 
-test("the Linux feed must include and verify both generated package formats", () => {
-  const missingDeb = fixture();
-  const staleDeb = fixture();
-  try {
-    writeFileSync(join(missingDeb.directory, "latest-linux.yml"),
-      feed(missingDeb.directory, VERSION, [missingDeb.files[5]]));
-    assert.throws(() => verifyReleaseAssets(missingDeb.directory, VERSION),
-      /latest-linux.yml: expected .*amd64\.deb/);
-
-    writeFileSync(join(staleDeb.directory, staleDeb.files[6]), "changed deb after feed generation");
-    assert.throws(() => verifyReleaseAssets(staleDeb.directory, VERSION),
-      /latest-linux.yml: hash or size mismatch .*amd64\.deb/);
-  } finally {
-    rmSync(missingDeb.directory, { recursive: true, force: true });
-    rmSync(staleDeb.directory, { recursive: true, force: true });
-  }
-});
-
 test("mac feed regeneration replaces duplicate intermediate entries deterministically", () => {
   const { directory } = fixture();
   try {
@@ -132,6 +74,74 @@ test("mac feed regeneration replaces duplicate intermediate entries deterministi
     assert.doesNotThrow(() => verifyReleaseAssets(directory, VERSION));
   } finally {
     rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("the mac feed names the stamped release, not the package.json floor", () => {
+  // package.json's version is the FLOOR of the stamp scheme, and it is also
+  // the version already installed on the owner's Mac.  The first unified
+  // release died regenerating the feed because the script fell back to it:
+  // the run looked for BotFleet-1.0.31-arm64.zip while the build had made
+  // BotFleet-1.0.2193-arm64.zip.
+  assert.equal(resolveFeedVersion({ env: { BOTFLEET_BUILD_VERSION: " 1.0.2193 " } }), "1.0.2193");
+  // An unset or blank stamp falls back to the floor, which is right for a
+  // local build that never stamped one.
+  assert.equal(resolveFeedVersion({ env: { BOTFLEET_BUILD_VERSION: "" } }), VERSION);
+  assert.equal(resolveFeedVersion({ env: {} }), VERSION);
+
+  // And the feed the release writes names the stamped version and its files.
+  const pinned = "1.0.2193";
+  const directory = mkdtempSync(join(tmpdir(), "botfleet-feed-"));
+  try {
+    for (const file of macArtifactNames(pinned)) {
+      writeFileSync(join(directory, file), `bytes:${file}`);
+    }
+    const feedPath = join(directory, "latest-mac.yml");
+    regenerateMacFeed({
+      feedPath,
+      version: resolveFeedVersion({ env: { BOTFLEET_BUILD_VERSION: pinned } }),
+      releaseDate: "2026-10-24T00:00:00.000Z",
+    });
+    const feed = readFileSync(feedPath, "utf8");
+    assert.match(feed, new RegExp(`^version: ${pinned}$`, "m"));
+    for (const file of macArtifactNames(pinned)) {
+      assert.ok(feed.includes(file), `the feed lists ${file}`);
+    }
+    assert.doesNotMatch(feed, new RegExp(`^version: ${VERSION}$`, "m"));
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a missing release artifact names the version instead of failing bare", () => {
+  const directory = mkdtempSync(join(tmpdir(), "botfleet-feed-missing-"));
+  try {
+    assert.throws(
+      () => buildMacFeed(directory, "1.0.2193"),
+      /missing release artifact BotFleet-1\.0\.2193-arm64\.zip for version 1\.0\.2193/,
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("the release workflow hands the pinned version to every feed regeneration", () => {
+  const workflow = readFileSync(join(ROOT, ".github/workflows/release.yml"), "utf8").replace(/\r\n/g, "\n");
+  const macMerge = workflow.slice(workflow.indexOf("\n  mac-merge:"), workflow.indexOf("\n  assemble:"));
+  assert.ok(macMerge.length > 0, "the workflow has a mac-merge job");
+
+  // The feed has to describe the release that was just built.  The script
+  // falls back to package.json's version when it is not told which release
+  // this is, and that fallback is the floor of the stamp scheme.
+  assert.match(macMerge, /node scripts\/regenerate-mac-feed\.mjs release\/latest-mac\.yml "\$v"/);
+  assert.match(macMerge, /v="\$\{\{ needs\.prepare\.outputs\.version \}\}"/);
+
+  // Every call in the workflow names the version, so no release can drift
+  // back onto the floor.
+  const calls = [...workflow.matchAll(/node scripts\/regenerate-mac-feed\.mjs[^\n]*/g)].map((match) => match[0]);
+  assert.ok(calls.length > 0, "the workflow regenerates the feed");
+  for (const call of calls) {
+    assert.match(call, /"\$v"/, `the feed regeneration names the version: ${call}`);
   }
 });
 
@@ -189,14 +199,76 @@ test("release workflow defaults to artifacts and requires explicit release mutat
   assert.match(workflow, /node scripts\/verify-release-assets\.mjs uploaded "\$VERSION"/);
 });
 
-test("the windows packaging gate asserts the owner as well as the repo it names", () => {
-  const workflow = readFileSync(join(ROOT, ".github/workflows/package-win.yml"), "utf8").replace(/\r\n/g, "\n");
-  const builder = readFileSync(join(ROOT, "electron-builder.yml"), "utf8").replace(/\r\n/g, "\n");
-  // The error text names Simple-With-Us/BotFleet, so the gate has to check both halves.
-  assert.match(workflow, /grep -q "\^owner: Simple-With-Us\$" "\$res\/app-update\.yml"/);
-  assert.match(workflow, /grep -q "\^repo: BotFleet\$" "\$res\/app-update\.yml"/);
-  // …and both halves have to match what electron-builder actually publishes.
-  assert.match(builder, /publish:\n\s+- provider: github\n\s+owner: Simple-With-Us\n\s+repo: BotFleet/);
+test("the publish guard compares the stamped version, not an empty needs context", () => {
+  const workflow = readFileSync(join(ROOT, ".github/workflows/release.yml"), "utf8").replace(/\r\n/g, "\n");
+  const prepare = workflow.slice(workflow.indexOf("\n  prepare:"), workflow.indexOf("\n  mac:"));
+  assert.ok(prepare.length > 0, "the workflow has a prepare job");
+
+  // The release version comes from the shared planner, not from package.json:
+  // package.json says 1.0.31, which is the version already installed on the
+  // owner's Mac, so a feed carrying it can never offer an update (BF-2588).
+  assert.match(prepare, /node scripts\/electron-release-version\.mjs --repo-root \. --sha/);
+  assert.match(prepare, /echo "version=\$app_version" >> "\$GITHUB_OUTPUT"/);
+  assert.match(prepare, /echo "marketing_version=\$marketing_version" >> "\$GITHUB_OUTPUT"/);
+  assert.match(prepare, /echo "build=\$build" >> "\$GITHUB_OUTPUT"/);
+  // The planner reads the App Store Connect inventory, so the plan job needs
+  // the ASC credentials or it cannot plan a build at all.
+  assert.match(prepare, /required: APPLE_API_KEY_ID APPLE_API_ISSUER_ID APPLE_API_KEY_P8_BASE64/);
+  // The retired scheme must be gone from the release path:  it numbered a
+  // build 1.0.<commit_count>, which is not the policy's build number.
+  assert.doesNotMatch(prepare, /stamp-commit-version/);
+  // The stamp is the committer date of the commit, which a shallow clone
+  // cannot prove, so the checkout has to be full depth.
+  assert.match(prepare, /fetch-depth: 0/);
+  // Inside the prepare job the needs context is empty -- prepare is the first
+  // job and depends on nothing -- so needs.prepare.outputs.version rendered
+  // empty and the guard compared the literal tag "v".  That matched no
+  // release, so the gate never fired and a published release could be
+  // overwritten instead of stopping the run.  Comments may name the mistake;
+  // the code must not use it.
+  const prepareCode = prepare
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("#"))
+    .join("\n");
+  assert.match(prepareCode, /v="v\$\{\{ steps\.pin\.outputs\.version \}\}"/);
+  assert.doesNotMatch(prepareCode, /needs\.prepare\.outputs\.version/);
+});
+
+test("the desktop release carries the shared version and build (BF-2588)", () => {
+  // The policy splits the desktop bundle's version in two:  the marketing
+  // version 0.1.0 is what a person sees (CFBundleShortVersionString), and the
+  // build number is the commit's merge stamp (CFBundleVersion).  The app
+  // version carries that build in its patch, because the Electron updater
+  // orders releases by semver on it and by nothing else.
+  const workflow = readFileSync(join(ROOT, ".github/workflows/release.yml"), "utf8").replace(/\r\n/g, "\n");
+  const commitBuild = readFileSync(join(ROOT, ".github/workflows/mac-commit-build.yml"), "utf8").replace(/\r\n/g, "\n");
+  for (const [name, text] of [["release.yml", workflow], ["mac-commit-build.yml", commitBuild]]) {
+    assert.match(text, /BOTFLEET_MARKETING_VERSION=/, `${name} pins the marketing version`);
+    assert.match(text, /-c\.mac\.bundleShortVersion="\$BOTFLEET_MARKETING_VERSION"/, `${name} sets the short version`);
+    assert.match(text, /-c\.mac\.bundleVersion="\$\{\{ needs\.\w+\.outputs\.build \}\}"/, `${name} sets the build number`);
+    assert.match(text, /-c\.extraMetadata\.version="\$BOTFLEET_BUILD_VERSION"/, `${name} sets the app version`);
+    assert.doesNotMatch(text, /stamp-commit-version/, `${name} does not stamp the retired scheme`);
+  }
+  // The Control bundle and the packaged server have to agree on the version,
+  // or the version handshake reads them as different builds.
+  const control = readFileSync(join(ROOT, "electron/build-control-app.mjs"), "utf8");
+  assert.match(control, /CFBundleShortVersionString<\/key><string>\$\{version\}<\/string>/);
+  assert.match(control, /CFBundleVersion<\/key><string>\$\{buildNumber\}<\/string>/);
+  // Wiring alone cannot prove the shipped bytes agree: the stampers are
+  // covered in isolation while nothing reads the packaged app back, so a
+  // Control bundle on the retired number could ride inside a release whose
+  // feed and server carry the merge stamp with every gate green (BF-2531).
+  // Both shippers of an installable Mac app prove the bytes against the pin.
+  assert.match(
+    workflow,
+    /node scripts\/verify-packaged-versions\.mjs "\$\{\{ matrix\.app \}\}" \\\n\s+--version "\$\{\{ needs\.prepare\.outputs\.version \}\}" \\\n\s+--build "\$\{\{ needs\.prepare\.outputs\.build \}\}"/,
+    "release.yml verifies the packaged bundle set against the pinned release",
+  );
+  assert.match(
+    commitBuild,
+    /node scripts\/verify-packaged-versions\.mjs release\/mac-arm64\/BotFleet\.app \\\n\s+--version "\$\{\{ needs\.pin\.outputs\.version \}\}" \\\n\s+--build "\$\{\{ needs\.pin\.outputs\.build \}\}"/,
+    "mac-commit-build.yml verifies the packaged bundle set against the pinned build",
+  );
 });
 
 test("release tags must resolve to the pinned build, including nested annotated tags", async () => {

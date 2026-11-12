@@ -4,6 +4,12 @@
 // pin the first paint of each one, watch the timed enter→hold transition on
 // the thinking avatar, and remount a keyed hold avatar on demand.
 //
+// Every cell mounts on the multi-GIF tree: blue thinking-class states stay
+// off the one-file packs (they have no dedicated thinking pack), and
+// transitionSpeed 2 keeps a non-thinking state there too, since the one-file
+// player has no speed control. The one-file pack path itself is covered by
+// the packs unit tests and the board snapshot.
+//
 // The avatar component itself is untouched; this file is a pure renderer.
 import { useState } from "react";
 import { TVFaceAvatar } from "./TVFaceAvatar";
@@ -29,23 +35,23 @@ export default function TVFaceAvatarVisualFixture() {
       }}
     >
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-        <span>Still happy</span>
+        <span>Still tools</span>
         <div data-testid="still-happy">
-          <TVFaceAvatar state="happy" animated={false} size={96} />
+          <TVFaceAvatar color="blue" state="tools" animated={false} transitionSpeed={2} size={96} />
         </div>
       </div>
 
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
         <span>Animated resting</span>
         <div data-testid="animated-resting">
-          <TVFaceAvatar state="idle" animated size={96} />
+          <TVFaceAvatar color="blue" transitionSpeed={2} state="idle" animated size={96} />
         </div>
       </div>
 
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
         <span>Animated thinking</span>
         <div data-testid="animated-hold">
-          <TVFaceAvatar state="thinking" animated size={96} />
+          <TVFaceAvatar color="blue" state="thinking" animated size={96} />
         </div>
       </div>
 
@@ -53,6 +59,8 @@ export default function TVFaceAvatarVisualFixture() {
         <span>Remount slot</span>
         <div data-testid="remount-slot">
           <TVFaceAvatar
+            color="blue"
+            transitionSpeed={2}
             key={`remount-${remountKey}`}
             state="idle"
             animated

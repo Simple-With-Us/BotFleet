@@ -11,6 +11,51 @@
 // These tests are pure: `buildTurnEvents` never touches the network, so the
 // arithmetic is checked without a fetch stub anywhere near it.
 import { describe, expect, it } from "vitest";
+import { billedClaudeCallEventId } from "./claude-billed-call.ts";
+
+describe("exact single-call coverage receipt", () => {
+  const proof = { id: "msg-test", model: "claude-test", input: 10, output: 20, cacheRead: 30, cacheWrite: 40 };
+  const params = {
+    botId: "bot-test", botName: "Test", threadId: "thread-test", instanceId: "claude", driverKind: "claudeAgent",
+    inputTokens: 80, outputTokens: 20, cachedInputTokens: 30, cacheWrite5mTokens: 40,
+    servedModelId: "claude-test", childSessionId: "session-test", billedCall: proof,
+  };
+
+  it("names the unique call receipt only when settled tokens and model reconcile", () => {
+    const [event] = buildTurnEvents(params);
+    expect(event.eventId).toBe(billedClaudeCallEventId("session-test", "msg-test"));
+    expect(event.metadata).toMatchObject({
+      billedCallProofVersion: 1, billedCallId: "msg-test", billedCallModel: "claude-test",
+      billedCallOutput: 20, billedCallCacheRead: 30, billedCallCacheWrite: 40,
+    });
+    expect(event.ai?.tokens).toMatchObject({ input: 10, output: 20, cacheRead: 30, cacheWrite5m: 40, cacheWrite1h: 0 });
+  });
+
+  it.each([
+    { inputTokens: 81 }, { outputTokens: 21 }, { cachedInputTokens: 31 },
+    { cacheWrite5mTokens: 41 }, { childSessionId: undefined },
+    { servedModelId: "different-model" }, { driverKind: "codex" },
+  ])("keeps the ordinary turn identity without proof for inconsistent evidence %j", (change) => {
+    const [event] = buildTurnEvents({ ...params, ...change });
+    expect(event.eventId).not.toMatch(/^bf-call-v1:/);
+    expect(event.metadata).not.toHaveProperty("billedCallProofVersion");
+  });
+
+  it("forwards the driver's proof through shared one-to-one and room usage details", () => {
+    expect(turnUsageDetail({ billedCall: proof }, undefined, undefined).billedCall).toBe(proof);
+  });
+
+  it("keeps zero-token unreported turns outside billed-call coverage", () => {
+    const [event] = buildTurnEvents({ ...params,
+      inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, cacheWrite5mTokens: 0,
+      billedCall: { ...proof, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    });
+    expect(event.eventId).not.toMatch(/^bf-call-v1:/);
+    expect(event.metadata).not.toHaveProperty("billedCallProofVersion");
+    expect(event.metadata?.usageReported).toBe(false);
+    expect(event.ai).toBeUndefined();
+  });
+});
 
 import {
   buildAuxEvent,
@@ -640,6 +685,16 @@ describe("provider naming stays inside Usage Monitor's canon", () => {
     expect(inferProviderAndService("computer", undefined, "boxAgent").provider).toBe("box");
   });
 
+  it("does not attribute OpenAI-compatible GLM traffic to zcode", () => {
+    // GLM weights served over an OpenAI-compatible instance are that
+    // instance's traffic; the zcode engine is attributed by providerForEngine.
+    expect(inferProviderAndService("openrouter", "glm-4.6", "openai-compat").provider).toBe("openai-compat");
+    expect(inferProviderAndService("zcode", "GLM-5.3", "zcode").provider).toBe("zcode");
+    // The ACP bridge kind bills the same GLM Coding Plan, so it names the
+    // same provider as the headless CLI.
+    expect(inferProviderAndService("zcodeAcp", "GLM-5.3", "zcodeAcp").provider).toBe("zcode");
+  });
+
   it("keeps the two-argument form working exactly as before", () => {
     expect(inferProviderAndService("claude", "claude-sonnet-5")).toEqual({
       provider: "anthropic",
@@ -647,5 +702,57 @@ describe("provider naming stays inside Usage Monitor's canon", () => {
     });
     expect(inferProviderAndService("codex", "gpt-5")).toEqual({ provider: "openai", service: "gpt-5" });
     expect(inferProviderAndService("grok", "grok-4")).toEqual({ provider: "xai", service: "grok-4" });
+  });
+});
+
+describe("child harness de-duplication keys", () => {
+  // Usage Monitor pairs a BotFleet turn with the child harness's own
+  // telemetry by these three keys, so a turn is counted once.
+  it("names the engine, the child's native session and when the turn began", () => {
+    const [event] = build({
+      inputTokens: 10,
+      outputTokens: 5,
+      childSessionId: "8c0a8e0e-2a7f-4d1e-9a51-3f0b1c2d3e4f",
+      turnStartedAtMs: 1_756_999_990_000,
+    });
+    expect(event?.metadata.childHarness).toBe("claudeAgent");
+    expect(event?.metadata.childSessionId).toBe("8c0a8e0e-2a7f-4d1e-9a51-3f0b1c2d3e4f");
+    expect(event?.metadata.turnStartedAt).toBe(new Date(1_756_999_990_000).toISOString());
+  });
+
+  it("stamps them on a turn that reported no usage as well", () => {
+    const [event] = build({ driverKind: "opencodeGo", childSessionId: "ses_1", turnStartedAtMs: 1_756_999_990_000, success: false });
+    expect(event?.metadata.usageReported).toBe(false);
+    expect(event?.metadata.childHarness).toBe("opencodeGo");
+    expect(event?.metadata.childSessionId).toBe("ses_1");
+    expect(event?.metadata.turnStartedAt).toBe(new Date(1_756_999_990_000).toISOString());
+  });
+
+  it("omits a key it does not know rather than sending an empty value", () => {
+    const [event] = build({ driverKind: undefined, childSessionId: "   ", turnStartedAtMs: Number.NaN, inputTokens: 1 });
+    expect(event?.metadata).not.toHaveProperty("childHarness");
+    expect(event?.metadata).not.toHaveProperty("childSessionId");
+    expect(event?.metadata).not.toHaveProperty("turnStartedAt");
+    const [bare] = build({ inputTokens: 1 });
+    expect(bare?.metadata).not.toHaveProperty("childSessionId");
+    expect(bare?.metadata).not.toHaveProperty("turnStartedAt");
+  });
+
+  it("drops a start time past the Date range instead of throwing", () => {
+    const [event] = build({ inputTokens: 1, turnStartedAtMs: 9e15 });
+    expect(event?.metadata).not.toHaveProperty("turnStartedAt");
+  });
+
+  it("leaves the event id scheme and the occurrence time as they were", () => {
+    const [event] = build({ inputTokens: 10, childSessionId: "s", turnStartedAtMs: 1_756_999_990_000 });
+    expect(event?.eventId).toMatch(/^bf:anthropic:bot_1:1757000000000:[0-9a-f]{8}:turn$/);
+    expect(event?.occurredAt).toBe(new Date(1_757_000_000_000).toISOString());
+  });
+
+  it("is the same on every build of the same turn, so a replay never changes an event's content", () => {
+    const params = { ...BASE, inputTokens: 10, outputTokens: 5, childSessionId: "s-1", turnStartedAtMs: 1_756_999_990_000 };
+    const [a] = buildTurnEvents(params, { now: 1_757_000_000_000 });
+    const [b] = buildTurnEvents(params, { now: 1_757_000_000_000 });
+    expect({ ...a?.metadata }).toEqual({ ...b?.metadata });
   });
 });

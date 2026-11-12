@@ -422,13 +422,13 @@ describe("a model row keeps its name readable beside its tags", () => {
   it("renders the full slug in the title when the visible name is clipped", () => {
     const html = renderToStaticMarkup(
       <ModelRow
-        option={{ id: "m3.1", label: "MiniMax M3.1 Flash Preview · thinking" }}
+        option={{ id: "m3.1", label: "MiniMax M3.1 Flash · thinking" }}
         current={false}
         defaultId=""
         onPick={() => {}}
       />,
     );
-    expect(html).toContain('title="MiniMax M3.1 Flash Preview · thinking"');
+    expect(html).toContain('title="MiniMax M3.1 Flash · thinking"');
     expect(html).toContain("truncate");
   });
 });
@@ -670,7 +670,8 @@ describe("Effort section in the chat model menu", () => {
     expect(html).toContain("Max Input Tokens");
     expect(html).toContain("No Limit (1M)");
     expect(html).toContain(">512K<");
-    expect(html).toContain('placeholder="Custom"');
+    expect(html).toContain('placeholder="No limit"');
+    expect(html).toContain('aria-label="Max Input Tokens"');
     expect(html).toContain("Empty is no limit.");
     // A saved value that is not a preset shows in the custom field.
     const custom = renderToStaticMarkup(

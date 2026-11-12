@@ -121,7 +121,7 @@ function clip(text: string, max: number): string {
 export const ZULIP_OWNER_ITEMS_PREFIX = "Owner items:";
 
 /** How a woken bot handles a peer's request: the fleet's rule that peer
- *  requests are screened, not refused (AGENT-SYNC.md, Precedence rule 3).
+ *  requests are screened, not refused (FLEET-PROTOCOL.md, Precedence rule 3).
  *  ONE text, used by the inbound wrapper and by the system note in
  *  server/index.ts, so the two can never drift.  `ownerUserId` is whom the
  *  bot DMs; without one it cannot ask, so an uncertain request is declined. */
@@ -142,7 +142,7 @@ export function zulipPeerScreenRules(ownerUserId: number | undefined): string {
 }
 
 /** A link to one message, built by the harness from numeric ids only (the
- *  fleet listener's shape: AFC scripts/agent_sync), so it is safe outside
+ *  fleet listener's shape: the AFC Python package), so it is safe outside
  *  the untrusted markers.  Null when a channel message carried no id. */
 export function zulipMessageLink(
   realm: string,

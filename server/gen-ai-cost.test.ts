@@ -11,14 +11,14 @@ import {
 
 describe("catalog MiniMax keys", () => {
   it("maps picker ids, thinking suffixes, and DSH wire names", () => {
-    expect(catalogMinimaxPriceKey("MiniMax-M3.1-Flash-Preview")).toBe("MiniMax-M3.1-Flash-Preview");
-    expect(catalogMinimaxPriceKey("MiniMax-M3.1-Flash-Preview-thinking")).toBe("MiniMax-M3.1-Flash-Preview");
-    expect(catalogMinimaxPriceKey("MiniMax-M3.1-Flash-Preview-1M")).toBe("MiniMax-M3.1-Flash-Preview-1M");
-    expect(catalogMinimaxPriceKey("MiniMax-M3.1-Flash-Preview-thinking-1M")).toBe("MiniMax-M3.1-Flash-Preview-1M");
+    expect(catalogMinimaxPriceKey("MiniMax-M3.1-Flash")).toBe("MiniMax-M3.1-Flash");
+    expect(catalogMinimaxPriceKey("MiniMax-M3.1-Flash-thinking")).toBe("MiniMax-M3.1-Flash");
+    expect(catalogMinimaxPriceKey("MiniMax-M3.1-Flash-1M")).toBe("MiniMax-M3.1-Flash-1M");
+    expect(catalogMinimaxPriceKey("MiniMax-M3.1-Flash-thinking-1M")).toBe("MiniMax-M3.1-Flash-1M");
     expect(catalogMinimaxPriceKey("MiniMax-M2.7-highspeed")).toBe("MiniMax-M2.7-highspeed");
     expect(catalogMinimaxPriceKey("MiniMax-M2.7-highspeed-thinking")).toBe("MiniMax-M2.7-highspeed");
     expect(catalogMinimaxPriceKey("MiniMax-M2.7")).toBe("MiniMax-M2.7");
-    expect(catalogMinimaxPriceKey("dsh/minimax/MiniMax-M3.1-Flash-Preview")).toBe("MiniMax-M3.1-Flash-Preview");
+    expect(catalogMinimaxPriceKey("dsh/minimax/MiniMax-M3.1-Flash")).toBe("MiniMax-M3.1-Flash");
   });
 
   it("leaves Grok and Claude unpriced", () => {
@@ -38,7 +38,7 @@ describe("catalog DeepSeek family", () => {
   });
 
   it("ignores a model that is not DeepSeek", () => {
-    expect(catalogDeepSeekFamily("MiniMax-M3.1-Flash-Preview")).toBeNull();
+    expect(catalogDeepSeekFamily("MiniMax-M3.1-Flash")).toBeNull();
     expect(catalogDeepSeekFamily("gpt-5")).toBeNull();
   });
 });
@@ -46,13 +46,13 @@ describe("catalog DeepSeek family", () => {
 describe("estimateCatalogCost", () => {
   it("prices MiniMax M3.1 at the published ≤512K rate", () => {
     expect(
-      estimateCatalogCost("MiniMax-M3.1-Flash-Preview", { input: 100_000, output: 50_000 }),
+      estimateCatalogCost("MiniMax-M3.1-Flash", { input: 100_000, output: 50_000 }),
     ).toBeCloseTo((100_000 * 0.3 + 50_000 * 1.2) / 1_000_000, 10);
   });
 
   it("prices mcode thinking ids the same as the base model", () => {
-    const base = estimateCatalogCost("MiniMax-M3.1-Flash-Preview", { input: 10_000, output: 2_000 });
-    const thinking = estimateCatalogCost("MiniMax-M3.1-Flash-Preview-thinking", {
+    const base = estimateCatalogCost("MiniMax-M3.1-Flash", { input: 10_000, output: 2_000 });
+    const thinking = estimateCatalogCost("MiniMax-M3.1-Flash-thinking", {
       input: 10_000,
       output: 2_000,
     });
@@ -68,8 +68,8 @@ describe("estimateCatalogCost", () => {
 
   it("returns null when the model or the tokens are missing", () => {
     expect(estimateCatalogCost("grok-4.7", { input: 100, output: 10 })).toBeNull();
-    expect(estimateCatalogCost("MiniMax-M3.1-Flash-Preview", { output: 10 })).toBeNull();
-    expect(estimateCatalogCost("MiniMax-M3.1-Flash-Preview", null)).toBeNull();
+    expect(estimateCatalogCost("MiniMax-M3.1-Flash", { output: 10 })).toBeNull();
+    expect(estimateCatalogCost("MiniMax-M3.1-Flash", null)).toBeNull();
     expect(isCatalogPricedModel("MiniMax-M2.7-highspeed-thinking")).toBe(true);
     expect(isCatalogPricedModel("grok-4.7")).toBe(false);
   });

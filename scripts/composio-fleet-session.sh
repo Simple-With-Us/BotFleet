@@ -13,10 +13,13 @@
 #
 # Options:
 #   --user-id ID        Fleet user_id (default: jay-fleet)
-#   --out PATH          Where to persist the session_id (default: ~/.secrets/composio-session-id)
+#   --out PATH          Also persist the session (line 1 session_id, line 2 mcp_url) to this file;
+#                       default: none.  The fleet copy lives in Infisical Fleet-OPS /composio-session-id
+#                       key COMPOSIO_SESSION_ID (same two lines);  a mint prints it for you to store.
 #   --print-for PLAT    Print a paste-ready MCP config snippet for PLAT
 #                       (none|json|claude-code|cursor|antigravity|grok|codex)
-#   --check-only        Verify the session_id already at --out; do not mint
+#   --check-only        Verify the session already stored (--out file when given, otherwise
+#                       `fleet-secrets get COMPOSIO_SESSION_ID --path /composio-session-id`); do not mint
 #   --no-persist        Don't write to --out (use for one-off inspection)
 #   -h, --help          This help
 #
@@ -27,12 +30,15 @@
 set -euo pipefail
 
 USER_ID="jay-fleet"
-OUT="$HOME/.secrets/composio-session-id"
+OUT=""
+SESSION_FOLDER="/composio-session-id"
+SESSION_KEY="COMPOSIO_SESSION_ID"
+FLEET_SECRETS="${FLEET_SECRETS_BIN:-fleet-secrets}"
 PRINT_FOR="none"
 CHECK_ONLY=0
 PERSIST=1
 
-usage() { sed -n '2,28p' "$0"; }
+usage() { sed -n '2,31p' "$0"; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -50,12 +56,12 @@ resolve_api_key() {
   if [[ -n "${COMPOSIO_API_KEY:-}" ]]; then
     printf "%s" "$COMPOSIO_API_KEY"; return 0
   fi
-  if ! command -v fleet-secrets &>/dev/null; then
+  if ! command -v "$FLEET_SECRETS" &>/dev/null; then
     echo "COMPOSIO_API_KEY not set and fleet-secrets is not installed" >&2
     return 1
   fi
   local key
-  key="$(fleet-secrets get COMPOSIO_API_KEY 2>/dev/null)" || key=""
+  key="$("$FLEET_SECRETS" get COMPOSIO_API_KEY 2>/dev/null)" || key=""
   if [[ -z "$key" ]]; then
     echo "COMPOSIO_API_KEY not set and fleet-secrets get returned nothing" >&2
     return 1
@@ -105,7 +111,11 @@ print_summary() {
   echo "mcp_url:       ${url}"
   local prefix="${api_key:0:8}"
   echo "x-api-key:     ${prefix}...(length ${#api_key})"
-  echo "persisted_to:  ${OUT}"
+  if [[ -n "$OUT" && $PERSIST -eq 1 ]]; then
+    echo "persisted_to:  ${OUT}"
+  else
+    echo "persisted_to:  (not on disk;  store ${SESSION_KEY} in Infisical ${SESSION_FOLDER}: line 1 session_id, line 2 mcp_url)"
+  fi
 }
 
 print_config_snippet() {
@@ -201,26 +211,36 @@ main() {
     # Without this guard, a missing or stale --out file would silently
     # mint a new session and report success, which is the failure mode
     # an external monitor (session-start hook) is meant to detect.
-    if [[ ! -r "$OUT" ]]; then
-      echo "check-only: no persisted session at ${OUT}" >&2
-      exit 1
+    local stored
+    if [[ -n "$OUT" ]]; then
+      if [[ ! -r "$OUT" ]]; then
+        echo "check-only: no persisted session at ${OUT}" >&2
+        exit 1
+      fi
+      stored="$(cat "$OUT")"
+    else
+      stored="$("$FLEET_SECRETS" get "$SESSION_KEY" --path "$SESSION_FOLDER" 2>/dev/null)" || stored=""
+      if [[ -z "$stored" ]]; then
+        echo "check-only: no stored session (Infisical ${SESSION_FOLDER} ${SESSION_KEY} is missing or unreadable)" >&2
+        exit 1
+      fi
     fi
     # Format: line 1 = session_id, line 2 = mcp_url (persisted by mint path).
-    # Older files (pre-persistence-of-url) carry only the sid; for those we
+    # Older values (pre-persistence-of-url) carry only the sid; for those we
     # refuse to guess the URL and ask the caller to re-mint, instead of
     # returning a hardcoded template that may not match what the API issued.
-    sid=$(sed -n '1p' "$OUT" | tr -d '[:space:]')
+    sid=$(printf '%s\n' "$stored" | sed -n '1p' | tr -d '[:space:]')
     if [[ -z "$sid" ]]; then
-      echo "check-only: persisted file at ${OUT} is empty" >&2
+      echo "check-only: the stored session is empty" >&2
       exit 1
     fi
     if ! verify_session "$api_key" "$sid"; then
       echo "check-only: persisted session ${sid} is no longer valid" >&2
       exit 1
     fi
-    url=$(sed -n '2p' "$OUT" | tr -d '[:space:]')
+    url=$(printf '%s\n' "$stored" | sed -n '2p' | tr -d '[:space:]')
     if [[ -z "$url" ]]; then
-      echo "check-only: persisted file at ${OUT} has no mcp_url (pre-fix format); re-mint once and re-run" >&2
+      echo "check-only: the stored session has no mcp_url (pre-fix format); re-mint once and re-run" >&2
       exit 1
     fi
     print_summary "$sid" "$url" "$api_key"
@@ -233,7 +253,7 @@ main() {
   sid=$(echo "$resp" | python3 -c 'import json,sys; print(json.load(sys.stdin)["session_id"])')
   url=$(echo "$resp" | python3 -c 'import json,sys; print(json.load(sys.stdin)["mcp"]["url"])')
 
-  if [[ $PERSIST -eq 1 ]]; then
+  if [[ $PERSIST -eq 1 && -n "$OUT" ]]; then
     mkdir -p "$(dirname "$OUT")"
     chmod 700 "$(dirname "$OUT")"
     # Persist sid + url together so --check-only can read the API-issued

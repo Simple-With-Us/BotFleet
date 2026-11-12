@@ -23,6 +23,15 @@ function read(store: Store, key: string): Values {
   }
 }
 
+/** Draft key for a bot thread on screen.  The active thread keeps the
+ * legacy per-bot key (sidebar drops and the command palette target it,
+ * and existing drafts stay put); a browsed non-active thread gets its
+ * own key so typing while reading it never bleeds into the active
+ * thread's draft. */
+export function botThreadDraftId(botId: string, shownThreadId: string, activeThreadId: string): string {
+  return shownThreadId && shownThreadId !== activeThreadId ? `bot:${botId}:${shownThreadId}` : `bot:${botId}`;
+}
+
 export function getDraft(store: Store, id: string): string {
   const text = read(store, KEY)[id];
   return typeof text === "string" ? text : "";
@@ -54,6 +63,28 @@ export function setDraftAttachments(store: Store, id: string, attachments: Attac
   } catch {
     /* quota / private mode — attachments remain in component state */
   }
+}
+
+/** Carry an in-progress draft from one conversation key to another.  A
+ * thread typed while browsed lives under its per-thread key; when that
+ * thread becomes the active one the composer resolves the legacy
+ * per-bot key instead, which would strand the text.  The moved text
+ * goes first (it was typed for the thread now on screen) and chips
+ * join by id, the same merge a refused send folds back.  A missing
+ * source — or nothing stored under it — is a no-op. */
+export function migrateThreadDraft(store: Store, fromId: string, toId: string): void {
+  if (!fromId || !toId || fromId === toId) return;
+  const text = getDraft(store, fromId);
+  const attachments = getDraftAttachments(store, fromId);
+  if (!text && attachments.length === 0) return;
+  const merged = mergeRestoredDraft(
+    { text: getDraft(store, toId), attachments: getDraftAttachments(store, toId) },
+    { text, attachments },
+  );
+  setDraft(store, toId, merged.text);
+  setDraftAttachments(store, toId, merged.attachments);
+  setDraft(store, fromId, "");
+  setDraftAttachments(store, fromId, []);
 }
 
 interface EventTargetLike {
@@ -161,7 +192,7 @@ export function restoreDraft(id: string, sent: DraftSnapshot, store: Store = get
 
 // Reaching for localStorage is itself a failure point: on an origin with
 // storage blocked the getter throws, and `typeof` doesn't shield it.
-function getStore(): Store {
+export function getStore(): Store {
   try {
     return typeof localStorage === "undefined" ? undefined : localStorage;
   } catch {

@@ -61,3 +61,20 @@ Each turn books `promptBytes` (UTF-8 bytes of each half) and forwards them to
 Usage Monitor as `metadata.promptStableBytes` and `metadata.promptVolatileBytes`,
 two flat numbers, because the v2 metadata bag accepts only primitives.  Read them
 against `cachedInputTokens` to see whether the prefix is actually being cached.
+
+## Unattended Webhook And Schedule Wakes
+
+Webhook and schedule turns reorder that assembly before a driver sees it
+(`server/wake-prompt.ts`).  The standing system sections come first, then the
+tool schemas on HTTP tool-loop lanes, which cache the catalog in the prefix;  the
+Claude, Codex, and ACP lanes discover their tools at runtime.  The saved
+instructions follow when the wake carries a per-wake tail
+(a schedule wake with no tail keeps its saved prompt in the user text).  An
+`AUTHENTICATED WEBHOOK TASK` block is payload-derived, so it stays in the tail
+with timestamps, delivery ids, run ids, folded delivery counts, and untrusted
+event blocks.  A payload can contain the untrusted closer, so the block runs to
+the end of the wake and that text stays in the tail.  Two deliveries of the
+same standing instructions therefore share one byte-identical prefix.  The stored transcript
+keeps the original wake text.  Model selection is unchanged.  When a provider
+reports `cachedInput` on `thread.token-usage.updated`, the harness logs
+`cachedInputTokens`, `inputTokens`, and `outputTokens`, and nothing else.

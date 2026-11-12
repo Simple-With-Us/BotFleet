@@ -91,7 +91,7 @@ posixOnly("a routine with a command allowlist", () => {
   beforeAll(async () => {
     chmodSync(FAKE, 0o755);
     home = mkdtempSync(join(tmpdir(), "omb-routine-allowlist-e2e-"));
-    tool = join(home, "fake-agent-sync");
+    tool = join(home, "fake-simple-chat");
     writeFileSync(tool, `#!/bin/sh\necho "ran:$*:seat=$AGENT_LAUNCH_SEAT"\ntouch "${join(home, "TOOL-RAN")}"\n`);
     chmodSync(tool, 0o755);
     const grokHome = join(home, "grok-home");
@@ -183,7 +183,7 @@ posixOnly("a routine with a command allowlist", () => {
     expect(seen.results.map((r: any) => r.hook)).toEqual(["allow", "deny", "deny", "deny"]);
     expect(seen.results[0].output).toBe("ran:whoami --json:seat=BF-HOUSEKEEPER\n");
     expect(existsSync(join(home, "PWNED"))).toBe(false);
-    expect(run.denials).toEqual(["allowlist: fake-agent-sync", "allowlist: touch", "allowlist: COMPOSIO_SEARCH_TOOLS"]);
+    expect(run.denials).toEqual(["allowlist: fake-simple-chat", "allowlist: touch", "allowlist: COMPOSIO_SEARCH_TOOLS"]);
   }, 90_000);
 
   it("is refused on MiniMax Code, which cannot be held, and the engine never starts", async () => {
