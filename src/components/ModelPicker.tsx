@@ -38,6 +38,7 @@ import type { EffortLevel } from "../../server/contracts.ts";
 import { ProviderMark } from "./ProviderIcons";
 import { EngineQuotasPanel } from "./EngineQuotasPanel";
 import { EngineSetup, needsCli, needsSignIn } from "./EngineSetup";
+import { openCodeEngineStatusChip, openCodeModelProbeSentence } from "@/lib/opencode-engine-status";
 import { isCheckingEngine, isHiddenEngine } from "@/lib/engine-status";
 import { formatWindowPairLabel } from "@/lib/quota-display";
 import { EngineGroupLabel } from "./EngineGroupLabel";
@@ -407,11 +408,13 @@ export function engineStatus(instance: InstanceInfo): string {
   const modelCaps = Object.values(instance.snapshot.quota?.models ?? {});
   if (modelCaps.some((row) => row.capped)) return "Partial quota";
   if (instance.snapshot.reason === "Disabled in settings") return "Disabled";
+  const openCodeChip = openCodeEngineStatusChip(instance);
   // The last probe gave no answer: a slow Mac, not a missing CLI or a
   // sign-out.  Never "Not installed" or "Sign-in required" for it.
-  if (isCheckingEngine(instance)) return "Checking";
+  if (isCheckingEngine(instance)) return openCodeChip ?? "Checking";
   if (needsCli(instance)) return isCliMissing(instance) ? "Not installed" : "Unavailable";
-  if (needsSignIn(instance)) return "Sign-in required";
+  if (needsSignIn(instance)) return openCodeChip ?? "Sign-in required";
+  if (openCodeModelProbeSentence(instance)) return openCodeChip ?? "Needs attention";
   return instance.snapshot.version ?? "Ready";
 }
 

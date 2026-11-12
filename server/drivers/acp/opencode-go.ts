@@ -16,6 +16,7 @@ import {
 } from "./init-deadline.ts";
 import type { ModelCatalog, ProviderErrorCode } from "../../contracts.ts";
 import { execCli, isProbeTimeout, type ProbeTimeoutError } from "../../procs.ts";
+import { humanizeOpenCodeModelProbeProblem } from "../../../shared/opencode-model-probe.ts";
 
 /** Fallback catalog for a bot that has no saved model yet.
  *
@@ -277,6 +278,12 @@ let lastProbeProblem: string | null = null;
 
 export function openCodeModelProbeProblem(): string | null {
   return lastProbeProblem;
+}
+
+/** Human-facing catalog probe copy for `ProviderSnapshot.modelProbeProblem`. */
+export function openCodeModelProbeForClient(): string | null {
+  const raw = openCodeModelProbeProblem();
+  return raw ? humanizeOpenCodeModelProbeProblem(raw) : null;
 }
 
 /** Ask the CLI for its catalog, without assuming a flag it still has.

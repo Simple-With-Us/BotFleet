@@ -29,6 +29,7 @@ import type {
   ProviderInstance,
   ProviderSnapshot,
 } from "../contracts.ts";
+import { openCodeModelProbeForClient } from "../drivers/acp/opencode-go.ts";
 import { isJsonString } from "../schema.ts";
 
 /** The instance id the default fleet reserves for each driver whose reserved
@@ -1479,6 +1480,10 @@ export class ProviderRegistry {
           if (Object.keys(mergedModels).length > 0) mergedQuota.models = mergedModels;
           if (minimaxSummary) mergedQuota.minimax = minimaxSummary;
           snapshot.quota = mergedQuota;
+        }
+        if (inst.driverKind === "opencodeGo") {
+          const modelProbeProblem = openCodeModelProbeForClient();
+          if (modelProbeProblem) snapshot = { ...snapshot, modelProbeProblem };
         }
       } catch (e) {
         snapshot = { state: "unavailable", reason: e instanceof Error ? e.message : String(e) };

@@ -13,6 +13,7 @@ import {
   discoverOpenCodeModels,
   normalizeLegacyOpenCodeModel,
   openCodeModelProbeDeadline,
+  openCodeModelProbeForClient,
   openCodeModelProbeProblem,
   parseOpenCodeModelsOutput,
   resetOpenCodeModelCache,
@@ -697,6 +698,7 @@ describe("OpenCode sign-in probe on a busy host", () => {
 
         await discoverOpenCodeModels({}, empty, quick);
         expect(openCodeModelProbeProblem()).toContain("answered nothing");
+        expect(openCodeModelProbeForClient()).toBe("OpenCode answered but listed no models.");
         expect(openCodeModelProbeProblem()).not.toContain("timed out");
       } finally {
         resetOpenCodeModelCache();

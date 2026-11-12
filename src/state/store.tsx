@@ -811,6 +811,8 @@ export interface InstanceInfo {
     hidden?: boolean;
     /** Undefined when the auth probe could not tell. */
     authenticated?: boolean;
+    /** OpenCode only: why the last model catalog probe failed. */
+    modelProbeProblem?: string;
     version?: string | null;
     /** a reported cost on a subscription is notional; the UI says so */
     billing?: "metered" | "subscription";

@@ -1064,6 +1064,11 @@ private struct EngineSetupSheet: View {
                 Text(instance.snapshot.engineStatusLabel)
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
+                if let detail = instance.snapshot.engineProblemDetail {
+                    Text(detail)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
                 Text("Finish setup in the Mac app.")
                     .font(.body)
                     .foregroundStyle(.primary)
