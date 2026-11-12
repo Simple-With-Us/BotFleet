@@ -165,7 +165,10 @@ test("a harness that is gone yields 502, not a hang", async () => {
   await harness.close();
   const shim = await startUiShim({ uiDir: makeUiDir(), harnessPort: deadPort });
   try {
-    const res = await fetch(`http://127.0.0.1:${shim.port}/api/health`, { signal: AbortSignal.timeout(5_000) });
+    // A closed port usually refuses at once.  CI has also aborted this fetch
+    // at five seconds while the proxy was still connecting, so the bound has
+    // to cover a slow refusal without waiting out a true hang.
+    const res = await fetch(`http://127.0.0.1:${shim.port}/api/health`, { signal: AbortSignal.timeout(15_000) });
     assert.equal(res.status, 502);
     assert.match((await res.json()).error, /not reachable/);
     // the UI itself still serves — the renderer can show its own error state
