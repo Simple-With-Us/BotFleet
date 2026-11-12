@@ -4,7 +4,7 @@
 // machine your bots can borrow.
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Activity, Coins, Gauge, Globe, KeyRound, Layers, Monitor, Smartphone, Terminal, User, X } from "lucide-react";
-import { api, useStore, type AppSettingsSection, type ConfigStatus } from "@/state/store";
+import { ApiError, api, useStore, type AppSettingsSection, type ConfigStatus } from "@/state/store";
 import { searchSettings, type SettingsSearchItem } from "@/lib/settings-search";
 import { SettingsSearchResultsView } from "./SettingsSearchResultsView";
 import { SETTINGS_SECTIONS, SettingsNav } from "./SettingsNav";
@@ -24,6 +24,13 @@ import {
   parseConversationMode,
   type ConversationMode,
 } from "../../shared/conversation-mode";
+import {
+  conversationModeFailureCopy,
+  simpleMergeConflictLabel,
+  simpleMergeConflicts,
+  simpleMergeRefusal,
+  type SimpleMergeConflict,
+} from "../../shared/task-workspace-context";
 import {
   BUSY_SEND_DEFAULTS,
   parseBusySendDefault,
@@ -652,10 +659,12 @@ export function ConversationModeRow() {
   const lower = lowerRoomLabels(labels);
   const [saving, setSaving] = useState(false);
   const [pendingSimple, setPendingSimple] = useState(false);
+  const [mergeConflicts, setMergeConflicts] = useState<SimpleMergeConflict[]>([]);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const save = async (conversationMode: ConversationMode, mergeThreads = false) => {
     if (saving) return;
     setSaving(true);
-    setPendingSimple(false);
+    setSaveError(null);
     try {
       // `mergeThreads` is absent rather than false when the caller did not
       // ask for it, so each payload stays one the route actually documents.
@@ -667,17 +676,28 @@ export function ConversationModeRow() {
         body: JSON.stringify(payload),
       });
       dispatch({ type: "configStatus", config });
-    } catch {
+      setPendingSimple(false);
+      setMergeConflicts([]);
+    } catch (error) {
+      if (error instanceof ApiError) {
+        const serverMessage = typeof error.body?.error === "string" ? error.body.error : error.message;
+        setSaveError(conversationModeFailureCopy(error.status, serverMessage));
+      } else {
+        setSaveError(conversationModeFailureCopy(undefined, undefined));
+      }
     } finally {
       setSaving(false);
     }
   };
   const choose = (conversationMode: ConversationMode) => {
     if (saving || conversationMode === current) return;
+    setSaveError(null);
     if (conversationMode === "simple" && current === "projects") {
+      setMergeConflicts(simpleMergeConflicts([...state.bots, ...state.groups]));
       setPendingSimple(true);
       return;
     }
+    setPendingSimple(false);
     void save(conversationMode);
   };
   return (
@@ -709,20 +729,41 @@ export function ConversationModeRow() {
           );
         })}
         {pendingSimple && (
-          <div className="rounded-lg border border-hairline/40 bg-raised/40 px-3 py-2.5">
-            <div className="text-[14px] font-medium text-ink">Merge Extra Threads?</div>
-            <div className="mt-0.5 text-[12px] leading-relaxed text-ink-secondary">
-              Simple is one conversation per bot.{"\u00A0"} Merge extra threads into that conversation, or keep them saved and out of the sidebar.
-            </div>
+          <div className="rounded-lg border border-hairline/40 bg-raised/40 px-3 py-2.5" data-testid="simple-merge-prompt">
+            {mergeConflicts.length > 0 ? (
+              <div data-testid="simple-merge-refusal">
+                <div className="text-[14px] font-medium text-ink">These Stay Separate</div>
+                <p className="mt-0.5 text-[12px] leading-relaxed text-ink-secondary">
+                  {simpleMergeRefusal(mergeConflicts)}
+                </p>
+                <ul className="mt-2 flex flex-col gap-0.5">
+                  {mergeConflicts.map((conflict) => (
+                    <li key={conflict.threadId} className="text-[12px] text-ink-secondary">
+                      <span className="text-ink">{conflict.title}</span>
+                      {"\u00A0 "}— {simpleMergeConflictLabel(conflict.reason)}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : (
+              <>
+                <div className="text-[14px] font-medium text-ink">Merge Extra Threads?</div>
+                <div className="mt-0.5 text-[12px] leading-relaxed text-ink-secondary">
+                  Simple is one conversation per bot.{"\u00A0"} Merge extra threads into that conversation, or keep them saved and out of the sidebar.
+                </div>
+              </>
+            )}
             <div className="mt-2 flex flex-wrap gap-2">
-              <button
-                type="button"
-                disabled={saving}
-                onClick={() => void save("simple", true)}
-                className="rounded-lg border border-accent bg-accent/10 px-3 py-1.5 text-[13px] font-medium text-ink"
-              >
-                Merge All Threads
-              </button>
+              {mergeConflicts.length === 0 && (
+                <button
+                  type="button"
+                  disabled={saving}
+                  onClick={() => void save("simple", true)}
+                  className="rounded-lg border border-accent bg-accent/10 px-3 py-1.5 text-[13px] font-medium text-ink"
+                >
+                  Merge All Threads
+                </button>
+              )}
               <button
                 type="button"
                 disabled={saving}
@@ -734,13 +775,21 @@ export function ConversationModeRow() {
               <button
                 type="button"
                 disabled={saving}
-                onClick={() => setPendingSimple(false)}
+                onClick={() => {
+                  setPendingSimple(false);
+                  setSaveError(null);
+                }}
                 className="rounded-lg px-3 py-1.5 text-[13px] text-ink-secondary hover:text-ink"
               >
                 Cancel
               </button>
             </div>
           </div>
+        )}
+        {saveError && (
+          <p role="alert" data-testid="conversation-mode-error" className="text-[12px] leading-relaxed text-danger">
+            {saveError}
+          </p>
         )}
       </div>
     </Card>
