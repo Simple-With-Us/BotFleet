@@ -1576,6 +1576,7 @@
     {"path":"server/thread-wedge-guard.ts","category":"runtime","reason":"Import from server/index.ts"},
     {"path":"server/tool-fields.ts","category":"runtime","reason":"Import from server/drivers/minimax.ts"},
     {"path":"server/tool-policy.ts","category":"runtime","reason":"Import from server/routines.ts"},
+    {"path":"server/tool-result-history.ts","category":"runtime","reason":"Import from server/tools/host.ts"},
     {"path":"server/tool-row.ts","category":"runtime","reason":"Import from server/index.ts"},
     {"path":"server/tools/agents.ts","category":"runtime","reason":"Import from server/index.ts"},
     {"path":"server/tools/approvals.ts","category":"runtime","reason":"Import from server/index.ts"},
