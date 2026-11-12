@@ -44,6 +44,14 @@ test("autofix.yml passes only secrets the pr-autofix reusable declares", () => {
   assert.deepEqual(passedSecrets(yml), ["MINIMAX_API_KEY", "META_MODEL_API_TOKEN", "AUTOFIX_GITHUB_APP_PRIVATE_KEY", "USAGE_INGEST_TOKEN"]);
 });
 
+test("the trusted policy pins no model while the org-switch revision is pinned", () => {
+  // Kody on #1289:  with the switch revision pinned,  a model id in the
+  // trusted file is one more place that must move when the fleet switches,
+  // and it never wins -  the org variable outranks any file pin.  Keep it out.
+  const trusted = read(".github/pr-autofix-trusted.yml");
+  assert.doesNotMatch(trusted, /^model:/m, "the trusted policy must not pin a model id");
+});
+
 test("both autofix callers pin their reusable workflow to a full commit SHA", () => {
   const pins = [
     [".github/workflows/autofix.yml", "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/pr-autofix-reusable.yml"],
@@ -73,7 +81,7 @@ test("PR Autofix is not pinned to a reusable revision that deadlocks", () => {
   // Validate Model Switch guard.
   assert.equal(
     ref,
-    "c97a2dae96762eb9ffc122c753f0dfb0a7840650",
+    "a4c48f013a2108be517ee933dccb1b37e9403920",
     "pr-autofix-reusable.yml pin must stay on the model-switch revision",
   );
 });
@@ -128,13 +136,19 @@ test("Claude Autofix keeps the Sentry-capable pin and same-repository bot gate",
   // Validate Model Switch guard).
   // Compare the job-level uses: ref itself (as the PR Autofix guard does),  not a
   // whole-file text match that a comment quoting the SHA would also satisfy.
-  const claudeUses = claude.match(/^ {4}uses:\s*(\S+)\s*$/m)?.[1] ?? "";
-  assert.equal(
-    claudeUses.split("@")[1] ?? "",
-    "c97a2dae96762eb9ffc122c753f0dfb0a7840650",
+  const claudeUses = [...claude.matchAll(/^ {4}uses:\s*(\S+)\s*$/gm)].map(
+    (m) => m[1],
+  );
+  assert.ok(
+    claudeUses.includes(
+      "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/claude-code-autofix-reusable.yml@a4c48f013a2108be517ee933dccb1b37e9403920",
+    ),
     "claude-code-autofix-reusable.yml pin must stay on the model-switch revision",
   );
   assert.match(claude, /^\s+allowed_bots: .*swu-echo/m);
+  // BF-2487: the prompt must name the review bots the allowlist admits, so a
+  // Sentry review is treated as an expected trigger, not an unfamiliar actor.
+  assert.match(claude, /A review bot \(Codex, Kody, Cursor, Claude, or Sentry\)/);
   const guard = claude.match(/^ {4}if: >-\n([\s\S]*?)^ {4}uses:/m)?.[1];
   assert.ok(guard, "Claude Autofix has a job-level guard");
   assert.equal(

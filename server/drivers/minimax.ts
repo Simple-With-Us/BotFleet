@@ -942,6 +942,7 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
         // Only `timeoutMs` is read from this; the provider payload is built
         // separately above from name/description/parameters.
         tools: turn.tools,
+        toolResultHistoryChars: turn.toolResultHistoryChars,
         // Unattended turns (webhook- or resource-triggered) may need much
         // longer than the interactive ceiling (180s when PR 625 landed) to
         // stream a full reasoning and code response, such as the Compiler

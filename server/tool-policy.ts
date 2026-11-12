@@ -3,7 +3,7 @@
 //
 // Why it exists.  Every BotFleet bot runs with auto-approve, and a routine
 // reads untrusted text (public PRs, Linear issues, Zulip) while holding the
-// owner's credentials.  A routine that only needs `agent-sync whoami` and one
+// owner's credentials.  A routine that only needs `simple-chat whoami` and one
 // report command must not be talked into anything else, so the routine names
 // what it may run and the driver refuses the rest.
 //
@@ -63,11 +63,36 @@ const FLAG_NAME = /^(?:-[A-Za-z0-9]|--[A-Za-z0-9][A-Za-z0-9_-]*)$/;
 const ENV_ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
 const INTEGER = /^(?:0|[1-9][0-9]{0,8})$/;
 
-/** agent-sync flags no routine may pass, whatever its policy says:  each one
+/** The fleet chat CLI's basename:  `simple-chat`.  The retired launcher
+ *  name is gone from PATH, so there is one spelling and one rule set. */
+export const CHAT_CLI_NAMES = ["simple-chat"] as const;
+
+/** How a refusal names the fleet chat CLI. */
+const CHAT_CLI_LABEL = "simple-chat";
+
+/** The fleet chat CLI's retired launcher spelling.  It names nothing
+ *  runnable:  direct use as a program word is refused with a pointer to
+ *  the current name - never matched, migrated or aliased.  Compared in
+ *  any letter case, the same way `namesChatCli` treats the current name:
+ *  on a case-insensitive volume `AGENT-SYNC` is the same retired binary,
+ *  and a same-named program word is only ever a refusal.  A launch
+ *  wrapped in an interpreter or another launcher is not specially
+ *  detected;  that coverage is unimplemented, and whether one runs is
+ *  the ordinary allowlist's call - a genuinely allowed interpreter can
+ *  still execute such a script. */
+const RETIRED_CHAT_CLI_NAME = "agent-sync";
+
+/** Whether a program word spells the retired launcher name, in any
+ *  letter case.  A suffix (`agent-sync.log`) is not the name. */
+function namesRetiredChatCli(word: string): boolean {
+  return posix.basename(word).toLowerCase() === RETIRED_CHAT_CLI_NAME;
+}
+
+/** simple-chat flags no routine may pass, whatever its policy says:  each one
  *  changes who the post is from or who it wakes.  A word that is a prefix of
  *  one of these is refused too, because Python's argparse expands an
  *  unambiguous abbreviation (`--fl` becomes `--fleet`). */
-export const AGENT_SYNC_FORBIDDEN_FLAGS = [
+export const CHAT_CLI_FORBIDDEN_FLAGS = [
   "--as",
   "--default-seat",
   "--rc",
@@ -114,20 +139,22 @@ export function isProtectedPath(path: string): boolean {
   return PROTECTED_WRITE_PARTS.some((part) => folded.includes(part.toLowerCase()));
 }
 
-/** Whether a program or script path names agent-sync, in any letter case:  an
- *  `AGENT-SYNC` spelling on a case-insensitive volume is the same binary, and
+/** Whether a program or script path names the fleet chat CLI (`simple-chat`),
+ *  in any letter case:  a
+ *  `SIMPLE-CHAT` spelling on a case-insensitive volume is the same binary, and
  *  the forbidden-flag checks must still apply.  This is a basename, so the ACP
  *  gate also resolves links — an alias of another name is caught at run time
- *  from the word that turns out to be agent-sync. */
-export function namesAgentSync(word: string): boolean {
-  return posix.basename(word).toLowerCase() === "agent-sync";
+ *  from the word that turns out to be the chat CLI. */
+export function namesChatCli(word: string): boolean {
+  const base = posix.basename(word).toLowerCase();
+  return CHAT_CLI_NAMES.some((name) => name === base);
 }
 
-/** The agent-sync flag a word spells or abbreviates, if it is a forbidden one. */
-function forbiddenAgentSyncFlag(word: string): string | null {
+/** The chat-CLI flag a word spells or abbreviates, if it is a forbidden one. */
+function forbiddenChatCliFlag(word: string): string | null {
   if (!word.startsWith("--") || word.length < 3) return null;
   const name = word.includes("=") ? word.slice(0, word.indexOf("=")) : word;
-  return AGENT_SYNC_FORBIDDEN_FLAGS.find((flag) => flag.startsWith(name)) ?? null;
+  return CHAT_CLI_FORBIDDEN_FLAGS.find((flag) => flag.startsWith(name)) ?? null;
 }
 
 // ---------------------------------------------------------------------------
@@ -191,19 +218,26 @@ const commandSchema = z
   .superRefine((command, ctx) => {
     const names = Object.keys(command.flags);
     if (names.length > MAX_FLAGS) ctx.addIssue({ code: "custom", message: `has more than ${MAX_FLAGS} flags` });
-    // agent-sync as the program, or as the script an interpreter runs
+    // the retired launcher spelling as the program word:  never saved.
+    //  Fixed words are not scanned - they can pin data operands, and a
+    //  file may carry the retired name, the same way run time leaves
+    //  data words alone.
+    if (namesRetiredChatCli(command.argv0)) {
+      ctx.addIssue({ code: "custom", message: `${RETIRED_CHAT_CLI_NAME} has been retired: use ${CHAT_CLI_LABEL}` });
+    }
+    // the chat CLI as the program, or as the script an interpreter runs
     const fixed = [command.argv0, ...command.sub];
-    const agentSyncAt = fixed.findIndex(namesAgentSync);
+    const chatCliAt = fixed.findIndex(namesChatCli);
     for (const [name, spec] of Object.entries(command.flags)) {
       if (spec.value === "int" && spec.min !== undefined && spec.max !== undefined && spec.min > spec.max) {
         ctx.addIssue({ code: "custom", message: `flag ${name} has min above max` });
       }
-      if (agentSyncAt >= 0 && forbiddenAgentSyncFlag(name)) {
-        ctx.addIssue({ code: "custom", message: `agent-sync may never take ${name}` });
+      if (chatCliAt >= 0 && forbiddenChatCliFlag(name)) {
+        ctx.addIssue({ code: "custom", message: `${CHAT_CLI_LABEL} may never take ${name}` });
       }
     }
-    if (agentSyncAt >= 0 && fixed[agentSyncAt + 1] === "dm" && command.flags["--owner"]?.required !== true) {
-      ctx.addIssue({ code: "custom", message: "agent-sync dm is allowed only with a required --owner flag" });
+    if (chatCliAt >= 0 && fixed[chatCliAt + 1] === "dm" && command.flags["--owner"]?.required !== true) {
+      ctx.addIssue({ code: "custom", message: `${CHAT_CLI_LABEL} dm is allowed only with a required --owner flag` });
     }
   });
 
@@ -378,16 +412,16 @@ function matchEntry(entry: ToolPolicyCommand, argv: string[], paths: string[]): 
   return null;
 }
 
-/** The rules every agent-sync call keeps whatever the policy says.  `argv`
- *  starts at the word that runs agent-sync (the program, or the script an
+/** The rules every chat-CLI call keeps whatever the policy says.  `argv`
+ *  starts at the word that runs the chat CLI (the program, or the script an
  *  interpreter runs). */
-export function agentSyncProblem(argv: string[]): string | null {
+export function chatCliProblem(argv: string[]): string | null {
   for (const word of argv.slice(1)) {
-    const forbidden = forbiddenAgentSyncFlag(word);
-    if (forbidden) return `agent-sync may never take ${forbidden}`;
+    const forbidden = forbiddenChatCliFlag(word);
+    if (forbidden) return `${CHAT_CLI_LABEL} may never take ${forbidden}`;
   }
   const verb = argv.slice(1).find((word) => !word.startsWith("-"));
-  if (verb === "dm" && !argv.includes("--owner")) return "agent-sync dm is allowed only with --owner";
+  if (verb === "dm" && !argv.includes("--owner")) return `${CHAT_CLI_LABEL} dm is allowed only with --owner`;
   return null;
 }
 
@@ -399,15 +433,28 @@ export function evaluateArgv(policy: ToolPolicy, argv: string[]): PolicyDecision
   if (ENV_ASSIGNMENT.test(argv0)) return { ok: false, reason: "an environment-variable prefix", name: "env-prefix" };
   if (!argv0.startsWith("/")) return { ok: false, reason: "the program is not an absolute path", name };
   if (argv.some((word) => controlChar(word))) return { ok: false, reason: "a control character", name };
-  // agent-sync as the program or as a script among the fixed words:  only
-  // ever more refusals, so a free word that happens to say agent-sync costs
+  // the chat CLI as the program or as a script among the fixed words:  only
+  // ever more refusals, so a free word that happens to say simple-chat costs
   // nothing.
-  const agentSyncAt = argv.slice(0, 1 + MAX_SUB).findIndex(namesAgentSync);
-  if (agentSyncAt >= 0) {
-    const problem = agentSyncProblem(argv.slice(agentSyncAt));
+  const chatCliAt = argv.slice(0, 1 + MAX_SUB).findIndex(namesChatCli);
+  if (chatCliAt >= 0) {
+    const problem = chatCliProblem(argv.slice(chatCliAt));
     if (problem) return { ok: false, reason: problem, name };
   }
+  // The retired launcher spelling as the program word is refused by
+  //  name, even if a stored policy from before the rename still lists
+  //  it:  it is not an alias.  Only the program word is checked.  A
+  //  launch wrapped in an interpreter or another launcher is not
+  //  specially detected - that coverage is unimplemented - so whether
+  //  one runs is the ordinary allowlist's call:  a genuinely allowed
+  //  interpreter can still execute such a script.  Data words are never
+  //  scanned, so a file that carries the retired name
+  //  (`rm ~/.local/bin/agent-sync`, when deleting the retired
+  //  launcher) runs normally.
   const candidates = policy.commands.filter((entry) => entry.argv0 === argv0);
+  if (namesRetiredChatCli(argv0)) {
+    return { ok: false, reason: `${RETIRED_CHAT_CLI_NAME} has been retired: use ${CHAT_CLI_LABEL}`, name };
+  }
   if (candidates.length === 0) return { ok: false, reason: "the program is not on the allowlist", name };
   let lastProblem = "it matches no allowlist entry";
   for (const entry of candidates) {
@@ -434,7 +481,7 @@ export function evaluateCommand(policy: ToolPolicy, command: string): PolicyDeci
 const WRAPPER_SHELLS = new Set(["bash", "sh", "zsh"]);
 
 /** An engine that runs commands through the client terminal hands BotFleet a
- *  wrapper such as `/opt/homebrew/bin/bash -lc 'agent-sync whoami'`.  Return
+ *  wrapper such as `/opt/homebrew/bin/bash -lc 'simple-chat whoami'`.  Return
  *  the inner command when `command` is exactly such a wrapper, the command
  *  itself when it is not a wrapper, or null when it is a wrapper of any other
  *  shape. */

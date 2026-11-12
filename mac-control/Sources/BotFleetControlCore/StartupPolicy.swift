@@ -3,16 +3,49 @@ import Foundation
 public protocol CommandRunning {
     func run(_ executable: String, _ arguments: [String]) throws -> String
     func run(_ executable: String, _ arguments: [String], timeout: TimeInterval) throws -> String
+    /// Runs a command with an explicit environment.  A menu bar app inherits
+    /// no shell PATH, so a command that needs one has to be given it.
+    func run(_ executable: String, _ arguments: [String], environment: [String: String], timeout: TimeInterval) throws -> String
+    /// Runs a command and keeps what it printed, whatever its exit status.
+    ///
+    /// A command that warns and still answers is not a command that failed.
+    /// `lsof` exits with 1 when it could not examine one of the processes it
+    /// was asked about, and the answer for the ones it could examine is in
+    /// its output all the same.  Throwing that away would leave the caller
+    /// with nothing, and the caller cannot tell an empty answer from a lost
+    /// one.
+    func runKeepingOutput(_ executable: String, _ arguments: [String]) -> String
 }
 
 public struct CommandExitError: LocalizedError {
+    /// What the command printed on its standard output.
     public let output: String
+    /// What the command printed on its standard error, when the runner kept
+    /// it.  launchctl explains a refusal there, so a probe can tell "no such
+    /// service" from a request launchd could not answer.
+    public var errorOutput: String = ""
     public var errorDescription: String? { "The system command failed." }
 }
 
 public extension CommandRunning {
     func run(_ executable: String, _ arguments: [String], timeout: TimeInterval) throws -> String {
         try run(executable, arguments)
+    }
+
+    func run(_ executable: String, _ arguments: [String], environment: [String: String], timeout: TimeInterval) throws -> String {
+        try run(executable, arguments, timeout: timeout)
+    }
+
+    /// The default keeps what the command printed, whatever it exited with.
+    ///
+    /// A command that warns and still answers is not a command that failed,
+    /// and the answer it printed is in the failure itself.  A conformer that
+    /// does not override this has to keep that answer too, or the same probe
+    /// would come back empty from one conformer and full from another.
+    func runKeepingOutput(_ executable: String, _ arguments: [String]) -> String {
+        do { return try run(executable, arguments) }
+        catch let failure as CommandExitError { return failure.output }
+        catch { return "" }
     }
 }
 
@@ -22,20 +55,44 @@ public struct ProcessCommandRunner: CommandRunning {
         try run(executable, arguments, timeout: 15)
     }
     public func run(_ executable: String, _ arguments: [String], timeout: TimeInterval) throws -> String {
+        try run(executable, arguments, environment: ProcessInfo.processInfo.environment, timeout: timeout)
+    }
+    public func run(_ executable: String, _ arguments: [String], environment: [String: String], timeout: TimeInterval) throws -> String {
+        let (result, errorText, status) = try execute(executable, arguments, environment: environment, timeout: timeout)
+        guard status == 0 else { throw CommandExitError(output: result, errorOutput: errorText) }
+        return result
+    }
+    public func runKeepingOutput(_ executable: String, _ arguments: [String]) -> String {
+        runKeepingOutput(executable, arguments, environment: ProcessInfo.processInfo.environment, timeout: 15)
+    }
+    public func runKeepingOutput(_ executable: String, _ arguments: [String], environment: [String: String], timeout: TimeInterval) -> String {
+        (try? execute(executable, arguments, environment: environment, timeout: timeout)).map { $0.0 } ?? ""
+    }
+    /// Runs a command and reports what it printed, what it complained, and
+    /// how it ended.
+    private func execute(_ executable: String, _ arguments: [String], environment: [String: String], timeout: TimeInterval) throws -> (String, String, Int32) {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
+        process.environment = environment
         let output = Pipe()
+        let errors = Pipe()
         process.standardOutput = output
-        process.standardError = FileHandle.nullDevice
+        process.standardError = errors
         let readerDone = DispatchSemaphore(value: 0)
+        let errorReaderDone = DispatchSemaphore(value: 0)
         let finished = DispatchSemaphore(value: 0)
         var data = Data()
+        var errorData = Data()
         process.terminationHandler = { _ in finished.signal() }
         try process.run()
         DispatchQueue.global(qos: .utility).async {
             data = output.fileHandleForReading.readDataToEndOfFile()
             readerDone.signal()
+        }
+        DispatchQueue.global(qos: .utility).async {
+            errorData = errors.fileHandleForReading.readDataToEndOfFile()
+            errorReaderDone.signal()
         }
         if finished.wait(timeout: .now() + timeout) == .timedOut {
             if process.isRunning { process.terminate() }
@@ -46,8 +103,13 @@ public struct ProcessCommandRunner: CommandRunning {
         }
         guard readerDone.wait(timeout: .now() + 2) == .success else { throw StartupPolicyError.commandFailed }
         let result = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard process.terminationStatus == 0 else { throw CommandExitError(output: result) }
-        return result
+        // A command that exited after handing its stderr to a background
+        // child keeps this pipe open.  The command still answered, so a late
+        // stderr is read as empty rather than as a failure.
+        let errorText = errorReaderDone.wait(timeout: .now() + 2) == .success
+            ? String(decoding: errorData, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+            : ""
+        return (result, errorText, process.terminationStatus)
     }
 }
 
@@ -56,6 +118,7 @@ public enum StartupPolicyError: LocalizedError {
     case bootIdentityUnavailable
     case launchAgentMissing
     case commandFailed
+    case refused(String)
 
     public var errorDescription: String? {
         switch self {
@@ -63,6 +126,7 @@ public enum StartupPolicyError: LocalizedError {
         case .bootIdentityUnavailable: return "Could not identify the current Mac boot session."
         case .launchAgentMissing: return "The BotFleet Server LaunchAgent is not installed.  Reinstall BotFleet."
         case .commandFailed: return "macOS could not change the BotFleet Server LaunchAgent.  Check its installation."
+        case .refused(let message): return message
         }
     }
 }
@@ -78,6 +142,16 @@ public enum InstalledServerState: Equatable {
     case stopped
     case running
     case unknown
+
+    /// The state as the fleet services list shows it.
+    public var managedState: ManagedServiceState {
+        switch self {
+        case .running: return .running
+        case .stopped: return .stopped
+        case .notInstalled: return .notInstalled
+        case .unknown: return .unknown
+        }
+    }
 }
 
 public final class StartupPolicy {
@@ -111,6 +185,51 @@ public final class StartupPolicy {
     private var enabled: URL { dataDirectory.appendingPathComponent("startup-enabled.marker") }
     private var session: URL { dataDirectory.appendingPathComponent("startup-session") }
     private var stopped: URL { dataDirectory.appendingPathComponent("stopped.marker") }
+    private static let maximumStopMarkerBytes = 64 * 1024
+
+    /// Preserve the exact owner marker, or refuse to unpark when it cannot be read safely.
+    private func readStopMarker() throws -> Data? {
+        var status = stat()
+        if lstat(stopped.path, &status) != 0 {
+            if errno == ENOENT { return nil }
+            throw StartupPolicyError.refused("Could not safely read the deliberate-stop marker.")
+        }
+        guard (status.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG),
+              status.st_size >= 0, status.st_size <= Int64(Self.maximumStopMarkerBytes) else {
+            throw StartupPolicyError.refused("Could not safely read the deliberate-stop marker.")
+        }
+        let descriptor = open(stopped.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
+        guard descriptor >= 0 else {
+            throw StartupPolicyError.refused("Could not safely read the deliberate-stop marker.")
+        }
+        defer { close(descriptor) }
+        guard fstat(descriptor, &status) == 0,
+              (status.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG),
+              status.st_size >= 0, status.st_size <= Int64(Self.maximumStopMarkerBytes) else {
+            throw StartupPolicyError.refused("Could not safely read the deliberate-stop marker.")
+        }
+        var contents = Data()
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        while true {
+            let count = buffer.withUnsafeMutableBytes { Darwin.read(descriptor, $0.baseAddress, $0.count) }
+            guard count >= 0, contents.count + count <= Self.maximumStopMarkerBytes else {
+                throw StartupPolicyError.refused("Could not safely read the deliberate-stop marker.")
+            }
+            if count == 0 { return contents }
+            contents.append(contentsOf: buffer.prefix(count))
+        }
+    }
+
+    /// The label of the BotFleet Server LaunchAgent.
+    public static let serverAgentLabel = "app.botfleet.server"
+
+    /// The label of the BotFleet Companion LaunchAgent.
+    public static let companionAgentLabel = "app.botfleet.companion"
+
+    /// The LaunchAgent plist that installs a label.
+    public func launchAgentPlist(label: String) -> URL {
+        home.appendingPathComponent("Library/LaunchAgents/\(label).plist")
+    }
 
     public var supportsPolicy: Bool {
         guard let data = try? Data(contentsOf: wrapper),
@@ -127,12 +246,22 @@ public final class StartupPolicy {
     public var startsAtLogin: Bool { loginPolicy == .enabled }
 
     public var installedServerState: InstalledServerState {
-        guard files.fileExists(atPath: agent.path) else { return .notInstalled }
+        state(ofAgent: StartupPolicy.serverAgentLabel)
+    }
+
+    /// The state of a launchd agent, by its label.
+    ///
+    /// An agent with a live process behind it is running.  An agent that is
+    /// loaded without one is stopped, and so is one that is not loaded at
+    /// all.  An agent whose plist is not installed is not installed, and a
+    /// launchctl that could not be asked is unknown.
+    public func state(ofAgent label: String) -> InstalledServerState {
+        guard files.fileExists(atPath: launchAgentPlist(label: label).path) else { return .notInstalled }
         let listing: String
         do { listing = try commands.run("/bin/launchctl", ["list"]) }
         catch { return .unknown }
         let row = listing.split(separator: "\n").first { line in
-            line.split(whereSeparator: \.isWhitespace).last == "app.botfleet.server"
+            line.split(whereSeparator: \.isWhitespace).last == Substring(label)
         }
         guard let row else { return .stopped }
         let pid = row.split(whereSeparator: \.isWhitespace).first ?? "-"
@@ -153,26 +282,341 @@ public final class StartupPolicy {
         }
     }
 
-    public func startServer() throws {
+    /// Starts the BotFleet Server and waits to see whether it came up.
+    ///
+    /// A kickstart that succeeds does not prove the server is running, so a
+    /// deliberate stop goes back when the server is then seen not running.
+    /// An unknown state means launchctl could not be asked, so the marker is
+    /// not re-created on it.
+    @discardableResult
+    public func startServerAndSettle(attempts: Int = PM2Client.settleAttempts) async throws -> ManagedServiceState {
+        let deliberateStop = try startServer()
+        let observed = await ManagedServices.settle(to: .running, attempts: attempts, interval: 0.25) {
+            self.state(ofAgent: StartupPolicy.serverAgentLabel).managedState
+        }
+        if observed != .running && observed != .unknown { deliberateStop.restore() }
+        return observed
+    }
+
+    /// Starts the BotFleet Server.
+    ///
+    /// The returned handle puts back a deliberate stop this start cleared.
+    /// Callers that do not watch the result should use `startServerAndSettle`.
+    @discardableResult
+    public func startServer() throws -> DeliberateStop {
         guard supportsPolicy else { throw StartupPolicyError.updateRequired }
         guard files.fileExists(atPath: agent.path) else { throw StartupPolicyError.launchAgentMissing }
+        let markerContents = try readStopMarker()
         let boot = try bootID()
         try files.createDirectory(at: dataDirectory, withIntermediateDirectories: true)
         try Data((boot + "\n").utf8).write(to: session, options: .atomic)
-        let domain = "gui/\(uid)"
-        let label = "\(domain)/app.botfleet.server"
-        _ = try commands.run("/bin/launchctl", ["enable", label])
-        if (try? commands.run("/bin/launchctl", ["print", label])) == nil {
-            _ = try commands.run("/bin/launchctl", ["bootstrap", domain, agent.path])
-        }
-        let wasStopped = files.fileExists(atPath: stopped.path)
-        if wasStopped { try files.removeItem(at: stopped) }
+        if markerContents != nil { try files.removeItem(at: stopped) }
         do {
-            _ = try commands.run("/bin/launchctl", ["kickstart", label])
+            try startAgent(label: StartupPolicy.serverAgentLabel)
         } catch {
-            if wasStopped { try? Data().write(to: stopped, options: .atomic) }
+            if let markerContents { try? markerContents.write(to: stopped, options: .atomic) }
             throw error
         }
+        return DeliberateStop(marker: stopped, files: files, markerContents: markerContents)
+    }
+
+    /// Restarts the BotFleet Server.
+    ///
+    /// A restart asks for a fresh copy of the server, so the deliberate-stop
+    /// marker is cleared first: the installed wrapper stays down while that
+    /// marker exists, and a restart that left it in place would report a
+    /// server that never came back.  The marker is put back when the restart
+    /// fails, so a refused restart does not lift a deliberate stop.
+    ///
+    /// The returned handle puts the marker back as well, for a restart that
+    /// does not throw but does not replace the server either.
+    @discardableResult
+    public func restartServer() throws -> DeliberateStop {
+        guard supportsPolicy else { throw StartupPolicyError.updateRequired }
+        guard files.fileExists(atPath: agent.path) else { throw StartupPolicyError.launchAgentMissing }
+        let markerContents = try readStopMarker()
+        let boot = try bootID()
+        try files.createDirectory(at: dataDirectory, withIntermediateDirectories: true)
+        try Data((boot + "\n").utf8).write(to: session, options: .atomic)
+        if markerContents != nil { try files.removeItem(at: stopped) }
+        do {
+            try restartAgent(label: StartupPolicy.serverAgentLabel)
+        } catch {
+            if let markerContents { try? markerContents.write(to: stopped, options: .atomic) }
+            throw error
+        }
+        return DeliberateStop(marker: stopped, files: files, markerContents: markerContents)
+    }
+
+    /// Starts the BotFleet Companion LaunchAgent.
+    ///
+    /// A companion-only action cannot lift the server's deliberate stop.
+    /// The explicit server start owns that shared marker.
+    public func startCompanion() throws {
+        try requireFleetUnparked()
+        try startAgent(label: StartupPolicy.companionAgentLabel)
+    }
+
+    /// Restarts the BotFleet Companion LaunchAgent.
+    ///
+    /// Replacing the companion also leaves the server's park state alone.
+    public func restartCompanion() throws {
+        try requireFleetUnparked()
+        try restartAgent(label: StartupPolicy.companionAgentLabel)
+    }
+
+    private func requireFleetUnparked() throws {
+        if files.fileExists(atPath: stopped.path) {
+            throw StartupPolicyError.refused("The fleet is deliberately stopped.\u{00A0} Start the BotFleet Server before starting or restarting the companion.")
+        }
+    }
+
+    /// What a restart of the BotFleet Server did to the deliberate-stop
+    /// marker.
+    ///
+    /// A restart clears the marker so the installed wrapper can start the
+    /// server again.  When the restart does not replace the server, the
+    /// marker goes back, because a refused restart must not lift a
+    /// deliberate stop.
+    public struct DeliberateStop {
+        private let marker: URL
+        private let files: FileManager
+        private let markerContents: Data?
+
+        fileprivate init(marker: URL, files: FileManager, markerContents: Data?) {
+            self.marker = marker
+            self.files = files
+            self.markerContents = markerContents
+        }
+
+        /// True when the marker was there before the restart.
+        public var wasStoppedByOwner: Bool { markerContents != nil }
+
+        /// Puts the deliberate-stop marker back, when it was there before.
+        public func restore() {
+            guard let markerContents else { return }
+            try? files.createDirectory(at: marker.deletingLastPathComponent(),
+                                       withIntermediateDirectories: true)
+            try? markerContents.write(to: marker, options: .atomic)
+        }
+    }
+
+    /// Starts a launchd agent: it is enabled, loaded if it is not loaded
+    /// yet, and kickstarted.
+    ///
+    /// The kickstart does not terminate a running instance, so starting an
+    /// agent that is already up leaves it alone.
+    public func startAgent(label: String) throws {
+        let plist = launchAgentPlist(label: label)
+        guard files.fileExists(atPath: plist.path) else {
+            throw StartupPolicyError.refused("The \(label) LaunchAgent is not installed on this Mac.")
+        }
+        let domain = "gui/\(uid)"
+        let full = "\(domain)/\(label)"
+        _ = try commands.run("/bin/launchctl", ["enable", full])
+        if (try? commands.run("/bin/launchctl", ["print", full])) == nil {
+            _ = try commands.run("/bin/launchctl", ["bootstrap", domain, plist.path])
+        }
+        _ = try commands.run("/bin/launchctl", ["kickstart", full])
+    }
+
+    /// How long a stop waits for launchd to unload the agent before it
+    /// decides the stop did not take.
+    ///
+    /// launchd gives a job twenty seconds after SIGTERM before it kills it,
+    /// so the wait is longer than that: a teardown that is merely slow must
+    /// not be reported as a stop that failed.
+    public static let unloadAttempts = 50
+    public static let unloadInterval: TimeInterval = 0.5
+
+    /// Stops a launchd agent and leaves it stopped, across logins and
+    /// restarts.
+    ///
+    /// The agent is disabled in launchd's own record first, so a plist with
+    /// `RunAtLoad` does not bring it back at the next login, and then booted
+    /// out of the login domain, so it stops now and its `StartInterval`
+    /// cannot fire.  `startAgent` enables it again, so the owner's start
+    /// undoes exactly this.
+    ///
+    /// Whether the stop took is read from launchd, never from the bootout's
+    /// exit status: `launchctl bootout` exits nonzero while a teardown is
+    /// still in progress and when the job was already gone, and a command
+    /// that outlives the runner's timeout is not a bootout that failed.  So
+    /// the bootout is run for its effect, and `launchctl print` is asked
+    /// until the job is no longer loaded.  An agent that is still loaded
+    /// after that is put back to enabled, because an agent that is still
+    /// running must not be left disabled behind the owner's back, and the
+    /// refusal says so.
+    public func stopAgent(label: String,
+                          unloadAttempts: Int = StartupPolicy.unloadAttempts,
+                          unloadInterval: TimeInterval = StartupPolicy.unloadInterval) async throws {
+        let full = "gui/\(uid)/\(label)"
+        do {
+            _ = try commands.run("/bin/launchctl", ["disable", full])
+        } catch let error as CommandExitError {
+            throw StartupPolicyError.refused(error.output.isEmpty
+                ? "macOS could not disable the \(label) LaunchAgent."
+                : error.output)
+        } catch {
+            throw StartupPolicyError.refused("launchctl did not answer while disabling the \(label) LaunchAgent, so nothing was stopped.")
+        }
+        _ = try? commands.run("/bin/launchctl", ["bootout", full])
+        let step = StartupPolicy.unloadStep(unloadInterval)
+        switch await waitUntilUnloaded(full, attempts: unloadAttempts, step: step) {
+        case .unloaded:
+            return
+        case .loaded:
+            // The agent is still running, so it must not stay disabled behind
+            // the owner's back.  A teardown that finishes between the last
+            // look and the enable is caught by one more look: a job that is
+            // gone now is a stop that took, and the disable goes back on.
+            let enabled = (try? commands.run("/bin/launchctl", ["enable", full])) != nil
+            switch probeLoaded(full) {
+            case .unloaded:
+                do {
+                    _ = try commands.run("/bin/launchctl", ["disable", full])
+                } catch {
+                    // Enabled and unloaded is the one state this look exists
+                    // to prevent: launchd starts the agent again at the next
+                    // login.  It is a refusal the owner reads, never a stop
+                    // reported as held.
+                    throw StartupPolicyError.refused("The \(label) LaunchAgent stopped, but launchctl could not disable it again, so launchd starts it at the next login.  Repeat Stop once launchd answers.")
+                }
+                return
+            case .loaded:
+                let waited = Int((Double(max(unloadAttempts, 1)) * step).rounded())
+                throw StartupPolicyError.refused("The \(label) LaunchAgent is still loaded after \(waited) seconds.  \(StartupPolicy.enableOutcome(enabled, whileStopping: true))")
+            case .couldNotAsk:
+                throw StartupPolicyError.refused("The \(label) LaunchAgent was still loaded when the wait ran out, and launchctl did not answer the last look.  \(StartupPolicy.enableOutcome(enabled, whileStopping: false))  Try again once launchd answers.")
+            }
+        case .couldNotAsk:
+            let enabled = (try? commands.run("/bin/launchctl", ["enable", full])) != nil
+            throw StartupPolicyError.refused("launchctl did not answer while Control waited for the \(label) LaunchAgent to unload, so nothing can be said about it.  \(StartupPolicy.enableOutcome(enabled, whileStopping: false))  Try again once launchd answers.")
+        }
+    }
+
+    /// What the refusal says about the agent's enable, after a stop that did
+    /// not take: only what was checked, never the outcome the code hoped for.
+    private static func enableOutcome(_ enabled: Bool, whileStopping: Bool) -> String {
+        if enabled {
+            return whileStopping
+                ? "It is left enabled, and it may still be stopping; if it stops now, launchd starts it again at the next login until Stop is repeated."
+                : "It is left enabled."
+        }
+        return whileStopping
+            ? "It may still be stopping, and Control could not re-enable it, so it stays disabled and will not start at the next login until Start is used."
+            : "Control could not re-enable it, so it stays disabled and will not start at the next login until Start is used."
+    }
+
+    /// The wait between looks, clamped so a caller cannot trap the app or
+    /// wait for ever: a non-finite or negative interval waits nothing, and a
+    /// long one waits a minute at most.
+    static func unloadStep(_ interval: TimeInterval) -> TimeInterval {
+        interval.isFinite ? min(max(interval, 0), 60) : 0
+    }
+
+    /// What one look at launchd said about a job.
+    private enum LoadedAnswer {
+        case loaded
+        case unloaded
+        case couldNotAsk
+    }
+
+    /// Asks launchd once whether the job is loaded.
+    ///
+    /// `launchctl print` fails for a job that is not loaded, saying so on
+    /// its standard error, and that is the one answer that proves a bootout
+    /// took.  A print that failed for any other reason, or that the command
+    /// runner had to abandon, is not an answer, and it must not be read as
+    /// "unloaded": that is the one way a running agent could be left
+    /// disabled.
+    private func probeLoaded(_ full: String) -> LoadedAnswer {
+        do {
+            _ = try commands.run("/bin/launchctl", ["print", full])
+            return .loaded
+        } catch let error as CommandExitError {
+            return StartupPolicy.saysServiceMissing(error) ? .unloaded : .couldNotAsk
+        } catch {
+            return .couldNotAsk
+        }
+    }
+
+    /// Whether a failed `launchctl print` said the job is not loaded.
+    ///
+    /// launchctl writes `Could not find service "<label>" in domain for uid:
+    /// <uid>` for a job that is not loaded.  A domain it could not print, or
+    /// a request it refused, is worded differently and says nothing about the
+    /// job.
+    static func saysServiceMissing(_ error: CommandExitError) -> Bool {
+        error.errorOutput.contains("Could not find service")
+    }
+
+    /// Asks launchd until the job is unloaded, or the wait is up.
+    ///
+    /// A job that is still being torn down answers for a while, so the
+    /// question is asked more than once, with the wait between looks spent
+    /// suspended rather than holding a thread.  The window is a budget of
+    /// wall-clock time, not a number of looks: a look that was slow to answer
+    /// has spent the budget.  A look launchd did not answer ends the wait at
+    /// once, because the runner's own timeout has already been spent and
+    /// another look would not make launchd answer; the caller re-enables and
+    /// says so.
+    private func waitUntilUnloaded(_ full: String, attempts: Int, step: TimeInterval) async -> LoadedAnswer {
+        let looks = max(attempts, 1)
+        let deadline = Date().addingTimeInterval(Double(looks) * step)
+        for attempt in 0..<looks {
+            switch probeLoaded(full) {
+            case .unloaded: return .unloaded
+            case .couldNotAsk: return .couldNotAsk
+            case .loaded: break
+            }
+            if step > 0, Date() >= deadline { return .loaded }
+            if attempt + 1 < looks, step > 0 {
+                try? await Task.sleep(nanoseconds: UInt64(step * 1_000_000_000))
+            }
+        }
+        return .loaded
+    }
+
+    /// Stops a BotFleet Server that cannot be asked to stop itself.
+    ///
+    /// The server's own stop route is the right stop: it refuses while work
+    /// is in flight and drains before it exits.  A server older than this
+    /// app has no such route, so the only stop left is the one launchd
+    /// offers.  The deliberate-stop marker is written first, so the installed
+    /// wrapper does not start the server again on its next tick, and the
+    /// LaunchAgent, when it is installed, is then booted out, which sends the
+    /// server a termination signal.  The agent is not disabled: the marker is
+    /// the durable stop for the server, and a disabled agent would defeat
+    /// Start Server At Login.
+    ///
+    /// Nothing here is trusted as proof that the server is gone.  launchd
+    /// does not always own the server process, the plist is not always
+    /// installed, and `launchctl bootout` exits nonzero even when it worked,
+    /// so the bootout's exit status is ignored and the caller asks the port
+    /// afterwards.  The method reports whether launchd was asked at all, so
+    /// the caller can say what happened.
+    @discardableResult
+    public func forceStopServer() throws -> Bool {
+        try files.createDirectory(at: dataDirectory, withIntermediateDirectories: true)
+        try Data().write(to: stopped, options: .atomic)
+        guard files.fileExists(atPath: agent.path) else { return false }
+        _ = try? commands.run("/bin/launchctl", ["bootout", "gui/\(uid)/\(StartupPolicy.serverAgentLabel)"])
+        return true
+    }
+
+    /// Restarts a launchd agent.
+    ///
+    /// An agent that is not loaded is started instead, because there is
+    /// nothing to replace.  A loaded one is kickstarted with the running
+    /// instance replaced, so the agent comes back fresh.
+    public func restartAgent(label: String) throws {
+        let full = "gui/\(uid)/\(label)"
+        if (try? commands.run("/bin/launchctl", ["print", full])) == nil {
+            try startAgent(label: label)
+            return
+        }
+        _ = try commands.run("/bin/launchctl", ["kickstart", "-k", full])
     }
 
     private func bootID() throws -> String {

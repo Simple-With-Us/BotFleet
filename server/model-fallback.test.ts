@@ -13,12 +13,14 @@ import {
   isModelRejectionText,
   isQuotaOrCapText,
   isShortProviderErrorText,
+  isTransientCapacityChip,
   lastTurnStartIndex,
   parseQuotaResetTime,
   providerErrorCodeFromStopReason,
   QuotaCooldownRegistry,
   quotaCooldowns,
   quotaOrCapFromErrorCode,
+  isTransientCapacityText,
   selectTurnFallback,
   selectionForFallbackPick,
   shouldReplayPersistedStarter,
@@ -26,7 +28,11 @@ import {
   turnHitQuotaOrCap,
   turnModelRejectionEvidence,
   turnQuotaOrCapEvidence,
+  turnTransientCapacityEvidence,
+  transientCapacityRetryDelayMs,
   turnProducedAssistantOutput,
+  TransientRouteHealthRegistry,
+  transientRouteHealth,
   inheritedUnattended,
   dshVisionSelection,
   type FallbackScanMessage,
@@ -209,8 +215,10 @@ describe("quota and session-limit failover", () => {
     expect(isQuotaOrCapText("Insufficient Balance")).toBe(true);
     expect(isQuotaOrCapText("out of credits")).toBe(true);
     expect(isQuotaOrCapText("Your credit balance is too low")).toBe(true);
-    expect(isQuotaOrCapText("HTTP 429: Too Many Requests")).toBe(true);
-    expect(isQuotaOrCapText("RESOURCE_EXHAUSTED")).toBe(true);
+    expect(isQuotaOrCapText("HTTP 429: Too Many Requests")).toBe(false);
+    expect(isShortProviderErrorText("HTTP 429: Too Many Requests")).toBe(true);
+    expect(isQuotaOrCapText("RESOURCE_EXHAUSTED")).toBe(false);
+    expect(isTransientCapacityText("RESOURCE_EXHAUSTED")).toBe(true);
     expect(isQuotaOrCapText("Here is a long successful answer about quotas that is well over five hundred characters. ".repeat(8))).toBe(false);
     expect(isQuotaOrCapText("Done.")).toBe(false);
   });
@@ -222,25 +230,19 @@ describe("quota and session-limit failover", () => {
       // grok.com consumer
       "Message limit reached",
       "You've exceeded your messaging allowance for the moment",
-      // xAI API
-      "429 Too Many Requests",
       // Claude.ai subscription (support.claude.com)
       "5-hour limit reached - resets 3:00pm",
       // Claude API (docs.claude.com / platform.claude.com)
       "You have reached your API usage limits: your organization has crossed its monthly API usage threshold",
-      "This request would exceed your organization's rate limit of 30,000 input tokens per minute",
-      "rate_limit_error",
       "enforced_spend_limit_reached",
       // Gemini API (ai.google.dev)
       "Resource has been exhausted (e.g. check quota).",
       "You exceeded your current quota, please check your plan and billing details.",
-      "429 RESOURCE_EXHAUSTED",
       "Your prepayment credits are depleted.",
       // Codex CLI (openai/codex + help.openai.com)
       "You've hit your usage limit. Upgrade to Plus to continue using Codex, or try again later.",
       "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Sep 6th, 2026 11:41 PM.",
       "usage_limit_exceeded",
-      "Rate limit reached for gpt-4.1 in organization org-example on tokens per min (TPM)",
       // Cursor CLI / editor
       "You've reached your monthly limit. Set a new on-demand limit to continue.",
       "Increase limits for faster responses Claude Opus 4.5 is not available in the slow pool. Please switch to Auto.",
@@ -249,15 +251,85 @@ describe("quota and session-limit failover", () => {
       "Upgrade your plan to continue",
       // DeepSeek API (api-docs.deepseek.com)
       "402 Insufficient Balance",
-      "429 Rate Limit Reached",
       // Kimi Code (kimi.com/code/docs error-reference)
       "You've reached your 5-hour usage limit",
       "You've reached your weekly (7-day) usage limit",
       "You've reached your monthly usage limit for this billing cycle",
-      "We're receiving too many requests at the moment. Please wait a moment and try again.",
       "Quota exceeded, please upgrade your plan or retry later",
     ];
     expect(hits.filter((text) => !isQuotaOrCapText(text))).toEqual([]);
+    const transient = [
+      "429 Too Many Requests",
+      "HTTP 429: Too Many Requests",
+      "429 Rate Limit Reached",
+      "429 RESOURCE_EXHAUSTED",
+      "rate_limit_error",
+      "This request would exceed your organization's rate limit of 30,000 input tokens per minute",
+      "Rate limit reached for gpt-4.1 in organization org-example on tokens per min (TPM)",
+      "We're receiving too many requests at the moment. Please wait a moment and try again.",
+      "Concurrency limit reached",
+      "Session limit reached",
+      "Too many concurrent requests",
+      "Maximum number of in-flight sessions exceeded",
+      "RESOURCE_EXHAUSTED concurrency limit",
+    ];
+    expect(transient.filter((text) => !isTransientCapacityText(text))).toEqual([]);
+    expect(transient.filter((text) => isQuotaOrCapText(text))).toEqual([]);
+    expect(turnTransientCapacityEvidence([{ role: "bot", kind: "text", text: "429 Too Many Requests" }], true)).toMatchObject({
+      source: "terminal-text",
+      text: "429 Too Many Requests",
+    });
+    for (const text of [
+      "Maximum number of in-flight sessions exceeded",
+      "HTTP 429: Maximum number of concurrent sessions exceeded",
+    ]) {
+      expect(turnTransientCapacityEvidence([{ role: "bot", kind: "text", text }], true), text).toMatchObject({
+        source: "terminal-text",
+        text,
+      });
+    }
+    expect(isTransientCapacityChip("Rate limit parsing is tested.")).toBe(false);
+    expect(isShortProviderErrorText("Rate limit parsing is tested.")).toBe(false);
+    expect(isTransientCapacityChip("Rate limit reached tests now pass.")).toBe(false);
+    expect(isTransientCapacityChip("Concurrency limit reached tests now pass.")).toBe(false);
+    const healthyConcurrencyText = "Concurrency limit is 3 and currently healthy after the update.";
+    expect(isTransientCapacityChip(healthyConcurrencyText)).toBe(false);
+    expect(isShortProviderErrorText(healthyConcurrencyText)).toBe(false);
+    expect(turnTransientCapacityEvidence([{ role: "bot", kind: "text", text: healthyConcurrencyText }], true)).toBeUndefined();
+    expect(isQuotaOrCapText("429 rate limit reached for this month")).toBe(true);
+    expect(isQuotaOrCapText("429 concurrency limit; resets at 4:30 PM")).toBe(true);
+    expect(isQuotaOrCapText("429 Billing verification failed")).toBe(true);
+    expect(isTransientCapacityText("429 Billing verification failed")).toBe(false);
+    for (const reset of ["resets in30s", "resets in2h", "resets in30"]) {
+      const message = `429 concurrency limit; ${reset}`;
+      expect(isQuotaOrCapText(message), message).toBe(true);
+      expect(isTransientCapacityText(message), message).toBe(false);
+    }
+    for (const reset of [
+      "resets at 5pm",
+      "resets 5 PM",
+      "resets Monday",
+      "resets on Nov 3",
+      "resets today",
+      "resets tomorrow",
+      "resets tonight",
+      "resets next week",
+      "resets next month",
+      "resets in a week",
+    ]) {
+      const message = `You've hit your session limit · ${reset}`;
+      expect(isQuotaOrCapText(message), message).toBe(true);
+      expect(isTransientCapacityText(message), message).toBe(false);
+      expect(turnTransientCapacityEvidence([{ role: "bot", kind: "text", text: message }], true), message).toBeUndefined();
+    }
+    for (const code of ["HTTP 429 insufficient_quota", "HTTP 429 usage_limit_exceeded", "HTTP 429 enforced_spend_limit_reached"]) {
+      expect(isQuotaOrCapText(code), code).toBe(true);
+      expect(isTransientCapacityText(code), code).toBe(false);
+    }
+    for (const code of ["HTTP 429 insufficient_balance", "HTTP 429 insufficient_funds"]) {
+      expect(isQuotaOrCapText(code), code).toBe(true);
+      expect(isTransientCapacityText(code), code).toBe(false);
+    }
     expect(isQuotaOrCapText("Approaching 5-hour limit.")).toBe(false);
     expect(isQuotaOrCapText("You've used 80% of your included usage")).toBe(false);
   });
@@ -307,14 +379,73 @@ describe("quota and session-limit failover", () => {
       { role: "bot", kind: "text", text: "The billing review is complete." },
       { role: "bot", kind: "activity", tool: { name: "error: API request failed: 429 rate limit reached · retry after 45s", ok: false } },
     ];
-    expect(turnQuotaOrCapEvidence(afterUser, false)).toEqual({
+    expect(turnQuotaOrCapEvidence(afterUser, false)).toBeUndefined();
+    expect(turnTransientCapacityEvidence(afterUser, false)).toEqual({
       text: "API request failed: 429 rate limit reached · retry after 45s",
       source: "provider-error",
     });
+    const longProviderError = `429 rate limit reached ${"provider details ".repeat(40)}`;
+    expect(turnTransientCapacityEvidence([
+      { role: "bot", kind: "activity", tool: { name: `error: ${longProviderError}`, ok: false } },
+    ], false)).toMatchObject({ text: longProviderError.trim(), source: "provider-error" });
+    expect(transientCapacityRetryDelayMs("API request failed: 429 rate limit reached · retry after 45s")).toBe(45_000);
+    expect(transientCapacityRetryDelayMs("concurrency limit reached; retry after 120s")).toBe(120_000);
+    expect(transientCapacityRetryDelayMs("concurrency limit reached; try again in 10 minutes")).toBe(300_000);
+    expect(transientCapacityRetryDelayMs("concurrency limit reached; retry-after: 0")).toBe(1_000);
+    expect(transientCapacityRetryDelayMs("HTTP 429 Retry-After:120")).toBe(120_000);
+    expect(transientCapacityRetryDelayMs("retry after 10 seconds.")).toBe(10_000);
+    expect(transientCapacityRetryDelayMs("retry after10requests")).toBe(5_000);
+    expect(transientCapacityRetryDelayMs("retry after 10 requests")).toBe(5_000);
+    expect(transientCapacityRetryDelayMs("concurrency limit reached")).toBe(5_000);
     expect(parseQuotaResetTime("API request failed: 429 rate limit reached · retry after 45s", 1_000, true)).toEqual({
       isQuotaOrCap: true,
       resetsAt: 46_000,
       rawTimeText: "retry after 45s",
+    });
+  });
+
+  it("keeps an earlier transient error when a later generic error is not capacity evidence", () => {
+    const transient = "concurrency limit reached; retry after 10s";
+    const hardQuota = "quota exceeded for the plan";
+    expect(turnTransientCapacityEvidence([
+      { role: "bot", kind: "activity", tool: { name: `error: ${transient}`, ok: false } },
+      { role: "bot", kind: "activity", tool: { name: "error: request failed: transport closed", ok: false } },
+    ], false)).toEqual({ text: transient, source: "provider-error" });
+    expect(turnTransientCapacityEvidence([
+      { role: "bot", kind: "activity", tool: { name: `error: ${transient}`, ok: false } },
+      { role: "bot", kind: "activity", tool: { name: `error: ${hardQuota}`, ok: false } },
+    ], false)).toBeUndefined();
+    expect(turnQuotaOrCapEvidence([
+      { role: "bot", kind: "activity", tool: { name: `error: ${hardQuota}`, ok: false } },
+      { role: "bot", kind: "activity", tool: { name: `error: ${transient}`, ok: false } },
+    ], false)).toEqual({ text: hardQuota, source: "provider-error" });
+    expect(turnTransientCapacityEvidence([
+      { role: "bot", kind: "activity", tool: { name: `error: ${hardQuota}`, ok: false } },
+      { role: "bot", kind: "activity", tool: { name: `error: ${transient}`, ok: false } },
+    ], false)).toBeUndefined();
+    expect(turnQuotaOrCapEvidence([
+      { role: "bot", kind: "activity", tool: { name: `error: ${transient}`, ok: false } },
+      { role: "bot", kind: "activity", tool: { name: `error: ${hardQuota}`, ok: false } },
+    ], false)).toEqual({ text: hardQuota, source: "provider-error" });
+    expect(turnTransientCapacityEvidence([
+      { role: "bot", kind: "activity", tool: { name: `error: ${transient}`, ok: false } },
+      { role: "bot", kind: "activity", tool: { name: `error: ${hardQuota}`, ok: false } },
+    ], false)).toBeUndefined();
+  });
+
+  it("keeps an explicit hard quota ahead of concurrent-cap wording and treats reset chips as hard", () => {
+    const hardQuota = "quota exceeded: maximum concurrent sessions reached";
+    const resetChip = "You've hit your session limit · resets 12:10am (America/Chicago)";
+    expect(turnTransientCapacityEvidence([
+      { role: "bot", kind: "activity", tool: { name: `error: ${hardQuota}`, ok: false } },
+    ], false)).toBeUndefined();
+    expect(turnQuotaOrCapEvidence([
+      { role: "bot", kind: "activity", tool: { name: `error: ${hardQuota}`, ok: false } },
+    ], false)).toMatchObject({ text: hardQuota, source: "provider-error" });
+    expect(turnTransientCapacityEvidence([{ role: "bot", kind: "text", text: resetChip }], true)).toBeUndefined();
+    expect(turnQuotaOrCapEvidence([{ role: "bot", kind: "text", text: resetChip }], true)).toMatchObject({
+      text: resetChip,
+      source: "terminal-chip",
     });
   });
 
@@ -431,6 +562,71 @@ describe("selectTurnFallback", () => {
       nextUsed: 2,
     });
     expect(decide(afterUser, { ok: false, used: 2 })).toBeUndefined();
+  });
+
+  it("skips cooling fallback routes in saved order and advances past the selected entry", () => {
+    const coolingChecks: Array<[string, string, string, number]> = [];
+    const isCooling = (botId: string, instanceId: string, model: string, now: number): boolean => {
+      coolingChecks.push([botId, instanceId, model, now]);
+      return instanceId === "grok";
+    };
+    expect(selectTurnFallback({
+      ok: false,
+      stopReason: null,
+      produced: false,
+      quotaOrCap: true,
+      botId: "bot-1",
+      fallbacks: [
+        { instanceId: "grok", model: "grok-4" },
+        { instanceId: "claude", model: "claude-sonnet-5" },
+      ],
+      used: 0,
+      now: 123,
+      isCooling,
+    })).toEqual({ instanceId: "claude", model: "claude-sonnet-5", nextUsed: 2 });
+    expect(coolingChecks).toEqual([
+      ["bot-1", "grok", "grok-4", 123],
+      ["bot-1", "claude", "claude-sonnet-5", 123],
+    ]);
+  });
+
+  it("does not dispatch when every remaining fallback route is cooling", () => {
+    expect(selectTurnFallback({
+      ok: false,
+      stopReason: null,
+      produced: false,
+      quotaOrCap: true,
+      botId: "bot-1",
+      fallbacks: [
+        { instanceId: "grok", model: "grok-4" },
+        { instanceId: "claude", model: "claude-sonnet-5" },
+      ],
+      used: 0,
+      isCooling: () => true,
+    })).toBeUndefined();
+  });
+
+  it("skips a transiently busy exact route when walking the fallback chain", () => {
+    const now = 1_780_000_100_000;
+    const busyModel = "claude-sonnet-transient-capacity-test";
+    transientRouteHealth.recordFailure("bot-1", "claude", busyModel, "429 rate limit", now);
+    try {
+      expect(selectTurnFallback({
+        ok: false,
+        stopReason: null,
+        produced: false,
+        quotaOrCap: true,
+        botId: "bot-1",
+        fallbacks: [
+          { instanceId: "claude", model: busyModel },
+          { instanceId: "grok", model: "grok-4.7" },
+        ],
+        used: 0,
+        now,
+      })).toMatchObject({ instanceId: "grok", model: "grok-4.7", nextUsed: 2 });
+    } finally {
+      transientRouteHealth.markHealthy("sibling", "claude", busyModel, now + 1);
+    }
   });
 });
 
@@ -758,11 +954,11 @@ describe("bootRecoveryTurnOpts", () => {
 describe("parseQuotaResetTime", () => {
   it("parses relative reset durations in minutes and seconds", () => {
     const base = 1700000000000;
-    const res1 = parseQuotaResetTime("Rate limit reached. Try again in 15 minutes.", base);
+    const res1 = parseQuotaResetTime("You've hit your usage limit. Try again in 15 minutes.", base);
     expect(res1.isQuotaOrCap).toBe(true);
     expect(res1.resetsAt).toBe(base + 15 * 60 * 1000);
 
-    const res2 = parseQuotaResetTime("HTTP 429: Too Many Requests · retry after 45s", base);
+    const res2 = parseQuotaResetTime("HTTP 429: Too Many Requests · retry after 45s", base, true);
     expect(res2.isQuotaOrCap).toBe(true);
     expect(res2.resetsAt).toBe(base + 45 * 1000);
   });
@@ -859,6 +1055,56 @@ describe("a user stop must not fail over", () => {
 });
 
 describe("QuotaCooldownRegistry", () => {
+  it("does not lazily prune live cooldowns outside persisted-load migration", () => {
+    const registry = new QuotaCooldownRegistry();
+    const resetsAt = Date.now() + 60_000;
+    registry.record({
+      botId: "grok-bot",
+      instanceId: "grok",
+      model: "grok-4",
+      resetsAt,
+      error: "session limit",
+      recordedAt: Date.now(),
+    });
+    registry.record({
+      botId: "*",
+      instanceId: "minimax",
+      model: "MiniMax-M3",
+      resetsAt,
+      error: "Rate limit reached for MiniMax-M3",
+      recordedAt: Date.now(),
+    });
+
+    // A balance refresh for another provider calls list() before filtering.
+    // It must not erase the Grok row, and a real MiniMax rate-limit row must
+    // remain authoritative while the account balance is healthy.
+    expect(registry.list()).toHaveLength(2);
+    expect(registry.get("grok-bot", "grok", "grok-4")?.resetsAt).toBe(resetsAt);
+    expect(registry.get("any-bot", "minimax", "MiniMax-M3")?.error)
+      .toBe("Rate limit reached for MiniMax-M3");
+  });
+
+  it("drops a transient row after record normalizes its missing reset to a default TTL", () => {
+    const file = `${tmpdir()}/quota-cooldowns-transient-roundtrip-${Date.now()}.json`;
+    const now = Date.now();
+    const first = new QuotaCooldownRegistry();
+    first.enablePersist(file, (_path, json) => writeFileSync(file, json));
+    first.record({
+      botId: "roundtrip-bot",
+      instanceId: "claude",
+      model: "claude-sonnet-5",
+      error: "429 rate limit reached",
+      recordedAt: now,
+      source: "provider-error",
+    });
+    expect(JSON.parse(readFileSync(file, "utf8")).cooldowns[0].resetsAt).toBe(now + DEFAULT_QUOTA_COOLDOWN_TTL_MS);
+
+    const second = new QuotaCooldownRegistry();
+    second.enablePersist(file, (_path, json) => writeFileSync(file, json));
+    expect(second.get("roundtrip-bot", "claude", "claude-sonnet-5", now + 1)).toBeUndefined();
+    expect(JSON.parse(readFileSync(file, "utf8")).cooldowns).toHaveLength(0);
+  });
+
   it("resolves fallback when primary is on active cooldown and switches back once expired", () => {
     const registry = new (quotaCooldowns.constructor as any)();
     const primary: ModelSelection = {
@@ -875,7 +1121,7 @@ describe("QuotaCooldownRegistry", () => {
       instanceId: "grok",
       model: "grok-4",
       resetsAt,
-      error: "session limit",
+      error: "usage limit reached",
       recordedAt: now,
     });
 
@@ -900,14 +1146,14 @@ describe("QuotaCooldownRegistry", () => {
       fallbacks: [{ instanceId: "antigravity", model: "gemini-3.8-flash-high" }],
     };
 
-    registry.recordInstanceCap("codex", "*", { error: "Codex session limit reached" });
+    registry.recordInstanceCap("codex", "*", { error: "Codex session limit reached · resets in 1 hour" });
 
     // Any bot targeting codex should automatically use fallback
     const resolved = registry.resolveModel("any-bot-id", primary);
     expect(resolved.isFallback).toBe(true);
     expect(resolved.selection.instanceId).toBe("antigravity");
     expect(resolved.selection.model).toBe("gemini-3.8-flash-high");
-    expect(resolved.cooldown?.error).toBe("Codex session limit reached");
+    expect(resolved.cooldown?.error).toBe("Codex session limit reached · resets in 1 hour");
 
     // Cooldown list includes the instance cap
     const active = registry.list();
@@ -954,7 +1200,7 @@ describe("QuotaCooldownRegistry", () => {
     expect(second.get("bot", "grok", "grok-4.6")).toBeUndefined();
   });
 
-  it("drops only legacy sourceless prose cooldowns while retaining terminal chips and named sources", () => {
+  it("drops legacy prose and transient route failures while retaining hard chips and named sources", () => {
     const file = `${tmpdir()}/quota-cooldowns-prose-${Date.now()}.json`;
     writeFileSync(file, JSON.stringify({
       version: 1,
@@ -984,6 +1230,33 @@ describe("QuotaCooldownRegistry", () => {
           recordedAt: Date.now(),
         },
         {
+          botId: "reset-cap-bot",
+          instanceId: "grok",
+          model: "grok-4",
+          resetsAt: null,
+          error: "429 concurrency limit; resets in30s",
+          recordedAt: Date.now(),
+          source: "provider-error",
+        },
+        {
+          botId: "long-transient-bot",
+          instanceId: "grok",
+          model: "grok-4",
+          resetsAt: null,
+          error: `429 rate limit reached ${"provider detail ".repeat(40)}`,
+          recordedAt: Date.now(),
+          source: "provider-error",
+        },
+        {
+          botId: "timestamped-transient-bot",
+          instanceId: "grok",
+          model: "grok-4",
+          resetsAt: Date.now() + 60_000,
+          error: "429 concurrency limit; resets in30s",
+          recordedAt: Date.now(),
+          source: "provider-error",
+        },
+        {
           botId: "monitor-bot",
           instanceId: "antigravity",
           model: "gemini",
@@ -1003,10 +1276,68 @@ describe("QuotaCooldownRegistry", () => {
 
     expect(registry.get("prose-bot", "grok", "grok-4")).toBeUndefined();
     expect(registry.get("chip-bot", "grok", "grok-4")?.source).toBeUndefined();
-    expect(registry.get("prefixed-cap-bot", "grok", "grok-4")?.source).toBeUndefined();
+    expect(registry.get("prefixed-cap-bot", "grok", "grok-4")).toBeUndefined();
+    expect(registry.get("reset-cap-bot", "grok", "grok-4")?.source).toBe("provider-error");
+    expect(registry.get("long-transient-bot", "grok", "grok-4")).toBeUndefined();
+    expect(registry.get("timestamped-transient-bot", "grok", "grok-4")?.resetsAt).toBeGreaterThan(Date.now());
     expect(registry.get("monitor-bot", "antigravity", "gemini")?.source).toBe("antigravity-usage");
     expect(writes).toHaveLength(1);
-    expect(JSON.parse(writes[0]).cooldowns).toHaveLength(3);
+    expect(JSON.parse(writes[0]).cooldowns).toHaveLength(4);
+  });
+
+  it("keeps explicitly timed transient-looking cooldowns across persisted migration", () => {
+    const file = `${tmpdir()}/quota-cooldowns-explicit-reset-${Date.now()}.json`;
+    const recordedAt = Date.now();
+    const explicitReset = recordedAt + 60_000;
+    const defaultReset = recordedAt + DEFAULT_QUOTA_COOLDOWN_TTL_MS;
+    writeFileSync(file, JSON.stringify({
+      version: 1,
+      cooldowns: [
+        {
+          botId: "minimax-bot",
+          instanceId: "minimax",
+          model: "MiniMax-M3",
+          resetsAt: explicitReset,
+          error: "Rate limit reached for MiniMax-M3",
+          recordedAt,
+        },
+        {
+          botId: "provider-error-code-bot",
+          instanceId: "grok",
+          model: "grok-4",
+          resetsAt: explicitReset,
+          error: "API request failed: 429 rate limit reached",
+          recordedAt,
+          source: "provider-error-code",
+        },
+        {
+          botId: "*",
+          instanceId: "minimax",
+          model: "*",
+          resetsAt: explicitReset,
+          error: "429 rate limit reached",
+          recordedAt,
+          source: "usage-monitor",
+        },
+        {
+          botId: "legacy-bot",
+          instanceId: "grok",
+          model: "grok-3",
+          resetsAt: defaultReset,
+          error: "429 rate limit reached",
+          recordedAt,
+        },
+      ],
+    }));
+
+    const registry = new QuotaCooldownRegistry();
+    registry.enablePersist(file, (_path, json) => writeFileSync(file, json));
+
+    expect(registry.get("minimax-bot", "minimax", "MiniMax-M3")?.resetsAt).toBe(explicitReset);
+    expect(registry.get("provider-error-code-bot", "grok", "grok-4")?.resetsAt).toBe(explicitReset);
+    expect(registry.get("any-bot", "minimax", "MiniMax-M2.7")?.source).toBe("usage-monitor");
+    expect(registry.get("legacy-bot", "grok", "grok-3")).toBeUndefined();
+    expect(registry.list()).toHaveLength(3);
   });
 
   it("clearWhere removes a deleted instance's cooldowns even when they never expire, leaving other instances untouched", () => {
@@ -1081,6 +1412,137 @@ describe("QuotaCooldownRegistry", () => {
     registry.clear("non-existent-bot");
     registry.clear("non-existent-bot", "antigravity", "gemini-3.8-pro-high");
     expect(writes).toHaveLength(1);
+  });
+});
+
+describe("TransientRouteHealthRegistry", () => {
+  it("holds a transient route briefly without crossing engine or model ids", () => {
+    const health = new TransientRouteHealthRegistry();
+    health.recordFailure("bot-a", "claude", "claude-sonnet-5", "429 rate limit", 1_000, 5_000);
+    expect(health.get("claude", "claude-sonnet-5", 2_000)?.botId).toBe("bot-a");
+    expect(health.get("claude2", "claude-sonnet-5", 2_000)).toBeUndefined();
+    expect(health.get("claude", "claude-opus-5", 2_000)).toBeUndefined();
+    expect(health.get("claude", "claude-sonnet-5", 6_000)).toBeUndefined();
+    expect(health.recordFailure("bot-b", "claude", "claude-sonnet-5", "retry after 0", 7_000, 0)?.retryAt).toBe(8_000);
+  });
+
+  it("uses four other bots' recent same-route health to suppress transient holds, not hard quota", () => {
+    const health = new TransientRouteHealthRegistry();
+    const quotas = new QuotaCooldownRegistry();
+    for (const botId of ["bot-a", "bot-b", "bot-c", "bot-d"]) {
+      health.markHealthy(botId, "claude", "claude-sonnet-5", 10_000);
+    }
+    expect(health.recordFailure("bot-e", "claude", "claude-sonnet-5", "429 rate limit", 11_000)).toBeUndefined();
+    expect(health.get("claude", "claude-sonnet-5", 11_000)).toBeUndefined();
+
+    quotas.record({
+      botId: "bot-e",
+      instanceId: "claude",
+      model: "claude-sonnet-5",
+      resetsAt: 100_000,
+      error: "quota exceeded for the plan",
+      recordedAt: 11_000,
+      source: "provider-error",
+    });
+    health.markHealthy("bot-a", "claude", "claude-sonnet-5", 12_000);
+    expect(health.get("claude", "claude-sonnet-5", 12_000)).toBeUndefined();
+    expect(quotas.get("bot-e", "claude", "claude-sonnet-5", 12_000)?.error).toBe("quota exceeded for the plan");
+  });
+
+  it("requires a currently active sibling before prior health suppresses a new hold", () => {
+    const health = new TransientRouteHealthRegistry();
+    health.markHealthy("finished-bot", "claude", "claude-sonnet-5", 10_000);
+    expect(health.recordFailure(
+      "new-bot",
+      "claude",
+      "claude-sonnet-5",
+      "429 rate limit",
+      11_000,
+      5_000,
+      (botId) => botId === "active-bot",
+    )).toMatchObject({ botId: "new-bot", retryAt: 16_000 });
+
+    const activeHealth = new TransientRouteHealthRegistry();
+    activeHealth.markHealthy("active-bot", "claude", "claude-sonnet-5", 10_000);
+    expect(activeHealth.recordFailure(
+      "new-bot",
+      "claude",
+      "claude-sonnet-5",
+      "429 rate limit",
+      11_000,
+      5_000,
+      (botId) => botId === "active-bot",
+    )).toBeUndefined();
+  });
+
+  it("does not let the failing bot's own earlier health sample suppress its transient hold", () => {
+    const health = new TransientRouteHealthRegistry();
+    health.markHealthy("bot-a", "claude", "claude-sonnet-5", 10_000);
+    expect(health.recordFailure("bot-a", "claude", "claude-sonnet-5", "concurrency limit reached", 11_000)).toMatchObject({
+      botId: "bot-a",
+      retryAt: 16_000,
+    });
+  });
+
+  it("forgets failed bots before using sibling health and ignores stale success events", () => {
+    const health = new TransientRouteHealthRegistry();
+    health.markHealthy("bot-a", "claude", "claude-sonnet-5", 10_000);
+    health.markHealthy("bot-b", "claude", "claude-sonnet-5", 10_000);
+    expect(health.recordFailure("bot-a", "claude", "claude-sonnet-5", "429 rate limit", 11_000)).toBeUndefined();
+    expect(health.recordFailure("bot-b", "claude", "claude-sonnet-5", "429 rate limit", 12_000)).toMatchObject({ botId: "bot-b" });
+
+    health.markHealthy("bot-c", "claude", "claude-sonnet-5", 9_000);
+    expect(health.get("claude", "claude-sonnet-5", 12_001)?.botId).toBe("bot-b");
+    health.markHealthy("bot-b", "claude", "claude-sonnet-5", 8_000);
+    expect(health.get("claude", "claude-sonnet-5", 12_002)?.botId).toBe("bot-b");
+
+    const isolated = new TransientRouteHealthRegistry();
+    isolated.markHealthy("bot-c", "claude", "claude-sonnet-5", 10_000);
+    isolated.markUnhealthy("bot-c", "claude", "claude-sonnet-5");
+    expect(isolated.recordFailure("bot-c", "claude", "claude-sonnet-5", "concurrency limit reached", 11_000)).toMatchObject({ botId: "bot-c" });
+  });
+
+  it("bounds transient route and health state", () => {
+    const health = new TransientRouteHealthRegistry();
+    for (let index = 0; index < 520; index++) {
+      health.recordFailure(`bot-${index}`, "engine", `model-${index}`, "429 rate limit", 1_000);
+    }
+    expect(health.list(1_001)).toHaveLength(512);
+  });
+
+  it("resolves around a transiently busy fallback without replacing the primary hard-quota row", () => {
+    const now = 1_780_000_200_000;
+    const registry = new QuotaCooldownRegistry();
+    const busyModel = "grok-transient-capacity-test";
+    const primary: ModelSelection = {
+      instanceId: "codex",
+      model: "gpt-5.4",
+      fallbacks: [
+        { instanceId: "grok", model: busyModel },
+        { instanceId: "claude", model: "claude-sonnet-5" },
+      ],
+    };
+    registry.record({
+      botId: "bot-1",
+      instanceId: "codex",
+      model: "gpt-5.4",
+      resetsAt: now + 60_000,
+      error: "usage limit reached",
+      recordedAt: now,
+      source: "provider-error",
+    });
+    transientRouteHealth.recordFailure("bot-2", "grok", busyModel, "429 rate limit", now);
+    try {
+      const resolved = registry.resolveModel("bot-1", primary, now + 1_000);
+      expect(resolved).toMatchObject({
+        selection: { instanceId: "claude", model: "claude-sonnet-5" },
+        isFallback: true,
+        cooldown: { error: "usage limit reached" },
+      });
+      expect(registry.get("bot-1", "codex", "gpt-5.4", now + 1_000)?.error).toBe("usage limit reached");
+    } finally {
+      transientRouteHealth.markHealthy("sibling", "grok", busyModel, now + 2_000);
+    }
   });
 });
 
@@ -1633,7 +2095,7 @@ describe("a setup-dead engine is not a fallback candidate", () => {
       instanceId: primary.instanceId,
       model: primary.model,
       resetsAt: T0 + 60_000,
-      error: "session limit",
+      error: "usage limit reached",
       recordedAt: T0,
     });
     // The first chain entry is cooling too, so the walk reaches dsh — which
@@ -1643,7 +2105,7 @@ describe("a setup-dead engine is not a fallback candidate", () => {
       instanceId: "grok",
       model: "grok-4.7",
       resetsAt: T0 + 60_000,
-      error: "429",
+      error: "429 rate limit reached for this month",
       recordedAt: T0,
     });
 
@@ -1661,7 +2123,7 @@ describe("a setup-dead engine is not a fallback candidate", () => {
     const none = registry.resolveModel("bot1", primary, T0 + 1_000, { isDoomed: doomed("dsh", "claude") });
     expect(none.selection).toMatchObject({ instanceId: primary.instanceId, model: primary.model });
     expect(none.isFallback).toBe(false);
-    expect(none.cooldown?.error).toBe("session limit");
+    expect(none.cooldown?.error).toBe("usage limit reached");
   });
 });
 
@@ -1741,7 +2203,7 @@ describe("the default doomed gate is live, not a stub", () => {
       instanceId: primary.instanceId,
       model: primary.model,
       resetsAt: T0 + 60_000,
-      error: "session limit",
+      error: "usage limit reached",
       recordedAt: T0,
     });
     doomTheRealPair("bot-default-gate", "dsh");

@@ -155,9 +155,20 @@ honour_startup_policy() {
   fi
 }
 
-# True when launchd invoked us rather than a person.
+# True when launchd invoked us as the BotFleet Server job rather than a person.
+#
+# launchd sets XPC_SERVICE_NAME to the job's label.  A shell carries a value
+# too: Terminal.app and the agents' command shells set the string 0, and a
+# shell inside a GUI app such as VS Code inherits that app's own launchd name.
+# So a non-empty value is not launchd, and neither is "anything but 0": only
+# our own job labels are.  Anything else is a person, and a person starting
+# the server is the deliberate start that clears stopped.marker (BF-2527,
+# BF-2528, BF-2582).
 invoked_by_launchd() {
-  [ -n "$LAUNCHD_SERVICE_NAME" ]
+  case "$LAUNCHD_SERVICE_NAME" in
+    app.botfleet.server|com.jay.botfleet-server) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 # Exit 0 if the harness was stopped on purpose.  Returns 1 to carry on.
@@ -461,45 +472,24 @@ reset_fail_ledger
 # this point can still exit without ever touching the log file.
 rotate_log_if_large
 
-# --- the Infisical machine identity --------------------------------------
+# --- the Infisical service tokens ----------------------------------------
 # Recovered through `fleet-secrets get`, and nothing else out of it.
 #
-# This one credential is deliberately not in the vault -- a lock cannot hold
-# its own key -- and not in config.json, which is plaintext, because it can
-# read every name in the project.  That leaves exactly one place a
-# launchd-started harness can get it, and without it the harness comes up
-# "Infisical is not configured" and silently drops every vault-backed
-# credential: the speech-to-speech keys, Zulip's per-role keys, the lot.
+# The helper's own approved bootstrap is managed separately from these app
+# credentials.  Its replacement access must be verified before rollout;
+# fetching a dedicated name does not itself migrate the helper's identity.
+# The desktop can replay protected app credentials while attached, while
+# this optional bootstrap also serves an independently started harness.
 #
-# The desktop app can also replay the identity into a running harness, but
-# only while it is attached -- `before-quit` stops the replay on purpose,
-# because the always-on harness outlives it.  A crash, an update, or a manual
-# restart therefore leaves nothing to restore it, which is exactly when it
-# is most needed.
-#
-# The Node server never calls fleet-secrets.  This wrapper is the launchd entry
-# point, and it copies only the machine-identity pair into the environment
-# loadConfig() already prefers.  The values are fetched one name at a time
-# rather than injected wholesale (`fleet-secrets run` would also refuse every
-# INFISICAL_* name):  `ps eww` prints a process environment and Fleet-OPS holds
-# every fleet secret, so only the identity belongs in this process.  When both
-# halves are already in the environment, nothing is fetched.  A missing helper
-# or a failed fetch is not fatal -- the harness still starts, and the desktop
-# app can still supply the identity in memory.
-#
-# The helper is addressed by its absolute path, $HOME/.local/bin/fleet-secrets,
-# because a LaunchAgent's PATH is minimal.  It authenticates from the login
-# Keychain machine identity (see INFISICAL.md in AI-Fleet-Coordinator).
-#
-# An empty string must not be exported.  loadConfig() treats a defined env var
-# as present (`process.env[name] !== undefined`), so INFISICAL_CLIENT_ID=""
-# would hide config.json and the INFISICAL_UNIVERSAL_AUTH_* aliases.  A half
-# pair would do the same to one side.  Apply the fetched values only when they
-# yield both halves, and only into names that are still empty.  Documented
-# keys (INFISICAL_CLIENT_*) win;  the automation names are the fallback.
+# The managed launcher fetches only the existing dedicated harness tokens.
+# It never provisions or borrows a machine identity.  Explicit product machine
+# identity settings remain the backend's responsibility; inherited values are
+# left untouched and cannot activate that option implicitly.
+# A missing helper or token does not prevent an optional Infisical install
+# from starting; writes still require their separate write credential.
 fleet_secret() {
   local name="$1" bin="$HOME/.local/bin/fleet-secrets"
-  # Anything but an executable file is "no identity"; keep going.
+  # A missing executable helper leaves optional vault access unconfigured.
   [ -f "$bin" ] && [ -x "$bin" ] || return 0
   # The value goes to stdout only; errors are dropped so no fragment is shown.
   "$bin" get "$name" 2>/dev/null | tr -d '\r' || true
@@ -521,31 +511,78 @@ first_fleet_secret() {
 }
 
 load_infisical_identity() {
-  local fetched_id="" fetched_secret=""
-  if [ -n "${INFISICAL_CLIENT_ID:-}" ] && [ -n "${INFISICAL_CLIENT_SECRET:-}" ]; then
-    export INFISICAL_CLIENT_ID INFISICAL_CLIENT_SECRET
-    return 0
+  local fetched_token="" fetched_write_token=""
+  # Preserve configured tokens; consult the approved helper only for a
+  # missing dedicated token and never request a generic identity.
+  if [ -z "${INFISICAL_TOKEN:-}" ]; then
+    fetched_token="$(first_fleet_secret BOTFLEET_HARNESS_INFISICAL_READ_TOKEN)"
+    if [ -n "$fetched_token" ]; then INFISICAL_TOKEN="$fetched_token"; fi
   fi
-  [ -f "$HOME/.local/bin/fleet-secrets" ] && [ -x "$HOME/.local/bin/fleet-secrets" ] || return 0
-  fetched_id="$(first_fleet_secret INFISICAL_CLIENT_ID INFISICAL_AUTOMATION_CLIENT_ID)"
-  fetched_secret="$(first_fleet_secret INFISICAL_CLIENT_SECRET INFISICAL_AUTOMATION_CLIENT_SECRET)"
-  if [ -n "$fetched_id" ] && [ -n "$fetched_secret" ]; then
-    if [ -z "${INFISICAL_CLIENT_ID:-}" ]; then
-      INFISICAL_CLIENT_ID="$fetched_id"
-    fi
-    if [ -z "${INFISICAL_CLIENT_SECRET:-}" ]; then
-      INFISICAL_CLIENT_SECRET="$fetched_secret"
-    fi
+  if [ -z "${INFISICAL_WRITE_TOKEN:-}" ]; then
+    fetched_write_token="$(first_fleet_secret BOTFLEET_HARNESS_INFISICAL_WRITE_TOKEN)"
+    if [ -n "$fetched_write_token" ]; then INFISICAL_WRITE_TOKEN="$fetched_write_token"; fi
   fi
-  if [ -n "${INFISICAL_CLIENT_ID:-}" ]; then
-    export INFISICAL_CLIENT_ID
-  fi
-  if [ -n "${INFISICAL_CLIENT_SECRET:-}" ]; then
-    export INFISICAL_CLIENT_SECRET
-  fi
+  if [ -n "${INFISICAL_TOKEN:-}" ]; then export INFISICAL_TOKEN; fi
+  if [ -n "${INFISICAL_WRITE_TOKEN:-}" ]; then export INFISICAL_WRITE_TOKEN; fi
 }
 
-load_infisical_identity
+read_startup_enrollment() {
+  # Match botfleetDataDir(): trim the override and ignore a blank value.
+  local data_dir="${OMB_DATA_DIR:-}"
+  data_dir="${data_dir#"${data_dir%%[![:space:]]*}"}"
+  data_dir="${data_dir%"${data_dir##*[![:space:]]}"}"
+  local preference="${data_dir:-$HOME/.botfleet}/startup-enrollment.json"
+  if [ ! -e "$preference" ] && [ ! -L "$preference" ]; then
+    # A host that already had an Infisical identity source (environment or the
+    # fleet-secrets helper the old script read) was enrolled before this
+    # choice existed, so it keeps its remote startup.  Nothing is read here.
+    if [ -n "${INFISICAL_TOKEN:-}" ] || { [ -n "${INFISICAL_CLIENT_ID:-}" ] && [ -n "${INFISICAL_CLIENT_SECRET:-}" ]; } ||
+       { [ -f "$HOME/.local/bin/fleet-secrets" ] && [ -x "$HOME/.local/bin/fleet-secrets" ]; }; then
+      printf '%s' remote
+      return 0
+    fi
+    # No identity source at all: nothing to consent to, and the old script
+    # started this Mac without Infisical here too.  Remote needs an explicit
+    # choice in BotFleet Server Setup.
+    printf '%s' local
+    return 0
+    return 0
+  fi
+  "$NODE" --input-type=module -e '
+// BF_STARTUP_ENROLLMENT_V1
+import fs from "node:fs";
+let fd;
+try {
+  fd = fs.openSync(process.argv[1], fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+  const stat = fs.fstatSync(fd);
+  if (!stat.isFile() || stat.size > 1024) process.exit(1);
+  const value = JSON.parse(fs.readFileSync(fd, "utf8"));
+  if (value === null || typeof value !== "object" || Array.isArray(value) ||
+      Object.keys(value).length !== 2 || !Object.hasOwn(value, "version") ||
+      value.version !== 1 || !Object.hasOwn(value, "mode") ||
+      (value.mode !== "local" && value.mode !== "remote")) process.exit(1);
+  process.stdout.write(value.mode);
+} catch { process.exitCode = 1; }
+finally { if (fd !== undefined) fs.closeSync(fd); }
+' -- "$preference"
+}
+
+if ! startup_mode="$(read_startup_enrollment)"; then
+  log_err "startup choice is invalid; open BotFleet Server Setup before starting"
+  exit 1
+fi
+case "$startup_mode" in
+  remote) load_infisical_identity ;;
+  local) log "starting this Mac without Infisical bootstrap" ;;
+  missing)
+    log "startup setup is required; open BotFleet to choose this Mac or Infisical server settings"
+    exit 0
+    ;;
+  *)
+    log_err "startup choice could not be read; open BotFleet Server Setup before starting"
+    exit 1
+    ;;
+esac
 
 cd "$ROOT"
 exec "$NODE" --experimental-strip-types server/index.ts
