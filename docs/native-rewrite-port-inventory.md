@@ -53,7 +53,7 @@ cutover (BF-2498), signing/TCC (BF-2499).
 | `server/capability-profile.ts`, `server/computer-capability.ts`, `server/doomed-dispatch.ts`, `server/turn-safety.ts`, `server/turn-worktree-admission.ts` + wiring test | Dispatch gates → `EngineCoordinator` BF-2504 |
 | `server/model-{context-windows,fallback,lineage,default-slots,rejections}.ts`, `server/retired-model-ids.ts`, `server/instance-models.ts`, `server/claude-models.ts`, `server/antigravity-models.ts` | Model metadata + fallback chains → BF-2507 (data tables port with `shared/model-lineage.ts`) |
 | `server/engine-command-cache.ts` | Engine slash-command cache → `EngineDriver` BF-2504 |
-| `server/system-prompt.ts`, `server/context-injection.ts`, `server/turn-context.ts`, `server/tool-row.ts` | Prompt assembly → `EngineDriver` BF-2504 (pure logic, port with fixtures) |
+| `server/system-prompt.ts`, `server/context-injection.ts`, `server/turn-context.ts`, `server/tool-row.ts`, `server/tool-result-history.ts` | Prompt assembly → `EngineDriver` BF-2504 (pure logic, port with fixtures); oversized tool-result artifacts stay in this lane |
 | `server/seat-prompt.ts`, `bots/_shared.md`, `bots/*.md` (11 seats) | Seat prompts → app resources, `LifecycleService` BF-2497 |
 | `server/chief-of-staff.ts`, `server/botfleet-status-capsule.ts` | Roster/status capsule → `TurnDispatcherActor` input BF-2512 |
 | `server/turn-{stats,watchdog}.ts`, `server/thread-wedge-guard.ts`, `server/repeat-detector.ts`, `server/mcode-lock-contention.ts`, `server/provider-route-activity.ts` | Turn and provider-route health → `EngineCoordinator` BF-2504 |
