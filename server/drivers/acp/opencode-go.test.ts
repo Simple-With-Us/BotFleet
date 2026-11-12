@@ -20,6 +20,7 @@ import {
   discoverOpenCodeModels,
   normalizeLegacyOpenCodeModel,
   openCodeModelProbeDeadline,
+  openCodeModelProbeForClient,
   openCodeModelProbeProblem,
   parseOpenCodeModelsOutput,
   resetOpenCodeModelCache,
@@ -164,12 +165,17 @@ describe("OpenCode catalog", () => {
         await discoverOpenCodeModels({}, broken);
         expect(openCodeModelProbeProblem()).toBe(OPEN_CODE_MODELS_LOAD_FAILED);
         expect(openCodeModelProbeProblem()).not.toContain("probe");
+        expect(openCodeModelProbeForClient()).toBe(OPEN_CODE_MODELS_LOAD_FAILED);
 
         await discoverOpenCodeModels({}, flagOnly);
         // The CLI answered correctly and had nothing to list; the flag refusal
         // is context, not the cause.
         expect(openCodeModelProbeProblem()).toBe(OPEN_CODE_LISTED_NO_MODELS);
         expect(openCodeModelProbeProblem()).not.toMatch(/verbose|listed nothing/i);
+        // BF-2666 already humanized the stored sentence; the client helper
+        // must not convert it again and collapse it to the generic fallback.
+        expect(openCodeModelProbeForClient()).toBe(OPEN_CODE_LISTED_NO_MODELS);
+        expect(openCodeModelProbeForClient()).not.toBe(OPEN_CODE_MODELS_LOAD_FAILED);
       } finally {
         resetOpenCodeModelCache();
         await removeTempDir(scratch);
@@ -701,10 +707,14 @@ describe("OpenCode sign-in probe on a busy host", () => {
         expect(openCodeModelProbeProblem()).toBe(OPEN_CODE_MODELS_TIMED_OUT_BUSY);
         // A timeout says nothing about the flag, so no second ask that would only double the wait.
         expect(existsSync(calls) ? readFileSync(calls, "utf8") : "").not.toContain("--verbose");
+        expect(openCodeModelProbeForClient()).toBe(OPEN_CODE_MODELS_TIMED_OUT_BUSY);
+        expect(openCodeModelProbeForClient()).not.toBe(OPEN_CODE_MODELS_LOAD_FAILED);
 
         await discoverOpenCodeModels({}, empty, quick);
         expect(openCodeModelProbeProblem()).toBe(OPEN_CODE_ANSWERED_NO_MODELS);
         expect(openCodeModelProbeProblem()).not.toMatch(/probe|timed out/i);
+        expect(openCodeModelProbeForClient()).toBe(OPEN_CODE_ANSWERED_NO_MODELS);
+        expect(openCodeModelProbeForClient()).not.toBe(OPEN_CODE_MODELS_LOAD_FAILED);
       } finally {
         resetOpenCodeModelCache();
         await removeTempDir(scratch);
@@ -725,6 +735,8 @@ describe("OpenCode sign-in probe on a busy host", () => {
       await expect(canListOpenCodeModels({}, cli)).resolves.toBeUndefined();
       await discoverOpenCodeModels({}, cli);
       expect(openCodeModelProbeProblem()).toBe(OPEN_CODE_MODELS_STOPPED_EARLY);
+      expect(openCodeModelProbeForClient()).toBe(OPEN_CODE_MODELS_STOPPED_EARLY);
+      expect(openCodeModelProbeForClient()).not.toBe(OPEN_CODE_MODELS_LOAD_FAILED);
     } finally {
       resetOpenCodeModelCache();
       await removeTempDir(scratch);

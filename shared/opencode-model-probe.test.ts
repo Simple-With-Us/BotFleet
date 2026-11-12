@@ -56,6 +56,17 @@ describe("humanizeOpenCodeModelProbeProblem", () => {
     }
   });
 
+  it("does not collapse a second pass of a timeout sentence into the generic fallback", () => {
+    // BF-2666 stores the humanized sentence.  A second conversion that does
+    // not recognize its own output would show "couldn't load… Try again".
+    const once = humanizeOpenCodeModelProbeProblem(
+      "OpenCode's model probe timed out after 20 s (host load 3.0 per core)",
+    );
+    expect(once).toBe(OPEN_CODE_MODELS_TIMED_OUT_BUSY);
+    expect(humanizeOpenCodeModelProbeProblem(once)).toBe(OPEN_CODE_MODELS_TIMED_OUT_BUSY);
+    expect(humanizeOpenCodeModelProbeProblem(once)).not.toBe(OPEN_CODE_MODELS_LOAD_FAILED);
+  });
+
   it("never passes through the word probe", () => {
     for (const raw of [
       "OpenCode's model probe timed out after 50 s",

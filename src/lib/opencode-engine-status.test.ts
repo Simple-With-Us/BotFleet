@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { InstanceInfo } from "@/state/store";
+import { OPEN_CODE_MODELS_TIMED_OUT_BUSY } from "../../shared/opencode-model-probe.ts";
 import { openCodeEngineStatusChip, openCodeModelProbeSentence } from "./opencode-engine-status";
 
 function openCode(snapshot: InstanceInfo["snapshot"]): InstanceInfo {
@@ -32,5 +33,17 @@ describe("openCode engine status copy", () => {
 
     const signIn = openCode({ state: "available", authenticated: false, version: "1.0.0" });
     expect(openCodeModelProbeSentence(signIn)).toBeNull();
+  });
+
+  it("keeps an already-humanized timeout sentence instead of the generic fallback", () => {
+    // The server stores BF-2666's plain sentence on the snapshot.  Humanizing
+    // that text again must not turn it into "couldn't load… Try again".
+    const timeout = openCode({
+      state: "unavailable",
+      transient: true,
+      modelProbeProblem: OPEN_CODE_MODELS_TIMED_OUT_BUSY,
+    });
+    expect(openCodeModelProbeSentence(timeout)).toBe(OPEN_CODE_MODELS_TIMED_OUT_BUSY);
+    expect(openCodeEngineStatusChip(timeout)).toBe("Timed out under load");
   });
 });
