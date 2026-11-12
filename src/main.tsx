@@ -318,6 +318,17 @@ if (fixtureParam === "tv-face") {
       </StrictMode>,
     );
   });
+} else if (fixtureParam === "usage-monitor-quota-grid") {
+  // Visual-spec harness (tests/e2e/usage-monitor-quota-grid.visual.spec.ts):
+  // Settings → Usage → Engine Quotas usage cells and the empty placeholder.
+  void import("./components/UsageMonitorQuotaGridVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
 } else if (fixtureParam === "usage-notices") {
   // Visual-spec harness (tests/e2e/usage-notices.visual.spec.ts): the held-bots
   // and shorter-fallback-chain notices from Settings → Usage → Engine Quotas.
