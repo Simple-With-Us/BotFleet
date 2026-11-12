@@ -12,9 +12,10 @@
 //    synthesizer reports it.  Words the voice skipped (a code block, a URL)
 //    are swept through quickly before the cued word.
 //  - `frame(at:)` says which word is current, how much of it has "rolled
-//    in" (grapheme by grapheme over its duration), and which words just
-//    finished and are fading back to normal ink.  Under Reduce Motion whole
-//    words step on and nothing trails.
+//    in" (grapheme by grapheme over its duration), which one or two words
+//    lead ahead of it, and which two or three just spoken trail behind.
+//    The spoken word is the peak. Under Reduce Motion whole words step on,
+//    with no lead and no trail.
 //
 //  Times are milliseconds on one clock the caller picks.
 //
@@ -28,16 +29,30 @@ public struct KaraokeFrame: Equatable, Sendable {
     public var current: Int
     /// UTF-16 units of the current word painted, from its start.
     public var lit: Int
-    /// Words that just finished, newest first.
+    /// Words just ahead of the one being spoken. Level 0 is the next word.
+    public var lead: [KaraokeLeadWord]
+    /// Words that just finished, newest first. Level 0 is the nearest.
     public var trail: [KaraokeTrailWord]
 
-    public init(current: Int = -1, lit: Int = 0, trail: [KaraokeTrailWord] = []) {
+    public init(current: Int = -1, lit: Int = 0, lead: [KaraokeLeadWord] = [], trail: [KaraokeTrailWord] = []) {
         self.current = current
         self.lit = lit
+        self.lead = lead
         self.trail = trail
     }
 
     public static let none = KaraokeFrame()
+}
+
+public struct KaraokeLeadWord: Equatable, Sendable {
+    public let index: Int
+    /// 0 is the next word, the stronger lead. Higher eases off.
+    public let level: Int
+
+    public init(index: Int, level: Int) {
+        self.index = index
+        self.level = level
+    }
 }
 
 public struct KaraokeTrailWord: Equatable, Sendable {
@@ -59,10 +74,13 @@ public struct KaraokePlayhead: Sendable {
 
     public let words: [KaraokeWord]
     public let reducedMotion: Bool
-    /// How long a finished word keeps the softer accent.
+    /// How long the window lingers after the last word. During the read,
+    /// the trail is the words behind, not this many milliseconds.
     public var trailMs: Double = 220
-    /// How many steps the trail fades through.
-    public var trailLevels: Int = 3
+    /// Words ahead of the one being spoken that take a softer emphasis.
+    public var leadWords: Int = 2
+    /// Words behind the one being spoken that ease back to normal ink.
+    public var trailWords: Int = 3
     /// Live mode: sweep step and ceiling for skipped words (as the timeline).
     public var skipStepMs: Double = 40
     public var skipMaxMs: Double = 320
@@ -145,12 +163,14 @@ public struct KaraokePlayhead: Sendable {
         guard !words.isEmpty else { return .none }
         let c = index(at: t)
         var frame = KaraokeFrame()
+        var speaking = false
         if c >= 0 {
             let start = timeline[2 * c]
             let end = timeline[2 * c + 1]
             let duration = end - start
-            let speaking = t < end
-            if speaking && (!reducedMotion || duration >= Self.reducedMotionMinMs) {
+            let audible = t < end
+            if audible && (!reducedMotion || duration >= Self.reducedMotionMinMs) {
+                speaking = true
                 let word = words[c]
                 var cut = word.end - word.start
                 if !reducedMotion && duration > 0 && duration.isFinite {
@@ -164,19 +184,28 @@ public struct KaraokePlayhead: Sendable {
                 frame.lit = cut
             }
         }
-        if !reducedMotion && trailMs > 0 && c >= 0 {
-            // Recently finished words, newest first; ends never decrease, so
-            // stop at the first one that finished too long ago.
-            var i = frame.current == c ? c - 1 : c
-            var n = 0
-            while i >= 0 && n < 8 {
-                defer { i -= 1; n += 1 }
-                let end = timeline[2 * i + 1]
-                if end > t { continue }
-                let since = t - end
-                if since >= trailMs { break }
-                let level = min(trailLevels - 1, Int(since / trailMs * Double(trailLevels)))
-                frame.trail.append(KaraokeTrailWord(index: i, level: level))
+        if !reducedMotion && c >= 0 {
+            let more = c + 1 < words.count && timeline[2 * (c + 1)].isFinite
+            let lingerOver = !speaking && !more && t - timeline[2 * c + 1] >= trailMs
+            if !lingerOver {
+                var leadLevel = 0
+                var ahead = c + 1
+                while ahead < words.count && leadLevel < leadWords {
+                    defer { ahead += 1 }
+                    if timeline[2 * ahead].isFinite && timeline[2 * ahead] > t {
+                        frame.lead.append(KaraokeLeadWord(index: ahead, level: leadLevel))
+                        leadLevel += 1
+                    }
+                }
+                var trailLevel = 0
+                var behind = speaking ? c - 1 : c
+                while behind >= 0 && trailLevel < trailWords {
+                    defer { behind -= 1 }
+                    let end = timeline[2 * behind + 1]
+                    if end > t { continue }
+                    frame.trail.append(KaraokeTrailWord(index: behind, level: trailLevel))
+                    trailLevel += 1
+                }
             }
         }
         return frame

@@ -111,8 +111,12 @@ export function defaultEnginePlan(id: string): { planName: string; costPerMonth:
   const entry = ENGINE_CAPABILITIES[id];
   if (!entry) return { planName: "Standard", costPerMonth: null };
   return {
+    // An engine whose pricing the registry does not record is not a
+    // subscription: it gets no subscription-flavored plan name.
     planName:
-      entry.pricing.kind === "subscription" || entry.pricing.kind === "subscription+api"
+      entry.pricing.kind === "unknown"
+        ? "Unknown"
+      : entry.pricing.kind === "subscription" || entry.pricing.kind === "subscription+api"
         ? entry.pricing.subscription.tierLabel
         : entry.pricing.kind === "api"
           ? "Pay-as-you-go (API)"

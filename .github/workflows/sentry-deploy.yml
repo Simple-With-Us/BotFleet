@@ -108,8 +108,7 @@ jobs:
         with:
           names: SENTRY_AUTH_TOKEN
           project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
-          client-id: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID || secrets.INFISICAL_CLIENT_ID }}
-          client-secret: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET || secrets.INFISICAL_CLIENT_SECRET }}
+          token: ${{ secrets.INFISICAL_SENTRY_DEPLOY_READ_TOKEN }}
         env:
           GH_FALLBACK_SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
 

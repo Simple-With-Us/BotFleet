@@ -19,6 +19,13 @@ export interface EphemeralResultDelivery {
 const UI_PASS = /\bui[\s-]*pass\b/i;
 const CLASSIFY_WORD = /\bclassify\b/i;
 
+/** True when this trigger's own name, id, or saved instructions name a
+ *  Designer UI pass.  Narrower than `isClassifyOrUiPassWake`:  a plain
+ *  classify wake is not a UI pass. */
+export function isUiPassWake(input: { name?: string; instructions?: string; id?: string }): boolean {
+  return UI_PASS.test(input.name ?? "") || UI_PASS.test(input.instructions ?? "") || UI_PASS.test(input.id ?? "");
+}
+
 /** True when this trigger's own name, id, or saved instructions are a
  *  classify, gate, or Designer UI-pass wake.  The saved instructions are the
  *  operator's prompt, so the word "classify" there is the wake.  Delivery
@@ -35,6 +42,32 @@ export function isClassifyOrUiPassWake(input: {
   if (UI_PASS.test(name) || UI_PASS.test(instructions) || UI_PASS.test(id)) return true;
   if (CLASSIFY_WORD.test(name) || CLASSIFY_WORD.test(instructions) || CLASSIFY_WORD.test(id)) return true;
   return false;
+}
+
+const COMPILE_GATES = /\bcompile[\s-]*gates?\b/i;
+const COMPILE_GATES_PROMPT = /\b(?:own compile gates|bf-compiler)\b/i;
+
+/** True when this trigger's own name, id, or saved instructions are the
+ *  Compile gates webhook.  Matches the ingress pre-filter naming.  Compile
+ *  gates stay on the owning thread (not one-shot), but they share GitHub
+ *  state dedupe so a failed head SHA does not wake Compiler twice. */
+export function isCompileGatesWake(input: {
+  name?: string;
+  instructions?: string;
+  id?: string;
+}): boolean {
+  const name = input.name ?? "";
+  const instructions = input.instructions ?? "";
+  const id = input.id ?? "";
+  // Name/id use the compile-gates phrase.  Instructions stay on the narrow
+  // "own compile gates" / "bf-compiler" forms so an unrelated webhook whose
+  // prompt merely mentions compile gates does not inherit the pre-filter or
+  // head-SHA dedupe (same shape as the previous inline pre-filter).
+  return (
+    COMPILE_GATES.test(name) ||
+    COMPILE_GATES.test(id) ||
+    COMPILE_GATES_PROMPT.test(instructions)
+  );
 }
 
 /** Whether this run should dispatch as a one-shot.  An explicit `oneShotWake`

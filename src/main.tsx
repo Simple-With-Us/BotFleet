@@ -24,6 +24,11 @@ if (globalThis.window && window.matchMedia) {
 const rootElement = document.getElementById("root")!;
 const fixtureParam =
   globalThis.window ? new URLSearchParams(window.location.search).get("fixture") : null;
+// Dev server and `vite build --mode test` only.  A production build constant-folds
+// this to false and drops the usage-grid harness chunk, so a packaged app cannot
+// mount it from /?fixture=usage-monitor-quota-grid.
+const usageMonitorQuotaGridFixture =
+  import.meta.env.DEV || import.meta.env.MODE === "test";
 
 if (fixtureParam === "tv-face") {
   // Visual-spec harness: dynamically import so the fixture chunk is not paid
@@ -49,11 +54,44 @@ if (fixtureParam === "tv-face") {
       </StrictMode>,
     );
   });
+} else if (fixtureParam === "merge-all-threads") {
+  // Visual-spec harness: dynamically import so the fixture chunk is not paid
+  // for in the real app boot path. The App render below is unchanged for any
+  // other URL.
+  void import("./components/MergeAllThreadsVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
+} else if (fixtureParam === "merge-all-threads-menu") {
+  // Visual-spec harness: dynamically import so the fixture chunk is not paid
+  // for in the real app boot path. The App render below is unchanged for any
+  // other URL.
+  void import("./components/MergeAllThreadsMenuVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
 } else if (fixtureParam === "engine-callout") {
   // Visual-spec harness: dynamically import so the fixture chunk is not paid
   // for in the real app boot path. The App render below is unchanged for any
   // other URL.
   void import("./components/EngineCalloutVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
+} else if (fixtureParam === "local-model-wait") {
+  void import("./components/LocalModelWaitVisualFixture").then((mod) => {
     const Fixture = mod.default;
     createRoot(rootElement).render(
       <StrictMode>
@@ -285,6 +323,18 @@ if (fixtureParam === "tv-face") {
       </StrictMode>,
     );
   });
+} else if (usageMonitorQuotaGridFixture && fixtureParam === "usage-monitor-quota-grid") {
+  // Visual-spec harness (tests/e2e/usage-monitor-quota-grid.visual.spec.ts):
+  // Settings → Usage → Engine Quotas usage cells and the empty placeholder.
+  // Compiled for dev and test builds only; production falls through to <App />.
+  void import("./components/UsageMonitorQuotaGridVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
 } else if (fixtureParam === "usage-notices") {
   // Visual-spec harness (tests/e2e/usage-notices.visual.spec.ts): the held-bots
   // and shorter-fallback-chain notices from Settings → Usage → Engine Quotas.
@@ -344,6 +394,17 @@ if (fixtureParam === "tv-face") {
       </StrictMode>,
     );
   });
+} else if (fixtureParam === "sidebar-menu") {
+  // Visual-spec harness (tests/e2e/sidebar-menu-hover.visual.spec.ts): the real
+  // bot context menu, for the hover fill on its rows.
+  void import("./components/SidebarMenuVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
 } else if (fixtureParam === "sign-in-card") {
   // Visual-spec harness (tests/e2e/sign-in-card.visual.spec.ts): the Sign in
   // needed card, open, with a persistent error, and after Done.
@@ -370,6 +431,28 @@ if (fixtureParam === "tv-face") {
   // Visual-spec harness (tests/e2e/settings-always-allow.visual.spec.ts):
   // Agent settings Always allowed empty and populated revoke list.
   void import("./components/SettingsAlwaysAllowVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
+} else if (fixtureParam === "infisical-auth") {
+  // Visual-spec harness for the explicit Infisical authentication method and
+  // scoped read/write source rows; network status is stubbed by Playwright.
+  void import("./components/SecretsSectionVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
+} else if (fixtureParam === "history-compression") {
+  // Visual-spec harness (tests/e2e/history-compression.visual.spec.ts):
+  // History Compression controls, editable and read-only.
+  void import("./components/HistoryCompressionVisualFixture").then((mod) => {
     const Fixture = mod.default;
     createRoot(rootElement).render(
       <StrictMode>

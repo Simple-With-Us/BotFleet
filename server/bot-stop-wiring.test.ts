@@ -29,12 +29,20 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
-// Normalise line endings before matching.  A source-invariant test must not
-// depend on how the runner checked the repo out: without this, the one
-// assertion that anchors on `) {\n  if (runtimeQuiescing)` silently fails
-// on a CRLF checkout, which is every Windows runner.  (It did — this file
-// was the only test in the server suite matching on an explicit `\n`.)
+// Normalize line endings before locating the declaration/body boundaries,
+// independently of whichever admission fence is the first statement.
 const source = readFileSync(join(SERVER_DIR, "index.ts"), "utf8").replace(/\r\n/g, "\n");
+
+function stopPrologue(text: string): string {
+  const declaration = text.indexOf("async function startTurn(");
+  const opening = declaration < 0 ? -1 : text.indexOf(") {\n", declaration);
+  const closing = opening < 0 ? -1 : text.indexOf("\n}", opening);
+  if (opening < 0 || closing < 0) throw new Error("startTurn body is missing");
+  const body = text.slice(opening, closing);
+  const clear = body.indexOf("clearBotSnooze(");
+  if (clear < 0) throw new Error("startTurn does not contain its policy-gated clear");
+  return body.slice(0, clear + "clearBotSnooze(".length);
+}
 
 interface CallSite {
   line: number;
@@ -127,11 +135,7 @@ describe("startTurn call sites classify who initiated the turn", () => {
     // a bare `decideBotStop(...)` whose result is ignored looks identical to
     // a working guard to a reader and to this file, so the throw is asserted
     // too.  (Mutation-tested: deleting just the throw used to pass.)
-    const start = source.indexOf("async function startTurn(");
-    expect(start).toBeGreaterThan(-1);
-    const bodyStart = source.indexOf(") {\n  if (runtimeQuiescing)", start);
-    expect(bodyStart).toBeGreaterThan(start);
-    const prologue = source.slice(bodyStart, bodyStart + 1200);
+    const prologue = stopPrologue(source);
     expect(prologue).toMatch(/decideBotStop\(/);
     // The decision must be consumed, not merely computed.
     expect(prologue).toMatch(/action\s*===\s*"refuse"/);
@@ -139,5 +143,9 @@ describe("startTurn call sites classify who initiated the turn", () => {
     expect(prologue).toMatch(/status:\s*409/);
     // And the clear must be downstream of the decision, never before it.
     expect(prologue.indexOf("decideBotStop(")).toBeLessThan(prologue.indexOf("clearBotSnooze("));
+  });
+
+  it("cannot borrow a policy clear from an unrelated function", () => {
+    expect(() => stopPrologue("async function startTurn() {\n}\nfunction unrelated() { clearBotSnooze(); }")).toThrow(/policy-gated clear/);
   });
 });

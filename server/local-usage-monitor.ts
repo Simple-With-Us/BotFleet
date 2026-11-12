@@ -1,3 +1,4 @@
+import { parseQuotaPlanMetadata } from "../shared/quota-plan-metadata.ts";
 import { lstat, open } from "node:fs/promises";
 import { constants } from "node:fs";
 import { homedir } from "node:os";
@@ -152,7 +153,9 @@ export function parseLocalQuotaPayload(value: unknown, now = Date.now()): LocalQ
           ? "exhausted"
           : remainingPercent <= NEAR_CAP_PERCENT ? "near_cap" : "available",
       skip: false, skipReason: null,
-      planName: text(row.planName, 60), quotaUnit: text(row.quotaUnit, 24),
+      planName: text(row.planName, 60),
+      planMetadata: parseQuotaPlanMetadata(row.planMetadata),
+      quotaUnit: text(row.quotaUnit, 24),
       absoluteRemaining: amount(row.absoluteRemaining), absoluteLimit: amount(row.absoluteLimit),
       // Both cleared once the reset has passed, exactly as `remainingPercent`
       // above is: a verdict recorded before the boundary describes the period

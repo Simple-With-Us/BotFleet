@@ -5,7 +5,7 @@ import { parseJson, type JsonValue } from "./schema.ts";
 import { getSentry, isSentryActive } from "./sentry.ts";
 import type { WebhookManager } from "./webhooks.ts";
 
-export const MAX_WEBHOOK_BODY_BYTES = 256 * 1024;
+export const MAX_WEBHOOK_BODY_BYTES = 1024 * 1024;
 const statusErrorSchema = z.object({ status: z.number().int().optional() });
 const serverAddressSchema = z.object({ port: z.number().int().min(1).max(65_535) });
 
@@ -164,7 +164,11 @@ export function createWebhookIngressHandler(
       return;
     }
     if (req.method === "GET" && url.pathname === "/health") {
-      return json(res, 200, { app: "botfleet-webhooks", ready: true });
+      return json(res, 200, {
+        app: "botfleet-webhooks",
+        ready: true,
+        payloadDedupeSkips: manager.payloadDedupeSkipCount(),
+      });
     }
     if (req.method === "GET" && url.pathname === "/.well-known/apple-app-site-association") {
       return json(res, 200, {
@@ -215,6 +219,16 @@ export function createWebhookIngressHandler(
         });
         return json(res, 401, { error: "Invalid webhook URL or secret" });
       }
+      const event = eventName(req);
+      if (manager.isEventIgnoredAtEdge?.(match[1], event)) {
+        req.resume();
+        const result = manager.recordIgnoredAtEdge(match[1], {
+          eventName: event,
+          contentType: header(req, "content-type"),
+          deliveryId: deliveryId(req),
+        });
+        return json(res, 202, { accepted: true, ...result });
+      }
       releaseAdmission = beginAdmission();
       if (!releaseAdmission) return json(res, 503, { error: "BotFleet is quiescing for an update" });
       const raw = await readRawBody(req);
@@ -223,7 +237,7 @@ export function createWebhookIngressHandler(
       const result = manager.receive(match[1], secret, {
         payload,
         contentType,
-        eventName: eventName(req),
+        eventName: event,
         userAgent: header(req, "user-agent"),
         deliveryId: deliveryId(req),
       });

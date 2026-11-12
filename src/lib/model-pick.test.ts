@@ -172,6 +172,11 @@ describe("context cap", () => {
     expect(contextCapLabel(524_288)).toBe("512K");
     expect(contextCapLabel(1_000_000)).toBe("1M");
   });
+
+  it("never overstates a cap that is not a clean multiple", () => {
+    expect(contextCapLabel(100_000)).toBe("97K");
+    expect(contextCapLabel(300_000)).toBe("292K");
+  });
 });
 
 describe("max output tokens", () => {
