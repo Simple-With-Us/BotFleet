@@ -35,6 +35,23 @@ describe("lifecycle tool completion normalization", () => {
     expect(reconcileLifecycleToolOk(true, "Bash", "completed with errors")).toBe(true);
   });
 
+  it("treats a negated error or failure count as done", () => {
+    expect(lifecycleTextSaysCompleted("completed with no errors", "hookRun: failed")).toBe(true);
+    expect(lifecycleTextSaysCompleted("completed without errors", "hookRun: failed")).toBe(true);
+    expect(lifecycleTextSaysCompleted("0 errors", "hookRun: failed")).toBe(true);
+    expect(lifecycleTextSaysCompleted("0 failures", "hookRun: failed")).toBe(true);
+    expect(lifecycleTextSaysCompleted("no failures", "hookRun: failed")).toBe(true);
+    expect(reconcileLifecycleToolOk(false, "hookRun: failed", "completed with no errors")).toBe(true);
+    expect(reconcileLifecycleToolOk(false, "reminderChild: failed", "completed without errors")).toBe(true);
+    expect(reconcileLifecycleToolOk(false, "workflow: failed", "0 errors")).toBe(true);
+    expect(reconcileLifecycleToolOk(false, "hookRun: failed", "0 failures")).toBe(true);
+    expect(reconcileLifecycleToolOk(false, "subagent: failed", "no failures")).toBe(true);
+    expect(reconcileLifecycleToolOk(false, "workflow: failed", "zero errors")).toBe(true);
+    expect(reconcileLifecycleToolOk(true, "hookRun: completed", "0 errors")).toBe(true);
+    expect(reconcileLifecycleToolOk(false, "hookRun", "completed with 10 errors")).toBe(false);
+    expect(reconcileLifecycleToolOk(false, "Bash", "completed with no errors")).toBe(false);
+  });
+
   it("does not upgrade a non-lifecycle tool that mentions completed", () => {
     expect(reconcileLifecycleToolOk(false, "Bash", "command completed with exit 1")).toBe(false);
     expect(reconcileLifecycleToolOk(false, "Read", "finished reading file")).toBe(false);

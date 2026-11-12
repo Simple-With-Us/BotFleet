@@ -12,11 +12,31 @@ const TITLE_TERMINAL_SUCCESS = /:\s*(?:completed|finished)\s*$/i;
 // output.
 const TITLE_STATUS_SUFFIX = /:\s*(?:inprogress|in_progress|pending|completed|finished|failed|cancelled|canceled|rejected|live state unknown)\s*$/i;
 
-const NAMES_FAILURE = /\b(?:\d+\s+)?(?:errors?|failed|failures?)\b/;
+const FAILURE_WORD = /\b(?:errors?|failed|failures?)\b/g;
+
+// A count of zero, or "no" / "without" / "zero" immediately before the word,
+// is a clean run.  "10 errors" stays a failure because the 0 is not its own token.
+const NEGATED_BEFORE = /(?:^|[^a-z0-9])(?:without|zero|no|0)\s+$/;
+
+function lifecycleProse(detail: string | undefined, title?: string): string {
+  const titleBody = (title ?? "").replace(TITLE_STATUS_SUFFIX, "");
+  return `${titleBody}\n${detail ?? ""}`.toLowerCase();
+}
+
+/** Unnegated failure words force a miss.  A negated one ("0 errors", "no failures") is a clean finish. */
+function scanFailureWords(text: string) {
+  let bare = false;
+  let clean = false;
+  for (const match of text.matchAll(FAILURE_WORD)) {
+    const before = text.slice(0, match.index ?? 0);
+    if (NEGATED_BEFORE.test(before)) clean = true;
+    else bare = true;
+  }
+  return { bare, clean };
+}
 
 function namesFailure(detail: string | undefined, title?: string): boolean {
-  const titleBody = (title ?? "").replace(TITLE_STATUS_SUFFIX, "");
-  return NAMES_FAILURE.test(`${titleBody}\n${detail ?? ""}`.toLowerCase());
+  return scanFailureWords(lifecycleProse(detail, title)).bare;
 }
 
 /** Same shape as provider-route-activity and repeat-detector title guards. */
@@ -27,19 +47,20 @@ export function isLifecycleToolTitle(title: string | undefined): boolean {
 /** Whether lifecycle output or a terminal title says the step finished. */
 export function lifecycleTextSaysCompleted(detail: string | undefined, title?: string): boolean {
   const lower = (detail ?? "").trim().toLowerCase();
-  // "completed with errors" is not done, even under a completed title.
-  if (namesFailure(detail, title)) return false;
+  const scan = scanFailureWords(lifecycleProse(detail, title));
+  // "completed with errors" is not done.  "completed with no errors" and "0 failures" are.
+  if (scan.bare) return false;
   if (title && TITLE_TERMINAL_SUCCESS.test(title.trim())) return true;
-  if (!lower) return false;
-  if (!/\b(?:main run )?(?:completed|finished)\b/.test(lower)) return false;
   if (/\b(?:not|never|unable to|couldn't|could not)\b.{0,48}\b(?:completed|finished)\b/.test(lower)) return false;
   if (/\b(?:did not|didn't)\s+(?:complete|finish)\b/.test(lower)) return false;
+  if (scan.clean) return true;
+  if (!lower) return false;
+  if (!/\b(?:main run )?(?:completed|finished)\b/.test(lower)) return false;
   return true;
 }
 
 /** Treat a failed lifecycle status as success when its text says it completed.
- *  Text that names errors or failures stays failed, including when the
- *  provider already reported the step completed. */
+ *  An unnegated error or failure stays failed.  "no errors" and "0 failures" count as done. */
 export function reconcileLifecycleToolOk(reportedOk: boolean, title: string | undefined, detail?: string): boolean {
   if (!isLifecycleToolTitle(title)) return reportedOk;
   if (namesFailure(detail, title)) return false;
