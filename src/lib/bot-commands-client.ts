@@ -186,17 +186,9 @@ export async function runBotCommand(
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ id: body.id, threadId: body.threadId, surface: body.surface ?? "desktop" }),
   });
-  let payload: unknown = null;
-  try {
-    payload = await res.json();
-  } catch {
-    payload = null;
-  }
   if (!res.ok) {
-    const error = payload && typeof payload === "object" && "error" in payload && typeof payload.error === "string"
-      ? payload.error
-      : "That did not start.";
-    return { ok: false, error };
+    const parsed = z.object({ error: z.string() }).safeParse(await res.json().catch(() => null));
+    return { ok: false, error: parsed.success ? parsed.data.error : "That did not start." };
   }
   return { ok: true };
 }

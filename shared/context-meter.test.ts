@@ -167,5 +167,6 @@ describe("nextContextNote", () => {
     expect(CONTEXT_NOTE_TEXT.endsWith(".")).toBe(true);
     expect(CONTEXT_NOTE_TEXT.includes("  ")).toBe(false);
     expect(COMPACT_SESSION_LABEL).toBe("Compact Session");
+    expect(CONTEXT_NOTE_PERCENT).toBe(80);
   });
 });

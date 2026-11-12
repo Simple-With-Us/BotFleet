@@ -6042,12 +6042,20 @@ bus.subscribe((event: RuntimeEvent) => {
       // A later tick that omits the window keeps the size already reported.
       const previous = turnUsage.get(event.threadId);
       const contextWindow = event.contextWindow ?? previous?.contextWindow;
-      turnUsage.set(event.threadId, {
-        input: event.input,
-        output: event.output,
-        cachedInput: event.cachedInput,
-        ...(contextWindow !== undefined ? { contextWindow } : {}),
-      });
+      if (contextWindow === undefined) {
+        turnUsage.set(event.threadId, {
+          input: event.input,
+          output: event.output,
+          cachedInput: event.cachedInput,
+        });
+      } else {
+        turnUsage.set(event.threadId, {
+          input: event.input,
+          output: event.output,
+          cachedInput: event.cachedInput,
+          contextWindow,
+        });
+      }
       break;
     }
     case "turn.completed": {

@@ -17,8 +17,8 @@ export const CONTEXT_NOTE_TEXT =
 const GAP = "\u00A0 ";
 
 /** A non-negative finite token count, or null when the engine did not report one. */
-export function reportedTokens(value: unknown): number | null {
-  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return null;
+export function reportedTokens(value: number | null | undefined): number | null {
+  if (value == null || !Number.isFinite(value) || value < 0) return null;
   return Math.floor(value);
 }
 
