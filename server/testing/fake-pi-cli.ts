@@ -6,9 +6,14 @@
 // modes mirror how the real CLI misbehaves:
 //
 //   FAKE_PI_MODE   happy (default) | tooluse | permission | interleave | turn-error | no-models | exit-early
+//                  | model-refused (set_model answers success:false) | resume-fail (switch_session answers
+//                  success:false) | stderr-flood (on prompt: 100 KB to stderr, then exit 1) | length (the
+//                  reply is cut off by the output-token limit) | slow-tool (a bash step that runs
+//                  FAKE_PI_TOOL_MS, default 30000, before the reply; `abort` ends it early)
 //   FAKE_PI_MODELS comma-separated provider/model pairs (default "ollama-cloud/glm-5.2,openai/gpt-4o")
 //   FAKE_PI_DUMP   path to append {argv, env} JSON, so a test can assert argv shape
-//                  and env hygiene (no leaked secrets into the pi child).
+//                  and env hygiene (no leaked secrets into the pi child).  Also records
+//                  the child pid, the MCP config path, and each prompt received.
 
 import { appendFileSync, readFileSync } from "node:fs";
 
@@ -47,8 +52,14 @@ if (process.env.FAKE_PI_DUMP) {
       process.env.FAKE_PI_DUMP,
       JSON.stringify({
         argv,
+        pid: process.pid,
+        mcpConfigPath: process.env.OMB_MCP_CONFIG ?? null,
         envConfigured: ["PATH", "HOME", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "XAI_API_KEY", "BOX_TOKEN"].filter(
           (k) => process.env[k] !== undefined,
+        ),
+        // the launcher contract's variables, with values (see server/launch-identity.ts)
+        identityEnv: Object.fromEntries(
+          Object.entries(process.env).filter(([k]) => /^(AGENT_|SIMPLE_TOOLS_|ZULIP_|CLAUDE_CODE_SESSION_ID$)/.test(k)),
         ),
         mcpConfig,
       }) + "\n",
@@ -80,6 +91,15 @@ const streamTurn = () => {
   send({ type: "agent_end" });
 };
 
+// length: the reply stops at the output-token limit.
+const streamLengthTurn = () => {
+  send({ type: "agent_start" });
+  send({ type: "turn_start" });
+  send({ type: "message_update", usage: { input: 0, output: 0 }, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "The answer is" } });
+  send({ type: "turn_end", message: { stopReason: "length", usage: { input: 12, output: 4096 } }, usage: { input: 12, output: 4096 } });
+  send({ type: "agent_end" });
+};
+
 const streamErrorTurn = () => {
   send({ type: "agent_start" });
   send({ type: "turn_start" });
@@ -108,6 +128,22 @@ const streamToolTurn = () => {
   send({ type: "message_update", usage: { input: 0, output: 0 }, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "done" } });
   send({ type: "turn_end", message: { stopReason: "end_turn", usage: { input: 12, output: 2 } }, usage: { input: 12, output: 2 } });
   send({ type: "agent_end" });
+};
+
+// slow-tool: pi starts one of its own bash steps (no card, like the real
+// CLI) and keeps it running, so a test can act on the step while the turn is
+// still open.  An `abort` settles the turn cancelled.
+let slowToolTimer: ReturnType<typeof setTimeout> | undefined;
+const streamSlowToolTurn = () => {
+  send({ type: "agent_start" });
+  send({ type: "turn_start" });
+  send({ type: "tool_execution_start", toolCallId: "call_slow", toolName: "bash", args: { command: "make deploy" } });
+  slowToolTimer = setTimeout(() => {
+    send({ type: "tool_execution_end", toolCallId: "call_slow", toolName: "bash", isError: false });
+    send({ type: "message_update", usage: { input: 0, output: 0 }, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "deployed" } });
+    send({ type: "turn_end", message: { stopReason: "end_turn", usage: { input: 5, output: 1 } }, usage: { input: 5, output: 1 } });
+    send({ type: "agent_end" });
+  }, Number(process.env.FAKE_PI_TOOL_MS) || 30_000);
 };
 
 // permission: open a select ask, hold the turn until extension_ui_response
@@ -178,6 +214,10 @@ function handle(cmd: any) {
       send({ type: "response", command: "new_session", success: true, data: { sessionId: `s-${sessionCounter}`, sessionFile: currentSessionFile } });
       return;
     case "switch_session":
+      if (mode === "resume-fail") {
+        send({ type: "response", command: "switch_session", success: false, error: "session file not found" });
+        return;
+      }
       currentSessionFile = cmd.sessionPath ?? currentSessionFile;
       send({ type: "response", command: "switch_session", success: true, data: { sessionId: "s-resumed", sessionFile: currentSessionFile } });
       return;
@@ -188,6 +228,10 @@ function handle(cmd: any) {
         } catch {
           /* never let dumping break a run */
         }
+      }
+      if (mode === "model-refused") {
+        send({ type: "response", command: "set_model", success: false, error: `Model not found: ${cmd.provider}/${cmd.modelId}` });
+        return;
       }
       send({ type: "response", command: "set_model", success: true, data: { id: cmd.modelId, provider: cmd.provider } });
       return;
@@ -204,18 +248,35 @@ function handle(cmd: any) {
       send({ type: "response", command: "set_thinking_level", success: true });
       return;
     case "prompt":
+      if (process.env.FAKE_PI_DUMP) {
+        try {
+          appendFileSync(process.env.FAKE_PI_DUMP, JSON.stringify({ prompt: cmd.message }) + "\n");
+        } catch {
+          /* never let dumping break a run */
+        }
+      }
+      if (mode === "stderr-flood") {
+        // A crash that logs more than a pipe buffer: without a reader on
+        // stderr this write never completes and the process never exits.
+        const flood = `FATAL: provider stream exploded\n${"x".repeat(100 * 1024)}\nlast words: giving up\n`;
+        process.stderr.write(flood, () => process.exit(1));
+        return;
+      }
       // acknowledge acceptance; the completion comes via events
       send({ type: "response", command: "prompt", success: true });
       if (mode === "tooluse") streamToolTurn();
       else if (mode === "permission") streamPermissionTurn();
       else if (mode === "interleave") streamInterleaveTurn();
       else if (mode === "turn-error") streamErrorTurn();
+      else if (mode === "length") streamLengthTurn();
+      else if (mode === "slow-tool") streamSlowToolTurn();
       else streamTurn();
       return;
     case "extension_ui_response":
       if (cmd.id === "ask-1") finishPermissionTurn();
       return;
     case "abort":
+      if (slowToolTimer) clearTimeout(slowToolTimer);
       send({ type: "turn_end", message: { stopReason: "cancelled", usage: { input: 0, output: 0 } }, usage: { input: 0, output: 0 } });
       return;
     default:

@@ -162,13 +162,23 @@ export function UsageWhatIfProjection(props: UsageWhatIfProjectionProps): React.
   // for the displayed period.  Codex flagged the previous shape — the
   // prop was read but the math never used it.
   const prorationFactor = Math.min(1, Math.max(0, periodDays / 30));
-  const totalActual = rows.reduce((acc, { usage }) => acc + usage.actualCostUsd * prorationFactor, 0);
+  // Pure pay-as-you-go engines (pricing.kind "api", e.g. DeepSeek
+  // Harness) have no plan fee and no recorded spend here, so their
+  // actualCostUsd is a placeholder 0.  Counting them would show
+  // "$0" and book their whole API-equivalent as "saved", so keep them
+  // out of the actual and saved totals.
+  const planRows = rows.filter(({ entry }) => entry.pricing.kind !== "api");
+  const planApi = planRows.reduce((acc, { entry, usage }) => {
+    if (entry.pricing.kind !== "subscription+api") return acc;
+    return acc + apiEquivalentCost(usage, entry.pricing);
+  }, 0);
+  const totalActual = planRows.reduce((acc, { usage }) => acc + usage.actualCostUsd * prorationFactor, 0);
   // The aggregate `saved` can go negative when a subscription costs more
   // than the equivalent PAYG volume (e.g. low-usage Claude Max).  The
   // previous shape clamped it to 0, which misreports a real net loss.
   // Render the signed value with a tone that flips red when negative
   // so the loss is visible — the footer copy explains the math.
-  const totalSaved = totalApi - totalActual;
+  const totalSaved = planApi - totalActual;
 
   return (
     <Card
@@ -201,6 +211,7 @@ export function UsageWhatIfProjection(props: UsageWhatIfProjectionProps): React.
             // review flagged.  Prorating the actual cost keeps the row
             // and the totals in sync for sub-30-day windows.
             const actualCostProrated = usage.actualCostUsd * prorationFactor;
+            const isPayg = entry.pricing.kind === "api";
             const saved = apiCost - actualCostProrated;
             const savedPct = apiCost > 0 ? (saved / apiCost) * 100 : 0;
             const displayName = entry.displayName;
@@ -215,30 +226,34 @@ export function UsageWhatIfProjection(props: UsageWhatIfProjectionProps): React.
             // engine is free.  Codex flagged the previous shape.
             const isBundled =
               entry.pricing.kind === "subscription+api" && entry.pricing.subscription.costPerMonth == null;
-            const actualCostLabel = isBundled ? "Bundled" : hasFiniteCost(actualCostProrated) ? formatUsd(actualCostProrated) : "—";
+            const actualCostLabel = isPayg ? "PAYG" : isBundled ? "Bundled" : hasFiniteCost(actualCostProrated) ? formatUsd(actualCostProrated) : "—";
             return (
               <div key={entry.id} className="grid grid-cols-[1.4fr_1fr_1fr_1fr_0.7fr] items-center gap-x-3 border-b border-hairline/20 py-2 text-[12.5px]">
                 <div className="flex min-w-0 flex-col">
                   <span className="truncate font-medium text-ink" title={displayName}>{displayName}</span>
                   <span className="truncate text-[10.5px] text-ink-secondary">{subscriptionTierLabel}</span>
                 </div>
-                <span className="text-right tabular-nums text-ink" title={isBundled ? "Bundled into another plan" : "What you actually paid this period"}>{actualCostLabel}</span>
+                <span className="text-right tabular-nums text-ink" title={isPayg ? "Pay-as-you-go: billed by the provider per token, no plan fee" : isBundled ? "Bundled into another plan" : "What you actually paid this period"}>{actualCostLabel}</span>
                 <span className="text-right tabular-nums text-ink" title="Pay-as-you-go equivalent">{formatUsd(apiCost)}</span>
-                <span
-                  className={saved >= 0
-                    ? "text-right tabular-nums text-emerald-700 dark:text-emerald-300"
-                    : "text-right tabular-nums text-rose-700 dark:text-rose-300"}
-                  title={saved >= 0 ? "Your subscription saved you this much" : "This plan cost more than the equivalent PAYG volume this period"}
-                >
-                  {saved >= 0 ? formatUsd(saved) : `−${formatUsd(Math.abs(saved))}`}
-                </span>
-                <span className="text-right tabular-nums text-ink-secondary">{apiCost > 0 ? `${savedPct.toFixed(1)}%` : "—"}</span>
+                {isPayg ? (
+                  <span className="text-right tabular-nums text-ink-secondary" title="No plan, so nothing is saved vs PAYG">—</span>
+                ) : (
+                  <span
+                    className={saved >= 0
+                      ? "text-right tabular-nums text-emerald-700 dark:text-emerald-300"
+                      : "text-right tabular-nums text-rose-700 dark:text-rose-300"}
+                    title={saved >= 0 ? "Your subscription saved you this much" : "This plan cost more than the equivalent PAYG volume this period"}
+                  >
+                    {saved >= 0 ? formatUsd(saved) : `−${formatUsd(Math.abs(saved))}`}
+                  </span>
+                )}
+                <span className="text-right tabular-nums text-ink-secondary">{!isPayg && apiCost > 0 ? `${savedPct.toFixed(1)}%` : "—"}</span>
               </div>
             );
           })}
           <div className="mt-3 grid grid-cols-[1.4fr_1fr_1fr_1fr_0.7fr] items-center gap-x-3 border-t border-hairline/40 py-2 text-[13px] font-medium text-ink">
             <span>All engines</span>
-            <span className="text-right tabular-nums">{hasFiniteCost(totalActual) ? formatUsd(totalActual) : "—"}</span>
+            <span className="text-right tabular-nums">{planRows.length > 0 && hasFiniteCost(totalActual) ? formatUsd(totalActual) : "—"}</span>
             <span className="text-right tabular-nums">{formatUsd(totalApi)}</span>
             <span
               className={
@@ -252,9 +267,9 @@ export function UsageWhatIfProjection(props: UsageWhatIfProjectionProps): React.
                   : "Your subscriptions cost more than the equivalent PAYG volume this period — a net loss vs PAYG"
               }
             >
-              {totalSaved >= 0 ? formatUsd(totalSaved) : `−${formatUsd(Math.abs(totalSaved))}`}
+              {planRows.length === 0 ? "—" : totalSaved >= 0 ? formatUsd(totalSaved) : `−${formatUsd(Math.abs(totalSaved))}`}
             </span>
-            <span className="text-right tabular-nums text-ink-secondary">{totalApi > 0 ? `${((totalSaved / totalApi) * 100).toFixed(1)}%` : "—"}</span>
+            <span className="text-right tabular-nums text-ink-secondary">{planApi > 0 ? `${((totalSaved / planApi) * 100).toFixed(1)}%` : "—"}</span>
           </div>
         </div>
       )}
@@ -272,9 +287,10 @@ export function UsageWhatIfProjection(props: UsageWhatIfProjectionProps): React.
       )}
       <div className="mt-3 text-[12px] leading-relaxed text-ink-secondary">
         Saved by plan reflects what your subscription would have charged vs the equivalent
-        volume on PAYG API.{'\u00A0 '}For engines whose pricing is bundled into another plan (Cursor
-        Ultra, DSH), the row reads <em>Your cost: bundled</em> and saved is the same as the
-        API-equivalent — that is honest, not a bug.{'\u00A0 '}{periodDays}-day proration applies to
+        volume on PAYG API.{'\u00A0 '}For engines whose pricing is bundled into another plan, the
+        row reads <em>Your cost: bundled</em> and saved is the same as the API-equivalent — that is
+        honest, not a bug.{'\u00A0 '}Pay-as-you-go engines read <em>PAYG</em>: the API-equivalent
+        is roughly what they cost, and they are left out of the cost and saved totals.{'\u00A0 '}{periodDays}-day proration applies to
         monthly fees when the period is shorter than 30 days.
       </div>
     </Card>

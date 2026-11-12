@@ -9,8 +9,6 @@
 // - `<ComputerProviderToggle>` row per provider (ASCII.dev Box, Self-
 //   Hosted VPS, Local VM, This Computer), each with a caption explaining
 //   the impact of turning it off.
-// - `<VpsModeToggle>` next to the VPS row so the operator can pick
-//   per-bot or "not used" (Shared is hidden until it has a runtime).
 // - `<BotComputerMatrix>` so every bot's grant is visible in one table,
 //   with a one-click "Apply new default to all" that opens a confirm
 //   dialog.
@@ -25,7 +23,6 @@ import { useCallback, useMemo, useState } from "react";
 import { ApiError, api, useStore, type Bot, type ConfigStatus } from "@/state/store";
 import { Card } from "./SettingsPrimitives";
 import { ComputerProviderToggle } from "./ComputerProviderToggle";
-import { VpsModeToggle } from "./VpsModeToggle";
 import { BotComputerMatrix } from "./BotComputerMatrix";
 import { useDesktopCapabilities } from "./DesktopCapabilities";
 import { engineReachKnown, instanceSupportsLocalComputer } from "@/lib/local-computer";
@@ -258,19 +255,7 @@ export function LocalComputerSection() {
     persist(nextProviders, nextVpsMode);
   };
 
-  // The mode control and the VPS toggle drive the same state, so neither
-  // may refuse on account of the other.  Picking a mode while the VPS is
-  // off turns it on with that mode in one save; picking "Not Used" while it
-  // is on goes through the same disable path as the toggle, impact confirm
-  // included.
-  const handleVpsModeChange = (next: VpsMode) => {
-    if (locked) return;
-    if (next === null) {
-      if (providers.selfHostedVps) handleProviderToggle("selfHostedVps", false);
-      return;
-    }
-    persist({ ...providers, selfHostedVps: true }, next);
-  };
+
 
   // Apply workspace defaults to every bot.  Mirrors the existing
   // `BotComputerDefaults.tsx` consent handshake: the server may refuse
@@ -349,6 +334,7 @@ export function LocalComputerSection() {
   return (
     <>
       <Card
+        id="setting-computers-providers"
         title="Providers"
         subtitle="The computer providers any bot in this workspace is allowed to use.  Disabling a provider here keeps every bot off it, no matter what a bot's own settings say.  Leave the shipped set on to keep the current behavior."
       >
@@ -363,10 +349,6 @@ export function LocalComputerSection() {
             />
           ))}
         </div>
-        <div className="mt-4 flex flex-col gap-1.5 border-t border-hairline/40 pt-4">
-          <div className="text-[12px] font-medium text-ink">Self-Hosted VPS Mode</div>
-          <VpsModeToggle value={vpsMode} busy={locked} onChange={handleVpsModeChange} />
-        </div>
         {configReady && resolved.resolvedFromLegacy && (
           <div className="mt-3 rounded-lg bg-warning/10 px-3 py-2 text-[11.5px] text-warning">
             Loaded from the legacy <code className="font-mono">allowedComputers</code> shape.  The next save will write the new per-provider key alongside it.
@@ -375,6 +357,7 @@ export function LocalComputerSection() {
       </Card>
 
       <Card
+        id="setting-computers-matrix"
         title="Bots"
         subtitle="Which providers every bot in this workspace has.  Per-bot edits live in each bot's settings; the matrix is the master view."
       >

@@ -104,6 +104,24 @@ final class FailoverTests: XCTestCase {
         XCTAssertEqual(rotation.endpoints, [hosted])
     }
 
+    func testIsGatewayStatusCodeCoversBothTunnelRangesAndNothingElse() {
+        for code in [502, 503, 504, 520, 521, 522, 523, 524, 525, 526, 527, 528, 529, 530] {
+            XCTAssertTrue(ConnectionAdvice.isGatewayStatusCode(code), "expected HTTP \(code) to be a gateway status")
+        }
+        for code in [200, 400, 401, 403, 404, 409, 500, 501, 505, 519, 531, 600] {
+            XCTAssertFalse(ConnectionAdvice.isGatewayStatusCode(code), "expected HTTP \(code) not to be a gateway status")
+        }
+    }
+
+    func testIsGatewayOutageOnlyMatchesAPIStatusErrorsNotURLErrors() {
+        XCTAssertTrue(ConnectionAdvice.isGatewayOutage(APIError.status(code: 502, message: nil)))
+        XCTAssertFalse(ConnectionAdvice.isGatewayOutage(APIError.status(code: 500, message: nil)))
+        // An address-shaped URLError is a route problem, not a gateway
+        // response, even though `shouldTryAnotherRoute` also moves the dial
+        // for it.
+        XCTAssertFalse(ConnectionAdvice.isGatewayOutage(URLError(.cannotConnectToHost)))
+    }
+
     func testAuthenticationFailureDoesNotAdvanceTheRoute() throws {
         let hosted = try XCTUnwrap(CompanionEndpoint(
             url: "https://mac.companion.example",

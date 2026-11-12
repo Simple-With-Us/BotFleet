@@ -4,6 +4,8 @@
 import { useEffect, useRef, useState } from "react";
 import { Bot as BotIcon, MessageSquare, Search, Users } from "lucide-react";
 import { api, getRoomTerminology, useStore, type Bot, type Group } from "@/state/store";
+import { preparePaletteBots, preparePaletteGroups } from "@/lib/command-palette-entries";
+import { BOT_CHATS_SECTION } from "@/lib/sidebar-preferences";
 import { rankByName } from "@/lib/palette-rank";
 import { cn } from "@/lib/cn";
 import type { SearchHit } from "@/lib/search-hit";
@@ -63,14 +65,19 @@ export function CommandPalette({ onOpenChange }: { onOpenChange?: (open: boolean
     // debounce and request for this query are pending.
     setMessageHits([]);
     let alive = true;
+    const controller = new AbortController();
     const timer = setTimeout(() => {
-      api(`/api/search?q=${encodeURIComponent(q)}&limit=12`)
+      api(`/api/search?q=${encodeURIComponent(q)}&limit=12`, { signal: controller.signal })
         .then((result: { hits?: SearchHit[] }) => alive && setMessageHits(result.hits ?? []))
-        .catch(() => alive && setMessageHits([]));
+        .catch(() => {
+          if (!alive || controller.signal.aborted) return;
+          setMessageHits([]);
+        });
     }, 150);
     return () => {
       alive = false;
       clearTimeout(timer);
+      controller.abort();
     };
   }, [open, q]);
 
@@ -82,11 +89,14 @@ export function CommandPalette({ onOpenChange }: { onOpenChange?: (open: boolean
 
   if (!open) return null;
 
-  const bots = rankByName(state.bots.filter((b) => !b.hidden), q);
-  const rooms = rankByName(state.groups, q);
+  const { rooms: roomPool, botChats: botChatPool } = preparePaletteGroups(state.groups);
+  const bots = rankByName(preparePaletteBots(state.bots), q);
+  const rooms = rankByName(roomPool, q);
+  const botChats = rankByName(botChatPool, q);
   const entries: PaletteEntry[] = [
     ...bots.map((bot): PaletteEntry => ({ kind: "bot", bot })),
     ...rooms.map((group): PaletteEntry => ({ kind: "room", group })),
+    ...botChats.map((group): PaletteEntry => ({ kind: "room", group })),
     // message hits only make sense for a typed query; empty = switcher mode
     ...(q ? messageHits.map((hit): PaletteEntry => ({ kind: "message", hit })) : []),
   ];
@@ -128,7 +138,8 @@ export function CommandPalette({ onOpenChange }: { onOpenChange?: (open: boolean
 
   // flat cursor across sections; each row needs its absolute index
   const roomOffset = bots.length;
-  const messageOffset = bots.length + rooms.length;
+  const botChatsOffset = bots.length + rooms.length;
+  const messageOffset = botChatsOffset + botChats.length;
 
   const row = (key: string, index: number, onPick: () => void, children: React.ReactNode, twoLine = false) => (
     <button
@@ -207,6 +218,22 @@ export function CommandPalette({ onOpenChange }: { onOpenChange?: (open: boolean
             row(
               `room:${group.id}`,
               roomOffset + i,
+              () => void activate({ kind: "room", group }),
+              <>
+                <Users size={16} className="shrink-0 text-ink-secondary" />
+                <span className="truncate text-[14px] text-ink" title={group.name}>{group.name}</span>
+              </>,
+            ),
+          )}
+          {botChats.length > 0 && (
+            <div className="px-3 pb-1 pt-2 text-[11px] font-medium uppercase tracking-[0.08em] text-ink-secondary">
+              {BOT_CHATS_SECTION}
+            </div>
+          )}
+          {botChats.map((group, i) =>
+            row(
+              `room:${group.id}`,
+              botChatsOffset + i,
               () => void activate({ kind: "room", group }),
               <>
                 <Users size={16} className="shrink-0 text-ink-secondary" />

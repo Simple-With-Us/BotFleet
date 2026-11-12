@@ -19,6 +19,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import type { DecisionRow } from "./decision-log.ts";
 import { removeTempDir, spawnDetached, waitForExit } from "./testing/cleanup.ts";
+import { harnessReady } from "./testing/harness-ready.ts";
 
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
 const FAKE_CLI = join(SERVER_DIR, "testing", "fake-acp-cli.ts");
@@ -128,7 +129,12 @@ posixOnly("authorization decisions are logged", () => {
         },
       }),
     );
-    child = spawnDetached(process.execPath, [join(SERVER_DIR, "index.ts")], {
+    // This suite checks permission wiring, not host admission.  A busy
+    // runner defers a webhook wake for 20 minutes, longer than these
+    // assertions wait, so the webhook run stays queued and the test reads
+    // that as "the webhook never started a task".  Keep real production
+    // admission unchanged; isolate only this child.
+    child = spawnDetached(process.execPath, ["--import", join(SERVER_DIR, "testing", "cool-host-loader.mjs"), join(SERVER_DIR, "index.ts")], {
       cwd: join(SERVER_DIR, ".."),
       env: {
         ...(process.env.PATH ? { PATH: process.env.PATH } : {}),
@@ -143,7 +149,7 @@ posixOnly("authorization decisions are logged", () => {
     const deadline = Date.now() + 20_000;
     for (;;) {
       try {
-        if ((await fetch(`${BASE}/api/health`)).ok) break;
+        if (await harnessReady(BASE)) break;
       } catch {
         /* not up yet */
       }

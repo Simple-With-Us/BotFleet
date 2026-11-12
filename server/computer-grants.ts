@@ -25,7 +25,7 @@ import type { AppConfig } from "./config.ts";
 
 /** One computer granted to a bot for one turn. Exactly one of `box` / `stdio`
  * is set: the cloud box speaks through BotFleet's REST-to-MCP adapter, while
- * host, sandbox, and VPS computers expose Cua Driver's own MCP server. */
+ * host, sandbox, and VPS computers expose CUA Driver's own MCP server. */
 export interface ComputerMount {
   /** MCP server name, and therefore the agent's tool prefix. */
   name: string;
@@ -35,7 +35,15 @@ export interface ComputerMount {
   box?: {
     kind?: "box";
     boxId: string;
+    /** The mount's per-box gateway grant — NOT the account-wide Box API key.
+     *  It authenticates one box id at the harness's own loopback gateway and
+     *  nothing anywhere else, so the key that can reach every box in the
+     *  account never enters a bot's process. */
     token: string;
+    /** Loopback base for the Box calls.  Empty when the harness has no
+     *  gateway to point at, which leaves the proxy with a bearer the provider
+     *  will reject rather than one it will honour. */
+    gatewayUrl?: string;
     control?: { url: string; token: string };
   };
   stdio?: {
@@ -94,15 +102,15 @@ export function isHostMount(mount: ComputerMount): boolean {
 }
 
 const SINGLE_PROMPTS = {
-  vm: " You have a shared, isolated Cua sandbox: a Linux desktop in a container on this machine. Only /home/cua/workspace is durable; save downloads, repositories, working files, and browser profiles there because everything else inside the VM is disposable. No other host folder is mounted. Use the computer tools for desktop, accessibility, window, and shell work. Inspect the desktop state before acting, prefer accessibility targets over raw coordinates, and work carefully.",
+  vm: " You have a shared CUA sandbox: a Linux desktop in a container on this machine. Only /home/cua/workspace is durable; save downloads, repositories, working files, and browser profiles there because everything else inside the VM is disposable. That workspace is the only host folder mounted into the VM, and the VM has outbound internet access like any other computer, so treat it as your own machine rather than as a sealed sandbox. Use the computer tools for desktop, accessibility, window, and shell work. Inspect the desktop state before acting, prefer accessibility targets over raw coordinates, and work carefully.",
   box: " You have your own cloud computer. In Chrome, prefer browser_snapshot with browser_click/browser_fill for semantic, trusted actions; use screenshot/click/type_text for visual or non-browser UI, open_url for navigation, and computer_exec for Linux tasks. Every action already returns the resulting screen, so don't follow it with screenshot; batch predictable pixel actions with computer_batch.",
-  vps: " You have your own self-hosted remote Linux computer through the official Cua tools. Its filesystem is disposable: everything on it is wiped whenever its container is recreated, so keep long-lived work somewhere durable — push it to a remote, or hand the results back in chat — instead of leaving it only on that computer. Inspect the desktop state before acting, prefer accessibility targets over raw coordinates, and act carefully.",
+  vps: " You have your own self-hosted remote Linux computer through the official CUA tools. Its filesystem is disposable: everything on it is wiped whenever its container is recreated, so keep long-lived work somewhere durable — push it to a remote, or hand the results back in chat — instead of leaving it only on that computer. Inspect the desktop state before acting, prefer accessibility targets over raw coordinates, and act carefully.",
   local: " You can act on the user's computer through the computer tools — take a screenshot or read the desktop state first, prefer accessibility actions over raw coordinates, and act carefully.",
 } satisfies Record<ComputerKind, string>;
 
 /** What a host grant actually puts in the engine's hands.
  *
- * An MCP engine mounts the Cua Driver server and really can see and click the
+ * An MCP engine mounts the CUA Driver server and really can see and click the
  * desktop.  A toolLoop engine mounts no MCP server at all: its host surface is
  * the harness's own `bash`, `read_file`, `write_file` and `edit_file` behind
  * the `workspaceOrHostComputer` gate in server/tools/registry.ts, and that
@@ -121,15 +129,21 @@ function localPrompt(toolLoopSurface: boolean): string {
 
 /** One line per computer when several are mounted, naming the tool prefix so
  * the agent can tell them apart at the point of use. */
-function multiLine(mount: ComputerMount): string {
+function multiLine(mount: ComputerMount, opts: { vpsShared?: boolean } = {}): string {
   const tools = `\`${mount.name}\` tools (prefixed \`mcp__${mount.name}__\`)`;
   switch (mount.kind) {
     case "vm":
-      return `${mount.label} — an isolated Linux desktop in a container on this machine, through the ${tools}. Only /home/cua/workspace survives a rebuild.`;
+      return `${mount.label} — a Linux desktop in a container on this machine, through the ${tools}. Only /home/cua/workspace survives a rebuild, and it is the only host folder mounted into it.`;
     case "box":
       return `${mount.label} — your own cloud Linux desktop, through the ${tools}. In Chrome prefer browser_snapshot with browser_click/browser_fill; use computer_exec for shell work.`;
     case "vps":
-      return `${mount.label} — your own isolated, self-hosted remote Linux desktop (one container per bot, not shared with the other bots), through the ${tools}. Its filesystem is disposable, so push long-lived work to a remote instead of leaving it there.`;
+      // Shared mode hands every bot its own desktop session inside ONE
+      // container, so telling the bot it is isolated misdescribes the surface
+      // it is actually sharing — it invites a bot to assume desktop state it
+      // does not own.
+      return opts.vpsShared
+        ? `${mount.label} — your own self-hosted remote Linux desktop, running in a container the other bots share.  Every bot gets its own desktop session inside it, so nobody else sees or clicks your desktop.  Use the ${tools}.  Its filesystem is disposable, so push long-lived work to a remote instead of leaving it there.`
+        : `${mount.label} — your own isolated, self-hosted remote Linux desktop (one container per bot, not shared with the other bots), through the ${tools}. Its filesystem is disposable, so push long-lived work to a remote instead of leaving it there.`;
     case "local":
       return `${mount.label} — the user's own machine, through the ${tools}. Every action here is brokered for the user's approval, so it is slower and more intrusive than a remote desktop.`;
   }
@@ -163,6 +177,11 @@ export function computerSystemPrompt(
      * rather than MCP servers.  Both dispatchers pass it, so the two lanes
      * cannot describe the same grant differently. */
     toolLoopSurface?: boolean;
+    hasHostTerminal?: boolean;
+    /** True when the Self-hosted VPS runs in shared mode, where every bot
+     *  shares one container and only holds its own desktop session inside it.
+     *  Without this the prompt claims an isolation shared mode does not have. */
+    vpsShared?: boolean;
   } = {},
 ): string {
   if (mounts.length === 0) return "";
@@ -170,6 +189,10 @@ export function computerSystemPrompt(
   const protectedInput =
     " At a sign-in, password, MFA, CAPTCHA, or other protected-input step, stop and ask the user to complete it" +
     " on the visible computer. Never type their password or ask them to paste a password or one-time code into chat.";
+
+  const hostTerminalNotice = opts.hasHostTerminal
+    ? " You can also run commands and inspect files on the host computer through `bash` and the file tools without affecting the host desktop."
+    : "";
 
   if (mounts.length === 1) {
     const [only] = mounts;
@@ -181,17 +204,18 @@ export function computerSystemPrompt(
         : only.kind === "local"
           ? localPrompt(opts.toolLoopSurface === true)
           : SINGLE_PROMPTS[only.kind];
-    return body + protectedInput;
+    return body + hostTerminalNotice + protectedInput;
   }
 
   const host = mounts.find(isHostMount);
   const remote = mounts.find((m) => !isHostMount(m));
-  const lines = mounts.map((m) => `- ${multiLine(m)}`).join("\n");
+  const lines = mounts.map((m) => `- ${multiLine(m, opts)}`).join("\n");
   const policy = host && remote ? selectionPolicy(remote, host) : "";
   return (
     ` You have ${mounts.length} computers, each with its own separate set of tools:\n${lines}\n` +
     `They are separate machines: a file, a browser session, or an application on one is not on the other.` +
     policy +
+    hostTerminalNotice +
     protectedInput
   );
 }
@@ -364,11 +388,11 @@ export function cloudRunUsesBoxAgent(
  * Everything above answers "what was this bot granted".  What follows answers
  * "what can it actually hold for THIS turn", which is the half that has to
  * talk to the world: a Local VM has to be claimed, a VPS provisioned, a cloud
- * box woken, host control read off Cua Driver's descriptor.
+ * box woken, host control read off CUA Driver's descriptor.
  *
  * It lives here rather than inline in the dispatcher because there are two
  * dispatchers.  `startTurn` resolved all of this and a room turn resolved none
- * of it, so a bot holding Cua, a Box, a Local VM or a VPS in a direct chat
+ * of it, so a bot holding CUA, a Box, a Local VM or a VPS in a direct chat
  * lost every one of them the moment it spoke in a room — while the HTTP lane
  * in that same room kept host `bash` through `hasHostComputer`.  A room is a
  * different conversation, not a different bot, so both lanes call this.
@@ -397,7 +421,7 @@ export interface TurnComputerEngine {
    * rule lives in `server/contracts.ts`, and it is the only thing that makes
    * mounting the person's own desktop honest. */
   localComputerMcp: boolean;
-  /** Runs the harness tool loop itself, so it has host tools without Cua. */
+  /** Runs the harness tool loop itself, so it has host tools without CUA. */
   toolLoop: boolean;
 }
 
@@ -415,13 +439,47 @@ interface RemoteComputerStatus {
   sshAlias?: string | null;
   container_id?: string | null;
   problem?: string | null;
+  /** True when SSH and Docker answered.  A stopped desktop that answered
+   * is a switch the person can flip; a check that never answered is the
+   * connection. */
+  daemonUp?: boolean;
+}
+
+/** The one way on an Auto turn names when this bot's VPS is unavailable,
+ * fitted to what its check found.  `reachable` is true when SSH and Docker
+ * answered and the desktop is down, false when the VPS never answered, and
+ * undefined when the check threw. */
+export function vpsUnavailableHint(input: {
+  automationSource?: string;
+  autoStartVps?: boolean;
+  reachable?: boolean;
+}): string {
+  if (input.automationSource) {
+    const kind = input.automationSource === "schedule" ? "scheduled run" : "automation run";
+    return `This ${kind} tried to start the VPS computer and could not reach it.  Check the VPS connection in App Settings → Connections.`;
+  }
+  if (input.autoStartVps || input.reachable === false) {
+    return "Check the VPS connection in App Settings → Connections.";
+  }
+  return input.reachable
+    ? "Open Computer and enable Start VPS automatically, or choose Cloud to start it manually."
+    : "";
+}
+
+/** Scheduled and other unattended automation still fail when the VPS is
+ * unreachable: nobody is there to read a reply, and the work is the screen.
+ * A person chatting, a delegated turn, and a live iMessage or Zulip thread
+ * run, and the model is told why no computer is mounted. */
+export function autoVpsOutageFailsTurn(automationSource?: string): boolean {
+  if (!automationSource) return false;
+  return automationSource !== "delegation" && automationSource !== "imessage" && automationSource !== "zulip";
 }
 
 /** What the resolver needs from the running harness.  `Lease` is the VPS turn
  * lease handle, inferred from whatever pool the dispatcher passes. */
 export interface TurnComputerDeps<Lease = unknown> {
   hostPlatform: NodeJS.Platform;
-  /** Cua Driver's already-running connection descriptor, or null. */
+  /** CUA Driver's already-running connection descriptor, or null. */
   readHostConnection(): ComputerMount["stdio"] | null;
   /** Claim the Local VM for this turn, or throw the reason it cannot be had.
    * The lease, the lifecycle busy flags and the idle backstop are the
@@ -450,6 +508,14 @@ export interface TurnComputerDeps<Lease = unknown> {
   };
   /** The loopback control pair a computer bridge calls back on. */
   controlIntegration(botId: string): { url: string; token: string };
+  /** The Box gateway's own two calls, injected for the same reason
+   *  `controlIntegration` is: this module is reachable from the renderer
+   *  bundle, and the gateway needs `node:crypto`.  A value import here would
+   *  put it there and vite would refuse the build. */
+  boxGateway: {
+    url(control: { url: string } | undefined): string;
+    mint(botId: string, boxId: string, gatewayUrl: string): { url: string; token: string };
+  };
   broadcast(frame: ComputerStateFrame): void;
   /** One activity chip on the turn's own thread.  The caller shapes it,
    * because a room chip carries the speaking member and a 1:1 chip does not. */
@@ -475,8 +541,12 @@ export interface TurnComputerMounts<Lease = unknown> {
   /** `wantsLocal && localComputerMcp` — the host-tool gate both lanes hand to
    * `buildTurnTools`, kept here so the two dispatchers cannot drift.
    * Deliberately independent of `mounts`: a toolLoop engine has host tools
-   * through the harness executor whether or not Cua Driver is running. */
+   * through the harness executor whether or not CUA Driver is running. */
   hasHostComputer: boolean;
+  /** Set when Auto's VPS is unreachable and this turn still runs.  Empty
+   * when a computer mounted, the turn was cancelled, or the outage failed
+   * the turn instead.  The dispatcher appends it to the computer prompt. */
+  unavailableNote: string;
 }
 
 /** Resolve every computer this bot may hold for this turn.
@@ -495,9 +565,53 @@ export interface ResolveTurnComputerMountsInput<Lease> {
   runOn?: string;
   /** Whether this turn is running unattended (e.g. routine or webhook). */
   unattended?: boolean;
+  /** What started a turn nobody typed.  Scheduled and other automation
+   * still fail when Auto's VPS cannot be reached.  A chat, a delegation,
+   * and a live message run with `unavailableNote` instead. */
+  automationSource?: string;
   /** The operator-level allowlist, already read off the config. */
   allowed: ComputerDestination[] | null;
   deps: TurnComputerDeps<Lease>;
+}
+
+/** Drop each destination the redesigned per-provider settings
+ *  (`botDefaults.computerProviders`) disable.  A missing `computerProviders`
+ *  keeps the legacy allowlist's answer bit-for-bit.  Shared by the turn's
+ *  mount resolution and `hostShellGranted`, so the two cannot disagree. */
+export function filterGrantedByProviders(
+  granted: ComputerDestination[],
+  cfg: AppConfig,
+  cloudBackend: "box" | "vps",
+): ComputerDestination[] {
+  const providers = cfg.botDefaults?.computerProviders;
+  if (!providers) return granted;
+  let next = granted;
+  if (next.includes("cloud")) {
+    const backendEnabled = cloudBackend === "box" ? providers.asciiBox === true : providers.selfHostedVps === true;
+    if (!backendEnabled) next = next.filter((d) => d !== "cloud");
+  }
+  if (providers.localVm !== true) next = next.filter((d) => d !== "vm");
+  if (providers.localMac !== true) next = next.filter((d) => d !== "local");
+  return next;
+}
+
+/** Whether the bot may run shell commands on this host — `bash` and
+ *  background jobs on the HTTP tool lane.  The grant half of the
+ *  `hasHostComputer` derivation in the mount resolution below (This
+ *  Computer, or a Local VM grant with the host terminal allowed); the engine
+ *  half is the caller's.  The jobs registry asks it on every tick, so any
+ *  setting that narrows a bot's computers stops its jobs, whichever screen
+ *  it was changed on. */
+export function hostShellGranted(
+  bot: Pick<TurnComputerBot, "computers" | "cloudBackend">,
+  cfg: AppConfig,
+  allowed: ComputerDestination[] | null,
+): boolean {
+  const { granted } = resolveGrants(bot.computers, undefined, cfg.botDefaults?.computers, allowed);
+  const cloudBackend = resolveCloudBackend(bot.cloudBackend, cfg.botDefaults?.cloudBackend);
+  const filtered = filterGrantedByProviders(granted, cfg, cloudBackend);
+  const hasVmOrVps = filtered.includes("vm") || (filtered.includes("cloud") && cloudBackend === "vps");
+  return filtered.includes("local") || (hasVmOrVps && cfg.localVm?.allowHostTerminal === true);
 }
 
 export async function resolveTurnComputerMounts<Lease>(
@@ -535,18 +649,22 @@ export async function resolveTurnComputerMounts<Lease>(
 async function resolveMounts<Lease>(
   input: ResolveTurnComputerMountsInput<Lease>,
 ): Promise<TurnComputerMounts<Lease>> {
-  const { bot, cfg, engine, threadId, dispatchId, runOn, allowed, deps } = input;
+  const { bot, cfg, engine, threadId, dispatchId, runOn, allowed, deps, automationSource } = input;
   const hostPlatform = deps.hostPlatform;
   let previewCapture: (() => Promise<{ png: string; format: string }>) | null = null;
   let vpsLease: Lease | undefined;
   const mounts: ComputerMount[] = [];
   let autoVpsProblem: string | null = null;
+  /** Whether Auto's VPS check reached SSH and Docker.  Undefined when the
+   * check threw: the problem already says what happened. */
+  let autoVpsReachable: boolean | undefined;
   const stopped = (): TurnComputerMounts<Lease> => ({
     mounts: [],
     previewCapture,
     vpsLease,
     cancelled: true,
     hasHostComputer: false,
+    unavailableNote: "",
   });
 
   // Every destination the person granted, not just the first.  A grant is a
@@ -581,14 +699,7 @@ async function resolveMounts<Lease>(
   // fallback alike; a missing `computerProviders` keeps the legacy
   // behavior bit-for-bit.
   const providers = cfg.botDefaults?.computerProviders;
-  if (providers) {
-    if (granted.includes("cloud")) {
-      const backendEnabled = cloudBackend === "box" ? providers.asciiBox === true : providers.selfHostedVps === true;
-      if (!backendEnabled) granted = granted.filter((d) => d !== "cloud");
-    }
-    if (providers.localVm !== true) granted = granted.filter((d) => d !== "vm");
-    if (providers.localMac !== true) granted = granted.filter((d) => d !== "local");
-  }
+  granted = filterGrantedByProviders(granted, cfg, cloudBackend);
   // Recompute `wantsCloud`, `wantsVm` and `wantsLocal` after the
   // per-provider filter so the mount branches below see the post-filter
   // grant.
@@ -613,17 +724,34 @@ async function resolveMounts<Lease>(
   });
   const mountsCloudComputer = reach.box;
   const mountsLocalComputer = reach.local && !unattendedAgy;
-  const hasHostComputer = Boolean(wantsLocal && mountsLocalComputer);
+  const allowHostTerminalWithVm = Boolean(
+    (wantsVm || (wantsCloudFiltered && cloudBackend === "vps")) &&
+    cfg.localVm?.allowHostTerminal === true,
+  );
+  const hasHostComputer = Boolean((wantsLocal || allowHostTerminalWithVm) && mountsLocalComputer);
 
   // Explicit destinations are strict.  In particular, Local VM must never
-  // fall through to host CUA and accidentally click on the user's Mac.
+  // fall through to host CUA and accidentally click on the user's Mac.  The one
+  // softening is a bot that was ALSO explicitly granted another computer: a
+  // Local VM that is missing or not ready then degrades to those grants (with a
+  // notice saying why) rather than failing the whole turn, the same way an
+  // unreachable VPS does.  A VM-only grant, or runOn=vm, still refuses.
+  let vmFailure: Error | undefined;
   if (wantsVm) {
     if (!reach.vm) {
-      throw new Error("this model engine cannot use the Local VM — choose Claude or an ACP engine, or select another computer destination");
+      throw new Error("this bot cannot use the Local VM — choose Claude or an ACP engine, or select another computer destination");
     }
-    const stdio = await deps.acquireLocalVm();
+    const vmMayDegrade = runOn !== "vm" && granted.some((destination) => destination !== "vm");
+    let stdio: Awaited<ReturnType<typeof deps.acquireLocalVm>> | undefined;
+    try {
+      stdio = await deps.acquireLocalVm();
+    } catch (err) {
+      if (!vmMayDegrade) throw err;
+      vmFailure = err instanceof Error ? err : new Error(String(err));
+      deps.notice(`Local VM not mounted: ${vmFailure.message}`, false);
+    }
     if (!(await deps.checkpoint())) return stopped();
-    mounts.push({ name: "", label: computerLabel("vm", hostPlatform), kind: "vm", stdio });
+    if (stdio) mounts.push({ name: "", label: computerLabel("vm", hostPlatform), kind: "vm", stdio });
   }
   // Deliberately not an "else": "the Local VM and this computer" is a
   // legitimate grant, and each destination resolves independently.
@@ -684,19 +812,27 @@ async function resolveMounts<Lease>(
       }
       if (autoCloud) autoVpsProblem = unsupported;
     } else {
-      vpsLease = deps.vpsLeases.claim(bot.id, threadId, dispatchId);
       let remote: RemoteComputerStatus | undefined;
       try {
+        // Claim inside the try so a shared-desktop contention (another bot
+        // already on the single VPS) degrades like a provision failure when
+        // this turn has a usable fallback, instead of aborting the whole turn.
+        vpsLease = deps.vpsLeases.claim(bot.id, threadId, dispatchId);
         remote = wantsCloudFiltered || bot.autoStartVps
           ? await deps.vps.vpsComputerAction("provision", cfg, bot.id)
           : await deps.vps.inspectVpsForAuto(cfg, bot.id);
       } catch (err) {
+        if (vpsLease) {
+          deps.vpsLeases.release(vpsLease);
+          vpsLease = undefined;
+        }
         if (shouldThrowOnCloudFailure) throw err;
         const msg = err instanceof Error ? err.message : String(err);
         deps.notice(`VPS computer not mounted: ${msg}`, false);
         autoVpsProblem = msg;
       }
       if (!(await deps.checkpoint())) return stopped();
+      if (remote) autoVpsReachable = remote.daemonUp === true;
       if (remote?.ready && remote.sshAlias) {
         const targetCfg = { ...cfg, vps: { sshAlias: remote.sshAlias } };
         const vpsMcp = deps.vps.vpsComputerMcp(targetCfg, bot.id, remote.container_id ?? undefined);
@@ -712,8 +848,10 @@ async function resolveMounts<Lease>(
         });
         previewCapture = () => deps.vps.vpsComputerScreenshot(targetCfg, bot.id);
       } else {
-        deps.vpsLeases.release(vpsLease);
-        vpsLease = undefined;
+        if (vpsLease) {
+          deps.vpsLeases.release(vpsLease);
+          vpsLease = undefined;
+        }
         const problem = remote?.problem ?? autoVpsProblem ?? "the VPS computer could not be reached";
         if (shouldThrowOnCloudFailure) {
           throw new Error(remote?.problem ?? "the VPS computer could not be created or reached");
@@ -733,13 +871,13 @@ async function resolveMounts<Lease>(
   if ((wantsCloudFiltered || autoCloud) && cloudBackend === "box" && deps.box.boxConfigured(cfg)) {
     if (!mountsCloudComputer && wantsCloudFiltered) {
       if (shouldThrowOnCloudFailure) {
-        throw new Error("this model engine cannot use computer tools — choose Claude, an ACP engine, or the Computer engine");
+        throw new Error("this bot cannot use computer tools — choose Claude, an ACP engine, or ASCII.dev Box");
       }
-      deps.notice("cloud computer not mounted: this model engine cannot use computer tools", false);
+      deps.notice("cloud computer not mounted: this bot cannot use computer tools", false);
     }
     let b = await deps.box.findBox(cfg, bot.id).catch(() => null);
     if (!(await deps.checkpoint())) return stopped();
-    // Explicit Cloud and the box-native Computer engine provision on first
+    // Explicit Cloud and the box-native ASCII.dev Box engine provision on first
     // use.  Auto remains non-surprising and only reuses an existing box.
     if (!b && mountsCloudComputer && (wantsCloudFiltered || engine.driverKind === "boxAgent")) {
       deps.broadcast({ kind: "computer", botId: bot.id, state: "provisioning" });
@@ -765,6 +903,10 @@ async function resolveMounts<Lease>(
       const known = b;
       previewCapture = () => deps.box.screenshotBox(cfg, bot.id, known.id);
       if (mountsCloudComputer) {
+        // The account-wide Box API key is never read here: it stays in the
+        // harness, and the mount carries a grant that names this one box.
+        const control = deps.controlIntegration(bot.id);
+        const grant = deps.boxGateway.mint(bot.id, known.id, deps.boxGateway.url(control));
         mounts.push({
           name: "",
           label: computerLabel("box", hostPlatform),
@@ -772,8 +914,9 @@ async function resolveMounts<Lease>(
           box: {
             kind: "box",
             boxId: known.id,
-            token: cfg.box!.token!,
-            control: deps.controlIntegration(bot.id),
+            token: grant.token,
+            gatewayUrl: grant.url,
+            control,
           },
         });
       }
@@ -801,16 +944,30 @@ async function resolveMounts<Lease>(
       mounts.push({ name: "", label: computerLabel("local", hostPlatform), kind: "local", stdio: cua });
     }
   }
+  let unavailableNote = "";
   if (autoCloud && cloudBackend === "vps" && mounts.length === 0 && autoVpsProblem) {
-    const hint = bot.autoStartVps
-      ? "Check the VPS connection in App Settings → Connections."
-      : "Open Computer and enable Start VPS automatically, or choose Cloud to start it manually.";
-    throw new Error(`${autoVpsProblem}. ${hint}`);
+    const fails = autoVpsOutageFailsTurn(automationSource);
+    const hint = vpsUnavailableHint({
+      automationSource: fails ? automationSource : undefined,
+      autoStartVps: bot.autoStartVps,
+      reachable: autoVpsReachable,
+    });
+    if (fails) throw new Error(`${autoVpsProblem}.  ${hint}`);
+    unavailableNote =
+      `This bot's VPS computer is unavailable this turn (${autoVpsProblem}), so no computer is mounted.  ` +
+      "Work that needs no screen can go ahead.  If the request needs the VPS desktop, do not claim to have used it: " +
+      `say it is unavailable${hint ? ` and what the person can do: ${hint}` : "."}`;
   }
+
+  // The Local VM degraded but no other granted computer actually resolved:
+  // fail with the VM's own reason rather than run the turn with no computer.
+  // Hybrid host-shell grants (`allowHostTerminal`) never mount here; when the
+  // engine exposes host tools through `hasHostComputer`, keep degrading like cloud.
+  if (vmFailure && mounts.length === 0 && !(hasHostComputer && engine.toolLoop === true)) throw vmFailure;
 
   // Name the servers once, here, so a room turn and a direct turn hand the
   // driver byte-identical mounts.
-  return { mounts: nameMounts(mounts), previewCapture, vpsLease, cancelled: false, hasHostComputer };
+  return { mounts: nameMounts(mounts), previewCapture, vpsLease, cancelled: false, hasHostComputer, unavailableNote };
 }
 
 /** Hand every grant to the driver, on whichever lane resolved it.

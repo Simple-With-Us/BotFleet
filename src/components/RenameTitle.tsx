@@ -13,16 +13,19 @@ export function RenameTitle({
   onEditingChange,
   onActivate,
   showEditButton = false,
+  embedded = false,
   className,
   inputClassName,
 }: {
   value: string;
   onCommit: (next: string) => void;
   onEditingChange?: (editing: boolean) => void;
-  /** Optional single-click action for locations where the title opens a profile. */
+  /** Optional single-click action for locations where the title opens a profile or selects. */
   onActivate?: () => void;
   /** Preserve deliberate inline rename beside an onActivate title. */
   showEditButton?: boolean;
+  /** When embedded inside an outer interactive row or button, avoid nested role="button"/tabIndex. */
+  embedded?: boolean;
   className?: string;
   inputClassName?: string;
 }) {
@@ -105,8 +108,24 @@ export function RenameTitle({
           title="Rename Bot"
           className="flex size-10 shrink-0 items-center justify-center rounded text-ink-secondary opacity-70 hover:bg-raised hover:text-ink hover:opacity-100"
         >
-          <Pencil size={12} />
+          <Pencil size={12} aria-hidden="true" />
         </button>
+      </span>
+    );
+  }
+
+  if (embedded) {
+    return (
+      <span
+        className={cn("cursor-pointer select-none", className)}
+        title={`${value} · Double-click to rename`}
+        onClick={(e) => {
+          e.stopPropagation();
+          onActivate?.();
+        }}
+        onDoubleClick={startRename}
+      >
+        {value}
       </span>
     );
   }

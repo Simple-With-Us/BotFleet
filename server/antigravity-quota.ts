@@ -13,6 +13,7 @@ import { promisify } from "node:util";
 import { augmentedPath } from "./env-path.ts";
 import { stripWorkspaceCredentialEnv } from "./config.ts";
 import { antigravityQuotaCatalogId } from "./antigravity-models.ts";
+import { FailureLogDedup } from "./log-dedup.ts";
 import {
   quotaCooldowns,
   type QuotaCooldownRegistry,
@@ -296,6 +297,9 @@ export interface AntigravityQuotaPoller {
   lastSnapshot: () => AntigravityUsageSnapshot | null;
 }
 
+/** Ceiling for the consecutive-failure backoff below: 30 minutes. */
+const MAX_BACKOFF_MS = 30 * 60_000;
+
 export function createAntigravityQuotaPoller(opts: {
   registry?: QuotaCooldownRegistry;
   exec?: AntigravityQuotaExec;
@@ -303,21 +307,57 @@ export function createAntigravityQuotaPoller(opts: {
   refreshEveryMs?: number;
   now?: () => number;
   log?: (message: string) => void;
+  /** Gate the CLI spawn itself, not just the timer: the poller stays
+   * armed (a cheap timer, no process spawn) but skips every tick while
+   * this returns false, so a fleet with no Antigravity instance spawns
+   * `antigravity-usage` zero times a day instead of 1,440 (OP3, HS13),
+   * and a poller already running keeps polling once one is added without
+   * needing a restart to re-arm.  Default `() => true` preserves the
+   * always-on behavior for every existing caller and test. */
+  isConfigured?: () => boolean;
 } = {}): AntigravityQuotaPoller {
   const registry = opts.registry ?? quotaCooldowns;
   const exec = opts.exec ?? defaultAntigravityUsageExec;
   const intervalMs = opts.intervalMs ?? 60_000;
   const refreshEveryMs = opts.refreshEveryMs ?? 5 * 60_000;
   const now = opts.now ?? Date.now;
+  const isConfigured = opts.isConfigured ?? (() => true);
   const log = opts.log ?? ((message: string) => console.log(`[antigravity-quota] ${message}`));
+  // HS23: 350 `[antigravity-quota]` lines in two days, almost all repeats
+  // of the same failure.  Collapse those the same way telemetry.ts does.
+  const failureLog = new FailureLogDedup({
+    summaryIntervalMs: 30 * 60_000,
+    log,
+    formatSummary: (count, since, last) => `${count} poll(s) failed since ${since} (last: ${last})`,
+  });
   let timer: ReturnType<typeof setInterval> | null = null;
   let lastRefreshAt = 0;
   let snapshot: AntigravityUsageSnapshot | null = null;
   let ticking = false;
-  let missingLogged = false;
+  let consecutiveFailures = 0;
+  let nextAttemptAt = 0;
+  // "Unexpected end of JSON input" (10 of 350 lines in the field) usually
+  // means the CLI was caught mid-write, not that it is actually down — one
+  // immediate retry next tick is cheaper than waiting out a full backoff
+  // step, and it does not itself count toward the backoff ladder.
+  let truncatedRetried = false;
+
+  const backoffForFailure = (count: number): number =>
+    Math.min(MAX_BACKOFF_MS, intervalMs * 2 ** Math.max(0, count - 1));
 
   const tick = async (forceRefresh = false): Promise<AntigravityUsageSnapshot | null> => {
     if (ticking) return snapshot;
+    if (!isConfigured()) {
+      // Nothing to poll.  Drop any backoff/failure state so the tick right
+      // after an instance is (re)configured starts clean instead of
+      // honoring a delay left over from a previous, unrelated run.
+      consecutiveFailures = 0;
+      nextAttemptAt = 0;
+      truncatedRetried = false;
+      failureLog.reset();
+      return snapshot;
+    }
+    if (!forceRefresh && nextAttemptAt > now()) return snapshot;
     ticking = true;
     try {
       const elapsed = now() - lastRefreshAt;
@@ -327,7 +367,10 @@ export function createAntigravityQuotaPoller(opts: {
       snapshot = parsed;
       lastSnapshot = parsed;
       lastRefreshAt = now();
-      missingLogged = false;
+      consecutiveFailures = 0;
+      nextAttemptAt = 0;
+      truncatedRetried = false;
+      failureLog.reset();
       const applied = applyAntigravityUsageToRegistry(parsed, registry, now());
       if (applied.capped.length || applied.cleared.length) {
         log(
@@ -338,14 +381,25 @@ export function createAntigravityQuotaPoller(opts: {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const missing = /ENOENT|not found|not installed/i.test(message);
-      if (missing) {
-        if (!missingLogged) {
-          log("antigravity-usage CLI not on PATH; leaving existing cooldowns alone");
-          missingLogged = true;
-        }
-      } else {
-        log(`poll failed: ${message}`);
+      const truncated = !missing && /Unexpected end of JSON input/i.test(message);
+      const kind = missing ? "missing" : truncated ? "truncated-json" : "other";
+      const detail = missing ? "antigravity-usage CLI not on PATH; leaving existing cooldowns alone" : `poll failed: ${message}`;
+
+      if (truncated && !truncatedRetried) {
+        // One free immediate retry per INCIDENT, not per occurrence — do
+        // not reset this below, or a persistently truncated response would
+        // alternate immediate-retry/backoff-step forever and never
+        // actually escalate past the first backoff rung.  Only a success
+        // or a configuration change (both reset it above) starts a new
+        // incident.
+        truncatedRetried = true;
+        nextAttemptAt = 0;
+        failureLog.report(kind, detail);
+        return snapshot;
       }
+      consecutiveFailures += 1;
+      nextAttemptAt = now() + backoffForFailure(consecutiveFailures);
+      failureLog.report(kind, detail);
       return snapshot;
     } finally {
       ticking = false;
@@ -368,7 +422,23 @@ export function createAntigravityQuotaPoller(opts: {
   };
 }
 
-const defaultPoller = createAntigravityQuotaPoller();
+let configuredCheck: (() => boolean) | null = null;
+
+/** Installed by the harness at boot, before `startAntigravityQuotaPoller()`
+ * — the module-level default poller below is constructed once at import
+ * time, long before `cfg`/the provider registry exist, so it cannot close
+ * over them directly the way `createAntigravityQuotaPoller`'s own option
+ * does.  This indirection is what lets `server/index.ts` wire a live
+ * "is Antigravity configured" query in after the fact, mirroring how
+ * `telemetry.configure()` and `infisical.configure()` install a live
+ * settings getter post-construction. */
+export function configureAntigravityQuotaPoller(isConfigured: (() => boolean) | null): void {
+  configuredCheck = isConfigured;
+}
+
+const defaultPoller = createAntigravityQuotaPoller({
+  isConfigured: () => configuredCheck?.() ?? true,
+});
 
 export function startAntigravityQuotaPoller(): void {
   defaultPoller.start();

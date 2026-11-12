@@ -8,9 +8,15 @@ import { DATA_DIR } from "./config.ts";
 import {
   closeMessageDb,
   deleteThread,
+  firstUserText,
+  hasThreadRows,
   insertMessage,
+  pruneDeadThreads,
+  readMessageById,
   readThread,
   readThreadTail,
+  readThreadsTail,
+  runningHelperRows,
   searchMessages,
   setActiveLeaf,
   updateMessage,
@@ -34,6 +40,42 @@ describe("message-db", () => {
     closeMessageDb();
     rmSync(DATA_DIR, { recursive: true, force: true });
     mkdirSync(DATA_DIR, { recursive: true });
+  });
+
+  it("indexes running helpers without scanning every message row", () => {
+    insertMessage("t-run", {
+      ...msg("m-running", "helper"),
+      role: "bot",
+      kind: "activity",
+      tool: { name: "Task", itemId: "task-1" },
+      helper: {
+        fidelity: "typed",
+        depth: 1,
+        label: "Survey",
+        toolCount: 0,
+        status: "running",
+        startedAt: 1_000,
+        endedAt: null,
+      },
+    });
+    insertMessage("t-run", msg("m-done", "plain user line"));
+    expect(runningHelperRows()).toHaveLength(1);
+    updateMessage("t-run", {
+      ...msg("m-running", "helper"),
+      role: "bot",
+      kind: "activity",
+      tool: { name: "Task", itemId: "task-1" },
+      helper: {
+        fidelity: "typed",
+        depth: 1,
+        label: "Survey",
+        toolCount: 1,
+        status: "completed",
+        startedAt: 1_000,
+        endedAt: 2_000,
+      },
+    });
+    expect(runningHelperRows()).toEqual([]);
   });
 
   it("persists inserts, updates, and the active leaf across a reopen", () => {
@@ -74,6 +116,9 @@ describe("message-db", () => {
   it("migrates known legacy transcripts at Store startup so search sees unopened tasks", () => {
     const initial = new Store(selection);
     const bot = initial.createBot({}, { seedMessages: false });
+    // bots.json writes are debounced; a relaunch goes through the shutdown
+    // flush, so the roster is on disk before the next Store reads it.
+    initial.flushBotsNow();
     closeMessageDb();
     for (const suffix of ["", "-wal", "-shm"]) rmSync(join(DATA_DIR, `messages.db${suffix}`), { force: true });
     writeFileSync(legacy(bot.threadId), JSON.stringify([msg("old", "find this unopened legacy conversation")]));
@@ -88,6 +133,128 @@ describe("message-db", () => {
     if (process.platform !== "win32") {
       expect(statSync(join(DATA_DIR, "messages.db")).mode & 0o777).toBe(0o600);
     }
+  });
+
+  it("settles a helper left running when the harness boots again", () => {
+    const store = new Store(selection);
+    const bot = store.createBot({}, { seedMessages: false });
+    store.appendMessage(bot.threadId, {
+      role: "bot",
+      kind: "activity",
+      tool: { name: "Task", itemId: "task-1" },
+      helper: {
+        fidelity: "typed",
+        depth: 1,
+        label: "Survey files",
+        toolCount: 1,
+        status: "running",
+        startedAt: 1_000,
+        endedAt: null,
+      },
+    });
+    store.appendMessage(bot.threadId, {
+      role: "bot",
+      kind: "activity",
+      tool: { name: "Task", itemId: "task-2" },
+      helper: {
+        fidelity: "typed",
+        depth: 1,
+        label: "Done already",
+        toolCount: 1,
+        status: "completed",
+        startedAt: 1_000,
+        endedAt: 2_000,
+      },
+    });
+    store.flushBotsNow();
+    const next = new Store(selection);
+    expect(next.settleInterruptedHelpers(5_000)).toBe(1);
+    const rows = next.messagesFor(bot.threadId);
+    expect(rows.find((row) => row.tool?.itemId === "task-1")?.helper).toMatchObject({
+      status: "failed",
+      endedAt: 5_000,
+      lastActivity: "Stopped when BotFleet restarted",
+    });
+    expect(rows.find((row) => row.tool?.itemId === "task-2")?.helper?.status).toBe("completed");
+    expect(next.settleInterruptedHelpers(6_000)).toBe(0);
+  });
+
+  it("readThread preserves insertion order and the stored active leaf over many rows", () => {
+    // ids deliberately not in insertion order: rowid order, not id order, wins
+    for (let i = 0; i < 50; i++) insertMessage("ord", msg(`m${String(49 - i).padStart(2, "0")}`, `text ${i}`, { at: 1_000 + i }));
+    setActiveLeaf("ord", "m07");
+    const thread = readThread("ord", legacy("ord"));
+    expect(thread.messages.map((m) => m.text)).toEqual(Array.from({ length: 50 }, (_, i) => `text ${i}`));
+    expect(thread.activeLeafId).toBe("m07");
+    expect(readMessageById("ord", "m07")?.text).toBe("text 42");
+    expect(readMessageById("ord", "missing")).toBeNull();
+    expect(readMessageById("missing-thread", "m07")).toBeNull();
+  });
+
+  it("firstUserText reads the first user line at the SQL boundary, with a legacy fallback", () => {
+    insertMessage("fu", { ...msg("b1", "bot first"), role: "bot" });
+    insertMessage("fu", msg("u1", "  "));
+    insertMessage("fu", msg("u2", "the real ask"));
+    insertMessage("fu", msg("u3", "later ask"));
+    expect(firstUserText("fu", legacy("fu"))).toBe("the real ask");
+    writeFileSync(legacy("fu-legacy"), JSON.stringify([msg("a", "from file", { role: "bot" }), msg("b", "file ask")]));
+    expect(firstUserText("fu-legacy", legacy("fu-legacy"))).toBe("file ask");
+    expect(firstUserText("fu-empty", legacy("fu-empty"))).toBeNull();
+  });
+
+  it("settling interrupted helpers at boot does not hydrate or cache a large thread", () => {
+    const store = new Store(selection);
+    const bot = store.createBot({}, { seedMessages: false });
+    for (let i = 0; i < 200; i++) store.appendMessage(bot.threadId, { role: "user", kind: "text", text: `filler ${i} ${"x".repeat(200)}` });
+    store.appendMessage(bot.threadId, {
+      role: "bot",
+      kind: "activity",
+      tool: { name: "Task", itemId: "task-boot" },
+      helper: { fidelity: "typed", depth: 1, label: "Boot sweep", toolCount: 1, status: "running", startedAt: 1_000, endedAt: null },
+    });
+    store.flushBotsNow();
+
+    const next = new Store(selection);
+    expect(next.threadIsCachedForTests(bot.threadId)).toBe(false);
+    expect(next.settleInterruptedHelpers(5_000)).toBe(1);
+    expect(next.threadIsCachedForTests(bot.threadId)).toBe(false);
+    expect(next.hasMessage(bot.threadId, "nope")).toBe(false);
+    const settled = readThread(bot.threadId, legacy(bot.threadId)).messages.find((m) => m.tool?.itemId === "task-boot");
+    expect(settled?.helper).toMatchObject({ status: "failed", endedAt: 5_000 });
+    expect(next.hasMessage(bot.threadId, settled!.id)).toBe(true);
+    expect(next.threadIsCachedForTests(bot.threadId)).toBe(false);
+  });
+
+  it("hasMessage finds a message that lives only in a legacy JSON file", () => {
+    // No SQLite rows yet: the held-work restore at boot (restoreHeldWork in
+    // server/index.ts) gates on hasMessage, so a legacy-only thread must not
+    // read as "message gone" just because its file was never imported.
+    writeFileSync(legacy("legacy-only"), JSON.stringify([msg("held-1", "held ask"), msg("other", "other line")]));
+    expect(hasThreadRows("legacy-only")).toBe(false);
+    const store = new Store(selection);
+    expect(store.threadIsCachedForTests("legacy-only")).toBe(false);
+    expect(store.hasMessage("legacy-only", "held-1")).toBe(true);
+    expect(store.hasMessage("legacy-only", "missing")).toBe(false);
+    // the fallback hydrated through the one-time legacy import
+    expect(hasThreadRows("legacy-only")).toBe(true);
+    expect(existsSync(`${legacy("legacy-only")}.imported`)).toBe(true);
+  });
+
+  it("hasMessage on a thread with DB rows stays bounded and does not hydrate it", () => {
+    insertMessage("bounded", msg("m1", "hello"));
+    insertMessage("bounded", msg("m2", "world"));
+    expect(hasThreadRows("bounded")).toBe(true);
+    const store = new Store(selection);
+    expect(store.threadIsCachedForTests("bounded")).toBe(false);
+    expect(store.hasMessage("bounded", "m1")).toBe(true);
+    expect(store.threadIsCachedForTests("bounded")).toBe(false);
+  });
+
+  it("hasMessage returns false for a missing message in a thread with DB rows", () => {
+    insertMessage("with-rows", msg("present", "here"));
+    const store = new Store(selection);
+    expect(store.hasMessage("with-rows", "absent")).toBe(false);
+    expect(store.threadIsCachedForTests("with-rows")).toBe(false);
   });
 
   it("deleteThread removes rows and state", () => {
@@ -174,6 +341,126 @@ describe("message-db", () => {
     expect(existsSync(`${legacy("tail3")}.imported`)).toBe(true);
   });
 
+  // Most of these fixtures are 2-3 threads total, so a genuinely dead one is
+  // often "most of the database" by share alone, and every message here is
+  // inserted at Date.now() (fresh).  Tests that are not specifically about
+  // the age gate or the dead-share refusal disable both with NO_GATES; the
+  // dedicated tests below exercise them directly.  UNRELATED_LIVE pads the
+  // live set so it is never empty (the OTHER refusal) without being the
+  // thread under test.
+  const UNRELATED_LIVE = new Set(["unrelated-live-thread"]);
+  const NO_GATES = { maxAgeMs: 0, maxDeadShare: 1 };
+
+  it("pruneDeadThreads removes messages and thread_state for dead threads, keeps live ones", () => {
+    insertMessage("dead1", msg("m1", "gone"));
+    setActiveLeaf("dead1", "m1");
+    insertMessage("dead2", msg("m2", "also gone"));
+    insertMessage("live1", msg("m3", "keep"));
+    setActiveLeaf("live1", "m3");
+
+    const result = pruneDeadThreads(new Set(["live1"]), NO_GATES);
+    expect(result.refused).toBeUndefined();
+    expect(result.messagesDeleted).toBe(2);
+    expect(result.threadStateDeleted).toBe(1); // only dead1 had a thread_state row
+    expect(result.dryRun).toBe(false);
+    expect(readThread("dead1", legacy("dead1")).messages).toEqual([]);
+    expect(readThread("dead2", legacy("dead2")).messages).toEqual([]);
+    expect(readThread("live1", legacy("live1")).messages).toHaveLength(1);
+    expect(readThread("live1", legacy("live1")).activeLeafId).toBe("m3");
+  });
+
+  it("pruneDeadThreads removes an orphaned thread_state row with no messages rows too", () => {
+    setActiveLeaf("orphan-state", "some-id");
+    // No messages behind it, so there is nothing to date — the age gate
+    // does not apply to a thread_state-only row regardless of maxAgeMs.
+    const result = pruneDeadThreads(UNRELATED_LIVE, { maxDeadShare: 1 });
+    expect(result.refused).toBeUndefined();
+    expect(result.threadStateDeleted).toBeGreaterThanOrEqual(1);
+    expect(readThread("orphan-state", legacy("orphan-state")).activeLeafId).toBeNull();
+  });
+
+  it("pruneDeadThreads accepts a plain iterable, not just a Set", () => {
+    insertMessage("dead3", msg("m1", "gone"));
+    insertMessage("live2", msg("m2", "keep"));
+    pruneDeadThreads(["live2"], NO_GATES); // array, not a Set
+    expect(readThread("dead3", legacy("dead3")).messages).toEqual([]);
+    expect(readThread("live2", legacy("live2")).messages).toHaveLength(1);
+  });
+
+  it("pruneDeadThreads does not VACUUM when the freed freelist is small", () => {
+    insertMessage("dead4", msg("m1", "x"));
+    const result = pruneDeadThreads(UNRELATED_LIVE, NO_GATES);
+    expect(result.vacuumed).toBe(false);
+  });
+
+  it("pruneDeadThreads VACUUMs once the freed freelist crosses the threshold", () => {
+    // A large text value forces real page allocation, so deleting it frees
+    // at least one whole page — real production uses a 32 MB threshold
+    // (DEFAULT_VACUUM_THRESHOLD_BYTES), which a unit test should not have to
+    // allocate tens of megabytes to exercise.
+    insertMessage("dead5", msg("m1", "x".repeat(50_000)));
+    const result = pruneDeadThreads(UNRELATED_LIVE, { ...NO_GATES, vacuumThresholdBytes: 1 });
+    expect(result.vacuumed).toBe(true);
+  });
+
+  it("pruneDeadThreads leaves a dead thread alone until its newest message is old enough", () => {
+    insertMessage("dead-fresh", msg("m1", "just now"));
+    const fresh = pruneDeadThreads(UNRELATED_LIVE, { maxDeadShare: 1 }); // default maxAgeMs (7 days)
+    expect(fresh.refused).toBeUndefined();
+    expect(fresh.messagesDeleted).toBe(0);
+    expect(readThread("dead-fresh", legacy("dead-fresh")).messages).toHaveLength(1);
+
+    // an explicit old `at`, well past the default 7-day bar
+    insertMessage("dead-old", msg("m1", "long ago", { at: Date.now() - 8 * 24 * 60 * 60 * 1000 }));
+    const old = pruneDeadThreads(UNRELATED_LIVE, { maxDeadShare: 1 });
+    expect(old.messagesDeleted).toBe(1);
+    expect(readThread("dead-old", legacy("dead-old")).messages).toEqual([]);
+    // the still-fresh thread from above must not have been swept as a side effect
+    expect(readThread("dead-fresh", legacy("dead-fresh")).messages).toHaveLength(1);
+  });
+
+  it("pruneDeadThreads refuses an empty live set against a nonempty database, dry run or not", () => {
+    insertMessage("real-history", msg("m1", "do not lose this", { at: Date.now() - 30 * 24 * 60 * 60 * 1000 }));
+
+    const real = pruneDeadThreads(new Set());
+    expect(real.refused).toBe("empty-live-set");
+    expect(real.messagesDeleted).toBe(0);
+    expect(readThread("real-history", legacy("real-history")).messages).toHaveLength(1);
+
+    const preview = pruneDeadThreads(new Set(), { dryRun: true });
+    expect(preview.refused).toBe("empty-live-set");
+    expect(preview.messagesDeleted).toBe(0);
+  });
+
+  it("pruneDeadThreads refuses when dead threads are too large a share of the database", () => {
+    // one live thread, four dead ones — 80% dead, past the 50% default
+    insertMessage("keep-me", msg("m1", "keep"));
+    for (const id of ["d1", "d2", "d3", "d4"]) {
+      insertMessage(id, msg("m1", "old", { at: Date.now() - 30 * 24 * 60 * 60 * 1000 }));
+    }
+    const result = pruneDeadThreads(new Set(["keep-me"]));
+    expect(result.refused).toBe("dead-share-too-large");
+    expect(result.messagesDeleted).toBe(0);
+    for (const id of ["d1", "d2", "d3", "d4"]) {
+      expect(readThread(id, legacy(id)).messages).toHaveLength(1);
+    }
+  });
+
+  it("pruneDeadThreads dry run reports what a real run would delete, without deleting", () => {
+    insertMessage("dead-preview", msg("m1", "old enough", { at: Date.now() - 10 * 24 * 60 * 60 * 1000 }));
+    setActiveLeaf("dead-preview", "m1");
+
+    const preview = pruneDeadThreads(UNRELATED_LIVE, { maxDeadShare: 1, dryRun: true });
+    expect(preview).toMatchObject({ messagesDeleted: 1, threadStateDeleted: 1, vacuumed: false, dryRun: true });
+    expect(preview.refused).toBeUndefined();
+    // nothing actually removed
+    expect(readThread("dead-preview", legacy("dead-preview")).messages).toHaveLength(1);
+
+    const real = pruneDeadThreads(UNRELATED_LIVE, { maxDeadShare: 1 });
+    expect(real).toMatchObject({ messagesDeleted: 1, threadStateDeleted: 1, dryRun: false });
+    expect(readThread("dead-preview", legacy("dead-preview")).messages).toEqual([]);
+  });
+
   it("Store round-trips branching through the DB across a restart", () => {
     const store = new Store(selection);
     const bot = store.createBot();
@@ -188,5 +475,30 @@ describe("message-db", () => {
     expect(path.at(-1)?.text).toBe("edited");
     // both branches survive in the tree
     expect(reloaded.messagesFor(bot.threadId).filter((m) => m.parentId === first.parentId)).toHaveLength(2);
+  });
+
+  it("readThreadsTail batch loads tails for multiple threads in chronological order", () => {
+    for (let i = 0; i < 5; i++) insertMessage("batch1", msg(`b1-${i}`, `batch1 text ${i}`));
+    for (let i = 0; i < 3; i++) insertMessage("batch2", msg(`b2-${i}`, `batch2 text ${i}`));
+    insertMessage("batch3", msg("b3-0", "only one"));
+
+    const tails = readThreadsTail(["batch1", "batch2", "batch3", "empty"], 2);
+    expect(tails.get("empty")).toEqual([]);
+    expect(tails.get("batch3")?.map((m) => m.id)).toEqual(["b3-0"]);
+    expect(tails.get("batch2")?.map((m) => m.id)).toEqual(["b2-1", "b2-2"]);
+    expect(tails.get("batch1")?.map((m) => m.id)).toEqual(["b1-3", "b1-4"]);
+
+    // empty threadIds list returns empty map
+    expect(readThreadsTail([], 10).size).toBe(0);
+  });
+
+  it("searchMessages filters by role in SQL and supports content JSON", () => {
+    insertMessage("role-test", msg("user-1", "special keyword in user turn", { role: "user" }));
+    insertMessage("role-test", msg("bot-1", "special keyword in bot turn", { role: "bot" }));
+    insertMessage("role-test", msg("sys-1", "special keyword in system turn", { role: "system" }));
+
+    // User and bot messages match; system messages are filtered out in SQL
+    const hits = searchMessages("special keyword");
+    expect(hits.map((h) => h.messageId).sort()).toEqual(["bot-1", "user-1"]);
   });
 });

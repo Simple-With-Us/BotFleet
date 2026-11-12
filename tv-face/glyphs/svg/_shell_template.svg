@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <title>TV-Face shell (orange default)</title>
+  <defs>
+    <style>
+      :root { --shell: #E07030; --shell-dark: #C05820; --visor: #0A0A0A; --ear: #D06028; --lens: #4DB8FF; --glyph: #00E5FF; }
+    </style>
+    <linearGradient id="shellGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#F09050"/>
+      <stop offset="100%" stop-color="#C05018"/>
+    </linearGradient>
+  </defs>
+  <!-- left ear -->
+  <ellipse cx="70" cy="260" rx="48" ry="70" fill="var(--ear)" stroke="#222" stroke-width="6"/>
+  <ellipse cx="70" cy="260" rx="22" ry="34" fill="#1a1a1a"/>
+  <circle cx="70" cy="260" r="14" fill="var(--lens)"/>
+  <!-- right ear -->
+  <ellipse cx="442" cy="260" rx="48" ry="70" fill="var(--ear)" stroke="#222" stroke-width="6"/>
+  <ellipse cx="442" cy="260" rx="22" ry="34" fill="#1a1a1a"/>
+  <circle cx="442" cy="260" r="14" fill="var(--lens)"/>
+  <!-- head shell -->
+  <rect x="95" y="110" width="322" height="280" rx="70" ry="70" fill="url(#shellGrad)" stroke="#222" stroke-width="8"/>
+  <!-- gloss -->
+  <ellipse cx="200" cy="145" rx="50" ry="18" fill="#fff" fill-opacity="0.25"/>
+  <!-- visor -->
+  <rect x="130" y="160" width="252" height="180" rx="28" fill="var(--visor)" stroke="#111" stroke-width="4"/>
+  <!-- glyph slot (empty — drop glyph SVG here) -->
+  <text x="256" y="260" text-anchor="middle" fill="#333" font-size="14" font-family="monospace">glyph slot</text>
+</svg>

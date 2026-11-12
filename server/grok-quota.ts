@@ -175,14 +175,12 @@ export interface GrokQuotaPoller {
 
 export function createGrokQuotaPoller(opts: {
   exec?: GrokQuotaExec;
-  intervalMs?: number;
   /** Optional clock for tests; `Date.now` when omitted.  Reserved for a
    *  future quota reader that needs to date-stamp its snapshot. */
   now?: () => number;
   log?: (message: string) => void;
 } = {}): GrokQuotaPoller {
   const exec = opts.exec ?? defaultGrokQuotaExec;
-  const intervalMs = opts.intervalMs ?? 5 * 60_000;
   // Captured for the snapshot writer when a future quota reader needs
   // a stable clock.  ESLint flags this as unused until that reader
   // lands — the underscore prefix keeps the strict-no-unused-locals
@@ -190,10 +188,10 @@ export function createGrokQuotaPoller(opts: {
   const _now = opts.now ?? Date.now;
   void _now;
   const log = opts.log ?? ((message: string) => console.log(`[grok-quota] ${message}`));
-  let timer: ReturnType<typeof setInterval> | null = null;
   let snapshot: GrokUsageSnapshot | null = null;
   let ticking = false;
   let noSourceLogged = false;
+  let started = false;
 
   const tick = async (): Promise<GrokUsageSnapshot | null> => {
     if (ticking) return snapshot;
@@ -217,15 +215,20 @@ export function createGrokQuotaPoller(opts: {
   };
 
   return {
+    // HS14: the CLI has no quota subcommand, so `exec.snapshot()` returns
+    // the SAME documented no-source stub every time (or, for a caller that
+    // injects a real reader, whatever THAT reader currently reports at
+    // start time) — a recurring timer bought nothing but a tick every 5
+    // minutes forever.  Compute it once; a future real quota reader that
+    // needs to actually refresh over time can reintroduce a timer then,
+    // when there is a live value for it to refresh.
     start() {
-      if (timer) return;
+      if (started) return;
+      started = true;
       void tick();
-      timer = setInterval(() => void tick(), intervalMs);
-      timer.unref?.();
     },
     stop() {
-      if (timer) clearInterval(timer);
-      timer = null;
+      started = false;
     },
     tick,
     lastSnapshot: () => snapshot,

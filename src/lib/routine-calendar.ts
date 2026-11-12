@@ -20,6 +20,41 @@ export type CalendarItem = {
   run: RoutineRun | null;
 };
 
+export type CalendarItemGroup = {
+  id: string;
+  startAt: number;
+  endAt: number;
+  items: CalendarItem[];
+};
+
+/** The visual calendar guarantees enough height to read a card, so collision
+ * detection must use that same minimum instead of only the nominal duration. */
+export function calendarItemDurationMinutes(item: CalendarItem): number {
+  const duration = item.routine?.durationMinutes ?? item.run?.durationMinutes ?? 30;
+  return Math.max(45, duration);
+}
+
+/** Group transitive overlaps into one readable stack.  A dense run such as
+ * 8:00, 8:10 and 8:40 is one group when each card overlaps the next, even
+ * though the first and last cards do not overlap directly. */
+export function groupOverlappingCalendarItems(items: CalendarItem[]): CalendarItemGroup[] {
+  const sorted = [...items].sort((a, b) => a.at - b.at || a.id.localeCompare(b.id));
+  const groups: CalendarItemGroup[] = [];
+
+  for (const item of sorted) {
+    const endAt = item.at + calendarItemDurationMinutes(item) * 60_000;
+    const current = groups.at(-1);
+    if (!current || item.at >= current.endAt) {
+      groups.push({ id: item.id, startAt: item.at, endAt, items: [item] });
+      continue;
+    }
+    current.items.push(item);
+    current.endAt = Math.max(current.endAt, endAt);
+  }
+
+  return groups;
+}
+
 export function niceCalendarDate(at: number, includeWeekday = true): string {
   const nowYear = calendarDate(Date.now(), CENTRAL_TIME_ZONE).year;
   const atYear = calendarDate(at, CENTRAL_TIME_ZONE).year;
@@ -142,4 +177,24 @@ export function projectedRoutineItems(
 export function calendarDayLabel(at: number): { weekday: string; day: number } {
   const date = calendarDate(at, CENTRAL_TIME_ZONE);
   return { weekday: DAY_NAMES[calendarWeekday(date)], day: date.day };
+}
+
+/** Start-of-day epochs (in `timeZone`) that `schedule` fires on within
+ * [from, to) — the same occurrence enumeration `projectedRoutineItems`
+ * uses, without the run-receipt/routine-list bookkeeping, for a
+ * lightweight calendar preview (MiniMonth) to highlight. */
+export function scheduleFireDays(schedule: RoutineSchedule, timeZone: string, from: number, to: number): Set<number> {
+  const days = new Set<number>();
+  if (schedule.type === "once") {
+    if (schedule.at >= from && schedule.at < to) days.add(startOfDayInTimeZone(schedule.at, timeZone));
+    return days;
+  }
+  let cursor = from - 1;
+  for (;;) {
+    const at = nextZonedOccurrence(schedule, cursor, timeZone);
+    if (at === null || at >= to) break;
+    days.add(startOfDayInTimeZone(at, timeZone));
+    cursor = at;
+  }
+  return days;
 }

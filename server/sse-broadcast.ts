@@ -75,6 +75,9 @@ export function writeToClient(client: SseClient, frame: string, kind: string, bo
   }
 }
 
+/** Frame kinds where only the newest one is worth replaying. */
+const LATEST_ONLY_KINDS = new Set(["instances"]);
+
 export interface ReplayEntry {
   seq: number;
   kind: string;
@@ -104,6 +107,16 @@ export class ReplayBuffer {
    * reason never changes that semantics. */
   push(seq: number, kind: string, frame: string): void {
     const kept = kind === "screen" ? null : frame;
+    // A whole engine list (~25 KB) supersedes the one before it: replaying an
+    // older list to a client that will also get this one only spends the
+    // byte budget that message frames need.  Keep the slot, drop the payload.
+    if (LATEST_ONLY_KINDS.has(kind)) {
+      for (const entry of this.entries) {
+        if (entry.kind !== kind || !entry.frame) continue;
+        this.bytes -= Buffer.byteLength(entry.frame, "utf8");
+        entry.frame = null;
+      }
+    }
     this.entries.push({ seq, kind, frame: kept });
     if (kept) this.bytes += Buffer.byteLength(kept, "utf8");
     while (this.entries.length > 0 && (this.entries.length > this.maxEntries || this.bytes > this.maxBytes)) {

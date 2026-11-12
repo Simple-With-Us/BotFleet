@@ -1,4 +1,4 @@
-export type PeerAction = "ask_bot" | "delegate_bot";
+export type PeerAction = "coordinate_bots" | "ask_bot" | "delegate_bot";
 
 /** Stable persisted grant for one peer action and one target bot. */
 export function peerAllowKey(action: PeerAction, targetId: string): string {

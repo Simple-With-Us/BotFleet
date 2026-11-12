@@ -57,3 +57,41 @@ export async function readSecureCredentials({
   }
   return { status: "unavailable", credentials: {}, error: lastError };
 }
+
+/** Plain JSON next to credentials.bin.  The legacy bundle writes this while
+ *  it can still decrypt; the renamed bundle imports it because changing the
+ *  macOS designated requirement invalidates Electron safeStorage. */
+export const SAFE_STORAGE_MIGRATION_BASENAME = "credentials.migration.json";
+export const SAFE_STORAGE_EXPORT_FLAG = "--export-safe-storage-migration";
+
+export function wantsSafeStorageExport(argv = process.argv) {
+  return argv.includes(SAFE_STORAGE_EXPORT_FLAG);
+}
+
+export function parseSafeStorageMigrationText(text) {
+  const parsed = JSON.parse(text);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("the safeStorage migration file is not readable");
+  }
+  return parsed;
+}
+
+/** After a rename, credentials.bin may be unreadable.  A migration file
+ *  written by the predecessor is the recovery; an already-readable store
+ *  drops a leftover file so it cannot be imported twice. */
+export function applySafeStorageMigration(readResult, { migrationExists, readMigration, removeMigration }) {
+  if (readResult.status === "ok" || readResult.status === "empty") {
+    if (migrationExists()) removeMigration();
+    return readResult;
+  }
+  if (!migrationExists()) return readResult;
+  try {
+    return {
+      status: "ok",
+      credentials: parseSafeStorageMigrationText(readMigration()),
+      fromMigration: true,
+    };
+  } catch (error) {
+    return { status: "unavailable", credentials: {}, error: message(error) };
+  }
+}

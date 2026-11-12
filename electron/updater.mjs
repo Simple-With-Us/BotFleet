@@ -12,10 +12,14 @@ import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { createRequire } from "node:module";
 import { join } from "node:path";
+import { readHarnessOwner } from "./harness-ownership.mjs";
 import { createUpdaterCoordinator } from "./updater-coordinator.mjs";
 import {
+  AUTO_CHECK_FAILURE_BACKOFF_MS,
   AUTO_CHECK_THROTTLE_MS,
+  isAutoCheckBackoffActive,
   macAppFingerprint,
+  nextAutoCheckFailureStreak,
   readAutoUpdateConfig,
   recordAutomaticCheck,
   shouldRunAutomaticCheck,
@@ -36,6 +40,27 @@ let win = null;
 let state = { status: "idle", canLocalUpdate: false };
 let updaterCoordinator = null;
 let autoUpdateEnabled = false;
+// UI4: consecutive-automatic-failure backoff.  Deliberately in-memory only
+// (never persisted) -- one of its three resets is "an app restart", which
+// falls out of that for free.  See updater-throttle.mjs's
+// nextAutoCheckFailureStreak / isAutoCheckBackoffActive for the pure logic.
+let autoCheckFailureStreak = null;
+let autoCheckBackoffUntilMs = 0;
+let autoCheckBackoffLogged = false;
+let cachedMacFingerprint;
+
+function currentMacAppFingerprint() {
+  if (cachedMacFingerprint === undefined) {
+    cachedMacFingerprint = macAppFingerprint();
+  }
+  return cachedMacFingerprint;
+}
+
+function resetAutoCheckBackoff() {
+  autoCheckFailureStreak = null;
+  autoCheckBackoffUntilMs = 0;
+  autoCheckBackoffLogged = false;
+}
 
 function localUpdateScript() {
   return join(homedir(), "apps", "update-botfleet.sh");
@@ -92,7 +117,7 @@ function recordSuccessfulAutoCheck() {
   // that never wrote `disk` back, so `lastCheckMs` never reached disk and
   // the 6-hour throttle never actually engaged.
   try {
-    recordAutomaticCheck(configPath(), { fingerprint: macAppFingerprint() });
+    recordAutomaticCheck(configPath(), { fingerprint: currentMacAppFingerprint() });
   } catch {
     /* never let the check fail because we could not persist */
   }
@@ -101,8 +126,14 @@ function recordSuccessfulAutoCheck() {
 export function registerUpdaterIpc() {
   ipcMain.handle("update:get-state", () => state);
   // Manual check always bypasses the 6-hour throttle — the whole point
-  // of the button is "ask now", and the Settings copy says so.
-  ipcMain.handle("update:check", () => updaterCoordinator?.check(true));
+  // of the button is "ask now", and the Settings copy says so.  It also
+  // clears any automatic-failure backoff (UI4): a user explicitly asking
+  // right now is one of the three ways out, independent of whether this
+  // particular attempt succeeds.
+  ipcMain.handle("update:check", () => {
+    resetAutoCheckBackoff();
+    return updaterCoordinator?.check(true);
+  });
   ipcMain.handle("update:download", () => updaterCoordinator?.download());
   ipcMain.handle("update:install", () => updaterCoordinator?.install());
   ipcMain.handle("update:set-enabled", (_event, enabled) => {
@@ -111,8 +142,11 @@ export function registerUpdaterIpc() {
     // renderer (vs. silently going idle) when the caller is manual. Flipping
     // the toggle on is a user-initiated action just like pressing "Check for
     // updates", so it should surface an error the same way instead of
-    // swallowing it.
-    if (autoUpdateEnabled) void updaterCoordinator?.check(true);
+    // swallowing it.  Same manual reset as the button above.
+    if (autoUpdateEnabled) {
+      resetAutoCheckBackoff();
+      void updaterCoordinator?.check(true);
+    }
   });
   ipcMain.handle("update:local", () => {
     const script = localUpdateScript();
@@ -135,14 +169,33 @@ export function registerUpdaterIpc() {
     const logFile = join(logDir, "updater-local.log");
     try { mkdirSync(logDir, { recursive: true, mode: 0o700 }); } catch { /* already exists */ }
 
+    const dataDir = process.env.OMB_DATA_DIR || process.env.BOTFLEET_DATA_DIR || join(homedir(), ".botfleet");
+    let harnessOwner;
+    try {
+      harnessOwner = readHarnessOwner(dataDir);
+    } catch {
+      setState({ status: "error", message: "Could not read harness ownership for the local update." });
+      return;
+    }
+    const childEnv = {
+      ...process.env,
+      PATH: childPath,
+      BOTFLEET_CHECKOUT: join(homedir(), "apps", "botfleet-server"),
+    };
+    if (harnessOwner) {
+      if (!harnessOwner.nonce) {
+        setState({
+          status: "error",
+          message: "Harness bearer credential is missing.\u00A0 Restart the harness before updating locally.",
+        });
+        return;
+      }
+      childEnv.BOTFLEET_OWNER_NONCE = harnessOwner.nonce;
+    }
     const child = spawn("/bin/bash", [script], {
       detached: true,
       stdio: ["ignore", "ignore", "pipe"],
-      env: {
-        ...process.env,
-        PATH: childPath,
-        BOTFLEET_CHECKOUT: join(homedir(), "apps", "botfleet-server"),
-      },
+      env: childEnv,
     });
 
     // Capture stderr to the log so a 127 / missing-node error is visible.
@@ -231,7 +284,7 @@ export function startUpdater(mainWindow) {
       const fallbackConfig = join(fallbackDir, "app-update.yml");
       if (!existsSync(fallbackConfig)) {
         const content = [
-          "owner: jaywedgeworth22",
+          "owner: Simple-With-Us",
           "repo: BotFleet",
           "provider: github",
           "updaterCacheDirName: botfleet-updater",
@@ -266,7 +319,44 @@ export function startUpdater(mainWindow) {
     const promise = updaterCoordinator?.check(manual);
     if (promise && typeof promise.then === "function") {
       promise.then((result) => {
-        if (result?.ok !== false) recordSuccessfulAutoCheck();
+        if (result?.ok !== false) {
+          recordSuccessfulAutoCheck();
+          // A success is one of the three ways out of backoff (UI4), same
+          // as a manual check or an app restart.
+          resetAutoCheckBackoff();
+          return;
+        }
+        // trackedCheck is only ever invoked for timer-driven (automatic)
+        // ticks today (see the note above); manual checks call the
+        // coordinator directly and reset their own backoff in the IPC
+        // handlers regardless of outcome.  Guard anyway so a future manual
+        // caller here can't extend the automatic streak.
+        if (manual) return;
+        const previousStreak = autoCheckFailureStreak;
+        autoCheckFailureStreak = nextAutoCheckFailureStreak(previousStreak, result?.errorClass);
+        // A different error class than last time is a fresh problem, not a
+        // continuation -- clear any prior backoff bookkeeping so this class
+        // gets its own three strikes and, if it also persists, its own log
+        // line rather than silently inheriting an old backoff window.
+        if (!previousStreak || previousStreak.errorClass !== autoCheckFailureStreak.errorClass) {
+          autoCheckBackoffLogged = false;
+          autoCheckBackoffUntilMs = 0;
+        }
+        if (isAutoCheckBackoffActive(autoCheckFailureStreak)) {
+          // Extend the window on every qualifying failure, not just the
+          // first, so backoff stays in effect continuously (one check per
+          // 24h) instead of silently reverting to hourly retries 24h after
+          // the first trip.
+          autoCheckBackoffUntilMs = Date.now() + AUTO_CHECK_FAILURE_BACKOFF_MS;
+          if (!autoCheckBackoffLogged) {
+            autoCheckBackoffLogged = true;
+            autoUpdater?.logger?.warn(
+              `[updater] ${autoCheckFailureStreak.count} consecutive automatic checks failed with ` +
+                `${autoCheckFailureStreak.errorClass}; backing off to one check per 24h until a manual ` +
+                "check, an app restart, or a success.",
+            );
+          }
+        }
       }).catch(() => {});
     }
     return promise;
@@ -278,12 +368,25 @@ export function startUpdater(mainWindow) {
   // 6-hour window has not seen — so it bypasses the throttle the same way
   // "never checked" does.
   const dueForAutomaticCheck = () => {
+    // UI4: a live backoff (three-plus consecutive automatic failures with
+    // the same error class) overrides the normal 6-hour throttle, which
+    // never engages on its own here -- a failed check is deliberately never
+    // recorded as "last checked" (see trackedCheck above), so without this
+    // gate a permanently broken feed retries every hour forever.
+    if (Date.now() < autoCheckBackoffUntilMs) return false;
     const record = readAutoUpdateConfig(configPath());
+    // The harness owns the toggle and writes it to this same file, whoever
+    // flipped it: this window's checkbox goes through the update:set-enabled
+    // handler as well, but a paired phone changes it through the harness
+    // alone, and with the window closed nothing would tell this process.
+    // Reading it back every tick keeps the cached copy from outliving the
+    // stored one.  An unreadable file reads as off, as it does at launch.
+    autoUpdateEnabled = record.enabled === true;
     return shouldRunAutomaticCheck({
       enabled: autoUpdateEnabled,
       lastCheckMs: record.lastCheckMs,
       lastAppFingerprint: record.lastAppFingerprint,
-      currentFingerprint: macAppFingerprint(),
+      currentFingerprint: currentMacAppFingerprint(),
     });
   };
 

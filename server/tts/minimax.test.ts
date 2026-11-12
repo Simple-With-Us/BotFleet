@@ -3,6 +3,8 @@
 // it formats the URL, and what it does on a refusal. The fetch is stubbed
 // through a local HTTP server, the API base is overridden, and the timeout
 // path is hit by swapping fetch for a rejecting stub.
+import { randomUUID } from "node:crypto";
+
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 let server: ReturnType<typeof import("node:http").createServer>;
@@ -11,6 +13,11 @@ let refuse: { status: number; body: unknown } | null = null;
 
 const MP3_BYTES = Buffer.from([0xff, 0xfb, 0x90, 0x00, 0x11, 0x22, 0x33, 0x44]);
 const MP3_HEX = MP3_BYTES.toString("hex");
+
+// Generated per run, never read from MINIMAX_API_KEY and never committed: the
+// requests go to the local stub above, so a real key has no business here, and
+// a credential-shaped literal does not belong in versioned source.
+const testKey = `test-${randomUUID()}`;
 
 beforeAll(async () => {
   const http = await import("node:http");
@@ -30,9 +37,9 @@ beforeAll(async () => {
       };
       if (refuse) return send(refuse.status, refuse.body);
       const path = (req.url ?? "").split("?")[0];
-      if (req.method === "GET" && path === "/v1/voice/list") {
+      if (req.method === "POST" && path === "/v1/get_voice") {
         return send(200, {
-          voice_list: [
+          system_voice: [
             { voice_id: "English_Graceful_Lady", voice_name: "Graceful Lady", language: "en", gender: "female" },
             { voice_id: "English_Persuasive_Man", voice_name: "Persuasive Man", language: "en", gender: "male" },
             { voice_id: "female-shaonv", voice_name: "Shaonv", language: "zh", gender: "female" },
@@ -62,19 +69,19 @@ afterAll(() => new Promise<void>((r) => server.close(() => r())));
 const driver = () => import("./minimax.ts");
 
 describe("verifyKey", () => {
-  it("returns ok against a real /v1/voice/list probe", async () => {
+  it("returns ok against a real /v1/get_voice probe", async () => {
     refuse = null;
     seen.length = 0;
     const { verifyKey } = await driver();
     expect(await verifyKey("sk-good")).toEqual({ ok: true });
     const call = seen.at(-1)!;
-    expect(call.method).toBe("GET");
-    expect(call.url.split("?")[0]).toBe("/v1/voice/list");
+    expect(call.method).toBe("POST");
+    expect(call.url.split("?")[0]).toBe("/v1/get_voice");
     expect(call.headers["authorization"]).toBe("Bearer sk-good");
   });
 
   it("rejects a key when MiniMax returns HTTP 200 with a non-zero base_resp", async () => {
-    refuse = { status: 200, body: { voice_list: [], base_resp: { status_code: 1001, status_msg: "auth failed" } } };
+    refuse = { status: 200, body: { system_voice: [], base_resp: { status_code: 1001, status_msg: "auth failed" } } };
     const { verifyKey } = await driver();
     const result = await verifyKey("bad");
     refuse = null;
@@ -124,19 +131,19 @@ describe("listVoices", () => {
     const voices = await listVoices("sk");
     expect(voices).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ id: "English_Graceful_Lady", label: "Graceful Lady", description: "en · female" }),
-        expect.objectContaining({ id: "English_Persuasive_Man", label: "Persuasive Man", description: "en · male" }),
-        expect.objectContaining({ id: "female-shaonv", label: "Shaonv", description: "zh · female" }),
+        expect.objectContaining({ id: "English_Graceful_Lady", label: "Graceful Lady", description: undefined }),
+        expect.objectContaining({ id: "English_Persuasive_Man", label: "Persuasive Man", description: undefined }),
+        expect.objectContaining({ id: "female-shaonv", label: "Shaonv", description: undefined }),
       ]),
     );
     const call = seen.at(-1)!;
-    expect(call.method).toBe("GET");
-    expect(call.url.split("?")[0]).toBe("/v1/voice/list");
+    expect(call.method).toBe("POST");
+    expect(call.url.split("?")[0]).toBe("/v1/get_voice");
     expect(call.headers["authorization"]).toBe("Bearer sk");
   });
 
   it("throws when the upstream returns a non-zero base_resp", async () => {
-    refuse = { status: 200, body: { voice_list: [], base_resp: { status_code: 1001, status_msg: "auth failed" } } };
+    refuse = { status: 200, body: { system_voice: [], base_resp: { status_code: 1001, status_msg: "auth failed" } } };
     const { listVoices } = await driver();
     const msg = await listVoices("sk").catch((e: Error) => e.message);
     refuse = null;
@@ -165,6 +172,7 @@ describe("synthesize", () => {
     expect(body.output_format).toBe("hex");
     expect(body.voice_setting.voice_id).toBe("English_Graceful_Lady");
     expect(body.audio_setting.format).toBe("mp3");
+    expect(body.audio_setting.bitrate).toBe(64_000);
     expect(body.language_boost).toBe("auto");
   });
 
@@ -226,4 +234,87 @@ describe("synthesize", () => {
     expect(err).toBeInstanceOf(Error);
     expect((err as Error).message.toLowerCase()).toContain("couldn't reach");
   });
+
+  describe("sanitizeForTTSByLine", () => {
+    it("preserves newlines while cleaning each line", async () => {
+      const { sanitizeForTTSByLine } = await driver();
+      expect(sanitizeForTTSByLine("## Status\n\n- First\n- Second")).toBe("## Status\n\n- First\n- Second");
+      expect(sanitizeForTTSByLine("Line one—pause\nLine two")).toBe("Line one, pause\nLine two");
+    });
+  });
+
+  describe("sanitizeForTTS", () => {
+    it("converts em-dashes and en-dashes into pauses with comma-space", async () => {
+      const { sanitizeForTTS } = await driver();
+      expect(sanitizeForTTS("Option A—fastest option–available now")).toBe("Option A, fastest option, available now");
+    });
+
+    it("converts floating hyphens into pauses and cleans ellipses", async () => {
+      const { sanitizeForTTS } = await driver();
+      expect(sanitizeForTTS("Start - middle... end")).toBe("Start, middle. end");
+    });
+
+    it("normalizes consecutive commas and trailing spaces", async () => {
+      const { sanitizeForTTS } = await driver();
+      expect(sanitizeForTTS("Hello — , world...  ")).toBe("Hello, world.");
+    });
+
+    it("keeps a minus sign between numbers and still pauses on a clause dash", async () => {
+      const { sanitizeForTTS } = await driver();
+      // arithmetic: the operator has to survive or it reads as "five, three"
+      expect(sanitizeForTTS("5 - 3 = 2")).toBe("5 - 3 = 2");
+      expect(sanitizeForTTS("5 - 3 - 1 = 1")).toBe("5 - 3 - 1 = 1");
+      // a digit on one side only is still a clause dash
+      expect(sanitizeForTTS("Step 1 - then deploy")).toBe("Step 1, then deploy");
+      expect(sanitizeForTTS("Start - middle end")).toBe("Start, middle end");
+      // consecutive clause dashes with single non-space characters
+      expect(sanitizeForTTS("a - b - c")).toBe("a, b, c");
+      expect(sanitizeForTTS("I - a - programmer")).toBe("I, a, programmer");
+      expect(sanitizeForTTS("a - b - c - d")).toBe("a, b, c, d");
+    });
+
+    it("collapses a Unicode ellipsis to a single period", async () => {
+      const { sanitizeForTTS } = await driver();
+      expect(sanitizeForTTS("Wait… then… go")).toBe("Wait. then. go");
+      expect(sanitizeForTTS("Wait… then... go")).toBe("Wait. then. go");
+    });
+
+    it("leaves a hyphenated word intact", async () => {
+      const { sanitizeForTTS } = await driver();
+      expect(sanitizeForTTS("A well-known fix")).toBe("A well-known fix");
+    });
+
+    it("sanitizes text before passing to POST /v1/t2a_v2", async () => {
+      const { synthesize } = await driver();
+      seen.length = 0;
+      await synthesize("Step one—do this - next... finish", "English_Graceful_Lady", testKey);
+      const post = seen.find((s) => s.method === "POST" && s.url.includes("/v1/t2a_v2"));
+      expect(post).toBeDefined();
+      const body = JSON.parse(post!.body);
+      expect(body.text).toBe("Step one, do this, next. finish");
+    });
+
+    it("returns empty audio for punctuation-only input without calling network", async () => {
+      const { synthesize } = await driver();
+      seen.length = 0;
+      const res1 = await synthesize(" — ", "English_Graceful_Lady", testKey);
+      expect(res1.bytes.length).toBe(0);
+      expect(seen.length).toBe(0);
+
+      const res2 = await synthesize("...", "English_Graceful_Lady", testKey);
+      expect(res2.bytes.length).toBe(0);
+      expect(seen.length).toBe(0);
+    });
+
+    it("collapses large whitespace runs efficiently without backtracking", async () => {
+      const { sanitizeForTTS } = await driver();
+      const padded = "Start" + " ".repeat(10_000) + "—" + " ".repeat(10_000) + "End";
+      const t0 = performance.now();
+      const sanitized = sanitizeForTTS(padded);
+      const elapsed = performance.now() - t0;
+      expect(sanitized).toBe("Start, End");
+      expect(elapsed).toBeLessThan(100);
+    });
+  });
 });
+

@@ -13,7 +13,17 @@ import {
   useState,
   type PointerEvent as ReactPointerEvent,
 } from "react";
-import { BOT_COLORS, type BotColor, type BotMotion, type BotState } from "@/lib/mascot";
+import {
+  BOT_COLORS,
+  mapBotStateToCursorAvatarState,
+  stateWithSpeech,
+  type BotColor,
+  type BotMotion,
+  type BotState,
+} from "@/lib/mascot";
+import { useSpeakingBotId } from "@/lib/tts/useSpeech";
+import { TVFaceAvatar } from "./tv-face/TVFaceAvatar";
+import { AnimatedFileAvatar } from "./avatar-file/AnimatedFileAvatar";
 import {
   CursorAvatar,
   DEFAULT_SILHOUETTE,
@@ -202,7 +212,7 @@ function BotMascotComponent(
     >
       <CursorAvatar
         ref={inner}
-        state={motionState ?? state}
+        state={mapBotStateToCursorAvatarState(motionState ?? state)}
         expression={expression}
         size={size}
         silhouette={GRADIENT_SILHOUETTE}
@@ -225,6 +235,8 @@ export const BotMascot = memo(forwardRef(BotMascotComponent));
 
 export type BotAvatarProps = Omit<BotMascotProps, "color"> & {
   bot: {
+    /** The bot's id, which is how the speech snapshot names the bot talking. */
+    id?: string;
     name?: string;
     color: BotColor;
     avatarUrl?: string | null;
@@ -241,12 +253,65 @@ export function BotAvatar({ bot, size = 44, label, ...mascotProps }: BotAvatarPr
   const profile = botAvatarProfile(bot);
   const [imageFailed, setImageFailed] = useState(false);
 
+  // A bot that is speaking is drawn as speaking, whatever else it is doing,
+  // because a moving mouth is the thing a listener is watching.  The speaker
+  // is a window-wide singleton, so this is the one place that can tell
+  // whether this bot is the one talking.
+  //
+  // The subscription is narrow on purpose.  A screen can hold a long list of
+  // avatars, and the speech snapshot is replaced on every caption, so every
+  // avatar that read all of it re-rendered on every line of a spoken reply.
+  // Reading only the name of the speaking bot means an avatar re-renders
+  // when its own bot starts or stops talking, and not otherwise.
+  const speakingBotId = useSpeakingBotId();
+  const state = stateWithSpeech(mascotProps.state, speakingBotId, bot.id);
+
   useEffect(() => setImageFailed(false), [profile.avatarUrl]);
+
+  if (profile.avatarCrop === "tvface") {
+    return (
+      <TVFaceAvatar
+        state={state}
+        color={bot.color}
+        size={size}
+        label={label ?? bot.name}
+        animated={mascotProps.animated}
+      />
+    );
+  }
+
+  // The corner radius of an image crop.  It is worked out before the
+  // branches because the animated crop needs it too: that crop is not a crop
+  // at all, it plays the file's own frames, and the artwork is drawn whole.
+  const radius =
+    profile.avatarCrop === "circle"
+      ? "50%"
+      : profile.avatarCrop === "rounded"
+        ? "22%"
+        : "0";
+
+  if (profile.avatarCrop === "animated" && profile.avatarUrl && !imageFailed) {
+    // A one-file animated avatar.  The component draws the ordinary image
+    // until the file proves it carries a manifest, so an avatar that turns
+    // out to be a plain picture looks exactly as it always did.
+    return (
+      <AnimatedFileAvatar
+        src={profile.avatarUrl}
+        state={state}
+        size={size}
+        alt={label ?? (bot.name ? `${bot.name} avatar` : "Bot avatar")}
+        radius={radius}
+        animated={mascotProps.animated}
+        onError={() => setImageFailed(true)}
+      />
+    );
+  }
 
   if (profile.avatarCrop === "mascot" || !profile.avatarUrl || imageFailed) {
     return (
       <BotMascot
         {...mascotProps}
+        state={state}
         color={bot.color}
         size={size}
         label={label ?? bot.name}
@@ -254,12 +319,6 @@ export function BotAvatar({ bot, size = 44, label, ...mascotProps }: BotAvatarPr
     );
   }
 
-  const radius =
-    profile.avatarCrop === "circle"
-      ? "50%"
-      : profile.avatarCrop === "rounded"
-        ? "22%"
-        : "0";
   return (
     <img
       src={profile.avatarUrl}
