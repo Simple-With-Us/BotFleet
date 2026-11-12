@@ -11,7 +11,7 @@ NODE="$(command -v node || true)"
 if [[ -z "$NODE" ]]; then echo 'BotFleet bootstrap: Node.js is missing.' >&2; exit 127; fi
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/botfleet-loader.XXXXXX")"
 COMMAND=update
-case "${1:-}" in prepare|apply|unquiesce|update) COMMAND="$1" ;; esac
+case "${1:-}" in prepare|apply|unquiesce|update|status|recover) COMMAND="$1" ;; esac
 PROGRESS=""; RUN_ID=""; EXPECT=""
 for arg in "$@"; do
   if [[ "$EXPECT" == progress ]]; then PROGRESS="$arg"; EXPECT=""; continue; fi

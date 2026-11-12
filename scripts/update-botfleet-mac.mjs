@@ -5,6 +5,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { createReadStream, realpathSync, rmSync } from "node:fs";
 import {
   chmod,
+  cp,
   lstat,
   mkdir,
   readdir,
@@ -20,7 +21,7 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { applyPreparedUpdate, prepareUpdate, runUpdate } from "./mac-update-transaction.mjs";
+import { UpdateRefusedError, applyPreparedUpdate, prepareUpdate, runUpdate } from "./mac-update-transaction.mjs";
 import {
   createUpdateProgress,
   instrumentOperations,
@@ -121,7 +122,7 @@ export function resolveUpdateComponentFlags(components) {
 
 export function parseArguments(argv) {
   const args = [...argv];
-  const command = ["prepare", "apply", "update", "unquiesce"].includes(args[0]) ? args.shift() : "update";
+  const command = ["prepare", "apply", "update", "unquiesce", "status", "recover"].includes(args[0]) ? args.shift() : "update";
   const parsed = {
     command,
     target: "origin/main",
@@ -164,10 +165,11 @@ export function parseArguments(argv) {
     else throw new Error(`Unknown option: ${arg}`);
   }
   if (command === "apply" && !parsed.stage) throw new Error("apply requires --stage <directory>");
-  if (command === "unquiesce" && (parsed.target !== "origin/main" || parsed.source || parsed.stage || parsed.bundle ||
+  if ((command === "unquiesce" || command === "status" || command === "recover") &&
+      (parsed.target !== "origin/main" || parsed.source || parsed.stage || parsed.bundle ||
       parsed.dependencies || parsed.components !== "both" || parsed.openApplication === false || parsed.progress ||
-      parsed.runId || parsed.graceMs !== undefined || parsed.waitForIdleMs !== undefined)) {
-    throw new Error("unquiesce accepts no options");
+      parsed.runId || parsed.graceMs !== undefined || parsed.waitForIdleMs !== undefined || parsed.force)) {
+    throw new Error(`${command} accepts no options`);
   }
   if (parsed.force && parsed.waitForIdleMs !== undefined) {
     throw new Error("--force and --wait-for-idle ask for opposite things; pass one");
@@ -223,6 +225,8 @@ function usage() {
   update-botfleet-mac.mjs apply   --stage PATH [--no-open]
                               [--grace SECONDS | --wait-for-idle [MINUTES] | --force]
   update-botfleet-mac.mjs unquiesce
+  update-botfleet-mac.mjs status
+  update-botfleet-mac.mjs recover
 
 --components both|server|app (or --server-only) states which halves a run owns, defaulting to both.
 A server-only run stops the harness, swaps the dependency tree, restarts it, and proves it is the
@@ -245,6 +249,14 @@ An existing exact-source build can be imported with --bundle and --dependencies.
 apply installs one prepared stage, verifies exact runtime identity, and rolls the prior bundle and
 checkout back if any install or startup step fails.
 unquiesce is the authenticated recovery action if the updater exits after fencing admission but before shutdown.
+
+status prints the installed version, any staged or in-progress update, pending-recovery markers,
+backup locations, and the last result.\u00A0 It changes nothing.
+
+recover restores the newest backup and leaves that backup where it is.\u00A0 A second run does nothing
+when the installed app already matches the backup, which makes the command safe to repeat.\u00A0
+A rollback bundle is copied back only while BotFleet is not running.\u00A0 A Resources backup is
+copied back into the installed bundle the same way.
 
 Busy bots never block an update.  Before it stops anything, apply asks BotFleet to hold new work
 (new turns, routine and webhook runs, job wakes) and gives the work already running a short grace
@@ -278,7 +290,8 @@ async function exists(path) {
     await stat(path);
     return true;
   } catch (error) {
-    if (error?.code === "ENOENT") return false;
+    // ENOTDIR is a parent that is a file: the path is not there, same as ENOENT.
+    if (error?.code === "ENOENT" || error?.code === "ENOTDIR") return false;
     throw error;
   }
 }
@@ -2290,8 +2303,11 @@ export async function releaseRuntimeAdmission(config, adapters = {}) {
   }
 }
 
-async function signatureIdentity(bundlePath, { allowLegacyBundleId = false } = {}) {
-  await run("codesign", ["--verify", "--deep", "--strict", bundlePath]);
+async function signatureIdentity(bundlePath, { allowLegacyBundleId = false, skipSealVerify = false } = {}) {
+  // A --force update already copied local Resources changes aside.  The seal
+  // on those files is then expected to fail, and the candidate is still
+  // verified on its own.  Every other install still verifies the live seal.
+  if (!skipSealVerify) await run("codesign", ["--verify", "--deep", "--strict", bundlePath]);
   const details = await run("codesign", ["-dvv", bundlePath], { allowFailure: true });
   const text = `${details.stdout}\n${details.stderr}`;
   const teamIdentifier = text.match(/^TeamIdentifier=(.+)$/m)?.[1]?.trim();
@@ -3170,6 +3186,541 @@ export function pendingRecoveryReceiptPath(prepared) {
   return join(prepared.stageDirectory, "pending-recovery.json");
 }
 
+/** Verdict of a live health probe.  Pending-recovery markers are cleared only for this value. */
+export const LIVE_OK = "live-ok";
+
+export function liveHealthMark(topology) {
+  if (topology?.safe === true && Array.isArray(topology.health) && topology.health.some((item) => item?.kind === "botfleet")) {
+    return LIVE_OK;
+  }
+  return "not-live";
+}
+
+export const LAST_RESULT_NAME = "last-result.json";
+export const RESOURCE_BACKUP_DIRNAME = "resource-backups";
+
+export function resourceBackupRoot(updatesDirectory) {
+  return join(updatesDirectory, RESOURCE_BACKUP_DIRNAME);
+}
+
+/**
+ * Finder and copier metadata are not local app changes.  Treating them as
+ * drift would refuse an ordinary update on a Mac where the bundle was opened
+ * in Finder, which is the current default path.
+ */
+function isResourceNoise(resourcePath) {
+  const base = resourcePath.split("/").pop();
+  return base === ".DS_Store" || base.startsWith("._");
+}
+
+/* oxlint-disable anti-slop/no-runtime-typeof -- dependency-free JSON boundary parse; zod is unavailable in the updater bootstrap graph. */
+function isString(value) {
+  return typeof value === "string";
+}
+/* oxlint-enable anti-slop/no-runtime-typeof */
+
+/**
+ * Rules for `Contents/Resources` from a CodeResources plist.  `null` means the
+ * seal could not be read, which is not treated as drift.  A later `files2`
+ * entry replaces the same path from `files`.
+ */
+export function sealedResourceRules(plistXml) {
+  if (!isString(plistXml) || !plistXml.includes("<plist")) return null;
+  const rules = new Map();
+  const pattern = /<key>(Resources\/[^<]+)<\/key>\s*(<data>([\s\S]*?)<\/data>|<dict>([\s\S]*?)<\/dict>)/g;
+  let found = false;
+  for (const match of plistXml.matchAll(pattern)) {
+    found = true;
+    const rule = {};
+    if (match[2].startsWith("<data>")) {
+      rule.hash = match[3].replace(/\s+/g, "");
+    } else {
+      const dict = match[4];
+      const hash2 = dict.match(/<key>hash2<\/key>\s*<data>([\s\S]*?)<\/data>/);
+      const hash = dict.match(/<key>hash<\/key>\s*<data>([\s\S]*?)<\/data>/);
+      const symlink = dict.match(/<key>symlink<\/key>\s*<string>([^<]*)<\/string>/);
+      if (hash2) rule.hash2 = hash2[1].replace(/\s+/g, "");
+      if (hash) rule.hash = hash[1].replace(/\s+/g, "");
+      if (symlink) rule.symlink = symlink[1];
+      // A nested bundle is sealed by its own signature.  The outer seal names
+      // the bundle (cdhash) and does not list the files inside it.
+      if (/<key>cdhash<\/key>/.test(dict) && !rule.hash2 && !rule.hash && rule.symlink === undefined) rule.nested = true;
+    }
+    rules.set(match[1], rule);
+  }
+  if (!found) return /<key>files2?<\/key>/.test(plistXml) ? rules : null;
+  return rules;
+}
+
+const NESTED_BUNDLE = /^(.*?\.(?:app|framework|xpc|plugin|bundle|kext|appex))(?:\/|$)/;
+
+function coveredByNestedSeal(rules, resourcePath) {
+  const match = NESTED_BUNDLE.exec(resourcePath);
+  const root = match?.[1];
+  if (!root || root === resourcePath) return false;
+  return rules.get(root)?.nested === true;
+}
+
+export function classifyResourceDrift(rules, entries) {
+  const findings = [];
+  for (const entry of entries) {
+    const rule = rules.get(entry.path);
+    if (!rule) {
+      if (!isResourceNoise(entry.path) && !coveredByNestedSeal(rules, entry.path)) {
+        findings.push({ path: entry.path, reason: "leftover" });
+      }
+      continue;
+    }
+    if (rule.symlink !== undefined) {
+      if (entry.kind !== "symlink" || entry.link !== rule.symlink) findings.push({ path: entry.path, reason: "modified" });
+      continue;
+    }
+    const expected = rule.hash2 || rule.hash;
+    const actual = rule.hash2 ? entry.hash2 : entry.hash;
+    if (expected && actual && expected !== actual) findings.push({ path: entry.path, reason: "modified" });
+  }
+  findings.sort((left, right) => left.path.localeCompare(right.path) || left.reason.localeCompare(right.reason));
+  return findings;
+}
+
+async function hashResourceFile(path) {
+  const sha1 = createHash("sha1");
+  const sha256Hash = createHash("sha256");
+  await new Promise((resolveHash, rejectHash) => {
+    const stream = createReadStream(path);
+    stream.on("data", (chunk) => {
+      sha1.update(chunk);
+      sha256Hash.update(chunk);
+    });
+    stream.on("error", rejectHash);
+    stream.on("end", resolveHash);
+  });
+  return { hash: sha1.digest("base64"), hash2: sha256Hash.digest("base64") };
+}
+
+async function walkResourceEntries(resourcesDir) {
+  const entries = [];
+  const visit = async (directory, prefix) => {
+    let names;
+    try {
+      names = await readdir(directory, { withFileTypes: true });
+    } catch (error) {
+      if (error?.code === "ENOENT") return;
+      throw error;
+    }
+    for (const name of names) {
+      const relative = prefix ? `${prefix}/${name.name}` : name.name;
+      const absolute = join(directory, name.name);
+      const resourcePath = `Resources/${relative}`;
+      if (name.isSymbolicLink()) {
+        entries.push({ path: resourcePath, kind: "symlink", link: await readlink(absolute), absolute });
+        continue;
+      }
+      if (name.isDirectory()) {
+        await visit(absolute, relative);
+        continue;
+      }
+      if (!name.isFile()) continue;
+      entries.push({ path: resourcePath, kind: "file", absolute });
+    }
+  };
+  await visit(resourcesDir, "");
+  return entries;
+}
+
+async function readCodeResourcesText(codeResourcesPath) {
+  let bytes;
+  try {
+    bytes = await readFile(codeResourcesPath);
+  } catch (error) {
+    if (error?.code === "ENOENT") return { text: null, reason: "no-seal" };
+    throw error;
+  }
+  if (bytes.subarray(0, 6).toString() === "bplist") {
+    const converted = await run("plutil", ["-convert", "xml1", "-o", "-", codeResourcesPath], { allowFailure: true });
+    if (converted.code !== 0 || !converted.stdout.includes("<plist")) return { text: null, reason: "binary-seal" };
+    return { text: converted.stdout, reason: null };
+  }
+  return { text: bytes.toString("utf8"), reason: null };
+}
+
+/** Local modifications and leftovers under the installed bundle's Resources. */
+export async function inspectInstalledResourceDrift(appPath) {
+  const codeResourcesPath = join(appPath, "Contents", "_CodeSignature", "CodeResources");
+  const read = await readCodeResourcesText(codeResourcesPath);
+  if (!read.text) return { checked: false, findings: [], reason: read.reason };
+  const rules = sealedResourceRules(read.text);
+  if (!rules) return { checked: false, findings: [], reason: "unreadable-seal" };
+  const entries = await walkResourceEntries(join(appPath, "Contents", "Resources"));
+  for (const entry of entries) {
+    if (entry.kind !== "file" || !rules.has(entry.path)) continue;
+    const hashed = await hashResourceFile(entry.absolute);
+    entry.hash = hashed.hash;
+    entry.hash2 = hashed.hash2;
+  }
+  return { checked: true, findings: classifyResourceDrift(rules, entries), reason: null };
+}
+
+export function dirtyResourcesRefusal(appPath, findings, backupRoot) {
+  const sample = findings.slice(0, 8).map((item) => `${item.reason} ${item.path}`).join(", ");
+  const extra = findings.length > 8 ? ` and ${findings.length - 8} more` : "";
+  return `Refusing to replace ${appPath} because its Resources folder has local changes (${sample}${extra}).\u00A0 Re-run with --force to back them up under ${backupRoot} and continue.`;
+}
+
+export function resourceDriftAction({ updateApp, force, drift }) {
+  if (!updateApp || !drift?.checked || !drift.findings?.length) return "skip";
+  return force ? "backup" : "refuse";
+}
+
+export async function backupDirtyResources({ appPath, backupDirectory, findings, now = new Date() }) {
+  await mkdir(backupDirectory, { recursive: true, mode: 0o700 });
+  for (const finding of findings) {
+    if (!isString(finding.path) || !finding.path.startsWith("Resources/") || finding.path.split("/").includes("..")) {
+      throw new Error(`Refusing to back up a Resources path outside the bundle: ${finding.path}`);
+    }
+    const source = join(appPath, "Contents", finding.path);
+    const destination = join(backupDirectory, finding.path);
+    await mkdir(dirname(destination), { recursive: true, mode: 0o700 });
+    await cp(source, destination, { recursive: true, verbatimSymlinks: true });
+  }
+  await atomicJson(join(backupDirectory, "manifest.json"), {
+    schemaVersion: 1,
+    kind: "resources",
+    appPath,
+    createdAt: now.toISOString(),
+    findings,
+  });
+  return backupDirectory;
+}
+
+/**
+ * Before the app bundle is swapped, refuse local Resources changes unless
+ * `--force` copied them aside.  A clean or unreadable seal keeps today's path.
+ */
+export async function guardInstalledResources({ appPath, updatesDirectory, updateApp, force, now = new Date() }) {
+  if (!updateApp) return { skipSealVerify: false, backupPath: null };
+  const drift = await inspectInstalledResourceDrift(appPath);
+  const action = resourceDriftAction({ updateApp, force, drift });
+  if (action === "skip") return { skipSealVerify: false, backupPath: null };
+  const backupRoot = resourceBackupRoot(updatesDirectory);
+  if (action === "refuse") throw new UpdateRefusedError(dirtyResourcesRefusal(appPath, drift.findings, backupRoot));
+  const backupPath = join(backupRoot, `${now.getTime()}-${process.pid}`);
+  await backupDirtyResources({ appPath, backupDirectory: backupPath, findings: drift.findings, now });
+  console.log(`Backed up ${drift.findings.length} local Resources change(s) to ${backupPath} and continuing because --force was set.`);
+  return { skipSealVerify: true, backupPath };
+}
+
+export async function clearPendingRecoveryAfterLiveOk({
+  updatesDirectory,
+  liveMark,
+  listNames = listDirectory,
+  fileExists = exists,
+  remove = (path) => rm(path, { force: true }),
+} = {}) {
+  if (liveMark !== LIVE_OK) return [];
+  const cleared = [];
+  for (const name of await listNames(updatesDirectory)) {
+    const receipt = join(updatesDirectory, name, "pending-recovery.json");
+    if (!(await fileExists(receipt))) continue;
+    await remove(receipt);
+    cleared.push(receipt);
+  }
+  return cleared;
+}
+
+export async function writeLastResult(updatesDirectory, result) {
+  await mkdir(updatesDirectory, { recursive: true, mode: 0o700 });
+  await atomicJson(join(updatesDirectory, LAST_RESULT_NAME), { schemaVersion: 1, ...result });
+}
+
+async function readBundleCommit(appPath) {
+  try {
+    const build = JSON.parse(await readFile(join(appPath, BUILD_MANIFEST_RELATIVE), "utf8"));
+    return /^[a-f0-9]{40}$/.test(build?.sourceCommit || "") ? build.sourceCommit : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function collectUpdateStatus(config) {
+  let installedVersion = null;
+  let installedBuild = null;
+  let installedCommit = null;
+  try {
+    const build = JSON.parse(await readFile(join(config.appPath, BUILD_MANIFEST_RELATIVE), "utf8"));
+    installedCommit = /^[a-f0-9]{40}$/.test(build?.sourceCommit || "") ? build.sourceCommit : null;
+    installedVersion = isString(build?.version) ? build.version : null;
+    installedBuild = build.build ?? null;
+  } catch {
+    installedCommit = null;
+  }
+  const installed = {
+    version: installedVersion,
+    build: installedBuild,
+    sourceCommit: installedCommit,
+    appPath: config.appPath,
+  };
+
+  const staged = [];
+  const pendingRecovery = [];
+  for (const name of await listDirectory(config.updatesDirectory)) {
+    if (name === RESOURCE_BACKUP_DIRNAME || name === "recover-displaced" || name === LAST_RESULT_NAME) continue;
+    const directory = join(config.updatesDirectory, name);
+    let details;
+    try {
+      details = await lstat(directory);
+    } catch {
+      continue;
+    }
+    if (!details.isDirectory() || details.isSymbolicLink()) continue;
+    const manifestPath = join(directory, "prepared.json");
+    if (await exists(manifestPath)) {
+      try {
+        const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+        if (manifest?.sourceCommit && manifest.sourceCommit !== installedCommit) {
+          staged.push({
+            path: directory,
+            sourceCommit: manifest.sourceCommit,
+            version: manifest.version || null,
+            createdAt: manifest.createdAt || null,
+          });
+        }
+      } catch {
+        staged.push({ path: directory, sourceCommit: null, version: null, createdAt: null });
+      }
+    }
+    const receipt = join(directory, "pending-recovery.json");
+    if (await exists(receipt)) {
+      let reason = null;
+      try {
+        reason = JSON.parse(await readFile(receipt, "utf8"))?.reason || null;
+      } catch {
+        reason = null;
+      }
+      pendingRecovery.push({ path: receipt, reason });
+    }
+  }
+
+  const backups = [];
+  for (const name of await listDirectory(resourceBackupRoot(config.updatesDirectory))) {
+    const directory = join(resourceBackupRoot(config.updatesDirectory), name);
+    let createdAt = null;
+    let count = null;
+    try {
+      const manifest = JSON.parse(await readFile(join(directory, "manifest.json"), "utf8"));
+      if (manifest?.kind === "resources" && manifest.schemaVersion === 1) {
+        createdAt = manifest.createdAt || null;
+        count = Array.isArray(manifest.findings) ? manifest.findings.length : null;
+        backups.push({ kind: "resources", path: directory, createdAt, count });
+      }
+    } catch {
+      /* A directory without a manifest is not a backup this updater can restore. */
+    }
+  }
+  const { generations } = await rollbackGenerations(config);
+  for (const item of generations) {
+    if (rollbackGenerationStatus(item.receipt) !== "verified") continue;
+    if (!isString(item.receipt.rollbackBundle)) continue;
+    backups.push({
+      kind: "rollback",
+      path: item.receipt.rollbackBundle,
+      createdAt: item.receipt.installedAt || null,
+      receiptPath: item.receiptPath,
+    });
+  }
+
+  let lastResult = null;
+  try {
+    const parsed = JSON.parse(await readFile(join(config.updatesDirectory, LAST_RESULT_NAME), "utf8"));
+    if (parsed?.schemaVersion === 1 && isString(parsed.outcome)) lastResult = parsed;
+  } catch {
+    lastResult = null;
+  }
+
+  let updateInProgress = null;
+  try {
+    const owner = JSON.parse(await readFile(join(config.lockDirectory, "owner.json"), "utf8"));
+    if (Number.isInteger(owner?.pid) && owner.pid !== process.pid && await processIsAlive(owner.pid)) {
+      updateInProgress = { pid: owner.pid, mode: owner.mode || null };
+    }
+  } catch {
+    updateInProgress = null;
+  }
+
+  return { installed, staged, pendingRecovery, backups, lastResult, updateInProgress };
+}
+
+export function renderUpdateStatus(status) {
+  const lines = ["BotFleet updater status"];
+  const installed = status.installed;
+  if (!installed?.sourceCommit) {
+    lines.push(`Installed: none at ${installed?.appPath || "unknown"}`);
+  } else {
+    const build = installed.build != null ? ` build ${installed.build}` : "";
+    lines.push(`Installed: ${installed.version || "unknown"}${build} (${installed.sourceCommit.slice(0, 12)})`);
+    lines.push(`App: ${installed.appPath}`);
+  }
+  if (status.updateInProgress) {
+    lines.push(`Pending update: running pid ${status.updateInProgress.pid}${status.updateInProgress.mode ? ` (${status.updateInProgress.mode})` : ""}`);
+  }
+  if (status.staged?.length) {
+    for (const stage of status.staged) {
+      const commit = stage.sourceCommit ? stage.sourceCommit.slice(0, 12) : "unreadable";
+      lines.push(`Staged update: ${stage.path} ${commit}${stage.version ? ` (${stage.version})` : ""}`);
+    }
+  } else if (!status.updateInProgress) {
+    lines.push("Staged update: none");
+  }
+  if (status.pendingRecovery?.length) {
+    for (const item of status.pendingRecovery) {
+      lines.push(`Pending recovery: ${item.path}${item.reason ? ` (${item.reason})` : ""}`);
+    }
+  } else {
+    lines.push("Pending recovery: none");
+  }
+  if (status.backups?.length) {
+    for (const backup of status.backups) {
+      const count = backup.kind === "resources" && backup.count != null ? ` (${backup.count} files)` : "";
+      lines.push(`Backup: ${backup.path}${count}`);
+    }
+  } else {
+    lines.push("Backup: none");
+  }
+  if (status.lastResult?.outcome) {
+    const live = status.lastResult.live ? ` ${status.lastResult.live}` : "";
+    const message = status.lastResult.message ? ` ${status.lastResult.message}` : "";
+    lines.push(`Last result: ${status.lastResult.outcome}${live}${message}`);
+  } else {
+    lines.push("Last result: none");
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+export function newestBackup(backups) {
+  return [...(backups || [])]
+    .filter((item) => item && (item.kind === "resources" || item.kind === "rollback") && isString(item.path))
+    .sort((left, right) => String(right.createdAt || "").localeCompare(String(left.createdAt || "")) || left.path.localeCompare(right.path))[0] || null;
+}
+
+function ownedBackupPath(path, config) {
+  const target = resolve(path);
+  const updates = resolve(config.updatesDirectory);
+  const appDirectory = dirname(resolve(config.appPath));
+  const underUpdates = target.startsWith(`${updates}${sep}`);
+  const adjacentRollback = target.startsWith(`${appDirectory}${sep}`) && basename(target).startsWith(".BotFleet.rollback-") && target.endsWith(".app");
+  return underUpdates || adjacentRollback;
+}
+
+async function restoreRollbackBackup(config, backup, { holders, copyTree, renamePath }) {
+  if (!ownedBackupPath(backup.path, config)) {
+    throw new Error(`Refusing to restore a backup outside the updater's directories: ${backup.path}`);
+  }
+  if (!(await exists(backup.path))) {
+    throw new Error(`The newest backup bundle is missing: ${backup.path}`);
+  }
+  const backupCommit = await readBundleCommit(backup.path);
+  const installedCommit = await readBundleCommit(config.appPath);
+  if (!backupCommit) throw new Error(`Backup bundle has no build identity: ${backup.path}`);
+  if (backupCommit === installedCommit) {
+    const message = `Already restored from ${backup.path}.`;
+    console.log(message);
+    return { restored: false, reason: "already", message, backupPath: backup.path };
+  }
+  const busy = await holders(config.appPath);
+  if (busy.length) {
+    throw new Error(`BotFleet is still running (pid ${busy.join(", ")}).\u00A0 Quit it before ubf recover.`);
+  }
+  const stamp = `${Date.now()}-${process.pid}`;
+  // The two renames are atomic only on one volume.  The cache is that volume
+  // when it shares one with the installed app; otherwise the work stays beside
+  // the app, which is the same fallback the update swap uses.
+  const shareVolume = await sameVolume(config.updatesDirectory, config.appPath).catch(() => false);
+  const displacedRoot = shareVolume
+    ? join(config.updatesDirectory, "recover-displaced", stamp)
+    : join(dirname(config.appPath), `.BotFleet.recover-displaced-${stamp}`);
+  const displaced = join(displacedRoot, basename(config.appPath));
+  const staging = join(displacedRoot, `.staging-${basename(config.appPath)}`);
+  await mkdir(displacedRoot, { recursive: true, mode: 0o700 });
+  await copyTree(backup.path, staging);
+  let movedLive = false;
+  try {
+    if (await exists(config.appPath)) {
+      await renamePath(config.appPath, displaced);
+      movedLive = true;
+    }
+    await renamePath(staging, config.appPath);
+  } catch (error) {
+    if (movedLive && !(await exists(config.appPath)) && await exists(displaced)) {
+      await renamePath(displaced, config.appPath);
+    }
+    throw error;
+  }
+  const message = `Restored ${config.appPath} from ${backup.path}.\u00A0 The backup was left in place.\u00A0 The previous app is at ${displaced}.`;
+  console.log(message);
+  return { restored: true, reason: "restored", message, backupPath: backup.path, displaced };
+}
+
+async function restoreResourceBackup(config, backup, { holders, copyTree }) {
+  if (!ownedBackupPath(backup.path, config)) {
+    throw new Error(`Refusing to restore a backup outside the updater's directories: ${backup.path}`);
+  }
+  const manifest = JSON.parse(await readFile(join(backup.path, "manifest.json"), "utf8"));
+  const findings = Array.isArray(manifest?.findings) ? manifest.findings : [];
+  const pending = [];
+  for (const finding of findings) {
+    if (!isString(finding?.path) || !finding.path.startsWith("Resources/") || finding.path.split("/").includes("..")) {
+      throw new Error(`Backup manifest names a path outside Resources: ${finding?.path}`);
+    }
+    const source = join(backup.path, finding.path);
+    const destination = join(config.appPath, "Contents", finding.path);
+    if (!(await exists(source))) throw new Error(`Backup is missing ${finding.path}: ${backup.path}`);
+    const sourceStat = await lstat(source);
+    let same = false;
+    if (await exists(destination)) {
+      const destinationStat = await lstat(destination);
+      if (sourceStat.isSymbolicLink() && destinationStat.isSymbolicLink()) {
+        same = await readlink(source) === await readlink(destination);
+      } else if (sourceStat.isFile() && destinationStat.isFile()) {
+        const [sourceHash, destinationHash] = await Promise.all([hashResourceFile(source), hashResourceFile(destination)]);
+        same = sourceHash.hash2 === destinationHash.hash2;
+      }
+    }
+    if (!same) pending.push({ source, destination });
+  }
+  if (!pending.length) {
+    const message = `Already restored from ${backup.path}.`;
+    console.log(message);
+    return { restored: false, reason: "already", message, backupPath: backup.path };
+  }
+  const busy = await holders(config.appPath);
+  if (busy.length) {
+    throw new Error(`BotFleet is still running (pid ${busy.join(", ")}).\u00A0 Quit it before ubf recover.`);
+  }
+  for (const item of pending) {
+    await mkdir(dirname(item.destination), { recursive: true, mode: 0o700 });
+    await copyTree(item.source, item.destination);
+  }
+  const message = `Restored ${pending.length} Resources file(s) into ${config.appPath} from ${backup.path}.\u00A0 The backup was left in place.`;
+  console.log(message);
+  return { restored: true, reason: "restored", message, backupPath: backup.path };
+}
+
+export async function recoverFromLatestBackup(config, {
+  holders = bundleHolderPids,
+  copyTree = (source, destination) => cp(source, destination, { recursive: true, verbatimSymlinks: true, force: true }),
+  renamePath = rename,
+} = {}) {
+  const status = await collectUpdateStatus(config);
+  const backup = newestBackup(status.backups);
+  if (!backup) {
+    const message = "No BotFleet backup to restore.";
+    console.log(message);
+    return { restored: false, reason: "none", message };
+  }
+  if (backup.kind === "rollback") return restoreRollbackBackup(config, backup, { holders, copyTree, renamePath });
+  return restoreResourceBackup(config, backup, { holders, copyTree });
+}
+
 export function credentialPreparationReceiptPath(prepared) {
   return join(prepared.stageDirectory, "credential-migration.json");
 }
@@ -3816,6 +4367,7 @@ function rollbackReceipt(prepared, previous, config, extra) {
   if (previous.crossVolumeReason) {
     receipt.crossVolumeReason = previous.crossVolumeReason;
   }
+  if (previous.resourceBackup) receipt.resourceBackup = previous.resourceBackup;
   return receipt;
 }
 
@@ -4430,8 +4982,8 @@ export function createOperations(config) {
     // is gone.  Swept at the start of every apply, not only after a verified
     // one, so a run of failures cannot pile them up (2026-10-09 left
     // /Applications/.BotFleet.update-86863-… and its dependency tree).  A
-    // deferred rollback's pending-recovery.json is reported, not acted on:
-    // nothing reads it, so it never blocks this update.
+    // A deferred rollback's pending-recovery.json is reported here, not acted
+    // on.  finish clears it after a later update is verified and live-ok.
     sweepLeftovers: async () => {
       const roots = [dirname(config.appPath), dirname(config.checkout), config.updatesDirectory];
       await sweepCandidates(dirname(config.appPath), CANDIDATE_BUNDLE_PREFIX, ".app", [], roots);
@@ -4511,12 +5063,21 @@ export function createOperations(config) {
         throw new Error(`Live always-on checkout has changes; refusing update:\n${dirty}`);
       }
       if (!(await exists(config.appPath))) throw new Error(`Installed BotFleet app is missing: ${config.appPath}`);
+      const resourceGuard = await guardInstalledResources({
+        appPath: config.appPath,
+        updatesDirectory: config.updatesDirectory,
+        updateApp,
+        force: config.force,
+      });
       const liveDependencies = join(config.checkout, "node_modules");
       const dependencyDetails = await lstat(liveDependencies);
       if (!dependencyDetails.isDirectory() || dependencyDetails.isSymbolicLink()) {
         throw new Error(`Live dependency tree must be a real directory: ${liveDependencies}`);
       }
-      const installedIdentity = await signatureIdentity(config.appPath, { allowLegacyBundleId: true });
+      const installedIdentity = await signatureIdentity(config.appPath, {
+        allowLegacyBundleId: true,
+        skipSealVerify: resourceGuard.skipSealVerify,
+      });
       const installedCommit = await installedBuildCommit(config.appPath);
       const installedDependencyFingerprint = await dependencyFingerprint(liveDependencies);
       const [launchd, legacyLaunchd] = await Promise.all([
@@ -4592,6 +5153,7 @@ export function createOperations(config) {
         candidatePath: join(dirname(config.appPath), `${CANDIDATE_BUNDLE_PREFIX}${process.pid}-${stamp}.app`),
         rollbackDependencies,
         candidateDependencies: join(dirname(config.checkout), `${CANDIDATE_DEPENDENCY_PREFIX}${process.pid}-${stamp}`),
+        resourceBackup: resourceGuard.backupPath,
       };
     },
 
@@ -4918,6 +5480,32 @@ export function createOperations(config) {
         await pruneSuperseded(receiptPath, prepared, previous);
       } catch (error) {
         console.error(`Could not prune superseded BotFleet rollback copies: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      let live = "not-live";
+      try {
+        live = liveHealthMark(await healthTopology(config.ports, { dataDirectory: config.dataDirectory }));
+        if (live === LIVE_OK) {
+          const cleared = await clearPendingRecoveryAfterLiveOk({
+            updatesDirectory: config.updatesDirectory,
+            liveMark: live,
+          });
+          if (cleared.length) console.log(`Cleared pending recovery after live-ok: ${cleared.join(", ")}`);
+        }
+      } catch (error) {
+        live = "not-live";
+        console.error(`Pending-recovery markers were left in place: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      try {
+        await writeLastResult(config.updatesDirectory, {
+          outcome: "verified",
+          command: config.parsed.command,
+          at: new Date().toISOString(),
+          message: `Updated BotFleet to ${prepared.targetCommit.slice(0, 12)}.`,
+          targetCommit: prepared.targetCommit,
+          live,
+        });
+      } catch (error) {
+        console.error(`Could not record the update result: ${error instanceof Error ? error.message : String(error)}`);
       }
     },
 
@@ -5250,6 +5838,30 @@ export async function main(argv = process.argv.slice(2)) {
     console.log("Released the BotFleet runtime admission fence.");
     return;
   }
+  if (parsed.command === "status") {
+    console.log(renderUpdateStatus(await collectUpdateStatus(config)).trimEnd());
+    return;
+  }
+  if (parsed.command === "recover") {
+    const lock = await acquireDirectoryLock(config.lockDirectory, "recover");
+    try {
+      const outcome = await recoverFromLatestBackup(config);
+      try {
+        await writeLastResult(config.updatesDirectory, {
+          outcome: outcome.restored ? "restored" : "unchanged",
+          command: "recover",
+          at: new Date().toISOString(),
+          message: outcome.message,
+          live: null,
+        });
+      } catch (error) {
+        console.error(`Could not record the recover result: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    } finally {
+      await lock.release();
+    }
+    return;
+  }
   const bare = createOperations(config);
   // The detached run is the only kind the desktop app and the phone can
   // start, and neither can be its parent — so a progress file is the whole
@@ -5277,8 +5889,27 @@ export async function main(argv = process.argv.slice(2)) {
     }
     return runUpdate(parsed, { ...parsed, signals: process }, operations);
   };
+  const recordFailure = async (error) => {
+    if (!["update", "apply", "prepare"].includes(parsed.command)) return;
+    try {
+      await writeLastResult(config.updatesDirectory, {
+        outcome: "failed",
+        command: parsed.command,
+        at: new Date().toISOString(),
+        message: error instanceof Error ? error.message : String(error),
+        live: null,
+      });
+    } catch (recordError) {
+      console.error(`Could not record the update result: ${recordError instanceof Error ? recordError.message : recordError}`);
+    }
+  };
   if (!progress) {
-    await perform();
+    try {
+      await perform();
+    } catch (error) {
+      await recordFailure(error);
+      throw error;
+    }
     return;
   }
   try {
@@ -5287,6 +5918,7 @@ export async function main(argv = process.argv.slice(2)) {
       ? "The update was prepared."
       : "The update installed and verified.");
   } catch (error) {
+    await recordFailure(error);
     progress.finish(
       outcomeForError(error, { rolledBack: progress.record.rolledBack }),
       outcomeMessage(error),
