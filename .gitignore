@@ -7,9 +7,16 @@ dist-native
 # which package:prepare runs before electron-builder stages it
 dist-companion
 dist-server
+# the shared STS bundle for the packaged Electron main process — regenerated
+# by `pnpm build:shared`, which package:prepare runs before electron-builder
+dist-shared
+dist-shared-types
 *.local
 .DS_Store
 *.tsbuildinfo
+native/helpers/speech-helper
+native/helpers/BotFleet Speech.app
+native/helpers/BotFleet Recorder.app
 electron/resources/speech-helper
 electron/resources/BotFleet Speech.app
 electron/resources/BotFleet Recorder.app
@@ -61,3 +68,34 @@ debug-cap.mjs
 # Python bytecode
 __pycache__/
 *.pyc
+
+# Playwright run output: regenerated on every failing spec run, and it is
+# never something to commit.  Without this, a `git add -A` after a local
+# playwright run sweeps error-context.md and .last-run.json into the diff.
+test-results/
+playwright-report/
+
+# The DSH/Clutch engine's own skill root for whatever checkout it runs in.
+# Per the fleet protocol it outranks the shared `~/.agents/skills` and "no installer
+# writes" it — the engine materializes it at runtime.  Left untracked-and-
+# unignored it reads as local work, so the updater refused every run with
+# "the always-on checkout has uncommitted changes" on a directory that was
+# simply the engine doing its job.
+# Exception: .agents/setup and .agents/resume are Amp orb lifecycle files
+# (see https://ampcode.com/docs/orbs) and must stay tracked.
+.agents/*
+!.agents/setup
+!.agents/resume
+
+# Amp orb portal scratch (screenshots, preview links).  Never commit.
+.amp/portals/
+
+# Generated native server controller and Swift package products.
+electron/resources/BotFleet Control.app/
+mac-control/.build/
+mac-control/.swiftpm/
+# The fleet iOS version manifest publisher writes a local cache next to
+# the script (scripts/ios-fleet/publish-ios-versions.sh).  It is a cache,
+# not source:  keeping it out of git stops it from tripping the ship's
+# dirty-worktree gate on the next local run.
+scripts/ios-fleet/ios-app-versions.json

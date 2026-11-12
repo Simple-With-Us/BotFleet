@@ -14,16 +14,25 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import { z } from "zod";
+import type { SignInRequestCardData } from "../../shared/sign-in-request.ts";
 import type { CloudBackend, EffortLevel } from "../../server/contracts.ts";
 import type { AccessTokenState } from "../../server/recall-access.ts";
 import type { ComputerReach } from "../../server/computer-capability.ts";
 import type { BotColor, BotMotion } from "@/lib/mascot";
-import type { BotAvatarCrop } from "../../shared/bot-avatar";
+import type { BotAvatarCrop, BotAvatarRecolorable } from "../../shared/bot-avatar";
 import type { ConnectorToolGrant } from "../../shared/connector-tools";
 import type { RoutineRequestCardData } from "../../shared/routine-request";
+import type { Attachment } from "@/lib/composer-attachments";
 import { publishRuntimeEvent, publishRuntimeGap } from "@/lib/runtime-feed";
+import type { HelperTranscript } from "../../shared/helpers";
 import type { ToolKind } from "../../shared/tool-activity";
+import type { ReviewHook } from "../../shared/auto-review";
+import type { BusySendDefault } from "../../shared/busy-send-default.ts";
 import type { ContextInjectionRef } from "../../shared/context-injection";
+import { taskWorkspaceContextsMatch, type TaskAppRef, type TaskWorkspaceContext } from "../../shared/task-workspace-context";
+import { MergeAllBotTasksResponseSchema } from "../../shared/merge-threads";
+import { eligibleTaskApps } from "@/lib/task-app-context";
 import {
   DEFAULT_ROOM_TERMINOLOGY,
   resolveRoomLabels,
@@ -31,6 +40,7 @@ import {
   type RoomTerminology,
 } from "../../shared/terminology";
 import {
+  allowsMultipleBotThreads,
   parseConversationMode,
   type ConversationMode,
 } from "../../shared/conversation-mode";
@@ -40,8 +50,10 @@ import type { WebhookAttempt, WebhookIngressStatus, WebhookTrigger } from "@/lib
 import { currentCall } from "@/lib/call";
 import { showNotification, type NotificationTarget } from "@/lib/notify";
 import { speaker } from "@/lib/tts";
-import { spokenReply } from "../../shared/voice-summary";
-import { createBotPatchQueue, type BotUpdatePatch } from "./bot-patch-queue";
+import type { Pronunciation } from "../../shared/pronunciations";
+import { voiceScriptKind } from "../../shared/voice-summary";
+import { applyBotPatch, createBotPatchQueue, type BotUpdatePatch } from "./bot-patch-queue";
+import { voiceForDevice, type BotVoices } from "../../shared/bot-voice";
 import { skillRecorderEnabled } from "@/lib/feature-flags";
 
 export type { BotColor, MausColor } from "@/lib/mascot";
@@ -60,6 +72,8 @@ export interface OptionCardData {
   held?: string;
   /** the narrow grant "always allow" remembers, e.g. "Bash:git" */
   allowKey?: string;
+  /** Extra confirmation before always-allow on a write-shaped MCP tool. */
+  allowKeyWarnWrite?: boolean;
   approvalScope?: "local-computer" | "disposable-computer";
   /** Persisted proposal used by the server when the user confirms it. */
   routineRequest?: RoutineRequestCardData;
@@ -97,8 +111,8 @@ export interface Message {
    * RoutineRunTrigger, inlined so this module does not depend on it.  Lets
    * the UI show an accurate subtitle instead of a generic "Routine" label
    * for every non-webhook/imessage system message. */
-  automationSource?: "schedule" | "manual" | "webhook" | "resource" | "delegation" | "imessage" | "job";
-  kind: "text" | "options" | "activity" | "screen" | "connector" | "secret";
+  automationSource?: "schedule" | "manual" | "webhook" | "resource" | "delegation" | "imessage" | "job" | "zulip";
+  kind: "text" | "options" | "activity" | "screen" | "connector" | "secret" | "sign-in";
   /** A "Job Finished" row: a background job of the bot's ended. */
   job?: import("../../shared/jobs").JobRowData;
   text?: string;
@@ -106,12 +120,14 @@ export interface Message {
   modelSelection?: { instanceId: string; model: string };
   audio?: Array<{ path: string; mime: string }>;
   voiceText?: string;
+  voiceTextKind?: "written" | "summary";
   recording?: { path: string; mime: "audio/wav"; transcript: string; engine: "apple-on-device" };
   recordingReview?: { correction?: string; comment?: string; updatedAt: number };
   translation?: { language: string; text: string; provider: string };
   card?: OptionCardData;
   connector?: ConnectorCardData;
   secret?: SecretRequestCardData;
+  signIn?: SignInRequestCardData;
   /** activity messages: tool name + outcome. `spoken` is the server's
    * narration of the same chip ("reading a file"), used by call mode. */
   /** `setup` marks an error fixed by installing something, not by retrying. */
@@ -142,6 +158,9 @@ export interface Message {
      * interleaving parallel helpers' steps with the bot's own. */
     parentItemId?: string;
   };
+  /** The helper card for the row that started an engine-native helper
+   * (jobs P3).  Absent on an ordinary step. */
+  helper?: HelperTranscript;
   /** What the harness put in front of the model for THIS turn that the person
    * did not type — memory, selected skills, a quoted reply, a replayed
    * conversation (shared/context-injection.ts).  One short record each: a
@@ -178,6 +197,13 @@ export interface Message {
   /** steer-queue entry this drained user line came from. Pending chips
    * match on this id, not on equal text. Absent on ordinary sends. */
   queueId?: string;
+  /** A slash command the person ran, rather than a line of the conversation. */
+  command?: {
+    id: string;
+    name: string;
+    source: "botfleet" | "engine";
+    role: "invocation" | "reply" | "output";
+  };
 }
 
 export type GroupDefaultResponder =
@@ -235,6 +261,7 @@ export interface GroupTask {
   lastActivity?: number;
   pinnedCwd?: string | null;
   pinnedMessageId?: string;
+  workspaceContext?: TaskWorkspaceContext;
 }
 
 export interface ModelSelection {
@@ -242,6 +269,13 @@ export interface ModelSelection {
   /** Always the real slug that runs, also for a "Latest <Class>" entry. */
   model: string;
   effort?: EffortLevel;
+  /** Working-context cap in tokens; absent is the model's full window.  `null`
+   *  is how a write clears a saved cap (an absent key keeps it for older
+   *  clients), and the harness never sends it back. */
+  contextCap?: number | null;
+  /** Output limit in tokens; absent leaves the model's own limit.  `null`
+   *  clears a saved limit, like `contextCap`. */
+  maxOutputTokens?: number | null;
   /** The model class this entry floats on ("sonnet" = Latest Sonnet); see
    *  shared/model-lineage.ts.  The picker sends `null` when a person picks
    *  a pinned model, so the harness does not carry an older float forward. */
@@ -257,6 +291,13 @@ export interface Task {
   createdAt: number;
   /** Last message in this task's thread; falls back to createdAt. */
   lastActivity?: number;
+  /** How many messages this task's thread holds.  Absent on frames from
+   * before the harness counted them. */
+  messageCount?: number;
+  /** When the conversation first spoke.  Absent on frames from before the
+   * harness stamped it.  A merge folds transcripts in the order they
+   * began, which is not always the order the tasks were created. */
+  startedAt?: number;
   /** what this task has spent, banked once per settled turn */
   usage?: TaskUsage;
   /** Timing aggregate banked with `usage`; absent on tasks from before it
@@ -268,9 +309,10 @@ export interface Task {
    *  connection;  `byModel` splits the bucket per model that ran.
    *  Absent on older records. */
   usageByInstance?: Record<string, TaskUsage & { engineId?: string; byModel?: Record<string, TaskUsage> }>;
-  /** folder this task's turns run in, pinned on its first turn; null =
+  /** Folder selected at creation or pinned on the first turn; null =
    * legacy home-folder session; absent = not pinned yet */
   cwd?: string | null;
+  workspaceContext?: TaskWorkspaceContext;
   /** Optional engine for this conversation.  Absent means the bot's own
    * modelSelection.  Used in Projects mode so a thread is not a named bot. */
   modelSelection?: ModelSelection;
@@ -309,6 +351,11 @@ export interface TaskUsage {
    * from builds before cost existed lack the field entirely */
   costUsd: number | null;
   turns: number;
+  /** Input tokens of the latest settled turn that reported any.  How full
+   * the window was, not a running total.  Absent until a turn reports it. */
+  lastInput?: number;
+  /** Context window the engine reported with that turn, when it sent one. */
+  contextWindow?: number;
 }
 
 export interface Bot {
@@ -333,6 +380,8 @@ export interface Bot {
   avatarUrl?: string | null;
   /** Mascot, or the crop applied to avatarUrl. */
   avatarCrop?: BotAvatarCrop;
+  /** none | shell | full — how much of the avatar the Color row may recolour. */
+  recolorable?: BotAvatarRecolorable;
   unread: boolean;
   busy?: boolean;
   activityStartedAt?: number;
@@ -345,12 +394,21 @@ export interface Bot {
   computers?: Array<"cloud" | "vm" | "local" | "off">;
   /** Which cloud computer backs `computer: "cloud"`; absent means Box. */
   cloudBackend?: CloudBackend;
+  /** The backend this bot really uses once the workspace default fills in for
+   * an unpinned one.  Read-only on the wire: the phone uses it to decide
+   * whether a live desktop exists; the settings UI keeps reading the raw
+   * `cloudBackend` so "inherited" and "pinned" stay distinguishable. */
+  effectiveCloudBackend?: CloudBackend;
   /** Allow Auto to prepare/start the managed VPS container. Off by default. */
   autoStartVps?: boolean;
   /** where new tasks run their shell tools; absent = the private bot workspace */
   cwd?: string;
   /** auto mode: the bot approves its own tool permissions */
   autoApprove?: boolean;
+  /** permission bypass mode: automatically approve all tools, commands, and routines without halting */
+  bypassPermissions?: boolean;
+  /** bypass mode extended to the requests that control this Mac; means nothing without bypassPermissions */
+  bypassLocalComputer?: boolean;
   /** optional model review for otherwise undecided, attended approvals */
   autoReview?: "off" | "shadow" | "enforce";
   /** tools this bot may always use without asking */
@@ -359,16 +417,30 @@ export interface Bot {
    *  Unset or null uses DEFAULT_MAX_TOOL_ROUNDS (shared/bot-profile.ts) — the
    *  same number the turn's prompt names and the loop stops at. */
   maxToolRounds?: number | null;
+  /** Cap on replayed history turns before older turns are dropped and
+   *  summarized (ACP engines).  Unset or null keeps every turn the byte
+   *  budget fits. */
+  maxHistoryTurns?: number | null;
+  /** Let the bot's model write the dropped-history summary (cached and
+   *  rolled forward), falling back to the extractive note on error. */
+  historySummaryModel?: boolean;
   /** speak this bot's replies aloud as they settle */
   speakReplies?: boolean;
   speechDevices?: Array<"mac" | "iphone">;
   /** this bot's own voice id (falls back to the app-wide one) */
   voice?: string;
+  /** Per-device overrides of `voice`.  The wire sends null when neither
+   * device has one.  Resolve with voiceForDevice (shared/bot-voice.ts). */
+  voices?: BotVoices | null;
   /** Whether to post-process bot answers with DeepSeek V4.1 Flash for TTS.
    * "on_demand" runs only on manual speak; "always" runs on every turn; "off" uses raw answer. */
   voiceSummaryMode?: "off" | "on_demand" | "always";
   pinned?: boolean;
   hidden?: boolean;
+  /** The bot's On/Off switch (shared/bot-power.ts).  True = Off: nothing new
+   *  starts for it from any source, but its chat stays visible and a turn
+   *  already running finishes.  Absent or false = on. */
+  off?: boolean;
   /** Sidebar section this bot renders under; absent = unsectioned. */
   section?: string;
   /** the one message pinned to the top of this bot's active thread */
@@ -506,18 +578,41 @@ export interface ConfigStatus {
     mode: "shared" | "per-bot";
     maxInstances: number;
     shareCliCredentials?: boolean;
+    shareGpgPrivateKeys?: boolean;
     allowHostTerminal?: boolean;
   };
   opencodeGo?: { configured: boolean };
   /** Voice (MiniMax). `configured` = a key is saved; `ready` = a key AND
    * a voice, which is what it takes to actually speak. The key itself is
    * never echoed back. */
-  tts?: { configured: boolean; ready: boolean; voice: string; provider?: "minimax" | "system"; optimizedSummary?: boolean };
+  /** `voice` is the workspace default voice (every bot without its own
+   * speaks with it).  `pronunciations` is the list in force, the seeded
+   * defaults included; absent only from a harness older than the list. */
+  tts?: {
+    configured: boolean;
+    ready: boolean;
+    voice: string;
+    provider?: "minimax" | "system" | "xai" | "azure";
+    optimizedSummary?: boolean;
+    audioRetentionDays?: number;
+    pronunciations?: Pronunciation[];
+  };
   /** Call-mode STT preference + global vocabulary, mirrored from AppConfig.
    * `provider` is undefined when the picker has no explicit preference and
    * chooses the platform default. `keyterms` is the global voice vocabulary
    * the user has set up; per-bot terms are layered on top in call-stt.ts. */
-  callStt?: { provider?: "apple" | "assemblyai"; keyterms?: string[] };
+  callStt?: {
+    provider?: "apple" | "assemblyai" | "xai" | "meta" | "azure" | "groq";
+    ladder?: Array<"meta" | "xai" | "assemblyai" | "azure" | "groq">;
+    keyterms?: string[];
+    cloud?: import("../../shared/voice-providers.ts").CloudSttCapabilities;
+  };
+  /** Speech-to-speech call preference, mirrored from AppConfig.  `provider`
+   * is undefined when the picker has no explicit preference and Auto picks
+   * whichever provider has a key; `frontEngine` defaults to true, so an
+   * absent value reads as on, matching prepareStsSession.  `engineTimeoutMs`
+   * is the deadline on one `bot_engine` call; absent means the default. */
+  sts?: { provider?: "xai" | "gemini"; frontEngine?: boolean; engineTimeoutMs?: number };
   /** Shared write-only credential for on-demand GPT Image avatars. */
   imageGen?: { configured: boolean };
   /** who's using the app — collected in onboarding, shown in the sidebar */
@@ -537,6 +632,8 @@ export interface ConfigStatus {
   /** Simple (Grok-style bots + group threads) or Projects (categories of
    * threads).  Absent means simple. */
   conversationMode?: ConversationMode;
+  /** Default delivery while a bot turn is busy.  Absent means steer-first. */
+  busySendDefault?: BusySendDefault;
   /** Shared Qdrant Bot RAG vector database status. `url` and `collection`
    * are empty until the operator sets them — BotFleet ships no endpoint. */
   qdrant?: {
@@ -565,6 +662,13 @@ export interface ConfigStatus {
     projects: Array<{ slug: string; match: string[] }>;
     enginePlans?: Record<string, { planName?: string; costPerMonth?: number | null }>;
   };
+  /** Auto-review's fleet settings.  `fallbackReviewer` is the stored choice
+   * of the engine that reviews a bot's approvals when its own engine cannot:
+   * null for Automatic, "none" for off, or an instance id.
+   * `automaticReviewer` is the engine Automatic picks right now (the card
+   * works it out live from the engine list by the same rule), and
+   * `maxReviewsPerTurn` is the per-turn reviewer-call cap. */
+  autoReview?: { fallbackReviewer: string | null; automaticReviewer?: string | null; maxReviewsPerTurn?: number };
   /** Opt-in flags. Absent means off. */
   features?: { skillRecorder: boolean; showToolCalls?: boolean; summarizeToolCalls?: boolean };
   /** Sentry diagnostics.  `configured` mirrors `hasDsn` — a key is on file,
@@ -595,9 +699,14 @@ export interface ConfigStatus {
   infisical?: {
     configured: boolean;
     enabled: boolean;
+    /** Persisted operator toggle, independent of whether credentials are configured. */
+    enabledSetting?: boolean;
     writeThrough: boolean;
+    authMethod?: "service-token" | "machine-identity";
     environment: string;
     hasClientSecret: boolean;
+    hasToken?: boolean;
+    hasWriteToken?: boolean;
     managedCount: number;
     lastSyncAt: string | null;
     stale: boolean;
@@ -641,7 +750,7 @@ export function getConversationMode(config?: ConfigStatus | null): ConversationM
 
 export type ConfigStatusFrame = Pick<
   ConfigStatus,
-  "xai" | "deepseek" | "composio" | "box" | "vps" | "rooms" | "botDefaults" | "host" | "ingress" | "localVm" | "opencodeGo" | "tts" | "callStt" | "imageGen" | "profile" | "autoUpdate" | "terminology" | "roomLabels" | "conversationMode" | "qdrant" | "usage" | "features" | "observability" | "infisical" | "imessageLinq"
+  "xai" | "deepseek" | "composio" | "box" | "vps" | "rooms" | "botDefaults" | "host" | "ingress" | "localVm" | "opencodeGo" | "tts" | "callStt" | "sts" | "imageGen" | "profile" | "autoUpdate" | "terminology" | "roomLabels" | "conversationMode" | "qdrant" | "usage" | "features" | "observability" | "infisical" | "imessageLinq" | "autoReview"
 >;
 
 export function configStatusFromFrame(frame: ConfigStatusFrame): ConfigStatus {
@@ -662,6 +771,7 @@ export function configStatusFromFrame(frame: ConfigStatusFrame): ConfigStatus {
     opencodeGo: frame.opencodeGo,
     tts: frame.tts,
     callStt: frame.callStt,
+    sts: frame.sts,
     imageGen: frame.imageGen,
     profile: frame.profile,
     autoUpdate: frame.autoUpdate,
@@ -676,6 +786,9 @@ export function configStatusFromFrame(frame: ConfigStatusFrame): ConfigStatus {
     // Without this every SSE `config` frame wipes Linq status and resets
     // LinqSettings back to its empty defaults.
     imessageLinq: frame.imessageLinq,
+    // Without this every SSE `config` frame forgets the fallback reviewer,
+    // and the Bot Profile tells the owner auto-review is unavailable again.
+    autoReview: frame.autoReview,
   };
 }
 
@@ -696,6 +809,8 @@ export interface InstanceInfo {
   instanceId: string;
   driverKind: string;
   displayName: string;
+  localModelWaitAvailable?: boolean;
+  replyWaitMinutes?: number;
   enabled?: boolean;
   snapshot: {
     state: "available" | "unavailable";
@@ -759,9 +874,13 @@ export interface InstanceInfo {
        * without a tooltip and a screen-reader hint. */
       badgeTitle?: string;
       effortLevels?: readonly EffortLevel[];
+      defaultEffort?: EffortLevel;
       supportsEffort?: boolean;
+      contextCaps?: readonly number[];
+      supportsMaxOutput?: boolean;
       /** Absent inherits the instance-wide image capability. */
       images?: boolean;
+      contextWindow?: number;
     }>;
   };
   capabilities?: {
@@ -776,8 +895,19 @@ export interface InstanceInfo {
     /** This engine can answer a bounded review prompt without changing the
      * bot's active conversation. */
     approvalReview?: boolean;
+    /** Where auto-review can see this engine's tool calls (shared/auto-review.ts).
+     * Absent means the engine has not reported it yet, never "none". */
+    reviewHook?: ReviewHook;
+    /** A full-auto instance can run a held turn in its asking mode. */
+    asksWhenHeld?: boolean;
+    /** What a bot's Bypass Permissions switch does on this engine
+     * (shared/bypass-coverage.ts).  Absent from an older server, which reads
+     * as "asks": the switch works as described. */
+    bypassCoverage?: "asks" | "native" | "none";
     /** The harness runs this engine's tool loop, so Maximum Tool Rounds applies. */
     toolLoop?: boolean;
+    /** ACP prompt budget: the per-bot history cap/summary settings apply. */
+    historySummary?: boolean;
   };
   /** Which computer destinations this engine can be given at all, derived
    *  server-side in `server/computer-capability.ts` and shipped whole.  The
@@ -793,6 +923,9 @@ export interface InstanceInfo {
   cli?: string;
   /** Driver's default binary name (e.g. "claude"). */
   cliDefault?: string;
+  /** Other command names that run this engine (e.g. Clutch's "clutch" beside
+   * the default "dsh").  The picker searches them alongside the default. */
+  cliAliases?: string[];
   /** Absolute paths of every default binary found on PATH, PATH order. */
   cliCandidates?: string[];
   /** YOLO full access bypass permissions */
@@ -813,7 +946,8 @@ export type AppSettingsSection =
   | "computers"
   | "usage"
   | "observability"
-  | "secrets";
+  | "secrets"
+  | "resources";
 
 export interface AppState {
   bots: Bot[];
@@ -829,6 +963,18 @@ export interface AppState {
   config: ConfigStatus | null;
   /** selected chat — a bot id OR a group id */
   selectedId: string;
+  /** Counts the times the person picked something to look at: every `select`,
+   *  including one that lands on the chat already open, and a `botAdded` that
+   *  moves the selection to the new bot.  `selectedId` alone cannot tell a click
+   *  on the open chat from no click, and the store also rewrites it by itself (a
+   *  hydrate that lost the selection, a delete that falls back).  UI that must
+   *  yield to a deliberate pick, such as the Fleet Matrix overview, watches this
+   *  instead; background updates never move it. */
+  selectionNonce: number;
+  /** Explicitly selected thread for the active bot (e.g., from App Matrix). Null follows bot.threadId. */
+  viewedThreadId: string | null;
+  /** Local task-creation dialog; never changes the bot's running thread. */
+  taskCreationBotId: string | null;
   activeView: "chat" | "team-map" | "routines" | "skill-recorder";
   selectedRoutineId?: string | null;
   routines: Routine[];
@@ -839,6 +985,9 @@ export interface AppState {
   resourceTriggers: ResourceTrigger[];
   settingsOpen: boolean;
   pluginsOpen: boolean;
+  /** The Plugins manager view (drop-in extensions).  Distinct from
+   *  `pluginsOpen`, which is the Composio connectors surface. */
+  pluginsManagerOpen: boolean;
   computerOpen: boolean;
   /** the per-thread event inspector (runtime stream + native protocol tee) */
   inspectorOpen: boolean;
@@ -869,7 +1018,7 @@ export interface AppState {
   } | null;
   /** 1:1 queue-fallback lines waiting for drain; keyed by threadId.
    * Each entry is identified by the server queueId, not by text. */
-  pendingQueued: Record<string, Array<{ queueId: string; text: string; at: number }>>;
+  pendingQueued: Record<string, Array<{ queueId: string; text: string; rawText?: string; at: number; reply?: Message; attachments: Attachment[] }>>;
   /** queueIds whose drain frame beat the POST continuation. One-shot and
    * bounded to a short event window so other clients cannot grow it forever. */
   consumedQueueIds: Record<string, true>;
@@ -885,6 +1034,20 @@ export interface AppState {
   /** Threads with a scrollback page in flight — the pill says "Loading…"
    * instead of firing a second request per click. */
   loadingEarlier: Record<string, boolean>;
+  /** Transcripts of threads opened for reading while they are not their
+   * bot's active (execution) thread, keyed by threadId.  Browsing a
+   * retained thread while the bot works reads from here; the active
+   * thread's transcript stays on the bot itself, so viewing never
+   * disturbs the turn in flight.  Fed by the per-thread messages route
+   * and by the same SSE message frames, applied by threadId. */
+  threadTranscripts: Record<string, Message[]>;
+  /** Viewed threads whose first transcript page is still in flight. */
+  loadingThread: Record<string, boolean>;
+  /** Viewed threads whose transcript page failed to load, keyed by
+   * threadId.  A recorded failure stops the view effect from
+   * redispatching `viewThread` in a tight retry loop; opening the
+   * thread again clears it so the reader can retry on purpose. */
+  threadTranscriptErrors: Record<string, string>;
 }
 
 /** Messages hydrated per thread on a cold start.
@@ -942,6 +1105,13 @@ export type Action =
   | { type: "loadEarlier"; threadId: string }
   | { type: "earlierLoading"; threadId: string }
   | { type: "earlierLoaded"; threadId: string; messages: Message[]; hasMore: boolean }
+  /** Open a thread for reading without making it the execution target.
+   * `threadId: null` (or the bot's active thread) returns to the active
+   * thread.  The wrapper fetches the transcript on a cache miss; the
+   * busy guard on switching is untouched. */
+  | { type: "viewThread"; botId: string; threadId: string | null }
+  | { type: "threadTranscriptLoaded"; threadId: string; messages: Message[]; hasMore: boolean }
+  | { type: "threadTranscriptFailed"; threadId: string; error?: string }
   | { type: "showRoutines"; routineId?: string }
   | { type: "showTeamMap" }
   | { type: "showSkillRecorder" }
@@ -991,6 +1161,20 @@ export type Action =
   | { type: "moveTaskToBot"; botId: string; threadId: string; toBotId: string }
   | { type: "moveTaskToGroup"; botId: string; threadId: string; toGroupId: string }
   | { type: "mergeTasks"; botId: string; threadId: string; intoThreadId: string }
+  | {
+      type: "mergeAllBotTasks";
+      botId: string;
+      intoThreadId: string;
+      /** What the server did, so a caller can say what was folded in and what
+       * was left behind.  `error` is set instead when the merge failed. */
+      onSettled?: (
+        result: {
+          merged: string[];
+          skipped: Array<{ threadId: string; title: string; reason: string }>;
+        } | null,
+        error: string | null,
+      ) => void;
+    }
   | { type: "deleteGroupTask"; groupId: string; threadId: string }
   | { type: "toggleReaction"; threadId: string; messageId: string; emoji: string }
   | { type: "interruptGroup"; groupId: string }
@@ -1000,20 +1184,34 @@ export type Action =
    *  the list) so the next answer is not judged against it. */
   | { type: "instancesOrderReset" }
   | { type: "configStatus"; config: ConfigStatus }
-  | { type: "select"; id: string }
+  | { type: "select"; id: string; viewedThreadId?: string | null }
   | {
       type: "send";
       botId: string;
       text: string;
+      /** Composer text before `composeMessage`; kept on queued entries so edit
+       * restore does not double-expand attachment markers. */
+      rawText?: string;
       replyToId?: string;
+      /** The full reply Message, kept on the queue entry so an edit can
+       * restore it.  The server only sees replyToId; the client needs the
+       * Message to put the quote back through restoreFailedSend. */
+      reply?: Message;
+      /** The attachments the composer held, kept on the queue entry so an
+       * edit can put them back: the composed `text` carries <attached-image …>
+       * placeholders, and restoring only the text would leave those
+       * placeholders stranded on a chip that no longer exists. */
+      attachments?: Attachment[];
       /** The server refused the send or could not be reached.  Called with the
        * reason, after the error banner is set, so a caller that cleared its
        * input can put it back. */
       onError?: (message: string) => void;
+      /** Per-send override while the bot is busy.  Omitted uses the workspace default. */
+      busyDelivery?: BusySendDefault;
     }
-  | { type: "pendingQueued"; threadId: string; queueId: string; text: string; at?: number }
+  | { type: "pendingQueued"; threadId: string; queueId: string; text: string; rawText?: string; at?: number; reply?: Message; attachments?: Attachment[] }
   | { type: "consumePendingQueued"; threadId: string; queueId: string }
-  | { type: "cancelQueued"; botId: string; queueId: string }
+  | { type: "cancelQueued"; botId: string; queueId: string; onSettled?: () => void }
   | { type: "editMessage"; botId: string; messageId: string; text: string }
   | { type: "switchBranch"; botId: string; messageId: string }
   | { type: "threadActive"; threadId: string; activeLeafId: string }
@@ -1032,9 +1230,18 @@ export type Action =
       /** Local UI recovery hook for voice flows. Never sent to the server. */
       onError?: (message: string) => void;
     }
-  | { type: "newTask"; botId: string }
+  | {
+      type: "approveAllRequests";
+      threadId: string;
+      onError?: (message: string) => void;
+    }
+  | { type: "requestNewTask"; botId: string }
+  | { type: "cancelNewTask" }
+  | { type: "newTask"; botId: string; appRef?: TaskAppRef }
   | { type: "switchTask"; botId: string; threadId: string }
-  | { type: "taskSwitched"; bot: Bot }
+  // `messages` is optional: the pre-send switch asks for `?messages=0`
+  // and must not be typed as a full transcript replace.
+  | { type: "taskSwitched"; bot: Pick<Bot, "id" | "threadId"> & Partial<Omit<Bot, "id" | "threadId">> }
   | { type: "renameTask"; botId: string; threadId: string; title: string }
   /** Put one thread to sleep, or wake it.  `null` is the wake — an omitted
    * field means "leave it alone" on the harness route, and `0` is the real
@@ -1048,6 +1255,8 @@ export type Action =
   | { type: "markUnread"; botId: string }
   | { type: "botPatched"; bot: BotAnnouncement }
   | { type: "messageAdded"; threadId: string; message: Message }
+  | { type: "messagesAdded"; threadId: string; messages: Message[] }
+  | { type: "mergeApplied"; botId: string; threadId: string; tasks: Task[] }
   | { type: "messagePatched"; threadId: string; message: Message }
   | { type: "screenFrame"; botId: string; png: string; mime: string }
   | { type: "provisioning"; botId: string; on: boolean }
@@ -1061,6 +1270,7 @@ export type Action =
   | { type: "error"; message: string | null }
   | { type: "toggleSettings"; open?: boolean }
   | { type: "togglePlugins"; open?: boolean }
+  | { type: "togglePluginsManager"; open?: boolean }
   | { type: "toggleComputer"; open?: boolean }
   | { type: "toggleInspector"; open?: boolean }
   | { type: "focusMessage"; threadId: string; messageId: string }
@@ -1126,8 +1336,8 @@ export function mergeHydrateBots(
     const local = localById.get(serverBot.id);
     const started = epochAtFetch[serverBot.id] ?? 0;
     const now = localEpoch[serverBot.id] ?? 0;
-    if (local && now > started) return { ...local, ...overlay };
-    return { ...serverBot, ...overlay };
+    if (local && now > started) return applyBotPatch(local, overlay);
+    return applyBotPatch(serverBot, overlay);
   });
 }
 
@@ -1213,12 +1423,68 @@ export function prependEarlier(current: Message[], earlier: Message[]): Message[
   return fresh.length ? [...fresh, ...current] : current;
 }
 
+/** A copy of a string-keyed record without one key. */
+function dropKey<T>(record: Record<string, T>, key: string) {
+  const rest = { ...record };
+  delete rest[key];
+  return rest;
+}
+
+/** Apply a live frame to a browsed (non-active) thread's cached
+ * transcript.  Returns the state unchanged when the thread was never
+ * opened — an unopened thread costs no memory, and its page is fetched
+ * whole when the reader first opens it. */
+function appendToCachedTranscript(state: AppState, threadId: string, incoming: Message[]): AppState {
+  const cached = state.threadTranscripts[threadId];
+  if (!cached) return state;
+  const known = new Set(cached.map((message) => message.id));
+  const fresh = incoming.filter((message) => !known.has(message.id));
+  if (!fresh.length) return state;
+  return {
+    ...state,
+    threadTranscripts: { ...state.threadTranscripts, [threadId]: [...cached, ...fresh] },
+  };
+}
+
+function patchCachedTranscript(state: AppState, threadId: string, message: Message): AppState {
+  const cached = state.threadTranscripts[threadId];
+  if (!cached?.some((candidate) => candidate.id === message.id)) return state;
+  return {
+    ...state,
+    threadTranscripts: {
+      ...state.threadTranscripts,
+      [threadId]: cached.map((candidate) => (candidate.id === message.id ? message : candidate)),
+    },
+  };
+}
+
+/** Transcript to apply from a bot frame, or undefined to keep the current one.
+ * A switch frame with messages always wins. A later snapshot for the same
+ * thread replaces only when it shares no ids with the transcript on screen.
+ * An empty snapshot is authoritative (the thread really is empty), and a
+ * non-empty snapshot replaces an empty client transcript. Either length used
+ * to return undefined, which left the previous conversation under the new
+ * header after a `?messages=0` ack, or left the chat blank. */
+function transcriptFromBotFrame(
+  beforeMessages: Message[],
+  incoming: Message[] | undefined,
+  switchedThread: boolean,
+): Message[] | undefined {
+  if (!incoming) return undefined;
+  if (switchedThread) return incoming;
+  const currentIds = new Set(beforeMessages.map((message) => message.id));
+  return incoming.every((message) => !currentIds.has(message.id)) ? incoming : undefined;
+}
+
 export function reducer(state: AppState, action: Action): AppState {
   switch (action.type) {
     case "hydrate": {
       const known = (id: string) => action.bots.some((b) => b.id === id) || action.groups.some((g) => g.id === id);
       const selectedId =
         state.selectedId && known(state.selectedId) ? state.selectedId : (action.bots[0]?.id ?? "");
+      // A pin belongs to the selection.  Falling through to another bot must
+      // not keep showing the previous thread.
+      const viewedThreadId = selectedId === state.selectedId ? state.viewedThreadId : null;
       return {
         ...state,
         bots: mergeHydrateBots(
@@ -1236,12 +1502,19 @@ export function reducer(state: AppState, action: Action): AppState {
         ),
         computerControl: action.computerControl,
         selectedId,
+        viewedThreadId,
         error: isHarnessUnreachableError(state.error) ? null : state.error,
         // a fresh hydrate replaces the whole picture, scrollback included:
         // carrying the old flags over would leave a pill promising a page
         // for a thread the server just sent in full
         hasMore: hydratedHasMore(action.bots, action.groups),
         loadingEarlier: {},
+        // A hydrate replaces every active transcript from the server;
+        // cached browsed pages may have missed frames while away, so
+        // they are refetched on next view instead of trusted.
+        threadTranscripts: {},
+        loadingThread: {},
+        threadTranscriptErrors: {},
       };
     }
     // an effect-only action: the wrapper fetches, and `earlierLoaded` lands
@@ -1255,10 +1528,14 @@ export function reducer(state: AppState, action: Action): AppState {
       delete loadingEarlier[action.threadId];
       const hasMore = { ...state.hasMore, [action.threadId]: action.hasMore };
       if (!action.messages.length) return { ...state, loadingEarlier, hasMore };
+      const cached = state.threadTranscripts[action.threadId];
       return {
         ...state,
         loadingEarlier,
         hasMore,
+        threadTranscripts: cached
+          ? { ...state.threadTranscripts, [action.threadId]: prependEarlier(cached, action.messages) }
+          : state.threadTranscripts,
         bots: state.bots.map((bot) =>
           bot.threadId === action.threadId
             ? { ...bot, messages: prependEarlier(bot.messages, action.messages) }
@@ -1269,6 +1546,62 @@ export function reducer(state: AppState, action: Action): AppState {
             ? { ...group, messages: prependEarlier(group.messages, action.messages) }
             : group,
         ),
+      };
+    }
+    case "viewThread": {
+      const bot = state.bots.find((candidate) => candidate.id === action.botId);
+      if (!bot) return state;
+      // Viewing is passive: it moves only the pin, never bot.threadId,
+      // so the running turn keeps its execution target.  A null (or the
+      // active thread itself) simply drops the pin.
+      if (!action.threadId || action.threadId === bot.threadId) {
+        return state.viewedThreadId === null ? state : { ...state, viewedThreadId: null };
+      }
+      if (!(bot.tasks ?? []).some((task) => task.threadId === action.threadId)) return state;
+      const needsFetch = !state.threadTranscripts[action.threadId];
+      // Reopening a thread that failed before is an explicit retry: drop
+      // its recorded failure so the page below fetches again on purpose.
+      const threadTranscriptErrors = { ...state.threadTranscriptErrors };
+      delete threadTranscriptErrors[action.threadId];
+      return {
+        ...state,
+        viewedThreadId: action.threadId,
+        loadingThread: needsFetch
+          ? { ...state.loadingThread, [action.threadId]: true }
+          : state.loadingThread,
+        threadTranscriptErrors,
+      };
+    }
+    case "threadTranscriptLoaded": {
+      const loadingThread = { ...state.loadingThread };
+      delete loadingThread[action.threadId];
+      // Frames that landed in the cache while the page was in flight are
+      // newer than anything the page holds; keep them after the page.
+      const existing = state.threadTranscripts[action.threadId];
+      let messages = action.messages;
+      if (existing?.length) {
+        const known = new Set(messages.map((message) => message.id));
+        const extras = existing.filter((message) => !known.has(message.id));
+        if (extras.length) messages = [...messages, ...extras];
+      }
+      return {
+        ...state,
+        loadingThread,
+        hasMore: { ...state.hasMore, [action.threadId]: action.hasMore },
+        threadTranscripts: { ...state.threadTranscripts, [action.threadId]: messages },
+      };
+    }
+    case "threadTranscriptFailed": {
+      if (!state.loadingThread[action.threadId]) return state;
+      const loadingThread = { ...state.loadingThread };
+      delete loadingThread[action.threadId];
+      return {
+        ...state,
+        loadingThread,
+        threadTranscriptErrors: {
+          ...state.threadTranscriptErrors,
+          [action.threadId]: action.error ?? "Could not load this thread.",
+        },
       };
     }
     case "showRoutines":
@@ -1376,7 +1709,8 @@ export function reducer(state: AppState, action: Action): AppState {
     case "groupDeleted": {
       const groups = state.groups.filter((g) => g.id !== action.groupId);
       const selectedId = state.selectedId === action.groupId ? (state.bots[0]?.id ?? "") : state.selectedId;
-      return { ...state, groups, selectedId };
+      const viewedThreadId = selectedId === state.selectedId ? state.viewedThreadId : null;
+      return { ...state, groups, selectedId, viewedThreadId };
     }
     case "instances": {
       // Every response carries the server's describedAt; drop one older than
@@ -1392,6 +1726,8 @@ export function reducer(state: AppState, action: Action): AppState {
       return {
         ...state,
         config: action.config,
+        taskCreationBotId: allowsMultipleBotThreads(getConversationMode(action.config))
+          ? state.taskCreationBotId : null,
         activeView:
           state.activeView === "skill-recorder" && !skillRecorderEnabled(action.config)
             ? "chat"
@@ -1404,13 +1740,17 @@ export function reducer(state: AppState, action: Action): AppState {
           ...state,
           activeView: "chat",
           selectedId: action.id,
+          selectionNonce: state.selectionNonce + 1,
+          // A group is not the bot the pin belongs to.  Leaving it set would
+          // show the next bot the previous thread.
+          viewedThreadId: null,
           groups: state.groups.map((g) => (g.id === action.id ? { ...g, unread: false } : g)),
           groupEpoch: wasUnread ? bumpEpoch(state.groupEpoch, action.id) : state.groupEpoch,
         };
       }
       const wasUnread = state.bots.find((b) => b.id === action.id)?.unread;
       const next = updateBot(
-        withMascotMotion({ ...state, activeView: "chat", selectedId: action.id }, action.id, "switch"),
+        withMascotMotion({ ...state, activeView: "chat", selectedId: action.id, selectionNonce: state.selectionNonce + 1, viewedThreadId: action.viewedThreadId ?? null }, action.id, "switch"),
         action.id,
         (b) => ({ ...b, unread: false }),
       );
@@ -1433,21 +1773,33 @@ export function reducer(state: AppState, action: Action): AppState {
     case "dismissCard":
       return patchCard(state, action.botId, action.messageId, { dismissed: true });
     case "decideRequest":
+    case "approveAllRequests":
       return state; // the server's request.resolved patch settles the card
-    case "botAdded":
+    case "botAdded": {
+      // An HTTP create/import response and a second fold of the same bot can
+      // both dispatch. Selecting a *different* bot must not inherit the
+      // previous chat's pin; re-folding the bot already on screen is not a
+      // selection change and must leave that pin alone.
+      const viewedThreadId = action.bot.id === state.selectedId ? state.viewedThreadId : null;
       return withMascotMotion({
         ...state,
-        // An HTTP create/import response and its SSE broadcast can race. Fold
-        // both paths without ever showing the same bot twice.
         bots: [action.bot, ...state.bots.filter((bot) => bot.id !== action.bot.id)],
         activeView: "chat",
         selectedId: action.bot.id,
+        // Same rule as the pin above: the new bot counts as a pick, a second
+        // fold of the bot already on screen does not.
+        selectionNonce: action.bot.id === state.selectedId ? state.selectionNonce : state.selectionNonce + 1,
+        viewedThreadId,
       }, action.bot.id, "arrive");
+    }
     case "deleteBot": {
       const bots = state.bots.filter((b) => b.id !== action.botId);
       const selectedId =
         state.selectedId === action.botId ? (bots.find((b) => !b.hidden)?.id ?? bots[0]?.id ?? "") : state.selectedId;
-      return { ...state, bots, selectedId };
+      // A thread pin onto the deleted bot's thread would dangle — and even
+      // without a deletion, the pin belongs to the old selection.
+      const viewedThreadId = state.selectedId === action.botId ? null : state.viewedThreadId;
+      return { ...state, bots, selectedId, viewedThreadId };
     }
     case "markUnread": {
       const next = updateBot(withMascotMotion(state, action.botId, "surprise"), action.botId, (b) => ({ ...b, unread: true }));
@@ -1486,25 +1838,46 @@ export function reducer(state: AppState, action: Action): AppState {
         : animated;
       const switchedThread =
         typeof action.bot.threadId === "string" && action.bot.threadId !== before.threadId;
-      return updateBot(next, action.bot.id, (b) => ({
+      const incomingMessages = Array.isArray(action.bot.messages) ? action.bot.messages : undefined;
+      // Ordinary bot patches omit messages and must preserve the current
+      // transcript. A task switch's full bot event carries the new transcript.
+      // The pre-send ack (`?messages=0`) advances threadId and keeps the
+      // previous transcript until that snapshot arrives on the same thread id,
+      // including when the snapshot is empty. It replaces when it shares no
+      // ids with what is on screen. A same-thread snapshot that overlaps
+      // current ids does not.
+      const replacement = transcriptFromBotFrame(before.messages, incomingMessages, switchedThread);
+      const patched = updateBot(next, action.bot.id, (b) => ({
         ...b,
         ...action.bot,
-        // Ordinary bot patches omit messages and must preserve the current
-        // transcript. A task switch is different: its full bot event carries
-        // the new transcript, which must replace the previous task before the
-        // webhook's streamed messages begin arriving.
-        messages:
-          switchedThread && Array.isArray(action.bot.messages)
-            ? action.bot.messages
-            : b.messages,
+        messages: replacement ?? b.messages,
       }));
+      // A thread that just became active stops receiving frames into the
+      // cache — new messages land on the bot — so a browsed page cached
+      // earlier is stale from here on, as is a recorded load failure.
+      // (Same invalidation as taskSwitched above.)
+      // switchedThread already implies threadId is a string (see above).
+      if (
+        !switchedThread
+        || (patched.threadTranscripts[action.bot.threadId] === undefined
+          && patched.threadTranscriptErrors[action.bot.threadId] === undefined)
+      ) {
+        return patched;
+      }
+      return {
+        ...patched,
+        threadTranscripts: dropKey(patched.threadTranscripts, action.bot.threadId),
+        threadTranscriptErrors: dropKey(patched.threadTranscriptErrors, action.bot.threadId),
+      };
     }
     case "messageAdded": {
       const bot = state.bots.find((b) => b.threadId === action.threadId);
       if (!bot) {
         // room thread — plain linear append, no branching/mascot machinery
         const group = state.groups.find((g) => g.threadId === action.threadId);
-        if (!group) return state;
+        // A browsed non-active thread keeps receiving frames into its
+        // cache; the active thread's transcript is not touched.
+        if (!group) return appendToCachedTranscript(state, action.threadId, [action.message]);
         if (group.messages.some((m) => m.id === action.message.id)) return state;
         return {
           ...state,
@@ -1547,11 +1920,54 @@ export function reducer(state: AppState, action: Action): AppState {
       const animated = motion ? withMascotMotion(next, bot.id, motion) : next;
       return animated;
     }
+    case "messagesAdded": {
+      // A bulk copy — a merge folding one conversation into another — writes
+      // a whole transcript at once, so it arrives in one piece instead of
+      // thousands of single-message frames.
+      //
+      // The frame belongs to a CONVERSATION, and the bot that shows it is
+      // the one whose active thread it is.  A merge can land in a
+      // background conversation — a single pair folded while another one is
+      // open — and that frame is not the conversation on screen, so it is
+      // not painted into it: the reader would see one conversation's words
+      // under another conversation's title.  The conversation that was
+      // merged into gets its own page when the bot moves to it.
+      const bot = state.bots.find((b) => b.threadId === action.threadId);
+      if (!bot) {
+        const group = state.groups.find((g) => g.threadId === action.threadId);
+        if (!group) return appendToCachedTranscript(state, action.threadId, action.messages);
+        const known = new Set(group.messages.map((m) => m.id));
+        const fresh = action.messages.filter((m) => !known.has(m.id));
+        if (fresh.length === 0) return state;
+        return {
+          ...state,
+          groups: state.groups.map((g) =>
+            g.id === group.id ? { ...g, messages: [...g.messages, ...fresh] } : g,
+          ),
+        };
+      }
+      const known = new Set(bot.messages.map((m) => m.id));
+      const fresh = action.messages.filter((m) => !known.has(m.id));
+      if (fresh.length === 0) return state;
+      return updateBot(state, bot.id, (b) => {
+        let messages = [...b.messages, ...fresh];
+        // base64 screen frames are big; a long computer-use session would
+        // grow memory without bound. Keep the newest few frames' pixels and
+        // strip the rest (the message row survives as a placeholder).
+        const withPng = messages.filter((m) => m.kind === "screen" && m.png);
+        const excess = withPng.length - MAX_KEPT_SCREEN_FRAMES;
+        if (excess > 0) {
+          const dropIds = new Set(withPng.slice(0, excess).map((m) => m.id));
+          messages = messages.map((m) => (dropIds.has(m.id) ? { ...m, png: undefined } : m));
+        }
+        return { ...b, messages, activeLeafId: messages.at(-1)?.id ?? b.activeLeafId };
+      });
+    }
     case "messagePatched": {
       const bot = state.bots.find((b) => b.threadId === action.threadId);
       if (!bot) {
         const group = state.groups.find((g) => g.threadId === action.threadId);
-        if (!group) return state;
+        if (!group) return patchCachedTranscript(state, action.threadId, action.message);
         return {
           ...state,
           groups: state.groups.map((g) =>
@@ -1632,10 +2048,23 @@ export function reducer(state: AppState, action: Action): AppState {
         computerOpen: open ? false : state.computerOpen,
         inspectorOpen: open ? false : state.inspectorOpen,
         appSettingsOpen: open ? false : state.appSettingsOpen,
+        pluginsManagerOpen: open ? false : state.pluginsManagerOpen,
       };
     }
     case "togglePlugins":
       return { ...state, pluginsOpen: action.open ?? !state.pluginsOpen };
+    case "togglePluginsManager": {
+      const open = action.open ?? !state.pluginsManagerOpen;
+      return {
+        ...state,
+        pluginsManagerOpen: open,
+        pluginsOpen: open ? false : state.pluginsOpen,
+        settingsOpen: open ? false : state.settingsOpen,
+        appSettingsOpen: open ? false : state.appSettingsOpen,
+        computerOpen: open ? false : state.computerOpen,
+        inspectorOpen: open ? false : state.inspectorOpen,
+      };
+    }
     case "focusMessage":
       return {
         ...state,
@@ -1657,6 +2086,7 @@ export function reducer(state: AppState, action: Action): AppState {
         settingsOpen: open ? false : state.settingsOpen,
         inspectorOpen: open ? false : state.inspectorOpen,
         appSettingsOpen: open ? false : state.appSettingsOpen,
+        pluginsManagerOpen: open ? false : state.pluginsManagerOpen,
       };
     }
     case "toggleInspector": {
@@ -1667,6 +2097,7 @@ export function reducer(state: AppState, action: Action): AppState {
         settingsOpen: open ? false : state.settingsOpen,
         computerOpen: open ? false : state.computerOpen,
         appSettingsOpen: open ? false : state.appSettingsOpen,
+        pluginsManagerOpen: open ? false : state.pluginsManagerOpen,
       };
     }
     case "toggleAppSettings": {
@@ -1679,6 +2110,7 @@ export function reducer(state: AppState, action: Action): AppState {
         computerOpen: open ? false : state.computerOpen,
         inspectorOpen: open ? false : state.inspectorOpen,
         pluginsOpen: open ? false : state.pluginsOpen,
+        pluginsManagerOpen: open ? false : state.pluginsManagerOpen,
       };
     }
     case "updateBot": {
@@ -1700,8 +2132,7 @@ export function reducer(state: AppState, action: Action): AppState {
             ),
           }
         : animated;
-      const { acknowledgeLocalAuto: _ack, ...botPatch } = action.patch;
-      const patched = updateBot(next, action.botId, (b) => ({ ...b, ...botPatch }));
+      const patched = updateBot(next, action.botId, (b) => applyBotPatch(b, action.patch));
       return { ...patched, botEpoch: bumpEpoch(patched.botEpoch, action.botId) };
     }
     case "threadActive": {
@@ -1767,6 +2198,9 @@ export function reducer(state: AppState, action: Action): AppState {
             {
               queueId: action.queueId,
               text: action.text,
+              rawText: action.rawText,
+              reply: action.reply,
+              attachments: action.attachments ?? [],
               // Stamp once at remember-time; ChatView must not remint Date.now().
               at: action.at ?? Date.now(),
             },
@@ -1804,7 +2238,15 @@ export function reducer(state: AppState, action: Action): AppState {
       return withMascotMotion(dismissOnboardingCard(state, action.botId), action.botId, "working");
     case "editMessage":
       return withMascotMotion(state, action.botId, "working");
+    case "requestNewTask": {
+      if (!allowsMultipleBotThreads(getConversationMode(state.config))) return state;
+      const bot = state.bots.find((entry) => entry.id === action.botId);
+      if (!bot || bot.busy || eligibleTaskApps(bot.id, state.groups).length === 0) return state;
+      return { ...state, taskCreationBotId: bot.id };
+    }
+    case "cancelNewTask":
     case "newTask":
+      return { ...state, taskCreationBotId: null };
     case "switchTask":
     case "deleteTask":
     case "newGroupTask":
@@ -1852,6 +2294,7 @@ export function reducer(state: AppState, action: Action): AppState {
       // too; refusing here keeps the sidebar honest if the drop is illegal.
       const source = state.groups.find((group) => group.id === action.groupId);
       if (!moving || !source || (source.tasks ?? []).length < 2) return state;
+      if (moving.workspaceContext && moving.workspaceContext.appRef.id !== action.toGroupId) return state;
       return {
         ...state,
         groups: state.groups.map((group) => {
@@ -1893,7 +2336,7 @@ export function reducer(state: AppState, action: Action): AppState {
             ? {
                 ...bot,
                 tasks: [
-                  { threadId: moving.threadId, title: moving.title, createdAt: moving.createdAt },
+                  { threadId: moving.threadId, title: moving.title, createdAt: moving.createdAt, cwd: moving.pinnedCwd, workspaceContext: moving.workspaceContext },
                   ...(bot.tasks ?? []),
                 ],
               }
@@ -1904,6 +2347,9 @@ export function reducer(state: AppState, action: Action): AppState {
     case "mergeTasks": {
       const source = state.bots.find((bot) => bot.id === action.botId);
       if (!source || action.threadId === action.intoThreadId || (source.tasks ?? []).length < 2) return state;
+      const from = source.tasks?.find((task) => task.threadId === action.threadId);
+      const into = source.tasks?.find((task) => task.threadId === action.intoThreadId);
+      if (!taskWorkspaceContextsMatch(from?.workspaceContext, into?.workspaceContext)) return state;
       const remaining = (source.tasks ?? []).filter((task) => task.threadId !== action.threadId);
       if (remaining.length === (source.tasks ?? []).length) return state;
       if (!remaining.some((task) => task.threadId === action.intoThreadId)) return state;
@@ -1918,6 +2364,70 @@ export function reducer(state: AppState, action: Action): AppState {
               }
             : bot,
         ),
+      };
+    }
+    case "mergeAllBotTasks": {
+      const source = state.bots.find((bot) => bot.id === action.botId);
+      if (!source) return state;
+      const into = (source.tasks ?? []).find((task) => task.threadId === action.intoThreadId);
+      if (!into) return state;
+      // A conversation bound to a different App cannot merge, so it stays:
+      // the server skips it and names it, and the roster agrees with that
+      // instead of briefly hiding a conversation that is still there.
+      const remaining = (source.tasks ?? []).filter(
+        (task) => task.threadId === action.intoThreadId
+          || !taskWorkspaceContextsMatch(task.workspaceContext, into.workspaceContext),
+      );
+      if (remaining.length === (source.tasks ?? []).length) return state;
+      // The bot keeps one conversation after the merge, and it is the one the
+      // person chose, so the roster and the open chat agree immediately.
+      return {
+        ...state,
+        bots: state.bots.map((bot) => {
+          if (bot.id !== action.botId) return bot;
+          const next: Bot = { ...bot, tasks: remaining, threadId: action.intoThreadId };
+          // The transcript on screen belongs to the conversation the bot was
+          // showing.  A merge moves the bot to another conversation, so the
+          // old transcript is dropped here rather than left on screen under
+          // the new conversation's name; the merged one arrives on its own
+          // frame.
+          if (bot.threadId !== action.intoThreadId) {
+            next.messages = [];
+            next.activeLeafId = undefined;
+          }
+          return next;
+        }),
+      };
+    }
+    case "mergeApplied": {
+      // The server's own answer about what is left: the conversations that
+      // stayed behind, and the one that is now live.
+      //
+      // Two kinds of truth meet here.  The server's record carries the
+      // counters it reads from the live transcript — how many messages a
+      // conversation holds, when it last spoke, when it began — and those
+      // are the fresh ones after a merge.  The client's record carries what
+      // only the client knows: what a conversation cost, whether it is
+      // asleep, which folder it runs in.  So the server's counters win and
+      // the client's own fields are kept.
+      return {
+        ...state,
+        bots: state.bots.map((bot) => {
+          if (bot.id !== action.botId) return bot;
+          const held = new Map((bot.tasks ?? []).map((task) => [task.threadId, task]));
+          const tasks = action.tasks.map((task) => {
+            const previous = held.get(task.threadId);
+            if (!previous) return task;
+            return {
+              ...previous,
+              title: task.title,
+              messageCount: task.messageCount ?? previous.messageCount,
+              lastActivity: task.lastActivity ?? previous.lastActivity,
+              startedAt: task.startedAt ?? previous.startedAt,
+            };
+          });
+          return { ...bot, tasks, threadId: action.threadId };
+        }),
       };
     }
     case "moveTaskToBot": {
@@ -1944,6 +2454,7 @@ export function reducer(state: AppState, action: Action): AppState {
       const source = state.bots.find((bot) => bot.id === action.botId);
       const moving = (source?.tasks ?? []).find((task) => task.threadId === action.threadId);
       if (!moving || !source || (source.tasks ?? []).length < 2) return state;
+      if (moving.workspaceContext && moving.workspaceContext.appRef.id !== action.toGroupId) return state;
       return {
         ...state,
         bots: state.bots.map((bot) => {
@@ -1960,7 +2471,7 @@ export function reducer(state: AppState, action: Action): AppState {
             ? {
                 ...group,
                 tasks: [
-                  { threadId: moving.threadId, title: moving.title, createdAt: moving.createdAt },
+                  { threadId: moving.threadId, title: moving.title, createdAt: moving.createdAt, pinnedCwd: moving.cwd, workspaceContext: moving.workspaceContext },
                   ...(group.tasks ?? []),
                 ],
               }
@@ -1968,8 +2479,60 @@ export function reducer(state: AppState, action: Action): AppState {
         ),
       };
     }
-    case "taskSwitched":
-      return updateBot(state, action.bot.id, (bot) => ({ ...bot, ...action.bot, messages: action.bot.messages ?? [] }));
+    case "taskSwitched": {
+      const before = state.bots.find((candidate) => candidate.id === action.bot.id);
+      const next = updateBot(state, action.bot.id, (bot) => ({
+        ...bot,
+        ...action.bot,
+        // Omitted messages mean "this ack did not carry a transcript"
+        // (`?messages=0` on the pre-send switch). Wiping here would show
+        // an empty thread until a later frame; keep what we have.
+        messages: action.bot.messages ?? bot.messages,
+      }));
+      // The thread the bot just left stays readable from the cache, so
+      // browsing back to it does not need a round trip.  Only a full
+      // switch (one that carried its transcript) proves the old
+      // transcript on screen really belongs to the old thread.
+      const stashed =
+        before && action.bot.messages && action.bot.threadId !== before.threadId && before.messages.length
+          ? { ...next, threadTranscripts: { ...state.threadTranscripts, [before.threadId]: before.messages } }
+          : next;
+      // The thread that just became active stops receiving frames into
+      // the cache — new messages land on the bot — so a browsed page
+      // cached earlier is stale from here on, as is a recorded load
+      // failure.  Drop both so the next view refetches the thread as it
+      // is now instead of showing messages that predate the active
+      // period (or refusing to load at all).
+      const activated =
+        before && action.bot.threadId !== before.threadId
+        && (stashed.threadTranscripts[action.bot.threadId] !== undefined
+          || stashed.threadTranscriptErrors[action.bot.threadId] !== undefined)
+          ? {
+              ...stashed,
+              threadTranscripts: dropKey(stashed.threadTranscripts, action.bot.threadId),
+              threadTranscriptErrors: dropKey(stashed.threadTranscriptErrors, action.bot.threadId),
+            }
+          : stashed;
+      // A full switch answer is also how a delete lands: a thread the
+      // bot no longer lists has no readable future, so its cached page
+      // goes with it instead of outliving the conversation.
+      if (before && action.bot.tasks) {
+        const kept = new Set(action.bot.tasks.map((task) => task.threadId));
+        const dropped = (before.tasks ?? []).filter(
+          (task) => !kept.has(task.threadId) && activated.threadTranscripts[task.threadId],
+        );
+        if (dropped.length) {
+          const threadTranscripts = { ...activated.threadTranscripts };
+          for (const task of dropped) delete threadTranscripts[task.threadId];
+          return state.selectedId === action.bot.id
+            ? { ...activated, threadTranscripts, viewedThreadId: null }
+            : { ...activated, threadTranscripts };
+        }
+      }
+      // The pin points at a thread; the active thread just changed, so the
+      // pin is stale.  Clearing it is a no-op when it already agreed.
+      return state.selectedId === action.bot.id ? { ...activated, viewedThreadId: null } : activated;
+    }
     case "newBot":
     case "duplicateBot":
     case "interrupt":
@@ -2002,6 +2565,9 @@ export const initialState: AppState = {
   instancesDescribedAt: 0,
   config: null,
   selectedId: "",
+  selectionNonce: 0,
+  viewedThreadId: null,
+  taskCreationBotId: null,
   activeView: "chat",
   selectedRoutineId: null,
   routines: [],
@@ -2012,6 +2578,7 @@ export const initialState: AppState = {
   resourceTriggers: [],
   settingsOpen: false,
   pluginsOpen: false,
+  pluginsManagerOpen: false,
   computerOpen: false,
   inspectorOpen: false,
   appSettingsOpen: false,
@@ -2030,7 +2597,114 @@ export const initialState: AppState = {
   groupEpoch: {},
   hasMore: {},
   loadingEarlier: {},
+  threadTranscripts: {},
+  loadingThread: {},
+  threadTranscriptErrors: {},
 };
+
+// ── API response contracts ─────────────────────────────────────────────
+// These responses cross the HTTP boundary through the deliberately generic
+// API helper, so each write path narrows its raw body before using it.
+//
+// The pre-send task switch only needs proof of which thread is now active.
+// The wire bot is much larger (profile, tasks, `lastMessage`, and — unless
+// `?messages=0` — the whole transcript). Parsing that with `.passthrough()`
+// kept unknown keys and then spread them into application state. This schema
+// keeps `id` and `threadId` only; every other property is dropped before
+// dispatch. `.strict()` on the envelope still rejects a body that is not
+// `{ bot }`. A full `.strict()` bot would reject the real `wireBot` payload
+// (or force this path to model and store fields it does not use).
+const taskSwitchAckBotSchema = z.object({
+  id: z.string(),
+  threadId: z.string(),
+});
+
+export const TaskSwitchResponseSchema = z.object({
+  bot: taskSwitchAckBotSchema,
+}).strict();
+
+// Idempotent replay is `{ ...firstBody, replayed: true }` (server `replyOnce`),
+// not a body of only `{ ok, replayed }`. Each success arm therefore allows
+// that flag. `ignored: "self_echo"` is a 200 from the loop breaker and is
+// still a successful post.
+const replayedFlag = z.literal(true).optional();
+export const MessagePostResponseSchema = z.union([
+  z.object({
+    ok: z.literal(true),
+    queued: z.literal(true),
+    queueId: z.string(),
+    threadId: z.string(),
+    replayed: replayedFlag,
+  }).strict(),
+  z.object({
+    ok: z.literal(true),
+    steered: z.literal(true),
+    replayed: replayedFlag,
+  }).strict(),
+  z.object({
+    ok: z.literal(true),
+    ignored: z.literal("self_echo"),
+    replayed: replayedFlag,
+  }).strict(),
+  z.object({
+    ok: z.literal(true),
+    replayed: replayedFlag,
+  }).strict(),
+]);
+
+/** What a message must be for the store and the renderer to trust it.
+ *
+ * A transcript carries far more than the renderer reads, so the rest passes
+ * through; what is checked is the identity, the role and the kind, because
+ * a row of the wrong form is what breaks a conversation view. */
+export const transcriptMessageSchema = z
+  .object({
+    id: z.string(),
+    role: z.enum(["bot", "user", "system"]),
+    kind: z.enum(["text", "options", "activity", "screen", "connector", "secret", "sign-in"]),
+    at: z.number(),
+    parentId: z.string().nullable().optional(),
+  })
+  .catchall(z.unknown());
+export type TranscriptMessage = z.infer<typeof transcriptMessageSchema>;
+
+/** One conversation's page of messages, and whether older ones are waiting. */
+export const threadMessagesPageSchema = z.object({
+  messages: z.array(transcriptMessageSchema).optional(),
+  hasMore: z.boolean().optional(),
+});
+export type ThreadMessagesPage = z.infer<typeof threadMessagesPageSchema>;
+
+/** The fleet list, read only far enough to pick one bot out of it.
+ *
+ * Every bot and every group ride along with their full transcripts, so one
+ * record that does not fit must not cancel the whole list: the entries are
+ * read as opaque rows and the one bot is validated on its own. */
+export const botListSchema = z.object({
+  bots: z.array(z.object({ id: z.string() }).catchall(z.unknown())).optional(),
+});
+export type BotList = z.infer<typeof botListSchema>;
+
+/** The bot a failed merge has to put back, narrowed to what it needs. */
+export const botRestoreSchema = z
+  .object({
+    id: z.string(),
+    threadId: z.string(),
+    messages: z.array(transcriptMessageSchema).optional(),
+    tasks: z
+      .array(
+        z
+          .object({
+            threadId: z.string(),
+            title: z.string(),
+            createdAt: z.number(),
+          })
+          .catchall(z.unknown()),
+      )
+      .optional(),
+  })
+  .catchall(z.unknown());
+export type BotRestore = z.infer<typeof botRestoreSchema>;
 
 // ── API client ─────────────────────────────────────────────────────────
 /** Thrown by `api()` on a non-2xx response.  Carries the parsed JSON body
@@ -2039,10 +2713,15 @@ export const initialState: AppState = {
  * have to re-fetch or duplicate this function's request/parse logic. */
 export class ApiError extends Error {
   readonly body: any;
-  constructor(message: string, body: any) {
+  /** The HTTP status, so callers can tell a 404 from a 500 without matching
+   * the message: the message prefers body.error when the server sent one, so
+   * the status code is often not in it at all. */
+  readonly status: number;
+  constructor(message: string, body: any, status: number) {
     super(message);
     this.name = "ApiError";
     this.body = body;
+    this.status = status;
   }
 }
 
@@ -2058,7 +2737,7 @@ export async function api(path: string, init?: RequestInit): Promise<any> {
     });
     const body = await res.json().catch(() => ({}));
     if (res.ok) return body;
-    lastError = new ApiError(body.error ?? `${res.status} ${res.statusText}`, body);
+    lastError = new ApiError(body.error ?? `${res.status} ${res.statusText}`, body, res.status);
     if (res.status !== 502) break;
   }
   throw lastError ?? new Error("request failed");
@@ -2093,7 +2772,10 @@ export interface InfisicalStatusPayload {
   infisical: {
     configured: boolean;
     enabled: boolean;
+    /** Persisted operator toggle, independent of whether credentials are configured. */
+    enabledSetting?: boolean;
     writeThrough: boolean;
+    authMethod: "service-token" | "machine-identity";
     source: "env" | "config" | "none";
     siteUrl: string | null;
     projectId: string | null;
@@ -2101,6 +2783,8 @@ export interface InfisicalStatusPayload {
     secretPath: string;
     hasClientId: boolean;
     hasClientSecret: boolean;
+    hasToken: boolean;
+    hasWriteToken: boolean;
     refreshMinutes: number;
     lastSyncAt: string | null;
     lastAttemptAt: string | null;
@@ -2113,6 +2797,20 @@ export interface InfisicalStatusPayload {
     appliedCount: number;
     appliedFields: string[];
     unusedVaultNames: string[];
+    readSources?: Array<{
+      name: string;
+      projectId: string;
+      environment: string;
+      secretPath: string;
+      tokenFile?: string;
+      tokenEnv?: string;
+      writeTokenFile?: string;
+      writeTokenEnv?: string;
+      hasReadToken: boolean;
+      hasWriteToken: boolean;
+      ok: boolean;
+      error: string | null;
+    }>;
   };
   fields: SecretFieldRow[];
 }
@@ -2191,7 +2889,7 @@ export function useStreaming() {
   return useContext(StreamContext);
 }
 
-const StoreContext = createContext<{
+export const StoreContext = createContext<{
   state: AppState;
   dispatch: React.Dispatch<Action>;
   /** Commit any debounced profile edits before an operation reads the bot. */
@@ -2210,6 +2908,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // only StreamContext consumers
   const [stream, setStream] = useState<StreamState>(EMPTY_STREAM);
   const deltaBuffer = useRef(new Map<string, { text: string; reasoning: string }>());
+  /** Browsed-thread transcript fetches in flight, by threadId.  The
+   * reducer's loadingThread flag cannot guard this on its own: the
+   * wrapper runs before the render that would publish the flag. */
+  const threadFetchInFlight = useRef(new Set<string>());
   const deltaFlush = useRef<number | null>(null);
   const clearStream = (threadId: string) => {
     // Drop the thread's un-flushed deltas too: the settled message that
@@ -2259,11 +2961,23 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           return result.bot;
         },
         reconcile: async (botId, signal) => {
-          const result: { bots: BotAnnouncement[] } = await api("/api/bots", { signal });
-          return result.bots.find((candidate) => candidate.id === botId) ?? null;
+          // `?messages=0` — this only needs the bot row to roll the optimistic
+          // patch back, never the transcript. Unpaged, the server answered with
+          // every bot's and group's full history, so one rejected PATCH
+          // serialized megabytes of transcript per conflict (BF-2424).
+          const result: { bots: BotAnnouncement[] } = await api("/api/bots?messages=0", { signal });
+          const found = result.bots.find((candidate) => candidate.id === botId) ?? null;
+          if (!found) return null;
+          // messages=0 answers with `messages: []`, and the reducer treats an
+          // incoming transcript sharing no ids with the screen as a full
+          // snapshot — vacuously true for an empty array, so handing that back
+          // would blank the conversation on every rejected save. This re-read
+          // is for the bot ROW; carry the transcript already on screen.
+          const current = stateRef.current.bots.find((candidate) => candidate.id === botId);
+          return { ...found, messages: current?.messages ?? found.messages };
         },
         onAuthoritative: (bot, optimisticOverlay) => {
-          rawDispatch({ type: "botPatched", bot: { ...bot, ...optimisticOverlay } });
+          rawDispatch({ type: "botPatched", bot: applyBotPatch(bot, optimisticOverlay) });
         },
         onError: (error) => {
           rawDispatch({ type: "error", message: error.message });
@@ -2313,9 +3027,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         return bot ? openOnboardingCard(bot) : undefined;
       })();
       if (action.type === "deleteBot") botPatchQueue.cancel(action.botId);
-      // A queued message is still real until the server confirms deletion.
-      // All other actions keep their existing optimistic behavior.
-      if (action.type !== "cancelQueued") rawDispatch(action);
+      // Rejected task moves and merges must not hide the original conversation.
+      // Apply their local projection only after the server accepts the change.
+      const confirmTaskMutation = action.type === "moveGroupTask"
+        || action.type === "moveGroupTaskToBot" || action.type === "mergeTasks"
+        || action.type === "mergeAllBotTasks"
+        || action.type === "moveTaskToBot" || action.type === "moveTaskToGroup";
+      if (action.type !== "cancelQueued" && !confirmTaskMutation) rawDispatch(action);
       switch (action.type) {
         case "createRoutine":
           api("/api/routines", { method: "POST", body: JSON.stringify(action.input) }).catch(showError);
@@ -2361,7 +3079,30 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         case "cancelQueued":
           void api(`/api/bots/${action.botId}/queue/${action.queueId}`, { method: "DELETE" })
             .then(() => rawDispatch(action))
-            .catch(showError);
+            // The caller restores a draft from the entry it is removing, and
+            // that has to wait for the server: until the DELETE lands the
+            // queued message is still live, so a draft put back now can be
+            // sent twice.  Either way the entry's owner hears how it ended.
+            // onSettled runs on success only, not from finally: a refusal
+            // leaves the queued message live, and putting the draft back
+            // beside it is exactly the duplicate this ordering avoids.
+            .then(() => action.onSettled?.())
+            .catch((error) => {
+              if (error instanceof ApiError && error.status === 404) {
+                // A 404 can mean the entry is already gone or that this harness
+                // is too old to expose DELETE /queue/ (body carries "no route").
+                // iOS keeps the chip in the latter case; mirror that here so a
+                // local drop does not hide a message that is still going to send.
+                if (String(error.body?.error ?? "").includes("no route")) {
+                  showError(error);
+                  return;
+                }
+                rawDispatch(action);
+                action.onSettled?.();
+                return;
+              }
+              showError(error);
+            });
           break;
         case "send": {
           // persist through the existing card route so an older server that
@@ -2370,29 +3111,86 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           // Stamp before the POST so a slow 202 still shows send-time, not
           // response-receipt time (Codex P2 on #587).
           const sentAt = Date.now();
-          void api(`/api/bots/${action.botId}/messages`, {
-            method: "POST",
-            body: JSON.stringify({ text: action.text, replyToId: action.replyToId }),
-          })
-            .then((body) => {
-              if (
-                body?.queued &&
-                typeof body.threadId === "string" &&
-                typeof body.queueId === "string"
-              ) {
-                rawDispatch({
-                  type: "pendingQueued",
-                  threadId: body.threadId,
-                  queueId: body.queueId,
-                  text: action.text,
-                  at: sentAt,
-                });
-              }
+          const current = stateRef.current;
+          const liveBot = current.bots.find((b) => b.id === action.botId);
+          // The pin is the thread on screen.  The message route accepts only
+          // the bot's active task, so a disagreeing pin has to become active
+          // before the POST.  Otherwise the text lands on the other thread.
+          const pinnedThreadId =
+            current.selectedId === action.botId && current.viewedThreadId
+              ? current.viewedThreadId
+              : null;
+          // `threadId` is sent only after this client has just switched the
+          // server task, when the id is known to be current. On the ordinary
+          // path the snapshot in `liveBot.threadId` can already be stale — a
+          // routine, another client, or an automation may have switched — and
+          // the server then 409s instead of delivering. Omitting it lets the
+          // server use the active thread.
+          const postMessage = (threadId?: string) => {
+            const body: {
+              text: string;
+              replyToId?: string;
+              threadId?: string;
+              busyDelivery?: BusySendDefault;
+            } = {
+              text: action.text,
+              replyToId: action.replyToId,
+            };
+            if (threadId) body.threadId = threadId;
+            if (action.busyDelivery) body.busyDelivery = action.busyDelivery;
+            void api(`/api/bots/${action.botId}/messages`, {
+              method: "POST",
+              body: JSON.stringify(body),
             })
-            .catch((error) => {
-              showError(error);
-              action.onError?.(error instanceof Error ? error.message : String(error));
-            });
+              .then((body: unknown) => {
+                const parsed = MessagePostResponseSchema.safeParse(body);
+                if (!parsed.success) {
+                  throw new Error("Invalid message post response.");
+                }
+                if ("queued" in parsed.data && parsed.data.queued) {
+                  rawDispatch({
+                    type: "pendingQueued",
+                    threadId: parsed.data.threadId,
+                    queueId: parsed.data.queueId,
+                    text: action.text,
+                    rawText: action.rawText,
+                    reply: action.reply,
+                    attachments: action.attachments ?? [],
+                    at: sentAt,
+                  });
+                }
+              })
+              .catch((error) => {
+                showError(error);
+                action.onError?.(error instanceof Error ? error.message : String(error));
+              });
+          };
+          if (liveBot && pinnedThreadId && pinnedThreadId !== liveBot.threadId) {
+            // `messages=0` skips the transcript. This path only checks the
+            // active thread id; the bot frame carries the new messages.
+            void api(`/api/bots/${action.botId}/tasks/${pinnedThreadId}?messages=0`, { method: "POST" })
+              .then((body: unknown) => {
+                const parsed = TaskSwitchResponseSchema.safeParse(body);
+                if (
+                  !parsed.success
+                  || parsed.data.bot.id !== action.botId
+                  || parsed.data.bot.threadId !== pinnedThreadId
+                ) {
+                  throw new Error("Could not open the thread on screen before sending.");
+                }
+                rawDispatch({
+                  type: "taskSwitched",
+                  bot: { id: parsed.data.bot.id, threadId: parsed.data.bot.threadId },
+                });
+                postMessage(pinnedThreadId);
+              })
+              .catch((error) => {
+                showError(error);
+                action.onError?.(error instanceof Error ? error.message : String(error));
+              });
+            break;
+          }
+          postMessage();
           break;
         }
         case "editMessage":
@@ -2438,6 +3236,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             break;
           }
           void respond();
+          break;
+        }
+        case "approveAllRequests": {
+          api(`/api/threads/${action.threadId}/approve-all`, {
+            method: "POST",
+          }).catch((error) => {
+            showError(error);
+            action.onError?.(error instanceof Error ? error.message : String(error));
+          });
           break;
         }
         case "answerCard": {
@@ -2602,8 +3409,17 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           break;
         // tasks: the server answers with the bot AND the live transcript,
         // because switching changes which conversation is on screen
+        case "requestNewTask": {
+          const current = stateRef.current;
+          if (!allowsMultipleBotThreads(getConversationMode(current.config))) break;
+          const bot = current.bots.find((entry) => entry.id === action.botId);
+          if (bot && !bot.busy && eligibleTaskApps(bot.id, current.groups).length === 0) {
+            wrapped({ type: "newTask", botId: bot.id });
+          }
+          break;
+        }
         case "newTask":
-          api(`/api/bots/${action.botId}/tasks`, { method: "POST", body: "{}" })
+          api(`/api/bots/${action.botId}/tasks`, { method: "POST", body: JSON.stringify({ appRef: action.appRef }) })
             .then((r: any) => r?.bot && dispatch({ type: "taskSwitched", bot: r.bot }))
             .catch(showError);
           break;
@@ -2654,31 +3470,118 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           api(`/api/groups/${action.groupId}/tasks/${action.threadId}`, {
             method: "PATCH",
             body: JSON.stringify({ groupId: action.toGroupId }),
-          }).catch(showError);
+          }).then(() => rawDispatch(action)).catch(showError);
           break;
         case "moveGroupTaskToBot":
           api(`/api/groups/${action.groupId}/tasks/${action.threadId}`, {
             method: "PATCH",
             body: JSON.stringify({ botId: action.botId }),
-          }).catch(showError);
+          }).then(() => rawDispatch(action)).catch(showError);
           break;
         case "mergeTasks":
           api(`/api/bots/${action.botId}/tasks/${action.threadId}`, {
             method: "PATCH",
             body: JSON.stringify({ mergeInto: action.intoThreadId }),
-          }).catch(showError);
+          }).then(() => rawDispatch(action)).catch(showError);
+          break;
+        case "mergeAllBotTasks":
+          api(`/api/bots/${action.botId}/merge-threads`, {
+            method: "POST",
+            body: JSON.stringify({ intoThreadId: action.intoThreadId }),
+          })
+            .then((body) => {
+              // The answer crosses the HTTP boundary through a deliberately
+              // generic helper, so it is narrowed before anything in it is
+              // believed.
+              const parsed = MergeAllBotTasksResponseSchema.safeParse(body);
+              if (!parsed.success) throw new Error("The merge answer was not in the expected shape.");
+              const { bot, merged, skipped } = parsed.data;
+              rawDispatch(action);
+              // The server's own list of conversations is the truth about
+              // what stayed behind, so the roster takes it rather than the
+              // guess the optimistic paint made.
+              dispatch({
+                type: "mergeApplied",
+                botId: bot.id,
+                threadId: bot.threadId,
+                tasks: bot.tasks ?? [],
+              });
+              // The merge folded conversations into the destination, so the
+              // destination's own transcript is the one on screen now, and
+              // it is in none of what arrived: the answer carries the
+              // roster, and the frames carry only the folded-in batch.  So
+              // the destination's page is fetched here, and it lands with
+              // its pagination flag, so the older messages of a long
+              // conversation stay reachable.
+              void api(`/api/threads/${action.intoThreadId}/messages?limit=${PAGE_SIZE}`)
+                .then((pageBody) => {
+                  const page = threadMessagesPageSchema.safeParse(pageBody);
+                  if (!page.success) throw new Error("The conversation page was not in the expected shape.");
+                  rawDispatch({
+                    type: "earlierLoaded",
+                    threadId: action.intoThreadId,
+                    messages: page.data.messages ?? [],
+                    hasMore: page.data.hasMore === true,
+                  });
+                })
+                .catch((error) => {
+                  console.warn(
+                    "Failed to load the merged conversation",
+                    error instanceof Error ? error.message : "unknown error",
+                  );
+                });
+              action.onSettled?.({ merged, skipped }, null);
+            })
+            .catch((error) => {
+              showError(error);
+              action.onSettled?.(null, error instanceof Error ? error.message : String(error));
+              // The optimistic paint moved the bot to the chosen conversation
+              // and dropped the transcript it was showing, so a merge that
+              // failed has to put the server's own state back rather than
+              // leave an empty chat under a conversation that never changed.
+              api("/api/bots")
+                .then((body) => {
+                  const list = botListSchema.safeParse(body);
+                  if (!list.success) throw new Error("The bot list was not in the expected shape.");
+                  // One record that does not fit must not cancel the whole
+                  // list: the bot that failed is picked out first and
+                  // validated on its own.
+                  const candidate = list.data.bots?.find((entry) => entry.id === action.botId);
+                  if (!candidate) return;
+                  const restored = botRestoreSchema.safeParse(candidate);
+                  if (!restored.success) throw new Error("The bot was not in the expected shape.");
+                  const current = stateRef.current.bots.find((entry) => entry.id === action.botId);
+                  if (!current) return;
+                  // the server's own conversation list and transcript win; the
+                  // rest of the bot is what this client already holds
+                  rawDispatch({
+                    type: "botPatched",
+                    bot: {
+                      ...current,
+                      ...restored.data,
+                      messages: restored.data.messages ?? current.messages,
+                    },
+                  });
+                })
+                .catch((restoreError) => {
+                  console.warn(
+                    "Failed to restore the bot after a merge did not work",
+                    restoreError instanceof Error ? restoreError.message : "unknown error",
+                  );
+                });
+            });
           break;
         case "moveTaskToBot":
           api(`/api/bots/${action.botId}/tasks/${action.threadId}`, {
             method: "PATCH",
             body: JSON.stringify({ botId: action.toBotId }),
-          }).catch(showError);
+          }).then(() => rawDispatch(action)).catch(showError);
           break;
         case "moveTaskToGroup":
           api(`/api/bots/${action.botId}/tasks/${action.threadId}`, {
             method: "PATCH",
             body: JSON.stringify({ groupId: action.toGroupId }),
-          }).catch(showError);
+          }).then(() => rawDispatch(action)).catch(showError);
           break;
         case "deleteGroupTask":
           api(`/api/groups/${action.groupId}/tasks/${action.threadId}`, { method: "DELETE" })
@@ -2694,12 +3597,46 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           }
           break;
         }
+        case "viewThread": {
+          const threadId = action.threadId;
+          if (!threadId) break;
+          const current = stateRef.current;
+          const bot = current.bots.find((candidate) => candidate.id === action.botId);
+          // Only a retained, non-active thread needs its own page; the
+          // active thread already lives on the bot.  Reading never
+          // consults busy — that guard stays on switching alone.  The
+          // ownership check mirrors the reducer: a thread the bot does
+          // not list is never fetched or cached from here.
+          if (!bot || bot.threadId === threadId) break;
+          if (!(bot.tasks ?? []).some((task) => task.threadId === threadId)) break;
+          if (current.threadTranscripts[threadId] || threadFetchInFlight.current.has(threadId)) break;
+          threadFetchInFlight.current.add(threadId);
+          api(`/api/threads/${encodeURIComponent(threadId)}/messages?limit=${INITIAL_PAGE}`)
+            .then((page: { messages?: Message[]; hasMore?: boolean }) =>
+              rawDispatch({
+                type: "threadTranscriptLoaded",
+                threadId,
+                messages: page?.messages ?? [],
+                hasMore: page?.hasMore === true,
+              }),
+            )
+            .catch((error) => {
+              rawDispatch({
+                type: "threadTranscriptFailed",
+                threadId,
+                error: error instanceof Error ? error.message : String(error),
+              });
+              showError(error);
+            })
+            .finally(() => threadFetchInFlight.current.delete(threadId));
+          break;
+        }
         case "loadEarlier": {
           const current = stateRef.current;
           const conversation =
             current.bots.find((bot) => bot.threadId === action.threadId) ??
             current.groups.find((group) => group.threadId === action.threadId);
-          const oldest = conversation?.messages[0]?.id;
+          const oldest = conversation?.messages[0]?.id ?? current.threadTranscripts[action.threadId]?.[0]?.id;
           // nothing loaded yet means the hydrate is still in flight; it will
           // bring the tail and the flag, and the pill will be there after
           if (!oldest || current.loadingEarlier[action.threadId]) break;
@@ -2880,11 +3817,17 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             // singleton speaker and microphone ordering for its whole lifetime.
             const owner = stateRef.current.bots.find((b) => b.threadId === frame.threadId || b.tasks?.some((t) => t.threadId === frame.threadId));
             if (owner && (owner.speechDevices ? owner.speechDevices.includes("mac") : owner.speakReplies) && currentCall() === null && frame.message.text?.trim()) {
-              void speaker.speak(spokenReply(frame.message.text), {
+              // The reply as stored: the harness owns what is read, and the
+              // speaker's local fallback picks the written or voice half
+              // by the bot's mode.
+              void speaker.speak(frame.message.text, {
                 botId: owner.id,
                 messageId: frame.message.id,
                 threadId: frame.threadId,
-                voiceId: owner.voice,
+                // This Mac's own voice: its override, else the shared one.
+                voiceId: voiceForDevice(owner, "mac"),
+                scriptKind: voiceScriptKind(owner),
+                enqueue: true,
               });
             }
           }
@@ -2892,6 +3835,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         }
         case "message.patch":
           rawDispatch({ type: "messagePatched", threadId: frame.threadId, message: frame.message });
+          break;
+        case "messages":
+          rawDispatch({ type: "messagesAdded", threadId: frame.threadId, messages: frame.messages });
           break;
         // An update runs detached and takes minutes; the harness pushes a
         // new status on every step so the Updates card and the floating
@@ -2915,7 +3861,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           }
           rawDispatch({
             type: "botPatched",
-            bot: { ...bot, ...botPatchQueue.overlayFor(bot.id) },
+            bot: applyBotPatch(bot, botPatchQueue.overlayFor(bot.id)),
           });
           break;
         }
@@ -2985,6 +3931,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           // the Trajectory tab's door: free unless that thread's tab is open
           publishRuntimeEvent(event);
           if (event.type === "content.delta") {
+            // A helper's prose belongs on its card, not in the bot's bubble.
+            if (event.subagentId) break;
             // Batch token deltas per animation frame (t3code-style): a fast
             // stream dispatches once per frame instead of once per token, so
             // the app tree re-renders at most ~60x/s while streaming.

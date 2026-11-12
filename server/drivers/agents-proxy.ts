@@ -1,18 +1,19 @@
 // Agent-to-agent comms MCP proxy — spawned as an MCP server inside a bot's
-// agent process (via the "agents" integration). Exposes eight tools that
+// agent process (via the "agents" integration). Exposes the fleet tools that
 // let one bot talk to another, routed back through the harness so the
 // harness stays the single owner of turns, permissions, and recursion
 // limits:
 //
 //   list_bots()                          → the other bots in this section + their status
-//   ask_bot(bot_id, msg)                 → send msg to that bot, wait, return its reply
-//   delegate_bot(bot_id, msg, reason?)   → hand the task to a peer ASYNC: returns
+//   coordinate_bots(bot_ids, message, ...)  → record a durable handoff and return
+//   assignment_status(id?)                  → read handoffs, change nothing
 //                                          immediately, the peer runs after your
 //                                          current turn finishes, the user sees
 //                                          the peer's reply as its own turn
 //   create_bot(name, role, instructions) → Chiefs can add a specialist to
 //                                          their own section
 //   request_credential(id, reason?)       → show a secure, allowlisted key card
+//   request_sign_in(site, reason?)        → show a Sign in needed card; never a password
 //   list_routines()                       → inspect this bot's scheduled work
 //   propose_routine(...)                  → show a confirmation card for a new routine
 //   propose_routine_action(...)           → show a confirmation card for a routine change
@@ -27,6 +28,7 @@
 import readline from "node:readline";
 
 import { CREDENTIAL_TARGETS, isCredentialTargetId } from "../../shared/credential-request.ts";
+import { inboundText } from "../../shared/sign-in-request.ts";
 import { MAX_CREATED_BOTS_PER_TURN, mcpToolDefinitions } from "../tools/registry.ts";
 import { routineFields } from "../tools/schedule.ts";
 
@@ -66,6 +68,11 @@ const REGISTRY_TOOLS = mcpToolDefinitions({
   // reads are the same per-turn values the HTTP lane's tool host gets, so the
   // two lanes' descriptions cannot drift.
   jobs: process.env.OMB_JOBS === "1",
+  // Zulip (docs/zulip.md).  Same shape as jobs: the harness sets OMB_ZULIP=1
+  // only for a bot whose Zulip identity is connected, and the
+  // `/api/internal/zulip` endpoints decide every target from this process's
+  // comms grant, never from the arguments.
+  zulip: process.env.OMB_ZULIP === "1",
 });
 
 // The publication order shipped CLI engines already see.  Spelled out so
@@ -73,16 +80,19 @@ const REGISTRY_TOOLS = mcpToolDefinitions({
 // list too.
 const MCP_TOOL_ORDER = [
   "list_bots",
-  "ask_bot",
-  "delegate_bot",
+  "coordinate_bots",
+  "assignment_status",
   "create_bot",
   "request_credential",
+  "request_sign_in",
   "list_routines",
   "propose_routine",
   "propose_routine_action",
   // Background jobs (jobs P2).  Listed after the fleet tools so a turn that
   // mounts them publishes its existing surface unchanged first.
   ...(process.env.OMB_JOBS === "1" ? ["job_start", "job_output", "job_list", "job_kill"] : []),
+  // Zulip, last: a turn without it publishes the existing surface unchanged.
+  ...(process.env.OMB_ZULIP === "1" ? ["zulip_reply", "zulip_post", "zulip_follow_topic"] : []),
 ];
 
 const TOOLS_BY_NAME = new Map(REGISTRY_TOOLS.map((tool) => [tool.name, tool]));
@@ -151,40 +161,51 @@ async function callTool(name: string, args: Json): Promise<{ text: string; isErr
     const lines = bots.map((b) => {
       const role = b.title ? ` — ${b.title}` : "";
       const about = b.description ? ` (${String(b.description).slice(0, 120)})` : "";
-      return `- ${b.name}${role}${about} [id: ${b.id}, model: ${b.model}${b.busy ? ", busy" : ""}]`;
+      // `off` rides the row only for a bot that is switched Off, exactly as it
+      // does on the HTTP lane, so a peer can tell before it tries a handoff.
+      return `- ${b.name}${role}${about} [id: ${b.id}, model: ${b.model}${b.busy ? ", busy" : ""}${b.off === true ? ", off" : ""}]`;
     });
-    return { text: `Other bots you can message with ask_bot:\n${lines.join("\n")}` };
+    return { text: `Other bots you can message with coordinate_bots:\n${lines.join("\n")}` };
   }
-  if (name === "ask_bot") {
-    const toBotId = String(args.bot_id ?? "").trim();
+  if (name === "coordinate_bots") {
+    const listed = Array.isArray(args.bot_ids) ? args.bot_ids : [];
+    const single = args.bot_id;
+    const botIds = listed.map((value) => String(value ?? "").trim()).filter(Boolean);
+    if (single !== undefined && single !== null) {
+      const extra = String(single).trim();
+      if (extra) botIds.push(extra);
+    }
     const message = String(args.message ?? "").trim();
-    if (!toBotId || !message) return { text: "ask_bot needs bot_id and message.", isError: true };
-    const r = await api(`/api/internal/ask-bot`, {
-      method: "POST",
-      body: JSON.stringify({ fromBotId: BOT_ID, fromThreadId: THREAD_ID, toBotId, message, depth: DEPTH }),
-    });
-    if (r.busy) return { text: `That bot is busy right now — try again after it finishes.` };
-    if (r.error) return { text: `Couldn't reach that bot: ${r.error}`, isError: true };
-    return { text: `${r.botName ?? "Bot"} replied:\n${r.text ?? "(no reply)"}` };
-  }
-  if (name === "delegate_bot") {
-    const toBotId = String(args.bot_id ?? "").trim();
-    const message = String(args.message ?? "").trim();
-    const reason = typeof args.reason === "string" ? args.reason.trim() : "";
-    if (!toBotId || !message) return { text: "delegate_bot needs bot_id and message.", isError: true };
+    if (botIds.length === 0 || !message) return { text: "coordinate_bots needs bot_ids and message.", isError: true };
     const body: Record<string, unknown> = {
       fromBotId: BOT_ID,
       fromThreadId: THREAD_ID,
-      toBotId,
+      botIds,
       message,
       depth: DEPTH,
     };
-    if (reason) body.reason = reason;
-    const r = await api(`/api/internal/delegate-bot`, { method: "POST", body: JSON.stringify(body) });
-    if (r.error) return { text: `Couldn't queue the delegation: ${r.error}`, isError: true };
-    // Fire-and-forget by contract: the harness returns immediately, the
-    // peer turn runs after our current turn finishes.
-    return { text: typeof r.message === "string" ? r.message : "Delegation queued." };
+    if (typeof args.reason === "string" && args.reason.trim()) body.reason = args.reason.trim();
+    if (args.rework === true) body.rework = true;
+    if (args.thread === "standing" || args.thread === "new") body.thread = args.thread;
+    if (args.reply === "resume" || args.reply === "none") body.reply = args.reply;
+    if (args.consult === true) body.consult = true;
+    if (args.done_when === String(args.done_when)) {
+      const doneWhen = String(args.done_when).trim();
+      if (doneWhen) body.doneWhen = doneWhen;
+    }
+    const r = await api(`/api/internal/coordinate-bots`, { method: "POST", body: JSON.stringify(body) });
+    if (r.error && !Array.isArray(r.assignments)) return { text: `Couldn't hand that off: ${r.error}`, isError: true };
+    return { text: typeof r.message === "string" ? r.message : "Handed off." };
+  }
+  if (name === "assignment_status") {
+    const id = args.id === String(args.id) ? String(args.id).trim() : "";
+    const query = id ? `?id=${encodeURIComponent(id)}` : "";
+    const r = await api(`/api/internal/assignment-status${query}`, {
+      method: "POST",
+      body: JSON.stringify(id ? { fromBotId: BOT_ID, fromThreadId: THREAD_ID, id } : { fromBotId: BOT_ID, fromThreadId: THREAD_ID }),
+    });
+    if (r.error) return { text: `Couldn't read that assignment: ${r.error}`, isError: true };
+    return { text: JSON.stringify(r) };
   }
   if (name === "create_bot") {
     const botName = String(args.name ?? "").trim();
@@ -208,7 +229,7 @@ async function callTool(name: string, args: Json): Promise<{ text: string; isErr
     });
     createdThisTurn += 1;
     return {
-      text: `Created @${r.name ?? botName} in ${r.section ?? "General"} [id: ${r.id}]. Assign work with delegate_bot.`,
+      text: `Created @${r.name ?? botName} in ${r.section ?? "General"} [id: ${r.id}]. Assign work with coordinate_bots.`,
     };
   }
   if (name === "request_credential") {
@@ -231,6 +252,25 @@ async function callTool(name: string, args: Json): Promise<{ text: string; isErr
     }
     return {
       text: `A secure ${r.label ?? CREDENTIAL_TARGETS[credentialId].label} card is now visible to the user. End this turn; BotFleet will resume the task after they save or decline. Never ask them to paste the key into chat.`,
+    };
+  }
+  if (name === "request_sign_in") {
+    const site = inboundText(args.site);
+    if (!site) return { text: "request_sign_in needs a site, like example.com.", isError: true };
+    const reason = inboundText(args.reason).slice(0, 280);
+    const payload = {
+      fromBotId: BOT_ID,
+      fromThreadId: THREAD_ID,
+      site,
+      reason,
+    };
+    const r = await api("/api/internal/request-sign-in", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    const named = inboundText(r.site) || site;
+    return {
+      text: `A Sign in needed card for ${named} is now visible. End this turn. The person signs in on the computer where you work. Never ask them to paste a password or one-time code into chat.`,
     };
   }
   if (name === "list_routines") {
@@ -317,6 +357,17 @@ async function callTool(name: string, args: Json): Promise<{ text: string; isErr
   }
   if (name === "job_kill") {
     return jobCall("kill", args);
+  }
+  // Zulip.  A thin hop like the job tools: the comms token is the identity,
+  // and the harness answers a refusal as `isError` so the model reads it as
+  // "not posted" rather than as a post that happened.
+  if (name === "zulip_reply" || name === "zulip_post" || name === "zulip_follow_topic") {
+    const route = name === "zulip_reply" ? "reply" : name === "zulip_post" ? "post" : "follow";
+    const r = await api(`/api/internal/zulip/${route}`, {
+      method: "POST",
+      body: JSON.stringify(args),
+    });
+    return { text: String(r.text ?? JSON.stringify(r)), isError: r.isError === true };
   }
   return { text: `Unknown tool: ${name}`, isError: true };
 }

@@ -4,7 +4,7 @@
 // `runGroupMemberTurn` used to assign exactly four integrations — agents,
 // phone, composio and qdrant — and nothing else.  `integrations.computer`,
 // `integrations.computers` and `integrations.localComputer` were never set,
-// so a Claude, Codex, Antigravity, pi or ACP bot holding Cua, a Box, a Local
+// so a Claude, Codex, Antigravity, pi or ACP bot holding CUA, a Box, a Local
 // VM or a VPS in a direct chat lost every one of them the moment it spoke in
 // a room.  The HTTP lane in that same room kept host `bash`, because the
 // function did compute `hasHostComputer` and hand it to `buildTurnTools` —
@@ -19,7 +19,7 @@
 // `mcpServers` array it was handed at `session/new`; the computer is a
 // managed container reached through a fake `docker` on OMB_EXTRA_PATH, the
 // same fixture `server/vps-routing.test.ts` uses for the 1:1 lane.  A host
-// Cua mount would have been simpler and is deliberately not used: reading a
+// CUA mount would have been simpler and is deliberately not used: reading a
 // real connection descriptor is macOS-only in practice, and these tests have
 // to run on Ubuntu too.
 import type { ChildProcess } from "node:child_process";
@@ -65,7 +65,7 @@ const posixOnly = describe.skipIf(process.platform === "win32");
 
 /* ── the policy, with every seam injected ─────────────────────────────── */
 
-/** A Cua Driver descriptor shaped like the real one, with nothing behind it.
+/** A CUA Driver descriptor shaped like the real one, with nothing behind it.
  * The resolver only ever passes it through. */
 const HOST_STDIO: NonNullable<ComputerMount["stdio"]> = {
   command: "/fake/cua-driver",
@@ -239,8 +239,9 @@ describe("the grant a turn resolves is the same on both lanes", () => {
   });
 
   it("keeps the caught VPS error when an Auto lookup throws and nothing mounts", async () => {
-    // The auto lookup's SSH/timeout error used to be replaced by the generic
-    // "could not be reached" text in the no-mount branch.
+    // A chat turn keeps going when the VPS cannot be reached.  The SSH
+    // error stays in the note, instead of a generic "could not be reached"
+    // and instead of failing the turn.
     const deps = stubDeps({
       readHostConnection: () => null,
       vps: {
@@ -262,7 +263,9 @@ describe("the grant a turn resolves is the same on both lanes", () => {
       allowed: null,
       deps,
     });
-    await expect(run).rejects.toThrow("ssh: connect to host vps-1 port 22: Operation timed out");
+    const resolved = await run;
+    expect(resolved.mounts).toEqual([]);
+    expect(resolved.unavailableNote).toContain("ssh: connect to host vps-1 port 22: Operation timed out");
   });
 
   describe("per-provider toggles are enforced on the cloud backend a bot resolves to", () => {
@@ -626,6 +629,9 @@ posixOnly("room turns carry the same computers as a direct chat", () => {
       USERPROFILE: home,
       OMB_PORT: String(port),
       OMB_EXTRA_PATH: fakeBin,
+      // spawnDetached switches container runtimes off; this fake `docker` is
+      // the one runtime the harness may run, by absolute path.
+      BOTFLEET_CONTAINER_RUNTIME_FIXTURE_DIR: fakeBin,
       FAKE_DOCKER_DIR: fakeBin,
       FAKE_DOCKER_LOG: dockerLog,
     };

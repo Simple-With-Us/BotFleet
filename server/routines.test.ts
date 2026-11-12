@@ -2,8 +2,43 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { z } from "zod";
 
-import { BUSY_DEFER_NOTE, nextOccurrence, RoutineManager, type RoutineManagerOptions } from "./routines.ts";
+import type { RuntimeEvent } from "./contracts.ts";
+import type { BotDispatchState } from "../shared/bot-profile.ts";
+import { BOT_OFF_SKIPPED } from "../shared/bot-power.ts";
+import { ROUTINE_ATTENTION_STATUSES } from "../shared/routine-outcomes.ts";
+import { wantsEphemeralDispatch } from "./ephemeral-dispatch.ts";
+import { ROUTINE_RUN_TERMINAL_SAFETY_CAP } from "../shared/routine-retention.ts";
+import { BUSY_DEFER_NOTE, DEFAULT_WEBHOOK_HOT_DEFER_MS, nextOccurrence, RoutineManager, type RoutineManagerOptions, type RoutineRunOn, type RoutineSchedule } from "./routines.ts";
+
+/** routines.json as the manager wrote it, validated before a test reads a field. */
+const routinesOnDiskSchema = z.object({
+  routines: z.array(z.looseObject({ sentryMonitorSlug: z.string().optional() })),
+});
+function routinesOnDisk(file: string): z.infer<typeof routinesOnDiskSchema> {
+  return routinesOnDiskSchema.parse(JSON.parse(readFileSync(file, "utf8")));
+}
+
+type TurnCompletedEvent = Extract<RuntimeEvent, { type: "turn.completed" }>;
+
+function turnCompletedFixture(
+  threadId: string,
+  partial: Partial<TurnCompletedEvent> = {},
+): TurnCompletedEvent {
+  return {
+    eventId: "event",
+    provider: "claude",
+    providerInstanceId: "claude-fixture",
+    threadId,
+    createdAt: new Date().toISOString(),
+    type: "turn.completed",
+    ok: true,
+    cost: 0,
+    denials: [],
+    ...partial,
+  };
+}
 
 const dirs: string[] = [];
 
@@ -15,7 +50,7 @@ function tempFile() {
 
 function harness(start = new Date(2026, 7, 17, 8, 0, 0).getTime()) {
   let now = start;
-  let bot: "ready" | "busy" | "missing" = "ready";
+  let bot: BotDispatchState = "ready";
   let task = 0;
   const threads = new Set<string>();
   const keys = new Map<string, string>();
@@ -27,7 +62,14 @@ function harness(start = new Date(2026, 7, 17, 8, 0, 0).getTime()) {
   const emitted: any[] = [];
   const failed: any[] = [];
   const checkInStarts: Array<{ run: any; routine: any }> = [];
-  const checkInFinishes: Array<{ run: any; checkInId: string; ok: boolean }> = [];
+  const checkInFinishes: Array<{ run: any; checkInId: string; ok: boolean; onSettled?: (delivered: boolean) => void }> = [];
+  const releasedMonitors: string[] = [];
+  const ephemeralFlags: boolean[] = [];
+  const deliveredEphemeral: Array<{
+    ownerThreadId: string;
+    ephemeralThreadId: string;
+    ok: boolean;
+  }> = [];
   let checkInIdSeq = 0;
   let live = true;
   let admitting = true;
@@ -53,19 +95,24 @@ function harness(start = new Date(2026, 7, 17, 8, 0, 0).getTime()) {
       keys.set(automationKey, threadId);
     },
     taskExists: (_botId, threadId) => threads.has(threadId),
-    startTurn: async (botId, threadId, prompt, runOn, triggerSource) => {
+    startTurn: async (botId, threadId, prompt, runOn, triggerSource, _onError, turnOpts) => {
       started.push({ botId, threadId, prompt });
       runOns.push(runOn);
       triggerSources.push(triggerSource);
+      ephemeralFlags.push(turnOpts?.ephemeralDispatch === true);
+    },
+    deliverEphemeralResult: (input) => {
+      deliveredEphemeral.push(input);
     },
     onRunFailed: (run) => failed.push(run),
     checkInStart: (run, routine) => {
       checkInStarts.push({ run: { ...run }, routine: { ...routine } });
       return `check-in-${++checkInIdSeq}`;
     },
-    checkInFinish: (run, checkInId, ok) => {
-      checkInFinishes.push({ run: { ...run }, checkInId, ok });
+    checkInFinish: (run, checkInId, ok, onSettled) => {
+      checkInFinishes.push({ run: { ...run }, checkInId, ok, onSettled });
     },
+    releaseMonitor: (slug) => releasedMonitors.push(slug),
   };
   const manager = new RoutineManager(options);
   return {
@@ -80,6 +127,9 @@ function harness(start = new Date(2026, 7, 17, 8, 0, 0).getTime()) {
     failed,
     checkInStarts,
     checkInFinishes,
+    releasedMonitors,
+    ephemeralFlags,
+    deliveredEphemeral,
     setNow: (value: number) => (now = value),
     setBot: (value: typeof bot) => (bot = value),
     setLive: (value: boolean) => (live = value),
@@ -93,20 +143,32 @@ afterEach(() => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-it("persists queued receipts while pruning more than 2,000 terminal records", () => {
+it("persists queued receipts while pruning terminal records past the safety cap", () => {
   const h = harness();
   h.setAdmitting(false);
-  const input = { runOn: "bot" as const, webhookId: "retention-hook", webhookName: "Retention", prompt: "Fixture", botId: "bot", receivedAt: 1 };
+  const anchor = new Date(2026, 7, 17, 8, 0, 0).getTime();
+  const input = { runOn: "bot" as const, webhookId: "retention-hook", webhookName: "Retention", prompt: "Fixture", botId: "bot", receivedAt: anchor };
   const queued = h.manager.enqueueWebhook({ ...input, deliveryId: "queued" });
   h.manager.flushNow();
   const disk = JSON.parse(readFileSync(h.options.file!, "utf8"));
-  disk.runs = [queued, ...Array.from({ length: 2001 }, (_, i) => ({ ...queued, id: `history-${i}`, deliveryId: `history-${i}`, status: "completed", createdAt: i + 2, finishedAt: i + 3 }))];
+  const excess = ROUTINE_RUN_TERMINAL_SAFETY_CAP + 1;
+  disk.runs = [
+    queued,
+    ...Array.from({ length: excess }, (_, i) => ({
+      ...queued,
+      id: `history-${i}`,
+      deliveryId: `history-${i}`,
+      status: "completed",
+      createdAt: anchor - excess + i,
+      finishedAt: anchor - excess + i + 1,
+    })),
+  ];
   writeFileSync(h.options.file!, JSON.stringify(disk));
   const reloaded = new RoutineManager(h.options);
   const second = reloaded.enqueueWebhook({ ...input, deliveryId: "new-queued" });
   reloaded.flushNow();
   const persisted = JSON.parse(readFileSync(h.options.file!, "utf8"));
-  expect(persisted.runs).toHaveLength(2002);
+  expect(persisted.runs).toHaveLength(ROUTINE_RUN_TERMINAL_SAFETY_CAP + 2);
   expect(persisted.runs.filter((run: { status: string }) => run.status === "queued").map((run: { id: string }) => run.id)).toEqual([queued.id, second.id]);
   expect(persisted.runs.some((run: { id: string }) => run.id === "history-0")).toBe(false);
 });
@@ -114,13 +176,24 @@ it("persists queued receipts while pruning more than 2,000 terminal records", ()
 it("bounds the prompt snapshot of settled runs older than the newest 100 when it saves", () => {
   const h = harness();
   h.setAdmitting(false);
+  const anchor = new Date(2026, 7, 17, 8, 0, 0).getTime();
   const payload = "p".repeat(20_000);
   const prompt = ["Event: deploy.finished", "[UNTRUSTED WEBHOOK EVENT DATA]", payload, "[/UNTRUSTED WEBHOOK EVENT DATA]"].join("\n");
-  const input = { runOn: "bot" as const, webhookId: "bound-hook", webhookName: "Bound", prompt, botId: "bot", receivedAt: 1 };
+  const input = { runOn: "bot" as const, webhookId: "bound-hook", webhookName: "Bound", prompt, botId: "bot", receivedAt: anchor };
   const queued = h.manager.enqueueWebhook({ ...input, deliveryId: "queued" });
   h.manager.flushNow();
   const disk = JSON.parse(readFileSync(h.options.file!, "utf8"));
-  disk.runs = [queued, ...Array.from({ length: 105 }, (_, i) => ({ ...queued, id: `history-${i}`, deliveryId: `history-${i}`, status: "completed", createdAt: i + 2, finishedAt: i + 3 }))];
+  disk.runs = [
+    queued,
+    ...Array.from({ length: 105 }, (_, i) => ({
+      ...queued,
+      id: `history-${i}`,
+      deliveryId: `history-${i}`,
+      status: "completed",
+      createdAt: anchor - 105 + i,
+      finishedAt: anchor - 105 + i + 1,
+    })),
+  ];
   writeFileSync(h.options.file!, JSON.stringify(disk));
   const reloaded = new RoutineManager(h.options);
   reloaded.enqueueWebhook({ ...input, deliveryId: "new-queued" });
@@ -141,25 +214,35 @@ it("bounds the prompt snapshot of settled runs older than the newest 100 when it
 it("retains the exact result of an unsettled run-now confirmation until its card settles", () => {
   const h = harness();
   h.setAdmitting(false);
+  const anchor = new Date(2026, 7, 17, 8, 0, 0).getTime();
   const routine = h.manager.create({ name: "Fixture", prompt: "Check", botId: "bot", schedule: { type: "daily", time: "09:00", weekdays: [1] } });
   const request = { requestId: "retained-request", messageId: "message", botId: "bot", threadId: "thread", action: "run_now" as const, fingerprintVersion: 1 as const, fingerprint: "a".repeat(64) };
   const committed = h.manager.runNow(routine.id, request)!;
   h.manager.flushNow();
   const disk = JSON.parse(readFileSync(h.options.file!, "utf8"));
-  const terminal = { ...committed, status: "completed", finishedAt: 1 };
-  disk.runs = [terminal, ...Array.from({ length: 2001 }, (_, i) => ({ ...terminal, id: `later-${i}`, createdAt: i + 2, finishedAt: i + 3 }))];
+  const terminal = { ...committed, status: "completed", finishedAt: anchor - 1 };
+  const history = 2001;
+  disk.runs = [
+    terminal,
+    ...Array.from({ length: history }, (_, i) => ({
+      ...terminal,
+      id: `later-${i}`,
+      createdAt: anchor - history + i,
+      finishedAt: anchor - history + i + 1,
+    })),
+  ];
   writeFileSync(h.options.file!, JSON.stringify(disk));
   const reloaded = new RoutineManager(h.options);
   reloaded.update(routine.id, { name: "Prune history" });
   reloaded.flushNow();
   const afterPruning = new RoutineManager(h.options);
   expect(afterPruning.runNow(routine.id, request)).toMatchObject({ id: committed.id, status: "completed" });
-  expect(afterPruning.listRuns()).toHaveLength(2001);
+  expect(afterPruning.listRuns()).toHaveLength(history + 1);
   afterPruning.forgetRoutineRequestReceipt(request);
   afterPruning.flushNow();
   const settled = new RoutineManager(h.options);
-  expect(settled.listRuns()).toHaveLength(2000);
-  expect(settled.listRuns().some((run) => run.id === committed.id)).toBe(false);
+  expect(settled.listRuns()).toHaveLength(history + 1);
+  expect(settled.listRuns().some((run) => run.id === committed.id)).toBe(true);
 });
 
 it("coalesces a burst of saves into one write, and stop() flushes a pending save", () => {
@@ -227,6 +310,235 @@ describe("nextOccurrence", () => {
 });
 
 describe("RoutineManager", () => {
+  it("defers a queued webhook while the host is hot and still starts a resource wake", async () => {
+    const h = harness();
+    let hot = true;
+    h.options.hostHot = () => (hot ? "Host is busy (load 4 per core, swap 90%)" : null);
+    const webhook = h.manager.enqueueWebhook({
+      webhookId: "compile-gates",
+      webhookName: "Compile gates",
+      prompt: "classify this",
+      botId: "maus-1",
+      runOn: "bot",
+      deliveryId: "wh-1",
+      receivedAt: 1,
+    });
+    h.manager.enqueueResource({
+      triggerId: "disk",
+      triggerName: "Housekeeper",
+      prompt: "disk",
+      botId: "maus-1",
+      runOn: "bot",
+      deliveryId: "rs-1",
+      receivedAt: 2,
+    });
+    await h.manager.tick();
+    expect(h.triggerSources).toEqual(["resource"]);
+    expect(h.manager.listRuns().find((run) => run.id === webhook.id)?.status).toBe("queued");
+    expect(h.manager.listRuns().find((run) => run.id === webhook.id)?.holdReason)
+      .toBe("Host is busy (load 4 per core, swap 90%)");
+    hot = false;
+    await h.manager.tick();
+    expect(h.triggerSources).toEqual(["resource", "webhook"]);
+    const dispatched = h.manager.listRuns().find((run) => run.id === webhook.id);
+    expect(dispatched?.status).toBe("running");
+    expect(dispatched?.holdReason).toBeUndefined();
+  });
+
+  it("replaces a stale engine hold with the hot-host reason", async () => {
+    // The engine may have recovered.  While the host is what is parking the
+    // webhook, the receipt names the host, through the same hold-reason
+    // field a dead CLI uses.
+    const h = harness();
+    let hot = false;
+    const hostReason = "Host is busy (load 12 per core, swap 91%)";
+    h.options.hostHot = () => (hot ? hostReason : null);
+    h.setCanStart(false);
+    h.options.dispatchHoldReason = () => "DeepSeek Harness could not start 3 times in a row";
+    const webhook = h.manager.enqueueWebhook({
+      webhookId: "compile-gates",
+      webhookName: "Compile gates",
+      prompt: "classify this",
+      botId: "maus-1",
+      runOn: "bot",
+      deliveryId: "wh-hold",
+      receivedAt: 1,
+    });
+    await h.manager.tick();
+    expect(h.manager.listRuns().find((run) => run.id === webhook.id)?.holdReason)
+      .toBe("DeepSeek Harness could not start 3 times in a row");
+    hot = true;
+    h.setCanStart(true);
+    await h.manager.tick();
+    const deferred = h.manager.listRuns().find((run) => run.id === webhook.id);
+    expect(deferred?.status).toBe("queued");
+    expect(deferred?.holdReason).toBe(hostReason);
+    expect(h.emitted.some((event) => event.run?.holdReason === hostReason)).toBe(true);
+    expect(h.triggerSources).toEqual([]);
+  });
+
+  it("measures hot-host defer cap from the first hot tick, not enqueue time", async () => {
+    const h = harness();
+    const logs: string[] = [];
+    const hostReason = "Host is busy (load 12 per core, swap 91%)";
+    const capMs = 5 * 60_000;
+    h.options.log = (line) => logs.push(line);
+    h.options.webhookHotDeferMaxMs = () => capMs;
+    h.options.hostHot = () => hostReason;
+    let busy = true;
+    h.options.botState = () => (busy ? "busy" : "ready");
+    const t0 = h.options.now!();
+    const webhook = h.manager.enqueueWebhook({
+      webhookId: "compile-gates",
+      webhookName: "Compile gates",
+      prompt: "classify this",
+      botId: "maus-1",
+      runOn: "bot",
+      deliveryId: "wh-hot-since",
+      receivedAt: t0,
+    });
+    await h.manager.tick();
+    expect(h.manager.listRuns().find((run) => run.id === webhook.id)?.status).toBe("queued");
+    expect(h.started).toHaveLength(0);
+
+    const hotAt = t0 + 10 * 60_000;
+    h.setNow(hotAt);
+    busy = false;
+    await h.manager.tick();
+    expect(h.manager.listRuns().find((run) => run.id === webhook.id)?.hotDeferredAt).toBe(hotAt);
+    expect(h.started).toHaveLength(0);
+
+    h.setNow(hotAt + capMs - 1);
+    await h.manager.tick();
+    expect(h.started).toHaveLength(0);
+
+    h.setNow(hotAt + capMs);
+    await h.manager.tick();
+    expect(h.triggerSources).toEqual(["webhook"]);
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toContain("waited 5 min");
+  });
+
+  it("does not probe the host while no webhook is queued", async () => {
+    const h = harness();
+    let probeCalls = 0;
+    h.options.hostHot = () => {
+      probeCalls += 1;
+      return "Host is busy (load 4 per core, swap 90%)";
+    };
+    await h.manager.tick();
+    expect(probeCalls).toBe(0);
+  });
+
+  it("dispatches a hot-deferred webhook after the max age, logs once, and clears the reason", async () => {
+    const h = harness();
+    const logs: string[] = [];
+    const hostReason = "Host is busy (load 12 per core, swap 91%)";
+    const capMs = 5 * 60_000;
+    h.options.log = (line) => logs.push(line);
+    h.options.webhookHotDeferMaxMs = () => capMs;
+    h.options.hostHot = () => hostReason;
+    const queuedAt = h.options.now!();
+    const webhook = h.manager.enqueueWebhook({
+      webhookId: "compile-gates",
+      webhookName: "Compile gates",
+      prompt: "classify this",
+      botId: "maus-1",
+      runOn: "bot",
+      deliveryId: "wh-age",
+      receivedAt: queuedAt,
+    });
+    await h.manager.tick();
+    expect(h.manager.listRuns().find((run) => run.id === webhook.id)?.holdReason).toBe(hostReason);
+    expect(h.started).toHaveLength(0);
+
+    h.setNow(queuedAt + capMs - 1);
+    await h.manager.tick();
+    expect(h.manager.listRuns().find((run) => run.id === webhook.id)?.status).toBe("queued");
+    expect(h.manager.listRuns().find((run) => run.id === webhook.id)?.holdReason).toBe(hostReason);
+    expect(logs).toEqual([]);
+
+    h.setNow(queuedAt + capMs);
+    await h.manager.tick();
+    const dispatched = h.manager.listRuns().find((run) => run.id === webhook.id);
+    expect(dispatched?.status).toBe("running");
+    expect(dispatched?.holdReason).toBeUndefined();
+    expect(h.triggerSources).toEqual(["webhook"]);
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toContain("waited 5 min");
+    expect(logs[0]).toContain("dispatching anyway");
+    expect(logs[0]).toContain(hostReason);
+    expect(logs[0]).toContain(webhook.id);
+    await h.manager.tick();
+    expect(logs).toHaveLength(1);
+  });
+
+  it("uses the 20 minute default when no deferral cap is configured", async () => {
+    const h = harness();
+    h.options.log = () => {};
+    h.options.hostHot = () => "Host is busy (load 8 per core, swap 99%)";
+    const queuedAt = h.options.now!();
+    h.manager.enqueueWebhook({
+      webhookId: "compile-gates",
+      webhookName: "Compile gates",
+      prompt: "classify this",
+      botId: "maus-1",
+      runOn: "bot",
+      deliveryId: "wh-default",
+      receivedAt: queuedAt,
+    });
+    await h.manager.tick();
+    expect(h.started).toHaveLength(0);
+    h.setNow(queuedAt + DEFAULT_WEBHOOK_HOT_DEFER_MS - 1);
+    await h.manager.tick();
+    expect(h.started).toHaveLength(0);
+    h.setNow(queuedAt + DEFAULT_WEBHOOK_HOT_DEFER_MS);
+    await h.manager.tick();
+    expect(h.triggerSources).toEqual(["webhook"]);
+    expect(DEFAULT_WEBHOOK_HOT_DEFER_MS).toBe(20 * 60_000);
+  });
+
+  it("still starts a scheduled run while the host is hot", async () => {
+    const h = harness();
+    const logs: string[] = [];
+    h.options.log = (line) => logs.push(line);
+    h.options.hostHot = () => "Host is busy (load 40 per core, swap 99%)";
+    const lateAt = new Date(2026, 7, 17, 7, 55, 0).getTime();
+    h.manager.create({
+      name: "Late check",
+      prompt: "Do the late thing",
+      botId: "maus-7",
+      schedule: { type: "once", at: lateAt },
+    });
+    await h.manager.tick();
+    expect(h.started).toHaveLength(1);
+    expect(h.triggerSources).toEqual(["schedule"]);
+    expect(h.manager.listRuns()[0]?.holdReason).toBeUndefined();
+    expect(logs).toEqual([]);
+  });
+
+  it("does not cancel an in-flight webhook when the host turns hot", async () => {
+    const h = harness();
+    let hot = false;
+    h.options.hostHot = () => (hot ? "Host is busy (load 4 per core, swap 90%)" : null);
+    h.manager.enqueueWebhook({
+      webhookId: "compile-gates",
+      webhookName: "Compile gates",
+      prompt: "classify this",
+      botId: "maus-1",
+      runOn: "bot",
+      deliveryId: "wh-1",
+      receivedAt: 1,
+    });
+    await h.manager.tick();
+    expect(h.manager.listRuns()[0]?.status).toBe("running");
+    hot = true;
+    h.setBot("busy");
+    await h.manager.tick();
+    expect(h.manager.listRuns()[0]?.status).toBe("running");
+    expect(h.started).toHaveLength(1);
+  });
+
   it("enriches legacy client schedules with the host zone without rewriting their stored semantics", () => {
     const h = harness(Date.parse("2026-09-14T12:00:00.000Z"));
     h.options.timeZone = () => "Europe/Athens";
@@ -833,6 +1145,117 @@ describe("RoutineManager", () => {
     expect(h.runOns).toEqual(["cloud"]);
     expect(h.triggerSources).toEqual(["webhook"]);
     expect(h.taskActivations).toEqual([true]);
+  });
+
+  it("dispatches one-shot webhooks on a fresh thread and posts back to the owner", async () => {
+    const h = harness();
+    h.options.conversationMode = () => "projects";
+    h.options.oneShotWakeForRun = () => true;
+    h.manager.enqueueWebhook({
+      webhookId: "hook-1",
+      webhookName: "Designer classify",
+      prompt: "Classify this UI pass",
+      botId: "maus-webhook",
+      runOn: "bot",
+      deliveryId: "d-one-shot",
+      receivedAt: new Date(2026, 7, 17, 8, 2).getTime(),
+    });
+    await h.manager.tick();
+    expect(h.started).toHaveLength(1);
+    expect(h.started[0].threadId).toBe("thread-2");
+    expect(h.ephemeralFlags).toEqual([true]);
+    const run = h.manager.listRuns().find((candidate) => candidate.deliveryId === "d-one-shot");
+    expect(run?.ownerThreadId).toBe("thread-1");
+    h.manager.handleRuntimeEvent(turnCompletedFixture("thread-2"));
+    expect(h.deliveredEphemeral).toEqual([
+      expect.objectContaining({
+        ownerThreadId: "thread-1",
+        ephemeralThreadId: "thread-2",
+        ok: true,
+      }),
+    ]);
+  });
+
+  it("posts a one-shot failure to the owner when dispatch fails", async () => {
+    const h = harness();
+    h.options.conversationMode = () => "projects";
+    h.options.oneShotWakeForRun = () => true;
+    h.options.startTurn = async () => {
+      throw new Error("engine offline");
+    };
+    h.manager.enqueueWebhook({
+      webhookId: "hook-1",
+      webhookName: "Designer classify",
+      prompt: "Classify",
+      botId: "maus-webhook",
+      runOn: "bot",
+      deliveryId: "d-dispatch-fail",
+      receivedAt: new Date(2026, 7, 17, 8, 2).getTime(),
+    });
+    await h.manager.tick();
+    expect(h.deliveredEphemeral).toEqual([
+      expect.objectContaining({
+        ownerThreadId: "thread-1",
+        ok: false,
+        error: expect.stringContaining("engine offline"),
+      }),
+    ]);
+  });
+
+  it("reuses the keyed one-shot workspace across deliveries", async () => {
+    const h = harness();
+    h.options.conversationMode = () => "projects";
+    h.options.oneShotWakeForRun = () => true;
+    for (const deliveryId of ["d1", "d2"]) {
+      h.manager.enqueueWebhook({
+        webhookId: "hook-1",
+        webhookName: "Designer classify",
+        prompt: `Wake ${deliveryId}`,
+        botId: "maus-webhook",
+        runOn: "bot",
+        deliveryId,
+        receivedAt: new Date(2026, 7, 17, 8, 2).getTime(),
+      });
+      await h.manager.tick();
+      h.manager.handleRuntimeEvent(turnCompletedFixture(h.started.at(-1)!.threadId));
+    }
+    expect(h.started.map((row) => row.threadId)).toEqual(["thread-2", "thread-2"]);
+    expect(h.taskActivations.filter(Boolean)).toHaveLength(1);
+  });
+
+  it("classifies a UI-pass webhook as one-shot and leaves a payload mention on another webhook alone", async () => {
+    const h = harness();
+    h.options.conversationMode = () => "projects";
+    h.options.oneShotWakeForRun = (run) => wantsEphemeralDispatch({
+      triggerSource: run.triggerSource,
+      name: run.routineName,
+      id: run.webhookId,
+    });
+    h.manager.enqueueWebhook({
+      webhookId: "ui-pass",
+      webhookName: "GitHub UI Pass",
+      prompt: "Review PR #4",
+      botId: "maus-webhook",
+      runOn: "bot",
+      deliveryId: "ui-1",
+      receivedAt: new Date(2026, 7, 17, 8, 2).getTime(),
+    });
+    await h.manager.tick();
+    h.manager.handleRuntimeEvent(turnCompletedFixture(h.started.at(-1)!.threadId));
+
+    h.manager.enqueueWebhook({
+      webhookId: "compile-gates",
+      webhookName: "Compile gates",
+      prompt: "check failed on a commit titled UI pass",
+      botId: "maus-webhook",
+      runOn: "bot",
+      deliveryId: "cg-1",
+      receivedAt: new Date(2026, 7, 17, 8, 3).getTime(),
+    });
+    await h.manager.tick();
+
+    expect(h.ephemeralFlags).toEqual([true, false]);
+    expect(h.started[0]?.threadId).not.toBe(h.started[1]?.threadId);
   });
 
   it("keeps every delivery of ONE webhook on that webhook's own thread", async () => {
@@ -1511,19 +1934,70 @@ describe("RoutineManager", () => {
         botId: "compiler-bot",
         schedule: { type: "daily", time: "09:00", weekdays: [0, 1, 2, 3, 4, 5, 6] },
       });
+      const nextBefore = routine.nextRunAt!;
       h.manager.snoozeBot("compiler-bot");
       expect(h.manager.isBotSnoozed("compiler-bot")).toBe(true);
 
-      h.setNow(routine.nextRunAt! + 1000);
+      h.setNow(nextBefore + 1000);
       await h.manager.tick();
       expect(h.started).toHaveLength(0);
-      expect(h.manager.listRuns()).toHaveLength(0);
+      expect(h.manager.listRuns()).toHaveLength(1);
+      expect(h.manager.listRuns()[0]).toMatchObject({
+        status: "missed",
+        outcomeCode: "bot_stopped",
+        error: "Automations paused because this bot is stopped",
+        scheduledFor: nextBefore,
+      });
+      expect(h.manager.listRoutines()[0]!.nextRunAt).toBeGreaterThan(nextBefore);
 
       h.manager.clearBotSnooze("compiler-bot");
       expect(h.manager.isBotSnoozed("compiler-bot")).toBe(false);
+      const nextAfterSkip = h.manager.listRoutines()[0]!.nextRunAt!;
+      h.setNow(nextAfterSkip + 1000);
       await h.manager.tick();
       expect(h.started).toHaveLength(1);
-      expect(h.manager.listRuns()[0]).toMatchObject({ status: "running", botId: "compiler-bot" });
+      expect(h.manager.listRuns().filter((r) => r.status === "running")).toHaveLength(1);
+    });
+
+    it("records a stopped-bot receipt (not offline) when a snoozed schedule is far past due", async () => {
+      const h = harness();
+      const routine = h.manager.create({
+        name: "Compiler check",
+        prompt: "Check compiler status",
+        botId: "compiler-bot",
+        schedule: { type: "daily", time: "09:00", weekdays: [0, 1, 2, 3, 4, 5, 6] },
+      });
+      h.manager.snoozeBot("compiler-bot");
+      h.setNow(routine.nextRunAt! + 13 * 60 * 60_000);
+      await h.manager.tick();
+      expect(h.manager.listRuns()[0]).toMatchObject({
+        status: "missed",
+        outcomeCode: "bot_stopped",
+        error: "Automations paused because this bot is stopped",
+      });
+      expect(h.manager.listRuns()[0]?.error).not.toMatch(/offline/i);
+      expect(h.started).toHaveLength(0);
+    });
+
+    it("opens and closes the Sentry check-in non-ok when a scheduled run is skipped because the bot is stopped (BF-2476)", async () => {
+      const h = harness();
+      const routine = h.manager.create({
+        name: "Housekeeper sweep",
+        prompt: "check disk",
+        botId: "compiler-bot",
+        schedule: { type: "daily", time: "09:00", weekdays: [1] },
+      });
+      h.manager.snoozeBot("compiler-bot");
+      h.setNow(routine.nextRunAt!);
+      await h.manager.tick();
+      // A stopped bot is a deliberate pause, never a success: the check-in
+      // opens and closes non-ok (BF-2476).  Emitting nothing would let Sentry
+      // synthesize a `missed` check-in at the deadline with no context.
+      expect(h.checkInStarts).toHaveLength(1);
+      expect(h.checkInFinishes).toHaveLength(1);
+      expect(h.checkInFinishes[0]).toMatchObject({ ok: false });
+      expect(h.started).toHaveLength(0);
+      expect(h.manager.listRuns()[0]).toMatchObject({ outcomeCode: "bot_stopped" });
     });
 
     it("cancels all queued, running, and waiting runs for a bot", async () => {
@@ -1581,6 +2055,10 @@ describe("RoutineManager", () => {
       });
       expect(webhookRun.status).toBe("cancelled");
       expect(webhookRun.outcomeCode).toBe("cancelled");
+      // BF-2462: never persisted — no run row, no prompt copy.
+      expect(webhookRun.prompt).toBe("");
+      expect(h.manager.listRuns()).toHaveLength(0);
+      expect(h.manager.skippedDeliveryCount()).toBe(1);
 
       const resourceRun = h.manager.enqueueResource({
         triggerId: "res-1",
@@ -1592,6 +2070,29 @@ describe("RoutineManager", () => {
         receivedAt: Date.now(),
       });
       expect(resourceRun.status).toBe("cancelled");
+      expect(h.manager.listRuns()).toHaveLength(0);
+      expect(h.manager.skippedDeliveryCount()).toBe(2);
+      h.manager.flushNow();
+      expect(readFileSync(h.options.file!, "utf8")).not.toContain("Run while snoozed");
+    });
+
+    it("does not persist or rewrite routines.json for repeated snoozed webhooks (BF-2462)", () => {
+      const h = harness();
+      h.manager.snoozeBot("compiler-bot");
+      h.manager.flushNow();
+      const before = readFileSync(h.options.file!, "utf8");
+      for (let i = 0; i < 5; i++) {
+        h.manager.enqueueWebhook({
+          webhookId: "wh-1", webhookName: "Hook 1", prompt: `secret-prompt-${i}`,
+          botId: "compiler-bot", runOn: "bot", deliveryId: `d-${i}`, receivedAt: Date.now(),
+        });
+      }
+      expect(h.manager.listRuns()).toHaveLength(0);
+      expect(h.manager.skippedDeliveryCount("wh-1", "webhook")).toBe(5);
+      h.manager.flushNow();
+      const after = readFileSync(h.options.file!, "utf8");
+      expect(after).toBe(before);
+      expect(after).not.toContain("secret-prompt");
     });
 
     it("requeues cancelled runs and clears snooze on runNow", async () => {
@@ -1615,6 +2116,34 @@ describe("RoutineManager", () => {
       const requeued = h.manager.requeueRun(run!.id);
       expect(requeued).toBe(true);
       expect(h.manager.listRuns()[0]?.status).toBe("queued");
+    });
+
+    it("never requeues a run that is already running again", async () => {
+      // An update's rollback requeues the runs its forced quiesce cancelled.
+      // A run something else already restarted (a release that resumed it
+      // first) is running, and queueing it again would run it twice.
+      const h = harness();
+      h.manager.enqueueWebhook({
+        webhookId: "compile-gates",
+        webhookName: "Compile gates",
+        prompt: "classify this",
+        botId: "maus-1",
+        runOn: "bot",
+        deliveryId: "wh-requeue",
+        receivedAt: 1,
+      });
+      await h.manager.tick();
+      const run = h.manager.listRuns()[0]!;
+      expect(run.status).toBe("running");
+      expect(h.manager.requeueRun(run.id)).toBe(false);
+      expect(h.manager.listRuns()[0]?.status).toBe("running");
+      expect(h.started).toHaveLength(1);
+
+      await h.manager.cancelRun(run.id);
+      expect(h.manager.requeueRun(run.id)).toBe(true);
+      expect(h.manager.listRuns()[0]?.status).toBe("queued");
+      // Queued is not cancelled either: a second requeue is a no-op.
+      expect(h.manager.requeueRun(run.id)).toBe(false);
     });
 
     it("persists bot snoozes across manager restarts", () => {
@@ -1749,6 +2278,122 @@ describe("Sentry Crons check-ins", () => {
     expect(reloaded.listRuns()[0]).toMatchObject({ status: "failed", outcomeCode: "runtime_restart" });
     expect(h.checkInFinishes).toHaveLength(1);
     expect(h.checkInFinishes[0]).toMatchObject({ checkInId: "check-in-1", ok: false });
+  });
+
+  it("preserves interrupted scheduler evidence and check-ins in a passive placement bridge", async () => {
+    const h = harness();
+    const routine = h.manager.create({ name: "Held bridge", prompt: "never rerun", botId: "maus-1", schedule: { type: "daily", time: "09:00", weekdays: [1] } });
+    h.setNow(routine.nextRunAt!);
+    await h.manager.tick(); h.manager.flushNow(); h.manager.stop();
+    const before = readFileSync(h.options.file!);
+    const started = h.started.length;
+    const options = { ...h.options, passive: true };
+    const bridge = new RoutineManager(options);
+    options.passive = false;
+    bridge.start(); await bridge.tick(); bridge.stop();
+    expect(bridge.listRuns()[0]).toMatchObject({ status: "running", sentryCheckInId: "check-in-1" });
+    expect(h.started).toHaveLength(started);
+    expect(h.checkInFinishes).toHaveLength(0);
+    expect(readFileSync(h.options.file!)).toEqual(before);
+  });
+
+  it("persists pendingClose until Sentry delivery confirmation, then deletes it", async () => {
+    const h = harness();
+    const routine = h.manager.create({
+      name: "Pending close test",
+      prompt: "do work",
+      botId: "maus-1",
+      schedule: { type: "daily", time: "09:00", weekdays: [1] },
+    });
+    h.setNow(routine.nextRunAt!);
+    await h.manager.tick();
+    const run = h.manager.listRuns()[0]!;
+
+    const base = { eventId: "e", provider: "claude" as const, threadId: run.threadId!, createdAt: new Date().toISOString() };
+    h.manager.handleRuntimeEvent({ ...base, type: "turn.completed", ok: true, stopReason: "end_turn" });
+
+    // pendingClose is set on the completed run immediately
+    const completedRun = h.manager.listRuns()[0]!;
+    expect(completedRun.pendingClose).toEqual({
+      status: "ok",
+      attempts: 0,
+      checkInId: "check-in-1",
+    });
+
+    // When delivery is confirmed, pendingClose is deleted
+    expect(h.checkInFinishes).toHaveLength(1);
+    h.checkInFinishes[0].onSettled?.(true);
+
+    const deliveredRun = h.manager.listRuns()[0]!;
+    expect(deliveredRun.pendingClose).toBeUndefined();
+  });
+
+  it("increments pendingClose attempt count when delivery fails", async () => {
+    const h = harness();
+    const routine = h.manager.create({
+      name: "Pending close retry test",
+      prompt: "do work",
+      botId: "maus-1",
+      schedule: { type: "daily", time: "09:00", weekdays: [1] },
+    });
+    h.setNow(routine.nextRunAt!);
+    await h.manager.tick();
+    const run = h.manager.listRuns()[0]!;
+
+    const base = { eventId: "e", provider: "claude" as const, threadId: run.threadId!, createdAt: new Date().toISOString() };
+    h.manager.handleRuntimeEvent({ ...base, type: "turn.completed", ok: true, stopReason: "end_turn" });
+
+    expect(h.checkInFinishes).toHaveLength(1);
+    // Notify failure
+    h.checkInFinishes[0].onSettled?.(false);
+
+    const failedRun = h.manager.listRuns()[0]!;
+    expect(failedRun.pendingClose).toEqual({
+      status: "ok",
+      attempts: 1,
+      checkInId: "check-in-1",
+    });
+  });
+
+  it("reconciles unclosed check-ins on manager restart", async () => {
+    const h = harness();
+    const routine = h.manager.create({
+      name: "Reconcile test",
+      prompt: "do work",
+      botId: "maus-1",
+      schedule: { type: "daily", time: "09:00", weekdays: [1] },
+    });
+    h.setNow(routine.nextRunAt!);
+    await h.manager.tick();
+    const run = h.manager.listRuns()[0]!;
+
+    const base = { eventId: "e", provider: "claude" as const, threadId: run.threadId!, createdAt: new Date().toISOString() };
+    h.manager.handleRuntimeEvent({ ...base, type: "turn.completed", ok: true, stopReason: "end_turn" });
+
+    // Flush to disk with pendingClose still set (simulating a crash/restart before delivery settled)
+    h.manager.flushNow();
+    expect(h.checkInFinishes).toHaveLength(1);
+
+    // Boot a new RoutineManager from the same disk state
+    const reloadedFinishes: Array<{ run: any; checkInId: string; ok: boolean; onSettled?: (delivered: boolean) => void }> = [];
+    const reloadedOptions = {
+      ...h.options,
+      checkInFinish: (r: any, checkInId: string, ok: boolean, onSettled?: (d: boolean) => void) => {
+        reloadedFinishes.push({ run: { ...r }, checkInId, ok, onSettled });
+      },
+    };
+    const reloaded = new RoutineManager(reloadedOptions);
+
+    // Reconciled the completed run's pendingClose on boot!
+    expect(reloadedFinishes).toHaveLength(1);
+    expect(reloadedFinishes[0]).toMatchObject({
+      checkInId: "check-in-1",
+      ok: true,
+    });
+
+    // Settle delivery on the reloaded manager
+    reloadedFinishes[0].onSettled?.(true);
+    expect(reloaded.listRuns()[0]!.pendingClose).toBeUndefined();
   });
 
   it("never opens a check-in for a webhook, resource, or manual dispatch", async () => {
@@ -2038,5 +2683,608 @@ describe("acknowledge one trigger without touching another", () => {
     h.emitted.length = 0;
     expect(h.manager.markAllSeen({ triggerId: "hook-a" }).acknowledged).toBe(0);
     expect(h.emitted).toHaveLength(0);
+  });
+});
+
+describe("a held run explains itself", () => {
+  /** A routine that is due, with canStart refusing and a reason to give.
+   *  Accepts either a fixed string or the real three-argument signature, so a
+   *  test can assert on the thread and destination it was handed. */
+  async function held(
+    reason?: string | RoutineManagerOptions["dispatchHoldReason"],
+  ) {
+    const h = harness();
+    h.setCanStart(false);
+    h.options.dispatchHoldReason = typeof reason === "function" ? reason : () => reason;
+    const routine = h.manager.create({
+      name: "Compile gates",
+      prompt: "Run the gate",
+      botId: "maus-1",
+      schedule: { type: "once", at: new Date(2026, 7, 17, 8, 5).getTime() },
+    });
+    h.setNow(routine.nextRunAt!);
+    await h.manager.tick();
+    return h;
+  }
+
+  it("records WHY a run is queued instead of sitting there looking stuck", async () => {
+    // The failure this fixes, end to end. A dead engine made canStart return
+    // false, the scheduler did `continue`, and the run sat QUEUED with nothing
+    // to read: the receipt said "queued", nothing said the engine was dead, and
+    // the only symptom was automation that had stopped.
+    const h = await held("DeepSeek Harness could not start 3 times in a row");
+    const [run] = h.manager.listRuns();
+    expect(run.status).toBe("queued");
+    expect(run.holdReason).toBe("DeepSeek Harness could not start 3 times in a row");
+    expect(h.started).toHaveLength(0);
+    expect(h.failed).toHaveLength(0);
+  });
+
+  it("emits and persists the reason, so a client can read it", async () => {
+    // A reason set in memory only is not a reason: on restart it is gone, and
+    // the receipt a person opens never saw it.
+    const h = await held("Grok is waiting on a credential");
+    expect(h.emitted.some((event) => (event as { run?: { holdReason?: string } }).run?.holdReason))
+      .toBe(true);
+    h.manager.flushNow();
+    expect(new RoutineManager(h.options).listRuns()[0].holdReason).toBe("Grok is waiting on a credential");
+  });
+
+  it("passes the run's own destination, so a cloud run is judged as cloud", async () => {
+    // The P1 this replaced. botState has no runOn, so evaluating the hold there
+    // hardcoded "bot" and put the local spend ceiling in front of CLOUD runs.
+    const seen: string[] = [];
+    const h = await held((_botId: string, _threadId: string | undefined, runOn: RoutineRunOn) => {
+      seen.push(runOn);
+      return `held for ${runOn}`;
+    });
+    expect(seen).toContain("bot");
+    expect(h.manager.listRuns()[0].holdReason).toBe("held for bot");
+  });
+
+  it("keeps the reason current as the cause changes", async () => {
+    // A stale reason is worse than none: it names an engine that is fine now
+    // and sends the reader to reinstall a working CLI.
+    const h = harness();
+    const reasons = ["dsh-agent could not start 3 times in a row", "Grok is waiting on a credential"];
+    let call = 0;
+    h.setCanStart(false);
+    h.options.dispatchHoldReason = () => reasons[Math.min(call++, reasons.length - 1)];
+    const routine = h.manager.create({
+      name: "Compile gates",
+      prompt: "Run the gate",
+      botId: "maus-1",
+      schedule: { type: "once", at: new Date(2026, 7, 17, 8, 5).getTime() },
+    });
+    h.setNow(routine.nextRunAt!);
+    await h.manager.tick();
+    expect(h.manager.listRuns()[0].holdReason).toBe(reasons[0]);
+    h.setNow(routine.nextRunAt! + 1_000);
+    await h.manager.tick();
+    expect(h.manager.listRuns()[0].holdReason).toBe(reasons[1]);
+  });
+
+  it("falls back to a plain statement when no reason is available", async () => {
+    // A reason is better than silence, but it is not required to be present:
+    // the option is optional, so the run must still read sensibly without it.
+    const h = await held(undefined);
+    const [run] = h.manager.listRuns();
+    expect(run.status).toBe("queued");
+    expect(run.holdReason).toMatch(/engine is not available/i);
+  });
+
+  it("clears the reason once the run finally dispatches", async () => {
+    // Otherwise the first successful run carries the previous failure's
+    // explanation forever.
+    const h = await held("dsh-agent could not start");
+    expect(h.manager.listRuns()[0].holdReason).toBeTruthy();
+    h.setCanStart(true);
+    h.setNow(h.manager.listRuns()[0].scheduledFor + 1_000);
+    await h.manager.tick();
+    const [run] = h.manager.listRuns();
+    expect(run.status).toBe("running");
+    expect(run.holdReason).toBeUndefined();
+  });
+});
+
+describe("a sustained hold does not churn the state file", () => {
+  it("saves and emits once, then stays quiet while the reason is unchanged", async () => {
+    // The scheduler ticks every ten seconds. Persisting and emitting on every
+    // tick wrote the whole state file and pushed duplicate SSE and replay
+    // frames indefinitely — 8,640 no-op writes a day for one sustained hold,
+    // scaling with queue depth.
+    const h = harness();
+    h.setCanStart(false);
+    h.options.dispatchHoldReason = () => "DeepSeek Harness could not start 3 times in a row";
+    const routine = h.manager.create({
+      name: "Compile gates",
+      prompt: "Run the gate",
+      botId: "maus-1",
+      schedule: { type: "once", at: new Date(2026, 7, 17, 8, 5).getTime() },
+    });
+    h.setNow(routine.nextRunAt!);
+    await h.manager.tick();
+    const afterFirst = h.emitted.length;
+    expect(h.manager.listRuns()[0].holdReason).toContain("DeepSeek Harness");
+
+    for (let i = 1; i <= 5; i++) {
+      h.setNow(routine.nextRunAt! + i * 10_000);
+      await h.manager.tick();
+    }
+    expect(h.emitted.length).toBe(afterFirst);
+    // The reason is still there — quiet, not forgotten.
+    expect(h.manager.listRuns()[0].holdReason).toContain("DeepSeek Harness");
+  });
+
+  it("emits again when the cause changes, because a stale reason misleads", async () => {
+    const h = harness();
+    const reasons = ["dsh-agent could not start", "Grok is waiting on a credential"];
+    let call = 0;
+    h.setCanStart(false);
+    h.options.dispatchHoldReason = () => reasons[Math.min(call++, reasons.length - 1)];
+    const routine = h.manager.create({
+      name: "Compile gates",
+      prompt: "Run the gate",
+      botId: "maus-1",
+      schedule: { type: "once", at: new Date(2026, 7, 17, 8, 5).getTime() },
+    });
+    h.setNow(routine.nextRunAt!);
+    await h.manager.tick();
+    const afterFirst = h.emitted.length;
+    h.setNow(routine.nextRunAt! + 10_000);
+    await h.manager.tick();
+    expect(h.emitted.length).toBeGreaterThan(afterFirst);
+    expect(h.manager.listRuns()[0].holdReason).toBe(reasons[1]);
+  });
+
+  it("clears the hold from a coalesced child so its receipt cannot claim to be held", async () => {
+    // The child runs on the owner's turn, and copyCombinedOutcome does not
+    // overwrite holdReason — so without this it ended up "completed" while
+    // still carrying a hold reason.
+    const h = harness();
+    h.setCanStart(false);
+    h.options.dispatchHoldReason = () => "held for now";
+    for (let i = 0; i < 2; i++) {
+      h.manager.enqueueWebhook({
+        webhookId: "combined-fixture",
+        webhookName: "Combined fixture",
+        prompt: `Delivery ${i}`,
+        botId: "maus-1",
+        runOn: "bot",
+        deliveryId: `delivery-${i}`,
+        receivedAt: 1000 + i,
+      });
+    }
+    h.setNow(Date.now());
+    await h.manager.tick();
+    expect(h.manager.listRuns().every((run) => run.holdReason === "held for now")).toBe(true);
+
+    h.setCanStart(true);
+    h.setNow(Date.now() + 10_000);
+    await h.manager.tick();
+    const runs = h.manager.listRuns();
+    const owner = runs.find((run) => !run.coalescedInto)!;
+    expect(runs.filter((run) => run.coalescedInto === owner.id)).toHaveLength(1);
+    expect(runs.every((run) => run.holdReason === undefined)).toBe(true);
+  });
+});
+
+describe("a terminal run stops claiming to be held", () => {
+  it("clears the reason when a held run is cancelled", async () => {
+    // A receipt reading "cancelled" AND "waiting because its engine is dead" at
+    // the same time is worse than no reason at all: nothing in it tells the
+    // reader which half is stale.
+    const h = harness();
+    h.setCanStart(false);
+    h.options.dispatchHoldReason = () => "DeepSeek Harness could not start 3 times in a row";
+    const routine = h.manager.create({
+      name: "Compile gates",
+      prompt: "Run the gate",
+      botId: "maus-1",
+      schedule: { type: "once", at: new Date(2026, 7, 17, 8, 5).getTime() },
+    });
+    h.setNow(routine.nextRunAt!);
+    await h.manager.tick();
+    const queued = h.manager.listRuns()[0];
+    expect(queued.status).toBe("queued");
+    expect(queued.holdReason).toContain("DeepSeek Harness");
+
+    await h.manager.cancelRun(queued.id);
+    const [cancelled] = h.manager.listRuns();
+    expect(cancelled.status).toBe("cancelled");
+    expect(cancelled.holdReason).toBeUndefined();
+  });
+
+  it("clears the reason when the run is failed rather than dispatched", async () => {
+    // `failRun` is the other terminal exit a held run can take — a deleted bot,
+    // a vanished thread, a dispatch throw — and it has to clear the reason too.
+    const h = harness();
+    h.setCanStart(false);
+    h.options.dispatchHoldReason = () => "held for now";
+    const routine = h.manager.create({
+      name: "Compile gates",
+      prompt: "Run the gate",
+      botId: "maus-1",
+      schedule: { type: "once", at: new Date(2026, 7, 17, 8, 5).getTime() },
+    });
+    h.setNow(routine.nextRunAt!);
+    await h.manager.tick();
+    const queued = h.manager.listRuns()[0];
+    expect(queued.holdReason).toBe("held for now");
+
+    // A bot that vanishes takes the run to "missing" on the next tick.
+    h.setBot("missing");
+    h.setNow(routine.nextRunAt! + 10_000);
+    await h.manager.tick();
+    const [failed] = h.manager.listRuns();
+    expect(failed.status).toBe("failed");
+    expect(failed.holdReason).toBeUndefined();
+  });
+});
+
+// The bot's On/Off switch (shared/bot-power.ts).  Every trigger that fires
+// while the bot is Off is recorded as a skipped receipt and never dispatched,
+// and none of those receipts count as needing attention.
+describe("bot on/off switch", () => {
+  const webhook = (botId = "sentry-bot", deliveryId = "del-1"): Parameters<RoutineManager["enqueueWebhook"]>[0] => ({
+    webhookId: "wh-sentry",
+    webhookName: "Sentry",
+    prompt: "issue opened",
+    botId,
+    runOn: "bot",
+    deliveryId,
+    receivedAt: 1,
+  });
+  const daily: RoutineSchedule = { type: "daily", time: "09:00", weekdays: [0, 1, 2, 3, 4, 5, 6] };
+
+  it("records an incoming webhook as skipped, with the reason, and never queues it", async () => {
+    const h = harness();
+    h.setBot("off");
+    const run = h.manager.enqueueWebhook(webhook());
+    expect(run).toMatchObject({ status: "cancelled", outcomeCode: "bot_off", error: BOT_OFF_SKIPPED, failurePhase: "lifecycle" });
+    expect(run.finishedAt).toBeDefined();
+    await h.manager.tick();
+    expect(h.started).toHaveLength(0);
+    // Turning the bot back on does not resurrect it: skipped means skipped.
+    h.setBot("ready");
+    await h.manager.tick();
+    expect(h.started).toHaveLength(0);
+    // BF-2462: skipped webhook is not persisted as a run.
+    expect(h.manager.listRuns()).toHaveLength(0);
+    expect(h.manager.skippedDeliveryCount()).toBe(1);
+  });
+
+  it("skips a webhook even while the bot is busy, instead of folding it into a deferred backlog", () => {
+    const h = harness();
+    h.setBot("busy");
+    const first = h.manager.enqueueWebhook(webhook("sentry-bot", "busy-1"));
+    expect(first.status).toBe("queued");
+    h.setBot("off");
+    const second = h.manager.enqueueWebhook(webhook("sentry-bot", "off-1"));
+    expect(second.id).not.toBe(first.id);
+    expect(second).toMatchObject({ status: "cancelled", outcomeCode: "bot_off" });
+    // The earlier queued receipt was not rewritten by the second delivery.
+    expect(h.manager.listRuns().find((run) => run.id === first.id)?.deliveryId).toBe("busy-1");
+  });
+
+  it("records a resource trigger as skipped", () => {
+    const h = harness();
+    h.setBot("off");
+    const run = h.manager.enqueueResource({
+      triggerId: "res-1", triggerName: "Disk", prompt: "disk hot", botId: "housekeeper", runOn: "bot", deliveryId: "d", receivedAt: 1,
+    });
+    expect(run).toMatchObject({ status: "cancelled", outcomeCode: "bot_off", error: BOT_OFF_SKIPPED });
+  });
+
+  it("skips a scheduled run, advances the schedule, and closes the Sentry check-in non-ok (BF-2476)", async () => {
+    const h = harness();
+    const routine = h.manager.create({ name: "Morning sweep", prompt: "sweep", botId: "sweeper", schedule: daily });
+    const due = routine.nextRunAt!;
+    h.setBot("off");
+    h.setNow(due + 1000);
+    await h.manager.tick();
+    expect(h.started).toHaveLength(0);
+    expect(h.manager.listRuns()).toHaveLength(1);
+    expect(h.manager.listRuns()[0]).toMatchObject({
+      status: "cancelled", outcomeCode: "bot_off", error: BOT_OFF_SKIPPED, scheduledFor: due,
+    });
+    // Advanced, so turning the bot on resumes at the NEXT occurrence rather
+    // than replaying a backlog.
+    expect(h.manager.listRoutines()[0]!.nextRunAt).toBeGreaterThan(due);
+    // BF-2476: a bot that is off never ran, so the check-in opens and
+    // closes non-ok — never `ok`, and never missing (Sentry would
+    // synthesize `missed`).  The start payload carries the populated
+    // `bot_off` outcome so the pause reads as deliberate in Sentry.
+    expect(h.checkInStarts).toHaveLength(1);
+    expect(h.checkInStarts[0].run).toMatchObject({ outcomeCode: "bot_off" });
+    expect(h.checkInFinishes).toHaveLength(1);
+    expect(h.checkInFinishes[0]).toMatchObject({ ok: false });
+    expect(h.failed).toHaveLength(0);
+  });
+
+  it("reports an offline catch-up as an error check-in instead of leaving Sentry to invent missed", async () => {
+    const h = harness();
+    const routine = h.manager.create({
+      name: "Morning sweep",
+      prompt: "sweep",
+      botId: "sweeper",
+      schedule: { type: "daily", time: "09:00", weekdays: [0, 1, 2, 3, 4, 5, 6] },
+    });
+    h.setNow(routine.nextRunAt! + 12 * 60 * 60_000 + 1000);
+    await h.manager.tick();
+    expect(h.started).toHaveLength(0);
+    expect(h.manager.listRuns()[0]).toMatchObject({ outcomeCode: "missed_offline" });
+    expect(h.checkInStarts).toHaveLength(1);
+    expect(h.checkInStarts[0].run.sentryMonitorSlug).toBe(routine.sentryMonitorSlug);
+    expect(h.checkInFinishes[0]).toMatchObject({ ok: false });
+  });
+
+  it("keeps one monitor slug when a daily routine is renamed", async () => {
+    const h = harness();
+    const routine = h.manager.create({
+      name: "Mac Hetzner Health 21:00",
+      prompt: "check the host",
+      botId: "sweeper",
+      schedule: { type: "daily", time: "21:00", weekdays: [0, 1, 2, 3, 4, 5, 6] },
+    });
+    const slug = routine.sentryMonitorSlug;
+    expect(slug).toMatch(/^botfleet-[a-f0-9]+$/);
+    h.setNow(routine.nextRunAt! + 1000);
+    await h.manager.tick();
+    const renamed = h.manager.update(routine.id, { name: "Mac Coolify Health 21:00" });
+    expect(renamed?.sentryMonitorSlug).toBe(slug);
+    expect(h.checkInStarts[0].run.sentryMonitorSlug).toBe(slug);
+    expect(h.releasedMonitors).not.toContain(slug);
+    expect(h.manager.listRoutines()[0]).not.toHaveProperty("sentryMonitorSlug");
+  });
+
+  it("freezes the existing monitor slug and retires only the previous name", () => {
+    const h = harness();
+    const id = "79c6c49d-1111-2222-3333-444444444444";
+    writeFileSync(h.options.file!, JSON.stringify({
+      routines: [{
+        id,
+        name: "Mac Coolify Health 21:00",
+        prompt: "check the host",
+        botId: "sweeper",
+        runOn: "bot",
+        enabled: true,
+        schedule: { type: "daily", time: "21:00", weekdays: [0, 1, 2, 3, 4, 5, 6] },
+        durationMinutes: 30,
+        nextRunAt: 1,
+        createdAt: 1,
+        updatedAt: 1,
+      }],
+      runs: [{
+        id: "old-run",
+        routineId: id,
+        routineName: "Mac Hetzner Health 21:00",
+        botId: "sweeper",
+        runOn: "bot",
+        scheduledFor: 1,
+        status: "completed",
+        manual: false,
+        triggerSource: "schedule",
+        sentryCheckInId: "check-in-old",
+        createdAt: 1,
+      }],
+    }));
+    const released: string[] = [];
+    const restarted = new RoutineManager({
+      ...h.options,
+      releaseMonitor: (slug) => released.push(slug),
+    });
+    restarted.flushNow();
+    const disk = routinesOnDisk(h.options.file!);
+    expect(disk.routines[0]?.sentryMonitorSlug).toBe("botfleet-mac-coolify-health-21-00-79c6c49d");
+    expect(released).toEqual(["botfleet-mac-hetzner-health-21-00-79c6c49d"]);
+    expect(restarted.listRoutines()[0]).not.toHaveProperty("sentryMonitorSlug");
+  });
+
+  it("loads a routine and run with no usable name instead of failing the monitor slug migration", () => {
+    const h = harness();
+    const id = "79c6c49d-1111-2222-3333-444444444444";
+    writeFileSync(h.options.file!, JSON.stringify({
+      routines: [{
+        id,
+        name: null,
+        prompt: "check the host",
+        botId: "sweeper",
+        runOn: "bot",
+        enabled: false,
+        schedule: { type: "daily", time: "21:00", weekdays: [0, 1, 2, 3, 4, 5, 6] },
+        durationMinutes: 30,
+        nextRunAt: 1,
+        createdAt: 1,
+        updatedAt: 1,
+      }],
+      runs: [{
+        id: "old-run",
+        routineId: "gone-routine",
+        botId: "sweeper",
+        runOn: "bot",
+        scheduledFor: 1,
+        status: "completed",
+        manual: false,
+        triggerSource: "schedule",
+        sentryCheckInId: "check-in-old",
+        createdAt: 1,
+      }],
+    }));
+    const released: string[] = [];
+    const restarted = new RoutineManager({
+      ...h.options,
+      releaseMonitor: (slug) => released.push(slug),
+    });
+    restarted.flushNow();
+    expect(routinesOnDisk(h.options.file!).routines[0]?.sentryMonitorSlug).toBe("botfleet-routine-79c6c49d");
+    // The run has no routineName, so its legacy slug would be a guess no
+    // check-in ever opened; nothing is released for it.
+    expect(released).toEqual([]);
+  });
+
+  it("does not retire the placeholder botfleet-routine-0 for a run with no routineId", () => {
+    const h = harness();
+    writeFileSync(h.options.file!, JSON.stringify({
+      routines: [],
+      runs: [{
+        id: "orphan-run",
+        routineName: "Mac Hetzner Health 21:00",
+        botId: "sweeper",
+        runOn: "bot",
+        scheduledFor: 1,
+        status: "completed",
+        manual: false,
+        triggerSource: "schedule",
+        sentryCheckInId: "check-in-old",
+        createdAt: 1,
+      }],
+    }));
+    const released: string[] = [];
+    new RoutineManager({ ...h.options, releaseMonitor: (slug) => released.push(slug) }).flushNow();
+    expect(released).toEqual([]);
+  });
+
+  it("starts a run queued before the freeze on the routine's frozen slug, not the retired name slug", async () => {
+    const h = harness();
+    const id = "79c6c49d-1111-2222-3333-444444444444";
+    const now = h.options.now!();
+    writeFileSync(h.options.file!, JSON.stringify({
+      routines: [{
+        id,
+        name: "Mac Coolify Health 21:00",
+        prompt: "check the host",
+        botId: "sweeper",
+        runOn: "bot",
+        enabled: true,
+        schedule: { type: "daily", time: "21:00", weekdays: [0, 1, 2, 3, 4, 5, 6] },
+        durationMinutes: 30,
+        nextRunAt: now + 86_400_000,
+        createdAt: 1,
+        updatedAt: 1,
+      }],
+      runs: [{
+        id: "old-run",
+        routineId: id,
+        routineName: "Mac Hetzner Health 21:00",
+        botId: "sweeper",
+        runOn: "bot",
+        scheduledFor: 1,
+        status: "completed",
+        manual: false,
+        triggerSource: "schedule",
+        sentryCheckInId: "check-in-old",
+        createdAt: 1,
+      }, {
+        id: "queued-run",
+        routineId: id,
+        routineName: "Mac Hetzner Health 21:00",
+        prompt: "check the host",
+        durationMinutes: 30,
+        botId: "sweeper",
+        runOn: "bot",
+        scheduledFor: now,
+        status: "queued",
+        manual: false,
+        triggerSource: "schedule",
+        createdAt: now,
+      }],
+    }));
+    const released: string[] = [];
+    const restarted = new RoutineManager({ ...h.options, releaseMonitor: (slug) => released.push(slug) });
+    expect(released).toEqual(["botfleet-mac-hetzner-health-21-00-79c6c49d"]);
+    const queued = restarted.listRuns().find((run) => run.id === "queued-run");
+    expect(queued?.sentryMonitorSlug).toBe("botfleet-mac-coolify-health-21-00-79c6c49d");
+    restarted.flushNow();
+  });
+
+  it("retires a deleted daily monitor only after a schedule check-in was opened", async () => {
+    const h = harness();
+    const untouched = h.manager.create({
+      name: "Never ran",
+      prompt: "idle",
+      botId: "sweeper",
+      schedule: { type: "daily", time: "09:00", weekdays: [0, 1, 2, 3, 4, 5, 6] },
+    });
+    h.manager.remove(untouched.id);
+    expect(h.releasedMonitors).toEqual([]);
+    const routine = h.manager.create({
+      name: "Morning sweep",
+      prompt: "sweep",
+      botId: "sweeper",
+      schedule: { type: "daily", time: "09:00", weekdays: [0, 1, 2, 3, 4, 5, 6] },
+    });
+    h.setNow(routine.nextRunAt! + 1000);
+    await h.manager.tick();
+    expect(h.checkInStarts).toHaveLength(1);
+    h.manager.remove(routine.id);
+    expect(h.releasedMonitors).toEqual([routine.sentryMonitorSlug]);
+  });
+
+  it("is never recorded as missed or failed, so it cannot light the attention badge", async () => {
+    const h = harness();
+    h.setBot("off");
+    h.manager.enqueueWebhook(webhook());
+    const routine = h.manager.create({ name: "Sweep", prompt: "sweep", botId: "sweeper", schedule: daily });
+    h.setNow(routine.nextRunAt! + 1000);
+    await h.manager.tick();
+    // BF-2462: only the scheduled skipped run is persisted; the webhook is not.
+    expect(h.manager.listRuns().length).toBeGreaterThanOrEqual(1);
+    for (const run of h.manager.listRuns()) {
+      expect(ROUTINE_ATTENTION_STATUSES.some((status) => status === run.status)).toBe(false);
+    }
+  });
+
+  it("settles a receipt that was already queued when the bot went Off, on the next tick", async () => {
+    const h = harness();
+    h.setAdmitting(false);
+    const queued = h.manager.enqueueWebhook(webhook());
+    expect(queued.status).toBe("queued");
+    h.setAdmitting(true);
+    h.setBot("off");
+    await h.manager.tick();
+    expect(h.started).toHaveLength(0);
+    expect(h.manager.listRuns()[0]).toMatchObject({ status: "cancelled", outcomeCode: "bot_off", error: BOT_OFF_SKIPPED });
+  });
+
+  it("skipQueuedRunsForBot settles only that bot's queued receipts and leaves a running one alone", async () => {
+    const h = harness();
+    const running = h.manager.enqueueWebhook(webhook("sentry-bot", "run-1"));
+    await h.manager.tick();
+    expect(h.manager.listRuns().find((run) => run.id === running.id)?.status).toBe("running");
+    h.setAdmitting(false);
+    h.setBot("busy");
+    const queued = h.manager.enqueueWebhook({ ...webhook("sentry-bot", "q-1"), webhookId: "wh-other" });
+    const otherBot = h.manager.enqueueWebhook({ ...webhook("someone-else", "q-2"), webhookId: "wh-third" });
+    const skipped = h.manager.skipQueuedRunsForBot("sentry-bot");
+    expect(skipped.map((run) => run.id)).toEqual([queued.id]);
+    const byId = new Map(h.manager.listRuns().map((run) => [run.id, run]));
+    expect(byId.get(running.id)?.status).toBe("running");
+    expect(byId.get(queued.id)).toMatchObject({ status: "cancelled", outcomeCode: "bot_off", error: BOT_OFF_SKIPPED });
+    expect(byId.get(otherBot.id)?.status).toBe("queued");
+  });
+
+  it("refuses Run now: the run is recorded as skipped, nothing starts, and a stop is not cleared", async () => {
+    const h = harness();
+    const routine = h.manager.create({ name: "Build", prompt: "build", botId: "builder", schedule: daily });
+    h.manager.snoozeBot("builder");
+    h.setBot("off");
+    const run = h.manager.runNow(routine.id);
+    expect(run).toMatchObject({ status: "cancelled", outcomeCode: "bot_off", error: BOT_OFF_SKIPPED, manual: true });
+    await h.manager.tick();
+    expect(h.started).toHaveLength(0);
+    // Off outranks Run now, and it does not quietly lift the separate stop.
+    expect(h.manager.isBotSnoozed("builder")).toBe(true);
+  });
+
+  it("dispatches normally again once the bot is on", async () => {
+    const h = harness();
+    h.setBot("off");
+    h.manager.enqueueWebhook(webhook("sentry-bot", "while-off"));
+    h.setBot("ready");
+    const run = h.manager.enqueueWebhook(webhook("sentry-bot", "after-on"));
+    expect(run.status).toBe("queued");
+    await h.manager.tick();
+    expect(h.started).toHaveLength(1);
   });
 });

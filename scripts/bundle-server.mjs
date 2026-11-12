@@ -21,11 +21,32 @@ import { build } from "esbuild";
 import { copyFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { hashStaticUi, readSourceBuildIdentity } from "../electron/runtime-identity.mjs";
+import { controlBuildVersion } from "../electron/control-build-version.mjs";
+import { hashStaticUi } from "../electron/runtime-identity.mjs";
+import { readSourceBuildIdentity } from "./source-build-identity.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const server = join(root, "server");
-const buildIdentity = { ...readSourceBuildIdentity(root), uiHash: hashStaticUi(join(root, "dist")) };
+// A CI build passes its commit-count version here rather than editing
+// package.json.  The provenance gate requires a pristine checkout, so stamping
+// the source file would make every build report sourceDirty and fail the very
+// gate that proves it came from a committed tree.  Unset in local builds, where
+// package.json's own version is the truth.
+const buildVersion = process.env.BOTFLEET_BUILD_VERSION?.trim() || null;
+// On the release path the workflow pins BOTFLEET_BUILD_VERSION from the
+// shared stamp planner, so resolve the same {version, build} the Control
+// bundle carries and stamp the build into this identity (BF-2588).  That is
+// what lets the version handshake order two packaged servers instead of
+// reporting unknown order for every release.  A malformed pin is refused by
+// the shared helper, never stamped as an unordered release.  Unpinned local
+// bundles keep package.json's version and no build; a build-less manifest
+// stays valid, it simply carries no order.
+const stamp = buildVersion ? controlBuildVersion({ repoRoot: root }) : null;
+const buildIdentity = {
+  ...readSourceBuildIdentity(root, { requireGit: true, version: stamp?.version ?? null, build: stamp?.build ?? null }),
+  uiHash: hashStaticUi(join(root, "dist")),
+  desktopStartupProtocol: 1,
+};
 
 // yaml's Node export is CommonJS and contains dynamic requires that cannot run
 // after it is inlined into our ESM-only packaged server. Its browser export is
@@ -56,11 +77,15 @@ const ENTRY_POINTS = [
   // package smoke probe also imports local-computer.js directly.
   "proxy-paths.ts",
   "local-computer.ts",
+  "local-vm-offline-cli.ts",
   "computer-proxy.ts",
   "container-mcp.ts",
   "vps-container-mcp.ts",
   "permission-proxy.ts",
+  "mcp-gate.ts",
+  "mcp-remote-proxy.ts",
   "connector-proxy.ts",
+  "plugin-sandbox-child.ts",
   "drivers/agents-proxy.ts",
   "drivers/dweb-proxy.ts",
   "drivers/qdrant-proxy.ts",
@@ -109,4 +134,8 @@ const piMcpExtSrc = join(server, "drivers", "pi-mcp-extension.ts");
 const piMcpExtDest = join(root, "dist-server", "drivers", "pi-mcp-extension.ts");
 mkdirSync(dirname(piMcpExtDest), { recursive: true });
 copyFileSync(piMcpExtSrc, piMcpExtDest);
+const vmCliManifestSrc = join(root, "scripts", "computer-vm-cli", "manifest.json");
+const vmCliManifestDest = join(root, "dist-server", "computer-vm-cli", "manifest.json");
+mkdirSync(dirname(vmCliManifestDest), { recursive: true });
+copyFileSync(vmCliManifestSrc, vmCliManifestDest);
 writeFileSync(join(root, "dist-server", "build-identity.json"), `${JSON.stringify(buildIdentity)}\n`);

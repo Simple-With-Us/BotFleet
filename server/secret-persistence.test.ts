@@ -204,35 +204,35 @@ describe("the fingerprint baseline and the reload fence", () => {
   });
 
   it("fences Sync Now the way the two Settings routes are fenced", () => {
-    expect(INDEX_SOURCE).toMatch(
-      /path === "\/api\/infisical\/sync"[\s\S]{0,600}?if \(providerConfigBusy\) return json\(res, 409/,
-    );
+    const syncStart = INDEX_SOURCE.indexOf('if (method === "POST" && path === "/api/infisical/sync") {');
+    const testRoute = INDEX_SOURCE.indexOf("// Test Connection:", syncStart);
+    const syncRoute = syncStart < 0 ? "" : INDEX_SOURCE.slice(syncStart, testRoute < 0 ? undefined : testRoute);
+    expect(syncRoute).toContain("if (infisicalCredentialPending())");
+    expect(syncRoute).toMatch(/if \(providerConfigBusy\) return json\(res, 409/);
   });
 });
 
-// The runbook other agents and the owner follow.  The prose already described
-// a handoff file, shell variables and an `rm -P`'d temp file, but the command
-// shown had none of them: an operator following the code block literally put
-// the credential that reads the whole project into `argv` — visible in `ps`
-// to every process on the machine, and appended to `~/.zsh_history` forever.
-describe("the headless-identity runbook", () => {
+// The headless runbook describes the managed service-token route and the
+// explicit app-level auth choice without reviving a universal-auth handoff.
+describe("the headless service-token runbook", () => {
   const DOC = readFileSync(join(SERVER_DIR, "..", "docs", "secrets.md"), "utf8");
+  const start = DOC.indexOf("## BotFleet's Own Infisical Authentication");
+  const end = DOC.indexOf("\n## ", start + 4);
+  const block = start < 0 ? "" : DOC.slice(start, end < 0 ? undefined : end);
 
-  it("sends the request body from a file, never inline in argv", () => {
-    const identity = DOC.slice(DOC.indexOf("## A Headless Install's Own Identity"));
-    const block = identity.slice(0, identity.indexOf("## ", 4));
-    expect(block).toContain('--data-binary @"$BODY"');
-    // The literal shape of the old example: the identity JSON as a curl
-    // argument.  Nothing in this section may name a client secret inline.
-    expect(block).not.toMatch(/--data-binary\s+'/);
-    expect(block).not.toMatch(/"clientSecret"\s*:\s*"/);
+  it("documents the service-token bindings and forbids automatic machine-identity fallback", () => {
+    expect(block).toContain("`INFISICAL_TOKEN`");
+    expect(block).toContain("`INFISICAL_WRITE_TOKEN`");
+    expect(block).toContain("`BOTFLEET_HARNESS_INFISICAL_READ_TOKEN`");
+    expect(block).toContain("`BOTFLEET_HARNESS_INFISICAL_WRITE_TOKEN`");
+    expect(block).toMatch(/never\s+activates machine identity/);
+    expect(block).toContain("pending AFC-600");
+    expect(block).not.toMatch(/INFISICAL_AUTOMATION_|--client-secret|\bcurl\b/);
   });
 
-  it("keeps the temp file private and removes it", () => {
-    const identity = DOC.slice(DOC.indexOf("## A Headless Install's Own Identity"));
-    const block = identity.slice(0, identity.indexOf("## ", 4));
-    expect(block).toContain("umask 077");
-    expect(block).toContain('rm -P "$BODY"');
+  it("documents disabled staging around encrypted credential writes", () => {
+    expect(block).toMatch(/metadata with Infisical disabled[\s\S]*encrypted credential store[\s\S]*requested toggle/);
+    expect(block).toContain("the staged connection stays disabled");
   });
 });
 

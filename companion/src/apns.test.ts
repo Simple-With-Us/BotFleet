@@ -1,14 +1,23 @@
 import { generateKeyPairSync } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { constants as http2Constants, type ClientHttp2Session } from "node:http2";
-import { mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   alertIsBlocking,
   apnsJwt,
+  APNS_VAULT_CACHE_MS,
+  APNS_VAULT_RETRY_MS,
+  apnsKeySource,
+  apnsKeyStamp,
+  loadApnsConfig,
+  resetApnsKeyCache,
+  SHARED_APNS_KEY_ID,
+  APNS_VAULT_READ_BUDGET_MS,
+  APNS_VAULT_READ_TIMEOUT_MS,
   apnsPayload,
   classifyHttpResponse,
   classifyTransportError,
@@ -19,17 +28,27 @@ import {
   getOrOpenSession,
   inspectTransportError,
   isTransportFailure,
+  keyPreview,
+  liveActivityContent,
+  liveActivityPayload,
+  liveActivityTopic,
+  parseLiveActivitySource,
   providerToken,
   resetProviderTokens,
   retryAfterMs,
   sendApnsAlert,
+  sendApnsLiveActivity,
   startHttp2PingKeepalive,
   tokenIsDead,
   watchHarnessNotifications,
   APNS_CIRCUIT_WINDOW_MS,
   APNS_TRANSPORT_SUMMARY_MS,
   APNS_TRANSPORT_THRESHOLD,
+  APPLE_REFERENCE_DATE_OFFSET,
+  DEFAULT_LIVE_ACTIVITY_COLOR,
+  LIVE_ACTIVITY_ATTRIBUTES_TYPE,
   type ApnsConfig,
+  type ApnsSendOptions,
   type ApnsPayload,
   type Http2ApnsSession,
   type Http2SessionFactory,
@@ -37,6 +56,14 @@ import {
   type PersistedKeyFault,
   watchHttp2SessionLifecycle,
 } from "./apns.ts";
+
+// The default key source reads Infisical through the fleet CLI.  A test must
+// never reach the real vault, so the binary points at nothing unless a test
+// installs its own fake.
+beforeEach(() => {
+  process.env.FLEET_SECRETS_BIN = "/nonexistent/fleet-bin";
+  resetApnsKeyCache();
+});
 
 function testP8(): string {
   const { privateKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
@@ -72,7 +99,7 @@ function testConfig(overrides: Partial<ApnsConfig> = {}): ApnsConfig {
   return {
     keyId: "ABC123",
     teamId: "TEAMID1",
-    bundleId: "app.botfleet",
+    bundleId: "app.botfleet.ios",
     p8: testP8(),
     production: true,
     ...overrides,
@@ -300,7 +327,7 @@ describe("sendApnsAlert", () => {
     expect(result).toEqual({ ok: true, status: 200, attempts: 1, failureKind: "none" });
     expect(url).toBe(`https://api.push.apple.com/3/device/${token}`);
     expect(headers?.get("apns-push-type")).toBe("alert");
-    expect(headers?.get("apns-topic")).toBe("app.botfleet");
+    expect(headers?.get("apns-topic")).toBe("app.botfleet.ios");
     expect(body.aps?.alert).toEqual({ title: "Scout finished", body: "done" });
     expect(body.aps?.["content-available"]).toBe(1);
     expect(body.aps?.category).toBe("BOTFLEET_UPDATE");
@@ -368,7 +395,7 @@ describe("sendApnsAlert", () => {
 
   it("does not re-sign for InvalidProviderToken — the key itself is refused", async () => {
     // Expiry is worth a fresh signature.  An invalid token means Apple
-    // refuses the KEY — wrong team, revoked, a .p8 that does not match its
+    // refuses the KEY — wrong team, revoked, a key that does not match its
     // key id — and every new signature earns the identical rejection.
     const config = testConfig();
     const { waits, sleep } = recordingSleep();
@@ -874,7 +901,7 @@ describe("watchHarnessNotifications", () => {
     expect(health.configured).toBe(false);
   });
 
-  it("picks up a rotated key file and forgets the one it replaced", async () => {
+  it("picks up a rotated signing key and forgets the one it replaced", async () => {
     let stamp = "key-v1";
     let loads = 0;
     const watch = watchHarnessNotifications({
@@ -1045,7 +1072,7 @@ describe("watchHarnessNotifications", () => {
 
   it("notices a rotated key while the stream stays open", async () => {
     // The re-check used to ride on the reconnect, so a sidecar whose harness
-    // stays up for days never looked at the key file again.
+    // stays up for days never looked at the signing key again.
     let stamp = "key-v1";
     let loads = 0;
     const watch = watchHarnessNotifications({
@@ -1118,8 +1145,8 @@ describe("watchHarnessNotifications", () => {
     // A rotation can land while a request signed with the old key is still
     // in flight.  Reading that request's answer as a verdict on the new key
     // disables the new key, and keeps it disabled: the fault clears only for
-    // a key file that differs from the recorded stamp, and the file on disk
-    // is already the new one.
+    // a key that differs from the recorded stamp, and the key in hand is
+    // already the new one.
     const keyA = testConfig({ keyId: "KEYAAA" });
     const keyB = testConfig({ keyId: "KEYBBB" });
     let stamp = "key-a";
@@ -1249,8 +1276,8 @@ describe("watchHarnessNotifications", () => {
   });
 
   it("treats a key rewritten with the same bytes as the same key, not a rotation", async () => {
-    // A secrets sync or a backup restore rewrites the .p8 with identical
-    // contents: the file stamp changes and so does the config object, but
+    // A secrets sync or a backup restore rewrites the key with identical
+    // contents: the stamp changes and so does the config object, but
     // the KEY does not.  Comparing objects rather than keys read Apple's
     // verdict on the key still in use as a verdict on a key already
     // replaced, waved it through, and went on signing with a key Apple
@@ -1396,6 +1423,465 @@ describe("watchHarnessNotifications", () => {
     });
     expect(watch.health().configured).toBe(false);
     expect(watch.health().production).toBeNull();
+    watch.stop();
+  });
+
+  // Live Activity pushes: the island a phone wears, not the banner it hears.
+  // These pin the JSON contract against `BotActivityAttributes` in
+  // ios/Shared/BotActivity.swift — the widget decodes it, so a renamed key is
+  // an island that quietly stops updating.
+  it("starts a Live Activity with the attributes type, an alert, and a Date as a number", () => {
+    const since = Date.UTC(2026, 9, 11, 22, 0, 0);
+    const body = liveActivityPayload(
+      "start",
+      { botId: "b1", threadId: "t1", name: "Scout", color: "coral" },
+      {
+        face: "thinking",
+        kind: "needsYou",
+        headline: "Forge needs you",
+        line: "Run rm -rf ./build",
+        requestId: "req-7",
+        options: ["Allow", "Deny"],
+        isPermission: true,
+        since: (since - APPLE_REFERENCE_DATE_OFFSET * 1000) / 1000,
+      },
+      { title: "Forge needs you", body: "Run rm -rf ./build" },
+      { timestamp: 1_800_000_000 },
+    );
+    expect(body.aps["attributes-type"]).toBe(LIVE_ACTIVITY_ATTRIBUTES_TYPE);
+    expect(body.aps["attributes-type"]).toBe("BotActivityAttributes");
+    expect(body.aps.attributes).toEqual({ botId: "b1", threadId: "t1", name: "Scout", color: "coral" });
+    expect(body.aps.alert).toEqual({ title: "Forge needs you", body: "Run rm -rf ./build" });
+    expect(body.aps.event).toBe("start");
+    expect(body.aps.timestamp).toBe(1_800_000_000);
+    // A Swift `Date` decodes from seconds since the Apple reference date, so
+    // the number here is the Unix time MINUS 978307200 — never an ISO string.
+    expect(body.aps["content-state"].since).toBe(since / 1000 - APPLE_REFERENCE_DATE_OFFSET);
+    expect(Number.isFinite(body.aps["content-state"].since)).toBe(true);
+    expect(JSON.stringify(body)).not.toContain("T00:00");
+  });
+
+  it("gives a start an alert even when the caller has none to give", () => {
+    // Apple rejects a start with no alert, so the builder never emits one.
+    const body = liveActivityPayload(
+      "start",
+      { botId: "b1", threadId: "t1", name: "Scout", color: "coral" },
+      {
+        face: "thinking",
+        kind: "needsYou",
+        headline: "Forge needs you",
+        line: "Run rm -rf ./build",
+        options: [],
+        isPermission: false,
+        since: 800_000_000,
+      },
+      undefined,
+      { timestamp: 1 },
+    );
+    expect(body.aps.alert).toEqual({ title: "Forge needs you", body: "Run rm -rf ./build" });
+  });
+
+  it("sends attributes on the start alone, and leaves requestId out when there is none", () => {
+    const attributes = { botId: "b1", threadId: "t1", name: "Scout", color: "coral" };
+    const state = {
+      face: "thinking",
+      kind: "needsYou",
+      headline: "Forge needs you",
+      line: "Run rm -rf ./build",
+      options: ["Allow", "Deny"],
+      isPermission: true,
+      since: 800_000_000,
+    };
+    for (const event of ["update", "end"] as const) {
+      const body = liveActivityPayload(event, attributes, state, undefined, { timestamp: 2 });
+      expect(body.aps.event).toBe(event);
+      expect(body.aps.attributes).toBeUndefined();
+      expect(body.aps["attributes-type"]).toBeUndefined();
+      expect(body.aps.alert).toBeUndefined();
+      expect(body.aps.timestamp).toBe(2);
+      // requestId is `String?` in Swift; an absent optional decodes as nil,
+      // and a literal null is what a hand-written encoder would have sent.
+      expect("requestId" in body.aps["content-state"]).toBe(false);
+      expect(JSON.stringify(body)).not.toContain("null");
+    }
+    const dismissal = liveActivityPayload("end", attributes, state, undefined, { timestamp: 3, dismissalDate: 4 });
+    expect(dismissal.aps["dismissal-date"]).toBe(4);
+  });
+
+  it("addresses Live Activity pushes to the bundle's own channel", () => {
+    // Derived, not spelled out: a build that moves between sandbox and
+    // production moves both channels together.
+    expect(liveActivityTopic("app.botfleet.ios")).toBe("app.botfleet.ios.push-type.liveactivity");
+    expect(liveActivityTopic("app.botfleet.ios")).not.toBe("app.botfleet.ios");
+  });
+
+  it("posts a liveactivity push with its own topic, type and start priority", async () => {
+    const seen: { topic: string | null; pushType: string | null; priority: string | null; auth: string | null; body: string }[] = [];
+    // Typed by assignment, not asserted: the stand-in IS a fetch.
+    const fetchImpl: NonNullable<ApnsSendOptions["fetchImpl"]> = async (_input, init) => {
+      const headers = new Headers(init?.headers);
+      seen.push({
+        topic: headers.get("apns-topic"),
+        pushType: headers.get("apns-push-type"),
+        priority: headers.get("apns-priority"),
+        auth: headers.get("authorization"),
+        body: String(init?.body),
+      });
+      return new Response("", { status: 200 });
+    };
+    const result = await sendApnsLiveActivity(
+      testConfig(),
+      "ab".repeat(32),
+      {
+        event: "start",
+        attributes: { botId: "b1", threadId: "t1", name: "Scout", color: "coral" },
+        state: {
+          face: "thinking",
+          kind: "needsYou",
+          headline: "Scout needs you",
+          line: "done",
+          options: [],
+          isPermission: false,
+          since: 812_345_678.5,
+        },
+        timestamp: 1_800_000_000,
+      },
+      { fetchImpl },
+    );
+    expect(result.ok).toBe(true);
+    expect(seen).toHaveLength(1);
+    expect(seen[0].pushType).toBe("liveactivity");
+    expect(seen[0].topic).toBe("app.botfleet.ios.push-type.liveactivity");
+    // 10 is what creates the island; an update could not use it.
+    expect(seen[0].priority).toBe("10");
+    expect(seen[0].auth).toMatch(/^bearer /);
+    expect(JSON.parse(seen[0].body).aps["content-state"].since).toBe(812_345_678.5);
+  });
+
+  it("gives an update or an end the power-friendly priority", async () => {
+    const priorities: (string | null)[] = [];
+    const config = testConfig();
+    const fetchImpl: NonNullable<ApnsSendOptions["fetchImpl"]> = async (_input, init) => {
+      priorities.push(new Headers(init?.headers).get("apns-priority"));
+      return new Response("", { status: 200 });
+    };
+    const state = {
+      face: "thinking",
+      kind: "needsYou",
+      headline: "Scout needs you",
+      line: "done",
+      options: [],
+      isPermission: false,
+      since: 1,
+    };
+    const attributes = { botId: "b1", threadId: "t1", name: "Scout", color: "coral" };
+    await sendApnsLiveActivity(config, "ab".repeat(32), { event: "update", attributes, state }, { fetchImpl });
+    await sendApnsLiveActivity(config, "ab".repeat(32), { event: "end", attributes, state }, { fetchImpl });
+    expect(priorities).toEqual(["5", "5"]);
+  });
+
+  it("refuses a malformed Live Activity token before it reaches Apple", async () => {
+    let called = 0;
+    const fetchImpl: NonNullable<ApnsSendOptions["fetchImpl"]> = async () => {
+      called += 1;
+      return new Response("", { status: 200 });
+    };
+    const result = await sendApnsLiveActivity(
+      testConfig(),
+      "not-hex",
+      {
+        event: "start",
+        attributes: { botId: "b1", threadId: "t1", name: "Scout", color: "coral" },
+        state: { face: "idle", kind: "working", headline: "h", line: "l", options: [], isPermission: false, since: 1 },
+      },
+      { fetchImpl },
+    );
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe(400);
+    expect(result.reason).toBe("BadDeviceToken");
+    expect(called).toBe(0);
+  });
+
+  it("degrades a frame from an older harness instead of refusing it", () => {
+    // The harness that predates botName/color/options/isPermission sends none
+    // of them, and the island should still start rather than be skipped.
+    const content = liveActivityContent(
+      { kind: "approval", title: "Forge needs you", body: "Run rm -rf ./build", threadId: "t1", botId: "b1", requestId: "req-7" },
+      Date.UTC(2026, 9, 11, 22, 0, 0),
+    );
+    expect(content.attributes.name).toBe("Forge needs you");
+    expect(content.attributes.color).toBe(DEFAULT_LIVE_ACTIVITY_COLOR);
+    expect(content.state.kind).toBe("needsYou");
+    expect(content.state.face).toBe("thinking");
+    expect(content.state.isPermission).toBe(true);
+    // A permission card offers the verdict; a question wants an answer typed.
+    expect(content.state.options).toEqual(["Allow", "Deny"]);
+    expect(content.state.requestId).toBe("req-7");
+    expect(content.state.since).toBe(Date.UTC(2026, 9, 11, 22, 0, 0) / 1000 - APPLE_REFERENCE_DATE_OFFSET);
+
+    const question = liveActivityContent({ kind: "question", title: "Forge asks", body: "Which branch?" }, 0);
+    expect(question.state.isPermission).toBe(false);
+    expect(question.state.options).toEqual([]);
+    expect(question.state.requestId).toBeUndefined();
+
+    // No fields at all still builds: the widget degrades one field at a time.
+    const bare = liveActivityContent({}, 0);
+    expect(bare.attributes).toEqual({ botId: "", threadId: "", name: "BotFleet", color: "gray" });
+    expect(bare.state.headline).toBe("BotFleet is working");
+    expect(bare.state.kind).toBe("working");
+  });
+
+  it("refuses a frame whose fields are the wrong shape, rather than coercing them", () => {
+    // An absent field falls back; a field of the wrong TYPE never reaches the
+    // widget at all, because the widget decodes it strictly.
+    expect(parseLiveActivitySource({ kind: "approval", title: 42 })).toEqual({
+      ok: false,
+      error: "title must be string, got number",
+    });
+    expect(parseLiveActivitySource({ kind: "approval", options: { a: 1 } })).toEqual({
+      ok: false,
+      error: "options must be string[], got an object",
+    });
+    expect(parseLiveActivitySource({ kind: "approval", options: ["Allow", 7] }).ok).toBe(false);
+    expect(parseLiveActivitySource({ isPermission: "yes" }).ok).toBe(false);
+    expect(parseLiveActivitySource({ since: "now" }).ok).toBe(false);
+    expect(parseLiveActivitySource("not an object").ok).toBe(false);
+    expect(parseLiveActivitySource(null).ok).toBe(false);
+    // A field nobody here reads is not a reason to refuse the frame: the
+    // harness sends `avatarUrl` on any bot with a profile picture.
+    expect(parseLiveActivitySource({ kind: "approval", avatarUrl: "https://x/y.png" }).ok).toBe(true);
+    // `null` reads as absent rather than as a malformed value.
+    expect(parseLiveActivitySource({ color: null })).toEqual({ ok: true, source: {} });
+  });
+
+  it("parses a sparse-but-valid frame, and keeps every fallback", () => {
+    // The degraded path must survive validation: a harness that predates the
+    // Live Activity work sends none of the new fields, and that is a valid
+    // frame, not a broken one.
+    const parsed = parseLiveActivitySource({ kind: "approval", title: "Forge needs you", body: "rm -rf", botId: "b1" });
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(Object.keys(parsed.source).sort()).toEqual(["body", "botId", "kind", "title"]);
+    const content = liveActivityContent(parsed.source, 0);
+    expect(content.attributes.color).toBe(DEFAULT_LIVE_ACTIVITY_COLOR);
+    expect(content.state.options).toEqual(["Allow", "Deny"]);
+    expect(content.state.requestId).toBeUndefined();
+  });
+
+  it("prefers the widened harness fields when the frame carries them", () => {
+    const content = liveActivityContent(
+      {
+        kind: "question",
+        title: "Forge asks",
+        body: "Which branch?",
+        botName: "Forge",
+        color: "coral",
+        options: ["main", "dev"],
+        isPermission: true,
+        since: (800_000_000 + APPLE_REFERENCE_DATE_OFFSET) * 1000,
+      },
+      0,
+    );
+    expect(content.attributes).toEqual({ botId: "", threadId: "", name: "Forge", color: "coral" });
+    expect(content.state.options).toEqual(["main", "dev"]);
+    expect(content.state.isPermission).toBe(true);
+    expect(content.state.since).toBe(800_000_000);
+  });
+
+  it("starts an island on a blocking frame for a disconnected phone that registered one", async () => {
+    const sent: { token: string; event: string; headline?: string }[] = [];
+    const banners: string[] = [];
+    const watch = watchHarnessNotifications({
+      harnessPort: 1,
+      connectedIds: () => ["streaming"],
+      tokensForDisconnected: () => [{ deviceId: "banner", token: "aa".repeat(32) }],
+      liveActivityTokensForDisconnected: () => [
+        { deviceId: "streaming", token: "11".repeat(32) },
+        { deviceId: "island", token: "22".repeat(32) },
+      ],
+      config: testConfig(),
+      fetchImpl: async () =>
+        new Response(notifyFrame("approval"), {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        }),
+      send: async (_config, token) => {
+        banners.push(token);
+        return { ok: true, status: 200, attempts: 1 };
+      },
+      sendLiveActivity: async (_config, token, push) => {
+        sent.push({ token, event: push.event, headline: push.state.headline });
+        return { ok: true, status: 200, attempts: 1 };
+      },
+    });
+    expect(await waitFor(() => sent.length > 0 && banners.length > 0)).toBe(true);
+    watch.stop();
+    // Both surfaces, as intended: the banner for a closed app and the island
+    // to answer from.  A phone already streaming gets no island — the socket
+    // is the banner, and a second copy would be noise.
+    expect(sent).toEqual([{ token: "22".repeat(32), event: "start", headline: "Scout finished needs you" }]);
+    expect(banners).toEqual(["aa".repeat(32)]);
+  });
+
+  it("drops a malformed frame from the island and still sends the banner", async () => {
+    // The whole point of the parse: `title` arrives as a number.  Nothing may
+    // start an island from it — and nothing may be lost either, because the
+    // banner is the same frame on a path that was already its own business.
+    const islands: string[] = [];
+    const banners: string[] = [];
+    const malformed = `data: ${JSON.stringify({
+      kind: "notify",
+      notification: { kind: "approval", title: 42, body: "done", threadId: "t1", botId: "b1" },
+    })}\n\n`;
+    const watch = watchHarnessNotifications({
+      harnessPort: 1,
+      connectedIds: () => [],
+      tokensForDisconnected: () => [{ deviceId: "banner", token: "aa".repeat(32) }],
+      liveActivityTokensForDisconnected: () => [{ deviceId: "island", token: "22".repeat(32) }],
+      config: testConfig(),
+      fetchImpl: async () => new Response(malformed, { status: 200, headers: { "content-type": "text/event-stream" } }),
+      send: async (_config, token) => {
+        banners.push(token);
+        return { ok: true, status: 200, attempts: 1 };
+      },
+      sendLiveActivity: async (_config, token) => {
+        islands.push(token);
+        return { ok: true, status: 200, attempts: 1 };
+      },
+    });
+    expect(await waitFor(() => banners.length > 0)).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    watch.stop();
+    expect(islands).toEqual([]);
+    expect(banners).toEqual(["aa".repeat(32)]);
+  });
+
+  it("still starts an island from a sparse frame the harness actually sent", async () => {
+    const islands: { token: string; color: string; options: string[] }[] = [];
+    const sparse = `data: ${JSON.stringify({
+      kind: "notify",
+      notification: { kind: "question", title: "Forge asks", body: "Which branch?", threadId: "t1", botId: "b1" },
+    })}\n\n`;
+    const watch = watchHarnessNotifications({
+      harnessPort: 1,
+      connectedIds: () => [],
+      tokensForDisconnected: () => [],
+      liveActivityTokensForDisconnected: () => [{ deviceId: "island", token: "22".repeat(32) }],
+      config: testConfig(),
+      fetchImpl: async () => new Response(sparse, { status: 200, headers: { "content-type": "text/event-stream" } }),
+      send: async () => ({ ok: true, status: 200, attempts: 1 }),
+      sendLiveActivity: async (_config, token, push) => {
+        islands.push({ token, color: push.attributes.color, options: push.state.options });
+        return { ok: true, status: 200, attempts: 1 };
+      },
+    });
+    expect(await waitFor(() => islands.length > 0)).toBe(true);
+    watch.stop();
+    // No color, no options, no requestId in the frame — the island goes out
+    // anyway, with the documented fallbacks rather than nothing.
+    expect(islands).toEqual([{ token: "22".repeat(32), color: DEFAULT_LIVE_ACTIVITY_COLOR, options: [] }]);
+  });
+
+  it("starts no island for a frame nobody is blocked on", async () => {
+    const sent: string[] = [];
+    const watch = watchHarnessNotifications({
+      harnessPort: 1,
+      connectedIds: () => [],
+      tokensForDisconnected: () => [],
+      liveActivityTokensForDisconnected: () => [{ deviceId: "island", token: "22".repeat(32) }],
+      config: testConfig(),
+      fetchImpl: async () =>
+        new Response(notifyFrame("done"), { status: 200, headers: { "content-type": "text/event-stream" } }),
+      send: async () => ({ ok: true, status: 200, attempts: 1 }),
+      sendLiveActivity: async (_config, token) => {
+        sent.push(token);
+        return { ok: true, status: 200, attempts: 1 };
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    watch.stop();
+    expect(sent).toEqual([]);
+  });
+
+  it("does not count a Live Activity token in the health page's phone totals", async () => {
+    const watch = watchHarnessNotifications({
+      harnessPort: 1,
+      connectedIds: () => [],
+      // One phone, two tokens.  Health counts the phones on the alert list
+      // only, or every phone reads as two against the trip thresholds.
+      tokensForDisconnected: () => [{ deviceId: "island", token: "22".repeat(32) }],
+      liveActivityTokensForDisconnected: () => [{ deviceId: "island", token: "33".repeat(32) }],
+      config: testConfig(),
+      fetchImpl: async () =>
+        new Response(notifyFrame("approval"), {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        }),
+      send: async () => ({ ok: true, status: 200, attempts: 1 }),
+      sendLiveActivity: async () => ({ ok: true, status: 200, attempts: 1 }),
+    });
+    expect(await waitFor(() => watch.health().sent > 0)).toBe(true);
+    const health = watch.health();
+    watch.stop();
+    expect(health.tokensRegistered).toBe(1);
+  });
+
+  it("drops a Live Activity token Apple has retired, through its own forget path", async () => {
+    const forgotten: Array<[string, string]> = [];
+    const alerts: string[] = [];
+    const watch = watchHarnessNotifications({
+      harnessPort: 1,
+      connectedIds: () => [],
+      tokensForDisconnected: () => [],
+      liveActivityTokensForDisconnected: () => [{ deviceId: "stale", token: "cc".repeat(32) }],
+      config: testConfig(),
+      fetchImpl: async () =>
+        new Response(notifyFrame("approval"), {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        }),
+      send: async (_config, token) => {
+        alerts.push(token);
+        return { ok: true, status: 200, attempts: 1 };
+      },
+      forgetToken: () => {
+        throw new Error("the alert path's forget must not be reached");
+      },
+      sendLiveActivity: async () => ({ ok: false, status: 410, reason: "Unregistered", attempts: 1 }),
+      forgetLiveActivityToken: (deviceId, token) => forgotten.push([deviceId, token]),
+    });
+    expect(await waitFor(() => forgotten.length > 0)).toBe(true);
+    watch.stop();
+    expect(forgotten).toEqual([["stale", "cc".repeat(32)]]);
+    expect(alerts).toEqual([]);
+  });
+
+  it("treats a refused key on the Live Activity channel as the key fault it is", async () => {
+    const store = memoryKeyFaultStore();
+    const watch = watchHarnessNotifications({
+      harnessPort: 1,
+      connectedIds: () => [],
+      tokensForDisconnected: () => [],
+      liveActivityTokensForDisconnected: () => [{ deviceId: "island", token: "33".repeat(32) }],
+      config: testConfig(),
+      keyStamp: () => "stamp-1",
+      keyFaultStore: store,
+      fetchImpl: async () =>
+        new Response(notifyFrame("approval"), {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        }),
+      send: async () => ({ ok: true, status: 200, attempts: 1 }),
+      sendLiveActivity: async () => ({
+        ok: false,
+        status: 403,
+        reason: "InvalidProviderToken",
+        attempts: 1,
+        failureKind: "key_fault",
+      }),
+    });
+    expect(await waitFor(() => store.current !== null)).toBe(true);
+    expect(store.current?.reason).toBe("InvalidProviderToken");
     watch.stop();
   });
 });
@@ -2651,7 +3137,7 @@ describe("watchHarnessNotifications — a refused key survives a restart", () =>
     expect(store.current?.keyStamp).toBe("key-v1");
     expect(store.current?.errorTimestamp).toBe(1_700_000_000_000);
 
-    // A relaunch.  Nothing about the key file changed, so Apple's answer has
+    // A relaunch.  Nothing about the signing key changed, so Apple's answer has
     // not changed either — and the old build resumed full-rate sends here.
     let secondRun = 0;
     const restarted = faultingWatch(store, () => "key-v1", () => {
@@ -2667,7 +3153,160 @@ describe("watchHarnessNotifications — a refused key survives a restart", () =>
     expect(h.pushesOffReason).toBe("key-rejected");
   });
 
-  it("clears the verdict when the key file fingerprint changes", async () => {
+  it("names the refused key by a masked preview, never by its value", async () => {
+    // Rule 43:  a rejected provider key is identified by its masked
+    // first-8/last-4 preview.  The operator has to be able to tell WHICH key
+    // Apple refused, and the key itself must never reach the log.
+    const store = memoryKeyFaultStore({
+      reason: "InvalidProviderToken",
+      at: 1_700_000_000_000,
+      keyStamp: "key-v1",
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const p8 = testP8();
+    const key = testConfig({ p8 });
+    const watch = watchHarnessNotifications({
+      harnessPort: 1,
+      connectedIds: () => [],
+      tokensForDisconnected: () => [{ deviceId: "phone", token: "aa".repeat(32) }],
+      loadConfig: () => key,
+      keyStamp: () => "key-v1",
+      keyRecheckMs: 10,
+      keyFaultStore: store,
+      fetchImpl: async () =>
+        new Response(notify, { status: 200, headers: { "content-type": "text/event-stream" } }),
+      send: async () => ({
+        ok: false as const,
+        status: 403,
+        reason: "InvalidProviderToken",
+        attempts: 1,
+        failureKind: "key_fault" as const,
+      }),
+    });
+    let line = "";
+    try {
+      await waitFor(() => {
+        line = warn.mock.calls.map((call) => String(call[0])).find((text) => text.includes("pushes stay off")) ?? "";
+        return line !== "";
+      });
+    } finally {
+      // Restore the spy:  a console.warn left mocked here stays a no-op for
+      // every test that follows in this file and hides the sidecar's own
+      // warnings.
+      warn.mockRestore();
+      watch.stop();
+    }
+    const material = p8.replace(/-----(?:BEGIN|END) PRIVATE KEY-----/g, "").trim();
+    expect(line).toContain(`${material.slice(0, 8)}…${material.slice(-4)}`);
+    // The key itself, in any form, is not in the line.
+    expect(line).not.toContain(material);
+    expect(line).not.toContain(p8);
+  });
+
+  it("names the live refusal by a masked preview too, never by its value", async () => {
+    // The persisted-fault warning names the refused key by its masked preview.
+    // The LIVE refusal — the line printed the moment Apple refuses the key —
+    // must name it the same way, or the common case is the one warning with
+    // no way to tell which key Apple rejected.
+    const store = memoryKeyFaultStore();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const p8 = testP8();
+    const key = testConfig({ p8 });
+    const watch = watchHarnessNotifications({
+      harnessPort: 1,
+      connectedIds: () => [],
+      tokensForDisconnected: () => [{ deviceId: "phone", token: "aa".repeat(32) }],
+      loadConfig: () => key,
+      keyStamp: () => "key-v1",
+      keyRecheckMs: 10,
+      keyFaultStore: store,
+      fetchImpl: async () =>
+        new Response(notify, { status: 200, headers: { "content-type": "text/event-stream" } }),
+      send: async () => ({
+        ok: false as const,
+        status: 403,
+        reason: "InvalidProviderToken",
+        attempts: 1,
+        failureKind: "key_fault" as const,
+      }),
+    });
+    let line = "";
+    try {
+      await waitFor(() => {
+        line = warn.mock.calls.map((call) => String(call[0])).find((text) => text.includes("refused the signing key")) ?? "";
+        return line !== "";
+      });
+    } finally {
+      warn.mockRestore();
+      watch.stop();
+    }
+    const material = p8.replace(/-----(?:BEGIN|END) PRIVATE KEY-----/g, "").trim();
+    expect(line).toContain(`${material.slice(0, 8)}…${material.slice(-4)}`);
+    expect(line).not.toContain(material);
+    expect(line).not.toContain(p8);
+    // The remedy names the source the key actually lives in.  "Until the key
+    // file changes" points an operator at a local .p8 that is no longer
+    // read, and replacing it would not clear the verdict.
+    expect(line).toContain(apnsKeySource());
+  });
+
+  it("refuses to preview a key too short to mask, rather than printing it whole", () => {
+    // The mask shows the first eight and the last four characters, so a
+    // material of twelve characters or fewer is COVERED by it:  the two
+    // pieces hand back every character of the key, just in two halves.  A
+    // preview that prints the secret it exists to hide is worse than no
+    // preview, so the short case previews as "unavailable".
+    expect(keyPreview("ABCDEFGH")).toBe("unavailable");
+    expect(keyPreview("ABCDEFGHIJKL")).toBe("unavailable");
+    // One character past the mask width is still maskable.
+    expect(keyPreview("ABCDEFGHIJKLM")).not.toBe("unavailable");
+  });
+
+  it("never prints a key too short to mask, not even in the refused-key warning", async () => {
+    // The guard above only proves the helper refuses.  The regression it
+    // exists to prevent is a SHORT key reaching the log through the
+    // refused-key warning, so the warning path itself has to be driven:  a
+    // future change that prints the key material straight into the
+    // live-refusal line would leave the helper untouched and still pass a
+    // helper-only test.
+    const store = memoryKeyFaultStore();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const material = "ABCDEFGH";
+    const key = testConfig({ p8: material });
+    const watch = watchHarnessNotifications({
+      harnessPort: 1,
+      connectedIds: () => [],
+      tokensForDisconnected: () => [{ deviceId: "phone", token: "aa".repeat(32) }],
+      loadConfig: () => key,
+      keyStamp: () => "key-v1",
+      keyRecheckMs: 10,
+      keyFaultStore: store,
+      fetchImpl: async () =>
+        new Response(notify, { status: 200, headers: { "content-type": "text/event-stream" } }),
+      send: async () => ({
+        ok: false as const,
+        status: 403,
+        reason: "InvalidProviderToken",
+        attempts: 1,
+        failureKind: "key_fault" as const,
+      }),
+    });
+    let line = "";
+    try {
+      await waitFor(() => {
+        line = warn.mock.calls.map((call) => String(call[0])).find((text) => text.includes("refused the signing key")) ?? "";
+        return line !== "";
+      });
+    } finally {
+      warn.mockRestore();
+      watch.stop();
+    }
+    // The warning says the key could not be previewed, and never the value.
+    expect(line).toContain("unavailable");
+    expect(line).not.toContain(material);
+  });
+
+  it("clears the verdict when the signing key fingerprint changes", async () => {
     const store = memoryKeyFaultStore({
       reason: "InvalidProviderToken",
       at: 1_700_000_000_000,
@@ -2677,7 +3316,7 @@ describe("watchHarnessNotifications — a refused key survives a restart", () =>
     const watch = faultingWatch(store, () => "key-v2", () => {
       sends += 1;
     });
-    // A different file: the verdict was about a key this process no longer
+    // A different key: the verdict was about a key this process no longer
     // holds, so it is forgotten and the replacement gets its chance.
     expect(await waitFor(() => sends > 0)).toBe(true);
     watch.stop();
@@ -2687,7 +3326,7 @@ describe("watchHarnessNotifications — a refused key survives a restart", () =>
   it("drops the refused key's provider token and http2 sessions, so a rotation is not signed against them", async () => {
     // The fault used to null `discovered`, so the key-identity comparison in
     // refreshConfig saw no previous key, skipped invalidateProviderToken and
-    // dropHttp2Sessions, and signed the replacement .p8 against the cached
+    // dropHttp2Sessions, and signed the replacement key against the cached
     // token minted for the key Apple had just refused.
     dropHttp2Sessions();
     const key = testConfig({ keyId: "ROTATE1" });
@@ -2774,11 +3413,277 @@ describe("diskKeyFaultStore", () => {
     try {
       const store = diskKeyFaultStore(dir);
       store.save({ reason: "InvalidProviderToken", at: 1, keyStamp: null });
-      // A fault with no stamp can never match a key file, so it can never
+      // A fault with no stamp can never match a key, so it can never
       // hold pushes off — which is the safe direction for a torn file.
       expect(store.load()?.keyStamp).toBeNull();
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("APNs signing key source (AFC-359: the retired secrets folder is never read)", () => {
+  const saved = { ...process.env };
+  let dir = "";
+
+  function fakeFleetSecrets(body: string): string {
+    const bin = join(dir, "fleet-secrets");
+    writeFileSync(bin, `#!/bin/sh\n${body}\n`);
+    chmodSync(bin, 0o755);
+    return bin;
+  }
+
+  function pemScript(pem: string): string {
+    return `cat <<'PEM'\n${pem}PEM`;
+  }
+
+  beforeEach(() => {
+    process.env = { ...saved };
+    delete process.env.APNS_P8;
+    delete process.env.APNS_P8_PATH;
+    delete process.env.APNS_KEY_ID;
+    dir = mkdtempSync(join(tmpdir(), "apns-key-"));
+    resetApnsKeyCache();
+  });
+
+  afterEach(() => {
+    process.env = { ...saved };
+    rmSync(dir, { recursive: true, force: true });
+    resetApnsKeyCache();
+  });
+
+  it.skipIf(process.platform === "win32")("previews a signing key as a masked first-8/last-4, and never its value", () => {
+    // Rule 43:  a key is identified by its masked preview.  The preview is of
+    // the key MATERIAL, so the PEM armour is not part of what is shown.
+    const p8 = testP8();
+    const material = p8.replace(/-----(?:BEGIN|END) PRIVATE KEY-----/g, "").trim();
+    expect(keyPreview(p8)).toBe(`${material.slice(0, 8)}…${material.slice(-4)}`);
+    expect(keyPreview(p8)).not.toContain(material);
+    // Nothing to preview says so plainly, rather than showing an empty one.
+    expect(keyPreview(null)).toBe("unavailable");
+    expect(keyPreview("")).toBe("unavailable");
+  });
+
+  it.skipIf(process.platform === "win32")("reads AUTHKEY_<KEY_ID> through fleet-secrets and never a file under the home folder", async () => {
+    const argsFile = join(dir, "args");
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(`echo "$@" > '${argsFile}'\n${pemScript(testP8())}`);
+    process.env.APNS_KEY_ID = "KEY1234567";
+    const config = await loadApnsConfig();
+    expect(config?.keyId).toBe("KEY1234567");
+    expect(config?.p8).toContain("BEGIN PRIVATE KEY");
+    expect(readFileSync(argsFile, "utf8").trim()).toBe("get AUTHKEY_KEY1234567");
+    expect(apnsKeySource()).toBe("Infisical AUTHKEY_KEY1234567");
+  });
+
+  it.skipIf(process.platform === "win32")("reads the shared key from APNS_KEY_P8 and its id from APNS_KEY_ID by default", async () => {
+    const argsFile = join(dir, "args");
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(
+      `echo "$@" >> '${argsFile}'\ncase "$2" in\n  APNS_KEY_ID) echo ROTATED001 ;;\n  APNS_KEY_P8) ${pemScript(testP8())}\n ;;\n  *) exit 3 ;;\nesac`,
+    );
+    const config = await loadApnsConfig();
+    expect(config?.keyId).toBe("ROTATED001");
+    expect(config?.p8).toContain("BEGIN PRIVATE KEY");
+    expect(readFileSync(argsFile, "utf8").trim().split("\n")).toEqual(["get APNS_KEY_P8", "get APNS_KEY_ID"]);
+    expect(apnsKeySource()).toBe("Infisical APNS_KEY_P8");
+  });
+
+  it.skipIf(process.platform === "win32")("falls back to the shared key id when Infisical has no usable APNS_KEY_ID", async () => {
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(
+      `case "$2" in\n  APNS_KEY_P8) ${pemScript(testP8())}\n ;;\n  *) exit 3 ;;\nesac`,
+    );
+    expect((await loadApnsConfig())?.keyId).toBe(SHARED_APNS_KEY_ID);
+    expect(SHARED_APNS_KEY_ID).toBe("HSJ98QN95V");
+  });
+
+  // The read ceiling is the difference between "the vault answered" and "the
+  // sidecar turned pushes off".  A ceiling below the vault's own latency does
+  // not slow the sidecar down, it removes the key:  the read is killed, the
+  // failure looks like "no key", and APNs stays off.  These three tests pin
+  // the ceiling above the measured worst case, the override that widens it,
+  // and the refusal to honour a nonsense override.
+  it.skipIf(process.platform === "win32")("keeps the read ceiling above the slowest measured vault read", async () => {
+    // Measured on the fleet Mac:  3.6-5.3 s warm, 16.6 s cold cache.  The
+    // ceiling is derived from the measurement, and this asserts the ordering
+    // that keeps it true if either number is retuned:  a ceiling at or below
+    // the budget is the defect, not a style choice.
+    expect(APNS_VAULT_READ_TIMEOUT_MS).toBeGreaterThanOrEqual(2 * APNS_VAULT_READ_BUDGET_MS);
+    expect(APNS_VAULT_READ_TIMEOUT_MS).toBeGreaterThan(16_600);
+  });
+
+  it.skipIf(process.platform === "win32")("honours a narrowed read ceiling from the environment", async () => {
+    // A ceiling of 1 ms kills the read before the fake can answer, which is
+    // exactly how a slow vault looks to the sidecar.  The fake has to be
+    // slower than the ceiling for that to hold on every machine:  a fake
+    // that answers inside the ceiling makes this test pass on a slow fork
+    // and fail on a fast one, which is how it was green on a Mac and red in
+    // CI.  The fake now waits, so the ceiling always wins.
+    process.env.APNS_VAULT_READ_TIMEOUT_MS = "1";
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(`sleep 2\n${pemScript(testP8())}`);
+    // The read is async now, so a read started by an earlier test can still be
+    // in flight.  The cache is cleared here as well as in `beforeEach` so this
+    // test never depends on the order the suite happens to run in.
+    resetApnsKeyCache();
+    expect(await loadApnsConfig()).toBeNull();
+  });
+
+  it.skipIf(process.platform === "win32")("keeps the cached answer when the key id read is slower than the retry window", async () => {
+    // The id read is part of the read.  An entry stamped before that read
+    // finished is already expired by the time it is stored when the id read
+    // takes longer than the retry window — and the raised ceiling allows
+    // exactly that — so the next caller runs a second full vault round trip
+    // instead of taking the cached answer.  The id read here takes half a
+    // second against a 200 ms retry window, so the two cases differ.
+    const calls = join(dir, "calls");
+    const pem = testP8();
+    process.env.APNS_VAULT_RETRY_MS = "200";
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(
+      `echo "$@" >> '${calls}'\ncase "$2" in\n  APNS_KEY_P8) ${pemScript(pem)}\n ;;\n  APNS_KEY_ID) sleep 0.5; exit 3 ;;\n  *) exit 3 ;;\nesac`,
+    );
+    resetApnsKeyCache();
+    expect((await loadApnsConfig())?.p8).toContain("BEGIN PRIVATE KEY");
+    // The next caller, well inside the retry window, must be served from the
+    // cache:  one read of the PEM and one of the id, not twice that.
+    expect((await loadApnsConfig())?.p8).toContain("BEGIN PRIVATE KEY");
+    expect(readFileSync(calls, "utf8").trim().split("\n")).toHaveLength(2);
+  });
+
+  it.skipIf(process.platform === "win32")("does not block the event loop while the vault answers", async () => {
+    // The read takes 400 ms.  A synchronous read freezes the event loop for
+    // that whole window, so a timer scheduled alongside it cannot fire until
+    // the read has already finished — which is exactly the stall the raised
+    // ceiling made five times worse.  The read is async, so the timer fires
+    // while the read is still running.
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(`sleep 0.4\nexit 3`);
+    resetApnsKeyCache();
+    let fired = false;
+    const timer = setTimeout(() => {
+      fired = true;
+    }, 50);
+    await loadApnsConfig();
+    clearTimeout(timer);
+    expect(fired).toBe(true);
+  });
+
+  it.skipIf(process.platform === "win32")("runs one vault read when two callers miss the cache together", async () => {
+    // The read is async now, so two callers can reach the vault at once.  A
+    // synchronous read could not be interleaved; an async one can, and two
+    // concurrent reads would double the wall time of the slow case.
+    const calls = join(dir, "calls");
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(`echo "$@" >> '${calls}'\nsleep 0.3\nexit 3`);
+    resetApnsKeyCache();
+    await Promise.all([loadApnsConfig(), apnsKeyStamp()]);
+    expect(readFileSync(calls, "utf8").trim().split("\n")).toHaveLength(1);
+  });
+
+  it.skipIf(process.platform === "win32")("ignores a read ceiling that is not a positive number", async () => {
+    // `Number("-1")` is a number, so a negative override would otherwise
+    // become a ceiling that fires instantly — the failure this ceiling
+    // exists to remove, reintroduced through the override.
+    for (const bad of ["0", "-1", "-5000", "not-a-number", ""]) {
+      process.env.APNS_VAULT_READ_TIMEOUT_MS = bad;
+      resetApnsKeyCache();
+      process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(pemScript(testP8()));
+      expect((await loadApnsConfig())?.p8).toContain("BEGIN PRIVATE KEY");
+    }
+  });
+
+  it.skipIf(process.platform === "win32")("ignores a read ceiling that is not a whole number of milliseconds", async () => {
+    // Node's execFileSync rejects a fractional timeout with ERR_OUT_OF_RANGE:
+    // the read throws, the catch swallows it, and the key silently vanishes
+    // — the same "no key" outcome the ceiling exists to prevent.
+    for (const bad of ["0.5", "1.5", "30000.25"]) {
+      process.env.APNS_VAULT_READ_TIMEOUT_MS = bad;
+      resetApnsKeyCache();
+      process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(pemScript(testP8()));
+      expect((await loadApnsConfig())?.p8).toContain("BEGIN PRIVATE KEY");
+    }
+  });
+
+  it.skipIf(process.platform === "win32")("does not read the vault again straight after a slow failed read", async () => {
+    // The failure is cached from the moment the read FINISHED.  A read that
+    // outlasts the retry window used to leave an already-expired entry
+    // behind, so the next caller — `refreshConfig` asks for the stamp and
+    // then the config — ran a second full blocking read instead of the
+    // cached answer.
+    const calls = join(dir, "calls");
+    process.env.APNS_VAULT_RETRY_MS = "100";
+    process.env.APNS_VAULT_READ_TIMEOUT_MS = "300";
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(`echo "$@" >> '${calls}'\nsleep 1\nexit 3`);
+    expect(await loadApnsConfig()).toBeNull();
+    expect(await apnsKeyStamp()).toBeNull();
+    expect(readFileSync(calls, "utf8").trim().split("\n")).toHaveLength(1);
+  });
+
+  it.skipIf(process.platform === "win32")("keeps the last good key id when only the id read fails, and stamps the id", async () => {
+    const pem = testP8();
+    const ok = `case "$2" in\n  APNS_KEY_ID) echo ROTATED001 ;;\n  APNS_KEY_P8) ${pemScript(pem)}\n ;;\n  *) exit 3 ;;\nesac`;
+    const noId = `case "$2" in\n  APNS_KEY_P8) ${pemScript(pem)}\n ;;\n  *) exit 3 ;;\nesac`;
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(ok);
+    const good = await apnsKeyStamp();
+    expect((await loadApnsConfig())?.keyId).toBe("ROTATED001");
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(noId);
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(Date.now() + APNS_VAULT_CACHE_MS + 1);
+      expect((await loadApnsConfig())?.keyId).toBe("ROTATED001");
+      expect(await apnsKeyStamp()).toBe(good);
+      // A cold start with no id falls back to the built-in id, and the stamp
+      // differs, so a fault recorded under it does not outlive the real id.
+      resetApnsKeyCache();
+      expect((await loadApnsConfig())?.keyId).toBe(SHARED_APNS_KEY_ID);
+      expect(await apnsKeyStamp()).not.toBe(good);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("uses the shared key id with an injected APNS_P8 and no pinned id", async () => {
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets("exit 3");
+    process.env.APNS_P8 = testP8();
+    expect((await loadApnsConfig())?.keyId).toBe("HSJ98QN95V");
+  });
+
+  it.skipIf(process.platform === "win32")("stamps the key with a digest, so a rotated key changes the stamp", async () => {
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(pemScript(testP8()));
+    const first = await apnsKeyStamp();
+    expect(first).toMatch(/^Infisical APNS_KEY_P8:[0-9a-f]{16}$/);
+    resetApnsKeyCache();
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(pemScript(testP8()));
+    expect(await apnsKeyStamp()).not.toBe(first);
+  });
+
+  it.skipIf(process.platform === "win32")("keeps the last good key through a transient fleet-secrets failure", async () => {
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(pemScript(testP8()));
+    const good = await loadApnsConfig();
+    expect(good?.p8).toContain("BEGIN PRIVATE KEY");
+    // Fail every later read and let the retry window pass.
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets("exit 3");
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(Date.now() + APNS_VAULT_CACHE_MS + 1);
+      expect((await loadApnsConfig())?.p8).toBe(good?.p8);
+      vi.setSystemTime(Date.now() + APNS_VAULT_RETRY_MS + 1);
+      expect((await loadApnsConfig())?.p8).toBe(good?.p8);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reads as no key when fleet-secrets fails", async () => {
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets("exit 3");
+    expect(await loadApnsConfig()).toBeNull();
+    expect(await apnsKeyStamp()).toBeNull();
+  });
+
+  it("prefers APNS_P8 and then APNS_P8_PATH over Infisical", async () => {
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets("exit 3");
+    process.env.APNS_P8 = testP8();
+    expect((await loadApnsConfig())?.p8).toContain("BEGIN PRIVATE KEY");
+    delete process.env.APNS_P8;
+    const file = join(dir, "AuthKey.p8");
+    writeFileSync(file, testP8(), { mode: 0o600 });
+    process.env.APNS_P8_PATH = file;
+    expect((await loadApnsConfig())?.p8).toContain("BEGIN PRIVATE KEY");
+    expect(apnsKeySource()).toBe(file);
   });
 });

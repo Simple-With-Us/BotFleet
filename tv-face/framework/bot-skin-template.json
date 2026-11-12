@@ -1,0 +1,27 @@
+{
+  "id": "my-bot",
+  "displayName": "My Bot",
+  "accent": "#00E5FF",
+  "shell": "#E36A2E",
+  "instructions": [
+    "1. Copy skins/default → skins/my-bot",
+    "2. Keep the SAME filenames for every clip (enter/hold/return + stills).",
+    "3. Recolor or redesign art; keep 480x480, transparent background, flat cartoon TV-head style.",
+    "4. Expression meanings must stay the same so eventMap keeps working across bots.",
+    "5. Register skin in framework/manifest.json under skins.",
+    "6. In BotFleet seat config: { \"seatId\": \"...\", \"tvFaceSkin\": \"my-bot\" }"
+  ],
+  "requiredFiles": {
+    "stills": [
+      "resting.png",
+      "fleet.png", "crash.png", "memory.png", "tools.png", "routine.png",
+      "screen.png", "git.png", "webhook.png",
+      "computer.png", "listening.png", "thinking.png", "typing.png", "speaking.png"
+    ],
+    "gifsPerExpression": ["enter", "hold", "return"],
+    "expressions": [
+      "fleet", "crash", "memory", "tools", "routine", "screen", "git", "webhook",
+      "computer", "listening", "thinking", "typing", "speaking"
+    ]
+  }
+}

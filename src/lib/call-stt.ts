@@ -12,7 +12,9 @@ import {
   type AssemblyAITranscriptionSession,
 } from "./assemblyai-transcription";
 
-export type STTProvider = "apple" | "assemblyai";
+import type { CloudSttProvider } from "../../shared/voice-providers.ts";
+
+export type STTProvider = "apple" | CloudSttProvider;
 
 export interface STTTranscriptLine {
   text: string;
@@ -264,5 +266,9 @@ export function createAssemblyAISTTSession(): STTSession {
 /** Factory that picks an implementation by name. Throws if the requested
  * provider has no usable bridge on this platform. */
 export function createSTTSession(provider: STTProvider): STTSession {
-  return provider === "apple" ? createAppleSTTSession() : createAssemblyAISTTSession();
+  if (provider === "apple") return createAppleSTTSession();
+  if (provider === "assemblyai") return createAssemblyAISTTSession();
+  throw new Error(
+    `Cloud transcription for "${provider}" is configured but this desktop build does not ship its streaming bridge yet. Pick AssemblyAI or Apple in Transcription settings for now.`,
+  );
 }

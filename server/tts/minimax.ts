@@ -20,11 +20,11 @@
 // An error response surfaces base_resp.status_msg verbatim.
 
 import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 
 import type { Audio, VerifyResult, Voice } from "./types.ts";
 import { recordSpeechUsage } from "./usage.ts";
+import { dataDir } from "../data-dir.ts";
 
 // ── Re-export shared types ────────────────────────────────────────────────────
 export type { Audio, VerifyResult, Voice };
@@ -33,7 +33,7 @@ const API = process.env.MINIMAX_API_URL || "https://api.minimax.io";
 const MODEL = process.env.MINIMAX_SPEECH_MODEL || "speech-2.8-turbo";
 const MAX_CHARS = 10_000;
 
-const DATA_DIR = process.env.OMB_DATA_DIR ?? join(homedir(), ".botfleet");
+const DATA_DIR = dataDir();
 const CLONED_VOICES_FILE = join(DATA_DIR, "tts-cloned-voices.json");
 
 // ── Documented starter voices ────────────────────────────────────────────────
@@ -319,7 +319,55 @@ interface T2AResponse {
   base_resp?: BaseResponse;
 }
 
-/** Synthesize one utterance to mp3 bytes. Throws if MiniMax returns a
+/**
+ * MiniMax TTS acoustic model (t2a_v2) drops pauses on em-dashes, en-dashes,
+ * and isolated hyphens, slurring words together without breaths.  Deterministically
+ * normalize dashes to natural pauses (comma/space) and clean up ellipses.
+ */
+export function sanitizeForTTS(text: string): string {
+  if (!text) return "";
+  return sanitizeForTTSLine(text);
+}
+
+/** Acoustic dash/ellipsis cleanup on one line (no newline folding). */
+function sanitizeForTTSLine(text: string): string {
+  if (!text) return "";
+  return text
+    // Collapse whitespace runs first to prevent regex backtracking on long runs
+    .replace(/\s+/g, " ")
+    // Replace em-dashes (—) and en-dashes (–) with a comma and space for natural breathing pause
+    .replace(/ ?[—–] ?/g, ", ")
+    // Replace floating/isolated hyphens (" - ") with a comma and space, but
+    // keep the operator in "5 - 3 = 2" — a minus sign between two numbers is
+    // arithmetic, not a clause dash, and reads as "five, three" otherwise
+    .replace(
+      /(\S) - (?=(\S))/g,
+      (_m, before: string, after: string) =>
+        (/\d/.test(before) && /\d/.test(after)) ? `${before} - ` : `${before}, `,
+    )
+    // Replace ellipses (ASCII "..." and the Unicode "…") with a single period
+    .replace(/(?:\.{2,}|…+)/g, ".")
+    // Clean up multiple consecutive commas or comma-periods
+    .replace(/,\s*,+/g, ",")
+    .replace(/,\s*\./g, ".")
+    .replace(/\.\s*,/g, ".")
+    // Clean up multiple spaces
+    .replace(/[ \t]+/g, " ")
+    .trim();
+}
+
+/** Like {@link sanitizeForTTS}, but keeps `\n` so `speakable()` / `toUtterances()`
+ * can still turn headings and lists into separate sentences before clip split. */
+export function sanitizeForTTSByLine(text: string): string {
+  if (!text) return "";
+  if (!text.includes("\n")) return sanitizeForTTS(text);
+  return text
+    .split("\n")
+    .map((line) => sanitizeForTTSLine(line))
+    .join("\n");
+}
+
+/** Synthesize one utterance to mp3 bytes.  Throws if MiniMax returns a
  * non-zero status_code or the audio payload is empty. */
 export async function synthesize(
   text: string,
@@ -327,8 +375,8 @@ export async function synthesize(
   key: string,
   options: SynthesizeOptions = { voiceId: "" },
 ): Promise<Audio> {
-  const trimmed = text.trim();
-  if (!trimmed) return { bytes: new Uint8Array(), mime: "audio/mpeg" };
+  const trimmed = sanitizeForTTS(text);
+  if (!trimmed || !/[\p{L}\p{N}]/u.test(trimmed)) return { bytes: new Uint8Array(), mime: "audio/mpeg" };
   if (trimmed.length > MAX_CHARS) {
     throw new Error(`utterance is ${trimmed.length} chars; MiniMax accepts at most ${MAX_CHARS} per request`);
   }
@@ -345,7 +393,7 @@ export async function synthesize(
     },
     audio_setting: {
       sample_rate: options.sampleRate ?? 24_000,
-      bitrate: options.bitrate ?? 128_000,
+      bitrate: options.bitrate ?? 64_000,
       format: options.format ?? "mp3",
       channel: 1,
     },
@@ -372,6 +420,6 @@ export async function synthesize(
   const format = parsed.extra_info?.audio_format ?? body.audio_setting.format;
   const mime = format === "wav" ? "audio/wav" : format === "pcm" ? "audio/pcm" : "audio/mpeg";
   if (bytes.length) recordSpeechUsage("minimax", parsed.extra_info?.usage_characters ?? trimmed.length,
-    Number.isSafeInteger(parsed.extra_info?.usage_characters) ? "provider" : "submitted");
+    Number.isSafeInteger(parsed.extra_info?.usage_characters) ? "provider" : "submitted", { service: MODEL });
   return { bytes, mime };
 }

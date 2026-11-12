@@ -204,12 +204,19 @@ describe("ingestInbound", () => {
       bot,
       chatId: "chat-1",
       text: "hello",
+      senderVerified: true,
     });
     expect(result.dispatched).toBe(true);
     const call = fetches.find((f) => f.url.endsWith("/api/bots/director/messages"));
-    expect((call?.body as Record<string, unknown>).source).toBe("linq");
-    expect((call?.body as Record<string, unknown>).chatId).toBe("chat-1");
-    expect(((call?.body as Record<string, unknown>).text as string).startsWith("[IMESSAGE INBOUND]")).toBe(true);
+    expect(call).toBeDefined();
+    expect(call!.body).toEqual(
+      expect.objectContaining({
+        source: "linq",
+        senderVerified: true,
+        chatId: "chat-1",
+        text: expect.stringMatching(/^\[IMESSAGE INBOUND\]/),
+      }),
+    );
   });
 
   it("refuses empty payloads", async () => {
@@ -231,7 +238,8 @@ describe("handleLinqInbound", () => {
     const result = await handleLinqInbound(sampleInbound(), bots);
     expect(result.dispatched).toBe(true);
     const call = fetches.find((f) => f.url.endsWith("/api/bots/director/messages"));
-    expect((call?.body as Record<string, unknown>).source).toBe("linq");
+    expect(call).toBeDefined();
+    expect(call!.body).toEqual(expect.objectContaining({ source: "linq" }));
   });
 
   it("refuses an inbound from a sender on the ignore list", async () => {

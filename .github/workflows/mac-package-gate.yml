@@ -1,0 +1,265 @@
+# Pre-merge Mac packaging gate.
+#
+# Why this exists: the "Mac Commit Build" workflow runs on push to main and is
+# deliberately not a required check, which made it the last place a Mac
+# packaging break could surface.  Renovate #919 merged with every required check
+# green and broke Mac packaging twice in one dependency bump:
+#
+#   1. @trycua/cua-driver 0.20.0 -> 0.32.0 had no pinned executable asset in
+#      scripts/prepare-cua.mjs ("CUA SDK 0.32.0 has no pinned executable
+#      asset"), fixed in #943.
+#   2. The pnpm override @xmldom/xmldom@0.8.13 went to 0.9.12 and
+#      electron-builder's plist parser then died with
+#      `DOMParser.parseFromString: the provided mimeType "undefined" is not
+#      valid`, fixed in #946.
+#
+# Because the Mac updater installs from the hosted build of main's tip, a
+# post-merge discovery blocks every Mac update until someone fixes it
+# retroactively.  This runs the same packaging path *before* the merge instead,
+# unsigned, so the two failure modes above fail a pull request instead of a
+# release.
+#
+# What it deliberately does NOT do: sign, notarize, staple, or build x64.  The
+# certificate import, the `codesign --verify` team gate, `ditto`, the build
+# manifest, and the artifact upload all belong to Mac Commit Build, which still
+# owns the real artifact and the signature boundary.  This only has to reach the
+# point where prepare-cua resolves and electron-builder has produced and parsed
+# a plist.  `--dir` gives the .app bundle without the DMG, and
+# CSC_IDENTITY_AUTO_DISCOVERY=false keeps electron-builder out of the keychain
+# entirely, so the ordinary packaging jobs need no credential bindings.
+#
+# An explicitly selected Linux-only audit checks existing Infisical readers
+# separately, before rollout of the service-token migration.
+# It runs only from an exact protected-main commit, emits metadata only, and skips both ordinary jobs
+# under distinct check names; ordinary pull-request runs never receive its tokens.
+#
+# On required-ness: this is deliberately NOT required, and the reasoning is in
+# the pull request.  Two reasons.  First, a path-filtered required check is a
+# trap -- when the filter skips the workflow the check never reports and the pull
+# request blocks forever -- and this workflow runs on every pull request with a
+# cheap classifier deciding the expensive job, which is the safe shape but the
+# only job that could be required is the classifier, which proves nothing about
+# packaging.  Second, it is a macOS runner: making it required would make every
+# packaging-touching pull request wait on the slowest, scarcest runner class in
+# the fleet.  Renovate pull requests always run it, which is where both real
+# failures came from, and Mac Commit Build stays the post-merge backstop.
+name: Mac Package Gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      audit_infisical_bindings:
+        description: Run the read-only managed-token binding audit only
+        type: boolean
+        required: false
+        default: false
+      expected_head_sha:
+        description: Exact protected-main SHA to validate against the dispatch metadata
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.event_name == 'workflow_dispatch' && inputs.audit_infisical_bindings == true && format('mac-package-audit-{0}', github.sha) || format('mac-package-gate-{0}', github.event.pull_request.number || github.ref) }}
+  cancel-in-progress: true
+
+jobs:
+  audit-infisical-bindings:
+    name: Read-only Infisical binding audit
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.audit_infisical_bindings == true && github.ref == 'refs/heads/main' && github.ref_protected == true }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Validate dispatch ref and expected commit before credential reads
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          ACTUAL_SHA: ${{ github.sha }}
+          EXPECTED_SHA: ${{ inputs.expected_head_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$EVENT_NAME" == "workflow_dispatch" ]] || exit 1
+          [[ "$REF" == refs/heads/main ]] || exit 1
+          [[ "$REF_PROTECTED" == true ]] || exit 1
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || exit 1
+          # A sha may arrive in either case.  macOS ships Bash 3.2, which has no ${var,,}.
+          shopt -s nocasematch
+          [[ "$ACTUAL_SHA" == "$EXPECTED_SHA" ]] || exit 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26
+          package-manager-cache: false
+      - name: Audit existing read-token bindings without printing values
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REF: ${{ github.ref }}
+          GITHUB_REF_PROTECTED: ${{ github.ref_protected }}
+          EXPECTED_HEAD_SHA: ${{ inputs.expected_head_sha }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_PROJECT_ID }}
+          INFISICAL_IOS_SHIP_READ_TOKEN: ${{ secrets.INFISICAL_IOS_SHIP_READ_TOKEN }}
+          INFISICAL_RELEASE_READ_TOKEN: ${{ secrets.INFISICAL_RELEASE_READ_TOKEN }}
+          INFISICAL_MAC_COMMIT_BUILD_READ_TOKEN: ${{ secrets.INFISICAL_MAC_COMMIT_BUILD_READ_TOKEN }}
+          INFISICAL_NATIVE_RELEASE_READ_TOKEN: ${{ secrets.INFISICAL_NATIVE_RELEASE_READ_TOKEN }}
+          INFISICAL_SENTRY_DEPLOY_READ_TOKEN: ${{ secrets.INFISICAL_SENTRY_DEPLOY_READ_TOKEN }}
+          INFISICAL_SENTRY_CI_REPORT_READ_TOKEN: ${{ secrets.INFISICAL_SENTRY_CI_REPORT_READ_TOKEN }}
+          INFISICAL_SENTRY_TESTFLIGHT_READ_TOKEN: ${{ secrets.INFISICAL_SENTRY_TESTFLIGHT_READ_TOKEN }}
+          GH_FALLBACK_APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID != '' }}
+          GH_FALLBACK_APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID != '' }}
+          GH_FALLBACK_APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 != '' }}
+          GH_FALLBACK_MAC_CERT_P12_BASE64: ${{ secrets.MAC_CERT_P12_BASE64 != '' }}
+          GH_FALLBACK_MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD != '' }}
+          GH_FALLBACK_SENTRY_DSN: ${{ secrets.SENTRY_DSN != '' }}
+          GH_FALLBACK_SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN != '' }}
+          GH_FALLBACK_SENTRY_FLEET_DSN: ${{ secrets.SENTRY_FLEET_DSN != '' }}
+        run: node scripts/infisical-ci-binding-audit.mjs
+
+  scope:
+    name: "${{ github.event_name == 'workflow_dispatch' && inputs.audit_infisical_bindings == true && 'Audit-only: Mac packaging classifier skipped' || 'Classify Mac packaging scope' }}"
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.audit_infisical_bindings == true) }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    outputs:
+      run: ${{ steps.scope.outputs.run }}
+      reason: ${{ steps.scope.outputs.reason }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Enough history to diff against.  A shallow fetch would report zero
+          # changed paths, which the classifier treats as "no information" and
+          # answers by running the gate -- correct, but an expensive way to say
+          # the diff was unavailable.
+          fetch-depth: 0
+          # Scope compares commit/tree metadata, without historical file blobs.
+          filter: blob:none
+          persist-credentials: false
+      - name: Diff against the base ref
+        id: base
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          # The pull request's own two ends,  computed by the same script
+          # ci.yml's classifier uses.  The stored base SHA is the base
+          # branch's tip at the last synchronisation and HEAD is the merge
+          # commit,  so the old diff folded main's newer commits into the
+          # scope:  a pull request that touched nothing here took a hosted
+          # macOS runner because main had moved a packaging file.
+          if ! bash scripts/ci-scope-diff.sh "$BASE_SHA" "$HEAD_SHA" > changed-paths.z; then
+            # No usable scope:  emit nothing and let the classifier fail closed.
+            echo "base_sha=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "base_sha=$BASE_SHA" >> "$GITHUB_OUTPUT"
+          echo "changed $(tr -cd '\0' < changed-paths.z | wc -c | tr -d ' ') path(s) against ${BASE_SHA:0:9}"
+      - name: Decide whether to package
+        id: scope
+        env:
+          # Two identities, because Renovate opens pull requests as a GitHub
+          # App: PR #919's author was `app/renovate` while the event actor was
+          # the app's bot login.  Pass both so either shape matches.
+          GATE_ACTORS: ${{ github.actor }},${{ github.event.pull_request.user.login }}
+          GATE_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          set -euo pipefail
+          if [ -s changed-paths.z ]; then
+            node scripts/mac-package-gate.mjs < changed-paths.z | tee -a "$GITHUB_OUTPUT"
+          else
+            echo "No base SHA to diff against; running the gate fail-closed." >&2
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "reason=no-base-sha" >> "$GITHUB_OUTPUT"
+          fi
+
+  package:
+    name: "${{ github.event_name == 'workflow_dispatch' && inputs.audit_infisical_bindings == true && 'Audit-only: unsigned package skipped' || 'Unsigned arm64 package (prepare-cua + plist)' }}"
+    needs: scope
+    if: ${{ needs.scope.outputs.run == 'true' && !cancelled() && !(github.event_name == 'workflow_dispatch' && inputs.audit_infisical_bindings == true) }}
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The packaged app's Control bundle is stamped from the commit
+          # count, and the stamp refuses a shallow clone rather than
+          # numbering the build 1.0.1.
+          fetch-depth: 0
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26
+          cache: pnpm
+
+      # A lockfile that disagrees with package.json fails here rather than
+      # halfway through a package run.  Renovate occasionally lands exactly
+      # that, so it is worth keeping as its own visible step.
+      - name: Install exactly what is committed
+        run: pnpm install --frozen-lockfile
+
+      # Same reason Mac Commit Build does this: stale output ships an app that
+      # looks corrupt because it is actually assembled from an older build.
+      - name: Clean generated output
+        run: rm -rf dist dist-server dist-native release
+
+      # Gate 1, deliberately first and on its own.  scripts/prepare-cua.mjs
+      # compares the SDK package version against its pinned release before it
+      # downloads anything, so a missing pin fails in seconds here instead of
+      # after package:prepare has already spent minutes on tsc and vite.  This
+      # is the #943 failure mode.
+      - name: "Gate 1: prepare-cua resolves a pinned driver for the installed SDK"
+        run: pnpm build:cua
+
+      # Gate 2: the unsigned arm64 package path.  Same script Mac Commit Build
+      # uses, minus signing.  `--dir` stops before the DMG, and
+      # CSC_IDENTITY_AUTO_DISCOVERY=false keeps electron-builder out of the
+      # keychain, so this needs no certificate and cannot publish one.
+      #
+      # This is where electron-builder reads electron-builder.yml, assembles
+      # BotFleet.app, and writes and parses Info.plist with the resolved
+      # dependency tree.  That plist parse is the #946 failure mode: the
+      # @xmldom/xmldom override reached 0.9.12 and every build died inside
+      # DOMParser.
+      - name: "Gate 2: unsigned arm64 package reaches electron-builder's plist handling"
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+          OMB_CLOUDFLARED_CURRENT: "1"
+        run: pnpm package:mac:local
+
+      # Gate 3: prove the artifact that gate 2 produced is a real bundle with a
+      # plist the OS itself accepts.  `plutil -lint` is the platform parser, not
+      # the same library electron-builder used, so this catches a plist that
+      # "parsed" in Node but is not valid on the way out.
+      - name: "Gate 3: the packaged bundle exists and its plist lints clean"
+        run: |
+          set -euo pipefail
+          app=release/mac-arm64/BotFleet.app
+          if [ ! -d "$app" ]; then
+            echo "::error::electron-builder reported success but $app is missing"
+            exit 1
+          fi
+          plutil -lint "$app/Contents/Info.plist"
+          # An arm64 bundle is ALWAYS signed -- the linker requires at least an
+          # ad-hoc signature for arm64 code to execute -- so `codesign -dv`
+          # succeeding proves nothing and this gate's first draft wrongly failed
+          # on it.  What must be absent is the real Developer ID identity: if the
+          # team shows up here, a certificate leaked into the runner and this
+          # job has stopped exercising the unsigned path it exists to test.
+          team=$(codesign -dv --verbose=4 "$app" 2>&1 | sed -n 's/^TeamIdentifier=//p')
+          if [ "${team:-}" = "CC8UTF7ATG" ]; then
+            echo "::error::the gate bundle carries Developer ID team ${team}; it must exercise the unsigned path"
+            exit 1
+          fi
+          echo "unsigned arm64 bundle at ${app}${team:+ (ad-hoc, team ${team})}"

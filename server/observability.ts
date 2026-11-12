@@ -10,6 +10,7 @@
 // DSN never reaches a log line, a status field, or a broadcast frame; only
 // the ingest host and the project id do.
 import { observabilitySettings, type ObservabilitySettings } from "./config.ts";
+import { runtimeBuildIdentity } from "./runtime-identity.ts";
 import { secretSource } from "./secret-map.ts";
 import {
   applySentryConfig,
@@ -17,16 +18,26 @@ import {
   getSentry,
   isSentryActive,
   MALFORMED_DSN_MESSAGE,
+  SENTRY_DELIVERY_NOT_READY_MESSAGE,
   sentryDsnFromEnv,
   sentryRuntimeState,
   type SentryRuntimeInput,
   type SentrySource,
 } from "./sentry.ts";
+import {
+  applySentryFleetConfig,
+  resetSentryFleetForTests,
+  resolveSentryFleetDsn,
+  sentryFleetState,
+} from "./sentry-fleet.ts";
 
 export interface ObservabilityStatusView {
-  /** Reporting is actually meant to be happening: a DSN is stored and the
-   * kill switch is on.  The Settings pill reads straight off this. */
+  /** Configuration fact: a valid DSN is on file and the kill switch is on.
+   *  The renderer uses this to decide whether it should keep a browser
+   *  client — not whether the Node SDK has finished restarting. */
   enabled: boolean;
+  /** Whether the harness Node SDK can deliver events right now. */
+  delivering: boolean;
   /** The stored switch before DSN/configuration validity is folded in. */
   requestedEnabled: boolean;
   configured: boolean;
@@ -43,6 +54,9 @@ export interface ObservabilityStatusView {
   uiTracesSampleRate: number;
   logsEnabled: boolean;
   profilingAvailable: boolean;
+  /** True when `SENTRY_FLEET_DSN` resolved to a valid DSN.  Host only. */
+  fleetExportConfigured: boolean;
+  fleetExportHost: string | null;
   totalCaptured: number;
   lastEventAt: string | null;
   lastError: string | null;
@@ -102,12 +116,14 @@ class ObservabilityManager {
       uiTracesSampleRate: settings.uiTracesSampleRate,
       logsEnabled: settings.logsEnabled,
       source,
+      release: runtimeBuildIdentity.sourceCommit,
     };
   }
 
   /** Re-read the config and bring the Sentry client in line with it. */
   async apply(): Promise<ObservabilityStatusView> {
     await applySentryConfig(this.resolve());
+    applySentryFleetConfig(resolveSentryFleetDsn({ observability: { sentryFleetDsn: this.settings().fleetDsn ?? undefined } }));
     return this.getStatus();
   }
 
@@ -122,8 +138,11 @@ class ObservabilityManager {
     // is on file — that is what makes a malformed DSN legible rather than
     // looking like nothing was set.
     const malformed = input.dsn !== null && parsed === null;
+    const wantsReporting = input.enabled && input.dsn !== null && !malformed;
+    const delivering = wantsReporting && isSentryActive();
     return {
-      enabled: input.enabled && input.dsn !== null && !malformed,
+      enabled: wantsReporting,
+      delivering,
       requestedEnabled: input.enabled,
       configured: input.dsn !== null,
       source: this.dsnFromVault() ? "infisical" : input.source,
@@ -136,6 +155,8 @@ class ObservabilityManager {
       uiTracesSampleRate: input.uiTracesSampleRate ?? 0.1,
       logsEnabled: input.logsEnabled,
       profilingAvailable: runtime.profilingAvailable,
+      fleetExportConfigured: sentryFleetState().configured && sentryFleetState().active,
+      fleetExportHost: sentryFleetState().host,
       totalCaptured: this.totalCaptured,
       lastEventAt: this.lastEventAt,
       // The runtime only knows what the last `apply()` saw; a DSN that has
@@ -168,7 +189,7 @@ class ObservabilityManager {
     if (!status.configured) {
       return { ok: false, error: "Set a Sentry DSN first.", eventId: null };
     }
-    if (!status.enabled) {
+    if (!status.requestedEnabled) {
       return {
         ok: false,
         error: "Diagnostics are turned off.  Turn them on to send a test event.",
@@ -209,6 +230,7 @@ class ObservabilityManager {
     this.totalCaptured = 0;
     this.lastEventAt = null;
     this.settingsProvider = null;
+    resetSentryFleetForTests();
   }
 }
 
@@ -229,6 +251,9 @@ export function observabilityBootLine(view: ObservabilityStatusView): string {
   }
   if (!view.enabled) {
     return "[sentry] disabled by settings: a DSN is stored, diagnostics are turned off";
+  }
+  if (!view.delivering) {
+    return `[sentry] starting (${view.source}): ${SENTRY_DELIVERY_NOT_READY_MESSAGE.slice(0, 120)}`;
   }
   const parts = [
     `[sentry] enabled (${view.source})`,

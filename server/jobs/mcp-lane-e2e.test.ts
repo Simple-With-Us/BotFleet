@@ -225,6 +225,6 @@ describe("a proxy spawned without jobs", () => {
     const bareNames = tools.map((t) => t.name);
     for (const name of ["job_start", "job_output", "job_list", "job_kill"]) expect(bareNames).not.toContain(name);
     // The fleet tools this wire already shipped are untouched.
-    expect(bareNames).toContain("ask_bot");
+    expect(bareNames).toContain("coordinate_bots");
   });
 });

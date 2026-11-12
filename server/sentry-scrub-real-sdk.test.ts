@@ -17,7 +17,6 @@ beforeAll(() => {
   Sentry.init({
     dsn: "https://public@example.invalid/1",
     tracesSampleRate: 1,
-    enableLogs: true,
     transport: () => ({
       send: async (envelope) => {
         envelopes.push(JSON.stringify(envelope));
@@ -26,10 +25,11 @@ beforeAll(() => {
       flush: async () => true,
     }),
     integrations: [Sentry.httpIntegration({ ignoreIncomingRequests: (urlPath) => isWebhookIngressPath(urlPath) })],
+    traceLifecycle: "static",
     beforeSend: (event) => safeScrubHook(event),
     beforeSendTransaction: (event) => safeScrubHook(event),
     beforeSendLog: (log) => safeScrubHook(log),
-    dataCollection: { httpBodies: [], httpHeaders: { request: false, response: false }, cookies: false, queryParams: false },
+    dataCollection: { httpBodies: [], httpHeaders: { request: false, response: false }, cookies: false, urlQueryParams: false },
   });
 });
 
@@ -94,7 +94,11 @@ describe("webhook-secret scrub against the real Sentry SDK", () => {
     const server = http.createServer((req, res) => {
       Sentry.addBreadcrumb({ category: "console", message: `got ${req.url}` });
       Sentry.captureException(new Error("webhook receiver broke"));
-      Sentry.startSpan({ name: "invoke_agent hook", op: "gen_ai.invoke_agent" }, () => {});
+      // v11 attaches this span to the ignored HTTP /hooks parent unless it
+      // starts its own trace, which then never reaches the transport.
+      Sentry.startNewTrace(() => {
+        Sentry.startSpan({ name: "invoke_agent hook", op: "gen_ai.invoke_agent" }, () => {});
+      });
       res.end("ok");
     });
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));

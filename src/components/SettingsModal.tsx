@@ -3,8 +3,8 @@
 // is the stuff shared by every bot: who you are, your keys, and the
 // machine your bots can borrow.
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Activity, Coins, Globe, KeyRound, Layers, Monitor, Smartphone, Terminal, User, X } from "lucide-react";
-import { api, useStore, type AppSettingsSection, type ConfigStatus } from "@/state/store";
+import { Activity, Coins, Gauge, Globe, KeyRound, Layers, Monitor, Smartphone, Terminal, User, X } from "lucide-react";
+import { ApiError, api, useStore, type AppSettingsSection, type ConfigStatus } from "@/state/store";
 import { searchSettings, type SettingsSearchItem } from "@/lib/settings-search";
 import { SettingsSearchResultsView } from "./SettingsSearchResultsView";
 import { SETTINGS_SECTIONS, SettingsNav } from "./SettingsNav";
@@ -13,6 +13,7 @@ import {
   ROOM_LABEL_MAX_LENGTH,
   ROOM_TERMINOLOGY_OPTIONS,
   ROOM_TERMINOLOGY_PRESETS,
+  lowerRoomLabels,
   suggestPlural,
   type RoomLabels,
   type RoomTerminology,
@@ -23,27 +24,44 @@ import {
   parseConversationMode,
   type ConversationMode,
 } from "../../shared/conversation-mode";
+import {
+  conversationModeFailureCopy,
+  simpleMergeConflictLabel,
+  simpleMergeConflicts,
+  simpleMergeRefusal,
+  type SimpleMergeConflict,
+} from "../../shared/task-workspace-context";
+import {
+  BUSY_SEND_DEFAULTS,
+  parseBusySendDefault,
+  type BusySendDefault,
+} from "../../shared/busy-send-default.ts";
 import { analyticsEnabled, setAnalyticsEnabled } from "@/lib/analytics";
 import { showToolCallsEnabled, skillRecorderEnabled, summarizeToolCallsEnabled } from "@/lib/feature-flags";
 import { ApiKeyRow, EngineKeyRow, VpsConnection } from "./ApiKeys";
 import { LinqSettings } from "./LinqSettings";
 import { useUpdaterState } from "@/lib/updater";
 import {
+  activeDrain,
   availableLabel,
+  drainLabel,
   idleLabel,
-  installBlockedBusy,
+  installPausesWork,
+  PAUSES_WORK_COPY,
   installBlockedReason,
   installedLabel,
   lastRunDetail,
   lastRunLabel,
   runningLabel,
   updateSource,
+  useNow,
   useUpdateControl,
 } from "@/lib/update-control";
 import { EnginesSettings } from "./EnginesSettings";
 import { FleetModelsSection } from "./FleetModelsSection";
 import { BotComputerDefaults } from "./BotComputerDefaults";
 import { LocalComputerSection } from "./LocalComputerSection";
+import { HostCliIntegrationCard } from "./HostCliIntegrationCard";
 import { LocalVmRuntimeCard } from "./LocalVmRuntimeCard";
 import { SharedVpsRuntimeCard } from "./SharedVpsRuntimeCard";
 import { CompanionSection } from "./CompanionSection";
@@ -51,10 +69,13 @@ import { RemoteAccessSection } from "./RemoteAccessSection";
 import { Card } from "./SettingsPrimitives";
 import { UsageSection } from "./UsageSection";
 import { ObservabilitySection } from "./ObservabilitySection";
+import { ResourcesSection } from "./ResourcesSection";
+import { scrollToSettingDomId } from "./scroll-to-setting";
 import { SecretsSection } from "./SecretsSection";
 import { SkinPicker } from "./SkinPicker";
 import { RoomTurnTimeoutSettings } from "./RoomTurnTimeoutSettings";
 import { TranscriptionSettings } from "./TranscriptionSettings";
+import { StsSettings } from "./StsSettings";
 import { QdrantRagConnection } from "./QdrantRagConnection";
 import { cn } from "@/lib/cn";
 import { putAutomaticUpdateSetting } from "@/lib/automatic-update-setting";
@@ -105,6 +126,7 @@ const SECTION_ICONS: Record<AppSettingsSection, typeof User> = {
   usage: Coins,
   observability: Activity,
   secrets: KeyRound,
+  resources: Gauge,
 };
 
 /** Name + email, persisted to /api/config {profile} on blur. */
@@ -348,7 +370,7 @@ function CustomIngressFields() {
           checked={enabled}
           onChange={toggleEnabled}
           className="accent-ink"
-          aria-label="Enable custom webhook domain"
+          aria-label="Enable Custom Webhook Domain"
         />
         Enable Custom Webhook Domain
       </label>
@@ -365,13 +387,13 @@ function CustomIngressFields() {
             // a new URL invalidates the previous test result
             if (test && test.kind !== "running") setTest(null);
           }}
-          placeholder="https://agents.botfleet.app"
+          placeholder="https://bots.botfleet.app"
           disabled={!enabled || useFreeUrl}
           className={inputClass}
         />
         <div className="text-[12px] text-ink-secondary leading-relaxed">
           {enabled
-            ? "If you run your own Cloudflare Tunnel (e.g. agents.botfleet.app), enter its public URL here to route webhooks."
+            ? "If you run your own Cloudflare Tunnel (e.g. bots.botfleet.app), enter its public URL here to route webhooks."
             : `When this is off, the saved URL is kept on disk but BotFleet advertises its local webhook receiver instead.${"\u00A0 "}Flip the switch back on to apply it again.`}
         </div>
       </div>
@@ -460,6 +482,9 @@ function UpdatesRow() {
   // only path that works there — and on a Mac that has both, it is the one
   // that can actually install without waiting for a published build.
   const local = useUpdateControl();
+  // A countdown while an update holds new work, so it ticks; a hook, so it
+  // comes before the early return below.
+  const holdNow = useNow(local.status?.drain ? 1_000 : null);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const hasBridge = Boolean(window.ogb?.updater);
@@ -488,12 +513,13 @@ function UpdatesRow() {
   // Why Install Update is down.  The harness ships a reason with every
   // refusal it can see coming, and no surface rendered one — so a card with an
   const blockedReason = source === "harness" ? installBlockedReason(status) : null;
-  const isBusyBlocked = installBlockedBusy(status);
-  const isBlocked = blockedReason !== null && !isBusyBlocked;
-  const subtitleReason = isBusyBlocked ? "Work will pause and resume after update" : blockedReason;
+  const isBlocked = blockedReason !== null;
+  const subtitleReason = blockedReason ?? (source === "harness" && installPausesWork(status) ? PAUSES_WORK_COPY : null);
+  // How many messages are saved for after the restart, and when it begins.
+  const holdLine = source === "harness" ? drainLabel(activeDrain(status, holdNow), holdNow) : null;
   const subtitle =
     source === "harness" && status
-      ? `Installed ${installedLabel(status)}.${"\u00A0 "}${harnessLine}${subtitleReason ? `.${"\u00A0 "}${subtitleReason}` : ""}`
+      ? `Installed ${installedLabel(status)}.${"\u00A0 "}${harnessLine}${subtitleReason ? `.${"\u00A0 "}${subtitleReason}` : ""}${holdLine ? `${"\u00A0 "}${holdLine}` : ""}`
       : `${feedLabel}${"\u00A0 "}Auto-checks at most once per 6 hours;${"\u00A0 "}you can manually check any time if an update is available.`;
   const lastRun = source === "harness" ? lastRunLabel(status?.lastRun ?? null) : null;
   // The updater's own message for that run — a hover only, never inline.
@@ -528,7 +554,7 @@ function UpdatesRow() {
                 }
               }}
             />
-            Enable automatic update checks
+            Enable Automatic Update Checks
           </label>
         )}
         {saveError && (
@@ -566,7 +592,7 @@ function UpdatesRow() {
             </button>
             {hasUpdate && (
               <button
-                onClick={() => void local.install({ force: true })}
+                onClick={() => void local.install()}
                 disabled={local.busy !== null || isBlocked}
                 className="rounded-lg bg-accent px-3 py-1.5 text-[13px] font-medium text-white disabled:bg-control disabled:text-ink-secondary"
               >
@@ -625,15 +651,20 @@ function UpdateNotificationsRow() {
   );
 }
 
-function ConversationModeRow() {
+export function ConversationModeRow() {
   const { state, dispatch } = useStore();
   const current = parseConversationMode(state.config?.conversationMode);
+  const labels = state.config?.roomLabels ?? { singular: "Channel", plural: "Channels" };
+  // Mid-sentence form:  keeps the capitals of a custom proper noun such as HUB.
+  const lower = lowerRoomLabels(labels);
   const [saving, setSaving] = useState(false);
   const [pendingSimple, setPendingSimple] = useState(false);
+  const [mergeConflicts, setMergeConflicts] = useState<SimpleMergeConflict[]>([]);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const save = async (conversationMode: ConversationMode, mergeThreads = false) => {
     if (saving) return;
     setSaving(true);
-    setPendingSimple(false);
+    setSaveError(null);
     try {
       // `mergeThreads` is absent rather than false when the caller did not
       // ask for it, so each payload stays one the route actually documents.
@@ -645,28 +676,41 @@ function ConversationModeRow() {
         body: JSON.stringify(payload),
       });
       dispatch({ type: "configStatus", config });
-    } catch {
+      setPendingSimple(false);
+      setMergeConflicts([]);
+    } catch (error) {
+      if (error instanceof ApiError) {
+        const serverMessage = typeof error.body?.error === "string" ? error.body.error : error.message;
+        setSaveError(conversationModeFailureCopy(error.status, serverMessage));
+      } else {
+        setSaveError(conversationModeFailureCopy(undefined, undefined));
+      }
     } finally {
       setSaving(false);
     }
   };
   const choose = (conversationMode: ConversationMode) => {
     if (saving || conversationMode === current) return;
+    setSaveError(null);
     if (conversationMode === "simple" && current === "projects") {
+      setMergeConflicts(simpleMergeConflicts([...state.bots, ...state.groups]));
       setPendingSimple(true);
       return;
     }
+    setPendingSimple(false);
     void save(conversationMode);
   };
   return (
     <Card
-      title="Workspace Layout"
-      subtitle="Simple is Grok-style: named bots with one conversation each, plus group threads.  Projects hide named bots and treat the room word as a category that any number of threads can sit under."
+      title="Workspace Arrangement"
+      subtitle={`Choose how your bots and ${lower.plural} are structured.${"\u00A0 "}Simple is Grok-style with named bots, while ${lower.plural} mode treats each ${lower.singular} as a category for threads.`}
     >
       <div className="flex flex-col gap-2">
         {CONVERSATION_MODES.map((mode) => {
           const copy = CONVERSATION_MODE_COPY[mode];
           const selected = current === mode;
+          const displayTitle = mode === "projects" ? labels.plural : copy.title;
+          const displaySubtitle = copy.subtitle(lower.singular);
           return (
             <button
               key={mode}
@@ -679,38 +723,62 @@ function ConversationModeRow() {
                 selected ? "border-accent bg-accent/10" : "border-hairline/40 hover:bg-raised/60",
               )}
             >
-              <div className="text-[14px] font-medium text-ink">{copy.title}</div>
-              <div className="mt-0.5 text-[12px] leading-relaxed text-ink-secondary">{copy.subtitle}</div>
+              <div className="text-[14px] font-medium text-ink">{displayTitle}</div>
+              <div className="mt-0.5 text-[12px] leading-relaxed text-ink-secondary">{displaySubtitle}</div>
             </button>
           );
         })}
         {pendingSimple && (
-          <div className="rounded-lg border border-hairline/40 bg-raised/40 px-3 py-2.5">
-            <div className="text-[14px] font-medium text-ink">Merge Extra Threads?</div>
-            <div className="mt-0.5 text-[12px] leading-relaxed text-ink-secondary">
-              Simple is one conversation per bot.{"\u00A0"} Merge extra threads into that conversation, or keep them saved but hidden.
-            </div>
+          <div className="rounded-lg border border-hairline/40 bg-raised/40 px-3 py-2.5" data-testid="simple-merge-prompt">
+            {mergeConflicts.length > 0 ? (
+              <div data-testid="simple-merge-refusal">
+                <div className="text-[14px] font-medium text-ink">These Stay Separate</div>
+                <p className="mt-0.5 text-[12px] leading-relaxed text-ink-secondary">
+                  {simpleMergeRefusal(mergeConflicts)}
+                </p>
+                <ul className="mt-2 flex flex-col gap-0.5">
+                  {mergeConflicts.map((conflict) => (
+                    <li key={conflict.threadId} className="text-[12px] text-ink-secondary">
+                      <span className="text-ink">{conflict.title}</span>
+                      {"\u00A0 "}— {simpleMergeConflictLabel(conflict.reason)}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : (
+              <>
+                <div className="text-[14px] font-medium text-ink">Merge Extra Threads?</div>
+                <div className="mt-0.5 text-[12px] leading-relaxed text-ink-secondary">
+                  Simple is one conversation per bot.{"\u00A0"} Merge extra threads into that conversation, or keep them saved and out of the sidebar.
+                </div>
+              </>
+            )}
             <div className="mt-2 flex flex-wrap gap-2">
-              <button
-                type="button"
-                disabled={saving}
-                onClick={() => void save("simple", true)}
-                className="rounded-lg border border-accent bg-accent/10 px-3 py-1.5 text-[13px] font-medium text-ink"
-              >
-                Merge All Threads
-              </button>
+              {mergeConflicts.length === 0 && (
+                <button
+                  type="button"
+                  disabled={saving}
+                  onClick={() => void save("simple", true)}
+                  className="rounded-lg border border-accent bg-accent/10 px-3 py-1.5 text-[13px] font-medium text-ink"
+                >
+                  Merge All Threads
+                </button>
+              )}
               <button
                 type="button"
                 disabled={saving}
                 onClick={() => void save("simple")}
                 className="rounded-lg border border-hairline/40 px-3 py-1.5 text-[13px] font-medium text-ink hover:bg-raised/60"
               >
-                Keep Extra Threads Hidden
+                Keep Them Out of the Sidebar
               </button>
               <button
                 type="button"
                 disabled={saving}
-                onClick={() => setPendingSimple(false)}
+                onClick={() => {
+                  setPendingSimple(false);
+                  setSaveError(null);
+                }}
                 className="rounded-lg px-3 py-1.5 text-[13px] text-ink-secondary hover:text-ink"
               >
                 Cancel
@@ -718,6 +786,71 @@ function ConversationModeRow() {
             </div>
           </div>
         )}
+        {saveError && (
+          <p role="alert" data-testid="conversation-mode-error" className="text-[12px] leading-relaxed text-danger">
+            {saveError}
+          </p>
+        )}
+      </div>
+    </Card>
+  );
+}
+
+const BUSY_SEND_COPY = {
+  queue: {
+    title: "Queue",
+    subtitle: "While a bot is working, Enter holds your message until the turn finishes.  Use Steer Now when you need to interrupt.",
+  },
+  steer: {
+    title: "Steer",
+    subtitle: "While a bot is working, Enter sends into the running turn when the engine supports it, or stops the turn and sends when it does not.",
+  },
+} satisfies Record<BusySendDefault, { title: string; subtitle: string }>;
+
+export function BusySendDefaultRow() {
+  const { state, dispatch } = useStore();
+  const current = parseBusySendDefault(state.config?.busySendDefault);
+  const [saving, setSaving] = useState(false);
+  const save = async (busySendDefault: BusySendDefault) => {
+    if (saving || busySendDefault === current) return;
+    setSaving(true);
+    try {
+      const config: ConfigStatus = await api("/api/busy-send-default", {
+        method: "PATCH",
+        body: JSON.stringify({ busySendDefault }),
+      });
+      dispatch({ type: "configStatus", config });
+    } catch {
+    } finally {
+      setSaving(false);
+    }
+  };
+  return (
+    <Card
+      title="Busy Sends"
+      subtitle="Choose what happens when you send while a bot is already working.  Each send can still override this from the composer."
+    >
+      <div className="flex flex-col gap-2">
+        {BUSY_SEND_DEFAULTS.map((mode) => {
+          const copy = BUSY_SEND_COPY[mode];
+          const selected = current === mode;
+          return (
+            <button
+              key={mode}
+              type="button"
+              disabled={saving}
+              aria-pressed={selected}
+              onClick={() => void save(mode)}
+              className={cn(
+                "rounded-lg border px-3 py-2.5 text-left",
+                selected ? "border-accent bg-accent/10" : "border-hairline/40 hover:bg-raised/60",
+              )}
+            >
+              <div className="text-[14px] font-medium text-ink">{copy.title}</div>
+              <div className="mt-0.5 text-[12px] leading-relaxed text-ink-secondary">{copy.subtitle}</div>
+            </button>
+          );
+        })}
       </div>
     </Card>
   );
@@ -864,7 +997,7 @@ function AnalyticsRow() {
   return (
     <Card
       title="Usage Analytics"
-      subtitle="Anonymous product events — app opened, which features get used. Never conversations, prompts, file contents, or bot output. Your email is only attached if you shared it during setup."
+      subtitle={"Anonymous product events — app opened, which features get used.\u00a0 Never conversations, prompts, file contents, or bot output.\u00a0 Your email is only attached if you shared it during setup."}
     >
       <button
         role="switch"
@@ -917,7 +1050,7 @@ function ToolCallsRow() {
           <div className="min-w-0">
             <div className="text-[14px] font-medium text-ink">Show tool calls</div>
             <div className="mt-0.5 text-[12px] leading-relaxed text-ink-secondary">
-              Named chips for Bash, search, and other tools. Errors and bot-to-bot messages still appear.
+              Named chips for Bash, search, and other tools.{"\u00a0 "}Errors and bot-to-bot messages still appear.
             </div>
           </div>
           <button
@@ -982,7 +1115,7 @@ function ExperimentalFeaturesRow() {
   return (
     <Card
       title="Experimental Features"
-      subtitle="Early features may change while we test them. They stay off unless you enable them."
+      subtitle={"Early features may change while we test them.\u00a0 They stay off unless you enable them."}
     >
       <div className="flex items-center justify-between gap-4">
         <div className="min-w-0">
@@ -1036,7 +1169,7 @@ function DiagnosticsRow() {
   return (
     <Card
       title="Diagnostics"
-      subtitle="Versions, configuration on/off state and a redacted server log tail. Review the file before sharing it."
+      subtitle={"Versions, configuration on/off state and a redacted server log tail.\u00a0 Review the file before sharing it."}
     >
       <div className="flex min-w-0 flex-col items-end gap-2">
         <button
@@ -1057,6 +1190,45 @@ function DiagnosticsRow() {
         ) : null}
       </div>
     </Card>
+  );
+}
+
+// Which build is running. Deliberately the quietest thing in General: it is
+// there to be read when something looks wrong and copied into a bug report,
+// not to be configured. Nothing here is editable, and a build that has not
+// answered yet simply renders nothing rather than a placeholder.
+function BuildInfoRow() {
+  const [info, setInfo] = useState<AppRuntimeInfo | null>(null);
+
+  useEffect(() => {
+    let live = true;
+    const ogb = window.ogb;
+    if (!ogb?.appInfo) return;
+    ogb
+      .appInfo()
+      .then((value) => {
+        if (live) setInfo(value);
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, []);
+
+  if (!info) return null;
+
+  return (
+    <div className="flex items-center gap-2 px-1 pt-1 text-[12px] text-ink-secondary">
+      <span className="font-mono">{info.summary}</span>
+      <button
+        type="button"
+        onClick={() => void navigator.clipboard?.writeText(info.summary)}
+        aria-label="Copy build details"
+        className="rounded px-1.5 py-0.5 text-[11px] text-ink-secondary hover:bg-control hover:text-ink"
+      >
+        Copy
+      </button>
+    </div>
   );
 }
 
@@ -1091,17 +1263,6 @@ export function SettingsModal() {
     };
   }, []);
 
-  const HIGHLIGHT_CLASSES = [
-    "ring-2",
-    "ring-accent",
-    "ring-offset-2",
-    "ring-offset-panel",
-    "shadow-[0_0_20px_rgba(33,139,255,0.35)]",
-    "rounded-xl",
-    "transition-all",
-    "duration-300",
-  ];
-
   const handleNavigateToSetting = (item: SettingsSearchItem) => {
     setQuery("");
     setSelectedSectionFilter(null);
@@ -1115,22 +1276,9 @@ export function SettingsModal() {
       setHighlightedDomId(null);
     }, 2600);
 
-    setTimeout(() => {
-      const el = document.getElementById(item.domId);
-      if (el) {
-        el.scrollIntoView({ behavior: "smooth", block: "center" });
-        el.classList.add(...HIGHLIGHT_CLASSES);
-        setTimeout(() => {
-          el.classList.remove(
-            "ring-2",
-            "ring-accent",
-            "ring-offset-2",
-            "ring-offset-panel",
-            "shadow-[0_0_20px_rgba(33,139,255,0.35)]",
-          );
-        }, 2600);
-      }
-    }, 80);
+    // The target card mounts its id only after its fetch resolves, so wait
+    // for it instead of racing a fixed timeout (see scroll-to-setting.ts).
+    scrollToSettingDomId(item.domId);
   };
 
   const highlightClass = (domId: string) =>
@@ -1349,7 +1497,7 @@ export function SettingsModal() {
                     id="setting-general-profile"
                     className={highlightClass("setting-general-profile")}
                     title="Profile"
-                    subtitle="Shown in the sidebar. Saved as you go."
+                    subtitle={"Shown in the sidebar.\u00a0 Saved as you go."}
                   >
                     <ProfileFields />
                   </Card>
@@ -1366,6 +1514,9 @@ export function SettingsModal() {
                   </div>
                   <div id="setting-general-conversation-mode" className={highlightClass("setting-general-conversation-mode")}>
                     <ConversationModeRow />
+                  </div>
+                  <div id="setting-general-busy-send" className={highlightClass("setting-general-busy-send")}>
+                    <BusySendDefaultRow />
                   </div>
                   <Card
                     id="setting-general-room-turn-timeout"
@@ -1393,6 +1544,9 @@ export function SettingsModal() {
                   <div id="setting-general-analytics" className={highlightClass("setting-general-analytics")}>
                     <AnalyticsRow />
                   </div>
+                  <div id="setting-general-build" className={highlightClass("setting-general-build")}>
+                    <BuildInfoRow />
+                  </div>
                 </>
               )}
 
@@ -1415,6 +1569,9 @@ export function SettingsModal() {
                     ) : null}
                     <div id="setting-connections-transcription" className={highlightClass("setting-connections-transcription")}>
                       <TranscriptionSettings />
+                    </div>
+                    <div id="setting-connections-sts" className={highlightClass("setting-connections-sts")}>
+                      <StsSettings />
                     </div>
                     <div id="setting-connections-api-keys" className={cn("flex flex-col gap-4", highlightClass("setting-connections-api-keys"))}>
                       <ApiKeyRow section="box" />
@@ -1465,7 +1622,7 @@ export function SettingsModal() {
                   id="setting-engines-clis"
                   className={highlightClass("setting-engines-clis")}
                   title="Engine CLIs"
-                  subtitle="Which binary each engine runs. Saved as you go."
+                  subtitle={"Which binary each engine runs.\u00a0 Saved as you go."}
                 >
                   <EnginesSettings highlightClass={highlightClass} />
                 </Card>
@@ -1487,6 +1644,9 @@ export function SettingsModal() {
                 <>
                   <div id="setting-computers-providers" className={highlightClass("setting-computers-providers")}>
                     <LocalComputerSection />
+                  </div>
+                  <div className={highlightClass("setting-computers-cli-credentials")}>
+                    <HostCliIntegrationCard />
                   </div>
                   <div id="setting-computers-local-vm" className={highlightClass("setting-computers-local-vm")}>
                     <LocalVmRuntimeCard />
@@ -1517,6 +1677,8 @@ export function SettingsModal() {
                   <SecretsSection />
                 </div>
               )}
+
+              {section === "resources" && <ResourcesSection highlightClass={highlightClass} />}
             </div>
           )}
         </div>

@@ -26,6 +26,11 @@
 //      and (in loop.test.ts) a test row.
 //   2. The messages array lives here and is only appended to, so the
 //      prefix the provider already saw stays byte-identical across rounds.
+//      One exception: a tool result over the history threshold is replaced
+//      with a head, a tail, and an artifact pointer after the round that
+//      received the full text (server/tool-result-history.ts).  Later
+//      rounds do not re-send the body.  Results under the threshold are
+//      never rewritten.
 //   3. Usage sums across rounds and is carried on the terminal event, on
 //      the error path as well as the success path.
 //   4. `item.completed` for a tool carries the REAL outcome, emitted after
@@ -58,6 +63,12 @@ import { ProviderError } from "../../contracts.ts";
 import { DEFAULT_MAX_TOOL_ROUNDS } from "../../../shared/bot-profile.ts";
 import { parseToolArguments, toolFields } from "../../tool-fields.ts";
 import { captureOutput } from "../../../shared/item-io.ts";
+import {
+  compactDeliveredToolResults,
+  resolveToolResultHistoryChars,
+  sharedToolResultArtifacts,
+  type ToolResultArtifactStore,
+} from "../../tool-result-history.ts";
 import { RETRY_MAX_ATTEMPTS, classifyError, computeBackoff, interruptibleDelay } from "../retry.ts";
 import { UNHINTED_RATE_LIMIT_ATTEMPTS, httpFailureOf, httpRetryPolicy, isPrematureCloseError } from "./errors.ts";
 
@@ -188,6 +199,9 @@ export interface TurnUsage {
   input: number;
   output: number;
   cachedInput?: number;
+  /** The reasoning share of `output` (already inside it), when the provider
+   *  reports it: `completion_tokens_details.reasoning_tokens`. */
+  reasoning?: number;
 }
 
 /** What one model request produced. */
@@ -294,6 +308,13 @@ export interface TurnLoopDeps {
    *  this tool needs longer than the uniform per-tool ceiling.  Absent, or a
    *  tool with no override, keeps `budget.toolTimeoutMs`. */
   tools?: ReadonlyArray<{ name: string; timeoutMs?: number }>;
+  /** Characters of a tool result kept in the messages array after the round
+   *  that saw the full text.  Absent uses 8,000.  `0` leaves every result
+   *  whole, which is the old re-send behaviour. */
+  toolResultHistoryChars?: number;
+  /** Where the full text goes when history keeps only an excerpt.  Absent
+   *  uses the process store `read_tool_result` reads. */
+  toolResultArtifacts?: ToolResultArtifactStore;
 }
 
 /** A tool's arguments are declared as a JSON object schema; anything else on
@@ -315,9 +336,9 @@ function unrefTimer(timer: ReturnType<typeof setTimeout>): void {
 }
 
 /** Push a pending timer's deadline out by its full delay, in place.  Node's
- *  `Timeout.refresh()` does that without allocating, which matters on a
- *  path that runs once per streamed chunk; where it is missing the caller
- *  re-arms instead. */
+ *  `Timeout.refresh()` does that without allocating, which matters on a path
+ *  that runs once per streamed chunk; where it is missing the caller re-arms
+ *  instead. */
 function refreshTimer(timer: ReturnType<typeof setTimeout>): boolean {
   const handle: { refresh?: () => unknown } = timer;
   if (typeof handle.refresh !== "function") return false;
@@ -353,6 +374,16 @@ export async function runTurnLoop(deps: TurnLoopDeps): Promise<TurnLoopExit> {
   const now = deps.now ?? Date.now;
   const startedAt = now();
   const messages = deps.messages;
+  const historyChars = resolveToolResultHistoryChars(deps.toolResultHistoryChars);
+  const historyStore = deps.toolResultArtifacts ?? sharedToolResultArtifacts();
+  // Anything already in the array was shown on an earlier turn.  Results
+  // appended during this turn stay full until the round after the one that
+  // received them, then this prefix is what later rounds re-send.
+  let deliveredUntil = messages.length;
+  const compactSeenToolResults = () => {
+    if (historyChars === null) return;
+    compactDeliveredToolResults(messages, deliveredUntil, { threshold: historyChars, store: historyStore });
+  };
   const announced = deps.startedToolIds ?? new Set<string>();
   const maxRounds = Math.max(1, deps.toolHost?.maxRounds ?? budget.maxRounds);
 
@@ -647,6 +678,11 @@ export async function runTurnLoop(deps: TurnLoopDeps): Promise<TurnLoopExit> {
         break;
       }
 
+      // Shorten tool results the model has already seen.  The result this
+      // round is about to receive for the first time is still past
+      // `deliveredUntil`, so this request gets that one in full.
+      compactSeenToolResults();
+
       const request = new AbortController();
       let requestTimedOut = false;
       // Which of the round's two clocks fired, for the message only: both
@@ -684,6 +720,8 @@ export async function runTurnLoop(deps: TurnLoopDeps): Promise<TurnLoopExit> {
       // Progress from the driver.  A no-op once the attempt is over or the
       // clock has fired, so a straggling chunk can never re-arm a timer for
       // a request that already ended.
+      // Refresh the deadline in place when `Timeout.refresh()` is honest
+      // (production Node): zero allocations on the per-chunk hot path.
       const noteProgress = () => {
         if (idleTimer === null || request.signal.aborted) return;
         if (!refreshTimer(idleTimer)) armIdle();
@@ -784,6 +822,7 @@ export async function runTurnLoop(deps: TurnLoopDeps): Promise<TurnLoopExit> {
               totals.output += roundState.usage.output;
               const cached = roundState.usage.cachedInput;
               if (cached !== undefined) totals.cachedInput = (totals.cachedInput ?? 0) + cached;
+              if (roundState.usage.reasoning !== undefined) totals.reasoning = (totals.reasoning ?? 0) + roundState.usage.reasoning;
               // These tokens are in `totals`, so they must be in `costSoFar`
               // too — see priceRound's own comment.
               priceRound(roundState.usage);
@@ -816,12 +855,17 @@ export async function runTurnLoop(deps: TurnLoopDeps): Promise<TurnLoopExit> {
         disarmIdle();
       }
 
+      // This round has now seen every message currently in the array.
+      // Tool results appended below stay past this index until the next round.
+      deliveredUntil = messages.length;
+
       if (result.usage) {
         sawUsage = true;
         totals.input += result.usage.input;
         totals.output += result.usage.output;
         const cached = result.usage.cachedInput;
         if (cached !== undefined) totals.cachedInput = (totals.cachedInput ?? 0) + cached;
+        if (result.usage.reasoning !== undefined) totals.reasoning = (totals.reasoning ?? 0) + result.usage.reasoning;
         // Priced from THIS round's own usage, never the running `totals`
         // — a size-tiered model must see this request's own size, not the
         // turn's cumulative size, or a multi-round turn gets billed as if
@@ -847,9 +891,8 @@ export async function runTurnLoop(deps: TurnLoopDeps): Promise<TurnLoopExit> {
         break;
       }
 
-      // The prefix the provider already saw is never rewritten — only
-      // appended to — which is what keeps prompt caching reachable and what
-      // removed the duplicate-replay bug the transcript rebuild had.
+      // Append only.  An oversized tool result already in the prefix is
+      // replaced before the next request, after this round has seen it whole.
       messages.push({ role: "assistant", content: result.text ?? "", tool_calls: calls });
 
       if (round === maxRounds) {
@@ -910,6 +953,9 @@ export async function runTurnLoop(deps: TurnLoopDeps): Promise<TurnLoopExit> {
     }
   } finally {
     clearTimeout(wallTimer);
+    // The round that saw a result has finished.  Keep the excerpt in the
+    // array the driver still holds, and the full text in the artifact store.
+    compactSeenToolResults();
     // Whatever a tool started and left running ends with the turn
     // (server/tools/process-group.ts).  Before the terminal event, so a
     // queued turn that dispatches from it never inherits this turn's work.
