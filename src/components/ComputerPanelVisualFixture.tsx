@@ -13,6 +13,7 @@
 // "Start VPS automatically" sentence and the Off-computer schedule warning
 // both render. An empty computers array hides that auto-start row.
 import { useMemo, type Dispatch } from "react";
+import { computerReach } from "../../server/computer-capability.ts";
 import { ComputerPanel } from "./ComputerPanel";
 import {
   initialState,
@@ -24,13 +25,18 @@ import {
 
 const BOT_ID = "visual-bot";
 
+const claudeCapabilities = { computerMcp: true };
+
 const claude: InstanceInfo = {
   instanceId: "claude",
   driverKind: "claude",
   displayName: "Claude",
   snapshot: { state: "available" },
   models: { default: "claude-sonnet", options: [] },
-  capabilities: { computerMcp: true },
+  capabilities: claudeCapabilities,
+  // The panel reads the reach the server ships.  A computerMcp engine can
+  // use a VPS, so these shots still reach the VPS warning cards.
+  computerReach: computerReach({ driverKind: "claude", capabilities: claudeCapabilities }),
 };
 
 function visualBot(mode: "default" | "unconfigured" | "vps-incompatible" | "source-picker"): Bot {
