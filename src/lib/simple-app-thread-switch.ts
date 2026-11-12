@@ -62,6 +62,15 @@ export function planAppThreadOpen(input: {
   const tasks = bot.tasks ?? [];
   const target = tasks.find((task) => task.threadId === threadId);
   const open = tasks.find((task) => task.threadId === bot.threadId);
+  // The open conversation already serves this App when it shares the App and the
+  // folder:  there is no boundary to protect, and the skip reason would claim a
+  // folder difference that does not exist.
+  if (
+    open?.workspaceContext?.appRef?.id === input.appId
+    && open.workspaceContext?.cwd === target?.workspaceContext?.cwd
+  ) {
+    return { action: "show", threadId: bot.threadId, activate: false };
+  }
   const reason = taskWorkspaceMergeSkipReason(target?.workspaceContext, open?.workspaceContext);
   return { action: "refuse", message: simpleAppThreadRefusal(target?.title ?? "", reason) };
 }

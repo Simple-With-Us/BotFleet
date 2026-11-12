@@ -56,6 +56,21 @@ describe("planAppThreadOpen", () => {
     });
   });
 
+  it("shows the open conversation when it serves the same App and folder as the saved one", () => {
+    const samePlace: AppThreadOpenBot = {
+      threadId: "app-a-second",
+      tasks: [
+        { threadId: "app-a-chat", title: "Build the deck", workspaceContext: context("app-a", "/repo/a") },
+        { threadId: "app-a-second", title: "Deck notes", workspaceContext: context("app-a", "/repo/a") },
+      ],
+    };
+    expect(planAppThreadOpen({ mode: "simple", bot: samePlace, appId: "app-a" })).toEqual({
+      action: "show",
+      threadId: "app-a-second",
+      activate: false,
+    });
+  });
+
   it("names a different folder inside the same App", () => {
     const otherFolder: AppThreadOpenBot = {
       threadId: "app-a-other",
