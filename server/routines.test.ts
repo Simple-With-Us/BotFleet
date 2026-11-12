@@ -53,6 +53,7 @@ function harness(start = new Date(2026, 7, 17, 8, 0, 0).getTime()) {
   const failed: any[] = [];
   const checkInStarts: Array<{ run: any; routine: any }> = [];
   const checkInFinishes: Array<{ run: any; checkInId: string; ok: boolean; onSettled?: (delivered: boolean) => void }> = [];
+  const releasedMonitors: string[] = [];
   const ephemeralFlags: boolean[] = [];
   const deliveredEphemeral: Array<{
     ownerThreadId: string;
@@ -101,6 +102,7 @@ function harness(start = new Date(2026, 7, 17, 8, 0, 0).getTime()) {
     checkInFinish: (run, checkInId, ok, onSettled) => {
       checkInFinishes.push({ run: { ...run }, checkInId, ok, onSettled });
     },
+    releaseMonitor: (slug) => releasedMonitors.push(slug),
   };
   const manager = new RoutineManager(options);
   return {
@@ -115,6 +117,7 @@ function harness(start = new Date(2026, 7, 17, 8, 0, 0).getTime()) {
     failed,
     checkInStarts,
     checkInFinishes,
+    releasedMonitors,
     ephemeralFlags,
     deliveredEphemeral,
     setNow: (value: number) => (now = value),
@@ -2954,6 +2957,110 @@ describe("bot on/off switch", () => {
     expect(h.checkInFinishes).toHaveLength(1);
     expect(h.checkInFinishes[0]).toMatchObject({ ok: false });
     expect(h.failed).toHaveLength(0);
+  });
+
+  it("reports an offline catch-up as an error check-in instead of leaving Sentry to invent missed", async () => {
+    const h = harness();
+    const routine = h.manager.create({
+      name: "Morning sweep",
+      prompt: "sweep",
+      botId: "sweeper",
+      schedule: { type: "daily", time: "09:00", weekdays: [0, 1, 2, 3, 4, 5, 6] },
+    });
+    h.setNow(routine.nextRunAt! + 12 * 60 * 60_000 + 1000);
+    await h.manager.tick();
+    expect(h.started).toHaveLength(0);
+    expect(h.manager.listRuns()[0]).toMatchObject({ outcomeCode: "missed_offline" });
+    expect(h.checkInStarts).toHaveLength(1);
+    expect(h.checkInStarts[0].run.sentryMonitorSlug).toBe(routine.sentryMonitorSlug);
+    expect(h.checkInFinishes[0]).toMatchObject({ ok: false });
+  });
+
+  it("keeps one monitor slug when a daily routine is renamed", async () => {
+    const h = harness();
+    const routine = h.manager.create({
+      name: "Mac Hetzner Health 21:00",
+      prompt: "check the host",
+      botId: "sweeper",
+      schedule: { type: "daily", time: "21:00", weekdays: [0, 1, 2, 3, 4, 5, 6] },
+    });
+    const slug = routine.sentryMonitorSlug;
+    expect(slug).toMatch(/^botfleet-[a-f0-9]+$/);
+    h.setNow(routine.nextRunAt! + 1000);
+    await h.manager.tick();
+    const renamed = h.manager.update(routine.id, { name: "Mac Coolify Health 21:00" });
+    expect(renamed?.sentryMonitorSlug).toBe(slug);
+    expect(h.checkInStarts[0].run.sentryMonitorSlug).toBe(slug);
+    expect(h.releasedMonitors).not.toContain(slug);
+    expect(h.manager.listRoutines()[0]).not.toHaveProperty("sentryMonitorSlug");
+  });
+
+  it("freezes the existing monitor slug and retires only the previous name", () => {
+    const h = harness();
+    const id = "79c6c49d-1111-2222-3333-444444444444";
+    writeFileSync(h.options.file!, JSON.stringify({
+      routines: [{
+        id,
+        name: "Mac Coolify Health 21:00",
+        prompt: "check the host",
+        botId: "sweeper",
+        runOn: "bot",
+        enabled: true,
+        schedule: { type: "daily", time: "21:00", weekdays: [0, 1, 2, 3, 4, 5, 6] },
+        durationMinutes: 30,
+        nextRunAt: 1,
+        createdAt: 1,
+        updatedAt: 1,
+      }],
+      runs: [{
+        id: "old-run",
+        routineId: id,
+        routineName: "Mac Hetzner Health 21:00",
+        botId: "sweeper",
+        runOn: "bot",
+        scheduledFor: 1,
+        status: "completed",
+        manual: false,
+        triggerSource: "schedule",
+        sentryCheckInId: "check-in-old",
+        createdAt: 1,
+      }],
+    }));
+    const released: string[] = [];
+    const restarted = new RoutineManager({
+      ...h.options,
+      releaseMonitor: (slug) => released.push(slug),
+    });
+    restarted.flushNow();
+    const disk = JSON.parse(readFileSync(h.options.file!, "utf8")) as {
+      routines: Array<{ sentryMonitorSlug?: string }>;
+    };
+    expect(disk.routines[0]?.sentryMonitorSlug).toBe("botfleet-mac-coolify-health-21-00-79c6c49d");
+    expect(released).toEqual(["botfleet-mac-hetzner-health-21-00-79c6c49d"]);
+    expect(restarted.listRoutines()[0]).not.toHaveProperty("sentryMonitorSlug");
+  });
+
+  it("retires a deleted daily monitor only after a schedule check-in was opened", async () => {
+    const h = harness();
+    const untouched = h.manager.create({
+      name: "Never ran",
+      prompt: "idle",
+      botId: "sweeper",
+      schedule: { type: "daily", time: "09:00", weekdays: [0, 1, 2, 3, 4, 5, 6] },
+    });
+    h.manager.remove(untouched.id);
+    expect(h.releasedMonitors).toEqual([]);
+    const routine = h.manager.create({
+      name: "Morning sweep",
+      prompt: "sweep",
+      botId: "sweeper",
+      schedule: { type: "daily", time: "09:00", weekdays: [0, 1, 2, 3, 4, 5, 6] },
+    });
+    h.setNow(routine.nextRunAt! + 1000);
+    await h.manager.tick();
+    expect(h.checkInStarts).toHaveLength(1);
+    h.manager.remove(routine.id);
+    expect(h.releasedMonitors).toEqual([routine.sentryMonitorSlug]);
   });
 
   it("is never recorded as missed or failed, so it cannot light the attention badge", async () => {
