@@ -193,6 +193,10 @@ posixOnly("App-bound private task API", () => {
 
     const simple = await api("PATCH", "/api/conversation-mode", { conversationMode: "simple", mergeThreads: true });
     expect(simple.status).toBe(409);
+    expect(simple.body.error).toContain("App task");
+    expect(simple.body.error).toContain("workspace stayed as it is");
+    expect(simple.body.error).not.toMatch(/\b409\b/);
+    expect(simple.body.error).not.toContain("bindings");
     expect(required((await api("GET", "/api/config")).body.conversationMode, "conversationMode")).toBe("projects");
     const after = await api("GET", "/api/bots");
     const afterTasks = required(botsFrom(after).find((entry) => entry.id === bot.id)?.tasks, "bot.tasks");

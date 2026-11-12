@@ -80,6 +80,14 @@ jobs:
         run: corepack enable && corepack prepare pnpm@10.33.0 --activate
       - run: pnpm install --frozen-lockfile
       - run: pnpm exec vite build
+      - name: Usage grid visual fixture stays out of the production bundle
+        run: |
+          if grep -R --include='*.js' -F -q 'usage-monitor-quota-grid-fixture' dist; then
+            echo 'production dist still contains the usage grid visual fixture' >&2
+            exit 1
+          fi
+      - name: Build the web shell in test mode for Playwright
+        run: pnpm exec vite build --mode test
       - run: pnpm exec playwright install --with-deps chromium
       - run: pnpm exec playwright test
       - name: Upload screenshot diffs on failure

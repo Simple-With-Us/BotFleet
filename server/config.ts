@@ -629,6 +629,8 @@ const appConfigSchema = z.object({
     // (DEFAULT_WEBHOOK_HOT_DEFER_MINUTES).  The vault knob of the same
     // field overrides the file.
     webhookHotDeferMinutes: z.number().int().min(1).max(720).optional(),
+    // Seconds to drop a repeat of an accepted webhook for the same bot and source (absent means 120, and 0 disables).
+    webhookPayloadDedupeSeconds: z.number().int().min(0).max(3600).optional(),
   }).optional(),
   // The placement transport's own two knobs (server/placement-controller-bridge.ts
   // and the lease service's unreachable window).  Both are optional: an
@@ -893,6 +895,8 @@ export interface AppConfig {
     /** Minutes a hot host may park a webhook before the wake dispatches
      *  anyway.  Absent means 20. */
     webhookHotDeferMinutes?: number;
+    /** Seconds to drop a repeat of an accepted webhook for the same bot and source (absent means 120, and 0 disables). */
+    webhookPayloadDedupeSeconds?: number;
   };
   /** The placement transport's two knobs (server/placement-controller-bridge.ts).
    *  Derived from the schema, so the type cannot drift from what the store

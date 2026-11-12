@@ -16,6 +16,6 @@ export function openCodeEngineStatusChip(instance: InstanceInfo): string | null 
   if (/listed no models/i.test(sentence) || /answered but listed no models/i.test(sentence)) {
     return "No models listed";
   }
-  if (/stopped by/i.test(sentence)) return "Probe stopped";
+  if (/stopped before/i.test(sentence)) return "Stopped early";
   return "Needs attention";
 }

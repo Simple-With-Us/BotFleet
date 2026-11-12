@@ -18,7 +18,7 @@ struct CompanionWelcomeView: View {
                 }
 
                 VStack(spacing: 12) {
-                    Text("Take your bots with you")
+                    Text("Take Your Bots With You")
                         .font(.largeTitle.bold())
                         .multilineTextAlignment(.center)
                     Text("Open chats, approve actions, and send new work from your iPhone.")
@@ -30,17 +30,17 @@ struct CompanionWelcomeView: View {
                 VStack(spacing: 18) {
                     WelcomeBenefit(
                         icon: "bubble.left.and.bubble.right.fill",
-                        title: "Your chats, in your pocket",
+                        title: "Your Chats, in Your Pocket",
                         detail: "Pick up the same conversations from your computer."
                     )
                     WelcomeBenefit(
                         icon: "checkmark.circle.fill",
-                        title: "Respond when a bot needs you",
+                        title: "Respond When a Bot Needs You",
                         detail: "Review approvals without going back to your desk."
                     )
                     WelcomeBenefit(
                         icon: "lock.shield.fill",
-                        title: "Private by design",
+                        title: "Private by Design",
                         detail: "You choose which trusted computer this phone connects to."
                     )
                 }
@@ -63,12 +63,12 @@ struct CompanionWelcomeView: View {
         .safeAreaInset(edge: .bottom) {
             VStack(spacing: 10) {
                 Button(action: onConnect) {
-                    Text("Connect my computer")
+                    Text("Connect My Computer")
                         .frame(maxWidth: .infinity)
                 }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.large)
-                Button("Not now", action: onSkip)
+                Button("Not Now", action: onSkip)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 6)
@@ -126,7 +126,7 @@ struct UnpairedHomeView: View {
                     .accessibilityHidden(true)
 
                     VStack(spacing: 8) {
-                        Text("Connect when you're ready")
+                        Text("Connect When You're Ready")
                             .font(.title2.bold())
                         Text("Pair this iPhone with BotFleet to see your chats and respond to your bots.")
                             .foregroundStyle(.secondary)
@@ -147,7 +147,7 @@ struct UnpairedHomeView: View {
             }
             .safeAreaInset(edge: .bottom) {
                 Button(action: onConnect) {
-                    Text("Connect computer")
+                    Text("Connect Computer")
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
@@ -192,9 +192,9 @@ struct NotificationOnboardingView: View {
                 .accessibilityHidden(true)
 
                 VStack(spacing: 10) {
-                    Text("Stay in the loop")
+                    Text("Stay in the Loop")
                         .font(.largeTitle.bold())
-                    Text("Get alerts while BotFleet is open or was recently in the background. Alerts stop after iOS fully suspends or closes the app.")
+                    Text("Get alerts while BotFleet is open or was recently in the background.\u{00A0} Alerts stop after iOS fully suspends or closes the app.")
                         .font(.title3)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
@@ -227,7 +227,7 @@ struct NotificationOnboardingView: View {
                 } label: {
                     HStack {
                         if enabling { ProgressView().tint(.white) }
-                        Text("Enable notifications")
+                        Text("Enable Notifications")
                     }
                     .frame(maxWidth: .infinity)
                 }
@@ -235,7 +235,7 @@ struct NotificationOnboardingView: View {
                 .controlSize(.large)
                 .disabled(enabling)
 
-                Button("Not now", action: onContinue)
+                Button("Not Now", action: onContinue)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 6)

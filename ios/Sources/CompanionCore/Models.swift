@@ -153,6 +153,13 @@ public struct CommChip: Codable, Hashable, Sendable {
     public var withColor: String
 }
 
+public struct MessageCommand: Codable, Hashable, Equatable, Sendable {
+    public var id: String
+    public var name: String
+    public var source: String
+    public var role: String
+}
+
 public struct Message: Codable, Hashable, Identifiable, Sendable {
     public enum Kind: String, Codable, Sendable {
         case text, options, activity, screen
@@ -230,6 +237,8 @@ public struct Message: Codable, Hashable, Identifiable, Sendable {
     /// User line that landed inside a running turn (server `steered: true`).
     /// Shown as the "Sent mid-turn" chip; distinct from the pending queue.
     public var steered: Bool? = nil
+    /// Set when this row is an engine command, such as compacting the session.
+    public var command: MessageCommand? = nil
 
     public var date: Date { Date(timeIntervalSince1970: at / 1000) }
 }
@@ -351,6 +360,10 @@ public struct TaskUsage: Codable, Hashable, Sendable {
     public var cachedInput: Int?
     public var costUsd: Double?
     public var turns: Int
+    /// Input tokens of the latest settled turn.  How full the window was.
+    public var lastInput: Int? = nil
+    /// Window size the engine reported with that turn, when it reported one.
+    public var contextWindow: Int? = nil
 }
 
 public struct BotTask: Codable, Hashable, Sendable {
@@ -789,12 +802,15 @@ public struct ModelOption: Codable, Hashable, Identifiable, Sendable {
     public var label: String
     public var effortLevels: [String]?
     public var supportsEffort: Bool?
+    /// Published window for this model, in tokens.  Absent when unknown.
+    public var contextWindow: Int? = nil
 
-    public init(id: String, label: String, effortLevels: [String]? = nil, supportsEffort: Bool? = nil) {
+    public init(id: String, label: String, effortLevels: [String]? = nil, supportsEffort: Bool? = nil, contextWindow: Int? = nil) {
         self.id = id
         self.label = label
         self.effortLevels = effortLevels
         self.supportsEffort = supportsEffort
+        self.contextWindow = contextWindow
     }
 }
 

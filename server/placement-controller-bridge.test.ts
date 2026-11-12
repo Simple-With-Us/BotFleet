@@ -192,7 +192,7 @@ describe("the registry bridge in a server mode on the controller", () => {
 });
 
 describe("the registry bridge on a host that does not hold the controller", () => {
-  it("refuses the start with a reason and enqueues nothing", () => {
+  it("refuses the start with a reason and enqueues nothing when forwarding is not configured", () => {
     const dir = mkdtempSync(join(tmpdir(), "bf-placement-bridge-other-"));
     made.push(dir);
     const epochStore = openControllerEpochStore(dir, controllerId);
@@ -223,6 +223,274 @@ describe("the registry bridge on a host that does not hold the controller", () =
     expect(admission.reason).toContain("does not admit jobs of its own");
     expect(admission.reason).toContain("Run the command with bash if it is short");
     expect(enqueued).toEqual([]);
+  });
+
+  it("forwards the job start to the controller when a forwarder is configured", () => {
+    const dir = mkdtempSync(join(tmpdir(), "bf-placement-bridge-fwd-"));
+    made.push(dir);
+    const epochStore = openControllerEpochStore(dir, controllerId);
+    const leases = new PlacementLeaseService({
+      hostId: controllerId,
+      controller: epochStore.read(),
+      controllerStore: epochStore,
+    });
+    const forwarded: EnqueueMessage[] = [];
+    const bridge = new PlacementControllerBridge({
+      hostId: otherHost,
+      view: () => ({
+        mode: "serverFirst",
+        controllerId: leases.controller().controllerId,
+        epoch: leases.controller().epoch,
+        acknowledged: true,
+      }),
+      enqueue: () => ({ ok: false, reason: "local enqueue should not be called on non-controller" }),
+      queuedReason: () => "stale local reason",
+      sweepUnreachable: () => leases.sweepUnreachable(),
+      forward: (message) => {
+        forwarded.push(message);
+        const result = leases.enqueue(message);
+        expect(result.ok && result.reply.queuedReason).toBe("waiting for an eligible host");
+        return result;
+      },
+    });
+    const admission = bridge.admit(request);
+    expect(admission.kind).toBe("queued");
+    if (admission.kind !== "queued") return;
+    expect(admission.jobId).toBe(request.jobId);
+    expect(admission.queuedReason).toBe("waiting for an eligible host");
+    expect(admission.controllerId).toBe(controllerId);
+    expect(admission.epoch).toBe(leases.controller().epoch);
+    expect(admission.duplicate).toBe(false);
+    expect(forwarded).toHaveLength(1);
+    expect(forwarded[0]).toMatchObject({
+      version: PLACEMENT_WIRE_VERSION,
+      controllerId,
+      epoch: leases.controller().epoch,
+      jobId: request.jobId,
+      botId: request.botId,
+      threadId: request.threadId,
+      command: request.command,
+      cwd: request.cwd,
+      timeoutMs: request.timeoutMs,
+    });
+  });
+
+  it("reports a forwarded duplicate job correctly", () => {
+    const dir = mkdtempSync(join(tmpdir(), "bf-placement-bridge-fwd-dup-"));
+    made.push(dir);
+    const epochStore = openControllerEpochStore(dir, controllerId);
+    const leases = new PlacementLeaseService({
+      hostId: controllerId,
+      controller: epochStore.read(),
+      controllerStore: epochStore,
+    });
+    const bridge = new PlacementControllerBridge({
+      hostId: otherHost,
+      view: () => ({
+        mode: "serverFirst",
+        controllerId: leases.controller().controllerId,
+        epoch: leases.controller().epoch,
+        acknowledged: true,
+      }),
+      enqueue: () => ({ ok: false, reason: "local enqueue should not be called" }),
+      queuedReason: () => "stale local reason",
+      sweepUnreachable: () => leases.sweepUnreachable(),
+      forward: (message) => leases.enqueue(message),
+    });
+    bridge.admit(request);
+    const second = bridge.admit(request);
+    expect(second.kind).toBe("queued");
+    if (second.kind !== "queued") return;
+    expect(second.duplicate).toBe(true);
+    expect(second.queuedReason).toBe("waiting for an eligible host");
+  });
+
+  it("uses the controller's queued reason and ignores the forwarding host's queue", () => {
+    const bridge = new PlacementControllerBridge({
+      hostId: otherHost,
+      view: () => ({
+        mode: "serverFirst",
+        controllerId,
+        epoch: 5,
+        acknowledged: true,
+      }),
+      enqueue: () => ({ ok: false, reason: "local enqueue should not be called" }),
+      queuedReason: () => "stale local reason",
+      sweepUnreachable: () => [],
+      forward: () => ({
+        ok: true,
+        reply: {
+          accepted: true,
+          jobId: request.jobId,
+          status: "queued",
+          controllerId,
+          epoch: 5,
+          queuedReason: "waiting for a Mac that can build",
+        },
+      }),
+    });
+    const admission = bridge.admit(request);
+    expect(admission).toMatchObject({ kind: "queued", queuedReason: "waiting for a Mac that can build" });
+  });
+
+  it("refuses when the forwarder throws, instead of letting the error escape", () => {
+    const bridge = new PlacementControllerBridge({
+      hostId: otherHost,
+      view: () => ({
+        mode: "serverFirst",
+        controllerId,
+        epoch: 5,
+        acknowledged: true,
+      }),
+      enqueue: () => ({ ok: false, reason: "local enqueue should not be called" }),
+      queuedReason: () => "stale local reason",
+      sweepUnreachable: () => [],
+      forward: () => {
+        throw new Error("connect ECONNREFUSED 127.0.0.1:8799");
+      },
+    });
+    const admission = bridge.admit(request);
+    expect(admission.kind).toBe("refused");
+    if (admission.kind !== "refused") return;
+    expect(admission.reason).toContain("could not be reached");
+    expect(admission.reason).toContain("connect ECONNREFUSED 127.0.0.1:8799");
+    expect(admission.reason).toContain("Run the command with bash if it is short");
+  });
+
+  it("refuses when the forwarder throws a non-error", () => {
+    const bridge = new PlacementControllerBridge({
+      hostId: otherHost,
+      view: () => ({
+        mode: "serverFirst",
+        controllerId,
+        epoch: 5,
+        acknowledged: true,
+      }),
+      enqueue: () => ({ ok: false, reason: "local enqueue should not be called" }),
+      queuedReason: () => undefined,
+      sweepUnreachable: () => [],
+      forward: () => {
+        throw "link down";
+      },
+    });
+    const admission = bridge.admit(request);
+    expect(admission.kind).toBe("refused");
+    if (admission.kind !== "refused") return;
+    expect(admission.reason).toContain("could not be reached");
+    expect(admission.reason).not.toContain("link down");
+  });
+
+  it("refuses a forwarded job the controller's per-thread cap rejects", () => {
+    const dir = mkdtempSync(join(tmpdir(), "bf-placement-bridge-fwd-cap-"));
+    made.push(dir);
+    const epochStore = openControllerEpochStore(dir, controllerId);
+    const leases = new PlacementLeaseService({
+      hostId: controllerId,
+      controller: epochStore.read(),
+      controllerStore: epochStore,
+    });
+    const fence = { ...leases.controller(), version: PLACEMENT_WIRE_VERSION };
+    for (let index = 0; index < JOB_CAP_PER_THREAD; index += 1) {
+      const admitted = leases.enqueue({
+        ...fence,
+        jobId: `held-${index}`,
+        botId: request.botId,
+        threadId: request.threadId,
+        command: "true",
+        cwd: "/tmp",
+        timeoutMs: 60_000,
+      });
+      expect(admitted.ok).toBe(true);
+    }
+    const bridge = new PlacementControllerBridge({
+      hostId: otherHost,
+      view: () => ({
+        mode: "serverFirst",
+        controllerId: leases.controller().controllerId,
+        epoch: leases.controller().epoch,
+        acknowledged: true,
+      }),
+      enqueue: () => ({ ok: false, reason: "local enqueue should not be called" }),
+      queuedReason: () => "stale local reason",
+      sweepUnreachable: () => [],
+      forward: (message) => leases.enqueue(message),
+    });
+    const admission = bridge.admit(request);
+    expect(admission.kind).toBe("refused");
+    if (admission.kind !== "refused") return;
+    expect(admission.reason).toContain(`${JOB_CAP_PER_THREAD} jobs running`);
+    expect(leases.job(request.jobId)).toBeNull();
+  });
+
+  it("refuses when the forwarded controller admission is refused", () => {
+    const bridge = new PlacementControllerBridge({
+      hostId: otherHost,
+      view: () => ({
+        mode: "serverFirst",
+        controllerId,
+        epoch: 5,
+        acknowledged: true,
+      }),
+      enqueue: () => ({ ok: false, reason: "local enqueue should not be called" }),
+      queuedReason: () => undefined,
+      sweepUnreachable: () => [],
+      forward: () => ({
+        ok: true,
+        reply: {
+          accepted: false,
+          jobId: request.jobId,
+          status: "refused",
+          controllerId,
+          epoch: 5,
+          reason: "controller rejected queue admission",
+        },
+      }),
+    });
+    const admission = bridge.admit(request);
+    expect(admission).toEqual({ kind: "refused", reason: "controller rejected queue admission" });
+  });
+
+  it("refuses when the forwarder reports a transport failure", () => {
+    const bridge = new PlacementControllerBridge({
+      hostId: otherHost,
+      view: () => ({
+        mode: "serverFirst",
+        controllerId,
+        epoch: 5,
+        acknowledged: true,
+      }),
+      enqueue: () => ({ ok: false, reason: "local enqueue should not be called" }),
+      queuedReason: () => undefined,
+      sweepUnreachable: () => [],
+      forward: () => ({ ok: false, reason: "connection to controller timed out" }),
+    });
+    const admission = bridge.admit(request);
+    expect(admission).toEqual({ kind: "refused", reason: "connection to controller timed out" });
+  });
+
+  it("refuses when placement mode is not acknowledged even if forwarder is present", () => {
+    const forwarded: EnqueueMessage[] = [];
+    const bridge = new PlacementControllerBridge({
+      hostId: otherHost,
+      view: () => ({
+        mode: "serverFirst",
+        controllerId,
+        epoch: 5,
+        acknowledged: false,
+      }),
+      enqueue: () => ({ ok: false, reason: "local enqueue should not be called" }),
+      queuedReason: () => undefined,
+      sweepUnreachable: () => [],
+      forward: (msg) => {
+        forwarded.push(msg);
+        return { ok: true, reply: { accepted: true, jobId: request.jobId, status: "queued", controllerId, epoch: 5 } };
+      },
+    });
+    const admission = bridge.admit(request);
+    expect(admission.kind).toBe("refused");
+    if (admission.kind !== "refused") return;
+    expect(admission.reason).toContain("not held at the current fence");
+    expect(forwarded).toEqual([]);
   });
 
   it("refuses a record that is not held at the current fence", () => {
@@ -504,15 +772,18 @@ describe("the registry under the bridge", () => {
     // registry's records.
     const fence = { ...leases.controller(), version: PLACEMENT_WIRE_VERSION };
     for (let index = 0; index < JOB_RECORD_MAX; index += 1) {
-      leases.enqueue({
+      // One job per bot and conversation, so this fills the queue bound
+      // rather than the per-bot or per-thread cap.
+      const admitted = leases.enqueue({
         ...fence,
         jobId: `job-full-${index}`,
-        botId: "bot_full",
-        threadId: "thread_full",
+        botId: `bot_full_${index}`,
+        threadId: `thread_full_${index}`,
         command: "true",
         cwd: "/tmp",
         timeoutMs: 60_000,
       });
+      expect(admitted.ok).toBe(true);
     }
     expect(leases.activeJobs()).toHaveLength(JOB_RECORD_MAX);
     const { registry, root, children } = registryHarness({

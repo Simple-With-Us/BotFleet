@@ -197,6 +197,13 @@ export interface Message {
   /** steer-queue entry this drained user line came from. Pending chips
    * match on this id, not on equal text. Absent on ordinary sends. */
   queueId?: string;
+  /** A slash command the person ran, rather than a line of the conversation. */
+  command?: {
+    id: string;
+    name: string;
+    source: "botfleet" | "engine";
+    role: "invocation" | "reply" | "output";
+  };
 }
 
 export type GroupDefaultResponder =
@@ -344,6 +351,11 @@ export interface TaskUsage {
    * from builds before cost existed lack the field entirely */
   costUsd: number | null;
   turns: number;
+  /** Input tokens of the latest settled turn that reported any.  How full
+   * the window was, not a running total.  Absent until a turn reports it. */
+  lastInput?: number;
+  /** Context window the engine reported with that turn, when it sent one. */
+  contextWindow?: number;
 }
 
 export interface Bot {

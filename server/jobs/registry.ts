@@ -76,6 +76,7 @@ import { writeFileAtomic } from "../atomic.ts";
 import { loadHostId } from "../host-id.ts";
 import { HOST_ID_PATTERN, type HostId, type PlacementMode } from "../../shared/placement.ts";
 import type { PlacementControllerBridge } from "../placement-controller-bridge.ts";
+import type { PlacementWorkerRuntime } from "../placement-worker-runtime.ts";
 import { redactSecretsInText } from "../redact.ts";
 import { commandLabel, groupAlive, killGroup, signalGroup, startedNear, GROUP_KILL_GRACE_MS } from "../tools/process-group.ts";
 import { modelShellEnv } from "../tools/shell-env.ts";
@@ -338,6 +339,10 @@ export interface JobRegistryDeps {
    *  this registry keeps no copy of it.  Absent is This Mac Only, where the
    *  registry runs the job exactly as it always has. */
   placementBridge?: PlacementControllerBridge;
+  /** The placement worker runtime (slice T5): when this host runs as an
+   *  execution worker, this runtime manages heartbeats, assignment pulls,
+   *  stop receipts, and durable report settlement. */
+  placementWorkerRuntime?: PlacementWorkerRuntime;
   /** The jobs the controller's queue still holds, named by their bot and
    *  their conversation.  In a server mode this registry keeps no copy of a
    *  controller-owned job, so the per-bot and per-thread caps count them
@@ -727,6 +732,11 @@ export class JobRegistry {
 
   private mode(): PlacementMode {
     return this.deps.placementMode?.() ?? "localOnly";
+  }
+
+  /** The worker runtime hook for this registry, if configured (slice T5). */
+  workerRuntime(): PlacementWorkerRuntime | undefined {
+    return this.deps.placementWorkerRuntime;
   }
 
   /** Jobs holding a running slot: everything active except the queued. */

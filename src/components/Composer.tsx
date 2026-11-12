@@ -85,10 +85,11 @@ function PermissionModeSelector({ bot, onSetAuto }: { bot: Bot; onSetAuto: (auto
         type="button"
         aria-haspopup="menu"
         aria-expanded={open}
+        aria-label={label}
         onClick={() => setOpen((current) => !current)}
         className="flex h-8 items-center gap-1.5 whitespace-nowrap rounded-full border border-hairline/20 bg-transparent px-3 text-[13px] text-ink-secondary hover:bg-raised hover:text-ink"
       >
-        <Icon size={14} className="opacity-70" />
+        <Icon size={14} className="opacity-70" aria-hidden="true" />
         {label}
       </button>
 
@@ -112,11 +113,11 @@ function PermissionModeSelector({ bot, onSetAuto }: { bot: Bot; onSetAuto: (auto
               }}
               className="flex items-start gap-3 px-4 py-3 text-left hover:bg-raised-hover"
             >
-              <Hand size={16} className="mt-0.5 shrink-0 opacity-70" />
+              <Hand size={16} className="mt-0.5 shrink-0 opacity-70" aria-hidden="true" />
               <div className="flex w-full flex-col gap-0.5">
                 <div className="flex items-center justify-between text-[14px] text-ink">
                   Ask for Approval
-                  {mode === "ask" && <Check size={14} />}
+                  {mode === "ask" && <Check size={14} aria-hidden="true" />}
                 </div>
                 <div className="text-[13px] text-ink-secondary">Ask before actions that need your permission</div>
               </div>
@@ -131,11 +132,11 @@ function PermissionModeSelector({ bot, onSetAuto }: { bot: Bot; onSetAuto: (auto
               }}
               className="flex items-start gap-3 px-4 py-3 text-left hover:bg-raised-hover"
             >
-              <ShieldCheck size={16} className="mt-0.5 shrink-0 opacity-70" />
+              <ShieldCheck size={16} className="mt-0.5 shrink-0 opacity-70" aria-hidden="true" />
               <div className="flex w-full flex-col gap-0.5">
                 <div className="flex items-center justify-between text-[14px] text-ink">
                   Approve for Me
-                  {mode === "auto" && <Check size={14} />}
+                  {mode === "auto" && <Check size={14} aria-hidden="true" />}
                 </div>
                 <div className="text-[13px] text-ink-secondary">
                   Keep going automatically; destructive and sensitive actions still ask
@@ -1046,7 +1047,7 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
                 title="Attach a File"
                 className="flex size-8 shrink-0 items-center justify-center rounded-full text-ink-secondary hover:bg-control hover:text-ink"
               >
-                <Paperclip size={17} />
+                <Paperclip size={17} aria-hidden="true" />
               </button>
               {autoBot && <PermissionModeSelector bot={autoBot} onSetAuto={setAuto} />}
             </div>
@@ -1176,7 +1177,7 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
             className="flex size-8 shrink-0 items-center justify-center rounded-full text-ink-secondary hover:bg-raised hover:text-ink"
             title="Stop"
           >
-            <Square size={14} className="fill-current" />
+            <Square size={14} className="fill-current" aria-hidden="true" />
           </button>
         )}
         {!locked && !busy && !hasContent && !onCall && dictationAvailable && (
@@ -1191,7 +1192,7 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
             )}
             title={recording ? "Stop Dictation (Esc)" : "Dictate"}
           >
-            <Mic size={18} />
+            <Mic size={18} aria-hidden="true" />
           </button>
         )}
         {hasContent && !locked && busy && busySendDefault === "queue" && (
@@ -1202,7 +1203,7 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
             title="Steer Now — send message and interrupt current turn immediately (Alt+Enter)"
             className="flex h-8 items-center gap-1 rounded-full bg-accent px-2.5 text-[12px] font-medium text-white shadow-sm hover:brightness-110"
           >
-            <Zap size={13} className="fill-current" />
+            <Zap size={13} className="fill-current" aria-hidden="true" />
             <span>Steer Now</span>
           </button>
         )}
@@ -1240,7 +1241,7 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
               busy && busySendDefault === "queue" ? "bg-raised text-ink-secondary hover:bg-raised-hover" : "bg-accent hover:brightness-110",
             )}
           >
-            {busy && busySendDefault === "queue" ? <Clock size={15} /> : <ArrowUp size={17} />}
+            {busy && busySendDefault === "queue" ? <Clock size={15} aria-hidden="true" /> : <ArrowUp size={17} aria-hidden="true" />}
           </button>
         )}
           </div>
