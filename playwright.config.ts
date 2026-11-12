@@ -18,10 +18,16 @@ export default defineConfig({
     toHaveScreenshot: {
       maxDiffPixelRatio: 0.02,
       threshold: 0.2,
+      animations: 'disabled',
+      caret: 'hide',
     },
   },
   projects: [{ name: 'chromium', use: { browserName: 'chromium' } }],
   webServer: {
+    // Preview the test-mode bundle.  CI builds it with `vite build --mode test`
+    // after proving a production build omitted the usage-grid visual fixture.
+    // A production `vite build` drops that hook, so this server must not be
+    // pointed at a production dist.
     command: 'pnpm exec vite preview --port 4173 --host 127.0.0.1',
     url: baseURL,
     timeout: 180_000,

@@ -12,9 +12,11 @@ import {
   COMPANION_PROFILE_PATCH_FIELDS,
   companionBodyCheck,
   companionBotOrganizeDenial,
+  companionLiveActivityTokenDenial,
   companionProfilePatchDenial,
   denyReason,
 } from "../src/routes.ts";
+import type { JsonObject } from "../src/json.ts";
 
 const ask = (method: string, path: string, authenticated = true) =>
   denyReason({ method, path, authenticated });
@@ -48,6 +50,7 @@ describe("what the app may do", () => {
     ["GET", "/api/instances"],
     ["GET", "/api/companion/endpoints"],
     ["POST", "/api/companion/push-token"],
+    ["POST", "/api/companion/live-activity-token"],
     ["GET", "/api/bots"],
     ["POST", "/api/bots"],
     ["POST", "/api/bots/bot_123/messages"],
@@ -440,6 +443,14 @@ describe("what it may not", () => {
     expect(ask("GET", "/api/companion/push-token")?.status).toBe(403);
   });
 
+  it("lets a paired phone register its Live Activity token, and only paired", () => {
+    expect(ask("POST", "/api/companion/live-activity-token", false)?.status).toBe(401);
+    expect(ask("POST", "/api/companion/live-activity-token")).toBeNull();
+    expect(ask("GET", "/api/companion/live-activity-token")?.status).toBe(403);
+    // Not a family: no sibling door opens beside it.
+    expect(ask("POST", "/api/companion/live-activity-token/extra")?.status).toBe(403);
+  });
+
   it("describes only refused routine operations as computer-only", () => {
     for (const [method, path] of [
       ["GET", "/api/routines/routine_1"],
@@ -706,6 +717,30 @@ describe("roster organization", () => {
   it("covers Pin Message on a room through the room PATCH it already had", () => {
     expect(allowed("PATCH", "/api/groups/room-1")).toBe(true);
     expect(ask("PATCH", "/api/groups/room-1", false)?.status).toBe(401);
+  });
+});
+
+describe("the Live Activity token body", () => {
+  const hex = "ab".repeat(32);
+  // SAFETY: the checker reads one key and asks `isJsonString` of each value,
+  // which is the contract a plain object literal satisfies; no assertion of
+  // the checker's own result is made.
+  const check = (body: Record<string, unknown>) => companionLiveActivityTokenDenial(body as JsonObject);
+
+  it("accepts the one field it exists for", () => {
+    expect(check({ token: hex })).toBeNull();
+  });
+
+  it("refuses a body that is not the shape, rather than coercing it", () => {
+    // Whole-request refusal, like the profile and organize routes: a device
+    // sending anything else has a bug or an intent, and neither is answered
+    // with a token.
+    expect(check({ token: 12 })?.error).toBe("token must be a string");
+    expect(check({ token: [1, 2] })?.error).toBe("token must be a string");
+    expect(check({ token: null })?.error).toBe("token must be a string");
+    expect(check({})?.error).toBe("a Live Activity token is required");
+    expect(check({ token: hex, environment: "production" })?.status).toBe(400);
+    expect(check({ environment: "production" })?.error).toContain("environment");
   });
 });
 

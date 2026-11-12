@@ -1,3 +1,7 @@
+import { z } from "zod";
+
+import { parseQuotaPlanMetadata } from "../shared/quota-plan-metadata.ts";
+import type { QuotaPlanMetadata } from "../shared/quota-plan-metadata.ts";
 import { mergeLocalQuotaWindows, readLocalQuotaSnapshot, type LocalQuotaFreshness } from "./local-usage-monitor.ts";
 import { quotaCooldowns } from "./model-fallback.ts";
 import {
@@ -37,6 +41,7 @@ export type RemoteQuotaWindow = {
   skipReason: string | null;
   /** The plan the allowance belongs to, as the producer names it ("ultra"). */
   planName?: string | null;
+  planMetadata?: QuotaPlanMetadata;
   /** What is left and what the plan holds, in `quotaUnit` — dollars for a
    *  Cursor plan, requests for a MiniMax pool, credits for Grok.  A window
    *  can report these with no percentage at all. */
@@ -69,6 +74,48 @@ export type QuotaWindowsPayload = {
   skipModelTypes: string[];
   skipModelIds: string[];
 };
+
+/** The /api/quota-windows response is an HTTP boundary: validate the envelope
+ *  and each window before any of it reaches `this.windows` or routing
+ *  (Kody review, PR #1280).  One malformed window is dropped with a warning
+ *  rather than blinding the whole feed; a malformed envelope fails the poll. */
+const remoteQuotaWindowSchema = z.object({
+  id: z.string(),
+  provider: z.string(),
+  providerKey: z.string().optional(),
+  providerLabel: z.string().optional(),
+  via: z.string().optional(),
+  occurredAt: z.string().optional(),
+  source: z.string().optional(),
+  sourceApp: z.string(),
+  label: z.string(),
+  modelId: z.string().nullable(),
+  modelType: z.string(),
+  window: z.string(),
+  remainingPercent: z.number().nullable(),
+  resetAt: z.string().nullable(),
+  status: z.string(),
+  skip: z.boolean(),
+  skipReason: z.string().nullable(),
+  planName: z.string().nullable().optional(),
+  // Validated per window by parseQuotaPlanMetadata in applyPayload.
+  planMetadata: z.unknown().optional(),
+  absoluteRemaining: z.number().nullable().optional(),
+  absoluteLimit: z.number().nullable().optional(),
+  quotaUnit: z.string().nullable().optional(),
+  isExhausted: z.boolean().optional(),
+  fileStatus: z.string().nullable().optional(),
+  fileSkip: z.boolean().optional(),
+  fileSkipReason: z.string().nullable().optional(),
+});
+
+const quotaWindowsPayloadSchema = z.object({
+  ok: z.literal(true),
+  generatedAt: z.string(),
+  windows: z.array(z.unknown()),
+  skipModelTypes: z.array(z.string()).default([]),
+  skipModelIds: z.array(z.string()).default([]),
+});
 
 export type QuotaPollerSettings = {
   ingestUrl?: string | null;
@@ -257,7 +304,9 @@ export class UsageQuotaPoller {
   }
 
   applyPayload(payload: QuotaWindowsPayload, instances: QuotaPollerInstance[]): void {
-    this.windows = Array.isArray(payload.windows) ? payload.windows : [];
+    this.windows = Array.isArray(payload.windows)
+      ? payload.windows.map((window) => ({ ...window, planMetadata: parseQuotaPlanMetadata(window.planMetadata) }))
+      : [];
     const nextOwned = new Set<string>();
     for (const window of this.windows) {
       const kinds = new Set(driverKindsForWindow(window));
@@ -376,12 +425,29 @@ export class UsageQuotaPoller {
           headers: { authorization: `Bearer ${token}`, accept: "application/json", "user-agent": "BotFleet/1.0" },
           signal: AbortSignal.timeout(10_000),
         });
-        const body = (await response.json().catch(() => null)) as QuotaWindowsPayload | { error?: string } | null;
+        // SAFETY: response.json() returns any; the ok check below narrows it.
+        const body = (await response.json().catch(() => null)) as { error?: string } | null;
         if (!response.ok || !body || typeof body !== "object" || !("ok" in body) || body.ok !== true) {
           this.lastError = `HTTP ${response.status}`;
           return;
         }
-        this.applyPayload(body, this.instancesProvider?.() ?? []);
+        const parsed = quotaWindowsPayloadSchema.safeParse(body);
+        if (!parsed.success) {
+          this.lastError = "invalid quota-windows payload";
+          return;
+        }
+        const windows: RemoteQuotaWindow[] = [];
+        for (const row of parsed.data.windows) {
+          const window = remoteQuotaWindowSchema.safeParse(row);
+          if (window.success) {
+            // SAFETY: the schema just proved the shape; planMetadata stays
+            // unknown here and is zod-parsed per window in applyPayload.
+            windows.push(window.data as RemoteQuotaWindow);
+          } else {
+            console.warn("usage-quota: dropping a malformed /api/quota-windows row:", window.error.issues[0]?.message);
+          }
+        }
+        this.applyPayload({ ...parsed.data, windows }, this.instancesProvider?.() ?? []);
         this.lastError = null;
         this.lastOkAt = new Date().toISOString();
       } catch (error) {

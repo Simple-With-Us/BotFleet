@@ -28,18 +28,20 @@ describe("fleet seat prompt composition", () => {
     }
   });
 
-  it("covers exactly the ten BotFleet roles, none of them a platform seat or a Grok Bot tag", () => {
+  it("covers exactly the twelve BotFleet roles, none of them a platform seat or a Grok Bot tag", () => {
     expect([...FLEET_SEAT_IDS].sort()).toEqual([
-      "builder",
       "compiler",
       "deployer",
       "designer",
+      "director",
+      "engineer",
       "fixer",
       "housekeeper",
       "monitor",
       "oracle",
       "plumber",
       "publisher",
+      "trader",
     ]);
     for (const seatId of FLEET_SEAT_IDS) {
       const composed = composeFleetSeatPrompt(seatId);
@@ -69,7 +71,10 @@ describe("fleet seat prompt composition", () => {
   it("reports byte counts for PR math", () => {
     const shared = fleetSharedPreambleBytes();
     expect(shared).toBeGreaterThan(900);
-    expect(shared).toBeLessThan(2500);
+    // The ceiling tracks the shared block's real size plus headroom: it grew
+    // past 2500 when the "Wakes and @all" paragraph landed, and past 3400 with
+    // the owner's @all-reply, one-line-note and merge-label rules (Oct 27 2026).
+    expect(shared).toBeLessThan(4000);
     const composed = fleetComposedPromptBytes("plumber");
     expect(composed).toBeGreaterThan(shared);
     expect(legacyDuplicatedSharedBytesPerTurn(2)).toBe(shared);
@@ -87,7 +92,7 @@ describe("fleet seat prompt composition", () => {
   });
 
   it("no longer maps a BF- bot to a platform seat or a Grok Bot tag", () => {
-    for (const name of ["BF-Claude", "BF-Codex", "BF-Grok", "BF-Cursor", "BF-Director", "BF-Monet"]) {
+    for (const name of ["BF-Claude", "BF-Codex", "BF-Grok", "BF-Cursor", "BF-Monet"]) {
       expect(resolveFleetSeatId({ name }), name).toBeNull();
     }
     expect(resolveFleetSeatId({ name: "Claude" })).toBeNull();

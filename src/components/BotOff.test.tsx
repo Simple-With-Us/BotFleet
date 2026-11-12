@@ -9,7 +9,15 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 
-import { BOT_OFF_COMPOSER_NOTICE, BOT_OFF_TURN_ON_LABEL } from "../../shared/bot-power";
+import {
+  BOT_OFF_AFTER_TURN,
+  BOT_OFF_COMPOSER_NOTICE,
+  BOT_OFF_KEEP_ON,
+  BOT_OFF_STOP_AND_POWER_OFF,
+  BOT_OFF_TURN_ON_LABEL,
+  botOffWhileRunningBody,
+  botOffWhileRunningTitle,
+} from "../../shared/bot-power";
 import { applyBotPatch } from "@/state/bot-patch-queue";
 import { roomRespondersForComposer } from "@/lib/group-routing";
 import { BotOffBadge } from "./BotOffBadge";
@@ -107,8 +115,53 @@ describe("wiring into the app", () => {
     expect(src("ChatView.tsx")).toContain("{bot.off === true && <BotOffBadge />}");
   });
 
-  it("puts the switch in the Bot Profile panel", () => {
-    expect(src("SettingsPanel.tsx")).toContain("<BotPowerToggle off={bot.off === true} onChange={(off) => patch({ off })} />");
+  it("puts the switch in the Bot Profile panel, and asks a working bot before it flips", () => {
+    const panel = src("SettingsPanel.tsx");
+    expect(panel).toContain("<BotPowerToggle");
+    expect(panel).toContain('off={bot.off === true}');
+    // Only a bot with a turn in flight is asked: an idle bot has nothing to
+    // stop, so its switch flips straight through.
+    expect(panel).toContain("if (off && bot.busy)");
+    expect(panel).toContain("patch({ off });");
+  });
+
+  it("offers a working bot all three answers, and each one does what it says", () => {
+    const panel = src("SettingsPanel.tsx");
+    expect(panel).toContain("botOffWhileRunningTitle(bot.name)");
+    expect(panel).toContain("botOffWhileRunningBody(bot.name)");
+    expect(panel).toContain("cancelLabel={BOT_OFF_KEEP_ON}");
+    expect(panel).toContain("altLabel={BOT_OFF_AFTER_TURN}");
+    expect(panel).toContain("confirmLabel={BOT_OFF_STOP_AND_POWER_OFF}");
+
+    // Letting the turn finish: power off, and interrupt nothing.
+    // Other dialogs in this panel have an `onConfirm` too, so the search for
+    // ours starts at our `onAlt` rather than at the top of the file.
+    const altAt = panel.indexOf("onAlt={() =>");
+    const confirmAt = panel.indexOf("onConfirm={() =>", altAt);
+    expect(altAt).toBeGreaterThan(-1);
+    expect(confirmAt).toBeGreaterThan(altAt);
+    const alt = panel.slice(altAt, confirmAt);
+    expect(alt).toContain("patch({ off: true });");
+    expect(alt).not.toContain("interrupt");
+
+    // Stopping it: power off AND stop the turn in flight.
+    const confirm = panel.slice(confirmAt, panel.indexOf("/>", confirmAt));
+    expect(confirm).toContain("patch({ off: true });");
+    expect(confirm).toContain('dispatch({ type: "interrupt", botId: bot.id });');
+  });
+
+  it("names the bot and both answers in the owner's words, with the gap preserved", () => {
+    expect(botOffWhileRunningTitle("Scout")).toBe("Scout Is Working");
+    expect(botOffWhileRunningBody("Scout").replace(/  /g, "  ")).toBe(
+      "Turning Scout off stops new work, but the turn running now will keep going.  Stop it now, or let it finish first.",
+    );
+    const copy = [botOffWhileRunningBody("Scout"), botOffWhileRunningTitle("Scout")];
+    for (const text of [...copy, BOT_OFF_STOP_AND_POWER_OFF, BOT_OFF_AFTER_TURN, BOT_OFF_KEEP_ON]) {
+      expect(text).not.toContain("&nbsp;");
+      expect(text).not.toMatch(/\bagent\b/i);
+    }
+    // The gap is a real U+00A0 plus a space, never the six-character entity.
+    expect(botOffWhileRunningBody("Scout")).toContain("  ");
   });
 
   it("keeps the room composer's preview in step with the server's responder rules", () => {

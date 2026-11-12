@@ -24,21 +24,38 @@ final class KaraokePlayheadTests: XCTestCase {
         XCTAssertEqual(playhead.frame(at: 650).current, 2)
     }
 
-    func testFinishedWordsTrailAndFade() {
+    func testTheWindowLeadsAheadAndTrailsBehind() {
         var playhead = KaraokePlayhead(words: words, reducedMotion: false)
         playhead.setTimeline([0, 100, 100, 600, 600, 900, 900, 1200])
-        // 10 ms after "three" ended, "seven" is current and "three" trails strongly.
+        // "one" is current: the next two words lead, and nothing has finished.
+        let opening = playhead.frame(at: 50)
+        XCTAssertEqual(opening.current, 0)
+        XCTAssertEqual(opening.lead, [
+            KaraokeLeadWord(index: 1, level: 0),
+            KaraokeLeadWord(index: 2, level: 1),
+        ])
+        XCTAssertEqual(opening.trail, [])
+        // "seven" just started. It is the peak, "nine" leads, and the two
+        // words behind trail, nearest first. The trail is those words, not
+        // a flash that expires while the next word is still being said.
         let early = playhead.frame(at: 610)
         XCTAssertEqual(early.current, 2)
-        XCTAssertEqual(early.trail, [KaraokeTrailWord(index: 1, level: 0)])
-        XCTAssertEqual(playhead.frame(at: 600 + 100).trail, [KaraokeTrailWord(index: 1, level: 1)])
-        XCTAssertEqual(playhead.frame(at: 600 + 200).trail, [KaraokeTrailWord(index: 1, level: 2)])
-        XCTAssertEqual(playhead.frame(at: 600 + 220).trail, [], "gone after the trail time")
-        // After the last word, it trails too, then everything is done.
+        XCTAssertEqual(early.lead, [KaraokeLeadWord(index: 3, level: 0)])
+        XCTAssertEqual(early.trail, [
+            KaraokeTrailWord(index: 1, level: 0),
+            KaraokeTrailWord(index: 0, level: 1),
+        ])
+        let later = playhead.frame(at: 820)
+        XCTAssertEqual(later.current, 2)
+        XCTAssertEqual(later.trail.map(\.index), [1, 0])
+        XCTAssertEqual(later.lead.map(\.index), [3])
+        // After the last word the window lingers, then clears.
         let after = playhead.frame(at: 1250)
         XCTAssertEqual(after.current, -1)
-        XCTAssertEqual(after.trail.map(\.index), [3])
+        XCTAssertEqual(after.lead, [])
+        XCTAssertEqual(after.trail.map(\.index), [3, 2, 1])
         XCTAssertFalse(playhead.finished(at: 1250))
+        XCTAssertEqual(playhead.frame(at: 1420).trail, [])
         XCTAssertTrue(playhead.finished(at: 1420))
         XCTAssertTrue(playhead.idle(at: 1420))
     }
@@ -57,7 +74,9 @@ final class KaraokePlayheadTests: XCTestCase {
     func testAShortTimelineLeavesTheRestUnspoken() {
         var playhead = KaraokePlayhead(words: words, reducedMotion: false)
         playhead.setTimeline([0, 100])
-        XCTAssertEqual(playhead.frame(at: 50).current, 0)
+        let mid = playhead.frame(at: 50)
+        XCTAssertEqual(mid.current, 0)
+        XCTAssertEqual(mid.lead, [], "words with no start time are not a lead")
         XCTAssertEqual(playhead.frame(at: 5_000).current, -1)
         XCTAssertFalse(playhead.finished(at: 5_000))
     }

@@ -1,0 +1,9 @@
+# Exact Claude Call Receipts
+
+BotFleet emits a version 1 billed-call receipt only for a Claude turn with exactly one main-thread assistant call and one owned CLI result.  The CLI must report lifecycle ownership, a message ID, a served model and explicit nonnegative safe-integer input, output, cache-read and cache-write counts.  Repeated assistant blocks must agree, and every component must equal the result and settled turn totals.  Missing, inconsistent, partial, multi-call or multi-result evidence preserves the ordinary turn event without proof.
+
+The receipt remains the turn's sole usage event; it adds no token or cost row.  Its event ID is `bf-call-v1:` followed by lowercase hexadecimal SHA-256 of UTF-8 `JSON.stringify([childSessionId, messageId])`.  The batch producer is `botfleet`.  Metadata carries `billedCallProofVersion: 1`, `billedCallId`, `billedCallModel`, `billedCallOutput`, `billedCallCacheRead` and `billedCallCacheWrite`, alongside the existing child session and harness fields.  The telemetry builder independently rechecks the proof against the settled usage and model before changing the event identity.
+
+A receiver may derive the shared producer-scoped idempotency key for an indexed lookup of that exact receipt.  It must compare the child session, call ID, provider, served model and measured component quantity, and verify the stored aggregate still agrees with its proof.  Absence, mismatch or ambiguity keeps the child row.  Timing and session overlap authorize no drop.  Input rows remain outside this proof's receiver coverage because historical collector input can occupy two distinct slices.  Cumulative native metrics, other harnesses and multi-call turns remain additive.
+
+This is deliberately partial coverage.  It does not establish that any production receipt has arrived, enable receiver suppression, repair historical data or replace a future multi-call billing ledger.

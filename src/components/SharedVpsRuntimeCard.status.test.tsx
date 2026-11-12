@@ -124,3 +124,53 @@ describe("SharedVpsRuntimeCard with one timed-out desktop check", () => {
     expect(text).not.toMatch(/failed to start/i);
   });
 });
+
+describe("SharedVpsRuntimeCard on an outdated image", () => {
+  const stale = {
+    backend: "vps",
+    configured: true,
+    sshAlias: "vps",
+    daemonUp: true,
+    managed: true,
+    container: "running",
+    ready: false,
+    imageOutdated: true,
+  };
+
+  it("says the container is outdated and offers Prepare Image", async () => {
+    const text = await readCard({
+      ...stale,
+      image: false,
+      imageBuild: { phase: "idle", startedAt: null, elapsedMs: null, error: null },
+      problem: "Prepare the pinned BotFleet CUA image on the VPS (Driver 0.20.0)",
+    });
+    expect(text).toContain("Running (outdated image)");
+    expect(text).not.toContain("The VPS container is up and running.");
+    expect(text).toContain("so bots can't use it until it switches to the new one");
+    expect(text).toContain("Prepare Image");
+    expect(text).not.toContain("Switch to New Image");
+  });
+
+  it("shows build progress with the elapsed time", async () => {
+    const text = await readCard({
+      ...stale,
+      image: false,
+      imageBuild: { phase: "building", startedAt: 1, elapsedMs: 754_000, error: null },
+      problem: "Prepare the pinned BotFleet CUA image on the VPS (Driver 0.20.0)",
+    });
+    expect(text).toContain("Building the new image on the VPS: 12m 34s so far.");
+    expect(text).not.toContain("Prepare Image");
+  });
+
+  it("offers Switch to New Image once the image is ready", async () => {
+    const text = await readCard({
+      ...stale,
+      image: true,
+      imageBuild: { phase: "ready", startedAt: null, elapsedMs: null, error: null },
+      problem: "The VPS container uses an incompatible or untrusted BotFleet image",
+    });
+    expect(text).toContain("Switch to New Image");
+    expect(text).toContain("resets its filesystem");
+    expect(text).not.toContain("incompatible or untrusted");
+  });
+});

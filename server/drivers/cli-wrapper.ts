@@ -15,7 +15,7 @@ import type {
   TurnStartResult,
 } from "../contracts.ts";
 import { newEventId, newId } from "../contracts.ts";
-import { applyLaunchIdentity } from "../launch-identity.ts";
+import { cliLoginEnvironment, launchedChildEnvironment, primeCliLogin } from "../cli-logins.ts";
 import { PROVIDER_CREDENTIAL_ENV, stripWorkspaceCredentialEnv } from "../config.ts";
 import { augmentedPath } from "../env-path.ts";
 import { describeSpawnFailure, execCli, isProbeTimeout, killCliTree, spawnCli } from "../procs.ts";
@@ -30,12 +30,28 @@ const MAX_PROMPT_ARG_BYTES = 32_000;
 /** Runtime config is a contract boundary, so it is parsed rather than
  * asserted.  Every field defaults, so an instance saved with no config still
  * decodes; a field saved with the wrong type is rejected, and registry.ts
- * turns that rejection into a shadow entry whose reason is this error. */
-export const CliWrapperConfigSchema = z.object({
-  command: z.string().min(1).default("echo"),
-  args: z.array(z.string()).default([]),
-  passPromptAs: z.enum(["stdin", "arg"]).default("arg"),
-}).strict();
+ * turns that rejection into a shadow entry whose reason is this error.
+ *
+ * Unknown keys are rejected too, because a typo (`commmand`) would otherwise
+ * decode to the default `echo` and quietly run the wrong program.  The
+ * exception is the keys the harness writes into EVERY instance's config,
+ * whatever its driver: the Engines page stores `fullAuto` (Bypass permissions)
+ * and `cli`, and the credential flow stores `key` and `credentialStorage`
+ * (`patchInstanceConfig` in server/config.ts).  The wrapper owns none of them,
+ * so it accepts and drops them; a strict schema that refused them turned a
+ * ticked checkbox into a shadow entry that took the engine offline. */
+export const CliWrapperConfigSchema = z
+  .object({
+    command: z.string().min(1).default("echo"),
+    args: z.array(z.string()).default([]),
+    passPromptAs: z.enum(["stdin", "arg"]).default("arg"),
+    fullAuto: z.boolean().optional(),
+    cli: z.string().optional(),
+    key: z.string().optional(),
+    credentialStorage: z.string().optional(),
+  })
+  .strict()
+  .transform(({ command, args, passPromptAs }) => ({ command, args, passPromptAs }));
 
 export type CliWrapperConfig = z.infer<typeof CliWrapperConfigSchema>;
 
@@ -199,6 +215,12 @@ export const CliWrapperDriver: ProviderDriver<CliWrapperConfig> = {
           threadId,
         });
 
+        // The seat's CLI login is read in the BACKGROUND, and the read is
+        // started here, before the guard:  the guard and the registration
+        // that follows it have to stay free of `await`, or a second turn on
+        // this thread would walk through the guard the first one already
+        // passed.
+        primeCliLogin(turnInput.launchIdentity?.seat);
         if (children.has(threadId)) throw new Error("a turn is already running on this thread");
 
         // Every driver opens its turn here, and sentry-ai.ts opens the
@@ -244,7 +266,7 @@ export const CliWrapperDriver: ProviderDriver<CliWrapperConfig> = {
           // handler that keeps a dead child's EPIPE from killing the harness.
           child = spawnCli(config.command, args, {
             cwd: turnInput.cwd ?? homedir(),
-            env: applyLaunchIdentity(childEnv(), turnInput.launchIdentity),
+            env: launchedChildEnvironment(childEnv(), turnInput.launchIdentity, cliLoginEnvironment(turnInput.launchIdentity?.seat)),
             stdio: ["pipe", "pipe", "pipe"],
           });
         } catch (err) {

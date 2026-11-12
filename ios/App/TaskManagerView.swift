@@ -24,8 +24,7 @@ struct TaskManagerView: View {
             List {
                 Section {
                     HStack(spacing: 12) {
-                        BotAvatarView(bot: current, size: 48, state: .idle, animated: false)
-                            .providerBadge(for: current, avatarSize: 48)
+                        BotAvatarWithProviderBadge(bot: current, size: 48, state: .idle, animated: false)
                         VStack(alignment: .leading, spacing: 2) {
                             Text(current.name).font(.headline)
                             Text(current.title.isEmpty ? "Agent tasks" : current.title)
@@ -38,9 +37,25 @@ struct TaskManagerView: View {
 
                 Section("Tasks") {
                     ForEach(tasks, id: \.threadId) { task in
+                    let viewed = session.state.viewingThreadId(forBotId: current.id) == task.threadId
                     Button {
                         Task {
-                            await session.switchTask(task, for: current)
+                            // While the bot works, a non-active thread opens
+                            // for reading only; switching stays gated on the
+                            // turn finishing, as in the tab bar.
+                            switch threadPickIntent(
+                                busy: current.busy == true,
+                                active: task.threadId == current.threadId,
+                                viewing: session.state.viewingThreadId(forBotId: current.id) != nil,
+                                canView: true
+                            ) {
+                            case .switchTo:
+                                await session.switchTask(task, for: current)
+                            case .view, .viewActive:
+                                await session.viewThread(task, for: current)
+                            case .none:
+                                break
+                            }
                             dismiss()
                         }
                     } label: {
@@ -57,7 +72,7 @@ struct TaskManagerView: View {
                                         .font(.caption)
                                         .foregroundStyle(Color.secondary)
                                 } else {
-                                    Text(RelativeStamp.list(task.createdAt))
+                                    Text(RelativeStamp.list(task.createdAt) + (viewed ? " · Viewing" : ""))
                                         .font(.caption)
                                         .foregroundStyle(Color.secondary)
                                 }
@@ -65,6 +80,8 @@ struct TaskManagerView: View {
                             Spacer()
                             if task.threadId == current.threadId {
                                 Image(systemName: "checkmark.circle.fill").foregroundStyle(Color.accentColor)
+                            } else if viewed {
+                                Image(systemName: "eye").foregroundStyle(Color.secondary)
                             }
                         }
                     }
@@ -162,12 +179,12 @@ struct RoomTaskManagerView: View {
     private var tasks: [BotTask] { current.tasks ?? [] }
     private var blocked: Bool { session.state.roomTaskChangesBlocked(current) }
     private var canAddTask: Bool { session.config?.allowsMultipleBotThreads == true }
-    private var roomWord: String { (session.config?.roomTerminologyLabel ?? "Channel").lowercased() }
+    private var roomWord: String { session.config?.roomTerminologyLabelLowered ?? "channel" }
 
     private var footerText: String {
         var text = "A task is one conversation in this \(roomWord).\u{00A0} Changes wait while a bot is working or needs an answer."
         if !canAddTask {
-            text += "\u{00A0} To add another, turn on Projects in Settings on your Mac."
+            text += "\u{00A0} To add another, switch Workspace Arrangement in Settings."
         }
         return text
     }

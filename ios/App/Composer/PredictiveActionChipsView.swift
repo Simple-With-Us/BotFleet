@@ -1,3 +1,4 @@
+import CompanionCore
 import SwiftUI
 
 public struct ActionChipItem: Identifiable {
@@ -20,12 +21,9 @@ public struct PredictiveActionChipsView: View {
     
     @Environment(\.colorScheme) private var colorScheme
     
-    public static let defaultChips: [ActionChipItem] = [
-        ActionChipItem(title: "Show diff", icon: "arrow.triangle.pull", prompt: "Show latest git diff"),
-        ActionChipItem(title: "Run tests", icon: "checkmark.seal", prompt: "Run all automated tests"),
-        ActionChipItem(title: "Explain steps", icon: "text.bubble", prompt: "Explain the changes in detail"),
-        ActionChipItem(title: "What's next?", icon: "sparkles", prompt: "What should we do next?")
-    ]
+    /// Empty on purpose.  Chips that only paste a sentence are not offered.
+    /// A real command belongs on the slash list, not here.
+    public static let defaultChips: [ActionChipItem] = []
     
     public init(
         chips: [ActionChipItem] = PredictiveActionChipsView.defaultChips,
@@ -37,12 +35,28 @@ public struct PredictiveActionChipsView: View {
         self.onSelectChip = onSelectChip
     }
     
+    /// Drops a chip that would only paste a canned sentence, even if a caller
+    /// still passes one of the old defaults.
+    private var offeredChips: [ActionChipItem] {
+        chips.filter { !ComposerPromptChips.isCannedSnippet(title: $0.title, prompt: $0.prompt) }
+    }
+
+    @ViewBuilder
     public var body: some View {
+        let offered = offeredChips
+        if offered.isEmpty {
+            EmptyView()
+        } else {
+            chipRow(offered)
+        }
+    }
+
+    private func chipRow(_ offered: [ActionChipItem]) -> some View {
         let isDark = colorScheme == .dark
-        
-        ScrollView(.horizontal, showsIndicators: false) {
+
+        return ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 6) {
-                ForEach(chips) { chip in
+                ForEach(offered) { chip in
                     Button {
                         onSelectChip(chip)
                         Haptics.selection()

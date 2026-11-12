@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, posix, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 // The updater bootstraps itself by archiving a fixed set of files out of the
-// commit it is about to install (scripts/update-botfleet.sh) and running that
+// commit it is about to install (scripts/update-botfleet-policy.sh) and running that
 // copy.  The set is a literal list in the shell, so nothing in the JavaScript
 // notices when a new local import is added: the archive is simply missing the
 // file, and `ubf` dies with ERR_MODULE_NOT_FOUND on every Mac at the moment it
@@ -18,12 +18,17 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const LOCAL_IMPORT = /from\s+"(\.[^"]+)"/g;
 
 async function archivedPaths() {
-  const wrapper = await readFile(join(root, "scripts/update-botfleet.sh"), "utf8");
-  const archive = wrapper.match(/git -C "\$BOTFLEET_CHECKOUT" archive[^|]*?--\s*((?:[\\\s]+[\w./-]+)+?)\s*\|/);
-  assert.ok(archive, "could not find the `git archive` call in scripts/update-botfleet.sh");
+  const wrapper = await readFile(join(root, "scripts/update-botfleet-policy.sh"), "utf8");
+  const archive = wrapper.match(/git -C "\$BOTFLEET_CHECKOUT" archive[^|]*?--\s*([^|]+)\|\s*tar/);
+  assert.ok(archive, "could not find the `git archive` call in scripts/update-botfleet-policy.sh");
   // The paths sit on shell line-continuation lines, so the captured group also
   // contains the backslashes that join them.
-  return new Set(archive[1].split(/\s+/).filter((token) => token && !token.includes("\\")));
+  const paths = new Set(archive[1].match(/(?:scripts|electron)\/[\w./-]+/g));
+  const optional = wrapper.match(/OPTIONAL_STARTUP_RECEIPT=\(([\w./-]+)\)/);
+  assert.ok(optional, "the optional startup helper must name a literal tracked path");
+  assert.ok(archive[1].includes("${OPTIONAL_STARTUP_RECEIPT[@]}"), "the archive must expand the optional helper array");
+  paths.add(optional[1]);
+  return paths;
 }
 
 test("every module the updater imports locally is in the bootstrap archive", async () => {
@@ -33,14 +38,13 @@ test("every module the updater imports locally is in the bootstrap archive", asy
   const missing = [];
   for (const match of source.matchAll(LOCAL_IMPORT)) {
     // Relative to the importing file, which is scripts/.
-    const imported = match[1].replace(/^\.\//, "");
-    if (imported.startsWith("..")) continue; // electron/ and shared/ are not archived today
-    if (!archived.has(`scripts/${imported}`)) missing.push(`scripts/${imported}`);
+    const imported = posix.normalize(posix.join("scripts", match[1]));
+    if (!archived.has(imported)) missing.push(imported);
   }
   assert.deepEqual(
     [...new Set(missing)],
     [],
-    "these modules are imported but not archived by scripts/update-botfleet.sh, so a bootstrapped ubf would fail to start on every Mac",
+    "these modules are imported but not archived by scripts/update-botfleet-policy.sh, so a bootstrapped ubf would fail to start on every Mac",
   );
 });
 
@@ -72,6 +76,8 @@ test("the stage-entry allowlist has exactly one definition, and the server uses 
   const { KNOWN_STAGE_ENTRIES, stageIsPrunable } = await import("./stage-entries.mjs");
   assert.ok(KNOWN_STAGE_ENTRIES.includes("hosted"), "a CI-built stage must be sweepable");
   assert.equal(stageIsPrunable(["hosted", "node_modules", "source"]), true);
+  assert.equal(stageIsPrunable(["desktop-startup.json", "source"]), true);
+  assert.equal(stageIsPrunable(["desktop-startup.json", "prepared.json"]), false);
   assert.equal(stageIsPrunable(["prepared.json", "hosted"]), false, "a reusable stage is load-bearing");
   assert.equal(stageIsPrunable(["rollback", "hosted"]), false, "the rollback bundle is load-bearing");
   assert.equal(stageIsPrunable(["hosted", "someones-notes.txt"]), false, "a person's file is not ours to delete");

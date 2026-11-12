@@ -24,8 +24,9 @@ import {
 } from "./build-speech-helper.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const SRC = path.join(__dirname, "resources", "speech-helper.swift");
-const INFO = path.join(__dirname, "resources", "speech-helper-Info.plist");
+const projectDir = path.dirname(__dirname);
+const SRC = path.join(projectDir, "native", "helpers", "speech-helper.swift");
+const INFO = path.join(projectDir, "native", "helpers", "speech-helper-Info.plist");
 // Packaged: the helper bundle ships pre-built + signed in Resources. A signed
 // app bundle must never be rewritten — lazy compilation would break its seal.
 const BUNDLE = app.isPackaged
@@ -481,7 +482,22 @@ export function speakPersonalVoice(text, voiceId, options = {}) {
         }
       }
     });
-    if (onRange) watchFile(outputPath, { interval: PERSONAL_VOICE_POLL_MS, persistent: false }, drain);
+    let pollTimer = null;
+    if (onRange) {
+      watchFile(outputPath, { interval: PERSONAL_VOICE_POLL_MS, persistent: false }, drain);
+      // watchFile alone can miss updates when the macOS CI runner's event loop is
+      // saturated by the full vitest suite; interval polling keeps ranges timely.
+      drain();
+      pollTimer = setInterval(drain, PERSONAL_VOICE_POLL_MS);
+      pollTimer.unref?.();
+    }
+
+    const stopPolling = () => {
+      if (pollTimer) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+      }
+    };
 
     // The helper parks in RunLoop.main.run() until the synthesizer delegate
     // fires or the stop marker appears, and the Personal Voice TCC prompt may
@@ -508,6 +524,7 @@ export function speakPersonalVoice(text, voiceId, options = {}) {
     timer.unref?.();
 
     proc.on("close", () => {
+      stopPolling();
       if (onRange) unwatchFile(outputPath, drain);
       drain();
       if (personalVoiceChild === session) personalVoiceChild = null;
@@ -519,6 +536,7 @@ export function speakPersonalVoice(text, voiceId, options = {}) {
     });
 
     proc.on("error", (err) => {
+      stopPolling();
       if (onRange) unwatchFile(outputPath, drain);
       if (personalVoiceChild === session) personalVoiceChild = null;
       rmSync(sessionDir, { recursive: true, force: true });

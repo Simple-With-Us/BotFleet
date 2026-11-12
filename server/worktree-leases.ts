@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
+import { existsSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { mkdir, rm, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 import { DATA_DIR } from "./config.ts";
@@ -16,6 +17,12 @@ function canonicalPath(p: string): string {
 }
 
 export const WORKTREES_BASE_DIR = join(DATA_DIR, "worktrees");
+
+/** Async existence check for the lease queue.  Each repository's queue is one
+ * async chain, and a synchronous `existsSync`, `mkdirSync` or `rmSync` inside it
+ * runs on the main thread: deleting a worktree full of `node_modules` and build
+ * output would stall every other bot's turn, not just the next lease. */
+const pathExists = (path: string): Promise<boolean> => stat(path).then(() => true, () => false);
 
 export interface WorktreeLease {
   readonly lease: ExactTurnLease;
@@ -233,18 +240,18 @@ export class WorktreeLeaseManager {
     try {
       await this.serialize(root, async () => {
         // If a leftover directory exists from a prior killed turn or crash, remove it first.
-        if (existsSync(worktreePath)) {
+        if (await pathExists(worktreePath)) {
           await this.runGit(
             ["worktree", "remove", "--force", worktreePath],
             root,
           ).catch(() => {});
           await this.runGit(["worktree", "prune"], root).catch(() => {});
-          if (existsSync(worktreePath)) {
-            rmSync(worktreePath, { recursive: true, force: true });
+          if (await pathExists(worktreePath)) {
+            await rm(worktreePath, { recursive: true, force: true });
           }
         }
 
-        mkdirSync(dirname(worktreePath), { recursive: true, mode: 0o700 });
+        await mkdir(dirname(worktreePath), { recursive: true, mode: 0o700 });
 
         const addResult = await this.runGit(
           ["worktree", "add", "--force", "-B", branch, worktreePath, commitIsh],
@@ -300,9 +307,9 @@ export class WorktreeLeaseManager {
           await this.runGit(["worktree", "prune"], leaseInfo.repoRoot).catch(
             () => {},
           );
-          if (existsSync(leaseInfo.worktreePath)) {
+          if (await pathExists(leaseInfo.worktreePath)) {
             try {
-              rmSync(leaseInfo.worktreePath, { recursive: true, force: true });
+              await rm(leaseInfo.worktreePath, { recursive: true, force: true });
             } catch {
               // Ignore disk removal error if Git already detached it
             }

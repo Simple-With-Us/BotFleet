@@ -14,8 +14,9 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+const projectDir = dirname(HERE);
 const speechSource = readFileSync(join(HERE, "speech.mjs"), "utf8");
-const helperSource = readFileSync(join(HERE, "resources", "speech-helper.swift"), "utf8");
+const helperSource = readFileSync(join(projectDir, "native", "helpers", "speech-helper.swift"), "utf8");
 
 describe("Personal Voice helper contract", () => {
   it("keeps reply text off argv", () => {
@@ -118,6 +119,7 @@ describe("Personal Voice helper contract", () => {
       speechSource.indexOf("export function stopPersonalVoice()"),
     );
     expect(speak).toContain("watchFile(outputPath, { interval: PERSONAL_VOICE_POLL_MS, persistent: false }, drain)");
+    expect(speak).toContain("setInterval(drain, PERSONAL_VOICE_POLL_MS)");
     expect(speak).toContain("personalVoiceChild === session");
     expect(speak).toContain("unwatchFile(outputPath, drain)");
   });

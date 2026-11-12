@@ -3,8 +3,8 @@
 // is the stuff shared by every bot: who you are, your keys, and the
 // machine your bots can borrow.
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Activity, Coins, Globe, KeyRound, Layers, Monitor, Smartphone, Terminal, User, X } from "lucide-react";
-import { api, useStore, type AppSettingsSection, type ConfigStatus } from "@/state/store";
+import { Activity, Coins, Gauge, Globe, KeyRound, Layers, Monitor, Smartphone, Terminal, User, X } from "lucide-react";
+import { ApiError, api, useStore, type AppSettingsSection, type ConfigStatus } from "@/state/store";
 import { searchSettings, type SettingsSearchItem } from "@/lib/settings-search";
 import { SettingsSearchResultsView } from "./SettingsSearchResultsView";
 import { SETTINGS_SECTIONS, SettingsNav } from "./SettingsNav";
@@ -13,6 +13,7 @@ import {
   ROOM_LABEL_MAX_LENGTH,
   ROOM_TERMINOLOGY_OPTIONS,
   ROOM_TERMINOLOGY_PRESETS,
+  lowerRoomLabels,
   suggestPlural,
   type RoomLabels,
   type RoomTerminology,
@@ -23,6 +24,18 @@ import {
   parseConversationMode,
   type ConversationMode,
 } from "../../shared/conversation-mode";
+import {
+  conversationModeFailureCopy,
+  simpleMergeConflictLabel,
+  simpleMergeConflicts,
+  simpleMergeRefusal,
+  type SimpleMergeConflict,
+} from "../../shared/task-workspace-context";
+import {
+  BUSY_SEND_DEFAULTS,
+  parseBusySendDefault,
+  type BusySendDefault,
+} from "../../shared/busy-send-default.ts";
 import { analyticsEnabled, setAnalyticsEnabled } from "@/lib/analytics";
 import { showToolCallsEnabled, skillRecorderEnabled, summarizeToolCallsEnabled } from "@/lib/feature-flags";
 import { ApiKeyRow, EngineKeyRow, VpsConnection } from "./ApiKeys";
@@ -56,10 +69,13 @@ import { RemoteAccessSection } from "./RemoteAccessSection";
 import { Card } from "./SettingsPrimitives";
 import { UsageSection } from "./UsageSection";
 import { ObservabilitySection } from "./ObservabilitySection";
+import { ResourcesSection } from "./ResourcesSection";
+import { scrollToSettingDomId } from "./scroll-to-setting";
 import { SecretsSection } from "./SecretsSection";
 import { SkinPicker } from "./SkinPicker";
 import { RoomTurnTimeoutSettings } from "./RoomTurnTimeoutSettings";
 import { TranscriptionSettings } from "./TranscriptionSettings";
+import { StsSettings } from "./StsSettings";
 import { QdrantRagConnection } from "./QdrantRagConnection";
 import { cn } from "@/lib/cn";
 import { putAutomaticUpdateSetting } from "@/lib/automatic-update-setting";
@@ -110,6 +126,7 @@ const SECTION_ICONS: Record<AppSettingsSection, typeof User> = {
   usage: Coins,
   observability: Activity,
   secrets: KeyRound,
+  resources: Gauge,
 };
 
 /** Name + email, persisted to /api/config {profile} on blur. */
@@ -638,12 +655,16 @@ export function ConversationModeRow() {
   const { state, dispatch } = useStore();
   const current = parseConversationMode(state.config?.conversationMode);
   const labels = state.config?.roomLabels ?? { singular: "Channel", plural: "Channels" };
+  // Mid-sentence form:  keeps the capitals of a custom proper noun such as HUB.
+  const lower = lowerRoomLabels(labels);
   const [saving, setSaving] = useState(false);
   const [pendingSimple, setPendingSimple] = useState(false);
+  const [mergeConflicts, setMergeConflicts] = useState<SimpleMergeConflict[]>([]);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const save = async (conversationMode: ConversationMode, mergeThreads = false) => {
     if (saving) return;
     setSaving(true);
-    setPendingSimple(false);
+    setSaveError(null);
     try {
       // `mergeThreads` is absent rather than false when the caller did not
       // ask for it, so each payload stays one the route actually documents.
@@ -655,30 +676,41 @@ export function ConversationModeRow() {
         body: JSON.stringify(payload),
       });
       dispatch({ type: "configStatus", config });
-    } catch {
+      setPendingSimple(false);
+      setMergeConflicts([]);
+    } catch (error) {
+      if (error instanceof ApiError) {
+        const serverMessage = typeof error.body?.error === "string" ? error.body.error : error.message;
+        setSaveError(conversationModeFailureCopy(error.status, serverMessage));
+      } else {
+        setSaveError(conversationModeFailureCopy(undefined, undefined));
+      }
     } finally {
       setSaving(false);
     }
   };
   const choose = (conversationMode: ConversationMode) => {
     if (saving || conversationMode === current) return;
+    setSaveError(null);
     if (conversationMode === "simple" && current === "projects") {
+      setMergeConflicts(simpleMergeConflicts([...state.bots, ...state.groups]));
       setPendingSimple(true);
       return;
     }
+    setPendingSimple(false);
     void save(conversationMode);
   };
   return (
     <Card
       title="Workspace Arrangement"
-      subtitle={`Choose how your bots and ${labels.plural.toLowerCase()} are structured.${"\u00A0 "}Simple is Grok-style with named bots, while ${labels.plural.toLowerCase()} mode treats each ${labels.singular.toLowerCase()} as a category for threads.`}
+      subtitle={`Choose how your bots and ${lower.plural} are structured.${"\u00A0 "}Simple is Grok-style with named bots, while ${lower.plural} mode treats each ${lower.singular} as a category for threads.`}
     >
       <div className="flex flex-col gap-2">
         {CONVERSATION_MODES.map((mode) => {
           const copy = CONVERSATION_MODE_COPY[mode];
           const selected = current === mode;
           const displayTitle = mode === "projects" ? labels.plural : copy.title;
-          const displaySubtitle = copy.subtitle;
+          const displaySubtitle = copy.subtitle(lower.singular);
           return (
             <button
               key={mode}
@@ -697,32 +729,56 @@ export function ConversationModeRow() {
           );
         })}
         {pendingSimple && (
-          <div className="rounded-lg border border-hairline/40 bg-raised/40 px-3 py-2.5">
-            <div className="text-[14px] font-medium text-ink">Merge Extra Threads?</div>
-            <div className="mt-0.5 text-[12px] leading-relaxed text-ink-secondary">
-              Simple is one conversation per bot.{"\u00A0"} Merge extra threads into that conversation, or keep them saved but hidden.
-            </div>
+          <div className="rounded-lg border border-hairline/40 bg-raised/40 px-3 py-2.5" data-testid="simple-merge-prompt">
+            {mergeConflicts.length > 0 ? (
+              <div data-testid="simple-merge-refusal">
+                <div className="text-[14px] font-medium text-ink">These Stay Separate</div>
+                <p className="mt-0.5 text-[12px] leading-relaxed text-ink-secondary">
+                  {simpleMergeRefusal(mergeConflicts)}
+                </p>
+                <ul className="mt-2 flex flex-col gap-0.5">
+                  {mergeConflicts.map((conflict) => (
+                    <li key={conflict.threadId} className="text-[12px] text-ink-secondary">
+                      <span className="text-ink">{conflict.title}</span>
+                      {"\u00A0 "}— {simpleMergeConflictLabel(conflict.reason)}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : (
+              <>
+                <div className="text-[14px] font-medium text-ink">Merge Extra Threads?</div>
+                <div className="mt-0.5 text-[12px] leading-relaxed text-ink-secondary">
+                  Simple is one conversation per bot.{"\u00A0"} Merge extra threads into that conversation, or keep them saved and out of the sidebar.
+                </div>
+              </>
+            )}
             <div className="mt-2 flex flex-wrap gap-2">
-              <button
-                type="button"
-                disabled={saving}
-                onClick={() => void save("simple", true)}
-                className="rounded-lg border border-accent bg-accent/10 px-3 py-1.5 text-[13px] font-medium text-ink"
-              >
-                Merge All Threads
-              </button>
+              {mergeConflicts.length === 0 && (
+                <button
+                  type="button"
+                  disabled={saving}
+                  onClick={() => void save("simple", true)}
+                  className="rounded-lg border border-accent bg-accent/10 px-3 py-1.5 text-[13px] font-medium text-ink"
+                >
+                  Merge All Threads
+                </button>
+              )}
               <button
                 type="button"
                 disabled={saving}
                 onClick={() => void save("simple")}
                 className="rounded-lg border border-hairline/40 px-3 py-1.5 text-[13px] font-medium text-ink hover:bg-raised/60"
               >
-                Keep Extra Threads Hidden
+                Keep Them Out of the Sidebar
               </button>
               <button
                 type="button"
                 disabled={saving}
-                onClick={() => setPendingSimple(false)}
+                onClick={() => {
+                  setPendingSimple(false);
+                  setSaveError(null);
+                }}
                 className="rounded-lg px-3 py-1.5 text-[13px] text-ink-secondary hover:text-ink"
               >
                 Cancel
@@ -730,6 +786,71 @@ export function ConversationModeRow() {
             </div>
           </div>
         )}
+        {saveError && (
+          <p role="alert" data-testid="conversation-mode-error" className="text-[12px] leading-relaxed text-danger">
+            {saveError}
+          </p>
+        )}
+      </div>
+    </Card>
+  );
+}
+
+const BUSY_SEND_COPY = {
+  queue: {
+    title: "Queue",
+    subtitle: "While a bot is working, Enter holds your message until the turn finishes.  Use Steer Now when you need to interrupt.",
+  },
+  steer: {
+    title: "Steer",
+    subtitle: "While a bot is working, Enter sends into the running turn when the engine supports it, or stops the turn and sends when it does not.",
+  },
+} satisfies Record<BusySendDefault, { title: string; subtitle: string }>;
+
+export function BusySendDefaultRow() {
+  const { state, dispatch } = useStore();
+  const current = parseBusySendDefault(state.config?.busySendDefault);
+  const [saving, setSaving] = useState(false);
+  const save = async (busySendDefault: BusySendDefault) => {
+    if (saving || busySendDefault === current) return;
+    setSaving(true);
+    try {
+      const config: ConfigStatus = await api("/api/busy-send-default", {
+        method: "PATCH",
+        body: JSON.stringify({ busySendDefault }),
+      });
+      dispatch({ type: "configStatus", config });
+    } catch {
+    } finally {
+      setSaving(false);
+    }
+  };
+  return (
+    <Card
+      title="Busy Sends"
+      subtitle="Choose what happens when you send while a bot is already working.  Each send can still override this from the composer."
+    >
+      <div className="flex flex-col gap-2">
+        {BUSY_SEND_DEFAULTS.map((mode) => {
+          const copy = BUSY_SEND_COPY[mode];
+          const selected = current === mode;
+          return (
+            <button
+              key={mode}
+              type="button"
+              disabled={saving}
+              aria-pressed={selected}
+              onClick={() => void save(mode)}
+              className={cn(
+                "rounded-lg border px-3 py-2.5 text-left",
+                selected ? "border-accent bg-accent/10" : "border-hairline/40 hover:bg-raised/60",
+              )}
+            >
+              <div className="text-[14px] font-medium text-ink">{copy.title}</div>
+              <div className="mt-0.5 text-[12px] leading-relaxed text-ink-secondary">{copy.subtitle}</div>
+            </button>
+          );
+        })}
       </div>
     </Card>
   );
@@ -1072,6 +1193,45 @@ function DiagnosticsRow() {
   );
 }
 
+// Which build is running. Deliberately the quietest thing in General: it is
+// there to be read when something looks wrong and copied into a bug report,
+// not to be configured. Nothing here is editable, and a build that has not
+// answered yet simply renders nothing rather than a placeholder.
+function BuildInfoRow() {
+  const [info, setInfo] = useState<AppRuntimeInfo | null>(null);
+
+  useEffect(() => {
+    let live = true;
+    const ogb = window.ogb;
+    if (!ogb?.appInfo) return;
+    ogb
+      .appInfo()
+      .then((value) => {
+        if (live) setInfo(value);
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, []);
+
+  if (!info) return null;
+
+  return (
+    <div className="flex items-center gap-2 px-1 pt-1 text-[12px] text-ink-secondary">
+      <span className="font-mono">{info.summary}</span>
+      <button
+        type="button"
+        onClick={() => void navigator.clipboard?.writeText(info.summary)}
+        aria-label="Copy build details"
+        className="rounded px-1.5 py-0.5 text-[11px] text-ink-secondary hover:bg-control hover:text-ink"
+      >
+        Copy
+      </button>
+    </div>
+  );
+}
+
 export function SettingsModal() {
   const { state, dispatch } = useStore();
   const bots = state.bots ?? [];
@@ -1103,17 +1263,6 @@ export function SettingsModal() {
     };
   }, []);
 
-  const HIGHLIGHT_CLASSES = [
-    "ring-2",
-    "ring-accent",
-    "ring-offset-2",
-    "ring-offset-panel",
-    "shadow-[0_0_20px_rgba(33,139,255,0.35)]",
-    "rounded-xl",
-    "transition-all",
-    "duration-300",
-  ];
-
   const handleNavigateToSetting = (item: SettingsSearchItem) => {
     setQuery("");
     setSelectedSectionFilter(null);
@@ -1127,22 +1276,9 @@ export function SettingsModal() {
       setHighlightedDomId(null);
     }, 2600);
 
-    setTimeout(() => {
-      const el = document.getElementById(item.domId);
-      if (el) {
-        el.scrollIntoView({ behavior: "smooth", block: "center" });
-        el.classList.add(...HIGHLIGHT_CLASSES);
-        setTimeout(() => {
-          el.classList.remove(
-            "ring-2",
-            "ring-accent",
-            "ring-offset-2",
-            "ring-offset-panel",
-            "shadow-[0_0_20px_rgba(33,139,255,0.35)]",
-          );
-        }, 2600);
-      }
-    }, 80);
+    // The target card mounts its id only after its fetch resolves, so wait
+    // for it instead of racing a fixed timeout (see scroll-to-setting.ts).
+    scrollToSettingDomId(item.domId);
   };
 
   const highlightClass = (domId: string) =>
@@ -1379,6 +1515,9 @@ export function SettingsModal() {
                   <div id="setting-general-conversation-mode" className={highlightClass("setting-general-conversation-mode")}>
                     <ConversationModeRow />
                   </div>
+                  <div id="setting-general-busy-send" className={highlightClass("setting-general-busy-send")}>
+                    <BusySendDefaultRow />
+                  </div>
                   <Card
                     id="setting-general-room-turn-timeout"
                     className={highlightClass("setting-general-room-turn-timeout")}
@@ -1405,6 +1544,9 @@ export function SettingsModal() {
                   <div id="setting-general-analytics" className={highlightClass("setting-general-analytics")}>
                     <AnalyticsRow />
                   </div>
+                  <div id="setting-general-build" className={highlightClass("setting-general-build")}>
+                    <BuildInfoRow />
+                  </div>
                 </>
               )}
 
@@ -1427,6 +1569,9 @@ export function SettingsModal() {
                     ) : null}
                     <div id="setting-connections-transcription" className={highlightClass("setting-connections-transcription")}>
                       <TranscriptionSettings />
+                    </div>
+                    <div id="setting-connections-sts" className={highlightClass("setting-connections-sts")}>
+                      <StsSettings />
                     </div>
                     <div id="setting-connections-api-keys" className={cn("flex flex-col gap-4", highlightClass("setting-connections-api-keys"))}>
                       <ApiKeyRow section="box" />
@@ -1532,6 +1677,8 @@ export function SettingsModal() {
                   <SecretsSection />
                 </div>
               )}
+
+              {section === "resources" && <ResourcesSection highlightClass={highlightClass} />}
             </div>
           )}
         </div>

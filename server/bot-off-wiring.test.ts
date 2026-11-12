@@ -134,13 +134,18 @@ describe("automation", () => {
 });
 
 describe("peers", () => {
-  it("refuses ask_bot and delegate_bot to an Off bot before anything is queued", () => {
-    const ask = functionBody("export async function executeAskBotRequest(");
-    expect(ask.indexOf("botIsOff(target)")).toBeGreaterThan(-1);
-    expect(ask.indexOf("botIsOff(target)")).toBeLessThan(ask.indexOf("askBotAndWait("));
-    const delegate = functionBody("export function executeDelegateBotRequest(");
-    expect(delegate.indexOf("botIsOff(target)")).toBeGreaterThan(-1);
-    expect(delegate.indexOf("botIsOff(target)")).toBeLessThan(delegate.indexOf("queueDelegation("));
+  it("refuses coordinate_bots to an Off bot before the handoff is recorded", () => {
+    const body = functionBody("export function executeCoordinateBotsRequest(");
+    expect(body.indexOf("botIsOff(target)")).toBeGreaterThan(-1);
+    expect(body.indexOf("botIsOff(target)")).toBeLessThan(body.indexOf("jobHost.coordinate("));
+  });
+
+  it("names every Off peer it refuses, in the shared wording, and not as a bare 'that bot'", () => {
+    // A handoff can name several bots; "that bot is off" cannot be told apart.
+    const body = functionBody("export function executeCoordinateBotsRequest(");
+    expect(body).toContain("botOffPeersRefusal([...offPeers.values()]");
+    expect(body.indexOf("botOffPeersRefusal(")).toBeLessThan(body.indexOf("jobHost.coordinate("));
+    expect(source).not.toContain("that bot is off");
   });
 });
 
@@ -151,8 +156,13 @@ describe("update readiness", () => {
     const body = functionBody("function runtimeWorkCounts(");
     expect(body).toContain("queuedMessageCount(botIsOffId)");
     expect(body).toContain("_queuedRoomCount(botIsOffId)");
-    expect(body).toContain("botIsOffId(item.toBotId)");
-    expect(body).toContain('run.status === "queued" && botIsOffId(run.botId)');
+    expect(body).toContain("botIsOffId(item.targetBotId)");
+    // The queued routine runs are filtered in the helper that the count and
+    // the hold both read, so that the discount the hold takes is never bigger
+    // than the count it comes from.  The filter used to sit in
+    // `runtimeWorkCounts` itself; it lives in one place now.
+    expect(body).toContain("routineRunCounts(");
+    expect(read("update-drain.ts")).toContain('run.status === "queued" && options.isBotOff(run.botId)');
     // `turns` is deliberately not filtered: a turn that is running is real work.
     const turnsLine = body.split("\n").find((line) => line.includes("turns:")) ?? "";
     expect(turnsLine).toContain("bot.busy");

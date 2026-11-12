@@ -38,8 +38,8 @@ export const SETTINGS_SEARCH_ITEMS: SettingsSearchItem[] = [
     sectionId: "general",
     sectionLabel: "General",
     title: "Workspace Arrangement",
-    subtitle: "Simple is Grok-style: named bots with one conversation each, plus group threads.\u00a0 Projects hide named bots and treat the room word as a category that any number of threads can sit under.",
-    keywords: ["workspace arrangement", "arrangement", "workspace layout", "conversation mode", "simple", "projects", "threads", "categories", "merge extra threads", "layout", "mode"],
+    subtitle: "Simple is Grok-style: named bots with one conversation each, plus group threads.\u00a0 Projects allows any number of threads under each bot and each shared space, nested in the sidebar.\u00a0 A thread can be tied to one shared space.",
+    keywords: ["workspace arrangement", "arrangement", "workspace layout", "conversation mode", "simple", "projects", "threads", "categories", "merge extra threads", "layout", "mode", "rooms", "channels"],
     domId: "setting-general-conversation-mode",
     badge: "Arrangement",
   },
@@ -123,6 +123,16 @@ export const SETTINGS_SEARCH_ITEMS: SettingsSearchItem[] = [
     domId: "setting-general-analytics",
     badge: "Privacy",
   },
+  {
+    id: "general:build",
+    sectionId: "general",
+    sectionLabel: "General",
+    title: "Build",
+    subtitle: "The version and build number of the running app.",
+    keywords: ["build", "build number", "version", "which version", "commit", "app version", "running version"],
+    domId: "setting-general-build",
+    badge: "System",
+  },
 
   // --- Connections ---
   {
@@ -143,6 +153,16 @@ export const SETTINGS_SEARCH_ITEMS: SettingsSearchItem[] = [
     subtitle: "Audio transcription settings for voice input, local Whisper, or cloud models.",
     keywords: ["transcription", "voice", "whisper", "speech", "speech to text", "stt", "audio", "microphone", "mic", "groq", "openai whisper"],
     domId: "setting-connections-transcription",
+    badge: "Voice",
+  },
+  {
+    id: "connections:sts",
+    sectionId: "connections",
+    sectionLabel: "Connections",
+    title: "Speech-to-Speech Calls",
+    subtitle: "The model hears the caller and speaks back on one connection, instead of transcribing each turn.",
+    keywords: ["speech-to-speech", "speech to speech", "sts", "realtime", "voice call", "xai realtime", "gemini live", "call", "calls", "voice", "audio"],
+    domId: "setting-connections-sts",
     badge: "Voice",
   },
   {
@@ -441,6 +461,38 @@ export const SETTINGS_SEARCH_ITEMS: SettingsSearchItem[] = [
     domId: "setting-secrets-infisical",
     badge: "Vault",
   },
+
+  // --- Resources ---
+  {
+    id: "resources:host",
+    sectionId: "resources",
+    sectionLabel: "Resources",
+    title: "Host Resource Readings",
+    subtitle: "Detected capacity, current use and per-resource enforcement for this host.",
+    keywords: ["resources", "host", "cpu", "cores", "memory", "ram", "swap", "disk", "root disk", "inodes", "io", "capacity", "current use", "enforcement"],
+    domId: "setting-resources-host",
+    badge: "Host",
+  },
+  {
+    id: "resources:thresholds",
+    sectionId: "resources",
+    sectionLabel: "Resources",
+    title: "Admission Thresholds (Saved vs Applied)",
+    subtitle: "Saved owner thresholds against what the runtime actually applies, with the reason when they differ.",
+    keywords: ["resources", "admission", "thresholds", "saved", "applied", "headroom", "reserved", "gates", "not applied", "not set"],
+    domId: "setting-resources-thresholds",
+    badge: "Thresholds",
+  },
+  {
+    id: "resources:headroom",
+    sectionId: "resources",
+    sectionLabel: "Resources",
+    title: "Owner-Set Headroom",
+    subtitle: "Reserved CPU, RAM and available-memory knobs, shown read-only.",
+    keywords: ["resources", "headroom", "reserved cpu", "reserved ram", "available memory", "owner", "read-only"],
+    domId: "setting-resources-headroom",
+    badge: "Headroom",
+  },
 ];
 
 export interface TextSegment {
@@ -498,6 +550,7 @@ export function searchSettings(rawQuery: string): SettingsSearchResult {
     "usage",
     "observability",
     "secrets",
+    "resources",
   ];
 
   const matchingSectionIds = new Set<AppSettingsSection>();

@@ -116,6 +116,17 @@ independent of the bot's display name.
 - **Remove** is yours, done by hand when a bot no longer needs the server:
   `docker -H ssh://my-vps rm -f <container>`.  BotFleet never deletes a container on its own.
 
+- **Prepare Image** and **Switch to New Image** (Settings → Computers, Shared VPS VM card, shared mode):  when a
+  BotFleet update pins a newer CUA image, the shared container is shown as "Running (outdated image)" and bots
+  refuse it.  **Prepare Image** builds the new image on the VPS in the background (20 to 45 minutes) while the old
+  container stays as it is; a second press, or a bot's provision that needs the image, joins the same build.  Once
+  the image is ready, **Switch to New Image** (after a confirm) removes the old container and creates one from the
+  new image, so the downtime is a container start, not a rebuild.  It is refused while any bot is using the shared
+  VPS.  Like removal, the switch wipes the container filesystem.  The endpoints are
+  `POST /api/vps-computer/prepare-image` and `POST /api/vps-computer/switch-image`, and
+  `GET /api/vps-computer` reports `imageBuild` (`idle`, `building` with its elapsed time, `failed` with the reason,
+  or `ready`) and `imageOutdated`.
+
 What survives what: sleep/start preserves the container's filesystem; removal — including the recreate that
 follows a CUA image upgrade, since a container pinned to an old image is refused rather than reused — wipes
 it.  Treat the container filesystem as **disposable**: anything a bot must keep should leave the VPS (pushed,

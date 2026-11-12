@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 import type { BotRecord } from "./store.ts";
+import { telemetry } from "./telemetry.ts";
 
 export const AVATAR_DIRECTION_MAX_CHARS = 400;
 export const AVATAR_IMAGE_TIMEOUT_MS = 120_000;
@@ -157,6 +158,7 @@ export async function generateAvatarImage(
         output_format: "webp",
       });
 
+  const startedAt = Date.now();
   const timeoutSignal = AbortSignal.timeout(timeoutMs);
   let response: Response;
   try {
@@ -243,5 +245,17 @@ export async function generateAvatarImage(
   if (bytes.byteLength === 0) {
     throw Object.assign(new Error(`${errorPrefix} returned an empty image`), { status: 502 });
   }
+  // A generated image is billed per image, and neither provider reports a
+  // price in the response, so Usage Monitor hears one request for one image
+  // and prices it from its catalog (BF-2435).  Reported only once an image
+  // exists: a failed or empty response produced nothing.
+  telemetry.trackAux({
+    kind: "avatar-image",
+    provider: isMiniMax ? "minimax" : "openai",
+    service: model,
+    label: "BotFleet avatar image",
+    latencyMs: Date.now() - startedAt,
+    metadata: { images: 1 },
+  });
   return { bytes, mime };
 }

@@ -61,6 +61,41 @@ import type { Readable, Writable } from "node:stream";
 import { join } from "node:path";
 import { resolveCliSpawn, type ResolvedSpawn } from "./env-path.ts";
 
+/** Rewrites the environment a child CLI is about to receive.  Returns the
+ * environment to use, or `undefined` to leave the caller's options alone. */
+export type SpawnEnvTransform = (env: NodeJS.ProcessEnv | undefined) => NodeJS.ProcessEnv | undefined;
+
+let spawnEnvTransform: SpawnEnvTransform | undefined;
+
+/** The harness registers its in-memory config here once at boot (Infisical
+ * Agent Proxy routing, server/config.ts `applyAgentProxyEnv`).  procs.ts must
+ * not import config.ts: the shipped mcp-gate and mcp-remote-proxy helpers
+ * bundle this module for `killCliTree`, and config.ts drags the whole harness
+ * graph (Sentry, the packaged build identity) into those bundles.  `undefined`
+ * clears the transform. */
+export function setSpawnEnvTransform(transform: SpawnEnvTransform | undefined): void {
+  spawnEnvTransform = transform;
+}
+
+let spawnEnvTransformFailureLogged = false;
+
+function withSpawnEnv<T extends { env?: NodeJS.ProcessEnv }>(opts: T): T {
+  let env: NodeJS.ProcessEnv | undefined;
+  try {
+    env = spawnEnvTransform?.(opts.env);
+  } catch (error) {
+    // A misbehaving transform must not wedge every spawn and probe: the child
+    // runs with the caller's own environment, and the failure is named once
+    // (the message only, never the environment).
+    if (!spawnEnvTransformFailureLogged) {
+      spawnEnvTransformFailureLogged = true;
+      console.warn(`procs: spawn environment transform failed, spawning with the caller's environment: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    return opts;
+  }
+  return env === undefined ? opts : { ...opts, env };
+}
+
 export function resolveCli(cli: string, args: string[] = []): ResolvedSpawn {
   return resolveCliSpawn(cli, args);
 }
@@ -72,7 +107,7 @@ export function spawnCli(
 ): ChildProcessByStdio<Writable, Readable, Readable> {
   const resolved = resolveCli(cli, args);
   const child = spawn(resolved.command, resolved.args, {
-    ...opts,
+    ...withSpawnEnv(opts),
     // posix: own process group so kill(-pid) reaps child MCP servers;
     // win32: taskkill /T does the reaping instead (see killCliTree)
     ...(process.platform === "win32" ? { windowsHide: true } : { detached: true }),
@@ -117,7 +152,7 @@ export function execCli(
   // that is genuinely still running.
   const softTimeout = typeof opts.timeout === "number" && opts.timeout > 0 ? opts.timeout : 0;
   const killSignal = opts.killSignal ?? "SIGTERM";
-  const execOpts: ExecFileOptions = { ...opts };
+  const execOpts: ExecFileOptions = { ...withSpawnEnv(opts) };
   delete execOpts.timeout;
   let settled = false;
   let timedOut = false;
