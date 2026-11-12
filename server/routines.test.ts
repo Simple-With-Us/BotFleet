@@ -3032,9 +3032,7 @@ describe("bot on/off switch", () => {
       releaseMonitor: (slug) => released.push(slug),
     });
     restarted.flushNow();
-    const disk = JSON.parse(readFileSync(h.options.file!, "utf8")) as {
-      routines: Array<{ sentryMonitorSlug?: string }>;
-    };
+    const disk = JSON.parse(readFileSync(h.options.file!, "utf8"));
     expect(disk.routines[0]?.sentryMonitorSlug).toBe("botfleet-mac-coolify-health-21-00-79c6c49d");
     expect(released).toEqual(["botfleet-mac-hetzner-health-21-00-79c6c49d"]);
     expect(restarted.listRoutines()[0]).not.toHaveProperty("sentryMonitorSlug");

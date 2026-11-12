@@ -733,11 +733,10 @@ export class RoutineManager {
   private releaseStaleMonitors(): void {
     const release = this.options.releaseMonitor;
     if (!release) return;
-    const live = new Set(
-      this.routines
-        .filter((routine) => routine.enabled && routine.sentryMonitorSlug)
-        .map((routine) => routine.sentryMonitorSlug as string),
-    );
+    const live = new Set<string>();
+    for (const routine of this.routines) {
+      if (routine.enabled && routine.sentryMonitorSlug) live.add(routine.sentryMonitorSlug);
+    }
     const seen = new Set<string>();
     const releaseOne = (slug: string | undefined): void => {
       if (!slug || !isRoutineMonitorSlug(slug) || live.has(slug) || seen.has(slug)) return;
