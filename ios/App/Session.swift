@@ -277,6 +277,23 @@ final class Session: ObservableObject {
     /// A saved connection exists, but its token could not be read yet. Keeps
     /// "the keychain is locked" from being mistaken for "not paired".
     private var restorePending = false
+    /// False until the off-main launch restore has published a result.  The
+    /// root stays on a static placeholder for that interval so Welcome is not
+    /// a flash for a phone that is already paired, and so the first frame
+    /// does not wait on the keychain.
+    @Published private(set) var launchRestoreSettled = false
+    /// `connect()` ran before a client existed.  Restore completion starts
+    /// the stream.
+    private var connectRequested = false
+    /// Bumped on sign-out and on a new pairing so an in-flight restore cannot
+    /// publish the previous computer's token afterwards.
+    private var launchGeneration = 0
+    /// The decision the in-flight restore last published.  `finishLaunchRestore`
+    /// reads it after `launchRestoreSettled` flips, which is the moment a tap
+    /// that arrived during the read has to be kept or dropped.
+    private var launchRestoreDecision: CompanionLaunchRestoreDecision = .unpaired
+    private var launchRestoreTask: Task<Void, Never>?
+    private var voiceObserversInstalled = false
     /// A notification can cold-launch the app before protected Keychain data
     /// is available. Retain the last explicitly tapped destination until the
     /// paired client can be rebuilt after unlock.
@@ -293,7 +310,6 @@ final class Session: ObservableObject {
 
     init() {
         _ = NotificationCoordinator.shared
-        observeVoiceAudioSession()
         NotificationCoordinator.shared.responseHandler = { [weak self] target in
             Task { @MainActor in await self?.openNotification(target) }
         }
@@ -322,21 +338,36 @@ final class Session: ObservableObject {
             state.hydrate(fleet)
             // StorePreview bots all select instanceId "preview"; seed the
             // driver map so the chat-header provider mark appears in the
-            // screenshot harness (no live client to warm from).
+            // screenshot harness (no live client to warm from).  The fixture
+            // decode stays synchronous only on this DEBUG launch, which is
+            // not the production hang.
             instanceDriverKinds = ["preview": "claude"]
             status = .live
+            launchRestoreSettled = true
             TranscriptScrollDemo.startIfRequested(self)
             KaraokeDemo.startIfRequested(self)
             ChatFixture.startIfRequested(self)
             return
         }
+        // Screenshot and Lock Screen fixtures must paint their harness on the
+        // first frame.  They have no pairing to restore, and waiting on the
+        // app-group container would race the capture.
+        let launchFixtures = [
+            "-tvface-preview",
+            "-composer-regression-preview",
+            "-live-activity-preview",
+        ]
+        if launchFixtures.contains(where: { ProcessInfo.processInfo.arguments.contains($0) }) {
+            launchRestoreSettled = true
+            return
+        }
 #endif
-        // Write the private-container blob into the app group before restore
-        // so a sibling `app.botfleet.ios` install can import it. No-op when
-        // the suite already holds data or this container was never paired.
-        CompanionConnectionStore.exportLegacyPairingToSharedStorage()
-        restore()
-        Task { await refreshNotificationAuthorization() }
+        // Blob export, JSON decode, and the keychain read used to run here,
+        // on the main thread, before UIKit could finish accessibility
+        // startup (BOTFLEET-W).  They now run off the main thread after one
+        // yield.  The notification delegate above is the part that has to
+        // stay, because a cold launch can deliver an action before a frame.
+        scheduleLaunchRestore(yieldsFirst: true)
     }
 
 #if DEBUG
@@ -420,60 +451,143 @@ final class Session: ObservableObject {
         abandoned?.cancel()
     }
 
-    /// Rebuild the last connection at launch.
+    /// Categories, voice observers, and the notification-settings lookup.
+    /// Idempotent.  Foreground launch calls this after the first frame.
+    /// Background launch calls it from restore completion, because that
+    /// process never shows a scene.
+    func activateAfterFirstFrame() {
+        NotificationCoordinator.shared.registerCategories()
+        observeVoiceAudioSession()
+    }
+
+    /// Rebuild the last connection without blocking the main thread.
     ///
-    /// Three outcomes, and keeping them apart is the whole point. No saved
-    /// connection: stay unpaired. A saved connection whose token reads back:
-    /// connect. A saved connection whose token cannot be read *yet* — the
+    /// Three outcomes, and keeping them apart is the whole point.  No saved
+    /// connection: stay unpaired.  A saved connection whose token reads back:
+    /// connect.  A saved connection whose token cannot be read *yet* — the
     /// locked keychain before a phone's first unlock after reboot, which is
     /// when iOS is most likely to have launched us in the background — hold
-    /// on to it and try again. Only the middle case is a real pairing, and
+    /// on to it and try again.  Only the middle case is a real pairing, and
     /// only the first should ever send someone back to the pairing screen.
-    private func restore() {
-        restorePending = false
-        guard let loaded = CompanionConnectionStore.loadConnectionData(),
-              let saved = try? JSONDecoder().decode(Connection.self, from: loaded.data)
-        else { return }
-        // Same-container dual-compat: a standard-only blob is promoted into
-        // the app-group suite so a later sibling install (or relaunch) can
-        // import it once the legacy export path also writes here.
-        CompanionConnectionStore.promoteStandardToSharedIfNeeded(
-            source: loaded.source,
-            data: loaded.data
-        )
+    ///
+    /// `yieldsFirst` is the cold-launch path.  One turn of the main executor
+    /// lets UIKit drain the accessibility startup block before this task
+    /// does file or keychain work.
+    private func scheduleLaunchRestore(yieldsFirst: Bool) {
+        guard launchRestoreTask == nil else { return }
+        let generation = launchGeneration
+        launchRestoreTask = Task { [weak self] in
+            if yieldsFirst { await Task.yield() }
+            await self?.performLaunchRestore(generation: generation)
+            await self?.finishLaunchRestore(generation: generation)
+        }
+    }
 
-        let stored: String?
+    private func performLaunchRestore(generation: Int) async {
+        let saved = await Task.detached(priority: .userInitiated) { () -> CompanionLaunchSavedConnection? in
+            assert(!Thread.isMainThread)
+            return CompanionLaunchRestore.loadDecoded()
+        }.value
+        guard generation == launchGeneration else { return }
+        let tokenRead: CompanionLaunchTokenRead
+        if let saved {
+            let connectionId = saved.connection.id
+            tokenRead = await Task.detached(priority: .userInitiated) { () -> CompanionLaunchTokenRead in
+                assert(!Thread.isMainThread)
+                return Self.readLaunchToken(connectionId)
+            }.value
+        } else {
+            tokenRead = .missing
+        }
+        guard generation == launchGeneration else { return }
+        if let saved {
+            // Same-container dual-compat: a standard-only blob is promoted
+            // into the app-group suite so a later sibling install can import
+            // it.  The copy stays on this actor, after the generation check.
+            CompanionConnectionStore.promoteStandardToSharedIfNeeded(
+                source: saved.source,
+                data: saved.data
+            )
+        }
+        applyLaunchDecision(
+            CompanionLaunchRestore.decide(saved: saved?.connection, token: tokenRead)
+        )
+    }
+
+    private nonisolated static func readLaunchToken(_ connectionId: String) -> CompanionLaunchTokenRead {
         do {
-            stored = try Keychain.token(for: saved.id)
+            if let token = try Keychain.token(for: connectionId) {
+                return .token(token)
+            }
+            return .missing
+        } catch let error as KeychainError {
+            return .unavailable(isLocked: error.isLocked, message: error.localizedDescription)
         } catch {
-            // Keep the connection and say why. `.offline` rather than
+            return .unavailable(isLocked: false, message: error.localizedDescription)
+        }
+    }
+
+    private func applyLaunchDecision(_ decision: CompanionLaunchRestoreDecision) {
+        launchRestoreDecision = decision
+        switch decision {
+        case .unpaired:
+            restorePending = false
+        case .waitForKeychain(let saved, let message):
+            // Keep the connection and say why.  `.offline` rather than
             // `.unpaired` matters: the latter is what puts PairingView on
             // screen, and asking for a new code is the one recovery that
             // costs a walk to the computer.
             connection = saved
             restorePending = true
-            status = .offline(
-                (error as? KeychainError)?.isLocked == true
-                    ? "Unlock this phone to reach your computer."
-                    : error.localizedDescription
-            )
-            return
+            status = .offline(message)
+        case .connect(let saved, let stored):
+            connection = saved
+            token = stored
+            // New connections honor the desktop's transport policy.  Automatic
+            // walking is credential-safe: protected routes stay protected, while
+            // a legacy/local route is only tried when it was the exact saved route.
+            rotation = CandidateRotation(endpoints: saved.orderedEndpoints)
+            let first = rotation.currentEndpoint.map(saved.dialing) ?? saved
+            client = CompanionClient(connection: first, token: stored)
+            pairingGeneration += 1
+            cancelPendingSettingsMutations()
+            cachedInstances = []
+            instanceRoster.reset()
+            restorePending = false
+            status = .connecting
         }
-        guard let stored else { return } // no token: genuinely not paired
+        // Unpaired drops a destination queued while this read was still
+        // running.  Connect and a locked keychain keep it.  `finishLaunchRestore`
+        // clears again, because a tap can still arrive before settle.
+        if !CompanionLaunchRestore.retainsQueuedNotification(decision) {
+            pendingNotification = nil
+        }
+    }
 
-        connection = saved
-        token = stored
-        // New connections honor the desktop's transport policy. Automatic
-        // walking is credential-safe: protected routes stay protected, while
-        // a legacy/local route is only tried when it was the exact saved route.
-        rotation = CandidateRotation(endpoints: saved.orderedEndpoints)
-        let first = rotation.currentEndpoint.map(saved.dialing) ?? saved
-        client = CompanionClient(connection: first, token: stored)
-        pairingGeneration += 1
-        cancelPendingSettingsMutations()
-        cachedInstances = []
-        instanceRoster.reset()
-        status = .connecting
+    private func finishLaunchRestore(generation: Int) {
+        guard generation == launchGeneration else { return }
+        launchRestoreTask = nil
+        launchRestoreSettled = true
+        // A tap can land after `applyLaunchDecision` and before this settle,
+        // while `launchRestoreSettled` is still false and `openNotification`
+        // is still willing to queue.  Clear that queue once the outcome is
+        // unpaired, with no await in between, so the next `pair()` does not
+        // open the stale chat.
+        if !CompanionLaunchRestore.retainsQueuedNotification(launchRestoreDecision) {
+            pendingNotification = nil
+        }
+        activateAfterFirstFrame()
+        guard connectRequested, client != nil else { return }
+        connect()
+    }
+
+    /// Drop an in-flight restore so it cannot publish over sign-out or a
+    /// pairing that just committed.
+    private func cancelLaunchRestore() {
+        launchGeneration += 1
+        launchRestoreTask?.cancel()
+        launchRestoreTask = nil
+        launchRestoreSettled = true
     }
 
     /// Redeem a one-time pairing credential. On success the device token goes
@@ -485,6 +599,7 @@ final class Session: ObservableObject {
         deviceName: String,
         pairRequestId: String
     ) async throws {
+        cancelLaunchRestore()
         var invited = connection
         // QR invites already carry this policy. Manual entry reaches the
         // session as a parsed Connection, so establish the same consent
@@ -593,6 +708,8 @@ final class Session: ObservableObject {
     }
 
     func signOut() {
+        cancelLaunchRestore()
+        connectRequested = false
         stopVoice()
         discardDeltas()
         streamTask?.cancel()
@@ -640,10 +757,16 @@ final class Session: ObservableObject {
 
     /// Called when the app comes to the front, and once at launch.
     func connect() {
+        connectRequested = true
         // A restore that found the keychain locked left `client` nil on
         // purpose. Coming to the front is the moment worth retrying on: the
         // app is on screen, so the phone is in someone's hand and unlocked.
-        if client == nil, restorePending { restore() }
+        // The retry reads the keychain off the main thread, same as launch.
+        if client == nil, !launchRestoreSettled || restorePending {
+            scheduleLaunchRestore(yieldsFirst: false)
+            endLinger()
+            return
+        }
         if client != nil, let pendingNotification {
             self.pendingNotification = nil
             Task { [weak self] in await self?.openNotification(pendingNotification) }
@@ -1533,8 +1656,8 @@ final class Session: ObservableObject {
         // the body read them at all.
         let attempt: @MainActor @Sendable () async throws -> Bool = {
             // Poll rather than fail on the first check: a cold launch may
-            // still be rebuilding the client — `restore()` reading the
-            // keychain — right now, and one moment later it may well exist.
+            // still be rebuilding the client — the keychain read runs off
+            // the main thread — and one moment later it may well exist.
             // No inner cap of its own: `run`'s 8 s deadline above is the
             // only timeout, and cancelling this sleep when that deadline
             // hits is what reaches `.failed` correctly.
@@ -1816,7 +1939,16 @@ final class Session: ObservableObject {
     /// completion, and `connect` keeps the event stream ready during the
     /// remaining background execution window.
     func refreshFromRemoteNotification() async throws -> Bool {
-        if client == nil, restorePending { restore() }
+        if client == nil, restorePending || !launchRestoreSettled {
+            connect()
+            // The delegate's background budget is 15 seconds.  Leave the rest
+            // of it for the hydrate after the keychain read returns.
+            let deadline = Date().addingTimeInterval(8)
+            while client == nil, !Task.isCancelled, Date() < deadline,
+                  !launchRestoreSettled || launchRestoreTask != nil {
+                try await Task.sleep(nanoseconds: 50_000_000)
+            }
+        }
         guard let client else { return false }
         connect()
         switch try await hydrateSnapshot(using: client) {
@@ -1845,7 +1977,7 @@ final class Session: ObservableObject {
     func refreshLiveActivityState() async -> CompanionState? {
         var clientWaitBackoff = LiveActivityRefreshBackoff()
         while client == nil, !Task.isCancelled {
-            if restorePending { restore() }
+            if restorePending || !launchRestoreSettled { connect() }
             guard client == nil else { break }
             let delay = clientWaitBackoff.takeNextDelay()
             try? await Task.sleep(nanoseconds: delay)
@@ -2791,6 +2923,8 @@ final class Session: ObservableObject {
     /// Calls, Siri, and alarms pause playback; unplugged headphones stop it.
     /// A Personal Voice read also handles these in PersonalVoiceService.
     private func observeVoiceAudioSession() {
+        guard !voiceObserversInstalled else { return }
+        voiceObserversInstalled = true
         let center = NotificationCenter.default
         voiceAudioObservers.append(center.addObserver(
             forName: AVAudioSession.interruptionNotification, object: nil, queue: .main
@@ -3636,7 +3770,7 @@ final class Session: ObservableObject {
             // Do not carry a stale destination into a future, unrelated
             // pairing. Only a saved connection waiting for Keychain access is
             // eligible for replay.
-            if restorePending {
+            if restorePending || !launchRestoreSettled {
                 pendingNotification = target
                 connect()
             } else {

@@ -149,12 +149,24 @@ jobs:
           fetch-depth: 0
 
       - name: Restore iOS ship state
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/ios-fleet
-          key: ios-fleet-botfleet-${{ github.run_id }}
+          key: ios-fleet-botfleet-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
+            ios-fleet-botfleet-${{ github.run_id }}-
             ios-fleet-botfleet-
+
+      - name: Clear stale ship-state lockdirs after cache restore
+        run: |
+          shopt -s nullglob
+          lockdirs=( "${HOME}/.cache/ios-fleet/"*.lockdir )
+          if ((${#lockdirs[@]})); then
+            rm -rf "${lockdirs[@]}"
+            echo "Removed stale lockdir(s): ${lockdirs[*]}"
+          else
+            echo "No stale lockdir entries under ~/.cache/ios-fleet."
+          fi
 
       # Runs FIRST so a tick with nothing to ship costs seconds and cannot go
       # red on an unrelated environment problem. The logic lives in a script,
@@ -346,6 +358,22 @@ jobs:
               echo "- BotFleet: post-sync readiness check did not run or produced no summary"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove ship-state lockdirs before saving cache
+        if: always()
+        run: |
+          shopt -s nullglob
+          lockdirs=( "${HOME}/.cache/ios-fleet/"*.lockdir )
+          if ((${#lockdirs[@]})); then
+            rm -rf "${lockdirs[@]}"
+          fi
+
+      - name: Save iOS ship state
+        if: always()
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/ios-fleet
+          key: ios-fleet-botfleet-${{ github.run_id }}-${{ github.run_attempt }}
 
   report-sentry-deployment:
     needs: ship

@@ -516,7 +516,7 @@ import { credentialFingerprint, SECRET_FIELDS, secretProvenance, secretSource, v
 import { KNOB_FIELDS, clearedHeadroomKnobs, knobSource, readKnobField } from "./knob-map.ts";
 import { patchChangesInfisicalConnection, writeThroughKnobs } from "./knob-write-through.ts";
 import { configureTurnIdentity, observeRuntimeEvent } from "./sentry-ai.ts";
-import { checkInRoutineFinish, checkInRoutineStart } from "./sentry-crons.ts";
+import { checkInRoutineFinish, checkInRoutineStart, releaseRoutineMonitor } from "./sentry-crons.ts";
 import { ProviderRegistry, type DescribedInstance } from "./harness/registry.ts";
 import { cancelPeerApprovalsFor, cancelPeerApprovalsForThread, dismissStalePeerCards, resolvePeerComms, type ApprovalBus } from "./peer-approval.ts";
 import {
@@ -681,6 +681,7 @@ import {
   type CommandSurface,
 } from "../shared/bot-commands.ts";
 import { memberTurnSelection } from "./member-turn.ts";
+import { DEFAULT_WEBHOOK_PAYLOAD_DEDUPE_MS } from "./webhook-payload-dedupe.ts";
 import { WebhookManager } from "./webhooks.ts";
 import { ResourceTriggerManager } from "./resource-triggers.ts";
 import { readHostDispatchHoldReason, readHostDispatchHot } from "./host-dispatch-hot.ts";
@@ -8740,6 +8741,7 @@ routines = new RoutineManager({
   },
   checkInStart: checkInRoutineStart,
   checkInFinish: checkInRoutineFinish,
+  releaseMonitor: releaseRoutineMonitor,
 });
 // Catch up retained durable receipts after restart; delivery IDs deduplicate states.
 for (const run of routines.listRuns()) webhookRequestLog.routineSubscriber({ kind: "routine.run", run });
@@ -8938,6 +8940,12 @@ const webhooks = new WebhookManager({
   pendingRuns: (webhookId) => routines!.activeWebhookRunCount(webhookId),
   canCoalesce: (webhookId, botId) => routines!.canCoalesceWebhook(webhookId, botId),
   runStatus: (runId) => routines!.runStatus(runId),
+  // Live read so an Infisical refresh applies on the next delivery, with 120 seconds when the knob is absent.
+  payloadDedupeWindowMs: () => {
+    const seconds = cfg.jobs?.webhookPayloadDedupeSeconds;
+    if (seconds === undefined || !Number.isFinite(seconds) || seconds < 0) return DEFAULT_WEBHOOK_PAYLOAD_DEDUPE_MS;
+    return seconds * 1000;
+  },
 });
 webhookEphemeralSource = (webhookId) => {
   const hook = webhooks.list().find((candidate) => candidate.id === webhookId);
