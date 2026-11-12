@@ -124,9 +124,9 @@ export function antigravityGroupSummary(
       const pctStr = exhausted ? "0%" : remainingPercent != null ? `${remainingPercent}% available` : "not reported";
       let headline = `${groupName}: ${pctStr}`;
       if (resetCountdown) {
-        headline += ` (5h window, resets in ${resetCountdown})`;
+        headline += ` (5-hour window, resets in ${resetCountdown})`;
       } else {
-        headline += ` (5h window)`;
+        headline += ` (5-hour window)`;
       }
       entry.headline = headline;
     }
@@ -469,6 +469,22 @@ export function localQuotaStatusLine(freshness: LocalQuotaFreshnessView | null |
   return `${producer}'s quota file could not be read`;
 }
 
+export type QuotaGridPlaceholderVariant = "loading" | "empty";
+
+/** One plain line under an engine row when the usage grid has no cells yet,
+ *  so an empty panel is not mistaken for a broken or still-loading one. */
+export function quotaGridPlaceholderLine(
+  variant: QuotaGridPlaceholderVariant,
+  engineName?: string | null,
+): string {
+  const name = (engineName ?? "").trim();
+  const forEngine = name ? ` for ${name}` : "";
+  if (variant === "loading") {
+    return `Loading usage limits${forEngine}…`;
+  }
+  return `No usage limits reported yet${forEngine}.`;
+}
+
 /** "Claude: sign in again to refresh quota (from CodeCaps)" — the reason a
  *  provider reported nothing, attributed to the app that measured it.  The
  *  reason is the producer's own user-safe text: rendered as plain text,
@@ -543,7 +559,7 @@ export function minimaxQuotaLine(row: MiniMaxQuotaView, now: number = Date.now()
     const boosted = row.secondaryRemainingPercent > 100 ? " of a boosted allowance" : "";
     parts.push(`${Math.round(row.secondaryRemainingPercent)}% left this week${boosted}`);
   }
-  if (row.remainingPercent != null) parts.push(`${Math.round(row.remainingPercent)}% left in the current 5 h window`);
+  if (row.remainingPercent != null) parts.push(`${Math.round(row.remainingPercent)}% left in the current 5-hour window`);
   if (parts.length === 0) return null;
   let line = parts.join(", ");
   // Name whichever window is actually BINDING: if the weekly allowance is
@@ -591,9 +607,21 @@ export function windowsLabelFromHeadlines(headlines: WindowHeadline[]): string |
   return undefined;
 }
 
+/** One capitalization for a pair of windows.  "5hr/Week" and "5-hour/weekly" both become "5-Hour / Weekly". */
+export function formatWindowPairLabel(label: string): string {
+  return label
+    .replace(/5\s*-?\s*h(?:ou)?rs?/gi, "5-Hour")
+    .replace(/\bweekly\b/gi, "Weekly")
+    .replace(/\bweek\b/gi, "Weekly")
+    .replace(/\bmonthly\b/gi, "Monthly")
+    .replace(/\bmonth\b/gi, "Monthly")
+    .replace(/\s*\/\s*/g, " / ")
+    .trim();
+}
+
 /** Formats dual-window quota percentage for ModelPicker row.
- *  When both primary (5h) and secondary (weekly/monthly) percentages exist: "(XX% / YY% for 5h / w)".
- *  When only primary exists: "(XX% for 5h)" if a windows label exists, or "XX% left" otherwise. */
+ *  When both primary (5h) and secondary (weekly/monthly) percentages exist: "(XX% / YY% for 5-Hour / Weekly)".
+ *  When only primary exists: "(XX% for 5-Hour)" if a windows label exists, or "XX% left" otherwise. */
 export function formatDualQuotaBadge(
   remainingPercent?: number | null,
   secondaryRemainingPercent?: number | null,
@@ -605,14 +633,7 @@ export function formatDualQuotaBadge(
   
   let suffix = "";
   if (options?.windowsLabel) {
-    let w = options.windowsLabel.toLowerCase();
-    w = w.replace(/hr/g, "h");
-    w = w.replace(/hour/g, "h");
-    w = w.replace(/week/g, "w");
-    w = w.replace(/month/g, "m");
-    w = w.replace(/day/g, "d");
-    w = w.replace(/\//g, " / ");
-    suffix = ` for ${w}`;
+    suffix = ` for ${formatWindowPairLabel(options.windowsLabel)}`;
   }
 
   if (p1 != null && p2 != null) {

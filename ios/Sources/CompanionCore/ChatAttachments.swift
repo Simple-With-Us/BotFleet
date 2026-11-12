@@ -28,6 +28,14 @@ public struct PendingChatAttachment: Sendable, Identifiable, Equatable, Hashable
         ChatAttachments.isImageMIME(mime) ? .image : .file
     }
 
+    /// Bytes the composer can draw as a thumbnail.  Nil for a file, an empty
+    /// payload, or an image outside the formats the phone can show, so the
+    /// strip keeps a document or photo icon instead of a broken picture.
+    public var previewImageData: Data? {
+        guard kind == .image, ChatAttachments.isDisplayImageMIME(mime), !data.isEmpty else { return nil }
+        return data
+    }
+
     public var size: Int { data.count }
 
     public static func == (left: PendingChatAttachment, right: PendingChatAttachment) -> Bool {

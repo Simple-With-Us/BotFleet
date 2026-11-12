@@ -1,9 +1,14 @@
 import Foundation
 import SwiftUI
+import AppKit
 import CoreVideo
 import CompanionCore
+#if os(macOS)
+import AppKit
+import UserNotifications
+#endif
 
-public enum MacConnectionStatus: Equatable {
+public enum MacConnectionStatus: Equatable, Sendable {
     case disconnected
     case connecting
     case connected(endpoint: String)
@@ -14,12 +19,25 @@ public enum MacConnectionStatus: Equatable {
         return false
     }
 
-    public var statusColor: Color {
+    public var statusPillKind: MacStatusPillKind {
         switch self {
+        case .connected:
+            return .connected
+        case .connecting:
+            return .reconnecting
+        case .disconnected:
+            return .offline
+        case .failed:
+            return .error
+        }
+    }
+
+    public var statusColor: Color {
+        switch statusPillKind {
         case .connected: return .green
-        case .connecting: return .yellow
-        case .disconnected: return .gray
-        case .failed: return .red
+        case .reconnecting: return .yellow
+        case .offline: return .gray
+        case .error: return .red
         }
     }
 
@@ -39,26 +57,228 @@ public enum SidebarSelection: Hashable, Sendable {
 }
 
 @MainActor
-public final class MacSession: ObservableObject {
+public protocol MacSessionSourceProtocol: AnyObject {
+    var state: CompanionState { get }
+    var status: MacConnectionStatus { get }
+    var selection: SidebarSelection? { get set }
+    var selectedThreadId: String? { get set }
+    var activeThreadId: String? { get }
+    var activeTitle: String { get }
+    var activeSubtitle: String { get }
+    var activeMessages: [Message] { get }
+    var activeStreamingText: String? { get }
+    var activeReasoningText: String? { get }
+    var unreadSummary: MacUnreadBadgeSummary { get }
+
+    func connect(host: HostRecord)
+    func disconnect()
+    @discardableResult
+    func sendMessage(_ text: String) async -> Bool
+    func stopActiveTurn() async
+}
+
+@MainActor
+public final class MacSession: ObservableObject, MacSessionSourceProtocol {
     @Published public var state: CompanionState = CompanionState()
     @Published public var status: MacConnectionStatus = .disconnected
-    @Published public var selection: SidebarSelection?
+    @Published public var selection: SidebarSelection? {
+        didSet {
+            reconcileWaitingThreadPin()
+        }
+    }
     @Published public var selectedThreadId: String?
     @Published public var isSending: Bool = false
-    @Published public var host: String = "127.0.0.1"
-    @Published public var port: Int = 8799
+    @Published public private(set) var host: String = "127.0.0.1"
+    @Published public private(set) var port: Int = 8799
+    public let servers: ServersCoordinator
+    public let resources: ResourcesCoordinator
 
-    // CUA Live Stream state
+    // Lifecycle & Remote Wake state (BF-2497)
+    @Published public var lifecycleSettings = MacLifecycleSettings()
+    @Published public var isShuttingDownServer = false
+    /// The last lifecycle-save failure, so the Settings panel can say why the
+    /// toggles went back to their previous values.
+    @Published public var lifecycleErrorMessage: String?
+
+    // Native companion listener lifecycle (BF-2590, the lifecycle half of BF-2511)
+    /// What the native companion listener is doing, mirrored from the
+    /// controller so the Settings section observes it.
+    @Published public var companionListenerState: CompanionListenerState = .off
+    /// Whether the person turned the native companion listener on.  Off by
+    /// default until the native pairing contract lands.
+    @Published public var companionListenerEnabled: Bool = false
+    /// Owns the listener's start and stop; the backend opens the app's store
+    /// only on the first start, so nothing is created while the setting is off.
+    public let companionListener: CompanionListenerController
+
+    // Native engine composition (sole-writer handoff from AG).  The
+    // supervisor is owned here so its supervised-process count is readable
+    // even before the listener first starts; the engine turns are read
+    // through the listener-built runtime below.  Together they feed the
+    // graceful-stop drain counters (AG busy-flag note).
+    private let nativeProcessSupervisor: ProcessSupervisorActor
+    private let nativeRuntimeBox: MacNativeRuntimeBox
+    /// Native engine work currently in flight on the listener graph, for the
+    /// server-bridge session state.  Zero until the listener first starts.
+    @Published public private(set) var nativeBusy = MacNativeBusySnapshot()
+    /// What the last quit-time native drain did, in the owner's words.
+    @Published public private(set) var nativeDrainSummary: String?
+
+    // CUA Live Stream & Safety state (BF-2499)
     @Published public var showCuaViewer: Bool = false
     @Published public var isCuaStreaming: Bool = false
     @Published public var cuaPixelBuffer: CVPixelBuffer?
     @Published public var cuaStatusMessage: String?
+    @Published public var cuaRevocationBanner: String?
+
+    // Phase 3: Voice, System Integration, Streaming Transcript & Settings Routing
+    @Published public var voiceState: MacVoiceCaptureState = .idle
+    @Published public var voiceRouteBanner: String?
+    @Published public var activeSettingsSection: MacSettingsSection = .general
+    @Published public var allBotsPaused: Bool = false
+    /// The composer's text.  The session owns it so the menubar can compose
+    /// and dictate without a view in the window being the source of truth.
+    @Published public var composerDraft: String = ""
+    /// Published model windows, keyed by instance and model.  Empty until a
+    /// conversation asks for them.
+    @Published public private(set) var modelWindows: [String: Int] = [:]
+    /// Bumped whenever something asks the composer to take the keyboard.
+    @Published public var composerFocusToken: Int = 0
+
+    public let voiceEngine = MacVoiceEngine()
+    public let transcriptEngine = MacTranscriptEngine()
+    public let hotkeyManager = MacGlobalHotkeyManager()
+    public let notificationCoordinator = MacNotificationCoordinator()
+    public let capabilities = MacDesktopCapabilities()
+    #if os(macOS)
+    public let menubarController = MacMenubarController()
+    #endif
 
     private var client: CompanionClient?
     private var streamTask: Task<Void, Never>?
+    private var connectionGeneration = UUID()
     private var reconnectAttempt = 0
+    private let policyStore: MacPersistencePolicyStore
+    private let permissionMonitor: CuaPermissionMonitor
+    private let cuaStatusState = CuaStatusState()
+    private var hasLaunched = false
+    private var didDeliberatelyStopServer = false
+    private weak var mainWindow: NSWindow?
+    private var mainWindowObservers: [NSObjectProtocol] = []
+    private var surfaceSyncThrottle = MacSystemSurfaceSyncThrottle()
+    private var waitingThreadPin = MacWaitingThreadPin()
+    private var pendingSystemSurfaceSync: Task<Void, Never>?
+    private var notificationAuthorizationTask: Task<Bool, Never>?
+    #if os(macOS)
+    private var voiceCaptureCoordinator: MacVoiceCaptureCoordinator?
+    #endif
 
-    public init() {}
+    public init(
+        policyStore: MacPersistencePolicyStore = MacPersistencePolicyStore(),
+        permissionMonitor: CuaPermissionMonitor = CuaPermissionMonitor()
+    ) {
+        self.policyStore = policyStore
+        let hostStore = HostStore(fileURL: policyStore.dataDir.appendingPathComponent("hosts.json"))
+        self.servers = ServersCoordinator(store: hostStore)
+        self.resources = ResourcesCoordinator(store: hostStore)
+        self.resources.observeHosts(from: self.servers)
+        self.permissionMonitor = permissionMonitor
+        if let localPersist = policyStore.readPersistOnExit() {
+            self.lifecycleSettings = MacLifecycleSettings(
+                allowRemoteDesktopLaunch: nil,
+                persistOnExit: localPersist
+            )
+        }
+        // BF-2511's acceptance has landed: durable device credentials
+        // (digest-only `devices.json`, revocation, the fleet cap), Origin
+        // rejection on every device route, and the pairing contract now
+        // stand between a network peer and this listener.  So the LAN
+        // opt-in and the Bonjour advertisement turn on together here —
+        // and only together: both read the one explicit opt-in
+        // (`OMB_COMPANION_ALLOW_CLEARTEXT_LAN`, as the Node sidecar reads
+        // it), and with nothing configured the listener still binds
+        // loopback and advertises nothing a phone could not connect to.
+        // The listener itself also stays off until it is turned on.
+        let lanPolicy = CompanionLANPolicy.read()
+        let listenerOptions = NativeCompanionServer.ListenerOptions(
+            allowCleartextLAN: lanPolicy.allowCleartextLAN
+        )
+        let advertisement = listenerOptions.allowCleartextLAN
+            ? CompanionListenerController.defaultAdvertisement(computerName: Host.current().localizedName)
+            : nil
+        let storeURL = policyStore.dataDir
+            .appendingPathComponent("native", isDirectory: true)
+            .appendingPathComponent("companion.sqlite")
+        // The paired fleet's durable home, beside the listener's store:
+        // digests only, so a paired phone survives an app restart.
+        let deviceStoreURL = storeURL.deletingLastPathComponent()
+            .appendingPathComponent("devices.json")
+        // Session-owned composition pieces: the supervisor is created now
+        // (no disk I/O) and injected into the listener graph on first start,
+        // so the session reads the one supervised-process count its drain
+        // counters use.  The box ferries the built runtime back out for
+        // quit-time drain; it stays empty while the setting is off, and an
+        // empty box honestly reads as nothing to drain.
+        let nativeProcessSupervisor = ProcessSupervisorActor()
+        let nativeRuntimeBox = MacNativeRuntimeBox()
+        self.nativeProcessSupervisor = nativeProcessSupervisor
+        self.nativeRuntimeBox = nativeRuntimeBox
+        let backend = NativeCompanionListenerBackend(port: 0, options: listenerOptions) {
+            // A store of the listener's own, under the Mac's data directory,
+            // created only when the listener is first turned on.  Where the
+            // native engine's store finally lives is BF-2504's call; this
+            // path is provisional and named in the BF-2590 PR.
+            try FileManager.default.createDirectory(
+                at: storeURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let database = try DatabaseService(path: storeURL.path)
+            // Inject the native runtime so the wait routes serve instead of
+            // answering 503, with workspaces confined beside the store.  The
+            // server retains the runtime (and through it the graph's actors);
+            // the listener stays default-off and stop stays socket-only.
+            let workspacesRoot = storeURL.deletingLastPathComponent()
+                .appendingPathComponent("workspaces", isDirectory: true)
+            let macRuntime = NativeMacCompanionRuntime(
+                database: database,
+                workspacesRoot: workspacesRoot,
+                processSupervisor: nativeProcessSupervisor
+            )
+            nativeRuntimeBox.store(macRuntime)
+            return NativeCompanionServer(database: database, deviceStoreURL: deviceStoreURL, nativeRuntime: macRuntime.runtime)
+        }
+        self.companionListener = CompanionListenerController(
+            backend: backend,
+            policyStore: policyStore,
+            advertisement: advertisement
+        )
+        self.companionListenerEnabled = self.companionListener.isEnabled
+        self.companionListener.onStateChange = { [weak self] state in
+            self?.companionListenerState = state
+        }
+        // Registering the notification categories is not asking for
+        // permission:  the permission prompt stays lazy, at the first event
+        // that actually needs the person.
+        MacNotificationCenter.registerCategories()
+    }
+
+    public var unreadSummary: MacUnreadBadgeSummary {
+        MacUnreadBadgeSummary.from(state: state)
+    }
+
+    public var menubarState: MacMenubarState {
+        #if os(macOS)
+        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        #else
+        let reduceMotion = false
+        #endif
+        return MacMenubarState.from(
+            state: state,
+            isConnected: status.isConnected,
+            allBotsPaused: allBotsPaused,
+            reduceMotion: reduceMotion
+        )
+    }
 
     public var selectedBotId: String? {
         get {
@@ -136,71 +356,587 @@ public final class MacSession: ObservableObject {
         return state.reasoning[threadKey]
     }
 
-    public func connect(host: String = "127.0.0.1", port: Int = 8799) {
-        self.host = host
-        self.port = port
+    // MARK: - Voice & System Sync
+
+    /// Handles a tap on the composer's microphone button.
+    ///
+    /// The returned text is what the composer should show afterwards.  A
+    /// cancelled pending start keeps the caller's draft verbatim, because the
+    /// engine's frozen snapshot predates anything typed while the microphone
+    /// was warming up.
+    public func toggleComposerDictation(currentDraft: String) -> String {
+        let outcome = voiceEngine.tapMicrophoneButtonReportingOutcome(
+            mode: .composerDictation,
+            currentDraft: currentDraft
+        )
+        switch outcome {
+        case .startedCapture(let attemptId):
+            Task { @MainActor in
+                await startComposerCapture(attemptId: attemptId)
+            }
+        case .stoppedCapture:
+            stopVoiceCapture()
+        case .cancelledPendingStart:
+            break
+        }
+        voiceState = voiceEngine.state
+        voiceRouteBanner = voiceEngine.routeBanner
+        return voiceEngine.composerDraftAfterTap(incomingDraft: currentDraft)
+    }
+
+    /// Asks the system for microphone and speech access, then completes the
+    /// attempt the engine is waiting on and opens the capture stack.
+    private func startComposerCapture(attemptId: UUID) async {
+        #if os(macOS)
+        let outcome = await MacVoiceCaptureCoordinator.requestPermissions()
+        let opened = voiceEngine.completeStartPermissionGrant(
+            attemptId: attemptId,
+            micGranted: outcome.micGranted,
+            speechGranted: outcome.speechGranted,
+            hasInputDevice: outcome.hasInputDevice,
+            localeSupported: outcome.localeSupported,
+            micBusy: outcome.micBusy
+        )
+        voiceState = voiceEngine.state
+        voiceRouteBanner = voiceEngine.routeBanner
+        guard opened else { return }
+
+        let coordinator = MacVoiceCaptureCoordinator(
+            onPartialTranscript: { [weak self] partial, level in
+                Task { @MainActor in
+                    guard let self else { return }
+                    self.voiceEngine.receivePartialTranscript(partial, audioLevel: level)
+                    self.voiceState = self.voiceEngine.state
+                    // The composer is live while dictation runs:  the
+                    // partials stream into it, exactly like the Electron
+                    // composer, which shows the text typed before the
+                    // microphone went on and then the latest partial.
+                    if let liveDraft = self.voiceEngine.liveComposerDraft {
+                        self.composerDraft = liveDraft
+                    }
+                }
+            },
+            onRecognitionEnded: { [weak self] end in
+                Task { @MainActor in
+                    guard let self else { return }
+                    self.handleVoiceCaptureEnded(end)
+                }
+            }
+        )
+        voiceCaptureCoordinator = coordinator
+        if !coordinator.start() {
+            voiceEngine.handleMidSessionRecognitionFailure()
+            voiceState = voiceEngine.state
+        }
+        #else
+        _ = attemptId
+        #endif
+    }
+
+    /// Leaves the recording state when the capture stack ends on its own.
+    ///
+    /// A recognizer that fails or finishes closes the microphone without a
+    /// tap, so the session has to hear about it:  otherwise the composer
+    /// keeps showing a recording that no longer exists.
+    private func handleVoiceCaptureEnded(_ end: MacVoiceCaptureEnd) {
+        voiceCaptureCoordinator = nil
+        voiceEngine.handleCaptureEnded(end)
+        voiceState = voiceEngine.state
+        switch end {
+        case .recognitionFailed:
+            // A failed recognition restores the text the user had before
+            // dictating, so a half-transcribed fragment never stays behind
+            // as if it were what they said.
+            composerDraft = voiceEngine.currentDraft
+        case .completed:
+            // The final transcript is already in the composer;  the engine
+            // only stops.
+            break
+        }
+    }
+
+    /// Closes the microphone and stops recognition.
+    private func stopVoiceCapture() {
+        #if os(macOS)
+        voiceCaptureCoordinator?.stop()
+        voiceCaptureCoordinator = nil
+        #endif
+    }
+
+    /// Routes a `botfleet://settings/...` deep link and presents Settings.
+    public func routeSettingsDeepLink(_ url: URL) {
+        if let section = MacSettingsDeepLinkRouter.section(for: url) {
+            activeSettingsSection = section
+            presentSettingsScene()
+        }
+    }
+
+    /// Presents the app's Settings scene.
+    public func presentSettingsScene() {
+        #if os(macOS)
+        let settingsSelector = NSSelectorFromString("showSettingsWindow:")
+        if NSApp.sendAction(settingsSelector, to: nil, from: nil) { return }
+        let preferencesSelector = NSSelectorFromString("showPreferencesWindow:")
+        NSApp.sendAction(preferencesSelector, to: nil, from: nil)
+        #endif
+    }
+
+    /// Opens the app's Settings on the section that resolves a voice failure,
+    /// and the system privacy pane when the failure needs one.
+    public func openSettingsForVoiceFailure(_ failure: MacVoiceFailure) {
+        activeSettingsSection = MacSettingsDeepLinkRouter.section(forVoiceFailure: failure)
+        // Only the system privacy panes are opened externally.  The app's own
+        // deep link is presented as the Settings scene, because the URL scheme
+        // is not guaranteed to be registered.
+        if let url = failure.settingsURL, url.scheme == "x-apple.systempreferences" {
+            #if os(macOS)
+            NSWorkspace.shared.open(url)
+            #endif
+        }
+        presentSettingsScene()
+    }
+
+    // MARK: - Menubar Actions
+
+    /// Brings the main window forward.
+    public func activateMainWindow() {
+        #if os(macOS)
+        NSApp.activate(ignoringOtherApps: true)
+        if let window = NSApp.windows.first(where: { $0.isVisible }) {
+            window.makeKeyAndOrderFront(nil)
+        } else {
+            NSApp.sendAction(NSSelectorFromString("reopen:"), to: nil, from: nil)
+        }
+        #endif
+    }
+
+    /// Brings the main window forward and puts the keyboard in the composer.
+    public func focusComposer() {
+        activateMainWindow()
+        composerFocusToken &+= 1
+    }
+
+    /// Dictates a message from the menubar.
+    public func beginMenubarDictation() {
+        activateMainWindow()
+        composerDraft = toggleComposerDictation(currentDraft: composerDraft)
+    }
+
+    /// Selects a bot that is waiting for the person.
+    public func selectWaitingBot(_ item: MacWaitingBotItem) {
+        selectedBotId = item.id
+        waitingThreadPin.pin(threadId: item.threadId, botId: item.id)
+        selectedThreadId = item.threadId
+        activateMainWindow()
+    }
+
+    /// Drops a menubar thread pin once the sidebar selection moves on.
+    ///
+    /// The menubar pins the thread it opened, so a later sidebar pick has
+    /// to release it:  otherwise the transcript on screen stays on the
+    /// thread the menubar picked while the sidebar shows another bot.
+    private func reconcileWaitingThreadPin() {
+        if waitingThreadPin.dropIfSelectionMoved(toBotId: selectedBotId) {
+            selectedThreadId = nil
+        }
+    }
+
+    /// Pauses or resumes every bot.
+    public func togglePauseResumeAll() {
+        allBotsPaused.toggle()
+    }
+
+    /// Opens the app's Settings.
+    public func openSettings() {
+        presentSettingsScene()
+    }
+
+    // MARK: - Notifications
+
+    /// Turns a harness notify frame into the candidate event the coordinator
+    /// evaluates.  Routine progress and normal completions never notify.
+    private func handleNotificationFrame(_ notification: NotificationFrame) {
+        let event = MacCandidateNotificationEvent(notificationFrame: notification)
+        guard event.requiresPersonAttention else {
+            _ = notificationCoordinator.handleEvent(event)
+            return
+        }
+        Task { @MainActor [weak self] in
+            await self?.deliverNotification(event)
+        }
+    }
+
+    /// Asks the system for notification permission at the first blocking event,
+    /// then delivers the notification.
+    private func deliverNotification(_ event: MacCandidateNotificationEvent) async {
+        if !notificationCoordinator.hasRequestedPermission {
+            let granted = await requestNotificationAuthorization()
+            notificationCoordinator.applyResolvedPermission(granted)
+        }
+        let decision = notificationCoordinator.handleEvent(event)
+        if case .deliver(let payload) = decision {
+            MacNotificationCenter.submit(payload)
+        }
+    }
+
+    /// Requests notification authorization from the system, once.
+    private func requestNotificationAuthorization() async -> Bool {
+        if let task = notificationAuthorizationTask {
+            return await task.value
+        }
+        let task = Task<Bool, Never> {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+                UNUserNotificationCenter.current().requestAuthorization(
+                    options: [.alert, .sound, .badge]
+                ) { granted, _ in
+                    continuation.resume(returning: granted)
+                }
+            }
+        }
+        notificationAuthorizationTask = task
+        return await task.value
+    }
+
+    private func syncSystemSurfaces(force: Bool = false) {
+        let now = Date()
+        switch surfaceSyncThrottle.action(for: now, force: force) {
+        case .scheduleDeferred:
+            scheduleDeferredSystemSurfaceSync()
+        case .syncNow:
+            // A forced rebuild replaces the pending deferred one:  the
+            // surfaces are current, so the deferred rebuild would only
+            // repeat it with older state.
+            pendingSystemSurfaceSync?.cancel()
+            pendingSystemSurfaceSync = nil
+            surfaceSyncThrottle.recordSync(at: now)
+            performSystemSurfaceSync()
+        }
+    }
+
+    /// Rebuilds the surfaces once the throttle window has passed, so the last
+    /// frame of a burst is never dropped.
+    private func scheduleDeferredSystemSurfaceSync() {
+        guard pendingSystemSurfaceSync == nil else { return }
+        pendingSystemSurfaceSync = Task { @MainActor [weak self] in
+            let nanoseconds = UInt64(MacSystemSurfaceSyncPolicy.minimumInterval * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: nanoseconds)
+            guard let self, !Task.isCancelled else { return }
+            self.pendingSystemSurfaceSync = nil
+            // The deferred rebuild advances the throttle too:  without this
+            // the next frame would schedule another rebuild immediately.
+            self.surfaceSyncThrottle.recordSync(at: Date())
+            self.performSystemSurfaceSync()
+        }
+    }
+
+    private func performSystemSurfaceSync() {
+        notificationCoordinator.activeOnScreenThreadId = activeThreadId
+        #if os(macOS)
+        menubarController.apply(menubarState)
+        NSApplication.shared.dockTile.badgeLabel = unreadSummary.dockBadgeLabel
+        #endif
+    }
+
+    /// Connects to the local harness.
+    ///
+    /// A reconnect never clears the deliberate-stop sentinel: the marker is the
+    /// only thing keeping the launchd `StartInterval` tick from resurrecting a
+    /// harness the operator stopped on purpose.  Only `launch()` clears it.
+    public func connect() {
+        guard servers.isLoaded, let local = servers.hosts.first(where: \.isLocal) else { return }
+        connect(host: local)
+    }
+
+    public func connect(host record: HostRecord) {
+        // Remote enrollment does not opt the app into remote chat or actions.
+        guard record.isLocal, let connection = try? record.companionConnection() else {
+            status = .failed("Choose This Mac to connect.")
+            return
+        }
+        self.host = connection.host
+        self.port = connection.port
         disconnect()
 
-        status = .connecting
-
-        let normalizedHost = Connection.urlHost(host)
-        guard let url = URL(string: "http://\(normalizedHost):\(port)"),
-              let endpoint = CompanionEndpoint(url: url.absoluteString, kind: .lan, priority: 1) else {
-            status = .failed("Invalid server URL: http://\(normalizedHost):\(port)")
+        if didDeliberatelyStopServer {
+            // The harness was deliberately stopped in this session, so a
+            // reconnect would only hammer a server that is meant to stay down.
+            status = .failed("Server was deliberately stopped.\u{00A0} Start the harness to reconnect.")
             return
         }
 
-        let connection = Connection(
-            name: "Local Mac",
-            host: host,
-            port: port,
-            activeEndpoint: endpoint,
-            endpoints: [endpoint],
-            allowedRouteKinds: [.lan, .bonjour, .hosted],
-            allowedLocalRouteURLs: [endpoint.url]
-        )
+        status = .connecting
 
         // Local loopback does not require a bearer token in dev mode
-        let client = CompanionClient(connection: connection, token: nil)
+        let client = CompanionClient(connection: connection, token: nil, hostOrigin: record.origin)
         self.client = client
+        servers.connectedRecordID = record.id
+        let generation = connectionGeneration
 
         streamTask = Task { [weak self] in
-            await self?.runConnectionLoop(client: client, endpoint: "\(host):\(port)")
+            await self?.runConnectionLoop(client: client, endpoint: record.origin.url.absoluteString, generation: generation)
         }
     }
 
+    /// Called once when the desktop app is deliberately launched.
+    ///
+    /// The launch clears the deliberate-stop sentinel so the launchd wrapper is
+    /// allowed to start or supervise the harness again.
+    public func launch() {
+        guard !hasLaunched else { return }
+        hasLaunched = true
+        _ = try? policyStore.clearStoppedMarker(for: .appLaunch)
+        // The native companion listener starts with the app when the
+        // setting is on; off by default, so this is a no-op today.
+        Task { @MainActor [weak self] in
+            await self?.companionListener.applyLaunch()
+        }
+        let generation = connectionGeneration
+        Task { [weak self] in
+            guard let self else { return }
+            await MacLocalConnectionBootstrap.run(
+                loadHosts: {
+                    await self.servers.load()
+                    return self.servers.isLoaded ? self.servers.hosts : nil
+                },
+                isCurrent: { self.connectionGeneration == generation && !self.didDeliberatelyStopServer },
+                connect: { self.connect(host: $0) }
+            )
+        }
+    }
+
+    /// Turns the native companion listener on or off from Settings.  The
+    /// setting is written before the listener moves, and a refusal is shown
+    /// on the same line the other lifecycle toggles use.
+    public func setCompanionListenerEnabled(_ enabled: Bool) async {
+        do {
+            try await companionListener.setEnabled(enabled)
+            companionListenerEnabled = companionListener.isEnabled
+            lifecycleErrorMessage = nil
+        } catch {
+            companionListenerEnabled = companionListener.isEnabled
+            lifecycleErrorMessage = "The companion listener setting could not be saved: \(error.localizedDescription)"
+        }
+        await refreshNativeBusyState()
+    }
+
+    // MARK: - Native Engine Composition (drain counters + graceful stop)
+
+    /// Reads the current native busy snapshot for the server-bridge session
+    /// state: engine turns from the listener graph's coordinator and
+    /// supervised processes from the session-owned supervisor.  Zero while
+    /// the listener has never started.
+    public func refreshNativeBusyState() async {
+        let engineTurns = await nativeRuntimeBox.runtime?.activeEngineTurnCount() ?? 0
+        let processes = await nativeProcessSupervisor.activeProcessCount()
+        nativeBusy = MacNativeBusySnapshot(engineTurns: engineTurns, supervisedProcesses: processes)
+    }
+
+    /// Reads the snapshot without publishing it, for the drain path.
+    private func readNativeBusySnapshot() async -> MacNativeBusySnapshot {
+        let engineTurns = await nativeRuntimeBox.runtime?.activeEngineTurnCount() ?? 0
+        let processes = await nativeProcessSupervisor.activeProcessCount()
+        return MacNativeBusySnapshot(engineTurns: engineTurns, supervisedProcesses: processes)
+    }
+
+    /// Bounded graceful drain of the native runtime for app termination.
+    ///
+    /// Fences admission first so the bounded wait converges, waits for the
+    /// in-flight native turns and processes to settle, then runs the
+    /// terminal runtime shutdown which stops what remains and flushes the
+    /// stores.  Both phases are bounded: quit replies and proceeds even if a
+    /// cancelled engine task never exits, because a hung quit is worse than
+    /// a shutdown that finishes behind it.  A listener that never started
+    /// drains trivially.  This never runs on window close: a persisted
+    /// window close keeps the listener up, and the terminal shutdown would
+    /// make a later listener start fail.
+    public func drainNativeEnginesForTermination(
+        deadlineMs: Double = MacNativeComposition.drainDeadlineMs,
+        pollMs: Double = MacNativeComposition.drainPollMs,
+        shutdownAckTimeoutMs: Double = MacNativeComposition.shutdownAckTimeoutMs
+    ) async -> MacNativeDrainResult {
+        guard let macRuntime = nativeRuntimeBox.runtime else {
+            let result = MacNativeDrainResult(settledCleanly: true)
+            nativeDrainSummary = result.summary
+            return result
+        }
+        // Fence first: no new wait dispatches while the bounded wait runs,
+        // so the counters it watches can actually reach zero.  In-flight
+        // engine turns keep running until they settle or are stopped below.
+        // This is the right layer for this composition: the app dispatches
+        // native turns only through the wait queue, which this shutdown
+        // fences, and supervised processes stop through the engine
+        // cancellations the terminal shutdown below performs.
+        await macRuntime.runtime.shutdown()
+        var result = await MacNativeGracefulDrain.drain(
+            deadlineMs: deadlineMs,
+            pollMs: pollMs,
+            readSnapshot: { [weak self] in await self?.readNativeBusySnapshot() ?? MacNativeBusySnapshot() }
+        )
+        // The terminal phase runs detached and only acknowledged: awaiting
+        // it directly would hang quit past the bounded window when a
+        // cancelled engine task never exits.
+        let shutdownAck = MacNativeShutdownAck()
+        let runtime = macRuntime.runtime
+        Task.detached(priority: .utility) {
+            do {
+                try await runtime.shutdownAndDrain()
+                await shutdownAck.acknowledge(success: true)
+            } catch {
+                NSLog("Native runtime shutdown failed: %@", error.localizedDescription)
+                await shutdownAck.acknowledge(success: false)
+            }
+        }
+        let ackedCleanly = await MacNativeGracefulDrain.waitUntil(
+            deadlineMs: shutdownAckTimeoutMs,
+            pollMs: pollMs,
+            condition: { await shutdownAck.isAcknowledged }
+        )
+        let shutdownSucceeded = await shutdownAck.didSucceed
+        result.didShutDownRuntime = ackedCleanly && shutdownSucceeded
+        if !ackedCleanly {
+            NSLog("Native runtime shutdown did not answer before quitting; proceeding with termination.")
+        }
+        await refreshNativeBusyState()
+        nativeDrainSummary = result.summary
+        return result
+    }
+
+    /// Observes the close of the app's main window.
+    ///
+    /// The observer is bound to the main window instance rather than to every
+    /// `NSWindow`, so closing the Settings panel never applies the quit policy.
+    public func registerMainWindow(_ window: NSWindow) {
+        // SwiftUI can recreate the window, so the previous observers are
+        // dropped rather than left pointing at a window that no longer
+        // exists.
+        for observer in mainWindowObservers {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        mainWindowObservers.removeAll()
+        mainWindow = window
+
+        mainWindowObservers.append(
+            NotificationCenter.default.addObserver(
+                forName: NSWindow.willCloseNotification,
+                object: window,
+                queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    await self?.handleWindowClose()
+                    self?.updateMainWindowFocusState()
+                }
+            }
+        )
+
+        // The notification coordinator only suppresses a banner for the
+        // thread on screen while the app is actually in front, so the
+        // window's visibility and the app's focus both have to be tracked.
+        let windowNotifications: [Notification.Name] = [
+            NSWindow.didMiniaturizeNotification,
+            NSWindow.didDeminiaturizeNotification
+        ]
+        for name in windowNotifications {
+            mainWindowObservers.append(
+                NotificationCenter.default.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in
+                    Task { @MainActor in
+                        self?.updateMainWindowFocusState()
+                    }
+                }
+            )
+        }
+        let applicationNotifications: [Notification.Name] = [
+            NSApplication.didBecomeActiveNotification,
+            NSApplication.didResignActiveNotification,
+            NSApplication.didUnhideNotification
+        ]
+        for name in applicationNotifications {
+            mainWindowObservers.append(
+                NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                    Task { @MainActor in
+                        self?.updateMainWindowFocusState()
+                    }
+                }
+            )
+        }
+        updateMainWindowFocusState()
+    }
+
+    /// Keeps the coordinator's on-screen flag in step with the window.
+    ///
+    /// The Electron app suppresses a desktop banner whenever the app has
+    /// focus, because the chat on screen already shows the card.  The Mac
+    /// only suppresses it for the thread actually on screen, so it needs
+    /// both facts:  the window is on screen, and the app is active.
+    private func updateMainWindowFocusState() {
+        #if os(macOS)
+        let window = mainWindow
+        let windowIsVisible = (window?.isVisible ?? false) && !(window?.isMiniaturized ?? false)
+        let applicationIsActive = NSApplication.shared.isActive
+        notificationCoordinator.isMainWindowVisibleAndFocused = MacMainWindowFocus.isVisibleAndFocused(
+            windowIsVisible: windowIsVisible,
+            applicationIsActive: applicationIsActive
+        )
+        #endif
+    }
+
     public func disconnect() {
+        connectionGeneration = UUID()
         streamTask?.cancel()
         streamTask = nil
         client = nil
+        servers.connectedRecordID = nil
         status = .disconnected
+        syncSystemSurfaces(force: true)
     }
 
-    private func runConnectionLoop(client: CompanionClient, endpoint: String) async {
-        while !Task.isCancelled {
+    private func runConnectionLoop(client: CompanionClient, endpoint: String, generation: UUID) async {
+        while !Task.isCancelled && connectionGeneration == generation {
             do {
-                // Fetch initial fleet roster snapshot
-                let fleet = try await client.fleet()
-                self.state.hydrate(fleet)
-                if self.selection == nil, let first = fleet.bots.first {
-                    self.selection = .bot(first.id)
-                }
+                // The roster snapshot and the lifecycle settings are fetched once
+                // per successful connection.  Fetching the settings on the
+                // connect path as well would double the request count on every
+                // reconnect, which is exactly when the harness is least able to
+                // serve it.
+                try await MacHarnessConnectionCycle.connect(
+                    fetchFleet: { try await client.fleet() },
+                    hydrate: { [weak self] fleet in
+                        guard let self, self.connectionGeneration == generation, !Task.isCancelled else { return }
+                        self.state.hydrate(fleet)
+                        if self.selection == nil, let first = fleet.bots.first {
+                            self.selection = .bot(first.id)
+                        }
+                    },
+                    refreshLifecycleSettings: { [weak self] in
+                        guard let self, self.connectionGeneration == generation, !Task.isCancelled else { return }
+                        await self.refreshLifecycleSettings()
+                    }
+                )
+                guard connectionGeneration == generation, !Task.isCancelled else { return }
                 self.status = .connected(endpoint: endpoint)
                 self.reconnectAttempt = 0
+                self.syncSystemSurfaces(force: true)
 
-                // Open SSE stream
                 let stream = try client.events(since: state.cursor, screens: true)
                 for try await frame in stream {
-                    if Task.isCancelled { break }
+                    if Task.isCancelled || connectionGeneration != generation { break }
                     self.state.apply(frame)
+                    if case let .notify(notification) = frame.frame {
+                        self.handleNotificationFrame(notification)
+                    }
+                    if let threadKey = self.activeThreadId,
+                       let streaming = self.state.streaming[threadKey] {
+                        self.transcriptEngine.updateStreamingText(streaming, messageId: "streaming:\(threadKey)")
+                    }
+                    self.syncSystemSurfaces()
                 }
             } catch {
-                if Task.isCancelled { break }
+                if Task.isCancelled || connectionGeneration != generation { break }
                 reconnectAttempt += 1
                 let baseBackoff = min(Double(reconnectAttempt) * 1.5, 10.0)
                 let jitter = Double.random(in: -0.2...0.2) * baseBackoff
                 let backoff = max(1.0, baseBackoff + jitter)
-                status = .failed("Connection lost. Retrying in \(Int(backoff))s…")
+                status = .failed("Connection lost.\u{00A0} Retrying in \(Int(backoff))s…")
+                syncSystemSurfaces(force: true)
                 try? await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
             }
         }
@@ -253,7 +989,107 @@ public final class MacSession: ObservableObject {
         }
     }
 
-    // MARK: - CUA Stream Controls
+    // MARK: - Lifecycle Controls (BF-2497)
+
+    private func makeLifecycleClient() -> MacLifecycleClient {
+        MacLifecycleClient(host: host, port: port, policyStore: policyStore)
+    }
+
+    public func refreshLifecycleSettings() async {
+        let generation = connectionGeneration
+        let lifecycleClient = makeLifecycleClient()
+        guard let fetched = try? await lifecycleClient.fetchLifecycleSettings() else { return }
+        guard connectionGeneration == generation, !Task.isCancelled else { return }
+        // A grant the harness did not report stays unknown, so the next save
+        // never writes back a `false` the app never read.
+        var merged = fetched
+        if merged.allowRemoteDesktopLaunch == nil {
+            merged.allowRemoteDesktopLaunch = lifecycleSettings.allowRemoteDesktopLaunch
+        }
+        lifecycleSettings = merged
+    }
+
+    public func saveLifecycleSettings(_ settings: MacLifecycleSettings) async {
+        let previous = lifecycleSettings
+        let result = await makeLifecycleClient().saveLifecycleSettings(settings, restoring: previous)
+        switch result {
+        case .saved(let saved):
+            lifecycleSettings = saved
+            lifecycleErrorMessage = nil
+        case .failed(let restored, let message):
+            // The write was rejected, so the toggles go back to the last value
+            // the harness actually accepted.
+            lifecycleSettings = restored
+            lifecycleErrorMessage = message
+            NSLog("Failed to save lifecycle settings: %@", message)
+        }
+    }
+
+    public func shutDownServerAndLocalVM() async {
+        guard !isShuttingDownServer else { return }
+        isShuttingDownServer = true
+        defer { isShuttingDownServer = false }
+
+        triggerCuaEmergencyStop()
+        let lifecycleClient = makeLifecycleClient()
+        switch await lifecycleClient.performDeliberateShutdown() {
+        case .stopped:
+            didDeliberatelyStopServer = true
+            disconnect()
+            status = .disconnected
+        case .failed(let message):
+            // A failed shutdown must not leave the deliberate-stop marker behind:
+            // the harness is still running, and the marker would make the launchd
+            // wrapper treat it as deliberately stopped forever.
+            NSLog("Server shutdown failed: %@", message)
+            status = .failed("Shutdown error: \(message)")
+        }
+    }
+
+    /// Applies the exit policy when the desktop window closes.
+    ///
+    /// The Settings toggle reads "Keep Server Running When Window Closes", and
+    /// closing the SwiftUI window does not terminate the app, so the policy has
+    /// to be evaluated here as well as on termination.
+    public func handleWindowClose() async {
+        await applyExitPolicy(for: .mainWindowClosed)
+    }
+
+    /// Applies the exit policy when the app terminates.
+    ///
+    /// The native engine graph drains first, inside its bounded window, so
+    /// in-flight turns settle or are stopped and flushed before the listener
+    /// socket closes and the harness shuts down.
+    public func handleAppTermination() async {
+        triggerCuaEmergencyStop()
+        await drainNativeEnginesForTermination()
+        await applyExitPolicy(for: .appTerminating)
+    }
+
+    private func applyExitPolicy(for event: CompanionListenerExitEvent) async {
+        let persist = policyStore.readPersistOnExit() ?? lifecycleSettings.persistOnExit
+        // The native listener reads the setting the same way the harness
+        // shutdown does: it stays up through a window close that keeps the
+        // server running, and stops when the server is shut down or the app
+        // quits.
+        await companionListener.applyExitPolicy(event, persistOnExit: persist)
+        guard MacLifecycleClient.evaluateQuitAction(persistOnExit: persist) == .shutDownServerAndVM else {
+            return
+        }
+        guard !didDeliberatelyStopServer else { return }
+        await shutDownServerAndLocalVM()
+    }
+
+    // MARK: - CUA Stream & Emergency Safety Stop Controls (BF-2499)
+
+    public func triggerCuaEmergencyStop() {
+        _ = MacCuaDriver.shared.emergencyStop()
+        permissionMonitor.stopMonitoring()
+        if isCuaStreaming {
+            stopCuaStreaming(updateStatusMessage: false)
+        }
+        setCuaStatus(.emergencyStopActivated)
+    }
 
     public func toggleCuaStreaming() {
         if isCuaStreaming {
@@ -264,40 +1100,138 @@ public final class MacSession: ObservableObject {
     }
 
     public func startCuaStreaming() {
-        Task {
+        let monitor = permissionMonitor
+        Task { [weak self] in
+            guard let self else { return }
             do {
-                cuaStatusMessage = "Starting live capture…"
-                try await ScreenStreamActor.shared.startStreaming { [weak self] buffer in
+                MacCuaDriver.shared.resetEmergencyStop()
+                self.cuaStatusState.reset()
+                self.cuaRevocationBanner = nil
+                self.setCuaStatus(.starting)
+
+                monitor.startMonitoring { [weak self] permissionState in
                     Task { @MainActor [weak self] in
-                        self?.cuaPixelBuffer = buffer
+                        guard let self else { return }
+                        self.isCuaStreaming = false
+                        self.cuaPixelBuffer = nil
+                        self.cuaRevocationBanner = permissionState.bannerMessage
+                        self.setCuaStatus(.screenRecordingPermissionNeeded)
                     }
                 }
-                isCuaStreaming = true
-                cuaStatusMessage = "Live desktop shared"
+
+                try await ScreenStreamActor.shared.startStreaming(
+                    onStreamStoppedWithError: { [weak self] error in
+                        let permissionState = monitor.notifyStreamStoppedWithError(error)
+                        Task { @MainActor [weak self] in
+                            guard let self else { return }
+                            self.isCuaStreaming = false
+                            self.cuaPixelBuffer = nil
+                            switch permissionState {
+                            case .authorized:
+                                // A benign capture failure is not a lost
+                                // permission, so no revocation banner is shown.
+                                self.cuaRevocationBanner = nil
+                                self.setCuaStatus(.streamStopped)
+                            case .missingPermissions, .revoked:
+                                self.cuaRevocationBanner = permissionState.bannerMessage
+                                self.setCuaStatus(.screenRecordingPermissionNeeded)
+                            }
+                        }
+                    },
+                    onFrame: { [weak self] buffer in
+                        Task { @MainActor [weak self] in
+                            self?.cuaPixelBuffer = buffer
+                        }
+                    }
+                )
+                self.isCuaStreaming = true
+                self.setCuaStatus(.liveDesktopShared)
             } catch {
-                // The raw error is a developer string (framework domain codes,
-                // TCC denial text), so it goes to the log and the status bar
-                // gets product copy.
                 NSLog("CUA stream error: %@", error.localizedDescription)
+                monitor.stopMonitoring()
                 let hasScreenRecording = MacCuaDriver.shared.checkPermissions().hasScreenRecording
                 if let streamError = error as? ScreenStreamError {
-                    cuaStatusMessage = streamError.statusMessage(hasScreenRecording: hasScreenRecording)
+                    switch streamError {
+                    case .notAuthorized:
+                        self.setCuaStatus(.screenRecordingPermissionNeeded)
+                    case .noDisplayFound:
+                        self.setCuaStatus(.noDisplayAvailable)
+                    case .streamInitializationFailed, .captureFailed:
+                        self.setCuaStatus(
+                            hasScreenRecording ? .liveCaptureUnavailable : .screenRecordingPermissionNeeded
+                        )
+                    }
                 } else {
-                    cuaStatusMessage = hasScreenRecording
-                        ? "Live capture could not start"
-                        : "Screen recording permission needed"
+                    self.setCuaStatus(
+                        hasScreenRecording ? .liveCaptureUnavailable : .screenRecordingPermissionNeeded
+                    )
                 }
-                isCuaStreaming = false
+                if !hasScreenRecording {
+                    self.cuaRevocationBanner = CuaPermissionState.missingPermissions(
+                        missingScreenRecording: true,
+                        missingAccessibility: !MacCuaDriver.shared.checkPermissions().hasAccessibility
+                    ).bannerMessage
+                }
+                self.isCuaStreaming = false
             }
         }
     }
 
-    public func stopCuaStreaming() {
+    public func stopCuaStreaming(updateStatusMessage: Bool = true) {
+        permissionMonitor.stopMonitoring()
         Task {
             await ScreenStreamActor.shared.stopStreaming()
             isCuaStreaming = false
             cuaPixelBuffer = nil
-            cuaStatusMessage = "Stream stopped"
+            if updateStatusMessage {
+                setCuaStatus(.streamStopped)
+            }
         }
+    }
+
+    /// Records a CUA inspector status update.
+    ///
+    /// The emergency-stop confirmation is sticky, so the asynchronous
+    /// "stream stopped" update that lands right after an emergency stop cannot
+    /// replace the safety message the operator just triggered.
+    func contextCommands(botId: String, threadId: String) async -> [ContextMeterMath.Command]? {
+        guard let client else { return nil }
+        return try? await client.contextCommands(botId: botId, threadId: threadId, surface: "desktop")
+    }
+
+    func catalogWindow(instanceId: String, model: String) -> Int? {
+        modelWindows["\(instanceId)\u{1e}\(model)"]
+    }
+
+    func refreshModelWindows() async {
+        guard let client else { return }
+        guard let list = try? await client.instanceList() else { return }
+        var next: [String: Int] = [:]
+        for instance in list.instances {
+            for option in instance.models.options {
+                if let window = option.contextWindow, window > 0 {
+                    next["\(instance.instanceId)\u{1e}\(option.id)"] = window
+                }
+            }
+        }
+        modelWindows = next
+    }
+
+    /// Nil means compact started.  A string is the reason it did not.
+    func compactSession(botId: String, commandId: String, threadId: String) async -> String? {
+        guard let client else { return ContextMeterMath.unavailable }
+        do {
+            try await client.runContextCommand(botId: botId, id: commandId, threadId: threadId, surface: "desktop")
+            return nil
+        } catch {
+            let message = (error as? LocalizedError)?.errorDescription?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let message, !message.isEmpty { return message }
+            return ContextMeterMath.unavailable
+        }
+    }
+
+    private func setCuaStatus(_ status: MacCuaStatus) {
+        cuaStatusState.record(status)
+        cuaStatusMessage = cuaStatusState.current?.message
     }
 }

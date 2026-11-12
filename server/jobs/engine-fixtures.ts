@@ -70,4 +70,18 @@ export const JOB_ENGINE_FIXTURES: readonly JobEngineFixture[] = [
     lane: "none",
     because: "generic CLI wrapper: unmounted tool loop, no MCP server",
   },
+  {
+    displayName: "ZCode",
+    driverKind: "zcodeAgent",
+    capabilities: { backgroundJobs: "none" },
+    lane: "none",
+    because: "spawns the ZCode CLI headless: one prompt per turn, no MCP server mounted",
+  },
+  {
+    displayName: "ZCode ACP",
+    driverKind: "zcodeAcp",
+    capabilities: { agentsMcp: true, backgroundJobs: "emulated" },
+    lane: "mcp",
+    because: "agents MCP server, forwarded through the zcode-acp-server bridge",
+  },
 ];

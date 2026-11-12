@@ -157,6 +157,9 @@ describe("newest member and hiding", () => {
       "Latest Luna",
     ]);
     expect(latestOptions("minimax", [{ id: "MiniMax-M3" }])).toEqual([]);
+    expect(latestOptions("cursorAgent", [{ id: "composer-2.5" }])).toEqual([
+      { classKey: "composer", label: "Latest Composer", resolvedId: "composer-2.5" },
+    ]);
   });
 });
 

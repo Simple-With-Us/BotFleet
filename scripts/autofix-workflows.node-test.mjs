@@ -146,6 +146,9 @@ test("Claude Autofix keeps the Sentry-capable pin and same-repository bot gate",
     "claude-code-autofix-reusable.yml pin must stay on the model-switch revision",
   );
   assert.match(claude, /^\s+allowed_bots: .*swu-echo/m);
+  // BF-2487: the prompt must name the review bots the allowlist admits, so a
+  // Sentry review is treated as an expected trigger, not an unfamiliar actor.
+  assert.match(claude, /A review bot \(Codex, Kody, Cursor, Claude, or Sentry\)/);
   const guard = claude.match(/^ {4}if: >-\n([\s\S]*?)^ {4}uses:/m)?.[1];
   assert.ok(guard, "Claude Autofix has a job-level guard");
   assert.equal(

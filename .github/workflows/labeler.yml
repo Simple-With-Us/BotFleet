@@ -1,0 +1,22 @@
+name: Label UI pull requests
+
+# `pull_request_target` gives the workflow the base repository's token, so it
+# runs with write access to labels.  It deliberately does NOT check out the
+# pull request: no PR code is fetched, built, or executed here.
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  label-ui:
+    name: Label ui
+    runs-on: ubuntu-latest
+    steps:
+      - name: Add the ui label for UI changes
+        uses: actions/labeler@bf12e9b00b37c5c0ca2b87b79b2daf7891dbda13 # v7.0.0
+        with:
+          configuration-path: .github/labeler.yml

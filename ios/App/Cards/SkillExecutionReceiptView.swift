@@ -1,4 +1,5 @@
 import SwiftUI
+import CompanionCore
 
 /// One tool call: what it was, how it went, and — when you open it — what it
 /// was given and what it said back.
@@ -16,7 +17,7 @@ import SwiftUI
 /// from the system palette.
 public struct SkillExecutionReceiptView: View {
     public let skillName: String
-    public let status: String // "running", "success", "error"
+    public let status: String
     public let durationMs: Int
     public let parameters: String
     public let output: String
@@ -38,46 +39,36 @@ public struct SkillExecutionReceiptView: View {
         self.output = output
     }
 
-    /// The three states a tool call can be in, as one shape.  Derived from
-    /// the same `status` string the transcript carries, so a card cannot say
-    /// "Running" in its badge and draw itself as a failure.
-    private enum State {
-        case running, success, failure
+    /// Parsed in CompanionCore.  Done and Failed are only those outcomes.
+    /// Cancelled or stopped reads as Stopped.  Anything else stays Running.
+    private var state: SkillReceiptStatus { SkillReceiptStatus(status) }
 
-        init(_ raw: String) {
-            switch raw {
-            case "running": self = .running
-            case "error": self = .failure
-            default: self = .success
-            }
-        }
-
-        var label: String {
-            switch self {
-            case .running: return "Running"
-            case .success: return "Done"
-            case .failure: return "Failed"
-            }
-        }
-
-        var tint: Color {
-            switch self {
-            case .running: return .accentColor
-            case .success: return .green
-            case .failure: return .red
-            }
-        }
-
-        var systemImage: String {
-            switch self {
-            case .running: return "circle.dotted"
-            case .success: return "checkmark.circle.fill"
-            case .failure: return "exclamationmark.triangle.fill"
-            }
+    private var stateTint: Color {
+        switch state {
+        case .running:
+            return .accentColor
+        case .success:
+            return .green
+        case .failure:
+            return .red
+        case .stopped:
+            return Color.secondary
         }
     }
 
-    private var state: State { State(status) }
+    private var stateSymbol: String {
+        switch state {
+        case .running:
+            return "circle.dotted"
+        case .success:
+            return "checkmark.circle.fill"
+        case .failure:
+            return "exclamationmark.triangle.fill"
+        case .stopped:
+            return "stop.circle"
+        }
+    }
+
     private var hasDetails: Bool { !parameters.isEmpty || !output.isEmpty }
 
     /// One sentence for the whole row.  Without it VoiceOver read the tool
@@ -169,14 +160,17 @@ public struct SkillExecutionReceiptView: View {
         )
     }
 
-    /// Only a failure earns a coloured edge.  A run that succeeded or is still
-    /// running gets a neutral one, so a transcript full of completed tool
-    /// calls does not read as a wall of alerts.
+    /// Only a failure earns a coloured edge.  Success and Stopped stay
+    /// neutral, so a transcript full of finished tool calls does not read
+    /// as a wall of alerts.
     private var borderTint: Color {
         switch state {
-        case .failure: return .red.opacity(0.4)
-        case .running: return .accentColor.opacity(0.35)
-        case .success: return Color.secondary.opacity(0.18)
+        case .failure:
+            return .red.opacity(0.4)
+        case .running:
+            return .accentColor.opacity(0.35)
+        case .success, .stopped:
+            return Color.secondary.opacity(0.18)
         }
     }
 
@@ -252,19 +246,19 @@ private var statusBadge: some View {
             if state == .running {
                 ProgressView()
                     .controlSize(.mini)
-                    .tint(state.tint)
+                    .tint(stateTint)
             } else {
-                Image(systemName: state.systemImage)
+                Image(systemName: stateSymbol)
                     .font(.scaled(11, weight: .bold, relativeTo: .caption))
-                    .foregroundStyle(state.tint)
+                    .foregroundStyle(stateTint)
             }
             Text(state.label)
                 .font(.scaled(12, weight: .semibold, relativeTo: .caption))
-                .foregroundStyle(state.tint)
+                .foregroundStyle(stateTint)
         }
         .padding(.horizontal, 8)
         .frame(height: 22)
-        .background(Capsule().fill(state.tint.opacity(0.14)))
+        .background(Capsule().fill(stateTint.opacity(0.14)))
         .accessibilityHidden(true)
     }
 }

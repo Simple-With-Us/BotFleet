@@ -44,10 +44,21 @@ export class ZulipCredentialError extends Error {
   /** "missing": no file yet, so the bot is simply not set up.  Anything else
    *  is a file that exists and is wrong. */
   readonly reason: "missing" | "invalid" | "insecure" | "realm";
-  constructor(message: string, reason: "missing" | "invalid" | "insecure" | "realm") {
+  /** Set when the Infisical folder itself is unreadable: the read was refused
+   *  (401/403/404, carried in `status`) or the folder holds none of the
+   *  role's expected names (`status` unset).  The hub logs one consolidated
+   *  warn line per folder from this; the message still carries the precise
+   *  per-role reason.  Path and status only, never a value. */
+  readonly vaultUnreadable?: { where: string; status?: number };
+  constructor(
+    message: string,
+    reason: "missing" | "invalid" | "insecure" | "realm",
+    vaultUnreadable?: { where: string; status?: number },
+  ) {
     super(message);
     this.name = "ZulipCredentialError";
     this.reason = reason;
+    if (vaultUnreadable) this.vaultUnreadable = vaultUnreadable;
   }
 }
 
@@ -70,7 +81,12 @@ export interface ZulipCredentialSource {
 
 /** One Infisical folder the Infisical source reads. */
 export interface ZulipVaultLocation {
-  secretPath: string;
+  /** The folder to read.  Unset only for a sourced location with no
+   * per-field `path`: the named read source's own `secretPath` then
+   * decides, not the global Zulip `infisicalPath`. */
+  secretPath?: string;
+  /** Name of an `infisical.readSources` entry to read through, when set. */
+  source?: string;
   /** Another Infisical project's id.  Unset: the harness's own project. */
   projectId?: string;
   /** Another environment's slug.  Unset: the harness's own environment. */
@@ -93,7 +109,11 @@ export type ZulipVaultReader = (location: ZulipVaultLocation) => Promise<Readonl
  *  `<project> <env> /zulip`.  When only one of the two is set, the other
  *  reads `own-project` or `own-env`, since `readPath` falls back to the
  *  harness's own for whichever is unset. */
-export function describeVaultLocation(location: Pick<ZulipVaultLocation, "secretPath" | "projectId" | "environment">): string {
+export function describeVaultLocation(location: Pick<ZulipVaultLocation, "secretPath" | "projectId" | "environment" | "source">): string {
+  if (location.source?.trim()) {
+    const path = location.secretPath?.trim();
+    return path ? `source ${location.source.trim()} ${path}` : `source ${location.source.trim()}`;
+  }
   const projectId = location.projectId?.trim() || undefined;
   const environment = location.environment?.trim() || undefined;
   const parts = [
@@ -102,6 +122,40 @@ export function describeVaultLocation(location: Pick<ZulipVaultLocation, "secret
     location.secretPath,
   ];
   return parts.filter((part) => part?.trim()).join(" ");
+}
+
+export interface ZulipCredentialFieldSource {
+  /** Name of an `infisical.readSources` entry.  That entry's token is
+   * scoped to its own project and environment, so there is no per-field
+   * project/environment override: it could not be honoured. */
+  source: string;
+  keyPattern?: string;
+  path?: string;
+}
+
+export function roleCode(role: string): string {
+  return role.trim().toUpperCase().replace(/[^A-Z0-9]/g, "_");
+}
+
+export function zulipKeyFromPattern(pattern: string, role: string, field?: string): string {
+  return pattern.replaceAll("{ROLE}", roleCode(role)).replaceAll("{FIELD}", field ?? "");
+}
+
+function namesForPattern(pattern: string | undefined, roles: readonly string[], fields: readonly string[] | null): string[] {
+  const names = new Set<string>();
+  for (const role of roles) {
+    if (!validZulipRole(role.trim())) continue;
+    if (!pattern) {
+      const n = zulipVaultNames(role);
+      if (fields) for (const f of fields) names.add(f === "EMAIL" ? n.email : f === "API_KEY" ? n.key : f === "SITE" ? n.site : n.outgoingToken);
+      else names.add(n.outgoingToken);
+    } else if (fields) {
+      for (const f of fields) names.add(f === "OUTGOING_TOKEN" ? zulipVaultNames(role).outgoingToken : zulipKeyFromPattern(pattern, role, f));
+    } else {
+      names.add(zulipKeyFromPattern(pattern, role));
+    }
+  }
+  return [...names].sort();
 }
 
 function expandHome(path: string): string {
@@ -233,7 +287,7 @@ export function fileCredentialSource(dir: string): ZulipCredentialSource {
 
 /** The vault names for one role: `BF-Plumber` -> `ZULIP_BF_PLUMBER_*`. */
 export function zulipVaultNames(role: string): { email: string; key: string; site: string; outgoingToken: string } {
-  const code = role.trim().toUpperCase().replace(/[^A-Z0-9]/g, "_");
+  const code = roleCode(role);
   const stem = `ZULIP_${code}`;
   return {
     email: `${stem}_EMAIL`,
@@ -269,39 +323,90 @@ export function zulipVaultNamesFor(roles: readonly string[]): string[] {
  *  `verifyCredentialRealm` still checks it. */
 export function infisicalCredentialSource(
   read: ZulipVaultReader,
-  opts: { path?: string; projectId?: string; environment?: string; roles?: readonly string[]; realm: string },
+  opts: { path?: string; projectId?: string; environment?: string; roles?: readonly string[]; realm: string; credentialSources?: { login?: ZulipCredentialFieldSource; outgoing?: ZulipCredentialFieldSource } },
 ): ZulipCredentialSource {
   const secretPath = opts.path?.trim() || ZULIP_DEFAULT_INFISICAL_PATH;
   const projectId = opts.projectId?.trim() || undefined;
   const environment = opts.environment?.trim() || undefined;
-  const where = describeVaultLocation({ secretPath, projectId, environment });
+  const loginSpec = opts.credentialSources?.login;
+  const outgoingSpec = opts.credentialSources?.outgoing;
+  const sourcedLoc = (spec: ZulipCredentialFieldSource): ZulipVaultLocation => {
+    const loc: ZulipVaultLocation = { source: spec.source };
+    const path = spec.path?.trim();
+    if (path) loc.secretPath = path;
+    return loc;
+  };
+  const loginLoc: ZulipVaultLocation = loginSpec ? sourcedLoc(loginSpec) : { secretPath, projectId, environment };
+  const outgoingLoc: ZulipVaultLocation | null = outgoingSpec ? sourcedLoc(outgoingSpec) : null;
+  const where = describeVaultLocation(loginLoc);
   const bound = opts.roles?.map((role) => role.trim());
+  const split = Boolean(loginSpec || outgoingSpec);
   return {
-    describe: (role) => (validZulipRole(role) ? `infisical ${where} ${zulipVaultNames(role).key.replace(/_API_KEY$/, "_*")}` : "invalid role"),
+    describe: (role) => {
+      if (!validZulipRole(role)) return "invalid role";
+      if (loginSpec?.keyPattern) return `infisical ${where} ${zulipKeyFromPattern(loginSpec.keyPattern, role, "API_KEY")}`;
+      return `infisical ${where} ${zulipVaultNames(role).key.replace(/_API_KEY$/, "_*")}`;
+    },
     load: async (role) => {
       if (!validZulipRole(role)) throw new ZulipCredentialError(`"${role}" is not a valid Zulip role name`, "invalid");
-      const names = zulipVaultNames(role);
-      // A role loaded outside the bound set still gets its own names.
-      const keep = bound ? zulipVaultNamesFor(bound.includes(role) ? bound : [...bound, role]) : undefined;
+      const defaults = zulipVaultNames(role);
+      const names = loginSpec?.keyPattern
+        ? { email: zulipKeyFromPattern(loginSpec.keyPattern, role, "EMAIL"), key: zulipKeyFromPattern(loginSpec.keyPattern, role, "API_KEY"), site: zulipKeyFromPattern(loginSpec.keyPattern, role, "SITE"), outgoingToken: defaults.outgoingToken }
+        : defaults;
+      const rolesForKeep = bound ? (bound.includes(role) ? bound : [...bound, role]) : undefined;
+      const keep = rolesForKeep
+        ? (split ? namesForPattern(loginSpec?.keyPattern, rolesForKeep, outgoingLoc ? ["EMAIL", "API_KEY", "SITE"] : ["EMAIL", "API_KEY", "SITE", "OUTGOING_TOKEN"]) : zulipVaultNamesFor(rolesForKeep))
+        : undefined;
       let values: ReadonlyMap<string, string>;
       try {
-        values = await read({ secretPath, projectId, environment, names: keep });
+        values = await read({ ...loginLoc, names: keep });
       } catch (e) {
-        // The manager's errors are value-free; keep only its message.
         const why = e instanceof Error ? e.message : "unknown error";
-        throw new ZulipCredentialError(`cannot read Infisical ${where}: ${why}`, "invalid");
+        // The statuses that mean the folder itself refused the read: a
+        // revoked token (401), a grant that does not cover the folder (403),
+        // or a project, environment or path that is gone (404).  Read
+        // structurally off the injected reader's error, never parsed out of
+        // the message; only the manager's own errors carry a status.  A 429,
+        // a 5xx or a dropped connection is transient and says nothing about
+        // the folder, so it marks nothing.
+        // SAFETY: the reader is injected and its errors are untyped; `statusCode`
+        // is read as `unknown` and only ever used once confirmed to be one of
+        // the three refusal statuses below.
+        const status = (e as { statusCode?: unknown } | null)?.statusCode;
+        const refused = status === 401 || status === 403 || status === 404 ? { where, status } : undefined;
+        throw new ZulipCredentialError(`cannot read Infisical ${where}: ${why}`, "invalid", refused);
       }
       const email = values.get(names.email)?.trim();
       const key = values.get(names.key)?.trim();
       const missing = [!email && names.email, !key && names.key].filter(Boolean);
-      if (missing.length) throw new ZulipCredentialError(`Infisical ${where} has no ${missing.join(" or ")}`, "missing");
+      if (missing.length) {
+        throw new ZulipCredentialError(
+          `Infisical ${where} has no ${missing.join(" or ")}`,
+          "missing",
+          // Only when NONE of the role's expected names is there: one name
+          // present and one missing is a partial setup, and the message
+          // above already names exactly which half is missing.
+          !email && !key ? { where } : undefined,
+        );
+      }
       const source = `infisical ${where}`;
       const site = normalizeSite(values.get(names.site)?.trim() || opts.realm);
-      const outgoingWebhookToken = z.string().regex(/^[\x21-\x7e]+$/).optional()
-        .safeParse(values.get(names.outgoingToken)?.trim() || undefined);
-      // A present-but-malformed webhook token must not take down the bot's own
-      // credentials: drop just the token (the webhook route answers 503
-      // without it) and keep the email/key/site load working.
+      let outgoingRaw: string | undefined;
+      if (outgoingLoc) {
+        const outName = outgoingSpec?.keyPattern ? zulipKeyFromPattern(outgoingSpec.keyPattern, role) : defaults.outgoingToken;
+        names.outgoingToken = outName;
+        try {
+          const outKeep = rolesForKeep ? namesForPattern(outgoingSpec?.keyPattern, rolesForKeep, null) : undefined;
+          const outValues = await read({ ...outgoingLoc, names: outKeep });
+          outgoingRaw = outValues.get(outName)?.trim() || undefined;
+        } catch {
+          console.warn(`[zulip] outgoing token source "${outgoingSpec?.source}" unavailable for ${role}; continuing without it`);
+          outgoingRaw = undefined;
+        }
+      } else {
+        outgoingRaw = values.get(names.outgoingToken)?.trim() || undefined;
+      }
+      const outgoingWebhookToken = z.string().regex(/^[\x21-\x7e]+$/).optional().safeParse(outgoingRaw);
       const webhookToken = outgoingWebhookToken.success ? outgoingWebhookToken.data : undefined;
       return {
         ...checkCredentialFields({ email: email!, key: key!, site }, source),
@@ -329,9 +434,10 @@ export function cachedVaultReader(
   return (location) => {
     const names = location.names ? [...new Set(location.names)].sort() : null;
     const cacheKey = JSON.stringify([
+      location.source?.trim() ?? "",
       location.projectId?.trim() ?? "",
       location.environment?.trim() ?? "",
-      location.secretPath,
+      location.secretPath?.trim() ?? "",
       names,
     ]);
     const hit = cache.get(cacheKey);
@@ -371,6 +477,7 @@ export function credentialSourceFor(
         infisicalPath?: string;
         infisicalProjectId?: string;
         infisicalEnv?: string;
+        credentialSources?: { login?: ZulipCredentialFieldSource; outgoing?: ZulipCredentialFieldSource };
         bots?: Record<string, { role: string }>;
         realm?: string;
       }
@@ -379,7 +486,7 @@ export function credentialSourceFor(
   deps: { vault?: ZulipVaultReader; realm?: string } = {},
 ): ZulipCredentialSource | null {
   const envDir = env.OMB_ZULIP_CREDENTIAL_DIR?.trim();
-  if (!envDir && settings?.credentialSource === "infisical") {
+  if (!envDir && (settings?.credentialSource === "infisical" || settings?.credentialSources)) {
     if (!deps.vault) return null;
     return infisicalCredentialSource(deps.vault, {
       path: settings.infisicalPath,
@@ -387,6 +494,7 @@ export function credentialSourceFor(
       environment: settings.infisicalEnv,
       roles: Object.values(settings.bots ?? {}).map((bot) => bot.role),
       realm: deps.realm ?? settings.realm ?? ZULIP_DEFAULT_REALM,
+      credentialSources: settings.credentialSources,
     });
   }
   const dir = envDir || settings?.credentialDir?.trim();

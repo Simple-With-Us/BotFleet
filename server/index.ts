@@ -18,13 +18,14 @@ import { isIP } from "node:net";
 import { extname, join } from "node:path";
 
 import { z } from "zod";
-import { instanceModelsSchema } from "./instance-models.ts";
+import { InstancePatchBodySchema, InstancePatchRestoreBodySchema, instancePatchInputError } from "./instance-patch.ts";
 import { ScreenPollers } from "./screen-poller.ts";
 import { ReplayBuffer, SLOW_CLIENT_BYTE_LIMIT, wants, writeToClient, type SseClient } from "./sse-broadcast.ts";
-import { BOT_AVATAR_CROPS, botAvatarUrlFromStoredPath, botAvatarUrlSchema } from "../shared/bot-avatar.ts";
+import { BOT_AVATAR_CROPS, botAvatarRecolorableSchema, botAvatarUrlFromStoredPath, botAvatarUrlSchema } from "../shared/bot-avatar.ts";
 import { DEFAULT_ROOM_TERMINOLOGY, lowerRoomLabels, resolveRoomLabels } from "../shared/terminology.ts";
 import { isThreadSnoozed, SNOOZE_UNTIL_ACTIVITY } from "../shared/thread-snooze.ts";
 import { fallbackCountAllowed, MAX_MODEL_FALLBACKS } from "../shared/model-limits.ts";
+import { MergeThreadsBodySchema } from "../shared/merge-threads.ts";
 import {
   applyFallbackSlots,
   KEEP_FALLBACK_SLOT,
@@ -110,19 +111,40 @@ import { authorizedRuntime } from "../electron/runtime-identity.mjs";
 import { planCredentialRestore } from "../electron/credential-restore.mjs";
 import { workspaceCredentialPending } from "../electron/workspace-credentials.mjs";
 import { runtimeBuildIdentity, runtimeReadiness, sweepMapIfPresent } from "./runtime-identity.ts";
+import { loadHostId } from "./host-id.ts";
+import { createHostResourcesResponder } from "./host-resources.ts";
+import { placementIdentityResponse } from "./placement-identity.ts";
+import { createWorkerRequestBoundary, privateWorkerAuthorizationSource } from "./placement-worker-auth.ts";
+import { classifyWorkerRequest } from "../shared/placement-worker-http.mjs";
+import { openRollbackPlacementAuthority, PLACEMENT_ROLLBACK_REFUSAL } from "./placement-readonly.ts";
+import { PlacementLeaseService, placementLeaseRoute, PLACEMENT_LEASE_ACTIONS, type PlacementLeaseAction } from "./placement-leases.ts";
+import { PlacementModeStore, placementModeRead, placementModeWrite } from "./placement-mode-store.ts";
+import {
+  PlacementControllerBridge,
+  DEFAULT_PLACEMENT_HEARTBEAT_SECONDS,
+  DEFAULT_PLACEMENT_UNREACHABLE_AFTER_SECONDS,
+} from "./placement-controller-bridge.ts";
+import { createHostProbe } from "./jobs/admission.ts";
+import { storageDeviceGuard, STORAGE_OFFLINE_EXIT_CODE } from "./storage-device.ts";
 import {
   appendHeldWork,
   drainViewOf,
   inFlightCounts,
+  carriedWorkIds,
+  journalItemStillOwed,
   partitionByAge,
+  readQueueJournal,
+  seedQueuedFirstSeen,
   takeHeldWork,
   UpdateDrain,
+  writeQueueJournal,
   type UpdateDrainView,
   type HeldQueueEntry,
   type HeldRoomRound,
   type HeldSend,
   type HeldWork,
   type DrainWindowInput,
+  routineRunCounts,
 } from "./update-drain.ts";
 import {
   arrivedViaCloudflareTunnel,
@@ -162,6 +184,7 @@ import {
 } from "./turn-worktree-admission.ts";
 import { RoomTurnDeadline, RoomTurnStallRegistry, roomTurnTimeoutMessage } from "./room-turn-timeout.ts";
 import { buildSystemPrompt, ownerNotesPrompt } from "./system-prompt.ts";
+import { arrangeUnattendedWakePrompt, logReportedCachedTokens, unattendedCurrentWakeIsStandingText } from "./wake-prompt.ts";
 import { telemetry, turnUsageDetail } from "./telemetry.ts";
 import { usageQuotaPoller } from "./usage-quota.ts";
 import { getDeepSeekBalance } from "./deepseek-balance.ts";
@@ -186,6 +209,8 @@ import {
   parseQuotaResetTime,
   providerErrorCodeFromStopReason,
   quotaCooldowns,
+  transientCapacityRetryDelayMs,
+  transientRouteHealth,
   quotaOrCapFromErrorCode,
   selectTurnFallback,
   selectionForFallbackPick,
@@ -195,6 +220,7 @@ import {
   sliceIsShortProviderError,
   turnModelRejectionEvidence,
   turnQuotaOrCapEvidence,
+  turnTransientCapacityEvidence,
   BOOT_RECOVERY_NOTICE,
   turnProducedAssistantOutput,
   unattendedModelDowngrade,
@@ -215,6 +241,8 @@ import {
 import { chiefOfStaffSystemPrompt } from "./chief-of-staff.ts";
 import { requestHarnessShutdown } from "./harness-lifecycle.ts";
 import { ControlConflict, createSystemControl, reserveSystemShutdown } from "./system-control.ts";
+import { describeGracefulStop, gracefulStop, gracefulStopRefusal as gracefulStopRefusalMessage, withoutOwnControlLock } from "./graceful-shutdown.ts";
+import type { GracefulStopReport } from "./graceful-shutdown.ts";
 import { botFleetStatusSystemPrompt } from "./botfleet-status-capsule.ts";
 import {
   BOX_GATEWAY_PATH,
@@ -276,12 +304,15 @@ import {
   ensureDirs,
   instanceConfigs,
   loadConfig,
+  type AppConfig,
   localVmMaxInstances,
   allowedBotComputers,
   infisicalSettings,
+  validateInfisicalConfigPatch,
   observabilitySettings,
   parseConfigPatch,
   publicIngressUrlEffective,
+  webhookPublicIngressUrlEffective,
   roomTurnTimeoutMinutes,
   saveConfig,
   showToolCallsEnabled,
@@ -297,6 +328,7 @@ import {
   localQuotaRoutingEnabled,
   autoReviewFallbackReviewer,
   autoReviewMaxPerTurn,
+  computerCallSettings,
   usageIngestUrl,
   usageProjectRules,
   vpsCpus,
@@ -308,12 +340,15 @@ import {
   ITEM_IO_DIR,
   NATIVE_DIR,
 } from "./config.ts";
+import { createRequestLog } from "./request-log.ts";
+import { readGitHubRequestLog } from "./routes/github-request-log.ts";
 import {
   appendBounded,
   describeSweep,
   startIdleLiveTranscriptSweeps,
   startOrphanTranscriptSweeps,
   startTranscriptRetentionSweeps,
+  startVolumeTranscriptSweeps,
   sweepTranscriptRetention,
   removeTranscriptLogs,
 } from "./transcript-retention.ts";
@@ -348,7 +383,7 @@ import {
 import { buildTurnTools } from "./turn-tools.ts";
 import { createTurnToolHost } from "./tools/host.ts";
 import { adoptGroupLedger } from "./tools/process-group.ts";
-import { completedToolRow, startedToolRow } from "./tool-row.ts";
+import { completedToolRow, redactToolTitle, startedToolRow } from "./tool-row.ts";
 import { createPermissionBroker, type ApprovalAnswerSource } from "./tools/approvals.ts";
 import { listAgentsResponse } from "./tools/agents.ts";
 import { toolsFor } from "./tools/registry.ts";
@@ -378,8 +413,10 @@ import {
   type TurnComputerInputs,
 } from "./turn-safety.ts";
 import { TurnStatsTracker } from "./turn-stats.ts";
+import { ChildSessionIds } from "./child-session-ids.ts";
 
 import { BUILT_IN_DRIVERS } from "./drivers/builtIn.ts";
+import { isLocalModelEndpoint, ReplyWaitMinutesSchema } from "./drivers/openai-compat.ts";
 // Read-only probe for the Secrets card: whether ~/.mmx/config.json holds a
 // MiniMax key at all.  The driver's own resolver is the authority on
 // precedence; this only reports what the secret map structurally cannot see.
@@ -398,16 +435,18 @@ import {
   dropJobNotices,
   dropJobNoticesForBot,
   dropQueuedForOffBot,
-  dropSteeredMessages,
+  dropSteeredMessagesForBot,
   pendingJobNotices,
   queueJobNotice,
   queueSteeredMessage,
   queuedMessageCount,
   queuedMessageCountFor,
-  queuedMessageIds,
+  queuedMessageIdsForBot,
   restoreJobNotices,
   drainEveryReadyBatch,
   restoreSteeredEntries,
+  setSteerQueueObserver,
+  snapshotSteerQueue,
   takeSteeredEntries,
   type SteerQueueSnapshot,
   type JobNoticeItem,
@@ -416,7 +455,7 @@ import { jobsPrompt, noticeWithoutJobTools } from "./jobs/prompt.ts";
 import { JobRegistry, resolveJobsSettings } from "./jobs/registry.ts";
 import { JobWakeCoordinator } from "./jobs/wake.ts";
 import { ZulipHub } from "./zulip/hub.ts";
-import { cachedVaultReader } from "./zulip/credentials.ts";
+import { cachedVaultReader, ZULIP_DEFAULT_INFISICAL_PATH } from "./zulip/credentials.ts";
 import { zulipToolsMounted } from "./zulip/mount.ts";
 import { zulipPeerScreenRules } from "./zulip/format.ts";
 import type { ZulipOrigin } from "./zulip/types.ts";
@@ -469,15 +508,15 @@ import {
   type InjectionDraft,
 } from "./context-injection.ts";
 import { observability, observabilityBootLine } from "./observability.ts";
-import { formatListenInUse, isListenInUse, listenErrorDisposition } from "./harness-ports.ts";
+import { formatListenInUse, isListenInUse, listenErrorDisposition, resolveHarnessPort, resolveWebhookPort } from "./harness-ports.ts";
 import { getSentry, isSentryActive } from "./sentry.ts";
 import { infisical, type RefreshReason } from "./infisical.ts";
 import { InfisicalError } from "./infisical-client.ts";
 import { credentialFingerprint, SECRET_FIELDS, secretProvenance, secretSource, vaultNames, type SecretFieldSpec } from "./secret-map.ts";
-import { KNOB_FIELDS, knobSource, readKnobField } from "./knob-map.ts";
+import { KNOB_FIELDS, clearedHeadroomKnobs, knobSource, readKnobField } from "./knob-map.ts";
 import { patchChangesInfisicalConnection, writeThroughKnobs } from "./knob-write-through.ts";
 import { configureTurnIdentity, observeRuntimeEvent } from "./sentry-ai.ts";
-import { checkInRoutineFinish, checkInRoutineStart } from "./sentry-crons.ts";
+import { checkInRoutineFinish, checkInRoutineStart, releaseRoutineMonitor } from "./sentry-crons.ts";
 import { ProviderRegistry, type DescribedInstance } from "./harness/registry.ts";
 import { cancelPeerApprovalsFor, cancelPeerApprovalsForThread, dismissStalePeerCards, resolvePeerComms, type ApprovalBus } from "./peer-approval.ts";
 import {
@@ -560,7 +599,8 @@ import {
   ensureContainerComputerSession,
   localVmSharedBotSession,
 } from "./local-vm-shared-session.ts";
-import { RepeatDetector, callKey } from "./repeat-detector.ts";
+import { RepeatDetector, callKey, titleCallKey } from "./repeat-detector.ts";
+import { ProviderRouteActivity } from "./provider-route-activity.ts";
 import { HelperTracker, type HelperPublication } from "./helpers/tracker.ts";
 import { helperSnapshotForWire, helperTranscript } from "../shared/helpers.ts";
 import { redactSecretsInText } from "./redact.ts";
@@ -641,6 +681,7 @@ import {
   type CommandSurface,
 } from "../shared/bot-commands.ts";
 import { memberTurnSelection } from "./member-turn.ts";
+import { DEFAULT_WEBHOOK_PAYLOAD_DEDUPE_MS } from "./webhook-payload-dedupe.ts";
 import { WebhookManager } from "./webhooks.ts";
 import { ResourceTriggerManager } from "./resource-triggers.ts";
 import { readHostDispatchHoldReason, readHostDispatchHot } from "./host-dispatch-hot.ts";
@@ -661,6 +702,8 @@ import {
 import { createBotPackageExport } from "./package-export.ts";
 import { installTestParentWatchdog } from "./test-parent-watchdog.ts";
 import { installTimestampedConsole } from "./console-timestamps.ts";
+import { installProcessCrashHandlers } from "./process-crash-handler.ts";
+import { healthReadiness } from "./health-readiness.ts";
 import {
   BOOT_RESUME_CONCURRENCY,
   BOOT_RESUME_STAGGER_MS,
@@ -680,15 +723,110 @@ import {
   type InterruptedTurnRecord,
 } from "./boot-recovery.ts";
 
+// ── the provider reload fence ────────────────────────────────────────────
+//
+// This block lives at the TOP of the module on purpose.  The four bindings
+// below are read by `startTurn`, and `startTurn` is reachable WHILE this
+// module is still being evaluated.
+//
+// `jobHost.boot()` is a top-level call — it is what resumes the durable job
+// runtime after a restart — and boot dispatches a queued assignment
+// synchronously: `Runtime.tick()` -> `dispatchDue()` -> `dispatch()` ->
+// `runner.run()` -> `runTurn()` -> `startTurn()`.  `startTurn` reads
+// `providerReloadInProgress` before its first `await`, so while that binding
+// was declared further down this file the read landed in its temporal dead
+// zone and threw `Cannot access 'providerReloadInProgress' before
+// initialization`.  The assignment being dispatched then failed with
+// `provider_error` and its turn was killed.
+//
+// `tsc` cannot see this: the read is inside a function body reached through
+// a call graph that starts at module evaluation, so there is no ordering for
+// the compiler to complain about.  `server/provider-reload-order.test.ts`
+// pins the order instead — the mutation it is written against is this block
+// moving back down.
+//
+// The functions that keep the fence follow the state it keeps.  They are
+// hoisted declarations, so they can be called from anywhere in the module;
+// the state they read cannot, because a `let` is dead until its declaration
+// has run.
+
+/** The rebuild currently running, if any.  Every caller queues behind it.
+ *
+ * The sequence below is `detachAll` -> `disposeAll` -> `load` -> `attach`, and
+ * two of those overlapping is the worst outcome available: one run's `load`
+ * repopulates the registry while the other's `disposeAll` empties it, leaving
+ * instances registered but disposed, or the bus attached to a torn-down fleet.
+ * `providerConfigBusy` fences the two Settings routes, but not the secret
+ * paths — `POST /api/infisical/sync` and a late `onApplied` both reach here on
+ * their own — so the guarantee lives here, where the sequence does.
+ *
+ * Queued, not coalesced: a caller that arrives mid-run gets its OWN rebuild
+ * afterwards.  Handing it the run already in flight would be cheaper and
+ * wrong — that run read `cfg` before this caller changed it. */
+let providerReloadChain: Promise<void> = Promise.resolve();
+let pendingProviderReloads = 0;
+let providerReloadInProgress = false;
+let providerReloadGeneration = 0;
+
+async function waitForProviderReloads(): Promise<void> {
+  while (providerReloadInProgress) await providerReloadChain;
+}
+
+function finishProviderReloadMutation(): void {
+  providerReloadGeneration += 1;
+  pendingProviderReloads -= 1;
+  if (pendingProviderReloads !== 0) return;
+  providerReloadInProgress = false;
+  // Success and failure both lower the global fence.  Unaffected engines can
+  // accept deferred work after a failed mutation, and the original rejection
+  // still reaches its settings caller through serializeProviderReload.
+  drainProviderReloadContinuations();
+}
+
+function serializeProviderReload(runProviderMutation: () => Promise<void>): Promise<void> {
+  pendingProviderReloads += 1;
+  // Fence dispatch as soon as a mutation is queued, including the gap
+  // between two serialized reloads.  Otherwise the first run's drain can
+  // start work that the already-queued second run immediately disposes.
+  providerReloadInProgress = true;
+  const run = providerReloadChain.then(runProviderMutation, runProviderMutation);
+  const settled = run.then(
+    () => finishProviderReloadMutation(),
+    (error) => {
+      finishProviderReloadMutation();
+      throw error;
+    },
+  );
+  // The chain itself must never reject, or every later caller inherits the
+  // failure; the run each caller awaits still rejects normally.
+  providerReloadChain = settled.catch(() => {});
+  return settled;
+}
+
+/** Rebuild the provider fleet after a config change so new keys take
+ * effect without a server restart (kills any in-flight turns).  Serialized:
+ * see `providerReloadChain`. */
+function reloadProviders(): Promise<void> {
+  return serializeProviderReload(runProviderReload);
+}
+
 // OP7: before any other logging in this file — the launchd StandardOutPath
 // is one shared, unrotated file with the companion sidecar's already-
 // timestamped lines, and every harness line below (boot sweeps, telemetry,
 // antigravity-quota, infisical, …) otherwise carries no timestamp at all,
 // so nothing here can be correlated against a companion line by time.
 installTimestampedConsole();
+// A crash after this point is logged, captured to Sentry and exited on,
+// instead of dying under Node's defaults with nothing reported.  Sentry
+// is resolved at crash time, so installing before it initializes is fine.
+installProcessCrashHandlers({
+  logError: (...args) => console.error(...args),
+  getSentry: () => (isSentryActive() ? getSentry() : null),
+  exit: (code) => process.exit(code),
+});
 
-const PORT = Number(process.env.OMB_PORT || process.env.OGB_PORT || 8799);
-const WEBHOOK_PORT = Number(process.env.OMB_WEBHOOK_PORT || PORT + 1);
+const PORT = resolveHarnessPort();
+const WEBHOOK_PORT = resolveWebhookPort(process.env, PORT);
 const STATIC_DIR = process.env.OMB_STATIC_DIR || null;
 const MIME: Record<string, string> = {
   ".html": "text/html",
@@ -704,7 +842,88 @@ const MIME: Record<string, string> = {
 // Fence duplicate schedulers and database writers before config, providers,
 // SQLite, routines, or webhook receivers start.  Health timeouts never release it.
 // The parent startup lock also serializes the one-time legacy directory move.
+const storageGuard = process.platform === "linux" && process.argv.includes("--require-data-volume") ? storageDeviceGuard(DATA_DIR) : null;
+if (storageGuard && !storageGuard.initial.online) {
+  console.error(storageGuard.initial.reason);
+  process.exit(STORAGE_OFFLINE_EXIT_CODE);
+}
 const harnessOwner = initializeHarnessOwnership(DATA_DIR, PORT, ensureDirs);
+const hostId = loadHostId(DATA_DIR);
+const placementAuthority = openRollbackPlacementAuthority(DATA_DIR, hostId);
+// Immutable for this process: updater unquiesce cannot grant execution authority.
+const placementRollbackReadOnly = placementAuthority.kind === "readonly";
+// The placement transport's two knobs, read live.  The config object is
+// mutated in place on every save and vault refresh, so a holder that points
+// at it always answers with the current value.  It starts empty because the
+// config is loaded further down this file and the lease service is built
+// before that, so nothing may read the config yet.
+let placementConfig: AppConfig | null = null;
+/** How long a worker may go quiet before the controller marks it
+ *  unreachable.  The lease service asks for this every time it judges a
+ *  worker, so a knob change applies without a restart. */
+const placementUnreachableAfterMs = (): number =>
+  (placementConfig?.placement?.unreachableAfterSeconds ?? DEFAULT_PLACEMENT_UNREACHABLE_AFTER_SECONDS) * 1000;
+/** How often a worker says it is alive.  The controller's sweep runs at the
+ *  same cadence:  the sweep exists to notice that a worker's heartbeat
+ *  stopped, so the controller re-checks liveness as often as workers report
+ *  it, and a quiet worker is marked unreachable within one period of the
+ *  window closing rather than within a whole window. */
+const placementHeartbeatMs = (): number =>
+  (placementConfig?.placement?.heartbeatSeconds ?? DEFAULT_PLACEMENT_HEARTBEAT_SECONDS) * 1000;
+const placementLeases = placementAuthority.kind === "legacy" ? new PlacementLeaseService({
+  hostId, controller: placementAuthority.controllerStore.read(), controllerStore: placementAuthority.controllerStore,
+  unreachableAfterMs: placementUnreachableAfterMs,
+}) : null;
+// The server's copy of the mode record, beside `jobs.json`.  It shares the
+// lease service's epoch and keeps no epoch of its own, so the record can
+// never name a fence the controller does not hold.
+const placementModeStore = new PlacementModeStore(join(DATA_DIR, "jobs"), {
+  hostId,
+  controller: () => {
+    if (placementAuthority.kind === "readonly") return placementAuthority.reader.controller();
+    if (!placementLeases) throw new Error("Placement authority is unavailable");
+    return placementLeases.controller();
+  },
+});
+// The bridge between that record and the job registry (slice T4).  It is
+// built on every host, including one with no writable authority:  a server
+// mode on a host that cannot admit a job refuses the start with a reason,
+// and it never falls through to running the job here.  A bridge that was
+// absent would leave the registry's own path open, which is the one thing
+// the plan refuses.
+const placementBridge = new PlacementControllerBridge({
+  hostId,
+  view: () => {
+    const view = placementModeStore.read();
+    return {
+      mode: view.record.mode,
+      controllerId: view.controller.controllerId,
+      epoch: view.controller.epoch,
+      acknowledged: view.acknowledged,
+    };
+  },
+  enqueue: (message) => {
+    if (!placementLeases) {
+      return { ok: false, reason: "The placement authority on this computer is read-only, so no job is admitted.  Run the command with bash if it is short, or switch to This Mac Only in Settings." };
+    }
+    return placementLeases.enqueue(message);
+  },
+  queuedReason: (jobId) => placementLeases?.job(jobId)?.queuedReason,
+  sweepUnreachable: () => placementLeases?.sweepUnreachable() ?? [],
+});
+const jobHostProbe = createHostProbe({
+  storageState: storageGuard?.sample,
+  // The Mac memory-pressure probe runs only while a memory-headroom knob
+  // is set (P-BF-6 B7); unset means no probe and unchanged readings.
+  memoryHeadroomEnabled: () => {
+    const admission = jobSettings().admission;
+    return admission.reservedRamBytes !== undefined || admission.minMemoryAvailablePercent !== undefined;
+  },
+});
+const hostResourcesResponse = createHostResourcesResponder({
+  hostId, version: runtimeBuildIdentity.version, platform: process.platform,
+  dataDir: DATA_DIR, probe: jobHostProbe, thresholds: () => jobSettings().admission,
+});
 
 // ── the port opens BEFORE boot work, and health answers while it runs ─────
 // `server.listen` used to be the last statement in this file, behind the
@@ -726,6 +945,10 @@ const harnessOwner = initializeHarnessOwnership(DATA_DIR, PORT, ensureDirs);
 // One server, one socket, no window where the port is unbound: the real
 // handler takes over the moment `booting` flips at the end of this file.
 let booting = true;
+// Set when the webhook ingress listener fails during boot (assigned far
+// below); declared here so the boot-phase health handler can read it
+// without a temporal-dead-zone throw on an early request.
+let webhookIngressError: string | null = null;
 let handleRequest: ((req: IncomingMessage, res: ServerResponse) => unknown) | null = null;
 
 function handleBootRequest(req: IncomingMessage, res: ServerResponse): void {
@@ -745,23 +968,37 @@ function handleBootRequest(req: IncomingMessage, res: ServerResponse): void {
   if (path === "/health" || path === "/api/health") {
     return json(res, 200, {
       app: "botfleet",
+      hostId,
+      version: runtimeBuildIdentity.version,
       pid: process.pid,
       static: Boolean(STATIC_DIR),
       ownerProof: harnessOwnerProof(harnessOwner, req.headers["x-botfleet-owner-challenge"]),
-      ready: false,
-      booting: true,
+      ...healthReadiness({ booting: true, webhookIngressError }),
     });
   }
   return json(res, 503, { error: "booting" });
 }
 
+const workerRequestBoundary = createWorkerRequestBoundary({
+  audience: hostId, source: privateWorkerAuthorizationSource(DATA_DIR), readBody,
+});
 const server = createServer((req, res) => {
-  if (booting || !handleRequest) return handleBootRequest(req, res);
-  void Promise.resolve(handleRequest(req, res)).catch((error: unknown) => {
+  void (async () => {
+    if (!isLoopbackHost(req.headers.host)) return json(res, 403, { error: "forbidden: loopback host required" });
+    if (await workerRequestBoundary(req, res)) return;
+    if (booting || !handleRequest) return handleBootRequest(req, res);
+    await handleRequest(req, res);
+  })().catch((error: unknown) => {
     console.error("[request] unhandled route failure:", error);
     if (!res.headersSent) json(res, 500, { error: "internal error" });
     else res.destroy();
   });
+});
+// No worker WebSocket protocol exists; an upgrade cannot bypass the HTTP guard.
+server.on("upgrade", (req, socket) => {
+  if (classifyWorkerRequest(req).kind !== "none") {
+    socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+  } else socket.destroy();
 });
 server.on("error", (error: NodeJS.ErrnoException) => {
   if (listenErrorDisposition(error) === "named-exit") {
@@ -787,7 +1024,9 @@ server.listen(PORT, "127.0.0.1", () => {
 // it now rather than at recovery time also means a crash DURING recovery
 // cannot replay the record on the next boot — the surviving
 // `inflightThreadId` markers are the fallback, and they are evidence enough.
-const interruptedAtLastStop = takeInterruptedTurns(DATA_DIR);
+const interruptedAtLastStop = placementRollbackReadOnly
+  ? { version: 1 as const, recordedAt: 0, turns: [], failures: [] }
+  : takeInterruptedTurns(DATA_DIR);
 /** `botId:threadId` of every resume that already failed terminally.  Mirrors
  * the on-disk list so the common dispatch touches no disk at all. */
 const rememberedResumeFailures = new Set(
@@ -798,7 +1037,7 @@ const rememberedResumeFailures = new Set(
 // (server/tools/process-group.ts), so they no longer die with this process
 // the way launchd's job cleanup used to make them.  Groups a crashed or
 // killed run recorded and never saw end are stopped now, before any turn.
-void adoptGroupLedger(join(DATA_DIR, "process-groups.json")).catch((error) => {
+if (!placementRollbackReadOnly) void adoptGroupLedger(join(DATA_DIR, "process-groups.json")).catch((error) => {
   console.error("could not stop process groups an earlier run left running", error);
 });
 
@@ -983,6 +1222,9 @@ const updateDrain = new UpdateDrain({
   log: (line) => console.warn(line),
 });
 const cfg = loadConfig();
+// The placement knobs read this object, and it is mutated in place on every
+// save and vault refresh, so a knob change applies without a restart.
+placementConfig = cfg;
 // Agent CLIs spawn with the Infisical Agent Proxy environment when it is on.  Read
 // from the in-memory `cfg` (mutated in place on every save and vault refresh), so a
 // spawn never re-reads config.json.
@@ -1016,8 +1258,8 @@ infisical.configure(
   () => infisicalSettings(cfg),
   // Fire and forget by necessity — the manager's refresh does not await this
   // — but never unhandled: without the catch a failed apply becomes an
-  // unhandled rejection, and there is no process-level handler in server/ to
-  // stop that terminating the harness.
+  // unhandled rejection, and the process-level handler above would
+  // (correctly, but needlessly) take the harness down for it.
   (reason) => {
     void applyResolvedSecrets(reason).catch((error) => {
       console.error(`[infisical] apply failed (${reason}): ${error instanceof Error ? error.message : String(error)}`);
@@ -1139,6 +1381,18 @@ const PLUGIN_SETTINGS_BODY = z.object({ settings: z.record(z.string(), z.json())
 const PLUGIN_SLUG = z.string().min(1).max(64).regex(/^[\w][\w-]*$/);
 const PLUGIN_PATH_PARAMS = z.tuple([PLUGIN_SLUG]);
 const PLUGIN_ITEM_PATH_PARAMS = z.tuple([PLUGIN_SLUG, PLUGIN_SLUG]);
+
+// Request schema for the explicit per-context send route.  Bodies are
+// untrusted input; the handler only ever sees parsed values.
+const PER_CONTEXT_SEND_BODY = z.object({
+  text: z.unknown(),
+  recording: z.unknown().optional(),
+  idempotencyKey: z.unknown().optional(),
+  replyToId: z.unknown().optional(),
+  source: z.unknown().optional(),
+  senderVerified: z.unknown().optional(),
+  chatId: z.unknown().optional(),
+}).strip();
 
 pluginsModule.initPluginRuntime({
   listBots: () => store.bots.map((bot) => ({
@@ -1652,21 +1906,43 @@ function dispatchHoldFor(
   runOn: RoutineRunOn,
   opts: { count?: boolean } = {},
 ): DispatchHold | undefined {
+  if (placementRollbackReadOnly) return { reason: PLACEMENT_ROLLBACK_REFUSAL };
   const bot = store.bot(botId);
   if (!bot) return undefined;
   const task = threadId ? store.taskByThread(bot.id, threadId) : undefined;
   const policy = task?.modelSelection ?? bot.modelSelection;
+  const boxCloud = cloudRunUsesBoxAgent(runOn, bot.cloudBackend ?? undefined, cfg.botDefaults?.cloudBackend)
+    ? registry.instances().find((candidate) => candidate.driverKind === "boxAgent")
+    : undefined;
+  const modelRoute = boxCloud ? undefined : quotaCooldowns.resolveModel(bot.id, policy);
   // A Box-backed cloud run does NOT execute on the bot's model engine:
   // `startTurn` switches it to the boxAgent instance. Judging the hold against
   // the local engine queued healthy cloud work whenever the local engine was
   // setup-dead, and never consulted a breaker that had opened on boxAgent.
   // This is the engine the turn will actually reach, which is the only one a
   // hold can honestly be about.
-  const instanceId = executionInstanceFor(bot, policy, runOn);
+  const instanceId = boxCloud?.instanceId ?? modelRoute?.selection.instanceId;
+  if (!instanceId) return undefined;
   // The registry's own display name where it has one, so the reason says
   // "DeepSeek Harness" rather than "dsh".  A queue full of "dsh could not
   // start" is no easier to act on than the boolean it replaced.
   const engine = registry.get(instanceId as never)?.displayName ?? instanceId;
+
+  // Unattended work stays queued while its actual primary route is cooling
+  // and every saved fallback is unavailable.
+
+  // RoutineManager retries this gate on its normal tick, so the receipt
+  // resumes automatically when the cooldown expires.
+
+  // A Box-backed run has its own executor and bypasses this model-route hold.
+  if (!boxCloud && policy.fallbacks?.length && modelRoute?.transientCapacity && !modelRoute.cooldown && !modelRoute.isFallback) {
+    const hint = `This queued run will start automatically when a model has room.`;
+    return { reason: `${engine} is temporarily at capacity.\u00a0 ${hint}`, hint };
+  }
+  if (!boxCloud && policy.fallbacks?.length && modelRoute?.cooldown && !modelRoute.isFallback) {
+    const hint = `This queued run will start automatically when a model becomes available.`;
+    return { reason: `${engine} is cooling down after reaching its limit.\u00a0 ${hint}`, hint };
+  }
 
   // A (bot, engine) pair that has failed to START repeatedly is not going to
   // start on the next tick either — the CLI is missing, not executable, or
@@ -2128,8 +2404,23 @@ function presentInstances<T extends Parameters<typeof presentDescribedInstances>
 }
 
 function instancesPayload(described: DescribedInstance[]) {
+  const configs = instanceConfigs(cfg);
+  const instances = presentInstances(described).map((instance) => {
+    const entry = configs[instance.instanceId];
+    if (entry?.driver !== "openai-compat") return instance;
+    const config = z.object({
+      url: z.string().optional(),
+      replyWaitMinutes: ReplyWaitMinutesSchema.optional(),
+    }).safeParse(entry.config);
+    if (!config.success || !config.data.url || !isLocalModelEndpoint(config.data.url)) return instance;
+    const available = Object.assign({}, instance, { localModelWaitAvailable: true });
+    if (config.data.replyWaitMinutes !== undefined) {
+      Object.assign(available, { replyWaitMinutes: config.data.replyWaitMinutes });
+    }
+    return available;
+  });
   return {
-    instances: presentInstances(described),
+    instances,
     describedAt: registry.describedAtOf(described),
     ...(registry.describeWasStale() ? { stale: true } : {}),
   };
@@ -2720,9 +3011,22 @@ function jobStopReason(job: JobSnapshot): { reason: string; forget: boolean } | 
   return null;
 }
 const jobRegistry = new JobRegistry({
+  passive: placementRollbackReadOnly,
   dir: join(DATA_DIR, "jobs"),
   dataDir: DATA_DIR,
+  probe: jobHostProbe,
   settings: jobSettings,
+  // The bridge to the placement authority (slice T4).  It is always present,
+  // so a server mode can never fall through to running the job on this host.
+  placementBridge,
+  // The mode the record holds, so the per-host cap refuses only in This Mac
+  // Only:  in a server mode the cap is an eligibility input and the job
+  // queues instead.
+  placementMode: () => placementBridge.mode(),
+  // The jobs the controller's queue still holds.  In a server mode the
+  // registry keeps no copy of them, so the per-bot and per-thread caps count
+  // them from there.
+  placementActiveJobs: () => placementLeases?.activeJobs() ?? [],
   // A job is a shell the model started: it carries its bot's launch identity
   // the way the engine's own children do (server/launch-identity.ts).
   launchEnv: (botId, threadId) => {
@@ -2740,7 +3044,7 @@ const jobWakeUsage = new JobWakeUsage(join(DATA_DIR, "jobs"));
 // a bot deleted while the harness was down has no row to keep
 jobWakeUsage.retainBots((botId) => Boolean(store.bot(botId)));
 const jobWakes = new JobWakeCoordinator({
-  wakeEnabled: () => jobSettings().wake,
+  wakeEnabled: () => !placementRollbackReadOnly && jobSettings().wake,
   isRoom: (threadId) => Boolean(store.groupByThread(threadId)),
   botBusy: (botId) => Boolean(store.bot(botId)?.busy),
   // The engine the bot is on NOW: it may have been switched since the job
@@ -2959,6 +3263,21 @@ const stopIdleLiveTranscriptSweeps = startIdleLiveTranscriptSweeps(
     hold: () => cleanupHoldReason(DATA_DIR),
   },
 );
+// Data-volume budget (BF-2463): every transcript log together stays under
+// ~8.4 GB.  Boot run is deferred off the request path (the starter's initial
+// delay), then daily alongside the other retention timers.  What is still
+// over budget is reported through describeVolumeSweep, never taken from
+// live data.  No per-file cap or admission change here.
+const stopVolumeTranscriptSweeps = startVolumeTranscriptSweeps(
+  transcriptDirs,
+  liveThreadIds,
+  inFlightThreadIds,
+  console.log,
+  {
+    dryRun: retentionDryRun,
+    hold: () => cleanupHoldReason(DATA_DIR),
+  },
+);
 // Workspaces and messages.db are swept once, shortly after boot, off the
 // request path — no recurring timer to unref, because a harness restart (29
 // in two days per the audit) already re-runs this often enough on its own.
@@ -3034,7 +3353,8 @@ setInterval(() => {
  * than the desktop window did. Stripped here rather than at each call site
  * so a new broadcast cannot forget. */
 const wireTask = ({ resumeCursors, lastInstanceId, snoozedUntil, ...task }: TaskRecord) => {
-  const last = store.messagesFor(task.threadId).at(-1);
+  const messages = store.messagesFor(task.threadId);
+  const last = messages.at(-1);
   // Time-based snoozes heal on read against the HARNESS clock, so a phone
   // whose clock is minutes off still agrees with the desktop about whether
   // a thread is asleep.  The 0 sentinel is not a time and survives every
@@ -3044,6 +3364,13 @@ const wireTask = ({ resumeCursors, lastInstanceId, snoozedUntil, ...task }: Task
     ...(isThreadSnoozed(snoozedUntil) ? { snoozedUntil } : {}),
     lastActivity: last?.at ?? task.createdAt,
     lastMessage: last,
+    // How much conversation a thread holds, so a person can tell a long
+    // history from a recent one before choosing what to merge into what.
+    messageCount: messages.length,
+    // When the conversation first spoke.  A merge folds transcripts in the
+    // order they began, and the task's own creation time can disagree with
+    // that, so the client orders by this one.
+    startedAt: messages[0]?.at ?? task.createdAt,
   };
 };
 const wireGroupTask = (task: GroupTaskRecord) => {
@@ -3162,6 +3489,11 @@ store.onChange((change) => {
   switch (change.type) {
     case "message":
       broadcast({ kind: "message", threadId: change.threadId, message: change.message });
+      break;
+    case "messages":
+      // A bulk copy (a merge) writes a whole transcript at once, so it
+      // arrives as one frame instead of thousands of single-message ones.
+      broadcast({ kind: "messages", threadId: change.threadId, messages: change.messages });
       break;
     case "message.patch":
       broadcast({ kind: "message.patch", threadId: change.threadId, message: change.message });
@@ -3328,10 +3660,11 @@ function redactRuntimeEventForWire(event: RuntimeEvent): RuntimeEvent {
         const text = redactSecretsInText(event.text);
         return text === event.text ? event : { ...event, text };
       }
+      const title = redactToolTitle(event.title);
       const detail = typeof event.detail === "string" ? redactSecretsInText(event.detail) : event.detail;
       const args = typeof event.arguments === "string" ? redactSecretsInText(event.arguments) : event.arguments;
-      if (detail === event.detail && args === event.arguments) return event;
-      return { ...event, detail, arguments: args };
+      if (title === event.title && detail === event.detail && args === event.arguments) return event;
+      return { ...event, title, detail, arguments: args };
     }
     case "request.opened": {
       const summary = redactSecretsInText(event.summary);
@@ -3824,11 +4157,13 @@ function commandsFor(bot: BotRecord, surface: CommandSurface) {
   });
 }
 
-/** Drop every message waiting behind the bot's running turn, and forget the
- * unattended mark a relayed one carried. */
+/** Drop every message waiting behind the bot's running turn, on every thread
+ * it owns, and forget the unattended mark a relayed one carried.  Per-context
+ * sends queue against their own thread, so clearing only the active thread
+ * would let a side thread's queue drain and run after a typed /stop. */
 function dropQueuedMessages(bot: BotRecord): number {
-  for (const queueId of queuedMessageIds(bot.threadId)) relayQueuedMessageIds.delete(queueId);
-  const dropped = dropSteeredMessages(bot.threadId);
+  for (const queueId of queuedMessageIdsForBot(bot.id)) relayQueuedMessageIds.delete(queueId);
+  const dropped = dropSteeredMessagesForBot(bot.id);
   if (dropped > 0) {
     const fresh = store.bot(bot.id);
     if (fresh) broadcast({ kind: "bot", bot: botWithThreadView(fresh) });
@@ -4049,6 +4384,7 @@ function notify(notification: Notification | null) {
 // records the active member here before dispatching its turn.
 const groupSpeakers = new Map<string, { botId: string; name: string; color: string }>();
 const activeTurnOwners = new ActiveTurnOwners();
+const providerRouteActivity = new ProviderRouteActivity();
 
 // A Sentry span only ever sees a thread id.  This is what turns one into the
 // bot, the engine, and the room behind it, so a failed turn in the Issues
@@ -4074,12 +4410,17 @@ configureTurnIdentity((threadId) => {
 // The latest running token totals for the turn in flight on each thread.
 // Providers report cumulative-within-turn numbers; the final value is folded
 // into the task's tally when the turn settles.
-const turnUsage = new Map<string, { input: number; output?: number; cachedInput?: number }>();
+const turnUsage = new Map<string, { input: number; output?: number; cachedInput?: number; contextWindow?: number }>();
 
 // Where each 1:1 turn in flight is spending its wall time (model, tools, or
 // waiting on a person).  Folded into the task's `stats` aggregate at
 // turn.completed; dropped on every path that ends a turn without one.
 const turnStats = new TurnStatsTracker();
+
+// The native session id each engine child last reported, per thread and
+// instance, so a turn's Usage Monitor event can name it (childSessionId) and
+// be paired with the child harness's own telemetry.
+const childSessionIds = new ChildSessionIds();
 
 // UTF-8 bytes of the system prompt each in-flight turn was handed, split at
 // the volatile boundary (server/system-prompt.ts).  Booked at dispatch and
@@ -4191,6 +4532,7 @@ function scheduleStalledTurnRelease(
 const watchdog = new TurnWatchdog({
   stallMs: TURN_STALL_MS,
   checkMs: 60_000,
+  liveThreadIds: () => registry.instances().flatMap((instance) => instance.adapter.liveTurnThreadIds?.() ?? []),
   onSweep: () => {
     for (const instance of registry.instances()) {
       const sweep = instance.adapter.sweepStuckTurns;
@@ -4994,6 +5336,8 @@ async function launchFallbackTurn(input: {
             used: pick.nextUsed,
             current: selection,
             botId,
+            isCooling: (candidateBotId, instanceId, model, now) =>
+              Boolean(quotaCooldowns.get(candidateBotId, instanceId, model, now)) || Boolean(transientRouteHealth.get(instanceId, model, now)),
           });
       if (!following) {
         fallbackAttemptByTurn.delete(key);
@@ -5086,6 +5430,18 @@ bus.subscribe((event: RuntimeEvent) => {
   }
   broadcast({ kind: "runtime", event: redactRuntimeEventForWire(event) });
   const bot = store.botByThread(event.threadId);
+  if (event.type === "content.delta" && !event.subagentId) {
+    const owner = activeTurnOwners.forEvent(event.threadId, event.providerInstanceId);
+    if (owner && providerRouteActivity.observe(owner, event.streamKind, event.delta)) {
+      transientRouteHealth.markHealthy(owner.botId, owner.selection.instanceId, owner.selection.model);
+    }
+  }
+  if ((event.type === "item.started" || event.type === "item.completed") && event.itemType === "tool") {
+    const owner = activeTurnOwners.forEvent(event.threadId, event.providerInstanceId);
+    if (owner && providerRouteActivity.observeTool(owner, event)) {
+      transientRouteHealth.markHealthy(owner.botId, owner.selection.instanceId, owner.selection.model);
+    }
+  }
   noteThreadWedge(bot ?? null, event);
   noteDoomedDispatch(bot ?? null, event);
   const group = bot ? undefined : store.groupByThread(event.threadId);
@@ -5115,11 +5471,18 @@ bus.subscribe((event: RuntimeEvent) => {
 
   switch (event.type) {
     case "session.started":
+      // Room threads too: a room turn's event names its child session as well.
+      if (event.providerInstanceId) {
+        childSessionIds.note(event.threadId, event.providerInstanceId, event.sessionId, event.turnId);
+      }
       if (bot && event.sessionId && event.providerInstanceId) {
         store.setResumeCursor(bot.id, event.providerInstanceId, event.sessionId, event.threadId);
       }
       break;
     case "session.invalidated":
+      if (event.providerInstanceId) {
+        childSessionIds.forget(event.threadId, event.providerInstanceId, event.sessionId);
+      }
       if (bot && event.providerInstanceId) {
         store.clearResumeCursor(bot.id, event.providerInstanceId, event.sessionId, event.threadId);
       }
@@ -5167,10 +5530,11 @@ bus.subscribe((event: RuntimeEvent) => {
           // item.started across — dropping them here would silently
           // un-narrate every completed tool and blank the row's target
           const existing = store.messagesFor(event.threadId).find((m) => m.id === messageId)?.tool;
-          toolName = existing?.name ?? "tool";
+          const safeEvent = event.title === undefined ? event : { ...event, title: redactToolTitle(event.title) };
+          toolName = safeEvent.title ?? existing?.name ?? "tool";
           const startedAt = toolStartedAt.get(itemKey);
           store.patchMessage(event.threadId, messageId, {
-            tool: completedToolRow(existing, event, startedAt === undefined ? undefined : Math.max(0, Date.now() - startedAt)),
+            tool: completedToolRow(existing, safeEvent, startedAt === undefined ? undefined : Math.max(0, Date.now() - startedAt)),
           });
           toolMessageByItem.delete(itemKey);
           toolStartedAt.delete(itemKey);
@@ -5674,11 +6038,29 @@ bus.subscribe((event: RuntimeEvent) => {
       if (event.setup && bot) store.setActivity(bot.id, "dead");
       break;
     }
-    case "thread.token-usage.updated":
+    case "thread.token-usage.updated": {
       // running totals for the turn in flight; folded into the task's
-      // tally at turn.completed (below) so retries never double-count
-      turnUsage.set(event.threadId, { input: event.input, output: event.output, cachedInput: event.cachedInput });
+      // tally at turn.completed (below) so retries never double-count.
+      // A later tick that omits the window keeps the size already reported.
+      logReportedCachedTokens(event);
+      const previous = turnUsage.get(event.threadId);
+      const contextWindow = event.contextWindow ?? previous?.contextWindow;
+      if (contextWindow === undefined) {
+        turnUsage.set(event.threadId, {
+          input: event.input,
+          output: event.output,
+          cachedInput: event.cachedInput,
+        });
+      } else {
+        turnUsage.set(event.threadId, {
+          input: event.input,
+          output: event.output,
+          cachedInput: event.cachedInput,
+          contextWindow,
+        });
+      }
       break;
+    }
     case "turn.completed": {
       const completionToken = Symbol(event.turnId);
       const completionFold = (async () => {
@@ -5717,6 +6099,21 @@ bus.subscribe((event: RuntimeEvent) => {
       const tokens = event.usage ?? lastReported;
       // Closes the turn's clock now, before any await below stretches it.
       const turnTiming = bot ? turnStats.settle(event.threadId, tokens?.output) : undefined;
+      // The child's own session id for the turn, read before any await (a
+      // later turn on the thread could report a new one meanwhile).
+      const turnChildSessionId = event.providerInstanceId
+        ? childSessionIds.forTurn(
+            event.threadId,
+            event.providerInstanceId,
+            event.turnId,
+            (tokens?.input ?? 0) > 0 || (tokens?.output ?? 0) > 0,
+          )
+        : undefined;
+      // When the turn began, on the wall clock.  `startedAtMs` is monotonic
+      // (performance.now), so it is not a date; the settled latency is the
+      // same interval on the same clock, counted back from now.
+      const turnStartedAtMs =
+        settledOwner?.latencyMs !== undefined ? Date.now() - settledOwner.latencyMs : undefined;
       // The turn that ended owns its failover: resolve the member from the
       // settled owner (this thread, this provider instance) before the
       // thread's speaker entry, which a crossed room can leave naming the
@@ -5790,7 +6187,11 @@ bus.subscribe((event: RuntimeEvent) => {
         // existing chip-prose regexes decide exactly as they do today.
         const structuredQuotaOrCap = quotaOrCapFromErrorCode(providerErrorCodeFromStopReason(event.stopReason));
         const quotaEvidence = turnQuotaOrCapEvidence(afterUser, Boolean(event.ok));
-        const quotaOrCap = structuredQuotaOrCap ?? Boolean(quotaEvidence);
+        const capacityEvidence = turnTransientCapacityEvidence(afterUser, Boolean(event.ok));
+        // HTTP 429 shares a structured code with quota failures, so explicit
+        // hard-quota text takes precedence while a pure capacity refusal stays transient.
+        const quotaOrCap = capacityEvidence ? Boolean(quotaEvidence) : structuredQuotaOrCap ?? Boolean(quotaEvidence);
+        const fallbackCapacityHit = quotaOrCap || Boolean(capacityEvidence);
         const quotaText = (quotaEvidence?.text ?? reply) || lastMsgText;
         const quotaInfo = parseQuotaResetTime(quotaText, Date.now(), quotaOrCap);
         const textIsCandidateForQuota = !event.ok || Boolean(quotaEvidence);
@@ -5803,13 +6204,16 @@ bus.subscribe((event: RuntimeEvent) => {
         const isTextError =
           structuredQuotaOrCap === true ||
           Boolean(quotaEvidence) ||
+          Boolean(capacityEvidence) ||
           sliceIsShortProviderError(afterUser) ||
           Boolean(modelRejection);
         const isOk = Boolean(event.ok) && !isTextError;
+        if (!isOk) transientRouteHealth.markUnhealthy(fallbackBot.id, actualSelection.instanceId, actualSelection.model);
         if (isOk) {
           fallbackAttemptByTurn.delete(fallbackKey);
           pendingMemberFallback.delete(event.threadId);
           quotaCooldowns.clear(fallbackBot.id, actualSelection.instanceId, actualSelection.model);
+          transientRouteHealth.markHealthy(fallbackBot.id, actualSelection.instanceId, actualSelection.model);
           modelRejections.clear(fallbackBot.id, actualSelection.instanceId, actualSelection.model);
         } else if (
           actualSelection.instanceId &&
@@ -5820,6 +6224,21 @@ bus.subscribe((event: RuntimeEvent) => {
           (event.stopReason === "prompt_timeout" || event.stopReason === "prompt_stall" || event.stopReason === "resume_failed")
         ) {
           store.setResumeCursor(fallbackBot.id, actualSelection.instanceId, undefined, event.threadId);
+        }
+        if (capacityEvidence && actualSelection.instanceId && actualSelection.model) {
+          transientRouteHealth.recordFailure(
+            fallbackBot.id,
+            actualSelection.instanceId,
+            actualSelection.model,
+            redactSecretsInText(capacityEvidence.text),
+            Date.now(),
+            transientCapacityRetryDelayMs(capacityEvidence.text),
+            (peerId) => {
+              const peer = activeTurnOwners.forBot(peerId);
+              return Boolean(peer && !peer.revoked &&
+                peer.selection.instanceId === actualSelection.instanceId && peer.selection.model === actualSelection.model);
+            },
+          );
         }
         if (quotaOrCap && textIsCandidateForQuota) {
           quotaCooldowns.record({
@@ -5851,7 +6270,7 @@ bus.subscribe((event: RuntimeEvent) => {
         // a fallback must not wander to another engine on any failure.
         const configuredChain = fallbackPolicy?.fallbacks;
         let chain = configuredChain && configuredChain.length > 0 ? configuredChain : undefined;
-        if (!chain && quotaOrCap) {
+        if (!chain && fallbackCapacityHit) {
           deferredAutoFallback = true;
           chain = await autoFallbackChain(fallbackBot.id, actualSelection.instanceId, actualSelection.effort, fallbackComputerReach(settledOwner?.computerInputs));
         }
@@ -5888,7 +6307,7 @@ bus.subscribe((event: RuntimeEvent) => {
           ok: isOk,
           stopReason: event.stopReason,
           produced: turnProducedAssistantOutput(afterUser, { textIsError: isTextError }),
-          quotaOrCap,
+          quotaOrCap: fallbackCapacityHit,
           fallbacks: chain,
           used,
           current: {
@@ -5899,6 +6318,8 @@ bus.subscribe((event: RuntimeEvent) => {
           // doomed breaker is refusing; without it the gate is inert and the
           // fail-over can hand the turn to a second dead engine.
           botId: fallbackBot.id,
+          isCooling: (candidateBotId, instanceId, model, now) =>
+            Boolean(quotaCooldowns.get(candidateBotId, instanceId, model, now)) || Boolean(transientRouteHealth.get(instanceId, model, now)),
         });
         // Receipt now that the failover decision exists: while a fallback is
         // launching the run stays open and receipts on the fallback's own
@@ -5963,6 +6384,7 @@ bus.subscribe((event: RuntimeEvent) => {
           input: tokens?.input,
           output: tokens?.output,
           cachedInput: tokens?.cachedInput,
+          contextWindow: lastReported?.contextWindow,
           costUsd: event.cost ?? null,
           billingMode: event.billingMode,
           // No live entry (a repeated completion, a turn from before a
@@ -6017,6 +6439,8 @@ bus.subscribe((event: RuntimeEvent) => {
           latencyMs: settledOwner?.latencyMs,
           success: event.ok !== false,
           promptBytes,
+          childSessionId: turnChildSessionId,
+          turnStartedAtMs,
         });
         // settled → idle; a setup failure already marked it dead, keep that
         if (store.bot(bot.id)?.activity !== "dead") store.setActivity(bot.id, "idle");
@@ -6081,6 +6505,8 @@ bus.subscribe((event: RuntimeEvent) => {
             promptBytes,
             roomId: group.id,
             roomName: group.name,
+            childSessionId: turnChildSessionId,
+            turnStartedAtMs,
           });
           store.addRoomUsage(roomBot.id, actualSelection.instanceId, {
             input: tokens?.input,
@@ -6194,6 +6620,7 @@ async function autoFallbackChain(
       priority: AUTO_FALLBACK_PRIORITY,
       isCooling: (candidateBotId, instanceId, model) =>
         Boolean(quotaCooldowns.get(candidateBotId, instanceId, model)) ||
+        Boolean(transientRouteHealth.get(instanceId, model)) ||
         modelRejections.isRejected(candidateBotId, instanceId, model),
     });
   } catch (error) {
@@ -6245,7 +6672,7 @@ bus.subscribe((event: RuntimeEvent) => {
     if (event.arguments != null && title) key = callKey(title, event.arguments);
     // A title with more than a bare identifier is a call with arguments
     // (ACP: "echo hi", "Read src/x.ts"); a bare "Bash" is not countable.
-    else if (/\s|\//.test(title)) key = callKey("tool", title);
+    else key = titleCallKey(title);
   } else if (event.type === "request.opened" && event.requestType === "permission") key = callKey(event.tool, event.summary);
   if (!key) return;
   const { threshold } = repeats.record(event.threadId, key);
@@ -6359,7 +6786,7 @@ bus.subscribe((event: RuntimeEvent) => {
 function drainRoomQueue() {
   // Held for an update, like the steer queue: released or carried, never
   // started into a fence that would refuse it.
-  if (updateDrain.active || runtimeQuiescing) return;
+  if (placementRollbackReadOnly || updateDrain.active || runtimeQuiescing) return;
   drainRoomRounds(store, Date.now(), (round) => {
     credentialPendingRoomRounds.delete(`${round.groupId}:${round.threadId}:${round.botId}`);
     // The drained round runs on the room's operation queue, behind any
@@ -6409,6 +6836,76 @@ function drainRoomQueue() {
  *  back off the drained batch's `queueId`s so a batch that mixes relayed and
  *  typed text runs unattended — the conservative reading. */
 const relayQueuedMessageIds = new Set<string>();
+
+/** The steer queue lives in memory, so a crash or kill between accepting a
+ *  queued send and draining it would lose the user's words.  Every change to
+ *  the queue is therefore written to a small journal (steer-queue-journal.json
+ *  in the data directory), and the entries a previous run left are put back at
+ *  boot through the same path an update's held sends take, so the age rule and
+ *  the in-thread notice for a too-old send apply to them too. */
+let unrestoredQueueJournal: HeldQueueEntry[] = placementRollbackReadOnly
+  ? []
+  : readQueueJournal(DATA_DIR, (line) => console.warn(line));
+/** When each live queued send was first journaled, so rewriting the journal
+ *  never makes an old send look new to the age rule. */
+const queuedFirstSeen = new Map<string, number>();
+
+function steerJournalEntries(): HeldQueueEntry[] {
+  const now = Date.now();
+  const live = snapshotSteerQueue().map((entry): HeldQueueEntry => {
+    let heldAt = now;
+    const items = entry.items.map((item): HeldQueueEntry["items"][number] => {
+      const seen = queuedFirstSeen.get(item.messageId) ?? now;
+      queuedFirstSeen.set(item.messageId, seen);
+      heldAt = Math.min(heldAt, item.committed ? item.committed.heldAt : seen);
+      const held: HeldQueueEntry["items"][number] = {
+        messageId: item.messageId,
+        text: item.text,
+        prompt: item.prompt,
+        relayed: item.committed ? item.committed.relayed : Boolean(item.relayed) || relayQueuedMessageIds.has(item.messageId),
+      };
+      if (item.replyToId) held.replyToId = item.replyToId;
+      if (item.linqChatId) held.linqChatId = item.linqChatId;
+      if (item.automationSource) held.automationSource = item.automationSource;
+      if (item.committed) held.committed = { ...item.committed, excludeIds: [...item.committed.excludeIds] };
+      return held;
+    });
+    return { botId: entry.botId, threadId: entry.threadId, heldAt, items };
+  });
+  const liveIds = new Set(live.flatMap((entry) => entry.items.map((item) => item.messageId)));
+  for (const id of queuedFirstSeen.keys()) if (!liveIds.has(id)) queuedFirstSeen.delete(id);
+  return [...live, ...unrestoredQueueJournal];
+}
+
+/** Why the last journal write failed, or null when it succeeded.  A queued
+ *  send is only acknowledged while this is null: a send the journal could not
+ *  save is refused, not accepted into a memory-only queue. */
+let steerJournalFailure: string | null = null;
+function writeSteerJournal() {
+  if (placementRollbackReadOnly) return;
+  const failure = writeQueueJournal(DATA_DIR, steerJournalEntries());
+  // Only the error code is logged: nothing a user wrote ever reaches a log line.
+  // SAFETY: the journal writer only reports fs errors, which carry an optional string code.
+  steerJournalFailure = failure ? ((failure as NodeJS.ErrnoException).code ?? failure.name) : null;
+  if (failure) console.warn(`[steer-queue] could not write the crash journal (${steerJournalFailure})`);
+}
+setSteerQueueObserver(writeSteerJournal);
+
+/** What the last run's journal still holds that is not already running or
+ *  carried: a send that was drained into its thread before the journal caught
+ *  up (its `queueId` is on a transcript line), or that an update carried, is
+ *  dropped here so nothing runs twice. */
+function takeRecoveredQueueJournal(carried: HeldWork): HeldQueueEntry[] {
+  const carriedIds = carriedWorkIds(carried);
+  const recovered: HeldQueueEntry[] = [];
+  for (const entry of unrestoredQueueJournal) {
+    const inThread = new Set(store.messagesFor(entry.threadId).flatMap((message) => (message.queueId ? [message.queueId] : [])));
+    const items = entry.items.filter((item) => journalItemStillOwed(item, carriedIds, inThread, (messageId) => store.hasMessage(entry.threadId, messageId)));
+    if (items.length > 0) recovered.push({ ...entry, items });
+  }
+  unrestoredQueueJournal = [];
+  return recovered;
+}
 
 /** Whether a drained batch carried any relayed line, consuming the marks.
  *  Read back off the transcript lines drain just appended (their `queueId`). */
@@ -6472,7 +6969,7 @@ function drainQueuedSends() {
   // new work, so it stays queued.  It is either released (`releaseHeldWork`)
   // or carried across the restart (`persistHeldWork`) —
   // never started into a fence that would refuse it.
-  if (!updateDrain.active && !runtimeQuiescing) {
+  if (!placementRollbackReadOnly && !updateDrain.active && !runtimeQuiescing) {
     drainSteeredMessages(store, (botId, threadId, prompt, userMessage, excludeIds, linqChatId, carried) =>
       runQueuedSend(
         {
@@ -6595,7 +7092,7 @@ function restoreHeldWork(work: HeldWork, context: string) {
   const pending: Array<{ heldAt: number; entry: SteerQueueSnapshot }> = [];
   for (const send of sends.run) {
     if (!store.bot(send.botId)) continue;
-    if (!store.messagesFor(send.threadId).some((message) => message.id === send.userMessageId)) {
+    if (!store.hasMessage(send.threadId, send.userMessageId)) {
       console.log(`[${context}] held message for bot ${send.botId} is no longer in its thread; nothing to run`);
       continue;
     }
@@ -6604,6 +7101,9 @@ function restoreHeldWork(work: HeldWork, context: string) {
   for (const entry of queued.run) {
     if (!store.bot(entry.botId)) continue;
     for (const item of entry.items) if (item.relayed && !item.committed) relayQueuedMessageIds.add(item.messageId);
+    // Keep the send's true age: without this the next journal rewrite would
+    // treat every restored send as first seen now and reset its clock.
+    seedQueuedFirstSeen(queuedFirstSeen, [entry]);
     pending.push({
       heldAt: entry.heldAt,
       entry: {
@@ -6613,6 +7113,7 @@ function restoreHeldWork(work: HeldWork, context: string) {
           const restored: SteerQueueSnapshot["items"][number] = { messageId: item.messageId, text: item.text, prompt: item.prompt };
           if (item.replyToId) restored.replyToId = item.replyToId;
           if (item.linqChatId) restored.linqChatId = item.linqChatId;
+          if (item.relayed && !item.committed) restored.relayed = true;
           if (item.automationSource) {
             // SAFETY: the carrier only ever holds what `persistHeldWork` copied
             // out of a steer-queue item, whose automationSource is this type.
@@ -6710,6 +7211,7 @@ async function startTurn(
     command?: EngineCommandRun;
   },
 ) {
+  if (placementRollbackReadOnly) throw Object.assign(new Error(PLACEMENT_ROLLBACK_REFUSAL), { status: 503 });
   if (runtimeQuiescing) {
     throw Object.assign(new Error("BotFleet is quiescing for an update"), { status: 503 });
   }
@@ -6833,7 +7335,7 @@ async function startTurn(
             modelId,
           )
       : undefined,
-    isCooling: (instanceId, model) => Boolean(quotaCooldowns.get(bot.id, instanceId, model)),
+    isCooling: (instanceId, model) => Boolean(quotaCooldowns.get(bot.id, instanceId, model)) || Boolean(transientRouteHealth.get(instanceId, model)),
   });
   // The engine this turn will run on, not merely the one the selection names —
   // see `executionInstanceFor`. Asking the credential gate about a Box-backed
@@ -7409,7 +7911,7 @@ async function startTurn(
                 (availableAgentTools.includes("assignment_status")
                   ? ", and assignment_status reads a handoff without waiting."
                   : "."),
-              "Never dismiss incoming alerts, webhook notifications, or tasks by merely claiming 'not my problem'.  When an issue, error, or notification falls outside your domain or expertise, identify the specialist bot best suited to solve it (e.g. Compiler for build/typecheck errors, Deployer for PRs/merges, Fixer for bug fixes/tests, Plumber for infra/secrets/health, Housekeeper for disk/workspace maintenance, Builder for features) and forward the alert with a clear summary using coordinate_bots rather than stopping without action.",
+              "Never dismiss incoming alerts, webhook notifications, or tasks by merely claiming 'not my problem'.  When an issue, error, or notification falls outside your domain or expertise, identify the specialist bot best suited to solve it (e.g. Compiler for build/typecheck errors, Deployer for PRs/merges, Fixer for bug fixes/tests, Plumber for infra/secrets/health, Housekeeper for disk/workspace maintenance, Engineer for features, Trader for trading performance and trade questions:  it monitors trading performance and answers trade questions; it does not trade) and forward the alert with a clear summary using coordinate_bots rather than stopping without action.",
             ].join(" ")
           : "";
       const credentialPrompt = credentialPromptFor(availableAgentTools) + signInPromptFor(availableAgentTools);
@@ -7504,8 +8006,8 @@ async function startTurn(
           ? { localComputer: hasHostComputer, workspace: worksInWorkspace }
           : { ...integrations, localComputer: hasHostComputer, workspace: worksInWorkspace, recall: hasRecall, phone: hasPhone, linq: hasLinq, jobs: jobsForTurn, zulip: zulipMounted },
         oneShot
-          ? { chiefOfStaff: false }
-          : { chiefOfStaff: Boolean(bot.chiefOfStaff), linq: hasLinq },
+          ? { chiefOfStaff: false, toolResultArchive: usesDriverToolLoop }
+          : { chiefOfStaff: Boolean(bot.chiefOfStaff), linq: hasLinq, toolResultArchive: usesDriverToolLoop },
       );
       const httpToolPrompt = usesDriverToolLoop
         ? httpCatalogPromptFor(
@@ -7553,7 +8055,7 @@ async function startTurn(
                 : opts?.automationSource === "schedule"
                   ? scheduleAutomationNote(zulipMounted, oneShot)
                   : "";
-      const prompt = buildSystemPrompt(oneShot ? ephemeralPromptSections({ persona, automationNote }) : [
+      let prompt = buildSystemPrompt(oneShot ? ephemeralPromptSections({ persona, automationNote }) : [
         { id: "persona", label: "Identity", text: persona },
         ...(fleetSeat ? [{ id: "fleet-seat", label: "Fleet seat", text: fleetSeat.text }] : []),
         { id: "voice-summary", label: "Speech-friendly summaries", text: cfg.tts?.optimizedSummary ? VOICE_SUMMARY_PROMPT : "" },
@@ -7641,6 +8143,43 @@ async function startTurn(
             : "",
         },
       ]);
+      // Webhook and schedule wakes keep a byte-identical prefix: standing
+      // system sections, then tool schemas, then saved instructions.  The
+      // per-wake tail (timestamps, payloads, run ids) follows that prefix.
+      const cacheFriendlyWake =
+        (opts?.automationSource === "webhook" || opts?.automationSource === "schedule") &&
+        opts?.command === undefined &&
+        !oneShot;
+      let wakeUserText = turnText;
+      let wakeRecoveryText = recoveryText;
+      let wakeHoisted = false;
+      if (cacheFriendlyWake) {
+        const arranged = arrangeUnattendedWakePrompt({
+          sections: prompt.sections,
+          toolSchemas: turnTools.map((tool) => ({
+            name: tool.name,
+            description: tool.description,
+            parameters: tool.parameters,
+          })),
+          wakeText: turnText,
+          // HTTP tool-loop drivers cache the catalog in the prefix.  CLI
+          // lanes discover tools at runtime and must not get a second copy.
+          inlineToolSchemas: usesDriverToolLoop,
+        });
+        prompt = {
+          text: arranged.system,
+          stable: arranged.systemStable,
+          volatile: arranged.systemVolatile,
+          volatileDigest: arranged.volatileDigest,
+          sections: arranged.sections,
+          bytes: arranged.bytes,
+        };
+        wakeUserText = arranged.userText;
+        wakeHoisted = arranged.hoisted;
+        if (recoveryText !== undefined && turnText.length > 0 && recoveryText.endsWith(turnText)) {
+          wakeRecoveryText = recoveryText.slice(0, recoveryText.length - turnText.length) + arranged.userText;
+        }
+      }
       turnPromptBytes.set(threadId, prompt.bytes);
       // Where a turn's context-injection records go: a `context.injected` event
       // for the Trajectory, and a short list on the message the chat hangs the
@@ -7679,6 +8218,22 @@ async function startTurn(
       // A command takes nothing in front of it, so the notices wait for the next turn.
       const jobReminder = opts?.command ? { text: "", items: [] } : jobTurnReminder(bot.id, threadId, jobsMounted);
       jobNoticeItems = jobReminder.items;
+      // A job reminder names live jobs, so it is volatile.  On a wake whose
+      // user text is still the saved routine, it follows that text.  A hoisted
+      // wake's user text is already the per-wake tail, and the reminder stays
+      // in front of that tail.  A payload-only webhook is not hoisted, and
+      // the reminder stays in front of that untrusted body too.
+      const remindedWakeText = (body: string): string => {
+        if (!jobReminder.text) return body;
+        // Saved standing text is stable, so a live job reminder follows it.
+        // Every other turn keeps the reminder in front, including a hoisted
+        // wake whose body is already the volatile tail, and a webhook whose
+        // body is a payload-derived task or untrusted event block.
+        if (cacheFriendlyWake && !wakeHoisted && unattendedCurrentWakeIsStandingText(body)) {
+          return `${body}\n\n${jobReminder.text}`;
+        }
+        return `${jobReminder.text}\n\n${body}`;
+      };
       // The replayed-history cap and the model-written summary toggle.
       // Only a driver that budgets the prompt (ACP) honours them; the
       // rest ignore what they do not know.
@@ -7692,7 +8247,7 @@ async function startTurn(
       if (bot.historySummaryModel === true) historySettings.historySummaryModel = true;
       const turnInput = {
         threadId,
-        text: jobReminder.text ? `${jobReminder.text}\n\n${turnText}` : turnText,
+        text: remindedWakeText(wakeUserText),
         model,
         effort,
         // Only a cap this model's row offers reaches a driver; a stale value
@@ -7716,7 +8271,7 @@ async function startTurn(
         // the active task's own session — another task's cursor would
         // resume the wrong conversation and defeat the context bubble
         resumeCursor: resume ? task.resumeCursors[instanceId] : undefined,
-        recoveryText: recoveryText !== undefined && jobReminder.text ? `${jobReminder.text}\n\n${recoveryText}` : recoveryText,
+        recoveryText: wakeRecoveryText !== undefined ? remindedWakeText(wakeRecoveryText) : undefined,
         ...(recoveryText !== undefined && recoveryText !== turnText ? { recoveryIsReplay: true } : {}),
         ...historySettings,
         // A driver whose provider lost its session sends `recoveryText` in place
@@ -7795,6 +8350,7 @@ async function startTurn(
               // the chiefOfStaff check both live there), independent of
               // whatever the model was actually offered this turn.
               chiefOfStaff: Boolean(bot.chiefOfStaff),
+              toolResultArchive: true,
               // The same `jobsForTurn` the catalog above was built from.
               jobs: jobsForTurn
                 ? { registry: jobRegistry, onComplete: "wake", wakes: jobSettings().wake, maxWaitSeconds: JOB_OUTPUT_WAIT_MAX_SECONDS_HTTP }
@@ -7986,8 +8542,20 @@ let webhookEphemeralSource: ((webhookId: string) => {
   name: string;
   prompt: string;
 } | undefined) | undefined;
+const webhookRequestLog = createRequestLog({
+  filePath: process.env.BOTFLEET_REQUEST_LOG_PATH ?? join(DATA_DIR, "github-request-log.md"),
+  spoolPath: join(DATA_DIR, "github-request-log.spool"),
+  cursorPath: join(DATA_DIR, "github-request-log.cursor"),
+  // Stable record identifier avoids reading the later-created manager.
+  onError: (message) => console.warn(`[github-request-log] ${message}`),
+});
+webhookRequestLog.replay();
 routines = new RoutineManager({
-  emit: broadcast,
+  passive: placementRollbackReadOnly,
+  emit: (event) => {
+    webhookRequestLog.routineSubscriber(event);
+    broadcast(event);
+  },
   timeZone: routineTimeZone,
   incapableRun: routineIncapableForRun,
   // A restore route sets providerConfigBusy before its first await.  Keep
@@ -7995,7 +8563,7 @@ routines = new RoutineManager({
   // then tick them after the authenticated credential has landed.
   // An update drain holds every run here too: routine, webhook and resource
   // receipts stay `queued` in routines.json, which a restart keeps as-is.
-  admit: () => !runtimeQuiescing && !providerConfigBusy && !updateDrain.active,
+  admit: () => !placementRollbackReadOnly && !runtimeQuiescing && !providerConfigBusy && !updateDrain.active,
   // Defer new webhook wakes while the host is hot, and say so on the
   // receipt.  The probe is the jobs admission swap cache (non-blocking)
   // plus the ACP init load reading.  Resource wakes are not shed: that is
@@ -8173,7 +8741,10 @@ routines = new RoutineManager({
   },
   checkInStart: checkInRoutineStart,
   checkInFinish: checkInRoutineFinish,
+  releaseMonitor: releaseRoutineMonitor,
 });
+// Catch up retained durable receipts after restart; delivery IDs deduplicate states.
+for (const run of routines.listRuns()) webhookRequestLog.routineSubscriber({ kind: "routine.run", run });
 const recoveryOwners = routines.routineRequestReceiptOwners();
 if (recoveryOwners.length > 0) {
   // A normal launch has no crash-gap receipts, so it must not eagerly load
@@ -8352,7 +8923,10 @@ function resolveAndSendRoutine(
 // delivery joins the same RoutineManager queue. That keeps unattended work
 // ordered behind a busy bot and gives webhook runs the same durable receipts.
 const webhooks = new WebhookManager({
-  emit: broadcast,
+  emit: (event) => {
+    webhookRequestLog.subscriber(event);
+    broadcast(event);
+  },
   botState: (botId) => {
     const bot = store.bot(botId);
     return !bot ? "missing" : botIsOff(bot) ? "off" : bot.busy ? "busy" : "ready";
@@ -8364,6 +8938,14 @@ const webhooks = new WebhookManager({
   enqueue: (input) => routines!.enqueueWebhook(input),
   cancelQueued: (webhookId, message) => routines!.cancelQueuedWebhook(webhookId, message),
   pendingRuns: (webhookId) => routines!.activeWebhookRunCount(webhookId),
+  canCoalesce: (webhookId, botId) => routines!.canCoalesceWebhook(webhookId, botId),
+  runStatus: (runId) => routines!.runStatus(runId),
+  // Live read so an Infisical refresh applies on the next delivery, with 120 seconds when the knob is absent.
+  payloadDedupeWindowMs: () => {
+    const seconds = cfg.jobs?.webhookPayloadDedupeSeconds;
+    if (seconds === undefined || !Number.isFinite(seconds) || seconds < 0) return DEFAULT_WEBHOOK_PAYLOAD_DEDUPE_MS;
+    return seconds * 1000;
+  },
 });
 webhookEphemeralSource = (webhookId) => {
   const hook = webhooks.list().find((candidate) => candidate.id === webhookId);
@@ -8372,7 +8954,6 @@ webhookEphemeralSource = (webhookId) => {
 };
 
 let webhookIngress: WebhookIngress | null = null;
-let webhookIngressError: string | null = null;
 try {
   webhookIngress = await listenWebhookIngress(webhooks, {
     port: WEBHOOK_PORT,
@@ -8393,6 +8974,18 @@ try {
           }),
         deferAdmission: true,
       },
+      "/hooks/github-request-log": {
+        // Stable non-secret endpoint: X-Hub-Signature-256 HMAC verified
+        // before admission, fail-closed when unconfigured.  Records only -
+        // deliveries here never dispatch and never reach a bot prompt.
+        handler: (req, res) =>
+          readGitHubRequestLog(req, res, {
+            requestLog: webhookRequestLog,
+            secretProvider: () => loadConfig().githubRequestLog?.webhookSecret?.trim() || undefined,
+            beginAdmission: beginUpdateAdmission,
+          }),
+        deferAdmission: true,
+      },
     },
   });
   console.log(`botfleet webhook receiver on ${webhookIngress.baseUrl}`);
@@ -8407,7 +9000,11 @@ try {
 
 const webhookIngressStatus = () => ({
   available: Boolean(webhookIngress),
-  baseUrl: publicIngressUrlEffective(cfg) || webhookIngress?.baseUrl || `http://127.0.0.1:${WEBHOOK_PORT}`,
+  baseUrl:
+    webhookPublicIngressUrlEffective(cfg) ||
+    publicIngressUrlEffective(cfg) ||
+    webhookIngress?.baseUrl ||
+    `http://127.0.0.1:${WEBHOOK_PORT}`,
   ...(webhookIngressError ? { error: webhookIngressError } : {}),
 });
 
@@ -8503,7 +9100,7 @@ async function probeIngressUrl(raw: string): Promise<IngressProbeResult> {
     try {
       response = await fetch(parsed.toString(), {
         method: "GET",
-        redirect: "follow",
+        redirect: parsed.pathname === "/hooks/wh_probe/x" ? "manual" : "follow",
         signal: controller.signal,
         headers: { "user-agent": INGRESS_PROBE_USER_AGENT },
       });
@@ -8571,6 +9168,28 @@ async function probeIngressUrl(raw: string): Promise<IngressProbeResult> {
         };
       }
     }
+    if (parsed.pathname === "/hooks/wh_probe/x") {
+      if (status === 302 || status === 403) {
+        const out: IngressProbeResult = {
+          ok: false,
+          url: raw,
+          resolved: true,
+          reason: "The public URL is protected by Cloudflare Access and external webhooks cannot reach it.",
+        };
+        if (tunnel) out.tunnel = tunnel;
+        return out;
+      }
+      if (status === 401) {
+        const out: IngressProbeResult = {
+          ok: true,
+          url: raw,
+          resolved: true,
+          reason: "BotFleet webhook receiver is reachable.",
+        };
+        if (tunnel) out.tunnel = tunnel;
+        return out;
+      }
+    }
     const head = tunnel
       ? `${tunnel === "cloudflare" ? "Cloudflare" : tunnel.charAt(0).toUpperCase() + tunnel.slice(1)} answered with HTTP ${status}.`
       : `The server answered with HTTP ${status}.`;
@@ -8588,7 +9207,7 @@ async function probeIngressUrl(raw: string): Promise<IngressProbeResult> {
 
 const resourceTriggers = new ResourceTriggerManager({
   emit: broadcast,
-  admit: () => !runtimeQuiescing,
+  admit: () => !placementRollbackReadOnly && !runtimeQuiescing,
   botState: (botId) => {
     const bot = store.bot(botId);
     return !bot ? "missing" : botIsOff(bot) ? "off" : bot.busy ? "busy" : "ready";
@@ -9006,6 +9625,9 @@ export async function executeRoutineRequestRequest(input: {
 
 // Handoffs a previous process queued, and turns a restart cut, live in
 // runtime.db.  Open reconciles them, then the legacy queue is imported once.
+// Passive rollback must not open runtime.db or boot its queued dispatcher:
+// a refused startTurn would otherwise settle retained assignments as failed.
+if (!placementRollbackReadOnly) {
 jobHost = createJobHost({
   store,
   commsBus,
@@ -9032,6 +9654,7 @@ jobHost = createJobHost({
   },
 });
 jobHost.boot();
+}
 
 // Auto-resume only when a previous process died mid-turn.  An external-only
 // custom credential can arrive after the standalone harness starts; keep that
@@ -9406,6 +10029,7 @@ async function runGroupMemberTurn(
   // it has its own dispatch path and its own `sendTurn` call).
   toolPolicy?: ToolPolicy,
 ): Promise<boolean> {
+  if (placementRollbackReadOnly) return false;
   if (isCancelled?.()) return false;
   const group = store.group(groupId);
   const bot = store.bot(botId);
@@ -9969,7 +10593,7 @@ async function runGroupMemberTurn(
             phone: hasRoomPhone,
             jobs: roomJobs,
           },
-          { chiefOfStaff: Boolean(bot.chiefOfStaff) },
+          { chiefOfStaff: Boolean(bot.chiefOfStaff), toolResultArchive: true },
         )
       : [];
   // `commsDepth: hop` — the room's own hop, not zero.  The catalog above
@@ -9993,6 +10617,7 @@ async function runGroupMemberTurn(
           confinement: confinementForRoom,
           cwd: cwd ?? bot.cwd ?? undefined,
           chiefOfStaff: Boolean(bot.chiefOfStaff),
+          toolResultArchive: true,
           jobs: roomJobs
             ? { registry: jobRegistry, onComplete: "notice", maxWaitSeconds: JOB_OUTPUT_WAIT_MAX_SECONDS_HTTP }
             : undefined,
@@ -10419,6 +11044,7 @@ function markConnectorResumeFailed(threadId: string, resumeKey: string, error: s
 }
 
 function dispatchConnectorResume(entry: { botId: string; threadId: string; resumeKey: string; labels: string[] }) {
+  if (placementRollbackReadOnly) return;
   const owner = connectorThread(entry.botId, entry.threadId);
   if (!owner) return;
   if (providerReloadInProgress) {
@@ -10489,6 +11115,7 @@ function dispatchConnectorResume(entry: { botId: string; threadId: string; resum
 }
 
 function maybeResumeConnectors(botId: string, threadId: string, resumeKey: string) {
+  if (placementRollbackReadOnly) return false;
   const cards = connectorCards(threadId, resumeKey);
   if (!cards.length || cards.some((message) => message.connector?.dismissed || message.connector?.status !== "connected")) return false;
   if (cards.every((message) => message.connector?.resumed)) return true;
@@ -10501,6 +11128,7 @@ function maybeResumeConnectors(botId: string, threadId: string, resumeKey: strin
 }
 
 function drainConnectorResumes() {
+  if (placementRollbackReadOnly) return;
   for (const [key, entry] of pendingConnectorResumes) {
     if (store.bot(entry.botId)?.busy) continue;
     pendingConnectorResumes.delete(key);
@@ -10943,6 +11571,15 @@ function secretFieldRows() {
   });
 }
 
+function infisicalCredentialPending(): boolean {
+  const settings = infisicalSettings(cfg);
+  if (!settings.enabled || settings.configurationError) return false;
+  if (settings.authMethod === "machine-identity") return workspaceCredentialPending(cfg, "infisicalClientSecret");
+  const dedicatedSource = settings.readSources.some((source) => source.projectId === settings.projectId &&
+    source.environment === settings.environment && source.secretPath === settings.secretPath);
+  return !dedicatedSource && workspaceCredentialPending(cfg, "infisicalReadToken");
+}
+
 function configStatus() {
   const diagnostics = observability.getStatus();
   const vault = infisical.getStatus();
@@ -11125,9 +11762,13 @@ function configStatus() {
     infisical: {
       configured: vault.configured,
       enabled: vault.enabled,
+      enabledSetting: vault.enabledSetting,
+      authMethod: vault.authMethod,
       writeThrough: vault.writeThrough,
       environment: vault.environment,
       hasClientSecret: vault.hasClientSecret,
+      hasToken: vault.hasToken,
+      hasWriteToken: vault.hasWriteToken,
       managedCount: vault.appliedCount,
       lastSyncAt: vault.lastSyncAt,
       stale: vault.stale,
@@ -11155,66 +11796,6 @@ function configStatus() {
       summarizeToolCalls: summarizeToolCallsEnabled(cfg),
     },
   };
-}
-
-/** The rebuild currently running, if any.  Every caller queues behind it.
- *
- * The sequence below is `detachAll` -> `disposeAll` -> `load` -> `attach`, and
- * two of those overlapping is the worst outcome available: one run's `load`
- * repopulates the registry while the other's `disposeAll` empties it, leaving
- * instances registered but disposed, or the bus attached to a torn-down fleet.
- * `providerConfigBusy` fences the two Settings routes, but not the secret
- * paths — `POST /api/infisical/sync` and a late `onApplied` both reach here on
- * their own — so the guarantee lives here, where the sequence does.
- *
- * Queued, not coalesced: a caller that arrives mid-run gets its OWN rebuild
- * afterwards.  Handing it the run already in flight would be cheaper and
- * wrong — that run read `cfg` before this caller changed it. */
-let providerReloadChain: Promise<void> = Promise.resolve();
-let pendingProviderReloads = 0;
-let providerReloadInProgress = false;
-let providerReloadGeneration = 0;
-
-async function waitForProviderReloads(): Promise<void> {
-  while (providerReloadInProgress) await providerReloadChain;
-}
-
-function finishProviderReloadMutation(): void {
-  providerReloadGeneration += 1;
-  pendingProviderReloads -= 1;
-  if (pendingProviderReloads !== 0) return;
-  providerReloadInProgress = false;
-  // Success and failure both lower the global fence.  Unaffected engines can
-  // accept deferred work after a failed mutation, and the original rejection
-  // still reaches its settings caller through serializeProviderReload.
-  drainProviderReloadContinuations();
-}
-
-function serializeProviderReload(runProviderMutation: () => Promise<void>): Promise<void> {
-  pendingProviderReloads += 1;
-  // Fence dispatch as soon as a mutation is queued, including the gap
-  // between two serialized reloads.  Otherwise the first run's drain can
-  // start work that the already-queued second run immediately disposes.
-  providerReloadInProgress = true;
-  const run = providerReloadChain.then(runProviderMutation, runProviderMutation);
-  const settled = run.then(
-    () => finishProviderReloadMutation(),
-    (error) => {
-      finishProviderReloadMutation();
-      throw error;
-    },
-  );
-  // The chain itself must never reject, or every later caller inherits the
-  // failure; the run each caller awaits still rejects normally.
-  providerReloadChain = settled.catch(() => {});
-  return settled;
-}
-
-/** Rebuild the provider fleet after a config change so new keys take
- * effect without a server restart (kills any in-flight turns).  Serialized:
- * see `providerReloadChain`. */
-function reloadProviders(): Promise<void> {
-  return serializeProviderReload(runProviderReload);
 }
 
 const RELOAD_REASON = "The turn was interrupted — provider settings changed";
@@ -11943,8 +12524,12 @@ function currentRuntimeReadiness(ownAdmissionActive = false, allowCredentialQueu
  *  what the updater tells a person it is waiting for. */
 function drainRuntimeReadiness() {
   const counts = runtimeWorkCounts();
+  // The queued runs are discounted with the same filter the runtime count
+  // uses, so the discount can never be bigger than the count it is taken
+  // from:  a queued run for a bot that is switched Off is in neither, because
+  // it will be dropped or refused, never run.
   const queuedRoutineRuns = bootComplete
-    ? routines?.listRuns().filter((run) => run.status === "queued").length ?? 0
+    ? routineRunCounts(routines?.listRuns() ?? [], { allowCredentialQueues: false, isBotOff: botIsOffId }).queued
     : 0;
   return {
     ...runtimeReadiness(inFlightCounts(counts, { queuedRoutineRuns })),
@@ -12051,10 +12636,10 @@ function runtimeWorkCounts(ownAdmissionActive = false, allowCredentialQueues = f
     localVmChanges: Number(localVmImageBusy) + Number(localVmProvisionBusy) + Number(localVmModeChangeBusy),
     restores: checkpointRestoreLeases.size,
     reloads: pendingProviderReloads + Number(providerConfigBusy),
-    routineRuns: routines?.listRuns().filter((run) =>
-      (allowCredentialQueues ? ["running", "waiting"] : ["queued", "running", "waiting"]).includes(run.status)
-      && !(run.status === "queued" && botIsOffId(run.botId))
-    ).length ?? 0,
+    routineRuns: routineRunCounts(routines?.listRuns() ?? [], {
+      allowCredentialQueues,
+      isBotOff: botIsOffId,
+    }).inFlight,
   };
 }
 
@@ -12130,18 +12715,174 @@ function blockingWorkLabel(kind: string): string {
  * "2 active operation(s) must finish before the server can stop" with nothing
  * in between to explain the contradiction.  Naming the kinds closes that gap.
  */
-function blockingWorkBreakdown(ownAdmissionActive: boolean): { count: number; label: string }[] {
-  const counts = runtimeWorkCounts(ownAdmissionActive);
+function blockingWorkBreakdown(ownAdmissionActive: boolean, ownControlLock = false): { count: number; label: string }[] {
+  const counts = withoutOwnControlLock(runtimeWorkCounts(ownAdmissionActive), ownControlLock);
   return Object.entries(counts)
     .filter(([, count]) => count > 0)
     .map(([kind, count]) => ({ count, label: blockingWorkLabel(kind) }));
+}
+
+/** The kinds of work a graceful stop can settle (BF-2536).
+ *
+ *  These are the kinds the bots themselves are doing, and every one of them
+ *  survives the shutdown in a way the owner can be told about:
+ *
+ *  - A bot turn is interrupted by the harness's own shutdown and recorded for
+ *    the next boot, so it resumes instead of being lost.
+ *  - A completion fold is the tail of a turn that has already written its
+ *    events, and those events are in the event log the shutdown flushes.
+ *  - A delegated task is held by the job registry, which is on disk.
+ *  - A connector or a secret resume is a card in the thread's transcript, so
+ *    the next boot finds the work the bot was waiting on.
+ *  - A routine run is held by the routines store:  a queued one runs at the
+ *    next boot, and a running one ends with its bot.
+ *
+ *  Everything else in flight is work the stop has no way to carry, and the
+ *  refusal is the safe answer for it:  an in-flight request, a file restore,
+ *  a provider reload, a VPS thread or mode change, a Local VM task or change,
+ *  and the server still starting.  A room turn is the one that matters most:
+ *  the shutdown deliberately skips a room turn, because a room turn cannot be
+ *  resumed without repeating it, so the work would be lost rather than
+ *  carried. */
+const GRACEFUL_STOP_SETTLED_KINDS = new Set([
+  "turns",
+  "completions",
+  "delegations",
+  "connectors",
+  "secrets",
+  "routineRuns",
+]);
+
+/** The work in flight for a graceful stop, by kind.
+ *
+ *  The drain's counts, because the work a graceful stop parks is held rather
+ *  than in flight (a queued message, a queued room round and a queued
+ *  routine run survive the restart or are carried across it), and less this
+ *  request's own admission, because the stop request is itself an admitted
+ *  request:  counting it would mean the work in flight never reached zero
+ *  and every stop would wait out the whole window.
+ *
+ *  Less this request's own control lock too, for the same reason:  the stop
+ *  takes that lock when it fences the server, and the lock is counted as a
+ *  Local VM change in flight.  It is the stop's own reservation, not work
+ *  the stop has to wait for. */
+function gracefulStopWorkCounts(ownAdmissionActive: boolean, ownControlLock = false): RuntimeWorkCounts {
+  const counts = runtimeWorkCounts(ownAdmissionActive);
+  // The queued runs are discounted with the same filter the runtime count
+  // uses, so the discount can never be bigger than the count it is taken
+  // from.  A queued run for a bot that is switched Off is in neither:  it
+  // will be dropped or refused, never run.  Discounting it anyway took more
+  // than the count held, and a routine run that really was running
+  // disappeared from the work in flight:  the wait ended early and the
+  // shutdown interrupted a run that was still going.
+  const queuedRoutineRuns = bootComplete
+    ? routineRunCounts(routines?.listRuns() ?? [], { allowCredentialQueues: false, isBotOff: botIsOffId }).queued
+    : 0;
+  return withoutOwnControlLock(inFlightCounts(counts, { queuedRoutineRuns }), ownControlLock);
+}
+
+/** Can the graceful stop settle the work that is in flight right now? */
+function gracefulStopAllowed(ownAdmissionActive: boolean, ownControlLock = false): boolean {
+  return Object.entries(gracefulStopWorkCounts(ownAdmissionActive, ownControlLock))
+    .every(([kind, count]) => count <= 0 || GRACEFUL_STOP_SETTLED_KINDS.has(kind));
+}
+
+/** The work in flight that a graceful stop cannot carry, by kind.
+ *
+ *  The kinds the stop can settle are not here:  they are what the stop is
+ *  for.  What is here is the work that would be lost rather than carried,
+ *  and it is why the server stays up. */
+function gracefulStopBlockers(ownAdmissionActive: boolean, ownControlLock = false): { count: number; label: string }[] {
+  return Object.entries(gracefulStopWorkCounts(ownAdmissionActive, ownControlLock))
+    .filter(([kind, count]) => count > 0 && !GRACEFUL_STOP_SETTLED_KINDS.has(kind))
+    .map(([kind, count]) => ({ count, label: blockingWorkLabel(kind) }));
+}
+
+/** Why the server stays up, when the work in flight cannot be carried.
+ *
+ *  The wording lives with the rest of the graceful stop, in
+ *  server/graceful-shutdown.ts, so it can be exercised without a server. */
+const gracefulStopRefusal = gracefulStopRefusalMessage;
+
+/** The work still in flight, by kind, for the graceful stop's report.
+ *
+ *  The bot turns are left out:  the report names the bots that are being
+ *  stopped one by one, and a count of the same bots under a second heading
+ *  reads as two different facts about one thing. */
+function inFlightWorkBreakdown(ownAdmissionActive: boolean, ownControlLock = false): { count: number; label: string }[] {
+  return Object.entries(gracefulStopWorkCounts(ownAdmissionActive, ownControlLock))
+    .filter(([kind, count]) => count > 0 && kind !== "turns")
+    .map(([kind, count]) => ({ count, label: blockingWorkLabel(kind) }));
+}
+
+/** How long a graceful stop waits for the work in flight to settle.
+ *
+ *  The stop's whole answer has to fit inside the clients' request budgets:
+ *  the native Mac app waits 30 seconds for this route, and a Local VM
+ *  container stop in the same request can take 10 of them, so the window
+ *  takes 10 and leaves the rest to the container.  It is enough for a turn
+ *  that is about to end to land, and for the report to tell a bot that
+ *  finished from one that was interrupted.
+ *
+ *  It is a bound and not a promise:  when it passes, the server shuts down
+ *  anyway and the report names what did not finish. */
+const GRACEFUL_STOP_DEADLINE_MS = 10_000;
+
+/** How often the graceful stop re-reads the count while it waits. */
+const GRACEFUL_STOP_POLL_MS = 250;
+
+/** Stop the bots that are working, the way the owner asked, and report it.
+ *
+ *  The bots are given a window to finish on their own.  The ones still
+ *  working when it closes are stopped by the shutdown that follows, which
+ *  interrupts them the way the harness always has and records them for the
+ *  next boot.  The messages queued behind them are carried across the
+ *  restart by the same carrier the update drain parks work in, so they run
+ *  the next time the harness comes up. */
+async function runGracefulStop(context: string, options: {
+  /** The stop request's own admission:  it is an admitted request itself. */
+  ownAdmissionActive: boolean;
+  /** Whether this request holds the control lock.  Its own reservation is
+   *  not work in flight, so it is discounted from the counts the wait
+   *  watches:  counting it would mean the count never reached zero and every
+   *  stop waited out the whole window. */
+  ownControlLock?: boolean;
+  /** Called when the stop fails, so the caller can put its fence back down.
+   *  A fence that stays up after a failure refuses every route of a server
+   *  that is still running. */
+  onFailure?(): void;
+}): Promise<GracefulStopReport> {
+  const { ownAdmissionActive, ownControlLock = false } = options;
+  const report = await gracefulStop({
+    busyBots: () => store.bots.filter((bot) => bot.busy).map((bot) => ({ id: bot.id, name: bot.name })),
+    activeWorkCount: () => runtimeReadiness(gracefulStopWorkCounts(ownAdmissionActive, ownControlLock)).activeWorkCount ?? 1,
+    blockingWork: () => inFlightWorkBreakdown(ownAdmissionActive, ownControlLock),
+    // The bots that are being stopped keep their queued sends uncommitted:
+    // their own turn resumes first at the next boot, and boot recovery reads
+    // the thread to find it.  Every other bot's sends are committed to their
+    // transcripts and run at that boot.
+    parkHeldWork: (interrupted) => {
+      const unsaved = persistHeldWork(context, interrupted);
+      if (unsaved.sends.length === 0 && unsaved.queued.length === 0 && unsaved.rooms.length === 0) return true;
+      // The queues were drained before the write, so the work that could not
+      // be saved is neither on disk nor in memory.  Put it back where it came
+      // from before the stop refuses, or the refusal itself is what loses the
+      // messages.  The update drain restores it the same way.
+      returnUnsavedWork(unsaved, context);
+      return false;
+    },
+    deadlineMs: GRACEFUL_STOP_DEADLINE_MS,
+    pollMs: GRACEFUL_STOP_POLL_MS,
+    onFailure: options.onFailure,
+  });
+  console.log(`[graceful-shutdown] ${describeGracefulStop(report)}`);
+  return report;
 }
 
 /** Whether the bot with this id is switched Off (a missing bot is not). */
 function botIsOffId(botId: string): boolean {
   return botIsOff(store.bot(botId));
 }
-
 /** A bot was just switched Off: settle what was waiting for it.
  *
  *  - Queued routine, webhook and resource receipts become `Skipped: this bot
@@ -12161,7 +12902,7 @@ function settleWorkForOffBot(botId: string): void {
 }
 
 function beginUpdateAdmission(): (() => void) | null {
-  if (runtimeQuiescing) return null;
+  if (placementRollbackReadOnly || runtimeQuiescing) return null;
   activeUpdateAdmissions += 1;
   let released = false;
   return () => {
@@ -12308,6 +13049,7 @@ function resumePausedWork(
   context: string,
   extra: { runs?: readonly RoutineRun[]; bots?: readonly InterruptedBotResumeEntry[] } = {},
 ): Promise<void> | null {
+  if (placementRollbackReadOnly) return null;
   const path = join(DATA_DIR, PENDING_RESUME_FILE);
   const saved = readResumeSnapshot();
   const paused = mergeResumeSnapshots(saved, extra.runs ?? [], extra.bots ?? []);
@@ -12318,7 +13060,9 @@ function resumePausedWork(
   for (const run of paused.interruptedRuns) {
     try {
       routines?.requeueRun(run.id);
-    } catch {}
+    } catch (error) {
+      console.error(`[resume] could not requeue interrupted routine run ${run.id}:`, error);
+    }
   }
   for (const { botId, threadId } of paused.interruptedBots) stoppedTurns.delete(`${botId}:${threadId}`);
   return resumeInterruptedChatTurns(paused.interruptedBots, context);
@@ -12495,6 +13239,7 @@ function releaseAfterDrain() {
  *  inside a route answers before the turns it lets loose start, and a no-op
  *  while something still holds them (the fence, or a drain). */
 function releaseHeldWork() {
+  if (placementRollbackReadOnly) return;
   queueMicrotask(() => {
     if (runtimeQuiescing || updateDrain.active) return;
     restoreHeldWork(takeHeldWork(DATA_DIR, (line) => console.warn(line)), "update-released");
@@ -12947,6 +13692,12 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     if (mutatingApiRequest && arrivedViaCloudflareTunnel(req)) {
       return json(res, 403, { error: NAMED_TUNNEL_MUTATION_FORBIDDEN });
     }
+    // A bridge offers diagnostics and an update check, but cannot install a
+    // replacement that would escape the immutable hold without artifact proof.
+    if (placementRollbackReadOnly && mutatingApiRequest && !path.startsWith("/api/placement/") &&
+        path !== "/api/runtime/quiesce" && path !== "/api/update/check") {
+      return json(res, 503, { error: PLACEMENT_ROLLBACK_REFUSAL });
+    }
     if (runtimeQuiescing && path.startsWith("/api/") && path !== "/api/runtime" && path !== "/api/runtime/quiesce" &&
         path !== "/api/health" && path !== "/api/update/status") {
       return json(res, 503, { error: controlShutdownPending ? "server shutdown is in progress" : "BotFleet is quiescing for an update" });
@@ -12958,7 +13709,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         : { error: UNSUPPORTED_JSON_BODY });
     }
     let ownAdmissionActive = false;
-    if (mutatingApiRequest) {
+    if (mutatingApiRequest && !placementRollbackReadOnly) {
       const releaseAdmission = beginUpdateAdmission();
       if (!releaseAdmission) return json(res, 503, { error: "BotFleet is quiescing for an update" });
       ownAdmissionActive = true;
@@ -13363,6 +14114,9 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
             if (!res.writableEnded) abort.abort();
           });
           const snapshot = () => computerControl.snapshot(botId);
+          // Resolved per call from the live cfg (the `computerCall` knobs),
+          // the same way `jobSettings()` reads `cfg.jobs` per use.
+          const callWaits = computerCallSettings(cfg);
           return json(res, 200, await waitForComputerCall({
             snapshot: () => {
               const current = snapshot();
@@ -13373,6 +14127,9 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
               };
             },
             signal: abort.signal,
+            waitMs: callWaits.waitMs,
+            actWithinMs: callWaits.actWithinMs,
+            personAwayMs: callWaits.personAwayMs,
           }));
         }
         if (method === "POST") {
@@ -14882,24 +15639,78 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (!isLoopbackAddress(req.socket.remoteAddress)) {
         return json(res, 403, { error: "forbidden: the harness can only be shut down from this computer" });
       }
-      const stopping = await requestHarnessShutdown({
-        stopLocalVm: async () => {
-          // Same lease check the Computer panel's own stop route makes.  The
-          // harness is about to go away either way, but yanking a VM out from
-          // under a bot mid-turn destroys work the person did not ask to lose,
-          // so a leased VM is left running and reported instead.  It will be
-          // reclaimed by the runtime's own idle reaper.
-          const owner = localVmLeaseFor(SHARED_LOCAL_VM_TARGET).current(localVmOwnerBusy);
-          if (owner) {
-            return { stopped: false, note: `the Local VM is in use by ${owner}; left running` };
-          }
-          await containerComputerAction("stop", undefined, undefined, SHARED_LOCAL_VM_TARGET);
-          localVmIdleFor(SHARED_LOCAL_VM_TARGET).cancel();
-          return { stopped: true };
-        },
-      });
-      if (!stopping.ok) return json(res, 500, { error: stopping.error });
-      return json(res, 200, { ok: true, detail: stopping.detail });
+      // The bots that are working are stopped before the server goes down, so
+      // a turn in flight ends the way the Stop button ends it instead of being
+      // cut in half by the exit (BF-2536).  The fence goes up first, so no new
+      // turn starts while they are being stopped.
+      //
+      // The work in flight has to be work the graceful stop can carry across
+      // the restart.  A room turn cannot:  the shutdown leaves a room turn
+      // alone, because a room turn cannot be resumed without repeating it.
+      const blockers = gracefulStopBlockers(ownAdmissionActive);
+      if (blockers.length) {
+        return json(res, 409, { ok: false, error: gracefulStopRefusal(blockers) });
+      }
+      cancelFenceLease();
+      controlShutdownPending = true;
+      runtimeQuiescing = true;
+      // The fence is up while the stop runs.  A failure that left it up would
+      // refuse every route of a server that is still running, so it comes
+      // back down before the error travels on.
+      const lowerTheFence = () => {
+        controlShutdownPending = false;
+        runtimeQuiescing = false;
+      };
+      try {
+        const report = await runGracefulStop("system-shutdown", {
+          ownAdmissionActive,
+          onFailure: lowerTheFence,
+        });
+        if (!report.ok) {
+          // The work could not be preserved, and it is still in memory, so the
+          // server stays up rather than losing it.
+          lowerTheFence();
+          // The work the park could not save is back in the queues, and the
+          // fence is down, so it runs:  a stop that refuses has to leave the
+          // server doing what it was doing.
+          drainQueuedSends();
+          return json(res, 409, { ok: false, error: report.refusal, report });
+        }
+        const stopping = await requestHarnessShutdown({
+          stopLocalVm: async () => {
+            // Same lease check the Computer panel's own stop route makes.  The
+            // harness is about to go away either way, but yanking a VM out from
+            // under a bot mid-turn destroys work the person did not ask to lose,
+            // so a leased VM is left running and reported instead.  It will be
+            // reclaimed by the runtime's own idle reaper.
+            const owner = localVmLeaseFor(SHARED_LOCAL_VM_TARGET).current(localVmOwnerBusy);
+            if (owner) {
+              return { stopped: false, note: `the Local VM is in use by ${owner}; left running` };
+            }
+            await containerComputerAction("stop", undefined, undefined, SHARED_LOCAL_VM_TARGET);
+            localVmIdleFor(SHARED_LOCAL_VM_TARGET).cancel();
+            return { stopped: true };
+          },
+          // Through the registered signal handler, so the queued event logs, the
+          // children and the stores receive the normal graceful drain.  A
+          // process.exit here skipped all of it, and a turn in flight was cut in
+          // half rather than recorded.
+          exit: () => process.kill(process.pid, "SIGTERM"),
+        });
+        if (!stopping.ok) {
+          // The marker could not be written, so the harness is not going down
+          // and the fence has to come back down with it:  a server that stays
+          // up and refuses every other route is worse than a server that stays
+          // up and serves them.
+          lowerTheFence();
+          return json(res, 500, { error: stopping.error });
+        }
+        return json(res, 200, { ok: true, detail: stopping.detail, report });
+      } catch (error) {
+        lowerTheFence();
+        console.error("[graceful-shutdown] the graceful stop failed", error);
+        return json(res, 500, { ok: false, error: "the graceful stop failed, so the server stays up" });
+      }
     }
     if (path === "/api/system/control" || path.startsWith("/api/system/control/")) {
       if (!isLoopbackAddress(req.socket.remoteAddress) || req.headers["x-botfleet-companion"] === "1") {
@@ -14909,6 +15720,10 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         return json(res, 415, { error: UNSUPPORTED_JSON_BODY });
       }
       let ownControlLock = false;
+      // A graceful stop is about to stop the bots that are working, so the
+      // "a bot is busy" half of the guard does not apply to it (BF-2536).
+      // Everything else the guard refuses on still does.
+      let ownGracefulStop = false;
       const control = createSystemControl({
         targets: () => localVmModeSwitchTargets(store.bots.map((bot) => bot.id)),
         status: (target) => containerComputerStatus(undefined, undefined, target),
@@ -14930,7 +15745,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
             ? store.bots.map((bot) => localVmLeaseFor(localVmTargetForBot(bot.id)).current(localVmOwnerBusy)?.botId).find(Boolean)
             : undefined),
         busy: () => runtimeFencing || updateDrain.active || (runtimeQuiescing && !controlShutdownPending)
-          || store.bots.some((bot) => bot.busy) || localVmActiveThreads.size > 0
+          || (store.bots.some((bot) => bot.busy) && !ownGracefulStop) || localVmActiveThreads.size > 0
           || localVmLifecycleBusy.size > 0 || localVmImageBusy || localVmProvisionBusy
           || (localVmModeChangeBusy && !ownControlLock),
         action: async (action, target) => {
@@ -14954,6 +15769,11 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       try {
         if (method === "GET" && path === "/api/system/control") {
           return json(res, 200, {
+            serverBuild: {
+              version: runtimeBuildIdentity.version,
+              build: runtimeBuildIdentity.build ?? null,
+              sourceCommit: runtimeBuildIdentity.sourceDirty ? null : runtimeBuildIdentity.sourceCommit,
+            },
             activeBotCount: store.bots.filter((bot) => bot.busy).length,
             localVms: await control.list(),
             persistOnExit: cfg.server?.persistOnExit !== false,
@@ -14980,11 +15800,23 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           } finally { localVmModeChangeBusy = false; }
         }
         if (method === "POST" && path === "/api/system/control/stop") {
+          // The owner confirmed this in the app, so the bots that are working
+          // are stopped and the server then shuts down (BF-2536).  The count is
+          // still a refusal when the work in flight is something the graceful
+          // stop cannot settle.
+          ownGracefulStop = true;
           // No marker or VM effect until all active work and leases are clear.
           const reservation = reserveSystemShutdown({
             guard: () => control.guard(),
-            activeWorkCount: () => currentRuntimeReadiness(ownAdmissionActive).activeWorkCount ?? 1,
-            blockingWork: () => blockingWorkBreakdown(ownAdmissionActive),
+            activeWorkCount: () => runtimeReadiness(gracefulStopWorkCounts(ownAdmissionActive, ownControlLock)).activeWorkCount ?? 1,
+            blockingWork: () => blockingWorkBreakdown(ownAdmissionActive, ownControlLock),
+            // The work in flight is not a refusal:  the graceful stop settles
+            // it, and says so in the report it returns.
+            canStopGracefully: () => gracefulStopAllowed(ownAdmissionActive, ownControlLock),
+            // The default refusal counts the work and names its kinds.  This
+            // one says why the server stays up, and names the kinds the stop
+            // cannot carry.
+            refusal: () => gracefulStopRefusal(gracefulStopBlockers(ownAdmissionActive, ownControlLock)),
             fence: () => {
               reserveControl();
               cancelFenceLease();
@@ -14995,8 +15827,36 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
               controlShutdownPending = false;
               runtimeQuiescing = false;
               localVmModeChangeBusy = false;
+              ownGracefulStop = false;
             },
           });
+          let report: GracefulStopReport;
+          try {
+            report = await runGracefulStop("control-stop", {
+              ownAdmissionActive,
+              // The fence is up now, and the lock it took is the stop's own
+              // reservation:  it is discounted from the counts the wait
+              // watches, so the wait ends as soon as the bots are done.
+              ownControlLock,
+              // A failure that left the fence up would refuse every route of a
+              // server that is still running, so the reservation is released
+              // before the error travels on.
+              onFailure: () => reservation.release(),
+            });
+          } catch (error) {
+            reservation.release();
+            console.error("[graceful-shutdown] the graceful stop failed", error);
+            return json(res, 500, { ok: false, error: "the graceful stop failed, so the server stays up" });
+          }
+          if (!report.ok) {
+            // The work could not be preserved, so the server stays up.
+            reservation.release();
+            // The work the park could not save is back in the queues, and the
+            // fence is down, so it runs:  a stop that refuses has to leave the
+            // server doing what it was doing.
+            drainQueuedSends();
+            return json(res, 409, { ok: false, error: report.refusal, report });
+          }
           let stopping;
           try {
             stopping = await requestHarnessShutdown({
@@ -15019,9 +15879,10 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
               ok: false,
               error: "Server shutdown is proceeding, but one or more Local VMs could not be stopped.  Check Computer settings before assuming they are off.",
               detail: stopping.detail,
+              report,
             });
           }
-          return json(res, 200, { ok: true, detail: stopping.detail });
+          return json(res, 200, { ok: true, detail: stopping.detail, report });
         }
       } catch (error) {
         const failure = localComputerActionError(error);
@@ -15344,11 +16205,18 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // not a guard.  The six organize fields are parsed together.
       // From a paired phone (the sidecar stamps `x-botfleet-companion`) the
       // body may carry the six organize fields and nothing else.
+      const recolorableParsed = botAvatarRecolorableSchema.safeParse(body.recolorable);
+      if (!recolorableParsed.success) {
+        return json(res, 400, { error: "recolorable must be none, shell, full, or a legacy boolean" });
+      }
       const organize = checkBotOrganizeBody(body, req.headers["x-botfleet-companion"] === "1");
       if (!organize.ok) return json(res, organize.status, { error: organize.error });
       for (const key of ["unread", "cloudBackend", "color", "mascotExpression", "pinned", "hidden"] as const) {
         if (body[key] !== undefined) patch[key] = body[key];
       }
+      // Store the normalised enum (true→shell, false→none) so clients never
+      // see a bare boolean after the none|shell|full upgrade.
+      if (body.recolorable !== undefined) patch.recolorable = recolorableParsed.data;
       if (normalizedSelection) {
         patch.modelSelection = normalizedSelection;
         patch.activeModelSelection = normalizedSelection;
@@ -15983,7 +16851,14 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
             prompt: promptWithReply(text, replyTo, cfg.profile?.name?.trim() || "User"),
             linqChatId,
             ...(fromImessage ? { automationSource: "imessage" as const } : {}),
+            relayed: relaySourced,
           });
+          if (steerJournalFailure) {
+            // Not durable: refuse rather than acknowledge a send a crash would lose.
+            const failedWith = steerJournalFailure;
+            cancelSteeredMessage(bot.threadId, queued.id);
+            return { status: 503, body: { error: `could not save the queued message (${failedWith}); send it again` } };
+          }
           if (relaySourced) relayQueuedMessageIds.add(queued.id);
           // The same answer a busy bot's queued send gets: the client's
           // response schema is strict, and the pending chip is already right.
@@ -16015,12 +16890,124 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       return json(res, reply.status, reply.body);
     }
 
+    // Explicit per-context send (Slice 0 item 5): a composer pinned on a
+    // non-active thread posts here.  The message either queues for when that
+    // context can run, or dispatches there when the bot is idle — without
+    // ever re-pointing bot.threadId, so the parent's in-flight turn and
+    // default automation targeting are untouched.  The active thread keeps
+    // its own endpoint byte-identical; posting the active thread id here is
+    // a 400, not a second way to do the same send.
+    m = path.match(/^\/api\/bots\/([\w-]+)\/threads\/([\w-]+)\/messages$/);
+    if (m && method === "POST") {
+      const parsedBody = PER_CONTEXT_SEND_BODY.safeParse(await readBody(req));
+      if (!parsedBody.success) return json(res, 400, { error: "body must be a JSON object" });
+      const body = parsedBody.data;
+      const rawText = String(body.text ?? "").trim();
+      if (!rawText) return json(res, 400, { error: "text required" });
+      const bot = store.bot(m[1]);
+      if (!bot) return json(res, 404, { error: "no such bot" });
+      if (botIsOff(bot)) return json(res, 409, { error: BOT_OFF_REFUSAL, code: BOT_OFF_CODE });
+      const targetThreadId = m[2];
+      const ownedThreads = [bot.threadId, ...(bot.tasks ?? []).map((task) => task.threadId)];
+      if (!ownedThreads.includes(targetThreadId)) return json(res, 404, { error: "no such thread for this bot" });
+      if (targetThreadId === bot.threadId) {
+        return json(res, 400, { error: "this is the active thread — post to /api/bots/:id/messages instead" });
+      }
+      const recording = body.recording === undefined ? undefined : incomingRecording(body.recording) ?? undefined;
+      if (body.recording !== undefined && !recording) return json(res, 400, { error: "recording must be a saved WAV attachment" });
+      const idempotencyKey = idempotencyKeyFrom(body.idempotencyKey);
+      if (idempotencyKey === null) return json(res, 400, { error: IDEMPOTENCY_KEY_ERROR });
+      const scopedIdempotencyKey = idempotencyKey && `bot:${bot.id}:${targetThreadId}:${idempotencyKey}`;
+      const userAgent = Array.isArray(req.headers["user-agent"]) ? req.headers["user-agent"][0] : req.headers["user-agent"] ?? "unknown";
+      const origin = req.headers.origin ?? "direct";
+      const fromImessage = isImessageInboundSource(body.source, userAgent);
+      if (fromImessage) {
+        const transport = loadConfig().botDefaults?.imessagePerBot?.[bot.id] ?? "mac-relay";
+        if (transport !== "mac-relay") {
+          console.warn(`[inbound-message] rejecting Mac-relay post for bot ${bot.name} (${bot.id}): imessagePerBot=${transport}`);
+          return json(res, 403, { error: "imessage_transport_disabled", transport });
+        }
+      }
+      const fromLinq = body.source === "linq";
+      const chatIdParsed = z.string().trim().min(1).max(512).safeParse(body.chatId);
+      const linqChatId = fromLinq ? (chatIdParsed.success ? chatIdParsed.data : undefined) : undefined;
+      if (fromLinq) {
+        const transport = loadConfig().botDefaults?.imessagePerBot?.[bot.id];
+        if (transport !== "linq") {
+          console.warn(`[inbound-message] rejecting Linq post for bot ${bot.name} (${bot.id}): imessagePerBot=${transport ?? "unset"}`);
+          return json(res, 403, { error: "imessage_transport_disabled", transport: transport ?? "off" });
+        }
+        if (!linqChatId) return json(res, 400, { error: "chatId required for linq source" });
+      }
+      const messagingCommand =
+        fromImessage || (fromLinq && body.senderVerified === true) ? messagingCommandOf(rawText) : null;
+      if (messagingCommand) {
+        const commandReply = await replyOnce(scopedIdempotencyKey, () =>
+          runMessagingCommand(bot, messagingCommand, fromLinq ? "linq" : "imessage", linqChatId),
+        );
+        return json(res, commandReply.status, commandReply.body);
+      }
+      const text = fromImessage ? wrapImessageInbound(rawText) : rawText;
+      console.log(`[inbound-message] bot=${bot.name} (${bot.id}) thread=${targetThreadId} origin=${origin} ua=${userAgent} imessage=${fromImessage} len=${text.length}`);
+      const recentBotMessages = store.messagesFor(targetThreadId).slice(-5).filter((msg) => msg.role === "bot" && msg.text && !msg.command);
+      const isSelfEcho = recentBotMessages.some((msg) => {
+        const botText = outboundImessageText(msg.text ?? "") ?? msg.text?.trim() ?? "";
+        return botText === rawText || (rawText.length > 50 && botText.includes(rawText));
+      });
+      if (isSelfEcho) {
+        console.warn(`[inbound-message] DROPPING duplicate self-echo for bot ${bot.name} (${bot.id})`);
+        return json(res, 200, { ok: true, ignored: "self_echo" });
+      }
+      const replyTo = resolveReplyTarget(targetThreadId, body.replyToId);
+      const relaySourced = fromImessage || fromLinq;
+      const deliver = async (): Promise<RouteReply> => {
+        if (recording && bot.busy) return { status: 409, body: { error: "wait for the current turn before sending a recording" } };
+        const holdForUpdate = !bot.busy && !recording && updateDrain.active;
+        if (bot.busy || holdForUpdate) {
+          const queued = queueSteeredMessage(bot, text, {
+            threadId: targetThreadId,
+            replyToId: replyTo?.id,
+            prompt: promptWithReply(text, replyTo, cfg.profile?.name?.trim() || "User"),
+            linqChatId,
+            automationSource: fromImessage ? "imessage" : undefined,
+            relayed: relaySourced,
+          });
+          if (steerJournalFailure) {
+            // Not durable: refuse rather than acknowledge a send a crash would lose.
+            const failedWith = steerJournalFailure;
+            cancelSteeredMessage(targetThreadId, queued.id);
+            return { status: 503, body: { error: `could not save the queued message (${failedWith}); send it again` } };
+          }
+          if (relaySourced) relayQueuedMessageIds.add(queued.id);
+          return { status: 202, body: { ok: true, queued: true, queueId: queued.id, threadId: targetThreadId } };
+        }
+        await startTurn(bot.id, text, {
+          threadId: targetThreadId,
+          replyTo,
+          linqChatId,
+          recording,
+          automationSource: fromImessage ? "imessage" : undefined,
+          unattended: relaySourced || undefined,
+          // person-initiated: a person targeted this thread on purpose,
+          // which is how a stopped bot is meant to be woken — `interrupt`
+          // stops automation, not the owner.
+          personInitiated: true,
+        });
+        return { status: 202, body: { ok: true } };
+      };
+      const reply = await replyOnce(scopedIdempotencyKey, deliver);
+      return json(res, reply.status, reply.body);
+    }
+
     m = path.match(/^\/api\/bots\/([\w-]+)\/queue\/([\w-]+)$/);
     if (m && method === "DELETE") {
       const bot = store.bot(m[1]);
       if (!bot) return json(res, 404, { error: "no such bot" });
       const queueId = m[2];
-      if (!cancelSteeredMessage(bot.threadId, queueId)) {
+      // A per-context send queues against its own thread, so the active
+      // thread's queue is not the only place a queued id can live.
+      const queuedThreads = [bot.threadId, ...(bot.tasks ?? []).map((task) => task.threadId)];
+      if (!queuedThreads.some((threadId) => cancelSteeredMessage(threadId, queueId))) {
         return json(res, 404, { error: "no such queued message" });
       }
       // A cancelled relayed message must not leave a mark behind: the next
@@ -16522,6 +17509,44 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       return json(res, 200, { bot: fresh });
     }
 
+    // Fold every other conversation of ONE bot into the one the person picks.
+    // The workspace switch has a merge of its own, but that one moves every
+    // bot and room at once and only as a side effect of changing the
+    // arrangement, so a single bot's threads cannot be gathered on demand.
+    m = path.match(/^\/api\/bots\/([\w-]+)\/merge-threads$/);
+    if (m && method === "POST") {
+      const parsed = MergeThreadsBodySchema.safeParse(await readBody(req));
+      if (!parsed.success) return json(res, 400, { error: "choose the conversation to merge into" });
+      const { intoThreadId } = parsed.data;
+      const bot = store.bot(m[1]);
+      if (!bot) return json(res, 404, { error: "no such bot" });
+      if (bot.busy) {
+        return json(res, 409, { error: "this bot is working — let it finish before merging its threads" });
+      }
+      if (!(bot.tasks ?? []).some((task) => task.threadId === intoThreadId)) {
+        return json(res, 400, { error: "that is not one of this bot's conversations" });
+      }
+      const result = store.mergeAllBotTasks(bot.id, intoThreadId);
+      if (!result || !result.bot) return json(res, 400, { error: "this bot has nothing to merge" });
+      // A merge COPIES the source's messages into the target and then deletes
+      // the source task, so — unlike a move, which keeps its thread id — the
+      // source thread ids name nothing afterwards and their logs would sit on
+      // disk forever.
+      for (const dir of TRANSCRIPT_LOG_DIRS) removeTranscriptLogs(dir, result.merged);
+      // The source conversations are gone, so anything still scheduled against
+      // them — a routine, a webhook — would keep writing into a thread that
+      // no longer exists.
+      stopJobsForDeleted(result.merged, "its conversation was merged away");
+      // The merged conversation can hold far more than one event frame
+      // carries (the companion's limit is 1 MB), so the bot frame goes out
+      // WITHOUT the transcript.  The messages themselves arrive on their own
+      // frames as the fold writes them, and the roster is all this frame
+      // has to carry.
+      const light = wireBot(result.bot);
+      broadcast({ kind: "bot", bot: light });
+      return json(res, 200, { bot: light, merged: result.merged, skipped: result.skipped });
+    }
+
     // what the user's machine can host: which runtime is installed, whether
     // its daemon is up, and whether the desktop image and container exist
     if (method === "GET" && path === "/api/local-computer") {
@@ -16773,7 +17798,8 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         await serializeProviderReload(async () => {
           Object.assign(process.env, plan.env);
           Object.assign(cfg, loadConfig());
-          if (plan.restored.includes("infisicalClientSecret")) {
+          if (plan.restored.some((name) => name === "infisicalClientSecret" ||
+              name === "infisicalReadToken" || name === "infisicalWriteToken")) {
             // Timer semantics refresh the canonical snapshot without nesting
             // a provider reload inside the mutation already holding its fence.
             await infisical.refresh("timer");
@@ -16803,6 +17829,16 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         ((method === "POST" || method === "DELETE") && path === "/api/runtime/quiesce")) {
       if (!isLoopbackAddress(req.socket.remoteAddress) || !authorizedRuntime(harnessOwner, req.headers.authorization)) {
         return json(res, 401, { error: "unauthorized" });
+      }
+      if (placementRollbackReadOnly) {
+        // Neither force, drain, lease expiry nor DELETE may claim old work or
+        // release the immutable bridge capability or claim existing jobs.
+        return json(res, 200, {
+          ...runtimeBuildIdentity, pid: process.pid, ...currentRuntimeReadiness(),
+          quiescing: true, fencing: false, placementReadOnly: true, lease: null,
+          placementController: placementAuthority.kind === "readonly" ? placementAuthority.reader.controller() : null,
+          dataOwner: { pid: harnessOwner.pid, port: harnessOwner.port },
+        });
       }
       // What a quiesce or release asks for, checked against a strict shape:
       // a malformed flag or window is refused with 400, never read loosely
@@ -16934,9 +17970,89 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     if (method === "GET" && (path === "/api/health" || path === "/health")) {
       return json(res, 200, {
         app: "botfleet", pid: process.pid, static: Boolean(STATIC_DIR),
+        hostId, version: runtimeBuildIdentity.version,
         ownerProof: harnessOwnerProof(harnessOwner, req.headers["x-botfleet-owner-challenge"]),
-        ready: !booting, booting,
+        ...healthReadiness({ booting, webhookIngressError }),
       });
+    }
+    if (method === "GET" && path === "/api/host/resources") {
+      // The Linux owner gate strips its credential before this loopback hop.
+      // Companion tokens grant no access to host inventory, even if its proxy
+      // allowlist is extended later; the named tunnel has no owner credential.
+      const response = hostResourcesResponse({
+        localOwner: isLoopbackAddress(req.socket.remoteAddress),
+        fromCompanion: req.headers["x-botfleet-companion"] !== undefined,
+        viaNamedTunnel: arrivedViaCloudflareTunnel(req),
+      });
+      return json(res, response.status, response.body);
+    }
+    // SAFETY: `includes` narrowed the path segment to a known lease action;
+    // the assertion restores the narrowed literal TypeScript cannot keep.
+    if (method === "POST" && path.startsWith("/api/placement/") && PLACEMENT_LEASE_ACTIONS.includes(path.slice("/api/placement/".length) as PlacementLeaseAction)) {
+      // The same owner boundary as placement identity and host resources.
+      // No worker-scoped credential class exists yet (the plan's open
+      // question 3), so these routes invent none.
+      if (!placementLeases) {
+        if (!isLoopbackAddress(req.socket.remoteAddress) || req.headers["x-botfleet-companion"] !== undefined || arrivedViaCloudflareTunnel(req)) {
+          return json(res, 403, { error: "Placement routes are available only through the local owner or authenticated server gate" });
+        }
+        return json(res, 503, { error: PLACEMENT_ROLLBACK_REFUSAL });
+      }
+      // SAFETY: the guard above accepted only segments in
+      // PLACEMENT_LEASE_ACTIONS, so this slice is one of them.
+      const action = path.slice("/api/placement/".length) as PlacementLeaseAction;
+      let body: unknown;
+      try {
+        body = await readBody(req);
+      } catch {
+        return json(res, 400, { error: "invalid placement message" });
+      }
+      const response = placementLeaseRoute({
+        localOwner: isLoopbackAddress(req.socket.remoteAddress),
+        fromCompanion: req.headers["x-botfleet-companion"] !== undefined,
+        viaNamedTunnel: arrivedViaCloudflareTunnel(req),
+      }, action, body, placementLeases);
+      return json(res, response.status, response.body);
+    }
+    if (method === "GET" && path === "/api/placement/identity") {
+      // The same owner boundary as host resources: the native server
+      // handshake reads this through the local owner or authenticated
+      // server gate, never through the companion or the named tunnel.
+      const response = placementIdentityResponse({
+        localOwner: isLoopbackAddress(req.socket.remoteAddress),
+        fromCompanion: req.headers["x-botfleet-companion"] !== undefined,
+        viaNamedTunnel: arrivedViaCloudflareTunnel(req),
+      }, { hostId, controller: () => {
+        if (placementAuthority.kind === "readonly") return placementAuthority.reader.controller();
+        if (!placementLeases) throw new Error("Placement authority is unavailable");
+        return placementLeases.controller();
+      }, platform: process.platform });
+      return json(res, response.status, response.body);
+    }
+    if ((method === "GET" || method === "PUT") && path === "/api/placement/mode") {
+      // The same owner boundary as placement identity and host resources:
+      // the local owner or the authenticated server gate, never the companion
+      // lane or the named tunnel.
+      const caller = {
+        localOwner: isLoopbackAddress(req.socket.remoteAddress),
+        fromCompanion: req.headers["x-botfleet-companion"] !== undefined,
+        viaNamedTunnel: arrivedViaCloudflareTunnel(req),
+      };
+      if (method === "GET") {
+        const response = placementModeRead(caller, placementModeStore);
+        return json(res, response.status, response.body);
+      }
+      // A rollback build holds placement state:  it reads the mode record and
+      // never writes one.
+      if (placementRollbackReadOnly) return json(res, 503, { error: PLACEMENT_ROLLBACK_REFUSAL });
+      let body: unknown;
+      try {
+        body = await readBody(req);
+      } catch {
+        return json(res, 400, { error: "invalid placement mode message" });
+      }
+      const response = placementModeWrite(caller, body, placementModeStore);
+      return json(res, response.status, response.body);
     }
     // Saved data that could not be read or used, for the notice at the top of the app.  File base names
     // and short reasons only: no paths, and never a fragment of a file.
@@ -16973,7 +18089,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     // Sync Now: the one refresh that is allowed to rebuild the fleet, because
     // a person asked for it and is watching.
     if (method === "POST" && path === "/api/infisical/sync") {
-      if (workspaceCredentialPending(cfg, "infisicalClientSecret")) {
+      if (infisicalCredentialPending()) {
         return json(res, 409, { error: "Infisical is waiting for its encrypted credential" });
       }
       // Takes the same fence the two Settings routes take: this is the one
@@ -16984,6 +18100,11 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (providerConfigBusy) return json(res, 409, { error: "provider settings are already being updated" });
       providerConfigBusy = true;
       try {
+        // A Sync Now is the operator asking for the configured token to be
+        // tried again:  a grant widened or a path created in the vault
+        // changes nothing about the token, so a token remembered as refused
+        // has to come back on an explicit retry.
+        infisical.retryRefusedTokens();
         await infisical.refresh("manual");
         await applyResolvedSecrets("manual");
       } finally {
@@ -16994,7 +18115,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     // Test Connection: proves the identity works without changing what any
     // bot resolves to mid-session — it never reads a value, only names.
     if (method === "POST" && path === "/api/infisical/test") {
-      if (workspaceCredentialPending(cfg, "infisicalClientSecret")) {
+      if (infisicalCredentialPending()) {
         return json(res, 409, { error: "Infisical is waiting for its encrypted credential" });
       }
       return json(res, 200, await infisical.probe());
@@ -17389,35 +18510,6 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         return json(res, 415, { error: UNSUPPORTED_JSON_BODY });
       }
       const body = await readBody(req);
-      const patchOptions: { cli?: string; fullAuto?: boolean; enabled?: boolean; key?: string; externalCredential?: boolean; models?: Array<{ id: string; label: string }> } = {};
-
-      if (body?.cli !== undefined) {
-        if (typeof body.cli !== "string") return json(res, 400, { error: "cli must be a string" });
-        if (/[\n\r]/.test(body.cli)) return json(res, 400, { error: "cli must not contain newlines" });
-        patchOptions.cli = body.cli;
-      }
-
-      if (body?.models !== undefined) {
-        const parsedModels = instanceModelsSchema.safeParse(body.models);
-        if (!parsedModels.success) return json(res, 400, { error: "models must contain at most 100 unique IDs with valid labels" });
-        patchOptions.models = parsedModels.data;
-      }
-
-      if (body?.fullAuto !== undefined) {
-        if (typeof body.fullAuto !== "boolean") return json(res, 400, { error: "fullAuto must be a boolean" });
-        patchOptions.fullAuto = body.fullAuto;
-      }
-
-      if (body?.enabled !== undefined) {
-        if (typeof body.enabled !== "boolean") return json(res, 400, { error: "enabled must be a boolean" });
-        patchOptions.enabled = body.enabled;
-      }
-
-      if (body?.key !== undefined) {
-        if (typeof body.key !== "string") return json(res, 400, { error: "key must be a string" });
-        if (/[\n\r]/.test(body.key)) return json(res, 400, { error: "key must not contain newlines" });
-        patchOptions.key = body.key;
-      }
 
       if (url.searchParams.get("restore") === "1") {
         if (!isLoopbackAddress(req.socket.remoteAddress) || !authorizedRuntime(harnessOwner, req.headers.authorization)) {
@@ -17430,9 +18522,12 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         // same table the live override rides on, so a replay can never push a
         // key into an engine that has nowhere to read it from.
         const restoreKeyEnv = INSTANCE_API_KEY_ENV.get(current.driver);
-        if (!restoreKeyEnv || !body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).some((key) => key !== "key") || !patchOptions.key?.trim() || patchOptions.key.length > 16_384) {
+        const restoredBody = InstancePatchRestoreBodySchema.safeParse(body);
+        const restoreKey = restoredBody.success ? restoredBody.data.key : "";
+        if (!restoreKeyEnv || !restoreKey.trim() || restoreKey.length > 16_384) {
           return json(res, 400, { error: "Invalid instance credential restore payload" });
         }
+        const patchOptions = { key: restoreKey };
         const configuredKey = current.config && typeof current.config === "object" && "key" in current.config ? current.config.key : undefined;
         if (configuredKey || current.environment?.[restoreKeyEnv]) return json(res, 200, { retained: true });
         if (!currentRuntimeReadiness(ownAdmissionActive, true).safeToRestart) return json(res, 409, { error: "Credential restoration waits for current work to finish" });
@@ -17452,6 +18547,21 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           return json(res, 503, { error: "Instance credential restoration could not refresh provider readiness" });
         } finally { providerConfigBusy = false; }
       }
+
+      const parsedBody = InstancePatchBodySchema.safeParse(body);
+      if (!parsedBody.success) {
+        return json(res, 400, { error: instancePatchInputError(parsedBody.error) });
+      }
+      const patchOptions: { cli?: string; fullAuto?: boolean; enabled?: boolean; key?: string; externalCredential?: boolean; models?: Array<{ id: string; label: string }>; replyWaitMinutes?: number | null } = { ...parsedBody.data };
+
+      if (patchOptions.replyWaitMinutes !== undefined) {
+        const configured = instanceConfigs(cfg)[instancePatch[1]];
+        if (!configured) return json(res, 404, { error: `unknown instance "${instancePatch[1]}"` });
+        if (configured.driver !== "openai-compat") {
+          return json(res, 400, { error: "replyWaitMinutes is available for OpenAI-compatible servers only" });
+        }
+      }
+
       if (providerConfigBusy) return json(res, 409, { error: "provider settings are already being updated" });
       providerConfigBusy = true;
       try {
@@ -18524,6 +19634,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     if ((method === "PUT" || method === "PATCH") && path === "/api/config") {
       const body = await readBody(req);
       const patch = parseConfigPatch(body);
+      validateInfisicalConfigPatch(cfg, patch);
       if (!Object.keys(patch).length) return json(res, 400, { error: "nothing to save" });
       if (providerConfigBusy) return json(res, 409, { error: "provider settings are already being updated" });
       // The window confirmed a provider disable against its own copy of the
@@ -18737,10 +19848,13 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // identity) would land the knob write in the OLD project before the
       // connection moves.  Refuse the combination outright.  A patch that
       // carries only `infisical.refreshMinutes` is a knob write like any
-      // other and is handled below.
+      // other and is handled below.  An explicit null clear counts as a knob
+      // write here too: the refusal must fire before any vault answer is
+      // trusted, not only when a value rides along.
       if (
         patchChangesInfisicalConnection(patch) &&
-        KNOB_FIELDS.some((spec) => readKnobField(patch, spec) !== undefined)
+        (KNOB_FIELDS.some((spec) => readKnobField(patch, spec) !== undefined) ||
+          clearedHeadroomKnobs(patch).length > 0)
       ) {
         return json(res, 400, {
           error: "Updating the Infisical connection and managed settings in the same request is not supported.\u00A0 Save the Infisical connection first.",
@@ -18929,6 +20043,8 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           ["tts", "key"],
           ["imageGen", "key"],
           ["infisical", "clientSecret"],
+          ["infisical", "token"],
+          ["infisical", "writeToken"],
         ] as const;
         for (const [section, field] of externalFields) {
           const externalSection = persisted[section] as Record<string, string | undefined> | undefined;
@@ -18937,8 +20053,8 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           externalSection![field] = "";
           externalCredentialSections[section] = Boolean(supplied.trim());
         }
-        // The one credential the store can never hold for us: its own client
-        // secret.  The client id is a plain identifier and stays readable,
+        // The credentials the store can never hold for us: its own client
+        // secret and service tokens.  The client id stays readable,
         // the way the Access client id does.
         saveConfig(persisted, { externalCredentialSections });
         syncCredentialEnv(patch);
@@ -18985,6 +20101,10 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // diagnostics re-apply below, so a DSN the store holds is already in
       // `cfg` when Sentry is reconfigured.
       if (patch.infisical !== undefined) {
+        // The same escape hatch as Sync Now:  a save that touches the
+        // Infisical settings is an explicit ask to try the configured token
+        // again, whatever the vault said about it last time.
+        infisical.retryRefusedTokens();
         await infisical.refresh("settings");
         await applyResolvedSecrets("settings");
         // Re-arm the poller: `start()` reads Refresh Minutes when it creates
@@ -19417,6 +20537,12 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         }
       }
       if (m[3] === "status" && method === "GET") {
+        if (placementRollbackReadOnly) {
+          return json(res, 200, {
+            connected: connector.status === "connected", pending: connector.status === "authorizing",
+            status: connector.status, placementReadOnly: true,
+          });
+        }
         const state = (await composio.connectionStatus(cfg, [connector.slug]))[connector.slug];
         const failed = /failed|expired|revoked|error/i.test(state?.status ?? "");
         const next = {
@@ -19673,7 +20799,7 @@ if (!process.env.OMB_DISABLE_GROK_QUOTA) {
 // Post-update resumption: If an update quiesced active work and rebooted successfully,
 // clear all bot snoozes, requeue interrupted runs, and resume routines on this new build.
 const pendingResumePath = join(DATA_DIR, "pending-update-resume.json");
-if (existsSync(pendingResumePath)) {
+if (!placementRollbackReadOnly && existsSync(pendingResumePath)) {
   try {
     const raw = readFileSync(pendingResumePath, "utf-8");
     const resumeState = JSON.parse(raw);
@@ -19743,18 +20869,24 @@ await localVmStartupProbe.catch(() => {});
 await jobRegistry.adopt().catch((error) => {
   console.error(`[jobs] could not settle earlier jobs: ${error instanceof Error ? error.message : String(error)}`);
 });
-try {
+if (!placementRollbackReadOnly) try {
   const interrupted = store.settleInterruptedHelpers(Date.now());
   if (interrupted > 0) console.log(`[helpers] boot: ${interrupted} helper(s) stopped by the restart`);
 } catch (error) {
   console.error(`[helpers] could not settle interrupted helpers: ${error instanceof Error ? error.message : String(error)}`);
 }
 jobRegistry.startTimers();
+// The unreachable sweep (slice T4).  It is the one part of the lease service
+// that had no production caller:  a controller runs it to notice a worker
+// that went quiet, and nothing is requeued when it does.  The period is the
+// heartbeat period, so the controller looks as often as workers report, and
+// a knob change applies on the next tick.
+if (placementLeases) placementBridge.startUnreachableSweep(placementHeartbeatMs);
 // Boot is done: the socket has been open since the top of this file, and the
 // full route table takes over from the boot-phase handler on the very next
 // request.  `/api/health` flips to `ready: true`, and the 503 gate lifts.
 booting = false;
-console.log(`botfleet server ready on http://127.0.0.1:${PORT}`);
+console.log(`botfleet server ready on http://127.0.0.1:${PORT}${webhookIngressError ? " (degraded: webhook receiver unavailable)" : ""}`);
 
 // The Zulip source (docs/zulip.md).  Sessions connect now, but nothing is
 // dispatched until boot recovery has claimed the turns a restart interrupted
@@ -19772,7 +20904,9 @@ zulipHub = new ZulipHub({
   // rest are in memory for the length of the fetch.  The keys stay in the
   // hub's memory, never in `cfg`, `process.env` or a log (docs/zulip.md, D0).
   vault: cachedVaultReader((location) =>
-    infisical.readPath(location.secretPath, { projectId: location.projectId, environment: location.environment }),
+    location.source
+      ? infisical.readSource(location.source, location.secretPath)
+      : infisical.readPath(location.secretPath ?? ZULIP_DEFAULT_INFISICAL_PATH, { projectId: location.projectId, environment: location.environment }),
   ),
   botExists: (botId) => Boolean(store.bot(botId)),
   // A bot holding a crash marker is not free either: its interrupted turn
@@ -19784,7 +20918,7 @@ zulipHub = new ZulipHub({
   },
   busyThread: (botId) => store.bot(botId)?.inflightThreadId,
   turnStarter: (threadId) => zulipTurnStarter(store.activePath(threadId))?.id,
-  dispatchHeld: () => !bootRecoveryDone,
+  dispatchHeld: () => placementRollbackReadOnly || !bootRecoveryDone,
   startTurn: async (botId, text, conversation) => {
     const bot = store.bot(botId);
     if (!bot) throw Object.assign(new Error("no such bot"), { status: 404 });
@@ -19870,7 +21004,7 @@ zulipHub.start();
 // Everything the recovery coordinator reads now exists: the store, the
 // provider fleet, the shutdown record read at the top of this file, and the
 // post-update snapshot folded into it a few lines above.
-setTimeout(() => {
+if (!placementRollbackReadOnly) setTimeout(() => {
   // Messages an update held for this restart (update-held-sends.json) go
   // back in their bots' queues only now: after `jobRegistry.adopt()` settled
   // the jobs an earlier run left (no turn starts before that), and after
@@ -19880,7 +21014,13 @@ setTimeout(() => {
   void runBootRecovery()
     .catch((error) => console.error("[boot-recovery] failed:", error))
     .finally(() => {
-      restoreHeldWork(takeHeldWork(DATA_DIR, (line) => console.warn(line)), "update-held");
+      const carried = takeHeldWork(DATA_DIR, (line) => console.warn(line));
+      const recovered = takeRecoveredQueueJournal(carried);
+      if (recovered.length > 0) console.warn(`[boot-recovery] ${recovered.length} queued send batch(es) survived a crash in the journal`);
+      restoreHeldWork({ ...carried, queued: [...carried.queued, ...recovered] }, "update-held");
+      // The journal must now say what is in memory, even when nothing changed
+      // the queue (a too-old send was written into its thread instead).
+      writeSteerJournal();
       drainQueuedSends();
       drainRoomQueue();
     });
@@ -19940,7 +21080,7 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
     // is settled below, after bus.flush(), and a stop whose drain never
     // finishes leaves a record that cannot license a replay.
     const interrupted: InterruptedTurnRecord[] = [];
-    for (const bot of store.bots) {
+    for (const bot of placementRollbackReadOnly ? [] : store.bots) {
       if (!bot.busy) continue;
       const threadId = bot.inflightThreadId ?? bot.threadId;
       // Room turns are not re-dispatchable (startGroupTurn always appends the
@@ -19971,6 +21111,7 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
     stopTranscriptSweeps();
     stopOrphanTranscriptSweeps();
     stopIdleLiveTranscriptSweeps();
+    stopVolumeTranscriptSweeps();
     // A flush that throws (disk full, data dir gone) must not skip the rest
     // of shutdown — above all bus.flush() below — so each one is guarded.
     const flushOnShutdown = (label: string, flush: () => void) => {

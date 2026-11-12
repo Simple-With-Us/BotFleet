@@ -157,7 +157,12 @@ describe("update readiness", () => {
     expect(body).toContain("queuedMessageCount(botIsOffId)");
     expect(body).toContain("_queuedRoomCount(botIsOffId)");
     expect(body).toContain("botIsOffId(item.targetBotId)");
-    expect(body).toContain('run.status === "queued" && botIsOffId(run.botId)');
+    // The queued routine runs are filtered in the helper that the count and
+    // the hold both read, so that the discount the hold takes is never bigger
+    // than the count it comes from.  The filter used to sit in
+    // `runtimeWorkCounts` itself; it lives in one place now.
+    expect(body).toContain("routineRunCounts(");
+    expect(read("update-drain.ts")).toContain('run.status === "queued" && options.isBotOff(run.botId)');
     // `turns` is deliberately not filtered: a turn that is running is real work.
     const turnsLine = body.split("\n").find((line) => line.includes("turns:")) ?? "";
     expect(turnsLine).toContain("bot.busy");

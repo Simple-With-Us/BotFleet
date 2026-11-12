@@ -10,7 +10,6 @@ import {
   DSH_MINIMUM_ACP_VERSION,
   DSH_PROVIDER_ID,
   DSH_MINIMAX_PROVIDER_ID,
-  dshCanonicalWireModelId,
   classifyDshError,
   dshCredentialCandidates,
   dshInstalledEffortLevels,
@@ -22,6 +21,8 @@ import {
   dshSpawnArgs as clutchDshSpawnArgs,
   dshSupport as clutchDshSupport,
   dshVersionCompatibilityReason,
+  parseAdvertisedDshModels,
+  type DshAdvertisedModel,
 } from "clutch/dsh/acp";
 
 import type { ModelCatalog, ProviderErrorCode, SendTurnInput } from "../../contracts.ts";
@@ -402,7 +403,26 @@ export function dshSpawnArgs(config: AcpConfig, turn: Pick<SendTurnInput, "integ
   return clutchDshSpawnArgs(config, turn);
 }
 
+const DSH_FLASH_WIRE_MODEL_ID = "deepseek-flash";
 const dshSelectModel = clutchDshSupport.selectModel;
+
+/** Switch a resolved model value whose id is a non-canonical spelling of
+ * DeepSeek Flash (for example the settings alias `deepseek-v4.1-flash`) to the
+ * stock `deepseek-flash` option, but only when the session advertises that
+ * option on the same provider route.  dsh refuses any option it did not
+ * advertise ("unknown model option"), so a session that offers only the alias
+ * keeps the declared value.  Without an advertisement Clutch already builds the
+ * stock wire id, so the value is returned unchanged. */
+export function dshCanonicalFlashWireValue(value: string, advertised: readonly DshAdvertisedModel[] | null): string {
+  const resolved = advertised?.find((entry) => entry.value === value);
+  if (!resolved || resolved.id === DSH_FLASH_WIRE_MODEL_ID || !dshSameModel(resolved.id, DSH_FLASH_WIRE_MODEL_ID)) {
+    return value;
+  }
+  const canonical = advertised?.find(
+    (entry) => entry.provider === resolved.provider && entry.id === DSH_FLASH_WIRE_MODEL_ID,
+  );
+  return canonical?.value ?? value;
+}
 
 /**
  * The Clutch package's error codes include "unknown"; BotFleet's
@@ -435,16 +455,17 @@ export const dshSupport = {
   images: true,
   models: STATIC_DSH_MODELS,
   resolveModels: (environment) => readDshModelCatalog(environment),
-  // The installed settings can advertise `deepseek-v4.1-flash`, but DeepSeek's
-  // API accepts the stock `deepseek-flash` id.  Keep Clutch's advertised-value
-  // resolution for every other model, while canonicalizing this settings-only
-  // alias before BotFleet sends the model option over ACP.
+  // The installed settings can declare Flash as `deepseek-v4.1-flash`, but
+  // DeepSeek's API accepts only the stock `deepseek-flash` id.  Resolve every
+  // model through Clutch first, so the advertised route and the not-offered
+  // check (DshModelNotOfferedError) still apply, then prefer the advertised
+  // `deepseek-flash` option on the same route when the session offers it.
   selectModel: dshSelectModel && {
     ...dshSelectModel,
-    valueForModel: (model, advertised) =>
-      model.toLowerCase() === "deepseek-v4.1-flash"
-        ? dshSelectModel.valueForModel?.(dshCanonicalWireModelId(model))
-        : dshSelectModel.valueForModel?.(model, advertised),
+    valueForModel: (model, advertised) => {
+      const value = dshSelectModel.valueForModel?.(model, advertised);
+      return value ? dshCanonicalFlashWireValue(value, parseAdvertisedDshModels(advertised)) : value;
+    },
   },
   loginNote: clutchDshSupport.loginNote ?? "DSH CLI auth missing — add ~/.dsh/.credentials.yaml",
   resumeMethod: "session/resume" as const,
