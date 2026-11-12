@@ -135,13 +135,15 @@ public struct StoredBotRecord: Equatable, Sendable, Identifiable {
     public let name: String
     public let threadId: String?
     public let createdAt: Double
+    public let snoozedUntil: Double?
     public let rawJSON: String
 
-    public init(id: String, name: String, threadId: String? = nil, createdAt: Double, rawJSON: String) {
+    public init(id: String, name: String, threadId: String? = nil, createdAt: Double, snoozedUntil: Double? = nil, rawJSON: String) {
         self.id = id
         self.name = name
         self.threadId = threadId
         self.createdAt = createdAt
+        self.snoozedUntil = snoozedUntil
         self.rawJSON = rawJSON
     }
 }
@@ -417,6 +419,7 @@ public actor DatabaseService {
             name TEXT NOT NULL,
             thread_id TEXT,
             created_at REAL NOT NULL,
+            snoozed_until REAL,
             raw_json TEXT NOT NULL
         );
 
@@ -451,6 +454,9 @@ public actor DatabaseService {
         }
         if try !tableHasColumn("revision", inTable: "native_event_waits") {
             try execute(sql: "ALTER TABLE native_event_waits ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;")
+        }
+        if try !tableHasColumn("snoozed_until", inTable: "bots") {
+            try execute(sql: "ALTER TABLE bots ADD COLUMN snoozed_until REAL;")
         }
         try ensureMessageTriggers()
     }
@@ -1289,12 +1295,13 @@ public actor DatabaseService {
     public func upsertBot(_ bot: StoredBotRecord) throws {
         guard let db = db else { throw DatabaseError.openFailed("Database connection closed") }
         let sql = """
-        INSERT INTO bots (id, name, thread_id, created_at, raw_json)
-        VALUES (?1, ?2, ?3, ?4, ?5)
+        INSERT INTO bots (id, name, thread_id, created_at, snoozed_until, raw_json)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
         ON CONFLICT(id) DO UPDATE SET
             name = excluded.name,
             thread_id = excluded.thread_id,
             created_at = excluded.created_at,
+            snoozed_until = excluded.snoozed_until,
             raw_json = excluded.raw_json;
         """
         var stmt: OpaquePointer?
@@ -1311,7 +1318,12 @@ public actor DatabaseService {
             sqlite3_bind_null(stmt, 3)
         }
         sqlite3_bind_double(stmt, 4, bot.createdAt)
-        sqlite3_bind_text(stmt, 5, (bot.rawJSON as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        if let snoozedUntil = bot.snoozedUntil {
+            sqlite3_bind_double(stmt, 5, snoozedUntil)
+        } else {
+            sqlite3_bind_null(stmt, 5)
+        }
+        sqlite3_bind_text(stmt, 6, (bot.rawJSON as NSString).utf8String, -1, SQLITE_TRANSIENT)
 
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             throw DatabaseError.stepFailed(String(cString: sqlite3_errmsg(db)))
@@ -1320,7 +1332,7 @@ public actor DatabaseService {
 
     public func loadBots() throws -> [StoredBotRecord] {
         guard let db = db else { throw DatabaseError.openFailed("Database connection closed") }
-        let sql = "SELECT id, name, thread_id, created_at, raw_json FROM bots ORDER BY created_at ASC, id ASC;"
+        let sql = "SELECT id, name, thread_id, created_at, snoozed_until, raw_json FROM bots ORDER BY created_at ASC, id ASC;"
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
             throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
@@ -1333,8 +1345,16 @@ public actor DatabaseService {
             let name = String(cString: sqlite3_column_text(stmt, 1))
             let threadId = sqlite3_column_type(stmt, 2) != SQLITE_NULL ? String(cString: sqlite3_column_text(stmt, 2)) : nil
             let createdAt = sqlite3_column_double(stmt, 3)
-            let rawJSON = String(cString: sqlite3_column_text(stmt, 4))
-            results.append(StoredBotRecord(id: id, name: name, threadId: threadId, createdAt: createdAt, rawJSON: rawJSON))
+            let snoozedUntil = sqlite3_column_type(stmt, 4) != SQLITE_NULL ? sqlite3_column_double(stmt, 4) : nil
+            let rawJSON = String(cString: sqlite3_column_text(stmt, 5))
+            results.append(StoredBotRecord(
+                id: id,
+                name: name,
+                threadId: threadId,
+                createdAt: createdAt,
+                snoozedUntil: snoozedUntil,
+                rawJSON: rawJSON
+            ))
         }
         return results
     }
