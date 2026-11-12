@@ -1624,6 +1624,7 @@
     {"path":"server/vps-shared-session.ts","category":"runtime","reason":"Import from server/index.ts"},
     {"path":"server/wake-prompt.ts","category":"runtime","reason":"Import from server/index.ts"},
     {"path":"server/webhook-ingress.ts","category":"runtime","reason":"Import from server/index.ts"},
+    {"path":"server/webhook-payload-dedupe.ts","category":"runtime","reason":"Import from server/index.ts"},
     {"path":"server/webhook-payload.ts","category":"runtime","reason":"Import from server/webhooks.ts"},
     {"path":"server/webhooks.ts","category":"runtime","reason":"Import from server/index.ts"},
     {"path":"server/workspace.ts","category":"runtime","reason":"Import from server/index.ts"},
