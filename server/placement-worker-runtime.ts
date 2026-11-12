@@ -95,6 +95,7 @@ export interface PlacementWorkerRuntimeDeps {
 export interface ActiveRunningJob {
   record: WorkerLocalLeaseRecord;
   done: Promise<{ exitCode: number | null; signal: NodeJS.Signals | null }>;
+  settled: Promise<void>;
   stopRequested?: boolean;
 }
 
@@ -312,48 +313,68 @@ export class PlacementWorkerRuntime {
     record.pid = spawnResult.pid;
     this.saveLeaseRecord(record);
 
+    let resolveSettled!: () => void;
+    const settledPromise = new Promise<void>((resolve) => {
+      resolveSettled = resolve;
+    });
+
     const activeJob: ActiveRunningJob = {
       record,
       done: spawnResult.done,
+      settled: settledPromise,
     };
     this.activeJobs.set(lease.jobId, activeJob);
 
     // Attach completion listener.
     void spawnResult.done.then(async ({ exitCode, signal }) => {
-      this.activeJobs.delete(lease.jobId);
-      const status = activeJob.stopRequested
-        ? "killed"
-        : (exitCode === 0 ? "completed" : "failed");
-
-      const report: ReportMessage = {
-        version: PLACEMENT_WIRE_VERSION,
-        controllerId: lease.controllerId,
-        epoch: lease.epoch,
-        jobId: lease.jobId,
-        leaseId: lease.leaseId,
-        hostId: this.deps.hostId,
-        status,
-        exitCode,
-        signal,
-        endedAt: this.now(),
-        reason: activeJob.stopRequested ? "stopped by controller" : undefined,
-      };
-
       try {
-        this.deps.spool.add(report);
-      } catch {
-        // Report already durable.
-      }
-      this.removeLeaseRecord(lease.jobId);
-      await settlePendingReports(this.deps.spool, this.deps.client);
+        this.activeJobs.delete(lease.jobId);
+        const status = activeJob.stopRequested
+          ? "killed"
+          : (exitCode === 0 ? "completed" : "failed");
 
-      // Trigger next work pull if running.
-      if (this.running) {
-        void this.pullAssignment();
+        const report: ReportMessage = {
+          version: PLACEMENT_WIRE_VERSION,
+          controllerId: lease.controllerId,
+          epoch: lease.epoch,
+          jobId: lease.jobId,
+          leaseId: lease.leaseId,
+          hostId: this.deps.hostId,
+          status,
+          exitCode,
+          signal,
+          endedAt: this.now(),
+          reason: activeJob.stopRequested ? "stopped by controller" : undefined,
+        };
+
+        try {
+          this.deps.spool.add(report);
+        } catch {
+          // Report already durable.
+        }
+        this.removeLeaseRecord(lease.jobId);
+        await settlePendingReports(this.deps.spool, this.deps.client);
+
+        // Trigger next work pull if running.
+        if (this.running) {
+          void this.pullAssignment();
+        }
+      } finally {
+        resolveSettled();
       }
     });
 
     return { polled: true, jobId: lease.jobId };
+  }
+
+  getActiveJob(jobId: string): ActiveRunningJob | undefined {
+    return this.activeJobs.get(jobId);
+  }
+
+  async waitForJob(jobId: string): Promise<void> {
+    const job = this.activeJobs.get(jobId);
+    if (!job) return;
+    await job.settled;
   }
 
   /** Start background loops (heartbeat and reconciliation). */
