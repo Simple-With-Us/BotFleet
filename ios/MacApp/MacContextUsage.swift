@@ -26,16 +26,22 @@ struct MacContextMeterStrip: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 6)
-        .task(id: "\(bot.id)|\(threadId)") {
-            let task = bot.tasks?.first { $0.threadId == threadId }
-            let selection = task?.modelSelection ?? bot.modelSelection
+        .task(id: "\(bot.id)|\(threadId)|\(selection.instanceId)|\(selection.model)") {
             if session.catalogWindow(instanceId: selection.instanceId, model: selection.model) == nil {
                 await session.refreshModelWindows()
             }
         }
         .task(id: "\(bot.id)|\(threadId)|\(bot.busy == true)") {
-            commands = await session.contextCommands(botId: bot.id, threadId: threadId)
+            let fresh = await session.contextCommands(botId: bot.id, threadId: threadId)
+            if !Task.isCancelled {
+                commands = fresh
+            }
         }
+    }
+
+    private var selection: ModelSelection {
+        let task = bot.tasks?.first { $0.threadId == threadId }
+        return task?.modelSelection ?? bot.modelSelection
     }
 
     private var reading: ContextMeterMath.Reading {
@@ -142,7 +148,10 @@ struct MacContextNoteBanner: View {
             }
         }
         .task(id: "\(bot.id)|\(threadId)|\(bot.busy == true)") {
-            commands = await session.contextCommands(botId: bot.id, threadId: threadId)
+            let fresh = await session.contextCommands(botId: bot.id, threadId: threadId)
+            if !Task.isCancelled {
+                commands = fresh
+            }
         }
         .task(id: noteStamp) {
             let next = ContextMeterMath.nextNote(

@@ -29,7 +29,10 @@ struct ContextMeterStrip: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 6)
         .task(id: reloadKey) {
-            commands = await session.contextCommands(botId: bot.id, threadId: threadId)
+            let fresh = await session.contextCommands(botId: bot.id, threadId: threadId)
+            if !Task.isCancelled {
+                commands = fresh
+            }
         }
     }
 
@@ -155,7 +158,10 @@ struct ContextNoteBanner: View {
             }
         }
         .task(id: reloadKey) {
-            commands = await session.contextCommands(botId: bot.id, threadId: threadId)
+            let fresh = await session.contextCommands(botId: bot.id, threadId: threadId)
+            if !Task.isCancelled {
+                commands = fresh
+            }
         }
         .task(id: noteStamp) {
             let next = ContextMeterMath.nextNote(
