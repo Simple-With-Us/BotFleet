@@ -195,6 +195,7 @@ struct MacSidebarView: View {
                     : Color(NSColor.windowBackgroundColor)
             )
         }
+        .task { await session.refreshModelWindows() }
     }
 }
 
@@ -202,6 +203,7 @@ struct MacBotRowView: View {
     let bot: Bot
     let pill: MacSidebarStatusPill
     let mascotExpression: MacMascotExpression
+    @EnvironmentObject private var session: MacSession
 
     var body: some View {
         HStack(spacing: 10) {
@@ -235,6 +237,9 @@ struct MacBotRowView: View {
                         Circle()
                             .fill(Color.accentColor)
                             .frame(width: 6, height: 6)
+                    }
+                    if let fill = MacContextFill.percent(for: bot, windows: session.modelWindows) {
+                        MacContextFillBadge(percent: fill)
                     }
                 }
 
@@ -362,10 +367,11 @@ struct MacDetailChatView: View {
                 ScrollViewReader { proxy in
                     ScrollView {
                         LazyVStack(spacing: 16) {
-                            ForEach(session.activeMessages) { message in
+                            ForEach(Array(session.activeMessages.enumerated()), id: \.element.id) { index, message in
                                 MacMessageBubbleView(
                                     message: message,
                                     renderedBlocks: session.transcriptEngine.renderedBlocks(for: message),
+                                    compactSettled: MacContextFill.compactSettled(message, in: session.activeMessages, at: index),
                                     onQuoteInReply: { text in
                                         inputText = MacTranscriptContextMenuBuilder.applyQuoteInReply(
                                             text,
@@ -374,6 +380,9 @@ struct MacDetailChatView: View {
                                     }
                                 )
                                 .id(message.id)
+                            }
+                            if let bot = session.activeBot, session.activeRoom == nil {
+                                MacContextNoteBanner(bot: bot, threadId: bot.threadId)
                             }
 
                             if let reasoning = session.activeReasoningText, !reasoning.isEmpty {
@@ -407,6 +416,10 @@ struct MacDetailChatView: View {
 
                 Divider()
 
+                if let bot = session.activeBot, session.activeRoom == nil {
+                    MacContextMeterStrip(bot: bot, threadId: bot.threadId)
+                }
+
                 // Composer Bar with Native Voice Dictation
                 MacComposerBar(inputText: $inputText)
             } else {
@@ -434,6 +447,7 @@ struct MacDetailChatView: View {
 struct MacMessageBubbleView: View {
     let message: Message
     let renderedBlocks: [MacRenderedMarkdownBlock]
+    var compactSettled = false
     var onQuoteInReply: ((String) -> Void)?
 
     var isUser: Bool {
@@ -441,6 +455,18 @@ struct MacMessageBubbleView: View {
     }
 
     var body: some View {
+        if message.role == .user, message.command?.name == "compact" {
+            Text(ContextMeterMath.compactCopy(settled: compactSettled))
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 4)
+        } else {
+            bubble
+        }
+    }
+
+    private var bubble: some View {
         HStack(alignment: .top, spacing: 12) {
             if isUser {
                 Spacer(minLength: 48)

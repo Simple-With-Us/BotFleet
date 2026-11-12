@@ -4408,7 +4408,7 @@ configureTurnIdentity((threadId) => {
 // The latest running token totals for the turn in flight on each thread.
 // Providers report cumulative-within-turn numbers; the final value is folded
 // into the task's tally when the turn settles.
-const turnUsage = new Map<string, { input: number; output?: number; cachedInput?: number }>();
+const turnUsage = new Map<string, { input: number; output?: number; cachedInput?: number; contextWindow?: number }>();
 
 // Where each 1:1 turn in flight is spending its wall time (model, tools, or
 // waiting on a person).  Folded into the task's `stats` aggregate at
@@ -6036,11 +6036,28 @@ bus.subscribe((event: RuntimeEvent) => {
       if (event.setup && bot) store.setActivity(bot.id, "dead");
       break;
     }
-    case "thread.token-usage.updated":
+    case "thread.token-usage.updated": {
       // running totals for the turn in flight; folded into the task's
-      // tally at turn.completed (below) so retries never double-count
-      turnUsage.set(event.threadId, { input: event.input, output: event.output, cachedInput: event.cachedInput });
+      // tally at turn.completed (below) so retries never double-count.
+      // A later tick that omits the window keeps the size already reported.
+      const previous = turnUsage.get(event.threadId);
+      const contextWindow = event.contextWindow ?? previous?.contextWindow;
+      if (contextWindow === undefined) {
+        turnUsage.set(event.threadId, {
+          input: event.input,
+          output: event.output,
+          cachedInput: event.cachedInput,
+        });
+      } else {
+        turnUsage.set(event.threadId, {
+          input: event.input,
+          output: event.output,
+          cachedInput: event.cachedInput,
+          contextWindow,
+        });
+      }
       break;
+    }
     case "turn.completed": {
       const completionToken = Symbol(event.turnId);
       const completionFold = (async () => {
@@ -6364,6 +6381,7 @@ bus.subscribe((event: RuntimeEvent) => {
           input: tokens?.input,
           output: tokens?.output,
           cachedInput: tokens?.cachedInput,
+          contextWindow: lastReported?.contextWindow,
           costUsd: event.cost ?? null,
           billingMode: event.billingMode,
           // No live entry (a repeated completion, a turn from before a

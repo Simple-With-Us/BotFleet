@@ -408,6 +408,9 @@ export interface TaskUsage {
    * they fill the window).  Unlike `input`, it is not a running total.  Absent
    * until a turn reports input. */
   lastInput?: number;
+  /** The context window the engine reported with that turn (`usage_update.size`).
+   * Absent when the engine did not send one.  Not a catalog guess. */
+  contextWindow?: number;
 }
 
 /** Running timing aggregate for one task, banked at each settled turn from
@@ -2492,6 +2495,8 @@ export class Store {
       input?: number;
       output?: number;
       cachedInput?: number;
+      /** The window the engine reported on this turn, when it reported one. */
+      contextWindow?: number;
       costUsd: number | null;
       billingMode?: TurnBillingMode;
       /** This turn's timing, banked in the same write so the task reaches
@@ -2504,11 +2509,15 @@ export class Store {
     const task = this.taskByThread(botId, threadId);
     if (!task) return null;
     const previousLastInput = task.usage?.lastInput;
+    const previousContextWindow = task.usage?.contextWindow;
     task.usage = mergeTaskUsage(task.usage, turn);
     // Context fullness is the LAST turn's input, not a running sum.  A turn
     // that reports no input says nothing about it, so the earlier figure stands.
     if (turn.input !== undefined && Number.isFinite(turn.input) && turn.input >= 0) task.usage.lastInput = Math.trunc(turn.input);
     else if (previousLastInput !== undefined) task.usage.lastInput = previousLastInput;
+    if (turn.contextWindow !== undefined && Number.isFinite(turn.contextWindow) && turn.contextWindow > 0) {
+      task.usage.contextWindow = Math.trunc(turn.contextWindow);
+    } else if (previousContextWindow !== undefined) task.usage.contextWindow = previousContextWindow;
     if (turn.stats) task.stats = mergeTaskStats(task.stats, turn.stats);
     if (instanceId) {
       const byInstance = (task.usageByInstance ??= {});
