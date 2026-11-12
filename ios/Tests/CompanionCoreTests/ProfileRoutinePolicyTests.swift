@@ -27,12 +27,12 @@ final class ProfileRoutinePolicyTests: XCTestCase {
 
         let ready = RoutineRunAvailability(config: configured, instances: available)
         XCTAssertTrue(ready.cloudReady)
-        XCTAssertTrue(ready.canSelect(.cloud, preserving: .maus))
+        XCTAssertTrue(ready.canSelect(.cloud, preserving: .bot))
 
         let offline = RoutineRunAvailability(config: configured, instances: unavailable)
-        XCTAssertFalse(offline.canSelect(.cloud, preserving: .maus))
+        XCTAssertFalse(offline.canSelect(.cloud, preserving: .bot))
         XCTAssertTrue(offline.canSelect(.cloud, preserving: .cloud), "an existing cloud routine must not silently move")
-        XCTAssertTrue(offline.canSelect(.maus, preserving: .cloud))
+        XCTAssertTrue(offline.canSelect(.bot, preserving: .cloud))
     }
 
     func testEngineStatusLabelKeepsAmbiguousProbeFailuresUnavailable() {
@@ -98,7 +98,7 @@ final class ProfileRoutinePolicyTests: XCTestCase {
             name: "Brief",
             prompt: "Summarize",
             botId: "bot-1",
-            runOn: "maus",
+            runOn: "bot",
             enabled: false,
             schedule: schedule,
             durationMinutes: 30,

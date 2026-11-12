@@ -35,7 +35,7 @@ import {
   type BrowserTarget,
   type CropRegion,
 } from "./computer-observation.ts";
-import { CONTROL_REFUSAL, createControlClient } from "./control-client.ts";
+import { controlRefusal, createControlClient } from "./control-client.ts";
 import {
   ensureRemoteCuaCommand,
   REMOTE_CUA_EXECUTABLE,
@@ -353,15 +353,15 @@ function geometryFrom(stdout: string): Frame["geometry"] {
 function automationSummary(stdout: string): string {
   if (/^BACKEND CUA$/m.test(stdout)) {
     const encoded = stdout.match(/^CUA_RESULT\s+([^\s]+)$/m)?.[1];
-    if (!encoded) return `Cua Driver ${REMOTE_CUA_VERSION}`;
+    if (!encoded) return `CUA Driver ${REMOTE_CUA_VERSION}`;
     try {
       const result = JSON.parse(Buffer.from(encoded, "base64").toString("utf8")) as Record<string, unknown>;
       const details = [result.effect, result.route, result.escalation]
         .filter((value): value is string => typeof value === "string" && Boolean(value))
         .slice(0, 3);
-      return [`Cua Driver ${REMOTE_CUA_VERSION}`, ...details].join(" · ");
+      return [`CUA Driver ${REMOTE_CUA_VERSION}`, ...details].join(" · ");
     } catch {
-      return `Cua Driver ${REMOTE_CUA_VERSION}`;
+      return `CUA Driver ${REMOTE_CUA_VERSION}`;
     }
   }
   return /^BACKEND X11$/m.test(stdout) ? "X11 fallback" : "automation backend unavailable";
@@ -528,7 +528,7 @@ const TOOLS = [
   },
   {
     name: "computer_status",
-    description: "Report whether the cloud computer is using Cua Driver or the degraded X11 fallback.",
+    description: "Report whether the cloud computer is using CUA Driver or the degraded X11 fallback.",
     inputSchema: { type: "object", properties: {} },
   },
   {
@@ -803,14 +803,17 @@ async function semanticActAndObserve(
 const OPEN_WHILE_DRIVEN = new Set(["computer_request_help", "computer_status", "observation_metrics"]);
 
 async function call(id: unknown, name: string, args: any) {
-  if (!OPEN_WHILE_DRIVEN.has(name) && (await control.state(true)).held) {
-    return text(id, CONTROL_REFUSAL, true);
+  // Help, status, and metrics only look.  A blocking check would turn a
+  // hand-back that happened during the wait into a brand-new plea.
+  const driving = await control.state(true, !OPEN_WHILE_DRIVEN.has(name));
+  if (!OPEN_WHILE_DRIVEN.has(name) && driving.held) {
+    return text(id, controlRefusal(driving), true);
   }
   if (name === "computer_request_help") {
     if (!control.configured) {
       return text(id, "nobody can be paged for this computer right now — carry on carefully", true);
     }
-    const initial = await control.state(true);
+    const initial = await control.state(true, false);
     // If the person is already driving, don't clobber whatever plea they
     // are reading — just wait for the hand-back.
     const requestId = initial.held ? null : await control.requestHelp(String(args?.reason ?? ""));
@@ -821,7 +824,7 @@ async function call(id: unknown, name: string, args: any) {
     const deadline = Date.now() + CONTROL_WAIT_MS;
     while (Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, CONTROL_POLL_MS));
-      const state = await control.state(true);
+      const state = await control.state(true, false);
       if (state.held) sawHold = true;
       if (!state.held && !state.helpOpen) {
         return text(
@@ -936,10 +939,10 @@ async function call(id: unknown, name: string, args: any) {
     ].join("\n");
     const out = await runOnBox(command, 20_000);
     if (!/^CUA /m.test(out.stdout)) {
-      return text(id, "Cloud computer automation: X11 fallback (Cua Driver is still installing or needs repair).", true);
+      return text(id, "Cloud computer automation: X11 fallback (CUA Driver is still installing or needs repair).", true);
     }
     const overall = out.stdout.match(/"overall"\s*:\s*"(ok|degraded|failed)"/)?.[1] ?? "unknown";
-    return text(id, `Cloud computer automation: Cua Driver ${REMOTE_CUA_VERSION} (${overall}).`);
+    return text(id, `Cloud computer automation: CUA Driver ${REMOTE_CUA_VERSION} (${overall}).`);
   }
   if (name === "click") {
     const x = Math.round(Number(args.x));

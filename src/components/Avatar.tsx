@@ -1,8 +1,8 @@
 // Bot avatar — the Blob Studio "Cursor" mascot (CursorAvatar.tsx), wrapped
-// in the app's historical MausAvatar API so no call site changes: per-bot
+// in the app's historical BotMascot API so no call site changes: per-bot
 // color becomes a body gradient, the app's one-shot motion beats borrow the
 // face/state for a moment, and the eyes follow the pointer. The previous
-// hand-built Maus body + face engine (maus-engine/face/driver) is gone;
+// hand-built Bot body + face engine (legacy face/driver) is gone;
 // CursorAvatar owns morphing, blinking, drift, body motion and effects.
 import {
   forwardRef,
@@ -13,7 +13,17 @@ import {
   useState,
   type PointerEvent as ReactPointerEvent,
 } from "react";
-import { MAUS_COLORS, type MausColor, type MausMotion, type MausState } from "@/lib/mascot";
+import {
+  BOT_COLORS,
+  mapBotStateToCursorAvatarState,
+  stateWithSpeech,
+  type BotColor,
+  type BotMotion,
+  type BotState,
+} from "@/lib/mascot";
+import { useSpeakingBotId } from "@/lib/tts/useSpeech";
+import { TVFaceAvatar } from "./tv-face/TVFaceAvatar";
+import { AnimatedFileAvatar } from "./avatar-file/AnimatedFileAvatar";
 import {
   CursorAvatar,
   DEFAULT_SILHOUETTE,
@@ -34,7 +44,7 @@ const GRADIENT_SILHOUETTE: CursorSilhouette = {
 };
 
 /**
- * Legacy face-placement knobs from the Maus body era. The cursor mascot
+ * Legacy face-placement knobs from the Bot body era. The cursor mascot
  * places its own face; these remain only so the preview harness's sliders
  * keep compiling — the matching props are accepted and ignored.
  */
@@ -56,7 +66,7 @@ const POINTER_GAZE = { forward: 1, authored: 0.25 };
  */
 interface MotionFaces
   extends Partial<
-    Record<Exclude<MausMotion, "none">, { state?: MausState; blink?: boolean; spin?: number }>
+    Record<Exclude<BotMotion, "none">, { state?: BotState; blink?: boolean; spin?: number }>
   > {}
 
 const MOTION_FACE: MotionFaces = {
@@ -96,22 +106,22 @@ function mix(hex: string, toward: string, t: number): string {
  * shadow), with the same light/dark spread as the pack's default green
  * ["#9FE6B5", "#3FAE6E", "#1C7A4C"].
  */
-const gradientFor = (color: MausColor): [string, string, string] => {
-  const fill = MAUS_COLORS[color] ?? MAUS_COLORS.green;
+const gradientFor = (color: BotColor): [string, string, string] => {
+  const fill = BOT_COLORS[color] ?? BOT_COLORS.green;
   return [mix(fill, "#ffffff", 0.55), fill, mix(fill, "#000000", 0.42)];
 };
 
-export type MausAvatarHandle = CursorAvatarHandle;
+export type BotMascotHandle = CursorAvatarHandle;
 
-export type MausAvatarProps = {
-  color: MausColor;
+export type BotMascotProps = {
+  color: BotColor;
   /** Named behaviour — drives the expression pool, its cadence and blinking. */
-  state?: MausState;
+  state?: BotState;
   /** Pin one of the 25 faces and stop the state's own drift. */
   expression?: number;
   size?: number;
   label?: string;
-  motion?: MausMotion;
+  motion?: BotMotion;
   motionKey?: number;
   /** Head turn in degrees. */
   turn?: number;
@@ -131,14 +141,14 @@ export type MausAvatarProps = {
   trackPointer?: boolean;
   /** Run the animation. Off renders the state's resting face. */
   animated?: boolean;
-  /** Legacy Maus face-placement knobs — accepted, ignored. */
+  /** Legacy Bot face-placement knobs — accepted, ignored. */
   eyeSpacing?: number;
   faceX?: number;
   faceY?: number;
   faceScale?: number;
 };
 
-function MausAvatarComponent(
+function BotMascotComponent(
   {
     color,
     state = "idle",
@@ -157,8 +167,8 @@ function MausAvatarComponent(
     lookAround,
     trackPointer = true,
     animated = true,
-  }: MausAvatarProps,
-  ref: React.Ref<MausAvatarHandle>,
+  }: BotMascotProps,
+  ref: React.Ref<BotMascotHandle>,
 ) {
   const inner = useRef<CursorAvatarHandle>(null);
   useImperativeHandle(ref, () => ({
@@ -168,7 +178,7 @@ function MausAvatarComponent(
   }));
 
   // A one-shot motion borrows the state for a moment, then hands it back.
-  const [motionState, setMotionState] = useState<MausState | null>(null);
+  const [motionState, setMotionState] = useState<BotState | null>(null);
   useEffect(() => {
     if (motion === "none" || !animated) return;
     const beat = MOTION_FACE[motion];
@@ -202,7 +212,7 @@ function MausAvatarComponent(
     >
       <CursorAvatar
         ref={inner}
-        state={motionState ?? state}
+        state={mapBotStateToCursorAvatarState(motionState ?? state)}
         expression={expression}
         size={size}
         silhouette={GRADIENT_SILHOUETTE}
@@ -221,12 +231,14 @@ function MausAvatarComponent(
   );
 }
 
-export const MausAvatar = memo(forwardRef(MausAvatarComponent));
+export const BotMascot = memo(forwardRef(BotMascotComponent));
 
-export type BotAvatarProps = Omit<MausAvatarProps, "color"> & {
+export type BotAvatarProps = Omit<BotMascotProps, "color"> & {
   bot: {
+    /** The bot's id, which is how the speech snapshot names the bot talking. */
+    id?: string;
     name?: string;
-    color: MausColor;
+    color: BotColor;
     avatarUrl?: string | null;
     avatarCrop?: BotAvatarCrop;
   };
@@ -241,12 +253,65 @@ export function BotAvatar({ bot, size = 44, label, ...mascotProps }: BotAvatarPr
   const profile = botAvatarProfile(bot);
   const [imageFailed, setImageFailed] = useState(false);
 
+  // A bot that is speaking is drawn as speaking, whatever else it is doing,
+  // because a moving mouth is the thing a listener is watching.  The speaker
+  // is a window-wide singleton, so this is the one place that can tell
+  // whether this bot is the one talking.
+  //
+  // The subscription is narrow on purpose.  A screen can hold a long list of
+  // avatars, and the speech snapshot is replaced on every caption, so every
+  // avatar that read all of it re-rendered on every line of a spoken reply.
+  // Reading only the name of the speaking bot means an avatar re-renders
+  // when its own bot starts or stops talking, and not otherwise.
+  const speakingBotId = useSpeakingBotId();
+  const state = stateWithSpeech(mascotProps.state, speakingBotId, bot.id);
+
   useEffect(() => setImageFailed(false), [profile.avatarUrl]);
+
+  if (profile.avatarCrop === "tvface") {
+    return (
+      <TVFaceAvatar
+        state={state}
+        color={bot.color}
+        size={size}
+        label={label ?? bot.name}
+        animated={mascotProps.animated}
+      />
+    );
+  }
+
+  // The corner radius of an image crop.  It is worked out before the
+  // branches because the animated crop needs it too: that crop is not a crop
+  // at all, it plays the file's own frames, and the artwork is drawn whole.
+  const radius =
+    profile.avatarCrop === "circle"
+      ? "50%"
+      : profile.avatarCrop === "rounded"
+        ? "22%"
+        : "0";
+
+  if (profile.avatarCrop === "animated" && profile.avatarUrl && !imageFailed) {
+    // A one-file animated avatar.  The component draws the ordinary image
+    // until the file proves it carries a manifest, so an avatar that turns
+    // out to be a plain picture looks exactly as it always did.
+    return (
+      <AnimatedFileAvatar
+        src={profile.avatarUrl}
+        state={state}
+        size={size}
+        alt={label ?? (bot.name ? `${bot.name} avatar` : "Bot avatar")}
+        radius={radius}
+        animated={mascotProps.animated}
+        onError={() => setImageFailed(true)}
+      />
+    );
+  }
 
   if (profile.avatarCrop === "mascot" || !profile.avatarUrl || imageFailed) {
     return (
-      <MausAvatar
+      <BotMascot
         {...mascotProps}
+        state={state}
         color={bot.color}
         size={size}
         label={label ?? bot.name}
@@ -254,12 +319,6 @@ export function BotAvatar({ bot, size = 44, label, ...mascotProps }: BotAvatarPr
     );
   }
 
-  const radius =
-    profile.avatarCrop === "circle"
-      ? "50%"
-      : profile.avatarCrop === "rounded"
-        ? "22%"
-        : "0";
   return (
     <img
       src={profile.avatarUrl}
@@ -312,3 +371,9 @@ export function InitialsAvatar({
   );
 }
 
+
+
+/** @deprecated Temporary alias during the Maus → Bot rebrand. Prefer BotMascot. */
+export const MausAvatar = BotMascot;
+export type MausAvatarProps = BotMascotProps;
+export type MausAvatarHandle = BotMascotHandle;

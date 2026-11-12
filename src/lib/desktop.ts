@@ -34,13 +34,17 @@ export function browserDesktopCapabilities(): DesktopCapabilities {
 }
 
 export function initialDesktopCapabilities(): DesktopCapabilities {
-  const platform = window.ogb?.platform;
+  const platform = typeof window !== "undefined" ? window.ogb?.platform : undefined;
   if (!platform) return browserCapabilities;
   const isMac = platform === "darwin";
   const dictation: DesktopCapabilities["dictation"] = {
     available: isMac,
     engine: isMac ? "apple-speech" : "none",
     onDevice: isMac,
+    // Optimistic first paint, not an answer: only the main process knows the
+    // host's macOS version, and Personal Voice needs 14+. `ready` stays false
+    // until the real capabilities land, so nothing is offered on this value.
+    personalVoice: false,
   };
   if (!isMac) dictation.reasonCode = "unsupported-platform";
   return {
@@ -57,7 +61,7 @@ export function initialDesktopCapabilities(): DesktopCapabilities {
 
 export async function loadDesktopCapabilities(): Promise<DesktopCapabilities> {
   if (cached) return cached;
-  if (!window.ogb?.getCapabilities) return browserCapabilities;
+  if (typeof window === "undefined" || !window.ogb?.getCapabilities) return browserCapabilities;
   const revisionAtStart = cacheRevision;
   let loaded: DesktopCapabilities;
   try {

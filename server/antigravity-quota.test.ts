@@ -241,6 +241,130 @@ describe("createAntigravityQuotaPoller", () => {
     expect(registry.get("bot", ANTIGRAVITY_INSTANCE_ID, "claude-opus-4-6-thinking")?.error).toBe("prior");
     poller.stop();
   });
+
+  // OP3 / HS13: the poller used to spawn the CLI every 60s whether or not
+  // any bot uses Antigravity — 1,440 spawns a day at idle.
+  it("never spawns the CLI while isConfigured() is false, and resumes once it is true", async () => {
+    let configured = false;
+    let execCalls = 0;
+    const poller = createAntigravityQuotaPoller({
+      exec: async () => {
+        execCalls += 1;
+        return JSON.stringify(FIXTURE);
+      },
+      log: () => {},
+      isConfigured: () => configured,
+    });
+
+    await poller.tick(true);
+    expect(execCalls).toBe(0);
+    expect(poller.lastSnapshot()).toBeNull();
+
+    configured = true;
+    const snapshot = await poller.tick(true);
+    expect(execCalls).toBe(1);
+    expect(snapshot?.models).toHaveLength(5);
+    poller.stop();
+  });
+
+  it("backs off exponentially on consecutive failures and resets the instant one succeeds", async () => {
+    let now = 0;
+    let execCalls = 0;
+    let fail = true;
+    const poller = createAntigravityQuotaPoller({
+      now: () => now,
+      intervalMs: 60_000,
+      exec: async () => {
+        execCalls += 1;
+        if (fail) throw new Error("boom");
+        return JSON.stringify(FIXTURE);
+      },
+      log: () => {},
+    });
+
+    now = 0;
+    await poller.tick(true); // attempt 1 (forced): fails, backoff -> nextAttemptAt = 60_000
+    expect(execCalls).toBe(1);
+
+    now = 59_999;
+    await poller.tick(false); // still inside the backoff window: no spawn
+    expect(execCalls).toBe(1);
+
+    now = 60_000;
+    await poller.tick(false); // attempt 2: fails, backoff -> nextAttemptAt = 60_000 + 120_000 = 180_000
+    expect(execCalls).toBe(2);
+
+    now = 179_999;
+    await poller.tick(false); // still inside the LONGER window from attempt 2: no spawn
+    expect(execCalls).toBe(2);
+
+    now = 180_000;
+    fail = false; // recovers on attempt 3
+    await poller.tick(false);
+    expect(execCalls).toBe(3);
+    expect(poller.lastSnapshot()?.models).toHaveLength(5);
+
+    // Reset on success: the very next tick, with no delay at all, spawns
+    // again immediately rather than honoring a stale backoff.
+    fail = true;
+    await poller.tick(false);
+    expect(execCalls).toBe(4);
+    poller.stop();
+  });
+
+  it("collapses repeated identical poll failures into one log line", async () => {
+    let now = 0;
+    const lines: string[] = [];
+    const poller = createAntigravityQuotaPoller({
+      now: () => now,
+      intervalMs: 1,
+      exec: async () => {
+        throw new Error("boom");
+      },
+      log: (message) => lines.push(message),
+    });
+
+    await poller.tick(true);
+    now += 1;
+    await poller.tick(true);
+    now += 1;
+    await poller.tick(true);
+
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toBe("poll failed: boom");
+    poller.stop();
+  });
+
+  it("retries a truncated JSON response once immediately, then backs off like any other failure", async () => {
+    let now = 0;
+    let execCalls = 0;
+    const poller = createAntigravityQuotaPoller({
+      now: () => now,
+      intervalMs: 60_000,
+      exec: async () => {
+        execCalls += 1;
+        throw new SyntaxError("Unexpected end of JSON input");
+      },
+      log: () => {},
+    });
+
+    await poller.tick(true); // attempt 1: truncated -> free immediate retry, nextAttemptAt reset to 0
+    expect(execCalls).toBe(1);
+
+    await poller.tick(false); // attempt 2 (the free retry, same tick's clock): still truncated -> now backs off for real
+    expect(execCalls).toBe(2);
+
+    await poller.tick(false); // backoff is active: no spawn
+    expect(execCalls).toBe(2);
+
+    now = 60_000;
+    await poller.tick(false); // attempt 3: backoff elapsed, still truncated -> escalates further (no more free retries this incident)
+    expect(execCalls).toBe(3);
+
+    await poller.tick(false); // immediately after attempt 3: the escalated backoff is active, no spawn
+    expect(execCalls).toBe(3);
+    poller.stop();
+  });
 });
 
 describe("findAntigravityUsageBin", () => {

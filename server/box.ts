@@ -20,9 +20,13 @@ const READY = new Set(["idle", "ready", "running"]);
 const DEFAULT_BOX_TTL_SECONDS = 8 * 60 * 60;
 const TRIAL_BOX_TTL_SECONDS = 2 * 60 * 60;
 
-function boxFetch(cfg: AppConfig, path: string, opts: RequestInit = {}) {
+const BOX_FETCH_TIMEOUT_MS = 30_000;
+
+export async function boxFetch(cfg: AppConfig, path: string, opts: RequestInit = {}): Promise<Response> {
+  const { signal, ...rest } = opts;
   return fetch(`${BOX_API}${path}`, {
-    ...opts,
+    ...rest,
+    signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(BOX_FETCH_TIMEOUT_MS)]) : AbortSignal.timeout(BOX_FETCH_TIMEOUT_MS),
     headers: {
       authorization: `Bearer ${cfg.box?.token}`,
       "content-type": "application/json",
@@ -296,7 +300,7 @@ export async function provisionBox(cfg: AppConfig, botId: string, botName: strin
     const ready = await waitReady(cfg, box.id);
     if (!ready) throw new Error("box did not become ready within 90s — retry in a minute");
 
-    // Install the exact Cua Driver executable in the background, keep its
+    // Install the exact CUA Driver executable in the background, keep its
     // daemon private to the VM, and retain X11 tooling as a degraded fallback.
     const bootstrap = remoteComputerBootstrapCommand(botName);
     let boot;
@@ -431,5 +435,10 @@ export async function screenshotBox(cfg: AppConfig, botId: string, knownBoxId?: 
   }
   const data = await readFileBase64(cfg, boxId, PANEL_PATH);
   if (!data) throw new Error("could not read the frame back from the box");
-  return { png: data, format: "jpeg" };
+  // Stamped in the harness clock, matching vpsComputerScreenshot and the
+  // frames ScreenPollers publishes.  The panel ages a polled capture against a
+  // streamed one to decide which picture is newer, and that comparison is only
+  // meaningful when both stamps come from one clock — a browser-clock fallback
+  // here would reintroduce exactly that skew for the Box backend alone.
+  return { png: data, format: "jpeg" as const, capturedAt: Date.now() };
 }

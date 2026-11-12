@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { afterAll, describe, expect, it } from "vitest";
 
 import { removeTempDir, spawnDetached, waitForExit } from "./testing/cleanup.ts";
+import { harnessReady } from "./testing/harness-ready.ts";
 
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(SERVER_DIR, "..");
@@ -51,10 +52,7 @@ async function launchHarness(): Promise<ChildProcess> {
   children.push(child);
   child.stdout?.on("data", (chunk) => (output += String(chunk)));
   child.stderr?.on("data", (chunk) => (output += String(chunk)));
-  await expect.poll(async () => {
-    try { return (await fetch(`${BASE}/api/health`)).status; }
-    catch { return 0; }
-  }, { timeout: 20_000 }).toBe(200);
+  await expect.poll(() => harnessReady(BASE), { timeout: 20_000 }).toBe(true);
   return child;
 }
 

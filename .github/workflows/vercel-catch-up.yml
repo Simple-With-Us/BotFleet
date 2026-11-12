@@ -1,0 +1,109 @@
+name: Vercel production catch-up
+
+on:
+  workflow_run:
+    workflows: ["CI", "Node CI"]
+    types: [completed]
+    branches: [main]
+  schedule:
+    - cron: '41 * * * *'
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - scripts/deploy/**
+      - .github/workflows/vercel-catch-up.yml
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: vercel-production-catch-up
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+      - run: node --test scripts/deploy/vercel-catch-up.node-test.mjs
+
+  deploy:
+    needs: test
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.VERCEL_CATCH_UP_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERCEL_ORG_ID: team_l3mWAejl1E08y8ijku5DpBE6
+      VERCEL_PROJECT_ID: prj_m5bk3D75HzKZfIVSM3OmMx7WYwKz
+      VERCEL_TELEMETRY_DISABLED: '1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+      - name: Check Dedicated Service Token Binding
+        id: credentials
+        env:
+          INFISICAL_TOKEN: ${{ secrets.BOTFLEET_VERCEL_CATCHUP_READ_TOKEN }}
+          INFISICAL_SECRET_PATH: ${{ vars.INFISICAL_VERCEL_CATCH_UP_SECRET_PATH }}
+        run: |
+          canonical_non_root=true
+          case "$INFISICAL_SECRET_PATH" in
+            ''|'/'|[!/]*) canonical_non_root=false ;;
+            *'//'*|*/./*|*/../*|*/.|*/..|*'*'*|*'?'*|*'['*|*']'*|*'{'*|*'}'*) canonical_non_root=false ;;
+          esac
+          if [ -n "$INFISICAL_TOKEN" ] && [ "$canonical_non_root" = true ]; then
+            echo 'available=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'available=false' >> "$GITHUB_OUTPUT"
+            echo '::notice::Vercel catch-up is paused until its dedicated token and non-root Infisical folder are bound.'
+            echo 'Vercel catch-up is paused until its dedicated token and non-root Infisical folder are bound.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Load deploy token through its dedicated Fleet-OPS read binding
+        if: steps.credentials.outputs.available == 'true'
+        env:
+          INFISICAL_PROJECT_ID: 8dae6d03-8f12-48b2-adf3-e5c1b881c8c5
+          INFISICAL_ENVIRONMENT: prod
+          INFISICAL_SECRET_PATH: ${{ vars.INFISICAL_VERCEL_CATCH_UP_SECRET_PATH }}
+          INFISICAL_NAMES: VERCEL_TOKEN
+          INFISICAL_REQUIRED: VERCEL_TOKEN
+          # Binding is pending AFC-600 scope and registry verification.
+          # No broad machine identity fallback is permitted.
+          INFISICAL_TOKEN: ${{ secrets.BOTFLEET_VERCEL_CATCHUP_READ_TOKEN }}
+        run: node scripts/infisical-fetch.mjs
+      - name: Check binding, deployed SHA, cooldown and exact-main CI
+        if: steps.credentials.outputs.available == 'true'
+        id: gate
+        run: node scripts/deploy/vercel-catch-up.mjs prepare
+      - name: Install pinned Vercel CLI
+        if: steps.gate.outputs.deploy == 'true'
+        run: npm install --global vercel@64.5.0
+      - name: Pull project settings and build from repo root
+        if: steps.gate.outputs.deploy == 'true'
+        run: |
+          vercel pull --yes --environment=production
+          vercel build --prod --yes
+      - name: Recheck main, publisher binding and 3h window before upload
+        if: steps.gate.outputs.deploy == 'true'
+        id: recheck
+        run: node scripts/deploy/vercel-catch-up.mjs
+      - name: Deploy once and verify provider receipt
+        if: steps.recheck.outputs.deploy == 'true'
+        run: |
+          set -euo pipefail
+          vercel deploy --prebuilt --prod --yes --json \
+            --meta fleetCommitSha="$(git rev-parse HEAD)" \
+            --meta githubCommitSha="$(git rev-parse HEAD)" \
+            --meta githubCommitRef=main > "$RUNNER_TEMP/vercel-deployment.json"
+          node scripts/deploy/vercel-catch-up.mjs receipt "$RUNNER_TEMP/vercel-deployment.json"

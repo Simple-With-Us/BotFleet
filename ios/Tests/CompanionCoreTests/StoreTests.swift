@@ -38,6 +38,195 @@ final class StoreTests: XCTestCase {
         }
     }
 
+    // MARK: - Hydration merges scrollback instead of wiping it (IO12)
+
+    func testRehydratingMergesTheFreshPageInsteadOfDiscardingPagedInScrollback() throws {
+        var state = try hydrated()
+        let threadId = try XCTUnwrap(state.bots.first?.threadId)
+        let beforeCount = state.transcript(forThread: threadId).count
+
+        // Simulate "Load earlier": an older page the fresh 50-message
+        // hydrate below will not repeat.
+        state.prepend(
+            ThreadPage(messages: [message("older-page-1", at: 0)], hasMore: true),
+            toThread: threadId
+        )
+        XCTAssertEqual(state.transcript(forThread: threadId).count, beforeCount + 1)
+
+        state.hydrate(try fleet())
+
+        XCTAssertTrue(
+            state.transcript(forThread: threadId).contains { $0.id == "older-page-1" },
+            "a foreground re-hydrate must not discard scrollback paged in earlier"
+        )
+        XCTAssertEqual(state.transcript(forThread: threadId).count, beforeCount + 1)
+    }
+
+    func testRehydratingReplacesOverlappingMessageIdsWithTheFreshCopy() throws {
+        var state = try hydrated()
+        let threadId = try XCTUnwrap(state.bots.first?.threadId)
+        let existingId = try XCTUnwrap(state.transcript(forThread: threadId).first?.id)
+
+        var edited = try fleet()
+        if let index = edited.bots.firstIndex(where: { $0.threadId == threadId }) {
+            edited.bots[index].messages = edited.bots[index].messages?.map { original in
+                guard original.id == existingId else { return original }
+                var patched = original
+                patched.text = "edited server-side"
+                return patched
+            }
+        }
+
+        state.hydrate(edited)
+
+        let merged = state.transcript(forThread: threadId).first { $0.id == existingId }
+        XCTAssertEqual(merged?.text, "edited server-side")
+    }
+
+    func testRehydratingDoesNotUnlearnHasMoreOnceScrollbackAlreadyExtendsPastTheFreshPage() throws {
+        var state = try hydrated()
+        let threadId = try XCTUnwrap(state.bots.first?.threadId)
+        // The fixture's bot already reports `hasMore: false` — establish
+        // "there is more above" the way paging earlier actually would.
+        state.prepend(
+            ThreadPage(messages: [message("older-page-1", at: 0)], hasMore: true),
+            toThread: threadId
+        )
+        XCTAssertEqual(state.hasMore[threadId], true)
+
+        // A plain foreground re-hydrate re-fetches only the newest 50 and
+        // reports `hasMore: false` for that narrow window — it must not
+        // un-learn the boundary already resolved by paging further back.
+        state.hydrate(try fleet())
+
+        XCTAssertEqual(
+            state.hasMore[threadId], true,
+            "a 50-message re-hydrate must not overwrite a boundary already resolved by paging earlier"
+        )
+    }
+
+    func testStubHydrateDoesNotWipeAnAlreadyLoadedThread() throws {
+        // #609 changed hydrateSnapshot() to fetch only a one-message stub
+        // per thread (`fleet(messages: 1)`), so launch no longer lays out
+        // every bot's full scrollback; ChatView separately loads the full
+        // page for a thread via `loadInitialMessages` the first time the
+        // person opens it. Review on #609 (before IO12's merge fix landed
+        // in #614) flagged that any LATER hydrate — push refresh,
+        // reconnect, approval-reply — still only fetches that same
+        // one-message stub, and would collapse an already-opened chat back
+        // down to it. This proves the two now interact correctly: a stub
+        // hydrate merges by id like any other hydrate, so it cannot discard
+        // a fuller page the person already has loaded.
+        var state = try hydrated()
+        let threadId = try XCTUnwrap(state.bots.first?.threadId)
+
+        // "Open the chat": loadInitialMessages's own merge path, on top of
+        // whatever the initial fixture hydrate already seeded for this
+        // thread (the fixture is not necessarily empty — merge, not a
+        // literal count, is the invariant under test).
+        let fullPage = (0..<50).map { message("full-\($0)", at: Double($0) + 1000) }
+        state.merge(ThreadPage(messages: fullPage, hasMore: true), intoThread: threadId)
+        let loadedCount = state.transcript(forThread: threadId).count
+        XCTAssertGreaterThanOrEqual(loadedCount, 50)
+
+        // A mid-session hydrate arrives with only the newest-message stub —
+        // exactly what `fleet(messages: 1)` returns.
+        var stub = try fleet()
+        let stubIndex = try XCTUnwrap(stub.bots.firstIndex { $0.threadId == threadId })
+        stub.bots[stubIndex].messages = [message("full-49", at: 1049)]
+        stub.bots[stubIndex].hasMore = true
+        state.hydrate(stub)
+
+        XCTAssertEqual(
+            state.transcript(forThread: threadId).count, loadedCount,
+            "a one-message stub hydrate must merge into, not replace, an already-loaded thread"
+        )
+    }
+
+    func testPendingApprovalsFindsANonTipCardAfterTheBackfillMerge() throws {
+        // #1660: hydration carries one message per thread, so a thread
+        // whose unanswered card is not its newest message contributes
+        // nothing to pendingApprovals until its first page is merged —
+        // which is what Session.backfillStubThreads does, per stub
+        // thread, when the chat list goes live.
+        var state = try hydrated()
+        let threadId = try XCTUnwrap(state.bots.first?.threadId)
+        func card(_ id: String, at: Double) -> Message {
+            var message = Message(id: id, role: .bot, kind: .options, at: at)
+            message.card = OptionCard(
+                title: "Approval needed", subtitle: "rm -rf ./build", options: ["Allow", "Deny"],
+                answered: nil, dismissed: nil, requestId: "r-\(id)", tool: "Bash",
+                held: nil, allowKey: "Bash:rm"
+            )
+            return message
+        }
+        // The stub: only the tip is held, and the tip is not the card.
+        state.messages[threadId] = [message("tip", at: 10)]
+        XCTAssertFalse(
+            state.pendingApprovals.contains { $0.threadId == threadId },
+            "a stub thread cannot surface an approval it has not loaded"
+        )
+        // The backfill merge: the first page carries the older card.
+        state.merge(
+            ThreadPage(messages: [card("card", at: 5), message("tip", at: 10)], hasMore: true),
+            intoThread: threadId
+        )
+        XCTAssertEqual(
+            state.pendingApprovals.filter { $0.threadId == threadId }.map(\.message.id),
+            ["card"]
+        )
+    }
+
+    func testRehydrateWithNoMessagesFieldLeavesExistingScrollbackUntouched() throws {
+        var state = try hydrated()
+        let threadId = try XCTUnwrap(state.bots.first?.threadId)
+        let before = state.transcript(forThread: threadId)
+        XCTAssertFalse(before.isEmpty)
+
+        // A response shape that omits `messages` entirely for a bot that
+        // still exists — decodes to `nil`, not `[]` — must never be read as
+        // "this thread now has zero messages".
+        let json = #"""
+        {
+          "bots": [
+            {
+              "id": "4f254cf4-98c5-45ca-907e-967e2bbcb8ac",
+              "threadId": "\#(threadId)",
+              "name": "Pesto",
+              "title": "",
+              "description": "",
+              "notifications": true,
+              "color": "green",
+              "unread": true,
+              "modelSelection": { "instanceId": "", "model": "" },
+              "createdAt": 1786742441013
+            }
+          ],
+          "groups": []
+        }
+        """#
+        let noMessagesField = try JSONDecoder().decode(Fleet.self, from: Data(json.utf8))
+
+        state.hydrate(noMessagesField)
+
+        XCTAssertEqual(state.transcript(forThread: threadId), before)
+    }
+
+    func testRehydrateDropsScrollbackOnlyForAThreadNoLongerInTheFleet() throws {
+        var state = try hydrated()
+        let deletedThreadId = "thread-deleted-elsewhere"
+        state.apply(.message(threadId: deletedThreadId, message: message("orphan-1")))
+        XCTAssertFalse(state.transcript(forThread: deletedThreadId).isEmpty)
+
+        state.hydrate(try fleet())
+
+        XCTAssertTrue(
+            state.transcript(forThread: deletedThreadId).isEmpty,
+            "a thread absent from the fresh roster is the one real reset signal a hydrate carries today"
+        )
+        XCTAssertNil(state.hasMore[deletedThreadId])
+    }
+
     func testConflictRefreshSnapshotCannotOverwriteAConcurrentStreamFrame() throws {
         var state = try hydrated()
         let staleSnapshot = try fleet()
@@ -205,6 +394,118 @@ final class StoreTests: XCTestCase {
         XCTAssertTrue(state.transcript(forThread: bot.threadId).contains { $0.id == "from-server" })
     }
 
+    func testHydrateKeepsBusyPendingWhenOnlySameTextLanded() throws {
+        var state = try hydrated()
+        let bot = try XCTUnwrap(state.bots.first)
+        state.rememberPendingSend(threadId: bot.threadId, id: "q-busy-h", text: "same text", queued: true)
+        var snapshot = try fleet()
+        var hydratedBot = try XCTUnwrap(snapshot.bots.first { $0.id == bot.id })
+        // A different same-text user row (no queueId) landed while offline.
+        hydratedBot.messages = (hydratedBot.messages ?? []) + [message("other-send", text: "same text")]
+        snapshot = Fleet(
+            bots: snapshot.bots.map { $0.id == bot.id ? hydratedBot : $0 },
+            groups: snapshot.groups
+        )
+        state.hydrate(snapshot)
+        XCTAssertTrue((state.pendingQueued[bot.threadId] ?? []).contains { $0.queueId == "q-busy-h" })
+
+        // Its own drained row (stamped with the queueId) retires it.
+        var drained = message("drained", text: "same text")
+        drained.queueId = "q-busy-h"
+        hydratedBot.messages = (hydratedBot.messages ?? []) + [drained]
+        snapshot = Fleet(
+            bots: snapshot.bots.map { $0.id == bot.id ? hydratedBot : $0 },
+            groups: snapshot.groups
+        )
+        state.hydrate(snapshot)
+        XCTAssertFalse((state.pendingQueued[bot.threadId] ?? []).contains { $0.queueId == "q-busy-h" })
+    }
+
+    func testPendingOptimisticAtStaysStableAcrossVisibleTranscript() {
+        var state = CompanionState()
+        let threadId = "t-pending-at"
+        state.rememberPendingSend(threadId: threadId, id: "local-1", text: "old ask", queued: false)
+        let first = state.pendingQueued[threadId]!.first!.at
+        let visibleA = state.visibleTranscript(forThread: threadId)
+        // Simulate time passing without reminting the stamp.
+        Thread.sleep(forTimeInterval: 0.05)
+        let visibleB = state.visibleTranscript(forThread: threadId)
+        XCTAssertEqual(visibleA.last?.at, first)
+        XCTAssertEqual(visibleB.last?.at, first)
+        XCTAssertEqual(visibleA.last?.text, "old ask")
+    }
+
+    func testConsumePendingMatchingTextLeavesBusyChipForQueueId() {
+        var state = CompanionState()
+        let threadId = "t-pending-busy"
+        state.rememberPendingSend(threadId: threadId, id: "q-busy", text: "same text", queued: true)
+        state.consumePendingMatchingText(threadId: threadId, text: "same text")
+        XCTAssertEqual(state.pendingQueued[threadId]?.map(\.queueId), ["q-busy"])
+        state.consumePendingQueued(threadId: threadId, queueId: "q-busy")
+        XCTAssertNil(state.pendingQueued[threadId])
+    }
+
+    func testQueuedSendKeepsRawTextAndAttachmentsForEditRestore() throws {
+        var state = CompanionState()
+        let threadId = "t-queued-edit"
+        let attachment = PendingChatAttachment(name: "shot.png", mime: "image/png", data: Data("x".utf8))
+        let composed = ChatAttachments.composeMessage(
+            text: "check this",
+            attachments: [ChatPromptAttachment(kind: .image, path: "/tmp/shot.png")]
+        )
+        state.rememberPendingSend(
+            threadId: threadId,
+            id: "q-edit",
+            text: composed,
+            queued: true,
+            rawText: "check this",
+            attachments: [attachment]
+        )
+        let entry = try XCTUnwrap(state.pendingQueued[threadId]?.first)
+        XCTAssertEqual(entry.rawText, "check this")
+        XCTAssertEqual(entry.text, composed)
+        XCTAssertEqual(entry.attachments.count, 1)
+        XCTAssertEqual(entry.attachments.first?.name, "shot.png")
+        let restored = entry.rawText ?? entry.text
+        let resent = ChatAttachments.composeMessage(
+            text: restored,
+            attachments: [ChatPromptAttachment(kind: .image, path: "/tmp/shot.png")]
+        )
+        XCTAssertEqual(resent.components(separatedBy: "<attached-image").count - 1, 1)
+    }
+
+    func testLegacyQueuedSendWithoutRawTextRestoresComposedTextWithoutAttachments() {
+        let attachment = PendingChatAttachment(name: "shot.png", mime: "image/png", data: Data("x".utf8))
+        let composed = ChatAttachments.composeMessage(
+            text: "check this",
+            attachments: [ChatPromptAttachment(kind: .image, path: "/tmp/shot.png")]
+        )
+        let entry = QueuedSend(
+            queueId: "q-legacy",
+            text: composed,
+            rawText: nil,
+            attachments: [attachment],
+            queued: true
+        )
+        let draft: String
+        let restoredAttachments: [PendingChatAttachment]
+        if let rawText = entry.rawText {
+            draft = rawText
+            restoredAttachments = entry.attachments
+        } else {
+            draft = entry.text
+            restoredAttachments = []
+        }
+        XCTAssertEqual(draft, composed)
+        XCTAssertTrue(restoredAttachments.isEmpty)
+        let resent = ChatAttachments.composeMessage(
+            text: draft,
+            attachments: restoredAttachments.map { ChatPromptAttachment(kind: $0.kind, path: "/tmp/shot.png") }
+        )
+        XCTAssertEqual(resent.components(separatedBy: "<attached-image").count - 1, 1)
+    }
+
+
     // MARK: - Bots
 
     func testABotFrameMergesRatherThanWipingTheTranscript() throws {
@@ -255,6 +556,36 @@ final class StoreTests: XCTestCase {
 
         state.apply(.thread(threadId: bot.threadId, activeLeafId: tail.id))
         XCTAssertEqual(state.visibleTranscript(forThread: bot.threadId).map(\.id), ["root", "fork", "tail"])
+    }
+
+    /// The chat list resolves the leaf from the bot it already holds
+    /// (BOTFLEET-3R); that must match the roster-scanning reader.
+    func testLeafAwareVisibleTranscriptMatchesTheRosterLookup() throws {
+        var state = try hydrated()
+        let bot = try XCTUnwrap(state.bots.first)
+        let root = message("root")
+        var first = message("first", at: 2)
+        first.parentId = root.id
+        var fork = message("fork", at: 3)
+        fork.parentId = root.id
+        state.messages[bot.threadId] = [root, first, fork]
+        state.apply(.thread(threadId: bot.threadId, activeLeafId: fork.id))
+        let live = try XCTUnwrap(state.bot(bot.id))
+
+        XCTAssertEqual(
+            state.visibleTranscript(forThread: bot.threadId, activeLeafId: live.activeLeafId).map(\.id),
+            state.visibleTranscript(forThread: bot.threadId).map(\.id)
+        )
+        XCTAssertEqual(
+            state.visibleTranscript(forThread: bot.threadId, activeLeafId: live.activeLeafId).map(\.id),
+            ["root", "fork"]
+        )
+
+        state.messages["room-thread"] = [message("r1"), message("r2", at: 2)]
+        XCTAssertEqual(
+            state.visibleTranscript(forThread: "room-thread", activeLeafId: nil).map(\.id),
+            state.visibleTranscript(forThread: "room-thread").map(\.id)
+        )
     }
 
     func testVersionsAreUserMessagesWithTheSameParent() {
@@ -330,6 +661,32 @@ final class StoreTests: XCTestCase {
         let pending = state.pendingApprovals
         XCTAssertEqual(pending.map(\.message.id), ["new", "old"])
         XCTAssertEqual(pending.first?.threadId, secondThread)
+    }
+
+    /// BOTFLEET-30: `pendingApprovals` resolves each bot's leaf directly
+    /// rather than via `bot(forThread:)`, and must still honor the branch.
+    func testPendingApprovalsOnlyCountTheActiveBranch() throws {
+        var state = try hydrated()
+        let bot = try XCTUnwrap(state.bots.first)
+        func pendingCard(_ id: String, at: Double, parent: String) -> Message {
+            var message = Message(id: id, role: .bot, kind: .options, at: at)
+            message.parentId = parent
+            message.card = OptionCard(
+                title: "Approval needed", subtitle: "rm -rf ./build", options: ["Allow", "Deny"],
+                answered: nil, dismissed: nil, requestId: "r-\(id)", tool: "Bash",
+                held: nil, allowKey: "Bash:rm"
+            )
+            return message
+        }
+        let root = message("root")
+        let offBranch = pendingCard("off-branch", at: 2, parent: root.id)
+        let onBranch = pendingCard("on-branch", at: 3, parent: root.id)
+        for threadId in Array(state.messages.keys) { state.messages[threadId] = [] }
+        state.messages[bot.threadId] = [root, offBranch, onBranch]
+
+        state.apply(.thread(threadId: bot.threadId, activeLeafId: onBranch.id))
+        XCTAssertEqual(state.pendingApprovals.map(\.message.id), ["on-branch"])
+        XCTAssertEqual(state.pendingApprovals.first?.threadId, bot.threadId)
     }
 
     // MARK: - Cursor

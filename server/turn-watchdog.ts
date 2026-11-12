@@ -27,6 +27,11 @@ export interface TurnWatchdogOptions {
    * slow heartbeat — today, asking each driver whether it has stranded a
    * turn.  Never throws out of the sweep. */
   onSweep?: () => void;
+  /** Threads whose provider is proven alive right now (a local model server
+   * answering while it generates silently).  Each sweep counts them as
+   * activity before the stall scan.  The provider owns how fresh that proof
+   * must be, and its own request budget still ends a wedged generation. */
+  liveThreadIds?: () => Iterable<string>;
   now?: () => number;
 }
 
@@ -106,6 +111,11 @@ export class TurnWatchdog {
     } catch (e) {
       // a heartbeat that throws must never stop the stall detector
       console.error("watchdog: onSweep threw", e);
+    }
+    try {
+      for (const threadId of this.opts.liveThreadIds?.() ?? []) this.touch(threadId);
+    } catch (e) {
+      console.error("watchdog: liveThreadIds threw", e);
     }
     const at = this.now();
     for (const turn of this.turns.values()) {

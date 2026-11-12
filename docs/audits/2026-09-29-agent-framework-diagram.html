@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>BotFleet Agent Framework — Dispatch, Context, Cost</title>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --paper: #f5f5f5;
+    --paper-2: #ececec;
+    --ink: #2d3142;
+    --muted: #4f5d75;
+    --soft: #7a8399;
+    --rule: rgba(45,49,66,0.12);
+    --accent: #eb6c36;
+    --accent-tint: rgba(235,108,54,0.08);
+    --link: #2e5aa8;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: 'Geist', system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .page { max-width: 900px; margin: 0 auto; padding: 56px 32px 72px; }
+  .eyebrow {
+    font-family: 'Geist Mono', monospace;
+    font-size: 8px; letter-spacing: 0.18em; text-transform: uppercase;
+    color: var(--soft); margin: 0 0 12px;
+  }
+  h1 {
+    font-family: 'Instrument Serif', serif; font-weight: 400;
+    font-size: 40px; line-height: 1.1; margin: 0 0 8px; letter-spacing: -0.01em;
+  }
+  .sub {
+    font-size: 16px; line-height: 1.5; color: var(--muted);
+    margin: 0 0 32px; max-width: 62ch;
+  }
+  figure { margin: 0; }
+  .cards { display: grid; grid-template-columns: 1.15fr 1fr 0.9fr; gap: 16px; margin-top: 40px; }
+  .card {
+    background: #ffffff; border: 1px solid var(--rule); border-radius: 6px; padding: 20px;
+  }
+  .card h3 { font-size: 12px; font-weight: 600; margin: 0 0 10px; display: flex; align-items: center; gap: 8px; }
+  .card-dot { width: 7px; height: 7px; border-radius: 50%; flex: 0 0 7px; }
+  .card p { font-size: 12px; line-height: 1.6; color: var(--muted); margin: 0; }
+  .card code { font-family: 'Geist Mono', monospace; font-size: 11px; color: var(--ink); }
+  .card ul { margin: 0; padding-left: 16px; }
+  .card li { font-size: 12px; line-height: 1.6; color: var(--muted); margin-bottom: 4px; }
+  footer {
+    margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--rule);
+    font-family: 'Geist Mono', monospace; font-size: 8px; letter-spacing: 0.1em;
+    color: var(--soft); text-transform: uppercase;
+  }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <p class="eyebrow">BotFleet · Agent Framework Evaluation · MiniMax</p>
+  <h1>Every wake converges, then pays twice for the same context</h1>
+  <p class="sub">
+    Six ingress paths collapse into one durable queue with layered backpressure, and the
+    reliability work there is better than Grok Bot's documented trigger layer.  The cost
+    work is missing: the harness splits its prompt into a stable prefix and then never
+    asks for the cache, and it has no compaction at all.
+  </p>
+
+  <figure>
+  <svg viewBox="0 0 800 840" width="100%" role="img"
+       aria-labelledby="bf-arch-title bf-arch-desc" style="display:block;">
+    <title id="bf-arch-title">BotFleet dispatch spine, from six ingress paths to the turn loop</title>
+    <desc id="bf-arch-desc">
+      Webhooks, schedules, and human or bot messages all feed a single durable routine
+      queue that applies trigger-gap, doomed-dispatch, bot-busy, and spend guards before
+      assembling a turn.  Context assembly splits the prompt into a stable and a volatile
+      half, appends a forty-message transcript tail, and offers thirty-six tool schemas
+      every turn, after which the turn loop runs up to forty rounds.
+    </desc>
+
+    <defs>
+      <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+        <polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/>
+      </marker>
+      <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+        <polygon points="0 0, 8 3, 0 6" fill="#eb6c36"/>
+      </marker>
+    </defs>
+
+    <rect width="100%" height="100%" fill="#f5f5f5"/>
+
+    <!-- ============ ARROWS (drawn before boxes) ============ -->
+
+    <!-- ingress 1 -> queue -->
+    <path d="M168,112 V180" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#arrow)"/>
+    <rect x="180" y="132" width="52" height="12" rx="2" fill="#f5f5f5"/>
+    <text x="206" y="141" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace"
+          text-anchor="middle" letter-spacing="0.06em">DEDUPE</text>
+
+    <!-- ingress 2 -> queue -->
+    <path d="M400,112 V180" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#arrow)"/>
+
+    <!-- ingress 3 -> queue -->
+    <path d="M632,112 V180" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#arrow)"/>
+
+    <!-- queue -> guards -->
+    <path d="M400,268 V336" fill="none" stroke="#eb6c36" stroke-width="1.2" marker-end="url(#arrow-accent)"/>
+    <rect x="412" y="294" width="56" height="12" rx="2" fill="#f5f5f5"/>
+    <text x="440" y="303" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace"
+          text-anchor="middle" letter-spacing="0.06em">10S TICK</text>
+
+    <!-- guards -> context assembly -->
+    <path d="M400,424 V444 A8,8 0 0 1 392,452 H172 A8,8 0 0 0 164,460 V500"
+          fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#arrow)"/>
+    <rect x="246" y="428" width="72" height="12" rx="2" fill="#f5f5f5"/>
+    <text x="282" y="437" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace"
+          text-anchor="middle" letter-spacing="0.06em">SINGLE WRITER</text>
+
+    <!-- transcript -> loop -->
+    <path d="M400,588 V656" fill="none" stroke="#eb6c36" stroke-width="1.2" marker-end="url(#arrow-accent)"/>
+    <rect x="412" y="614" width="84" height="12" rx="2" fill="#f5f5f5"/>
+    <text x="454" y="623" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace"
+          text-anchor="middle" letter-spacing="0.06em">NO COMPACTION</text>
+
+    <!-- context assembly -> loop -->
+    <path d="M164,588 V616 A8,8 0 0 0 172,624 H312 A8,8 0 0 1 320,632 V656"
+          fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#arrow)"/>
+    <rect x="176" y="596" width="64" height="12" rx="2" fill="#f5f5f5"/>
+    <text x="208" y="605" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace"
+          text-anchor="middle" letter-spacing="0.06em">STABLE | VOL</text>
+
+    <!-- tool schemas -> loop -->
+    <path d="M636,588 V616 A8,8 0 0 1 628,624 H608 A8,8 0 0 0 600,632 V656"
+          fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#arrow)"/>
+    <rect x="652" y="596" width="64" height="12" rx="2" fill="#f5f5f5"/>
+    <text x="684" y="605" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace"
+          text-anchor="middle" letter-spacing="0.06em">36 / TURN</text>
+
+    <!-- ============ NODES ============ -->
+
+    <!-- 1. Webhook -->
+    <rect x="64" y="40" width="208" height="72" rx="6" fill="#f5f5f5"/>
+    <rect x="64" y="40" width="208" height="72" rx="6" fill="rgba(45,49,66,0.03)"
+          stroke="rgba(45,49,66,0.30)" stroke-width="1"/>
+    <rect x="76" y="52" width="32" height="12" rx="2" fill="transparent"
+          stroke="rgba(45,49,66,0.40)" stroke-width="0.8"/>
+    <text x="92" y="61" fill="rgba(45,49,66,0.80)" font-size="8" font-family="'Geist Mono', monospace"
+          text-anchor="middle" letter-spacing="0.08em">API</text>
+    <text x="168" y="84" fill="#2d3142" font-size="12" font-weight="600"
+          font-family="'Geist', sans-serif" text-anchor="middle">Webhooks</text>
+    <text x="168" y="100" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace"
+          text-anchor="middle">:8800 · HMAC</text>
+
+    <!-- 2. Schedules -->
+    <rect x="296" y="40" width="208" height="72" rx="6" fill="#f5f5f5"/>
+    <rect x="296" y="40" width="208" height="72" rx="6" fill="rgba(45,49,66,0.03)"
+          stroke="rgba(45,49,66,0.30)" stroke-width="1"/>
+    <rect x="308" y="52" width="44" height="12" rx="2" fill="transparent"
+          stroke="rgba(45,49,66,0.40)" stroke-width="0.8"/>
+    <text x="330" y="61" fill="rgba(45,49,66,0.80)" font-size="8" font-family="'Geist Mono', monospace"
+          text-anchor="middle" letter-spacing="0.08em">LOCAL</text>
+    <text x="400" y="84" fill="#2d3142" font-size="12" font-weight="600"
+          font-family="'Geist', sans-serif" text-anchor="middle">Schedules + Resource</text>
+    <text x="400" y="100" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace"
+          text-anchor="middle">cron · 30s host sampler</text>
+
+    <!-- 3. Human + bots -->
+    <rect x="528" y="40" width="208" height="72" rx="6" fill="#f5f5f5"/>
+    <rect x="528" y="40" width="208" height="72" rx="6" fill="rgba(77,93,117,0.10)"
+          stroke="#7a8399" stroke-width="1"/>
+    <rect x="540" y="52" width="36" height="12" rx="2" fill="transparent"
+          stroke="#7a8399" stroke-width="0.8"/>
+    <text x="558" y="61" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace"
+          text-anchor="middle" letter-spacing="0.08em">1:1</text>
+    <text x="632" y="84" fill="#2d3142" font-size="12" font-weight="600"
+          font-family="'Geist', sans-serif" text-anchor="middle">Human + Bot Delegation</text>
+    <text x="632" y="100" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace"
+          text-anchor="middle">chat · steer · ask_bot</text>
+
+    <!-- 4. RoutineManager queue  (FOCAL) -->
+    <rect x="64" y="180" width="672" height="88" rx="6" fill="#f5f5f5"/>
+    <rect x="64" y="180" width="672" height="88" rx="6" fill="rgba(235,108,54,0.08)"
+          stroke="#eb6c36" stroke-width="1"/>
+    <rect x="76" y="192" width="56" height="12" rx="2" fill="transparent"
+          stroke="#eb6c36" stroke-width="0.8"/>
+    <text x="104" y="201" fill="#eb6c36" font-size="8" font-family="'Geist Mono', monospace"
+          text-anchor="middle" letter-spacing="0.08em">FOCAL</text>
+    <text x="400" y="232" fill="#2d3142" font-size="12" font-weight="600"
+          font-family="'Geist', sans-serif" text-anchor="middle">RoutineManager Queue — one durable queue, all wakes</text>
+    <text x="400" y="248" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace"
+          text-anchor="middle">routines.ts · trigger coalesces, never drops</text>
+
+    <!-- 5. Guards -->
+    <rect x="64" y="336" width="672" height="88" rx="6" fill="#f5f5f5"/>
+    <rect x="64" y="336" width="672" height="88" rx="6" fill="#ffffff"
+          stroke="rgba(45,49,66,0.30)" stroke-width="1"/>
+    <rect x="76" y="348" width="48" height="12" rx="2" fill="transparent"
+          stroke="rgba(45,49,66,0.40)" stroke-width="0.8"/>
+    <text x="100" y="357" fill="rgba(45,49,66,0.80)" font-size="8" font-family="'Geist Mono', monospace"
+          text-anchor="middle" letter-spacing="0.08em">GATE</text>
+    <text x="400" y="388" fill="#2d3142" font-size="12" font-weight="600"
+          font-family="'Geist', sans-serif" text-anchor="middle">Guards — evaluated in order, refusal leaves the run queued</text>
+    <text x="400" y="404" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace"
+          text-anchor="middle">trigger gap · doomed dispatch · bot busy · spend ceiling</text>
+
+    <!-- 6. Context assembly -->
+    <rect x="64" y="500" width="200" height="88" rx="6" fill="#f5f5f5"/>
+    <rect x="64" y="500" width="200" height="88" rx="6" fill="#ffffff"
+          stroke="rgba(45,49,66,0.30)" stroke-width="1"/>
+    <rect x="76" y="512" width="36" height="12" rx="2" fill="transparent"
+          stroke="rgba(45,49,66,0.40)" stroke-width="0.8"/>
+    <text x="94" y="521" fill="rgba(45,49,66,0.80)" font-size="8" font-family="'Geist Mono', monospace"
+          text-anchor="middle" letter-spacing="0.08em">CTX</text>
+    <text x="164" y="552" fill="#2d3142" font-size="12" font-weight="600"
+          font-family="'Geist', sans-serif" text-anchor="middle">Context Assembly</text>
+    <text x="164" y="568" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace"
+          text-anchor="middle">17 layers · 6 uncapped</text>
+
+    <!-- 7. Transcript tail  (FOCAL) -->
+    <rect x="288" y="500" width="224" height="88" rx="6" fill="#f5f5f5"/>
+    <rect x="288" y="500" width="224" height="88" rx="6" fill="rgba(235,108,54,0.08)"
+          stroke="#eb6c36" stroke-width="1"/>
+    <rect x="300" y="512" width="52" height="12" rx="2" fill="transparent"
+          stroke="#eb6c36" stroke-width="0.8"/>
+    <text x="326" y="521" fill="#eb6c36" font-size="8" font-family="'Geist Mono', monospace"
+          text-anchor="middle" letter-spacing="0.08em">FOCAL</text>
+    <text x="400" y="552" fill="#2d3142" font-size="12" font-weight="600"
+          font-family="'Geist', sans-serif" text-anchor="middle">Transcript Tail</text>
+    <text x="400" y="568" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace"
+          text-anchor="middle">index.ts:3890 · 128 KB cap</text>
+
+    <!-- 8. Tool schemas -->
+    <rect x="536" y="500" width="200" height="88" rx="6" fill="#f5f5f5"/>
+    <rect x="536" y="500" width="200" height="88" rx="6" fill="rgba(45,49,66,0.05)"
+          stroke="#7a8399" stroke-width="1"/>
+    <rect x="548" y="512" width="40" height="12" rx="2" fill="transparent"
+          stroke="#7a8399" stroke-width="0.8"/>
+    <text x="568" y="521" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace"
+          text-anchor="middle" letter-spacing="0.08em">TOOL</text>
+    <text x="636" y="552" fill="#2d3142" font-size="12" font-weight="600"
+          font-family="'Geist', sans-serif" text-anchor="middle">Tool Schemas</text>
+    <text x="636" y="568" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace"
+          text-anchor="middle">~22 KB · no top-k</text>
+
+    <!-- 9. Turn loop -->
+    <rect x="288" y="656" width="448" height="88" rx="6" fill="#f5f5f5"/>
+    <rect x="288" y="656" width="448" height="88" rx="6" fill="#ffffff"
+          stroke="rgba(45,49,66,0.30)" stroke-width="1"/>
+    <rect x="300" y="668" width="44" height="12" rx="2" fill="transparent"
+          stroke="rgba(45,49,66,0.40)" stroke-width="0.8"/>
+    <text x="322" y="677" fill="rgba(45,49,66,0.80)" font-size="8" font-family="'Geist Mono', monospace"
+          text-anchor="middle" letter-spacing="0.08em">LOOP</text>
+    <text x="512" y="708" fill="#2d3142" font-size="12" font-weight="600"
+          font-family="'Geist', sans-serif" text-anchor="middle">Turn Loop — 40 rounds, tool results appended verbatim</text>
+    <text x="512" y="724" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace"
+          text-anchor="middle">chat-completions · ACP CLI · usage → telemetry</text>
+
+    <!-- ============ LEGEND (horizontal bottom strip) ============ -->
+    <line x1="64" y1="792" x2="736" y2="792" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+    <text x="64" y="808" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace"
+          letter-spacing="0.14em">LEGEND</text>
+
+    <rect x="132" y="802" width="8" height="8" rx="2" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="0.8"/>
+    <text x="148" y="809" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace">finding</text>
+
+    <rect x="228" y="802" width="8" height="8" rx="2" fill="#ffffff" stroke="rgba(45,49,66,0.30)" stroke-width="0.8"/>
+    <text x="244" y="809" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace">harness</text>
+
+    <rect x="324" y="802" width="8" height="8" rx="2" fill="rgba(45,49,66,0.05)" stroke="#7a8399" stroke-width="0.8"/>
+    <text x="340" y="809" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace">state</text>
+
+    <rect x="404" y="802" width="8" height="8" rx="2" fill="rgba(77,93,117,0.10)" stroke="#7a8399" stroke-width="0.8"/>
+    <text x="420" y="809" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace">input</text>
+
+    <line x1="500" y1="806" x2="524" y2="806" stroke="#4f5d75" stroke-width="1" marker-end="url(#arrow)"/>
+    <text x="536" y="809" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace">dispatch</text>
+
+    <line x1="628" y1="806" x2="652" y2="806" stroke="#eb6c36" stroke-width="1.2" marker-end="url(#arrow-accent)"/>
+    <text x="664" y="809" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace">reused path</text>
+  </svg>
+  </figure>
+
+  <div class="cards">
+    <div class="card">
+      <p class="eyebrow">What works</p>
+      <div class="card-header" style="display:flex;align-items:center;gap:8px;">
+        <span class="card-dot" style="background:var(--accent)"></span>
+        <h3 style="margin:0">The trigger layer</h3>
+      </div>
+      <p>Dedupe is checked before the rate limit and flushed durably before the 202.  A
+      webhook storm folds into one turn instead of a hundred conversations.  The doomed-dispatch
+      breaker declines a dead engine without failing the run, so it still lands after the TTL.</p>
+    </div>
+    <div class="card">
+      <p class="eyebrow">Biggest lever</p>
+      <div class="card-header" style="display:flex;align-items:center;gap:8px;">
+        <span class="card-dot" style="background:var(--accent)"></span>
+        <h3 style="margin:0">No cache directive</h3>
+      </div>
+      <p><code>grep -rn cache_control</code> returns zero hits.  The harness already splits the
+      prompt into a byte-identical stable prefix and already ships <code>promptBytes</code>
+      telemetry to check whether the prefix cached — it simply never asks the provider for the
+      discount.  That is a missing flag, not a design decision.</p>
+    </div>
+    <div class="card">
+      <p class="eyebrow">Cost floor</p>
+      <div class="card-header" style="display:flex;align-items:center;gap:8px;">
+        <span class="card-dot" style="background:var(--muted)"></span>
+        <h3 style="margin:0">No compaction</h3>
+      </div>
+      <ul>
+        <li>40-message tail, hard cut, never summarized</li>
+        <li>Thread reuse makes this permanent, not transient</li>
+        <li>Tool results appended verbatim; <code>bash</code> has no byte cap</li>
+      </ul>
+    </div>
+  </div>
+
+  <footer>BotFleet agent framework evaluation · origin/main @ 532ce508b · minimax/agent-framework-eval</footer>
+
+</div>
+</body>
+</html>

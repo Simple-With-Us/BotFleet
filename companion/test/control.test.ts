@@ -8,6 +8,7 @@ import { type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { createControlServer, hostCandidates, originIsLoopback } from "../src/control.ts";
+import { readLanPolicy } from "../src/lan-policy.ts";
 import { DeviceRegistry } from "../src/devices.ts";
 
 let control: Server;
@@ -47,6 +48,11 @@ beforeAll(async () => {
       disconnectedDeviceIds.push(deviceId);
       connectedDeviceIds = connectedDeviceIds.filter((connectedId) => connectedId !== deviceId);
     },
+    // S11: the device port binds loopback unless an operator says otherwise,
+    // and this suite is about the ORDER of the host list rather than the
+    // default, so it runs with the port open.  The loopback-only default is
+    // pinned in lan-policy.test.ts.
+    lanPolicy: readLanPolicy("1"),
   });
   port = await new Promise<number>((resolve) =>
     control.listen(0, "127.0.0.1", () => resolve((control.address() as { port: number }).port)),
@@ -170,7 +176,11 @@ describe("hostCandidates", () => {
     // refuses plain HTTP to 100.64/10 and a candidate that can never succeed
     // only slows the walk down. The synthetic mDNS name is last — it resolves
     // only while the sidecar runs.
-    const hosts = hostCandidates(["100.121.5.6", "192.168.1.42", "10.0.0.7"], "macbook.tail1234.ts.net");
+    const hosts = hostCandidates(
+      ["100.121.5.6", "192.168.1.42", "10.0.0.7"],
+      "macbook.tail1234.ts.net",
+      readLanPolicy("1"),
+    );
     expect(hosts.slice(0, 3)).toEqual(["macbook.tail1234.ts.net", "192.168.1.42", "10.0.0.7"]);
     expect(hosts.at(-1)).toMatch(/^botfleet-[0-9a-f]{8}\.local$/);
     expect(hosts).not.toContain("100.121.5.6");
@@ -179,8 +189,9 @@ describe("hostCandidates", () => {
   it("skips the tailnet name when Tailscale is not part of the picture", () => {
     // A MagicDNS name left over from a cached read is only dialable while a
     // tailnet address exists; without one it would be a dead first candidate.
-    expect(hostCandidates(["192.168.1.42"], "stale.tail1234.ts.net")[0]).toBe("192.168.1.42");
-    expect(hostCandidates(["100.121.5.6", "192.168.1.42"], null)[0]).toBe("192.168.1.42");
+    const allowed = readLanPolicy("1");
+    expect(hostCandidates(["192.168.1.42"], "stale.tail1234.ts.net", allowed)[0]).toBe("192.168.1.42");
+    expect(hostCandidates(["100.121.5.6", "192.168.1.42"], null, allowed)[0]).toBe("192.168.1.42");
   });
 
   it("is what /state hands the pairing panel", async () => {
@@ -306,19 +317,22 @@ describe("originIsLoopback", () => {
 describe("pairing page push drop lines", () => {
   /** Pull the page's own `pushDropLines` out of the served HTML and run it,
    * so the test checks the copy the browser actually renders. */
-  const loadPushDropLines = async (): Promise<(push: Record<string, unknown>) => string> => {
+  const loadPushDropLines = async (): Promise<(push: import("../src/json.ts").JsonObject) => string> => {
     const page = await ask("GET", "/");
     expect(page.status).toBe(200);
     const source = /const pushDropLines = (\(push\) => \{[\s\S]*?\n\});/.exec(String(page.body))?.[1];
     if (!source) throw new Error("pushDropLines not found in the pairing page");
-    return new Function(`return ${source};`)() as (push: Record<string, unknown>) => string;
+    return new Function(`return ${source};`)() as (push: import("../src/json.ts").JsonObject) => string;
   };
 
-  it("shows a circuit-breaker skip on its own, with no queue overflow", async () => {
+  it("shows a circuit-breaker hold on its own, with no queue overflow", async () => {
     const lines = await loadPushDropLines();
     const html = lines({ dropped: 0, circuitDropped: 4 });
-    expect(html).toContain("4 skipped (Apple push service unreachable)");
+    // Held, not lost: an open circuit leaves every alert on its lane, so the
+    // copy must not read like a drop.
+    expect(html).toContain("4 held back while Apple's push service was unreachable");
     expect(html).not.toContain("queue full");
+    expect(html).not.toContain("dropped");
   });
 
   it("blames a queue drop on the queue only", async () => {
@@ -332,7 +346,7 @@ describe("pairing page push drop lines", () => {
     const lines = await loadPushDropLines();
     const html = lines({ dropped: 2, circuitDropped: 5 });
     expect(html).toContain("2 dropped (queue full)");
-    expect(html).toContain("5 skipped (Apple push service unreachable)");
+    expect(html).toContain("5 held back while Apple's push service was unreachable");
   });
 
   it("shows nothing when neither counter moved, including an older sidecar with no circuitDropped", async () => {

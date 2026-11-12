@@ -16,6 +16,11 @@ enum Keychain {
     /// there across on first read, so a phone that paired before the
     /// rename stays paired after it.
     private static let service = CompanionTokenService.current
+    /// Shared with the legacy `app.botfleet` install once that build
+    /// exports under the same access group. Private-group items from
+    /// earlier builds of this renamed app remain readable via the
+    /// dual-compat fallback in `read`.
+    private static let accessGroup = CompanionAppGroup.keychainAccessGroup
 
     static func save(_ token: String, for connectionId: String) throws {
         let data = Data(token.utf8)
@@ -23,6 +28,7 @@ enum Keychain {
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: connectionId,
+            kSecAttrAccessGroup as String: accessGroup,
             kSecValueData as String: data,
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
         ]
@@ -43,6 +49,7 @@ enum Keychain {
                 kSecClass as String: kSecClassGenericPassword,
                 kSecAttrService as String: service,
                 kSecAttrAccount as String: connectionId,
+                kSecAttrAccessGroup as String: accessGroup,
             ]
             status = SecItemUpdate(
                 identity as CFDictionary,
@@ -105,13 +112,30 @@ enum Keychain {
     }
 
     private static func read(_ connectionId: String, service: String) throws -> String? {
-        let query: [String: Any] = [
+        // Shared access group first (legacy export / post-migration writes),
+        // then the app-private group so a build that paired before the
+        // access-group entitlement still restores without a walk to the Mac.
+        if let token = try read(connectionId, service: service, accessGroup: accessGroup) {
+            return token
+        }
+        return try read(connectionId, service: service, accessGroup: nil)
+    }
+
+    private static func read(
+        _ connectionId: String,
+        service: String,
+        accessGroup: String?
+    ) throws -> String? {
+        var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: connectionId,
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne,
         ]
+        if let accessGroup {
+            query[kSecAttrAccessGroup as String] = accessGroup
+        }
         var item: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &item)
         if status == errSecItemNotFound { return nil }
@@ -138,11 +162,25 @@ enum Keychain {
 
     @discardableResult
     private static func delete(_ connectionId: String, service: String) -> Bool {
-        let query: [String: Any] = [
+        let shared = delete(connectionId, service: service, accessGroup: accessGroup)
+        let priv = delete(connectionId, service: service, accessGroup: nil)
+        return shared && priv
+    }
+
+    @discardableResult
+    private static func delete(
+        _ connectionId: String,
+        service: String,
+        accessGroup: String?
+    ) -> Bool {
+        var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: connectionId,
         ]
+        if let accessGroup {
+            query[kSecAttrAccessGroup as String] = accessGroup
+        }
         let status = SecItemDelete(query as CFDictionary)
         return status == errSecSuccess || status == errSecItemNotFound
     }

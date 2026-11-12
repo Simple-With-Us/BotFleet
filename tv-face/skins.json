@@ -1,0 +1,31 @@
+{
+  "skins": [
+    "orange",
+    "blue",
+    "green",
+    "purple",
+    "pink",
+    "red",
+    "yellow"
+  ],
+  "defaultSkin": "orange",
+  "glyphColor": "cyan",
+  "method": "AI hero orange base + HSV body recolor; cyan glyph preserved",
+  "gifsPerSkin": 135,
+  "stillsPerSkin": 45,
+  "segments": [
+    "enter",
+    "hold",
+    "return"
+  ],
+  "utilities": [
+    "idle_loop",
+    "blink",
+    "anticipate",
+    "pack_intro",
+    "pack_outro"
+  ],
+  "resolution": "480x480",
+  "frameCount": 73,
+  "frameDurationMs": 80
+}

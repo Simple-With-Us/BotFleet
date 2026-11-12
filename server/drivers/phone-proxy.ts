@@ -11,6 +11,11 @@ type Device = { serial: string; state: string; model: string; connection: "usb" 
 type UiNode = { text: string; description: string; id: string; className: string; bounds: [number, number, number, number] };
 
 const MAX_ADB_OUTPUT = 16 * 1024 * 1024;
+const MAX_SCREEN_NODES = 250;
+const MAX_SCREEN_OUTPUT_BYTES = 12 * 1024;
+const MAX_LABEL_BYTES = 160;
+const MAX_ID_BYTES = 96;
+const MAX_CLASS_BYTES = 64;
 const PACKAGE = /^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+$/;
 const COMPONENT = /^([A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+)\/\S+$/;
 const SAFE_TEXT = /^[A-Za-z0-9 _.,@-]+$/;
@@ -221,11 +226,52 @@ async function readNodes(serial: string) {
   return parseUiNodes(savedStart >= 0 ? saved.slice(savedStart) : saved);
 }
 
-function nodeLines(nodes: UiNode[]) {
-  return nodes.slice(0, 250).map((node, index) => {
-    const label = [node.text, node.description].filter(Boolean).join(" · ");
-    return `${index}: ${JSON.stringify(label || node.id)} bounds=${node.bounds.join(",")} class=${node.className}`;
-  }).join("\n") || "No accessible Android UI text is visible.";
+/** Bound the serialized JSON string, including escapes, without splitting a Unicode character. */
+function clippedField(value: string, maxBytes: number): { value: string; truncated: boolean } {
+  let clipped = "";
+  let bytes = 2; // JSON quotation marks.
+  for (const character of value) {
+    const nextBytes = Buffer.byteLength(JSON.stringify(character)) - 2;
+    if (bytes + nextBytes > maxBytes) {
+      const suffixBytes = Buffer.byteLength("…");
+      while (clipped && bytes + suffixBytes > maxBytes) {
+        const last = Array.from(clipped).at(-1)!;
+        clipped = clipped.slice(0, -last.length);
+        bytes -= Buffer.byteLength(JSON.stringify(last)) - 2;
+      }
+      return { value: `${clipped}…`, truncated: true };
+    }
+    clipped += character;
+    bytes += nextBytes;
+  }
+  return { value: clipped, truncated: false };
+}
+
+export function formatUiNodes(nodes: UiNode[]): string {
+  if (nodes.length === 0) return "No accessible Android UI text is visible.  Shown: 0; omitted: 0; truncated labels: 0.";
+
+  const lines: string[] = [];
+  let usedBytes = 0;
+  let truncatedLabels = 0;
+  for (const [index, node] of nodes.entries()) {
+    if (index >= MAX_SCREEN_NODES) break;
+    const text = clippedField(node.text, MAX_LABEL_BYTES);
+    const description = clippedField(node.description, MAX_LABEL_BYTES);
+    const id = clippedField(node.id, MAX_ID_BYTES);
+    const className = clippedField(node.className, MAX_CLASS_BYTES);
+    const label = text.value || description.value || id.value;
+    const line = `${index}: ${JSON.stringify(label)}${text.value && description.value ? ` desc=${JSON.stringify(description.value)}` : ""} id=${JSON.stringify(id.value)} bounds=${node.bounds.join(",")} class=${JSON.stringify(className.value)}`;
+    const nextTruncatedLabels = truncatedLabels + Number(text.truncated) + Number(description.truncated);
+    const omitted = nodes.length - lines.length - 1;
+    const footer = `Shown: ${lines.length + 1}; omitted: ${omitted}; truncated labels: ${nextTruncatedLabels}.`;
+    const nextBytes = usedBytes + Buffer.byteLength(line) + Buffer.byteLength(footer) + 2;
+    if (nextBytes > MAX_SCREEN_OUTPUT_BYTES) break;
+    lines.push(line);
+    usedBytes += Buffer.byteLength(line) + 1;
+    truncatedLabels = nextTruncatedLabels;
+  }
+  const footer = `Shown: ${lines.length}; omitted: ${nodes.length - lines.length}; truncated labels: ${truncatedLabels}.`;
+  return `${lines.join("\n")}\n${footer}`;
 }
 
 const TOOLS = [
@@ -257,7 +303,7 @@ export async function callTool(name: string, args: Json): Promise<ToolResult> {
     return textResult(JSON.stringify({ available: Boolean(adb), devices }, null, 2));
   }
   const serial = await readySerial(args.serial);
-  if (name === "read_screen") return textResult(nodeLines(await readNodes(serial)));
+  if (name === "read_screen") return textResult(formatUiNodes(await readNodes(serial)));
   if (name === "screenshot") {
     const png = await onDevice(serial, ["exec-out", "screencap", "-p"], true);
     if (!png.subarray(0, 8).equals(Buffer.from("89504e470d0a1a0a", "hex"))) throw new Error("Android returned an invalid screenshot");

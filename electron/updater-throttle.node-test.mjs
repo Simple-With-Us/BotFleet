@@ -10,8 +10,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  AUTO_CHECK_FAILURE_BACKOFF_MS,
+  AUTO_CHECK_FAILURE_STREAK_THRESHOLD,
   AUTO_CHECK_THROTTLE_MS,
+  classifyAutoCheckError,
+  isAutoCheckBackoffActive,
   macAppFingerprint,
+  nextAutoCheckFailureStreak,
   nextAutoUpdateRecord,
   readAutoUpdateConfig,
   recordAutomaticCheck,
@@ -383,4 +388,66 @@ test("recordAutomaticCheck starts fresh when the config file is missing or unrea
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// UI4: a permanently broken release feed (e.g. a release missing
+// latest-mac.yml) fails every automatic check the same way, forever, and the
+// 6-hour throttle above never engages because a failed check is never
+// recorded as "last checked" (on purpose -- see updater.mjs's
+// recordSuccessfulAutoCheck comment).  These pure helpers back a SEPARATE,
+// in-memory backoff in updater.mjs: after AUTO_CHECK_FAILURE_STREAK_THRESHOLD
+// consecutive automatic failures with the same classifyAutoCheckError()
+// value, back off for AUTO_CHECK_FAILURE_BACKOFF_MS.
+test("classifyAutoCheckError groups electron-updater's HttpError by name and status", () => {
+  const httpError = Object.assign(new Error("HTTP error: 404"), { name: "HttpError", statusCode: 404 });
+  assert.equal(classifyAutoCheckError(httpError), "HttpError:404");
+  // A different status is a different class -- a 404 today and a 503
+  // tomorrow is not "the same problem happening again".
+  const other = Object.assign(new Error("HTTP error: 503"), { name: "HttpError", statusCode: 503 });
+  assert.equal(classifyAutoCheckError(other), "HttpError:503");
+});
+
+test("classifyAutoCheckError falls back from statusCode to status to code, then to a bare name", () => {
+  assert.equal(classifyAutoCheckError(Object.assign(new Error("x"), { name: "E", status: 500 })), "E:500");
+  assert.equal(classifyAutoCheckError(Object.assign(new Error("x"), { name: "E", code: "ECONNRESET" })), "E:ECONNRESET");
+  assert.equal(classifyAutoCheckError(new TypeError("network down")), "TypeError");
+  assert.equal(classifyAutoCheckError(new Error("plain")), "Error");
+});
+
+test("classifyAutoCheckError never throws on a non-Error rejection", () => {
+  assert.equal(classifyAutoCheckError(null), "unknown");
+  assert.equal(classifyAutoCheckError(undefined), "unknown");
+  assert.equal(classifyAutoCheckError("offline"), "offline");
+  assert.equal(classifyAutoCheckError(42), "42");
+});
+
+test("nextAutoCheckFailureStreak counts up on a repeated class and resets on a different one", () => {
+  let streak = null;
+  streak = nextAutoCheckFailureStreak(streak, "HttpError:404");
+  assert.deepEqual(streak, { errorClass: "HttpError:404", count: 1 });
+  streak = nextAutoCheckFailureStreak(streak, "HttpError:404");
+  assert.deepEqual(streak, { errorClass: "HttpError:404", count: 2 });
+
+  // A transient, differently-shaped failure in between must not extend the
+  // streak toward backoff -- that is the "keep the transient-failure path
+  // unchanged" half of the fix.
+  streak = nextAutoCheckFailureStreak(streak, "TypeError");
+  assert.deepEqual(streak, { errorClass: "TypeError", count: 1 });
+});
+
+test("isAutoCheckBackoffActive fires only once the streak reaches the threshold", () => {
+  assert.equal(isAutoCheckBackoffActive(null), false);
+  let streak = null;
+  for (let i = 0; i < AUTO_CHECK_FAILURE_STREAK_THRESHOLD - 1; i += 1) {
+    streak = nextAutoCheckFailureStreak(streak, "HttpError:404");
+    assert.equal(isAutoCheckBackoffActive(streak), false, `after ${i + 1} failures`);
+  }
+  streak = nextAutoCheckFailureStreak(streak, "HttpError:404");
+  assert.equal(streak.count, AUTO_CHECK_FAILURE_STREAK_THRESHOLD);
+  assert.equal(isAutoCheckBackoffActive(streak), true);
+});
+
+test("the failure backoff window documents one check per day", () => {
+  assert.equal(AUTO_CHECK_FAILURE_BACKOFF_MS, 24 * 60 * 60 * 1000);
+  assert.ok(AUTO_CHECK_FAILURE_BACKOFF_MS > AUTO_CHECK_THROTTLE_MS, "backoff must be a longer wait than the normal throttle");
 });

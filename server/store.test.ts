@@ -1,16 +1,35 @@
 // Store persistence contract: bots.json + messages-<threadId>.json are
 // the durable record — everything here must survive a process restart
 // except `busy`, which never does (no turn survives one either).
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { DATA_DIR } from "./config.ts";
 import type { ModelSelection } from "./contracts.ts";
+import { insertMessage } from "./message-db.ts";
 import { peerAllowKey } from "./peer-approval-key.ts";
 import { resolveRoomMemberIds, Store, type BotRecord } from "./store.ts";
 
 const selection = (): ModelSelection => ({ instanceId: "claude", model: "claude-sonnet-5" });
+
+// saveBots() now debounces behind a real setTimeout (see store.ts). DATA_DIR
+// is one fixed path shared by every test below (each beforeEach just wipes
+// it), not a fresh temp dir per test — so a save left un-flushed at the end
+// of one test would otherwise fire its real timer during a LATER test and
+// overwrite whatever that test just wrote. Fake timers file-wide make that
+// impossible: nothing fires until a test explicitly asks it to, and nothing
+// carries over once the fake clock is torn down.
+beforeEach(() => {
+  // Scoped to just the timer functions — Date must stay real, since plenty
+  // of tests below compare createdAt/updatedAt-style timestamps across
+  // operations.
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 describe("Store", () => {
   beforeEach(() => {
@@ -38,6 +57,7 @@ describe("Store", () => {
     store.appendMessage(bot.threadId, { role: "user", kind: "text", text: "hi" });
     expect(store.messagesFor(bot.threadId).find((m) => m.id === quiz.id)?.card?.dismissed).toBe(true);
 
+    store.flushBotsNow();
     const reloaded = new Store(selection);
     expect(reloaded.messagesFor(bot.threadId).find((m) => m.id === quiz.id)?.card?.dismissed).toBe(true);
 
@@ -124,6 +144,7 @@ describe("Store", () => {
       output: 300,
       cachedInput: 1000,
       costUsd: null,
+      lastInput: 1200,
       turns: 1,
     });
     // a driver that never reports the cached share leaves it unchanged
@@ -135,22 +156,80 @@ describe("Store", () => {
     // a different thread never inherits another task's tally
     expect(store.addTaskUsage(bot.id, "no-such-thread", { input: 5, output: 5, costUsd: null })).toBeNull();
 
+    store.flushBotsNow();
     const reloaded = new Store(selection);
     expect(reloaded.taskByThread(bot.id, bot.threadId)?.usage).toEqual({
       input: 2010,
       output: 400,
       cachedInput: 1010,
       costUsd: null,
+      lastInput: 10,
       turns: 4,
     });
+  });
+
+  it("addTaskUsage banks per-turn timing as aggregates only, and it survives a restart", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    expect(store.taskByThread(bot.id, bot.threadId)?.stats).toBeUndefined();
+    store.addTaskUsage(bot.id, bot.threadId, {
+      input: 100,
+      output: 40,
+      costUsd: null,
+      stats: { steps: 3, modelMs: 4000, toolMs: 1500, ttftMs: 600, outputTokens: 40 },
+    });
+    // a turn with no timing (no live clock entry) leaves the aggregate alone
+    store.addTaskUsage(bot.id, bot.threadId, { input: 10, output: 1, costUsd: null });
+    store.addTaskUsage(bot.id, bot.threadId, {
+      input: 100,
+      output: 60,
+      costUsd: null,
+      stats: { steps: 0, modelMs: 2000, toolMs: 0, outputTokens: 60 },
+    });
+    store.flushBotsNow();
+    const stats = new Store(selection).taskByThread(bot.id, bot.threadId)?.stats;
+    expect(stats).toEqual({
+      turns: 2,
+      steps: 3,
+      modelMs: 6000,
+      toolMs: 1500,
+      ttftMsSum: 600,
+      ttftSamples: 1,
+      tpsTokens: 100,
+      tpsMs: 6000,
+    });
+    // aggregates only: a fixed handful of numbers, never a per-turn array
+    expect(Object.values(stats ?? {}).every((v) => typeof v === "number")).toBe(true);
   });
 
   it("persists the per-bot composio gate", () => {
     const store = new Store(selection);
     const bot = store.createBot();
     store.patchBot(bot.id, { composio: false });
+    store.flushBotsNow();
     const reloaded = new Store(selection);
     expect(reloaded.bot(bot.id)?.composio).toBe(false);
+  });
+
+  it("persists connectorTools grants and clears them back to legacy via undefined", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    expect(bot.connectorTools).toBeUndefined();
+
+    const grants = { gmail: { tools: "*" as const }, slack: { tools: ["SLACK_POST_MESSAGE"] } };
+    store.patchBot(bot.id, { connectorTools: grants });
+    expect(store.bot(bot.id)?.connectorTools).toEqual(grants);
+    store.flushBotsNow();
+    const reloaded = new Store(selection);
+    expect(reloaded.bot(bot.id)?.connectorTools).toEqual(grants);
+
+    // parseBotProfilePatch's null clear resolves to a patch key present with
+    // value undefined — Object.assign must still apply that key, not skip it.
+    reloaded.patchBot(bot.id, { connectorTools: undefined });
+    expect(reloaded.bot(bot.id)?.connectorTools).toBeUndefined();
+    reloaded.flushBotsNow();
+    const reloadedAgain = new Store(selection);
+    expect(reloadedAgain.bot(bot.id)?.connectorTools).toBeUndefined();
   });
 
   it("rotates colors across created bots", () => {
@@ -170,6 +249,7 @@ describe("Store", () => {
     store.patchGroup(group.id, { memberIds: [second.id] });
     expect(group.defaultResponder).toEqual({ kind: "member", botId: second.id });
 
+    store.flushBotsNow();
     const reloaded = new Store(selection);
     expect(reloaded.group(group.id)?.defaultResponder).toEqual({ kind: "member", botId: second.id });
   });
@@ -180,6 +260,7 @@ describe("Store", () => {
     const channel = store.createGroup("Website launch", [bot.id], false, "Work");
 
     expect(channel.section).toBe("Work");
+    store.flushBotsNow();
     expect(new Store(selection).group(channel.id)?.section).toBe("Work");
   });
 
@@ -198,6 +279,7 @@ describe("Store", () => {
       setupSkippedAt: null,
     });
     expect(channel.setupCompletedAt).toEqual(expect.any(Number));
+    store.flushBotsNow();
     expect(new Store(selection).group(channel.id)).toMatchObject({
       bulletin: "Ship carefully.",
       defaultResponder: { kind: "mentions" },
@@ -215,6 +297,10 @@ describe("Store", () => {
     delete saved[0].defaultResponder;
     writeFileSync(groupsFile, JSON.stringify(saved));
 
+    // Group load filters memberIds down to bots it can find via this.bot(id)
+    // — first/second must already be on disk or the reload sees no live
+    // members at all.
+    store.flushBotsNow();
     const reloaded = new Store(selection);
     expect(reloaded.group(group.id)?.defaultResponder).toEqual({ kind: "member", botId: first.id });
   });
@@ -225,6 +311,7 @@ describe("Store", () => {
     store.patchBot(bot.id, { name: "Testy", busy: true });
     store.appendMessage(bot.threadId, { role: "user", kind: "text", text: "hi there" });
 
+    store.flushBotsNow();
     const reloaded = new Store(selection);
     const back = reloaded.bot(bot.id)!;
     expect(back.name).toBe("Testy");
@@ -239,6 +326,7 @@ describe("Store", () => {
     const vps = store.createBot();
     const invalid = store.createBot();
     const absent = store.createBot();
+    store.flushBotsNow();
     const raw: BotRecord[] = JSON.parse(readFileSync(join(DATA_DIR, "bots.json"), "utf8"));
     raw.find((bot) => bot.id === box.id)!.cloudBackend = "box";
     raw.find((bot) => bot.id === vps.id)!.cloudBackend = "vps";
@@ -252,6 +340,7 @@ describe("Store", () => {
     expect(reloaded.bot(invalid.id)?.cloudBackend).toBeUndefined();
     expect(reloaded.bot(absent.id)?.cloudBackend).toBeUndefined();
 
+    reloaded.flushBotsNow();
     const saved: BotRecord[] = JSON.parse(readFileSync(join(DATA_DIR, "bots.json"), "utf8"));
     expect(saved.find((bot) => bot.id === box.id)?.cloudBackend).toBe("box");
     expect(saved.find((bot) => bot.id === vps.id)?.cloudBackend).toBe("vps");
@@ -269,6 +358,7 @@ describe("Store", () => {
       alwaysAllow: ["ask_bot:@Helper", "delegate_bot:@Twin", "Bash:git status"],
     });
 
+    store.flushBotsNow();
     const reloaded = new Store(selection);
     expect(reloaded.bot(requester.id)?.alwaysAllow).toEqual([
       peerAllowKey("ask_bot", helper.id),
@@ -276,10 +366,22 @@ describe("Store", () => {
       "Bash:git status",
     ]);
 
+    reloaded.flushBotsNow();
     const persisted: BotRecord[] = JSON.parse(readFileSync(join(DATA_DIR, "bots.json"), "utf8"));
     expect(persisted.find((bot) => bot.id === requester.id)?.alwaysAllow).toEqual(
       reloaded.bot(requester.id)?.alwaysAllow,
     );
+  });
+
+  it("persists provider-tool always-allow grants on the bot across restart", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    store.patchBot(bot.id, {
+      alwaysAllow: ["provider-tool:claude:linear:list_issues:abc", "Bash:git"],
+    });
+    store.flushBotsNow();
+    const reloaded = new Store(selection);
+    expect(reloaded.bot(bot.id)?.alwaysAllow).toEqual(["provider-tool:claude:linear:list_issues:abc", "Bash:git"]);
   });
 
   it("persists a bot's effort level across a restart, defaulting to unset", () => {
@@ -289,6 +391,7 @@ describe("Store", () => {
 
     store.patchBot(bot.id, { modelSelection: { ...bot.modelSelection, effort: "high" } });
 
+    store.flushBotsNow();
     const reloaded = new Store(selection);
     expect(reloaded.bot(bot.id)?.modelSelection.effort).toBe("high");
   });
@@ -309,6 +412,7 @@ describe("Store", () => {
     expect(store.bot(second.id)?.chiefOfStaff).toBe(true);
     expect(store.bot(personal.id)?.chiefOfStaff).toBe(true);
 
+    store.flushBotsNow();
     const reloaded = new Store(selection);
     expect(reloaded.bots.filter((bot) => bot.chiefOfStaff).map((bot) => bot.id).sort()).toEqual(
       [second.id, personal.id].sort(),
@@ -337,8 +441,35 @@ describe("Store", () => {
     store.setResumeCursor(bot.id, "claude", "sess-abc");
     store.setResumeCursor(bot.id, "codex", "thread-xyz");
 
+    store.flushBotsNow();
     const reloaded = new Store(selection);
     expect(reloaded.bot(bot.id)?.resumeCursors).toEqual({ claude: "sess-abc", codex: "thread-xyz" });
+  });
+
+  it("setResumeCursor deletes per-instance continuations when cursor is undefined", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    store.setResumeCursor(bot.id, "claude", "sess-abc");
+    store.setResumeCursor(bot.id, "claude", undefined);
+
+    store.flushBotsNow();
+    const reloaded = new Store(selection);
+    expect(reloaded.bot(bot.id)?.resumeCursors).toEqual({});
+  });
+
+  it("clearResumeCursor drops only the cursor it names, durably", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    store.setResumeCursor(bot.id, "codex", "thread-rejected", bot.threadId);
+    store.setResumeCursor(bot.id, "claude", "sess-keep", bot.threadId);
+    // A stale invalidation (a newer thread was saved since) is a no-op.
+    store.clearResumeCursor(bot.id, "claude", "sess-older", bot.threadId);
+    store.clearResumeCursor(bot.id, "codex", "thread-rejected", bot.threadId);
+
+    store.flushBotsNow();
+    const reloaded = new Store(selection);
+    expect(reloaded.bot(bot.id)?.resumeCursors).toEqual({ claude: "sess-keep" });
+    expect(reloaded.taskByThread(bot.id, bot.threadId)?.resumeCursors).toEqual({ claude: "sess-keep" });
   });
 
   it("seedIfEmpty creates exactly one starter bot, once", () => {
@@ -348,6 +479,7 @@ describe("Store", () => {
     store.seedIfEmpty();
     expect(store.bots).toHaveLength(1);
 
+    store.flushBotsNow();
     const reloaded = new Store(selection);
     reloaded.seedIfEmpty();
     expect(reloaded.bots).toHaveLength(1);
@@ -362,6 +494,21 @@ describe("Store", () => {
     expect(user.parentId).toBe(messages[1].id); // follows the onboarding card
     expect(store.activeLeaf(bot.threadId)).toBe(user.id);
     expect(store.activePath(bot.threadId).map((m) => m.id)).toEqual(messages.map((m) => m.id));
+  });
+
+  it("keeps a recorded utterance and its original transcript when a review is added", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    const recording = { path: "/api/attachments/one.wav", mime: "audio/wav" as const,
+      transcript: "what the recognizer heard", engine: "apple-on-device" as const };
+    const original = store.appendMessage(bot.threadId, { role: "user", kind: "text", text: "what the recognizer heard", recording });
+    const review = { correction: "what I meant", comment: "Name spelled wrong", updatedAt: 10 };
+    store.patchMessage(bot.threadId, original.id, { recordingReview: review });
+    expect(store.branchMessage(bot.threadId, original.id, "rewrite history")).toBeNull();
+    const restored = new Store(selection).messagesFor(bot.threadId).find((message) => message.id === original.id);
+    expect(restored?.text).toBe("what the recognizer heard");
+    expect(restored?.recording).toEqual(recording);
+    expect(restored?.recordingReview).toEqual(review);
   });
 
   it("branchMessage forks at the edited message and hides the old tail", () => {
@@ -382,6 +529,40 @@ describe("Store", () => {
     expect(store.messagesFor(bot.threadId).map((m) => m.id)).toContain(original.id);
 
     expect(store.branchMessage(bot.threadId, "nope", "x")).toBeNull();
+  });
+
+  it("branchMessage keeps a routine's command allowlist, so an edit or retry is still held to it", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    const toolPolicy = { mode: "allowlist" as const, commands: [], writePaths: ["/Users/you/apps/state/line.md"], readPaths: [] };
+    const routine = store.appendMessage(bot.threadId, { role: "system", kind: "text", text: "run the routine", automationSource: "manual", toolPolicy });
+    const edited = store.branchMessage(bot.threadId, routine.id, "run the routine again")!;
+    expect(edited.toolPolicy).toEqual(toolPolicy);
+    const chat = store.appendMessage(bot.threadId, { role: "user", kind: "text", text: "hello" });
+    expect(store.branchMessage(bot.threadId, chat.id, "hello again")!.toolPolicy).toBeUndefined();
+  });
+
+  it("branchMessage retains delegated attribution but drops the stale peer-thread link", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    const from = { botId: "sender", name: "Compiler", color: "blue" };
+    const comm = { groupId: "peer-thread", withBotId: "sender", withName: "Compiler", withColor: "blue" };
+    const original = store.appendMessage(bot.threadId, {
+      role: "system", kind: "text", text: "Run CI",
+      automationSource: "delegation", from, comm,
+    });
+
+    const edited = store.branchMessage(bot.threadId, original.id, "Run tests")!;
+    expect(edited).toMatchObject({ role: "system", automationSource: "delegation", from });
+    expect(edited.from).not.toBe(original.from);
+    expect(edited.comm).toBeUndefined();
+    const regenerated = store.branchMessage(bot.threadId, edited.id, "Run tests")!;
+    expect(regenerated).toMatchObject({ role: "system", automationSource: "delegation", from });
+    expect(regenerated.comm).toBeUndefined();
+    store.flushBotsNow();
+    const reloaded = new Store(selection);
+    expect(reloaded.messagesFor(bot.threadId).find((message) => message.id === regenerated.id))
+      .toMatchObject({ role: "system", automationSource: "delegation", from });
   });
 
   it("setActiveLeaf switches branches and descends to the newest leaf", () => {
@@ -407,6 +588,7 @@ describe("Store", () => {
     const original = store.appendMessage(bot.threadId, { role: "user", kind: "text", text: "v1" });
     const edited = store.branchMessage(bot.threadId, original.id, "v2")!;
 
+    store.flushBotsNow();
     const reloaded = new Store(selection);
     expect(reloaded.activeLeaf(bot.threadId)).toBe(edited.id);
     expect(reloaded.messagesFor(bot.threadId).map((m) => m.text)).toContain("v1");
@@ -439,6 +621,7 @@ describe("Store", () => {
   it("busy is wiped even when bots.json says otherwise", () => {
     const store = new Store(selection);
     const bot = store.createBot();
+    store.flushBotsNow();
     const raw: BotRecord[] = JSON.parse(readFileSync(join(DATA_DIR, "bots.json"), "utf8"));
     raw.find((b) => b.id === bot.id)!.busy = true;
     writeFileSync(join(DATA_DIR, "bots.json"), JSON.stringify(raw));
@@ -456,6 +639,7 @@ describe("Store", () => {
     const store = new Store(selection);
     const bot = store.createBot();
     store.patchBot(bot.id, { composio: false });
+    store.flushBotsNow();
     const reloaded = new Store(selection);
     expect(reloaded.bot(bot.id)?.composio).toBe(false);
   });
@@ -463,11 +647,13 @@ describe("Store", () => {
   it("deleteBot removes the bot and its durable transcript", () => {
     const store = new Store(selection);
     const bot = store.createBot();
+    store.flushBotsNow();
     // the transcript is durable — a fresh Store sees the seeded messages
     expect(new Store(selection).messagesFor(bot.threadId).length).toBeGreaterThan(0);
 
     expect(store.deleteBot(bot.id)).toBe(true);
     expect(store.bot(bot.id)).toBeNull();
+    store.flushBotsNow();
     expect(new Store(selection).messagesFor(bot.threadId)).toHaveLength(0);
     expect(store.deleteBot(bot.id)).toBe(false);
   });
@@ -521,6 +707,9 @@ describe("Store", () => {
     store.patchGroup(room.id, { memberIds: [bot.id, "ghost-from-before-deleteBot"] });
     expect(store.group(room.id)?.memberIds).toEqual([bot.id, "ghost-from-before-deleteBot"]);
 
+    // bot must be on disk or the live-member filter below finds neither id
+    // and drops both, not just the ghost.
+    store.flushBotsNow();
     const reloaded = new Store(selection);
     expect(reloaded.group(room.id)?.memberIds).toEqual([bot.id]);
   });
@@ -543,6 +732,7 @@ describe("Store", () => {
     ];
     writeFileSync(join(DATA_DIR, `messages-${bot.threadId}.json`), JSON.stringify(legacy));
 
+    store.flushBotsNow();
     const reloaded = new Store(selection);
     const messages = reloaded.messagesFor(bot.threadId);
     expect(messages.map((m) => m.parentId)).toEqual([null, "m1"]);
@@ -709,9 +899,37 @@ describe("Store bot activity state", () => {
     const store = new Store(selection);
     const bot = store.createBot();
     store.setActivity(bot.id, "waiting-on-you");
+    // setActivity() no longer saves at all (see below) — flush so the bot's
+    // EXISTENCE (from createBot) is on disk for the reload to find it.
+    store.flushBotsNow();
     const again = new Store(selection);
     expect(again.bot(bot.id)?.activity).toBe("idle");
     expect(Boolean(again.bot(bot.id)?.busy)).toBe(false);
+  });
+
+  it("never writes bots.json on an activity transition, and never persists busy/activity at all", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    store.flushBotsNow();
+    const bytesBefore = readFileSync(join(DATA_DIR, "bots.json"), "utf8");
+
+    store.setActivity(bot.id, "working");
+    store.setActivity(bot.id, "waiting-on-you");
+    store.setActivity(bot.id, "idle");
+
+    // Nothing dirtied the debounce — a real flush right after is a no-op,
+    // proven by the file being byte-for-byte unchanged.
+    store.flushBotsNow();
+    expect(readFileSync(join(DATA_DIR, "bots.json"), "utf8")).toBe(bytesBefore);
+
+    // A save triggered for an unrelated reason must still exclude both
+    // fields from the roster entirely, not merely reset them.
+    store.patchBot(bot.id, { name: "Unrelated save" });
+    store.setActivity(bot.id, "working");
+    store.flushBotsNow();
+    const raw = readFileSync(join(DATA_DIR, "bots.json"), "utf8");
+    expect(raw).not.toContain('"busy"');
+    expect(raw).not.toContain('"activity"');
   });
 });
 
@@ -757,7 +975,7 @@ describe("Store redacts bot-authored secrets on write", () => {
               name: `Use ${key}`,
               instructions: `Send a request with ${key}`,
               schedule: { type: "daily", time: "09:00", weekdays: [1] },
-              runOn: "maus",
+              runOn: "bot",
               durationMinutes: 30,
             },
           },
@@ -785,6 +1003,7 @@ describe("Store redacts bot-authored secrets on write", () => {
     const mine = store.appendMessage(bot.threadId, { role: "user", kind: "text", text: `use ${key} for the api` });
     expect(mine.text).toContain(key);
     // and the stored copy is what was masked, not just the returned one
+    store.flushBotsNow();
     const again = new Store(selection);
     expect(again.messagesFor(bot.threadId).find((m) => m.id === reply.id)?.text).not.toContain(key);
   });
@@ -802,15 +1021,23 @@ describe("Store task usage", () => {
       input: 100,
       output: 20,
       costUsd: 0.01,
+      lastInput: 100,
       turns: 1,
     });
     expect(store.addTaskUsage(bot.id, bot.threadId, { input: 50, output: 5, costUsd: 0.005 })).toEqual({
       input: 150,
       output: 25,
       costUsd: 0.015,
+      lastInput: 50,
       turns: 2,
     });
-    expect(store.taskByThread(bot.id, bot.threadId)?.usage).toEqual({ input: 150, output: 25, costUsd: 0.015, turns: 2 });
+    expect(store.taskByThread(bot.id, bot.threadId)?.usage).toEqual({
+      input: 150,
+      output: 25,
+      costUsd: 0.015,
+      lastInput: 50,
+      turns: 2,
+    });
   });
 
   it("keeps cost null until some turn reports one, then sums only reported costs", () => {
@@ -831,7 +1058,27 @@ describe("Store task usage", () => {
       output: 2,
       costUsd: 0.03,
       billingMode: "estimated",
-    })).toEqual({ input: 30, output: 3, costUsd: 0.02, turns: 2 });
+    })).toEqual({ input: 30, output: 3, costUsd: 0.02, lastInput: 20, turns: 2 });
+  });
+
+  it("keeps the window the engine reported and does not invent one", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    expect(store.addTaskUsage(bot.id, bot.threadId, {
+      input: 910_800,
+      output: 20,
+      costUsd: null,
+      contextWindow: 1_000_000,
+    })?.contextWindow).toBe(1_000_000);
+    expect(store.addTaskUsage(bot.id, bot.threadId, {
+      input: 40_000,
+      output: 2,
+      costUsd: null,
+    })?.contextWindow).toBe(1_000_000);
+    expect(store.addTaskUsage(bot.id, bot.threadId, {
+      costUsd: null,
+      contextWindow: 0,
+    })?.contextWindow).toBe(1_000_000);
   });
 
   it("counts a turn that reported no tokens at all", () => {
@@ -889,6 +1136,51 @@ describe("Store task working folder", () => {
     expect(store.stampAutomationKey(bot.id, bot.threadId, "routine:other")?.automationKey).toBe("webhook:wh_1");
   });
 
+  it("rolloverAutomationTask mints a fresh task under the same automationKey and keeps history", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    const first = store.createTask(bot.id, "Compile gates", false, "webhook:wh_compile")!;
+    store.addTaskUsage(bot.id, first.threadId, { input: 100, output: 10, costUsd: null });
+    store.addTaskUsage(bot.id, first.threadId, { input: 100, output: 10, costUsd: null });
+    store.appendMessage(first.threadId, { role: "system", kind: "text", text: "old wake", automationSource: "webhook" });
+    store.appendMessage(first.threadId, { role: "bot", kind: "text", text: "old reply" });
+
+    const rolled = store.rolloverAutomationTask(bot.id, "webhook:wh_compile", {
+      title: "Compile gates",
+      activate: true,
+    })!;
+    expect(rolled.threadId).not.toBe(first.threadId);
+    expect(rolled.automationKey).toBe("webhook:wh_compile");
+    expect(store.taskByThread(bot.id, first.threadId)?.automationKey).toBeUndefined();
+    expect(store.taskByAutomationKey(bot.id, "webhook:wh_compile")?.threadId).toBe(rolled.threadId);
+    // Old history stays put.
+    expect(store.messagesFor(first.threadId).some((m) => m.text === "old wake")).toBe(true);
+    // New task starts thin with a pointer, not the old transcript.
+    const seed = store.messagesFor(rolled.threadId);
+    expect(seed).toHaveLength(1);
+    expect(seed[0]?.role).toBe("system");
+    expect(seed[0]?.text).toContain(first.threadId);
+    expect(seed[0]?.text).not.toContain("old wake");
+    // createTask still reunites on the NEW owner.
+    const again = store.createTask(bot.id, "Compile gates", false, "webhook:wh_compile")!;
+    expect(again.threadId).toBe(rolled.threadId);
+  });
+
+  it("rolloverAutomationTask clears the key from aliases so lookup cannot stick on a merged source", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    const home = store.taskByThread(bot.id, bot.threadId)!;
+    home.automationKey = "webhook:keep";
+    home.automationKeyAliases = ["webhook:wh_alias"];
+    store.flushBotsNow();
+    const rolled = store.rolloverAutomationTask(bot.id, "webhook:wh_alias", { title: "Alias", activate: false })!;
+    expect(store.taskByAutomationKey(bot.id, "webhook:wh_alias")?.threadId).toBe(rolled.threadId);
+    expect(store.taskByThread(bot.id, home.threadId)?.automationKeyAliases ?? []).not.toContain("webhook:wh_alias");
+    // Unrelated primary key on the old task is untouched.
+    expect(store.taskByThread(bot.id, home.threadId)?.automationKey).toBe("webhook:keep");
+  });
+
+
   it("pins the default (null) when the bot has no folder, so a later folder can't move a live session", () => {
     const store = new Store(selection);
     const bot = store.createBot();
@@ -935,6 +1227,7 @@ describe("Store room working folder", () => {
     expect(store.pinGroupCwd(group.id)).toBe("/tmp/project-a");
 
     // the pin is durable — a restart must not re-pin from the new folder
+    store.flushBotsNow();
     const reloaded = new Store(selection);
     expect(reloaded.pinGroupCwd(group.id)).toBe("/tmp/project-a");
   });
@@ -1005,6 +1298,204 @@ describe("Store patchBot modelSelection", () => {
       instanceId: "custom",
       model: "custom-model",
     });
+  });
+});
+
+// HS12/HS21: GET /api/bots used to hydrate every bot and group's thread
+// through an unbounded cache — one request against a large database
+// pulled every thread into the heap for the life of the process.
+describe("Store thread cache", () => {
+  beforeEach(() => {
+    rmSync(DATA_DIR, { recursive: true, force: true });
+    // a couple of these tests seed rows via message-db directly, before
+    // any Store exists to create DATA_DIR itself
+    mkdirSync(DATA_DIR, { recursive: true });
+  });
+
+  it("messagesTail reads a bounded page without caching the whole thread", () => {
+    const threadId = "long-thread";
+    // seeded directly through sqlite, bypassing Store, so this thread has
+    // never been hydrated into any Store's cache before messagesTail runs.
+    // parentId is chained explicitly, same as Store.appendMessage would —
+    // an omitted parentId reads back as undefined and is what marks a row
+    // as pre-branching legacy data, which always forces a full load.
+    let parentId: string | null = null;
+    for (let i = 0; i < 10; i++) {
+      insertMessage(threadId, { id: `m${i}`, role: "user", kind: "text", text: `text ${i}`, at: Date.now(), parentId });
+      parentId = `m${i}`;
+    }
+
+    const store = new Store(selection);
+    const page = store.messagesTail(threadId, 3);
+    expect(page.messages.map((m) => m.text)).toEqual(["text 7", "text 8", "text 9"]);
+    expect(page.hasMore).toBe(true);
+    // the bounded SQL read must not have materialized and cached the rest
+    // of the transcript
+    expect(store.threadIsCachedForTests(threadId)).toBe(false);
+
+    // an explicit full read still works correctly, and now caches it
+    expect(store.messagesFor(threadId)).toHaveLength(10);
+    expect(store.threadIsCachedForTests(threadId)).toBe(true);
+  });
+
+  it("messagesTail caches a thread whose whole history fits in the page", () => {
+    const threadId = "short-thread";
+    insertMessage(threadId, { id: "a", role: "user", kind: "text", text: "one", at: Date.now(), parentId: null });
+    insertMessage(threadId, { id: "b", role: "user", kind: "text", text: "two", at: Date.now(), parentId: "a" });
+
+    const store = new Store(selection);
+    const page = store.messagesTail(threadId, 5);
+    expect(page.messages.map((m) => m.text)).toEqual(["one", "two"]);
+    expect(page.hasMore).toBe(false);
+    // nothing left to page through later, so this is cached like any
+    // other full load — a later messagesFor() does not re-read it
+    expect(store.threadIsCachedForTests(threadId)).toBe(true);
+  });
+
+  it("evicts the least-recently-used thread and re-reads it transparently", () => {
+    const setup = new Store(selection);
+    const a = setup.createBot({ name: "A" }, { seedMessages: false });
+    const b = setup.createBot({ name: "B" }, { seedMessages: false });
+    const c = setup.createBot({ name: "C" }, { seedMessages: false });
+    setup.appendMessage(a.threadId, { role: "user", kind: "text", text: "hi a" });
+    setup.appendMessage(b.threadId, { role: "user", kind: "text", text: "hi b" });
+    setup.appendMessage(c.threadId, { role: "user", kind: "text", text: "hi c" });
+
+    // a fresh Store with a bound cache starts cold regardless of what the
+    // setup store above warmed — the messagesFor() calls below are what
+    // actually populate this store's cache, in a controlled order
+    const store = new Store(selection, { threadCacheLimit: 2 });
+    expect(store.threadIsCachedForTests(a.threadId)).toBe(false);
+
+    store.messagesFor(a.threadId);
+    store.messagesFor(b.threadId);
+    expect(store.threadIsCachedForTests(a.threadId)).toBe(true);
+    expect(store.threadIsCachedForTests(b.threadId)).toBe(true);
+
+    // a third thread pushes the cache past its bound; A is the least
+    // recently used (touched before B) and is evicted, not B
+    store.messagesFor(c.threadId);
+    expect(store.threadIsCachedForTests(a.threadId)).toBe(false);
+    expect(store.threadIsCachedForTests(b.threadId)).toBe(true);
+    expect(store.threadIsCachedForTests(c.threadId)).toBe(true);
+
+    // eviction is invisible to callers: A's messages re-hydrate correctly
+    // from sqlite, and touching it again re-warms the cache — this time
+    // evicting B, the next-least-recently-used entry
+    expect(store.messagesFor(a.threadId).map((m) => m.text)).toEqual(["hi a"]);
+    expect(store.threadIsCachedForTests(a.threadId)).toBe(true);
+    expect(store.threadIsCachedForTests(b.threadId)).toBe(false);
+  });
+
+  // BF-2424 follow-up: a thread-COUNT bound is not a memory bound. 64 fully
+  // hydrated threads carrying inline base64 captures measured 74 GB RSS,
+  // because nothing capped how MANY MESSAGES those 64 threads retained. The
+  // size bound has to bite while the thread count is nowhere near its own
+  // limit — that is exactly the case the count limit missed.
+  it("evicts on retained message count while the thread count stays under its limit", () => {
+    const setup = new Store(selection);
+    const fat = setup.createBot({ name: "Fat" }, { seedMessages: false });
+    for (let i = 0; i < 6; i++) {
+      setup.appendMessage(fat.threadId, { role: "user", kind: "text", text: `m${i}` });
+    }
+    // room for 10 retained messages across 8 threads: the size bound is the
+    // only one that can be reached here
+    const store = new Store(selection, { threadCacheLimit: 8, threadCacheMaxMessages: 10 });
+
+    store.messagesFor(fat.threadId); // 6 retained — under the bound
+    expect(store.threadIsCachedForTests(fat.threadId)).toBe(true);
+
+    const rest = ["s", "a", "b", "c", "d", "e"].map((name) => {
+      const bot = setup.createBot({ name }, { seedMessages: false });
+      setup.appendMessage(bot.threadId, { role: "user", kind: "text", text: name });
+      return bot;
+    });
+
+    // 6 + 5 = 11 retained, over the bound of 10, while only 6 of the 8 slots
+    // are in use — the thread-COUNT limit alone would have kept all of them
+    store.messagesFor(rest[0]!.threadId); // 7
+    store.messagesFor(rest[1]!.threadId); // 8
+    store.messagesFor(rest[2]!.threadId); // 9
+    store.messagesFor(rest[3]!.threadId); // 10 — at the bound
+    store.messagesFor(rest[4]!.threadId); // 11 — over it, evict the LRU end
+    expect(store.threadIsCachedForTests(fat.threadId)).toBe(false);
+    expect(store.threadIsCachedForTests(rest[4]!.threadId)).toBe(true);
+
+    // eviction stays invisible to callers: the thread re-hydrates correctly
+    expect(store.messagesFor(fat.threadId).map((m) => m.text)).toEqual([
+      "m0", "m1", "m2", "m3", "m4", "m5",
+    ]);
+  });
+
+  // BF-2424: the unpaginated GET /api/bots path answers with a thread's whole
+  // transcript for every bot AND every group in one request. It must not cache
+  // them — messagesFor pins a thread for the life of the process, and the LRU
+  // bounds the thread COUNT rather than a thread's size, so a single
+  // unpaginated poll was enough to hold the entire database in the heap.
+  it("messagesForTransient returns the whole transcript without pinning it in the LRU", () => {
+    const setup = new Store(selection);
+    const target = setup.createBot({ name: "Transient" }, { seedMessages: false });
+    setup.appendMessage(target.threadId, { role: "user", kind: "text", text: "one" });
+    setup.appendMessage(target.threadId, { role: "bot", kind: "text", text: "two" });
+
+    const store = new Store(selection);
+    expect(store.threadIsCachedForTests(target.threadId)).toBe(false);
+
+    // same bytes out as the caching read...
+    expect(store.messagesForTransient(target.threadId).map((m) => m.text)).toEqual(["one", "two"]);
+    // ...and nothing retained for the life of the process
+    expect(store.threadIsCachedForTests(target.threadId)).toBe(false);
+
+    // an already-warm thread still serves from memory, and stays warm: the
+    // transient read must not evict what other work legitimately cached
+    store.messagesFor(target.threadId);
+    expect(store.messagesForTransient(target.threadId).map((m) => m.text)).toEqual(["one", "two"]);
+    expect(store.threadIsCachedForTests(target.threadId)).toBe(true);
+  });
+
+  it("appendMessage after eviction stays consistent with what is durable on disk", () => {
+    const setup = new Store(selection);
+    const target = setup.createBot({ name: "Target" }, { seedMessages: false });
+    const filler = setup.createBot({ name: "Filler" }, { seedMessages: false });
+    setup.appendMessage(target.threadId, { role: "user", kind: "text", text: "before eviction" });
+
+    const store = new Store(selection, { threadCacheLimit: 1 });
+    store.messagesFor(target.threadId); // warm the cache
+    expect(store.threadIsCachedForTests(target.threadId)).toBe(true);
+    store.messagesFor(filler.threadId); // one slot only — evicts target
+    expect(store.threadIsCachedForTests(target.threadId)).toBe(false);
+
+    // appendMessage on an evicted thread must re-hydrate from sqlite
+    // (which already has "before eviction" persisted) rather than lose
+    // it, then persist and cache the new message on top.
+    const appended = store.appendMessage(target.threadId, { role: "bot", kind: "text", text: "after eviction" });
+    expect(store.messagesFor(target.threadId).map((m) => m.text)).toEqual(["before eviction", "after eviction"]);
+    expect(store.activeLeaf(target.threadId)).toBe(appended.id);
+
+    // durable across a full restart, not just this process's cache
+    const reloaded = new Store(selection);
+    expect(reloaded.messagesFor(target.threadId).map((m) => m.text)).toEqual(["before eviction", "after eviction"]);
+  });
+
+  it("appendMessage on a warm thread updates retained message count and evicts older cached threads", () => {
+    const store = new Store(selection, { threadCacheLimit: 8, threadCacheMaxMessages: 4 });
+    const older = store.createBot({ name: "Older" }, { seedMessages: false });
+    const active = store.createBot({ name: "Active" }, { seedMessages: false });
+
+    store.appendMessage(older.threadId, { role: "user", kind: "text", text: "o1" });
+    store.appendMessage(older.threadId, { role: "bot", kind: "text", text: "o2" });
+    expect(store.threadIsCachedForTests(older.threadId)).toBe(true);
+
+    store.appendMessage(active.threadId, { role: "user", kind: "text", text: "a1" });
+    store.appendMessage(active.threadId, { role: "bot", kind: "text", text: "a2" });
+    // 2 + 2 = 4 retained (at the bound of 4)
+    expect(store.threadIsCachedForTests(older.threadId)).toBe(true);
+    expect(store.threadIsCachedForTests(active.threadId)).toBe(true);
+
+    // 5th retained message across the cache via in-place appendMessage evicts older
+    store.appendMessage(active.threadId, { role: "user", kind: "text", text: "a3" });
+    expect(store.threadIsCachedForTests(older.threadId)).toBe(false);
+    expect(store.threadIsCachedForTests(active.threadId)).toBe(true);
   });
 });
 

@@ -3,6 +3,8 @@
  * to start the browser SDK.  Nothing in this module ever reads or returns it. */
 export type ObservabilityStatusView = {
   enabled?: boolean;
+  /** Harness Node SDK delivery, separate from the configuration `enabled` flag. */
+  delivering?: boolean;
   requestedEnabled?: boolean;
   /** A DSN is on file, whether or not diagnostics are currently enabled. */
   configured?: boolean;
@@ -15,6 +17,9 @@ export type ObservabilityStatusView = {
   projectId?: string | null;
   environment?: string;
   tracesSampleRate?: number;
+  aiTracesSampleRate?: number;
+  httpTracesSampleRate?: number;
+  uiTracesSampleRate?: number;
   logsEnabled?: boolean;
   profilingAvailable?: boolean;
   totalCaptured?: number;
@@ -48,5 +53,6 @@ export function observabilityBadge(
   if (status.requestedEnabled === false) return { label: "Turned off", tone: "off" };
   if (!status.configured) return { label: "Not configured", tone: "off" };
   if (!status.enabled) return { label: "Turned off", tone: "off" };
+  if (status.delivering === false) return { label: "Starting client", tone: "waiting" };
   return { label: "Sending diagnostics", tone: "active" };
 }

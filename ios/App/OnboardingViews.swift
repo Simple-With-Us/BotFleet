@@ -11,14 +11,14 @@ struct CompanionWelcomeView: View {
 
                 ZStack {
                     RoundedRectangle(cornerRadius: 32, style: .continuous)
-                        .fill(MausPalette.color("blue").opacity(0.12))
+                        .fill(BotPalette.color("blue").opacity(0.12))
                         .frame(width: 148, height: 148)
-                    MausAvatar(color: "blue", size: 108, state: .happy, animated: false)
+                    BotMascot(color: "blue", size: 108, state: .happy, animated: false)
                         .accessibilityHidden(true)
                 }
 
                 VStack(spacing: 12) {
-                    Text("Take your bots with you")
+                    Text("Take Your Bots With You")
                         .font(.largeTitle.bold())
                         .multilineTextAlignment(.center)
                     Text("Open chats, approve actions, and send new work from your iPhone.")
@@ -30,17 +30,17 @@ struct CompanionWelcomeView: View {
                 VStack(spacing: 18) {
                     WelcomeBenefit(
                         icon: "bubble.left.and.bubble.right.fill",
-                        title: "Your chats, in your pocket",
+                        title: "Your Chats, in Your Pocket",
                         detail: "Pick up the same conversations from your computer."
                     )
                     WelcomeBenefit(
                         icon: "checkmark.circle.fill",
-                        title: "Respond when a bot needs you",
+                        title: "Respond When a Bot Needs You",
                         detail: "Review approvals without going back to your desk."
                     )
                     WelcomeBenefit(
                         icon: "lock.shield.fill",
-                        title: "Private by design",
+                        title: "Private by Design",
                         detail: "You choose which trusted computer this phone connects to."
                     )
                 }
@@ -54,7 +54,7 @@ struct CompanionWelcomeView: View {
         }
         .background {
             LinearGradient(
-                colors: [MausPalette.color("blue").opacity(0.10), Color.clear],
+                colors: [BotPalette.color("blue").opacity(0.10), Color.clear],
                 startPoint: .top,
                 endPoint: .center
             )
@@ -63,12 +63,12 @@ struct CompanionWelcomeView: View {
         .safeAreaInset(edge: .bottom) {
             VStack(spacing: 10) {
                 Button(action: onConnect) {
-                    Text("Connect my computer")
+                    Text("Connect My Computer")
                         .frame(maxWidth: .infinity)
                 }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.large)
-                Button("Not now", action: onSkip)
+                Button("Not Now", action: onSkip)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 6)
@@ -90,7 +90,7 @@ private struct WelcomeBenefit: View {
         HStack(alignment: .top, spacing: 14) {
             Image(systemName: icon)
                 .font(.title3)
-                .foregroundStyle(MausPalette.color("blue"))
+                .foregroundStyle(BotPalette.color("blue"))
                 .frame(width: 30, height: 30)
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 3) {
@@ -117,16 +117,16 @@ struct UnpairedHomeView: View {
 
                     ZStack {
                         Circle()
-                            .fill(MausPalette.color("blue").opacity(0.12))
+                            .fill(BotPalette.color("blue").opacity(0.12))
                             .frame(width: 112, height: 112)
                         Image(systemName: "laptopcomputer.and.iphone")
                             .font(.system(size: 42, weight: .medium))
-                            .foregroundStyle(MausPalette.color("blue"))
+                            .foregroundStyle(BotPalette.color("blue"))
                     }
                     .accessibilityHidden(true)
 
                     VStack(spacing: 8) {
-                        Text("Connect when you're ready")
+                        Text("Connect When You're Ready")
                             .font(.title2.bold())
                         Text("Pair this iPhone with BotFleet to see your chats and respond to your bots.")
                             .foregroundStyle(.secondary)
@@ -147,7 +147,7 @@ struct UnpairedHomeView: View {
             }
             .safeAreaInset(edge: .bottom) {
                 Button(action: onConnect) {
-                    Text("Connect computer")
+                    Text("Connect Computer")
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
@@ -183,18 +183,18 @@ struct NotificationOnboardingView: View {
 
                 ZStack {
                     RoundedRectangle(cornerRadius: 30, style: .continuous)
-                        .fill(MausPalette.color("green").opacity(0.12))
+                        .fill(BotPalette.color("green").opacity(0.12))
                         .frame(width: 132, height: 132)
                     Image(systemName: "bell.badge.fill")
                         .font(.system(size: 48, weight: .medium))
-                        .foregroundStyle(MausPalette.color("green"))
+                        .foregroundStyle(BotPalette.color("green"))
                 }
                 .accessibilityHidden(true)
 
                 VStack(spacing: 10) {
-                    Text("Stay in the loop")
+                    Text("Stay in the Loop")
                         .font(.largeTitle.bold())
-                    Text("Get alerts while BotFleet is open or was recently in the background. Alerts stop after iOS fully suspends or closes the app.")
+                    Text("Get alerts while BotFleet is open or was recently in the background.\u{00A0} Alerts stop after iOS fully suspends or closes the app.")
                         .font(.title3)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
@@ -227,7 +227,7 @@ struct NotificationOnboardingView: View {
                 } label: {
                     HStack {
                         if enabling { ProgressView().tint(.white) }
-                        Text("Enable notifications")
+                        Text("Enable Notifications")
                     }
                     .frame(maxWidth: .infinity)
                 }
@@ -235,7 +235,7 @@ struct NotificationOnboardingView: View {
                 .controlSize(.large)
                 .disabled(enabling)
 
-                Button("Not now", action: onContinue)
+                Button("Not Now", action: onContinue)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 6)

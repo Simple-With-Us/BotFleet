@@ -163,7 +163,7 @@ afterAll(async () => {
   await new Promise<void>((resolve) => api.close(() => resolve()));
 });
 
-describe.sequential("Composio Sessions", () => {
+describe("Composio Sessions", { concurrent: false }, () => {
   it("rejects broker URL components and invalid tokens from the environment", () => {
     process.env.OMB_COMPOSIO_BROKER_TOKEN = "a".repeat(64);
     try {
@@ -413,7 +413,11 @@ describe.sequential("Composio Sessions", () => {
       args: [expect.stringContaining("connector-proxy")],
       env: {
         OMB_CONNECTOR_UPSTREAM_URL: "http://127.0.0.1:8799/api/internal/connectors/mcp",
-        OMB_CONNECTOR_UPSTREAM_HEADERS: JSON.stringify({ authorization: "Bearer secret" }),
+        OMB_CONNECTOR_UPSTREAM_HEADERS: JSON.stringify({
+          authorization: "Bearer secret",
+          "x-botfleet-bot-id": "bot-1",
+          "x-botfleet-thread-id": "thread-1",
+        }),
         OMB_HARNESS_URL: "http://127.0.0.1:8799",
         OMB_COMMS_TOKEN: "secret",
         OMB_BOT_ID: "bot-1",

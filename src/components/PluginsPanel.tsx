@@ -605,8 +605,8 @@ export function PluginsPanel() {
       >
         <header className="flex items-start justify-between gap-4 px-6 pb-3 pt-6 sm:px-8 sm:pt-7">
           <div>
-            <h2 id="connected-apps-title" className="text-[22px] font-semibold tracking-[-0.01em] text-ink">Connected Apps</h2>
-            <p className="mt-1 text-[13px] text-ink-secondary">Connect the apps your bots can use.</p>
+            <h2 id="connected-apps-title" className="text-[22px] font-semibold tracking-[-0.01em] text-ink">Connected Apps via Composio</h2>
+            <p className="mt-1 text-[13px] text-ink-secondary">Connect third-party accounts (Google, Slack, GitHub, and more) via Composio for your bots to use.</p>
           </div>
           <div className="flex items-center gap-1">
             <button
@@ -619,7 +619,7 @@ export function PluginsPanel() {
             </button>
             <button
               onClick={close}
-              aria-label="Close Connected Apps"
+              aria-label="Close Connected Apps via Composio"
               className="rounded-lg p-2 text-ink-secondary hover:bg-raised hover:text-ink"
             >
               <X size={21} />
@@ -635,7 +635,7 @@ export function PluginsPanel() {
         )}
 
         <div className="flex flex-col gap-3 px-6 pb-4 pt-5 sm:flex-row sm:items-center sm:justify-between sm:px-8">
-          <div className="flex w-fit rounded-xl bg-raised/70 p-1" role="tablist" aria-label="Connected Apps view">
+          <div className="flex w-fit rounded-xl bg-raised/70 p-1" role="tablist" aria-label="Connected Apps via Composio view">
             <button
               role="tab"
               aria-selected={tab === "marketplace"}

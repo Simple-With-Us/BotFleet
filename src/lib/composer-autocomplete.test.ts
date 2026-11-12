@@ -17,6 +17,16 @@ describe("autocompleteQueryAt", () => {
     expect(autocompleteQueryAt("#general", 8)).toEqual({ trigger: "#", start: 0, query: "general" });
   });
 
+  it("detects / at start of input for slash commands", () => {
+    expect(autocompleteQueryAt("/", 1)).toEqual({ trigger: "/", start: 0, query: "" });
+    expect(autocompleteQueryAt("/stop", 5)).toEqual({ trigger: "/", start: 0, query: "stop" });
+  });
+
+  it("ignores / inside paths and URLs", () => {
+    expect(autocompleteQueryAt("https://example.com/foo", 23)).toBeNull();
+    expect(autocompleteQueryAt("read docs/plans.md", 16)).toBeNull();
+  });
+
   it("detects triggers preceded by whitespace", () => {
     expect(autocompleteQueryAt("hello @", 7)).toEqual({ trigger: "@", start: 6, query: "" });
     expect(autocompleteQueryAt("check out #linear please", 17)).toEqual({ trigger: "#", start: 10, query: "linear" });
@@ -124,6 +134,35 @@ describe("applyAutocomplete", () => {
     expect(result).toEqual({
       text: "Check #general ",
       caret: 15,
+    });
+  });
+
+  it("inserts slash command labels with trailing space", () => {
+    const result = applyAutocomplete("/st", 3, { trigger: "/", start: 0, query: "st" }, {
+      id: "botfleet:stop",
+      name: "stop",
+      kind: "command",
+      badge: "BotFleet",
+      command: {
+        id: "botfleet:stop",
+        name: "stop",
+        label: "/stop",
+        title: "Stop",
+        description: "Stop the running turn.",
+        source: "botfleet",
+        invoke: "server",
+        clientAction: null,
+        args: null,
+        availability: "always",
+        enabled: true,
+        disabledReason: null,
+        runsModelTurn: false,
+        collidesWith: null,
+      },
+    });
+    expect(result).toEqual({
+      text: "/stop ",
+      caret: 6,
     });
   });
 });

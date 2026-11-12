@@ -3,21 +3,21 @@
 // current releases; TCC reads the Info.plist belonging to the executable's
 // bundle and terminates the process before Swift can recover when it is absent.
 import { execFileSync } from "node:child_process";
-import { copyFileSync, mkdirSync, rmSync } from "node:fs";
+import { copyFileSync, mkdirSync, realpathSync, rmSync } from "node:fs";
 import path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 
 const electronDir = path.dirname(fileURLToPath(import.meta.url));
 const projectDir = path.dirname(electronDir);
-const resourcesDir = path.join(electronDir, "resources");
+const helpersDir = path.join(projectDir, "native", "helpers");
 
-export const speechHelperBundle = path.join(resourcesDir, "BotFleet Speech.app");
+export const speechHelperBundle = path.join(helpersDir, "BotFleet Speech.app");
 export const speechHelperBinary = path.join(speechHelperBundle, "Contents", "MacOS", "speech-helper");
 
 export function buildSpeechHelper() {
   const contents = path.join(speechHelperBundle, "Contents");
   mkdirSync(path.join(contents, "MacOS"), { recursive: true });
-  copyFileSync(path.join(resourcesDir, "speech-helper-Info.plist"), path.join(contents, "Info.plist"));
+  copyFileSync(path.join(helpersDir, "speech-helper-Info.plist"), path.join(contents, "Info.plist"));
   // The mac app ships for arm64 and x64, and the helper rides inside both
   // bundles, so it must be universal — bare `swiftc` builds host-arch only,
   // which inside an Intel app is a dictation helper that cannot launch.
@@ -27,7 +27,7 @@ export function buildSpeechHelper() {
     const slice = `${speechHelperBinary}-${arch}`;
     execFileSync(
       "swiftc",
-      ["-O", "-target", `${arch}-apple-macos12`, path.join(resourcesDir, "speech-helper.swift"), "-o", slice],
+      ["-O", "-target", `${arch}-apple-macos12`, path.join(helpersDir, "speech-helper.swift"), "-o", slice],
       { stdio: "inherit", timeout: 120_000 },
     );
     return slice;
@@ -61,6 +61,17 @@ export function buildSpeechHelper() {
   );
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+// Compare physical paths.  Node's ESM loader realpaths the entry module, so an
+// invocation through a symlinked directory (macOS /var -> /private/var) never
+// matches process.argv[1] when compared as text.
+function isEntryModule() {
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (isEntryModule()) {
   buildSpeechHelper();
 }

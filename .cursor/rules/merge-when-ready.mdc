@@ -1,0 +1,16 @@
+---
+description: Owner default — land work by merging PRs when CI and review gates are green
+alwaysApply: true
+---
+
+# Merge When Ready
+
+Finished agent work is not complete at push.  Default landing path:
+
+1. Commit and push on the feature branch.
+2. Open or update the pull request (draft only when the owner or lane explicitly requires it).
+3. Enable GitHub **auto-merge** (squash unless the repo lane documents another method).
+4. Fix failing required checks and resolve blocking review threads until CI is green.
+5. Let auto-merge complete, or merge explicitly once green if auto-merge is unavailable.
+
+Do not merge with red required checks.  Do not force-push unless the owner asks.  Pause only for force-push, prod data wipe, or live-key revoke.

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   computerLabel,
   resolveCloudBackend,
@@ -7,19 +7,32 @@ import {
   resolveGrants,
   resolveTurnComputerMounts,
   computerSystemPrompt,
+  vpsUnavailableHint,
+  autoVpsOutageFailsTurn,
   hostToolPrefix,
   nameMounts,
   turnComputerMounts,
+  hostShellGranted,
   type ComputerMount,
   type TurnComputerDeps,
 } from "./computer-grants.ts";
+import { boxGatewayUrl, mintBoxGatewayGrant } from "./box-gateway-grant.ts";
 import type { AppConfig } from "./config.ts";
 import { buildMcpServers } from "./drivers/pi.ts";
 import type { SendTurnInput } from "./contracts.ts";
 
 const stdio = (env: Record<string, string> = {}) => ({ command: "/bin/cua", args: ["mcp"], env });
 const hostStdio = () => ({ ...stdio(), scope: "local-computer" as const });
-const box = () => ({ kind: "box" as const, boxId: "b1", token: "t" });
+// A Box mount carries a per-box grant AND the loopback gateway that grant is
+// only good at.  `computerProxyEnv` refuses a token with no gateway, because
+// a child holding one would fall back to the provider and present a credential
+// that authorises every box in the account.
+const box = () => ({
+  kind: "box" as const,
+  boxId: "b1",
+  token: "t",
+  gatewayUrl: "http://127.0.0.1:8799/api/local/box-gateway",
+});
 
 const mount = (kind: ComputerMount["kind"], stdioOrBox: "stdio" | "box" = "stdio"): ComputerMount => ({
   name: "",
@@ -102,6 +115,18 @@ describe("computerSystemPrompt", () => {
     expect(one).not.toContain("mcp__computer_");
   });
 
+  it("describes the Local VM as what it is: one mounted folder and real network access", () => {
+    // The prompt used to call the VM isolated and say no other host folder was
+    // mounted.  Both were false: the workspace is a host folder, and the
+    // container reaches the internet.  A bot that believes the second one will
+    // treat a reachable host service as out of bounds.
+    const prompt = computerSystemPrompt(nameMounts([mount("vm")]));
+    expect(prompt).not.toContain("isolated");
+    expect(prompt).not.toContain("No other host folder is mounted");
+    expect(prompt).toContain("That workspace is the only host folder mounted into the VM");
+    expect(prompt).toContain("the VM has outbound internet access like any other computer");
+  });
+
   it("does not describe the box to the agent already running on it", () => {
     const mounts = nameMounts([mount("box", "box")]);
     expect(computerSystemPrompt(mounts, { boxAgent: true })).not.toContain("your own cloud computer");
@@ -117,6 +142,23 @@ describe("computerSystemPrompt", () => {
     expect(prompt).toContain("mcp__computer_host__");
     expect(prompt).toContain("My VPS");
     expect(prompt).toContain("This Mac");
+  });
+
+  it("does not claim a VPS is isolated when the container is shared", () => {
+    const mounts = nameMounts([mount("vps"), mount("local")]);
+
+    // Default and per-bot both keep the historical isolated wording, so a
+    // caller that has not learned about shared mode moves nothing.
+    const perBot = computerSystemPrompt(mounts, { hostPlatform: "darwin" });
+    expect(perBot).toContain("one container per bot, not shared with the other bots");
+    expect(computerSystemPrompt(mounts, { hostPlatform: "darwin", vpsShared: false })).toBe(perBot);
+
+    // Shared mode hands every bot its own desktop session inside ONE container.
+    // Telling it otherwise invites a bot to assume desktop state it does not own.
+    const shared = computerSystemPrompt(mounts, { hostPlatform: "darwin", vpsShared: true });
+    expect(shared).not.toContain("not shared with the other bots");
+    expect(shared).toContain("its own desktop session");
+    expect(shared).toContain("nobody else sees or clicks your desktop");
   });
 
   it("states the owner's selection rule: remote by default, host only when it earns it", () => {
@@ -138,7 +180,7 @@ describe("computerSystemPrompt", () => {
   });
 
   it("describes the host as a desktop only to an engine that is handed one", () => {
-    // An MCP engine mounts the Cua Driver server and really can see and click
+    // An MCP engine mounts the CUA Driver server and really can see and click
     // the desktop.  A driver-loop engine mounts no MCP server at all: its
     // host surface is the harness's own bash and file tools, and that
     // registry holds no screenshot, click or desktop-state tool.  Telling it
@@ -240,7 +282,7 @@ describe("resolveGrants", () => {
   });
 
   it("leaves an ordinary turn alone when runOn is anything else", () => {
-    expect(resolveGrants(["vm"], "maus")).toEqual({ granted: ["vm"], auto: false });
+    expect(resolveGrants(["vm"], "bot")).toEqual({ granted: ["vm"], auto: false });
     expect(resolveGrants(undefined, undefined)).toEqual({ granted: [], auto: true });
   });
 });
@@ -316,7 +358,7 @@ describe("workspace defaults", () => {
     expect(cloudRunUsesBoxAgent("cloud", "box", undefined)).toBe(true);
     expect(cloudRunUsesBoxAgent("cloud", undefined, undefined)).toBe(true);
     expect(cloudRunUsesBoxAgent("cloud", undefined, "box")).toBe(true);
-    expect(cloudRunUsesBoxAgent("maus", "box", undefined)).toBe(false);
+    expect(cloudRunUsesBoxAgent("bot", "box", undefined)).toBe(false);
     expect(cloudRunUsesBoxAgent(undefined, "box", undefined)).toBe(false);
   });
 });
@@ -461,6 +503,7 @@ describe("per-provider gates (computerProviders)", () => {
       },
       vpsLeases: { claim: () => ({}), release: () => {} },
       controlIntegration: () => ({ url: "http://localhost", token: "t" }),
+      boxGateway: { url: boxGatewayUrl, mint: mintBoxGatewayGrant },
       broadcast: () => {},
       notice: () => {},
       checkpoint: async () => true,
@@ -531,5 +574,525 @@ describe("per-provider gates (computerProviders)", () => {
     });
     expect(result.mounts.map((m) => m.kind)).not.toContain("local");
     expect(result.hasHostComputer).toBe(false);
+  });
+});
+
+describe("routine failure resiliency and unattended safety", () => {
+  const makeBaseDeps = (notices: string[] = []) =>
+    ({
+      hostPlatform: "darwin" as NodeJS.Platform,
+      readHostConnection: () => ({ command: "/bin/cua", args: ["mcp"], env: {} }),
+      acquireLocalVm: async () => ({ command: "/bin/vm", args: ["mcp"], env: {} }),
+      vps: {
+        vpsDriverError: () => null,
+        vpsComputerAction: async () => ({ ready: true, sshAlias: "coolify", container_id: "c1" }),
+        inspectVpsForAuto: async () => ({ ready: true, sshAlias: "coolify", container_id: "c1" }),
+        vpsComputerMcp: () => ({ command: "/bin/vps", args: ["mcp"], env: {} }),
+        vpsComputerScreenshot: async () => ({ png: "", format: "png" }),
+      },
+      box: {
+        boxConfigured: (): boolean => false,
+        findBox: async () => null,
+        provisionBox: async () => ({ boxId: "b1" }),
+        readyBox: async () => null,
+        screenshotBox: async () => ({ png: "", format: "png" }),
+      },
+      vpsLeases: { claim: () => ({}), release: () => {} },
+      controlIntegration: () => ({ url: "http://localhost", token: "t" }),
+      boxGateway: { url: boxGatewayUrl, mint: mintBoxGatewayGrant },
+      broadcast: () => {},
+      notice: (msg: string) => {
+        notices.push(msg);
+      },
+      checkpoint: async () => true,
+    }) satisfies TurnComputerDeps<object>;
+
+  it("does not mount local desktop for unattended Antigravity turns and emits notice", async () => {
+    const notices: string[] = [];
+    const deps = makeBaseDeps(notices);
+    const result = await resolveTurnComputerMounts({
+      bot: { id: "b1", name: "Plumber", computers: ["local"] },
+      cfg: {} as AppConfig,
+      engine: { driverKind: "antigravityAgent", computerMcp: true, localComputerMcp: true, toolLoop: false },
+      threadId: "t1",
+      dispatchId: 1,
+      unattended: true,
+      allowed: null,
+      deps,
+    });
+    expect(result.mounts.map((m) => m.kind)).not.toContain("local");
+    expect(result.hasHostComputer).toBe(false);
+    expect(notices).toContain(
+      "local computer not mounted: unattended turns with this model engine cannot broker host approvals, so BotFleet did not mount the desktop",
+    );
+  });
+
+  it("mounts local desktop for attended Antigravity turns", async () => {
+    const notices: string[] = [];
+    const deps = makeBaseDeps(notices);
+    const result = await resolveTurnComputerMounts({
+      bot: { id: "b1", name: "Plumber", computers: ["local"] },
+      cfg: {} as AppConfig,
+      engine: { driverKind: "antigravityAgent", computerMcp: true, localComputerMcp: true, toolLoop: false },
+      threadId: "t1",
+      dispatchId: 1,
+      unattended: false,
+      allowed: null,
+      deps,
+    });
+    expect(result.mounts.map((m) => m.kind)).toContain("local");
+    expect(result.hasHostComputer).toBe(true);
+    expect(notices).toEqual([]);
+  });
+
+  it("mounts local desktop for unattended Claude turns", async () => {
+    const notices: string[] = [];
+    const deps = makeBaseDeps(notices);
+    const result = await resolveTurnComputerMounts({
+      bot: { id: "b1", name: "ClaudeBot", computers: ["local"] },
+      cfg: {} as AppConfig,
+      engine: { driverKind: "claude", computerMcp: true, localComputerMcp: true, toolLoop: false },
+      threadId: "t1",
+      dispatchId: 1,
+      unattended: true,
+      allowed: null,
+      deps,
+    });
+    expect(result.mounts.map((m) => m.kind)).toContain("local");
+    expect(result.hasHostComputer).toBe(true);
+    expect(notices).toEqual([]);
+  });
+
+  it("gracefully degrades when VPS inspect throws on a local turn (runOn !== 'cloud')", async () => {
+    const notices: string[] = [];
+    const deps = makeBaseDeps(notices);
+    deps.vps.vpsComputerAction = async () => {
+      throw new Error("Docker-over-SSH command timed out");
+    };
+    deps.vps.inspectVpsForAuto = async () => {
+      throw new Error("Docker-over-SSH command timed out");
+    };
+
+    const result = await resolveTurnComputerMounts({
+      bot: { id: "b1", name: "Compiler", computers: ["cloud", "local"], cloudBackend: "vps" },
+      cfg: {} as AppConfig,
+      engine: { driverKind: "claude", computerMcp: true, localComputerMcp: true, toolLoop: false },
+      threadId: "t1",
+      dispatchId: 1,
+      runOn: undefined,
+      allowed: null,
+      deps,
+    });
+
+    expect(result.mounts.map((m) => m.kind)).toEqual(["local"]);
+    expect(notices).toContain("VPS computer not mounted: Docker-over-SSH command timed out");
+  });
+
+  it("throws when VPS inspect throws on an explicit cloud turn (runOn === 'cloud')", async () => {
+    const notices: string[] = [];
+    const deps = makeBaseDeps(notices);
+    deps.vps.vpsComputerAction = async () => {
+      throw new Error("Docker-over-SSH command timed out");
+    };
+
+    await expect(
+      resolveTurnComputerMounts({
+        bot: { id: "b1", name: "Compiler", computers: ["cloud", "local"], cloudBackend: "vps" },
+        cfg: {} as AppConfig,
+        engine: { driverKind: "claude", computerMcp: true, localComputerMcp: true, toolLoop: false },
+        threadId: "t1",
+        dispatchId: 1,
+        runOn: "cloud",
+        allowed: null,
+        deps,
+      }),
+    ).rejects.toThrow("Docker-over-SSH command timed out");
+  });
+
+  it("gracefully degrades when VPS returns ready: false with a problem on a local turn", async () => {
+    const notices: string[] = [];
+    const deps = makeBaseDeps(notices);
+    deps.vps.vpsComputerAction = async () =>
+      ({ ready: false, problem: "VPS container is stopped" }) as unknown as Awaited<
+        ReturnType<typeof deps.vps.vpsComputerAction>
+      >;
+
+    const result = await resolveTurnComputerMounts({
+      bot: { id: "b1", name: "Monitor", computers: ["cloud", "local"], cloudBackend: "vps" },
+      cfg: {} as AppConfig,
+      engine: { driverKind: "claude", computerMcp: true, localComputerMcp: true, toolLoop: false },
+      threadId: "t1",
+      dispatchId: 1,
+      runOn: undefined,
+      allowed: null,
+      deps,
+    });
+
+    expect(result.mounts.map((m) => m.kind)).toEqual(["local"]);
+    expect(notices).toContain("VPS computer not mounted: VPS container is stopped");
+  });
+  it("fails a cloud failure when the host grant mounted nothing (MCP engine, CUA down)", async () => {
+    const deps: TurnComputerDeps<object> = { ...makeBaseDeps(), readHostConnection: () => null };
+    deps.vps.vpsComputerAction = async () => {
+      throw new Error("Docker-over-SSH command timed out");
+    };
+
+    await expect(
+      resolveTurnComputerMounts({
+        bot: { id: "b1", name: "Compiler", computers: ["cloud", "local"], cloudBackend: "vps" },
+        cfg: {} as AppConfig,
+        engine: { driverKind: "claude", computerMcp: true, localComputerMcp: true, toolLoop: false },
+        threadId: "t1",
+        dispatchId: 1,
+        runOn: undefined,
+        allowed: null,
+        deps,
+      }),
+    ).rejects.toThrow("Docker-over-SSH command timed out");
+  });
+
+  it("degrades a cloud failure onto an acquired Local VM", async () => {
+    const notices: string[] = [];
+    const deps = makeBaseDeps(notices);
+    deps.vps.vpsComputerAction = async () => {
+      throw new Error("Docker-over-SSH command timed out");
+    };
+
+    const result = await resolveTurnComputerMounts({
+      bot: { id: "b1", name: "Compiler", computers: ["cloud", "vm"], cloudBackend: "vps" },
+      cfg: {} as AppConfig,
+      engine: { driverKind: "claude", computerMcp: true, localComputerMcp: true, toolLoop: false },
+      threadId: "t1",
+      dispatchId: 1,
+      runOn: undefined,
+      allowed: null,
+      deps,
+    });
+
+    expect(result.mounts.map((m) => m.kind)).toEqual(["vm"]);
+    expect(notices).toContain("VPS computer not mounted: Docker-over-SSH command timed out");
+  });
+
+  describe("Local VM that cannot be acquired", () => {
+    const vmDown = (notices: string[]) => {
+      const deps = makeBaseDeps(notices);
+      deps.acquireLocalVm = async () => {
+        throw new Error("Local VM is not ready (App Settings → Local VM)");
+      };
+      return deps;
+    };
+    const turn = (computers: string[], deps: TurnComputerDeps<object>, runOn?: "cloud" | "vm" | "local") =>
+      resolveTurnComputerMounts({
+        bot: { id: "b1", name: "Compiler", computers: computers as ["vm"], cloudBackend: "vps" },
+        cfg: {} as AppConfig,
+        engine: { driverKind: "claude", computerMcp: true, localComputerMcp: true, toolLoop: false },
+        threadId: "t1",
+        dispatchId: 1,
+        runOn,
+        allowed: null,
+        deps,
+      });
+
+    it("falls back to the VPS the bot was also granted, with a notice", async () => {
+      const notices: string[] = [];
+      const result = await turn(["vm", "cloud"], vmDown(notices));
+      expect(result.mounts.map((m) => m.kind)).toEqual(["vps"]);
+      expect(notices).toContain("Local VM not mounted: Local VM is not ready (App Settings → Local VM)");
+    });
+
+    it("falls back to This Computer when that was granted too", async () => {
+      const notices: string[] = [];
+      const result = await turn(["vm", "local"], vmDown(notices));
+      expect(result.mounts.map((m) => m.kind)).toEqual(["local"]);
+      expect(notices.some((n) => n.startsWith("Local VM not mounted"))).toBe(true);
+    });
+
+    it("still refuses when the Local VM is the only grant", async () => {
+      await expect(turn(["vm"], vmDown([]))).rejects.toThrow("Local VM is not ready");
+    });
+
+    it("still refuses when the turn explicitly asked to run on the Local VM", async () => {
+      await expect(turn(["vm", "local"], vmDown([]), "vm")).rejects.toThrow("Local VM is not ready");
+    });
+
+    it("never reaches a computer the bot was not granted", async () => {
+      const deps = vmDown([]);
+      const hostReads = vi.fn(() => ({ command: "/bin/cua", args: ["mcp"], env: {} }));
+      deps.readHostConnection = hostReads;
+      await expect(turn(["vm"], deps)).rejects.toThrow("Local VM is not ready");
+      expect(hostReads).not.toHaveBeenCalled();
+    });
+
+    it("fails the turn when the granted fallback is also unreachable, rather than running with no computer", async () => {
+      const deps = vmDown([]);
+      deps.vps.vpsComputerAction = async () => {
+        throw new Error("Docker-over-SSH command timed out");
+      };
+      await expect(turn(["vm", "cloud"], deps)).rejects.toThrow("Docker-over-SSH command timed out");
+    });
+
+    it("keeps degrading onto hybrid host shell when VM and VPS both fail but allowHostTerminal is on", async () => {
+      const notices: string[] = [];
+      const deps = vmDown(notices);
+      deps.vps.vpsComputerAction = async () => {
+        throw new Error("Docker-over-SSH command timed out");
+      };
+      const result = await resolveTurnComputerMounts({
+        bot: { id: "b1", name: "Compiler", computers: ["vm", "cloud"], cloudBackend: "vps" },
+        cfg: { localVm: { allowHostTerminal: true } } as unknown as AppConfig,
+        engine: { driverKind: "claude", computerMcp: true, localComputerMcp: true, toolLoop: true },
+        threadId: "t1",
+        dispatchId: 1,
+        runOn: undefined,
+        allowed: null,
+        deps,
+      });
+      expect(result.mounts).toEqual([]);
+      expect(result.hasHostComputer).toBe(true);
+      expect(notices).toContain("Local VM not mounted: Local VM is not ready (App Settings → Local VM)");
+      expect(notices).toContain("VPS computer not mounted: Docker-over-SSH command timed out");
+    });
+  });
+
+  it("fails clearly when an unattended cloud-only turn cannot reach the VPS", async () => {
+    const deps = makeBaseDeps();
+    deps.vps.vpsComputerAction = async () => {
+      throw new Error("Docker-over-SSH command timed out");
+    };
+
+    await expect(
+      resolveTurnComputerMounts({
+        bot: { id: "b1", name: "Routine", computers: ["cloud"], cloudBackend: "vps" },
+        cfg: {} as AppConfig,
+        engine: { driverKind: "claude", computerMcp: true, localComputerMcp: true, toolLoop: false },
+        threadId: "t1",
+        dispatchId: 1,
+        runOn: undefined,
+        unattended: true,
+        allowed: null,
+        deps,
+      }),
+    ).rejects.toThrow("Docker-over-SSH command timed out");
+  });
+
+  it("falls back to the host computer when the cloud box cannot be created", async () => {
+    for (const provisionFails of [true, false]) {
+      const notices: string[] = [];
+      const deps = makeBaseDeps(notices);
+      deps.box.boxConfigured = () => true;
+      deps.box.findBox = async () => null;
+      deps.box.provisionBox = async () => {
+        if (provisionFails) throw new Error("Box API returned 503");
+        return { boxId: "b1" };
+      };
+
+      const result = await resolveTurnComputerMounts({
+        bot: { id: "b1", name: "Compiler", computers: ["cloud", "local"], cloudBackend: "box" },
+        cfg: { box: { token: "t" } } as unknown as AppConfig,
+        engine: { driverKind: "claude", computerMcp: true, localComputerMcp: true, toolLoop: false },
+        threadId: "t1",
+        dispatchId: 1,
+        runOn: undefined,
+        allowed: null,
+        deps,
+      });
+
+      expect(result.mounts.map((m) => m.kind)).toEqual(["local"]);
+      expect(notices).toContain("cloud computer not mounted: the cloud computer could not be created or reached");
+    }
+  });
+
+  it("fails clearly when an unattended Antigravity turn's cloud fails, since its local grant never mounts", async () => {
+    for (const cloudBackend of ["vps", "box"] as const) {
+      const deps = makeBaseDeps();
+      deps.vps.vpsComputerAction = async () => {
+        throw new Error("Docker-over-SSH command timed out");
+      };
+      deps.box.boxConfigured = () => true;
+      deps.box.provisionBox = async () => {
+        throw new Error("Box API returned 503");
+      };
+
+      await expect(
+        resolveTurnComputerMounts({
+          bot: { id: "b1", name: "Agy", computers: ["cloud", "local"], cloudBackend },
+          cfg: { box: { token: "t" } } as unknown as AppConfig,
+          engine: { driverKind: "antigravityAgent", computerMcp: true, localComputerMcp: true, toolLoop: false },
+          threadId: "t1",
+          dispatchId: 1,
+          runOn: undefined,
+          unattended: true,
+          allowed: null,
+          deps,
+        }),
+      ).rejects.toThrow(cloudBackend === "vps" ? "Docker-over-SSH command timed out" : "Box API returned 503");
+    }
+  });
+
+  it("still fails a cloud-only box turn when the box cannot be created", async () => {
+    const deps = makeBaseDeps();
+    deps.box.boxConfigured = () => true;
+    deps.box.provisionBox = async () => {
+      throw new Error("Box API returned 503");
+    };
+
+    await expect(
+      resolveTurnComputerMounts({
+        bot: { id: "b1", name: "Compiler", computers: ["cloud"], cloudBackend: "box" },
+        cfg: { box: { token: "t" } } as unknown as AppConfig,
+        engine: { driverKind: "claude", computerMcp: true, localComputerMcp: true, toolLoop: false },
+        threadId: "t1",
+        dispatchId: 1,
+        runOn: undefined,
+        unattended: true,
+        allowed: null,
+        deps,
+      }),
+    ).rejects.toThrow("Box API returned 503");
+  });
+
+  it("enables host computer tools without mounting host CUA when allowHostTerminal is set on Local VM", async () => {
+    const deps = makeBaseDeps();
+    deps.acquireLocalVm = async () => ({ command: "vm-cua", args: [], env: {} });
+    const result = await resolveTurnComputerMounts({
+      bot: { id: "b1", name: "Worker", computers: ["vm"] },
+      cfg: { localVm: { allowHostTerminal: true } } as unknown as AppConfig,
+      engine: { driverKind: "claude", computerMcp: true, localComputerMcp: true, toolLoop: false },
+      threadId: "t1",
+      dispatchId: 1,
+      runOn: undefined,
+      unattended: false,
+      allowed: null,
+      deps,
+    });
+    expect(result.hasHostComputer).toBe(true);
+    expect(result.mounts.map((m) => m.kind)).toEqual(["vm"]);
+    const prompt = computerSystemPrompt(result.mounts, {
+      hasHostTerminal: true,
+      hostPlatform: "darwin",
+    });
+    expect(prompt).toContain("bash");
+  });
+
+  it("enables host computer tools without mounting host CUA when allowHostTerminal is set on Cloud VPS", async () => {
+    const deps = makeBaseDeps();
+    deps.vps.vpsComputerAction = async () => ({
+      container_name: "botfleet-vps-shared",
+      container_id: "c1",
+      container: "running",
+      image: true,
+      ready: true,
+      problem: null,
+      daemonUp: true,
+      managed: true,
+      network: "host",
+      security: "confined",
+      persistence: "disposable",
+      sshAlias: "coolify",
+    });
+    deps.vps.vpsComputerMcp = () => ({ command: "vps-cua", args: [], env: {} });
+    const result = await resolveTurnComputerMounts({
+      bot: { id: "b1", name: "Worker", computers: ["cloud"], cloudBackend: "vps" },
+      cfg: { localVm: { allowHostTerminal: true } } as unknown as AppConfig,
+      engine: { driverKind: "claude", computerMcp: true, localComputerMcp: true, toolLoop: false },
+      threadId: "t1",
+      dispatchId: 1,
+      runOn: undefined,
+      unattended: false,
+      allowed: null,
+      deps,
+    });
+    expect(result.hasHostComputer).toBe(true);
+    expect(result.mounts.map((m) => m.kind)).toEqual(["vps"]);
+  });
+
+  describe("an unreachable Auto VPS", () => {
+    const engine = { driverKind: "claude", computerMcp: true, localComputerMcp: true, toolLoop: false };
+    const down = (notices: string[] = []) => {
+      const deps: TurnComputerDeps<object> = {
+        ...makeBaseDeps(notices),
+        readHostConnection: () => null,
+      };
+      deps.vps.inspectVpsForAuto = async () => {
+        throw new Error("Docker over SSH is not reachable");
+      };
+      return deps;
+    };
+    // SAFETY: these cases only read the bot's cloud backend.  The empty config
+    // is the same fixture the other resolver tests use when no credential matters.
+    const turn = (deps: TurnComputerDeps<object>, automationSource?: string) =>
+      resolveTurnComputerMounts({
+        bot: { id: "b1", name: "Auto", cloudBackend: "vps" },
+        cfg: {} as AppConfig,
+        engine,
+        threadId: "t1",
+        dispatchId: 1,
+        automationSource,
+        allowed: null,
+        deps,
+      });
+
+    it("lets a chat turn run and tells the model the VPS is not mounted", async () => {
+      const result = await turn(down());
+      expect(result.mounts).toEqual([]);
+      expect(result.unavailableNote).toContain("Docker over SSH is not reachable");
+      expect(result.unavailableNote).toContain("no computer is mounted");
+      expect(result.unavailableNote).toContain("Work that needs no screen can go ahead");
+    });
+
+    it("still fails a scheduled run and says why", async () => {
+      await expect(turn(down(), "schedule")).rejects.toThrow(/scheduled run tried to start the VPS computer/);
+    });
+
+    it("lets a delegated turn run", async () => {
+      const result = await turn(down(), "delegation");
+      expect(result.mounts).toEqual([]);
+      expect(result.unavailableNote).toContain("no computer is mounted");
+    });
+
+    it("keeps the host computer when Auto can still mount it, with no outage note", async () => {
+      const deps = makeBaseDeps();
+      deps.vps.inspectVpsForAuto = async () => {
+        throw new Error("Docker over SSH is not reachable");
+      };
+      const result = await turn(deps);
+      expect(result.mounts.map((m) => m.kind)).toEqual(["local"]);
+      expect(result.unavailableNote).toBe("");
+    });
+
+    it("names the way on that fits what the check found", () => {
+      const connection = "Check the VPS connection in App Settings → Connections.";
+      expect(vpsUnavailableHint({ reachable: true })).toBe(
+        "Open Computer and enable Start VPS automatically, or choose Cloud to start it manually.",
+      );
+      expect(vpsUnavailableHint({ reachable: false })).toBe(connection);
+      expect(vpsUnavailableHint({ autoStartVps: true, reachable: true })).toBe(connection);
+      expect(vpsUnavailableHint({})).toBe("");
+      expect(vpsUnavailableHint({ automationSource: "schedule" })).toMatch(/^This scheduled run tried to start the VPS computer/);
+      expect(vpsUnavailableHint({ automationSource: "webhook" })).toMatch(/^This automation run tried to start the VPS computer/);
+      expect(autoVpsOutageFailsTurn("schedule")).toBe(true);
+      expect(autoVpsOutageFailsTurn("delegation")).toBe(false);
+      expect(autoVpsOutageFailsTurn(undefined)).toBe(false);
+    });
+  });
+
+  describe("hostShellGranted", () => {
+    it("grants host shell when local computer is granted", () => {
+      const cfg: AppConfig = {};
+      expect(hostShellGranted({ computers: ["local"] }, cfg, null)).toBe(true);
+    });
+
+    it("grants host shell in hybrid mode for Local VM", () => {
+      const cfg: AppConfig = { localVm: { allowHostTerminal: true } };
+      expect(hostShellGranted({ computers: ["vm"] }, cfg, null)).toBe(true);
+      expect(hostShellGranted({ computers: ["vm"] }, {}, null)).toBe(false);
+    });
+
+    it("grants host shell in hybrid mode for Cloud VPS", () => {
+      const cfg: AppConfig = { localVm: { allowHostTerminal: true } };
+      expect(hostShellGranted({ computers: ["cloud"], cloudBackend: "vps" }, cfg, null)).toBe(true);
+      expect(hostShellGranted({ computers: ["cloud"], cloudBackend: "box" }, cfg, null)).toBe(false);
+      expect(hostShellGranted({ computers: ["cloud"], cloudBackend: "vps" }, {}, null)).toBe(false);
+    });
   });
 });

@@ -1,7 +1,7 @@
 # Observability (Sentry)
 
 BotFleet reports crashes, errors, and a sample of performance traces to
-Sentry (`jays-services/botfleet`) from five surfaces: the Mac harness, the
+Sentry (`simple-with-us/botfleet`) from five surfaces: the Mac harness, the
 Electron desktop renderer, the iOS TestFlight app, the public desktop
 releases (macOS/Windows/Ubuntu installers built by CI), and a local desktop
 package built by hand on the owner's Mac.  Every surface is off unless a DSN
@@ -13,7 +13,7 @@ reaches it — there is no shipped default, and none has ever been in source.
   the BotFleet project, `env=prod`, `path=/`.  These two names are the source
   of truth; every CI workflow resolves from here first.
 - **GitHub Actions secret (synced copy).**  `SENTRY_DSN` on
-  `jaywedgeworth22/BotFleet` is a fallback for when a workflow's Infisical
+  `Simple-With-Us/BotFleet` is a fallback for when a workflow's Infisical
   login fails (CLI install hiccup, a rotated machine identity, and so on).
   It is read only from step `env:`, never from an `if:` condition — GitHub's
   dispatch parser rejects `secrets.*` inside `if:` with an HTTP 422 (the same
@@ -70,8 +70,10 @@ so you can confirm delivery.  Leaving the DSN field blank on Save keeps the
 value already stored — there is no accidental-wipe path.  Clearing the DSN
 is a separate, explicit "Remove Diagnostics Key" action.
 
-Prompts, transcripts, and tool arguments are never sent to Sentry from any
-surface.
+Prompts, transcripts, and tool arguments stay off the wire by default.
+Set `SENTRY_AI_PROMPT_CAPTURE=1` on the harness to stamp redacted, clipped
+`gen_ai.input.messages` / `gen_ai.output.messages` on chat and turn spans.
+Jay approved that opt-in.  Tool arguments are still never attached.
 
 ## The two HTTP routes
 
@@ -132,7 +134,7 @@ the field leaves the stored value untouched).
 
 ## How each surface gets its DSN
 
-1. **Mac harness** (`com.jay.botfleet-server`).  Resolution order above.
+1. **Mac harness** (`app.botfleet.server`).  Resolution order above.
    Boot line on success:
    `[sentry] enabled (config) env=production traces=0.2 logs=on host=o123.ingest.sentry.io project=456`.
    The DSN's key and the full DSN string never reach a log line, an error
@@ -161,9 +163,9 @@ the field leaves the stored value untouched).
    inert.` and the ship continues — a missing DSN never fails a TestFlight
    upload.  `scripts/ios-fleet/ship-testflight.sh` logs the same condition
    locally and, under `GITHUB_ACTIONS`, emits its own `::warning::` too.
-4. **Public desktop releases** (`release.yml`'s `mac` / `windows` / `linux`
-   jobs, plus the standalone `package-win.yml` and `package-linux.yml`
-   workflows).  Each package job runs a "Resolve the Sentry DSN" step before
+4. **Public desktop releases** (`release.yml`'s `mac` jobs; BF-2500 removed
+   the `windows` and `linux` jobs and the standalone `package-win.yml` and
+   `package-linux.yml` workflows).  Each package job runs a "Resolve the Sentry DSN" step before
    its `pnpm package:*` step: Infisical prod for both `SENTRY_DSN` and
    `VITE_SENTRY_DSN`, the GitHub secret as `SENTRY_DSN`'s fallback, and
    `VITE_SENTRY_DSN` copied from whichever `SENTRY_DSN` resolved to when
@@ -187,11 +189,10 @@ the field leaves the stored value untouched).
    fails the build.
 5. **Local desktop packaging.**  `scripts/with-sentry-dsn.sh` wraps a local
    `pnpm package:mac:local` (or any other `package:*` script) with the same
-   three-tier resolution — already-exported environment, Infisical (only if
-   already logged in; this script never calls `infisical login`), then the
-   handoff file `~/.secrets/botfleet-sentry.env` via
-   an `awk` read that produces only the value after the first `NAME=`, never
-   the whole `NAME=value` row — and exports both `SENTRY_DSN` and
+   three-tier resolution — already-exported environment, then
+   `fleet-secrets get NAME --path /botfleet-sentry` (Infisical Fleet-OPS),
+   then the `infisical` CLI (only if already logged in; this script never
+   calls `infisical login`) — and exports both `SENTRY_DSN` and
    `VITE_SENTRY_DSN` before executing the wrapped command.  It turns xtrace
    off before it reads anything, so neither `bash -x` nor an inherited
    `SHELLOPTS` can echo a resolved value, and it never prints one in any
@@ -201,10 +202,84 @@ the field leaves the stored value untouched).
    scripts/with-sentry-dsn.sh pnpm package:mac:local
    ```
 
+## Product analytics (PostHog) — desktop only
+
+This is a separate product from the Sentry reporting above: the desktop app
+(Electron renderer, `src/lib/analytics.ts`) bundles PostHog and initializes
+it unconditionally on mount (`src/App.tsx`), **on by default**.  It sends a
+write-only client token (`phc_…`, safe to ship — it cannot read data back)
+to `us.i.posthog.com` with autocapture and pageview capture both off, so
+PostHog never captures clicked-element text, a URL route, or a page view.  It
+never captures message content or transcripts either — every `track()` call
+site passes counts, a driver id, or a step name, and no call site passes a
+message body.
+
+Seventeen named events are captured today.  Two are lifecycle, one is the
+email gate, four are onboarding and phone setup, and ten are feature use.
+
+| Event | Properties | Sent when |
+| --- | --- | --- |
+| `app_first_open` | `platform` | Once per install, on the first launch after `omb-installed` is absent |
+| `app_opened` | `platform` | Every launch |
+| `email_submitted` | — | A profile email is submitted through the email gate, alongside `posthog.identify(email, { email })` |
+| `email_skipped` | — | The email gate is dismissed without an address |
+| `onboarding_step` | `step` | The user advances an onboarding step |
+| `onboarding_completed` | `engines_available`, `mic` | Onboarding finishes; `engines_available` is the count of engines whose snapshot is `available` (`-1` when unknown) and `mic` is the microphone permission state or `n/a` |
+| `phone_setup_completed` | — | The phone-pairing step finishes |
+| `phone_setup_skipped` | — | The phone-pairing step is skipped |
+| `bot_created` | — | A bot is created |
+| `message_sent` | `room`, or `driver`, `queued`, `steerNow` | A message is sent or queued; `room: true` for a room message, otherwise the `driver` instance id |
+| `room_created` | `members`, `context` | A room is created; `members` is the chosen count and `context` whether it was started from a section |
+| `room_members_changed` | `members`, `added`, `removed` | A room's member list is saved |
+| `call_started` | `driver` | A one-to-one call starts |
+| `group_call_started` | `memberCount` | A group call starts |
+| `team_imported` | `members`, `source`, `mode` | A team is imported, including from a scout |
+| `team_exported` | `members`, `scope` | A team is exported |
+| `team_scouted` | `signals` | A team scout runs |
+
+`platform` is `desktop` under Electron and `browser` otherwise.  Only
+`email_submitted` is paired with `posthog.identify(email, { email })`, so a
+PostHog person profile exists only for an install that supplied an address;
+`person_profiles` is `identified_only`, so an install that never supplied one
+is never given a profile at all.
+
+The counts above are counts — how many bots, how many members, how many
+signals.  `message_sent` carries the instance id of the driver that ran the
+turn, never the text it was given or the text it produced.
+
+An install can opt out at **Settings → General**, which calls
+`posthog.opt_out_capturing()` and drops anything already queued; the choice
+persists in `localStorage` and is checked before `posthog.init()` ever runs,
+so an opted-out install makes no request to PostHog at all, not even to load
+the library.  `identifyEmail()` re-checks the opt-out itself, because the
+email address is the one value on this list that identifies a person.  The
+iOS app is a different product with no analytics SDK at all — see
+[iOS privacy](ios-privacy.md).
+
+## Fleet-infra export
+
+Completed bot turns can also send one summary event to the shared
+`fleet-infra` Sentry project.  That DSN is `SENTRY_FLEET_DSN` in Infisical
+prod (or the same name in the process environment).  It is never hardcoded,
+and it is never the product `SENTRY_DSN`.  The summary carries provider,
+model, tokens, catalog or reported cost, duration, and tool names — not
+prompts.  Missing `SENTRY_FLEET_DSN` leaves the export inert.
+
+## Release and source maps
+
+Node and the Electron renderer set `release` to a git SHA (`SENTRY_RELEASE`,
+then `GITHUB_SHA`, then `VERCEL_GIT_COMMIT_SHA`, then the harness build
+identity).  That is the same SHA `sentry-deploy.yml` records, so Issues and
+deploys line up.
+
+`@sentry/vite-plugin` uploads renderer source maps when `SENTRY_AUTH_TOKEN`
+is in the package-job environment.  Without that token the plugin stays
+disabled and the build does not emit maps.  Electron main uses
+`@sentry/electron`.  The harness loads `@sentry/profiling-node` when the
+package is installed.
+
 ## What is intentionally out of scope
 
-- A second Sentry project — everything lands in `jays-services/botfleet`.
-- `@sentry/profiling-node` — not installed; `profilingAvailable` reports
-  `false` and the harness warns once rather than silently no-oping.
+- Shipping a default DSN — every surface stays off until a DSN is configured.
 - `ios/App/SentryTelemetry.swift` and `ios/project.yml` already handle an
   empty DSN and are unchanged by any of this.

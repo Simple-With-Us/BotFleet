@@ -15,8 +15,31 @@
 // this file cannot quietly start leaking a credential just by adding detail
 // to a thrown message.
 import { redactSecretsInText } from "./redact.ts";
+import { z } from "zod";
+import { parseJson } from "./schema.ts";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
+const serviceTokenFolderSchema = z.string().startsWith("/").refine((path) => !/[*?[\]{}]/.test(path) &&
+  !path.includes("//") && !path.split("/").some((segment) => segment === "." || segment === ".."));
+const vendorServiceTokenScopesSchema = z.array(z.looseObject({
+  environment: z.string().min(1),
+  secretPath: serviceTokenFolderSchema,
+})).min(1);
+const serializedServiceTokenScopesSchema = z.string().transform((encoded, context) => {
+  try {
+    const parsed = vendorServiceTokenScopesSchema.safeParse(parseJson(encoded));
+    if (parsed.success) return parsed.data;
+  } catch { /* Invalid JSON is reported through the same vendor schema boundary. */ }
+  context.addIssue({ code: "custom", message: "Invalid serialized service-token scopes" });
+  return z.NEVER;
+});
+const vendorServiceTokenMetadataSchema = z.looseObject({
+  workspace: z.string().refine((project) => Boolean(project.trim())),
+  projectId: z.string().optional(),
+  scopes: z.union([vendorServiceTokenScopesSchema, serializedServiceTokenScopesSchema]),
+  permissions: z.array(z.enum(["read", "write"])).min(1),
+  expiresAt: z.string().nullable(),
+});
 
 export class InfisicalError extends Error {
   readonly statusCode: number;
@@ -99,6 +122,79 @@ export async function login({
   const token = body && typeof body.accessToken === "string" ? body.accessToken : "";
   if (!token) throw new InfisicalError("Infisical login response carried no accessToken", 502);
   return token;
+}
+
+export interface VerifyServiceTokenOptions {
+  siteUrl: string;
+  token: string;
+  projectId: string;
+  environment: string;
+  secretPath: string;
+  mode: "read" | "write";
+  timeoutMs?: number;
+}
+
+/** Verify the token's own flat metadata before requesting secrets: the raw
+ * secrets endpoint may clamp a requested folder to a granted folder.
+ * Only expiry leaves this boundary; response bodies and token values never do. */
+export async function verifyServiceToken({
+  siteUrl, token, projectId, environment, secretPath, mode, timeoutMs = DEFAULT_TIMEOUT_MS,
+}: VerifyServiceTokenOptions): Promise<{ expiresAt: number | null }> {
+  try {
+    if (siteUrl !== siteUrl.trim()) throw new Error("Invalid service-token site");
+    const site = new URL(siteUrl);
+    const authority = /^https:\/\/([^/?#\\]*)/i.exec(siteUrl)?.[1];
+    if (!authority || authority.includes("@") || site.protocol !== "https:" || !site.hostname ||
+        site.username || site.password || /[?#\\]/.test(siteUrl)) throw new Error("Invalid service-token site");
+  } catch {
+    throw new InfisicalError("Infisical service-token site must be an absolute HTTPS URL without userinfo, query or fragment", 403);
+  }
+  if (!serviceTokenFolderSchema.safeParse(secretPath).success) {
+    throw new InfisicalError("Infisical service-token scope must use a literal folder", 403);
+  }
+  let response: Response;
+  try {
+    response = await fetch(`${siteUrl}/api/v2/service-token`, {
+      method: "GET", headers: { authorization: `Bearer ${token}` },
+      redirect: "error", signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (error) {
+    throw new InfisicalError(isTimeoutError(error)
+      ? `Infisical service-token verification timed out after ${timeoutMs} ms`
+      : "Infisical service-token verification failed", isTimeoutError(error) ? 504 : 502);
+  }
+  if (!response.ok) throw httpError("Infisical service-token verification failed", response.status);
+  let raw: unknown;
+  try { raw = await response.json(); }
+  catch { throw new InfisicalError("Infisical service-token verification returned invalid metadata", 502); }
+  const invalid = () => new InfisicalError("Infisical service-token verification returned invalid metadata", 502);
+  const parsed = vendorServiceTokenMetadataSchema.safeParse(raw);
+  if (!parsed.success) throw invalid();
+  const metadata = parsed.data;
+  if (metadata.workspace !== projectId ||
+      (metadata.projectId !== undefined && metadata.projectId !== projectId)) {
+    throw new InfisicalError("Infisical service token does not belong to the configured project", 403);
+  }
+  const normalizeFolder = (path: string) => path.replace(/\/+$/, "") || "/";
+  const matches = metadata.scopes.some((scope) => scope.environment === environment &&
+    normalizeFolder(scope.secretPath) === normalizeFolder(secretPath));
+  if (!matches) throw new InfisicalError("Infisical service token does not grant the exact configured environment and folder", 403);
+  if (mode === "read" ? !metadata.permissions.includes("read") || metadata.permissions.includes("write")
+    : !metadata.permissions.includes("write")) {
+    throw new InfisicalError(mode === "read" ? "Infisical read credential must be read-only"
+      : "Infisical write credential must grant write permission", 403);
+  }
+  let expiresAt: number | null = null;
+  if (metadata.expiresAt !== null) {
+    if (!/^\d{4}-\d{2}-\d{2}T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(metadata.expiresAt)) throw invalid();
+    expiresAt = Date.parse(metadata.expiresAt);
+    if (!Number.isFinite(expiresAt)) throw invalid();
+    const date = metadata.expiresAt.slice(0, 10);
+    const calendarDate = Date.parse(`${date}T00:00:00Z`);
+    if (!Number.isFinite(calendarDate) || new Date(calendarDate).toISOString().slice(0, 10) !== date) throw invalid();
+    if (expiresAt <= Date.now()) throw new InfisicalError("Infisical service token has expired", 401);
+  }
+  return { expiresAt };
 }
 
 export interface ListSecretsOptions {
@@ -196,6 +292,7 @@ export interface UpsertSecretOptions {
   name: string;
   value: string;
   timeoutMs?: number;
+  beforeRequest?: () => void;
 }
 
 /** `PATCH {siteUrl}/api/v3/secrets/raw/{name}`, falling back to `POST` with
@@ -212,11 +309,13 @@ export async function upsertSecret({
   name,
   value,
   timeoutMs = DEFAULT_TIMEOUT_MS,
+  beforeRequest,
 }: UpsertSecretOptions): Promise<void> {
   const url = `${siteUrl}/api/v3/secrets/raw/${encodeURIComponent(name)}`;
   const headers = { "content-type": "application/json", authorization: `Bearer ${token}` };
 
   let patchRes: Response;
+  beforeRequest?.();
   try {
     patchRes = await fetch(url, {
       method: "PATCH",
@@ -231,6 +330,7 @@ export async function upsertSecret({
   if (patchRes.status !== 404) throw httpError("Infisical secret update failed", patchRes.status);
 
   let postRes: Response;
+  beforeRequest?.();
   try {
     postRes = await fetch(url, {
       method: "POST",
