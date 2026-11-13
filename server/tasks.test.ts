@@ -259,7 +259,19 @@ describe("tasks", () => {
     const beforePlain = structuredClone(store.messagesFor(plain.threadId));
     const beforeBound = structuredClone(store.messagesFor(bound.threadId));
 
-    expectConflict(() => store.mergeAllExtraThreads());
+    let refusal = "";
+    expectConflict(() => {
+      try {
+        store.mergeAllExtraThreads();
+      } catch (error) {
+        refusal = error instanceof Error ? error.message : "";
+        throw error;
+      }
+    });
+    expect(refusal).toContain("Bound extra");
+    expect(refusal).toContain("workspace stayed as it is");
+    expect(refusal).not.toMatch(/\b409\b/);
+    expect(refusal).not.toContain("bindings");
     expect(store.tasks(bot.id)).toHaveLength(3);
     expect(store.messagesFor(inbox)).toEqual(beforeInbox);
     expect(store.messagesFor(plain.threadId)).toEqual(beforePlain);

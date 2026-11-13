@@ -25,6 +25,7 @@ struct AgentProfileView: View {
     @State private var instanceId: String
     @State private var modelId: String
     @State private var effort: String?
+    @State private var latest: String?
     @State private var fallbacks: [ModelSelection]
     @State private var maxToolRoundsText: String
     @State private var photo: PhotosPickerItem?
@@ -76,6 +77,7 @@ struct AgentProfileView: View {
         _instanceId = State(initialValue: bot.modelSelection.instanceId)
         _modelId = State(initialValue: bot.modelSelection.model)
         _effort = State(initialValue: bot.modelSelection.effort)
+        _latest = State(initialValue: bot.modelSelection.latest ?? ModelLineage.detectAlias(from: bot.modelSelection.model))
         _fallbacks = State(initialValue: bot.modelSelection.fallbacks ?? [])
         _maxToolRoundsText = State(initialValue: Self.roundsText(bot.maxToolRounds))
         _isOff = State(initialValue: bot.isOff)
@@ -132,7 +134,7 @@ struct AgentProfileView: View {
     private var unavailableVoiceLabel: String {
         switch voiceProvider {
         case .minimax: return "MiniMax voice is not configured"
-        case .elevenlabs: return "ElevenLabs is not configured"
+        case .elevenlabs: return "Voice is not configured"
         case .system: return "Built-in Mac voices are unavailable"
         case .personal: return "Apple Personal Voice is not configured"
         case .unknown: return "Voice is not configured"
@@ -144,28 +146,28 @@ struct AgentProfileView: View {
         case .minimax:
             return "Add the shared MiniMax key in a bot's Voice settings on the computer.\u{00A0} The key is never returned to iOS."
         case .elevenlabs:
-            return "Add the shared ElevenLabs key in a bot's Voice settings on the computer.\u{00A0} The key is never returned to iOS."
+            return "Add the shared voice key in a bot's Voice settings on the computer.\u{00A0} The key is never returned to iOS."
         case .system:
-            return "Built-in Mac voices need no key, and this computer has none available.\u{00A0} Switch the voice engine in a bot's Voice settings on the computer to keep using voice."
+            return "Built-in Mac voices need no key, and this computer has none available.\u{00A0} Switch the voice provider in a bot's Voice settings on the computer to keep using voice."
         case .personal:
             return "Apple Personal Voice speaks directly on this iOS device and requires authorization."
         case .unknown:
-            return "Configure the selected voice engine in a bot's Voice settings on the computer.\u{00A0} Provider keys are never returned to iOS."
+            return "Configure the selected voice provider in a bot's Voice settings on the computer.\u{00A0} Provider keys are never returned to iOS."
         }
     }
 
     private var missingDefaultVoiceGuidance: String {
         switch voiceProvider {
         case .minimax:
-            return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose a voice for each device above; synthesis still uses the shared MiniMax key on your computer."
+            return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose a voice for each device above; speech still uses the shared MiniMax key on your computer."
         case .elevenlabs:
-            return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose a voice for each device above; synthesis still uses the shared ElevenLabs key on your computer."
+            return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose a voice for each device above; speech still uses the shared voice key on your computer."
         case .system:
-            return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose a voice for each device above; synthesis still uses the built-in Mac voices on your computer."
+            return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose a voice for each device above; speech still uses the built-in Mac voices on your computer."
         case .personal:
             return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose an Apple Personal Voice for this iPhone above to speak on this device."
         case .unknown:
-            return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose a voice for each device above; synthesis still uses the selected voice engine on your computer."
+            return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose a voice for each device above; speech still uses the selected voice provider on your computer."
         }
     }
 
@@ -275,8 +277,14 @@ struct AgentProfileView: View {
                                 set: { newInstanceId in
                                     fallbacks[index].instanceId = newInstanceId
                                     if let inst = instances.first(where: { $0.id == newInstanceId }) {
-                                        if !inst.models.options.contains(where: { $0.id == fallbacks[index].model }) {
-                                            fallbacks[index].model = inst.models.default
+                                        if let fbLatest = fallbacks[index].latest,
+                                           let resolved = ModelLineage.resolveClass(fbLatest, in: inst) {
+                                            fallbacks[index].model = resolved.resolvedId
+                                        } else {
+                                            fallbacks[index].latest = nil
+                                            if !inst.models.options.contains(where: { $0.id == fallbacks[index].model }) {
+                                                fallbacks[index].model = inst.models.default
+                                            }
                                         }
                                         if let effort = fallbacks[index].effort,
                                            !inst.effortLevels(for: fallbacks[index].model).contains(effort) {
@@ -293,17 +301,47 @@ struct AgentProfileView: View {
 
                             if let fallbackInstance = instances.first(where: { $0.id == fallbacks[index].instanceId }) {
                                 Picker("Model", selection: Binding(
-                                    get: { fallbacks[index].model },
-                                    set: { newModel in
-                                        fallbacks[index].model = newModel
+                                    get: {
+                                        if let fbLatest = fallbacks[index].latest, !fbLatest.isEmpty {
+                                            return "latest:\(fbLatest)"
+                                        }
+                                        return fallbacks[index].model
+                                    },
+                                    set: { newTag in
+                                        if newTag.hasPrefix("latest:") {
+                                            let classKey = String(newTag.dropFirst("latest:".count))
+                                            fallbacks[index].latest = classKey
+                                            if let resolved = ModelLineage.resolveClass(classKey, in: fallbackInstance) {
+                                                fallbacks[index].model = resolved.resolvedId
+                                            }
+                                        } else {
+                                            fallbacks[index].latest = nil
+                                            fallbacks[index].model = newTag
+                                        }
                                         if let effort = fallbacks[index].effort,
-                                           !fallbackInstance.effortLevels(for: newModel).contains(effort) {
+                                           !fallbackInstance.effortLevels(for: fallbacks[index].model).contains(effort) {
                                             fallbacks[index].effort = nil
                                         }
                                     }
                                 )) {
-                                    ForEach(fallbackInstance.models.options) { option in
-                                        Text(option.label).tag(option.id)
+                                    let latestOpts = ModelLineage.latestOptions(for: fallbackInstance)
+                                    if !latestOpts.isEmpty {
+                                        Section("Latest") {
+                                            ForEach(latestOpts) { opt in
+                                                VStack(alignment: .leading, spacing: 2) {
+                                                    Text(opt.label)
+                                                    Text(opt.resolvedId)
+                                                        .font(.caption)
+                                                        .foregroundStyle(.secondary)
+                                                }
+                                                .tag("latest:\(opt.classKey)")
+                                            }
+                                        }
+                                    }
+                                    Section("Models") {
+                                        ForEach(fallbackInstance.models.options) { option in
+                                            Text(option.label).tag(option.id)
+                                        }
                                     }
                                 }
                                 .pickerStyle(.navigationLink)
@@ -642,6 +680,7 @@ struct AgentProfileView: View {
             instanceId: instanceId,
             model: modelId,
             effort: effort,
+            latest: latest,
             fallbacks: fallbacks.isEmpty ? nil : fallbacks
         )
         let trimmedCwd = cwd.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -689,8 +728,14 @@ struct AgentProfileView: View {
             .pickerStyle(.navigationLink)
             .onChange(of: instanceId) { _, newInstanceId in
                 if let instance = instances.first(where: { $0.id == newInstanceId }) {
-                    if !instance.models.options.contains(where: { $0.id == modelId }) {
-                        modelId = instance.models.default
+                    if let curLatest = latest,
+                       let resolved = ModelLineage.resolveClass(curLatest, in: instance) {
+                        modelId = resolved.resolvedId
+                    } else {
+                        latest = nil
+                        if !instance.models.options.contains(where: { $0.id == modelId }) {
+                            modelId = instance.models.default
+                        }
                     }
                     if let effort, !instance.effortLevels(for: modelId).contains(effort) {
                         self.effort = nil
@@ -699,17 +744,50 @@ struct AgentProfileView: View {
             }
 
             if let selectedInstance = instances.first(where: { $0.id == instanceId }) {
-                Picker("Model", selection: $modelId) {
-                    ForEach(selectedInstance.models.options) { option in
-                        Text(option.label).tag(option.id)
+                Picker("Model", selection: Binding(
+                    get: {
+                        if let curLatest = latest, !curLatest.isEmpty {
+                            return "latest:\(curLatest)"
+                        }
+                        return modelId
+                    },
+                    set: { newTag in
+                        if newTag.hasPrefix("latest:") {
+                            let classKey = String(newTag.dropFirst("latest:".count))
+                            latest = classKey
+                            if let resolved = ModelLineage.resolveClass(classKey, in: selectedInstance) {
+                                modelId = resolved.resolvedId
+                            }
+                        } else {
+                            latest = nil
+                            modelId = newTag
+                        }
+                        if let effort, !selectedInstance.effortLevels(for: modelId).contains(effort) {
+                            self.effort = nil
+                        }
+                    }
+                )) {
+                    let latestOpts = ModelLineage.latestOptions(for: selectedInstance)
+                    if !latestOpts.isEmpty {
+                        Section("Latest") {
+                            ForEach(latestOpts) { opt in
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(opt.label)
+                                    Text(opt.resolvedId)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                .tag("latest:\(opt.classKey)")
+                            }
+                        }
+                    }
+                    Section("Models") {
+                        ForEach(selectedInstance.models.options) { option in
+                            Text(option.label).tag(option.id)
+                        }
                     }
                 }
                 .pickerStyle(.navigationLink)
-                .onChange(of: modelId) { _, newModelId in
-                    if let effort, !selectedInstance.effortLevels(for: newModelId).contains(effort) {
-                        self.effort = nil
-                    }
-                }
 
                 effortPicker(selection: $effort, instance: selectedInstance, modelId: modelId)
             }
@@ -753,9 +831,12 @@ struct AgentProfileView: View {
     private var bypassPermissionsSection: some View {
         Section {
             Toggle("Bypass Permissions", isOn: bypassBinding)
-            if mayTurnOnLocalBypass {
+            switch localBypassControl {
+            case .toggle:
                 Toggle("Bypass Including This Mac", isOn: localBypassBinding)
-            } else {
+            case .macOnly:
+                LabeledContent("Bypass Including This Mac", value: "Off")
+            case .needsBypass:
                 Label(BotExecutionPolicy.localBypassNeedsBypass, systemImage: "lock")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
@@ -765,8 +846,11 @@ struct AgentProfileView: View {
         } footer: {
             VStack(alignment: .leading, spacing: 8) {
                 Text(BotExecutionPolicy.bypassSummary(isOn: bypassPermissions))
-                if mayTurnOnLocalBypass {
+                if localBypassControl == .toggle {
                     Text(BotExecutionPolicy.localBypassSummary(isOn: bypassLocalComputer))
+                }
+                if !BotExecutionPolicy.mayTurnOnLocalBypass(computers: current.computers) {
+                    Text(BotExecutionPolicy.localBypassMacOnlyNote)
                 }
                 if let note = BypassCoverage(engine: policyEngine).note {
                     Text(note)
@@ -775,21 +859,25 @@ struct AgentProfileView: View {
         }
     }
 
-    /// The second switch is the Mac's to turn on for a bot that holds This
-    /// Mac, so the phone offers a line that says so rather than a control that
-    /// would come back 403.
-    private var mayTurnOnLocalBypass: Bool {
-        BotExecutionPolicy.mayTurnOnLocalBypass(computers: current.computers)
+    /// Whether the second switch is a control, a read-only Off, or a note
+    /// that Bypass itself is off.  The computer refuses to turn it on for a
+    /// bot that can use This Mac, so that case is never a switch.
+    private var localBypassControl: BotExecutionPolicy.LocalBypassControl {
+        BotExecutionPolicy.localBypassControl(
+            computers: current.computers,
+            bypassOn: bypassPermissions,
+            localBypassOn: bypassLocalComputer
+        )
     }
 
-    /// Switching on asks first, and does nothing at all while Bypass itself is
-    /// off — otherwise it would be a switch over nothing.
+    /// Switching on asks first.  Turning it off does not, and does not require
+    /// Bypass to still be on: an on switch has to be able to come back off.
     private var localBypassBinding: Binding<Bool> {
         Binding(
             get: { bypassLocalComputer },
             set: { wantsOn in
-                guard bypassPermissions else { return }
                 if wantsOn {
+                    guard bypassPermissions, BotExecutionPolicy.mayTurnOnLocalBypass(computers: current.computers) else { return }
                     confirmingLocalBypass = true
                 } else {
                     bypassLocalComputer = false
@@ -1266,7 +1354,7 @@ struct AgentProfileView: View {
             uploadData = jpeg
             uploadMIME = "image/jpeg"
         }
-        let intendedCrop = crop == .mascot ? AvatarCrop.circle : crop
+        let intendedCrop = crop == .mascot || crop == .tvface ? AvatarCrop.circle : crop
         if let updated = await session.uploadAvatar(uploadData, mime: uploadMIME, for: current, crop: intendedCrop) {
             crop = updated.avatarCrop ?? intendedCrop
             baseline.crop = crop
@@ -1276,7 +1364,7 @@ struct AgentProfileView: View {
     private func generateImage() async {
         busy = true
         defer { busy = false }
-        let intendedCrop = crop == .mascot ? AvatarCrop.circle : crop
+        let intendedCrop = crop == .mascot || crop == .tvface ? AvatarCrop.circle : crop
         guard let generated = await session.generateAvatar(
             prompt: String(prompt.trimmingCharacters(in: .whitespacesAndNewlines).prefix(400)),
             for: current
@@ -1469,6 +1557,7 @@ private extension AvatarCrop {
     var label: String {
         switch self {
         case .mascot: "Mascot"
+        case .tvface: "TV Face"
         case .circle: "Circle"
         case .rounded: "Rounded"
         case .square: "Square"

@@ -59,7 +59,10 @@ struct BotFleetMacApp: App {
     @NSApplicationDelegateAdaptor(BotFleetMacAppDelegate.self) private var appDelegate
 
     init() {
-        // Any early native Mac initialization
+        // Sentry first, so a crash in session startup is captured; it stays
+        // inert without a stamped DSN (BF-2541).  Notifications are NEVER
+        // requested at launch.
+        MacSentryTelemetry.start()
     }
 
     var body: some Scene {
@@ -71,6 +74,29 @@ struct BotFleetMacApp: App {
                     session.registerMainWindow(window)
                 })
                 .onAppear {
+                    #if os(macOS)
+                    // Every menubar row needs a handler, or the surface this
+                    // PR ships is a menu of dead buttons.
+                    session.menubarController.onOpenBotFleet = {
+                        session.activateMainWindow()
+                    }
+                    session.menubarController.onComposeNewMessage = {
+                        session.focusComposer()
+                    }
+                    session.menubarController.onDictateMessage = {
+                        session.beginMenubarDictation()
+                    }
+                    session.menubarController.onSelectWaitingBot = { item in
+                        session.selectWaitingBot(item)
+                    }
+                    session.menubarController.onTogglePauseResumeAll = {
+                        session.togglePauseResumeAll()
+                    }
+                    session.menubarController.onOpenSettings = {
+                        session.openSettings()
+                    }
+                    session.menubarController.installIfNeeded()
+                    #endif
                     appDelegate.session = session
                     session.launch()
                 }
@@ -84,8 +110,8 @@ struct BotFleetMacApp: App {
                 Button("About BotFleet") {
                     NSApplication.shared.orderFrontStandardAboutPanel(
                         options: [
-                            NSApplication.AboutPanelOptionKey.applicationName: "BotFleet (Native macOS)",
-                            NSApplication.AboutPanelOptionKey.version: "Option A Native Alpha",
+                            NSApplication.AboutPanelOptionKey.applicationName: "BotFleet",
+                            NSApplication.AboutPanelOptionKey.version: session.capabilities.versionStamp,
                         ]
                     )
                 }
@@ -114,82 +140,115 @@ struct BotFleetMacApp: App {
                     Task { await session.shutDownServerAndLocalVM() }
                 }
                 .disabled(session.isShuttingDownServer)
+
+                Divider()
+
+                Menu("Settings Section") {
+                    ForEach(MacSettingsSection.allCases) { section in
+                        Button(section.displayTitle) {
+                            session.activeSettingsSection = section
+                        }
+                    }
+                }
             }
         }
 
         #if os(macOS)
         Settings {
-            VStack(alignment: .leading, spacing: 20) {
-                Text("BotFleet Desktop Settings")
-                    .font(.headline)
+            TabView(selection: $session.activeSettingsSection) {
+                ForEach(MacSettingsSection.allCases) { section in
+                    VStack(alignment: .leading, spacing: 16) {
+                        Text(section.displayTitle)
+                            .font(.headline)
 
-                HStack {
-                    Text("Local Harness Address:")
-                    TextField("Host", text: $session.host)
-                        .frame(width: 120)
-                    Text(":")
-                    TextField("Port", value: $session.port, format: .number.grouping(.never))
-                        .frame(width: 70)
-                }
+                        if section == .general {
+                            GroupBox("Remote Wake & Lifecycle") {
+                                VStack(alignment: .leading, spacing: 12) {
+                                    Toggle(
+                                        "Allow iOS Remote Desktop Launch",
+                                        isOn: Binding(
+                                            get: { session.lifecycleSettings.allowRemoteDesktopLaunch ?? false },
+                                            set: { newValue in
+                                                var updated = session.lifecycleSettings
+                                                updated.allowRemoteDesktopLaunch = newValue
+                                                Task { await session.saveLifecycleSettings(updated) }
+                                            }
+                                        )
+                                    )
 
-                Button("Save and Reconnect") {
-                    session.connect(host: session.host, port: session.port)
-                }
+                                    Toggle(
+                                        "Keep Server Running When Window Closes",
+                                        isOn: Binding(
+                                            get: { session.lifecycleSettings.persistOnExit },
+                                            set: { newValue in
+                                                var updated = session.lifecycleSettings
+                                                updated.persistOnExit = newValue
+                                                Task { await session.saveLifecycleSettings(updated) }
+                                            }
+                                        )
+                                    )
 
-                Divider()
+                                    Toggle(
+                                        "Host The Companion API From This App",
+                                        isOn: Binding(
+                                            get: { session.companionListenerEnabled },
+                                            set: { newValue in
+                                                Task { await session.setCompanionListenerEnabled(newValue) }
+                                            }
+                                        )
+                                    )
+                                    Text(session.companionListenerState.summary)
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
 
-                GroupBox("Remote Wake & Lifecycle") {
-                    VStack(alignment: .leading, spacing: 12) {
-                        Toggle(
-                            "Allow iOS Remote Desktop Launch",
-                            isOn: Binding(
-                                get: { session.lifecycleSettings.allowRemoteDesktopLaunch ?? false },
-                                set: { newValue in
-                                    var updated = session.lifecycleSettings
-                                    updated.allowRemoteDesktopLaunch = newValue
-                                    Task { await session.saveLifecycleSettings(updated) }
+                                    HStack {
+                                        Button(role: .destructive) {
+                                            Task { await session.shutDownServerAndLocalVM() }
+                                        } label: {
+                                            Text(session.isShuttingDownServer ? "Shutting Down…" : "Shut Down Server & Local VM")
+                                        }
+                                        .disabled(session.isShuttingDownServer)
+
+                                        Spacer()
+                                    }
+                                    .padding(.top, 4)
+
+                                    if let errorMessage = session.lifecycleErrorMessage {
+                                        Text(errorMessage)
+                                            .font(.caption)
+                                            .foregroundColor(.red)
+                                    }
                                 }
-                            )
-                        )
-
-                        Toggle(
-                            "Keep Server Running When Window Closes",
-                            isOn: Binding(
-                                get: { session.lifecycleSettings.persistOnExit },
-                                set: { newValue in
-                                    var updated = session.lifecycleSettings
-                                    updated.persistOnExit = newValue
-                                    Task { await session.saveLifecycleSettings(updated) }
-                                }
-                            )
-                        )
-
-                        HStack {
-                            Button(role: .destructive) {
-                                Task { await session.shutDownServerAndLocalVM() }
-                            } label: {
-                                Text(session.isShuttingDownServer ? "Shutting Down…" : "Shut Down Server & Local VM")
+                                .padding(8)
+                                .frame(maxWidth: .infinity, alignment: .leading)
                             }
-                            .disabled(session.isShuttingDownServer)
-
-                            Spacer()
-                        }
-                        .padding(.top, 4)
-
-                        if let errorMessage = session.lifecycleErrorMessage {
-                            Text(errorMessage)
+                        } else if section == .servers {
+                            MacServersSettings(coordinator: session.servers) { session.connect(host: $0) }
+                        } else if section == .resources {
+                            MacResourcesSettings(coordinator: session.resources)
+                        } else if section == .secrets {
+                            MacSecretsSettings(servers: session.servers)
+                        } else if section == .permissions,
+                                  let banner = session.notificationCoordinator.settingsStatusBanner {
+                            Text(banner)
+                                .font(.subheadline)
+                                .foregroundColor(.secondary)
+                        } else {
+                            Text(session.capabilities.versionStamp)
                                 .font(.caption)
-                                .foregroundColor(.red)
+                                .foregroundColor(.secondary)
                         }
-                    }
-                    .padding(8)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
 
-                Spacer()
+                        Spacer()
+                    }
+                    .padding(24)
+                    .tabItem {
+                        Label(section.displayTitle, systemImage: section.symbolName)
+                    }
+                    .tag(section)
+                }
             }
-            .padding(24)
-            .frame(width: 480, height: 380)
+            .frame(width: 620, height: 500)
         }
         #endif
     }

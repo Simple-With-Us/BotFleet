@@ -24,8 +24,9 @@ import {
 } from "./build-speech-helper.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const SRC = path.join(__dirname, "resources", "speech-helper.swift");
-const INFO = path.join(__dirname, "resources", "speech-helper-Info.plist");
+const projectDir = path.dirname(__dirname);
+const SRC = path.join(projectDir, "native", "helpers", "speech-helper.swift");
+const INFO = path.join(projectDir, "native", "helpers", "speech-helper-Info.plist");
 // Packaged: the helper bundle ships pre-built + signed in Resources. A signed
 // app bundle must never be rewritten — lazy compilation would break its seal.
 const BUNDLE = app.isPackaged

@@ -4,6 +4,75 @@ import CoreGraphics
 import Foundation
 import Security
 
+/// Whether this process may post to the live desktop.
+///
+/// The CUA suite used to post real mouse and keyboard events to the live
+/// desktop, so running it took the person's mouse over while they worked.
+/// The sink seam keeps the tests off the live path, and this is the belt on
+/// that seam: a process that is a test runner never posts, whatever sink it
+/// was handed.  The shipping app is an application bundle and is never a test
+/// runner, so the product capability is unchanged.
+public enum MacDesktopInputPolicy {
+    /// True when this process is a test runner rather than the app.
+    ///
+    /// The SwiftPM testing helper is the process that runs the suite, and an
+    /// XCTest run is an XCTest bundle.  This is computed once, so the check
+    /// costs a single boolean read on the hot path.
+    public static let isUnderTestRunner: Bool = {
+        // The helper is the process that runs the suite under SwiftPM.  The
+        // name is folded before the comparison so a differently cased helper
+        // still matches.
+        if ProcessInfo.processInfo.processName.lowercased() == "swiftpm-testing-helper" { return true }
+        if Bundle.main.bundleURL.pathExtension.lowercased() == "xctest" { return true }
+        // XCTestCase and XCTestExpectation are the classes that actually
+        // exist in XCTest; the bare name "XCTest" never resolved to anything,
+        // so the old probe silently stopped recognizing other runners.
+        if NSClassFromString("XCTestCase") != nil { return true }
+        if NSClassFromString("XCTestExpectation") != nil { return true }
+        return false
+    }()
+
+    /// True when a synthesized event may be posted to the live desktop.
+    public static let mayPostToDesktop: Bool = !isUnderTestRunner
+
+    /// The one place in the shipping sources that posts to the live desktop.
+    ///
+    /// Every other delivery goes through the injected sink, which reaches the
+    /// window server only when its caller says so.  Routing the single real
+    /// post through here means handing the driver a different sink cannot
+    /// bypass the policy, and a test that scans the sources fails if a second
+    /// post site ever appears.  A test runner is refused, and the refusal is
+    /// counted so a test can prove the guard fired.
+    @discardableResult
+    static func postToDesktop(_ event: CGEvent) -> Bool {
+        guard mayPostToDesktop else {
+            recordSuppressedPost()
+            return false
+        }
+        event.post(tap: .cghidEventTap)
+        return true
+    }
+
+    /// How many desktop posts this policy suppressed.
+    ///
+    /// Only the denying path moves the counter, so the shipping app pays
+    /// nothing to carry it.
+    static var suppressedDesktopPostCount: Int {
+        suppressedPostLock.lock()
+        defer { suppressedPostLock.unlock() }
+        return _suppressedDesktopPostCount
+    }
+
+    private static let suppressedPostLock = NSLock()
+    private static var _suppressedDesktopPostCount = 0
+
+    private static func recordSuppressedPost() {
+        suppressedPostLock.lock()
+        _suppressedDesktopPostCount += 1
+        suppressedPostLock.unlock()
+    }
+}
+
 /// Normalized or absolute coordinates for Computer Use Agent (CUA) interactions.
 public struct CuaPoint: Sendable, Hashable, Codable {
     public var x: Double
@@ -327,11 +396,32 @@ public final class MacCuaDriver: @unchecked Sendable {
     /// physically held.
     var mouseDownPrePostHook: (() -> Void)?
 
-    /// Test seam invoked right after a synthesized mouse event reaches the window
-    /// server, so a test can assert the real post order of the events.
+    /// Test seam invoked right after a synthesized mouse event reaches the event
+    /// sink, so a test can assert delivery order without real desktop input.
     var mouseEventPostedHook: ((CGEventType, CuaMouseButton) -> Void)?
 
-    public init() {}
+    /// The sink owns event delivery.  Inject a recording sink in tests; observers
+    /// alone do not prevent events from reaching the active desktop.
+    private let eventSink: @Sendable (CGEvent) -> Void
+
+    public convenience init() {
+        // A test runner never reaches the live desktop, even with the
+        // production sink.  The app is not a test runner, so it still
+        // drives the desktop exactly as before.
+        //
+        // The post itself lives in the policy, so this sink is the only
+        // route to the window server and the guard cannot be stepped around
+        // by handing the driver a different sink.
+        self.init(eventSink: { event in
+            MacDesktopInputPolicy.postToDesktop(event)
+        })
+    }
+
+    /// Internal so ordinary tests can exercise synthesis and safety bookkeeping
+    /// without sending keyboard or pointer input to the window server.
+    init(eventSink: @escaping @Sendable (CGEvent) -> Void) {
+        self.eventSink = eventSink
+    }
 
     // MARK: - Emergency Stop State
 
@@ -398,7 +488,7 @@ public final class MacCuaDriver: @unchecked Sendable {
                 mouseCursorPosition: releasePoint,
                 mouseButton: cgButton
             ) {
-                upEvent.post(tap: .cghidEventTap)
+                eventSink(upEvent)
                 mouseEventPostedHook?(upType, button)
             }
             observer?(upType, releasePoint, button)
@@ -567,7 +657,7 @@ public final class MacCuaDriver: @unchecked Sendable {
         ) else {
             return false
         }
-        event.post(tap: .cghidEventTap)
+        eventSink(event)
         mouseEventObserver?(.mouseMoved, point, .left)
         return true
     }
@@ -602,7 +692,7 @@ public final class MacCuaDriver: @unchecked Sendable {
         // post.  Otherwise the stop would release the button first and the
         // later down event would leave it physically held, with no record left
         // to release it.
-        downEvent.post(tap: .cghidEventTap)
+        eventSink(downEvent)
         mouseEventPostedHook?(downType, button)
         stateLock.unlock()
 
@@ -630,7 +720,7 @@ public final class MacCuaDriver: @unchecked Sendable {
         let observer = mouseEventObserver
         stateLock.unlock()
 
-        upEvent.post(tap: .cghidEventTap)
+        eventSink(upEvent)
         mouseEventPostedHook?(upType, button)
         observer?(upType, point, button)
         return true
@@ -715,7 +805,7 @@ public final class MacCuaDriver: @unchecked Sendable {
                 mouseCursorPosition: currentPoint,
                 mouseButton: mouseButton
             ) {
-                dragEvent.post(tap: .cghidEventTap)
+                eventSink(dragEvent)
                 observer?(draggedType, currentPoint, button)
             }
             onStep?(i, currentPoint)
@@ -742,7 +832,7 @@ public final class MacCuaDriver: @unchecked Sendable {
         ) else {
             return false
         }
-        event.post(tap: .cghidEventTap)
+        eventSink(event)
         return true
     }
 
@@ -776,8 +866,8 @@ public final class MacCuaDriver: @unchecked Sendable {
             upEvent.flags = modifiers.cgEventFlags
         }
 
-        downEvent.post(tap: .cghidEventTap)
-        upEvent.post(tap: .cghidEventTap)
+        eventSink(downEvent)
+        eventSink(upEvent)
         return true
     }
 
@@ -819,8 +909,8 @@ public final class MacCuaDriver: @unchecked Sendable {
             downEvent.keyboardSetUnicodeString(stringLength: utf16Units.count, unicodeString: &utf16Units)
             upEvent.keyboardSetUnicodeString(stringLength: utf16Units.count, unicodeString: &utf16Units)
 
-            downEvent.post(tap: .cghidEventTap)
-            upEvent.post(tap: .cghidEventTap)
+            eventSink(downEvent)
+            eventSink(upEvent)
         }
         return true
     }

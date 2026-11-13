@@ -100,7 +100,7 @@ When we forked, that project already shipped the core app this repo still runs o
 - **Keys once** — paste credentials in App Settings; they persist locally and the provider fleet hot-reloads.  The UI only ever sees "configured" flags.
 - **Channels** — Work, Personal, and each project in separate channels without cloning bots.  Each channel has its own transcript, shared instructions, working folder, responder rules, and roster.
 - **Team import from one Markdown file** — browse outcome-driven teams (BotMRR), review, then create bots, Chief of Staff, channels, playbooks, connector checklist, and suggested routines.  File or GitHub URL import too.  Packages never carry credentials, conversations, permissions, memory, or computer access.
-- **Voice** — ElevenLabs TTS on any reply, per-bot voices, and a macOS call mode that uses on-device dictation.
+- **Voice** — hosted TTS (xAI, Azure, or MiniMax), per-bot voices, and call mode with on-device Apple dictation or xAI / AssemblyAI speech-to-text. Speech-to-speech calls use xAI realtime or Gemini Live, with the bot's own engine as a tool.
 - **Streaming tool-run chips**, native macOS dictation from the composer mic, cursor mascots, and screenshots of the bot's work folded into the transcript.
 - **MCP control plane** — a stdio MCP server for Claude Desktop / Cursor to inspect bots and channels, page transcripts, create work, wait, switch models, and interrupt.  It does not expose approval grants, deletion, arbitrary settings, credentials, or computer lifecycle.
 - **Routines and webhooks** — one-shot or weekday schedules, plus a dedicated webhook receiver on `127.0.0.1:8800`.
@@ -175,7 +175,7 @@ These credentials are optional — local chat works without them.  Paste a key o
 |---|---|---|
 | Composio project key (`ak_…`) | Connect Gmail, GitHub, Slack, Notion, and other apps to your bots | [BotFleet Composio setup](docs/composio.md) |
 | Box API key | Give bots an isolated remote Linux computer with a desktop and terminal | [Box API key guide](https://docs.ascii.dev/box/api-keys) |
-| ElevenLabs key | Read replies aloud, and call your bots | [ElevenLabs API keys](https://elevenlabs.io/app/settings/api-keys) |
+| xAI, Azure Speech, or MiniMax key | Read replies aloud, and call your bots | [xAI console](https://console.x.ai/), [Azure Speech](https://portal.azure.com/), or [MiniMax](https://platform.minimax.io/) |
 
 **"Box" here means [ascii.dev](https://ascii.dev)'s cloud computer product** — the dashboard is `box.ascii.dev`, the API is `https://ascii.dev/api/box/v1`, and its keys start with `box_`.  It is **not** Box Inc. (`box.com`), and the two keys are not interchangeable.
 
@@ -213,7 +213,7 @@ Early but real — the loop works end to end: message → bot → streamed reply
 - **macOS is the only released platform.**  The published build is **v0.1.38** (Apple Silicon and Intel DMGs).  Windows and Ubuntu packages are produced by CI but **no Windows or Ubuntu build has ever shipped** — see the download table above.
 - **Ubuntu is beta**, with the capability limits in the table earlier in this file.
 - **Hosted/mobile connectivity is still being built.**  The iOS companion is on public TestFlight.
-- **Voice needs an ElevenLabs key**, and calls are macOS-only for now (they ride the same on-device dictation as the composer mic) — see [`docs/voice-mode.md`](docs/voice-mode.md).
+- **Voice** uses an xAI, Azure Speech, or MiniMax key for spoken replies (or macOS system voices / Apple Personal Voice). Calls work on macOS with Apple dictation, and on any desktop with an xAI or AssemblyAI key — see [`docs/voice-mode.md`](docs/voice-mode.md).
 - The engine list is much larger than the one the project started with — see [Engines](#engines).
 
 Every BotFleet-layer add-on listed above is in testing.

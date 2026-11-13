@@ -11,6 +11,9 @@ import { promisify } from "node:util";
 
 import { isFiniteJsonNumber, isJsonObject, isJsonString, type JsonObject, type JsonValue } from "./json.ts";
 import { DATA_DIR, writeFileAtomic } from "./state.ts";
+import { loadScopedApnsMaterial, resetScopedApnsCache, type ApnsScopedBinding } from "./apns-scoped-binding.ts";
+
+export type { ApnsScopedBinding };
 
 export interface ApnsConfig {
   keyId: string;
@@ -121,6 +124,7 @@ export function resetApnsKeyCache(): void {
   vaultKey = null;
   vaultReadInFlight = null;
   vaultGeneration++;
+  resetScopedApnsCache();
 }
 
 const execFileAsync = promisify(execFile);
@@ -213,15 +217,17 @@ async function readVault(now = Date.now()): Promise<VaultKey> {
 /** Where the signing key comes from, as text for status lines.  Never the
  * contents.  Order: `APNS_P8` (the PEM itself, for a host that injects it),
  * then `APNS_P8_PATH` (an explicit file), then Infisical:  `AUTHKEY_<KEY_ID>`
- * when `APNS_KEY_ID` pins a key, otherwise the shared `APNS_KEY_P8`. */
-export function apnsKeySource(): string {
+ * when `APNS_KEY_ID` pins a key, otherwise the shared `APNS_KEY_P8`.
+ * An explicit scoped binding keeps that order and labels the vault read as scoped. */
+export function apnsKeySource(binding?: ApnsScopedBinding): string {
   if (process.env.APNS_P8?.trim()) return "APNS_P8 environment";
   const explicit = process.env.APNS_P8_PATH?.trim();
   if (explicit) return explicit;
-  return `Infisical ${apnsVaultName(pinnedKeyId())}`;
+  const name = apnsVaultName(pinnedKeyId());
+  return binding ? `Infisical scoped ${name}` : `Infisical ${name}`;
 }
 
-async function resolveP8(): Promise<{ p8: string; origin: string; keyId: string } | null> {
+async function resolveP8(binding?: ApnsScopedBinding): Promise<{ p8: string; origin: string; keyId: string } | null> {
   const pinned = pinnedKeyId();
   const inline = process.env.APNS_P8?.trim();
   if (inline) return { p8: inline, origin: "env", keyId: pinned ?? SHARED_APNS_KEY_ID };
@@ -238,6 +244,17 @@ async function resolveP8(): Promise<{ p8: string; origin: string; keyId: string 
       return null;
     }
   }
+  // A caller-supplied scoped binding replaces the fleet-secrets read. Without one, the path below is unchanged.
+  if (binding) {
+    const got = await loadScopedApnsMaterial(binding, {
+      pin: pinned ?? "",
+      timeoutMs: vaultReadTimeoutMs(),
+      retryMs: vaultRetryMs(),
+      cacheMs: APNS_VAULT_CACHE_MS,
+      keyIdFallback: SHARED_APNS_KEY_ID,
+    });
+    return got.p8 ? { p8: got.p8, origin: "vault", keyId: got.keyId } : null;
+  }
   const got = await readVault();
   return got.p8 ? { p8: got.p8, origin: "vault", keyId: got.keyId } : null;
 }
@@ -252,13 +269,13 @@ async function resolveP8(): Promise<{ p8: string; origin: string; keyId: string 
 // fault persisted before the upgrade therefore never matches and is cleared
 // once on load:  the safe direction, since a key that is still bad is simply
 // re-recorded by the next push Apple refuses.
-export async function apnsKeyStamp(): Promise<string | null> {
-  const got = await resolveP8();
+export async function apnsKeyStamp(binding?: ApnsScopedBinding): Promise<string | null> {
+  const got = await resolveP8(binding);
   if (!got) return null;
   // The key id is hashed with the PEM:  the same PEM under a different id is
   // a different signing identity to Apple.
   const digest = createHash("sha256").update(`${got.keyId}\n${got.p8}`).digest("hex").slice(0, 16);
-  return `${apnsKeySource()}:${digest}`;
+  return `${apnsKeySource(binding)}:${digest}`;
 }
 
 /** The mask:  the first eight and the last four characters of the key
@@ -296,10 +313,10 @@ export function keyPreview(p8: string | null | undefined): string {
   return `${material.slice(0, KEY_PREVIEW_HEAD)}…${material.slice(-KEY_PREVIEW_TAIL)}`;
 }
 
-export async function loadApnsConfig(): Promise<ApnsConfig | null> {
+export async function loadApnsConfig(binding?: ApnsScopedBinding): Promise<ApnsConfig | null> {
   const teamId = process.env.APNS_TEAM_ID?.trim() || "CC8UTF7ATG";
   const bundleId = process.env.APNS_BUNDLE_ID?.trim() || "app.botfleet.ios";
-  const got = await resolveP8();
+  const got = await resolveP8(binding);
   if (!got) return null;
   const { p8, keyId } = got;
   if (!p8.includes("BEGIN PRIVATE KEY")) return null;

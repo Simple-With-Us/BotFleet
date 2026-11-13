@@ -17,6 +17,9 @@
 #   --allow-dirty      Allow shipping from a dirty git worktree
 #   --force-ship       Bypass min-interval + same-HEAD skip (emergency / owner)
 #   --sync-project-version  Write the resolved version into project.pbxproj
+#   --plan-build-only  Print the shared release build for a fixed marketing
+#                      version and exit before any Xcode requirement (the
+#                      release workflow's plan-build job; read-only)
 #   --allow-unverified-seq  Ship even if App Store Connect cannot be consulted
 #                           (dangerous: the marketing version and the build
 #                           number are then planned from unverified state)
@@ -81,7 +84,7 @@
 #                              (record_successful_ship must still run or the rate
 #                              gate never advances)
 #
-# It also renders the mandatory AGENT-SYNC "What to Test" release note from the
+# It also renders the mandatory FLEET-PROTOCOL "What to Test" release note from the
 # commit range since the last successful ship. THIS IS OPT-IN, because it writes
 # copy every TestFlight tester reads:
 #   IOS_TF_RELEASE_NOTES=1     publish to App Store Connect
@@ -112,8 +115,10 @@ set -euo pipefail
 
 # LaunchAgents inherit a tiny PATH (no Homebrew). Node is required for
 # ensure-tf-ready and for the App Store Connect queries. Keep this before any
-# `node` / `xcodegen` call.
-export PATH="/opt/homebrew/bin:/usr/local/bin:${PATH}"
+# `node` / `xcodegen` call. Apple system paths must lead Homebrew so
+# xcodebuild -exportArchive uses openrsync against Apple's rsync, not Homebrew
+# 3.5.x (Usage-Monitor #1691, exportArchive Copy failed).
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin:${PATH}"
 # The node that runs asc-api.mjs.  IOS_FLEET_NODE lets an offline test
 # answer App Store Connect from a stub;  a real ship leaves it unset and
 # uses node from PATH.
@@ -157,6 +162,7 @@ ALLOW_DIRTY=0
 FORCE_SHIP=0
 ALLOW_UNVERIFIED_SEQ=0
 SYNC_PROJECT_VERSION=0
+PLAN_BUILD_ONLY=0
 
 die() { echo "error: $*" >&2; exit 1; }
 log() { echo "[ios-ship] $*"; }
@@ -822,10 +828,220 @@ project_marketing_seq() {
   printf '%s' "$best"
 }
 
-# Highest patch already used on the <prefix>.N train in App Store Connect:  the
-# App Store versions AND the TestFlight trains, drift trains ignored.
-# Returns 1 (and prints nothing) when ASC cannot be consulted:  the caller
-# must distinguish "no versions yet" (0) from "unknown" (failure).
+# The shared merge-timestamp build for a fixed marketing version (owner, Oct 29 2026):
+# ONE build per app across iOS and macOS: max(S, M + 1), where S is the
+# committer date of HEAD in America/Chicago as YYYYMMDDHHMM and M is the
+# highest first numeric component among every iOS build, every macOS build
+# and every extra floor.  Prints the build on stdout.  Returns 1 (and prints
+# nothing) when it cannot be worked out.
+asc_next_shared_build() {
+  local out rc paired_id feed feed_xml max floor curl_err curl_err_root curl_diag stripped stamp
+  command -v "$ASC_NODE" >/dev/null 2>&1 || return 1
+  # Not load_secrets: this helper runs inside command substitutions, where a
+  # secrets temp dir and its EXIT trap die with the subshell and leave the
+  # key behind.  asc-api.mjs resolves its own credential.
+  asc_credential_available || return 1
+  # S: the committer date of the commit being built, in Chicago time.  A
+  # shallow checkout still holds HEAD, so this needs no history;  anything
+  # that is not a 12-digit stamp fails closed.
+  stamp="$(TZ=America/Chicago git -C "$REPO_ROOT" show -s --format=%cd --date=format-local:%Y%m%d%H%M HEAD 2>/dev/null)" || stamp=""
+  if [[ ! "$stamp" =~ ^[1-9][0-9]{11}$ ]]; then
+    logerr "shared-build: cannot read a 12-digit merge stamp from HEAD; failing closed"
+    return 1
+  fi
+  # The paired app whose builds join the counter: pairedBundleId, with
+  # macBundleId as the accepted alias.  For a macOS entry this names the iOS
+  # app; for an iOS entry it names the Mac app.
+  paired_id="$(json_get "$APP_KEY" pairedBundleId 2>/dev/null || true)"
+  [[ "$paired_id" == "null" ]] && paired_id=""
+  if [[ -z "$paired_id" ]]; then
+    paired_id="$(json_get "$APP_KEY" macBundleId 2>/dev/null || true)"
+    [[ "$paired_id" == "null" ]] && paired_id=""
+  fi
+  # A macOS entry with no paired id borrows the iOS peer that points at it:
+  # the entry whose pairedBundleId or macBundleId equals this bundle id lends
+  # its own bundle id, so iOS builds join the counter.
+  if [[ -z "$paired_id" && "${PLATFORM:-}" == "macOS" && -n "${BUNDLE_ID:-}" ]]; then
+    paired_id="$(/usr/bin/python3 - "$APPS_JSON" "$BUNDLE_ID" 2>/dev/null <<'PY'
+import json, sys
+path, mine = sys.argv[1], sys.argv[2]
+try:
+    data = json.load(open(path))
+except Exception:
+    sys.exit(0)
+apps = data.get("apps", {}) or {}
+for key in sorted(apps.keys()):
+    a = apps[key] or {}
+    if a.get("pairedBundleId") == mine or a.get("macBundleId") == mine:
+        b = a.get("bundleId") or ""
+        if b and b != mine:
+            print(b, end="")
+            sys.exit(0)
+PY
+)" || paired_id=""
+    [[ "$paired_id" == "null" ]] && paired_id=""
+  fi
+  feed="$(json_get "$APP_KEY" pairedBuildFeed 2>/dev/null || true)"
+  [[ "$feed" == "null" ]] && feed=""
+  floor=""
+  if [[ -n "$feed" ]]; then
+    case "$feed" in
+      https://*) ;;
+      *)
+        logerr "shared-build: paired build feed ${feed} is not an https URL; failing closed"
+        return 1
+        ;;
+    esac
+    if ! command -v curl >/dev/null 2>&1; then
+      logerr "shared-build: curl is not on PATH, so the paired build feed ${feed} cannot be read"
+      return 1
+    fi
+    curl_err_root="$(asc_temp_root)" || curl_err_root=""
+    if [[ -z "$curl_err_root" ]]; then
+      logerr "shared-build: TMPDIR resolves to the filesystem root; refusing to fetch the paired build feed ${feed}"
+      return 1
+    fi
+    curl_err="$(mktemp "${curl_err_root}/paired-feed-err.XXXXXX" 2>/dev/null)" || curl_err=""
+    if [[ -z "$curl_err" ]]; then
+      logerr "shared-build: cannot stage a scratch file, so the paired build feed ${feed} cannot be read"
+      return 1
+    fi
+    set +e
+    feed_xml="$(curl -fsSL --proto =https --proto-redir =https --connect-timeout 10 --max-time 30 --max-filesize 5000000 "$feed" 2>"$curl_err")"
+    rc=$?
+    set -e
+    curl_diag=""
+    if [[ -s "$curl_err" ]]; then
+      curl_diag="$(cat "$curl_err" 2>/dev/null || true)"
+    fi
+    rm -f "$curl_err" >/dev/null 2>&1 || true
+    # A timeout is a feed failure: fail closed, never guess the floor.  The
+    # URL and curl's own stderr are logged so a feed failure is not reported
+    # as an App Store Connect failure.
+    if [[ $rc -ne 0 ]]; then
+      if [[ -n "$curl_diag" ]]; then
+        logerr "shared-build: paired build feed fetch failed for ${feed}: ${curl_diag}"
+      else
+        logerr "shared-build: paired build feed fetch failed for ${feed} (curl rc=${rc})"
+      fi
+      return 1
+    fi
+    max="$(printf '%s' "$feed_xml" | grep -o -E '<sparkle:version>[[:space:]]*[0-9]+[[:space:]]*</sparkle:version>' 2>/dev/null | grep -o -E '[0-9]+' 2>/dev/null | sort -n 2>/dev/null | tail -n 1 2>/dev/null || true)"
+    if [[ ! "$max" =~ ^[0-9]+$ ]]; then
+      logerr "shared-build: paired build feed ${feed} holds no numeric <sparkle:version>; failing closed"
+      return 1
+    fi
+    # The feed floor is numeric, at least 1, and at most 12 digits: fixed
+    # mode plans a 12-digit merge-timestamp build, and a floor past that
+    # would plan a build the 12-digit gate rejects.  Compared as a string,
+    # so no arithmetic ever sees a huge value.
+    stripped="$max"
+    while [[ "$stripped" == 0* && "${#stripped}" -gt 1 ]]; do
+      stripped="${stripped#0}"
+    done
+    if [[ "${#stripped}" -gt 12 ]]; then
+      logerr "shared-build: paired build feed ${feed} version ${max} exceeds 12 digits; failing closed"
+      return 1
+    fi
+    if [[ "$stripped" == "0" ]]; then
+      logerr "shared-build: paired build feed ${feed} version ${max} is outside 1..999999999999; failing closed"
+      return 1
+    fi
+    floor="$max"
+  fi
+  set +e
+  if [[ -n "$paired_id" && -n "$floor" ]]; then
+    out=$(asc_client plan-release-build "$BUNDLE_ID" "$paired_id" "$floor" --merge-stamp "$stamp")
+    rc=$?
+  elif [[ -n "$paired_id" ]]; then
+    out=$(asc_client plan-release-build "$BUNDLE_ID" "$paired_id" --merge-stamp "$stamp")
+    rc=$?
+  elif [[ -n "$floor" ]]; then
+    out=$(asc_client plan-release-build "$BUNDLE_ID" "$floor" --merge-stamp "$stamp")
+    rc=$?
+  else
+    out=$(asc_client plan-release-build "$BUNDLE_ID" --merge-stamp "$stamp")
+    rc=$?
+  fi
+  set -e
+  [[ $rc -eq 0 && "$out" =~ ^[1-9][0-9]{11}$ ]] || return 1
+  printf '%s' "$out"
+}
+
+# digits_gt A B: true when digit-string A is numerically greater than
+# digit-string B.  Leading zeros are allowed;  the comparison is by length
+# first, so values past the shell's integer range compare correctly.
+digits_gt() {
+  local a="$1" b="$2"
+  [[ "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ ]] || return 1
+  while [[ "$a" == 0* && "${#a}" -gt 1 ]]; do
+    a="${a#0}"
+  done
+  while [[ "$b" == 0* && "${#b}" -gt 1 ]]; do
+    b="${b#0}"
+  done
+  if [[ "${#a}" -ne "${#b}" ]]; then
+    [[ "${#a}" -gt "${#b}" ]]
+    return $?
+  fi
+  [[ "$a" > "$b" ]]
+}
+
+# The highest first-component build of THIS app record on THIS platform (all
+# trains), for checking an operator --build in fixed mode.  Prints the max,
+# or nothing when the app has no builds yet.  Returns 1 (and prints nothing
+# usable) when it cannot be worked out.
+asc_max_build_this_platform() {
+  local out rc
+  command -v "$ASC_NODE" >/dev/null 2>&1 || return 1
+  # Not load_secrets: this helper runs inside command substitutions, where a
+  # secrets temp dir and its EXIT trap die with the subshell and leave the
+  # key behind.  asc-api.mjs resolves its own credential.
+  asc_credential_available || return 1
+  set +e
+  out=$(asc_client max-build "$BUNDLE_ID" "$ASC_PLATFORM" "${APPLE_ID:-}")
+  rc=$?
+  set -e
+  [[ $rc -eq 0 ]] || return 1
+  if [[ -z "$out" ]]; then
+    printf ''
+    return 0
+  fi
+  [[ "$out" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$out"
+}
+
+asc_released_store_version() {
+  local plat="${1:-}" out rc
+  command -v "$ASC_NODE" >/dev/null 2>&1 || return 1
+  # Not load_secrets: both helpers run inside command substitutions, where a
+  # secrets temp dir and its EXIT trap die with the subshell and leave the
+  # key behind.  asc-api.mjs resolves its own credential.
+  asc_credential_available || return 1
+  # Keep the client's stderr: it carries the reason (HTTP status, unknown
+  # state).  Only the labelled lines are logged, never key material, and an
+  # auth failure keeps its own status 4.
+  local errf errf_root
+  errf_root="$(asc_temp_root)" || {
+    logerr "asc-released: TMPDIR resolves to the filesystem root; refusing to write there"
+    return 1
+  }
+  errf="$(mktemp "${errf_root}/asc-released-err.XXXXXX")"
+  set +e
+  out=$(asc_client released-store-version "$BUNDLE_ID" "$plat" "${APPLE_ID:-}" 2>"$errf")
+  rc=$?
+  set -e
+  if [[ -s "$errf" ]]; then
+    while IFS= read -r _pl; do
+      case "$_pl" in asc-auth:*|released-store-version:*) logerr "asc-released: ${_pl}" ;; esac
+    done <"$errf"
+  fi
+  rm -f "$errf" >/dev/null 2>&1 || true
+  [[ $rc -eq 4 ]] && return 4
+  [[ $rc -eq 0 ]] || return 1
+  printf '%s' "$out"
+}
+
 asc_latest_marketing_patch() {
   local prefix="$1" plat="${2:-}" out rc errf
   if ! command -v "$ASC_NODE" >/dev/null 2>&1; then
@@ -1045,6 +1261,29 @@ evaluate_ship_gate() {
   log "ship-gate: ok — ${elapsed}s since last ship (min ${min_sec}s from ${min_src}); HEAD ${head_sha:0:10}"
 }
 
+# "<marketing> <build>" from an IPA's Info.plist, only when its bundle id is the
+# expected one.  Fails (prints nothing) on anything else.  Never guesses.
+ipa_manifest_versions() {
+  local ipa="$1" want="$2"
+  [[ -f "$ipa" && -n "$want" ]] || return 1
+  python3 - "$ipa" "$want" <<'PY'
+import plistlib, re, sys, zipfile
+ipa, want = sys.argv[1:3]
+try:
+    z = zipfile.ZipFile(ipa)
+    names = [n for n in z.namelist() if re.fullmatch(r"Payload/[^/]+\.app/Info\.plist", n)]
+    if len(names) != 1:
+        sys.exit(1)
+    info = plistlib.loads(z.read(names[0]))
+except Exception:
+    sys.exit(1)
+ver, build, bid = info.get("CFBundleShortVersionString"), info.get("CFBundleVersion"), info.get("CFBundleIdentifier")
+if bid != want or not ver or not build or re.search(r"\s", ver + build):
+    sys.exit(1)
+print(ver, build)
+PY
+}
+
 record_successful_ship() {
   local path head_sha now
   path="$(ship_state_path)"
@@ -1057,6 +1296,22 @@ record_successful_ship() {
   log "ship-gate: recorded success ts=${now} sha=${head_sha:0:10} -> ${path}"
   # Public version manifest for the in-app update prompt.  Best-effort —
   # a publish miss must never fail a ship that already uploaded.
+  # --upload-only reuses an IPA whose versions this run never read, so
+  # MARKETING and BUILD_NUM hold a placeholder.  The placeholder must never
+  # reach the manifest:  read the real versions out of the IPA's Info.plist,
+  # and skip the publish when that cannot be done or names another app.
+  if [[ "${MARKETING:-}" == "(from IPA)" || "${BUILD_NUM:-}" == "(from IPA)" ]]; then
+    local ipa_ver
+    if [[ -n "${UPLOAD_ONLY_IPA:-}" ]] && ipa_ver="$(ipa_manifest_versions "$UPLOAD_ONLY_IPA" "${BUNDLE_ID:-}")" && [[ -n "$ipa_ver" ]]; then
+      MARKETING="${ipa_ver%% *}"
+      BUILD_NUM="${ipa_ver#* }"
+      log "version-manifest: --upload-only versions read from the IPA (${MARKETING} build ${BUILD_NUM})"
+    else
+      MARKETING=""
+      BUILD_NUM=""
+      log "version-manifest: skipped (--upload-only and the IPA's versions could not be read for ${BUNDLE_ID:-?})"
+    fi
+  fi
   if [[ -n "${BUNDLE_ID:-}" && -n "${MARKETING:-}" ]]; then
     local apple_id display pub_out pr_url
     local -a pub_args
@@ -1099,6 +1354,7 @@ while [[ $# -gt 0 ]]; do
     --force-ship) FORCE_SHIP=1; shift ;;
     --allow-unverified-seq) ALLOW_UNVERIFIED_SEQ=1; shift ;;
     --sync-project-version) SYNC_PROJECT_VERSION=1; shift ;;
+    --plan-build-only) PLAN_BUILD_ONLY=1; shift ;;
     -h|--help) usage ;;
     -*) die "unknown option: $1 (try --help)" ;;
     *)
@@ -1120,6 +1376,32 @@ _EARLY_BUNDLE="$(json_get "$APP_KEY" bundleId)"
 _EARLY_SCHEME="$(json_get "$APP_KEY" scheme)"
 _EARLY_PROJECT="$(json_get "$APP_KEY" projectRel)"
 [[ -n "$_EARLY_BUNDLE" && -n "$_EARLY_SCHEME" && -n "$_EARLY_PROJECT" ]] || die "unknown app key or incomplete registry: $APP_KEY"
+
+# Read-only planner for the release workflow's plan-build job: print the one
+# shared release build and exit BEFORE the Xcode/toolchain requirements below,
+# so the plan job runs on any runner (it needs only bash, git, python3, node
+# and curl).  Only stdout carries the build; every diagnostic is on stderr.
+# asc-api.mjs resolves its own credential; nothing is staged here.
+if [[ "$PLAN_BUILD_ONLY" -eq 1 ]]; then
+  if [[ -z "$REPO_ROOT" ]]; then
+    REPO_ROOT="$(pwd)"
+  fi
+  REPO_ROOT="$(cd "$REPO_ROOT" && pwd)"
+  BUNDLE_ID="$_EARLY_BUNDLE"
+  PLATFORM="$(json_get "$APP_KEY" platform)"
+  if [[ -z "$PLATFORM" ]]; then
+    if [[ "$APP_KEY" == *-mac ]]; then
+      PLATFORM="macOS"
+    else
+      PLATFORM="iOS"
+    fi
+  fi
+  _plan_fixed="$(json_get "$APP_KEY" fixedMarketingVersion)"
+  [[ -n "$_plan_fixed" ]] || die "--plan-build-only plans a fixed marketing version, and ${APP_KEY} has no fixedMarketingVersion in apps.json; nothing planned"
+  _plan_build="$(asc_next_shared_build)" || die "cannot work out the shared release build for ${APP_KEY}; nothing planned"
+  printf '%s\n' "$_plan_build"
+  exit 0
+fi
 
 # Prefer stable Xcode.app over Xcode-beta for TestFlight / ASC compatibility.
 # Beta toolchains + beta macOS stamp BuildMachineOSBuild that App Store review
@@ -1167,6 +1449,18 @@ PROJECT_REL="$(json_get "$APP_KEY" projectRel)"
 PROJECT_REL_ALT="$(json_get "$APP_KEY" projectRelAlt)"
 XCODEGEN_DIR="$(json_get "$APP_KEY" xcodegenDir)"
 DEFAULT_MARKETING="$(json_get "$APP_KEY" marketingVersionDefault)"
+# Optional fixed-version policy (owner, Oct 29 2026): the marketing version does
+# not count up per ship; the build is one shared merge-timestamp build per app
+# across iOS and macOS: max(S, M + 1), where S is the merge stamp of HEAD and
+# M is the highest build anywhere on either platform (see asc-api.mjs
+# plan-release-build and shared-build.mjs).
+# apps.json keys: fixedMarketingVersion ("0.1.0"), optional pairedBundleId (the
+# paired app whose builds join the max; macBundleId is the accepted alias),
+# optional pairedBuildFeed (a Sparkle appcast URL whose max <sparkle:version>
+# joins the max).  Absent fixedMarketingVersion keeps the next-patch
+# behaviour.  Fixed mode works on both platforms: the build sits above every
+# Mac build, which is what macOS needs.
+FIXED_MARKETING="$(json_get "$APP_KEY" fixedMarketingVersion)"
 
 if [[ -z "$PLATFORM" ]]; then
   if [[ "$APP_KEY" == *-mac || "$SCHEME" == *[Mm]ac* ]]; then
@@ -1290,6 +1584,7 @@ PLAN_FLOOR="n/a"
 PLAN_TRAIN_FLOOR="n/a"
 PLAN_APP_FLOOR="n/a"
 PLAN_COMMIT_COUNT="n/a"
+FIXED_MODE=0
 PLAN_READY=0
 
 if [[ -n "$UPLOAD_ONLY_IPA" ]]; then
@@ -1318,6 +1613,26 @@ else
   # ---- the marketing version ---------------------------------------------
   # --version is an exact override.  Otherwise the version is the next patch
   # on the default train, and P comes from App Store Connect.
+  FIXED_MODE=0
+  if [[ -n "$FIXED_MARKETING" && ( -z "$FORCE_VERSION" || "$FORCE_VERSION" == "$FIXED_MARKETING" ) ]]; then
+    [[ "$FIXED_MARKETING" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+      || die "fixedMarketingVersion '${FIXED_MARKETING}' for ${APP_KEY} in apps.json is not M.m.p (three dot-separated integers).  Nothing was shipped."
+    FORCE_VERSION="$FIXED_MARKETING"
+    FIXED_MODE=1
+    log "version: fixed marketing version ${FIXED_MARKETING} from apps.json; it does not count up per ship"
+    # A released App Store version closes its train:  a fixed version at or
+    # below one is refused, never silently bumped.
+    _rel="$(asc_released_store_version "$ASC_PLATFORM")" \
+      || die "cannot read the released App Store version for ${BUNDLE_ID}, so fixedMarketingVersion ${FIXED_MARKETING} cannot be checked against a closed train.  Nothing was shipped or bumped."
+    if [[ -n "$_rel" ]]; then
+      if ! python3 -c 'import sys
+a=[int(x) for x in sys.argv[1].split(".")]; b=[int(x) for x in sys.argv[2].split(".")]
+n=max(len(a),len(b)); a+= [0]*(n-len(a)); b+=[0]*(n-len(b))
+sys.exit(0 if a>b else 1)' "$FIXED_MARKETING" "$_rel"; then
+        die "fixedMarketingVersion ${FIXED_MARKETING} is at or below the released App Store version ${_rel}.  Apple requires each new version to be greater than the last released one.  Nothing was bumped.  Pick a version above ${_rel} in apps.json."
+      fi
+    fi
+  fi
   if [[ -n "$FORCE_VERSION" ]]; then
     MARKETING="$FORCE_VERSION"
     # The patch the operator pinned, on its own train ("2.0.5" -> 5).
@@ -1370,6 +1685,22 @@ else
 
   # ---- the build number ---------------------------------------------------
   if [[ -n "$FORCE_BUILD" ]]; then
+    if [[ "$FIXED_MODE" -eq 1 ]]; then
+      [[ "$FORCE_BUILD" =~ ^[1-9][0-9]{11}$ ]] || die "fixed mode requires a 12-digit merge-timestamp build; nothing shipped"
+      _thismax="$(asc_max_build_this_platform)" || die "cannot verify this platform's highest build; nothing shipped"
+      if [[ -n "$_thismax" ]]; then
+        digits_gt "$FORCE_BUILD" "$_thismax" || die "requested build is at or below this platform's highest build ${_thismax}; nothing shipped"
+      fi
+      # The value was planned for a commit: it must not predate the merge
+      # stamp of the HEAD being shipped, or it was planned for an older
+      # commit.  The plan and the ship check out the same SHA, so a
+      # correctly planned value always passes.
+      _ship_stamp="$(TZ=America/Chicago git -C "$REPO_ROOT" show -s --format=%cd --date=format-local:%Y%m%d%H%M HEAD 2>/dev/null)" || _ship_stamp=""
+      [[ "$_ship_stamp" =~ ^[1-9][0-9]{11}$ ]] || die "cannot read the merge stamp of the commit being shipped; nothing shipped"
+      if digits_gt "$_ship_stamp" "$FORCE_BUILD"; then
+        die "requested build ${FORCE_BUILD} is below the merge stamp ${_ship_stamp} of the commit being shipped (planned for an older commit); nothing shipped"
+      fi
+    fi
     # An explicit --build is honoured exactly, and it does NOT move the
     # marketing version:  the two numbers are independent.
     BUILD_NUM="$FORCE_BUILD"
@@ -1380,6 +1711,9 @@ else
       die "--build ${BUILD_NUM} equals the patch of ${MARKETING}, which would ship ${MARKETING} (${BUILD_NUM}): the 1.0.N (N) form the owner retired (AFC-517).  Pass a different --build."
     fi
     log "version: operator override (--build/--version); the local build-seq counter is not consulted"
+  elif [[ "$FIXED_MODE" -eq 1 ]]; then
+    BUILD_NUM="$(asc_next_shared_build)" || die "cannot work out the next shared merge-timestamp build: incomplete inventory or unreadable merge stamp; nothing shipped"
+    log "build: shared merge-timestamp build ${BUILD_NUM} for fixed version ${MARKETING}"
   else
     [[ "$PLAN_COMMIT_COUNT" =~ ^[0-9]+$ ]] || die "could not read the commit count from ${REPO_ROOT}; CFBundleVersion is the repo commit count and UTC timestamps are retired"
 
@@ -1435,7 +1769,7 @@ else
     # count -- so the log line names the floor rather than asserting the
     # commit count was shipped.
     BUILD_NUM="$PLAN_COMMIT_COUNT"
-    if [[ "$BUILD_NUM" -le "$PLAN_FLOOR" ]]; then
+    if [[ "$FIXED_MODE" -ne 1 && "$BUILD_NUM" -le "$PLAN_FLOOR" ]]; then
       BUILD_NUM="$((PLAN_FLOOR + 1))"
       log "build: floor ${PLAN_FLOOR} is at or above the commit count ${PLAN_COMMIT_COUNT}; using ${BUILD_NUM} instead"
     fi
@@ -1672,6 +2006,9 @@ release_archive_lock() {
 # ITSAppUsesNonExemptEncryption. Otherwise TestFlight stays
 # MISSING_EXPORT_COMPLIANCE and the phone never sees the build (ST 1.0.1/2
 # on 2026-08-12).
+# shellcheck source=scripts/ios-fleet/tf-ready-rc.sh
+source "${FLEET_DIR}/tf-ready-rc.sh"
+
 TF_READY_CONFIRMED=0
 ensure_tf_ready() {
   log "verifying TestFlight ready-to-install for ${BUNDLE_ID} build ${BUILD_NUM}"
@@ -1693,66 +2030,36 @@ ensure_tf_ready() {
     while IFS= read -r line; do log "tf-ready: $line"; done <"${LOG_DIR}/ensure-tf-ready.err"
   fi
   if [[ $rc -eq 0 ]]; then
-    log "TestFlight internal testers can install this build"
     TF_READY_CONFIRMED=1
-    return 0
   fi
-  if [[ $rc -eq 5 ]]; then
-    # Apple finished processing the build, but the app has no internal tester
-    # with access to all builds, so nobody can install it.  This is not a failed
-    # upload (the build is in App Store Connect), so do not fail the job; make
-    # it impossible to miss instead.  A new bundle ID starts with no groups, and
-    # 14 green ships once reached nobody this way (GH #1018).
-    log "warning: build ${BUILD_NUM} is processed but ${BUNDLE_ID} has no internal TestFlight tester; nobody can install it yet"
-    log "warning: the Sync standing TestFlight testers step creates the internal group; otherwise add an App Store Connect user under TestFlight > Internal Testing"
-    if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
-      echo "::warning title=TestFlight has no internal tester::${BUNDLE_ID} build ${BUILD_NUM} is processed but no internal tester can install it.  Check the Sync standing TestFlight testers step."
-    fi
-    return 0
-  fi
-  if [[ $rc -eq 6 ]]; then
-    # Processed, but the internal-tester count could not be read, so we cannot
-    # say anyone can install it.  Say so instead of printing the success line.
-    log "warning: build ${BUILD_NUM} is processed but the internal TestFlight tester count could not be read for ${BUNDLE_ID}; installability is unverified"
-    if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
-      echo "::warning title=TestFlight installability unverified::${BUNDLE_ID} build ${BUILD_NUM} is processed but the internal tester count could not be read.  Check TestFlight."
-    fi
-    return 0
-  fi
-  if [[ $rc -eq 3 ]]; then
-    log "warning: upload succeeded but ASC has not reached IN_BETA_TESTING yet; watch TestFlight"
-    return 0
-  fi
-  if [[ $rc -eq 4 ]]; then
-    # The upload itself succeeded; ASC simply never surfaced the build in time.
-    # Warn loudly but do NOT fail: the caller must still record_successful_ship,
-    # or the rate gate never advances and the next scheduled run re-ships the
-    # same HEAD. A red job after a successful upload also mislabels the outcome.
-    log "warning: ASC never surfaced build ${BUILD_NUM}; export compliance NOT declared on it"
-    log "warning: if the phone never gets this build, declare compliance by hand in App Store Connect"
-    if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
-      echo "::warning::ensure-tf-ready could not find uploaded build ${BUILD_NUM} for ${BUNDLE_ID}; export compliance not declared"
-    fi
-    return 0
-  fi
-  # rc=2 is a usage error or an ASC API error. Compliance was NOT declared, so
-  # this deserves the same CI annotation rc=4 gets -- otherwise the only trace
-  # is one log line inside a green job, which is how ST 1.0.1/2 stayed
-  # VALID-but-uninstallable without anyone noticing.
-  log "warning: ensure-tf-ready failed (rc=$rc); build may be stuck on export compliance"
-  if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
-    echo "::warning::ensure-tf-ready failed (rc=${rc}) for ${BUNDLE_ID} build ${BUILD_NUM}; export compliance not declared"
-  fi
+  handle_ensure_tf_ready_rc "$rc"
   return 0
 }
 
 # Freeze source identity before building.  A later checkout change invalidates
 # the reporting receipt rather than associating an archive with the wrong SHA.
 SENTRY_ARCHIVE_COMMIT="$(repo_head_sha)"
+write_deferred_sentry_ship_context() {
+  [[ "$APP_KEY" == "botfleet" && -n "${GITHUB_OUTPUT:-}" ]] || return 0
+  {
+    echo "ios_ship_archive_path=${ARCHIVE_PATH}"
+    echo "ios_ship_build=${BUILD_NUM}"
+    echo "ios_ship_marketing=${MARKETING}"
+    echo "ios_ship_bundle=${BUNDLE_ID}"
+    echo "ios_ship_commit=${SENTRY_ARCHIVE_COMMIT}"
+  } >>"$GITHUB_OUTPUT"
+}
+
 emit_sentry_deployment_receipt() {
   # Hosted BotFleet iOS only.  Skips, export-only, upload-only and pending ASC
   # processing are not deployments and must never manufacture a receipt.
   [[ "$APP_KEY" == "botfleet" && -n "${GITHUB_OUTPUT:-}" ]] || return 0
+  # The hosted workflow re-runs ensure-tf-ready after standing-tester sync and
+  # records the Sentry receipt from that second pass (OPS-1052 / BF-2552).
+  if [[ "${IOS_DEFER_SENTRY_RECEIPT:-}" == "1" ]]; then
+    write_deferred_sentry_ship_context
+    return 0
+  fi
   if [[ "$TF_READY_CONFIRMED" != "1" ]]; then
     echo "::warning::No confirmed TestFlight readiness; Sentry deployment was not recorded."
     return 0

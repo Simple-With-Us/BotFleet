@@ -28,7 +28,7 @@ Notes.app does not render raw Markdown.  The helper converts MD → HTML.  Pass 
 /Users/jay/apps/apple-notes-coding.sh --unpin-only "Exact Title"
 ```
 
-Also: `--notify` / `--pushover`, `--needs-owner` / `--action-required`, `--summary "one sentence"`, `--pr "18"`.
+Also: `--notify` / `--pushover`, `--needs-owner` / `--action-required`, `--summary "real summary"`, `--pr "18"`. The summary is optional and only for long notes: a readable `Summary:` paragraph of up to 4-5 sentences that adds context beyond the title, never a restatement of it. The helper skips a summary on a note under 800 characters of body text (`APPLE_NOTES_SUMMARY_MIN_BODY_CHARS` adjusts the floor), one that mostly restates the title, or one over 20% of the note length (`APPLE_NOTES_SUMMARY_MAX_PCT` adjusts the share), so a short note gets no block.
 
 Default is headless pin via the `Pin Coding Note` shortcut (no focus steal).  Do not `APPLE_NOTES_ACTIVATE=1` unless the owner is sitting at the Mac.
 
@@ -88,7 +88,7 @@ Do not pass a packed markdown blob.  If you use the plain-body MD path, put a bl
 
 Do Notes: plans, design docs, reviews, handoffs, rollouts, **Completion / work-complete** for anything the owner might ask about.
 
-Skip: pure `#agent-sync` chatter, effort-board row edits, routine commit messages, peer-only PR nits.
+Skip: pure `#Work-In-Progress` chatter, effort-board row edits, routine commit messages, peer-only PR nits.
 
 Open a living work note when substantial work starts.  Always Completion at the end.  Update in place; unpin stale Completion notes when the lane closes (`--unpin-only`).
 
@@ -96,7 +96,7 @@ Background-jobs inventory note is `⭐️ Background Jobs Master List` — refre
 
 ## Canon
 
-- `/Users/jay/apps/AGENT-SYNC.md` § Apple Notes
+- `/Users/jay/apps/FLEET-PROTOCOL.md` § Apple Notes
 - Skills: `closeout`, `owner-copy`
 
 ### Handoff Reports (Immediate & Living)

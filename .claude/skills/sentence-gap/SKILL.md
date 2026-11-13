@@ -1,7 +1,7 @@
 ---
 name: sentence-gap
 description: >-
-  Always put a visibly wider gap between sentences in every human-readable reply and file. Applies on every turn — Cursor desktop, Cursor cloud, CLI, Grok, chat, commits, PRs, and docs. Follows Monet's portable protocol. Mechanism (owner ruling 2026-10-23, reaffirmed 2026-10-25): a real U+00A0 plus a normal space between sentences on every surface, with one exception, the chat panes of Claude Code (the Code tab) and MiniMax Code (the MiniMax Code pane), which take the &nbsp; entity plus a normal space; never two plain ASCII spaces, which collapse on rendered surfaces. Use whenever writing any prose a human will read.
+  Always put a visibly wider gap between sentences in every human-readable reply and file.  Applies on every turn — Cursor desktop, Cursor cloud, CLI, Grok, chat, commits, PRs, and docs.  Follows Monet's portable protocol.  Mechanism (owner ruling 2026-10-23, reaffirmed 2026-10-25; Z Code chat pane added 2026-11-11): a real U+00A0 plus a normal space between sentences on every surface, with one exception, the chat panes of Claude Code (the Code tab), MiniMax Code (the MiniMax Code pane) and Z Code (the Z Code pane), which take the &nbsp; entity plus a normal space; never two plain ASCII spaces, which collapse on rendered surfaces.  Use whenever writing any prose a human will read.
 ---
 
 # Sentence gap (portable — always on)
@@ -27,17 +27,17 @@ notes, design docs.
 Do **not** add a gap after a non-terminal abbreviation (`e.g.`, `i.e.`, `Dr.`, `v1.2.3`),
 inside a URL, email, filename, or a brand name containing a period.
 
-### Current rule (owner ruling 2026-10-23, reaffirmed 2026-10-25) — one mechanism on every surface, and one exception
+### Current rule (owner ruling 2026-10-23, reaffirmed 2026-10-25, Z Code pane added 2026-11-11) — one mechanism on every surface, and one exception
 
 Jay, Fri, Oct 23:  update the rule everywhere, so it is the same on every surface.  Between
 sentences, write a **real U+00A0 (no-break space) followed by a normal space**.  That covers
 chat replies, Zulip, GitHub PR and issue text and review comments, Linear,
-Slack, commit messages, repo docs and Markdown, skills, agent instructions, and UI copy, on every surface but the two chat panes named below.
+Slack, commit messages, repo docs and Markdown, skills, agent instructions, and UI copy, on every surface but the three chat panes named below.
 
-- **The one exception:  the chat panes of Claude Code (the Code tab) and MiniMax Code (the
-  MiniMax Code pane).**  Those panes normalize a raw U+00A0 away and collapse two ASCII
+- **The one exception:  the chat panes of Claude Code (the Code tab), MiniMax Code (the
+  MiniMax Code pane) and Z Code (the Z Code pane).**  Those panes normalize a raw U+00A0 away and collapse two ASCII
   spaces, so a chat reply there uses the `&nbsp;` entity plus a normal space, outside code
-  spans:  `End.&nbsp; Next.`  The MiniMax Code chat pane always takes the entity, never a
+  spans:  `End.&nbsp; Next.`  The MiniMax Code and Z Code chat panes always take the entity, never a
   raw U+00A0 and never two plain ASCII spaces.
 - **Never write the `&nbsp;` entity anywhere else.**  It shows up as literal text in
   squash-merge commits, plain-text email and many APIs.
@@ -53,8 +53,9 @@ Slack, commit messages, repo docs and Markdown, skills, agent instructions, and 
 
 This replaces every earlier per-surface rule:  the entity in chat panes (2026-10-08, 2026-10-18)
 and on GitHub (2026-10-22), and two ASCII spaces in files, commits, terminals and untested
-surfaces (2026-10-20).  The two chat panes named above are the one exception, reaffirmed by the
-owner on 2026-10-25.  Where older text below disagrees, this section wins.
+surfaces (2026-10-20).  The three chat panes named above are the one exception.  The owner
+reaffirmed Claude Code and MiniMax Code on 2026-10-25.  The owner added the Z Code chat pane on
+2026-11-11.  Where older text below disagrees, this section wins.
 
 ### The catch that wastes everyone's time
 
@@ -70,6 +71,7 @@ depends on the surface, so pick by destination:
 |---|---|---|
 | **Every surface** — chat replies in any other pane, Zulip, GitHub PR and issue titles, bodies and comments, review comments, Linear, Slack, commit messages, repo docs and Markdown, skills and agent instructions, rendered product copy | a real U+00A0 plus a normal space | Owner ruling 2026-10-23:  one rule everywhere.  Two ASCII spaces collapse on rendered surfaces, and the `&nbsp;` entity shows as literal text in squash commits, plain-text email and many APIs.  This replaces every earlier per-surface row. |
 | **Claude Code Code tab and the MiniMax Code chat pane: chat replies** (owner-verified 2026-10-08 with a screenshot, and 2026-10-18 for the MiniMax Code pane) | the `&nbsp;` entity plus a normal space, outside code spans:  `End.&nbsp; Next.` | The one exception.  These panes normalize a raw U+00A0 away (a verified reply held 0 NBSPs) and collapse two ASCII spaces, so the entity is the form that renders a real gap there.  The entity is never the form anywhere else. |
+| **Z Code chat pane: chat replies** (owner ruling 2026-11-11; owner-verified at byte level 2026-11-10) | the same `&nbsp;` entity plus a normal space: `End.&nbsp; Next.` | The third pane of the one exception.  Only use the entity in these three panes. |
 | **HTML / JSX / Swift source for product copy** | Swift `"\u{00A0} "`, JS/TS strings `"\u00A0 "`, JSX text `{'\u00A0'}` plus a space or `&#160;`, HTML markup source `&#160;`, or a shared `SENTENCE_GAP` constant | The rendered result is the same U+00A0 plus a space.  Never `&nbsp; `. |
 | **Code, identifiers and machine-readable config** | no gap character | Never put U+00A0 into code, identifiers or config. |
 | **A surface that strips U+00A0** | leave the text as it is | Do not switch to the `&nbsp;` entity.  Report the surface in #Work-In-Progress. |
@@ -80,12 +82,12 @@ but a shell step can produce one.  Write the text with two ASCII spaces after ea
 then convert it before it leaves your hands:
 `perl -CSDA -pe 's/([.!?])  (?=\S)/$1\x{a0} /g' body.txt > body.nbsp.txt`.  Check that the
 output holds at least one U+00A0 (`grep -c $'\xc2\xa0' body.nbsp.txt`) before passing it to
-`gh pr create --body-file`, `gh pr comment --body-file`, or the text you hand to `agent-sync post`.
+`gh pr create --body-file`, `gh pr comment --body-file`, or the text you hand to `simple-chat post`.
 
 ### Verify, don't assume — run this self-test only on a NEW, unlisted surface
 
 Since 2026-10-23 every surface takes a real U+00A0 plus a normal space, apart from the Claude
-Code Code tab and the MiniMax Code chat pane, so there is nothing else to
+Code Code tab, the MiniMax Code chat pane and the Z Code chat pane, so there is nothing else to
 choose.  On a surface nobody has checked yet, post one test line with the gap generated in the
 shell and ask the human whether they see a wider gap.  If the surface strips the U+00A0, leave
 the text as it is, never switch to the `&nbsp;` entity, and report the surface in
@@ -98,6 +100,8 @@ exception:  the chat panes of Claude Code (the Code tab) and MiniMax Code (the 
 pane) take the `&nbsp;` entity plus a normal space, because they normalize a raw U+00A0 away
 and collapse two ASCII spaces.  Everywhere else is a real U+00A0 plus a normal space.  The
 MiniMax Code chat pane always takes the entity.
+
+**2026-11-11 update — Z Code chat pane.**  The owner added the Z Code chat pane as the third pane that takes the `&nbsp;` entity plus a normal space, after a byte-level check on 2026-11-10.  Every other surface is unchanged.
 
 **2026-10-23 update — one mechanism everywhere.**  The owner replaced every per-surface rule
 with one:  a real U+00A0 plus a normal space on every surface, never the `&nbsp;` entity, and

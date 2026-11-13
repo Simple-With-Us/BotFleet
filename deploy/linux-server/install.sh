@@ -58,7 +58,7 @@ note "code: $BF_CODE"
 # --------------------------------------------------------------------------
 
 say "creating the runtime tree under $BF_ROOT"
-for dir in home data logs tmp config workdir node; do
+for dir in home data logs tmp var-tmp config workdir node bin; do
   run mkdir -p "$BF_ROOT/$dir"
 done
 run mkdir -p "$PNPM_STORE_DIR"
@@ -73,9 +73,9 @@ if ! id -u "$BF_USER" >/dev/null 2>&1; then
 fi
 
 run chown "$BF_USER:$BF_GROUP" "$BF_ROOT" "$BF_ROOT/home" "$BF_ROOT/data" "$BF_ROOT/logs" \
-  "$BF_ROOT/tmp" "$BF_ROOT/config" "$BF_ROOT/workdir" "$BF_ROOT/node"
+  "$BF_ROOT/tmp" "$BF_ROOT/var-tmp" "$BF_ROOT/config" "$BF_ROOT/workdir" "$BF_ROOT/node" "$BF_ROOT/bin"
 run chmod 2770 "$BF_ROOT" "$BF_ROOT/home" "$BF_ROOT/data" "$BF_ROOT/logs" \
-  "$BF_ROOT/tmp" "$BF_ROOT/config" "$BF_ROOT/workdir" "$BF_ROOT/node"
+  "$BF_ROOT/tmp" "$BF_ROOT/var-tmp" "$BF_ROOT/config" "$BF_ROOT/workdir" "$BF_ROOT/node" "$BF_ROOT/bin"
 # The pnpm store is shared by every host on the fleet volume and is owned by
 # root:fleet, so it is created when it is missing and never re-owned here.
 
@@ -165,7 +165,8 @@ fi
 
 say "installing dependencies and building the UI"
 run as_user corepack enable --install-directory "$BF_ROOT/node/bin"
-run as_user sh -c "cd '$BF_CODE' && pnpm install --frozen-lockfile --store-dir '$PNPM_STORE_DIR'"
+# The root compiler rewrites dependency exports; cached installs need independent copies and lifecycle execution.
+run as_user sh -c "cd '$BF_CODE' && pnpm install --frozen-lockfile --force --package-import-method=copy --config.optimistic-repeat-install=false --store-dir '$PNPM_STORE_DIR'"
 run as_user sh -c "cd '$BF_CODE' && pnpm exec vite build"
 
 # --------------------------------------------------------------------------
@@ -181,6 +182,15 @@ if [ ! -f "$BF_ROOT/config/server.env" ]; then
 # No secrets live in this file.  Secrets come from Infisical (INFISICAL.md)
 # and from the engine CLIs' own login files under the service user's home.
 # OMB_DATA_DIR, OMB_STATIC_DIR and OMB_PORT are set by the systemd unit.
+# The harness reads its vault secrets with the read-only Infisical service
+# token in config/harness-infisical-token (mode 0600, owned by the service
+# user; start.sh loads it into INFISICAL_TOKEN unless the environment already
+# sets one).  That file is optional and is never created here.  Point the
+# harness at the vault project with INFISICAL_PROJECT_ID when Settings does
+# not already name it:
+# INFISICAL_PROJECT_ID=
+# BF_NODE_HEAP_MB pins the V8 old-space heap in MB (default 6144) so the cgroup's memory.high cannot shrink it.
+# BF_NODE_HEAP_MB=6144
 EOF
 else
   say "keeping the existing $BF_ROOT/config/server.env"
@@ -213,16 +223,19 @@ render_unit() {
     note "would render ${src} into ${dst}"
     return 0
   fi
-  sed -e "s|@BF_USER@|$BF_USER|g" \
-    -e "s|@BF_GROUP@|$BF_GROUP|g" \
-    -e "s|@BF_ROOT@|$BF_ROOT|g" \
-    -e "s|@BF_CODE@|$BF_CODE|g" \
-    -e "s|@NODE_BIN@|$BF_ROOT/node/bin/node|g" \
-    "$src" >"$dst"
-  chmod 0644 "$dst"
+  "$BF_ROOT/node/bin/node" --experimental-strip-types "$SCRIPT_DIR/render-resources.mjs" --write-unit "$(basename "$src")"
 }
 
 say "installing the systemd units"
+for helper in start.sh check-storage.mjs read-harness-token.mjs; do
+  run install -m 0755 -o "$BF_USER" -g "$BF_GROUP" "$SCRIPT_DIR/$helper" "$BF_ROOT/bin/$helper"
+done
+export BF_VOLUME BF_ROOT BF_CODE BF_USER BF_GROUP
+if [ "$DRY_RUN" -eq 1 ]; then
+  run "$BF_ROOT/node/bin/node" --experimental-strip-types "$SCRIPT_DIR/render-resources.mjs" --dry-run
+else
+  "$BF_ROOT/node/bin/node" --experimental-strip-types "$SCRIPT_DIR/render-resources.mjs" --write
+fi
 render_unit "$SCRIPT_DIR/botfleet-server.service.in" "/etc/systemd/system/$SERVER_UNIT"
 render_unit "$SCRIPT_DIR/botfleet-owner-gate.service.in" "/etc/systemd/system/$GATE_UNIT"
 run systemctl daemon-reload

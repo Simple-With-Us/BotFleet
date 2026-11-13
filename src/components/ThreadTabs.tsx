@@ -10,7 +10,7 @@ import { TaskWorkspaceLabel } from "./TaskWorkspaceLabel";
 import { allowsMultipleBotThreads } from "../../shared/conversation-mode";
 import { cn } from "@/lib/cn";
 import { nextRename } from "@/lib/rename";
-import { TASK_RENAME_HINT, taskPickerPointerIntent } from "./TaskPicker";
+import { TASK_RENAME_HINT, taskPickerPointerIntent, threadPickIntent } from "./TaskPicker";
 import { formatTokens } from "@/lib/format-tokens";
 
 type TabTask = Pick<Task, "threadId" | "title" | "createdAt"> & {
@@ -18,7 +18,7 @@ type TabTask = Pick<Task, "threadId" | "title" | "createdAt"> & {
   usage?: Task["usage"];
 };
 
-function ConversationThreadTabs({
+export function ConversationThreadTabs({
   threadId,
   tasks,
   busy,
@@ -27,6 +27,8 @@ function ConversationThreadTabs({
   onRename,
   onDelete,
   onMerge,
+  viewedThreadId,
+  onView,
 }: {
   threadId: string;
   tasks: TabTask[];
@@ -36,6 +38,10 @@ function ConversationThreadTabs({
   onRename: (threadId: string, title: string) => void;
   onDelete: (threadId: string) => void;
   onMerge?: (threadId: string, intoThreadId: string) => void;
+  /** The thread open for reading when it is not the active one. */
+  viewedThreadId?: string | null;
+  /** Open a thread for reading only; null returns to the active one. */
+  onView?: (threadId: string | null) => void;
 }) {
   const [renaming, setRenaming] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
@@ -78,15 +84,21 @@ function ConversationThreadTabs({
       >
         {tasks.map((task) => {
           const active = task.threadId === threadId;
+          const viewed = Boolean(viewedThreadId && task.threadId === viewedThreadId && !active);
           const usage = task.usage;
           const usageLabel = usage ? formatTokens(usage.input + usage.output) : null;
           return (
             <div
               key={task.threadId}
               data-active-thread={active ? "true" : undefined}
+              data-viewed-thread={viewed ? "true" : undefined}
               className={cn(
                 "group relative flex min-w-[7.5rem] max-w-[16rem] shrink-0 items-center border-b-2 px-1",
-                active ? "border-accent bg-raised/40" : "border-transparent hover:bg-raised/30",
+                active
+                  ? "border-accent bg-raised/40"
+                  : viewed
+                    ? "border-accent/40 bg-raised/25 hover:bg-raised/30"
+                    : "border-transparent hover:bg-raised/30",
                 picked.includes(task.threadId) && "bg-accent/15",
               )}
             >
@@ -115,9 +127,9 @@ function ConversationThreadTabs({
                 <button
                   type="button"
                   role="tab"
-                  aria-selected={active}
-                  disabled={busy && !active}
-                  title={`${task.title || "Untitled"} · ${TASK_RENAME_HINT}${usageLabel ? ` · ${usageLabel}` : ""}`}
+                  aria-selected={active || viewed}
+                  disabled={busy && !active && !onView}
+                  title={`${task.title || "Untitled"}${viewed ? " · Viewing" : ""} · ${TASK_RENAME_HINT}${usageLabel ? ` · ${usageLabel}` : ""}`}
                   onClick={(e) => {
                     if (taskPickerPointerIntent("click", e.detail) !== "select") return;
                     if (e.metaKey || e.ctrlKey) {
@@ -130,7 +142,15 @@ function ConversationThreadTabs({
                       return;
                     }
                     setPicked([]);
-                    if (!active) onSwitch(task.threadId);
+                    const intent = threadPickIntent({
+                      busy,
+                      active,
+                      viewing: Boolean(viewedThreadId && viewedThreadId !== threadId),
+                      canView: Boolean(onView),
+                    });
+                    if (intent === "switch") onSwitch(task.threadId);
+                    else if (intent === "view") onView?.(task.threadId);
+                    else if (intent === "viewActive") onView?.(null);
                   }}
                   draggable={Boolean(onMerge)}
                   onDragStart={(event) => {
@@ -163,12 +183,13 @@ function ConversationThreadTabs({
                   className={cn(
                     "min-w-0 flex-1 truncate px-2 py-2 text-left text-[13px]",
                     active ? "font-semibold text-ink" : "text-ink-secondary",
-                    busy && !active && "opacity-40",
+                    busy && !active && !onView && "opacity-40",
                   )}
                 >
                   <span className="block truncate">{task.title || "Untitled"}</span>
                   <span className="block truncate text-[10.5px] font-normal text-ink-secondary">
                     {formatTime(task.lastActivity ?? task.createdAt)}
+                    {viewed ? " · Viewing" : null}
                   </span>
                 </button>
               )}
@@ -264,6 +285,12 @@ export function ThreadTabs({ bot }: { bot: Bot }) {
         onRename={(threadId, title) => dispatch({ type: "renameTask", botId: bot.id, threadId, title })}
         onDelete={(threadId) => dispatch({ type: "deleteTask", botId: bot.id, threadId })}
         onMerge={(threadId, intoThreadId) => dispatch({ type: "mergeTasks", botId: bot.id, threadId, intoThreadId })}
+        viewedThreadId={
+          state.viewedThreadId && tasks.some((task) => task.threadId === state.viewedThreadId)
+            ? state.viewedThreadId
+            : null
+        }
+        onView={(threadId) => dispatch({ type: "viewThread", botId: bot.id, threadId })}
       />
       {context && (
         <TaskWorkspaceLabel

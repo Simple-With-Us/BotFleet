@@ -16,6 +16,7 @@ import {
   selectionWithMaxOutput,
 } from "@/lib/model-pick";
 import { ContextSection, EffortSection, MaxOutputSection } from "./ModelPicker";
+import { openCodeModelProbeSentence } from "@/lib/opencode-engine-status";
 
 export function modelSettingsAvailable(
   instance: InstanceInfo | undefined,
@@ -51,8 +52,14 @@ export function ModelSettings({
   const defaultEffort = showEffort ? selectionDefaultEffort(instance, selection) : undefined;
   const caps = selectionContextCaps(instance, selection);
   const windowTokens = instance?.models.options.find((option) => option.id === selection.model)?.contextWindow;
+  const engineProbeProblem = openCodeModelProbeSentence(instance);
   return (
     <div data-model-settings className="rounded-lg border border-hairline/40">
+      {engineProbeProblem && (
+        <p className="border-b border-hairline/40 px-3 py-2 text-[12px] leading-relaxed text-ink-secondary">
+          {engineProbeProblem}
+        </p>
+      )}
       <button
         type="button"
         aria-expanded={open}

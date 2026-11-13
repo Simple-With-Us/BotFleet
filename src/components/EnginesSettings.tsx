@@ -20,6 +20,7 @@ import {
   instanceAutonomousModeApplies,
 } from "../../shared/bypass-coverage";
 import { cn } from "@/lib/cn";
+import { openCodeModelProbeSentence } from "@/lib/opencode-engine-status";
 import { ConfirmDialog } from "./ConfirmDialog";
 import {
   ADD_ENGINE_DRIVERS,
@@ -36,6 +37,8 @@ interface ProbeResult {
   version?: string;
   message?: string;
 }
+
+const LOCAL_REPLY_WAIT_CHOICES = [5, 10, 20, 30, 60] as const;
 
 /** Default the toggle to ON when the persisted config never had the field
  * — the registry treats absent `enabled` as `true` and the UI must match. */
@@ -360,7 +363,7 @@ function AddModelForm({
   );
 }
 
-function EngineRow({
+export function EngineRow({
   instance,
   busyInstanceId,
   onPatch,
@@ -369,7 +372,7 @@ function EngineRow({
   instance: InstanceInfo;
   busyInstanceId: string | null;
   onPatch: (
-    patch: { cli?: string; fullAuto?: boolean; enabled?: boolean; models?: Array<{ id: string; label: string }> },
+    patch: { cli?: string; fullAuto?: boolean; enabled?: boolean; models?: Array<{ id: string; label: string }>; replyWaitMinutes?: number | null },
   ) => Promise<{ ok: boolean; error?: string }>;
   /** One line saying why this engine is not usable right now.  Rendered
    *  only where the panel knows the answer. */
@@ -389,6 +392,7 @@ function EngineRow({
   // because a separately-disabled wildcard cooldown on an otherwise available
   // engine is the wrong gate (we want settings, not quotas, to block the row).
   const enabled = isEngineEnabled(instance);
+  const catalogProbeProblem = openCodeModelProbeSentence(instance);
   const isBusy = busyInstanceId !== null;
   const isThisBusy = busyInstanceId === instance.instanceId;
   const hasCli = instance.cli !== undefined || instance.cliDefault !== undefined;
@@ -407,7 +411,7 @@ function EngineRow({
     wasOpenFor.current = instance.cli ?? null;
   }, [instance.cli]);
 
-  const patchWithLocalError = async (patch: { cli?: string; fullAuto?: boolean; enabled?: boolean; models?: Array<{ id: string; label: string }> }) => {
+  const patchWithLocalError = async (patch: { cli?: string; fullAuto?: boolean; enabled?: boolean; models?: Array<{ id: string; label: string }>; replyWaitMinutes?: number | null }) => {
     setError(null);
     const res = await onPatch(patch);
     if (!res.ok && res.error) {
@@ -505,6 +509,27 @@ function EngineRow({
             <span className={cn("truncate text-[11px]", enabled ? "text-ink-secondary" : "text-ink-secondary/60")} title={`${instance.cliDefault} · default`}>{instance.cliDefault} · default</span>
           )
         )}
+        {instance.localModelWaitAvailable && (
+          <label className="flex shrink-0 items-center gap-1.5 text-[11.5px] text-ink-secondary">
+            <span>Reply Wait</span>
+            <select
+              aria-label={`How long to wait for ${instance.displayName} to reply`}
+              title="How long to wait for the local model to reply before stopping the turn."
+              value={instance.replyWaitMinutes ?? ""}
+              disabled={isBusy || !enabled || deleting}
+              onChange={(event) => {
+                const value = event.target.value;
+                patchWithLocalError({ replyWaitMinutes: value ? Number(value) : null }).catch(() => undefined);
+              }}
+              className="rounded-md border border-hairline/60 bg-inset px-1.5 py-1 text-[11.5px] text-ink disabled:opacity-50"
+            >
+              <option value="">Default (3 min)</option>
+              {[...new Set([...LOCAL_REPLY_WAIT_CHOICES, ...(instance.replyWaitMinutes ? [instance.replyWaitMinutes] : [])])]
+                .sort((a, b) => a - b)
+                .map((minutes) => <option key={minutes} value={minutes}>{minutes} min</option>)}
+            </select>
+          </label>
+        )}
         <span className="flex-1" />
         {instance.cli && (
           <button
@@ -575,6 +600,9 @@ function EngineRow({
       </div>
       {reason && (
         <p className="mt-1 text-[11px] leading-relaxed text-ink-secondary/70">{reason}</p>
+      )}
+      {enabled && catalogProbeProblem && (
+        <p className="mt-1 text-[11px] leading-relaxed text-ink-secondary/70">{catalogProbeProblem}</p>
       )}
       {!instanceAutonomousModeApplies(instance.driverKind) && (
         <p className="mt-1 text-[11px] leading-relaxed text-ink-secondary/70">{INSTANCE_AUTONOMOUS_MODE_NO_OP_NOTE}</p>
@@ -970,7 +998,7 @@ export function EnginesSettings({ highlightClass }: { highlightClass?: (domId: s
   const handlePatch = useCallback(
     async (
       instanceId: string,
-      patch: { cli?: string; fullAuto?: boolean; enabled?: boolean; models?: Array<{ id: string; label: string }> },
+      patch: { cli?: string; fullAuto?: boolean; enabled?: boolean; models?: Array<{ id: string; label: string }>; replyWaitMinutes?: number | null },
     ): Promise<{ ok: boolean; error?: string }> => {
       setBusyInstanceId(instanceId);
       setGlobalError(null);

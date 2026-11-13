@@ -1,5 +1,7 @@
 # BotFleet On A Linux Server
 
+The BF-2600 [storage and resource scaffold](../../docs/rollouts/2026-10-30-linux-storage-scaffold.md) adds mount/device guards, volume-backed temporary paths and explicit resource/log-rotation inputs.  It is not installed by a code-only update.  Its private namespace keeps the volume busy until the service stops; live isolation and placement evidence remain unasserted.
+
 This directory deploys the BotFleet harness headless on a Linux host (the Hetzner box) as the `jay` user.  Every file the harness writes lives under one root on the `/mnt/fleet-extra` volume.  The only way in is a Tailscale serve URL that carries an owner credential.
 
 ## What Runs Where
@@ -17,9 +19,10 @@ The runtime root (`BF_ROOT`) holds everything the service writes:
 /mnt/fleet-extra/apps/botfleet-server/     BF_ROOT
 ├── home/      the service user's HOME: engine logins, caches, credentials
 ├── data/      OMB_DATA_DIR: harness state, workspaces, checkpoints
-├── logs/      server.log and owner-gate.log
+├── logs/      server.log and historical owner-gate.log (new gate logs use journal)
+├── bin/       installed startup/preflight helpers retained through code rollback
 ├── tmp/       TMPDIR
-├── config/    server.env and infisical-read-token
+├── config/    server.env, infisical-read-token and harness-infisical-token
 ├── workdir/   the systemd working directory
 └── node/      the private Node install (v24)
 
@@ -34,7 +37,7 @@ The harness binds loopback and treats every loopback caller as the owner.  That 
 - The gate rewrites `Host` to `127.0.0.1:8799` and strips the identity, forwarding, `sec-fetch-*` and Cloudflare edge headers, so the harness sees a plain loopback caller and nothing else.
 - `tailscale serve` is tailnet only.  Never enable Funnel: Funnel is public and adds no identity header, which would leave the gate with no owner check at all.
 - No port is exposed to the public internet, and nothing listens on a routable address.
-- The systemd sandbox (`ProtectSystem=strict`, `ProtectHome=read-only`, `ReadWritePaths=/mnt/fleet-extra`) makes every path read-only except the fleet volume, so a write outside `/mnt/fleet-extra` fails.
+- The unit templates configure ordinary root paths read-only and put application data and literal temporary paths on the volume.  `/run`, `/dev/shm` and live namespace behavior still need recipe 12's write attempts; configuration text alone proves no isolation.  Private volume propagation keeps the volume busy until both services stop.
 - Any local process on the host can still reach `127.0.0.1:8799` directly, the same as on the Mac today.  Only trusted users should have shell access on the host, and every bot shell runs as the service user.
 
 ## Where The Configuration Lives
@@ -53,7 +56,7 @@ At least one of `BOTFLEET_OWNER_LOGINS` and `BOTFLEET_SERVER_GATE_TOKEN` has to 
 
 ### The One Local Item: config/infisical-read-token
 
-Reading the vault needs a key, so the host keeps exactly one local file:
+Reading the vault needs a key, so the gate keeps one local file:
 
 ```
 /mnt/fleet-extra/apps/botfleet-server/config/infisical-read-token
@@ -65,6 +68,25 @@ Reading the vault needs a key, so the host keeps exactly one local file:
 
 ```sh
 sudo install -m 600 -o jay -g fleet /dev/null /mnt/fleet-extra/apps/botfleet-server/config/infisical-read-token && sudo -u jay bash -c 'IFS= read -rs t && printf %s "$t" > '/mnt/fleet-extra/apps/botfleet-server'/config/infisical-read-token'
+```
+
+The token is read from the terminal without echo and written straight into the file, so it never reaches argv or the shell history.
+
+### Harness vault token: config/harness-infisical-token
+
+A second local file, distinct from the gate's token above: the key the harness itself reads its vault secrets with.
+
+```
+/mnt/fleet-extra/apps/botfleet-server/config/harness-infisical-token
+```
+
+- A **read-only Infisical service token** (`st.…`), scoped to the BotFleet project, the `prod` environment and the folders the harness reads: the root path, plus `/zulip` when Zulip credentials come from the vault (`zulip.credentialSource: "infisical"`).  It grants reading those secrets and nothing else.
+- Mode `0600`, owned by the service user (`jay`), a regular file: `start.sh` refuses a symlink, a non-regular file, a foreign owner, or any group/other permission bits, prints one line naming the file and the reason, and starts the server without it.
+- `start.sh` loads it into `INFISICAL_TOKEN` only when the environment does not already set one; an `INFISICAL_TOKEN` already in the environment always wins.  The project itself comes from `INFISICAL_PROJECT_ID` in `config/server.env` (or the stored Settings); the token file carries only the token.
+- The file is optional and the installer never creates it: without it (and without `INFISICAL_TOKEN` in the environment) the harness simply has no vault to read.  Create it with:
+
+```sh
+sudo install -m 600 -o jay -g fleet /dev/null /mnt/fleet-extra/apps/botfleet-server/config/harness-infisical-token && sudo -u jay bash -c 'IFS= read -rs t && printf %s "$t" > '/mnt/fleet-extra/apps/botfleet-server'/config/harness-infisical-token'
 ```
 
 The token is read from the terminal without echo and written straight into the file, so it never reaches argv or the shell history.
@@ -96,6 +118,10 @@ The Mac has to be allowed to reach the server's HTTPS port (`8799`) in the tailn
 
 - `config/server.env`: the harness launch parameters (`OMB_*`).  These still live on the host and are tracked as a follow-up to move them into Infisical.
 - The engine CLIs' own login files under the service user's home.  Those belong to the CLIs, not to BotFleet.
+
+### V8 Heap Size
+
+`config/server.env` may set `BF_NODE_HEAP_MB` (default `6144`).  `start.sh` passes it to the harness as `--max-old-space-size`, so the V8 heap stays fixed instead of being derived from the unit's cgroup `memory.high`, which `fleet-coding-memory` lowers dynamically: a 1.3 GB ceiling once yielded a 256 MB heap and a boot-time "Reached heap limit" crash in `node:sqlite`.  The value has to be an integer from 512 to 65536; anything else fails the unit at start with exit 2.  It is a command-line flag rather than `NODE_OPTIONS` because Datadog's APM injector appends `--require` to `NODE_OPTIONS`.
 
 ## Install, Update, Uninstall
 
@@ -167,9 +193,13 @@ curl -fsS -H "Tailscale-User-Login: you@example.com" http://127.0.0.1:8798/__gat
 curl -fsS -H "x-botfleet-gate-token: $BOTFLEET_SERVER_GATE_TOKEN" http://127.0.0.1:8798/__gate/health
 systemctl status botfleet-server botfleet-owner-gate
 tail -f /mnt/fleet-extra/apps/botfleet-server/logs/server.log
+journalctl -u botfleet-owner-gate.service -f
+journalctl -u botfleet-server.service -n 100
 ```
 
 The harness health route is loopback only.  The gate health route answers without touching the harness, but it still requires an owner credential.
+
+New gate logs and startup preflight errors use the service journal; historical `owner-gate.log` files are kept.  Journald is host-managed and may consume root-disk space; no per-app journal quota or disk budget is established by this scaffold.
 
 ## Limits
 

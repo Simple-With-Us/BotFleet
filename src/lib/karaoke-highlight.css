@@ -3,25 +3,72 @@
  *
  * ::highlight() paints over existing glyphs and cannot change layout, which is
  * the point: no font-weight, padding or size here, so lines never re-wrap.
- * Only color and text-shadow are used.  The theme tokens already switch for
- * light, dark and every skin, so these rules need no theme variants.
+ * Bold is a text-shadow. The spoken word is the strongest. One or two words
+ * ahead lead a little, and two or three just spoken trail off. The theme
+ * tokens already switch for light, dark and every skin, so these rules need
+ * no theme variants.
  */
 
-/* Not yet spoken: the secondary ink every theme already defines. */
+/* Not yet spoken, past the lead: the secondary ink every theme already defines. */
 ::highlight(karaoke-ahead) {
   color: var(--color-ink-secondary);
 }
 
-/* Rolling in: the accent text color plus a hairline shadow on each side as
- * faux bold.  The shadow adds weight without changing glyph advances. */
+/* The whole current word. Accent ink, a light wash, and a faux bold. */
 ::highlight(karaoke-current) {
-  color: var(--color-accent-text);
+  color: color-mix(in srgb, var(--color-accent-text) 78%, var(--color-ink));
+  background-color: color-mix(in srgb, var(--color-accent-text) 16%, transparent);
   text-shadow:
-    0.02em 0 0 var(--color-accent-text),
-    -0.02em 0 0 var(--color-accent-text);
+    0.045em 0 0 currentColor,
+    -0.045em 0 0 currentColor,
+    0 0.02em 0 currentColor,
+    0 -0.012em 0 currentColor;
 }
 
-/* Just spoken: a softer accent for a moment, then back to normal ink. */
+/* Spoken letters rolling across that word. Same weight, full accent. */
+::highlight(karaoke-roll) {
+  color: var(--color-accent-text);
+  text-shadow:
+    0.045em 0 0 currentColor,
+    -0.045em 0 0 currentColor,
+    0 0.02em 0 currentColor,
+    0 -0.012em 0 currentColor;
+}
+
+/* The next word. */
+::highlight(karaoke-lead) {
+  color: color-mix(in srgb, var(--color-accent-text) 62%, var(--color-ink));
+  text-shadow:
+    0.028em 0 0 currentColor,
+    -0.028em 0 0 currentColor;
+}
+
+/* The word after that. */
+::highlight(karaoke-lead-far) {
+  color: color-mix(in srgb, var(--color-accent-text) 40%, var(--color-ink));
+  text-shadow:
+    0.016em 0 0 currentColor,
+    -0.016em 0 0 currentColor;
+}
+
+/* Just spoken, nearest first. */
 ::highlight(karaoke-trail) {
-  color: color-mix(in srgb, var(--color-accent-text) 55%, var(--color-ink));
+  color: color-mix(in srgb, var(--color-accent-text) 52%, var(--color-ink));
+  text-shadow:
+    0.026em 0 0 currentColor,
+    -0.026em 0 0 currentColor;
+}
+
+::highlight(karaoke-trail-mid) {
+  color: color-mix(in srgb, var(--color-accent-text) 34%, var(--color-ink));
+  text-shadow:
+    0.016em 0 0 currentColor,
+    -0.016em 0 0 currentColor;
+}
+
+::highlight(karaoke-trail-far) {
+  color: color-mix(in srgb, var(--color-accent-text) 18%, var(--color-ink));
+  text-shadow:
+    0.008em 0 0 currentColor,
+    -0.008em 0 0 currentColor;
 }

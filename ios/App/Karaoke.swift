@@ -17,9 +17,11 @@
 //   by the one `InlineMarkdown` that draws it, so a word moving repaints
 //   one paragraph, not the transcript.
 //
-// Only color and background change, never weight or size, so lines never
-// re-wrap and the transcript never jumps.  Reduce Motion steps whole words
-// with no sweep and no trail.
+// The spoken word is the peak of a short window: one or two words lead
+// ahead of it and two or three trail behind, easing off. Weight and size
+// never change, so lines never re-wrap and the transcript never jumps.
+// The bold is an overdraw in KaraokeEmphasisRenderer, on top of a color
+// ramp. Reduce Motion steps whole words, with no sweep, no lead and no trail.
 import AVFoundation
 import CompanionCore
 import QuartzCore
@@ -340,11 +342,25 @@ final class KaraokeBlockState {
         var out = base
         for trail in paint.trail {
             guard let range = range(trail.range, in: out) else { continue }
-            out[range].foregroundColor = KaraokeStyle.trail[min(trail.level, KaraokeStyle.trail.count - 1)]
+            let level = min(trail.level, KaraokeStyle.trail.count - 1)
+            out[range].foregroundColor = KaraokeStyle.trail[level]
+            out[range].emphasis = KaraokeEmphasis(step: KaraokeStyle.trailStep(level))
+        }
+        for lead in paint.lead {
+            guard let range = range(lead.range, in: out) else { continue }
+            let level = min(lead.level, KaraokeStyle.lead.count - 1)
+            out[range].foregroundColor = KaraokeStyle.lead[level]
+            out[range].emphasis = KaraokeEmphasis(step: KaraokeStyle.leadStep(level))
+        }
+        if let peak = paint.peak, let range = range(peak, in: out) {
+            out[range].foregroundColor = KaraokeStyle.rest
+            out[range].backgroundColor = KaraokeStyle.wash
+            out[range].emphasis = KaraokeEmphasis(step: 0)
         }
         if let lit = paint.lit, let range = range(lit, in: out) {
             out[range].foregroundColor = KaraokeStyle.lit
             out[range].backgroundColor = KaraokeStyle.wash
+            out[range].emphasis = KaraokeEmphasis(step: 0)
         }
         text = out
     }
@@ -361,14 +377,105 @@ final class KaraokeBlockState {
     }
 }
 
-/// The colors.  Color only: a weight or size change would re-wrap lines.
+/// The colors, and how heavy the faux bold is. A real weight or size change
+/// would re-wrap lines, so the bold is an overdraw keyed by `emphasis`.
 enum KaraokeStyle {
-    /// The part of the current word already spoken.
+    /// Spoken letters of the current word.
     static let lit = Color.accentColor
-    /// A light wash behind it, so the word reads as marked without a bold.
+    /// The rest of the current word: still clearly the one being said.
+    static let rest = Color.primary.mix(with: .accentColor, by: 0.78)
+    /// A light wash behind the current word.
     static let wash = Color.accentColor.opacity(0.16)
-    /// Words just spoken, fading from a softer accent back to normal ink.
-    static let trail: [Color] = [0.55, 0.35, 0.18].map { Color.primary.mix(with: .accentColor, by: $0) }
+    /// The next words, nearer first.
+    static let lead: [Color] = [0.58, 0.36].map { Color.primary.mix(with: .accentColor, by: $0) }
+    /// Words just spoken, nearer first.
+    static let trail: [Color] = [0.50, 0.32, 0.16].map { Color.primary.mix(with: .accentColor, by: $0) }
+
+    /// Horizontal overdraw as a fraction of the run's line height.
+    /// Step 0 is the spoken word. Higher steps ease off.
+    static func strokeScale(_ step: Int) -> CGFloat {
+        switch step {
+        case 0: return 0.030
+        case 1: return 0.018
+        case 2: return 0.011
+        default: return 0.006
+        }
+    }
+
+    static func leadStep(_ level: Int) -> Int { min(level, 1) + 1 }
+
+    static func trailStep(_ level: Int) -> Int { min(level, 2) + 1 }
+}
+
+/// Marks a run for KaraokeEmphasisRenderer. The value is not a font, so it
+/// does not change advances or line breaks.
+struct KaraokeEmphasis: Hashable, Sendable, TextAttribute {
+    var step: Int
+}
+
+struct KaraokeEmphasisAttribute: AttributedStringKey {
+    typealias Value = KaraokeEmphasis
+    static let name = "app.botfleet.karaoke.emphasis"
+}
+
+extension AttributeScopes {
+    struct KaraokeAttributes: AttributeScope {
+        let emphasis: KaraokeEmphasisAttribute
+    }
+}
+
+extension AttributeDynamicLookup {
+    subscript<T: AttributedStringKey>(dynamicMember keyPath: KeyPath<AttributeScopes.KaraokeAttributes, T>) -> T {
+        self[T.self]
+    }
+}
+
+/// Passes the emphasis mark through to Text, and keeps the attributes
+/// markdown already uses so a bold or a link does not change width when
+/// karaoke starts.
+struct KaraokeTextFormatting: AttributedTextFormattingDefinition {
+    struct Scope: AttributeScope {
+        let foundation: AttributeScopes.FoundationAttributes
+        let swiftUI: AttributeScopes.SwiftUIAttributes
+        let emphasis: KaraokeEmphasisAttribute
+    }
+
+    var body: some AttributedTextFormattingDefinition<Scope> {}
+}
+
+/// Draws the emphasized runs a second time, a fraction of a point to each
+/// side. The layout is the text's own, so the transcript does not jump.
+private struct KaraokeEmphasisRenderer: TextRenderer {
+    func draw(layout: Text.Layout, in context: inout GraphicsContext) {
+        for line in layout {
+            for run in line {
+                if let mark = run[KaraokeEmphasis.self] {
+                    let dx = run.typographicBounds.rect.height * KaraokeStyle.strokeScale(mark.step)
+                    if dx > 0.05 {
+                        for shift in shifts(step: mark.step, dx: dx) {
+                            var copy = context
+                            copy.translateBy(x: shift.x, y: shift.y)
+                            copy.draw(run)
+                        }
+                    }
+                }
+                context.draw(run)
+            }
+        }
+    }
+
+    private func shifts(step: Int, dx: CGFloat) -> [CGPoint] {
+        if step == 0 {
+            let dy = dx * 0.45
+            return [
+                CGPoint(x: dx, y: 0),
+                CGPoint(x: -dx, y: 0),
+                CGPoint(x: 0, y: dy),
+                CGPoint(x: 0, y: -dy * 0.5),
+            ]
+        }
+        return [CGPoint(x: dx, y: 0), CGPoint(x: -dx, y: 0)]
+    }
 }
 
 /// A display link that runs while its owner has something to animate.
@@ -431,8 +538,15 @@ struct InlineMarkdown: View {
     @Environment(\.messageKaraoke) private var karaoke
     @Environment(\.markdownBlockIndex) private var blockIndex
 
-    var body: Text {
+    var body: some View {
         let attributed = karaoke?.block(blockIndex, markdown: text)?.text ?? Markdown.inlineAttributed(text)
-        return Text(attributed) + caret
+        let line = Text(attributed) + caret
+        if attributed.runs.contains(where: { $0.emphasis != nil }) {
+            line
+                .attributedTextFormattingDefinition(KaraokeTextFormatting())
+                .textRenderer(KaraokeEmphasisRenderer())
+        } else {
+            line
+        }
     }
 }

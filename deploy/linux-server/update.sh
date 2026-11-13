@@ -54,7 +54,8 @@ run as_user git -C "$BF_CODE" checkout --detach "origin/$BF_REF"
 note "now at $(as_user git -C "$BF_CODE" rev-parse --short HEAD)"
 
 say "installing dependencies and building the UI"
-run as_user sh -c "cd '$BF_CODE' && pnpm install --frozen-lockfile --store-dir '$PNPM_STORE_DIR'"
+# The root compiler rewrites dependency exports; cached installs need independent copies and lifecycle execution.
+run as_user sh -c "cd '$BF_CODE' && pnpm install --frozen-lockfile --force --package-import-method=copy --config.optimistic-repeat-install=false --store-dir '$PNPM_STORE_DIR'"
 run as_user sh -c "cd '$BF_CODE' && pnpm exec vite build"
 
 say "restarting the harness and the owner gate"

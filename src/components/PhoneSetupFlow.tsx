@@ -94,11 +94,11 @@ export type CompanionBridge = {
 type AccountBridge = NonNullable<NonNullable<Window["ogb"]>["companionAccount"]>;
 type StateBridge<T> = { state: () => Promise<T> };
 const DIRECT_PAIRING_UNAVAILABLE =
-  "Direct Wi-Fi pairing isn’t available on this computer right now.  Connect this computer to Wi-Fi, then try again.";
+  "Direct Wi-Fi pairing isn’t available on this computer right now.\u00A0 Connect this computer to Wi-Fi, then try again.";
 const TAILSCALE_PAIRING_UNAVAILABLE =
-  "Tailscale pairing isn’t available right now.  Make sure Tailscale is connected and MagicDNS is on.";
+  "Tailscale pairing isn’t available right now.\u00A0 Make sure Tailscale is connected and MagicDNS is on.";
 const PROTECTED_PAIRING_UNAVAILABLE =
-  "The HTTPS pairing route became unavailable.  Check secure access, then create a new code.";
+  "The secure pairing route became unavailable.\u00A0 Check secure access, then create a new code.";
 
 interface OwnedCompanionPairingRoutePin extends CompanionPairingRoutePin {
   generation: number;
@@ -705,7 +705,7 @@ export function usePhoneSetupController(profileEmail = ""): PhoneSetupController
         : PROTECTED_PAIRING_UNAVAILABLE;
     setError(tokenMatches
       ? routeError
-      : "The pairing code changed before setup finished.  Create a new code and try again.");
+      : "The pairing code changed before setup finished.\u00A0 Create a new code and try again.");
     dispatchFlow({ type: "reset" });
 
     if (tokenMatches && companion) {
@@ -942,15 +942,15 @@ export function PhoneSetupFlowView({
                 {c.state?.devices.length ? "Pair Another Phone" : "Pair a Phone"}
               </h2>
               <p className="mt-1 text-[13px] leading-relaxed text-ink-secondary">
-                Select a route below to create an instant pairing QR code for your iPhone.
+                Choose how this phone should connect.{'\u00A0 '}Then scan the code on your iPhone.
               </p>
             </div>
             <button
               onClick={c.start}
               disabled={!c.state || c.busy || c.accountBusy}
-              className="rounded-lg bg-accent px-3.5 py-2 text-[13px] font-medium text-white hover:opacity-90 disabled:cursor-wait disabled:opacity-40"
+              className="min-h-11 rounded-lg bg-accent px-3.5 py-2 text-[13px] font-medium text-white hover:opacity-90 disabled:cursor-wait disabled:opacity-40"
             >
-              {c.state?.devices.length ? "Pair (Auto Select)" : "Pair a Phone"}
+              {c.state?.devices.length ? "Pair Another Phone" : "Pair a Phone"}
             </button>
           </div>
 
@@ -972,16 +972,16 @@ export function PhoneSetupFlowView({
                   </span>
                 </div>
                 <div className="mt-2 truncate font-mono text-[11.5px] text-ink-secondary" title={tailscaleHost ?? "Not connected"}>
-                  {tailscaleHost ?? "Tailnet not detected"}
+                  {tailscaleHost ?? "Not connected"}
                 </div>
                 <p className="mt-1 text-[11.5px] leading-relaxed text-ink-secondary">
-                  Direct private mesh.  Best when your phone is signed in to Tailscale.
+                  A private network.{'\u00A0 '}Best when your phone is also signed in to Tailscale.
                 </p>
               </div>
               <button
                 onClick={c.useTailscale}
                 disabled={!c.tailscaleAvailable || c.busy || c.accountBusy}
-                className="mt-3 w-full rounded-lg border border-hairline/50 bg-control/60 py-1.5 text-[12px] font-medium text-ink hover:bg-control disabled:opacity-40"
+                className="mt-3 min-h-11 w-full rounded-lg border border-hairline/50 bg-control/60 py-2 text-[12px] font-medium text-ink hover:bg-control disabled:opacity-40"
               >
                 Pair over Tailscale
               </button>
@@ -1000,11 +1000,11 @@ export function PhoneSetupFlowView({
                       c.hostedReady ? "bg-success/15 text-success" : "bg-control text-ink-secondary"
                     }`}
                   >
-                    {c.hostedReady ? "Ready" : "Port 8810"}
+                    {c.hostedReady ? "Ready" : "Not Set Up"}
                   </span>
                 </div>
-                <div className="mt-2 truncate font-mono text-[11.5px] text-ink-secondary" title={hostedHost ?? "Cloudflare Tunnel (port 8810)"}>
-                  {hostedHost ?? "Cloudflare Tunnel (8810)"}
+                <div className="mt-2 truncate font-mono text-[11.5px] text-ink-secondary" title={hostedHost ?? "Not set up on this computer"}>
+                  {hostedHost ?? "Not set up on this computer"}
                 </div>
                 <p className="mt-1 text-[11.5px] leading-relaxed text-ink-secondary">
                   Works away from home on cellular or travel Wi-Fi without VPN.
@@ -1013,7 +1013,7 @@ export function PhoneSetupFlowView({
               <button
                 onClick={c.start}
                 disabled={!c.state || c.busy || c.accountBusy}
-                className="mt-3 w-full rounded-lg bg-accent/90 py-1.5 text-[12px] font-medium text-white hover:bg-accent disabled:opacity-40"
+                className="mt-3 min-h-11 w-full rounded-lg bg-accent/90 py-2 text-[12px] font-medium text-white hover:bg-accent disabled:opacity-40"
               >
                 Pair via Gateway
               </button>
@@ -1032,20 +1032,20 @@ export function PhoneSetupFlowView({
                       lanHost ? "bg-success/15 text-success" : "bg-control text-ink-secondary"
                     }`}
                   >
-                    {lanHost ? "Available" : "No LAN"}
+                    {lanHost ? "Available" : "Offline"}
                   </span>
                 </div>
-                <div className="mt-2 truncate font-mono text-[11.5px] text-ink-secondary" title={lanHost ?? "Not connected"}>
-                  {lanHost ?? "No local IP"}
+                <div className="mt-2 truncate font-mono text-[11.5px] text-ink-secondary" title={lanHost ?? "Not on Wi-Fi"}>
+                  {lanHost ?? "Not on Wi-Fi"}
                 </div>
                 <p className="mt-1 text-[11.5px] leading-relaxed text-ink-secondary">
-                  Direct LAN connection when both devices are on the same local network.
+                  Same Wi-Fi.{'\u00A0 '}Both devices need to be on your home network.
                 </p>
               </div>
               <button
                 onClick={c.useLocal}
                 disabled={!lanHost || c.busy || c.accountBusy}
-                className="mt-3 w-full rounded-lg border border-hairline/50 bg-control/60 py-1.5 text-[12px] font-medium text-ink hover:bg-control disabled:opacity-40"
+                className="mt-3 min-h-11 w-full rounded-lg border border-hairline/50 bg-control/60 py-2 text-[12px] font-medium text-ink hover:bg-control disabled:opacity-40"
               >
                 Pair on Wi-Fi
               </button>
@@ -1082,7 +1082,7 @@ export function PhoneSetupFlowView({
                 c.skip();
                 onSkip?.();
               }}
-              className="mt-2.5 text-[12.5px] text-ink-secondary hover:text-ink"
+              className="mt-2.5 inline-flex min-h-11 items-center justify-center px-3 text-[13px] text-ink-secondary hover:text-ink"
             >
               Not Now
             </button>
@@ -1104,32 +1104,32 @@ export function PhoneSetupFlowView({
     const failed = c.account?.status === "error" || c.setupTimedOut;
     return (
       <div className="mx-auto flex w-full max-w-[430px] flex-col">
-        <button onClick={c.cancel} className="mb-4 flex w-fit items-center gap-1.5 text-[12px] text-ink-secondary hover:text-ink">
-          <ArrowLeft size={13} /> Back
+        <button onClick={c.cancel} className="mb-4 inline-flex min-h-11 w-fit items-center gap-1.5 px-1 text-[13px] text-ink-secondary hover:text-ink">
+          <ArrowLeft size={16} /> Back
         </button>
         <div className="flex size-11 items-center justify-center rounded-xl bg-accent/12 text-accent">
           <Mail size={20} />
         </div>
         <h2 className="mt-3 text-[18px] font-semibold text-ink">
           {unconfigured
-            ? "Pair on your own network"
+            ? "Pair on Your Own Network"
             : unavailable || failed
-              ? "Secure access needs attention"
-              : "Sign in to pair securely"}
+              ? "Secure Access Needs Attention"
+              : "Sign In to Pair Securely"}
         </h2>
         <p
           role={c.setupTimedOut ? "alert" : undefined}
           className="mt-1 text-[13px] leading-relaxed text-ink-secondary"
         >
           {unconfigured
-            ? "Secure online access is not configured in this build.\u00a0 Pair directly on the same Wi-Fi, or over Tailscale when both devices share a tailnet."
+            ? "Secure online access is not configured in this build.\u00a0 Pair directly on the same Wi-Fi, or over Tailscale when both devices share a network."
             : unavailable
-            ? "Online phone access is not available right now. You can still pair directly on the same Wi-Fi."
+            ? "Online phone access is not available right now.\u00a0 You can still pair directly on the same Wi-Fi."
             : c.setupTimedOut
-              ? "Secure access is taking longer than expected. You can try again or pair directly on this Wi-Fi."
-            : failed
+              ? "Secure access is taking longer than expected.\u00a0 You can try again or pair directly on this Wi-Fi."
+              : failed
               ? c.account?.message ?? "We could not finish creating your private connection."
-              : "We’ll email you a one-time code. No password needed."}
+              : "We’ll email you a one-time code.\u00a0 No password needed."}
         </p>
 
         {!unavailable && !failed && (
@@ -1213,7 +1213,7 @@ export function PhoneSetupFlowView({
               <ShieldCheck size={15} /> Pair over Tailscale
             </button>
             <p className="mt-2 text-center text-[11px] leading-relaxed text-ink-secondary">
-              Your iPhone must be signed in to the same tailnet.
+              Your iPhone must be signed in to the same Tailscale network.
             </p>
           </>
         )}
@@ -1239,22 +1239,22 @@ export function PhoneSetupFlowView({
         </div>
         <h2 className="mt-4 text-[18px] font-semibold text-ink">
           {c.localFallback
-            ? "Preparing your pairing code"
+            ? "Preparing Your Pairing Code"
             : c.tailscaleFallback
-              ? "Preparing Tailscale pairing"
-              : "Creating secure phone access"}
+              ? "Preparing Tailscale Pairing"
+              : "Creating Secure Phone Access"}
         </h2>
         <p className="mt-1.5 max-w-[360px] text-[13px] leading-relaxed text-ink-secondary">
           {c.localFallback
             ? "This should only take a moment."
             : c.tailscaleFallback
-              ? "Your pairing code will use your private tailnet connection."
+              ? "Your pairing code will use your private Tailscale connection."
             : "We’re giving this computer a private connection that works even when your phone is away from this Wi-Fi."}
         </p>
         {(c.error || c.accountError) && (
           <p role="alert" className="mt-3 max-w-[380px] text-[12.5px] text-danger">{c.error ?? c.accountError}</p>
         )}
-        <button onClick={c.cancel} className="mt-5 text-[12px] text-ink-secondary hover:text-ink">Cancel</button>
+        <button onClick={c.cancel} className="mt-5 inline-flex min-h-11 items-center justify-center px-3 text-[13px] text-ink-secondary hover:text-ink">Cancel</button>
       </div>
     );
   }
@@ -1265,7 +1265,7 @@ export function PhoneSetupFlowView({
         <div className="flex size-14 items-center justify-center rounded-full bg-success/15 text-success">
           <Check size={28} />
         </div>
-        <h2 className="mt-4 text-[19px] font-semibold text-ink">Your phone is ready</h2>
+        <h2 className="mt-4 text-[19px] font-semibold text-ink">Your Phone Is Ready</h2>
         <p className="mt-1.5 text-[13px] text-ink-secondary">
           It can now open chats, answer approvals, and send new work.
         </p>

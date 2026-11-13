@@ -18,11 +18,13 @@ import { homedir } from "node:os";
 
 import { z } from "zod";
 
+import { createFirstReplyLedger } from "./first-reply-ledger.ts";
 import { PROVIDER_CREDENTIAL_ENV, WORKSPACE_CREDENTIAL_ENV } from "../../config.ts";
 import { cliProbeEnvironment } from "../../cli-probe-env.ts";
 import { decodeInjectId } from "../local-inject.ts";
 import { toolFields } from "../../tool-fields.ts";
 import { describeResult } from "../../../shared/tool-activity.ts";
+import { reconcileLifecycleToolOk } from "../../../shared/lifecycle-tool.ts";
 import { capturePreparedBoth, capturePreparedInput, prepareInput, textSignature } from "../../../shared/item-io.ts";
 import {
   classifyVersionProbeFailure,
@@ -81,9 +83,11 @@ import type {
   ProviderErrorCode,
 } from "../../contracts.ts";
 import { newEventId, newId } from "../../contracts.ts";
-import { applyLaunchIdentity } from "../../launch-identity.ts";
+import { cliLoginEnvironment, launchedChildEnvironment, primeCliLogin } from "../../cli-logins.ts";
 import { hostToolPrefix, turnComputerMounts } from "../../computer-grants.ts";
 import { augmentedPath } from "../../env-path.ts";
+
+const MAX_SETTLED_TOOL_CALLS_PER_PROMPT = 1_024;
 
 // Resolved from the server root, never relative to this file: bundling inlines
 // this module two directories up, so the `".."` pair here would climb past the
@@ -362,6 +366,17 @@ export interface AcpSupport {
   classifyError?(error: unknown): ProviderErrorCode | undefined;
   /** Compose the session/prompt text. Default prepends the persona. */
   buildPromptText?(turn: SendTurnInput): string;
+  /** Text put in front of the budgeted prompt, after budgeting, so it never
+   *  changes which system sections the budget sees.  `newSession` is true for
+   *  the turn whose `session/new` opens the native session, which is the one
+   *  message an engine titles a session from, and for each later turn of a
+   *  session this process opened until the agent has answered a prompt on it
+   *  (a first prompt that failed or went unanswered leaves a saved cursor on a
+   *  session that never carried the marker).  A resumed session that has
+   *  answered a prompt, and any session from before this process started, get
+   *  `newSession: false`.  Return nothing for no prefix.  Never called for a
+   *  command turn. */
+  promptPrefix?(turn: SendTurnInput, context: { newSession: boolean }): string | undefined;
   /** Rewrite a picker id (`omlx::model`) into the CLI-native id before spawn
    * and session/select. Local inject writers live here so the child sees a
    * model it already knows. */
@@ -848,6 +863,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
        *  bigger budget).  An LRU past SUMMARY_CACHE_MAX_THREADS:  the driver
        *  lives as long as the harness, and one note per thread forever is a
        *  leak. */
+      const firstReplyLedger = createFirstReplyLedger(instanceId);
       const summaryCacheByThread = new Map<string, { summary: string; coveredTurns: number }>();
       const rememberSummary = (threadId: string, entry: { summary: string; coveredTurns: number }) => {
         if (summaryCacheByThread.has(threadId)) summaryCacheByThread.delete(threadId);
@@ -947,6 +963,12 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         const toolPolicy = turn.toolPolicy;
         const turnConfig: AcpConfig =
           (controlsHost || turn.holdForReview === true || toolPolicy) && config.fullAuto ? { ...config, fullAuto: false } : config;
+        // The seat's CLI login is read in the BACKGROUND, and the read is
+        // started here, before the guard:  the guard and the registration
+        // that follows it have to stay free of `await`, or a second turn on
+        // this thread would walk through the guard the first one already
+        // passed.
+        primeCliLogin(turn.launchIdentity?.seat);
         if (active.has(threadId)) throw new Error("a turn is already running on this thread");
         const turnId = newId();
         // Carried across a relaunch (see maybeRetry): `attempt` is how many
@@ -1071,7 +1093,11 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           };
           // Last, over the instance's env and a wrapper's additions alike:
           // the launch identity is this bot's and this turn's.
-          launchEnv = applyLaunchIdentity(spawned.env ? { ...env, ...spawned.env } : env, turn.launchIdentity);
+          launchEnv = launchedChildEnvironment(
+            spawned.env ? { ...env, ...spawned.env } : env,
+            turn.launchIdentity,
+            cliLoginEnvironment(turn.launchIdentity?.seat),
+          );
           child = spawnCli(spawned.cli, spawned.args, {
             cwd,
             env: launchEnv,
@@ -1134,6 +1160,18 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         // fingerprint is held (never the text, which can be a whole file), and
         // it is dropped as the call ends.
         const toolInputs = new Map<string, string>();
+        const toolTitles = new Map<string, string>();
+        // Adapters may repeat a terminal update after an initially terminal
+        // tool_call. Keep bounded IDs for this prompt so duplicates cannot
+        // create a second completion row.
+        const settledToolCalls = new Set<string>();
+        const rememberSettledToolCall = (toolCallId: string) => {
+          settledToolCalls.add(toolCallId);
+          if (settledToolCalls.size > MAX_SETTLED_TOOL_CALLS_PER_PROMPT) {
+            const oldest = settledToolCalls.values().next().value;
+            if (oldest !== undefined) settledToolCalls.delete(oldest);
+          }
+        };
         let nextId = 1;
         let sessionId: string | null = null;
         let interruptTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1689,14 +1727,22 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               state.sawOutput = true;
               const bypassedBy = gate?.bypassed(u);
               if (bypassedBy) return tripAllowlist(bypassedBy);
+              const isTerminal = u.status === "completed" || u.status === "failed";
+              const parsedToolCallId = z.string().max(256).safeParse(u.toolCallId);
+              const toolCallId = parsedToolCallId.success ? parsedToolCallId.data : undefined;
+              if (toolCallId !== undefined && settledToolCalls.has(toolCallId)) break;
               // prepared once: the same text is filed with the event and
               // fingerprinted for the update that may follow
               const announced = "rawInput" in u ? prepareInput(u.rawInput) : undefined;
-              const parsedToolCallId = z.string().max(256).safeParse(u.toolCallId);
-              const toolCallId = parsedToolCallId.success ? parsedToolCallId.data : undefined;
               if (toolCallId !== undefined) {
-                openToolCalls.add(toolCallId);
-                if (announced !== undefined) toolInputs.set(toolCallId, textSignature(announced.text));
+                if (isTerminal) {
+                  openToolCalls.delete(toolCallId);
+                  toolInputs.delete(toolCallId);
+                  toolTitles.delete(toolCallId);
+                } else {
+                  openToolCalls.add(toolCallId);
+                  if (announced !== undefined) toolInputs.set(toolCallId, textSignature(announced.text));
+                }
               }
               flushAssistantText();
               const parsedTitle = z.string().max(256).safeParse(u.title);
@@ -1709,12 +1755,14 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               // title.  Folding all of it into one 80-char title was what left
               // the transcript showing `read_file` seven times with no paths;
               // the name and the thing it acted on are separate columns now.
+              const startedTitle = String(titleText ?? commandText ?? "tool").slice(0, 80);
+              if (toolCallId !== undefined) toolTitles.set(toolCallId, startedTitle);
               emit({
                 ...base(threadId, turnId),
                 type: "item.started",
                 itemType: "tool",
                 itemId: toolCallId,
-                title: String(titleText ?? commandText ?? "tool").slice(0, 80),
+                title: startedTitle,
                 ...toolFields(titleText ?? commandText, u.rawInput, {
                   hint: kindText,
                   locations: u.locations,
@@ -1722,6 +1770,23 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 }),
                 ...capturePreparedInput(announced),
               });
+              if (isTerminal) {
+                const output = u.content ?? u.rawOutput;
+                const parsedTerminalTitle = z.string().max(256).safeParse(u.title);
+                const terminalTitle = parsedTerminalTitle.success ? parsedTerminalTitle.data : titleText;
+                const detail = describeResult(output);
+                emit({
+                  ...base(threadId, turnId),
+                  type: "item.completed",
+                  itemType: "tool",
+                  itemId: toolCallId,
+                  ok: reconcileLifecycleToolOk(u.status === "completed", terminalTitle, detail),
+                  detail,
+                  title: parsedTerminalTitle.success ? parsedTerminalTitle.data : undefined,
+                  ...capturePreparedBoth(undefined, output),
+                });
+                if (toolCallId !== undefined) rememberSettledToolCall(toolCallId);
+              }
               break;
             }
             case "tool_call_update": {
@@ -1731,22 +1796,31 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               // at any status: take it when it is new text for this call.
               const parsedToolCallId = z.string().max(256).safeParse(u.toolCallId);
               const toolCallId = parsedToolCallId.success ? parsedToolCallId.data : undefined;
+              if (toolCallId !== undefined && settledToolCalls.has(toolCallId)) break;
               const settled = toolCallId !== undefined && "rawInput" in u ? prepareInput(u.rawInput) : undefined;
               const settledSignature = settled === undefined ? undefined : textSignature(settled.text);
               const newInput = settled !== undefined && toolCallId !== undefined && toolInputs.get(toolCallId) !== settledSignature ? settled : undefined;
               if (newInput !== undefined && settledSignature !== undefined && toolCallId !== undefined) toolInputs.set(toolCallId, settledSignature);
               if (u.status === "completed" || u.status === "failed") {
+                const parsedTerminalTitle = z.string().max(256).safeParse(u.title);
+                const terminalTitle = parsedTerminalTitle.success ? parsedTerminalTitle.data : undefined;
+                const lifecycleTitle = terminalTitle
+                  ?? (toolCallId !== undefined ? toolTitles.get(toolCallId) : undefined);
                 if (toolCallId !== undefined) {
                   openToolCalls.delete(toolCallId);
                   toolInputs.delete(toolCallId);
+                  toolTitles.delete(toolCallId);
+                  rememberSettledToolCall(toolCallId);
                 }
+                const detail = describeResult(u.content ?? u.rawOutput);
                 emit({
                   ...base(threadId, turnId),
                   type: "item.completed",
                   itemType: "tool",
                   itemId: toolCallId,
-                  ok: u.status !== "failed",
-                  detail: describeResult(u.content ?? u.rawOutput),
+                  ok: reconcileLifecycleToolOk(u.status !== "failed", lifecycleTitle, detail),
+                  detail,
+                  title: parsedTerminalTitle.success ? parsedTerminalTitle.data : undefined,
                   ...capturePreparedBoth(newInput, u.content ?? u.rawOutput),
                 });
               } else if (newInput !== undefined) {
@@ -1777,6 +1851,11 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             // on `turnUsage` above.
             case "usage_update": {
               const used = u.used;
+              // `size` is the model's context window, so `used / size` is the
+              // occupancy; carried on the live event only when it is sane.
+              const size = u.size;
+              // Number.isFinite is false for every non-number, so no typeof is needed.
+              const contextWindow = Number.isFinite(size) && Number(size) > 0 ? Math.trunc(Number(size)) : undefined;
               if (typeof used === "number" && Number.isFinite(used)) {
                 // Spread, not a literal `output: turnUsage?.output` — that
                 // would always create the key (value undefined when
@@ -1788,12 +1867,15 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                   input: Math.max(0, Math.trunc(used)),
                   ...(turnUsage?.output != null ? { output: turnUsage.output } : {}),
                 };
-                emit({
+                const usageEvent: Extract<RuntimeEvent, { type: "thread.token-usage.updated" }> = {
                   ...base(threadId, turnId),
                   type: "thread.token-usage.updated",
                   input: turnUsage.input,
                   ...(turnUsage.output != null ? { output: turnUsage.output } : {}),
-                });
+                };
+                // Set after the literal so the key is absent, not undefined, when unknown.
+                if (contextWindow !== undefined) usageEvent.contextWindow = contextWindow;
+                emit(usageEvent);
               }
               break;
             }
@@ -1969,6 +2051,11 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             let sessionResult: any = null;
             let sessionModelsState: z.infer<typeof acpSessionResultModels> | undefined;
             let fallbackNotice: string | undefined;
+            // True when this turn created the native session (session/new), false
+            // when it resumed one.  Read by `support.promptPrefix`.
+            let openedNewSession = false;
+            // The session id recorded as awaiting its first reply this turn.
+            let markerRecordedFor: string | null = null;
             // The harness replay, when a poisoned saved session forces a
             // fresh one (BF-2447): recoveryText carries the conversation so
             // the new session is not blank (Sentry review on #1272).
@@ -2072,6 +2159,12 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               sessionModelsState = parsedSessionResult.success ? parsedSessionResult.data.models : undefined;
               sessionId = typeof sessionResult?.sessionId === "string" ? sessionResult.sessionId : null;
               if (!sessionId) throw new Error("session/new returned no sessionId");
+              openedNewSession = true;
+              // session.started below persists the resume cursor before the
+              // prompt goes out.  Record the pending marker first, so a setup
+              // failure or crash between the two still leaves the first
+              // identification owed on the next turn for this cursor.
+              if (support.promptPrefix !== undefined) firstReplyLedger.record(sessionId);
             }
             let selectedModel: string | null = null;
             let sessionStarted = false;
@@ -2341,12 +2434,26 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               // is never budgeted, so there is nothing to trim or refuse.
               text = engineCommandText(turn.command);
             } else {
-              const budgetBytes = resolveAcpPromptBudget({
+              // Applied after budgeting (below), so its bytes are taken out of
+              // the budget here instead of being added past the ceiling.
+              const markerOwed = openedNewSession || (support.promptPrefix !== undefined && sessionId !== null && firstReplyLedger.owed(sessionId));
+              const promptPrefix = support.promptPrefix?.(promptTurn, { newSession: markerOwed }) ?? "";
+              if (promptPrefix && markerOwed && sessionId) {
+                // Recorded before the prompt goes out: if it fails or is never
+                // answered, the next turn on this cursor owes the marker again.
+                firstReplyLedger.record(sessionId);
+                markerRecordedFor = sessionId;
+              }
+              const unreservedBudgetBytes = resolveAcpPromptBudget({
                 configuredBytes: turnConfig.promptBudgetBytes,
                 capTokens: turn.contextCapTokens ?? turnConfig.contextCapTokens,
                 model: resolvedModel ?? turn.model,
                 composed,
               }).bytes;
+              const budgetBytes =
+                unreservedBudgetBytes === null
+                  ? null
+                  : Math.max(1, unreservedBudgetBytes - Buffer.byteLength(promptPrefix));  // never 0: zero means unbounded
               // The per-bot turn cap arrives unvalidated (a stored value out of
               // range is honored nowhere else):  decode it at the driver
               // boundary so an out-of-range value reads as absent, the same
@@ -2503,7 +2610,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 retry.compressionBody = trim.text;
                 announceCompression(trim.preview, trim.bytesSaved, trim.text);
               }
-              text = neutralizeLeadingSlash(budgeted.text);
+              text = neutralizeLeadingSlash(promptPrefix + budgeted.text);
               captureTurnPrompt(threadId, turnId, text);
             }
             const result = await request(
@@ -2515,6 +2622,8 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               turnConfig.promptTimeoutMs ?? DEFAULT_PROMPT_MAX_MS,
               turnConfig.promptIdleMs ?? DEFAULT_PROMPT_IDLE_MS,
             );
+            // The agent answered, so this session has had its first prompt.
+            if (markerRecordedFor) firstReplyLedger.answered(markerRecordedFor);
             // opencode 1.18.18 reports usage at the result root; grok and
             // gemini put it under _meta. Read both rather than lose the count.
             const usage = result?.usage ?? result?._meta ?? {};

@@ -516,6 +516,13 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
     },
     defaultModels: [
       { id: "gemini-3.8-flash-high", display: "Gemini 3.8 Flash (High)", ctxTokens: 1_000_000 },
+      { id: "gemini-4-hydrogen-xhigh", display: "Gemini 4 Hydrogen (XHigh)", ctxTokens: 1_000_000 },
+      { id: "gemini-4-hydrogen-high", display: "Gemini 4 Hydrogen (High)", ctxTokens: 1_000_000 },
+      { id: "gemini-4-hydrogen-medium", display: "Gemini 4 Hydrogen (Medium)", ctxTokens: 1_000_000 },
+      { id: "gemini-4-hydrogen-low", display: "Gemini 4 Hydrogen (Low)", ctxTokens: 1_000_000 },
+      { id: "gemini-4-argon-high", display: "Gemini 4 Argon (High)", ctxTokens: 1_000_000 },
+      { id: "gemini-4-argon-medium", display: "Gemini 4 Argon (Medium)", ctxTokens: 1_000_000 },
+      { id: "gemini-4-argon-low", display: "Gemini 4 Argon (Low)", ctxTokens: 1_000_000 },
       { id: "gemini-3.1-pro-high", display: "Gemini 3.1 Pro (High)", ctxTokens: 1_000_000 },
       { id: "gemini-3.1-pro-low", display: "Gemini 3.1 Pro (Low)", ctxTokens: 1_000_000 },
       { id: "gemini-3.8-flash-medium", display: "Gemini 3.8 Flash (Medium)", ctxTokens: 1_000_000 },
@@ -856,6 +863,71 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       { id: "kimi-code/k3-256k", display: "Kimi K3 256K" },
       { id: "kimi-code/kimi-for-coding", display: "Kimi for Coding" },
       { id: "kimi-code/kimi-for-coding-highspeed", display: "Kimi for Coding Highspeed" },
+    ],
+  },
+
+  zcode: {
+    id: "zcode",
+    displayName: "ZCode",
+    capabilityBadgeColor: "bg-indigo-700 text-white",
+    group: "Cloud",
+    pricing: {
+      kind: "subscription",
+      subscription: {
+        // The plan tiers are account-side; the quota endpoint names the
+        // active one as "GLM Coding <Level>".  costPerMonth is null so the
+        // pricing chip does not invent a billed amount.
+        tierLabel: "GLM Coding Plan",
+        costPerMonth: null,
+        includedQuota: "Rolling 5-hour and weekly token windows plus a monthly MCP-call window, reported by the plan quota endpoint",
+        notes:
+          "GLM Coding Plan subscription.  BotFleet does not register a separate z.ai API rate for this engine.  Source:  https://z.ai/subscribe",
+      },
+    },
+    capabilities: {
+      files: "yes",
+      terminal: "yes",
+      thisComputer: "yes",
+      imageAttachments: "yes",
+      connectedApps: "yes",
+      crossBotCoordination: "yes",
+      roomCoordination: "yes",
+      computerUse: "yes",
+      voiceChat: "no",
+      webAccess: "yes",
+      longContext: "yes",
+      liveResearch: "no",
+    },
+    capabilityNotes: {
+      thisComputer:
+        "ZCode ACP turns run on the zcode-acp-server bridge, which mounts BotFleet's local computer channel; a bot on this engine reaches the host desktop under the standard approval cards.  The headless CLI driver mounts nothing.",
+      imageAttachments:
+        "ZCode ACP turns carry image and PDF attachments natively (the bridge stages embedded resources for the backend); the headless CLI driver takes text prompts only.",
+      connectedApps:
+        "The ZCode ACP driver mounts the Connected Apps via Composio bridge alongside the team and computer channels.  The headless CLI driver declares no MCP wiring, so BotFleet's servers are not mounted for it.",
+      crossBotCoordination:
+        "The ZCode ACP driver mounts BotFleet's team tools, so a ZCode bot can delegate work to peers and answer when asked; the headless CLI driver does not.",
+      roomCoordination: "The ZCode ACP driver mounts the room channel with the team tools; the headless CLI driver does not.",
+      computerUse:
+        "The ZCode ACP driver mounts BotFleet's screen channel so a bot can inspect and drive a desktop under the standard approval cards; the headless CLI driver declares no host-control wiring.",
+      webAccess:
+        "The ZCode CLI registers WebSearch as a core read-only tool (apps/zcode-cli/packages/core/src/tool/scheduler.ts, implemented in tool/handlers/websearch.ts), and both drivers run it:  the ACP bridge drives the official app-server with the full tool set, and the headless driver's --disallowed-tools removes only the ask tools.",
+      longContext:
+        "GLM-5.3 documents a 1M-token context window and is the default model on both drivers.  Source:  https://docs.z.ai/guides/llm/glm-5.3 (fetched 2026-11-03).",
+      liveResearch:
+        "The CLI's modes are build, edit, plan, yolo, and guarded; there is no dedicated multi-step research pass, only single-shot WebSearch.",
+    },
+    whyThisEngine: {
+      headline: "Z.ai's GLM Coding Plan agent — over ACP or headless.",
+      prose: [
+        "BotFleet drives ZCode two ways.  The ACP engine speaks the Agent Client Protocol to the zcode-acp-server bridge, which runs the official zcode app-server:  BotFleet's team, computer, screen and Connected Apps channels mount, image and PDF attachments ride along, sessions resume, and the model and thought level switch per turn.",
+        "The headless driver spawns the zcode CLI one prompt per turn, NDJSON events back, resume by session id, with no MCP wiring \u2014 files, terminal and web search inside the CLI's own workspace.",
+        "Turns ride the GLM Coding Plan behind the Mac's own ZCode sign-in, so a reported cost is notional.",
+      ],
+    },
+    defaultModels: [
+      { id: "GLM-5.3", display: "GLM-5.3" },
+      { id: "GLM-5.3-Flash", display: "GLM-5.3 Flash" },
     ],
   },
 
@@ -1297,6 +1369,7 @@ export const ENGINE_DISPLAY_ORDER: string[] = [
   "mcode",
   "muse",
   "kimi",
+  "zcode",
   "droid",
   "opencode",
   "qwen",
@@ -1333,6 +1406,7 @@ export function engineAccessLabel(entry: EngineCapabilityEntry): string {
     case "mcode":
     case "muse":
     case "kimi":
+    case "zcode":
     case "droid":
     case "opencode":
     case "qwen":
@@ -1368,6 +1442,11 @@ export function engineIdFromDriverKind(driverKind: string | undefined | null): s
   // from Go to OpenCode.  The registry id follows the product name, so the
   // kind needs spelling out here.
   if (normalized === "opencodego") return "opencode";
+  // The ZCode ACP bridge driver rides the same engine row as the headless
+  // CLI (the grok pair precedent): one row, notes name which driver mounts
+  // what. `zcodeAcp` normalizes to `zcodeacp`, which matches nothing without
+  // this alias.
+  if (normalized === "zcodeacp") return "zcode";
   // antigravity / cursor / claude / codex / grok / deepseek all collapse
   // to their registry id after the Agent suffix strip.
   if (ENGINE_CAPABILITIES[normalized]) return normalized;

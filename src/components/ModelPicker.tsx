@@ -38,10 +38,13 @@ import type { EffortLevel } from "../../server/contracts.ts";
 import { ProviderMark } from "./ProviderIcons";
 import { EngineQuotasPanel } from "./EngineQuotasPanel";
 import { EngineSetup, needsCli, needsSignIn } from "./EngineSetup";
+import { openCodeEngineStatusChip, openCodeModelProbeSentence } from "@/lib/opencode-engine-status";
 import { isCheckingEngine, isHiddenEngine } from "@/lib/engine-status";
+import { formatWindowPairLabel } from "@/lib/quota-display";
 import { EngineGroupLabel } from "./EngineGroupLabel";
 import { EngineCallout } from "./EngineCallout";
 import { cn } from "@/lib/cn";
+import { modelControlLabel } from "@/lib/chat-accessibility";
 import { COMPACT_SQUARE } from "@/lib/compact-chip";
 import {
   latestRows,
@@ -406,11 +409,13 @@ export function engineStatus(instance: InstanceInfo): string {
   const modelCaps = Object.values(instance.snapshot.quota?.models ?? {});
   if (modelCaps.some((row) => row.capped)) return "Partial quota";
   if (instance.snapshot.reason === "Disabled in settings") return "Disabled";
+  const openCodeChip = openCodeEngineStatusChip(instance);
   // The last probe gave no answer: a slow Mac, not a missing CLI or a
   // sign-out.  Never "Not installed" or "Sign-in required" for it.
-  if (isCheckingEngine(instance)) return "Checking";
+  if (isCheckingEngine(instance)) return openCodeChip ?? "Checking";
   if (needsCli(instance)) return isCliMissing(instance) ? "Not installed" : "Unavailable";
-  if (needsSignIn(instance)) return "Sign-in required";
+  if (needsSignIn(instance)) return openCodeChip ?? "Sign-in required";
+  if (openCodeModelProbeSentence(instance)) return openCodeChip ?? "Needs attention";
   return instance.snapshot.version ?? "Ready";
 }
 
@@ -892,6 +897,11 @@ export function ModelPicker({
     else if (id.includes("hermes")) activeDriverKind = "hermesAgent";
   }
 
+  const modelAriaLabel = modelControlLabel(
+    active ? selectionChipLabel(active, selection, { showLatest: contained }) : selection.model,
+    savedStatus.badge ?? undefined,
+  );
+
   const trigger = (
     <button
       type="button"
@@ -905,6 +915,7 @@ export function ModelPicker({
       }}
       aria-expanded={open}
       aria-haspopup="dialog"
+      aria-label={modelAriaLabel}
       className={cn(
         "flex max-w-full items-center gap-1.5 border border-hairline/40 bg-control/60 py-1 pl-2 pr-2.5 text-[13px] text-ink hover:bg-raised-hover",
         // The contained trigger now sits on its own line under the label, so
@@ -939,6 +950,7 @@ export function ModelPicker({
       )}
       <ChevronDown
         size={14}
+        aria-hidden="true"
         className={cn(
           "text-ink-secondary transition-transform",
           open && "rotate-180",
@@ -1195,7 +1207,7 @@ export function ModelPicker({
                               onClick={() => setShowAll(true)}
                               className="mt-1 flex w-full items-center justify-between rounded-lg border-t border-hairline/40 px-2.5 py-2 text-[12.5px] font-medium text-ink-secondary hover:bg-control/60 hover:text-ink"
                             >
-                              Show all {official.length} models{windowsLabel ? ` (${windowsLabel})` : ""} <ChevronDown size={13} />
+                              Show all {official.length} models{windowsLabel ? ` (${formatWindowPairLabel(windowsLabel)})` : ""} <ChevronDown size={13} aria-hidden="true" />
                             </button>
                           )}
                           {!query && showAll && official.length > COMPACT_MODEL_COUNT && (

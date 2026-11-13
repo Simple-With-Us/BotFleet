@@ -1995,6 +1995,28 @@ export function containerComputerMcp(
   };
 }
 
+/** Display text a person may paste into a shell.  A word carrying whitespace
+ * or a shell metacharacter (the git credential helper, `!gh auth git-credential`)
+ * is quoted rather than left to be split or history-expanded.  A backslash or
+ * `~` alone is left bare: those are ordinary in a Windows path, which has
+ * always been printed as-is here.  POSIX shells get single quotes with the `'\\''`
+ * escape; cmd.exe ignores single quotes, so win32 gets the double-quote form
+ * with `""` doubling. */
+export function shellWord(word: string, platform: NodeJS.Platform = process.platform): string {
+  if (word === "") return platform === "win32" ? '""' : "''";
+  // Bracket pairs glob in POSIX shells; cmd.exe additionally expands %VAR%
+  // inside double quotes and treats ^ as its escape character.
+  const trigger = platform === "win32"
+    ? /[\s!"'`$&;|<>()*?{}#[\]^%]/
+    : /[\s!"'`$&;|<>()*?{}#[\]]/;
+  if (!trigger.test(word)) return word;
+  // A trailing backslash run would escape the closing quote under the
+  // Windows argv parser, so the run is doubled before the quote is added.
+  return platform === "win32"
+    ? `"${word.replace(/"/g, '""').replace(/(\\+)$/, "$1$1")}"`
+    : `'${word.replace(/'/g, `'\\''`)}'`;
+}
+
 /** Commands shown as a transparent fallback. Normal setup builds the pinned
  * derivative through the API, so users do not need to author a Dockerfile. */
 export function setupCommands(
@@ -2031,14 +2053,7 @@ export function setupCommands(
       view: target.viewerPort ? `http://127.0.0.1:${target.viewerPort}/vnc.html` : "",
     };
   }
-  // Display text a person may paste into a shell, so an argument with whitespace
-  // or a shell metacharacter (the git credential helper, `!gh auth git-credential`)
-  // is single-quoted rather than left to be split or history-expanded.  A
-  // backslash or `~` alone is left bare: those are ordinary in a Windows path,
-  // which has always been printed as-is here.
-  const shellWord = (word: string) =>
-    /[\s!"'`$&;|<>()*?{}#]/.test(word) ? `'${word.replace(/'/g, `'\\''`)}'` : word;
-  const command = (args: string[]) => [runtime, ...args].map(shellWord).join(" ");
+  const command = (args: string[]) => [runtime, ...args].map((arg) => shellWord(arg, platform)).join(" ");
   return {
     install,
     runtimeStart,

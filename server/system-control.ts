@@ -52,12 +52,27 @@ export function reserveSystemShutdown(options: {
   activeWorkCount(): number;
   /** The kinds of work in flight, for a refusal the owner can act on. */
   blockingWork?(): BlockingWork[];
+  /** When the caller can stop the work in flight itself, the count is not a
+   *  refusal but the work its graceful stop has to settle.  Without it the
+   *  refusal stands, which is the safe default:  the count is a refusal
+   *  whenever the caller cannot say what would happen to the work. */
+  canStopGracefully?(): boolean;
+  /** The message the owner reads when the work in flight is a refusal.
+   *
+   *  The default counts the work and names its kinds.  A caller that knows
+   *  more than a count (a graceful stop knows which kinds it can carry
+   *  across the restart and which it cannot) passes its own wording, so the
+   *  refusal says why the server stays up rather than that something is
+   *  busy. */
+  refusal?(): string;
   fence(): void;
   unfence(): void;
 }): ShutdownReservation {
   options.guard();
   const count = options.activeWorkCount();
-  if (count > 0) throw new ControlConflict(shutdownRefusal(count, options.blockingWork?.()));
+  if (count > 0 && !options.canStopGracefully?.()) {
+    throw new ControlConflict(options.refusal ? options.refusal() : shutdownRefusal(count, options.blockingWork?.()));
+  }
   options.fence();
   let released = false;
   return { release() {

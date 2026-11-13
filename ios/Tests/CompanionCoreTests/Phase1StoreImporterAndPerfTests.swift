@@ -554,8 +554,12 @@ struct Phase1StoreImporterAndPerfTests {
         // Nothing was dropped, so there is no receipt gap to report.
         #expect(report.warnings.contains { $0.contains("routine request receipt") } == false)
 
-        // The manual snooze has no native column either, and says so.
-        #expect(report.warnings.contains { $0.contains("bot snooze") })
+        // The manual snooze is migrated into the native bots table (BF-2651).
+        let bots = try await db.loadBots()
+        let snoozedBot = bots.first { $0.id == "bot-1" }
+        #expect(snoozedBot?.snoozedUntil == 1_700_000_900)
+        #expect(report.warnings.contains { $0.contains("bot snooze") } == false)
+        #expect(report.isFullyVerified == true)
     }
 
     // MARK: - Review Fix: a cross-thread message id fails the import in the importer's own words
@@ -804,6 +808,12 @@ struct Phase1StoreImporterAndPerfTests {
         let report = try await MacPerformanceHarness.runFullSuite(
             messageCount: 1_000,
             walInsertCount: 10_000,
+            // The surface-sync sweep is measured at a smaller transcript here
+            // so the suite does not pay for a 50,000-message transcript it
+            // does not judge.  The metric is reported and not gated in the
+            // test runner, so the shape it runs at changes nothing but the
+            // time the suite takes.
+            surfaceSyncTranscriptSizes: [1_000, 5_000],
             context: .testRunner
         )
         #expect(report.fts5StemmingVerified == true)
@@ -828,10 +838,11 @@ struct Phase1StoreImporterAndPerfTests {
             "Idle memory footprint": 80.0,
             "Idle CPU usage": 0.1,
             "5-bot streaming memory": 150.0,
-            "100 tok/s streaming CPU": 6.0,
+            "100 tok/s streaming CPU (per bot)": 6.0,
             "CUA 60fps memory drift": 10.0,
             "FTS5 search latency (p95)": 10.0,
-            "SQLite WAL size after checkpoint": 64.0
+            "SQLite WAL size after checkpoint": 64.0,
+            "Badge/menubar surface sync": 10.0
         ]
         #expect(MacPerformanceBudget.maxColdStartMs == 50.0)
         #expect(Double(MacPerformanceBudget.maxIdleMemoryBytes) / (1024.0 * 1024.0) == 80.0)
@@ -841,6 +852,7 @@ struct Phase1StoreImporterAndPerfTests {
         #expect(Double(MacPerformanceBudget.maxCuaMemoryDriftBytes) / (1024.0 * 1024.0) == 10.0)
         #expect(MacPerformanceBudget.maxFts5P95LatencyMs == 10.0)
         #expect(Double(MacPerformanceBudget.maxWalSizeBytes) / (1024.0 * 1024.0) == 64.0)
+        #expect(MacPerformanceBudget.maxSurfaceSyncMs == 10.0)
 
         // The harness also prints the FTS5 latency including the caller's round
         // trip, and the pooled percentile over every raw sample.  Both are
@@ -890,7 +902,8 @@ struct Phase1StoreImporterAndPerfTests {
         // carry their product budget, and still say why they are not gated.
         let wallClockNames: Set<String> = [
             "Cold start time",
-            "FTS5 search latency (p95)"
+            "FTS5 search latency (p95)",
+            "Badge/menubar surface sync"
         ]
         for metric in report.metrics where wallClockNames.contains(metric.name) {
             #expect(metric.enforced == false)
@@ -903,6 +916,296 @@ struct Phase1StoreImporterAndPerfTests {
         let summary = report.formattedSummary()
         #expect(summary.contains("[PASS] Visual design contract:"))
         #expect(summary.contains("[PENDING] App visual surface:"))
+    }
+
+    @Test("The badge/menubar surface-sync budget still fails a regression, and the tail stays visible")
+    func surfaceSyncBudgetStillFailsAndCarriesTheTail() async throws {
+        // The badge, the menubar and the sidebar row answer "is anything
+        // waiting?" by scanning the thread for a pending card, so the scan is
+        // the thing the budget is about.  A rebuild over the budget has to
+        // fail, or the gate could not catch the regression it exists for.
+        let breach = MacPerformanceHarness.surfaceSyncMetric(measuredMs: 12.0, context: .standalone)
+        #expect(breach.passed == false)
+        #expect(breach.enforced == true)
+        #expect(breach.name == "Badge/menubar surface sync")
+        #expect(breach.specBudgetLimit == 10.0)
+
+        let within = MacPerformanceHarness.surfaceSyncMetric(measuredMs: 1.0, context: .standalone)
+        #expect(within.passed == true)
+        #expect(within.enforced == true)
+
+        // A duration measured inside the test runner describes the runner, so
+        // the budget is reported there and enforced by the standalone
+        // executable, which is where CI runs it.
+        let inTestRunner = MacPerformanceHarness.surfaceSyncMetric(measuredMs: 1.0, context: .testRunner)
+        #expect(inTestRunner.enforced == false)
+        #expect(inTestRunner.reportNote != nil)
+        #expect(inTestRunner.specBudgetLimit == 10.0)
+
+        // The measurement itself has to describe the surfaces rather than a
+        // private copy of their logic, so the harness builds a real state and
+        // reads the real summaries off it.
+        let report = try await MacPerformanceHarness.runFullSuite(
+            messageCount: 200,
+            walInsertCount: 100,
+            surfaceSyncTranscriptSizes: [500],
+            surfaceSyncRepeats: 2,
+            context: .testRunner
+        )
+        let surfaceSync = try #require(
+            report.metrics.first { $0.name == "Badge/menubar surface sync" },
+            "The harness did not report the badge/menubar surface sync metric."
+        )
+        #expect(surfaceSync.measuredValue.isFinite == true)
+        #expect(surfaceSync.measuredValue >= 0)
+        #expect(surfaceSync.unit == "ms")
+        #expect(surfaceSync.specBudgetLimit == MacPerformanceBudget.maxSurfaceSyncMs)
+        // The note carries the whole curve, because a budget that hides the
+        // tail is how a linear scan passes a gate and still stalls the app.
+        #expect(surfaceSync.reportNote?.contains("500 msgs") == true)
+    }
+
+    @Test("The badge/menubar surface-sync sweep refuses an impossible configuration instead of trapping")
+    func surfaceSyncSweepRefusesImpossibleConfiguration() async throws {
+        // A zero-repeat sweep leaves the sample array empty, so the median
+        // index would run off the end of it.  The suite has to reject the
+        // configuration it cannot measure, not crash on it.
+        await #expect(throws: MacPerformanceHarnessError.invalidSurfaceSyncConfiguration) {
+            try await MacPerformanceHarness.runFullSuite(
+                messageCount: 50,
+                walInsertCount: 50,
+                surfaceSyncTranscriptSizes: [200],
+                surfaceSyncRepeats: 0,
+                context: .testRunner
+            )
+        }
+
+        // A sweep with no transcript size has nothing to report, and a
+        // negative size is not a message count at all.
+        await #expect(throws: MacPerformanceHarnessError.missingSurfaceSyncMeasurement) {
+            try await MacPerformanceHarness.runFullSuite(
+                messageCount: 50,
+                walInsertCount: 50,
+                surfaceSyncTranscriptSizes: [],
+                surfaceSyncRepeats: 2,
+                context: .testRunner
+            )
+        }
+
+        await #expect(throws: MacPerformanceHarnessError.invalidSurfaceSyncConfiguration) {
+            try await MacPerformanceHarness.runFullSuite(
+                messageCount: 50,
+                walInsertCount: 50,
+                surfaceSyncTranscriptSizes: [-1],
+                surfaceSyncRepeats: 2,
+                context: .testRunner
+            )
+        }
+    }
+
+    @Test("The active streaming CPU budget is measured over the streaming second and still catches a regression")
+    func streamingCpuBudgetIsMeasuredOverTheStreamingSecond() async throws {
+        // The shape the P-BF-6 budget is written against: five bots, one
+        // hundred tokens each, at one hundred tokens per second, so one
+        // window covers exactly one simulated second of streaming.
+        let shape = MacStreamingCpuShape.product
+        #expect(shape.botCount == 5)
+        #expect(shape.tokensPerBot == 100)
+        #expect(shape.tokensPerSecond == 100)
+        #expect(shape.repeats == 3)
+        #expect(shape.simulatedSeconds == 1.0)
+
+        // The budget's own arithmetic: the CPU a window costs over the
+        // simulated second it covers.  A window that costs more than 6% of
+        // one core breaches the 6% budget and one that costs less passes,
+        // so the budget still fails a regression that makes streaming
+        // expensive.
+        let atBudget = MacPerformanceHarness.streamingCpuPercent(cpuSeconds: 0.060, simulatedSeconds: 1.0)
+        #expect(abs(atBudget - 6.0) < 0.0001)
+        #expect(atBudget <= MacPerformanceBudget.maxStreamingCpuPercent)
+        let overBudget = MacPerformanceHarness.streamingCpuPercent(cpuSeconds: 0.0601, simulatedSeconds: 1.0)
+        #expect(overBudget > MacPerformanceBudget.maxStreamingCpuPercent)
+        let underBudget = MacPerformanceHarness.streamingCpuPercent(cpuSeconds: 0.010, simulatedSeconds: 1.0)
+        #expect(underBudget < MacPerformanceBudget.maxStreamingCpuPercent)
+
+        // A window that covers no simulated time cannot be converted, and it
+        // must not turn into an infinite percentage that passes or fails at
+        // random.
+        #expect(MacPerformanceHarness.streamingCpuPercent(cpuSeconds: 0.060, simulatedSeconds: 0) == 0)
+
+        // The budget is written for one bot, so a measurement of several bots
+        // is divided by the bot count.  Five bots that cost 1.2% of a core
+        // each cost six percent in total, and each bot meets the six percent
+        // per-bot budget, so the reported number has to be the per-bot cost.
+        let fiveBotsAtOnePointTwo = MacPerformanceHarness.streamingCpuPercent(
+            cpuSeconds: 0.06,
+            simulatedSeconds: 1.0,
+            botCount: 5
+        )
+        #expect(abs(fiveBotsAtOnePointTwo - 1.2) < 0.0001)
+        #expect(fiveBotsAtOnePointTwo <= MacPerformanceBudget.maxStreamingCpuPercent)
+
+        // The gate's own verdict.  A window that costs more than 6% of one
+        // core over its simulated second fails the budget, and the same
+        // metric built from a cheap window passes, so the budget is still
+        // able to fail a regression.  The window that breaches it is the
+        // per-bot cost multiplied by the bot count, because the metric
+        // divides the measured CPU by the bot count.
+        let breach = MacPerformanceHarness.streamingCpuMetric(
+            cpuSeconds: 0.0601 * Double(shape.botCount),
+            shape: shape,
+            context: .standalone
+        )
+        #expect(breach.passed == false)
+        #expect(breach.enforced == true)
+        #expect(breach.name == "100 tok/s streaming CPU (per bot)")
+        #expect(breach.specBudgetLimit == 6.0)
+        #expect(abs(breach.measuredValue - 6.01) < 0.0001)
+        let within = MacPerformanceHarness.streamingCpuMetric(
+            cpuSeconds: 0.010 * Double(shape.botCount),
+            shape: shape,
+            context: .standalone
+        )
+        #expect(within.passed == true)
+        #expect(within.enforced == true)
+
+        // The measurement itself.  The concurrency pool is warmed before the
+        // measured windows, so the one-time cost of starting the process's
+        // threads is not charged to streaming, and the reported number is
+        // the median of the windows rather than one sample.
+        let smallShape = MacStreamingCpuShape(botCount: 2, tokensPerBot: 4, tokensPerSecond: 40, repeats: 2)
+        let measurement = try await MacPerformanceHarness.measureStreamingCpu(shape: smallShape)
+        #expect(measurement.samples.count == smallShape.repeats)
+        #expect(measurement.simulatedSeconds == smallShape.simulatedSeconds)
+        #expect(measurement.cpuPercent.isFinite == true)
+
+        // The reported number is the median of the windows, divided by the
+        // simulated second and not by the wall clock the host took.  The
+        // conversion takes no wall-clock input at all, so a host that
+        // finishes the window slowly cannot move the number.  The sample
+        // count is even here, so the median is the average of the two middle
+        // windows rather than the upper one, which would be the largest
+        // sample and would let one noisy window decide the gate.
+        let ordered = measurement.samples.sorted()
+        let median = (ordered[ordered.count / 2 - 1] + ordered[ordered.count / 2]) / 2.0
+        #expect(abs(measurement.medianCpuSeconds - median) < 0.000000001)
+        #expect(measurement.medianCpuSeconds >= ordered[ordered.count / 2 - 1] - 0.000000001)
+        #expect(measurement.medianCpuSeconds <= ordered[ordered.count / 2] + 0.000000001)
+        let expected = MacPerformanceHarness.streamingCpuPercent(
+            cpuSeconds: median,
+            simulatedSeconds: smallShape.simulatedSeconds,
+            botCount: smallShape.botCount
+        )
+        #expect(abs(measurement.cpuPercent - expected) < 0.000001)
+    }
+
+    @Test("The idle CPU metric is the median of several quiet windows, so one noisy window cannot decide the gate")
+    func idleCpuMetricIsTheMedianOfSeveralQuietWindows() async throws {
+        // The idle CPU budget is a fraction of one percent, so it is a
+        // fraction of a millisecond of CPU, and one window on a shared
+        // runner decides the verdict by itself.  The metric is the median
+        // of several quiet windows, like every other budgeted metric here.
+        #expect(MacPerformanceHarness.idleCpuWindowCount >= 3)
+        #expect(MacPerformanceHarness.idleCpuWindowNanoseconds == 500_000_000)
+
+        // An even count has no middle sample, so the two middle ones are
+        // averaged and the reported number is never the largest sample.
+        #expect(MacPerformanceHarness.median(of: [1.0, 2.0]) == 1.5)
+        #expect(MacPerformanceHarness.median(of: [1.0, 2.0, 3.0]) == 2.0)
+        #expect(MacPerformanceHarness.median(of: []) == nil)
+
+        // One window that caught a scheduler hiccup does not move the
+        // median, and a process that burns CPU in every window still does.
+        #expect(MacPerformanceHarness.median(of: [0.01, 0.02, 9.0, 0.02, 0.01]) == 0.02)
+        #expect(MacPerformanceHarness.median(of: [0.11, 0.11, 0.12, 0.11, 0.11]) == 0.11)
+
+        // The gate's own verdict.  The budget is unchanged, so a process
+        // that idles above it still fails, and the metric says how it was
+        // produced.
+        let noisy = MacPerformanceHarness.idleCpuMetric(
+            samples: [0.01, 0.02, 9.0, 0.02, 0.01],
+            context: .standalone
+        )
+        #expect(noisy.name == "Idle CPU usage")
+        #expect(noisy.measuredValue == 0.02)
+        #expect(noisy.specBudgetLimit == 0.1)
+        #expect(noisy.passed == true)
+        #expect(noisy.enforced == true)
+        #expect(noisy.reportNote?.contains("median") == true)
+
+        let idle = MacPerformanceHarness.idleCpuMetric(
+            samples: [0.11, 0.11, 0.12, 0.11, 0.11],
+            context: .standalone
+        )
+        #expect(idle.measuredValue == 0.11)
+        #expect(idle.passed == false)
+        #expect(idle.enforced == true)
+
+        // No window at all is a missing measurement, not a perfect one:  the
+        // metric fails and says so, so absent data can never pass the gate.
+        let missing = MacPerformanceHarness.idleCpuMetric(
+            samples: [],
+            context: .standalone
+        )
+        #expect(missing.passed == false)
+        #expect(missing.enforced == true)
+        #expect(missing.reportNote?.contains("no idle window could be measured") == true)
+
+        // The note says how many windows the median actually came from, so a
+        // caller that passes its own count is not credited with the default.
+        let three = MacPerformanceHarness.idleCpuMetric(
+            samples: [0.01, 0.02, 0.03],
+            context: .standalone
+        )
+        #expect(three.reportNote?.contains("the median of 3 quiet windows") == true)
+
+        // The windows are measured back to back, and each one is a share
+        // of a core, so every sample is a finite share of a core.
+        let samples = try await MacPerformanceHarness.measureIdleCpuSamples(
+            windows: 3,
+            windowNanoseconds: 20_000_000
+        )
+        #expect(samples.count == 3)
+        #expect(samples.allSatisfy { $0 >= 0 && $0.isFinite })
+    }
+
+    @Test("A shape with impossible counts is held at one bot instead of trapping")
+    func streamingCpuShapeHoldsImpossibleCounts() async throws {
+        // A negative count would build a Range whose lower bound is above its
+        // upper bound, and Swift's Range initializer traps on that, so the
+        // harness would die instead of producing a measurement.  A count of
+        // zero would be worse than a crash, because it would measure nothing
+        // and report a clean pass, which is a gate that cannot fail.
+        let shape = MacStreamingCpuShape(botCount: -3, tokensPerBot: 0, tokensPerSecond: -1, repeats: 0)
+        #expect(shape.botCount == 1)
+        #expect(shape.tokensPerBot == 1)
+        #expect(shape.tokensPerSecond == 1)
+        #expect(shape.repeats == 1)
+        #expect(shape.simulatedSeconds == 1.0)
+
+        // The measurement runs on the held shape, so the whole path is safe
+        // and a measurement is still produced.
+        let measurement = try await MacPerformanceHarness.measureStreamingCpu(shape: shape)
+        #expect(measurement.samples.count == 1)
+        #expect(measurement.cpuPercent.isFinite == true)
+    }
+
+    @Test("The streaming memory delta is measured from the footprint before the warm-up window")
+    func streamingCpuMemoryDeltaSpansTheWarmUp() async throws {
+        let shape = MacStreamingCpuShape(botCount: 2, tokensPerBot: 4, tokensPerSecond: 40, repeats: 2)
+        let measurement = try await MacPerformanceHarness.measureStreamingCpu(shape: shape)
+
+        // The baseline is the footprint from before the warm-up window ran,
+        // and the delta runs from that baseline to the footprint after the
+        // first measured window.  Measuring from the post-warm-up footprint
+        // would report about nothing, and the streaming memory budget could
+        // no longer fail however much the streaming load retained.
+        #expect(measurement.memoryBaselineBytes > 0)
+        #expect(measurement.memoryAfterBytes > 0)
+        let expected = measurement.memoryAfterBytes > measurement.memoryBaselineBytes
+            ? measurement.memoryAfterBytes - measurement.memoryBaselineBytes
+            : 0
+        #expect(measurement.memoryDeltaBytes == expected)
     }
 
     // MARK: - Visual parity against the legacy source and the app (BF-2496)
@@ -968,6 +1271,43 @@ struct Phase1StoreImporterAndPerfTests {
         return palette
     }
 
+    /// TV-Face manifest resolutions parsed from src/components/tv-face/manifest.ts.
+    private static func legacyTvFaceManifest(in source: String) throws -> [String: String] {
+        guard let start = source.range(of: "export const TVFACE_MANIFEST"),
+              let end = source.range(of: "};", range: start.lowerBound..<source.endIndex) else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        let block = String(source[start.lowerBound..<end.lowerBound])
+        let regex = try NSRegularExpression(pattern: "([a-z-]+):\\s*\"([a-z_]+)\"")
+        let nsRange = NSRange(block.startIndex..<block.endIndex, in: block)
+        var manifest: [String: String] = [:]
+        for match in regex.matches(in: block, range: nsRange) {
+            guard let stateRange = Range(match.range(at: 1), in: block),
+                  let exprRange = Range(match.range(at: 2), in: block) else { continue }
+            manifest[String(block[stateRange])] = String(block[exprRange])
+        }
+        return manifest
+    }
+
+    /// CursorAvatar alias map from src/lib/mascot.ts (GROK_ACTION remaps only).
+    private static func legacyCursorAvatarAliases(in source: String) throws -> [String: String] {
+        guard let start = source.range(of: "export function mapBotStateToCursorState"),
+              let mapStart = source.range(of: "const map:", range: start.lowerBound..<source.endIndex),
+              let end = source.range(of: "};", range: mapStart.lowerBound..<source.endIndex) else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        let block = String(source[mapStart.lowerBound..<end.lowerBound])
+        let regex = try NSRegularExpression(pattern: "([a-z-]+):\\s*\"([a-z-]+)\"")
+        let nsRange = NSRange(block.startIndex..<block.endIndex, in: block)
+        var aliases: [String: String] = [:]
+        for match in regex.matches(in: block, range: nsRange) {
+            guard let keyRange = Range(match.range(at: 1), in: block),
+                  let valueRange = Range(match.range(at: 2), in: block) else { continue }
+            aliases[String(block[keyRange])] = String(block[valueRange])
+        }
+        return aliases
+    }
+
     @Test("The visual design contract carries the legacy mascot vocabulary and palette")
     func visualDesignContractMatchesTheLegacySource() throws {
         let repoRoot = Self.repoRoot()
@@ -978,8 +1318,8 @@ struct Phase1StoreImporterAndPerfTests {
         let legacyStates = try Self.legacyMascotStates(in: source)
         let legacyPalette = try Self.legacyMascotPalette(in: source)
 
-        #expect(legacyStates.count == 50)
-        #expect(legacyPalette.count == 10)
+        #expect(legacyStates.count == 51)
+        #expect(legacyPalette.count == 12)
 
         // The native contract is the legacy vocabulary, verbatim.
         #expect(Set(MacMascotExpression.allCases.map(\.rawValue)) == Set(legacyStates))
@@ -994,6 +1334,16 @@ struct Phase1StoreImporterAndPerfTests {
         // against the pinned snapshot, so dropping an expression breaks it.
         let drifted = MacMascotExpression.allCases.dropLast()
         #expect(Set(drifted.map(\.rawValue)) != MacVisualParityExpectations.mascotExpressions)
+
+        let manifestSource = try String(
+            contentsOf: repoRoot.appendingPathComponent("src/components/tv-face/manifest.ts"),
+            encoding: .utf8
+        )
+        let tvFaceManifest = try Self.legacyTvFaceManifest(in: manifestSource)
+        let cursorAliases = try Self.legacyCursorAvatarAliases(in: source)
+        #expect(tvFaceManifest["sneaking"] == "sneaking")
+        #expect(MacMascotTvFaceRenderMap.expressionByBotState["sneaking"] == tvFaceManifest["sneaking"])
+        #expect(cursorAliases["sneaking"] == nil, "sneaking must not collapse in mapBotStateToCursorState; TV-Face uses manifest.ts")
     }
 
     @Test("The Mac app follows the system theme and its connection states map onto the shared status pills")
@@ -1042,33 +1392,241 @@ struct Phase1StoreImporterAndPerfTests {
         #expect(Set(MacConnectionStatusPill.pillByConnectionState.values) == Set(MacStatusPillKind.allCases))
     }
 
-    @Test("The Mac app does not render the mascot or status pill surface yet")
-    func macAppVisualSurfaceIsNotImplementedYet() throws {
+    @Test("The Mac app renders the mascot and status pill surface without hardcoded hex colors")
+    func macAppVisualSurfaceRendersMascotAndStatusPillsWithoutHardcodedHex() throws {
         let repoRoot = Self.repoRoot()
         let sources = try Self.macAppSources(repoRoot: repoRoot)
 
         let rendersMascot = sources.contains { $0.contains("MacMascotExpression") }
         let rendersStatusPills = sources.contains { $0.contains("MacStatusPillKind") }
-        let appSurfaceVerified = rendersMascot && rendersStatusPills
+        let forcesScheme = sources.contains { $0.contains(".preferredColorScheme(") }
+        let hexPattern = try NSRegularExpression(pattern: "#[0-9A-Fa-f]{6}")
+        let hardcodedHexCount = sources.reduce(into: 0) { count, source in
+            let range = NSRange(source.startIndex..<source.endIndex, in: source)
+            count += hexPattern.numberOfMatches(in: source, range: range)
+        }
 
-        // Phase 1 ships the shared design contract; the views that draw it
-        // land with the Phase 2 and Phase 3 user interface.  This tripwire
-        // fails the moment the app starts rendering the contract, so the
-        // visual parity gate has to be updated to verify the app surface and
-        // to run the snapshot suite BF-2496 asks for.
+        #expect(rendersMascot == true)
+        #expect(rendersStatusPills == true)
+        #expect(forcesScheme == false)
+        #expect(hardcodedHexCount == 0)
+
+        // Every expression in the shared contract resolves a non-empty symbol,
+        // display label, and canonical sidebar category across light and dark
+        // system appearance.
+        for expression in MacMascotExpression.allCases {
+            #expect(expression.symbolName.isEmpty == false)
+            #expect(expression.displayLabel.isEmpty == false)
+            #expect(expression.canonicalCategory.symbolName.isEmpty == false)
+        }
+        let coreExpressions: [MacMascotExpression] = [
+            .idle, .thinking, .working, .happy, .confused,
+            .sleeping, .crash, .celebrate, .listening, .speaking
+        ]
+        for expression in coreExpressions {
+            var bot = Bot(
+                id: "bot-\(expression.rawValue)",
+                threadId: "thread-\(expression.rawValue)",
+                name: "Bot",
+                title: "",
+                description: "",
+                notifications: true,
+                color: "blue",
+                unread: false,
+                modelSelection: ModelSelection(instanceId: "claude", model: "sonnet"),
+                createdAt: 1,
+                mascotExpression: expression.rawValue
+            )
+            let resolved = MacMascotExpression.resolve(for: bot, isConnected: true)
+            #expect(resolved == expression)
+            bot.busy = true
+            let busyResolved = MacMascotExpression.resolve(for: bot, isConnected: true)
+            let canonicalBusyResolved = MacBotMascotExpression.resolve(for: bot, isConnected: true)
+            #expect(busyResolved == .working)
+            #expect(canonicalBusyResolved == .working)
+            #expect(busyResolved.canonicalCategory == canonicalBusyResolved)
+        }
+        let baseBot = Bot(
+            id: "bot-live",
+            threadId: "thread-live",
+            name: "Monet",
+            title: "",
+            description: "",
+            notifications: true,
+            color: "blue",
+            unread: false,
+            modelSelection: ModelSelection(instanceId: "claude", model: "sonnet"),
+            createdAt: 1
+        )
+        #expect(MacMascotExpression.resolve(for: baseBot, isConnected: false) == .sleeping)
+        #expect(MacMascotExpression.resolve(for: baseBot, hasPendingCard: true, isConnected: true) == .alerting)
+        #expect(MacMascotExpression.resolve(for: baseBot, hasReasoning: true, isConnected: true) == .thinking)
+        #expect(MacMascotExpression.resolve(for: baseBot, isConnected: true) == .idle)
+
+        // Every status pill kind carries a label, symbol, semantic color token,
+        // and VoiceOver accessibility label (including visible detail text).
+        for pill in MacStatusPillKind.allCases {
+            #expect(pill.label.isEmpty == false)
+            #expect(pill.symbolName.isEmpty == false)
+            #expect(pill.semanticColorToken.isEmpty == false)
+            #expect(pill.accessibilityLabel == "Connection status: \(pill.label)")
+            #expect(pill.accessibilityLabel(detailText: nil) == pill.accessibilityLabel)
+            #expect(pill.accessibilityLabel(detailText: pill.label) == pill.accessibilityLabel)
+        }
         #expect(
-            appSurfaceVerified == false,
-            "The Mac app renders the mascot or status pill surface now; update the visual parity gate to verify the app surface and to run the snapshot suite."
+            MacStatusPillKind.connected.accessibilityLabel(detailText: "Connected (http://127.0.0.1:8799)") ==
+            "Connection status: Connected, Connected (http://127.0.0.1:8799)"
         )
+        #expect(
+            MacStatusPillKind.error.accessibilityLabel(detailText: "Error: Connection refused") ==
+            "Connection status: Error, Error: Connection refused"
+        )
+        #expect(MacThemeMode.system.followsSystemAppearance == true)
+        #expect(MacThemeMode.light.followsSystemAppearance == false)
+        #expect(MacThemeMode.dark.followsSystemAppearance == false)
 
-        // The gate reports the app surface separately from the contract, so a
-        // contract pass can never read as an app surface pass.
-        let report = MacPerformanceHarness.verifyVisualParity(
-            appSurfaceVerified: appSurfaceVerified,
-            appSurfaceNote: "the Mac app does not render the mascot or status pill surface yet"
-        )
+        // Light/dark snapshot suite covers all 3 theme modes across light and dark
+        // effective appearances, 51 mascot expressions, and 4 status pills.
+        let snapshots = MacPerformanceHarness.runLightDarkVisualSnapshotSuite()
+        #expect(snapshots.count == 4)
+        #expect(MacPerformanceHarness.verifyLightDarkVisualSnapshotSuite() == true)
+        for snapshot in snapshots {
+            #expect(snapshot.mascotSnapshots.count == 51)
+            #expect(snapshot.statusPillSnapshots.count == 4)
+        }
+
+        let report = MacPerformanceHarness.verifyVisualParity(macAppSources: sources)
         #expect(report.contractSnapshotVerified == true)
-        #expect(report.appSurfaceVerified == false)
+        #expect(report.appSurfaceVerified == true)
         #expect(report.allPassed == true)
+        #expect(report.summaryLine.isEmpty == false)
+
+        let emptySurfaceReport = MacPerformanceHarness.verifyVisualParity(macAppSources: [])
+        #expect(emptySurfaceReport.appSurfaceVerified == false)
+
+        // Comment-only mentions of MacMascotExpression and MacStatusPillKind must
+        // never satisfy the visual parity gate.
+        let commentOnlySources = [
+            "// MacMascotExpression.resolve(for: bot) : MacMascotExpression\n/* MacStatusPillView(kind: .connected) : MacStatusPillKind */\nstruct PlaceholderView {}"
+        ]
+        let commentOnlyReport = MacPerformanceHarness.verifyVisualParity(macAppSources: commentOnlySources)
+        #expect(commentOnlyReport.appSurfaceVerified == false)
+    }
+
+    // MARK: - BF-2651: Manual Bot Snooze Column & Migration
+
+    @Test("The native store migrates manual bot snoozes into the bots table with schema upgrade and warns on unmapped bots (BF-2651)")
+    func testManualBotSnoozeMigrationAndSchemaUpgrade() async throws {
+        let tempDir = try makeTempDir("bot-snooze-test")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        try populateSourceFixture(in: tempDir)
+
+        // Write routines.json with one mapped snooze and one unmapped snooze.
+        let routinesJson = """
+        {
+          "routines": [
+            {
+              "id": "routine-1",
+              "name": "Nightly Check",
+              "botId": "bot-1",
+              "enabled": true,
+              "createdAt": 1700000010000,
+              "updatedAt": 1700000020000
+            }
+          ],
+          "runs": [],
+          "botSnoozes": {
+            "bot-1": 1700000950000,
+            "bot-ghost": 1700000850000
+          },
+          "routineRequestReceipts": []
+        }
+        """
+        try Data(routinesJson.utf8).write(to: tempDir.appendingPathComponent("routines.json"))
+
+        // Create an older SQLite database with the pre-migration bots schema (no snoozed_until column).
+        let dbPath = tempDir.appendingPathComponent("native.sqlite").path
+        var rawDb: OpaquePointer?
+        #expect(sqlite3_open(dbPath, &rawDb) == SQLITE_OK)
+        let oldBotsSchema = """
+        CREATE TABLE bots (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            thread_id TEXT,
+            created_at REAL NOT NULL,
+            raw_json TEXT NOT NULL
+        );
+        """
+        #expect(sqlite3_exec(rawDb, oldBotsSchema, nil, nil, nil) == SQLITE_OK)
+        sqlite3_close(rawDb)
+
+        // Opening via DatabaseService must migrate the bots table and add snoozed_until column cleanly.
+        let db = try DatabaseService(path: dbPath)
+        let importer = StoreImporter(batchSize: 10)
+        let report = try await importer.importStore(from: tempDir, into: db)
+
+        // Mapped snooze migrated to bot-1 in bots table.
+        let bots = try await db.loadBots()
+        let snoozedBot = bots.first { $0.id == "bot-1" }
+        #expect(snoozedBot?.snoozedUntil == 1_700_000_950)
+
+        // Unmapped snooze is warned rather than dropping silently.
+        #expect(report.warnings.contains { $0.contains("1 manual bot snooze(s) name a bot not in bots.json") })
+        #expect(report.isParityVerified == true)
+        #expect(report.isFullyVerified == false)
+
+        // Upserting a bot with a manual snooze updates the column.
+        let updatedBot = StoredBotRecord(
+            id: "bot-1",
+            name: "Updated Bot",
+            threadId: nil,
+            createdAt: 1_700_000_000,
+            snoozedUntil: 1_700_001_000,
+            rawJSON: "{}"
+        )
+        try await db.upsertBot(updatedBot)
+        let reloadedBots = try await db.loadBots()
+        let reloadedBot = reloadedBots.first { $0.id == "bot-1" }
+        #expect(reloadedBot?.snoozedUntil == 1_700_001_000)
+    }
+
+    @Test("Filtering import by botId excludes snoozes for other bots and avoids false unmapped warnings (BF-2651)")
+    func testFilteredBotImportExcludesOtherBotSnoozes() async throws {
+        let tempDir = try makeTempDir("filtered-bot-snooze-test")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        try populateSourceFixture(in: tempDir)
+
+        // Multiple bot snoozes in routines.json: bot-1 and bot-2.
+        let routinesJson = """
+        {
+          "routines": [],
+          "runs": [],
+          "botSnoozes": {
+            "bot-1": 1700000950000,
+            "bot-2": 1700000960000
+          },
+          "routineRequestReceipts": []
+        }
+        """
+        try Data(routinesJson.utf8).write(to: tempDir.appendingPathComponent("routines.json"))
+
+        let dbPath = tempDir.appendingPathComponent("native.sqlite").path
+        let db = try DatabaseService(path: dbPath)
+        let importer = StoreImporter(batchSize: 10)
+
+        // Import only bot-1.
+        let report = try await importer.importStore(from: tempDir, into: db, filterBotId: "bot-1")
+
+        // bot-1 migrated with its snooze.
+        let bots = try await db.loadBots()
+        let snoozedBot = bots.first { $0.id == "bot-1" }
+        #expect(snoozedBot?.snoozedUntil == 1_700_000_950)
+
+        // bot-2 was filtered out, and its snooze must NOT trigger an unmapped snooze warning.
+        #expect(report.warnings.contains { $0.contains("manual bot snooze") } == false)
+        #expect(report.isParityVerified == true)
+        #expect(report.isFullyVerified == true)
     }
 }

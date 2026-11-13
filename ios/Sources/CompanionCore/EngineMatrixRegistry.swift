@@ -107,7 +107,11 @@ public struct EngineTurnSpawnInput: Equatable, Sendable {
 }
 
 /// Concrete process spawn specification produced for a CLI-backed engine.
-public struct EngineSpawnSpec: Equatable, Sendable {
+///
+/// Named `EngineMatrixSpawnSpec` so it stays distinct from `EngineSpawnSpec`, the process-transport spec in
+/// `EngineDriver.swift`.
+/// That other spec carries the environment overlay and the keys a child CLI must never inherit.
+public struct EngineMatrixSpawnSpec: Equatable, Sendable {
     public let engineId: EngineMatrixID
     public let executable: String
     public let argv: [String]
@@ -202,30 +206,36 @@ public struct EngineInitDeadline: Equatable, Sendable {
     }
 }
 
-/// Failure modes for `opencode models` catalog probes (`BF-2488`).
+/// Failure modes for `opencode models` catalog probes (`BF-2488`, user copy `BF-2666`).
 public enum OpenCodeProbeFailureKind: Equatable, Sendable {
     case timedOut(deadline: EngineInitDeadline)
     case stoppedBySignal(signal: String?)
     case emptyOutput(verboseError: String?)
     case cliError(message: String)
 
-    /// Exact human-facing sentence for the Engines status row (`server/drivers/acp/opencode-go.ts`).
+    private static let sentenceGap = "\u{00A0} "
+
+    private static let modelsLoadFailed =
+        "BotFleet couldn't load OpenCode's models.\(sentenceGap)Try again in a moment."
+    private static let modelsTimedOutBusy =
+        "BotFleet couldn't load OpenCode's models.\(sentenceGap)It timed out while your computer was busy."
+    private static let modelsStoppedEarly =
+        "BotFleet couldn't load OpenCode's models.\(sentenceGap)OpenCode stopped before it could answer."
+
+    /// Human-facing sentence for the Engines status row (`shared/opencode-model-probe.ts`).
     public var statusSentence: String {
         switch self {
-        case .timedOut(let deadline):
-            return "OpenCode's model probe timed out \(deadline.deadlineDescription)"
-        case .stoppedBySignal(let signal):
-            if let signal, !signal.isEmpty {
-                return "OpenCode's model probe was stopped by \(signal) before it answered"
-            }
-            return "OpenCode's model probe was stopped before it answered"
+        case .timedOut:
+            return Self.modelsTimedOutBusy
+        case .stoppedBySignal:
+            return Self.modelsStoppedEarly
         case .emptyOutput(let verboseError):
             if let verboseError, !verboseError.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                return "opencode models listed nothing (\(verboseError))"
+                return "OpenCode listed no models."
             }
-            return "opencode models answered nothing"
-        case .cliError(let message):
-            return message
+            return "OpenCode answered but listed no models."
+        case .cliError:
+            return Self.modelsLoadFailed
         }
     }
 }
@@ -333,8 +343,8 @@ public enum EngineMatrixRegistry {
             id: .muse,
             displayName: "Muse",
             driverKind: "museAgent",
-            executable: "muse",
-            baseArguments: ["acp"],
+            executable: "muse-code-acp",
+            baseArguments: [],
             wireProtocol: .acpJSONRPC,
             authRequirement: .cliManagedLogin(cliBinary: "muse"),
             defaultModel: "muse-default"
@@ -405,7 +415,7 @@ public enum EngineMatrixRegistry {
     public static func buildSpawnSpec(
         for id: EngineMatrixID,
         input: EngineTurnSpawnInput
-    ) -> EngineSpawnSpec? {
+    ) -> EngineMatrixSpawnSpec? {
         let desc = descriptor(for: id)
         guard let executable = desc.executable else {
             return nil
@@ -442,7 +452,7 @@ public enum EngineMatrixRegistry {
             if let cursor = input.resumeCursor, !cursor.isEmpty {
                 argv.append(contentsOf: ["--conversation", cursor])
             }
-            return EngineSpawnSpec(
+            return EngineMatrixSpawnSpec(
                 engineId: id,
                 executable: executable,
                 argv: argv,
@@ -462,7 +472,7 @@ public enum EngineMatrixRegistry {
             if input.fullAuto && !input.controlsHostMac {
                 argv.append("--dangerously-skip-permissions")
             }
-            return EngineSpawnSpec(
+            return EngineMatrixSpawnSpec(
                 engineId: id,
                 executable: executable,
                 argv: argv,
@@ -471,7 +481,7 @@ public enum EngineMatrixRegistry {
             )
 
         case .codex, .grokAcp, .mcode, .muse, .cursor, .geminiCli, .dsh, .opencode:
-            return EngineSpawnSpec(
+            return EngineMatrixSpawnSpec(
                 engineId: id,
                 executable: executable,
                 argv: desc.baseArguments,
