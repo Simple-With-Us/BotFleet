@@ -591,6 +591,8 @@ export interface ConfigStatus {
   tts?: {
     configured: boolean;
     ready: boolean;
+    /** Absent or true means voice is on. */
+    enabled?: boolean;
     voice: string;
     provider?: "minimax" | "system" | "xai" | "azure";
     optimizedSummary?: boolean;
@@ -823,6 +825,8 @@ export interface InstanceInfo {
     hidden?: boolean;
     /** Undefined when the auth probe could not tell. */
     authenticated?: boolean;
+    /** OpenCode only: why the last model catalog probe failed. */
+    modelProbeProblem?: string;
     version?: string | null;
     /** a reported cost on a subscription is notional; the UI says so */
     billing?: "metered" | "subscription";
@@ -3816,7 +3820,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             // Auto-speak is disabled during any call. Call mode owns both the
             // singleton speaker and microphone ordering for its whole lifetime.
             const owner = stateRef.current.bots.find((b) => b.threadId === frame.threadId || b.tasks?.some((t) => t.threadId === frame.threadId));
-            if (owner && (owner.speechDevices ? owner.speechDevices.includes("mac") : owner.speakReplies) && currentCall() === null && frame.message.text?.trim()) {
+            if (owner && stateRef.current.config?.tts?.enabled !== false && (owner.speechDevices ? owner.speechDevices.includes("mac") : owner.speakReplies) && currentCall() === null && frame.message.text?.trim()) {
               // The reply as stored: the harness owns what is read, and the
               // speaker's local fallback picks the written or voice half
               // by the bot's mode.

@@ -4,6 +4,7 @@
 // ~/.botfleet/config.json, picks the engine, and decides whether there
 // is a voice at all.
 import { isPersonalVoiceId, readableVoiceId } from "../../shared/bot-voice.ts";
+import { voiceMasterEnabled } from "../../shared/voice-master.ts";
 import { applyPronunciations, effectivePronunciations, type Pronunciation } from "../../shared/pronunciations.ts";
 import { stripPauseTags } from "../../shared/spoken-script.ts";
 import type { AppConfig } from "../config.ts";
@@ -90,6 +91,7 @@ export function describeVoice(cfg: AppConfig) {
   return {
     configured: providerConfigured(cfg),
     ready: voiceConfigured(cfg),
+    enabled: voiceMasterEnabled(cfg.tts),
     voice: cfg.tts?.voice || "",
     provider: voiceProvider(cfg),
     optimizedSummary: cfg.tts?.optimizedSummary === true,

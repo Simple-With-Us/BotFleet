@@ -749,6 +749,8 @@ public struct ProviderSnapshot: Codable, Hashable, Sendable {
     /// The probe gave no answer yet (a slow CLI on a busy Mac) and nothing
     /// definitive stood in: the engine is being checked, not missing or signed out.
     public var transient: Bool?
+    /// OpenCode only: why the last model catalog probe failed, in plain language.
+    public var modelProbeProblem: String?
     /// How the engine bills: `metered` (a charge to an API key) or
     /// `subscription` (a flat plan, so a cost figure is an equivalent, not a
     /// charge).  A raw string so a new mode from a newer harness still decodes.
@@ -762,11 +764,28 @@ public struct ProviderSnapshot: Codable, Hashable, Sendable {
     /// Phone Settings strip labels.  Mac owns setup, so these never deep-link
     /// into key entry or a CLI path — they only say what is true right now.
     public var engineStatusLabel: String {
+        if let problem = modelProbeProblem?.trimmingCharacters(in: .whitespacesAndNewlines), !problem.isEmpty {
+            if problem.localizedCaseInsensitiveContains("timed out") { return "Timed out under load" }
+            if problem.localizedCaseInsensitiveContains("listed no models")
+                || problem.localizedCaseInsensitiveContains("answered but listed no models") {
+                return "No models listed"
+            }
+            if problem.localizedCaseInsensitiveContains("stopped by") { return "Probe stopped" }
+            return "Needs attention"
+        }
         // A probe still in flight is neither "Unavailable" nor "Sign in": say so.
         if isChecking { return "Checking" }
         if isAvailable, authenticated == false { return "Sign in" }
         if !isAvailable { return "Unavailable" }
         return "Ready"
+    }
+
+    /// Full catalog probe sentence for the engine sheet, when the harness sent one.
+    public var engineProblemDetail: String? {
+        guard let problem = modelProbeProblem?.trimmingCharacters(in: .whitespacesAndNewlines), !problem.isEmpty else {
+            return nil
+        }
+        return problem
     }
 
     /// Reserved for a structured missing-binary signal on `ProviderSnapshot`.
@@ -1104,7 +1123,7 @@ public struct ConfigStatus: Codable, Sendable {
     }
 
     /// Whether synthesis is available on the paired computer. Deliberately
-    /// provider-neutral: under ElevenLabs this is a key on file, while under
+    /// provider-neutral: under a hosted engine this is a key on file, while under
     /// the built-in engine `providerConfigured` in `server/tts/index.ts`
     /// reports whether the computer has voices it can use and no credential
     /// exists at all. Only the reason behind the flag changes — so anything

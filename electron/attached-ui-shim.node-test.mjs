@@ -81,6 +81,31 @@ function startFakeHarness() {
   });
 }
 
+// A just-closed ephemeral port is immediately reusable. Parallel suites call
+// listen(0), and the kernel often hands them that port. A silent occupant
+// accepts the proxy and never answers, so the 5s client abort fires instead
+// of a 502. Holding the port and resetting every connection keeps the peer
+// gone for this process and still fails the upstream call at once.
+function occupyResettingPort() {
+  const server = http.createServer((req, res) => {
+    req.socket.destroy();
+    res.destroy();
+  });
+  server.on("connection", (socket) => socket.destroy());
+  return new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      resolve({
+        port: server.address().port,
+        close: () => new Promise((done) => {
+          server.closeAllConnections();
+          server.close(() => done());
+        }),
+      });
+    });
+  });
+}
+
 test("isApiPath only matches the /api subtree", () => {
   assert.equal(isApiPath("/api"), true);
   assert.equal(isApiPath("/api/health"), true);
@@ -160,10 +185,8 @@ test("server-sent events reach the client before the stream ends", async () => {
 });
 
 test("a harness that is gone yields 502, not a hang", async () => {
-  const harness = await startFakeHarness();
-  const deadPort = harness.port;
-  await harness.close();
-  const shim = await startUiShim({ uiDir: makeUiDir(), harnessPort: deadPort });
+  const gone = await occupyResettingPort();
+  const shim = await startUiShim({ uiDir: makeUiDir(), harnessPort: gone.port });
   try {
     const res = await fetch(`http://127.0.0.1:${shim.port}/api/health`, { signal: AbortSignal.timeout(5_000) });
     assert.equal(res.status, 502);
@@ -173,6 +196,7 @@ test("a harness that is gone yields 502, not a hang", async () => {
     assert.equal(index.status, 200);
   } finally {
     await shim.close();
+    await gone.close();
   }
 });
 
@@ -632,22 +656,21 @@ test("a remote origin is used even when a local harness port is given", async ()
 });
 
 test("a remote server that is gone yields 502, not a hang", async () => {
-  const upstream = await startRecordingUpstream();
-  const deadPort = upstream.port;
-  await upstream.close();
-  const shim = await startUiShim({ uiDir: makeUiDir(), remoteOrigin: `http://127.0.0.1:${deadPort}` });
+  const gone = await occupyResettingPort();
+  const shim = await startUiShim({ uiDir: makeUiDir(), remoteOrigin: `http://127.0.0.1:${gone.port}` });
   try {
     const res = await fetch(`http://127.0.0.1:${shim.port}/api/health`, { signal: AbortSignal.timeout(5_000) });
     assert.equal(res.status, 502);
     const body = await res.json();
     assert.match(body.error, /not reachable/);
     // The failure names the remote server, not a local port.
-    assert.match(body.error, new RegExp(`127\\.0\\.0\\.1:${deadPort}`));
+    assert.match(body.error, new RegExp(`127\\.0\\.0\\.1:${gone.port}`));
     // The UI itself still serves — the renderer can show its own error state.
     const index = await fetch(`http://127.0.0.1:${shim.port}/`);
     assert.equal(index.status, 200);
   } finally {
     await shim.close();
+    await gone.close();
   }
 });
 

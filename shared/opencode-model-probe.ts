@@ -17,6 +17,14 @@ export const OPEN_CODE_ANSWERED_NO_MODELS = "OpenCode answered but listed no mod
 
 export const OPEN_CODE_LISTED_NO_MODELS = "OpenCode listed no models.";
 
+const KNOWN_SENTENCES: ReadonlySet<string> = new Set([
+  OPEN_CODE_MODELS_LOAD_FAILED,
+  OPEN_CODE_MODELS_TIMED_OUT_BUSY,
+  OPEN_CODE_MODELS_STOPPED_EARLY,
+  OPEN_CODE_ANSWERED_NO_MODELS,
+  OPEN_CODE_LISTED_NO_MODELS,
+]);
+
 const PROBE_TIMEOUT = /^OpenCode's model probe timed out\b/i;
 const PROBE_STOPPED = /^OpenCode's model probe was stopped\b/i;
 const ANSWERED_NOTHING = /^opencode models answered nothing$/i;
@@ -26,6 +34,9 @@ const LISTED_NOTHING = /^opencode models listed nothing\b/i;
 export function humanizeOpenCodeModelProbeProblem(raw: string): string {
   const text = raw.trim();
   if (!text) return text;
+  // The server stores the humanized sentence, and the client humanizes again:
+  // a sentence this function already produced passes through unchanged.
+  if (KNOWN_SENTENCES.has(text)) return text;
   if (PROBE_TIMEOUT.test(text)) return OPEN_CODE_MODELS_TIMED_OUT_BUSY;
   if (PROBE_STOPPED.test(text)) return OPEN_CODE_MODELS_STOPPED_EARLY;
   if (ANSWERED_NOTHING.test(text)) return OPEN_CODE_ANSWERED_NO_MODELS;

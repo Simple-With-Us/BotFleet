@@ -434,6 +434,7 @@ const appConfigSchema = z.object({
     voice: optionalText,
     provider: z.enum(TTS_PROVIDERS).optional(),
     ladder: z.array(z.enum(HOSTED_TTS_PROVIDERS)).max(HOSTED_TTS_PROVIDERS.length).optional(),
+    enabled: z.boolean().optional(),
     optimizedSummary: z.boolean().optional(),
     audioRetentionDays: z.number().int().min(0).max(3650).optional(),
     pronunciations: pronunciationListSchema.optional(),
@@ -775,6 +776,9 @@ export interface AppConfig {
     voice?: string;
     provider?: (typeof TTS_PROVIDERS)[number];
     ladder?: Array<(typeof HOSTED_TTS_PROVIDERS)[number]>;
+    /** Absent or true keeps voice on (existing behavior).  False gates
+     *  auto-speak, calls, and the TTS / STS routes. */
+    enabled?: boolean;
     optimizedSummary?: boolean;
     audioRetentionDays?: number;
     pronunciations?: Pronunciation[];

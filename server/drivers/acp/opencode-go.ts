@@ -280,6 +280,17 @@ export function openCodeModelProbeProblem(): string | null {
   return lastProbeProblem;
 }
 
+/** Human-facing catalog probe copy for `ProviderSnapshot.modelProbeProblem`.
+ *
+ *  Main's BF-2666 already stores `lastProbeProblem` as plain English.  Calling
+ *  `humanizeOpenCodeModelProbeProblem` again would miss those sentences (they
+ *  no longer start with "OpenCode's model probe…") and show the generic
+ *  "couldn't load" fallback instead of the timeout, stopped, or empty-catalog
+ *  copy. */
+export function openCodeModelProbeForClient(): string | null {
+  return openCodeModelProbeProblem();
+}
+
 /** Ask the CLI for its catalog, without assuming a flag it still has.
  *
  *  `--verbose` is what turns a bare id list into `provider/model` header lines
