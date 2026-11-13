@@ -974,6 +974,8 @@ export class ZulipHub {
     if (this.reconcileTimer) clearInterval(this.reconcileTimer);
     this.drainTimer = undefined;
     this.reconcileTimer = undefined;
+    for (const held of this.heldTimers.values()) clearTimeout(held.timer);
+    this.heldTimers.clear();
     const sessions = [...this.sessions.values()];
     this.sessions.clear();
     await Promise.all(sessions.map((session) => session.stop()));
@@ -1034,6 +1036,11 @@ export class ZulipHub {
         next?.role !== session.role || next?.credentialRole !== session.credentialRole || session.realm !== realm || retry;
       if (changed) {
         this.sessions.delete(botId);
+        const held = this.heldTimers.get(botId);
+        if (held) {
+          clearTimeout(held.timer);
+          this.heldTimers.delete(botId);
+        }
         const stopped = session.stop().finally(() => {
           this.stopping.delete(botId);
           // Start the replacement, if one is still wanted, now that the old
@@ -1382,7 +1389,15 @@ export class ZulipHub {
     const origin = c.origin!;
     const key = originKey(origin);
     const now = this.now();
-    const unit = state.pending.find((candidate) => originKey(candidate.origin) === key);
+    const unit = state.pending.find((candidate) => {
+      if (originKey(candidate.origin) !== key) return false;
+      // Owner work never parks inside a held peer unit: a peer budget hold
+      // would gate it for up to an hour and the staleness expiry could drop
+      // it unanswered.  It gets its own unit on its own schedule instead;
+      // the held peer work still waits for its window, and peer budgets and
+      // the chain guard still apply to it when it does.
+      return !(c.owner && candidate.held);
+    });
     let refusal: string | null = null;
     if (!unit) {
       // A new wake: budgets and the loop guard decide whether it may exist.
@@ -1401,6 +1416,7 @@ export class ZulipHub {
         this.enqueueOwnerNotice(
           session,
           `[botfleet] ${session.role}: stopped a peer chain in ${originAsData(origin)} at the limit (peerChainLimit); message ${id} was not answered. The chain resumes when the owner speaks there.`,
+          `[botfleet] ${session.role}: stopped a peer chain at the limit (peerChainLimit); message ${id} was not answered (origin names withheld: the label tripped the content check). The chain resumes when the owner speaks there.`,
         );
         this.log(`[zulip] ${session.role}: message ${id} not woken (${refusal}); owner notice queued`);
         session.save(true);
@@ -1600,13 +1616,19 @@ export class ZulipHub {
    *    the refusal is actionable, never silently lost;
    *  - concurrency: the drain loop is the only caller and it is serial per
    *    session, so no two flushes interleave on one queue. */
+  /** One held-wake timer per session: re-armed only when the earliest due
+   *  time moves, cleared when the queue drains or the session stops, so a
+   *  long hold can never stack timers that all fire at once.  Visible (not
+   *  private), like store, so lifecycle tests can pin the invariant. */
+  readonly heldTimers = new Map<string, { due: number; timer: ReturnType<typeof setTimeout> }>();
+
   /** Per-session watermark for the loss counters already surfaced in the
    *  log: each new session logs once per increase, so a boot after a lossy
    *  load or prune says so.  Content-free by construction: counts only. */
-  private noticeLossReported = new WeakMap<ZulipSession, { dropped: number; archived: number }>();
+  private noticeLossReported = new WeakMap<ZulipSession, { dropped: number; archived: number; pendingDropped: number }>();
 
   private reportNoticeLoss(session: ZulipSession): void {
-    const seen = this.noticeLossReported.get(session) ?? { dropped: 0, archived: 0 };
+    const seen = this.noticeLossReported.get(session) ?? { dropped: 0, archived: 0, pendingDropped: 0 };
     const dropped = session.state.noticesDroppedOnLoad ?? 0;
     const archived = session.state.noticesArchived ?? 0;
     if (dropped > seen.dropped) {
@@ -1616,6 +1638,11 @@ export class ZulipHub {
     if (archived > seen.archived) {
       this.log(`[zulip] ${session.role}: ${archived} notice record(s) moved to the private notices archive; escalation stands - archiving is not resolution`);
       seen.archived = archived;
+    }
+    const pendingDropped = session.state.pendingDroppedOnLoad ?? 0;
+    if (pendingDropped > seen.pendingDropped) {
+      this.log(`[zulip] ${session.role}: ${pendingDropped} invalid pending unit${pendingDropped === 1 ? "" : "s"} quarantined on load; raw units preserved in the private notices archive, valid units kept`);
+      seen.pendingDropped = pendingDropped;
     }
     this.noticeLossReported.set(session, seen);
   }
@@ -1685,19 +1712,32 @@ export class ZulipHub {
    *  refused owner DM uses: deduped, capped, logged when it cannot be
    *  queued, never silently dropped.  The text carries origins and counts,
    *  never message content. */
-  private enqueueOwnerNotice(session: ZulipSession, text: string): void {
+  private enqueueOwnerNotice(session: ZulipSession, text: string, safeFallback?: string): void {
+    // The origin label is peer-controlled data: pre-check the text here so
+    // a label that trips the content check never enters the queue (the
+    // flush would refuse it every time and the owner would lose the
+    // conversation identity entirely).  checkContent follows the outbound
+    // contract: it RETURNS { error } on a refusal, it never throws.  On a
+    // refusal, queue the caller's content-free variant - message ids and
+    // counts, never names.
+    let noticeText = text;
+    if ("error" in checkContent(text, this.knownSecrets())) {
+      noticeText =
+        safeFallback ??
+        `[botfleet] ${session.role}: an owner notice was withheld because its text tripped the content check; the detail stays in the private state file and logs.`;
+    }
     const ownerId = this.ownerUserId();
     if (ownerId === undefined) {
-      this.log(`[zulip] ${session.role}: owner notice NOT queued (no owner id configured): ${text}`);
+      this.log(`[zulip] ${session.role}: owner notice NOT queued (no owner id configured); text withheld from the log (may carry peer-controlled names), ${noticeText.length} char(s)`);
       return;
     }
     const notices = session.state.notices;
-    if (notices.some((n) => !n.failed && n.userId === ownerId && n.text === text)) return;
+    if (notices.some((n) => !n.failed && n.userId === ownerId && n.text === noticeText)) return;
     if (notices.filter((n) => !n.failed).length >= PENDING_NOTICE_LIMIT) {
-      this.log(`[zulip] ${session.role}: owner notice NOT queued (queue full at ${PENDING_NOTICE_LIMIT}): ${text}`);
+      this.log(`[zulip] ${session.role}: owner notice NOT queued (queue full at ${PENDING_NOTICE_LIMIT}); text withheld from the log (may carry peer-controlled names), ${noticeText.length} char(s)`);
       return;
     }
-    notices.push({ at: this.now(), userId: ownerId, text, attempts: 0 });
+    notices.push({ at: this.now(), userId: ownerId, text: noticeText, attempts: 0 });
     session.markDirty();
     session.save();
     this.log(`[zulip] ${session.role}: owner notice queued (${notices.filter((n) => !n.failed).length} pending)`);
@@ -1883,14 +1923,37 @@ export class ZulipHub {
   /** Arm a one-shot drain for when the earliest waiting unit becomes
    *  eligible; without it a held unit would wait for the next message. */
   private armHeldDrain(session: ZulipSession): void {
+    const botId = session.botId;
+    const existing = this.heldTimers.get(botId);
     const state = session.state;
-    if (!state.pending.length) return;
     const now = this.now();
     const coalesceMs = this.deps.timings?.coalesceMs ?? 2_000;
-    const nextAt = Math.min(...state.pending.map((unit) => Math.max(unit.notBefore, unit.updatedAt + coalesceMs)));
-    if (!Number.isFinite(nextAt) || nextAt <= now) return;
-    const timer = setTimeout(() => void this.dispatchNext(session), nextAt - now + 20);
+    const nextAt = state.pending.length
+      ? Math.min(...state.pending.map((unit) => Math.max(unit.notBefore, unit.updatedAt + coalesceMs)))
+      : Number.POSITIVE_INFINITY;
+    // Nothing due later (empty queue or work already eligible): any armed
+    // timer is stale, so it goes away.
+    if (!Number.isFinite(nextAt) || nextAt <= now) {
+      if (existing) {
+        clearTimeout(existing.timer);
+        this.heldTimers.delete(botId);
+      }
+      return;
+    }
+    // One timer per session: re-arm only when the earliest due time moved.
+    if (existing?.due === nextAt) return;
+    if (existing) clearTimeout(existing.timer);
+    const timer = setTimeout(() => {
+      this.heldTimers.delete(botId);
+      void this.dispatchNext(session).catch((error) => {
+        // A rejected drain must not take the process down or lose the work:
+        // log it content-free and arm the next wake for the same unit.
+        this.log(`[zulip] ${session.role}: held-drain dispatch failed; anything still pending retries at the next drain: ${describe(error)}`);
+        this.armHeldDrain(session);
+      });
+    }, nextAt - now + 20);
     timer.unref?.();
+    this.heldTimers.set(botId, { due: nextAt, timer });
   }
 
   private async dispatchNext(session: ZulipSession): Promise<void> {
@@ -1918,6 +1981,7 @@ export class ZulipHub {
           this.enqueueOwnerNotice(
             session,
             `[botfleet] ${session.role}: a held peer request expired unanswered after ${UNIT_MAX_AGE_MS / 3600_000}h in ${originAsData(unit.origin)}; ${unit.items.length} message(s) never reached a turn${unit.dropped ? `, and ${unit.dropped} more were trimmed at the queue cap (preserved in the private archive)` : ""}.`,
+            `[botfleet] ${session.role}: a held peer request expired unanswered after ${UNIT_MAX_AGE_MS / 3600_000}h; ${unit.items.length} message(s) never reached a turn${unit.dropped ? `, and ${unit.dropped} more were trimmed at the queue cap (preserved in the private archive)` : ""} (origin names withheld: the label tripped the content check).`,
           );
         }
       }
@@ -1956,6 +2020,7 @@ export class ZulipHub {
         this.enqueueOwnerNotice(
           session,
           `[botfleet] ${session.role}: a held peer request hit the peer-chain limit and never got a turn in ${originAsData(unit.origin)}; ${ids.length} message(s) went unanswered${unit.dropped ? `, and ${unit.dropped} more were trimmed at the queue cap (preserved in the private archive)` : ""}. The chain resumes when the owner speaks there.`,
+          `[botfleet] ${session.role}: a held peer request hit the peer-chain limit and never got a turn; ${ids.length} message(s) went unanswered${unit.dropped ? `, and ${unit.dropped} more were trimmed at the queue cap (preserved in the private archive)` : ""} (origin names withheld: the label tripped the content check). The chain resumes when the owner speaks there.`,
         );
         this.log(`[zulip] ${session.role}: held unit stopped by the loop guard; ${ids.length} message(s) dropped, owner notice queued`);
         session.save(true);

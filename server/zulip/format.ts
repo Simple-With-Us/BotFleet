@@ -66,7 +66,18 @@ export function zulipMentionHandle(user: { userId: number; fullName: string }): 
   // sender keeps its plain user-id form instead.
   const unsafe = (ch: string): boolean => {
     const code = ch.codePointAt(0) ?? 0;
-    return code < 0x20 || code === 0x7f || ch === "*" || ch === "|" || ch === "`" || ch === "\\";
+    // C0 and C1 controls, DEL, and the Unicode line/paragraph separators:
+    // any of them can break the sender out of the trusted Senders line.
+    return (
+      code < 0x20 ||
+      (code >= 0x7f && code <= 0x9f) ||
+      code === 0x2028 ||
+      code === 0x2029 ||
+      ch === "*" ||
+      ch === "|" ||
+      ch === "`" ||
+      ch === "\\"
+    );
   };
   if (!name || [...name].some(unsafe)) return null;
   return `@**${name}|${user.userId}**`;

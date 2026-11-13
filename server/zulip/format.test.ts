@@ -233,5 +233,11 @@ describe("zulipMentionHandle", () => {
     expect(zulipMentionHandle({ userId: 50, fullName: "tick`name" })).toBeNull();
     expect(zulipMentionHandle({ userId: 50, fullName: "line\nbreak" })).toBeNull();
     expect(zulipMentionHandle({ userId: 50, fullName: "   " })).toBeNull();
+    // C1 controls and the Unicode line/paragraph separators can split the
+    // trusted Senders line just like C0 line breaks.
+    expect(zulipMentionHandle({ userId: 50, fullName: "next\u0085" })).toBeNull();
+    expect(zulipMentionHandle({ userId: 50, fullName: "del\u007F" })).toBeNull();
+    expect(zulipMentionHandle({ userId: 50, fullName: "line\u2028sep" })).toBeNull();
+    expect(zulipMentionHandle({ userId: 50, fullName: "para\u2029sep" })).toBeNull();
   });
 });

@@ -2150,6 +2150,173 @@ describe("peer budget holds", () => {
     );
   });
 
+  it("owner work never parks in a held peer unit: it dispatches while the peer unit waits", async () => {
+    settings.budgets = { peerChainLimit: 100, peerWakesPerHour: 100, peerWakesPerTopicPerHour: 0 };
+    const hub = makeHub();
+    await connected(hub);
+    fake.postStream(PEER, "Work-In-Progress", "peer budget hold", "@**BF-Plumber** peer ask", "ZulipPython");
+    await waitFor(() => logs.some((line) => line.includes("held (topic_budget)")), "the peer hold");
+    const ownerId = fake.postStream(JAY, "Work-In-Progress", "peer budget hold", "@**BF-Plumber** owner ask", "website");
+    await waitFor(() => turns.length === 1, "the owner turn despite the held peer unit");
+    expect(turns[0]!.text).toContain("owner ask");
+    expect(turns[0]!.text).not.toContain("peer ask");
+    const pending = sessionOf(hub).state.pending;
+    expect(pending).toHaveLength(1);
+    expect(pending[0]!.held).toBe("topic_budget");
+    expect(pending[0]!.items.map((item) => item.id)).not.toContain(ownerId);
+    await finishTurn(hub);
+  });
+
+  it("keeps owner work ungated by a held peer unit while busy and across a restart", async () => {
+    settings.budgets = { peerChainLimit: 100, peerWakesPerHour: 100, peerWakesPerTopicPerHour: 0 };
+    const hub = makeHub();
+    await connected(hub);
+    fake.postStream(PEER, "Work-In-Progress", "peer budget hold restart", "@**BF-Plumber** peer ask", "ZulipPython");
+    await waitFor(() => logs.some((line) => line.includes("held (topic_budget)")), "the peer hold");
+    busy.add("bot-plumber");
+    fake.postStream(JAY, "Work-In-Progress", "peer budget hold restart", "@**BF-Plumber** owner ask", "website");
+    await waitFor(() => sessionOf(hub).state.pending.length === 2, "the owner unit parked next to the held peer unit");
+    const ownerUnit = sessionOf(hub).state.pending.find((unit) => unit.items.some((item) => item.owner))!;
+    expect(ownerUnit.held).toBeUndefined();
+    expect(ownerUnit.notBefore).toBe(0);
+    await hub.stop();
+    const again = makeHub();
+    await connected(again);
+    const restored = sessionOf(again).state.pending;
+    expect(restored).toHaveLength(2);
+    const restoredOwner = restored.find((unit) => unit.items.some((item) => item.owner))!;
+    expect(restoredOwner.held).toBeUndefined();
+    expect(restoredOwner.notBefore).toBe(0);
+    const restoredPeer = restored.find((unit) => unit.held !== undefined)!;
+    expect(restoredPeer.items.every((item) => !item.owner)).toBe(true);
+    busy.delete("bot-plumber");
+    await waitFor(() => turns.some((turn) => turn.text.includes("owner ask")), "the owner turn after the restart");
+    await finishTurn(again);
+  });
+
+  it("arms one held-drain timer per session and clears it on stop", async () => {
+    settings.budgets = { peerChainLimit: 100, peerWakesPerHour: 100, peerWakesPerTopicPerHour: 0 };
+    const hub = makeHub();
+    await connected(hub);
+    const heldTimers = hub.heldTimers;
+    fake.postStream(PEER, "Work-In-Progress", "timer hold", "@**BF-Plumber** one", "ZulipPython");
+    await waitFor(() => heldTimers.size === 1, "the held-drain timer");
+    const first = [...heldTimers.values()][0]!;
+    fake.postStream(PEER, "Work-In-Progress", "timer hold", "@**BF-Plumber** two", "ZulipPython");
+    await settle(200);
+    expect(heldTimers.size).toBe(1);
+    const second = [...heldTimers.values()][0]!;
+    // the joined message moves the unit's updatedAt but not its notBefore,
+    // so the same timer stays armed - no stacking
+    expect(second.timer).toBe(first.timer);
+    expect(second.due).toBe(first.due);
+    await hub.stop();
+    expect(heldTimers.size).toBe(0);
+  });
+
+  it("re-arms the held-drain timer when the earliest due time moves", async () => {
+    const hub = makeHub({
+      timings: { coalesceMs: 400, drainIntervalMs: 25, reconcileIntervalMs: 60_000, backoffMs: [30, 60], postSpacingMs: 0, retryBaseMs: 30, eventsTimeoutMs: 5_000 },
+    });
+    await connected(hub);
+    const heldTimers = hub.heldTimers;
+    fake.postStream(JAY, "builds", "coalesce due", "@**BF-Plumber** first", "website");
+    await waitFor(() => heldTimers.size === 1, "the coalescing timer");
+    const first = [...heldTimers.values()][0]!;
+    fake.postStream(JAY, "builds", "coalesce due", "@**BF-Plumber** second", "website");
+    await waitFor(() => [...heldTimers.values()][0]!.due !== first.due, "the re-armed timer");
+    expect(heldTimers.size).toBe(1);
+    expect([...heldTimers.values()][0]!.timer).not.toBe(first.timer);
+  });
+
+  it("logs a rejected held-drain dispatch instead of an unhandled rejection", async () => {
+    let failStart = true;
+    let postHoldChecks = 0;
+    const hub = makeHub({
+      dispatchHeld: () => {
+        if (!logs.some((line) => line.includes("turn not started (409)"))) return false;
+        postHoldChecks += 1;
+        // The second post-hold check is the armed timer's: a dep throwing
+        // there rejects the dispatch promise for real, nothing stubbed.
+        if (postHoldChecks >= 2) throw new Error("boom");
+        return false;
+      },
+      timings: { coalesceMs: 30, drainIntervalMs: 3_600_000, reconcileIntervalMs: 60_000, backoffMs: [30, 60], postSpacingMs: 0, retryBaseMs: 200, eventsTimeoutMs: 5_000 },
+      startTurn: async (botId, text) => {
+        if (failStart) {
+          failStart = false;
+          // SAFETY: the refusal shape dispatchNext reads - an Error carrying a numeric status.
+          const error = new Error("concurrent") as Error & { status: number };
+          error.status = 409;
+          throw error;
+        }
+        const threadId = `thread-${botId}`;
+        turns.push({ botId, text, threadId });
+        return { threadId, triggerMessageId: `trigger-${turns.length}` };
+      },
+    });
+    await connected(hub);
+    fake.postStream(JAY, "builds", "drain rejection", "@**BF-Plumber** hold on", "website");
+    await waitFor(() => logs.some((line) => line.includes("turn not started (409); retrying")), "the 409 retry hold");
+    // Too early for the retry window: this drain arms the held-drain timer.
+    await hub.drain();
+    await waitFor(() => hub.heldTimers.size === 1, "the retry timer");
+    await waitFor(() => logs.some((line) => line.includes("held-drain dispatch failed")), "the rejection to be logged");
+    // the failure cost no work: the unit is still pending and no turn started
+    expect(turns).toHaveLength(0);
+    expect(sessionOf(hub).state.pending).toHaveLength(1);
+  });
+
+  it("queues the content-free fallback when a notice label trips the content check", async () => {
+    settings.budgets = { peerChainLimit: 2, peerWakesPerHour: 100, peerWakesPerTopicPerHour: 100 };
+    // never busy: every peer mention becomes its own wake
+    const hub = makeHub({
+      startTurn: async (botId, text) => {
+        turns.push({ botId, text, threadId: `thread-${botId}` });
+        return { threadId: `thread-${botId}` };
+      },
+    });
+    await connected(hub);
+    const keyTopic = "leak plumber-test-key here";
+    for (let n = 1; n <= 2; n++) {
+      fake.postStream(PEER, "Work-In-Progress", keyTopic, `@**BF-Plumber** round ${n}`, "ZulipPython");
+      await waitFor(() => turns.length === n, `peer wake ${n}`);
+    }
+    const stoppedId = fake.postStream(PEER, "Work-In-Progress", keyTopic, "@**BF-Plumber** round 3", "ZulipPython");
+    await waitFor(() => noticeTexts(hub).some((text) => text.includes("stopped a peer chain")), "the owner notice");
+    const notice = noticeTexts(hub).find((text) => text.includes("stopped a peer chain"))!;
+    expect(notice).toContain(`message ${stoppedId} was not answered`);
+    expect(notice).not.toContain("plumber-test-key");
+    expect(notice).not.toContain(keyTopic);
+    expect(logs.join("\n")).not.toContain("plumber-test-key");
+  });
+
+  it("quarantines a stored pending unit carrying unknown keys instead of silently stripping them", async () => {
+    settings.budgets = { peerChainLimit: 100, peerWakesPerHour: 100, peerWakesPerTopicPerHour: 0 };
+    const hub = makeHub();
+    await connected(hub);
+    fake.postStream(PEER, "Work-In-Progress", "strict unit", "@**BF-Plumber** held work", "ZulipPython");
+    await waitFor(() => logs.some((line) => line.includes("held (topic_budget)")), "the hold");
+    expect(sessionOf(hub).state.pending).toHaveLength(1);
+    await hub.stop();
+    const file = join(dataDir, "zulip", "bot-plumber.json");
+    const stored = stateFileSchema.parse(JSON.parse(readFileSync(file, "utf8")));
+    const storedUnits: unknown[] = [...stored.pending];
+    // SAFETY: spreading the stored unit to attach an unknown key the strict
+    // schema must reject.
+    storedUnits[0] = { ...(storedUnits[0] as object), surprise: "RAW_UNIT_MARKER" };
+    writeFileSync(file, JSON.stringify({ ...stored, pending: storedUnits }));
+    const again = makeHub();
+    await connected(again);
+    expect(sessionOf(again).state.pending).toHaveLength(0);
+    expect(sessionOf(again).state.pendingDroppedOnLoad).toBe(1);
+    await waitFor(() => logs.some((line) => line.includes("invalid pending unit")), "the content-free quarantine warning");
+    const archive = readFileSync(join(dataDir, "zulip", "bot-plumber.notices-archive.jsonl"), "utf8");
+    expect(archive).toMatch(/RAW_UNIT_MARKER/);
+    expect(archive).toMatch(/schema-invalid-on-load/);
+    expect(logs.join("\n")).not.toMatch(/RAW_UNIT_MARKER/);
+  });
+
   it("stops a held unit at the loop guard on release, and tells the owner", async () => {
     settings.budgets = { peerChainLimit: 3, peerWakesPerHour: 100, peerWakesPerTopicPerHour: 1 };
     let offset = 0;

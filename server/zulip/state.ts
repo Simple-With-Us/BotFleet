@@ -27,7 +27,7 @@ import { z } from "zod";
 
 import { writeFileAtomic } from "../atomic.ts";
 import { canonicalZulipRole } from "../launch-identity.ts";
-import type { ZulipInboundItem, ZulipOrigin, ZulipWorkUnit } from "./types.ts";
+import type { ZulipInboundItem, ZulipOrigin } from "./types.ts";
 
 export const HANDLED_RING_LIMIT = 2000;
 const WAKE_LEDGER_MS = 24 * 3600_000;
@@ -47,28 +47,8 @@ export const TERMINAL_NOTICE_LIMIT = 10;
 /** Resend attempts before a notice is escalated instead of retried. */
 export const MAX_NOTICE_ATTEMPTS = 8;
 
-export interface ZulipBotState {
-  version: 1;
-  role: string;
-  userId?: number;
-  cursor: number | null;
-  handled: number[];
-  pending: ZulipWorkUnit[];
-  wakes: ZulipWakeRecord[];
-  /** originKey -> peer wakes since the last owner message there. */
-  chains: Record<string, number>;
-  /** ms since the epoch of each DM sent that was not a reply to the origin. */
-  dms: number[];
-  /** owner DMs refused by the DM-out cap, oldest first. */
-  notices: ZulipPendingNotice[];
-  /** entries dropped across loads because they failed the schema - a count
-   *  only, never the content: the durable flag that a load was lossy.  The
-   *  raw entries themselves are preserved in the private archive file. */
-  noticesDroppedOnLoad?: number;
-  /** records moved to the private archive on prune - a count, so pruning is
-   *  visible and never mistaken for resolution. */
-  noticesArchived?: number;
-}
+// The state shape is z.infer<typeof stateFileSchema>, declared below the
+// schema: never a hand-maintained twin that can drift from the boundary.
 
 export function emptyState(role: string): ZulipBotState {
   return { version: 1, role, cursor: null, handled: [], pending: [], wakes: [], chains: {}, dms: [], notices: [] };
@@ -108,7 +88,7 @@ const unitSchema = z.object({
   notBefore: z.number(),
   held: z.string().optional(),
   dropped: z.number().optional(),
-});
+}).strict();
 /** One queued owner notice, parsed on its own so a single damaged entry can
  *  be quarantined (with its raw form preserved privately) instead of costing
  *  the whole ledger. */
@@ -130,20 +110,38 @@ export const stateFileSchema = z.object({
   userId: z.number().optional().catch(undefined),
   cursor: z.number().int().nullable().catch(null),
   handled: z.array(z.number()).catch([]),
-  pending: z.array(unitSchema).catch([]),
+  // Pending work units, per-entry catch like notices: one invalid unit
+  // quarantines as null and is counted and archived on load, never silently
+  // stripped and never at the cost of the valid units around it.
+  pending: z
+    .array(unitSchema.nullable().catch(null))
+    .catch([])
+    .transform((units) => units.filter((unit): unit is z.infer<typeof unitSchema> => unit !== null)),
   wakes: z
     .array(z.object({ at: z.number(), kind: z.enum(["owner", "peer"]), key: z.string() }))
     .catch([]),
   chains: z.record(z.string(), z.number()).catch({}),
   // Added after the first state files were written: absent reads as empty.
-  dms: z.array(z.number()).optional().catch(undefined),
+  dms: z.array(z.number()).optional().catch(undefined).transform((value) => value ?? []),
   // Queued owner notices, absent on older files.  PER-ENTRY catch: one
   // invalid entry quarantines as null and is counted on load, it never
   // erases the valid entries around it.
-  notices: z.array(noticeEntrySchema.nullable().catch(null)).optional().catch(undefined),
+  notices: z
+    .array(noticeEntrySchema.nullable().catch(null))
+    .optional()
+    .catch(undefined)
+    .transform((entries) => (entries ?? []).filter((entry): entry is ZulipPendingNotice => entry !== null)),
   noticesDroppedOnLoad: z.number().int().nonnegative().optional().catch(undefined),
   noticesArchived: z.number().int().nonnegative().optional().catch(undefined),
+  // Units dropped across loads because they failed the schema - a count
+  // only, never the content: the durable flag that a load was lossy.  The
+  // raw units themselves are preserved in the private archive file.
+  pendingDroppedOnLoad: z.number().int().nonnegative().optional().catch(undefined),
 });
+
+/** The live state shape: exactly what stateFileSchema produces at the
+ *  boundary. */
+export type ZulipBotState = z.infer<typeof stateFileSchema>;
 
 export class ZulipStateStore {
   readonly dir: string;
@@ -167,7 +165,7 @@ export class ZulipStateStore {
     } catch {
       return emptyState(role);
     }
-    let rawJson;
+    let rawJson: unknown;
     try {
       rawJson = JSON.parse(text);
     } catch {
@@ -183,21 +181,36 @@ export class ZulipStateStore {
     // that is not an array at all is lost to the schema in one piece (the
     // whole field becomes undefined), and only the raw value can be
     // quarantined and counted instead of silently erased.
-    const rawField: unknown = rawJson?.notices;
+    // SAFETY: the parsed JSON is only ever inspected field-by-field here;
+    // each field read off it is re-validated as unknown before use.
+    const rawRecord =
+      rawJson !== null && typeof rawJson === "object" && !Array.isArray(rawJson)
+        ? (rawJson as { notices?: unknown; pending?: unknown })
+        : {};
+    const rawField: unknown = rawRecord.notices;
     const nonArrayNotices = rawField !== undefined && rawField !== null && !Array.isArray(rawField);
     const rawEntries: unknown[] = Array.isArray(rawField) ? rawField : [];
-    const { userId, dms, notices, noticesDroppedOnLoad, ...rest } = parsed.data;
-    const raw = notices ?? [];
-    const valid = raw.filter((n): n is ZulipPendingNotice => n !== null);
-    const state: ZulipBotState = { ...rest, role, dms: dms ?? [], notices: valid };
+    const rawPendingField: unknown = rawRecord.pending;
+    const nonArrayPending = rawPendingField !== undefined && rawPendingField !== null && !Array.isArray(rawPendingField);
+    const rawPendingEntries: unknown[] = Array.isArray(rawPendingField) ? rawPendingField : [];
+    const { userId, noticesDroppedOnLoad, pendingDroppedOnLoad, ...rest } = parsed.data;
+    const state: ZulipBotState = { ...rest, role };
     if (userId !== undefined) state.userId = userId;
-    const droppedTotal = (noticesDroppedOnLoad ?? 0) + (raw.length - valid.length) + (nonArrayNotices ? 1 : 0);
+    const droppedTotal = (noticesDroppedOnLoad ?? 0) + (rawEntries.length - parsed.data.notices.length) + (nonArrayNotices ? 1 : 0);
     if (droppedTotal > 0) state.noticesDroppedOnLoad = droppedTotal;
+    const droppedPendingTotal =
+      (pendingDroppedOnLoad ?? 0) + (rawPendingEntries.length - parsed.data.pending.length) + (nonArrayPending ? 1 : 0);
+    if (droppedPendingTotal > 0) state.pendingDroppedOnLoad = droppedPendingTotal;
     // Quarantine the raw invalid entries BEFORE any save can overwrite the
     // file: private, mode-600, never logged, never posted.
     const invalidRaw = rawEntries.filter((entry) => !noticeEntrySchema.safeParse(entry).success);
     if (nonArrayNotices) invalidRaw.push(rawField);
     if (invalidRaw.length > 0) this.archive(botId, "schema-invalid-on-load", invalidRaw);
+    // Strict units: an unknown key fails the entry, and the raw original is
+    // quarantined privately and counted - never silently stripped.
+    const invalidPending = rawPendingEntries.filter((entry) => !unitSchema.safeParse(entry).success);
+    if (nonArrayPending) invalidPending.push(rawPendingField);
+    if (invalidPending.length > 0) this.archive(botId, "schema-invalid-on-load", invalidPending);
     return state;
   }
 
