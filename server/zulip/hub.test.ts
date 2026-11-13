@@ -1043,8 +1043,72 @@ describe("DMs out", () => {
     await connected(again);
     expect(sessionOf(again).state.notices).toHaveLength(1);
     offset = 61 * 60_000;
-    await waitFor(() => fake.postsBy(PLUMBER).length === 3, "the queued notice to flush after the window resets");
-    expect(sessionOf(again).state.notices).toHaveLength(0);
+    await waitFor(() => sessionOf(again).state.notices.length === 0, "the queued notice to flush after the window resets");
+    expect(fake.postsBy(PLUMBER)).toHaveLength(3);
+    expect(logs.some((line) => line.includes("queued owner notice delivered"))).toBe(true);
+  });
+
+  it("reports an identical refused owner notice as already queued instead of queuing a duplicate", async () => {
+    settings.budgets = { dmsPerHour: 2 };
+    const hub = makeHub();
+    await connected(hub);
+    fake.postDm(PEER, [PLUMBER], "ping", "ZulipPython");
+    await waitFor(() => turns.length === 1, "the peer DM's wake");
+    expect((await dm(hub, JAY, "one")).ok).toBe(true);
+    expect((await dm(hub, JAY, "two")).ok).toBe(true);
+    expect((await dm(hub, JAY, "three")).ok).toBe(false);
+    expect(sessionOf(hub).state.notices).toHaveLength(1);
+    const again = await dm(hub, JAY, "three");
+    expect(again.ok).toBe(false);
+    expect(again.text).toMatch(/already queued/);
+    expect(again.text).toMatch(/NOT delivered yet/);
+    expect(sessionOf(hub).state.notices).toHaveLength(1);
+    expect(logs.some((line) => line.includes("identical notice already queued"))).toBe(true);
+  });
+
+  it("refuses a new owner notice OUT LOUD when the notice queue is full, dropping nothing", async () => {
+    settings.budgets = { dmsPerHour: 0 };
+    const hub = makeHub();
+    await connected(hub);
+    for (let n = 0; n < 50; n++) {
+      expect((await dm(hub, JAY, `notice ${n}`)).ok).toBe(false);
+    }
+    expect(sessionOf(hub).state.notices).toHaveLength(50);
+    const over = await dm(hub, JAY, "notice 50");
+    expect(over.ok).toBe(false);
+    expect(over.text).toMatch(/queue is full/);
+    expect(over.text).toMatch(/NOT queued/);
+    expect(over.text).toMatch(/not notified/);
+    expect(sessionOf(hub).state.notices).toHaveLength(50);
+    expect(sessionOf(hub).state.notices[0]!.text).toBe("notice 0");
+    expect(logs.some((line) => line.includes("notice queue FULL"))).toBe(true);
+  });
+
+  it("keeps a notice whose resend fails, backs off, and retries after the backoff", async () => {
+    settings.budgets = { dmsPerHour: 1 };
+    let offset = 0;
+    const hub = makeHub({ now: () => Date.now() + offset });
+    await connected(hub);
+    fake.postDm(PEER, [PLUMBER], "ping", "ZulipPython");
+    await waitFor(() => turns.length === 1, "the peer DM's wake");
+    expect((await dm(hub, JAY, "one")).ok).toBe(true);
+    expect((await dm(hub, JAY, "two")).ok).toBe(false);
+    expect(sessionOf(hub).state.notices).toHaveLength(1);
+    // the window resets, but the resend fails once: kept, with a 30s backoff
+    fake.failNext("messages", 500, 1, "POST");
+    offset = 61 * 60_000;
+    await waitFor(() => logs.some((line) => line.includes("resend failed (attempt 1")), "the failed resend");
+    expect(fake.postsBy(PLUMBER)).toHaveLength(1);
+    expect(sessionOf(hub).state.notices).toHaveLength(1);
+    // inside the backoff: drain ticks pass without another attempt
+    offset += 10_000;
+    await settle(2_500);
+    expect(fake.postsBy(PLUMBER)).toHaveLength(1);
+    expect(sessionOf(hub).state.notices).toHaveLength(1);
+    // after the backoff: the retry lands
+    offset += 25_000;
+    await waitFor(() => fake.postsBy(PLUMBER).length === 2, "the retried notice to land");
+    expect(sessionOf(hub).state.notices).toHaveLength(0);
     expect(logs.some((line) => line.includes("queued owner notice delivered"))).toBe(true);
   });
 });

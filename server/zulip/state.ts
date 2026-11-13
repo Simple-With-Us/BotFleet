@@ -45,6 +45,10 @@ export interface ZulipPendingNotice {
   at: number;
   userId: number;
   text: string;
+  /** resend attempts so far; drives the backoff in `nextAt`. */
+  attempts: number;
+  /** earliest ms epoch of the next resend try; undefined means as soon as the window allows. */
+  nextAt?: number;
 }
 
 export const PENDING_NOTICE_LIMIT = 50;
@@ -117,7 +121,15 @@ const stateFileSchema = z.object({
   dms: z.array(z.number()).optional().catch(undefined),
   // Same: queued owner notices, absent on older files.
   notices: z
-    .array(z.object({ at: z.number(), userId: z.number(), text: z.string().max(9500) }))
+    .array(
+      z.object({
+        at: z.number(),
+        userId: z.number(),
+        text: z.string().max(9500),
+        attempts: z.number().int().nonnegative().catch(0),
+        nextAt: z.number().optional().catch(undefined),
+      }),
+    )
     .optional()
     .catch(undefined),
 });

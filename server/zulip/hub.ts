@@ -1490,21 +1490,34 @@ export class ZulipHub {
   }
 
   /** Send owner DMs the hourly cap queued, oldest first, as the window
-   *  allows.  Every resend counts against the same dms ledger, so the cap
-   *  still holds; a failed resend keeps its notice for the next drain. */
+   *  allows.  Delivery semantics, honestly:
+   *  - the cap still holds: every resend counts against the same dms ledger;
+   *  - ack: a notice leaves the queue only after its post resolves, and the
+   *    state is saved after each one, narrowing the crash window;
+   *  - failure: a thrown post keeps the notice and backs it off (30s, 60s,
+   *    ... capped at 15m), so a persistent outage is not hammered every
+   *    drain tick.  A throw can mean the DM actually landed (ambiguous
+   *    outcome): delivery is AT-LEAST-ONCE, so a rare duplicate is possible;
+   *  - if the save after a successful post itself fails, a restart can
+   *    resend that notice once - the same at-least-once trade, logged;
+   *  - a notice whose content can never pass checkContent is dropped with a
+   *    loud log line: it can never be delivered, and it is never rewritten.
+   *  Concurrency: the drain loop is the only caller and it is serial per
+   *  session, so no two flushes interleave on one queue. */
   private async flushNotices(session: ZulipSession): Promise<void> {
     const notices = session.state.notices;
     if (this.stopped || notices.length === 0) return;
     const limit = this.budget("dmsPerHour");
     let inWindow = session.state.dms.filter((at) => this.now() - at < 3600_000).length;
-    let touched = false;
     while (notices.length > 0 && inWindow < limit) {
       const notice = notices[0]!;
+      if (notice.nextAt !== undefined && this.now() < notice.nextAt) return;
       const content = checkContent(notice.text, this.knownSecrets());
       if ("error" in content) {
-        this.log(`[zulip] ${session.role}: queued owner notice dropped: ${content.error}`);
+        this.log(`[zulip] ${session.role}: queued owner notice dropped (unsendable content): ${content.error}`);
         notices.shift();
-        touched = true;
+        session.markDirty();
+        session.save();
         continue;
       }
       try {
@@ -1512,16 +1525,17 @@ export class ZulipHub {
         session.state.dms.push(this.now());
         inWindow++;
         notices.shift();
-        touched = true;
+        session.markDirty();
+        session.save();
         this.log(`[zulip] ${session.role}: queued owner notice delivered to user ${notice.userId} (${notices.length} pending)`);
       } catch (error) {
-        this.log(`[zulip] ${session.role}: queued owner notice resend failed: ${describe(error)}`);
-        break;
+        notice.attempts += 1;
+        notice.nextAt = this.now() + Math.min(30_000 * 2 ** (notice.attempts - 1), 900_000);
+        session.markDirty();
+        session.save();
+        this.log(`[zulip] ${session.role}: queued owner notice resend failed (attempt ${notice.attempts}, kept; if the DM landed, the retry duplicates it): ${describe(error)}`);
+        return;
       }
-    }
-    if (touched) {
-      session.markDirty();
-      session.save();
     }
   }
 
@@ -1843,11 +1857,25 @@ export class ZulipHub {
         // resend counts against the same ledger.
         const ownerId = this.ownerUserId();
         if (ownerId !== undefined && target.target.userIds.length === 1 && target.target.userIds[0] === ownerId) {
-          if (session.state.notices.length >= PENDING_NOTICE_LIMIT) {
-            session.state.notices.shift();
-            this.log(`[zulip] ${session.role}: owner notice queue full, oldest dropped (dm_budget)`);
+          const text = String(args.content ?? "");
+          // Dedup: the same notice asked twice is one queue entry.  A full
+          // queue refuses the enqueue OUT LOUD - an accepted notice is never
+          // discarded to make room, and this one is not claimed as queued.
+          if (session.state.notices.some((notice) => notice.userId === ownerId && notice.text === text)) {
+            this.log(`[zulip] ${session.role}: DM to user ${ownerId} refused (dm_budget), identical notice already queued`);
+            return {
+              ok: false,
+              text: `Not posted now: this bot has sent ${lastHour} DMs in the last hour, its limit (zulip.budgets.dmsPerHour).  An identical notice to the owner is already queued and will be sent when the window resets - NOT delivered yet.  Do not treat the owner as notified until it lands.`,
+            };
           }
-          session.state.notices.push({ at: now, userId: ownerId, text: String(args.content ?? "") });
+          if (session.state.notices.length >= PENDING_NOTICE_LIMIT) {
+            this.log(`[zulip] ${session.role}: DM to user ${ownerId} refused (dm_budget), notice queue FULL (${PENDING_NOTICE_LIMIT}) - NOT queued`);
+            return {
+              ok: false,
+              text: `Not posted: this bot has sent ${lastHour} DMs in the last hour, its limit (zulip.budgets.dmsPerHour), AND the owner-notice queue is full (${PENDING_NOTICE_LIMIT} pending), so this notice was NOT queued: the owner is not notified.  Keep the notify step open, record the refusal in the registry row, and retry the DM after the window resets.`,
+            };
+          }
+          session.state.notices.push({ at: now, userId: ownerId, text, attempts: 0 });
           session.markDirty();
           session.save();
           this.log(`[zulip] ${session.role}: DM to user ${ownerId} refused (dm_budget), notice queued (${session.state.notices.length} pending)`);
