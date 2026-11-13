@@ -60,13 +60,21 @@ describe("ZulipStateStore write-path policy", () => {
   });
 
   it("refuses a dangling symlink above a RELATIVE data root", () => {
-    // The fixture lives UNDER the process cwd so the relative root has no
-    // leading "..": a raw split seeded at the filesystem root would check
-    // "/<dirname>" (absent) and misclassify the hostile path as genuine
-    // absence - this pin fails without the resolve() anchoring.
-    const base = mkdtempSync(join(process.cwd(), ".zulip-store-rel-test-"));
+    // The backing tree lives in tmpdir; only a gitignored SYMLINK sits in
+    // the checkout, so a killed run leaves one inert dangling link at most
+    // (gitignored - the dirty-worktree gate never sees it) rather than
+    // scratch data in the tracked tree.  Each run owns exactly one
+    // pid-named entry and removes only that entry, never a parallel run's.
+    // The relative root through that link has no leading "..": a raw split
+    // seeded at the filesystem root would check "/<name>" (absent) and
+    // misclassify the hostile path as genuine absence - this pin fails
+    // without the resolve() anchoring.
+    const base = mkdtempSync(join(tmpdir(), "zulip-store-rel-backing-"));
+    const exposure = join(process.cwd(), `.zulip-store-rel-test-${process.pid}`);
+    rmSync(exposure, { force: true });
+    symlinkSync(base, exposure);
     symlinkSync(join(base, "no-such-target"), join(base, "link"));
-    const root = relative(process.cwd(), join(base, "link", "root"));
+    const root = relative(process.cwd(), join(exposure, "link", "root"));
     try {
       const store = new ZulipStateStore(root);
       // A relative configured root resolves against the process cwd; the
@@ -77,6 +85,7 @@ describe("ZulipStateStore write-path policy", () => {
       expect(() => store.save("bot-plumber", emptyState("BF-Plumber"))).toThrow(/dangling|does not resolve to a directory/);
       expect(existsSync(join(base, "no-such-target"))).toBe(false);
     } finally {
+      rmSync(exposure, { force: true });
       rmSync(base, { recursive: true, force: true });
     }
   });
