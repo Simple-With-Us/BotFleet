@@ -32,11 +32,12 @@ describe("recallPromptFor", () => {
 
     expect(prompt).toContain("recall_search");
     expect(prompt).toContain("recall_contribute");
-    // The three reasons to search, the verify-don't-trust rule, and the
-    // categories a contribution may carry.
-    expect(prompt).toMatch(/re-derive a lesson/);
-    expect(prompt).toMatch(/smells familiar/);
-    expect(prompt).toMatch(/past ruling probably answers/);
+    expect(prompt).toContain("At the start of every turn");
+    expect(prompt).toContain("before substantive action or reply, including continuations and mechanical tasks");
+    expect(prompt).toContain("At the end of every turn");
+    expect(prompt).toContain("search for duplicates and, if appropriate");
+    expect(prompt).toContain("Otherwise add nothing: no filler or public declaration");
+    expect(prompt).toContain("If retrieval is unavailable, record that limitation once");
     expect(prompt).toMatch(/lead to verify rather than a verdict/);
     expect(prompt).toMatch(/lesson, preference, infrastructure, decision, or runbook/);
     expect(prompt).toMatch(/never\s+secrets, and never a transcript/);

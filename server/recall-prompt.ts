@@ -40,10 +40,12 @@ export function recallPromptFor(integrations?: RecallPromptIntegrations | null):
   if (!integrations?.qdrant && !integrations?.recall) return "";
   return (
     " You share a memory corpus with the rest of the fleet — lessons, preferences, infrastructure facts, decisions," +
-    " and runbooks written by other seats and bots.  Search it with recall_search before you re-derive a lesson," +
-    " debug something that smells familiar, or ask a question a past ruling probably answers, and treat a hit as a" +
-    " lead to verify rather than a verdict.  When you learn something reusable, save one paragraph with" +
-    " recall_contribute under the category lesson, preference, infrastructure, decision, or runbook — never" +
-    " secrets, and never a transcript."
+    " and runbooks written by other seats and bots.\u00a0 At the start of every turn, run one targeted recall_search" +
+    " before substantive action or reply, including continuations and mechanical tasks.\u00a0 Treat a hit as a" +
+    " lead to verify rather than a verdict.\u00a0 If retrieval is unavailable, record that limitation once and" +
+    " continue independent work without changing credentials, trust or services.\u00a0 At the end of every turn," +
+    " consider whether new durable knowledge would help the fleet; search for duplicates and, if appropriate," +
+    " save one useful paragraph with recall_contribute under the category lesson, preference, infrastructure," +
+    " decision, or runbook.\u00a0 Otherwise add nothing: no filler or public declaration, never secrets, and never a transcript."
   );
 }
