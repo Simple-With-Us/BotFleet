@@ -20,6 +20,7 @@ interface LiveSession {
   listeners: Set<SttListener>;
   timer: NodeJS.Timeout;
   pending: SttSessionEvent[];
+  finished: boolean;
 }
 
 const MAX_SESSIONS = 8;
@@ -36,10 +37,16 @@ function emit(live: LiveSession, event: SttSessionEvent): void {
   }
 }
 
+function dropLater(id: string, reason: "idle" | "stop"): void {
+  void drop(id, reason).catch(() => {
+    console.error("Could not clean up the speech-to-text session.");
+  });
+}
+
 function touch(live: LiveSession): void {
   clearTimeout(live.timer);
   live.timer = setTimeout(() => {
-    void drop(live.id, "idle").catch(() => {});
+    dropLater(live.id, "idle");
   }, IDLE_MS);
 }
 
@@ -77,12 +84,17 @@ export async function createXaiSttSession(options: CreateXaiSessionOptions): Pro
       deliver({ type: "partial", text, final });
     },
     onDone: (duration) => {
+      // Keep the session until the client stops it or the idle timer fires,
+      // so a trailing audio POST or stop() after the vendor final does not
+      // look like a missing session.
+      const live = sessions.get(id);
+      if (live) live.finished = true;
       deliver({ type: "done", duration });
-      void drop(id, "stop").catch(() => {});
     },
     onError: (message) => {
+      const live = sessions.get(id);
+      if (live) live.finished = true;
       deliver({ type: "error", message });
-      void drop(id, "stop").catch(() => {});
     },
   }, { openSocket: options.openSocket });
   const live: LiveSession = {
@@ -90,16 +102,22 @@ export async function createXaiSttSession(options: CreateXaiSessionOptions): Pro
     stream,
     listeners,
     pending: [],
-    timer: setTimeout(() => { void drop(id, "idle").catch(() => {}); }, IDLE_MS),
+    finished: false,
+    timer: setTimeout(() => { dropLater(id, "idle"); }, IDLE_MS),
   };
   sessions.set(id, live);
   for (const event of early) emit(live, event);
   return id;
 }
 
+export function hasXaiSttSession(id: string): boolean {
+  return sessions.has(id);
+}
+
 export function appendXaiSttAudio(id: string, bytes: Uint8Array): boolean {
   const live = sessions.get(id);
   if (!live) return false;
+  if (live.finished) return true;
   touch(live);
   live.stream.sendAudio(bytes);
   return true;

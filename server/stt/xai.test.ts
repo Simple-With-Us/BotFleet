@@ -54,7 +54,7 @@ describe("transcribeFile", () => {
   });
 });
 
-function fakeSocket() {
+function fakeSocket(options: { autoReady?: boolean } = {}) {
   let handlers: AuthorizedWsHandlers = {};
   const sentBinary: Uint8Array[] = [];
   const sentText: string[] = [];
@@ -66,7 +66,9 @@ function fakeSocket() {
   };
   const open = async (_url: string, _headers: Record<string, string>, next: AuthorizedWsHandlers) => {
     handlers = next;
-    queueMicrotask(() => handlers.onMessage?.(JSON.stringify({ type: "transcript.created" })));
+    if (options.autoReady !== false) {
+      queueMicrotask(() => handlers.onMessage?.(JSON.stringify({ type: "transcript.created" })));
+    }
     return socket;
   };
   return {
@@ -124,6 +126,18 @@ describe("openStreamingSession", () => {
     expect(errors).toEqual([]);
     expect(done).toHaveLength(1);
   });
+
+  it("rejects the ready promise when the socket closes before transcript.created", async () => {
+    const fake = fakeSocket({ autoReady: false });
+    const opening = openStreamingSession("sk-test", { language: "en" }, {}, {
+      openSocket: async (url, headers, handlers) => {
+        const socket = await fake.open(url, headers, handlers);
+        fake.hangup();
+        return socket;
+      },
+    });
+    await expect(opening).rejects.toThrow(/closed before the session finished/);
+  });
 });
 
 describe("session store", () => {
@@ -149,14 +163,18 @@ describe("session store", () => {
     await stopXaiSttSession(id);
   });
 
-  it("ends the session when the socket closes without transcript.done", async () => {
+  it("keeps a completed session until the client stops it", async () => {
     const fake = fakeSocket();
     const id = await createXaiSttSession({ apiKey: "sk-test", params: { language: "en" }, openSocket: fake.open });
     const events: Array<{ type: string }> = [];
     subscribeXaiSttSession(id, (event) => events.push(event));
+    const sentBefore = fake.sentBinary.length;
     fake.hangup();
     await Promise.resolve();
     expect(events.some((event) => event.type === "done")).toBe(true);
+    expect(appendXaiSttAudio(id, new Uint8Array([1]))).toBe(true);
+    expect(fake.sentBinary).toHaveLength(sentBefore);
+    expect(await stopXaiSttSession(id)).toBe(true);
     expect(appendXaiSttAudio(id, new Uint8Array([1]))).toBe(false);
   });
 });

@@ -233,7 +233,9 @@ export function createAssemblyAISTTSession(): STTSession {
             void (async () => {
               await stopCloud("error", false);
               if (generation === attempt + 1) emitEnd({ code: 1, reason: message });
-            })().catch(() => {});
+            })().catch(() => {
+              console.error("Could not stop speech-to-text.");
+            });
           },
           keyterms: opts?.keyterms,
           minTurnSilenceMs: opts?.endpointMs,
@@ -285,6 +287,7 @@ export function createXaiSTTSession(
   let session: XaiTranscriptionSession | null = null;
   let running = false;
   let generation = 0;
+  let finalizingGeneration: number | null = null;
   let finals: string[] = [];
   let partial = "";
 
@@ -306,6 +309,12 @@ export function createXaiSTTSession(
   const stopCloud = async (reason: string, notify = true) => {
     if (!running) return;
     running = false;
+    // Increment before awaiting stop so a start() that begins during the
+    // drain receives a strictly higher generation and is not invalidated
+    // when this stop later finishes.
+    generation += 1;
+    const drainGeneration = generation;
+    finalizingGeneration = drainGeneration - 1;
     const live = session;
     session = null;
     releaseMedia();
@@ -313,8 +322,9 @@ export function createXaiSTTSession(
       await live?.stop();
     } catch {
       // best-effort; the harness session may already have closed
+    } finally {
+      if (generation === drainGeneration) finalizingGeneration = null;
     }
-    generation += 1;
     if (notify) emitEnd({ code: 0, reason });
   };
 
@@ -352,8 +362,9 @@ export function createXaiSTTSession(
           stream,
           onTurn: (turn) => {
             // Keep the original attempt during finish()/stop() so the last
-            // drained final can still land after running is cleared.
-            if (generation !== attempt) return;
+            // drained final can still land after running is cleared and
+            // generation has already advanced.
+            if (generation !== attempt && finalizingGeneration !== attempt) return;
             if (turn.final) {
               finals.push(turn.text);
               partial = "";
@@ -367,7 +378,9 @@ export function createXaiSTTSession(
             void (async () => {
               await stopCloud("error", false);
               if (generation === attempt + 1) emitEnd({ code: 1, reason: message });
-            })();
+            })().catch(() => {
+              console.error("Could not stop speech-to-text.");
+            });
           },
           keyterms: opts?.keyterms,
           minTurnSilenceMs: opts?.endpointMs,

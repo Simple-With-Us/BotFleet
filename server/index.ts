@@ -12424,8 +12424,14 @@ function readBody(req: IncomingMessage, maxBytes = 1_000_000): Promise<any> {
 const NON_JSON_BODY_ROUTES = new Set(["/api/attachments"]);
 const NON_JSON_BODY_ROUTE_PATTERN = /^\/api\/stt\/xai\/sessions\/[^/]+\/audio$/;
 
-function isNonJsonBodyRoute(path: string): boolean {
-  return NON_JSON_BODY_ROUTES.has(path) || NON_JSON_BODY_ROUTE_PATTERN.test(path);
+function isNonJsonBodyRoute(path: string, req: IncomingMessage): boolean {
+  if (NON_JSON_BODY_ROUTES.has(path)) return true;
+  if (!NON_JSON_BODY_ROUTE_PATTERN.test(path)) return false;
+  // Only raw PCM may skip the JSON content-type gate.  A CORS-simple
+  // text/plain POST must still receive a 415 so a cross-origin page cannot
+  // append attacker-controlled bytes to a live dictation session.
+  const type = String(req.headers["content-type"] ?? "").split(";")[0]!.trim().toLowerCase();
+  return type === "application/octet-stream";
 }
 
 /** The 415 a mutating request gets when it carries a body the harness will
@@ -13708,7 +13714,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         path !== "/api/health" && path !== "/api/update/status") {
       return json(res, 503, { error: controlShutdownPending ? "server shutdown is in progress" : "BotFleet is quiescing for an update" });
     }
-    if (mutatingApiRequest && !isNonJsonBodyRoute(path) && hasRequestBody(req) && !isJsonContentType(req)) {
+    if (mutatingApiRequest && !isNonJsonBodyRoute(path, req) && hasRequestBody(req) && !isJsonContentType(req)) {
       // the commands route names its code so a client can branch on it
       return json(res, 415, /^\/api\/bots\/[\w-]+\/commands$/.test(path)
         ? { error: UNSUPPORTED_JSON_BODY, code: "unsupported_media_type" }

@@ -8,6 +8,7 @@ import { transcribeFile } from "./xai.ts";
 import {
   appendXaiSttAudio,
   createXaiSttSession,
+  hasXaiSttSession,
   stopXaiSttSession,
   subscribeXaiSttSession,
 } from "./sessions.ts";
@@ -32,12 +33,12 @@ export const SttFileRequestSchema = z.object({
   filename: z.string().max(255).optional(),
   mime: z.string().max(127).optional(),
   language: z.string().max(32).optional(),
-  keyterms: z.array(z.string().max(50)).max(100).optional(),
+  keyterms: z.array(z.string()).max(100).optional(),
 }).strict();
 
 export const SttSessionRequestSchema = z.object({
   language: z.string().max(32).optional(),
-  keyterms: z.array(z.string().max(50)).max(100).optional(),
+  keyterms: z.array(z.string()).max(100).optional(),
   endpointMs: z.number().finite().max(60_000).optional(),
 }).strict();
 
@@ -170,11 +171,9 @@ export async function handleXaiSttRoutes(args: {
   const eventsMatch = path.match(/^\/api\/stt\/xai\/sessions\/([^/]+)\/events$/);
   if (eventsMatch && method === "GET") {
     const id = eventsMatch[1]!;
-    const off = subscribeXaiSttSession(id, (event) => {
-      if (res.writableEnded) return;
-      res.write(`data: ${JSON.stringify(event)}\n\n`);
-    });
-    if (!off) {
+    // Headers must go out before subscribe replays any queued events, or
+    // res.write() throws ERR_HTTP_HEADERS_SENT and the EventSource drops.
+    if (!hasXaiSttSession(id)) {
       json(res, 404, { error: "Dictation session is not running." });
       return true;
     }
@@ -184,6 +183,14 @@ export async function handleXaiSttRoutes(args: {
       connection: "keep-alive",
     });
     res.write("\n");
+    const off = subscribeXaiSttSession(id, (event) => {
+      if (res.writableEnded) return;
+      res.write(`data: ${JSON.stringify(event)}\n\n`);
+    });
+    if (!off) {
+      res.end();
+      return true;
+    }
     req.on("close", () => off());
     return true;
   }

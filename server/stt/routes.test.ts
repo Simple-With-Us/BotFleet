@@ -24,3 +24,10 @@ describe("STT request schemas", () => {
     expect(SttFileRequestSchema.safeParse({ audioBase64: "AAAA" }).success).toBe(true);
   });
 });
+
+  it("accepts a keyterm longer than 50 characters, matching parseKeyterms", () => {
+    const term = "A".repeat(80);
+    expect(SttSessionRequestSchema.safeParse({ keyterms: [term] }).success).toBe(true);
+    expect(SttFileRequestSchema.safeParse({ audioBase64: "AAAA", keyterms: [term] }).success).toBe(true);
+  });
+

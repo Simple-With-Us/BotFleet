@@ -265,6 +265,10 @@ describe("harness trust boundary", () => {
         "content-type": "application/octet-stream",
       });
       expect(xaiAudio.status).not.toBe(415);
+      const xaiPlain = await raw("/api/stt/xai/sessions/sess-test/audio", "pcm", {
+        "content-type": "text/plain",
+      });
+      expect(xaiPlain.status).toBe(415);
       // A bodyless mutating request has no content type to check.
       const stoppable = (await api("POST", "/api/bots", { name: "Stopper" })).body.bot;
       expect((await api("POST", `/api/bots/${stoppable.id}/interrupt`, {})).status).not.toBe(415);

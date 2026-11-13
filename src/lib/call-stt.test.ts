@@ -154,4 +154,55 @@ describe("xAI STT lifecycle", () => {
     expect(createSTTSession("xai").provider).toBe("xai");
     expect(() => createSTTSession("meta")).toThrow(/does not ship its streaming bridge/i);
   });
+
+  it("still delivers a drained final after finish advances generation", async () => {
+    setup();
+    let onTurn: ((value: { text: string; final: boolean }) => void) | undefined;
+    const drainStarted = deferred<void>();
+    const releaseDrain = deferred<void>();
+    const session = createXaiSTTSession(async (opts) => {
+      onTurn = opts.onTurn;
+      return {
+        stop: async () => {
+          drainStarted.resolve();
+          onTurn?.({ text: "Last words.", final: true });
+          await releaseDrain.promise;
+        },
+      };
+    });
+    const transcript = vi.fn();
+    session.onTranscript(transcript);
+    await session.start();
+    const finishing = session.finish();
+    await drainStarted.promise;
+    expect(transcript).toHaveBeenCalledWith({ text: "Last words.", partial: false });
+    releaseDrain.resolve();
+    await finishing;
+  });
+
+  it("does not drop turns from a session that starts during the previous drain", async () => {
+    setup();
+    let onTurn: ((value: { text: string; final: boolean }) => void) | undefined;
+    const firstDrain = deferred<void>();
+    let starts = 0;
+    const session = createXaiSTTSession(async (opts) => {
+      starts += 1;
+      onTurn = opts.onTurn;
+      if (starts === 1) {
+        return { stop: () => firstDrain.promise };
+      }
+      return { stop: async () => {} };
+    });
+    const transcript = vi.fn();
+    session.onTranscript(transcript);
+    await session.start();
+    const stopping = session.stop();
+    await session.start();
+    firstDrain.resolve();
+    await stopping;
+    if (!onTurn) throw new Error("expected the restarted session to register onTurn");
+    onTurn({ text: "After restart.", final: true });
+    expect(transcript).toHaveBeenCalledWith({ text: "After restart.", partial: false });
+    await session.stop();
+  });
 });

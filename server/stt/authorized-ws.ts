@@ -7,6 +7,9 @@ import { request as httpsRequest } from "node:https";
 import { request as httpRequest, type IncomingMessage } from "node:http";
 import { z } from "zod";
 
+// Unknown upgrade-response fields are intentionally ignored.  The vendor or
+// the Node HTTP parser may add headers and properties, and a strict schema
+// would reject a valid 101 Switching Protocols response.
 export const UpgradeResponseSchema = z.object({
   statusCode: z.number().int().optional(),
 }).passthrough();

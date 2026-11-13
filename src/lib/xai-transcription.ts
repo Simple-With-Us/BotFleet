@@ -175,8 +175,11 @@ export async function startXaiTranscription({
   try {
     capture = await io.attachCapture(stream, enqueueAudio, () => !stopping);
   } catch (error) {
-    await io.stopSession(sessionId);
-    unsubscribe();
+    try {
+      await io.stopSession(sessionId);
+    } finally {
+      unsubscribe();
+    }
     throw error;
   }
 
@@ -185,10 +188,17 @@ export async function startXaiTranscription({
       if (stopping) return;
       stopping = true;
       await capture.stop().catch(() => {});
-      await flushAudio().catch(() => {});
+      if (flushTimer) {
+        clearTimeout(flushTimer);
+        flushTimer = null;
+      }
+      sending = sending.then(flushAudio);
       await sending.catch(() => {});
-      await io.stopSession(sessionId);
-      unsubscribe();
+      try {
+        await io.stopSession(sessionId);
+      } finally {
+        unsubscribe();
+      }
     },
   };
 }

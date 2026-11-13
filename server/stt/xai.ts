@@ -185,8 +185,13 @@ export async function openStreamingSession(
     },
     onClose: () => {
       closed = true;
-      if (ready) notify("done");
-      else notify("error", "xAI speech-to-text closed before the session finished.");
+      if (ready) {
+        notify("done");
+        return;
+      }
+      const message = "xAI speech-to-text closed before the session finished.";
+      rejectReady(new Error(message));
+      notify("error", message);
     },
   });
 
