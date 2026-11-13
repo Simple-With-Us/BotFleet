@@ -1,7 +1,7 @@
 // The Zulip source end to end against a fake Zulip server: real HTTP, real
 // event queues, real files on disk, and a fake `startTurn` standing in for
 // the harness.  Each test boots its own fake realm and its own data folder.
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -2882,5 +2882,35 @@ describe("review fixes: round 12 (reset counter carry, notice event keys, archiv
     expect(readFileSync(statePath, "utf8")).toBe("{ not json");
     await blocked.stop();
     rmSync(join(dataDir, "zulip", "bot-plumber.notices-archive.jsonl"), { recursive: true, force: true });
+  });
+
+  it("archives a genuine recurrence of identical damage as a new incident", async () => {
+    const first = makeHub();
+    await connected(first);
+    sessionOf(first).markDirty();
+    sessionOf(first).save();
+    await first.stop();
+    const statePath = join(dataDir, "zulip", "bot-plumber.json");
+    const damaged = `${JSON.stringify(Object.assign(stateFileSchema.parse(JSON.parse(readFileSync(statePath, "utf8"))), { dms: "not-an-array" }))}\n`;
+    const archivePath = join(dataDir, "zulip", "bot-plumber.notices-archive.jsonl");
+    writeFileSync(statePath, damaged);
+    const blocked = makeHub();
+    await waitFor(() => logs.some((line) => line.includes("state load failed")), "the loud load failure");
+    const afterFirst = readFileSync(archivePath, "utf8");
+    const firstLines = afterFirst.trimEnd().split("\n").length;
+    await blocked.stop();
+    // Same bytes, NEW damage event (new mtime): the recurrence is evidence
+    // and must be archived again, not deduped away.
+    writeFileSync(statePath, damaged);
+    const later = new Date(Date.now() + 5000);
+    utimesSync(statePath, later, later);
+    const blockedAgain = makeHub();
+    await waitFor(
+      () => logs.filter((line) => line.includes("state load failed")).length >= 2,
+      "the repeated loud failure",
+    );
+    const afterSecond = readFileSync(archivePath, "utf8");
+    expect(afterSecond.trimEnd().split("\n")).toHaveLength(firstLines * 2);
+    await blockedAgain.stop();
   });
 });

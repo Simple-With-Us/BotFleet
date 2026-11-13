@@ -161,10 +161,24 @@ export const stateFileSchema = stateFileSchemaBase.strict();
  *  raw fields with this schema instead: absent probes clean (legacy files
  *  predate the field and get the default), present-but-malformed refuses
  *  the load closed. */
+/** Load-time fingerprint of the damaged state file: reconcile retries of
+ *  one blocked load (byte-identical file, same mtime+size) dedup, while a
+ *  genuine recurrence after repair carries a new mtime and is archived
+ *  again - the recurrence stays visible in the evidence. */
+interface ArchiveFingerprint {
+  mtimeMs: number;
+  size: number;
+}
+
 /** One line of the notices archive, validated before the dedup read
  *  trusts its fields; a malformed line is simply not a match. */
 const archiveLineSchema = z
-  .object({ archivedAt: z.number(), reason: z.string(), entry: z.unknown() })
+  .object({
+    archivedAt: z.number(),
+    reason: z.string(),
+    entry: z.unknown(),
+    fingerprint: z.object({ mtimeMs: z.number(), size: z.number() }).optional(),
+  })
   .strict();
 
 const ledgerProbeSchemas = {
@@ -199,8 +213,18 @@ export class ZulipStateStore {
    *  ledgers, relabelled, so the next save writes the canonical role. */
   load(botId: string, role: string): ZulipBotState {
     let text: string;
+    let fingerprint: ArchiveFingerprint | undefined;
     try {
-      text = readFileSync(join(this.dir, fileName(botId)), "utf8");
+      // Read through an opened descriptor so the incident fingerprint
+      // describes the exact bytes loaded, not a later state of the path.
+      const fd = openSync(join(this.dir, fileName(botId)), constants.O_RDONLY);
+      try {
+        const stat = fstatSync(fd);
+        fingerprint = { mtimeMs: stat.mtimeMs, size: stat.size };
+        text = readFileSync(fd, "utf8");
+      } finally {
+        closeSync(fd);
+      }
     } catch {
       return emptyState(role);
     }
@@ -215,7 +239,7 @@ export class ZulipStateStore {
       // and loud (state file untouched) while the others run, and the next
       // reconcile retries.
       try {
-        this.archiveLoadIncident(botId, "state-unparseable-on-load", [text]);
+        this.archiveLoadIncident(botId, "state-unparseable-on-load", [text], fingerprint);
       } catch (error) {
         this.onArchiveError?.(
           `state quarantine failed for ${botId}; original file left byte-identical for retry: ${
@@ -255,6 +279,7 @@ export class ZulipStateStore {
             botId,
             "state-unknown-keys-on-load",
             unknownEntries.map(([key, value]) => ({ key, value })),
+            fingerprint,
           );
         } catch (error) {
           // Fail closed.  Resuming with the cleaned in-memory state would
@@ -283,7 +308,7 @@ export class ZulipStateStore {
         // trusted: quarantine it and refuse the load rather than resuming
         // with empty caps and no pending work.  Same containment as above.
         try {
-          this.archiveLoadIncident(botId, "state-schema-invalid-on-load", [rawJson]);
+          this.archiveLoadIncident(botId, "state-schema-invalid-on-load", [rawJson], fingerprint);
         } catch (error) {
           this.onArchiveError?.(
             `state quarantine failed for ${botId}; original file left byte-identical for retry: ${
@@ -327,7 +352,7 @@ export class ZulipStateStore {
       }
       if (ledgerDamaged) {
         try {
-          this.archiveLoadIncident(botId, "state-ledger-damaged-on-load", [rawJson]);
+          this.archiveLoadIncident(botId, "state-ledger-damaged-on-load", [rawJson], fingerprint);
         } catch (error) {
           this.onArchiveError?.(
             `state quarantine failed for ${botId}; original file left byte-identical for retry: ${
@@ -410,22 +435,82 @@ export class ZulipStateStore {
    *  created it as a real directory, or the final handle/path inode check
    *  below still guards the file itself. */
   /** Create the state directory if missing and hold its mode at 0700
-   *  through an opened, verified descriptor - never chmod(2) on the path,
+   *  through an opened, PROVEN descriptor - never chmod(2) on the path,
    *  which would follow a swapped link to its target.  Callers verify the
-   *  ancestors FIRST so a planted link receives no mutation at all. */
+   *  ancestors FIRST so a planted link receives no mutation at all.  The
+   *  mode repair itself is best effort: a directory the process can write
+   *  but not read must not make persistence fatal. */
   private ensureStateDir(): void {
     mkdirSync(this.dir, { recursive: true, mode: 0o700 });
-    if (!lstatSync(this.dir).isDirectory()) {
+    const linkStat = lstatSync(this.dir);
+    let followRootLink = false;
+    if (linkStat.isSymbolicLink()) {
+      // Mirror the ancestor policy: a root-owned link that resolves to a
+      // directory is permitted (the /var -> /private/var pattern);
+      // anything else refuses the write.
+      if (linkStat.uid !== 0 || !statSync(this.dir).isDirectory()) {
+        throw new Error(
+          `state directory ${this.dir} is a symlink not owned by root or not resolving to a directory; refusing to write`,
+        );
+      }
+      followRootLink = true;
+    } else if (!linkStat.isDirectory()) {
       throw new Error(`state directory ${this.dir} is not a plain directory; refusing to write`);
     }
-    const dirFd = openSync(this.dir, constants.O_RDONLY | constants.O_NOFOLLOW);
+    let dirFd: number;
     try {
-      fchmodSync(dirFd, 0o700);
-    } catch {
-      /* best effort: the files themselves are 600 */
+      dirFd = openSync(
+        this.dir,
+        followRootLink ? constants.O_RDONLY : constants.O_RDONLY | constants.O_NOFOLLOW,
+      );
+    } catch (error) {
+      // SAFETY: filesystem failures carry .code; an unreadable but
+      // writable directory skips only the mode repair.
+      if ((error as NodeJS.ErrnoException).code !== "EACCES") throw error;
+      return;
+    }
+    try {
+      // Prove the handle is the directory the path names right now: a
+      // rename between open and fchmod must never retarget the mode
+      // change.  A permitted root-owned link is proven against its
+      // resolved target instead.
+      const handleStat = fstatSync(dirFd);
+      const pathStat = followRootLink ? statSync(this.dir) : lstatSync(this.dir);
+      if (
+        !handleStat.isDirectory() ||
+        !pathStat.isDirectory() ||
+        handleStat.dev !== pathStat.dev ||
+        handleStat.ino !== pathStat.ino
+      ) {
+        throw new Error(`state directory ${this.dir} changed under the open; refusing to write`);
+      }
+      try {
+        fchmodSync(dirFd, 0o700);
+      } catch {
+        /* best effort: the files themselves are 600 */
+      }
     } finally {
       closeSync(dirFd);
     }
+  }
+
+  /** Verify, create, re-verify: the store stays self-sufficient when the
+   *  configured data root does not exist yet (realpathSync needs an
+   *  existing root), without mutating anything before a passed
+   *  verification.  Only a MISSING root is tolerated; policy violations
+   *  always refuse. */
+  private verifyThenEnsureDir(path: string): void {
+    try {
+      this.verifyArchiveAncestors(path);
+    } catch (error) {
+      // SAFETY: realpathSync failures carry .code; policy violations
+      // thrown by verifyArchiveAncestors are plain Errors without one.
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    this.ensureStateDir();
+    // Re-verify UNCONDITIONALLY after creation: what exists now is what
+    // the write below uses, and a planted link must receive no mutation.
+    this.verifyArchiveAncestors(path);
   }
 
   private verifyArchiveAncestors(path: string): void {
@@ -474,7 +559,7 @@ export class ZulipStateStore {
    *  not necessarily the final line, and a multi-entry incident spans
    *  several lines.  A miss appends: a duplicate is evidence, never
    *  loss. */
-  private archiveLoadIncident(botId: string, reason: string, entries: unknown[]): void {
+  private archiveLoadIncident(botId: string, reason: string, entries: unknown[], fingerprint?: ArchiveFingerprint): void {
     const path = join(this.dir, fileName(botId).replace(/\.json$/, ".notices-archive.jsonl"));
     try {
       // The dedup read is part of the durability claim, so it gets the
@@ -514,7 +599,8 @@ export class ZulipStateStore {
             if (
               !candidate.success ||
               candidate.data.reason !== reason ||
-              JSON.stringify(candidate.data.entry) !== JSON.stringify(entries[index])
+              JSON.stringify(candidate.data.entry) !== JSON.stringify(entries[index]) ||
+              JSON.stringify(candidate.data.fingerprint ?? null) !== JSON.stringify(fingerprint ?? null)
             ) {
               match = false;
               break;
@@ -530,22 +616,31 @@ export class ZulipStateStore {
       // the path itself is hostile, archive() below throws and the load
       // fails closed).
     }
-    this.archive(botId, reason, entries);
+    this.archive(botId, reason, entries, fingerprint);
   }
 
   /** Append records to the bot's private notices archive (mode-600 JSONL
    *  next to the state file): the evidence for anything the ledger no
    *  longer carries.  Contents are never logged or posted. */
-  private archive(botId: string, reason: string, entries: unknown[]): void {
+  private archive(botId: string, reason: string, entries: unknown[], fingerprint?: ArchiveFingerprint): void {
     if (entries.length === 0) return;
     const path = join(this.dir, fileName(botId).replace(/\.json$/, ".notices-archive.jsonl"));
     // Ancestors first, BEFORE any mutation: a planted link in the path
     // above the file redirects the write even with O_NOFOLLOW on the final
     // component, and it must not even have its target created or
     // re-permissioned.
-    this.verifyArchiveAncestors(path);
-    this.ensureStateDir();
-    const lines = entries.map((entry) => JSON.stringify({ archivedAt: Date.now(), reason, entry })).join("\n") + "\n";
+    this.verifyThenEnsureDir(path);
+    const archivedAt = Date.now();
+    const lines =
+      entries
+        .map((entry) =>
+          JSON.stringify(
+            fingerprint === undefined
+              ? { archivedAt, reason, entry }
+              : { archivedAt, reason, entry, fingerprint },
+          ),
+        )
+        .join("\n") + "\n";
     // Follow no link: a swapped archive path must never redirect the
     // write.  Open with O_NOFOLLOW, then prove the handle is the same
     // regular, single-link file the path still names - a race can swap it
@@ -594,8 +689,7 @@ export class ZulipStateStore {
     // even have its target created or re-permissioned.  A violation
     // throws - session.save logs it and the in-memory ledgers survive to
     // retry.
-    this.verifyArchiveAncestors(join(this.dir, fileName(botId)));
-    this.ensureStateDir();
+    this.verifyThenEnsureDir(join(this.dir, fileName(botId)));
     // Bound every ledger before it reaches disk.
     if (state.handled.length > HANDLED_RING_LIMIT) state.handled = state.handled.slice(-HANDLED_RING_LIMIT);
     state.wakes = state.wakes.filter((w) => now - w.at < WAKE_LEDGER_MS).slice(-WAKE_LEDGER_LIMIT);
@@ -632,8 +726,15 @@ export class ZulipStateStore {
     state.notices = bounded;
     writeFileAtomic(join(this.dir, fileName(botId)), `${JSON.stringify(state)}\n`, { mode: 0o600 });
     if (process.platform !== "win32") {
-      const fd = openSync(this.dir, "r");
-      try { fsyncSync(fd); } finally { closeSync(fd); }
+      try {
+        const fd = openSync(this.dir, "r");
+        try { fsyncSync(fd); } finally { closeSync(fd); }
+      } catch (error) {
+        // SAFETY: filesystem failures carry .code.  The directory fsync is
+        // a durability extra; an unreadable directory still holds the
+        // renamed file, so it must not fail the save.
+        if ((error as NodeJS.ErrnoException).code !== "EACCES") throw error;
+      }
     }
   }
 }
