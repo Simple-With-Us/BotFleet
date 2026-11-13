@@ -81,7 +81,7 @@ function clipsFeed() {
 }
 
 describe("attachKaraoke with a hosted voice", () => {
-  it("aligns with the spans and rolls the spoken word in, leaving every other word alone", () => {
+  it("aligns with the spans and bolds the spoken word, with a lead and a trail", () => {
     const fx = fakeEnv();
     const { feed, audio, script } = clipsFeed();
     const session = attachKaraoke(mount(RENDERED), feed, SOURCE, { env: fx.env, schedule: fx.schedule });
@@ -100,8 +100,9 @@ describe("attachKaraoke with a hosted voice", () => {
     audio.currentTime = (startMs + 30) / 1000;
     fx.flush();
     const current = fx.painted("current");
-    expect(current).toHaveLength(1);
-    expect("passed".startsWith(current[0])).toBe(true);
+    expect(current).toEqual(["passed"]);
+    expect(fx.painted("lead").length + fx.painted("leadFar").length).toBeGreaterThan(0);
+    expect(fx.painted("trail").length).toBeGreaterThan(0);
     // Nothing dims the rest of the message when reading starts.
     expect(fx.painted("ahead")).toEqual([]);
     expect(script.spokenText).toContain("749");

@@ -286,6 +286,9 @@ const DRIVER_DISPLAY_NAME = new Map<string, string>([
   ["piAgent", "pi"],
   ["mcodeAgent", "MiniMax Code"],
   ["museAgent", "Muse Code"],
+  // The humanizer would render the bare kind ("Zcodeacp"); both ZCode
+  // drivers present under the engine's own name.
+  ["zcodeAcp", "ZCode"],
 ]);
 
 export function driverDisplayName(driverKind: string): string {

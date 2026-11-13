@@ -1,22 +1,24 @@
 # cloudflared release provenance
 
-BotFleet stages the official `cloudflared` 2026.8.2 executable as a separate
-process. The binaries come from Cloudflare's official GitHub release:
+BotFleet stages the official `cloudflared` 2026.10.3 executable as a separate
+process.  The binaries come from Cloudflare's official GitHub release:
 
-<https://github.com/cloudflare/cloudflared/releases/tag/2026.8.2>
+<https://github.com/cloudflare/cloudflared/releases/tag/2026.10.3>
 
 `scripts/prepare-cloudflared.mjs` verifies these SHA-256 digests before an
 executable can be staged:
 
 | BotFleet target | Release asset | Release asset SHA-256 | Extracted executable SHA-256 |
 | --- | --- | --- | --- |
-| macOS arm64 | `cloudflared-darwin-arm64.tgz` | `9042c2c5d8b2de78e60f313d5fb31b6c5c1cebde787a3caf1f2c9588084ac442` | `b61054d3d6326ea558cb49826eebf5676e0d0a36d51b546975096ca3e0e3c89d` |
-| macOS x64 | `cloudflared-darwin-amd64.tgz` | `f1727723c586500e2092368ae21871b3df7ddfd2cb097f22d81bee4a9c458bb4` | `b0f770e1e0b281399a57219b840fd8eef1cc25387a404124248157ea2073727a` |
-| Linux x64 | `cloudflared-linux-amd64` | `fcfb02b575a52ca1af2e3267af4e1517bcdeb30ac48c834c69abaed3c0576ad2` | same as release asset |
-| Windows x64 | `cloudflared-windows-amd64.exe` | `c29eee2b121f5436a642eed69fd9767da7e7b8c510fa50aaa130337f931357b5` | same as release asset |
+| macOS arm64 | `cloudflared-darwin-arm64.tgz` | `1165d14b6f6360a3b8c283d7d1100024d6ec7cd9bc9e32519e96150645f3ec55` | `f249139e0541fa589c987397d867cc16c83ab1236d31eb6782f2e4552ee9cf80` |
+| macOS x64 | `cloudflared-darwin-amd64.tgz` | `81b7b85f2376815c4f59b1aa323887b62e16ce8b67555c2e1577dc23f2a82000` | `947e2942d6a59922d80190d23b12f3ade8da16e23e3bd937182a48993b7c00db` |
+| Linux x64 | `cloudflared-linux-amd64` | `053b80b0a23031a038fdbf3c073f59f82b8f1f152aa67971d7383ffafc0dbab0` | same as release asset |
+| Windows x64 | `cloudflared-windows-amd64.exe` | `76b2805253d0d6ffacb092a7acfbee99e7af6917835c0c5410e23f3ef5052da2` | same as release asset |
+
+For the two Darwin `.tgz` files, the checksum text in the release notes matches the extracted executable bytes, not the downloaded archive bytes.  The archive digests above match GitHub's current asset metadata and were recomputed from the downloaded release assets; the executable digests were recomputed from the extracted files and match the release checksum text.  Release review confirmed a Debian container base-image CA-store change; it does not establish a corresponding CA-bundle change in BotFleet's packaged macOS executable.
 
 The staged executables are generated build output and are intentionally not
-checked into git. The preparation script downloads release archives from the
+checked into git.  The preparation script downloads release archives from the
 URL above (10 minute timeout, 3 attempts, 5 second delay between attempts)
 and keeps a verified copy of each in a shared cache
 (`~/Library/Caches/BotFleet/cloudflared-archives` on macOS) so a later
@@ -28,20 +30,20 @@ below before it is trusted; a mismatch is treated as a cache miss and
 re-downloaded.
 
 The macOS release process applies BotFleet's Developer ID signature to the
-staged executable as part of signing the app bundle. It verifies the unsigned
+staged executable as part of signing the app bundle.  It verifies the unsigned
 upstream digest before that necessary packaging change, then verifies the
-nested signature, signing team, and architecture before notarization. Linux
+nested signature, signing team, and architecture before notarization.  Linux
 and Windows packages retain the exact reviewed upstream executable bytes.
 
 The executable is also asked to report its own version, and that step waits
-60 seconds with one retry. `cloudflared version` prints in well under two
+60 seconds with one retry.  `cloudflared version` prints in well under two
 seconds on an idle host, so a longer wait costs nothing when the machine is
 healthy, while a build running on a heavily loaded fleet host no longer
-reports a saturated CPU as a version mismatch. Only a timeout is retried: a
+reports a saturated CPU as a version mismatch.  Only a timeout is retried: a
 missing, non-executable, or wrong-version binary fails the same way twice, so
 the error names what actually happened -- exit status, terminating signal, or
 spawn error -- instead of a bare "did not identify as cloudflared".
 
-cloudflared is licensed under Apache License 2.0. The distribution includes a
+cloudflared is licensed under Apache License 2.0.  The distribution includes a
 separately named copy of the complete Apache 2.0 text at
 `resources/licenses/cloudflared-LICENSE.txt`.

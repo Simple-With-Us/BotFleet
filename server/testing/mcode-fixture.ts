@@ -26,6 +26,11 @@ const execFileAsync = promisify(execFile);
 /** The stdio MCP server that reports its own launch variables (`dump_env`). */
 export const ENV_PROBE_MCP = join(dirname(fileURLToPath(import.meta.url)), "env-probe-mcp.mjs");
 
+/** The stdio MCP server that stands in for the fleet's simple-chat entry
+ *  (`whoami`), so the test that reads the seat a turn would sign as does not
+ *  depend on which simple-chat the host has installed. */
+export const SIMPLE_CHAT_MCP = join(dirname(fileURLToPath(import.meta.url)), "simple-chat-mcp.mjs");
+
 /** The picker id of the fixture model:  the model id plus the `thinking` mode
  *  mcode gives a custom provider's model.  A BotFleet turn passes it as
  *  `model`, so the driver selects it and never the real MiniMax rows. */
@@ -265,17 +270,17 @@ export async function writeMcodeFixture(input: {
   return { dataDir, home };
 }
 
-/** The environment that hands `agent-sync mcp` a seat's bot credentials,
+/** The environment that hands `simple-chat mcp` a seat's bot credentials,
  *  pointing at a fake realm:  `ZULIP_<CODE>_EMAIL` and `ZULIP_<CODE>_API_KEY`
  *  for each bot (CODE is the seat with hyphens as underscores) and
  *  `ZULIP_SITE`, which is how an MCP server is given a key now that no
- *  credential folder is read (AFC-359).  `AGENT_SYNC_INFISICAL=0` keeps it from
+ *  credential folder is read (AFC-359).  `SIMPLE_TOOLS_INFISICAL=0` keeps it from
  *  asking the real vault for anything else.  The keys are a fixture's. */
 export function zulipCredentialEnv(input: {
   site: string;
   bots: ReadonlyArray<{ seat: string; email: string; key: string }>;
 }): Record<string, string> {
-  const env: Record<string, string> = { ZULIP_SITE: input.site, AGENT_SYNC_INFISICAL: "0" };
+  const env: Record<string, string> = { ZULIP_SITE: input.site, SIMPLE_TOOLS_INFISICAL: "0" };
   for (const bot of input.bots) {
     const code = bot.seat.toUpperCase().replace(/[^A-Z0-9]/g, "_");
     env[`ZULIP_${code}_EMAIL`] = bot.email;

@@ -7,7 +7,14 @@ import { homedir, tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { augmentedPath, findCliCandidates, resetPathCache, resetPathCacheForTests, splitCliString } from "./env-path.ts";
+import {
+  augmentedPath,
+  findCliCandidates,
+  resetPathCache,
+  resetPathCacheForTests,
+  setKnownDirsForTests,
+  splitCliString,
+} from "./env-path.ts";
 import { resolveCli } from "./procs.ts";
 import { removeTempDir } from "./testing/cleanup.ts";
 
@@ -380,7 +387,12 @@ describe("augmentedPath", () => {
       // augmentedPath(), so execFile below ran the host binary and failed even
       // when candidates[0] was already the canonical path we planted.
       process.env.PATH = symlinkFarm;
+      // The merge also carries the well-known install dirs, and a host that
+      // has an `mcode` in one of them (/usr/local/bin carries one on some
+      // machines) answers this lookup instead of the fixture.  The known dirs
+      // are the canonical dir this test planted, and nothing else.
       resetPathCacheForTests();
+      setKnownDirsForTests([installerDir]);
       const candidates = findCliCandidates("mcode");
       expect(candidates[0]).toBe(canonical);
       expect(candidates).toHaveLength(1);
@@ -392,6 +404,7 @@ describe("augmentedPath", () => {
     } finally {
       if (previous === undefined) delete process.env.PATH;
       else process.env.PATH = previous;
+      setKnownDirsForTests(null);
       resetPathCacheForTests();
     }
   });
@@ -410,6 +423,24 @@ describe("augmentedPath", () => {
       else process.env.LOCALAPPDATA = previous;
       resetPathCacheForTests();
       rmSync(localAppData, { recursive: true, force: true });
+    }
+  });
+
+  it("drops the known-dir override with the cache, so it cannot outlive its case", () => {
+    // The known install dirs are an override,  and an override that outlives
+    // the case that set it redirects every later lookup in the process.  The
+    // global afterEach calls resetPathCacheForTests(),  so that is where the
+    // override has to go with the cache:  a case that forgets its own restore
+    // must not become the next case's environment.
+    const dir = mkdtempSync(join(tmpdir(), "omb-known-dirs-"));
+    try {
+      setKnownDirsForTests([dir]);
+      expect(augmentedPath().split(delimiter)).toContain(dir);
+      resetPathCacheForTests();
+      expect(augmentedPath().split(delimiter)).not.toContain(dir);
+    } finally {
+      resetPathCacheForTests();
+      removeTempDir(dir);
     }
   });
 });
@@ -618,13 +649,18 @@ describe("findCliCandidates", () => {
     const previous = process.env.PATH;
     try {
       process.env.PATH = bin;
+      // No known install dirs:  the merge carries them whatever the inherited
+      // PATH says, and a host with a `dsh` in one of them would answer this
+      // lookup instead of the fixture's own binaries.
       resetPathCacheForTests();
+      setKnownDirsForTests([]);
       writeFileSync(join(bin, "dsh"), "#!/bin/sh\n");
       writeFileSync(join(bin, "clutch"), "#!/bin/sh\n");
       expect(findCliCandidates(["dsh", "clutch"])).toEqual([join(bin, "dsh"), join(bin, "clutch")]);
     } finally {
       if (previous === undefined) delete process.env.PATH;
       else process.env.PATH = previous;
+      setKnownDirsForTests(null);
       resetPathCacheForTests();
     }
   });
@@ -636,6 +672,7 @@ describe("findCliCandidates", () => {
     try {
       process.env.PATH = bin;
       resetPathCacheForTests();
+      setKnownDirsForTests([]);
       writeFileSync(join(bin, "clutch"), "#!/bin/sh\n");
       // The regression itself: searching the default alone answers empty, so
       // the picker rendered Clutch as having no binary at all.
@@ -644,6 +681,7 @@ describe("findCliCandidates", () => {
     } finally {
       if (previous === undefined) delete process.env.PATH;
       else process.env.PATH = previous;
+      setKnownDirsForTests(null);
       resetPathCacheForTests();
     }
   });
@@ -694,6 +732,7 @@ describe("findCliCandidates", () => {
     try {
       process.env.PATH = [real, link].join(delimiter);
       resetPathCacheForTests();
+      setKnownDirsForTests([]);
       const bin = join(real, "dsh");
       writeFileSync(bin, "#!/bin/sh\n");
       symlinkSync(bin, join(link, "dsh"));
@@ -701,6 +740,7 @@ describe("findCliCandidates", () => {
     } finally {
       if (previous === undefined) delete process.env.PATH;
       else process.env.PATH = previous;
+      setKnownDirsForTests(null);
       resetPathCacheForTests();
     }
   });

@@ -68,6 +68,25 @@ public struct OptionCard: Codable, Hashable, Sendable {
     /// Permission cards carry a tool; questions do not.
     public var isPermission: Bool { tool != nil }
 
+    /// Whether the choices should be stacked full-width instead of laid
+    /// out as equal-width capsules in one row.  A permission card's
+    /// Allow/Deny pair always fits the row, so only questions stack — when
+    /// there are more than two choices, or any one of them is too long to
+    /// survive being squeezed into a share of the row.
+    public var prefersStackedChoices: Bool {
+        Self.prefersStackedChoices(options: options, isPermission: isPermission)
+    }
+
+    /// The longest choice a two-across capsule row can show before the
+    /// text is crushed past reading.
+    public static let stackedChoiceLength = 18
+
+    public static func prefersStackedChoices(options: [String], isPermission: Bool) -> Bool {
+        guard !isPermission else { return false }
+        if options.count > 2 { return true }
+        return options.contains { $0.count > stackedChoiceLength }
+    }
+
     /// The wire API accepts an approval behavior rather than the button's
     /// display text. Treat the one refusal as deny and every other offered
     /// permission choice as allow: providers may say "Approve", "Yes", or
@@ -110,6 +129,10 @@ public struct ToolActivity: Codable, Hashable, Sendable {
     public var kind: String?
     public var detail: String?
     public var durationMs: Int?
+    /// The harness id for this step.  A child step points at the step that
+    /// started it with `parentItemId`.
+    public var itemId: String? = nil
+    public var parentItemId: String? = nil
 }
 
 public struct Sender: Codable, Hashable, Sendable {
@@ -128,6 +151,13 @@ public struct CommChip: Codable, Hashable, Sendable {
     public var withBotId: String
     public var withName: String
     public var withColor: String
+}
+
+public struct MessageCommand: Codable, Hashable, Equatable, Sendable {
+    public var id: String
+    public var name: String
+    public var source: String
+    public var role: String
 }
 
 public struct Message: Codable, Hashable, Identifiable, Sendable {
@@ -207,6 +237,8 @@ public struct Message: Codable, Hashable, Identifiable, Sendable {
     /// User line that landed inside a running turn (server `steered: true`).
     /// Shown as the "Sent mid-turn" chip; distinct from the pending queue.
     public var steered: Bool? = nil
+    /// Set when this row is an engine command, such as compacting the session.
+    public var command: MessageCommand? = nil
 
     public var date: Date { Date(timeIntervalSince1970: at / 1000) }
 }
@@ -266,13 +298,59 @@ public struct ModelSelection: Codable, Hashable, Sendable {
     /// Kept as a string so a newer server's saved value still round-trips
     /// through an older phone until the person explicitly changes it.
     public var effort: String?
+    /// A model class this entry floats on ("Latest Sonnet" is `latest: "sonnet"`).
+    public var latest: String?
     public var fallbacks: [ModelSelection]?
 
-    public init(instanceId: String, model: String, effort: String? = nil, fallbacks: [ModelSelection]? = nil) {
+    public init(
+        instanceId: String,
+        model: String,
+        effort: String? = nil,
+        latest: String? = nil,
+        fallbacks: [ModelSelection]? = nil
+    ) {
         self.instanceId = instanceId
         self.model = model
         self.effort = effort
+        self.latest = latest
         self.fallbacks = fallbacks
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case instanceId
+        case model
+        case effort
+        case latest
+        case fallbacks
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.instanceId = try container.decode(String.self, forKey: .instanceId)
+        let rawModel = try container.decode(String.self, forKey: .model)
+        self.effort = try container.decodeIfPresent(String.self, forKey: .effort)
+        let rawLatest = try container.decodeIfPresent(String.self, forKey: .latest)
+        self.fallbacks = try container.decodeIfPresent([ModelSelection].self, forKey: .fallbacks)
+
+        if let rawLatest, !rawLatest.isEmpty {
+            self.latest = rawLatest
+            self.model = rawModel
+        } else if let alias = ModelLineage.detectAlias(from: rawModel) {
+            self.latest = alias
+            self.model = rawModel
+        } else {
+            self.latest = nil
+            self.model = rawModel
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(instanceId, forKey: .instanceId)
+        try container.encode(model, forKey: .model)
+        try container.encodeIfPresent(effort, forKey: .effort)
+        try container.encodeIfPresent(latest, forKey: .latest)
+        try container.encodeIfPresent(fallbacks, forKey: .fallbacks)
     }
 }
 
@@ -282,6 +360,10 @@ public struct TaskUsage: Codable, Hashable, Sendable {
     public var cachedInput: Int?
     public var costUsd: Double?
     public var turns: Int
+    /// Input tokens of the latest settled turn.  How full the window was.
+    public var lastInput: Int? = nil
+    /// Window size the engine reported with that turn, when it reported one.
+    public var contextWindow: Int? = nil
 }
 
 public struct BotTask: Codable, Hashable, Sendable {
@@ -409,7 +491,7 @@ public struct Bot: Codable, Hashable, Identifiable, Sendable {
 }
 
 public enum AvatarCrop: String, Codable, CaseIterable, Hashable, Sendable {
-    case mascot, circle, rounded, square
+    case mascot, tvface, circle, rounded, square
 
     /// The desktop may gain crop modes before this app updates. Falling back
     /// keeps the complete bot/fleet payload decodable and guarantees a safe,
@@ -667,6 +749,8 @@ public struct ProviderSnapshot: Codable, Hashable, Sendable {
     /// The probe gave no answer yet (a slow CLI on a busy Mac) and nothing
     /// definitive stood in: the engine is being checked, not missing or signed out.
     public var transient: Bool?
+    /// OpenCode only: why the last model catalog probe failed, in plain language.
+    public var modelProbeProblem: String?
     /// How the engine bills: `metered` (a charge to an API key) or
     /// `subscription` (a flat plan, so a cost figure is an equivalent, not a
     /// charge).  A raw string so a new mode from a newer harness still decodes.
@@ -680,11 +764,28 @@ public struct ProviderSnapshot: Codable, Hashable, Sendable {
     /// Phone Settings strip labels.  Mac owns setup, so these never deep-link
     /// into key entry or a CLI path — they only say what is true right now.
     public var engineStatusLabel: String {
+        if let problem = modelProbeProblem?.trimmingCharacters(in: .whitespacesAndNewlines), !problem.isEmpty {
+            if problem.localizedCaseInsensitiveContains("timed out") { return "Timed out under load" }
+            if problem.localizedCaseInsensitiveContains("listed no models")
+                || problem.localizedCaseInsensitiveContains("answered but listed no models") {
+                return "No models listed"
+            }
+            if problem.localizedCaseInsensitiveContains("stopped by") { return "Probe stopped" }
+            return "Needs attention"
+        }
         // A probe still in flight is neither "Unavailable" nor "Sign in": say so.
         if isChecking { return "Checking" }
         if isAvailable, authenticated == false { return "Sign in" }
         if !isAvailable { return "Unavailable" }
         return "Ready"
+    }
+
+    /// Full catalog probe sentence for the engine sheet, when the harness sent one.
+    public var engineProblemDetail: String? {
+        guard let problem = modelProbeProblem?.trimmingCharacters(in: .whitespacesAndNewlines), !problem.isEmpty else {
+            return nil
+        }
+        return problem
     }
 
     /// Reserved for a structured missing-binary signal on `ProviderSnapshot`.
@@ -701,12 +802,15 @@ public struct ModelOption: Codable, Hashable, Identifiable, Sendable {
     public var label: String
     public var effortLevels: [String]?
     public var supportsEffort: Bool?
+    /// Published window for this model, in tokens.  Absent when unknown.
+    public var contextWindow: Int? = nil
 
-    public init(id: String, label: String, effortLevels: [String]? = nil, supportsEffort: Bool? = nil) {
+    public init(id: String, label: String, effortLevels: [String]? = nil, supportsEffort: Bool? = nil, contextWindow: Int? = nil) {
         self.id = id
         self.label = label
         self.effortLevels = effortLevels
         self.supportsEffort = supportsEffort
+        self.contextWindow = contextWindow
     }
 }
 
@@ -1019,7 +1123,7 @@ public struct ConfigStatus: Codable, Sendable {
     }
 
     /// Whether synthesis is available on the paired computer. Deliberately
-    /// provider-neutral: under ElevenLabs this is a key on file, while under
+    /// provider-neutral: under a hosted engine this is a key on file, while under
     /// the built-in engine `providerConfigured` in `server/tts/index.ts`
     /// reports whether the computer has voices it can use and no credential
     /// exists at all. Only the reason behind the flag changes — so anything

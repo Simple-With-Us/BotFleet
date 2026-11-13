@@ -43,6 +43,9 @@ describe("speakReadiness", () => {
 
   it("treats a Personal Voice workspace default as a Personal Voice", () => {
     expect(speakReadiness({ tts: { configured: false, voice: "personal:mac" }, personalVoiceAvailable: true }).ready).toBe(true);
+    expect(speakReadiness({ voiceId: "minimax-warm", tts: { configured: true, voice: "minimax-warm", enabled: false }, personalVoiceAvailable: true })).toEqual({
+      ready: false, reason: "voice-off", personal: false,
+    });
   });
 });
 

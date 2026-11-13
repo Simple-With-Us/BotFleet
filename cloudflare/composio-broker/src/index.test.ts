@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { z } from "zod";
 
 import worker, {
   authorize,
@@ -27,12 +28,34 @@ function session(id: string, userId: string, configured = true) {
   };
 }
 
-function testEnv(fetchCalls: Array<{ url: string; init?: RequestInit }>) {
+function testContext(): ExecutionContext {
+  const context = { waitUntil(promise: Promise<unknown>) { void promise; } };
+  // SAFETY: The broker paths in these tests use only waitUntil; this fixture deliberately consumes the promise and does not model unrelated Workers runtime APIs.
+  return context as ExecutionContext;
+}
+
+const requestedUserIdSchema = z.object({ user_id: z.string() });
+
+function requestedUserId(body: BodyInit | null | undefined): string {
+  return requestedUserIdSchema.parse(JSON.parse(String(body))).user_id;
+}
+
+function testEnv(
+  fetchCalls: Array<{ url: string; init?: RequestInit }>,
+  initialInstallation?: { id: string; composio_user_id: string; session_id: string | null; disabled_at: number | null; session_upgrade_attempted?: number | null; last_seen_at?: number },
+) {
   const dbRuns: Array<{ sql: string; values: unknown[] }> = [];
-  const env = {
+  let installation = initialInstallation ? { ...initialInstallation } : null;
+  let beforeRun: ((sql: string, values: unknown[]) => void) | undefined;
+  // SAFETY: This fixture supplies the broker's exercised bindings: a scripted D1 prepare/bind/run/first double, rate-limit stubs, and fixed Composio test settings. Each test stubs fetch, so no production binding or network is reached.
+  const env: Env = {
     COMPOSIO_API_BASE: "https://backend.composio.dev/api/v3.1",
+    COMPOSIO_TOOLKIT_BASE: "https://backend.composio.dev/api/v3",
     COMPOSIO_API_KEY: "ak_test",
+    REGISTRATION_MODE: "closed",
+    REGISTRATION_LIMITER: { limit: async () => ({ success: true }) },
     SESSION_LIMITER: { limit: async () => ({ success: true }) },
+    // SAFETY: This fake implements the D1 calls exercised here and tracks the broker's ownership predicates and compare-and-swap result. Other D1 APIs are outside these request fixtures.
     DB: {
       prepare(sql: string) {
         return {
@@ -40,20 +63,43 @@ function testEnv(fetchCalls: Array<{ url: string; init?: RequestInit }>) {
             return {
               run: async () => {
                 dbRuns.push({ sql, values });
+                beforeRun?.(sql, values);
+                if (sql.includes("UPDATE installations SET session_id")) {
+                  const [sessionId, , id, userId, previousSessionId] = values;
+                  if (installation && installation.id === id && installation.composio_user_id === userId && installation.disabled_at === null && installation.session_id === previousSessionId) {
+                    installation.session_id = String(sessionId);
+                    installation.session_upgrade_attempted = 1;
+                    return { success: true, meta: { changes: 1 } };
+                  }
+                  return { success: true, meta: { changes: 0 } };
+                }
+                if (sql.includes("UPDATE installations SET last_seen_at")) {
+                  const [, id, userId, sessionId] = values;
+                  const matched = Boolean(installation && installation.id === id && installation.composio_user_id === userId && installation.disabled_at === null && installation.session_id === sessionId);
+                  if (matched && installation) installation.last_seen_at = Number(values[0]);
+                  return { success: true, meta: { changes: matched ? 1 : 0 } };
+                }
                 return { success: true, meta: { changes: 1 } };
               },
               first: async () => {
                 dbRuns.push({ sql, values });
-                return null;
+                return installation ? { ...installation } : null;
               },
             };
           },
         };
       },
-    },
+    } as D1Database,
   };
-  const ctx = { waitUntil(promise: Promise<unknown>) { void promise; } };
-  return { env, ctx, dbRuns, fetchCalls };
+  const ctx = testContext();
+  return {
+    env,
+    ctx,
+    dbRuns,
+    fetchCalls,
+    setInstallation(row: typeof installation) { installation = row ? { ...row } : null; },
+    setBeforeRun(hook: typeof beforeRun) { beforeRun = hook; },
+  };
 }
 
 afterEach(() => vi.unstubAllGlobals());
@@ -97,7 +143,7 @@ describe("connected-apps broker boundaries", () => {
       return Response.json(session("trs_new", "omb_user"), { status: 201 });
     });
 
-    await expect(createSession(env as never, "omb_user")).resolves.toMatchObject({
+    await expect(createSession(env, "omb_user")).resolves.toMatchObject({
       sessionId: "trs_new",
       multiAccountConfigured: true,
     });
@@ -107,9 +153,190 @@ describe("connected-apps broker boundaries", () => {
     });
   });
 
+  it("rejects a newly created Session explicitly assigned to another user", async () => {
+    const { env } = testEnv([]);
+    vi.stubGlobal("fetch", async () => Response.json(session("trs_wrong", "omb_other"), { status: 201 }));
+
+    await expect(createSession(env, "omb_expected")).rejects.toThrow(/another user/i);
+  });
+
+  it("binds a created Session to the requested user when Composio omits user_id", async () => {
+    const { env } = testEnv([]);
+    vi.stubGlobal("fetch", async () => Response.json({
+      session_id: "trs_user_omitted",
+      mcp: { url: "https://mcp.composio.dev/trs_user_omitted" },
+      config: { multi_account: multiAccount },
+    }, { status: 201 }));
+
+    await expect(createSession(env, "omb_expected")).resolves.toMatchObject({
+      sessionId: "trs_user_omitted",
+      userId: "omb_expected",
+    });
+  });
+
+  it("replaces a cached Session belonging to a different stable user", async () => {
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    const { env, ctx } = testEnv(calls, {
+      id: "install-1",
+      composio_user_id: "omb_expected",
+      session_id: "trs_wrong_owner",
+      disabled_at: null,
+    });
+    vi.stubGlobal("fetch", async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      calls.push({ url, init });
+      if (init?.method === "POST") return Response.json(session("trs_replacement", "omb_expected"), { status: 201 });
+      return Response.json(session("trs_wrong_owner", "omb_other"));
+    });
+
+    await expect(ensureSession({
+      id: "install-1",
+      composio_user_id: "omb_expected",
+      session_id: "trs_wrong_owner",
+      disabled_at: null,
+    }, env, ctx)).resolves.toMatchObject({ sessionId: "trs_replacement", userId: "omb_expected" });
+    expect(calls.some((call) => call.init?.method === "POST")).toBe(true);
+  });
+
+  it("re-reads installation ownership after Session lookup before reusing the cache", async () => {
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    const { env, ctx, setInstallation } = testEnv(calls, {
+      id: "install-1",
+      composio_user_id: "omb_first",
+      session_id: "trs_cached",
+      disabled_at: null,
+    });
+    let lookupCount = 0;
+    vi.stubGlobal("fetch", async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      calls.push({ url, init });
+      if (init?.method === "POST") return Response.json(session("trs_second_user", "omb_second"), { status: 201 });
+      lookupCount += 1;
+      if (lookupCount === 1) {
+        setInstallation({ id: "install-1", composio_user_id: "omb_second", session_id: "trs_cached", disabled_at: null });
+      }
+      return Response.json(session("trs_cached", "omb_first"));
+    });
+
+    await expect(ensureSession({
+      id: "install-1",
+      composio_user_id: "omb_first",
+      session_id: "trs_cached",
+      disabled_at: null,
+    }, env, ctx)).resolves.toMatchObject({ sessionId: "trs_second_user", userId: "omb_second" });
+    expect(lookupCount).toBeGreaterThanOrEqual(2);
+    expect(calls.filter((call) => call.init?.method === "POST")).toHaveLength(1);
+  });
+
+  it("uses the fresh persisted upgrade flag when a stale request carries a legacy Session", async () => {
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    const { env, ctx } = testEnv(calls, {
+      id: "install-1",
+      composio_user_id: "omb_user",
+      session_id: "trs_cached_legacy",
+      disabled_at: null,
+      session_upgrade_attempted: 1,
+    });
+    vi.stubGlobal("fetch", async (input: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(input), init });
+      return Response.json(session("trs_cached_legacy", "omb_user", false));
+    });
+
+    await expect(ensureSession({
+      id: "install-1",
+      composio_user_id: "omb_user",
+      session_id: "trs_cached_legacy",
+      disabled_at: null,
+      session_upgrade_attempted: 0,
+    }, env, ctx)).resolves.toMatchObject({ sessionId: "trs_cached_legacy", multiAccountConfigured: false });
+    expect(calls.filter((call) => call.init?.method === "POST")).toHaveLength(0);
+  });
+
+  it("does not reuse a concurrent winner Session owned by another user", async () => {
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    const { env, ctx, setBeforeRun, setInstallation } = testEnv(calls, {
+      id: "install-1",
+      composio_user_id: "omb_expected",
+      session_id: null,
+      disabled_at: null,
+    });
+    let raced = false;
+    setBeforeRun((sql) => {
+      if (!raced && sql.includes("UPDATE installations SET session_id")) {
+        raced = true;
+        // Simulate another writer winning the compare-and-swap with a foreign Session.
+        setInstallation({ id: "install-1", composio_user_id: "omb_expected", session_id: "trs_foreign_winner", disabled_at: null });
+      }
+    });
+    vi.stubGlobal("fetch", async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      calls.push({ url, init });
+      if (url.endsWith("/trs_foreign_winner")) return Response.json(session("trs_foreign_winner", "omb_other"));
+      if (init?.method === "POST") {
+        const userId = requestedUserId(init.body);
+        const id = calls.filter((call) => call.init?.method === "POST").length === 1 ? "trs_first_attempt" : "trs_owned_replacement";
+        return Response.json(session(id, userId), { status: 201 });
+      }
+      return Response.json(session("trs_foreign_winner", "omb_other"));
+    });
+
+    await expect(ensureSession({
+      id: "install-1",
+      composio_user_id: "omb_expected",
+      session_id: null,
+      disabled_at: null,
+    }, env, ctx)).resolves.toMatchObject({ sessionId: "trs_owned_replacement", userId: "omb_expected" });
+    expect(calls.filter((call) => call.init?.method === "POST")).toHaveLength(2);
+  });
+
+  it("fails closed after three consecutive installation identity changes", async () => {
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    const { env, ctx, setInstallation } = testEnv(calls, {
+      id: "install-1",
+      composio_user_id: "omb_user_0",
+      session_id: null,
+      disabled_at: null,
+    });
+    let changes = 0;
+    vi.stubGlobal("fetch", async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      calls.push({ url, init });
+      if (init?.method === "POST") {
+        const userId = requestedUserId(init.body);
+        changes += 1;
+        setInstallation({ id: "install-1", composio_user_id: `omb_user_${changes}`, session_id: null, disabled_at: null });
+        return Response.json(session(`trs_churn_${changes}`, userId), { status: 201 });
+      }
+      throw new Error(`unexpected session lookup ${url}`);
+    });
+
+    await expect(ensureSession({
+      id: "install-1",
+      composio_user_id: "omb_user_0",
+      session_id: null,
+      disabled_at: null,
+    }, env, ctx)).rejects.toMatchObject({ status: 503 });
+    expect(changes).toBe(3);
+  });
+
+  it("fails closed when the active-installation marker is missing", async () => {
+    const { env, ctx } = testEnv([]);
+    // SAFETY: The omitted disabled_at field is intentional malformed input; this test proves the handler fails closed when the active-installation marker is missing.
+    await expect(ensureSession({
+      id: "install-1",
+      composio_user_id: "omb_user",
+      session_id: null,
+    } as never, env, ctx)).rejects.toMatchObject({ status: 401 });
+  });
+
   it("upgrades a legacy Session without changing the installation's Composio user", async () => {
     const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
-    const { env, ctx, dbRuns } = testEnv(fetchCalls);
+    const { env, ctx, dbRuns } = testEnv(fetchCalls, {
+      id: "install-1",
+      composio_user_id: "omb_stable",
+      session_id: "trs_legacy",
+      disabled_at: null,
+    });
     vi.stubGlobal("fetch", async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input);
       fetchCalls.push({ url, init });
@@ -122,15 +349,26 @@ describe("connected-apps broker boundaries", () => {
       composio_user_id: "omb_stable",
       session_id: "trs_legacy",
       disabled_at: null,
-    }, env as never, ctx as never)).resolves.toMatchObject({ sessionId: "trs_new", multiAccountConfigured: true });
+    }, env, ctx)).resolves.toMatchObject({ sessionId: "trs_new", multiAccountConfigured: true });
     const creation = fetchCalls.find((call) => call.init?.method === "POST");
     expect(JSON.parse(String(creation?.init?.body))).toMatchObject({ user_id: "omb_stable", multi_account: multiAccount });
-    expect(dbRuns.some((run) => run.values[0] === "trs_new" && run.values[2] === "install-1")).toBe(true);
+    const save = dbRuns.find((run) => run.sql.includes("UPDATE installations SET session_id"));
+    expect(save?.values[0]).toBe("trs_new");
+    expect(save?.values[2]).toBe("install-1");
+    expect(save?.values[3]).toBe("omb_stable");
+    expect(save?.values[4]).toBe("trs_legacy");
+    expect(save?.sql).toContain("composio_user_id = ? AND disabled_at IS NULL AND session_id IS ?");
   });
 
   it("returns every account and deletes only an owned account ID", async () => {
     const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
-    const { env, ctx } = testEnv(fetchCalls);
+    const { env, ctx } = testEnv(fetchCalls, {
+      id: "install-1",
+      composio_user_id: "omb_stable",
+      session_id: "trs_multi",
+      disabled_at: null,
+      session_upgrade_attempted: 1,
+    });
     const accounts = {
       items: [
         { id: "ca_work", alias: "work", toolkit: { slug: "gmail" }, status: "ACTIVE", updated_at: "2026-08-21T10:00:00Z" },
@@ -191,8 +429,8 @@ describe("connected-apps broker boundaries", () => {
     const statusResponse = await connectionStatus(
       new URL("https://broker.example/v1/connectors?services=gmail"),
       installation,
-      env as never,
-      ctx as never,
+      env,
+      ctx,
     );
     await expect(statusResponse.json()).resolves.toEqual({
       services: {
@@ -207,7 +445,7 @@ describe("connected-apps broker boundaries", () => {
         },
       },
     });
-    const connectedResponse = await connectedServices(installation, env as never, ctx as never);
+    const connectedResponse = await connectedServices(installation, env, ctx);
     await expect(connectedResponse.json()).resolves.toMatchObject({
       configured: true,
       services: {
@@ -248,7 +486,7 @@ describe("connected-apps broker boundaries", () => {
     )).toBe(true);
 
     connectedAccountsUnavailable = true;
-    const fallbackResponse = await connectedServices(installation, env as never, ctx as never);
+    const fallbackResponse = await connectedServices(installation, env, ctx);
     await expect(fallbackResponse.json()).resolves.toMatchObject({
       configured: true,
       services: {
@@ -266,18 +504,18 @@ describe("connected-apps broker boundaries", () => {
       },
     });
     connectedAccountsUnavailable = false;
-    await expect((await disconnectAccount("gmail", "ca_work", installation, env as never, ctx as never)).json())
+    await expect((await disconnectAccount("gmail", "ca_work", installation, env, ctx)).json())
       .resolves.toEqual({ removed: 1 });
-    await expect((await disconnectAccount("gmail", "ca_not_owned", installation, env as never, ctx as never)).json())
+    await expect((await disconnectAccount("gmail", "ca_not_owned", installation, env, ctx)).json())
       .resolves.toEqual({ removed: 0 });
     expect(fetchCalls.filter((call) => call.init?.method === "DELETE")).toHaveLength(1);
 
-    const missingAlias = await authorize("gmail", undefined, installation, env as never, ctx as never);
+    const missingAlias = await authorize("gmail", undefined, installation, env, ctx);
     expect(missingAlias.status).toBe(400);
     await expect(missingAlias.json()).resolves.toEqual({
       error: "Add an account alias so the existing connection is not replaced",
     });
-    const authorized = await authorize("gmail", "second", installation, env as never, ctx as never);
+    const authorized = await authorize("gmail", "second", installation, env, ctx);
     expect(authorized.status).toBe(200);
     await expect(authorized.json()).resolves.toEqual({ url: "https://connect.composio.dev/link/gmail" });
     const linkCall = fetchCalls.find((call) => call.url.endsWith("/tool_router/session/trs_multi/link"));
@@ -291,7 +529,13 @@ describe("connected-apps broker boundaries", () => {
 
   it("does not recreate a Session after D1 records the upgrade attempt", async () => {
     const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
-    const { env, ctx } = testEnv(fetchCalls);
+    const { env, ctx, dbRuns } = testEnv(fetchCalls, {
+      id: "install-1",
+      composio_user_id: "omb_stable",
+      session_id: "trs_legacy",
+      disabled_at: null,
+      session_upgrade_attempted: 1,
+    });
     vi.stubGlobal("fetch", async (input: string | URL | Request, init?: RequestInit) => {
       fetchCalls.push({ url: String(input), init });
       return Response.json(session("trs_legacy", "omb_stable", false));
@@ -303,8 +547,10 @@ describe("connected-apps broker boundaries", () => {
       session_id: "trs_legacy",
       disabled_at: null,
       session_upgrade_attempted: 1,
-    }, env as never, ctx as never)).resolves.toMatchObject({ sessionId: "trs_legacy", multiAccountConfigured: false });
+    }, env, ctx)).resolves.toMatchObject({ sessionId: "trs_legacy", multiAccountConfigured: false });
     expect(fetchCalls.some((call) => call.init?.method === "POST")).toBe(false);
+    expect(dbRuns.some((run) => run.sql.includes("UPDATE installations SET last_seen_at")
+      && run.sql.includes("composio_user_id = ? AND disabled_at IS NULL AND session_id IS ?"))).toBe(true);
   });
 
   it("rejects new installations when REGISTRATION_MODE is closed", async () => {
@@ -317,7 +563,7 @@ describe("connected-apps broker boundaries", () => {
     const response = await worker.fetch(
       new Request("https://broker.test/v1/installations", { method: "POST" }),
       closedEnv as never,
-      ctx as never,
+      ctx,
     );
     expect(response.status).toBe(503);
     await expect(response.json()).resolves.toEqual({ error: "registration is temporarily closed" });

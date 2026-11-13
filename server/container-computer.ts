@@ -884,13 +884,61 @@ export function resetCuaShimHealGate(): void {
   shimHealedAt.clear();
 }
 
+/**
+ * A read-only snapshot of the things every target shares: which container
+ * runtime is usable, and whether the prepared image is there.
+ *
+ * Probing a list of N targets used to cost N runtime probes and N image
+ * probes, because each target repeated the same work.  One context, built
+ * once for the whole list, turns that into one of each.
+ */
+export interface ContainerProbeContext {
+  runtimeStatus: ContainerRuntimeStatus;
+  /** `present` means the prepared image is there AND still carries the pinned
+   * labels, which is what `ContainerComputerStatus.image` reports. */
+  image: { present: boolean; image_id: string | null };
+}
+
+/** Is the prepared BotFleet derivative image there, and does it still match
+ *  the pinned labels?  Read-only: it inspects the image store and changes
+ *  nothing. */
+async function probePreparedImage(
+  runner: CommandRunner,
+  runtime: Runtime,
+): Promise<{ present: boolean; image_id: string | null }> {
+  try {
+    const { stdout } = await runner(runtime, ["image", "inspect", IMAGE]);
+    const image = inspectedImage(stdout);
+    return { present: imageLabelsMatch(image.labels), image_id: image.id };
+  } catch {
+    // The prepared BotFleet derivative has not been built yet.
+    return { present: false, image_id: null };
+  }
+}
+
+/** Build the shared probe context.  Read-only: it inspects, it never changes.
+ *
+ *  The image is only inspected when a runtime is actually usable, because a
+ *  stopped or missing runtime cannot answer an image inspect either. */
+export async function containerProbeContext(
+  runner: CommandRunner = sh,
+  platform: NodeJS.Platform = process.platform,
+): Promise<ContainerProbeContext> {
+  const runtimeStatus = await containerRuntimeStatus(runner, platform);
+  const image = runtimeStatus.runtime && runtimeStatus.daemonUp
+    ? await probePreparedImage(runner, runtimeStatus.runtime)
+    : { present: false, image_id: null };
+  return { runtimeStatus, image };
+}
+
 export async function containerComputerStatus(
   runner: CommandRunner = sh,
   platform: NodeJS.Platform = process.platform,
   target: LocalVmTarget = SHARED_LOCAL_VM_TARGET,
+  context?: ContainerProbeContext,
 ): Promise<ContainerComputerStatus> {
   const status = emptyStatus(platform, target);
-  const runtimeStatus = await containerRuntimeStatus(runner, platform);
+  const runtimeStatus = context ? context.runtimeStatus : await containerRuntimeStatus(runner, platform);
   status.available = runtimeStatus.available;
   status.runtime = runtimeStatus.runtime;
   status.daemonUp = runtimeStatus.daemonUp;
@@ -905,8 +953,12 @@ export async function containerComputerStatus(
     return status;
   }
 
+  // The container inspect is reused for the detail read below, so a target
+  // costs one inspect instead of two.  A legacy name that had to be renamed
+  // is the one case where the first inspect is stale.
+  let inspectedContainer: string | null = null;
   try {
-    await runner(status.runtime, ["inspect", target.containerName]);
+    inspectedContainer = (await runner(status.runtime, ["inspect", target.containerName])).stdout;
   } catch {
     for (const prefix of LEGACY_CONTAINER_PREFIXES) {
       const legacy =
@@ -916,6 +968,7 @@ export async function containerComputerStatus(
       try {
         await runner(status.runtime, ["inspect", legacy]);
         await runner(status.runtime, ["rename", legacy, target.containerName]);
+        inspectedContainer = null;
         break;
       } catch {
         /* predecessor missing, or rename lost the race — try the next name */
@@ -923,17 +976,17 @@ export async function containerComputerStatus(
     }
   }
 
-  try {
-    const { stdout } = await runner(status.runtime, ["image", "inspect", IMAGE]);
-    const image = inspectedImage(stdout);
-    status.image = imageLabelsMatch(image.labels);
-    status.image_id = image.id;
-  } catch {
-    // The prepared BotFleet derivative has not been built yet.
-  }
+  const image = context
+    ? context.image
+    : await probePreparedImage(runner, status.runtime);
+  status.image = image.present;
+  status.image_id = image.image_id;
 
   try {
-    const { stdout } = await runner(status.runtime, ["inspect", target.containerName]);
+    // The container inspect from above is reused here, so a target costs one
+    // inspect instead of two.  It is only re-read when the first inspect did
+    // not produce output to reuse.
+    const stdout = inspectedContainer ?? (await runner(status.runtime, ["inspect", target.containerName])).stdout;
     if (status.runtime === "container") {
       const inspected = JSON.parse(stdout) as Array<{
         configuration?: {
@@ -1942,6 +1995,28 @@ export function containerComputerMcp(
   };
 }
 
+/** Display text a person may paste into a shell.  A word carrying whitespace
+ * or a shell metacharacter (the git credential helper, `!gh auth git-credential`)
+ * is quoted rather than left to be split or history-expanded.  A backslash or
+ * `~` alone is left bare: those are ordinary in a Windows path, which has
+ * always been printed as-is here.  POSIX shells get single quotes with the `'\\''`
+ * escape; cmd.exe ignores single quotes, so win32 gets the double-quote form
+ * with `""` doubling. */
+export function shellWord(word: string, platform: NodeJS.Platform = process.platform): string {
+  if (word === "") return platform === "win32" ? '""' : "''";
+  // Bracket pairs glob in POSIX shells; cmd.exe additionally expands %VAR%
+  // inside double quotes and treats ^ as its escape character.
+  const trigger = platform === "win32"
+    ? /[\s!"'`$&;|<>()*?{}#[\]^%]/
+    : /[\s!"'`$&;|<>()*?{}#[\]]/;
+  if (!trigger.test(word)) return word;
+  // A trailing backslash run would escape the closing quote under the
+  // Windows argv parser, so the run is doubled before the quote is added.
+  return platform === "win32"
+    ? `"${word.replace(/"/g, '""').replace(/(\\+)$/, "$1$1")}"`
+    : `'${word.replace(/'/g, `'\\''`)}'`;
+}
+
 /** Commands shown as a transparent fallback. Normal setup builds the pinned
  * derivative through the API, so users do not need to author a Dockerfile. */
 export function setupCommands(
@@ -1978,14 +2053,7 @@ export function setupCommands(
       view: target.viewerPort ? `http://127.0.0.1:${target.viewerPort}/vnc.html` : "",
     };
   }
-  // Display text a person may paste into a shell, so an argument with whitespace
-  // or a shell metacharacter (the git credential helper, `!gh auth git-credential`)
-  // is single-quoted rather than left to be split or history-expanded.  A
-  // backslash or `~` alone is left bare: those are ordinary in a Windows path,
-  // which has always been printed as-is here.
-  const shellWord = (word: string) =>
-    /[\s!"'`$&;|<>()*?{}#]/.test(word) ? `'${word.replace(/'/g, `'\\''`)}'` : word;
-  const command = (args: string[]) => [runtime, ...args].map(shellWord).join(" ");
+  const command = (args: string[]) => [runtime, ...args].map((arg) => shellWord(arg, platform)).join(" ");
   return {
     install,
     runtimeStart,

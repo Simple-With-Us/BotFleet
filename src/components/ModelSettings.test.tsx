@@ -34,6 +34,22 @@ describe("ModelSettings", () => {
     expect(html).not.toContain("data-effort-section");
   });
 
+  it("shows an OpenCode catalog probe sentence on the engine row", () => {
+    const openCode: InstanceInfo = {
+      ...INSTANCE,
+      instanceId: "opencode",
+      driverKind: "opencodeGo",
+      displayName: "OpenCode",
+      snapshot: {
+        state: "available",
+        authenticated: false,
+        modelProbeProblem: "OpenCode answered but listed no models.",
+      },
+    };
+    const html = render(m31, { instance: openCode });
+    expect(html).toContain("OpenCode answered but listed no models.");
+  });
+
   it("shows Effort, Context and Max Output Tokens when opened", () => {
     const html = render(m31, { initialOpen: true });
     expect(html).toContain('aria-expanded="true"');

@@ -608,7 +608,9 @@ const playTurn = (prompt: JsonValue) => {
         { type: "tool_use", id: "tu-1", name: "Bash", ...(process.env.FAKE_CLAUDE_TOOL_IO ? { input: { command: "echo hi", stdin: "TAIL-INPUT-MARKER" } } : {}) },
       ],
       model: process.env.FAKE_CLAUDE_SERVED_MODEL,
-      usage: { input_tokens: 10, cache_read_input_tokens: 2, output_tokens: 5 },
+      id: process.env.FAKE_CLAUDE_PROOF ? "msg-single-call" : undefined,
+      usage: { input_tokens: 10, cache_read_input_tokens: 2, output_tokens: 5,
+        cache_creation_input_tokens: process.env.FAKE_CLAUDE_PROOF ? 0 : undefined },
     },
   });
   out({
@@ -643,7 +645,8 @@ const playTurn = (prompt: JsonValue) => {
       is_error: false,
       stop_reason: "end_turn",
       total_cost_usd: 0.01,
-      usage: { input_tokens: 10, cache_read_input_tokens: 2, output_tokens: 5, ...cacheWrite },
+      usage: { input_tokens: 10, cache_read_input_tokens: 2, output_tokens: 5,
+        cache_creation_input_tokens: process.env.FAKE_CLAUDE_PROOF ? 0 : undefined, ...cacheWrite },
     };
     // 2.1.284 names where each turn came from; an older CLI does not
     out(lifecycleOn ? { ...result, origin: { kind: "human" }, queued_turn_count: 0 } : result);

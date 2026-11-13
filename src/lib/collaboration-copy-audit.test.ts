@@ -4,14 +4,14 @@ import { convertSlackReferenceToZulip, hasSlackReference } from "./collaboration
 
 describe("collaboration copy audit", () => {
   it("finds Slack in saved names, prompts, and retired helper names", () => {
-    expect(hasSlackReference("Daily review", "Post to Slack #agent-sync")).toBe(true);
+    expect(hasSlackReference("Daily review", "Post to Slack #fleet")).toBe(true);
     expect(hasSlackReference("Run slack-sync inbox")).toBe(true);
-    expect(hasSlackReference("Post to Zulip #agent-sync")).toBe(false);
+    expect(hasSlackReference("Post to Zulip #Work-In-Progress")).toBe(false);
   });
 
   it("converts only after the user chooses Zulip", () => {
     expect(convertSlackReferenceToZulip("Run slack-collab, then post to Slack."))
-      .toBe("Run agent-sync, then post to Zulip.");
+      .toBe("Run simple-chat, then post to Zulip.");
     expect(convertSlackReferenceToZulip("Keep SLACK_BOT_TOKEN secret."))
       .toBe("Keep SLACK_BOT_TOKEN secret.");
   });

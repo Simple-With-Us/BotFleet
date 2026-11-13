@@ -23,6 +23,8 @@ export const WORKSPACE_CREDENTIALS = [
   { section: "imageGen", field: "key", name: "openaiImageApiKey", env: "OMB_OPENAI_IMAGE_KEY" },
   { section: "opencodeGo", field: "apiKey", name: "opencodeGoApiKey", env: "OPENCODE_API_KEY" },
   { section: "infisical", field: "clientSecret", name: "infisicalClientSecret", env: "INFISICAL_CLIENT_SECRET" },
+  { section: "infisical", field: "token", name: "infisicalReadToken", env: "INFISICAL_TOKEN" },
+  { section: "infisical", field: "writeToken", name: "infisicalWriteToken", env: "INFISICAL_WRITE_TOKEN" },
 ];
 
 /** The per-instance environment variable each driver that can carry more than

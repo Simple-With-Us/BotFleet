@@ -222,6 +222,10 @@ The device-facing socket rejects browser `Origin` headers before reading a
 token. Its route policy in `companion/src/routes.ts` is default-deny: a new
 harness route remains unreachable until it is deliberately added.
 
+A client constructed with an enrolled `HostOrigin` refuses a different request origin.  Mismatch
+remains a typed refusal rather than a retryable transport failure;
+`SavedHostsTests` verifies the credentialless client makes no request on drift.
+
 Allowed:
 
 - Read the fleet, rooms, instances, configuration status, and transcripts.

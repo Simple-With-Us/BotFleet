@@ -244,7 +244,7 @@ struct UsageView: View {
                 .foregroundStyle(.secondary)
         }
         if groups.isEmpty && snapshot.cooldowns.isEmpty && held.isEmpty && notice == nil {
-            Text("No quota windows reported yet.")
+            Text("No usage limits reported yet.")
                 .foregroundStyle(.secondary)
         }
     }

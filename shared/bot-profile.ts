@@ -1,4 +1,6 @@
 /** Profile input limits shared by every web and server write surface. */
+import { z } from "zod";
+
 export const BOT_PROFILE_LIMITS = {
   name: 100,
   title: 200,
@@ -8,6 +10,23 @@ export const BOT_PROFILE_LIMITS = {
 
 /** Ceiling for per-bot HTTP tool-loop rounds (Designer 2026-09-25). */
 export const MAX_TOOL_ROUNDS = 200;
+
+/** Ceiling for a bot's replayed-history turn cap.  0 keeps none: every
+ *  replayed turn is dropped and summarized. */
+export const MAX_HISTORY_TURNS = 500;
+
+/** The one history-turn-cap contract every surface shares: the bot API
+ *  boundary (server/bot-profile.ts), the prompt-budget decoder
+ *  (server/drivers/acp/prompt-budget.ts), the dispatch lanes
+ *  (server/index.ts) and the web capability gates
+ *  (src/lib/bot-settings-gates.ts).  A non-negative integer at most
+ *  MAX_HISTORY_TURNS; anything else is ignored (treated as absent), never
+ *  applied.  Declared once here so the TypeScript and runtime contracts
+ *  cannot drift apart: derive the type with `MaxHistoryTurns`. */
+export const maxHistoryTurnsSchema = z.number().int().min(0).max(MAX_HISTORY_TURNS);
+
+/** A valid history-turn cap, as `maxHistoryTurnsSchema` accepts it. */
+export type MaxHistoryTurns = z.infer<typeof maxHistoryTurnsSchema>;
 
 /** The round budget an HTTP tool-loop turn gets when a bot sets none.
  *
@@ -32,6 +51,14 @@ export const DEFAULT_MAX_TOOL_ROUNDS = 40;
  *  number a person reads is the number the loop enforces. */
 export function toolRoundsCaption(): string {
   return `Per turn.  Empty uses ${DEFAULT_MAX_TOOL_ROUNDS}.  Cap is ${MAX_TOOL_ROUNDS}.`;
+}
+
+/** The owner-facing sentence for the Maximum History Turns control, built
+ *  from the real cap. */
+export function historyTurnsCaption(): string {
+  // Rendered in HTML, where two typed spaces collapse:  the gap is U+00A0
+  // plus a space, written as an escape so the source stays ASCII.
+  return `Replayed turns kept per prompt.\u00A0 Empty keeps them all.\u00A0 Cap is ${MAX_HISTORY_TURNS}.`;
 }
 
 /** The budget a turn will actually run under, and whether the owner chose it.

@@ -21,7 +21,9 @@ import { build } from "esbuild";
 import { copyFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { hashStaticUi, readSourceBuildIdentity } from "../electron/runtime-identity.mjs";
+import { controlBuildVersion } from "../electron/control-build-version.mjs";
+import { hashStaticUi } from "../electron/runtime-identity.mjs";
+import { readSourceBuildIdentity } from "./source-build-identity.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const server = join(root, "server");
@@ -31,9 +33,19 @@ const server = join(root, "server");
 // gate that proves it came from a committed tree.  Unset in local builds, where
 // package.json's own version is the truth.
 const buildVersion = process.env.BOTFLEET_BUILD_VERSION?.trim() || null;
+// On the release path the workflow pins BOTFLEET_BUILD_VERSION from the
+// shared stamp planner, so resolve the same {version, build} the Control
+// bundle carries and stamp the build into this identity (BF-2588).  That is
+// what lets the version handshake order two packaged servers instead of
+// reporting unknown order for every release.  A malformed pin is refused by
+// the shared helper, never stamped as an unordered release.  Unpinned local
+// bundles keep package.json's version and no build; a build-less manifest
+// stays valid, it simply carries no order.
+const stamp = buildVersion ? controlBuildVersion({ repoRoot: root }) : null;
 const buildIdentity = {
-  ...readSourceBuildIdentity(root, { requireGit: true, version: buildVersion }),
+  ...readSourceBuildIdentity(root, { requireGit: true, version: stamp?.version ?? null, build: stamp?.build ?? null }),
   uiHash: hashStaticUi(join(root, "dist")),
+  desktopStartupProtocol: 1,
 };
 
 // yaml's Node export is CommonJS and contains dynamic requires that cannot run

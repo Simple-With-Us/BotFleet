@@ -249,8 +249,12 @@ const SHORT_PROVIDER_ERROR =
 const QUOTA_OR_CAP_TERMINAL = [
   /^(?:you(?:'ve| have)?|you are|you're)\s+(?:hit|reached|exceeded|exhausted|out of)\b.{0,120}\b(?:session|usage|message|messaging|quota|limit|allowance|credits?|funds?|balance|plan|tier|spend|budget|requests?)\b(?!\s+(?:session|usage|message|messaging|quota|limit|allowance|credits?|funds?|balance|plan|tier|spend|budget|requests?|fix|handling|parser|parsing|test|tests|coverage|review|work|logic|implementation|documentation|code)\b)/i,
   /^your\s+(?:credit|prepayment|message|messaging|usage|quota|plan|tier|spend|budget)\b.{0,120}\b(?:low|depleted|empty|exhausted|insufficient|exceeded|reached|limit|cap)\b(?!\s+(?:fix|handling|parser|parsing|test|tests|coverage|review|work|logic|implementation|documentation|code)\b)/i,
+  /^(?:(?:error:\s*)?(?:http\s*)?(?:429|rate.?limit|session (?:limit|cap)|concurrency limit|usage (?:limit|cap))\b).{0,120}\bresets?\b/i,
   /^this request would exceed\b.{0,120}\b(?:rate|usage|quota|plan|tier|spend|budget|token|request)\s+(?:limit|cap|quota|allowance|budget)\b(?:\s+of\s+[\d,.]+\s+(?:input\s+)?tokens?\s+per\s+(?:minute|hour|day))?[.!]?$/i,
   /^individual\s+quota\s+reached\b/i,
+  /^billing (?:verification|issue|failure|failed|error|problem|unavailable|required)\b/i,
+  /^(?:http\s*)?(?:402|429)\b.{0,40}\b(?:insufficient_quota|insufficient_balance|insufficient_funds|usage_limit_exceeded|enforced_spend_limit(?:_reached)?|account_inactive)\b/i,
+  /^(?:http\s*)?(?:402|429)\b.{0,120}\b(?:billing|plan|credits?|usage|quota|balance|payment)\b/i,
   /^(?:codex|claude|grok|cursor|deepseek|kimi|gemini|antigravity)\s+(?:session|usage|message)\s+(?:limit|cap|quota)\s+(?:reached|exceeded|exhausted)\b/i,
   /^(?:session|usage|message|monthly|daily|plan|tier|free tier|spend|budget|concurrency)\s+(?:limit|cap|quota)(?:\s+(?:reached|exceeded|exhausted))?(?:\s+(?:for|on|in|until)\b.{0,120})?[.!]?$/i,
   /^(?:session limit or usage cap reached|quota exceeded|daily quota exceeded)(?:\s*[.:,!·—-]|\s*$|\s+(?:for|please|retry|try|upgrade|check|on|at|because|due)\b)/i,
@@ -267,7 +271,39 @@ const QUOTA_OR_CAP_TERMINAL = [
 ];
 
 const KNOWN_FAILURE_QUOTA_OR_CAP =
-  /session limit|hit your usage limit|usage cap|usage limit|individual\s+quota\s+reached|quota exceeded|insufficient.?quota|insufficient.?balance|insufficient.?funds|zero balance|resource.?exhausted|credits exhausted|credits? (?:are )?depleted|out of (?:usage|credits)|credit balance (?:is )?(?:too )?low|message limit reached|messaging allowance|5-hour limit reached|monthly limit|weekly (?:\([^)]+\) )?usage limit|slow pool|payment required|plan limit|tier limit|free tier limit|spend limit|budget exceeded|rate.?limit|rate_limit_error|usage_limit_exceeded|too many requests|(?:server|service|provider) (?:is )?(?:overloaded|at capacity)|capacity (?:reached|exceeded|unavailable)|concurrency limit|account_inactive|enforced_spend_limit|\b402\b|\b429\b/i;
+  /session limit|hit your usage limit|usage cap|usage limit|individual\s+quota\s+reached|quota exceeded|insufficient.?quota|insufficient.?balance|insufficient.?funds|zero balance|resource.?exhausted|credits exhausted|credits? (?:are )?depleted|out of (?:usage|credits)|credit balance (?:is )?(?:too )?low|message limit reached|messaging allowance|5-hour limit reached|monthly limit|weekly (?:\([^)]+\) )?usage limit|slow pool|billing (?:verification|issue|failure|failed|error|problem|unavailable|required)|payment required|plan limit|tier limit|free tier limit|spend limit|budget exceeded|rate.?limit|rate_limit_error|usage_limit_exceeded|too many requests|(?:server|service|provider) (?:is )?(?:overloaded|at capacity)|capacity (?:reached|exceeded|unavailable)|account_inactive|enforced_spend_limit|\b402\b|\b429\b/i;
+
+const EXPLICIT_CONCURRENCY_CAP =
+  /\b(?:concurrency|concurrent|in[- ]flight|active sessions?)\b.{0,80}\b(?:limit|cap|maximum|max|too many|at capacity|full|busy|reached|exceeded)|\b(?:limit|cap|maximum|max|too many)\b.{0,80}\b(?:concurrency|concurrent|in[- ]flight|active sessions?)\b|\btoo many concurrent\b/i;
+const EXPLICIT_RESET_NOTICE =
+  /\bresets?\s+(?:(?:at|in|on)\s*)?(?:\d{1,2}(?::\d{2})?\s*(?:am|pm)\b|\d{1,2}:\d{2}\b|midnight\b|noon\b|today\b|tomorrow\b|tonight\b|(?:next\s+)?(?:week|month)\b|(?:(?:a|one)\s+)?(?:week|month)s?\b|(?:next\s+)?(?:mon|tues|wednes|thurs|fri|satur|sun)day\b|(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?\s+\d{1,2}(?:,?\s+\d{4})?\b|\d{4}-\d{1,2}-\d{1,2}\b|\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b|\d+(?:\s*(?:seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d))?\b)/i;
+const EXPLICIT_HARD_QUOTA =
+  /\b(?:insufficient_quota|insufficient_balance|insufficient_funds|usage_limit_exceeded|enforced_spend_limit(?:_reached)?|account_inactive)\b|\b(?:quota exceeded|usage (?:limit|cap)|monthly (?:usage )?limit|daily (?:usage )?limit|weekly (?:usage )?limit|billing (?:cycle|period|verification|issue|failure|failed|error|problem|unavailable|required)|payment required|insufficient (?:balance|funds|quota)|credits? (?:exhausted|depleted)|out of (?:usage|credits)|plan limit|tier limit|spend limit|budget exceeded|5-hour limit reached|message limit reached|messaging allowance|(?:your|current) plan)\b|\b(?:quota|credits?|funds?|balance|usage)\b[^.\n]{0,60}\b(?:exhausted|depleted|exceeded|insufficient|empty|zero)\b|\b(?:exhausted|depleted|exceeded|insufficient|empty|zero)\b[^.\n]{0,60}\b(?:quota|credits?|funds?|balance|usage)\b|\brate limit reached\b.{0,60}\b(?:this month|per month|monthly|billing cycle|your plan|hard limit)\b/i;
+const AMBIGUOUS_SESSION_LIMIT = /\b(?:session limit|session cap|limit on sessions)\b/i;
+const TRANSIENT_RATE_CAPACITY = /\b(?:429|rate.?limit(?:_error)?|too many requests|resource.?exhausted)\b/i;
+
+/** Short-lived capacity and throttling signals stay out of the hard quota
+ * classifier unless the same message names a usage, billing, or reset cap. */
+export function isTransientCapacityText(text: string): boolean {
+  const trimmed = text.trim();
+  return trimmed.length > 0 && trimmed.length < QUOTA_TEXT_MAX &&
+    !EXPLICIT_HARD_QUOTA.test(trimmed) && !EXPLICIT_RESET_NOTICE.test(trimmed) &&
+    (EXPLICIT_CONCURRENCY_CAP.test(trimmed) || TRANSIENT_RATE_CAPACITY.test(trimmed) || AMBIGUOUS_SESSION_LIMIT.test(trimmed));
+}
+
+function isTransientCapacityProviderError(text: string): boolean {
+  const trimmed = text.trim();
+  return trimmed.length > 0 &&
+    !EXPLICIT_HARD_QUOTA.test(trimmed) && !EXPLICIT_RESET_NOTICE.test(trimmed) &&
+    (EXPLICIT_CONCURRENCY_CAP.test(trimmed) || TRANSIENT_RATE_CAPACITY.test(trimmed) || AMBIGUOUS_SESSION_LIMIT.test(trimmed));
+}
+
+const TRANSIENT_CAPACITY_CHIP =
+  /^(?:(?:error:\s*)?(?:(?:api request failed|provider error|request failed|http error):\s*)?)(?:http\s*)?(?:429\s*[:—-]?\s*)?(?:429|resource.?exhausted|rate.?limit(?:_error|\s+(?:reached|exceeded|hit))?|too many requests|session (?:limit|cap)\s*(?:reached|exceeded|hit)|limit on sessions\s*(?:reached|exceeded|hit)|(?:you(?:'ve| have)?\s+)?(?:hit|reached|exceeded)\s+.{0,40}\bsession limit|concurrency (?:limit|cap)\s*(?:reached|exceeded|hit)?|too many concurrent(?: requests?|sessions?|connections?)?|(?:maximum|max) number of (?:concurrent|in[- ]flight|active)\s+(?:sessions?|requests?|connections?)(?:\s+(?:limit|cap))?\s+(?:reached|exceeded|busy|full))(?:[.!]?|\s*(?:[.!·,;—-]\s*)?(?:please (?:wait|retry|try again)|retry|try again|resets?\b|current(?:ly)? at capacity)\b.*)$/i;
+
+export function isTransientCapacityChip(text: string): boolean {
+  return isTransientCapacityText(text) && TRANSIENT_CAPACITY_CHIP.test(text.trim());
+}
 
 const LEGACY_PROVIDER_ERROR_PREFIX = /^(?:api request failed|provider error|request failed|http error):\s*/i;
 
@@ -278,7 +314,8 @@ export const DEFAULT_QUOTA_COOLDOWN_TTL_MS = 15 * 60 * 1000;
 /** Short error-chip text that must not count as a real assistant reply. */
 export function isShortProviderErrorText(text: string): boolean {
   const trimmed = text.trim();
-  return trimmed.length < 300 && (SHORT_PROVIDER_ERROR.test(trimmed) || isQuotaOrCapText(trimmed));
+  return trimmed.length < 300 &&
+    (SHORT_PROVIDER_ERROR.test(trimmed) || isQuotaOrCapText(trimmed) || isTransientCapacityChip(trimmed));
 }
 
 /** Quota, usage-cap, or session-limit chip — including Grok's
@@ -286,6 +323,7 @@ export function isShortProviderErrorText(text: string): boolean {
 export function isQuotaOrCapText(text: string): boolean {
   const trimmed = text.trim();
   if (!trimmed || trimmed.length >= QUOTA_TEXT_MAX) return false;
+  if (isTransientCapacityText(trimmed)) return false;
   const stripped = trimmed.replace(
     /^(?:error:\s*)?(?:(?:antigravity|grok|claude|codex|gemini|cursor|deepseek|openai):\s*)?/i,
     "",
@@ -319,6 +357,7 @@ export function turnQuotaOrCapEvidence(
       const name = message.tool?.name ?? "";
       if (!/^error:/i.test(name)) continue;
       const text = name.replace(/^error:\s*/i, "").trim();
+      if (isTransientCapacityProviderError(text)) continue;
       if (text && KNOWN_FAILURE_QUOTA_OR_CAP.test(text)) return { text, source: "provider-error" };
     }
   }
@@ -330,6 +369,50 @@ export function turnQuotaOrCapEvidence(
   if (!text) return undefined;
   if (isQuotaOrCapText(text)) return { text, source: "terminal-chip" };
   return undefined;
+}
+
+export interface TransientCapacityEvidence {
+  text: string;
+  source: "provider-error" | "terminal-text";
+}
+
+/** Finds transient capacity evidence from a failed provider event or a
+ * standalone terminal chip, keeping plan and billing exhaustion separate. */
+export function turnTransientCapacityEvidence(
+  messagesAfterUser: FallbackScanMessage[],
+  turnOk: boolean,
+): TransientCapacityEvidence | undefined {
+  if (!turnOk) {
+    let transientError: TransientCapacityEvidence | undefined;
+    for (let i = messagesAfterUser.length - 1; i >= 0; i--) {
+      const message = messagesAfterUser[i];
+      if (message.role !== "bot" || message.kind !== "activity") continue;
+      const name = message.tool?.name ?? "";
+      if (!/^error:/i.test(name)) continue;
+      const text = name.replace(/^error:\s*/i, "").trim();
+      if (EXPLICIT_HARD_QUOTA.test(text) || EXPLICIT_RESET_NOTICE.test(text) || isQuotaOrCapText(text)) return undefined;
+      if (!transientError && isTransientCapacityProviderError(text)) {
+        transientError = { text, source: "provider-error" };
+      }
+    }
+    if (transientError) return transientError;
+  }
+  const botTexts = messagesAfterUser.filter(
+    (message) => message.role === "bot" && message.kind === "text" && message.text !== undefined,
+  );
+  const text = botTexts.at(-1)?.text?.trim();
+  return text && isTransientCapacityChip(text) ? { text, source: "terminal-text" } : undefined;
+}
+
+/** Uses a provider's short retry hint when present and caps transient holds at
+ * five minutes so no rate signal becomes a durable quota cooldown. */
+export function transientCapacityRetryDelayMs(text: string): number {
+  const retry = text.match(/\b(?:retry[- ]after:?|try again in)\s*(\d+)(?:\s*(seconds?|secs?|s|minutes?|mins?|m)\b|(?=\s*(?:$|[.,;!?)])))/i);
+  if (!retry) return DEFAULT_TRANSIENT_CAPACITY_RETRY_MS;
+  const amount = Number.parseInt(retry[1], 10);
+  const unit = retry[2]?.toLowerCase() ?? "s";
+  const milliseconds = amount * (unit.startsWith("m") ? 60_000 : 1_000);
+  return Math.max(1_000, Math.min(MAX_TRANSIENT_CAPACITY_RETRY_MS, milliseconds));
 }
 
 /** The last message that actually started a turn — a human's "user" message,
@@ -686,6 +769,8 @@ export function selectTurnFallback(input: {
   /** Skips an entry the provider already rejected for this bot.  Like the
    *  doomed gate it needs `botId`; defaults to the process-wide registry. */
   isModelRejected?: ModelRejectionGate;
+  /** Skips a fallback whose exact (bot, engine, model) route is cooling down. */
+  isCooling?: (botId: string, instanceId: string, model: string, now: number) => boolean;
   now?: number;
 }): TurnFallbackPick | undefined {
   if (input.ok) return undefined;
@@ -719,6 +804,8 @@ export function selectTurnFallback(input: {
     // A model the provider already said it does not have would only spend
     // another spawn to hear it again, and end the walk there.
     if (botId && isRejected?.(botId, next.instanceId, model, now)) continue;
+    if (transientRouteHealth.get(next.instanceId, model, now)) continue;
+    if (botId && input.isCooling?.(botId, next.instanceId, model, now)) continue;
     return { ...selectionForFallbackPick({ ...next, model }), nextUsed: i + 1 };
   }
   return undefined;
@@ -740,6 +827,141 @@ export interface BotQuotaCooldown {
   /** Who wrote this row: a terminal chip, provider error, or quota poller. */
   source?: string;
 }
+
+export interface TransientRouteCapacity {
+  botId: string;
+  instanceId: string;
+  model: string;
+  error: string;
+  recordedAt: number;
+  retryAt: number;
+}
+
+export interface ModelRouteResolution {
+  selection: ModelSelection;
+  isFallback: boolean;
+  cooldown?: BotQuotaCooldown;
+  transientCapacity?: TransientRouteCapacity;
+}
+
+export const DEFAULT_TRANSIENT_CAPACITY_RETRY_MS = 5_000;
+export const MAX_TRANSIENT_CAPACITY_RETRY_MS = 5 * 60_000;
+const TRANSIENT_HEALTH_WINDOW_MS = 30_000;
+const MAX_TRACKED_TRANSIENT_ROUTES = 512;
+const MAX_TRACKED_BOTS_PER_ROUTE = 16;
+
+function trimOldest<K, V>(map: Map<K, V>, maximum: number): void {
+  while (map.size > maximum) {
+    const oldest = map.keys().next().value;
+    if (oldest === undefined) return;
+    map.delete(oldest);
+  }
+}
+
+/** Volatile route-level state for explicit in-flight/concurrency refusals.
+ * It is separate from quota persistence and is keyed by the shared
+ * instance/model credential route, not by a bot. */
+export class TransientRouteHealthRegistry {
+  private readonly routes = new Map<string, Map<string, TransientRouteCapacity>>();
+  private readonly healthyBots = new Map<string, Map<string, number>>();
+
+  private key(instanceId: string, model: string): string {
+    return JSON.stringify([instanceId, model]);
+  }
+
+  private trim(): void {
+    trimOldest(this.routes, MAX_TRACKED_TRANSIENT_ROUTES);
+    trimOldest(this.healthyBots, MAX_TRACKED_TRANSIENT_ROUTES);
+  }
+
+  private pruneRoute(key: string, now: number): void {
+    const holds = this.routes.get(key);
+    if (holds) {
+      for (const [botId, hold] of holds) {
+        if (now >= hold.retryAt) holds.delete(botId);
+      }
+    }
+    if (holds?.size === 0) this.routes.delete(key);
+    const healthy = this.healthyBots.get(key);
+    for (const [botId, at] of healthy ?? []) {
+      if (now - at >= TRANSIENT_HEALTH_WINDOW_MS) healthy!.delete(botId);
+    }
+    if (healthy?.size === 0) this.healthyBots.delete(key);
+  }
+
+  recordFailure(
+    botId: string,
+    instanceId: string,
+    model: string,
+    error: string,
+    now = Date.now(),
+    retryAfterMs = DEFAULT_TRANSIENT_CAPACITY_RETRY_MS,
+    isActiveSibling?: (botId: string) => boolean,
+  ): TransientRouteCapacity | undefined {
+    const key = this.key(instanceId, model);
+    this.pruneRoute(key, now);
+    const healthy = this.healthyBots.get(key);
+    healthy?.delete(botId);
+    if (healthy?.size === 0) this.healthyBots.delete(key);
+    if ([...(healthy?.entries() ?? [])].some(
+      ([healthyBotId, at]) => healthyBotId !== botId && at <= now && now - at < TRANSIENT_HEALTH_WINDOW_MS &&
+        (isActiveSibling === undefined || isActiveSibling(healthyBotId)),
+    )) {
+      this.routes.delete(key);
+      return undefined;
+    }
+    const requestedDelay = Number.isFinite(retryAfterMs) ? retryAfterMs : DEFAULT_TRANSIENT_CAPACITY_RETRY_MS;
+    const boundedDelay = Math.max(1_000, Math.min(MAX_TRANSIENT_CAPACITY_RETRY_MS, requestedDelay));
+    const route: TransientRouteCapacity = { botId, instanceId, model, error, recordedAt: now, retryAt: now + boundedDelay };
+    const holds = this.routes.get(key) ?? new Map<string, TransientRouteCapacity>();
+    holds.set(botId, route);
+    trimOldest(holds, MAX_TRACKED_BOTS_PER_ROUTE);
+    this.routes.set(key, holds);
+    this.trim();
+    return route;
+  }
+
+  markUnhealthy(botId: string, instanceId: string, model: string): void {
+    const key = this.key(instanceId, model);
+    const healthy = this.healthyBots.get(key);
+    healthy?.delete(botId);
+    if (healthy?.size === 0) this.healthyBots.delete(key);
+  }
+
+  get(instanceId: string, model: string, now = Date.now()): TransientRouteCapacity | undefined {
+    const key = this.key(instanceId, model);
+    this.pruneRoute(key, now);
+    return [...(this.routes.get(key)?.values() ?? [])].sort((a, b) => b.recordedAt - a.recordedAt)[0];
+  }
+
+  /** A healthy sibling proves only this exact route is usable and clears only
+   * its transient holds; persisted quota rows are stored separately. */
+  markHealthy(botId: string, instanceId: string, model: string, at = Date.now()): void {
+    const key = this.key(instanceId, model);
+    this.pruneRoute(key, at);
+    const healthy = this.healthyBots.get(key) ?? new Map<string, number>();
+    healthy.set(botId, Math.max(healthy.get(botId) ?? Number.NEGATIVE_INFINITY, at));
+    trimOldest(healthy, MAX_TRACKED_BOTS_PER_ROUTE);
+    this.healthyBots.set(key, healthy);
+    const holds = this.routes.get(key);
+    for (const [heldBotId, hold] of holds ?? []) {
+      if (hold.recordedAt <= at) holds?.delete(heldBotId);
+    }
+    if (holds?.size === 0) this.routes.delete(key);
+    this.trim();
+  }
+
+  list(now = Date.now()): TransientRouteCapacity[] {
+    const active: TransientRouteCapacity[] = [];
+    for (const key of [...this.routes.keys(), ...this.healthyBots.keys()]) this.pruneRoute(key, now);
+    for (const holds of this.routes.values()) {
+      active.push(...holds.values());
+    }
+    return active;
+  }
+}
+
+export const transientRouteHealth = new TransientRouteHealthRegistry();
 
 function computeNextOccurrence(targetHour: number, targetMinute: number, tz: string | undefined, now: number): number {
   if (tz) {
@@ -857,6 +1079,18 @@ export class QuotaCooldownRegistry {
     return now >= recorded + DEFAULT_QUOTA_COOLDOWN_TTL_MS;
   }
 
+  private isLegacyTransientRoute(cd: BotQuotaCooldown): boolean {
+    if (cd.source === "provider-error" || cd.source === "provider-error-code") {
+      return isTransientCapacityProviderError(cd.error);
+    }
+    return (cd.source === undefined || cd.source === "terminal-chip") && isTransientCapacityText(cd.error);
+  }
+
+  private hasSyntheticDefaultReset(cd: BotQuotaCooldown): boolean {
+    if (cd.resetsAt == null || !Number.isFinite(cd.resetsAt) || cd.resetsAt <= 0) return true;
+    return cd.resetsAt === cd.recordedAt + DEFAULT_QUOTA_COOLDOWN_TTL_MS;
+  }
+
   private load(): void {
     if (!this.persistPath) return;
     try {
@@ -876,6 +1110,10 @@ export class QuotaCooldownRegistry {
           typeof cd.model !== "string" ||
           typeof cd.error !== "string"
         ) {
+          removed = true;
+          continue;
+        }
+        if (this.isLegacyTransientRoute(cd) && this.hasSyntheticDefaultReset(cd)) {
           removed = true;
           continue;
         }
@@ -1024,23 +1262,25 @@ export class QuotaCooldownRegistry {
     primary: ModelSelection,
     now = Date.now(),
     opts: { isDoomed?: DoomedEngineGate; isModelRejected?: ModelRejectionGate } = {},
-  ): { selection: ModelSelection; isFallback: boolean; cooldown?: BotQuotaCooldown } {
+  ): ModelRouteResolution {
     // Heal retired picker ids before cooldown / rejection lookups so a
     // bots.json still naming MiniMax-M3 never reaches the engine.
     const rewrittenPrimary = rewriteModelSelection(primary).selection;
     const cd = this.get(botId, rewrittenPrimary.instanceId, rewrittenPrimary.model, now);
+    const transientCapacity = transientRouteHealth.get(rewrittenPrimary.instanceId, rewrittenPrimary.model, now);
     const isRejected = rejectionGate(opts.isModelRejected);
     // A primary the provider rejected is routed around exactly like a cooling
     // one: it would fail again before doing any work.  Unlike a cooldown it
     // leaves no row for the Usage settings to show as a quota hit.
     const primaryRejected = isRejected(botId, rewrittenPrimary.instanceId, rewrittenPrimary.model, now);
-    if (!cd && !primaryRejected) {
+    if (!cd && !primaryRejected && !transientCapacity) {
       return { selection: rewrittenPrimary, isFallback: false };
     }
     // A rejected primary has no cooldown row, so the result carries none.
     const resolved = (selection: ModelSelection, isFallback: boolean) => {
-      const result: { selection: ModelSelection; isFallback: boolean; cooldown?: BotQuotaCooldown } = { selection, isFallback };
+      const result: ModelRouteResolution = { selection, isFallback };
       if (cd) result.cooldown = cd;
+      if (transientCapacity && !isFallback) result.transientCapacity = transientCapacity;
       return result;
     };
     const fallbacks = rewrittenPrimary.fallbacks;
@@ -1049,6 +1289,7 @@ export class QuotaCooldownRegistry {
       for (const fb of fallbacks) {
         const next = rewriteModelSelection(fb).selection;
         if (this.get(botId, next.instanceId, next.model, now)) continue;
+        if (transientRouteHealth.get(next.instanceId, next.model, now)) continue;
         if (isDoomed(botId, next.instanceId, now)) continue;
         if (isRejected(botId, next.instanceId, next.model, now)) continue;
         return resolved(next, true);

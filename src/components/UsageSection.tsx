@@ -19,7 +19,7 @@ import { HeldBotsNotice, RedundantChainsNotice } from "./UsageNotices";
 import { ENGINE_CAPABILITIES, engineIdFromDriverKind, uniqueModelToEngineId } from "@/lib/engine-capabilities";
 import { telemetryBadge, telemetryHost, type TelemetryStatusView } from "@/lib/telemetry-status";
 import { buildUsageConfigPatch } from "@/lib/usage-config";
-import { antigravityGroupSummary, antigravityQuotaLines, formatResetCountdown, headlinesExhausted, headlinesNearCap, isEngineUnconfigured, localQuotaStatusLine, minimaxQuotaLine, providerIssueLine, quotaLinesSummary, usageWindowLines, windowHeadlines, windowsLabelFromHeadlines, type LocalQuotaFreshnessView } from "@/lib/quota-display";
+import { antigravityGroupSummary, antigravityQuotaLines, formatResetCountdown, headlinesExhausted, headlinesNearCap, isEngineUnconfigured, localQuotaStatusLine, minimaxQuotaLine, providerIssueLine, quotaGridPlaceholderLine, quotaLinesSummary, usageWindowLines, windowHeadlines, windowsLabelFromHeadlines, type LocalQuotaFreshnessView } from "@/lib/quota-display";
 import {
   antigravityQuotaCapped,
   antigravityDisplayWindows,
@@ -357,6 +357,7 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
     fileSkipReason?: string | null;
   }>>([]);
   const [localQuota, setLocalQuota] = React.useState<LocalQuotaFreshnessView | null>(null);
+  const [quotasLoaded, setQuotasLoaded] = React.useState(false);
   const [expandedQuota, setExpandedQuota] = React.useState<string | null>(null);
   const usageConfig = state.config?.usage;
   const secretSources = useSecretSources();
@@ -471,8 +472,11 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
           if (parsedDoomed.success) setDoomed(parsedDoomed.data);
           const parsedChains = RedundantChainArraySchema.safeParse(data?.fallbackChains);
           if (parsedChains.success) setRedundantChains(parsedChains.data);
+          setQuotasLoaded(true);
         })
-        .catch(() => {});
+        .catch(() => {
+          setQuotasLoaded(true);
+        });
     };
     fetchQuotas();
     const quotaInterval = setInterval(() => {
@@ -1003,6 +1007,21 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
             const engineIssue = !showGenericGrid && !hasUsageMonitorAG && engineProvider
               ? providerIssueLine(instance.displayName, localQuota?.issues?.[engineProvider], localQuota?.producer)
               : null;
+            const expectsUsageMonitorPlaceholder =
+              Boolean(engineProvider) &&
+              instance.instanceId !== "grok" &&
+              !hasUsageMonitorAG &&
+              instanceWindows.length === 0 &&
+              !engineIssue &&
+              // MiniMax and DeepSeek already say their quota or balance in the headline.
+              !minimaxStatus &&
+              !deepseekStatus &&
+              !(instance.instanceId === "antigravity" && agGroups.length > 0);
+            const usageMonitorGridEmptyLine = expectsUsageMonitorPlaceholder
+              ? quotaGridPlaceholderLine(quotasLoaded ? "empty" : "loading", instance.displayName)
+              : null;
+            const showUsageMonitorGrid =
+              hasUsageMonitorAG || showGenericGrid || Boolean(usageMonitorGridEmptyLine);
             const baseDetailLines = hasUsageMonitorAG
               ? []
               : agLines.length > 0
@@ -1071,7 +1090,7 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
                   const value = group.remainingPercent == null
                     ? "not reported"
                     : `${group.remainingPercent}% available`;
-                  return `${group.label}: ${value} (5h window)`;
+                  return `${group.label}: ${value} (5-hour window)`;
                 })
               : [
                   // The wildcard cooldown (Cursor's monthly cap, an exhausted
@@ -1214,8 +1233,12 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
                     />
                   </div>
                 </button>
-                {hasUsageMonitorAG && <UsageMonitorQuotaGrid windows={usageMonitorAGWindows} />}
-                {showGenericGrid && <UsageMonitorQuotaGrid windows={instanceWindows as any} />}
+                {showUsageMonitorGrid && (
+                  <UsageMonitorQuotaGrid
+                    windows={hasUsageMonitorAG ? usageMonitorAGWindows : (instanceWindows as any)}
+                    emptyLine={usageMonitorGridEmptyLine}
+                  />
+                )}
                 {engineIssue && (
                   <div className="ml-9 mt-1.5 rounded-lg border border-hairline/25 bg-inset/30 px-2.5 py-2 text-[11.5px] leading-relaxed text-ink-secondary" title={engineIssue}>
                     {engineIssue}
@@ -1303,7 +1326,7 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
                 <div className="flex min-w-0 flex-col">
                   <span className="truncate font-medium text-ink" title={entry.displayName}>{entry.displayName}</span>
                   <span className="truncate text-[11px] text-ink-secondary/90" title={entry.pricing.notes ?? sub?.notes ?? api?.notes ?? ""}>
-                    {entry.pricing.kind === "api" ? "API pay-as-you-go" : entry.pricing.kind === "free" ? "Free engine" : "Subscription engine"}
+                    {entry.pricing.kind === "api" ? "API pay-as-you-go" : entry.pricing.kind === "free" ? "Free engine" : entry.pricing.kind === "unknown" ? "Pricing unknown" : "Subscription engine"}
                   </span>
                 </div>
                 <div className="flex flex-col gap-1">

@@ -123,7 +123,7 @@ export async function applyPreparedUpdate(prepared, options, ops) {
     signals.hold();
     await ops.quiesce(previous);
     await ops.assertQuiesced(previous);
-    await ops.advanceCheckout(prepared.targetCommit, previous);
+    await ops.advanceCheckout(prepared, previous);
     await ops.installCandidate(prepared, previous);
     await ops.prepareCredentials(prepared, previous);
     await ops.startHarness(prepared, previous);

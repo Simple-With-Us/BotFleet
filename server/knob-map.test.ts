@@ -5,6 +5,7 @@ import {
   KNOB_FIELDS,
   KNOB_INFISICAL_NAMES,
   canonicalKnobString,
+  clearedHeadroomKnobs,
   deleteKnobField,
   knobProvenance,
   knobSource,
@@ -30,7 +31,53 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+describe("headroom knobs (P-BF-6 B7)", () => {
+  const ids = ["jobs.admission.reservedCpuCores", "jobs.admission.reservedRamMb", "jobs.admission.minMemoryAvailablePercent"];
+  it("are unset when neither file nor vault holds them — no default is invented", () => {
+    const cfg: AppConfig = {};
+    const rows = resolveKnobFields(cfg, new Map());
+    for (const id of ids) {
+      expect(rows.find((row) => row.id === id)).toMatchObject({ source: "none", hasValue: false });
+      expect(readKnobField(cfg, spec(id))).toBeUndefined();
+    }
+    expect(cfg.jobs?.admission).toBeUndefined();
+  });
+  it("land on the config when the vault sets them", () => {
+    const cfg: AppConfig = {};
+    const rows = resolveKnobFields(cfg, new Map([
+      ["BOTFLEET_JOBS_RESERVED_CPU_CORES", "2"],
+      ["BOTFLEET_JOBS_RESERVED_RAM_MB", "4096"],
+      ["BOTFLEET_JOBS_MIN_MEMORY_AVAILABLE_PERCENT", "15"],
+    ]));
+    expect(cfg.jobs?.admission).toEqual({ reservedCpuCores: 2, reservedRamMb: 4096, minMemoryAvailablePercent: 15 });
+    for (const id of ids) expect(rows.find((row) => row.id === id)).toMatchObject({ source: "infisical", hasValue: true });
+  });
+  it("names the headroom knobs a patch clears with an explicit null", () => {
+    expect(clearedHeadroomKnobs({ jobs: { admission: { reservedCpuCores: null } } })).toEqual([
+      "jobs.admission.reservedCpuCores",
+    ]);
+    expect(
+      clearedHeadroomKnobs({ jobs: { admission: { reservedRamMb: null, minMemoryAvailablePercent: null } } }),
+    ).toEqual(["jobs.admission.reservedRamMb", "jobs.admission.minMemoryAvailablePercent"]);
+    // A real value is not a clear, and neither is an absent key or patch.
+    expect(clearedHeadroomKnobs({ jobs: { admission: { reservedCpuCores: 2 } } })).toEqual([]);
+    expect(clearedHeadroomKnobs({ jobs: { admission: {} } })).toEqual([]);
+    expect(clearedHeadroomKnobs({})).toEqual([]);
+    expect(clearedHeadroomKnobs(undefined)).toEqual([]);
+    // An explicit null is not a value either: it reads as absent everywhere.
+    expect(readKnobField({ jobs: { admission: { reservedCpuCores: null } } }, spec("jobs.admission.reservedCpuCores"))).toBeUndefined();
+  });
+});
+
 describe("the knob table", () => {
+  it("resolves queue wait from the vault and strips it from file snapshots independently of run time", () => {
+    const cfg: AppConfig = { jobs: { maxMinutes: 30 } };
+    resolveKnobFields(cfg, new Map([["BOTFLEET_JOBS_QUEUE_WAIT_MINUTES", "20000"]]));
+    expect(cfg.jobs).toMatchObject({ maxMinutes: 30, queueWaitMinutes: 10080 });
+    expect(parseKnobValue(spec("jobs.queueWaitMinutes"), "0")).toBe(1);
+    expect(stripVaultManagedKnobs(cfg)).toContain("jobs.queueWaitMinutes");
+    expect(cfg.jobs?.queueWaitMinutes).toBeUndefined();
+  });
   it("has unique ids, paths and Infisical names", () => {
     const ids = KNOB_FIELDS.map((entry) => entry.id);
     const names = KNOB_FIELDS.map((entry) => entry.infisicalName);
@@ -84,6 +131,16 @@ describe("parseKnobValue", () => {
     expect(parseKnobValue(spec("jobs.webhookHotDeferMinutes"), "9999")).toBe(720);
   });
 
+  it("clamps the webhook payload dedupe window and applies it from the vault", () => {
+    expect(parseKnobValue(spec("jobs.webhookPayloadDedupeSeconds"), "120")).toBe(120);
+    expect(parseKnobValue(spec("jobs.webhookPayloadDedupeSeconds"), "0")).toBe(0);
+    expect(parseKnobValue(spec("jobs.webhookPayloadDedupeSeconds"), "-5")).toBe(0);
+    expect(parseKnobValue(spec("jobs.webhookPayloadDedupeSeconds"), "99999")).toBe(3600);
+    const cfg: AppConfig = { jobs: { webhookHotDeferMinutes: 20 } };
+    resolveKnobFields(cfg, new Map([["BOTFLEET_WEBHOOK_PAYLOAD_DEDUPE_SECONDS", "30"]]));
+    expect(cfg.jobs).toEqual({ webhookHotDeferMinutes: 20, webhookPayloadDedupeSeconds: 30 });
+  });
+
   it("clamps the auto-review limit per turn and applies it from the vault", () => {
     expect(parseKnobValue(spec("autoReview.maxReviewsPerTurn"), "50")).toBe(50);
     expect(parseKnobValue(spec("autoReview.maxReviewsPerTurn"), "0")).toBe(1);
@@ -124,6 +181,28 @@ describe("parseKnobValue", () => {
 });
 
 describe("resolving knobs", () => {
+  it("leaves the inode floor unset until a file or vault explicitly supplies it", () => {
+    const cfg: AppConfig = {};
+    resolveKnobFields(cfg, new Map());
+    expect(readKnobField(cfg, spec("jobs.admission.minFreeInodes"))).toBeUndefined();
+    resolveKnobFields(cfg, new Map([["BOTFLEET_JOBS_MIN_FREE_INODES", "1250"]]));
+    expect(cfg.jobs?.admission?.minFreeInodes).toBe(1250);
+    expect(knobSource("jobs.admission.minFreeInodes")).toBe("infisical");
+  });
+  it("applies the migrated computer-call and Claude-session knobs, clamped to their bounds", () => {
+    const cfg: AppConfig = { computerCall: { waitMs: 10_000 } };
+    resolveKnobFields(cfg, new Map([
+      ["BOTFLEET_COMPUTER_CALL_WAIT_MS", "999999"],
+      ["BOTFLEET_COMPUTER_CALL_ACT_WITHIN_MS", "250"],
+      ["BOTFLEET_COMPUTER_CALL_WAIT_MAX_MS", "90000"],
+      ["BOTFLEET_CLAUDE_SESSION_IDLE_MS", "120000"],
+      ["BOTFLEET_CLAUDE_SESSION_IDLE_MIN_MS", "2000"],
+    ]));
+    expect(cfg.computerCall).toEqual({ waitMs: 45_000, actWithinMs: 250, personAwayMs: 90_000 });
+    expect(cfg.claudeSession).toEqual({ idleMs: 120_000, idleMinMs: 2_000 });
+    expect(knobSource("computerCall.waitMs")).toBe("infisical");
+    expect(knobSource("claudeSession.idleMs")).toBe("infisical");
+  });
   it("applies a vault value over the file value", () => {
     const cfg: AppConfig = { jobs: { defaultMinutes: 60 } };
     setInfisicalSnapshot(new Map([["BOTFLEET_JOBS_DEFAULT_MINUTES", "30"]]), ["BOTFLEET_JOBS_DEFAULT_MINUTES"]);

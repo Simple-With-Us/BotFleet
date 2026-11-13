@@ -47,7 +47,7 @@ import {
   VOICE_CLONE_MIN_SECONDS,
   type MicRecorder,
 } from "@/lib/voice-clone-recording";
-import { AudioRetentionPicker, DefaultVoicePicker, PronunciationSettings } from "./WorkspaceVoiceSettings";
+import { AudioRetentionPicker, DefaultVoicePicker, PronunciationSettings, VoiceMasterSwitch } from "./WorkspaceVoiceSettings";
 
 const SAMPLE = "Morning.  Overnight the tests went green, and I left two notes for you in the thread.";
 
@@ -94,7 +94,7 @@ const personalName = (id: string) => id.replace(/^(personal|apple-personal):/, "
 export const deviceVoicesSupported = (bot: Bot): boolean => bot.voices !== undefined;
 
 export const DEVICE_VOICES_NEED_UPDATE =
-  "The iPhone uses this voice too.\u00A0 A separate iPhone voice needs an update to the bot server on this computer.";
+  "The iPhone uses this voice too.\u00A0 Update BotFleet on this computer to pick a separate iPhone voice.";
 
 /** A per-device override counts only when it is a non-blank string, the
  * same rule voiceForDevice applies. */
@@ -684,6 +684,11 @@ export function VoiceSettings({
       <div className="mt-0.5 text-[13px] text-ink-secondary">
         Give this bot a voice for calls and spoken replies.{"\u00A0 "}Each device can use its own voice: an Apple Personal Voice stays on the device that made it, and a MiniMax voice plays anywhere.{"\u00A0 "}The voices belong to this bot; the MiniMax key, the default voice and the pronunciations are shared by the workspace.
       </div>
+
+      <VoiceMasterSwitch
+        tts={tts}
+        onConfig={(config) => dispatch({ type: "configStatus", config })}
+      />
 
       {/* ── Default Voice (workspace) ── */}
       <DefaultVoicePicker

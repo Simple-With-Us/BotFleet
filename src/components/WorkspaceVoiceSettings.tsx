@@ -36,7 +36,8 @@ export interface WorkspaceVoiceDeps {
     patch:
       | { tts: { voice: string } }
       | { tts: { pronunciations: Pronunciation[] } }
-      | { tts: { audioRetentionDays: number } },
+      | { tts: { audioRetentionDays: number } }
+      | { tts: { enabled: boolean } },
   ): Promise<ConfigStatus>;
   speak(text: string, voiceId: string): void;
 }
@@ -192,7 +193,7 @@ export function PronunciationSettings({
       <div className="mt-4 border-t border-hairline/40 pt-4">
         <div className="text-[13px] font-medium text-ink">Pronunciations</div>
         <p role="status" className="mt-1 text-[12px] text-ink-secondary">
-          Update the bot server on this computer to edit pronunciations.
+          Update BotFleet on this computer to edit pronunciations.
         </p>
       </div>
     );
@@ -328,7 +329,7 @@ export const AUDIO_RETENTION_OPTIONS: ReadonlyArray<{ days: number; label: strin
 ];
 
 export const AUDIO_RETENTION_HELP =
-  "How long synthesized voice clips and audio attachments are kept on disk before automatic cleanup.\u00A0 Playing an older reply again re-synthesizes its audio on demand.";
+  "How long voice clips and audio attachments are kept on disk before automatic cleanup.\u00A0 Playing an older reply again recreates its audio on demand.";
 
 export function AudioRetentionPicker({
   tts,
@@ -382,6 +383,72 @@ export function AudioRetentionPicker({
       </select>
       <p className="mt-1.5 text-[12px] text-ink-secondary">{AUDIO_RETENTION_HELP}</p>
       {error && <div role="alert" className="mt-1.5 text-[12px] text-danger">{error}</div>}
+    </div>
+  );
+}
+
+export const VOICE_MASTER_HELP =
+  "Turns auto-speak, calls, and hosted speech on or off for this workspace.  Existing replies stay on screen; nothing is spoken and new calls will not start while this is off.";
+
+function logVoiceSwitchSaveError(error: Error): void {
+  console.error(error instanceof Error ? error.message : "Could not save the voice switch.");
+}
+
+export function VoiceMasterSwitch({
+  tts,
+  onConfig,
+  deps = defaultWorkspaceVoiceDeps,
+}: {
+  tts?: WorkspaceTts;
+  onConfig: (config: ConfigStatus) => void;
+  deps?: WorkspaceVoiceDeps;
+}) {
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const enabled = tts?.enabled !== false;
+
+  async function save(next: boolean) {
+    setSaving(true);
+    setError(null);
+    try {
+      onConfig(await deps.saveConfig({ tts: { enabled: next } }));
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not save the voice switch.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="mt-3 flex flex-col gap-1.5">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <div className="text-[13px] font-medium text-ink">Voice</div>
+          <p className="mt-0.5 text-[12px] text-ink-secondary">{VOICE_MASTER_HELP}</p>
+        </div>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={enabled}
+          aria-label="Voice on"
+          disabled={saving}
+          onClick={() => {
+            void save(!enabled).catch(logVoiceSwitchSaveError);
+          }}
+          className={cn(
+            "relative h-6 w-11 shrink-0 rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50",
+            enabled ? "bg-success" : "bg-raised-hover",
+          )}
+        >
+          <span
+            className={cn(
+              "absolute top-0.5 size-5 rounded-full bg-white shadow transition-transform",
+              enabled ? "translate-x-5" : "translate-x-0.5",
+            )}
+          />
+        </button>
+      </div>
+      {error && <div className="text-[12px] text-danger">{error}</div>}
     </div>
   );
 }

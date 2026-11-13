@@ -8,8 +8,11 @@ import { DATA_DIR } from "./config.ts";
 import {
   closeMessageDb,
   deleteThread,
+  firstUserText,
+  hasThreadRows,
   insertMessage,
   pruneDeadThreads,
+  readMessageById,
   readThread,
   readThreadTail,
   readThreadsTail,
@@ -174,6 +177,84 @@ describe("message-db", () => {
     });
     expect(rows.find((row) => row.tool?.itemId === "task-2")?.helper?.status).toBe("completed");
     expect(next.settleInterruptedHelpers(6_000)).toBe(0);
+  });
+
+  it("readThread preserves insertion order and the stored active leaf over many rows", () => {
+    // ids deliberately not in insertion order: rowid order, not id order, wins
+    for (let i = 0; i < 50; i++) insertMessage("ord", msg(`m${String(49 - i).padStart(2, "0")}`, `text ${i}`, { at: 1_000 + i }));
+    setActiveLeaf("ord", "m07");
+    const thread = readThread("ord", legacy("ord"));
+    expect(thread.messages.map((m) => m.text)).toEqual(Array.from({ length: 50 }, (_, i) => `text ${i}`));
+    expect(thread.activeLeafId).toBe("m07");
+    expect(readMessageById("ord", "m07")?.text).toBe("text 42");
+    expect(readMessageById("ord", "missing")).toBeNull();
+    expect(readMessageById("missing-thread", "m07")).toBeNull();
+  });
+
+  it("firstUserText reads the first user line at the SQL boundary, with a legacy fallback", () => {
+    insertMessage("fu", { ...msg("b1", "bot first"), role: "bot" });
+    insertMessage("fu", msg("u1", "  "));
+    insertMessage("fu", msg("u2", "the real ask"));
+    insertMessage("fu", msg("u3", "later ask"));
+    expect(firstUserText("fu", legacy("fu"))).toBe("the real ask");
+    writeFileSync(legacy("fu-legacy"), JSON.stringify([msg("a", "from file", { role: "bot" }), msg("b", "file ask")]));
+    expect(firstUserText("fu-legacy", legacy("fu-legacy"))).toBe("file ask");
+    expect(firstUserText("fu-empty", legacy("fu-empty"))).toBeNull();
+  });
+
+  it("settling interrupted helpers at boot does not hydrate or cache a large thread", () => {
+    const store = new Store(selection);
+    const bot = store.createBot({}, { seedMessages: false });
+    for (let i = 0; i < 200; i++) store.appendMessage(bot.threadId, { role: "user", kind: "text", text: `filler ${i} ${"x".repeat(200)}` });
+    store.appendMessage(bot.threadId, {
+      role: "bot",
+      kind: "activity",
+      tool: { name: "Task", itemId: "task-boot" },
+      helper: { fidelity: "typed", depth: 1, label: "Boot sweep", toolCount: 1, status: "running", startedAt: 1_000, endedAt: null },
+    });
+    store.flushBotsNow();
+
+    const next = new Store(selection);
+    expect(next.threadIsCachedForTests(bot.threadId)).toBe(false);
+    expect(next.settleInterruptedHelpers(5_000)).toBe(1);
+    expect(next.threadIsCachedForTests(bot.threadId)).toBe(false);
+    expect(next.hasMessage(bot.threadId, "nope")).toBe(false);
+    const settled = readThread(bot.threadId, legacy(bot.threadId)).messages.find((m) => m.tool?.itemId === "task-boot");
+    expect(settled?.helper).toMatchObject({ status: "failed", endedAt: 5_000 });
+    expect(next.hasMessage(bot.threadId, settled!.id)).toBe(true);
+    expect(next.threadIsCachedForTests(bot.threadId)).toBe(false);
+  });
+
+  it("hasMessage finds a message that lives only in a legacy JSON file", () => {
+    // No SQLite rows yet: the held-work restore at boot (restoreHeldWork in
+    // server/index.ts) gates on hasMessage, so a legacy-only thread must not
+    // read as "message gone" just because its file was never imported.
+    writeFileSync(legacy("legacy-only"), JSON.stringify([msg("held-1", "held ask"), msg("other", "other line")]));
+    expect(hasThreadRows("legacy-only")).toBe(false);
+    const store = new Store(selection);
+    expect(store.threadIsCachedForTests("legacy-only")).toBe(false);
+    expect(store.hasMessage("legacy-only", "held-1")).toBe(true);
+    expect(store.hasMessage("legacy-only", "missing")).toBe(false);
+    // the fallback hydrated through the one-time legacy import
+    expect(hasThreadRows("legacy-only")).toBe(true);
+    expect(existsSync(`${legacy("legacy-only")}.imported`)).toBe(true);
+  });
+
+  it("hasMessage on a thread with DB rows stays bounded and does not hydrate it", () => {
+    insertMessage("bounded", msg("m1", "hello"));
+    insertMessage("bounded", msg("m2", "world"));
+    expect(hasThreadRows("bounded")).toBe(true);
+    const store = new Store(selection);
+    expect(store.threadIsCachedForTests("bounded")).toBe(false);
+    expect(store.hasMessage("bounded", "m1")).toBe(true);
+    expect(store.threadIsCachedForTests("bounded")).toBe(false);
+  });
+
+  it("hasMessage returns false for a missing message in a thread with DB rows", () => {
+    insertMessage("with-rows", msg("present", "here"));
+    const store = new Store(selection);
+    expect(store.hasMessage("with-rows", "absent")).toBe(false);
+    expect(store.threadIsCachedForTests("with-rows")).toBe(false);
   });
 
   it("deleteThread removes rows and state", () => {

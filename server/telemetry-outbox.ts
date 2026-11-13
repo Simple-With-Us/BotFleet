@@ -212,6 +212,8 @@ const SAFE_METADATA_KEYS = new Set([
   "characters",
   "characterSource",
   "images",
+  "durationSeconds",
+  "mode",
   "success",
   "tokenType",
   "model",
@@ -219,6 +221,18 @@ const SAFE_METADATA_KEYS = new Set([
   "usageReported",
   "roomId",
   "estimatedCostUsd",
+  // De-duplication keys against a child harness's own telemetry: an engine
+  // id, an opaque native session id and a timestamp, never prompt text.
+  // The queued batch is what gets sent, so a key missing here never arrives.
+  "childHarness",
+  "childSessionId",
+  "turnStartedAt",
+  "billedCallProofVersion",
+  "billedCallId",
+  "billedCallModel",
+  "billedCallOutput",
+  "billedCallCacheRead",
+  "billedCallCacheWrite",
 ]);
 
 export function usageTelemetryDestinationHash(endpoint: string): string {

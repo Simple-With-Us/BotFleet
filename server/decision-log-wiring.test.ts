@@ -129,7 +129,12 @@ posixOnly("authorization decisions are logged", () => {
         },
       }),
     );
-    child = spawnDetached(process.execPath, [join(SERVER_DIR, "index.ts")], {
+    // This suite checks permission wiring, not host admission.  A busy
+    // runner defers a webhook wake for 20 minutes, longer than these
+    // assertions wait, so the webhook run stays queued and the test reads
+    // that as "the webhook never started a task".  Keep real production
+    // admission unchanged; isolate only this child.
+    child = spawnDetached(process.execPath, ["--import", join(SERVER_DIR, "testing", "cool-host-loader.mjs"), join(SERVER_DIR, "index.ts")], {
       cwd: join(SERVER_DIR, ".."),
       env: {
         ...(process.env.PATH ? { PATH: process.env.PATH } : {}),
