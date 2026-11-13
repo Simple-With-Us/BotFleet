@@ -59,6 +59,23 @@ describe("ZulipStateStore write-path policy", () => {
     }
   });
 
+  it("refuses a dangling symlinked data root instead of booting or saving empty", () => {
+    const base = mkdtempSync(join(tmpdir(), "zulip-store-dangling-root-"));
+    const root = join(base, "dangling-root");
+    symlinkSync(join(base, "no-such-target"), root);
+    try {
+      const store = new ZulipStateStore(root);
+      // A dangling root is a hostile path, not a fresh tree: the load must
+      // refuse (per-bot containment), never boot with silently reset
+      // ledgers, and the save must refuse BEFORE creating anything.  No
+      // root needed: realpathSync fails before any ownership check.
+      expect(() => store.load("bot-plumber", "BF-Plumber")).toThrow();
+      expect(() => store.save("bot-plumber", emptyState("BF-Plumber"))).toThrow(/dangling/);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
   // uid 0 only: planting a ROOT-OWNED dangling symlink (which the
   // verifier's statSync then fails to resolve with ENOENT) needs root;
   // non-root CI skips deterministically rather than passing vacuously.
@@ -70,6 +87,9 @@ describe("ZulipStateStore write-path policy", () => {
       // A dangling ancestor link is a hostile path: the load must refuse
       // (per-bot containment), never boot with silently reset ledgers.
       expect(() => store.load("bot-plumber", "BF-Plumber")).toThrow();
+      // The save side refuses through the same classifier, BEFORE any
+      // create: a hostile path is never mkdir'd through or around.
+      expect(() => store.save("bot-plumber", emptyState("BF-Plumber"))).toThrow(/dangling/);
     } finally {
       rmSync(base, { recursive: true, force: true });
     }
