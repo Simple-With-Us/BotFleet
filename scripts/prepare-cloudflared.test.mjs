@@ -27,26 +27,26 @@ import {
 const PINNED_ASSETS = {
   "darwin-arm64": {
     name: "cloudflared-darwin-arm64.tgz",
-    sha256: "9042c2c5d8b2de78e60f313d5fb31b6c5c1cebde787a3caf1f2c9588084ac442",
-    binarySha256: "b61054d3d6326ea558cb49826eebf5676e0d0a36d51b546975096ca3e0e3c89d",
+    sha256: "1165d14b6f6360a3b8c283d7d1100024d6ec7cd9bc9e32519e96150645f3ec55",
+    binarySha256: "f249139e0541fa589c987397d867cc16c83ab1236d31eb6782f2e4552ee9cf80",
     archive: true,
   },
   "darwin-x64": {
     name: "cloudflared-darwin-amd64.tgz",
-    sha256: "f1727723c586500e2092368ae21871b3df7ddfd2cb097f22d81bee4a9c458bb4",
-    binarySha256: "b0f770e1e0b281399a57219b840fd8eef1cc25387a404124248157ea2073727a",
+    sha256: "81b7b85f2376815c4f59b1aa323887b62e16ce8b67555c2e1577dc23f2a82000",
+    binarySha256: "947e2942d6a59922d80190d23b12f3ade8da16e23e3bd937182a48993b7c00db",
     archive: true,
   },
   "linux-x64": {
     name: "cloudflared-linux-amd64",
-    sha256: "fcfb02b575a52ca1af2e3267af4e1517bcdeb30ac48c834c69abaed3c0576ad2",
-    binarySha256: "fcfb02b575a52ca1af2e3267af4e1517bcdeb30ac48c834c69abaed3c0576ad2",
+    sha256: "053b80b0a23031a038fdbf3c073f59f82b8f1f152aa67971d7383ffafc0dbab0",
+    binarySha256: "053b80b0a23031a038fdbf3c073f59f82b8f1f152aa67971d7383ffafc0dbab0",
     archive: false,
   },
   "win32-x64": {
     name: "cloudflared-windows-amd64.exe",
-    sha256: "c29eee2b121f5436a642eed69fd9767da7e7b8c510fa50aaa130337f931357b5",
-    binarySha256: "c29eee2b121f5436a642eed69fd9767da7e7b8c510fa50aaa130337f931357b5",
+    sha256: "76b2805253d0d6ffacb092a7acfbee99e7af6917835c0c5410e23f3ef5052da2",
+    binarySha256: "76b2805253d0d6ffacb092a7acfbee99e7af6917835c0c5410e23f3ef5052da2",
     archive: false,
   },
 };
@@ -110,7 +110,7 @@ describe("pinned cloudflared packaging", () => {
   });
 
   it("pins a complete release asset and digest for every packaged target", () => {
-    expect(CLOUDFLARED_VERSION).toBe("2026.8.2");
+    expect(CLOUDFLARED_VERSION).toBe("2026.10.3");
     expect(CLOUDFLARED_ASSETS).toEqual(PINNED_ASSETS);
   });
 
@@ -241,7 +241,9 @@ describe("identifying the staged cloudflared executable", () => {
   it("waits 60s and allows one retry by default, not the old 10s ceiling", () => {
     expect(VERSION_PROBE_TIMEOUT_MS).toBe(60_000);
     expect(VERSION_PROBE_ATTEMPTS).toBe(2);
-    const { spawn, calls } = fakeSpawn([probeResult({ stdout: `cloudflared version ${CLOUDFLARED_VERSION}\n` })]);
+    const { spawn, calls } = fakeSpawn([
+      probeResult({ stdout: `cloudflared version ${CLOUDFLARED_VERSION} (abc)\n` }),
+    ]);
     probePinnedVersion("/staged/cloudflared", { spawn, ...quiet });
     expect(calls).toHaveLength(1);
     expect(calls[0].args).toEqual(["version"]);
@@ -252,7 +254,7 @@ describe("identifying the staged cloudflared executable", () => {
     // The Oct 1, 2026 incident: the binary was correct, the host was not.
     const { spawn, calls } = fakeSpawn([
       timedOutResult(),
-      probeResult({ stdout: `cloudflared version ${CLOUDFLARED_VERSION}\n` }),
+      probeResult({ stdout: `cloudflared version ${CLOUDFLARED_VERSION} (abc)\n` }),
     ]);
     const probe = probePinnedVersion("/staged/cloudflared", { spawn, ...quiet });
     expect(probe.ok).toBe(true);
@@ -274,6 +276,19 @@ describe("identifying the staged cloudflared executable", () => {
     expect(message).toContain("ETIMEDOUT");
     // The cause a person can act on, not the "corrupt download" dead end.
     expect(message).not.toMatch(/did not report the pinned version/);
+  });
+
+  it("does not accept a pinned version mention on stderr alone", () => {
+    const { spawn, calls } = fakeSpawn([
+      probeResult({
+        stdout: "cloudflared version 2026.7.1\n",
+        stderr: `cloudflared version ${CLOUDFLARED_VERSION}\n`,
+      }),
+    ]);
+    const probe = probePinnedVersion("/staged/cloudflared", { spawn, ...quiet });
+    expect(probe.ok).toBe(false);
+    expect(probe.reason).toBe("version");
+    expect(calls).toHaveLength(1);
   });
 
   it("still reports a genuine version mismatch, without retrying", () => {
@@ -320,9 +335,19 @@ describe("identifying the staged cloudflared executable", () => {
     expect(versionProbeFailureMessage("linux-x64", probe)).toMatch(/could not be run/);
   });
 
-  it("accepts the version from either stream and ignores an unversioned failure", () => {
-    expect(classifyVersionProbe(probeResult({ stderr: `cloudflared ${CLOUDFLARED_VERSION}\n` }))).toEqual({
+  it("requires the version line on stdout and ignores stderr-only mentions", () => {
+    expect(
+      classifyVersionProbe(
+        probeResult({ stdout: `cloudflared version ${CLOUDFLARED_VERSION} (abc)\n` }),
+      ),
+    ).toEqual({
       ok: true,
+      reason: "version",
+    });
+    expect(
+      classifyVersionProbe(probeResult({ stderr: `cloudflared version ${CLOUDFLARED_VERSION}\n` })),
+    ).toEqual({
+      ok: false,
       reason: "version",
     });
     expect(classifyVersionProbe(probeResult({ status: 0, stdout: "some other tunnel client\n" }))).toEqual({

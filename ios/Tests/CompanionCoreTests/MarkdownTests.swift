@@ -104,6 +104,113 @@ final class MarkdownTests: XCTestCase {
         )
     }
 
+    // MARK: - Tables
+
+    func testBasicTable() {
+        XCTAssertEqual(
+            Markdown.blocks("| Name | Score |\n| --- | --- |\n| Ada | 3 |\n| Bob | 5 |"),
+            [.table(
+                header: ["Name", "Score"],
+                alignments: [.leading, .leading],
+                rows: [["Ada", "3"], ["Bob", "5"]]
+            )]
+        )
+    }
+
+    func testTableAlignments() {
+        XCTAssertEqual(
+            Markdown.blocks("| L | C | R | D |\n| :-- | :-: | --: | --- |\n| 1 | 2 | 3 | 4 |"),
+            [.table(
+                header: ["L", "C", "R", "D"],
+                alignments: [.leading, .center, .trailing, .leading],
+                rows: [["1", "2", "3", "4"]]
+            )]
+        )
+    }
+
+    func testTableWithoutOuterPipes() {
+        XCTAssertEqual(
+            Markdown.blocks("Name | Score\n--- | ---\nAda | 3"),
+            [.table(
+                header: ["Name", "Score"],
+                alignments: [.leading, .leading],
+                rows: [["Ada", "3"]]
+            )]
+        )
+    }
+
+    /// `\|` is a cell's content, not a separator -- it is the only way
+    /// GFM lets a pipe appear in a cell at all.
+    func testTableEscapedPipeStaysInCell() {
+        XCTAssertEqual(
+            Markdown.blocks("| Expr | Note |\n| --- | --- |\n| a \\| b | x |"),
+            [.table(
+                header: ["Expr", "Note"],
+                alignments: [.leading, .leading],
+                rows: [["a | b", "x"]]
+            )]
+        )
+    }
+
+    /// A model that miscounts a row should not lose the table: short rows
+    /// gain empty cells, long rows drop their extras, as on the desktop.
+    func testRaggedTableRowsArePaddedAndTrimmed() {
+        XCTAssertEqual(
+            Markdown.blocks("| A | B |\n| --- | --- |\n| only |\n| 1 | 2 | 3 |"),
+            [.table(
+                header: ["A", "B"],
+                alignments: [.leading, .leading],
+                rows: [["only", ""], ["1", "2"]]
+            )]
+        )
+    }
+
+    /// Pipes in prose are prose. Without the delimiter row there is no
+    /// table, so both lines stay the paragraph the author wrote.
+    func testHeaderWithoutDelimiterRowStaysParagraph() {
+        XCTAssertEqual(
+            Markdown.blocks("| a | b |\n| not a delimiter |"),
+            [.paragraph("| a | b | | not a delimiter |")]
+        )
+        XCTAssertEqual(
+            Markdown.blocks("| a | b |\n| --- |"),
+            [.paragraph("| a | b | | --- |")]
+        )
+    }
+
+    /// Mid-stream the header arrives before its delimiter. It must read as
+    /// the paragraph it would be without one until the delimiter lands --
+    /// flashing a header-only table and falling back would flicker.
+    func testStreamedHeaderBeforeDelimiterStaysParagraph() {
+        XCTAssertEqual(
+            Markdown.blocks("| Name | Score |"),
+            [.paragraph("| Name | Score |")]
+        )
+        XCTAssertEqual(
+            Markdown.blocks("| Name | Score |\n| --"),
+            [.paragraph("| Name | Score | | --")]
+        )
+    }
+
+    func testTableEndsAtLineWithoutPipe() {
+        XCTAssertEqual(
+            Markdown.blocks("| A | B |\n| --- | --- |\n| 1 | 2 |\nafter"),
+            [
+                .table(header: ["A", "B"], alignments: [.leading, .leading], rows: [["1", "2"]]),
+                .paragraph("after"),
+            ]
+        )
+    }
+
+    /// A fence is code, not structure: a table inside one stays the
+    /// characters the fence holds.
+    func testTableInsideCodeFenceIsUntouched() {
+        XCTAssertEqual(
+            Markdown.blocks("```\n| a | b |\n| --- | --- |\n| 1 | 2 |\n```"),
+            [.code(language: nil, text: "| a | b |\n| --- | --- |\n| 1 | 2 |")]
+        )
+    }
+
     // MARK: - Fences
 
     func testFencedCodeKeepsItsLanguageAndItsWhitespace() {
@@ -191,6 +298,7 @@ final class MarkdownTests: XCTestCase {
         case let .heading(_, text): return text
         case let .code(language, text): return (language ?? "") + text
         case let .quote(text): return text
+        case let .table(header, _, rows): return (header + rows.flatMap { $0 }).joined()
         case .rule: return ""
         }
     }

@@ -13,6 +13,7 @@ import { createHash, randomBytes, randomInt, randomUUID, timingSafeEqual } from 
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { isJsonString, type JsonValue } from "./json.ts";
 import { DATA_DIR, ensureDataDir, writeFileAtomic } from "./state.ts";
 
 /** One paired phone, as it is written to disk. */
@@ -28,10 +29,14 @@ export interface DeviceRecord {
   cloudDesktopAccess: boolean;
   /** Hex APNs device token.  Used only to wake a killed companion. */
   pushToken?: string;
+  /** Hex APNs token for the push-to-start Live Activity channel.  A separate
+   * token from `pushToken` because the two are registered separately on the
+   * phone and either can be reissued without the other. */
+  liveActivityToken?: string;
 }
 
 /** What the UI is allowed to see: a device without its secret. */
-export type PublicDevice = Omit<DeviceRecord, "tokenHash" | "pushToken">;
+export type PublicDevice = Omit<DeviceRecord, "tokenHash" | "pushToken" | "liveActivityToken">;
 
 /** A pairing window: two short-lived credentials, deliberately single-use.
  *
@@ -94,6 +99,13 @@ function sameCredential(a: string, b: string): boolean {
 
 /** Device names come from the phone, so they are untrusted display text:
  * clamp the length and drop control characters before they reach a UI. */
+/** Parse the optional pairing idempotency key from a JSON pairing body. */
+export function parsePairRequestId(value: JsonValue | undefined): string | null {
+  if (value === undefined) return null;
+  if (!isJsonString(value) || !/^[A-Za-z0-9._-]{16,128}$/.test(value)) return null;
+  return value;
+}
+
 export function cleanDeviceName(raw: unknown): string {
   const name = String(raw ?? "")
     .replace(/[\u0000-\u001f\u007f]/g, " ")
@@ -108,6 +120,12 @@ export function cleanDeviceName(raw: unknown): string {
 const timestamp = (value: unknown, fallback: number): number =>
   typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
 
+/** A stored APNs token, lowercased, if it still looks like one.  Both channels
+ * — the alert token and the Live Activity one — are held to the same shape,
+ * and neither is trusted because it came off disk. */
+const storedToken = (value: string | undefined): string | undefined =>
+  value !== undefined && /^[0-9a-fA-F]{64,}$/.test(value) ? value.toLowerCase() : undefined;
+
 /** Complete a stored record, whatever shape the file had. `lastSeenAt` falls
  * back to `createdAt` rather than to the clock: a device we have never heard
  * from since pairing was last seen when it paired. */
@@ -120,9 +138,8 @@ function normalizeDevice(record: Partial<DeviceRecord> & { id: string; tokenHash
     createdAt,
     lastSeenAt: timestamp(record.lastSeenAt, createdAt),
     cloudDesktopAccess: record.cloudDesktopAccess === true,
-    pushToken: typeof record.pushToken === "string" && /^[0-9a-fA-F]{64,}$/.test(record.pushToken)
-      ? record.pushToken.toLowerCase()
-      : undefined,
+    pushToken: storedToken(record.pushToken),
+    liveActivityToken: storedToken(record.liveActivityToken),
   };
 }
 
@@ -176,7 +193,9 @@ export class DeviceRegistry {
 
   /** Every paired device, without the hash — this is what the page renders. */
   list(): PublicDevice[] {
-    return this.devices.map(({ tokenHash, pushToken: _push, ...rest }) => rest);
+    return this.devices.map(
+      ({ tokenHash: _tokenHash, pushToken: _push, liveActivityToken: _live, ...rest }) => rest,
+    );
   }
 
   /** How many phones are paired, against MAX_DEVICES. */
@@ -229,14 +248,12 @@ export class DeviceRegistry {
    * response while changing routes. There is no general token-read endpoint. */
   redeem(
     credential: string,
-    name: unknown,
-    pairRequestId?: unknown,
+    name: string,
+    pairRequestId?: string | null,
   ): { device: PublicDevice; token: string } | { error: string } {
     const presented = String(credential ?? "");
     const requestId =
-      typeof pairRequestId === "string" && /^[A-Za-z0-9._-]{16,128}$/.test(pairRequestId)
-        ? pairRequestId
-        : null;
+      pairRequestId && /^[A-Za-z0-9._-]{16,128}$/.test(pairRequestId) ? pairRequestId : null;
 
     // A route can die after the registry committed the device but before the
     // phone received the response. Retrying the same logical request through
@@ -303,7 +320,7 @@ export class DeviceRegistry {
       this.devices.pop();
       return { error: `could not save the pairing: ${(e as Error).message}` };
     }
-    const { tokenHash, pushToken: _push, ...pub } = device;
+    const { tokenHash: _tokenHash, pushToken: _push, liveActivityToken: _live, ...pub } = device;
     const result = { device: pub, token };
     if (requestId) {
       this.replay = {
@@ -409,6 +426,40 @@ export class DeviceRegistry {
     return this.devices
       .filter((device) => typeof device.pushToken === "string")
       .map((device) => ({ deviceId: device.id, token: device.pushToken as string }));
+  }
+
+  /** The push-to-start Live Activity token, exactly as `pushToken` works and
+   * for the same reason: it is a credential Apple's copy of the phone can be
+   * started from, and it must never reach the pairing page. */
+  setLiveActivityToken(id: string, token: string): boolean {
+    const device = this.devices.find((candidate) => candidate.id === id);
+    if (!device) return false;
+    const cleaned = token.replace(/\s+/g, "").toLowerCase();
+    if (!/^[0-9a-f]{64,}$/.test(cleaned)) return false;
+    device.liveActivityToken = cleaned;
+    this.persist();
+    return true;
+  }
+
+  /** Drop a Live Activity token Apple has retired.  Names the rejected token
+   * for the same reason `clearPushToken` does: a phone may have registered a
+   * replacement while this send was in flight. */
+  clearLiveActivityToken(id: string, rejected?: string): boolean {
+    const device = this.devices.find((candidate) => candidate.id === id);
+    if (!device || device.liveActivityToken === undefined) return false;
+    if (rejected !== undefined && device.liveActivityToken !== rejected.replace(/\s+/g, "").toLowerCase()) return false;
+    delete device.liveActivityToken;
+    this.persist();
+    return true;
+  }
+
+  liveActivityTokens(): { deviceId: string; token: string }[] {
+    const rows: { deviceId: string; token: string }[] = [];
+    for (const device of this.devices) {
+      const token = device.liveActivityToken;
+      if (token !== undefined) rows.push({ deviceId: device.id, token });
+    }
+    return rows;
   }
 }
 

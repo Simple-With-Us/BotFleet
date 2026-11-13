@@ -7,6 +7,8 @@ import {
   resolveGrants,
   resolveTurnComputerMounts,
   computerSystemPrompt,
+  vpsUnavailableHint,
+  autoVpsOutageFailsTurn,
   hostToolPrefix,
   nameMounts,
   turnComputerMounts,
@@ -178,7 +180,7 @@ describe("computerSystemPrompt", () => {
   });
 
   it("describes the host as a desktop only to an engine that is handed one", () => {
-    // An MCP engine mounts the Cua Driver server and really can see and click
+    // An MCP engine mounts the CUA Driver server and really can see and click
     // the desktop.  A driver-loop engine mounts no MCP server at all: its
     // host surface is the harness's own bash and file tools, and that
     // registry holds no screenshot, click or desktop-state tool.  Telling it
@@ -828,6 +830,28 @@ describe("routine failure resiliency and unattended safety", () => {
       };
       await expect(turn(["vm", "cloud"], deps)).rejects.toThrow("Docker-over-SSH command timed out");
     });
+
+    it("keeps degrading onto hybrid host shell when VM and VPS both fail but allowHostTerminal is on", async () => {
+      const notices: string[] = [];
+      const deps = vmDown(notices);
+      deps.vps.vpsComputerAction = async () => {
+        throw new Error("Docker-over-SSH command timed out");
+      };
+      const result = await resolveTurnComputerMounts({
+        bot: { id: "b1", name: "Compiler", computers: ["vm", "cloud"], cloudBackend: "vps" },
+        cfg: { localVm: { allowHostTerminal: true } } as unknown as AppConfig,
+        engine: { driverKind: "claude", computerMcp: true, localComputerMcp: true, toolLoop: true },
+        threadId: "t1",
+        dispatchId: 1,
+        runOn: undefined,
+        allowed: null,
+        deps,
+      });
+      expect(result.mounts).toEqual([]);
+      expect(result.hasHostComputer).toBe(true);
+      expect(notices).toContain("Local VM not mounted: Local VM is not ready (App Settings → Local VM)");
+      expect(notices).toContain("VPS computer not mounted: Docker-over-SSH command timed out");
+    });
   });
 
   it("fails clearly when an unattended cloud-only turn cannot reach the VPS", async () => {
@@ -943,6 +967,11 @@ describe("routine failure resiliency and unattended safety", () => {
     });
     expect(result.hasHostComputer).toBe(true);
     expect(result.mounts.map((m) => m.kind)).toEqual(["vm"]);
+    const prompt = computerSystemPrompt(result.mounts, {
+      hasHostTerminal: true,
+      hostPlatform: "darwin",
+    });
+    expect(prompt).toContain("bash");
   });
 
   it("enables host computer tools without mounting host CUA when allowHostTerminal is set on Cloud VPS", async () => {
@@ -975,6 +1004,76 @@ describe("routine failure resiliency and unattended safety", () => {
     });
     expect(result.hasHostComputer).toBe(true);
     expect(result.mounts.map((m) => m.kind)).toEqual(["vps"]);
+  });
+
+  describe("an unreachable Auto VPS", () => {
+    const engine = { driverKind: "claude", computerMcp: true, localComputerMcp: true, toolLoop: false };
+    const down = (notices: string[] = []) => {
+      const deps: TurnComputerDeps<object> = {
+        ...makeBaseDeps(notices),
+        readHostConnection: () => null,
+      };
+      deps.vps.inspectVpsForAuto = async () => {
+        throw new Error("Docker over SSH is not reachable");
+      };
+      return deps;
+    };
+    // SAFETY: these cases only read the bot's cloud backend.  The empty config
+    // is the same fixture the other resolver tests use when no credential matters.
+    const turn = (deps: TurnComputerDeps<object>, automationSource?: string) =>
+      resolveTurnComputerMounts({
+        bot: { id: "b1", name: "Auto", cloudBackend: "vps" },
+        cfg: {} as AppConfig,
+        engine,
+        threadId: "t1",
+        dispatchId: 1,
+        automationSource,
+        allowed: null,
+        deps,
+      });
+
+    it("lets a chat turn run and tells the model the VPS is not mounted", async () => {
+      const result = await turn(down());
+      expect(result.mounts).toEqual([]);
+      expect(result.unavailableNote).toContain("Docker over SSH is not reachable");
+      expect(result.unavailableNote).toContain("no computer is mounted");
+      expect(result.unavailableNote).toContain("Work that needs no screen can go ahead");
+    });
+
+    it("still fails a scheduled run and says why", async () => {
+      await expect(turn(down(), "schedule")).rejects.toThrow(/scheduled run tried to start the VPS computer/);
+    });
+
+    it("lets a delegated turn run", async () => {
+      const result = await turn(down(), "delegation");
+      expect(result.mounts).toEqual([]);
+      expect(result.unavailableNote).toContain("no computer is mounted");
+    });
+
+    it("keeps the host computer when Auto can still mount it, with no outage note", async () => {
+      const deps = makeBaseDeps();
+      deps.vps.inspectVpsForAuto = async () => {
+        throw new Error("Docker over SSH is not reachable");
+      };
+      const result = await turn(deps);
+      expect(result.mounts.map((m) => m.kind)).toEqual(["local"]);
+      expect(result.unavailableNote).toBe("");
+    });
+
+    it("names the way on that fits what the check found", () => {
+      const connection = "Check the VPS connection in App Settings → Connections.";
+      expect(vpsUnavailableHint({ reachable: true })).toBe(
+        "Open Computer and enable Start VPS automatically, or choose Cloud to start it manually.",
+      );
+      expect(vpsUnavailableHint({ reachable: false })).toBe(connection);
+      expect(vpsUnavailableHint({ autoStartVps: true, reachable: true })).toBe(connection);
+      expect(vpsUnavailableHint({})).toBe("");
+      expect(vpsUnavailableHint({ automationSource: "schedule" })).toMatch(/^This scheduled run tried to start the VPS computer/);
+      expect(vpsUnavailableHint({ automationSource: "webhook" })).toMatch(/^This automation run tried to start the VPS computer/);
+      expect(autoVpsOutageFailsTurn("schedule")).toBe(true);
+      expect(autoVpsOutageFailsTurn("delegation")).toBe(false);
+      expect(autoVpsOutageFailsTurn(undefined)).toBe(false);
+    });
   });
 
   describe("hostShellGranted", () => {

@@ -169,15 +169,19 @@ describe("TrajectoryPanel: Turns", () => {
   it("keeps the message that started a turn with that turn", () => {
     const t = text(html);
     expect(t).not.toContain("Outside a Turn");
+    // Newest turn first, and newest step first inside it, so the message that
+    // opened Turn 1 is the last line of Turn 1's block rather than the first.
+    expect(t.indexOf("Turn 2")).toBeLessThan(t.indexOf("Turn 1"));
     expect(t.indexOf("Turn 1")).toBeLessThan(t.indexOf("Please run the suite"));
-    expect(t.indexOf("Please run the suite")).toBeLessThan(t.indexOf("Turn 2"));
   });
 
   it("does not drop a message after the last turn", () => {
     const late = buildTrajectory(events(), { inputs: [...inputs, { id: "u9", at: T0 + 4000 * 1000, role: "user", text: "still there?" }] });
     const t = text(render({ trajectory: late }, "turns"));
     expect(t).toContain("Outside a Turn");
-    expect(t.indexOf("Turn 2")).toBeLessThan(t.indexOf("Outside a Turn"));
+    // It is the most recent thing in the thread, so newest-first puts it at
+    // the top — the message is kept either way, only its position moved.
+    expect(t.indexOf("Outside a Turn")).toBeLessThan(t.indexOf("Turn 2"));
     expect(t).toContain("still there?");
   });
 
@@ -450,6 +454,45 @@ describe("TrajectoryPanel: states", () => {
     // the newest are the ones shown
     expect(html).toContain(`step number ${STEP_WINDOW + 39}`);
     expect(html).not.toContain("step number 0<");
+  });
+
+  it("lists the newest step first, so a step arriving lands at the top", () => {
+    const trajectory = build();
+    const stepsHtml = render({ trajectory });
+    const list = stepsHtml.slice(stepsHtml.indexOf('aria-label="Steps"'));
+    const drawn = [...list.matchAll(/data-row-id="([^"]+)"/g)].map((m) => m[1]);
+    // The window is still the newest N steps.  They are just drawn newest-first,
+    // so the step that just happened leads and pushes the rest down, rather
+    // than waiting at the bottom of a page that keeps growing.
+    expect(drawn).toEqual(trajectory.rows.slice(-STEP_WINDOW).map((row) => row.id).reverse());
+    expect(drawn[0]).toBe(trajectory.rows.at(-1)!.id);
+    expect(drawn.at(-1)).toBe(trajectory.rows[0]!.id);
+  });
+
+  it("puts Show Earlier Steps at the oldest end of whichever list is showing", () => {
+    const many: RuntimeEvent[] = [ev(0, { type: "turn.started" })];
+    for (let i = 0; i < STEP_WINDOW + 40; i++) many.push(ev(1 + i, { type: "item.completed", itemType: "assistant_text", text: `step number ${i}` }));
+    many.push(ev(9999, { type: "turn.completed", ok: true }));
+    const trajectory = buildTrajectory(many);
+
+    // Duration: the oldest rows are at the bottom now, so the button is too.
+    const durationHtml = render({ trajectory });
+    const drawn = [...durationHtml.matchAll(/data-row-id="([^"]+)"/g)].map((m) => m[1]);
+    expect(durationHtml.indexOf("Show Earlier Steps")).toBeGreaterThan(
+      durationHtml.lastIndexOf(`data-row-id="${drawn.at(-1)}"`),
+    );
+
+    // Calls: the table is sorted oldest-first by default and the sort buttons
+    // own that order, so the button stays on top.
+    const manyCalls: RuntimeEvent[] = [ev(0, { type: "turn.started" })];
+    for (let i = 0; i < STEP_WINDOW + 40; i++) {
+      manyCalls.push(ev(1 + 2 * i, { type: "item.started", itemType: "tool", itemId: `c${i}`, title: "Read", target: `f${i}.ts` }));
+      manyCalls.push(ev(2 + 2 * i, { type: "item.completed", itemType: "tool", itemId: `c${i}`, ok: true, detail: "ok" }));
+    }
+    manyCalls.push(ev(9999, { type: "turn.completed", ok: true }));
+    const callsHtml = render({ trajectory: buildTrajectory(manyCalls) }, "calls");
+    expect(callsHtml).toContain("Show Earlier Steps");
+    expect(callsHtml.indexOf("Show Earlier Steps")).toBeLessThan(callsHtml.indexOf("data-row-id="));
   });
 });
 

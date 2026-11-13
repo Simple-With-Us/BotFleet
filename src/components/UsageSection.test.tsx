@@ -11,7 +11,8 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 import { UsageWhatIfProjection, apiEquivalentCost, projectionRows } from "./UsageWhatIfProjection.tsx";
 import { ENGINE_CAPABILITIES, uniqueModelToEngineId } from "@/lib/engine-capabilities.tsx";
-import { hasEngineSpendActivity, hidesIdleUnavailableEngineRow, unpricedTurnCount } from "./UsageSection.tsx";
+import { DoomedPairArraySchema, buildClutchDetailLines, hasEngineSpendActivity, hidesIdleUnavailableEngineRow, unpricedTurnCount } from "./UsageSection.tsx";
+import type { DoomedPair, RedundantChain } from "./UsageSection.tsx";
 
 describe("uniqueModelToEngineId", () => {
   it("maps unique model ids and leaves shared ids unmapped", () => {
@@ -211,52 +212,58 @@ describe("ENGINE_PLAN_OPTIONS & findMatchingPreset", () => {
     expect(plans.grok).toEqual({ planName: "xAI SuperGrok Heavy", costPerMonth: 99 });
   });
 
-  it("detects engine plans from CodeCaps / Usage Monitor quota windows", () => {
+  it("does not claim to auto-detect subscription billing plans from quota windows", () => {
     const windows = [
-      { providerKey: "cursor", planName: "ultra", label: "Cursor Ultra" },
-      { providerKey: "anthropic", planName: "pro", label: "Claude Pro" },
+      { providerKey: "cursor", planName: "ultra", label: "Cursor Ultra", planMetadata: { detectedPlanName: "Ultra", userPlanName: "My Pro", hasMismatch: true } },
+      { providerKey: "anthropic", planName: "Max", label: "5-Hour" },
       { providerKey: "openai", planName: "plus", label: "ChatGPT Plus" },
       { providerKey: "xai", planName: "super", label: "xAI SuperGrok" },
       { providerKey: "minimax", planName: "starter", label: "MiniMax Token Plan Starter" },
       { providerKey: "google", planName: "ultra", label: "Google AI Ultra" },
     ];
 
-    expect(detectEnginePlanFromWindows("cursor", windows)).toEqual({
-      label: "Cursor Ultra",
-      planName: "Cursor Ultra",
-      costPerMonth: null,
-    });
-    expect(detectEnginePlanFromWindows("claude", windows)).toEqual({
-      label: "Claude Pro ($20/mo)",
-      planName: "Claude Pro",
-      costPerMonth: 20,
-    });
-    expect(detectEnginePlanFromWindows("codex", windows)).toEqual({
-      label: "ChatGPT Plus ($20/mo)",
-      planName: "ChatGPT Plus",
-      costPerMonth: 20,
-    });
-    expect(detectEnginePlanFromWindows("grok", windows)).toEqual({
-      label: "xAI SuperGrok ($30/mo)",
-      planName: "xAI SuperGrok",
-      costPerMonth: 30,
-    });
-    expect(detectEnginePlanFromWindows("minimax", windows)).toEqual({
-      label: "Token Plan Starter ($15/mo)",
-      planName: "MiniMax Token Plan Starter",
-      costPerMonth: 15,
-    });
-    expect(detectEnginePlanFromWindows("antigravity", windows)).toEqual({
-      label: "Google AI Ultra ($105.79/mo)",
-      planName: "Google AI Ultra",
-      costPerMonth: 105.79,
-    });
+    expect(detectEnginePlanFromWindows("cursor", windows)).toBeNull();
+    expect(detectEnginePlanFromWindows("claude", windows)).toBeNull();
+    expect(detectEnginePlanFromWindows("codex", windows)).toBeNull();
+    expect(detectEnginePlanFromWindows("grok", windows)).toBeNull();
+    expect(detectEnginePlanFromWindows("minimax", windows)).toBeNull();
+    expect(detectEnginePlanFromWindows("antigravity", windows)).toBeNull();
+    expect(autoDetectAllEnginePlans(windows)).toEqual({});
+  });
+});
 
-    const all = autoDetectAllEnginePlans(windows);
-    expect(all.cursor.planName).toBe("Cursor Ultra");
-    expect(all.claude.planName).toBe("Claude Pro");
-    expect(all.codex.planName).toBe("ChatGPT Plus");
-    expect(all.grok.planName).toBe("xAI SuperGrok");
+describe("Clutch / DeepSeek remaining balance and MiniMax subscription note", () => {
+  it("verifies DeepSeek Remaining Balance and Subscription (not API) for MiniMax (MM & MC)", () => {
+    const lines = buildClutchDetailLines({
+      balanceUsd: 12.34,
+      availability: "available",
+      grantedUsd: 10,
+      toppedUpUsd: 5,
+    });
+    expect(lines).toContainEqual({
+      label: "DeepSeek Remaining Balance",
+      value: "$12.34 remaining",
+      exhausted: false,
+      group: "external",
+    });
+    expect(lines).toContainEqual({
+      label: "MiniMax (MM & MC)",
+      value: "Subscription (not API)",
+      exhausted: false,
+      group: "external",
+    });
+  });
+
+  it("includes MiniMax (MM & MC) subscription note when DeepSeek balance is missing", () => {
+    const lines = buildClutchDetailLines(null);
+    expect(lines).toEqual([
+      {
+        label: "MiniMax (MM & MC)",
+        value: "Subscription (not API)",
+        exhausted: false,
+        group: "external",
+      },
+    ]);
   });
 });
 
@@ -319,5 +326,122 @@ describe("hidesIdleUnavailableEngineRow", () => {
 
   it("keeps a configured engine that is failing right now", () => {
     expect(hidesIdleUnavailableEngineRow({ snapshot: { state: "unavailable", reason: "box API unreachable: fetch failed" } })).toBe(false);
+  });
+});
+
+describe("held-engine and redundant-chain payloads", () => {
+  it("accepts the shapes the server sends and tolerates their absence", () => {
+    // Both fields have been on /api/quotas since they were added, with nothing
+    // rendering them — a fact recorded for someone and read by no one, which is
+    // the same defect a dead field is. The component must not assume they exist.
+    const doomed: DoomedPair[] = [
+      {
+        botId: "bot-abcdef12",
+        instanceId: "dsh",
+        consecutiveFailures: 3,
+        openedAt: 1_780_000_000_000,
+        lastFailureAt: 1_780_000_000_000,
+        lastError: "spawn dsh-agent ENOENT",
+      },
+    ];
+    const chains: RedundantChain[] = [
+      {
+        botId: "bot-abcdef12",
+        name: "Designer",
+        total: 3,
+        effective: 2,
+        redundant: [{ instanceId: "grok", model: "grok-4.6", reason: "same-as-primary" }],
+      },
+    ];
+    // A server that predates either field sends neither, and the panel must
+    // render rather than throw — which is why both start as [].
+    expect(doomed[0].instanceId).toBe("dsh");
+    expect(doomed[0].consecutiveFailures).toBe(3);
+    expect(chains[0].redundant[0].reason).toBe("same-as-primary");
+    expect(chains[0].effective).toBeLessThan(chains[0].total);
+  });
+});
+
+describe("DoomedPairArraySchema", () => {
+  // The exact pair server/index.ts builds: one DoomedEntry spread, plus the
+  // two fields that decide whether the entry is holding anything.
+  const wired = {
+    botId: "bot-abcdef12",
+    instanceId: "dsh",
+    consecutiveFailures: 3,
+    openedAt: 1_780_000_000_000,
+    lastFailureAt: 1_780_000_000_000,
+    lastError: "spawn dsh-agent ENOENT",
+    open: true,
+    holds: true,
+  };
+  /** Every case below is a payload the panel must refuse.  A named union
+   *  rather than `unknown` keeps each negative case one line. */
+  const refuses = (value: unknown[] | string | null | undefined) =>
+    !DoomedPairArraySchema.safeParse(value).success;
+
+  it("keeps a pair the server sends, flags included", () => {
+    expect(DoomedPairArraySchema.safeParse([wired]).data).toEqual([wired]);
+  });
+
+  it("accepts a server that predates the open and holds flags", () => {
+    // Absent means OPEN, the compatibility contract DoomedPair documents.  A
+    // strict schema must not turn an older server's pairs into a dropped list.
+    const legacy = {
+      botId: "bot-abcdef12",
+      instanceId: "dsh",
+      consecutiveFailures: 3,
+      openedAt: 1_780_000_000_000,
+      lastFailureAt: 1_780_000_000_000,
+    };
+    expect(DoomedPairArraySchema.safeParse([legacy]).data).toEqual([legacy]);
+  });
+
+  it("accepts an empty list as an answer, not a failure", () => {
+    // An empty list is the panel's "nothing is held" state, and it has to
+    // clear the previous list — the one payload that is allowed through.
+    expect(DoomedPairArraySchema.safeParse([]).data).toEqual([]);
+  });
+
+  it("rejects a truthy string where a boolean flag belongs", () => {
+    // The defect an array check cannot see: `heldPairs` reads `holds`, and
+    // "false" is truthy, so a stringified flag reports a healthy engine as held
+    // no matter what it says.
+    expect(refuses([{ ...wired, holds: "false" }])).toBe(true);
+    expect(refuses([{ ...wired, open: "true" }])).toBe(true);
+  });
+
+  it("rejects a number sent as a string and a counter sent as a fraction", () => {
+    expect(refuses([{ ...wired, consecutiveFailures: "3" }])).toBe(true);
+    expect(refuses([{ ...wired, consecutiveFailures: 2.5 }])).toBe(true);
+    expect(refuses([{ ...wired, openedAt: Number.NaN }])).toBe(true);
+  });
+
+  it("rejects a pair missing a required field", () => {
+    const { lastFailureAt: _dropped, ...withoutTimestamp } = wired;
+    expect(refuses([withoutTimestamp])).toBe(true);
+  });
+
+  it("rejects an unknown field rather than trusting the rest of the entry", () => {
+    expect(refuses([{ ...wired, holdReason: "ready to dispatch" }])).toBe(true);
+  });
+
+  it("rejects a null or non-object entry inside the list", () => {
+    // A JSON array can carry null, and the old filter would have read `.holds`
+    // off it.  One bad entry rejects the list; it is not silently dropped.
+    expect(refuses([null])).toBe(true);
+    expect(refuses(["dsh"])).toBe(true);
+    expect(refuses([wired, null])).toBe(true);
+  });
+
+  it("rejects a payload that is not a list at all", () => {
+    // Including absent: a server old enough to omit the field sends nothing,
+    // and the panel must keep its current answer rather than clear it.
+    expect(refuses(undefined)).toBe(true);
+    expect(refuses(null)).toBe(true);
+    // A single object where a list belongs, asserted directly: the helper's
+    // union has no room for it and widening it re-arms the dictionary rule.
+    expect(DoomedPairArraySchema.safeParse({ botId: "bot-abcdef12" }).success).toBe(false);
+    expect(refuses("dsh")).toBe(true);
   });
 });

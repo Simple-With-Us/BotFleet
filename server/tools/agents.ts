@@ -15,6 +15,10 @@
 // ignored everywhere below — the turn's own identity is the only one that
 // reaches an endpoint function.
 
+import { z } from "zod";
+
+import { joinRefusals } from "../../shared/peer-refusals.ts";
+import { inboundText, signInReason, signInSite } from "../../shared/sign-in-request.ts";
 import type { TurnToolCall, TurnToolOutcome, TurnToolRuntime } from "../contracts.ts";
 import { sectionKey } from "../store.ts";
 import { MAX_CREATED_BOTS_PER_TURN } from "./registry.ts";
@@ -27,6 +31,8 @@ export interface AgentBot {
   name: string;
   section?: string | null;
   hidden?: boolean;
+  /** Switched Off (shared/bot-power.ts): visible, but takes no new work. */
+  off?: boolean;
   busy?: boolean;
   title?: string | null;
   description?: string | null;
@@ -39,6 +45,10 @@ export interface AgentPeerRow {
   name: string;
   model: string;
   busy: boolean;
+  /** `true` only when the peer is switched Off (absent otherwise, and dropped
+   *  from the JSON): ask_bot and delegate_bot refuse it, so a model should pick
+   *  someone else. */
+  off?: true;
   title?: string;
   description?: string;
 }
@@ -70,6 +80,8 @@ export function selectPeerBots(selfId: string, all: readonly AgentBot[]): AgentP
       name: bot.name,
       model: bot.modelSelection.model,
       busy: !!bot.busy,
+      // only ever `true` (an On bot carries nothing, like title below)
+      off: bot.off === true ? true : undefined,
       // title/description so a Chief-of-Staff-style bot can judge the team:
       // who does what, and who has no job description yet.
       title: bot.title || undefined,
@@ -92,12 +104,18 @@ export function listAgentsResponse(selfId: string, all: readonly AgentBot[]): Ag
   return { status: 200, body: { section, bots } };
 }
 
-export interface AskBotRequestInput {
+export interface CoordinateBotsRequestInput {
   fromBotId: string;
-  toBotId: string;
+  botIds: string[];
   message: string;
   depth: number;
   fromThreadId?: string;
+  reason?: string;
+  rework?: boolean;
+  thread?: "standing" | "new";
+  reply?: "resume" | "none";
+  consult?: boolean;
+  doneWhen?: string;
 }
 
 export interface ListRoutinesRequestInput {
@@ -106,13 +124,10 @@ export interface ListRoutinesRequestInput {
   routineId?: string;
 }
 
-export interface DelegateBotRequestInput {
+export interface AssignmentStatusRequestInput {
   fromBotId: string;
-  toBotId: string;
-  message: string;
-  depth: number;
   fromThreadId?: string;
-  reason?: string;
+  id?: string;
 }
 
 export interface CreateBotRequestInput {
@@ -153,17 +168,25 @@ export interface RoutineRequestInput {
  *  loopback hop are the same function with the same guards. */
 export interface AgentToolDeps {
   executeListAgentsRequest(input: { selfId: string }): AgentRequestResult | Promise<AgentRequestResult>;
-  executeAskBotRequest(input: AskBotRequestInput): Promise<AgentRequestResult>;
+  executeCoordinateBotsRequest(
+    input: CoordinateBotsRequestInput,
+  ): AgentRequestResult | Promise<AgentRequestResult>;
   executeListRoutinesRequest(
     input: ListRoutinesRequestInput,
   ): AgentRequestResult | Promise<AgentRequestResult>;
-  executeDelegateBotRequest(
-    input: DelegateBotRequestInput,
+  executeAssignmentStatusRequest(
+    input: AssignmentStatusRequestInput,
   ): AgentRequestResult | Promise<AgentRequestResult>;
   executeCreateBotRequest(input: CreateBotRequestInput): AgentRequestResult | Promise<AgentRequestResult>;
   executeRequestCredentialRequest(
     input: RequestCredentialRequestInput,
   ): AgentRequestResult | Promise<AgentRequestResult>;
+  executeRequestSignInRequest(input: {
+    fromBotId: string;
+    fromThreadId?: string;
+    site: unknown;
+    reason?: unknown;
+  }): AgentRequestResult | Promise<AgentRequestResult>;
   executeRoutineRequestRequest(input: RoutineRequestInput): AgentRequestResult | Promise<AgentRequestResult>;
 }
 
@@ -186,10 +209,11 @@ export type AgentToolExecutor = (
  *  `registry.test.ts` is what keeps the two lists in step. */
 export type AgentToolName =
   | "list_bots"
-  | "ask_bot"
-  | "delegate_bot"
+  | "coordinate_bots"
+  | "assignment_status"
   | "create_bot"
   | "request_credential"
+  | "request_sign_in"
   | "list_routines"
   | "propose_routine"
   | "propose_routine_action";
@@ -212,6 +236,21 @@ const ok = (content: string, detail?: string): TurnToolOutcome =>
 
 const failed = (content: string, detail?: string): TurnToolOutcome =>
   detail ? { kind: "error", content, detail } : { kind: "error", content };
+
+/** Model arguments for request_sign_in.  Strict, so a password, code, or
+ * any other extra field is refused.  The refusal text is fixed and never
+ * includes the rejected value. */
+export const SIGN_IN_CALL = z
+  .object({
+    site: z.string().min(1),
+    reason: z.string().optional(),
+  })
+  .strict();
+
+export type SignInCall = z.infer<typeof SIGN_IN_CALL>;
+
+const SIGN_IN_CALL_REFUSAL =
+  "request_sign_in accepts only a site and an optional reason.\u00A0 Never send a password or one-time code.";
 
 const errorText = (body: Record<string, unknown>, fallback: string): string =>
   typeof body.error === "string" && body.error ? body.error : fallback;
@@ -281,77 +320,73 @@ export function createAgentTools(deps: AgentToolDeps): AgentTools {
       );
     },
 
-    async ask_bot(call, ctx): Promise<TurnToolOutcome> {
-      // Both spellings: the MCP lane advertises `message`, the HTTP lane
-      // advertises `task` (see the declared wire deviation in registry.ts).
-      // One body, two advertised names, so neither lane can drift.
-      const target = String(call.arguments.bot_id ?? call.arguments.bot ?? "").trim();
-      const text = String(call.arguments.message ?? call.arguments.task ?? "").trim();
-      if (!target || !text) {
+    async coordinate_bots(call, ctx): Promise<TurnToolOutcome> {
+      const listed = Array.isArray(call.arguments.bot_ids) ? call.arguments.bot_ids : [];
+      const single = call.arguments.bot_id ?? call.arguments.bot;
+      const tokens = listed.map((value) => String(value ?? "").trim()).filter(Boolean);
+      if (single !== undefined && single !== null) {
+        const extra = String(single).trim();
+        if (extra) tokens.push(extra);
+      }
+      const message = String(call.arguments.message ?? call.arguments.task ?? "").trim();
+      if (tokens.length === 0 || !message) {
         return failed(
-          JSON.stringify({ error: "ask_bot requires both `bot_id` and `task`" }),
+          JSON.stringify({ error: "coordinate_bots requires `bot_ids` and `message`" }),
           "bad arguments",
         );
       }
       const list = await roster(ctx);
       if (typeof list === "string") return failed(JSON.stringify({ error: list }), list);
-      // Resolved against the roster the model was actually shown, so a bot
-      // it cannot see is a bot it cannot reach.
-      const peer = list.rows.find((row) => row.id === target || `@${row.name}` === target);
-      if (!peer) return failed(JSON.stringify({ error: `no bot matches ${target}` }), "no such bot");
-      // Every guard that matters — depth cap, section, thread ownership,
-      // approvePeerComms, mirroring — lives in executeAskBotRequest, which
-      // is why this calls it rather than reimplementing the hop.
-      const result = await deps.executeAskBotRequest({
-        fromBotId: ctx.botId,
-        toBotId: peer.id,
-        message: text,
-        depth: ctx.commsDepth,
-        fromThreadId: ctx.threadId,
-      });
-      if (result.body.busy) {
-        return failed(
-          JSON.stringify({ error: "That bot is busy right now — try again after it finishes." }),
-          "peer busy",
-        );
+      const botIds: string[] = [];
+      const unmatched: string[] = [];
+      for (const token of tokens) {
+        const peer = list.rows.find((row) => row.id === token || `@${row.name}` === token || row.name === token.replace(/^@/, ""));
+        if (peer) botIds.push(peer.id);
+        else unmatched.push(`no bot matches ${token}`);
       }
-      if (result.body.error) {
-        const message = String(result.body.error);
-        return failed(JSON.stringify({ error: message }), message);
+      // Every token that matched nobody is named, not only the first, so one
+      // retry can fix them all.
+      if (unmatched.length > 0) {
+        const errorMessage = joinRefusals(unmatched);
+        return failed(JSON.stringify({ error: errorMessage }), errorMessage);
       }
-      const reply = typeof result.body.text === "string" ? result.body.text : "";
-      const name = typeof result.body.botName === "string" ? result.body.botName : peer.name;
-      if (!reply) return failed(JSON.stringify({ error: "no reply" }), "no reply");
-      return ok(`${name} replied:\n${reply}`, `@${name} replied`);
-    },
-
-    async delegate_bot(call, ctx): Promise<TurnToolOutcome> {
-      const target = String(call.arguments.bot_id ?? "").trim();
-      const message = String(call.arguments.message ?? "").trim();
       const reason = typeof call.arguments.reason === "string" ? call.arguments.reason.trim() : "";
-      if (!target || !message) {
-        return failed(
-          JSON.stringify({ error: "delegate_bot requires both `bot_id` and `message`" }),
-          "bad arguments",
-        );
-      }
-      // Async handoff: the harness queues it and returns immediately. Every
-      // guard that matters — section, thread ownership, depth, the queue
-      // cap — lives in executeDelegateBotRequest, same as ask_bot's hop.
-      const result = await deps.executeDelegateBotRequest({
+      const thread = call.arguments.thread === "new" || call.arguments.thread === "standing" ? call.arguments.thread : undefined;
+      const reply = call.arguments.reply === "none" || call.arguments.reply === "resume" ? call.arguments.reply : undefined;
+      const doneWhen = typeof call.arguments.done_when === "string" ? call.arguments.done_when.trim() : "";
+      const result = await deps.executeCoordinateBotsRequest({
         fromBotId: ctx.botId,
-        toBotId: target,
+        botIds,
         message,
         depth: ctx.commsDepth,
         fromThreadId: ctx.threadId,
-        ...(reason ? { reason } : {}),
+        reason: reason || undefined,
+        rework: call.arguments.rework === true ? true : undefined,
+        thread,
+        reply,
+        consult: call.arguments.consult === true ? true : undefined,
+        doneWhen: doneWhen || undefined,
       });
-      if (result.body.error) {
+      if (result.body.error && !Array.isArray(result.body.assignments)) {
         const errorMessage = String(result.body.error);
         return failed(JSON.stringify({ error: errorMessage }), errorMessage);
       }
-      const text = typeof result.body.message === "string" ? result.body.message : "Delegation queued.";
-      return ok(text);
+      const text = typeof result.body.message === "string" ? result.body.message : "Handed off.";
+      return ok(JSON.stringify(result.body), text);
+    },
+
+    async assignment_status(call, ctx): Promise<TurnToolOutcome> {
+      const id = typeof call.arguments.id === "string" ? call.arguments.id.trim() : "";
+      const result = await deps.executeAssignmentStatusRequest({
+        fromBotId: ctx.botId,
+        fromThreadId: ctx.threadId,
+        id: id || undefined,
+      });
+      if (result.status >= 400 || result.body.error) {
+        const errorMessage = errorText(result.body, "that assignment could not be read");
+        return failed(JSON.stringify({ error: errorMessage }), errorMessage);
+      }
+      return ok(JSON.stringify(result.body));
     },
 
     async create_bot(call, ctx): Promise<TurnToolOutcome> {
@@ -386,7 +421,7 @@ export function createAgentTools(deps: AgentToolDeps): AgentTools {
       createdThisTurn += 1;
       const createdName = typeof result.body.name === "string" ? result.body.name : name;
       const section = typeof result.body.section === "string" ? result.body.section : "General";
-      return ok(`Created @${createdName} in ${section} [id: ${result.body.id}]. Assign work with delegate_bot.`);
+      return ok(`Created @${createdName} in ${section} [id: ${result.body.id}]. Assign work with coordinate_bots.`);
     },
 
     async request_credential(call, ctx): Promise<TurnToolOutcome> {
@@ -424,6 +459,35 @@ export function createAgentTools(deps: AgentToolDeps): AgentTools {
       return {
         kind: "suspend",
         content: `A secure ${label} card is now visible to the user. End this turn; BotFleet will resume the task after they save or decline. Never ask them to paste the key into chat.`,
+        stopReason: "awaiting_human",
+      };
+    },
+
+    async request_sign_in(call, ctx): Promise<TurnToolOutcome> {
+      const parsed = SIGN_IN_CALL.safeParse(call.arguments);
+      if (!parsed.success) {
+        return failed(JSON.stringify({ error: SIGN_IN_CALL_REFUSAL }), "bad arguments");
+      }
+      const site = signInSite(parsed.data.site);
+      if (!site) {
+        return failed(JSON.stringify({ error: "request_sign_in needs a site, like example.com" }), "bad arguments");
+      }
+      const reason = signInReason(parsed.data.reason ?? "");
+      const result = await deps.executeRequestSignInRequest({
+        fromBotId: ctx.botId,
+        fromThreadId: ctx.threadId,
+        site,
+        reason,
+      });
+      if (result.status >= 400) {
+        const message = errorText(result.body, "that sign-in could not be requested");
+        return failed(JSON.stringify({ error: message }), message);
+      }
+      const named = inboundText(result.body.site) || site;
+      return {
+        kind: "suspend",
+        content:
+          `A Sign in needed card for ${named} is now visible. End this turn. The person signs in on the computer where you work. Never ask them to paste a password or one-time code into chat.`,
         stopReason: "awaiting_human",
       };
     },

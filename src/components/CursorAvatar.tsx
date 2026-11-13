@@ -1453,9 +1453,12 @@ export const CursorAvatar = React.forwardRef<CursorAvatarHandle, CursorAvatarPro
       return () => clearTimeout(timer)
     }, [state, autoBlink, paused])
 
+    const paint = `url(#${uid}-grad)`
+    const paintRef = useRef(paint)
+    paintRef.current = paint
+
     useEffect(() => {
       let frame = 0
-      let wake: ReturnType<typeof setTimeout> | undefined
       engine.current.last = performance.now()
 
       const draw = (e: typeof engine.current, now: number, spinTurn: number) => {
@@ -1552,14 +1555,12 @@ export const CursorAvatar = React.forwardRef<CursorAvatarHandle, CursorAvatarPro
       }
 
       const step = (now: number) => {
+        frame = 0
         const e = engine.current
         const p = e.props
-        // A paused mascot must not wake at display rate: re-arming BEFORE the
-        // pause check once had N idle sidebar faces ticking at 60fps forever.
-        // While paused, poll for unpause at 4Hz — but the resting face must
-        // still be PAINTED: the SVG layers hold no expression until the first
-        // draw, so a mascot that mounts paused would otherwise stay blank.
-        // One draw per change of what the still face shows, then park.
+        // A paused mascot must not wake at display rate or on a polling timer:
+        // paint the resting face once when its state/expression/paint changes,
+        // then park with zero timers until props change.
         if (p.paused) {
           e.last = now
           const targetIndex = p.expression ?? POOLS[p.state]?.[0] ?? 0
@@ -1580,12 +1581,13 @@ export const CursorAvatar = React.forwardRef<CursorAvatarHandle, CursorAvatarPro
             e.velocity = 0
             draw(e, now, 0)
           }
-          wake = setTimeout(() => {
-            frame = requestAnimationFrame(step)
-          }, 250)
           return
         }
         e.pausedPaint = ''
+        if (globalThis.document?.visibilityState === 'hidden') {
+          e.last = now
+          return
+        }
         frame = requestAnimationFrame(step)
         const dt = Math.min((now - e.last) / 1000, 0.1)
         e.last = now
@@ -1608,16 +1610,24 @@ export const CursorAvatar = React.forwardRef<CursorAvatarHandle, CursorAvatarPro
         draw(e, now, spinTurn)
       }
 
-      frame = requestAnimationFrame(step)
-      return () => {
-        cancelAnimationFrame(frame)
-        if (wake !== undefined) clearTimeout(wake)
+      const onVisibilityChange = () => {
+        if (globalThis.document?.visibilityState === 'visible' && !engine.current.props.paused && frame === 0) {
+          engine.current.last = performance.now()
+          frame = requestAnimationFrame(step)
+        }
       }
-    }, [])
 
-    const paint = `url(#${uid}-grad)`
-    const paintRef = useRef(paint)
-    paintRef.current = paint
+      frame = requestAnimationFrame(step)
+      if (!paused && globalThis.document?.addEventListener) {
+        globalThis.document.addEventListener('visibilitychange', onVisibilityChange)
+      }
+      return () => {
+        if (frame !== 0) cancelAnimationFrame(frame)
+        if (!paused && globalThis.document?.removeEventListener) {
+          globalThis.document.removeEventListener('visibilitychange', onVisibilityChange)
+        }
+      }
+    }, [paused, state, expression, paint])
 
     const dimension = size.constructor === Number ? `${size}px` : size
     const label = title === undefined ? `${silhouette.name} mascot` : title

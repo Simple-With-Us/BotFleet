@@ -40,6 +40,7 @@ export const JOB_ENGINE_FIXTURES: readonly JobEngineFixture[] = [
   { displayName: "Grok CLI", driverKind: "grokAgent", capabilities: { agentsMcp: true, backgroundJobs: "emulated" }, lane: "mcp", because: "agents MCP server" },
   { displayName: "Kimi", driverKind: "kimiAgent", capabilities: { agentsMcp: true, backgroundJobs: "emulated" }, lane: "mcp", because: "agents MCP server" },
   { displayName: "mcode", driverKind: "mcodeAgent", capabilities: { agentsMcp: true, backgroundJobs: "emulated" }, lane: "mcp", because: "agents MCP server" },
+  { displayName: "Muse Code", driverKind: "museAgent", capabilities: { agentsMcp: true, backgroundJobs: "emulated" }, lane: "mcp", because: "agents MCP server, forwarded through the muse-code-acp adapter" },
   { displayName: "Cursor", driverKind: "cursorAgent", capabilities: { agentsMcp: true, backgroundJobs: "emulated" }, lane: "mcp", because: "agents MCP server" },
   { displayName: "Droid", driverKind: "droidAgent", capabilities: { agentsMcp: true, backgroundJobs: "emulated" }, lane: "mcp", because: "agents MCP server" },
   { displayName: "opencode", driverKind: "opencodeGo", capabilities: { agentsMcp: true, backgroundJobs: "emulated" }, lane: "mcp", because: "agents MCP server" },
@@ -68,5 +69,19 @@ export const JOB_ENGINE_FIXTURES: readonly JobEngineFixture[] = [
     capabilities: { backgroundJobs: "none" },
     lane: "none",
     because: "generic CLI wrapper: unmounted tool loop, no MCP server",
+  },
+  {
+    displayName: "ZCode",
+    driverKind: "zcodeAgent",
+    capabilities: { backgroundJobs: "none" },
+    lane: "none",
+    because: "spawns the ZCode CLI headless: one prompt per turn, no MCP server mounted",
+  },
+  {
+    displayName: "ZCode ACP",
+    driverKind: "zcodeAcp",
+    capabilities: { agentsMcp: true, backgroundJobs: "emulated" },
+    lane: "mcp",
+    because: "agents MCP server, forwarded through the zcode-acp-server bridge",
   },
 ];

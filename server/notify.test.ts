@@ -20,6 +20,18 @@ describe("buildNotification", () => {
     expect(buildNotification("routine-failed", bot, "thread-1", "boom")?.title).toBe("Scout's routine failed");
   });
 
+  it("masks a credential in the body before it is clipped and pushed", () => {
+    // assembled at runtime so no token-shaped literal sits in the source
+    const key = ["sk-test", "-TESTONLY-", "0123456789abcdef0123456789abcdef"].join("");
+    const finished = buildNotification("done", bot, "thread-1", `Rotated it. The new key is ${key} and it works.`);
+    expect(finished?.body).not.toContain(key);
+    expect(finished?.body).not.toContain("TESTONLY");
+    expect(finished?.body).toContain("Rotated it.");
+    // a key long enough to be cut by the clip is still masked first
+    const long = buildNotification("done", bot, "thread-1", `${"x".repeat(120)} ${key}`);
+    expect(long?.body).not.toContain("TESTONLY");
+  });
+
   it("stays silent for a bot whose notifications are off", () => {
     const quiet = { ...bot, notifications: false };
     for (const kind of ["approval", "question", "done", "routine-failed"] as const) {
@@ -81,6 +93,56 @@ describe("buildNotification", () => {
     expect(frame?.requestId).toBeUndefined();
     expect(frame?.tool).toBeUndefined();
     expect(Object.hasOwn(frame ?? {}, "requestId")).toBe(false);
+  });
+
+  // A phone that starts this ask as a Live Activity has no transcript open,
+  // so these three fields are the only thing it has to draw the card and to
+  // offer the card's real verbs from.  Getting them wrong means showing
+  // "Deny" where the card said "Reject", or answering a free-text question
+  // as if it were a permission decision.
+  describe("what a Live Activity needs to draw itself", () => {
+    it("carries the card's own choices on a blocking frame", () => {
+      const frame = buildNotification("approval", bot, "thread-1", "rm -rf ./build", {
+        requestId: "req-7",
+        tool: "Bash",
+        options: ["Allow", "Always allow", "Deny"],
+        isPermission: true,
+      });
+      expect(frame?.options).toEqual(["Allow", "Always allow", "Deny"]);
+      expect(frame?.isPermission).toBe(true);
+    });
+
+    it("distinguishes a free-text question from a permission decision", () => {
+      const question = buildNotification("question", bot, "thread-1", "which branch?", {
+        requestId: "req-8",
+        options: ["main", "release"],
+        isPermission: false,
+      });
+      expect(question?.isPermission).toBe(false);
+      expect(question?.options).toEqual(["main", "release"]);
+    });
+
+    it("withholds the choices where nothing is waiting, like the request id", () => {
+      // A `done` frame advertising options invites a client to offer buttons
+      // on a thread whose card is already settled.
+      for (const kind of ["done", "routine-failed", "takeover"] as const) {
+        const frame = buildNotification(kind, bot, "thread-1", "finished", {
+          options: ["Allow", "Deny"],
+          isPermission: true,
+        });
+        expect(frame?.options).toBeUndefined();
+        expect(frame?.isPermission).toBeUndefined();
+      }
+    });
+
+    it("carries the bot's colour so the card is drawn in that bot's own face", () => {
+      const coloured = { ...bot, color: "coral" };
+      expect(buildNotification("approval", coloured, "thread-1", "x")?.color).toBe("coral");
+      // absent for an older record, and that must stay a reachable shape
+      const frame = buildNotification("approval", bot, "thread-1", "x");
+      expect(frame?.color).toBeUndefined();
+      expect(Object.hasOwn(frame ?? {}, "color")).toBe(false);
+    });
   });
 });
 

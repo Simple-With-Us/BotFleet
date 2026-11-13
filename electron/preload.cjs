@@ -10,10 +10,17 @@ ipcRenderer.on("package:install", (_event, url) => {
   for (const listener of packageInstallListeners) listener(url);
 });
 
+// Each Personal Voice speak call gets its own id so word ranges from a call
+// that was replaced never reach the newer call's listener.
+let personalVoiceProgressSeq = 0;
+
 contextBridge.exposeInMainWorld("ogb", {
   /** Host platform ("darwin" | "win32" | "linux") — for platform-aware UI. */
   platform: process.platform,
   getCapabilities: () => ipcRenderer.invoke("desktop:capabilities"),
+  /** Which build is running right now — version, build number, and the
+   *  Electron/Node/OS the live process reports. */
+  appInfo: () => ipcRenderer.invoke("desktop:app-info"),
   onCapabilitiesChanged: (cb) => {
     const handler = (_event, capabilities) => cb(capabilities);
     ipcRenderer.on("desktop:capabilities-changed", handler);
@@ -75,7 +82,24 @@ contextBridge.exposeInMainWorld("ogb", {
   personalVoice: {
     isAvailable: () => ipcRenderer.invoke("personal-voice:available"),
     list: () => ipcRenderer.invoke("personal-voice:list"),
-    speak: (text, voiceId) => ipcRenderer.invoke("personal-voice:speak", text, voiceId),
+    /** `options.onRange({ location, length, elapsedMs })` fires as each word
+     * is about to be spoken; offsets are UTF-16 indices into `text`.  The
+     * callback stays in this preload: only a numeric id crosses IPC, and the
+     * listener is removed when the speech settles. */
+    speak: (text, voiceId, options) => {
+      const onRange = typeof options?.onRange === "function" ? options.onRange : null;
+      if (!onRange) return ipcRenderer.invoke("personal-voice:speak", text, voiceId);
+      personalVoiceProgressSeq += 1;
+      const progressId = personalVoiceProgressSeq;
+      const handler = (_event, payload) => {
+        if (!payload || payload.id !== progressId) return;
+        onRange({ location: payload.location, length: payload.length, elapsedMs: payload.elapsedMs ?? null });
+      };
+      ipcRenderer.on("personal-voice:range", handler);
+      return ipcRenderer
+        .invoke("personal-voice:speak", text, voiceId, { progressId })
+        .finally(() => ipcRenderer.removeListener("personal-voice:range", handler));
+    },
     stop: () => ipcRenderer.invoke("personal-voice:stop"),
   },
   /** A local-first demonstration recorder. Global events stay in main; the
@@ -100,6 +124,14 @@ contextBridge.exposeInMainWorld("ogb", {
     status: () => ipcRenderer.invoke("assemblyai:status"),
     setKey: (value) => ipcRenderer.invoke("assemblyai:set-key", value),
     streamingToken: () => ipcRenderer.invoke("assemblyai:streaming-token"),
+  },
+  /** Speech-to-speech call tokens.  The permanent provider keys stay in the
+   *  encrypted store; the renderer only ever receives one short-lived,
+   *  single-session token, same rule as transcription.streamingToken. */
+  sts: {
+    status: () => ipcRenderer.invoke("sts:status"),
+    xaiToken: () => ipcRenderer.invoke("sts:xai-token"),
+    geminiToken: () => ipcRenderer.invoke("sts:gemini-token"),
   },
   /** Absolute path of a dropped File — Electron 32 removed File.path, and
    * only the preload can ask. "" when the drag carried no file on disk. */
@@ -176,6 +208,8 @@ contextBridge.exposeInMainWorld("ogb", {
   openFile: (filePath) => ipcRenderer.invoke("desktop:open-file", filePath),
   /** Reveal a file in Finder with the file selected. */
   showInFolder: (filePath) => ipcRenderer.invoke("desktop:show-in-folder", filePath),
+  /** Reveal a user-chosen file or folder (e.g. a plugin install source). */
+  revealLocalPath: (filePath) => ipcRenderer.invoke("desktop:reveal-local-path", filePath),
   /** Open a web URL in the default browser. */
   openExternal: (url) => ipcRenderer.invoke("desktop:open-external", url),
   /** Ask where to save a bot-created file (inside ~/.botfleet), copy it

@@ -1,6 +1,7 @@
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { hashStaticUi, readPackagedBuildIdentity, readSourceBuildIdentity, type BuildIdentity } from "../electron/runtime-identity.mjs";
+import { hashStaticUi, readPackagedBuildIdentity, type BuildIdentity } from "../electron/runtime-identity.mjs";
+import { readSourceBuildIdentity } from "../scripts/source-build-identity.mjs";
 
 // A bundle has an adjacent manifest.  Source execution pins git identity at
 // module load; no request re-reads HEAD after an updater moves the checkout.

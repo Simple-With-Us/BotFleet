@@ -3,9 +3,61 @@ import { useEffect, useMemo, useState } from "react";
 
 import { cn } from "@/lib/cn";
 import { announceTranscriptionStatus } from "@/lib/transcription-status";
+import { parseCallSttProvider } from "../../shared/voice-providers.ts";
 import { KEYTERMS_MAX, formatKeyterms, keytermsDirty, parseKeyterms, persistKeyterms } from "@/lib/stt-keyterms";
 
-type Provider = "auto" | "apple" | "assemblyai";
+type Provider = "auto" | "apple" | "assemblyai" | "xai" | "meta" | "azure" | "groq";
+
+type ProviderOption = { value: Provider; title: string; description: string; available?: boolean };
+
+function providerFromRadio(value: string): Provider {
+  if (value === "auto") return "auto";
+  return parseCallSttProvider(value) ?? "auto";
+}
+
+const CALL_STT_PROVIDER_OPTIONS: readonly ProviderOption[] = [
+  {
+    value: "auto",
+    title: "Automatic",
+    description:
+      "Apple on-device dictation on macOS, then xAI, then AssemblyAI on other computers.",
+  },
+  {
+    value: "apple",
+    title: "Apple Speech Recognition",
+    description:
+      "macOS only.\u00A0 Audio never leaves the device.\u00A0 Lower accuracy on technical jargon.",
+  },
+  {
+    value: "assemblyai",
+    title: "AssemblyAI Cloud Recognition",
+    description:
+      "Cross-platform.\u00A0 Requires an API key above.\u00A0 Better accuracy and custom vocabulary.",
+  },
+  {
+    value: "xai",
+    title: "xAI Cloud Recognition",
+    description: "Uses the xAI API key from Connections.\u00A0 Streaming speech-to-text in 38+ languages.",
+  },
+  {
+    value: "meta",
+    title: "Meta Muse Voice Transcribe",
+    description: "Not yet available in this version.",
+    available: false,
+  },
+  {
+    value: "azure",
+    title: "Azure Speech",
+    description: "Not yet available in this version.",
+    available: false,
+  },
+  {
+    value: "groq",
+    title: "Groq Whisper",
+    description: "Not yet available in this version.",
+    available: false,
+  },
+];
 
 const MAX_INPUT_HEIGHT_PX = 220;
 
@@ -41,7 +93,8 @@ export function TranscriptionSettings() {
       .then((cfg) => {
         if (!alive) return;
         const explicit = cfg?.callStt?.provider;
-        setProvider(explicit === "apple" || explicit === "assemblyai" ? explicit : "auto");
+        const parsed = typeof explicit === "string" ? parseCallSttProvider(explicit) : undefined;
+        setProvider(parsed ?? "auto");
         const saved = parseKeyterms(formatKeyterms(Array.isArray(cfg?.callStt?.keyterms) ? cfg.callStt.keyterms : []));
         setGlobalKeyterms(formatKeyterms(saved));
         setLastSavedKeyterms(saved);
@@ -167,38 +220,16 @@ export function TranscriptionSettings() {
           <span className="text-ink">Voice Calls & Dictation</span>
         </div>
         <p className="mb-2 text-[12px] leading-relaxed text-ink-secondary">
-          Voice mode works everywhere.{"\u00A0 "}macOS uses on-device Apple Speech Recognition until a
-          key is added, then opts into the same cloud engine that powers skill narration —
-          quicker turnaround, custom vocabulary, server-side turn detection.
+          Automatic uses Apple on-device dictation on macOS (private and free), then xAI, then AssemblyAI.{"\u00A0 "}Pin a cloud provider when you want that one every time.
         </p>
         <fieldset className="space-y-1.5">
           <legend className="sr-only">Voice call dictation provider</legend>
-          {(
-            [
-              {
-                value: "auto" as Provider,
-                title: "Automatic",
-                description:
-                  "Use the best provider for this device — Apple on macOS, AssemblyAI on every other platform.",
-              },
-              {
-                value: "apple" as Provider,
-                title: "Apple Speech Recognition",
-                description:
-                  "macOS only.\u00A0 Audio never leaves the device.\u00A0 Lower accuracy on technical jargon.",
-              },
-              {
-                value: "assemblyai" as Provider,
-                title: "AssemblyAI Cloud Recognition",
-                description:
-                  "Cross-platform.\u00A0 Requires an API key above.\u00A0 Better accuracy and custom vocabulary.",
-              },
-            ]
-          ).map((option) => (
+          {CALL_STT_PROVIDER_OPTIONS.map((option) => (
             <label
               key={option.value}
               className={cn(
-                "flex cursor-pointer items-start gap-3 rounded-lg border border-hairline/40 bg-inset px-3 py-2 hover:border-hairline",
+                "flex items-start gap-3 rounded-lg border border-hairline/40 bg-inset px-3 py-2",
+                option.available === false ? "cursor-not-allowed opacity-60" : "cursor-pointer hover:border-hairline",
                 provider === option.value && "border-accent",
               )}
             >
@@ -207,8 +238,8 @@ export function TranscriptionSettings() {
                 name="call-stt-provider"
                 value={option.value}
                 checked={provider === option.value}
-                onChange={(event) => void saveProvider(event.target.value as Provider)}
-                disabled={!callSttLoaded || savingProvider}
+                onChange={(event) => void saveProvider(providerFromRadio(event.target.value))}
+                disabled={!callSttLoaded || savingProvider || option.available === false}
                 className="mt-1 size-3 accent-accent"
               />
               <div>

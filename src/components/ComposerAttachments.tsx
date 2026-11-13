@@ -115,7 +115,7 @@ export function ComposerAttachments({
             aria-label="Dismiss"
             className="shrink-0 rounded p-0.5"
           >
-            <X size={12} />
+            <X size={12} aria-hidden="true" />
           </button>
         </div>
       )}
@@ -158,7 +158,8 @@ export function ComposerAttachments({
                 >
                   <img
                     src={attachmentImageUrl(a.path) ?? undefined}
-                    alt={a.name}
+                    alt=""
+                    aria-hidden="true"
                     loading="lazy"
                     className="max-h-[76px] max-w-full object-contain"
                   />
@@ -206,7 +207,7 @@ function Chip({
     >
       {children}
       <div className="mt-1 flex items-center gap-1">
-        <Icon size={11} className="text-ink-secondary/70" />
+        <Icon size={11} className="text-ink-secondary/70" aria-hidden="true" />
         <span className="rounded border border-hairline/60 px-1 py-px text-[9.5px] font-medium tracking-wide text-ink-secondary">
           {label}
         </span>
@@ -218,7 +219,7 @@ function Chip({
         aria-label={`Remove ${label === "PASTED" ? "pasted text" : "file"}`}
         className="absolute -right-1.5 -top-1.5 flex size-5 items-center justify-center rounded-full border border-hairline/60 bg-panel text-ink-secondary opacity-0 transition-opacity hover:text-ink focus-visible:opacity-100 group-hover:opacity-100"
       >
-        <X size={11} />
+        <X size={11} aria-hidden="true" />
       </button>
     </div>
   );

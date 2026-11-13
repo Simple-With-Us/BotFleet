@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   computeRoomAttentionIndex,
+  isBotTurnError,
   summarizeFleetAttention,
   type MinimalBot,
   type MinimalGroup,
@@ -82,6 +83,7 @@ describe("computeRoomAttentionIndex", () => {
     const st = result.find((r) => r.roomId === "group-st")!;
     expect(st.errors.count).toBe(1);
     expect(st.errors.bots[0].botName).toBe("Scout");
+    expect(st.errors.bots[0].reason).toBe("Process terminated");
     expect(st.working.count).toBe(0);
     expect(st.needsAction.count).toBe(0);
     expect(st.unread.count).toBe(1); // group unread is true
@@ -160,7 +162,12 @@ describe("computeRoomAttentionIndex", () => {
         errors: { count: 1, bots: [{ botId: "b1", botName: "Bot 1" }] },
         needsAction: { count: 0, bots: [] },
         working: { count: 1, bots: [{ botId: "b1", botName: "Bot 1" }] },
-        unread: { count: 2, hasUnread: true },
+        unread: {
+          count: 2,
+          hasUnread: true,
+          roomUnread: true,
+          bots: [{ botId: "b1", botName: "Bot 1" }],
+        },
       },
       {
         roomId: "r2",
@@ -169,7 +176,7 @@ describe("computeRoomAttentionIndex", () => {
         errors: { count: 0, bots: [] },
         needsAction: { count: 2, bots: [{ botId: "b2", botName: "Bot 2" }, { botId: "b3", botName: "Bot 3" }] },
         working: { count: 0, bots: [] },
-        unread: { count: 0, hasUnread: false },
+        unread: { count: 0, hasUnread: false, roomUnread: false, bots: [] },
       },
     ];
 
@@ -183,5 +190,302 @@ describe("computeRoomAttentionIndex", () => {
     expect(summary.totalWorking).toBe(1);
     expect(summary.roomsWithUnread).toBe(1);
     expect(summary.totalUnread).toBe(2);
+  });
+
+  it("includes bots with active turn errors in room errors and reasons", () => {
+    const groups: MinimalGroup[] = [
+      {
+        id: "group-bf",
+        name: "BotFleet",
+        memberIds: ["bot-err"],
+        unread: false,
+      },
+    ];
+
+    const bots: MinimalBot[] = [
+      {
+        id: "bot-err",
+        name: "Builder",
+        activity: "idle",
+        messages: [
+          { kind: "text" },
+          { kind: "activity", tool: { name: "error: rate limit from provider" } },
+        ],
+      },
+    ];
+
+    expect(isBotTurnError(bots[0])).toBe(true);
+    const result = computeRoomAttentionIndex(groups, bots);
+    expect(result[0].errors.count).toBe(1);
+    expect(result[0].errors.bots[0].botName).toBe("Builder");
+    expect(result[0].errors.bots[0].reason).toBe("Turn error: rate limit from provider");
+  });
+
+  it("reads a turn error from the visible branch, not the flat message tail", () => {
+    const groups: MinimalGroup[] = [
+      {
+        id: "group-bf",
+        name: "BotFleet",
+        memberIds: ["bot-fork", "bot-stale"],
+        unread: false,
+      },
+    ];
+
+    const bots: MinimalBot[] = [
+      {
+        id: "bot-fork",
+        name: "Builder",
+        activity: "idle",
+        activeLeafId: "err",
+        messages: [
+          { id: "root", kind: "text", parentId: null },
+          { id: "err", kind: "activity", parentId: "root", tool: { name: "error: rate limit from provider" } },
+          { id: "abandoned", kind: "text", parentId: "root" },
+        ],
+      },
+      {
+        id: "bot-stale",
+        name: "Scout",
+        activity: "idle",
+        activeLeafId: "live",
+        messages: [
+          { id: "root", kind: "text", parentId: null },
+          { id: "live", kind: "text", parentId: "root" },
+          { id: "old-err", kind: "activity", parentId: "root", tool: { name: "error: abandoned branch" } },
+        ],
+      },
+    ];
+
+    expect(isBotTurnError(bots[0])).toBe(true);
+    expect(isBotTurnError(bots[1])).toBe(false);
+    const result = computeRoomAttentionIndex(groups, bots);
+    expect(result[0].errors.count).toBe(1);
+    expect(result[0].errors.bots.map((bot) => bot.botName)).toEqual(["Builder"]);
+    expect(result[0].errors.bots[0].reason).toBe("Turn error: rate limit from provider");
+  });
+
+  it("reuses one transcript for a bot shared by two rooms", () => {
+    const messages = [
+      { id: "root", kind: "text", parentId: null },
+      { id: "err", kind: "activity", parentId: "root", tool: { name: "error: rate limit from provider" } },
+      { id: "abandoned", kind: "text", parentId: "root" },
+    ];
+    const bot: MinimalBot = {
+      id: "bot-shared",
+      name: "Builder",
+      activity: "idle",
+      activeLeafId: "err",
+      messages,
+    };
+    const groups: MinimalGroup[] = [
+      { id: "room-a", name: "A", memberIds: ["bot-shared"], unread: false },
+      { id: "room-b", name: "B", memberIds: ["bot-shared"], unread: false },
+    ];
+
+    const result = computeRoomAttentionIndex(groups, [bot]);
+    expect(result.map((room) => room.errors.bots[0]?.reason)).toEqual([
+      "Turn error: rate limit from provider",
+      "Turn error: rate limit from provider",
+    ]);
+    expect(isBotTurnError(bot)).toBe(true);
+
+    const again = computeRoomAttentionIndex(groups, [bot]);
+    expect(again.map((room) => room.roomId)).toEqual(["room-a", "room-b"]);
+    expect(again.map((room) => room.errors.count)).toEqual([1, 1]);
+    expect(again.map((room) => room.errors.bots[0].reason)).toEqual([
+      "Turn error: rate limit from provider",
+      "Turn error: rate limit from provider",
+    ]);
+  });
+
+  it("uses the leaf as the visible tail, including a deep chain and a cycle", () => {
+    const deep = [
+      { id: "m0", kind: "text", parentId: null },
+      ...Array.from({ length: 40 }, (_, i) => ({
+        id: `m${i + 1}`,
+        kind: "text",
+        parentId: `m${i}`,
+      })),
+      {
+        id: "leaf",
+        kind: "activity",
+        parentId: "m40",
+        tool: { name: "error: leaf on the visible branch" },
+      },
+      {
+        id: "flat-tail",
+        kind: "activity",
+        parentId: "m0",
+        tool: { name: "error: abandoned flat tail" },
+      },
+    ];
+    const deepBot: MinimalBot = {
+      id: "bot-deep",
+      name: "Builder",
+      activity: "idle",
+      activeLeafId: "leaf",
+      messages: deep,
+    };
+
+    const cycle: MinimalBot = {
+      id: "bot-cycle",
+      name: "Scout",
+      activity: "idle",
+      activeLeafId: "loop-leaf",
+      messages: [
+        { id: "loop-leaf", kind: "activity", parentId: "loop-mid", tool: { name: "error: cycle leaf" } },
+        { id: "loop-mid", kind: "activity", parentId: "loop-leaf", tool: { name: "error: cycle parent" } },
+        { id: "flat-tail", kind: "activity", parentId: null, tool: { name: "error: cycle flat tail" } },
+      ],
+    };
+
+    const missingLeaf: MinimalBot = {
+      id: "bot-missing",
+      name: "Fixer",
+      activity: "idle",
+      activeLeafId: "not-in-transcript",
+      messages: [
+        { id: "root", kind: "text", parentId: null },
+        { id: "flat-tail", kind: "activity", parentId: "root", tool: { name: "error: flat fallback" } },
+      ],
+    };
+
+    const ancestorOnly: MinimalBot = {
+      id: "bot-ancestor",
+      name: "Archivist",
+      activity: "idle",
+      activeLeafId: "clean-leaf",
+      messages: [
+        { id: "root", kind: "activity", parentId: null, tool: { name: "error: ancestor only" } },
+        { id: "clean-leaf", kind: "text", parentId: "root" },
+        { id: "flat-tail", kind: "activity", parentId: "root", tool: { name: "error: not the leaf" } },
+      ],
+    };
+
+    expect(isBotTurnError(deepBot)).toBe(true);
+    expect(isBotTurnError(cycle)).toBe(true);
+    expect(isBotTurnError(missingLeaf)).toBe(true);
+    expect(isBotTurnError(ancestorOnly)).toBe(false);
+
+    const groups: MinimalGroup[] = [
+      {
+        id: "room",
+        name: "BotFleet",
+        memberIds: ["bot-deep", "bot-cycle", "bot-missing", "bot-ancestor"],
+        unread: false,
+      },
+    ];
+    const result = computeRoomAttentionIndex(groups, [deepBot, cycle, missingLeaf, ancestorOnly]);
+    expect(result[0].errors.bots.map((bot) => [bot.botName, bot.reason])).toEqual([
+      ["Builder", "Turn error: leaf on the visible branch"],
+      ["Scout", "Turn error: cycle leaf"],
+      ["Fixer", "Turn error: flat fallback"],
+    ]);
+  });
+});
+
+describe("summarizeFleetAttention", () => {
+  const room = (
+    id: string,
+    memberIds: string[],
+    extra: Partial<MinimalGroup> = {},
+  ): MinimalGroup => ({ id, name: id, memberIds, unread: false, ...extra });
+
+  it("counts a bot once however many rooms it belongs to", () => {
+    // One working bot and one dead bot, each a member of all three rooms.
+    const groups = [
+      room("room-a", ["bot-worker", "bot-crashed"]),
+      room("room-b", ["bot-worker", "bot-crashed"]),
+      room("room-c", ["bot-worker", "bot-crashed"]),
+    ];
+    const bots: MinimalBot[] = [
+      { id: "bot-worker", name: "Worker", activity: "working" },
+      { id: "bot-crashed", name: "Crashed", activity: "dead" },
+    ];
+
+    const rooms = computeRoomAttentionIndex(groups, bots);
+    // Every room still shows the bot's one global state, so the per-room chips
+    // and matrix rows are unchanged.
+    expect(rooms.map((r) => r.working.count)).toEqual([1, 1, 1]);
+    expect(rooms.map((r) => r.errors.count)).toEqual([1, 1, 1]);
+
+    const summary = summarizeFleetAttention(rooms);
+    expect(summary.totalWorking).toBe(1);
+    expect(summary.totalErrors).toBe(1);
+    expect(summary.totalNeedsAction).toBe(0);
+    expect(summary.totalUnread).toBe(0);
+    // How many rooms are affected is a different question, and it stays per room.
+    expect(summary.roomsWorking).toBe(3);
+    expect(summary.roomsWithErrors).toBe(3);
+  });
+
+  it("still counts different bots separately when their rooms overlap", () => {
+    const groups = [
+      room("room-a", ["bot-a", "bot-c"]),
+      room("room-b", ["bot-a", "bot-b", "bot-c", "bot-d"]),
+      room("room-c", ["bot-b", "bot-d"]),
+    ];
+    const bots: MinimalBot[] = [
+      { id: "bot-a", name: "A", activity: "working" },
+      { id: "bot-b", name: "B", activity: "working" },
+      { id: "bot-c", name: "C", activity: "waiting-on-you" },
+      { id: "bot-d", name: "D", activity: "waiting-on-you" },
+    ];
+
+    const rooms = computeRoomAttentionIndex(groups, bots);
+    expect(rooms.map((r) => r.working.count)).toEqual([1, 2, 1]);
+    expect(rooms.map((r) => r.needsAction.count)).toEqual([1, 2, 1]);
+
+    const summary = summarizeFleetAttention(rooms);
+    expect(summary.totalWorking).toBe(2);
+    expect(summary.totalNeedsAction).toBe(2);
+  });
+
+  it("counts a working bot once whether its activity or its room's busy marker says so", () => {
+    const groups = [
+      room("room-a", ["bot-global"], { busyBotId: "bot-global" }),
+      room("room-b", ["bot-global", "bot-room-only"], { busyBotId: "bot-room-only" }),
+    ];
+    const bots: MinimalBot[] = [
+      { id: "bot-global", name: "Global", activity: "working" },
+      { id: "bot-room-only", name: "Room Only", activity: "idle" },
+    ];
+
+    const rooms = computeRoomAttentionIndex(groups, bots);
+    // room-a lists bot-global once although two signals mark it working, and
+    // room-b adds a bot that is busy only in that room.
+    expect(rooms.map((r) => r.working.bots.map((b) => b.botId))).toEqual([
+      ["bot-global"],
+      ["bot-global", "bot-room-only"],
+    ]);
+
+    const summary = summarizeFleetAttention(rooms);
+    expect(summary.totalWorking).toBe(2);
+    expect(summary.roomsWorking).toBe(2);
+  });
+
+  it("counts an unread bot once, plus each room chat that is unread itself", () => {
+    const groups = [
+      room("room-a", ["bot-reader"]),
+      room("room-b", ["bot-reader"], { unread: true }),
+      room("room-c", ["bot-reader"]),
+    ];
+    const bots: MinimalBot[] = [
+      { id: "bot-reader", name: "Reader", activity: "idle", unread: true },
+    ];
+
+    const rooms = computeRoomAttentionIndex(groups, bots);
+    // Per room: the bot's thread, plus the room chat where it is unread.
+    expect(rooms.map((r) => r.unread.count)).toEqual([1, 2, 1]);
+    expect(rooms.map((r) => r.unread.roomUnread)).toEqual([false, true, false]);
+    expect(rooms.map((r) => r.unread.bots.map((b) => b.botId))).toEqual([
+      ["bot-reader"],
+      ["bot-reader"],
+      ["bot-reader"],
+    ]);
+
+    const summary = summarizeFleetAttention(rooms);
+    expect(summary.totalUnread).toBe(2); // the bot once, plus room-b's chat
+    expect(summary.roomsWithUnread).toBe(3);
   });
 });

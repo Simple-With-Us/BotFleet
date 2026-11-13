@@ -124,9 +124,9 @@ export function antigravityGroupSummary(
       const pctStr = exhausted ? "0%" : remainingPercent != null ? `${remainingPercent}% available` : "not reported";
       let headline = `${groupName}: ${pctStr}`;
       if (resetCountdown) {
-        headline += ` (5h window, resets in ${resetCountdown})`;
+        headline += ` (5-hour window, resets in ${resetCountdown})`;
       } else {
-        headline += ` (5h window)`;
+        headline += ` (5-hour window)`;
       }
       entry.headline = headline;
     }
@@ -235,9 +235,42 @@ function bucketFor(window: string | null | undefined): string {
   const raw = window.toLowerCase();
   if (raw.includes("week")) return "weekly";
   if (raw.includes("month")) return "monthly";
-  if (raw === "5h" || raw.includes("5-h") || raw.includes("5 hour") || raw.includes("session")) return "5h";
+  // "5hr" and "5hrs" are the 5-hour window spelled without the dash, and are
+  // exactly what `server/antigravity-quota.ts` and `server/minimax-balance.ts`
+  // emit.  Left out of this test they reach the compact-duration branch below
+  // and come back "hourly", which paints a 5-hour session window as an hourly
+  // allowance -- a different quota with a similar name.
+  if (
+    raw === "5h" ||
+    raw === "5hr" ||
+    raw === "5hrs" ||
+    raw.includes("5-h") ||
+    raw.includes("5 hour") ||
+    raw.includes("session")
+  ) {
+    return "5h";
+  }
   if (raw.includes("day")) return "daily";
   if (raw.includes("hour")) return "hourly";
+  // Several engines report the window as a bare duration instead of a name
+  // ("7d", "30d", "2w").  Those used to fall through as their own bucket,
+  // which left `windowsLabelFromHeadlines` with nothing it recognised and the
+  // panel painting the SECONDARY window as the word "Longer" — a length
+  // comparison standing in for a timeframe the reader could have been told.
+  // Classify the compact forms so the label resolves to a real period.
+  const duration = /^(\d+)\s*(h|hr|hrs|d|day|days|w|wk|wks|m|mo|mos)$/.exec(raw);
+  if (duration) {
+    const amount = Number(duration[1]);
+    const unit = duration[2][0];
+    if (unit === "h" || unit === "d") {
+      if (unit === "h") return amount >= 20 && amount <= 24 ? "daily" : "hourly";
+      if (amount >= 28) return "monthly";
+      if (amount >= 6) return "weekly";
+      return "daily";
+    }
+    if (unit === "w") return "weekly";
+    return "monthly";
+  }
   return raw;
 }
 
@@ -405,7 +438,7 @@ export type LocalQuotaFreshnessView = {
  *  the file is the only thing that could say otherwise.
  *
  *  CodeCaps renamed on the wire from `agent-bar` to `codecaps` on 2026-09-20
- *  (PR #22 in jaywedgeworth22/codecaps).  Both values resolve to the new
+ *  (PR #22 in Simple-With-Us/codecaps).  Both values resolve to the new
  *  brand in the UI; anything else falls through to "CodeCaps" as the
  *  assumed writer of the local handoff path. */
 export function quotaProducerLabel(producer?: string | null): string {
@@ -434,6 +467,22 @@ export function localQuotaStatusLine(freshness: LocalQuotaFreshnessView | null |
       : `${producer} has not written quota recently`;
   }
   return `${producer}'s quota file could not be read`;
+}
+
+export type QuotaGridPlaceholderVariant = "loading" | "empty";
+
+/** One plain line under an engine row when the usage grid has no cells yet,
+ *  so an empty panel is not mistaken for a broken or still-loading one. */
+export function quotaGridPlaceholderLine(
+  variant: QuotaGridPlaceholderVariant,
+  engineName?: string | null,
+): string {
+  const name = (engineName ?? "").trim();
+  const forEngine = name ? ` for ${name}` : "";
+  if (variant === "loading") {
+    return `Loading usage limits${forEngine}…`;
+  }
+  return `No usage limits reported yet${forEngine}.`;
 }
 
 /** "Claude: sign in again to refresh quota (from CodeCaps)" — the reason a
@@ -510,7 +559,7 @@ export function minimaxQuotaLine(row: MiniMaxQuotaView, now: number = Date.now()
     const boosted = row.secondaryRemainingPercent > 100 ? " of a boosted allowance" : "";
     parts.push(`${Math.round(row.secondaryRemainingPercent)}% left this week${boosted}`);
   }
-  if (row.remainingPercent != null) parts.push(`${Math.round(row.remainingPercent)}% left in the current 5 h window`);
+  if (row.remainingPercent != null) parts.push(`${Math.round(row.remainingPercent)}% left in the current 5-hour window`);
   if (parts.length === 0) return null;
   let line = parts.join(", ");
   // Name whichever window is actually BINDING: if the weekly allowance is
@@ -558,9 +607,21 @@ export function windowsLabelFromHeadlines(headlines: WindowHeadline[]): string |
   return undefined;
 }
 
+/** One capitalization for a pair of windows.  "5hr/Week" and "5-hour/weekly" both become "5-Hour / Weekly". */
+export function formatWindowPairLabel(label: string): string {
+  return label
+    .replace(/5\s*-?\s*h(?:ou)?rs?/gi, "5-Hour")
+    .replace(/\bweekly\b/gi, "Weekly")
+    .replace(/\bweek\b/gi, "Weekly")
+    .replace(/\bmonthly\b/gi, "Monthly")
+    .replace(/\bmonth\b/gi, "Monthly")
+    .replace(/\s*\/\s*/g, " / ")
+    .trim();
+}
+
 /** Formats dual-window quota percentage for ModelPicker row.
- *  When both primary (5h) and secondary (weekly/monthly) percentages exist: "(XX% / YY% for 5h / w)".
- *  When only primary exists: "(XX% for 5h)" if a windows label exists, or "XX% left" otherwise. */
+ *  When both primary (5h) and secondary (weekly/monthly) percentages exist: "(XX% / YY% for 5-Hour / Weekly)".
+ *  When only primary exists: "(XX% for 5-Hour)" if a windows label exists, or "XX% left" otherwise. */
 export function formatDualQuotaBadge(
   remainingPercent?: number | null,
   secondaryRemainingPercent?: number | null,
@@ -572,14 +633,7 @@ export function formatDualQuotaBadge(
   
   let suffix = "";
   if (options?.windowsLabel) {
-    let w = options.windowsLabel.toLowerCase();
-    w = w.replace(/hr/g, "h");
-    w = w.replace(/hour/g, "h");
-    w = w.replace(/week/g, "w");
-    w = w.replace(/month/g, "m");
-    w = w.replace(/day/g, "d");
-    w = w.replace(/\//g, " / ");
-    suffix = ` for ${w}`;
+    suffix = ` for ${formatWindowPairLabel(options.windowsLabel)}`;
   }
 
   if (p1 != null && p2 != null) {
@@ -592,5 +646,93 @@ export function formatDualQuotaBadge(
     return `(${p2}%${suffix})`;
   }
   return null;
+}
+
+/** One named quota window, ready to render as its own labelled row.
+ *
+ *  `formatDualQuotaBadge` collapses a two-window engine into one string —
+ *  `(93% / 3% for 5h / w)` — which packs two numbers, an unexplained
+ *  abbreviation and an implied ordering into a chip the width of a word.  The
+ *  owner read it as noise that hid the one number worth knowing, which is
+ *  usually the *binding* window: the one closest to 0%.  Splitting the pair
+ *  into named windows lets each one carry its own label, its own bar, and — for
+ *  the binding one — a sentence that says so. */
+export interface QuotaWindow {
+  /** Title Case name for the row: "5-Hour", "Weekly", "Monthly". */
+  label: string;
+  remainingPercent: number;
+  /** Which end of the pair is this: the short window or the long one. */
+  kind: "primary" | "secondary";
+  resetsAt?: number | null;
+}
+
+/** Title Case window names for the abbreviations the badge used to emit.
+ *  Keys are the lowercased forms `windowsLabelFromHeadlines` produces
+ *  ("5hr/week", "hour", "day", "month"), plus the bare primary forms. */
+const WINDOW_NAMES = {
+  "5h": "5-Hour",
+  "5hr": "5-Hour",
+  hour: "Hourly",
+  day: "Daily",
+  week: "Weekly",
+  monthly: "Monthly",
+  month: "Monthly",
+} as const;
+
+/** Look up a window name for an untrusted label, falling back when unknown.
+ *
+ *  The label arrives from the server, so it is a `string` rather than one of the
+ *  keys above; this narrows it in one place instead of asserting at each call
+ *  site. */
+function windowName(key: string | undefined, fallback: string): string {
+  if (!key) return fallback;
+  const found = Object.entries(WINDOW_NAMES).find(([name]) => name === key);
+  return found ? found[1] : fallback;
+}
+
+/** The windows a dual (or single) quota reading describes, named.
+ *
+ *  Returns an empty array when neither percentage is present, so a caller can
+ *  treat "nothing to show" and "everything exhausted" as different things. */
+export function quotaWindows(
+  remainingPercent?: number | null,
+  secondaryRemainingPercent?: number | null,
+  options?: { windowsLabel?: string },
+): QuotaWindow[] {
+  const raw = (options?.windowsLabel ?? "").toLowerCase();
+  const [primaryRaw, secondaryRaw] = raw.split("/").map((part) => part.trim());
+  const primary = remainingPercent != null ? Math.round(remainingPercent) : null;
+  const secondary = secondaryRemainingPercent != null ? Math.round(secondaryRemainingPercent) : null;
+  if (primary == null && secondary == null) return [];
+
+  const windows: QuotaWindow[] = [];
+  if (primary != null) {
+    windows.push({
+      label: windowName(primaryRaw, primaryRaw ? "Current" : "Quota"),
+      remainingPercent: primary,
+      kind: "primary",
+    });
+  }
+  if (secondary != null) {
+    windows.push({
+      label: windowName(secondaryRaw, "Longer"),
+      remainingPercent: secondary,
+      kind: "secondary",
+    });
+  }
+  return windows;
+}
+
+/** The window a caller should lead with: the lowest remaining percentage.
+ *
+ *  Two windows both at 93% are unremarkable; one at 3% beside one at 93% means
+ *  the engine is effectively spent.  Picking the minimum is what lets the panel
+ *  answer "can this bot run right now?" without the reader doing arithmetic on
+ *  a pair of numbers. */
+export function bindingQuotaWindow(windows: QuotaWindow[]): QuotaWindow | null {
+  if (windows.length === 0) return null;
+  return windows.reduce((lowest, window) =>
+    window.remainingPercent < lowest.remainingPercent ? window : lowest,
+  );
 }
 

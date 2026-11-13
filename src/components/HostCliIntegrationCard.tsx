@@ -7,9 +7,10 @@ import { useState } from "react";
 import { Loader2 } from "lucide-react";
 import { api, useStore, type ConfigStatus } from "@/state/store";
 import { Card } from "./SettingsPrimitives";
-import { productErrorHeadline } from "@/lib/product-error";
+import { redactCommandSecrets } from "@/lib/redact-command-secrets";
+import { PersistentActionErrorCard } from "./PersistentActionErrorCard";
 
-type VmToggle = "shareCliCredentials" | "allowHostTerminal";
+type VmToggle = "shareCliCredentials" | "shareGpgPrivateKeys" | "allowHostTerminal";
 
 export function HostCliIntegrationCard() {
   const { state, dispatch } = useStore();
@@ -27,7 +28,7 @@ export function HostCliIntegrationCard() {
       .then((config: ConfigStatus) => {
         dispatch({ type: "configStatus", config });
       })
-      .catch((e) => setError(e instanceof Error ? e.message : String(e)))
+      .catch((e) => setError(redactCommandSecrets(e instanceof Error ? e.message : String(e))))
       .finally(() => setSaving(null));
   };
 
@@ -36,15 +37,22 @@ export function HostCliIntegrationCard() {
       key: "shareCliCredentials",
       title: "Share Host CLI Credentials with Local & Cloud VMs",
       body:
-        "Makes your host CLI credentials (~/.infisical, ~/.ssh, ~/.docker, ~/.gitconfig, ~/.config/gh, ~/.aws, ~/.config/gcloud, ~/.npmrc, etc.) available read-only, so tools run inside a VM are signed into your accounts.\u00a0 " +
+        "Makes manifest-listed host CLI login files available read-only inside Local and Shared VPS VMs (Infisical, SSH, Git, cloud CLIs, registries, kubectl, turso, vercel, and more).\u00a0 " +
         "The Shared VPS is synced automatically when a bot starts a turn, at most once every ten minutes.\u00a0 " +
         "A Local VM mounts them when it is created, so recreate an existing Local VM to pick this up.",
+    },
+    {
+      key: "shareGpgPrivateKeys",
+      title: "Include GPG Private Keys in VM Credential Sync",
+      body:
+        "When enabled, GPG private keys under ~/.gnupg/private-keys-v1.d are included in VPS sync and Local VM mounts.\u00a0 " +
+        "Public GPG configuration is always synced; private keys stay on the host unless you opt in here.",
     },
     {
       key: "allowHostTerminal",
       title: "Host Shell Execution with VM Screen (Hybrid Mode)",
       body:
-        "Lets bots using a Local VM or the Shared VPS run shell commands and tests in your host Mac terminal, while every mouse click, keystroke, and desktop view stays strictly inside the VM.",
+        "Lets bots using a Local VM or the Shared VPS run shell commands on your Mac (for example `gh`, `kodus`, and other CLIs you already installed) while every mouse click, keystroke, and desktop view stays inside the VM.\u00a0 Heavy or auth-bound tools stay on the host; the VM image can stay lean.",
     },
   ];
 
@@ -74,9 +82,7 @@ export function HostCliIntegrationCard() {
           </label>
         ))}
         {error && (
-          <div className="rounded-lg bg-danger/10 px-3 py-2 text-[12px] text-danger" title={error}>
-            {productErrorHeadline(error)}
-          </div>
+          <PersistentActionErrorCard message={error} onDismiss={() => setError(null)} />
         )}
       </div>
     </Card>

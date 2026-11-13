@@ -21,3 +21,5 @@ address would point the phone at the harness.  macOS desktop is the same
 Electron Settings modal.
 
 **Board:** `a4b7edb0`.  **Issue:** #226.  **Branch:** `grok/remote-access-named-tunnel`.
+
+**Security note (2026-10-15, BF-2129):** The tunnel forwards with a loopback `Host`, so the harness treats Access-authenticated traffic like local loopback for the Host gate.  Mutating `/api/*` requests that arrive with Cloudflare edge headers are refused until dedicated remote auth ships.  See `docs/verification/named-tunnel-loopback-host.md`.
