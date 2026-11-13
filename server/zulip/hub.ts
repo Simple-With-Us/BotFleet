@@ -57,7 +57,7 @@ import {
   type ZulipTarget,
 } from "./outbound.ts";
 import { DEFAULT_OWNER_CLIENTS, classify, wakeVerdict, type Classification, type RouterContext, type WakeReason, type WakeVerdict } from "./router.ts";
-import { HANDLED_RING_LIMIT, ZulipStateStore, emptyState, type ZulipBotState } from "./state.ts";
+import { HANDLED_RING_LIMIT, PENDING_NOTICE_LIMIT, ZulipStateStore, emptyState, type ZulipBotState } from "./state.ts";
 import type { PluginEventEnvelope } from "../../shared/plugin-events.ts";
 import { ZULIP_OUTGOING_MAX_ATTEMPTS, ZulipOutgoingSpool } from "./outgoing-spool.ts";
 import type { ZulipIdentity, ZulipInboundItem, ZulipMessage, ZulipOrigin, ZulipSettings, ZulipUser } from "./types.ts";
@@ -1478,11 +1478,50 @@ export class ZulipHub {
         await this.finalizeSettled();
         for (const session of this.sessions.values()) {
           if (this.stopped) return;
+          await this.flushNotices(session).catch((error) => {
+            this.log(`[zulip] ${session.role}: owner-notice flush failed: ${describe(error)}`);
+          });
           await this.dispatchNext(session);
         }
       } while (this.redrain && !this.stopped);
     } finally {
       this.draining = false;
+    }
+  }
+
+  /** Send owner DMs the hourly cap queued, oldest first, as the window
+   *  allows.  Every resend counts against the same dms ledger, so the cap
+   *  still holds; a failed resend keeps its notice for the next drain. */
+  private async flushNotices(session: ZulipSession): Promise<void> {
+    const notices = session.state.notices;
+    if (this.stopped || notices.length === 0) return;
+    const limit = this.budget("dmsPerHour");
+    let inWindow = session.state.dms.filter((at) => this.now() - at < 3600_000).length;
+    let touched = false;
+    while (notices.length > 0 && inWindow < limit) {
+      const notice = notices[0]!;
+      const content = checkContent(notice.text, this.knownSecrets());
+      if ("error" in content) {
+        this.log(`[zulip] ${session.role}: queued owner notice dropped: ${content.error}`);
+        notices.shift();
+        touched = true;
+        continue;
+      }
+      try {
+        await session.post({ kind: "dm", userIds: [notice.userId] }, content.chunks);
+        session.state.dms.push(this.now());
+        inWindow++;
+        notices.shift();
+        touched = true;
+        this.log(`[zulip] ${session.role}: queued owner notice delivered to user ${notice.userId} (${notices.length} pending)`);
+      } catch (error) {
+        this.log(`[zulip] ${session.role}: queued owner notice resend failed: ${describe(error)}`);
+        break;
+      }
+    }
+    if (touched) {
+      session.markDirty();
+      session.save();
     }
   }
 
@@ -1798,6 +1837,25 @@ export class ZulipHub {
       const limit = this.budget("dmsPerHour");
       const lastHour = session.state.dms.filter((at) => now - at < 3600_000).length;
       if (lastHour >= limit) {
+        // The one recipient a refused DM must not silently drop: the owner.
+        // Queue the notice on the bot's persisted state; flushNotices sends
+        // it when the window resets.  The cap itself is unchanged - the
+        // resend counts against the same ledger.
+        const ownerId = this.ownerUserId();
+        if (ownerId !== undefined && target.target.userIds.length === 1 && target.target.userIds[0] === ownerId) {
+          if (session.state.notices.length >= PENDING_NOTICE_LIMIT) {
+            session.state.notices.shift();
+            this.log(`[zulip] ${session.role}: owner notice queue full, oldest dropped (dm_budget)`);
+          }
+          session.state.notices.push({ at: now, userId: ownerId, text: String(args.content ?? "") });
+          session.markDirty();
+          session.save();
+          this.log(`[zulip] ${session.role}: DM to user ${ownerId} refused (dm_budget), notice queued (${session.state.notices.length} pending)`);
+          return {
+            ok: false,
+            text: `Not posted now: this bot has sent ${lastHour} DMs in the last hour, its limit (zulip.budgets.dmsPerHour).  This notice to the owner is queued and will be sent when the window resets - NOT delivered yet.  Record the refusal in the registry row and do not treat the owner as notified until it lands.`,
+          };
+        }
         this.log(`[zulip] ${session.role}: DM to user ${target.target.userIds.join(", ")} refused (dm_budget)`);
         return {
           ok: false,

@@ -15,6 +15,10 @@
 //   - `wakes` and `chains`  the budget and loop-guard ledgers.
 //   - `dms`      when each outbound DM that was not a reply went out: the
 //                per-bot DM rate limit's ledger.
+//   - `notices`  owner DMs refused by that rate limit, queued for resend when
+//                the window resets.  Persisted like every other ledger, so a
+//                restart cannot drop one; the text stays in this mode-600
+//                file, the same protection the DM ledger gets.
 
 import { chmodSync, closeSync, fsyncSync, mkdirSync, openSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -36,6 +40,15 @@ export interface ZulipWakeRecord {
   key: string;
 }
 
+/** An owner DM the hourly cap refused, held for resend after the window. */
+export interface ZulipPendingNotice {
+  at: number;
+  userId: number;
+  text: string;
+}
+
+export const PENDING_NOTICE_LIMIT = 50;
+
 export interface ZulipBotState {
   version: 1;
   role: string;
@@ -48,10 +61,12 @@ export interface ZulipBotState {
   chains: Record<string, number>;
   /** ms since the epoch of each DM sent that was not a reply to the origin. */
   dms: number[];
+  /** owner DMs refused by the DM-out cap, oldest first. */
+  notices: ZulipPendingNotice[];
 }
 
 export function emptyState(role: string): ZulipBotState {
-  return { version: 1, role, cursor: null, handled: [], pending: [], wakes: [], chains: {}, dms: [] };
+  return { version: 1, role, cursor: null, handled: [], pending: [], wakes: [], chains: {}, dms: [], notices: [] };
 }
 
 function fileName(botId: string): string {
@@ -100,6 +115,11 @@ const stateFileSchema = z.object({
   chains: z.record(z.string(), z.number()).catch({}),
   // Added after the first state files were written: absent reads as empty.
   dms: z.array(z.number()).optional().catch(undefined),
+  // Same: queued owner notices, absent on older files.
+  notices: z
+    .array(z.object({ at: z.number(), userId: z.number(), text: z.string().max(9500) }))
+    .optional()
+    .catch(undefined),
 });
 
 export class ZulipStateStore {
@@ -132,8 +152,8 @@ export class ZulipStateStore {
     if (savedRole !== role && canonicalZulipRole(savedRole) !== role) {
       return emptyState(role);
     }
-    const { userId, dms, ...rest } = parsed.data;
-    const state: ZulipBotState = { ...rest, role, dms: dms ?? [] };
+    const { userId, dms, notices, ...rest } = parsed.data;
+    const state: ZulipBotState = { ...rest, role, dms: dms ?? [], notices: notices ?? [] };
     if (userId !== undefined) state.userId = userId;
     return state;
   }
@@ -143,6 +163,7 @@ export class ZulipStateStore {
     if (state.handled.length > HANDLED_RING_LIMIT) state.handled = state.handled.slice(-HANDLED_RING_LIMIT);
     state.wakes = state.wakes.filter((w) => now - w.at < WAKE_LEDGER_MS).slice(-WAKE_LEDGER_LIMIT);
     state.dms = (state.dms ?? []).filter((at) => now - at < WAKE_LEDGER_MS).slice(-WAKE_LEDGER_LIMIT);
+    state.notices = (state.notices ?? []).slice(-PENDING_NOTICE_LIMIT);
     mkdirSync(this.dir, { recursive: true, mode: 0o700 });
     try {
       chmodSync(this.dir, 0o700);

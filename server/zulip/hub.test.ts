@@ -1022,6 +1022,31 @@ describe("DMs out", () => {
     await connected(again);
     expect(sessionOf(again).state.dms).toHaveLength(2);
   });
+
+  it("queues an owner DM refused by the hourly cap and delivers it after the window resets, across a restart", async () => {
+    settings.budgets = { dmsPerHour: 2 };
+    let offset = 0;
+    const hub = makeHub({ now: () => Date.now() + offset });
+    await connected(hub);
+    fake.postDm(PEER, [PLUMBER], "ping", "ZulipPython");
+    await waitFor(() => turns.length === 1, "the peer DM's wake");
+    expect((await dm(hub, JAY, "one")).ok).toBe(true);
+    expect((await dm(hub, JAY, "two")).ok).toBe(true);
+    const third = await dm(hub, JAY, "three");
+    expect(third.ok).toBe(false);
+    expect(third.text).toMatch(/queued and will be sent when the window resets - NOT delivered yet/);
+    expect(sessionOf(hub).state.notices).toHaveLength(1);
+    expect(fake.postsBy(PLUMBER)).toHaveLength(2);
+    // the queued notice survives a restart before the flush
+    await hub.stop();
+    const again = makeHub({ now: () => Date.now() + offset });
+    await connected(again);
+    expect(sessionOf(again).state.notices).toHaveLength(1);
+    offset = 61 * 60_000;
+    await waitFor(() => fake.postsBy(PLUMBER).length === 3, "the queued notice to flush after the window resets");
+    expect(sessionOf(again).state.notices).toHaveLength(0);
+    expect(logs.some((line) => line.includes("queued owner notice delivered"))).toBe(true);
+  });
 });
 
 describe("followed topics", () => {
@@ -1554,7 +1579,7 @@ describe("review fixes: the decided-message indexes", () => {
     };
     await waitFor(() => saved()?.handled?.length === 1, "the saved handled id");
     expect(Object.keys(saved()).sort()).toEqual(
-      ["chains", "cursor", "dms", "handled", "pending", "role", "userId", "version", "wakes"].sort(),
+      ["chains", "cursor", "dms", "handled", "notices", "pending", "role", "userId", "version", "wakes"].sort(),
     );
   });
 
