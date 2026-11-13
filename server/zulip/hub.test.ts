@@ -2913,4 +2913,39 @@ describe("review fixes: round 12 (reset counter carry, notice event keys, archiv
     expect(afterSecond.trimEnd().split("\n")).toHaveLength(firstLines * 2);
     await blockedAgain.stop();
   });
+
+  it("blocks the bot when the state path is a planted link to valid state", async () => {
+    const first = makeHub();
+    await connected(first);
+    sessionOf(first).markDirty();
+    sessionOf(first).save();
+    await first.stop();
+    const statePath = join(dataDir, "zulip", "bot-plumber.json");
+    const elsewhere = join(dataDir, "elsewhere-state.json");
+    writeFileSync(elsewhere, readFileSync(statePath, "utf8"));
+    rmSync(statePath);
+    symlinkSync(elsewhere, statePath);
+    // A planted link to VALID state elsewhere must not boot: the verified
+    // read refuses it and containment keeps the bot down and loud - it
+    // never starts with silently reset empty ledgers.
+    const blocked = makeHub();
+    await waitFor(() => logs.some((line) => line.includes("state load failed")), "the loud load failure");
+    expect(botStatus(blocked, "bot-plumber")).toBeUndefined();
+    await settle();
+    expect(turns).toHaveLength(0);
+    expect(fake.postsBy(PLUMBER)).toHaveLength(0);
+    // Nothing was proven, so nothing was quarantined: no archive growth,
+    // and the link target's bytes stand untouched.
+    expect(existsSync(join(dataDir, "zulip", "bot-plumber.notices-archive.jsonl"))).toBe(false);
+    expect(readFileSync(statePath, "utf8")).toBe(readFileSync(elsewhere, "utf8"));
+    await blocked.stop();
+    // Control: a genuinely ABSENT state file still starts empty - the same
+    // boundary that refuses a hostile path admits a first boot.
+    rmSync(statePath);
+    rmSync(elsewhere);
+    const fresh = makeHub();
+    await connected(fresh);
+    expect(sessionOf(fresh).state.handled).toEqual([]);
+    await fresh.stop();
+  });
 });
