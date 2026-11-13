@@ -1,7 +1,7 @@
 // The Zulip source end to end against a fake Zulip server: real HTTP, real
 // event queues, real files on disk, and a fake `startTurn` standing in for
 // the harness.  Each test boots its own fake realm and its own data folder.
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -11,7 +11,7 @@ import { FakeZulip } from "../testing/fake-zulip-server.ts";
 import { abortableSleep } from "./client.ts";
 import type { ZulipVaultLocation } from "./credentials.ts";
 import { ZulipHub, type ZulipHubDeps, type ZulipSession } from "./hub.ts";
-import { HANDLED_RING_LIMIT } from "./state.ts";
+import { HANDLED_RING_LIMIT, stateFileSchema } from "./state.ts";
 import type { ZulipMessage, ZulipSettings } from "./types.ts";
 
 const JAY = 9;
@@ -1142,7 +1142,13 @@ describe("DMs out", () => {
     sessionOf(hub).markDirty();
     sessionOf(hub).save();
     offset = 61 * 60_000;
-    await waitFor(() => fake.postsBy(PLUMBER).length === 2, "the content-free terminal alarm DM");
+    // The fake records the post before the hub's fetch resolves and the
+    // delivered notice is spliced: wait for the settled end state, not the
+    // mid-flight post count.
+    await waitFor(
+      () => fake.postsBy(PLUMBER).length === 2 && sessionOf(hub).state.notices.length === 1,
+      "the content-free terminal alarm DM and the delivered notice's removal",
+    );
     const notices = sessionOf(hub).state.notices;
     expect(notices).toHaveLength(1);
     expect(notices[0]!.failed).toMatch(/loaded Zulip credential/);
@@ -1199,9 +1205,10 @@ describe("DMs out", () => {
     await hub.stop();
     // corrupt one entry on disk, leave the others intact
     const file = join(dataDir, "zulip", "bot-plumber.json");
-    const stored = JSON.parse(readFileSync(file, "utf8"));
-    stored.notices.splice(1, 0, { at: "RAW_MARKER_XYZ", marker: "RAW_MARKER_XYZ" });
-    writeFileSync(file, JSON.stringify(stored));
+    const stored = stateFileSchema.parse(JSON.parse(readFileSync(file, "utf8")));
+    const storedNotices: unknown[] = [...(stored.notices ?? [])];
+    storedNotices.splice(1, 0, { at: "RAW_MARKER_XYZ", marker: "RAW_MARKER_XYZ" });
+    writeFileSync(file, JSON.stringify({ ...stored, notices: storedNotices }));
     const again = makeHub();
     await connected(again);
     const notices = sessionOf(again).state.notices;
@@ -1213,6 +1220,156 @@ describe("DMs out", () => {
     expect(archive).toMatch(/RAW_MARKER_XYZ/);
     expect(archive).toMatch(/schema-invalid-on-load/);
     expect(logs.join("\n")).not.toMatch(/RAW_MARKER_XYZ/);
+  });
+
+  it("a dry run never posts a held notice: it stays pending with no attempts burned", async () => {
+    settings.budgets = { dmsPerHour: 1 };
+    let offset = 0;
+    const hub = makeHub({ now: () => Date.now() + offset });
+    await connected(hub);
+    expect((await dm(hub, JAY, "visible one")).ok).toBe(true);
+    expect((await dm(hub, JAY, "held one")).ok).toBe(false);
+    expect(sessionOf(hub).state.notices).toHaveLength(1);
+    settings.dryRun = true;
+    offset = 61 * 60_000;
+    await new Promise((resolve) => setTimeout(resolve, 750));
+    expect(sessionOf(hub).state.notices).toHaveLength(1);
+    expect(sessionOf(hub).state.notices[0]!.attempts).toBe(0);
+    expect(fake.postsBy(PLUMBER)).toHaveLength(1);
+    settings.dryRun = false;
+    await waitFor(() => sessionOf(hub).state.notices.length === 0, "the held notice to flush once the dry run ends");
+    expect(fake.postsBy(PLUMBER)).toHaveLength(2);
+    await hub.stop();
+  });
+
+  it("a session that has not connected yet keeps notices pending without burning attempts", async () => {
+    settings.budgets = { dmsPerHour: 1 };
+    let offset = 0;
+    const hub = makeHub({ now: () => Date.now() + offset });
+    await connected(hub);
+    expect((await dm(hub, JAY, "visible")).ok).toBe(true);
+    expect((await dm(hub, JAY, "held")).ok).toBe(false);
+    expect(sessionOf(hub).state.notices).toHaveLength(1);
+    // SAFETY: the test simulates a session whose connect has not populated
+    // `me` yet; the field is private precisely so production cannot do this.
+    (sessionOf(hub) as { me?: unknown }).me = undefined;
+    offset = 61 * 60_000;
+    await new Promise((resolve) => setTimeout(resolve, 750));
+    expect(sessionOf(hub).state.notices).toHaveLength(1);
+    expect(sessionOf(hub).state.notices[0]!.attempts).toBe(0);
+    expect(fake.postsBy(PLUMBER)).toHaveLength(1);
+    await hub.stop();
+  });
+
+  it("keeps pruned terminal records in the state file when the archive append fails, loudly", async () => {
+    settings.budgets = { dmsPerHour: 0 };
+    const hub = makeHub();
+    await connected(hub);
+    const session = sessionOf(hub);
+    const now = Date.now();
+    for (let n = 0; n < 12; n++) {
+      session.state.notices.push({ at: now + n, userId: JAY, text: `terminal ${n}`, attempts: 8, failed: "gave up" });
+    }
+    mkdirSync(join(dataDir, "zulip", "bot-plumber.notices-archive.jsonl"), { recursive: true });
+    session.markDirty();
+    session.save();
+    expect(logs.some((line) => line.includes("notice archive failed"))).toBe(true);
+    expect(session.state.notices).toHaveLength(12);
+    await hub.stop();
+    const again = makeHub();
+    await connected(again);
+    expect(sessionOf(again).state.notices.filter((n) => n.failed)).toHaveLength(12);
+    expect(sessionOf(again).state.noticesArchived ?? 0).toBe(0);
+    await again.stop();
+  });
+
+  it("keeps held notices, loss counts, and the owner-DM cap ledger across a same-role Zulip-user change", async () => {
+    settings.budgets = { dmsPerHour: 1 };
+    const hub = makeHub();
+    await connected(hub);
+    expect((await dm(hub, JAY, "counted toward the cap")).ok).toBe(true);
+    expect((await dm(hub, JAY, "held through user change")).ok).toBe(false);
+    expect(sessionOf(hub).state.notices).toHaveLength(1);
+    await hub.stop();
+    const file = join(dataDir, "zulip", "bot-plumber.json");
+    const stored = stateFileSchema.parse(JSON.parse(readFileSync(file, "utf8")));
+    expect(stored.userId).toBe(PLUMBER);
+    expect(stored.dms).toHaveLength(1);
+    writeFileSync(file, JSON.stringify({ ...stored, userId: PLUMBER + 900_000, noticesArchived: 3 }));
+    const again = makeHub();
+    await connected(again);
+    const st = sessionOf(again).state;
+    expect(st.userId).toBe(PLUMBER);
+    expect(st.notices.map((n) => n.text)).toEqual(["held through user change"]);
+    expect(st.noticesArchived).toBe(3);
+    // The cap ledger carries over too: the reset must not reopen the
+    // owner's hourly window and let another DM straight through.
+    expect(st.dms).toHaveLength(1);
+    expect((await dm(again, JAY, "must not get through")).ok).toBe(false);
+    expect(sessionOf(again).state.notices.map((n) => n.text)).toEqual(["held through user change", "must not get through"]);
+    await again.stop();
+  });
+
+  it("quarantines a non-array notices field whole and counts it instead of erasing it", async () => {
+    settings.budgets = { dmsPerHour: 0 };
+    const hub = makeHub();
+    await connected(hub);
+    expect((await dm(hub, JAY, "good one")).ok).toBe(false);
+    await hub.stop();
+    const file = join(dataDir, "zulip", "bot-plumber.json");
+    const stored = stateFileSchema.parse(JSON.parse(readFileSync(file, "utf8")));
+    writeFileSync(file, JSON.stringify({ ...stored, notices: { bogus: "RAW_MARKER_NONARRAY" } }));
+    const again = makeHub();
+    await connected(again);
+    expect(sessionOf(again).state.notices).toHaveLength(0);
+    expect(sessionOf(again).state.noticesDroppedOnLoad).toBe(1);
+    const archive = readFileSync(join(dataDir, "zulip", "bot-plumber.notices-archive.jsonl"), "utf8");
+    expect(archive).toMatch(/RAW_MARKER_NONARRAY/);
+    expect(archive).toMatch(/schema-invalid-on-load/);
+    expect(logs.join("\n")).not.toMatch(/RAW_MARKER_NONARRAY/);
+    await again.stop();
+  });
+
+  it("quarantines a stored notice carrying unknown keys instead of silently dropping them", async () => {
+    settings.budgets = { dmsPerHour: 0 };
+    const hub = makeHub();
+    await connected(hub);
+    expect((await dm(hub, JAY, "good one")).ok).toBe(false);
+    await hub.stop();
+    const file = join(dataDir, "zulip", "bot-plumber.json");
+    const stored = stateFileSchema.parse(JSON.parse(readFileSync(file, "utf8")));
+    const notices: unknown[] = [...(stored.notices ?? [])];
+    notices.push({ at: Date.now(), userId: JAY, text: "sneaky", attempts: 0, unexpected: "RAW_MARKER_STRICT" });
+    writeFileSync(file, JSON.stringify({ ...stored, notices }));
+    const again = makeHub();
+    await connected(again);
+    expect(sessionOf(again).state.notices.map((n) => n.text)).toEqual(["good one"]);
+    expect(sessionOf(again).state.noticesDroppedOnLoad).toBe(1);
+    const archive = readFileSync(join(dataDir, "zulip", "bot-plumber.notices-archive.jsonl"), "utf8");
+    expect(archive).toMatch(/RAW_MARKER_STRICT/);
+    await again.stop();
+  });
+
+  it("refuses to append the notice archive through a symlink and keeps the pruned records", async () => {
+    settings.budgets = { dmsPerHour: 0 };
+    const hub = makeHub();
+    await connected(hub);
+    const session = sessionOf(hub);
+    const now = Date.now();
+    for (let n = 0; n < 12; n++) {
+      session.state.notices.push({ at: now + n, userId: JAY, text: `terminal ${n}`, attempts: 8, failed: "gave up" });
+    }
+    writeFileSync(join(dataDir, "attacker-target.jsonl"), "pre-existing\n");
+    symlinkSync(join(dataDir, "attacker-target.jsonl"), join(dataDir, "zulip", "bot-plumber.notices-archive.jsonl"));
+    session.markDirty();
+    session.save();
+    expect(logs.some((line) => line.includes("notice archive failed"))).toBe(true);
+    expect(readFileSync(join(dataDir, "attacker-target.jsonl"), "utf8")).toBe("pre-existing\n");
+    await hub.stop();
+    const again = makeHub();
+    await connected(again);
+    expect(sessionOf(again).state.notices.filter((n) => n.failed)).toHaveLength(12);
+    await again.stop();
   });
 
   it("archives pruned terminal records privately and counts them, never treating pruning as resolution", async () => {
@@ -1252,9 +1409,10 @@ describe("DMs out", () => {
     await hub.stop();
     // one invalid entry, and an unwritable archive path (a directory)
     const file = join(dataDir, "zulip", "bot-plumber.json");
-    const stored = JSON.parse(readFileSync(file, "utf8"));
-    stored.notices.push({ at: "RAW_MARKER_QQ", marker: "RAW_MARKER_QQ" });
-    writeFileSync(file, JSON.stringify(stored));
+    const stored = stateFileSchema.parse(JSON.parse(readFileSync(file, "utf8")));
+    const storedNotices: unknown[] = [...(stored.notices ?? [])];
+    storedNotices.push({ at: "RAW_MARKER_QQ", marker: "RAW_MARKER_QQ" });
+    writeFileSync(file, JSON.stringify({ ...stored, notices: storedNotices }));
     mkdirSync(join(dataDir, "zulip", "bot-plumber.notices-archive.jsonl"));
     const before = readFileSync(file, "utf8");
     const again = makeHub();

@@ -20,7 +20,7 @@
 //                restart cannot drop one; the text stays in this mode-600
 //                file, the same protection the DM ledger gets.
 
-import { chmodSync, closeSync, fsyncSync, mkdirSync, openSync, readFileSync, writeSync } from "node:fs";
+import { chmodSync, closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
 
 import { z } from "zod";
@@ -40,19 +40,6 @@ export interface ZulipWakeRecord {
   key: string;
 }
 
-/** An owner DM the hourly cap refused, held for resend after the window. */
-export interface ZulipPendingNotice {
-  at: number;
-  userId: number;
-  text: string;
-  /** resend attempts so far; drives the backoff in `nextAt`. */
-  attempts: number;
-  /** earliest ms epoch of the next resend try; undefined means as soon as the window allows. */
-  nextAt?: number;
-  /** terminal: why this notice can never be delivered.  Kept, not dropped:
-   *  the record is the durable evidence of the refused notice. */
-  failed?: string;
-}
 
 export const PENDING_NOTICE_LIMIT = 50;
 /** Terminal (never-deliverable) notice records kept as evidence. */
@@ -125,16 +112,19 @@ const unitSchema = z.object({
 /** One queued owner notice, parsed on its own so a single damaged entry can
  *  be quarantined (with its raw form preserved privately) instead of costing
  *  the whole ledger. */
-const noticeEntrySchema = z.object({
+export const noticeEntrySchema = z.object({
   at: z.number(),
   userId: z.number(),
   text: z.string().max(9500),
   attempts: z.number().int().nonnegative().catch(0),
   nextAt: z.number().optional().catch(undefined),
   failed: z.string().max(500).optional().catch(undefined),
-});
+}).strict();
 
-const stateFileSchema = z.object({
+/** An owner DM the hourly cap refused, held for resend after the window. */
+export type ZulipPendingNotice = z.infer<typeof noticeEntrySchema>;
+
+export const stateFileSchema = z.object({
   version: z.literal(1),
   role: z.string(),
   userId: z.number().optional().catch(undefined),
@@ -158,7 +148,10 @@ const stateFileSchema = z.object({
 export class ZulipStateStore {
   readonly dir: string;
 
-  constructor(dataDir: string) {
+  private readonly onArchiveError?: (message: string) => void;
+
+  constructor(dataDir: string, onArchiveError?: (message: string) => void) {
+    this.onArchiveError = onArchiveError;
     this.dir = join(dataDir, "zulip");
   }
 
@@ -186,17 +179,24 @@ export class ZulipStateStore {
     if (savedRole !== role && canonicalZulipRole(savedRole) !== role) {
       return emptyState(role);
     }
+    // Read the raw notices field before the schema view: a notices field
+    // that is not an array at all is lost to the schema in one piece (the
+    // whole field becomes undefined), and only the raw value can be
+    // quarantined and counted instead of silently erased.
+    const rawField: unknown = rawJson?.notices;
+    const nonArrayNotices = rawField !== undefined && rawField !== null && !Array.isArray(rawField);
+    const rawEntries: unknown[] = Array.isArray(rawField) ? rawField : [];
     const { userId, dms, notices, noticesDroppedOnLoad, ...rest } = parsed.data;
     const raw = notices ?? [];
     const valid = raw.filter((n): n is ZulipPendingNotice => n !== null);
     const state: ZulipBotState = { ...rest, role, dms: dms ?? [], notices: valid };
     if (userId !== undefined) state.userId = userId;
-    const droppedTotal = (noticesDroppedOnLoad ?? 0) + (raw.length - valid.length);
+    const droppedTotal = (noticesDroppedOnLoad ?? 0) + (raw.length - valid.length) + (nonArrayNotices ? 1 : 0);
     if (droppedTotal > 0) state.noticesDroppedOnLoad = droppedTotal;
     // Quarantine the raw invalid entries BEFORE any save can overwrite the
     // file: private, mode-600, never logged, never posted.
-    const rawEntries: unknown[] = Array.isArray(rawJson?.notices) ? rawJson.notices : [];
     const invalidRaw = rawEntries.filter((entry) => !noticeEntrySchema.safeParse(entry).success);
+    if (nonArrayNotices) invalidRaw.push(rawField);
     if (invalidRaw.length > 0) this.archive(botId, "schema-invalid-on-load", invalidRaw);
     return state;
   }
@@ -222,8 +222,28 @@ export class ZulipStateStore {
     }
     const path = join(this.dir, fileName(botId).replace(/\.json$/, ".notices-archive.jsonl"));
     const lines = entries.map((entry) => JSON.stringify({ archivedAt: Date.now(), reason, entry })).join("\n") + "\n";
-    const fd = openSync(path, "a", 0o600);
+    // Follow no link: a swapped archive path must never redirect the
+    // write.  Open with O_NOFOLLOW, then prove the handle is the same
+    // regular, single-link file the path still names - a race can swap it
+    // between the two checks, so handle and path must agree on dev + inode.
+    const fd = openSync(
+      path,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND | constants.O_NOFOLLOW,
+      0o600,
+    );
     try {
+      const handleStat = fstatSync(fd);
+      const pathStat = lstatSync(path);
+      if (
+        !handleStat.isFile() ||
+        !pathStat.isFile() ||
+        handleStat.nlink !== 1 ||
+        pathStat.nlink !== 1 ||
+        handleStat.dev !== pathStat.dev ||
+        handleStat.ino !== pathStat.ino
+      ) {
+        throw new Error(`archive path ${path} is not a plain single-link file; refusing to append`);
+      }
       writeSync(fd, lines);
       fsyncSync(fd);
     } finally {
@@ -255,8 +275,20 @@ export class ZulipStateStore {
       bounded = bounded.slice(-(PENDING_NOTICE_LIMIT + TERMINAL_NOTICE_LIMIT));
     }
     if (pruned.length > 0) {
-      this.archive(botId, "notice-record-pruned", pruned);
-      state.noticesArchived = (state.noticesArchived ?? 0) + pruned.length;
+      try {
+        this.archive(botId, "notice-record-pruned", pruned);
+        state.noticesArchived = (state.noticesArchived ?? 0) + pruned.length;
+      } catch (error) {
+        // Archival failed: the pruned records are NOT dropped - they stay in
+        // the ledger and the failure is loud, so no record is silently lost
+        // between the state file and the archive.
+        this.onArchiveError?.(
+          `notice archive failed for ${botId}; ${pruned.length} record(s) kept in the state file: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+        bounded = all;
+      }
     }
     state.notices = bounded;
     mkdirSync(this.dir, { recursive: true, mode: 0o700 });

@@ -631,8 +631,13 @@ class ZulipSession {
     this.me = { userId: me.user_id, fullName: String(me.full_name ?? this.role), email: this.creds!.email };
     if (this.state.userId !== undefined && this.state.userId !== me.user_id) {
       // Same role name, different Zulip user: the old cursor and ring
-      // describe another mailbox.  Keep nothing but the pending work.
-      this.state = { ...emptyState(this.role), pending: this.state.pending };
+      // describe another mailbox - but held owner notices, their loss
+      // counts, and the owner-DM cap ledger are not mailbox state, so they
+      // carry over.  Dropping `dms` would reopen the owner's hourly cap.
+      const prior = this.state;
+      this.state = { ...emptyState(this.role), pending: prior.pending, notices: prior.notices, dms: prior.dms };
+      if (prior.noticesDroppedOnLoad !== undefined) this.state.noticesDroppedOnLoad = prior.noticesDroppedOnLoad;
+      if (prior.noticesArchived !== undefined) this.state.noticesArchived = prior.noticesArchived;
       this.seedSeen();
     }
     this.state.userId = me.user_id;
@@ -861,7 +866,7 @@ export class ZulipHub {
 
   constructor(deps: ZulipHubDeps) {
     this.deps = deps;
-    this.store = new ZulipStateStore(deps.dataDir);
+    this.store = new ZulipStateStore(deps.dataDir, (message) => this.log(`[zulip] ${message}`));
     this.outgoingSpool = new ZulipOutgoingSpool(deps.dataDir);
     this.backoffMs = deps.timings?.backoffMs ?? BACKOFF_MS;
     this.postSpacingMs = deps.timings?.postSpacingMs ?? 3_000;
@@ -1617,12 +1622,16 @@ export class ZulipHub {
 
   private async flushNotices(session: ZulipSession): Promise<void> {
     this.reportNoticeLoss(session);
+    // A dry run posts nothing at all, and a session that has not
+    // connected yet must not burn resend attempts: leave notices pending.
+    if (this.stopped || this.dryRun() || !session.ready) return;
     const notices = session.state.notices;
-    if (this.stopped || notices.length === 0) return;
+    if (notices.length === 0) return;
     const limit = this.budget("dmsPerHour");
     let inWindow = session.state.dms.filter((at) => this.now() - at < 3600_000).length;
-    for (let i = 0; i < notices.length && inWindow < limit; ) {
-      const notice = notices[i]!;
+    let sent = 0;
+    for (let i = 0; i < session.state.notices.length && inWindow < limit && sent === 0; ) {
+      const notice = session.state.notices[i]!;
       if (notice.failed || (notice.nextAt !== undefined && this.now() < notice.nextAt)) {
         i++;
         continue;
@@ -1642,10 +1651,11 @@ export class ZulipHub {
         await session.post({ kind: "dm", userIds: [notice.userId] }, content.chunks);
         session.state.dms.push(this.now());
         inWindow++;
-        notices.splice(i, 1);
+        session.state.notices.splice(i, 1);
+        sent += 1;
         session.markDirty();
         session.save();
-        this.log(`[zulip] ${session.role}: queued owner notice delivered to user ${notice.userId} (${notices.filter((n) => !n.failed).length} pending)`);
+        this.log(`[zulip] ${session.role}: queued owner notice delivered to user ${notice.userId} (${session.state.notices.filter((n) => !n.failed).length} pending)`);
       } catch (error) {
         notice.attempts += 1;
         if (notice.attempts >= MAX_NOTICE_ATTEMPTS) {
