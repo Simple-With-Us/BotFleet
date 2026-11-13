@@ -253,12 +253,14 @@ final class BotExecutionPolicyTests: XCTestCase {
     }
 
     func testModelRiskFollowsTheDesktopsPatterns() {
-        for risky in ["claude-haiku-4-5", "gpt-4o-mini", "gemini-2.5-flash-lite", "Llama-3.1-8B", "qwen-14b", "o4-nano", "GPT-5.6-TERRA", ""] {
+        for risky in ["claude-haiku-4-5", "gpt-4o-mini", "gemini-2.5-flash-lite", "Llama-3.1-8B", "qwen-14b", "o4-nano", "DeepSeek-Flash", ""] {
             XCTAssertTrue(BypassModelRisk.isHighRisk(model: risky), risky)
         }
-        for sturdy in ["claude-sonnet-4-5", "claude-opus-4", "gpt-4o", "deepseek-r1", "grok-3", "MiniMax-M3"] {
+        for sturdy in ["claude-sonnet-4-5", "claude-opus-4", "gpt-4o", "deepseek-r1", "grok-3", "MiniMax-M3", "GPT-5.6-TERRA"] {
             XCTAssertFalse(BypassModelRisk.isHighRisk(model: sturdy), sturdy)
         }
         XCTAssertTrue(BypassModelRisk.isHighRisk(model: nil))
+        // The gpt-3.5 pattern still ships in highRiskPatterns; keep one fixture on it while it does.
+        XCTAssertTrue(BypassModelRisk.isHighRisk(model: "gpt-3.5-turbo"))
     }
 }

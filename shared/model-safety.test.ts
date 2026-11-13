@@ -28,6 +28,13 @@ describe("evaluateModelRiskForBypass", () => {
     }
   });
 
+  it("keeps the shipped gpt-3.5 high-risk pattern covered", () => {
+    // The gpt-3.5 entry still lives in HIGH_RISK_PATTERNS; keep one fixture on it while it does.
+    const evaluation = evaluateModelRiskForBypass("gpt-3.5-turbo");
+    expect(evaluation.isDangerous).toBe(true);
+    expect(evaluation.tier).toBe("high_risk");
+  });
+
   it("identifies frontier reasoning models as safe from high-risk warning", () => {
     const frontier = [
       "claude-3-5-sonnet-20241022",
