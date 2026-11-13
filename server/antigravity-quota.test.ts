@@ -148,7 +148,7 @@ describe("observed Antigravity catalog aliases", () => {
     const now = Date.now();
     const snapshot = parseAntigravityUsageJson({ models: [
       { modelId: "MODEL_PLACEHOLDER_M318", label: "Gemini 3.8 Flash (High)", remainingPercentage: 0, resetTime: new Date(now + 60_000).toISOString() },
-      { modelId: "MODEL_PLACEHOLDER_M35", label: "Claude Sonnet 4.6 (Thinking)", remainingPercentage: 1 },
+      { modelId: "MODEL_PLACEHOLDER_M35", label: "Claude Sonnet 5.5 (High)", remainingPercentage: 1 },
       { modelId: "MODEL_OPENAI_GPT_OSS_120B_MEDIUM", label: "GPT-OSS 120B (Medium)", remainingPercentage: 0 },
       { modelId: "MODEL_PLACEHOLDER_UNKNOWN", label: "Unknown future model", remainingPercentage: 0 },
     ] });
@@ -156,9 +156,9 @@ describe("observed Antigravity catalog aliases", () => {
     applyAntigravityUsageToRegistry(snapshot, registry, now);
     const primary = { instanceId: "antigravity", model: "gemini-3.8-flash-high", fallbacks: [
       { instanceId: "antigravity", model: "gpt-oss-120b-medium" },
-      { instanceId: "antigravity", model: "claude-sonnet-4-6" },
+      { instanceId: "antigravity", model: "claude-sonnet-5-5-high" },
     ] };
-    expect(registry.resolveModel("bot", primary, now)).toMatchObject({ isFallback: true, selection: { model: "claude-sonnet-4-6" } });
+    expect(registry.resolveModel("bot", primary, now)).toMatchObject({ isFallback: true, selection: { model: "claude-sonnet-5-5-high" } });
     expect(quotaModelsFromSnapshot(snapshot, now)[primary.model]?.capped).toBe(true);
     expect(registry.get("bot", "antigravity", "gemini-2.5-flash", now)).toBeUndefined();
     expect(registry.resolveModel("bot", primary, now + 60_001).isFallback).toBe(false);
