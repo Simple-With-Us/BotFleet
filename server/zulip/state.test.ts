@@ -59,6 +59,25 @@ describe("ZulipStateStore write-path policy", () => {
     }
   });
 
+  it("refuses when a dangling symlink sits above the data root", () => {
+    const base = mkdtempSync(join(tmpdir(), "zulip-store-dangling-ancestor-"));
+    symlinkSync(join(base, "no-such-target"), join(base, "link"));
+    const root = join(base, "link", "root");
+    try {
+      const store = new ZulipStateStore(root);
+      // The dangling link is an ANCESTOR of the configured root: lstat on
+      // the root itself fails too, so only walking the root's own
+      // components distinguishes this from a genuinely absent tree.  The
+      // load must refuse, never boot with silently reset ledgers; the
+      // save must refuse and create nothing.
+      expect(() => store.load("bot-plumber", "BF-Plumber")).toThrow();
+      expect(() => store.save("bot-plumber", emptyState("BF-Plumber"))).toThrow(/dangling|does not resolve to a directory/);
+      expect(existsSync(join(base, "no-such-target"))).toBe(false);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
   it("refuses a dangling symlinked data root instead of booting or saving empty", () => {
     const base = mkdtempSync(join(tmpdir(), "zulip-store-dangling-root-"));
     const root = join(base, "dangling-root");
@@ -70,7 +89,10 @@ describe("ZulipStateStore write-path policy", () => {
       // ledgers, and the save must refuse BEFORE creating anything.  No
       // root needed: realpathSync fails before any ownership check.
       expect(() => store.load("bot-plumber", "BF-Plumber")).toThrow();
-      expect(() => store.save("bot-plumber", emptyState("BF-Plumber"))).toThrow(/dangling/);
+      expect(() => store.save("bot-plumber", emptyState("BF-Plumber"))).toThrow(/dangling|does not resolve to a directory/);
+      // The refusal happens BEFORE any create: the link target tree is
+      // never materialized through the dangling link.
+      expect(existsSync(join(base, "no-such-target"))).toBe(false);
     } finally {
       rmSync(base, { recursive: true, force: true });
     }
@@ -89,7 +111,8 @@ describe("ZulipStateStore write-path policy", () => {
       expect(() => store.load("bot-plumber", "BF-Plumber")).toThrow();
       // The save side refuses through the same classifier, BEFORE any
       // create: a hostile path is never mkdir'd through or around.
-      expect(() => store.save("bot-plumber", emptyState("BF-Plumber"))).toThrow(/dangling/);
+      expect(() => store.save("bot-plumber", emptyState("BF-Plumber"))).toThrow(/dangling|does not resolve to a directory/);
+      expect(existsSync(join(base, "no-such-target"))).toBe(false);
     } finally {
       rmSync(base, { recursive: true, force: true });
     }

@@ -597,14 +597,33 @@ export class ZulipStateStore {
     try {
       canonicalRoot = realpathSync(this.dataRoot);
     } catch {
-      // A root that lstat sees but realpath cannot resolve is a DANGLING
-      // LINK: hostile, not absence.  Only a truly absent root is a fresh
-      // tree (save() self-creates it, then re-verifies unconditionally).
-      try {
-        lstatSync(this.dataRoot);
-      } catch {
-        return true;
+      // realpath failed: walk the root's OWN components from the
+      // filesystem root.  The first component lstat cannot see is genuine
+      // absence (a fresh tree, from there down); a component lstat sees
+      // but stat cannot resolve is a DANGLING LINK at or above the root -
+      // hostile, not absence.  Anything else (EACCES, ELOOP) refuses too.
+      let current: string = sep;
+      for (const part of this.dataRoot.split(sep)) {
+        if (!part) continue;
+        current = join(current, part);
+        let linkStat: Stats;
+        try {
+          linkStat = lstatSync(current);
+        } catch (error) {
+          // SAFETY: lstatSync failures carry .code; a missing component is
+          // genuine absence, anything else (EACCES, ELOOP) is not.
+          return (error as NodeJS.ErrnoException).code === "ENOENT";
+        }
+        if (linkStat.isSymbolicLink()) {
+          try {
+            statSync(current);
+          } catch {
+            return false;
+          }
+        }
       }
+      // Every component lstat-visible yet realpath failed (a link loop):
+      // refuse (safe side).
       return false;
     }
     const below = relative(this.dataRoot, statePath);
