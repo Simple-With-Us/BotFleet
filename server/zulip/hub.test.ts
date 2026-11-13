@@ -2608,20 +2608,37 @@ describe("review fixes: round 12 (reset counter carry, notice event keys, archiv
     await second.stop();
   });
 
-  it("quarantines an unparseable state file instead of silently starting fresh", async () => {
+  it("blocks the bot on an unparseable state file instead of reopening empty ledgers", async () => {
     const first = makeHub();
     await connected(first);
     sessionOf(first).markDirty();
     sessionOf(first).save();
     await first.stop();
-    writeFileSync(join(dataDir, "zulip", "bot-plumber.json"), "{ not json");
+    const statePath = join(dataDir, "zulip", "bot-plumber.json");
+    const original = readFileSync(statePath, "utf8");
+    writeFileSync(statePath, "{ not json");
     const second = makeHub();
-    await connected(second);
+    // Fail closed: the original is quarantined, the damaged file is left
+    // untouched byte-for-byte, and the session is refused - loud and
+    // content-free - rather than resumed with empty caps and no pending
+    // work.  No session, no turn, no send.
+    await waitFor(() => logs.some((line) => line.includes("state load failed")), "the loud load failure");
+    expect(logs.some((line) => line.includes("refusing to start with empty ledgers"))).toBe(true);
+    expect(botStatus(second, "bot-plumber")).toBeUndefined();
+    expect(readFileSync(statePath, "utf8")).toBe("{ not json");
+    await settle();
+    expect(turns).toHaveLength(0);
+    expect(fake.postsBy(PLUMBER)).toHaveLength(0);
     const archive = readFileSync(join(dataDir, "zulip", "bot-plumber.notices-archive.jsonl"), "utf8");
     expect(archive).toMatch(/state-unparseable-on-load/);
     expect(archive).toMatch(/not json/);
-    expect(sessionOf(second).state.stateQuarantinedOnLoad).toBe(1);
     await second.stop();
+    // Recovery: restore a valid file and the next start picks it up whole.
+    writeFileSync(statePath, original);
+    const third = makeHub();
+    await connected(third);
+    expect(sessionOf(third).state.userId).toBe(PLUMBER);
+    await third.stop();
   });
 
   it("fails closed with visibility when a known state field violates the schema", async () => {
@@ -2637,16 +2654,50 @@ describe("review fixes: round 12 (reset counter carry, notice event keys, archiv
     saved.role = 42;
     writeFileSync(statePath, `${JSON.stringify(saved)}\n`);
     const second = makeHub();
-    await connected(second);
-    // Nothing salvageable: fresh state, but the quarantine is archived,
-    // counted and reported - never a silent empty start.
-    expect(sessionOf(second).state.stateQuarantinedOnLoad).toBe(1);
+    // A malformed known field means the file cannot be trusted: the bot
+    // stays down and loud, the damaged file untouched, the original
+    // quarantined - the ledgers are never silently reopened empty.
+    await waitFor(() => logs.some((line) => line.includes("state load failed")), "the loud load failure");
+    expect(logs.some((line) => line.includes("refusing to start with empty ledgers"))).toBe(true);
+    expect(botStatus(second, "bot-plumber")).toBeUndefined();
+    expect(readFileSync(statePath, "utf8")).toContain('"role":42');
+    await settle();
+    expect(turns).toHaveLength(0);
+    expect(fake.postsBy(PLUMBER)).toHaveLength(0);
     const archive = readFileSync(join(dataDir, "zulip", "bot-plumber.notices-archive.jsonl"), "utf8");
     expect(archive).toMatch(/state-schema-invalid-on-load/);
-    await waitFor(
-      () => logs.some((line) => line.includes("state-file quarantine")),
-      "the content-free quarantine warning",
-    );
     await second.stop();
+  });
+
+  it("blocks the bot on version drift, preserving the original byte-for-byte", async () => {
+    const first = makeHub();
+    await connected(first);
+    sessionOf(first).markDirty();
+    sessionOf(first).save();
+    await first.stop();
+    const statePath = join(dataDir, "zulip", "bot-plumber.json");
+    const original = readFileSync(statePath, "utf8");
+    // SAFETY: the parsed state is only mutated field-by-field here; the
+    // strict schema revalidates every field on the next load.
+    const saved = JSON.parse(original) as { version?: unknown };
+    saved.version = 2;
+    writeFileSync(statePath, `${JSON.stringify(saved)}\n`);
+    const second = makeHub();
+    await waitFor(() => logs.some((line) => line.includes("state load failed")), "the loud load failure");
+    expect(logs.some((line) => line.includes("refusing to start with empty ledgers"))).toBe(true);
+    expect(botStatus(second, "bot-plumber")).toBeUndefined();
+    await settle();
+    expect(turns).toHaveLength(0);
+    expect(fake.postsBy(PLUMBER)).toHaveLength(0);
+    const archive = readFileSync(join(dataDir, "zulip", "bot-plumber.notices-archive.jsonl"), "utf8");
+    expect(archive).toMatch(/state-schema-invalid-on-load/);
+    expect(archive).toMatch(/"version":2/);
+    await second.stop();
+    // Recovery: restore the original and the bot comes back whole.
+    writeFileSync(statePath, original);
+    const third = makeHub();
+    await connected(third);
+    expect(sessionOf(third).state.userId).toBe(PLUMBER);
+    await third.stop();
   });
 });

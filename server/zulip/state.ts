@@ -140,9 +140,11 @@ const stateFileSchemaBase = z.object({
   // only, never the content: the durable flag that a load was lossy.  The
   // raw units themselves are preserved in the private archive file.
   pendingDroppedOnLoad: z.number().int().nonnegative().optional().catch(undefined),
-  // Loads that had to quarantine state data (unknown keys set aside, or a
-  // whole file too damaged to trust): a durable count, content-free, so the
-  // loss is reported on the next drain instead of vanishing with the file.
+  // Loads that had to quarantine unknown top-level keys while keeping the
+  // valid ledgers: a durable count, content-free, so the drift is reported
+  // on the next drain instead of vanishing with the file.  (A file too
+  // damaged to trust never reaches a fresh state at all - load() throws and
+  // the bot stays down and loud; see below.)
   stateQuarantinedOnLoad: z.number().int().nonnegative().optional().catch(undefined),
 });
 
@@ -182,14 +184,16 @@ export class ZulipStateStore {
     try {
       rawJson = JSON.parse(text);
     } catch {
-      // A state file that does not parse at all cannot be salvaged:
-      // quarantine the raw text privately and fail closed - the fresh state
-      // carries the durable quarantine counter so the loss is reported
-      // content-free on the next drain instead of vanishing silently.
+      // A state file that does not parse at all cannot be salvaged, and a
+      // fresh state would silently reopen the caps and drop pending work:
+      // quarantine the raw text privately, then REFUSE the load.  The
+      // session constructor throws, per-bot containment keeps this bot down
+      // and loud (state file untouched) while the others run, and the next
+      // reconcile retries.
       this.archive(botId, "state-unparseable-on-load", [text]);
-      const fresh = emptyState(role);
-      fresh.stateQuarantinedOnLoad = 1;
-      return fresh;
+      throw new Error(
+        `state file for ${botId} is not parseable JSON; original quarantined to the private notices archive; refusing to start with empty ledgers`,
+      );
     }
     let parsed = stateFileSchema.safeParse(rawJson);
     let quarantinedUnknownKeys = false;
@@ -219,10 +223,13 @@ export class ZulipStateStore {
         parsed = salvaged;
         quarantinedUnknownKeys = true;
       } else {
+        // A known field violating the schema means the file cannot be
+        // trusted: quarantine it and refuse the load rather than resuming
+        // with empty caps and no pending work.  Same containment as above.
         this.archive(botId, "state-schema-invalid-on-load", [rawJson]);
-        const fresh = emptyState(role);
-        fresh.stateQuarantinedOnLoad = 1;
-        return fresh;
+        throw new Error(
+          `state file for ${botId} failed schema validation (a known field is malformed); original quarantined to the private notices archive; refusing to start with empty ledgers`,
+        );
       }
     }
     const savedRole = parsed.data.role;
