@@ -622,4 +622,41 @@ describe("summarizeFleetAttention", () => {
     expect(summary.totalUnread).toBe(2); // the bot once, plus room-b's chat
     expect(summary.roomsWithUnread).toBe(1);
   });
+
+  it("counts a room-less dead or errored bot once in the fleet error total", () => {
+    // bot-orphan and bot-flagged belong to no room: their failures are
+    // real but land in no room error list.  The fleet pill still counts
+    // each of them once.
+    const groups = [room("room-a", ["bot-member"])];
+    const bots: MinimalBot[] = [
+      { id: "bot-member", name: "Member", activity: "idle" },
+      { id: "bot-orphan", name: "Orphan", activity: "dead" },
+      { id: "bot-flagged", name: "Flagged", activity: "idle", hasError: true },
+    ];
+
+    const rooms = computeRoomAttentionIndex(groups, bots);
+    expect(rooms[0].errors.count).toBe(0);
+
+    const summary = summarizeFleetAttention(rooms, bots);
+    expect(summary.totalErrors).toBe(2);
+    expect(summary.roomsWithErrors).toBe(0);
+  });
+
+  it("counts a waiting bot claimed by a room busy marker only as working", () => {
+    // room-a's busyBotId names bot-split, whose raw activity is an
+    // unattributed wait.  The busy marker already counts it working; the
+    // fleet union must not also add it to needs action.
+    const groups = [room("room-a", ["bot-split"], { busyBotId: "bot-split" })];
+    const bots: MinimalBot[] = [
+      { id: "bot-split", name: "Split", activity: "waiting-on-you" },
+    ];
+
+    const rooms = computeRoomAttentionIndex(groups, bots);
+    expect(rooms[0].working.count).toBe(1);
+    expect(rooms[0].needsAction.count).toBe(0);
+
+    const summary = summarizeFleetAttention(rooms, bots);
+    expect(summary.totalWorking).toBe(1);
+    expect(summary.totalNeedsAction).toBe(0);
+  });
 });

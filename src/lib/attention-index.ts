@@ -334,8 +334,8 @@ export function computeRoomAttentionIndex(
  * in every room it belongs to), so the totals here count each bot once per
  * state, matched by `botId`, and each unread room chat once.  The `rooms*`
  * fields stay per room: how many rooms are affected.  Callers pass the
- * fleet bots so a wait or turn that owns no room (a 1:1, or one the server
- * never attributed) still counts once in the totals.
+ * fleet bots so a wait, turn, or failure that owns no room (a 1:1, or one
+ * the server never attributed) still counts once in the totals.
  */
 export function summarizeFleetAttention(
   attentionList: readonly RoomAttention[],
@@ -370,8 +370,24 @@ export function summarizeFleetAttention(
   // anywhere in the fleet, so union the direct activity states in.
   for (const bot of bots ?? []) {
     if (bot.hidden) continue;
-    if (bot.activity === "waiting-on-you") needsActionBotIds.add(bot.id);
-    if (bot.activity === "working") workingBotIds.add(bot.id);
+    // Errors: mirror the room predicate so a dead or failed bot that owns
+    // no room still counts once in the fleet total.
+    if (
+      bot.activity === "dead" ||
+      bot.hasError ||
+      messageIsTurnError(visibleAttentionTail(bot.messages, bot.activeLeafId))
+    ) {
+      errorBotIds.add(bot.id);
+    }
+    // A room may already count the bot as working through busyBotId while
+    // its raw activity is a wait (or vice versa through a stale wait
+    // thread): each bot counts once per pill.
+    if (bot.activity === "waiting-on-you" && !workingBotIds.has(bot.id)) {
+      needsActionBotIds.add(bot.id);
+    }
+    if (bot.activity === "working" && !needsActionBotIds.has(bot.id)) {
+      workingBotIds.add(bot.id);
+    }
   }
 
   return {
