@@ -1,6 +1,6 @@
 import { chmodSync, existsSync, lstatSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { describe, expect, it } from "vitest";
 import { ZulipStateStore, emptyState, stateFileSchema } from "./state.ts";
 
@@ -54,6 +54,21 @@ describe("ZulipStateStore write-path policy", () => {
       const store = new ZulipStateStore(root);
       store.save("bot-plumber", emptyState("BF-Plumber"));
       expect(existsSync(join(root, "zulip", "bot-plumber.json"))).toBe(true);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a dangling symlink above a RELATIVE data root", () => {
+    const base = mkdtempSync(join(tmpdir(), "zulip-store-rel-dangling-"));
+    symlinkSync(join(base, "no-such-target"), join(base, "link"));
+    const root = relative(process.cwd(), join(base, "link", "root"));
+    try {
+      const store = new ZulipStateStore(root);
+      // A relative configured root resolves against the process cwd; the
+      // dangling-link classification must inspect THAT path, not a
+      // same-named tree under the filesystem root.
+      expect(() => store.load("bot-plumber", "BF-Plumber")).toThrow();
     } finally {
       rmSync(base, { recursive: true, force: true });
     }

@@ -21,7 +21,7 @@
 //                file, the same protection the DM ledger gets.
 
 import { closeSync, constants, fchmodSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, statSync, writeSync, type Stats } from "node:fs";
-import { dirname, join, relative, sep } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 
 import { z } from "zod";
 
@@ -603,7 +603,10 @@ export class ZulipStateStore {
       // but stat cannot resolve is a DANGLING LINK at or above the root -
       // hostile, not absence.  Anything else (EACCES, ELOOP) refuses too.
       let current: string = sep;
-      for (const part of this.dataRoot.split(sep)) {
+      // resolve() anchors a RELATIVE configured root at the process cwd:
+      // the walk must inspect the path the store actually uses, not a
+      // same-named tree under the filesystem root.
+      for (const part of resolve(this.dataRoot).split(sep)) {
         if (!part) continue;
         current = join(current, part);
         let linkStat: Stats;
