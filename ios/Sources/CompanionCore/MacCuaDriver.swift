@@ -787,8 +787,16 @@ public final class MacCuaDriver: @unchecked Sendable {
                 return false
             }
             // The grant can be taken away mid-drag, so every step re-checks it
-            // instead of relying on the check that opened the drag.
-            guard desktopControlIsAuthorized() else { return false }
+            // instead of relying on the check that opened the drag. A revoked
+            // grant must release the held button the way emergencyStop() does,
+            // so the physical mouse is never left stuck down.
+            guard desktopControlIsAuthorized() else {
+                stateLock.lock()
+                let releasePoint = _lastCursorPosition
+                stateLock.unlock()
+                _ = mouseUp(at: releasePoint, button: button)
+                return false
+            }
 
             if stepDelayMs > 0 {
                 if !sleepInterruptibly(milliseconds: stepDelayMs, generation: startGeneration) {
@@ -907,6 +915,9 @@ public final class MacCuaDriver: @unchecked Sendable {
         // extended scripts) is a surrogate pair and both halves must ride in a
         // single CGEvent or the character is corrupted.
         for character in text {
+            // The grant can be revoked mid-typing, so re-check it per character
+            // the way drag re-checks per step instead of relying on the opening check.
+            guard desktopControlIsAuthorized() else { return false }
             guard isGenerationActive(startGeneration) else {
                 return false
             }
