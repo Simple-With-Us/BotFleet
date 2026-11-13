@@ -215,7 +215,6 @@ export class ZulipStateStore {
     }
     let parsed = stateFileSchema.safeParse(rawJson);
     let quarantinedUnknownKeys = false;
-    let driftArchived = false;
     if (!parsed.success) {
       // Two failure classes.  Unknown top-level keys ALONE (the lenient
       // base still parses): quarantine the unsupported fields privately and
@@ -240,20 +239,26 @@ export class ZulipStateStore {
             "state-unknown-keys-on-load",
             unknownEntries.map(([key, value]) => ({ key, value })),
           );
-          // Only now may the load repair-persist below: the drift has a
-          // durable private copy, so rewriting the file loses no evidence.
-          driftArchived = true;
         } catch (error) {
-          // The valid ledgers are kept either way: an unwritable archive
-          // must not turn into a permanent outage.  The original file is
-          // NOT rewritten (it is the only copy of the drift), the failure
-          // is loud, and the next load retries the quarantine.
+          // Fail closed.  Resuming with the cleaned in-memory state would
+          // let the next ordinary save strip the unsupported keys from
+          // disk while no durable copy exists anywhere - silent loss.  So
+          // an unwritable archive refuses the load instead: the original
+          // file stays byte-identical, per-bot containment keeps the bot
+          // down and loud, and the next reconcile retries the quarantine.
+          // The counter and repair-persist below are only reached after
+          // the quarantine here has durably succeeded.
           this.onArchiveError?.(
-            `unknown-key quarantine failed for ${botId}; valid ledgers kept, original file left untouched for retry: ${
+            `unknown-key quarantine failed for ${botId}; original file left byte-identical for retry: ${
               error instanceof Error ? error.message : String(error)
             }`,
           );
+          throw new Error(
+            `state file for ${botId} carries unsupported fields and the quarantine archive is unwritable; refusing to start so the next ordinary save cannot strip them before they are durably archived; original left untouched`,
+          );
         }
+        // Only now may the load repair-persist below: the drift has a
+        // durable private copy, so rewriting the file loses no evidence.
         parsed = salvaged;
         quarantinedUnknownKeys = true;
       } else {
@@ -339,12 +344,12 @@ export class ZulipStateStore {
     const invalidPending = rawPendingEntries.filter((entry) => !unitSchema.safeParse(entry).success);
     if (nonArrayPending) invalidPending.push(rawPendingField);
     if (invalidPending.length > 0) this.archive(botId, "schema-invalid-on-load", invalidPending);
-    if (quarantinedUnknownKeys && driftArchived) {
+    if (quarantinedUnknownKeys) {
       // Repair-persist: the rewritten file carries neither the quarantined
       // keys nor a reason to quarantine them again, so the incident is
-      // archived exactly once and the counter survives.  Skipped entirely
-      // when the quarantine write failed - the original file is then the
-      // only copy of the drift and the next load retries.
+      // archived exactly once and the counter survives.  Only reached
+      // after the drift quarantine above has durably succeeded; a failed
+      // quarantine refused the load before this point.
       this.save(botId, state);
     }
     return state;

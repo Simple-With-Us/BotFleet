@@ -2717,6 +2717,51 @@ describe("review fixes: round 12 (reset counter carry, notice event keys, archiv
     await third.stop();
   });
 
+  it("fails the load closed when the drift quarantine archive is unwritable", async () => {
+    const first = makeHub();
+    await connected(first);
+    sessionOf(first).markDirty();
+    sessionOf(first).save();
+    await first.stop();
+    const statePath = join(dataDir, "zulip", "bot-plumber.json");
+    const withDrift = `${JSON.stringify(Object.assign(stateFileSchema.parse(JSON.parse(readFileSync(statePath, "utf8"))), { surpriseFutureField: { experimental: true } }))}\n`;
+    writeFileSync(statePath, withDrift);
+    // The state path stays writable; only the archive write fails (a
+    // directory sits where the archive file belongs).
+    const archivePath = join(dataDir, "zulip", "bot-plumber.notices-archive.jsonl");
+    mkdirSync(archivePath);
+    const blocked = makeHub();
+    await waitFor(() => logs.some((line) => line.includes("state load failed")), "the loud load failure");
+    expect(logs.some((line) => line.includes("unknown-key quarantine failed"))).toBe(true);
+    expect(botStatus(blocked, "bot-plumber")).toBeUndefined();
+    await settle();
+    expect(turns).toHaveLength(0);
+    expect(fake.postsBy(PLUMBER)).toHaveLength(0);
+    // The original stays byte-identical - no ordinary save may strip the
+    // drift before it is durably archived - across a repeated reconcile.
+    expect(readFileSync(statePath, "utf8")).toBe(withDrift);
+    await blocked.stop();
+    const blockedAgain = makeHub();
+    await waitFor(
+      () => logs.filter((line) => line.includes("state load failed")).length >= 2,
+      "the repeated loud failure",
+    );
+    expect(readFileSync(statePath, "utf8")).toBe(withDrift);
+    await blockedAgain.stop();
+    // Repair the archive path: the next boot quarantines the drift exactly
+    // once, keeps every known ledger, counts it, and repair-persists.
+    rmSync(archivePath, { recursive: true, force: true });
+    const third = makeHub();
+    await connected(third);
+    expect(sessionOf(third).state.userId).toBe(PLUMBER);
+    expect(sessionOf(third).state.stateQuarantinedOnLoad).toBe(1);
+    const archive = readFileSync(archivePath, "utf8");
+    expect(archive).toMatch(/state-unknown-keys-on-load/);
+    expect(archive).toMatch(/surpriseFutureField/);
+    expect(readFileSync(statePath, "utf8")).not.toContain("surpriseFutureField");
+    await third.stop();
+  });
+
   it("blocks the bot when a known ledger is damaged instead of silently resetting it", async () => {
     const first = makeHub();
     await connected(first);
