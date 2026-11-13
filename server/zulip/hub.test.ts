@@ -1,7 +1,7 @@
 // The Zulip source end to end against a fake Zulip server: real HTTP, real
 // event queues, real files on disk, and a fake `startTurn` standing in for
 // the harness.  Each test boots its own fake realm and its own data folder.
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -2922,7 +2922,13 @@ describe("review fixes: round 12 (reset counter carry, notice event keys, archiv
     await first.stop();
     const statePath = join(dataDir, "zulip", "bot-plumber.json");
     const elsewhere = join(dataDir, "elsewhere-state.json");
-    writeFileSync(elsewhere, readFileSync(statePath, "utf8"));
+    // Capture the genuine bytes BEFORE planting anything: the post-boot
+    // checks compare against this snapshot, never the link against its
+    // own target.  This read is fixture setup in our own mkdtemp tree,
+    // before any hostile shape exists.
+    const original = readFileSync(statePath, "utf8");
+    const originalParsed = stateFileSchema.parse(JSON.parse(original));
+    writeFileSync(elsewhere, original);
     rmSync(statePath);
     symlinkSync(elsewhere, statePath);
     // A planted link to VALID state elsewhere must not boot: the verified
@@ -2935,9 +2941,12 @@ describe("review fixes: round 12 (reset counter carry, notice event keys, archiv
     expect(turns).toHaveLength(0);
     expect(fake.postsBy(PLUMBER)).toHaveLength(0);
     // Nothing was proven, so nothing was quarantined: no archive growth,
-    // and the link target's bytes stand untouched.
+    // and the link target stands untouched - exact bytes against the
+    // pre-plant snapshot, both sides contract-valid and equal when parsed.
     expect(existsSync(join(dataDir, "zulip", "bot-plumber.notices-archive.jsonl"))).toBe(false);
-    expect(readFileSync(statePath, "utf8")).toBe(readFileSync(elsewhere, "utf8"));
+    const after = readFileSync(elsewhere, "utf8");
+    expect(after).toBe(original);
+    expect(stateFileSchema.parse(JSON.parse(after))).toEqual(originalParsed);
     await blocked.stop();
     // Control: a genuinely ABSENT state file still starts empty - the same
     // boundary that refuses a hostile path admits a first boot.
@@ -2947,5 +2956,29 @@ describe("review fixes: round 12 (reset counter carry, notice event keys, archiv
     await connected(fresh);
     expect(sessionOf(fresh).state.handled).toEqual([]);
     await fresh.stop();
+  });
+
+  it("blocks the bot when the state file is hard-linked to a second name", async () => {
+    const first = makeHub();
+    await connected(first);
+    sessionOf(first).markDirty();
+    sessionOf(first).save();
+    await first.stop();
+    const statePath = join(dataDir, "zulip", "bot-plumber.json");
+    const twin = join(dataDir, "elsewhere-hardlink.json");
+    // A second name for the same inode: the single-link refusal must keep
+    // shared fleet accounting out of the session, exactly like the
+    // planted-symlink half above.
+    linkSync(statePath, twin);
+    expect(statSync(statePath).nlink).toBe(2);
+    const blocked = makeHub();
+    await waitFor(() => logs.some((line) => line.includes("state load failed")), "the loud load failure");
+    expect(botStatus(blocked, "bot-plumber")).toBeUndefined();
+    await settle();
+    expect(turns).toHaveLength(0);
+    expect(fake.postsBy(PLUMBER)).toHaveLength(0);
+    expect(existsSync(join(dataDir, "zulip", "bot-plumber.notices-archive.jsonl"))).toBe(false);
+    await blocked.stop();
+    rmSync(twin);
   });
 });

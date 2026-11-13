@@ -247,7 +247,16 @@ export class ZulipStateStore {
       // state file starts empty (a fresh bot).  A hostile or unreadable
       // path fails closed through per-bot containment - it never silently
       // resets the ledgers.
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return emptyState(role);
+      // ENOENT splits two ways: a genuinely ABSENT tree or final file is
+      // a fresh bot, but a DANGLING ancestor link (lstat sees it, realpath
+      // or stat cannot resolve it) is a hostile path that must refuse
+      // rather than silently reset the ledgers.
+      if (
+        (error as NodeJS.ErrnoException).code === "ENOENT" &&
+        this.stateGenuinelyAbsent(statePath)
+      ) {
+        return emptyState(role);
+      }
       throw error;
     }
     let rawJson: unknown;
@@ -528,6 +537,13 @@ export class ZulipStateStore {
       // SAFETY: realpathSync failures carry .code; policy violations
       // thrown by verifyArchiveAncestors are plain Errors without one.
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      // A DANGLING root or component masquerades as ENOENT but is not
+      // absence: refuse it as a policy error so the ensure below cannot
+      // create through or around it.  Genuinely absent trees keep the
+      // fresh-root tolerance.
+      if (!this.stateGenuinelyAbsent(path)) {
+        throw new Error(`state-store path ${path} sits on a dangling link; refusing to create through it`);
+      }
     }
     this.ensureStateDir();
     // Re-verify UNCONDITIONALLY after creation: what exists now is what
@@ -570,6 +586,53 @@ export class ZulipStateStore {
         throw new Error(`state-store write ancestor ${current} is not a directory; refusing to write`);
       }
     }
+  }
+
+  /** True only when the state path is genuinely ABSENT: walking from the
+   *  canonical root, some component simply does not exist (a fresh tree -
+   *  save() self-creates it).  A component that lstat sees but stat cannot
+   *  resolve is a DANGLING LINK: a hostile path, not absence. */
+  private stateGenuinelyAbsent(statePath: string): boolean {
+    let canonicalRoot: string;
+    try {
+      canonicalRoot = realpathSync(this.dataRoot);
+    } catch {
+      // A root that lstat sees but realpath cannot resolve is a DANGLING
+      // LINK: hostile, not absence.  Only a truly absent root is a fresh
+      // tree (save() self-creates it, then re-verifies unconditionally).
+      try {
+        lstatSync(this.dataRoot);
+      } catch {
+        return true;
+      }
+      return false;
+    }
+    const below = relative(this.dataRoot, statePath);
+    if (below.startsWith("..")) return false;
+    let current = canonicalRoot;
+    for (const part of below.split(sep)) {
+      if (!part || part === ".") continue;
+      current = join(current, part);
+      let linkStat: Stats;
+      try {
+        linkStat = lstatSync(current);
+      } catch (error) {
+        // SAFETY: lstatSync failures carry .code; a missing component is
+        // genuine absence, anything else (EACCES, ELOOP) is not.
+        return (error as NodeJS.ErrnoException).code === "ENOENT";
+      }
+      if (linkStat.isSymbolicLink()) {
+        try {
+          statSync(current);
+        } catch {
+          // A link that does not resolve is dangling: hostile, not absent.
+          return false;
+        }
+      }
+    }
+    // Every component exists for lstat and resolves: the ENOENT came from
+    // a race after verification, not from absence.  Refuse (safe side).
+    return false;
   }
 
   /** Load-quarantine wrapper.  A bot blocked by a damaged state file

@@ -59,6 +59,25 @@ describe("ZulipStateStore write-path policy", () => {
     }
   });
 
+  // uid 0 only: planting a ROOT-OWNED dangling symlink (which the
+  // verifier's statSync then fails to resolve with ENOENT) needs root;
+  // non-root CI skips deterministically rather than passing vacuously.
+  it.skipIf(!process.getuid || process.getuid() !== 0)("refuses a root-owned dangling symlinked state directory", () => {
+    const base = mkdtempSync(join(tmpdir(), "zulip-store-dangling-"));
+    symlinkSync(join(base, "no-such-target"), join(base, "zulip"));
+    try {
+      const store = new ZulipStateStore(base);
+      // A dangling ancestor link is a hostile path: the load must refuse
+      // (per-bot containment), never boot with silently reset ledgers.
+      expect(() => store.load("bot-plumber", "BF-Plumber")).toThrow();
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  // uid 0 only: creating the ROOT-OWNED symlink this case accepts (the
+  // /var -> /private/var pattern) needs root; non-root CI skips
+  // deterministically rather than passing vacuously.
   it.skipIf(!process.getuid || process.getuid() !== 0)("accepts a root-owned symlinked state directory", () => {
     const target = mkdtempSync(join(tmpdir(), "zulip-store-dirlink-"));
     const base = mkdtempSync(join(tmpdir(), "zulip-store-base-"));
