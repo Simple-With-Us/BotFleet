@@ -286,6 +286,9 @@ describe("BoxAgentDriver snapshot without a Box token", () => {
         hidden: true,
         reason: expect.stringContaining("no Box token"),
       });
+      // the agent runs on the box and asks nothing here; auto-review can
+      // only watch the work events it reports
+      expect(instance.adapter.capabilities.reviewHook).toBe("after");
     } finally {
       await instance.dispose();
       if (previous !== undefined) env.BOX_TOKEN = previous;

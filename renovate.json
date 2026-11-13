@@ -5,16 +5,89 @@
   "minimumReleaseAge": "5 days",
   "packageRules": [
     {
+      "description": [
+        "Grouped non-major bumps share one pnpm-lock.yaml.",
+        "PR #919 showed Renovate can collapse a 0.x root importer and a 1.x fumadocs entry into a single 1.x resolution that breaks `pnpm install --frozen-lockfile` on CI.",
+        "Run the same frozen install CI uses after the lockfile is regenerated so a bad graph fails the bot update instead of every required context."
+      ],
       "matchUpdateTypes": ["minor", "patch", "pin", "digest"],
       "groupName": "non-major dependencies",
       "automerge": true,
       "automergeType": "pr",
-      "platformAutomerge": true
+      "platformAutomerge": true,
+      "postUpgradeTasks": {
+        "commands": ["pnpm install --frozen-lockfile"],
+        "fileFilters": ["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", "**/package.json"],
+        "executionMode": "branch"
+      }
     },
     {
+      "description": [
+        "Major version dependency updates are never auto-merged: the new line may drop APIs the harness, electron, or iOS code still calls, change required peer dependencies, or shift platform/runtime minimums.",
+        "The PR body below lists the verification recipe the reviewer must run before merge; the Renovate dashboard entry is the linked task."
+      ],
       "matchUpdateTypes": ["major"],
+      "prBodyTemplate": "## Major dependency update: `{{depName}}` {{currentVersion}} -> {{newVersion}}\n\nThis is a major version bump of `{{depName}}`.\n\n### Why this requires manual review\n\nMajor versions may include breaking API changes, dropped APIs the codebase still calls, new peer-dependency requirements, or shifted runtime minimums. Renovate does not auto-merge major bumps (see `renovate.json`).\n\n### Acceptance criteria\n\n- [ ] `pnpm install` resolves cleanly with no new peer-dependency warnings\n- [ ] `pnpm typecheck` passes\n- [ ] `pnpm test` passes\n- [ ] Release notes reviewed; any breaking change in code paths this repo exercises is either patched here or called out in the PR description\n- [ ] For Electron/iOS-native bumps: `pnpm package:mac:local` (or the matching iOS path) still builds\n\n### Verification recipe\n\nRun the commands above in an isolated checkout, then arm auto-merge once CI is green. Document any deviations from the new package's release notes in the PR comments.",
       "automerge": false,
       "labels": ["dependencies", "major"]
+    },
+    {
+      "description": [
+        "Fleet compatibility guard (OPS-1063, owner 2026-11-10): a repo on typescript 5.x or older stays there.",
+        "Renovate keeps proposing typescript 7 to repos whose toolchains cannot take it; repos already on 7 (like BotFleet) are exempt through matchCurrentVersion.",
+        "Copy the guard rules into any repo where the suggestion cannot land."
+      ],
+      "matchPackageNames": ["typescript"],
+      "matchCurrentVersion": "/^[\\^~v]?[0-5]([.!+~-]|$)/",
+      "allowedVersions": "<6"
+    },
+    {
+      "description": [
+        "Fleet compatibility guard: a repo that has deliberately moved to the typescript 6 line stays on it until a human opens 7."
+      ],
+      "matchPackageNames": ["typescript"],
+      "matchCurrentVersion": "/^[\\^~v]?6([.!+~-]|$)/",
+      "allowedVersions": "<7"
+    },
+    {
+      "description": [
+        "Fleet compatibility guard: a repo on node 18 through 25 never sees node 26+ suggestions.",
+        "Owner 2026-11-10: node 26 proposals keep landing where the deployed runtime or platform cannot take them.",
+        "Covers the dockerfile and nvm managers; repos already on 26 or newer are exempt."
+      ],
+      "matchPackageNames": ["node"],
+      "matchManagers": ["dockerfile", "nvm"],
+      "matchCurrentVersion": "/^v?(1[89]|2[0-5])([.!-]|$)/",
+      "allowedVersions": "!/^(v?)(2[6-9]|[3-9][0-9])/"
+    },
+    {
+      "description": [
+        "Fleet compatibility guard: @types/node tracks the runtime major, so the same boundary applies to the typings."
+      ],
+      "matchPackageNames": ["@types/node"],
+      "matchCurrentVersion": "/^(1[89]|2[0-5])([.!-]|$)/",
+      "allowedVersions": "<26"
+    },
+    {
+      "description": [
+        "@trycua/cua-driver is pinned in several places that must move together in one deliberate PR:",
+        "package.json (this SDK), scripts/prepare-cua.mjs (CUA_RELEASE: the macOS executable asset and its sha256), server/container-computer.ts (CUA_DRIVER_VERSION and the Linux wheel URLs and hashes for the Local VM image), and server/remote-computer.ts (REMOTE_CUA_VERSION and the same wheels for the VPS driver).",
+        "The Linux desktop binary in scripts/cua-linux-release.mjs is pinned separately and is not part of this bump.",
+        "A bare package.json bump broke the Mac packaging step in #919, so Renovate must never raise it on its own.",
+        "This rule stays last so it overrides the non-major grouping rule above."
+      ],
+      "matchPackageNames": ["@trycua/cua-driver"],
+      "enabled": false
+    },
+    {
+      "description": [
+        "@xmldom/xmldom must stay on the 0.8 line.",
+        "electron-builder's plist parsing (through the plist package) calls DOMParser.parseFromString without a mimeType, which xmldom 0.9 requires, so packaging fails with 'the provided mimeType \"undefined\" is not valid'.",
+        "#919 moved the pnpm override in package.json to 0.9.12 and broke the Mac build.",
+        "Lift this cap only in a PR that proves electron-builder packages on the newer line."
+      ],
+      "matchPackageNames": ["@xmldom/xmldom", "@xmldom/xmldom@*"],
+      "allowedVersions": "<0.9"
     }
   ],
   "vulnerabilityAlerts": { "labels": ["security"] }

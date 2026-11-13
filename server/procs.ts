@@ -61,6 +61,41 @@ import type { Readable, Writable } from "node:stream";
 import { join } from "node:path";
 import { resolveCliSpawn, type ResolvedSpawn } from "./env-path.ts";
 
+/** Rewrites the environment a child CLI is about to receive.  Returns the
+ * environment to use, or `undefined` to leave the caller's options alone. */
+export type SpawnEnvTransform = (env: NodeJS.ProcessEnv | undefined) => NodeJS.ProcessEnv | undefined;
+
+let spawnEnvTransform: SpawnEnvTransform | undefined;
+
+/** The harness registers its in-memory config here once at boot (Infisical
+ * Agent Proxy routing, server/config.ts `applyAgentProxyEnv`).  procs.ts must
+ * not import config.ts: the shipped mcp-gate and mcp-remote-proxy helpers
+ * bundle this module for `killCliTree`, and config.ts drags the whole harness
+ * graph (Sentry, the packaged build identity) into those bundles.  `undefined`
+ * clears the transform. */
+export function setSpawnEnvTransform(transform: SpawnEnvTransform | undefined): void {
+  spawnEnvTransform = transform;
+}
+
+let spawnEnvTransformFailureLogged = false;
+
+function withSpawnEnv<T extends { env?: NodeJS.ProcessEnv }>(opts: T): T {
+  let env: NodeJS.ProcessEnv | undefined;
+  try {
+    env = spawnEnvTransform?.(opts.env);
+  } catch (error) {
+    // A misbehaving transform must not wedge every spawn and probe: the child
+    // runs with the caller's own environment, and the failure is named once
+    // (the message only, never the environment).
+    if (!spawnEnvTransformFailureLogged) {
+      spawnEnvTransformFailureLogged = true;
+      console.warn(`procs: spawn environment transform failed, spawning with the caller's environment: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    return opts;
+  }
+  return env === undefined ? opts : { ...opts, env };
+}
+
 export function resolveCli(cli: string, args: string[] = []): ResolvedSpawn {
   return resolveCliSpawn(cli, args);
 }
@@ -72,7 +107,7 @@ export function spawnCli(
 ): ChildProcessByStdio<Writable, Readable, Readable> {
   const resolved = resolveCli(cli, args);
   const child = spawn(resolved.command, resolved.args, {
-    ...opts,
+    ...withSpawnEnv(opts),
     // posix: own process group so kill(-pid) reaps child MCP servers;
     // win32: taskkill /T does the reaping instead (see killCliTree)
     ...(process.platform === "win32" ? { windowsHide: true } : { detached: true }),
@@ -117,7 +152,7 @@ export function execCli(
   // that is genuinely still running.
   const softTimeout = typeof opts.timeout === "number" && opts.timeout > 0 ? opts.timeout : 0;
   const killSignal = opts.killSignal ?? "SIGTERM";
-  const execOpts: ExecFileOptions = { ...opts };
+  const execOpts: ExecFileOptions = { ...withSpawnEnv(opts) };
   delete execOpts.timeout;
   let settled = false;
   let timedOut = false;
@@ -422,6 +457,102 @@ export function killCliTree(child: ChildProcess): void {
       /* already gone */
     }
   }
+}
+
+/** How often a CLI's process group is re-probed once its leader has exited
+ * and members are still alive in it.  See `trackCliGroup`. */
+export const CLI_GROUP_WATCH_MS = 50;
+
+/** A spawned CLI's process group, signalled only while this driver can still
+ * show that `-pid` names it. */
+export interface CliGroup {
+  /** Whether `-pid` still names this CLI's own process group. */
+  readonly owned: boolean;
+  /** Signal every member of the group if, and only if, it is still owned.
+   * Returns whether a signal was delivered. */
+  signal(sig: NodeJS.Signals): boolean;
+}
+
+/** Track ownership of the process group `spawnCli` gave a CLI (POSIX).
+ *
+ * `spawnCli` starts every CLI detached, so its pid is also its process group
+ * id and `kill(-pid)` reaches the CLI and every MCP server it spawned.  That
+ * id stays this CLI's only as long as nothing else can hold it, and POSIX
+ * forbids reusing a pid while a process group with that id still exists.  So
+ * ownership is continuity:
+ *
+ *   - while the leader is unreaped (alive, or a zombie), the id is ours;
+ *   - when the leader is reaped, the group is probed in the same tick as the
+ *     `exit` event (no other JS runs between libuv's waitpid and that
+ *     emit).  An empty group ends ownership for good: the pid is free and a
+ *     later `-pid` could name an unrelated, recycled group;
+ *   - a group with members left (a SIGTERM-ignoring MCP descendant, the
+ *     wedge that holds a session lock) stays owned, and is re-probed every
+ *     `CLI_GROUP_WATCH_MS` until it empties.  The first empty probe ends
+ *     ownership, and `signal` re-probes before every send.
+ *
+ * The one gap left is a group that empties AND has its id recycled into a
+ * new group inside a single watch interval, which needs the whole pid space
+ * to wrap in 50 ms.  Signalling on a timer without any of this (the
+ * previous shape) left that gap open for the whole timer.
+ *
+ * On Windows there are no process groups (`killCliTree` uses taskkill /T):
+ * `owned` is false and `signal` never sends, so callers keep their own
+ * win32 path. */
+export function trackCliGroup(child: ChildProcess): CliGroup {
+  const pid = child.pid;
+  const leaderAlive = () => child.exitCode === null && child.signalCode === null;
+  let owned = process.platform !== "win32" && !!pid && leaderAlive();
+  let watch: ReturnType<typeof setInterval> | null = null;
+  const disown = () => {
+    owned = false;
+    if (watch) clearInterval(watch);
+    watch = null;
+  };
+  /** True while the group still provably exists as this CLI's.  Any error
+   * (ESRCH: empty; EPERM: a group we cannot signal, so not ours) disowns. */
+  const probe = (): boolean => {
+    if (!owned || !pid) return false;
+    if (leaderAlive()) return true;
+    try {
+      process.kill(-pid, 0);
+      return true;
+    } catch {
+      disown();
+      return false;
+    }
+  };
+  if (owned) {
+    child.once("exit", () => {
+      if (!probe()) return;
+      watch = setInterval(probe, CLI_GROUP_WATCH_MS);
+      watch.unref?.();
+    });
+  }
+  return {
+    get owned() {
+      return owned;
+    },
+    signal(sig) {
+      if (!pid || !probe()) return false;
+      try {
+        process.kill(-pid, sig);
+        return true;
+      } catch {
+        // The group vanished between the probe and the send.  While the
+        // leader is unreaped its own pid is still safe to signal directly.
+        if (!leaderAlive()) {
+          disown();
+          return false;
+        }
+        try {
+          return child.kill(sig);
+        } catch {
+          return false;
+        }
+      }
+    },
+  };
 }
 
 /** Per-turn broker channel: unix socket on POSIX, named pipe on Windows

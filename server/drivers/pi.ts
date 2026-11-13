@@ -55,6 +55,7 @@ import type {
   SendTurnInput,
 } from "../contracts.ts";
 import { EFFORT_LEVELS, newEventId, newId } from "../contracts.ts";
+import { cliLoginEnvironment, launchedChildEnvironment, primeCliLogin } from "../cli-logins.ts";
 import {
   decodeInjectId,
   encodeInjectId,
@@ -457,7 +458,13 @@ function piEnvironment(source: Record<string, string | undefined>): Record<strin
 
 export const PiDriver: ProviderDriver<PiConfig> = {
   driverKind: DRIVER_KIND,
-  metadata: { displayName: "pi", supportsMultipleInstances: true, access: "custom" },
+  metadata: {
+    displayName: "pi",
+    supportsMultipleInstances: true,
+    access: "custom",
+    // Mirrors the `capabilities` block in `create` below.
+    channelWiring: { agentsMcp: true, computerMcp: true, composioMcp: true, localComputerMcp: true, images: true },
+  },
   install: {
     command: {
       darwin: "npm install -g @earendil-works/pi-coding-agent",
@@ -515,6 +522,11 @@ export const PiDriver: ProviderDriver<PiConfig> = {
 
     const sendTurn = async (turn: SendTurnInput) => {
       const { threadId } = turn;
+      // The seat's CLI login is read in the BACKGROUND, and the read is started
+      // here, before the guard:  the guard and the registration that follows it
+      // have to stay free of `await`, or a second turn on this thread would walk
+      // through the guard the first one already passed.
+      primeCliLogin(turn.launchIdentity?.seat);
       if (active.has(threadId)) throw new Error("a turn is already running on this thread");
       // Host control always routes through the permission card: the
       // pi-mcp-extension gates every `local-computer` scoped call behind
@@ -558,16 +570,22 @@ export const PiDriver: ProviderDriver<PiConfig> = {
       // spawnCli can throw synchronously (unresolvable CLI); if it does, the
       // 0600 temp file with the box token / composio key / comms token must
       // not be left on disk — settle() never runs because no child existed.
-      const child = (() => {
+      // The IIFE is async because the seat's CLI login is read before the
+      // spawn; the try still covers the spawn itself.
+      const child = await (async () => {
         try {
           return spawnCli(config.cli, childArgs, {
             stdio: ["pipe", "pipe", "pipe"],
             cwd: turn.cwd,
-            env: piEnvironment({
-              ...process.env,
-              ...input.environment,
-              ...(mcpServers && mcpTempDir ? { OMB_MCP_CONFIG: join(mcpTempDir, "mcp.json") } : {}),
-            }),
+            env: launchedChildEnvironment(
+              piEnvironment({
+                ...process.env,
+                ...input.environment,
+                ...(mcpServers && mcpTempDir ? { OMB_MCP_CONFIG: join(mcpTempDir, "mcp.json") } : {}),
+              }),
+              turn.launchIdentity,
+              cliLoginEnvironment(turn.launchIdentity?.seat),
+            ),
           });
         } catch (err) {
           if (mcpTempDir) {
@@ -1050,6 +1068,11 @@ export const PiDriver: ProviderDriver<PiConfig> = {
           // xhigh/max only land on models that expose them; pi rejects an
           // unsupported level and the turn keeps the engine default.
           effortLevels: EFFORT_LEVELS,
+          // pi core runs its own bash/edit/write without asking, in every
+          // mode (fullAuto changes nothing here); only host-control MCP calls
+          // reach a card, and auto-review never answers those.  Its steps do
+          // arrive as tool_execution_start, so review can watch them.
+          reviewHook: "after",
           // Jobs matrix: BotFleet's own job tools arrive through the same
           // pi-mcp-extension that already carries ask_bot, and the chain is
           // proven end to end in server/drivers/pi-jobs.test.ts — the real

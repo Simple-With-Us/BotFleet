@@ -2,7 +2,7 @@
   "reviewDate": "2026-09-09",
   "timezone": "America/Chicago",
   "sourceCommit": "121cb85aa3ebb85cb2d5b9233bc69838979a88f7",
-  "parentIssue": "https://github.com/jaywedgeworth22/BotFleet/issues/263",
+  "parentIssue": "https://github.com/Simple-With-Us/BotFleet/issues/263",
   "auditBoardId": "55bff4ee870442cb8aea8a0a6597c901",
   "scope": "Source audit and read-only live metadata; no paid inference, physical-phone acceptance or production changes.",
   "findings": [
@@ -22,7 +22,7 @@
         "Safe runtime snapshot: both runtimes 12 bots; 8799 five webhooks versus 18799 six"
       ],
       "issueNumber": 264,
-      "issueUrl": "https://github.com/jaywedgeworth22/BotFleet/issues/264",
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/264",
       "boardId": "f781c56d",
       "boardUrl": "https://mac.jays.services/board"
     },
@@ -39,7 +39,7 @@
         "electron/server-boot-probe.node-test.mjs:259-277 tests static attachment but not compatibility"
       ],
       "issueNumber": 265,
-      "issueUrl": "https://github.com/jaywedgeworth22/BotFleet/issues/265",
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/265",
       "boardId": "e4190ce1cd5e473eb5fee2957db86fc9",
       "boardUrl": "https://mac.jays.services/board"
     },
@@ -56,7 +56,7 @@
         "docs/audits/2026-08-31-full-stack-audit.md:139 notes broad empty catches; docs/audits/2026-08-31-full-stack-audit.md:66 covered a different hydrate patch-overlay race"
       ],
       "issueNumber": 266,
-      "issueUrl": "https://github.com/jaywedgeworth22/BotFleet/issues/266",
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/266",
       "boardId": "62a567333ee945999c908620023e0318",
       "boardUrl": "https://mac.jays.services/board"
     },
@@ -73,7 +73,7 @@
         "Board b9d541e9ec1d48308a9bc9504f9d75e7 covers the broader settings lane"
       ],
       "issueNumber": 267,
-      "issueUrl": "https://github.com/jaywedgeworth22/BotFleet/issues/267",
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/267",
       "boardId": "1ca6cb49c1404ffb901e390d29345353",
       "boardUrl": "https://mac.jays.services/board"
     },
@@ -92,7 +92,7 @@
         "docs/audits/2026-08-31-full-stack-audit.md:77 covered missing computer recovery cards, a separate issue"
       ],
       "issueNumber": 268,
-      "issueUrl": "https://github.com/jaywedgeworth22/BotFleet/issues/268",
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/268",
       "boardId": "5ee62380f70740bd9284702031f1e731",
       "boardUrl": "https://mac.jays.services/board"
     },
@@ -109,7 +109,7 @@
         "Live PagerDuty subscription metadata and non-mutating target GET; no incident generated"
       ],
       "issueNumber": 269,
-      "issueUrl": "https://github.com/jaywedgeworth22/BotFleet/issues/269",
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/269",
       "boardId": "0dd2ce223de84582934edc4518f8fc4e",
       "boardUrl": "https://mac.jays.services/board"
     },
@@ -126,7 +126,7 @@
         "Live desktop18799 /api/connectors/connected returns500; fetch failed"
       ],
       "issueNumber": 270,
-      "issueUrl": "https://github.com/jaywedgeworth22/BotFleet/issues/270",
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/270",
       "boardId": "0ade868cdc2a4593be27ce1e6c1e46dd",
       "boardUrl": "https://mac.jays.services/board"
     },
@@ -144,7 +144,7 @@
         "Live paired runtime RAG status comparison"
       ],
       "issueNumber": 271,
-      "issueUrl": "https://github.com/jaywedgeworth22/BotFleet/issues/271",
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/271",
       "boardId": "2d627f55",
       "boardUrl": "https://mac.jays.services/board"
     },
@@ -160,7 +160,7 @@
         "server/index.ts:7540-7571"
       ],
       "issueNumber": 272,
-      "issueUrl": "https://github.com/jaywedgeworth22/BotFleet/issues/272",
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/272",
       "boardId": "432930fc31424d8dabd0ef77f004c5f3",
       "boardUrl": "https://mac.jays.services/board"
     },
@@ -179,7 +179,7 @@
         "https://sentry.zendesk.com/hc/en-us/articles/27232675871771-Webhook-Request-is-Missing-Headers"
       ],
       "issueNumber": 273,
-      "issueUrl": "https://github.com/jaywedgeworth22/BotFleet/issues/273",
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/273",
       "boardId": "d141ec97b302409d93f316514478fcb0",
       "boardUrl": "https://mac.jays.services/board"
     },
@@ -196,7 +196,7 @@
         "docs/audits/2026-09-09-end-to-end-audit.md"
       ],
       "issueNumber": 274,
-      "issueUrl": "https://github.com/jaywedgeworth22/BotFleet/issues/274",
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/274",
       "boardId": "7e582b82679442faa5f8563a0ee3ae4a",
       "boardUrl": "https://mac.jays.services/board"
     },
@@ -214,7 +214,7 @@
         "server/harness/bus.ts:35-59"
       ],
       "issueNumber": 275,
-      "issueUrl": "https://github.com/jaywedgeworth22/BotFleet/issues/275",
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/275",
       "boardId": "46f08797c6e146469e9ed768aaf064c0",
       "boardUrl": "https://mac.jays.services/board"
     },
@@ -232,7 +232,7 @@
         "server/index.ts:1289-1312"
       ],
       "issueNumber": 276,
-      "issueUrl": "https://github.com/jaywedgeworth22/BotFleet/issues/276",
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/276",
       "boardId": "fbef84b20ea14ef68ff47322c0ae5add",
       "boardUrl": "https://mac.jays.services/board"
     },
@@ -249,7 +249,7 @@
         "Sanitized read-only runtime snapshot, summarized in the audit report."
       ],
       "issueNumber": 277,
-      "issueUrl": "https://github.com/jaywedgeworth22/BotFleet/issues/277",
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/277",
       "boardId": "adae362e0a544da7a5669d771af4f17d",
       "boardUrl": "https://mac.jays.services/board"
     },
@@ -266,7 +266,7 @@
         "server/drivers/claude.ts:686-707"
       ],
       "issueNumber": 278,
-      "issueUrl": "https://github.com/jaywedgeworth22/BotFleet/issues/278",
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/278",
       "boardId": "5344a9835c2648b5b96cb58bec81f122",
       "boardUrl": "https://mac.jays.services/board"
     },
@@ -281,7 +281,7 @@
         "server/drivers/grok.ts:183-219"
       ],
       "issueNumber": 279,
-      "issueUrl": "https://github.com/jaywedgeworth22/BotFleet/issues/279",
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/279",
       "boardId": "93839dda22d84857932b4bebff31f01c",
       "boardUrl": "https://mac.jays.services/board"
     },
@@ -299,7 +299,7 @@
         "server/drivers/codex.ts:534-557"
       ],
       "issueNumber": 280,
-      "issueUrl": "https://github.com/jaywedgeworth22/BotFleet/issues/280",
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/280",
       "boardId": "89a631729bf444f9bfe8da8b079bc55f",
       "boardUrl": "https://mac.jays.services/board"
     },
@@ -315,7 +315,7 @@
         "server/index.ts:1234-1240"
       ],
       "issueNumber": 281,
-      "issueUrl": "https://github.com/jaywedgeworth22/BotFleet/issues/281",
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/281",
       "boardId": "689d0f4eb3984292a441940f34ab52cd",
       "boardUrl": "https://mac.jays.services/board"
     },
@@ -332,7 +332,7 @@
         "server/index.ts:1949-1967"
       ],
       "issueNumber": 282,
-      "issueUrl": "https://github.com/jaywedgeworth22/BotFleet/issues/282",
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/282",
       "boardId": "ad5536b6440f42c69152443fa5a4d432",
       "boardUrl": "https://mac.jays.services/board"
     },
@@ -351,7 +351,7 @@
         "Sanitized read-only runtime snapshot, summarized in the audit report."
       ],
       "issueNumber": 188,
-      "issueUrl": "https://github.com/jaywedgeworth22/BotFleet/issues/188",
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/188",
       "boardId": "2784c3c7",
       "boardUrl": "https://mac.jays.services/board"
     },
@@ -371,7 +371,7 @@
         "Sanitized read-only runtime snapshot, summarized in the audit report."
       ],
       "issueNumber": 283,
-      "issueUrl": "https://github.com/jaywedgeworth22/BotFleet/issues/283",
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/283",
       "boardId": "09d689cb4a6f46bbb6e4988fecd7c284",
       "boardUrl": "https://mac.jays.services/board"
     },
@@ -387,7 +387,7 @@
         "No prompts or raw user output are included.  Follow-up depends on #264."
       ],
       "issueNumber": 284,
-      "issueUrl": "https://github.com/jaywedgeworth22/BotFleet/issues/284",
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/284",
       "boardId": "c0f364eab041404aa6bba35afc9a5bbf",
       "boardUrl": "https://mac.jays.services/board"
     },
@@ -399,12 +399,12 @@
       "fix": "Complete the existing release lane with the authorized signing credentials, publish the full updater feed and architecture-specific payloads, and verify check/download/signature/install on a disposable or explicitly approved device.  Expose app version, renderer build, harness commit, data owner, and API compatibility separately.  Do not infer release state from source version or CI success.",
       "confidence": "high for observed metadata; investigation required",
       "evidence": [
-        "https://github.com/jaywedgeworth22/BotFleet/releases/tag/v0.1.38",
-        "https://github.com/jaywedgeworth22/BotFleet/actions/runs/33822154040",
+        "https://github.com/Simple-With-Us/BotFleet/releases/tag/v0.1.38",
+        "https://github.com/Simple-With-Us/BotFleet/actions/runs/33822154040",
         "electron-builder.yml; electron/updater.mjs; existing board 5a2b2e02 comments."
       ],
       "issueNumber": 285,
-      "issueUrl": "https://github.com/jaywedgeworth22/BotFleet/issues/285",
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/285",
       "boardId": "5a2b2e02bf5c4debbc0559d2009032d0",
       "boardUrl": "https://mac.jays.services/board"
     },
@@ -421,7 +421,7 @@
         "Live BOTFLEET-EFFORT-LOG.md versus source docs/EFFORT-LOG.md at 121cb85a."
       ],
       "issueNumber": 286,
-      "issueUrl": "https://github.com/jaywedgeworth22/BotFleet/issues/286",
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/286",
       "boardId": "66958de400b04f9892a2bc9a14c71a09",
       "boardUrl": "https://mac.jays.services/board"
     },
@@ -439,7 +439,7 @@
         "ios/App/AgentProfileView.swift:230-299,453-480"
       ],
       "issueNumber": 93,
-      "issueUrl": "https://github.com/jaywedgeworth22/BotFleet/issues/93",
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/93",
       "boardId": "6ff6f3559eb242e5ada21d28e2143d7d",
       "boardUrl": "https://mac.jays.services/board"
     },
@@ -458,7 +458,7 @@
         "companion/src/routes.ts:73-78"
       ],
       "issueNumber": 93,
-      "issueUrl": "https://github.com/jaywedgeworth22/BotFleet/issues/93",
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/93",
       "boardId": "9af28de9bea9442db1ae0f1c01c78cca",
       "boardUrl": "https://mac.jays.services/board"
     },
@@ -477,7 +477,7 @@
         "ios/App/ChatListView.swift:75-85"
       ],
       "issueNumber": 287,
-      "issueUrl": "https://github.com/jaywedgeworth22/BotFleet/issues/287",
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/287",
       "boardId": "39f7be5ceb2e44a5afb58d12cb50eb32",
       "boardUrl": "https://mac.jays.services/board"
     },
@@ -493,7 +493,7 @@
         "ios/App/CompanionApp.swift:33-38,80-89"
       ],
       "issueNumber": 288,
-      "issueUrl": "https://github.com/jaywedgeworth22/BotFleet/issues/288",
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/288",
       "boardId": "18341d8cf54140edb2383eb3f2165219",
       "boardUrl": "https://mac.jays.services/board"
     },
@@ -509,7 +509,7 @@
         "server/index.ts:6118-6133,6159-6173,6790-6805,6994-7010,7028-7047"
       ],
       "issueNumber": 289,
-      "issueUrl": "https://github.com/jaywedgeworth22/BotFleet/issues/289",
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/289",
       "boardId": "118caef55b844c8dad0103894058c59f",
       "boardUrl": "https://mac.jays.services/board"
     },
@@ -526,7 +526,7 @@
         "server/index.ts:6150-6157,6825-6862"
       ],
       "issueNumber": 290,
-      "issueUrl": "https://github.com/jaywedgeworth22/BotFleet/issues/290",
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/290",
       "boardId": "4505f828facf4e179ee341a8b21b0c5c",
       "boardUrl": "https://mac.jays.services/board"
     },
@@ -543,7 +543,7 @@
         "companion/src/routes.ts:110-113"
       ],
       "issueNumber": 291,
-      "issueUrl": "https://github.com/jaywedgeworth22/BotFleet/issues/291",
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/291",
       "boardId": "ced11b511edd4cc7acac4496029e90e4",
       "boardUrl": "https://mac.jays.services/board"
     },
@@ -561,7 +561,7 @@
         "ios/App/AgentProfileView.swift:220-225,453-468"
       ],
       "issueNumber": 292,
-      "issueUrl": "https://github.com/jaywedgeworth22/BotFleet/issues/292",
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/292",
       "boardId": "1e36bd92d91447af8a7576cc9068c5f1",
       "boardUrl": "https://mac.jays.services/board"
     },
@@ -578,7 +578,7 @@
         "ios/App/GroupProfileView.swift:173-177"
       ],
       "issueNumber": 293,
-      "issueUrl": "https://github.com/jaywedgeworth22/BotFleet/issues/293",
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/293",
       "boardId": "f16194b9a2284a3dadd4d47e4a80ade1",
       "boardUrl": "https://mac.jays.services/board"
     },
@@ -594,7 +594,7 @@
         "ios/project.yml:110-144"
       ],
       "issueNumber": 294,
-      "issueUrl": "https://github.com/jaywedgeworth22/BotFleet/issues/294",
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/294",
       "boardId": "699ea1ae62564711992ff91ac5a75887",
       "boardUrl": "https://mac.jays.services/board"
     },
@@ -615,7 +615,7 @@
       "boardId": "2c27a6351b18472993007b0a9f86d24d",
       "boardUrl": "https://mac.jays.services/board",
       "issueNumber": 296,
-      "issueUrl": "https://github.com/jaywedgeworth22/BotFleet/issues/296"
+      "issueUrl": "https://github.com/Simple-With-Us/BotFleet/issues/296"
     }
   ],
   "dependencyAlerts": [

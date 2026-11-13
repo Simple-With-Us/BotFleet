@@ -31,10 +31,17 @@ function nvmBinDirs(): string[] {
 function knownDirs(): string[] {
   const home = homedir();
   return [
+    // Canonical installer dirs FIRST, before the ~/.local/bin symlink farm.
+    // The MiniMax Code installer drops a `~/.local/bin/mcode` symlink, but the
+    // launcher it points at resolves its own data dir from the parent of its
+    // own path — so invoked through the symlink it looks for `~/.local/current`
+    // and exits non-zero.  The canonical copy under `~/.minimax-code/bin` is
+    // the one that runs, and a GUI launch inherits a PATH with no mcode in it,
+    // so knownDirs order is the only thing that decides which one gets picked.
+    join(home, ".minimax-code", "bin"), // MiniMax Code CLI installer (mcode)
+    join(home, ".kimi-code", "bin"), // kimi-code installer
     join(home, ".local", "bin"), // claude installer default
     join(home, ".npm-global", "bin"), // npm prefix ~/.npm-global (claude, opencode)
-    join(home, ".kimi-code", "bin"), // kimi-code installer
-    join(home, ".minimax-code", "bin"), // MiniMax Code CLI installer (mcode)
     join(home, ".grok", "bin"), // x.ai installer
     join(home, ".opencode", "bin"), // opencode installer
     join(home, ".claude", "local"), // claude "local install"
@@ -79,6 +86,36 @@ let cached: string | null = null;
 let probed = false;
 let loginShellPath: string | null = null;
 
+/** Test hook — the well-known install dirs the merge adds, replaced wholesale
+ *  so a test can point the merge at its own fixture dirs.  `null` restores the
+ *  real list, and nothing but a test ever sets it.  Without it a host that has
+ *  a CLI installed in one of the real dirs (/usr/local/bin carries a `dsh` and
+ *  an `mcode` on some machines) answers a lookup that means to exercise a
+ *  fixture, and the suite's result depends on what the machine has installed
+ *  rather than on what the test planted. */
+let knownDirsOverride: readonly string[] | null = null;
+
+/** Point the merged PATH's known install dirs at `dirs` (or restore the real
+ *  list with `null`).  Test hook, like `resetPathCacheForTests` below:  the
+ *  cache is dropped with it, so the next `augmentedPath()` rebuilds the merge
+ *  from the new list. */
+export function setKnownDirsForTests(dirs: readonly string[] | null): void {
+  knownDirsOverride = dirs;
+  // The cache is dropped here and not through resetPathCacheForTests(),  which
+  // also drops the override:  setting the override and then resetting would
+  // cancel the setting.
+  clearPathCache();
+}
+
+/** Drop the memoized PATH and the login-shell probe.  The known install dirs
+ *  are not part of it:  they are an override,  and only the test hook and the
+ *  test reset touch them. */
+function clearPathCache(): void {
+  cached = null;
+  probed = false;
+  loginShellPath = null;
+}
+
 /** Drop the memoized PATH so the next augmentedPath() rescans. Called when
  * the app re-probes engines, so "check again" can find something installed
  * since launch instead of answering from the PATH we booted with. `probed`
@@ -105,7 +142,7 @@ export function augmentedPath(): string {
       // Both platforms scan their standard install locations; only the
       // login-shell probe below stays unix-only, since Windows has no
       // equivalent rc file to source.
-      ...(process.platform === "win32" ? windowsKnownDirs() : knownDirs()).filter((d) => existsSync(d)),
+      ...(knownDirsOverride ?? (process.platform === "win32" ? windowsKnownDirs() : knownDirs())).filter((d) => existsSync(d)),
     ]);
   }
   // belt-and-braces: fold in the login shell's PATH once, in the
@@ -118,8 +155,84 @@ export function augmentedPath(): string {
   return cached;
 }
 
+/** Installer dirs that must stay ahead of the `~/.local/bin` symlink farm,
+ * keyed by dir name and mapped to the CLI shim that installer drops into the
+ * farm.  The MiniMax Code installer drops a `~/.local/bin/mcode` symlink at
+ * a launcher that is not symlink-safe (it resolves its data dir from the
+ * parent of its own path, so through the symlink it reads
+ * `~/.local/current` and exits non-zero), and kimi-code symlinks `kimi` the
+ * same way.  Whichever copy comes first in PATH is the one that runs, so the
+ * canonical dir has to win when, and only when, the farm carries the shim. */
+const CANONICAL_INSTALLER_DIRS = {
+  ".minimax-code": "mcode",
+  ".kimi-code": "kimi",
+} as const satisfies Readonly<Record<string, string>>;
+
+/** Move a canonical installer dir ahead of `~/.local/bin` in a finished
+ * PATH, when the farm actually shadows that installer's CLI.  Ordering
+ * knownDirs() alone does not hold that precedence: `augmentedPath()` merges
+ * OMB_EXTRA_PATH, the inherited PATH and the login-shell probe AHEAD of
+ * knownDirs(), and any of those can carry `~/.local/bin`.  A GUI launch hits
+ * exactly that case, and every `resetPathCache()` (a rescan,
+ * `/api/cli-candidates`) rebuilds the merge with those sources first, so the
+ * symlink farm won again on the very next rebuild.  This runs on every
+ * merge, so the invariant holds whichever source supplied each dir.
+ *
+ * What the move does and does not change: a hoisted dir is inserted
+ * immediately ahead of the farm, so it jumps every entry that sat between
+ * the farm and its original slot.  When the farm leads PATH (the GUI-launch
+ * shape) that includes `/usr/bin`, `/usr/local/bin`, Homebrew and nvm bins,
+ * so any binary the canonical dir shares with one of those entries resolves
+ * differently afterwards.  That is why the move is gated rather than
+ * unconditional: it happens only when the farm carries the installer's shim
+ * (`~/.local/bin/mcode`, `~/.local/bin/kimi`) and the canonical dir carries
+ * the real CLI it shadows.  A machine whose farm has no such shim keeps its
+ * merged PATH order exactly, and a canonical dir that is absent from the
+ * merged list (uninstalled, or filtered out by knownDirs' existsSync) is
+ * never injected.
+ *
+ * The hoisted dir is dropped from its ORIGINAL position rather than left to
+ * appear twice: `mergePaths` dedupes before calling this, so a dir inserted
+ * ahead of the farm would otherwise also still be emitted when the walk
+ * reaches its old slot, and PATH would carry it twice.  `seen` is what makes
+ * each dir appear exactly once, hoisted position winning. */
+function promoteCanonicalDirs(parts: string[]): string[] {
+  const symlinkFarm = join(homedir(), ".local", "bin");
+  const farmIndex = parts.indexOf(symlinkFarm);
+  if (farmIndex === -1) return parts;
+  const toHoist = Object.entries(CANONICAL_INSTALLER_DIRS)
+    .map(([name, shim]) => ({ dir: join(homedir(), name, "bin"), shim }))
+    .filter(
+      ({ dir, shim }) =>
+        // Only a dir the farm currently outranks needs moving.  A dir
+        // already ahead of the farm keeps its inherited place, and a dir the
+        // merged list does not carry (indexOf -1) is never injected.
+        parts.indexOf(dir) > farmIndex &&
+        // Only when the farm really shadows this CLI, and the canonical dir
+        // really has the copy that should win.
+        existsSync(join(symlinkFarm, shim)) &&
+        existsSync(join(dir, shim)),
+    )
+    .map(({ dir }) => dir);
+  if (toHoist.length === 0) return parts;
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const part of parts) {
+    if (part === symlinkFarm) {
+      for (const dir of toHoist) {
+        out.push(dir);
+        seen.add(dir);
+      }
+    }
+    if (seen.has(part)) continue;
+    out.push(part);
+    seen.add(part);
+  }
+  return out;
+}
+
 function mergePaths(parts: string[]): string {
-  return [...new Set(parts.filter(Boolean))].join(delimiter);
+  return promoteCanonicalDirs([...new Set(parts.filter(Boolean))]).join(delimiter);
 }
 
 function probeLoginShellPath(): void {
@@ -142,24 +255,38 @@ function probeLoginShellPath(): void {
 
 /** Test hook — the cache is process-wide otherwise. */
 export function resetPathCacheForTests(): void {
-  cached = null;
-  probed = false;
-  loginShellPath = null;
+  clearPathCache();
+  // The known install dirs are an override,  and an override that outlives
+  // the case that set it redirects every later lookup in the process:  the
+  // global afterEach calls this function,  so clearing the override here is
+  // what makes one test's choice unable to become another test's environment.
+  knownDirsOverride = null;
 }
 
-/** Every `name` binary on the augmented PATH as absolute paths, in PATH
- * order (first = what a bare name would run). Used by the Engines panel's
- * "detected" dropdown and the /api/cli-candidates endpoint. A path-ish
- * name is echoed back as-is — it already IS a location.  Multiple PATH
- * entries that resolve to the same file (symlinks, copies installed by
- * different package managers that share an upstream tarball) are deduped
- * by inode after symlink resolution, keeping PATH order: a bare `grok`
- * invocation still hits the first match, and the picker only shows one
- * row for the actual binary the user has. */
-export function findCliCandidates(name: string): string[] {
-  if (!name || /[\n\r]/.test(name)) return [];
-  if (/[/\\]/.test(name) || /^[a-zA-Z]:/.test(name)) return [name];
-  const exts = process.platform === "win32" ? (process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean) : [""];
+/** A command name is searchable when it is a bare name: a path is already a
+ * location, and a newline would let one name smuggle a second into the join. */
+function isBareName(name: string): boolean {
+  return Boolean(name) && !/[\n\r]/.test(name) && !/[/\\]/.test(name) && !/^[a-zA-Z]:/.test(name);
+}
+
+/** A name that is already a location: it is handed back, never searched for.
+ * A newline disqualifies it — that value is never emitted at all. */
+function isExplicitCliPath(name: string): boolean {
+  return Boolean(name) && !/[\n\r]/.test(name) && (/[/\\]/.test(name) || /^[a-zA-Z]:/.test(name));
+}
+
+/** Executable suffixes this platform will resolve for a bare command. */
+function candidateExts(): string[] {
+  return process.platform === "win32"
+    ? (process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean)
+    : [""];
+}
+
+/** Every PATH entry holding `name`, in PATH order.  Deliberately does NOT
+ * dedupe: one search per name, then ONE dedupe across the union, so an alias
+ * that is a symlink to the default's binary still costs a single walk rather
+ * than a stat pass per name. */
+function searchNameOnPath(name: string, exts: string[]): string[] {
   const out: string[] = [];
   for (const dir of augmentedPath().split(delimiter)) {
     if (!dir) continue;
@@ -171,7 +298,50 @@ export function findCliCandidates(name: string): string[] {
       }
     }
   }
-  return dedupeByInode(out);
+  return out;
+}
+
+/** How many alias names one call will search.  Each name is a full PATH walk,
+ * so an unbounded list turns a single request into thousands of existsSync
+ * calls.  Real engines declare one or two aliases, so this sits far above any
+ * legitimate use while keeping the worst case bounded. */
+const CLI_ALIAS_LIMIT = 64;
+
+/** Absolute paths of every `name` binary on the augmented PATH, used by the
+ * Engines panel's "detected" dropdown and the /api/cli-candidates endpoint.
+ *
+ * A list searches the head (the driver's default binary) first and its aliases
+ * after it, each in PATH order, then dedupes by inode across the WHOLE union —
+ * so one engine offers every binary that runs it even when they do not share a
+ * name.  Clutch is the case that forced this: its driver default is `dsh`, but
+ * the Clutch-branded build is installed as `clutch` and is the one carrying
+ * Clutch's own profiles, so a single-name search made it invisible.
+ *
+ * Within one name the order is PATH order (first = what a bare invocation
+ * would run), and multiple PATH entries resolving to the same file (symlinks,
+ * copies installed by different package managers that share an upstream
+ * tarball) collapse to one row: the picker shows one row for the actual binary
+ * the user has.
+ *
+ * A head that is already a location is echoed back exactly as the scalar form
+ * has always echoed it, list or no list — `?name=/opt/dsh` must answer with
+ * that path whether or not an alias widened the query.  Later entries that
+ * are already locations are dropped instead: the caller asked about command
+ * names, and a row the user cannot re-pick is worse than no row. */
+export function findCliCandidates(name: string | string[]): string[] {
+  const exts = candidateExts();
+  if (Array.isArray(name)) {
+    const [head, ...rest] = name;
+    const out: string[] = [];
+    if (isExplicitCliPath(head)) out.push(head);
+    else if (isBareName(head)) out.push(...searchNameOnPath(head, exts));
+    const aliases = [...new Set(rest.filter(isBareName))].slice(0, CLI_ALIAS_LIMIT);
+    for (const alias of aliases) out.push(...searchNameOnPath(alias, exts));
+    return dedupeByInode(out);
+  }
+  if (isExplicitCliPath(name)) return [name];
+  if (!isBareName(name)) return [];
+  return dedupeByInode(searchNameOnPath(name, exts));
 }
 
 /** Keep the first occurrence of each unique target file. Symlinks, npm-global
@@ -279,7 +449,9 @@ function nodeExe(near: string): string | null {
   // make a stray node.cmd hide the real node.exe beside it.
   const onPath = whichWin("node.exe");
   if (onPath && extname(onPath).toLowerCase() === ".exe") return onPath;
-  return (process.versions as Record<string, string | undefined>).electron ? null : process.execPath;
+  // SAFETY: `process.versions.electron` is set only when this process is Electron, not plain Node.
+  const versions = process.versions as Record<string, string | undefined>;
+  return versions.electron ? null : process.execPath;
 }
 
 /** npm/pnpm .cmd shims all spell their target as "%dp0%\..." (or

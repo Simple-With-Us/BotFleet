@@ -2,6 +2,10 @@
 // problems.  Shared so every surface answers the same way.
 import type { InstanceInfo } from "@/state/store";
 
+export function showBuiltInOpenAiCompatible(configured: boolean, url?: string): boolean {
+  return Boolean(configured || url);
+}
+
 /** The last probe gave no answer (a CLI that did not respond in time on a
  *  busy Mac) and there is no earlier answer to stand in for it.  Not "not
  *  installed", not "sign-in required" — the next probe settles it. */
@@ -26,13 +30,13 @@ export function noEngineCanRun(instances: readonly Pick<InstanceInfo, "snapshot"
   );
 }
 
-/** Whether Settings → Engines lists this engine: CLI engines, MiniMax,
- *  OpenAI-compatible and custom engines — but not an optional integration
- *  nobody has set up (the ASCII.dev Box engine with no Box token). */
+/** Whether Settings → Engines lists this engine.  ASCII.dev Box is a computer
+ * provider and stays in Computer settings even though the runtime implements
+ * it through a driver. */
 export function listedInEnginesSettings(
   instance: Pick<InstanceInfo, "snapshot" | "cli" | "cliDefault" | "driverKind" | "isCustom">,
 ): boolean {
-  if (isHiddenEngine(instance)) return false;
+  if (instance.driverKind === "boxAgent" || isHiddenEngine(instance)) return false;
   return (
     instance.cli !== undefined ||
     instance.cliDefault !== undefined ||

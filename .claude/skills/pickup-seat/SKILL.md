@@ -33,24 +33,25 @@ git worktree list
 
 git for-each-ref --sort=-committerdate refs/remotes/origin --format='%(committerdate:short) %(refname:short) %(authorname)' | head -30
 
-AGENT_TAG="${AGENT_SEAT:?set MONET, CLAUDE, or RENOIR}" /usr/bin/python3 /Users/jay/apps/agent-sync-poll.py
+AGENT_SEAT="${AGENT_SEAT:?set MONET, CLAUDE, or RENOIR}" simple-chat read --channel Work-In-Progress --topic "<active work topic>" --json --limit 20
 ```
 
-Also read their last Slack claim and any living Apple Note titled `[APP, <Seat>] …`.
+Also read their last #Work-In-Progress claim and any living Apple Note titled `[APP, <Seat>] …`.
 
 ## CLAIM
 
 Post repo-first, naming exactly what you are taking:
 
 ```bash
-AGENT_TAG="${AGENT_SEAT:?set MONET, CLAUDE, or RENOIR}" /Users/jay/apps/agent-sync-websocket.py --post "[MONET-><SEAT>] sync-1
+printf '%s\n' "[MONET-><SEAT>] sync-1
 repo: <project>
 claim: picking up <SEAT> cap — effort + PR #<n>
 state: WIP
-do-not: double-work these lanes"
+do-not: double-work these lanes" > /tmp/claim-note.md && chmod 600 /tmp/claim-note.md
+AGENT_SEAT="${AGENT_SEAT:?set MONET, CLAUDE, or RENOIR}" simple-chat post --topic "<project> sync" --body-file /tmp/claim-note.md
 ```
 
-Put the same claim on THE BOARD (`board claim` or `board comment`) **and** on the live effort board + `docs/EFFORT-LOG.md`.  Live-only rows have been lost before.
+Put the same claim on Linear (`board claim` or `board comment`) **and** a Zulip post in the work topic.  Effort logs are archived — do not edit them.
 
 If they used `FLEET` incorrectly, do not echo it.  Directed `<SEAT>` is enough.
 
@@ -91,18 +92,18 @@ Answer disambiguation pings fast.  Cede lanes the returning seat re-claims, espe
 
 ## CLOSE OUT
 
-`closeout` skill: both effort boards, THE BOARD resolution, `docs/rollouts/YYYY-MM-DD-pickup-<seat>-cap.md`, Apple Note `[APP, Monet] pickup <seat> cap`, Slack summary.  Correct premature claims in place.  Never delete their row.
+`closeout` skill: Linear resolution, `docs/rollouts/YYYY-MM-DD-pickup-<seat>-cap.md`, Apple Note `[APP, Monet] pickup <seat> cap`, Slack summary.  Correct premature claims in place on Linear.
 
 ## Canon
 
-- `/Users/jay/apps/AGENT-SYNC.md` — handoff, seats, Mac local processes
+- `/Users/jay/apps/FLEET-PROTOCOL.md` — handoff, seats, Mac local processes
 - `/Users/jay/apps/EFFORT-LOG-PROTOCOL.md`
 - Skills: `session-start`, `board-ops`, `land-lane`, `unstick-pr`, `closeout`
 
 ## Substitute Agent Direct Slack Closeout `[SUB->ORIGINAL]`
 
 Once you finish taking over a peer agent's work (or reach a clean handoff point):
-1. **Send Direct Slack Message:** Post directly to `#agent-sync` addressed to the original agent:
+1. **Post to the coordination channel:** Post to `#Work-In-Progress` addressed to the original agent:
    ```text
    [<YOUR_TAG>-><ORIGINAL_TAG>]
    repo: <repo>

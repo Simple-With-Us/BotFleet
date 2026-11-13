@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { execFile } from "node:child_process";
+import { realpathSync } from "node:fs";
 import {
   chmod,
   copyFile,
@@ -14,10 +14,9 @@ import {
   writeFile,
 } from "node:fs/promises";
 import path from "node:path";
-import { promisify } from "node:util";
 import { gunzipSync } from "node:zlib";
+import { nativeProbeFailureMessage, probeNativeVersion } from "./native-version-probe.mjs";
 
-const run = promisify(execFile);
 const KIB = 1024;
 const MIB = KIB * KIB;
 const TAR_BLOCK_SIZE = 512;
@@ -28,6 +27,13 @@ export const LICENSE_FILES = Object.freeze([
   "THIRD_PARTY_NOTICES.md",
   "SBOM.cdx.json",
 ]);
+
+export const LINUX_CUA_PROBE_ENV = Object.freeze({
+  LANG: "C",
+  LC_ALL: "C",
+  CUA_DRIVER_RS_UPDATE_CHECK: "false",
+  CUA_DRIVER_RS_TELEMETRY_ENABLED: "false",
+});
 
 export const LINUX_CUA_RELEASE = Object.freeze({
   version: "0.19.3",
@@ -253,47 +259,90 @@ function releaseManifest() {
   });
 }
 
-async function binaryVersion(binary) {
-  const { stdout } = await run(binary, ["--version"], {
-    encoding: "utf8",
-    timeout: 5_000,
-    maxBuffer: 256 * KIB,
-    env: {
-      LANG: "C",
-      LC_ALL: "C",
-      CUA_DRIVER_RS_UPDATE_CHECK: "false",
-      CUA_DRIVER_RS_TELEMETRY_ENABLED: "false",
-    },
-  });
-  return stdout.trim();
+function linuxCuaSpawnOptions() {
+  return { env: { ...process.env, ...LINUX_CUA_PROBE_ENV } };
 }
 
-async function validateBinaryManifest(binary) {
-  const { stdout } = await run(binary, ["manifest"], {
-    encoding: "utf8",
-    timeout: 5_000,
-    maxBuffer: 256 * KIB,
-    env: {
-      LANG: "C",
-      LC_ALL: "C",
-      CUA_DRIVER_RS_UPDATE_CHECK: "false",
-      CUA_DRIVER_RS_TELEMETRY_ENABLED: "false",
-    },
+export function matchLinuxCuaDriverVersionLine(output) {
+  const line = String(output ?? "")
+    .split("\n")
+    .map((entry) => entry.trim())
+    .find((entry) => entry.startsWith("cua-driver "));
+  return line === `cua-driver ${LINUX_CUA_RELEASE.version}` ? LINUX_CUA_RELEASE.version : null;
+}
+
+export function probeLinuxCuaDriverVersion(binary, options = {}) {
+  return probeNativeVersion(binary, {
+    ...options,
+    args: ["--version"],
+    spawnOptions: { ...linuxCuaSpawnOptions(), ...options.spawnOptions },
+    matchVersion: matchLinuxCuaDriverVersionLine,
+    probeLabel: "CUA driver version probe",
   });
-  const manifest = JSON.parse(stdout);
+}
+
+export function linuxCuaDriverVersionFailureMessage(binary, probe) {
+  return nativeProbeFailureMessage(
+    `cua-driver at ${binary} did not identify as cua-driver ${LINUX_CUA_RELEASE.version}`,
+    probe,
+  );
+}
+
+export function matchLinuxCuaDriverManifest(output, driverRealpath) {
+  let manifest;
+  try {
+    manifest = JSON.parse(String(output ?? ""));
+  } catch {
+    return null;
+  }
   const invocationCommand = manifest.mcp_invocation?.command;
-  const invocationPath =
-    typeof invocationCommand === "string" && invocationCommand.length > 0
-      ? await realpath(invocationCommand).catch(() => null)
-      : null;
+  let invocationPath = null;
+  const commandText = invocationCommand == null ? "" : String(invocationCommand);
+  if (commandText.length > 0) {
+    try {
+      invocationPath = realpathSync(commandText);
+    } catch {
+      invocationPath = null;
+    }
+  }
   if (
     manifest.schema_version !== "1" ||
     manifest.binary_version !== LINUX_CUA_RELEASE.version ||
-    invocationPath !== (await realpath(binary)) ||
+    invocationPath !== driverRealpath ||
     JSON.stringify(manifest.mcp_invocation?.args) !== JSON.stringify(["mcp"])
   ) {
-    throw new Error("staged CUA Driver returned an incompatible manifest");
+    return null;
   }
+  return LINUX_CUA_RELEASE.version;
+}
+
+export function probeLinuxCuaDriverManifest(binary, driverRealpath, options = {}) {
+  const resolved = path.resolve(driverRealpath);
+  return probeNativeVersion(binary, {
+    ...options,
+    args: ["manifest"],
+    spawnOptions: { ...linuxCuaSpawnOptions(), ...options.spawnOptions },
+    matchVersion: (output) => matchLinuxCuaDriverManifest(output, resolved),
+    probeLabel: "CUA driver manifest probe",
+  });
+}
+
+export function linuxCuaDriverManifestFailureMessage(binary, probe) {
+  return nativeProbeFailureMessage(`cua-driver at ${binary} returned an incompatible manifest`, probe, {
+    causes: { version: () => "it ran but did not report a compatible manifest" },
+  });
+}
+
+async function binaryVersion(binary) {
+  const probe = probeLinuxCuaDriverVersion(binary);
+  if (!probe.ok) throw new Error(linuxCuaDriverVersionFailureMessage(binary, probe));
+  return `cua-driver ${probe.version}`;
+}
+
+async function validateBinaryManifest(binary) {
+  const driverRealpath = await realpath(binary);
+  const probe = probeLinuxCuaDriverManifest(binary, driverRealpath);
+  if (!probe.ok) throw new Error(linuxCuaDriverManifestFailureMessage(binary, probe));
 }
 
 export async function validateStagedLayout(stageDirectory) {

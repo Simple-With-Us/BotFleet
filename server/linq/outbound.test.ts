@@ -23,6 +23,7 @@ import {
   peekLinqChat,
   releaseLinqChat,
   rememberLinqChat,
+  sendLinqCommandReply,
 } from "./outbound.ts";
 
 afterEach(() => {
@@ -80,5 +81,41 @@ describe("Linq turn-scoped chat binding", () => {
     expect(second).toEqual({ sent: true });
     expect(linqSendMessage).toHaveBeenNthCalledWith(1, "chat-a", { text: "hello a" });
     expect(linqSendMessage).toHaveBeenNthCalledWith(2, "chat-b", { text: "hello b" });
+  });
+
+  it("masks a credential in a tagged reply before it is pushed to the phone", async () => {
+    // assembled at runtime so no token-shaped literal sits in the source
+    const key = ["sk", "-test-", "TESTONLY", "0123456789abcdef0123456789abcdef"].join("");
+    bindLinqChatToTurn("thread-1", "turn-a", "bot-1", "chat-a");
+    const result = await deliverLinqOutboundIfNeeded("thread-1", "bot-1", `[to iMessage]\nThe key is ${key}`, "turn-a");
+    expect(result).toEqual({ sent: true });
+    expect(linqSendMessage).toHaveBeenCalledWith(
+      "chat-a",
+      expect.objectContaining({ text: expect.stringContaining("The key is") }),
+    );
+    expect(linqSendMessage).toHaveBeenCalledWith(
+      "chat-a",
+      expect.objectContaining({ text: expect.not.stringContaining("TESTONLY") }),
+    );
+  });
+});
+
+describe("Linq command replies", () => {
+  it("sends the reply to the chat the command came from, redacted, and stops the typing indicator", async () => {
+    const key = ["sk", "-test-", "TESTONLY", "0123456789abcdef0123456789abcdef"].join("");
+    await expect(sendLinqCommandReply("chat-z", `Conversation: ${key}`)).resolves.toEqual({ sent: true });
+    expect(linqSendMessage).toHaveBeenCalledWith(
+      "chat-z",
+      expect.objectContaining({
+        text: expect.not.stringContaining("TESTONLY"),
+      }),
+    );
+    expect(linqStopTyping).toHaveBeenCalledWith("chat-z");
+  });
+
+  it("stops the typing indicator even when the send fails, and says why", async () => {
+    linqSendMessage.mockRejectedValueOnce(new Error("linq: send failed"));
+    await expect(sendLinqCommandReply("chat-z", "Idle")).resolves.toEqual({ sent: false, reason: "linq: send failed" });
+    expect(linqStopTyping).toHaveBeenCalledWith("chat-z");
   });
 });

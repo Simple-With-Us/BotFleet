@@ -61,7 +61,7 @@ describe("ChatView Trajectory switch", () => {
     expect(SRC).toContain("<ThreadViewSwitch view={threadView} onChange={setThreadView} />");
     // in the header's right-hand cluster, ahead of the find button, and not among the thread tabs
     expect(SRC.indexOf("<ThreadViewSwitch")).toBeLessThan(SRC.indexOf('aria-label={trajectoryOpen ? "Search Steps" : "Find in Conversation"}'));
-    expect(SRC.indexOf("<ThreadViewSwitch")).toBeLessThan(SRC.indexOf("<ThreadTabs bot={bot} />"));
+    expect(SRC.indexOf("<ThreadViewSwitch")).toBeLessThan(SRC.indexOf("<ThreadTabs bot={originalBot} />"));
   });
 
   // The switch sits beside a button that used to unmount in Trajectory, which
@@ -116,5 +116,46 @@ describe("ChatView step payloads and injected context", () => {
     // nothing else opens between the message and its rows
     expect(SRC.slice(row, rows)).not.toMatch(/<(?:Bubble|ActivityChip|ToolLine)\b/);
     expect(SRC).toContain("{showToolCalls && m.contextInjections?.length ? (");
+  });
+});
+
+describe("ChatView karaoke on the reply itself", () => {
+  it("has no Spoken Summary card under the message any more", () => {
+    expect(SRC).not.toContain("SpokenSummaryCard");
+    expect(SRC).not.toContain("Spoken Summary");
+    expect(SRC).not.toContain("speech.wordIndex");
+  });
+
+  it("follows the voice over the rendered markdown, keyed by the message and its written text", () => {
+    // The workspace pronunciation list rides along, so "sequel" lights up "SQL".
+    expect(SRC).toContain("useMessageKaraoke(spokenRef, message.id, writtenSource, speakable, state.config?.tts?.pronunciations);");
+    expect(SRC).toContain("writtenReply(message.text ?? \"\")");
+    const wrapper = SRC.indexOf("<div ref={spokenRef}>");
+    const markdown = SRC.indexOf("<ChatMarkdown text={voiceSections?.written ?? toImessageBody ?? cleanWritten} />");
+    expect(wrapper).toBeGreaterThan(-1);
+    expect(markdown).toBeGreaterThan(wrapper);
+    // The wrapper holds only the markdown, so only the reply's own words are read.
+    expect(SRC.slice(wrapper + "<div ref={spokenRef}>".length, markdown).trim()).toBe("");
+    const close = SRC.indexOf("</div>", markdown);
+    expect(SRC.slice(markdown + "<ChatMarkdown text={voiceSections?.written ?? toImessageBody ?? cleanWritten} />".length, close).trim()).toBe("");
+  });
+
+  it("calls the hook before any early return, so the hook order never changes", () => {
+    const hook = SRC.indexOf("useMessageKaraoke(spokenRef");
+    const firstReturn = SRC.indexOf("if (humanTyped && editing) {");
+    expect(hook).toBeGreaterThan(-1);
+    expect(hook).toBeLessThan(firstReturn);
+  });
+});
+
+describe("browsing a retained thread while the bot works", () => {
+  it("holds the view fetch while the page failure stands, until the reader reopens it", () => {
+    expect(SRC).toContain("const viewedFailed = explicitThreadId ? state.threadTranscriptErrors[explicitThreadId] : undefined;");
+    expect(SRC).toContain("if (viewingOther && explicitThreadId && !viewedMessages && !viewedLoading && !viewedFailed) {");
+    expect(SRC).toContain("[viewingOther, explicitThreadId, viewedMessages, viewedLoading, viewedFailed, originalBot.id, dispatch]);");
+  });
+
+  it("locks the composer while browsing with a busy bot, so a send cannot retarget the turn", () => {
+    expect(SRC).toContain("locked={viewingOther && originalBot.busy}");
   });
 });

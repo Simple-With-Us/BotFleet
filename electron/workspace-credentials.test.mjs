@@ -47,6 +47,25 @@ describe("workspace credential migration", () => {
     expect(config.xai.key).toBe("xai-secret");
   });
 
+  it("migrates legacy primary Infisical tokens to encrypted credential slots", () => {
+    const result = migrateWorkspaceCredentials({
+      infisical: { clientSecret: "identity-secret", token: "read-service-token", writeToken: "write-service-token", projectId: "fixture-project" },
+    }, {});
+
+    expect(result.credentials).toEqual({
+      infisicalClientSecret: "identity-secret",
+      infisicalReadToken: "read-service-token",
+      infisicalWriteToken: "write-service-token",
+    });
+    expect(result.config).toEqual({ infisical: { projectId: "fixture-project" } });
+    expect(JSON.stringify(result.config)).not.toMatch(/identity-secret|read-service-token|write-service-token/);
+    expect(workspaceCredentialEnv(result.credentials)).toEqual({
+      INFISICAL_CLIENT_SECRET: "identity-secret",
+      INFISICAL_TOKEN: "read-service-token",
+      INFISICAL_WRITE_TOKEN: "write-service-token",
+    });
+  });
+
   it("is idempotent: a second boot over migrated output changes nothing", () => {
     const first = migrateWorkspaceCredentials(
       { xai: { key: "xai-secret" }, tts: { key: "tts-secret", voice: "narrator" } },
@@ -186,6 +205,8 @@ describe("workspace credential replay markers", () => {
     expect(workspaceCredentialPending({ xai: { credentialStorage: "external", key: "runtime-only" } }, "xaiApiKey")).toBe(false);
     expect(workspaceCredentialPending({ xai: {} }, "xaiApiKey")).toBe(false);
     expect(EXTERNAL_WORKSPACE_CREDENTIALS.map((field) => field.name)).toContain("infisicalClientSecret");
+    expect(EXTERNAL_WORKSPACE_CREDENTIALS.map((field) => field.name)).toContain("infisicalReadToken");
+    expect(EXTERNAL_WORKSPACE_CREDENTIALS.map((field) => field.name)).toContain("infisicalWriteToken");
   });
 
   it("removes an external marker only on an explicit credential clear", () => {

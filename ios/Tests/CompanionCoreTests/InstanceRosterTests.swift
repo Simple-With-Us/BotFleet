@@ -167,6 +167,18 @@ final class InstanceRosterTests: XCTestCase {
 
     // MARK: - Checking
 
+    func testOpenCodeModelProbeProblemReadsApartFromSignIn() throws {
+        let json = """
+        {"instanceId":"opencode","driverKind":"opencodeGo","displayName":"OpenCode","enabled":true,
+         "snapshot":{"state":"available","authenticated":false,
+         "modelProbeProblem":"OpenCode answered but listed no models."},
+         "models":{"default":"","options":[]}}
+        """
+        let opencode = try JSONDecoder().decode(Instance.self, from: Data(json.utf8))
+        XCTAssertEqual(opencode.snapshot.engineStatusLabel, "No models listed")
+        XCTAssertEqual(opencode.snapshot.engineProblemDetail, "OpenCode answered but listed no models.")
+    }
+
     func testASlowProbeReadsAsCheckingNotUnavailable() throws {
         let slow = try instance("claude", state: "unavailable", transient: true)
         XCTAssertTrue(slow.snapshot.isChecking)

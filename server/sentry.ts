@@ -6,6 +6,8 @@
 // SDK tax.  Browser Replay/Feedback live in src/lib/sentry.ts.
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
+import { resetSentryCronsForTests } from "./sentry-crons.ts";
+import { runtimeBuildIdentity } from "./runtime-identity.ts";
 
 export type SentryNode = typeof import("@sentry/node");
 type SentryIntegration = Parameters<SentryNode["addIntegration"]>[0];
@@ -24,6 +26,8 @@ export interface SentryRuntimeInput {
   uiTracesSampleRate?: number;
   logsEnabled: boolean;
   source: SentrySource;
+  /** Git SHA so `sentry-deploy.yml` markers line up with events. */
+  release?: string | null;
 }
 
 export interface SentryRuntimeState {
@@ -122,6 +126,12 @@ export const MALFORMED_DSN_MESSAGE = "The stored DSN is not a Sentry https:// DS
 export const SDK_REJECTED_DSN_MESSAGE =
   "Sentry refused this DSN, so nothing is being reported.  Check it in Settings > Observability.";
 
+/** Shown when configuration looks healthy but the SDK client is closed or has
+ * no transport — for example after a config refresh closed the old client
+ * before the replacement finished starting. */
+export const SENTRY_DELIVERY_NOT_READY_MESSAGE =
+  "Sentry is configured but not delivering events yet.  Save Settings or wait for the client to finish restarting.";
+
 /** Split a DSN into the two halves that are safe to show.  Returns null for
  * anything that is not a DSN, which is how a malformed stored value becomes
  * a visible `lastError` instead of a silently inert SDK. */
@@ -179,6 +189,24 @@ export function sentryDsnFromEnv(
   return raw || undefined;
 }
 
+const UNKNOWN_COMMIT = "0".repeat(40);
+const RELEASE_SHA = /^[0-9a-f]{7,40}$/i;
+
+/** A git SHA Sentry can use as `release`.  All-zeros (unknown checkout) is
+ *  not a release.  `SENTRY_RELEASE` wins, then `GITHUB_SHA`, then
+ *  `VERCEL_GIT_COMMIT_SHA`. */
+export function sentryReleaseName(
+  env: NodeJS.ProcessEnv = process.env,
+  fallback?: string | null,
+): string | undefined {
+  const candidates = [env.SENTRY_RELEASE, env.GITHUB_SHA, env.VERCEL_GIT_COMMIT_SHA, fallback];
+  for (const raw of candidates) {
+    const value = raw?.trim();
+    if (value && value !== UNKNOWN_COMMIT && RELEASE_SHA.test(value)) return value;
+  }
+  return undefined;
+}
+
 interface SentrySdkLoad {
   sdk: SentryNode | null;
   error: string | null;
@@ -206,21 +234,33 @@ async function loadSdk(): Promise<SentrySdkLoad> {
   }
 }
 
-/** Stop the running client.  The close is deliberately not awaited: this
- * runs on the PATCH /api/config path, and a hung flush must not hold a
- * request open.  `initialized` drops first, so `isSentryActive()` gates
- * captures off the instant the switch flips, flush or no flush. */
-function shutdown(): void {
+/** Best-effort flush budget when swapping clients.  Buffered events are
+ * discarded after this cap so `PATCH /api/config` is not held open for two
+ * seconds on every observability save. */
+const SENTRY_CLIENT_CLOSE_MS = 500;
+
+/** Stop the running client.  `initialized` drops first, so `isSentryActive()`
+ * gates captures off the instant the switch flips.  Only the re-init path
+ * awaits the close so `init()` never races a stale global client; turning
+ * diagnostics off keeps the historical fire-and-forget close. */
+async function closeRunningClient(options?: { awaitFlush?: boolean }): Promise<void> {
   const sdk = sentrySdk;
   sentrySdk = null;
   initialized = false;
   activeFingerprint = null;
   if (!sdk) return;
+  let close: Promise<unknown>;
   try {
-    void Promise.resolve(sdk.close(2000)).catch(() => {});
+    close = Promise.resolve(sdk.close(SENTRY_CLIENT_CLOSE_MS)).catch(() => {});
   } catch {
     /* an SDK that cannot close must not take the harness down with it */
+    return;
   }
+  if (options?.awaitFlush) {
+    await close;
+    return;
+  }
+  void close;
 }
 
 /** @sentry/profiling-node is in neither package.json nor the lockfile, so
@@ -424,7 +464,7 @@ async function applySentryConfigLocked(input: SentryRuntimeInput): Promise<Sentr
   };
 
   if (!input.enabled || !input.dsn || !parsed) {
-    shutdown();
+    await closeRunningClient({ awaitFlush: false });
     killed = !input.enabled;
     runtimeState = {
       ...base,
@@ -455,13 +495,14 @@ async function applySentryConfigLocked(input: SentryRuntimeInput): Promise<Sentr
     input.logsEnabled ? "logs" : "nologs",
     genAiCollection ? "ai-data-on" : "ai-data-off",
     "stream-genai",
+    sentryReleaseName(process.env, input.release) || "norelease",
   ].join("|");
   if (initialized && activeFingerprint === fingerprint) {
     runtimeState = { ...base, active: true, profilingAvailable: runtimeState.profilingAvailable };
     return runtimeState;
   }
 
-  shutdown();
+  await closeRunningClient({ awaitFlush: true });
   const { sdk, error } = await loadSdk();
   if (!sdk) {
     runtimeState = { ...base, active: false, lastError: error };
@@ -475,22 +516,23 @@ async function applySentryConfigLocked(input: SentryRuntimeInput): Promise<Sentr
   if (sdk.httpIntegration) {
     integrations.push(sdk.httpIntegration({
       ignoreIncomingRequests: (urlPath) => isWebhookIngressPath(urlPath),
-      maxIncomingRequestBodySize: "none",
+      maxRequestBodySize: "none",
     }));
   }
-  // enableLogs alone only produces breadcrumbs; the console integration
-  // is what turns a warn or an error into a Sentry log.
+  // v11 dropped enableLogs; the console integration is what turns a
+  // warn or an error into a Sentry log.
   if (input.logsEnabled) integrations.push(sdk.consoleLoggingIntegration({ levels: ["warn", "error"] }));
   try {
     sdk.init({
       dsn: input.dsn,
       environment: input.environment,
+      release: sentryReleaseName(process.env, input.release),
       tracesSampleRate: input.tracesSampleRate,
       tracesSampler: (samplingContext: {
         parentSampled?: boolean;
         name?: string;
         op?: string;
-        attributes?: Record<string, unknown>;
+        attributes?: { "sentry.op"?: string };
       }) => {
         if (samplingContext.parentSampled !== undefined) {
           return samplingContext.parentSampled;
@@ -525,8 +567,11 @@ async function applySentryConfigLocked(input: SentryRuntimeInput): Promise<Sentr
 
         return input.tracesSampleRate;
       },
-      enableLogs: true,
       integrations,
+      // v11 streams spans by default, which makes beforeSendTransaction a
+      // no-op.  Static lifecycle keeps one transaction event so the webhook
+      // secret scrub still walks names, URLs, and child spans.
+      traceLifecycle: "static",
       // Every payload kind the client sends passes the webhook-secret scrub:
       // errors and messages, transactions with all their child spans, and
       // console-derived logs.  No beforeSendSpan: in this SDK the gen_ai
@@ -536,11 +581,9 @@ async function applySentryConfigLocked(input: SentryRuntimeInput): Promise<Sentr
       beforeSend: (event) => safeScrubHook(event),
       beforeSendTransaction: (event) => safeScrubHook(event),
       beforeSendLog: (log) => safeScrubHook(log),
-      sendDefaultPii: false,
-      // Sentry Agents (SaaS): standalone gen_ai envelopes for Conversations.
-      // Opt-out only for self-hosted that cannot ingest them.
-      streamGenAiSpans: true,
       // GenAI I/O collection ON by default; kill with SENTRY_AI_DATA_COLLECTION=0.
+      // v11 dropped sendDefaultPii and streamGenAiSpans; dataCollection is the
+      // remaining privacy knob, and gen_ai spans always stream.
       dataCollection: {
         ...genAiDataCollectionOptions(),
         httpBodies: [],
@@ -564,7 +607,7 @@ async function applySentryConfigLocked(input: SentryRuntimeInput): Promise<Sentr
   // module exists to prevent.  A stand-in SDK without `getClient` answers
   // "unknown" and is left alone.
   if (acceptedDsn(sdk) === "rejected") {
-    shutdown();
+    await closeRunningClient({ awaitFlush: false });
     runtimeState = { ...base, active: false, lastError: SDK_REJECTED_DSN_MESSAGE };
     return runtimeState;
   }
@@ -577,11 +620,30 @@ async function applySentryConfigLocked(input: SentryRuntimeInput): Promise<Sentr
   return runtimeState;
 }
 
+/** True when the SDK can actually send events.  `@sentry/core`'s
+ * `captureCheckIn` returns a uuid even when there is no live client, so
+ * callers must gate on this — not merely on `initialized`. */
+export function isSentryDeliveryReady(): boolean {
+  if (!initialized || killed) return false;
+  const sdk = sentrySdk;
+  if (!sdk) return false;
+  if (sdk.isEnabled === undefined && sdk.getClient === undefined) return true;
+  try {
+    if (sdk.isEnabled !== undefined) return sdk.isEnabled();
+    const client = sdk.getClient?.();
+    if (!client) return false;
+    if (client.getOptions?.().enabled === false) return false;
+    return Boolean(client.getTransport?.());
+  } catch {
+    return false;
+  }
+}
+
 /** True only while a client is running and nobody has turned it off.  Every
  * capture site gates on this, not on `isSentryInitialized`, so flipping the
  * switch stops reporting immediately instead of at the next restart. */
 export function isSentryActive(): boolean {
-  return initialized && !killed;
+  return isSentryDeliveryReady();
 }
 
 export function sentryRuntimeState(): SentryRuntimeState {
@@ -616,6 +678,7 @@ export async function initSentry(env: NodeJS.ProcessEnv = process.env): Promise<
       : 0.1,
     logsEnabled: true,
     source: dsn ? "env" : "none",
+    release: sentryReleaseName(env, runtimeBuildIdentity.sourceCommit),
   })).active;
 }
 
@@ -625,6 +688,38 @@ export function isSentryInitialized(): boolean {
 
 export function getSentry(): SentryNode | null {
   return sentrySdk;
+}
+
+/** Partial @sentry/node surface implemented by vitest stand-ins. */
+export type SentrySdkTestStandIn = {
+  init: (...opts: Parameters<SentryNode["init"]>) => ReturnType<SentryNode["init"]> | void;
+  close: (...args: Parameters<SentryNode["close"]>) => ReturnType<SentryNode["close"]>;
+  addIntegration: (...args: Parameters<SentryNode["addIntegration"]>) => void;
+  consoleLoggingIntegration: (
+    ...args: Parameters<SentryNode["consoleLoggingIntegration"]>
+  ) => { name: string };
+  captureCheckIn?: SentryNode["captureCheckIn"];
+  isEnabled?: () => boolean;
+  getClient?: () => {
+    getDsn(): { host?: string } | undefined;
+    getOptions(): { enabled: boolean };
+    getTransport(): undefined | Record<string, never>;
+  };
+  httpIntegration?: (
+    options: Parameters<NonNullable<SentryNode["httpIntegration"]>>[0],
+  ) => { name: string; options: Parameters<NonNullable<SentryNode["httpIntegration"]>>[0] };
+};
+
+/** Coerce a partial SDK stand-in to the lazy-loaded module type for test loaders. */
+export function asSentryNodeTestStandIn(standIn: SentrySdkTestStandIn): SentryNode {
+  // SAFETY: stand-ins stamp only members applySentryConfig and cron check-ins
+  // call; the real SDK stays dynamically imported so vitest never loads it.
+  return standIn as unknown as SentryNode;
+}
+
+/** Loader wrapper for `setSentryLoaderForTests` that accepts a partial stand-in. */
+export function sentryTestLoader(standIn: SentrySdkTestStandIn): () => Promise<SentryNode> {
+  return async () => asSentryNodeTestStandIn(standIn);
 }
 
 /** Install a stand-in for @sentry/node so a test can exercise the init,
@@ -645,4 +740,5 @@ export function resetSentryForTests(): void {
   loaderForTests = null;
   applyQueue = Promise.resolve();
   runtimeState = { ...DORMANT };
+  resetSentryCronsForTests();
 }
