@@ -2567,13 +2567,15 @@ describe("review fixes: round 12 (reset counter carry, notice event keys, archiv
       session.state.notices.push({ at: now + n, userId: JAY, text: `terminal ${n}`, attempts: 8, failed: "gave up" });
     }
     rmSync(join(dataDir, "zulip"), { recursive: true, force: true });
-    mkdirSync(join(dataDir, "redirect-target"));
     symlinkSync(join(dataDir, "redirect-target"), join(dataDir, "zulip"));
     session.markDirty();
     // Both write paths (state file AND archive) refuse the redirect: the
     // save fails loudly and the ledgers stay in memory, unwritten.
     expect(session.save()).toBe(false);
     expect(logs.some((line) => line.includes("could not save state") && line.includes("symlink"))).toBe(true);
+    // The refusal mutates NOTHING at the redirect target: it is not even
+    // created, let alone re-permissioned.
+    expect(existsSync(join(dataDir, "redirect-target"))).toBe(false);
     expect(session.state.notices.filter((n) => n.failed)).toHaveLength(12);
     expect(existsSync(join(dataDir, "redirect-target", "bot-plumber.notices-archive.jsonl"))).toBe(false);
     expect(existsSync(join(dataDir, "redirect-target", "bot-plumber.json"))).toBe(false);
@@ -2790,5 +2792,95 @@ describe("review fixes: round 12 (reset counter carry, notice event keys, archiv
     await connected(third);
     expect(sessionOf(third).state.userId).toBe(PLUMBER);
     await third.stop();
+  });
+
+  it("dedupes every incident of a blocked load across reconcile retries", async () => {
+    const first = makeHub();
+    await connected(first);
+    sessionOf(first).markDirty();
+    sessionOf(first).save();
+    await first.stop();
+    const statePath = join(dataDir, "zulip", "bot-plumber.json");
+    const original = readFileSync(statePath, "utf8");
+    // Two unknown top-level keys AND a damaged known ledger: one load
+    // archives BOTH incidents before failing closed.
+    const saved = Object.assign(stateFileSchema.parse(JSON.parse(original)), {
+      surpriseFutureField: { experimental: true },
+      anotherFutureField: 42,
+      dms: "not-an-array",
+    });
+    writeFileSync(statePath, `${JSON.stringify(saved)}\n`);
+    const archivePath = join(dataDir, "zulip", "bot-plumber.notices-archive.jsonl");
+    const blocked = makeHub();
+    await waitFor(() => logs.some((line) => line.includes("state load failed")), "the loud load failure");
+    expect(botStatus(blocked, "bot-plumber")).toBeUndefined();
+    const afterFirst = readFileSync(archivePath, "utf8");
+    expect(afterFirst).toMatch(/state-unknown-keys-on-load/);
+    expect(afterFirst).toMatch(/state-ledger-damaged-on-load/);
+    // two drift entries + one ledger-damage entry, archived exactly once
+    expect(afterFirst.trimEnd().split("\n")).toHaveLength(3);
+    await blocked.stop();
+    // A repeated blocked boot re-archives NOTHING: each incident's complete
+    // entry sequence is found in the retained tail.
+    const blockedAgain = makeHub();
+    await waitFor(
+      () => logs.filter((line) => line.includes("state load failed")).length >= 2,
+      "the repeated loud failure",
+    );
+    expect(readFileSync(archivePath, "utf8")).toBe(afterFirst);
+    expect(readFileSync(statePath, "utf8")).toBe(`${JSON.stringify(saved)}\n`);
+    await blockedAgain.stop();
+    writeFileSync(statePath, original);
+    const third = makeHub();
+    await connected(third);
+    expect(sessionOf(third).state.userId).toBe(PLUMBER);
+    await third.stop();
+  });
+
+  it("refuses to treat a symlinked archive as durable evidence", async () => {
+    const first = makeHub();
+    await connected(first);
+    sessionOf(first).markDirty();
+    sessionOf(first).save();
+    await first.stop();
+    const statePath = join(dataDir, "zulip", "bot-plumber.json");
+    const withDrift = `${JSON.stringify(Object.assign(stateFileSchema.parse(JSON.parse(readFileSync(statePath, "utf8"))), { surpriseFutureField: { experimental: true } }))}\n`;
+    writeFileSync(statePath, withDrift);
+    // A planted link whose TARGET fakes a matching tail line must not read
+    // as "already archived".
+    const archivePath = join(dataDir, "zulip", "bot-plumber.notices-archive.jsonl");
+    const plantedTarget = join(dataDir, "planted-target.jsonl");
+    writeFileSync(
+      plantedTarget,
+      `${JSON.stringify({ archivedAt: 1, reason: "state-unknown-keys-on-load", entry: { key: "surpriseFutureField", value: { experimental: true } } })}\n`,
+    );
+    symlinkSync(plantedTarget, archivePath);
+    const blocked = makeHub();
+    await waitFor(() => logs.some((line) => line.includes("state load failed")), "the loud load failure");
+    expect(botStatus(blocked, "bot-plumber")).toBeUndefined();
+    await settle();
+    expect(turns).toHaveLength(0);
+    // The drift is NOT stripped: the original stays byte-identical.
+    expect(readFileSync(statePath, "utf8")).toBe(withDrift);
+    await blocked.stop();
+  });
+
+  it("reports the state-file diagnosis when the quarantine archive itself is unwritable", async () => {
+    const first = makeHub();
+    await connected(first);
+    sessionOf(first).markDirty();
+    sessionOf(first).save();
+    await first.stop();
+    const statePath = join(dataDir, "zulip", "bot-plumber.json");
+    writeFileSync(statePath, "{ not json");
+    mkdirSync(join(dataDir, "zulip", "bot-plumber.notices-archive.jsonl"));
+    const blocked = makeHub();
+    await waitFor(() => logs.some((line) => line.includes("state load failed")), "the loud load failure");
+    // The operator sees WHY the bot is down - not a bare archive-path error.
+    expect(logs.some((line) => line.includes("state quarantine failed"))).toBe(true);
+    expect(logs.some((line) => line.includes("not parseable JSON and the quarantine archive is unwritable"))).toBe(true);
+    expect(readFileSync(statePath, "utf8")).toBe("{ not json");
+    await blocked.stop();
+    rmSync(join(dataDir, "zulip", "bot-plumber.notices-archive.jsonl"), { recursive: true, force: true });
   });
 });

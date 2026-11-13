@@ -20,7 +20,7 @@
 //                restart cannot drop one; the text stays in this mode-600
 //                file, the same protection the DM ledger gets.
 
-import { chmodSync, closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, statSync, writeSync, type Stats } from "node:fs";
+import { closeSync, constants, fchmodSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, statSync, writeSync, type Stats } from "node:fs";
 import { dirname, join, relative, sep } from "node:path";
 
 import { z } from "zod";
@@ -161,6 +161,12 @@ export const stateFileSchema = stateFileSchemaBase.strict();
  *  raw fields with this schema instead: absent probes clean (legacy files
  *  predate the field and get the default), present-but-malformed refuses
  *  the load closed. */
+/** One line of the notices archive, validated before the dedup read
+ *  trusts its fields; a malformed line is simply not a match. */
+const archiveLineSchema = z
+  .object({ archivedAt: z.number(), reason: z.string(), entry: z.unknown() })
+  .strict();
+
 const ledgerProbeSchemas = {
   cursor: z.number().int().nullable(),
   handled: z.array(z.number()),
@@ -208,7 +214,18 @@ export class ZulipStateStore {
       // session constructor throws, per-bot containment keeps this bot down
       // and loud (state file untouched) while the others run, and the next
       // reconcile retries.
-      this.archiveLoadIncident(botId, "state-unparseable-on-load", [text]);
+      try {
+        this.archiveLoadIncident(botId, "state-unparseable-on-load", [text]);
+      } catch (error) {
+        this.onArchiveError?.(
+          `state quarantine failed for ${botId}; original file left byte-identical for retry: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+        throw new Error(
+          `state file for ${botId} is not parseable JSON and the quarantine archive is unwritable; original left untouched; refusing to start with empty ledgers`,
+        );
+      }
       throw new Error(
         `state file for ${botId} is not parseable JSON; original quarantined to the private notices archive; refusing to start with empty ledgers`,
       );
@@ -265,7 +282,18 @@ export class ZulipStateStore {
         // A known field violating the schema means the file cannot be
         // trusted: quarantine it and refuse the load rather than resuming
         // with empty caps and no pending work.  Same containment as above.
-        this.archiveLoadIncident(botId, "state-schema-invalid-on-load", [rawJson]);
+        try {
+          this.archiveLoadIncident(botId, "state-schema-invalid-on-load", [rawJson]);
+        } catch (error) {
+          this.onArchiveError?.(
+            `state quarantine failed for ${botId}; original file left byte-identical for retry: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+          throw new Error(
+            `state file for ${botId} failed schema validation (a known field is malformed) and the quarantine archive is unwritable; original left untouched; refusing to start with empty ledgers`,
+          );
+        }
         throw new Error(
           `state file for ${botId} failed schema validation (a known field is malformed); original quarantined to the private notices archive; refusing to start with empty ledgers`,
         );
@@ -298,7 +326,18 @@ export class ZulipStateStore {
         }
       }
       if (ledgerDamaged) {
-        this.archiveLoadIncident(botId, "state-ledger-damaged-on-load", [rawJson]);
+        try {
+          this.archiveLoadIncident(botId, "state-ledger-damaged-on-load", [rawJson]);
+        } catch (error) {
+          this.onArchiveError?.(
+            `state quarantine failed for ${botId}; original file left byte-identical for retry: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+          throw new Error(
+            `state file for ${botId} has a malformed known ledger (cursor, handled, wakes, chains or dms) and the quarantine archive is unwritable; original left untouched; refusing to start with reset ledgers`,
+          );
+        }
         throw new Error(
           `state file for ${botId} has a malformed known ledger (cursor, handled, wakes, chains or dms); original quarantined to the private notices archive; refusing to start with reset ledgers`,
         );
@@ -370,6 +409,25 @@ export class ZulipStateStore {
    *  not a plain directory.  A missing component is skipped: mkdir just
    *  created it as a real directory, or the final handle/path inode check
    *  below still guards the file itself. */
+  /** Create the state directory if missing and hold its mode at 0700
+   *  through an opened, verified descriptor - never chmod(2) on the path,
+   *  which would follow a swapped link to its target.  Callers verify the
+   *  ancestors FIRST so a planted link receives no mutation at all. */
+  private ensureStateDir(): void {
+    mkdirSync(this.dir, { recursive: true, mode: 0o700 });
+    if (!lstatSync(this.dir).isDirectory()) {
+      throw new Error(`state directory ${this.dir} is not a plain directory; refusing to write`);
+    }
+    const dirFd = openSync(this.dir, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      fchmodSync(dirFd, 0o700);
+    } catch {
+      /* best effort: the files themselves are 600 */
+    } finally {
+      closeSync(dirFd);
+    }
+  }
+
   private verifyArchiveAncestors(path: string): void {
     // The configured data root may itself be a user-owned alias (supported:
     // server/host-id.ts resolves it with realpathSync), so canonicalize the
@@ -410,30 +468,67 @@ export class ZulipStateStore {
   /** Load-quarantine wrapper.  A bot blocked by a damaged state file
    *  fails the same way every reconcile, and appending an identical copy
    *  each cycle grows the append-only archive without adding evidence.
-   *  Skip the append when the archive's last line is this same incident
-   *  (same reason, same content). */
+   *  Skip the append when the archive's retained tail already carries
+   *  this incident's complete entry sequence in order - one load can
+   *  emit several incidents (drift AND ledger damage), so this one is
+   *  not necessarily the final line, and a multi-entry incident spans
+   *  several lines.  A miss appends: a duplicate is evidence, never
+   *  loss. */
   private archiveLoadIncident(botId: string, reason: string, entries: unknown[]): void {
     const path = join(this.dir, fileName(botId).replace(/\.json$/, ".notices-archive.jsonl"));
     try {
-      const fd = openSync(path, constants.O_RDONLY);
+      // The dedup read is part of the durability claim, so it gets the
+      // same protections as the write: ancestors verified, no links
+      // followed, the handle proven against the path.  A planted link
+      // faking a matching tail must never read as "already archived";
+      // any failure falls through to archive(), whose own verification
+      // refuses the write and fails the load closed.
+      this.verifyArchiveAncestors(path);
+      const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
       try {
-        const stat = fstatSync(fd);
-        const size = Math.min(stat.size, 256 * 1024);
+        const handleStat = fstatSync(fd);
+        const pathStat = lstatSync(path);
+        if (
+          !handleStat.isFile() ||
+          !pathStat.isFile() ||
+          handleStat.dev !== pathStat.dev ||
+          handleStat.ino !== pathStat.ino
+        ) {
+          throw new Error("archive tail is not a plain file");
+        }
+        const size = Math.min(handleStat.size, 256 * 1024);
         const buffer = Buffer.alloc(size);
-        readSync(fd, buffer, 0, size, stat.size - size);
-        const tail = buffer.toString("utf8").trimEnd();
-        const lastLine = tail.slice(tail.lastIndexOf("\n") + 1);
-        // SAFETY: the archive is JSONL written only by archive(); a line
-        // that fails to parse is simply not a dedup match.
-        const last = JSON.parse(lastLine) as { reason?: unknown; entry?: unknown };
-        if (last.reason === reason && entries.length === 1 && JSON.stringify(last.entry) === JSON.stringify(entries[0])) {
-          return;
+        readSync(fd, buffer, 0, size, handleStat.size - size);
+        const lines = buffer.toString("utf8").trimEnd().split("\n");
+        for (let start = lines.length - entries.length; start >= 0; start -= 1) {
+          let match = true;
+          for (let index = 0; index < entries.length; index += 1) {
+            let line: unknown;
+            try {
+              line = JSON.parse(lines[start + index]);
+            } catch {
+              match = false;
+              break;
+            }
+            const candidate = archiveLineSchema.safeParse(line);
+            if (
+              !candidate.success ||
+              candidate.data.reason !== reason ||
+              JSON.stringify(candidate.data.entry) !== JSON.stringify(entries[index])
+            ) {
+              match = false;
+              break;
+            }
+          }
+          if (match) return;
         }
       } finally {
         closeSync(fd);
       }
     } catch {
-      // No readable archive yet: append normally.
+      // No readable or verifiable archive yet: append normally (or, when
+      // the path itself is hostile, archive() below throws and the load
+      // fails closed).
     }
     this.archive(botId, reason, entries);
   }
@@ -443,17 +538,14 @@ export class ZulipStateStore {
    *  longer carries.  Contents are never logged or posted. */
   private archive(botId: string, reason: string, entries: unknown[]): void {
     if (entries.length === 0) return;
-    mkdirSync(this.dir, { recursive: true, mode: 0o700 });
-    try {
-      chmodSync(this.dir, 0o700);
-    } catch {
-      // best effort, as with the state file
-    }
     const path = join(this.dir, fileName(botId).replace(/\.json$/, ".notices-archive.jsonl"));
-    const lines = entries.map((entry) => JSON.stringify({ archivedAt: Date.now(), reason, entry })).join("\n") + "\n";
-    // Ancestors first: a planted link in the path above the file redirects
-    // the write even with O_NOFOLLOW on the final component.
+    // Ancestors first, BEFORE any mutation: a planted link in the path
+    // above the file redirects the write even with O_NOFOLLOW on the final
+    // component, and it must not even have its target created or
+    // re-permissioned.
     this.verifyArchiveAncestors(path);
+    this.ensureStateDir();
+    const lines = entries.map((entry) => JSON.stringify({ archivedAt: Date.now(), reason, entry })).join("\n") + "\n";
     // Follow no link: a swapped archive path must never redirect the
     // write.  Open with O_NOFOLLOW, then prove the handle is the same
     // regular, single-link file the path still names - a race can swap it
@@ -484,27 +576,26 @@ export class ZulipStateStore {
       }
       writeSync(fd, lines);
       fsyncSync(fd);
+      // Mode through the verified descriptor: chmod(2) on the path would
+      // follow a swapped link to its target.
+      try {
+        fchmodSync(fd, 0o600);
+      } catch {
+        // best effort
+      }
     } finally {
       closeSync(fd);
-    }
-    try {
-      chmodSync(path, 0o600);
-    } catch {
-      // best effort
     }
   }
 
   save(botId: string, state: ZulipBotState, now = Date.now()): void {
-    mkdirSync(this.dir, { recursive: true, mode: 0o700 });
-    try {
-      chmodSync(this.dir, 0o700);
-    } catch {
-      /* best effort: the files themselves are 600 */
-    }
-    // The state file gets the same redirect policy as the archive: a
-    // planted ancestor link must receive neither.  A violation throws -
-    // session.save logs it and the in-memory ledgers survive to retry.
+    // The state file gets the same redirect policy as the archive, and the
+    // check comes BEFORE any mutation: a planted ancestor link must not
+    // even have its target created or re-permissioned.  A violation
+    // throws - session.save logs it and the in-memory ledgers survive to
+    // retry.
     this.verifyArchiveAncestors(join(this.dir, fileName(botId)));
+    this.ensureStateDir();
     // Bound every ledger before it reaches disk.
     if (state.handled.length > HANDLED_RING_LIMIT) state.handled = state.handled.slice(-HANDLED_RING_LIMIT);
     state.wakes = state.wakes.filter((w) => now - w.at < WAKE_LEDGER_MS).slice(-WAKE_LEDGER_LIMIT);
@@ -539,12 +630,6 @@ export class ZulipStateStore {
       }
     }
     state.notices = bounded;
-    mkdirSync(this.dir, { recursive: true, mode: 0o700 });
-    try {
-      chmodSync(this.dir, 0o700);
-    } catch {
-      /* best effort: the files themselves are 600 */
-    }
     writeFileAtomic(join(this.dir, fileName(botId)), `${JSON.stringify(state)}\n`, { mode: 0o600 });
     if (process.platform !== "win32") {
       const fd = openSync(this.dir, "r");
