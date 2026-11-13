@@ -155,8 +155,27 @@ require_root() {
 require_under_volume() {
   local path="$1"
   local label="$2"
-  case "$path" in
-    "$BF_VOLUME"/*) return 0 ;;
+  if [[ ! "$path" =~ ^/[a-zA-Z0-9_./+-]+$ ]] || [[ "$path" == *"/../"* || "$path" == *"/./"* || "$path" == */.. || "$path" == */. ]]; then
+    die "$label must be a safe absolute path"
+  fi
+  if [[ ! "$BF_VOLUME" =~ ^/[a-zA-Z0-9_./+-]+$ ]] || [ "$BF_VOLUME" = "/" ]; then
+    die "BF_VOLUME must be a dedicated absolute volume path"
+  fi
+  if [[ ! "$BF_USER" =~ ^[a-z_][a-z0-9_-]*\$?$ ]] || [[ ! "$BF_GROUP" =~ ^[a-z_][a-z0-9_-]*\$?$ ]]; then
+    die "BF_USER and BF_GROUP must be valid service identities"
+  fi
+  local resolved_volume resolved_path
+  resolved_volume="$(realpath -m -- "$BF_VOLUME")" || die "cannot resolve BF_VOLUME"
+  resolved_path="$(realpath -m -- "$path")" || die "cannot resolve $label"
+  if [ "${DRY_RUN:-0}" -ne 1 ]; then
+    mountpoint -q -- "$BF_VOLUME" || die "BF_VOLUME is not mounted; refusing to create runtime files"
+    local volume_device root_device
+    volume_device="$(stat -c %d -- "$BF_VOLUME")" || die "cannot read the volume device"
+    root_device="$(stat -c %d /)" || die "cannot read the root device"
+    [ "$volume_device" != "$root_device" ] || die "BF_VOLUME is on the root device; refusing to create runtime files"
+  fi
+  case "$resolved_path" in
+    "$resolved_volume"/*) return 0 ;;
     *) die "$label must live under $BF_VOLUME: $path" ;;
   esac
 }

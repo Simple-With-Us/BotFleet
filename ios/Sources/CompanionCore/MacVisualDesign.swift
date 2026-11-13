@@ -75,6 +75,144 @@ public enum MacMascotExpression: String, CaseIterable, Sendable, Codable {
     case typing = "typing"
     case speaking = "speaking"
     case sneaking = "sneaking"
+
+    /// The SF Symbol name the native Mac surface uses to draw this expression.
+    public var symbolName: String {
+        switch self {
+        case .sleeping: return "moon.zzz.fill"
+        case .waking: return "sunrise.fill"
+        case .idle: return "cpu"
+        case .listening: return "ear.and.waveform"
+        case .thinking: return "brain"
+        case .searching: return "magnifyingglass"
+        case .working: return "gearshape.2.fill"
+        case .excited: return "sparkles"
+        case .surprised: return "exclamationmark.circle.fill"
+        case .suspicious: return "eye.trianglebadge.exclamationmark"
+        case .angry: return "flame.fill"
+        case .drowsy: return "zzz"
+        case .happy: return "face.smiling.fill"
+        case .curious: return "questionmark.bubble.fill"
+        case .confused: return "questionmark.circle.fill"
+        case .bored: return "clock.fill"
+        case .proud: return "star.fill"
+        case .shy: return "hand.raised.slash.fill"
+        case .sad: return "cloud.rain.fill"
+        case .laughing: return "face.smiling.inverse"
+        case .scared: return "bolt.trianglebadge.exclamationmark.fill"
+        case .playful: return "gamecontroller.fill"
+        case .celebrate: return "party.popper.fill"
+        case .orbit: return "atom"
+        case .radar: return "dot.radiowaves.left.and.right"
+        case .progress: return "chart.bar.fill"
+        case .spawning: return "plus.square.on.square"
+        case .humming: return "music.note"
+        case .loading: return "arrow.triangle.2.circlepath"
+        case .dictating: return "mic.fill"
+        case .writing: return "pencil.line"
+        case .sending: return "paperplane.fill"
+        case .receiving: return "tray.and.arrow.down.fill"
+        case .uploading: return "arrow.up.doc.fill"
+        case .notifying: return "bell.badge.fill"
+        case .alerting: return "hand.raised.fill"
+        case .dragging: return "hand.draw.fill"
+        case .bouncing: return "arrow.up.and.down.circle.fill"
+        case .poweringDown: return "poweroff"
+        case .fleet: return "square.grid.2x2.fill"
+        case .crash: return "exclamationmark.triangle.fill"
+        case .memory: return "memorychip.fill"
+        case .tools: return "wrench.and.screwdriver.fill"
+        case .routine: return "calendar.badge.clock"
+        case .screen: return "display"
+        case .git: return "point.3.connected.trianglepath.dotted"
+        case .webhook: return "link"
+        case .computer: return "desktopcomputer"
+        case .typing: return "keyboard.fill"
+        case .speaking: return "speaker.wave.2.fill"
+        case .sneaking: return "eyeglasses"
+        }
+    }
+
+    /// The human-readable label for tooltips and VoiceOver.
+    public var displayLabel: String {
+        switch self {
+        case .poweringDown:
+            return "Powering Down"
+        default:
+            return rawValue.capitalized
+        }
+    }
+
+    /// Whether the expression animates when Reduce Motion is off.
+    public var isAnimated: Bool {
+        switch self {
+        case .waking, .listening, .thinking, .searching, .working, .excited,
+             .laughing, .playful, .celebrate, .orbit, .radar, .progress,
+             .spawning, .humming, .loading, .dictating, .writing, .sending,
+             .receiving, .uploading, .notifying, .alerting, .dragging,
+             .bouncing, .typing, .speaking:
+            return true
+        case .sleeping, .idle, .surprised, .suspicious, .angry, .drowsy,
+             .happy, .curious, .confused, .bored, .proud, .shy, .sad,
+             .scared, .poweringDown, .fleet, .crash, .memory, .tools,
+             .routine, .screen, .git, .webhook, .computer, .sneaking:
+            return false
+        }
+    }
+
+    /// Maps the full mascot expression onto the sidebar's canonical status category.
+    public var canonicalCategory: MacBotMascotExpression {
+        switch self {
+        case .sleeping, .drowsy, .poweringDown:
+            return .offline
+        case .alerting, .notifying, .surprised, .scared:
+            return .waiting
+        case .thinking, .searching, .curious, .confused, .memory, .orbit, .radar:
+            return .thinking
+        case .working, .waking, .listening, .progress, .spawning, .loading,
+             .dictating, .writing, .sending, .receiving, .uploading, .dragging,
+             .bouncing, .tools, .routine, .screen, .git, .webhook, .computer,
+             .typing, .speaking, .sneaking:
+            return .working
+        case .happy, .excited, .proud, .laughing, .playful, .celebrate, .humming:
+            return .happy
+        case .angry, .crash, .sad, .suspicious:
+            return .error
+        case .idle, .bored, .shy, .fleet:
+            return .idle
+        }
+    }
+
+    /// Resolves a bot's live mascot expression from its state, pending cards,
+    /// reasoning stream, and connection health.
+    public static func resolve(
+        for bot: Bot,
+        hasPendingCard: Bool = false,
+        hasReasoning: Bool = false,
+        isConnected: Bool = true
+    ) -> MacMascotExpression {
+        if !isConnected || bot.isOff {
+            if let raw = bot.mascotExpression?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+               raw == MacMascotExpression.poweringDown.rawValue {
+                return .poweringDown
+            }
+            return .sleeping
+        }
+        if hasPendingCard {
+            return .alerting
+        }
+        if hasReasoning {
+            return .thinking
+        }
+        if bot.busy == true {
+            return .working
+        }
+        if let raw = bot.mascotExpression?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+           let explicit = MacMascotExpression(rawValue: raw) {
+            return explicit
+        }
+        return .idle
+    }
 }
 
 // MARK: - TV-Face render resolution
@@ -110,6 +248,43 @@ public enum MacStatusPillKind: String, CaseIterable, Sendable, Codable {
         case .error: return "Error"
         }
     }
+
+    /// The SF Symbol name the status pill renders alongside its label.
+    public var symbolName: String {
+        switch self {
+        case .connected: return "checkmark.circle.fill"
+        case .reconnecting: return "arrow.triangle.2.circlepath"
+        case .offline: return "bolt.slash.fill"
+        case .error: return "exclamationmark.triangle.fill"
+        }
+    }
+
+    /// The VoiceOver accessibility label for the status pill.
+    public var accessibilityLabel: String {
+        "Connection status: \(label)"
+    }
+
+    /// The VoiceOver accessibility label for the status pill, including any
+    /// visible detail text such as the connected endpoint or failure reason.
+    public func accessibilityLabel(detailText: String?) -> String {
+        guard let detail = detailText?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !detail.isEmpty,
+              detail != label,
+              detail != accessibilityLabel else {
+            return accessibilityLabel
+        }
+        return "\(accessibilityLabel), \(detail)"
+    }
+
+    /// The semantic system color token name for the status pill across light and dark appearances.
+    public var semanticColorToken: String {
+        switch self {
+        case .connected: return "systemGreen"
+        case .reconnecting: return "systemYellow"
+        case .offline: return "systemGray"
+        case .error: return "systemRed"
+        }
+    }
 }
 
 /// Maps the app's connection states onto the shared pill vocabulary.
@@ -133,6 +308,93 @@ public enum MacThemeMode: String, CaseIterable, Sendable, Codable {
     case light
     case dark
     case system
+
+    /// True when the theme mode defers to macOS system appearance rather than pinning a scheme.
+    public var followsSystemAppearance: Bool {
+        self == .system
+    }
+
+    /// The effective macOS appearances this theme mode resolves across light and dark environments.
+    public var effectiveAppearances: [String] {
+        switch self {
+        case .light: return ["aqua"]
+        case .dark: return ["darkAqua"]
+        case .system: return ["aqua", "darkAqua"]
+        }
+    }
+}
+
+/// A rendered light/dark visual snapshot entry for the BF-2496 parity suite.
+public struct MacVisualSurfaceSnapshot: Sendable, Codable, Equatable {
+    public let themeMode: MacThemeMode
+    public let effectiveAppearance: String
+    public let backgroundToken: String
+    public let foregroundToken: String
+    public let mascotSnapshots: [MascotSnapshot]
+    public let statusPillSnapshots: [StatusPillSnapshot]
+
+    public struct MascotSnapshot: Sendable, Codable, Equatable {
+        public let expression: MacMascotExpression
+        public let symbolName: String
+        public let displayLabel: String
+        public let canonicalCategory: String
+        public let isAnimated: Bool
+        public let badgeTintToken: String
+
+        public init(
+            expression: MacMascotExpression,
+            symbolName: String,
+            displayLabel: String,
+            canonicalCategory: String,
+            isAnimated: Bool,
+            badgeTintToken: String
+        ) {
+            self.expression = expression
+            self.symbolName = symbolName
+            self.displayLabel = displayLabel
+            self.canonicalCategory = canonicalCategory
+            self.isAnimated = isAnimated
+            self.badgeTintToken = badgeTintToken
+        }
+    }
+
+    public struct StatusPillSnapshot: Sendable, Codable, Equatable {
+        public let kind: MacStatusPillKind
+        public let label: String
+        public let symbolName: String
+        public let accessibilityLabel: String
+        public let semanticColorToken: String
+
+        public init(
+            kind: MacStatusPillKind,
+            label: String,
+            symbolName: String,
+            accessibilityLabel: String,
+            semanticColorToken: String
+        ) {
+            self.kind = kind
+            self.label = label
+            self.symbolName = symbolName
+            self.accessibilityLabel = accessibilityLabel
+            self.semanticColorToken = semanticColorToken
+        }
+    }
+
+    public init(
+        themeMode: MacThemeMode,
+        effectiveAppearance: String,
+        backgroundToken: String,
+        foregroundToken: String,
+        mascotSnapshots: [MascotSnapshot],
+        statusPillSnapshots: [StatusPillSnapshot]
+    ) {
+        self.themeMode = themeMode
+        self.effectiveAppearance = effectiveAppearance
+        self.backgroundToken = backgroundToken
+        self.foregroundToken = foregroundToken
+        self.mascotSnapshots = mascotSnapshots
+        self.statusPillSnapshots = statusPillSnapshots
+    }
 }
 
 /// The design tokens the Mac app and the parity gate share.

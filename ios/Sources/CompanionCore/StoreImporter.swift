@@ -326,7 +326,11 @@ public struct StoreImporter: Sendable {
 
         // 1. Parse and validate JSON stores first (failing loudly on unknown keys).
         let routinesSnapshot = try loadAndValidateRoutines(from: sourceDirectory, filterBotId: filterBotId)
-        let botsSnapshot = try loadAndValidateBots(from: sourceDirectory, filterBotId: filterBotId)
+        let botsSnapshot = try loadAndValidateBots(
+            from: sourceDirectory,
+            filterBotId: filterBotId,
+            botSnoozes: routinesSnapshot.botSnoozes
+        )
         let groupsSnapshot = try loadAndValidateGroups(from: sourceDirectory)
         let webhooksSnapshot = try loadAndValidateWebhooks(from: sourceDirectory, filterBotId: filterBotId)
 
@@ -518,7 +522,7 @@ public struct StoreImporter: Sendable {
         let runs: [RoutineRunRecord]
         /// Durable commit receipts for cross-file confirmation recovery.
         let requestReceipts: [RoutineRequestReceiptRecord]
-        /// Manual bot snoozes, which the native schema cannot hold yet.
+        let botSnoozes: [String: Double?]
         let botSnoozeCount: Int
     }
 
@@ -532,7 +536,11 @@ public struct StoreImporter: Sendable {
         let unmappedDeliveryCount: Int
     }
 
-    private func loadAndValidateBots(from dir: URL, filterBotId: String?) throws -> BotsSnapshot {
+    private func loadAndValidateBots(
+        from dir: URL,
+        filterBotId: String?,
+        botSnoozes: [String: Double?] = [:]
+    ) throws -> BotsSnapshot {
         let url = dir.appendingPathComponent("bots.json")
         guard FileManager.default.fileExists(atPath: url.path) else {
             return BotsSnapshot(bots: [], threadsById: [:])
@@ -560,10 +568,25 @@ public struct StoreImporter: Sendable {
             let threadId = item["threadId"] as? String
             let createdAt = Self.normalizeSeconds(item["createdAt"])
             let updatedAt = Self.normalizeSeconds(item["updatedAt"]) > 0 ? Self.normalizeSeconds(item["updatedAt"]) : createdAt
+            let snoozedUntil: Double?
+            if let routineSnooze = botSnoozes[id] {
+                snoozedUntil = routineSnooze
+            } else if let botSnooze = item["snoozedUntil"] {
+                snoozedUntil = Self.normalizeSeconds(botSnooze)
+            } else {
+                snoozedUntil = nil
+            }
             let rawJSONData = try JSONSerialization.data(withJSONObject: item, options: [.sortedKeys])
             let rawJSON = String(data: rawJSONData, encoding: .utf8) ?? "{}"
 
-            bots.append(StoredBotRecord(id: id, name: name, threadId: threadId, createdAt: createdAt, rawJSON: rawJSON))
+            bots.append(StoredBotRecord(
+                id: id,
+                name: name,
+                threadId: threadId,
+                createdAt: createdAt,
+                snoozedUntil: snoozedUntil,
+                rawJSON: rawJSON
+            ))
 
             if let mainThreadId = threadId, !mainThreadId.isEmpty {
                 threadsById[mainThreadId] = ThreadRecord(
@@ -646,7 +669,7 @@ public struct StoreImporter: Sendable {
     private func loadAndValidateRoutines(from dir: URL, filterBotId: String?) throws -> RoutinesSnapshot {
         let url = dir.appendingPathComponent("routines.json")
         guard FileManager.default.fileExists(atPath: url.path) else {
-            return RoutinesSnapshot(routines: [], runs: [], requestReceipts: [], botSnoozeCount: 0)
+            return RoutinesSnapshot(routines: [], runs: [], requestReceipts: [], botSnoozes: [:], botSnoozeCount: 0)
         }
         let data = try Data(contentsOf: url)
         guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -768,15 +791,31 @@ public struct StoreImporter: Sendable {
             }
         }
 
-        // Manual snoozes survive restarts in the legacy store.  The native
-        // schema has no column for them, so they are reported, not dropped
-        // silently.
-        let botSnoozeCount = (root["botSnoozes"] as? [String: Any])?.count ?? 0
+        // Manual snoozes survive restarts in the legacy store.
+        var botSnoozes: [String: Double?] = [:]
+        if let rawSnoozes = root["botSnoozes"] as? [String: Any] {
+            for (botId, until) in rawSnoozes {
+                if let filter = filterBotId, botId != filter {
+                    continue
+                }
+                if until is NSNull {
+                    botSnoozes[botId] = threadSnoozeUntilActivity
+                } else if let num = until as? NSNumber {
+                    botSnoozes[botId] = Self.normalizeSeconds(num)
+                } else if let str = until as? String, let d = Double(str) {
+                    botSnoozes[botId] = Self.normalizeSeconds(d)
+                } else {
+                    botSnoozes[botId] = threadSnoozeUntilActivity
+                }
+            }
+        }
+        let botSnoozeCount = botSnoozes.count
 
         return RoutinesSnapshot(
             routines: routines,
             runs: runs,
             requestReceipts: requestReceipts,
+            botSnoozes: botSnoozes,
             botSnoozeCount: botSnoozeCount
         )
     }
@@ -1298,9 +1337,12 @@ public struct StoreImporter: Sendable {
                 "\(webhooksSnapshot.unmappedDeliveryCount) webhook delivery receipt(s) name an endpoint that no longer resolves to a webhook, so they could not be migrated."
             )
         }
-        if routinesSnapshot.botSnoozeCount > 0 {
+        let unmappedSnoozeCount = routinesSnapshot.botSnoozes.keys.filter { snoozeBotId in
+            !botsSnapshot.bots.contains { $0.id == snoozeBotId }
+        }.count
+        if unmappedSnoozeCount > 0 {
             warnings.append(
-                "\(routinesSnapshot.botSnoozeCount) manual bot snooze(s) have no native column yet, so they were not migrated."
+                "\(unmappedSnoozeCount) manual bot snooze(s) name a bot not in bots.json, so they could not be migrated."
             )
         }
 

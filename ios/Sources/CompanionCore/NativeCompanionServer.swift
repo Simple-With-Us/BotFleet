@@ -132,6 +132,28 @@ public struct CompanionServerConfig: Codable, Sendable, Equatable {
     }
 }
 
+/// How phones can reach this computer, as the app knows it.  The companion
+/// server answers `GET /api/companion/endpoints` and the pairing response
+/// from this value only, never from a request's `Host` or `X-Forwarded-*`
+/// headers, which whoever sent the request controls.  The empty default
+/// advertises nothing, and the phone keeps the routes it already has.
+public struct CompanionEndpointAdvertisement: Sendable, Equatable {
+    /// What the phone calls this computer in its connection list.
+    public var serverName: String
+    /// Legacy host names, best first, for phone builds that predate typed
+    /// endpoints.  Sent only with the pairing response, as
+    /// `companion/src/proxy.ts` does.
+    public var hosts: [String]
+    /// Complete routes, each with its own scheme and port.
+    public var endpoints: [CompanionEndpoint]
+
+    public init(serverName: String = "", hosts: [String] = [], endpoints: [CompanionEndpoint] = []) {
+        self.serverName = serverName
+        self.hosts = hosts
+        self.endpoints = endpoints
+    }
+}
+
 /// Bot summary returned on `GET /api/bots` and `GET /api/fleet`.
 public struct CompanionBotRecord: Codable, Sendable, Equatable, Identifiable {
     public let id: String
@@ -458,19 +480,50 @@ public actor NativeCompanionServer {
     private let database: DatabaseService
     /// The injecting app composition owns this shared runtime; listener activation does not transfer lifetime ownership.
     private let nativeRuntime: NativeRuntimeServices?
-    private var pairedTokens: Set<String>
+    /// The paired fleet, held only as token digests.  When
+    /// `deviceStoreURL` is set the fleet is durable across restarts, as
+    /// `companion/src/devices.ts` keeps it; without one it is memory-only,
+    /// which is what direct unit tests get.
+    private var deviceRegistry: CompanionDeviceRegistry
+    private let deviceStoreURL: URL?
+    /// When `lastSeenAt` last reached disk (ms), and whether fresher
+    /// sightings are waiting.  Sightings from every device share one
+    /// flush window, so a burst of authenticated requests across the
+    /// fleet rewrites `devices.json` at most once per
+    /// `lastSeenWriteIntervalMs` instead of once per device.
+    private var lastSeenPersistedAtMs: Double?
+    private var lastSeenPersistPending = false
+    /// The six-digit code a person types on the phone.
     private var pairingCode: String?
+    /// The high-entropy credential the Mac puts in its pairing QR code.  It
+    /// redeems the same window as `pairingCode`, and the two share one
+    /// wrong-guess budget, as in `companion/src/devices.ts` (`PairingWindow`).
+    private var pairingQRCredential: String?
     /// When the open pairing window closes.  `nil` means no window is open.
     private var pairingCodeExpiresAt: Date?
-    /// How many more wrong pairing codes the open window will accept.
+    /// How many more wrong pairing credentials the open window will accept,
+    /// counting both variants together.
     private var pairingAttemptsRemaining: Int = 0
+    /// The last successful redemption that named a `pairRequestId`, kept
+    /// until the window's original expiry so the same phone request can
+    /// recover a reply lost in transit.
+    private var pairingReplay: PairingReplay?
+    private var endpointAdvertisement: CompanionEndpointAdvertisement
+    private let clock: @Sendable () -> Date
     private var config: CompanionServerConfig
     private var bots: [CompanionBotRecord]
     private var pushTokens: Set<String> = []
     private var liveActivityTokens: Set<String> = []
     private var apnsProvider: NativeAPNsProvider?
     private var interruptedThreadIds: Set<String> = []
-    private var sseContinuationById: [UUID: AsyncStream<String>.Continuation] = [:]
+    /// One live SSE subscription.  `deviceId` is the paired device whose
+    /// credential opened the stream (`nil` for an in-process `subscribeSSE()`
+    /// caller), so revoking a device can finish exactly its streams.
+    private struct SSESubscriber {
+        let deviceId: String?
+        let continuation: AsyncStream<String>.Continuation
+    }
+    private var sseContinuationById: [UUID: SSESubscriber] = [:]
 
     public private(set) var desktopOpenCount: Int = 0
     public private(set) var shutdownRequested: Bool = false
@@ -481,6 +534,18 @@ public actor NativeCompanionServer {
     /// (`PAIRING_TTL_MS`, `MAX_PAIRING_ATTEMPTS`).
     public static let pairingWindowTTL: TimeInterval = 120
     public static let pairingMaxAttempts: Int = 5
+
+    /// The identity `GET /api/health` reports.  The phone probes health
+    /// before it sends a pairing credential and refuses any server that does
+    /// not name itself this way (`CompanionClient.healthy`).
+    public static let healthAppIdentity: String = "botfleet"
+
+    /// The most endpoints or hosts one answer carries, and the longest server
+    /// name, matching `companion/src/endpoints.ts` (`MAX_COMPANION_ENDPOINTS`)
+    /// and `companion/src/proxy.ts` (`endpointSnapshot`).
+    public static let maxAdvertisedEndpoints: Int = 8
+    public static let maxAdvertisedServerNameLength: Int = 200
+    public static let maxAdvertisedEndpointPriority: Int = 10_000
 
     /// The default and the maximum number of rows one search may return.  The
     /// limit is clamped before it reaches `sqlite3_bind_int`, which takes an
@@ -508,27 +573,55 @@ public actor NativeCompanionServer {
 
     #if canImport(Network)
     private var listener: NWListener?
+    private var listenerGeneration: UInt64 = 0
+    private var listenerUpdateSequence: UInt64 = 0
     private let listenerQueue = DispatchQueue(label: "app.botfleet.companion-server", qos: .userInitiated)
     #endif
 
+    /// `endpointAdvertisement` is what the app knows about its own routes;
+    /// the empty default advertises none.  `clock` is the time every pairing
+    /// window and replay is measured against; tests pass a manual one.
+    ///
+    /// `pairedTokens` are raw bearer tokens the caller already holds; each
+    /// becomes a device record kept only as its digest.  `deviceStoreURL`
+    /// is the durable `devices.json`: the fleet is loaded from it here and
+    /// written back on every pairing change, so a paired phone survives a
+    /// restart of the listener.
     public init(
         database: DatabaseService,
         pairedTokens: Set<String> = [],
+        deviceStoreURL: URL? = nil,
         pairingCode: String? = nil,
+        pairingQRCredential: String? = nil,
         config: CompanionServerConfig = CompanionServerConfig(),
         bots: [CompanionBotRecord] = [],
         apnsProvider: NativeAPNsProvider? = nil,
         nativeRuntime: NativeRuntimeServices? = nil,
+        endpointAdvertisement: CompanionEndpointAdvertisement = CompanionEndpointAdvertisement(),
         onDesktopOpen: (@Sendable () async throws -> Void)? = nil,
-        onShutdown: (@Sendable () async -> Void)? = nil
+        onShutdown: (@Sendable () async -> Void)? = nil,
+        clock: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.database = database
-        self.pairedTokens = pairedTokens
-        self.pairingCode = pairingCode
-        self.pairingCodeExpiresAt = pairingCode.map { _ in
-            Date().addingTimeInterval(NativeCompanionServer.pairingWindowTTL)
+        self.deviceStoreURL = deviceStoreURL
+        var registry = deviceStoreURL.map { CompanionDeviceRegistry.load(from: $0) }
+            ?? CompanionDeviceRegistry()
+        let seededAtMs = clock().timeIntervalSince1970 * 1000
+        for token in pairedTokens.sorted()
+        where !token.isEmpty && !registry.contains(token: token)
+            && registry.count < CompanionDeviceRegistry.maxDevices {
+            registry.register(name: "Companion", token: token, nowMs: seededAtMs)
         }
-        self.pairingAttemptsRemaining = pairingCode == nil ? 0 : NativeCompanionServer.pairingMaxAttempts
+        self.deviceRegistry = registry
+        self.pairingCode = pairingCode
+        self.pairingQRCredential = pairingQRCredential
+        let opensWindow = pairingCode != nil || pairingQRCredential != nil
+        self.pairingCodeExpiresAt = opensWindow
+            ? clock().addingTimeInterval(NativeCompanionServer.pairingWindowTTL)
+            : nil
+        self.pairingAttemptsRemaining = opensWindow ? NativeCompanionServer.pairingMaxAttempts : 0
+        self.endpointAdvertisement = NativeCompanionServer.sanitizedAdvertisement(endpointAdvertisement)
+        self.clock = clock
         self.config = config
         self.bots = bots
         self.apnsProvider = apnsProvider
@@ -569,25 +662,129 @@ public actor NativeCompanionServer {
         return cleaned == "127.0.0.1" || cleaned == "::1" || cleaned == "::ffff:127.0.0.1"
     }
 
-    private func isAuthenticated(_ request: CompanionHTTPRequest) -> Bool {
-        guard let authHeader = request.headerValue(for: "Authorization") else {
-            return false
-        }
-        let prefix = "Bearer "
-        guard authHeader.count > prefix.count,
-              authHeader.lowercased().hasPrefix(prefix.lowercased()) else {
-            return false
-        }
-        let candidate = String(authHeader.dropFirst(prefix.count)).trimmingCharacters(in: .whitespaces)
-        guard !candidate.isEmpty else { return false }
+    /// True when `presented` is the non-empty `expected` credential, compared
+    /// in constant time.
+    static func matchesPairingCredential(_ presented: String, _ expected: String?) -> Bool {
+        guard let expected, !expected.isEmpty else { return false }
+        return constantTimeEquals(presented, expected)
+    }
 
-        var matched = false
-        for storedToken in pairedTokens {
-            if Self.constantTimeEquals(candidate, storedToken) {
-                matched = true
-            }
+    /// The SHA-256 of a pairing credential, in hex.  A replay is matched on
+    /// this digest, so the raw credential is not kept once it is spent.
+    static func pairingCredentialDigest(_ credential: String) -> String {
+        SHA256.hash(data: Data(credential.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// The pairing idempotency key, or `nil`.  The shape matches
+    /// `companion/src/devices.ts` (`^[A-Za-z0-9._-]{16,128}$`); anything else
+    /// counts as absent, so that request is redeemed exactly once.
+    static func validPairRequestId(_ raw: String?) -> String? {
+        guard let raw,
+              (16...128).contains(raw.utf8.count),
+              raw.utf8.allSatisfy({
+                  (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) ||
+                      $0 == 45 || $0 == 46 || $0 == 95
+              })
+        else { return nil }
+        return raw
+    }
+
+    /// A device name is untrusted display text from the phone.  Control
+    /// characters become spaces and the result is trimmed and clamped, as in
+    /// `companion/src/devices.ts` (`cleanDeviceName`).
+    static func cleanDeviceName(_ raw: String?) -> String {
+        let space: Unicode.Scalar = " "
+        var scalars = String.UnicodeScalarView()
+        for scalar in (raw ?? "").unicodeScalars {
+            let value = scalar.value
+            let isControl = value < 0x20 || (0x7F...0x9F).contains(value) || value == 0x2028 || value == 0x2029 ||
+                (0x202A...0x202E).contains(value) || (0x2066...0x2069).contains(value) ||
+                value == 0x200E || value == 0x200F || value == 0xFEFF
+            scalars.append(isControl ? space : scalar)
         }
-        return matched
+        let trimmed = String(scalars).trimmingCharacters(in: .whitespacesAndNewlines)
+        let name = String(trimmed.prefix(60))
+        return name.isEmpty ? "Companion" : name
+    }
+
+    /// Mints the credential a pairing QR code carries: `omb_pair_` and 32
+    /// random bytes as unpadded base64url, the shape `companion/src/devices.ts`
+    /// mints and `PairingInvite` accepts.
+    public static func makePairingQRCredential() -> String {
+        let bytes = SymmetricKey(size: .bits256).withUnsafeBytes { Data($0) }
+        return "omb_pair_" + NativeAPNsProvider.base64URLEncode(bytes)
+    }
+
+    /// Bounds the app's advertisement at the network boundary, as
+    /// `companion/src/proxy.ts` (`endpointSnapshot`) does: a clamped name, no
+    /// duplicate or out-of-range routes, and at most eight of each list.
+    static func sanitizedAdvertisement(_ raw: CompanionEndpointAdvertisement) -> CompanionEndpointAdvertisement {
+        var seenURLs = Set<String>()
+        let endpoints = raw.endpoints.filter { endpoint in
+            (0...maxAdvertisedEndpointPriority).contains(endpoint.priority) && seenURLs.insert(endpoint.url).inserted
+        }
+        var seenHosts = Set<String>()
+        let hosts = raw.hosts
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && seenHosts.insert($0).inserted }
+        return CompanionEndpointAdvertisement(
+            serverName: String(raw.serverName.prefix(maxAdvertisedServerNameLength)),
+            hosts: Array(hosts.prefix(maxAdvertisedEndpoints)),
+            endpoints: Array(endpoints.prefix(maxAdvertisedEndpoints))
+        )
+    }
+
+    /// Resolves the request's bearer token to its paired device.  The
+    /// header is parsed by the registry's one parser (as `devices.ts`
+    /// insists: two parsers that disagree about what a credential looks
+    /// like means a phone authenticates on one path and not the other),
+    /// and only the token's digest is ever compared or kept.
+    private func authenticatedDevice(_ request: CompanionHTTPRequest) -> CompanionDeviceRecord? {
+        let token = CompanionDeviceRegistry.bearerToken(
+            fromAuthorizationHeader: request.headerValue(for: "Authorization")
+        )
+        guard let device = deviceRegistry.authenticate(token: token) else { return nil }
+        // `lastSeenAt` decorates a settings row; a failed write must never
+        // stop an already-valid token from authenticating.
+        let nowMs = clock().timeIntervalSince1970 * 1000
+        if deviceRegistry.recordSeen(id: device.id, nowMs: nowMs) {
+            persistLastSeenCoalesced(nowMs: nowMs)
+        }
+        return device
+    }
+
+    private func isAuthenticated(_ request: CompanionHTTPRequest) -> Bool {
+        authenticatedDevice(request) != nil
+    }
+
+    /// Writes the paired fleet when a durable store is configured.
+    /// Any successful write also carries every pending `lastSeenAt`
+    /// sighting, so the coalesced flush restarts its window here.
+    private func persistDevices() throws {
+        guard let deviceStoreURL else { return }
+        try deviceRegistry.persist(to: deviceStoreURL)
+        lastSeenPersistedAtMs = clock().timeIntervalSince1970 * 1000
+        lastSeenPersistPending = false
+    }
+
+    private func persistDevicesBestEffort() {
+        try? persistDevices()
+    }
+
+    /// Batches `lastSeenAt` persistence across devices: the first
+    /// sighting in a window writes immediately, later sightings only
+    /// mark the fleet dirty until the window (`lastSeenWriteIntervalMs`
+    /// since the last successful write) closes, when the next sighting
+    /// flushes them all in one write.  At most one window of sightings
+    /// is ever unwritten — the same bound the per-device throttle in
+    /// `recordSeen` already accepts.
+    private func persistLastSeenCoalesced(nowMs: Double) {
+        if let lastSeenPersistedAtMs,
+           nowMs - lastSeenPersistedAtMs <= CompanionDeviceRegistry.lastSeenWriteIntervalMs {
+            lastSeenPersistPending = true
+            return
+        }
+        persistDevicesBestEffort()
     }
 
     // MARK: - Configuration & State Mutation
@@ -600,29 +797,107 @@ public actor NativeCompanionServer {
         config
     }
 
+    /// Pairs a raw token the caller already holds, kept only as its
+    /// digest.  An empty token is not a credential and is refused.
     public func addPairedToken(_ token: String) {
-        pairedTokens.insert(token)
+        guard !token.isEmpty, !deviceRegistry.contains(token: token),
+              deviceRegistry.count < CompanionDeviceRegistry.maxDevices else { return }
+        deviceRegistry.register(
+            name: "Companion",
+            token: token,
+            nowMs: clock().timeIntervalSince1970 * 1000
+        )
+        persistDevicesBestEffort()
+    }
+
+    /// Every paired device, without its digest — what a settings page
+    /// renders, as `list()` answers in `companion/src/devices.ts`.
+    public func pairedDevices() -> [PairedDevice] {
+        deviceRegistry.devices.map(\.publicDevice)
+    }
+
+    /// How many phones are paired, against `CompanionDeviceRegistry.maxDevices`.
+    public var pairedDeviceCount: Int {
+        deviceRegistry.count
+    }
+
+    /// Takes one phone's access away.  False when there was no such
+    /// device, or when the revoked fleet could not be saved — in which
+    /// case the device keeps its access rather than the file and the
+    /// running server disagreeing about it.  A successful revoke also
+    /// forgets the pairing replay, whose whole purpose is handing a
+    /// just-minted token out again.
+    @discardableResult
+    public func revokeDevice(id: String) -> Bool {
+        let before = deviceRegistry
+        guard deviceRegistry.revoke(id: id) else { return false }
+        do {
+            try persistDevices()
+        } catch {
+            deviceRegistry = before
+            return false
+        }
+        pairingReplay = nil
+        terminateSSEStreams(forDeviceId: id)
+        return true
+    }
+
+    /// Finishes every live SSE stream opened with this device's credential,
+    /// and no other device's.  Finishing a continuation ends the socket
+    /// task's `for await` loop, which then cancels its connection.
+    private func terminateSSEStreams(forDeviceId deviceId: String) {
+        let doomed = sseContinuationById.filter { $0.value.deviceId == deviceId }
+        for (id, subscriber) in doomed {
+            sseContinuationById.removeValue(forKey: id)
+            subscriber.continuation.finish()
+        }
+    }
+
+    /// Replaces what `GET /api/companion/endpoints` and the pairing response
+    /// advertise, for when the app's routes change.
+    public func setEndpointAdvertisement(_ advertisement: CompanionEndpointAdvertisement) {
+        endpointAdvertisement = Self.sanitizedAdvertisement(advertisement)
     }
 
     /// Opens a pairing window for the Mac side to show on its own loopback
-    /// page.  The code is a credential for `pairingWindowTTL` seconds and is
-    /// spent by the first device that redeems it.
+    /// page.  The code, and the QR credential when there is one, are
+    /// credentials for `pairingWindowTTL` seconds; the first device that
+    /// redeems either one spends both.  Opening a window replaces any earlier
+    /// window and forgets its replay, as `companion/src/devices.ts`
+    /// (`openPairing`) does.
     public func openPairingWindow(
         code: String,
+        qrCredential: String? = nil,
         ttl: TimeInterval = NativeCompanionServer.pairingWindowTTL,
         maxAttempts: Int = NativeCompanionServer.pairingMaxAttempts
     ) {
+        pairingReplay = nil
         pairingCode = code
-        pairingCodeExpiresAt = Date().addingTimeInterval(ttl)
+        pairingQRCredential = qrCredential
+        pairingCodeExpiresAt = clock().addingTimeInterval(ttl)
         pairingAttemptsRemaining = max(1, maxAttempts)
     }
 
     /// Closes the open pairing window, so a code that is still on screen stops
-    /// working at once.
+    /// working at once.  It also forgets the replay, so a cancelled pairing
+    /// cannot hand its token out again.
     public func closePairingWindow() {
+        discardPairingWindow()
+        pairingReplay = nil
+    }
+
+    /// Forgets the window's credentials and budget but keeps the replay, so
+    /// a redeemed window can still answer its own lost reply.
+    private func discardPairingWindow() {
         pairingCode = nil
+        pairingQRCredential = nil
         pairingCodeExpiresAt = nil
         pairingAttemptsRemaining = 0
+    }
+
+    /// True when the window holds at least one credential to check against.
+    private var hasPairingCredential: Bool {
+        !(pairingCode ?? "").isEmpty || !(pairingQRCredential ?? "").isEmpty
     }
 
     /// Subscribes to Server-Sent Events emitted by the companion server.
@@ -630,13 +905,19 @@ public actor NativeCompanionServer {
         subscribeSSEWithIdentifier().stream
     }
 
+    /// Subscribes on behalf of one paired device, so `revokeDevice` can
+    /// finish this stream the moment that device loses access.
+    func subscribeSSE(deviceId: String?) -> AsyncStream<String> {
+        subscribeSSEWithIdentifier(deviceId: deviceId).stream
+    }
+
     /// Subscribes to Server-Sent Events and returns the subscriber's id, so a
     /// caller that owns the transport can retire the subscription itself
     /// instead of waiting for the stream to terminate.
-    func subscribeSSEWithIdentifier() -> (stream: AsyncStream<String>, id: UUID) {
+    func subscribeSSEWithIdentifier(deviceId: String? = nil) -> (stream: AsyncStream<String>, id: UUID) {
         let id = UUID()
         let stream = AsyncStream<String>(bufferingPolicy: .bufferingNewest(Self.sseBufferCapacity)) { continuation in
-            sseContinuationById[id] = continuation
+            sseContinuationById[id] = SSESubscriber(deviceId: deviceId, continuation: continuation)
             continuation.yield("event: connected\ndata: {\"ok\":true}\n\n")
             continuation.onTermination = { [weak self] _ in
                 Task {
@@ -653,8 +934,8 @@ public actor NativeCompanionServer {
 
     private func broadcastSSE(event: String, jsonPayload: String) {
         let frame = "event: \(event)\ndata: \(jsonPayload)\n\n"
-        for continuation in sseContinuationById.values {
-            continuation.yield(frame)
+        for subscriber in sseContinuationById.values {
+            subscriber.continuation.yield(frame)
         }
     }
 
@@ -668,6 +949,40 @@ public actor NativeCompanionServer {
         return text
     }
 
+    /// The one Origin gate every request path shares - the router and the
+    /// socket SSE path alike.  A native app sends no Origin; anything that
+    /// does is a browser that has found this port, and a browser has no
+    /// business on it, whatever the origin claims and however good the
+    /// token behind it is.  Mirrors `companion/src/proxy.ts`.
+    static func crossOriginRejection(for request: CompanionHTTPRequest) -> CompanionHTTPResponse? {
+        if let origin = request.headerValue(for: "Origin"), !origin.isEmpty {
+            return .error(403, "forbidden: cross-origin request")
+        }
+        return nil
+    }
+
+    /// Whether a socket `GET /api/events` request may stream, and as which
+    /// device.  The Origin gate runs before any credential is looked at,
+    /// exactly as in `handleRequest`; the socket path must not bypass it
+    /// by streaming directly.
+    enum EventsAuthorization {
+        case authorized(deviceId: String)
+        case rejected(CompanionHTTPResponse)
+    }
+
+    func authorizeEventsStream(_ request: CompanionHTTPRequest) -> EventsAuthorization {
+        if let rejection = Self.crossOriginRejection(for: request) {
+            return .rejected(rejection)
+        }
+        guard let device = authenticatedDevice(request) else {
+            return .rejected(.error(
+                401,
+                "pair this device from Phone settings in BotFleet on your computer"
+            ))
+        }
+        return .authorized(deviceId: device.id)
+    }
+
     // MARK: - HTTP Request Router (Default-Deny Allowlist)
 
     /// Primary HTTP request entrypoint for both `NWConnection` and unit tests.
@@ -676,13 +991,24 @@ public actor NativeCompanionServer {
         let method = request.method.uppercased()
         let path = request.path
 
+        // 0. Origin rejection, before any route or credential is looked at.
+        if let rejection = Self.crossOriginRejection(for: request) {
+            return rejection
+        }
+
         // 1. Open routes (unauthenticated)
         if method == "GET" && path == "/api/health" {
+            // `app` and `ready` are what the phone checks before it sends a
+            // pairing credential (`CompanionClient.healthy`), the same pair
+            // `companion/src/proxy.ts` answers with.  This actor serves every
+            // route itself, so once it answers it is ready.
             struct HealthPayload: Encodable {
                 let ok: Bool
                 let status: String
+                let app: String
+                let ready: Bool
             }
-            return .json(200, HealthPayload(ok: true, status: "healthy"))
+            return .json(200, HealthPayload(ok: true, status: "healthy", app: Self.healthAppIdentity, ready: true))
         }
 
         if method == "POST" && path == "/api/pair" {
@@ -720,6 +1046,9 @@ public actor NativeCompanionServer {
 
         case ("GET", "/api/companion/push-health"):
             return await handlePushHealth()
+
+        case ("GET", "/api/companion/endpoints"):
+            return handleCompanionEndpoints()
 
         case ("POST", "/api/desktop/open"):
             return await handleDesktopOpen(request)
@@ -761,35 +1090,90 @@ public actor NativeCompanionServer {
 
     // MARK: - Route Handlers
 
+    /// A successful redemption that named a `pairRequestId`.  The credential
+    /// is kept only as its digest; the token is the raw bearer held only in
+    /// this replay (the registry keeps just its digest), and only until
+    /// the window's original expiry.
+    private struct PairingReplay: Sendable {
+        let requestId: String
+        let credentialDigest: String
+        /// The redeemed window's original expiry, not redemption time plus
+        /// the TTL.
+        let expiresAt: Date
+        let token: String
+        let device: PairedDevice
+    }
+
+    /// Redeems either pairing credential for a device token, mirroring
+    /// `companion/src/devices.ts` (`redeem`) and `companion/src/proxy.ts`.
+    ///
+    /// A closed or expired window answers 401, as the Node sidecar does, not
+    /// 503: the phone reads 502-504 as a dead route and moves on
+    /// (`ConnectionAdvice.shouldTryAnotherRoute`), which turned "this window
+    /// is closed" into "couldn't reach this computer".
     private func handlePair(_ request: CompanionHTTPRequest) -> CompanionHTTPResponse {
+        // The phone sends a six-digit credential as `code` and the QR
+        // credential as `credential` (`CompanionClient.pair`).  Either one is
+        // checked against both of the window's credentials.
         struct PairRequest: Decodable {
-            let code: String
+            let code: String?
+            let credential: String?
             let deviceName: String?
+            let pairRequestId: String?
         }
         guard let body = request.body,
-              let payload = try? JSONDecoder().decode(PairRequest.self, from: body),
-              !payload.code.isEmpty else {
+              let payload = try? JSONDecoder().decode(PairRequest.self, from: body) else {
             return .error(400, "invalid_pair_request")
         }
-        guard payload.code.utf8.count <= CompanionFieldLimits.pairingCode else {
+        let presented = payload.credential ?? payload.code ?? ""
+        guard !presented.isEmpty else {
+            return .error(400, "invalid_pair_request")
+        }
+        guard presented.utf8.count <= CompanionFieldLimits.pairingCode else {
             return .error(400, "pairing_code_too_long")
         }
+        let requestId = Self.validPairRequestId(payload.pairRequestId)
+        let presentedDigest = Self.pairingCredentialDigest(presented)
+        let now = clock()
 
-        // Fail closed.  With no open pairing window there is no code to check
-        // against, and skipping the check would mint a working bearer token for
-        // the first unauthenticated caller on the socket.
-        guard let expectedCode = pairingCode, !expectedCode.isEmpty else {
-            return .error(503, "pairing_unavailable")
+        // A reply lost in transit is recoverable: the same request id with the
+        // same credential gets the same answer until the window's original
+        // expiry.  It spends no guess and touches no window.  A different
+        // credential falls through to the checks below, which refuse it.
+        if let replay = pairingReplay, now >= replay.expiresAt {
+            pairingReplay = nil
         }
-        if let expiry = pairingCodeExpiresAt, Date() >= expiry {
-            closePairingWindow()
-            return .error(503, "pairing_code_expired")
+        if let requestId,
+           let replay = pairingReplay,
+           Self.constantTimeEquals(replay.requestId, requestId),
+           Self.constantTimeEquals(replay.credentialDigest, presentedDigest) {
+            // A token taken away since must not come back through a replay.
+            guard deviceRegistry.contains(token: replay.token) else {
+                pairingReplay = nil
+                return .error(401, "pairing_unavailable")
+            }
+            return pairResponse(token: replay.token, device: replay.device)
+        }
+
+        // Fail closed.  With no open pairing window there is no credential to
+        // check against, and skipping the check would mint a working bearer
+        // token for the first unauthenticated caller on the socket.
+        guard let expiry = pairingCodeExpiresAt, hasPairingCredential else {
+            return .error(401, "pairing_unavailable")
+        }
+        if now >= expiry {
+            discardPairingWindow()
+            return .error(401, "pairing_code_expired")
         }
         guard pairingAttemptsRemaining > 0 else {
             closePairingWindow()
             return .error(429, "pairing_attempts_exhausted")
         }
-        guard Self.constantTimeEquals(payload.code, expectedCode) else {
+        // Both comparisons always run, and a wrong guess at either variant
+        // spends the one shared budget.
+        let matchesCode = Self.matchesPairingCredential(presented, pairingCode)
+        let matchesQRCredential = Self.matchesPairingCredential(presented, pairingQRCredential)
+        guard matchesCode || matchesQRCredential else {
             pairingAttemptsRemaining -= 1
             if pairingAttemptsRemaining <= 0 {
                 closePairingWindow()
@@ -798,14 +1182,84 @@ public actor NativeCompanionServer {
             return .error(403, "invalid_pairing_code")
         }
 
-        let issuedToken = "bf_tok_\(UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased())"
-        pairedTokens.insert(issuedToken)
-        // One code, one device: redeeming the code spends the window.
-        closePairingWindow()
-        return .json(200, [
-            "token": issuedToken,
-            "deviceId": UUID().uuidString.lowercased(),
-        ])
+        // After the credential, not before: checked first, a full fleet
+        // would answer every wrong guess without spending its budget.
+        // The window survives, so removing a phone and presenting the
+        // same credential again still works, as in `devices.ts`.
+        guard deviceRegistry.count < CompanionDeviceRegistry.maxDevices else {
+            return .error(401, "too_many_paired_devices")
+        }
+
+        // One window, one device: redeeming either credential spends both.
+        discardPairingWindow()
+        // 32 random bytes, not a UUID: this token is the credential for
+        // the device port once the socket leaves loopback.
+        let tokenBytes = SymmetricKey(size: .bits256).withUnsafeBytes { Data($0) }
+        let issuedToken = "bf_tok_" + NativeAPNsProvider.base64URLEncode(tokenBytes)
+        let pairedAtMs = now.timeIntervalSince1970 * 1000.0
+        let record = deviceRegistry.register(
+            name: Self.cleanDeviceName(payload.deviceName),
+            token: issuedToken,
+            nowMs: pairedAtMs
+        )
+        // A device that lives in memory but not on disk is paired until
+        // the next restart and then silently is not.  Roll the pairing
+        // back and say so, so the person retries now instead of
+        // discovering it days later.
+        do {
+            try persistDevices()
+        } catch {
+            deviceRegistry.revoke(id: record.id)
+            return .error(500, "pairing_persist_failed")
+        }
+        let device = record.publicDevice
+        // The replay outlives the window, but only to its original expiry.
+        if let requestId {
+            pairingReplay = PairingReplay(
+                requestId: requestId,
+                credentialDigest: presentedDigest,
+                expiresAt: expiry,
+                token: issuedToken,
+                device: device
+            )
+        }
+        return pairResponse(token: issuedToken, device: device)
+    }
+
+    /// The envelope the phone decodes as `PairResponse`: `token`, `device`
+    /// and `serverName`, with `hosts` and `endpoints` absent rather than
+    /// empty when there is nothing to advertise, as in `companion/src/proxy.ts`.
+    private func pairResponse(token: String, device: PairedDevice) -> CompanionHTTPResponse {
+        struct PairEnvelope: Encodable {
+            let token: String
+            let device: PairedDevice
+            let serverName: String
+            let hosts: [String]?
+            let endpoints: [CompanionEndpoint]?
+        }
+        let advertisement = endpointAdvertisement
+        return .json(200, PairEnvelope(
+            token: token,
+            device: device,
+            serverName: advertisement.serverName,
+            hosts: advertisement.hosts.isEmpty ? nil : advertisement.hosts,
+            endpoints: advertisement.endpoints.isEmpty ? nil : advertisement.endpoints
+        ))
+    }
+
+    /// Answers `GET /api/companion/endpoints` from the app's advertisement
+    /// alone, in the shape the phone decodes as `CompanionConnectionMetadata`.
+    /// Nothing here reads the request, so a forged `Host` or
+    /// `X-Forwarded-Host` cannot steer a phone to another address.
+    private func handleCompanionEndpoints() -> CompanionHTTPResponse {
+        struct EndpointSnapshot: Encodable {
+            let serverName: String
+            let endpoints: [CompanionEndpoint]
+        }
+        return .json(200, EndpointSnapshot(
+            serverName: endpointAdvertisement.serverName,
+            endpoints: endpointAdvertisement.endpoints
+        ))
     }
 
     private func handleGetFleet() -> CompanionHTTPResponse {
@@ -816,7 +1270,7 @@ public actor NativeCompanionServer {
         }
         let summary = FleetSummary(
             bots: bots,
-            pairedDevices: pairedTokens.count,
+            pairedDevices: deviceRegistry.count,
             pushTokensRegistered: pushTokens.count
         )
         return .json(200, summary)
@@ -1246,13 +1700,21 @@ public actor NativeCompanionServer {
     }
 
     /// Starts the listener and answers the port it bound once the socket is
-    /// ready, or throws the listener's own error when the bind fails.  The
-    /// port is read back from the listener, never from the number asked for,
+    /// ready, or throws the listener's own fatal error; a waiting start
+    /// remains pending and can be stopped while networking recovers.
+    /// The port is read back from the listener, never from the number asked for,
     /// so a system-chosen port is reported truly.  A second start replaces the
     /// first listener instead of leaking it beside the new one.
     @discardableResult
-    public func startListening(port: UInt16 = 0, options: ListenerOptions = ListenerOptions()) async throws -> UInt16? {
-        try await nativeRuntime?.activate(pollIntervalSeconds: 1)
+    public func startListening(
+        port: UInt16 = 0,
+        options: ListenerOptions = ListenerOptions(),
+        onUpdate: @escaping @Sendable (CompanionListenerUpdate) async -> Void = { _ in }
+    ) async throws -> UInt16? {
+        // Reserve this request without stopping a healthy listener during
+        // validation, runtime activation or replacement construction.
+        listenerGeneration &+= 1
+        let generation = listenerGeneration
         let nwPort: NWEndpoint.Port
         if port == 0 {
             nwPort = .any
@@ -1262,9 +1724,8 @@ public actor NativeCompanionServer {
             }
             nwPort = resolved
         }
-        // A listener that is already up is cancelled first, so a repeated
-        // start never leaves an orphan bound to a port nobody knows.
-        stopListenerSocket()
+        try await nativeRuntime?.activate(pollIntervalSeconds: 1)
+        guard generation == listenerGeneration else { throw CancellationError() }
         let listener = try NWListener(using: .tcp, on: nwPort)
         // Loopback by default: the cleartext device port must not be reachable
         // from the network unless someone opted in on purpose.
@@ -1286,23 +1747,42 @@ public actor NativeCompanionServer {
                 await self.acceptConnection(connection)
             }
         }
+        // A replacement on the same port needs a bind handoff: it cannot
+        // become ready while the old listener still owns that address.
+        let previous = self.listener
         self.listener = listener
+        listenerUpdateSequence = 0
+        previous?.cancel()
         // The listener reports each state on its queue.  The first report that
-        // settles the start resumes the continuation; later ones, such as the
-        // cancel that follows a failure, are ignored.
+        // settles the start resumes the continuation; waiting retains the
+        // socket and a later ready event restores its visible state.
         let settlement = ListenerStartSettlement()
         do {
             let bound: UInt16? = try await withCheckedThrowingContinuation { continuation in
                 // Weak, so the handler never keeps its own listener alive.
-                listener.stateUpdateHandler = { [weak listener] state in
+                listener.stateUpdateHandler = { [weak self, weak listener] state in
                     switch state {
                     case .ready:
-                        settlement.once { continuation.resume(returning: listener?.port?.rawValue) }
-                    case .waiting(let error), .failed(let error):
-                        // A port in use arrives as `.waiting` on some systems
-                        // and as `.failed` on others, and neither becomes
-                        // ready on its own, so both are a failed start.
-                        settlement.once { continuation.resume(throwing: error) }
+                        let port = listener?.port?.rawValue
+                        let update = CompanionListenerUpdate(sequence: settlement.nextSequence(), event: .ready(port: port))
+                        Task {
+                            if let listener { await self?.listenerChanged(listener, update: update, onUpdate: onUpdate) }
+                            settlement.once { continuation.resume(returning: port) }
+                        }
+                    case .waiting(let error):
+                        let update = CompanionListenerUpdate(sequence: settlement.nextSequence(), event: .waiting(reason: error.localizedDescription))
+                        Task {
+                            if let listener { await self?.listenerChanged(listener, update: update, onUpdate: onUpdate) }
+                        }
+                    case .failed(let error):
+                        let update = CompanionListenerUpdate(sequence: settlement.nextSequence(), event: .failed(reason: error.localizedDescription))
+                        // Reserve the fatal outcome before cancellation or a
+                        // delayed ready task can settle the pending start.
+                        settlement.reserveFailure(error)
+                        Task {
+                            if let listener { await self?.listenerChanged(listener, update: update, onUpdate: onUpdate) }
+                            settlement.finishFailure { continuation.resume(throwing: error) }
+                        }
                     case .cancelled:
                         settlement.once { continuation.resume(throwing: CancellationError()) }
                     case .setup:
@@ -1312,6 +1792,10 @@ public actor NativeCompanionServer {
                     }
                 }
                 listener.start(queue: listenerQueue)
+            }
+            guard generation == listenerGeneration, self.listener === listener else {
+                if let failure = settlement.failure { throw failure }
+                throw CancellationError()
             }
             return bound
         } catch {
@@ -1327,19 +1811,37 @@ public actor NativeCompanionServer {
 
     public func stopListening() async {
         stopListenerSocket()
+        await nativeRuntime?.deactivatePolling()
     }
 
     private func stopListenerSocket() {
+        listenerGeneration &+= 1
         listener?.cancel()
         listener = nil
     }
 
-    /// The port the listener bound, once it has one; nil before `startListening`
-    /// answers or after `stopListening`.  Read back from the listener, never
-    /// from the number that was asked for, so a system-chosen port is reported
-    /// truly.
+    private func listenerChanged(
+        _ changedListener: NWListener,
+        update: CompanionListenerUpdate,
+        onUpdate: @Sendable (CompanionListenerUpdate) async -> Void
+    ) async {
+        // A queued state from a replaced or intentionally stopped listener
+        // cannot clear the current socket or overwrite a newer observation.
+        guard listener === changedListener, update.sequence > listenerUpdateSequence else { return }
+        listenerUpdateSequence = update.sequence
+        if case .failed = update.event {
+            changedListener.cancel()
+            listener = nil
+        }
+        await onUpdate(update)
+    }
+
+    /// The bound port while the current listener is ready; nil during setup,
+    /// waiting, after `stopListening`, or after a fatal listener failure.
+    /// Read back from the listener rather than the number that was asked for.
     public var listeningPort: UInt16? {
-        listener?.port?.rawValue
+        guard let listener, case .ready = listener.state else { return nil }
+        return listener.port?.rawValue
     }
 
     private func acceptConnection(_ connection: NWConnection) {
@@ -1422,11 +1924,11 @@ public actor NativeCompanionServer {
     /// connection open, so `message.created` and `thread.interrupted` actually
     /// reach a network client.
     private func streamEvents(over connection: NWConnection, request: CompanionHTTPRequest) {
-        guard isAuthenticated(request) else {
-            let response = CompanionHTTPResponse.error(
-                401,
-                "pair this device from Phone settings in BotFleet on your computer"
-            )
+        let deviceId: String
+        switch authorizeEventsStream(request) {
+        case .authorized(let authorizedDeviceId):
+            deviceId = authorizedDeviceId
+        case .rejected(let response):
             connection.send(content: Self.serializeHTTPResponse(response), completion: .contentProcessed { _ in
                 connection.cancel()
             })
@@ -1434,7 +1936,7 @@ public actor NativeCompanionServer {
         }
         let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n"
         connection.send(content: Data(head.utf8), completion: .contentProcessed { _ in })
-        let subscription = subscribeSSEWithIdentifier()
+        let subscription = subscribeSSEWithIdentifier(deviceId: deviceId)
         Task.detached { [weak self] in
             for await frame in subscription.stream {
                 // A write that fails means the peer is gone.  The loop ends
@@ -1556,14 +2058,43 @@ public actor NativeCompanionServer {
 #if canImport(Network)
 /// Lets a Network.framework state handler, which fires once per state on the
 /// listener's queue, resume a start's continuation exactly once.
-private final class ListenerStartSettlement: @unchecked Sendable {
+final class ListenerStartSettlement: @unchecked Sendable {
     private let lock = NSLock()
     private var settled = false
+    private var sequence: UInt64 = 0
+    private var reservedFailure: NWError?
+
+    var failure: NWError? {
+        lock.lock()
+        defer { lock.unlock() }
+        return reservedFailure
+    }
+
+    func reserveFailure(_ error: NWError) {
+        lock.lock()
+        if reservedFailure == nil { reservedFailure = error }
+        lock.unlock()
+    }
+
+    func nextSequence() -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        sequence &+= 1
+        return sequence
+    }
 
     func once(_ body: () -> Void) {
+        finish(allowReservedFailure: false, body)
+    }
+
+    func finishFailure(_ body: () -> Void) {
+        finish(allowReservedFailure: true, body)
+    }
+
+    private func finish(allowReservedFailure: Bool, _ body: () -> Void) {
         lock.lock()
-        let first = !settled
-        settled = true
+        let first = !settled && (reservedFailure == nil || allowReservedFailure)
+        if first { settled = true }
         lock.unlock()
         if first { body() }
     }

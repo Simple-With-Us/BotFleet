@@ -130,3 +130,15 @@ test("a capture with no IEND or a short chunk is refused", () => {
   assert.notEqual(r.status, 0);
   assert.match(r.stderr, /truncated PNG chunk/);
 });
+
+// The CI artifact must carry actual composer pixels as well as the existing
+// TV-Face comparison, and fail closed on missing or failed synthetic checks.
+test("composer capture reuses the isolated simulator and requires exact successful checks", () => {
+  assert.match(SCRIPT, /-composer-regression-preview/);
+  assert.match(SCRIPT, /simctl get_app_container/);
+  assert.match(SCRIPT, /set\(checks\) != expected/);
+  assert.match(SCRIPT, /value is not True/);
+  assert.match(SCRIPT, /ios-join-preview-captures\.swift/);
+  assert.equal((SCRIPT.match(/  capture_composer_regression\n/g) ?? []).length, 1);
+  assert.ok(SCRIPT.endsWith("capture_composer_regression\n"));
+});

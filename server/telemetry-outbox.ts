@@ -212,6 +212,8 @@ const SAFE_METADATA_KEYS = new Set([
   "characters",
   "characterSource",
   "images",
+  "durationSeconds",
+  "mode",
   "success",
   "tokenType",
   "model",
@@ -225,6 +227,12 @@ const SAFE_METADATA_KEYS = new Set([
   "childHarness",
   "childSessionId",
   "turnStartedAt",
+  "billedCallProofVersion",
+  "billedCallId",
+  "billedCallModel",
+  "billedCallOutput",
+  "billedCallCacheRead",
+  "billedCallCacheWrite",
 ]);
 
 export function usageTelemetryDestinationHash(endpoint: string): string {

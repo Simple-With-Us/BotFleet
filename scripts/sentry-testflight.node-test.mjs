@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFileSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -212,18 +212,30 @@ test('a failed write reports the JSON reason Sentry gave, with credentials scrub
 
 test('ship receipt follows recorded success only after exact ASC readiness; skipped states produce none', () => {
   const source=read('scripts/ios-fleet/ship-testflight.sh');
+  const rcSh=read('scripts/ios-fleet/tf-ready-rc.sh');
+  const prefix=source.slice(source.indexOf('# shellcheck source=scripts/ios-fleet/tf-ready-rc.sh'),source.indexOf('TF_READY_CONFIRMED=0'));
   const ensure=source.slice(source.indexOf('TF_READY_CONFIRMED=0'),source.indexOf('SENTRY_ARCHIVE_COMMIT="$(repo_head_sha)"'));
-  const emit=source.slice(source.indexOf('emit_sentry_deployment_receipt() {'),source.indexOf('\nacquire_archive_lock\nlog "archiving..."'));
+  const emit=source.slice(source.indexOf('write_deferred_sentry_ship_context() {'),source.indexOf('\nacquire_archive_lock\nlog "archiving..."'));
   const dir=mkdtempSync(join(tmpdir(),'sentry-testflight-'));
+  const fleetDir=join(dir,'fleet');
   try {
+    mkdirSync(fleetDir);
+    writeFileSync(join(fleetDir,'tf-ready-rc.sh'),rcSh);
     for (const [status, receiptStatus] of [[0,0],[0,1],[2,0],[3,0],[4,0]]) {
       const out=join(dir,`out-${status}-${receiptStatus}`); writeFileSync(out,'');
-      const script=`set -euo pipefail\nlog(){ :; }\nnode(){ if [[ "$1" == *asc-api.mjs ]]; then printf '{"ok":true}'; return ${status}; elif [[ ${receiptStatus} == 1 ]]; then return 1; else echo emitted >> "$GITHUB_OUTPUT"; fi; }\n${ensure}\n${emit}\nensure_tf_ready\nemit_sentry_deployment_receipt\n`;
+      const script=`set -euo pipefail\nlog(){ :; }\nnode(){ if [[ "$1" == *asc-api.mjs ]]; then printf '{"ok":true,"buildId":"b1","version":"2126","internalBuildState":"IN_BETA_TESTING","externalInstallPath":true}'; return ${status}; elif [[ ${receiptStatus} == 1 ]]; then return 1; else echo emitted >> "$GITHUB_OUTPUT"; fi; }\n${prefix}\n${ensure}\n${emit}\nensure_tf_ready\nemit_sentry_deployment_receipt\n`;
       const scriptFile=join(dir,'fixture.sh'); writeFileSync(scriptFile,script);
-      const result=spawnSync('bash',[shellPath(scriptFile)],{env:{PATH:process.env.PATH,APP_KEY:'botfleet',GITHUB_OUTPUT:shellPath(out),BUNDLE_ID:'app.botfleet.ios',BUILD_NUM:'2126',MARKETING:'1.0.79',REPO_ROOT:shellPath(dir),PREV_SHIP_SHA:sha,DISPLAY_NAME:'BotFleet',IOS_PATH_PREFIX:'ios',FLEET_DIR:shellPath(dir),LOG_DIR:shellPath(dir),ARCHIVE_PATH:shellPath(dir),SENTRY_ARCHIVE_COMMIT:sha},encoding:'utf8'});
+      const result=spawnSync('bash',[shellPath(scriptFile)],{env:{PATH:process.env.PATH,APP_KEY:'botfleet',GITHUB_OUTPUT:shellPath(out),BUNDLE_ID:'app.botfleet.ios',BUILD_NUM:'2126',MARKETING:'1.0.79',REPO_ROOT:shellPath(dir),PREV_SHIP_SHA:sha,DISPLAY_NAME:'BotFleet',IOS_PATH_PREFIX:'ios',FLEET_DIR:shellPath(fleetDir),LOG_DIR:shellPath(dir),ARCHIVE_PATH:shellPath(dir),SENTRY_ARCHIVE_COMMIT:sha,IOS_DEFER_SENTRY_RECEIPT:'0'},encoding:'utf8'});
       assert.equal(result.status,0,result.stderr);
       assert.equal(readFileSync(out,'utf8'),status!==0?'':receiptStatus===0?'emitted\n':'sentry_receipt_error=true\n');
     }
+    const deferOut=join(dir,'defer-out'); writeFileSync(deferOut,'');
+    const deferScript=`set -euo pipefail\nlog(){ :; }\nnode(){ if [[ "$1" == *asc-api.mjs ]]; then printf '{"ok":true}'; return 0; else return 1; fi; }\n${prefix}\n${ensure}\n${emit}\nensure_tf_ready\nemit_sentry_deployment_receipt\n`;
+    writeFileSync(join(dir,'defer.sh'),deferScript);
+    const defer=spawnSync('bash',[shellPath(join(dir,'defer.sh'))],{env:{PATH:process.env.PATH,APP_KEY:'botfleet',GITHUB_OUTPUT:shellPath(deferOut),BUNDLE_ID:'app.botfleet.ios',BUILD_NUM:'2126',MARKETING:'1.0.79',REPO_ROOT:shellPath(dir),PREV_SHIP_SHA:sha,DISPLAY_NAME:'BotFleet',IOS_PATH_PREFIX:'ios',FLEET_DIR:shellPath(fleetDir),LOG_DIR:shellPath(dir),ARCHIVE_PATH:shellPath(dir),SENTRY_ARCHIVE_COMMIT:sha,IOS_DEFER_SENTRY_RECEIPT:'1'},encoding:'utf8'});
+    assert.equal(defer.status,0,defer.stderr);
+    assert.match(readFileSync(deferOut,'utf8'),/ios_ship_archive_path=/);
+    assert.doesNotMatch(readFileSync(deferOut,'utf8'),/sentry_receipt=/);
   } finally { rmSync(dir,{recursive:true,force:true}); }
   assert.equal((source.match(/record_successful_ship\n\s*emit_sentry_deployment_receipt/g)||[]).length,2);
   assert.equal((source.match(/TF_READY_CONFIRMED=1/g)||[]).length,1);
@@ -236,8 +248,10 @@ test('ship receipt follows recorded success only after exact ASC readiness; skip
   assert.match(workflow,/receipt.sourceCommit !== process.env.GITHUB_SHA/);
   assert.match(workflow,/SENTRY_RECEIPT_ERROR === "true"\) throw new Error/);
   const ship=read('.github/workflows/ios-ship.yml');
-  assert.match(ship,/needs.ship.outputs.sentry_receipt != ''/);
-  assert.match(ship,/needs.ship.outputs.sentry_receipt_error == 'true'/);
+  assert.match(ship,/needs\.ship\.outputs\.sentry_receipt != ''/);
+  assert.match(ship,/needs\.ship\.outputs\.sentry_receipt_error == 'true'/);
+  assert.match(ship,/steps\.post_sync_tf\.outputs\.sentry_receipt/);
+  assert.match(ship,/ios-post-sync-tf-ready\.sh/);
   assert.match(ship,/uses: .\/.github\/workflows\/sentry-testflight.yml/);
   // The reporter is part of the ship, so an edit to any of its files must run the ship (the only way to exercise it).
   const shipPaths=ship.slice(ship.indexOf('paths:'),ship.indexOf('workflow_dispatch:'));
@@ -281,18 +295,23 @@ test('CLI malformed JSON error does not echo provided input or token', () => {
 
 test('a confirmed upload survives receipt failure and the same source is not uploaded again', () => {
   const source=read('scripts/ios-fleet/ship-testflight.sh');
+  const rcSh=read('scripts/ios-fleet/tf-ready-rc.sh');
   const stateFunctions=source.slice(source.indexOf('ship_state_path() {'),source.indexOf('\nwhile [[ $# -gt 0 ]]'));
+  const prefix=source.slice(source.indexOf('# shellcheck source=scripts/ios-fleet/tf-ready-rc.sh'),source.indexOf('TF_READY_CONFIRMED=0'));
   const ensure=source.slice(source.indexOf('TF_READY_CONFIRMED=0'),source.indexOf('SENTRY_ARCHIVE_COMMIT="$(repo_head_sha)"'));
-  const emit=source.slice(source.indexOf('emit_sentry_deployment_receipt() {'),source.indexOf('\nacquire_archive_lock\nlog "archiving..."'));
+  const emit=source.slice(source.indexOf('write_deferred_sentry_ship_context() {'),source.indexOf('\nacquire_archive_lock\nlog "archiving..."'));
   const dir=mkdtempSync(join(tmpdir(),'sentry-ship-state-'));
+  const fleetDir=join(dir,'fleet');
   const out=join(dir,'outputs'); writeFileSync(out,'');
   try {
+    mkdirSync(fleetDir);
+    writeFileSync(join(fleetDir,'tf-ready-rc.sh'),rcSh);
     // Only local fixture builtins replace time/permissions/publication; the
     // production state writer, duplicate-upload gate, and receipt guard run.
-    const script=`set -euo pipefail\nlog(){ :; }\njson_get(){ :; }\ndate(){ echo 1791280000; }\nmkdir(){ :; }\nchmod(){ :; }\nbash(){ return 1; }\n${stateFunctions}\nrepo_head_sha(){ echo ${sha}; }\nnode(){ if [[ "$1" == *asc-api.mjs ]]; then printf '{"ok":true}'; else return 1; fi; }\n${ensure}\n${emit}\nprintf uploaded > "$STATE_DIR/uploaded"\nensure_tf_ready\nrecord_successful_ship\nemit_sentry_deployment_receipt\nevaluate_ship_gate\nprintf '%s' "$SHIP_GATE_DECISION"\n`;
+    const script=`set -euo pipefail\nlog(){ :; }\njson_get(){ :; }\ndate(){ echo 1791280000; }\nmkdir(){ :; }\nchmod(){ :; }\nbash(){ return 1; }\n${stateFunctions}\nrepo_head_sha(){ echo ${sha}; }\nnode(){ if [[ "$1" == *asc-api.mjs ]]; then printf '{"ok":true,"buildId":"b1","version":"2126","internalBuildState":"IN_BETA_TESTING","externalInstallPath":true}'; return 0; else return 1; fi; }\n${prefix}\n${ensure}\n${emit}\nprintf uploaded > "$STATE_DIR/uploaded"\nensure_tf_ready\nrecord_successful_ship\nemit_sentry_deployment_receipt\nevaluate_ship_gate\nprintf '%s' "$SHIP_GATE_DECISION"\n`;
     // A file avoids Windows/Git Bash inline-command length and quoting limits.
     const scriptFile=join(dir,'fixture.sh'); writeFileSync(scriptFile,script);
-    const result=spawnSync('bash',[shellPath(scriptFile)],{env:{PATH:process.env.PATH,APP_KEY:'botfleet',GITHUB_OUTPUT:shellPath(out),STATE_DIR:shellPath(dir),FORCE_SHIP:'0',EXPORT_ONLY:'0',DEFAULT_MIN_INTERVAL_SEC:'3600',BUNDLE_ID:'app.botfleet.ios',BUILD_NUM:'2126',MARKETING:'1.0.79',REPO_ROOT:shellPath(dir),PREV_SHIP_SHA:'',DISPLAY_NAME:'BotFleet',IOS_PATH_PREFIX:'ios',FLEET_DIR:shellPath(dir),LOG_DIR:shellPath(dir),ARCHIVE_PATH:shellPath(dir),SENTRY_ARCHIVE_COMMIT:sha},encoding:'utf8'});
+    const result=spawnSync('bash',[shellPath(scriptFile)],{env:{PATH:process.env.PATH,APP_KEY:'botfleet',GITHUB_OUTPUT:shellPath(out),STATE_DIR:shellPath(dir),FORCE_SHIP:'0',EXPORT_ONLY:'0',DEFAULT_MIN_INTERVAL_SEC:'3600',BUNDLE_ID:'app.botfleet.ios',BUILD_NUM:'2126',MARKETING:'1.0.79',REPO_ROOT:shellPath(dir),PREV_SHIP_SHA:'',DISPLAY_NAME:'BotFleet',IOS_PATH_PREFIX:'ios',FLEET_DIR:shellPath(fleetDir),LOG_DIR:shellPath(dir),ARCHIVE_PATH:shellPath(dir),SENTRY_ARCHIVE_COMMIT:sha,IOS_DEFER_SENTRY_RECEIPT:'0'},encoding:'utf8'});
     assert.equal(result.status,0,result.stderr);
     assert.equal(result.stdout,'skip');
     assert.equal(readFileSync(join(dir,'uploaded'),'utf8'),'uploaded');

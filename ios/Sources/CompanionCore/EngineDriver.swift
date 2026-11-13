@@ -442,7 +442,18 @@ public actor TurnDispatcherActor {
     }
 
     private var activeTurns: [String: ActiveTurnContext] = [:]
+    private var unsettledTasks: [UUID: Task<Void, Never>] = [:]
+    private struct Cancellation {
+        let threadId: String
+        let botId: String
+        let task: Task<Void, Never>
+    }
+    private var cancellations: [UUID: Cancellation] = [:]
+    private var cancellationByThread: [String: UUID] = [:]
+    private var isShutdown = false
     private let database: DatabaseService?
+    private let requiresDurablePersistence: Bool
+    private var persistenceFailed = false
     private let stallTimeoutSeconds: Double
     private let maxRetriesPerEngine: Int
     private let retryDelaySeconds: Double
@@ -455,9 +466,11 @@ public actor TurnDispatcherActor {
         maxRetriesPerEngine: Int = 1,
         retryDelaySeconds: Double = 0.05,
         bufferCapacity: Int = 256,
-        recovery: NativeEngineRecoveryActor = NativeEngineRecoveryActor()
+        recovery: NativeEngineRecoveryActor = NativeEngineRecoveryActor(),
+        requiresDurablePersistence: Bool = false
     ) {
         self.database = database
+        self.requiresDurablePersistence = requiresDurablePersistence
         self.stallTimeoutSeconds = stallTimeoutSeconds
         self.maxRetriesPerEngine = maxRetriesPerEngine
         self.retryDelaySeconds = retryDelaySeconds
@@ -466,23 +479,49 @@ public actor TurnDispatcherActor {
     }
 
     public func isTurnActive(threadId: String) -> Bool {
-        activeTurns[threadId] != nil
+        activeTurns[threadId] != nil || cancellationByThread[threadId] != nil
     }
 
     public func isBotActive(botId: String) -> Bool {
-        activeTurns.values.contains { $0.botId == botId }
+        activeTurns.values.contains { $0.botId == botId } || cancellations.values.contains { $0.botId == botId }
+    }
+
+    /// How many turns are in flight right now.  Read-only composition glue
+    /// for the Mac app's graceful-stop drain counters: the active engine
+    /// turn count feeds the drain path's work-in-flight number.
+    public func activeTurnCount() -> Int {
+        activeTurns.count + cancellations.count
     }
 
     public func cancelTurn(threadId: String) async {
-        guard let generation = activeTurns[threadId]?.generation else { return }
+        guard let generation = activeTurns[threadId]?.generation ?? cancellationByThread[threadId] else { return }
         await cancelTurn(threadId: threadId, generation: generation)
     }
 
     private func cancelTurn(threadId: String, generation: UUID) async {
-        guard let active = activeTurns[threadId], active.generation == generation else { return }
+        guard let task = beginCancellation(threadId: threadId, generation: generation) else { return }
+        await task.value
+        finishCancellation(threadId: threadId, generation: generation)
+    }
+
+    /// Register teardown ownership before yielding, so every stop caller joins the same driver cancellation.
+    private func beginCancellation(threadId: String, generation: UUID) -> Task<Void, Never>? {
+        if let cancellation = cancellations[generation] {
+            return cancellation.threadId == threadId ? cancellation.task : nil
+        }
+        guard let active = activeTurns[threadId], active.generation == generation else { return nil }
+        let driver = active.currentEngine
+        let task = Task { await driver.cancelTurn(threadId: threadId) }
+        cancellations[generation] = Cancellation(threadId: threadId, botId: active.botId, task: task)
+        cancellationByThread[threadId] = generation
         activeTurns.removeValue(forKey: threadId)
         active.task.cancel()
-        await active.currentEngine.cancelTurn(threadId: threadId)
+        return task
+    }
+
+    private func finishCancellation(threadId: String, generation: UUID) {
+        cancellations.removeValue(forKey: generation)
+        if cancellationByThread[threadId] == generation { cancellationByThread.removeValue(forKey: threadId) }
     }
 
     /// Dispatches a turn across the provided ordered fallback chain of drivers.
@@ -491,10 +530,11 @@ public actor TurnDispatcherActor {
         input: TurnInput,
         fallbackChain: [any EngineDriver]
     ) throws -> AsyncStream<TurnEvent> {
+        guard !isShutdown else { throw EngineDriverError.cancelled(threadId: input.threadId) }
         guard !fallbackChain.isEmpty else {
             throw EngineDriverError.noEnginesConfigured(botId: input.botId)
         }
-        guard activeTurns[input.threadId] == nil else {
+        guard activeTurns[input.threadId] == nil, cancellationByThread[input.threadId] == nil else {
             throw EngineDriverError.turnAlreadyActive(threadId: input.threadId)
         }
 
@@ -524,6 +564,7 @@ public actor TurnDispatcherActor {
             currentModelId: input.modelId,
             task: task
         )
+        unsettledTasks[generation] = task
 
         continuation.onTermination = { [weak self] termination in
             if case .cancelled = termination {
@@ -543,8 +584,28 @@ public actor TurnDispatcherActor {
     }
 
     private func finishTurn(threadId: String, generation: UUID) {
+        unsettledTasks.removeValue(forKey: generation)
         guard activeTurns[threadId]?.generation == generation else { return }
         activeTurns.removeValue(forKey: threadId)
+    }
+
+    /// Fence admission before cancelling owned turns, then await their persistence and stream settlement.
+    public func shutdownAndDrain() async throws {
+        isShutdown = true
+        let turns = Array(activeTurns.values)
+        for turn in turns {
+            _ = beginCancellation(threadId: turn.threadId, generation: turn.generation)
+        }
+        let tasks = Array(unsettledTasks.values)
+        let pendingCancellations = Array(cancellations)
+        for (generation, cancellation) in pendingCancellations {
+            await cancellation.task.value
+            finishCancellation(threadId: cancellation.threadId, generation: generation)
+        }
+        for task in tasks { await task.value }
+        guard !persistenceFailed else {
+            throw EngineDriverError.protocolError(code: "persistence_failed", message: "Native turn persistence did not complete")
+        }
     }
 
     private func dispatchIsCurrent(threadId: String, generation: UUID) -> Bool {
@@ -563,32 +624,37 @@ public actor TurnDispatcherActor {
         }
 
         if let database {
-            let now = Date().timeIntervalSince1970
-            // `upsertThread` overwrites `title` and `bot_id` on conflict, so a thread that already
-            // carries a user-visible title must keep it: only a thread that does not exist yet gets
-            // the raw thread id as its title.
-            let existing = try? await database.loadThreads(forBot: nil, limit: 1000)
-                .first(where: { $0.id == input.threadId })
-            try? await database.upsertThread(
-                ThreadRecord(
-                    id: input.threadId,
-                    title: existing?.title ?? input.threadId,
-                    botId: existing?.botId ?? input.botId,
-                    createdAt: existing?.createdAt ?? now,
-                    updatedAt: now
+            do {
+                let now = Date().timeIntervalSince1970
+                // Preserve the existing title and bot ownership when persisting a native turn.
+                let existing = try await database.loadThread(id: input.threadId)
+                try await database.upsertThread(
+                    ThreadRecord(
+                        id: input.threadId,
+                        title: existing?.title ?? input.threadId,
+                        botId: existing?.botId ?? input.botId,
+                        createdAt: existing?.createdAt ?? now,
+                        updatedAt: now
+                    )
                 )
-            )
-            try? await database.insertMessage(
-                MessageRecord(
-                    id: "user-\(UUID().uuidString)",
-                    threadId: input.threadId,
-                    role: "user",
-                    kind: "text",
-                    content: input.prompt,
-                    createdAt: now,
-                    model: input.modelId
+                try await database.insertMessage(
+                    MessageRecord(
+                        id: "user-\(UUID().uuidString)",
+                        threadId: input.threadId,
+                        role: "user",
+                        kind: "text",
+                        content: input.prompt,
+                        createdAt: now,
+                        model: input.modelId
+                    )
                 )
-            )
+            } catch {
+                if requiresDurablePersistence {
+                    persistenceFailed = true
+                    continuation.yield(.error(code: "persistence_failed", message: "Native turn input could not be persisted"))
+                    return
+                }
+            }
         }
 
         var accumulatedText = ""
@@ -709,17 +775,24 @@ public actor TurnDispatcherActor {
                     await recovery.markHealthy(route: route)
                     await recovery.clearSuccessfulQuota(route: route)
                     if let database, !accumulatedText.isEmpty {
-                        try? await database.insertMessage(
-                            MessageRecord(
-                                id: "assistant-\(UUID().uuidString)",
-                                threadId: input.threadId,
-                                role: "assistant",
-                                kind: "text",
-                                content: accumulatedText,
-                                createdAt: Date().timeIntervalSince1970,
-                                model: input.modelId
+                        do {
+                            try await database.insertMessage(
+                                MessageRecord(
+                                    id: "assistant-\(UUID().uuidString)",
+                                    threadId: input.threadId,
+                                    role: "assistant",
+                                    kind: "text",
+                                    content: accumulatedText,
+                                    createdAt: Date().timeIntervalSince1970,
+                                    model: input.modelId
+                                )
                             )
-                        )
+                        } catch {
+                            if requiresDurablePersistence {
+                                persistenceFailed = true
+                                continuation.yield(.error(code: "persistence_failed", message: "Native turn output could not be persisted"))
+                            }
+                        }
                     }
                     return
                 }
@@ -793,6 +866,7 @@ public actor EngineCoordinatorActor {
     private var botFallbackChains: [String: [String]] = [:]
     private let dispatcher: TurnDispatcherActor
     private let turnTools: NativeTurnToolsActor?
+    private var isShutdown = false
 
     public init(
         drivers: [any EngineDriver] = [],
@@ -817,6 +891,7 @@ public actor EngineCoordinatorActor {
     }
 
     public func sendTurn(input: TurnInput) async throws -> AsyncStream<TurnEvent> {
+        guard !isShutdown else { throw EngineDriverError.cancelled(threadId: input.threadId) }
         let preparedInput: TurnInput
         if let turnTools {
             preparedInput = try input.withToolPreparation(await turnTools.prepare(botId: input.botId))
@@ -824,6 +899,7 @@ public actor EngineCoordinatorActor {
             preparedInput = try input.withToolPreparation(input.toolPreparation)
         }
         let chainIds = botFallbackChains[input.botId] ?? Array(driversById.keys.sorted())
+        guard !isShutdown else { throw EngineDriverError.cancelled(threadId: input.threadId) }
         let chain = chainIds.compactMap { driversById[$0] }
         guard !chain.isEmpty else {
             throw EngineDriverError.noEnginesConfigured(botId: input.botId)
@@ -834,7 +910,16 @@ public actor EngineCoordinatorActor {
     public func isTurnActive(threadId: String) async -> Bool { await dispatcher.isTurnActive(threadId: threadId) }
     public func isBotActive(botId: String) async -> Bool { await dispatcher.isBotActive(botId: botId) }
 
+    /// How many turns are in flight right now.  Read-only composition glue
+    /// for the Mac app's graceful-stop drain counters.
+    public func activeTurnCount() async -> Int { await dispatcher.activeTurnCount() }
+
     public func cancelTurn(threadId: String) async {
         await dispatcher.cancelTurn(threadId: threadId)
+    }
+
+    public func shutdownAndDrain() async throws {
+        isShutdown = true
+        try await dispatcher.shutdownAndDrain()
     }
 }

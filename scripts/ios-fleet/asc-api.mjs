@@ -258,19 +258,19 @@ const AGENT_MARKER = new RegExp(`\\[\\s*(?:ag|${AGENT_NAMES})\\s*\\]`, "gi");
 // so the final rendered-body assertion tests for that form specifically.
 const AGENT_NAME_DENY = new RegExp(`(?:\\b(?:${AGENT_NAMES})\\b|\\[\\s*ag\\s*\\])`, "i");
 
-function centralTimestamp(now = new Date()) {
-  // FLEET-PROTOCOL renders "Mon, Aug 12, 2026 at 1:15 AM CT". One combined
-  // Intl call yields "Mon, Aug 12, 2026, 1:15 AM" (comma, not "at"), so build
-  // the two halves separately. America/Chicago handles CDT/CST automatically.
+export function centralTimestamp(now = new Date()) {
+  // TestFlight "Released:" line: owner's clock in America/Chicago, 12-hour
+  // lowercase am/pm, zone never named (Usage-Monitor #1693).
   const d = new Intl.DateTimeFormat("en-US", {
     timeZone: "America/Chicago",
     weekday: "short", month: "short", day: "numeric", year: "numeric"
   }).format(now);
-  const t = new Intl.DateTimeFormat("en-US", {
+  let t = new Intl.DateTimeFormat("en-US", {
     timeZone: "America/Chicago",
     hour: "numeric", minute: "2-digit", hour12: true
   }).format(now);
-  return `${d} at ${t} CT`;
+  t = t.replace(/\u202F/g, "").replace(/\s*(AM|PM)\s*$/i, (_, ap) => ap.toLowerCase());
+  return `${d} at ${t}`;
 }
 
 function gitSubjects(repoRoot, prevSha) {
@@ -450,6 +450,42 @@ export async function ascAllRows({ api, url }) {
 export function ascErrorText(res) {
   const e = (res?.parsed?.errors || [])[0] || {};
   return `HTTP ${res?.status} ${e.code || ""} ${e.detail || e.title || ""}`.trim();
+}
+
+// One authenticated client for importers (fleet-tf-audit.mjs).  It resolves the
+// credential and signs the JWT exactly as main() does, then hands back the
+// same api(method, path, jsonBody) shape the helpers above take.  Nothing here
+// changes the CLI:  main() keeps its own client.  Key material and the token
+// stay inside the closure and are never returned or printed.
+export function createAscApi({ fetchImpl = fetch } = {}) {
+  const cred = resolveCredential();
+  if (cred.error) return { ok: false, error: cred.error };
+  if (!cred.privateKeyPem) {
+    const notes = RESOLUTION_NOTES.length ? ` Skipped: ${RESOLUTION_NOTES.join("; ")}.` : "";
+    return { ok: false, error: `no App Store Connect credential found.${notes}` };
+  }
+  let token;
+  try {
+    token = signJwt({ keyId: cred.keyId, issuerId: cred.issuerId, privateKeyPem: cred.privateKeyPem });
+  } catch {
+    return { ok: false, error: "could not sign the App Store Connect token with the resolved credential" };
+  }
+  async function api(methodName, apiPath, jsonBody) {
+    const url = apiPath.startsWith("http") ? apiPath : `https://api.appstoreconnect.apple.com${apiPath}`;
+    const res = await fetchImpl(url, {
+      method: methodName,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json"
+      },
+      body: jsonBody ? jsonBody : undefined
+    });
+    const text = await res.text();
+    let parsed;
+    try { parsed = JSON.parse(text); } catch { parsed = { raw: text }; }
+    return { status: res.status, ok: res.ok, parsed, text };
+  }
+  return { ok: true, api, source: cred.source };
 }
 
 export function maskEmail(email) {
@@ -800,7 +836,93 @@ async function setWhatToTest({ api, buildId, appId, marketing }) {
     : `release-notes: POST failed HTTP ${res.status}`);
 }
 
+/**
+ * The arguments of a shared release build plan.
+ *
+ * Parsed and validated on its own, before any credential is resolved, so a
+ * usage mistake is answered as a usage mistake.  A caller that misspells
+ * --platform must not be told it has no App Store Connect credential: that
+ * sends the operator to the wrong place, and the plan is a release step.
+ *
+ * Throws with the message to print; the caller turns that into exit 2.
+ */
+export function parseSharedPlanArgs(command, restArgs) {
+  const usage = `Usage: node asc-api.mjs ${command} <bundleId> [pairedBundleId] [floor...] --merge-stamp <S> [--platform ios|macos]`;
+  const bundleId = restArgs[0] || "";
+  if (!bundleId || bundleId.startsWith("--")) {
+    throw new Error(usage);
+  }
+  // A pure-integer arg is a floor, not a bundle id (bundle ids are never
+  // bare integers), so a caller with no paired app passes only floors.
+  // --merge-stamp S (or --merge-stamp=S) carries the merge stamp.
+  let macBundleId = "";
+  let platform = "";
+  let platformFlagSeen = false;
+  const floorArgs = [];
+  let mergeStamp = "";
+  const rest = restArgs.slice(1);
+  for (let i = 0; i < rest.length; i++) {
+    const arg = rest[i];
+    if (arg === "--platform") {
+      platformFlagSeen = true;
+      platform = rest[i + 1] || "";
+      i++;
+    } else if (arg.startsWith("--platform=")) {
+      platformFlagSeen = true;
+      platform = arg.slice("--platform=".length);
+    } else if (arg === "--merge-stamp") {
+      mergeStamp = rest[i + 1] || "";
+      i++;
+    } else if (arg.startsWith("--merge-stamp=")) {
+      mergeStamp = arg.slice("--merge-stamp=".length);
+    } else if (arg.startsWith("--")) {
+      throw new Error(usage);
+    } else if (/^[0-9]+$/.test(arg)) {
+      floorArgs.push(arg);
+    } else if (!macBundleId) {
+      macBundleId = arg;
+    } else {
+      throw new Error(usage);
+    }
+  }
+  if (!/^[1-9][0-9]{11}$/.test(mergeStamp)) {
+    throw new Error(`${command}: --merge-stamp must be a 12-digit YYYYMMDDHHMM string`);
+  }
+  if (platform && platform !== "ios" && platform !== "macos") {
+    throw new Error(`${command}: --platform must be ios or macos (got "${platform}")`);
+  }
+  // A --platform with no value is a caller mistake, not a request for the
+  // legacy plan.  Falling through would plan the legacy max + 1 build and
+  // split the iOS and Mac builds of one commit by one, silently.
+  if (platformFlagSeen && !platform) {
+    throw new Error(`${command}: --platform requires a value (ios or macos)`);
+  }
+  // Floors stay strings: an 18-digit Sparkle floor is past Number's safe
+  // range, and the planner compares them as BigInt.
+  const extraFloors = [];
+  for (const f of floorArgs) {
+    if (!/^[0-9]+$/.test(f)) {
+      throw new Error(`${command}: floor ${JSON.stringify(f)} is not a non-negative integer`);
+    }
+    extraFloors.push(f);
+  }
+  return { bundleId, macBundleId, platform, extraFloors, mergeStamp };
+}
+
 async function main() {
+  const [method, path, body, arg4, arg5] = process.argv.slice(2);
+  // The plan commands validate their arguments BEFORE any credential is
+  // resolved.  A usage mistake must be answered as a usage mistake: telling
+  // the operator that they have no credential when they misspelled a flag
+  // sends them to the wrong place, and the plan is a release step.
+  if (method === "plan-release-build" || method === "next-shared-build") {
+    try {
+      parseSharedPlanArgs(method, process.argv.slice(3));
+    } catch (error) {
+      console.error(error.message);
+      process.exit(2);
+    }
+  }
   const cred = resolveCredential();
   if (cred.error) {
     console.error(`asc-auth: ${cred.error}`);
@@ -823,7 +945,6 @@ async function main() {
   console.error(`asc-auth: using ${cred.source} (key id length ${cred.keyId.length})`);
   const token = signJwt({ keyId: cred.keyId, issuerId: cred.issuerId, privateKeyPem: cred.privateKeyPem });
 
-  const [method, path, body, arg4, arg5] = process.argv.slice(2);
   if (!method || !path) {
     console.error("Usage: node asc-api.mjs <METHOD> <PATH> [JSON_BODY]");
     console.error("       node asc-api.mjs ensure-tf-ready <bundleId> <buildVersion> [marketingVersion] [appleId]");
@@ -1396,52 +1517,14 @@ async function main() {
   // App Store Connect at upload, so the loser fails loudly and nothing is
   // promoted.  Do not run a local ship while the workflow is running.
   async function planSharedReleaseBuild(command, restArgs) {
-    const usage = `Usage: node asc-api.mjs ${command} <bundleId> [pairedBundleId] [floor...] --merge-stamp <S>`;
-    const bundleId = restArgs[0] || "";
-    if (!bundleId || bundleId.startsWith("--")) {
-      console.error(usage);
+    let parsed;
+    try {
+      parsed = parseSharedPlanArgs(command, restArgs);
+    } catch (error) {
+      console.error(error.message);
       process.exit(2);
     }
-    // A pure-integer arg is a floor, not a bundle id (bundle ids are never
-    // bare integers), so a caller with no paired app passes only floors.
-    // --merge-stamp S (or --merge-stamp=S) carries the merge stamp.
-    let macBundleId = "";
-    const floorArgs = [];
-    let mergeStamp = "";
-    const rest = restArgs.slice(1);
-    for (let i = 0; i < rest.length; i++) {
-      const arg = rest[i];
-      if (arg === "--merge-stamp") {
-        mergeStamp = rest[i + 1] || "";
-        i++;
-      } else if (arg.startsWith("--merge-stamp=")) {
-        mergeStamp = arg.slice("--merge-stamp=".length);
-      } else if (arg.startsWith("--")) {
-        console.error(usage);
-        process.exit(2);
-      } else if (/^[0-9]+$/.test(arg)) {
-        floorArgs.push(arg);
-      } else if (!macBundleId) {
-        macBundleId = arg;
-      } else {
-        console.error(usage);
-        process.exit(2);
-      }
-    }
-    if (!/^[1-9][0-9]{11}$/.test(mergeStamp)) {
-      console.error(`${command}: --merge-stamp must be a 12-digit YYYYMMDDHHMM string`);
-      process.exit(2);
-    }
-    // Floors stay strings: an 18-digit Sparkle floor is past Number's safe
-    // range, and the planner compares them as BigInt.
-    const extraFloors = [];
-    for (const f of floorArgs) {
-      if (!/^[0-9]+$/.test(f)) {
-        console.error(`${command}: floor ${JSON.stringify(f)} is not a non-negative integer`);
-        process.exit(2);
-      }
-      extraFloors.push(f);
-    }
+    const { bundleId, macBundleId, platform, extraFloors, mergeStamp } = parsed;
     // No positional appleId slot: the floors are variadic.  A hint set in the
     // environment still applies through resolveAscAppId.
     const { appId } = await resolveAscAppId(bundleId, "", command);
@@ -1483,7 +1566,7 @@ async function main() {
       macBuilds = macA;
     }
     try {
-      const planned = nextSharedBuild({ iosBuilds, macBuilds, extraFloors, complete: true, mergeStamp });
+      const planned = nextSharedBuild({ iosBuilds, macBuilds, extraFloors, complete: true, mergeStamp, platform: platform || undefined });
       console.error(`${command}: ${iosBuilds.length} iOS build(s) + ${macBuilds.length} macOS build(s) inspected; merge stamp ${mergeStamp}; next is ${planned.build}`);
       console.log(planned.build);
     } catch (error) {

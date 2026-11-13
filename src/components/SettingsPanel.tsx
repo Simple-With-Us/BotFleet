@@ -14,7 +14,17 @@ import { requestNotificationPermission } from "@/lib/notify";
 import { botUsage, costCaption, formatTokens, formatUsd, hasFiniteCost } from "@/lib/usage";
 import { shortPath } from "@/lib/short-path";
 import { botCloudBackend, cloudBackendInherited, cloudDestinationLabel } from "@/lib/cloud-backend";
-import { computerDestinationDisabledReason, instanceSupportsLocalComputer, localComputerDisabledReason, localComputerSelectable } from "@/lib/local-computer";
+import {
+  COMPUTER_REACH_CHECKING,
+  cloudBackendUnavailableNote,
+  computerDestinationDisabledReason,
+  engineReachKnown,
+  instanceSupportsCloudComputer,
+  instanceSupportsLocalComputer,
+  localComputerDisabledReason,
+  localComputerSelectable,
+  runsOnDisabledNote,
+} from "@/lib/local-computer";
 import { BotProfileAvatarCard } from "./BotProfileAvatarCard";
 import { BotPowerToggle } from "./BotPowerToggle";
 import { ConfirmDialog } from "./ConfirmDialog";
@@ -372,13 +382,35 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
   // actually open — not the empty field it happens to carry.  Hoisted above
   // `destinationDisabled` because that helper takes cloudBackend too.
   const cloudBackend = botCloudBackend(bot, state.config?.botDefaults?.cloudBackend);
+  const platformIsMac =
+    capabilities.host.platform === "darwin" ||
+    (capabilities.host.platform === "other" && globalThis.navigator?.userAgent.includes("Mac") === true);
+  const reachReady = engineReachKnown({
+    instances: state.instances,
+    hydrationStatus: state.hydration.status,
+  });
   // The server refuses an unsupported destination at turn time; the picker
   // should not have offered it.  See computerDestinationDisabledReason.
   const destinationDisabled = (mode: "cloud" | "vm" | "local" | "off"): string | null => {
     if (mode === "local") return localSelectable ? null : localDisabledReason;
-    if (mode === "cloud" || mode === "vm") return computerDestinationDisabledReason(mode, state.instances, bot, cloudBackend);
+    if (mode === "cloud" || mode === "vm") {
+      if (!reachReady) return COMPUTER_REACH_CHECKING;
+      return computerDestinationDisabledReason(mode, state.instances, bot, cloudBackend, platformIsMac);
+    }
     return null;
   };
+  const vpsSupported = reachReady && instanceSupportsCloudComputer(state.instances, bot, "vps");
+  const boxSupported = reachReady && instanceSupportsCloudComputer(state.instances, bot, "box");
+  const cloudNote = reachReady
+    ? cloudBackendUnavailableNote(state.instances, bot, platformIsMac)
+    : COMPUTER_REACH_CHECKING;
+  const cloudPickerVisible = !(bot.computers?.length) || Boolean(bot.computers?.includes("cloud"));
+  const runsOnNote = runsOnDisabledNote(
+    destinationDisabled("cloud"),
+    destinationDisabled("vm"),
+    cloudNote,
+    cloudPickerVisible,
+  );
   const patch = (
     p: Partial<BotUpdatePatch> & {
       // Panel-only fields the broad PATCH boundary (BotUpdatePatch) does not
@@ -401,7 +433,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
   // lib/bot-settings-gates.ts.
   const gates = botCapabilityGates(state.instances, bot);
   const engine = gates.engine;
-  const { canCoordinate, canUseConnectedApps, canUseVps } = gates;
+  const { canCoordinate, canUseConnectedApps } = gates;
   const roundsGate = toolRoundsGate(state.instances, bot);
   const historyGate = historySummaryGate(state.instances, bot);
   // Null when the engine asks and the broker answers, which is the common case.
@@ -724,9 +756,13 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
                 ["off", "Off"],
               ] as const).map(([mode, label], i) => {
                 const blocked = destinationDisabled(mode);
+                const selected = mode === "off"
+                  ? bot.computers !== undefined && bot.computers.length === 0
+                  : (bot.computers ?? []).includes(mode as any);
                 return (
                 <button
                   key={mode}
+                  type="button"
                   disabled={Boolean(blocked)}
                   title={blocked ?? undefined}
                   onClick={() => {
@@ -746,11 +782,8 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
                     "flex-1 py-1.5 text-[13px] capitalize",
                     i > 0 && "border-l border-hairline/40",
                     blocked && "cursor-not-allowed opacity-40",
-                    (mode === "off"
-                      ? bot.computers !== undefined && bot.computers.length === 0
-                      : (bot.computers ?? []).includes(mode as any))
-                      ? "bg-control text-ink font-medium"
-                      : "text-ink-secondary hover:bg-control/60 hover:text-ink",
+                    selected ? "bg-control text-ink font-medium" : "text-ink-secondary",
+                    !blocked && !selected && "hover:bg-control/60 hover:text-ink",
                   )}
                 >
                   {label}
@@ -758,15 +791,11 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
                 );
               })}
             </div>
-            {(["cloud", "vm"] as const)
-              .map((mode) => destinationDisabled(mode))
-              .filter((reason): reason is string => Boolean(reason))
-              .slice(0, 1)
-              .map((reason) => (
-                <div key={reason} className="mt-2 text-[11.5px] leading-relaxed text-ink-secondary">
-                  {reason}
-                </div>
-              ))}
+            {runsOnNote && (
+              <div className="mt-2 text-[11.5px] leading-relaxed text-ink-secondary">
+                {runsOnNote}
+              </div>
+            )}
             {(bot.computers ?? []).length > 1 && (
               <div className="mt-3 rounded-lg bg-inset px-3 py-2.5 text-[11.5px] text-ink-secondary">
                 This bot has {(bot.computers ?? []).length} computers and its own tools for each.  It picks per task,
@@ -778,7 +807,10 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
                 <CloudBackendPicker
                   value={cloudBackend}
                   inherited={cloudBackendInherited(bot)}
-                  vpsSupported={canUseVps}
+                  vpsSupported={vpsSupported}
+                  boxSupported={boxSupported}
+                  engineName={engine?.displayName}
+                  unavailableNote={cloudNote}
                   onChange={(backend) => patch({ cloudBackend: backend })}
                 />
                 {!(bot.computers?.length) && cloudBackend === "vps" && (
@@ -965,10 +997,10 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
           <div className="flex items-center justify-between gap-4 rounded-xl bg-card p-4">
             <div>
               <div className="flex items-center gap-2 text-[15px] font-medium text-ink">
-                <Bug size={16} className="text-ink-secondary" /> Developer Inspector
+                <Bug size={16} className="text-ink-secondary" /> Chat Inspector
               </div>
               <div className="mt-0.5 text-[13px] text-ink-secondary">
-                View live runtime events, tool execution payloads, and wire protocol diagnostics for this thread.
+                See this chat’s events, tool results, and connection details.
               </div>
             </div>
             <button

@@ -7,8 +7,16 @@ import { z } from "zod";
 import { writeFileAtomic } from "./atomic.ts";
 import { extractRequestMetadata, type WebhookRequestMetadata } from "./request-log.ts";
 import { DATA_DIR } from "./config.ts";
+import { isClassifyOrUiPassWake, isCompileGatesWake, isUiPassWake } from "./ephemeral-dispatch.ts";
 import type { RoutineRunOn } from "./routines.ts";
 import { parseJson, schemaIssue, type JsonValue } from "./schema.ts";
+import { getSentry, isSentryActive } from "./sentry.ts";
+import {
+  DEFAULT_WEBHOOK_PAYLOAD_DEDUPE_MS,
+  sameWebhookPayloadDedupeIdentity,
+  webhookPayloadDedupeIdentity,
+  type WebhookPayloadDedupeIdentity,
+} from "./webhook-payload-dedupe.ts";
 import {
   asRecord,
   isGithubWebhookPayload,
@@ -146,6 +154,9 @@ interface DeliveryReceipt {
   key: string;
   runId: string;
   at: number;
+  stateKey?: string;
+  /** Set only for a delivery that was accepted and may suppress a later copy. */
+  payloadDedupe?: WebhookPayloadDedupeIdentity;
 }
 
 interface WebhookFile {
@@ -153,6 +164,7 @@ interface WebhookFile {
   webhooks: StoredWebhookTrigger[];
   deliveries: DeliveryReceipt[];
   attempts?: WebhookAttempt[];
+  payloadDedupeSkips?: number;
 }
 
 interface CreatedWebhook {
@@ -166,6 +178,8 @@ export interface WebhookEvent {
   eventName?: string;
   userAgent?: string;
   deliveryId?: string;
+  /** Manual tester sends are intentional repeats, so they neither match nor arm payload dedupe. */
+  skipPayloadDedupe?: boolean;
 }
 
 export interface WebhookReceiveResult {
@@ -195,7 +209,18 @@ export interface WebhookManagerOptions {
   }) => { id: string; status?: string; error?: string };
   cancelQueued?: (webhookId: string, message: string) => void;
   pendingRuns?: (webhookId: string) => number;
+  /** Whether a new delivery for this webhook and bot can be coalesced into an existing queued run. */
+  canCoalesce?: (webhookId: string, botId: string) => boolean;
+  /** The current status of a run, when the engine still holds it.  A PR
+   *  state whose run failed, was cancelled or was missed did not get
+   *  handled, so it must not block a later delivery. */
+  runStatus?: (runId: string) => string | undefined;
+  /** Quiet period for an identical normalized payload.  Absent means 120 seconds.  0 disables. */
+  payloadDedupeWindowMs?: () => number;
 }
+
+/** Run statuses that mean the PR state was not handled. */
+const UNHANDLED_RUN_STATUSES = new Set(["failed", "cancelled", "missed"]);
 
 export type WebhookManagerEvent =
   | { kind: "webhook"; webhook: WebhookTrigger }
@@ -294,10 +319,17 @@ const storedWebhookSchema = z.object({
   oneShotWake: z.boolean().optional(),
   secretHash: z.string().regex(/^[a-f0-9]{64}$/),
 });
+const payloadDedupeIdentitySchema = z.object({
+  botId: z.string().min(1),
+  source: z.string().min(1),
+  hash: z.string().regex(/^[a-f0-9]{64}$/),
+});
 const deliveryReceiptSchema = z.object({
   key: z.string().min(1),
   runId: z.string().min(1),
   at: z.number().finite().nonnegative(),
+  stateKey: z.string().min(1).optional(),
+  payloadDedupe: payloadDedupeIdentitySchema.optional().catch(undefined),
 });
 const webhookAttemptSchema = z.object({
   id: z.string().min(1),
@@ -316,6 +348,7 @@ const webhookFileSchema = z.object({
   webhooks: z.array(storedWebhookSchema),
   deliveries: z.array(deliveryReceiptSchema),
   attempts: z.array(webhookAttemptSchema).optional(),
+  payloadDedupeSkips: z.number().int().nonnegative().optional().catch(undefined),
 });
 const taskPayloadSchema = z.object({ task: z.string().optional(), message: z.string().optional() });
 const statusErrorSchema = z.object({ status: z.number().int().optional() });
@@ -473,8 +506,35 @@ function isLabelSignal(
   return action === "labeled" && (trigger.requiredLabels?.length ?? 0) > 0;
 }
 
+/** Review bots whose GitHub login carries no `[bot]` suffix.  Lower case. */
+export const KNOWN_REVIEW_BOT_LOGINS: readonly string[] = [
+  "kody-ai",
+  "kodus-ai",
+  "coderabbitai",
+  "sentry-io",
+  "vercel",
+  "seer-by-sentry",
+];
+
+/** PR review and comment events that a bot account sends as review churn. */
+const UI_PASS_REVIEW_EVENTS = new Set([
+  "pull_request_review",
+  "pull_request_review_comment",
+  "pull_request_review_thread",
+  "issue_comment",
+]);
+
+/** A saved prompt that asks the bot to act on bot reviews keeps them. */
+const ASKS_FOR_BOT_REVIEWS = /\bkody\b|\bbot[\s-]+reviews?\b|\breview[\s-]+comments?\b/i;
+
+function isBotAccount(sender: Record<string, JsonValue> | undefined, login: string): boolean {
+  if (/\[bot\]$/i.test(login) || login === "github-actions") return true;
+  if (pickStr(sender, "type") === "Bot") return true;
+  return KNOWN_REVIEW_BOT_LOGINS.includes(login.toLowerCase());
+}
+
 export function shouldIgnoreWebhookEvent(
-  trigger: { prompt?: string; name?: string; eventTypes?: string[]; requiredLabels?: string[] },
+  trigger: { id?: string; prompt?: string; name?: string; eventTypes?: string[]; requiredLabels?: string[] },
   event: WebhookEvent,
 ): IngressIgnoreDecision {
   const payload = event.payload;
@@ -812,8 +872,7 @@ export function shouldIgnoreWebhookEvent(
   }
 
   // 2. GitHub Compile Gates Pre-Filter (only applies to verified GitHub payloads)
-  const isCompileGatesTrigger =
-    /\bcompile[\s-]*gates?\b/i.test(name) || /\b(?:own compile gates|bf-compiler)\b/i.test(prompt);
+  const isCompileGatesTrigger = isCompileGatesWake({ name, instructions: prompt, id: trigger.id });
   if (isCompileGatesTrigger && isGithubWebhookPayload(payload)) {
     const eventName = event.eventName;
     const root = asRecord(payload);
@@ -1013,7 +1072,29 @@ export function shouldIgnoreWebhookEvent(
     }
   }
 
-  // 4. Universal GitHub Ingress Guard: automated bot issue edits across any trigger
+  // 4. GitHub UI Pass Pre-Filter: bot review churn (only applies to verified GitHub payloads)
+  // A UI pass judges code changes and human reviews.  Reviews and comments
+  // from bot accounts (Kody, Cursor, Actions) never change that verdict, and
+  // each one used to cost a full model turn.
+  if (
+    isGithubWebhookPayload(payload) &&
+    UI_PASS_REVIEW_EVENTS.has(event.eventName ?? "") &&
+    isUiPassWake({ id: trigger.id, name, instructions: prompt }) &&
+    !ASKS_FOR_BOT_REVIEWS.test(prompt)
+  ) {
+    const root = asRecord(payload);
+    const action = pickStr(root, "action");
+    const sender = asRecord(root?.sender);
+    const senderLogin = pickStr(sender, "login") ?? "";
+    if (!isLabelSignal(trigger, action) && isBotAccount(sender, senderLogin)) {
+      return {
+        ignore: true,
+        reason: `GitHub ${event.eventName} by bot '${senderLogin}' ignored: UI Pass reacts to human reviews and code changes, not bot review churn`,
+      };
+    }
+  }
+
+  // 5. Universal GitHub Ingress Guard: automated bot issue edits across any trigger
   if (isGithubWebhookPayload(payload) && event.eventName === "issues") {
     const root = asRecord(payload);
     const action = pickStr(root, "action");
@@ -1226,6 +1307,130 @@ function githubRunObject(root: Record<string, JsonValue>): Record<string, JsonVa
   );
 }
 
+/** How long a handled GitHub PR state blocks a repeat classify wake.  Six
+ *  hours covers a redelivery burst for one head without hiding a later
+ *  re-check of the same head. */
+export const PR_STATE_DEDUPE_MS = 6 * 60 * 60 * 1000;
+
+interface GithubPrStateParts {
+  repo: string;
+  prNumber: number;
+  headSha: string;
+  eventName: string;
+  action: string;
+  key: string;
+}
+
+const prNumberSchema = z.number().int().positive();
+const githubIdSchema = z.union([z.number().finite(), z.string().min(1)]);
+
+function pickNumberField(record: Record<string, JsonValue> | undefined, key: string): number | undefined {
+  const parsed = prNumberSchema.safeParse(record?.[key]);
+  return parsed.success ? parsed.data : undefined;
+}
+
+function pickIdField(record: Record<string, JsonValue> | undefined, key: string): string | undefined {
+  const parsed = githubIdSchema.safeParse(record?.[key]);
+  return parsed.success ? String(parsed.data) : undefined;
+}
+
+function githubPrStateParts(event: WebhookEvent): GithubPrStateParts | undefined {
+  if (!isGithubWebhookPayload(event.payload)) return undefined;
+  const root = asRecord(event.payload);
+  if (!root) return undefined;
+  const repo = pickStr(asRecord(root.repository), "full_name");
+  if (!repo) return undefined;
+  const pullRequest = asRecord(root.pull_request);
+  let prNumber = pickNumberField(pullRequest, "number");
+  if (prNumber === undefined) {
+    const issue = asRecord(root.issue);
+    if (issue && issue.pull_request !== undefined && issue.pull_request !== null) {
+      prNumber = pickNumberField(issue, "number");
+    }
+  }
+  if (prNumber === undefined) {
+    for (const containerName of ["check_run", "check_suite", "workflow_run"] as const) {
+      const container = asRecord(root[containerName]);
+      const pulls = container?.pull_requests;
+      if (!Array.isArray(pulls) || pulls.length === 0) continue;
+      prNumber = pickNumberField(asRecord(pulls[0]), "number");
+      if (prNumber !== undefined) break;
+    }
+  }
+  if (prNumber === undefined) return undefined;
+  const headSha =
+    pickStr(asRecord(pullRequest?.head), "sha") ??
+    pickStr(asRecord(root.check_run), "head_sha") ??
+    pickStr(asRecord(root.check_suite), "head_sha") ??
+    pickStr(asRecord(root.workflow_run), "head_sha");
+  if (!headSha) return undefined;
+  const eventName = event.eventName ?? "";
+  const action = pickStr(root, "action") ?? "";
+  const parts: string[] = [repo, String(prNumber), headSha, eventName, action];
+  if (eventName === "check_run" || eventName === "check_suite" || eventName === "workflow_run") {
+    parts.push(pickStr(asRecord(root[eventName]), "conclusion") ?? "");
+  }
+  if (eventName === "pull_request_review") {
+    parts.push(`review:${pickIdField(asRecord(root.review), "id") ?? ""}`);
+  }
+  if (eventName === "issue_comment" || eventName === "pull_request_review_comment") {
+    parts.push(`comment:${pickIdField(asRecord(root.comment), "id") ?? ""}`);
+  }
+  return { repo, prNumber, headSha, eventName, action, key: parts.join("|") };
+}
+
+/** A stable key for one GitHub PR state, or undefined when the payload
+ *  does not carry a repo, a PR number and a head SHA.  Each human review
+ *  or comment keeps its own id in the key, so new human input is never
+ *  collapsed. */
+export function githubPrStateKey(event: WebhookEvent): string | undefined {
+  return githubPrStateParts(event)?.key;
+}
+
+/** A stable key for one GitHub head SHA state that does not require a pull
+ *  request number.  Compile gates mostly see default-branch `workflow_run`
+ *  failures, which often carry no `pull_requests` array, so the PR-state key
+ *  never arms for them. */
+export function githubHeadStateKey(event: WebhookEvent): string | undefined {
+  if (!isGithubWebhookPayload(event.payload)) return undefined;
+  const root = asRecord(event.payload);
+  if (!root) return undefined;
+  const repo = pickStr(asRecord(root.repository), "full_name");
+  if (!repo) return undefined;
+  const pullRequest = asRecord(root.pull_request);
+  const headSha =
+    pickStr(asRecord(pullRequest?.head), "sha") ??
+    pickStr(asRecord(root.check_run), "head_sha") ??
+    pickStr(asRecord(root.check_suite), "head_sha") ??
+    pickStr(asRecord(root.workflow_run), "head_sha") ??
+    pickStr(root, "sha");
+  if (!headSha) return undefined;
+  const eventName = event.eventName ?? "";
+  const action = pickStr(root, "action") ?? "";
+  const parts: string[] = [`head`, repo, headSha, eventName, action];
+  if (eventName === "check_run" || eventName === "check_suite" || eventName === "workflow_run") {
+    parts.push(pickStr(asRecord(root[eventName]), "conclusion") ?? "");
+  }
+  return parts.join("|");
+}
+
+/** Which GitHub state key, if any, this trigger uses for ingress dedupe. */
+export function webhookGithubStateDedupeKey(
+  trigger: { name: string; prompt: string; id?: string },
+  event: WebhookEvent,
+): { key: string; kind: "pr" | "head" } | undefined {
+  const meta = { name: trigger.name, instructions: trigger.prompt, id: trigger.id };
+  if (isClassifyOrUiPassWake(meta)) {
+    const key = githubPrStateKey(event);
+    return key ? { key, kind: "pr" } : undefined;
+  }
+  if (isCompileGatesWake(meta)) {
+    const key = githubHeadStateKey(event);
+    return key ? { key, kind: "head" } : undefined;
+  }
+  return undefined;
+}
+
 /** The one decision every per-trigger filter makes, in one pure function so
  *  it can be tested without a delivery.  A filter that is not set never
  *  ignores anything. */
@@ -1351,6 +1556,7 @@ export class WebhookManager {
   private rate = new Map<string, number[]>();
   private recentIgnored = new Map<string, number[]>();
   private recentRejected = new Map<string, number[]>();
+  private payloadDedupeSkips = 0;
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
   private dirty = false;
 
@@ -1365,6 +1571,7 @@ export class WebhookManager {
       this.webhooks = parsed.data.webhooks;
       this.deliveries = parsed.data.deliveries.slice(-MAX_DELIVERIES);
       this.attempts = (parsed.data.attempts ?? []).slice(-MAX_ATTEMPTS);
+      this.payloadDedupeSkips = parsed.data.payloadDedupeSkips ?? 0;
       // One-shot: rewrite legacy runOn "maus" → "bot" on disk.
       if (/"runOn"\s*:\s*"maus"/.test(rawText)) this.save();
     } catch {
@@ -1380,6 +1587,11 @@ export class WebhookManager {
 
   listAttempts(): WebhookAttempt[] {
     return this.attempts.map((attempt) => ({ ...attempt }));
+  }
+
+  /** Accepted deliveries dropped because the same bot, source, and payload were already taken. */
+  payloadDedupeSkipCount(): number {
+    return this.payloadDedupeSkips;
   }
 
   create(input: JsonValue): CreatedWebhook {
@@ -1534,6 +1746,7 @@ export class WebhookManager {
       eventName,
       userAgent: "BotFleet webhook tester",
       deliveryId: `test-${randomUUID()}`,
+      skipPayloadDedupe: true,
     });
   }
 
@@ -1541,6 +1754,41 @@ export class WebhookManager {
     const trigger = this.webhooks.find((candidate) => candidate.endpointId === endpointId);
     if (!trigger) return null;
     return this.recordRejectedForTrigger(trigger, statusCode, reason, event);
+  }
+
+  isEventIgnoredAtEdge(endpointId: string, eventName?: string): boolean {
+    const trigger = this.webhooks.find((candidate) => candidate.endpointId === endpointId);
+    if (!trigger || trigger.enabled === false) return false;
+    const allowed = trigger.eventTypes ?? [];
+    if (allowed.length > 0 && (!eventName || !allowed.includes(eventName))) {
+      return true;
+    }
+    return false;
+  }
+
+  recordIgnoredAtEdge(
+    endpointId: string,
+    meta: { eventName?: string; contentType?: string; deliveryId?: string },
+  ): WebhookReceiveResult {
+    const trigger = this.webhooks.find((candidate) => candidate.endpointId === endpointId);
+    const deliveryId = meta.deliveryId || randomUUID();
+    const reason = meta.eventName
+      ? `Event type “${meta.eventName}” is not enabled`
+      : "Event type is missing";
+    if (trigger) {
+      this.recordIgnoredAttempt(
+        trigger,
+        {
+          payload: {},
+          contentType: meta.contentType ?? "text/plain",
+          eventName: meta.eventName,
+          deliveryId,
+        },
+        deliveryId,
+        reason,
+      );
+    }
+    return { deliveryId, duplicate: false, ignored: true };
   }
 
   private dispatch(trigger: StoredWebhookTrigger, event: WebhookEvent): WebhookReceiveResult {
@@ -1630,10 +1878,71 @@ export class WebhookManager {
 
     const now = this.now();
 
+    // A classify/UI-pass or Compile gates wake for a GitHub state already
+    // handled in the window is ignored here, before rate limiting.  Other
+    // triggers are not collapsed by this state key.
+    const stateDedupe = webhookGithubStateDedupeKey(trigger, event);
+    const prStateKey = stateDedupe?.key;
+    if (prStateKey && stateDedupe) {
+      const prior = this.deliveries.find(
+        (delivery) =>
+          delivery.key.startsWith(`${trigger.endpointId}:`) &&
+          delivery.stateKey === prStateKey &&
+          now - delivery.at < PR_STATE_DEDUPE_MS &&
+          !UNHANDLED_RUN_STATUSES.has(this.options.runStatus?.(delivery.runId) ?? ""),
+      );
+      if (prior) {
+        const deliveryId = requestedDeliveryId || randomUUID();
+        const reason =
+          stateDedupe.kind === "head"
+            ? (() => {
+                const [, repo, headSha, eventName, action] = prStateKey.split("|");
+                return `GitHub head state already handled: ${eventName || "unknown"} ${action || "unknown"} on ${repo} at ${(headSha ?? "").slice(0, 7)} (run ${prior.runId})`;
+              })()
+            : (() => {
+                const [repo, prNumber, headSha, eventName, action] = prStateKey.split("|");
+                return `GitHub PR state already handled: ${eventName || "unknown"} ${action || "unknown"} on ${repo}#${prNumber} at ${(headSha ?? "").slice(0, 7)} (run ${prior.runId})`;
+              })();
+        this.recordIgnoredAttempt(trigger, event, deliveryId, reason);
+        return { deliveryId, duplicate: false, ignored: true };
+      }
+    }
+
+    // Payload identity runs after the GitHub state check so a handled state keeps its existing reason.
+    // A manual test leaves the window alone: the same default body must be able to wake again.
+    const payloadWindowMs = this.payloadDedupeWindowMs();
+    const payloadIdentity = payloadWindowMs > 0 && event.skipPayloadDedupe !== true
+      ? webhookPayloadDedupeIdentity(route.botId, trigger.id, event.eventName, event.payload)
+      : undefined;
+    if (payloadIdentity) {
+      const prior = this.deliveries.find((delivery) => {
+        if (!delivery.payloadDedupe || now - delivery.at >= payloadWindowMs) return false;
+        if (!sameWebhookPayloadDedupeIdentity(delivery.payloadDedupe, payloadIdentity)) return false;
+        const status = this.options.runStatus?.(delivery.runId) ?? "";
+        return !UNHANDLED_RUN_STATUSES.has(status);
+      });
+      if (prior) {
+        const deliveryId = requestedDeliveryId || randomUUID();
+        this.appendAttempt(trigger, event, {
+          outcome: "duplicate",
+          statusCode: 202,
+          deliveryId,
+          runId: prior.runId,
+          reason: `Duplicate payload ignored; original run ${prior.runId}`,
+        });
+        this.notePayloadDedupeSkip(route.botId, payloadIdentity.source, deliveryId, prior.runId);
+        this.save();
+        return { runId: prior.runId, deliveryId, duplicate: true };
+      }
+    }
+
     // A sender retrying an already-accepted delivery must remain idempotent
     // even while this webhook's queue is full. Only new work consumes a slot.
     if ((this.options.pendingRuns?.(trigger.id) ?? 0) >= MAX_PENDING_RUNS) {
-      fail(429, "This webhook already has too many unfinished tasks");
+      const canCoalesce = this.options.canCoalesce?.(trigger.id, route.botId) ?? false;
+      if (!canCoalesce) {
+        fail(429, "This webhook already has too many unfinished tasks");
+      }
     }
 
     const recent = (this.rate.get(trigger.endpointId) ?? []).filter((at) => now - at < RATE_WINDOW_MS);
@@ -1653,7 +1962,13 @@ export class WebhookManager {
       deliveryId,
       receivedAt: now,
     });
-    this.deliveries.push({ key: `${trigger.endpointId}:${deliveryId}`, runId: run.id, at: now });
+    // Only classify/UI-pass and Compile gates wakes store a stateKey.  A
+    // cancelled run did not handle the state, so it stores none either.  A
+    // later delivery for the same state can still run.
+    const receipt: DeliveryReceipt = { key: `${trigger.endpointId}:${deliveryId}`, runId: run.id, at: now };
+    if (prStateKey && run.status !== "cancelled") receipt.stateKey = prStateKey;
+    if (payloadIdentity && run.status !== "cancelled") receipt.payloadDedupe = payloadIdentity;
+    this.deliveries.push(receipt);
     if (this.deliveries.length > MAX_DELIVERIES) {
       this.deliveries.splice(0, this.deliveries.length - MAX_DELIVERIES);
     }
@@ -1706,6 +2021,31 @@ export class WebhookManager {
     this.save();
     this.emit(trigger);
     return { deliveryId, duplicate: false, captured: true };
+  }
+
+  private payloadDedupeWindowMs(): number {
+    const value = this.options.payloadDedupeWindowMs?.();
+    if (value === undefined || !Number.isFinite(value)) return DEFAULT_WEBHOOK_PAYLOAD_DEDUPE_MS;
+    if (value <= 0) return 0;
+    return value;
+  }
+
+  private notePayloadDedupeSkip(botId: string, source: string, deliveryId: string, originalRunId: string): void {
+    this.payloadDedupeSkips += 1;
+    console.info(
+      `webhook payload dedupe: skipped delivery ${deliveryId} for bot ${botId} source ${source}; original run ${originalRunId}`,
+    );
+    if (!isSentryActive()) return;
+    try {
+      getSentry()?.metrics.count("botfleet.webhook.payload_dedupe_skipped", 1, {
+        attributes: {
+          "botfleet.bot.id": botId.slice(0, 200),
+          "botfleet.webhook.source": source.slice(0, 200),
+        },
+      });
+    } catch {
+      // A metrics failure must not change the skip.
+    }
   }
 
   private recordRejectedForTrigger(trigger: StoredWebhookTrigger, statusCode: number, reason: string, event: Partial<WebhookEvent>): WebhookAttempt | null {
@@ -1836,11 +2176,14 @@ export class WebhookManager {
     }
     if (!this.dirty) return;
     mkdirSync(dirname(this.file), { recursive: true });
-    writeFileAtomic(
-      this.file,
-      JSON.stringify({ version: 1, webhooks: this.webhooks, deliveries: this.deliveries, attempts: this.attempts } satisfies WebhookFile),
-      { mode: 0o600 },
-    );
+    const stored: WebhookFile = {
+      version: 1,
+      webhooks: this.webhooks,
+      deliveries: this.deliveries,
+      attempts: this.attempts,
+    };
+    if (this.payloadDedupeSkips > 0) stored.payloadDedupeSkips = this.payloadDedupeSkips;
+    writeFileAtomic(this.file, JSON.stringify(stored), { mode: 0o600 });
     this.dirty = false;
   }
 }

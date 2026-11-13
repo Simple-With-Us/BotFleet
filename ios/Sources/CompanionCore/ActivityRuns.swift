@@ -32,10 +32,47 @@ public enum TranscriptItem: Identifiable, Hashable, Sendable {
     }
 }
 
+/// The three words a tool row may show.  No outcome yet means it is still
+/// running.  `ok == false` is the only failure.
+public enum ToolStepStatus: String, Sendable, Equatable {
+    case done = "Done"
+    case running = "Running"
+    case failed = "Failed"
+
+    public init(ok: Bool?) {
+        switch ok {
+        case .some(true):
+            self = .done
+        case .some(false):
+            self = .failed
+        case .none:
+            self = .running
+        }
+    }
+
+    /// The status string the receipt card already understands.
+    public var receiptStatus: String {
+        switch self {
+        case .done:
+            return "success"
+        case .running:
+            return "running"
+        case .failed:
+            return "error"
+        }
+    }
+}
+
 /// A step that may be folded into an activity run.
 public func isFoldableActivity(_ message: Message) -> Bool {
     guard message.kind == .activity, let tool = message.tool else { return false }
     if message.comm != nil { return false }
+    // A step still running stays on its own row.  Folding it would hide
+    // mid-turn work until the turn finished.
+    if tool.ok == nil { return false }
+    // A child step stays on its own row too.  Folding it into the summary
+    // hides whose work it was until the reader opens the run.
+    if tool.parentItemId != nil { return false }
     return !tool.name.hasPrefix("error:")
 }
 
@@ -119,22 +156,30 @@ public func transcriptRowEndsRun(
     at index: Int,
     in items: [TranscriptItem],
     liveReply: Bool,
-    liveSpeaker: String?
+    liveSpeaker: String?,
+    liveAt: Date? = nil
 ) -> Bool {
+    guard let this = items[index].messages.last,
+          isGroupableProse(this)
+    else {
+        return true
+    }
     guard index + 1 < items.count else {
-        guard liveReply, case let .message(this) = items[index],
-              this.role == .bot, this.kind == .text
-        else { return true }
+        guard liveReply, this.role == .bot else { return true }
+        if let liveAt, liveAt.timeIntervalSince(this.date) > groupMessageTimeGap {
+            return true
+        }
         return this.from?.name != liveSpeaker
     }
-    guard case let .message(this) = items[index],
-          case let .message(next) = items[index + 1] else {
+    guard let next = items[index + 1].messages.first,
+          isGroupableProse(next)
+    else {
         return true
     }
     if this.role != next.role { return true }
     if this.from?.name != next.from?.name { return true }
-    // a card or a tool chip between two texts breaks the run visually
-    return next.kind != .text
+    if !messagesShareGroup(this, next) { return true }
+    return false
 }
 
 /// Describes a folded activity run with tool breakdown and failure count.

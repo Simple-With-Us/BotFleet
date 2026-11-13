@@ -19,6 +19,10 @@ test("only the explicit non-executable documentation paths take the fast path", 
     packagingChanged: false,
   });
   assert.equal(classifyCIPaths(["README.md", "SECURITY.md"]).docsOnly, true);
+  assert.equal(
+    classifyCIPaths(["marketing/README.md", "marketing/screenshots/README.md"]).docsOnly,
+    true,
+  );
 
   for (const path of [
     "src/App.tsx",
@@ -28,6 +32,8 @@ test("only the explicit non-executable documentation paths take the fast path", 
     "LICENSE",
     "NOTICE",
     "docs/secrets.md",
+    "marketing/screenshots/macos/drafts/screen.png",
+    "marketing/scripts/publish.mjs",
     ".github/workflows/ci.yml",
     "scripts/release.mjs",
   ]) {
@@ -47,10 +53,14 @@ test("per-area outputs gate the expensive jobs on the paths that actually affect
   assert.equal(isIosPath(".github/workflows/ci.yml"), true);
   assert.equal(isIosPath("scripts/ci-ios-gate.mjs"), true);
   assert.equal(isIosPath("scripts/ci-change-scope.mjs"), true);
+  // The script that computes the changed-path list every workflow reads is
+  // itself a proof path:  a pull request that edits only the script must not
+  // be able to narrow its own scope and skip the build it should trigger.
+  assert.equal(isIosPath("scripts/ci-scope-diff.sh"), true);
   assert.equal(isIosPath("server/index.ts"), false);
 
   for (const path of ["electron/main.mjs", "electron-builder.yml", "third_party/cloudflared/README.md",
-    "scripts/prepare-cloudflared.mjs", "scripts/prepare-cua-linux.mjs", "package.json", "pnpm-lock.yaml"]) {
+    "native/helpers/speech-helper.swift", "scripts/prepare-cloudflared.mjs", "scripts/prepare-cua-linux.mjs", "package.json", "pnpm-lock.yaml"]) {
     assert.equal(isPackagingPath(path), true, path);
   }
   assert.equal(isPackagingPath(".github/workflows/ci.yml"), false);
@@ -108,7 +118,10 @@ test("every protected check stays present and takes the same fail-closed scope o
   const classifier = workflow.jobs.changes.steps.find((step) => step.id === "scope");
   assert.match(classifier.run, /EVENT_NAME.*!= "push".*EVENT_NAME.*!= "pull_request"/s);
   assert.match(classifier.run, /echo "docs_only=false"/);
-  assert.match(classifier.run, /BASE_SHA.*\^\[0-9a-f\]\{40\}\$/);
+  // The scope comes from the shared script,  and the commit-shaped check
+  // the workflow used to hold lives with it.
+  assert.match(classifier.run, /scripts\/ci-scope-diff\.sh "\$BASE_SHA" "\$HEAD_SHA"/);
+  assert.match(readFileSync(join(ROOT, "scripts/ci-scope-diff.sh"), "utf8"), /\^\[0-9a-f\]\{40\}\$/);
 
   for (const jobId of requiredJobs) {
     const job = workflow.jobs[jobId];
@@ -124,8 +137,73 @@ test("every protected check stays present and takes the same fail-closed scope o
   }
 
   const source = readFileSync(join(ROOT, ".github/workflows/ci.yml"), "utf8");
-  assert.match(source, /git diff --no-renames --name-only -z/);
   assert.doesNotMatch(source, /paths-ignore:/);
+});
+
+test("the application checkout keeps full history while filtering blobs within the job ceiling", () => {
+  const workflow = parse(readFileSync(join(ROOT, ".github/workflows/ci.yml"), "utf8"));
+  const job = workflow.jobs.test;
+  const checkout = job.steps.find((step) => String(step.uses ?? "").startsWith("actions/checkout@"));
+
+  assert.ok(checkout, "application checkout");
+  assert.equal(checkout.with.filter, "blob:none");
+  assert.equal(checkout.with["fetch-depth"], 0);
+  assert.equal(Object.hasOwn(checkout.with, "persist-credentials"), false);
+  assert.equal(job["timeout-minutes"], "${{ matrix.os == 'macos-15' && 35 || 25 }}");
+  assert.equal(job.steps.some((step) => step.run === "pnpm test"), true);
+});
+
+test("the scope is the pull request's own changes,  and both jobs use the one script", () => {
+  const workflow = parse(readFileSync(join(ROOT, ".github/workflows/ci.yml"), "utf8"));
+  const scopeScript = readFileSync(join(ROOT, "scripts/ci-scope-diff.sh"), "utf8");
+
+  // The script computes the branch point to the head:  the pull request's own
+  // two ends.  Diffing from the stored base SHA to the merge commit folded
+  // main's newer commits into the pull request's scope.
+  assert.match(scopeScript, /git merge-base "\$base_sha" "\$head_sha"/);
+  assert.match(scopeScript, /git diff --no-renames --name-only -z "\$scope_base" "\$head_sha"/);
+
+  const classifier = workflow.jobs.changes.steps.find((step) => step.id === "scope");
+  const gate = workflow.jobs.ios.steps.find(
+    (step) => step.name === "Prove the iOS build ran or that no iOS paths changed",
+  );
+
+  for (const [name, step] of [["changes", classifier], ["ios", gate]]) {
+    assert.ok(step, name);
+    // The head is the pull request's head,  not the merge commit.
+    assert.equal(step.env.HEAD_SHA, "${{ github.event.pull_request.head.sha || github.sha }}", name);
+    assert.equal(step.env.BASE_SHA, "${{ github.event.pull_request.base.sha || github.event.before }}", name);
+    // One script,  one diff,  so the classifier and the required check's
+    // replay can never drift apart.
+    assert.match(step.run, /scripts\/ci-scope-diff\.sh "\$BASE_SHA" "\$HEAD_SHA"/, name);
+    // The workflow never diffs a range itself.
+    assert.doesNotMatch(step.run, /git diff/, name);
+  }
+});
+
+test("every workflow that classifies a pull request reads the one shared scope", () => {
+  // The same stale-base bug lived in three workflows.  The classifier in
+  // ci.yml read the stored base SHA to the merge commit,  which folded
+  // main's newer commits into the pull request's scope;  the E2E and Mac
+  // packaging gates did the same.  One script,  one scope,  so a pull
+  // request's cost is the pull request's own changes.
+  const scopeScript = readFileSync(join(ROOT, "scripts/ci-scope-diff.sh"), "utf8");
+  assert.match(scopeScript, /git merge-base "\$base_sha" "\$head_sha"/);
+
+  for (const workflowFile of ["e2e.yml", "mac-package-gate.yml"]) {
+    const source = readFileSync(join(ROOT, ".github/workflows", workflowFile), "utf8");
+    const step = source;
+    // The scope comes from the shared script.
+    assert.match(step, /scripts\/ci-scope-diff\.sh "\$BASE_SHA" "\$HEAD_SHA"/, workflowFile);
+    // The head is the pull request's head,  not the merge commit.
+    assert.match(
+      step,
+      /HEAD_SHA: \$\{\{ github\.event\.pull_request\.head\.sha \|\| github\.sha \}\}/,
+      workflowFile,
+    );
+    // The workflow never diffs a range itself.
+    assert.doesNotMatch(step, /git diff --no-renames --name-only/, workflowFile);
+  }
 });
 
 test("no Linux packaging job remains in ci.yml (BF-2500 clean break)", () => {
@@ -194,7 +272,7 @@ test("the required iOS check is a diff replay, not an echo, and the build job ha
   const verify = gate.steps.find((step) => step.name === "Prove the iOS build ran or that no iOS paths changed");
   assert.ok(verify);
   assert.match(verify.run, /ci-ios-gate\.mjs/);
-  assert.match(verify.run, /git diff --no-renames --name-only -z/);
+  assert.match(verify.run, /scripts\/ci-scope-diff\.sh "\$BASE_SHA" "\$HEAD_SHA"/);
   assert.doesNotMatch(verify.run, /^echo /m);
 });
 
@@ -300,8 +378,28 @@ test("the iOS gate keeps changed paths out of workflow-command stdout", () => {
 test("the weekly full run is registered with the Sentry cron reporter", () => {
   const workflow = parse(readFileSync(join(ROOT, ".github/workflows/ci.yml"), "utf8"));
   const schedule = workflow.on.schedule[0].cron;
+  const testJob = workflow.jobs.test;
+  const testMatrix = testJob.strategy.matrix.include;
+  // TEMP BF-2066/BF-2627: both required check names run on ubuntu-latest while
+  // hosted macos runners stay unallocated.  Budget is 25 for both until the
+  // macos-15 matrix leg returns.
+  const testTimeoutExpression = "${{ matrix.os == 'macos-15' && 35 || 25 }}";
+  const matrixBudgets = testMatrix.map(({ os, check }) => [
+    check,
+    os === "macos-15" ? 35 : os === "ubuntu-latest" ? 25 : null,
+  ]);
+  assert.equal(testJob["timeout-minutes"], testTimeoutExpression);
+  assert.deepEqual(matrixBudgets, [
+    ["macos-latest", 25],
+    ["ubuntu-latest", 25],
+  ]);
+  const otherJobTimeouts = Object.values(workflow.jobs)
+    .filter((job) => job !== testJob)
+    .map((job) => job["timeout-minutes"] ?? 0);
+  assert.ok(otherJobTimeouts.every(Number.isFinite));
   const maxJobTimeout = Math.max(
-    ...Object.values(workflow.jobs).map((job) => job["timeout-minutes"] ?? 0),
+    ...otherJobTimeouts,
+    ...matrixBudgets.map(([, minutes]) => minutes),
   );
   const probe = spawnSync(
     "python3",
@@ -322,7 +420,7 @@ test("the weekly full run is registered with the Sentry cron reporter", () => {
   assert.equal(probe.status, 0, probe.stderr);
   const reporter = JSON.parse(probe.stdout);
   assert.equal(reporter.schedules.CI, schedule);
-  assert.ok(reporter.margins.CI >= maxJobTimeout + 15);
+  assert.ok(reporter.margins.CI >= maxJobTimeout + 20);
 });
 
 test("every host runs the canonical complete test chain without masking failures", () => {
@@ -333,8 +431,10 @@ test("every host runs the canonical complete test chain without masking failures
   // allocate a runner (BF-2066) and macos-14 is retiring (BF-2587), so
   // the mac leg runs on macos-15.  Ubuntu keeps its own label.
   assert.equal(job.name, "typecheck + test (${{ matrix.check }})");
+  // TEMP BF-2066/BF-2627: required "macos-latest" context runs on ubuntu until
+  // hosted macos-15 runners allocate again.  Check names stay required by ruleset.
   assert.deepEqual(job.strategy.matrix.include, [
-    { os: "macos-15", check: "macos-latest" },
+    { os: "ubuntu-latest", check: "macos-latest" },
     { os: "ubuntu-latest", check: "ubuntu-latest" },
   ]);
   assert.match(String(job["runs-on"]), /matrix\.os/);
@@ -355,6 +455,47 @@ test("the test job checks out full history so the effort ledger guard can find i
   const checkout = workflow.jobs.test.steps.find((step) => String(step.uses ?? "").startsWith("actions/checkout@"));
   assert.ok(checkout, "the test job must check out the repository");
   assert.equal(checkout.with?.["fetch-depth"], 0);
+  assert.equal(checkout.with?.filter, "blob:none");
+});
+
+test("CI full-history checkouts preserve the commit graph without downloading historic blobs", () => {
+  const workflow = parse(readFileSync(join(ROOT, ".github/workflows/ci.yml"), "utf8"));
+  const checkouts = Object.values(workflow.jobs).flatMap((job) =>
+    (job.steps ?? []).filter((step) => String(step.uses ?? "").startsWith("actions/checkout@")),
+  );
+  const fullHistoryCheckouts = checkouts.filter((step) => step.with?.["fetch-depth"] === 0);
+
+  assert.equal(fullHistoryCheckouts.length, 3);
+  for (const checkout of fullHistoryCheckouts) {
+    assert.equal(checkout.with.filter, "blob:none");
+  }
+
+  const ledgerGuard = workflow.jobs.changes.steps.find((step) =>
+    /effort-log-integrity\.node-test\.mjs/.test(step.run ?? ""),
+  );
+  assert.ok(ledgerGuard, "the history guard must remain present");
+  assert.match(
+    readFileSync(join(ROOT, "scripts/effort-log-integrity.node-test.mjs"), "utf8"),
+    /git", \["show"/,
+  );
+});
+
+test("required full-history workflows use blobless checkouts", () => {
+  const workflows = [
+    { file: "e2e.yml", jobName: "changes", proof: /ci-scope-diff\.sh/ },
+    { file: "mac-package-gate.yml", jobName: "scope", proof: /ci-scope-diff\.sh/ },
+    { file: "node-ci.yml", jobName: "lint", proof: /check-lint-baseline\.mjs/ },
+  ];
+  for (const { file: workflowFile, jobName, proof } of workflows) {
+    const workflow = parse(readFileSync(join(ROOT, ".github/workflows", workflowFile), "utf8"));
+    const job = workflow.jobs[jobName];
+    assert.ok(job, `${workflowFile} job`);
+    const checkout = job.steps.find((step) => String(step.uses ?? "").startsWith("actions/checkout@"));
+    assert.ok(checkout, `${workflowFile} checkout`);
+    assert.equal(checkout.with?.["fetch-depth"], 0, `${workflowFile} must retain full history`);
+    assert.equal(checkout.with?.filter, "blob:none", `${workflowFile} must avoid downloading historic blobs`);
+    assert.match(job.steps.map((step) => step.run ?? "").join("\n"), proof);
+  }
 });
 
 test("a later push cannot cancel an earlier main run before it dispatches jobs", () => {
@@ -380,6 +521,7 @@ test("a documentation-only change still runs the effort ledger guard", () => {
   const steps = workflow.jobs.changes.steps;
   const checkout = steps.find((step) => String(step.uses ?? "").startsWith("actions/checkout@"));
   assert.equal(checkout.with["fetch-depth"], 0);
+  assert.equal(checkout.with.filter, "blob:none");
   const guard = steps.find((step) => /effort-log-integrity\.node-test\.mjs/.test(step.run ?? ""));
   assert.ok(guard, "the changes job must run the effort ledger guard");
   assert.equal(guard.if, checkout.if, "the guard runs exactly when the checkout does");

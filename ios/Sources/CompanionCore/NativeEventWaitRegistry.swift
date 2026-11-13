@@ -28,6 +28,7 @@ public struct NativeEventWait: Codable, Equatable, Sendable, Identifiable {
     public var status: NativeEventWaitStatus
     public var revision: UInt64
     public var holdReason: String?
+    public var admissionHold: NativeWorkHoldReason?
 
     public init(
         id: String = "wait_\(UUID().uuidString.lowercased())",
@@ -39,7 +40,8 @@ public struct NativeEventWait: Codable, Equatable, Sendable, Identifiable {
         deadlineAt: Double,
         status: NativeEventWaitStatus = .pending,
         revision: UInt64 = 0,
-        holdReason: String? = nil
+        holdReason: String? = nil,
+        admissionHold: NativeWorkHoldReason? = nil
     ) {
         self.id = id
         self.botId = botId
@@ -51,6 +53,7 @@ public struct NativeEventWait: Codable, Equatable, Sendable, Identifiable {
         self.status = status
         self.revision = revision
         self.holdReason = holdReason
+        self.admissionHold = admissionHold
     }
 }
 
@@ -104,6 +107,9 @@ public protocol NativeEventWaitQueue: Sendable {
 public enum NativeEventWaitQueueResult: Equatable, Sendable {
     case completed
     case held(reason: String)
+    case admissionHeld(NativeWorkHoldReason)
+    /// No durable claim was attempted, so the wait can return to pending without an uncertain outcome.
+    case preClaimInterrupted
 }
 
 /// Persistence stores a complete bounded snapshot so implementations can use one atomic write.
@@ -223,6 +229,7 @@ public actor NativeEventWaitRegistry {
     private var didRecover = false
     private var snapshotRevision: UInt64 = 0
     private var saveTask: Task<Void, Error>?
+    private var snapshotPersistenceFailed = false
     private struct DispatchTask { let token: UUID; let task: Task<Void, Never> }
     private var dispatchTasks: [String: DispatchTask] = [:]
     public private(set) var dispatchPersistenceFailed = false
@@ -443,6 +450,25 @@ public actor NativeEventWaitRegistry {
         for task in current { await task.value }
     }
 
+    /// The durable queue checks the claim ledger before requesting this transition.
+    func resumeAdmissionHold(id: String) async throws {
+        guard !stopped, dispatchTasks[id] == nil, var wait = waitsById[id],
+              wait.status == .held, wait.admissionHold != nil else { return }
+        wait.status = .pending
+        wait.admissionHold = nil
+        wait.holdReason = nil
+        wait.revision &+= 1
+        waitsById[id] = wait
+        try await persistSnapshot()
+    }
+
+    func flushPersistence() async throws {
+        try await saveTask?.value
+        guard !dispatchPersistenceFailed, !snapshotPersistenceFailed else {
+            throw NativeRuntimeServicesError.stopped
+        }
+    }
+
     private func runDispatch(_ dispatching: NativeEventWait, token: UUID) async {
         defer { if dispatchTasks[dispatching.id]?.token == token { dispatchTasks.removeValue(forKey: dispatching.id) } }
         guard !stopped, !Task.isCancelled, var current = waitsById[dispatching.id],
@@ -455,12 +481,17 @@ public actor NativeEventWaitRegistry {
             catch { result = .held(reason: "Wait dispatch could not confirm completion") }
             guard var latest = waitsById[dispatching.id], latest.status == .dispatching,
                   latest.revision == dispatching.revision else { return }
-            if stopped || Task.isCancelled {
+            if (stopped || Task.isCancelled) && result != .preClaimInterrupted {
                 latest.status = .held; latest.holdReason = "Dispatch outcome unknown after shutdown"
+                latest.admissionHold = nil
             } else {
                 switch result {
                 case .completed: latest.status = .completed
                 case .held(let reason): latest.status = .held; latest.holdReason = String(reason.prefix(512))
+                case .admissionHeld(let reason):
+                    latest.status = .held; latest.admissionHold = reason; latest.holdReason = reason.rawValue
+                case .preClaimInterrupted:
+                    latest.status = .pending; latest.admissionHold = nil; latest.holdReason = nil
                 }
             }
             latest.revision &+= 1
@@ -510,7 +541,9 @@ public actor NativeEventWaitRegistry {
         saveTask = task
         do {
             try await task.value
+            snapshotPersistenceFailed = false
         } catch {
+            snapshotPersistenceFailed = true
             if snapshotRevision == revision { saveTask = nil }
             throw error
         }

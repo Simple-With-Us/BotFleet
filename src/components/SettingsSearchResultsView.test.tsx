@@ -3,7 +3,7 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { SettingsSearchResultsView } from "./SettingsSearchResultsView";
 import { searchSettings } from "@/lib/settings-search";
-import { Activity, Coins, Globe, KeyRound, Layers, Monitor, Smartphone, Terminal, User } from "lucide-react";
+import { Activity, Coins, Gauge, Globe, KeyRound, Layers, Monitor, Smartphone, Terminal, User } from "lucide-react";
 import type { AppSettingsSection } from "@/state/store";
 
 const SECTION_ICONS: Record<AppSettingsSection, typeof User> = {
@@ -17,6 +17,7 @@ const SECTION_ICONS: Record<AppSettingsSection, typeof User> = {
   usage: Coins,
   observability: Activity,
   secrets: KeyRound,
+  resources: Gauge,
 };
 
 describe("SettingsSearchResultsView Component", () => {

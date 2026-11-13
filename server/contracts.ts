@@ -182,6 +182,8 @@ export type RuntimeEvent = RuntimeEventBase &
         /** The model the provider says served the turn, when it says (an
          * alias or a fallback can differ from the one requested). */
         servedModel?: string;
+        /** Present only when the Claude driver reconciled exactly one billed call. */
+        billedCall?: import("./claude-billed-call.ts").ClaudeBilledCall;
       }
     | {
         type: "item.started";
@@ -260,7 +262,10 @@ export type RuntimeEvent = RuntimeEventBase &
       }
     // Same invariant as turn.completed.usage: `cachedInput` is a subset of
     // `input`, and `output` is optional for the same reason (see there).
-    | { type: "thread.token-usage.updated"; input: number; output?: number; cachedInput?: number }
+    // `contextWindow` is the model's context size in tokens when the driver
+    // learns it live (ACP `usage_update.size`), so `input / contextWindow`
+    // is the occupancy; telemetry records it as gen_ai.request.context_window.
+    | { type: "thread.token-usage.updated"; input: number; output?: number; cachedInput?: number; contextWindow?: number }
     // `setup: true` marks a failure the user fixes by installing or
     // configuring something, not by retrying — the UI offers setup instead.
     | { type: "runtime.error"; message: string; setup?: boolean }
@@ -434,6 +439,10 @@ export interface SendTurnInput {
      * Completions API expects.  Default is an empty object schema. */
     parameters?: { type: "object"; properties?: Record<string, unknown>; required?: string[] };
   }>;
+  /** Characters of a tool result kept in replayed history after the round
+   *  that saw the full text.  Absent uses 8,000.  `0` leaves every result
+   *  whole.  See server/tool-result-history.ts. */
+  toolResultHistoryChars?: number;
   /** Per-bot integrations the driver may hand to the agent as tools. */
   integrations?: {
     /** A local stdio bridge owns the remote Composio transport. Keeping the
@@ -774,6 +783,11 @@ export interface ProviderAdapter {
    * correct implementation always returns `[]` — a non-empty return is a bug
    * report, which is exactly why it is worth the six lines. */
   sweepStuckTurns?(olderThanMs: number): Promise<ThreadId[]>;
+  /** Threads whose provider request is in flight and was proven alive within
+   * the last probe interval (bytes arrived or a liveness probe answered).  The
+   * stall watchdog counts these as activity, so a slow local model that emits
+   * no events is not stopped before its own configured wait. */
+  liveTurnThreadIds?(): ThreadId[];
   onEvent(listener: RuntimeEventListener): () => void;
 }
 
@@ -794,6 +808,9 @@ export interface ProviderSnapshot {
   /** Undefined when the auth probe was inconclusive (timed out); only an
    * explicit answer from the CLI is `true` or `false`. */
   authenticated?: boolean;
+  /** OpenCode only: why the last `opencode models` catalog probe failed, in
+   * plain language.  Cleared after a successful probe. */
+  modelProbeProblem?: string;
   version?: string | null;
   /** How this instance is paid for, when the driver can tell: a reported
    * cost on a subscription is notional and the UI labels it as such. */

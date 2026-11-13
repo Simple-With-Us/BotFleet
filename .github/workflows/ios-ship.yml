@@ -45,6 +45,8 @@ on:
       - '.github/workflows/sentry-testflight.yml'
       - 'scripts/sentry-report-testflight.mjs'
       - 'scripts/sentry-testflight-receipt.mjs'
+      - 'scripts/ios-post-sync-tf-ready.sh'
+      - 'scripts/ios-observe-ship.mjs'
       - 'scripts/ios-fleet/**'
       - 'scripts/ios-ship-testflight.sh'
       - 'scripts/ios-appstore-gm-prepare.sh'
@@ -132,8 +134,8 @@ jobs:
     runs-on: xcode-27
     timeout-minutes: 90
     outputs:
-      sentry_receipt: ${{ steps.ship.outputs.sentry_receipt }}
-      sentry_receipt_error: ${{ steps.ship.outputs.sentry_receipt_error }}
+      sentry_receipt: ${{ steps.post_sync_tf.outputs.sentry_receipt }}
+      sentry_receipt_error: ${{ steps.post_sync_tf.outputs.sentry_receipt_error }}
     env:
       DEVELOPER_DIR: /Applications/Xcode_27.0.app/Contents/Developer
     steps:
@@ -147,12 +149,24 @@ jobs:
           fetch-depth: 0
 
       - name: Restore iOS ship state
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/ios-fleet
-          key: ios-fleet-botfleet-${{ github.run_id }}
+          key: ios-fleet-botfleet-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
+            ios-fleet-botfleet-${{ github.run_id }}-
             ios-fleet-botfleet-
+
+      - name: Clear stale ship-state lockdirs after cache restore
+        run: |
+          shopt -s nullglob
+          lockdirs=( "${HOME}/.cache/ios-fleet/"*.lockdir )
+          if ((${#lockdirs[@]})); then
+            rm -rf "${lockdirs[@]}"
+            echo "Removed stale lockdir(s): ${lockdirs[*]}"
+          else
+            echo "No stale lockdir entries under ~/.cache/ios-fleet."
+          fi
 
       # Runs FIRST so a tick with nothing to ship costs seconds and cannot go
       # red on an unrelated environment problem. The logic lives in a script,
@@ -170,6 +184,8 @@ jobs:
             --path-prefix '.github/workflows/sentry-testflight.yml' \
             --path-prefix 'scripts/sentry-report-testflight.mjs' \
             --path-prefix 'scripts/sentry-testflight-receipt.mjs' \
+            --path-prefix 'scripts/ios-post-sync-tf-ready.sh' \
+            --path-prefix 'scripts/ios-observe-ship.mjs' \
             --path-prefix 'scripts/ios-fleet/**' \
             --path-prefix 'scripts/ios-ship-testflight.sh' \
             --path-prefix 'scripts/ios-appstore-gm-prepare.sh' \
@@ -262,6 +278,12 @@ jobs:
         env:
           IOS_TF_RELEASE_NOTES: "1"  # Jay 2026-09-08: publish ASC What to Test
           IOS_MANUAL_SIGN: "1"  # 2026-10-07: API profiles; no Xcode provisioning service
+          # Receipt uses the post-sync ensure-tf-ready pass, not the in-ship check.
+          IOS_DEFER_SENTRY_RECEIPT: "1"
+          # fleet-icon-audit.mjs is a Mac-side fleet tool not vendored in
+          # this repo, so the hosted ship cannot run it; hand runs on the
+          # Mac keep the publisher's default block gate.
+          FLEET_ICON_AUDIT: "off"
           # The fleet iOS version manifest lives in AI-Fleet-Coordinator, and
           # that repository's ruleset refuses a direct write to its protected
           # branch, so the publish is a branch plus a pull request.  The
@@ -270,7 +292,7 @@ jobs:
           # passed for that one step.  The publisher refuses GITHUB_TOKEN
           # outright, and it never arms auto-merge with one.
           GH_TOKEN: ${{ secrets.GH_PAT }}
-        run: bash scripts/ios-ship-testflight.sh --build "${{ needs.plan-build.outputs.build }}"
+        run: node scripts/ios-observe-ship.mjs bash scripts/ios-ship-testflight.sh --build "${{ needs.plan-build.outputs.build }}"
 
       # Standing TestFlight testers (asc-standing-testers skill): make sure the
       # three standing emails are in BotFleet's external beta group and the new
@@ -303,6 +325,55 @@ jobs:
           if [ "$rc" -ne 0 ]; then
             echo "::warning title=TestFlight standing testers::tester sync exited ${rc}; see the standing-testers lines above.  The TestFlight upload itself succeeded."
           fi
+
+      # The in-ship ensure-tf-ready runs before standing-tester sync, so rc=5
+      # is common when the external group is not ready yet.  Re-check after sync
+      # so the job summary and Sentry receipt reflect post-sync installability
+      # (OPS-1052 / BF-2552).
+      - name: Re-check TestFlight readiness after tester sync
+        id: post_sync_tf
+        if: success() && steps.gate.outputs.should_ship == '1' && steps.ship.outputs.uploaded == 'true'
+        continue-on-error: true
+        timeout-minutes: 15
+        env:
+          IOS_TF_READY_TIMEOUT_SEC: "300"
+          IOS_SHIP_ARCHIVE_PATH: ${{ steps.ship.outputs.ios_ship_archive_path }}
+          IOS_SHIP_ARCHIVE_COMMIT: ${{ steps.ship.outputs.ios_ship_commit }}
+        run: |
+          build="${{ needs.plan-build.outputs.build }}"
+          [[ "$build" =~ ^[1-9][0-9]{11}$ ]] || { echo "::error::missing planned build for post-sync tf-ready recheck"; exit 1; }
+          bash "$GITHUB_WORKSPACE/scripts/ios-post-sync-tf-ready.sh" "$build"
+
+      - name: iOS ship summary (TestFlight readiness after sync)
+        if: always() && steps.gate.outputs.should_ship == '1'
+        run: |
+          set -euo pipefail
+          {
+            echo "## TestFlight readiness (after standing-tester sync)"
+            if [ "${{ steps.ship.outputs.uploaded }}" != "true" ]; then
+              echo "- BotFleet: no TestFlight upload this run (ship gate skip or no new build); post-sync readiness not evaluated."
+            elif [ -n "${{ steps.post_sync_tf.outputs.tf_ready_summary }}" ]; then
+              echo "- BotFleet (${{ steps.post_sync_tf.outputs.tf_ready_bundle }} build ${{ steps.post_sync_tf.outputs.tf_ready_build }}): rc=${{ steps.post_sync_tf.outputs.tf_ready_rc }} — ${{ steps.post_sync_tf.outputs.tf_ready_summary }}"
+            else
+              echo "- BotFleet: post-sync readiness check did not run or produced no summary"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove ship-state lockdirs before saving cache
+        if: always()
+        run: |
+          shopt -s nullglob
+          lockdirs=( "${HOME}/.cache/ios-fleet/"*.lockdir )
+          if ((${#lockdirs[@]})); then
+            rm -rf "${lockdirs[@]}"
+          fi
+
+      - name: Save iOS ship state
+        if: always()
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/ios-fleet
+          key: ios-fleet-botfleet-${{ github.run_id }}-${{ github.run_attempt }}
 
   report-sentry-deployment:
     needs: ship

@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Orb resume for the BotFleet repository.
+#
+# This repository has no databases, tunnels, or per-user services to reconnect:
+# the toolchain and node_modules live on the snapshot, and Playwright browsers
+# live in ~/.cache/ms-playwright.  Resume therefore only does a fast health
+# check and must finish well inside Amp's 10-second window.
+
+printf '[orb-resume] node %s / pnpm %s / repo deps %s\n' \
+  "$(node --version)" \
+  "$(pnpm --version)" \
+  "$([[ -d node_modules ]] && echo present || echo MISSING)"
+
+if [[ ! -d node_modules ]]; then
+  # Rare: only after a snapshot that predates dependency changes.  Reinstall
+  # here rather than fail; Amp leaves a script running past the 10s window.
+  printf '[orb-resume] node_modules missing, reinstalling\n'
+  pnpm install --frozen-lockfile
+fi
+
+exit 0

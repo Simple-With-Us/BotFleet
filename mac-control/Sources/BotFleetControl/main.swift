@@ -76,6 +76,8 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// True when the local server answered the health check as BotFleet but
     /// has no control routes: it is running, and it is older than this app.
     private var serverOutdated = false
+    private let controlBuild = ControlBuildIdentity.installed()
+    private let controlUpdate = ControlUpdateHandoff()
     private var serverPresence: ServerPresence = .unknown
     private var offlineVMs: OfflineDockerState = .unavailable
     private var helperVMs: [LocalVM]?
@@ -565,6 +567,7 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             else { add("Shared VM: unknown while server is busy") }
         }
         if let problem { add("Error: \(problem)") }
+        add(ControlVersionHandshake(control: controlBuild, server: status?.serverBuild).summary)
         if let ownerStopsProblem { add("Fleet Services: \(ownerStopsProblem)") }
         if let vmProblem { add("Local VM: \(vmProblem)") }
         if status?.sharedVM?.state == "stopped" { add("Local VM requires recreation in BotFleet") }
@@ -613,6 +616,7 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
             if let st = hostStatuses[host.id] {
                 add("Server: running (\(st.activeBotCount) active bots)")
+                add(ControlVersionHandshake(control: controlBuild, server: st.serverBuild).summary)
                 let vmState = st.isSharedVMRunning ? "Running 🟢" : "Off ⚪️ (\(st.sharedVM?.state ?? "stopped"))"
                 add("Shared VM: \(vmState)")
                 if st.localVms.count > 1 {
@@ -767,6 +771,7 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             state: SMAppService.mainApp.status == .enabled ? .on : .off)
         menu.addItem(.separator())
         add("Open BotFleet", selector: #selector(openBotFleet))
+        add("Update Control…", selector: #selector(updateControl), enabled: ready)
         add("Hide Menu Bar Icon…", selector: #selector(hideIcon), enabled: ready)
         add("Quit Control", selector: #selector(quitControl), enabled: !isBusy)
     }
@@ -1064,7 +1069,7 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // The server is wanted running, so wait for its process to appear
         // before the managed services decide what the MCP server should be doing.
         run(settlesWhen: [.running, .notInstalled]) { [self] in
-            try await Task.detached(priority: .userInitiated) { try self.startup.startServer() }.value
+            _ = try await Task.detached(priority: .userInitiated) { try await self.startup.startServerAndSettle() }.value
         }
     }
 
@@ -1078,18 +1083,27 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         guard let status else { return }
-        // Say what will actually block the stop, not just the bot turns.  The
-        // server refuses on any kind of in-flight work, so a dialog that
-        // counts only bot turns could promise a clean stop and then the
-        // server would refuse it for something the owner was never shown.
-        let blocking = status.blockingWorkSummary
-        let message = blocking.map { "This stops the server and its local VMs.  The server will refuse while work is in flight: \($0)." }
-            ?? "This stops the server and its local VMs.  \(status.activeBotCount) bot turn(s) are active; the server will refuse while bots or leases are busy."
+        // Say what will actually happen, not just the bot turns.  The server
+        // stops the bots that are working and then shuts down (BF-2536), so a
+        // dialog that promised a refusal would describe the old behavior.
+        // The work in flight is named so the owner can see what the stop is
+        // about to deal with, without the dialog promising what the server
+        // will decide.
+        var message = "This stops the server and its local VMs.  The bots that are working are stopped first, and the messages queued behind them are kept for the next start.  If the server cannot carry the work in flight, it says so and stays up."
+        if let blocking = status.blockingWorkSummary {
+            message += "  In flight right now: \(blocking)."
+        } else if status.activeBotCount > 0 {
+            message += "  \(status.activeBotCount) bot turn(s) are active."
+        }
         guard confirm("Stop BotFleet Server And Local VMs?", message) else { return }
         // The server is wanted stopped, so wait for its process to go away
         // before the managed services stop the services that only run with it.
         run(refresh: false, settlesWhen: [.stopped, .notInstalled]) { [self] in
-            try await api.stopServer()
+            let report = try await api.stopServer()
+            // What the stop did is worth saying out loud:  the owner asked for
+            // the bots that were working to be stopped, and the server says
+            // which ones it stopped and what was still running.
+            if let summary = report?.summary { showMessage(summary) }
         }
     }
 
@@ -1275,6 +1289,16 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration()) { _, error in
             if let error { DispatchQueue.main.async { self.showError(error.localizedDescription) } }
+        }
+    }
+
+    @objc private func updateControl() {
+        guard !isBusy && !isLoading else { return }
+        let application = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "app.botfleet.macos")
+        do {
+            try controlUpdate.perform(selection: .updateControl, application: application)
+        } catch {
+            showError(error.localizedDescription)
         }
     }
 

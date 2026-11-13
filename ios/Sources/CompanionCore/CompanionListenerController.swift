@@ -21,9 +21,11 @@ public enum CompanionListenerState: Equatable, Sendable {
     /// backend could read it back, and `advertisedAs` the Bonjour instance
     /// name it asked for.
     case listening(port: UInt16?, advertisedAs: String?)
+    /// Network.framework is waiting for connectivity and may recover itself.
+    case waiting(reason: String)
     /// The listener was up and was stopped on purpose.
     case stopped
-    /// A start failed; `reason` is the error's own words.
+    /// A start or running listener failed; `reason` is the error's own words.
     case failed(reason: String)
 
     /// One line for the Settings section.
@@ -33,6 +35,8 @@ public enum CompanionListenerState: Equatable, Sendable {
             return "Off.\u{00A0} The phone pairs with the Node harness until the native pairing contract lands (BF-2511)."
         case .starting:
             return "Starting…"
+        case .waiting(let reason):
+            return "Waiting for network: \(reason)"
         case .listening(let port, let advertisedAs):
             var text = "Listening"
             if let port { text += " on port \(port)" }
@@ -41,7 +45,7 @@ public enum CompanionListenerState: Equatable, Sendable {
         case .stopped:
             return "Stopped."
         case .failed(let reason):
-            return "Could not start: \(reason)"
+            return "Listener failed: \(reason)"
         }
     }
 }
@@ -67,12 +71,34 @@ public enum CompanionListenerExitEvent: Equatable, Sendable {
     case appTerminating
 }
 
+/// Sequence numbers start at one and increase within one backend start, so
+/// tasks crossing actors cannot overwrite a newer network observation.
+public struct CompanionListenerUpdate: Equatable, Sendable {
+    public enum Event: Equatable, Sendable {
+        case ready(port: UInt16?)
+        case waiting(reason: String)
+        case failed(reason: String)
+    }
+    public let sequence: UInt64
+    public let event: Event
+
+    public init(sequence: UInt64, event: Event) {
+        self.sequence = sequence
+        self.event = event
+    }
+}
+
 /// What the controller drives.  The real backend wraps one
 /// `NativeCompanionServer`; tests use a stub that records calls and opens
 /// nothing.
 public protocol CompanionListenerBackend: Sendable {
     /// Starts the listener and answers the bound port when it can be read.
-    func start(advertising: CompanionListenerAdvertisement?) async throws -> UInt16?
+    /// Reports this start's sequenced network states; an intentional stop
+    /// does not report a failure.
+    func start(
+        advertising: CompanionListenerAdvertisement?,
+        onUpdate: @escaping @Sendable (CompanionListenerUpdate) async -> Void
+    ) async throws -> UInt16?
     /// Stops the listener; a stop with nothing running is not an error.
     func stop() async
 }
@@ -105,6 +131,7 @@ public final class CompanionListenerController {
     /// stop cannot write a stale state over the newer one, nor a stop over a
     /// newer start.
     private var serial = 0
+    private var lastUpdateSequence: UInt64 = 0
     /// Whether the newest request was a start or a stop, whatever has
     /// answered so far.  A start while the newest request is already a start
     /// would only restart a listener that is up, or on its way, on a new
@@ -176,21 +203,44 @@ public final class CompanionListenerController {
     public func start() async {
         if newestRequest == .start {
             switch state {
-            case .starting, .listening: return
+            case .starting, .listening, .waiting: return
             case .off, .stopped, .failed: break
             }
         }
         newestRequest = .start
         serial += 1
         let mine = serial
+        lastUpdateSequence = 0
         state = .starting
         do {
-            let port = try await backend.start(advertising: advertisement)
-            guard mine == serial else { return }
+            let port = try await backend.start(advertising: advertisement) { [weak self] update in
+                await self?.listenerChanged(update, serial: mine)
+            }
+            // Waiting or failure can arrive after readiness but before this
+            // await returns, so it must not be replaced with "listening".
+            guard mine == serial, case .starting = state else { return }
             state = .listening(port: port, advertisedAs: advertisement?.name)
         } catch {
             guard mine == serial else { return }
-            state = .failed(reason: error.localizedDescription)
+            switch state {
+            case .starting, .waiting, .listening: state = .failed(reason: error.localizedDescription)
+            case .off, .stopped, .failed: break
+            }
+        }
+    }
+
+    private func listenerChanged(_ update: CompanionListenerUpdate, serial updateSerial: Int) {
+        guard updateSerial == serial, newestRequest == .start, update.sequence > lastUpdateSequence else { return }
+        lastUpdateSequence = update.sequence
+        switch state {
+        case .starting, .listening, .waiting:
+            switch update.event {
+            case .ready(let port): state = .listening(port: port, advertisedAs: advertisement?.name)
+            case .waiting(let reason): state = .waiting(reason: reason)
+            case .failed(let reason): state = .failed(reason: reason)
+            }
+        case .off, .stopped, .failed:
+            break
         }
     }
 
@@ -209,7 +259,7 @@ public final class CompanionListenerController {
         let mine = serial
         let wasUp: Bool
         switch state {
-        case .listening, .starting: wasUp = true
+        case .listening, .starting, .waiting: wasUp = true
         case .off, .stopped, .failed: wasUp = false
         }
         await backend.stop()
@@ -246,7 +296,10 @@ public actor NativeCompanionListenerBackend: CompanionListenerBackend {
         self.makeServer = makeServer
     }
 
-    public func start(advertising: CompanionListenerAdvertisement?) async throws -> UInt16? {
+    public func start(
+        advertising: CompanionListenerAdvertisement?,
+        onUpdate: @escaping @Sendable (CompanionListenerUpdate) async -> Void
+    ) async throws -> UInt16? {
         let server: NativeCompanionServer
         if let existing = self.server {
             server = existing
@@ -259,7 +312,7 @@ public actor NativeCompanionListenerBackend: CompanionListenerBackend {
         // The server answers once the socket is ready, with the port it bound,
         // or throws the listener's own error; a loopback bind drops the
         // advertisement whatever was asked.
-        return try await server.startListening(port: port, options: options)
+        return try await server.startListening(port: port, options: options, onUpdate: onUpdate)
     }
 
     public func stop() async {

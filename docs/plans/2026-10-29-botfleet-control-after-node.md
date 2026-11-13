@@ -98,11 +98,19 @@ Option 3, one bundle.  If Decision 1 picks A or C, the lifecycle surface ships 
 
 Recommendation: Option 2 now, under either answer to Decision 1, plus the version stamp fix so Control and the app carry the same number from the same stamp.  Option 1 only with Jay's explicit yes, because it is an unattended install.  Option 3 follows Decision 1.
 
+Ruling, Fri, Oct 30, 2026 (Jay's direct answer in Codex chat `01a18e51-fa5e-77a3-8d7b-b5baa414ab98`, recorded in Zulip `636401337` and BF-2531 comment `7996bdf1-7dc2-4e92-a38f-94f0a0924095`): asked “The landed Control plan leaves Decision 2 to you: how should an outdated BotFleet Control app update?”, Jay selected “Version handshake with an explicit Update Control action (recommended)”.  This is Option 2; an install remains a deliberate user action.
+
+BF-2531 implements an optional `serverBuild` handshake on the existing control status route, using the marketing version, release build and source commit.  Numeric build components order releases across the marketing-version transition to 0.1.0; no build is inferred from a version or commit count, and incomplete metadata reports unknown order.  The shared build planner already outputs `build`; BF-2588 must carry that exact output into the server's build identity when the Mac release path adopts the planner.  Old identities without `build` remain valid.
+
+`Update Control…` hands off to a supported installed BotFleet app, whose dialog requires the explicit `Update Control` selection before it requests a normal quit, observes that Control exited, uses the existing staged replacement and reopens Control.  Cancellation, a refused quit, an unknown release, a package that is not newer, and release drift all leave the installed bundle in place.  A native-only BotFleet app without a bundled Control replacement and update handler reports that dependency instead of inventing a download source.  The rollout recipe is `docs/rollouts/2026-10-30-control-version-handshake.md`.
+
 ## Decision 3 For Jay: Starting After An Unattended Reboot
 
 BF-2528 reports `AutoLoginUser` unset, so nothing in `~/Library/LaunchAgents` loads until someone logs in.  There are three honest answers.  Enable automatic login for the owner account, which gives launchd a GUI session at boot; with FileVault on, the disk still waits for a password at the pre-boot screen, so this only helps a restart that reaches the login window.  Move the harness to a LaunchDaemon, which starts without a login but runs with no window server, so the computer-use agent, screen capture, Accessibility and every TCC-gated feature stop working until a user session exists; the harness drives the desktop, so this does not fit.  Or accept that the stack starts at first login, write that down in the register and the Apple Note, and have the iOS remote wake show `waiting for login` instead of `offline` when the Mac is up and the harness is not.
 
 Recommendation: accept first-login start as the documented behaviour, and treat automatic login as a separate owner security decision with the FileVault caveat stated.  Not checked from here: the Mac's current `AutoLoginUser` and FileVault state.
+
+Ruling, Fri, Oct 30, 2026 (the same direct Codex exchange and provenance as Decision 2): asked “The same plan leaves Decision 3 to you: when should BotFleet start after a reboot?”, Jay answered “should be able to do so before login but optionally”.  Optional pre-login support is therefore the target; BF-2597 owns its separate design and implementation decisions.  BF-2531 installs no daemon and changes no login, FileVault, identity or credential policy.  The separate design is `docs/plans/2026-10-30-optional-prelogin-host.md`.
 
 ## What I Will Build Now
 

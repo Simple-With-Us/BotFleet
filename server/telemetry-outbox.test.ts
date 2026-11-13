@@ -518,6 +518,12 @@ describe("UsageTelemetryOutbox", () => {
           childHarness: "claudeAgent",
           childSessionId: "8c0a8e0e-2a7f-4d1e-9a51-3f0b1c2d3e4f",
           turnStartedAt: "2026-10-29T15:00:00.000Z",
+          billedCallProofVersion: 1,
+          billedCallId: "msg-test",
+          billedCallModel: "claude-test",
+          billedCallOutput: 10,
+          billedCallCacheRead: 0,
+          billedCallCacheWrite: 0,
           cwd: "/should/strip",
         },
       }],
@@ -529,8 +535,27 @@ describe("UsageTelemetryOutbox", () => {
       childHarness: "claudeAgent",
       childSessionId: "8c0a8e0e-2a7f-4d1e-9a51-3f0b1c2d3e4f",
       turnStartedAt: "2026-10-29T15:00:00.000Z",
+      billedCallProofVersion: 1,
+      billedCallId: "msg-test",
+      billedCallModel: "claude-test",
+      billedCallOutput: 10,
+      billedCallCacheRead: 0,
+      billedCallCacheWrite: 0,
     });
     await outbox.dispose();
+    const delivered: DurableTelemetryBatch[] = [];
+    const restarted = new UsageTelemetryOutbox({ path });
+    restarted.configure(() => ({
+      destinationHash,
+      deliver: async (posted) => {
+        delivered.push(posted);
+        return { acknowledged: true, rejected: 0 };
+      },
+    }));
+    await restarted.flushNow();
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0].events[0].metadata).toEqual(persisted.metadata);
+    await restarted.dispose();
   });
 
   it("writes the retry file atomically and leaves no sibling temp files", async () => {

@@ -113,7 +113,10 @@ public actor NativeEngineRecoveryActor {
         if limit.kind == .capacity, let hard = holds[route], hard.kind == .quota { return hard }
         if limit.kind == .capacity, healthy[key]?.contains(where: {
             $0.key != route.botId && activeSiblingBots.contains($0.key) && $0.value <= now && now.timeIntervalSince($0.value) < 30
-        }) == true { return nil }
+        }) == true {
+            clearCapacityHolds(for: key, now: now)
+            return nil
+        }
         let delay = max(1, min(limit.kind == .capacity ? 300 : 7 * 86_400,
                                limit.retryAfterSeconds.isFinite ? limit.retryAfterSeconds : 5))
         let proposedRetryAt = now.addingTimeInterval(delay)
@@ -136,11 +139,15 @@ public actor NativeEngineRecoveryActor {
         bots[route.botId] = now
         if bots.count > 16, let oldest = bots.min(by: { $0.value < $1.value }) { bots[oldest.key] = nil }
         healthy[key] = bots
+        clearCapacityHolds(for: key, now: now)
+        trim()
+    }
+
+    private func clearCapacityHolds(for key: ModelRoute, now: Date) {
         for (heldRoute, hold) in holds where hold.kind == .capacity && hold.recordedAt <= now &&
-            heldRoute.engineId == route.engineId && heldRoute.modelId == route.modelId {
+            heldRoute.engineId == key.engineId && heldRoute.modelId == key.modelId {
             holds[heldRoute] = nil
         }
-        trim()
     }
 
     public func markUnhealthy(route: NativeEngineRoute) {

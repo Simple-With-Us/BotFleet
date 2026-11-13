@@ -172,6 +172,11 @@ let currentModel: string | null = models[0] ?? null;
 const reasoningEfforts = (process.env.FAKE_ACP_REASONING_EFFORTS ?? "").split(",").filter(Boolean);
 let currentReasoningEffort: string | null = reasoningEfforts[0] ?? null;
 const reasoningConfigId = process.env.FAKE_ACP_REASONING_CONFIG_ID || "reasoning_effort";
+// zcode-acp-shaped surface: the session carries a permission mode select
+// (configId "mode") beside the model. Off unless FAKE_ACP_SESSION_MODES is
+// set, so every existing mode stays byte-identical to before.
+const sessionModes = (process.env.FAKE_ACP_SESSION_MODES ?? "").split(",").filter(Boolean);
+let currentMode: string | null = sessionModes[0] ?? null;
 const reasoningModels = (process.env.FAKE_ACP_REASONING_MODELS ?? "").split(",").filter(Boolean);
 // Whether the effort option is on offer right now: always when no model list is
 // declared, otherwise only while the current model is one of the listed ones.
@@ -189,6 +194,18 @@ const configOptions = () => {
           type: "select",
           currentValue: currentModel,
           options: models.map((value) => ({ value, name: value })),
+        },
+      ]
+      : []),
+    ...(sessionModes.length
+      ? [
+        {
+          id: "mode",
+          name: "Mode",
+          category: "mode",
+          type: "select",
+          currentValue: currentMode,
+          options: sessionModes.map((value) => ({ value, name: value })),
         },
       ]
       : []),
@@ -218,8 +235,16 @@ const acpModels = (process.env.FAKE_ACP_SESSION_MODELS ?? "")
     const [modelId, name] = entry.split("|");
     return name ? { modelId, name } : { modelId };
   });
-const sessionModels = () =>
-  acpModels.length ? { currentModelId: acpModels[0].modelId, availableModels: acpModels } : null;
+const sessionModels = (currentModelId?: string) =>
+  acpModels.length
+    ? {
+        currentModelId:
+          currentModelId && acpModels.some((m) => m.modelId === currentModelId)
+            ? currentModelId
+            : acpModels[0].modelId,
+        availableModels: acpModels,
+      }
+    : null;
 
 const argv = process.argv.slice(2);
 const dumpEnv = Object.fromEntries(
@@ -243,6 +268,9 @@ const dumpEnv = Object.fromEntries(
     "UNSLOTH_STUDIO_AUTH_TOKEN",
     "CURSOR_API_KEY",
     "CURSOR_AUTH_TOKEN",
+    "Z_AI_API_KEY",
+    "GLM_API_KEY",
+    "ZCODE_ACP_MODE",
     "KIMI_MODEL_NAME",
     "KIMI_MODEL_API_KEY",
     "KIMI_MODEL_BASE_URL",
@@ -250,7 +278,7 @@ const dumpEnv = Object.fromEntries(
     "KIMI_MODEL_DISPLAY_NAME",
     "TEST_TURN_MODEL",
   ]
-    .concat(Object.keys(process.env).filter((key) => /^(AGENT_|ZULIP_|CLAUDE_CODE_SESSION_ID$)/.test(key)))
+    .concat(Object.keys(process.env).filter((key) => /^(AGENT_|SIMPLE_TOOLS_|ZULIP_|CLAUDE_CODE_SESSION_ID$)/.test(key)))
     .flatMap((key) => (process.env[key] === undefined ? [] : [[key, process.env[key]]] as const)),
 );
 const dumpState: Record<string, unknown> = { argv, env: dumpEnv };
@@ -381,6 +409,19 @@ if (process.env.FAKE_ACP_DUMP) {
     }
   }
 }
+
+// A resumed session keeps the model its last accepted set_model pinned, so
+// session/load reports that as current; session/new starts at the first
+// advertised model instead.
+const lastAcceptedModelId = (): string | undefined => {
+  for (let i = configCalls.length - 1; i >= 0; i--) {
+    const call = configCalls[i]!;
+    if (call.method !== "session/set_model") continue;
+    const parsed = z.object({ modelId: z.string() }).safeParse(call.params);
+    if (parsed.success) return parsed.data.modelId;
+  }
+  return undefined;
+};
 
 // pending server→client permission request id → resolver
 let pendingPermissionId: number | null = null;
@@ -650,7 +691,7 @@ function handle(rawMsg: unknown, resumed = false) {
         break;
       }
       const opts = configOptions();
-      const mdls = sessionModels();
+      const mdls = sessionModels(lastAcceptedModelId());
       result(msg.id, { ...(opts ? { configOptions: opts } : {}), ...(mdls ? { models: mdls } : {}) });
       announceCommands(process.env.FAKE_ACP_COMMANDS_REPLAY === "1");
       break;
@@ -710,6 +751,14 @@ function handle(rawMsg: unknown, resumed = false) {
         });
         break;
       }
+      if (configId === "mode" && process.env.FAKE_ACP_MODE_ERROR_CODE) {
+        out({
+          jsonrpc: "2.0",
+          id: msg.id,
+          error: { code: Number(process.env.FAKE_ACP_MODE_ERROR_CODE), message: `mode set failed: ${value}` },
+        });
+        break;
+      }
       if (configId === reasoningConfigId && reasoningModels.length > 0 && !reasoningAdvertised()) {
         out({
           jsonrpc: "2.0",
@@ -722,7 +771,9 @@ function handle(rawMsg: unknown, resumed = false) {
         ? parsedValue.success && models.includes(parsedValue.data)
         : configId === reasoningConfigId
           ? parsedValue.success && reasoningEfforts.includes(parsedValue.data)
-          : false;
+          : configId === "mode"
+            ? parsedValue.success && sessionModes.includes(parsedValue.data)
+            : false;
       if (!accepted) {
         out({
           jsonrpc: "2.0",
@@ -743,6 +794,9 @@ function handle(rawMsg: unknown, resumed = false) {
       }
       if (configId === reasoningConfigId && !process.env.FAKE_ACP_REASONING_STICKS && parsedValue.success) {
         currentReasoningEffort = parsedValue.data;
+      }
+      if (configId === "mode" && !process.env.FAKE_ACP_MODE_STICKS && parsedValue.success) {
+        currentMode = parsedValue.data;
       }
       configCalls.push({ method: msg.method, params: msg.params });
       if (process.env.FAKE_ACP_DUMP) {
@@ -941,6 +995,70 @@ function handle(rawMsg: unknown, resumed = false) {
               title: "hookRun: completed",
               status: "completed",
               content: [{ type: "content", content: { type: "text", text: "hook ran" } }],
+            },
+          },
+        });
+        complete();
+        return;
+      }
+      if (mode === "lifecycle-completed-with-errors") {
+        const callId = "lifecycle-completed-with-errors-1";
+        const output = [{ type: "content", content: { type: "text", text: "Hook run completed with errors" } }];
+        out({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            update: {
+              sessionUpdate: "tool_call",
+              toolCallId: callId,
+              title: "hookRun: inProgress",
+              kind: "other",
+              rawInput: { hook: "Run" },
+            },
+          },
+        });
+        out({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            update: {
+              sessionUpdate: "tool_call_update",
+              toolCallId: callId,
+              status: "completed",
+              title: "hookRun: completed",
+              content: output,
+            },
+          },
+        });
+        complete();
+        return;
+      }
+      if (mode === "lifecycle-failed-done") {
+        const callId = "lifecycle-failed-done-1";
+        const output = [{ type: "content", content: { type: "text", text: "Reminder child session main run completed." } }];
+        out({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            update: {
+              sessionUpdate: "tool_call",
+              toolCallId: callId,
+              title: "reminderChild: inProgress",
+              kind: "other",
+              rawInput: { child: "reminder" },
+            },
+          },
+        });
+        out({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            update: {
+              sessionUpdate: "tool_call_update",
+              toolCallId: callId,
+              status: "failed",
+              title: "reminderChild: failed",
+              content: output,
             },
           },
         });

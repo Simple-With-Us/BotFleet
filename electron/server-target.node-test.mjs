@@ -15,6 +15,13 @@ import {
   validateRemoteServerUrl,
   SERVER_TARGET_FILE,
 } from "./server-target.mjs";
+import {
+  STARTUP_ENROLLMENT_FILE,
+  parseStartupEnrollment,
+  readStartupEnrollment,
+  resolveEnrolledServerTarget,
+  writeStartupEnrollment,
+} from "./startup-enrollment.mjs";
 
 function makeUserDataDir() {
   return mkdtempSync(path.join(os.tmpdir(), "bf-server-target-"));
@@ -495,24 +502,273 @@ test("no message ever carries a token or a url value", async () => {
   }
 });
 
+// ── Explicit startup enrollment ──────────────────────────────────────────
+
+test("startup enrollment is a strict nonsecret versioned choice", () => {
+  assert.equal(parseStartupEnrollment({ version: 1, mode: "local" }), "local");
+  assert.equal(parseStartupEnrollment({ version: 1, mode: "remote" }), "remote");
+  for (const value of [null, [], {}, { version: 2, mode: "local" }, { version: 1, mode: "LOCAL" },
+    { version: 1, mode: "remote", token: "unexpected" }, Object.assign(Object.create({ version: 1 }), { mode: "local", extra: true })]) {
+    assert.throws(() => parseStartupEnrollment(value), /startup choice/);
+  }
+});
+
+test("startup enrollment reads missing state and atomically round-trips explicit choices", () => {
+  const dir = makeUserDataDir();
+  try {
+    assert.equal(readStartupEnrollment(dir), null);
+    writeStartupEnrollment("local", dir);
+    assert.equal(readStartupEnrollment(dir), "local");
+    writeStartupEnrollment("remote", dir);
+    assert.equal(readStartupEnrollment(dir), "remote");
+    assert.deepEqual(fs.readdirSync(dir), [STARTUP_ENROLLMENT_FILE]);
+    assert.throws(() => writeStartupEnrollment("unknown", dir), /startup choice/);
+    assert.equal(readStartupEnrollment(dir), "remote");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("startup enrollment refuses malformed, oversized, and symlinked files", () => {
+  const dir = makeUserDataDir();
+  const file = path.join(dir, STARTUP_ENROLLMENT_FILE);
+  try {
+    for (const body of ["{", "x".repeat(1025), JSON.stringify({ version: 1, mode: "local", extra: true })]) {
+      fs.writeFileSync(file, body);
+      assert.throws(() => readStartupEnrollment(dir), /startup choice/);
+    }
+    fs.rmSync(file);
+    const other = path.join(dir, "other.json");
+    fs.writeFileSync(other, JSON.stringify({ version: 1, mode: "remote" }));
+    fs.symlinkSync(other, file);
+    assert.throws(() => readStartupEnrollment(dir), /startup choice/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("local startup never invokes the token or vault reader", async () => {
+  const calls = [];
+  const result = await resolveEnrolledServerTarget({
+    readEnrollment: () => "local",
+    chooseMode: () => { calls.push("choose"); return "remote"; },
+    readRemoteTarget: () => resolveServerTarget({
+      readToken: async () => { calls.push("token"); return serviceToken(); },
+      readSecrets: async () => { calls.push("vault"); return {}; },
+    }),
+  });
+  assert.deepEqual(result, { mode: "local", source: "local-preference", legacyFile: false });
+  assert.deepEqual(calls, []);
+});
+
+test("missing or cancelled startup setup cannot read credentials", async () => {
+  for (const choice of [undefined, null]) {
+    const calls = [];
+    const result = await resolveEnrolledServerTarget({
+      readEnrollment: () => null,
+    forceChoice: true,
+      chooseMode: choice === undefined ? undefined : () => null,
+      writeEnrollment: () => calls.push("write"),
+      readRemoteTarget: () => calls.push("credentials"),
+    });
+    assert.equal(result.mode, "cancelled");
+    assert.deepEqual(calls, []);
+  }
+});
+
+test("a Mac enrolled before the choice existed keeps its remote startup without a prompt", async () => {
+  const calls = [];
+  const result = await resolveEnrolledServerTarget({
+    readEnrollment: () => null,
+    hasLegacyEnrollment: async () => true,
+    chooseMode: () => { calls.push("prompt"); return "local"; },
+    writeEnrollment: () => calls.push("write"),
+    readRemoteTarget: async () => { calls.push("credentials"); return { mode: "local", source: "infisical", legacyFile: false }; },
+  });
+  assert.equal(result.source, "infisical");
+  assert.deepEqual(calls, ["credentials"]);
+});
+
+test("an explicit choice or Server Setup outranks the legacy enrollment", async () => {
+  const local = await resolveEnrolledServerTarget({
+    readEnrollment: () => "local",
+    hasLegacyEnrollment: async () => { throw new Error("must not be consulted"); },
+    readRemoteTarget: () => { throw new Error("must not read credentials"); },
+  });
+  assert.equal(local.source, "local-preference");
+  const calls = [];
+  const forced = await resolveEnrolledServerTarget({
+    forceChoice: true,
+    hasLegacyEnrollment: async () => { throw new Error("must not be consulted"); },
+    chooseMode: () => null,
+    readRemoteTarget: () => calls.push("credentials"),
+  });
+  assert.equal(forced.mode, "cancelled");
+  assert.deepEqual(calls, []);
+});
+
+test("a Mac with no choice and no legacy enrollment runs on this Mac, reads nothing and saves nothing", async () => {
+  const calls = [];
+  const result = await resolveEnrolledServerTarget({
+    readEnrollment: () => null,
+    hasLegacyEnrollment: async () => false,
+    chooseMode: () => { calls.push("prompt"); return "remote"; },
+    writeEnrollment: () => calls.push("write"),
+    readRemoteTarget: () => calls.push("credentials"),
+  });
+  assert.equal(result.mode, "local");
+  assert.deepEqual(calls, []);
+});
+
+test("Server Setup is the only path that asks, and declining it changes nothing", async () => {
+  const calls = [];
+  const result = await resolveEnrolledServerTarget({
+    forceChoice: true,
+    hasLegacyEnrollment: async () => true,
+    chooseMode: () => null,
+    writeEnrollment: () => calls.push("write"),
+    readRemoteTarget: () => calls.push("credentials"),
+  });
+  assert.equal(result.mode, "cancelled");
+  assert.deepEqual(calls, []);
+});
+
+test("a remote choice that fails is not saved, so the next launch asks again", async () => {
+  for (const readToken of [async () => null, async () => { throw new Error("fixture keychain unavailable"); }]) {
+    const calls = [];
+    const result = await resolveEnrolledServerTarget({
+      readEnrollment: () => null,
+    forceChoice: true,
+      chooseMode: () => "remote",
+      writeEnrollment: (mode) => calls.push(`write:${mode}`),
+      readRemoteTarget: () => resolveServerTarget({ readToken }),
+    });
+    assert.equal(result.mode, "error");
+    assert.deepEqual(calls, []);
+  }
+});
+
+test("a first local choice is persisted without reading credentials", async () => {
+  const calls = [];
+  const result = await resolveEnrolledServerTarget({
+    readEnrollment: () => null,
+    forceChoice: true,
+    chooseMode: () => { calls.push("choose"); return "local"; },
+    writeEnrollment: (mode) => calls.push(`write:${mode}`),
+    readRemoteTarget: () => calls.push("credentials"),
+  });
+  assert.equal(result.mode, "local");
+  assert.deepEqual(calls, ["choose", "write:local"]);
+});
+
+test("remote setup is persisted only after the scoped vault read works", async () => {
+  const calls = [];
+  const result = await resolveEnrolledServerTarget({
+    readEnrollment: () => null,
+    forceChoice: true,
+    chooseMode: () => { calls.push("choose"); return "remote"; },
+    writeEnrollment: (mode) => calls.push(`write:${mode}`),
+    readRemoteTarget: () => resolveServerTarget({
+      readToken: async () => { calls.push("token"); return serviceToken(); },
+      readSecrets: async ({ names }) => {
+        calls.push("vault");
+        assert.deepEqual(names, ["BOTFLEET_SERVER_MODE", "BOTFLEET_SERVER_URL", "BOTFLEET_SERVER_GATE_TOKEN"]);
+        return { BOTFLEET_SERVER_MODE: "remote", BOTFLEET_SERVER_URL: "https://host.example", BOTFLEET_SERVER_GATE_TOKEN: gateToken() };
+      },
+    }),
+  });
+  assert.equal(result.mode, "remote");
+  assert.deepEqual(calls, ["choose", "token", "vault", "write:remote"]);
+});
+
+test("a remote choice that fails is not saved, so the next launch asks again", async () => {
+  for (const readToken of [async () => null, async () => { throw new Error("fixture keychain unavailable"); }]) {
+    const calls = [];
+    const result = await resolveEnrolledServerTarget({
+      readEnrollment: () => null,
+    forceChoice: true,
+      chooseMode: () => "remote",
+      writeEnrollment: (mode) => calls.push(`write:${mode}`),
+      readRemoteTarget: () => resolveServerTarget({ readToken }),
+    });
+    assert.equal(result.mode, "error");
+    assert.deepEqual(calls, []);
+  }
+});
+
+test("a non-interactive launch with no choice runs on this Mac and saves nothing", async () => {
+  const calls = [];
+  const result = await resolveEnrolledServerTarget({
+    readEnrollment: () => null,
+    interactive: false,
+    chooseMode: () => { calls.push("prompt"); return "remote"; },
+    writeEnrollment: () => calls.push("write"),
+    readRemoteTarget: () => calls.push("credentials"),
+  });
+  assert.equal(result.mode, "local");
+  assert.deepEqual(calls, []);
+});
+
+test("explicit remote setup cannot fall back locally when its bootstrap is absent or fails", async () => {
+  for (const readToken of [async () => null, async () => { throw new Error("fixture keychain unavailable"); }]) {
+    const result = await resolveEnrolledServerTarget({
+      readEnrollment: () => "remote",
+      readRemoteTarget: () => resolveServerTarget({ readToken }),
+    });
+    assert.equal(result.mode, "error");
+    assert.equal(result.source, "infisical");
+  }
+});
+
+test("invalid enrollment and failed persistence stop before credential access", async () => {
+  for (const options of [
+    { readEnrollment: () => { throw new Error("malformed preference"); } },
+    { readEnrollment: () => null,
+    forceChoice: true, chooseMode: () => "local", writeEnrollment: () => { throw new Error("read only"); } },
+    { readEnrollment: () => "unexpected" },
+  ]) {
+    let reads = 0;
+    const result = await resolveEnrolledServerTarget({ ...options, readRemoteTarget: () => { reads += 1; } });
+    assert.equal(result.mode, "error");
+    assert.equal(result.source, "startup-enrollment");
+    assert.equal(reads, 0);
+  }
+});
+
+test("Server Setup can replace a bad preference only through a new explicit choice", async () => {
+  const calls = [];
+  const result = await resolveEnrolledServerTarget({
+    forceChoice: true,
+    readEnrollment: () => { throw new Error("must not read the old preference during explicit setup"); },
+    chooseMode: () => { calls.push("choose"); return "local"; },
+    writeEnrollment: (mode) => calls.push(`write:${mode}`),
+    readRemoteTarget: () => calls.push("credentials"),
+  });
+  assert.equal(result.mode, "local");
+  assert.deepEqual(calls, ["choose", "write:local"]);
+});
+
 // ── main.mjs: the shape of the startup ────────────────────────────────────
 
-test("main.mjs resolves the target from Infisical and keeps the source order", () => {
+test("main.mjs resolves the startup choice before credentials and server selection", () => {
   const main = fs.readFileSync(new URL("./main.mjs", import.meta.url), "utf8");
-  // The read starts early, alongside the boot preparation, and is awaited
-  // before any server is chosen.  A failed read becomes an error target, never
-  // a fallback.
   assert.match(
     main,
-    /const serverTargetRead = app\.isPackaged\s*\? readServerTargetFromInfisical\(\)\.catch\(\(error\) => serverTargetFailure\(error\)\)/,
+    /let serverTargetRead = app\.isPackaged\s*\? await readStartupServerTarget\(\)\.catch\(\(error\) => serverTargetFailure\(error\)\)/,
   );
-  assert.match(main, /const target = await serverTargetRead;/);
+  assert.match(main, /const target = serverTargetRead;/);
   assert.match(main, /return resolveServerTarget\(\{ userDataDir \}\);/);
-  const readAt = main.indexOf("const target = await serverTargetRead;");
+  const choiceAt = main.indexOf("let serverTargetRead = app.isPackaged");
+  const credentialsAt = main.indexOf("secureCredentials = await loadSecureCredentials();", choiceAt);
+  assert.ok(choiceAt > 0 && credentialsAt > choiceAt, "startup choice precedes credential preparation");
+  assert.match(main.slice(choiceAt, credentialsAt), /serverTargetRead\?\.mode === "cancelled"[\s\S]*app\.quit\(\);[\s\S]*return;/);
+  const readAt = main.indexOf("const target = serverTargetRead;");
   const packagedAt = main.indexOf("serverReady = await startServerPackaged()", readAt);
   assert.ok(readAt > 0 && packagedAt > readAt, "the target is awaited before the local server starts");
   assert.match(main, /if \(target\.mode === "remote"\) serverReady = await startRemoteServer\(/);
   assert.match(main, /else serverReady = await startServerPackaged\(\);/);
+  assert.match(main, /label: "Server Setup…"/);
+  assert.match(main, /label: "Reload From Infisical",\s*enabled: enrolled/);
   // The remote error page still exists, so the remote path keeps its own
   // failure handling.
   assert.match(main, /startRemoteServer\(target\.origin, target\.token \?\? ""\)/);
@@ -520,7 +776,7 @@ test("main.mjs resolves the target from Infisical and keeps the source order", (
 
 test("main.mjs stages a reloaded target until the restart is accepted", () => {
   const main = fs.readFileSync(new URL("./main.mjs", import.meta.url), "utf8");
-  const start = main.indexOf("async function reloadServerTargetFromInfisical()");
+  const start = main.indexOf("async function reloadServerTargetFromInfisical(");
   const end = main.indexOf("function syncManagedComposioCredentials()", start);
   assert.ok(start > 0 && end > start, "the reload handler is where it was");
   const reload = main.slice(start, end);

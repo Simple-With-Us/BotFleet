@@ -1,6 +1,17 @@
 import { describe, expect, it } from "vitest";
 
 import { engineCheckingCopy, engineSetupCopy, isApiKeyOnly, needsCli, needsSignIn } from "./EngineSetup";
+
+function openCodeInstance(snapshot: InstanceInfo["snapshot"]): InstanceInfo {
+  return {
+    instanceId: "opencode",
+    driverKind: "opencodeGo",
+    displayName: "OpenCode",
+    models: { default: "", options: [] },
+    snapshot,
+    install: { signInCommand: "opencode auth login" },
+  };
+}
 import type { InstanceInfo } from "@/state/store";
 
 function instance(snapshot: InstanceInfo["snapshot"]): InstanceInfo {
@@ -94,5 +105,16 @@ describe("isApiKeyOnly / engineSetupCopy — MiniMax-shaped, key-only engines", 
     const unsigned = instance({ state: "available", authenticated: false, version: "0.36.1" });
     const { title } = engineSetupCopy(unsigned, "cloud");
     expect(title).toBe("Sign in to Kimi");
+  });
+
+  it("prefers an OpenCode catalog probe sentence over generic sign-in copy", () => {
+    const empty = openCodeInstance({
+      state: "available",
+      authenticated: false,
+      modelProbeProblem: "OpenCode answered but listed no models.",
+    });
+    const setup = engineSetupCopy(empty, "cloud");
+    expect(setup.title).toBe("OpenCode needs setup");
+    expect(setup.description).toBe("OpenCode answered but listed no models.");
   });
 });

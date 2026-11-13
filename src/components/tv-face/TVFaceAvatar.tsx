@@ -10,6 +10,8 @@ import {
   TVFACE_MANIFEST,
   type TVFaceExpression,
 } from "./manifest";
+import { tvFaceOneFilePackUrl } from "./packs";
+import { AnimatedFileAvatar } from "../avatar-file/AnimatedFileAvatar";
 
 /** The expression an idle bot rests on. */
 const RESTING: TVFaceExpression = "resting";
@@ -291,6 +293,53 @@ function initialFrameMedia(
 }
 
 export function TVFaceAvatar({
+  state = "idle",
+  color = "orange",
+  size = 44,
+  label,
+  animated = true,
+  transitionSpeed = 1,
+}: TVFaceAvatarProps) {
+  // One-file pack path:  play the embedded-manifest WebP through the shared
+  // avatar-file player.  Colors without a shipped pack keep the multi-GIF tree,
+  // as do callers that ask for a transition speed:  the one-file player has no
+  // speed control, and silently ignoring the prop would break its documented
+  // behavior on every shipped color.
+  //
+  // A pack that cannot load must not leave a broken image:  the failed URL is
+  // recorded and the multi-GIF tree takes over (its own onError chain recovers
+  // to the hold/resting stills).  Keyed on the URL, so a different pack for
+  // another state still gets its chance.
+  const [failedPackSrc, setFailedPackSrc] = useState<string | null>(null);
+  const oneFileSrc = tvFaceOneFilePackUrl(color, state);
+  if (oneFileSrc && oneFileSrc !== failedPackSrc && transitionSpeed === 1) {
+    return (
+      <AnimatedFileAvatar
+        src={oneFileSrc}
+        state={state}
+        size={size}
+        alt={label || `Bot TV-Face`}
+        radius="0"
+        animated={animated}
+        onError={() => setFailedPackSrc(oneFileSrc)}
+      />
+    );
+  }
+
+  return (
+    <TVFaceGifAvatar
+      state={state}
+      color={color}
+      size={size}
+      label={label}
+      animated={animated}
+      transitionSpeed={transitionSpeed}
+    />
+  );
+}
+
+/** Legacy multi-GIF / still player.  Used when no one-file pack ships for the color. */
+function TVFaceGifAvatar({
   state = "idle",
   color = "orange",
   size = 44,

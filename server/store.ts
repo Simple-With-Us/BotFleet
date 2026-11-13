@@ -18,7 +18,7 @@ import { workspaceDir } from "./workspace.ts";
 import { newId, type CloudBackend, type ModelSelection, type ThreadId, type TurnBillingMode } from "./contracts.ts";
 import { pickBotName } from "./names.ts";
 import { redactSecretsInText } from "./redact.ts";
-import { botAvatarProfile, type BotAvatarCrop } from "../shared/bot-avatar.ts";
+import { botAvatarProfile, type BotAvatarCrop, type BotAvatarRecolorable } from "../shared/bot-avatar.ts";
 import { isSnoozeExpired, SNOOZE_UNTIL_ACTIVITY } from "../shared/thread-snooze.ts";
 import { withoutNestedFallbacks } from "../shared/model-limits.ts";
 import type { BotVoices } from "../shared/bot-voice.ts";
@@ -28,7 +28,13 @@ import type { RoutineRequestCardData } from "../shared/routine-request.ts";
 import { interruptedHelper, type HelperTranscript } from "../shared/helpers.ts";
 import type { ToolKind } from "../shared/tool-activity.ts";
 import type { ContextInjectionRef } from "../shared/context-injection.ts";
-import { taskWorkspaceContextsMatch, taskWorkspaceMergeSkipReason, type TaskWorkspaceContext } from "../shared/task-workspace-context.ts";
+import {
+  simpleMergeConflicts,
+  simpleMergeRefusal,
+  taskWorkspaceContextsMatch,
+  taskWorkspaceMergeSkipReason,
+  type TaskWorkspaceContext,
+} from "../shared/task-workspace-context.ts";
 import {
   applyOwnerDirective,
   classifyModel,
@@ -402,6 +408,9 @@ export interface TaskUsage {
    * they fill the window).  Unlike `input`, it is not a running total.  Absent
    * until a turn reports input. */
   lastInput?: number;
+  /** The context window the engine reported with that turn (`usage_update.size`).
+   * Absent when the engine did not send one.  Not a catalog guess. */
+  contextWindow?: number;
 }
 
 /** Running timing aggregate for one task, banked at each settled turn from
@@ -644,6 +653,8 @@ export interface BotRecord {
   avatarUrl?: string;
   /** Mascot, or the crop applied to avatarUrl. */
   avatarCrop?: BotAvatarCrop;
+  /** none | shell | full — how much of the avatar the Color row may recolour. */
+  recolorable?: BotAvatarRecolorable;
   unread: boolean;
   modelSelection: ModelSelection;
   /** The model selection that actually ran on the most recent turn (post-fallback). */
@@ -1286,7 +1297,9 @@ export class Store {
     ]);
     for (const threadId of knownThreads) {
       const legacyFile = messagesFile(threadId);
-      if (existsSync(legacyFile)) mdb.readThread(threadId, legacyFile);
+      // Only a thread with no rows can need importing; readThread on an
+      // already-migrated thread hydrated the whole transcript for nothing.
+      if (existsSync(legacyFile) && mdb.countMessages(threadId) === 0) mdb.readThread(threadId, legacyFile);
     }
   }
 
@@ -1448,7 +1461,9 @@ export class Store {
     for (const file of [messagesFile(threadId), `${messagesFile(threadId)}.imported`]) {
       try {
         unlinkSync(file);
-      } catch {}
+      } catch {
+        // the legacy file may not exist; the DB rows are already gone
+      }
     }
     this.emit({ type: "thread.deleted", threadId });
   }
@@ -1689,18 +1704,16 @@ export class Store {
   }
 
   /** Fold every extra bot and room conversation into the active thread.
-   * Used when switching the workspace to Simple with merge opted in. */
+   * Used when switching the workspace to Simple with merge opted in.
+   *
+   * A conversation that cannot merge blocks the whole switch.  Simple would
+   * hide it, and folding only the rest would look like every conversation
+   * had been combined.  Nothing is moved, and the error names what stayed
+   * separate so the settings card can say so before the person commits. */
   mergeAllExtraThreads(): { bots: number; groups: number; threads: number } {
-    // Preflight the entire operation before moving any transcript or alias.
-    // Simple-mode conversion must not hide a task whose binding prevented merge.
-    for (const owner of [...this.bots, ...this.groups.filter((group) => !group.dm)]) {
-      const into = owner.tasks?.find((task) => task.threadId === owner.threadId);
-      for (const task of owner.tasks ?? []) {
-        if (task.threadId !== owner.threadId
-          && !taskWorkspaceContextsMatch(task.workspaceContext, into?.workspaceContext)) {
-          throw Object.assign(new Error("these conversations have different App bindings — keep them separate"), { status: 409 });
-        }
-      }
+    const blocked = simpleMergeConflicts([...this.bots, ...this.groups]);
+    if (blocked.length > 0) {
+      throw Object.assign(new Error(simpleMergeRefusal(blocked)), { status: 409 });
     }
     let bots = 0;
     let groups = 0;
@@ -1737,8 +1750,8 @@ export class Store {
    * `mergeAllExtraThreads`, a source that cannot merge does not abort the
    * rest: a thread bound to a different App is left alone and reported, so
    * a person sees exactly what stayed behind instead of a refusal that
-   * merged nothing.  The workspace switch has to refuse outright, because
-   * it would otherwise hide a task whose binding prevented the merge.
+   * merged nothing.  The workspace switch refuses outright, because Simple
+   * would hide a conversation the merge had to leave separate.
    *
    * Sources fold oldest first, so the destination's own transcript stays at
    * the front and the merged text reads in chronological order. */
@@ -2198,9 +2211,32 @@ export class Store {
       if (!row.message.helper) continue;
       const helper = interruptedHelper(row.message.helper, now);
       if (!helper) continue;
-      if (this.patchMessage(row.threadId, row.message.id, { helper })) settled += 1;
+      // A warm thread patches in place; a cold one patches its single row
+      // by id so boot never hydrates a large thread to settle one card.
+      if (this.threads.has(row.threadId)) {
+        if (this.patchMessage(row.threadId, row.message.id, { helper })) settled += 1;
+        continue;
+      }
+      const updated: Message = { ...row.message, helper };
+      mdb.updateMessage(row.threadId, updated);
+      this.emit({ type: "message.patch", threadId: row.threadId, message: updated });
+      settled += 1;
     }
     return settled;
+  }
+
+  /** Whether one message exists, without hydrating its thread when cold —
+   * the held-work restore at boot only needs this lookup by id. A cold
+   * thread with no rows yet may still hold the message in its legacy JSON
+   * file, so only that case falls back to the hydrating read (which imports
+   * the file once); a thread with rows keeps the bounded by-id lookup. */
+  hasMessage(threadId: string, messageId: string): boolean {
+    const warm = this.threads.get(threadId);
+    if (warm) return warm.messages.some((m) => m.id === messageId);
+    if (!mdb.hasThreadRows(threadId)) {
+      return this.thread(threadId).messages.some((m) => m.id === messageId);
+    }
+    return mdb.readMessageById(threadId, messageId) !== null;
   }
 
   patchMessage(threadId: string, messageId: string, patch: Partial<Message>): Message | null {
@@ -2302,7 +2338,9 @@ export class Store {
     // transcripts: deleting a bot deletes what it knew
     try {
       rmSync(workspaceDir(id), { recursive: true, force: true });
-    } catch {}
+    } catch (error) {
+      console.error(`store: could not remove workspace for deleted bot ${id}`, error);
+    }
     this.saveBots();
     this.emit({ type: "bot.deleted", botId: id });
     return true;
@@ -2457,6 +2495,8 @@ export class Store {
       input?: number;
       output?: number;
       cachedInput?: number;
+      /** The window the engine reported on this turn, when it reported one. */
+      contextWindow?: number;
       costUsd: number | null;
       billingMode?: TurnBillingMode;
       /** This turn's timing, banked in the same write so the task reaches
@@ -2469,11 +2509,15 @@ export class Store {
     const task = this.taskByThread(botId, threadId);
     if (!task) return null;
     const previousLastInput = task.usage?.lastInput;
+    const previousContextWindow = task.usage?.contextWindow;
     task.usage = mergeTaskUsage(task.usage, turn);
     // Context fullness is the LAST turn's input, not a running sum.  A turn
     // that reports no input says nothing about it, so the earlier figure stands.
     if (turn.input !== undefined && Number.isFinite(turn.input) && turn.input >= 0) task.usage.lastInput = Math.trunc(turn.input);
     else if (previousLastInput !== undefined) task.usage.lastInput = previousLastInput;
+    if (turn.contextWindow !== undefined && Number.isFinite(turn.contextWindow) && turn.contextWindow > 0) {
+      task.usage.contextWindow = Math.trunc(turn.contextWindow);
+    } else if (previousContextWindow !== undefined) task.usage.contextWindow = previousContextWindow;
     if (turn.stats) task.stats = mergeTaskStats(task.stats, turn.stats);
     if (instanceId) {
       const byInstance = (task.usageByInstance ??= {});
@@ -2572,8 +2616,8 @@ export class Store {
   // ── tasks ─────────────────────────────────────────────────────────────
   /** The first thing the human asked in a thread — a task's natural name. */
   private firstUserLine(threadId: string): string | null {
-    const first = this.messagesFor(threadId).find((m) => m.role === "user" && m.kind === "text" && m.text?.trim());
-    return first?.text ? titleFromMessage(first.text) : null;
+    const text = mdb.firstUserText(threadId, messagesFile(threadId));
+    return text ? titleFromMessage(text) : null;
   }
 
   tasks(botId: string): TaskRecord[] {
@@ -2828,7 +2872,13 @@ export class Store {
             if (Array.isArray(keys)) pendingById[id] = keys.filter((key): key is string => typeof key === "string");
           }
         }
-      } catch {
+      } catch (error) {
+        // ENOENT is the first boot before any marker exists; anything else
+        // reads as "directive never applied" and would re-run the migration.
+        // SAFETY: a failed `readFileSync` throws an errno exception carrying `code`.
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+          console.error("model-lineage: could not read the migration marker; treating the directive as unapplied", error);
+        }
         applied = [];
         pendingById = {};
       }
@@ -2959,7 +3009,8 @@ export class Store {
         let botId: unknown;
         try {
           [botId] = JSON.parse(key) as unknown[];
-        } catch {
+        } catch (error) {
+          console.error("model-lineage: dropping a malformed pending migration key", error);
           continue;
         }
         if (typeof botId === "string" && !visited.has(botId) && this.bots.some((bot) => bot.id === botId)) {

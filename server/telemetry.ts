@@ -11,6 +11,7 @@ import {
   tokenCount,
   type AiUsageBlock,
 } from "./ai-usage.ts";
+import { billedClaudeCallEventId, type ClaudeBilledCall } from "./claude-billed-call.ts";
 import { FailureLogDedup } from "./log-dedup.ts";
 import { getSentry, isSentryActive } from "./sentry.ts";
 import {
@@ -80,6 +81,7 @@ export interface TelemetryTurnParams {
   childSessionId?: string;
   /** When the turn was dispatched, in epoch milliseconds. */
   turnStartedAtMs?: number;
+  billedCall?: ClaudeBilledCall;
 }
 
 export interface TelemetryStatus {
@@ -239,6 +241,12 @@ const PROVIDER_BY_ENGINE = new Map<string, string>(Object.entries({
   dsh: "dsh",
   kimi: "moonshot",
   moonshot: "moonshot",
+  zcode: "zcode",
+  // The ACP variant (driverKind zcodeAcp normalizes to zcodeacp) bills the
+  // same GLM Coding Plan, so it attributes to the same provider.
+  zcodeacp: "zcode",
+  zai: "zcode",
+  glm: "zcode",
   cursor: "cursor",
   minimax: "minimax",
   mcode: "minimax",
@@ -312,6 +320,12 @@ export function inferProviderAndService(
   }
   if (inst.includes("kimi") || model.includes("moonshot")) {
     return { provider: "moonshot", service: modelId || "unknown" };
+  }
+  // No model check here: GLM weights served over an OpenAI-compatible
+  // instance (OpenRouter, Ollama, ...) are that instance's traffic, and the
+  // zcode engine itself is already attributed by providerForEngine above.
+  if (inst.includes("zcode")) {
+    return { provider: "zcode", service: modelId || "unknown" };
   }
 
   // Still nothing: an OpenAI-compatible instance reports itself honestly
@@ -393,6 +407,12 @@ type TurnMetadata = {
   childSessionId?: string;
   /** ISO time the turn began, when known. */
   turnStartedAt?: string;
+  billedCallProofVersion?: number;
+  billedCallId?: string;
+  billedCallModel?: string;
+  billedCallOutput?: number;
+  billedCallCacheRead?: number;
+  billedCallCacheWrite?: number;
 };
 
 /** Turn one completed turn into the events that go on the wire.
@@ -534,8 +554,24 @@ export function buildTurnEvents(
   }
 
   const priced = cost != null;
+  const call = params.billedCall;
+  const exactCall = usageReported && call && childSessionId && params.driverKind === "claudeAgent" &&
+    provider === "anthropic" && servedModel === call.model &&
+    [call.input, call.output, call.cacheRead, call.cacheWrite].every((value) => Number.isSafeInteger(value) && value >= 0) &&
+    call.input + call.cacheRead + call.cacheWrite === inTokens &&
+    call.output === outTokens && call.cacheRead === cachedTokens &&
+    call.cacheWrite === cacheWrite5m + cacheWrite1h &&
+    call.id.length > 0 && call.id.length <= 200 && childSessionId === params.childSessionId;
+  if (exactCall) {
+    metadata.billedCallProofVersion = 1;
+    metadata.billedCallId = call.id;
+    metadata.billedCallModel = call.model;
+    metadata.billedCallOutput = call.output;
+    metadata.billedCallCacheRead = call.cacheRead;
+    metadata.billedCallCacheWrite = call.cacheWrite;
+  }
   const event: TelemetryV2Event = {
-    eventId: `${prefix}:${usageReported ? "turn" : "none"}`,
+    eventId: exactCall ? billedClaudeCallEventId(childSessionId, call.id) : `${prefix}:${usageReported ? "turn" : "none"}`,
     environment,
     provider,
     service,
@@ -568,16 +604,25 @@ export function buildTurnEvents(
       costSource:
         params.billingMode === "estimated" ? "estimated" : params.billingMode === "actual" && cost != null ? "billed" : undefined,
     });
-    if (ai) event.ai = ai;
+    if (ai) {
+      // A reconciled receipt knows its absent buckets are exactly zero.
+      // Keep those zeros explicit so a receiver never invents missing proof.
+      if (exactCall) ai.tokens = {
+        ...ai.tokens,
+        input: call.input, output: call.output, cacheRead: call.cacheRead,
+        cacheWrite5m, cacheWrite1h,
+      };
+      event.ai = ai;
+    }
   }
   return [event];
 }
 
 /** Spend that is not a chat turn: a synthesized clip, a generated avatar, a
- * speech summary, a voice-call token.  Nothing here carries prompt text, a
- * key, or a task title. */
+ * speech summary, a voice-call token, or a speech-to-text session.  Nothing
+ * here carries prompt text, a key, or a task title. */
 export interface TelemetryAuxParams {
-  kind: "tts" | "avatar-image" | "speech-summary" | "sts-session";
+  kind: "tts" | "avatar-image" | "speech-summary" | "sts-session" | "stt";
   /** Usage Monitor's provider name for who was paid. */
   provider: string;
   /** The model, voice engine or surface inside that provider. */
@@ -652,19 +697,21 @@ export function turnUsageDetail(
   event: {
     usage?: { cacheWrite5m?: number; cacheWrite1h?: number; reasoning?: number };
     servedModel?: string;
+    billedCall?: ClaudeBilledCall;
     stopReason?: string | null;
   },
   timing: { ttftMs?: number } | undefined,
   seat: string | null | undefined,
 ): Pick<
   TelemetryTurnParams,
-  "cacheWrite5mTokens" | "cacheWrite1hTokens" | "reasoningTokens" | "servedModelId" | "ttftMs" | "seat" | "stopReason"
+  "cacheWrite5mTokens" | "cacheWrite1hTokens" | "reasoningTokens" | "servedModelId" | "ttftMs" | "seat" | "stopReason" | "billedCall"
 > {
   const detail: ReturnType<typeof turnUsageDetail> = {};
   if (event.usage?.cacheWrite5m !== undefined) detail.cacheWrite5mTokens = event.usage.cacheWrite5m;
   if (event.usage?.cacheWrite1h !== undefined) detail.cacheWrite1hTokens = event.usage.cacheWrite1h;
   if (event.usage?.reasoning !== undefined) detail.reasoningTokens = event.usage.reasoning;
   if (event.servedModel) detail.servedModelId = event.servedModel;
+  if (event.billedCall) detail.billedCall = event.billedCall;
   if (timing?.ttftMs !== undefined) detail.ttftMs = timing.ttftMs;
   if (seat) detail.seat = seat;
   if (event.stopReason !== undefined) detail.stopReason = event.stopReason;

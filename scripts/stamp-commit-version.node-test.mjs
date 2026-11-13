@@ -62,6 +62,18 @@ describe("version planning", () => {
     assert.equal(plan.floored, true);
   });
 
+  it("carries the ordered build the version handshake compares (BF-2588)", () => {
+    // The build is the planner output the packaged server stamps into its
+    // identity.  It must be the same number the version ends in, floored
+    // builds included, and a later commit must order strictly after an
+    // earlier one.
+    assert.equal(planVersion({ commitCount: 2127 }).build, "2127");
+    assert.equal(planVersion({ commitCount: 31, floorVersion: "1.0.900" }).build, "900");
+    assert.ok(Number(planVersion({ commitCount: 2128 }).build) > Number(planVersion({ commitCount: 2127 }).build));
+    assert.equal(resolveBuildVersion(initRepo(tempRepo())).build, "4");
+    assert.equal(resolveBuildVersion(initRepo(tempRepo(), { version: "1.0.900" })).build, "900");
+  });
+
   it("leaves a floor it cannot parse alone rather than inventing one", () => {
     assert.equal(planVersion({ commitCount: 2127, floorVersion: "1.0.0-beta.3" }).version, "1.0.2127");
     assert.equal(planVersion({ commitCount: 2127, floorVersion: "latest" }).version, "1.0.2127");
@@ -153,14 +165,16 @@ describe("workflow wiring", () => {
   it("never derives the version on a default-depth clone", () => {
     // Per job, not per string index: the thing that matters is that the job
     // which asks git for the commit count is the same job that asked for the
-    // history it counts.
+    // history it counts.  The shared planner asks for the commit's committer
+    // date instead, and the release workflows keep the full-history checkout
+    // so one rule covers every way a version is derived.
     for (const { name, text } of workflows) {
       const blocks = text.split(/^ {2}(?=[a-z][a-z0-9-]*:\s*$)/m).slice(1);
       for (const block of blocks) {
-        if (!/stamp-commit-version\.mjs/.test(block)) continue;
+        if (!/stamp-commit-version\.mjs|electron-release-version\.mjs/.test(block)) continue;
         assert.ok(
           /fetch-depth: 0/.test(block),
-          `${name}: job "${block.split("\n")[0].trim()}" derives the commit count but its checkout is not full-history`,
+          `${name}: job "${block.split("\n")[0].trim()}" derives the version but its checkout is not full-history`,
         );
       }
     }
@@ -177,8 +191,11 @@ describe("workflow wiring", () => {
 
   it("stamps before the overwrite guard reads the version", () => {
     const release = workflows.find((w) => w.name === "release.yml").text;
-    const stamp = release.indexOf("stamp-commit-version.mjs");
+    // The plan is what the guard compares against, so it has to happen first.
+    // The planner's name changed with the shared version policy (BF-2588);
+    // the order is the thing this guards.
+    const stamp = release.indexOf("electron-release-version.mjs");
     const guard = release.indexOf("is already published");
-    assert.ok(stamp !== -1 && guard !== -1 && stamp < guard, "the guard must see the stamped version, not the hand-typed one");
+    assert.ok(stamp !== -1 && guard !== -1 && stamp < guard, "the guard must see the planned version, not the hand-typed one");
   });
 });
