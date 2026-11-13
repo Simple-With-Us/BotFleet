@@ -154,21 +154,15 @@ const stateFileSchemaBase = z.object({
  *  drift) from real damage (quarantine the whole file). */
 export const stateFileSchema = stateFileSchemaBase.strict();
 
-/** The known accounting ledgers WITHOUT their per-field catches.  The
- *  catches exist so one damaged entry does not cost the whole file, but
- *  they also silently RESET a damaged ledger (a reset dms or wakes ledger
- *  reopens hourly caps; a reset cursor skips backfill).  load() probes the
- *  raw fields with this schema instead: absent probes clean (legacy files
- *  predate the field and get the default), present-but-malformed refuses
- *  the load closed. */
 /** Load-time fingerprint of the damaged state file: reconcile retries of
  *  one blocked load (byte-identical file, same mtime+size) dedup, while a
  *  genuine recurrence after repair carries a new mtime and is archived
  *  again - the recurrence stays visible in the evidence. */
-interface ArchiveFingerprint {
-  mtimeMs: number;
-  size: number;
-}
+export const archiveFingerprintSchema = z
+  .object({ mtimeMs: z.number(), size: z.number() })
+  .strict();
+
+export type ArchiveFingerprint = z.infer<typeof archiveFingerprintSchema>;
 
 /** One line of the notices archive, validated before the dedup read
  *  trusts its fields; a malformed line is simply not a match. */
@@ -177,10 +171,17 @@ const archiveLineSchema = z
     archivedAt: z.number(),
     reason: z.string(),
     entry: z.unknown(),
-    fingerprint: z.object({ mtimeMs: z.number(), size: z.number() }).optional(),
+    fingerprint: archiveFingerprintSchema.optional(),
   })
   .strict();
 
+/** The known accounting ledgers WITHOUT their per-field catches.  The
+ *  catches exist so one damaged entry does not cost the whole file, but
+ *  they also silently RESET a damaged ledger (a reset dms or wakes ledger
+ *  reopens hourly caps; a reset cursor skips backfill).  load() probes the
+ *  raw fields with this schema instead: absent probes clean (legacy files
+ *  predate the field and get the default), present-but-malformed refuses
+ *  the load closed. */
 const ledgerProbeSchemas = {
   cursor: z.number().int().nullable(),
   handled: z.array(z.number()),
@@ -214,19 +215,40 @@ export class ZulipStateStore {
   load(botId: string, role: string): ZulipBotState {
     let text: string;
     let fingerprint: ArchiveFingerprint | undefined;
+    const statePath = join(this.dir, fileName(botId));
     try {
-      // Read through an opened descriptor so the incident fingerprint
-      // describes the exact bytes loaded, not a later state of the path.
-      const fd = openSync(join(this.dir, fileName(botId)), constants.O_RDONLY);
+      // The READ gets the same redirect policy as the writes: ancestors
+      // verified, no links followed, the handle proven against the path
+      // (regular, single-link, same dev+inode).  A planted link must not
+      // choose which bytes become fleet accounting.  The fingerprint is
+      // taken from the proven handle, so it describes the bytes loaded.
+      this.verifyArchiveAncestors(statePath);
+      const fd = openSync(statePath, constants.O_RDONLY | constants.O_NOFOLLOW);
       try {
-        const stat = fstatSync(fd);
-        fingerprint = { mtimeMs: stat.mtimeMs, size: stat.size };
+        const handleStat = fstatSync(fd);
+        const pathStat = lstatSync(statePath);
+        if (
+          !handleStat.isFile() ||
+          !pathStat.isFile() ||
+          handleStat.nlink !== 1 ||
+          pathStat.nlink !== 1 ||
+          handleStat.dev !== pathStat.dev ||
+          handleStat.ino !== pathStat.ino
+        ) {
+          throw new Error(`state file ${statePath} is not a plain single-link file; refusing to load`);
+        }
+        fingerprint = { mtimeMs: handleStat.mtimeMs, size: handleStat.size };
         text = readFileSync(fd, "utf8");
       } finally {
         closeSync(fd);
       }
-    } catch {
-      return emptyState(role);
+    } catch (error) {
+      // SAFETY: filesystem failures carry .code; only a genuinely ABSENT
+      // state file starts empty (a fresh bot).  A hostile or unreadable
+      // path fails closed through per-bot containment - it never silently
+      // resets the ledgers.
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return emptyState(role);
+      throw error;
     }
     let rawJson: unknown;
     try {

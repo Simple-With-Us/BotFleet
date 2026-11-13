@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -25,7 +25,9 @@ describe("ZulipStateStore write-path policy", () => {
     }
   });
 
-  it("persists through a write-only state directory: the mode repair stays best effort", () => {
+  // Root bypasses DAC checks, so the EACCES branch this pins never runs
+  // under uid 0; skip there instead of passing vacuously.
+  it.skipIf(process.getuid?.() === 0)("persists through a write-only state directory: the mode repair stays best effort", () => {
     const root = mkdtempSync(join(tmpdir(), "zulip-store-wonly-"));
     const dir = join(root, "zulip");
     try {
@@ -35,6 +37,8 @@ describe("ZulipStateStore write-path policy", () => {
       const state = emptyState("BF-Plumber");
       state.userId = 9;
       store.save("bot-plumber", state);
+      // The mode repair was skipped: the directory stays write-only.
+      expect(lstatSync(dir).mode & 0o777).toBe(0o300);
       chmodSync(dir, 0o700);
       expect(stateFileSchema.parse(JSON.parse(readFileSync(join(dir, "bot-plumber.json"), "utf8"))).userId).toBe(9);
     } finally {
@@ -55,8 +59,7 @@ describe("ZulipStateStore write-path policy", () => {
     }
   });
 
-  it("accepts a root-owned symlinked state directory (verifiable as uid 0 only)", () => {
-    if (!process.getuid || process.getuid() !== 0) return;
+  it.skipIf(!process.getuid || process.getuid() !== 0)("accepts a root-owned symlinked state directory", () => {
     const target = mkdtempSync(join(tmpdir(), "zulip-store-dirlink-"));
     const base = mkdtempSync(join(tmpdir(), "zulip-store-base-"));
     symlinkSync(target, join(base, "zulip"));
