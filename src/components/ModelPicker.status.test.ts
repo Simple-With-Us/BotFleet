@@ -39,6 +39,34 @@ describe("engineStatus", () => {
     expect(engineStatus(engine("kimi", { state: "unavailable", reason: "Disabled in settings" }))).toBe("Disabled");
   });
 
+  it("shows OpenCode catalog probe failures apart from generic sign-in", () => {
+    const timeout = {
+      instanceId: "opencode",
+      driverKind: "opencodeGo",
+      displayName: "OpenCode",
+      models: { default: "", options: [] },
+      snapshot: {
+        state: "unavailable" as const,
+        transient: true,
+        modelProbeProblem: "OpenCode's model probe timed out after 20 s (host load 2.0 per core)",
+      },
+    };
+    expect(engineStatus(timeout)).toBe("Timed out under load");
+
+    const empty = {
+      ...timeout,
+      snapshot: {
+        state: "available" as const,
+        authenticated: false,
+        modelProbeProblem: "OpenCode answered but listed no models.",
+      },
+    };
+    expect(engineStatus(empty)).toBe("No models listed");
+    expect(engineStatus({ ...empty, snapshot: { ...empty.snapshot, modelProbeProblem: undefined } })).toBe(
+      "Sign-in required",
+    );
+  });
+
   it("does not call an API-key engine that is missing its key Not installed", () => {
     // MiniMax declares no CLI, so it has no CLI candidates either.
     const minimax = engine(

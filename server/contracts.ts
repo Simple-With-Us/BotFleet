@@ -808,6 +808,9 @@ export interface ProviderSnapshot {
   /** Undefined when the auth probe was inconclusive (timed out); only an
    * explicit answer from the CLI is `true` or `false`. */
   authenticated?: boolean;
+  /** OpenCode only: why the last `opencode models` catalog probe failed, in
+   * plain language.  Cleared after a successful probe. */
+  modelProbeProblem?: string;
   version?: string | null;
   /** How this instance is paid for, when the driver can tell: a reported
    * cost on a subscription is notional and the UI labels it as such. */
