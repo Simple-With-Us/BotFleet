@@ -206,7 +206,7 @@ final class QuotasTests: XCTestCase {
         XCTAssertNil(QuotaDisplay.localQuotaNotice(nil, botFleetWindowCount: 0))
         XCTAssertEqual(notice("missing"), "CodeCaps is not running, so no local subscription quota is available")
         XCTAssertEqual(notice("missing", producer: "usage-monitor"), "Usage Monitor is not running, so no local subscription quota is available")
-        XCTAssertEqual(notice("stale", windows: 2, generatedAt: "2026-10-09T20:15:00.000Z"), "CodeCaps has not written quota since 3:15pm")
+        XCTAssertEqual(notice("stale", windows: 2, generatedAt: "2026-10-09T20:15:00.000Z"), "CodeCaps has not written quota since 3:15 PM")
         XCTAssertEqual(notice("stale", windows: 2), "CodeCaps has not written quota recently")
         XCTAssertEqual(notice("unreadable", windows: 2), "CodeCaps's quota file could not be read")
         // a missing file is only news when there is nothing else to show
@@ -305,17 +305,22 @@ final class QuotasTests: XCTestCase {
     // MARK: - Clock
 
     func testTimesReadTwelveHourCentralWithNoZoneName() {
-        // 2026-10-09 20:15:00 UTC is 3:15pm in Chicago (CDT)
+        // 2026-10-09 20:15:00 UTC is 3:15 PM in Chicago (CDT)
         let ms = 1_791_576_900_000.0
-        XCTAssertEqual(OwnerClock.stamp(ms: ms), "Oct 9, 2026, 3:15pm")
-        XCTAssertEqual(OwnerClock.time(ms: ms), "3:15pm")
-        // and through the winter, when the same instant reads an hour earlier
-        XCTAssertEqual(OwnerClock.time(ms: 1_798_172_760_000), "10:26pm")
-        XCTAssertEqual(OwnerClock.stamp(iso: "2026-10-09T20:15:00.000Z"), "Oct 9, 2026, 3:15pm")
-        XCTAssertEqual(OwnerClock.stamp(iso: "2026-10-09T20:15:00Z"), "Oct 9, 2026, 3:15pm")
+        XCTAssertEqual(OwnerClock.stamp(ms: ms), "Oct 9, 2026, 3:15 PM")
+        XCTAssertEqual(OwnerClock.time(ms: ms), "3:15 PM")
+        XCTAssertEqual(OwnerClock.stamp(ms: 1_791_637_500_000), "Oct 10, 2026, 8:05 AM")
+        XCTAssertEqual(OwnerClock.time(ms: 1_791_637_500_000), "8:05 AM")
+        // Winter keeps the Chicago clock and date while switching from CDT to CST.
+        XCTAssertEqual(OwnerClock.stamp(ms: 1_768_485_900_000), "Jan 15, 2026, 8:05 AM")
+        XCTAssertEqual(OwnerClock.time(ms: 1_768_485_900_000), "8:05 AM")
+        XCTAssertEqual(OwnerClock.stamp(ms: 1_768_451_160_000), "Jan 14, 2026, 10:26 PM")
+        XCTAssertEqual(OwnerClock.stamp(iso: "2026-10-09T20:15:00.000Z"), "Oct 9, 2026, 3:15 PM")
+        XCTAssertEqual(OwnerClock.stamp(iso: "2026-10-09T20:15:00Z"), "Oct 9, 2026, 3:15 PM")
         XCTAssertNil(OwnerClock.stamp(iso: "yesterday"))
         for text in [OwnerClock.stamp(ms: ms), OwnerClock.time(ms: ms)] {
-            XCTAssertFalse(text.contains("CDT") || text.contains("CST") || text.contains("AM") || text.contains("PM"))
+            XCTAssertTrue(text.contains(" AM") || text.contains(" PM"))
+            XCTAssertFalse(text.contains("CDT") || text.contains("CST"))
         }
     }
 
@@ -325,7 +330,8 @@ final class QuotasTests: XCTestCase {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [QuotasRequestStub.self]
         let connection = Connection(id: "c1", name: "Mac", host: "192.168.1.5", port: 4748)
-        return CompanionClient(connection: connection, token: TestFixtures.fakeCompanionToken, session: URLSession(configuration: configuration))
+        let fixture = TestFixtures.fakeCompanionToken
+        return CompanionClient(connection: connection, token: fixture, session: URLSession(configuration: configuration))
     }
 
     override func setUp() {

@@ -1,6 +1,6 @@
 // The owner's clock, for times shown to a person.
 //
-// Twelve-hour, lowercase am or pm, Central, and no zone abbreviation: the
+// Twelve-hour, uppercase AM or PM with a separating space, Central, and no zone abbreviation: the
 // fleet's copy rule.  The desktop's own `Intl` formats ask for
 // `timeZoneName: "short"`, which prints "CDT" or "CST"; the phone does not copy
 // that.  Pure and clock-free (the caller passes the instant), so every string
@@ -12,20 +12,20 @@ public enum OwnerClock {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.timeZone = TimeZone(identifier: "America/Chicago")
-        formatter.amSymbol = "am"
-        formatter.pmSymbol = "pm"
+        formatter.amSymbol = "AM"
+        formatter.pmSymbol = "PM"
         formatter.dateFormat = format
         return formatter
     }
 
-    /// "Oct 9, 2026, 3:15pm"
+    /// "Oct 9, 2026, 3:15 PM"
     public static func stamp(ms: Double) -> String {
-        formatter("MMM d, yyyy, h:mma").string(from: Date(timeIntervalSince1970: ms / 1000))
+        formatter("MMM d, yyyy, h:mm a").string(from: Date(timeIntervalSince1970: ms / 1000))
     }
 
-    /// "3:15pm"
+    /// "3:15 PM"
     public static func time(ms: Double) -> String {
-        formatter("h:mma").string(from: Date(timeIntervalSince1970: ms / 1000))
+        formatter("h:mm a").string(from: Date(timeIntervalSince1970: ms / 1000))
     }
 
     /// Epoch milliseconds for an ISO-8601 string the harness wrote with
@@ -40,7 +40,7 @@ public enum OwnerClock {
         return nil
     }
 
-    /// "Oct 9, 2026, 3:15pm" for an ISO string, or nil when it is not a date.
+    /// "Oct 9, 2026, 3:15 PM" for an ISO string, or nil when it is not a date.
     public static func stamp(iso: String) -> String? {
         milliseconds(iso: iso).map { stamp(ms: $0) }
     }
