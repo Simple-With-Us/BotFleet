@@ -2512,9 +2512,7 @@ describe("review fixes: round 12 (reset counter carry, notice event keys, archiv
     // resolve to: the connect reset must keep the durable loss counter, so
     // the next session still reports the quarantined load.
     const statePath = join(dataDir, "zulip", "bot-plumber.json");
-    // SAFETY: the parsed state is only mutated field-by-field here; the
-    // strict schema revalidates every field on the next load.
-    const saved = JSON.parse(readFileSync(statePath, "utf8")) as { userId?: number; stateQuarantinedOnLoad?: number };
+    const saved = stateFileSchema.parse(JSON.parse(readFileSync(statePath, "utf8")));
     saved.userId = 999999;
     saved.stateQuarantinedOnLoad = 2;
     writeFileSync(statePath, `${JSON.stringify(saved)}\n`);
@@ -2556,7 +2554,10 @@ describe("review fixes: round 12 (reset counter carry, notice event keys, archiv
     await hub.stop();
   });
 
-  it("refuses to let an archive write follow a planted ancestor link", async () => {
+  it("refuses to let any state-store write follow a planted ancestor link", async () => {
+    // As uid 0 every planted link is root-owned and followed by design:
+    // there is nothing to assert.
+    if (process.getuid && process.getuid() === 0) return;
     settings.budgets = { dmsPerHour: 0 };
     const hub = makeHub();
     await connected(hub);
@@ -2569,10 +2570,13 @@ describe("review fixes: round 12 (reset counter carry, notice event keys, archiv
     mkdirSync(join(dataDir, "redirect-target"));
     symlinkSync(join(dataDir, "redirect-target"), join(dataDir, "zulip"));
     session.markDirty();
-    session.save();
-    expect(logs.some((line) => line.includes("notice archive failed"))).toBe(true);
+    // Both write paths (state file AND archive) refuse the redirect: the
+    // save fails loudly and the ledgers stay in memory, unwritten.
+    expect(session.save()).toBe(false);
+    expect(logs.some((line) => line.includes("could not save state") && line.includes("symlink"))).toBe(true);
     expect(session.state.notices.filter((n) => n.failed)).toHaveLength(12);
     expect(existsSync(join(dataDir, "redirect-target", "bot-plumber.notices-archive.jsonl"))).toBe(false);
+    expect(existsSync(join(dataDir, "redirect-target", "bot-plumber.json"))).toBe(false);
     await hub.stop();
   });
 
@@ -2605,7 +2609,15 @@ describe("review fixes: round 12 (reset counter carry, notice event keys, archiv
       () => logs.some((line) => line.includes("state-file quarantine")),
       "the content-free quarantine warning",
     );
+    // The load repair-persisted: the file no longer carries the drift, so
+    // the next boot archives nothing again and keeps the counter.
+    expect(readFileSync(statePath, "utf8")).not.toContain("surpriseFutureField");
     await second.stop();
+    const third = makeHub();
+    await connected(third);
+    expect(sessionOf(third).state.stateQuarantinedOnLoad).toBe(1);
+    expect(readFileSync(join(dataDir, "zulip", "bot-plumber.notices-archive.jsonl"), "utf8")).toBe(archive);
+    await third.stop();
   });
 
   it("blocks the bot on an unparseable state file instead of reopening empty ledgers", async () => {
@@ -2633,6 +2645,14 @@ describe("review fixes: round 12 (reset counter carry, notice event keys, archiv
     expect(archive).toMatch(/state-unparseable-on-load/);
     expect(archive).toMatch(/not json/);
     await second.stop();
+    // A second blocked boot is the same incident: the archive does not grow.
+    const blockedAgain = makeHub();
+    await waitFor(
+      () => logs.filter((line) => line.includes("state load failed")).length >= 2,
+      "the repeated loud failure",
+    );
+    expect(readFileSync(join(dataDir, "zulip", "bot-plumber.notices-archive.jsonl"), "utf8")).toBe(archive);
+    await blockedAgain.stop();
     // Recovery: restore a valid file and the next start picks it up whole.
     writeFileSync(statePath, original);
     const third = makeHub();
@@ -2648,10 +2668,8 @@ describe("review fixes: round 12 (reset counter carry, notice event keys, archiv
     sessionOf(first).save();
     await first.stop();
     const statePath = join(dataDir, "zulip", "bot-plumber.json");
-    // SAFETY: the parsed state is only mutated field-by-field here; the
-    // strict schema revalidates every field on the next load.
-    const saved = JSON.parse(readFileSync(statePath, "utf8")) as { role?: unknown };
-    saved.role = 42;
+    // Start from production-valid state, then inject the violation.
+    const saved = Object.assign(stateFileSchema.parse(JSON.parse(readFileSync(statePath, "utf8"))), { role: 42 });
     writeFileSync(statePath, `${JSON.stringify(saved)}\n`);
     const second = makeHub();
     // A malformed known field means the file cannot be trusted: the bot
@@ -2677,10 +2695,8 @@ describe("review fixes: round 12 (reset counter carry, notice event keys, archiv
     await first.stop();
     const statePath = join(dataDir, "zulip", "bot-plumber.json");
     const original = readFileSync(statePath, "utf8");
-    // SAFETY: the parsed state is only mutated field-by-field here; the
-    // strict schema revalidates every field on the next load.
-    const saved = JSON.parse(original) as { version?: unknown };
-    saved.version = 2;
+    // Start from production-valid state, then inject the drift.
+    const saved = Object.assign(stateFileSchema.parse(JSON.parse(original)), { version: 2 });
     writeFileSync(statePath, `${JSON.stringify(saved)}\n`);
     const second = makeHub();
     await waitFor(() => logs.some((line) => line.includes("state load failed")), "the loud load failure");
@@ -2694,6 +2710,36 @@ describe("review fixes: round 12 (reset counter carry, notice event keys, archiv
     expect(archive).toMatch(/"version":2/);
     await second.stop();
     // Recovery: restore the original and the bot comes back whole.
+    writeFileSync(statePath, original);
+    const third = makeHub();
+    await connected(third);
+    expect(sessionOf(third).state.userId).toBe(PLUMBER);
+    await third.stop();
+  });
+
+  it("blocks the bot when a known ledger is damaged instead of silently resetting it", async () => {
+    const first = makeHub();
+    await connected(first);
+    sessionOf(first).markDirty();
+    sessionOf(first).save();
+    await first.stop();
+    const statePath = join(dataDir, "zulip", "bot-plumber.json");
+    const original = readFileSync(statePath, "utf8");
+    // Start from production-valid state, then damage the dms cap ledger.
+    const saved = Object.assign(stateFileSchema.parse(JSON.parse(original)), { dms: "not-an-array" });
+    writeFileSync(statePath, `${JSON.stringify(saved)}\n`);
+    const second = makeHub();
+    // A silently catch-reset dms ledger would reopen the owner's hourly
+    // cap: instead the load fails closed - quarantined, loud, untouched.
+    await waitFor(() => logs.some((line) => line.includes("state load failed")), "the loud load failure");
+    expect(logs.some((line) => line.includes("malformed known ledger"))).toBe(true);
+    expect(botStatus(second, "bot-plumber")).toBeUndefined();
+    await settle();
+    expect(turns).toHaveLength(0);
+    expect(fake.postsBy(PLUMBER)).toHaveLength(0);
+    const archive = readFileSync(join(dataDir, "zulip", "bot-plumber.notices-archive.jsonl"), "utf8");
+    expect(archive).toMatch(/state-ledger-damaged-on-load/);
+    await second.stop();
     writeFileSync(statePath, original);
     const third = makeHub();
     await connected(third);

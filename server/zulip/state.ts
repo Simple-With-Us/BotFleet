@@ -20,8 +20,8 @@
 //                restart cannot drop one; the text stays in this mode-600
 //                file, the same protection the DM ledger gets.
 
-import { chmodSync, closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, statSync, writeSync, type Stats } from "node:fs";
-import { dirname, join, parse, relative, sep } from "node:path";
+import { chmodSync, closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, statSync, writeSync, type Stats } from "node:fs";
+import { dirname, join, relative, sep } from "node:path";
 
 import { z } from "zod";
 
@@ -154,6 +154,21 @@ const stateFileSchemaBase = z.object({
  *  drift) from real damage (quarantine the whole file). */
 export const stateFileSchema = stateFileSchemaBase.strict();
 
+/** The known accounting ledgers WITHOUT their per-field catches.  The
+ *  catches exist so one damaged entry does not cost the whole file, but
+ *  they also silently RESET a damaged ledger (a reset dms or wakes ledger
+ *  reopens hourly caps; a reset cursor skips backfill).  load() probes the
+ *  raw fields with this schema instead: absent probes clean (legacy files
+ *  predate the field and get the default), present-but-malformed refuses
+ *  the load closed. */
+const ledgerProbeSchemas = {
+  cursor: z.number().int().nullable(),
+  handled: z.array(z.number()),
+  wakes: z.array(z.object({ at: z.number(), kind: z.enum(["owner", "peer"]), key: z.string() })),
+  chains: z.record(z.string(), z.number()),
+  dms: z.array(z.number()),
+} as const;
+
 /** The live state shape: exactly what stateFileSchema produces at the
  *  boundary. */
 export type ZulipBotState = z.infer<typeof stateFileSchema>;
@@ -163,8 +178,11 @@ export class ZulipStateStore {
 
   private readonly onArchiveError?: (message: string) => void;
 
+  private readonly dataRoot: string;
+
   constructor(dataDir: string, onArchiveError?: (message: string) => void) {
     this.onArchiveError = onArchiveError;
+    this.dataRoot = dataDir;
     this.dir = join(dataDir, "zulip");
   }
 
@@ -190,13 +208,14 @@ export class ZulipStateStore {
       // session constructor throws, per-bot containment keeps this bot down
       // and loud (state file untouched) while the others run, and the next
       // reconcile retries.
-      this.archive(botId, "state-unparseable-on-load", [text]);
+      this.archiveLoadIncident(botId, "state-unparseable-on-load", [text]);
       throw new Error(
         `state file for ${botId} is not parseable JSON; original quarantined to the private notices archive; refusing to start with empty ledgers`,
       );
     }
     let parsed = stateFileSchema.safeParse(rawJson);
     let quarantinedUnknownKeys = false;
+    let driftArchived = false;
     if (!parsed.success) {
       // Two failure classes.  Unknown top-level keys ALONE (the lenient
       // base still parses): quarantine the unsupported fields privately and
@@ -215,20 +234,68 @@ export class ZulipStateStore {
             if (!known.has(key)) unknownEntries.push([key, value]);
           }
         }
-        this.archive(
-          botId,
-          "state-unknown-keys-on-load",
-          unknownEntries.map(([key, value]) => ({ key, value })),
-        );
+        try {
+          this.archiveLoadIncident(
+            botId,
+            "state-unknown-keys-on-load",
+            unknownEntries.map(([key, value]) => ({ key, value })),
+          );
+          // Only now may the load repair-persist below: the drift has a
+          // durable private copy, so rewriting the file loses no evidence.
+          driftArchived = true;
+        } catch (error) {
+          // The valid ledgers are kept either way: an unwritable archive
+          // must not turn into a permanent outage.  The original file is
+          // NOT rewritten (it is the only copy of the drift), the failure
+          // is loud, and the next load retries the quarantine.
+          this.onArchiveError?.(
+            `unknown-key quarantine failed for ${botId}; valid ledgers kept, original file left untouched for retry: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        }
         parsed = salvaged;
         quarantinedUnknownKeys = true;
       } else {
         // A known field violating the schema means the file cannot be
         // trusted: quarantine it and refuse the load rather than resuming
         // with empty caps and no pending work.  Same containment as above.
-        this.archive(botId, "state-schema-invalid-on-load", [rawJson]);
+        this.archiveLoadIncident(botId, "state-schema-invalid-on-load", [rawJson]);
         throw new Error(
           `state file for ${botId} failed schema validation (a known field is malformed); original quarantined to the private notices archive; refusing to start with empty ledgers`,
+        );
+      }
+    }
+    // Probe the raw accounting ledgers WITHOUT their per-field catches:
+    // absent is fine (legacy files get defaults), present-but-malformed is
+    // real damage - a silent catch-reset would reopen the dms/wakes caps or
+    // skip backfill - so it fails closed like any other trusted-field
+    // violation.  pending/notices keep their designed per-entry quarantine.
+    if (rawJson !== null && rawJson !== undefined && !Array.isArray(rawJson)) {
+      let ledgerDamaged = false;
+      for (const [key, value] of Object.entries(rawJson)) {
+        switch (key) {
+          case "cursor":
+            ledgerDamaged ||= !ledgerProbeSchemas.cursor.safeParse(value).success;
+            break;
+          case "handled":
+            ledgerDamaged ||= !ledgerProbeSchemas.handled.safeParse(value).success;
+            break;
+          case "wakes":
+            ledgerDamaged ||= !ledgerProbeSchemas.wakes.safeParse(value).success;
+            break;
+          case "chains":
+            ledgerDamaged ||= !ledgerProbeSchemas.chains.safeParse(value).success;
+            break;
+          case "dms":
+            ledgerDamaged ||= !ledgerProbeSchemas.dms.safeParse(value).success;
+            break;
+        }
+      }
+      if (ledgerDamaged) {
+        this.archiveLoadIncident(botId, "state-ledger-damaged-on-load", [rawJson]);
+        throw new Error(
+          `state file for ${botId} has a malformed known ledger (cursor, handled, wakes, chains or dms); original quarantined to the private notices archive; refusing to start with reset ledgers`,
         );
       }
     }
@@ -272,6 +339,14 @@ export class ZulipStateStore {
     const invalidPending = rawPendingEntries.filter((entry) => !unitSchema.safeParse(entry).success);
     if (nonArrayPending) invalidPending.push(rawPendingField);
     if (invalidPending.length > 0) this.archive(botId, "schema-invalid-on-load", invalidPending);
+    if (quarantinedUnknownKeys && driftArchived) {
+      // Repair-persist: the rewritten file carries neither the quarantined
+      // keys nor a reason to quarantine them again, so the incident is
+      // archived exactly once and the counter survives.  Skipped entirely
+      // when the quarantine write failed - the original file is then the
+      // only copy of the drift and the next load retries.
+      this.save(botId, state);
+    }
     return state;
   }
 
@@ -291,9 +366,21 @@ export class ZulipStateStore {
    *  created it as a real directory, or the final handle/path inode check
    *  below still guards the file itself. */
   private verifyArchiveAncestors(path: string): void {
-    const root = parse(path).root;
-    let current = root;
-    for (const part of relative(root, dirname(path)).split(sep)) {
+    // The configured data root may itself be a user-owned alias (supported:
+    // server/host-id.ts resolves it with realpathSync), so canonicalize the
+    // root and police only the components the app creates below it.  A
+    // symlink there is followed only when root-owned and resolving to a
+    // directory (the /var -> /private/var pattern); anything else that is
+    // not a plain directory refuses the write.  A missing component is
+    // skipped: mkdir just made it, or the final handle/path inode check
+    // still guards the file itself.
+    const canonicalRoot = realpathSync(this.dataRoot);
+    const below = relative(this.dataRoot, path);
+    if (below.startsWith("..")) {
+      throw new Error(`state-store write path ${path} escapes the data root; refusing`);
+    }
+    let current = canonicalRoot;
+    for (const part of dirname(below).split(sep)) {
       if (!part || part === ".") continue;
       current = join(current, part);
       let linkStat: Stats;
@@ -304,15 +391,46 @@ export class ZulipStateStore {
       }
       if (linkStat.isSymbolicLink()) {
         if (linkStat.uid !== 0) {
-          throw new Error(`archive ancestor ${current} is a symlink not owned by root; refusing to follow it`);
+          throw new Error(`state-store write ancestor ${current} is a symlink not owned by root; refusing to follow it`);
         }
         if (!statSync(current).isDirectory()) {
-          throw new Error(`archive ancestor ${current} is a root-owned link that does not resolve to a directory; refusing to follow it`);
+          throw new Error(`state-store write ancestor ${current} is a root-owned link that does not resolve to a directory; refusing to follow it`);
         }
       } else if (!linkStat.isDirectory()) {
-        throw new Error(`archive ancestor ${current} is not a directory; refusing to append`);
+        throw new Error(`state-store write ancestor ${current} is not a directory; refusing to write`);
       }
     }
+  }
+
+  /** Load-quarantine wrapper.  A bot blocked by a damaged state file
+   *  fails the same way every reconcile, and appending an identical copy
+   *  each cycle grows the append-only archive without adding evidence.
+   *  Skip the append when the archive's last line is this same incident
+   *  (same reason, same content). */
+  private archiveLoadIncident(botId: string, reason: string, entries: unknown[]): void {
+    const path = join(this.dir, fileName(botId).replace(/\.json$/, ".notices-archive.jsonl"));
+    try {
+      const fd = openSync(path, constants.O_RDONLY);
+      try {
+        const stat = fstatSync(fd);
+        const size = Math.min(stat.size, 256 * 1024);
+        const buffer = Buffer.alloc(size);
+        readSync(fd, buffer, 0, size, stat.size - size);
+        const tail = buffer.toString("utf8").trimEnd();
+        const lastLine = tail.slice(tail.lastIndexOf("\n") + 1);
+        // SAFETY: the archive is JSONL written only by archive(); a line
+        // that fails to parse is simply not a dedup match.
+        const last = JSON.parse(lastLine) as { reason?: unknown; entry?: unknown };
+        if (last.reason === reason && entries.length === 1 && JSON.stringify(last.entry) === JSON.stringify(entries[0])) {
+          return;
+        }
+      } finally {
+        closeSync(fd);
+      }
+    } catch {
+      // No readable archive yet: append normally.
+    }
+    this.archive(botId, reason, entries);
   }
 
   /** Append records to the bot's private notices archive (mode-600 JSONL
@@ -341,6 +459,12 @@ export class ZulipStateStore {
       0o600,
     );
     try {
+      // Re-verify the ancestors now that the handle exists.  This narrows
+      // the check/open race but cannot close it: Node's fs exposes no
+      // descriptor-relative (openat-style) traversal, so a swapped ancestor
+      // between the two passes still resolves.  The residual window is
+      // documented, not hidden.
+      this.verifyArchiveAncestors(path);
       const handleStat = fstatSync(fd);
       const pathStat = lstatSync(path);
       if (
@@ -366,6 +490,16 @@ export class ZulipStateStore {
   }
 
   save(botId: string, state: ZulipBotState, now = Date.now()): void {
+    mkdirSync(this.dir, { recursive: true, mode: 0o700 });
+    try {
+      chmodSync(this.dir, 0o700);
+    } catch {
+      /* best effort: the files themselves are 600 */
+    }
+    // The state file gets the same redirect policy as the archive: a
+    // planted ancestor link must receive neither.  A violation throws -
+    // session.save logs it and the in-memory ledgers survive to retry.
+    this.verifyArchiveAncestors(join(this.dir, fileName(botId)));
     // Bound every ledger before it reaches disk.
     if (state.handled.length > HANDLED_RING_LIMIT) state.handled = state.handled.slice(-HANDLED_RING_LIMIT);
     state.wakes = state.wakes.filter((w) => now - w.at < WAKE_LEDGER_MS).slice(-WAKE_LEDGER_LIMIT);
