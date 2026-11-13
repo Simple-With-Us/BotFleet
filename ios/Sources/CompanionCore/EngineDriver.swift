@@ -1,0 +1,925 @@
+import Foundation
+
+// MARK: - Turn Input & Event Contracts
+
+/// Canonical input for a single conversational or routine turn dispatched to a native engine driver.
+/// Carries thread and bot identity, user prompt, model selection, resume cursor, working directory,
+/// child environment overrides, and engine-specific session config options.
+public struct TurnInput: Equatable, Sendable, Codable {
+    public let threadId: String
+    public let botId: String
+    public let prompt: String
+    public let modelId: String?
+    public let resumeSessionId: String?
+    public let workingDirectory: String?
+    public let environment: [String: String]
+    public let configOptions: [String: String]
+    /// Trusted in-process preparation is never accepted from or exported to serialized turn input.
+    public let toolPreparation: NativeTurnToolPreparation?
+
+    private enum CodingKeys: String, CodingKey {
+        case threadId, botId, prompt, modelId, resumeSessionId, workingDirectory, environment, configOptions
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        threadId = try values.decode(String.self, forKey: .threadId)
+        botId = try values.decode(String.self, forKey: .botId)
+        prompt = try values.decode(String.self, forKey: .prompt)
+        modelId = try values.decodeIfPresent(String.self, forKey: .modelId)
+        resumeSessionId = try values.decodeIfPresent(String.self, forKey: .resumeSessionId)
+        workingDirectory = try values.decodeIfPresent(String.self, forKey: .workingDirectory)
+        environment = try values.decodeIfPresent([String: String].self, forKey: .environment) ?? [:]
+        configOptions = try values.decodeIfPresent([String: String].self, forKey: .configOptions) ?? [:]
+        toolPreparation = nil
+    }
+
+    public init(
+        threadId: String,
+        botId: String,
+        prompt: String,
+        modelId: String? = nil,
+        resumeSessionId: String? = nil,
+        workingDirectory: String? = nil,
+        environment: [String: String] = [:],
+        configOptions: [String: String] = [:],
+        toolPreparation: NativeTurnToolPreparation? = nil
+    ) {
+        self.threadId = threadId
+        self.botId = botId
+        self.prompt = prompt
+        self.modelId = modelId
+        self.resumeSessionId = resumeSessionId
+        self.workingDirectory = workingDirectory
+        self.environment = environment
+        self.configOptions = configOptions
+        self.toolPreparation = toolPreparation
+    }
+
+    public func withToolPreparation(_ preparation: NativeTurnToolPreparation?) throws -> TurnInput {
+        try preparation?.validate(forBot: botId)
+        return TurnInput(threadId: threadId, botId: botId, prompt: prompt, modelId: modelId,
+            resumeSessionId: resumeSessionId, workingDirectory: workingDirectory, environment: environment,
+            configOptions: configOptions, toolPreparation: preparation)
+    }
+}
+
+/// Canonical normalized event emitted by all native engine drivers during a turn.
+/// Maps engine-specific wire frames (Claude stream-json, ACP JSON-RPC 2.0, Codex app-server)
+/// into a single strongly-typed stream for persistence and UI rendering.
+public enum TurnEvent: Equatable, Sendable, Codable {
+    case sessionStarted(sessionId: String)
+    case textDelta(String)
+    case reasoningDelta(String)
+    case toolCall(id: String, name: String, argumentsJSON: String)
+    case toolResult(id: String, output: String, isError: Bool)
+    case permissionRequest(id: String, tool: String, description: String)
+    case configUpdated(key: String, value: String)
+    case completed(stopReason: String, inputTokens: Int?, outputTokens: Int?)
+    case error(code: String, message: String)
+
+    /// True when the event represents user-visible output or side-effects that must not be duplicated by a blind retry or failover.
+    public var producesVisibleOutput: Bool {
+        switch self {
+        case .textDelta(let text):
+            return !text.isEmpty
+        case .reasoningDelta(let text):
+            return !text.isEmpty
+        case .toolCall, .toolResult, .permissionRequest:
+            return true
+        case .sessionStarted, .configUpdated, .completed, .error:
+            return false
+        }
+    }
+
+    /// True when the event terminates a turn stream.
+    public var isTerminal: Bool {
+        switch self {
+        case .completed:
+            return true
+        default:
+            return false
+        }
+    }
+}
+
+/// Protocol implemented by all native CLI engine runners (Claude Code, Grok ACP, MiniMax mcode, Muse ACP, Codex app-server).
+public protocol EngineDriver: Sendable {
+    var engineId: String { get }
+    func sendTurn(input: TurnInput) async throws -> AsyncStream<TurnEvent>
+    func cancelTurn(threadId: String) async
+}
+
+// MARK: - Process Transport Abstractions
+
+/// Exit disposition of a supervised child CLI process.
+public enum ProcessExitReason: Equatable, Sendable, Codable {
+    case exited(code: Int32)
+    case signaled(signal: Int32)
+    case cancelled
+    case spawnFailed(message: String)
+}
+
+/// Specification for launching a native CLI engine subprocess.
+public struct EngineSpawnSpec: Equatable, Sendable, Codable {
+    public let executable: String
+    public let arguments: [String]
+    public let workingDirectory: String?
+    public let environment: [String: String]
+    /// Environment keys that must NOT reach the child process, even when the parent process carries them.
+    ///
+    /// `environment` is an overlay on the parent's environment, so dropping a key from it cannot express
+    /// "the child must not see this key" — the parent still carries it.  A runner that must not hand an
+    /// ambient API key to a CLI (so the CLI uses its subscription login instead of pay-as-you-go billing)
+    /// states the key here.
+    public let unsetEnvironmentKeys: [String]
+
+    public init(
+        executable: String,
+        arguments: [String],
+        workingDirectory: String? = nil,
+        environment: [String: String] = [:],
+        unsetEnvironmentKeys: [String] = []
+    ) {
+        self.executable = executable
+        self.arguments = arguments
+        self.workingDirectory = workingDirectory
+        self.environment = environment
+        self.unsetEnvironmentKeys = unsetEnvironmentKeys
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.executable = try container.decode(String.self, forKey: .executable)
+        self.arguments = try container.decode([String].self, forKey: .arguments)
+        self.workingDirectory = try container.decodeIfPresent(String.self, forKey: .workingDirectory)
+        self.environment = try container.decodeIfPresent([String: String].self, forKey: .environment) ?? [:]
+        self.unsetEnvironmentKeys = try container.decodeIfPresent([String].self, forKey: .unsetEnvironmentKeys) ?? []
+    }
+}
+
+/// Direction of a native wire frame for diagnostic teeing.
+public enum NativeProtocolDirection: String, Equatable, Sendable, Codable {
+    case inbound = "in"
+    case outbound = "out"
+}
+
+/// Redacted diagnostic record of a line sent to or received from a native CLI process.
+public struct NativeProtocolRecord: Equatable, Sendable, Codable {
+    public let engineId: String
+    public let threadId: String
+    public let direction: NativeProtocolDirection
+    public let redactedLine: String
+    public let timestamp: Double
+
+    public init(
+        engineId: String,
+        threadId: String,
+        direction: NativeProtocolDirection,
+        line: String,
+        timestamp: Double = Date().timeIntervalSince1970
+    ) {
+        self.engineId = engineId
+        self.threadId = threadId
+        self.direction = direction
+        self.redactedLine = Self.redactSecrets(in: line)
+        self.timestamp = timestamp
+    }
+
+    /// Redacts bearer tokens, API keys, and credential-shaped JSON fields before diagnostic logging.
+    public static func redactSecrets(in raw: String) -> String {
+        var result = raw
+        // The first pattern keeps the JSON field name and quotes so the redacted line still reads as
+        // the shape the CLI sent; every other pattern replaces the credential itself.
+        let patterns: [(pattern: String, template: String)] = [
+            (#"("?(?:api_key|apiKey|token|secret|password|authorization)"?\s*:\s*")([^"]+)(")"#, "$1[REDACTED]$3"),
+            (#"(?i)(bearer\s+)([A-Za-z0-9._~+/=-]{8,})"#, "$1[REDACTED]"),
+            (#"(sk-[A-Za-z0-9_-]{12,})"#, "[REDACTED]"),
+            (#"(xai-[A-Za-z0-9_-]{12,})"#, "[REDACTED]"),
+            (#"(gsk_[A-Za-z0-9_-]{12,})"#, "[REDACTED]"),
+            (#"(AIza[A-Za-z0-9_-]{20,})"#, "[REDACTED]")
+        ]
+        for entry in patterns {
+            guard let regex = try? NSRegularExpression(pattern: entry.pattern, options: [.caseInsensitive]) else {
+                continue
+            }
+            let range = NSRange(result.startIndex..<result.endIndex, in: result)
+            result = regex.stringByReplacingMatches(in: result, options: [], range: range, withTemplate: entry.template)
+        }
+        return result
+    }
+}
+
+/// Live handle to a spawned or scripted CLI session with line-delimited stdout, chunked stderr, and stdin writer.
+public struct EngineProcessSession: Sendable {
+    public let pid: Int32
+    public let stdoutLines: AsyncStream<String>
+    public let stderrChunks: AsyncStream<String>
+    public let writeStdinLine: @Sendable (String) async throws -> Void
+    public let closeStdin: @Sendable () async -> Void
+    public let cancel: @Sendable () async -> Void
+    public let waitForExit: @Sendable () async -> ProcessExitReason
+
+    public init(
+        pid: Int32,
+        stdoutLines: AsyncStream<String>,
+        stderrChunks: AsyncStream<String>,
+        writeStdinLine: @escaping @Sendable (String) async throws -> Void,
+        closeStdin: @escaping @Sendable () async -> Void,
+        cancel: @escaping @Sendable () async -> Void,
+        waitForExit: @escaping @Sendable () async -> ProcessExitReason
+    ) {
+        self.pid = pid
+        self.stdoutLines = stdoutLines
+        self.stderrChunks = stderrChunks
+        self.writeStdinLine = writeStdinLine
+        self.closeStdin = closeStdin
+        self.cancel = cancel
+        self.waitForExit = waitForExit
+    }
+}
+
+/// Protocol abstracting child process spawning so engine runners work identically over
+/// `ProcessSupervisorActor` (real POSIX processes) and `EngineReplayHarness` (deterministic fixtures).
+public protocol EngineProcessLauncher: Sendable {
+    func launch(
+        spec: EngineSpawnSpec,
+        threadId: String,
+        engineId: String
+    ) async throws -> EngineProcessSession
+}
+
+// MARK: - Errors & Retry / Failover Classification
+
+/// Errors thrown by engine drivers and the turn dispatcher.
+public enum EngineDriverError: LocalizedError, Equatable, Sendable {
+    case turnAlreadyActive(threadId: String)
+    case noEnginesConfigured(botId: String)
+    case spawnFailed(String)
+    case stdinWriteFailed(String)
+    case protocolError(code: String, message: String)
+    case stallTimedOut(threadId: String, timeoutSeconds: Double)
+    case cancelled(threadId: String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .turnAlreadyActive(let threadId):
+            return "A turn is already active on thread \(threadId)."
+        case .noEnginesConfigured(let botId):
+            return "No engines are configured for bot \(botId)."
+        case .spawnFailed(let msg):
+            return "Failed to spawn CLI process: \(msg)"
+        case .stdinWriteFailed(let msg):
+            return "Failed to write to child stdin: \(msg)"
+        case .protocolError(let code, let message):
+            return "Engine protocol error (\(code)): \(message)"
+        case .stallTimedOut(let threadId, let timeoutSeconds):
+            return "Turn on thread \(threadId) stalled for more than \(timeoutSeconds)s."
+        case .cancelled(let threadId):
+            return "Turn on thread \(threadId) was cancelled."
+        }
+    }
+}
+
+/// Verdict returned by `TurnRetryClassifier` for an engine error.
+public struct TurnErrorVerdict: Equatable, Sendable {
+    public let reason: String
+    public let isTransient: Bool
+    public let isFailoverEligible: Bool
+
+    public init(reason: String, isTransient: Bool, isFailoverEligible: Bool) {
+        self.reason = reason
+        self.isTransient = isTransient
+        self.isFailoverEligible = isFailoverEligible
+    }
+}
+
+/// Classifies engine error events to decide retry and fallback-chain advancement.
+/// Matches `server/drivers/retry.ts` semantics: transient transport/rate-limit errors may retry
+/// before output is produced, while model/quota/provider errors advance the fallback chain.
+public enum TurnRetryClassifier {
+    public static func classify(code: String, message: String, sawVisibleOutput: Bool) -> TurnErrorVerdict {
+        // Once visible output or a tool call has been emitted, automatic retry or failover
+        // is forbidden because re-running the prompt would duplicate text or side-effects.
+        guard !sawVisibleOutput else {
+            return TurnErrorVerdict(reason: code, isTransient: false, isFailoverEligible: false)
+        }
+
+        let lowerCode = code.lowercased()
+        let lowerMsg = message.lowercased()
+
+        if lowerCode == "cancelled" || lowerCode == "interrupted" {
+            return TurnErrorVerdict(reason: "cancelled", isTransient: false, isFailoverEligible: false)
+        }
+
+        if lowerCode == "rate_limited" || lowerCode == "overloaded" || lowerCode == "server_error" ||
+            lowerCode == "connection_reset" || lowerCode == "stall_timeout" ||
+            lowerMsg.contains("429") || lowerMsg.contains("rate limit") ||
+            lowerMsg.contains("overloaded") || lowerMsg.contains("econnreset") ||
+            lowerMsg.contains("503") || lowerMsg.contains("502") {
+            return TurnErrorVerdict(reason: lowerCode, isTransient: true, isFailoverEligible: true)
+        }
+
+        if lowerCode == "unknown_model" || lowerCode == "model_not_found" ||
+            lowerCode == "auth_required" || lowerCode == "invalid_credentials" ||
+            lowerCode == "quota_exceeded" || lowerCode == "spawn_error" ||
+            lowerCode == "process_signal" || lowerCode == "process_exit" ||
+            lowerMsg.contains("model_not_found") || lowerMsg.contains("unknown model") {
+            return TurnErrorVerdict(reason: lowerCode, isTransient: false, isFailoverEligible: true)
+        }
+
+        return TurnErrorVerdict(reason: lowerCode, isTransient: false, isFailoverEligible: true)
+    }
+}
+
+// MARK: - Bounded Backpressure Event Buffer
+
+/// Bounded ring buffer for `TurnEvent` values that coalesces adjacent `.textDelta` or
+/// `.reasoningDelta` events under backpressure so high-frequency streaming never drops
+/// structural tool/completion events or grows unbounded in memory.
+public struct BoundedTurnEventBuffer: Sendable {
+    public let capacity: Int
+    private var storage: [TurnEvent] = []
+    public private(set) var coalescedDeltaCount: Int = 0
+
+    public init(capacity: Int = 256) {
+        self.capacity = max(4, capacity)
+    }
+
+    public var count: Int { storage.count }
+    public var isEmpty: Bool { storage.isEmpty }
+
+    public mutating func enqueue(_ event: TurnEvent) {
+        // Coalesce adjacent text or reasoning deltas when the buffer is at capacity
+        // or when the tail is already the same delta kind.
+        if let last = storage.last {
+            switch (last, event) {
+            case (.textDelta(let prev), .textDelta(let next)) where storage.count >= capacity:
+                storage[storage.count - 1] = .textDelta(prev + next)
+                coalescedDeltaCount += 1
+                return
+            case (.reasoningDelta(let prev), .reasoningDelta(let next)) where storage.count >= capacity:
+                storage[storage.count - 1] = .reasoningDelta(prev + next)
+                coalescedDeltaCount += 1
+                return
+            default:
+                break
+            }
+        }
+
+        if storage.count >= capacity {
+            // Compact any adjacent deltas across the buffer to free slots without losing text.
+            if compactAdjacentDeltas() && storage.count < capacity {
+                storage.append(event)
+                return
+            }
+            // If still full, drop the oldest non-structural delta if possible.
+            if let dropIdx = storage.firstIndex(where: {
+                if case .textDelta = $0 { return true }
+                if case .reasoningDelta = $0 { return true }
+                return false
+            }) {
+                storage.remove(at: dropIdx)
+            } else {
+                storage.removeFirst()
+            }
+        }
+        storage.append(event)
+    }
+
+    public mutating func dequeue() -> TurnEvent? {
+        guard !storage.isEmpty else { return nil }
+        return storage.removeFirst()
+    }
+
+    public mutating func drainAll() -> [TurnEvent] {
+        defer { storage.removeAll(keepingCapacity: true) }
+        return storage
+    }
+
+    private mutating func compactAdjacentDeltas() -> Bool {
+        guard storage.count > 1 else { return false }
+        var compacted: [TurnEvent] = []
+        compacted.reserveCapacity(storage.count)
+        var didCompact = false
+
+        for event in storage {
+            if let last = compacted.last {
+                switch (last, event) {
+                case (.textDelta(let a), .textDelta(let b)):
+                    compacted[compacted.count - 1] = .textDelta(a + b)
+                    coalescedDeltaCount += 1
+                    didCompact = true
+                    continue
+                case (.reasoningDelta(let a), .reasoningDelta(let b)):
+                    compacted[compacted.count - 1] = .reasoningDelta(a + b)
+                    coalescedDeltaCount += 1
+                    didCompact = true
+                    continue
+                default:
+                    break
+                }
+            }
+            compacted.append(event)
+        }
+        storage = compacted
+        return didCompact
+    }
+}
+
+// MARK: - TurnDispatcherActor & EngineCoordinatorActor
+
+/// Per-thread turn dispatcher managing active turn state, stall detection, retry/failover across
+/// a fallback chain of `EngineDriver`s, and SQLite transcript persistence via `DatabaseService`.
+public actor TurnDispatcherActor {
+    private struct ActiveTurnContext {
+        let generation: UUID
+        let threadId: String
+        let botId: String
+        var currentEngine: any EngineDriver
+        var currentModelId: String?
+        let task: Task<Void, Never>
+    }
+
+    private var activeTurns: [String: ActiveTurnContext] = [:]
+    private var unsettledTasks: [UUID: Task<Void, Never>] = [:]
+    private struct Cancellation {
+        let threadId: String
+        let botId: String
+        let task: Task<Void, Never>
+    }
+    private var cancellations: [UUID: Cancellation] = [:]
+    private var cancellationByThread: [String: UUID] = [:]
+    private var isShutdown = false
+    private let database: DatabaseService?
+    private let requiresDurablePersistence: Bool
+    private var persistenceFailed = false
+    private let stallTimeoutSeconds: Double
+    private let maxRetriesPerEngine: Int
+    private let retryDelaySeconds: Double
+    private let bufferCapacity: Int
+    private let recovery: NativeEngineRecoveryActor
+
+    public init(
+        database: DatabaseService? = nil,
+        stallTimeoutSeconds: Double = 900.0,
+        maxRetriesPerEngine: Int = 1,
+        retryDelaySeconds: Double = 0.05,
+        bufferCapacity: Int = 256,
+        recovery: NativeEngineRecoveryActor = NativeEngineRecoveryActor(),
+        requiresDurablePersistence: Bool = false
+    ) {
+        self.database = database
+        self.requiresDurablePersistence = requiresDurablePersistence
+        self.stallTimeoutSeconds = stallTimeoutSeconds
+        self.maxRetriesPerEngine = maxRetriesPerEngine
+        self.retryDelaySeconds = retryDelaySeconds
+        self.bufferCapacity = bufferCapacity
+        self.recovery = recovery
+    }
+
+    public func isTurnActive(threadId: String) -> Bool {
+        activeTurns[threadId] != nil || cancellationByThread[threadId] != nil
+    }
+
+    public func isBotActive(botId: String) -> Bool {
+        activeTurns.values.contains { $0.botId == botId } || cancellations.values.contains { $0.botId == botId }
+    }
+
+    /// How many turns are in flight right now.  Read-only composition glue
+    /// for the Mac app's graceful-stop drain counters: the active engine
+    /// turn count feeds the drain path's work-in-flight number.
+    public func activeTurnCount() -> Int {
+        activeTurns.count + cancellations.count
+    }
+
+    public func cancelTurn(threadId: String) async {
+        guard let generation = activeTurns[threadId]?.generation ?? cancellationByThread[threadId] else { return }
+        await cancelTurn(threadId: threadId, generation: generation)
+    }
+
+    private func cancelTurn(threadId: String, generation: UUID) async {
+        guard let task = beginCancellation(threadId: threadId, generation: generation) else { return }
+        await task.value
+        finishCancellation(threadId: threadId, generation: generation)
+    }
+
+    /// Register teardown ownership before yielding, so every stop caller joins the same driver cancellation.
+    private func beginCancellation(threadId: String, generation: UUID) -> Task<Void, Never>? {
+        if let cancellation = cancellations[generation] {
+            return cancellation.threadId == threadId ? cancellation.task : nil
+        }
+        guard let active = activeTurns[threadId], active.generation == generation else { return nil }
+        let driver = active.currentEngine
+        let task = Task { await driver.cancelTurn(threadId: threadId) }
+        cancellations[generation] = Cancellation(threadId: threadId, botId: active.botId, task: task)
+        cancellationByThread[threadId] = generation
+        activeTurns.removeValue(forKey: threadId)
+        active.task.cancel()
+        return task
+    }
+
+    private func finishCancellation(threadId: String, generation: UUID) {
+        cancellations.removeValue(forKey: generation)
+        if cancellationByThread[threadId] == generation { cancellationByThread.removeValue(forKey: threadId) }
+    }
+
+    /// Dispatches a turn across the provided ordered fallback chain of drivers.
+    /// Persists user and assistant messages into `DatabaseService` when configured.
+    public func dispatchTurn(
+        input: TurnInput,
+        fallbackChain: [any EngineDriver]
+    ) throws -> AsyncStream<TurnEvent> {
+        guard !isShutdown else { throw EngineDriverError.cancelled(threadId: input.threadId) }
+        guard !fallbackChain.isEmpty else {
+            throw EngineDriverError.noEnginesConfigured(botId: input.botId)
+        }
+        guard activeTurns[input.threadId] == nil, cancellationByThread[input.threadId] == nil else {
+            throw EngineDriverError.turnAlreadyActive(threadId: input.threadId)
+        }
+
+        let (stream, continuation) = AsyncStream<TurnEvent>.makeStream(
+            bufferingPolicy: .unbounded
+        )
+
+        let generation = UUID()
+        let task = Task { [weak self] in
+            guard let self else {
+                continuation.finish()
+                return
+            }
+            await self.runTurnPipeline(
+                input: input,
+                fallbackChain: fallbackChain,
+                generation: generation,
+                continuation: continuation
+            )
+        }
+
+        activeTurns[input.threadId] = ActiveTurnContext(
+            generation: generation,
+            threadId: input.threadId,
+            botId: input.botId,
+            currentEngine: fallbackChain[0],
+            currentModelId: input.modelId,
+            task: task
+        )
+        unsettledTasks[generation] = task
+
+        continuation.onTermination = { [weak self] termination in
+            if case .cancelled = termination {
+                Task { await self?.cancelTurn(threadId: input.threadId, generation: generation) }
+            }
+        }
+
+        return stream
+    }
+
+    private func updateCurrentEngine(threadId: String, generation: UUID, engine: any EngineDriver, modelId: String?) {
+        if var ctx = activeTurns[threadId], ctx.generation == generation {
+            ctx.currentEngine = engine
+            ctx.currentModelId = modelId
+            activeTurns[threadId] = ctx
+        }
+    }
+
+    private func finishTurn(threadId: String, generation: UUID) {
+        unsettledTasks.removeValue(forKey: generation)
+        guard activeTurns[threadId]?.generation == generation else { return }
+        activeTurns.removeValue(forKey: threadId)
+    }
+
+    /// Fence admission before cancelling owned turns, then await their persistence and stream settlement.
+    public func shutdownAndDrain() async throws {
+        isShutdown = true
+        let turns = Array(activeTurns.values)
+        for turn in turns {
+            _ = beginCancellation(threadId: turn.threadId, generation: turn.generation)
+        }
+        let tasks = Array(unsettledTasks.values)
+        let pendingCancellations = Array(cancellations)
+        for (generation, cancellation) in pendingCancellations {
+            await cancellation.task.value
+            finishCancellation(threadId: cancellation.threadId, generation: generation)
+        }
+        for task in tasks { await task.value }
+        guard !persistenceFailed else {
+            throw EngineDriverError.protocolError(code: "persistence_failed", message: "Native turn persistence did not complete")
+        }
+    }
+
+    private func dispatchIsCurrent(threadId: String, generation: UUID) -> Bool {
+        activeTurns[threadId]?.generation == generation
+    }
+
+    private func runTurnPipeline(
+        input: TurnInput,
+        fallbackChain: [any EngineDriver],
+        generation: UUID,
+        continuation: AsyncStream<TurnEvent>.Continuation
+    ) async {
+        defer {
+            finishTurn(threadId: input.threadId, generation: generation)
+            continuation.finish()
+        }
+
+        if let database {
+            do {
+                let now = Date().timeIntervalSince1970
+                // Preserve the existing title and bot ownership when persisting a native turn.
+                let existing = try await database.loadThread(id: input.threadId)
+                try await database.upsertThread(
+                    ThreadRecord(
+                        id: input.threadId,
+                        title: existing?.title ?? input.threadId,
+                        botId: existing?.botId ?? input.botId,
+                        createdAt: existing?.createdAt ?? now,
+                        updatedAt: now
+                    )
+                )
+                try await database.insertMessage(
+                    MessageRecord(
+                        id: "user-\(UUID().uuidString)",
+                        threadId: input.threadId,
+                        role: "user",
+                        kind: "text",
+                        content: input.prompt,
+                        createdAt: now,
+                        model: input.modelId
+                    )
+                )
+            } catch {
+                if requiresDurablePersistence {
+                    persistenceFailed = true
+                    continuation.yield(.error(code: "persistence_failed", message: "Native turn input could not be persisted"))
+                    return
+                }
+            }
+        }
+
+        var accumulatedText = ""
+        var buffer = BoundedTurnEventBuffer(capacity: bufferCapacity)
+        var lastErrorEvent: TurnEvent?
+
+        engineLoop: for (engineIndex, driver) in fallbackChain.enumerated() {
+            if Task.isCancelled || !dispatchIsCurrent(threadId: input.threadId, generation: generation) { return }
+            let engineInput = engineIndex == 0 ? input : input.forBackupEngine()
+            let route = NativeEngineRoute(botId: input.botId, engineId: driver.engineId, modelId: engineInput.modelId)
+            if await recovery.hold(for: route) != nil { continue }
+            updateCurrentEngine(threadId: input.threadId, generation: generation, engine: driver, modelId: engineInput.modelId)
+
+            var attempt = 0
+            while attempt <= maxRetriesPerEngine {
+                if Task.isCancelled || !dispatchIsCurrent(threadId: input.threadId, generation: generation) { return }
+                var sawVisibleOutput = false
+                var terminalError: (code: String, message: String)?
+                var didComplete = false
+                var activityPrefix = ""
+                var pendingWorkTools: Set<String> = []
+
+                do {
+                    let driverStream = try await driver.sendTurn(input: engineInput)
+                    let outcome = await consumeWithStallWatchdog(
+                        driverStream: driverStream,
+                        driver: driver,
+                        threadId: input.threadId
+                    ) { event in
+                        guard await self.dispatchIsCurrent(threadId: input.threadId, generation: generation) else { return }
+                        if event.producesVisibleOutput {
+                            sawVisibleOutput = true
+                        }
+                        if case .textDelta(let delta) = event {
+                            accumulatedText += delta
+                            activityPrefix = String((activityPrefix + delta).prefix(512))
+                            if NativeEngineLimitClassifier.isHealthyPrefix(activityPrefix) {
+                                await self.recovery.markHealthy(route: route)
+                            }
+                        }
+                        if case .toolCall(let id, let name, _) = event {
+                            pendingWorkTools.remove(id)
+                            if pendingWorkTools.count < 1_024, NativeEngineLimitClassifier.isWorkTool(name) {
+                                pendingWorkTools.insert(id)
+                            }
+                        }
+                        if case .toolResult(let id, _, let isError) = event,
+                           pendingWorkTools.remove(id) != nil, !isError {
+                            await self.recovery.markHealthy(route: route)
+                        }
+                        if case .error(let code, let message) = event {
+                            terminalError = (code, message)
+                            return
+                        }
+                        if case .completed(let stopReason, _, _) = event {
+                            // Error-plus-completed is one failed attempt, not a successful reply.
+                            if terminalError != nil { return }
+                            if let code = NativeEngineLimitClassifier.completionFailureCode(stopReason) {
+                                terminalError = (code, code == "cancelled" ? "Engine turn was cancelled" : "Engine ended without a successful completion")
+                                return
+                            }
+                            didComplete = true
+                        }
+                        buffer.enqueue(event)
+                        while let next = buffer.dequeue() {
+                            continuation.yield(next)
+                        }
+                    }
+
+                    if case .stalled = outcome {
+                        terminalError = ("stall_timeout", "Turn stalled with no events for \(stallTimeoutSeconds)s")
+                    }
+                    if case .providerLimit(let code) = outcome {
+                        terminalError = (code, "Engine remained quiet after reporting a provider limit")
+                    }
+                } catch {
+                    terminalError = ("spawn_error", error.localizedDescription)
+                }
+
+                if Task.isCancelled || !dispatchIsCurrent(threadId: input.threadId, generation: generation) { return }
+
+                if let err = terminalError, !didComplete {
+                    await recovery.markUnhealthy(route: route)
+                    let limit = NativeEngineLimitClassifier.classify(code: err.code, message: err.message)
+                    if let limit {
+                        let activeSiblings = Set(activeTurns.values.filter {
+                            $0.currentEngine.engineId == driver.engineId && $0.currentModelId == engineInput.modelId
+                        }.map(\.botId))
+                        await recovery.recordFailure(route: route, limit: limit, activeSiblingBots: activeSiblings)
+                    }
+                    let errorEvent = TurnEvent.error(code: err.code, message: err.message)
+                    lastErrorEvent = errorEvent
+                    let verdict = TurnRetryClassifier.classify(
+                        code: err.code,
+                        message: err.message,
+                        sawVisibleOutput: sawVisibleOutput
+                    )
+
+                    if limit == nil && verdict.isTransient && attempt < maxRetriesPerEngine {
+                        attempt += 1
+                        if retryDelaySeconds > 0 {
+                            try? await Task.sleep(nanoseconds: UInt64(retryDelaySeconds * 1_000_000_000))
+                        }
+                        continue
+                    }
+
+                    if verdict.isFailoverEligible && (engineIndex + 1) < fallbackChain.count {
+                        // Advance to the next fallback engine in the chain.
+                        continue engineLoop
+                    }
+
+                    // Terminal failure on the final eligible engine: emit the error event.
+                    continuation.yield(errorEvent)
+                    return
+                }
+
+                if didComplete {
+                    await recovery.markHealthy(route: route)
+                    await recovery.clearSuccessfulQuota(route: route)
+                    if let database, !accumulatedText.isEmpty {
+                        do {
+                            try await database.insertMessage(
+                                MessageRecord(
+                                    id: "assistant-\(UUID().uuidString)",
+                                    threadId: input.threadId,
+                                    role: "assistant",
+                                    kind: "text",
+                                    content: accumulatedText,
+                                    createdAt: Date().timeIntervalSince1970,
+                                    model: input.modelId
+                                )
+                            )
+                        } catch {
+                            if requiresDurablePersistence {
+                                persistenceFailed = true
+                                continuation.yield(.error(code: "persistence_failed", message: "Native turn output could not be persisted"))
+                            }
+                        }
+                    }
+                    return
+                }
+
+                // The engine stream ended without a terminal event and without an error.
+                // Failing over is only safe while nothing has been produced: once visible output or a
+                // tool call exists, re-running the prompt on the next engine would duplicate text or
+                // side-effects.  That is the same rule `TurnRetryClassifier` applies to error paths.
+                if sawVisibleOutput {
+                    continuation.yield(
+                        TurnEvent.error(
+                            code: "eof_before_result",
+                            message: "Engine stream ended before completing the turn after producing output"
+                        )
+                    )
+                    return
+                }
+
+                if (engineIndex + 1) < fallbackChain.count {
+                    // Nothing was produced, so the next engine can safely take the turn.
+                    continue engineLoop
+                }
+
+                // Last engine in the chain: the turn still ends with exactly one terminal event.
+                continuation.yield(
+                    TurnEvent.error(
+                        code: "eof_before_result",
+                        message: "Engine stream ended before completing the turn"
+                    )
+                )
+                return
+            }
+        }
+
+        if let lastErrorEvent {
+            continuation.yield(lastErrorEvent)
+        } else {
+            continuation.yield(.error(code: "all_routes_held", message: "The selected engines are temporarily unavailable.\u{00A0} The turn can resume when a limit clears."))
+        }
+    }
+
+    private enum StreamConsumptionOutcome {
+        case finished
+        case stalled
+        case providerLimit(code: String)
+    }
+
+    private func consumeWithStallWatchdog(
+        driverStream: AsyncStream<TurnEvent>,
+        driver: any EngineDriver,
+        threadId: String,
+        onEvent: @escaping (TurnEvent) async -> Void
+    ) async -> StreamConsumptionOutcome {
+        let outcome = await NativeEngineQuietWatchdog.consume(
+            stream: driverStream, driver: driver, threadId: threadId,
+            policy: NativeEngineQuietPolicy(hardQuietSeconds: stallTimeoutSeconds), onEvent: onEvent
+        )
+        switch outcome {
+        case .finished: return .finished
+        case .stalled: return .stalled
+        case .providerLimit(let code): return .providerLimit(code: code)
+        }
+    }
+
+}
+
+/// Top-level coordinator registering engine drivers and bot fallback chains,
+/// routing turns through `TurnDispatcherActor` and broadcasting live `TurnEvent`s.
+public actor EngineCoordinatorActor {
+    private var driversById: [String: any EngineDriver] = [:]
+    private var botFallbackChains: [String: [String]] = [:]
+    private let dispatcher: TurnDispatcherActor
+    private let turnTools: NativeTurnToolsActor?
+    private var isShutdown = false
+
+    public init(
+        drivers: [any EngineDriver] = [],
+        botFallbackChains: [String: [String]] = [:],
+        dispatcher: TurnDispatcherActor = TurnDispatcherActor(),
+        turnTools: NativeTurnToolsActor? = nil
+    ) {
+        for driver in drivers {
+            self.driversById[driver.engineId] = driver
+        }
+        self.botFallbackChains = botFallbackChains
+        self.dispatcher = dispatcher
+        self.turnTools = turnTools
+    }
+
+    public func registerDriver(_ driver: any EngineDriver) {
+        driversById[driver.engineId] = driver
+    }
+
+    public func setFallbackChain(forBot botId: String, engineIds: [String]) {
+        botFallbackChains[botId] = engineIds
+    }
+
+    public func sendTurn(input: TurnInput) async throws -> AsyncStream<TurnEvent> {
+        guard !isShutdown else { throw EngineDriverError.cancelled(threadId: input.threadId) }
+        let preparedInput: TurnInput
+        if let turnTools {
+            preparedInput = try input.withToolPreparation(await turnTools.prepare(botId: input.botId))
+        } else {
+            preparedInput = try input.withToolPreparation(input.toolPreparation)
+        }
+        let chainIds = botFallbackChains[input.botId] ?? Array(driversById.keys.sorted())
+        guard !isShutdown else { throw EngineDriverError.cancelled(threadId: input.threadId) }
+        let chain = chainIds.compactMap { driversById[$0] }
+        guard !chain.isEmpty else {
+            throw EngineDriverError.noEnginesConfigured(botId: input.botId)
+        }
+        return try await dispatcher.dispatchTurn(input: preparedInput, fallbackChain: chain)
+    }
+
+    public func isTurnActive(threadId: String) async -> Bool { await dispatcher.isTurnActive(threadId: threadId) }
+    public func isBotActive(botId: String) async -> Bool { await dispatcher.isBotActive(botId: botId) }
+
+    /// How many turns are in flight right now.  Read-only composition glue
+    /// for the Mac app's graceful-stop drain counters.
+    public func activeTurnCount() async -> Int { await dispatcher.activeTurnCount() }
+
+    public func cancelTurn(threadId: String) async {
+        await dispatcher.cancelTurn(threadId: threadId)
+    }
+
+    public func shutdownAndDrain() async throws {
+        isShutdown = true
+        try await dispatcher.shutdownAndDrain()
+    }
+}

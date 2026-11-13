@@ -8,13 +8,17 @@
  * a failed refresh leaves the current client alone.
  * Completely inert in dev/CI when neither path finds a DSN.
  *
- * Replay stays 100% on error / 10% session with mask-all privacy.
+ * Replay is opt-in and off by default (BF-2466): its rrweb recording
+ * kept an otherwise idle renderer at 14–21% CPU, so only an explicit
+ * `VITE_SENTRY_REPLAY_ENABLED=true` (or 1/on/yes) turns it on.  When on
+ * it stays 100% on error / 10% session with mask-all privacy.
  * User Feedback is the consumer widget.  Agent traces live on the
  * Node harness (`server/sentry.ts`), not this browser bundle.
  */
 
 import { lazy } from "react";
 import type * as SentryTypes from "@sentry/react";
+import { redactSecretsInText } from "../../shared/redact";
 
 /** The real SDK's shape, used only to type the dynamic loader below.
  * `import type` and `typeof import()` are both erased at build time, so
@@ -33,6 +37,7 @@ export interface SentryClientOptions {
   replayEnabled: boolean;
   replaysSessionSampleRate: number;
   replaysOnErrorSampleRate: number;
+  release?: string;
 }
 
 /** The three things this module does to the browser SDK.  Behind a port so
@@ -53,6 +58,7 @@ export interface RuntimeObservability {
   dsn?: string | null;
   environment?: string;
   tracesSampleRate?: number;
+  uiTracesSampleRate?: number;
 }
 
 /** How the renderer asks the harness what it resolved. */
@@ -95,9 +101,8 @@ const browserPort: SentryBrowserPort = {
         Sentry.init({
           dsn: options.dsn,
           environment: options.environment,
+          release: options.release,
           tracesSampleRate: options.tracesSampleRate,
-          enableLogs: true,
-          sendDefaultPii: false,
           dataCollection: {
             userInfo: false,
             cookies: false,
@@ -181,6 +186,14 @@ function viteEnvText(value: string | undefined): string | undefined {
   return value?.trim() || undefined;
 }
 
+/** Replay records only on an explicit opt-in (BF-2466).  Unset, false-like
+ * and unrecognised values all stay off, so a packaged default can never
+ * silently re-enable the idle recording cost this lane removed. */
+function replayOptedIn(): boolean {
+  const raw = viteEnvText(import.meta.env.VITE_SENTRY_REPLAY_ENABLED);
+  return raw ? /^(true|1|on|yes)$/i.test(raw) : false;
+}
+
 function packagedClientOptions(): SentryClientOptions | null {
   const dsn = viteEnvText(import.meta.env.VITE_SENTRY_DSN);
   if (!dsn) return null;
@@ -188,18 +201,19 @@ function packagedClientOptions(): SentryClientOptions | null {
   const env = viteEnvText(import.meta.env.VITE_SENTRY_ENV) || viteEnvText(import.meta.env.MODE) || "production";
 
   const tracesSampleRate = Number(viteEnvText(import.meta.env.VITE_SENTRY_TRACES_SAMPLE_RATE) ?? "0.2");
-  const replayRaw = viteEnvText(import.meta.env.VITE_SENTRY_REPLAY_ENABLED);
-  const replayDisabled = replayRaw ? /^(false|0|off|no)$/i.test(replayRaw) : false;
+  const replayEnabled = replayOptedIn();
   const replaysSessionSampleRate = Number(viteEnvText(import.meta.env.VITE_SENTRY_REPLAY_SESSION_SAMPLE_RATE) ?? "0.1");
   const replaysOnErrorSampleRate = Number(viteEnvText(import.meta.env.VITE_SENTRY_REPLAY_ERROR_SAMPLE_RATE) ?? "1.0");
 
+  const release = viteEnvText(import.meta.env.VITE_SENTRY_RELEASE);
   return {
     dsn,
     environment: env,
     tracesSampleRate: Number.isFinite(tracesSampleRate) ? Math.min(Math.max(tracesSampleRate, 0), 1) : 0.2,
-    replayEnabled: !replayDisabled,
-    replaysSessionSampleRate: !replayDisabled && Number.isFinite(replaysSessionSampleRate) ? replaysSessionSampleRate : 0,
-    replaysOnErrorSampleRate: !replayDisabled && Number.isFinite(replaysOnErrorSampleRate) ? replaysOnErrorSampleRate : 0,
+    replayEnabled,
+    replaysSessionSampleRate: replayEnabled && Number.isFinite(replaysSessionSampleRate) ? replaysSessionSampleRate : 0,
+    replaysOnErrorSampleRate: replayEnabled && Number.isFinite(replaysOnErrorSampleRate) ? replaysOnErrorSampleRate : 0,
+    release,
   };
 }
 
@@ -266,6 +280,9 @@ export interface OpenFeedbackOptions {
   defaultMessage?: string;
   defaultEmail?: string;
   defaultName?: string;
+  /** The bot driver the failure came from, when the caller knows it.  Goes
+   * into the synthetic diagnostics block, never into the message. */
+  engine?: string;
 }
 
 interface SentryFeedbackDialog {
@@ -331,27 +348,225 @@ function toWellFormedString(val: string): string {
   return result;
 }
 
+/** The five diagnostic facts that belong on a bug report, and nothing else.
+ *
+ * Every field is synthetic: a version string, a commit id, an OS name, a CPU
+ * architecture, and a driver label.  None of them is derived from what the
+ * user typed, and none of them identifies a person or a machine. */
+export interface ReportDiagnostics {
+  appVersion?: string;
+  build?: string;
+  os?: string;
+  architecture?: string;
+  /** The bot driver the failing turn ran on, when the renderer knows it. */
+  engine?: string;
+}
+
+/** The labels every Report a Problem issue carries.
+ *
+ * `bug` is the repo's existing bug label.  `user-report` is the one that
+ * keeps a filed-from-the-app report out of the ordinary maintainer triage
+ * pile; GitHub silently drops a label that does not exist, so the owner has
+ * to create it once (lowercase kebab, matching `effort-in-progress`). */
+export const REPORT_ISSUE_LABELS = ["bug", "user-report"] as const;
+
+const UNKNOWN = "unknown";
+
+/** Installed version + build commit, cached for the life of the window.
+ *
+ * `buildFallbackIssueUrl` is synchronous, so the one round trip that can
+ * answer this has to land before it is called, not inside it. */
+interface ReportBuildIdentity {
+  appVersion?: string;
+  build?: string;
+}
+
+let reportBuildIdentity: ReportBuildIdentity = {};
+let reportBuildIdentityRequest: Promise<void> | null = null;
+
+/** Short form of a commit id — the full 40 characters cost issue-body
+ * budget without telling a reader anything the short form does not.
+ *
+ * `raw` is a field of a JSON body the harness answered, so it is untrusted by
+ * contract and no narrower named type would be honest here.  The guard below
+ * is the decode, and everything after it branches on the decoded string. */
+// oxlint-disable-next-line anti-slop/no-unknown-parameters
+function shortCommit(raw: unknown): string | undefined {
+  // oxlint-disable-next-line anti-slop/no-runtime-typeof
+  if (typeof raw !== "string") return undefined;
+  const trimmed = raw.trim();
+  if (!trimmed) return undefined;
+  return /^[0-9a-f]{7,40}$/i.test(trimmed) ? trimmed.slice(0, 12) : trimmed.slice(0, 64);
+}
+
+/**
+ * Ask the harness what build is running, once, and remember it.
+ *
+ * `GET /api/update/status` is the one loopback route that already reports
+ * the installed version and its source commit, so this needs no new
+ * endpoint and no new preload surface.  It is best effort: a timeout, an
+ * offline harness, or a non-OK status leaves the fields `unknown` and the
+ * report still files.
+ */
+export async function primeReportBuildIdentity(options?: {
+  fetchImpl?: typeof fetch;
+  timeoutMs?: number;
+}): Promise<void> {
+  if (Object.keys(reportBuildIdentity).length > 0) return;
+  reportBuildIdentityRequest ??= (async () => {
+    // Reading the global off `globalThis` keeps the "no fetch in this runtime"
+    // case on the same `!doFetch` path below instead of a second check.
+    const doFetch = options?.fetchImpl ?? globalThis.fetch;
+    if (!doFetch) return;
+    try {
+      const response = await doFetch("/api/update/status", {
+        signal: AbortSignal.timeout(options?.timeoutMs ?? 1_500),
+      });
+      if (!response.ok) return;
+      // SAFETY: this is the harness's own `/api/update/status` answer, whose
+      // `installed` block carries a version string and a commit id; both are
+      // read as `unknown` and re-checked before anything is reported.
+      const body = (await response.json()) as { installed?: { version?: unknown; sourceCommit?: unknown } };
+      const installed = body?.installed;
+      if (!installed) return;
+      // A version that is not a string is the one field the harness may be
+      // mid-write on, so it reads as "no version" and the commit still stands.
+      // oxlint-disable-next-line anti-slop/no-runtime-typeof
+      const appVersion = typeof installed.version === "string" ? installed.version.trim().slice(0, 64) : "";
+      const build = shortCommit(installed.sourceCommit) ?? "";
+      if (appVersion || build) reportBuildIdentity = { appVersion, build };
+    } catch {
+      /* an unreadable build identity is not a reason to lose the report */
+    }
+  })();
+  try {
+    await reportBuildIdentityRequest;
+  } finally {
+    // A failed attempt must not be cached, or one dead harness would keep
+    // every later report in this window version-less.
+    if (reportBuildIdentityRequest && Object.keys(reportBuildIdentity).length === 0) {
+      reportBuildIdentityRequest = null;
+    }
+  }
+}
+
+/** Reset the cached build identity.  Test-only. */
+export function resetReportBuildIdentityForTests(): void {
+  reportBuildIdentity = {};
+  reportBuildIdentityRequest = null;
+}
+
+/** Override the cached build identity.  Test-only. */
+export function setReportBuildIdentityForTests(identity: { appVersion?: string; build?: string }): void {
+  reportBuildIdentity = { ...identity };
+  reportBuildIdentityRequest = null;
+}
+
+interface NavigatorHints {
+  platform?: string;
+  platformVersion?: string;
+  architecture?: string;
+  bitness?: string;
+}
+
+/** Chromium's UA client hints, which the packaged desktop app always has. */
+function userAgentHints(): NavigatorHints {
+  // SAFETY: `userAgentData` is Chromium's own client-hints object; the DOM lib
+  // types do not declare it, so this widens the navigator by exactly that one
+  // key and every field it hands back is read as `string | undefined`.
+  const hints = (globalThis.navigator as { userAgentData?: NavigatorHints } | undefined)?.userAgentData;
+  return hints ?? {};
+}
+
+/** OS and CPU, read from what this window can already see. */
+interface HostFacts {
+  os: string;
+  architecture: string;
+}
+
+function hostFacts(): HostFacts {
+  const hints = userAgentHints();
+  // SAFETY: `ogb` is this app's own preload bridge, absent in a plain browser
+  // tab; the assertion widens the window by exactly that one optional key.
+  const ogbPlatform = (globalThis.window as { ogb?: { platform?: string } } | undefined)?.ogb?.platform;
+  const osParts = [hints.platform ?? ogbPlatform, hints.platformVersion].filter(
+    (part): part is string => part !== undefined && part.length > 0,
+  );
+  const arch = [hints.architecture ?? "", hints.bitness === undefined ? "" : `${hints.bitness}-bit`]
+    .filter((part) => part.length > 0)
+    .join(" ");
+  return {
+    os: osParts.length > 0 ? osParts.join(" ") : UNKNOWN,
+    architecture: arch || UNKNOWN,
+  };
+}
+
+/** The diagnostics a report carries: whatever the caller stated, filled in
+ * from the cached build identity and the window's own host facts. */
+export function readReportDiagnostics(overrides: ReportDiagnostics = {}): ReportDiagnostics {
+  const host = hostFacts();
+  return {
+    appVersion: overrides.appVersion || reportBuildIdentity.appVersion || UNKNOWN,
+    build: overrides.build || reportBuildIdentity.build || UNKNOWN,
+    os: overrides.os || host.os,
+    architecture: overrides.architecture || host.architecture,
+    engine: overrides.engine,
+  };
+}
+
+/** One field of the context block.  Values are sentence case and clipped, so
+ * a hostile value cannot reformat the block or blow the body budget. */
+function diagnosticLine(label: string, value: string | undefined): string {
+  const flat = (value ?? "").replace(/\s+/g, " ").trim().slice(0, 120);
+  return `- ${label}: ${flat || UNKNOWN}`;
+}
+
+function diagnosticsBlock(diagnostics: ReportDiagnostics): string {
+  return [
+    "**Diagnostics (synthetic — generated by the app, not user data):**",
+    diagnosticLine("App version", diagnostics.appVersion),
+    diagnosticLine("Build", diagnostics.build),
+    diagnosticLine("OS", diagnostics.os),
+    diagnosticLine("Architecture", diagnostics.architecture),
+    diagnosticLine("Engine", diagnostics.engine),
+  ].join("\n");
+}
+
+const ISSUE_LABEL_SUFFIX = `&labels=${encodeURIComponent(REPORT_ISSUE_LABELS.join(","))}`;
+
 export function buildFallbackIssueUrl(
   rawTitle: string,
   rawMessage?: string,
   maxTotalLength = 2000,
+  diagnostics: ReportDiagnostics = {},
 ): string {
   const wellFormedTitle = toWellFormedString(rawTitle || "Bug Report");
   const points = Array.from(wellFormedTitle);
   const safeTitle = (points.length > 80 ? points.slice(0, 80).join("") + "…" : points.join(""));
   const encodedTitle = encodeURIComponent(safeTitle);
-  const base = `https://github.com/jaywedgeworth22/BotFleet/issues/new?title=${encodedTitle}&body=`;
-  const budget = maxTotalLength - base.length;
-  if (budget <= 0) return base;
+  const base = `https://github.com/Simple-With-Us/BotFleet/issues/new?title=${encodedTitle}&body=`;
+  const budget = maxTotalLength - base.length - ISSUE_LABEL_SUFFIX.length;
+  if (budget <= 0) return base + ISSUE_LABEL_SUFFIX;
 
+  const context = diagnosticsBlock(readReportDiagnostics(diagnostics));
   if (!rawMessage) {
-    const defaultBody = "<!-- Describe the problem and reproduction steps here -->\n\n*(Submitted via BotFleet)*";
-    return base + encodeURIComponent(defaultBody);
+    const defaultBody =
+      "<!-- Describe the problem and reproduction steps here -->\n\n" +
+      `${context}\n\n` +
+      "*(Submitted via BotFleet)*";
+    const encoded = encodeURIComponent(defaultBody);
+    // A caller who passed a body budget too small for the context block
+    // still gets a report; the description placeholder is what gets cut.
+    if (encoded.length > budget) return base + encodeURIComponent("<!-- Describe the problem and reproduction steps here -->") + ISSUE_LABEL_SUFFIX;
+    return base + encoded + ISSUE_LABEL_SUFFIX;
   }
 
-  const wellFormedMsg = toWellFormedString(rawMessage);
+  // Redact before anything is measured or encoded.  The issue body lands in
+  // a public repository, so a token that rode in on an error string must
+  // never reach the URL.
+  const wellFormedMsg = toWellFormedString(redactSecretsInText(toWellFormedString(rawMessage)));
   const header = "**Reported Problem:**\n";
-  const footer = "\n\n*(Submitted via BotFleet)*";
+  const footer = `\n\n${context}\n\n*(Submitted via BotFleet)*`;
   const msgPoints = Array.from(wellFormedMsg);
   let low = 0;
   let high = Math.min(msgPoints.length, budget);
@@ -374,7 +589,7 @@ export function buildFallbackIssueUrl(
     }
   }
 
-  return base + best;
+  return base + best + ISSUE_LABEL_SUFFIX;
 }
 
 export function isSentryFeedbackAvailable(): boolean {
@@ -386,7 +601,16 @@ export async function openSentryFeedback(options?: OpenFeedbackOptions): Promise
   if (!globalThis.window) return;
   try {
     if (!isSentryFeedbackAvailable()) {
-      const url = buildFallbackIssueUrl(options?.formTitle ?? "Report a Problem", options?.defaultMessage);
+      // One loopback round trip so the report can name the build it came
+      // from.  Bounded and swallowed, so a dead harness costs a moment and
+      // never a report.
+      await primeReportBuildIdentity();
+      const url = buildFallbackIssueUrl(
+        options?.formTitle ?? "Report a Problem",
+        options?.defaultMessage,
+        2000,
+        { engine: options?.engine },
+      );
       if (typeof window !== "undefined") {
         if (window.ogb?.openExternal) {
           await window.ogb.openExternal(url);
@@ -490,16 +714,15 @@ function closeClient(): void {
 
 /** Start the browser SDK against a DSN the harness resolved. */
 function startRuntimeClient(dsn: string, environment: string, tracesSampleRate: number): void {
-  const replayRaw = viteEnvText(import.meta.env.VITE_SENTRY_REPLAY_ENABLED);
-  const replayDisabled = replayRaw ? /^(false|0|off|no)$/i.test(replayRaw) : false;
   const replaysSessionSampleRate = Number(viteEnvText(import.meta.env.VITE_SENTRY_REPLAY_SESSION_SAMPLE_RATE) ?? "0.1");
   const replaysOnErrorSampleRate = Number(viteEnvText(import.meta.env.VITE_SENTRY_REPLAY_ERROR_SAMPLE_RATE) ?? "1.0");
-  const replayEnabled = buildTimeOptions?.replayEnabled ?? !replayDisabled;
+  const replayEnabled = buildTimeOptions?.replayEnabled ?? replayOptedIn();
 
   sentryPort.init({
     dsn,
     environment,
     tracesSampleRate,
+    release: buildTimeOptions?.release ?? viteEnvText(import.meta.env.VITE_SENTRY_RELEASE),
     replayEnabled,
     replaysSessionSampleRate: replayEnabled
       ? buildTimeOptions?.replaysSessionSampleRate ?? (Number.isFinite(replaysSessionSampleRate) ? replaysSessionSampleRate : 0)
@@ -558,7 +781,7 @@ function applyRuntimeObservability(data: RuntimeObservability | null): void {
   buildTimeClientActive = false;
 
   const environment = data.environment?.trim() || "production";
-  const reportedRate = data.tracesSampleRate;
+  const reportedRate = data.uiTracesSampleRate ?? data.tracesSampleRate;
   const resolvedRate = reportedRate !== undefined && Number.isFinite(reportedRate) ? reportedRate : 0.2;
   const tracesSampleRate = Math.min(Math.max(resolvedRate, 0), 1);
 

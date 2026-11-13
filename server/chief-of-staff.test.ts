@@ -6,17 +6,16 @@ import { chiefOfStaffSystemPrompt } from "./chief-of-staff.ts";
 // `agents-proxy.ts` still splices in ahead of their PR 7 registry entries.
 const CLI_AGENT_TOOLS = [
   "list_bots",
-  "ask_bot",
+  "coordinate_bots",
+  "assignment_status",
   "list_routines",
   "create_bot",
-  "delegate_bot",
   "request_credential",
+  "request_sign_in",
   "propose_routine",
   "propose_routine_action",
 ];
-// A MiniMax-shaped bot's tool set: the registry's HTTP-surface tools only —
-// no create_bot / delegate_bot, because those are not registry entries yet.
-const MINIMAX_AGENT_TOOLS = ["list_bots", "ask_bot", "list_routines"];
+const MINIMAX_AGENT_TOOLS = ["list_bots", "coordinate_bots", "assignment_status", "list_routines"];
 
 describe("chiefOfStaffSystemPrompt roster caps", () => {
   it("clips oversized persona fields instead of interpolating them whole", () => {
@@ -72,7 +71,7 @@ describe("chiefOfStaffSystemPrompt", () => {
     expect(prompt).not.toContain("Secret");
     expect(prompt).not.toContain("Scout");
     expect(prompt).not.toContain("Atlas —");
-    expect(prompt).toContain("Use ask_bot");
+    expect(prompt).toContain("Use coordinate_bots");
     expect(prompt).toContain("use create_bot");
   });
 
@@ -127,19 +126,14 @@ describe("chiefOfStaffSystemPrompt", () => {
     const prompt = chiefOfStaffSystemPrompt("chief", bots, []);
 
     expect(prompt).toContain("cannot contact teammates");
-    expect(prompt).not.toContain("Use ask_bot");
+    expect(prompt).not.toContain("Use coordinate_bots");
   });
 
-  it("offers ask_bot but not create_bot/delegate_bot for a MiniMax-shaped tool set", () => {
-    // MiniMax's HTTP catalog is the registry's three tools only —
-    // create_bot and delegate_bot are still MCP-only splices (PR 7 gives
-    // them registry entries). Telling a MiniMax Chief it can "use
-    // create_bot" would name a tool its turn cannot call.
+  it("offers coordinate_bots but not create_bot when the catalog has no team builder", () => {
     const prompt = chiefOfStaffSystemPrompt("chief", bots, MINIMAX_AGENT_TOOLS);
 
-    expect(prompt).toContain("Use ask_bot");
+    expect(prompt).toContain("Use coordinate_bots");
     expect(prompt).not.toContain("create_bot");
-    expect(prompt).not.toContain("delegate_bot");
     expect(prompt).not.toContain("cannot contact teammates");
   });
 

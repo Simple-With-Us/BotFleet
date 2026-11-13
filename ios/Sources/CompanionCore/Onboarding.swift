@@ -11,6 +11,9 @@ public enum CompanionPairingState: Equatable, Sendable {
 }
 
 public enum CompanionOnboardingRoute: Equatable, Sendable {
+    /// The saved pairing is still being read off the main thread.  Welcome
+    /// and Pairing would be a lie for a phone that is already paired.
+    case restoring
     case welcome
     case pairing
     case unpairedHome
@@ -130,6 +133,10 @@ public struct CompanionOnboardingContext: Equatable, Sendable {
     public var notificationOnboardingPending: Bool
     public var hasSeenNotificationPrompt: Bool
     public var notificationAuthorization: CompanionNotificationAuthorizationState
+    /// False while launch restore is still reading the pairing blob and the
+    /// keychain.  Defaults to true so a caller that is not the launch path
+    /// keeps the routes it had before that gate existed.
+    public var launchRestoreSettled: Bool
 
     public init(
         pairingState: CompanionPairingState,
@@ -138,7 +145,8 @@ public struct CompanionOnboardingContext: Equatable, Sendable {
         hasPendingPairingInvite: Bool = false,
         notificationOnboardingPending: Bool = false,
         hasSeenNotificationPrompt: Bool = false,
-        notificationAuthorization: CompanionNotificationAuthorizationState = .notDetermined
+        notificationAuthorization: CompanionNotificationAuthorizationState = .notDetermined,
+        launchRestoreSettled: Bool = true
     ) {
         self.pairingState = pairingState
         self.hasSeenWelcome = hasSeenWelcome
@@ -147,11 +155,13 @@ public struct CompanionOnboardingContext: Equatable, Sendable {
         self.notificationOnboardingPending = notificationOnboardingPending
         self.hasSeenNotificationPrompt = hasSeenNotificationPrompt
         self.notificationAuthorization = notificationAuthorization
+        self.launchRestoreSettled = launchRestoreSettled
     }
 }
 
 public enum CompanionOnboardingRouter {
     public static func route(for context: CompanionOnboardingContext) -> CompanionOnboardingRoute {
+        guard context.launchRestoreSettled else { return .restoring }
         switch context.pairingState {
         case .revoked:
             return .revoked

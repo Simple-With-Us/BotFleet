@@ -4,6 +4,7 @@ import { computerReach } from "../../server/computer-capability.ts";
 import { engineFixture, type EngineFixture } from "../../server/computer-capability.fixtures.ts";
 import {
   autoSelectsLocalComputer,
+  cloudBackendUnavailableNote,
   computerDestinationDisabledReason,
   engineReachKnown,
   instanceSupportsCloudComputer,
@@ -12,6 +13,7 @@ import {
   linuxAutoDescription,
   localComputerDisabledReason,
   localComputerSelectable,
+  runsOnDisabledNote,
 } from "./local-computer";
 
 const BOT = { modelSelection: { instanceId: "engine", model: "m" } } satisfies Pick<Bot, "modelSelection">;
@@ -37,7 +39,7 @@ const instanceFor = (fixture: EngineFixture): InstanceInfo[] =>
 describe("local computer UI eligibility", () => {
   it("requires the selected instance to advertise approval-capable local MCP", () => {
     expect(instanceSupportsLocalComputer(instanceFor(engineFixture("Claude")), BOT)).toBe(true);
-    expect(instanceSupportsLocalComputer(instanceFor(engineFixture("Computer")), BOT)).toBe(false);
+    expect(instanceSupportsLocalComputer(instanceFor(engineFixture("ASCII.dev Box")), BOT)).toBe(false);
   });
 
   it("does not offer This computer to an engine that only has the computer MCP surface", () => {
@@ -102,7 +104,7 @@ describe("local computer UI eligibility", () => {
     expect(
       localComputerDisabledReason({ capabilities, providerSupportsLocal: true }),
     ).toBe(
-      "Local computer control is not available on Wayland yet. Sign out and choose Ubuntu on Xorg to use This computer.",
+      "Local computer control is not available on Wayland yet.  Sign out and choose Ubuntu on Xorg to use This Computer.",
     );
   });
 
@@ -123,6 +125,14 @@ describe("local computer UI eligibility", () => {
         localSelectable: true,
       }),
     ).toBe(false);
+    expect(
+      autoSelectsLocalComputer({
+        platform: "darwin",
+        computers: ["vm"],
+        capabilitiesReady: true,
+        localSelectable: true,
+      }),
+    ).toBe(false);
   });
 });
 
@@ -139,30 +149,30 @@ describe("computer destination eligibility", () => {
     // Stated as a TRANSPORT rather than as `driverKind === "boxAgent"`: the
     // reason is that the agent runs on the remote machine, so there is no
     // local agent to mount a VM into — not that one engine is special-cased.
-    expect(instanceSupportsLocalVm(instanceFor(engineFixture("Computer")), BOT)).toBe(false);
+    expect(instanceSupportsLocalVm(instanceFor(engineFixture("ASCII.dev Box")), BOT)).toBe(false);
   });
 
-  it("offers a remote desktop to the Computer engine and to anything with the computer surface", () => {
-    expect(instanceSupportsCloudComputer(instanceFor(engineFixture("Computer")), BOT, "box")).toBe(true);
+  it("offers a remote desktop to the ASCII.dev Box engine and to anything with the computer surface", () => {
+    expect(instanceSupportsCloudComputer(instanceFor(engineFixture("ASCII.dev Box")), BOT, "box")).toBe(true);
     expect(instanceSupportsCloudComputer(instanceFor(engineFixture("Claude")), BOT, "box")).toBe(true);
     expect(instanceSupportsCloudComputer(instanceFor(engineFixture("ACP without MCP servers")), BOT, "box")).toBe(false);
   });
 
-  it("does not offer Cloud to the Computer engine when the backend resolves to a VPS", () => {
+  it("does not offer Cloud to the ASCII.dev Box engine when the backend resolves to a VPS", () => {
     // REGRESSION.  This helper could not see the backend at all, so it
     // answered "box" for every bot and returned true for the box-native
     // engine unconditionally.  A bot on that engine whose cloud backend
     // resolved to "vps" was therefore offered Cloud in Settings and then
     // died mid-turn at server/vps-computer.ts's vpsDriverError, which
     // refuses boxAgent outright.  Same engine, two backends, two answers.
-    expect(instanceSupportsCloudComputer(instanceFor(engineFixture("Computer")), BOT, "vps")).toBe(false);
-    expect(instanceSupportsCloudComputer(instanceFor(engineFixture("Computer")), BOT, "box")).toBe(true);
+    expect(instanceSupportsCloudComputer(instanceFor(engineFixture("ASCII.dev Box")), BOT, "vps")).toBe(false);
+    expect(instanceSupportsCloudComputer(instanceFor(engineFixture("ASCII.dev Box")), BOT, "box")).toBe(true);
     expect(instanceSupportsCloudComputer(instanceFor(engineFixture("Claude")), BOT, "vps")).toBe(true);
     expect(
-      computerDestinationDisabledReason("cloud", instanceFor(engineFixture("Computer")), BOT, "vps"),
+      computerDestinationDisabledReason("cloud", instanceFor(engineFixture("ASCII.dev Box")), BOT, "vps"),
     ).toContain("cannot drive a remote desktop");
     expect(
-      computerDestinationDisabledReason("cloud", instanceFor(engineFixture("Computer")), BOT, "box"),
+      computerDestinationDisabledReason("cloud", instanceFor(engineFixture("ASCII.dev Box")), BOT, "box"),
     ).toBeNull();
   });
 
@@ -182,11 +192,58 @@ describe("computer destination eligibility", () => {
   });
 
   it("names the engine in the reason, so the fix is obvious from the tooltip", () => {
-    const grok = instanceFor(engineFixture("Grok"));
-    const reason = computerDestinationDisabledReason("vm", grok, BOT, "box");
-    expect(reason).toContain("Grok");
+    const bare = instanceFor(engineFixture("ACP without MCP servers"));
+    const reason = computerDestinationDisabledReason("vm", bare, BOT, "box");
+    expect(reason).toContain("ACP without MCP servers");
     expect(reason).toContain("Local VM");
     expect(computerDestinationDisabledReason("vm", instanceFor(engineFixture("Claude")), BOT, "box")).toBeNull();
+  });
+
+  it("tells a local-only engine, in one sentence, that it stays on this Mac", () => {
+    const grok = instanceFor(engineFixture("Grok"));
+    expect(computerDestinationDisabledReason("cloud", grok, BOT, "vps")).toBe(
+      "Grok runs only on this Mac.",
+    );
+    expect(computerDestinationDisabledReason("vm", grok, BOT, "box")).toBe(
+      "Grok runs only on this Mac.",
+    );
+    expect(computerDestinationDisabledReason("cloud", grok, BOT, "box", false)).toBe(
+      "Grok runs only on this computer.",
+    );
+    expect(cloudBackendUnavailableNote(grok, BOT, true)).toBe("Grok runs only on this Mac.");
+    expect(cloudBackendUnavailableNote(instanceFor(engineFixture("MiniMax")), BOT, false)).toBe(
+      "MiniMax runs only on this computer.",
+    );
+  });
+
+  it("keeps the VPS sentence for an engine that can use a box and not a VPS", () => {
+    const box = instanceFor(engineFixture("ASCII.dev Box"));
+    const note = cloudBackendUnavailableNote(box, BOT, true);
+    expect(note).toContain("can't run a desktop on your own server");
+    expect(note).not.toContain("only on this Mac");
+    expect(cloudBackendUnavailableNote(instanceFor(engineFixture("Claude")), BOT, true)).toBeNull();
+    expect(cloudBackendUnavailableNote([], BOT, true)).toBeNull();
+  });
+
+  it("does not repeat the cloud-backend sentence under Runs On", () => {
+    const note = "Grok runs only on this Mac.";
+    expect(runsOnDisabledNote(note, note, note, true)).toBeNull();
+    expect(runsOnDisabledNote(note, "Grok cannot drive a Local VM.", note, true)).toBe(
+      "Grok cannot drive a Local VM.",
+    );
+    expect(runsOnDisabledNote(note, note, note, false)).toBe(note);
+  });
+
+  it("lets the cloud picker explain a Box-only engine, instead of denying every remote desktop", () => {
+    const box = instanceFor(engineFixture("ASCII.dev Box"));
+    const cloudReason = computerDestinationDisabledReason("cloud", box, BOT, "vps");
+    const vmReason = computerDestinationDisabledReason("vm", box, BOT, "vps");
+    const pickerNote = cloudBackendUnavailableNote(box, BOT, true);
+    expect(cloudReason).toContain("cannot drive a remote desktop");
+    expect(pickerNote).toContain("can't run a desktop on your own server");
+    const shown = runsOnDisabledNote(cloudReason, vmReason, pickerNote, true);
+    expect(shown).toBe(vmReason);
+    expect(shown).not.toContain("remote desktop");
   });
 });
 

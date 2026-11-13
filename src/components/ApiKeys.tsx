@@ -39,7 +39,7 @@ const SECTIONS: Record<
   opencodeGo: { body: (v) => ({ opencodeGo: { apiKey: v } }), flag: (c) => c.opencodeGo?.configured ?? false },
   // The deepseek key lives at the user level and is used only to fetch the
   // account balance for the engine row chip — never injected into any
-  // engine's process environment, so a bot can run on the DeepSeek harness
+  // engine's process environment, so a bot can run on Clutch
   // without this key set.
   deepseek: { body: (v) => ({ deepseek: { key: v } }), flag: (c) => c.deepseek?.configured ?? false },
 };
@@ -95,7 +95,8 @@ const CREDENTIALS: Record<
   deepseek: {
     label: "DeepSeek API key (balance display only)",
     placeholder: "sk-…",
-    description: "Used only to display your account balance under the DeepSeek engine row. Never sent to the engine itself, so the harness works without it.",
+    description:
+      "Used only to display your DeepSeek remaining balance under the DeepSeek engine row.  MiniMax (MM) and MiniMax Code (MC) operate on subscriptions, not API.  Never sent to the engine itself, so the harness works without it.",
     href: "https://platform.deepseek.com/api_keys",
     linkLabel: "Open the DeepSeek API key page",
     optional: true,
@@ -314,7 +315,7 @@ export function VpsConnection() {
         SSH config alias for the Linux VPS. BotFleet uses your normal SSH config and agent; it does not store keys or passwords.{" "}
         See the{" "}
         <a
-          href="https://github.com/jaywedgeworth22/BotFleet/blob/main/docs/byo-vps.md"
+          href="https://github.com/Simple-With-Us/BotFleet/blob/main/docs/byo-vps.md"
           target="_blank"
           rel="noopener noreferrer"
           className="text-accent hover:underline"

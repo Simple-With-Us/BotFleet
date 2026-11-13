@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   configStatusFromFrame,
+  MessagePostResponseSchema,
+  TaskSwitchResponseSchema,
   getRoomTerminology,
   initialState,
   isHarnessUnreachableError,
@@ -18,6 +20,65 @@ import {
   type Group,
   type Message,
 } from "./store";
+
+describe("API response contracts", () => {
+  const bot = {
+    id: "bot-1",
+    threadId: "thread-1",
+    name: "Bot",
+    title: "Bot",
+    description: "A test bot",
+    notifications: true,
+    color: "blue",
+    unread: false,
+    modelSelection: { instanceId: "engine-1", model: "model-1" },
+    messages: [],
+  };
+
+  it("keeps only the task-switch thread identity and rejects a bad envelope", () => {
+    const parsed = TaskSwitchResponseSchema.safeParse({
+      bot: {
+        ...bot,
+        messages: [{ id: "m1", role: "user", kind: "text", at: 1, injected: true }],
+        unexpected: true,
+      },
+    });
+    expect(parsed.success).toBe(true);
+    if (!parsed.success) return;
+    expect(parsed.data.bot).toEqual({ id: "bot-1", threadId: "thread-1" });
+    expect(TaskSwitchResponseSchema.safeParse({ bot, extra: true }).success).toBe(false);
+    expect(TaskSwitchResponseSchema.safeParse({ bot: { ...bot, threadId: 42 } }).success).toBe(false);
+    expect(TaskSwitchResponseSchema.safeParse({ bot: { id: "bot-1" } }).success).toBe(false);
+  });
+
+  it("accepts each message post outcome and rejects unvalidated fields", () => {
+    expect(MessagePostResponseSchema.safeParse({ ok: true }).success).toBe(true);
+    expect(MessagePostResponseSchema.safeParse({ ok: true, steered: true }).success).toBe(true);
+    expect(MessagePostResponseSchema.safeParse({ ok: true, ignored: "self_echo" }).success).toBe(true);
+    expect(MessagePostResponseSchema.safeParse({ ok: true, replayed: true }).success).toBe(true);
+    expect(MessagePostResponseSchema.safeParse({ ok: true, steered: true, replayed: true }).success).toBe(true);
+    expect(
+      MessagePostResponseSchema.safeParse({
+        ok: true,
+        ignored: "self_echo",
+        replayed: true,
+      }).success,
+    ).toBe(true);
+    expect(
+      MessagePostResponseSchema.safeParse({
+        ok: true,
+        queued: true,
+        queueId: "queue-1",
+        threadId: "thread-1",
+        replayed: true,
+      }).success,
+    ).toBe(true);
+    expect(MessagePostResponseSchema.safeParse({ ok: true, queued: true, queueId: 7, threadId: "thread-1" }).success).toBe(false);
+    expect(MessagePostResponseSchema.safeParse({ ok: true, extra: "unexpected" }).success).toBe(false);
+    expect(MessagePostResponseSchema.safeParse({ ok: true, ignored: "other" }).success).toBe(false);
+    expect(MessagePostResponseSchema.safeParse({ ok: true, replayed: false }).success).toBe(false);
+  });
+});
 
 describe("renderer hydration recovery", () => {
   const retainedBot = {
@@ -278,6 +339,28 @@ describe("config status frames", () => {
     });
   });
 
+  it("round-trips imessageLinq, so a config broadcast does not wipe Linq status", () => {
+    const imessageLinq = {
+      configured: true,
+      botNumber: "+15555550100",
+      perBot: { "maus-1": "linq" as const },
+      ignoredSenders: ["+15555550101"],
+      allowedSenders: [],
+      allowVoiceByDefault: true,
+      webhookReady: true,
+    };
+    const frame = {
+      xai: { configured: true },
+      composio: { configured: true, mode: "managed" as const },
+      box: { configured: false },
+      vps: { configured: true, sshAlias: "homelab" },
+      rooms: { turnTimeoutMinutes: 20 },
+      localVm: { mode: "per-bot" as const, maxInstances: 3 },
+      imessageLinq,
+    };
+    expect(configStatusFromFrame(frame).imessageLinq).toEqual(imessageLinq);
+  });
+
   it("round-trips botDefaults, so an inheriting bot's resolved backend survives a broadcast", () => {
     // botDefaults was missing from the ConfigStatusFrame Pick, so every SSE
     // `config` frame silently dropped it via the reducer's full `config:
@@ -481,6 +564,56 @@ describe("cross-client bot creation", () => {
     });
 
     expect(greeted.bots[0]?.messages).toEqual([greeting]);
+  });
+});
+
+// BF-2424: the optimistic-patch reconcile re-reads a bot after a rejected
+// PATCH. It asks for `?messages=0`, which answers with `messages: []`, and an
+// incoming transcript sharing no ids with what is on screen is read as a full
+// snapshot and replaces — vacuously true for an empty array. So the visible
+// conversation would blank on every rejected save. The reconcile therefore
+// carries the transcript already on screen instead of the empty one.
+describe("reconcile frames must not blank the transcript", () => {
+  const seedBot = {
+    id: "bot-1",
+    threadId: "t1",
+    name: "Ada",
+    title: "",
+    description: "",
+    notifications: false,
+    color: "green",
+    unread: false,
+    modelSelection: { instanceId: "acp", model: "fake" },
+  } satisfies Omit<Bot, "messages">;
+
+  const seeded = reducer(initialState, {
+    type: "botPatched",
+    bot: { ...seedBot, messages: [] },
+  });
+  const withTranscript = reducer(seeded, {
+    type: "messageAdded",
+    threadId: "t1",
+    message: { id: "m1", role: "user", kind: "text", text: "still here", at: 1 },
+  });
+
+  it("documents the hazard: a bare empty transcript from the same thread DOES replace", () => {
+    // This is the existing, intended behaviour for a task-switch snapshot that
+    // arrives empty (see "task switch transcript" below). It is exactly why the
+    // reconcile must not hand an empty array back: the reducer cannot tell the
+    // two apart, so the caller has to carry the real transcript.
+    const blanked = reducer(withTranscript, {
+      type: "botPatched",
+      bot: { ...seedBot, messages: [] },
+    });
+    expect(blanked.bots[0]?.messages).toEqual([]);
+  });
+
+  it("keeps the transcript when the reconcile carries the messages already on screen", () => {
+    const reconciled = reducer(withTranscript, {
+      type: "botPatched",
+      bot: { ...seedBot, messages: withTranscript.bots[0]!.messages },
+    });
+    expect(reconciled.bots[0]?.messages.map((m) => m.id)).toEqual(["m1"]);
   });
 });
 
@@ -974,5 +1107,501 @@ describe("paginated scrollback", () => {
     const fresh = reducer(stale, { type: "hydrate", bots: [bot()], groups: [], computerControl: {} });
     expect(fresh.hasMore.t1).toBe(false);
     expect(fresh.loadingEarlier).toEqual({});
+  });
+});
+
+describe("instances ordering guard", () => {
+  const engine = (version: string) => ({
+    instanceId: "claude",
+    driverKind: "claudeAgent",
+    displayName: "Claude",
+    snapshot: { state: "available" as const, version },
+    models: { default: "", options: [] },
+  });
+
+  it("drops an instances answer older than the one already shown", () => {
+    // A slow GET that started before the `instances` push must not put the
+    // older sweep back on screen.
+    const pushed = reducer(initialState, { type: "instances", instances: [engine("new")], describedAt: 2_000 });
+    const late = reducer(pushed, { type: "instances", instances: [engine("old")], describedAt: 1_000 });
+    expect(late.instances[0].snapshot.version).toBe("new");
+    expect(late.instancesDescribedAt).toBe(2_000);
+  });
+
+  it("applies a newer or equal answer, and one from a server that sends no stamp", () => {
+    const first = reducer(initialState, { type: "instances", instances: [engine("a")], describedAt: 1_000 });
+    const same = reducer(first, { type: "instances", instances: [engine("b")], describedAt: 1_000 });
+    expect(same.instances[0].snapshot.version).toBe("b");
+    const newer = reducer(same, { type: "instances", instances: [engine("c")], describedAt: 3_000 });
+    expect(newer.instances[0].snapshot.version).toBe("c");
+    const unstamped = reducer(newer, { type: "instances", instances: [engine("d")] });
+    expect(unstamped.instances[0].snapshot.version).toBe("d");
+    expect(unstamped.instancesDescribedAt).toBe(3_000);
+  });
+  it("forgets the ordering mark but keeps the engine list when the stream could not resume", () => {
+    // A restarted harness stamps from its own clock, which can sit below the
+    // last process's final stamp.  Its first answer must not be dropped as old.
+    const held = reducer(initialState, { type: "instances", instances: [engine("held")], describedAt: 9_000 });
+    const reset = reducer(held, { type: "instancesOrderReset" });
+    expect(reset.instances[0].snapshot.version).toBe("held");
+    expect(reset.instancesDescribedAt).toBe(0);
+    const restarted = reducer(reset, { type: "instances", instances: [engine("restarted")], describedAt: 4_000 });
+    expect(restarted.instances[0].snapshot.version).toBe("restarted");
+    expect(restarted.instancesDescribedAt).toBe(4_000);
+    // Ordering holds again from that stamp on.
+    const late = reducer(restarted, { type: "instances", instances: [engine("late")], describedAt: 3_000 });
+    expect(late.instances[0].snapshot.version).toBe("restarted");
+  });
+});
+
+describe("viewed thread pin stays with its selection", () => {
+  const bot = (id: string, threadId: string): Bot => ({
+    id,
+    threadId,
+    name: id,
+    title: "",
+    description: "",
+    notifications: true,
+    color: "green",
+    unread: false,
+    modelSelection: { instanceId: "x", model: "y" },
+    messages: [],
+  });
+
+  const pinned = {
+    ...initialState,
+    bots: [bot("a", "thread-a"), bot("b", "thread-b")],
+    selectedId: "a",
+    viewedThreadId: "app-thread",
+  };
+
+  it("drops the pin when botAdded selects the new bot", () => {
+    const next = reducer(pinned, { type: "botAdded", bot: bot("c", "thread-c") });
+    expect(next.selectedId).toBe("c");
+    expect(next.viewedThreadId).toBeNull();
+  });
+
+  it("keeps the pin when botAdded folds the bot that is already selected", () => {
+    const next = reducer(pinned, { type: "botAdded", bot: bot("a", "thread-a") });
+    expect(next.selectedId).toBe("a");
+    expect(next.viewedThreadId).toBe("app-thread");
+  });
+
+  it("drops the pin when the selected bot is deleted and keeps it otherwise", () => {
+    const deleted = reducer(pinned, { type: "deleteBot", botId: "a" });
+    expect(deleted.selectedId).not.toBe("a");
+    expect(deleted.viewedThreadId).toBeNull();
+    const other = reducer(pinned, { type: "deleteBot", botId: "b" });
+    expect(other.selectedId).toBe("a");
+    expect(other.viewedThreadId).toBe("app-thread");
+  });
+
+  it("drops the pin when hydrate has to move the selection, and keeps it when the bot remains", () => {
+    const moved = reducer(pinned, {
+      type: "hydrate",
+      bots: [bot("b", "thread-b")],
+      groups: [],
+      computerControl: {},
+    });
+    expect(moved.selectedId).toBe("b");
+    expect(moved.viewedThreadId).toBeNull();
+    const kept = reducer(pinned, {
+      type: "hydrate",
+      bots: [bot("a", "thread-a"), bot("b", "thread-b")],
+      groups: [],
+      computerControl: {},
+    });
+    expect(kept.selectedId).toBe("a");
+    expect(kept.viewedThreadId).toBe("app-thread");
+  });
+});
+
+describe("task switch transcript", () => {
+  const message = (id: string): Message => ({ id, role: "user", kind: "text", text: id, at: 1 });
+  const bot = (threadId: string, messages: Message[]): Bot => ({
+    id: "a",
+    threadId,
+    name: "a",
+    title: "",
+    description: "",
+    notifications: true,
+    color: "green",
+    unread: false,
+    modelSelection: { instanceId: "x", model: "y" },
+    messages,
+  });
+
+  it("keeps the transcript when a task switch ack omits messages", () => {
+    const state = {
+      ...initialState,
+      bots: [bot("old-thread", [message("old")])],
+      selectedId: "a",
+      viewedThreadId: "new-thread",
+    };
+    const next = reducer(state, { type: "taskSwitched", bot: { id: "a", threadId: "new-thread" } });
+    expect(next.bots[0]?.threadId).toBe("new-thread");
+    expect(next.bots[0]?.messages.map((entry) => entry.id)).toEqual(["old"]);
+    expect(next.viewedThreadId).toBeNull();
+  });
+
+  it("replaces the transcript when a later bot frame is a different thread's snapshot", () => {
+    const state = {
+      ...initialState,
+      bots: [bot("new-thread", [message("old")])],
+      selectedId: "a",
+    };
+    const next = reducer(state, {
+      type: "botPatched",
+      bot: { ...bot("new-thread", [message("fresh")]), messages: [message("fresh")] },
+    });
+    expect(next.bots[0]?.messages.map((entry) => entry.id)).toEqual(["fresh"]);
+  });
+
+  it("does not replace a same-thread snapshot that overlaps the current transcript", () => {
+    const state = {
+      ...initialState,
+      bots: [bot("same", [message("keep"), message("local")])],
+      selectedId: "a",
+    };
+    const next = reducer(state, {
+      type: "botPatched",
+      bot: { ...bot("same", [message("keep")]), messages: [message("keep")] },
+    });
+    expect(next.bots[0]?.messages.map((entry) => entry.id)).toEqual(["keep", "local"]);
+  });
+
+  it("replaces the retained transcript when the new thread snapshot is empty", () => {
+    const held = reducer(
+      {
+        ...initialState,
+        bots: [bot("old-thread", [message("old")])],
+        selectedId: "a",
+      },
+      { type: "taskSwitched", bot: { id: "a", threadId: "new-thread" } },
+    );
+    expect(held.bots[0]?.threadId).toBe("new-thread");
+    expect(held.bots[0]?.messages.map((entry) => entry.id)).toEqual(["old"]);
+    const next = reducer(held, {
+      type: "botPatched",
+      bot: { ...bot("new-thread", []), messages: [] },
+    });
+    expect(next.bots[0]?.threadId).toBe("new-thread");
+    expect(next.bots[0]?.messages).toEqual([]);
+  });
+
+  it("applies a non-empty snapshot when the client transcript is empty", () => {
+    const state = {
+      ...initialState,
+      bots: [bot("thread", [])],
+      selectedId: "a",
+    };
+    const next = reducer(state, {
+      type: "botPatched",
+      bot: { ...bot("thread", [message("fresh")]), messages: [message("fresh")] },
+    });
+    expect(next.bots[0]?.threadId).toBe("thread");
+    expect(next.bots[0]?.messages.map((entry) => entry.id)).toEqual(["fresh"]);
+  });
+});
+
+// The Fleet Matrix overview closes when the person picks a chat, and only then.
+// `selectedId` cannot say that: a click on the open chat leaves it unchanged,
+// and the store rewrites it by itself when a hydrate loses the selection or a
+// delete falls back.  `selectionNonce` is the signal, so this pins which
+// actions move it.
+describe("selectionNonce", () => {
+  const botNamed = (id: string) =>
+    ({
+      id,
+      threadId: `${id}-thread`,
+      name: id,
+      title: "",
+      description: "",
+      notifications: true,
+      color: "blue",
+      unread: false,
+      modelSelection: { instanceId: "x", model: "y" },
+      messages: [],
+    }) satisfies Bot;
+  const roomNamed = (id: string) =>
+    ({
+      id,
+      threadId: `${id}-thread`,
+      name: id,
+      memberIds: ["a"],
+      defaultResponder: { kind: "everyone" },
+      bulletin: "",
+      unread: false,
+      createdAt: 1,
+      messages: [],
+    }) satisfies Group;
+  const open = {
+    ...initialState,
+    bots: [botNamed("a"), botNamed("b")],
+    groups: [roomNamed("room")],
+    selectedId: "a",
+  };
+
+  it("counts picking another bot or a room", () => {
+    const toBot = reducer(open, { type: "select", id: "b" });
+    expect(toBot.selectionNonce).toBe(open.selectionNonce + 1);
+    const toRoom = reducer(toBot, { type: "select", id: "room" });
+    expect(toRoom.selectionNonce).toBe(open.selectionNonce + 2);
+  });
+
+  it("counts a click on the chat that is already open, which selectedId cannot show", () => {
+    const sameBot = reducer(open, { type: "select", id: "a" });
+    expect(sameBot.selectedId).toBe(open.selectedId);
+    expect(sameBot.selectionNonce).toBe(open.selectionNonce + 1);
+
+    const inRoom = { ...open, selectedId: "room" };
+    const sameRoom = reducer(inRoom, { type: "select", id: "room" });
+    expect(sameRoom.selectedId).toBe("room");
+    expect(sameRoom.selectionNonce).toBe(inRoom.selectionNonce + 1);
+  });
+
+  it("counts a new bot taking the selection, not a second fold of the bot already on screen", () => {
+    const added = reducer(open, { type: "botAdded", bot: botNamed("c") });
+    expect(added.selectedId).toBe("c");
+    expect(added.selectionNonce).toBe(open.selectionNonce + 1);
+    const refolded = reducer(added, { type: "botAdded", bot: botNamed("c") });
+    expect(refolded.selectedId).toBe("c");
+    expect(refolded.selectionNonce).toBe(added.selectionNonce);
+  });
+
+  it("does not move for a bot or room update streamed in the background", () => {
+    const busy = reducer(open, { type: "botPatched", bot: { ...botNamed("a"), busy: true } });
+    const arrived = reducer(busy, { type: "botPatched", bot: botNamed("elsewhere") });
+    const room = reducer(arrived, { type: "groupPatched", group: { id: "room", unread: true } });
+    const thread = reducer(room, { type: "taskSwitched", bot: { id: "a", threadId: "a-other" } });
+    expect(thread.selectionNonce).toBe(open.selectionNonce);
+  });
+
+  it("does not move when hydrate picks the first bot at launch or after the selection vanished", () => {
+    const launch = reducer(initialState, {
+      type: "hydrate",
+      bots: [botNamed("a"), botNamed("b")],
+      groups: [roomNamed("room")],
+      computerControl: {},
+    });
+    expect(launch.selectedId).toBe("a");
+    expect(launch.selectionNonce).toBe(initialState.selectionNonce);
+
+    const lost = reducer({ ...open, selectedId: "gone" }, {
+      type: "hydrate",
+      bots: [botNamed("b")],
+      groups: [],
+      computerControl: {},
+    });
+    expect(lost.selectedId).toBe("b");
+    expect(lost.selectionNonce).toBe(open.selectionNonce);
+  });
+
+  it("does not move when a delete makes the store fall back to another chat", () => {
+    const roomGone = reducer({ ...open, selectedId: "room" }, { type: "groupDeleted", groupId: "room" });
+    expect(roomGone.selectedId).toBe("a");
+    expect(roomGone.selectionNonce).toBe(open.selectionNonce);
+
+    const botGone = reducer(open, { type: "deleteBot", botId: "a" });
+    expect(botGone.selectedId).toBe("b");
+    expect(botGone.selectionNonce).toBe(open.selectionNonce);
+  });
+});
+
+describe("browsing a retained thread while the bot works", () => {
+  const message = (id: string): Message => ({ id, role: "bot", kind: "text", text: id, at: 1 });
+  const busyBot = {
+    id: "worker",
+    threadId: "thread-a",
+    name: "Worker",
+    title: "",
+    description: "",
+    notifications: true,
+    color: "blue",
+    unread: false,
+    busy: true,
+    modelSelection: { instanceId: "codex", model: "gpt" },
+    messages: [message("a1")],
+    tasks: [
+      { threadId: "thread-a", title: "Active", createdAt: 1 },
+      { threadId: "thread-b", title: "Retained", createdAt: 2 },
+    ],
+  } satisfies Bot;
+  const open = { ...initialState, bots: [busyBot], selectedId: "worker" };
+
+  it("views thread B without moving the execution target or its transcript", () => {
+    const viewed = reducer(open, { type: "viewThread", botId: "worker", threadId: "thread-b" });
+    expect(viewed.viewedThreadId).toBe("thread-b");
+    expect(viewed.bots[0]?.threadId).toBe("thread-a");
+    expect(viewed.bots[0]?.busy).toBe(true);
+    expect(viewed.bots[0]?.messages.map((entry) => entry.id)).toEqual(["a1"]);
+    // a first open needs its own page from the messages route
+    expect(viewed.loadingThread["thread-b"]).toBe(true);
+  });
+
+  it("refuses to view a thread the bot does not own, and clears the pin for the active thread", () => {
+    const viewed = reducer(open, { type: "viewThread", botId: "worker", threadId: "thread-b" });
+    expect(reducer(viewed, { type: "viewThread", botId: "worker", threadId: "elsewhere" })).toBe(viewed);
+    expect(reducer(viewed, { type: "viewThread", botId: "worker", threadId: "thread-a" }).viewedThreadId).toBeNull();
+    expect(reducer(viewed, { type: "viewThread", botId: "worker", threadId: null }).viewedThreadId).toBeNull();
+  });
+
+  it("keeps A streaming into the bot while B fills and updates its own cache", () => {
+    let state = reducer(open, { type: "viewThread", botId: "worker", threadId: "thread-b" });
+    state = reducer(state, {
+      type: "threadTranscriptLoaded",
+      threadId: "thread-b",
+      messages: [message("b1")],
+      hasMore: false,
+    });
+    expect(state.loadingThread["thread-b"]).toBeUndefined();
+    // A is still the execution target: its frames land on the bot
+    state = reducer(state, { type: "messageAdded", threadId: "thread-a", message: message("a2") });
+    expect(state.bots[0]?.messages.map((entry) => entry.id)).toEqual(["a1", "a2"]);
+    // B keeps receiving frames by threadId without touching A's transcript
+    state = reducer(state, { type: "messageAdded", threadId: "thread-b", message: message("b2") });
+    state = reducer(state, {
+      type: "messagePatched",
+      threadId: "thread-b",
+      message: { ...message("b2"), text: "edited" },
+    });
+    state = reducer(state, { type: "messagesAdded", threadId: "thread-b", messages: [message("b3")] });
+    expect(state.threadTranscripts["thread-b"]?.map((entry) => entry.id)).toEqual(["b1", "b2", "b3"]);
+    expect(state.threadTranscripts["thread-b"]?.[1]?.text).toBe("edited");
+    expect(state.bots[0]?.messages.map((entry) => entry.id)).toEqual(["a1", "a2"]);
+    expect(state.bots[0]?.threadId).toBe("thread-a");
+    // duplicate frames are dropped, unopened threads stay uncached
+    const dupes = reducer(state, { type: "messageAdded", threadId: "thread-b", message: message("b3") });
+    expect(dupes.threadTranscripts["thread-b"]).toHaveLength(3);
+    const unopened = reducer(open, { type: "messageAdded", threadId: "thread-b", message: message("b1") });
+    expect(unopened.threadTranscripts["thread-b"]).toBeUndefined();
+  });
+
+  it("prepends scrollback into the cache and stashes the left thread on a real switch", () => {
+    let state = reducer(open, { type: "viewThread", botId: "worker", threadId: "thread-b" });
+    state = reducer(state, {
+      type: "threadTranscriptLoaded",
+      threadId: "thread-b",
+      messages: [message("b2")],
+      hasMore: true,
+    });
+    state = reducer(state, {
+      type: "earlierLoaded",
+      threadId: "thread-b",
+      messages: [message("b1")],
+      hasMore: false,
+    });
+    expect(state.threadTranscripts["thread-b"]?.map((entry) => entry.id)).toEqual(["b1", "b2"]);
+    expect(state.hasMore["thread-b"]).toBe(false);
+
+    const switched = reducer(open, {
+      type: "taskSwitched",
+      bot: { id: "worker", threadId: "thread-b", messages: [message("b1")] },
+    });
+    expect(switched.bots[0]?.threadId).toBe("thread-b");
+    expect(switched.threadTranscripts["thread-a"]?.map((entry) => entry.id)).toEqual(["a1"]);
+    expect(switched.viewedThreadId).toBeNull();
+
+    // the same answer shape after a delete drops the deleted page
+    const deleted = reducer(state, {
+      type: "taskSwitched",
+      bot: {
+        id: "worker",
+        threadId: "thread-a",
+        messages: [message("a1")],
+        tasks: [{ threadId: "thread-a", title: "Active", createdAt: 1 }],
+      },
+    });
+    expect(deleted.threadTranscripts["thread-b"]).toBeUndefined();
+  });
+
+  it("drops cached pages on hydrate so a reconnect refetches instead of trusting them", () => {
+    const cached = {
+      ...open,
+      threadTranscripts: { "thread-b": [message("b1")] },
+      loadingThread: { "thread-b": true },
+      threadTranscriptErrors: { "thread-b": "boom" },
+    };
+    const hydrated = reducer(cached, {
+      type: "hydrate",
+      bots: [busyBot],
+      groups: [],
+      computerControl: {},
+    });
+    expect(hydrated.threadTranscripts).toEqual({});
+    expect(hydrated.loadingThread).toEqual({});
+    expect(hydrated.threadTranscriptErrors).toEqual({});
+  });
+
+  it("records a failed page so the view stops refetching, and clears it on an explicit reopen", () => {
+    let state = reducer(open, { type: "viewThread", botId: "worker", threadId: "thread-b" });
+    // a failure for a thread that is not loading is ignored
+    expect(reducer(state, { type: "threadTranscriptFailed", threadId: "thread-x" })).toBe(state);
+    state = reducer(state, { type: "threadTranscriptFailed", threadId: "thread-b", error: "boom" });
+    // no cache and no loading flag, but the error stays so the view
+    // effect holds instead of redispatching viewThread in a loop
+    expect(state.threadTranscripts["thread-b"]).toBeUndefined();
+    expect(state.loadingThread["thread-b"]).toBeUndefined();
+    expect(state.threadTranscriptErrors["thread-b"]).toBe("boom");
+    // opening the same thread again is an explicit retry: the error
+    // clears and the page is flagged for loading
+    const retried = reducer(state, { type: "viewThread", botId: "worker", threadId: "thread-b" });
+    expect(retried.threadTranscriptErrors["thread-b"]).toBeUndefined();
+    expect(retried.loadingThread["thread-b"]).toBe(true);
+  });
+
+  it("drops the newly active thread's stale browsed cache on a real switch", () => {
+    const browsed = {
+      ...open,
+      threadTranscripts: { "thread-b": [message("b-old")] },
+    };
+    const switched = reducer(browsed, {
+      type: "taskSwitched",
+      bot: { id: "worker", threadId: "thread-b", messages: [message("b1")] },
+    });
+    expect(switched.bots[0]?.threadId).toBe("thread-b");
+    // the thread just left is stashed for browsing back ...
+    expect(switched.threadTranscripts["thread-a"]?.map((entry) => entry.id)).toEqual(["a1"]);
+    // ... while the newly active thread's older browsed page is dropped:
+    // new frames land on the bot now, so the cache would lie by omission
+    expect(switched.threadTranscripts["thread-b"]).toBeUndefined();
+  });
+
+  it("keeps the browsed cache when a switch answer carries no thread change", () => {
+    const browsed = {
+      ...open,
+      threadTranscripts: { "thread-b": [message("b-old")] },
+    };
+    const same = reducer(browsed, {
+      type: "taskSwitched",
+      bot: { id: "worker", threadId: "thread-a", messages: [message("a1")] },
+    });
+    expect(same.threadTranscripts["thread-b"]?.map((entry) => entry.id)).toEqual(["b-old"]);
+  });
+
+  it("drops the newly active thread's stale browsed cache on a bot frame switch", () => {
+    const browsed = {
+      ...open,
+      threadTranscripts: { "thread-b": [message("b-old")] },
+    };
+    const patched = reducer(browsed, {
+      type: "botPatched",
+      bot: { ...busyBot, threadId: "thread-b", messages: [message("b1")] },
+    });
+    expect(patched.bots[0]?.threadId).toBe("thread-b");
+    expect(patched.bots[0]?.messages.map((entry) => entry.id)).toEqual(["b1"]);
+    expect(patched.threadTranscripts["thread-b"]).toBeUndefined();
+  });
+
+  it("keeps the browsed cache on bot frames that carry no thread change", () => {
+    const browsed = {
+      ...open,
+      threadTranscripts: { "thread-b": [message("b-old")] },
+    };
+    const patched = reducer(browsed, {
+      type: "botPatched",
+      bot: { ...busyBot, busy: false },
+    });
+    expect(patched.threadTranscripts["thread-b"]?.map((entry) => entry.id)).toEqual(["b-old"]);
   });
 });

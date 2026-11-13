@@ -40,6 +40,22 @@ describe("driverKindsForWindow — droid/Factory", () => {
   });
 });
 
+describe("driverKindsForWindow — MiniMax Code", () => {
+  it("caps the mcode instance off the same MiniMax window", () => {
+    // MiniMax Code spends the same Token Plan as the direct MiniMax engine,
+    // so a MiniMax window has to reach both driver kinds — otherwise a
+    // mcode instance shows no quota and is never cooled down.
+    const kinds = driverKindsForWindow(window({ provider: "minimax", label: "MiniMax weekly" }));
+    expect(kinds).toContain("mcodeAgent");
+    expect(kinds).toContain("minimaxAgent");
+    expect(quotaProviderForDriver("mcodeAgent")).toBe("minimax");
+  });
+
+  it("gives mcode no standalone meter note — it has a real window", () => {
+    expect(engineMeterNote("mcodeAgent")).toBeNull();
+  });
+});
+
 describe("engineMeterNote", () => {
   it("returns an explicit metered note for pi, qwen, hermes, opencodeGo and boxAgent", () => {
     for (const kind of ["piAgent", "qwenAgent", "hermesAgent", "opencodeGo", "boxAgent"]) {

@@ -2,7 +2,7 @@
 
 ## Summary
 
-Upgrade the harness from basic `gen_ai.*` spans to the full [Sentry Agents](https://docs.sentry.io/product/agents/) product surface for project `jays-services/botfleet`.
+Upgrade the harness from basic `gen_ai.*` spans to the full [Sentry Agents](https://docs.sentry.io/product/agents/) product surface for project `simple-with-us/botfleet`.
 
 | Requirement | Implementation |
 | --- | --- |
@@ -44,7 +44,7 @@ Manual spans still omit raw prompts and tool arguments (credentials). The kill-s
 
 ## Verify in Sentry
 
-1. Open [Sentry → Agents](https://jays-services.sentry.io/insights/agents/) for project **botfleet**.
+1. Open [Sentry → Agents](https://simple-with-us.sentry.io/insights/agents/) for project **botfleet**.
 2. Run any bot turn (e.g. Fixer / Monitor). Confirm an Agents Dashboard row named after the **bot title**, with tool and model children and token usage when reported.
 3. Open **Conversations** — thread id groups the chat; **User** shows bot id/name (or room).
 4. Optional: `SENTRY_AI_DATA_COLLECTION=0`, restart harness, confirm init fingerprint flips (`ai-data-off`) via Settings → Observability restart / boot logs.

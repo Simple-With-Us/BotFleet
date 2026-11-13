@@ -5,8 +5,10 @@ import type { ComputerProviderId } from "../shared/local-auto-consent.ts";
 // provider and interrupts every in-flight turn, so only a key a driver
 // actually reads may trigger it.
 //
-// Profile, voice, VPS, and room timeout changes do not rebuild the fleet:
-// no driver reads them.  Terminology is only a display word, so renaming
+// Profile, voice, VPS, background-job and room timeout changes do not
+// rebuild the fleet: no driver reads them.  `jobs` is read per use from the
+// live config (`resolveJobsSettings(cfg.jobs)`), so a job-limit save takes
+// effect without interrupting a single in-flight turn.  Terminology is only a display word, so renaming
 // rooms must never kill a turn that is running.  `botDefaults` (the
 // workspace computer providers, VPS mode, the New Bots default and the
 // legacy allowlist) is read per turn by `resolveTurnComputerMounts` from
@@ -21,6 +23,11 @@ export const CONFIG_KEYS_WITHOUT_PROVIDER_RELOAD: ReadonlySet<string> = new Set(
   "imageGen",
   "vps",
   "rooms",
+  "jobs",
+  // The placement transport's knobs are read live by the registry bridge and
+  // the lease service (server/placement-controller-bridge.ts); no driver
+  // reads the section, so a save must never rebuild the fleet.
+  "placement",
   "localVm",
   "autoUpdate",
   "ingress",
@@ -32,6 +39,16 @@ export const CONFIG_KEYS_WITHOUT_PROVIDER_RELOAD: ReadonlySet<string> = new Set(
   "terminologyCustom",
   "conversationMode",
   "botDefaults",
+  // The Zulip source reads its section live on every reconcile; no driver
+  // reads it, so a save must never interrupt a turn.
+  "zulip",
+  // The fallback reviewer is looked up per review from the live config.
+  "autoReview",
+  // The computer-call gate resolves its waits per call from the live
+  // config (`computerCallSettings(cfg)` in server/index.ts); no driver
+  // reads the section.  `claudeSession` is deliberately absent: the Claude
+  // driver reads its idle window at create time, so a save must rebuild.
+  "computerCall",
 ]);
 
 /** The keys in a config patch that require rebuilding the provider fleet. */

@@ -2,7 +2,7 @@
 // fake is a stubbed globalThis.fetch that scripts HTTP failures and SSE
 // bodies. Covers the auto-retry policy: transient (429/5xx) retried with
 // backoff, terminal (401/400) never, partial streamed output never.
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ProviderInstance } from "../contracts.ts";
 import { recordEvents, type EventRecorder } from "../testing/events.ts";
@@ -68,10 +68,14 @@ describe("GrokDriver turns (fake fetch)", () => {
     expect(instance.models.default).toBe("grok-4.7");
     expect(instance.models.options.map((model) => model.id)).toEqual([
       "grok-4.7",
+      "grok-build-0.1",
       "grok-4.6",
       "grok-4.5",
     ]);
+    expect(instance.models.options.find((model) => model.id === "grok-build-0.1")?.label).toBe("Grok Build 0.1");
     expect(instance.models.options.some((model) => model.id === "grok-4.7-build-fast")).toBe(false);
+    // Composer 2.5 is Cursor's model served through the Grok Build CLI, not an xAI API id.
+    expect(instance.models.options.some((model) => model.id.startsWith("composer"))).toBe(false);
   });
 
   it("sends the selected Grok 4.7 API model id unchanged", async () => {
@@ -81,6 +85,30 @@ describe("GrokDriver turns (fake fetch)", () => {
     await recorder.until((event) => event.type === "turn.completed");
 
     expect(requestBodies[0].model).toBe("grok-4.7");
+  });
+
+  it("sends the bot's output limit as max_completion_tokens, and every catalog row carries supportsMaxOutput", async () => {
+    script = [];
+    await create();
+    expect(instance.models.options.every((model) => model.supportsMaxOutput === true)).toBe(true);
+    // The server gate and the picker only bound the limit when the row
+    // knows the window, so the flag must never ride alone.
+    expect(
+      instance.models.options.every((model) => model.contextWindow !== undefined && model.contextWindow > 0),
+    ).toBe(true);
+    await instance.adapter.sendTurn({ threadId: "t-max-out", text: "hi", maxOutputTokens: 4096 });
+    await recorder.until((e) => e.type === "turn.completed");
+    expect(requestBodies[0].max_completion_tokens).toBe(4096);
+    expect(requestBodies[0]).not.toHaveProperty("max_tokens");
+  });
+
+  it("sends no output-limit field when the bot sets none", async () => {
+    script = [];
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-max-out-unset", text: "hi" });
+    await recorder.until((e) => e.type === "turn.completed");
+    expect(requestBodies[0]).not.toHaveProperty("max_completion_tokens");
+    expect(requestBodies[0]).not.toHaveProperty("max_tokens");
   });
 
   it("normalizes a full turn into the canonical event sequence", async () => {
@@ -415,5 +443,223 @@ describe("GrokDriver turns (fake fetch)", () => {
     );
     expect(total).toBeLessThan(80 * 5_000);
     expect(total).toBeGreaterThan(0);
+  });
+});
+
+// The round's deadlines belong to the turn loop alone.  grok.ts used to wrap
+// the loop's signal in its own fixed 120s timer, under the loop's round
+// ceiling, so a slow-but-live reasoning round was cut off, retried, and then
+// reported as a provider_error that paged.  Fake timers, so neither test
+// costs minutes of real time.
+describe("GrokDriver round deadlines (fake timers)", () => {
+  const enc = new TextEncoder();
+  const frame = (content: string) => enc.encode(`data: ${JSON.stringify({ choices: [{ delta: { content } }] })}\n`);
+
+  const createInstance = () =>
+    GrokDriver.create({
+      instanceId: "grok-deadlines",
+      displayName: "Grok Deadlines",
+      environment: { XAI_API_KEY: "xai-fake" },
+      enabled: true,
+      config: { url: "https://fake.xai.invalid/v1", apiKeyEnv: "XAI_API_KEY" },
+    });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it("lets a round that streams for 150s complete", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn(async (_input: unknown, init?: RequestInit) => {
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          init?.signal?.addEventListener("abort", () => controller.error(new DOMException("aborted", "AbortError")));
+          // a chunk every 25s for 150s, then the answer ends
+          for (let at = 0; at <= 150_000; at += 25_000) {
+            setTimeout(() => controller.enqueue(frame(`t${at / 1000} `)), at);
+          }
+          setTimeout(() => {
+            controller.enqueue(enc.encode("data: [DONE]\n"));
+            controller.close();
+          }, 150_001);
+        },
+      });
+      return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const instance = await createInstance();
+    const recorder = recordEvents(instance.adapter);
+    try {
+      await instance.adapter.sendTurn({ threadId: "t-slow-live", text: "think hard" });
+      const completed = recorder.until((event) => event.type === "turn.completed", 1_000_000);
+      await vi.advanceTimersByTimeAsync(151_000);
+
+      expect(await completed).toMatchObject({ ok: true, stopReason: "end_turn" });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(recorder.events.filter((e) => e.type === "runtime.error")).toHaveLength(0);
+      expect(recorder.events.filter((e) => e.type === "turn.retrying")).toHaveLength(0);
+    } finally {
+      recorder.stop();
+      await instance.dispose();
+    }
+  }, 20_000);
+
+  it("ends a 200s stall as request_timeout, not provider_error", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn(async (_input: unknown, init?: RequestInit) => {
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          // Real fetch rejects a pending read once its signal aborts; the
+          // mock wires that up because it never touches the network.
+          init?.signal?.addEventListener("abort", () => controller.error(new DOMException("aborted", "AbortError")));
+          setTimeout(() => controller.enqueue(frame("partial ")), 1_000);
+          // ...and then nothing for 200s.
+        },
+      });
+      return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const instance = await createInstance();
+    const recorder = recordEvents(instance.adapter);
+    try {
+      await instance.adapter.sendTurn({ threadId: "t-stall", text: "hi" });
+      const completed = recorder.until((event) => event.type === "turn.completed", 1_000_000);
+      await vi.advanceTimersByTimeAsync(201_000);
+
+      expect(await completed).toMatchObject({ ok: false, stopReason: "timeout" });
+      const error = recorder.events.find((e) => e.type === "runtime.error");
+      expect(error).toMatchObject({ message: expect.stringContaining("the model did not answer within 120s") });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(recorder.events.filter((e) => e.type === "turn.retrying")).toHaveLength(0);
+    } finally {
+      recorder.stop();
+      await instance.dispose();
+    }
+  }, 20_000);
+});
+
+// The xAI driver used to ship three hardcoded rows as its only catalog, so a
+// newly released Grok could not reach the picker without a BotFleet release.
+describe("GrokDriver live model catalog", () => {
+  let previousFetch: typeof globalThis.fetch;
+  let requestedUrls: string[];
+
+  const create = () =>
+    GrokDriver.create({
+      instanceId: "grok-catalog",
+      displayName: "Grok Catalog",
+      environment: { XAI_API_KEY: "xai-fake" },
+      enabled: true,
+      config: { url: "https://fake.xai.invalid/v1", apiKeyEnv: "XAI_API_KEY" },
+    });
+
+  const serve = (body: unknown, status = 200) => {
+    globalThis.fetch = (async (input) => {
+      requestedUrls.push(String(input));
+      return new Response(JSON.stringify(body), { status });
+    }) as typeof globalThis.fetch;
+  };
+
+  beforeEach(() => {
+    previousFetch = globalThis.fetch;
+    requestedUrls = [];
+  });
+
+  afterEach(() => {
+    globalThis.fetch = previousFetch;
+  });
+
+  it("adopts the ids xAI lists, including one the static catalog never had", async () => {
+    serve({ data: [{ id: "grok-4.7" }, { id: "grok-5" }] });
+    const instance = await create();
+    await instance.refreshModels?.();
+    expect(instance.models.options.map((option) => option.id)).toEqual(["grok-4.7", "grok-5"]);
+  });
+
+  it("asks xAI for the list rather than trusting the built-in rows", async () => {
+    serve({ data: [] });
+    const instance = await create();
+    await instance.refreshModels?.();
+    expect(requestedUrls).toContain("https://fake.xai.invalid/v1/models");
+  });
+
+  it("keeps the hand-written label for a model it already knows", async () => {
+    serve({ data: [{ id: "grok-4.7" }] });
+    const instance = await create();
+    await instance.refreshModels?.();
+    expect(instance.models.options[0].label).toBe("Grok 4.7");
+  });
+
+  it("lists grok-build-0.1 once, under its own label, when xAI also returns it", async () => {
+    serve({ data: [{ id: "grok-build-0.1", name: "xai grok-build-0.1" }, { id: "grok-4.7" }, { id: "grok-build-0.1" }] });
+    const instance = await create();
+    await instance.refreshModels?.();
+    const rows = instance.models.options.filter((option) => option.id === "grok-build-0.1");
+    expect(rows).toEqual([{ id: "grok-build-0.1", label: "Grok Build 0.1", contextWindow: 256_000, supportsMaxOutput: true }]);
+    expect(instance.models.options.map((option) => option.id)).toEqual(["grok-build-0.1", "grok-4.7"]);
+  });
+
+  it("labels grok-build-0.1 cleanly when xAI returns it without a name", async () => {
+    serve({ data: [{ id: "grok-4.7" }, { id: "grok-build-0.1" }] });
+    const instance = await create();
+    await instance.refreshModels?.();
+    expect(instance.models.options.find((option) => option.id === "grok-build-0.1")?.label).toBe("Grok Build 0.1");
+  });
+
+  it("keeps the current default across a refresh", async () => {
+    serve({ data: [{ id: "grok-5" }, { id: "grok-4.7" }] });
+    const instance = await create();
+    await instance.refreshModels?.();
+    expect(instance.models.default).toBe("grok-4.7");
+  });
+
+  it("keeps the static catalog when xAI answers with an error", async () => {
+    serve({ error: "nope" }, 503);
+    const instance = await create();
+    await instance.refreshModels?.();
+    expect(instance.models.options.map((option) => option.id)).toEqual([
+      "grok-4.7",
+      "grok-build-0.1",
+      "grok-4.6",
+      "grok-4.5",
+    ]);
+  });
+
+  it("keeps the static catalog when xAI answers 200 with an empty list", async () => {
+    serve({ data: [] });
+    const instance = await create();
+    await instance.refreshModels?.();
+    expect(instance.models.options.length).toBeGreaterThan(0);
+  });
+
+  it("keeps the static catalog when the network fails outright", async () => {
+    globalThis.fetch = (async () => {
+      throw new Error("ECONNREFUSED");
+    }) as typeof globalThis.fetch;
+    const instance = await create();
+    await instance.refreshModels?.();
+    expect(instance.models.default).toBe("grok-4.7");
+  });
+
+  it("does not call xAI at all without a key", async () => {
+    serve({ data: [{ id: "grok-5" }] });
+    const instance = await GrokDriver.create({
+      instanceId: "grok-no-key",
+      displayName: "Grok No Key",
+      environment: {},
+      enabled: true,
+      config: { url: "https://fake.xai.invalid/v1", apiKeyEnv: "XAI_API_KEY_MISSING" },
+    });
+    await instance.refreshModels?.();
+    expect(requestedUrls).toEqual([]);
+    expect(instance.models.default).toBe("grok-4.7");
+  });
+
+  it("collapses a burst of refreshes into one request", async () => {
+    serve({ data: [{ id: "grok-4.7" }] });
+    const instance = await create();
+    await Promise.all([instance.refreshModels?.(), instance.refreshModels?.(), instance.refreshModels?.()]);
+    expect(requestedUrls.filter((url) => url.endsWith("/models"))).toHaveLength(1);
   });
 });

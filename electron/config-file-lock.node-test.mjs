@@ -6,7 +6,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -466,7 +466,9 @@ test("two processes doing locked read-modify-writes on one file never lose an up
   const { dir, path } = tempConfig();
   const N = 40;
   try {
-    const env = { CFL_PATH: path, CFL_N: String(N) };
+    // windows-latest under parallel CI load can keep a peer lock held longer than
+    // the default 5s acquire timeout while each side does N read-modify-writes.
+    const env = { CFL_PATH: path, CFL_N: String(N), CFL_TIMEOUT_MS: "30000" };
     await Promise.all([
       runWorker(COUNTER_SOURCE, { ...env, CFL_SECTION: "server" }),
       runWorker(COUNTER_SOURCE, { ...env, CFL_SECTION: "electron" }),
@@ -477,4 +479,308 @@ test("two processes doing locked read-modify-writes on one file never lose an up
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// An unusable config.json used to read as `{}`, so the next writer (a Settings
+// save, the updater's throttle record, a boot credential migration) replaced
+// the file with its patch alone and every key the owner had was gone.  Now the
+// unusable file is renamed aside first, under the same lock, and never
+// deleted.
+
+const setAsideNames = (dir) => readdirSync(dir).filter((name) => name.startsWith("config.json.corrupt-"));
+
+test("updateConfigFile sets an unparseable file aside, byte for byte, before writing a new one", () => {
+  const { dir, path } = tempConfig();
+  try {
+    const broken = '{"xai":{"key":"REDACTED_TEST_MARKER"},"profile":{"name":"Ada"';
+    writeFileSync(path, broken, { mode: 0o600 });
+    const notices = [];
+    let seen;
+    updateConfigFile(
+      path,
+      (disk) => {
+        seen = { ...disk };
+        disk.second = true;
+      },
+      { now: 1790000000000, onSetAside: (info) => notices.push(info) },
+    );
+    assert.deepEqual(seen, {});
+    assert.deepEqual(JSON.parse(readFileSync(path, "utf8")), { second: true });
+    assert.deepEqual(setAsideNames(dir), ["config.json.corrupt-1790000000000"]);
+    const aside = join(dir, "config.json.corrupt-1790000000000");
+    assert.equal(readFileSync(aside, "utf8"), broken);
+    // The mode is only meaningful where the filesystem has permission bits.
+    // NTFS has none, so statSync reports 0o666 for every file there and
+    // writeFileSync ignores its mode option; asserting it would be asserting a
+    // property Windows does not have, and did not have when this branch first
+    // ran there.
+    if (process.platform !== "win32") {
+      assert.equal(statSync(aside).mode & 0o777, 0o600, "the preserved file keeps its private mode");
+    }
+    assert.equal(notices.length, 1);
+    assert.equal(notices[0].setAsidePath, aside);
+    assert.match(notices[0].reason, /ends early|not valid JSON/);
+    assert.ok(!notices[0].reason.includes("REDACTED_TEST_MARKER"), "the reason never quotes the file");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("updateConfigFile sets aside a JSON value that is not an object, and never reuses a name", () => {
+  const { dir, path } = tempConfig();
+  try {
+    writeFileSync(path, "[1,2,3]");
+    writeFileSync(join(dir, "config.json.corrupt-1790000000000"), "earlier");
+    updateConfigFile(path, (disk) => {
+      disk.fresh = true;
+    }, { now: 1790000000000, onSetAside: () => {} });
+    assert.deepEqual(setAsideNames(dir).sort(), [
+      "config.json.corrupt-1790000000000",
+      "config.json.corrupt-1790000000000-1",
+    ]);
+    assert.equal(readFileSync(join(dir, "config.json.corrupt-1790000000000"), "utf8"), "earlier");
+    assert.equal(readFileSync(join(dir, "config.json.corrupt-1790000000000-1"), "utf8"), "[1,2,3]");
+    assert.deepEqual(readConfigFile(path), { fresh: true });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("updateConfigFile treats a byte-order mark as part of a healthy file", () => {
+  const { dir, path } = tempConfig();
+  try {
+    writeFileSync(path, `\uFEFF${JSON.stringify({ keep: { me: 1 } })}`);
+    assert.deepEqual(readConfigFile(path), { keep: { me: 1 } });
+    updateConfigFile(path, (disk) => {
+      disk.added = true;
+    });
+    assert.deepEqual(setAsideNames(dir), []);
+    const text = readFileSync(path, "utf8");
+    assert.ok(!text.startsWith("\uFEFF"));
+    assert.deepEqual(JSON.parse(text), { keep: { me: 1 }, added: true });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("updateConfigFile does not set aside an empty file, which holds nothing to lose", () => {
+  const { dir, path } = tempConfig();
+  try {
+    for (const body of ["", "  \n"]) {
+      writeFileSync(path, body);
+      updateConfigFile(path, (disk) => {
+        disk.ok = true;
+      });
+      assert.deepEqual(setAsideNames(dir), []);
+      assert.deepEqual(readConfigFile(path), { ok: true });
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("updateConfigFile leaves an unusable file exactly where it is when nothing needs writing", () => {
+  const { dir, path } = tempConfig();
+  try {
+    writeFileSync(path, "{ not json");
+    updateConfigFile(path, () => null);
+    assert.equal(readFileSync(path, "utf8"), "{ not json");
+    assert.deepEqual(setAsideNames(dir), []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("updateConfigFile refuses to overwrite an unusable file it cannot set aside", () => {
+  const { dir, path } = tempConfig();
+  try {
+    writeFileSync(path, "{ not json");
+    // A name longer than the filesystem allows makes the rename fail the same
+    // way a read-only directory would, without depending on who runs the test.
+    // That limit is a POSIX name-length rule though, and NTFS with long paths
+    // enabled accepts the name — so on the first Windows run of this branch
+    // the rename went through, nothing was refused, and this reported a
+    // missing exception while proving nothing.  Ask, then check the answer.
+    let refused = false;
+    try {
+      updateConfigFile(path, (disk) => {
+        disk.fresh = true;
+      }, { now: "9".repeat(400) });
+    } catch (error) {
+      refused = true;
+      assert.match(String(error), /config\.json/);
+    }
+    if (!refused) {
+      // The platform allowed the oversized name, so the refusal was never set up.  Assert the
+      // outcome it did produce rather than returning silently: a lock that was not released, or a
+      // staged file left behind, would otherwise pass here.  POSIX takes the branch below on
+      // every run.
+      //
+      // Find the moved file by listing the directory rather than existsSync on a constructed
+      // path.  GitHub's windows-latest lies on existsSync of a > 255-char component, so a path
+      // built from "9".repeat(400) cannot prove the rename landed; readdir returns the names
+      // the directory actually holds, which is the honest evidence.
+      const moved = readdirSync(dir).find((name) => name.startsWith("config.json.corrupt-"));
+      assert.ok(moved, "the unusable file was moved aside");
+      assert.equal(readFileSync(join(dir, moved), "utf8"), "{ not json", "the moved file is byte for byte");
+      assert.deepEqual(JSON.parse(readFileSync(path, "utf8")), { fresh: true });
+      assert.equal(existsSync(lockPathFor(path)), false, "the lock is released");
+      assert.deepEqual(readdirSync(dir).filter((name) => name.endsWith(".tmp")), [], "no staged file is left behind");
+      return;
+    }
+    assert.equal(readFileSync(path, "utf8"), "{ not json", "the unusable file is untouched");
+    assert.equal(existsSync(lockPathFor(path)), false, "the lock is released");
+    assert.deepEqual(readdirSync(dir).filter((name) => name.endsWith(".tmp")), [], "no staged file is left behind");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ENOENT from the set-aside rename means "another process already moved it"
+// only while the file is really gone.  Windows answers a too-long target name
+// with ENOENT as well, and the first windows-latest run of this branch showed
+// that trusting it replaced a file that was never set aside.  `now` is spliced
+// into the target name, so a slash in it points the rename at a directory that
+// does not exist: ENOENT with the source still there, on every platform.
+test("an ENOENT from the set-aside rename is a refusal while the unusable file is still there", () => {
+  const { dir, path } = tempConfig();
+  try {
+    writeFileSync(path, "{ not json");
+    assert.throws(
+      () => updateConfigFile(path, (disk) => { disk.fresh = true; }, { now: "no-such-dir/1" }),
+      /could not be moved aside \(ENOENT\), so it was not overwritten/,
+    );
+    assert.equal(readFileSync(path, "utf8"), "{ not json", "the unusable file is untouched");
+    assert.equal(existsSync(lockPathFor(path)), false, "the lock is released");
+    assert.deepEqual(readdirSync(dir), ["config.json"], "nothing staged and nothing set aside");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an ENOENT from the set-aside rename is the race it always was once the file is gone", () => {
+  const { dir, path } = tempConfig();
+  try {
+    writeFileSync(path, "{ not json");
+    const told = [];
+    // Another process sets the file aside between this one reading it and
+    // renaming it: the file is gone by the time of the rename.
+    updateConfigFile(
+      path,
+      (disk) => {
+        rmSync(path);
+        disk.fresh = true;
+      },
+      { onSetAside: (info) => told.push(info) },
+    );
+    assert.deepEqual(JSON.parse(readFileSync(path, "utf8")), { fresh: true });
+    assert.equal(told.length, 1);
+    assert.equal(told[0].setAsidePath, null, "told that someone else already moved it");
+    assert.deepEqual(readdirSync(dir), ["config.json"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// What the lock validates, and what it must leave alone.  The lock checks the
+// envelope (a readable JSON object) and the shape of what it is about to
+// persist (a plain object).  It does not check sections: those belong to
+// server/config.ts's zod schema, and a stricter check here would drop settings
+// a newer build wrote or set aside a file for one bad section.  See the doc
+// comment on inspectConfigFile.
+// ---------------------------------------------------------------------------
+
+test("updateConfigFile carries keys it does not know and sections of the wrong shape through untouched", () => {
+  const { dir, path } = tempConfig();
+  try {
+    // A section a newer build added, an unknown key inside a known section,
+    // and three known sections holding the wrong kind of value.  A strict
+    // schema in the lock would have rejected or stripped every one of them.
+    const original = {
+      futureSection: { nested: [1, { deep: true }], flag: "on" },
+      profile: { name: "Ada", addedByANewerBuild: 7 },
+      instances: "not an object",
+      autoUpdate: [1, 2, 3],
+      botDefaults: null,
+    };
+    writeFileSync(path, JSON.stringify(original));
+    updateConfigFile(path, (disk) => {
+      disk.touched = true;
+    });
+    assert.deepEqual(JSON.parse(readFileSync(path, "utf8")), { ...original, touched: true });
+    assert.deepEqual(setAsideNames(dir), [], "a file with a wrong-shaped section is not an unusable file");
+    assert.deepEqual(readConfigFile(path), { ...original, touched: true });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("updateConfigFile refuses a mutate result that is not a plain object, and leaves the file and the lock alone", () => {
+  const healthy = '{"profile":{"name":"Ada"},"autoUpdate":{"enabled":true}}';
+  const wrong = [
+    ["an array", () => [{ profile: {} }], /an array/],
+    ["a string", () => '{"profile":{}}', /a string/],
+    ["a number", () => 0, /a number/],
+    ["a boolean", () => false, /a boolean/],
+    ["a Map, which JSON.stringify would turn into {}", () => new Map([["profile", {}]]), /not a plain JSON object/],
+    ["a class instance", () => new (class Config {})(), /not a plain JSON object/],
+  ];
+  for (const [label, mutate, message] of wrong) {
+    const { dir, path } = tempConfig();
+    try {
+      writeFileSync(path, healthy);
+      assert.throws(() => updateConfigFile(path, mutate), message, label);
+      assert.equal(readFileSync(path, "utf8"), healthy, `${label}: the file is exactly as it was`);
+      assert.equal(existsSync(lockPathFor(path)), false, `${label}: the lock is released`);
+      assert.deepEqual(readdirSync(dir), ["config.json"], `${label}: nothing staged and nothing set aside`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("a refused mutate result does not create a missing file or move an unusable one", () => {
+  const { dir, path } = tempConfig();
+  try {
+    assert.throws(() => updateConfigFile(path, () => []), /an array/);
+    assert.deepEqual(readdirSync(dir), [], "a fresh install gains no file from a refused write");
+
+    writeFileSync(path, "{ not json");
+    assert.throws(() => updateConfigFile(path, () => "x"), /a string/);
+    assert.equal(readFileSync(path, "utf8"), "{ not json", "the unusable file is still where it was");
+    assert.deepEqual(setAsideNames(dir), [], "a refused write sets nothing aside: only a write that replaces the file does");
+    assert.deepEqual(readdirSync(dir), ["config.json"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the refusal message names the kind of value and never its contents", () => {
+  const { dir, path } = tempConfig();
+  try {
+    const secret = "ak_live_SECRET_VALUE";
+    let message = "";
+    try {
+      updateConfigFile(path, () => secret);
+    } catch (error) {
+      message = String(error);
+    }
+    assert.match(message, /a string/);
+    assert.equal(message.includes(secret), false, "config.json holds API keys; an error must not quote what was refused");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the lock imports only node: built-ins and sibling files, so the packaged app can load it", () => {
+  // The packaged app ships no node_modules (electron-builder.yml `files`,
+  // scripts/bundle-server.mjs).  A bare import here, zod included, would fail
+  // the packaged boot with ERR_MODULE_NOT_FOUND.  That is why the section
+  // schema stays in server/config.ts and this module checks only the envelope.
+  const source = readFileSync(new URL("./config-file-lock.mjs", import.meta.url), "utf8");
+  const specifiers = [...source.matchAll(/^\s*(?:import|export)\b[^"'`;]*?\bfrom\s+["']([^"']+)["']/gms)].map((match) => match[1]);
+  assert.ok(specifiers.length > 0, "found the module's imports");
+  const bare = specifiers.filter((specifier) => !specifier.startsWith("node:") && !specifier.startsWith("./") && !specifier.startsWith("../"));
+  assert.deepEqual(bare, []);
 });

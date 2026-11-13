@@ -1,10 +1,11 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { removeTempDir, waitForExit } from "./testing/cleanup.ts";
+import { containerRuntimeLockdownEnv } from "./container-runtime-guard.ts";
+import { removeTempDir, spawnDetached, waitForExit } from "./testing/cleanup.ts";
 import { harnessReady } from "./testing/harness-ready.ts";
 
 // Real HTTP admission and state changes, with every container executable
@@ -31,6 +32,16 @@ describe.skipIf(process.platform === "win32")("Local VM lifecycle exclusion", ()
     writeFileSync(gate, "hold");
   };
   const release = () => rmSync(gate, { force: true });
+  /** After the fake runtime signals `entered`, late startup docker lines can
+   *  still land on macOS CI.  Wait until the held-gate `info` and any boot
+   *  probe traffic are both in the log before snapshotting exact equality. */
+  const waitForHeldGateLogSettled = async () => {
+    await expect.poll(() => existsSync(entered), { timeout: 10000 }).toBe(true);
+    await expect.poll(
+      () => readFileSync(log, "utf8").split("\n").filter(Boolean).length,
+      { timeout: 5000 },
+    ).toBeGreaterThanOrEqual(2);
+  };
 
   beforeAll(async () => {
     home = mkdtempSync(join(tmpdir(), "bf-vm-lifecycle-"));
@@ -69,9 +80,12 @@ fs.appendFileSync(path.join(home, "runtime.log"), args.join(" ") + "\\n");
     // three makes runtime discovery probe Docker and Podman concurrently, so
     // a second preflight line can race an assertion about the fenced request.
     writeFileSync(join(bin, "docker"), fake, { mode: 0o755 });
-    child = spawn(process.execPath, [join(serverDir, "index.ts")], {
+    child = spawnDetached(process.execPath, ["--experimental-strip-types", "--no-warnings", join(serverDir, "index.ts")], {
       cwd: join(serverDir, ".."), stdio: ["ignore", "pipe", "pipe"],
       env: { HOME: home, USERPROFILE: home, PATH: process.env.PATH, OMB_EXTRA_PATH: bin,
+        // Container runtimes are off for the harness except the fixture above,
+        // which runs by absolute path so PATH can never reach the real docker.
+        ...containerRuntimeLockdownEnv(), BOTFLEET_CONTAINER_RUNTIME_FIXTURE_DIR: bin,
         OMB_PORT: String(port), OMB_WEBHOOK_PORT: String(39000 + Math.floor(Math.random() * 10000)),
         OMB_DISABLE_ANTIGRAVITY_QUOTA: "1", VITEST: "1" },
     });
@@ -107,7 +121,7 @@ fs.appendFileSync(path.join(home, "runtime.log"), args.join(" ") + "\\n");
     hold();
     const mode = api("POST", "/api/local-computer/mode", { mode: "per-bot" });
     try {
-      await expect.poll(() => existsSync(entered), { timeout: 10000 }).toBe(true);
+      await waitForHeldGateLogSettled();
       const before = readFileSync(log, "utf8");
       expect((await api("DELETE", `/api/bots/${bot.id}`)).status).toBe(409);
       expect((await api("GET", "/api/bots")).body.bots.some((item: any) => item.id === bot.id)).toBe(true);
@@ -118,7 +132,7 @@ fs.appendFileSync(path.join(home, "runtime.log"), args.join(" ") + "\\n");
     } finally { release(); await mode; }
     expect((await mode).status).toBe(200);
     expect((await api("DELETE", `/api/bots/${bot.id}`)).status).toBe(200);
-  });
+  }, 30_000);
 
   it("refuses mode changes while deletion owns a target fence, then permits retry", async () => {
     // Establish this case's own starting mode.  It must not depend on the
@@ -128,7 +142,7 @@ fs.appendFileSync(path.join(home, "runtime.log"), args.join(" ") + "\\n");
     hold();
     const deletion = api("DELETE", `/api/bots/${bot.id}`);
     try {
-      await expect.poll(() => existsSync(entered), { timeout: 10000 }).toBe(true);
+      await waitForHeldGateLogSettled();
       const before = readFileSync(log, "utf8");
       expect((await api("POST", "/api/local-computer/mode", { mode: "shared" })).status).toBe(409);
       // Same contract as the deletion fence case above.

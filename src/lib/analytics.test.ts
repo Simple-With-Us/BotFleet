@@ -190,6 +190,31 @@ describe("PostHog capture gate and queue", () => {
     expect(fakeCapture).not.toHaveBeenCalled();
   });
 
+  it("pins every remotely-controlled capture arm off in the init options", async () => {
+    // S14: without these pins a PostHog project-side toggle would start
+    // recording conversation text without an app release.
+    vi.resetModules();
+    const fresh = await import("./analytics");
+    fresh.setPostHogLoaderForTests(() => new Promise((resolve) => { resolveLoad = resolve; }));
+
+    fresh.initAnalytics();
+    resolveLoad?.(fakeClient);
+    await settle();
+
+    expect(fakeInit).toHaveBeenCalledTimes(1);
+    expect(fakeInit).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({
+        autocapture: false,
+        capture_pageview: false,
+        disable_session_recording: true,
+        capture_exceptions: false,
+        enable_heatmaps: false,
+        capture_dead_clicks: false,
+      }),
+    );
+  });
+
   it("drops track() outright when nothing has ever called initAnalytics()", async () => {
     vi.resetModules();
     const fresh = await import("./analytics");

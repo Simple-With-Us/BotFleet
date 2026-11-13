@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 sentry-ci-report.py — reports CI workflow outcomes to the shared fleet-infra
-Sentry project (org jays-services), via raw envelope HTTP (no sentry-sdk
+Sentry project (org simple-with-us), via raw envelope HTTP (no sentry-sdk
 dependency, no GitHub Actions marketplace action).
 
 Invoked by .github/workflows/sentry-ci-report.yml, which listens for
@@ -16,11 +16,14 @@ Two independent signals are sent per completed run:
      {app, workflow, branch, actor}, carrying the run URL, fingerprinted on
      [ci-failure, app, workflow] so every failure of one workflow groups into
      ONE Sentry issue instead of paging separately every time.
-  2. If the run was schedule-triggered (event == "schedule"): a Sentry Crons
-     check-in (status "ok" on success, "error" otherwise) with an upsert
-     monitor_config whose schedule mirrors that workflow's own cron
-     expression (see CRON_SCHEDULES below) so a nightly/weekly job that
-     silently STOPS running raises a missed-check-in alert.
+  2. A Sentry Crons check-in (status "ok" on success, "error" on failure)
+     with an upsert monitor_config whose schedule mirrors that workflow's
+     own cron expression (see CRON_SCHEDULES below) so a job that silently
+     STOPS running raises a missed-check-in alert.  Schedule-only workflows
+     check in only for a cron tick.  A production heartbeat (see
+     PRODUCTION_HEARTBEAT_WORKFLOWS) also checks in when the same job
+     finishes on main from workflow_run or workflow_dispatch, because
+     GitHub drops an hourly tick that is delayed past the next hour.
 
 The branch is deliberately NOT part of the fingerprint (it was until
 2026-08-12).  Branch names are unbounded and short-lived, so including one
@@ -33,7 +36,7 @@ event), which is where unbounded-cardinality data belongs.
 The `app` tag + fingerprint component are required: fleet-infra is shared
 across repos, and this repo may share workflow names ("CI", "Security",
 "Effort Issues Sync") with peer apps, so without `app` a "CI" failure here
-would dedup into the same Sentry issue as one there.  Per AGENT-SYNC.md
+would dedup into the same Sentry issue as one there.  Per FLEET-PROTOCOL.md
 "Observability", every event is tagged with `app:<repo>`.
 
 Secrets: SENTRY_FLEET_DSN is read only from the environment (set by the
@@ -68,9 +71,20 @@ APP = "botfleet"
 # also runs its full matrix weekly so documentation-only fast paths cannot
 # conceal dependency or runner drift between code changes.
 CRON_SCHEDULES = {
+    "Vercel production catch-up": "41 * * * *",
     "CI": "17 9 * * 1",
     "iOS TestFlight ship (GitHub-hosted macOS)": "18,48 * * * *",
 }
+
+# Workflows whose production job also runs outside the cron tick.  GitHub
+# drops an hourly schedule when the tick is delayed past the next hour, and
+# the catch-up workflow's real runs are mostly `workflow_run` completions of
+# CI on main.  Those successes used to send no check-in, so Sentry recorded
+# a missed hour for a job that had already succeeded.  A check-in for one of
+# these names is sent for a main-branch schedule, workflow_run, or
+# workflow_dispatch completion.  Every other scheduled workflow stays
+# schedule-only, so a push cannot mark its weekly monitor ok.
+PRODUCTION_HEARTBEAT_WORKFLOWS = frozenset({"Vercel production catch-up"})
 
 # checkin_margin (minutes): how long after the scheduled trigger time Sentry
 # waits before flagging a missed check-in.  This reporter only ever reports
@@ -83,9 +97,9 @@ CRON_SCHEDULES = {
 # in a couple of minutes; override per-workflow below for anything slower.
 DEFAULT_CHECKIN_MARGIN_MINUTES = 15
 CRON_CHECKIN_MARGIN_OVERRIDES = {
-    # ci.yml's longest job has timeout-minutes: 25; +20 for queueing, the
-    # classifier, and this reporter's own dispatch/run time.
-    "CI": 45,
+    "Vercel production catch-up": 75,
+    # ci.yml's longest job is macOS 35m; preserve its 20m queueing/reporter buffer.
+    "CI": 55,
     # ios-ship.yml's job sets `timeout-minutes: 90`; +15 for queueing and
     # this reporter's own dispatch/run time.
     "iOS TestFlight ship (GitHub-hosted macOS)": 105,
@@ -107,6 +121,7 @@ _CRON_CHECKIN_MARGIN_FOLDED = {
 #      the workflow files in this repo, and main() reports a mismatch to Sentry
 #      (a real issue in fleet-infra), not just to the job log.
 _CRON_SCHEDULES_FOLDED = {name.casefold(): expr for name, expr in CRON_SCHEDULES.items()}
+_HEARTBEAT_FOLDED = {name.casefold() for name in PRODUCTION_HEARTBEAT_WORKFLOWS}
 
 # Where the observed workflows live, resolved from this file rather than the
 # process CWD so the guard works regardless of how the script is invoked.
@@ -248,6 +263,33 @@ def send_config_drift_event(
     send_envelope(envelope_url, auth_header, "event", payload)
 
 
+def cron_checkin_status(workflow_name: str, event: str, branch: str, conclusion: str) -> str | None:
+    """`ok`, `error`, or None when this completion must not check in.
+
+    Schedule-only workflows keep the historical rule: every schedule
+    completion checks in, and anything other than success is `error`.
+    A production heartbeat also checks in when the same job finishes on
+    main from `workflow_run` or `workflow_dispatch`.  Cancelled and skipped
+    heartbeat runs check in as nothing, so a dropped duplicate does not
+    invent a failure and does not count as a success.
+    """
+    if workflow_name.casefold() not in _CRON_SCHEDULES_FOLDED:
+        return None
+    if event == "schedule" and workflow_name.casefold() not in _HEARTBEAT_FOLDED:
+        return "ok" if conclusion == "success" else "error"
+    if (
+        workflow_name.casefold() in _HEARTBEAT_FOLDED
+        and event in {"schedule", "workflow_run", "workflow_dispatch"}
+        and branch == "main"
+    ):
+        if conclusion == "success":
+            return "ok"
+        if conclusion in ALERT_CONCLUSIONS:
+            return "error"
+        return None
+    return None
+
+
 def main() -> int:
     dsn = os.environ.get("SENTRY_FLEET_DSN", "").strip()
     workflow_name = os.environ.get("WORKFLOW_NAME", "unknown")
@@ -316,12 +358,17 @@ def main() -> int:
     else:
         print(f"Workflow '{workflow_name}' concluded '{conclusion}' (no alert); no error event sent.")
 
-    # ── 2. Cron check-in (only for schedule-triggered runs) ─────────────────
-    if event == "schedule":
+    # ── 2. Cron check-in ────────────────────────────────────────────────────
+    # Schedule-only workflows check in only for a cron tick.  A production
+    # heartbeat also checks in when the same job finishes on main by another
+    # trigger, so a skipped GitHub cron hour is not a miss when the job ran.
+    checkin_status = cron_checkin_status(workflow_name, event, branch, conclusion)
+    if checkin_status is None and event == "schedule":
         # Case-folded lookup: a workflow rename that only changes capitalisation
         # must never again silently detach a job from its Crons monitor.
-        cron_expr = _CRON_SCHEDULES_FOLDED.get(workflow_name.casefold())
-        if not cron_expr:
+        # cron_checkin_status already returns None for an unmapped name, and
+        # for a heartbeat completion that was cancelled or skipped.
+        if workflow_name.casefold() not in _CRON_SCHEDULES_FOLDED:
             print(
                 f"::warning::Schedule-triggered run for '{workflow_name}' has no known cron "
                 "expression mapped in CRON_SCHEDULES; skipping check-in."
@@ -336,7 +383,20 @@ def main() -> int:
                 {"workflow": workflow_name, "run_url": run_url, "run_id": run_id},
             )
         else:
-            checkin_status = "ok" if conclusion == "success" else "error"
+            print(
+                f"Workflow '{workflow_name}' schedule run concluded '{conclusion}'; "
+                "no cron check-in sent."
+            )
+    elif checkin_status is None:
+        print(f"Workflow '{workflow_name}' was triggered by '{event}' (not a cron check-in); no cron check-in sent.")
+    else:
+        cron_expr = _CRON_SCHEDULES_FOLDED.get(workflow_name.casefold())
+        if not cron_expr:
+            print(
+                f"::warning::Run for '{workflow_name}' has no known cron "
+                "expression mapped in CRON_SCHEDULES; skipping check-in."
+            )
+        else:
             slug = monitor_slug(APP, workflow_name)
             checkin_margin = _CRON_CHECKIN_MARGIN_FOLDED.get(
                 workflow_name.casefold(), DEFAULT_CHECKIN_MARGIN_MINUTES
@@ -354,8 +414,6 @@ def main() -> int:
             }
             send_envelope(envelope_url, auth_header, "check_in", checkin_payload)
             print(f"Sent Sentry Crons check-in '{checkin_status}' for monitor '{slug}' (workflow '{workflow_name}').")
-    else:
-        print(f"Workflow '{workflow_name}' was triggered by '{event}' (not schedule); no cron check-in sent.")
 
     return 0
 

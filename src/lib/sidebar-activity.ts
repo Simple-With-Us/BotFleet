@@ -22,15 +22,19 @@
 //     queueDelegation: "Delegated to @X…", prose-only) — while the bot is
 //     still busy and that chip is the last thing in its active thread, it
 //     is almost certainly still waiting on that reply.
-import type { Bot, Message, OptionCardData } from "@/state/store";
+import type { Bot, Group, Message, OptionCardData } from "@/state/store";
 
 export type BotWaitReason =
   | { kind: "teammate"; name: string }
   | { kind: "approval" }
   | { kind: "question" };
 
+export type BotLocation =
+  | { kind: "group"; id: string; name: string }
+  | { kind: "task"; threadId: string; title: string };
+
 const MESSAGED_PREFIX = "Messaged @";
-const DELEGATED_PREFIX = "Delegated to @";
+const HANDOFF_PREFIXES = ["Delegated to @", "Handed to @"];
 
 /** The still-open card at the tail of a thread, if any. Answered/dismissed
  * cards are not open — the harness only ever pauses a bot for a LIVE ask. */
@@ -44,7 +48,7 @@ function openCardOf(last: Message | undefined): OptionCardData | undefined {
  * — never parsed out of the card's prose title, which is copy and may
  * change under it. */
 function peerApprovalTeammate(card: OptionCardData | undefined, bots: Bot[]): string | undefined {
-  if (card?.tool !== "ask_bot" && card?.tool !== "delegate_bot") return undefined;
+  if (card?.tool !== "ask_bot" && card?.tool !== "delegate_bot" && card?.tool !== "coordinate_bots") return undefined;
   const targetId = card.allowKey?.split(":")[1];
   return targetId ? bots.find((bot) => bot.id === targetId)?.name : undefined;
 }
@@ -57,8 +61,9 @@ function outboundTeammate(last: Message | undefined, bots: Bot[]): string | unde
   const name = last.tool?.name;
   if (!name) return undefined;
   if (last.comm && name.startsWith(MESSAGED_PREFIX)) return last.comm.withName;
-  if (name.startsWith(DELEGATED_PREFIX)) {
-    const label = name.slice(DELEGATED_PREFIX.length).split(/[:\n]/, 1)[0]?.trim();
+  const prefix = HANDOFF_PREFIXES.find((item) => name.startsWith(item));
+  if (prefix) {
+    const label = name.slice(prefix.length).split(/[:\n]/, 1)[0]?.trim();
     return label && bots.some((bot) => bot.name === label) ? label : undefined;
   }
   return undefined;
@@ -82,13 +87,55 @@ export function botWaitReason(bot: Bot, last: Message | undefined, bots: Bot[]):
   return null;
 }
 
+/** Where a bot is currently active or speaking.
+ *
+ * Prioritizes active group/channel presence (`group.busyBotId === bot.id`)
+ * so channel members or Director working inside a room are immediately
+ * identified with that channel. For busy bots working on a distinct named
+ * task, identifies the task title.
+ */
+export function botActivityLocation(
+  bot: Bot,
+  groups?: Array<Pick<Group, "id" | "name" | "busyBotId">>,
+): BotLocation | null {
+  if (groups && groups.length > 0) {
+    const activeGroup = groups.find((g) => g.busyBotId === bot.id);
+    if (activeGroup) {
+      return { kind: "group", id: activeGroup.id, name: activeGroup.name };
+    }
+  }
+  if (bot.busy || bot.activity === "working" || bot.activity === "waiting-on-you") {
+    if (bot.tasks && bot.tasks.length > 0) {
+      const activeTask = bot.tasks.find((t) => t.threadId === bot.threadId);
+      if (activeTask && activeTask.title && activeTask.title !== "Inbox" && activeTask.title !== "New Task") {
+        return { kind: "task", threadId: activeTask.threadId, title: activeTask.title };
+      }
+    }
+  }
+  return null;
+}
+
 /** The roster row's status text — ported 1:1 from upstream's own copy
  * choices for "waiting" vs "working", split further for approval vs
- * question. Falls back to the pre-existing "Working…" for a plain busy
- * bot with nothing more specific to report, and "" when idle. */
-export function botStatusText(bot: Bot, wait: BotWaitReason | null): string {
+ * question. When a location is provided (e.g. channel or task), it clarifies
+ * where the bot is busy or waiting. Falls back to the pre-existing "Working…"
+ * for a plain busy bot with nothing more specific to report, and "" when idle. */
+export function botStatusText(
+  bot: Bot,
+  wait: BotWaitReason | null,
+  location?: BotLocation | null,
+): string {
   if (wait?.kind === "teammate") return `Waiting on @${wait.name}…`;
-  if (wait?.kind === "approval") return "Waiting for approval…";
-  if (wait?.kind === "question") return "Waiting for you…";
-  return bot.busy ? "Working…" : "";
+  if (wait?.kind === "approval") {
+    return location?.kind === "group" ? `#${location.name} (needs approval)` : "Waiting for approval…";
+  }
+  if (wait?.kind === "question") {
+    return location?.kind === "group" ? `#${location.name} (waiting on you)` : "Waiting for you…";
+  }
+  if (bot.busy) {
+    if (location?.kind === "group") return `#${location.name} (working)`;
+    if (location?.kind === "task") return `Working on ${location.title}…`;
+    return "Working…";
+  }
+  return "";
 }
