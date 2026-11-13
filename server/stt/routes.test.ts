@@ -48,10 +48,13 @@ describe("STT request schemas", () => {
     expect(SttFileRequestSchema.safeParse({ audioBase64: "AAAA" }).success).toBe(true);
   });
 
-  it("accepts a keyterm longer than 50 characters, matching parseKeyterms", () => {
-    const term = "A".repeat(80);
-    expect(SttSessionRequestSchema.safeParse({ keyterms: [term] }).success).toBe(true);
-    expect(SttFileRequestSchema.safeParse({ audioBase64: "AAAA", keyterms: [term] }).success).toBe(true);
+  it("accepts a keyterm up to 512 characters and rejects a longer one", () => {
+    const allowed = "A".repeat(512);
+    const tooLong = "A".repeat(513);
+    expect(SttSessionRequestSchema.safeParse({ keyterms: [allowed] }).success).toBe(true);
+    expect(SttSessionRequestSchema.safeParse({ keyterms: [tooLong] }).success).toBe(false);
+    expect(SttFileRequestSchema.safeParse({ audioBase64: "AAAA", keyterms: [allowed] }).success).toBe(true);
+    expect(SttFileRequestSchema.safeParse({ audioBase64: "AAAA", keyterms: [tooLong] }).success).toBe(false);
   });
 });
 

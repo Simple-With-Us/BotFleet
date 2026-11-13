@@ -25,6 +25,7 @@ interface LiveSession {
 
 const MAX_SESSIONS = 8;
 const IDLE_MS = 8 * 60 * 1000;
+const FINISHED_GRACE_MS = 8_000;
 const sessions = new Map<string, LiveSession>();
 
 function emit(live: LiveSession, event: SttSessionEvent): void {
@@ -37,10 +38,20 @@ function emit(live: LiveSession, event: SttSessionEvent): void {
   }
 }
 
+function warnSessionCleanupFailure(error: Error): void {
+  console.warn(error instanceof Error ? (error.stack ?? error.message) : "Could not clean up the speech-to-text session.");
+}
+
 function dropLater(id: string, reason: "idle" | "stop"): void {
-  void drop(id, reason).catch(() => {
-    console.error("Could not clean up the speech-to-text session.");
-  });
+  void drop(id, reason).catch(warnSessionCleanupFailure);
+}
+
+function markFinished(id: string): void {
+  const live = sessions.get(id);
+  if (!live) return;
+  live.finished = true;
+  clearTimeout(live.timer);
+  live.timer = setTimeout(() => { dropLater(id, "stop"); }, FINISHED_GRACE_MS);
 }
 
 function touch(live: LiveSession): void {
@@ -84,16 +95,13 @@ export async function createXaiSttSession(options: CreateXaiSessionOptions): Pro
       deliver({ type: "partial", text, final });
     },
     onDone: (duration) => {
-      // Keep the session until the client stops it or the idle timer fires,
-      // so a trailing audio POST or stop() after the vendor final does not
-      // look like a missing session.
-      const live = sessions.get(id);
-      if (live) live.finished = true;
+      // Keep the session briefly so a trailing stop() can still succeed,
+      // then reclaim the slot instead of waiting out the full idle timer.
+      markFinished(id);
       deliver({ type: "done", duration });
     },
     onError: (message) => {
-      const live = sessions.get(id);
-      if (live) live.finished = true;
+      markFinished(id);
       deliver({ type: "error", message });
     },
   }, { openSocket: options.openSocket });
@@ -116,8 +124,7 @@ export function hasXaiSttSession(id: string): boolean {
 
 export function appendXaiSttAudio(id: string, bytes: Uint8Array): boolean {
   const live = sessions.get(id);
-  if (!live) return false;
-  if (live.finished) return true;
+  if (!live || live.finished) return false;
   touch(live);
   live.stream.sendAudio(bytes);
   return true;

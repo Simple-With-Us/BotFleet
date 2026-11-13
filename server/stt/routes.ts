@@ -33,12 +33,12 @@ export const SttFileRequestSchema = z.object({
   filename: z.string().max(255).optional(),
   mime: z.string().max(127).optional(),
   language: z.string().max(32).optional(),
-  keyterms: z.array(z.string()).max(100).optional(),
+  keyterms: z.array(z.string().max(512)).max(100).optional(),
 }).strict();
 
 export const SttSessionRequestSchema = z.object({
   language: z.string().max(32).optional(),
-  keyterms: z.array(z.string()).max(100).optional(),
+  keyterms: z.array(z.string().max(512)).max(100).optional(),
   endpointMs: z.number().finite().max(60_000).optional(),
 }).strict();
 

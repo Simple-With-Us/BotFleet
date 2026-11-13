@@ -129,9 +129,15 @@ export async function startXaiTranscription({
   const sessionId = created.sessionId;
 
   let stopping = false;
+  let vendorDone = false;
+  const reportSendError = (error: Error) => {
+    onError(error instanceof Error ? error.message : "Could not send audio to xAI dictation.");
+  };
   const unsubscribe = io.subscribe(sessionId, (event) => {
     if (event.type === "partial" && event.text.trim()) {
       onTurn({ text: event.text, final: event.final });
+    } else if (event.type === "done") {
+      vendorDone = true;
     } else if (event.type === "error" && !stopping) {
       onError(event.message || "xAI dictation failed.");
     }
@@ -155,18 +161,24 @@ export async function startXaiTranscription({
       packed.set(chunk, offset);
       offset += chunk.byteLength;
     }
-    await io.postAudio(sessionId, packed.buffer);
+    try {
+      await io.postAudio(sessionId, packed.buffer);
+    } catch (error) {
+      // A 404 after the vendor has already finished is expected and must
+      // not fail the send chain.  Other post failures still propagate so
+      // stop() can report them and flush whatever remains.
+      if (vendorDone) return;
+      throw error;
+    }
   };
 
   const enqueueAudio = (payload: ArrayBuffer) => {
-    if (stopping || !payload.byteLength) return;
+    if (stopping || vendorDone || !payload.byteLength) return;
     chunks.push(new Uint8Array(payload));
     if (!flushTimer) {
       flushTimer = setTimeout(() => {
         flushTimer = null;
-        sending = sending.then(flushAudio).catch((error) => {
-          if (!stopping) onError(error instanceof Error ? error.message : String(error));
-        });
+        sending = sending.then(flushAudio).catch(reportSendError);
       }, 150);
     }
   };
@@ -177,6 +189,8 @@ export async function startXaiTranscription({
   } catch (error) {
     try {
       await io.stopSession(sessionId);
+    } catch {
+      // Keep the original attach failure; a later stop error must not mask it.
     } finally {
       unsubscribe();
     }
@@ -192,8 +206,12 @@ export async function startXaiTranscription({
         clearTimeout(flushTimer);
         flushTimer = null;
       }
-      sending = sending.then(flushAudio);
-      await sending.catch(() => {});
+      sending = sending.catch(reportSendError).then(flushAudio);
+      try {
+        await sending;
+      } catch (error) {
+        reportSendError(error instanceof Error ? error : new Error("Could not send audio to xAI dictation."));
+      }
       try {
         await io.stopSession(sessionId);
       } finally {

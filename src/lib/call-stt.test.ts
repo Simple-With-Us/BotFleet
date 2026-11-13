@@ -205,4 +205,29 @@ describe("xAI STT lifecycle", () => {
     expect(transcript).toHaveBeenCalledWith({ text: "After restart.", partial: false });
     await session.stop();
   });
+
+  it("does not apply a stopped session's turns after a restart", async () => {
+    setup();
+    const turns: Array<(value: { text: string; final: boolean }) => void> = [];
+    const firstDrain = deferred<void>();
+    const session = createXaiSTTSession(async (opts) => {
+      turns.push(opts.onTurn);
+      if (turns.length === 1) {
+        return { stop: () => firstDrain.promise };
+      }
+      return { stop: async () => {} };
+    });
+    const transcript = vi.fn();
+    session.onTranscript(transcript);
+    await session.start();
+    const stopping = session.stop();
+    await session.start();
+    firstDrain.resolve();
+    await stopping;
+    turns[0]!({ text: "Stale final.", final: true });
+    expect(transcript).not.toHaveBeenCalledWith({ text: "Stale final.", partial: false });
+    turns[1]!({ text: "Fresh final.", final: true });
+    expect(transcript).toHaveBeenCalledWith({ text: "Fresh final.", partial: false });
+    await session.stop();
+  });
 });

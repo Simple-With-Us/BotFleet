@@ -7,6 +7,7 @@ import type { AuthorizedWs, AuthorizedWsHandlers } from "./authorized-ws.ts";
 import type { XaiSttServerEvent } from "../../shared/xai-stt.ts";
 
 afterEach(async () => {
+  vi.useRealTimers();
   await resetXaiSttSessions();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
@@ -172,9 +173,20 @@ describe("session store", () => {
     fake.hangup();
     await Promise.resolve();
     expect(events.some((event) => event.type === "done")).toBe(true);
-    expect(appendXaiSttAudio(id, new Uint8Array([1]))).toBe(true);
+    expect(appendXaiSttAudio(id, new Uint8Array([1]))).toBe(false);
     expect(fake.sentBinary).toHaveLength(sentBefore);
     expect(await stopXaiSttSession(id)).toBe(true);
     expect(appendXaiSttAudio(id, new Uint8Array([1]))).toBe(false);
+  });
+
+  it("drops a finished session once the grace period elapses", async () => {
+    const fake = fakeSocket();
+    const id = await createXaiSttSession({ apiKey: "sk-test", params: { language: "en" }, openSocket: fake.open });
+    vi.useFakeTimers();
+    fake.hangup();
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(8_000);
+    expect(appendXaiSttAudio(id, new Uint8Array([1]))).toBe(false);
+    expect(await stopXaiSttSession(id)).toBe(false);
   });
 });

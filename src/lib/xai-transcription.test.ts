@@ -149,3 +149,71 @@ describe("startXaiTranscription", () => {
     expect(order).toEqual(["capture-stop", "stop", "unsub"]);
   });
 
+  it("recovers a rejected send chain so the final flush still runs", async () => {
+    vi.useFakeTimers();
+    const posts: number[] = [];
+    const errors: string[] = [];
+    let onPcm: ((bytes: ArrayBuffer) => void) | undefined;
+    let releaseFirst: (() => void) | undefined;
+    const firstPost = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    let postCount = 0;
+    const session = await startXaiTranscription({
+      stream: { getTracks: () => [] },
+      onTurn: vi.fn(),
+      onError: (message) => { errors.push(message); },
+      language: "en",
+      deps: {
+        createSession: async () => ({ sessionId: "sess-recover" }),
+        postAudio: async (_id, bytes) => {
+          postCount += 1;
+          posts.push(bytes.byteLength);
+          if (postCount === 1) {
+            await firstPost;
+            throw new Error("first post failed");
+          }
+        },
+        stopSession: async () => {},
+        subscribe: () => () => {},
+        attachCapture: async (_stream, send) => {
+          onPcm = send;
+          return { stop: async () => {} };
+        },
+      },
+    });
+    onPcm?.(new Uint8Array([1, 2]).buffer);
+    vi.advanceTimersByTime(150);
+    await Promise.resolve();
+    await Promise.resolve();
+    onPcm?.(new Uint8Array([3, 4, 5, 6]).buffer);
+    const stopping = session.stop();
+    releaseFirst?.();
+    await stopping;
+    vi.useRealTimers();
+    expect(errors).toEqual(["first post failed"]);
+    expect(posts).toEqual([2, 4]);
+  });
+
+  it("rethrows the attach failure when stopSession also rejects", async () => {
+    const order: string[] = [];
+    const starting = startXaiTranscription({
+      stream: { getTracks: () => [] },
+      onTurn: vi.fn(),
+      onError: vi.fn(),
+      language: "en",
+      deps: {
+        createSession: async () => ({ sessionId: "sess-attach" }),
+        postAudio: async () => {},
+        stopSession: async () => {
+          order.push("stop");
+          throw new Error("stop failed");
+        },
+        subscribe: () => () => { order.push("unsub"); },
+        attachCapture: async () => {
+          throw new Error("mic failed");
+        },
+      },
+    });
+    await expect(starting).rejects.toThrow(/mic failed/);
+    expect(order).toEqual(["stop", "unsub"]);
+  });
+
