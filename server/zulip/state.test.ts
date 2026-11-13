@@ -1,6 +1,6 @@
 import { chmodSync, existsSync, lstatSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, relative } from "node:path";
+import { basename, join, relative } from "node:path";
 import { describe, expect, it } from "vitest";
 import { ZulipStateStore, emptyState, stateFileSchema } from "./state.ts";
 
@@ -63,15 +63,16 @@ describe("ZulipStateStore write-path policy", () => {
     // The backing tree lives in tmpdir; only a gitignored SYMLINK sits in
     // the checkout, so a killed run leaves one inert dangling link at most
     // (gitignored - the dirty-worktree gate never sees it) rather than
-    // scratch data in the tracked tree.  Each run owns exactly one
-    // pid-named entry and removes only that entry, never a parallel run's.
-    // The relative root through that link has no leading "..": a raw split
-    // seeded at the filesystem root would check "/<name>" (absent) and
-    // misclassify the hostile path as genuine absence - this pin fails
-    // without the resolve() anchoring.
+    // scratch data in the tracked tree.  The exposure takes its name from
+    // the uniquely-created backing directory, so it cannot collide with a
+    // concurrent run's entry (not even pid-recycling containers sharing a
+    // bind-mount) and each run removes only its own.  The relative root
+    // through that link has no leading "..": a raw split seeded at the
+    // filesystem root would check "/<name>" (absent) and misclassify the
+    // hostile path as genuine absence - this pin fails without the
+    // resolve() anchoring.
     const base = mkdtempSync(join(tmpdir(), "zulip-store-rel-backing-"));
-    const exposure = join(process.cwd(), `.zulip-store-rel-test-${process.pid}`);
-    rmSync(exposure, { force: true });
+    const exposure = join(process.cwd(), `.zulip-store-rel-test-${basename(base)}`);
     symlinkSync(base, exposure);
     symlinkSync(join(base, "no-such-target"), join(base, "link"));
     const root = relative(process.cwd(), join(exposure, "link", "root"));
