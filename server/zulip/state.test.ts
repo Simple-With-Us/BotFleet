@@ -60,15 +60,22 @@ describe("ZulipStateStore write-path policy", () => {
   });
 
   it("refuses a dangling symlink above a RELATIVE data root", () => {
-    const base = mkdtempSync(join(tmpdir(), "zulip-store-rel-dangling-"));
+    // The fixture lives UNDER the process cwd so the relative root has no
+    // leading "..": a raw split seeded at the filesystem root would check
+    // "/<dirname>" (absent) and misclassify the hostile path as genuine
+    // absence - this pin fails without the resolve() anchoring.
+    const base = mkdtempSync(join(process.cwd(), ".zulip-store-rel-test-"));
     symlinkSync(join(base, "no-such-target"), join(base, "link"));
     const root = relative(process.cwd(), join(base, "link", "root"));
     try {
       const store = new ZulipStateStore(root);
       // A relative configured root resolves against the process cwd; the
       // dangling-link classification must inspect THAT path, not a
-      // same-named tree under the filesystem root.
+      // same-named tree under the filesystem root.  Load AND save refuse,
+      // and the save creates nothing through the link.
       expect(() => store.load("bot-plumber", "BF-Plumber")).toThrow();
+      expect(() => store.save("bot-plumber", emptyState("BF-Plumber"))).toThrow(/dangling|does not resolve to a directory/);
+      expect(existsSync(join(base, "no-such-target"))).toBe(false);
     } finally {
       rmSync(base, { recursive: true, force: true });
     }

@@ -552,9 +552,13 @@ export class ZulipStateStore {
   }
 
   private verifyArchiveAncestors(path: string): void {
-    // The configured data root may itself be a user-owned alias (supported:
-    // server/host-id.ts resolves it with realpathSync), so canonicalize the
-    // root and police only the components the app creates below it.  A
+    // The configured data root may itself be a user-owned alias, so
+    // canonicalize the root and police only the components the app
+    // creates below it.  No absoluteness contract exists upstream:
+    // server/data-dir.ts returns a non-blank OMB_DATA_DIR verbatim
+    // (relative roots are possible) and server/host-id.ts canonicalizes
+    // only for its own reads - each consumer anchors the root itself
+    // (stateGenuinelyAbsent resolve()s before walking).  A
     // symlink there is followed only when root-owned and resolving to a
     // directory (the /var -> /private/var pattern); anything else that is
     // not a plain directory refuses the write.  A missing component is
