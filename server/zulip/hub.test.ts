@@ -1,7 +1,7 @@
 // The Zulip source end to end against a fake Zulip server: real HTTP, real
 // event queues, real files on disk, and a fake `startTurn` standing in for
 // the harness.  Each test boots its own fake realm and its own data folder.
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -1238,6 +1238,37 @@ describe("DMs out", () => {
     expect(archive).toMatch(/terminal 1"/);
     expect(archive).not.toMatch(/terminal 2"/);
     await waitFor(() => logs.some((line) => line.includes("private notices archive")), "the content-free archive warning");
+  });
+
+  it("keeps a bot down and loud when its state load fails, never degrading to a fresh state", async () => {
+    settings.budgets = { dmsPerHour: 0 };
+    const hub = makeHub();
+    await connected(hub);
+    expect((await dm(hub, JAY, "kept notice")).ok).toBe(false);
+    expect(sessionOf(hub).state.notices).toHaveLength(1);
+    await hub.stop();
+    // one invalid entry, and an unwritable archive path (a directory)
+    const file = join(dataDir, "zulip", "bot-plumber.json");
+    const stored = JSON.parse(readFileSync(file, "utf8"));
+    stored.notices.push({ at: "RAW_MARKER_QQ", marker: "RAW_MARKER_QQ" });
+    writeFileSync(file, JSON.stringify(stored));
+    mkdirSync(join(dataDir, "zulip", "bot-plumber.notices-archive.jsonl"));
+    const before = readFileSync(file, "utf8");
+    const again = makeHub();
+    await waitFor(() => logs.some((line) => line.includes("state load failed")), "the loud load failure");
+    expect(botStatus(again, "bot-plumber")).toBeUndefined();
+    // the state file was never overwritten, evidence and all
+    expect(readFileSync(file, "utf8")).toBe(before);
+    expect(logs.join("\n")).not.toMatch(/RAW_MARKER_QQ/);
+    // fix the archive path: the next reconcile boots the bot with state intact
+    rmSync(join(dataDir, "zulip", "bot-plumber.notices-archive.jsonl"), { recursive: true });
+    (again as unknown as { reconcile(): void }).reconcile();
+    await connected(again);
+    const notices = sessionOf(again).state.notices;
+    expect(notices.map((n) => n.text)).toEqual(["kept notice"]);
+    expect(sessionOf(again).state.noticesDroppedOnLoad).toBe(1);
+    const archive = readFileSync(join(dataDir, "zulip", "bot-plumber.notices-archive.jsonl"), "utf8");
+    expect(archive).toMatch(/RAW_MARKER_QQ/);
   });
 });
 

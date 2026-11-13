@@ -1019,7 +1019,18 @@ export class ZulipHub {
     }
     for (const [botId, next] of wanted) {
       if (this.sessions.has(botId) || this.stopping.has(botId)) continue;
-      const session = new ZulipSession(this, botId, next.role, realm, next.credentialRole);
+      let session: ZulipSession;
+      try {
+        session = new ZulipSession(this, botId, next.role, realm, next.credentialRole);
+      } catch (error) {
+        // A state-load failure (for example the notices archive is
+        // unwritable) must never degrade to a fresh empty state: that bot
+        // stays down and loud until the store works, its state file left
+        // untouched, while the other bots keep running.  The next reconcile
+        // retries it.
+        this.log(`[zulip] ${next.role}: not started - state load failed, state file left untouched: ${describe(error)}`);
+        continue;
+      }
       this.sessions.set(botId, session);
       session.start();
     }
