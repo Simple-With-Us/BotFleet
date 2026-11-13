@@ -639,6 +639,7 @@ class ZulipSession {
       if (prior.noticesDroppedOnLoad !== undefined) this.state.noticesDroppedOnLoad = prior.noticesDroppedOnLoad;
       if (prior.noticesArchived !== undefined) this.state.noticesArchived = prior.noticesArchived;
       if (prior.pendingDroppedOnLoad !== undefined) this.state.pendingDroppedOnLoad = prior.pendingDroppedOnLoad;
+      if (prior.stateQuarantinedOnLoad !== undefined) this.state.stateQuarantinedOnLoad = prior.stateQuarantinedOnLoad;
       this.seedSeen();
     }
     this.state.userId = me.user_id;
@@ -1606,10 +1607,10 @@ export class ZulipHub {
   /** Per-session watermark for the loss counters already surfaced in the
    *  log: each new session logs once per increase, so a boot after a lossy
    *  load or prune says so.  Content-free by construction: counts only. */
-  private noticeLossReported = new WeakMap<ZulipSession, { dropped: number; archived: number; pendingDropped: number }>();
+  private noticeLossReported = new WeakMap<ZulipSession, { dropped: number; archived: number; pendingDropped: number; quarantined: number }>();
 
   private reportNoticeLoss(session: ZulipSession): void {
-    const seen = this.noticeLossReported.get(session) ?? { dropped: 0, archived: 0, pendingDropped: 0 };
+    const seen = this.noticeLossReported.get(session) ?? { dropped: 0, archived: 0, pendingDropped: 0, quarantined: 0 };
     const dropped = session.state.noticesDroppedOnLoad ?? 0;
     const archived = session.state.noticesArchived ?? 0;
     if (dropped > seen.dropped) {
@@ -1624,6 +1625,11 @@ export class ZulipHub {
     if (pendingDropped > seen.pendingDropped) {
       this.log(`[zulip] ${session.role}: ${pendingDropped} invalid pending unit${pendingDropped === 1 ? "" : "s"} quarantined on load; raw units preserved in the private notices archive, valid units kept`);
       seen.pendingDropped = pendingDropped;
+    }
+    const quarantined = session.state.stateQuarantinedOnLoad ?? 0;
+    if (quarantined > seen.quarantined) {
+      this.log(`[zulip] ${session.role}: ${quarantined} state-file quarantine${quarantined === 1 ? "" : "s"} recorded on load; raw originals preserved in the private notices archive, readable ledgers kept`);
+      seen.quarantined = quarantined;
     }
     this.noticeLossReported.set(session, seen);
   }

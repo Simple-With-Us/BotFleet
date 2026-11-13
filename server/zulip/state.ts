@@ -107,7 +107,7 @@ export const noticeEntrySchema = z.object({
 /** An owner DM the hourly cap refused, held for resend after the window. */
 export type ZulipPendingNotice = z.infer<typeof noticeEntrySchema>;
 
-export const stateFileSchema = z.object({
+const stateFileSchemaBase = z.object({
   version: z.literal(1),
   role: z.string(),
   userId: z.number().optional().catch(undefined),
@@ -140,7 +140,17 @@ export const stateFileSchema = z.object({
   // only, never the content: the durable flag that a load was lossy.  The
   // raw units themselves are preserved in the private archive file.
   pendingDroppedOnLoad: z.number().int().nonnegative().optional().catch(undefined),
-}).strict();
+  // Loads that had to quarantine state data (unknown keys set aside, or a
+  // whole file too damaged to trust): a durable count, content-free, so the
+  // loss is reported on the next drain instead of vanishing with the file.
+  stateQuarantinedOnLoad: z.number().int().nonnegative().optional().catch(undefined),
+});
+
+/** The strict boundary: unknown top-level keys FAIL the parse, they are
+ *  never silently stripped.  The lenient base above exists only so load()
+ *  can tell "unknown keys alone" (salvage the valid ledgers, quarantine the
+ *  drift) from real damage (quarantine the whole file). */
+export const stateFileSchema = stateFileSchemaBase.strict();
 
 /** The live state shape: exactly what stateFileSchema produces at the
  *  boundary. */
@@ -172,19 +182,48 @@ export class ZulipStateStore {
     try {
       rawJson = JSON.parse(text);
     } catch {
-      // A state file that does not parse at all is drift too: quarantine the
-      // raw text privately before the fresh start overwrites the file.
+      // A state file that does not parse at all cannot be salvaged:
+      // quarantine the raw text privately and fail closed - the fresh state
+      // carries the durable quarantine counter so the loss is reported
+      // content-free on the next drain instead of vanishing silently.
       this.archive(botId, "state-unparseable-on-load", [text]);
-      return emptyState(role);
+      const fresh = emptyState(role);
+      fresh.stateQuarantinedOnLoad = 1;
+      return fresh;
     }
-    const parsed = stateFileSchema.safeParse(rawJson);
+    let parsed = stateFileSchema.safeParse(rawJson);
+    let quarantinedUnknownKeys = false;
     if (!parsed.success) {
-      // Strict top-level keys: an unknown key now fails the whole file
-      // instead of being silently stripped.  The original is quarantined
-      // privately BEFORE the fresh start overwrites it - drift surfaces in
-      // the archive, never silently.
-      this.archive(botId, "state-schema-invalid-on-load", [rawJson]);
-      return emptyState(role);
+      // Two failure classes.  Unknown top-level keys ALONE (the lenient
+      // base still parses): quarantine the unsupported fields privately and
+      // KEEP every valid known ledger - pending work, notices, the DM and
+      // wake caps - rather than wiping them with the file.  Anything worse
+      // (a known field itself violates the schema): the whole file is
+      // suspect, so quarantine it and fail closed with the counter.
+      const salvaged = stateFileSchemaBase.safeParse(rawJson);
+      if (salvaged.success) {
+        const known = new Set<string>(stateFileSchemaBase.keyof().options);
+        const unknownEntries: [string, unknown][] = [];
+        // A successful base parse proves the raw value is a plain object;
+        // the null/array narrowing only satisfies Object.entries' typing.
+        if (rawJson !== null && rawJson !== undefined && !Array.isArray(rawJson)) {
+          for (const [key, value] of Object.entries(rawJson)) {
+            if (!known.has(key)) unknownEntries.push([key, value]);
+          }
+        }
+        this.archive(
+          botId,
+          "state-unknown-keys-on-load",
+          unknownEntries.map(([key, value]) => ({ key, value })),
+        );
+        parsed = salvaged;
+        quarantinedUnknownKeys = true;
+      } else {
+        this.archive(botId, "state-schema-invalid-on-load", [rawJson]);
+        const fresh = emptyState(role);
+        fresh.stateQuarantinedOnLoad = 1;
+        return fresh;
+      }
     }
     const savedRole = parsed.data.role;
     if (savedRole !== role && canonicalZulipRole(savedRole) !== role) {
@@ -206,9 +245,11 @@ export class ZulipStateStore {
     const rawPendingField: unknown = rawRecord.pending;
     const nonArrayPending = rawPendingField !== undefined && rawPendingField !== null && !Array.isArray(rawPendingField);
     const rawPendingEntries: unknown[] = Array.isArray(rawPendingField) ? rawPendingField : [];
-    const { userId, noticesDroppedOnLoad, pendingDroppedOnLoad, ...rest } = parsed.data;
+    const { userId, noticesDroppedOnLoad, pendingDroppedOnLoad, stateQuarantinedOnLoad, ...rest } = parsed.data;
     const state: ZulipBotState = { ...rest, role };
     if (userId !== undefined) state.userId = userId;
+    if (stateQuarantinedOnLoad !== undefined) state.stateQuarantinedOnLoad = stateQuarantinedOnLoad;
+    if (quarantinedUnknownKeys) state.stateQuarantinedOnLoad = (state.stateQuarantinedOnLoad ?? 0) + 1;
     const droppedTotal = (noticesDroppedOnLoad ?? 0) + (rawEntries.length - parsed.data.notices.length) + (nonArrayNotices ? 1 : 0);
     if (droppedTotal > 0) state.noticesDroppedOnLoad = droppedTotal;
     const droppedPendingTotal =

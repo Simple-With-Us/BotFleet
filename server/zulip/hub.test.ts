@@ -2514,13 +2514,15 @@ describe("review fixes: round 12 (reset counter carry, notice event keys, archiv
     const statePath = join(dataDir, "zulip", "bot-plumber.json");
     // SAFETY: the parsed state is only mutated field-by-field here; the
     // strict schema revalidates every field on the next load.
-    const saved = JSON.parse(readFileSync(statePath, "utf8")) as { userId?: number };
+    const saved = JSON.parse(readFileSync(statePath, "utf8")) as { userId?: number; stateQuarantinedOnLoad?: number };
     saved.userId = 999999;
+    saved.stateQuarantinedOnLoad = 2;
     writeFileSync(statePath, `${JSON.stringify(saved)}\n`);
     const second = makeHub();
     await connected(second);
     expect(sessionOf(second).state.userId).toBe(PLUMBER);
     expect(sessionOf(second).state.pendingDroppedOnLoad).toBe(3);
+    expect(sessionOf(second).state.stateQuarantinedOnLoad).toBe(2);
     await waitFor(
       () => logs.some((line) => line.includes("3 invalid pending units quarantined on load")),
       "the pending-loss warning after the reset",
@@ -2574,7 +2576,8 @@ describe("review fixes: round 12 (reset counter carry, notice event keys, archiv
     await hub.stop();
   });
 
-  it("quarantines a state file with unknown top-level keys instead of silently stripping them", async () => {
+  it("keeps valid ledgers while quarantining unknown top-level state keys", async () => {
+    settings.budgets = { dmsPerHour: 0 };
     const first = makeHub();
     await connected(first);
     const session = sessionOf(first);
@@ -2590,12 +2593,18 @@ describe("review fixes: round 12 (reset counter carry, notice event keys, archiv
     writeFileSync(statePath, `${JSON.stringify(saved)}\n`);
     const second = makeHub();
     await connected(second);
-    // The whole file fails the strict schema: fresh state, original kept.
-    expect(sessionOf(second).state.notices.some((n) => n.text === "kept evidence")).toBe(false);
+    // Unknown keys alone never wipe the valid known ledgers: the queued
+    // notice (and the cap and work ledgers) survive; only the drift is
+    // quarantined, counted and reported.
+    expect(sessionOf(second).state.notices.some((n) => n.text === "kept evidence")).toBe(true);
+    expect(sessionOf(second).state.stateQuarantinedOnLoad).toBe(1);
     const archive = readFileSync(join(dataDir, "zulip", "bot-plumber.notices-archive.jsonl"), "utf8");
-    expect(archive).toMatch(/state-schema-invalid-on-load/);
+    expect(archive).toMatch(/state-unknown-keys-on-load/);
     expect(archive).toMatch(/surpriseFutureField/);
-    expect(archive).toMatch(/kept evidence/);
+    await waitFor(
+      () => logs.some((line) => line.includes("state-file quarantine")),
+      "the content-free quarantine warning",
+    );
     await second.stop();
   });
 
@@ -2611,6 +2620,33 @@ describe("review fixes: round 12 (reset counter carry, notice event keys, archiv
     const archive = readFileSync(join(dataDir, "zulip", "bot-plumber.notices-archive.jsonl"), "utf8");
     expect(archive).toMatch(/state-unparseable-on-load/);
     expect(archive).toMatch(/not json/);
+    expect(sessionOf(second).state.stateQuarantinedOnLoad).toBe(1);
+    await second.stop();
+  });
+
+  it("fails closed with visibility when a known state field violates the schema", async () => {
+    const first = makeHub();
+    await connected(first);
+    sessionOf(first).markDirty();
+    sessionOf(first).save();
+    await first.stop();
+    const statePath = join(dataDir, "zulip", "bot-plumber.json");
+    // SAFETY: the parsed state is only mutated field-by-field here; the
+    // strict schema revalidates every field on the next load.
+    const saved = JSON.parse(readFileSync(statePath, "utf8")) as { role?: unknown };
+    saved.role = 42;
+    writeFileSync(statePath, `${JSON.stringify(saved)}\n`);
+    const second = makeHub();
+    await connected(second);
+    // Nothing salvageable: fresh state, but the quarantine is archived,
+    // counted and reported - never a silent empty start.
+    expect(sessionOf(second).state.stateQuarantinedOnLoad).toBe(1);
+    const archive = readFileSync(join(dataDir, "zulip", "bot-plumber.notices-archive.jsonl"), "utf8");
+    expect(archive).toMatch(/state-schema-invalid-on-load/);
+    await waitFor(
+      () => logs.some((line) => line.includes("state-file quarantine")),
+      "the content-free quarantine warning",
+    );
     await second.stop();
   });
 });
