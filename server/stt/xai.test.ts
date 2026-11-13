@@ -74,6 +74,7 @@ function fakeSocket() {
     sentBinary,
     sentText,
     emit: (payload: XaiSttServerEvent) => handlers.onMessage?.(JSON.stringify(payload)),
+    hangup: () => handlers.onClose?.(),
   };
 }
 
@@ -109,6 +110,19 @@ describe("openStreamingSession", () => {
     const session = await openStreamingSession("sk-test", { language: "en", keyterms: ["BotFleet"] }, {}, { openSocket: open });
     expect(opened).toBe(buildXaiSttStreamingUrl({ language: "en", keyterms: ["BotFleet"] }));
     session.close();
+  });
+
+  it("notifies onDone when the socket closes cleanly without transcript.done", async () => {
+    const fake = fakeSocket();
+    const done: Array<number | undefined> = [];
+    const errors: string[] = [];
+    await openStreamingSession("sk-test", { language: "en" }, {
+      onDone: (duration) => done.push(duration),
+      onError: (message) => errors.push(message),
+    }, { openSocket: fake.open });
+    fake.hangup();
+    expect(errors).toEqual([]);
+    expect(done).toHaveLength(1);
   });
 });
 

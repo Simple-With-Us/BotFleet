@@ -121,7 +121,7 @@ export const openAuthorizedWebSocket: AuthorizedWsOpener = (url, headers, handle
       reject(error);
     };
     request.on("error", (error) => fail(error instanceof Error ? error : new Error(String(error))));
-    request.on("upgrade", (response: IncomingMessage, socket) => {
+    request.on("upgrade", (response: IncomingMessage, socket, head) => {
       if (response.statusCode !== 101) {
         socket.destroy();
         fail(new Error(`WebSocket upgrade failed (HTTP ${response.statusCode ?? "unknown"}).`));
@@ -154,7 +154,7 @@ export const openAuthorizedWebSocket: AuthorizedWsOpener = (url, headers, handle
         try { socket.write(frame(0x8, reason)); } catch { /* already gone */ }
         socket.end();
       };
-      socket.on("data", (chunk: Buffer) => {
+      const ingest = (chunk: Buffer) => {
         try {
           remainder = decodeFrames(Buffer.concat([remainder, chunk]), (opcode, payload) => {
             if (opcode === 0x1) handlers.onMessage?.(payload.toString("utf8"));
@@ -165,12 +165,14 @@ export const openAuthorizedWebSocket: AuthorizedWsOpener = (url, headers, handle
           handlers.onError?.(error instanceof Error ? error : new Error(String(error)));
           socket.destroy();
         }
-      });
+      };
+      socket.on("data", ingest);
       socket.on("error", (error) => handlers.onError?.(error instanceof Error ? error : new Error(String(error))));
       socket.on("close", () => {
         readyState = CLOSED;
         handlers.onClose?.();
       });
+      if (head.length) ingest(head);
       const client: AuthorizedWs = {
         sendText,
         sendBinary,

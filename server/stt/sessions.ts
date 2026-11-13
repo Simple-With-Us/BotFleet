@@ -72,11 +72,15 @@ export async function createXaiSttSession(options: CreateXaiSessionOptions): Pro
     },
     onDone: (duration) => {
       const live = sessions.get(id);
-      if (live) emit(live, { type: "done", duration });
+      if (!live) return;
+      emit(live, { type: "done", duration });
+      void drop(id, "stop");
     },
     onError: (message) => {
       const live = sessions.get(id);
-      if (live) emit(live, { type: "error", message });
+      if (!live) return;
+      emit(live, { type: "error", message });
+      void drop(id, "stop");
     },
   }, { openSocket: options.openSocket });
   const live: LiveSession = {

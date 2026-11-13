@@ -118,6 +118,7 @@ export async function openStreamingSession(
   let recorded = false;
   let closed = false;
   let ready = false;
+  let notified = false;
   let lastDuration: number | undefined;
   let socket: AuthorizedWs | undefined;
   let resolveReady: () => void = () => {};
@@ -136,6 +137,15 @@ export async function openStreamingSession(
     recorded = true;
     const elapsed = (Date.now() - startedAt) / 1000;
     recordSttUsage("xai", lastDuration ?? elapsed, "streaming", { service: "xai-stt-streaming" });
+  };
+  const notify = (kind: "done" | "error", message?: string) => {
+    if (notified) return;
+    notified = true;
+    closed = true;
+    record();
+    if (kind === "error") handlers.onError?.(message || "xAI speech-to-text failed.");
+    else handlers.onDone?.(lastDuration);
+    resolveDone();
   };
 
   socket = await openSocket(url, { Authorization: `Bearer ${secret}` }, {
@@ -163,26 +173,24 @@ export async function openStreamingSession(
       if (event.type === "transcript.done") {
         const duration = finiteDuration(event.duration);
         if (duration !== undefined) lastDuration = duration;
-        record();
-        handlers.onDone?.(lastDuration);
-        resolveDone();
+        notify("done");
         return;
       }
       if (event.type === "error") {
         const message = event.message?.trim() || "xAI speech-to-text failed.";
         if (!ready) rejectReady(new Error(message));
-        handlers.onError?.(message);
+        notify("error", message);
       }
     },
     onError: (error) => {
       const message = error.message || "Could not reach xAI speech-to-text.";
       if (!ready) rejectReady(new Error(message));
-      handlers.onError?.(message);
+      notify("error", message);
     },
     onClose: () => {
       closed = true;
-      record();
-      resolveDone();
+      if (ready) notify("done");
+      else notify("error", "xAI speech-to-text closed before the session finished.");
     },
   });
 
