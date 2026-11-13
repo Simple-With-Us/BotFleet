@@ -100,6 +100,57 @@ final class ActivityRunsTests: XCTestCase {
         XCTAssertNil(transcriptRowId(containing: "missing", in: items))
     }
 
+    func testARunningStepStaysOutOfTheFold() {
+        let messages = [
+            makeToolMessage(id: "1", name: "view_file", ok: true),
+            makeToolMessage(id: "2", name: "view_file", ok: true),
+            makeToolMessage(id: "3", name: "bash", ok: nil),
+        ]
+        let items = groupActivityRuns(messages)
+        XCTAssertEqual(items.count, 2)
+        if case let .run(_, run) = items[0] {
+            XCTAssertEqual(run.map(\.id), ["1", "2"])
+        } else {
+            XCTFail("Expected the finished steps to fold")
+        }
+        if case let .message(msg) = items[1] {
+            XCTAssertEqual(msg.id, "3")
+            XCTAssertEqual(ToolStepStatus(ok: msg.tool?.ok), .running)
+        } else {
+            XCTFail("Expected the running step on its own row")
+        }
+    }
+
+    func testAChildStepStaysOnItsOwnRow() {
+        var parent = makeToolMessage(id: "1", name: "Task", ok: true)
+        parent.tool = ToolActivity(name: "Task", ok: true, itemId: "task-1")
+        var child = makeToolMessage(id: "2", name: "Read", ok: true)
+        child.tool = ToolActivity(name: "Read", ok: true, itemId: "read-1", parentItemId: "task-1")
+        let items = groupActivityRuns([parent, child])
+        XCTAssertEqual(items.count, 2)
+        XCTAssertEqual(items.map(\.id), ["1", "2"])
+        XCTAssertEqual(ToolStepStatus(ok: child.tool?.ok), .done)
+    }
+
+    func testAChildStepDecodesItsParentAndStatus() throws {
+        let running = #"{"id":"c","role":"bot","kind":"activity","at":1,"tool":{"name":"Read","itemId":"read-1","parentItemId":"task-1"}}"#
+        let message = try JSONDecoder().decode(Message.self, from: Data(running.utf8))
+        XCTAssertEqual(message.tool?.itemId, "read-1")
+        XCTAssertEqual(message.tool?.parentItemId, "task-1")
+        XCTAssertEqual(ToolStepStatus(ok: message.tool?.ok), .running)
+        XCTAssertEqual(ToolStepStatus(ok: message.tool?.ok).receiptStatus, "running")
+
+        let done = #"{"id":"d","role":"bot","kind":"activity","at":2,"tool":{"name":"Read","ok":true}}"#
+        let finished = try JSONDecoder().decode(Message.self, from: Data(done.utf8))
+        XCTAssertEqual(ToolStepStatus(ok: finished.tool?.ok), .done)
+        XCTAssertEqual(ToolStepStatus(ok: finished.tool?.ok).receiptStatus, "success")
+
+        let failed = #"{"id":"f","role":"bot","kind":"activity","at":3,"tool":{"name":"Read","ok":false}}"#
+        let broken = try JSONDecoder().decode(Message.self, from: Data(failed.utf8))
+        XCTAssertEqual(ToolStepStatus(ok: broken.tool?.ok), .failed)
+        XCTAssertEqual(ToolStepStatus(ok: broken.tool?.ok).receiptStatus, "error")
+    }
+
     func testTextMessagesBreakRuns() {
         let messages = [
             makeToolMessage(id: "1", name: "view_file"),

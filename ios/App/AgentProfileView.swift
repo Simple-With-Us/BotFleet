@@ -25,6 +25,7 @@ struct AgentProfileView: View {
     @State private var instanceId: String
     @State private var modelId: String
     @State private var effort: String?
+    @State private var latest: String?
     @State private var fallbacks: [ModelSelection]
     @State private var maxToolRoundsText: String
     @State private var photo: PhotosPickerItem?
@@ -40,6 +41,11 @@ struct AgentProfileView: View {
     @State private var confirmingDuplicate = false
     @State private var player: AVAudioPlayer?
     @State private var isOff: Bool
+    /// The On/Off switch was flipped while the bot was working, and the
+    /// person has not yet said what should happen to the turn in flight.
+    @State private var powerOffWhileRunning = false
+    /// They said stop it: the switch saves first, then the turn is stopped.
+    @State private var stopRunningTurnOnSave = false
     @State private var computers: Set<String>
     @State private var cwd: String
     /// The execution policy, saved with the rest of the sheet.  Bypass is
@@ -48,6 +54,8 @@ struct AgentProfileView: View {
     @State private var autoReview: AutoReviewMode
     @State private var approvePeerComms: Bool
     @State private var bypassPermissions: Bool
+    @State private var bypassLocalComputer: Bool
+    @State private var confirmingLocalBypass = false
     @State private var confirmingBypass = false
     @State private var baseline: ProfileFormSnapshot
     /// Set while the Delete Bot confirmation is up.
@@ -69,6 +77,7 @@ struct AgentProfileView: View {
         _instanceId = State(initialValue: bot.modelSelection.instanceId)
         _modelId = State(initialValue: bot.modelSelection.model)
         _effort = State(initialValue: bot.modelSelection.effort)
+        _latest = State(initialValue: bot.modelSelection.latest ?? ModelLineage.detectAlias(from: bot.modelSelection.model))
         _fallbacks = State(initialValue: bot.modelSelection.fallbacks ?? [])
         _maxToolRoundsText = State(initialValue: Self.roundsText(bot.maxToolRounds))
         _isOff = State(initialValue: bot.isOff)
@@ -78,6 +87,7 @@ struct AgentProfileView: View {
         _autoReview = State(initialValue: AutoReviewMode(stored: bot.autoReview))
         _approvePeerComms = State(initialValue: bot.approvePeerComms ?? false)
         _bypassPermissions = State(initialValue: bot.bypassPermissions ?? false)
+        _bypassLocalComputer = State(initialValue: bot.bypassLocalComputer ?? false)
         _baseline = State(initialValue: ProfileFormSnapshot(bot: bot))
     }
 
@@ -124,7 +134,7 @@ struct AgentProfileView: View {
     private var unavailableVoiceLabel: String {
         switch voiceProvider {
         case .minimax: return "MiniMax voice is not configured"
-        case .elevenlabs: return "ElevenLabs is not configured"
+        case .elevenlabs: return "Voice is not configured"
         case .system: return "Built-in Mac voices are unavailable"
         case .personal: return "Apple Personal Voice is not configured"
         case .unknown: return "Voice is not configured"
@@ -136,28 +146,28 @@ struct AgentProfileView: View {
         case .minimax:
             return "Add the shared MiniMax key in a bot's Voice settings on the computer.\u{00A0} The key is never returned to iOS."
         case .elevenlabs:
-            return "Add the shared ElevenLabs key in a bot's Voice settings on the computer.\u{00A0} The key is never returned to iOS."
+            return "Add the shared voice key in a bot's Voice settings on the computer.\u{00A0} The key is never returned to iOS."
         case .system:
-            return "Built-in Mac voices need no key, and this computer has none available.\u{00A0} Switch the voice engine in a bot's Voice settings on the computer to keep using voice."
+            return "Built-in Mac voices need no key, and this computer has none available.\u{00A0} Switch the voice provider in a bot's Voice settings on the computer to keep using voice."
         case .personal:
             return "Apple Personal Voice speaks directly on this iOS device and requires authorization."
         case .unknown:
-            return "Configure the selected voice engine in a bot's Voice settings on the computer.\u{00A0} Provider keys are never returned to iOS."
+            return "Configure the selected voice provider in a bot's Voice settings on the computer.\u{00A0} Provider keys are never returned to iOS."
         }
     }
 
     private var missingDefaultVoiceGuidance: String {
         switch voiceProvider {
         case .minimax:
-            return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose a voice for each device above; synthesis still uses the shared MiniMax key on your computer."
+            return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose a voice for each device above; speech still uses the shared MiniMax key on your computer."
         case .elevenlabs:
-            return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose a voice for each device above; synthesis still uses the shared ElevenLabs key on your computer."
+            return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose a voice for each device above; speech still uses the shared voice key on your computer."
         case .system:
-            return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose a voice for each device above; synthesis still uses the built-in Mac voices on your computer."
+            return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose a voice for each device above; speech still uses the built-in Mac voices on your computer."
         case .personal:
             return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose an Apple Personal Voice for this iPhone above to speak on this device."
         case .unknown:
-            return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose a voice for each device above; synthesis still uses the selected voice engine on your computer."
+            return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose a voice for each device above; speech still uses the selected voice provider on your computer."
         }
     }
 
@@ -169,8 +179,7 @@ struct AgentProfileView: View {
                 Section {
                     HStack {
                         Spacer()
-                        BotAvatarView(bot: current, size: 112, state: .happy, animated: true)
-                            .providerBadge(for: current, avatarSize: 112)
+                        BotAvatarWithProviderBadge(bot: current, size: 112, state: .happy, animated: true)
                         Spacer()
                     }
                     .listRowBackground(Color.clear)
@@ -215,7 +224,21 @@ struct AgentProfileView: View {
                 }
 
                 Section {
-                    Toggle("On", isOn: Binding(get: { !isOff }, set: { isOff = !$0 }))
+                    Toggle("On", isOn: Binding(get: { !isOff }, set: { turnedOn in
+                    // Switching a working bot off is really two decisions —
+                    // stop the turn now, or stop it starting from now — and a
+                    // switch cannot tell which one was meant.  Hold the flip
+                    // until they answer, and only ask when there is a turn to
+                    // decide about.  The decision lives in CompanionCore so it
+                    // is tested rather than eyeballed: `get` reads `!isOff`,
+                    // so `set` must apply the inverse of what the switch says.
+                    switch botPowerToggleAction(turnedOn: turnedOn, isOff: isOff, isBusy: current.busy == true) {
+                    case .askAboutRunningTurn:
+                        powerOffWhileRunning = true
+                    case .setOff(let next):
+                        isOff = next
+                    }
+                }))
                 } header: {
                     Text("Power")
                 } footer: {
@@ -254,8 +277,14 @@ struct AgentProfileView: View {
                                 set: { newInstanceId in
                                     fallbacks[index].instanceId = newInstanceId
                                     if let inst = instances.first(where: { $0.id == newInstanceId }) {
-                                        if !inst.models.options.contains(where: { $0.id == fallbacks[index].model }) {
-                                            fallbacks[index].model = inst.models.default
+                                        if let fbLatest = fallbacks[index].latest,
+                                           let resolved = ModelLineage.resolveClass(fbLatest, in: inst) {
+                                            fallbacks[index].model = resolved.resolvedId
+                                        } else {
+                                            fallbacks[index].latest = nil
+                                            if !inst.models.options.contains(where: { $0.id == fallbacks[index].model }) {
+                                                fallbacks[index].model = inst.models.default
+                                            }
                                         }
                                         if let effort = fallbacks[index].effort,
                                            !inst.effortLevels(for: fallbacks[index].model).contains(effort) {
@@ -272,17 +301,47 @@ struct AgentProfileView: View {
 
                             if let fallbackInstance = instances.first(where: { $0.id == fallbacks[index].instanceId }) {
                                 Picker("Model", selection: Binding(
-                                    get: { fallbacks[index].model },
-                                    set: { newModel in
-                                        fallbacks[index].model = newModel
+                                    get: {
+                                        if let fbLatest = fallbacks[index].latest, !fbLatest.isEmpty {
+                                            return "latest:\(fbLatest)"
+                                        }
+                                        return fallbacks[index].model
+                                    },
+                                    set: { newTag in
+                                        if newTag.hasPrefix("latest:") {
+                                            let classKey = String(newTag.dropFirst("latest:".count))
+                                            fallbacks[index].latest = classKey
+                                            if let resolved = ModelLineage.resolveClass(classKey, in: fallbackInstance) {
+                                                fallbacks[index].model = resolved.resolvedId
+                                            }
+                                        } else {
+                                            fallbacks[index].latest = nil
+                                            fallbacks[index].model = newTag
+                                        }
                                         if let effort = fallbacks[index].effort,
-                                           !fallbackInstance.effortLevels(for: newModel).contains(effort) {
+                                           !fallbackInstance.effortLevels(for: fallbacks[index].model).contains(effort) {
                                             fallbacks[index].effort = nil
                                         }
                                     }
                                 )) {
-                                    ForEach(fallbackInstance.models.options) { option in
-                                        Text(option.label).tag(option.id)
+                                    let latestOpts = ModelLineage.latestOptions(for: fallbackInstance)
+                                    if !latestOpts.isEmpty {
+                                        Section("Latest") {
+                                            ForEach(latestOpts) { opt in
+                                                VStack(alignment: .leading, spacing: 2) {
+                                                    Text(opt.label)
+                                                    Text(opt.resolvedId)
+                                                        .font(.caption)
+                                                        .foregroundStyle(.secondary)
+                                                }
+                                                .tag("latest:\(opt.classKey)")
+                                            }
+                                        }
+                                    }
+                                    Section("Models") {
+                                        ForEach(fallbackInstance.models.options) { option in
+                                            Text(option.label).tag(option.id)
+                                        }
                                     }
                                 }
                                 .pickerStyle(.navigationLink)
@@ -415,6 +474,24 @@ struct AgentProfileView: View {
             } message: {
                 Text(BotDuplicate.summary)
             }
+            .confirmationDialog(
+                "\(current.name) Is Working",
+                isPresented: $powerOffWhileRunning,
+                titleVisibility: .visible
+            ) {
+                Button("Stop It And Power Off", role: .destructive) {
+                    isOff = true
+                    stopRunningTurnOnSave = true
+                }
+                Button("Power Off After This Turn") {
+                    isOff = true
+                    stopRunningTurnOnSave = false
+                }
+                Button("Keep It On", role: .cancel) {}
+            } message: {
+                // Two spaces between sentences, held with a non-breaking space.
+                Text("Turning \(current.name) off stops new work, but the turn running now will keep going.\u{00A0} Stop it now, or let it finish first.")
+            }
             .task {
                 if !session.cachedInstances.isEmpty {
                     instances = profileEngines(from: session.cachedInstances)
@@ -453,6 +530,11 @@ struct AgentProfileView: View {
                 botName: current.name,
                 model: modelId,
                 confirm: { bypassPermissions = true }
+            ))
+            .modifier(LocalBypassConfirmation(
+                isPresented: $confirmingLocalBypass,
+                botName: current.name,
+                confirm: { bypassLocalComputer = true }
             ))
             .modifier(DeleteChatAlert(target: $deleteTarget, roomTerm: "", onConfirm: { _ in
                 Task { await deleteBot() }
@@ -598,6 +680,7 @@ struct AgentProfileView: View {
             instanceId: instanceId,
             model: modelId,
             effort: effort,
+            latest: latest,
             fallbacks: fallbacks.isEmpty ? nil : fallbacks
         )
         let trimmedCwd = cwd.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -621,6 +704,7 @@ struct AgentProfileView: View {
             autoReview: autoReview == baseline.autoReview ? nil : autoReview,
             approvePeerComms: approvePeerComms == baseline.approvePeerComms ? nil : approvePeerComms,
             bypassPermissions: bypassPermissions == baseline.bypassPermissions ? nil : bypassPermissions,
+            bypassLocalComputer: bypassLocalComputer == baseline.bypassLocalComputer ? nil : bypassLocalComputer,
             // The bot as it is now, with only the person's two switches applied,
             // so This Mac is never part of what this phone asks to change.
             computers: BotComputers.updated(
@@ -644,8 +728,14 @@ struct AgentProfileView: View {
             .pickerStyle(.navigationLink)
             .onChange(of: instanceId) { _, newInstanceId in
                 if let instance = instances.first(where: { $0.id == newInstanceId }) {
-                    if !instance.models.options.contains(where: { $0.id == modelId }) {
-                        modelId = instance.models.default
+                    if let curLatest = latest,
+                       let resolved = ModelLineage.resolveClass(curLatest, in: instance) {
+                        modelId = resolved.resolvedId
+                    } else {
+                        latest = nil
+                        if !instance.models.options.contains(where: { $0.id == modelId }) {
+                            modelId = instance.models.default
+                        }
                     }
                     if let effort, !instance.effortLevels(for: modelId).contains(effort) {
                         self.effort = nil
@@ -654,17 +744,50 @@ struct AgentProfileView: View {
             }
 
             if let selectedInstance = instances.first(where: { $0.id == instanceId }) {
-                Picker("Model", selection: $modelId) {
-                    ForEach(selectedInstance.models.options) { option in
-                        Text(option.label).tag(option.id)
+                Picker("Model", selection: Binding(
+                    get: {
+                        if let curLatest = latest, !curLatest.isEmpty {
+                            return "latest:\(curLatest)"
+                        }
+                        return modelId
+                    },
+                    set: { newTag in
+                        if newTag.hasPrefix("latest:") {
+                            let classKey = String(newTag.dropFirst("latest:".count))
+                            latest = classKey
+                            if let resolved = ModelLineage.resolveClass(classKey, in: selectedInstance) {
+                                modelId = resolved.resolvedId
+                            }
+                        } else {
+                            latest = nil
+                            modelId = newTag
+                        }
+                        if let effort, !selectedInstance.effortLevels(for: modelId).contains(effort) {
+                            self.effort = nil
+                        }
+                    }
+                )) {
+                    let latestOpts = ModelLineage.latestOptions(for: selectedInstance)
+                    if !latestOpts.isEmpty {
+                        Section("Latest") {
+                            ForEach(latestOpts) { opt in
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(opt.label)
+                                    Text(opt.resolvedId)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                .tag("latest:\(opt.classKey)")
+                            }
+                        }
+                    }
+                    Section("Models") {
+                        ForEach(selectedInstance.models.options) { option in
+                            Text(option.label).tag(option.id)
+                        }
                     }
                 }
                 .pickerStyle(.navigationLink)
-                .onChange(of: modelId) { _, newModelId in
-                    if let effort, !selectedInstance.effortLevels(for: newModelId).contains(effort) {
-                        self.effort = nil
-                    }
-                }
 
                 effortPicker(selection: $effort, instance: selectedInstance, modelId: modelId)
             }
@@ -708,16 +831,59 @@ struct AgentProfileView: View {
     private var bypassPermissionsSection: some View {
         Section {
             Toggle("Bypass Permissions", isOn: bypassBinding)
+            switch localBypassControl {
+            case .toggle:
+                Toggle("Bypass Including This Mac", isOn: localBypassBinding)
+            case .macOnly:
+                LabeledContent("Bypass Including This Mac", value: "Off")
+            case .needsBypass:
+                Label(BotExecutionPolicy.localBypassNeedsBypass, systemImage: "lock")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
         } header: {
             Text("Bypass Permissions")
         } footer: {
             VStack(alignment: .leading, spacing: 8) {
                 Text(BotExecutionPolicy.bypassSummary(isOn: bypassPermissions))
+                if localBypassControl == .toggle {
+                    Text(BotExecutionPolicy.localBypassSummary(isOn: bypassLocalComputer))
+                }
+                if !BotExecutionPolicy.mayTurnOnLocalBypass(computers: current.computers) {
+                    Text(BotExecutionPolicy.localBypassMacOnlyNote)
+                }
                 if let note = BypassCoverage(engine: policyEngine).note {
                     Text(note)
                 }
             }
         }
+    }
+
+    /// Whether the second switch is a control, a read-only Off, or a note
+    /// that Bypass itself is off.  The computer refuses to turn it on for a
+    /// bot that can use This Mac, so that case is never a switch.
+    private var localBypassControl: BotExecutionPolicy.LocalBypassControl {
+        BotExecutionPolicy.localBypassControl(
+            computers: current.computers,
+            bypassOn: bypassPermissions,
+            localBypassOn: bypassLocalComputer
+        )
+    }
+
+    /// Switching on asks first.  Turning it off does not, and does not require
+    /// Bypass to still be on: an on switch has to be able to come back off.
+    private var localBypassBinding: Binding<Bool> {
+        Binding(
+            get: { bypassLocalComputer },
+            set: { wantsOn in
+                if wantsOn {
+                    guard bypassPermissions, BotExecutionPolicy.mayTurnOnLocalBypass(computers: current.computers) else { return }
+                    confirmingLocalBypass = true
+                } else {
+                    bypassLocalComputer = false
+                }
+            }
+        )
     }
 
     /// Switching on asks first; the toggle stays where it was until the person
@@ -860,16 +1026,28 @@ struct AgentProfileView: View {
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
-                Toggle("Play on Mac", isOn: Binding(
-                    get: { speechDevices.contains("mac") },
-                    set: { if $0 { speechDevices.insert("mac") } else { speechDevices.remove("mac") } }
-                ))
-                .disabled(!macVoiceCanSpeak)
-                Toggle("Play on iPhone (while app is open)", isOn: Binding(
-                    get: { speechDevices.contains("iphone") },
-                    set: { if $0 { speechDevices.insert("iphone") } else { speechDevices.remove("iphone") } }
-                ))
-                .disabled(!iphoneVoiceCanSpeak)
+                speechDeviceToggle(
+                    device: "mac",
+                    title: "Play on Mac",
+                    row: CrossPlatformProfileSettings.speechDeviceRow(
+                        device: "mac",
+                        voice: macVoice,
+                        speechDevices: speechDevices,
+                        agentVoiceCanSpeakOnClient: macVoiceCanSpeak,
+                        personalVoicePlaybackAllowed: true
+                    )
+                )
+                speechDeviceToggle(
+                    device: "iphone",
+                    title: "Play on iPhone (while app is open)",
+                    row: CrossPlatformProfileSettings.speechDeviceRow(
+                        device: "iphone",
+                        voice: iphoneVoice,
+                        speechDevices: speechDevices,
+                        agentVoiceCanSpeakOnClient: iphoneVoiceCanSpeak,
+                        personalVoicePlaybackAllowed: true
+                    )
+                )
 
                 if !hasWorkspaceDefaultVoice, iphoneVoice.isEmpty || macVoice.isEmpty {
                     Label("Pick a voice for each device before turning on speech.", systemImage: "info.circle")
@@ -905,6 +1083,28 @@ struct AgentProfileView: View {
     /// The workspace default voice by name ("Jay Wedgeworth 001").
     private var defaultVoiceName: String {
         BotVoice.displayName(config?.workspaceDefaultVoice ?? "", voices: voices)
+    }
+
+    @ViewBuilder
+    private func speechDeviceToggle(
+        device: String,
+        title: String,
+        row: CrossPlatformProfileSettings.SpeechDeviceRow
+    ) -> some View {
+        let displaySelected = row.editable ? row.selected : false
+        Toggle(title, isOn: Binding(
+            get: { displaySelected },
+            set: { enabled in
+                guard row.editable else { return }
+                if enabled { speechDevices.insert(device) } else { speechDevices.remove(device) }
+            }
+        ))
+        .disabled(!row.editable)
+        if let reason = row.disabledReason {
+            Text(reason)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
     }
 
     /// Every picker's first option names the workspace default voice,
@@ -1056,7 +1256,7 @@ struct AgentProfileView: View {
     private func save() async -> Bool {
         busy = true
         defer { busy = false }
-        return await ProfileSaveGate.run(
+        let saved = await ProfileSaveGate.run(
             save: {
                 await session.updateProfile(
                     profilePatch(),
@@ -1067,6 +1267,16 @@ struct AgentProfileView: View {
             accept: synchronizeForm(with:),
             rejected: revertRefusableFields
         )
+        // Stopping is a second act, after the switch has saved: the Off flag
+        // is what keeps the bot from starting anything new in the gap, and an
+        // interrupt still works on a bot that is already Off because it acts
+        // on the turn in flight rather than on the bot being on.  A save the
+        // computer refused has switched nothing off, so nothing is stopped.
+        if saved, stopRunningTurnOnSave {
+            stopRunningTurnOnSave = false
+            await session.interrupt(bot: current)
+        }
+        return saved
     }
 
     /// A refused save puts the fields the computer can say no to back to what
@@ -1090,6 +1300,8 @@ struct AgentProfileView: View {
         baseline.approvePeerComms = approvePeerComms
         bypassPermissions = held.bypassPermissions ?? false
         baseline.bypassPermissions = bypassPermissions
+        bypassLocalComputer = held.bypassLocalComputer ?? false
+        baseline.bypassLocalComputer = bypassLocalComputer
     }
 
     /// The same save for a computer that predates per-device voices and so
@@ -1142,7 +1354,7 @@ struct AgentProfileView: View {
             uploadData = jpeg
             uploadMIME = "image/jpeg"
         }
-        let intendedCrop = crop == .mascot ? AvatarCrop.circle : crop
+        let intendedCrop = crop == .mascot || crop == .tvface ? AvatarCrop.circle : crop
         if let updated = await session.uploadAvatar(uploadData, mime: uploadMIME, for: current, crop: intendedCrop) {
             crop = updated.avatarCrop ?? intendedCrop
             baseline.crop = crop
@@ -1152,7 +1364,7 @@ struct AgentProfileView: View {
     private func generateImage() async {
         busy = true
         defer { busy = false }
-        let intendedCrop = crop == .mascot ? AvatarCrop.circle : crop
+        let intendedCrop = crop == .mascot || crop == .tvface ? AvatarCrop.circle : crop
         guard let generated = await session.generateAvatar(
             prompt: String(prompt.trimmingCharacters(in: .whitespacesAndNewlines).prefix(400)),
             for: current
@@ -1251,6 +1463,7 @@ struct AgentProfileView: View {
         autoReview = AutoReviewMode(stored: bot.autoReview)
         approvePeerComms = bot.approvePeerComms ?? false
         bypassPermissions = bot.bypassPermissions ?? false
+        bypassLocalComputer = bot.bypassLocalComputer ?? false
         baseline = ProfileFormSnapshot(bot: bot)
     }
 }
@@ -1279,6 +1492,24 @@ private struct BypassConfirmation: ViewModifier {
     }
 }
 
+/// The second switch is the same kind of decision as the first, one step
+/// further: it gives up the asking for the person's real machine.  It asks
+/// before it takes effect, and turning it back off does not.
+private struct LocalBypassConfirmation: ViewModifier {
+    @Binding var isPresented: Bool
+    let botName: String
+    let confirm: () -> Void
+
+    func body(content: Content) -> some View {
+        content.alert(BotExecutionPolicy.localBypassTitle, isPresented: $isPresented) {
+            Button("Cancel", role: .cancel) {}
+            Button(BotExecutionPolicy.localBypassConfirmButton, role: .destructive, action: confirm)
+        } message: {
+            Text(BotExecutionPolicy.localBypassWarning(botName: botName))
+        }
+    }
+}
+
 private struct ProfileFormSnapshot {
     var name: String
     var title: String
@@ -1298,6 +1529,7 @@ private struct ProfileFormSnapshot {
     var autoReview: AutoReviewMode
     var approvePeerComms: Bool
     var bypassPermissions: Bool
+    var bypassLocalComputer: Bool
 
     init(bot: Bot) {
         name = bot.name
@@ -1317,6 +1549,7 @@ private struct ProfileFormSnapshot {
         autoReview = AutoReviewMode(stored: bot.autoReview)
         approvePeerComms = bot.approvePeerComms ?? false
         bypassPermissions = bot.bypassPermissions ?? false
+        bypassLocalComputer = bot.bypassLocalComputer ?? false
     }
 }
 
@@ -1324,6 +1557,7 @@ private extension AvatarCrop {
     var label: String {
         switch self {
         case .mascot: "Mascot"
+        case .tvface: "TV Face"
         case .circle: "Circle"
         case .rounded: "Rounded"
         case .square: "Square"

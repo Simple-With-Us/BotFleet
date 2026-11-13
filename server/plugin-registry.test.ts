@@ -95,6 +95,7 @@ describe("plugin registry", () => {
     expect(listing.version).toBe("1.0.0");
     expect(listing.description).toBe("Demo plugin.");
     expect(listing.capabilities.length).toBe(0);
+    expect(listing.needs).toEqual({ network: [] });
   });
 
   it("does not touch another install's staging dir for the same plugin", async () => {

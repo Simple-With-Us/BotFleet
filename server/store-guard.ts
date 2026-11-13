@@ -195,8 +195,10 @@ export function loadGuarded<T>(
   path: string,
   interpret: (parsed: JsonValue) => Interpreted<T>,
   now: number = Date.now(),
+  options: { readOnly?: boolean } = {},
 ): GuardedLoad<T> {
   const file = basename(path);
+  const readOnly = options.readOnly === true;
 
   const leaveInPlace = (reason: string): GuardedLoad<T> => {
     console.error(
@@ -207,6 +209,7 @@ export function loadGuarded<T>(
   };
 
   const setAside = (reason: string): GuardedLoad<T> => {
+    if (readOnly) return leaveInPlace(reason);
     const moved = setFileAside(path, "move", now);
     if (!moved.ok) return leaveInPlace(`${reason}, and ${moved.reason}`);
     const to = moved.path;
@@ -223,7 +226,7 @@ export function loadGuarded<T>(
   } catch (error) {
     const failure = error instanceof Error ? error : new Error(String(error));
     const code = fsFailureCode(failure);
-    if (code === "ENOENT") return { status: "missing", value: null, writesRefused: false };
+    if (code === "ENOENT") return { status: "missing", value: null, writesRefused: readOnly };
     return leaveInPlace(`it could not be read (${code})`);
   }
 
@@ -239,9 +242,15 @@ export function loadGuarded<T>(
 
   const result = interpret(parsed);
   if (!result.ok) return setAside(result.reason);
-  if (result.omitted === 0) return { status: "ok", value: result.value, writesRefused: false };
+  if (result.omitted === 0) return { status: "ok", value: result.value, writesRefused: readOnly };
 
   const entries = result.omitted === 1 ? "entry" : "entries";
+  if (readOnly) {
+    const reason = `${result.omitted} ${entries} could not be read; a read-only load preserved the complete original`;
+    console.error(`store: ${file} has ${result.omitted} unusable ${entries}; the read-only load left every byte unchanged.`);
+    notice(path, { kind: "partial", reason, setAsideAs: null, omitted: result.omitted, writesRefused: true }, now);
+    return { status: "ok", value: result.value, writesRefused: true };
+  }
   const copied = setFileAside(path, "copy", now);
   if (!copied.ok) {
     const reason = `${result.omitted} ${entries} could not be read, and ${copied.reason}`;

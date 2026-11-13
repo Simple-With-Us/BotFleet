@@ -74,7 +74,7 @@ import { z } from "zod";
 import { isPersonalVoiceId, isSpeechDevice, SPEECH_DEVICES, voiceForDevice, type BotVoices, type SpeechDevice } from "../../shared/bot-voice.ts";
 import { pronouncer, type Pronunciation } from "../../shared/pronunciations.ts";
 import { pronounceUtterance, utterancesWithSpans, type SpokenUtterance } from "../../shared/speech-spans.ts";
-import { encodeSpokenSpans, stripPauseTags, type SpokenScriptKind, type SpokenSpansWire } from "../../shared/spoken-script.ts";
+import { encodeSpokenSpans, stripOnDeviceProsodyMarkup, type SpokenScriptKind, type SpokenSpansWire } from "../../shared/spoken-script.ts";
 import { voiceScriptKind, writtenReply, type VoiceSummaryMode } from "../../shared/voice-summary.ts";
 import { toUtterances } from "./speech-text.ts";
 
@@ -131,7 +131,16 @@ export const SCRIPT_CHANGED = "This reply's spoken text changed while it was bei
 /** Per-voice clip lists kept on one message besides the owner's own. */
 export const MAX_EXTRA_VOICE_SLOTS = 4;
 
-const SUPPORTED_MIME = new Set(["audio/mpeg", "audio/wav"]);
+const SUPPORTED_MIME = new Set([
+  "audio/mpeg",
+  "audio/wav",
+  "audio/ogg",
+  "audio/opus",
+  "audio/mp4",
+  "audio/x-m4a",
+  "audio/aac",
+  "audio/webm",
+]);
 
 export interface AudioOwner {
   voice?: string;
@@ -588,7 +597,7 @@ export class MessageAudio {
       } else {
         const respell = pronouncer(list);
         onDevice = utterances
-          .map(stripPauseTags)
+          .map(stripOnDeviceProsodyMarkup)
           .filter((u) => /[\p{L}\p{N}]/u.test(u))
           .map(respell);
       }

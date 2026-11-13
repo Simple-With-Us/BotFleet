@@ -142,6 +142,23 @@ describe("VoiceSettings", () => {
     expect(html).not.toContain("Apple Personal Voice:");
   });
 
+  it("greys Mac playback with a reason when Personal Voice is unavailable on this computer", () => {
+    mockPersonalVoice = false;
+    try {
+      const html = renderToStaticMarkup(
+        createElement(VoiceSettings, {
+          bot: { ...sampleBot("personal:pv-1"), speechDevices: ["mac"] },
+          onPatch: () => {},
+        }),
+      );
+      expect(html).toContain("disabled");
+      expect(html).toMatch(/Personal Voice is not available on this computer/i);
+      expect(html).toMatch(/Play on iPhone/i);
+    } finally {
+      mockPersonalVoice = false;
+    }
+  });
+
   it("shows the iPhone's Personal Voice greyed with the reason, not as a choice", () => {
     const html = render(sampleBot(undefined, { iphone: "personal:iphone-voice" }));
     expect(html).toContain("Personal Voice from your iPhone.\u00A0 Choose it on the iPhone.");
@@ -254,6 +271,10 @@ describe("VoiceSettings personal voice selection guard", () => {
   it("routes add and clone through the select guard", () => {
     const guard = between("const commitVoice", "const commitIphoneVoice");
     const add = between("const handleAddCustomVoice", "const handleDeleteVoice");
+    const stop = between("const stopCloneRecording", "const saveKey");
+    expect(stop).toContain("const stopIntent = cloneRecordIntentRef.current");
+    expect(stop).toContain("if (stopIntent !== cloneRecordIntentRef.current) return");
+
     const clone = between("const handleClone =", "if (!tts) return null");
 
     expect(guard).toContain("personalVoiceAllowedRef.current");
@@ -285,6 +306,12 @@ describe("VoiceSettings personal voice selection guard", () => {
     expect(del).toContain("setPersonalVoiceDenied(false)");
     expect(clone).toContain("commitVoice(result.voiceId)");
     expect(clone).not.toContain("onPatch(");
+    expect(SRC).toContain("startMicRecorder");
+    expect(SRC).toContain("cloneRecordPending");
+    expect(SRC).toContain("cloneRecordIntentRef");
+    expect(SRC).toContain("closeClonePanel");
+    expect(SRC).toContain("cancelActiveCloneRecording");
+    expect(SRC).toContain("Record on This Mac");
     expect(SRC).toContain("commitVoice(e.target.value)");
 
     // The iPhone picker never saves a Personal Voice from this Mac.

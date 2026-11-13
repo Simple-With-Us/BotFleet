@@ -1,7 +1,7 @@
 import { z } from "zod";
 
-import { botAvatarCropSchema, botAvatarUrlSchema } from "../shared/bot-avatar.ts";
-import { BOT_PROFILE_LIMITS, MAX_TOOL_ROUNDS } from "../shared/bot-profile.ts";
+import { BOT_AVATAR_CROPS, botAvatarCropSchema, botAvatarUrlSchema } from "../shared/bot-avatar.ts";
+import { BOT_PROFILE_LIMITS, MAX_TOOL_ROUNDS, maxHistoryTurnsSchema } from "../shared/bot-profile.ts";
 import { mergeBotVoices, type BotVoices } from "../shared/bot-voice.ts";
 import {
   CONNECTOR_SLUGS_MAX,
@@ -29,6 +29,7 @@ export const BOT_PROFILE_PATCH_FIELDS = [
   "approvePeerComms",
   "autoApprove",
   "bypassPermissions",
+  "bypassLocalComputer",
   "autoReview",
   "composio",
   "off",
@@ -41,6 +42,8 @@ export const BOT_PROFILE_PATCH_FIELDS = [
   "effort",
   "computers",
   "maxToolRounds",
+  "maxHistoryTurns",
+  "historySummaryModel",
 ] as const;
 
 /** One service's grant, `{ tools: "*" }` for every tool Composio offers on
@@ -108,6 +111,14 @@ export function resolveMaxToolRounds(
   return parsed.success ? parsed.data : undefined;
 }
 
+/** Integer 0..MAX_HISTORY_TURNS, else absent. Empty/null/invalid all mean unset. */
+export function resolveMaxHistoryTurns(
+  value: string | number | boolean | null | undefined,
+): number | undefined {
+  const parsed = maxHistoryTurnsSchema.safeParse(value);
+  return parsed.success ? parsed.data : undefined;
+}
+
 const profilePatchSchema = z.object({
   name: z
     .string({ error: "name must be a string" })
@@ -142,6 +153,12 @@ const profilePatchSchema = z.object({
   approvePeerComms: z.boolean({ error: "approvePeerComms must be true or false" }).optional(),
   autoApprove: z.boolean({ error: "autoApprove must be true or false" }).optional(),
   bypassPermissions: z.boolean({ error: "bypassPermissions must be true or false" }).optional(),
+  // Owner's second switch, 2026-10-14.  Bypass alone deliberately stops at the
+  // edge of the person's real desktop, which made it *weaker* than Auto Mode,
+  // since Auto already answers those requests.  This is the named, opt-in way
+  // to say so, so the default boundary keeps standing rather than being
+  // quietly removed.  It means nothing without `bypassPermissions`.
+  bypassLocalComputer: z.boolean({ error: "bypassLocalComputer must be true or false" }).optional(),
   autoReview: z.enum(["off", "shadow", "enforce"], { error: "autoReview must be off, shadow, or enforce" }).optional(),
   composio: z.boolean({ error: "composio must be true or false" }).optional(),
   // The bot's On/Off switch (shared/bot-power.ts).  Writable from a paired
@@ -158,6 +175,12 @@ const profilePatchSchema = z.object({
   computers: z.array(z.enum(["cloud", "vm", "local"])).optional(),
   // Integer 1..MAX_TOOL_ROUNDS kept; null/"" /invalid → undefined (absent).
   maxToolRounds: z.any().optional(),
+  // Integer 0..MAX_HISTORY_TURNS kept; null/"" /invalid → undefined (absent).
+  // Arrays, objects and oversized strings never reach the resolver:  they
+  // fail the patch schema itself and take the API's validation-failure 4xx
+  // path instead of being accepted and silently clearing the setting.
+  maxHistoryTurns: z.union([z.string().max(64), z.number(), z.boolean(), z.null()]).optional(),
+  historySummaryModel: z.boolean({ error: "historySummaryModel must be true or false" }).optional(),
 });
 
 export type BotProfilePatchInput = z.input<typeof profilePatchSchema>;
@@ -181,6 +204,7 @@ export type BotProfilePatch = Partial<
     | "approvePeerComms"
     | "autoApprove"
     | "bypassPermissions"
+    | "bypassLocalComputer"
     | "autoReview"
     | "composio"
     | "off"
@@ -192,6 +216,8 @@ export type BotProfilePatch = Partial<
     | "userNotes"
     | "computers"
     | "maxToolRounds"
+    | "maxHistoryTurns"
+    | "historySummaryModel"
   >
 > & { effort?: string };
 
@@ -207,9 +233,11 @@ export type BotProfilePatchResult =
  * The execution-policy fields (`autoApprove`, `autoReview`,
  * `approvePeerComms`, `bypassPermissions`) pass in both modes since the
  * owner's 2026-10-09 ruling that a paired phone may set them.  Validating the
- * VALUE is all this file does; whether a particular bot may have Auto or
- * Bypass switched on from a phone (never when it can use This Mac) is decided
- * where the stored bot is, in the profile route of server/index.ts.
+ * VALUE is all this file does.  Which switches a particular bot may have
+ * turned on from a phone is decided where the stored bot is, in the profile
+ * route of server/index.ts:  Auto Mode never for a bot that can use This Mac,
+ * and `bypassLocalComputer` follows Auto rather than plain Bypass, because
+ * both name the same act — unattended control of the real desktop.
  *
  * avatarUrl deliberately uses `undefined` as the normalized clear value.
  * Store persistence already omits undefined fields, while wireBot sends null
@@ -220,7 +248,8 @@ export type BotProfilePatchResult =
  * patch carries the complete record to store, or `undefined` to drop it.
  */
 export function parseBotProfilePatch(
-  input: BotProfilePatchInput,
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- validation boundary: the wire patch is untrusted and safeParse-checked before any field is read
+  input: unknown,
   strict = false,
   current?: { voices?: BotVoices } | null,
 ): BotProfilePatchResult {
@@ -235,12 +264,27 @@ export function parseBotProfilePatch(
     }
     const issue = parsed.error.issues[0];
     if (issue?.path[0] === "avatarCrop") {
-      return { ok: false, error: "avatarCrop must be mascot, circle, rounded, or square" };
+      // The message lists the crops a bot can actually pick.  It used to omit
+      // TV-Face, and it would have gone on omitting the animated crop, so it
+      // is built from the list the schema uses instead of being written out
+      // by hand.
+      return {
+        ok: false,
+        error: `avatarCrop must be ${BOT_AVATAR_CROPS.join(", ")}`,
+      };
     }
     return { ok: false, error: issue?.message ?? "invalid profile patch" };
   }
 
-  const { avatarUrl, cwd, connectorTools, voices, maxToolRounds: _maxToolRounds, ...fields } = parsed.data;
+  const {
+    avatarUrl,
+    cwd,
+    connectorTools,
+    voices,
+    maxToolRounds: _maxToolRounds,
+    maxHistoryTurns: _maxHistoryTurns,
+    ...fields
+  } = parsed.data;
   const patch: BotProfilePatch = fields;
   if (voices !== undefined) patch.voices = mergeBotVoices(current?.voices, voices);
   if (avatarUrl !== undefined) patch.avatarUrl = avatarUrl || undefined;
@@ -254,6 +298,11 @@ export function parseBotProfilePatch(
   // clear); key absent → leave existing value alone.
   if (Object.prototype.hasOwnProperty.call(parsed.data, "maxToolRounds")) {
     patch.maxToolRounds = resolveMaxToolRounds(parsed.data.maxToolRounds);
+  }
+  // maxHistoryTurns: same rule — key present resolves (null/"" /invalid
+  // clear), key absent leaves the stored cap alone.
+  if (Object.prototype.hasOwnProperty.call(parsed.data, "maxHistoryTurns")) {
+    patch.maxHistoryTurns = resolveMaxHistoryTurns(parsed.data.maxHistoryTurns);
   }
   return { ok: true, patch };
 }

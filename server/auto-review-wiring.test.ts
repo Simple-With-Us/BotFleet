@@ -92,7 +92,7 @@ let offeredTools: string[] = [];
  *  then, once the tool's result comes back, finish with a line of text. */
 function answerTurn(res: ServerResponse, body: ChatRequest): void {
   offeredTools = (body.tools ?? []).map((tool) => tool.function?.name ?? "");
-  const tool = offeredTools.includes("write_file") ? "write_file" : offeredTools.includes("ask_bot") ? "ask_bot" : null;
+  const tool = offeredTools.includes("write_file") ? "write_file" : offeredTools.includes("coordinate_bots") ? "coordinate_bots" : null;
   const args = tool === "write_file" ? { path: "review-notes.txt", content: "hi" } : { bot_id: "nobody", message: "hi" };
   const finished = body.messages?.at(-1)?.role === "tool" || tool === null;
   const toolCall = { index: 0, id: "call_review", type: "function", function: { name: tool, arguments: JSON.stringify(args) } };
@@ -249,7 +249,7 @@ posixOnly("auto-review on an engine without a reviewer of its own", () => {
             environment: {
               FAKE_ACP_MODE: "quiet-tool-call",
               FAKE_ACP_QUIET_MS: "1500",
-              FAKE_ACP_QUIET_TITLE: "mcp__agents__ask_bot",
+              FAKE_ACP_QUIET_TITLE: "mcp__agents__coordinate_bots",
             },
             config: { cli: FAKE_CLI, fullAuto: true },
           },
@@ -582,7 +582,7 @@ posixOnly("auto-review on an engine without a reviewer of its own", () => {
     const row = await decision((r) => r.botId === bot.id && r.decision === "review-would-deny");
     expect(row, `the ask_bot step was never reviewed. stderr:\n${stderr.slice(-2000)}`).toMatchObject({
       source: "auto-review-watch",
-      tool: "mcp__agents__ask_bot",
+      tool: "mcp__agents__coordinate_bots",
       reviewer: "reviewer",
     });
   }, 90_000);

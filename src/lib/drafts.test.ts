@@ -2,10 +2,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Attachment } from "./composer-attachments";
 import {
+  botThreadDraftId,
   foldSentDrafts,
   getDraft,
   getDraftAttachments,
   mergeRestoredDraft,
+  migrateThreadDraft,
   registerLiveDraft,
   restoreDraft,
   setDraft,
@@ -202,5 +204,57 @@ describe("restoreDraft", () => {
     expect(first).not.toHaveBeenCalled();
     expect(second).toHaveBeenCalledTimes(1);
     unregisterSecond();
+  });
+});
+
+describe("botThreadDraftId", () => {
+  it("keeps the legacy per-bot key for the active thread", () => {
+    expect(botThreadDraftId("one", "thread-a", "thread-a")).toBe("bot:one");
+    expect(botThreadDraftId("one", "", "thread-a")).toBe("bot:one");
+  });
+
+  it("gives a browsed non-active thread an independent draft", () => {
+    const store = memoryStore();
+    const activeId = botThreadDraftId("one", "thread-a", "thread-a");
+    const viewedId = botThreadDraftId("one", "thread-b", "thread-a");
+    expect(viewedId).toBe("bot:one:thread-b");
+    setDraft(store, activeId, "for the working thread");
+    setDraft(store, viewedId, "for the retained thread");
+    expect(getDraft(store, activeId)).toBe("for the working thread");
+    expect(getDraft(store, viewedId)).toBe("for the retained thread");
+    // clearing one draft leaves the other untouched
+    setDraft(store, viewedId, "");
+    expect(getDraft(store, viewedId)).toBe("");
+    expect(getDraft(store, activeId)).toBe("for the working thread");
+  });
+});
+
+describe("migrateThreadDraft", () => {
+  it("carries a browsed thread's text to the legacy key when it goes active", () => {
+    const store = memoryStore();
+    setDraft(store, "bot:one:thread-b", "typed while browsing");
+    migrateThreadDraft(store, "bot:one:thread-b", "bot:one");
+    expect(getDraft(store, "bot:one")).toBe("typed while browsing");
+    expect(getDraft(store, "bot:one:thread-b")).toBe("");
+  });
+
+  it("merges with text already waiting on the target instead of dropping either", () => {
+    const store = memoryStore();
+    setDraft(store, "bot:one", "older active text");
+    setDraft(store, "bot:one:thread-b", "typed while browsing");
+    setDraftAttachments(store, "bot:one:thread-b", [paste("p1")]);
+    migrateThreadDraft(store, "bot:one:thread-b", "bot:one");
+    expect(getDraft(store, "bot:one")).toBe("typed while browsing\n\nolder active text");
+    expect(getDraftAttachments(store, "bot:one")).toEqual([paste("p1")]);
+    expect(getDraft(store, "bot:one:thread-b")).toBe("");
+    expect(getDraftAttachments(store, "bot:one:thread-b")).toEqual([]);
+  });
+
+  it("is a no-op when the source holds nothing or the ids match", () => {
+    const store = memoryStore();
+    setDraft(store, "bot:one", "stays put");
+    migrateThreadDraft(store, "bot:one:thread-b", "bot:one");
+    migrateThreadDraft(store, "bot:one", "bot:one");
+    expect(getDraft(store, "bot:one")).toBe("stays put");
   });
 });

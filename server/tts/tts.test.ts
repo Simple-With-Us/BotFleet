@@ -109,10 +109,12 @@ describe("configuration", () => {
     expect(described).toEqual({
       configured: true,
       ready: true,
+      enabled: true,
       voice: "English_Graceful_Lady",
       provider: "minimax",
       optimizedSummary: false,
       pronunciations: SEEDED,
+      audioRetentionDays: 7,
     });
     expect(JSON.stringify(described)).not.toContain("sk-secret");
   });
@@ -316,9 +318,11 @@ describe("built-in macOS voices", () => {
     expect(described).toEqual({
       configured: onMac,
       ready: onMac,
+      enabled: true,
       voice: "Albert",
       provider: "system", optimizedSummary: false,
       pronunciations: SEEDED,
+      audioRetentionDays: 7,
     });
   });
 
@@ -354,6 +358,13 @@ describe("built-in macOS voices", () => {
     const { access } = await import("node:fs/promises");
     const { dirname } = await import("node:path");
     await expect(access(dirname(args[1]))).rejects.toThrow();
+  });
+
+  it("strips MiniMax pause tags before macOS say synthesizes", async () => {
+    const { speak } = await voice();
+    const record: string[][] = [];
+    await speak(cfg({ provider: "system" }), "Hello there. <#0.5#> Goodbye now.", "Albert", fakeSay(record));
+    expect(record.find((argv) => argv[0] === "-o")!.at(-1)).toBe("Hello there. Goodbye now.");
   });
 
   it("still demands a picked voice, and says so", async () => {

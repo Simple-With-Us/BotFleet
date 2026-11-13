@@ -8,7 +8,7 @@
 // key.  An empty voice is the workspace default, which can itself be either.
 import { isPersonalVoiceId, voiceForDevice, type BotVoices } from "../../../shared/bot-voice";
 
-export type TtsStatusLike = { configured?: boolean; ready?: boolean; voice?: string } | null | undefined;
+export type TtsStatusLike = { configured?: boolean; ready?: boolean; voice?: string; enabled?: boolean } | null | undefined;
 
 /** The id this Mac actually speaks: the bot's Mac voice, else the workspace
  * default.  "" means neither is set. */
@@ -16,7 +16,7 @@ export function effectiveVoice(voiceId: string | null | undefined, tts: TtsStatu
   return voiceId?.trim() ? voiceId : tts?.voice ?? "";
 }
 
-export type SpeakReadinessReason = "ready" | "no-engine" | "no-voice" | "personal-unavailable";
+export type SpeakReadinessReason = "ready" | "no-engine" | "no-voice" | "personal-unavailable" | "voice-off";
 
 export type SpeakReadiness = {
   ready: boolean;
@@ -32,6 +32,9 @@ export function speakReadiness(input: {
   personalVoiceAvailable: boolean;
   hasAudio?: boolean;
 }): SpeakReadiness {
+  if (input.tts?.enabled === false) {
+    return { ready: false, reason: "voice-off", personal: false };
+  }
   const voice = effectiveVoice(input.voiceId, input.tts);
   if (isPersonalVoiceId(voice)) {
     // Saved clips belong to a hosted voice; a Personal Voice is always
@@ -89,6 +92,8 @@ export function speakButtonState(input: {
       ? `${action} failed: ${speech.error ?? ""}`
       : readiness.reason === "personal-unavailable"
         ? PLAY_PERSONAL_UNAVAILABLE
+        : readiness.reason === "voice-off"
+        ? "Voice is turned off in Settings"
         : readiness.reason === "no-engine"
           ? "Add a voice engine key in settings to play audio"
           : readiness.reason === "no-voice"

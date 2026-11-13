@@ -23,6 +23,9 @@ const stableShot = {
 const LINUX_CHROME_UA =
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
+const MAC_CHROME_UA =
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+
 async function pinFonts(page: Page): Promise<void> {
   await page.addStyleTag({
     content: `
@@ -139,4 +142,32 @@ test('visual: ComputerPanel VPS auto-start and off-computer warnings', async ({ 
 
   await expect(autoStart).toHaveScreenshot('computer-panel-vps-auto-start.png', stableShot);
   await expect(schedule).toHaveScreenshot('computer-panel-schedule-off.png', stableShot);
+});
+
+test('visual: ComputerPanel preview computer picker labels (Linux host)', async ({ page }) => {
+  await page.goto('/?fixture=computer-panel&warning=source-picker');
+  await pinFonts(page);
+
+  const picker = page.getByRole('group', { name: 'Preview Computer' });
+  await expect(picker).toBeVisible();
+  await expect(picker.getByRole('button', { name: /This Computer/ })).toBeVisible();
+
+  await expect(picker).toHaveScreenshot('computer-source-picker-linux.png', stableShot);
+});
+
+test.describe('mac host labels', () => {
+  test.use({ userAgent: MAC_CHROME_UA });
+
+  test('visual: ComputerPanel preview computer picker labels (Mac host)', async ({ page }) => {
+    await page.goto('/?fixture=computer-panel&warning=source-picker');
+    await pinFonts(page);
+
+    const picker = page.getByRole('group', { name: 'Preview Computer' });
+    await expect(picker).toBeVisible();
+    await expect(picker.getByRole('button', { name: /This Mac/ })).toBeVisible();
+    await picker.getByRole('button', { name: /This Mac/ }).click();
+    await expect(picker.getByRole('button', { name: /This Mac/, pressed: true })).toBeVisible();
+
+    await expect(picker).toHaveScreenshot('computer-source-picker-mac-selected.png', stableShot);
+  });
 });

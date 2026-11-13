@@ -265,9 +265,23 @@ struct TranscriptFollowModifier: ViewModifier {
     }
 
     private func fold(previous: TranscriptScrollSample, current: TranscriptScrollSample, driver: TranscriptScrollDriver) {
+        // The first reading has nothing to be compared against. It lands
+        // while the scroll view is still being anchored and before the
+        // view's own open-the-newest scroll has run, so the reader has not
+        // moved — but `observe` sees an offset that differs from the one the
+        // scroll view was constructed with and calls it a scroll away from
+        // the bottom.  That decision is a trap: it flips the size-change
+        // anchor to `.top`, which yanks the transcript to the oldest message,
+        // and every follow scroll after it is suppressed because follow is
+        // now off.  The result is a chat that opens on the first message with
+        // "Jump to Latest" showing, for a reader who never scrolled.
+        //
+        // So a decision needs two readings.  The first one is recorded and
+        // returns; nothing can have been scrolled away from yet.
+        let isFirstReading = tracker.lastSample == nil
         tracker.lastSample = current
         var next = follow
-        if next.observe(
+        if !isFirstReading, next.observe(
             from: previous,
             to: current,
             driver: driver,
@@ -276,6 +290,8 @@ struct TranscriptFollowModifier: ViewModifier {
         ) {
             follow = next
             TranscriptScrollLog.event(next.isFollowing ? "following" : "stopped following", current)
+        } else if isFirstReading {
+            TranscriptScrollLog.event("first reading, no decision \(current)", current)
         }
         if next.shouldRepin(at: current, driver: driver) {
             TranscriptScrollLog.event("layout left the bottom while following, repinning", current)
@@ -425,7 +441,13 @@ struct JumpToLatestPill: View {
 /// `xcrun simctl spawn booted log show --predicate 'category == "transcript-scroll"'`.
 enum TranscriptScrollLog {
 #if DEBUG
-    static let enabled = ProcessInfo.processInfo.arguments.contains("-scroll-demo")
+    /// Any harness that seeds a transcript and then expects the reader to be
+    /// at the bottom of it needs the trace: `-chat-fixture` opens on a
+    /// scripted thread, and a follow decision made during launch is not
+    /// something a screenshot can explain.
+    static let enabled = ProcessInfo.processInfo.arguments.contains {
+        ["-scroll-demo", "-chat-fixture", "-chat-fixture-code"].contains($0)
+    }
     private static let logger = Logger(subsystem: "app.botfleet", category: "transcript-scroll")
 #endif
 

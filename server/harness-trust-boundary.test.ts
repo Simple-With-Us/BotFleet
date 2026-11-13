@@ -261,6 +261,14 @@ describe("harness trust boundary", () => {
       // forwarded by the companion with its own content-type.
       const upload = await raw("/api/attachments", "not-json", { "content-type": "image/png" });
       expect(upload.status).not.toBe(415);
+      const xaiAudio = await raw("/api/stt/xai/sessions/sess-test/audio", "pcm", {
+        "content-type": "application/octet-stream",
+      });
+      expect(xaiAudio.status).not.toBe(415);
+      const xaiPlain = await raw("/api/stt/xai/sessions/sess-test/audio", "pcm", {
+        "content-type": "text/plain",
+      });
+      expect(xaiPlain.status).toBe(415);
       // A bodyless mutating request has no content type to check.
       const stoppable = (await api("POST", "/api/bots", { name: "Stopper" })).body.bot;
       expect((await api("POST", `/api/bots/${stoppable.id}/interrupt`, {})).status).not.toBe(415);
@@ -309,7 +317,7 @@ describe("harness trust boundary", () => {
       const other = (await api("POST", "/api/bots", { name: "Victim" })).body.bot;
       const res = await api(
         "POST",
-        "/api/internal/ask-bot",
+        "/api/internal/coordinate-bots",
         { fromBotId: other.id, toBotId: grant.botId, message: "hi", depth: 0 },
         { authorization: `Bearer ${grant.token}` },
       );
@@ -322,7 +330,7 @@ describe("harness trust boundary", () => {
       // is an escalation the caller was never granted.
       const res = await api(
         "POST",
-        "/api/internal/ask-bot",
+        "/api/internal/coordinate-bots",
         { fromBotId: grant.botId, toBotId: grant.botId, message: "and again", depth: 1 },
         { authorization: `Bearer ${grant.token}` },
       );
@@ -333,8 +341,8 @@ describe("harness trust boundary", () => {
     it("lets the same token speak for its own bot, and turns away another bot's name", async () => {
       // The positive half, on the one route that answers immediately: the
       // grant is for THIS bot, so this bot's own name stands and only another
-      // name is refused.  (ask-bot is not the control — it dispatches a real
-      // peer turn and this fixture has no second engine.)
+      // name is refused.  (coordinate-bots is not the control — it records a
+      // real assignment and this fixture has no second engine.)
       const other = (await api("POST", "/api/bots", { name: "Target" })).body.bot;
       const own = await api("GET", `/api/internal/agents?self=${grant.botId}`, undefined, {
         authorization: `Bearer ${grant.token}`,

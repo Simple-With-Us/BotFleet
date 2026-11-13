@@ -12,6 +12,12 @@ import {
   type RemoteQuotaWindow,
 } from "./usage-quota.ts";
 
+const planMetadata = {
+  detectedPlanName: "Ultra", userPlanName: "My Pro", userCostUsd: "20.00",
+  userRenewalDateText: "Next Friday", userSubtitle: "Work account",
+  showCostAndRenewal: true, hasMismatch: true,
+};
+
 const opus: RemoteQuotaWindow = {
   id: "claude-opus-4-6-thinking",
   provider: "google-antigravity",
@@ -28,6 +34,19 @@ const opus: RemoteQuotaWindow = {
 };
 
 describe("usage quota mapping", () => {
+  it("preserves structured HTTP plan metadata without interpreting billing", () => {
+    const poller = new UsageQuotaPoller();
+    const untrustedMetadata = { ...planMetadata, secret: "drop", userSubtitle: "x".repeat(501) };
+    poller.applyPayload({ ok: true, generatedAt: new Date().toISOString(), windows: [{ ...opus, skip: false, planName: "Ultra", planMetadata: untrustedMetadata }], skipModelTypes: [], skipModelIds: [] }, []);
+    const window = poller.getWindows()[0];
+    expect(window.planMetadata).toEqual({
+      detectedPlanName: "Ultra", userPlanName: "My Pro", userCostUsd: "20.00",
+      userRenewalDateText: "Next Friday", showCostAndRenewal: true, hasMismatch: true,
+    });
+    expect(window.planMetadata).not.toHaveProperty("secret");
+    expect(window.planName).toBe("Ultra");
+  });
+
   it("derives quota-windows URL from the ingest endpoint", () => {
     expect(quotaWindowsUrl("https://usage.jays.services/api/ingest/usage")).toBe(
       "https://usage.jays.services/api/quota-windows",

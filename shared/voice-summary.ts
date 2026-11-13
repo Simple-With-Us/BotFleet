@@ -13,8 +13,8 @@ export type VoiceSummaryMode = "off" | "on_demand" | "always";
  * bot is "on_demand": a reply is distilled when it is played.
  *
  * Distilled means the DeepSeek pass (server/tts/speech-summary.ts): the reply
- * rewritten for the ear, with numbers, codes, acronyms and links spelled out
- * and code skipped.  That is what the owner wants spoken (owner correction,
+ * kept word-for-word for Apple Personal Voice, with punctuation and pause
+ * markers adjusted only (BF-1773).  That is what the owner wants spoken (owner correction,
  * 2026-10-08: "Why would I want to spend a bunch of time and energy and money
  * having an llm distill speech to optimize for spoken word if I didn't want
  * to use it", and "I never said I wanted it read word for word").  It

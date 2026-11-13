@@ -28,6 +28,14 @@ import { cn } from "@/lib/cn";
 import { railAsideClass } from "@/lib/layout-rails";
 import { usePageVisible } from "@/lib/page-visible";
 import {
+  resolvePreviewSource,
+  choiceSurvives,
+  hasPreviewChoice,
+  type ComputerKind,
+  type PreviewChoice,
+} from "@/lib/computer-source";
+import { ComputerSourcePicker } from "./ComputerSourcePicker";
+import {
   captureFailureIsActionable,
   cloudCaptureErrorIsStale,
   decideCloudPreview,
@@ -44,11 +52,17 @@ import { LinuxLocalControl } from "./LinuxLocalControl";
 import { MacLocalControl } from "./MacLocalControl";
 import { LocalComputerAutoWarning } from "./LocalComputerAutoWarning";
 import {
+  COMPUTER_REACH_CHECKING,
   autoSelectsLocalComputer,
+  cloudBackendUnavailableNote,
+  computerDestinationDisabledReason,
+  engineReachKnown,
+  instanceSupportsCloudComputer,
   instanceSupportsLocalComputer,
   linuxAutoDescription,
   localComputerDisabledReason,
   localComputerSelectable,
+  runsOnDisabledNote,
 } from "@/lib/local-computer";
 import { botCloudBackend, cloudBackendInherited, cloudDestinationLabel } from "@/lib/cloud-backend";
 import { vpsComputerNeedsReplacement, type VpsComputerStatus } from "@/lib/vps-computer";
@@ -151,6 +165,26 @@ export function ComputerPanel({
   const [error, setError] = useState<string | null>(null);
   const [creatingRoutine, setCreatingRoutine] = useState(false);
   const [panelView, setPanelView] = useState<"computer" | "android">("computer");
+
+  // WHICH computer the preview is looking at, when the bot holds more than
+  // one.  Auto is the default and reproduces the precedence this panel always
+  // used; the override exists because "the bot has a Local VM" and "the Local
+  // VM actually works for this bot" are different claims and only the second
+  // one is visible.  Picking a source the bot does not hold falls back to auto
+  // rather than showing a computer it has no claim to.
+  const [previewChoice, setPreviewChoice] = useState<PreviewChoice>("auto");
+  // A choice made for a previous bot must not follow the selection.
+  useEffect(() => {
+    setPreviewChoice("auto");
+  }, [bot.id]);
+  const heldComputers = (bot.computers ?? []).filter(
+    (c): c is ComputerKind => c !== "off",
+  );
+  const platformIsMac =
+    capabilities.host.platform === "darwin" ||
+    (capabilities.host.platform === "other" &&
+      globalThis.navigator?.userAgent.includes("Mac") === true);
+  const previewSource = resolvePreviewSource(heldComputers, previewChoice);
   const androidStatus = useAndroidUsbDevices();
   const androidConnected = androidStatus.devices.length > 0;
   // bumped when a Box API key is saved inline, to re-run the spin-up flow
@@ -193,8 +227,14 @@ export function ComputerPanel({
       selectedInstance.capabilities?.computerMcp &&
       selectedInstance.driverKind !== "boxAgent",
   );
-  const computerToolSupported = selectedInstance?.capabilities?.computerMcp === true;
-  const vpsSupported = Boolean(computerToolSupported && selectedInstance?.driverKind !== "boxAgent");
+  // Reach is derived once on the server.  Until that list is in, remote
+  // choices stay grey instead of looking selectable for an HTTP engine.
+  const reachReady = engineReachKnown({
+    instances: state.instances,
+    hydrationStatus: state.hydration.status,
+  });
+  const vpsSupported = reachReady && instanceSupportsCloudComputer(state.instances, bot, "vps");
+  const boxSupported = reachReady && instanceSupportsCloudComputer(state.instances, bot, "box");
   // Resolved, never `bot.cloudBackend ?? "box"`: a bot that never opened the
   // picker inherits the workspace default, and the server resolves it that way
   // for the status body this panel is about to parse.  Reading the bot's own
@@ -202,9 +242,18 @@ export function ComputerPanel({
   // lifecycle.  Everything downstream — labels, the status shape, the sleep and
   // provision calls, this effect's deps — hangs off this one const.
   const cloudBackend = botCloudBackend(bot, state.config?.botDefaults?.cloudBackend);
-  const cloudSupported = cloudBackend === "vps"
-    ? vpsSupported
-    : computerToolSupported || selectedInstance?.driverKind === "boxAgent";
+  const cloudSupported = cloudBackend === "vps" ? vpsSupported : boxSupported;
+  const cloudNote = reachReady
+    ? cloudBackendUnavailableNote(state.instances, bot, platformIsMac)
+    : COMPUTER_REACH_CHECKING;
+  const cloudReason = reachReady
+    ? computerDestinationDisabledReason("cloud", state.instances, bot, cloudBackend, platformIsMac)
+    : COMPUTER_REACH_CHECKING;
+  const vmReason = reachReady
+    ? computerDestinationDisabledReason("vm", state.instances, bot, cloudBackend, platformIsMac)
+    : COMPUTER_REACH_CHECKING;
+  const cloudPickerVisible = !bot.computers || (bot.computers ?? []).includes("cloud");
+  const runsOnNote = runsOnDisabledNote(cloudReason, vmReason, cloudNote, cloudPickerVisible);
   const botRoutines = state.routines
     .filter((routine) => routine.botId === bot.id)
     .sort((a, b) => Number(b.enabled) - Number(a.enabled) || (a.nextRunAt ?? Infinity) - (b.nextRunAt ?? Infinity));
@@ -245,9 +294,9 @@ export function ComputerPanel({
       setPhase("off");
       return;
     }
-    if ((bot.computers ?? []).includes("vm")) {
+    if (previewSource === "vm") {
       if (!vmSupported) {
-        setError("This model engine cannot use the Local VM. Choose Claude or an ACP engine.");
+        setError("This bot cannot use the Local VM.\u00A0 Choose Claude or an ACP engine.");
         setPhase("vm-unavailable");
         return;
       }
@@ -298,26 +347,34 @@ export function ComputerPanel({
         if (retryTimer !== undefined) window.clearTimeout(retryTimer);
       };
     }
-    if ((bot.computers ?? []).includes("cloud") && !cloudSupported) {
-      setError("This model engine cannot use cloud computer tools. Choose Claude, an ACP engine, or the ASCII.dev Box engine.");
+    if (previewSource === "cloud" && !cloudSupported) {
+      if (!reachReady) {
+        setPhase("checking");
+        return;
+      }
+      setError("This bot cannot use cloud computer tools.\u00A0 Choose Claude, an ACP engine, or ASCII.dev Box.");
       setPhase("error");
       return;
     }
-    if ((bot.computers ?? []).includes("local") && !(bot.computers ?? []).includes("cloud")) {
+    if (previewSource === "local") {
       if (!providerSupportsLocal) {
         setError("This model engine has no approval channel for actions on this computer, so it cannot control it.  Choose another engine, or another destination.");
       }
       setPhase(capabilitiesReady && localAvailable && providerSupportsLocal ? "local" : "local-unavailable");
       return;
     }
-    if (!(bot.computers ?? []).includes("cloud") && !capabilitiesReady) return;
+    if (previewSource !== "cloud" && !capabilitiesReady) return;
     if (cloudBackend === "vps") {
       const autoLocal =
         !isLinux && !(bot.computers ?? []).includes("cloud") && capabilitiesReady && localSelectable;
       if (!vpsSupported) {
+        if (!reachReady) {
+          setPhase("checking");
+          return;
+        }
         if (autoLocal) setPhase("local");
         else {
-          setError("This model engine cannot use a self-hosted VPS. Choose Claude or an ACP engine, or switch the cloud backend to Box.");
+          setError("This bot cannot use a self-hosted VPS.\u00A0 Choose Claude or an ACP engine, or switch the cloud backend to Box.");
           setPhase("error");
         }
         return;
@@ -418,6 +475,11 @@ export function ComputerPanel({
   }, [
     bot.id,
     bot.computers,
+    // The resolved SOURCE, not the raw list: switching the preview has to
+    // re-resolve the mode, or the panel keeps painting the computer the person
+    // just navigated away from.  `previewSource` changes whenever the choice
+    // does and whenever the bot's holdings do, so it subsumes both.
+    previewSource,
     bot.autoStartVps,
     cloudBackend,
     retry,
@@ -428,6 +490,7 @@ export function ComputerPanel({
     vmSupported,
     cloudSupported,
     vpsSupported,
+    reachReady,
     state.config?.vps?.sshAlias,
   ]);
 
@@ -567,7 +630,7 @@ export function ComputerPanel({
     };
   }, []);
   useEffect(() => {
-    if (!preview.poll) return;
+    if (!preview.poll || !pageVisible) return;
     const shoot = () => {
       pendingCapture.current ??= (async () => {
         try {
@@ -627,7 +690,7 @@ export function ComputerPanel({
     return () => {
       clearInterval(timer);
     };
-  }, [preview.poll, preview.intervalMs, bot.id]);
+  }, [preview.poll, preview.intervalMs, bot.id, pageVisible]);
 
   // Local VM preview comes directly from Computer Driver through the harness. It
   // does not use the password-protected noVNC viewer or cloud endpoints.
@@ -980,12 +1043,28 @@ export function ComputerPanel({
       ) : (
       <div className="flex-1 overflow-y-auto px-5 pb-5">
           {/* Screen preview */}
-          <div className="mb-1.5 mt-2 flex items-center justify-between text-[13px] text-ink-secondary">
-            <span>{bot.name}'s screen</span>
-            {phase === "local" && <span className="text-[11px]">this computer</span>}
-            {phase === "vm" && <span className="text-[11px]">Local VM</span>}
-            {cloudBackend === "vps" && (phase === "ready" || phase === "starting") && <span className="text-[11px]">self-hosted VPS</span>}
-        </div>
+          <div className="mb-1.5 mt-2 flex items-center justify-between gap-3 text-[13px] text-ink-secondary">
+            <span className="truncate">{bot.name}'s screen</span>
+            {/* Only when the bot actually holds more than one: a one-option
+                control is noise.  The label doubles as the answer to "which
+                computer am I looking at", which is the question this exists to
+                answer — so it names the destination, never just "Cloud". */}
+            {hasPreviewChoice(heldComputers) ? (
+              <ComputerSourcePicker
+                computers={heldComputers}
+                choice={choiceSurvives(previewChoice, heldComputers)}
+                cloudBackend={cloudBackend}
+                platformIsMac={platformIsMac}
+                onChange={setPreviewChoice}
+              />
+            ) : (
+              <>
+                {phase === "local" && <span className="text-[11px]">this computer</span>}
+                {phase === "vm" && <span className="text-[11px]">Local VM</span>}
+                {cloudBackend === "vps" && (phase === "ready" || phase === "starting") && <span className="text-[11px]">self-hosted VPS</span>}
+              </>
+            )}
+          </div>
         <div className="flex aspect-[16/10] w-full items-center justify-center overflow-hidden rounded-xl bg-card">
           {frameSrc && previewOpensDesktop ? (
             <button
@@ -1318,17 +1397,21 @@ export function ComputerPanel({
                   (mode === "cloud" && !cloudSupported) ||
                   (mode === "vm" && !vmSupported) ||
                   (mode === "local" && !localSelectable);
+                const selected = mode === "off"
+                  ? (bot.computers ?? []).length === 0
+                  : (bot.computers ?? []).includes(mode as any);
                 const unavailableTitle =
                   mode === "vm" && !vmSupported
-                    ? "This model engine cannot use the Local VM"
+                    ? vmReason ?? "This model engine cannot use the Local VM"
                     : mode === "cloud" && !cloudSupported
-                      ? "This model engine cannot use cloud computer tools"
+                      ? cloudReason ?? cloudNote ?? undefined
                       : mode === "local" && !localSelectable
                         ? localDisabledReason ?? "Local computer control isn't ready"
                           : undefined;
                 return (
               <button
                 key={mode}
+                type="button"
                 disabled={disabled}
                 title={unavailableTitle}
                 onClick={() => {
@@ -1348,9 +1431,8 @@ export function ComputerPanel({
                   "flex-1 py-1.5 text-[13px]",
                   i > 0 && "border-l border-hairline/40",
                   disabled && "cursor-not-allowed opacity-40",
-                  (mode === "off" ? (bot.computers ?? []).length === 0 : (bot.computers ?? []).includes(mode as any))
-                    ? "bg-control text-ink font-medium"
-                    : "text-ink-secondary hover:bg-control/60 hover:text-ink",
+                  selected ? "bg-control text-ink font-medium" : "text-ink-secondary",
+                  !disabled && !selected && "hover:bg-control/60 hover:text-ink",
                 )}
               >
                 {label}
@@ -1359,12 +1441,20 @@ export function ComputerPanel({
               })()
             ))}
           </div>
+          {runsOnNote && (
+            <div className="mt-2 text-[11.5px] leading-relaxed text-ink-secondary">
+              {runsOnNote}
+            </div>
+          )}
           {(!bot.computers || (bot.computers ?? []).includes("cloud")) && (
             <>
               <CloudBackendPicker
                 value={cloudBackend}
                 inherited={cloudBackendInherited(bot)}
                 vpsSupported={vpsSupported}
+                boxSupported={boxSupported}
+                engineName={selectedInstance?.displayName}
+                unavailableNote={cloudNote}
                 onChange={(backend) => dispatch({ type: "updateBot", botId: bot.id, patch: { cloudBackend: backend } })}
               />
               {!(bot.computers?.length) && cloudBackend === "vps" && (
