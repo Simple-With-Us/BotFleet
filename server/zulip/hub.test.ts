@@ -2278,7 +2278,7 @@ describe("peer budget holds", () => {
       });
     }
     // the archive is down: the trim must not happen, nothing is counted
-    const store = sessionOf(hub).hub.store;
+    const store = hub.store;
     const spy = vi.spyOn(store, "archiveDroppedItems").mockImplementation(() => {
       throw new Error("injected archive failure");
     });

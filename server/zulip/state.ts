@@ -27,7 +27,7 @@ import { z } from "zod";
 
 import { writeFileAtomic } from "../atomic.ts";
 import { canonicalZulipRole } from "../launch-identity.ts";
-import type { ZulipWorkUnit } from "./types.ts";
+import type { ZulipInboundItem, ZulipOrigin, ZulipWorkUnit } from "./types.ts";
 
 export const HANDLED_RING_LIMIT = 2000;
 const WAKE_LEDGER_MS = 24 * 3600_000;
