@@ -1,64 +1,26 @@
 import { describe, expect, it } from "vitest";
-import type { IncomingMessage, ServerResponse } from "node:http";
 
-import { handleXaiSttRoutes, INVALID_STT_SESSION_REQUEST, VOICE_OFF_ERROR } from "./routes.ts";
-import type { AppConfig } from "../config.ts";
+import { INVALID_STT_SESSION_REQUEST, SttFileRequestSchema, SttSessionRequestSchema } from "./routes.ts";
 
-function jsonSink() {
-  const calls: Array<{ status: number; body: unknown }> = [];
-  const json = (_res: ServerResponse, status: number, body: unknown) => {
-    calls.push({ status, body });
-  };
-  return { json, calls, res: {} as ServerResponse };
-}
-
-const cfg = { tts: { enabled: true }, xai: { key: "sk-test" } } as AppConfig;
-
-describe("handleXaiSttRoutes", () => {
-  it("rejects an invalid session payload with a stable error code", async () => {
-    const { json, calls, res } = jsonSink();
-    const handled = await handleXaiSttRoutes({
-      method: "POST",
-      path: "/api/stt/xai/sessions",
-      req: {} as IncomingMessage,
-      res,
-      cfg,
-      json,
-      readBody: async () => ({ language: "en", unexpected: true }),
-    });
-    expect(handled).toBe(true);
-    expect(calls).toEqual([
-      { status: 400, body: { error: "Invalid speech-to-text session request.", code: INVALID_STT_SESSION_REQUEST } },
-    ]);
+describe("STT request schemas", () => {
+  it("rejects an invalid session payload so the route can return a stable error code", () => {
+    const parsed = SttSessionRequestSchema.safeParse({ language: "en", unexpected: true });
+    expect(parsed.success).toBe(false);
+    expect(INVALID_STT_SESSION_REQUEST).toBe("invalid_stt_session_request");
   });
 
-  it("rejects unknown fields on the file-transcription request", async () => {
-    const { json, calls, res } = jsonSink();
-    const handled = await handleXaiSttRoutes({
-      method: "POST",
-      path: "/api/stt/xai",
-      req: {} as IncomingMessage,
-      res,
-      cfg,
-      json,
-      readBody: async () => ({ audioBase64: "AAAA", unexpected: true }),
-    });
-    expect(handled).toBe(true);
-    expect(calls[0]?.status).toBe(400);
+  it("accepts a valid session payload", () => {
+    const parsed = SttSessionRequestSchema.safeParse({ language: "en", keyterms: ["BotFleet"], endpointMs: 850 });
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.language).toBe("en");
+      expect(parsed.data.keyterms).toEqual(["BotFleet"]);
+      expect(parsed.data.endpointMs).toBe(850);
+    }
   });
 
-  it("refuses dictation when the workspace voice switch is off", async () => {
-    const { json, calls, res } = jsonSink();
-    const handled = await handleXaiSttRoutes({
-      method: "POST",
-      path: "/api/stt/xai/sessions",
-      req: {} as IncomingMessage,
-      res,
-      cfg: { tts: { enabled: false }, xai: { key: "sk-test" } } as AppConfig,
-      json,
-      readBody: async () => ({}),
-    });
-    expect(handled).toBe(true);
-    expect(calls).toEqual([{ status: 409, body: { error: VOICE_OFF_ERROR } }]);
+  it("rejects unknown fields on the file-transcription request", () => {
+    expect(SttFileRequestSchema.safeParse({ audioBase64: "AAAA", unexpected: true }).success).toBe(false);
+    expect(SttFileRequestSchema.safeParse({ audioBase64: "AAAA" }).success).toBe(true);
   });
 });

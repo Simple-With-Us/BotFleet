@@ -3,6 +3,7 @@ import { z } from "zod";
 
 import { voiceMasterEnabled } from "../../shared/voice-master.ts";
 import type { AppConfig } from "../config.ts";
+import type { XaiSttFileResult } from "../../shared/xai-stt.ts";
 import { transcribeFile } from "./xai.ts";
 import {
   appendXaiSttAudio,
@@ -22,11 +23,11 @@ export type SttJsonResponse =
   | { error: string; code?: string }
   | { sessionId: string }
   | { ok: true }
-  | { text: string; duration?: number };
+  | XaiSttFileResult;
 
 type JsonFn = (res: ServerResponse, status: number, body: SttJsonResponse) => ServerResponse | void;
 
-const SttFileRequestSchema = z.object({
+export const SttFileRequestSchema = z.object({
   audioBase64: z.string().max(12_000_000),
   filename: z.string().max(255).optional(),
   mime: z.string().max(127).optional(),
@@ -34,11 +35,12 @@ const SttFileRequestSchema = z.object({
   keyterms: z.array(z.string().max(50)).max(100).optional(),
 }).strict();
 
-const SttSessionRequestSchema = z.object({
+export const SttSessionRequestSchema = z.object({
   language: z.string().max(32).optional(),
   keyterms: z.array(z.string().max(50)).max(100).optional(),
   endpointMs: z.number().finite().max(60_000).optional(),
 }).strict();
+
 
 function readRawBytes(req: IncomingMessage, maxBytes = 1_000_000): Promise<Buffer> {
   return new Promise((resolve, reject) => {

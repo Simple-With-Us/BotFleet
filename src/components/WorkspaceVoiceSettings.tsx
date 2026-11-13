@@ -429,8 +429,8 @@ export function VoiceMasterSwitch({
           aria-label="Voice on"
           disabled={saving}
           onClick={() => {
-            void save(!enabled).catch((caught: unknown) => {
-              console.error(caught instanceof Error ? caught.message : "Could not save the voice switch.");
+            void save(!enabled).catch(() => {
+              console.error("Could not save the voice switch.");
             });
           }}
           className={cn(

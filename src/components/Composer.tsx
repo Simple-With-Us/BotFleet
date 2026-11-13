@@ -752,7 +752,7 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
       // An ordinary mic-off still drains the last formatted cloud turn.
       void (async () => {
         try {
-          if (drainsFinal && !callStarted) await session.finish();
+          if (session && drainsFinal && !callStarted) await session.finish();
           else await session?.stop();
         } catch {
           // A provider can close during navigation; still detach listeners.
