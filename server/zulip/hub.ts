@@ -57,7 +57,7 @@ import {
   type ZulipTarget,
 } from "./outbound.ts";
 import { DEFAULT_OWNER_CLIENTS, classify, wakeVerdict, type Classification, type RouterContext, type WakeReason, type WakeVerdict } from "./router.ts";
-import { HANDLED_RING_LIMIT, MAX_NOTICE_ATTEMPTS, PENDING_NOTICE_LIMIT, ZulipStateStore, emptyState, type ZulipBotState } from "./state.ts";
+import { HANDLED_RING_LIMIT, MAX_NOTICE_ATTEMPTS, PENDING_NOTICE_LIMIT, ZulipStateStore, emptyState, type ZulipBotState, type ZulipPendingNotice } from "./state.ts";
 import type { PluginEventEnvelope } from "../../shared/plugin-events.ts";
 import { ZULIP_OUTGOING_MAX_ATTEMPTS, ZulipOutgoingSpool } from "./outgoing-spool.ts";
 import type { ZulipIdentity, ZulipInboundItem, ZulipMessage, ZulipOrigin, ZulipSettings, ZulipUser } from "./types.ts";
@@ -638,6 +638,7 @@ class ZulipSession {
       this.state = { ...emptyState(this.role), pending: prior.pending, notices: prior.notices, dms: prior.dms };
       if (prior.noticesDroppedOnLoad !== undefined) this.state.noticesDroppedOnLoad = prior.noticesDroppedOnLoad;
       if (prior.noticesArchived !== undefined) this.state.noticesArchived = prior.noticesArchived;
+      if (prior.pendingDroppedOnLoad !== undefined) this.state.pendingDroppedOnLoad = prior.pendingDroppedOnLoad;
       this.seedSeen();
     }
     this.state.userId = me.user_id;
@@ -1417,6 +1418,7 @@ export class ZulipHub {
           session,
           `[botfleet] ${session.role}: stopped a peer chain in ${originAsData(origin)} at the limit (peerChainLimit); message ${id} was not answered. The chain resumes when the owner speaks there.`,
           `[botfleet] ${session.role}: stopped a peer chain at the limit (peerChainLimit); message ${id} was not answered (origin names withheld: the label tripped the content check). The chain resumes when the owner speaks there.`,
+          `loop-guard:${id}`,
         );
         this.log(`[zulip] ${session.role}: message ${id} not woken (${refusal}); owner notice queued`);
         session.save(true);
@@ -1595,27 +1597,6 @@ export class ZulipHub {
     }
   }
 
-  /** Send owner DMs the hourly cap queued, oldest first, as the window
-   *  allows.  Delivery semantics, honestly:
-   *  - the cap still holds: every resend counts against the same dms ledger;
-   *  - ack: a notice leaves the queue only after its post resolves, and the
-   *    state is saved after each one, narrowing the crash window;
-   *  - failure: a thrown post keeps the notice and backs it off (30s, 60s,
-   *    ... capped at 15m), so a persistent outage is not hammered every
-   *    drain tick.  A throw can mean the DM actually landed (an ambiguous
-   *    outcome): delivery is AT-LEAST-ONCE - every throw that actually
-   *    delivered produces a duplicate, several under repeated ambiguous
-   *    failures.  After MAX_NOTICE_ATTEMPTS failures the notice is marked
-   *    undeliverable and escalated with a content-free alarm - the
-   *    obligation is surfaced, not dropped, and failure is never reported
-   *    as delivery.  A failed save after a successful post can likewise
-   *    redeliver that notice after a restart;
-   *  - terminal failure: a notice that can never pass checkContent is
-   *    MARKED undeliverable and kept in the state file (durable evidence),
-   *    and a content-free alarm DM is queued through this same mechanism so
-   *    the refusal is actionable, never silently lost;
-   *  - concurrency: the drain loop is the only caller and it is serial per
-   *    session, so no two flushes interleave on one queue. */
   /** One held-wake timer per session: re-armed only when the earliest due
    *  time moves, cleared when the queue drains or the session stops, so a
    *  long hold can never stack timers that all fire at once.  Visible (not
@@ -1647,6 +1628,27 @@ export class ZulipHub {
     this.noticeLossReported.set(session, seen);
   }
 
+  /** Send owner DMs the hourly cap queued, oldest first, as the window
+   *  allows.  Delivery semantics, honestly:
+   *  - the cap still holds: every resend counts against the same dms ledger;
+   *  - ack: a notice leaves the queue only after its post resolves, and the
+   *    state is saved after each one, narrowing the crash window;
+   *  - failure: a thrown post keeps the notice and backs it off (30s, 60s,
+   *    ... capped at 15m), so a persistent outage is not hammered every
+   *    drain tick.  A throw can mean the DM actually landed (an ambiguous
+   *    outcome): delivery is AT-LEAST-ONCE - every throw that actually
+   *    delivered produces a duplicate, several under repeated ambiguous
+   *    failures.  After MAX_NOTICE_ATTEMPTS failures the notice is marked
+   *    undeliverable and escalated with a content-free alarm - the
+   *    obligation is surfaced, not dropped, and failure is never reported
+   *    as delivery.  A failed save after a successful post can likewise
+   *    redeliver that notice after a restart;
+   *  - terminal failure: a notice that can never pass checkContent is
+   *    MARKED undeliverable and kept in the state file (durable evidence),
+   *    and a content-free alarm DM is queued through this same mechanism so
+   *    the refusal is actionable, never silently lost;
+   *  - concurrency: the drain loop is the only caller and it is serial per
+   *    session, so no two flushes interleave on one queue. */
   private async flushNotices(session: ZulipSession): Promise<void> {
     this.reportNoticeLoss(session);
     // A dry run posts nothing at all, and a session that has not
@@ -1711,8 +1713,11 @@ export class ZulipHub {
   /** Queue a content-free owner notice through the same durable path a
    *  refused owner DM uses: deduped, capped, logged when it cannot be
    *  queued, never silently dropped.  The text carries origins and counts,
-   *  never message content. */
-  private enqueueOwnerNotice(session: ZulipSession, text: string, safeFallback?: string): void {
+   *  never message content.  Distinct events whose rendered text happens to
+   *  match (the content-free fallbacks keep only counts, by design) are
+   *  still distinct: the caller passes an event key and dedup matches on
+   *  the key, never on the rendered text alone. */
+  private enqueueOwnerNotice(session: ZulipSession, text: string, safeFallback?: string, eventKey?: string): void {
     // The origin label is peer-controlled data: pre-check the text here so
     // a label that trips the content check never enters the queue (the
     // flush would refuse it every time and the owner would lose the
@@ -1732,12 +1737,22 @@ export class ZulipHub {
       return;
     }
     const notices = session.state.notices;
-    if (notices.some((n) => !n.failed && n.userId === ownerId && n.text === noticeText)) return;
+    const duplicate = notices.some(
+      (n) => !n.failed && n.userId === ownerId && (eventKey !== undefined ? n.eventKey === eventKey : n.text === noticeText),
+    );
+    if (duplicate) {
+      // A repeat of an event already queued is not a drop: say so,
+      // content-free, instead of returning bare.
+      this.log(`[zulip] ${session.role}: owner notice for this event is already queued; not duplicated`);
+      return;
+    }
     if (notices.filter((n) => !n.failed).length >= PENDING_NOTICE_LIMIT) {
       this.log(`[zulip] ${session.role}: owner notice NOT queued (queue full at ${PENDING_NOTICE_LIMIT}); text withheld from the log (may carry peer-controlled names), ${noticeText.length} char(s)`);
       return;
     }
-    notices.push({ at: this.now(), userId: ownerId, text: noticeText, attempts: 0 });
+    const notice: ZulipPendingNotice = { at: this.now(), userId: ownerId, text: noticeText, attempts: 0 };
+    if (eventKey !== undefined) notice.eventKey = eventKey;
+    notices.push(notice);
     session.markDirty();
     session.save();
     this.log(`[zulip] ${session.role}: owner notice queued (${notices.filter((n) => !n.failed).length} pending)`);
@@ -1982,6 +1997,7 @@ export class ZulipHub {
             session,
             `[botfleet] ${session.role}: a held peer request expired unanswered after ${UNIT_MAX_AGE_MS / 3600_000}h in ${originAsData(unit.origin)}; ${unit.items.length} message(s) never reached a turn${unit.dropped ? `, and ${unit.dropped} more were trimmed at the queue cap (preserved in the private archive)` : ""}.`,
             `[botfleet] ${session.role}: a held peer request expired unanswered after ${UNIT_MAX_AGE_MS / 3600_000}h; ${unit.items.length} message(s) never reached a turn${unit.dropped ? `, and ${unit.dropped} more were trimmed at the queue cap (preserved in the private archive)` : ""} (origin names withheld: the label tripped the content check).`,
+            `held-expired:${unit.createdAt}:${unit.items[0]?.id ?? 0}`,
           );
         }
       }
@@ -2021,6 +2037,7 @@ export class ZulipHub {
           session,
           `[botfleet] ${session.role}: a held peer request hit the peer-chain limit and never got a turn in ${originAsData(unit.origin)}; ${ids.length} message(s) went unanswered${unit.dropped ? `, and ${unit.dropped} more were trimmed at the queue cap (preserved in the private archive)` : ""}. The chain resumes when the owner speaks there.`,
           `[botfleet] ${session.role}: a held peer request hit the peer-chain limit and never got a turn; ${ids.length} message(s) went unanswered${unit.dropped ? `, and ${unit.dropped} more were trimmed at the queue cap (preserved in the private archive)` : ""} (origin names withheld: the label tripped the content check). The chain resumes when the owner speaks there.`,
+          `held-chain:${unit.createdAt}:${ids[0] ?? 0}`,
         );
         this.log(`[zulip] ${session.role}: held unit stopped by the loop guard; ${ids.length} message(s) dropped, owner notice queued`);
         session.save(true);

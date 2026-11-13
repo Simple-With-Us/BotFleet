@@ -2494,3 +2494,123 @@ describe("peer budget holds", () => {
   });
 });
 
+describe("review fixes: round 12 (reset counter carry, notice event keys, archive ancestors, strict state)", () => {
+  const noticeTexts = (hub: ZulipHub): string[] => [
+    ...sessionOf(hub).state.notices.map((n) => n.text),
+    ...fake.postsBy(PLUMBER).map((post) => JSON.stringify(post)),
+  ];
+
+  it("carries the pending-loss counter across a connect-time identity reset", async () => {
+    const first = makeHub();
+    await connected(first);
+    const session = sessionOf(first);
+    session.state.pendingDroppedOnLoad = 3;
+    session.markDirty();
+    session.save();
+    await first.stop();
+    // The saved file now names a different Zulip user than the credentials
+    // resolve to: the connect reset must keep the durable loss counter, so
+    // the next session still reports the quarantined load.
+    const statePath = join(dataDir, "zulip", "bot-plumber.json");
+    // SAFETY: the parsed state is only mutated field-by-field here; the
+    // strict schema revalidates every field on the next load.
+    const saved = JSON.parse(readFileSync(statePath, "utf8")) as { userId?: number };
+    saved.userId = 999999;
+    writeFileSync(statePath, `${JSON.stringify(saved)}\n`);
+    const second = makeHub();
+    await connected(second);
+    expect(sessionOf(second).state.userId).toBe(PLUMBER);
+    expect(sessionOf(second).state.pendingDroppedOnLoad).toBe(3);
+    await waitFor(
+      () => logs.some((line) => line.includes("3 invalid pending units quarantined on load")),
+      "the pending-loss warning after the reset",
+    );
+    await second.stop();
+  });
+
+  it("queues one expiry notice per held unit even when withheld-origin fallbacks render identically", async () => {
+    // Topic budget zero: every new-topic peer message is held.
+    settings.budgets = { peerChainLimit: 100, peerWakesPerHour: 100, peerWakesPerTopicPerHour: 0 };
+    let offset = 0;
+    const hub = makeHub({ now: () => Date.now() + offset });
+    await connected(hub);
+    // Both topics carry the credential-shaped string, so each origin label
+    // trips the content check and both fallback texts keep only "1
+    // message(s)" - byte-identical for two distinct events.
+    fake.postStream(PEER, "Work-In-Progress", "leak plumber-test-key one", "@**BF-Plumber** held one", "ZulipPython");
+    await waitFor(() => sessionOf(hub).state.pending[0]?.held === "topic_budget", "the first hold");
+    fake.postStream(PEER, "Work-In-Progress", "leak plumber-test-key two", "@**BF-Plumber** held two", "ZulipPython");
+    await waitFor(
+      () => sessionOf(hub).state.pending.length === 2 && sessionOf(hub).state.pending[1]?.held === "topic_budget",
+      "the second hold",
+    );
+    offset = 7 * 3600_000;
+    fake.clock += 7 * 3600;
+    fake.postStream(PEER, "Work-In-Progress", "BF nudge", "@**BF-Plumber** nudge", "ZulipPython");
+    await waitFor(
+      () => noticeTexts(hub).filter((text) => text.includes("expired unanswered")).length === 2,
+      "both expiry notices, one per held unit",
+    );
+    await hub.stop();
+  });
+
+  it("refuses to let an archive write follow a planted ancestor link", async () => {
+    settings.budgets = { dmsPerHour: 0 };
+    const hub = makeHub();
+    await connected(hub);
+    const session = sessionOf(hub);
+    const now = Date.now();
+    for (let n = 0; n < 12; n++) {
+      session.state.notices.push({ at: now + n, userId: JAY, text: `terminal ${n}`, attempts: 8, failed: "gave up" });
+    }
+    rmSync(join(dataDir, "zulip"), { recursive: true, force: true });
+    mkdirSync(join(dataDir, "redirect-target"));
+    symlinkSync(join(dataDir, "redirect-target"), join(dataDir, "zulip"));
+    session.markDirty();
+    session.save();
+    expect(logs.some((line) => line.includes("notice archive failed"))).toBe(true);
+    expect(session.state.notices.filter((n) => n.failed)).toHaveLength(12);
+    expect(existsSync(join(dataDir, "redirect-target", "bot-plumber.notices-archive.jsonl"))).toBe(false);
+    await hub.stop();
+  });
+
+  it("quarantines a state file with unknown top-level keys instead of silently stripping them", async () => {
+    const first = makeHub();
+    await connected(first);
+    const session = sessionOf(first);
+    session.state.notices.push({ at: Date.now(), userId: JAY, text: "kept evidence", attempts: 0 });
+    session.markDirty();
+    session.save();
+    await first.stop();
+    const statePath = join(dataDir, "zulip", "bot-plumber.json");
+    // SAFETY: the parsed state is only mutated field-by-field here; the
+    // strict schema revalidates every field on the next load.
+    const saved = JSON.parse(readFileSync(statePath, "utf8")) as { surpriseFutureField?: unknown };
+    saved.surpriseFutureField = { drift: true };
+    writeFileSync(statePath, `${JSON.stringify(saved)}\n`);
+    const second = makeHub();
+    await connected(second);
+    // The whole file fails the strict schema: fresh state, original kept.
+    expect(sessionOf(second).state.notices.some((n) => n.text === "kept evidence")).toBe(false);
+    const archive = readFileSync(join(dataDir, "zulip", "bot-plumber.notices-archive.jsonl"), "utf8");
+    expect(archive).toMatch(/state-schema-invalid-on-load/);
+    expect(archive).toMatch(/surpriseFutureField/);
+    expect(archive).toMatch(/kept evidence/);
+    await second.stop();
+  });
+
+  it("quarantines an unparseable state file instead of silently starting fresh", async () => {
+    const first = makeHub();
+    await connected(first);
+    sessionOf(first).markDirty();
+    sessionOf(first).save();
+    await first.stop();
+    writeFileSync(join(dataDir, "zulip", "bot-plumber.json"), "{ not json");
+    const second = makeHub();
+    await connected(second);
+    const archive = readFileSync(join(dataDir, "zulip", "bot-plumber.notices-archive.jsonl"), "utf8");
+    expect(archive).toMatch(/state-unparseable-on-load/);
+    expect(archive).toMatch(/not json/);
+    await second.stop();
+  });
+});

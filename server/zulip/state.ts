@@ -20,8 +20,8 @@
 //                restart cannot drop one; the text stays in this mode-600
 //                file, the same protection the DM ledger gets.
 
-import { chmodSync, closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, writeSync } from "node:fs";
-import { join } from "node:path";
+import { chmodSync, closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, statSync, writeSync, type Stats } from "node:fs";
+import { dirname, join, parse, relative, sep } from "node:path";
 
 import { z } from "zod";
 
@@ -99,6 +99,9 @@ export const noticeEntrySchema = z.object({
   attempts: z.number().int().nonnegative().catch(0),
   nextAt: z.number().optional().catch(undefined),
   failed: z.string().max(500).optional().catch(undefined),
+  // Which event queued this notice: when present, dedup matches on the key,
+  // so two events whose rendered text collides still queue two notices.
+  eventKey: z.string().max(200).optional().catch(undefined),
 }).strict();
 
 /** An owner DM the hourly cap refused, held for resend after the window. */
@@ -137,7 +140,7 @@ export const stateFileSchema = z.object({
   // only, never the content: the durable flag that a load was lossy.  The
   // raw units themselves are preserved in the private archive file.
   pendingDroppedOnLoad: z.number().int().nonnegative().optional().catch(undefined),
-});
+}).strict();
 
 /** The live state shape: exactly what stateFileSchema produces at the
  *  boundary. */
@@ -169,10 +172,20 @@ export class ZulipStateStore {
     try {
       rawJson = JSON.parse(text);
     } catch {
+      // A state file that does not parse at all is drift too: quarantine the
+      // raw text privately before the fresh start overwrites the file.
+      this.archive(botId, "state-unparseable-on-load", [text]);
       return emptyState(role);
     }
     const parsed = stateFileSchema.safeParse(rawJson);
-    if (!parsed.success) return emptyState(role);
+    if (!parsed.success) {
+      // Strict top-level keys: an unknown key now fails the whole file
+      // instead of being silently stripped.  The original is quarantined
+      // privately BEFORE the fresh start overwrites it - drift surfaces in
+      // the archive, never silently.
+      this.archive(botId, "state-schema-invalid-on-load", [rawJson]);
+      return emptyState(role);
+    }
     const savedRole = parsed.data.role;
     if (savedRole !== role && canonicalZulipRole(savedRole) !== role) {
       return emptyState(role);
@@ -222,6 +235,38 @@ export class ZulipStateStore {
     this.archive(botId, "queue-cap-item-drop", items.map((item) => ({ origin, item })));
   }
 
+  /** O_NOFOLLOW guards only the final path component: a planted ancestor
+   *  symlink would still redirect the write.  Walk every ancestor of the
+   *  archive path before opening it - follow only root-owned links (the
+   *  system /var -> /private/var pattern) and refuse anything else that is
+   *  not a plain directory.  A missing component is skipped: mkdir just
+   *  created it as a real directory, or the final handle/path inode check
+   *  below still guards the file itself. */
+  private verifyArchiveAncestors(path: string): void {
+    const root = parse(path).root;
+    let current = root;
+    for (const part of relative(root, dirname(path)).split(sep)) {
+      if (!part || part === ".") continue;
+      current = join(current, part);
+      let linkStat: Stats;
+      try {
+        linkStat = lstatSync(current);
+      } catch {
+        continue;
+      }
+      if (linkStat.isSymbolicLink()) {
+        if (linkStat.uid !== 0) {
+          throw new Error(`archive ancestor ${current} is a symlink not owned by root; refusing to follow it`);
+        }
+        if (!statSync(current).isDirectory()) {
+          throw new Error(`archive ancestor ${current} is a root-owned link that does not resolve to a directory; refusing to follow it`);
+        }
+      } else if (!linkStat.isDirectory()) {
+        throw new Error(`archive ancestor ${current} is not a directory; refusing to append`);
+      }
+    }
+  }
+
   /** Append records to the bot's private notices archive (mode-600 JSONL
    *  next to the state file): the evidence for anything the ledger no
    *  longer carries.  Contents are never logged or posted. */
@@ -235,6 +280,9 @@ export class ZulipStateStore {
     }
     const path = join(this.dir, fileName(botId).replace(/\.json$/, ".notices-archive.jsonl"));
     const lines = entries.map((entry) => JSON.stringify({ archivedAt: Date.now(), reason, entry })).join("\n") + "\n";
+    // Ancestors first: a planted link in the path above the file redirects
+    // the write even with O_NOFOLLOW on the final component.
+    this.verifyArchiveAncestors(path);
     // Follow no link: a swapped archive path must never redirect the
     // write.  Open with O_NOFOLLOW, then prove the handle is the same
     // regular, single-link file the path still names - a race can swap it
