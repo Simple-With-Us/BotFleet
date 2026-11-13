@@ -9,20 +9,16 @@
 // what came back.
 //
 // What it proves:
-//   - the app reads its server target from Infisical and nowhere else;
-//   - an app with no Infisical read token in its keychain runs against
-//     the server on this Mac, and the menu says so;
+//   - an explicit local startup choice runs against this Mac without an
+//     Infisical server lookup, and the menu says so;
 //   - the old server-target.json is ignored: it is flagged, never read, and
 //     never rewritten;
 //   - the Server menu offers "This Mac", the Infisical status line and
 //     "Reload From Infisical", and no longer offers "Set Remote Server…";
 //   - "Reload From Infisical" is safe to click: the app keeps running.
 //
-// What it never does: it never contacts a real server and it never reaches
-// the owner's Keychain, its user data or its server target.  The app reads
-// its Infisical read token from a throwaway keychain this script creates
-// (OMB_SMOKE_KEYCHAIN), never from the login Keychain, so even on an
-// enrolled Mac the run cannot see the owner's enrollment.
+// This run never contacts a real server or reads the owner's startup data.
+// A throwaway Keychain remains a backstop for any accidental bootstrap read.
 //
 // Usage: node scripts/smoke-mac-server-menu.mjs <path to BotFleet.app>
 
@@ -64,6 +60,8 @@ mkdirSync(userDataDir, { recursive: true });
 // throwaway HOME.
 const dataDir = join(home, ".botfleet");
 mkdirSync(dataDir, { recursive: true });
+// The smoke chooses local startup explicitly, so it never displays setup UI.
+writeFileSync(join(dataDir, "startup-enrollment.json"), JSON.stringify({ version: 1, mode: "local" }));
 // The one thing this script must never do is point the app at a directory
 // outside its own throwaway home.  Refuse instead of risking the owner's
 // real user data.
@@ -87,10 +85,8 @@ const legacyTarget = {
 const legacyTargetText = `${JSON.stringify(legacyTarget, null, 2)}\n`;
 writeFileSync(legacyTargetFile, legacyTargetText);
 
-// A throwaway keychain for the app to read its Infisical read token from.
-// It is empty, so the app must come up "not-enrolled" on any Mac, enrolled
-// or not; the app refuses to run the smoke without one, so it can never fall
-// through to the login Keychain.  Its password is random and dies with it.
+// The app refuses smoke mode without a throwaway Keychain, so an accidental
+// bootstrap read can never fall through to the login Keychain.
 const smokeKeychain = join(home, "server-menu-smoke.keychain-db");
 let keychainCreated = false;
 function removeSmokeKeychain() {
@@ -243,15 +239,14 @@ if (spawnError !== null) {
       : `the app printed no "[smoke] server-menu" line within ${SMOKE_TIMEOUT_MS / 1000}s`,
   );
 } else {
-  // The runner has no Infisical read token in its Keychain, so the app runs
-  // against the server on this Mac and says where that came from.
+  // The fixture's local choice must be enough without a Keychain lookup.
   check(
     report.serverMode === "local",
     `serverMode must be "local", got ${JSON.stringify(report.serverMode)}`,
   );
   check(
-    report.source === "not-enrolled",
-    `source must be "not-enrolled", got ${JSON.stringify(report.source)}`,
+    report.source === "local-preference",
+    `source must be "local-preference", got ${JSON.stringify(report.source)}`,
   );
   check(report.legacyFile === true, `legacyFile must be true, got ${JSON.stringify(report.legacyFile)}`);
   check(report.error === null || report.error === undefined, `the smoke reported an error: ${report.error}`);
@@ -259,8 +254,8 @@ if (spawnError !== null) {
   const labels = report.serverMenu?.labels ?? [];
   check(labels.includes("This Mac"), `the Server menu must offer "This Mac", got ${JSON.stringify(labels)}`);
   check(
-    labels.includes("No Infisical Token In The Keychain"),
-    `the Server menu must say it has no Infisical read token, got ${JSON.stringify(labels)}`,
+    labels.includes("Infisical Server Lookup Off"),
+    `the Server menu must say its Infisical lookup is off, got ${JSON.stringify(labels)}`,
   );
   check(
     labels.includes("Reload From Infisical"),
@@ -271,8 +266,7 @@ if (spawnError !== null) {
     `the Server menu must no longer offer "Set Remote Server…", got ${JSON.stringify(labels)}`,
   );
 
-  // The reload reads Infisical again.  Nothing changed, so the app has to be
-  // exactly where it was.
+  // A reload respects local enrollment, so the app stays on this Mac.
   const reloadLabels = report.reload?.labels ?? [];
   check(
     reloadLabels.includes("Reload From Infisical"),

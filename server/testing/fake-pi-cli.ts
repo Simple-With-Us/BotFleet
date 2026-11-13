@@ -59,7 +59,7 @@ if (process.env.FAKE_PI_DUMP) {
         ),
         // the launcher contract's variables, with values (see server/launch-identity.ts)
         identityEnv: Object.fromEntries(
-          Object.entries(process.env).filter(([k]) => /^(AGENT_|ZULIP_|CLAUDE_CODE_SESSION_ID$)/.test(k)),
+          Object.entries(process.env).filter(([k]) => /^(AGENT_|SIMPLE_TOOLS_|ZULIP_|CLAUDE_CODE_SESSION_ID$)/.test(k)),
         ),
         mcpConfig,
       }) + "\n",

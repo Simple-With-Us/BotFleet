@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+// Keep the final CLI's receipt-boundary fixtures in the existing native-release gate.
+import "./decommission-evidence.node-test.mjs";
 import {
   DEPENDENT_SURFACES,
   MAC_LOCAL_ROOTS,
@@ -240,7 +242,7 @@ test("the state file is validated before it reaches the gate", () => {
   }
 });
 
-test("the CLI validates the state file before it decides", () => {
+test("the CLI validates the state file before it decides", { skip: process.platform === "win32" ? "Final private evidence requires POSIX ownership" : false }, () => {
   const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
   const cli = join(repoRoot, "scripts/check-decommission-gates.mjs");
   const directory = mkdtempSync(join(tmpdir(), "botfleet-gate-"));
@@ -253,26 +255,18 @@ test("the CLI validates the state file before it decides", () => {
       JSON.stringify({
         ...ALL_DONE,
         evidence: { ...ALL_DONE.evidence, "soak-24h-no-node": "yes" },
-      }),
+      }), { mode: 0o600 },
     );
     const refused = spawnSync("node", [cli, malformed], { encoding: "utf8" });
     assert.equal(refused.status, 2, "a malformed state file must be refused");
     assert.match(refused.stderr, /does not match the state schema/);
 
-    // The same CLI prints the retained optional server path, so a reader
-    // can see it is kept on purpose and not merely unmentioned.
+    // Even a previously green boolean-only file cannot authorize deletion.
     const green = join(directory, "green.json");
-    writeFileSync(green, JSON.stringify(ALL_DONE));
+    writeFileSync(green, JSON.stringify(ALL_DONE), { mode: 0o600 });
     const passed = spawnSync("node", [cli, green], { encoding: "utf8" });
-    assert.equal(passed.status, 0);
-    assert.match(passed.stdout, /all green/);
-    assert.match(passed.stdout, /Retained on purpose: deploy\/linux-server\//);
-    assert.match(passed.stdout, /is retained, and its shared source has a separate preservation evidence gate/);
-    // Control's dependency is printed next to the retained path, so the
-    // reader sees in one place what is kept, and what stops working.
-    assert.match(passed.stdout, /Depends on the stack being deleted: mac-control\//);
-    assert.match(passed.stdout, /Depends on the stack being deleted: deploy\/linux-server\//);
-    assert.match(passed.stdout, /evidence linux-server-preservation/);
+    assert.equal(passed.status, 1);
+    assert.match(passed.stderr, /final evidence bundle: required/);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

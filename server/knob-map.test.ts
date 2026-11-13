@@ -5,6 +5,7 @@ import {
   KNOB_FIELDS,
   KNOB_INFISICAL_NAMES,
   canonicalKnobString,
+  clearedHeadroomKnobs,
   deleteKnobField,
   knobProvenance,
   knobSource,
@@ -51,9 +52,32 @@ describe("headroom knobs (P-BF-6 B7)", () => {
     expect(cfg.jobs?.admission).toEqual({ reservedCpuCores: 2, reservedRamMb: 4096, minMemoryAvailablePercent: 15 });
     for (const id of ids) expect(rows.find((row) => row.id === id)).toMatchObject({ source: "infisical", hasValue: true });
   });
+  it("names the headroom knobs a patch clears with an explicit null", () => {
+    expect(clearedHeadroomKnobs({ jobs: { admission: { reservedCpuCores: null } } })).toEqual([
+      "jobs.admission.reservedCpuCores",
+    ]);
+    expect(
+      clearedHeadroomKnobs({ jobs: { admission: { reservedRamMb: null, minMemoryAvailablePercent: null } } }),
+    ).toEqual(["jobs.admission.reservedRamMb", "jobs.admission.minMemoryAvailablePercent"]);
+    // A real value is not a clear, and neither is an absent key or patch.
+    expect(clearedHeadroomKnobs({ jobs: { admission: { reservedCpuCores: 2 } } })).toEqual([]);
+    expect(clearedHeadroomKnobs({ jobs: { admission: {} } })).toEqual([]);
+    expect(clearedHeadroomKnobs({})).toEqual([]);
+    expect(clearedHeadroomKnobs(undefined)).toEqual([]);
+    // An explicit null is not a value either: it reads as absent everywhere.
+    expect(readKnobField({ jobs: { admission: { reservedCpuCores: null } } }, spec("jobs.admission.reservedCpuCores"))).toBeUndefined();
+  });
 });
 
 describe("the knob table", () => {
+  it("resolves queue wait from the vault and strips it from file snapshots independently of run time", () => {
+    const cfg: AppConfig = { jobs: { maxMinutes: 30 } };
+    resolveKnobFields(cfg, new Map([["BOTFLEET_JOBS_QUEUE_WAIT_MINUTES", "20000"]]));
+    expect(cfg.jobs).toMatchObject({ maxMinutes: 30, queueWaitMinutes: 10080 });
+    expect(parseKnobValue(spec("jobs.queueWaitMinutes"), "0")).toBe(1);
+    expect(stripVaultManagedKnobs(cfg)).toContain("jobs.queueWaitMinutes");
+    expect(cfg.jobs?.queueWaitMinutes).toBeUndefined();
+  });
   it("has unique ids, paths and Infisical names", () => {
     const ids = KNOB_FIELDS.map((entry) => entry.id);
     const names = KNOB_FIELDS.map((entry) => entry.infisicalName);
@@ -105,6 +129,16 @@ describe("parseKnobValue", () => {
     expect(parseKnobValue(spec("jobs.webhookHotDeferMinutes"), "20")).toBe(20);
     expect(parseKnobValue(spec("jobs.webhookHotDeferMinutes"), "0")).toBe(1);
     expect(parseKnobValue(spec("jobs.webhookHotDeferMinutes"), "9999")).toBe(720);
+  });
+
+  it("clamps the webhook payload dedupe window and applies it from the vault", () => {
+    expect(parseKnobValue(spec("jobs.webhookPayloadDedupeSeconds"), "120")).toBe(120);
+    expect(parseKnobValue(spec("jobs.webhookPayloadDedupeSeconds"), "0")).toBe(0);
+    expect(parseKnobValue(spec("jobs.webhookPayloadDedupeSeconds"), "-5")).toBe(0);
+    expect(parseKnobValue(spec("jobs.webhookPayloadDedupeSeconds"), "99999")).toBe(3600);
+    const cfg: AppConfig = { jobs: { webhookHotDeferMinutes: 20 } };
+    resolveKnobFields(cfg, new Map([["BOTFLEET_WEBHOOK_PAYLOAD_DEDUPE_SECONDS", "30"]]));
+    expect(cfg.jobs).toEqual({ webhookHotDeferMinutes: 20, webhookPayloadDedupeSeconds: 30 });
   });
 
   it("clamps the auto-review limit per turn and applies it from the vault", () => {

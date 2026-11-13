@@ -3,23 +3,29 @@
 //
 // This is the regression test for "BotFleet chat turns sign as MM through the
 // mcode MCP" (BF-2408).  The suspicion was that mcode starts its MCP servers
-// with a cut-down environment, so the `agent-sync mcp --default-seat MM` entry
+// with a cut-down environment, so the `simple-chat mcp --default-seat MM` entry
 // in ~/.minimax/mcp.json would never see AGENT_LAUNCHER and AGENT_LAUNCH_SEAT
 // and would fall back to its default seat.  Run against mcode 0.6.2 that is
 // not what happens:  mcode hands the five launch variables (AGENT_LAUNCHER,
-// AGENT_LAUNCH_SEAT, AGENT_SEAT, AGENT_SESSION, AGENT_SYNC_ATTACH) to an MCP
+// AGENT_LAUNCH_SEAT, AGENT_SEAT, AGENT_SESSION, SIMPLE_TOOLS_ATTACH) to an MCP
 // server it starts, whether the server is listed in mcp.json or comes in over
-// ACP, and to the shell tool as well.  (The probe reports only AGENT_ and
+// ACP, and to the shell tool as well.  (The probe reports only AGENT_, SIMPLE_TOOLS_ and
 // X_FIXTURE_ names, so these tests do not claim anything about the rest of the
-// environment.)  agent-sync then reads the launcher's seat and ignores
+// environment.)  simple-chat then reads the launcher's seat and ignores
 // `--default-seat`.  These tests pin that, so an mcode update that stops
 // forwarding those variables fails here before it signs a bot's post with the
 // wrong seat.
 //
-// They run the REAL mcode (and, for the second group, the real agent-sync)
-// against a scripted fake model and a fake Zulip, in a throwaway data
-// directory and home.  Neither is in CI, so every test skips with a message
-// when its binary is missing;  run them on the Mac that has both.
+// They run the REAL mcode against a scripted fake model and a fake Zulip,
+// in a throwaway data directory and home.  The simple-chat MCP entry the
+// owner registered is served by the repo's own fixture
+// (server/testing/simple-chat-mcp.mjs), not by whatever simple-chat the host
+// has installed:  the fleet's build gates that server on the seat's own
+// bearer file and on a hosted gateway with a fixed endpoint, so on a host
+// carrying it the server refuses to start and the answer this file reads
+// came from the machine rather than from the fixture.  mcode itself is not in
+// CI either, so every test skips with a message when its binary is missing;
+// run them on the Mac that has both.
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -36,6 +42,7 @@ import {
   ENV_PROBE_MCP,
   FakeModel,
   FIXTURE_MODEL,
+  SIMPLE_CHAT_MCP,
   findExecutable,
   runOrdinaryMcode,
   writeMcodeFixture,
@@ -46,10 +53,9 @@ import {
 } from "../../testing/mcode-fixture.ts";
 import { McodeAgentDriver } from "./mcode.ts";
 
-// BOTFLEET_REAL_MCODE_TESTS=0 skips them on a Mac that has both binaries.
+// BOTFLEET_REAL_MCODE_TESTS=0 skips them on a Mac that has the binary.
 const OPTED_OUT = process.env.BOTFLEET_REAL_MCODE_TESTS === "0";
 const MCODE = OPTED_OUT ? null : findExecutable("mcode");
-const AGENT_SYNC = OPTED_OUT ? null : findExecutable("agent-sync");
 
 if (!MCODE) {
   console.info(
@@ -57,12 +63,10 @@ if (!MCODE) {
       ? "[mcode-launch-seat] skipped: BOTFLEET_REAL_MCODE_TESTS=0."
       : "[mcode-launch-seat] skipped: no `mcode` on PATH or in ~/.local/bin.  Run these on the Mac that has MiniMax Code.",
   );
-} else if (!AGENT_SYNC) {
-  console.info("[mcode-launch-seat] the agent-sync tests skip: no `agent-sync` on PATH or in ~/.local/bin.");
 }
 
 const withMcode = describe.skipIf(!MCODE);
-const withMcodeAndAgentSync = describe.skipIf(!MCODE || !AGENT_SYNC);
+const withMcodeAndSimpleChat = describe.skipIf(!MCODE);
 
 /** A real mcode turn is a process start, an MCP handshake and a few model
  *  round trips against a fake;  the default 20 seconds is not enough for it. */
@@ -75,7 +79,7 @@ function launchedAs(seat: string, session: string) {
     AGENT_LAUNCH_SEAT: seat,
     AGENT_SEAT: seat,
     AGENT_SESSION: session,
-    AGENT_SYNC_ATTACH: "0",
+    SIMPLE_TOOLS_ATTACH: "0",
   };
 }
 
@@ -155,7 +159,7 @@ withMcode("a BotFleet turn on the real mcode keeps its seat in the MCP servers a
     async () => {
       const steps: ModelStep[] = [
         { tool: /dump_env$/, input: {} },
-        { tool: /^bash$/i, input: { command: "env | grep -E '^AGENT_' | sort" } },
+        { tool: /^bash$/i, input: { command: "env | grep -E '^(AGENT_|SIMPLE_TOOLS_)' | sort" } },
       ];
       model = new FakeModel(steps);
       await model.start();
@@ -224,7 +228,7 @@ withMcode("a BotFleet turn on the real mcode keeps its seat in the MCP servers a
   }
 });
 
-withMcodeAndAgentSync("the agent-sync MCP entry the owner registered (`--default-seat MM`) signs the seat BotFleet gave", () => {
+withMcodeAndSimpleChat("the simple-chat MCP entry the owner registered (`--default-seat MM`) signs the seat BotFleet gave", () => {
   const MONITOR = { user_id: 9101, full_name: "BF-Monitor", email: "bf-monitor-bot@zulip.test", key: "fixture-key-monitor" };
   const MINIMAX = { user_id: 9102, full_name: "MiniMax", email: "mm-bot@zulip.test", key: "fixture-key-minimax" };
   let scratch: string;
@@ -255,9 +259,11 @@ withMcodeAndAgentSync("the agent-sync MCP entry the owner registered (`--default
   });
 
   /** The fixture:  a fake Zulip with the two bots, their credentials in
-   *  the MCP entry's environment, and `mcp.json` registering agent-sync exactly as
-   *  ~/.minimax/mcp.json does (`mcp --default-seat MM`), plus the one variable
-   *  that points it at the fake realm instead of the real one. */
+   *  the MCP entry's environment, and `mcp.json` registering the simple-chat
+   *  entry exactly as ~/.minimax/mcp.json does (`mcp --default-seat MM`),
+   *  plus the one variable that points it at the fake realm instead of the
+   *  real one.  The entry runs the repo's own simple-chat fixture, so what
+   *  answers is the fixture and never a simple-chat the host has installed. */
   async function build(): Promise<McodeFixture> {
     zulip = new FakeZulip();
     zulip.addUser(MONITOR);
@@ -265,11 +271,11 @@ withMcodeAndAgentSync("the agent-sync MCP entry the owner registered (`--default
     await zulip.start();
     model = new FakeModel([{ tool: /whoami$/, input: {} }]);
     await model.start();
-    const agentSync: McpEntry = {
-      command: AGENT_SYNC!,
-      args: ["mcp", "--default-seat", "MM"],
+    const simpleChat: McpEntry = {
+      command: process.execPath,
+      args: [SIMPLE_CHAT_MCP, "mcp", "--default-seat", "MM"],
       env: {
-        AGENT_SYNC_REALM: zulip.url,
+        SIMPLE_TOOLS_REALM: zulip.url,
         ...zulipCredentialEnv({
           site: zulip.url,
           bots: [
@@ -283,7 +289,7 @@ withMcodeAndAgentSync("the agent-sync MCP entry the owner registered (`--default
       mcode: MCODE!,
       dir: scratch,
       modelUrl: model.url,
-      mcpServers: { "agent-sync": agentSync },
+      mcpServers: { "simple-chat": simpleChat },
     });
     return fixture;
   }
@@ -327,11 +333,11 @@ withMcodeAndAgentSync("the agent-sync MCP entry the owner registered (`--default
   );
 
   it(
-    "gives a launched turn with no seat no agent-sync at all, so nothing can sign as MM",
+    "gives a launched turn with no seat no simple-chat at all, so nothing can sign as MM",
     async () => {
       // The seat switch is off, which is how the live harness runs until the
       // operator fleet is turned on:  the child is marked as launched and has
-      // no seat, so agent-sync refuses to start and the tool is not offered.
+      // no seat, so simple-chat refuses to start and the tool is not offered.
       vi.stubEnv("BOTFLEET_FLEET_SEAT_PROMPTS", "");
       const fixture = await build();
       await runLaunchedTurn(fixture, "a1b2c3d4-0000-4000-8000-000000000002");

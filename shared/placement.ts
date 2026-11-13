@@ -126,6 +126,7 @@ export interface DispatchMessage extends PlacementMessage {
 }
 export interface DispatchReply extends ControllerEpoch { accepted: boolean; leaseId: string; reason?: string }
 export interface StopMessage extends PlacementMessage { jobId: string; leaseId: string; reason: string }
+export interface StopReply extends ControllerEpoch { accepted: boolean; jobId: string; leaseId: string; reason?: string }
 export interface ReportMessage extends PlacementMessage {
   jobId: string;
   leaseId: string;
@@ -138,7 +139,18 @@ export interface ReportMessage extends PlacementMessage {
 }
 export interface ReportReply extends ControllerEpoch { accepted: boolean; reason?: string }
 export interface TakeoverMessage extends PlacementMessage { reconcile: boolean }
+export interface TakeoverReply extends ControllerEpoch {
+  accepted: boolean;
+  reconcile: boolean;
+  orphanedJobIds: string[];
+  reason?: string;
+}
 export interface ReleaseMessage extends PlacementMessage { toControllerId: HostId }
+export interface ControllerReleaseReply extends ControllerEpoch {
+  accepted: boolean;
+  releasedFromEpoch?: number;
+  reason?: string;
+}
 export interface EnqueueMessage extends PlacementMessage {
   jobId: string;
   botId: string;
@@ -153,6 +165,8 @@ export interface EnqueueReply extends ControllerEpoch {
   status: string;
   duplicate?: boolean;
   reason?: string;
+  /** Why an accepted job waits, copied from the controller's own record. */
+  queuedReason?: string;
 }
 /** A worker giving back a lease it has not started yet.  Distinct from
  *  `ReleaseMessage`, which hands the controller role itself over. */

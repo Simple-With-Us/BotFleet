@@ -3,7 +3,7 @@
 // queued jobs oldest-first with per-bot FIFO.  A fake spawn (bookkeeping,
 // not processes) and an injected clock, one temp folder per test.
 import { EventEmitter } from "node:events";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -75,6 +75,13 @@ const start = (h: Harness, command: string, threadId: string, botId: string) => 
   return h.registry.start({ botId, threadId, command, cwd: h.dir, onComplete: "wake" });
 };
 
+function legacyWaiter(h: Harness, id: string): void {
+  const path = join(h.dir, "jobs", "jobs.json");
+  const records = JSON.parse(readFileSync(path, "utf8"));
+  for (const record of records) if (record.id === id) delete record.pendingCommand;
+  writeFileSync(path, JSON.stringify(records));
+}
+
 const runningIds = (h: Harness, n: number, botPrefix = "bot") => {
   const ids: string[] = [];
   for (let i = 0; i < n; i++) {
@@ -86,7 +93,7 @@ const runningIds = (h: Harness, n: number, botPrefix = "bot") => {
   return ids;
 };
 
-describe("placement queue", () => {
+describe.skipIf(process.platform === "win32")("placement queue", () => {
   it("queues past the host cap in a server mode and refuses in This Mac Only", () => {
     const server = harness({ placementMode: () => "serverFirst" });
     runningIds(server.h, 8);
@@ -144,6 +151,7 @@ describe("placement queue", () => {
     runningIds(first.h, 8);
     const aOld = start(first.h, "cmd-a-old", "ta", "bot-a");
     if (!aOld.ok) throw new Error("expected a queued job");
+    legacyWaiter(first.h, aOld.job.id);
     // A restart: the new registry reads the queued records back but holds
     // no command for them, so the old job stays queued for its controller.
     const second = harness({ placementMode: () => "serverFirst" });
@@ -190,6 +198,7 @@ describe("placement queue", () => {
     const old = start(first.h, "old cmd", "t", "bot-a");
     if (!old.ok) throw new Error(old.error);
     expect(old.job.status).toBe("queued");
+    legacyWaiter(first.h, old.job.id);
     // A restart with no queue window (production-like): the record stays
     // queued for its controller, but this process holds no command for it.
     const second = harness();
@@ -232,6 +241,7 @@ describe("placement queue", () => {
     runningIds(first.h, 8);
     const aOld = start(first.h, "cmd-a-old", "ta", "bot-a");
     if (!aOld.ok) throw new Error("expected a queued job");
+    legacyWaiter(first.h, aOld.job.id);
     const second = harness({ placementMode: () => "serverFirst" });
     second.h.clock.now = first.h.clock.now;
     const restarted = new JobRegistry({
@@ -320,10 +330,45 @@ describe("placement queue", () => {
     expect(killed.job?.status).toBe("killed");
   });
 
+  it("refuses to kill a restart-read queued job this process never accepted", async () => {
+    const first = harness({ placementMode: () => "serverFirst" });
+    runningIds(first.h, 8);
+    const queued = start(first.h, "stays queued", "tq", "bot-q");
+    if (!queued.ok) throw new Error(queued.error);
+    expect(queued.job.status).toBe("queued");
+    legacyWaiter(first.h, queued.job.id);
+    // A restart drops the memory-only pending command, so the restarted
+    // process never accepted this job: it stays queued for its controller
+    // and kill leaves it unchanged instead of settling it as killed.
+    const second = harness({ placementMode: () => "serverFirst" });
+    const restarted = new JobRegistry({
+      dir: join(first.h.dir, "jobs"),
+      dataDir: first.h.dir,
+      settings: () => second.h.settings.value,
+      spendBlocked: () => false,
+      broadcast: () => undefined,
+      probe: { swapUsedPercent: () => 50, freeDiskBytes: () => 100 * 1024 ** 3 },
+      now: () => second.h.clock.now,
+      awakeNow: () => second.h.awake.now,
+      spawn: second.spawnFn,
+      listProcesses: async () => [],
+      platform: "darwin",
+    });
+    registries.push(restarted);
+    const refused = await restarted.kill(queued.job.id, "owner");
+    expect(refused.ok).toBe(false);
+    expect(restarted.get(queued.job.id)?.status).toBe("queued");
+    expect(second.children).toHaveLength(0);
+    // The process that accepted the job can still dequeue it on demand.
+    const killed = await first.h.registry.kill(queued.job.id, "owner");
+    expect(killed.ok).toBe(true);
+    expect(killed.job?.status).toBe("killed");
+  });
+
   it("expires a queued job under the default window when no window is configured", () => {
-    // The fail-safe default is the longest run any job is allowed, so this
+    // The fail-safe default is the independent queue wait window, so this
     // test names the exported constant instead of a magic duration.
-    expect(DEFAULT_QUEUE_WINDOW_MS).toBe(240 * 60_000);
+    expect(DEFAULT_QUEUE_WINDOW_MS).toBe(24 * 60 * 60_000);
     const { h } = harness({ placementMode: () => "serverFirst" });
     runningIds(h, 8);
     const queued = start(h, "doomed queue", "tq", "bot-q");
@@ -339,6 +384,6 @@ describe("placement queue", () => {
     h.awake.now += 5_000;
     h.registry.tick();
     expect(h.registry.get(queued.job.id)?.status).toBe("lost");
-    expect(h.registry.get(queued.job.id)?.reason).toMatch(/no host could take it within 240 minutes/);
+    expect(h.registry.get(queued.job.id)?.reason).toMatch(/no host could take it within 1440 minutes/);
   });
 });

@@ -3,7 +3,7 @@
 //     "instances": { "<instanceId>": {"driver":"grok", …} } }
 import { readFileSync, mkdirSync, existsSync, renameSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { z } from "zod";
 
 import { updateConfigFile, type ConfigFileSetAside } from "../electron/config-file-lock.mjs";
@@ -11,7 +11,7 @@ import { readPersistOnExitPolicy, writePersistOnExitPolicy } from "../electron/p
 import type { InstanceConfig, InstanceConfigMap } from "./contracts.ts";
 import { dataDir } from "./data-dir.ts";
 import { clearDataFault, findSetAsideFiles, recordDataFault, type SetAsideFile } from "./data-faults.ts";
-import { parseJson, schemaIssue, type JsonObject, type JsonValue } from "./schema.ts";
+import { isJsonObject, isJsonString, parseJson, schemaIssue, type JsonObject, type JsonValue } from "./schema.ts";
 import { infisicalSnapshot, resolveSecretFields, stripVaultManagedValues } from "./secret-map.ts";
 import { resolveKnobFields, stripVaultManagedKnobs } from "./knob-map.ts";
 import { CONTROL_ACT_WITHIN_MS, CONTROL_WAIT_MS } from "./control-client.ts";
@@ -270,6 +270,30 @@ const featureConfigSchema = z.object({
   /** Per-turn Git worktree isolation for bots working in a shared repository. */
   gitWorktreeLeases: z.boolean().optional(),
 });
+const zulipKeyPatternSchema = z.string().trim().regex(/^[A-Z0-9_{}]+$/).max(200);
+// Without `{ROLE}` every role resolves to the same secret name, so a
+// pattern that omits it must never validate.  The login pattern also
+// needs `{FIELD}`, or EMAIL/API_KEY/SITE collapse onto one name.  The
+// outgoing pattern must not carry `{FIELD}`: there is no field to expand
+// it with, so it would become "" and leave a double underscore.
+const zulipLoginCredentialFieldSourceSchema = z.object({
+  source: z.string().trim().regex(/^[a-z0-9][a-z0-9-]{0,63}$/),
+  keyPattern: zulipKeyPatternSchema
+    .refine((value) => value.includes("{ROLE}") && value.includes("{FIELD}"), {
+      message: "login keyPattern must contain {ROLE} and {FIELD}",
+    })
+    .optional(),
+  path: z.string().trim().regex(/^\/[A-Za-z0-9/_-]*$/).max(200).optional(),
+});
+const zulipOutgoingCredentialFieldSourceSchema = z.object({
+  source: z.string().trim().regex(/^[a-z0-9][a-z0-9-]{0,63}$/),
+  keyPattern: zulipKeyPatternSchema
+    .refine((value) => value.includes("{ROLE}") && !value.includes("{FIELD}"), {
+      message: "outgoing keyPattern must contain {ROLE} and must not contain {FIELD}",
+    })
+    .optional(),
+  path: z.string().trim().regex(/^\/[A-Za-z0-9/_-]*$/).max(200).optional(),
+});
 const zulipConfigSchema = z.object({
   enabled: z.boolean().optional(),
   dryRun: z.boolean().optional(),
@@ -282,6 +306,10 @@ const zulipConfigSchema = z.object({
   // Empty means unset (the harness's own project and environment).
   infisicalProjectId: z.string().trim().regex(/^[A-Za-z0-9-]*$/).max(64).optional(),
   infisicalEnv: z.string().trim().regex(/^[A-Za-z0-9_-]*$/).max(64).optional(),
+  credentialSources: z.object({
+    login: zulipLoginCredentialFieldSourceSchema.optional(),
+    outgoing: zulipOutgoingCredentialFieldSourceSchema.optional(),
+  }).optional(),
   bots: z
     .record(z.string(), z.object({ role: z.string().trim().min(1).max(48), enabled: z.boolean().optional() }))
     .optional(),
@@ -299,6 +327,34 @@ const zulipConfigSchema = z.object({
     .optional(),
 });
 
+const infisicalAuthMethodSchema = z.enum(["service-token", "machine-identity"]);
+const infisicalReadSourceSchema = z.object({
+  name: z.string().trim().regex(/^[a-z0-9][a-z0-9-]{0,63}$/),
+  tokenFile: z.string().trim().min(1).max(4096).refine((v) => v.startsWith("/"), "tokenFile must be an absolute path").optional(),
+  tokenEnv: z.string().trim().max(256).regex(/^[A-Z][A-Z0-9_]*$/).optional(),
+  writeTokenFile: z.string().trim().min(1).max(4096).refine((v) => v.startsWith("/"), "writeTokenFile must be an absolute path").optional(),
+  writeTokenEnv: z.string().trim().max(256).regex(/^[A-Z][A-Z0-9_]*$/).optional(),
+  projectId: z.string().trim().regex(/^[A-Za-z0-9-]{1,64}$/),
+  environment: z.string().trim().regex(/^[a-z0-9-]{1,64}$/).optional(),
+  secretPath: z.string().trim().regex(/^\/[A-Za-z0-9/_-]*$/).max(200).optional(),
+});
+const infisicalConfigSchema = z.object({
+  authMethod: infisicalAuthMethodSchema.optional(),
+  enabled: z.boolean().optional(),
+  writeThrough: z.boolean().optional(),
+  siteUrl: optionalText,
+  projectId: optionalText,
+  environment: optionalText,
+  secretPath: optionalText,
+  clientId: optionalText,
+  clientSecret: optionalText,
+  // Primary tokens must survive stored-file parsing rather than being stripped as unknown fields.
+  token: optionalText,
+  writeToken: optionalText,
+  readSources: z.array(infisicalReadSourceSchema).max(32).optional(),
+  credentialStorage: externalCredentialStorage,
+  refreshMinutes: z.number().int().min(5).max(1440).optional(),
+});
 const instanceConfigSchema = z.object({
   driver: z.string().min(1),
   displayName: optionalText,
@@ -308,6 +364,41 @@ const instanceConfigSchema = z.object({
   config: z.json().optional(),
 });
 const instanceConfigMapSchema = z.record(z.string(), instanceConfigSchema);
+
+/** The placement transport's two knobs, with their own invariant.
+ *
+ *  The unreachable window has to be longer than the heartbeat period:  a
+ *  worker that has not said so for less than one period is healthy, and
+ *  marking it unreachable would stop work that is running fine.  The window
+ *  is raised rather than the heartbeat lowered, because a generous window
+ *  is the safe direction and a short heartbeat only costs a little traffic.
+ *
+ *  The pair is clamped, never rejected:  a knob that fails closed on a typo
+ *  would rather hold its bound than fail the whole configuration file, and
+ *  the store's rule for every other knob is the same one.  The vault can
+ *  hold an inverted pair the file never sees, so `clampPlacementWindow`
+ *  applies the same rule after the vault resolves. */
+export const placementSchema = z.object({
+  heartbeatSeconds: z.number().int().min(1).max(3600).optional(),
+  unreachableAfterSeconds: z.number().int().min(16).max(86400).optional(),
+}).strict().transform((value) => clampPlacementWindow(value));
+
+/** The placement knobs' shape, before the schema's transform. */
+export interface PlacementWindow {
+  heartbeatSeconds?: number;
+  unreachableAfterSeconds?: number;
+}
+
+/** The placement knobs' own invariant, applied to whatever the file and the
+ *  vault hold.  Returns the pair with the window raised above the period. */
+export function clampPlacementWindow(value: PlacementWindow): PlacementWindow {
+  const heartbeat = value.heartbeatSeconds;
+  const unreachable = value.unreachableAfterSeconds;
+  if (heartbeat === undefined || unreachable === undefined) return value;
+  if (unreachable <= heartbeat) return { ...value, unreachableAfterSeconds: heartbeat + 1 };
+  return value;
+}
+
 const appConfigSchema = z.object({
   deleteInstance: optionalText,
   xai: z.object({ key: optionalText, url: optionalText, credentialStorage: externalCredentialStorage }).optional(),
@@ -343,6 +434,7 @@ const appConfigSchema = z.object({
     voice: optionalText,
     provider: z.enum(TTS_PROVIDERS).optional(),
     ladder: z.array(z.enum(HOSTED_TTS_PROVIDERS)).max(HOSTED_TTS_PROVIDERS.length).optional(),
+    enabled: z.boolean().optional(),
     optimizedSummary: z.boolean().optional(),
     audioRetentionDays: z.number().int().min(0).max(3650).optional(),
     pronunciations: pronunciationListSchema.optional(),
@@ -432,6 +524,12 @@ const appConfigSchema = z.object({
       .refine((value) => value === undefined || value === "" || isAbsoluteHttpUrl(value), {
         message: "must be an absolute http(s) URL",
       }),
+    webhookPublicUrl: z
+      .string()
+      .optional()
+      .refine((value) => value === undefined || value === "" || isAbsoluteHttpUrl(value), {
+        message: "must be an absolute http(s) URL",
+      }),
     /** Whether the public URL is applied at all. Off keeps the stored URL
      * for the next time the toggle is flipped on, but the webhook receiver
      * does not advertise it. */
@@ -509,22 +607,40 @@ const appConfigSchema = z.object({
     cliLanes: z.boolean().optional(),
     defaultMinutes: z.number().int().min(1).max(360).optional(),
     maxMinutes: z.number().int().min(1).max(360).optional(),
+    queueWaitMinutes: z.number().int().min(1).max(10080).optional(),
     cpuCores: z.number().min(1).max(64).optional(),
     admission: z.object({
       maxSwapPercent: z.number().min(1).max(100).optional(),
       minFreeDiskMb: z.number().min(0).optional(),
       minFreeInodes: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
       // Headroom (P-BF-6 B7): absent means unset — no gate and no default.
-      reservedCpuCores: z.number().int().min(0).max(64).optional(),
-      reservedRamMb: z.number().int().min(0).optional(),
-      minMemoryAvailablePercent: z.number().min(0).max(100).optional(),
+      // `null` is the wire spelling of "clear this knob back to unset" and is
+      // what a client sends when the owner empties a previously-set box.
+      // Absent still means "leave it"; only an explicit null deletes, the
+      // same differential `botDefaults.allowedComputers` and
+      // `callStt.provider` already use.  The merge below turns null into the
+      // deletion itself, so a stored file never holds null and resolution
+      // keeps reading `number | undefined`.
+      reservedCpuCores: z.number().int().min(0).max(64).nullable().optional(),
+      reservedRamMb: z.number().int().min(0).nullable().optional(),
+      minMemoryAvailablePercent: z.number().min(0).max(100).nullable().optional(),
     }).optional(),
     // How long a webhook may sit queued while the host is hot before the
     // scheduler dispatches it anyway.  Absent means 20 minutes
     // (DEFAULT_WEBHOOK_HOT_DEFER_MINUTES).  The vault knob of the same
     // field overrides the file.
     webhookHotDeferMinutes: z.number().int().min(1).max(720).optional(),
+    // Seconds to drop a repeat of an accepted webhook for the same bot and source (absent means 120, and 0 disables).
+    webhookPayloadDedupeSeconds: z.number().int().min(0).max(3600).optional(),
   }).optional(),
+  // The placement transport's own two knobs (server/placement-controller-bridge.ts
+  // and the lease service's unreachable window).  Both are optional: an
+  // absent field resolves to the built-in default, and the vault knob of the
+  // same field overrides the file.  `heartbeatSeconds` is the worker's
+  // heartbeat period and `unreachableAfterSeconds` is how long a worker may
+  // go quiet before the controller marks it unreachable, so the second must
+  // be longer than the first or a healthy worker is swept.
+  placement: placementSchema.optional(),
   // How long one computer call waits inside the harness while its desktop
   // is busy (server/computer-call-gate.ts).  Every field is optional: an
   // absent field resolves through the legacy `OMB_COMPUTER_*` env names to
@@ -560,29 +676,13 @@ const appConfigSchema = z.object({
     uiTracesSampleRate: z.number().min(0).max(1).optional(),
     logsEnabled: z.boolean().optional(),
   }).optional(),
-  // An optional external secret store.  Unconfigured is inert: with no
-  // project id and machine identity, BotFleet resolves exactly as it always
+  // An optional external secret store.
+  //
+  // Unconfigured is inert: without the
+  // project and selected method's credentials, BotFleet resolves as it always
   // has.  The kill switch is explicit the same way `ingress` and
   // `observability` are — absent means on once it is configured.
-  infisical: z.object({
-    enabled: z.boolean().optional(),
-    writeThrough: z.boolean().optional(),
-    siteUrl: optionalText,
-    projectId: optionalText,
-    environment: optionalText,
-    secretPath: optionalText,
-    clientId: optionalText,
-    clientSecret: optionalText,
-    // The two service tokens.  They are declared here because the schema
-    // strips the keys it does not know: a token in the config file that
-    // the schema does not mention is dropped on the floor, and the file
-    // would look configured while the server fell back to the machine
-    // identity.  The environment names are the primary route.
-    token: optionalText,
-    writeToken: optionalText,
-    credentialStorage: externalCredentialStorage,
-    refreshMinutes: z.number().int().min(5).max(1440).optional(),
-  }).optional(),
+  infisical: infisicalConfigSchema.optional(),
   // Infisical Agent Proxy settings. Off by default. When enabled, agent CLIs
   // and child processes route through the local Infisical Agent Proxy
   // daemon (HTTP_PROXY/HTTPS_PROXY/NO_PROXY and TLS CA certificate injection).
@@ -647,7 +747,13 @@ const appConfigSchema = z.object({
 // can show), while a stored file stays lenient (a bad value turns Zulip off).
 const appConfigPatchSchema = appConfigSchema
   .omit({ instances: true, deleteInstance: true })
-  .extend({ zulip: zulipConfigSchema.optional() });
+  .extend({
+    zulip: zulipConfigSchema.optional(),
+    // Stored files stay forward-compatible; requests must not silently accept typos or inline source tokens.
+    infisical: infisicalConfigSchema.extend({
+      readSources: z.array(infisicalReadSourceSchema.strict()).max(32).optional(),
+    }).strict().optional(),
+  });
 const jsonObjectSchema = z.record(z.string(), z.json());
 
 export interface AppConfig {
@@ -670,6 +776,9 @@ export interface AppConfig {
     voice?: string;
     provider?: (typeof TTS_PROVIDERS)[number];
     ladder?: Array<(typeof HOSTED_TTS_PROVIDERS)[number]>;
+    /** Absent or true keeps voice on (existing behavior).  False gates
+     *  auto-speak, calls, and the TTS / STS routes. */
+    enabled?: boolean;
     optimizedSummary?: boolean;
     audioRetentionDays?: number;
     pronunciations?: Pronunciation[];
@@ -747,7 +856,7 @@ export interface AppConfig {
     allowedSenders?: string[];
     allowVoiceByDefault?: boolean;
   };
-  ingress?: { publicUrl?: string; enabled?: boolean };
+  ingress?: { publicUrl?: string; enabled?: boolean; webhookPublicUrl?: string };
   /** The Zulip source (docs/zulip.md, server/zulip/types.ts). */
   zulip?: import("./zulip/types.ts").ZulipSettings;
   /** Shared preserves the historical singleton. Per-bot gives every bot a
@@ -784,12 +893,19 @@ export interface AppConfig {
     cliLanes?: boolean;
     defaultMinutes?: number;
     maxMinutes?: number;
+    queueWaitMinutes?: number;
     cpuCores?: number;
-    admission?: { maxSwapPercent?: number; minFreeDiskMb?: number; minFreeInodes?: number; reservedCpuCores?: number; reservedRamMb?: number; minMemoryAvailablePercent?: number };
+    admission?: { maxSwapPercent?: number; minFreeDiskMb?: number; minFreeInodes?: number; reservedCpuCores?: number | null; reservedRamMb?: number | null; minMemoryAvailablePercent?: number | null };
     /** Minutes a hot host may park a webhook before the wake dispatches
      *  anyway.  Absent means 20. */
     webhookHotDeferMinutes?: number;
+    /** Seconds to drop a repeat of an accepted webhook for the same bot and source (absent means 120, and 0 disables). */
+    webhookPayloadDedupeSeconds?: number;
   };
+  /** The placement transport's two knobs (server/placement-controller-bridge.ts).
+   *  Derived from the schema, so the type cannot drift from what the store
+   *  accepts.  Absent fields resolve to the built-in defaults. */
+  placement?: z.infer<typeof placementSchema>;
   /** Computer-call gate waits (server/computer-call-gate.ts).  See the
    *  schema above; absent fields resolve in `computerCallSettings`. */
   computerCall?: {
@@ -858,6 +974,7 @@ export interface AppConfig {
    * non-agent consumer uses.  They are read from this section or from
    * `INFISICAL_TOKEN` / `INFISICAL_WRITE_TOKEN`. */
   infisical?: {
+    authMethod?: InfisicalAuthMethod;
     enabled?: boolean;
     writeThrough?: boolean;
     siteUrl?: string;
@@ -868,6 +985,7 @@ export interface AppConfig {
     clientSecret?: string;
     token?: string;
     writeToken?: string;
+    readSources?: InfisicalReadSource[];
     credentialStorage?: "external";
     refreshMinutes?: number;
   };
@@ -1061,6 +1179,12 @@ export function publicIngressUrl(cfg: AppConfig): string | null {
   return raw && isAbsoluteHttpUrl(raw) ? raw.replace(/\/+$/, "") : null;
 }
 
+export function webhookPublicIngressUrl(cfg: AppConfig): string | null {
+  const dedicated = cfg.ingress?.webhookPublicUrl?.trim();
+  const raw = dedicated && isAbsoluteHttpUrl(dedicated) ? dedicated : cfg.ingress?.publicUrl?.trim();
+  return raw && isAbsoluteHttpUrl(raw) ? raw.replace(/\/+$/, "") : null;
+}
+
 /** The public URL that should actually be advertised.  Disabled
  * (`ingress.enabled === false`) keeps the stored value on disk for the next
  * time the user flips the switch, but the harness behaves as if the URL
@@ -1069,6 +1193,11 @@ export function publicIngressUrl(cfg: AppConfig): string | null {
 export function publicIngressUrlEffective(cfg: AppConfig): string | null {
   if (cfg.ingress?.enabled === false) return null;
   return publicIngressUrl(cfg);
+}
+
+export function webhookPublicIngressUrlEffective(cfg: AppConfig): string | null {
+  if (cfg.ingress?.enabled === false) return null;
+  return webhookPublicIngressUrl(cfg);
 }
 
 
@@ -1269,7 +1398,41 @@ export const DEFAULT_INFISICAL_REFRESH_MINUTES = 15;
  * defaulted.  Values are used, never rendered: the only fields here a status
  * view may repeat are the site URL, the project id, the environment and the
  * path. */
+export type InfisicalAuthMethod = z.infer<typeof infisicalAuthMethodSchema>;
+
+export interface InfisicalReadSource {
+  name: string;
+  tokenFile?: string;
+  tokenEnv?: string;
+  writeTokenFile?: string;
+  writeTokenEnv?: string;
+  projectId: string;
+  environment?: string;
+  secretPath?: string;
+}
+
+/** Strip a single trailing slash (except root), so `/zulip/` and `/zulip`
+ * name the same folder everywhere paths are stored or compared. */
+export function normalizeInfisicalSecretPath(path: string): string {
+  const trimmed = path.trim();
+  if (!trimmed) return "/";
+  return trimmed.length > 1 && trimmed.endsWith("/") && !trimmed.endsWith("//") ? trimmed.slice(0, -1) : trimmed;
+}
+
+export interface ResolvedInfisicalReadSource {
+  name: string;
+  tokenFile: string;
+  tokenEnv: string;
+  writeTokenFile?: string;
+  writeTokenEnv?: string;
+  projectId: string;
+  environment: string;
+  secretPath: string;
+}
+
 export interface InfisicalSettings {
+  authMethod?: InfisicalAuthMethod;
+  configurationError?: string;
   enabled: boolean;
   writeThrough: boolean;
   siteUrl: string;
@@ -1280,6 +1443,7 @@ export interface InfisicalSettings {
   clientSecret: string;
   token: string;
   writeToken: string;
+  readSources: ResolvedInfisicalReadSource[];
   refreshMinutes: number;
 }
 
@@ -1288,11 +1452,12 @@ export interface InfisicalSettings {
  * identity with no project has nothing to read.  Unconfigured is inert — no
  * request is ever made, and nothing about resolution changes. */
 export function infisicalConfigured(cfg: AppConfig): boolean {
-  return Boolean(
-    cfg.infisical?.projectId?.trim() &&
-      (cfg.infisical?.token?.trim() ||
-        (cfg.infisical?.clientId?.trim() && cfg.infisical?.clientSecret?.trim())),
-  );
+  const settings = infisicalSettings(cfg);
+  if (!settings.projectId) return false;
+  if (settings.authMethod === "machine-identity") return Boolean(settings.clientId && settings.clientSecret);
+  const source = settings.readSources.find((entry) => entry.projectId === settings.projectId &&
+    entry.environment === settings.environment && entry.secretPath === settings.secretPath);
+  return source ? Boolean(source.tokenEnv || source.tokenFile) : Boolean(settings.token);
 }
 
 /** The explicit kill switch.  Absent means on once configured, matching
@@ -1309,22 +1474,93 @@ export function infisicalEnabled(cfg: AppConfig): boolean {
 export function infisicalSettings(cfg: AppConfig): InfisicalSettings {
   const stored = cfg.infisical ?? {};
   const refresh = stored.refreshMinutes;
-  return {
+  const resolved: InfisicalSettings = {
+    authMethod: stored.authMethod ?? "service-token",
     enabled: infisicalEnabled(cfg),
     writeThrough: stored.writeThrough === true,
     siteUrl: (stored.siteUrl?.trim() || DEFAULT_INFISICAL_SITE_URL).replace(/\/+$/, ""),
     projectId: stored.projectId?.trim() ?? "",
     environment: stored.environment?.trim() || DEFAULT_INFISICAL_ENVIRONMENT,
-    secretPath: stored.secretPath?.trim() || DEFAULT_INFISICAL_SECRET_PATH,
+    secretPath: normalizeInfisicalSecretPath(stored.secretPath || DEFAULT_INFISICAL_SECRET_PATH),
     clientId: stored.clientId?.trim() ?? "",
     clientSecret: stored.clientSecret ?? "",
     token: stored.token?.trim() ?? "",
     writeToken: stored.writeToken?.trim() ?? "",
+    readSources: (() => {
+      const seen = new Set<string>();
+      const out: ResolvedInfisicalReadSource[] = [];
+      for (const src of stored.readSources ?? []) {
+        const name = src.name?.trim() ?? "";
+        const projectId = src.projectId?.trim() ?? "";
+        if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(name) || !INFISICAL_PROJECT_ID_PATTERN.test(projectId) || seen.has(name)) continue;
+        const env = src.environment?.trim() ?? "";
+        const path = src.secretPath?.trim() ?? "";
+        if (env && !INFISICAL_ENVIRONMENT_PATTERN.test(env)) continue;
+        if (path && (!/^\/[A-Za-z0-9/_-]*$/.test(path) || path.length > 200)) continue;
+        if ([src.tokenEnv, src.writeTokenEnv].some((value) => value && (value.trim().length > 256 || !/^[A-Z][A-Z0-9_]*$/.test(value.trim())))) continue;
+        if ([src.tokenFile, src.writeTokenFile].some((value) => value && (value.trim().length > 4096 || !value.trim().startsWith("/")))) continue;
+        seen.add(name);
+        const source: ResolvedInfisicalReadSource = {
+          name,
+          tokenFile: src.tokenFile?.trim() ?? "",
+          tokenEnv: src.tokenEnv?.trim() ?? "",
+          projectId,
+          environment: INFISICAL_ENVIRONMENT_PATTERN.test(env) ? env : (stored.environment?.trim() || DEFAULT_INFISICAL_ENVIRONMENT),
+          secretPath: path.startsWith("/") ? normalizeInfisicalSecretPath(path) : DEFAULT_INFISICAL_SECRET_PATH,
+        };
+        if (src.writeTokenFile) source.writeTokenFile = src.writeTokenFile.trim();
+        if (src.writeTokenEnv) source.writeTokenEnv = src.writeTokenEnv.trim();
+        out.push(source);
+      }
+      return out;
+    })(),
     refreshMinutes:
       refresh !== undefined && Number.isFinite(refresh)
         ? Math.min(Math.max(Math.trunc(refresh), 5), 1440)
         : DEFAULT_INFISICAL_REFRESH_MINUTES,
   };
+  const error = infisicalTokenScopeError(resolved);
+  if (error) resolved.configurationError = error;
+  return resolved;
+}
+
+/** One read reference and one optional write reference per project may be
+ * reused across environment/folder routes; credentials never appear in errors. */
+export function infisicalTokenScopeError(settings: InfisicalSettings): string | null {
+  if (settings.readSources.length > 32) return "Infisical supports at most 32 service-token folder routes.";
+  const projects = new Map<string, { read: Set<string>; write: Set<string> }>();
+  const add = (project: string, mode: "read" | "write", reference: string) => {
+    if (!project || !reference) return;
+    const refs = projects.get(project) ?? { read: new Set<string>(), write: new Set<string>() };
+    refs[mode].add(reference);
+    projects.set(project, refs);
+  };
+  const reference = (file?: string, env?: string) => file?.trim()
+    ? `file:${resolve(file.trim())}` : env?.trim() ? `env:${env.trim()}` : "";
+  for (const source of settings.readSources) {
+    add(source.projectId, "read", reference(source.tokenFile, source.tokenEnv));
+    add(source.projectId, "write", reference(source.writeTokenFile, source.writeTokenEnv));
+  }
+  const primarySource = settings.readSources.some((source) => source.projectId === settings.projectId &&
+    source.environment === settings.environment && normalizeInfisicalSecretPath(source.secretPath) === normalizeInfisicalSecretPath(settings.secretPath));
+  if (settings.authMethod !== "machine-identity" && !primarySource) {
+    if (settings.token.trim()) add(settings.projectId, "read", "env:INFISICAL_TOKEN");
+    if (settings.writeToken.trim()) add(settings.projectId, "write", "env:INFISICAL_WRITE_TOKEN");
+  }
+  for (const [project, refs] of projects) {
+    if (refs.read.size > 1 || refs.write.size > 1) {
+      return `Infisical project ${project} permits one read token reference and at most one write token reference; reuse those references across its folder and environment routes.`;
+    }
+  }
+  return null;
+}
+
+/** Validate against resolved current config, including bootstrap environment
+ * overlays, before a settings save can persist or activate another token. */
+export function validateInfisicalConfigPatch(cfg: AppConfig, patch: Partial<AppConfig>): void {
+  if (!patch.infisical) return;
+  const candidate = infisicalSettings({ infisical: { ...cfg.infisical, ...patch.infisical } });
+  if (candidate.configurationError) throw Object.assign(new Error(candidate.configurationError), { status: 400 });
 }
 
 export const DEFAULT_AGENT_PROXY_ADDRESS = "127.0.0.1:17322";
@@ -1631,6 +1867,78 @@ function ignoredConfig(reason: string): StoredConfigRead {
   return { config: {}, problem: { kind: "config-ignored", reason, sections: [] } };
 }
 
+/** Drop only the invalid `infisical.readSources` entries.  The warning
+ * names the entry index and, when present, its name — never any other
+ * value from the entry.  Returns null when nothing was dropped or when
+ * the rest of the section still does not validate. */
+function salvageInfisicalReadSources(value: JsonValue): { usable: JsonObject; issues: string[]; left: string[] } | null {
+  if (!isJsonObject(value)) return null;
+  const raw = value.readSources;
+  if (raw === undefined) return null;
+  if (!Array.isArray(raw)) {
+    const { readSources: _dropped, ...rest } = value;
+    try {
+      parseStoredConfig({ infisical: rest });
+    } catch {
+      return null;
+    }
+    return { usable: rest, issues: ["infisical.readSources is invalid"], left: ["infisical.readSources"] };
+  }
+  const kept: JsonValue[] = [];
+  const issues: string[] = [];
+  const left: string[] = [];
+  raw.forEach((entry, index) => {
+    if (infisicalReadSourceSchema.safeParse(entry).success) {
+      kept.push(entry);
+      return;
+    }
+    const name = isJsonObject(entry) && isJsonString(entry.name) ? ` (name ${JSON.stringify(entry.name.slice(0, 64))})` : "";
+    issues.push(`infisical.readSources.${index}${name} is invalid`);
+    left.push(`infisical.readSources.${index}`);
+  });
+  if (issues.length === 0) return null;
+  const usable: JsonObject = { ...value, readSources: kept };
+  try {
+    parseStoredConfig({ infisical: usable });
+  } catch {
+    return null;
+  }
+  return { usable, issues, left };
+}
+
+/** Drop only the invalid `zulip.credentialSources` entries (`login` /
+ * `outgoing`).  Returns null when nothing was dropped or when the rest
+ * of the section still does not validate. */
+function salvageZulipCredentialSources(value: JsonValue): { usable: JsonObject; issues: string[]; left: string[] } | null {
+  if (!isJsonObject(value)) return null;
+  const raw = value.credentialSources;
+  if (raw === undefined) return null;
+  if (!isJsonObject(raw)) {
+    const { credentialSources: _dropped, ...rest } = value;
+    if (!zulipConfigSchema.safeParse(rest).success) return null;
+    return { usable: rest, issues: ["zulip.credentialSources is invalid"], left: ["zulip.credentialSources"] };
+  }
+  const kept: JsonObject = {};
+  const issues: string[] = [];
+  const left: string[] = [];
+  for (const field of ["login", "outgoing"] as const) {
+    const entry = raw[field];
+    if (entry === undefined) continue;
+    const fieldSchema = field === "login" ? zulipLoginCredentialFieldSourceSchema : zulipOutgoingCredentialFieldSourceSchema;
+    if (fieldSchema.safeParse(entry).success) {
+      kept[field] = entry;
+    } else {
+      issues.push(`zulip.credentialSources.${field} is invalid`);
+      left.push(`zulip.credentialSources.${field}`);
+    }
+  }
+  if (issues.length === 0) return null;
+  const { credentialSources: _dropped, ...rest } = value;
+  const usable: JsonObject = Object.keys(kept).length > 0 ? { ...rest, credentialSources: kept } : rest;
+  if (!zulipConfigSchema.safeParse(usable).success) return null;
+  return { usable, issues, left };
+}
+
 /** Keep every section of an invalid config.json that validates on its own, and report the rest.
  * Inside `instances` the unit is one engine entry, because dropping the whole map reroutes every
  * engine to its default for the sake of one bad field.  Each piece is validated with the same
@@ -1641,11 +1949,29 @@ function salvageStoredConfig(stored: JsonObject): StoredConfigRead {
   const left: string[] = [];
   for (const [section, value] of Object.entries(stored)) {
     if (!STORED_CONFIG_SECTIONS.has(section)) continue;
+    if (section === "zulip") {
+      const salvaged = salvageZulipCredentialSources(value);
+      if (salvaged) {
+        usable[section] = salvaged.usable;
+        issues.push(...salvaged.issues);
+        left.push(...salvaged.left);
+        continue;
+      }
+    }
     try {
       parseStoredConfig({ [section]: value });
       usable[section] = value;
       continue;
     } catch (error) {
+      if (section === "infisical") {
+        const salvaged = salvageInfisicalReadSources(value);
+        if (salvaged) {
+          usable[section] = salvaged.usable;
+          issues.push(...salvaged.issues);
+          left.push(...salvaged.left);
+          continue;
+        }
+      }
       const entries = section === "instances" ? jsonObjectSchema.safeParse(value) : null;
       if (!entries?.success) {
         issues.push(error instanceof Error ? error.message : `${section} is invalid`);
@@ -1727,7 +2053,14 @@ function readStoredConfig(path: string): StoredConfigRead {
     return ignoredConfig(jsonFailureReason(error instanceof Error ? error : new Error(String(error)), body.length));
   }
   try {
-    return { config: parseStoredConfig(parsed), problem: null };
+    const config = parseStoredConfig(parsed);
+    // `zulip` is caught to undefined by its schema, so a bad
+    // `credentialSources` entry would otherwise drop the whole section
+    // silently instead of reaching the per-entry salvage below.
+    if (isJsonObject(parsed) && parsed.zulip !== undefined && salvageZulipCredentialSources(parsed.zulip) !== null) {
+      return salvageStoredConfig(parsed);
+    }
+    return { config, problem: null };
   } catch {
     const asObject = jsonObjectSchema.safeParse(parsed);
     return asObject.success ? salvageStoredConfig(asObject.data) : ignoredConfig("it must hold a JSON object");
@@ -1759,6 +2092,44 @@ function reportStoredConfig(path: string, problem: StoredConfigProblem | null): 
     holdsCleanup: false,
     at: Date.now(),
   });
+}
+
+/** Resolve bootstrap credentials and source routes identically for loads and locked saves. */
+function overlayInfisicalBootstrap(stored: AppConfig["infisical"]): NonNullable<AppConfig["infisical"]> {
+  const section = { ...stored };
+  const fields: Array<[field: "clientId" | "clientSecret" | "token" | "writeToken" | "projectId" | "siteUrl" | "environment" | "secretPath", names: string[]]> = [
+    ["clientId", ["INFISICAL_CLIENT_ID", "INFISICAL_UNIVERSAL_AUTH_CLIENT_ID"]],
+    ["clientSecret", ["INFISICAL_CLIENT_SECRET", "INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET"]],
+    ["token", ["INFISICAL_TOKEN"]],
+    ["writeToken", ["INFISICAL_WRITE_TOKEN"]],
+    ["projectId", ["INFISICAL_PROJECT_ID"]],
+    ["siteUrl", ["INFISICAL_SITE_URL", "INFISICAL_DOMAIN"]],
+    ["environment", ["INFISICAL_ENVIRONMENT"]],
+    ["secretPath", ["INFISICAL_SECRET_PATH"]],
+  ];
+  for (const [field, names] of fields) {
+    const name = names.find((candidate) => process.env[candidate] !== undefined);
+    if (name !== undefined) section[field] = process.env[name];
+  }
+  if (process.env.INFISICAL_READ_SOURCES !== undefined) {
+    try {
+      const parsed: unknown = JSON.parse(process.env.INFISICAL_READ_SOURCES);
+      if (Array.isArray(parsed)) {
+        section.readSources = parsed.flatMap((entry): InfisicalReadSource[] => {
+          if (!isJsonObject(entry) || !isJsonString(entry.name) || !isJsonString(entry.projectId)) return [];
+          const source: InfisicalReadSource = { name: entry.name, projectId: entry.projectId };
+          if (isJsonString(entry.tokenFile)) source.tokenFile = entry.tokenFile;
+          if (isJsonString(entry.tokenEnv)) source.tokenEnv = entry.tokenEnv;
+          if (isJsonString(entry.writeTokenFile)) source.writeTokenFile = entry.writeTokenFile;
+          if (isJsonString(entry.writeTokenEnv)) source.writeTokenEnv = entry.writeTokenEnv;
+          if (isJsonString(entry.environment)) source.environment = entry.environment;
+          if (isJsonString(entry.secretPath)) source.secretPath = entry.secretPath;
+          return [source];
+        });
+      }
+    } catch { /* Invalid JSON leaves the stored routes unchanged. */ }
+  }
+  return section;
 }
 
 export function loadConfig(): AppConfig {
@@ -1825,27 +2196,8 @@ export function loadConfig(): AppConfig {
   if (process.env.ASSEMBLYAI_API_KEY !== undefined) cfg.assemblyai.key = process.env.ASSEMBLYAI_API_KEY;
   cfg.imageGen = { ...cfg.imageGen };
   if (process.env.OMB_OPENAI_IMAGE_KEY !== undefined) cfg.imageGen.key = process.env.OMB_OPENAI_IMAGE_KEY;
-  // The secret store's own machine identity, which is the one credential pair
-  // that cannot come out of the store.  The alias names mirror the pair the
-  // iOS ship workflow already uses, so a single identity works in CI, on a
-  // headless machine, and in Settings without being renamed on the way.
-  // First defined wins, and env beats the file here for the same reason it
-  // does above: the desktop shell injects it at spawn.
-  cfg.infisical = { ...cfg.infisical };
-  const identity: Array<[field: "clientId" | "clientSecret" | "token" | "writeToken" | "projectId" | "siteUrl" | "environment" | "secretPath", names: string[]]> = [
-    ["clientId", ["INFISICAL_CLIENT_ID", "INFISICAL_UNIVERSAL_AUTH_CLIENT_ID"]],
-    ["clientSecret", ["INFISICAL_CLIENT_SECRET", "INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET"]],
-    ["token", ["INFISICAL_TOKEN"]],
-    ["writeToken", ["INFISICAL_WRITE_TOKEN"]],
-    ["projectId", ["INFISICAL_PROJECT_ID"]],
-    ["siteUrl", ["INFISICAL_SITE_URL", "INFISICAL_DOMAIN"]],
-    ["environment", ["INFISICAL_ENVIRONMENT"]],
-    ["secretPath", ["INFISICAL_SECRET_PATH"]],
-  ];
-  for (const [field, names] of identity) {
-    const name = names.find((candidate) => process.env[candidate] !== undefined);
-    if (name !== undefined) cfg.infisical[field] = process.env[name];
-  }
+  // Bootstrap env beats disk; an inherited machine identity still requires explicit selection.
+  cfg.infisical = overlayInfisicalBootstrap(cfg.infisical);
   cfg.agentProxy = { ...cfg.agentProxy };
   if (process.env.INFISICAL_AGENT_PROXY_ENABLED !== undefined) {
     const raw = process.env.INFISICAL_AGENT_PROXY_ENABLED.trim().toLowerCase();
@@ -1873,6 +2225,16 @@ export function loadConfig(): AppConfig {
   // are no-ops when the store is unconfigured.  Runtime reads never consult
   // the vault — they read this resolved `cfg` from memory.
   resolveKnobFields(cfg, infisicalSnapshot());
+  for (const source of cfg.infisical?.readSources ?? []) {
+    for (const locator of [source.tokenEnv, source.writeTokenEnv]) {
+      const name = locator?.trim();
+      if (name && name.length <= 256 && /^[A-Z][A-Z0-9_]*$/.test(name)) scopedInfisicalCredentialEnv.add(name);
+    }
+  }
+  // The vault can hold a pair the file schema never saw, so the placement
+  // knobs' own invariant is applied here too:  the unreachable window has to
+  // be longer than the heartbeat period, or a healthy worker is swept.
+  if (cfg.placement) cfg.placement = clampPlacementWindow(cfg.placement);
   // Pin pre-MiniMax key-only installs after env and external-secret resolution.
   // Never persist the injected key to config.json in cleartext.
   migrateLegacyElevenLabsTtsProvider(cfg);
@@ -1923,6 +2285,8 @@ export function syncCredentialEnv(patch: Partial<AppConfig>): void {
     // keep shadowing the one just saved in Settings, and the card would report
     // a store the operator has already replaced.
     [patch.infisical?.clientSecret, "INFISICAL_CLIENT_SECRET"],
+    [patch.infisical?.token, "INFISICAL_TOKEN"],
+    [patch.infisical?.writeToken, "INFISICAL_WRITE_TOKEN"],
   ];
   for (const [value, name] of secrets) {
     if (value === undefined) continue;
@@ -1946,9 +2310,23 @@ export function syncCredentialEnv(patch: Partial<AppConfig>): void {
     else delete process.env["AZURE_SPEECH_REGION"];
   }
   if (patch.infisical?.clientId !== undefined) {
+    delete process.env["INFISICAL_UNIVERSAL_AUTH_CLIENT_ID"];
     if (patch.infisical.clientId) process.env["INFISICAL_CLIENT_ID"] = patch.infisical.clientId;
     else delete process.env["INFISICAL_CLIENT_ID"];
   }
+  if (patch.infisical?.clientSecret !== undefined) delete process.env["INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET"];
+  const vaultPointers = [
+    ["projectId", "INFISICAL_PROJECT_ID"], ["siteUrl", "INFISICAL_SITE_URL"],
+    ["environment", "INFISICAL_ENVIRONMENT"], ["secretPath", "INFISICAL_SECRET_PATH"],
+  ] as const;
+  for (const [field, envName] of vaultPointers) {
+    const value = patch.infisical?.[field];
+    if (value === undefined) continue;
+    if (value) process.env[envName] = value;
+    else delete process.env[envName];
+  }
+  if (patch.infisical?.siteUrl !== undefined) delete process.env.INFISICAL_DOMAIN;
+  if (patch.infisical?.readSources !== undefined) process.env.INFISICAL_READ_SOURCES = JSON.stringify(patch.infisical.readSources);
 }
 
 /** Env names of every workspace credential this process may be holding —
@@ -2013,8 +2391,11 @@ export const WORKSPACE_CREDENTIAL_ENV = [
 ] as const;
 
 /** Drop every workspace credential from a child-process env (in place). */
+const scopedInfisicalCredentialEnv = new Set<string>();
+
 export function stripWorkspaceCredentialEnv(env: Record<string, string | undefined>): void {
   for (const key of WORKSPACE_CREDENTIAL_ENV) delete env[key];
+  for (const key of scopedInfisicalCredentialEnv) delete env[key];
 }
 
 /** Env names a provider CLI might read as its own billing identity. A spawned
@@ -2096,6 +2477,10 @@ export function saveConfig(
   // stale snapshot, and vice versa.  (PR #251 review, board a2a3a586.)
   updateConfigFile(p, (raw) => {
     const merged = mergeConfigPatch(raw, checkedPatch);
+    if (checkedPatch.infisical) {
+      const section = infisicalConfigSchema.parse(merged.infisical);
+      validateInfisicalConfigPatch({ infisical: overlayInfisicalBootstrap(section) }, { infisical: checkedPatch.infisical });
+    }
     for (const [section, present] of Object.entries(options.externalCredentialSections ?? {})) {
       const current = jsonObjectSchema.safeParse(merged[section]);
       const next: JsonObject = current.success ? { ...current.data } : {};
@@ -2155,7 +2540,7 @@ function mergeConfigPatch(raw: Record<string, unknown>, checkedPatch: CheckedCon
   // resolve from the file when the vault is off, so a save that never
   // reaches disk breaks the vault-over-file contract for exactly the knobs
   // this rollout manages.
-  for (const key of ["xai", "gemini", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "callStt", "azureSpeech", "metaSpeech", "groq", "assemblyai", "imageGen", "profile", "rooms", "jobs", "localVm", "server", "features", "autoUpdate", "ingress", "usage", "qdrant", "observability", "infisical", "agentProxy", "botDefaults", "imessageLinq", "githubRequestLog", "zulip", "autoReview", "sts", "computerCall", "claudeSession"] as const) {
+  for (const key of ["xai", "gemini", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "callStt", "azureSpeech", "metaSpeech", "groq", "assemblyai", "imageGen", "profile", "rooms", "jobs", "localVm", "server", "features", "autoUpdate", "ingress", "usage", "qdrant", "observability", "infisical", "agentProxy", "botDefaults", "imessageLinq", "githubRequestLog", "zulip", "autoReview", "sts", "computerCall", "claudeSession", "placement"] as const) {
     const section = checkedPatch[key];
     if (!section) continue;
     const current = jsonObjectSchema.safeParse(disk[key]);
@@ -2179,6 +2564,28 @@ function mergeConfigPatch(raw: Record<string, unknown>, checkedPatch: CheckedCon
     if (stored.success) {
       const { allowedComputers: _cleared, ...rest } = stored.data;
       disk.botDefaults = rest;
+    }
+  }
+  // Headroom null-clear (P-BF-6 slice 7b): the generic section merge above
+  // would persist a JSON null, so an explicit null on any of the three
+  // unset-by-default knobs deletes the stored key instead — the file keeps
+  // reading "unset", exactly as before the knob was set.  Only an explicit
+  // null deletes; an absent key still leaves the stored value alone.
+  {
+    const admission = checkedPatch.jobs?.admission;
+    if (admission && (admission.reservedCpuCores === null || admission.reservedRamMb === null || admission.minMemoryAvailablePercent === null)) {
+      const stored = jsonObjectSchema.safeParse(disk.jobs);
+      if (stored.success) {
+        const storedAdmission = jsonObjectSchema.safeParse(stored.data.admission);
+        if (storedAdmission.success) {
+          const next = { ...storedAdmission.data };
+          if (admission.reservedCpuCores === null) delete next.reservedCpuCores;
+          if (admission.reservedRamMb === null) delete next.reservedRamMb;
+          if (admission.minMemoryAvailablePercent === null) delete next.minMemoryAvailablePercent;
+          stored.data.admission = next;
+        }
+        disk.jobs = stored.data;
+      }
     }
   }
   if (checkedPatch.vps !== undefined) disk.vps = normalizeVpsConfig(checkedPatch.vps);
@@ -2219,7 +2626,7 @@ function mergeConfigPatch(raw: Record<string, unknown>, checkedPatch: CheckedCon
 export function patchInstanceConfig(
   cfg: AppConfig,
   instanceId: string,
-  patch: { cli?: string; fullAuto?: boolean; enabled?: boolean; key?: string; externalCredential?: boolean; models?: Array<{ id: string; label: string }> },
+  patch: { cli?: string; fullAuto?: boolean; enabled?: boolean; key?: string; externalCredential?: boolean; models?: Array<{ id: string; label: string }>; replyWaitMinutes?: number | null },
 ): InstanceCliUpdate {
   const next: AppConfig = structuredClone(cfg);
   const map = instanceConfigs(next);
@@ -2265,6 +2672,11 @@ export function patchInstanceConfig(
     } else {
       delete nextConfig.userModels;
     }
+  }
+
+  if (patch.replyWaitMinutes !== undefined) {
+    if (patch.replyWaitMinutes === null) delete nextConfig.replyWaitMinutes;
+    else nextConfig.replyWaitMinutes = patch.replyWaitMinutes;
   }
 
   if (patch.fullAuto !== undefined) {
@@ -2514,6 +2926,8 @@ export function instanceConfigs(cfg: AppConfig): InstanceConfigMap {
   };
   const CUSTOM_ONLY = {
     kimi: { driver: "kimiAgent" },
+    zcode: { driver: "zcodeAgent" },
+    zcodeAcp: { driver: "zcodeAcp" },
     qwen: { driver: "qwenAgent" },
     hermes: { driver: "hermesAgent" },
     pi: { driver: "piAgent" },

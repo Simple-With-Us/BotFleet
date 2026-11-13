@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { JOB_CAP_PER_BOT, JOB_CAP_PER_THREAD } from "../shared/jobs.ts";
 import { PLACEMENT_WIRE_VERSION, type CapacitySample, type HostId } from "../shared/placement.ts";
 import { PlacementLeaseService, placementLeaseRoute } from "./placement-leases.ts";
 
@@ -32,6 +33,7 @@ function service(nowValue = 1_000) {
   return {
     now,
     leases: new PlacementLeaseService({
+      volatileForTests: true,
       hostId: controllerId,
       controller: { controllerId, epoch: 0 },
       now: () => now.value,
@@ -59,6 +61,48 @@ describe("placement lease compare-and-set", () => {
     expect(first.ok && first.reply.accepted).toBe(true);
     expect(second.ok && second.reply).toMatchObject({ accepted: true, duplicate: true, jobId: "job-1", status: "queued" });
     expect(leases.jobsList()).toHaveLength(1);
+  });
+
+  it("refuses a new job past the per-thread and per-bot caps, and a settled job frees its slot", () => {
+    const { leases } = service();
+    const admit = (jobId: string, botId = "bot-a", threadId = "t") =>
+      leases.enqueue({ ...fence, jobId, botId, threadId, command: "true", cwd: "/tmp", timeoutMs: 60_000 });
+    for (let index = 0; index < JOB_CAP_PER_THREAD; index += 1) {
+      expect(admit(`thread-${index}`).ok).toBe(true);
+    }
+    const threadFull = admit("thread-extra");
+    expect(threadFull.ok).toBe(false);
+    expect(!threadFull.ok ? threadFull.reason : "").toContain(`${JOB_CAP_PER_THREAD} jobs running`);
+    expect(leases.job("thread-extra")).toBeNull();
+    // The same id is a replay, so the cap does not swallow a duplicate.
+    const replay = admit("thread-0");
+    expect(replay.ok && replay.reply).toMatchObject({
+      accepted: true,
+      duplicate: true,
+      queuedReason: "waiting for an eligible host",
+    });
+
+    expect(admit("bot-extra", "bot-a", "other-thread").ok).toBe(true);
+    const botFull = admit("bot-over", "bot-a", "third-thread");
+    expect(botFull.ok).toBe(false);
+    expect(!botFull.ok ? botFull.reason : "").toContain(`${JOB_CAP_PER_BOT} jobs running`);
+    expect(admit("other-bot", "bot-b", "third-thread").ok).toBe(true);
+
+    leases.register({ ...fence, hostId: workerId, role: "worker", capabilities: ["shell"], sample });
+    const claim = leases.claim({ ...fence, hostId: workerId, jobId: "thread-0" });
+    expect(claim.ok && claim.reply.accepted).toBe(true);
+    const leaseId = claim.ok && claim.reply.accepted ? claim.reply.lease.leaseId : "";
+    expect(leases.report({
+      ...fence,
+      jobId: "thread-0",
+      leaseId,
+      hostId: workerId,
+      status: "completed",
+      exitCode: 0,
+      signal: null,
+      endedAt: 2_000,
+    }).ok).toBe(true);
+    expect(admit("thread-after-finish").ok).toBe(true);
   });
 
   it("refuses a higher epoch instead of adopting it, keeping its own pair", () => {
@@ -148,6 +192,290 @@ describe("placement lease compare-and-set", () => {
     expect(claim.ok && claim.reply.accepted).toBe(false);
     expect(claim.ok && !claim.reply.accepted ? claim.reply.reason : "").toMatch(/cannot run this job/);
   });
+
+  it("dispatches idempotently on the active lease and refuses a second distinct lease or mismatched payload", () => {
+    const { leases } = service();
+    leases.register({ ...fence, hostId: workerId, role: "worker", capabilities: ["shell"], sample });
+    leases.enqueue({ ...fence, jobId: "job-d", botId: "bot-a", threadId: "t", command: "true", cwd: "/tmp", timeoutMs: 60_000 });
+
+    const lease = { controllerId, epoch: 0, leaseId: "lease-1", jobId: "job-d", host: workerId };
+    const staleLease = leases.dispatch({
+      ...fence,
+      lease: { ...lease, epoch: 3 },
+      command: "true",
+      cwd: "/tmp",
+      timeoutMs: 60_000,
+    });
+    expect(staleLease.ok && staleLease.reply.accepted).toBe(false);
+    expect(staleLease.ok && staleLease.reply.reason).toMatch(/stale lease epoch/);
+
+    const badPayload = leases.dispatch({
+      ...fence,
+      lease,
+      command: "false",
+      cwd: "/tmp",
+      timeoutMs: 60_000,
+    });
+    expect(badPayload.ok && badPayload.reply.accepted).toBe(false);
+    expect(badPayload.ok && badPayload.reply.reason).toMatch(/does not match the queued job/);
+
+    const dispatched = leases.dispatch({
+      ...fence,
+      lease,
+      command: "true",
+      cwd: "/tmp",
+      timeoutMs: 60_000,
+    });
+    expect(dispatched.ok && dispatched.reply).toEqual({
+      accepted: true,
+      leaseId: "lease-1",
+      controllerId,
+      epoch: 0,
+    });
+    expect(leases.job("job-d")).toMatchObject({
+      status: "dispatching",
+      host: workerId,
+      leaseId: "lease-1",
+      placedReason: "dispatched to an eligible host",
+    });
+
+    // Exact replay is idempotent and returns accepted: true without re-dispatching.
+    const replay = leases.dispatch({
+      ...fence,
+      lease,
+      command: "true",
+      cwd: "/tmp",
+      timeoutMs: 60_000,
+    });
+    expect(replay.ok && replay.reply.accepted).toBe(true);
+
+    // A second distinct leaseId for the same job is refused.
+    const duplicate = leases.dispatch({
+      ...fence,
+      lease: { ...lease, leaseId: "lease-2" },
+      command: "true",
+      cwd: "/tmp",
+      timeoutMs: 60_000,
+    });
+    expect(duplicate.ok && duplicate.reply.accepted).toBe(false);
+    expect(duplicate.ok && duplicate.reply.reason).toMatch(/never leased twice/);
+
+    // Reusing an existing leaseId for a different jobId is rejected with lease_conflict.
+    leases.enqueue({ ...fence, jobId: "job-d2", botId: "bot-a", threadId: "t", command: "true", cwd: "/tmp", timeoutMs: 60_000 });
+    const collided = leases.dispatch({
+      ...fence,
+      lease: { controllerId, epoch: 0, leaseId: "lease-1", jobId: "job-d2", host: workerId },
+      command: "true",
+      cwd: "/tmp",
+      timeoutMs: 60_000,
+    });
+    expect(collided.ok && collided.reply).toEqual({
+      accepted: false,
+      leaseId: "lease-1",
+      reason: "lease_conflict",
+      controllerId,
+      epoch: 0,
+    });
+    expect(leases.job("job-d2")?.status).toBe("queued");
+  });
+
+  it("accepts idempotent dispatch replay after worker is marked unreachable", () => {
+    const { now, leases } = service();
+    leases.register({ ...fence, hostId: workerId, role: "worker", capabilities: ["shell"], sample });
+    leases.enqueue({ ...fence, jobId: "job-unreach", botId: "bot-a", threadId: "t", command: "true", cwd: "/tmp", timeoutMs: 60_000 });
+    const claim = leases.claim({ ...fence, hostId: workerId, jobId: "job-unreach" });
+    const lease = claim.ok && claim.reply.accepted ? claim.reply.lease : undefined;
+    expect(lease).toBeDefined();
+    if (!lease) return;
+
+    leases.dispatch({ ...fence, lease, command: "true", cwd: "/tmp", timeoutMs: 60_000 });
+    now.value += 60_000;
+    expect(leases.sweepUnreachable()).toEqual(["job-unreach"]);
+    expect(leases.job("job-unreach")?.status).toBe("worker-unreachable");
+
+    const replay = leases.dispatch({ ...fence, lease, command: "true", cwd: "/tmp", timeoutMs: 60_000 });
+    expect(replay.ok && replay.reply.accepted).toBe(true);
+  });
+
+  it("retains pendingStops across intervening heartbeats while a stopped job is still dispatching", () => {
+    const { leases } = service();
+    leases.register({ ...fence, hostId: workerId, role: "worker", capabilities: ["shell"], sample });
+    leases.enqueue({ ...fence, jobId: "job-early-stop", botId: "bot-a", threadId: "t", command: "sleep 30", cwd: "/tmp", timeoutMs: 60_000 });
+    const claim = leases.claim({ ...fence, hostId: workerId, jobId: "job-early-stop" });
+    const leaseId = claim.ok && claim.reply.accepted ? claim.reply.lease.leaseId : "";
+
+    expect(leases.stop({ ...fence, jobId: "job-early-stop", leaseId, reason: "stop before ack" }).ok).toBe(true);
+
+    // Intervening heartbeat before worker acknowledges holding the lease must NOT prune the pending stop.
+    const preAckHb = leases.heartbeat({
+      ...fence,
+      hostId: workerId,
+      leases: [],
+      admission: { admit: true },
+      sample,
+    });
+    expect(preAckHb.ok && preAckHb.reply.pendingStops).toEqual([leaseId]);
+    expect(leases.job("job-early-stop")?.status).toBe("dispatching");
+
+    // Subsequent heartbeat where the worker reports holding the lease still delivers the pending stop.
+    const ackHb = leases.heartbeat({
+      ...fence,
+      hostId: workerId,
+      leases: [leaseId],
+      admission: { admit: true },
+      sample,
+    });
+    expect(ackHb.ok && ackHb.reply.pendingStops).toEqual([leaseId]);
+    expect(leases.job("job-early-stop")?.status).toBe("running");
+
+    // Once the worker stops holding the lease on a subsequent heartbeat, the pending stop is pruned.
+    const postStopHb = leases.heartbeat({
+      ...fence,
+      hostId: workerId,
+      leases: [],
+      admission: { admit: true },
+      sample,
+    });
+    expect(postStopHb.ok && postStopHb.reply.pendingStops).toEqual([]);
+  });
+
+  it("delivers pendingStops on heartbeat for a stopped lease and prunes once dropped or reported", () => {
+    const { leases } = service();
+    leases.register({ ...fence, hostId: workerId, role: "worker", capabilities: ["shell"], sample });
+    leases.enqueue({ ...fence, jobId: "job-s", botId: "bot-a", threadId: "t", command: "sleep 30", cwd: "/tmp", timeoutMs: 60_000 });
+    const claim = leases.claim({ ...fence, hostId: workerId, jobId: "job-s" });
+    const leaseId = claim.ok && claim.reply.accepted ? claim.reply.lease.leaseId : "";
+
+    const stopped = leases.stop({ ...fence, jobId: "job-s", leaseId, reason: "owner cancelled" });
+    expect(stopped.ok && stopped.reply).toEqual({
+      accepted: true,
+      jobId: "job-s",
+      leaseId,
+      controllerId,
+      epoch: 0,
+    });
+    expect(leases.job("job-s")?.stopReason).toBe("owner cancelled");
+
+    // While the worker still reports holding the lease, heartbeat returns it in pendingStops.
+    const hbRunning = leases.heartbeat({
+      ...fence,
+      hostId: workerId,
+      leases: [leaseId],
+      admission: { admit: true },
+      sample,
+    });
+    expect(hbRunning.ok && hbRunning.reply.pendingStops).toEqual([leaseId]);
+    expect(leases.job("job-s")?.status).toBe("running");
+
+    // Once the worker settles the job via report, the stop is cleared and terminal stop is refused.
+    leases.report({
+      ...fence,
+      jobId: "job-s",
+      leaseId,
+      hostId: workerId,
+      status: "killed",
+      exitCode: null,
+      signal: "SIGTERM",
+      endedAt: 2_000,
+    });
+    const afterReportHb = leases.heartbeat({
+      ...fence,
+      hostId: workerId,
+      leases: [],
+      admission: { admit: true },
+      sample,
+    });
+    expect(afterReportHb.ok && afterReportHb.reply.pendingStops).toEqual([]);
+
+    const stopTerminal = leases.stop({ ...fence, jobId: "job-s", leaseId, reason: "late stop" });
+    expect(stopTerminal.ok && stopTerminal.reply.accepted).toBe(false);
+    expect(stopTerminal.ok && stopTerminal.reply.reason).toMatch(/already killed/);
+  });
+
+  it("refuses clean controller release while jobs are active and bumps epoch once drained", () => {
+    const { leases } = service();
+    leases.register({ ...fence, hostId: workerId, role: "worker", capabilities: ["shell"], sample });
+    leases.enqueue({ ...fence, jobId: "job-r", botId: "bot-a", threadId: "t", command: "true", cwd: "/tmp", timeoutMs: 60_000 });
+
+    const blocked = leases.release({ ...fence, toControllerId: workerId });
+    expect(blocked.ok && blocked.reply).toEqual({
+      accepted: false,
+      reason: "Settle all active jobs with terminal reports before releasing the controller",
+      controllerId,
+      epoch: 0,
+    });
+    expect(leases.controller()).toEqual({ controllerId, epoch: 0 });
+
+    const claim = leases.claim({ ...fence, hostId: workerId, jobId: "job-r" });
+    const leaseId = claim.ok && claim.reply.accepted ? claim.reply.lease.leaseId : "";
+    leases.report({
+      ...fence,
+      jobId: "job-r",
+      leaseId,
+      hostId: workerId,
+      status: "completed",
+      exitCode: 0,
+      signal: null,
+      endedAt: 2_000,
+    });
+
+    const released = leases.release({ ...fence, toControllerId: workerId });
+    expect(released.ok && released.reply).toEqual({
+      accepted: true,
+      releasedFromEpoch: 0,
+      controllerId: workerId,
+      epoch: 1,
+    });
+    expect(leases.controller()).toEqual({ controllerId: workerId, epoch: 1 });
+  });
+
+  it("adopts a strictly higher epoch on takeover and marks in-flight jobs ranAfterTakeover", () => {
+    const { leases } = service();
+    leases.register({ ...fence, hostId: workerId, role: "worker", capabilities: ["shell"], sample });
+    leases.enqueue({ ...fence, jobId: "job-inflight", botId: "bot-a", threadId: "t", command: "true", cwd: "/tmp", timeoutMs: 60_000 });
+    leases.enqueue({ ...fence, jobId: "job-queued", botId: "bot-a", threadId: "t", command: "true", cwd: "/tmp", timeoutMs: 60_000 });
+    leases.claim({ ...fence, hostId: workerId, jobId: "job-inflight" });
+
+    // Equal or lower epoch is refused.
+    const sameEpoch = leases.takeover({
+      version: PLACEMENT_WIRE_VERSION,
+      controllerId: otherController,
+      epoch: 0,
+      reconcile: true,
+    });
+    expect(sameEpoch.ok && sameEpoch.reply.accepted).toBe(false);
+    expect(leases.controller()).toEqual({ controllerId, epoch: 0 });
+
+    // Epoch jump exceeding bounds is refused.
+    const outOfBounds = leases.takeover({
+      version: PLACEMENT_WIRE_VERSION,
+      controllerId: otherController,
+      epoch: 100_001,
+      reconcile: true,
+    });
+    expect(outOfBounds.ok && outOfBounds.reply.accepted).toBe(false);
+    expect(outOfBounds.ok && outOfBounds.reply.reason).toMatch(/within bounds/);
+    expect(leases.controller()).toEqual({ controllerId, epoch: 0 });
+
+    // Strictly higher epoch is adopted and surfaces orphaned in-flight jobs.
+    const taken = leases.takeover({
+      version: PLACEMENT_WIRE_VERSION,
+      controllerId: otherController,
+      epoch: 2,
+      reconcile: true,
+    });
+    expect(taken.ok && taken.reply).toEqual({
+      accepted: true,
+      reconcile: true,
+      orphanedJobIds: ["job-inflight"],
+      controllerId: otherController,
+      epoch: 2,
+    });
+    expect(leases.controller()).toEqual({ controllerId: otherController, epoch: 2 });
+    expect(leases.reconciling()).toBe(true);
+    expect(leases.job("job-inflight")?.ranAfterTakeover).toBe(true);
+    expect(leases.job("job-queued")?.ranAfterTakeover).toBeUndefined();
+  });
 });
 
 describe("placement lease route boundary", () => {
@@ -174,5 +502,81 @@ describe("placement lease route boundary", () => {
     // Overlong host ids are rejected before the regex ever runs.
     const longHost = `mac:${"a".repeat(200)}`;
     expect(placementLeaseRoute(owner, "register", { ...register, hostId: longHost }, leases).status).toBe(400);
+  });
+
+  it("routes dispatch, stop, release-controller, and takeover through the validated boundary", () => {
+    const { leases } = service();
+    expect(placementLeaseRoute(owner, "register", { ...fence, hostId: workerId, role: "worker", capabilities: ["shell"], sample }, leases).status).toBe(200);
+    expect(placementLeaseRoute(owner, "enqueue", { ...fence, jobId: "job-route", botId: "bot-a", threadId: "t", command: "true", cwd: "/tmp", timeoutMs: 60_000 }, leases).status).toBe(200);
+
+    const dispatchRes = placementLeaseRoute(owner, "dispatch", {
+      ...fence,
+      lease: { controllerId, epoch: 0, leaseId: "lease-route", jobId: "job-route", host: workerId },
+      command: "true",
+      cwd: "/tmp",
+      timeoutMs: 60_000,
+    }, leases);
+    expect(dispatchRes).toEqual({
+      status: 200,
+      body: { accepted: true, leaseId: "lease-route", controllerId, epoch: 0 },
+    });
+
+    const stopRes = placementLeaseRoute(owner, "stop", {
+      ...fence,
+      jobId: "job-route",
+      leaseId: "lease-route",
+      reason: "stop from route",
+    }, leases);
+    expect(stopRes).toEqual({
+      status: 200,
+      body: { accepted: true, jobId: "job-route", leaseId: "lease-route", controllerId, epoch: 0 },
+    });
+
+    const takeoverRes = placementLeaseRoute(owner, "takeover", {
+      version: PLACEMENT_WIRE_VERSION,
+      controllerId: otherController,
+      epoch: 1,
+      reconcile: true,
+    }, leases);
+    expect(takeoverRes).toEqual({
+      status: 200,
+      body: {
+        accepted: true,
+        reconcile: true,
+        orphanedJobIds: ["job-route"],
+        controllerId: otherController,
+        epoch: 1,
+      },
+    });
+
+    // Settle the in-flight job under the new controller epoch, then release the controller cleanly.
+    expect(placementLeaseRoute(owner, "report", {
+      version: PLACEMENT_WIRE_VERSION,
+      controllerId: otherController,
+      epoch: 1,
+      jobId: "job-route",
+      leaseId: "lease-route",
+      hostId: workerId,
+      status: "killed",
+      exitCode: null,
+      signal: "SIGTERM",
+      endedAt: 3_000,
+    }, leases).status).toBe(200);
+
+    const releaseControllerRes = placementLeaseRoute(owner, "release-controller", {
+      version: PLACEMENT_WIRE_VERSION,
+      controllerId: otherController,
+      epoch: 1,
+      toControllerId: controllerId,
+    }, leases);
+    expect(releaseControllerRes).toEqual({
+      status: 200,
+      body: {
+        accepted: true,
+        releasedFromEpoch: 1,
+        controllerId,
+        epoch: 2,
+      },
+    });
   });
 });

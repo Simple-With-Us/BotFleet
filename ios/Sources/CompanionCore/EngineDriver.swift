@@ -443,6 +443,13 @@ public actor TurnDispatcherActor {
 
     private var activeTurns: [String: ActiveTurnContext] = [:]
     private var unsettledTasks: [UUID: Task<Void, Never>] = [:]
+    private struct Cancellation {
+        let threadId: String
+        let botId: String
+        let task: Task<Void, Never>
+    }
+    private var cancellations: [UUID: Cancellation] = [:]
+    private var cancellationByThread: [String: UUID] = [:]
     private var isShutdown = false
     private let database: DatabaseService?
     private let requiresDurablePersistence: Bool
@@ -472,23 +479,49 @@ public actor TurnDispatcherActor {
     }
 
     public func isTurnActive(threadId: String) -> Bool {
-        activeTurns[threadId] != nil
+        activeTurns[threadId] != nil || cancellationByThread[threadId] != nil
     }
 
     public func isBotActive(botId: String) -> Bool {
-        activeTurns.values.contains { $0.botId == botId }
+        activeTurns.values.contains { $0.botId == botId } || cancellations.values.contains { $0.botId == botId }
+    }
+
+    /// How many turns are in flight right now.  Read-only composition glue
+    /// for the Mac app's graceful-stop drain counters: the active engine
+    /// turn count feeds the drain path's work-in-flight number.
+    public func activeTurnCount() -> Int {
+        activeTurns.count + cancellations.count
     }
 
     public func cancelTurn(threadId: String) async {
-        guard let generation = activeTurns[threadId]?.generation else { return }
+        guard let generation = activeTurns[threadId]?.generation ?? cancellationByThread[threadId] else { return }
         await cancelTurn(threadId: threadId, generation: generation)
     }
 
     private func cancelTurn(threadId: String, generation: UUID) async {
-        guard let active = activeTurns[threadId], active.generation == generation else { return }
+        guard let task = beginCancellation(threadId: threadId, generation: generation) else { return }
+        await task.value
+        finishCancellation(threadId: threadId, generation: generation)
+    }
+
+    /// Register teardown ownership before yielding, so every stop caller joins the same driver cancellation.
+    private func beginCancellation(threadId: String, generation: UUID) -> Task<Void, Never>? {
+        if let cancellation = cancellations[generation] {
+            return cancellation.threadId == threadId ? cancellation.task : nil
+        }
+        guard let active = activeTurns[threadId], active.generation == generation else { return nil }
+        let driver = active.currentEngine
+        let task = Task { await driver.cancelTurn(threadId: threadId) }
+        cancellations[generation] = Cancellation(threadId: threadId, botId: active.botId, task: task)
+        cancellationByThread[threadId] = generation
         activeTurns.removeValue(forKey: threadId)
         active.task.cancel()
-        await active.currentEngine.cancelTurn(threadId: threadId)
+        return task
+    }
+
+    private func finishCancellation(threadId: String, generation: UUID) {
+        cancellations.removeValue(forKey: generation)
+        if cancellationByThread[threadId] == generation { cancellationByThread.removeValue(forKey: threadId) }
     }
 
     /// Dispatches a turn across the provided ordered fallback chain of drivers.
@@ -501,7 +534,7 @@ public actor TurnDispatcherActor {
         guard !fallbackChain.isEmpty else {
             throw EngineDriverError.noEnginesConfigured(botId: input.botId)
         }
-        guard activeTurns[input.threadId] == nil else {
+        guard activeTurns[input.threadId] == nil, cancellationByThread[input.threadId] == nil else {
             throw EngineDriverError.turnAlreadyActive(threadId: input.threadId)
         }
 
@@ -560,9 +593,14 @@ public actor TurnDispatcherActor {
     public func shutdownAndDrain() async throws {
         isShutdown = true
         let turns = Array(activeTurns.values)
-        let tasks = Array(unsettledTasks.values)
         for turn in turns {
-            await cancelTurn(threadId: turn.threadId, generation: turn.generation)
+            _ = beginCancellation(threadId: turn.threadId, generation: turn.generation)
+        }
+        let tasks = Array(unsettledTasks.values)
+        let pendingCancellations = Array(cancellations)
+        for (generation, cancellation) in pendingCancellations {
+            await cancellation.task.value
+            finishCancellation(threadId: cancellation.threadId, generation: generation)
         }
         for task in tasks { await task.value }
         guard !persistenceFailed else {
@@ -871,6 +909,10 @@ public actor EngineCoordinatorActor {
 
     public func isTurnActive(threadId: String) async -> Bool { await dispatcher.isTurnActive(threadId: threadId) }
     public func isBotActive(botId: String) async -> Bool { await dispatcher.isBotActive(botId: botId) }
+
+    /// How many turns are in flight right now.  Read-only composition glue
+    /// for the Mac app's graceful-stop drain counters.
+    public func activeTurnCount() async -> Int { await dispatcher.activeTurnCount() }
 
     public func cancelTurn(threadId: String) async {
         await dispatcher.cancelTurn(threadId: threadId)

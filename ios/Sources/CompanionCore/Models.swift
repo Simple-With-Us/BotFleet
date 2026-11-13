@@ -129,6 +129,10 @@ public struct ToolActivity: Codable, Hashable, Sendable {
     public var kind: String?
     public var detail: String?
     public var durationMs: Int?
+    /// The harness id for this step.  A child step points at the step that
+    /// started it with `parentItemId`.
+    public var itemId: String? = nil
+    public var parentItemId: String? = nil
 }
 
 public struct Sender: Codable, Hashable, Sendable {
@@ -147,6 +151,13 @@ public struct CommChip: Codable, Hashable, Sendable {
     public var withBotId: String
     public var withName: String
     public var withColor: String
+}
+
+public struct MessageCommand: Codable, Hashable, Equatable, Sendable {
+    public var id: String
+    public var name: String
+    public var source: String
+    public var role: String
 }
 
 public struct Message: Codable, Hashable, Identifiable, Sendable {
@@ -226,6 +237,8 @@ public struct Message: Codable, Hashable, Identifiable, Sendable {
     /// User line that landed inside a running turn (server `steered: true`).
     /// Shown as the "Sent mid-turn" chip; distinct from the pending queue.
     public var steered: Bool? = nil
+    /// Set when this row is an engine command, such as compacting the session.
+    public var command: MessageCommand? = nil
 
     public var date: Date { Date(timeIntervalSince1970: at / 1000) }
 }
@@ -347,6 +360,10 @@ public struct TaskUsage: Codable, Hashable, Sendable {
     public var cachedInput: Int?
     public var costUsd: Double?
     public var turns: Int
+    /// Input tokens of the latest settled turn.  How full the window was.
+    public var lastInput: Int? = nil
+    /// Window size the engine reported with that turn, when it reported one.
+    public var contextWindow: Int? = nil
 }
 
 public struct BotTask: Codable, Hashable, Sendable {
@@ -732,6 +749,8 @@ public struct ProviderSnapshot: Codable, Hashable, Sendable {
     /// The probe gave no answer yet (a slow CLI on a busy Mac) and nothing
     /// definitive stood in: the engine is being checked, not missing or signed out.
     public var transient: Bool?
+    /// OpenCode only: why the last model catalog probe failed, in plain language.
+    public var modelProbeProblem: String?
     /// How the engine bills: `metered` (a charge to an API key) or
     /// `subscription` (a flat plan, so a cost figure is an equivalent, not a
     /// charge).  A raw string so a new mode from a newer harness still decodes.
@@ -745,11 +764,28 @@ public struct ProviderSnapshot: Codable, Hashable, Sendable {
     /// Phone Settings strip labels.  Mac owns setup, so these never deep-link
     /// into key entry or a CLI path — they only say what is true right now.
     public var engineStatusLabel: String {
+        if let problem = modelProbeProblem?.trimmingCharacters(in: .whitespacesAndNewlines), !problem.isEmpty {
+            if problem.localizedCaseInsensitiveContains("timed out") { return "Timed out under load" }
+            if problem.localizedCaseInsensitiveContains("listed no models")
+                || problem.localizedCaseInsensitiveContains("answered but listed no models") {
+                return "No models listed"
+            }
+            if problem.localizedCaseInsensitiveContains("stopped by") { return "Probe stopped" }
+            return "Needs attention"
+        }
         // A probe still in flight is neither "Unavailable" nor "Sign in": say so.
         if isChecking { return "Checking" }
         if isAvailable, authenticated == false { return "Sign in" }
         if !isAvailable { return "Unavailable" }
         return "Ready"
+    }
+
+    /// Full catalog probe sentence for the engine sheet, when the harness sent one.
+    public var engineProblemDetail: String? {
+        guard let problem = modelProbeProblem?.trimmingCharacters(in: .whitespacesAndNewlines), !problem.isEmpty else {
+            return nil
+        }
+        return problem
     }
 
     /// Reserved for a structured missing-binary signal on `ProviderSnapshot`.
@@ -766,12 +802,15 @@ public struct ModelOption: Codable, Hashable, Identifiable, Sendable {
     public var label: String
     public var effortLevels: [String]?
     public var supportsEffort: Bool?
+    /// Published window for this model, in tokens.  Absent when unknown.
+    public var contextWindow: Int? = nil
 
-    public init(id: String, label: String, effortLevels: [String]? = nil, supportsEffort: Bool? = nil) {
+    public init(id: String, label: String, effortLevels: [String]? = nil, supportsEffort: Bool? = nil, contextWindow: Int? = nil) {
         self.id = id
         self.label = label
         self.effortLevels = effortLevels
         self.supportsEffort = supportsEffort
+        self.contextWindow = contextWindow
     }
 }
 
@@ -1084,7 +1123,7 @@ public struct ConfigStatus: Codable, Sendable {
     }
 
     /// Whether synthesis is available on the paired computer. Deliberately
-    /// provider-neutral: under ElevenLabs this is a key on file, while under
+    /// provider-neutral: under a hosted engine this is a key on file, while under
     /// the built-in engine `providerConfigured` in `server/tts/index.ts`
     /// reports whether the computer has voices it can use and no credential
     /// exists at all. Only the reason behind the flag changes — so anything

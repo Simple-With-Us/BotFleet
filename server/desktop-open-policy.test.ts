@@ -91,7 +91,13 @@ describe("the shutdown route", () => {
   it("is loopback-only like every route that stops something on this computer", () => {
     const start = SERVER_SOURCE.indexOf('path === "/api/system/shutdown"');
     expect(start).toBeGreaterThan(-1);
-    const branch = SERVER_SOURCE.slice(start, start + 1200);
+    // The whole branch, not a window of it:  the route grew when the graceful
+    // stop landed, and a fixed character count would have stopped looking at
+    // the end of the route at all.  The two facts below are about the whole
+    // route, so the whole route is what is read.
+    const end = SERVER_SOURCE.indexOf('path === "/api/system/control"', start);
+    expect(end).toBeGreaterThan(start);
+    const branch = SERVER_SOURCE.slice(start, end);
     expect(branch).toContain("isLoopbackAddress");
     expect(branch).toContain("requestHarnessShutdown");
   });

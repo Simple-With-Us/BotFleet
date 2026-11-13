@@ -29,6 +29,18 @@ const BASE = `http://127.0.0.1:${PORT}`;
 const WEBHOOK_PORT = 39000 + Math.floor(Math.random() * 10_000);
 const WEBHOOK_BASE = `http://127.0.0.1:${WEBHOOK_PORT}`;
 
+// The harness server runs as a child process, and its environment is built
+// by hand rather than inherited, so it used to fall back to the machine's
+// own zone while this process ran in whatever zone its environment named.
+// The two then disagreed, and an assertion that compared the zone the server
+// reported against the zone this process saw failed on any host whose
+// environment did not match the machine's — which is every runner that sets
+// TZ.  Pinning the child's zone to a fixed one, and asserting that same
+// fixed zone, makes the pair independent of the host: the assertion still
+// catches a server that ignores its own environment, and it no longer says
+// anything about where the machine happens to be.
+const CHILD_TIME_ZONE = "America/Chicago";
+
 let child: ChildProcess;
 /** stands in for the box provider so config saving never touches the network */
 let boxStub: Server;
@@ -479,6 +491,7 @@ beforeAll(async () => {
       ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
       HOME: home,
       USERPROFILE: home,
+      TZ: CHILD_TIME_ZONE,
       OMB_PORT: String(PORT),
       OMB_WEBHOOK_PORT: String(WEBHOOK_PORT),
       OMB_BOX_API: `http://127.0.0.1:${boxStubPort}`,
@@ -1114,6 +1127,7 @@ describe("harness HTTP API", () => {
     const SLOW = { timeout: 30_000, interval: 250 };
     // SAFETY: the harness's own JSON answer, read back by its test; the assertions below check it.
     const runtime = async () => (await (await fetch(`${BASE}/api/runtime`, { headers: authorization })).json()) as {
+      activeWorkCount: number;
       quiescing: boolean;
       fencing: boolean;
       draining: boolean;
@@ -1142,12 +1156,14 @@ describe("harness HTTP API", () => {
 
       // A request still reading its body keeps the forced quiesce settling
       // (it waits up to 15 seconds for work in flight to clear).
+      const activeBeforeHeld = (await runtime()).activeWorkCount;
       heldMutation = request({
         hostname: "127.0.0.1", port: PORT, path: "/api/config", method: "PUT",
         headers: { "content-type": "application/json", "content-length": "2" },
       });
       heldMutation.on("error", () => {});
       heldMutation.write("{");
+      await expect.poll(async () => (await runtime()).activeWorkCount, SLOW).toBeGreaterThan(activeBeforeHeld);
       const forced = quiesce("POST", "?force=true");
       await expect.poll(async () => (await runtime()).fencing, SLOW).toBe(true);
 
@@ -4963,6 +4979,100 @@ describe("harness HTTP API", () => {
     expect(res.body.error).toMatch(/Updating Infisical settings and credentials in the same request is not supported/);
   });
 
+  it("keeps externally stored Infisical read and write tokens off disk and out of responses", async () => {
+    const readToken = "st.fixture-read-token";
+    const writeToken = "st.fixture-write-token";
+    try {
+      const saved = await api("PUT", "/api/config?secretStorage=external", {
+        infisical: {
+          enabled: false,
+          authMethod: "service-token",
+          projectId: "11111111-1111-4111-8111-111111111111",
+          token: readToken,
+          writeToken,
+        },
+      });
+      expect(saved.status).toBe(200);
+      expect(saved.body.infisical).toMatchObject({
+        enabled: false, authMethod: "service-token", hasToken: true, hasWriteToken: true,
+      });
+      const disk = JSON.parse(readFileSync(join(home, ".botfleet", "config.json"), "utf8"));
+      expect(disk.infisical).toMatchObject({ token: "", writeToken: "", credentialStorage: "external" });
+      const status = await api("GET", "/api/infisical/status");
+      expect(status.status).toBe(200);
+      for (const payload of [saved.body, disk, status.body]) {
+        expect(JSON.stringify(payload)).not.toContain(readToken);
+        expect(JSON.stringify(payload)).not.toContain(writeToken);
+      }
+      const reloaded = await api("PUT", "/api/config", { profile: { name: "Grace" } });
+      expect(reloaded.status).toBe(200);
+      expect(reloaded.body.infisical).toMatchObject({ hasToken: true, hasWriteToken: true });
+    } finally {
+      await api("PUT", "/api/config?secretStorage=external", {
+        infisical: { enabled: false, projectId: "", token: "", writeToken: "", authMethod: "service-token" },
+      });
+    }
+  });
+
+  it("allows exact source-based Infisical test and sync despite an encrypted primary credential marker", async () => {
+    const projectId = "fixture-source-project";
+    const source = { name: "primary-source", projectId, environment: "prod", secretPath: "/", tokenEnv: "BF_SCOPE_FIXTURE_MISSING" };
+    try {
+      expect((await api("PUT", "/api/config?secretStorage=external", { infisical: {
+        enabled: false, authMethod: "machine-identity", projectId, clientId: "fixture-client", clientSecret: "fixture-encrypted-secret",
+      } })).status).toBe(200);
+      const saved = await api("PATCH", "/api/config", { infisical: {
+        enabled: true, authMethod: "service-token", environment: "prod", secretPath: "/", readSources: [source],
+      } });
+      expect(saved.status).toBe(200);
+      const tested = await api("POST", "/api/infisical/test");
+      expect(tested.status).toBe(200);
+      expect(tested.body.ok).toBe(false);
+      expect(tested.body.error).toContain("BF_SCOPE_FIXTURE_MISSING");
+      expect((await api("POST", "/api/infisical/sync")).status).toBe(200);
+      expect((await api("PATCH", "/api/config", { infisical: { readSources: [{ ...source, secretPath: "/another-folder" }] } })).status).toBe(200);
+      expect((await api("POST", "/api/infisical/test")).status).toBe(409);
+    } finally {
+      await api("PUT", "/api/config?secretStorage=external", { infisical: {
+        enabled: false, authMethod: "service-token", projectId: "", clientId: "", clientSecret: "", token: "", writeToken: "", readSources: [],
+      } });
+    }
+  });
+
+  it("retains partial Infisical setup metadata and the explicit off switch across saves", async () => {
+    try {
+      const saved = await api("PATCH", "/api/config", { infisical: {
+        enabled: false, authMethod: "service-token", projectId: "partial-project", siteUrl: "https://vault.example.test", readSources: [],
+      } });
+      expect(saved.status).toBe(200);
+      expect(saved.body.infisical).toMatchObject({ configured: false, enabled: false, enabledSetting: false });
+      expect((await api("GET", "/api/infisical/status")).body.infisical).toMatchObject({
+        enabledSetting: false, siteUrl: "https://vault.example.test", projectId: "partial-project",
+      });
+      expect((await api("PATCH", "/api/config", { infisical: { refreshMinutes: 20 } })).body.infisical.enabledSetting).toBe(false);
+    } finally {
+      await api("PATCH", "/api/config", { infisical: { enabled: false, projectId: "", siteUrl: "", refreshMinutes: 15 } });
+    }
+  });
+
+  it("rejects extra per-project token references before persisting or exposing credentials", async () => {
+    const token = "st.fixture-cap-read";
+    try {
+      expect((await api("PUT", "/api/config?secretStorage=external", { infisical: {
+        enabled: false, authMethod: "service-token", projectId: "cap-project", token,
+      } })).status).toBe(200);
+      const refused = await api("PATCH", "/api/config", { infisical: { readSources: [{
+        name: "extra", projectId: "cap-project", secretPath: "/extra", tokenEnv: "OTHER_READ_REFERENCE",
+      }] } });
+      expect(refused.status).toBe(400);
+      expect(refused.body.error).toMatch(/one read token reference/);
+      expect(JSON.stringify(refused.body)).not.toContain(token);
+      expect((await api("GET", "/api/infisical/status")).body.infisical.readSources).toEqual([]);
+    } finally {
+      await api("PUT", "/api/config?secretStorage=external", { infisical: { enabled: false, projectId: "", token: "", readSources: [] } });
+    }
+  });
+
   it("keeps shared Local VM mode by default and resolves isolated targets per bot when enabled", async () => {
     const first = (await api("POST", "/api/bots")).body.bot;
     const second = (await api("POST", "/api/bots")).body.bot;
@@ -5379,7 +5489,7 @@ describe("harness HTTP API", () => {
       }).toEqual(["card-shown:routine", "user-approved:user"]);
 
       const after = await api("GET", "/api/routines");
-      expect(after.body.timeZone).toBe(Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC");
+      expect(after.body.timeZone).toBe(CHILD_TIME_ZONE);
       expect(after.body.routines.filter((routine: { botId: string }) => routine.botId === bot.id)).toHaveLength(1);
       const duplicate = await api("POST", `/api/threads/${bot.threadId}/respond`, {
         requestId: proposal.requestId,
@@ -5416,7 +5526,7 @@ describe("harness HTTP API", () => {
         });
         bulkRoutineIds.push(bulk.body.routine.id);
       }
-      expect(legacy.body.routine.schedule.timeZone).toBe(Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC");
+      expect(legacy.body.routine.schedule.timeZone).toBe(CHILD_TIME_ZONE);
       const listed = await fetch(
         `${BASE}/api/internal/routines?fromBotId=${encodeURIComponent(bot.id)}&fromThreadId=${encodeURIComponent(bot.threadId)}`,
         { headers: internalHeaders },
@@ -6876,15 +6986,40 @@ describe("instance CLI override API", () => {
     const instanceId = created.body.instanceId;
     expect(instanceId).toContain("custom-ollama-local");
 
+    type CustomEngineListItem = {
+      instanceId: string;
+      replyWaitMinutes?: number;
+      displayName?: string;
+      driverKind?: string;
+      isCustom?: boolean;
+      localModelWaitAvailable?: boolean;
+      snapshot?: { state?: string; authenticated?: boolean };
+      models?: { options?: Array<{ id: string }> };
+    };
+    const findInstance = (instances: CustomEngineListItem[], id: string): CustomEngineListItem | undefined =>
+      instances.find((item) => item.instanceId === id);
+
     const instancesRes = await api("GET", "/api/instances");
-    const found = instancesRes.body.instances.find((i: any) => i.instanceId === instanceId);
+    const found = findInstance(instancesRes.body.instances, instanceId);
     expect(found).toBeDefined();
-    expect(found.displayName).toBe("Ollama Local");
-    expect(found.driverKind).toBe("openai-compat");
-    expect(found.isCustom).toBe(true);
-    expect(found.snapshot.state).toBe("available");
-    expect(found.snapshot.authenticated).toBe(true);
-    expect(found.models.options.map((m: any) => m.id)).toEqual(["llama3.3:70b", "mistral:latest"]);
+    expect(found?.displayName).toBe("Ollama Local");
+    expect(found?.driverKind).toBe("openai-compat");
+    expect(found?.isCustom).toBe(true);
+    expect(found?.snapshot?.state).toBe("available");
+    expect(found?.snapshot?.authenticated).toBe(true);
+    expect(found?.models?.options?.map((model) => model.id)).toEqual(["llama3.3:70b", "mistral:latest"]);
+    expect(found?.localModelWaitAvailable).toBe(true);
+
+    expect((await api("PATCH", `/api/instances/${instanceId}`, { replyWaitMinutes: 20 })).status).toBe(200);
+    expect((await api("PATCH", `/api/instances/${instanceId}`, { replyWaitMinutes: 10, unexpected: true })).status).toBe(400);
+    const configured = await api("GET", "/api/instances");
+    expect(findInstance(configured.body.instances, instanceId)?.replyWaitMinutes).toBe(20);
+    for (const invalid of [1, 4, 61, 2.5, "20"]) {
+      expect((await api("PATCH", `/api/instances/${instanceId}`, { replyWaitMinutes: invalid })).status).toBe(400);
+    }
+    expect((await api("PATCH", `/api/instances/${instanceId}`, { replyWaitMinutes: null })).status).toBe(200);
+    const reset = await api("GET", "/api/instances");
+    expect(findInstance(reset.body.instances, instanceId)).not.toHaveProperty("replyWaitMinutes");
 
     const botRes = await api("POST", "/api/bots", {
       name: "Local Bot",

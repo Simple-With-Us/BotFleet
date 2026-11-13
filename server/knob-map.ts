@@ -90,6 +90,16 @@ export const KNOB_FIELDS: readonly KnobFieldSpec[] = [
     max: 360,
   },
   {
+    id: "jobs.queueWaitMinutes",
+    label: "Maximum job queue wait",
+    section: "jobs",
+    path: ["queueWaitMinutes"],
+    infisicalName: "BOTFLEET_JOBS_QUEUE_WAIT_MINUTES",
+    kind: "int",
+    min: 1,
+    max: 10080,
+  },
+  {
     id: "jobs.cpuCores",
     label: "Job CPU cores",
     section: "jobs",
@@ -170,6 +180,42 @@ export const KNOB_FIELDS: readonly KnobFieldSpec[] = [
     kind: "int",
     min: 1,
     max: 720,
+  },
+  {
+    id: "jobs.webhookPayloadDedupeSeconds",
+    label: "Webhook payload dedupe window",
+    section: "jobs",
+    path: ["webhookPayloadDedupeSeconds"],
+    infisicalName: "BOTFLEET_WEBHOOK_PAYLOAD_DEDUPE_SECONDS",
+    kind: "int",
+    min: 0,
+    max: 3600,
+  },
+  {
+    // The placement transport's own two knobs (server/placement-controller-bridge.ts).
+    // `heartbeatSeconds` is how often a worker says it is alive, and the
+    // controller's sweep runs at the same cadence.  The other one is how
+    // long a worker may go quiet before the controller marks it unreachable,
+    // so the window has to stay longer than the period:  the pair is clamped
+    // to that order in `server/config.ts`, after the vault resolves as well.
+    id: "placement.heartbeatSeconds",
+    label: "Placement worker heartbeat period",
+    section: "placement",
+    path: ["heartbeatSeconds"],
+    infisicalName: "BOTFLEET_PLACEMENT_HEARTBEAT_SECONDS",
+    kind: "int",
+    min: 1,
+    max: 3600,
+  },
+  {
+    id: "placement.unreachableAfterSeconds",
+    label: "Placement unreachable window",
+    section: "placement",
+    path: ["unreachableAfterSeconds"],
+    infisicalName: "BOTFLEET_PLACEMENT_UNREACHABLE_AFTER_SECONDS",
+    kind: "int",
+    min: 16,
+    max: 86400,
   },
   {
     id: "observability.tracesSampleRate",
@@ -461,10 +507,29 @@ function kindMatches(spec: KnobFieldSpec, value: unknown): value is KnobValue {
   }
 }
 
+/** The ids of the headroom knobs the patch clears with an explicit JSON null —
+ * the wire spelling of "clear this knob back to unset" (slice 7b).  Only the
+ * three unset-by-default knobs admit null through the patch schema, so the
+ * check reads the typed admission object straight off the zod-validated
+ * patch — the same differential `botDefaults.allowedComputers` and
+ * `callStt.provider` already use — instead of walking blindly.  An absent
+ * key or a real value is not a clear. */
+export function clearedHeadroomKnobs(patch: Partial<AppConfig> | undefined): string[] {
+  const admission = patch?.jobs?.admission;
+  if (!admission) return [];
+  const cleared: string[] = [];
+  if (admission.reservedCpuCores === null) cleared.push("jobs.admission.reservedCpuCores");
+  if (admission.reservedRamMb === null) cleared.push("jobs.admission.reservedRamMb");
+  if (admission.minMemoryAvailablePercent === null) cleared.push("jobs.admission.minMemoryAvailablePercent");
+  return cleared;
+}
+
 /** Read one knob off a config-shaped object, typed.  Returns `undefined`
  * when the field is absent or holds a value of the wrong kind — the schema
  * below this layer is zod-validated, so the wrong-kind case is a caller
- * handing in something unvalidated, not a state the file can be in. */
+ * handing in something unvalidated, not a state the file can be in.
+ * An explicit null (see `knobClearRequested`) is not a value and also reads
+ * as `undefined` here. */
 // SAFETY: `spec.section` is a `keyof AppConfig` from the table above, so
 // indexing a plain config object by it reads a declared section and nothing
 // else.

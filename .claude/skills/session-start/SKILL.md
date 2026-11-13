@@ -79,12 +79,13 @@ Then read that app's `AGENTS.md`, `STATUS.md`, and latest `docs/rollouts/`.  `do
 Post (prefer this over Zulip MCP):
 
 ```bash
-AGENT_TAG="${AGENT_SEAT:?set MONET, CLAUDE, or RENOIR}" /Users/jay/apps/agent-sync-websocket.py --post "[$AGENT_SEAT] sync-1
+printf '%s\n' "[$AGENT_SEAT] sync-1
 repo: <project>
 claim: <monet|claude|renoir>/<slug>
 state: WIP
 cadence: per-turn-poll
-work: <one line>"
+work: <one line>" > /tmp/sync-note.md && chmod 600 /tmp/sync-note.md
+AGENT_SEAT="${AGENT_SEAT:?set MONET, CLAUDE, or RENOIR}" simple-chat post --topic "<project> sync" --body-file /tmp/sync-note.md
 ```
 
 Fallback: `AGENT_TAG="$AGENT_SEAT" bash scripts/simple-chat post "..."` from the app checkout, or `/Users/jay/apps/simple-chat`.  Do not open a second Zulip Socket Mode connection.

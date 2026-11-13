@@ -241,6 +241,12 @@ const PROVIDER_BY_ENGINE = new Map<string, string>(Object.entries({
   dsh: "dsh",
   kimi: "moonshot",
   moonshot: "moonshot",
+  zcode: "zcode",
+  // The ACP variant (driverKind zcodeAcp normalizes to zcodeacp) bills the
+  // same GLM Coding Plan, so it attributes to the same provider.
+  zcodeacp: "zcode",
+  zai: "zcode",
+  glm: "zcode",
   cursor: "cursor",
   minimax: "minimax",
   mcode: "minimax",
@@ -314,6 +320,12 @@ export function inferProviderAndService(
   }
   if (inst.includes("kimi") || model.includes("moonshot")) {
     return { provider: "moonshot", service: modelId || "unknown" };
+  }
+  // No model check here: GLM weights served over an OpenAI-compatible
+  // instance (OpenRouter, Ollama, ...) are that instance's traffic, and the
+  // zcode engine itself is already attributed by providerForEngine above.
+  if (inst.includes("zcode")) {
+    return { provider: "zcode", service: modelId || "unknown" };
   }
 
   // Still nothing: an OpenAI-compatible instance reports itself honestly
@@ -607,10 +619,10 @@ export function buildTurnEvents(
 }
 
 /** Spend that is not a chat turn: a synthesized clip, a generated avatar, a
- * speech summary, a voice-call token.  Nothing here carries prompt text, a
- * key, or a task title. */
+ * speech summary, a voice-call token, or a speech-to-text session.  Nothing
+ * here carries prompt text, a key, or a task title. */
 export interface TelemetryAuxParams {
-  kind: "tts" | "avatar-image" | "speech-summary" | "sts-session";
+  kind: "tts" | "avatar-image" | "speech-summary" | "sts-session" | "stt";
   /** Usage Monitor's provider name for who was paid. */
   provider: string;
   /** The model, voice engine or surface inside that provider. */

@@ -160,6 +160,59 @@ struct NativeMacCompanionRuntimeTests {
         }
     }
 
+    @Test("Injected coordinator and supervisor counts feed the runtime drain counters")
+    func runtimeExposesDrainCounters() async throws {
+        let fixture = try await makeFixture()
+        defer { fixture.cleanup() }
+        let gate = TurnGate()
+        let gatedEngine = GatedFixtureEngine(gate: gate)
+        let turnCoordinator = EngineCoordinatorActor(
+            drivers: [gatedEngine], botFallbackChains: ["bot-a": ["gated"]]
+        )
+        let supervisor = ProcessSupervisorActor(config: .testing)
+        let graph = NativeMacCompanionRuntime(
+            database: fixture.database,
+            workspacesRoot: fixture.workspacesRoot,
+            engineCoordinator: turnCoordinator,
+            engineSwitch: fixture.engineSwitch,
+            processSupervisor: supervisor
+        )
+        // Idle counters read zero: the drain path skips waiting when idle.
+        #expect(await graph.activeEngineTurnCount() == 0)
+        #expect(await graph.activeProcessCount() == 0)
+        #expect(await turnCoordinator.activeTurnCount() == 0)
+
+        // A dispatched turn holds its count until its stream is consumed.
+        let stream = try await turnCoordinator.sendTurn(
+            input: TurnInput(threadId: "thread-a", botId: "bot-a", prompt: "hold the turn open")
+        )
+        #expect(await turnCoordinator.activeTurnCount() == 1)
+        #expect(await graph.activeEngineTurnCount() == 1)
+        await gate.open()
+        for await _ in stream {}
+        #expect(await turnCoordinator.activeTurnCount() == 0)
+        #expect(await graph.activeEngineTurnCount() == 0)
+
+        #if os(macOS)
+        // A supervised process feeds the same counters through the runtime.
+        let session = try await supervisor.launch(
+            spec: EngineSpawnSpec(executable: "/bin/sh", arguments: ["-c", "echo READY; /bin/sleep 30"]),
+            threadId: "drain-counter-thread",
+            engineId: "drain-counter"
+        )
+        var iterator = session.stdoutLines.makeAsyncIterator()
+        _ = await iterator.next()
+        #expect(await supervisor.activeProcessCount() == 1)
+        #expect(await graph.activeProcessCount() == 1)
+        await supervisor.cancel(threadId: "drain-counter-thread")
+        _ = await session.waitForExit()
+        #expect(await supervisor.activeProcessCount() == 0)
+        #expect(await graph.activeProcessCount() == 0)
+        #endif
+
+        await graph.runtime.shutdown()
+    }
+
     @Test("Deactivating polling is not terminal: activate can restart it")
     func pollingDeactivateIsNotTerminal() async throws {
         let fixture = try await makeFixture()
@@ -225,6 +278,45 @@ private actor MacRuntimeFixtureEngine: EngineDriver {
         callCount += 1
         return AsyncStream { continuation in
             continuation.yield(.textDelta("done"))
+            continuation.yield(.completed(stopReason: "end_turn", inputTokens: 1, outputTokens: 1))
+            continuation.finish()
+        }
+    }
+
+    func cancelTurn(threadId: String) async {}
+}
+
+/// One-shot gate holding a turn open until the test lets it finish.
+/// Opening before the engine waits still releases it, so no rendezvous
+/// with the dispatch pipeline is needed.
+private actor TurnGate {
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var opened = false
+
+    func wait() async {
+        if opened { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func open() {
+        opened = true
+        let pending = waiters
+        waiters.removeAll()
+        for waiter in pending { waiter.resume(returning: ()) }
+    }
+}
+
+private actor GatedFixtureEngine: EngineDriver {
+    nonisolated let engineId = "gated"
+    let gate: TurnGate
+
+    init(gate: TurnGate) {
+        self.gate = gate
+    }
+
+    func sendTurn(input: TurnInput) async throws -> AsyncStream<TurnEvent> {
+        await gate.wait()
+        return AsyncStream { continuation in
             continuation.yield(.completed(stopReason: "end_turn", inputTokens: 1, outputTokens: 1))
             continuation.finish()
         }

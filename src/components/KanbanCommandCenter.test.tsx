@@ -318,6 +318,22 @@ describe("collapseAttentionCards", () => {
     expect(a.olderRuns).toBeUndefined();
     expect(b.olderRuns).toBeUndefined();
   });
+
+  it("keeps searchable text from folded runs on the standing card", () => {
+    const oldest = attentionCard(
+      run({ routineId: "r-1", routineName: "Nightly", error: "disk full", scheduledFor: 1_000 }),
+    );
+    oldest.subtitle = "disk full";
+    const newest = attentionCard(
+      run({ routineId: "r-1", routineName: "Nightly", error: "timeout", scheduledFor: 2_000 }),
+    );
+    newest.subtitle = "timeout";
+
+    const [standing] = collapseAttentionCards([oldest, newest]);
+
+    expect(standing.olderRuns).toBe(1);
+    expect(standing.foldedSearchText?.toLowerCase()).toContain("disk full");
+  });
 });
 
 describe("KanbanCommandCenter column paging", () => {
@@ -334,6 +350,14 @@ describe("KanbanCommandCenter column paging", () => {
     // The badge and the header strip still report the true total.
     expect(attention).toContain(">40</span>");
     expect(html).toContain("40 Needs Action");
+  });
+
+  it("reports visible cards in the header when a column still hides the rest", () => {
+    const failing = Array.from({ length: 40 }, (_, i) =>
+      run({ routineId: `r-fail-${i}`, routineName: `Failing ${i}`, status: "failed" }),
+    );
+    const html = renderBoard(failing);
+    expect(html).toContain("15 of 40 Cards");
   });
 
   it("pages In Progress, Ready and Completed too, and offers only what is left", () => {

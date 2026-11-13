@@ -40,7 +40,7 @@ export function ReplyQuote({
       )}
       {onClear && (
         <button type="button" onClick={onClear} aria-label="Cancel Reply" className="shrink-0 rounded p-0.5 text-ink-secondary hover:bg-raised hover:text-ink">
-          <X size={14} />
+          <X size={14} aria-hidden="true" />
         </button>
       )}
     </div>

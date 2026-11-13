@@ -89,7 +89,7 @@ function toStsApproval(pending: Pending, botName: string): StsApprovalView {
 // the model hands back, and both call paths must judge that answer by exactly
 // the same standard.
 
-type Phase = "listening" | "sending" | "working" | "speaking";
+type Phase = "connecting" | "listening" | "sending" | "working" | "speaking" | "reconnecting";
 const CALL_ENDPOINT_MS = 850;
 
 export function CallButton({ bot }: { bot: Bot }) {
@@ -203,7 +203,8 @@ export function CallTargetButton({
   const voiceReady = readiness.ready && !hostedEngineMissing;
   // An STS call brings its own dictation and its own voice, so the chained gates
   // describe a path this call is not taking.  They still apply in full otherwise.
-  const unavailable = !active && (!capabilitiesReady || (!stsCall && (!supported || !voiceReady)));
+  const voiceOff = state.config?.tts?.enabled === false;
+  const unavailable = !active && (voiceOff || !capabilitiesReady || (!stsCall && (!supported || !voiceReady)));
   const voiceSetupRequired = capabilitiesReady && !stsCall && supported && !voiceReady;
   const [helpOpen, setHelpOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -211,6 +212,8 @@ export function CallTargetButton({
   const helpId = useId();
   const label = active
     ? `Hang up on ${targetName}`
+    : voiceOff
+      ? "Voice is turned off"
     : !capabilitiesReady
       ? "Checking call availability"
       : stsCall
@@ -227,16 +230,18 @@ export function CallTargetButton({
               : "Pick a voice in a bot profile to make calls"
             : `Call ${targetName}`;
 
-  const reason = !capabilitiesReady
+  const reason = voiceOff
+    ? "Voice is turned off in Settings.\u00A0 Turn it on to make calls."
+    : !capabilitiesReady
     ? "Checking whether this device can make calls."
     : stsCall
       ? ""
       : !supported
         ? provider.provider === null && provider.missing === "cloud-stt-key"
-          ? "Add an AssemblyAI API key in Settings to make calls on this computer."
+          ? "Add an xAI or AssemblyAI API key in Settings to make calls on this computer."
           : "This dictation provider is unavailable.\u00A0 Check your choice in Settings or restart BotFleet."
         : hostedEngineMissing
-          ? "Add a MiniMax API key in Settings so the bot can speak during calls."
+          ? "Set up a voice in Settings so the bot can speak during calls."
           : !voiceReady
             ? personalVoiceChosen
               ? capabilities.dictation.reasonCode === "requires-macos-14"
@@ -295,7 +300,7 @@ export function CallTargetButton({
               : "text-ink-secondary hover:bg-raised hover:text-ink",
         )}
       >
-        {active ? <PhoneOff size={17} /> : <Phone size={17} />}
+        {active ? <PhoneOff size={17} aria-hidden="true" /> : <Phone size={17} aria-hidden="true" />}
         {unavailable && (
           <span className="absolute right-1 top-1 size-1.5 rounded-full bg-warning ring-2 ring-app" aria-hidden="true" />
         )}
@@ -341,7 +346,7 @@ function Call({ bot }: { bot: Bot }) {
   // This Mac's voice for the bot: its Mac override, else the shared voice.
   const macVoice = voiceForDevice(bot, "mac");
   const speech = useSpeech();
-  const initialPhase: Phase = bot.busy ? "working" : "listening";
+  const initialPhase: Phase = bot.busy ? "working" : "connecting";
   const [phase, setPhase] = useState<Phase>(initialPhase);
   const [heard, setHeard] = useState("");
   const [note, setNote] = useState<string | null>(null);
@@ -402,8 +407,8 @@ function Call({ bot }: { bot: Bot }) {
   approvalsRef.current = pendingApprovals(messages).map((pending) => toStsApproval(pending, bot.name));
   const decidedRef = useRef<Set<string>>(new Set());
   // The STT provider session is chosen once per call and reused across every
-  // listen cycle. The provider picker decides apple (macOS, no cloud key) vs
-  // assemblyai (cross-platform, or macOS-with-key per the picker default).
+  // listen cycle. Auto prefers Apple, then xAI, then AssemblyAI, unless the
+  // user pinned a provider in Settings.
 
 
   /** Change the rendered phase and the synchronous phase used by native
@@ -433,6 +438,8 @@ function Call({ bot }: { bot: Bot }) {
       if (alive.current && currentCall() === bot.id) {
         setNote(session?.provider === "assemblyai"
           ? "Cloud dictation couldn't start.\u00A0 Check the AssemblyAI key, connection, and microphone access."
+          : session?.provider === "xai"
+            ? "xAI dictation couldn't start.\u00A0 Check the xAI key, connection, and microphone access."
           : "The microphone couldn't start.\u00A0 Check Microphone and Speech Recognition access.");
       }
     });
@@ -682,6 +689,8 @@ function Call({ bot }: { bot: Bot }) {
         setNote(
           session?.provider === "assemblyai"
             ? "Cloud dictation stopped.\u00A0 Check the AssemblyAI key, connection, and microphone access."
+            : session?.provider === "xai"
+              ? "xAI dictation stopped.\u00A0 Check the xAI key, connection, and microphone access."
             : reason === "helper-build-failed"
               ? "The dictation helper couldn't be built.\u00A0 Install Apple's Command Line Tools and try again."
               : "Dictation needs Microphone + Speech Recognition access in System Settings.",
@@ -696,6 +705,7 @@ function Call({ bot }: { bot: Bot }) {
     (async () => {
       const bridge = window.ogb;
       if (!bridge || detached) return;
+      move("connecting");
 
       // ── which mode this call runs in ───────────────────────────────────
       // Asked before the dictation probe so an STS call never waits on one.
@@ -803,7 +813,7 @@ function Call({ bot }: { bot: Bot }) {
         if (alive.current && currentCall() === bot.id) {
           setNote(
             choice.missing === "cloud-stt-key"
-              ? "Add an AssemblyAI API key in Settings to use voice on this computer."
+              ? "Add an xAI or AssemblyAI API key in Settings to use voice on this computer."
               : "Dictation isn't available in this app build.\u00A0 Restart or update BotFleet.",
           );
         }
@@ -962,21 +972,36 @@ function Call({ bot }: { bot: Bot }) {
   }, [bot.id, listen]);
 
   const mascotState =
-    phase === "listening" ? "listening" : phase === "speaking" ? "sending" : phase === "sending" ? "thinking" : "working";
+    phase === "listening" ? "listening" : phase === "speaking" ? "sending" : phase === "sending" || phase === "connecting" || phase === "reconnecting" ? "thinking" : "working";
   // A speech-to-speech call that has lost its session must not keep claiming
   // it is listening to someone.
   const stsBroken = callMode?.mode === "sts" && Boolean(note);
   const status = stsBroken
     ? "Not connected"
-    : phase === "listening"
-      ? pushToTalk
-        ? "Push to talk"
-        : "Listening"
-      : phase === "sending"
-        ? "One moment"
-        : phase === "speaking"
-          ? bot.name
-          : "Working";
+    : phase === "connecting"
+      ? "Connecting"
+      : phase === "reconnecting"
+        ? "Reconnecting"
+        : phase === "listening"
+          ? pushToTalk
+            ? "Push to talk"
+            : "Listening"
+          : phase === "sending" || phase === "working"
+            ? "Thinking"
+            : phase === "speaking"
+              ? "Speaking"
+              : "Thinking";
+  const sttProvider = sttSessionRef.current?.provider ?? null;
+  const modeLabel = callMode?.mode === "sts" ? "Speech-to-speech" : "Dictation + replies";
+  const providerLabel = callMode?.mode === "sts"
+    ? (callMode.provider === "gemini" ? "Gemini Live" : callMode.provider === "xai" ? "xAI voice" : "voice model")
+    : sttProvider === "apple"
+      ? "Apple dictation"
+      : sttProvider === "xai"
+        ? "xAI transcribe"
+        : sttProvider === "assemblyai"
+          ? "AssemblyAI"
+          : "dictation";
 
   return (
     <div className="absolute inset-0 z-30 flex flex-col items-center justify-center gap-6 bg-app/95 backdrop-blur-sm">
@@ -993,8 +1018,13 @@ function Call({ bot }: { bot: Bot }) {
       <div className="flex flex-col items-center gap-1.5 text-center">
         <div className="text-[20px] font-medium text-ink">{bot.name}</div>
         <div className="flex items-center gap-2 text-[13.5px] text-ink-secondary">
-          {(phase === "working" || phase === "sending") && <Loader2 size={13} className="animate-spin" />}
+          {(phase === "working" || phase === "sending" || phase === "connecting" || phase === "reconnecting") && <Loader2 size={13} className="animate-spin" />}
           {status}
+        </div>
+        <div className="text-[11.5px] text-ink-secondary/70">
+          {modeLabel}
+          {" · "}
+          {providerLabel}
         </div>
       </div>
 

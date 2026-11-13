@@ -134,7 +134,7 @@ struct AgentProfileView: View {
     private var unavailableVoiceLabel: String {
         switch voiceProvider {
         case .minimax: return "MiniMax voice is not configured"
-        case .elevenlabs: return "ElevenLabs is not configured"
+        case .elevenlabs: return "Voice is not configured"
         case .system: return "Built-in Mac voices are unavailable"
         case .personal: return "Apple Personal Voice is not configured"
         case .unknown: return "Voice is not configured"
@@ -146,7 +146,7 @@ struct AgentProfileView: View {
         case .minimax:
             return "Add the shared MiniMax key in a bot's Voice settings on the computer.\u{00A0} The key is never returned to iOS."
         case .elevenlabs:
-            return "Add the shared ElevenLabs key in a bot's Voice settings on the computer.\u{00A0} The key is never returned to iOS."
+            return "Add the shared voice key in a bot's Voice settings on the computer.\u{00A0} The key is never returned to iOS."
         case .system:
             return "Built-in Mac voices need no key, and this computer has none available.\u{00A0} Switch the voice provider in a bot's Voice settings on the computer to keep using voice."
         case .personal:
@@ -161,7 +161,7 @@ struct AgentProfileView: View {
         case .minimax:
             return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose a voice for each device above; speech still uses the shared MiniMax key on your computer."
         case .elevenlabs:
-            return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose a voice for each device above; speech still uses the shared ElevenLabs key on your computer."
+            return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose a voice for each device above; speech still uses the shared voice key on your computer."
         case .system:
             return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose a voice for each device above; speech still uses the built-in Mac voices on your computer."
         case .personal:
@@ -831,9 +831,12 @@ struct AgentProfileView: View {
     private var bypassPermissionsSection: some View {
         Section {
             Toggle("Bypass Permissions", isOn: bypassBinding)
-            if mayTurnOnLocalBypass {
+            switch localBypassControl {
+            case .toggle:
                 Toggle("Bypass Including This Mac", isOn: localBypassBinding)
-            } else {
+            case .macOnly:
+                LabeledContent("Bypass Including This Mac", value: "Off")
+            case .needsBypass:
                 Label(BotExecutionPolicy.localBypassNeedsBypass, systemImage: "lock")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
@@ -843,8 +846,11 @@ struct AgentProfileView: View {
         } footer: {
             VStack(alignment: .leading, spacing: 8) {
                 Text(BotExecutionPolicy.bypassSummary(isOn: bypassPermissions))
-                if mayTurnOnLocalBypass {
+                if localBypassControl == .toggle {
                     Text(BotExecutionPolicy.localBypassSummary(isOn: bypassLocalComputer))
+                }
+                if !BotExecutionPolicy.mayTurnOnLocalBypass(computers: current.computers) {
+                    Text(BotExecutionPolicy.localBypassMacOnlyNote)
                 }
                 if let note = BypassCoverage(engine: policyEngine).note {
                     Text(note)
@@ -853,21 +859,25 @@ struct AgentProfileView: View {
         }
     }
 
-    /// The second switch is the Mac's to turn on for a bot that holds This
-    /// Mac, so the phone offers a line that says so rather than a control that
-    /// would come back 403.
-    private var mayTurnOnLocalBypass: Bool {
-        BotExecutionPolicy.mayTurnOnLocalBypass(computers: current.computers)
+    /// Whether the second switch is a control, a read-only Off, or a note
+    /// that Bypass itself is off.  The computer refuses to turn it on for a
+    /// bot that can use This Mac, so that case is never a switch.
+    private var localBypassControl: BotExecutionPolicy.LocalBypassControl {
+        BotExecutionPolicy.localBypassControl(
+            computers: current.computers,
+            bypassOn: bypassPermissions,
+            localBypassOn: bypassLocalComputer
+        )
     }
 
-    /// Switching on asks first, and does nothing at all while Bypass itself is
-    /// off — otherwise it would be a switch over nothing.
+    /// Switching on asks first.  Turning it off does not, and does not require
+    /// Bypass to still be on: an on switch has to be able to come back off.
     private var localBypassBinding: Binding<Bool> {
         Binding(
             get: { bypassLocalComputer },
             set: { wantsOn in
-                guard bypassPermissions else { return }
                 if wantsOn {
+                    guard bypassPermissions, BotExecutionPolicy.mayTurnOnLocalBypass(computers: current.computers) else { return }
                     confirmingLocalBypass = true
                 } else {
                     bypassLocalComputer = false

@@ -75,6 +75,171 @@ struct EngineRunnerAndSupervisorTests {
         }
     }
 
+    @Test("Antigravity (agy) stream-json 20-turn replay corpus produces exact TurnEvent sequence and spawn spec")
+    func antigravityReplayCorpusParity() async throws {
+        let fixtures = EngineReplayHarness.antigravityFixtures()
+        #expect(fixtures.count == 20)
+        #expect(EngineReplayHarness.allFixtures().count == 120)
+
+        for fixture in fixtures {
+            let result = try await EngineReplayHarness.runFixture(fixture)
+            #expect(result.recordedSpawnSpec == fixture.expectedSpawnSpec, "Spawn spec mismatch on \(fixture.id)")
+            #expect(result.actualEvents == fixture.expectedEvents, "Event sequence mismatch on \(fixture.id)")
+            #expect(result.passed, "Fixture \(fixture.id) failed replay check")
+        }
+    }
+
+    @Test("AntigravityStreamRunner builds spawn spec with stdin fallback, host-control bypass stripping, and stream-json event parsing")
+    func antigravityStreamRunnerSpawnSpecAndParser() async throws {
+        // 1. Default <= 64 KiB prompt passes on argv with --mode accept-edits and default model
+        let defaultInput = TurnInput(
+            threadId: "t-agy-default",
+            botId: "bot-agy",
+            prompt: "Run status check",
+            workingDirectory: "/tmp/ws-agy",
+            environment: [
+                "CUSTOM_ENV": "keep-me",
+                "INFISICAL_CLIENT_SECRET": "strip-me",
+                "XAI_API_KEY": "strip-me"
+            ]
+        )
+        let defaultSpec = AntigravityStreamRunner.buildSpawnSpec(input: defaultInput)
+        #expect(defaultSpec.executable == "agy")
+        #expect(defaultSpec.arguments == [
+            "--print", "Run status check",
+            "--output-format", "stream-json",
+            "--print-timeout", "11m",
+            "--add-dir", "/tmp/ws-agy",
+            "--mode", "accept-edits",
+            "--model", "gemini-3.1-pro-high"
+        ])
+        #expect(defaultSpec.unsetEnvironmentKeys == AntigravityStreamRunner.workspaceCredentialEnvKeys)
+        #expect(defaultSpec.environment["CUSTOM_ENV"] == "keep-me")
+        #expect(defaultSpec.environment["INFISICAL_CLIENT_SECRET"] == nil)
+        #expect(defaultSpec.environment["XAI_API_KEY"] == nil)
+
+        // 2. > 64 KiB prompt uses `--print -` and pipes over stdin; fullAuto without host control adds bypass
+        let hugePrompt = String(repeating: "X", count: AntigravityStreamRunner.maxArgvPromptUTF8Bytes + 1)
+        let stdinInput = TurnInput(
+            threadId: "t-agy-stdin",
+            botId: "bot-agy",
+            prompt: hugePrompt,
+            modelId: "gemini-3.1-pro-low",
+            resumeSessionId: "conv-resume-99",
+            workingDirectory: "/tmp/ws-agy",
+            configOptions: [
+                "fullAuto": "true",
+                "printTimeoutSeconds": "660"
+            ]
+        )
+        let stdinSpec = AntigravityStreamRunner.buildSpawnSpec(input: stdinInput)
+        #expect(stdinSpec.arguments == [
+            "--print", "-",
+            "--output-format", "stream-json",
+            "--print-timeout", "12m",
+            "--add-dir", "/tmp/ws-agy",
+            "--dangerously-skip-permissions",
+            "--model", "gemini-3.1-pro-low",
+            "--conversation", "conv-resume-99"
+        ])
+
+        // 3. Host-control turn strips `--dangerously-skip-permissions` when not auto-approved,
+        // and allows `--dangerously-skip-permissions` when `isAutoApproved` is true and attended.
+        let hostControlInput = TurnInput(
+            threadId: "t-agy-host",
+            botId: "bot-agy",
+            prompt: "Inspect desktop",
+            workingDirectory: "/tmp/ws-agy",
+            configOptions: [
+                "fullAuto": "true",
+                "controlsHostMac": "true"
+            ]
+        )
+        let hostControlSpec = AntigravityStreamRunner.buildSpawnSpec(
+            input: hostControlInput,
+            isAutoApproved: false
+        )
+        #expect(!hostControlSpec.arguments.contains("--dangerously-skip-permissions"))
+        #expect(hostControlSpec.arguments.contains("--mode"))
+        #expect(hostControlSpec.arguments.contains("accept-edits"))
+
+        let hostAutoApprovedSpec = AntigravityStreamRunner.buildSpawnSpec(
+            input: hostControlInput,
+            isAutoApproved: true
+        )
+        #expect(hostAutoApprovedSpec.arguments.contains("--dangerously-skip-permissions"))
+        #expect(!hostAutoApprovedSpec.arguments.contains("--mode"))
+
+        // 4. Host-control parser refuses `always-proceed` even when auto-approved, matching EngineMatrixRegistry
+        var autoApprovedHostState = AntigravityStreamRunner.AntigravityStreamParserState(
+            controlsHostMac: true,
+            isAutoApproved: true
+        )
+        let refusedEvents = AntigravityStreamRunner.parseLine(
+            #"{"event":"init","conversation_id":"conv-host-auto","init":{"permission_mode":"always-proceed"}}"#,
+            state: &autoApprovedHostState
+        )
+        #expect(autoApprovedHostState.hostPolicyRefused)
+        #expect(autoApprovedHostState.sawTerminalEvent)
+        #expect(refusedEvents.count == 2)
+        if case .error(let code, let message) = refusedEvents.last {
+            #expect(code == "host_control_policy")
+            #expect(message.contains("always-proceed"))
+        } else {
+            Issue.record("Expected host_control_policy error event")
+        }
+
+        // 5. Host-control parser refuses `proceed-in-sandbox` and ignores trailing lines
+        var hostState = AntigravityStreamRunner.AntigravityStreamParserState(
+            controlsHostMac: true,
+            isAutoApproved: false
+        )
+        let initEvents = AntigravityStreamRunner.parseLine(
+            #"{"event":"init","conversation_id":"conv-host-1","init":{"permission_mode":"proceed-in-sandbox"}}"#,
+            state: &hostState
+        )
+        #expect(hostState.hostPolicyRefused)
+        #expect(hostState.sawTerminalEvent)
+        #expect(initEvents.count == 2)
+        #expect(initEvents.first == .sessionStarted(sessionId: "conv-host-1"))
+        if case .error(let code, let message) = initEvents.last {
+            #expect(code == "host_control_policy")
+            #expect(message.contains("proceed-in-sandbox"))
+        } else {
+            Issue.record("Expected host_control_policy error event")
+        }
+        let trailingEvents = AntigravityStreamRunner.parseLine(
+            #"{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"Ignored"}}"#,
+            state: &hostState
+        )
+        #expect(trailingEvents.isEmpty)
+
+        // 6. Missing step_index disambiguates sequential tool calls instead of dropping the second
+        var toolState = AntigravityStreamRunner.AntigravityStreamParserState(
+            conversationId: "conv-tool"
+        )
+        let tool1Events = AntigravityStreamRunner.parseLine(
+            #"{"event":"step_update","step_update":{"step_type":"tool","tool_name":"bash","state":"ACTIVE","tool_input":{"cmd":"pwd"}}}"#,
+            state: &toolState
+        )
+        let tool2Events = AntigravityStreamRunner.parseLine(
+            #"{"event":"step_update","step_update":{"step_type":"tool","tool_name":"bash","state":"ACTIVE","tool_input":{"cmd":"whoami"}}}"#,
+            state: &toolState
+        )
+        #expect(tool1Events.count == 1)
+        #expect(tool2Events.count == 1)
+        if case .toolCall(let id1, let name1, _) = tool1Events.first,
+           case .toolCall(let id2, let name2, _) = tool2Events.first {
+            #expect(name1 == "bash")
+            #expect(name2 == "bash")
+            #expect(id1 == "conv-tool:bash_0")
+            #expect(id2 == "conv-tool:bash_1")
+            #expect(id1 != id2)
+        } else {
+            Issue.record("Expected two distinct toolCall events with disambiguated IDs")
+        }
+    }
+
     // MARK: - 2. ProcessSupervisorActor Hostile Process Tests
 
     #if os(macOS)
@@ -161,7 +326,6 @@ struct EngineRunnerAndSupervisorTests {
             arguments: ["-c", "echo 'READY'; /bin/sleep 30"]
         )
 
-        let startNanos = DispatchTime.now().uptimeNanoseconds
         let stream = try await supervisor.runSupervisedTurnStream(
             spec: crashSpec,
             threadId: "thread-sigkill",
@@ -174,15 +338,20 @@ struct EngineRunnerAndSupervisorTests {
         }
 
         var receivedEvents: [TurnEvent] = []
+        var killedAt: UInt64?
         for await event in stream {
             receivedEvents.append(event)
             if event == .textDelta("READY") {
-                if let pid = await supervisor.activePID(forThread: "thread-sigkill") {
-                    _ = Darwin.kill(pid, SIGKILL)
-                }
+                let activePID = await supervisor.activePID(forThread: "thread-sigkill")
+                let pid = try #require(activePID)
+                // Measure post-signal recovery, excluding process launch and readiness scheduling.
+                let signalAt = DispatchTime.now().uptimeNanoseconds
+                try #require(Darwin.kill(pid, SIGKILL) == 0)
+                killedAt = signalAt
             }
         }
 
+        let startNanos = try #require(killedAt)
         let elapsedSeconds = Double(DispatchTime.now().uptimeNanoseconds - startNanos) / 1_000_000_000.0
         #expect(elapsedSeconds < 2.0, "Expected SIGKILL recovery in < 2.0s, took \(elapsedSeconds)s")
         #expect(receivedEvents.first == .textDelta("READY"))

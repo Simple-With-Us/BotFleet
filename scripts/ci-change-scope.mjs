@@ -12,7 +12,11 @@ const ROOT_DOCUMENTS = new Set([
 const FULL_CI_DOCUMENTS = new Set(["docs/secrets.md"]);
 
 export function isDocumentationPath(path) {
-  return !FULL_CI_DOCUMENTS.has(path) && (ROOT_DOCUMENTS.has(path) || path.startsWith("docs/"));
+  const marketingMarkdown = path.startsWith("marketing/") && path.endsWith(".md");
+  return (
+    !FULL_CI_DOCUMENTS.has(path) &&
+    (ROOT_DOCUMENTS.has(path) || path.startsWith("docs/") || marketingMarkdown)
+  );
 }
 
 // Per-area path filters feeding the expensive jobs' own `if` gates (mirrors
@@ -27,12 +31,16 @@ export function isIosPath(path) {
   // gate lives in its own workflow file -- so a workflow edit here can
   // change the job itself, not just build scripts.
   // The required check replays this classifier and scripts/ci-ios-gate.mjs.
-  // Those two files are iOS paths so a change to the proof cannot take the
-  // skip path and approve itself.
+  // Those files are iOS paths so a change to the proof cannot take the skip
+  // path and approve itself.  scripts/ci-scope-diff.sh is the third one:  it
+  // computes the changed-path list every workflow now reads,  so a pull
+  // request that edits only the script could otherwise narrow its own scope
+  // and skip the build it was supposed to trigger.
   return (
     path === ".github/workflows/ci.yml" ||
     path === "scripts/ci-change-scope.mjs" ||
     path === "scripts/ci-ios-gate.mjs" ||
+    path === "scripts/ci-scope-diff.sh" ||
     path.startsWith("ios/") ||
     path.startsWith("scripts/ios-")
   );
@@ -44,6 +52,7 @@ export function isPackagingPath(path) {
     path === "package.json" ||
     path === "pnpm-lock.yaml" ||
     path.startsWith("electron/") ||
+    path.startsWith("native/") ||
     path.startsWith("third_party/") ||
     path.startsWith("scripts/prepare-") ||
     path.startsWith("scripts/package-")

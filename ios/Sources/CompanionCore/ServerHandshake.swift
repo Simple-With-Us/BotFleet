@@ -64,6 +64,17 @@ public struct ServerCapacity: Decodable, Equatable, Sendable {
     }
 }
 
+/// Proof the controller accepted a placement selection: the identity pair it
+/// reported after the selection was registered with it.  Carrying the pair —
+/// rather than copying the saved selection — is what lets applied state be
+/// recorded only after the controller answers.
+public struct ControllerAcknowledgement: Sendable, Equatable {
+    public let controllerId: String
+    public let epoch: Int
+    public init(controllerId: String, epoch: Int) { self.controllerId = controllerId; self.epoch = epoch }
+    public init(_ verified: VerifiedServer) { self.controllerId = verified.controllerId; self.epoch = verified.epoch }
+}
+
 /// A read-only enrollment check; this does not save a host, apply a mode or dispatch work.
 public struct ServerHandshake: Sendable {
     private let session: URLSession
