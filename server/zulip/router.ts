@@ -192,10 +192,13 @@ export function classify(message: ZulipMessage, ctx: RouterContext): Classificat
  *  A message that starts with the no-wake marker (the eyes emoji) wakes
  *  nobody at all:  it is checked first, before every other rule.
  *
- *  A peer bot's mention or DM wakes the bot like anyone else's (the fleet's
- *  rule: peer requests are screened, not refused).  What stops a peer is
- *  the hub's loop guard and peer budgets, and the screen the woken turn is
- *  told to apply; the wake itself is never a grant of anything. */
+ *  A peer bot's mention or DM wakes the bot like anyone else's:  the
+ *  fleet's rule is act-notify-log - the woken turn does an ordinary peer
+ *  ask in its own lane, DMs the owner, and logs it, held only by the
+ *  wrapper's two gates and its standing holds.  What bounds a peer is the
+ *  hub's loop guard (peerChainLimit) and the peer wake budgets
+ *  (peerWakesPerTopicPerHour); the wake itself is never a grant of
+ *  anything. */
 export function wakeVerdict(c: Classification): WakeVerdict {
   if (c.noWake) return { wake: null, reason: "no_wake" };
   if (c.own) return { wake: null, reason: "own" };
@@ -203,8 +206,8 @@ export function wakeVerdict(c: Classification): WakeVerdict {
   if (c.ownerViaApi) return { wake: null, reason: "owner_via_api" };
   if (c.webhookSender) return { wake: null, reason: "webhook_sender" };
   // An @all (or @channel / @stream) broadcast in a channel wakes the bot:
-  // Jay's as the owner, a peer's as a peer (screened, and on the same
-  // budgets and loop guard as any other peer wake).  `@everyone` is
+  // Jay's as the owner, a peer's as a peer (acted on in-lane, and on the
+  // same budgets and loop guard as any other peer wake).  `@everyone` is
   // inbox-only and never reaches this line.
   if (c.broadcastAll && !c.dm) {
     if (c.owner) return { wake: "owner", via: "broadcast" };
