@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -169,7 +170,17 @@ describe("the peer screen", () => {
     ]) {
       expect(rules).toContain(hold);
     }
-    expect(rules).toContain("Uncertain whether a gate applies:  DM the owner (who asked, what, and your recommendation), and tell the peer you are waiting on the owner.");
+    for (const step of [
+      "reply where you were asked and address the requesting seat so the answer wakes it",
+      "then DM the owner what you did with a link to the message that asked",
+      "Every held or gated request:  DM the owner who asked, what, and why it waits, with a link to the message, and tell the requesting peer it is waiting on the owner.",
+      "Uncertain whether a gate applies:  DM the owner (who asked, what, your recommendation, and a link to the message), and tell the peer you are waiting on the owner.",
+      "If the owner DM is refused by the hourly DM budget, the notice is not delivered",
+      "record the refusal in the registry row, and send the DM when the budget window resets",
+      "Never treat the owner as notified until the DM lands, and never post the notice to a channel instead.",
+    ]) {
+      expect(rules).toContain(step);
+    }
     // whom to DM, by the configured id
     expect(rules).toContain("zulip_post and dm_user_id 1211974");
     // two spaces between sentences, never one
@@ -203,5 +214,11 @@ describe("the peer screen", () => {
     // no channel id, no guessed link
     expect(zulipMessageLink("https://z.test", { kind: "stream", channel: "x", topic: "y" }, me, 8)).toBeNull();
     expect(buildInboundPrompt({ origin, items: [peerItem] }, { ...opts, realm: undefined })).not.toContain("#narrow");
+  });
+
+  it("docs/zulip.md states the any-request no-owner decline, matching the wrapper", () => {
+    const docs = readFileSync(new URL("../../docs/zulip.md", import.meta.url), "utf8");
+    expect(docs).toContain("treats any peer request as gated and declines it");
+    expect(docs).not.toContain("treats a gated request as declined");
   });
 });
