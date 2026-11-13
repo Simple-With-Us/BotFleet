@@ -1,6 +1,30 @@
-import { describe, expect, it } from "vitest";
+import { IncomingMessage, ServerResponse } from "node:http";
+import { Socket } from "node:net";
+import { afterEach, describe, expect, it } from "vitest";
 
-import { INVALID_STT_SESSION_REQUEST, SttFileRequestSchema, SttSessionRequestSchema } from "./routes.ts";
+import type { AppConfig } from "../config.ts";
+import {
+  handleXaiSttRoutes,
+  INVALID_STT_SESSION_REQUEST,
+  SttFileRequestSchema,
+  SttSessionRequestSchema,
+  VOICE_OFF_ERROR,
+  type SttJsonResponse,
+} from "./routes.ts";
+
+const sockets: Socket[] = [];
+
+function dummyPair() {
+  const socket = new Socket();
+  sockets.push(socket);
+  const req = new IncomingMessage(socket);
+  const res = new ServerResponse(req);
+  return { req, res };
+}
+
+afterEach(() => {
+  for (const socket of sockets.splice(0)) socket.destroy();
+});
 
 describe("STT request schemas", () => {
   it("rejects an invalid session payload so the route can return a stable error code", () => {
@@ -23,11 +47,49 @@ describe("STT request schemas", () => {
     expect(SttFileRequestSchema.safeParse({ audioBase64: "AAAA", unexpected: true }).success).toBe(false);
     expect(SttFileRequestSchema.safeParse({ audioBase64: "AAAA" }).success).toBe(true);
   });
-});
 
   it("accepts a keyterm longer than 50 characters, matching parseKeyterms", () => {
     const term = "A".repeat(80);
     expect(SttSessionRequestSchema.safeParse({ keyterms: [term] }).success).toBe(true);
     expect(SttFileRequestSchema.safeParse({ audioBase64: "AAAA", keyterms: [term] }).success).toBe(true);
   });
+});
 
+describe("handleXaiSttRoutes", () => {
+  it("returns 409 with VOICE_OFF_ERROR when voice is off", async () => {
+    const { req, res } = dummyPair();
+    const replies: Array<{ status: number; body: SttJsonResponse }> = [];
+    const cfg: AppConfig = { tts: { enabled: false }, xai: { key: "sk-test" } };
+    const handled = await handleXaiSttRoutes({
+      method: "POST",
+      path: "/api/stt/xai/sessions",
+      req,
+      res,
+      cfg,
+      json: (_res, status, body) => { replies.push({ status, body }); },
+      readBody: async () => ({}),
+    });
+    expect(handled).toBe(true);
+    expect(replies).toEqual([{ status: 409, body: { error: VOICE_OFF_ERROR } }]);
+  });
+
+  it("returns 400 with invalid_stt_session_request for an invalid session payload", async () => {
+    const { req, res } = dummyPair();
+    const replies: Array<{ status: number; body: SttJsonResponse }> = [];
+    const cfg: AppConfig = { tts: { enabled: true }, xai: { key: "sk-test" } };
+    const handled = await handleXaiSttRoutes({
+      method: "POST",
+      path: "/api/stt/xai/sessions",
+      req,
+      res,
+      cfg,
+      json: (_res, status, body) => { replies.push({ status, body }); },
+      readBody: async () => ({ language: "en", unexpected: true }),
+    });
+    expect(handled).toBe(true);
+    expect(replies).toEqual([{
+      status: 400,
+      body: { error: "Invalid speech-to-text session request.", code: INVALID_STT_SESSION_REQUEST },
+    }]);
+  });
+});

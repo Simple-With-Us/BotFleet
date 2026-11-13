@@ -42,6 +42,9 @@ export const SttSessionRequestSchema = z.object({
   endpointMs: z.number().finite().max(60_000).optional(),
 }).strict();
 
+export type SttFileRequest = z.infer<typeof SttFileRequestSchema>;
+export type SttSessionRequest = z.infer<typeof SttSessionRequestSchema>;
+
 
 function readRawBytes(req: IncomingMessage, maxBytes = 1_000_000): Promise<Buffer> {
   return new Promise((resolve, reject) => {

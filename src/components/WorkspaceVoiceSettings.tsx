@@ -390,6 +390,10 @@ export function AudioRetentionPicker({
 export const VOICE_MASTER_HELP =
   "Turns auto-speak, calls, and hosted speech on or off for this workspace.  Existing replies stay on screen; nothing is spoken and new calls will not start while this is off.";
 
+function logVoiceSwitchSaveError(error: Error): void {
+  console.error(error instanceof Error ? error.message : "Could not save the voice switch.");
+}
+
 export function VoiceMasterSwitch({
   tts,
   onConfig,
@@ -429,9 +433,7 @@ export function VoiceMasterSwitch({
           aria-label="Voice on"
           disabled={saving}
           onClick={() => {
-            void save(!enabled).catch(() => {
-              console.error("Could not save the voice switch.");
-            });
+            void save(!enabled).catch(logVoiceSwitchSaveError);
           }}
           className={cn(
             "relative h-6 w-11 shrink-0 rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50",
