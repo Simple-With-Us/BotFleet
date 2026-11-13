@@ -20,7 +20,7 @@
 //                restart cannot drop one; the text stays in this mode-600
 //                file, the same protection the DM ledger gets.
 
-import { chmodSync, closeSync, fsyncSync, mkdirSync, openSync, readFileSync } from "node:fs";
+import { chmodSync, closeSync, fsyncSync, mkdirSync, openSync, readFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
 
 import { z } from "zod";
@@ -75,8 +75,12 @@ export interface ZulipBotState {
   /** owner DMs refused by the DM-out cap, oldest first. */
   notices: ZulipPendingNotice[];
   /** entries dropped across loads because they failed the schema - a count
-   *  only, never the content: the durable flag that a load was lossy. */
+   *  only, never the content: the durable flag that a load was lossy.  The
+   *  raw entries themselves are preserved in the private archive file. */
   noticesDroppedOnLoad?: number;
+  /** records moved to the private archive on prune - a count, so pruning is
+   *  visible and never mistaken for resolution. */
+  noticesArchived?: number;
 }
 
 export function emptyState(role: string): ZulipBotState {
@@ -116,6 +120,18 @@ const unitSchema = z.object({
   attempts: z.number(),
   notBefore: z.number(),
 });
+/** One queued owner notice, parsed on its own so a single damaged entry can
+ *  be quarantined (with its raw form preserved privately) instead of costing
+ *  the whole ledger. */
+const noticeEntrySchema = z.object({
+  at: z.number(),
+  userId: z.number(),
+  text: z.string().max(9500),
+  attempts: z.number().int().nonnegative().catch(0),
+  nextAt: z.number().optional().catch(undefined),
+  failed: z.string().max(500).optional().catch(undefined),
+});
+
 const stateFileSchema = z.object({
   version: z.literal(1),
   role: z.string(),
@@ -129,26 +145,12 @@ const stateFileSchema = z.object({
   chains: z.record(z.string(), z.number()).catch({}),
   // Added after the first state files were written: absent reads as empty.
   dms: z.array(z.number()).optional().catch(undefined),
-  // Same: queued owner notices, absent on older files.  PER-ENTRY catch:
-  // one invalid entry quarantines as null and is counted on load, it never
+  // Queued owner notices, absent on older files.  PER-ENTRY catch: one
+  // invalid entry quarantines as null and is counted on load, it never
   // erases the valid entries around it.
-  notices: z
-    .array(
-      z
-        .object({
-          at: z.number(),
-          userId: z.number(),
-          text: z.string().max(9500),
-          attempts: z.number().int().nonnegative().catch(0),
-          nextAt: z.number().optional().catch(undefined),
-          failed: z.string().max(500).optional().catch(undefined),
-        })
-        .nullable()
-        .catch(null),
-    )
-    .optional()
-    .catch(undefined),
+  notices: z.array(noticeEntrySchema.nullable().catch(null)).optional().catch(undefined),
   noticesDroppedOnLoad: z.number().int().nonnegative().optional().catch(undefined),
+  noticesArchived: z.number().int().nonnegative().optional().catch(undefined),
 });
 
 export class ZulipStateStore {
@@ -170,12 +172,13 @@ export class ZulipStateStore {
     } catch {
       return emptyState(role);
     }
-    let parsed;
+    let rawJson: unknown;
     try {
-      parsed = stateFileSchema.safeParse(JSON.parse(text));
+      rawJson = JSON.parse(text);
     } catch {
       return emptyState(role);
     }
+    const parsed = stateFileSchema.safeParse(rawJson);
     if (!parsed.success) return emptyState(role);
     const savedRole = parsed.data.role;
     if (savedRole !== role && canonicalZulipRole(savedRole) !== role) {
@@ -188,7 +191,42 @@ export class ZulipStateStore {
     if (userId !== undefined) state.userId = userId;
     const droppedTotal = (noticesDroppedOnLoad ?? 0) + (raw.length - valid.length);
     if (droppedTotal > 0) state.noticesDroppedOnLoad = droppedTotal;
+    // Quarantine the raw invalid entries BEFORE any save can overwrite the
+    // file: private, mode-600, never logged, never posted.
+    const rawEntries: unknown[] =
+      rawJson !== null && typeof rawJson === "object" && Array.isArray((rawJson as { notices?: unknown }).notices)
+        ? ((rawJson as { notices: unknown[] }).notices)
+        : [];
+    const invalidRaw = rawEntries.filter((entry) => !noticeEntrySchema.safeParse(entry).success);
+    if (invalidRaw.length > 0) this.archive(botId, "schema-invalid-on-load", invalidRaw);
     return state;
+  }
+
+  /** Append records to the bot's private notices archive (mode-600 JSONL
+   *  next to the state file): the evidence for anything the ledger no
+   *  longer carries.  Contents are never logged or posted. */
+  private archive(botId: string, reason: string, entries: unknown[]): void {
+    if (entries.length === 0) return;
+    mkdirSync(this.dir, { recursive: true, mode: 0o700 });
+    try {
+      chmodSync(this.dir, 0o700);
+    } catch {
+      // best effort, as with the state file
+    }
+    const path = join(this.dir, fileName(botId).replace(/\.json$/, ".notices-archive.jsonl"));
+    const lines = entries.map((entry) => JSON.stringify({ archivedAt: Date.now(), reason, entry })).join("\n") + "\n";
+    const fd = openSync(path, "a", 0o600);
+    try {
+      writeSync(fd, lines);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    try {
+      chmodSync(path, 0o600);
+    } catch {
+      // best effort
+    }
   }
 
   save(botId: string, state: ZulipBotState, now = Date.now()): void {
@@ -197,10 +235,23 @@ export class ZulipStateStore {
     state.wakes = state.wakes.filter((w) => now - w.at < WAKE_LEDGER_MS).slice(-WAKE_LEDGER_LIMIT);
     state.dms = (state.dms ?? []).filter((at) => now - at < WAKE_LEDGER_MS).slice(-WAKE_LEDGER_LIMIT);
     // Deliverable notices are already bounded by the enqueue refusal; keep
-    // them all, plus the most recent terminal records as evidence.
+    // them all, plus the most recent terminal records as evidence.  Anything
+    // pruned is archived privately first and counted - pruning is archival,
+    // never silent loss and never resolution of the obligation.
     const all = state.notices ?? [];
-    const keepFailed = new Set(all.filter((n) => n.failed).slice(-TERMINAL_NOTICE_LIMIT));
-    state.notices = all.filter((n) => !n.failed || keepFailed.has(n)).slice(-(PENDING_NOTICE_LIMIT + TERMINAL_NOTICE_LIMIT));
+    const failed = all.filter((n) => n.failed);
+    const pruned = failed.slice(0, Math.max(0, failed.length - TERMINAL_NOTICE_LIMIT));
+    const keepFailed = new Set(failed.slice(-TERMINAL_NOTICE_LIMIT));
+    let bounded = all.filter((n) => !n.failed || keepFailed.has(n));
+    if (bounded.length > PENDING_NOTICE_LIMIT + TERMINAL_NOTICE_LIMIT) {
+      pruned.push(...bounded.slice(0, bounded.length - (PENDING_NOTICE_LIMIT + TERMINAL_NOTICE_LIMIT)));
+      bounded = bounded.slice(-(PENDING_NOTICE_LIMIT + TERMINAL_NOTICE_LIMIT));
+    }
+    if (pruned.length > 0) {
+      this.archive(botId, "notice-record-pruned", pruned);
+      state.noticesArchived = (state.noticesArchived ?? 0) + pruned.length;
+    }
+    state.notices = bounded;
     mkdirSync(this.dir, { recursive: true, mode: 0o700 });
     try {
       chmodSync(this.dir, 0o700);

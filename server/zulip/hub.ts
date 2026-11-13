@@ -1510,7 +1510,28 @@ export class ZulipHub {
    *    the refusal is actionable, never silently lost;
    *  - concurrency: the drain loop is the only caller and it is serial per
    *    session, so no two flushes interleave on one queue. */
+  /** Per-session watermark for the loss counters already surfaced in the
+   *  log: each new session logs once per increase, so a boot after a lossy
+   *  load or prune says so.  Content-free by construction: counts only. */
+  private noticeLossReported = new WeakMap<ZulipSession, { dropped: number; archived: number }>();
+
+  private reportNoticeLoss(session: ZulipSession): void {
+    const seen = this.noticeLossReported.get(session) ?? { dropped: 0, archived: 0 };
+    const dropped = session.state.noticesDroppedOnLoad ?? 0;
+    const archived = session.state.noticesArchived ?? 0;
+    if (dropped > seen.dropped) {
+      this.log(`[zulip] ${session.role}: ${dropped} invalid queued-notice entr${dropped === 1 ? "y" : "ies"} quarantined on load; raw entries preserved in the private notices archive, valid notices kept`);
+      seen.dropped = dropped;
+    }
+    if (archived > seen.archived) {
+      this.log(`[zulip] ${session.role}: ${archived} notice record(s) moved to the private notices archive; escalation stands - archiving is not resolution`);
+      seen.archived = archived;
+    }
+    this.noticeLossReported.set(session, seen);
+  }
+
   private async flushNotices(session: ZulipSession): Promise<void> {
+    this.reportNoticeLoss(session);
     const notices = session.state.notices;
     if (this.stopped || notices.length === 0) return;
     const limit = this.budget("dmsPerHour");

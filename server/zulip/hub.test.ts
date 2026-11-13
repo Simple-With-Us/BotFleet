@@ -1197,13 +1197,47 @@ describe("DMs out", () => {
     // corrupt one entry on disk, leave the others intact
     const file = join(dataDir, "zulip", "bot-plumber.json");
     const stored = JSON.parse(readFileSync(file, "utf8"));
-    stored.notices.splice(1, 0, { at: "not-a-number", bogus: true });
+    stored.notices.splice(1, 0, { at: "RAW_MARKER_XYZ", marker: "RAW_MARKER_XYZ" });
     writeFileSync(file, JSON.stringify(stored));
     const again = makeHub();
     await connected(again);
     const notices = sessionOf(again).state.notices;
     expect(notices.map((n) => n.text)).toEqual(["good one", "good two"]);
     expect(sessionOf(again).state.noticesDroppedOnLoad).toBe(1);
+    // the raw invalid entry is quarantined privately, and the log stays content-free
+    await waitFor(() => logs.some((line) => line.includes("quarantined on load")), "the content-free quarantine warning");
+    const archive = readFileSync(join(dataDir, "zulip", "bot-plumber.notices-archive.jsonl"), "utf8");
+    expect(archive).toMatch(/RAW_MARKER_XYZ/);
+    expect(archive).toMatch(/schema-invalid-on-load/);
+    expect(logs.join("\n")).not.toMatch(/RAW_MARKER_XYZ/);
+  });
+
+  it("archives pruned terminal records privately and counts them, never treating pruning as resolution", async () => {
+    settings.budgets = { dmsPerHour: 0 };
+    const hub = makeHub();
+    await connected(hub);
+    const session = sessionOf(hub);
+    const now = Date.now();
+    for (let n = 0; n < 12; n++) {
+      session.state.notices.push({ at: now + n, userId: JAY, text: `terminal ${n}`, attempts: 8, failed: "gave up" });
+    }
+    session.state.notices.push({ at: now + 100, userId: JAY, text: "still pending", attempts: 0 });
+    session.markDirty();
+    session.save();
+    await hub.stop();
+    const again = makeHub();
+    await connected(again);
+    const st = sessionOf(again).state;
+    expect(st.notices).toHaveLength(11);
+    expect(st.notices.filter((n) => n.failed)).toHaveLength(10);
+    expect(st.notices.some((n) => n.text === "still pending" && !n.failed)).toBe(true);
+    expect(st.noticesArchived).toBe(2);
+    const archive = readFileSync(join(dataDir, "zulip", "bot-plumber.notices-archive.jsonl"), "utf8");
+    expect(archive).toMatch(/notice-record-pruned/);
+    expect(archive).toMatch(/terminal 0"/);
+    expect(archive).toMatch(/terminal 1"/);
+    expect(archive).not.toMatch(/terminal 2"/);
+    await waitFor(() => logs.some((line) => line.includes("private notices archive")), "the content-free archive warning");
   });
 });
 
