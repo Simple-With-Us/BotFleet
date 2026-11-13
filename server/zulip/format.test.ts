@@ -176,7 +176,7 @@ describe("the peer screen", () => {
       "Every held or gated request:  DM the owner who asked, what, and why it waits, with a link to the message, and tell the requesting peer it is waiting on the owner.",
       "Uncertain whether a gate applies:  DM the owner (who asked, what, your recommendation, and a link to the message), and tell the peer you are waiting on the owner.",
       "If the owner DM is refused by the hourly DM budget, the notice is not delivered",
-      "the harness queues it - an identical notice is reported as already queued, and a full notice queue as NOT queued, never silently dropped - and sends it when the budget window resets",
+      "the harness queues it - an identical notice is reported as already queued, and a full notice queue as NOT queued, never silently dropped - and sends it when the budget window resets (one that can never be sent is marked undeliverable, kept, and the owner gets a content-free alarm DM)",
       "Record the refusal in the registry row, never treat the owner as notified until the DM lands, and never post the notice to a channel instead.",
     ]) {
       expect(rules).toContain(step);

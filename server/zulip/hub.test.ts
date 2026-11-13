@@ -1111,6 +1111,100 @@ describe("DMs out", () => {
     expect(sessionOf(hub).state.notices).toHaveLength(0);
     expect(logs.some((line) => line.includes("queued owner notice delivered"))).toBe(true);
   });
+
+  it("validates content before queueing: an oversize notice is refused whole, never queued, never truncated", async () => {
+    settings.budgets = { dmsPerHour: 0 };
+    const hub = makeHub();
+    await connected(hub);
+    const over = await dm(hub, JAY, "x".repeat(10_000));
+    expect(over.ok).toBe(false);
+    expect(over.text).toMatch(/too long to queue/);
+    expect(over.text).toMatch(/NOT queued/);
+    expect(over.text).toMatch(/NOT truncated/);
+    expect(sessionOf(hub).state.notices).toHaveLength(0);
+    expect(logs.some((line) => line.includes("over 9500 chars"))).toBe(true);
+  });
+
+  it("marks a notice that can never pass the content check undeliverable, keeps it, and alarms the owner content-free", async () => {
+    settings.budgets = { dmsPerHour: 1 };
+    let offset = 0;
+    const hub = makeHub({ now: () => Date.now() + offset });
+    await connected(hub);
+    expect((await dm(hub, JAY, "one")).ok).toBe(true);
+    // queued while the cap holds; a key rotated in later makes it unsendable
+    const refused = await dm(hub, JAY, "status: all fine");
+    expect(refused.ok).toBe(false);
+    expect(sessionOf(hub).state.notices).toHaveLength(1);
+    sessionOf(hub).state.notices[0]!.text = "the key is plumber-test-key";
+    sessionOf(hub).markDirty();
+    sessionOf(hub).save();
+    offset = 61 * 60_000;
+    await waitFor(() => fake.postsBy(PLUMBER).length === 2, "the content-free terminal alarm DM");
+    const notices = sessionOf(hub).state.notices;
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.failed).toMatch(/loaded Zulip credential/);
+    expect(logs.some((line) => line.includes("marked undeliverable"))).toBe(true);
+    // the alarm names the kind of refusal, never the refused text
+    const alarm = fake.postsBy(PLUMBER)[1]!;
+    expect(JSON.stringify(alarm)).toMatch(/marked undeliverable/);
+    expect(JSON.stringify(alarm)).not.toMatch(/plumber-test-key/);
+    // the terminal record survives a restart, and is never retried
+    await hub.stop();
+    const again = makeHub({ now: () => Date.now() + offset });
+    await connected(again);
+    expect(sessionOf(again).state.notices[0]!.failed).toBeTruthy();
+    offset += 61 * 60_000;
+    await settle(2_500);
+    expect(fake.postsBy(PLUMBER)).toHaveLength(2);
+  });
+
+  it("escalates a notice whose resend keeps failing after 8 attempts, without calling failure delivery", async () => {
+    settings.budgets = { dmsPerHour: 2 };
+    let offset = 0;
+    const hub = makeHub({ now: () => Date.now() + offset });
+    await connected(hub);
+    expect((await dm(hub, JAY, "one")).ok).toBe(true);
+    expect((await dm(hub, JAY, "two")).ok).toBe(true);
+    expect((await dm(hub, JAY, "three")).ok).toBe(false);
+    expect(sessionOf(hub).state.notices).toHaveLength(1);
+    fake.failNext("messages", 500, 8, "POST");
+    offset = 61 * 60_000;
+    for (const wait of [0, 31, 61, 121, 241, 481, 901, 901]) {
+      offset += wait * 1_000;
+      await settle(350);
+    }
+    await waitFor(() => sessionOf(hub).state.notices.some((n) => n.failed), "the notice to be escalated after 8 attempts");
+    const notice = sessionOf(hub).state.notices.find((n) => n.failed)!;
+    expect(notice.failed).toMatch(/gave up after 8 attempts/);
+    expect(logs.some((line) => line.includes("escalated"))).toBe(true);
+    // the content-free alarm is delivered; the failed notice is never retried
+    await waitFor(() => fake.postsBy(PLUMBER).length === 3, "the escalation alarm DM");
+    const delivered = fake.postsBy(PLUMBER).length;
+    offset += 2 * 3_600_000;
+    await settle(2_500);
+    expect(fake.postsBy(PLUMBER)).toHaveLength(delivered);
+    expect(JSON.stringify(fake.postsBy(PLUMBER))).not.toMatch(/"three"/);
+  });
+
+  it("keeps the valid queued notices when one stored entry is invalid, and counts the loss", async () => {
+    settings.budgets = { dmsPerHour: 0 };
+    const hub = makeHub();
+    await connected(hub);
+    expect((await dm(hub, JAY, "good one")).ok).toBe(false);
+    expect((await dm(hub, JAY, "good two")).ok).toBe(false);
+    expect(sessionOf(hub).state.notices).toHaveLength(2);
+    await hub.stop();
+    // corrupt one entry on disk, leave the others intact
+    const file = join(dataDir, "zulip", "bot-plumber.json");
+    const stored = JSON.parse(readFileSync(file, "utf8"));
+    stored.notices.splice(1, 0, { at: "not-a-number", bogus: true });
+    writeFileSync(file, JSON.stringify(stored));
+    const again = makeHub();
+    await connected(again);
+    const notices = sessionOf(again).state.notices;
+    expect(notices.map((n) => n.text)).toEqual(["good one", "good two"]);
+    expect(sessionOf(again).state.noticesDroppedOnLoad).toBe(1);
+  });
 });
 
 describe("followed topics", () => {

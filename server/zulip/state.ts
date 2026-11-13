@@ -49,9 +49,16 @@ export interface ZulipPendingNotice {
   attempts: number;
   /** earliest ms epoch of the next resend try; undefined means as soon as the window allows. */
   nextAt?: number;
+  /** terminal: why this notice can never be delivered.  Kept, not dropped:
+   *  the record is the durable evidence of the refused notice. */
+  failed?: string;
 }
 
 export const PENDING_NOTICE_LIMIT = 50;
+/** Terminal (never-deliverable) notice records kept as evidence. */
+export const TERMINAL_NOTICE_LIMIT = 10;
+/** Resend attempts before a notice is escalated instead of retried. */
+export const MAX_NOTICE_ATTEMPTS = 8;
 
 export interface ZulipBotState {
   version: 1;
@@ -67,6 +74,9 @@ export interface ZulipBotState {
   dms: number[];
   /** owner DMs refused by the DM-out cap, oldest first. */
   notices: ZulipPendingNotice[];
+  /** entries dropped across loads because they failed the schema - a count
+   *  only, never the content: the durable flag that a load was lossy. */
+  noticesDroppedOnLoad?: number;
 }
 
 export function emptyState(role: string): ZulipBotState {
@@ -119,19 +129,26 @@ const stateFileSchema = z.object({
   chains: z.record(z.string(), z.number()).catch({}),
   // Added after the first state files were written: absent reads as empty.
   dms: z.array(z.number()).optional().catch(undefined),
-  // Same: queued owner notices, absent on older files.
+  // Same: queued owner notices, absent on older files.  PER-ENTRY catch:
+  // one invalid entry quarantines as null and is counted on load, it never
+  // erases the valid entries around it.
   notices: z
     .array(
-      z.object({
-        at: z.number(),
-        userId: z.number(),
-        text: z.string().max(9500),
-        attempts: z.number().int().nonnegative().catch(0),
-        nextAt: z.number().optional().catch(undefined),
-      }),
+      z
+        .object({
+          at: z.number(),
+          userId: z.number(),
+          text: z.string().max(9500),
+          attempts: z.number().int().nonnegative().catch(0),
+          nextAt: z.number().optional().catch(undefined),
+          failed: z.string().max(500).optional().catch(undefined),
+        })
+        .nullable()
+        .catch(null),
     )
     .optional()
     .catch(undefined),
+  noticesDroppedOnLoad: z.number().int().nonnegative().optional().catch(undefined),
 });
 
 export class ZulipStateStore {
@@ -164,9 +181,13 @@ export class ZulipStateStore {
     if (savedRole !== role && canonicalZulipRole(savedRole) !== role) {
       return emptyState(role);
     }
-    const { userId, dms, notices, ...rest } = parsed.data;
-    const state: ZulipBotState = { ...rest, role, dms: dms ?? [], notices: notices ?? [] };
+    const { userId, dms, notices, noticesDroppedOnLoad, ...rest } = parsed.data;
+    const raw = notices ?? [];
+    const valid = raw.filter((n): n is ZulipPendingNotice => n !== null);
+    const state: ZulipBotState = { ...rest, role, dms: dms ?? [], notices: valid };
     if (userId !== undefined) state.userId = userId;
+    const droppedTotal = (noticesDroppedOnLoad ?? 0) + (raw.length - valid.length);
+    if (droppedTotal > 0) state.noticesDroppedOnLoad = droppedTotal;
     return state;
   }
 
@@ -175,7 +196,11 @@ export class ZulipStateStore {
     if (state.handled.length > HANDLED_RING_LIMIT) state.handled = state.handled.slice(-HANDLED_RING_LIMIT);
     state.wakes = state.wakes.filter((w) => now - w.at < WAKE_LEDGER_MS).slice(-WAKE_LEDGER_LIMIT);
     state.dms = (state.dms ?? []).filter((at) => now - at < WAKE_LEDGER_MS).slice(-WAKE_LEDGER_LIMIT);
-    state.notices = (state.notices ?? []).slice(-PENDING_NOTICE_LIMIT);
+    // Deliverable notices are already bounded by the enqueue refusal; keep
+    // them all, plus the most recent terminal records as evidence.
+    const all = state.notices ?? [];
+    const keepFailed = new Set(all.filter((n) => n.failed).slice(-TERMINAL_NOTICE_LIMIT));
+    state.notices = all.filter((n) => !n.failed || keepFailed.has(n)).slice(-(PENDING_NOTICE_LIMIT + TERMINAL_NOTICE_LIMIT));
     mkdirSync(this.dir, { recursive: true, mode: 0o700 });
     try {
       chmodSync(this.dir, 0o700);

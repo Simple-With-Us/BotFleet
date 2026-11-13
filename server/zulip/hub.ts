@@ -57,7 +57,7 @@ import {
   type ZulipTarget,
 } from "./outbound.ts";
 import { DEFAULT_OWNER_CLIENTS, classify, wakeVerdict, type Classification, type RouterContext, type WakeReason, type WakeVerdict } from "./router.ts";
-import { HANDLED_RING_LIMIT, PENDING_NOTICE_LIMIT, ZulipStateStore, emptyState, type ZulipBotState } from "./state.ts";
+import { HANDLED_RING_LIMIT, MAX_NOTICE_ATTEMPTS, PENDING_NOTICE_LIMIT, ZulipStateStore, emptyState, type ZulipBotState } from "./state.ts";
 import type { PluginEventEnvelope } from "../../shared/plugin-events.ts";
 import { ZULIP_OUTGOING_MAX_ATTEMPTS, ZulipOutgoingSpool } from "./outgoing-spool.ts";
 import type { ZulipIdentity, ZulipInboundItem, ZulipMessage, ZulipOrigin, ZulipSettings, ZulipUser } from "./types.ts";
@@ -1496,47 +1496,90 @@ export class ZulipHub {
    *    state is saved after each one, narrowing the crash window;
    *  - failure: a thrown post keeps the notice and backs it off (30s, 60s,
    *    ... capped at 15m), so a persistent outage is not hammered every
-   *    drain tick.  A throw can mean the DM actually landed (ambiguous
-   *    outcome): delivery is AT-LEAST-ONCE, so a rare duplicate is possible;
-   *  - if the save after a successful post itself fails, a restart can
-   *    resend that notice once - the same at-least-once trade, logged;
-   *  - a notice whose content can never pass checkContent is dropped with a
-   *    loud log line: it can never be delivered, and it is never rewritten.
-   *  Concurrency: the drain loop is the only caller and it is serial per
-   *  session, so no two flushes interleave on one queue. */
+   *    drain tick.  A throw can mean the DM actually landed (an ambiguous
+   *    outcome): delivery is AT-LEAST-ONCE - every throw that actually
+   *    delivered produces a duplicate, several under repeated ambiguous
+   *    failures.  After MAX_NOTICE_ATTEMPTS failures the notice is marked
+   *    undeliverable and escalated with a content-free alarm - the
+   *    obligation is surfaced, not dropped, and failure is never reported
+   *    as delivery.  A failed save after a successful post can likewise
+   *    redeliver that notice after a restart;
+   *  - terminal failure: a notice that can never pass checkContent is
+   *    MARKED undeliverable and kept in the state file (durable evidence),
+   *    and a content-free alarm DM is queued through this same mechanism so
+   *    the refusal is actionable, never silently lost;
+   *  - concurrency: the drain loop is the only caller and it is serial per
+   *    session, so no two flushes interleave on one queue. */
   private async flushNotices(session: ZulipSession): Promise<void> {
     const notices = session.state.notices;
     if (this.stopped || notices.length === 0) return;
     const limit = this.budget("dmsPerHour");
     let inWindow = session.state.dms.filter((at) => this.now() - at < 3600_000).length;
-    while (notices.length > 0 && inWindow < limit) {
-      const notice = notices[0]!;
-      if (notice.nextAt !== undefined && this.now() < notice.nextAt) return;
+    for (let i = 0; i < notices.length && inWindow < limit; ) {
+      const notice = notices[i]!;
+      if (notice.failed || (notice.nextAt !== undefined && this.now() < notice.nextAt)) {
+        i++;
+        continue;
+      }
       const content = checkContent(notice.text, this.knownSecrets());
       if ("error" in content) {
-        this.log(`[zulip] ${session.role}: queued owner notice dropped (unsendable content): ${content.error}`);
-        notices.shift();
+        notice.failed = content.error;
+        delete notice.nextAt;
         session.markDirty();
         session.save();
+        this.log(`[zulip] ${session.role}: owner notice marked undeliverable (content check): ${content.error}`);
+        this.queueTerminalAlarm(session, notice.userId, content.error);
+        i++;
         continue;
       }
       try {
         await session.post({ kind: "dm", userIds: [notice.userId] }, content.chunks);
         session.state.dms.push(this.now());
         inWindow++;
-        notices.shift();
+        notices.splice(i, 1);
         session.markDirty();
         session.save();
-        this.log(`[zulip] ${session.role}: queued owner notice delivered to user ${notice.userId} (${notices.length} pending)`);
+        this.log(`[zulip] ${session.role}: queued owner notice delivered to user ${notice.userId} (${notices.filter((n) => !n.failed).length} pending)`);
       } catch (error) {
         notice.attempts += 1;
+        if (notice.attempts >= MAX_NOTICE_ATTEMPTS) {
+          // Bounded retry: stop here WITHOUT turning failure into delivery.
+          // The record is kept as terminal evidence and the owner gets a
+          // content-free alarm through this same queue; the notice's text
+          // is never posted anywhere else.
+          notice.failed = `resend gave up after ${notice.attempts} attempts (each may have landed); last error: ${describe(error).slice(0, 200)}`;
+          delete notice.nextAt;
+          session.markDirty();
+          session.save();
+          this.log(`[zulip] ${session.role}: owner notice undeliverable after ${notice.attempts} attempts, escalated`);
+          this.queueTerminalAlarm(session, notice.userId, `resend failed ${notice.attempts} times; the notice may or may not have reached you - it stays in the bot's state file`);
+          i++;
+          continue;
+        }
         notice.nextAt = this.now() + Math.min(30_000 * 2 ** (notice.attempts - 1), 900_000);
         session.markDirty();
         session.save();
         this.log(`[zulip] ${session.role}: queued owner notice resend failed (attempt ${notice.attempts}, kept; if the DM landed, the retry duplicates it): ${describe(error)}`);
-        return;
+        i++;
       }
     }
+  }
+
+  /** Queue a content-free alarm that a notice went terminal, through the
+   *  same mechanism, so it is delivered with the same guarantees.  The
+   *  reason names the kind of refusal, never the refused text. */
+  private queueTerminalAlarm(session: ZulipSession, userId: number, reason: string): void {
+    const text = `[botfleet] ${session.role}: a queued owner notice can never be sent (${reason}) and was marked undeliverable; its text stays in the bot's state file.`;
+    const notices = session.state.notices;
+    if (notices.some((n) => !n.failed && n.text === text)) return;
+    if (notices.filter((n) => !n.failed).length >= PENDING_NOTICE_LIMIT) {
+      this.log(`[zulip] ${session.role}: terminal-failure alarm NOT queued (notice queue full)`);
+      return;
+    }
+    notices.push({ at: this.now(), userId, text, attempts: 0 });
+    session.markDirty();
+    session.save();
+    this.log(`[zulip] ${session.role}: terminal-failure alarm queued for user ${userId}`);
   }
 
   /** Drain a bounded batch, serially per bot and concurrently across bots.
@@ -1858,17 +1901,29 @@ export class ZulipHub {
         const ownerId = this.ownerUserId();
         if (ownerId !== undefined && target.target.userIds.length === 1 && target.target.userIds[0] === ownerId) {
           const text = String(args.content ?? "");
+          // Validate BEFORE queueing: content that can never be posted is
+          // refused now with the ordinary refusal, never queued; and text
+          // too long for the state schema is refused whole, never truncated.
+          const precheck = checkContent(text, this.knownSecrets());
+          if ("error" in precheck) return { ok: false, text: precheck.error };
+          if (text.length > 9500) {
+            this.log(`[zulip] ${session.role}: DM to user ${ownerId} refused (dm_budget), notice NOT queued (over 9500 chars)`);
+            return {
+              ok: false,
+              text: `Not posted: this bot has sent ${lastHour} DMs in the last hour, its limit (zulip.budgets.dmsPerHour), and the notice is too long to queue for later delivery (over 9500 characters).  It was NOT queued and NOT truncated: shorten it and try again after the window resets.`,
+            };
+          }
           // Dedup: the same notice asked twice is one queue entry.  A full
           // queue refuses the enqueue OUT LOUD - an accepted notice is never
           // discarded to make room, and this one is not claimed as queued.
-          if (session.state.notices.some((notice) => notice.userId === ownerId && notice.text === text)) {
+          if (session.state.notices.some((notice) => !notice.failed && notice.userId === ownerId && notice.text === text)) {
             this.log(`[zulip] ${session.role}: DM to user ${ownerId} refused (dm_budget), identical notice already queued`);
             return {
               ok: false,
               text: `Not posted now: this bot has sent ${lastHour} DMs in the last hour, its limit (zulip.budgets.dmsPerHour).  An identical notice to the owner is already queued and will be sent when the window resets - NOT delivered yet.  Do not treat the owner as notified until it lands.`,
             };
           }
-          if (session.state.notices.length >= PENDING_NOTICE_LIMIT) {
+          if (session.state.notices.filter((notice) => !notice.failed).length >= PENDING_NOTICE_LIMIT) {
             this.log(`[zulip] ${session.role}: DM to user ${ownerId} refused (dm_budget), notice queue FULL (${PENDING_NOTICE_LIMIT}) - NOT queued`);
             return {
               ok: false,
