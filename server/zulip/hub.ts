@@ -47,7 +47,7 @@ import {
   type ZulipCredentials,
   type ZulipVaultReader,
 } from "./credentials.ts";
-import { buildInboundPrompt, followKey, originKey, withTag, ZULIP_INBOUND_UNIT_MAX_ITEMS } from "./format.ts";
+import { buildInboundPrompt, followKey, originKey, withTag, zulipMentionHandle, ZULIP_INBOUND_UNIT_MAX_ITEMS } from "./format.ts";
 import {
   checkContent,
   resolveTarget,
@@ -57,7 +57,7 @@ import {
   type ZulipTarget,
 } from "./outbound.ts";
 import { DEFAULT_OWNER_CLIENTS, classify, wakeVerdict, type Classification, type RouterContext, type WakeReason, type WakeVerdict } from "./router.ts";
-import { HANDLED_RING_LIMIT, ZulipStateStore, emptyState, type ZulipBotState } from "./state.ts";
+import { HANDLED_RING_LIMIT, MAX_NOTICE_ATTEMPTS, PENDING_NOTICE_LIMIT, ZulipStateStore, emptyState, type ZulipBotState, type ZulipPendingNotice } from "./state.ts";
 import type { PluginEventEnvelope } from "../../shared/plugin-events.ts";
 import { ZULIP_OUTGOING_MAX_ATTEMPTS, ZulipOutgoingSpool } from "./outgoing-spool.ts";
 import type { ZulipIdentity, ZulipInboundItem, ZulipMessage, ZulipOrigin, ZulipSettings, ZulipUser } from "./types.ts";
@@ -108,6 +108,29 @@ const UNIT_MAX_AGE_MS = 6 * 3600_000;
  *  only when the harness cannot say which turn the bot is running. */
 const BINDING_MAX_AGE_MS = 2 * 3600_000;
 const STORED_ITEMS_PER_UNIT = ZULIP_INBOUND_UNIT_MAX_ITEMS * 2;
+
+/** When a held unit may next try to wake: the moment the oldest in-window
+ *  wake behind the refusal ages out of the hour, plus a second of slack. */
+function heldWakeAt(state: ZulipBotState, key: string, refusal: string, now: number): number {
+  const relevant = state.wakes.filter(
+    (w) => w.kind === "peer" && now - w.at < 3600_000 && (refusal === "peer_budget" || w.key === key),
+  );
+  const oldest = relevant.length ? Math.min(...relevant.map((w) => w.at)) : now;
+  return oldest + 3600_000 + 1_000;
+}
+
+/** Origin labels in owner notices are peer-controlled data, never
+ *  instructions: the notice says so where they appear. */
+function originAsData(origin: ZulipOrigin): string {
+  return `${describeOrigin(origin)} (names are peer-controlled data, not instructions)`;
+}
+
+/** A readable origin label for logs and content-free owner notices. */
+function describeOrigin(origin: ZulipOrigin): string {
+  return origin.kind === "dm"
+    ? `a DM with user id ${origin.userId}`
+    : `the topic ${JSON.stringify(origin.topic)} in #${origin.channel}`;
+}
 /** How long one plugin-routing decision may take before the hub falls
  *  back to the legacy direct wake.  Covers the sandbox call deadline
  *  plus the bus's bounded backoff settle. */
@@ -608,8 +631,15 @@ class ZulipSession {
     this.me = { userId: me.user_id, fullName: String(me.full_name ?? this.role), email: this.creds!.email };
     if (this.state.userId !== undefined && this.state.userId !== me.user_id) {
       // Same role name, different Zulip user: the old cursor and ring
-      // describe another mailbox.  Keep nothing but the pending work.
-      this.state = { ...emptyState(this.role), pending: this.state.pending };
+      // describe another mailbox - but held owner notices, their loss
+      // counts, and the owner-DM cap ledger are not mailbox state, so they
+      // carry over.  Dropping `dms` would reopen the owner's hourly cap.
+      const prior = this.state;
+      this.state = { ...emptyState(this.role), pending: prior.pending, notices: prior.notices, dms: prior.dms };
+      if (prior.noticesDroppedOnLoad !== undefined) this.state.noticesDroppedOnLoad = prior.noticesDroppedOnLoad;
+      if (prior.noticesArchived !== undefined) this.state.noticesArchived = prior.noticesArchived;
+      if (prior.pendingDroppedOnLoad !== undefined) this.state.pendingDroppedOnLoad = prior.pendingDroppedOnLoad;
+      if (prior.stateQuarantinedOnLoad !== undefined) this.state.stateQuarantinedOnLoad = prior.stateQuarantinedOnLoad;
       this.seedSeen();
     }
     this.state.userId = me.user_id;
@@ -838,7 +868,7 @@ export class ZulipHub {
 
   constructor(deps: ZulipHubDeps) {
     this.deps = deps;
-    this.store = new ZulipStateStore(deps.dataDir);
+    this.store = new ZulipStateStore(deps.dataDir, (message) => this.log(`[zulip] ${message}`));
     this.outgoingSpool = new ZulipOutgoingSpool(deps.dataDir);
     this.backoffMs = deps.timings?.backoffMs ?? BACKOFF_MS;
     this.postSpacingMs = deps.timings?.postSpacingMs ?? 3_000;
@@ -946,6 +976,8 @@ export class ZulipHub {
     if (this.reconcileTimer) clearInterval(this.reconcileTimer);
     this.drainTimer = undefined;
     this.reconcileTimer = undefined;
+    for (const held of this.heldTimers.values()) clearTimeout(held.timer);
+    this.heldTimers.clear();
     const sessions = [...this.sessions.values()];
     this.sessions.clear();
     await Promise.all(sessions.map((session) => session.stop()));
@@ -1006,6 +1038,11 @@ export class ZulipHub {
         next?.role !== session.role || next?.credentialRole !== session.credentialRole || session.realm !== realm || retry;
       if (changed) {
         this.sessions.delete(botId);
+        const held = this.heldTimers.get(botId);
+        if (held) {
+          clearTimeout(held.timer);
+          this.heldTimers.delete(botId);
+        }
         const stopped = session.stop().finally(() => {
           this.stopping.delete(botId);
           // Start the replacement, if one is still wanted, now that the old
@@ -1019,7 +1056,18 @@ export class ZulipHub {
     }
     for (const [botId, next] of wanted) {
       if (this.sessions.has(botId) || this.stopping.has(botId)) continue;
-      const session = new ZulipSession(this, botId, next.role, realm, next.credentialRole);
+      let session: ZulipSession;
+      try {
+        session = new ZulipSession(this, botId, next.role, realm, next.credentialRole);
+      } catch (error) {
+        // A state-load failure (for example the notices archive is
+        // unwritable) must never degrade to a fresh empty state: that bot
+        // stays down and loud until the store works, its state file left
+        // untouched, while the other bots keep running.  The next reconcile
+        // retries it.
+        this.log(`[zulip] ${next.role}: not started - state load failed, state file left untouched: ${describe(error)}`);
+        continue;
+      }
       this.sessions.set(botId, session);
       session.start();
     }
@@ -1343,16 +1391,51 @@ export class ZulipHub {
     const origin = c.origin!;
     const key = originKey(origin);
     const now = this.now();
-    const unit = state.pending.find((candidate) => originKey(candidate.origin) === key);
+    const unit = state.pending.find((candidate) => {
+      if (originKey(candidate.origin) !== key) return false;
+      // Owner work never parks inside a held peer unit: a peer budget hold
+      // would gate it for up to an hour and the staleness expiry could drop
+      // it unanswered.  It gets its own unit on its own schedule instead;
+      // the held peer work still waits for its window, and peer budgets and
+      // the chain guard still apply to it when it does.
+      return !(c.owner && candidate.held);
+    });
+    let refusal: string | null = null;
     if (!unit) {
       // A new wake: budgets and the loop guard decide whether it may exist.
-      const refusal = this.wakeRefusal(state, verdict.wake, key, now);
-      if (refusal) {
+      refusal = this.wakeRefusal(state, verdict.wake, key, now);
+      if (refusal && settings?.dryRun) {
+        session.markHandled([id]);
+        this.log(`[zulip] ${session.role}: dry run — message ${id} would be held or refused (${refusal})`);
+        session.save(true);
+        return;
+      }
+      // The loop guard is a hard stop, never held: the message becomes no
+      // work, and the owner hears of it once through the qualified notice
+      // path - origin and count, never the peer's text.
+      if (refusal === "loop_guard") {
+        session.markHandled([id]);
+        const noticeQueued = this.enqueueOwnerNotice(
+          session,
+          `[botfleet] ${session.role}: stopped a peer chain in ${originAsData(origin)} at the limit (peerChainLimit); message ${id} was not answered. The chain resumes when the owner speaks there.`,
+          `[botfleet] ${session.role}: stopped a peer chain at the limit (peerChainLimit); message ${id} was not answered (origin names withheld: the label tripped the content check). The chain resumes when the owner speaks there.`,
+          `loop-guard:${id}`,
+        );
+        this.log(
+          `[zulip] ${session.role}: message ${id} not woken (${refusal}); owner notice ${noticeQueued ? "queued" : "NOT queued (see the refusal log above)"}`,
+        );
+        session.save(true);
+        return;
+      }
+      if (refusal && refusal !== "topic_budget" && refusal !== "peer_budget") {
         session.markHandled([id]);
         this.log(`[zulip] ${session.role}: message ${id} not woken (${refusal})`);
         session.save(true);
         return;
       }
+      // topic_budget and peer_budget hold the request below instead of
+      // dropping it: the unit waits for the budget window, and its wake is
+      // charged when it actually dispatches, never before.
     }
     const item: ZulipInboundItem = {
       id,
@@ -1379,8 +1462,36 @@ export class ZulipHub {
     }
     if (unit) {
       unit.items.push(item);
-      if (unit.items.length > STORED_ITEMS_PER_UNIT) unit.items.splice(0, unit.items.length - STORED_ITEMS_PER_UNIT);
+      if (unit.items.length > STORED_ITEMS_PER_UNIT) {
+        const lost = unit.items.length - STORED_ITEMS_PER_UNIT;
+        const trimmed = unit.items.slice(0, lost);
+        try {
+          // Accepted input is never destroyed without a private copy: the
+          // trimmed items go to the same mode-600 archive as quarantined
+          // notices.  On archive failure the items stay in the unit - a
+          // loud failure, never a silent drop.
+          this.store.archiveDroppedItems(session.botId, unit.origin, trimmed);
+          unit.items.splice(0, lost);
+          unit.dropped = (unit.dropped ?? 0) + lost;
+          this.log(`[zulip] ${session.role}: queue cap preserved ${lost} stored message(s) in the private archive (counted and shown to the turn)`);
+        } catch (error) {
+          this.log(`[zulip] ${session.role}: queue-cap archive FAILED - keeping ${lost} message(s) past the storage cap, nothing dropped: ${describe(error)}`);
+        }
+      }
       unit.updatedAt = now;
+    } else if (refusal) {
+      // Held, not dropped: the request waits for the budget window.  No
+      // wake is charged here - charging happens at dispatch, exactly once.
+      state.pending.push({
+        origin,
+        items: [item],
+        createdAt: now,
+        updatedAt: now,
+        attempts: 0,
+        notBefore: heldWakeAt(state, key, refusal, now),
+        held: refusal,
+      });
+      this.log(`[zulip] ${session.role}: message ${id} held (${refusal}); it waits for the budget window instead of being dropped`);
     } else {
       state.pending.push({ origin, items: [item], createdAt: now, updatedAt: now, attempts: 0, notBefore: 0 });
       state.wakes.push({ at: now, kind: verdict.wake, key });
@@ -1478,12 +1589,201 @@ export class ZulipHub {
         await this.finalizeSettled();
         for (const session of this.sessions.values()) {
           if (this.stopped) return;
+          await this.flushNotices(session).catch((error) => {
+            this.log(`[zulip] ${session.role}: owner-notice flush failed: ${describe(error)}`);
+          });
           await this.dispatchNext(session);
         }
       } while (this.redrain && !this.stopped);
     } finally {
       this.draining = false;
     }
+  }
+
+  /** One held-wake timer per session: re-armed only when the earliest due
+   *  time moves, cleared when the queue drains or the session stops, so a
+   *  long hold can never stack timers that all fire at once.  Visible (not
+   *  private), like store, so lifecycle tests can pin the invariant. */
+  readonly heldTimers = new Map<string, { due: number; timer: ReturnType<typeof setTimeout> }>();
+
+  /** Per-session watermark for the loss counters already surfaced in the
+   *  log: each new session logs once per increase, so a boot after a lossy
+   *  load or prune says so.  Content-free by construction: counts only. */
+  private noticeLossReported = new WeakMap<ZulipSession, { dropped: number; archived: number; pendingDropped: number; quarantined: number }>();
+
+  private reportNoticeLoss(session: ZulipSession): void {
+    const seen = this.noticeLossReported.get(session) ?? { dropped: 0, archived: 0, pendingDropped: 0, quarantined: 0 };
+    const dropped = session.state.noticesDroppedOnLoad ?? 0;
+    const archived = session.state.noticesArchived ?? 0;
+    if (dropped > seen.dropped) {
+      this.log(`[zulip] ${session.role}: ${dropped} invalid queued-notice entr${dropped === 1 ? "y" : "ies"} quarantined on load; raw entries preserved in the private notices archive, valid notices kept`);
+      seen.dropped = dropped;
+    }
+    if (archived > seen.archived) {
+      this.log(`[zulip] ${session.role}: ${archived} notice record(s) moved to the private notices archive; escalation stands - archiving is not resolution`);
+      seen.archived = archived;
+    }
+    const pendingDropped = session.state.pendingDroppedOnLoad ?? 0;
+    if (pendingDropped > seen.pendingDropped) {
+      this.log(`[zulip] ${session.role}: ${pendingDropped} invalid pending unit${pendingDropped === 1 ? "" : "s"} quarantined on load; raw units preserved in the private notices archive, valid units kept`);
+      seen.pendingDropped = pendingDropped;
+    }
+    const quarantined = session.state.stateQuarantinedOnLoad ?? 0;
+    if (quarantined > seen.quarantined) {
+      this.log(`[zulip] ${session.role}: ${quarantined} state-file quarantine${quarantined === 1 ? "" : "s"} recorded on load; raw originals preserved in the private notices archive, readable ledgers kept`);
+      seen.quarantined = quarantined;
+    }
+    this.noticeLossReported.set(session, seen);
+  }
+
+  /** Send owner DMs the hourly cap queued, oldest first, as the window
+   *  allows.  Delivery semantics, honestly:
+   *  - the cap still holds: every resend counts against the same dms ledger;
+   *  - ack: a notice leaves the queue only after its post resolves, and the
+   *    state is saved after each one, narrowing the crash window;
+   *  - failure: a thrown post keeps the notice and backs it off (30s, 60s,
+   *    ... capped at 15m), so a persistent outage is not hammered every
+   *    drain tick.  A throw can mean the DM actually landed (an ambiguous
+   *    outcome): delivery is AT-LEAST-ONCE - every throw that actually
+   *    delivered produces a duplicate, several under repeated ambiguous
+   *    failures.  After MAX_NOTICE_ATTEMPTS failures the notice is marked
+   *    undeliverable and escalated with a content-free alarm - the
+   *    obligation is surfaced, not dropped, and failure is never reported
+   *    as delivery.  A failed save after a successful post can likewise
+   *    redeliver that notice after a restart;
+   *  - terminal failure: a notice that can never pass checkContent is
+   *    MARKED undeliverable and kept in the state file (durable evidence),
+   *    and a content-free alarm DM is queued through this same mechanism so
+   *    the refusal is actionable, never silently lost;
+   *  - concurrency: the drain loop is the only caller and it is serial per
+   *    session, so no two flushes interleave on one queue. */
+  private async flushNotices(session: ZulipSession): Promise<void> {
+    this.reportNoticeLoss(session);
+    // A dry run posts nothing at all, and a session that has not
+    // connected yet must not burn resend attempts: leave notices pending.
+    if (this.stopped || this.dryRun() || !session.ready) return;
+    const notices = session.state.notices;
+    if (notices.length === 0) return;
+    const limit = this.budget("dmsPerHour");
+    let inWindow = session.state.dms.filter((at) => this.now() - at < 3600_000).length;
+    let sent = 0;
+    for (let i = 0; i < session.state.notices.length && inWindow < limit && sent === 0; ) {
+      const notice = session.state.notices[i]!;
+      if (notice.failed || (notice.nextAt !== undefined && this.now() < notice.nextAt)) {
+        i++;
+        continue;
+      }
+      const content = checkContent(notice.text, this.knownSecrets());
+      if ("error" in content) {
+        notice.failed = content.error;
+        delete notice.nextAt;
+        session.markDirty();
+        session.save();
+        this.log(`[zulip] ${session.role}: owner notice marked undeliverable (content check): ${content.error}`);
+        this.queueTerminalAlarm(session, notice.userId, content.error);
+        i++;
+        continue;
+      }
+      try {
+        await session.post({ kind: "dm", userIds: [notice.userId] }, content.chunks);
+        session.state.dms.push(this.now());
+        inWindow++;
+        session.state.notices.splice(i, 1);
+        sent += 1;
+        session.markDirty();
+        session.save();
+        this.log(`[zulip] ${session.role}: queued owner notice delivered to user ${notice.userId} (${session.state.notices.filter((n) => !n.failed).length} pending)`);
+      } catch (error) {
+        notice.attempts += 1;
+        if (notice.attempts >= MAX_NOTICE_ATTEMPTS) {
+          // Bounded retry: stop here WITHOUT turning failure into delivery.
+          // The record is kept as terminal evidence and the owner gets a
+          // content-free alarm through this same queue; the notice's text
+          // is never posted anywhere else.
+          notice.failed = `resend gave up after ${notice.attempts} attempts (each may have landed); last error: ${describe(error).slice(0, 200)}`;
+          delete notice.nextAt;
+          session.markDirty();
+          session.save();
+          this.log(`[zulip] ${session.role}: owner notice undeliverable after ${notice.attempts} attempts, escalated`);
+          this.queueTerminalAlarm(session, notice.userId, `resend failed ${notice.attempts} times; the notice may or may not have reached you - it stays in the bot's state file`);
+          i++;
+          continue;
+        }
+        notice.nextAt = this.now() + Math.min(30_000 * 2 ** (notice.attempts - 1), 900_000);
+        session.markDirty();
+        session.save();
+        this.log(`[zulip] ${session.role}: queued owner notice resend failed (attempt ${notice.attempts}, kept; if the DM landed, the retry duplicates it): ${describe(error)}`);
+        i++;
+      }
+    }
+  }
+
+  /** Queue a content-free owner notice through the same durable path a
+   *  refused owner DM uses: deduped, capped, logged when it cannot be
+   *  queued, never silently dropped.  The text carries origins and counts,
+   *  never message content.  Distinct events whose rendered text happens to
+   *  match (the content-free fallbacks keep only counts, by design) are
+   *  still distinct: the caller passes an event key and dedup matches on
+   *  the key, never on the rendered text alone.  Returns whether a notice
+   *  for this event is in the queue when it returns (true also when the
+   *  event was already queued), so call sites log the outcome accurately. */
+  private enqueueOwnerNotice(session: ZulipSession, text: string, safeFallback?: string, eventKey?: string): boolean {
+    // The origin label is peer-controlled data: pre-check the text here so
+    // a label that trips the content check never enters the queue (the
+    // flush would refuse it every time and the owner would lose the
+    // conversation identity entirely).  checkContent follows the outbound
+    // contract: it RETURNS { error } on a refusal, it never throws.  On a
+    // refusal, queue the caller's content-free variant - message ids and
+    // counts, never names.
+    let noticeText = text;
+    if ("error" in checkContent(text, this.knownSecrets())) {
+      noticeText =
+        safeFallback ??
+        `[botfleet] ${session.role}: an owner notice was withheld because its text tripped the content check; the detail stays in the private state file and logs.`;
+    }
+    const ownerId = this.ownerUserId();
+    if (ownerId === undefined) {
+      this.log(`[zulip] ${session.role}: owner notice NOT queued (no owner id configured); text withheld from the log (may carry peer-controlled names), ${noticeText.length} char(s)`);
+      return false;
+    }
+    const notices = session.state.notices;
+    const duplicate = notices.some(
+      (n) => !n.failed && n.userId === ownerId && (eventKey !== undefined ? n.eventKey === eventKey : n.text === noticeText),
+    );
+    if (duplicate) {
+      // A repeat of an event already queued is not a drop: say so,
+      // content-free, instead of returning bare.
+      this.log(`[zulip] ${session.role}: owner notice for this event is already queued; not duplicated`);
+      return true;
+    }
+    if (notices.filter((n) => !n.failed).length >= PENDING_NOTICE_LIMIT) {
+      this.log(`[zulip] ${session.role}: owner notice NOT queued (queue full at ${PENDING_NOTICE_LIMIT}); text withheld from the log (may carry peer-controlled names), ${noticeText.length} char(s)`);
+      return false;
+    }
+    const notice: ZulipPendingNotice = { at: this.now(), userId: ownerId, text: noticeText, attempts: 0 };
+    if (eventKey !== undefined) notice.eventKey = eventKey;
+    notices.push(notice);
+    session.markDirty();
+    session.save();
+    this.log(`[zulip] ${session.role}: owner notice queued (${notices.filter((n) => !n.failed).length} pending)`);
+    return true;
+  }
+
+  /** Queue a content-free alarm that a notice went terminal, through the
+   *  same mechanism, so it is delivered with the same guarantees.  The
+   *  reason names the kind of refusal, never the refused text. */
+  private queueTerminalAlarm(session: ZulipSession, userId: number, reason: string): void {
+    const text = `[botfleet] ${session.role}: a queued owner notice can never be sent (${reason}) and was marked undeliverable; its text stays in the bot's state file.`;
+    const notices = session.state.notices;
+    if (notices.some((n) => !n.failed && n.text === text)) return;
+    if (notices.filter((n) => !n.failed).length >= PENDING_NOTICE_LIMIT) {
+      this.log(`[zulip] ${session.role}: terminal-failure alarm NOT queued (notice queue full)`);
+      return;
+    }
+    notices.push({ at: this.now(), userId, text, attempts: 0 });
+    session.markDirty();
+    session.save();
+    this.log(`[zulip] ${session.role}: terminal-failure alarm queued for user ${userId}`);
   }
 
   /** Drain a bounded batch, serially per bot and concurrently across bots.
@@ -1646,6 +1946,42 @@ export class ZulipHub {
     }
   }
 
+  /** Arm a one-shot drain for when the earliest waiting unit becomes
+   *  eligible; without it a held unit would wait for the next message. */
+  private armHeldDrain(session: ZulipSession): void {
+    const botId = session.botId;
+    const existing = this.heldTimers.get(botId);
+    const state = session.state;
+    const now = this.now();
+    const coalesceMs = this.deps.timings?.coalesceMs ?? 2_000;
+    const nextAt = state.pending.length
+      ? Math.min(...state.pending.map((unit) => Math.max(unit.notBefore, unit.updatedAt + coalesceMs)))
+      : Number.POSITIVE_INFINITY;
+    // Nothing due later (empty queue or work already eligible): any armed
+    // timer is stale, so it goes away.
+    if (!Number.isFinite(nextAt) || nextAt <= now) {
+      if (existing) {
+        clearTimeout(existing.timer);
+        this.heldTimers.delete(botId);
+      }
+      return;
+    }
+    // One timer per session: re-arm only when the earliest due time moved.
+    if (existing?.due === nextAt) return;
+    if (existing) clearTimeout(existing.timer);
+    const timer = setTimeout(() => {
+      this.heldTimers.delete(botId);
+      void this.dispatchNext(session).catch((error) => {
+        // A rejected drain must not take the process down or lose the work:
+        // log it content-free and arm the next wake for the same unit.
+        this.log(`[zulip] ${session.role}: held-drain dispatch failed; anything still pending retries at the next drain: ${describe(error)}`);
+        this.armHeldDrain(session);
+      });
+    }, nextAt - now + 20);
+    timer.unref?.();
+    this.heldTimers.set(botId, { due: nextAt, timer });
+  }
+
   private async dispatchNext(session: ZulipSession): Promise<void> {
     const botId = session.botId;
     const state = session.state;
@@ -1665,19 +2001,75 @@ export class ZulipHub {
     // stale by the time it is started again.
     const expired = state.pending.filter((unit) => now - unit.createdAt > UNIT_MAX_AGE_MS);
     if (expired.length) {
-      for (const unit of expired) session.markHandled(unit.items.map((item) => item.id));
+      for (const unit of expired) {
+        session.markHandled(unit.items.map((item) => item.id));
+        if (unit.held) {
+          this.enqueueOwnerNotice(
+            session,
+            `[botfleet] ${session.role}: a held peer request expired unanswered after ${UNIT_MAX_AGE_MS / 3600_000}h in ${originAsData(unit.origin)}; ${unit.items.length} message(s) never reached a turn${unit.dropped ? `, and ${unit.dropped} more were trimmed at the queue cap (preserved in the private archive)` : ""}.`,
+            `[botfleet] ${session.role}: a held peer request expired unanswered after ${UNIT_MAX_AGE_MS / 3600_000}h; ${unit.items.length} message(s) never reached a turn${unit.dropped ? `, and ${unit.dropped} more were trimmed at the queue cap (preserved in the private archive)` : ""} (origin names withheld: the label tripped the content check).`,
+            `held-expired:${unit.createdAt}:${unit.items[0]?.id ?? 0}`,
+          );
+        }
+      }
       state.pending = state.pending.filter((unit) => !expired.includes(unit));
       session.indexPending();
       this.log(`[zulip] ${session.role}: dropped ${expired.length} unit(s) older than ${UNIT_MAX_AGE_MS / 3600_000}h`);
       session.save(true);
     }
     const unit = state.pending.find((candidate) => candidate.notBefore <= now && now - candidate.updatedAt >= coalesceMs);
-    if (!unit) return;
+    if (!unit) {
+      // Held or coalescing units become eligible later: wake the drain when
+      // the earliest one does, instead of waiting for the next message.
+      this.armHeldDrain(session);
+      return;
+    }
     const owner = unit.items.some((item) => item.owner);
     // The spend ceiling holds peer work; Jay asking is not held by it.
     if (!owner && this.deps.spendBlocked?.()) {
       unit.notBefore = now + 60_000;
       return;
+    }
+    // A held unit is rechecked here, at the moment it would dispatch:
+    // against live budgets, the chain guard, and the spend ledger.  The
+    // wake is charged only now - exactly once, never at parking time.
+    let heldMs: number | undefined;
+    if (unit.held) {
+      const heldKey = originKey(unit.origin);
+      const heldRefusal = this.wakeRefusal(state, "peer", heldKey, now);
+      if (heldRefusal === "loop_guard") {
+        // The loop guard never retries and never resets itself: the held
+        // request is stopped, and the owner hears of it content-free.
+        const ids = unit.items.map((item) => item.id);
+        session.markHandled(ids);
+        state.pending = state.pending.filter((candidate) => candidate !== unit);
+        session.indexPending();
+        const noticeQueued = this.enqueueOwnerNotice(
+          session,
+          `[botfleet] ${session.role}: a held peer request hit the peer-chain limit and never got a turn in ${originAsData(unit.origin)}; ${ids.length} message(s) went unanswered${unit.dropped ? `, and ${unit.dropped} more were trimmed at the queue cap (preserved in the private archive)` : ""}. The chain resumes when the owner speaks there.`,
+          `[botfleet] ${session.role}: a held peer request hit the peer-chain limit and never got a turn; ${ids.length} message(s) went unanswered${unit.dropped ? `, and ${unit.dropped} more were trimmed at the queue cap (preserved in the private archive)` : ""} (origin names withheld: the label tripped the content check). The chain resumes when the owner speaks there.`,
+          `held-chain:${unit.createdAt}:${ids[0] ?? 0}`,
+        );
+        this.log(
+          `[zulip] ${session.role}: held unit stopped by the loop guard; ${ids.length} message(s) dropped, owner notice ${noticeQueued ? "queued" : "NOT queued (see the refusal log above)"}`,
+        );
+        session.save(true);
+        this.armHeldDrain(session);
+        return;
+      }
+      if (heldRefusal) {
+        unit.notBefore = heldWakeAt(state, heldKey, heldRefusal, now);
+        this.log(`[zulip] ${session.role}: held unit still refused (${heldRefusal}); held until the window resets`);
+        session.save(true);
+        this.armHeldDrain(session);
+        return;
+      }
+      state.wakes.push({ at: now, kind: "peer", key: heldKey });
+      state.chains[heldKey] = (state.chains[heldKey] ?? 0) + 1;
+      heldMs = now - unit.createdAt;
+      delete unit.held;
+      unit.notBefore = 0;
+      this.log(`[zulip] ${session.role}: held unit released as its budget window reset; the wake is charged now`);
     }
     this.dispatching.add(botId);
     // The batch this turn is handed, fixed before the await: a message for
@@ -1689,6 +2081,15 @@ export class ZulipHub {
     // because the bot follows the topic is listening, not being asked.
     const autoReply =
       (this.settings()?.autoReply ?? "final") === "final" && batch.some((item) => item.via !== "followed");
+    // Trusted mention handles for the Senders line: the realm's cached
+    // member directory keyed by the numeric sender id, never the name a
+    // sender typed into its own message.
+    const senderHandles = new Map<number, string>();
+    for (const item of batch) {
+      const user = session.users.get(item.senderId);
+      const handle = user ? zulipMentionHandle({ userId: user.user_id, fullName: String(user.full_name ?? "") }) : null;
+      if (handle) senderHandles.set(item.senderId, handle);
+    }
     const text = buildInboundPrompt(
       { origin: unit.origin, items: batch },
       {
@@ -1698,6 +2099,9 @@ export class ZulipHub {
         autoReply,
         ownerUserId: this.ownerUserId(),
         realm: session.realm,
+        senderHandles,
+        heldMs,
+        droppedFromQueue: unit.dropped,
       },
     );
     // Plugin-platform routing: the dispatcher's hint rides into the turn
@@ -1798,6 +2202,51 @@ export class ZulipHub {
       const limit = this.budget("dmsPerHour");
       const lastHour = session.state.dms.filter((at) => now - at < 3600_000).length;
       if (lastHour >= limit) {
+        // The one recipient a refused DM must not silently drop: the owner.
+        // Queue the notice on the bot's persisted state; flushNotices sends
+        // it when the window resets.  The cap itself is unchanged - the
+        // resend counts against the same ledger.
+        const ownerId = this.ownerUserId();
+        if (ownerId !== undefined && target.target.userIds.length === 1 && target.target.userIds[0] === ownerId) {
+          const text = String(args.content ?? "");
+          // Validate BEFORE queueing: content that can never be posted is
+          // refused now with the ordinary refusal, never queued; and text
+          // too long for the state schema is refused whole, never truncated.
+          const precheck = checkContent(text, this.knownSecrets());
+          if ("error" in precheck) return { ok: false, text: precheck.error };
+          if (text.length > 9500) {
+            this.log(`[zulip] ${session.role}: DM to user ${ownerId} refused (dm_budget), notice NOT queued (over 9500 chars)`);
+            return {
+              ok: false,
+              text: `Not posted: this bot has sent ${lastHour} DMs in the last hour, its limit (zulip.budgets.dmsPerHour), and the notice is too long to queue for later delivery (over 9500 characters).  It was NOT queued and NOT truncated: shorten it and try again after the window resets.`,
+            };
+          }
+          // Dedup: the same notice asked twice is one queue entry.  A full
+          // queue refuses the enqueue OUT LOUD - an accepted notice is never
+          // discarded to make room, and this one is not claimed as queued.
+          if (session.state.notices.some((notice) => !notice.failed && notice.userId === ownerId && notice.text === text)) {
+            this.log(`[zulip] ${session.role}: DM to user ${ownerId} refused (dm_budget), identical notice already queued`);
+            return {
+              ok: false,
+              text: `Not posted now: this bot has sent ${lastHour} DMs in the last hour, its limit (zulip.budgets.dmsPerHour).  An identical notice to the owner is already queued and will be sent when the window resets - NOT delivered yet.  Do not treat the owner as notified until it lands.`,
+            };
+          }
+          if (session.state.notices.filter((notice) => !notice.failed).length >= PENDING_NOTICE_LIMIT) {
+            this.log(`[zulip] ${session.role}: DM to user ${ownerId} refused (dm_budget), notice queue FULL (${PENDING_NOTICE_LIMIT}) - NOT queued`);
+            return {
+              ok: false,
+              text: `Not posted: this bot has sent ${lastHour} DMs in the last hour, its limit (zulip.budgets.dmsPerHour), AND the owner-notice queue is full (${PENDING_NOTICE_LIMIT} pending), so this notice was NOT queued: the owner is not notified.  Keep the notify step open, record the refusal in the registry row, and retry the DM after the window resets.`,
+            };
+          }
+          session.state.notices.push({ at: now, userId: ownerId, text, attempts: 0 });
+          session.markDirty();
+          session.save();
+          this.log(`[zulip] ${session.role}: DM to user ${ownerId} refused (dm_budget), notice queued (${session.state.notices.length} pending)`);
+          return {
+            ok: false,
+            text: `Not posted now: this bot has sent ${lastHour} DMs in the last hour, its limit (zulip.budgets.dmsPerHour).  This notice to the owner is queued and will be sent when the window resets - NOT delivered yet.  Record the refusal in the registry row and do not treat the owner as notified until it lands.`,
+          };
+        }
         this.log(`[zulip] ${session.role}: DM to user ${target.target.userIds.join(", ")} refused (dm_budget)`);
         return {
           ok: false,
