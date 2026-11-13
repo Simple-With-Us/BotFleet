@@ -1,0 +1,54 @@
+import { describe, expect, it } from "vitest";
+
+import {
+  allowsMultipleBotThreads,
+  automationLaneTitle,
+  CONVERSATION_MODE_COPY,
+  CONVERSATION_MODES,
+  DEFAULT_CONVERSATION_MODE,
+  parseConversationMode,
+  roomRole,
+  rosterPrimaryLabel,
+} from "../shared/conversation-mode.ts";
+
+describe("conversation mode", () => {
+  it("defaults to simple, and reads leftover fleet as projects", () => {
+    expect(DEFAULT_CONVERSATION_MODE).toBe("simple");
+    expect(parseConversationMode(undefined)).toBe("simple");
+    expect(parseConversationMode("threads")).toBe("simple");
+    expect(parseConversationMode("fleet")).toBe("projects");
+    expect(parseConversationMode("projects")).toBe("projects");
+    expect(CONVERSATION_MODES).toEqual(["simple", "projects"]);
+  });
+
+  it("only projects mint extra conversations", () => {
+    expect(allowsMultipleBotThreads("simple")).toBe(false);
+    expect(allowsMultipleBotThreads("projects")).toBe(true);
+  });
+
+  it("treats rooms as group threads in simple and categories in projects", () => {
+    expect(roomRole("simple")).toBe("group-thread");
+    expect(roomRole("projects")).toBe("category");
+    expect(rosterPrimaryLabel("simple").newLabel).toBe("New Bot");
+    expect(rosterPrimaryLabel("projects").newLabel).toBe("New Bot");
+  });
+
+  it("names automation lanes by type in projects mode", () => {
+    expect(automationLaneTitle("simple", "webhook")).toBe("Triggers");
+    expect(automationLaneTitle("projects", "webhook")).toBe("Webhooks");
+    expect(automationLaneTitle("projects", "resource")).toBe("Resources");
+    expect(automationLaneTitle("projects", "schedule")).toBe("Schedules");
+  });
+
+  it("describes Projects with the person's own room word, and promises only what it does", () => {
+    const projects = CONVERSATION_MODE_COPY.projects.subtitle("channel");
+    expect(projects).toBe(
+      "Any number of threads under each bot and channel, nested in the sidebar.\u00a0 A thread can be tied to one channel.",
+    );
+    expect(CONVERSATION_MODE_COPY.projects.subtitle("project")).toContain("each bot and project,");
+    // Projects lists bots exactly as Simple does, and no shipped client sets a
+    // thread's model, so neither claim may come back.
+    expect(projects).not.toMatch(/hidden|hide/i);
+    expect(projects).not.toMatch(/picks a model|its own model|per-thread model/i);
+  });
+});

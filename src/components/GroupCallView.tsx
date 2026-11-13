@@ -11,11 +11,17 @@ import { routeSpokenGroupMessage } from "@/lib/group-call";
 import { track } from "@/lib/analytics";
 import { normalizeState } from "@/lib/mascot";
 import { speaker } from "@/lib/tts";
+import { spokenReply } from "../../shared/voice-summary";
+import { voiceForDevice } from "../../shared/bot-voice";
 import { useSpeech } from "@/lib/tts/useSpeech";
 import { usePushToTalk } from "@/lib/push-to-talk";
+import { createSTTSession, disposeAppleSTTSession, type STTSession } from "@/lib/call-stt";
+import { sessionKeyterms } from "@/lib/stt-keyterms";
+import { mergeCloudSttCapabilities } from "@/lib/cloud-stt-capabilities";
+import { pickSTTProvider, type ProviderChoice } from "@/lib/transcription-provider";
 import { useStore, type Bot, type Group, type Message } from "@/state/store";
 import { cn } from "@/lib/cn";
-import { MausAvatar } from "./Avatar";
+import { BotMascot } from "./Avatar";
 import { CallTargetButton } from "./CallView";
 import { isRoutineApproval, pendingApprovals, spokenApprovalPrompt } from "./PendingApproval";
 
@@ -31,8 +37,8 @@ export function GroupCallButton({ group, members }: { group: Group; members: Bot
     <CallTargetButton
       targetId={group.id}
       targetName={group.name}
-      voices={members.map((member) => member.voice)}
-      setupBotId={members.find((member) => !member.voice)?.id ?? members[0]?.id}
+      voices={members.map((member) => voiceForDevice(member, "mac"))}
+      setupBotId={members.find((member) => !voiceForDevice(member, "mac"))?.id ?? members[0]?.id}
       requireExplicitVoices
       onStart={() => track("group_call_started", { memberCount: members.length })}
     />
@@ -57,15 +63,18 @@ function questionIn(messages: Message[]): Message | undefined {
 }
 
 function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
-  const { dispatch } = useStore();
+  const { state, dispatch } = useStore();
   const speech = useSpeech();
   const initialPhase: Phase = group.busyBotId ? "working" : "listening";
   const [phase, setPhase] = useState<Phase>(initialPhase);
   const [heard, setHeard] = useState("");
   const [note, setNote] = useState<string | null>(null);
   const [speakingMemberId, setSpeakingMemberId] = useState<string | null>(null);
-  const pushToTalk = usePushToTalk(group.id, phase === "listening", () => {
-    setNote("Push to talk couldn't start. Check Microphone and Speech Recognition access.");
+  const sttSessionRef = useRef<STTSession | null>(null);
+  const pushToTalk = usePushToTalk(group.id, phase === "listening", sttSessionRef, () => {
+    setNote(sttSessionRef.current?.provider === "assemblyai"
+      ? "Cloud dictation couldn't start.\u00A0 Check the AssemblyAI key, connection, and microphone access."
+      : "Push to talk couldn't start.\u00A0 Check Microphone and Speech Recognition access.");
   });
 
   const messages = group.messages;
@@ -102,6 +111,12 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
   const listenWhenDrained = useRef(false);
   const listenTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const allowBargeIn = useRef(false);
+  // The STT provider session is chosen once per group call and reused across
+  // every listen cycle. Picks apple (macOS without a cloud key) vs assemblyai
+  // (cross-platform, or macOS-with-key per the picker default). The same
+  // `useOnCall` micro-task lifecycle means a session can outlive one render
+  // but the cleanup hook releases it before the timer ref is reset.
+
 
   const move = useCallback((next: Phase) => {
     phaseRef.current = next;
@@ -109,7 +124,7 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
   }, []);
 
   const hush = useCallback(() => {
-    void window.ogb?.speechStop();
+    void sttSessionRef.current?.stop();
   }, []);
 
   const listen = useCallback(() => {
@@ -118,12 +133,16 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
     setSpeakingMemberId(null);
     setHeard("");
     setNote(null);
-    void window.ogb?.speechStart({ endpointMs: CALL_ENDPOINT_MS }).catch(() => {
+    const session = sttSessionRef.current;
+    if (!session) return;
+    session.start({ endpointMs: CALL_ENDPOINT_MS, keyterms: sessionKeyterms(membersRef.current.map((member) => member.name), state.config?.callStt?.keyterms ?? []) }).catch(() => {
       if (alive.current && currentCall() === group.id) {
-        setNote("The microphone couldn't start. Check Microphone and Speech Recognition access.");
+        setNote(session?.provider === "assemblyai"
+          ? "Cloud dictation couldn't start.\u00A0 Check the AssemblyAI key, connection, and microphone access."
+          : "The microphone couldn't start.\u00A0 Check Microphone and Speech Recognition access.");
       }
     });
-  }, [group.id, move]);
+  }, [group.id, move, state.config?.callStt?.keyterms]);
 
   const scheduleListen = useCallback(
     (force = false, delay = 140) => {
@@ -138,20 +157,21 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
   );
 
   const say = useCallback(
-    async (text: string, member?: Bot) => {
+    async (text: string, member?: Bot, messageId?: string) => {
       if (!alive.current || currentCall() !== group.id) return false;
       const mine = ++sayGeneration.current;
       move("speaking");
       setSpeakingMemberId(member?.id ?? null);
       hush();
-      await speaker.speak(text, { botId: member?.id, voiceId: member?.voice });
+      // Each member speaks with its voice for this Mac.
+      await speaker.speak(text, { botId: member?.id, voiceId: member ? voiceForDevice(member, "mac") : undefined, ...(messageId ? { messageId, threadId: group.threadId } : {}) });
       return alive.current && currentCall() === group.id && sayGeneration.current === mine;
     },
-    [group.id, hush, move],
+    [group.id, group.threadId, hush, move],
   );
 
   const enqueueSpeech = useCallback(
-    (text: string, member?: Bot, answerAfter = false) => {
+    (text: string, member?: Bot, answerAfter = false, messageId?: string) => {
       const generation = queueGeneration.current;
       const jobId = ++nextJobId.current;
       queuedJobs.current.add(jobId);
@@ -160,7 +180,7 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
         .catch(() => {})
         .then(async () => {
           if (generation !== queueGeneration.current) return;
-          await say(text, member);
+          await say(text, member, messageId);
         })
         .finally(() => {
           if (generation !== queueGeneration.current) return;
@@ -201,12 +221,18 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
   }, [group.id]);
 
   useEffect(() => {
-    const bridge = window.ogb;
-    if (!bridge) return;
-    const offTranscript = bridge.onSpeechTranscript((line) => {
+    let detached = false;
+    let offTranscript: () => void = () => {};
+    let offEnd: () => void = () => {};
+    let session: STTSession | null = null;
+
+    const handleTranscript = (line: { text: string; partial: boolean; error?: string }) => {
       if (!alive.current || currentCall() !== group.id || phaseRef.current !== "listening") return;
+      if (speaker.state.status === "speaking" || speaker.state.status === "preparing") return;
       if (line.error) {
-        setNote("Dictation stopped unexpectedly. Check Microphone and Speech Recognition access.");
+        setNote(sttSessionRef.current?.provider === "assemblyai"
+          ? "Cloud dictation stopped unexpectedly.\u00A0 Check the AssemblyAI key, connection, and microphone access."
+          : "Dictation stopped unexpectedly.\u00A0 Check Microphone and Speech Recognition access.");
         return;
       }
       if (typeof line.text !== "string") return;
@@ -214,6 +240,23 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
       if (line.partial !== false) return;
       const said = line.text.trim();
       if (!said) return listen();
+
+      // Acoustic echo suppression: drop text heard from speaker output
+      const recentBotTexts = messages
+        .filter((m) => m.role === "bot" && m.text)
+        .slice(-5)
+        .map((m) => m.text!.toLowerCase().replace(/[^a-z0-9]/g, " ").trim());
+      const normalized = said.toLowerCase().replace(/[^a-z0-9]/g, " ").trim();
+      if (
+        normalized.length > 8 &&
+        recentBotTexts.some(
+          (botText) =>
+            botText.includes(normalized) ||
+            (normalized.length > 20 && botText.split(" ").filter((w) => w.length > 3 && normalized.includes(w)).length >= 3),
+        )
+      ) {
+        return listen();
+      }
 
       const openApproval = askedApproval.current;
       if (openApproval) {
@@ -273,6 +316,7 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
           message: said,
         });
         move("working");
+        hush();
         return;
       }
 
@@ -288,29 +332,72 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
       move(busyRef.current ? "working" : "sending");
       dispatch({ type: "sendGroup", groupId: group.id, text: routed.text });
       scheduleListen(false, 600);
-    });
-    const offEnd = bridge.onSpeechEnd(({ code, reason }) => {
+    };
+
+    const handleEnd = ({ code, reason }: { code: number; reason?: string }) => {
       if (!alive.current || currentCall() !== group.id) return;
       if (code === 2) {
-        setNote("Calls need macOS dictation, which isn't available here yet.");
+        setNote(
+          "Calls need a working dictation provider.\u00A0 Add an AssemblyAI key in Settings, or install the desktop app for macOS.",
+        );
         return;
       }
       if (code === 1) {
         setNote(
-          reason === "helper-build-failed"
-            ? "The dictation helper couldn't be built. Install Apple's Command Line Tools and try again."
-            : "Dictation needs Microphone + Speech Recognition access in System Settings.",
+          session?.provider === "assemblyai"
+            ? "Cloud dictation stopped.\u00A0 Check the AssemblyAI key, connection, and microphone access."
+            : reason === "helper-build-failed"
+              ? "The dictation helper couldn't be built.\u00A0 Install Apple's Command Line Tools and try again."
+              : "Dictation needs Microphone + Speech Recognition access in System Settings.",
         );
         return;
       }
-      if (phaseRef.current === "listening") listen();
+      if (phaseRef.current === "listening" && alive.current) listen();
+    };
+
+    (async () => {
+      const bridge = window.ogb;
+      if (!bridge || detached) return;
+      const status = await bridge.transcription?.status?.().catch(() => undefined);
+      const hostPlatform = bridge.platform ?? "unknown";
+      const choice: ProviderChoice = pickSTTProvider({
+        cloudStt: mergeCloudSttCapabilities(state.config?.callStt?.cloud, Boolean(status?.configured)),
+        appleSpeechAvailable: hostPlatform === "darwin",
+        platform: hostPlatform,
+        explicitPreference: state.config?.callStt?.provider ?? undefined,
+        ladder: state.config?.callStt?.ladder,
+      });
+      if (choice.provider === null) {
+        if (alive.current && currentCall() === group.id) {
+          setNote(
+            choice.missing === "cloud-stt-key"
+              ? "Add an AssemblyAI API key in Settings to use voice on this computer."
+              : "Dictation isn't available in this app build.\u00A0 Restart or update BotFleet.",
+          );
+        }
+        return;
+      }
+      if (detached || !alive.current) return;
+      const created = createSTTSession(choice.provider);
+      sttSessionRef.current = created;
+      session = created;
+      offTranscript = created.onTranscript(handleTranscript);
+      offEnd = created.onEnd(handleEnd);
+      if (group.busyBotId && !approval && !question) move("working");
+      else listen();
+    })().catch((error) => {
+      if (alive.current && currentCall() === group.id) {
+        setNote(error instanceof Error ? error.message : String(error));
+      }
     });
-    if (group.busyBotId && !approval && !question) move("working");
-    else listen();
+
     return () => {
+      detached = true;
       offTranscript();
       offEnd();
-      void window.ogb?.speechStop();
+      if (session?.provider === "apple") disposeAppleSTTSession(session);
+      void session?.stop().catch(() => {});
+      if (sttSessionRef.current === session) sttSessionRef.current = null;
     };
     // Live busy/card changes are handled below without restarting native capture.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -372,7 +459,7 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
     );
     for (const reply of replies) {
       const member = members.find((candidate) => candidate.id === reply.from?.botId);
-      enqueueSpeech(reply.text!, member);
+      enqueueSpeech(spokenReply(reply.text!), member, false, reply.id);
     }
     if (!replies.length) {
       const chip = [...fresh].reverse().find((message) => message.kind === "activity" && message.tool?.spoken);
@@ -442,7 +529,7 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
     <div className="absolute inset-0 z-30 flex flex-col items-center justify-center gap-6 bg-app/95 px-8 backdrop-blur-sm">
       <button
         onClick={() => endCall(group.id)}
-        aria-label="Hang up"
+        aria-label="Hang Up"
         className="absolute right-5 top-5 rounded-md p-2 text-ink-secondary hover:bg-raised hover:text-ink"
       >
         <X size={18} />
@@ -468,7 +555,7 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
                   focused ? "scale-105 bg-raised/70 shadow-lg" : "opacity-75",
                 )}
               >
-                <MausAvatar
+                <BotMascot
                   color={member.color}
                   state={state}
                   size={94}
@@ -535,12 +622,12 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
           onClick={() => endCall(group.id)}
           className="flex items-center gap-2 rounded-full bg-danger px-5 py-2.5 text-[14px] font-medium text-white hover:brightness-110"
         >
-          <PhoneOff size={16} /> Hang up
+          <PhoneOff size={16} /> Hang Up
         </button>
       </div>
 
       <div className="text-[11.5px] text-ink-secondary/70">
-        Hold Control + Option to talk · Say a member’s name to direct the turn · Space interrupts · Esc hangs up
+        {sttSessionRef.current?.provider === "apple" ? "Hold Control + Option to talk · " : ""}Say a member’s name to direct the turn · Space interrupts · Esc hangs up
       </div>
     </div>
   );

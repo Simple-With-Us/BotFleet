@@ -1,81 +1,105 @@
-// Refresh latest-mac.yml after notarization stapling has changed the bytes.
-//
-// electron-builder writes latest-mac.yml during packaging, but the release
-// flow then notarizes and STAPLES the dmg and the updater zip, which rewrites
-// both files — so every hash in the feed is stale by the time it is published.
-// Shipping the stale feed makes electron-updater reject the download (sha512
-// mismatch) and every update falls back to a full manual reinstall.
-//
-// This keeps the file list and ORDER exactly as electron-builder wrote them —
-// electron-updater filters that list by arch on macOS (files carrying an
-// "arm64" marker on Apple silicon, the unmarked x64 ones on Intel), and the
-// top-level path/sha512 is the legacy fallback taken from the first entry —
-// and only recomputes sha512 + size from the bytes on disk right now.
-//
-// Blockmaps are NOT handled here: regenerate them separately with
-// scripts/regenerate-blockmaps.mjs after stapling, for the same staleness reason.
+// Rebuild latest-mac.yml after notarization and stapling have changed the
+// bytes.  Generate the feed from the four expected versioned artifacts rather
+// than editing electron-builder's intermediate file: repeated multi-arch
+// packaging used to leave duplicate entries in the feed.
 import { createHash } from "node:crypto";
-import { readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const feedPath = process.argv[2] ?? join(root, "release", "latest-mac.yml");
-const releaseDir = dirname(feedPath);
 
-const sha512 = (file) => createHash("sha512").update(readFileSync(file)).digest("base64");
+function sha512(file) {
+  return createHash("sha512").update(readFileSync(file)).digest("base64");
+}
 
-const original = readFileSync(feedPath, "utf8");
-const lines = original.split("\n");
+export function macArtifactNames(version) {
+  if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)) {
+    throw new Error(`invalid package version: ${version}`);
+  }
+  return [
+    `BotFleet-${version}-arm64.zip`,
+    `BotFleet-${version}-x64.zip`,
+    `BotFleet-${version}-arm64.dmg`,
+    `BotFleet-${version}-x64.dmg`,
+  ];
+}
 
-let currentUrl = null;
-let firstUrl = null;
-const out = lines.map((line) => {
-  const url = line.match(/^\s*-\s+url:\s+(\S+)\s*$/);
-  if (url) {
-    currentUrl = url[1];
-    firstUrl ??= currentUrl;
-    return line;
+export function buildMacFeed(releaseDir, version, releaseDate = new Date().toISOString()) {
+  const entries = macArtifactNames(version).map((url) => {
+    const file = join(releaseDir, url);
+    // A missing artifact means the feed would describe a release that does
+    // not exist, so say which version and which file instead of letting the
+    // read fail with a bare ENOENT.
+    if (!existsSync(file)) {
+      throw new Error(
+        `missing release artifact ${url} for version ${version} in ${releaseDir}`,
+      );
+    }
+    return { url, sha512: sha512(file), size: statSync(file).size };
+  });
+  const fallback = entries[0];
+  const lines = [`version: ${version}`, "files:"];
+  for (const entry of entries) {
+    lines.push(`  - url: ${entry.url}`, `    sha512: ${entry.sha512}`, `    size: ${entry.size}`);
   }
-  // top-level path introduces the legacy fallback block: hash the first file
-  if (/^path:\s+/.test(line)) {
-    currentUrl = firstUrl;
-    return `path: ${firstUrl}`;
-  }
-  if (currentUrl && /^\s*sha512:\s+/.test(line)) {
-    const indent = line.match(/^\s*/)[0];
-    return `${indent}sha512: ${sha512(join(releaseDir, currentUrl))}`;
-  }
-  if (currentUrl && /^\s*size:\s+/.test(line)) {
-    const indent = line.match(/^\s*/)[0];
-    return `${indent}size: ${statSync(join(releaseDir, currentUrl)).size}`;
-  }
-  if (/^sha512:\s+/.test(line)) {
-    return `sha512: ${sha512(join(releaseDir, firstUrl))}`;
-  }
-  if (/^releaseDate:/.test(line)) {
-    return `releaseDate: '${new Date().toISOString()}'`;
-  }
-  return line;
-});
+  lines.push(
+    `path: ${fallback.url}`,
+    `sha512: ${fallback.sha512}`,
+    `releaseDate: '${releaseDate}'`,
+    "",
+  );
+  return lines.join("\n");
+}
 
-const updated = out.join("\n");
-if (updated === original) {
-  console.log("latest-mac.yml already matches the bytes on disk");
-} else {
+/**
+ * The version the feed must describe.
+ *
+ * A CI release stamps its version from the commit count and hands it over as
+ * BOTFLEET_BUILD_VERSION, the same way it hands the value to electron-builder
+ * and to the server bundler.  package.json's own version is the FLOOR of that
+ * scheme, not the release number: it stays at 1.0.31, which is also the
+ * version already installed on the owner's Mac, so a feed carrying it can
+ * never offer an update.
+ *
+ * Reading the floor here broke the first unified release: the regeneration
+ * looked for BotFleet-1.0.31-arm64.zip while the build had produced
+ * BotFleet-1.0.2193-arm64.zip, and the run died naming a file that was never
+ * going to exist.  The stamped version is the truth; the floor is only the
+ * fallback for a local build that never stamped one.
+ */
+export function resolveFeedVersion({ env = process.env, versionPath = join(root, "package.json") } = {}) {
+  const pinned = env.BOTFLEET_BUILD_VERSION?.trim();
+  if (pinned) return pinned;
+  return JSON.parse(readFileSync(versionPath, "utf8")).version;
+}
+
+export function regenerateMacFeed({
+  feedPath = join(root, "release", "latest-mac.yml"),
+  version = resolveFeedVersion(),
+  releaseDate,
+} = {}) {
+  const updated = buildMacFeed(dirname(feedPath), version, releaseDate);
   writeFileSync(feedPath, updated);
+  console.log(`latest-mac.yml regenerated from ${macArtifactNames(version).length} artifacts`);
+  return updated;
 }
 
-// Refuse to end with a feed that lies: verify every entry against the disk.
-const entries = [...updated.matchAll(/-\s+url:\s+(\S+)[\s\S]*?sha512:\s+(\S+)\n\s+size:\s+(\d+)/g)];
-if (entries.length === 0) throw new Error("no file entries found in latest-mac.yml");
-for (const [, url, hash, size] of entries) {
-  const file = join(releaseDir, url);
-  const actualHash = sha512(file);
-  const actualSize = statSync(file).size;
-  if (actualHash !== hash || actualSize !== Number(size)) {
-    throw new Error(`feed mismatch for ${url}: hash/size do not match the file on disk`);
+// Compare physical paths.  Node's ESM loader realpaths the entry module, so an
+// invocation through a symlinked directory (macOS /var -> /private/var) never
+// matches process.argv[1] when compared as text.
+function isEntryModule() {
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
   }
-  console.log(`  ok ${url} (${actualSize} bytes)`);
 }
-console.log(`latest-mac.yml verified against ${entries.length} artifacts`);
+
+if (isEntryModule()) {
+  // node scripts/regenerate-mac-feed.mjs [feedPath] [version]
+  // The version argument wins; without it the stamped BOTFLEET_BUILD_VERSION
+  // is used, and without that the package.json floor.  A release always
+  // passes one, so the feed can never drift onto the floor.
+  regenerateMacFeed({ feedPath: process.argv[2], version: process.argv[3] });
+}

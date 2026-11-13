@@ -50,11 +50,25 @@ describe("package export", () => {
         name: "Release check",
         prompt: "Verify release readiness.",
         botId: "private-id",
-        runOn: "maus",
+        runOn: "bot",
         enabled: true,
-        schedule: { type: "daily", time: "09:00", weekdays: [1] },
+        schedule: { type: "daily", time: "09:00", weekdays: [1], timeZone: "America/Chicago" },
+        scheduleTimeZoneSource: "stored",
         durationMinutes: 30,
         nextRunAt: 123,
+        createdAt: 1,
+        updatedAt: 1,
+      }, {
+        id: "legacy-routine-id",
+        name: "Legacy local check",
+        prompt: "Check in the recipient's local timezone.",
+        botId: "private-id",
+        runOn: "bot",
+        enabled: true,
+        schedule: { type: "daily", time: "10:00", weekdays: [2], timeZone: "Europe/Athens" },
+        scheduleTimeZoneSource: "host",
+        durationMinutes: 30,
+        nextRunAt: 456,
         createdAt: 1,
         updatedAt: 1,
       }],
@@ -66,11 +80,16 @@ describe("package export", () => {
         chiefOfStaff: "lead",
         requirements: { apps: [{ slug: "github" }] },
         rooms: [{ members: ["lead"], defaultResponder: { kind: "agent", agent: "lead" } }],
-        routines: [{ agent: "lead", enabledAfterInstall: false }],
+        routines: [
+          { agent: "lead", enabledAfterInstall: false },
+          { agent: "lead", enabledAfterInstall: false },
+        ],
         playbooks: [{ key: "launch" }],
       },
     });
     expect(JSON.stringify(exported)).not.toMatch(/private-id|private-thread|private-engine|secret-model|secret-session|private\/path|autoApprove|alwaysAllow|nextRunAt/);
+    expect(exported.package.routines?.[0].schedule).toMatchObject({ timeZone: "America/Chicago" });
+    expect(exported.package.routines?.[1].schedule).toEqual({ type: "daily", time: "10:00", weekdays: [2] });
   });
 
   it("shares one identical playbook definition across multiple bots", () => {

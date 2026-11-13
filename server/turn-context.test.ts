@@ -1,11 +1,67 @@
 import { describe, expect, it } from "vitest";
 
-import { buildTurnContext, engineIsFresh } from "./turn-context.ts";
+import { boundNativeTranscript, boundRoomContextLines, buildTurnContext, engineIsFresh } from "./turn-context.ts";
 
 const transcript = [
   { role: "user" as const, text: "my dog is named Biscuit" },
   { role: "assistant" as const, text: "Noted — Biscuit." },
 ];
+
+describe("boundNativeTranscript", () => {
+  it("keeps ordinary replay unchanged", () => {
+    expect(boundNativeTranscript(transcript)).toBe(transcript);
+  });
+
+  it("keeps recent complete turns and marks older history as omitted", () => {
+    const history = [
+      { role: "user" as const, text: "old".repeat(50 * 1024) },
+      { role: "assistant" as const, text: "recent assistant" },
+      { role: "user" as const, text: "recent user" },
+    ];
+    const bounded = boundNativeTranscript(history);
+    expect(bounded.map((entry) => entry.text)).toEqual([
+      "[Earlier conversation omitted for length]",
+      "recent assistant",
+      "recent user",
+    ]);
+    expect(bounded[0].role).toBe("user");
+  });
+
+  it("clips one oversized newest turn at a UTF-8 boundary", () => {
+    const bounded = boundNativeTranscript([{ role: "assistant", text: "é".repeat(100 * 1024) }]);
+    expect(bounded).toHaveLength(2);
+    expect(bounded[1].text).not.toContain("\uFFFD");
+    expect(bounded[1].text.length).toBeLessThan(100 * 1024);
+    expect(Buffer.byteLength(bounded.map((entry) => entry.text).join(""), "utf8")).toBeLessThanOrEqual(128 * 1024);
+  });
+});
+
+describe("boundRoomContextLines", () => {
+  it("preserves short room conversations", () => {
+    expect(boundRoomContextLines(["User: hello", "Bot: hi"])).toBe("User: hello\nBot: hi");
+  });
+
+  it("omits a huge prior room message while retaining the newest request", () => {
+    const current = "User: answer my latest question";
+    const bounded = boundRoomContextLines(["Bot: " + "x".repeat(200 * 1024), current]);
+    expect(bounded).toBe(`[Earlier conversation omitted for length]\n${current}`);
+    expect(Buffer.byteLength(bounded, "utf8")).toBeLessThan(128 * 1024);
+  });
+
+  it("keeps a deliberately large current room request intact", () => {
+    const current = "User: " + "z".repeat(200 * 1024);
+    expect(boundRoomContextLines(["Bot: older", current])).toBe(`[Earlier conversation omitted for length]\n${current}`);
+  });
+
+  it("clips the newest stored line when a card continuation is the current prompt", () => {
+    const prior = "Bot: " + "é".repeat(100 * 1024);
+    const bounded = boundRoomContextLines(["User: older", prior], false);
+    expect(bounded).toContain("[Earlier conversation omitted for length]");
+    expect(bounded).not.toContain("User: older");
+    expect(bounded).not.toContain("\uFFFD");
+    expect(Buffer.byteLength(bounded, "utf8")).toBeLessThanOrEqual(128 * 1024);
+  });
+});
 
 describe("buildTurnContext", () => {
   it("passes text through untouched on a plain resumed turn", () => {
@@ -40,6 +96,61 @@ describe("buildTurnContext", () => {
   it("does not wrap a fresh engine on an empty thread — nothing to replay", () => {
     const out = buildTurnContext({ text: "hi", transcript: [], rewound: false, fresh: true, replaysNatively: false });
     expect(out).toEqual({ turnText: "hi", resume: false });
+  });
+
+  it("caps oversized transcripts to 128KB, keeping recent messages and marking omission", () => {
+    const hugeTranscript = [
+      { role: "user" as const, text: "A".repeat(80 * 1024) },
+      { role: "assistant" as const, text: "B".repeat(80 * 1024) },
+      { role: "user" as const, text: "most recent user turn" },
+    ];
+    const out = buildTurnContext({ text: "hi", transcript: hugeTranscript, rewound: false, fresh: true, replaysNatively: false });
+    expect(out.resume).toBe(false);
+    expect(out.turnText).toContain("[Earlier conversation omitted for length]");
+    expect(out.turnText).toContain("most recent user turn");
+    expect(out.turnText).not.toContain("A".repeat(80 * 1024));
+    expect(Buffer.byteLength(out.turnText, "utf8")).toBeLessThan(130 * 1024);
+  });
+
+  it("clips a single entry that alone exceeds the cap instead of replaying it whole", () => {
+    const oneHugeEntry = [{ role: "user" as const, text: "A".repeat(200 * 1024) }];
+    const out = buildTurnContext({ text: "hi", transcript: oneHugeEntry, rewound: false, fresh: true, replaysNatively: false });
+    expect(out.resume).toBe(false);
+    expect(out.turnText).toContain("[Earlier conversation omitted for length]");
+    expect(out.turnText).not.toContain("A".repeat(200 * 1024));
+    expect(Buffer.byteLength(out.turnText, "utf8")).toBeLessThan(132 * 1024);
+  });
+
+  it("never splits a multi-byte character when clipping an oversized entry", () => {
+    const oneHugeEntry = [{ role: "user" as const, text: "é".repeat(100 * 1024) }];
+    const out = buildTurnContext({ text: "hi", transcript: oneHugeEntry, rewound: false, fresh: true, replaysNatively: false });
+    expect(out.turnText).not.toContain("\uFFFD");
+    expect(Buffer.byteLength(out.turnText, "utf8")).toBeLessThan(132 * 1024);
+  });
+
+  describe("the chat-completions capabilities.replaysTranscript contract", () => {
+    // index.ts derives `replaysNatively` from
+    // `instance.adapter.capabilities.replaysTranscript === true` rather than
+    // from `driverKind === "grok"`. minimax, openai-compat and grok all
+    // declare that capability because their driver already rebuilds the
+    // message history from SendTurnInput.transcript every round — so
+    // inlining the same history here as well would send it twice. A CLI
+    // driver never declares it, so its path (inline replay on rewind/fresh)
+    // must stay exactly as it is today.
+    it("a chat-completions driver (replaysTranscript: true) never gets the transcript inlined", () => {
+      for (const flags of [{ rewound: true, fresh: false }, { rewound: false, fresh: true }]) {
+        const out = buildTurnContext({ text: "hi", transcript, ...flags, replaysNatively: true });
+        expect(out.turnText).toBe("hi");
+        expect(out.turnText).not.toContain("Biscuit");
+      }
+    });
+
+    it("a CLI driver's path (no replaysTranscript capability) is unchanged: still inlined", () => {
+      const rewoundOut = buildTurnContext({ text: "hi", transcript, rewound: true, fresh: false, replaysNatively: false });
+      expect(rewoundOut.turnText).toContain("User: my dog is named Biscuit");
+      const freshOut = buildTurnContext({ text: "hi", transcript, rewound: false, fresh: true, replaysNatively: false });
+      expect(freshOut.turnText).toContain("Assistant: Noted — Biscuit.");
+    });
   });
 });
 

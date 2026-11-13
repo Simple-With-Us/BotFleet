@@ -4,6 +4,14 @@ import { saveConfig, type AppConfig } from "./config.ts";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
+import {
+  connectorIdentityDigest,
+  createConnectorInventoryProbe,
+  type ConnectorCredentialState,
+  type ConnectorInventoryResult,
+} from "./composio-readiness.ts";
+
+export type { ConnectorInventoryResult, ConnectorReadiness } from "./composio-readiness.ts";
 
 const DEFAULT_BACKEND_ORIGIN = "https://backend.composio.dev";
 
@@ -99,7 +107,11 @@ const connectorServiceSchema = z.object({
   status: z.string().optional(),
   accounts: z.array(z.object({ id: z.string(), alias: z.string().optional(), status: z.string() })).optional(),
 });
-const connectorServicesResponseSchema = z.object({ services: z.record(z.string(), connectorServiceSchema).optional() });
+const connectorServicesResponseSchema = z.object({
+  services: z.record(z.string(), connectorServiceSchema).optional(),
+  authoritative: z.boolean().optional(),
+  error: z.string().optional(),
+});
 const removalResponseSchema = z.object({ removed: z.number() });
 const authUrlResponseSchema = z.object({ url: z.string().optional() });
 const linkResponseSchema = z.object({ redirect_url: z.string().optional() });
@@ -144,7 +156,34 @@ interface IntegrationContext {
   threadId: string;
 }
 
+/** Headers the connector-proxy stdio bridge sends on every relay to
+ * /api/internal/connectors/mcp, naming the bot on whose behalf it is
+ * calling. The route handler (server/index.ts) reads these to enforce that
+ * bot's connectorTools grants — see the OMB_CONNECTOR_UPSTREAM_HEADERS
+ * comment in mcpIntegration below for why headers rather than the body. */
+export const CONNECTOR_BOT_ID_HEADER = "x-botfleet-bot-id";
+export const CONNECTOR_THREAD_ID_HEADER = "x-botfleet-thread-id";
+
 let managedBrokerAccess: { url: string; token: string } | null | undefined;
+let managedBrokerGeneration = 0;
+
+/** What the desktop learned when it last tried to set up the managed
+ * connected-apps service. "unconfigured" is the shipped default: no broker
+ * is built in, so a packaged install without OMB_COMPOSIO_BROKER_URL (or
+ * composio.brokerUrl) is not broken, it is simply not set up. */
+export interface ManagedBrokerSetup {
+  status: "unconfigured" | "ready" | "failed";
+  message?: string;
+}
+
+const managedBrokerSetupSchema = z
+  .object({
+    status: z.enum(["unconfigured", "ready", "failed"]),
+    message: z.string().max(400).optional(),
+  })
+  .strict();
+
+let managedBrokerSetup: ManagedBrokerSetup = { status: "unconfigured" };
 
 const managedBrokerMessageSchema = z.record(z.string(), z.unknown());
 const managedBrokerToken = /^[0-9a-f]{64}$/;
@@ -171,16 +210,67 @@ export function applyManagedBrokerMessage(message: unknown): boolean {
     return false;
   }
   setManagedBrokerAccess(parsed.data.access);
+  if (Object.hasOwn(parsed.data, "setup")) setManagedBrokerSetup(parsed.data.setup);
   return true;
+}
+
+export function setManagedBrokerSetup(setup: unknown): void {
+  const parsed = managedBrokerSetupSchema.safeParse(setup);
+  managedBrokerSetup = parsed.success ? parsed.data : { status: "unconfigured" };
+}
+
+/** Secret-free: the status word plus a human sentence, nothing else. */
+export function managedSetup(): ManagedBrokerSetup {
+  if (brokerAccess()) return { status: "ready" };
+  return managedBrokerSetup.message
+    ? { status: managedBrokerSetup.status, message: managedBrokerSetup.message }
+    : { status: managedBrokerSetup.status };
 }
 
 export function setManagedBrokerAccess(access: unknown): void {
   if (access === null) {
+    if (managedBrokerAccess === null) return;
     managedBrokerAccess = null;
+    managedBrokerGeneration += 1;
     return;
   }
   const parsed = z.object({ url: z.string().url(), token: z.string().regex(managedBrokerToken) }).strict().parse(access);
-  managedBrokerAccess = { url: normalizeManagedBrokerUrl(parsed.url), token: parsed.token };
+  const normalized = { url: normalizeManagedBrokerUrl(parsed.url), token: parsed.token };
+  if (managedBrokerAccess?.url === normalized.url && managedBrokerAccess.token === normalized.token) return;
+  managedBrokerAccess = normalized;
+  managedBrokerGeneration += 1;
+}
+
+/** One-way identity for readiness bookkeeping.  A credential, broker token,
+ * or private broker URL is hashed in-process and is never returned to a client. */
+function connectorIdentity(cfg: AppConfig): { key: string | null; configured: boolean } {
+  const explicitBroker = managedBrokerAccess;
+  const envBrokerUrl = explicitBroker === undefined ? process.env.OMB_COMPOSIO_BROKER_URL?.trim() ?? "" : "";
+  const envBrokerToken = explicitBroker === undefined ? process.env.OMB_COMPOSIO_BROKER_TOKEN?.trim() ?? "" : "";
+  if (explicitBroker || envBrokerUrl || envBrokerToken) {
+    return {
+      configured: true,
+      key: connectorIdentityDigest([
+        "managed",
+        managedBrokerGeneration,
+        explicitBroker?.url ?? envBrokerUrl,
+        explicitBroker?.token ?? envBrokerToken,
+      ]),
+    };
+  }
+  const composio = cfg.composio;
+  if (!composio?.apiKey) return { key: null, configured: false };
+  return {
+    configured: true,
+    key: connectorIdentityDigest([
+      "self-hosted",
+      composio.apiKey,
+      composio.userId ?? "",
+      composio.sessionId ?? "",
+      process.env.OMB_COMPOSIO_API ?? "",
+      process.env.OMB_COMPOSIO_TOOLKITS_API ?? "",
+    ]),
+  };
 }
 
 function brokerAccess(): { url: string; token: string } | null {
@@ -246,7 +336,11 @@ async function responseError(res: Response, fallback: string) {
 
 async function throwBrokerError(res: Response, fallback: string): Promise<never> {
   const status = res.status >= 400 && res.status < 500 ? res.status : 502;
-  throw Object.assign(new Error(await responseError(res, fallback)), { status });
+  throw Object.assign(new Error(await responseError(res, fallback)), { status, upstreamStatus: res.status });
+}
+
+async function upstreamError(res: Response, fallback: string): Promise<Error> {
+  return Object.assign(new Error(await responseError(res, fallback)), { upstreamStatus: res.status });
 }
 
 function trustedAuthUrl(value: string | undefined, slug: string): string {
@@ -310,7 +404,7 @@ async function getProjectSession(apiKey: string, sessionId: string): Promise<Ses
     signal: AbortSignal.timeout(15_000),
   });
   if (res.status === 404) return null;
-  if (!res.ok) throw new Error(await responseError(res, `Composio session: HTTP ${res.status}`));
+  if (!res.ok) throw await upstreamError(res, `Composio session: HTTP ${res.status}`);
   return parseSessionResponse(sessionResponseSchema.parse(await res.json()));
 }
 
@@ -414,7 +508,7 @@ export async function prepareProjectSession(
     body: JSON.stringify(sessionRequest),
     signal: AbortSignal.timeout(30_000),
   });
-  if (!res.ok) throw new Error(await responseError(res, `Composio rejected this key (HTTP ${res.status})`));
+  if (!res.ok) throw await upstreamError(res, `Composio rejected this key (HTTP ${res.status})`);
   const session = parseSessionResponse(sessionResponseSchema.parse(await res.json()));
   // If Composio does not echo the configs back, a later check would ask for
   // the same creation again — remember this attempt so it happens once.
@@ -485,7 +579,18 @@ export async function mcpIntegration(
       // Project/broker credentials stay in the harness process, so a coding
       // agent that prints its environment cannot export a durable secret.
       OMB_CONNECTOR_UPSTREAM_URL: `${context.harnessUrl}/api/internal/connectors/mcp`,
-      OMB_CONNECTOR_UPSTREAM_HEADERS: JSON.stringify({ authorization: `Bearer ${context.commsToken}` }),
+      // COMMS_TOKEN is one shared secret for every internal caller, so it
+      // alone does not say which bot is relaying — the connectorTools
+      // verdict (connector-verdict.ts) needs that to pick the right grants
+      // and to write an attributable decision-log row. Carried as headers
+      // (merged into every relay request by connector-proxy.ts's existing
+      // upstreamHeaders mechanism) rather than folded into the JSON-RPC
+      // body, so the payload Composio itself sees never changes shape.
+      OMB_CONNECTOR_UPSTREAM_HEADERS: JSON.stringify({
+        authorization: `Bearer ${context.commsToken}`,
+        [CONNECTOR_BOT_ID_HEADER]: context.botId,
+        [CONNECTOR_THREAD_ID_HEADER]: context.threadId,
+      }),
       OMB_HARNESS_URL: context.harnessUrl,
       OMB_COMMS_TOKEN: context.commsToken,
       OMB_BOT_ID: context.botId,
@@ -557,7 +662,7 @@ async function listConnectedAccounts(
       headers: projectHeaders(apiKey),
       signal: AbortSignal.timeout(15_000),
     });
-    if (!response.ok) throw new Error(await responseError(response, `Composio accounts: HTTP ${response.status}`));
+    if (!response.ok) throw await upstreamError(response, `Composio accounts: HTTP ${response.status}`);
     const body = connectedAccountsPageSchema.parse(await response.json());
     accounts.push(...body.items);
     const next = body.next_cursor || undefined;
@@ -585,7 +690,7 @@ async function listSessionToolkits(
       `${apiBase()}/tool_router/session/${encodeURIComponent(sessionId)}/toolkits?${params}`,
       { headers: projectHeaders(apiKey), signal: AbortSignal.timeout(15_000) },
     );
-    if (!response.ok) throw new Error(await responseError(response, `Composio toolkits: HTTP ${response.status}`));
+    if (!response.ok) throw await upstreamError(response, `Composio toolkits: HTTP ${response.status}`);
     const body = toolkitPageSchema.parse(await response.json());
     toolkits.push(...(body.items ?? []));
     const next = body.next_cursor || undefined;
@@ -666,6 +771,14 @@ function allServiceStates(
   return Object.fromEntries(services);
 }
 
+function isScopedAccountReadDenied(error: unknown): boolean {
+  return Boolean(
+    error
+    && typeof error === "object"
+    && (error as { upstreamStatus?: unknown }).upstreamStatus === 403,
+  );
+}
+
 /**
  * Enumerate the user's complete connected-account inventory without depending
  * on marketplace ordering or catalog pagination.
@@ -675,6 +788,9 @@ export async function connectedServices(cfg: AppConfig): Promise<Record<string, 
     const response = await brokerRequest("/v1/connectors/connected");
     if (!response.ok) await throwBrokerError(response, `Connected apps: HTTP ${response.status}`);
     const body = connectorServicesResponseSchema.parse(await response.json());
+    if (body.authoritative === false || body.error) {
+      throw new Error(body.error || "Connected apps inventory is incomplete");
+    }
     return Object.fromEntries(
       Object.entries(body.services ?? {}).map(([slug, state]) => [slug, {
         connected: state.connected,
@@ -692,10 +808,27 @@ export async function connectedServices(cfg: AppConfig): Promise<Record<string, 
     listSessionToolkits(cfg.composio.apiKey, session.session_id),
     // Scoped project keys can grant Session reads without granting the raw
     // connected-account list. The Session still proves which selected/no-auth
-    // toolkits belong to this installation, so retain that safe fallback.
-    listConnectedAccounts(cfg.composio.apiKey, userId, []).catch(() => []),
+    // toolkits belong to this installation, so retain that safe fallback for
+    // the permission response only. Network, timeout, malformed, and upstream
+    // failures must remain degraded instead of becoming an empty inventory.
+    listConnectedAccounts(cfg.composio.apiKey, userId, []).catch((error: unknown) => {
+      if (isScopedAccountReadDenied(error)) return [];
+      throw error;
+    }),
   ]);
   return allServiceStates(summarizeAccounts(accounts, []), toolkits);
+}
+
+const connectorInventoryProbe = createConnectorInventoryProbe<ConnectorServiceState>({
+  identify: connectorIdentity,
+  load: connectedServices,
+});
+
+export function connectedInventoryStatus(
+  cfg: AppConfig,
+  credentialState: ConnectorCredentialState = "available",
+): Promise<ConnectorInventoryResult<ConnectorServiceState>> {
+  return connectorInventoryProbe(cfg, credentialState);
 }
 
 export async function connectionStatus(cfg: AppConfig, slugs: string[]) {

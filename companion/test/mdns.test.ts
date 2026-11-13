@@ -19,8 +19,10 @@ import {
   encodeName,
   encodeResponse,
   isOnLink,
+  LEGACY_SERVICE_TYPES,
   MdnsResponder,
   SERVICE_ENUMERATION,
+  SERVICE_TYPE,
   serviceRecords,
   TYPE,
   type ServiceInfo,
@@ -240,7 +242,8 @@ describe("answersFor", () => {
   });
 
   it("still answers the predecessor Bonjour type during a rename", () => {
-    const renamed: ServiceInfo = { ...service, legacyTypes: ["_openmausbot._tcp"] };
+    // the type a phone on the OpenMausBot build is still browsing for
+    const renamed: ServiceInfo = { ...service, legacyTypes: [...LEGACY_SERVICE_TYPES] };
     const { answers, additionals } = answersFor(decodeMessage(query("_openmausbot._tcp.local", TYPE.PTR))!, renamed);
     expect(answers[0]).toMatchObject({
       name: "_openmausbot._tcp.local",
@@ -248,6 +251,14 @@ describe("answersFor", () => {
       data: "Milind's computer._openmausbot._tcp.local",
     });
     expect(additionals.map((r) => r.type).sort()).toEqual([TYPE.A, TYPE.SRV, TYPE.TXT].sort());
+    // and the current type is still the one it answers first
+    expect(ask(SERVICE_NAME, TYPE.PTR).answers[0]).toMatchObject({ data: INSTANCE });
+  });
+
+  it("names the predecessor type, never the current one", () => {
+    expect(service.type).toBe(SERVICE_TYPE);
+    expect(LEGACY_SERVICE_TYPES).toEqual(["_openmausbot._tcp"]);
+    expect(LEGACY_SERVICE_TYPES).not.toContain(SERVICE_TYPE);
   });
 
   it("matches names case-insensitively, as DNS does", () => {

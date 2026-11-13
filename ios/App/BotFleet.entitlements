@@ -2,10 +2,11 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>aps-environment</key>
+	<string>production</string>
 	<key>com.apple.developer.associated-domains</key>
 	<array>
 		<string>applinks:botfleet.app</string>
-		<string>applinks:agents.jays.services</string>
 		<string>webcredentials:botfleet.app</string>
 	</array>
 	<key>com.apple.developer.usernotifications.time-sensitive</key>
@@ -13,6 +14,10 @@
 	<key>com.apple.security.application-groups</key>
 	<array>
 		<string>group.app.botfleet</string>
+	</array>
+	<key>keychain-access-groups</key>
+	<array>
+		<string>$(AppIdentifierPrefix)group.app.botfleet</string>
 	</array>
 </dict>
 </plist>

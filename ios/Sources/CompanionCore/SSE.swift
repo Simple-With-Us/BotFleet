@@ -14,7 +14,7 @@ import OSLog
 
 /// Same subsystem the app's own stream logging uses, so a session reads as
 /// one story in Console rather than two halves under different names.
-private let log = Logger(subsystem: "com.openmausbot.companion", category: "stream")
+private let log = Logger(subsystem: "com.botfleet.companion", category: "stream")
 
 /// One event off the wire, before it is understood as a `Frame`.
 public struct SSEEvent: Equatable, Sendable {
@@ -96,12 +96,13 @@ public struct SSEParser: Sendable {
 /// or the consuming task is cancelled.
 public func eventStream(
     request: URLRequest,
-    session: URLSession = .shared
+    session: URLSession = .shared,
+    delegate: (any URLSessionTaskDelegate)? = nil
 ) -> AsyncThrowingStream<StreamFrame, Error> {
     AsyncThrowingStream { continuation in
         let task = Task {
             do {
-                let (bytes, response) = try await session.bytes(for: request)
+                let (bytes, response) = try await session.bytes(for: request, delegate: delegate)
                 if let http = response as? HTTPURLResponse, http.statusCode != 200 {
                     throw APIError.status(code: http.statusCode, message: nil)
                 }

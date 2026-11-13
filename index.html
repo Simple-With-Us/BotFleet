@@ -3,8 +3,39 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" type="image/png" href="/favicon-64.png" sizes="64x64" />
     <link rel="icon" type="image/svg+xml" href="/app-icon.svg" />
     <title>BotFleet</title>
+    <script>
+      // Keep in sync with resolveSkin() in src/lib/skins.ts.  First visit with
+      // nothing stored is System Auto (studio in light, midnight in dark).
+      (function () {
+        try {
+          var stored = localStorage.getItem("omb-skin") || "system";
+          var dark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+          var resolved = stored;
+          if (stored === "system") {
+            resolved = dark ? "midnight" : "studio";
+          } else if (stored === "user-auto") {
+            var pair = { light: "studio", dark: "midnight" };
+            try {
+              var parsed = JSON.parse(localStorage.getItem("omb-user-auto-pair") || "null");
+              if (parsed && typeof parsed.light === "string") pair.light = parsed.light;
+              if (parsed && typeof parsed.dark === "string") pair.dark = parsed.dark;
+            } catch (e) {}
+            var chosen = dark ? pair.dark : pair.light;
+            resolved =
+              chosen === "system" || chosen === "user-auto"
+                ? dark
+                  ? "midnight"
+                  : "studio"
+                : chosen;
+          }
+          document.documentElement.dataset.skin = resolved;
+          document.documentElement.dataset.skinMode = stored;
+        } catch (e) {}
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

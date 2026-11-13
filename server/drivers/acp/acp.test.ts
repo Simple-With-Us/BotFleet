@@ -6,24 +6,48 @@
 //
 // The fake CLI is a shebang script Windows cannot exec directly —
 // resolveCliSpawn turns it into `node <script>`, so these run everywhere.
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { z } from "zod";
 
 import { ensureDirs } from "../../config.ts";
-import type { ProviderInstance } from "../../contracts.ts";
+import type { ModelCatalog, ProviderInstance, RuntimeEvent } from "../../contracts.ts";
+import type { ContextInjectionRef } from "../../../shared/context-injection.ts";
 import { recordEvents, type EventRecorder } from "../../testing/events.ts";
-import { createAcpDriver, skipSubscriptionAuthForLocalInject, type AcpSupport } from "./core.ts";
+import { buildTurnContext } from "../../turn-context.ts";
+import { expectLaunchedAs, inheritHarnessIdentity, readEngineDump } from "../../testing/launch-identity.ts";
+import { MODEL_REJECTED_STOP_REASON } from "../../model-fallback.ts";
+import { classifyError } from "../retry.ts";
+import { createAcpDriver, isPoisonedSessionError, skipSubscriptionAuthForLocalInject, type AcpConfig, type AcpSupport } from "./core.ts";
+import {
+  ACP_PROMPT_SECTION_OMITTED,
+  acpPromptCeilingRefusal,
+  applyAcpPromptBudget,
+  describeAcpPromptTrim,
+} from "./prompt-budget.ts";
 import { GrokAgentDriver } from "./grok.ts";
-import { GeminiAgentDriver } from "./gemini.ts";
+import { DshAgentDriver } from "./dsh.ts";
 import { KimiAgentDriver } from "./kimi.ts";
 import { DroidAgentDriver } from "./droid.ts";
 import { CursorAgentDriver } from "./cursor.ts";
+import { McodeAgentDriver } from "./mcode.ts";
 import { removeTempDir } from "../../testing/cleanup.ts";
 
 const FAKE_CLI = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "testing", "fake-acp-cli.ts");
+
+/** One side-session prompt the fake CLI recorded: the session it went to and
+ *  the summarizer text it carried.  Strict, so a malformed dump line fails
+ *  the suite instead of bypassing the assertions that read it. */
+export const SidePromptSchema = z
+  .object({
+    sessionId: z.string().min(1).max(256),
+    text: z.string(),
+  })
+  .strict();
+export type SidePrompt = z.infer<typeof SidePromptSchema>;
 
 /** A harness that exists only in tests: it exercises the opt-in session-config
  *  model hook so PR 1 can prove the core capability without shipping a visible
@@ -63,6 +87,33 @@ const AsyncAuthDriver = createAcpDriver({
   isAuthenticated: async () => true,
 });
 
+const VersionGateDriver = createAcpDriver({
+  ...SELECT_MODEL_SUPPORT,
+  driverKind: "versionGateTest",
+  defaultCli: FAKE_CLI,
+  selectModel: undefined,
+  credentialEnv: ["DEEPSEEK_API_KEY", "BOX_TOKEN"],
+  versionCompatibilityReason: (version) => version.includes("2.0.0") ? null : "ACP 2.0.0 is required",
+});
+
+/** Proves the initialize flow never spawns the isAuthenticated probe for a
+ *  fail-open driver (authFailure: "continue", the Cursor shape): its result
+ *  can't change the outcome, so calling it — for every driver, every turn,
+ *  once the probe cache expires — was pure wasted latency. */
+let authProbeCalls = 0;
+const AuthProbeSupport: AcpSupport = {
+  ...SELECT_MODEL_SUPPORT,
+  driverKind: "authProbeTest",
+  selectModel: undefined,
+  pickAuthMethod: () => null,
+  authFailure: "continue",
+  isAuthenticated: () => {
+    authProbeCalls++;
+    return true;
+  },
+};
+const AuthProbeDriver = createAcpDriver(AuthProbeSupport);
+
 const ClassifiedErrorDriver = createAcpDriver({
   ...SELECT_MODEL_SUPPORT,
   driverKind: "classifiedErrorTest",
@@ -71,6 +122,39 @@ const ClassifiedErrorDriver = createAcpDriver({
     error && typeof error === "object" && (error as { code?: unknown }).code === -32000
       ? "invalid_credentials"
       : undefined,
+});
+
+/** Proves createAcpDriver overlays perModelEffortLevels onto the described
+ *  model catalog: a model in the map gets its entry as the option's
+ *  effortLevels (which the client prefers over the engine-wide list), an
+ *  option that already declares its own levels keeps them, and every other
+ *  model falls back to the driver-wide list. */
+const perModelEffortCatalog = {
+  default: "m-one",
+  options: [
+    { id: "m-one", label: "One" },
+    { id: "m-two", label: "Two", effortLevels: ["low"] as const },
+    { id: "m-three", label: "Three" },
+  ],
+} satisfies ModelCatalog;
+const PerModelEffortSupport: AcpSupport = {
+  ...SELECT_MODEL_SUPPORT,
+  driverKind: "perModelEffortTest",
+  effortLevels: ["low", "medium", "high"],
+  perModelEffortLevels: { "m-one": ["none", "high", "max"] },
+  models: perModelEffortCatalog,
+};
+const PerModelEffortDriver = createAcpDriver(PerModelEffortSupport);
+
+const PerModelImagesDriver = createAcpDriver({
+  ...SELECT_MODEL_SUPPORT,
+  driverKind: "perModelImagesTest",
+  models: { default: "flash", options: [
+    { id: "flash", label: "Flash" },
+    { id: "pro", label: "Pro", images: false },
+    { id: "custom", label: "Custom" },
+  ] },
+  perModelImages: { flash: true, pro: true },
 });
 
 describe("skipSubscriptionAuthForLocalInject", () => {
@@ -117,8 +201,8 @@ describe("ACP decodeConfig", () => {
   it("grok defaults to the grok binary", () => {
     expect(GrokAgentDriver.decodeConfig({})).toEqual({ cli: "grok", fullAuto: false, workspace: undefined });
   });
-  it("gemini defaults to the gemini binary", () => {
-    expect(GeminiAgentDriver.decodeConfig(undefined)).toEqual({ cli: "gemini", fullAuto: false, workspace: undefined });
+  it("dsh defaults to the dsh binary", () => {
+    expect(DshAgentDriver.decodeConfig(undefined)).toEqual({ cli: "dsh", fullAuto: false, workspace: undefined });
   });
   it("kimi defaults to the kimi binary and declares cross-platform setup", () => {
     expect(KimiAgentDriver.decodeConfig(undefined)).toEqual({ cli: "kimi", fullAuto: false, workspace: undefined });
@@ -156,7 +240,39 @@ describe("ACP decodeConfig", () => {
     expect(GrokAgentDriver.decodeConfig({ fullAuto: true }).fullAuto).toBe(true);
   });
 
-  it("does not advertise or accept local CUA in full-auto mode", async () => {
+  it("accepts a prompt byte budget and treats zero as disabled", () => {
+    expect(GrokAgentDriver.decodeConfig({ promptBudgetBytes: 0 }).promptBudgetBytes).toBe(0);
+    expect(GrokAgentDriver.decodeConfig({ promptBudgetBytes: 128 * 1024 }).promptBudgetBytes).toBe(128 * 1024);
+    expect(GrokAgentDriver.decodeConfig({ promptBudgetBytes: 1.5 }).promptBudgetBytes).toBeUndefined();
+    expect(GrokAgentDriver.decodeConfig({ promptBudgetBytes: -5 }).promptBudgetBytes).toBeUndefined();
+    expect("promptBudgetBytes" in GrokAgentDriver.decodeConfig({})).toBe(false);
+  });
+
+  it("accepts only bounded prompt deadlines", () => {
+    expect(GrokAgentDriver.decodeConfig({ promptTimeoutMs: 1_000 }).promptTimeoutMs).toBe(1_000);
+    expect(GrokAgentDriver.decodeConfig({ promptTimeoutMs: 20 * 60_000 }).promptTimeoutMs).toBe(20 * 60_000);
+    expect(GrokAgentDriver.decodeConfig({ promptTimeoutMs: 999 }).promptTimeoutMs).toBeUndefined();
+    expect(GrokAgentDriver.decodeConfig({ promptTimeoutMs: 1_000.5 }).promptTimeoutMs).toBeUndefined();
+    expect(GrokAgentDriver.decodeConfig({ promptTimeoutMs: 20 * 60_000 + 1 }).promptTimeoutMs).toBeUndefined();
+  });
+
+  it("accepts only bounded initialize deadlines", () => {
+    expect(GrokAgentDriver.decodeConfig({ initTimeoutMs: 1_000 }).initTimeoutMs).toBe(1_000);
+    expect(GrokAgentDriver.decodeConfig({ initTimeoutMs: 5 * 60_000 }).initTimeoutMs).toBe(5 * 60_000);
+    expect(GrokAgentDriver.decodeConfig({ initTimeoutMs: 999 }).initTimeoutMs).toBeUndefined();
+    expect(GrokAgentDriver.decodeConfig({ initTimeoutMs: 5 * 60_000 + 1 }).initTimeoutMs).toBeUndefined();
+    expect("initTimeoutMs" in GrokAgentDriver.decodeConfig({})).toBe(false);
+  });
+
+  it("accepts only bounded prompt idle deadlines", () => {
+    expect(GrokAgentDriver.decodeConfig({ promptIdleMs: 1_000 }).promptIdleMs).toBe(1_000);
+    expect(GrokAgentDriver.decodeConfig({ promptIdleMs: 20 * 60_000 }).promptIdleMs).toBe(20 * 60_000);
+    expect(GrokAgentDriver.decodeConfig({ promptIdleMs: 999 }).promptIdleMs).toBeUndefined();
+    expect(GrokAgentDriver.decodeConfig({ promptIdleMs: 1_000.5 }).promptIdleMs).toBeUndefined();
+    expect(GrokAgentDriver.decodeConfig({ promptIdleMs: 20 * 60_000 + 1 }).promptIdleMs).toBeUndefined();
+  });
+
+  it("advertises local CUA and qdrant in full-auto mode, because a host turn runs brokered", async () => {
     const fullAuto = await GrokAgentDriver.create({
       instanceId: "grok-full-auto",
       displayName: "Grok Full Auto",
@@ -164,24 +280,71 @@ describe("ACP decodeConfig", () => {
       enabled: true,
       config: { cli: FAKE_CLI, fullAuto: true },
     });
-    expect(fullAuto.adapter.capabilities.localComputerMcp).toBe(false);
-    await expect(
-      fullAuto.adapter.sendTurn({
-        threadId: "t-full-auto-local",
-        text: "click",
-        integrations: {
-          localComputer: {
-            command: "/cua-driver",
-            args: ["mcp"],
-            env: {},
-            platform: "linux",
-            scope: "local-computer",
-          },
-        },
-      }),
-    ).rejects.toThrow(/interactive provider approvals/);
+    expect(fullAuto.adapter.capabilities.localComputerMcp).toBe(true);
+    expect(fullAuto.adapter.capabilities.qdrantMcp).toBe(true);
     await fullAuto.dispose();
   });
+});
+
+
+/** A CLI whose `--version` answers while `ok` exists and otherwise dies the
+ *  way the test asks (`mode`: exit or crash).  Lets a test take an engine from
+ *  working to broken between two snapshots without any real engine. */
+function switchableCli(dir: string): { cli: string; setWorking: (working: boolean) => void; setMode: (mode: "exit" | "crash") => void } {
+  const cli = join(dir, "switchable-cli");
+  writeFileSync(
+    cli,
+    [
+      // A node-shebang script: env-path resolves it to `node <script>` on
+      // Windows, where a `#!/bin/sh` fixture cannot run at all.
+      "#!/usr/bin/env node",
+      'const fs = require("node:fs");',
+      `const dir = ${JSON.stringify(dir)};`,
+      'if (fs.existsSync(dir + "/ok")) { console.log("9.9.9"); process.exit(0); }',
+      'if (fs.readFileSync(dir + "/mode", "utf8") === "crash") process.kill(process.pid, "SIGSEGV");',
+      "process.exit(3)",
+      "",
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+  writeFileSync(join(dir, "mode"), "exit");
+  return {
+    cli,
+    setWorking: (working) => {
+      if (working) writeFileSync(join(dir, "ok"), "");
+      else rmSync(join(dir, "ok"), { force: true });
+    },
+    setMode: (mode) => writeFileSync(join(dir, "mode"), mode),
+  };
+}
+
+describe("ACP shared core version reuse", () => {
+  // A SIGSEGV crash has no Windows equivalent: POSIX only.
+  for (const mode of (process.platform === "win32" ? (["exit"] as const) : (["exit", "crash"] as const))) {
+    it(`does not keep reporting the last version once the binary ${mode === "crash" ? "crashes" : "fails"} definitively`, async () => {
+      const dir = mkdtempSync(join(tmpdir(), "omb-acp-switch-"));
+      const cli = switchableCli(dir);
+      const instance = await GrokAgentDriver.create({
+        instanceId: `acp-switch-${mode}`,
+        displayName: "ACP Switch",
+        environment: {},
+        enabled: true,
+        config: { cli: cli.cli, fullAuto: false },
+      });
+      cli.setWorking(true);
+      const first = await instance.snapshot();
+      expect(first.state).toBe("available");
+      expect(first.version).toBe("9.9.9");
+      cli.setWorking(false);
+      cli.setMode(mode);
+      const second = await instance.snapshot();
+      expect(second.state).toBe("unavailable");
+      expect(second.transient).toBeUndefined();
+      expect(second.version).toBeUndefined();
+      await instance.dispose();
+      rmSync(dir, { recursive: true, force: true });
+    });
+  }
 });
 
 describe("ACP turns (fake CLI)", () => {
@@ -189,14 +352,14 @@ describe("ACP turns (fake CLI)", () => {
   let recorder: EventRecorder;
   let scratch: string;
 
-  const create = async (driver = GrokAgentDriver, mode?: string) => {
+  const create = async (driver = GrokAgentDriver, mode?: string, config: Partial<AcpConfig> = {}) => {
     if (mode) process.env.FAKE_ACP_MODE = mode;
     instance = await driver.create({
       instanceId: "acp-test",
       displayName: "ACP Test",
       environment: {},
       enabled: true,
-      config: { cli: FAKE_CLI, fullAuto: false },
+      config: { cli: FAKE_CLI, fullAuto: false, ...config },
     });
     recorder = recordEvents(instance.adapter);
   };
@@ -210,6 +373,10 @@ describe("ACP turns (fake CLI)", () => {
   afterEach(async () => {
     delete process.env.FAKE_ACP_MODE;
     delete process.env.FAKE_ACP_DUMP;
+    delete process.env.FAKE_ACP_RPC_DUMP;
+    delete process.env.FAKE_ACP_RPC_APPEND_FILE;
+    delete process.env.FAKE_ACP_EXIT_GATE;
+    delete process.env.FAKE_ACP_DESCENDANT_PID;
     delete process.env.XAI_API_KEY;
     delete process.env.OPENCODE_API_KEY;
     delete process.env.CURSOR_API_KEY;
@@ -217,8 +384,27 @@ describe("ACP turns (fake CLI)", () => {
     delete process.env.BOX_TOKEN;
     delete process.env.OMB_TTS_KEY;
     delete process.env.FAKE_ACP_MODELS;
+    delete process.env.FAKE_ACP_SESSION_MODELS;
     delete process.env.FAKE_ACP_MODEL_STICKS;
+    delete process.env.FAKE_ACP_CONFIG_REPLY_BARE;
     delete process.env.FAKE_ACP_USAGE_ROOT;
+    delete process.env.FAKE_ACP_CACHE_READ;
+    delete process.env.FAKE_ACP_COST;
+    delete process.env.FAKE_ACP_TERMINAL_STATUS;
+    delete process.env.FAKE_ACP_TRANSIENTS;
+    delete process.env.FAKE_ACP_PARTIAL_FAILS;
+    delete process.env.FAKE_ACP_FAIL_AT_PROMPT;
+    delete process.env.FAKE_ACP_LATE_INPUT_AT;
+    delete process.env.FAKE_ACP_STATE;
+    delete process.env.FAKE_ACP_RETRY_SCALE;
+    delete process.env.FAKE_ACP_INIT_DELAY_MS;
+    delete process.env.FAKE_ACP_DRIP_MS;
+    delete process.env.FAKE_ACP_DRIP_COUNT;
+    delete process.env.FAKE_ACP_MULTI_SESSION;
+    delete process.env.FAKE_ACP_SIDE_REPLY;
+    delete process.env.FAKE_ACP_SIDE_DUMP;
+    delete process.env.FAKE_ACP_SIDE_FAIL;
+    delete process.env.FAKE_ACP_GATE_FILE;
     recorder?.stop();
     await instance?.dispose();
     await removeTempDir(scratch);
@@ -248,6 +434,907 @@ describe("ACP turns (fake CLI)", () => {
     const done = recorder.events.at(-1)!;
     expect(done).toMatchObject({ type: "turn.completed", ok: true });
     expect(instance.adapter.hasSession("t-happy")).toBe(false);
+  });
+
+  it("sends a budgeted prompt: oldest volatile section becomes the one-line marker", async () => {
+    await create(GrokAgentDriver, "echo-gated", { promptBudgetBytes: 512 });
+    const stable = "STABLE-BLOCK";
+    const volOld = `VOLATILE-OLD ${"alpha ".repeat(400)}`;
+    const volNew = "VOLATILE-NEW kept";
+    const current = "CURRENT USER MESSAGE";
+    const compressed: ContextInjectionRef[] = [];
+    await instance.adapter.sendTurn({
+      threadId: "t-budget",
+      text: current,
+      onContextCompressed: (ref) => void compressed.push(ref),
+      system: stable + volOld + volNew,
+      systemSections: [
+        { id: "persona", text: stable, volatile: false },
+        { id: "memory", text: volOld, volatile: true },
+        { id: "mentions", text: volNew, volatile: true },
+      ],
+    });
+    await recorder.until((event) => event.type === "turn.completed");
+    const echoed = recorder.events.find((event) => event.type === "item.completed" && event.itemType === "assistant_text");
+    expect(echoed && echoed.type === "item.completed" ? echoed.text : "").toContain(`echo: ${stable}${ACP_PROMPT_SECTION_OMITTED}${volNew}\n\n${current}`);
+
+    const row = recorder.events.find((event) => event.type === "context.injected" && event.source === "compression");
+    expect(row).toMatchObject({ type: "context.injected", source: "compression", turnId: expect.any(String), itemId: expect.stringMatching(/^ctx-/) });
+    if (row?.type === "context.injected") {
+      expect(row.preview).toContain("memory");
+      expect(row.bytes).toBeGreaterThan(0);
+      expect(row.io?.text?.text).toContain("Sections dropped: memory");
+      expect(JSON.stringify(row)).not.toContain("alpha");
+      // the harness hears the same row, once, so it can hang it under the
+      // message that started THIS turn
+      expect(compressed).toEqual([{ id: row.itemId, source: "compression", preview: row.preview, bytes: row.bytes }]);
+    }
+  });
+
+  // A system prompt whose oldest volatile section the budget can drop.  The
+  // sections concatenate to the system text exactly, which the budget requires.
+  const BUDGET_STABLE = "STABLE-BLOCK";
+  const BUDGET_OLD = `VOLATILE-OLD ${"alpha ".repeat(400)}`;
+  const BUDGET_NEW = "VOLATILE-NEW kept";
+  const BUDGET_SYSTEM = BUDGET_STABLE + BUDGET_OLD + BUDGET_NEW;
+  const BUDGET_SECTIONS = [
+    { id: "persona", text: BUDGET_STABLE, volatile: false },
+    { id: "memory", text: BUDGET_OLD, volatile: true },
+    { id: "mentions", text: BUDGET_NEW, volatile: true },
+  ];
+
+  // A relaunch after a transient failure builds the same prompt again, and the
+  // trim row for the turn must not be published a second time.
+  it("announces the trim once when the turn is relaunched after a transient failure", async () => {
+    process.env.FAKE_ACP_TRANSIENTS = "1";
+    process.env.FAKE_ACP_FAIL_AT_PROMPT = "1";
+    process.env.FAKE_ACP_STATE = join(scratch, "acp-launches-budget-retry");
+    process.env.FAKE_ACP_RETRY_SCALE = "0.001";
+    await create(GrokAgentDriver, "echo-gated", { promptBudgetBytes: 512 });
+    const compressed: ContextInjectionRef[] = [];
+    await instance.adapter.sendTurn({
+      threadId: "t-budget-retry",
+      text: "CURRENT USER MESSAGE",
+      onContextCompressed: (ref) => void compressed.push(ref),
+      system: BUDGET_SYSTEM,
+      systemSections: BUDGET_SECTIONS,
+    });
+
+    await recorder.until((e) => e.type === "turn.completed" && e.ok === true, 25_000);
+    expect(recorder.events.filter((e) => e.type === "turn.retrying")).toHaveLength(1);
+    // the prompt was built on both attempts, but the row is the turn's, once
+    const rows = recorder.events.filter((e) => e.type === "context.injected" && e.source === "compression");
+    expect(rows).toHaveLength(1);
+    expect(compressed).toHaveLength(1);
+  }, 40_000);
+
+  it("refuses an over-ceiling turn without also announcing a trim it did not send", async () => {
+    const dump = join(scratch, "ceiling-trim-rpc.json");
+    process.env.FAKE_ACP_RPC_DUMP = dump;
+    await create(GrokAgentDriver, "echo-gated", { promptBudgetBytes: 512 });
+    const compressed: ContextInjectionRef[] = [];
+    // The memory section is droppable, so the budget does cut; the message
+    // itself is past twice the budget, so the turn is refused anyway.
+    const huge = `HUGE ${"z".repeat(2000)}`;
+    const budgeted = applyAcpPromptBudget({
+      composed: `${BUDGET_SYSTEM}\n\n${huge}`,
+      sections: BUDGET_SECTIONS,
+      userText: huge,
+      budgetBytes: 512,
+    });
+    // the precondition: this input trims AND is still over the ceiling
+    expect(describeAcpPromptTrim(budgeted, 512)).not.toBeNull();
+    expect(acpPromptCeilingRefusal(budgeted.text, 512)).not.toBeNull();
+    await instance.adapter.sendTurn({
+      threadId: "t-ceiling-trim",
+      text: huge,
+      onContextCompressed: (ref) => void compressed.push(ref),
+      system: BUDGET_SYSTEM,
+      systemSections: BUDGET_SECTIONS,
+    });
+    const done = await recorder.until((event) => event.type === "turn.completed");
+    expect(done).toMatchObject({ ok: false, stopReason: "prompt_too_large" });
+    expect(recorder.events.some((event) => event.type === "runtime.error")).toBe(true);
+    expect(recorder.events.some((event) => event.type === "context.injected")).toBe(false);
+    expect(compressed).toHaveLength(0);
+    const methods = JSON.parse(readFileSync(dump, "utf8")) as string[];
+    expect(methods).not.toContain("session/prompt");
+  });
+
+  it("refuses a turn whose untrimmable text is over the hard ceiling, with a visible error", async () => {
+    const dump = join(scratch, "ceiling-rpc.json");
+    process.env.FAKE_ACP_RPC_DUMP = dump;
+    await create(GrokAgentDriver, "echo-gated", { promptBudgetBytes: 512 });
+    await instance.adapter.sendTurn({ threadId: "t-ceiling", text: `HUGE ${"z".repeat(2000)}`, system: "SYS" });
+    const done = await recorder.until((event) => event.type === "turn.completed");
+    expect(done).toMatchObject({ ok: false, stopReason: "prompt_too_large" });
+    const error = recorder.events.find((event) => event.type === "runtime.error");
+    expect(error?.type === "runtime.error" ? error.message : "").toMatch(/was not sent.*hard limit/);
+    expect(JSON.stringify(error)).not.toContain("zzzz");
+    const methods = JSON.parse(readFileSync(dump, "utf8")) as string[];
+    expect(methods).not.toContain("session/prompt");
+  });
+
+  it("derives the prompt budget from contextCapTokens when no byte budget is set", async () => {
+    expect(GrokAgentDriver.decodeConfig({ contextCapTokens: 524288 }).contextCapTokens).toBe(524288);
+    expect(GrokAgentDriver.decodeConfig({ contextCapTokens: "big" }).contextCapTokens).toBeUndefined();
+    await create(GrokAgentDriver, "echo-gated", { contextCapTokens: 100 });
+    await instance.adapter.sendTurn({
+      threadId: "t-cap",
+      text: "CURRENT",
+      system: `STABLE${"s ".repeat(40)}MENT ${"n ".repeat(500)}`,
+      systemSections: [
+        { id: "persona", text: `STABLE${"s ".repeat(40)}`, volatile: false },
+        { id: "mentions", text: `MENT ${"n ".repeat(500)}`, volatile: true },
+      ],
+    });
+    await recorder.until((event) => event.type === "turn.completed");
+    const row = recorder.events.find((event) => event.type === "context.injected" && event.source === "compression");
+    expect(row).toBeDefined();
+  });
+
+  it("a turn's contextCapTokens overrides the driver config", async () => {
+    await create(GrokAgentDriver, "echo-gated", { contextCapTokens: 10_000_000 });
+    await instance.adapter.sendTurn({
+      threadId: "t-turn-cap",
+      text: "CURRENT",
+      contextCapTokens: 100,
+      system: `STABLE${"s ".repeat(40)}MENT ${"n ".repeat(500)}`,
+      systemSections: [
+        { id: "persona", text: `STABLE${"s ".repeat(40)}`, volatile: false },
+        { id: "mentions", text: `MENT ${"n ".repeat(500)}`, volatile: true },
+      ],
+    });
+    await recorder.until((event) => event.type === "turn.completed");
+    expect(recorder.events.find((event) => event.type === "context.injected" && event.source === "compression")).toBeDefined();
+  });
+
+  it("emits no Compressing Context row when the prompt fits", async () => {
+    await create(GrokAgentDriver, "echo-gated", { promptBudgetBytes: 0 });
+    await instance.adapter.sendTurn({ threadId: "t-fits", text: "hi", system: "SYS" });
+    await recorder.until((event) => event.type === "turn.completed");
+    expect(recorder.events.some((event) => event.type === "context.injected")).toBe(false);
+  });
+
+  // --- Model-written rolling summary for dropped history (per-bot toggle) ---
+  // Six one-line pieces of replayed history;  maxHistoryTurns keeps the
+  // newest two, so four drop — no byte math involved, the count cap drives.
+  const SUMMARY_TRANSCRIPT: Array<{ role: "user" | "assistant"; text: string }> = [
+    { role: "user", text: "TURN1A my dog is named Biscuit" },
+    { role: "assistant", text: "TURN1B noted, Biscuit" },
+    { role: "user", text: "TURN2A my cat is named Mochi" },
+    { role: "assistant", text: "TURN2B noted, Mochi" },
+    { role: "user", text: "TURN3A my bird is named Kiwi" },
+    { role: "assistant", text: "TURN3B noted, Kiwi" },
+  ];
+  const TURN4_PAIR: Array<{ role: "user" | "assistant"; text: string }> = [
+    { role: "user", text: "TURN4A my fish is named Bubbles" },
+    { role: "assistant", text: "TURN4B noted, Bubbles" },
+  ];
+  const replayText = (current: string, transcript: Array<{ role: "user" | "assistant"; text: string }> = SUMMARY_TRANSCRIPT) =>
+    buildTurnContext({ text: current, transcript, rewound: false, fresh: true, replaysNatively: false }).turnText;
+  // SAFETY: recorder events are typed RuntimeEvents;  the predicate narrows
+  // to compression injections so itemId/preview/io stay checked.
+  const compressionRows = () =>
+    recorder.events.filter(
+      (e): e is Extract<RuntimeEvent, { type: "context.injected" }> =>
+        e.type === "context.injected" && "source" in e && e.source === "compression",
+    );
+  // SAFETY: same narrowing for transcript text the fake CLI echoed back.
+  const echoedPrompts = () =>
+    recorder.events
+      .filter(
+        (e): e is Extract<RuntimeEvent, { type: "item.completed"; itemType: "assistant_text" }> =>
+          e.type === "item.completed" && "itemType" in e && e.itemType === "assistant_text",
+      )
+      .map((e) => e.text);
+  // SAFETY: the side dump is written by the fake CLI in this suite, one
+  // { sessionId, text } JSON object per line — each line is parsed against
+  // the strict contract below, so a malformed record fails the test instead
+  // of slipping through an assertion.
+  const readSidePrompts = (path: string): SidePrompt[] =>
+    readFileSync(path, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => SidePromptSchema.parse(JSON.parse(line)));
+
+  it("runs the model-written summary behind a pending row that resolves in place", async () => {
+    const gate = join(scratch, "summary-gate");
+    const sideDump = join(scratch, "summary-side.jsonl");
+    process.env.FAKE_ACP_MULTI_SESSION = "1";
+    process.env.FAKE_ACP_SIDE_REPLY = "SUMMARY-BRIEF: Biscuit the dog and Mochi the cat.";
+    process.env.FAKE_ACP_SIDE_DUMP = sideDump;
+    process.env.FAKE_ACP_GATE_FILE = gate;
+    await create(GrokAgentDriver, "echo-gated");
+    const compressed: ContextInjectionRef[] = [];
+    const sent = instance.adapter.sendTurn({
+      threadId: "t-summary",
+      text: replayText("what are my pets called?"),
+      historySummaryModel: true,
+      maxHistoryTurns: 2,
+      system: "SYS-PERSONA",
+      onContextCompressed: (ref) => void compressed.push(ref),
+    });
+    // The gate holds the side session's prompt open: while the model is
+    // still writing, the row must already be up, pending.  The whole event
+    // is parsed against the compression-row contract;  preview and io come
+    // only from the validated result, never from a cast.
+    const pendingRowSchema = z
+      .object({
+        type: z.literal("context.injected"),
+        preview: z.string(),
+        io: z.object({ text: z.object({ text: z.string() }).optional() }).optional(),
+      })
+      .catchall(z.unknown());
+    const pending = pendingRowSchema.parse(
+      await recorder.until((e) => {
+        const parsed = pendingRowSchema.safeParse(e);
+        return parsed.success && parsed.data.preview.includes("summarizing 4 earlier turns");
+      }),
+    );
+    expect(pending.io?.text?.text).toContain("The model is writing a summary");
+    expect(echoedPrompts()).toHaveLength(0);
+    writeFileSync(gate, "go");
+    await sent;
+    await recorder.until((e) => e.type === "turn.completed");
+
+    const rows = compressionRows();
+    expect(rows).toHaveLength(2);
+    expect(rows[0].itemId).toBe(rows[1].itemId); // resolves in place
+    expect(rows[1].preview).toContain("4 earlier turns, 4 summarized");
+    expect(rows[1].io?.text?.text).toContain("a summary the model wrote");
+    expect(compressed).toHaveLength(2);
+    expect(compressed[0].id).toBe(compressed[1].id);
+
+    const text = echoedPrompts().at(-1)!;
+    expect(text).toContain("[4 earlier turns summarized to fit the prompt budget.  SUMMARY-BRIEF: Biscuit the dog and Mochi the cat.]");
+    for (const dropped of ["TURN1A", "TURN1B", "TURN2A", "TURN2B"]) expect(text).not.toContain(dropped);
+    for (const kept of ["TURN3A", "TURN3B", "what are my pets called?"]) expect(text).toContain(kept);
+
+    const side = readSidePrompts(sideDump);
+    expect(side).toHaveLength(1);
+    expect(side[0].sessionId).toBe("fake-acp-session-2");
+    expect(side[0].text).toContain("compressing omitted conversation history");
+    for (const dropped of ["TURN1A", "TURN1B", "TURN2A", "TURN2B"]) expect(side[0].text).toContain(dropped);
+    expect(side[0].text).not.toContain("TURN3A");
+    // the side session's reply never became a transcript item
+    expect(echoedPrompts()).toHaveLength(1);
+  });
+
+  it("falls back to an extractive note when the summary side session fails", async () => {
+    process.env.FAKE_ACP_MULTI_SESSION = "1";
+    process.env.FAKE_ACP_SIDE_FAIL = "new";
+    await create(GrokAgentDriver, "echo-gated");
+    await instance.adapter.sendTurn({
+      threadId: "t-summary-fallback",
+      text: replayText("what are my pets called?"),
+      historySummaryModel: true,
+      maxHistoryTurns: 2,
+      system: "SYS-PERSONA",
+    });
+    const done = await recorder.until((e) => e.type === "turn.completed");
+    expect(done).toMatchObject({ ok: true });
+    const rows = compressionRows();
+    expect(rows).toHaveLength(2); // pending, then the fallback's final
+    expect(rows[0].itemId).toBe(rows[1].itemId);
+    expect(rows[1].preview).toContain("4 earlier turns, 4 summarized");
+    expect(rows[1].io?.text?.text).toContain("one excerpt line each");
+    const text = echoedPrompts().at(-1)!;
+    expect(text).toContain("[4 earlier turns omitted to fit the prompt budget.");
+    expect(text).toContain("TURN1A"); // a dropped turn's excerpt line
+    expect(text).toContain("TURN3A"); // the kept newest turns
+    expect(text).not.toContain("SUMMARY-BRIEF");
+  });
+
+  it("rolls the cached summary forward as more turns drop, and reuses it when the same turns drop again", async () => {
+    const sideDump = join(scratch, "rolling-side.jsonl");
+    process.env.FAKE_ACP_MULTI_SESSION = "1";
+    process.env.FAKE_ACP_SIDE_REPLY = "ROLLING-BRIEF";
+    process.env.FAKE_ACP_SIDE_DUMP = sideDump;
+    await create(GrokAgentDriver, "echo-gated");
+    const send = async (transcript: Array<{ role: "user" | "assistant"; text: string }>, current: string) => {
+      const { turnId } = await instance.adapter.sendTurn({
+        threadId: "t-rolling",
+        text: replayText(current, transcript),
+        historySummaryModel: true,
+        maxHistoryTurns: 2,
+        system: "SYS-PERSONA",
+      });
+      await recorder.until((e) => e.type === "turn.completed" && e.turnId === turnId);
+    };
+    await send(SUMMARY_TRANSCRIPT, "first question");
+    await send([...SUMMARY_TRANSCRIPT, ...TURN4_PAIR], "second question");
+    await send([...SUMMARY_TRANSCRIPT, ...TURN4_PAIR], "second question");
+
+    const side = readSidePrompts(sideDump);
+    // Two side prompts, not three: the identical third turn reuses the cache.
+    expect(side).toHaveLength(2);
+    expect(side[0].text).not.toContain("Summary so far");
+    expect(side[0].text).toContain("TURN1A");
+    // Turn two sends only the newly dropped turns, plus the summary so far.
+    expect(side[1].text).toContain("Summary so far");
+    expect(side[1].text).toContain("ROLLING-BRIEF");
+    expect(side[1].text).toContain("TURN3A");
+    expect(side[1].text).toContain("TURN3B");
+    expect(side[1].text).not.toContain("TURN1A");
+    expect(side[1].text).not.toContain("TURN2A");
+    // The note grows with the drops and the reused note ships verbatim.
+    expect(echoedPrompts()[1]).toContain("[6 earlier turns summarized to fit the prompt budget.  ROLLING-BRIEF]");
+    expect(echoedPrompts()[2]).toContain("[6 earlier turns summarized to fit the prompt budget.  ROLLING-BRIEF]");
+  });
+
+  it("resolves the pending row in place when a transient relaunch re-runs the summary", async () => {
+    process.env.FAKE_ACP_MULTI_SESSION = "1";
+    process.env.FAKE_ACP_SIDE_REPLY = "BRIEF-AFTER-RETRY";
+    process.env.FAKE_ACP_TRANSIENTS = "1";
+    process.env.FAKE_ACP_FAIL_AT_PROMPT = "1";
+    process.env.FAKE_ACP_STATE = join(scratch, "acp-retry-state");
+    process.env.FAKE_ACP_RETRY_SCALE = "0.001";
+    await create(GrokAgentDriver, "echo-gated");
+    await instance.adapter.sendTurn({
+      threadId: "t-summary-retry",
+      text: replayText("what are my pets called?"),
+      historySummaryModel: true,
+      maxHistoryTurns: 2,
+      system: "SYS-PERSONA",
+    });
+    // SAFETY: turn.completed carries ok on the contract;  narrow to it.
+    const done = await recorder.until(
+      (e): e is Extract<RuntimeEvent, { type: "turn.completed" }> => e.type === "turn.completed" && "ok" in e && e.ok === true,
+      30_000,
+    );
+    expect(done).toMatchObject({ ok: true });
+    expect(recorder.events.filter((e) => e.type === "turn.retrying")).toHaveLength(1);
+    // Pending, the crashed attempt's extractive final, then the relaunch's
+    // model-written final: one row, updated in place each time.
+    const rows = compressionRows();
+    expect(rows).toHaveLength(3);
+    expect(new Set(rows.map((row) => row.itemId)).size).toBe(1);
+    expect(rows[0].preview).toContain("summarizing 4 earlier turns");
+    expect(rows[1].io?.text?.text).toContain("one excerpt line each");
+    expect(rows[2].io?.text?.text).toContain("a summary the model wrote");
+    expect(echoedPrompts().at(-1)).toContain("BRIEF-AFTER-RETRY");
+  }, 40_000);
+
+  it("does not re-announce an identical extractive row when a relaunch re-derives it", async () => {
+    process.env.FAKE_ACP_MULTI_SESSION = "1";
+    process.env.FAKE_ACP_SIDE_FAIL = "new";
+    process.env.FAKE_ACP_TRANSIENTS = "1";
+    process.env.FAKE_ACP_FAIL_AT_PROMPT = "1";
+    process.env.FAKE_ACP_STATE = join(scratch, "acp-dedupe-state");
+    process.env.FAKE_ACP_RETRY_SCALE = "0.001";
+    await create(GrokAgentDriver, "echo-gated");
+    await instance.adapter.sendTurn({
+      threadId: "t-summary-dedupe",
+      text: replayText("what are my pets called?"),
+      historySummaryModel: true,
+      maxHistoryTurns: 2,
+      system: "SYS-PERSONA",
+    });
+    await recorder.until((e) => e.type === "turn.completed" && e.turnId !== undefined);
+    expect(recorder.events.filter((e) => e.type === "turn.retrying")).toHaveLength(1);
+    // Pending, then one extractive final: the relaunch derives the same
+    // deterministic note and must not publish the row a second time.  The
+    // stable itemId would make a real update an in-place replace;  an
+    // identical reading is not an update.
+    const rows = compressionRows();
+    expect(rows).toHaveLength(2);
+    expect(new Set(rows.map((row) => row.itemId)).size).toBe(1);
+    expect(rows[0].preview).toContain("summarizing 4 earlier turns");
+    expect(rows[1].preview).toContain("4 earlier turns, 4 summarized");
+    expect(rows[1].io?.text?.text).toContain("one excerpt line each");
+  }, 40_000);
+
+  it("fails closed when a saved ACP session cannot be resumed", async () => {
+    const dump = join(scratch, "resume-rpc.json");
+    process.env.FAKE_ACP_RPC_DUMP = dump;
+    await create(GrokAgentDriver, "resume-fails");
+
+    await instance.adapter.sendTurn({
+      threadId: "t-resume-failed",
+      text: "continue",
+      resumeCursor: "missing-native-session",
+    });
+    const done = await recorder.until((event) => event.type === "turn.completed");
+
+    expect(done).toMatchObject({ ok: false, stopReason: "resume_failed" });
+    expect(recorder.events.filter((event) => event.type === "turn.completed")).toHaveLength(1);
+    expect(recorder.events.filter((event) => event.type === "runtime.error")).toHaveLength(1);
+    expect(recorder.events.find((event) => event.type === "runtime.error")?.message).toMatch(
+      /saved ACP session could not be resumed/i,
+    );
+    expect(recorder.events.some((event) => event.type === "session.started")).toBe(false);
+    const methods = JSON.parse(readFileSync(dump, "utf8")) as string[];
+    expect(methods).toContain("session/load");
+    expect(methods).not.toContain("session/new");
+    expect(methods).not.toContain("session/prompt");
+  });
+
+  it("falls back to a fresh session when the saved session is poisoned (BF-2447)", async () => {
+    const dump = join(scratch, "resume-poisoned-rpc.json");
+    process.env.FAKE_ACP_RPC_DUMP = dump;
+    await create(GrokAgentDriver, "resume-poisoned");
+
+    await instance.adapter.sendTurn({
+      threadId: "t-resume-poisoned",
+      text: "continue",
+      resumeCursor: "wedged-native-session",
+    });
+    const done = await recorder.until((event) => event.type === "turn.completed");
+
+    expect(done).toMatchObject({ ok: true });
+    expect(recorder.events.some((event) => event.type === "session.started")).toBe(true);
+    const notice = recorder.events.find((event) => event.type === "runtime.notice");
+    expect(notice?.message).toMatch(/unfinished turn/i);
+    expect(notice?.message).toMatch(/discarded/i);
+    const methods: string[] = JSON.parse(readFileSync(dump, "utf8"));
+    expect(methods).toContain("session/load");
+    expect(methods).toContain("session/new");
+    expect(methods).toContain("session/prompt");
+  });
+
+  it("a relaunch after a poisoned-session recovery resends the replayed context (BF-2447)", async () => {
+    // The dump file is per-launch (each child overwrites it), so the
+    // cross-launch method counts below come from the append file instead.
+    const appended = join(scratch, "resume-poisoned-retry-rpc.jsonl");
+    process.env.FAKE_ACP_RPC_APPEND_FILE = appended;
+    // One launch dies at session/prompt, after the recovery already rebuilt
+    // the prompt: the relaunch must skip the doomed session/load but still
+    // send the replay, not the bare turn text.
+    process.env.FAKE_ACP_TRANSIENTS = "1";
+    process.env.FAKE_ACP_FAIL_AT_PROMPT = "1";
+    process.env.FAKE_ACP_STATE = join(scratch, "acp-launches-poisoned");
+    process.env.FAKE_ACP_RETRY_SCALE = "0.001";
+    await create(GrokAgentDriver, "resume-poisoned");
+
+    let recovered = 0;
+    await instance.adapter.sendTurn({
+      threadId: "t-resume-poisoned-retry",
+      text: "continue",
+      resumeCursor: "wedged-native-session",
+      recoveryText: "REPLAYED CONVERSATION SO FAR\n\ncontinue",
+      onReplayRecovered: () => {
+        recovered += 1;
+      },
+    });
+    const done = await recorder.until((event) => event.type === "turn.completed", 25_000);
+
+    expect(done).toMatchObject({ ok: true });
+    // The replay reached the prompt on both attempts: once before the prompt
+    // died, once on the relaunch that skipped the doomed session/load.
+    expect(recovered).toBe(2);
+    expect(recorder.events.filter((event) => event.type === "turn.retrying")).toHaveLength(1);
+    // SAFETY: every line was written by the fake CLI's recordMethod as { pid, method, cwd }.
+    const methods: string[] = readFileSync(appended, "utf8")
+      .split("\n")
+      .filter((line) => line.length > 0)
+      .map((line) => (JSON.parse(line) as { method: string }).method);
+    expect(methods.filter((method) => method === "session/load")).toHaveLength(1);
+    expect(methods.filter((method) => method === "session/new")).toHaveLength(2);
+  }, 40_000);
+
+  it("a second poisoned session on the same thread still announces its own discard (BF-2447)", async () => {
+    await create(GrokAgentDriver, "resume-poisoned");
+
+    await instance.adapter.sendTurn({
+      threadId: "t-resume-poisoned-twice",
+      text: "continue",
+      resumeCursor: "wedged-native-session",
+    });
+    await recorder.until((event) => event.type === "turn.completed");
+    await instance.adapter.sendTurn({
+      threadId: "t-resume-poisoned-twice",
+      text: "and more",
+      resumeCursor: "wedged-again-session",
+    });
+    await vi.waitFor(
+      () => {
+        expect(recorder.events.filter((event) => event.type === "turn.completed")).toHaveLength(2);
+      },
+      { timeout: 25_000 },
+    );
+
+    // One notice per discarded session: keyed by cursor, not by message
+    // text, so the second wedged session is not silenced by the first.
+    const notices = recorder.events.filter((event) => event.type === "runtime.notice");
+    expect(notices).toHaveLength(2);
+  });
+
+  it("classifies only the wedged-session rejection as poisoned (BF-2447)", () => {
+    expect(isPoisonedSessionError(new Error("The saved Muse session has an unfinished turn or pending input"))).toBe(true);
+    expect(isPoisonedSessionError(new Error("session has pending input"))).toBe(true);
+    expect(isPoisonedSessionError(new Error("resume failed", { cause: new Error("unfinished turn") }))).toBe(true);
+    expect(isPoisonedSessionError(new Error("saved session is gone"))).toBe(false);
+    expect(isPoisonedSessionError(new Error("authentication required"))).toBe(false);
+    expect(isPoisonedSessionError(null)).toBe(false);
+    expect(isPoisonedSessionError(undefined)).toBe(false);
+  });
+
+  it("classifies authentication rejected during ACP resume as setup", async () => {
+    await create(ClassifiedErrorDriver, "resume-auth");
+
+    await instance.adapter.sendTurn({
+      threadId: "t-resume-auth",
+      text: "continue",
+      resumeCursor: "saved-session",
+    });
+    const error = await recorder.until((event) => event.type === "runtime.error");
+    const done = await recorder.until((event) => event.type === "turn.completed");
+
+    expect(error).toMatchObject({
+      setup: true,
+      message: expect.stringMatching(/authentication required/),
+    });
+    expect(done).toMatchObject({ ok: false, stopReason: "auth_required" });
+    expect(recorder.events.some((event) => event.type === "session.started")).toBe(false);
+  });
+
+  it.skipIf(process.platform === "win32")("cancels and kills a prompt that exceeds its configured deadline", async () => {
+    const dump = join(scratch, "deadline-rpc.json");
+    const exitGate = join(scratch, "allow-exit");
+    process.env.FAKE_ACP_RPC_DUMP = dump;
+    process.env.FAKE_ACP_EXIT_GATE = exitGate;
+    await create(GrokAgentDriver, "hang-exit-gated", { promptTimeoutMs: 1_000 });
+
+    await instance.adapter.sendTurn({ threadId: "t-deadline", text: "never finishes" });
+    await vi.waitFor(() => {
+      expect(JSON.parse(readFileSync(dump, "utf8"))).toEqual(
+        expect.arrayContaining(["session/prompt", "session/cancel", "process.sigterm"]),
+      );
+    }, { timeout: 3_000 });
+    expect(instance.adapter.hasSession("t-deadline")).toBe(true);
+    expect(recorder.events.some((event) => event.type === "turn.completed")).toBe(false);
+    writeFileSync(exitGate, "exit\n");
+    const done = await recorder.until((event) => event.type === "turn.completed", 3_000);
+
+    expect(done).toMatchObject({ ok: false, stopReason: "prompt_timeout" });
+    expect(recorder.events.filter((event) => event.type === "turn.completed")).toHaveLength(1);
+    expect(recorder.events.filter((event) => event.type === "runtime.error")).toHaveLength(1);
+    expect(recorder.events.find((event) => event.type === "runtime.error")?.message).toMatch(
+      /session\/prompt timed out/i,
+    );
+    expect(instance.adapter.hasSession("t-deadline")).toBe(false);
+  });
+
+  it("reports a prompt timeout when cancellation makes the child exit immediately", async () => {
+    await create(GrokAgentDriver, "cancel-exits", { promptTimeoutMs: 1_000 });
+
+    await instance.adapter.sendTurn({ threadId: "t-cancel-exits", text: "never finishes" });
+    const done = await recorder.until((event) => event.type === "turn.completed", 3_000);
+
+    expect(done).toMatchObject({ ok: false, stopReason: "prompt_timeout" });
+    expect(recorder.events.filter((event) => event.type === "turn.completed")).toHaveLength(1);
+    expect(recorder.events.filter((event) => event.type === "runtime.error")).toHaveLength(1);
+    expect(instance.adapter.hasSession("t-cancel-exits")).toBe(false);
+  });
+
+  it("kills an MCP descendant after a timed-out prompt", async () => {
+    const descendantPidFile = join(scratch, "descendant.pid");
+    process.env.FAKE_ACP_DESCENDANT_PID = descendantPidFile;
+    await create(GrokAgentDriver, "cancel-exits-with-child", { promptTimeoutMs: 1_000 });
+    await instance.adapter.sendTurn({ threadId: "t-cancel-child", text: "never finishes" });
+    await vi.waitFor(() => {
+      expect(() => readFileSync(descendantPidFile, "utf8")).not.toThrow();
+    }, { timeout: 5_000 });
+    const descendantPid = Number(readFileSync(descendantPidFile, "utf8"));
+
+    try {
+      const done = await recorder.until((event) => event.type === "turn.completed", 3_000);
+      expect(done).toMatchObject({ ok: false, stopReason: "prompt_timeout" });
+
+      await vi.waitFor(() => {
+        expect(() => process.kill(descendantPid, 0)).toThrow();
+      }, { timeout: 4_000 });
+    } finally {
+      try {
+        process.kill(descendantPid, "SIGKILL");
+      } catch {
+        // expected once the deadline cleanup has reaped it
+      }
+    }
+  });
+
+  it.skipIf(process.platform === "win32")("reaps a lingering descendant after the CLI leader has already exited", async () => {
+    // A lock is only released when every holder is gone, and killCliTree
+    // early-returns once the leader has exited.  So when an MCP descendant
+    // ignores SIGTERM and outlives its parent while still holding the session
+    // lock, stop() must reap the group itself (SIGTERM, then the 2s SIGKILL),
+    // or the wedge survives and the next run collides with the lock.  The
+    // descendant keeps the group alive, so the group id is still this CLI's.
+    const descendantPidFile = join(scratch, "descendant.pid");
+    process.env.FAKE_ACP_DESCENDANT_PID = descendantPidFile;
+    await create(GrokAgentDriver, "exit-with-lingering-child", { promptTimeoutMs: 30_000 });
+    await instance.adapter.sendTurn({ threadId: "t-lingering-child", text: "never finishes" });
+    await vi.waitFor(() => {
+      expect(() => readFileSync(descendantPidFile, "utf8")).not.toThrow();
+    }, { timeout: 5_000 });
+    const descendantPid = Number(readFileSync(descendantPidFile, "utf8"));
+
+    try {
+      const done = await recorder.until((event) => event.type === "turn.completed", 5_000);
+      expect(done).toMatchObject({ ok: false, stopReason: "exit_before_result" });
+
+      // Without the already-exited group reap the descendant is never
+      // signalled again: it holds the lock forever.  With it, the
+      // SIGTERM-ignoring descendant is gone within the force-kill window.
+      await vi.waitFor(() => {
+        expect(() => process.kill(descendantPid, 0)).toThrow();
+      }, { timeout: 4_000 });
+    } finally {
+      try {
+        process.kill(descendantPid, "SIGKILL");
+      } catch {
+        // expected once the leader-already-exited group kill has reaped it
+      }
+    }
+  });
+
+  it.skipIf(process.platform === "win32")("reaps a SIGTERM-ignoring descendant that outlives a leader stopped on a normal completion", async () => {
+    // Kody #831: settle() calls stop() while the leader is alive, the leader
+    // dies on the SIGTERM within milliseconds, and the SIGTERM-ignoring
+    // descendant lives on holding the session lock.  settle() has already
+    // dropped the turn from `active`, so stopAll/dispose can never reach it:
+    // the 2s force-kill is the only thing left that can reap it, and it must
+    // not stand down just because the leader is gone.
+    const descendantPidFile = join(scratch, "descendant.pid");
+    process.env.FAKE_ACP_DESCENDANT_PID = descendantPidFile;
+    await create(GrokAgentDriver, "happy-with-lingering-child");
+    await instance.adapter.sendTurn({ threadId: "t-happy-lingering", text: "hi" });
+    const done = await recorder.until((event) => event.type === "turn.completed", 5_000);
+    expect(done).toMatchObject({ ok: true });
+    const descendantPid = Number(readFileSync(descendantPidFile, "utf8"));
+    try {
+      await vi.waitFor(() => {
+        expect(() => process.kill(descendantPid, 0)).toThrow();
+      }, { timeout: 4_000 });
+    } finally {
+      try {
+        process.kill(descendantPid, "SIGKILL");
+      } catch {
+        // expected once the force-kill has reaped it
+      }
+    }
+  });
+
+  // POSIX only: the assertion reads the negative-pid SIGTERM killCliTree sends
+  // to the CLI's process group, and Windows has no process groups (killCliTree
+  // runs taskkill /T there and never calls process.kill with a negative pid).
+  it.skipIf(process.platform === "win32")("never sends a stale process-group SIGKILL once the child has exited", async () => {
+    // stop() arms a 2s force-kill on the per-turn hot path (settle() calls
+    // stop() on every normal completion while the child is alive).  By the time
+    // that timer fires the child has usually exited on SIGTERM and, with no
+    // descendant left in its group, its pid is free for the OS to recycle, so
+    // the force-kill must stand down rather than SIGKILL an unrelated group
+    // that inherited the recycled pid (another turn's CLI, the deployer's
+    // children).
+    const kill = vi.spyOn(process, "kill");
+    try {
+      await create(GrokAgentDriver);
+      // drop anything earlier tests left behind, so the group id below is this
+      // turn's own child
+      kill.mockClear();
+      await instance.adapter.sendTurn({ threadId: "t-stale-group-kill", text: "hi" });
+      const done = await recorder.until((event) => event.type === "turn.completed", 3_000);
+      expect(done).toMatchObject({ ok: true });
+
+      // killCliTree signalled THIS child's own process group on the way out
+      // (the only negative-pid SIGTERM a settled turn sends), and that group id
+      // is the one a 2s force-kill would reuse if it fired against a pgid the
+      // OS had already recycled.  Leftover timers from earlier tests only ever
+      // send SIGKILL and belong to other groups, so scoping by it keeps them
+      // out of the assertion.
+      const pgid = kill.mock.calls.find(
+        ([pid, signal]) => typeof pid === "number" && pid < 0 && signal === "SIGTERM",
+      )?.[0];
+      expect(typeof pgid).toBe("number");
+
+      // Outlive the 2s force-kill window, then prove it never SIGKILLed the
+      // group of a child that had already exited.
+      await new Promise((resolve) => setTimeout(resolve, 2_600));
+      const staleGroupKills = kill.mock.calls.filter(
+        ([pid, signal]) => pid === pgid && signal === "SIGKILL",
+      );
+      expect(staleGroupKills).toEqual([]);
+    } finally {
+      kill.mockRestore();
+    }
+  });
+
+  it("keeps a turn alive past the idle window as long as it keeps streaming", async () => {
+    // macOS CI runners can coalesce short timers; keep the same proof on every
+    // OS with wider margins on darwin only.
+    const promptIdleMs = process.platform === "darwin" ? 450 : 150;
+    const dripMs = process.platform === "darwin" ? 50 : 30;
+    const dripCount = process.platform === "darwin" ? 12 : 8;
+    process.env.FAKE_ACP_DRIP_MS = String(dripMs);
+    process.env.FAKE_ACP_DRIP_COUNT = String(dripCount);
+    // each gap is well under the idle window, but the whole turn runs well
+    // past it — proving renewal, not just a generous deadline
+    await create(GrokAgentDriver, "drip", { promptIdleMs });
+    await instance.adapter.sendTurn({ threadId: "t-idle-drip", text: "keep talking" });
+
+    const done = await recorder.until((event) => event.type === "turn.completed", 3_000);
+    expect(done).toMatchObject({ ok: true });
+    expect(recorder.events.filter((event) => event.type === "content.delta")).toHaveLength(dripCount);
+    expect(recorder.events.some((event) => event.type === "runtime.error")).toBe(false);
+  });
+
+  it("settles a fully silent prompt as a stall once the idle window elapses", async () => {
+    // promptTimeoutMs stays at its real 18-minute default — only the idle
+    // guard is short here, so this proves the idle path fires on its own,
+    // independent of the hard ceiling.
+    await create(GrokAgentDriver, "cancel-exits", { promptIdleMs: 150 });
+    await instance.adapter.sendTurn({ threadId: "t-idle-stall", text: "never finishes" });
+
+    const done = await recorder.until((event) => event.type === "turn.completed", 3_000);
+    expect(done).toMatchObject({ ok: false, stopReason: "prompt_stall" });
+    expect(recorder.events.filter((event) => event.type === "turn.completed")).toHaveLength(1);
+    expect(recorder.events.filter((event) => event.type === "runtime.error")).toHaveLength(1);
+    expect(recorder.events.find((event) => event.type === "runtime.error")?.message).toMatch(/no output for/i);
+    expect(instance.adapter.hasSession("t-idle-stall")).toBe(false);
+  });
+
+  it("keeps a turn alive through a silently running tool call past the idle window", async () => {
+    process.env.FAKE_ACP_QUIET_MS = "600";
+    // the tool call is quiet for 600 ms — four times the idle window (150
+    // ms) — so only open-tool-call tracking can explain the turn surviving
+    await create(GrokAgentDriver, "quiet-tool-call", { promptIdleMs: 150 });
+    await instance.adapter.sendTurn({ threadId: "t-idle-tool", text: "build it" });
+
+    const done = await recorder.until((event) => event.type === "turn.completed", 3_000);
+    expect(done).toMatchObject({ ok: true });
+    expect(recorder.events.some((event) => event.type === "runtime.error")).toBe(false);
+    expect(recorder.events.some((event) => event.type === "item.started" && event.itemId === "quiet-tool-1")).toBe(true);
+    expect(recorder.events.some((event) => event.type === "item.completed" && event.itemId === "quiet-tool-1" && "ok" in event && event.ok === true)).toBe(true);
+  });
+
+  it("files a tool call's raw input and its content for the side store, beside the clipped headline", async () => {
+    process.env.FAKE_ACP_QUIET_MS = "50";
+    await create(GrokAgentDriver, "quiet-tool-call");
+    await instance.adapter.sendTurn({ threadId: "t-acp-tool-io", text: "build it" });
+    await recorder.until((event) => event.type === "turn.completed", 3_000);
+
+    const started = recorder.events.find((event) => event.type === "item.started" && event.itemId === "quiet-tool-1")!;
+    expect(started).toMatchObject({ title: "pnpm build", target: "pnpm build" });
+    expect(started.io?.input?.text).toBe('{\n  "command": "pnpm build"\n}');
+    const done = recorder.events.find((event) => event.type === "item.completed" && event.itemId === "quiet-tool-1")!;
+    expect(done.io?.output).toEqual({ text: "built", truncated: false, length: 5 });
+  });
+
+  it.each(["completed", "failed"] as const)("settles an initially terminal tool_call (%s) with its output", async (status) => {
+    process.env.FAKE_ACP_TERMINAL_STATUS = status;
+    await create(GrokAgentDriver, "initial-terminal-tool-call");
+    await instance.adapter.sendTurn({ threadId: `t-acp-initial-terminal-${status}`, text: "run the hook" });
+
+    const doneTurn = await recorder.until((event) => event.type === "turn.completed", 3_000);
+    expect(doneTurn).toMatchObject({ ok: true });
+    const started = recorder.events.find((event) => event.type === "item.started" && event.itemId === "initial-terminal-1");
+    const completed = recorder.events.find((event) => event.type === "item.completed" && event.itemType === "tool" && event.itemId === "initial-terminal-1");
+    expect(recorder.events.filter((event) => event.type === "item.completed" && event.itemType === "tool" && event.itemId === "initial-terminal-1")).toHaveLength(1);
+    expect(started).toMatchObject({ title: `hookRun: ${status}` });
+    expect(started?.io?.input?.text).toContain('"hook": "Run"');
+    expect(completed).toMatchObject({
+      ok: status === "completed",
+      title: `hookRun: ${status}`,
+      detail: status === "completed" ? "hook ran" : "hook rejected",
+      io: { output: { text: status === "completed" ? "hook ran" : "hook rejected" } },
+    });
+    expect(completed?.io?.input).toBeUndefined();
+  });
+
+  it("settles a tool_call_update that has no earlier tool_call", async () => {
+    await create(GrokAgentDriver, "update-only-tool-call");
+    await instance.adapter.sendTurn({ threadId: "t-acp-update-only-tool-call", text: "run the hook" });
+
+    await expect(recorder.until((event) => event.type === "turn.completed", 3_000)).resolves.toMatchObject({ ok: true });
+    const completions = recorder.events.filter((event) => event.type === "item.completed" && event.itemType === "tool" && event.itemId === "update-only-1");
+    expect(completions).toHaveLength(1);
+    expect(completions[0]).toMatchObject({ ok: true, title: "hookRun: completed", detail: "hook ran" });
+    expect(recorder.events.some((event) => event.type === "item.started" && event.itemId === "update-only-1")).toBe(false);
+  });
+
+  it("keeps a lifecycle tool failed when its output says it completed with errors", async () => {
+    await create(GrokAgentDriver, "lifecycle-completed-with-errors");
+    await instance.adapter.sendTurn({ threadId: "t-acp-lifecycle-completed-with-errors", text: "run the hook" });
+    await recorder.until((event) => event.type === "turn.completed", 3_000);
+
+    const completion = recorder.events.find(
+      (event) => event.type === "item.completed" && event.itemType === "tool" && event.itemId === "lifecycle-completed-with-errors-1",
+    );
+    expect(completion).toMatchObject({
+      ok: false,
+      title: "hookRun: completed",
+      detail: "Hook run completed with errors",
+    });
+  });
+
+  it("marks a failed lifecycle tool done when its output says it completed", async () => {
+    await create(GrokAgentDriver, "lifecycle-failed-done");
+    await instance.adapter.sendTurn({ threadId: "t-acp-lifecycle-failed-done", text: "run the reminder child" });
+    await recorder.until((event) => event.type === "turn.completed", 3_000);
+
+    const completion = recorder.events.find(
+      (event) => event.type === "item.completed" && event.itemType === "tool" && event.itemId === "lifecycle-failed-done-1",
+    );
+    expect(completion).toMatchObject({
+      ok: true,
+      title: "reminderChild: failed",
+      detail: "Reminder child session main run completed.",
+    });
+  });
+
+  it("uses a truthful terminal title from tool_call_update", async () => {
+    await create(GrokAgentDriver, "refreshed-tool-title");
+    await instance.adapter.sendTurn({ threadId: "t-acp-refreshed-title", text: "run the hook" });
+    await recorder.until((event) => event.type === "turn.completed", 3_000);
+
+    expect(recorder.events.find((event) => event.type === "item.started" && event.itemId === "refreshed-title-1"))
+      .toMatchObject({ title: "hookRun: inProgress" });
+    expect(recorder.events.find((event) => event.type === "item.completed" && event.itemType === "tool" && event.itemId === "refreshed-title-1"))
+      .toMatchObject({ ok: true, title: "hookRun: completed", detail: "hook ran" });
+  });
+
+  it("files the arguments a streaming agent sends on a later tool_call_update", async () => {
+    // announced with an empty rawInput; the real arguments settle mid-run
+    await create(GrokAgentDriver, "late-input-tool-call");
+    await instance.adapter.sendTurn({ threadId: "t-acp-late-input", text: "list it" });
+    await recorder.until((event) => event.type === "turn.completed", 15_000);
+
+    const started = recorder.events.find((event) => event.type === "item.started" && event.itemId === "late-input-1")!;
+    // an empty object is not an input worth filing
+    expect(started.io?.input).toBeUndefined();
+    const updates = recorder.events.filter((event) => event.type === "item.updated" && event.itemId === "late-input-1");
+    expect(updates).toHaveLength(1);
+    expect(updates[0]!.io?.input?.text).toBe('{\n  "command": "ls -la"\n}');
+    const done = recorder.events.find((event) => event.type === "item.completed" && event.itemId === "late-input-1")!;
+    expect(done.io?.output?.text).toBe("total 0");
+    // already filed on the update, so the completion does not file it twice
+    expect(done.io?.input).toBeUndefined();
+  });
+
+  it("files the arguments that only settle on the completing tool_call_update", async () => {
+    process.env.FAKE_ACP_LATE_INPUT_AT = "completion";
+    await create(GrokAgentDriver, "late-input-tool-call");
+    await instance.adapter.sendTurn({ threadId: "t-acp-late-input-end", text: "list it" });
+    await recorder.until((event) => event.type === "turn.completed", 15_000);
+
+    expect(recorder.events.some((event) => event.type === "item.updated" && event.itemId === "late-input-1")).toBe(false);
+    const done = recorder.events.find((event) => event.type === "item.completed" && event.itemId === "late-input-1")!;
+    expect(done.io?.input?.text).toBe('{\n  "command": "ls -la"\n}');
+    expect(done.io?.output?.text).toBe("total 0");
+  });
+
+  it("still enforces the hard ceiling even while the agent keeps streaming", async () => {
+    process.env.FAKE_ACP_DRIP_MS = "20";
+    // no FAKE_ACP_DRIP_COUNT: drips forever, so the idle guard (5 s, never
+    // reached in this test) never has a reason to fire — only the 150 ms
+    // hard ceiling can end this turn.
+    await create(GrokAgentDriver, "drip", { promptIdleMs: 5_000, promptTimeoutMs: 150 });
+    await instance.adapter.sendTurn({ threadId: "t-hard-ceiling-drip", text: "keep talking forever" });
+
+    const done = await recorder.until((event) => event.type === "turn.completed", 3_000);
+    expect(done).toMatchObject({ ok: false, stopReason: "prompt_timeout" });
+    expect(recorder.events.some((event) => event.type === "content.delta")).toBe(true);
+    expect(instance.adapter.hasSession("t-hard-ceiling-drip")).toBe(false);
+  });
+
+  it("does not expire the idle guard while a person is answering a permission ask", async () => {
+    await create(GrokAgentDriver, "permission", { promptIdleMs: 150 });
+    await instance.adapter.sendTurn({ threadId: "t-idle-permission", text: "go" });
+
+    const opened = await recorder.until((event) => event.type === "request.opened");
+    // sit on the unanswered ask for several idle windows — waiting for a
+    // person must not read as a wedged agent
+    await new Promise((resolve) => setTimeout(resolve, 450));
+    expect(recorder.events.some((event) => event.type === "turn.completed")).toBe(false);
+
+    await instance.adapter.respondToRequest("t-idle-permission", (opened as any).requestId, { behavior: "allow" });
+    const done = await recorder.until((event) => event.type === "turn.completed");
+    expect(done).toMatchObject({ ok: true });
+    // the answer resumes the agent — confirm the idle guard does not fire
+    // on some stale deadline left over from before the ask was resolved
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(recorder.events.some((event) => event.type === "runtime.error")).toBe(false);
   });
 
   it("emits each assistant text block before the tool that follows it", async () => {
@@ -288,6 +1375,77 @@ describe("ACP turns (fake CLI)", () => {
     expect(usage).toMatchObject({ input: 10, output: 5 });
   });
 
+  it("carries a cost the agent reported instead of hardcoding null", async () => {
+    // Every ACP settle path used to emit `cost: null` unconditionally, and
+    // rolling-spend drops a non-positive cost — so dsh, claude, codex and
+    // antigravity contributed nothing at all to the fleet's spend figure while
+    // the HTTP engines did.  A number the AGENT reported is provider truth and
+    // must survive to turn.completed.
+    process.env.FAKE_ACP_USAGE_ROOT = "1";
+    process.env.FAKE_ACP_COST = "0.42";
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-cost", text: "go" });
+    const done = await recorder.until((e) => e.type === "turn.completed");
+    expect(done).toMatchObject({ type: "turn.completed", ok: true, cost: 0.42 });
+    // Provider-reported, so it is an actual charge rather than an estimate.
+    expect(done).not.toMatchObject({ billingMode: "estimated" });
+  });
+
+  it("still reports a null cost when the agent reports none", async () => {
+    // Grok has no catalog row.  Inventing a price from a table here would be
+    // a worse lie, because these are subscription logins: an API-equivalent
+    // figure is an estimate, and `billingMode` exists to mark one as such.
+    process.env.FAKE_ACP_USAGE_ROOT = "1";
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-no-cost", text: "go" });
+    const done = await recorder.until((e) => e.type === "turn.completed");
+    expect(done).toMatchObject({ type: "turn.completed", ok: true, cost: null });
+  });
+
+  it("estimates MiniMax Code catalog cost when the agent reports tokens but no charge", async () => {
+    process.env.FAKE_ACP_USAGE_ROOT = "1";
+    await create(McodeAgentDriver);
+    await instance.adapter.sendTurn({
+      threadId: "t-mcode-cost",
+      text: "go",
+      model: "MiniMax-M3.1-Flash-thinking",
+    });
+    const done = await recorder.until((e) => e.type === "turn.completed");
+    expect(done).toMatchObject({
+      type: "turn.completed",
+      ok: true,
+      billingMode: "estimated",
+    });
+    expect((done as { cost?: number | null }).cost).toBeGreaterThan(0);
+  });
+
+  it("folds cache reads into input rather than reporting them beside it", async () => {
+    // cachedInput is a SUBSET of input by contract, so a provider that reports
+    // the two separately must have its cache figure counted inside input —
+    // otherwise the same tokens are billed as both fresh and cached.
+    process.env.FAKE_ACP_USAGE_ROOT = "1";
+    process.env.FAKE_ACP_CACHE_READ = "4";
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-cache", text: "go" });
+    const done = await recorder.until((e) => e.type === "turn.completed");
+    expect(done).toMatchObject({ usage: { input: 14, output: 5, cachedInput: 4 } });
+    const live = recorder.events.find((e) => e.type === "thread.token-usage.updated");
+    expect(live).toMatchObject({ input: 14, output: 5, cachedInput: 4 });
+  });
+
+  it("drops a cache figure larger than the input it must sit inside", async () => {
+    // The two numbers contradict each other, so neither supports a split.
+    // Clamping the cache down and adding it in would invent a total; the
+    // honest reading is the input on its own with no cache claim at all.
+    process.env.FAKE_ACP_USAGE_ROOT = "1";
+    process.env.FAKE_ACP_CACHE_READ = "99";
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-cache-over", text: "go" });
+    const done = await recorder.until((e) => e.type === "turn.completed");
+    expect(done).toMatchObject({ usage: { input: 10, output: 5 } });
+    expect((done as { usage?: { cachedInput?: number } }).usage?.cachedInput).toBeUndefined();
+  });
+
   it("passes ACP stdio flags and strips foreign provider keys from the child env", async () => {
     await create();
     const dump = join(scratch, "dump.json");
@@ -316,6 +1474,30 @@ describe("ACP turns (fake CLI)", () => {
     expect(seen.env.OMB_TTS_KEY).toBeUndefined();
   });
 
+  it("launches each bot's turn with its own seat and none of the harness's identity", async () => {
+    const restore = inheritHarnessIdentity();
+    try {
+      await create();
+      const dump = join(scratch, "launch-dump.json");
+      process.env.FAKE_ACP_DUMP = dump;
+      const seenFor = async (threadId: string, launchIdentity: { seat: string | null; session: string } | undefined) => {
+        const started = await instance.adapter.sendTurn({ threadId, text: "go", launchIdentity });
+        await recorder.until((e) => e.type === "turn.completed" && e.turnId === started.turnId);
+        return readEngineDump(dump).env;
+      };
+      const plumber = await seenFor("t-acp-plumber", { seat: "BF-PLUMBER", session: "t-acp-plumber" });
+      const fixer = await seenFor("t-acp-fixer", { seat: "BF-FIXER", session: "t-acp-fixer" });
+      const none = await seenFor("t-acp-none", { seat: null, session: "t-acp-none" });
+      const bare = await seenFor("t-acp-bare", undefined);
+      expectLaunchedAs(plumber, { seat: "BF-PLUMBER", session: "t-acp-plumber" });
+      expectLaunchedAs(fixer, { seat: "BF-FIXER", session: "t-acp-fixer" });
+      expectLaunchedAs(none, { seat: null, session: "t-acp-none" });
+      expectLaunchedAs(bare, { seat: null });
+    } finally {
+      restore();
+    }
+  });
+
   // ACP session/new accepts stdio MCP entries, so connected apps use the
   // same harness-owned bridge as Claude and Codex.
   it("mounts connected apps as a stdio MCP server", async () => {
@@ -341,6 +1523,50 @@ describe("ACP turns (fake CLI)", () => {
       args: ["/tmp/connector-proxy.js"],
       env: [{ name: "OMB_CONNECTOR_UPSTREAM_URL", value: "http://127.0.0.1:8799/api/internal/connectors/mcp" }],
     });
+  });
+
+  it("grok names what the account is offered when the CLI rejects a picked model", async () => {
+    // Composer 2.5 and Grok Build 0.1 are in the picker but only some accounts
+    // are served them.  A rejected session/set_model must end the turn with the
+    // CLI's own offered list and the command that prints it, not a version hint.
+    process.env.FAKE_ACP_MODE = "set-model-invalid-params";
+    process.env.FAKE_ACP_SESSION_MODELS = "grok-4.7|Grok 4.7,grok-4.7-build-fast|Grok 4.7 Fast,grok-4.6|Grok 4.6";
+    await create();
+
+    await instance.adapter.sendTurn({ threadId: "t-grok-composer", text: "go", model: "composer-2.5" });
+    const done = await recorder.until((e) => e.type === "turn.completed");
+
+    // The turn settles with the structural rejection stop reason, which is
+    // what lets the fallback walk mark this model rejected (model-rejections.ts)
+    // instead of spawning the CLI again on every turn.
+    expect(done).toMatchObject({ ok: false, stopReason: MODEL_REJECTED_STOP_REASON });
+    const err = recorder.events.filter((e) => e.type === "runtime.error");
+    expect(err).toHaveLength(1);
+    const message = err[0]!.message as string;
+    expect(message).toContain('Grok rejected model "composer-2.5" via session/set_model');
+    // The reason rides in the RPC error's `data`; core.ts keeps it off the
+    // Error message, so the driver has to fold it back in.
+    expect(message).toContain("via session/set_model: Invalid params: unknown model id.");
+    expect(classifyError(new Error(message))).toEqual({ transient: false, reason: "unknown_model" });
+    expect(message).toContain("This account's Grok CLI offers: grok-4.7, grok-4.7-build-fast, grok-4.6.");
+    expect(message).toContain("`grok models`");
+    expect(message).not.toContain("1.0.6");
+  });
+
+  it("grok does not mark a model rejected when set_model fails for another reason", async () => {
+    // An agent that predates session/set_model answers -32601 "method not
+    // found".  That is no verdict on the model id, so the turn keeps the
+    // generic rpc_error stop reason and the model is not hidden for hours.
+    process.env.FAKE_ACP_MODE = "no-session-config";
+    await create();
+
+    await instance.adapter.sendTurn({ threadId: "t-grok-old-cli", text: "go", model: "grok-4.7" });
+    const done = await recorder.until((e) => e.type === "turn.completed");
+
+    expect(done).toMatchObject({ ok: false, stopReason: "rpc_error" });
+    const message = recorder.events.find((e) => e.type === "runtime.error")!.message as string;
+    expect(message).toContain('Grok rejected model "grok-4.7" via session/set_model');
+    expect(message).toContain("method not found");
   });
 
   it("droid takes model and autonomy over the wire, never through argv", async () => {
@@ -484,13 +1710,214 @@ describe("ACP turns (fake CLI)", () => {
     expect(done).toMatchObject({ ok: true });
   });
 
+  it("names the tool call an ask is about, the id its item.started carried", async () => {
+    process.env.FAKE_ACP_PERMISSION_CALL_ID = "tc-ask";
+    try {
+      await create(GrokAgentDriver, "permission");
+      await instance.adapter.sendTurn({ threadId: "t-perm-id", text: "go" });
+      const opened = await recorder.until((e) => e.type === "request.opened");
+      const started = recorder.events.find((e) => e.type === "item.started" && e.itemId === "tc-ask");
+      expect(started).toBeDefined();
+      // the auto-review step watch matches the two by this id
+      expect(opened).toHaveProperty("itemId", "tc-ask");
+      await instance.adapter.respondToRequest("t-perm-id", (opened as any).requestId, { behavior: "deny" });
+      await recorder.until((e) => e.type === "turn.completed");
+    } finally {
+      delete process.env.FAKE_ACP_PERMISSION_CALL_ID;
+    }
+  });
+
+  it("leaves an explicitly remote MCP ask unscoped in a mixed-computer turn", async () => {
+    await create(GrokAgentDriver, "remote-computer-permission");
+    await instance.adapter.sendTurn({
+      threadId: "t-mixed-computer",
+      text: "work remotely",
+      integrations: { computers: [
+        { name: "computer_shared_vm", label: "My VPS", kind: "vps", stdio: { command: "/vps-driver", args: ["mcp"], env: {} } },
+        { name: "computer_host", label: "This Computer", kind: "local", stdio: { command: "/cua-driver", args: ["mcp"], env: {}, scope: "local-computer" } },
+      ] },
+    });
+    const opened = await recorder.until((e) => e.type === "request.opened");
+    expect(opened).toMatchObject({ tool: "mcp__computer_shared_vm__bash", summary: "bash -c echo hi" });
+    expect((opened as { approvalScope?: string }).approvalScope).toBeUndefined();
+    await instance.adapter.respondToRequest("t-mixed-computer", opened.requestId!, { behavior: "allow" });
+    await recorder.until((e) => e.type === "turn.completed");
+  });
+
+  it("recognizes an execute-classified remote shell only with exact mounted MCP identity", async () => {
+    await create(GrokAgentDriver, "remote-execute-permission");
+    await instance.adapter.sendTurn({
+      threadId: "t-remote-execute",
+      text: "work remotely",
+      integrations: { computers: [
+        { name: "computer_shared_vm", label: "My VPS", kind: "vps", stdio: { command: "/vps-driver", args: ["mcp"], env: {} } },
+        { name: "computer_host", label: "This Computer", kind: "local", stdio: { command: "/cua-driver", args: ["mcp"], env: {}, scope: "local-computer" } },
+      ] },
+    });
+    const opened = await recorder.until((e) => e.type === "request.opened");
+    expect(opened).toMatchObject({ tool: "mcp__computer_shared_vm__bash", summary: "bash -c echo hi" });
+    expect((opened as { approvalScope?: string }).approvalScope).toBeUndefined();
+    await instance.adapter.respondToRequest("t-remote-execute", opened.requestId!, { behavior: "allow" });
+    await recorder.until((e) => e.type === "turn.completed");
+  });
+
+  it("brokers host control on a full-auto instance instead of auto-allowing it", async () => {
+    process.env.FAKE_ACP_MODE = "permission";
+    instance = await GrokAgentDriver.create({
+      instanceId: "acp-full-auto",
+      displayName: "ACP Full Auto",
+      environment: {},
+      enabled: true,
+      config: { cli: FAKE_CLI, fullAuto: true },
+    });
+    recorder = recordEvents(instance.adapter);
+    const dump = join(scratch, "full-auto-host.json");
+    process.env.FAKE_ACP_DUMP = dump;
+    await instance.adapter.sendTurn({
+      threadId: "t-full-auto-host",
+      text: "click the button",
+      integrations: {
+        localComputer: {
+          command: "/cua-driver",
+          args: ["mcp"],
+          env: {},
+          platform: "linux",
+          scope: "local-computer",
+        },
+      },
+    });
+    // the ask reaches the harness (where the bot's Auto policy decides)
+    // rather than being answered inside the driver
+    const opened = await recorder.until((e) => e.type === "request.opened");
+    expect(opened).toMatchObject({ requestType: "permission", tool: "shell", approvalScope: "local-computer" });
+    // and the CLI was spawned in its asking mode for this turn, not bypass
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    expect(seen.argv.slice(0, 2)).toEqual(["--permission-mode", "default"]);
+    await instance.adapter.respondToRequest("t-full-auto-host", (opened as any).requestId, { behavior: "allow" });
+    const done = await recorder.until((e) => e.type === "turn.completed");
+    expect(done).toMatchObject({ ok: true });
+  });
+
+  it("keeps a full-auto instance's auto-allow for a turn that does not touch this computer", async () => {
+    process.env.FAKE_ACP_MODE = "permission";
+    instance = await GrokAgentDriver.create({
+      instanceId: "acp-full-auto-shell",
+      displayName: "ACP Full Auto",
+      environment: {},
+      enabled: true,
+      config: { cli: FAKE_CLI, fullAuto: true },
+    });
+    recorder = recordEvents(instance.adapter);
+    const dump = join(scratch, "full-auto-shell.json");
+    process.env.FAKE_ACP_DUMP = dump;
+    await instance.adapter.sendTurn({ threadId: "t-full-auto-shell", text: "list the files" });
+    const done = await recorder.until((e) => e.type === "turn.completed");
+    expect(done).toMatchObject({ ok: true });
+    expect(recorder.events.some((e) => e.type === "request.opened")).toBe(false);
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    expect(seen.argv.slice(0, 2)).toEqual(["--permission-mode", "bypassPermissions"]);
+  });
+
+  it("declares where auto-review sees its actions: before an ask, or only afterwards when full-auto", async () => {
+    instance = await GrokAgentDriver.create({
+      instanceId: "acp-review-hook",
+      displayName: "ACP",
+      environment: {},
+      enabled: true,
+      config: { cli: FAKE_CLI, fullAuto: false },
+    });
+    expect(instance.adapter.capabilities).toMatchObject({ reviewHook: "before", asksWhenHeld: true });
+    await instance.dispose();
+    instance = await GrokAgentDriver.create({
+      instanceId: "acp-review-hook-auto",
+      displayName: "ACP Full Auto",
+      environment: {},
+      enabled: true,
+      config: { cli: FAKE_CLI, fullAuto: true },
+    });
+    expect(instance.adapter.capabilities).toMatchObject({ reviewHook: "after", asksWhenHeld: true });
+  });
+
+  it("runs a full-auto turn held for auto-review in its asking mode, so the ask reaches the reviewer", async () => {
+    process.env.FAKE_ACP_MODE = "permission";
+    instance = await GrokAgentDriver.create({
+      instanceId: "acp-full-auto-held",
+      displayName: "ACP Full Auto",
+      environment: {},
+      enabled: true,
+      config: { cli: FAKE_CLI, fullAuto: true },
+    });
+    recorder = recordEvents(instance.adapter);
+    const dump = join(scratch, "full-auto-held.json");
+    process.env.FAKE_ACP_DUMP = dump;
+    await instance.adapter.sendTurn({ threadId: "t-full-auto-held", text: "list the files", holdForReview: true });
+    const opened = await recorder.until((e) => e.type === "request.opened");
+    // an ordinary ask, not host control: the reviewer may answer it
+    expect(opened).toMatchObject({ requestType: "permission", tool: "shell", summary: "echo hi" });
+    expect(opened.type === "request.opened" && opened.approvalScope).toBeUndefined();
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    expect(seen.argv.slice(0, 2)).toEqual(["--permission-mode", "default"]);
+    await instance.adapter.respondToRequest("t-full-auto-held", opened.requestId!, { behavior: "deny" });
+    await recorder.until((e) => e.type === "turn.completed");
+  });
+
   it("grok fails closed when the CLI advertises no cached_token (needs login)", async () => {
-    await create(GrokAgentDriver, "no-auth");
+    process.env.FAKE_ACP_MODE = "no-auth";
+    mkdirSync(join(scratch, ".grok"), { recursive: true });
+    instance = await GrokAgentDriver.create({
+      instanceId: "acp-test",
+      displayName: "ACP Test",
+      environment: { HOME: scratch, GROK_HOME: join(scratch, ".grok") },
+      enabled: true,
+      config: { cli: FAKE_CLI, fullAuto: false },
+    });
+    recorder = recordEvents(instance.adapter);
     await instance.adapter.sendTurn({ threadId: "t-auth", text: "go" });
     const done = await recorder.until((e) => e.type === "turn.completed");
     expect(done).toMatchObject({ ok: false, stopReason: "auth_required" });
     const err = recorder.events.find((e) => e.type === "runtime.error")!;
     expect(err.message).toMatch(/not signed in/);
+  });
+
+  it("grok proceeds on ambient login when auth.json exists even without cached_token", async () => {
+    process.env.FAKE_ACP_MODE = "no-auth";
+    mkdirSync(join(scratch, ".grok"), { recursive: true });
+    writeFileSync(join(scratch, ".grok", "auth.json"), "{}\n");
+    instance = await GrokAgentDriver.create({
+      instanceId: "acp-test",
+      displayName: "ACP Test",
+      environment: { HOME: scratch, GROK_HOME: join(scratch, ".grok") },
+      enabled: true,
+      config: { cli: FAKE_CLI, fullAuto: false },
+    });
+    recorder = recordEvents(instance.adapter);
+    await instance.adapter.sendTurn({ threadId: "t-auth-ambient", text: "go" });
+    const done = await recorder.until((e) => e.type === "turn.completed");
+    expect(done).toMatchObject({ ok: true });
+    expect(recorder.events.some((e) => e.type === "runtime.error")).toBe(false);
+  });
+
+  it("grok ambient-login probe honors a custom GROK_HOME rather than $HOME/.grok", async () => {
+    process.env.FAKE_ACP_MODE = "no-auth";
+    // $HOME/.grok has no auth.json at all — only the custom GROK_HOME does.
+    // If isAuthenticated hardcoded $HOME/.grok, this would fail closed even
+    // though the account is genuinely signed in under GROK_HOME.
+    mkdirSync(join(scratch, ".grok"), { recursive: true });
+    const customGrokHome = join(scratch, "custom-grok-home");
+    mkdirSync(customGrokHome, { recursive: true });
+    writeFileSync(join(customGrokHome, "auth.json"), "{}\n");
+    instance = await GrokAgentDriver.create({
+      instanceId: "acp-test",
+      displayName: "ACP Test",
+      environment: { HOME: scratch, GROK_HOME: customGrokHome },
+      enabled: true,
+      config: { cli: FAKE_CLI, fullAuto: false },
+    });
+    recorder = recordEvents(instance.adapter);
+    await instance.adapter.sendTurn({ threadId: "t-auth-grok-home", text: "go" });
+    const done = await recorder.until((e) => e.type === "turn.completed");
+    expect(done).toMatchObject({ ok: true });
+    expect(recorder.events.some((e) => e.type === "runtime.error")).toBe(false);
   });
 
   it("grok local inject does not require grok.com login", async () => {
@@ -514,12 +1941,21 @@ describe("ACP turns (fake CLI)", () => {
     expect(recorder.events.some((e) => e.type === "runtime.error")).toBe(false);
   });
 
-  it("gemini proceeds through a missing auth method (lenient login)", async () => {
-    await create(GeminiAgentDriver, "no-auth");
+  it("does not probe isAuthenticated for a fail-open (authFailure: continue) driver", async () => {
+    authProbeCalls = 0;
+    await create(AuthProbeDriver);
+    await instance.adapter.sendTurn({ threadId: "t-auth-probe-skip", text: "go" });
+    const done = await recorder.until((e) => e.type === "turn.completed");
+    expect(done).toMatchObject({ ok: true });
+    expect(authProbeCalls).toBe(0);
+  });
+
+  it("dsh proceeds through a missing auth method (lenient login)", async () => {
+    await create(DshAgentDriver, "no-auth");
     await instance.adapter.sendTurn({ threadId: "t-lenient", text: "go" });
     const done = await recorder.until((e) => e.type === "turn.completed");
     expect(done).toMatchObject({ ok: true });
-    expect(recorder.events.some((e) => e.provider === "geminiAgent")).toBe(true);
+    expect(recorder.events.some((e) => e.provider === "dshAgent")).toBe(true);
   });
 
   it("rejects a second turn while one is in flight", async () => {
@@ -531,13 +1967,14 @@ describe("ACP turns (fake CLI)", () => {
     await recorder.until((e) => e.type === "turn.completed");
   });
 
-  it("interrupt settles a hung turn as cancelled", async () => {
+  it("interrupt settles a hung turn interrupted, not as a success and not a crash", async () => {
     await create(GrokAgentDriver, "hang");
     await instance.adapter.sendTurn({ threadId: "t-int", text: "go" });
     await recorder.until((e) => e.type === "session.started");
     await instance.adapter.interruptTurn("t-int");
     const done = await recorder.until((e) => e.type === "turn.completed");
-    expect(done).toMatchObject({ type: "turn.completed" });
+    expect(done).toMatchObject({ ok: false, stopReason: "interrupted" });
+    expect(recorder.events.some((e) => e.type === "runtime.error")).toBe(false);
   });
 
   it("an exit before result becomes runtime.error + failed turn", async () => {
@@ -546,7 +1983,98 @@ describe("ACP turns (fake CLI)", () => {
     const done = await recorder.until((e) => e.type === "turn.completed");
     expect(done).toMatchObject({ ok: false });
     expect(recorder.events.some((e) => e.type === "runtime.error")).toBe(true);
+    // DR2: "simulated crash before result" carries no transient vocabulary,
+    // so the classifier calls it terminal and no relaunch is attempted.  A
+    // CLI that died for its own reasons must not be tried again.
+    expect(recorder.events.some((e) => e.type === "turn.retrying")).toBe(false);
   });
+
+  // DR2.  Every ACP engine — Cursor, Droid, Grok CLI, Hermes, Kimi, DeepSeek,
+  // Qwen, OpenCode, DSH — used to fail the whole turn on one 429 or reset,
+  // which then pushed the bot's fallback chain into a cooldown a single retry
+  // would have avoided.
+  it("auto-retries a transient exit, then completes with exactly one reply", async () => {
+    process.env.FAKE_ACP_TRANSIENTS = "2";
+    process.env.FAKE_ACP_STATE = join(scratch, "acp-launches");
+    process.env.FAKE_ACP_RETRY_SCALE = "0.001";
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-acp-retry", text: "go" });
+
+    // Three real child launches on a loaded machine: give the settle room.
+    await recorder.until((e) => e.type === "turn.completed" && e.ok === true, 25_000);
+    const retries = recorder.events.filter((e) => e.type === "turn.retrying");
+    expect(retries.map((e) => e.attempt)).toEqual([1, 2]);
+    expect(retries.every((e) => e.delayMs > 0 && typeof e.reason === "string")).toBe(true);
+    // one settled reply across all three launches, not one per launch
+    const replies = recorder.events.filter(
+      (e) => e.type === "item.completed" && e.itemType === "assistant_text",
+    );
+    expect(replies).toHaveLength(1);
+    expect(recorder.events.filter((e) => e.type === "turn.completed")).toHaveLength(1);
+  }, 40_000);
+
+  it("stops retrying at the attempt cap and settles the turn as failed", async () => {
+    process.env.FAKE_ACP_TRANSIENTS = "9";
+    process.env.FAKE_ACP_STATE = join(scratch, "acp-launches-cap");
+    process.env.FAKE_ACP_RETRY_SCALE = "0.001";
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-acp-cap", text: "go" });
+
+    await recorder.until((e) => e.type === "turn.completed" && e.ok === false, 25_000);
+    expect(recorder.events.filter((e) => e.type === "turn.retrying").map((e) => e.attempt)).toEqual([1, 2]);
+    expect(recorder.events.some((e) => e.type === "runtime.error")).toBe(true);
+  }, 40_000);
+
+  // A cold boot that is slow but alive must get its answer in: the deadline is
+  // what used to cut DSH off mid-boot under host load.
+  it("completes a turn whose initialize answers late but inside its deadline", async () => {
+    process.env.FAKE_ACP_INIT_DELAY_MS = "1500";
+    await create(GrokAgentDriver, undefined, { initTimeoutMs: 20_000 });
+    await instance.adapter.sendTurn({ threadId: "t-acp-slow-init", text: "go" });
+
+    await recorder.until((e) => e.type === "turn.completed", 25_000);
+    expect(recorder.events.filter((e) => e.type === "turn.retrying")).toHaveLength(0);
+    expect(recorder.events.at(-1)).toMatchObject({ type: "turn.completed", ok: true });
+  }, 40_000);
+
+  // A relaunch repeats the whole cold boot under the same load, so an
+  // initialize timeout spends one retry, not the full transient budget.
+  it("relaunches an initialize timeout once, then fails naming the budget", async () => {
+    process.env.FAKE_ACP_INIT_DELAY_MS = "60000";
+    process.env.FAKE_ACP_RETRY_SCALE = "0.001";
+    await create(GrokAgentDriver, undefined, { initTimeoutMs: 1_000 });
+    await instance.adapter.sendTurn({ threadId: "t-acp-init-timeout", text: "go" });
+
+    await recorder.until((e) => e.type === "turn.completed", 25_000);
+    const retries = recorder.events.filter((e) => e.type === "turn.retrying");
+    expect(retries.map((e) => e.attempt)).toEqual([1]);
+    expect(retries[0]).toMatchObject({ reason: "timeout" });
+    const error = recorder.events.find((e) => e.type === "runtime.error");
+    // Keeps the phrase sentry-ai.ts keys its expected-condition breadcrumb on,
+    // and names the budget that ran out.
+    expect(error).toMatchObject({ message: expect.stringContaining("initialize timed out after 1 s (instance setting") });
+    expect(recorder.events.at(-1)).toMatchObject({ type: "turn.completed", ok: false, stopReason: "rpc_error" });
+    expect(recorder.events.filter((e) => e.type === "turn.completed")).toHaveLength(1);
+  }, 40_000);
+
+  it("never retries a failure that arrived after the agent had already spoken", async () => {
+    // Replay safety comes from PROTOCOL state, not from the error text: the
+    // stderr here is the same transient 503 the test above relaunches on.
+    // What forbids the retry is that a chunk already reached the person.
+    process.env.FAKE_ACP_TRANSIENTS = "1";
+    process.env.FAKE_ACP_PARTIAL_FAILS = "1";
+    process.env.FAKE_ACP_STATE = join(scratch, "acp-launches-partial");
+    process.env.FAKE_ACP_RETRY_SCALE = "0.001";
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-acp-partial", text: "go" });
+
+    const done = await recorder.until((e) => e.type === "turn.completed", 25_000);
+    expect(done).toMatchObject({ ok: false });
+    expect(recorder.events.some((e) => e.type === "turn.retrying")).toBe(false);
+    expect(
+      recorder.events.some((e) => e.type === "content.delta" && e.delta === "half an answer"),
+    ).toBe(true);
+  }, 40_000);
 
   it("preserves ACP error codes for provider setup classification", async () => {
     await create(ClassifiedErrorDriver, "auth-required");
@@ -596,6 +2124,68 @@ describe("ACP turns (fake CLI)", () => {
     const err = recorder.events.find((e) => e.type === "runtime.error")!;
     expect(err.message).toMatch(/did not switch to m-two \(still m-one\)/);
     // the whole point: no paid turn is spent on the wrong model
+    expect(recorder.events.some((e) => e.type === "content.delta")).toBe(false);
+  });
+
+  // Stock `dsh` answers session/set_config_option with a bare `{}`: it applies
+  // the switch but echoes no state.  That is not the silent-stick case above —
+  // there is no reported value to compare — so the guard must not fail the
+  // turn (BOTFLEET-M).
+  it("a bare set_config_option acknowledgement is not read as a failed switch", async () => {
+    process.env.FAKE_ACP_MODELS = "m-one,m-two";
+    process.env.FAKE_ACP_CONFIG_REPLY_BARE = "1";
+    await create(SelectModelDriver);
+    await instance.adapter.sendTurn({ threadId: "t-bare-model", text: "go", model: "m-two" });
+
+    const started = await recorder.until((e) => e.type === "session.started");
+    expect(started).toMatchObject({ model: "m-two" });
+    const done = await recorder.until((e) => e.type === "turn.completed");
+    expect(done).toMatchObject({ ok: true });
+    expect(recorder.events.some((e) => e.type === "content.delta")).toBe(true);
+  });
+
+  // mcode rides the same hook, but its wire values embed the user's login
+  // provider (m:<providerId>:<modelId>[:v:<variant>]): the driver matches the
+  // picker id against the advertised options and sends the advertised value
+  // back verbatim rather than constructing one.
+  it("mcode switches to a picker model via the advertised option value", async () => {
+    process.env.FAKE_ACP_MODELS = "m:minimax:MiniMax-M3:u,m:minimax:MiniMax-M2.7:v:highspeed";
+    const rpcDump = join(scratch, "rpc.json");
+    process.env.FAKE_ACP_RPC_DUMP = rpcDump;
+    await create(McodeAgentDriver);
+    await instance.adapter.sendTurn({ threadId: "t-mcode-model", text: "go", model: "MiniMax-M2.7-highspeed" });
+
+    const started = await recorder.until((e) => e.type === "session.started");
+    expect(started).toMatchObject({ model: "MiniMax-M2.7-highspeed" });
+    const done = await recorder.until((e) => e.type === "turn.completed");
+    expect(done).toMatchObject({ ok: true });
+    expect(JSON.parse(readFileSync(rpcDump, "utf8"))).toContain("session/set_config_option");
+  });
+
+  // An older mcode advertises no model option: the switch must be skipped,
+  // not attempted - the session keeps its login default, exactly the behavior
+  // the picker had before this hook existed.
+  it("mcode keeps the session default when no model option is advertised", async () => {
+    const rpcDump = join(scratch, "rpc.json");
+    process.env.FAKE_ACP_RPC_DUMP = rpcDump;
+    await create(McodeAgentDriver);
+    await instance.adapter.sendTurn({ threadId: "t-mcode-default", text: "go", model: "MiniMax-M3" });
+
+    const done = await recorder.until((e) => e.type === "turn.completed");
+    expect(done).toMatchObject({ ok: true });
+    expect(recorder.events.some((e) => e.type === "content.delta")).toBe(true);
+    expect(JSON.parse(readFileSync(rpcDump, "utf8"))).not.toContain("session/set_config_option");
+  });
+
+  it("mcode fails the turn clearly when the model is not advertised", async () => {
+    process.env.FAKE_ACP_MODELS = "m:minimax:MiniMax-M3:u";
+    await create(McodeAgentDriver);
+    await instance.adapter.sendTurn({ threadId: "t-mcode-bad", text: "go", model: "MiniMax-M9" });
+
+    const done = await recorder.until((e) => e.type === "turn.completed");
+    expect(done).toMatchObject({ ok: false });
+    const err = recorder.events.find((e) => e.type === "runtime.error")!;
+    expect(err.message).toMatch(/does not offer MiniMax-M9/);
     expect(recorder.events.some((e) => e.type === "content.delta")).toBe(false);
   });
 
@@ -653,6 +2243,36 @@ describe("ACP turns (fake CLI)", () => {
     );
   });
 
+  it("clears the reservation when turn model setup throws before spawn", async () => {
+    let resolveAttempts = 0;
+    const ThrowingTurnSetupDriver = createAcpDriver({
+      ...SELECT_MODEL_SUPPORT,
+      driverKind: "throwingTurnSetupTest",
+      selectModel: undefined,
+      resolveTurnModel: (model) => {
+        resolveAttempts += 1;
+        if (resolveAttempts === 1) throw new Error("model setup failed");
+        return model;
+      },
+    });
+    await create(ThrowingTurnSetupDriver);
+
+    const failed = await instance.adapter.sendTurn({ threadId: "t-setup-throw", text: "first" });
+    expect(failed).toMatchObject({ dispatched: false });
+    expect(instance.adapter.hasSession("t-setup-throw")).toBe(false);
+    expect(recorder.events).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "runtime.error", message: "model setup failed" }),
+      expect.objectContaining({ type: "turn.completed", ok: false, stopReason: "setup_error" }),
+    ]));
+
+    const retried = await instance.adapter.sendTurn({ threadId: "t-setup-throw", text: "second" });
+    expect(retried).toMatchObject({ turnId: expect.any(String) });
+    await vi.waitFor(() => {
+      expect(recorder.events.filter((event) => event.type === "turn.completed")).toHaveLength(2);
+    });
+    expect(recorder.events.at(-1)).toMatchObject({ type: "turn.completed", ok: true });
+  });
+
   it("transformEnv sees the instance config", async () => {
     const dump = join(scratch, "policy.json");
     process.env.FAKE_ACP_DUMP = dump;
@@ -671,15 +2291,91 @@ describe("ACP turns (fake CLI)", () => {
     expect(JSON.parse(readFileSync(dump, "utf8")).env.TEST_POLICY).toBe("auto");
   });
 
-  it("declares effort levels for Grok only", async () => {
+  it("declares effort levels only where a driver can actually apply them", async () => {
     await create(GrokAgentDriver);
     expect(instance.adapter.capabilities.effortLevels).toEqual(["low", "medium", "high"]);
 
-    await create(GeminiAgentDriver);
-    expect(instance.adapter.capabilities.effortLevels).toBeUndefined();
+    // Native DSH exposes the exact model's off/high/max options through ACP.
+    // BotFleet calls its no-reasoning choice "none" and maps it on the wire.
+    await create(DshAgentDriver);
+    expect(instance.adapter.capabilities.effortLevels).toEqual(["none", "high", "max"]);
 
     await create(KimiAgentDriver);
     expect(instance.adapter.capabilities.effortLevels).toBeUndefined();
+  });
+
+  it("overlays per-model effort levels onto the described model catalog", () => {
+    const options = PerModelEffortDriver.models.options;
+    // A model in the map gets the map's entry as the option's effortLevels.
+    expect(options.find((option) => option.id === "m-one")?.effortLevels).toEqual(["none", "high", "max"]);
+    // An option that already declares its own levels keeps them.
+    expect(options.find((option) => option.id === "m-two")?.effortLevels).toEqual(["low"]);
+    // A model absent from the map gets none: it falls back to the
+    // driver-wide list.
+    expect(options.find((option) => option.id === "m-three")?.effortLevels).toBeUndefined();
+  });
+
+  it("overlays image flags onto static models without overriding an explicit false", () => {
+    expect(PerModelImagesDriver.models.options).toEqual([
+      { id: "flash", label: "Flash", images: true },
+      { id: "pro", label: "Pro", images: false },
+      { id: "custom", label: "Custom" },
+    ]);
+  });
+
+  it("overlays image flags onto live-discovered models", async () => {
+    const driver = createAcpDriver({
+      ...SELECT_MODEL_SUPPORT,
+      driverKind: "perModelImagesRefreshTest",
+      perModelImages: { "dynamic-model": false },
+      resolveModels: async () => ({ default: "dynamic-model", options: [{ id: "dynamic-model", label: "Dynamic" }] }),
+    });
+    const inst = await driver.create({
+      instanceId: "images-refresh", displayName: "Images", environment: {}, enabled: true,
+      config: driver.defaultConfig(),
+    });
+    try {
+      expect(inst.models.options).toEqual([{ id: "dynamic-model", label: "Dynamic", images: false }]);
+    } finally {
+      await inst.dispose();
+    }
+  });
+
+  it("leaves the catalog untouched when no per-model map is declared", () => {
+    const driver = createAcpDriver({ ...SELECT_MODEL_SUPPORT, driverKind: "noPerModelMapTest" });
+    expect(driver.models).toBe(SELECT_MODEL_SUPPORT.models);
+  });
+
+  it("keeps the driver-wide effort capability alongside per-model levels", async () => {
+    await create(PerModelEffortDriver);
+    expect(instance.adapter.capabilities.effortLevels).toEqual(["low", "medium", "high"]);
+  });
+
+  it("overlays per-model effort levels onto a refreshed catalog", async () => {
+    const driver = createAcpDriver({
+      ...SELECT_MODEL_SUPPORT,
+      driverKind: "perModelEffortRefreshTest",
+      defaultCli: FAKE_CLI,
+      perModelEffortLevels: { "dynamic-model": ["high", "max"] },
+      resolveModels: async () => ({
+        default: "dynamic-model",
+        options: [{ id: "dynamic-model", label: "Dynamic model" }],
+      }),
+    });
+    const inst = await driver.create({
+      instanceId: "per-model-effort-refresh-test",
+      displayName: "Per-Model Effort Refresh Test",
+      environment: {},
+      enabled: true,
+      config: driver.defaultConfig(),
+    });
+    try {
+      expect(inst.models.options).toEqual([
+        { id: "dynamic-model", label: "Dynamic model", effortLevels: ["high", "max"] },
+      ]);
+    } finally {
+      await inst.dispose();
+    }
   });
 
   it("passes effort to Grok, and omits the flag when unset", async () => {
@@ -702,11 +2398,11 @@ describe("ACP turns (fake CLI)", () => {
     expect(JSON.parse(readFileSync(without, "utf8")).argv).not.toContain("--reasoning-effort");
   });
 
-  it("puts Grok -m after agent so ACP stdio binds the local slug", async () => {
+  it("round-trips the Grok 4.7 picker model into the CLI argv", async () => {
     const dump = join(scratch, "grok-argv-order.json");
     await create(GrokAgentDriver);
     process.env.FAKE_ACP_DUMP = dump;
-    await instance.adapter.sendTurn({ threadId: "t-argv", text: "hi", model: "grok-4.5", effort: "high" });
+    await instance.adapter.sendTurn({ threadId: "t-argv", text: "hi", model: "grok-4.7", effort: "high" });
     await recorder.until((e) => e.type === "turn.completed");
 
     const argv = JSON.parse(readFileSync(dump, "utf8")).argv as string[];
@@ -716,13 +2412,184 @@ describe("ACP turns (fake CLI)", () => {
     expect(agent).toBeGreaterThan(-1);
     expect(modelFlag).toBeGreaterThan(agent);
     expect(stdio).toBeGreaterThan(modelFlag);
-    expect(argv[modelFlag + 1]).toBe("grok-4.5");
+    expect(argv[modelFlag + 1]).toBe("grok-4.7");
     expect(argv.indexOf("--reasoning-effort")).toBeGreaterThan(agent);
     expect(argv.indexOf("--permission-mode")).toBeLessThan(agent);
   });
 });
 
 describe("ACP snapshot", () => {
+  it("enforces a stock CLI compatibility gate again at dispatch", async () => {
+    process.env.FAKE_ACP_VERSION = "fake-acp 1.0.0";
+    const scratch = mkdtempSync(join(tmpdir(), "omb-version-gate-"));
+    const dump = join(scratch, "version.json");
+    process.env.FAKE_ACP_DUMP = dump;
+    const instance = await VersionGateDriver.create({
+      instanceId: "version-gated",
+      displayName: undefined,
+      environment: {
+        DEEPSEEK_API_KEY: "billing-key-must-not-reach-version-probe",
+        BOX_TOKEN: "workspace-key-must-not-reach-version-probe",
+      },
+      enabled: true,
+      config: VersionGateDriver.defaultConfig(),
+    });
+    const recorder = recordEvents(instance.adapter);
+    try {
+      expect(await instance.snapshot()).toMatchObject({
+        state: "unavailable",
+        reason: "ACP 2.0.0 is required",
+        version: "fake-acp 1.0.0",
+      });
+      const started = await instance.adapter.sendTurn({ threadId: "version-gated", text: "do not dispatch" });
+      expect(started.dispatched).toBe(false);
+      expect(recorder.events).toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: "runtime.error", message: "ACP 2.0.0 is required", setup: true }),
+        expect.objectContaining({ type: "turn.completed", ok: false, stopReason: "setup_required" }),
+      ]));
+      expect(JSON.parse(readFileSync(dump, "utf8")).env).not.toHaveProperty("DEEPSEEK_API_KEY");
+      expect(JSON.parse(readFileSync(dump, "utf8")).env).not.toHaveProperty("BOX_TOKEN");
+    } finally {
+      recorder.stop();
+      await instance.dispose();
+      delete process.env.FAKE_ACP_VERSION;
+      delete process.env.FAKE_ACP_DUMP;
+      await removeTempDir(scratch);
+    }
+  });
+
+  it("reserves a delayed version preflight against duplicate turns and interruption", async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "omb-version-race-"));
+    const gate = join(scratch, "release-version");
+    const dump = join(scratch, "version.json");
+    const rpcDump = join(scratch, "rpc.json");
+    process.env.FAKE_ACP_VERSION = "fake-acp 2.0.0";
+    process.env.FAKE_ACP_VERSION_GATE_FILE = gate;
+    process.env.FAKE_ACP_DUMP = dump;
+    process.env.FAKE_ACP_RPC_DUMP = rpcDump;
+    const instance = await VersionGateDriver.create({
+      instanceId: "version-race",
+      displayName: undefined,
+      environment: {},
+      enabled: true,
+      config: VersionGateDriver.defaultConfig(),
+    });
+    const recorder = recordEvents(instance.adapter);
+    try {
+      const pending = instance.adapter.sendTurn({ threadId: "version-race", text: "must not dispatch" });
+      await vi.waitFor(() => expect(existsSync(dump)).toBe(true), { timeout: 10_000, interval: 10 });
+      expect(instance.adapter.hasSession("version-race")).toBe(true);
+      await expect(
+        instance.adapter.sendTurn({ threadId: "version-race", text: "duplicate" }),
+      ).rejects.toThrow(/already running/);
+      await instance.adapter.interruptTurn("version-race");
+      writeFileSync(gate, "release");
+      expect(await pending).toMatchObject({ dispatched: false });
+      expect(instance.adapter.hasSession("version-race")).toBe(false);
+      expect(existsSync(rpcDump)).toBe(false);
+      expect(recorder.events).toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: "turn.completed", ok: false, stopReason: "interrupted" }),
+      ]));
+    } finally {
+      recorder.stop();
+      await instance.dispose();
+      delete process.env.FAKE_ACP_VERSION;
+      delete process.env.FAKE_ACP_VERSION_GATE_FILE;
+      delete process.env.FAKE_ACP_DUMP;
+      delete process.env.FAKE_ACP_RPC_DUMP;
+      await removeTempDir(scratch);
+    }
+  });
+
+  it.each(["stopAll", "dispose"] as const)("prevents launch after %s during a delayed version preflight", async (operation) => {
+    const scratch = mkdtempSync(join(tmpdir(), `omb-version-${operation}-`));
+    const gate = join(scratch, "release-version");
+    const dump = join(scratch, "version.json");
+    const rpcDump = join(scratch, "rpc.json");
+    process.env.FAKE_ACP_VERSION = "fake-acp 2.0.0";
+    process.env.FAKE_ACP_VERSION_GATE_FILE = gate;
+    process.env.FAKE_ACP_DUMP = dump;
+    process.env.FAKE_ACP_RPC_DUMP = rpcDump;
+    const instance = await VersionGateDriver.create({
+      instanceId: `version-${operation}`,
+      displayName: undefined,
+      environment: {},
+      enabled: true,
+      config: VersionGateDriver.defaultConfig(),
+    });
+    try {
+      const pending = instance.adapter.sendTurn({ threadId: `version-${operation}`, text: "must not dispatch" });
+      await vi.waitFor(() => expect(existsSync(dump)).toBe(true), { timeout: 10_000, interval: 10 });
+      if (operation === "stopAll") await instance.adapter.stopAll();
+      else await instance.dispose();
+      writeFileSync(gate, "release");
+      expect(await pending).toMatchObject({ dispatched: false });
+      expect(existsSync(rpcDump)).toBe(false);
+      if (operation === "dispose") {
+        await expect(
+          instance.adapter.sendTurn({ threadId: "after-dispose", text: "must reject" }),
+        ).rejects.toThrow(/disposed/);
+      }
+    } finally {
+      await instance.dispose();
+      delete process.env.FAKE_ACP_VERSION;
+      delete process.env.FAKE_ACP_VERSION_GATE_FILE;
+      delete process.env.FAKE_ACP_DUMP;
+      delete process.env.FAKE_ACP_RPC_DUMP;
+      await removeTempDir(scratch);
+    }
+  });
+
+  it("holds the same reservation through an asynchronous authentication preflight", async () => {
+    let authStarted!: () => void;
+    let releaseAuth!: () => void;
+    const startedAuth = new Promise<void>((resolve) => {
+      authStarted = resolve;
+    });
+    const authGate = new Promise<void>((resolve) => {
+      releaseAuth = resolve;
+    });
+    const AsyncPreflightDriver = createAcpDriver({
+      ...SELECT_MODEL_SUPPORT,
+      driverKind: "asyncPreflightTest",
+      selectModel: undefined,
+      requireAuthenticationBeforeSpawn: true,
+      isAuthenticated: async () => {
+        authStarted();
+        await authGate;
+        return true;
+      },
+    });
+    const scratch = mkdtempSync(join(tmpdir(), "omb-auth-race-"));
+    const rpcDump = join(scratch, "rpc.json");
+    process.env.FAKE_ACP_RPC_DUMP = rpcDump;
+    const instance = await AsyncPreflightDriver.create({
+      instanceId: "auth-race",
+      displayName: undefined,
+      environment: {},
+      enabled: true,
+      config: { cli: FAKE_CLI, fullAuto: false },
+    });
+    try {
+      const pending = instance.adapter.sendTurn({ threadId: "auth-race", text: "must not dispatch" });
+      await startedAuth;
+      expect(instance.adapter.hasSession("auth-race")).toBe(true);
+      await expect(
+        instance.adapter.sendTurn({ threadId: "auth-race", text: "duplicate" }),
+      ).rejects.toThrow(/already running/);
+      await instance.adapter.interruptTurn("auth-race");
+      releaseAuth();
+      expect(await pending).toMatchObject({ dispatched: false });
+      expect(instance.adapter.hasSession("auth-race")).toBe(false);
+      expect(existsSync(rpcDump)).toBe(false);
+    } finally {
+      releaseAuth();
+      await instance.dispose();
+      delete process.env.FAKE_ACP_RPC_DUMP;
+      await removeTempDir(scratch);
+    }
+  });
+
   it("a missing binary is unavailable", async () => {
     const instance = await GrokAgentDriver.create({
       instanceId: "grok-missing",

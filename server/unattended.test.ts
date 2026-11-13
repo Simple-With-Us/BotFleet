@@ -10,13 +10,16 @@
 //   2. and so must the turn that bot hands to a teammate — the gate has to
 //      survive the peer-comms hop, or it protects the bot that read the
 //      payload and releases the one that acts on it
-import { spawn, type ChildProcess } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { removeTempDir, waitForExit } from "./testing/cleanup.ts";
+import { z } from "zod";
+
+import { removeTempDir, spawnDetached, waitForExit } from "./testing/cleanup.ts";
+import { harnessReady } from "./testing/harness-ready.ts";
 
 
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
@@ -29,11 +32,36 @@ let child: ChildProcess;
 let home: string;
 let stderr = "";
 
-const api = async (method: string, path: string, body?: unknown): Promise<{ status: number; body: any }> => {
+type HarnessModelSelection = { instanceId: string; model: string };
+type HarnessRequestBody = {
+  name?: string;
+  autoApprove?: boolean;
+  hidden?: boolean;
+  computers?: string[];
+  acknowledgeLocalAuto?: boolean;
+  modelSelection?: HarnessModelSelection;
+  prompt?: string;
+  botId?: string;
+  runOn?: string;
+  /** A relay-sourced inbound message names its transport. */
+  source?: string;
+  chatId?: string;
+  botDefaults?: { imessagePerBot?: Record<string, string> };
+  text?: string;
+  schedule?: { type: string; at: number };
+};
+
+// SAFETY: the harness answers JSON on every route this test calls, and the
+// body shapes are asserted at the point of use.
+const api = async (
+  method: string,
+  path: string,
+  payload?: HarnessRequestBody,
+): Promise<{ status: number; body: any }> => {
   const res = await fetch(`${BASE}${path}`, {
     method,
-    headers: body ? { "content-type": "application/json" } : undefined,
-    body: body ? JSON.stringify(body) : undefined,
+    headers: payload ? { "content-type": "application/json" } : undefined,
+    body: payload ? JSON.stringify(payload) : undefined,
   });
   return { status: res.status, body: await res.json() };
 };
@@ -54,13 +82,48 @@ async function waitForCard(threadId: string, ms = 30_000) {
   return null;
 }
 
+/** Poll a BOT's own conversation for a live permission card.  A relayed
+ *  message dispatches on the bot's thread, so unlike the webhook case the
+ *  card does land on the open conversation. */
+async function waitForBotCard(botId: string, ms = 30_000) {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    const { body } = await api("GET", "/api/bots");
+    const messages = (body.bots ?? []).find((b: { id: string }) => b.id === botId)?.messages ?? [];
+    const card = messages.find(
+      (m: { kind: string; card?: { requestId?: string } }) => m.kind === "options" && m.card?.requestId,
+    );
+    if (card) return card;
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  return null;
+}
+
+type RoutineRunView = { id: string; routineId: string; status: string; threadId?: string; error?: string };
+
+/** The latest receipt for a routine, once it satisfies `ready`. */
+async function waitForRoutineRun(
+  routineId: string,
+  ready: (run: RoutineRunView) => boolean,
+  ms = 30_000,
+): Promise<RoutineRunView | null> {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    const { body } = await api("GET", "/api/routines");
+    const run = (body.runs ?? []).find((r: RoutineRunView) => r.routineId === routineId);
+    if (run && ready(run)) return run;
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  return null;
+}
+
 /** The detached task a webhook delivery created. */
 async function waitForRunThread(runId: string, ms = 20_000) {
   const deadline = Date.now() + ms;
   while (Date.now() < deadline) {
     const { body } = await api("GET", "/api/routines");
     const run = (body.runs ?? []).find((r: { id: string }) => r.id === runId);
-    if (run?.threadId) return run.threadId as string;
+    if (run?.threadId) return run.threadId;
     await new Promise((r) => setTimeout(r, 250));
   }
   return null;
@@ -95,32 +158,49 @@ posixOnly("unattended turns keep asking", () => {
             environment: { FAKE_ACP_MODE: "ask-peer" },
             config: { cli: FAKE_CLI, fullAuto: false },
           },
+          // the shape every fleet bot has: a full-auto instance with the bot
+          // pointed at this computer, which used to die at dispatch
+          "grok-full": {
+            driver: "grokAgent",
+            environment: { FAKE_ACP_MODE: "permission" },
+            config: { cli: FAKE_CLI, fullAuto: true },
+          },
         },
       }),
     );
-    child = spawn(process.execPath, [join(SERVER_DIR, "index.ts")], {
+    const childEnv: NodeJS.ProcessEnv = {
+      HOME: home,
+      USERPROFILE: home,
+      OMB_PORT: String(PORT),
+    };
+    if (process.env.PATH) childEnv.PATH = process.env.PATH;
+    if (process.env.SystemRoot) childEnv.SystemRoot = process.env.SystemRoot;
+    // This suite checks permission propagation, not host admission. A busy
+    // runner can defer a webhook for 20 minutes, longer than these assertions.
+    // Keep real production admission unchanged; isolate only this child.
+    child = spawnDetached(process.execPath, ["--import", join(SERVER_DIR, "testing", "cool-host-loader.mjs"), join(SERVER_DIR, "index.ts")], {
       cwd: join(SERVER_DIR, ".."),
-      env: {
-        ...(process.env.PATH ? { PATH: process.env.PATH } : {}),
-        ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
-        HOME: home,
-        USERPROFILE: home,
-        OMB_PORT: String(PORT),
-      },
+      env: childEnv,
       stdio: ["ignore", "pipe", "pipe"],
     });
     child.stderr!.on("data", (c) => (stderr += c));
-    const deadline = Date.now() + 20_000;
+    // Four ACP instances means four CLI probes before the fleet is ready.
+    // 20s was tuned on an idle machine; a loaded one (other seats working in
+    // their own worktrees) spends it in the probes and reports "the server
+    // never came up" for a child that is booting perfectly well.  All the
+    // boot log goes to stdout, which this loop does not read, so the failure
+    // message had nothing to show for it either.
+    const deadline = Date.now() + 90_000;
     for (;;) {
       try {
-        if ((await fetch(`${BASE}/api/health`)).ok) break;
+        if (await harnessReady(BASE)) break;
       } catch {
         /* not up yet */
       }
       if (Date.now() > deadline) throw new Error(`server never came up. stderr:\n${stderr}`);
       await new Promise((r) => setTimeout(r, 150));
     }
-  }, 40_000);
+  }, 100_000);
 
   afterAll(async () => {
     await waitForExit(child, { signal: "SIGTERM" });
@@ -137,6 +217,7 @@ posixOnly("unattended turns keep asking", () => {
         (
           await api("PATCH", `/api/bots/${bot.id}`, {
             autoApprove: true,
+            computers: [],
             modelSelection: { instanceId: "grok", model: "fake-model" },
           })
         ).status,
@@ -146,7 +227,7 @@ posixOnly("unattended turns keep asking", () => {
         name: "Nightly build",
         prompt: "Handle the incoming build event",
         botId: bot.id,
-        runOn: "maus",
+        runOn: "bot",
       });
       expect(hook.status).toBe(201);
 
@@ -156,7 +237,8 @@ posixOnly("unattended turns keep asking", () => {
         body: JSON.stringify({ status: "failed" }),
       });
       expect(delivered.status).toBe(202);
-      const { runId } = (await delivered.json()) as { runId: string };
+      const webhookAcceptedSchema = z.object({ runId: z.string() });
+      const { runId } = webhookAcceptedSchema.parse(await delivered.json());
 
       const threadId = await waitForRunThread(runId);
       expect(threadId, "the webhook never started a task").toBeTruthy();
@@ -172,6 +254,220 @@ posixOnly("unattended turns keep asking", () => {
   );
 
   it(
+    "still asks a human when a stranger's iMessage text starts the turn, even with auto mode on",
+    async () => {
+      // A message that arrived over the Mac relay is somebody else's phone,
+      // not the owner's keyboard.  It must dispatch unattended, so Auto mode
+      // cannot answer for a person who is not watching.
+      const bot = (await api("POST", "/api/bots")).body.bot;
+      expect(
+        (
+          await api("PATCH", `/api/bots/${bot.id}`, {
+            name: "Relay",
+            autoApprove: true,
+            computers: [],
+            modelSelection: { instanceId: "grok", model: "fake-model" },
+          })
+        ).status,
+      ).toBe(200);
+
+      const delivered = await api("POST", `/api/bots/${bot.id}/messages`, {
+        text: "run the deploy",
+        source: "imessage",
+      });
+      expect(delivered.status).toBe(202);
+
+      const card = await waitForBotCard(bot.id);
+      expect(card, "relayed iMessage text auto-approved instead of asking").not.toBeNull();
+      expect(card.card.requestId).toBeTruthy();
+      expect(card.card.answered).toBeUndefined();
+    },
+    60_000,
+  );
+
+  it(
+    "still asks a human when a Linq chat starts the turn, even with auto mode on",
+    async () => {
+      // The other relay.  It has to be armed per bot (`imessagePerBot`), the
+      // same gate the real Linq webhook posts through.
+      const bot = (await api("POST", "/api/bots")).body.bot;
+      expect(
+        (
+          await api("PATCH", `/api/bots/${bot.id}`, {
+            name: "Linq relay",
+            autoApprove: true,
+            computers: [],
+            modelSelection: { instanceId: "grok", model: "fake-model" },
+          })
+        ).status,
+      ).toBe(200);
+      const armed = await api("PUT", "/api/config", {
+        botDefaults: { imessagePerBot: { [bot.id]: "linq" } },
+      });
+      expect(armed.status, JSON.stringify(armed.body)).toBe(200);
+
+      const delivered = await api("POST", `/api/bots/${bot.id}/messages`, {
+        text: "ship it",
+        source: "linq",
+        chatId: "chat_test_1",
+      });
+      expect(delivered.status).toBe(202);
+
+      expect(
+        await waitForBotCard(bot.id),
+        "Linq-sourced text auto-approved instead of asking",
+      ).not.toBeNull();
+    },
+    60_000,
+  );
+
+  it(
+    "lets Auto mode answer an owner-typed message, which is the attended case",
+    async () => {
+      // The other half of the relay rule: a person typing into the bot is
+      // exactly what Auto mode is for, and S8 must not have taken it away.
+      const bot = (await api("POST", "/api/bots")).body.bot;
+      expect(
+        (
+          await api("PATCH", `/api/bots/${bot.id}`, {
+            name: "Owner",
+            autoApprove: true,
+            computers: [],
+            modelSelection: { instanceId: "grok", model: "fake-model" },
+          })
+        ).status,
+      ).toBe(200);
+
+      const sent = await api("POST", `/api/bots/${bot.id}/messages`, { text: "run the deploy" });
+      expect(sent.status).toBe(202);
+
+      const deadline = Date.now() + 30_000;
+      /** What the poll found on this pass: the auto-approval activity, and the
+       *  approval card that is still unanswered. */
+      type PollResult = { auto?: unknown; card?: unknown };
+      const seen: PollResult = {};
+      while (Date.now() < deadline) {
+        const { body } = await api("GET", "/api/bots");
+        const messages = (body.bots ?? []).find((b: { id: string }) => b.id === bot.id)?.messages ?? [];
+        const auto = messages.find(
+          (m: { kind: string; tool?: { name?: string } }) =>
+            m.kind === "activity" && String(m.tool?.name ?? "").startsWith("auto-approved"),
+        );
+        const card = messages.find(
+          (m: { kind: string; card?: { requestId?: string; answered?: string } }) =>
+            m.kind === "options" && m.card?.requestId && m.card.answered === undefined,
+        );
+        Object.assign(seen, { auto, card });
+        if (auto) break;
+        await new Promise((r) => setTimeout(r, 250));
+      }
+      expect(seen.auto, "Auto mode never answered the owner's own message").toBeTruthy();
+      expect(seen.card, "an owner-typed message stopped carding").toBeUndefined();
+    },
+    60_000,
+  );
+
+  it(
+    "lets Auto mode answer a calendar turn because the owner scheduled that bot",
+    async () => {
+      // Calendar ticks use the prompt the owner saved.  Auto mode applies;
+      // destructive/sensitive still card.  Webhooks stay unattended.
+      const bot = (await api("POST", "/api/bots")).body.bot;
+      expect(
+        (
+          await api("PATCH", `/api/bots/${bot.id}`, {
+            name: "Night owl",
+            autoApprove: true,
+            computers: [],
+            modelSelection: { instanceId: "grok", model: "fake-model" },
+          })
+        ).status,
+      ).toBe(200);
+      const created = await api("POST", "/api/routines", {
+        name: "Nightly sweep",
+        prompt: "Tidy the workspace",
+        botId: bot.id,
+        runOn: "bot",
+        schedule: { type: "once", at: Date.now() - 1_000 },
+      });
+      expect(created.status).toBe(201);
+
+      const run = await waitForRoutineRun(created.body.routine.id, (r) => Boolean(r.threadId));
+      expect(run?.threadId, "the scheduled routine never started a task").toBeTruthy();
+
+      // Auto mode answers the provider request without minting an options
+      // card — the transcript chip is `auto-approved …`.  An unanswered
+      // card would mean the calendar tick was still treated as unattended.
+      const deadline = Date.now() + 30_000;
+      let autoChip: { tool?: { name?: string } } | undefined;
+      while (Date.now() < deadline) {
+        const { body } = await api("GET", `/api/threads/${run!.threadId}/messages`);
+        const messages = body.messages ?? [];
+        autoChip = messages.find(
+          (m: { kind: string; tool?: { name?: string } }) =>
+            m.kind === "activity" && String(m.tool?.name ?? "").startsWith("auto-approved"),
+        );
+        if (autoChip) break;
+        await new Promise((r) => setTimeout(r, 250));
+      }
+      expect(autoChip, "Auto mode never answered the calendar permission").toBeTruthy();
+      const { body: late } = await api("GET", `/api/threads/${run!.threadId}/messages`);
+      const unanswered = (late.messages ?? []).find(
+        (m: { kind: string; card?: { requestId?: string; answered?: string } }) =>
+          m.kind === "options" && m.card?.requestId && m.card.answered === undefined,
+      );
+      expect(unanswered, "calendar Auto left an unanswered card").toBeUndefined();
+    },
+    60_000,
+  );
+
+  it(
+    "starts a scheduled turn on a full-auto engine whose bot is pointed at this computer",
+    async () => {
+      // Every fleet bot has this shape, and every one of its routine runs
+      // used to fail in under 40 ms with "this model engine cannot control
+      // this computer". The turn must start; when the desktop is not
+      // available it runs without the mount and says so in the transcript.
+      const bot = (await api("POST", "/api/bots")).body.bot;
+      expect(
+        (
+          await api("PATCH", `/api/bots/${bot.id}`, {
+            name: "Housekeeper",
+            autoApprove: true,
+            computers: ["local"],
+            // the desktop confirms the Auto-on-this-computer warning first
+            acknowledgeLocalAuto: true,
+            modelSelection: { instanceId: "grok-full", model: "fake-model" },
+          })
+        ).status,
+      ).toBe(200);
+      const created = await api("POST", "/api/routines", {
+        name: "Disk sweep",
+        prompt: "Free some disk space",
+        botId: bot.id,
+        runOn: "bot",
+        schedule: { type: "once", at: Date.now() - 1_000 },
+      });
+      expect(created.status).toBe(201);
+
+      const run = await waitForRoutineRun(
+        created.body.routine.id,
+        (r) => r.status !== "queued" && r.status !== "running" && r.status !== "waiting",
+      );
+      expect(run, "the scheduled routine never settled").not.toBeNull();
+      expect(run, "the run died instead of starting").toMatchObject({ status: "completed" });
+
+      const { body } = await api("GET", `/api/threads/${run!.threadId}/messages`);
+      const chips = (body.messages ?? [])
+        .filter((m: { kind: string; tool?: { name?: string } }) => m.kind === "activity")
+        .map((m: { tool?: { name?: string } }) => m.tool?.name ?? "");
+      expect(chips.some((name: string) => name.startsWith("local computer not mounted:"))).toBe(true);
+      expect(chips.some((name: string) => name.includes("cannot control this computer"))).toBe(false);
+    },
+    60_000,
+  );
+
+  it(
     "keeps asking after the work is handed to a teammate",
     async () => {
       // A runs the webhook and delegates; B does the acting. Without the
@@ -179,12 +475,13 @@ posixOnly("unattended turns keep asking", () => {
       // payload and releases the bot that ACTS on it.
       const created = await api("POST", "/api/bots");
       const teammate = created.body.bot;
-      await api("PATCH", `/api/bots/${teammate.id}`, { name: "Teammate", autoApprove: true });
+      await api("PATCH", `/api/bots/${teammate.id}`, { name: "Teammate", autoApprove: true, computers: [] });
 
       const delegator = (await api("POST", "/api/bots")).body.bot;
       await api("PATCH", `/api/bots/${delegator.id}`, {
         name: "Delegator",
         autoApprove: true,
+        computers: [],
         modelSelection: { instanceId: "delegator", model: "fake-model" },
       });
 
@@ -192,7 +489,7 @@ posixOnly("unattended turns keep asking", () => {
         name: "Handoff",
         prompt: "Ask the Teammate to handle this",
         botId: delegator.id,
-        runOn: "maus",
+        runOn: "bot",
       });
       expect(hook.status).toBe(201);
 
@@ -235,6 +532,7 @@ posixOnly("unattended turns keep asking", () => {
       await api("PATCH", `/api/bots/${target.id}`, {
         name: "Answerer",
         autoApprove: true,
+        computers: [],
         modelSelection: { instanceId: "grok", model: "fake-model" },
       });
 
@@ -242,6 +540,7 @@ posixOnly("unattended turns keep asking", () => {
       await api("PATCH", `/api/bots/${asker.id}`, {
         name: "Asker",
         autoApprove: true,
+        computers: [],
         hidden: true, // keep it out of its own peer list's way
         modelSelection: { instanceId: "asker", model: "fake-model" },
       });
@@ -250,7 +549,7 @@ posixOnly("unattended turns keep asking", () => {
         name: "Ask a teammate",
         prompt: "Ask the Answerer what to do about this",
         botId: asker.id,
-        runOn: "maus",
+        runOn: "bot",
       });
       expect(hook.status).toBe(201);
       const delivered = await fetch(hook.body.credential.url, {
@@ -272,7 +571,7 @@ posixOnly("unattended turns keep asking", () => {
         if (!card) await new Promise((r) => setTimeout(r, 300));
       }
       expect(card, "the asked teammate auto-approved — ask_bot did not carry the gate").not.toBeNull();
-      expect(card!.card!.answered).toBeUndefined();
+      expect(card!.card!.answered).not.toBe("approve");
     },
     90_000,
   );

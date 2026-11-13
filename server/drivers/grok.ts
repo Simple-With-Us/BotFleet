@@ -5,6 +5,7 @@
 // generateText (bot titles, thread names) — upstream's TextGeneration slot.
 import type {
   DriverCreateInput,
+  ModelCatalog,
   ProviderDriver,
   ProviderInstance,
   ProviderSnapshot,
@@ -13,20 +14,55 @@ import type {
   SendTurnInput,
 } from "../contracts.ts";
 import { newEventId, newId } from "../contracts.ts";
-import { classifyError, computeBackoff, interruptibleDelay, RETRY_MAX_ATTEMPTS } from "./retry.ts";
+import type { ReviewPrompt } from "../../shared/auto-review.ts";
 import { appendNative } from "./native.ts";
+import { splitChatPrompt } from "./prompt-split.ts";
+import { toolFields } from "../tool-fields.ts";
+import {
+  createModelDiscoveryProbe,
+  discoverModelCatalog,
+  fetchProviderModels,
+} from "./model-discovery.ts";
+
+import { runTurnLoop, type TurnLoopDeps, type TurnUsage } from "./chat-completions/loop.ts";
+import { toTurnUsage } from "./chat-completions/usage.ts";
+import { httpErrorFor } from "./chat-completions/errors.ts";
+import { capReplayedTranscript } from "./chat-completions/replay-cap.ts";
 
 const DRIVER_KIND = "grok";
 const DEFAULT_URL = "https://api.x.ai/v1";
 
+// This is the xAI API catalog, which is separate from Grok Build's
+// subscription CLI catalog in acp/grok.ts. The Build-only fast variant is
+// intentionally absent here, and so is Composer 2.5 (Cursor's model, served
+// through the Grok Build CLI, not the xAI API).  grok-build-0.1 is a public
+// xAI API model id (beta since 2026-05-29, https://x.ai/news/grok-build-0-1).
+// Live discovery below keeps this row's label and drops duplicates.  There is
+// no per-model rate table in the repo (the what-if projection prices a whole
+// engine from src/lib/engine-capabilities.tsx), so no rate is recorded here.
+// Every chat-completions model on api.x.ai takes `max_completion_tokens`
+// (endpoint-level per https://docs.x.ai/docs/api-reference#chat-completions:
+// "an upper bound for the number of tokens that can be generated for a
+// completion, only applies to visible output tokens"; `max_tokens` is
+// deprecated there), so the whole catalog carries supportsMaxOutput.
+// Context windows are per xAI's model table (https://docs.x.ai/docs/models,
+// fetched 2026-10-21): the server gate and the picker both bound the bot's
+// output limit against contextWindow, so a row with the flag and no window
+// would let an arbitrary limit reach xAI and fail the whole turn.
 const MODELS = {
-  default: "grok-4",
+  default: "grok-4.7",
   options: [
-    { id: "grok-4", label: "Grok 4" },
-    { id: "grok-4-fast", label: "Grok 4 Fast" },
-    { id: "grok-3-mini", label: "Grok 3 Mini" },
+    { id: "grok-4.7", label: "Grok 4.7", contextWindow: 500_000, supportsMaxOutput: true },
+    { id: "grok-build-0.1", label: "Grok Build 0.1", contextWindow: 256_000, supportsMaxOutput: true },
+    { id: "grok-4.6", label: "Grok 4.6", contextWindow: 500_000, supportsMaxOutput: true },
+    { id: "grok-4.5", label: "Grok 4.5", contextWindow: 500_000, supportsMaxOutput: true },
   ],
 };
+
+/** How long one `GET /models` answer is reused.  Matches the MiniMax driver's
+ *  60 s: short enough that a newly shipped model shows up in a picker refresh,
+ *  long enough that a burst of describes costs one round trip. */
+const MODEL_DISCOVERY_TTL_MS = 60_000;
 
 export interface GrokConfig {
   url: string;
@@ -45,7 +81,19 @@ function decodeConfig(raw: unknown): GrokConfig {
 export const GrokDriver: ProviderDriver<GrokConfig> = {
   driverKind: DRIVER_KIND,
   // "(API)" distinguishes this key-billed driver from grokAgent, the CLI one
-  metadata: { displayName: "Grok (API)", supportsMultipleInstances: true },
+  // billed to the user's own XAI_API_KEY — the same shape as openai-compat.
+  // Omitting access defaulted to "subscription" and put a BYOK engine above
+  // the picker's Custom divider alongside Claude and Codex.
+  metadata: {
+    displayName: "Grok (API)",
+    supportsMultipleInstances: true,
+    access: "custom",
+    // The direct HTTP driver.  No Composio bridge, no screen channel, no
+    // image input — the image row on the `grok` matrix row is carried by the
+    // Grok Build ACP driver, not by this one, which is why the matrix check
+    // aggregates across every driver that maps to an engine id.
+    channelWiring: { agentsMcp: true, computerMcp: false, composioMcp: false, localComputerMcp: true, images: false },
+  },
   models: MODELS,
   decodeConfig,
   defaultConfig: () => decodeConfig({}),
@@ -68,157 +116,258 @@ export const GrokDriver: ProviderDriver<GrokConfig> = {
     });
 
     const complete = async (
-      messages: Array<{ role: string; content: string }>,
+      messages: any[],
       model: string,
-      opts: { stream: boolean; signal?: AbortSignal; onDelta?: (d: string) => void },
-    ): Promise<{ text: string; usage: { input: number; output: number } | null }> => {
+      opts: { stream: boolean; tools?: any[]; signal?: AbortSignal; onChunk?: () => void; onUsage?: (usage: TurnUsage) => void; onDelta?: (d: string, streamKind?: string) => void; onToolCallDelta?: (index: number, id?: string, name?: string, args?: string) => void; maxOutputTokens?: number },
+    ): Promise<{ text: string; tool_calls?: any[]; usage: TurnUsage | null }> => {
       const res = await fetch(`${config.url}/chat/completions`, {
         method: "POST",
         headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
-        body: JSON.stringify({ model, messages, stream: opts.stream }),
-        signal: opts.signal ?? AbortSignal.timeout(120_000),
+        // max_completion_tokens, never the deprecated max_tokens (xAI docs,
+        // same reference as the catalog note above).  Undefined drops the key.
+        body: JSON.stringify({ model, messages, stream: opts.stream, ...(opts.stream ? { stream_options: { include_usage: true } } : {}), ...(opts.tools && opts.tools.length > 0 ? { tools: opts.tools } : {}), max_completion_tokens: opts.maxOutputTokens }),
+        // The turn loop's signal already carries this round's deadlines
+        // (a hard ceiling plus an idle clock fed by `onChunk`).  A second
+        // timer here used to race them: a fixed 120s under the loop's own
+        // round ceiling cut a slow-but-live reasoning round off, and
+        // because the loop could not see which clock fired it was retried
+        // and then failed as a provider_error, which paged.  Only a caller
+        // with no signal (generateText) needs a ceiling of its own — the
+        // same pattern minimax.ts and openai-compat.ts use.
+        signal: opts.signal ?? AbortSignal.timeout(180_000),
       });
       if (!res.ok) {
         const body = await res.text().catch(() => "");
-        throw new Error(`xAI HTTP ${res.status}${body ? `: ${body.slice(0, 200)}` : ""}`);
+        throw httpErrorFor(res.status, body ? body.slice(0, 200) : "");
       }
+      // headers are progress too: the socket answered
+      opts.onChunk?.();
       if (!opts.stream) {
         const json: any = await res.json();
         return {
           text: json.choices?.[0]?.message?.content ?? "",
+          tool_calls: json.choices?.[0]?.message?.tool_calls,
           usage: json.usage
-            ? { input: json.usage.prompt_tokens ?? 0, output: json.usage.completion_tokens ?? 0 }
+            ? toTurnUsage(json.usage)
             : null,
         };
       }
       let text = "";
-      let usage: { input: number; output: number } | null = null;
+      let usage: TurnUsage | null = null;
+      let streamToolCalls: any[] = [];
       const reader = res.body!.getReader();
       const decoder = new TextDecoder();
       let buf = "";
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
-        let nl;
-        while ((nl = buf.indexOf("\n")) !== -1) {
-          const line = buf.slice(0, nl).trim();
-          buf = buf.slice(nl + 1);
-          if (!line.startsWith("data:")) continue;
-          const data = line.slice(5).trim();
-          if (data === "[DONE]") continue;
-          let chunk: any;
-          try {
-            chunk = JSON.parse(data);
-          } catch {
-            continue;
-          }
-          const delta = chunk.choices?.[0]?.delta?.content;
-          if (delta) {
-            text += delta;
-            opts.onDelta?.(delta);
-          }
-          if (chunk.usage) {
-            usage = { input: chunk.usage.prompt_tokens ?? 0, output: chunk.usage.completion_tokens ?? 0 };
+      const takeSseLine = (line: string) => {
+        if (!line.startsWith("data:")) return;
+        const data = line.slice(5).trim();
+        if (data === "[DONE]") return;
+        let chunk: any;
+        try {
+          chunk = JSON.parse(data);
+        } catch {
+          return;
+        }
+        const deltaObj = chunk.choices?.[0]?.delta;
+        const delta = deltaObj?.content;
+        const toolCallsDelta = Array.isArray(deltaObj?.tool_calls) ? deltaObj.tool_calls : undefined;
+        
+        if (delta) {
+          text += delta;
+          opts.onDelta?.(delta, "assistant_text");
+        }
+        if (toolCallsDelta) {
+          for (const tc of toolCallsDelta) {
+            const tcIndex = tc.index ?? 0;
+            if (!streamToolCalls[tcIndex]) streamToolCalls[tcIndex] = { id: "", function: { name: "", arguments: "" } };
+            // Only the arguments stream in fragments.  A provider that
+            // repeats the id and the name on every chunk — several do — used
+            // to accumulate `call_acall_acall_a` and `bashbashbash`, so the
+            // settled call could never be matched to the step it opened.
+            if (tc.id && !streamToolCalls[tcIndex].id) streamToolCalls[tcIndex].id = tc.id;
+            if (tc.function?.name && !streamToolCalls[tcIndex].function.name) {
+              streamToolCalls[tcIndex].function.name = tc.function.name;
+            }
+            if (tc.function?.arguments) streamToolCalls[tcIndex].function.arguments += tc.function.arguments;
+            opts.onToolCallDelta?.(tcIndex, tc.id, tc.function?.name, tc.function?.arguments);
           }
         }
+        if (chunk.usage) {
+          usage = toTurnUsage(chunk.usage);
+          opts.onUsage?.(usage);
+        }
+        if (chunk.error) {
+          const status = chunk.error.code ?? chunk.error.status;
+          if (typeof status === "number" && Number.isInteger(status) && status >= 400 && status <= 599) {
+            throw httpErrorFor(status, "");
+          }
+          throw new Error("upstream reported a streaming error");
+        }
+      };
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) {
+            buf += decoder.decode();
+            if (buf.trim()) takeSseLine(buf.trim());
+            break;
+          }
+          // Any bytes at all keep the round's idle clock alive — a
+          // reasoning model can stream keep-alives or frames this reader
+          // never turns into a delta for a long time before it answers.
+          opts.onChunk?.();
+          buf += decoder.decode(value, { stream: true });
+          let nl;
+          while ((nl = buf.indexOf("\n")) !== -1) {
+            const line = buf.slice(0, nl).trim();
+            buf = buf.slice(nl + 1);
+            takeSseLine(line);
+          }
+        }
+      } finally {
+        await reader.cancel().catch(() => {});
+        reader.releaseLock();
       }
-      return { text, usage };
+      return { text, usage, tool_calls: streamToolCalls.length > 0 ? streamToolCalls : undefined };
     };
 
     const sendTurn = async (turn: SendTurnInput) => {
+      const openAiTools = (turn as any).tools ? (turn as any).tools.map((t: any) => ({
+        type: "function",
+        function: {
+          name: t.name,
+          description: t.description,
+          parameters: t.parameters ?? { type: "object", properties: {}, required: [] },
+        },
+      })) : undefined;
       const { threadId } = turn;
       if (!apiKey) throw new Error(`no xAI key — set ${config.apiKeyEnv} or config.json xai.key`);
       if (active.has(threadId)) throw new Error("a turn is already running on this thread");
       const turnId = newId();
       const abort = new AbortController();
-      let streamedText = false;
       // the backoff is scaled down in tests so a fake's transient failures
       // don't stall real seconds
       const retryScale = Number(process.env.FAKE_GROK_RETRY_SCALE ?? "1");
       active.set(threadId, { abort, turnId });
 
-      const messages = [
-        ...(turn.system ? [{ role: "system", content: turn.system }] : []),
-        ...(turn.transcript ?? []).map((m) => ({
-          role: m.role === "assistant" ? "assistant" : "user",
-          content: m.text,
-        })),
-        { role: "user", content: turn.text },
-      ];
-      appendNative(threadId, { dir: "out", source: "xai.chat.completions", msg: { model: turn.model, messages } });
-
-      emit({ ...base(threadId, turnId), type: "turn.started" });
-      emit({ ...base(threadId, turnId), type: "session.started", sessionId: null, model: turn.model ?? MODELS.default });
-
-      (async () => {
-        let attempt = 0;
-        for (;;) {
-          try {
-            const { text, usage } = await complete(messages, turn.model || MODELS.default, {
-              stream: true,
-              signal: abort.signal,
-              onDelta: (delta) => {
-                streamedText = true;
-                emit({ ...base(threadId, turnId), type: "content.delta", streamKind: "assistant_text", delta });
-              },
-            });
-            appendNative(threadId, { dir: "in", source: "xai.chat.completions", msg: { text, usage } });
-            if (text.trim()) {
-              emit({ ...base(threadId, turnId), type: "item.completed", itemType: "assistant_text", text });
+      // Only the stable half of the prompt heads the request; the volatile
+      // half rides the newest user message, every request, so the resent
+      // prefix stays byte-identical across a memory write (see
+      // prompt-split.ts splitChatPrompt).
+      const chat = splitChatPrompt(turn);
+      const messages: any[] = [
+        ...(chat.system ? [{ role: "system", content: chat.system }] : []),
+        // Byte-cap and entry-cap the transcript before folding it in so a
+        // long thread cannot ship its full history on every round — see
+        // chat-completions/replay-cap.ts.
+        ...capReplayedTranscript(turn.transcript).flatMap((m: any) => {
+          const res = [];
+          if (m.role === "assistant") {
+            const assistantMsg: any = { role: "assistant", content: m.text || "" };
+            if (m.toolCalls && m.toolCalls.length > 0) {
+              assistantMsg.tool_calls = m.toolCalls.map((tc: any) => ({
+                id: tc.id,
+                type: "function",
+                function: { name: tc.name, arguments: tc.arguments },
+              }));
             }
-            if (usage) {
-              emit({ ...base(threadId, turnId), type: "thread.token-usage.updated", ...usage });
-            }
-            active.delete(threadId);
-            emit({ ...base(threadId, turnId), type: "turn.completed", ok: true, stopReason: null, cost: null });
-            return;
-          } catch (e) {
-            const aborted = (e as Error).name === "AbortError";
-            const failure = e instanceof Error ? e : { text: String(e) };
-            const verdict = classifyError(failure);
-            if (!aborted && !streamedText && verdict.transient && attempt < RETRY_MAX_ATTEMPTS - 1) {
-              const delayMs = computeBackoff(attempt);
-              attempt++;
-              emit({
-                ...base(threadId, turnId),
-                type: "turn.retrying",
-                attempt,
-                delayMs,
-                reason: verdict.reason,
-              });
-              const wait = interruptibleDelay(delayMs * retryScale, abort.signal);
-              const outcome = await wait.promise;
-              if (outcome === "cancelled" || abort.signal.aborted) {
-                active.delete(threadId);
-                emit({
-                  ...base(threadId, turnId),
-                  type: "turn.completed",
-                  ok: false,
-                  stopReason: "interrupted",
-                  cost: null,
-                });
-                return;
+            res.push(assistantMsg);
+          } else {
+            if (m.toolResults && m.toolResults.length > 0) {
+              for (const tr of m.toolResults) {
+                res.push({ role: "tool", tool_call_id: tr.id, content: tr.result });
               }
-              continue;
+            } else {
+              res.push({ role: "user", content: m.text });
             }
-            active.delete(threadId);
-            if (!aborted) {
-              emit({ ...base(threadId, turnId), type: "runtime.error", message: (e as Error).message });
-            }
+          }
+          return res;
+        }),
+        { role: "user", content: chat.text },
+      ];
+      appendNative(threadId, { dir: "out", source: "xai.chat.completions", msg: { model: turn.model, messageCount: messages.length } });
+
+      const model = turn.model ?? MODELS.default;
+      emit({ ...base(threadId, turnId), type: "turn.started" });
+      emit({ ...base(threadId, turnId), type: "session.started", sessionId: null, model });
+
+      // Tool ids this turn has already opened a step for.  The stream
+      // announces a call once and then keeps sending argument fragments for
+      // it, and the settled reply repeats every call — without this a single
+      // tool would open a dozen rows.
+      const started = new Set<string>();
+
+      const runRound: TurnLoopDeps["runRound"] = async (roundMessages, opts) => {
+        appendNative(threadId, { dir: "out", source: "xai.chat.completions", msg: { model, messageCount: roundMessages.length, round: opts.round } });
+        const { text, usage, tool_calls } = await complete(roundMessages, model, {
+          stream: true,
+          tools: openAiTools,
+          signal: opts.signal,
+          maxOutputTokens: turn.maxOutputTokens,
+          onChunk: opts.onChunk,
+          onUsage: (u) => opts.onUsage?.(u),
+          onDelta: (delta) => {
+            opts.onPublished?.();
+            emit({ ...base(threadId, turnId), type: "content.delta", streamKind: "assistant_text", delta });
+          },
+          onToolCallDelta: (_index, id, name) => {
+            if (!id || started.has(id)) return;
+            started.add(id);
+            opts.onPublished?.();
             emit({
               ...base(threadId, turnId),
-              type: "turn.completed",
-              ok: false,
-              stopReason: aborted ? "interrupted" : "error",
-              cost: null,
+              type: "item.started",
+              itemType: "tool",
+              itemId: id,
+              title: name || "tool",
+              ...toolFields(name, undefined),
             });
-            return;
-          }
-        }
-      })();
+          },
+        });
+        appendNative(threadId, { dir: "in", source: "xai.chat.completions", msg: { textLength: text.length, toolCallsLength: tool_calls?.length ?? 0, usage, round: opts.round } });
+        return { text, usage, toolCalls: tool_calls };
+      };
+
+      void runTurnLoop({
+        base: () => base(threadId, turnId),
+        emit,
+        runRound,
+        messages,
+        // Only `timeoutMs` is read from this; the provider payload is built
+        // separately above from name/description/parameters.
+        tools: turn.tools,
+        toolResultHistoryChars: turn.toolResultHistoryChars,
+        toolHost: turn.toolHost,
+        requestApproval: turn.toolHost?.requestApproval
+          ? (ask) => turn.toolHost!.requestApproval!(ask)
+          : undefined,
+        signal: abort.signal,
+        startedToolIds: started,
+        onSettled: () => active.delete(threadId),
+        now: () => Date.now(),
+        retryDelayScale: retryScale,
+      });
 
       return { turnId };
+    };
+
+    // Live catalog.  xAI publishes an OpenAI-compatible `GET {url}/models`,
+    // so the three hand-written rows above are a starting point rather than
+    // the only source of truth: a new Grok appears in the picker when xAI
+    // ships it, not when a human edits this file.  `models` is a per-instance
+    // binding so the merge preserves whatever this instance is currently
+    // showing, not the module-level constant.
+    let models: ModelCatalog = MODELS;
+    const probeModels = createModelDiscoveryProbe(MODEL_DISCOVERY_TTL_MS, () =>
+      fetchProviderModels({ baseUrl: config.url, apiKey }),
+    );
+    const refreshModels = async (): Promise<void> => {
+      if (!apiKey) return;
+      const catalog = await discoverModelCatalog(probeModels, () => models);
+      // null = a miss or an empty list; keep what we had rather than blanking
+      // the picker on a transient xAI hiccup.
+      // The flag is endpoint-level on xAI, so a discovered row carries it too.
+      if (catalog) models = { ...catalog, options: catalog.options.map((option) => ({ ...option, supportsMaxOutput: true })) };
     };
 
     const snapshot = async (): Promise<ProviderSnapshot> => {
@@ -236,11 +385,30 @@ export const GrokDriver: ProviderDriver<GrokConfig> = {
       driverKind: DRIVER_KIND,
       displayName: input.displayName,
       enabled: input.enabled,
-      models: MODELS,
+      // A getter, not a value: `refreshModels` reassigns `models`, and a
+      // captured binding would leave the picker showing the old rows forever.
+      // Same shape as minimax.ts and openai-compat.ts.
+      get models() {
+        return models;
+      },
+      refreshModels,
       snapshot,
       adapter: {
         provider: DRIVER_KIND,
-        capabilities: { sessionModelSwitch: "in-session" },
+        capabilities: {
+          sessionModelSwitch: "in-session",
+          agentsMcp: true,
+          toolLoop: true,
+          localComputerMcp: true,
+          replaysTranscript: true,
+          // Jobs matrix: BotFleet's own job tools run in this loop (P1,
+          // server/tools/jobs.ts); helpers stay `delegate_bot`.
+          backgroundJobs: "emulated",
+          helpers: "none",
+          // Every tool with an `ask` policy opens a card on the in-process
+          // permission broker (server/tools/approvals.ts) before it runs.
+          reviewHook: "before",
+        },
         sendTurn,
         interruptTurn: async (threadId) => active.get(threadId)?.abort.abort(),
         respondToRequest: async () => "unavailable" as const, // this engine has no asks to answer
@@ -255,6 +423,20 @@ export const GrokDriver: ProviderDriver<GrokConfig> = {
       },
       generateText: async (prompt: string) => {
         const { text } = await complete([{ role: "user", content: prompt }], "grok-3-mini", { stream: false });
+        return text;
+      },
+      // Auto-review on this same xAI account: no `tools`, the brief as the
+      // system message and the action as the user message, cancelled by the
+      // reviewer's own deadline.
+      reviewPermission: async (prompt: ReviewPrompt, signal?: AbortSignal) => {
+        const { text } = await complete(
+          [
+            { role: "system", content: prompt.system },
+            { role: "user", content: prompt.data },
+          ],
+          "grok-3-mini",
+          { stream: false, signal },
+        );
         return text;
       },
       dispose: async () => {

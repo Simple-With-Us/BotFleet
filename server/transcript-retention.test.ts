@@ -1,0 +1,1447 @@
+// The rule these cover: a transcript log never grows past its cap, and what
+// the cap displaces is still readable until the generation after next. The
+// caps themselves are 64 MB and 16 MB in production; every test here passes
+// its own small cap, so the behaviour is pinned without writing megabytes.
+import { type appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import {
+  appendBounded,
+  appendBoundedAsync,
+  removeTranscriptLogs,
+  EVENTS_LOG_MAX_BYTES,
+  NATIVE_LOG_MAX_BYTES,
+  ITEM_IO_LOG_MAX_BYTES,
+  IDLE_EVENTS_TAIL_BYTES,
+  IDLE_IO_TAIL_BYTES,
+  IDLE_LIVE_MAX_AGE_MS,
+  IDLE_NATIVE_TAIL_BYTES,
+  ORPHAN_MAX_AGE_MS,
+  TRANSCRIPT_RETENTION_RULES,
+  describeIdleSweep,
+  describeOrphanSweep,
+  describeVolumeSweep,
+  formatRetentionInventory,
+  describeSweep,
+  inventoryTranscriptRetention,
+  rotatedPath,
+  sweepIdleLiveTranscripts,
+  sweepOrphanedTranscripts,
+  sweepTranscriptLogs,
+  sweepTranscriptRetention,
+  sweepTranscriptVolumeBudget,
+  startVolumeTranscriptSweeps,
+  TRANSCRIPT_DATA_VOLUME_BUDGET_BYTES,
+  TRANSCRIPT_PER_THREAD_MAX_BYTES,
+  transcriptLogPaths,
+  trimToTail,
+} from "./transcript-retention.ts";
+
+const dirs: string[] = [];
+function tmp() {
+  const d = mkdtempSync(join(tmpdir(), "omb-transcript-retention-"));
+  dirs.push(d);
+  return d;
+}
+afterEach(() => {
+  for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+});
+
+/** A record of a FIXED width, so a cap can be expressed in whole lines — the
+ * two-digit `n` is what keeps every line the same number of bytes. */
+const record = (n: number) => JSON.stringify({ n: String(n).padStart(2, "0"), pad: "x".repeat(20) }) + "\n";
+const lines = (text: string) => text.split("\n").filter(Boolean);
+const ns = (text: string) => lines(text).map((l) => Number(JSON.parse(l).n));
+
+describe("appendBounded", () => {
+  it("rotates when the next append would cross the cap", () => {
+    const dir = tmp();
+    const file = join(dir, "t1.ndjson");
+    const width = Buffer.byteLength(record(1));
+    const cap = width * 3;
+
+    for (let n = 1; n <= 3; n++) appendBounded(file, record(n), cap);
+    // three records fit exactly; nothing has rotated yet
+    expect(existsSync(rotatedPath(file))).toBe(false);
+    expect(lines(readFileSync(file, "utf8"))).toHaveLength(3);
+
+    appendBounded(file, record(4), cap);
+    expect(ns(readFileSync(rotatedPath(file), "utf8"))).toEqual([1, 2, 3]);
+    expect(ns(readFileSync(file, "utf8"))).toEqual([4]);
+    expect(statSync(file).size).toBeLessThanOrEqual(cap);
+  });
+
+  it("keeps exactly one rotated generation", () => {
+    const dir = tmp();
+    const file = join(dir, "t2.ndjson");
+    const cap = Buffer.byteLength(record(1)) * 2;
+    for (let n = 1; n <= 7; n++) appendBounded(file, record(n), cap);
+
+    expect(readdirSync(dir).sort()).toEqual(["t2.ndjson", "t2.ndjson.1"]);
+    // two caps' worth on disk, never more, whatever the thread has run
+    expect(statSync(file).size + statSync(rotatedPath(file)).size).toBeLessThanOrEqual(cap * 2);
+    expect([...ns(readFileSync(rotatedPath(file), "utf8")), ...ns(readFileSync(file, "utf8"))]).toEqual([5, 6, 7]);
+  });
+
+  it("writes a record larger than the cap rather than dropping it", () => {
+    const dir = tmp();
+    const file = join(dir, "t3.ndjson");
+    const huge = JSON.stringify({ big: "y".repeat(500) }) + "\n";
+    appendBounded(file, huge, 64);
+    expect(readFileSync(file, "utf8")).toBe(huge);
+    expect(existsSync(rotatedPath(file))).toBe(false);
+  });
+
+  it("counts the file it found on disk, so a restart does not forget its size", () => {
+    const dir = tmp();
+    const file = join(dir, "t4.ndjson");
+    const width = Buffer.byteLength(record(1));
+    // written by an "earlier run": nothing is cached for this path
+    writeFileSync(file, record(1) + record(2));
+    appendBounded(file, record(3), width * 2);
+    expect(ns(readFileSync(rotatedPath(file), "utf8"))).toEqual([1, 2]);
+    expect(ns(readFileSync(file, "utf8"))).toEqual([3]);
+  });
+
+  it("uses the writer it is handed and applies the file mode", () => {
+    const dir = tmp();
+    const file = join(dir, "t5.ndjson");
+    const seen: Array<{ file: string; data: string }> = [];
+    const append: typeof appendFileSync = (path, data) => {
+      seen.push({ file: String(path), data: String(data) });
+    };
+    appendBounded(file, record(1), 1024, { mode: 0o600 }, append);
+    // the injected writer is the one that touches disk — the event bus tests
+    // fail the write there, and must keep failing there
+    expect(seen).toEqual([{ file, data: record(1) }]);
+    expect(existsSync(file)).toBe(false);
+
+    appendBounded(file, record(2), 1024, { mode: 0o600 });
+    if (process.platform !== "win32") expect(statSync(file).mode & 0o777).toBe(0o600);
+  });
+});
+
+describe("trimToTail", () => {
+  it("keeps the newest whole lines and cuts on a line boundary", () => {
+    const dir = tmp();
+    const file = join(dir, "t1.ndjson");
+    const width = Buffer.byteLength(record(1));
+    let body = "";
+    for (let n = 1; n <= 10; n++) body += record(n);
+    writeFileSync(file, body);
+
+    // a cap of three and a half records: the window opens inside record 7,
+    // and the cut moves forward to the boundary rather than keeping half of it
+    const cap = width * 3 + Math.floor(width / 2);
+    const reclaimed = trimToTail(file, cap);
+    // every kept line parses: no half record at the head
+    expect(ns(readFileSync(file, "utf8"))).toEqual([8, 9, 10]);
+    expect(reclaimed).toBe(width * 7);
+    expect(statSync(file).size).toBeLessThanOrEqual(cap);
+    // the copy left nothing behind
+    expect(readdirSync(dir)).toEqual(["t1.ndjson"]);
+  });
+
+  it("is idempotent: a file already inside the cap is untouched", () => {
+    const dir = tmp();
+    const file = join(dir, "t2.ndjson");
+    const width = Buffer.byteLength(record(1));
+    let body = "";
+    for (let n = 1; n <= 10; n++) body += record(n);
+    writeFileSync(file, body);
+
+    expect(trimToTail(file, width * 4)).toBeGreaterThan(0);
+    const once = readFileSync(file, "utf8");
+    expect(trimToTail(file, width * 4)).toBe(0);
+    expect(trimToTail(file, width * 4)).toBe(0);
+    expect(readFileSync(file, "utf8")).toBe(once);
+  });
+
+  it("leaves a file whose last record is bigger than the cap exactly as it is", () => {
+    const dir = tmp();
+    const file = join(dir, "t3.ndjson");
+    const body = record(1) + JSON.stringify({ big: "z".repeat(400) }) + "\n";
+    writeFileSync(file, body);
+    // there is no line boundary inside the window, and emptying the file
+    // would throw away the only record it has
+    expect(trimToTail(file, 100)).toBe(0);
+    expect(readFileSync(file, "utf8")).toBe(body);
+  });
+
+  it("does nothing for a file that is not there", () => {
+    expect(trimToTail(join(tmp(), "missing.ndjson"), 10)).toBe(0);
+  });
+});
+
+describe("sweepTranscriptLogs", () => {
+  it("trims every oversized log in the directory, both generations", () => {
+    const dir = tmp();
+    const width = Buffer.byteLength(record(1));
+    let body = "";
+    for (let n = 1; n <= 10; n++) body += record(n);
+    writeFileSync(join(dir, "a.ndjson"), body);
+    writeFileSync(join(dir, "a.ndjson.1"), body);
+    writeFileSync(join(dir, "b.ndjson"), record(1));
+    writeFileSync(join(dir, "notes.txt"), body);
+
+    const result = sweepTranscriptLogs(dir, width * 2 + Math.floor(width / 2));
+    expect(result).toEqual({ scanned: 3, trimmed: 2, bytesReclaimed: width * 8 * 2, tempRemoved: 0, failed: 0 });
+    expect(ns(readFileSync(join(dir, "a.ndjson"), "utf8"))).toEqual([9, 10]);
+    expect(ns(readFileSync(join(dir, "a.ndjson.1"), "utf8"))).toEqual([9, 10]);
+    expect(readFileSync(join(dir, "b.ndjson"), "utf8")).toBe(record(1));
+    // a file that is not a transcript log is not this sweep's business
+    expect(readFileSync(join(dir, "notes.txt"), "utf8")).toBe(body);
+  });
+
+  it("is idempotent across runs", () => {
+    const dir = tmp();
+    const width = Buffer.byteLength(record(1));
+    let body = "";
+    for (let n = 1; n <= 10; n++) body += record(n);
+    writeFileSync(join(dir, "a.ndjson"), body);
+
+    const cap = width * 3 + Math.floor(width / 2);
+    expect(sweepTranscriptLogs(dir, cap).trimmed).toBe(1);
+    const once = readFileSync(join(dir, "a.ndjson"), "utf8");
+    // a second and third pass find a file already inside the cap: no trim, no
+    // rewrite, and — the part the boot sweep depends on — no growth in state
+    expect(sweepTranscriptLogs(dir, cap)).toEqual({ scanned: 1, trimmed: 0, bytesReclaimed: 0, tempRemoved: 0, failed: 0 });
+    expect(sweepTranscriptLogs(dir, cap)).toEqual({ scanned: 1, trimmed: 0, bytesReclaimed: 0, tempRemoved: 0, failed: 0 });
+    expect(readFileSync(join(dir, "a.ndjson"), "utf8")).toBe(once);
+  });
+
+  it("skips a log this process is appending to, because rotation already bounds it", () => {
+    const dir = tmp();
+    const file = join(dir, "live.ndjson");
+    appendBounded(file, record(1), 1024);
+    expect(sweepTranscriptLogs(dir, 1)).toEqual({ scanned: 0, trimmed: 0, bytesReclaimed: 0, tempRemoved: 0, failed: 0 });
+    expect(readFileSync(file, "utf8")).toBe(record(1));
+  });
+
+  it("says nothing when there was nothing to do, and leads with what happened when there was", () => {
+    expect(describeSweep({ scanned: 4, trimmed: 0, bytesReclaimed: 0, tempRemoved: 0, failed: 0 })).toBeNull();
+    expect(describeSweep({ scanned: 4, trimmed: 2, bytesReclaimed: 3 * 1024 * 1024, tempRemoved: 0, failed: 0 })).toBe(
+      "[transcripts] Trimmed 2 of 4 thread logs to their size cap, reclaiming 3.0 MB.",
+    );
+    // a sweep that only reaped a killed trim's leftovers must not open by
+    // announcing that it trimmed nothing
+    expect(describeSweep({ scanned: 4, trimmed: 0, bytesReclaimed: 2048, tempRemoved: 1, failed: 0 })).toBe(
+      "[transcripts] Removed 1 stale temp file from an interrupted trim, reclaiming 0.0 MB.",
+    );
+    expect(describeSweep({ scanned: 4, trimmed: 2, bytesReclaimed: 3 * 1024 * 1024, tempRemoved: 2, failed: 1 })).toBe(
+      "[transcripts] Trimmed 2 of 4 thread logs to their size cap, reclaiming 3.0 MB.  Removed 2 stale temp files from an interrupted trim.  1 log could not be trimmed.",
+    );
+  });
+
+  it("survives a directory that does not exist", () => {
+    expect(sweepTranscriptLogs(join(tmp(), "nope"), 10)).toEqual({ scanned: 0, trimmed: 0, bytesReclaimed: 0, tempRemoved: 0, failed: 0 });
+  });
+});
+
+describe("trimToTail on a file much larger than the cap", () => {
+  /** A line of exactly 64 bytes, so a cap in bytes is a count of records. */
+  const wide = (i: number) => {
+    const body = JSON.stringify({ i });
+    return body + " ".repeat(63 - body.length) + "\n";
+  };
+
+  it("keeps the newest whole lines and reads only the tail it keeps", () => {
+    const dir = tmp();
+    const file = join(dir, "big.ndjson");
+    const count = 65_536;
+    const parts: string[] = [];
+    for (let i = 0; i < count; i++) parts.push(wide(i));
+    writeFileSync(file, parts.join(""));
+    const size = statSync(file).size;
+    expect(size).toBe(count * 64);
+
+    // counts the bytes that actually leave the disk, so "seeks to size minus
+    // cap, never reads the whole file" is asserted rather than commented
+    let bytesRead = 0;
+    const cap = 256 * 1024;
+    const reclaimed = trimToTail(file, cap, (fd, buffer, offset, length, position) => {
+      const read = readSync(fd, buffer, offset, length, position);
+      bytesRead += Math.max(0, read);
+      return read;
+    });
+
+    const kept = lines(readFileSync(file, "utf8"));
+    // the window opens on a record boundary, so the first whole record after
+    // it is the 4,096th from the end minus that one
+    expect(kept).toHaveLength(4095);
+    expect(Number(JSON.parse(kept[0]!).i)).toBe(count - 4095);
+    expect(Number(JSON.parse(kept.at(-1)!).i)).toBe(count - 1);
+    expect(statSync(file).size).toBeLessThanOrEqual(cap);
+    expect(reclaimed).toBe(size - 4095 * 64);
+
+    // one chunk to find the line boundary, then the kept tail — nothing like
+    // the 4 MB the file holds.  The lower bound is what keeps this honest: a
+    // counter that never saw a read would satisfy the upper one trivially.
+    expect(bytesRead).toBeGreaterThanOrEqual(4095 * 64);
+    expect(bytesRead).toBeLessThanOrEqual(cap + 64 * 1024);
+    expect(bytesRead).toBeLessThan(size / 4);
+  });
+});
+
+describe("stale temp files", () => {
+  const tempName = (log: string, pid: number) => `${log}.${pid}.123e4567-e89b-42d3-a456-426614174000.tmp`;
+
+  it("reaps a temp file whose writer is gone, and one too old to be in flight", () => {
+    const dir = tmp();
+    const dead = join(dir, tempName("t1.ndjson", 2_147_480_000));
+    const old = join(dir, tempName("t2.ndjson.1", process.pid));
+    const mine = join(dir, tempName("t3.ndjson", process.pid));
+    for (const file of [dead, old, mine]) writeFileSync(file, "half a tail\n");
+    const hoursAgo = new Date(Date.now() - 3 * 60 * 60 * 1000);
+    utimesSync(old, hoursAgo, hoursAgo);
+
+    const result = sweepTranscriptLogs(dir, 1024);
+    expect(result.tempRemoved).toBe(2);
+    // what a killed trim was holding is reclaimed disk like any other
+    expect(result.bytesReclaimed).toBe(Buffer.byteLength("half a tail\n") * 2);
+    expect(existsSync(dead)).toBe(false);
+    expect(existsSync(old)).toBe(false);
+    // a live writer's fresh temp file is a trim in flight, not litter
+    expect(existsSync(mine)).toBe(true);
+    // and a temp file is never counted as a log to trim
+    expect(result.scanned).toBe(0);
+  });
+
+  it("leaves a file that only looks like one alone", () => {
+    const dir = tmp();
+    const decoy = join(dir, "notes.tmp");
+    const unowned = join(dir, "t1.ndjson.tmp");
+    // a pid wider than any system assigns is not a pid this sweep wrote
+    const absurd = join(dir, tempName("t2.ndjson", 123_456_789_012_345));
+    for (const file of [decoy, unowned, absurd]) writeFileSync(file, "keep me\n");
+    expect(sweepTranscriptLogs(dir, 1024).tempRemoved).toBe(0);
+    for (const file of [decoy, unowned, absurd]) expect(existsSync(file)).toBe(true);
+  });
+
+  it("reaps a temp file whose pid is a number no process can hold", () => {
+    const dir = tmp();
+    // ten digits, so the name matches, but past int32 — `process.kill` answers
+    // this with an argument complaint rather than ESRCH
+    const beyond = join(dir, tempName("t1.ndjson", 9_999_999_999));
+    writeFileSync(beyond, "half a tail\n");
+    expect(() => sweepTranscriptLogs(dir, 1024)).not.toThrow();
+    expect(existsSync(beyond)).toBe(false);
+  });
+
+  it("trims logs and reaps temps in the same pass", () => {
+    const dir = tmp();
+    const width = Buffer.byteLength(record(1));
+    let body = "";
+    for (let n = 1; n <= 10; n++) body += record(n);
+    writeFileSync(join(dir, "a.ndjson"), body);
+    writeFileSync(join(dir, tempName("a.ndjson", 2_147_480_000)), "orphan\n");
+
+    const result = sweepTranscriptLogs(dir, width * 3 + Math.floor(width / 2));
+    expect(result.trimmed).toBe(1);
+    expect(result.tempRemoved).toBe(1);
+    expect(readdirSync(dir)).toEqual(["a.ndjson"]);
+  });
+});
+
+describe("removeTranscriptLogs", () => {
+  it("removes both generations and any temp file, for every thread it is given", () => {
+    const dir = tmp();
+    for (const name of [
+      "t1.ndjson",
+      "t1.ndjson.1",
+      `t1.ndjson.${process.pid}.123e4567-e89b-42d3-a456-426614174000.tmp`,
+      "t2.ndjson",
+      "keep.ndjson",
+      "keep.ndjson.1",
+    ]) writeFileSync(join(dir, name), "x\n");
+
+    expect(removeTranscriptLogs(dir, ["t1", "t2"])).toBe(4);
+    expect(readdirSync(dir).sort()).toEqual(["keep.ndjson", "keep.ndjson.1"]);
+  });
+
+  it("does not mind a thread with nothing on disk, or a directory that is gone", () => {
+    const dir = tmp();
+    expect(removeTranscriptLogs(dir, ["never-written"])).toBe(0);
+    expect(removeTranscriptLogs(join(dir, "nope"), ["t1"])).toBe(0);
+  });
+
+  it("forgets the cached size, so a thread id that comes back starts from disk", () => {
+    const dir = tmp();
+    const file = join(dir, "t1.ndjson");
+    const width = Buffer.byteLength(record(1));
+    appendBounded(file, record(1), width * 2);
+    appendBounded(file, record(2), width * 2);
+    removeTranscriptLogs(dir, ["t1"]);
+
+    // with a stale counter still at two records, this append would rotate an
+    // empty file instead of starting one
+    appendBounded(file, record(3), width * 2);
+    expect(existsSync(rotatedPath(file))).toBe(false);
+    expect(ns(readFileSync(file, "utf8"))).toEqual([3]);
+  });
+});
+
+describe("caps and paths", () => {
+  it("names both generations of a thread's log", () => {
+    expect(transcriptLogPaths("/data/native", "t-1")).toEqual([join("/data/native", "t-1.ndjson"), join("/data/native", "t-1.ndjson.1")]);
+  });
+
+  it("caps the chattier native tee higher than the normalized event stream", () => {
+    expect(NATIVE_LOG_MAX_BYTES).toBe(64 * 1024 * 1024);
+    expect(EVENTS_LOG_MAX_BYTES).toBe(16 * 1024 * 1024);
+    expect(EVENTS_LOG_MAX_BYTES).toBeLessThan(NATIVE_LOG_MAX_BYTES);
+  });
+});
+
+describe("the tool input/output cap", () => {
+  it("is the smallest of the three: each field is already cut to 32 KB", () => {
+    expect(ITEM_IO_LOG_MAX_BYTES).toBe(6 * 1024 * 1024);
+    expect(ITEM_IO_LOG_MAX_BYTES).toBeLessThan(EVENTS_LOG_MAX_BYTES);
+  });
+
+  it("trims an oversized item-io log at boot along with the other two directories", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const ioDir = tmp();
+    const big = "{\"n\":\"x\"}\n".repeat(ITEM_IO_LOG_MAX_BYTES / 10 + 100);
+    writeFileSync(join(ioDir, "t.ndjson"), big);
+    const result = sweepTranscriptRetention({ eventsDir, nativeDir, ioDir });
+    expect(result.trimmed).toBe(1);
+    expect(statSync(join(ioDir, "t.ndjson")).size).toBeLessThanOrEqual(ITEM_IO_LOG_MAX_BYTES);
+  });
+
+  it("still takes the two-directory pair older callers build by hand", () => {
+    expect(sweepTranscriptRetention({ eventsDir: tmp(), nativeDir: tmp() }).scanned).toBe(0);
+  });
+});
+
+describe("sweepOrphanedTranscripts", () => {
+  const OLD = Date.now() - ORPHAN_MAX_AGE_MS - 24 * 60 * 60 * 1000; // 8 days ago
+  const RECENT = Date.now();
+
+  function age(file: string, at: number) {
+    const d = new Date(at);
+    utimesSync(file, d, d);
+  }
+
+  it("removes an orphaned thread's logs, both directories and both generations, once old enough", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const files = [
+      join(eventsDir, "orphan.ndjson"),
+      join(eventsDir, "orphan.ndjson.1"),
+      join(nativeDir, "orphan.ndjson"),
+      join(nativeDir, "orphan.ndjson.1"),
+    ];
+    for (const file of files) {
+      writeFileSync(file, "x".repeat(10));
+      age(file, OLD);
+    }
+
+    const result = sweepOrphanedTranscripts({ eventsDir, nativeDir }, new Set());
+    expect(result).toEqual({ ids: 1, files: 4, bytesReclaimed: 40, dryRun: false });
+    for (const file of files) expect(existsSync(file)).toBe(false);
+  });
+
+  it("folds a stray trim temp file into its thread's byte and file count", () => {
+    // removeTranscriptLogs already deletes a thread's leftover *.tmp files
+    // alongside its logs; this pins that the count and bytes this function
+    // reports agree with that, rather than under-reporting whenever an
+    // interrupted trim left one behind (Sentry finding on PR #599).
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const log = join(nativeDir, "orphan.ndjson");
+    const temp = join(nativeDir, `orphan.ndjson.${process.pid}.123e4567-e89b-42d3-a456-426614174000.tmp`);
+    writeFileSync(log, "x".repeat(10));
+    writeFileSync(temp, "y".repeat(7));
+    age(log, OLD);
+    age(temp, OLD);
+
+    const result = sweepOrphanedTranscripts({ eventsDir, nativeDir }, new Set());
+    expect(result).toEqual({ ids: 1, files: 2, bytesReclaimed: 17, dryRun: false });
+    expect(existsSync(log)).toBe(false);
+    expect(existsSync(temp)).toBe(false);
+  });
+
+  it("dry run previews a stray temp file's bytes too, without touching disk", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const log = join(nativeDir, "preview2.ndjson");
+    const temp = join(nativeDir, `preview2.ndjson.${process.pid}.123e4567-e89b-42d3-a456-426614174000.tmp`);
+    writeFileSync(log, "a".repeat(3));
+    writeFileSync(temp, "b".repeat(4));
+    age(log, OLD);
+    age(temp, OLD);
+
+    const result = sweepOrphanedTranscripts({ eventsDir, nativeDir }, new Set(), { dryRun: true });
+    expect(result).toEqual({ ids: 1, files: 2, bytesReclaimed: 7, dryRun: true });
+    expect(existsSync(log)).toBe(true);
+    expect(existsSync(temp)).toBe(true);
+  });
+
+  it("never deletes a file for a live id, no matter how old", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const file = join(eventsDir, "live.ndjson");
+    writeFileSync(file, "x");
+    age(file, OLD);
+
+    const result = sweepOrphanedTranscripts({ eventsDir, nativeDir }, new Set(["live"]));
+    expect(result).toEqual({ ids: 0, files: 0, bytesReclaimed: 0, dryRun: false });
+    expect(existsSync(file)).toBe(true);
+  });
+
+  it("leaves an orphaned thread alone until it is old enough", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const file = join(eventsDir, "fresh-orphan.ndjson");
+    writeFileSync(file, "x");
+    age(file, RECENT);
+
+    const result = sweepOrphanedTranscripts({ eventsDir, nativeDir }, new Set());
+    expect(result).toEqual({ ids: 0, files: 0, bytesReclaimed: 0, dryRun: false });
+    expect(existsSync(file)).toBe(true);
+  });
+
+  it("a recent write in EITHER directory keeps the whole thread out of the age check", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const oldFile = join(nativeDir, "mixed.ndjson");
+    const recentFile = join(eventsDir, "mixed.ndjson");
+    writeFileSync(oldFile, "x");
+    age(oldFile, OLD);
+    writeFileSync(recentFile, "x");
+    age(recentFile, RECENT);
+
+    const result = sweepOrphanedTranscripts({ eventsDir, nativeDir }, new Set());
+    expect(result).toEqual({ ids: 0, files: 0, bytesReclaimed: 0, dryRun: false });
+    expect(existsSync(oldFile)).toBe(true);
+    expect(existsSync(recentFile)).toBe(true);
+  });
+
+  it("dry run reports exactly what a real run would do, without touching disk", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const file = join(eventsDir, "preview.ndjson");
+    writeFileSync(file, "12345");
+    age(file, OLD);
+
+    const result = sweepOrphanedTranscripts({ eventsDir, nativeDir }, new Set(), { dryRun: true });
+    expect(result).toEqual({ ids: 1, files: 1, bytesReclaimed: 5, dryRun: true });
+    expect(existsSync(file)).toBe(true);
+  });
+
+  it("sweeps the tool input/output directory with the others when it is given one", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const ioDir = tmp();
+    const files = [join(eventsDir, "orphan.ndjson"), join(ioDir, "orphan.ndjson"), join(ioDir, "orphan.ndjson.1")];
+    for (const file of files) {
+      writeFileSync(file, "x".repeat(10));
+      age(file, OLD);
+    }
+    const result = sweepOrphanedTranscripts({ eventsDir, nativeDir, ioDir }, new Set());
+    expect(result).toEqual({ ids: 1, files: 3, bytesReclaimed: 30, dryRun: false });
+    for (const file of files) expect(existsSync(file)).toBe(false);
+  });
+
+  it("a recent write in the tool input/output directory keeps the thread out of the age check", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const ioDir = tmp();
+    const old = join(eventsDir, "busy.ndjson");
+    const fresh = join(ioDir, "busy.ndjson");
+    writeFileSync(old, "x");
+    writeFileSync(fresh, "x");
+    age(old, OLD);
+    age(fresh, RECENT);
+    expect(sweepOrphanedTranscripts({ eventsDir, nativeDir, ioDir }, new Set()).ids).toBe(0);
+    expect(existsSync(old)).toBe(true);
+    expect(existsSync(fresh)).toBe(true);
+  });
+
+  it("ignores threads not old enough while removing the ones that are, in the same pass", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const stale = join(eventsDir, "stale.ndjson");
+    const fresh = join(eventsDir, "fresh.ndjson");
+    writeFileSync(stale, "x");
+    age(stale, OLD);
+    writeFileSync(fresh, "x");
+    age(fresh, RECENT);
+
+    const result = sweepOrphanedTranscripts({ eventsDir, nativeDir }, new Set());
+    expect(result.ids).toBe(1);
+    expect(existsSync(stale)).toBe(false);
+    expect(existsSync(fresh)).toBe(true);
+  });
+
+  it("survives directories that do not exist", () => {
+    const result = sweepOrphanedTranscripts(
+      { eventsDir: join(tmp(), "nope-e"), nativeDir: join(tmp(), "nope-n") },
+      new Set(),
+    );
+    expect(result).toEqual({ ids: 0, files: 0, bytesReclaimed: 0, dryRun: false });
+  });
+});
+
+describe("describeOrphanSweep", () => {
+  it("says nothing when nothing was removed", () => {
+    expect(describeOrphanSweep({ ids: 0, files: 0, bytesReclaimed: 0, dryRun: false })).toBeNull();
+  });
+
+  it("reports what it removed", () => {
+    expect(describeOrphanSweep({ ids: 2, files: 4, bytesReclaimed: 1234, dryRun: false })).toBe(
+      "[retention] removed 4 transcript logs, 1234 bytes",
+    );
+  });
+
+  it("reports what a dry run would have removed, using the singular for one file", () => {
+    expect(describeOrphanSweep({ ids: 1, files: 1, bytesReclaimed: 10, dryRun: true })).toBe(
+      "[retention] would remove 1 transcript log, 10 bytes",
+    );
+  });
+});
+
+describe("idle live transcript retention", () => {
+  const NOW = 1_700_000_000_000;
+  const OLD = NOW - IDLE_LIVE_MAX_AGE_MS - 60_000;
+  const RECENT = NOW - 60_000;
+
+  function age(file: string, at: number) {
+    const d = new Date(at);
+    utimesSync(file, d, d);
+  }
+
+  function body(count: number) {
+    let text = "";
+    for (let n = 1; n <= count; n++) text += record(n);
+    return text;
+  }
+
+  function tails(native: number) {
+    return { native, events: native, io: native };
+  }
+
+  function sweep(
+    dirs: { eventsDir: string; nativeDir: string; ioDir?: string },
+    live: string[],
+    extra: Parameters<typeof sweepIdleLiveTranscripts>[3] = {},
+  ) {
+    return sweepIdleLiveTranscripts(dirs, new Set(live), extra.inFlightThreadIds ?? new Set(), {
+      now: NOW,
+      ...extra,
+    });
+  }
+
+  it("defines a rule for every class the finding names, including the two this store does not have", () => {
+    expect(IDLE_LIVE_MAX_AGE_MS).toBeGreaterThan(ORPHAN_MAX_AGE_MS);
+    expect(IDLE_NATIVE_TAIL_BYTES).toBe(8 * 1024 * 1024);
+    expect(IDLE_EVENTS_TAIL_BYTES).toBe(IDLE_NATIVE_TAIL_BYTES);
+    expect(IDLE_IO_TAIL_BYTES).toBeLessThan(IDLE_EVENTS_TAIL_BYTES);
+    expect(TRANSCRIPT_RETENTION_RULES.archived).toMatch(/No archived-thread record/);
+    expect(TRANSCRIPT_RETENTION_RULES.completed).toMatch(/orphan sweep/);
+    expect(TRANSCRIPT_RETENTION_RULES["idle-live"]).toMatch(/14 days/);
+    expect(TRANSCRIPT_RETENTION_RULES["in-flight"]).toMatch(/never trimmed/);
+  });
+
+  it("trims an idle live thread to the newest lines and leaves the conversation's id in place", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const width = Buffer.byteLength(record(1));
+    const text = body(10);
+    const live = join(nativeDir, "quiet.ndjson");
+    const rotated = join(nativeDir, "quiet.ndjson.1");
+    writeFileSync(live, text);
+    writeFileSync(rotated, text);
+    age(live, OLD);
+    age(rotated, OLD - 1000);
+
+    const cap = width * 3 + Math.floor(width / 2);
+    const result = sweep({ eventsDir, nativeDir }, ["quiet"], { tailBytes: tails(cap) });
+    expect(result.dryRun).toBe(false);
+    expect(result.failed).toBe(0);
+    expect(result.ids).toBe(1);
+    expect(result.files).toBe(2);
+    expect(result.bytesReclaimed).toBe(width * 7 * 2);
+    expect(ns(readFileSync(live, "utf8"))).toEqual([8, 9, 10]);
+    expect(ns(readFileSync(rotated, "utf8"))).toEqual([8, 9, 10]);
+    const row = result.inventory.find((item) => item.threadId === "quiet");
+    expect(row?.reason).toBe("idle-live");
+    expect(row?.bytes).toBe(Buffer.byteLength(text) * 2);
+    expect(row?.ageMs).toBeGreaterThan(IDLE_LIVE_MAX_AGE_MS);
+  });
+
+  it("is idempotent, and a second run reclaims nothing after a stale trim temp is gone", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const width = Buffer.byteLength(record(1));
+    const live = join(nativeDir, "again.ndjson");
+    writeFileSync(live, body(10));
+    age(live, OLD);
+    const temp = join(nativeDir, "again.ndjson.2147483646.123e4567-e89b-42d3-a456-426614174000.tmp");
+    writeFileSync(temp, "stale");
+    age(temp, OLD);
+
+    const cap = width * 3 + Math.floor(width / 2);
+    const first = sweep({ eventsDir, nativeDir }, ["again"], { tailBytes: tails(cap) });
+    expect(first.files).toBe(2);
+    expect(first.bytesReclaimed).toBe(width * 7 + Buffer.byteLength("stale"));
+    expect(existsSync(temp)).toBe(false);
+    const kept = readFileSync(live, "utf8");
+
+    const second = sweep({ eventsDir, nativeDir }, ["again"], { tailBytes: tails(cap) });
+    expect(second.ids).toBe(0);
+    expect(second.bytesReclaimed).toBe(0);
+    expect(readFileSync(live, "utf8")).toBe(kept);
+  });
+
+  it("dry run returns the inventory and reclaims no bytes", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const width = Buffer.byteLength(record(1));
+    const file = join(eventsDir, "preview.ndjson");
+    const text = body(10);
+    writeFileSync(file, text);
+    age(file, OLD);
+    const cap = width * 2;
+    const result = sweep({ eventsDir, nativeDir }, ["preview"], { dryRun: true, tailBytes: tails(cap) });
+    expect(result.bytesReclaimed).toBe(0);
+    expect(result.files).toBe(1);
+    expect(result.dryRun).toBe(true);
+    expect(readFileSync(file, "utf8")).toBe(text);
+    expect(result.inventory).toEqual([
+      expect.objectContaining({ threadId: "preview", reason: "idle-live", bytes: Buffer.byteLength(text), files: 1 }),
+    ]);
+    expect(inventoryTranscriptRetention({ eventsDir, nativeDir }, new Set(["preview"]), { now: NOW })).toEqual(
+      result.inventory,
+    );
+  });
+
+  it("never trims a thread whose turn is open, however old the log is", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const file = join(nativeDir, "open.ndjson");
+    const text = body(10);
+    writeFileSync(file, text);
+    age(file, OLD);
+    const result = sweep({ eventsDir, nativeDir }, ["open"], {
+      inFlightThreadIds: new Set(["open"]),
+      tailBytes: tails(Buffer.byteLength(record(1))),
+    });
+    expect(result.ids).toBe(0);
+    expect(result.bytesReclaimed).toBe(0);
+    expect(readFileSync(file, "utf8")).toBe(text);
+    expect(result.inventory[0]?.reason).toBe("in-flight");
+  });
+
+  it("trims a log whose size is still cached after the append finished, once the file is old", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const file = join(nativeDir, "cached.ndjson");
+    const width = Buffer.byteLength(record(1));
+    appendBounded(file, record(1), 1024 * 1024);
+    const text = body(10);
+    writeFileSync(file, text);
+    age(file, OLD);
+    const result = sweep({ eventsDir, nativeDir }, ["cached"], {
+      tailBytes: tails(width * 3 + Math.floor(width / 2)),
+    });
+    expect(result.inventory.find((item) => item.threadId === "cached")?.reason).toBe("idle-live");
+    expect(ns(readFileSync(file, "utf8"))).toEqual([8, 9, 10]);
+    expect(result.bytesReclaimed).toBe(width * 7);
+  });
+
+  it("does not trim a log while an async append is still writing it", async () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const file = join(nativeDir, "writing.ndjson");
+    const text = body(10);
+    writeFileSync(file, text);
+    age(file, OLD);
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const pending = appendBoundedAsync(file, record(11), 1024 * 1024, {}, async () => {
+      await gate;
+    });
+    const result = sweep({ eventsDir, nativeDir }, ["writing"], { tailBytes: tails(Buffer.byteLength(record(1))) });
+    expect(result.inventory.find((item) => item.threadId === "writing")?.reason).toBe("in-flight");
+    expect(readFileSync(file, "utf8")).toBe(text);
+    expect(result.bytesReclaimed).toBe(0);
+    release();
+    await pending;
+  });
+
+  it("a failed append does not leave the log looking in flight", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const file = join(nativeDir, "failed.ndjson");
+    const width = Buffer.byteLength(record(1));
+    const text = body(10);
+    writeFileSync(file, text);
+    age(file, OLD);
+    expect(() =>
+      appendBounded(file, record(11), 1024 * 1024, {}, () => {
+        throw new Error("disk");
+      }),
+    ).toThrow("disk");
+    const result = sweep({ eventsDir, nativeDir }, ["failed"], {
+      tailBytes: tails(width * 3 + Math.floor(width / 2)),
+    });
+    expect(result.inventory.find((item) => item.threadId === "failed")?.reason).toBe("idle-live");
+    expect(ns(readFileSync(file, "utf8"))).toEqual([8, 9, 10]);
+  });
+
+  it("leaves a recently touched live thread at the full cap", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const file = join(eventsDir, "fresh.ndjson");
+    const text = body(10);
+    writeFileSync(file, text);
+    age(file, RECENT);
+    const result = sweep({ eventsDir, nativeDir }, ["fresh"], { tailBytes: tails(Buffer.byteLength(record(1))) });
+    expect(result.inventory[0]?.reason).toBe("active");
+    expect(readFileSync(file, "utf8")).toBe(text);
+  });
+
+  it("a recent write in either directory keeps the whole live thread", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const oldFile = join(nativeDir, "mixed.ndjson");
+    const recentFile = join(eventsDir, "mixed.ndjson");
+    const text = body(10);
+    writeFileSync(oldFile, text);
+    writeFileSync(recentFile, record(1));
+    age(oldFile, OLD);
+    age(recentFile, RECENT);
+    const result = sweep({ eventsDir, nativeDir }, ["mixed"], { tailBytes: tails(Buffer.byteLength(record(1))) });
+    expect(result.inventory[0]?.reason).toBe("active");
+    expect(readFileSync(oldFile, "utf8")).toBe(text);
+  });
+
+  it("does not delete an orphan; that stays the orphan sweep's job", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const file = join(eventsDir, "gone.ndjson");
+    const text = body(10);
+    writeFileSync(file, text);
+    age(file, OLD);
+    const result = sweep({ eventsDir, nativeDir }, [], { tailBytes: tails(Buffer.byteLength(record(1))) });
+    expect(result.ids).toBe(0);
+    expect(result.inventory[0]?.reason).toBe("orphan-stale");
+    expect(readFileSync(file, "utf8")).toBe(text);
+  });
+
+  it("keeps going when one thread's trim fails and still trims the next", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const width = Buffer.byteLength(record(1));
+    const text = body(10);
+    const fail = join(nativeDir, "a-fail.ndjson");
+    const ok = join(nativeDir, "b-ok.ndjson");
+    writeFileSync(fail, text);
+    writeFileSync(ok, text);
+    age(fail, OLD);
+    age(ok, OLD);
+    let thrown = false;
+    const result = sweep({ eventsDir, nativeDir }, ["a-fail", "b-ok"], {
+      tailBytes: tails(width * 3 + Math.floor(width / 2)),
+      read: (fd, buffer, offset, length, position) => {
+        if (!thrown) {
+          thrown = true;
+          throw new Error("disk");
+        }
+        return readSync(fd, buffer, offset, length, position);
+      },
+    });
+    expect(result.failed).toBe(1);
+    expect(readFileSync(fail, "utf8")).toBe(text);
+    expect(ns(readFileSync(ok, "utf8"))).toEqual([8, 9, 10]);
+    expect(result.bytesReclaimed).toBe(width * 7);
+  });
+
+  it("uses the item-io tail for that directory only", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const ioDir = tmp();
+    const width = Buffer.byteLength(record(1));
+    const text = body(10);
+    const native = join(nativeDir, "io-thread.ndjson");
+    const io = join(ioDir, "io-thread.ndjson");
+    writeFileSync(native, text);
+    writeFileSync(io, text);
+    age(native, OLD);
+    age(io, OLD);
+    const nativeCap = Buffer.byteLength(text);
+    const ioCap = width * 3 + Math.floor(width / 2);
+    const result = sweep({ eventsDir, nativeDir, ioDir }, ["io-thread"], {
+      tailBytes: { native: nativeCap, events: nativeCap, io: ioCap },
+    });
+    expect(readFileSync(native, "utf8")).toBe(text);
+    expect(ns(readFileSync(io, "utf8"))).toEqual([8, 9, 10]);
+    expect(result.files).toBe(1);
+    expect(result.bytesReclaimed).toBe(width * 7);
+  });
+
+  it("survives directories that do not exist", () => {
+    const result = sweepIdleLiveTranscripts(
+      { eventsDir: join(tmp(), "nope-e"), nativeDir: join(tmp(), "nope-n") },
+      new Set(),
+    );
+    expect(result.inventory).toEqual([]);
+    expect(result.bytesReclaimed).toBe(0);
+  });
+});
+
+describe("describeIdleSweep", () => {
+  const base = { ids: 0, failed: 0, inventory: [] };
+
+  it("says nothing when nothing would change", () => {
+    expect(describeIdleSweep({ ...base, files: 0, bytesReclaimed: 0, dryRun: false })).toBeNull();
+  });
+
+  it("names reclaimed bytes only for a real run", () => {
+    expect(describeIdleSweep({ ...base, ids: 1, files: 2, bytesReclaimed: 80, dryRun: false })).toBe(
+      "[retention] Trimmed 2 idle transcript logs, reclaiming 80 bytes.",
+    );
+  });
+
+  it("a dry run does not quote a byte count", () => {
+    expect(describeIdleSweep({ ...base, ids: 1, files: 1, bytesReclaimed: 0, dryRun: true })).toBe(
+      "[retention] Would trim 1 idle transcript log.",
+    );
+  });
+
+  it("reports a trim that failed without claiming bytes", () => {
+    expect(describeIdleSweep({ ...base, files: 0, bytesReclaimed: 0, failed: 1, dryRun: false })).toBe(
+      "[retention] 1 idle log could not be trimmed.",
+    );
+  });
+});
+
+describe("formatRetentionInventory", () => {
+  it("lists idle and orphan rows with id, age, bytes, and reason, and skips active work", () => {
+    const rows = formatRetentionInventory([
+      { threadId: "busy", ageMs: 10, bytes: 99, files: 1, reason: "in-flight" },
+      { threadId: "fresh", ageMs: 20, bytes: 50, files: 1, reason: "active" },
+      { threadId: "quiet", ageMs: 30, bytes: 80, files: 2, reason: "idle-live" },
+      { threadId: "new-orphan", ageMs: 40, bytes: 5, files: 1, reason: "orphan-recent" },
+      { threadId: "old-orphan", ageMs: 50, bytes: 70, files: 4, reason: "orphan-stale" },
+    ]);
+    expect(rows).toEqual([
+      "[retention] idle-live quiet, age 30 ms, 80 bytes, 2 files",
+      "[retention] orphan-recent new-orphan, age 40 ms, 5 bytes, 1 file",
+      "[retention] orphan-stale old-orphan, age 50 ms, 70 bytes, 4 files",
+    ]);
+  });
+});
+
+describe("transcript data-volume budget", () => {
+  const NOW = 1_700_000_000_000;
+  const STALE = NOW - ORPHAN_MAX_AGE_MS - 24 * 60 * 60 * 1000;
+  const QUIET = NOW - IDLE_LIVE_MAX_AGE_MS - 60_000;
+
+  function age(file: string, at: number) {
+    const d = new Date(at);
+    utimesSync(file, d, d);
+  }
+
+  function body(count: number) {
+    let text = "";
+    for (let n = 1; n <= count; n++) text += record(n);
+    return text;
+  }
+
+  function tails(native: number) {
+    return { native, events: native, io: native };
+  }
+
+  function sweep(
+    dirs: { eventsDir: string; nativeDir: string; ioDir?: string },
+    live: string[],
+    extra: Parameters<typeof sweepTranscriptVolumeBudget>[3] = {},
+  ) {
+    return sweepTranscriptVolumeBudget(dirs, new Set(live), extra.inFlightThreadIds ?? new Set(), {
+      now: NOW,
+      ...extra,
+    });
+  }
+
+  it("derives the ~8.4 GB budget from the per-file caps, not a magic number", () => {
+    expect(TRANSCRIPT_PER_THREAD_MAX_BYTES).toBe(
+      2 * NATIVE_LOG_MAX_BYTES + 2 * EVENTS_LOG_MAX_BYTES + 2 * ITEM_IO_LOG_MAX_BYTES,
+    );
+    expect(TRANSCRIPT_DATA_VOLUME_BUDGET_BYTES).toBe(50 * TRANSCRIPT_PER_THREAD_MAX_BYTES);
+    expect(TRANSCRIPT_DATA_VOLUME_BUDGET_BYTES).toBe(9_017_753_600);
+    // 8,600 MiB ≈ 8.4 GiB: headroom for fifty fully-capped threads.
+    expect(TRANSCRIPT_DATA_VOLUME_BUDGET_BYTES / 1024 ** 3).toBeGreaterThan(8.3);
+    expect(TRANSCRIPT_DATA_VOLUME_BUDGET_BYTES / 1024 ** 3).toBeLessThan(8.5);
+    expect(TRANSCRIPT_RETENTION_RULES["volume-budget"]).toMatch(/8\.4/);
+    expect(TRANSCRIPT_RETENTION_RULES["volume-budget"]).toMatch(/live thread's logs are never deleted/i);
+  });
+
+  it("does nothing when the volume is inside its budget", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const file = join(nativeDir, "live.ndjson");
+    const text = body(10);
+    writeFileSync(file, text);
+
+    const result = sweep({ eventsDir, nativeDir }, ["live"], { budgetBytes: 1024 * 1024 });
+    expect(result).toEqual(
+      expect.objectContaining({ ids: 0, files: 0, bytesReclaimed: 0, failed: 0, over: false, dryRun: false }),
+    );
+    expect(result.bytesStart).toBe(Buffer.byteLength(text));
+    expect(result.bytesEnd).toBe(result.bytesStart);
+    expect(readFileSync(file, "utf8")).toBe(text);
+    expect(describeVolumeSweep(result)).toBeNull();
+  });
+
+  it("a dry run previews orphan deletes without touching disk", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const text = body(10);
+    const file = join(nativeDir, "orphan.ndjson");
+    writeFileSync(file, text);
+    age(file, STALE);
+
+    const result = sweep({ eventsDir, nativeDir }, [], { dryRun: true, budgetBytes: 10 });
+    expect(result.dryRun).toBe(true);
+    expect(result.ids).toBe(1);
+    expect(result.files).toBe(1);
+    expect(result.bytesReclaimed).toBe(0);
+    expect(result.bytesEnd).toBe(result.bytesStart);
+    expect(result.over).toBe(true);
+    expect(existsSync(file)).toBe(true);
+    expect(describeVolumeSweep(result)).toBe(
+      `[retention] Would reclaim 1 transcript log toward the data-volume budget.  ${result.bytesStart - 10} bytes still over the data-volume budget.`,
+    );
+  });
+
+  it("a dry run does not double-count a deleted orphan's leftover temps", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const text = body(10);
+    const log = join(nativeDir, "orphan.ndjson");
+    writeFileSync(log, text);
+    age(log, STALE);
+    const temp = join(nativeDir, "orphan.ndjson.2147480000.123e4567-e89b-42d3-a456-426614174000.tmp");
+    writeFileSync(temp, "orphan\n");
+    age(temp, STALE);
+
+    const dry = sweep({ eventsDir, nativeDir }, [], { dryRun: true, budgetBytes: 10 });
+    // one log plus one temp, counted once — not once for the delete and
+    // again for the temp reap a real run skips
+    expect(dry.ids).toBe(1);
+    expect(dry.files).toBe(2);
+    expect(dry.bytesReclaimed).toBe(0);
+    expect(dry.over).toBe(true);
+    expect(existsSync(log)).toBe(true);
+    expect(existsSync(temp)).toBe(true);
+
+    const real = sweep({ eventsDir, nativeDir }, [], { budgetBytes: 10 });
+    expect(real.ids).toBe(1);
+    expect(real.files).toBe(2);
+    expect(real.over).toBe(false);
+    expect(existsSync(log)).toBe(false);
+    expect(existsSync(temp)).toBe(false);
+  });
+
+  it("deletes the oldest orphans first and keeps live threads", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const width = Buffer.byteLength(record(1));
+    const text = body(10);
+    const older = join(nativeDir, "older.ndjson");
+    const newer = join(nativeDir, "newer.ndjson");
+    const live = join(nativeDir, "live.ndjson");
+    writeFileSync(older, text);
+    writeFileSync(newer, text);
+    writeFileSync(live, text);
+    age(older, STALE - 24 * 60 * 60 * 1000);
+    age(newer, STALE);
+
+    // Deleting the oldest orphan alone gets back inside budget.
+    const result = sweep({ eventsDir, nativeDir }, ["live"], { budgetBytes: width * 10 * 2 + 1 });
+    expect(result.ids).toBe(1);
+    expect(result.files).toBe(1);
+    expect(result.failed).toBe(0);
+    expect(result.over).toBe(false);
+    expect(result.bytesReclaimed).toBe(width * 10);
+    expect(existsSync(older)).toBe(false);
+    expect(existsSync(newer)).toBe(true);
+    expect(readFileSync(live, "utf8")).toBe(text);
+    expect(describeVolumeSweep(result)).toBe(
+      `[retention] Reclaimed ${width * 10} bytes across 1 transcript log toward the data-volume budget.`,
+    );
+  });
+
+  it("trims idle-live tails oldest-first when there is nothing orphaned to delete", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const width = Buffer.byteLength(record(1));
+    const text = body(10);
+    const live = join(nativeDir, "quiet.ndjson");
+    const rotated = join(nativeDir, "quiet.ndjson.1");
+    writeFileSync(live, text);
+    writeFileSync(rotated, text);
+    age(live, QUIET);
+    age(rotated, QUIET - 1000);
+
+    const cap = width * 3 + Math.floor(width / 2);
+    const result = sweep({ eventsDir, nativeDir }, ["quiet"], {
+      budgetBytes: width * 10,
+      tailBytes: tails(cap),
+    });
+    expect(result.ids).toBe(1);
+    expect(result.files).toBe(2);
+    expect(result.failed).toBe(0);
+    expect(result.over).toBe(false);
+    expect(ns(readFileSync(live, "utf8"))).toEqual([8, 9, 10]);
+    expect(ns(readFileSync(rotated, "utf8"))).toEqual([8, 9, 10]);
+    expect(describeVolumeSweep(result)).toBe(
+      `[retention] Reclaimed ${result.bytesReclaimed} bytes across 2 transcript logs toward the data-volume budget.`,
+    );
+  });
+
+  it("never deletes a live thread to make budget, and says how far over it still is", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const text = body(10);
+    const file = join(nativeDir, "live.ndjson");
+    writeFileSync(file, text);
+
+    const result = sweep({ eventsDir, nativeDir }, ["live"], { budgetBytes: 1 });
+    expect(result.ids).toBe(0);
+    expect(result.files).toBe(0);
+    expect(result.failed).toBe(0);
+    expect(result.over).toBe(true);
+    expect(readFileSync(file, "utf8")).toBe(text);
+    expect(describeVolumeSweep(result)).toBe(
+      `[retention] ${Buffer.byteLength(text) - 1} bytes still over the data-volume budget.`,
+    );
+  });
+
+  it("skips an open turn however old the log is", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const text = body(10);
+    const file = join(nativeDir, "open.ndjson");
+    writeFileSync(file, text);
+    age(file, QUIET);
+
+    const result = sweep({ eventsDir, nativeDir }, ["open"], {
+      inFlightThreadIds: new Set(["open"]),
+      budgetBytes: 1,
+    });
+    expect(result.ids).toBe(0);
+    expect(result.files).toBe(0);
+    expect(result.over).toBe(true);
+    expect(readFileSync(file, "utf8")).toBe(text);
+  });
+
+  it("protects an open turn passed only via opts.inFlightThreadIds", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const width = Buffer.byteLength(record(1));
+    const text = body(10);
+    const file = join(nativeDir, "open.ndjson");
+    writeFileSync(file, text);
+    age(file, QUIET);
+
+    // The ids arrive through the options object, not the positional
+    // parameter — an open turn must be safe either way.  The tail override
+    // matters: with production tails this small log would never trim, and
+    // the test would pass even without the fix.
+    const result = sweepTranscriptVolumeBudget(
+      { eventsDir, nativeDir },
+      new Set(["open"]),
+      new Set(),
+      {
+        now: NOW,
+        inFlightThreadIds: new Set(["open"]),
+        budgetBytes: 1,
+        tailBytes: tails(width * 3 + Math.floor(width / 2)),
+      },
+    );
+    expect(result.ids).toBe(0);
+    expect(result.files).toBe(0);
+    expect(result.over).toBe(true);
+    expect(readFileSync(file, "utf8")).toBe(text);
+  });
+
+  it("counts an orphan delete that fails instead of claiming its bytes", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    // A non-empty directory where the log should be: the scan stats it as a
+    // thread log, but no unlink can remove it — even for root — so the sweep
+    // must report the failure rather than the bytes.
+    const impostor = join(nativeDir, "orphan.ndjson");
+    mkdirSync(impostor);
+    writeFileSync(join(impostor, "nested.txt"), "held\n");
+    age(impostor, STALE);
+
+    const result = sweep({ eventsDir, nativeDir }, [], { budgetBytes: 1 });
+    expect(result.failed).toBe(1);
+    expect(result.ids).toBe(0);
+    expect(result.files).toBe(0);
+    expect(result.bytesReclaimed).toBe(0);
+    expect(result.over).toBe(true);
+    expect(existsSync(impostor)).toBe(true);
+    expect(describeVolumeSweep(result)).toBe(
+      `[retention] ${result.bytesStart - 1} bytes still over the data-volume budget.  1 transcript log could not be reclaimed.`,
+    );
+  });
+
+  it("does not count an already-removed temp as a second failure", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    // Phase 1's batch removes the temp but cannot remove the log (a
+    // non-empty directory), so verification fails on the thread — and phase
+    // 2 must credit the temp's absence instead of failing on it again.
+    const impostor = join(nativeDir, "orphan.ndjson");
+    mkdirSync(impostor);
+    writeFileSync(join(impostor, "nested.txt"), "held\n");
+    age(impostor, STALE);
+    const temp = join(nativeDir, "orphan.ndjson.2147480000.123e4567-e89b-42d3-a456-426614174000.tmp");
+    writeFileSync(temp, "orphan\n");
+    age(temp, STALE);
+
+    const result = sweep({ eventsDir, nativeDir }, [], { budgetBytes: 1 });
+    expect(result.failed).toBe(1);
+    expect(result.ids).toBe(1);
+    expect(result.files).toBe(1);
+    expect(result.bytesReclaimed).toBe(Buffer.byteLength("orphan\n"));
+    expect(result.over).toBe(true);
+    expect(existsSync(impostor)).toBe(true);
+    expect(existsSync(temp)).toBe(false);
+    expect(describeVolumeSweep(result)).toBe(
+      `[retention] Reclaimed ${Buffer.byteLength("orphan\n")} bytes across 1 transcript log toward the data-volume budget.  ` +
+        `${result.bytesEnd - 1} bytes still over the data-volume budget.  1 transcript log could not be reclaimed.`,
+    );
+  });
+
+  it("keeps a recent orphan even when over budget", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const text = body(10);
+    const file = join(eventsDir, "fresh-orphan.ndjson");
+    writeFileSync(file, text);
+
+    // Freshly written: missing from the store but not yet old enough to delete.
+    const result = sweep({ eventsDir, nativeDir }, [], { budgetBytes: 1 });
+    expect(result.ids).toBe(0);
+    expect(result.files).toBe(0);
+    expect(result.over).toBe(true);
+    expect(existsSync(file)).toBe(true);
+  });
+
+  it("reaps leftover trim temps toward the budget without touching the log", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const text = body(2);
+    const log = join(nativeDir, "x.ndjson");
+    writeFileSync(log, text);
+    const temp = join(nativeDir, "x.ndjson.2147480000.123e4567-e89b-42d3-a456-426614174000.tmp");
+    writeFileSync(temp, "y".repeat(100));
+
+    const result = sweep({ eventsDir, nativeDir }, ["x"], { budgetBytes: Buffer.byteLength(text) + 1 });
+    expect(result.ids).toBe(1);
+    expect(result.files).toBe(1);
+    expect(result.bytesReclaimed).toBe(100);
+    expect(result.over).toBe(false);
+    expect(existsSync(temp)).toBe(false);
+    expect(readFileSync(log, "utf8")).toBe(text);
+  });
+
+  it("keeps going when one idle trim fails and still trims the next", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const width = Buffer.byteLength(record(1));
+    const text = body(10);
+    const fail = join(nativeDir, "a-fail.ndjson");
+    const ok = join(nativeDir, "b-ok.ndjson");
+    writeFileSync(fail, text);
+    writeFileSync(ok, text);
+    age(fail, QUIET);
+    age(ok, QUIET);
+
+    let thrown = false;
+    const cap = width * 3 + Math.floor(width / 2);
+    const result = sweep({ eventsDir, nativeDir }, ["a-fail", "b-ok"], {
+      budgetBytes: 1,
+      tailBytes: tails(cap),
+      read: (fd, buffer, offset, length, position) => {
+        if (!thrown) {
+          thrown = true;
+          throw new Error("disk");
+        }
+        return readSync(fd, buffer, offset, length, position);
+      },
+    });
+    expect(result.failed).toBe(1);
+    expect(result.files).toBe(1);
+    expect(result.over).toBe(true);
+    expect(readFileSync(fail, "utf8")).toBe(text);
+    expect(ns(readFileSync(ok, "utf8"))).toEqual([8, 9, 10]);
+    expect(describeVolumeSweep(result)).toBe(
+      `[retention] Reclaimed ${result.bytesReclaimed} bytes across 1 transcript log toward the data-volume budget.  ` +
+        `${result.bytesEnd - 1} bytes still over the data-volume budget.  1 transcript log could not be reclaimed.`,
+    );
+  });
+
+  it("survives directories that do not exist", () => {
+    const result = sweepTranscriptVolumeBudget(
+      { eventsDir: join(tmp(), "nope-e"), nativeDir: join(tmp(), "nope-n") },
+      new Set(),
+    );
+    expect(result).toEqual(
+      expect.objectContaining({ ids: 0, files: 0, bytesReclaimed: 0, failed: 0, over: false }),
+    );
+    expect(describeVolumeSweep(result)).toBeNull();
+  });
+});
+
+describe("startVolumeTranscriptSweeps boot + daily timer", () => {
+  const DAY_MS = 24 * 60 * 60 * 1000;
+
+  it("does not sweep synchronously; the boot run reaps a leftover temp and logs through describeVolumeSweep", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const logText = record(1) + record(2);
+    const logFile = join(nativeDir, "x.ndjson");
+    writeFileSync(logFile, logText);
+    const temp = join(nativeDir, "x.ndjson.2147480000.123e4567-e89b-42d3-a456-426614174000.tmp");
+    writeFileSync(temp, "y".repeat(100));
+    const budgetBytes = Buffer.byteLength(logText) + 1;
+
+    vi.useFakeTimers();
+    try {
+      const lines: string[] = [];
+      const stop = startVolumeTranscriptSweeps(
+        { eventsDir, nativeDir },
+        () => ["x"],
+        () => [],
+        (line) => lines.push(line),
+        { budgetBytes, initialDelayMs: 1000 },
+      );
+      try {
+        // Non-blocking boot: nothing has run yet.
+        expect(existsSync(temp)).toBe(true);
+        expect(lines).toEqual([]);
+
+        vi.advanceTimersByTime(1000);
+        expect(existsSync(temp)).toBe(false);
+        expect(readFileSync(logFile, "utf8")).toBe(logText);
+        expect(lines).toHaveLength(1);
+        expect(lines[0]).toMatch(/^\[retention\] Reclaimed 100 bytes across 1 transcript log toward the data-volume budget\./);
+      } finally {
+        stop();
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("registers the daily timer: an over-budget volume still reports its overage every day", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const text = record(1) + record(2);
+    const file = join(nativeDir, "live.ndjson");
+    writeFileSync(file, text);
+
+    vi.useFakeTimers();
+    try {
+      const lines: string[] = [];
+      let liveCalls = 0;
+      const stop = startVolumeTranscriptSweeps(
+        { eventsDir, nativeDir },
+        () => {
+          liveCalls += 1;
+          return ["live"];
+        },
+        () => [],
+        (line) => lines.push(line),
+        { budgetBytes: 1, initialDelayMs: 1000 },
+      );
+      try {
+        vi.advanceTimersByTime(1000);
+        expect(liveCalls).toBe(1);
+        expect(lines).toHaveLength(1);
+        expect(lines[0]).toMatch(/still over the data-volume budget/);
+
+        // Daily cadence alongside the other retention timers.
+        vi.advanceTimersByTime(DAY_MS);
+        expect(liveCalls).toBe(2);
+        expect(lines).toHaveLength(2);
+        expect(lines[1]).toMatch(/still over the data-volume budget/);
+      } finally {
+        stop();
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stays silent inside budget and the stopper clears both timers", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const file = join(nativeDir, "live.ndjson");
+    writeFileSync(file, record(1));
+
+    vi.useFakeTimers();
+    try {
+      const lines: string[] = [];
+      const stop = startVolumeTranscriptSweeps(
+        { eventsDir, nativeDir },
+        () => ["live"],
+        () => [],
+        (line) => lines.push(line),
+        { budgetBytes: 1024 * 1024, initialDelayMs: 1000 },
+      );
+      vi.advanceTimersByTime(1000);
+      expect(lines).toEqual([]);
+      vi.advanceTimersByTime(DAY_MS);
+      expect(lines).toEqual([]);
+
+      stop();
+      vi.advanceTimersByTime(DAY_MS * 2);
+      expect(lines).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("holds off while cleanupHoldReason reports a set-aside and logs the skip once", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    writeFileSync(join(nativeDir, "live.ndjson"), record(1));
+
+    vi.useFakeTimers();
+    try {
+      const lines: string[] = [];
+      const stop = startVolumeTranscriptSweeps(
+        { eventsDir, nativeDir },
+        () => ["live"],
+        () => [],
+        (line) => lines.push(line),
+        { budgetBytes: 1, initialDelayMs: 1000, hold: () => "bots.json set aside" },
+      );
+      try {
+        vi.advanceTimersByTime(1000);
+        expect(lines).toEqual(["[retention] volume transcript sweep skipped: bots.json set aside."]);
+        vi.advanceTimersByTime(DAY_MS);
+        // Same hold reason: logged on change only, like the orphan/idle starters.
+        expect(lines).toHaveLength(1);
+      } finally {
+        stop();
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

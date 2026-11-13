@@ -12,7 +12,7 @@ const FALLBACK_LABELS: Array<[RegExp, string]> = [
   [/\b(?:click|type|keypress|press|scroll|computer)\b/i, "Using the computer"],
   [/\b(?:open_url|navigate)\b/i, "Opening a page"],
   [/\b(?:list_bots|list_agents)\b/i, "Checking who's around"],
-  [/\b(?:ask_bot|delegate_bot|send_message)\b/i, "Asking a teammate"],
+  [/\b(?:coordinate_bots|ask_bot|delegate_bot|send_message)\b/i, "Asking a teammate"],
 ];
 
 function sentenceCase(value: string): string {
@@ -22,7 +22,7 @@ function sentenceCase(value: string): string {
 }
 
 /**
- * The one quiet line shown while an agent is working. This follows t3code's
+ * The one quiet line shown while a bot is working. This follows t3code's
  * live-activity model: thinking before a tool starts, then the current verb.
  * The server-provided narration is authoritative; fallbacks cover older
  * messages and third-party drivers that only report a tool name.

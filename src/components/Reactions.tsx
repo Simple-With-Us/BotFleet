@@ -6,7 +6,11 @@ import { Plus, X } from "lucide-react";
 import { useStore, type Bot, type Message } from "@/state/store";
 import { cn } from "@/lib/cn";
 
-export const REACTION_SET = ["👍", "❤️", "😂", "🎉", "👀"] as const;
+/** The hover bar's suggested reactions.  Owner 2026-09-04: thumbs up and
+ * thumbs down are the only two worth suggesting — they answer the question a
+ * reaction is usually asked to answer.  Everything else lives behind the "+",
+ * which is where a reaction you have to think about belongs. */
+export const REACTION_SET = ["👍", "👎"] as const;
 
 /** The extended palette behind the "+". Kept to single-grapheme emoji the
  * API's 8-char cap carries comfortably — no long ZWJ sequences. */
@@ -62,9 +66,9 @@ export function ReactionBar({ threadId, message }: { threadId: string; message: 
         ))}
         <button
           onClick={() => setPickerOpen((o) => !o)}
-          aria-label="More reactions"
+          aria-label="More Reactions"
           aria-expanded={pickerOpen}
-          title="More reactions"
+          title="More Reactions"
           className="flex size-[22px] items-center justify-center rounded-full text-ink-secondary hover:bg-control hover:text-ink"
         >
           {pickerOpen ? <X size={12} /> : <Plus size={12} />}

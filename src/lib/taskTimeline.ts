@@ -2,8 +2,8 @@
  * structural avoids pulling the renderer's TSX store into server tests. */
 export interface TimelineMessage {
   id: string;
-  role: "bot" | "user";
-  kind: "text" | "options" | "activity" | "screen" | "connector" | "secret";
+  role: "bot" | "user" | "system";
+  kind: "text" | "options" | "activity" | "screen" | "connector" | "secret" | "sign-in";
   text?: string;
   tool?: { name: string; ok?: boolean };
   png?: string;
@@ -23,17 +23,22 @@ export interface TimelineEvent {
  * never guesses that an action or result happened. */
 export function timelineEvents(messages: TimelineMessage[]): TimelineEvent[] {
   const events: TimelineEvent[] = [];
-  let sawUserInput = false;
+  let sawTurnStart = false;
   for (const message of messages) {
-    if (message.kind === "text" && message.role === "user" && message.text?.trim()) {
+    if (message.kind === "text" && (message.role === "user" || message.role === "system") && message.text?.trim()) {
+      // The first turn-starter is always "Task started" regardless of role.
+      // After that, label by what actually happened: a later "user" message
+      // is a real reply typed by a person; a later "system" message is the
+      // same routine/webhook/resource firing again in a reused thread, not
+      // a person weighing in — do not borrow the human label for it.
       events.push({
         id: message.id,
         at: message.at,
-        label: sawUserInput ? "User input" : "Task started",
+        label: !sawTurnStart ? "Task started" : message.role === "user" ? "User input" : "Automated instruction",
         state: "observed",
         kind: "task",
       });
-      sawUserInput = true;
+      sawTurnStart = true;
     } else if (message.kind === "activity" && message.tool) {
       const failed = message.tool.ok === false || message.tool.name.startsWith("error:");
       events.push({

@@ -191,14 +191,14 @@ export function LocalScreenPreview() {
           <Monitor size={14} />
         )}
         {phase === "requesting"
-          ? "Choose a screen…"
+          ? "Choose a Screen…"
           : phase === "streaming"
-            ? "Stop preview"
+            ? "Stop Preview"
             : retry
-              ? "Try again"
+              ? "Try Again"
               : preview.interaction === "portal-picker"
-                ? "Choose a screen"
-                : "Start preview"}
+                ? "Choose a Screen"
+                : "Start Preview"}
       </button>
     </section>
   );

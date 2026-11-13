@@ -30,6 +30,13 @@ final class DecodingTests: XCTestCase {
         try JSONDecoder().decode(type, from: try fixture(name))
     }
 
+    func testVoiceClipsDecodeWithOlderMessagesAndNewerReplies() throws {
+        let plain = try JSONDecoder().decode(Message.self, from: Data(#"{"id":"old","role":"bot","kind":"text","at":1,"text":"Hi"}"#.utf8))
+        XCTAssertNil(plain.audio)
+        let voiced = try JSONDecoder().decode(Message.self, from: Data(#"{"id":"new","role":"bot","kind":"text","at":2,"text":"Hi","audio":[{"path":"/api/attachments/clip.mp3","mime":"audio/mpeg"}]}"#.utf8))
+        XCTAssertEqual(voiced.audio?.first?.path, "/api/attachments/clip.mp3")
+    }
+
     // MARK: - Hydration
 
     func testDecodesThePagedFleet() throws {
@@ -46,6 +53,23 @@ final class DecodingTests: XCTestCase {
         let room = try XCTUnwrap(fleet.groups.first)
         XCTAssertEqual(room.messages?.count, 3)
         XCTAssertEqual(room.hasMore, true)
+        XCTAssertFalse(room.isBotToBot)
+    }
+
+    func testDmTrueMarksABotToBotRoom() throws {
+        let data = Data(#"""
+        {"id":"g1","threadId":"t1","name":"Fixer \u21c4 Designer","memberIds":["a","b"],"defaultResponder":{"kind":"mentions"},"bulletin":"","unread":false,"createdAt":1,"dm":true}
+        """#.utf8)
+        let room = try JSONDecoder().decode(Room.self, from: data)
+        XCTAssertTrue(room.isBotToBot)
+    }
+
+    func testMissingDmIsAUserRoom() throws {
+        let data = Data(#"""
+        {"id":"g2","threadId":"t2","name":"Work","memberIds":["a"],"defaultResponder":{"kind":"mentions"},"bulletin":"","unread":false,"createdAt":1}
+        """#.utf8)
+        let room = try JSONDecoder().decode(Room.self, from: data)
+        XCTAssertFalse(room.isBotToBot)
     }
 
     func testDecodesTheFullFleetToo() throws {
@@ -77,15 +101,132 @@ final class DecodingTests: XCTestCase {
         XCTAssertEqual(fleet.bots.first?.avatarCrop, .mascot)
     }
 
+    func testBusySend202BodyKeepsQueueId() throws {
+        let result = try JSONDecoder().decode(
+            SendMessageResult.self,
+            from: Data(#"{"ok":true,"queued":true,"queueId":"q-7","threadId":"task-1"}"#.utf8)
+        )
+        XCTAssertEqual(result.queued, true)
+        XCTAssertEqual(result.queueId, "q-7")
+        XCTAssertEqual(result.threadId, "task-1")
+
+        let live = try JSONDecoder().decode(
+            SendMessageResult.self,
+            from: Data(#"{"ok":true}"#.utf8)
+        )
+        XCTAssertEqual(live.ok, true)
+        XCTAssertNil(live.queueId)
+        XCTAssertNotEqual(live.queued, true)
+    }
+
+    func testRoomTasksCarryLastActivityForRosterSort() throws {
+        let room = try JSONDecoder().decode(
+            Room.self,
+            from: Data(#"""
+            {"id":"room-1","threadId":"task-1","name":"Launch","memberIds":["bot-1"],
+             "defaultResponder":{"kind":"everyone"},"bulletin":"","unread":false,"createdAt":1,
+             "tasks":[{"threadId":"task-1","title":"Main","createdAt":1,"lastActivity":50},
+                      {"threadId":"task-2","title":"Nested","createdAt":2,"lastActivity":900}]}
+            """#.utf8)
+        )
+        XCTAssertEqual(room.tasks?.count, 2)
+        XCTAssertEqual(room.tasks?.last?.lastActivity, 900)
+        let stamp = ChatListOrder.activity(
+            createdAt: room.createdAt,
+            taskActivities: (room.tasks ?? []).map { $0.lastActivity ?? $0.createdAt },
+            loadedMessageAt: nil
+        )
+        XCTAssertEqual(stamp, 900)
+    }
+
+    func testRoomWorkingFlagCoversSetupWithoutABusyResponder() throws {
+        let room = try JSONDecoder().decode(
+            Room.self,
+            from: Data(#"{"id":"room-1","threadId":"task-1","name":"Setup","memberIds":["bot-1"],"defaultResponder":{"kind":"everyone"},"bulletin":"","unread":false,"createdAt":1,"busyBotId":null,"working":true}"#.utf8)
+        )
+        XCTAssertTrue(room.isWorking)
+
+        let legacy = try JSONDecoder().decode(
+            Room.self,
+            from: Data(#"{"id":"room-2","threadId":"task-2","name":"Legacy","memberIds":["bot-1"],"defaultResponder":{"kind":"everyone"},"bulletin":"","unread":false,"createdAt":1,"busyBotId":"bot-1"}"#.utf8)
+        )
+        XCTAssertTrue(legacy.isWorking)
+    }
+
+    func testDrainedUserLineKeepsQueueId() throws {
+        let message = try JSONDecoder().decode(
+            Message.self,
+            from: Data(#"{"id":"m1","role":"user","kind":"text","at":1,"text":"later","queueId":"q-7"}"#.utf8)
+        )
+        XCTAssertEqual(message.queueId, "q-7")
+        XCTAssertEqual(message.text, "later")
+    }
+
+    func testSteeredUserLineKeepsMidTurnFlag() throws {
+        let message = try JSONDecoder().decode(
+            Message.self,
+            from: Data(#"{"id":"m2","role":"user","kind":"text","at":2,"text":"and also","steered":true}"#.utf8)
+        )
+        XCTAssertEqual(message.steered, true)
+        XCTAssertEqual(message.text, "and also")
+    }
+
     func testFutureRoutineScheduleKindRemainsVisibleAsUnknown() throws {
         let schedule = try JSONDecoder().decode(
             RoutineSchedule.self,
-            from: Data(#"{"type":"weekly","time":"09:00","weekdays":[1]}"#.utf8)
+            from: Data(#"{"type":"weekly","time":"09:00","weekdays":[1],"timeZone":"Asia/Tokyo"}"#.utf8)
         )
 
         XCTAssertEqual(schedule.type, .unknown)
         XCTAssertEqual(schedule.time, "09:00")
         XCTAssertEqual(schedule.weekdays, [1])
+        XCTAssertEqual(schedule.timeZone, "Asia/Tokyo")
+    }
+
+    func testRoutineEditorPreservesGapWallTimeAndHostZoneOmission() throws {
+        let zone = try XCTUnwrap(TimeZone(identifier: "America/Chicago"))
+        let date = routineEditorTimeDate("02:30", in: zone)
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = zone
+        XCTAssertEqual(calendar.component(.hour, from: date), 2)
+        XCTAssertEqual(calendar.component(.minute, from: date), 30)
+        let foldDate = routineEditorTimeDate("01:30", in: zone)
+        XCTAssertEqual(calendar.component(.hour, from: foldDate), 1)
+        XCTAssertEqual(calendar.component(.minute, from: foldDate), 30)
+
+        let tokyo = try XCTUnwrap(TimeZone(identifier: "Asia/Tokyo"))
+        let transitions: [(
+            name: String,
+            effective: String?,
+            source: String?,
+            existingType: RoutineSchedule.Kind?,
+            editor: String?,
+            update: String?
+        )] = [
+            ("new daily", nil, nil, nil, "Asia/Tokyo", "Asia/Tokyo"),
+            ("legacy host daily", "America/Chicago", "host", .daily, "America/Chicago", nil),
+            ("explicit daily", "America/Chicago", "stored", .daily, "America/Chicago", "America/Chicago"),
+            ("one time to daily", nil, nil, .once, "Asia/Tokyo", "Asia/Tokyo"),
+            ("unknown to daily", nil, nil, .unknown, "Asia/Tokyo", "Asia/Tokyo"),
+            ("host provenance is daily only", nil, "host", .once, "Asia/Tokyo", "Asia/Tokyo"),
+        ]
+        for transition in transitions {
+            let editor = routineEditorTimeZoneIdentifier(
+                effectiveTimeZone: transition.effective,
+                existingScheduleType: transition.existingType,
+                currentTimeZone: tokyo
+            )
+            XCTAssertEqual(editor, transition.editor, transition.name)
+            XCTAssertEqual(
+                routineTimeZoneForUpdate(
+                    effectiveTimeZone: editor,
+                    source: transition.source,
+                    existingScheduleType: transition.existingType
+                ),
+                transition.update,
+                transition.name
+            )
+        }
     }
 
     func testNotificationTargetRequiresBothExactIds() {
@@ -101,6 +242,57 @@ final class DecodingTests: XCTestCase {
         }
         XCTAssertTrue(detached.requiresTaskSwitch(activeThreadId: "task-1"))
         XCTAssertFalse(detached.requiresTaskSwitch(activeThreadId: "task-2"))
+    }
+
+    func testNotificationTargetFromRemoteUserInfoReadsApnsOrLocalKeys() {
+        XCTAssertEqual(
+            NotificationTarget.fromRemoteUserInfo(["botId": "bot-1", "threadId": "task-2"]),
+            NotificationTarget(botId: "bot-1", threadId: "task-2")
+        )
+        XCTAssertEqual(
+            NotificationTarget.fromRemoteUserInfo([
+                "botId": "bot-1",
+                "aps": ["thread-id": "task-2", "alert": ["title": "Scout finished"]],
+            ]),
+            NotificationTarget(botId: "bot-1", threadId: "task-2")
+        )
+        XCTAssertNil(NotificationTarget.fromRemoteUserInfo(["aps": ["alert": "x"]]))
+        XCTAssertNil(NotificationTarget.fromRemoteUserInfo(["botId": "bot-1"]))
+    }
+
+    func testNotificationTargetFromRemoteUserInfoCarriesRequestIdAndKindWhenPresent() {
+        let target = NotificationTarget.fromRemoteUserInfo([
+            "botId": "bot-1", "threadId": "task-2", "kind": "approval", "requestId": "req-9",
+        ])
+        XCTAssertEqual(target?.requestId, "req-9")
+        XCTAssertEqual(target?.kind, "approval")
+    }
+
+    /// An older harness never sends `requestId`/`tool` on the notify frame.
+    /// Both are optional, so decoding must still succeed.
+    func testNotificationFrameWithoutRequestIdOrToolStillDecodes() throws {
+        let notification = try JSONDecoder().decode(
+            NotificationFrame.self,
+            from: Data(#"""
+            {"kind":"approval","botId":"bot-1","botName":"Scout","threadId":"task-2",
+             "title":"Scout needs approval","body":"rm -rf"}
+            """#.utf8)
+        )
+        XCTAssertNil(notification.requestId)
+        XCTAssertNil(notification.tool)
+        XCTAssertTrue(notification.isBlocking)
+    }
+
+    func testNotificationFrameWithRequestIdAndToolDecodesBoth() throws {
+        let notification = try JSONDecoder().decode(
+            NotificationFrame.self,
+            from: Data(#"""
+            {"kind":"approval","botId":"bot-1","botName":"Scout","threadId":"task-2",
+             "title":"Scout needs approval","body":"rm -rf","requestId":"req-9","tool":"Bash"}
+            """#.utf8)
+        )
+        XCTAssertEqual(notification.requestId, "req-9")
+        XCTAssertEqual(notification.tool, "Bash")
     }
 
     func testDecodesTheCloudBackendAndItsAbsence() throws {
@@ -202,6 +394,10 @@ final class DecodingTests: XCTestCase {
             try statuses(#"{"configured":false,"credentialStore":"Unavailable","services":{}}"#).isAuthoritative,
             "only the exact string server/index.ts writes withdraws the claim; anything else is as unknown as an absent field"
         )
+        XCTAssertFalse(
+            try statuses(#"{"configured":true,"authoritative":false,"credentialStore":"ok","services":{}}"#).isAuthoritative,
+            "an explicit non-authoritative 200 must not wipe a previously verified list"
+        )
     }
 
     func testOneMalformedBotDoesNotHideTheRestOfTheFleet() throws {
@@ -277,9 +473,9 @@ final class DecodingTests: XCTestCase {
         XCTAssertEqual(card.responseBehavior(for: "Always allow"), "allow")
         XCTAssertEqual(card.responseBehavior(for: "Deny"), "deny")
         XCTAssertEqual(card.responseBehavior(for: " deny "), "deny")
-        XCTAssertTrue(card.shouldRememberPermission(for: "Always allow"))
-        XCTAssertFalse(card.shouldRememberPermission(for: "Allow"))
-        XCTAssertFalse(card.shouldRememberPermission(for: " deny "))
+        XCTAssertEqual(card.displayChoice(for: "Always allow"), "Allow once")
+        XCTAssertEqual(card.displayChoice(for: "Allow"), "Allow")
+        XCTAssertEqual(card.displayChoice(for: " deny "), " deny ")
 
         var answered = card
         answered.answered = "Allow"
@@ -295,7 +491,7 @@ final class DecodingTests: XCTestCase {
         let card = try XCTUnwrap(message.card)
         XCTAssertFalse(card.isPermission)
         XCTAssertEqual(card.responseBehavior(for: "Anything"), "answer")
-        XCTAssertFalse(card.shouldRememberPermission(for: "Always allow"))
+        XCTAssertEqual(card.displayChoice(for: "Always allow"), "Always allow")
     }
 
     func testDecodesAMessageThatGainedAFieldWeDoNotKnow() throws {
@@ -339,12 +535,22 @@ final class DecodingTests: XCTestCase {
         XCTAssertEqual(paired.endpoints?.map(\.kind), [.hosted, .lan])
     }
 
+    func testNotFoundStatusIsDistinctFromUnauthorized() {
+        let missing = APIError.status(code: 404, message: "no such queued message")
+        let noRoute = APIError.status(code: 404, message: "no route: DELETE /api/bots/x/queue/y")
+        XCTAssertTrue(missing.isNotFound)
+        XCTAssertTrue(noRoute.isNotFound)
+        XCTAssertFalse(missing.isUnauthorized)
+        XCTAssertEqual(missing.errorDescription, "no such queued message")
+        XCTAssertTrue(noRoute.errorDescription?.contains("no route") == true)
+    }
+
     func testDecodesTheHarnessErrorBodies() throws {
         // These are captured server contracts. Keep them verbatim until the
         // desktop changes in lockstep; the client passes them through.
         XCTAssertEqual(
             try decode(APIErrorBody.self, "unauthorized").error,
-            "pair this device from Phone settings in OpenMausBot on your computer"
+            "pair this device from Phone settings in BotFleet on your computer"
         )
         XCTAssertFalse(try decode(APIErrorBody.self, "forbidden").error.isEmpty)
         XCTAssertEqual(
@@ -365,7 +571,16 @@ final class DecodingTests: XCTestCase {
 
         let config = try decode(ConfigStatus.self, "config")
         XCTAssertEqual(config.profile?.name, "Ada Lovelace")
+        XCTAssertEqual(config.profile?.email, "ada@example.com")
+        XCTAssertEqual(config.rooms?.turnTimeoutMinutes, 5)
+        XCTAssertEqual(config.features?.showToolCalls, true)
+        XCTAssertEqual(config.features?.summarizeToolCalls, true)
+        XCTAssertTrue(config.features?.showsToolCalls ?? false)
+        XCTAssertTrue(config.features?.summarizesToolCalls ?? false)
         XCTAssertEqual(config.box?.configured, false)
+        XCTAssertNil(config.conversationMode)
+        XCTAssertFalse(config.isProjectsMode)
+        XCTAssertFalse(config.allowsMultipleBotThreads)
         // Captured bytes, not our idea of them: `describeVoice` always sends
         // the engine, so a sidecar that stopped forwarding it fails here
         // instead of quietly sending every built-in-voices user back to an
@@ -374,6 +589,39 @@ final class DecodingTests: XCTestCase {
         // server's own fallback decides it.
         XCTAssertEqual(config.tts?.provider, "elevenlabs")
         XCTAssertEqual(config.voiceProvider, .elevenlabs)
+    }
+
+    func testDecodesEngineReasoningCapabilitiesAndOlderPayloads() throws {
+        let current = try JSONDecoder().decode(
+            Instance.self,
+            from: Data(#"{"instanceId":"codex","driverKind":"codex","snapshot":{"state":"available"},"models":{"default":"gpt-6","options":[]},"capabilities":{"effortLevels":["low","high","xhigh"]}}"#.utf8)
+        )
+        XCTAssertEqual(current.capabilities?.effortLevels, ["low", "high", "xhigh"])
+
+        let old = try JSONDecoder().decode(
+            Instance.self,
+            from: Data(#"{"instanceId":"legacy","driverKind":"legacy","snapshot":{"state":"available"},"models":{"default":"default","options":[]}}"#.utf8)
+        )
+        XCTAssertNil(old.capabilities)
+        XCTAssertNotEqual(old.capabilities?.toolLoop, true)
+
+        let loop = try JSONDecoder().decode(
+            Instance.self,
+            from: Data(#"{"instanceId":"grok","driverKind":"grok","snapshot":{"state":"available"},"models":{"default":"grok","options":[]},"capabilities":{"toolLoop":true}}"#.utf8)
+        )
+        XCTAssertEqual(loop.capabilities?.toolLoop, true)
+
+        let capped = try JSONDecoder().decode(
+            Bot.self,
+            from: Data(#"{"id":"b","threadId":"t","name":"N","title":"","description":"","notifications":true,"color":"blue","unread":false,"modelSelection":{"instanceId":"grok","model":"grok"},"createdAt":1,"maxToolRounds":40}"#.utf8)
+        )
+        XCTAssertEqual(capped.maxToolRounds, 40)
+
+        let unset = try JSONDecoder().decode(
+            Bot.self,
+            from: Data(#"{"id":"b2","threadId":"t2","name":"N","title":"","description":"","notifications":true,"color":"blue","unread":false,"modelSelection":{"instanceId":"grok","model":"grok"},"createdAt":1}"#.utf8)
+        )
+        XCTAssertNil(unset.maxToolRounds)
     }
 
     // MARK: - Frames
@@ -424,6 +672,25 @@ final class DecodingTests: XCTestCase {
         XCTAssertEqual(kind, "routine.run")
     }
 
+    func testDecodesAnInstancesFrame() throws {
+        let json = #"{"kind":"instances","seq":4,"describedAt":1,"instances":[]}"#
+        let frame = try JSONDecoder().decode(StreamFrame.self, from: Data(json.utf8))
+        guard case let .instances(list, describedAt) = frame.frame else {
+            return XCTFail("expected .instances, got \(frame.frame)")
+        }
+        XCTAssertTrue(list.isEmpty)
+        XCTAssertEqual(describedAt, 1)
+        XCTAssertEqual(frame.seq, 4)
+    }
+
+    func testDecodesAHiddenEngineSnapshot() throws {
+        let json = #"{"state":"unavailable","hidden":true,"reason":"no Box token"}"#
+        let snapshot = try JSONDecoder().decode(ProviderSnapshot.self, from: Data(json.utf8))
+        XCTAssertTrue(snapshot.isHidden)
+        let plain = try JSONDecoder().decode(ProviderSnapshot.self, from: Data(#"{"state":"available"}"#.utf8))
+        XCTAssertFalse(plain.isHidden)
+    }
+
     func testDecodesANotifyFrame() throws {
         let json = """
         {"kind":"notify","seq":12,"notification":{
@@ -456,16 +723,32 @@ final class DecodingTests: XCTestCase {
     }
 
     func testAnUnknownRoleIsNotAttributedToYou() throws {
+        // `system` is a real role now (auto-delivered instructions).  A
+        // role this build has never heard of still must not paint as the
+        // human — that would be the phone claiming you said it.
         let json = """
-        {"id":"m1","role":"system","kind":"text","at":1,"text":"hello"}
+        {"id":"m1","role":"narrator","kind":"text","at":1,"text":"hello"}
         """
         let message = try JSONDecoder().decode(Message.self, from: Data(json.utf8))
         XCTAssertEqual(message.role, .bot)
+        XCTAssertNotEqual(message.role, .user)
     }
 
     /// The one that matters. `kind` is not optional, so before this a single
     /// unrecognised message failed the decode of the entire response — the
     /// thread did not render one message oddly, it did not render.
+    func testSystemRoleDecodesAndUnknownRoleIsNotYours() throws {
+        let json = """
+        {"messages":[
+          {"id":"m1","role":"system","kind":"text","at":1,"text":"Morning brief"},
+          {"id":"m2","role":"not-a-role","kind":"text","at":2,"text":"mystery"}
+        ],"hasMore":false}
+        """
+        let page = try JSONDecoder().decode(ThreadPage.self, from: Data(json.utf8))
+        XCTAssertEqual(page.messages.map(\.role), [.system, .bot])
+        XCTAssertNotEqual(page.messages[0].role, .user)
+    }
+
     func testOneUnknownMessageDoesNotSinkThePage() throws {
         let json = """
         {"messages":[

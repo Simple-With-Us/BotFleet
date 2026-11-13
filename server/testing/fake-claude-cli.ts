@@ -4,9 +4,63 @@
 // scripted session. Failure modes are toggled by env var, mirroring how
 // the real thing misbehaves:
 //
-//   FAKE_CLAUDE_MODE   happy (default) | exit-early | hang | malformed
+//   FAKE_CLAUDE_MODE   happy (default) | exit-early | hang | malformed | quota
 //                      | stream (partial-message text deltas before the
 //                        whole-message frame, plus subagent noise to drop)
+//                      | api-error (a real Anthropic API failure shaped like
+//                        production BOTFLEET-K events: is_error true,
+//                        terminal_reason "api_error", but a stale
+//                        stop_reason "stop_sequence" left over from the CLI's
+//                        result-builder — the regression case for trusting
+//                        stop_reason over terminal_reason on a failed turn)
+//                      | model-not-found (the CLI's answer to a model id it
+//                        cannot use, shaped like production frames: a
+//                        synthetic assistant frame with zero usage and a
+//                        top-level error "model_not_found", then a result
+//                        frame with is_error true, terminal_reason
+//                        "api_error" and api_error_status 404)
+//                      | model-not-found-text (the same, from a CLI that
+//                        drops the `error` field: only the synthetic model
+//                        and the text name the rejection)
+//                      | model-404 (a bare 404 result frame, no assistant
+//                        frame at all)
+//                      | model-lookalike (a REAL reply, with real usage, whose
+//                        prose opens with the rejection words: a success that
+//                        must stay an ordinary assistant message)
+//                      | ghost-turn (after the first turn settles, the CLI
+//                        starts a turn of its own: a background task's
+//                        notification, text, a tool step, a second result)
+//                      | ghost-running (the same, still running: no result)
+//                      | ghost-ahead (the second message arrives while the
+//                        CLI runs a turn of its own: that turn's frames and
+//                        result come first, then the message is read and
+//                        answered)
+//                      | ghost-ahead-hang (the same, but the CLI's own turn
+//                        stops at its tool call, waiting on a permission)
+//                      | helpers (a native subagent's frames, each carrying
+//                        parent_tool_use_id)
+//                      | queued-steer (slow, like `slow`, but a message that
+//                        arrives mid-turn is QUEUED rather than folded: the
+//                        result reports it in queued_turn_count, and it then
+//                        runs as a turn of its own; FAKE_CLAUDE_GATE, when
+//                        set, holds each turn until that file exists)
+//   FAKE_CLAUDE_CACHE_WRITE  ttl | flat | split — adds cache-creation figures to the
+//                      happy-path result (see the usage block below);
+//                      FAKE_CLAUDE_SERVED_MODEL names the assistant frame's model
+//   FAKE_CLAUDE_LIFECYCLE  1 (default) | 0 — whether to report
+//                      `command_lifecycle` frames for messages that carry a
+//                      uuid (queued on read, started when a turn takes one,
+//                      completed after), and the consumed uuids on each
+//                      result, the way 2.1.284 does.  0 plays an older CLI.
+//   FAKE_CLAUDE_COST_DIR  where the running `total_cost_usd` of each session
+//                      is kept (default: a folder under the OS temp dir).  As
+//                      in the real CLI the total is CUMULATIVE for the
+//                      process, and a --resume continues from the total the
+//                      session saved; each mode's own figure is that turn's
+//                      share.
+//   FAKE_CLAUDE_RESULT_MARK  optional path; a line is appended once each
+//                      result has been handed to the OS, so a test can stall
+//                      the harness while results sit unread in the pipe
 //   FAKE_CLAUDE_DUMP   path to write {argv, env, prompt, mcpConfig} as JSON,
 //                      so the test can assert on argv shape and env hygiene.
 //                      mcpConfig is read back from the --mcp-config file the
@@ -14,10 +68,37 @@
 //                      private temp file and deletes it when the turn settles,
 //                      so a test cannot open it after the fact.
 //   FAKE_CLAUDE_AUTH   in (default) | out | unsupported | malformed |
-//                      inherited-api-key — what `auth status` reports
+//                      inherited-api-key | hang — what `auth status` reports
+//                      (hang: never answers, so the probe runs out of time)
+//   FAKE_CLAUDE_QUOTA_GATE  optional file whose creation releases quota mode,
+//                           so integration tests can queue work before settle
+//   FAKE_CLAUDE_REPLY  optional successful assistant text for prose-boundary tests
+//   FAKE_CLAUDE_SLASH_COMMANDS  optional comma-separated list the init frame
+//                        reports as `slash_commands`, the way the real CLI
+//                        lists its built-in, skill and plugin commands
+//   FAKE_CLAUDE_PROMPTS  optional path; every user message this process reads
+//                        from stdin is appended as one JSON line, so a test
+//                        can see what a REUSED process was sent (the dump
+//                        above records only the launch)
 //
 // Keep this file dependency-free — it runs as a bare `node` subprocess.
-import { readFileSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+// The dump is read by a separate process that only knows the file exists.
+// A plain writeFileSync creates the file and then fills it, so a reader that
+// polls existsSync() can open it mid-write and get truncated JSON — the
+// "Unexpected end of JSON input" flake.  Writing a sibling temp file and
+// renaming it into place makes the swap atomic: a reader sees either no file
+// or the whole thing.  The temp name carries the pid so two fake CLIs sharing
+// one dump path cannot clobber each other's partial write.
+const writeFileAtomic = (path: string, body: string): void => {
+  const tmp = `${path}.tmp-${process.pid}`;
+  writeFileSync(tmp, body);
+  renameSync(tmp, path);
+};
 
 const mode = process.env.FAKE_CLAUDE_MODE ?? "happy";
 
@@ -27,16 +108,45 @@ const argAfter = (flag: string): string | null => {
   return i === -1 ? null : (argv[i + 1] ?? null);
 };
 
-const out = (obj: unknown) => process.stdout.write(JSON.stringify(obj) + "\n");
+const write = (obj: unknown, done?: () => void) => process.stdout.write(JSON.stringify(obj) + "\n", done);
+// Results are rewritten on the way out (running cost, consumed uuids); the
+// hook is installed once the session state below exists.
+let shapeResult: ((result: Record<string, unknown>) => () => void) | null = null;
+const out = (obj: unknown) => {
+  if (shapeResult && obj && typeof obj === "object" && (obj as { type?: unknown }).type === "result") {
+    const after = shapeResult(obj as Record<string, unknown>);
+    const mark = process.env.FAKE_CLAUDE_RESULT_MARK;
+    write(obj, mark ? () => appendFileSync(mark, "result\n") : undefined);
+    after();
+    return;
+  }
+  write(obj);
+};
 
 // Snapshot probes: both answer on argv alone and exit without reading stdin.
 if (argv[0] === "--version") {
-  process.stdout.write("2.1.232 (Claude Code)\n");
+  process.stdout.write(`${process.env.FAKE_CLAUDE_VERSION ?? "2.1.232 (Claude Code)"}\n`);
+  process.exit(0);
+}
+
+if (argv[0] === "--help") {
+  if (process.env.FAKE_CLAUDE_HELP_PROBES) appendFileSync(process.env.FAKE_CLAUDE_HELP_PROBES, "probe\n");
+  if (process.env.FAKE_CLAUDE_HELP === "hang") {
+    // A busy Mac: no answer before the driver's deadline kills this.
+    await new Promise((resolve) => setTimeout(resolve, 60_000));
+    process.exit(0);
+  }
+  process.stdout.write(process.env.FAKE_CLAUDE_HELP === "unsupported" ? "Usage: claude\n" : "  --strict-mcp-config  Only load explicit MCP servers\n");
   process.exit(0);
 }
 
 if (argv[0] === "auth" && argv[1] === "status") {
   const auth = process.env.FAKE_CLAUDE_AUTH ?? "in";
+  if (auth === "hang") {
+    // A busy Mac: no answer before the driver's deadline kills this.
+    await new Promise((resolve) => setTimeout(resolve, 60_000));
+    process.exit(0);
+  }
   if (auth === "unsupported") {
     process.stderr.write("error: unknown command 'auth'\n");
     process.exit(1);
@@ -52,6 +162,19 @@ if (argv[0] === "auth" && argv[1] === "status") {
   );
 }
 
+// One-shot /usage renewal command used by claudeSignedIn
+if (argv.includes("-p") && argv.includes("/usage")) {
+  const auth = process.env.FAKE_CLAUDE_AUTH ?? "in";
+  if (auth === "out" || auth === "unsupported") {
+    process.stderr.write("Failed to authenticate: OAuth session expired and could not be refreshed\n");
+    process.exit(1);
+  }
+  process.stdout.write(
+    JSON.stringify({ is_error: false, subtype: "success", result: "Total cost: $0.00" }) + "\n",
+  );
+  process.exit(0);
+}
+
 // One-shot helper mode used by generateText/reviewPermission. The prompt is
 // deliberately read from stdin so sensitive review text never appears in
 // argv or process listings.
@@ -63,7 +186,7 @@ if (argAfter("--output-format") === "text") {
     process.stdin.on("end", () => resolve(input));
   });
   if (process.env.FAKE_CLAUDE_DUMP) {
-    writeFileSync(
+    writeFileAtomic(
       process.env.FAKE_CLAUDE_DUMP,
       JSON.stringify({ pid: process.pid, argv, env: process.env, prompt, mcpConfig: null }, null, 2),
     );
@@ -86,18 +209,135 @@ let turnRunning = false;
 let steered: string[] = [];
 let stdinEnded = false;
 
+// ── command lifecycle and running cost (2.1.284's shape) ─────────────────
+const lifecycleOn = process.env.FAKE_CLAUDE_LIFECYCLE !== "0";
+/** The stamped messages the running turn has taken, for its result. */
+let consumed: string[] = [];
+/** Folded steers' uuids, reported started when the fold lands. */
+let steeredIds: string[] = [];
+/** Messages read mid-turn and queued rather than folded (queued-steer). */
+const backlog: JsonValue[] = [];
+const uuidOf = (prompt: JsonValue): string | undefined => {
+  const id = prompt && typeof prompt === "object" && !Array.isArray(prompt) ? prompt.uuid : undefined;
+  return typeof id === "string" && id ? id : undefined;
+};
+const lifecycle = (commandUuid: string | undefined, state: string) => {
+  if (!lifecycleOn || !commandUuid) return;
+  write({ type: "command_lifecycle", command_uuid: commandUuid, state, uuid: randomUUID(), session_id: sessionId });
+};
+const take = (commandUuid: string | undefined) => {
+  if (!commandUuid) return;
+  consumed.push(commandUuid);
+  lifecycle(commandUuid, "started");
+};
+const costDir = process.env.FAKE_CLAUDE_COST_DIR ?? join(tmpdir(), "botfleet-fake-claude-cost");
+const costFile = join(costDir, sessionId.replace(/[^\w-]/g, "_"));
+let costTotal = 0;
+if (argAfter("--resume")) {
+  try {
+    costTotal = Number(readFileSync(costFile, "utf8")) || 0;
+  } catch {
+    /* a session with no saved total starts from zero */
+  }
+}
+shapeResult = (result) => {
+  // each mode states its own turn's cost; the CLI reports the running total
+  if (typeof result.total_cost_usd === "number") {
+    costTotal = Math.round((costTotal + result.total_cost_usd) * 1e6) / 1e6;
+    result.total_cost_usd = costTotal;
+    try {
+      mkdirSync(costDir, { recursive: true });
+      writeFileSync(costFile, String(costTotal));
+    } catch {
+      /* the next process starts from zero */
+    }
+  }
+  const taken = consumed;
+  consumed = [];
+  if (lifecycleOn && taken.length && result.user_message_uuids === undefined) {
+    result.user_message_uuids = taken;
+    result.user_message_uuid = taken[taken.length - 1];
+  }
+  // a command that started a fresh turn reports completed after its result
+  return () => {
+    for (const id of taken) lifecycle(id, "completed");
+  };
+};
+
+// The harness delivers out-of-band context (the volatile half of the system
+// prompt — drivers/prompt-split.ts) as a leading <system-reminder> block
+// inside the user turn.  The real CLI reads that block as context, not as
+// the message, so the echo below replies to the text after it: a test that
+// asserts on the reply sees the user's words, never the harness's note.
+const stripSystemReminder = (text: string): string =>
+  text.replace(/^<system-reminder>\n[\s\S]*?\n<\/system-reminder>(?:\n\n|$)/, "");
+
 const promptText = (prompt: JsonValue): string => {
   const m = prompt && typeof prompt === "object" && !Array.isArray(prompt) ? (prompt as { message?: { content?: unknown } }).message : undefined;
-  return typeof m?.content === "string" ? m.content : "";
+  return typeof m?.content === "string" ? stripSystemReminder(m.content) : "";
 };
 
 const finishIfDone = () => {
   if (stdinEnded && !turnRunning) process.exit(0);
 };
 
+// A turn the CLI starts on its own once the first turn has settled, in the
+// shape the jobs panel's live probe of 2.1.284 recorded: a task_notification,
+// a second init, the model's text and a tool step, then a second result whose
+// origin is the notification.  `ghost-running` stops before that result — the
+// CLI is still busy with its own turn when the next message would arrive.
+let ghostPlayed = false;
+const playGhostTurn = () => {
+  // an internally enqueued command: a fresh uuid, started with no `queued`
+  lifecycle(`internal-${randomUUID()}`, "started");
+  out({
+    type: "system",
+    subtype: "task_notification",
+    task_id: "bg-task-1",
+    tool_use_id: "tu-bg-1",
+    status: "completed",
+    output_file: "/tmp/bg-task-1.output",
+    summary: 'Background command "sleep 4; echo bgdone" completed (exit code 0)',
+  });
+  out({ type: "system", subtype: "init", session_id: sessionId, model, tools: ["Bash", "Task"] });
+  out({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "GHOST DELTA" } } });
+  out({
+    type: "assistant",
+    message: {
+      content: [
+        { type: "text", text: "GHOST TEXT" },
+        { type: "tool_use", id: "ghost-tu-1", name: "Bash", input: { command: "cat /tmp/bg-task-1.output" } },
+      ],
+      usage: { input_tokens: 40, cache_read_input_tokens: 0, output_tokens: 6 },
+    },
+  });
+  if (mode === "ghost-ahead-hang") {
+    // the CLI's own tool call waits on a permission nobody will grant
+    turnRunning = true;
+    setInterval(() => {}, 1_000);
+    return;
+  }
+  out({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "ghost-tu-1", is_error: false, content: "bgdone" }] } });
+  if (mode === "ghost-turn" || mode === "ghost-ahead") {
+    out({
+      type: "result",
+      is_error: false,
+      stop_reason: "end_turn",
+      result: "finished",
+      total_cost_usd: 0.02,
+      origin: { kind: "task-notification", producer: "session-task" },
+      queued_turn_count: 0,
+      result_index: 1,
+      usage: { input_tokens: 40, cache_read_input_tokens: 0, output_tokens: 6 },
+    });
+  }
+};
+
 const playTurn = (prompt: JsonValue) => {
   turnRunning = true;
   steered = [];
+  steeredIds = [];
+  take(uuidOf(prompt));
   if (!dumped && process.env.FAKE_CLAUDE_DUMP) {
     dumped = true;
     const configPath = argAfter("--mcp-config");
@@ -109,7 +349,7 @@ const playTurn = (prompt: JsonValue) => {
         /* leave null — the test will see it */
       }
     }
-    writeFileSync(process.env.FAKE_CLAUDE_DUMP, JSON.stringify({ pid: process.pid, argv, env: process.env, prompt, mcpConfig }, null, 2));
+    writeFileAtomic(process.env.FAKE_CLAUDE_DUMP, JSON.stringify({ pid: process.pid, argv, env: process.env, prompt, mcpConfig }, null, 2));
   }
 
   if (mode === "exit-early") {
@@ -135,13 +375,22 @@ const playTurn = (prompt: JsonValue) => {
       if (process.env.FAKE_CLAUDE_PARTIAL_FAILS) {
         out({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "half an answer" } } });
       }
+      // FAKE_CLAUDE_TOOL_FAILS makes the failing launch emit a tool_use frame
+      // first — the produced-output guard must forbid retrying it (E2): the
+      // relaunch would replay the user message and re-run the tool.
+      if (process.env.FAKE_CLAUDE_TOOL_FAILS) {
+        out({ type: "assistant", message: { content: [{ type: "tool_use", id: "toolu_fake_fail", name: "Bash", input: { command: "echo ran" } }] } });
+      }
       process.stderr.write("claude: API error (503): service temporarily unavailable\n");
       process.exit(5);
     }
   }
 
-  // the real CLI re-announces init on every turn of a live process
-  out({ type: "system", subtype: "init", session_id: sessionId, model });
+  // the real CLI re-announces init on every turn of a live process, with its
+  // catalog of slash commands (FAKE_CLAUDE_SLASH_COMMANDS, comma separated)
+  const init = { type: "system", subtype: "init", session_id: sessionId, model };
+  const slashCommands = process.env.FAKE_CLAUDE_SLASH_COMMANDS;
+  out(slashCommands ? { ...init, slash_commands: slashCommands.split(",") } : init);
 
   if (mode === "hang") {
     // stay alive until killed — lets tests exercise interrupt + the
@@ -152,6 +401,187 @@ const playTurn = (prompt: JsonValue) => {
 
   if (mode === "malformed") {
     process.stdout.write("this is not json\n{broken\n");
+  }
+
+  if (mode === "quota") {
+    const finishQuota = () => {
+      out({
+        type: "assistant",
+        message: {
+          content: [{ type: "text", text: "You've hit your session limit · resets in 30 minutes" }],
+          usage: { input_tokens: 3, cache_read_input_tokens: 0, output_tokens: 1 },
+        },
+      });
+      out({
+        type: "result",
+        is_error: false,
+        stop_reason: "end_turn",
+        total_cost_usd: 0,
+        usage: { input_tokens: 3, cache_read_input_tokens: 0, output_tokens: 1 },
+      });
+      turnRunning = false;
+      finishIfDone();
+    };
+    const gate = process.env.FAKE_CLAUDE_QUOTA_GATE;
+    if (gate && !existsSync(gate)) {
+      const timer = setInterval(() => {
+        if (!existsSync(gate)) return;
+        clearInterval(timer);
+        finishQuota();
+      }, 10);
+    } else {
+      finishQuota();
+    }
+    return;
+  }
+
+  if (mode === "api-error") {
+    // No assistant/tool_use frame first: production samples show
+    // duration_api_ms: 0 — the request never got a real model response, it
+    // failed before one arrived. subtype stays "success" and stop_reason
+    // stays the stale "stop_sequence" the same way the real CLI's result
+    // builder does; only terminal_reason + api_error_status name the actual
+    // cause.
+    out({
+      type: "result",
+      is_error: true,
+      subtype: "success",
+      stop_reason: "stop_sequence",
+      terminal_reason: "api_error",
+      api_error_status: 429,
+      num_turns: 1,
+      total_cost_usd: 0,
+    });
+    turnRunning = false;
+    finishIfDone();
+    return;
+  }
+
+  if (mode === "model-not-found" || mode === "model-not-found-text" || mode === "model-404") {
+    const rejection =
+      `There's an issue with the selected model (${model}). It may not exist or you may not have access to it. ` +
+      "Run /model to pick a different model.";
+    const synthetic = {
+      model: "<synthetic>",
+      role: "assistant",
+      content: [{ type: "text", text: rejection }],
+      usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0 },
+    };
+    // the structural marker; the text-only mode is a CLI that drops it
+    if (mode === "model-not-found") out({ type: "assistant", error: "model_not_found", message: synthetic });
+    if (mode === "model-not-found-text") out({ type: "assistant", message: synthetic });
+    const failure = {
+      type: "result",
+      is_error: true,
+      subtype: "success",
+      stop_reason: "stop_sequence",
+      terminal_reason: "api_error",
+      api_error_status: 404,
+      duration_api_ms: 0,
+      num_turns: 1,
+      total_cost_usd: 0,
+    };
+    out(mode === "model-404" ? failure : { ...failure, result: rejection });
+    turnRunning = false;
+    finishIfDone();
+    return;
+  }
+
+  if (mode === "model-lookalike") {
+    out({
+      type: "assistant",
+      message: {
+        model: "claude-fake",
+        content: [{ type: "text", text: "There's an issue with the selected model dropdown: it listed stale ids, so I fixed the filter." }],
+        usage: { input_tokens: 10, cache_read_input_tokens: 0, output_tokens: 18 },
+      },
+    });
+    out({ type: "result", is_error: false, stop_reason: "end_turn", total_cost_usd: 0.01, usage: { input_tokens: 10, cache_read_input_tokens: 0, output_tokens: 18 } });
+    turnRunning = false;
+    finishIfDone();
+    return;
+  }
+
+  if (mode === "helpers") {
+    // A native helper (subagent) at work, shaped like 2.1.284's stream: the
+    // bot calls Task, every helper frame carries parent_tool_use_id naming
+    // that call, and the Task's own tool_result comes back at the top level.
+    out({
+      type: "assistant",
+      message: {
+        content: [{ type: "tool_use", id: "task-1", name: "Task", input: { description: "Survey files", prompt: "look around", subagent_type: "Explore" } }],
+        usage: { input_tokens: 10, cache_read_input_tokens: 0, output_tokens: 4 },
+      },
+    });
+    const helperUsage = { input_tokens: 999, cache_read_input_tokens: 0, output_tokens: 99 };
+    out({
+      type: "assistant",
+      parent_tool_use_id: "task-1",
+      message: {
+        id: "msg-helper-1",
+        content: [
+          { type: "text", text: "HELPER NARRATION" },
+          { type: "tool_use", id: "helper-read-1", name: "Read", input: { file_path: "/tmp/helper-target.txt" } },
+        ],
+        usage: helperUsage,
+      },
+    });
+    // The CLI streams one assistant message as more than one frame, and the
+    // later frame repeats that message's usage.  The driver must count it once.
+    out({
+      type: "assistant",
+      parent_tool_use_id: "task-1",
+      message: {
+        id: "msg-helper-1",
+        content: [{ type: "text", text: "HELPER NARRATION" }],
+        usage: helperUsage,
+      },
+    });
+    out({
+      type: "user",
+      parent_tool_use_id: "task-1",
+      message: { content: [{ type: "tool_result", tool_use_id: "helper-read-1", is_error: false, content: "file body" }] },
+    });
+    out({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "task-1", is_error: false, content: "helper report" }] } });
+    out({ type: "assistant", message: { content: [{ type: "text", text: "all done" }], usage: { input_tokens: 12, cache_read_input_tokens: 0, output_tokens: 3 } } });
+    out({ type: "result", is_error: false, stop_reason: "end_turn", total_cost_usd: 0.02, usage: { input_tokens: 22, cache_read_input_tokens: 0, output_tokens: 7 } });
+    turnRunning = false;
+    finishIfDone();
+    return;
+  }
+
+  if (mode === "queued-steer") {
+    // A steer that lands after the turn's last model call: the CLI reads it
+    // but does not fold it, settles the turn with it still queued
+    // (queued_turn_count), then runs a turn of its own for it.  The turn
+    // ends 800 ms in, or once FAKE_CLAUDE_GATE exists when that is set (a
+    // test can make sure its steer was read first).
+    const gate = process.env.FAKE_CLAUDE_GATE;
+    const whenOpen = (run: () => void) => {
+      if (!gate) return void setTimeout(run, 800);
+      const timer = setInterval(() => {
+        if (!existsSync(gate)) return;
+        clearInterval(timer);
+        run();
+      }, 20);
+    };
+    whenOpen(() => {
+      out({
+        type: "assistant",
+        message: { content: [{ type: "text", text: `reply to: ${promptText(prompt)}` }], usage: { input_tokens: 10, cache_read_input_tokens: 4, output_tokens: 3 } },
+      });
+      out({
+        type: "result", is_error: false, stop_reason: "end_turn", total_cost_usd: 0.01,
+        ...(lifecycleOn ? { origin: { kind: "human" } } : {}),
+        queued_turn_count: backlog.length,
+        usage: { input_tokens: 10, cache_read_input_tokens: 4, output_tokens: 3 },
+      });
+      turnRunning = false;
+      const next = backlog.shift();
+      if (next !== undefined) playTurn(next);
+      else finishIfDone();
+    });
+    return;
   }
 
   if (mode === "stream") {
@@ -171,17 +601,60 @@ const playTurn = (prompt: JsonValue) => {
     type: "assistant",
     message: {
       content: [
-        { type: "text", text: "hello from fake claude" },
-        { type: "tool_use", id: "tu-1", name: "Bash" },
+        { type: "text", text: process.env.FAKE_CLAUDE_REPLY ?? "hello from fake claude" },
+        // FAKE_CLAUDE_TOOL_IO gives the step real arguments and a real result, the
+        // way the CLI reports them, so a test can follow them into the harness's
+        // input/output side store (the default step carries neither)
+        { type: "tool_use", id: "tu-1", name: "Bash", ...(process.env.FAKE_CLAUDE_TOOL_IO ? { input: { command: "echo hi", stdin: "TAIL-INPUT-MARKER" } } : {}) },
       ],
-      usage: { input_tokens: 10, cache_read_input_tokens: 2, output_tokens: 5 },
+      model: process.env.FAKE_CLAUDE_SERVED_MODEL,
+      id: process.env.FAKE_CLAUDE_PROOF ? "msg-single-call" : undefined,
+      usage: { input_tokens: 10, cache_read_input_tokens: 2, output_tokens: 5,
+        cache_creation_input_tokens: process.env.FAKE_CLAUDE_PROOF ? 0 : undefined },
     },
   });
-  out({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tu-1", is_error: false }] } });
+  out({
+    type: "user",
+    message: {
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "tu-1",
+          is_error: false,
+          ...(process.env.FAKE_CLAUDE_TOOL_IO
+            ? { content: [{ type: "text", text: `head line\n${"p".repeat(400)}\nTAIL-OUTPUT-MARKER the key is api_key=ak9999999999999999999999999999999 as printed` }] }
+            : {}),
+        },
+      ],
+    },
+  });
 
+  // FAKE_CLAUDE_CACHE_WRITE=ttl reports the split cache writes the CLI gives
+  // (3 in the 5 minute cache, 4 in the 1 hour cache); =flat reports only the
+  // old flat figure (7); =split reports ONLY the TTL split, no flat total.
+  const cacheWrite: Record<string, unknown> = {};
+  if (process.env.FAKE_CLAUDE_CACHE_WRITE === "ttl" || process.env.FAKE_CLAUDE_CACHE_WRITE === "flat") {
+    cacheWrite.cache_creation_input_tokens = 7;
+  }
+  if (process.env.FAKE_CLAUDE_CACHE_WRITE === "ttl" || process.env.FAKE_CLAUDE_CACHE_WRITE === "split") {
+    cacheWrite.cache_creation = { ephemeral_5m_input_tokens: 3, ephemeral_1h_input_tokens: 4 };
+  }
   const finish = () => {
-    out({ type: "result", is_error: false, stop_reason: "end_turn", total_cost_usd: 0.01, usage: { input_tokens: 10, cache_read_input_tokens: 2, output_tokens: 5 } });
+    const result = {
+      type: "result",
+      is_error: false,
+      stop_reason: "end_turn",
+      total_cost_usd: 0.01,
+      usage: { input_tokens: 10, cache_read_input_tokens: 2, output_tokens: 5,
+        cache_creation_input_tokens: process.env.FAKE_CLAUDE_PROOF ? 0 : undefined, ...cacheWrite },
+    };
+    // 2.1.284 names where each turn came from; an older CLI does not
+    out(lifecycleOn ? { ...result, origin: { kind: "human" }, queued_turn_count: 0 } : result);
     turnRunning = false;
+    if (!ghostPlayed && (mode === "ghost-turn" || mode === "ghost-running")) {
+      ghostPlayed = true;
+      setTimeout(playGhostTurn, 50);
+    }
     finishIfDone();
   };
   if (mode === "slow") {
@@ -189,6 +662,7 @@ const playTurn = (prompt: JsonValue) => {
     // was folded in, the way the real CLI includes a mid-turn message in
     // the same turn's next model call
     setTimeout(() => {
+      for (const id of steeredIds) take(id);
       const tail = steered.length ? ` + steered: ${steered.join(" | ")}` : "";
       out({ type: "assistant", message: { content: [{ type: "text", text: `reply to: ${promptText(prompt)}${tail}` }] } });
       finish();
@@ -199,6 +673,7 @@ const playTurn = (prompt: JsonValue) => {
 };
 
 let buf = "";
+let messagesRead = 0;
 process.stdin.on("data", (c) => {
   buf += c;
   let nl;
@@ -212,8 +687,24 @@ process.stdin.on("data", (c) => {
     } catch {
       continue;
     }
-    if (turnRunning) steered.push(promptText(prompt));
-    else playTurn(prompt);
+    if (process.env.FAKE_CLAUDE_PROMPTS) appendFileSync(process.env.FAKE_CLAUDE_PROMPTS, JSON.stringify({ pid: process.pid, prompt }) + "\n");
+    messagesRead++;
+    if ((mode === "ghost-ahead" || mode === "ghost-ahead-hang") && messagesRead === 2) {
+      // The CLI had started a turn of its own just before this message came
+      // in: that turn plays out first, and the message is read after it.
+      playGhostTurn();
+      if (mode === "ghost-ahead-hang") continue;
+      lifecycle(uuidOf(prompt), "queued");
+      playTurn(prompt);
+      continue;
+    }
+    lifecycle(uuidOf(prompt), "queued");
+    if (turnRunning && mode === "queued-steer") backlog.push(prompt);
+    else if (turnRunning) {
+      steered.push(promptText(prompt));
+      const id = uuidOf(prompt);
+      if (id) steeredIds.push(id);
+    } else playTurn(prompt);
   }
 });
 process.stdin.on("end", () => {

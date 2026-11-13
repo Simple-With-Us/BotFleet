@@ -28,9 +28,9 @@ async function canonicalPath(target, fsp, message) {
   }
 }
 
-function assertInside(root, target) {
+function assertInside(root, target, message) {
   if (target !== root && !target.startsWith(root + path.sep)) {
-    throw new Error("Only files created by your bots can be saved");
+    throw new Error(message);
   }
 }
 
@@ -45,30 +45,49 @@ function isSameFile(left, right) {
 // Paths come from model-rendered markdown, so they are untrusted. Resolve the
 // root and target before checking containment, then retain the target identity
 // for the open step below.
-async function resolveSource(rawPath, { home, fsp, platform }) {
+async function resolveSource(rawPath, { home, fsp, platform, outsideMessage }) {
   const target = normalizeSourcePath(rawPath);
+  const rejected = outsideMessage ?? "Only files created by your bots can be saved";
   const root = await canonicalPath(
     path.join(home, ".botfleet"),
     fsp,
-    "Only files created by your bots can be saved",
+    rejected,
   );
   const filePath = await canonicalPath(target, fsp, "That file no longer exists");
-  assertInside(root, filePath);
+  assertInside(root, filePath, rejected);
 
   const stats = await fsp.stat(filePath, { bigint: true });
   assertRegularFile(stats);
   if (platform === "win32") {
     const pathAfterStat = await canonicalPath(filePath, fsp, "That file no longer exists");
-    assertInside(root, pathAfterStat);
+    assertInside(root, pathAfterStat, rejected);
   }
   return { filePath, stats };
 }
 
 // Kept as a narrow validation seam for callers and tests that only need the
 // canonical path. The save flow uses withSavableFile so it cannot forget to
-// close the stable source handle.
-export async function resolveSavablePath(rawPath, { home, fsp = fs.promises, platform = process.platform } = {}) {
-  return (await resolveSource(rawPath, { home, fsp, platform })).filePath;
+// close the stable source handle.  open-file / show-in-folder reuse this so a
+// file:// URL is decoded with fileURLToPath on every platform and a path
+// outside ~/.botfleet cannot reach shell.openPath.
+export async function resolveSavablePath(
+  rawPath,
+  { home, fsp = fs.promises, platform = process.platform, outsideMessage } = {},
+) {
+  return (await resolveSource(rawPath, { home, fsp, platform, outsideMessage })).filePath;
+}
+
+/** Resolve an absolute file or folder path the user chose at plugin install
+ *  time.  Unlike bot-created files, plugin sources may live outside
+ *  ~/.botfleet; the path must exist on disk. */
+export async function resolveLocalRevealPath(rawPath, { fsp = fs.promises } = {}) {
+  const target = normalizeSourcePath(rawPath);
+  const resolved = await canonicalPath(target, fsp, "That path no longer exists");
+  const stats = await fsp.stat(resolved, { bigint: true });
+  if (!stats.isFile() && !stats.isDirectory()) {
+    throw new Error("That path is not a file or folder");
+  }
+  return resolved;
 }
 
 async function openSavableFile(rawPath, { home, fsp, platform }) {

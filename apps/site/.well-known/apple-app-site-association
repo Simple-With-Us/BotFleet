@@ -1,0 +1,14 @@
+{
+  "applinks": {
+    "apps": [],
+    "details": [
+      {
+        "appIDs": ["CC8UTF7ATG.app.botfleet"],
+        "paths": ["/pair/*", "/bot/*", "/chat/*", "*"]
+      }
+    ]
+  },
+  "webcredentials": {
+    "apps": ["CC8UTF7ATG.app.botfleet"]
+  }
+}

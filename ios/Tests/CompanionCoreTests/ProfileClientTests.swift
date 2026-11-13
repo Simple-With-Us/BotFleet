@@ -66,6 +66,22 @@ final class ProfileClientTests: XCTestCase {
         super.tearDown()
     }
 
+    func testProfilePatchEncodesMaxToolRoundsSetAndClear() throws {
+        let setData = try JSONEncoder().encode(BotProfilePatch(maxToolRounds: .set(40)))
+        let setBody = try XCTUnwrap(JSONSerialization.jsonObject(with: setData) as? [String: Any])
+        XCTAssertEqual(setBody.keys.sorted(), ["maxToolRounds"])
+        XCTAssertEqual((setBody["maxToolRounds"] as? NSNumber)?.intValue, 40)
+
+        let clearData = try JSONEncoder().encode(BotProfilePatch(maxToolRounds: .clear))
+        let clearBody = try XCTUnwrap(JSONSerialization.jsonObject(with: clearData) as? [String: Any])
+        XCTAssertEqual(clearBody.keys.sorted(), ["maxToolRounds"])
+        XCTAssertTrue(clearBody["maxToolRounds"] is NSNull)
+
+        let omitted = try JSONEncoder().encode(BotProfilePatch())
+        let omittedBody = try XCTUnwrap(JSONSerialization.jsonObject(with: omitted) as? [String: Any])
+        XCTAssertNil(omittedBody["maxToolRounds"])
+    }
+
     func testProfilePatchPreservesServerLimitsWithoutClientTruncation() throws {
         let name = String(repeating: "n", count: 100)
         let title = String(repeating: "t", count: 200)
@@ -79,6 +95,13 @@ final class ProfileClientTests: XCTestCase {
         XCTAssertEqual(body["title"] as? String, title)
         XCTAssertEqual(body["description"] as? String, description)
         XCTAssertEqual(body["voice"] as? String, "", "empty explicitly selects the workspace default")
+    }
+
+    func testVoiceDevicePatchCanExplicitlyTurnOffAllDevices() throws {
+        let data = try JSONEncoder().encode(BotProfilePatch(speechDevices: []))
+        let body = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(body.keys.sorted(), ["speechDevices"])
+        XCTAssertEqual(body["speechDevices"] as? [String], [])
     }
 
     func testProfileClientSendsOnlyFieldsOwnedByTheAction() async throws {
@@ -112,6 +135,58 @@ final class ProfileClientTests: XCTestCase {
         XCTAssertEqual(body["avatarCrop"] as? String, "mascot")
     }
 
+    func testProfileClientPreservesPrimaryAndFallbackReasoningEffort() async throws {
+        ProfileRequestStub.responseBody = Self.botResponse
+        let selection = ModelSelection(
+            instanceId: "codex",
+            model: "gpt-6",
+            effort: "future-ultra",
+            fallbacks: [ModelSelection(instanceId: "claude", model: "opus", effort: "high")]
+        )
+
+        _ = try await client.updateProfile(
+            botId: "avatar-bot",
+            patch: BotProfilePatch(modelSelection: selection)
+        )
+
+        let data = try XCTUnwrap(ProfileRequestStub.capturedBody)
+        let body = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(body.keys.sorted(), ["modelSelection"])
+        let primary = try XCTUnwrap(body["modelSelection"] as? [String: Any])
+        XCTAssertEqual(primary["effort"] as? String, "future-ultra")
+        let fallbacks = try XCTUnwrap(primary["fallbacks"] as? [[String: Any]])
+        XCTAssertEqual(fallbacks.first?["effort"] as? String, "high")
+
+        let roundTrip = try JSONDecoder().decode(ModelSelection.self, from: JSONEncoder().encode(selection))
+        XCTAssertEqual(roundTrip, selection)
+    }
+
+    func testUserProfilePatchOmitsUnchangedSiblingFields() async throws {
+        ProfileRequestStub.responseBody = Self.configResponse
+
+        _ = try await client.updateProfile(name: "Ada")
+
+        let nameOnly = try XCTUnwrap(ProfileRequestStub.capturedBody)
+        let nameBody = try XCTUnwrap(JSONSerialization.jsonObject(with: nameOnly) as? [String: Any])
+        XCTAssertEqual(nameBody.keys.sorted(), ["name"])
+        XCTAssertEqual(nameBody["name"] as? String, "Ada")
+
+        ProfileRequestStub.capturedBody = nil
+        _ = try await client.updateProfile(email: "ada@example.com")
+
+        let emailOnly = try XCTUnwrap(ProfileRequestStub.capturedBody)
+        let emailBody = try XCTUnwrap(JSONSerialization.jsonObject(with: emailOnly) as? [String: Any])
+        XCTAssertEqual(emailBody.keys.sorted(), ["email"])
+        XCTAssertEqual(emailBody["email"] as? String, "ada@example.com")
+
+        ProfileRequestStub.capturedBody = nil
+        _ = try await client.updateProfile(name: "Ada", email: "ada@example.com")
+
+        let both = try XCTUnwrap(ProfileRequestStub.capturedBody)
+        let bothBody = try XCTUnwrap(JSONSerialization.jsonObject(with: both) as? [String: Any])
+        XCTAssertEqual(bothBody.keys.sorted(), ["email", "name"])
+    }
+
     func testAvatarGenerationRequestOutlivesTheServersImageTimeout() async throws {
         ProfileRequestStub.responseBody = Self.generatedAvatarResponse
 
@@ -135,4 +210,7 @@ final class ProfileClientTests: XCTestCase {
     private static let generatedAvatarResponse = Data(
         "{\"avatarUrl\":\"/api/attachments/123e4567-e89b-12d3-a456-426614174000.webp\",\"bot\":\(botJSON)}".utf8
     )
+    private static let configResponse = Data("""
+    {"profile":{"name":"Ada","email":"ada@example.com"},"conversationMode":"simple"}
+    """.utf8)
 }

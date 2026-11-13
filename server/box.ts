@@ -12,6 +12,7 @@
 //   - the dedicated IP rotates across archive/resume — never persist it.
 import type { AppConfig } from "./config.ts";
 import { ensureRemoteCuaCommand, remoteComputerBootstrapCommand } from "./remote-computer.ts";
+import { getSentry, isSentryActive } from "./sentry.ts";
 
 // overridable so tests can point at a stub instead of the live provider
 const BOX_API = process.env.OMB_BOX_API || "https://ascii.dev/api/box/v1";
@@ -19,9 +20,13 @@ const READY = new Set(["idle", "ready", "running"]);
 const DEFAULT_BOX_TTL_SECONDS = 8 * 60 * 60;
 const TRIAL_BOX_TTL_SECONDS = 2 * 60 * 60;
 
-function boxFetch(cfg: AppConfig, path: string, opts: RequestInit = {}) {
+const BOX_FETCH_TIMEOUT_MS = 30_000;
+
+export async function boxFetch(cfg: AppConfig, path: string, opts: RequestInit = {}): Promise<Response> {
+  const { signal, ...rest } = opts;
   return fetch(`${BOX_API}${path}`, {
-    ...opts,
+    ...rest,
+    signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(BOX_FETCH_TIMEOUT_MS)]) : AbortSignal.timeout(BOX_FETCH_TIMEOUT_MS),
     headers: {
       authorization: `Bearer ${cfg.box?.token}`,
       "content-type": "application/json",
@@ -36,14 +41,12 @@ async function boxJson(cfg: AppConfig, path: string, opts: RequestInit = {}) {
   return { ok: res.ok && body?.ok !== false, status: res.status, body };
 }
 
-// deterministic per-bot name; the hash kills truncated-uuid collisions
+// Deterministic pool slot (#117 hetzner pooling): a bot's id hashes into
+// one of four shared boxes, so every lookup and rename uses this name.
 async function boxNameFor(botId: string) {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(botId));
-  const hash = [...new Uint8Array(digest)]
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("")
-    .slice(0, 6);
-  return `ogb-${botId.slice(0, 8).toLowerCase().replace(/[^a-z0-9]/g, "")}-${hash}`;
+  const poolIndex = new Uint8Array(digest)[0] % 4;
+  return `ogb-pool-${poolIndex}`;
 }
 
 export async function runCommand(cfg: AppConfig, boxId: string, command: string, { timeoutMs = 120_000 } = {}) {
@@ -99,6 +102,49 @@ async function waitReady(cfg: AppConfig, boxId: string, budgetMs = 90_000) {
 // whenever the direct read fails (deleted/renamed box) and always carries
 // the live state so callers can still see "archived".
 const boxIdCache = new Map<string, string>();
+
+// Pool occupancy (#117 hetzner pooling: up to four bots share one VM by
+// deterministic name — dc91bbc0). A pooled box has no per-bot identity of
+// its own, so this process tracks, in memory, which bot most recently
+// minted a LIVE desktop link on it. Two things that used to be silent lean
+// on this: a Sleep call now refuses to archive a box a DIFFERENT bot is
+// still actively viewing (dc91bbc0's "Sleep archives a peer's live VM"),
+// and a same-slot collision — two different bots live on one VM/mouse/
+// Chrome profile at once — is reported to Sentry instead of going unnoticed.
+// In-memory only: a server restart forgets it, which only ever falls back
+// to today's zero-protection behavior for one case, never worse.
+interface BoxOccupant {
+  botId: string;
+  since: number;
+}
+const boxOccupants = new Map<string, BoxOccupant>();
+// How long a join/provision counts as "still live" for the Sleep guard.
+// Short enough that a tab closed without ever calling Sleep does not block
+// the peer bot indefinitely; long enough to cover an ordinary session.
+// Overridable so tests can shrink it instead of faking global timers.
+const OCCUPANT_TTL_MS = Number(process.env.OMB_BOX_POOL_OCCUPANT_TTL_MS) || 20 * 60 * 1000;
+
+function currentOccupant(boxId: string): BoxOccupant | null {
+  const occupant = boxOccupants.get(boxId);
+  if (!occupant) return null;
+  return Date.now() - occupant.since < OCCUPANT_TTL_MS ? occupant : null;
+}
+
+/** Record that `botId` just minted a live desktop link on `boxId`. Reports
+ * to Sentry, once per claim, when a different bot's still-fresh claim on the
+ * same pooled box is being overwritten — the moment two bots are actually
+ * both live on one VM at once. */
+function claimOccupant(boxId: string, vmName: string, botId: string): void {
+  const prior = currentOccupant(boxId);
+  boxOccupants.set(boxId, { botId, since: Date.now() });
+  if (!prior || prior.botId === botId) return;
+  if (isSentryActive()) {
+    getSentry()?.captureException(
+      new Error(`Box pool collision: ${vmName} now live for ${botId}, still-fresh claim was ${prior.botId}`),
+      { tags: { component: "box-pool", "pool.vm": vmName } },
+    );
+  }
+}
 
 export async function findBox(cfg: AppConfig, botId: string) {
   const cachedId = boxIdCache.get(botId);
@@ -202,13 +248,23 @@ async function createBox(cfg: AppConfig) {
   return trialTtl === null ? first : request(trialTtl);
 }
 
-/** Box state for the Computer panel. */
+/** Box state for the Computer panel. `sharedWithBotId` surfaces a pooled
+ * box's other live occupant (dc91bbc0) so the panel can say so instead of
+ * leaving a mouse-fighting-itself collision unexplained. */
 export async function boxStatus(cfg: AppConfig, botId: string) {
   if (!boxConfigured(cfg)) return { configured: false, box: null };
   const box = await findBox(cfg, botId);
+  const occupant = box ? currentOccupant(box.id) : null;
   return {
     configured: true,
-    box: box ? { boxId: box.id, state: box.state, desktopAvailable: box.desktopAvailable ?? null } : null,
+    box: box
+      ? {
+          boxId: box.id,
+          state: box.state,
+          desktopAvailable: box.desktopAvailable ?? null,
+          sharedWithBotId: occupant && occupant.botId !== botId ? occupant.botId : null,
+        }
+      : null,
   };
 }
 
@@ -244,7 +300,7 @@ export async function provisionBox(cfg: AppConfig, botId: string, botName: strin
     const ready = await waitReady(cfg, box.id);
     if (!ready) throw new Error("box did not become ready within 90s — retry in a minute");
 
-    // Install the exact Cua Driver executable in the background, keep its
+    // Install the exact CUA Driver executable in the background, keep its
     // daemon private to the VM, and retain X11 tooling as a degraded fallback.
     const bootstrap = remoteComputerBootstrapCommand(botName);
     let boot;
@@ -260,6 +316,7 @@ export async function provisionBox(cfg: AppConfig, botId: string, botName: strin
 
     const joinUrl = await mintDesktopUrl(cfg, box.id);
     if (!joinUrl) throw new Error("box desktop link could not be created");
+    claimOccupant(box.id, vmName, botId);
     return { boxId: box.id, machineName: vmName, reused: !created, state: ready.state, joinUrl };
   } catch (error) {
     if (!created || !box?.id) throw error;
@@ -283,13 +340,27 @@ export async function joinBox(cfg: AppConfig, botId: string) {
   // Provider archive/resume preserves disk but not processes. Reattach the
   // driver daemon before handing the desktop back to the user.
   await runCommand(cfg, box.id, ensureRemoteCuaCommand(), { timeoutMs: 15_000 }).catch(() => null);
-  return { joinUrl: await mintDesktopUrl(cfg, box.id), state: ready.state ?? null };
+  const joinUrl = await mintDesktopUrl(cfg, box.id);
+  if (!joinUrl) throw new Error("box desktop link could not be created");
+  claimOccupant(box.id, box.name, botId);
+  return { joinUrl, state: ready.state ?? null };
 }
 
-/** Archive the bot's box now (billing pauses, disk survives). */
+/** Archive the bot's box now (billing pauses, disk survives). Refuses when a
+ * DIFFERENT bot's pooled-box claim is still fresh (dc91bbc0) instead of
+ * silently archiving a peer's live session out from under it — the same
+ * "someone else is using this" shape the VPS backend already enforces above
+ * for its own busy/active-thread check. */
 export async function sleepBox(cfg: AppConfig, botId: string) {
   const box = await findBox(cfg, botId);
   if (!box) throw new Error("no computer for this bot");
+  const occupant = currentOccupant(box.id);
+  if (occupant && occupant.botId !== botId) {
+    // Product copy per Designer review on #445: no pool/TTL/bot-id jargon in
+    // the banner — occupant + TTL stay diagnostic (hover, Sentry), same
+    // sentence shape as the VPS backend's own busy/active-thread refusal.
+    throw new Error("Someone else is using this computer.  Try Sleep again after that session ends.");
+  }
   // Ask the browser's oldest (main) process to exit before the provider
   // snapshots the disk. This gives Chrome a chance to flush cookies and
   // session state instead of restoring a crash-marked profile next wake.
@@ -299,6 +370,7 @@ export async function sleepBox(cfg: AppConfig, botId: string) {
   ].join("; ");
   await runCommand(cfg, box.id, quiesceBrowser, { timeoutMs: 5_000 }).catch(() => null);
   await boxJson(cfg, `/boxes/${box.id}/stop`, { method: "POST" }).catch(() => {});
+  boxOccupants.delete(box.id);
   return { ok: true };
 }
 
@@ -363,5 +435,10 @@ export async function screenshotBox(cfg: AppConfig, botId: string, knownBoxId?: 
   }
   const data = await readFileBase64(cfg, boxId, PANEL_PATH);
   if (!data) throw new Error("could not read the frame back from the box");
-  return { png: data, format: "jpeg" };
+  // Stamped in the harness clock, matching vpsComputerScreenshot and the
+  // frames ScreenPollers publishes.  The panel ages a polled capture against a
+  // streamed one to decide which picture is newer, and that comparison is only
+  // meaningful when both stamps come from one clock — a browser-clock fallback
+  // here would reintroduce exactly that skew for the Box backend alone.
+  return { png: data, format: "jpeg" as const, capturedAt: Date.now() };
 }

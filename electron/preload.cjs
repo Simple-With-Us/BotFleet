@@ -10,10 +10,17 @@ ipcRenderer.on("package:install", (_event, url) => {
   for (const listener of packageInstallListeners) listener(url);
 });
 
+// Each Personal Voice speak call gets its own id so word ranges from a call
+// that was replaced never reach the newer call's listener.
+let personalVoiceProgressSeq = 0;
+
 contextBridge.exposeInMainWorld("ogb", {
   /** Host platform ("darwin" | "win32" | "linux") — for platform-aware UI. */
   platform: process.platform,
   getCapabilities: () => ipcRenderer.invoke("desktop:capabilities"),
+  /** Which build is running right now — version, build number, and the
+   *  Electron/Node/OS the live process reports. */
+  appInfo: () => ipcRenderer.invoke("desktop:app-info"),
   onCapabilitiesChanged: (cb) => {
     const handler = (_event, capabilities) => cb(capabilities);
     ipcRenderer.on("desktop:capabilities-changed", handler);
@@ -52,7 +59,7 @@ contextBridge.exposeInMainWorld("ogb", {
   /** Arms exactly one display-media request from the current renderer frame. */
   beginScreenPreviewIntent: () => ipcRenderer.sendSync("screen:preview-intent"),
   /** One frame of this computer's screen as a data: URL when supported. */
-  screenFrame: () => ipcRenderer.invoke("screen:frame"),
+  screenFrame: (options) => ipcRenderer.invoke("screen:frame", options),
   /** Physical USB Android devices. Network ADB is deliberately excluded. */
   androidDevice: {
     status: () => ipcRenderer.invoke("android-device:status"),
@@ -72,6 +79,29 @@ contextBridge.exposeInMainWorld("ogb", {
     const handler = (_event, info) => cb(info);
     ipcRenderer.on("speech:end", handler);
     return () => ipcRenderer.removeListener("speech:end", handler);
+  },
+  personalVoice: {
+    isAvailable: () => ipcRenderer.invoke("personal-voice:available"),
+    list: () => ipcRenderer.invoke("personal-voice:list"),
+    /** `options.onRange({ location, length, elapsedMs })` fires as each word
+     * is about to be spoken; offsets are UTF-16 indices into `text`.  The
+     * callback stays in this preload: only a numeric id crosses IPC, and the
+     * listener is removed when the speech settles. */
+    speak: (text, voiceId, options) => {
+      const onRange = typeof options?.onRange === "function" ? options.onRange : null;
+      if (!onRange) return ipcRenderer.invoke("personal-voice:speak", text, voiceId);
+      personalVoiceProgressSeq += 1;
+      const progressId = personalVoiceProgressSeq;
+      const handler = (_event, payload) => {
+        if (!payload || payload.id !== progressId) return;
+        onRange({ location: payload.location, length: payload.length, elapsedMs: payload.elapsedMs ?? null });
+      };
+      ipcRenderer.on("personal-voice:range", handler);
+      return ipcRenderer
+        .invoke("personal-voice:speak", text, voiceId, { progressId })
+        .finally(() => ipcRenderer.removeListener("personal-voice:range", handler));
+    },
+    stop: () => ipcRenderer.invoke("personal-voice:stop"),
   },
   /** A local-first demonstration recorder. Global events stay in main; the
    * renderer receives only the privacy-filtered event stream. */
@@ -95,6 +125,14 @@ contextBridge.exposeInMainWorld("ogb", {
     status: () => ipcRenderer.invoke("assemblyai:status"),
     setKey: (value) => ipcRenderer.invoke("assemblyai:set-key", value),
     streamingToken: () => ipcRenderer.invoke("assemblyai:streaming-token"),
+  },
+  /** Speech-to-speech call tokens.  The permanent provider keys stay in the
+   *  encrypted store; the renderer only ever receives one short-lived,
+   *  single-session token, same rule as transcription.streamingToken. */
+  sts: {
+    status: () => ipcRenderer.invoke("sts:status"),
+    xaiToken: () => ipcRenderer.invoke("sts:xai-token"),
+    geminiToken: () => ipcRenderer.invoke("sts:gemini-token"),
   },
   /** Absolute path of a dropped File — Electron 32 removed File.path, and
    * only the preload can ask. "" when the drag carried no file on disk. */
@@ -123,7 +161,7 @@ contextBridge.exposeInMainWorld("ogb", {
   /** Tell the window which skin the page wears, so the native chrome the
    * renderer cannot paint (the Windows caption-button overlay) matches. */
   applySkin: (skin) => ipcRenderer.invoke("desktop:skin", skin),
-  /** A reviewed BotMRR package opened through openmausbot://install. */
+  /** A reviewed BotMRR package opened through botfleet://install. */
   onPackageInstall: (cb) => {
     packageInstallListeners.add(cb);
     if (pendingPackageInstallUrl) cb(pendingPackageInstallUrl);
@@ -131,6 +169,12 @@ contextBridge.exposeInMainWorld("ogb", {
   },
   /** Mirrors durable unread state into the native Dock/taskbar badge. */
   setUnreadCount: (count) => ipcRenderer.send("desktop:unread-count", count),
+  /** Native menu bar actions dispatched from the main process. */
+  onMenuAction: (cb) => {
+    const handler = (_event, action, payload) => cb(action, payload);
+    ipcRenderer.on("menu:action", handler);
+    return () => ipcRenderer.removeListener("menu:action", handler);
+  },
   /** Live VNC/noVNC in a sandboxed window owned by the app window. */
   desktopViewer: {
     open: (url, title, contextId) => ipcRenderer.invoke("desktop-viewer:open", url, title, contextId),
@@ -154,8 +198,10 @@ contextBridge.exposeInMainWorld("ogb", {
       return () => ipcRenderer.removeListener("desktop-workspace:state", handler);
     },
   },
-  /** Native folder picker for a bot's working folder; null when cancelled. */
-  pickFolder: (current) => ipcRenderer.invoke("desktop:pick-folder", current),
+  /** Native folder picker; null when cancelled.  `title` names what is
+   * being chosen — a working folder, a skill folder — so the dialog is not
+   * always labelled for the first caller that needed it. */
+  pickFolder: (current, title) => ipcRenderer.invoke("desktop:pick-folder", current, title),
   /** Writes the redacted diagnostics report to a user-chosen file; resolves
    * the path, or null when the save dialog was cancelled. */
   exportDiagnostics: () => ipcRenderer.invoke("desktop:export-diagnostics"),
@@ -163,6 +209,8 @@ contextBridge.exposeInMainWorld("ogb", {
   openFile: (filePath) => ipcRenderer.invoke("desktop:open-file", filePath),
   /** Reveal a file in Finder with the file selected. */
   showInFolder: (filePath) => ipcRenderer.invoke("desktop:show-in-folder", filePath),
+  /** Reveal a user-chosen file or folder (e.g. a plugin install source). */
+  revealLocalPath: (filePath) => ipcRenderer.invoke("desktop:reveal-local-path", filePath),
   /** Open a web URL in the default browser. */
   openExternal: (url) => ipcRenderer.invoke("desktop:open-external", url),
   /** Ask where to save a bot-created file (inside ~/.botfleet), copy it
@@ -176,7 +224,13 @@ contextBridge.exposeInMainWorld("ogb", {
       throw new Error(message.replace(/^Error invoking remote method '[^']*':\s*(?:Error:\s*)?/, ""));
     }),
   /** Store a provider credential with OS-backed encryption. */
-  setCredential: (name, value) => ipcRenderer.invoke("credential:set", name, value),
+  setCredential: (name, value, provider) => ipcRenderer.invoke("credential:set", name, value, provider),
+  /** Store a user-added custom engine's API key with the same OS-backed
+   * encryption, keyed by its dynamic instance id rather than a fixed name. */
+  setInstanceCredential: (instanceId, value) => ipcRenderer.invoke("credential:set-instance", instanceId, value),
+  /** Purge a deleted custom engine's key from the encrypted store only —
+   * never touches the live harness. */
+  clearInstanceCredential: (instanceId) => ipcRenderer.invoke("credential:clear-instance", instanceId),
 
   /** In-app auto-update. State object:
    *  { status: "idle"|"checking"|"available"|"downloading"|"downloaded"|"error",
@@ -186,6 +240,7 @@ contextBridge.exposeInMainWorld("ogb", {
     check: () => ipcRenderer.invoke("update:check"),
     download: () => ipcRenderer.invoke("update:download"),
     install: () => ipcRenderer.invoke("update:install"),
+    local: () => ipcRenderer.invoke("update:local"),
     setEnabled: (enabled) => ipcRenderer.invoke("update:set-enabled", enabled),
     onState: (cb) => {
       ipcRenderer

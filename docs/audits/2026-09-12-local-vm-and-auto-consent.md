@@ -1,0 +1,9 @@
+# Local VM Lifecycle And Fleet Auto Consent
+
+Bot deletion now respects an active shared/per-bot VM mode change before starting asynchronous cleanup.  The reverse order already refuses mode changes while deletion owns a target; the two operations must finish serially so cleanup cannot remove a replacement container or orphan an unnamed one.  Integration tests use an isolated harness and fake executables, never the installed container runtime.
+
+The fleet Auto warning now names every bot that would newly receive unattended access to This Computer.  Confirmation submits the exact displayed IDs and names with the original defaults; a changed fleet returns a new confirmation before any grant or default is saved.  The server checks again after awaiting interrupted turns.  A legacy boolean alone cannot acknowledge a bulk grant, while the existing per-bot confirmation remains supported.
+
+The same boundary now covers host access inherited from workspace defaults and the automatic host fallback used by a truly unconfigured bot.  Direct config saves refuse before provider or secret-store work, bind confirmation to the displayed fleet, and recheck after asynchronous validation before persistence.  Per-bot Auto toggles use the same effective grant rule, while explicit Off remains Off.  Default-setting requests are frozen through confirmation, and cancellation or failure restores the authoritative values.
+
+Typecheck, three consent-policy tests, two renderer checks, and eight focused real API tests passed on the feature source.  The Local VM concurrency fixture passed both in isolation and inside the broader run.  The actual warning component was rendered with three synthetic bot names and stable IDs and captured in `docs/screenshots/fleet-auto-consent.png`; no production permissions were changed.  The broader local run was stopped during machine-wide resource pressure after unrelated timeout failures; final hosted validation remains pending.

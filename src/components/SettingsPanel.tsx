@@ -1,19 +1,62 @@
-import { ChevronDown, ChevronLeft, Crown, FolderOpen, X } from "lucide-react";
+import { AlertTriangle, Bug, ChevronDown, ChevronLeft, Crown, FolderOpen, X } from "lucide-react";
 import { useState } from "react";
 import { api, useStore, type Bot } from "@/state/store";
+import type { BotUpdatePatch } from "@/state/bot-patch-queue";
 import { stateForBot } from "@/lib/mascot";
 import { CloudBackendPicker } from "./CloudBackendPicker";
+import { BotFallbackModels } from "./BotFallbackModels";
 import { ModelPicker } from "./ModelPicker";
+import { ModelSettings } from "./ModelSettings";
 import { useDesktopCapabilities } from "./DesktopCapabilities";
 import { cn } from "@/lib/cn";
+import { railAsideClass } from "@/lib/layout-rails";
 import { requestNotificationPermission } from "@/lib/notify";
 import { botUsage, costCaption, formatTokens, formatUsd, hasFiniteCost } from "@/lib/usage";
 import { shortPath } from "@/lib/short-path";
-import { instanceSupportsLocalComputer, localComputerDisabledReason, localComputerSelectable } from "@/lib/local-computer";
+import { botCloudBackend, cloudBackendInherited, cloudDestinationLabel } from "@/lib/cloud-backend";
+import {
+  COMPUTER_REACH_CHECKING,
+  cloudBackendUnavailableNote,
+  computerDestinationDisabledReason,
+  engineReachKnown,
+  instanceSupportsCloudComputer,
+  instanceSupportsLocalComputer,
+  localComputerDisabledReason,
+  localComputerSelectable,
+  runsOnDisabledNote,
+} from "@/lib/local-computer";
 import { BotProfileAvatarCard } from "./BotProfileAvatarCard";
-import { LocalComputerAutoWarning } from "./LocalComputerAutoWarning";
+import { BotPowerToggle } from "./BotPowerToggle";
+import { ConfirmDialog } from "./ConfirmDialog";
+import {
+  BOT_OFF_AFTER_TURN,
+  BOT_OFF_KEEP_ON,
+  BOT_OFF_STOP_AND_POWER_OFF,
+  botOffWhileRunningBody,
+  botOffWhileRunningTitle,
+} from "../../shared/bot-power";
+import { BotSkillsPanel } from "./BotSkillsPanel";
+import { ConnectorToolsSettings } from "./ConnectorToolsSettings";
+import { LocalComputerAutoWarning, shouldWarnBeforeAddingLocalAuto } from "./LocalComputerAutoWarning";
+import { BypassPermissionsWarning } from "./BypassPermissionsWarning";
+import {
+  BYPASS_LOCAL_COMPUTER_WARNING_BODY,
+  BYPASS_LOCAL_COMPUTER_WARNING_TITLE,
+  BypassLocalComputerControl,
+} from "./BypassLocalComputerControl";
+import { evaluateModelRiskForBypass } from "../../shared/model-safety";
+import { bypassCoverageNote } from "../../shared/bypass-coverage";
 import { VoiceSettings } from "./VoiceSettings";
+import { AutoReviewCard } from "./AutoReviewCard";
 import { BOT_PROFILE_LIMITS } from "../../shared/bot-profile";
+import { botCapabilityGates, historySummaryGate, toolRoundsGate } from "@/lib/bot-settings-gates";
+import { MaxToolRoundsField } from "./MaxToolRoundsField";
+import { HistoryCompressionField } from "./HistoryCompressionField";
+import { requiresLocalAutoConsent } from "../../shared/local-auto-consent";
+import { effortLabel } from "@/lib/model-effort";
+import { selectionEffortLevels, selectionWithEffort } from "@/lib/model-pick";
+import { CONNECTED_APPS_HEADING, connectedAppsBlurb } from "@/lib/connected-apps-copy";
+import { BotAlwaysAllowCard } from "./BotAlwaysAllowCard";
 
 function Field({
   label,
@@ -45,7 +88,7 @@ function BotUsageCard({ bot }: { bot: Bot }) {
           onClick={() => dispatch({ type: "toggleAppSettings", open: true, section: "usage" })}
           className="text-[12px] text-ink-secondary hover:text-ink"
         >
-          All bots →
+          All Bots →
         </button>
       </div>
       <div className="mt-3 grid grid-cols-3 gap-3 text-[13px]">
@@ -109,7 +152,7 @@ function WorkingFolder({ bot }: { bot: Bot }) {
 
   return (
     <div className="rounded-xl bg-card p-4">
-      <div className="text-[15px] font-medium text-ink">Working folder</div>
+      <div className="text-[15px] font-medium text-ink">Working Folder</div>
       <div className="mt-0.5 text-[13px] text-ink-secondary">Where this bot runs its shell and file tools.</div>
       {canPick ? (
         <div className="mt-3 flex items-center gap-2">
@@ -247,7 +290,7 @@ function MemoryCard({ bot }: { bot: Bot }) {
       {open && !loading && topic && (
         <div className="mt-3">
           <div className="flex items-center justify-between gap-2">
-            <span className="truncate font-mono text-[12.5px] text-ink">memory/{topic.name}</span>
+            <span className="truncate font-mono text-[12.5px] text-ink" title={`memory/${topic.name}`}>memory/{topic.name}</span>
             <button
               onClick={() => setTopic(null)}
               className="shrink-0 rounded-md px-2 py-1 text-[13px] text-ink-secondary hover:bg-control hover:text-ink"
@@ -266,7 +309,7 @@ function MemoryCard({ bot }: { bot: Bot }) {
           <textarea
             className={cn(inputCls, "min-h-[160px] resize-y font-mono text-[12.5px] leading-relaxed")}
             value={text}
-            placeholder="Nothing remembered yet. The bot writes durable notes here — or add your own."
+            placeholder={"Nothing remembered yet.\u00a0 The bot writes durable notes here — or add your own."}
             aria-label="Bot memory"
             onChange={(e) => {
               setText(e.target.value);
@@ -299,7 +342,7 @@ function MemoryCard({ bot }: { bot: Bot }) {
                     onClick={() => void openTopic(entry.name)}
                     className="flex w-full items-center justify-between gap-2 border-b border-hairline/40 px-3 py-2 text-left last:border-b-0 hover:bg-control/60"
                   >
-                    <span className="truncate font-mono text-[12.5px] text-ink">{entry.name}</span>
+                    <span className="truncate font-mono text-[12.5px] text-ink" title={entry.name}>{entry.name}</span>
                     <span className="shrink-0 text-[11.5px] text-ink-secondary">{formatBytes(entry.bytes)}</span>
                   </button>
                 ))}
@@ -319,41 +362,82 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
   const { capabilities } = useDesktopCapabilities();
   const providerSupportsLocal = instanceSupportsLocalComputer(state.instances, bot);
   const localSelectable = localComputerSelectable({ capabilities, providerSupportsLocal });
-  const [localAutoWarning, setLocalAutoWarning] = useState<"auto" | "local" | null>(null);
+  const [localAutoWarning, setLocalAutoWarning] = useState<"auto" | "local" | "bypassLocal" | null>(null);
+  // The switch is held open while this is true, so the bot is still On until
+  // the person has said what should happen to the turn it is running.
+  const [powerOffWhileRunning, setPowerOffWhileRunning] = useState(false);
   const localDisabledReason = localComputerDisabledReason({ capabilities, providerSupportsLocal });
+  const autoWouldUseLocal = requiresLocalAutoConsent(
+    bot.computers,
+    state.config?.botDefaults?.computers,
+    state.config?.botDefaults?.allowedComputers,
+    {
+      hostPlatform: capabilities.host.platform,
+      providerSupportsLocal,
+    },
+  );
+  // Resolved the way the server resolves it, so this panel's destination
+  // label, its backend picker, its Start-VPS toggle, AND the
+  // destination-disabled check above all describe the machine the bot will
+  // actually open — not the empty field it happens to carry.  Hoisted above
+  // `destinationDisabled` because that helper takes cloudBackend too.
+  const cloudBackend = botCloudBackend(bot, state.config?.botDefaults?.cloudBackend);
+  const platformIsMac =
+    capabilities.host.platform === "darwin" ||
+    (capabilities.host.platform === "other" && globalThis.navigator?.userAgent.includes("Mac") === true);
+  const reachReady = engineReachKnown({
+    instances: state.instances,
+    hydrationStatus: state.hydration.status,
+  });
+  // The server refuses an unsupported destination at turn time; the picker
+  // should not have offered it.  See computerDestinationDisabledReason.
+  const destinationDisabled = (mode: "cloud" | "vm" | "local" | "off"): string | null => {
+    if (mode === "local") return localSelectable ? null : localDisabledReason;
+    if (mode === "cloud" || mode === "vm") {
+      if (!reachReady) return COMPUTER_REACH_CHECKING;
+      return computerDestinationDisabledReason(mode, state.instances, bot, cloudBackend, platformIsMac);
+    }
+    return null;
+  };
+  const vpsSupported = reachReady && instanceSupportsCloudComputer(state.instances, bot, "vps");
+  const boxSupported = reachReady && instanceSupportsCloudComputer(state.instances, bot, "box");
+  const cloudNote = reachReady
+    ? cloudBackendUnavailableNote(state.instances, bot, platformIsMac)
+    : COMPUTER_REACH_CHECKING;
+  const cloudPickerVisible = !(bot.computers?.length) || Boolean(bot.computers?.includes("cloud"));
+  const runsOnNote = runsOnDisabledNote(
+    destinationDisabled("cloud"),
+    destinationDisabled("vm"),
+    cloudNote,
+    cloudPickerVisible,
+  );
   const patch = (
-    p: Partial<
-      Pick<
-        Bot,
-        | "name"
-        | "title"
-        | "description"
-        | "notifications"
-        | "computer"
-        | "cloudBackend"
-        | "autoStartVps"
-        | "color"
-        | "mascotExpression"
-        | "avatarUrl"
-        | "avatarCrop"
-        | "autoApprove"
-        | "autoReview"
-        | "speakReplies"
-        | "voice"
-        | "chiefOfStaff"
-        | "approvePeerComms"
-        | "composio"
-        | "modelSelection"
-      >
-    > & { acknowledgeLocalAuto?: boolean },
+    p: Partial<BotUpdatePatch> & {
+      // Panel-only fields the broad PATCH boundary (BotUpdatePatch) does not
+      // carry:  everything else derives from the canonical queue type, so a
+      // future whitelist on the queue cannot silently drop a setting the
+      // panel shows as saved.
+      autoReview?: Bot["autoReview"];
+      bypassLocalComputer?: Bot["bypassLocalComputer"];
+      alwaysAllow?: Bot["alwaysAllow"];
+      connectorTools?: Bot["connectorTools"];
+    },
   ) => dispatch({ type: "updateBot", botId: bot.id, patch: p });
+  const alwaysAllow = bot.alwaysAllow ?? [];
   const activeState = stateForBot(bot);
   const mascotMotion = state.mascotMotion?.botId === bot.id ? state.mascotMotion : null;
-  const engine = state.instances.find((instance) => instance.instanceId === bot.modelSelection.instanceId);
-  const canAutoReview = engine?.capabilities?.approvalReview === true;
-  const canCoordinate = engine?.capabilities?.agentsMcp === true;
-  const canUseConnectedApps = engine?.capabilities?.composioMcp === true;
-  const canUseVps = engine?.capabilities?.computerMcp === true && engine.driverKind !== "boxAgent";
+  const modelRisk = evaluateModelRiskForBypass(bot.modelSelection?.model, bot.modelSelection?.instanceId);
+  const [bypassWarningOpen, setBypassWarningOpen] = useState(false);
+  // One read of the engine's capabilities for the whole panel, so a control
+  // can never disagree with its neighbour about which engine this is.  See
+  // lib/bot-settings-gates.ts.
+  const gates = botCapabilityGates(state.instances, bot);
+  const engine = gates.engine;
+  const { canCoordinate, canUseConnectedApps } = gates;
+  const roundsGate = toolRoundsGate(state.instances, bot);
+  const historyGate = historySummaryGate(state.instances, bot);
+  // Null when the engine asks and the broker answers, which is the common case.
+  const bypassNote = bypassCoverageNote(engine?.capabilities?.bypassCoverage ?? "asks");
   const connectedAppsConfigured = state.config?.composio?.configured === true;
   const connectedAppsEnabled = bot.composio !== false;
   const sectionName = bot.section?.trim() || "General";
@@ -365,22 +449,22 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
 
   return (
     <>
-    <aside className="animate-panel-in relative z-20 flex h-full w-[400px] shrink-0 flex-col border-l border-hairline/40 bg-panel">
+    <aside className={railAsideClass("w-[400px]")}>
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-3">
         <button
           onClick={() => dispatch({ type: "toggleSettings", open: false })}
-          aria-label="Collapse agent profile"
-          title="Collapse agent profile"
+          aria-label="Collapse Bot Profile"
+          title="Collapse Bot Profile"
           className="flex size-10 items-center justify-center rounded-md text-ink-secondary hover:bg-control hover:text-ink"
         >
           <ChevronLeft size={18} />
         </button>
-        <span className="text-[15px] font-semibold text-ink">Agent profile</span>
+        <span className="text-[15px] font-semibold text-ink">Bot Profile</span>
         <button
           onClick={() => dispatch({ type: "toggleSettings", open: false })}
-          aria-label="Close agent profile"
-          title="Close agent profile"
+          aria-label="Close Bot Profile"
+          title="Close Bot Profile"
           className="flex size-10 items-center justify-center rounded-md text-ink-secondary hover:bg-control hover:text-ink"
         >
           <X size={18} />
@@ -408,7 +492,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
             <input
               className={inputCls}
               maxLength={BOT_PROFILE_LIMITS.title}
-              placeholder="Describe what your agent does"
+              placeholder="Describe what your bot does"
               value={bot.title}
               onChange={(e) => patch({ title: e.target.value })}
             />
@@ -417,11 +501,26 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
             <textarea
               className={cn(inputCls, "min-h-[96px] resize-none")}
               maxLength={BOT_PROFILE_LIMITS.description}
-              placeholder="What this agent is for"
+              placeholder="What this bot is for"
               value={bot.description}
               onChange={(e) => patch({ description: e.target.value })}
             />
           </Field>
+
+          {/* Switching a working bot Off is really two decisions — stop the turn
+              now, or stop it starting from now — and the switch cannot tell
+              which one was meant.  Only a busy bot has a turn to decide about,
+              so only a busy bot is asked, and it stays On until they answer. */}
+          <BotPowerToggle
+            off={bot.off === true}
+            onChange={(off) => {
+              if (off && bot.busy) {
+                setPowerOffWhileRunning(true);
+                return;
+              }
+              patch({ off });
+            }}
+          />
 
           <div className={cn(
             "rounded-xl border p-4",
@@ -460,11 +559,11 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
             </div>
             <div className="mt-3 text-[13px] leading-relaxed text-ink-secondary">
               {bot.chiefOfStaff && !canCoordinate
-                ? "This bot still holds the role, but its current engine cannot contact teammates. Choose a Claude or ACP engine to restore coordination."
+                ? "This bot still holds the role, but its current engine cannot contact teammates.  Choose a coordination-capable engine to restore coordination."
                 : bot.chiefOfStaff
                   ? `This is the primary contact for ${sectionName}. It can create and coordinate specialists in this section, then combine their work into one answer.`
                 : !canCoordinate
-                  ? "Choose a Claude or ACP engine to let this bot coordinate teammates."
+                  ? "Choose an engine that supports bot coordination to let this bot coordinate teammates."
                   : currentChief
                     ? `Make this bot the ${sectionName} Chief and hand the role over from ${currentChief.name}.`
                     : `Make this bot the primary contact for the ${sectionName} section.`}
@@ -503,32 +602,35 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
             </button>
           </div>
 
+          <BotAlwaysAllowCard
+            alwaysAllow={alwaysAllow}
+            onRemove={(key) => patch({ alwaysAllow: alwaysAllow.filter((entry) => entry !== key) })}
+          />
+
           <div className="flex items-center justify-between gap-4 rounded-xl bg-card p-4">
             <div>
-              <div className="text-[15px] font-medium text-ink">Connected apps</div>
+              <div className="text-[15px] font-medium text-ink">{CONNECTED_APPS_HEADING}</div>
               <div className="mt-0.5 text-[13px] text-ink-secondary">
-                {!connectedAppsConfigured
-                  ? "Connect apps in App Settings before giving this bot access."
-                  : !canUseConnectedApps
-                    ? "This bot's current engine cannot use connected apps."
-                    : connectedAppsEnabled
-                      ? "Let this bot use your connected Gmail, Calendar, Slack, and other apps."
-                      : "Keep your connected apps unavailable to this bot."}
+                {connectedAppsBlurb({
+                  configured: connectedAppsConfigured,
+                  canUse: canUseConnectedApps,
+                  enabled: connectedAppsEnabled,
+                })}
               </div>
             </div>
             <button
               role="switch"
               aria-checked={connectedAppsEnabled}
-              aria-label="Allow this bot to use connected apps"
+              aria-label="Let this bot use connected Composio apps"
               disabled={
                 !connectedAppsEnabled && (!connectedAppsConfigured || !canUseConnectedApps)
               }
               onClick={() => patch({ composio: !connectedAppsEnabled })}
               title={
                 !connectedAppsEnabled && !connectedAppsConfigured
-                  ? "Connect apps in App Settings first"
+                  ? "Composio is not set up for this workspace"
                   : !connectedAppsEnabled && !canUseConnectedApps
-                    ? "This engine cannot use connected apps"
+                    ? "This engine cannot call Composio tools"
                     : undefined
               }
               className={cn(
@@ -545,141 +647,178 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
             </button>
           </div>
 
+          {connectedAppsConfigured && canUseConnectedApps && connectedAppsEnabled && (
+            <ConnectorToolsSettings bot={bot} onPatch={patch} />
+          )}
+
           <div className="rounded-xl bg-card p-4 flex flex-col gap-4">
             <ModelPicker
               bot={bot}
               contained
-              label={
-                <div>
-                  <div className="text-[15px] font-medium text-ink">Primary Model</div>
-                  <div className="mt-0.5 text-[13px] text-ink-secondary">
-                    Which provider and model this bot runs on
-                  </div>
-                </div>
-              }
+              label={<div className="text-[15px] font-medium text-ink">Primary Model</div>}
             />
             
-            {bot.modelSelection.fallbacks?.map((fallback, i) => (
-              <div key={i} className="flex flex-col gap-2 pt-4 border-t border-hairline/40">
-                <div className="flex items-center justify-between">
-                  <div className="text-[13px] font-medium text-ink">Fallback #{i + 1}</div>
-                  <button 
-                    onClick={() => {
-                       const next = [...(bot.modelSelection.fallbacks || [])];
-                       next.splice(i, 1);
-                       patch({ modelSelection: { ...bot.modelSelection, fallbacks: next } });
-                    }}
-                    className="text-[12px] text-red-500 hover:underline"
-                  >
-                    Remove
-                  </button>
-                </div>
-                <ModelPicker
-                  bot={bot}
-                  contained
-                  selection={fallback}
-                  onChange={(sel) => {
-                     const next = [...(bot.modelSelection.fallbacks || [])];
-                     next[i] = sel;
-                     patch({ modelSelection: { ...bot.modelSelection, fallbacks: next } });
-                  }}
-                />
-              </div>
-            ))}
-            
-            {(bot.modelSelection.fallbacks?.length || 0) < 2 && (
-              <button
-                onClick={() => {
-                   const next = [...(bot.modelSelection.fallbacks || []), { instanceId: bot.modelSelection.instanceId, model: bot.modelSelection.model }];
-                   patch({ modelSelection: { ...bot.modelSelection, fallbacks: next } });
-                }}
-                className="mt-2 text-left text-[13px] text-blue-500 hover:underline"
-              >
-                + Add Fallback Model
-              </button>
-            )}
+            <BotFallbackModels bot={bot} onChange={(modelSelection) => patch({ modelSelection })} />
           </div>
 
-          {!!engine?.capabilities?.effortLevels?.length && (
-            <div className="rounded-xl bg-card p-4">
-              <div className="text-[15px] font-medium text-ink">Effort</div>
-              {/* Says what the app does, not what the engine ends up at:
-                  Codex applies a level to the whole thread and has no way to
-                  take one back, so "currently: engine default" was a promise
-                  we could not keep for a thread that had already been sent
-                  one. Sending nothing is true on every engine. */}
-              <div className="mt-0.5 text-[13px] text-ink-secondary">
-                How hard this bot thinks{bot.modelSelection.effort ? "" : " (Default: no level is sent)"}
-              </div>
-              <div className="mt-3 flex overflow-hidden rounded-lg border border-hairline/40">
-                {([undefined, ...engine.capabilities.effortLevels] as const).map((level, i) => (
+          {(() => {
+            const effortLevels = selectionEffortLevels(engine, bot.modelSelection);
+            if (!effortLevels.length && !bot.modelSelection.effort) return null;
+            return (
+              <div className="rounded-xl bg-card p-4">
+                <div className="text-[15px] font-medium text-ink">Reasoning</div>
+                {/* Says what the app does, not what the engine ends up at:
+                    Codex applies a level to the whole thread and has no way to
+                    take one back, so "currently: engine default" was a promise
+                    we could not keep for a thread that had already been sent
+                    one. Sending nothing is true on every engine. */}
+                <div className="mt-0.5 text-[13px] text-ink-secondary">
+                  {effortLevels.length
+                    ? "How hard this bot thinks."
+                    : "This model does not support reasoning effort."}
+                </div>
+                {effortLevels.length > 0 ? (
+                  <div className="mt-3 flex overflow-hidden rounded-lg border border-hairline/40">
+                    {([undefined, ...effortLevels] as const).map((level, i) => (
+                      <button
+                        key={level ?? "default"}
+                        aria-pressed={bot.modelSelection.effort === level}
+                        onClick={() => patch({ modelSelection: selectionWithEffort(bot.modelSelection, level) })}
+                        className={cn(
+                          "flex-1 py-1.5 text-[13px]",
+                          i > 0 && "border-l border-hairline/40",
+                          bot.modelSelection.effort === level
+                            ? "bg-control text-ink"
+                            : "text-ink-secondary hover:bg-control/60 hover:text-ink",
+                        )}
+                      >
+                        {effortLabel(level)}
+                      </button>
+                    ))}
+                  </div>
+                ) : (
                   <button
-                    key={level ?? "default"}
-                    aria-pressed={bot.modelSelection.effort === level}
-                    onClick={() => patch({ modelSelection: { ...bot.modelSelection, effort: level } })}
-                    className={cn(
-                      "flex-1 py-1.5 text-[13px] capitalize",
-                      i > 0 && "border-l border-hairline/40",
-                      bot.modelSelection.effort === level
-                        ? "bg-control text-ink"
-                        : "text-ink-secondary hover:bg-control/60 hover:text-ink",
-                    )}
+                    onClick={() => patch({ modelSelection: selectionWithEffort(bot.modelSelection, undefined) })}
+                    className="mt-3 rounded-lg border border-hairline/40 bg-control px-3 py-1.5 text-[13px] font-medium text-ink hover:bg-control/80"
                   >
-                    {/* the others capitalize cleanly; "xhigh" would read "Xhigh" */}
-                    {level === "xhigh" ? "X-High" : (level ?? "Default")}
+                    Clear Saved Reasoning ({bot.modelSelection.effort})
                   </button>
-                ))}
+                )}
               </div>
-            </div>
+            );
+          })()}
+
+          <ModelSettings
+            instance={engine}
+            selection={bot.modelSelection}
+            showEffort={false}
+            disabled={Boolean(bot.busy)}
+            onChange={(modelSelection) => patch({ modelSelection })}
+          />
+
+          {roundsGate.visible && (
+            <MaxToolRoundsField
+              value={bot.maxToolRounds}
+              onChange={(maxToolRounds) => patch({ maxToolRounds })}
+              gate={roundsGate}
+            />
+          )}
+
+          {historyGate.visible && (
+            <HistoryCompressionField
+              maxHistoryTurns={bot.maxHistoryTurns}
+              historySummaryModel={bot.historySummaryModel}
+              onMaxHistoryTurns={(maxHistoryTurns) => patch({ maxHistoryTurns })}
+              onHistorySummaryModel={(historySummaryModel) => patch({ historySummaryModel })}
+              gate={historyGate}
+            />
           )}
 
           <div className="rounded-xl bg-card p-4">
             <div className="text-[15px] font-medium text-ink">Computer</div>
             <div className="mt-0.5 text-[13px] text-ink-secondary">
-              Where this bot's computer runs{bot.computer ? "" : " (currently: auto)"}
+              {bot.computers?.length
+                ? "Which computers this bot can use — pick more than one and it chooses per task"
+                : bot.computers
+                  ? "This bot has no computer"
+                  : "Where this bot's computer runs (currently: auto)"}
             </div>
             <div className="mt-3 flex overflow-hidden rounded-lg border border-hairline/40">
               {([
-                ["cloud", "Cloud"],
+                // The cloud destination is whichever backend this bot resolves
+                // to.  Labelling it "ASCII.dev Box" while the bot is headed
+                // for a VPS tells the person the wrong thing about where their
+                // bot is about to click — and reading the bot's own field did
+                // exactly that for every bot inheriting a "vps" default.
+                ["cloud", cloudDestinationLabel(cloudBackend)],
                 ["vm", "Local VM"],
-                ["local", "This computer"],
+                ["local", typeof window !== "undefined" && (window.ogb?.platform === "darwin" || (typeof navigator !== "undefined" && navigator.userAgent.includes("Mac"))) ? "This Mac" : "This Computer"],
                 ["off", "Off"],
-              ] as const).map(([mode, label], i) => (
+              ] as const).map(([mode, label], i) => {
+                const blocked = destinationDisabled(mode);
+                const selected = mode === "off"
+                  ? bot.computers !== undefined && bot.computers.length === 0
+                  : (bot.computers ?? []).includes(mode as any);
+                return (
                 <button
                   key={mode}
-                  disabled={mode === "local" && !localSelectable}
-                  title={mode === "local" && !localSelectable ? localDisabledReason ?? undefined : undefined}
+                  type="button"
+                  disabled={Boolean(blocked)}
+                  title={blocked ?? undefined}
                   onClick={() => {
-                    if (mode === bot.computer) return;
-                    if (mode === "local" && bot.autoApprove) setLocalAutoWarning("local");
-                    else patch({ computer: mode });
+                    if (mode === "off") {
+                      patch({ computers: [] });
+                      return;
+                    }
+                    if (mode === "local" && shouldWarnBeforeAddingLocalAuto(bot.computers, bot.autoApprove)) {
+                      setLocalAutoWarning("local");
+                      return;
+                    }
+                    const cur = bot.computers ?? [];
+                    const nxt = cur.includes(mode as any) ? cur.filter(c => c !== mode) : [...cur, mode as any];
+                    patch({ computers: nxt });
                   }}
                   className={cn(
                     "flex-1 py-1.5 text-[13px] capitalize",
                     i > 0 && "border-l border-hairline/40",
-                    mode === "local" && !localSelectable && "cursor-not-allowed opacity-40",
-                    bot.computer === mode
-                      ? "bg-control text-ink"
-                      : "text-ink-secondary hover:bg-control/60 hover:text-ink",
+                    blocked && "cursor-not-allowed opacity-40",
+                    selected ? "bg-control text-ink font-medium" : "text-ink-secondary",
+                    !blocked && !selected && "hover:bg-control/60 hover:text-ink",
                   )}
                 >
                   {label}
                 </button>
-              ))}
+                );
+              })}
             </div>
-            {(!bot.computer || bot.computer === "cloud") && (
+            {runsOnNote && (
+              <div className="mt-2 text-[11.5px] leading-relaxed text-ink-secondary">
+                {runsOnNote}
+              </div>
+            )}
+            {(bot.computers ?? []).length > 1 && (
+              <div className="mt-3 rounded-lg bg-inset px-3 py-2.5 text-[11.5px] text-ink-secondary">
+                This bot has {(bot.computers ?? []).length} computers and its own tools for each.  It picks per task,
+                preferring a remote desktop and using this computer only when the work genuinely needs it.
+              </div>
+            )}
+            {(!(bot.computers?.length) || bot.computers?.includes("cloud")) && (
               <>
                 <CloudBackendPicker
-                  value={bot.cloudBackend ?? "box"}
-                  vpsSupported={canUseVps}
+                  value={cloudBackend}
+                  inherited={cloudBackendInherited(bot)}
+                  vpsSupported={vpsSupported}
+                  boxSupported={boxSupported}
+                  engineName={engine?.displayName}
+                  unavailableNote={cloudNote}
                   onChange={(backend) => patch({ cloudBackend: backend })}
                 />
-                {!bot.computer && bot.cloudBackend === "vps" && (
+                {!(bot.computers?.length) && cloudBackend === "vps" && (
                   <div className="mt-3 flex items-center justify-between gap-4 rounded-lg bg-inset px-3 py-2.5">
                     <div className="min-w-0">
                       <div className="text-[13px] text-ink">Start VPS automatically</div>
                       <div className="mt-0.5 text-[11.5px] text-ink-secondary">
-                        Allow Auto to create or wake this bot's managed container when needed.
+                        Off by default.  When enabled, Auto may create or wake this bot's managed container.
                       </div>
                     </div>
                     <button
@@ -711,11 +850,18 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
           {/* keyed so switching bots never shows one bot's notes under another's name */}
           <MemoryCard key={bot.id} bot={bot} />
 
+          {/* Skills sit beside Memory because they are the same kind of
+              thing: plain files in the bot's workspace that a person owns.
+              Keyed for the same reason — one bot's imports must never show
+              under another's name, and the read-then-enable gate is a
+              per-bot decision. */}
+          <BotSkillsPanel key={`skills-${bot.id}`} bot={bot} driverKind={engine?.driverKind} />
+
           <div className="flex items-center justify-between gap-4 rounded-xl bg-card p-4">
             <div>
-              <div className="text-[15px] font-medium text-ink">Auto mode</div>
+              <div className="text-[15px] font-medium text-ink">Auto Mode</div>
               <div className="mt-0.5 text-[13px] text-ink-secondary">
-                {bot.computer === "local"
+                {(bot.computers ?? []).includes("local")
                   ? bot.autoApprove
                     ? "Keeps going on this computer — you'll still be asked about anything destructive, and about questions it asks you."
                     : "Approve each action on this computer yourself. Turn on to let this bot keep working without stopping to ask."
@@ -727,9 +873,9 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
             <button
               role="switch"
               aria-checked={Boolean(bot.autoApprove)}
-              aria-label="Auto mode"
+              aria-label="Auto Mode"
               onClick={() => {
-                if (!bot.autoApprove && bot.computer === "local") setLocalAutoWarning("auto");
+                if (!bot.autoApprove && autoWouldUseLocal) setLocalAutoWarning("auto");
                 else patch({ autoApprove: !bot.autoApprove });
               }}
               className={cn(
@@ -747,39 +893,72 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
           </div>
 
           <div className="rounded-xl bg-card p-4">
-            <div className="text-[15px] font-medium text-ink">Review routine approvals</div>
-            <div className="mt-0.5 text-[13px] text-ink-secondary">
-              {canAutoReview
-                ? "The same engine reviews ordinary approval cards. Existing safety rules, unattended turns, local-computer access, and questions still wait for you."
-                : "This engine cannot run an isolated review safely, so approval cards continue to wait for you."}
+            <div className="flex items-center justify-between gap-4">
+              <div>
+                <div className="flex items-center gap-2">
+                  <span className="text-[15px] font-medium text-ink">Bypass Permissions</span>
+                  {modelRisk.isDangerous && (
+                    <span className="rounded-full bg-danger/10 px-2 py-0.5 text-[11px] font-semibold text-danger">
+                      High-Risk Model
+                    </span>
+                  )}
+                  {bot.bypassPermissions && (
+                    <span className="rounded-full bg-accent/15 px-2 py-0.5 text-[11px] font-semibold text-accent">
+                      Active
+                    </span>
+                  )}
+                </div>
+                <div className="mt-0.5 text-[13px] text-ink-secondary">
+                  {bot.bypassPermissions
+                    ? "Executing tools, shell commands, and routine proposals autonomously without approval cards.  Requests that control This Mac still ask, unless Bypass Including This Mac is on."
+                    : "Automatically approve all tool, command, and routine requests without stopping for manual approval cards.  Requests that control This Mac still ask."}
+                </div>
+              </div>
+              <button
+                role="switch"
+                aria-checked={Boolean(bot.bypassPermissions)}
+                aria-label="Bypass Permissions"
+                onClick={() => {
+                  if (bot.bypassPermissions) {
+                    patch({ bypassPermissions: false });
+                  } else {
+                    setBypassWarningOpen(true);
+                  }
+                }}
+                className={cn(
+                  "relative h-[26px] w-[44px] shrink-0 rounded-full transition-colors",
+                  bot.bypassPermissions ? "bg-accent" : "bg-control",
+                )}
+              >
+                <span
+                  className={cn(
+                    "absolute top-[3px] size-5 rounded-full bg-white transition-all",
+                    bot.bypassPermissions ? "left-[21px]" : "left-[3px]",
+                  )}
+                />
+              </button>
             </div>
-            <div className="mt-3 flex gap-1 rounded-lg bg-inset p-0.5">
-              {(
-                [
-                  ["off", "Off", "Every undecided approval waits for you."],
-                  ["shadow", "Watch", "Record the review without answering the card."],
-                  ["enforce", "On", "Answer only reviews that return a strict approval."],
-                ] as const
-              ).map(([value, label, hint]) => {
-                const current = bot.autoReview === "shadow" || bot.autoReview === "enforce" ? bot.autoReview : "off";
-                const disabled = value !== "off" && !canAutoReview;
-                return (
-                  <button
-                    key={value}
-                    title={disabled ? "Not supported by this engine" : hint}
-                    disabled={disabled}
-                    onClick={() => patch({ autoReview: value })}
-                    className={cn(
-                      "flex-1 rounded-md px-2.5 py-1.5 text-[13px] font-medium disabled:cursor-not-allowed disabled:opacity-40",
-                      current === value ? "bg-raised text-ink" : "text-ink-secondary hover:text-ink",
-                    )}
-                  >
-                    {label}
-                  </button>
-                );
-              })}
-            </div>
+            <BypassLocalComputerControl
+              bypassPermissions={Boolean(bot.bypassPermissions)}
+              bypassLocalComputer={Boolean(bot.bypassLocalComputer)}
+              onTurnOff={() => patch({ bypassLocalComputer: false })}
+              onRequestOn={() => setLocalAutoWarning("bypassLocal")}
+            />
+            {bypassNote && (
+              <div className="mt-3 text-[12px] leading-relaxed text-ink-secondary">{bypassNote}</div>
+            )}
+            {modelRisk.isDangerous && (
+              <div className="mt-3 flex items-start gap-2 rounded-lg border border-warning/40 bg-warning/10 p-2.5 text-[12px] text-warning">
+                <AlertTriangle size={15} className="mt-0.5 shrink-0" />
+                <div>
+                  <span className="font-semibold">{modelRisk.model}: </span>
+                  {modelRisk.warningBody}
+                </div>
+              </div>
+            )}
           </div>
+
+          <AutoReviewCard bot={bot} onMode={(autoReview) => patch({ autoReview })} />
 
           <VoiceSettings bot={bot} onPatch={patch} />
 
@@ -789,13 +968,13 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
                 Notifications
               </div>
               <div className="mt-0.5 text-[13px] text-ink-secondary">
-                Get notified when this agent finishes or needs input
+                Get notified when this bot finishes or needs input
               </div>
             </div>
             <button
               role="switch"
               aria-checked={bot.notifications}
-              aria-label="Agent notifications"
+              aria-label="Bot Notifications"
               onClick={() => {
                 const enabled = !bot.notifications;
                 if (enabled) void requestNotificationPermission();
@@ -814,16 +993,82 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
               />
             </button>
           </div>
+
+          <div className="flex items-center justify-between gap-4 rounded-xl bg-card p-4">
+            <div>
+              <div className="flex items-center gap-2 text-[15px] font-medium text-ink">
+                <Bug size={16} className="text-ink-secondary" /> Chat Inspector
+              </div>
+              <div className="mt-0.5 text-[13px] text-ink-secondary">
+                See this chat’s events, tool results, and connection details.
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => dispatch({ type: "toggleInspector" })}
+              className={cn(
+                "shrink-0 rounded-lg border border-hairline/60 px-3 py-1.5 text-[13px] font-medium transition-colors",
+                state.inspectorOpen
+                  ? "border-accent bg-accent/10 text-accent"
+                  : "bg-control text-ink hover:bg-raised-hover",
+              )}
+            >
+              {state.inspectorOpen ? "Hide Inspector" : "Show Inspector"}
+            </button>
+          </div>
         </div>
       </div>
     </aside>
     <LocalComputerAutoWarning
       open={localAutoWarning !== null}
+      title={localAutoWarning === "bypassLocal" ? BYPASS_LOCAL_COMPUTER_WARNING_TITLE : undefined}
+      body={localAutoWarning === "bypassLocal" ? BYPASS_LOCAL_COMPUTER_WARNING_BODY : undefined}
       onCancel={() => setLocalAutoWarning(null)}
       onConfirm={() => {
         if (localAutoWarning === "auto") patch({ autoApprove: true, acknowledgeLocalAuto: true });
-        if (localAutoWarning === "local") patch({ computer: "local", acknowledgeLocalAuto: true });
+        if (localAutoWarning === "local") patch({ computers: [...(bot.computers ?? []), "local"], acknowledgeLocalAuto: true });
+        // The same warning stands in front of the second switch: both give
+        // up the asking for the real desktop, so neither gets a quieter path.
+        if (localAutoWarning === "bypassLocal") patch({ bypassLocalComputer: true, acknowledgeLocalAuto: true });
         setLocalAutoWarning(null);
+      }}
+    />
+    <BypassPermissionsWarning
+      open={bypassWarningOpen}
+      onCancel={() => setBypassWarningOpen(false)}
+      onConfirm={() => {
+        patch({
+          bypassPermissions: true,
+          ...(autoWouldUseLocal ? { acknowledgeLocalAuto: true } : {}),
+        });
+        setBypassWarningOpen(false);
+      }}
+      botName={bot.name}
+      model={bot.modelSelection?.model ?? ""}
+      engineId={bot.modelSelection?.instanceId}
+    />
+    <ConfirmDialog
+      open={powerOffWhileRunning}
+      title={botOffWhileRunningTitle(bot.name)}
+      body={botOffWhileRunningBody(bot.name)}
+      confirmLabel={BOT_OFF_STOP_AND_POWER_OFF}
+      cancelLabel={BOT_OFF_KEEP_ON}
+      altLabel={BOT_OFF_AFTER_TURN}
+      onCancel={() => setPowerOffWhileRunning(false)}
+      onAlt={() => {
+        // What Off means on its own: no turn is stopped here.
+        setPowerOffWhileRunning(false);
+        patch({ off: true });
+      }}
+      onConfirm={() => {
+        setPowerOffWhileRunning(false);
+        // Off first, then stop.  The flag is what stops anything else from
+        // starting in the gap, and it is safe to set while a turn runs:
+        // settleWorkForOffBot returns early for a busy bot.  The interrupt
+        // still works afterwards, because it acts on the turn in flight
+        // rather than on the bot being on or off.
+        patch({ off: true });
+        dispatch({ type: "interrupt", botId: bot.id });
       }}
     />
     </>

@@ -5,7 +5,7 @@
 // header" failure. Inject writes providers.<host> and session/set_model
 // `custom:<host>:<model>` instead.
 import { spawn } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
@@ -34,6 +34,19 @@ export function bindHermesScreenshotCompat(
 
 function hermesHome(env: Record<string, string | undefined>): string {
   return env.HERMES_HOME || join(env.HOME || env.USERPROFILE || homedir(), ".hermes");
+}
+
+/** Is hermes configured enough to run a turn?
+ *
+ * Any of the three routes it supports counts: a key in this instance's
+ * environment, the `.env` it writes keys into, or the OAuth tokens the Nous
+ * Portal login leaves in its home. */
+function hermesAuthenticated(env: Record<string, string | undefined>): boolean {
+  for (const name of ["OPENROUTER_API_KEY", "OPENAI_API_KEY", "ZAI_API_KEY", "HERMES_API_KEY"]) {
+    if (env[name]?.trim()) return true;
+  }
+  const dir = hermesHome(env);
+  return existsSync(join(dir, ".env")) || existsSync(join(dir, "config.yaml"));
 }
 
 function quoteYaml(value: string): string {
@@ -428,7 +441,12 @@ const support: AcpSupport = {
   },
   pickAuthMethod: () => null,
   authFailure: "continue",
-  isAuthenticated: () => true,
+  // Read what hermes actually wrote, env-aware, instead of answering a
+  // hardcoded `true`.  A blanket yes made an installed-but-unconfigured
+  // hermes look ready: the setup card never appeared and the user found out
+  // when the first turn failed.  BYOK, so a key in the environment counts
+  // just as much as a stored login.
+  isAuthenticated: (env) => hermesAuthenticated(env),
   async configureSession({ request, sessionId, turn }) {
     // Decode only — resolveTurnModel already wrote the named provider using
     // the instance HOME. Calling ensure* again here would hit process.env

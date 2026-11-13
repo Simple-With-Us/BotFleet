@@ -130,10 +130,29 @@ public enum ConnectionAdvice {
         if let urlError = error as? URLError {
             return shouldTryAnotherHost(urlError.code)
         }
-        guard let apiError = error as? APIError,
-              case let .status(code, _) = apiError
-        else { return false }
-        return (502...504).contains(code) || (520...530).contains(code)
+        return isGatewayOutage(error)
+    }
+
+    /// The gateway-outage status family on its own — Cloudflare's answer
+    /// when the phone's paired Mac has nothing listening (502–504) or the
+    /// tunnel itself is unhealthy (520–530).  Split out from
+    /// `shouldTryAnotherRoute` so it has a name of its own: `Session`'s
+    /// reconnect backoff (IO11) uses it to decide when a run of failures
+    /// should escalate to the `.macOffline` status.  (Sentry's own gateway
+    /// filter, IO10, is intentionally narrower — `CompanionGatewayFailurePolicy`
+    /// only suppresses a 530 carrying Cloudflare's 1033 "no tunnel
+    /// connector" marker — so the two do not share this definition.)
+    public static func isGatewayStatusCode(_ code: Int) -> Bool {
+        (502...504).contains(code) || (520...530).contains(code)
+    }
+
+    /// `isGatewayStatusCode`, applied to whatever error the stream threw.
+    /// Only ever true for an `APIError.status` — a `URLError` is an address
+    /// problem, not a gateway response, even when its description mentions
+    /// a status code.
+    public static func isGatewayOutage(_ error: Error) -> Bool {
+        guard let apiError = error as? APIError, case let .status(code, _) = apiError else { return false }
+        return isGatewayStatusCode(code)
     }
 
     /// The offline banner as advice rather than an NSURLError string.

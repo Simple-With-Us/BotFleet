@@ -1,6 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as sentryAi from "../sentry-ai.ts";
 import { recordEvents } from "../testing/events.ts";
-import { OpenAICompatDriver } from "./openai-compat.ts";
+import { startFakeOpenAiServer, type FakeOpenAiServer } from "../testing/fake-openai-server.ts";
+import { OpenAICompatDriver, isLocalModelEndpoint, replyWaitTimeoutMs, replyWaitTurnBudget, sentryProviderForUrl, usesUnboundedFetchForReplyWait } from "./openai-compat.ts";
+import { DEFAULT_TURN_LOOP_BUDGET } from "./chat-completions/loop.ts";
+import { VOLATILE_CONTEXT_NOTE_PREFIX } from "./prompt-split.ts";
 
 describe("OpenAICompatDriver", () => {
   const savedUrl = process.env.OPENAI_COMPAT_URL;
@@ -25,6 +29,10 @@ describe("OpenAICompatDriver", () => {
     expect(OpenAICompatDriver.metadata.displayName).toMatch(/OpenRouter|Groq/);
   });
 
+  it("marks its install descriptor apiKeyOnly — no CLI, so the setup UI never says install or sign in", () => {
+    expect(OpenAICompatDriver.install?.apiKeyOnly).toBe(true);
+  });
+
   it("falls back to the OpenRouter endpoint by default", () => {
     const cfg = OpenAICompatDriver.defaultConfig();
     expect(cfg.url).toBe("https://openrouter.ai/api/v1");
@@ -40,9 +48,13 @@ describe("OpenAICompatDriver", () => {
     expect(cfg.apiKeyEnv).toBe("GROQ_KEY");
   });
 
-  it("reports unavailable without an API key", async () => {
+  it("reports unavailable without an API key for the workspace-shared instance", async () => {
+    // "openaiCompat" is the one reserved instance id backed by the shared
+    // openaiCompat.key/OPENAI_COMPAT_API_KEY credential — it still requires
+    // a key. A user-added custom instance does not; see the "keyless custom
+    // engine" tests below.
     const inst = await OpenAICompatDriver.create({
-      instanceId: "test-1",
+      instanceId: "openaiCompat",
       displayName: "Free",
       enabled: true,
       config: { url: "https://openrouter.ai/api/v1", apiKeyEnv: "OPENAI_COMPAT_API_KEY" },
@@ -50,6 +62,274 @@ describe("OpenAICompatDriver", () => {
     });
     const snap = await inst.snapshot();
     expect(snap.state).toBe("unavailable");
+    await inst.dispose();
+  });
+
+  it("permits a keyless custom instance (e.g. local Ollama/LM Studio) to be available", async () => {
+    const inst = await OpenAICompatDriver.create({
+      instanceId: "custom-ollama-local",
+      displayName: "Ollama Local",
+      enabled: true,
+      config: { url: "http://localhost:11434/v1", apiKeyEnv: "OPENAI_COMPAT_API_KEY" },
+      environment: {},
+    });
+    const snap = await inst.snapshot();
+    expect(snap.state).toBe("available");
+    expect(snap.authenticated).toBe(true);
+    await inst.dispose();
+  });
+
+  it("omits the Authorization header for a keyless custom instance", async () => {
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/models")) return new Response(JSON.stringify({ data: [] }), { status: 200 });
+      expect(init?.headers).not.toHaveProperty("authorization");
+      return new Response("data: [DONE]\n", {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const inst = await OpenAICompatDriver.create({
+      instanceId: "custom-ollama-local",
+      displayName: "Ollama Local",
+      enabled: true,
+      config: { url: "http://localhost:11434/v1", apiKeyEnv: "OPENAI_COMPAT_API_KEY" },
+      environment: {},
+    });
+    const recorder = recordEvents(inst.adapter);
+    await inst.adapter.sendTurn({ threadId: "thread", text: "hi", model: "llama3" });
+    await recorder.until((event) => event.type === "turn.completed");
+    recorder.stop();
+    await inst.dispose();
+    expect(fetchMock).toHaveBeenCalled();
+  });
+
+  it("sends max_tokens on an OpenRouter endpoint and marks its catalog", async () => {
+    const bodies: Array<{ max_tokens?: number; max_completion_tokens?: number }> = [];
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/models")) return new Response(JSON.stringify({ data: [] }), { status: 200 });
+      bodies.push(JSON.parse(String(init?.body ?? "{}")));
+      return new Response("data: [DONE]\n", { status: 200, headers: { "content-type": "text/event-stream" } });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const inst = await OpenAICompatDriver.create({
+      instanceId: "custom-openrouter",
+      displayName: "OpenRouter",
+      enabled: true,
+      config: { url: "https://openrouter.ai/api/v1", apiKeyEnv: "OPENAI_COMPAT_API_KEY", key: "sk-or-fake" },
+      environment: {},
+    });
+    expect(inst.models.options.every((model) => model.supportsMaxOutput === true)).toBe(true);
+    const recorder = recordEvents(inst.adapter);
+    await inst.adapter.sendTurn({ threadId: "t-or", text: "hi", maxOutputTokens: 2048 });
+    await recorder.until((event) => event.type === "turn.completed");
+    expect(bodies[0].max_tokens).toBe(2048);
+    expect(bodies[0]).not.toHaveProperty("max_completion_tokens");
+    recorder.stop();
+    await inst.dispose();
+  });
+
+  it("sends max_completion_tokens on a Groq endpoint", async () => {
+    const bodies: Array<{ max_tokens?: number; max_completion_tokens?: number }> = [];
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/models")) return new Response(JSON.stringify({ data: [] }), { status: 200 });
+      bodies.push(JSON.parse(String(init?.body ?? "{}")));
+      return new Response("data: [DONE]\n", { status: 200, headers: { "content-type": "text/event-stream" } });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const inst = await OpenAICompatDriver.create({
+      instanceId: "custom-groq",
+      displayName: "Groq",
+      enabled: true,
+      config: { url: "https://api.groq.com/openai/v1", apiKeyEnv: "OPENAI_COMPAT_API_KEY", key: "gsk-fake" },
+      environment: {},
+    });
+    expect(inst.models.options.every((model) => model.supportsMaxOutput === true)).toBe(true);
+    const recorder = recordEvents(inst.adapter);
+    await inst.adapter.sendTurn({ threadId: "t-groq", text: "hi", maxOutputTokens: 512 });
+    await recorder.until((event) => event.type === "turn.completed");
+    expect(bodies[0].max_completion_tokens).toBe(512);
+    expect(bodies[0]).not.toHaveProperty("max_tokens");
+    recorder.stop();
+    await inst.dispose();
+  });
+
+  it("sends max_completion_tokens on the OpenAI endpoint and stamps its fetched catalog", async () => {
+    const bodies: Array<{ max_tokens?: number; max_completion_tokens?: number }> = [];
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/models")) {
+        return new Response(JSON.stringify({ data: [{ id: "gpt-x", name: "GPT X" }] }), { status: 200 });
+      }
+      bodies.push(JSON.parse(String(init?.body ?? "{}")));
+      return new Response("data: [DONE]\n", { status: 200, headers: { "content-type": "text/event-stream" } });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const inst = await OpenAICompatDriver.create({
+      instanceId: "custom-openai",
+      displayName: "OpenAI",
+      enabled: true,
+      config: { url: "https://api.openai.com/v1", apiKeyEnv: "OPENAI_COMPAT_API_KEY", key: "sk-fake" },
+      environment: {},
+    });
+    await inst.refreshModels?.();
+    // The /models answer above is non-empty, so this asserts the stamp on
+    // fetched rows rather than the hand-written default catalog.
+    expect(inst.models.options).toEqual([{ id: "gpt-x", label: "GPT X", supportsMaxOutput: true }]);
+    const recorder = recordEvents(inst.adapter);
+    await inst.adapter.sendTurn({ threadId: "t-oai", text: "hi", maxOutputTokens: 1024 });
+    await recorder.until((event) => event.type === "turn.completed");
+    expect(bodies[0].max_completion_tokens).toBe(1024);
+    expect(bodies[0]).not.toHaveProperty("max_tokens");
+    recorder.stop();
+    await inst.dispose();
+  });
+
+  it("retries once without the output-limit field when the endpoint rejects it", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/models")) return new Response(JSON.stringify({ data: [] }), { status: 200 });
+      bodies.push(JSON.parse(String(init?.body ?? "{}")));
+      if (bodies.length === 1) {
+        return new Response('{"error":"max_completion_tokens is not supported by this endpoint"}', { status: 400 });
+      }
+      return new Response("data: [DONE]\n", { status: 200, headers: { "content-type": "text/event-stream" } });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const inst = await OpenAICompatDriver.create({
+      instanceId: "maxout-retry",
+      displayName: "Maxout Retry",
+      enabled: true,
+      config: { url: "https://api.groq.com/openai/v1", apiKeyEnv: "OPENAI_COMPAT_API_KEY", key: "gsk-fake" },
+      environment: {},
+    });
+    const recorder = recordEvents(inst.adapter);
+    await inst.adapter.sendTurn({ threadId: "t-maxout-retry", text: "hi", maxOutputTokens: 512 });
+    const done = await recorder.until((event) => event.type === "turn.completed");
+    expect(done).toMatchObject({ ok: true });
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0].max_completion_tokens).toBe(512);
+    expect(bodies[1]).not.toHaveProperty("max_completion_tokens");
+    recorder.stop();
+    await inst.dispose();
+  });
+
+  it("recovers when the endpoint names the rejected fields one at a time", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/models")) return new Response(JSON.stringify({ data: [] }), { status: 200 });
+      bodies.push(JSON.parse(String(init?.body ?? "{}")));
+      if (bodies.length === 1) {
+        return new Response('{"error":"max_completion_tokens is not supported by this endpoint"}', { status: 400 });
+      }
+      if (bodies.length === 2) {
+        return new Response('{"error":"This endpoint does not support stream_options"}', { status: 400 });
+      }
+      return new Response("data: [DONE]\n", { status: 200, headers: { "content-type": "text/event-stream" } });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const inst = await OpenAICompatDriver.create({
+      instanceId: "maxout-order",
+      displayName: "Maxout Order",
+      enabled: true,
+      config: { url: "https://api.groq.com/openai/v1", apiKeyEnv: "OPENAI_COMPAT_API_KEY", key: "gsk-fake" },
+      environment: {},
+    });
+    const recorder = recordEvents(inst.adapter);
+    await inst.adapter.sendTurn({ threadId: "t-maxout-order", text: "hi", maxOutputTokens: 512 });
+    const done = await recorder.until((event) => event.type === "turn.completed");
+    // The recovery order must not depend on which field the endpoint names
+    // first: max dropped on the first retry, stream_options on the second.
+    expect(done).toMatchObject({ ok: true });
+    expect(bodies).toHaveLength(3);
+    expect(bodies[0].max_completion_tokens).toBe(512);
+    expect(bodies[0]).toHaveProperty("stream_options");
+    // One field per retry: the intermediate body drops only the field the
+    // endpoint rejected, so stream_options is still requested there.
+    expect(bodies[1]).not.toHaveProperty("max_completion_tokens");
+    expect(bodies[1]).toHaveProperty("stream_options");
+    expect(bodies[2]).not.toHaveProperty("max_completion_tokens");
+    expect(bodies[2]).not.toHaveProperty("stream_options");
+    recorder.stop();
+    await inst.dispose();
+  });
+
+  it("sends no output-limit field and marks nothing on an unrecognized endpoint", async () => {
+    const bodies: Array<{ max_tokens?: number; max_completion_tokens?: number }> = [];
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/models")) return new Response(JSON.stringify({ data: [] }), { status: 200 });
+      bodies.push(JSON.parse(String(init?.body ?? "{}")));
+      return new Response("data: [DONE]\n", { status: 200, headers: { "content-type": "text/event-stream" } });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const inst = await OpenAICompatDriver.create({
+      instanceId: "custom-ollama-maxout",
+      displayName: "Ollama Local",
+      enabled: true,
+      config: { url: "http://localhost:11434/v1", apiKeyEnv: "OPENAI_COMPAT_API_KEY" },
+      environment: {},
+    });
+    expect(inst.models.options.some((model) => model.supportsMaxOutput === true)).toBe(false);
+    const recorder = recordEvents(inst.adapter);
+    await inst.adapter.sendTurn({ threadId: "t-ollama", text: "hi", maxOutputTokens: 999 });
+    await recorder.until((event) => event.type === "turn.completed");
+    expect(bodies[0]).not.toHaveProperty("max_tokens");
+    expect(bodies[0]).not.toHaveProperty("max_completion_tokens");
+    recorder.stop();
+    await inst.dispose();
+  });
+
+  it("never sends the workspace-shared process.env credential to a custom instance", async () => {
+    // syncCredentialEnv copies a saved openaiCompat.key into
+    // process.env.OPENAI_COMPAT_API_KEY as soon as it's saved — that env var
+    // is process-wide, not scoped to the reserved "openaiCompat" instance,
+    // so every openai-compat instance's own process.env lookup would
+    // otherwise see it. A user-added custom instance must never forward that
+    // workspace credential to whatever arbitrary endpoint the user typed in.
+    process.env.OPENAI_COMPAT_API_KEY = "sk-workspace-secret";
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/models")) return new Response(JSON.stringify({ data: [] }), { status: 200 });
+      expect(init?.headers).not.toHaveProperty("authorization");
+      return new Response("data: [DONE]\n", {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const inst = await OpenAICompatDriver.create({
+      instanceId: "custom-untrusted-endpoint",
+      displayName: "Untrusted Endpoint",
+      enabled: true,
+      config: { url: "https://untrusted.example.test/v1", apiKeyEnv: "OPENAI_COMPAT_API_KEY" },
+      environment: {},
+    });
+    const recorder = recordEvents(inst.adapter);
+    await inst.adapter.sendTurn({ threadId: "thread", text: "hi", model: "llama3" });
+    await recorder.until((event) => event.type === "turn.completed");
+    recorder.stop();
+    await inst.dispose();
+    expect(fetchMock).toHaveBeenCalled();
+  });
+
+  it("still lets the reserved workspace instance fall back to process.env", async () => {
+    process.env.OPENAI_COMPAT_API_KEY = "sk-workspace-secret";
+    const inst = await OpenAICompatDriver.create({
+      instanceId: "openaiCompat",
+      displayName: "Free",
+      enabled: true,
+      config: { url: "https://openrouter.ai/api/v1", apiKeyEnv: "OPENAI_COMPAT_API_KEY" },
+      environment: {},
+    });
+    const snap = await inst.snapshot();
+    expect(snap.state).toBe("available");
+    expect(snap.authenticated).toBe(true);
     await inst.dispose();
   });
 
@@ -192,7 +472,7 @@ describe("OpenAICompatDriver", () => {
         return new Response(
           'data: {"choices":[{"delta":{"reasoning_content":"thinking through the problem"}}]}\n' +
             'data: {"choices":[{"delta":{"content":""}}]}\n' +
-            'data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5}}\n' +
+            'data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":4}}}\n' +
             "data: [DONE]\n",
           { status: 200, headers: { "content-type": "text/event-stream" } },
         );
@@ -223,5 +503,608 @@ describe("OpenAICompatDriver", () => {
 
     recorder.stop();
     await inst.dispose();
+  });
+});
+
+describe("local OpenAI-compatible reply wait", () => {
+  it("accepts optional whole-minute waits from 5 to 60 and rejects invalid values", () => {
+    expect(OpenAICompatDriver.decodeConfig({ url: "http://127.0.0.1:11434/v1", replyWaitMinutes: 20 })).toMatchObject({ replyWaitMinutes: 20 });
+    expect(OpenAICompatDriver.decodeConfig({ url: "http://127.0.0.1:11434/v1" })).not.toHaveProperty("replyWaitMinutes");
+    for (const value of [1, 4, 61, 2.5, "20", null]) {
+      expect(() => OpenAICompatDriver.decodeConfig({ url: "http://127.0.0.1:11434/v1", replyWaitMinutes: value })).toThrow(/replyWaitMinutes/);
+    }
+  });
+
+  it("keeps the 3-minute local default and the 2-minute cloud timeout", () => {
+    expect(replyWaitTimeoutMs("http://127.0.0.1:11434/v1")).toBe(180_000);
+    expect(replyWaitTimeoutMs("http://127.0.0.1:11434/v1", 5)).toBe(300_000);
+    expect(replyWaitTimeoutMs("http://127.0.0.1:11434/v1", 60)).toBe(3_600_000);
+    expect(replyWaitTimeoutMs("https://api.example.test/v1", 20)).toBe(120_000);
+  });
+
+  it("gives a configured 60-minute local wait bounded request and turn headroom", () => {
+    const localDefault = { ...DEFAULT_TURN_LOOP_BUDGET, ...replyWaitTurnBudget("http://127.0.0.1:11434/v1") };
+    expect(localDefault.requestTimeoutMs).toBe(DEFAULT_TURN_LOOP_BUDGET.requestTimeoutMs);
+    expect(localDefault.wallClockMs).toBe(DEFAULT_TURN_LOOP_BUDGET.wallClockMs);
+
+    const local60 = { ...DEFAULT_TURN_LOOP_BUDGET, ...replyWaitTurnBudget("http://127.0.0.1:11434/v1", 60) };
+    expect(local60.requestIdleMs).toBe(3_600_000);
+    expect(local60.requestTimeoutMs).toBeGreaterThan(local60.requestIdleMs);
+    expect(local60.requestTimeoutMs).toBe(3_900_000);
+    expect(local60.wallClockMs).toBeGreaterThan(local60.requestTimeoutMs);
+    expect(local60.wallClockMs).toBe(4_500_000);
+
+    const cloud60 = { ...DEFAULT_TURN_LOOP_BUDGET, ...replyWaitTurnBudget("https://api.example.test/v1", 60) };
+    expect(cloud60).toEqual(DEFAULT_TURN_LOOP_BUDGET);
+  });
+
+  it("recognizes loopback and private network endpoints without classifying cloud hosts", () => {
+    for (const url of [
+      "http://localhost:11434/v1", "http://127.0.0.1:11434/v1", "http://[::1]:8080/v1",
+      "http://[::ffff:127.0.0.1]:11434/v1", "http://[::ffff:7f00:1]:11434/v1",
+      "http://192.168.1.20:11434/v1", "http://10.0.0.5/v1", "http://172.20.1.2/v1", "http://studio.local:1234/v1",
+    ]) expect(isLocalModelEndpoint(url), url).toBe(true);
+    for (const url of ["https://openrouter.ai/api/v1", "https://api.example.test/v1", "http://172.32.0.1/v1", "not a url"]) {
+      expect(isLocalModelEndpoint(url), url).toBe(false);
+    }
+  });
+
+  it("bypasses Node's no-byte fetch limit only for local waits of at least five minutes", () => {
+    expect(usesUnboundedFetchForReplyWait("http://127.0.0.1:11434/v1", 299_999)).toBe(false);
+    expect(usesUnboundedFetchForReplyWait("http://127.0.0.1:11434/v1", 300_000)).toBe(true);
+    expect(usesUnboundedFetchForReplyWait("https://api.example.test/v1", 3_600_000)).toBe(false);
+  });
+});
+
+describe("OpenAICompatDriver tool steps", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("settles a contract-shaped tool step with the host's real outcome", async () => {
+    // it used to emit `tool_call.delta` and `itemType: "tool_call"`, neither
+    // of which is in the RuntimeEvent union — both were cast past the type
+    // checker, the harness had no arm for either, and a turn that called a
+    // tool rendered no steps at all
+    let round = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request) => {
+        if (String(input).endsWith("/models")) {
+          return new Response(JSON.stringify({ data: [] }), { status: 200 });
+        }
+        round += 1;
+        return round === 1 ? new Response(
+          'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read_file","arguments":""}}]}}]}\n' +
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"file_path\\":\\"/srv/app/store.ts\\"}"}}]}}]}\n' +
+            "data: [DONE]\n",
+          { status: 200, headers: { "content-type": "text/event-stream" } },
+        ) : new Response(
+          'data: {"choices":[{"delta":{"content":"done"}}]}\ndata: [DONE]\n',
+          { status: 200, headers: { "content-type": "text/event-stream" } },
+        );
+      }),
+    );
+    const inst = await OpenAICompatDriver.create({
+      instanceId: "test-tool-steps",
+      displayName: "Tools",
+      enabled: true,
+      config: { url: "https://example.test/v1", apiKeyEnv: "TEST_KEY" },
+      environment: { TEST_KEY: "secret" },
+    });
+    const recorder = recordEvents(inst.adapter);
+
+    await inst.adapter.sendTurn({
+      threadId: "tool-thread",
+      text: "read it",
+      model: "vendor/model",
+      tools: [{ name: "read_file" }],
+      toolHost: { execute: async () => ({ kind: "result", content: "file contents" }) },
+    });
+    await recorder.until((event) => event.type === "turn.completed");
+
+    const started = recorder.events.filter(
+      (event) => event.type === "item.started" && event.itemType === "tool",
+    );
+    expect(started).toHaveLength(1);
+    expect(started[0]).toMatchObject({ itemId: "call_1", title: "read_file", toolKind: "read" });
+
+    expect(recorder.events).toContainEqual(
+      expect.objectContaining({ type: "item.completed", itemType: "tool", itemId: "call_1", ok: true }),
+    );
+    // the old off-contract shapes cannot recur: `tool_call.delta` and
+    // `itemType: "tool_call"` are not in the RuntimeEvent union, so the type
+    // checker now refuses them where an `as any` used to wave them through
+    recorder.stop();
+    await inst.dispose();
+  });
+
+  it("does not open a second step for a call whose arguments streamed in fragments", async () => {
+    let round = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request) => {
+        if (String(input).endsWith("/models")) {
+          return new Response(JSON.stringify({ data: [] }), { status: 200 });
+        }
+        round += 1;
+        return round === 1 ? new Response(
+          'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"bash","arguments":"{\\"comm"}}]}}]}\n' +
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"arguments":"and\\":\\"ls\\"}"}}]}}]}\n' +
+            "data: [DONE]\n",
+          { status: 200, headers: { "content-type": "text/event-stream" } },
+        ) : new Response(
+          'data: {"choices":[{"delta":{"content":"done"}}]}\ndata: [DONE]\n',
+          { status: 200, headers: { "content-type": "text/event-stream" } },
+        );
+      }),
+    );
+    const inst = await OpenAICompatDriver.create({
+      instanceId: "test-tool-fragments",
+      displayName: "Tools",
+      enabled: true,
+      config: { url: "https://example.test/v1", apiKeyEnv: "TEST_KEY" },
+      environment: { TEST_KEY: "secret" },
+    });
+    const recorder = recordEvents(inst.adapter);
+
+    await inst.adapter.sendTurn({
+      threadId: "fragment-thread",
+      text: "run it",
+      model: "vendor/model",
+      tools: [{ name: "bash" }],
+      toolHost: { execute: async () => ({ kind: "result", content: "ok" }) },
+    });
+    await recorder.until((event) => event.type === "turn.completed");
+
+    const started = recorder.events.filter(
+      (event) => event.type === "item.started" && event.itemType === "tool",
+    );
+    expect(started).toHaveLength(1);
+    expect(started[0]).toMatchObject({ itemId: "call_a", toolKind: "execute" });
+    recorder.stop();
+    await inst.dispose();
+  });
+
+  it("advertises local-computer capability for host computer execution via toolHost", async () => {
+    const inst = await OpenAICompatDriver.create({
+      instanceId: "test-caps",
+      displayName: "Caps",
+      enabled: true,
+      config: { url: "https://example.test/v1", apiKeyEnv: "TEST_KEY" },
+      environment: { TEST_KEY: "secret" },
+    });
+    expect(inst.adapter.capabilities.localComputerMcp).toBe(true);
+    expect(await inst.adapter.respondToRequest("t", "r", { behavior: "allow" })).toBe("unavailable");
+    await inst.dispose();
+  });
+});
+
+describe("OpenAICompatDriver driver-owned tool loop", () => {
+  let server: FakeOpenAiServer | undefined;
+
+  afterEach(async () => {
+    await server?.close();
+    server = undefined;
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("keeps one turn across tool rounds with cumulative usage and an unchanged prefix", async () => {
+    const legacyToolSpans = vi.spyOn(sentryAi, "recordExecutedTools");
+    server = await startFakeOpenAiServer();
+    server.queueCompletion({
+      kind: "sse",
+      frames: [
+        '{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"list_bots","arguments":"{}"}}]}}]}',
+        '{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":4}}}',
+        "[DONE]",
+      ],
+    });
+    server.queueCompletion({
+      kind: "sse",
+      frames: [
+        '{"choices":[{"delta":{"content":"two bots"}}]}',
+        '{"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":7,"prompt_tokens_details":{"cached_tokens":8}}}',
+        "[DONE]",
+      ],
+    });
+    const instance = await OpenAICompatDriver.create({
+      instanceId: "openai-loop-test",
+      displayName: "Loop",
+      enabled: true,
+      config: { url: server.url, apiKeyEnv: "TEST_KEY", models: ["fake-model"] },
+      environment: { TEST_KEY: "secret" },
+    });
+    const recorder = recordEvents(instance.adapter);
+    const requestApproval = vi.fn(async () => "allowed-once" as const);
+
+    await instance.adapter.sendTurn({
+      threadId: "loop-thread",
+      text: "list my bots",
+      model: "fake-model",
+      tools: [{ name: "list_bots" }],
+      toolHost: {
+        requestApproval,
+        execute: async (_call, runtime) => {
+          const outcome = await runtime.requestApproval({ tool: "list_bots", summary: "Read bot names" });
+          return { kind: "result", content: outcome === "allowed-once" ? "[]" : "denied" };
+        },
+      },
+    });
+    const completed = await recorder.until((event) => event.type === "turn.completed");
+
+    expect(recorder.events.filter((event) => event.type === "turn.completed")).toHaveLength(1);
+    expect(completed).toMatchObject({
+      ok: true,
+      stopReason: "end_turn",
+      usage: { input: 30, output: 12, cachedInput: 12 },
+    });
+    const requests = server.requests.filter((request) => request.url.endsWith("/chat/completions"));
+    expect(requests).toHaveLength(2);
+    expect(requestApproval).toHaveBeenCalledOnce();
+    expect(legacyToolSpans).not.toHaveBeenCalled();
+    expect(recorder.events.filter((event) => event.type === "item.started" && event.itemType === "tool")).toHaveLength(1);
+    expect(recorder.events.filter((event) => event.type === "item.completed" && event.itemType === "tool")).toHaveLength(1);
+    for (const request of requests) expect(request.body).toMatchObject({ stream_options: { include_usage: true } });
+    const first = (requests[0].body as { messages: unknown[] }).messages;
+    const second = (requests[1].body as { messages: unknown[] }).messages;
+    expect(second.slice(0, first.length)).toEqual(first);
+    expect(second.slice(first.length)).toEqual([
+      {
+        role: "assistant",
+        content: "",
+        tool_calls: [{ id: "call_1", type: "function", function: { name: "list_bots", arguments: "{}" } }],
+      },
+      { role: "tool", tool_call_id: "call_1", content: "[]" },
+    ]);
+    recorder.stop();
+    await instance.dispose();
+  });
+
+  it("retains streamed usage when the provider fails before the round settles", async () => {
+    const recordUsage = vi.fn();
+    vi.spyOn(sentryAi, "withChatSpan").mockImplementation(async (_opts, fn) => fn({
+      recordUsage,
+      span: { setAttribute() {}, end() {} },
+    }));
+    let pulls = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulls += 1;
+        if (pulls === 1) {
+          controller.enqueue(new TextEncoder().encode(
+            'data: {"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":9}}\n',
+          ));
+          return;
+        }
+        controller.error(new Error("stream exploded"));
+      },
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(stream, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    })));
+    const instance = await OpenAICompatDriver.create({
+      instanceId: "openai-usage-failure",
+      displayName: "Usage failure",
+      enabled: true,
+      config: { url: "https://example.test/v1", apiKeyEnv: "TEST_KEY", models: ["fake-model"] },
+      environment: { TEST_KEY: "secret" },
+    });
+    const recorder = recordEvents(instance.adapter);
+
+    await instance.adapter.sendTurn({ threadId: "usage-failure", text: "hi", model: "fake-model" });
+    const completed = await recorder.until((event) => event.type === "turn.completed");
+
+    expect(completed).toMatchObject({ ok: false, stopReason: "error", usage: { input: 20, output: 9 } });
+    expect(recordUsage).toHaveBeenCalledWith(expect.objectContaining({ input: 20, output: 9 }));
+    expect(recorder.events.filter((event) => event.type === "turn.completed")).toHaveLength(1);
+    recorder.stop();
+    await instance.dispose();
+  });
+
+  it.each([
+    [400, "stream_options: extra inputs are not permitted"],
+    [422, "This endpoint does not support stream_options"],
+  ])("retries an explicit unsupported stream_options rejection (%s: %s) once", async (status, error) => {
+    server = await startFakeOpenAiServer();
+    server.queueCompletion({ kind: "json", status, body: { error } });
+    server.queueCompletion({ kind: "sse", frames: ['{"choices":[{"delta":{"content":"compatible"}}]}', "[DONE]"] });
+    const instance = await OpenAICompatDriver.create({
+      instanceId: "optional-usage", displayName: "Optional usage", enabled: true,
+      config: { url: server.url, apiKeyEnv: "UNSET_OPTIONAL_KEY", models: ["fake-model"] }, environment: {},
+    });
+    const recorder = recordEvents(instance.adapter);
+    await instance.adapter.sendTurn({ threadId: "optional-usage", text: "hi", model: "fake-model" });
+    expect(await recorder.until((event) => event.type === "turn.completed")).toMatchObject({ ok: true });
+    const requests = server.requests.filter((request) => request.url.endsWith("/chat/completions"));
+    expect(requests).toHaveLength(2);
+    expect(requests[0].body).toHaveProperty("stream_options", { include_usage: true });
+    expect(requests[1].body).not.toHaveProperty("stream_options");
+    expect(requests[1].body).toMatchObject({ model: "fake-model", stream: true });
+    recorder.stop();
+    await instance.dispose();
+  });
+
+  it.each([
+    [400, "private prompt invalid messages"],
+    [401, "private prompt stream_options unsupported"],
+    [422, "private prompt stream_options must be an object"],
+  ])("does not retry unrelated HTTP %s errors or expose their body", async (status, error) => {
+    server = await startFakeOpenAiServer();
+    server.queueCompletion({ kind: "json", status: Number(status), body: { error } });
+    const instance = await OpenAICompatDriver.create({
+      instanceId: "invalid-request", displayName: "Invalid request", enabled: true,
+      config: { url: server.url, apiKeyEnv: "UNSET_OPTIONAL_KEY", models: ["fake-model"] }, environment: {},
+    });
+    const recorder = recordEvents(instance.adapter);
+    await instance.adapter.sendTurn({ threadId: "invalid-request", text: "hi", model: "fake-model" });
+    expect(await recorder.until((event) => event.type === "turn.completed")).toMatchObject({ ok: false });
+    expect(server.requests.filter((request) => request.url.endsWith("/chat/completions"))).toHaveLength(1);
+    expect(JSON.stringify(recorder.events)).not.toContain("private prompt");
+    recorder.stop();
+    await instance.dispose();
+  });
+
+  it("bounds the compatibility retry and preserves the original abort signal", async () => {
+    const signals: Array<AbortSignal | null | undefined> = [];
+    const fetchMock = vi.fn(async (_url: unknown, init?: RequestInit) => {
+      signals.push(init?.signal);
+      return new Response('{"error":"stream_options unsupported"}', { status: 400 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const instance = await OpenAICompatDriver.create({
+      instanceId: "bounded-retry", displayName: "Bounded retry", enabled: true,
+      config: { url: "https://example.test/v1", apiKeyEnv: "UNSET_OPTIONAL_KEY", models: ["fake-model"] }, environment: {},
+    });
+    const recorder = recordEvents(instance.adapter);
+    await instance.adapter.sendTurn({ threadId: "bounded-retry", text: "hi", model: "fake-model" });
+    expect(await recorder.until((event) => event.type === "turn.completed")).toMatchObject({ ok: false });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(signals[0]).toBeInstanceOf(AbortSignal);
+    expect(signals[1]).toBe(signals[0]);
+    recorder.stop();
+    await instance.dispose();
+  });
+
+  it("fails on an upstream SSE error while retaining reported cached usage", async () => {
+    server = await startFakeOpenAiServer();
+    server.queueCompletion({ kind: "sse", frames: [
+      '{"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":9,"prompt_tokens_details":{"cached_tokens":6}}}',
+      '{"error":{"code":502,"message":"private request detail"}}',
+      "[DONE]",
+    ] });
+    const instance = await OpenAICompatDriver.create({
+      instanceId: "openai-stream-error", displayName: "Stream error", enabled: true,
+      config: { url: server.url, apiKeyEnv: "TEST_KEY", models: ["fake-model"] },
+      environment: { TEST_KEY: "secret" },
+    });
+    const recorder = recordEvents(instance.adapter);
+    await instance.adapter.sendTurn({ threadId: "stream-error", text: "hi", model: "fake-model" });
+    const completed = await recorder.until((event) => event.type === "turn.completed");
+    expect(completed).toMatchObject({ ok: false, usage: { input: 20, output: 9, cachedInput: 6 } });
+    expect(recorder.events.filter((event) => event.type === "turn.completed")).toHaveLength(1);
+    expect(JSON.stringify(recorder.events)).not.toContain("private request detail");
+    recorder.stop();
+    await instance.dispose();
+  });
+
+  // 120s is this driver's IDLE budget now, not its whole-request ceiling:
+  // bytes on the wire keep a round alive, silence ends it.  Fake timers so
+  // the minutes are not real.
+  describe("the 120s idle budget", () => {
+    const enc = new TextEncoder();
+    const streamingFetch = (script: (controller: ReadableStreamDefaultController<Uint8Array>) => void) =>
+      vi.fn(async (_input: unknown, init?: RequestInit) => {
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            // Real fetch rejects a pending read once its signal aborts.
+            init?.signal?.addEventListener("abort", () => controller.error(new DOMException("aborted", "AbortError")));
+            script(controller);
+          },
+        });
+        return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
+      });
+    const createIdle = (instanceId: string) =>
+      OpenAICompatDriver.create({
+        instanceId,
+        displayName: "Idle budget",
+        enabled: true,
+        config: { url: "https://example.test/v1", apiKeyEnv: "TEST_KEY", models: ["fake-model"] },
+        environment: { TEST_KEY: "secret" },
+      });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("does not abort a stream that is still delivering bytes at 130s", async () => {
+      vi.useFakeTimers();
+      // SSE comment keep-alives only — nothing the reader turns into a
+      // delta — until the answer lands at 140s.  Only raw-chunk liveness
+      // explains this round surviving past 120s.
+      const fetchMock = streamingFetch((controller) => {
+        for (let at = 20_000; at <= 130_000; at += 20_000) {
+          setTimeout(() => controller.enqueue(enc.encode(": keep-alive\n")), at);
+        }
+        setTimeout(() => {
+          controller.enqueue(enc.encode('data: {"choices":[{"delta":{"content":"late but live"}}]}\n'));
+          controller.enqueue(enc.encode("data: [DONE]\n"));
+          controller.close();
+        }, 140_000);
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      const instance = await createIdle("idle-live");
+      const recorder = recordEvents(instance.adapter);
+      try {
+        await instance.adapter.sendTurn({ threadId: "idle-live", text: "hi", model: "fake-model" });
+        const completed = recorder.until((event) => event.type === "turn.completed", 1_000_000);
+        await vi.advanceTimersByTimeAsync(141_000);
+        expect(await completed).toMatchObject({ ok: true, stopReason: "end_turn" });
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+        expect(recorder.events.filter((e) => e.type === "runtime.error")).toHaveLength(0);
+      } finally {
+        recorder.stop();
+        await instance.dispose();
+      }
+    }, 20_000);
+
+    it("aborts after 125s of silence as a timeout", async () => {
+      vi.useFakeTimers();
+      // Headers, then nothing at all.
+      const fetchMock = streamingFetch(() => undefined);
+      vi.stubGlobal("fetch", fetchMock);
+      const instance = await createIdle("idle-silent");
+      const recorder = recordEvents(instance.adapter);
+      try {
+        await instance.adapter.sendTurn({ threadId: "idle-silent", text: "hi", model: "fake-model" });
+        const completed = recorder.until((event) => event.type === "turn.completed", 1_000_000);
+        await vi.advanceTimersByTimeAsync(125_000);
+        expect(await completed).toMatchObject({ ok: false, stopReason: "timeout" });
+        expect(recorder.events.find((e) => e.type === "runtime.error")).toMatchObject({
+          message: expect.stringContaining("the model did not answer within 120s"),
+        });
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+      } finally {
+        recorder.stop();
+        await instance.dispose();
+      }
+    }, 20_000);
+  });
+
+  it("rejects an invalid dispatch before starting a turn", async () => {
+    const instance = await OpenAICompatDriver.create({
+      instanceId: "openaiCompat",
+      displayName: "Missing key",
+      enabled: true,
+      config: { url: "https://example.test/v1", apiKeyEnv: "MISSING_TEST_KEY", models: ["fake-model"] },
+      environment: {},
+    });
+    const recorder = recordEvents(instance.adapter);
+
+    await expect(instance.adapter.sendTurn({ threadId: "rejected", text: "hi" })).rejects.toThrow(/no API key/);
+    expect(recorder.events).toEqual([]);
+    expect(instance.adapter.hasSession("rejected")).toBe(false);
+    recorder.stop();
+    await instance.dispose();
+  });
+
+  it("caps an oversized transcript before folding it into the chat-completions payload", async () => {
+    // Same intent as the matching tests on grok.ts and minimax.ts: the
+    // Codex review's replay-without-byte-limit finding applies equally to
+    // any chat-completions driver that re-uploads the prefix every round.
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/models")) {
+        return new Response(JSON.stringify({ data: [] }), { status: 200 });
+      }
+      bodies.push(JSON.parse(String(init?.body)));
+      return new Response(
+        'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: {"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1}}\n\ndata: [DONE]\n\n',
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      );
+    }));
+    const instance = await OpenAICompatDriver.create({
+      instanceId: "openai-compat-cap",
+      displayName: "Cap Test",
+      enabled: true,
+      config: { url: "https://example.com/v1", apiKeyEnv: "OPENAI_COMPAT_API_KEY", key: "test-key" },
+      environment: {},
+    });
+    try {
+      const big = "x".repeat(5_000);
+      const transcript = Array.from({ length: 80 }, () => ({ role: "user" as const, text: big }));
+      await instance.adapter.sendTurn({ threadId: "t-cap", transcript, text: "hi" });
+      // The /models probe + the completion = 2 calls.  Body[0] is /models,
+      // body[1] is the chat-completions request.
+      await new Promise((r) => setTimeout(r, 50));
+      const body = bodies.find((b: any) => Array.isArray(b.messages));
+      expect(body).toBeDefined();
+      const userMsgs = body.messages.filter((m: any) => m.role === "user");
+      expect(userMsgs.length).toBeLessThan(80);
+      const total = userMsgs.reduce(
+        (s: number, m: any) => s + (typeof m.content === "string" ? m.content.length : 0),
+        0,
+      );
+      expect(total).toBeLessThan(80 * 5_000);
+    } finally {
+      await instance.dispose();
+    }
+  });
+
+  it("heads the request with the stable half and carries the volatile half on the newest user message", async () => {
+    // Upstream PR #1758, HTTP half: the system message is the head of the
+    // resent prefix, so only the stable half belongs there, and the volatile
+    // half (memory, mentions) rides the newest user message every request.
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/models")) {
+        return new Response(JSON.stringify({ data: [] }), { status: 200 });
+      }
+      bodies.push(JSON.parse(String(init?.body)));
+      return new Response(
+        'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: {"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1}}\n\ndata: [DONE]\n\n',
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      );
+    }));
+    const instance = await OpenAICompatDriver.create({
+      instanceId: "openai-compat-split",
+      displayName: "Split Test",
+      enabled: true,
+      config: { url: "https://example.com/v1", apiKeyEnv: "OPENAI_COMPAT_API_KEY", key: "test-key" },
+      environment: {},
+    });
+    const recorder = recordEvents(instance.adapter);
+    try {
+      await instance.adapter.sendTurn({
+        threadId: "t-split",
+        system: "You are a test bot. Memory: likes tea.",
+        systemStable: "You are a test bot.",
+        systemVolatile: " Memory: likes tea.",
+        transcript: [{ role: "user", text: "earlier" }, { role: "assistant", text: "noted" }],
+        text: "Summarize it.",
+      });
+      await recorder.until((event) => event.type === "turn.completed");
+      const body = bodies.find((b: any) => Array.isArray(b.messages));
+      expect(body.messages).toEqual([
+        { role: "system", content: "You are a test bot." },
+        { role: "user", content: "earlier" },
+        { role: "assistant", content: "noted" },
+        { role: "user", content: `${VOLATILE_CONTEXT_NOTE_PREFIX}\n\nMemory: likes tea.\n\nSummarize it.` },
+      ]);
+
+      // a legacy unsplit turn keeps its whole prompt in the system message
+      await instance.adapter.sendTurn({ threadId: "t-unsplit", system: "You are a test bot. Memory: likes tea.", text: "hi" });
+      await recorder.until((event) => event.type === "turn.completed" && event.threadId === "t-unsplit");
+      const legacy = bodies.filter((b: any) => Array.isArray(b.messages)).at(-1);
+      expect(legacy.messages).toEqual([
+        { role: "system", content: "You are a test bot. Memory: likes tea." },
+        { role: "user", content: "hi" },
+      ]);
+    } finally {
+      recorder.stop();
+      await instance.dispose();
+    }
+  });
+});
+
+describe("Sentry provider for an OpenAI-compatible endpoint", () => {
+  it("names the vendor actually answering, not the wire shape", () => {
+    expect(sentryProviderForUrl("https://openrouter.ai/api/v1")).toBe("openrouter");
+    expect(sentryProviderForUrl("https://api.groq.com/openai/v1")).toBe("groq");
+    expect(sentryProviderForUrl("https://api.openai.com/v1")).toBe("openai");
+  });
+
+  it("falls back to openai-compat for anything else, matching on host only", () => {
+    expect(sentryProviderForUrl("http://127.0.0.1:8080/v1")).toBe("openai-compat");
+    expect(sentryProviderForUrl("https://together.xyz/v1")).toBe("openai-compat");
+    // A look-alike host must not be read as the real one.
+    expect(sentryProviderForUrl("https://openrouter.ai.example.com/v1")).toBe("openai-compat");
+    expect(sentryProviderForUrl("https://notgroq.com/v1")).toBe("openai-compat");
+    expect(sentryProviderForUrl("not a url")).toBe("openai-compat");
   });
 });

@@ -196,7 +196,9 @@ async function handle(message: Json): Promise<void> {
     if (id === undefined) return;
     const messageText = error instanceof Error ? error.message : String(error);
     if (method === "tools/call") send(textResult(id, messageText, true));
-    else send(jsonRpcError(id, messageText));
+    else if (method === "tools/list" && /HTTP (?:401|403)/i.test(messageText)) {
+      send({ jsonrpc: "2.0", id, result: { tools: [] } });
+    } else send(jsonRpcError(id, messageText));
   }
 }
 
@@ -215,7 +217,9 @@ input.on("line", (line) => {
     const method = String(message.method ?? "");
     const messageText = error instanceof Error ? error.message : String(error);
     if (method === "tools/call") send(textResult(message.id, messageText, true));
-    else send(jsonRpcError(message.id, messageText));
+    else if (method === "tools/list" && /HTTP (?:401|403)/i.test(messageText)) {
+      send({ jsonrpc: "2.0", id: message.id, result: { tools: [] } });
+    } else send(jsonRpcError(message.id, messageText));
   });
 });
 input.on("close", () => process.exit(0));

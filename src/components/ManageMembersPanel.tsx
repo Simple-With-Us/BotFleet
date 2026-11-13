@@ -1,5 +1,5 @@
 // Edit an existing room's roster: the same picker "New Room" uses, opened
-// from the member mauses in the room header and pre-ticked with who is
+// from the member bots in the room header and pre-ticked with who is
 // already in. Membership is the only thing this touches — the transcript
 // keeps every message a departing bot already sent.
 import { useEffect, useMemo, useRef, useState, type RefObject } from "react";
@@ -112,7 +112,7 @@ export function ManageMembersPanel({
         className="w-[340px] rounded-2xl border border-hairline/50 bg-card p-4 shadow-2xl"
       >
         <div className="mb-1 text-[15px] font-semibold text-ink">Manage Members</div>
-        <div className="mb-3 truncate text-[13px] text-ink-secondary">{group.name}</div>
+        <div className="mb-3 truncate text-[13px] text-ink-secondary" title={group.name}>{group.name}</div>
         <BotPickerList bots={bots} picked={picked} onToggle={toggle} emptyHint="Create a bot first — channels are made of bots." />
         {!memberIds.length && <div className="mt-2 text-[12px] text-ink-secondary">A channel needs at least one bot.</div>}
         {saveError && (

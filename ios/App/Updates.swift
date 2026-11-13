@@ -41,10 +41,10 @@ extension CompanionState {
             guard !seen.contains(chat.id) else { continue }
             if bot.busy == true {
                 seen.insert(chat.id)
-                out.append(ChatUpdate(chat: chat, kind: .working, line: workingLine(threadId: bot.threadId), card: nil))
+                out.append(ChatUpdate(chat: chat, kind: .working, line: workingLine(chat: chat), card: nil))
             } else if bot.unread {
                 seen.insert(chat.id)
-                out.append(ChatUpdate(chat: chat, kind: .toReview, line: lastLine(threadId: bot.threadId), card: nil))
+                out.append(ChatUpdate(chat: chat, kind: .toReview, line: lastLine(chat: chat), card: nil))
             }
         }
         for room in rooms {
@@ -52,10 +52,10 @@ extension CompanionState {
             guard !seen.contains(chat.id) else { continue }
             if room.busyBotId != nil {
                 seen.insert(chat.id)
-                out.append(ChatUpdate(chat: chat, kind: .working, line: workingLine(threadId: room.threadId), card: nil))
+                out.append(ChatUpdate(chat: chat, kind: .working, line: workingLine(chat: chat), card: nil))
             } else if room.unread {
                 seen.insert(chat.id)
-                out.append(ChatUpdate(chat: chat, kind: .toReview, line: lastLine(threadId: room.threadId), card: nil))
+                out.append(ChatUpdate(chat: chat, kind: .toReview, line: lastLine(chat: chat), card: nil))
             }
         }
         return out.sorted { $0.kind < $1.kind }
@@ -67,18 +67,28 @@ extension CompanionState {
         return nil
     }
 
-    private func workingLine(threadId: String) -> String {
-        if let live = streaming[threadId], !live.isEmpty {
-            return String(live.suffix(120)).replacingOccurrences(of: "\n", with: " ")
+    private func workingLine(chat: Chat) -> String {
+        let threadIds: [String]
+        switch chat {
+        case let .bot(bot): threadIds = [bot.threadId] + (bot.tasks ?? []).map(\.threadId)
+        case let .room(room): threadIds = [room.threadId]
         }
-        if let last = visibleTranscript(forThread: threadId).last, last.kind == .activity, let tool = last.tool {
+        
+        for threadId in threadIds {
+            if let live = streaming[threadId], !live.isEmpty {
+                return String(live.suffix(120)).replacingOccurrences(of: "\n", with: " ")
+            }
+        }
+        
+        let last = newestLoadedMessage(for: chat)
+        if let last = last, last.kind == .activity, let tool = last.tool {
             return tool.name
         }
         return "Working…"
     }
 
-    private func lastLine(threadId: String) -> String {
-        guard let last = visibleTranscript(forThread: threadId).last else { return "" }
+    private func lastLine(chat: Chat) -> String {
+        guard let last = newestLoadedMessage(for: chat) else { return "" }
         switch last.kind {
         case .text, .unknown: return last.text ?? ""
         case .options: return last.card?.title ?? ""

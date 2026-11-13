@@ -15,21 +15,56 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
-import { LICENSE_FILES } from "./cua-linux-release.mjs";
+import {
+  LICENSE_FILES,
+  linuxCuaDriverManifestFailureMessage,
+  linuxCuaDriverVersionFailureMessage,
+  probeLinuxCuaDriverManifest,
+  probeLinuxCuaDriverVersion,
+} from "./cua-linux-release.mjs";
+import { nativeProbeFailureMessage, probeNativeSync } from "./native-version-probe.mjs";
 import {
   CLOUDFLARED_ASSETS,
-  CLOUDFLARED_VERSION,
   executableTarget,
+  probePinnedVersion,
+  versionProbeFailureMessage,
 } from "./prepare-cloudflared.mjs";
 
 const require = createRequire(import.meta.url);
 const { validateDriverCandidate } = require("../electron/cua-linux.cjs");
+const electronBuilderRoot = path.dirname(require.resolve("electron-builder/package.json"));
+const appBuilderVersion = require(
+  require.resolve("app-builder-lib/package.json", { paths: [electronBuilderRoot] }),
+).version;
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const releaseDir = path.resolve(process.argv[2] ?? path.join(root, "release"));
 
 function fail(message) {
   throw new Error(`[verify-linux-package] ${message}`);
+}
+
+function verifyAppBuilderVersion() {
+  const [major, minor] = appBuilderVersion.split(".").map(Number);
+  if (
+    !Number.isInteger(major) ||
+    !Number.isInteger(minor) ||
+    major < 26 ||
+    (major === 26 && minor < 15)
+  ) {
+    fail(`app-builder-lib ${appBuilderVersion} is below the patched 26.15.0 floor`);
+  }
+}
+
+function verifyAppImageLauncher(appRun) {
+  requireFile(appRun);
+  const launcher = readFileSync(appRun, "utf8");
+  for (const variable of ["LD_LIBRARY_PATH", "PATH", "XDG_DATA_DIRS", "GSETTINGS_SCHEMA_DIR"]) {
+    const safeExpansion = `\${${variable}:+:\${${variable}}}`;
+    if (!launcher.includes(safeExpansion) || launcher.includes(`:\${${variable}}"`)) {
+      fail(`AppRun does not guard the ${variable} separator when the variable is unset`);
+    }
+  }
 }
 
 function exactlyOne(suffix) {
@@ -243,40 +278,13 @@ function verifyCuaResources(resources, label, {
     if (actual !== expected) fail(`${label} has the wrong hash for ${path.basename(file)}: ${actual}`);
   }
 
-  const commandEnvironment = {
-    LANG: "C",
-    LC_ALL: "C",
-    CUA_DRIVER_RS_UPDATE_CHECK: "false",
-    CUA_DRIVER_RS_TELEMETRY_ENABLED: "false",
-  };
-  const version = execFileSync(driver, ["--version"], {
-    encoding: "utf8",
-    env: commandEnvironment,
-    timeout: 5_000,
-  }).trim();
-  if (version !== "cua-driver 0.19.3") fail(`${label} CUA version is ${JSON.stringify(version)}`);
-  const manifest = JSON.parse(
-    execFileSync(driver, ["manifest"], {
-      encoding: "utf8",
-      env: commandEnvironment,
-      timeout: 5_000,
-      maxBuffer: 256 * 1024,
-    }),
-  );
-  const invocationCommand = manifest.mcp_invocation?.command;
-  let invocationPath = null;
-  if (typeof invocationCommand === "string" && invocationCommand.length > 0) {
-    try {
-      invocationPath = realpathSync(invocationCommand);
-    } catch {}
+  const versionProbe = probeLinuxCuaDriverVersion(driver, { log: () => {} });
+  if (!versionProbe.ok) {
+    fail(`${label}: ${linuxCuaDriverVersionFailureMessage(driver, versionProbe)}`);
   }
-  if (
-    manifest.schema_version !== "1" ||
-    manifest.binary_version !== "0.19.3" ||
-    invocationPath !== realpathSync(driver) ||
-    JSON.stringify(manifest.mcp_invocation?.args) !== JSON.stringify(["mcp"])
-  ) {
-    fail(`${label} CUA manifest does not match the packaged executable`);
+  const manifestProbe = probeLinuxCuaDriverManifest(driver, realpathSync(driver), { log: () => {} });
+  if (!manifestProbe.ok) {
+    fail(`${label}: ${linuxCuaDriverManifestFailureMessage(driver, manifestProbe)}`);
   }
 
   for (const name of LICENSE_FILES) {
@@ -342,12 +350,13 @@ function verifyCloudflaredResources(resources, label, { directoryMode = 0o755 } 
   if (executableTarget(readFileSync(executable)) !== "linux-x64") {
     fail(`${label} cloudflared does not contain the reviewed Linux x64 executable`);
   }
-  const version = execFileSync(executable, ["version"], {
-    encoding: "utf8",
-    timeout: 5_000,
-  }).trim();
-  if (!version.startsWith(`cloudflared version ${CLOUDFLARED_VERSION} `)) {
-    fail(`${label} cloudflared version is ${JSON.stringify(version)}`);
+  // probePinnedVersion hard-sets matchVersion to matchCloudflaredVersionLine
+  // (prepare-cloudflared.mjs); a caller matcher here would be silently discarded.
+  const cloudflaredProbe = probePinnedVersion(executable, {
+    log: () => {},
+  });
+  if (!cloudflaredProbe.ok) {
+    fail(`${label}: ${versionProbeFailureMessage("linux-x64", cloudflaredProbe)}`);
   }
 
   const licenses = path.join(resources, "licenses");
@@ -375,6 +384,7 @@ const unpacked = path.join(releaseDir, "linux-unpacked");
 const executable = path.join(unpacked, "botfleet");
 const resources = path.join(unpacked, "resources");
 
+verifyAppBuilderVersion();
 requireExecutable(appImage);
 requireExecutable(executable);
 requireDirectoryMode(unpacked, 0o755);
@@ -394,10 +404,12 @@ const fields = execFileSync(
   ["--field", deb, "Package", "Version", "Architecture", "Maintainer", "Section", "Priority"],
   { encoding: "utf8" },
 );
+// Maintainer must match electron-builder.yml `linux.maintainer` (the owner,
+// not the upstream fork author); dpkg-deb reports the full "Name <email>".
 for (const expected of [
   "Package: botfleet",
   "Architecture: amd64",
-  "Maintainer: Milind Soni",
+  "Maintainer: Jay Wedgeworth",
   "Section: utils",
   "Priority: optional",
 ]) {
@@ -452,11 +464,23 @@ try {
 
 const appImageExtracted = mkdtempSync(path.join(tmpdir(), "omb-appimage-verify-"));
 try {
-  const offset = execFileSync(appImage, ["--appimage-offset"], {
-    encoding: "utf8",
-    timeout: 10_000,
-  }).trim();
-  if (!/^\d+$/.test(offset)) fail(`AppImage returned an invalid SquashFS offset: ${offset}`);
+  const offsetProbe = probeNativeSync(appImage, {
+    args: ["--appimage-offset"],
+    log: () => {},
+    probeLabel: "AppImage offset probe",
+    matchVersion: (output) => {
+      const offset = String(output ?? "").trim();
+      return /^\d+$/.test(offset) ? offset : null;
+    },
+  });
+  if (!offsetProbe.ok) {
+    fail(
+      nativeProbeFailureMessage("AppImage --appimage-offset did not complete", offsetProbe, {
+        causes: { version: () => "it did not print a numeric SquashFS offset" },
+      }),
+    );
+  }
+  const offset = offsetProbe.version;
   const squashRoot = path.join(appImageExtracted, "squashfs-root");
   execFileSync(
     "unsquashfs",
@@ -470,6 +494,7 @@ try {
     );
   }
   const appImageResources = path.join(squashRoot, "resources");
+  verifyAppImageLauncher(path.join(squashRoot, "AppRun"));
   // Depending on the pinned appimagetool runtime, SquashFS directories are
   // emitted as root:root 0755 or 0775. Require one mode consistently across
   // the reviewed resource tree. The app never executes through that path:
@@ -494,4 +519,7 @@ try {
   rmSync(appImageExtracted, { recursive: true, force: true });
 }
 
-console.log(`[verify-linux-package] OK\n- ${path.basename(appImage)}\n- ${path.basename(deb)}`);
+console.log(
+  `[verify-linux-package] OK (app-builder-lib ${appBuilderVersion})\n` +
+    `- ${path.basename(appImage)}\n- ${path.basename(deb)}`,
+);

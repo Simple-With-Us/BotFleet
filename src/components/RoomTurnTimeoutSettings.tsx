@@ -3,6 +3,8 @@ import { useEffect, useRef, useState } from "react";
 import {
   MAX_ROOM_TURN_TIMEOUT_MINUTES,
   MIN_ROOM_TURN_TIMEOUT_MINUTES,
+  RECOMMENDED_TURN_TIMEOUT_MAX_MINUTES,
+  RECOMMENDED_TURN_TIMEOUT_MIN_MINUTES,
   createExclusiveSaveGate,
   saveRoomTurnTimeoutMinutes,
 } from "@/lib/room-turn-timeout";
@@ -85,7 +87,7 @@ export function RoomTurnTimeoutSettings() {
         <span className="pr-3 text-[13px] text-ink-secondary">minutes</span>
       </div>
       <p id="room-turn-timeout-help" className="text-[12px] leading-relaxed text-ink-secondary">
-        Applies to every bot turn in channels. Direct chats use the inactivity watchdog instead.
+        Applies to every bot turn in channels.{"\u00A0 "}Range is {MIN_ROOM_TURN_TIMEOUT_MINUTES}–{MAX_ROOM_TURN_TIMEOUT_MINUTES} minutes (about {MIN_ROOM_TURN_TIMEOUT_MINUTES} minute to {Math.round(MAX_ROOM_TURN_TIMEOUT_MINUTES / 60)} hours);{"\u00A0 "}the recommended band for typical work is {RECOMMENDED_TURN_TIMEOUT_MIN_MINUTES}–{RECOMMENDED_TURN_TIMEOUT_MAX_MINUTES} minutes.{"\u00A0 "}Direct chats use the inactivity watchdog instead.
       </p>
       {error ? (
         <p id="room-turn-timeout-error" role="alert" className="text-[12px] text-danger">

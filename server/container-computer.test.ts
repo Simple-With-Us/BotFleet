@@ -1,36 +1,91 @@
 import { describe, expect, it } from "vitest";
+import { createServer } from "node:net";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, isAbsolute, join, relative } from "node:path";
 
+import { DATA_DIR } from "./config.ts";
+import { credentialMountStagingRoot } from "./vm-cli-credentials.ts";
 import {
   BASE_IMAGE,
   BASE_IMAGE_DIGEST,
   BASE_IMAGE_LABEL,
+  BOX_GATEWAY_PATH,
   CONTAINER,
   CUA_DRIVER_VERSION,
   CUA_EXECUTABLE,
   CUA_SOCKET,
   DRIVER_LABEL,
+  HOST_GATEWAY_BLACKHOLE,
   IMAGE,
   IMAGE_LAYER_LABEL,
   IMAGE_LAYER_VERSION,
+  LEGACY_VM_WORKSPACE_DIR,
   MANAGED_LABEL,
   TARGET_LABEL,
   VM_WORKSPACE_DIR,
   VM_WORKSPACE_GUEST,
+  VM_WORKSPACE_ROOT,
   WORKSPACE_LABEL,
+  DEFAULT_CONTAINER_LIMITS,
+  LEGACY_UNLABELED_CONTAINER_LIMITS,
+  LIMITS_LABEL,
+  RUNTIME_PROBE_ATTEMPTS,
+  RUNTIME_PROBE_TIMEOUT_MS,
+  adaptContainerLimits,
+  localVmHostCapacityError,
+  declaredHardening,
+  authorizeBoxGateway,
+  defaultCommandRunner,
+  healCuaShimsScript,
+  limitsFromLabels,
+  redactSecrets,
+  readRuntimeHost,
+  resolveContainerLimits,
+  boxGatewayUrl,
   computerProxyEnv,
   containerComputerAction,
+  createStoppedSharedLocalVm,
   containerComputerMcp,
   containerComputerScreenshot,
   containerComputerStatus,
+  containerProbeContext,
+  wakeContainerComputer,
+  containerNetworkArgs,
   containerRuntimeStatus,
   containerRunArgs,
+  hostCliCredentialMounts,
+  handleBoxGatewayRequest,
   managedImageDockerfile,
+  migrateVmWorkspace,
+  mintBoxGatewayGrant,
+  resetBoxGatewayGrants,
+  revokeBoxGatewayGrant,
+  SHARED_LOCAL_VM_TARGET,
+  localVmModeSwitchTargets,
+  legacyVmWorkspaceDir,
   perBotLocalVmTarget,
   podmanSecurityIsHardened,
   setupCommands,
+  shellWord,
+  workspaceSources,
   type CommandRunner,
   type LocalVmTarget,
 } from "./container-computer.ts";
+
+function bindMountSpecs(args: string[]): string[] {
+  return args.filter((entry) => entry.startsWith("type=bind,"));
+}
+
+function expectBindMount(args: string[], guestTarget: string, sourcePath: string): void {
+  const mount = bindMountSpecs(args).find((entry) => entry.includes(`target=${guestTarget},readonly`));
+  expect(mount).toBeDefined();
+  const normalize = (value: string) =>
+    process.platform === "win32"
+      ? value.replaceAll("\\", "/").toLowerCase()
+      : value.replaceAll("\\", "/");
+  expect(normalize(mount!).includes(normalize(sourcePath))).toBe(true);
+}
 
 function runner(responses: Record<string, string | Error>) {
   const calls: string[] = [];
@@ -44,6 +99,59 @@ function runner(responses: Record<string, string | Error>) {
     return { stdout: response };
   };
   return { calls, run };
+}
+
+/** The answers a fake runner serves, keyed by the exact command line.
+ *
+ *  A named contract rather than a bare `Record<string, ...>`: the lint
+ *  ratchet treats an open dictionary annotation on a binding as throwing
+ *  away known type evidence, and a named owner keeps the index signature
+ *  while saying what the map holds. */
+interface ProbeResponses {
+  [command: string]: string | Error;
+}
+
+const DOCKER_PROBE = "docker info --format {{.ServerVersion}}";
+
+/** What `execFile` rejects with when its `timeout` kills the child: `killed`
+ * and `signal` set, no exit code, and a "Command failed:" message that never
+ * says "timed out". */
+function probeTimeout(command = DOCKER_PROBE): Error {
+  return Object.assign(new Error(`Command failed: ${command}`), { killed: true, signal: "SIGTERM", code: null });
+}
+
+/** The error a stopped daemon gives at once, which is an answer rather than a
+ * timeout. */
+function daemonRefused(): Error {
+  return Object.assign(
+    new Error("Command failed: docker info\nCannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?"),
+    { code: 1 },
+  );
+}
+
+/** A runner whose answers to one command arrive in order (the last repeats),
+ * recording every call with the timeout it was given. */
+function sequencedRunner(sequences: Record<string, Array<string | Error>>) {
+  const calls: Array<{ key: string; timeout: number | undefined }> = [];
+  const used = new Map<string, number>();
+  const run: CommandRunner = async (command, args, timeout) => {
+    const key = [command, ...args].join(" ");
+    calls.push({ key, timeout });
+    const outcomes = sequences[key];
+    if (!outcomes) throw new Error(`unexpected command: ${key}`);
+    const index = Math.min(used.get(key) ?? 0, outcomes.length - 1);
+    used.set(key, (used.get(key) ?? 0) + 1);
+    const outcome = outcomes[index]!;
+    if (outcome instanceof Error) throw outcome;
+    return { stdout: outcome };
+  };
+  return {
+    calls,
+    run,
+    keys: () => calls.map((call) => call.key),
+    count: (key: string) => calls.filter((call) => call.key === key).length,
+    timeouts: (key: string) => calls.filter((call) => call.key === key).map((call) => call.timeout),
+  };
 }
 
 const driverExec =
@@ -97,9 +205,9 @@ function readyInspect(overrides: Record<string, unknown> = {}) {
       // the full hardened HostConfig the stricter shared check now demands:
       // unprivileged, private IPC/cgroup namespaces, pinned shm, no devices
       HostConfig: {
-        Memory: 4 * 1024 * 1024 * 1024,
-        MemorySwap: 4 * 1024 * 1024 * 1024,
-        NanoCpus: 2_000_000_000,
+        Memory: 8 * 1024 * 1024 * 1024,
+        MemorySwap: 8 * 1024 * 1024 * 1024,
+        NanoCpus: 4_000_000_000,
         PidsLimit: 512,
         CapDrop: ["ALL"],
         CapAdd: ["CAP_SETUID", "CAP_SETGID"],
@@ -204,9 +312,9 @@ describe("containerComputerStatus", () => {
 
   it("rejects extra effective or bounding capabilities in Podman inspect output", () => {
     const config = {
-      Memory: 4 * 1024 * 1024 * 1024,
-      MemorySwap: 4 * 1024 * 1024 * 1024,
-      NanoCpus: 2_000_000_000,
+      Memory: 8 * 1024 * 1024 * 1024,
+      MemorySwap: 8 * 1024 * 1024 * 1024,
+      NanoCpus: 4_000_000_000,
       PidsLimit: 512,
       CapDrop: ["CAP_CHOWN"],
       CapAdd: [],
@@ -326,7 +434,7 @@ describe("containerComputerStatus", () => {
         {
           configuration: {
             image: { reference: IMAGE, descriptor: { digest: "sha256:managed-image-id" } },
-            resources: { cpus: 2, memoryInBytes: 4 * 1024 * 1024 * 1024 },
+            resources: { cpus: 4, memoryInBytes: 8 * 1024 * 1024 * 1024 },
             publishedPorts: [{ hostAddress: "127.0.0.1", containerPort: 6901 }],
             labels: {
               [MANAGED_LABEL]: "1",
@@ -358,9 +466,9 @@ describe("containerComputerStatus", () => {
       [`docker image inspect ${IMAGE}`]: preparedImageInspect(),
       [`docker inspect ${CONTAINER}`]: readyInspect({
         HostConfig: {
-          Memory: 4 * 1024 * 1024 * 1024,
-          MemorySwap: 4 * 1024 * 1024 * 1024,
-          NanoCpus: 2_000_000_000,
+          Memory: 8 * 1024 * 1024 * 1024,
+          MemorySwap: 8 * 1024 * 1024 * 1024,
+          NanoCpus: 4_000_000_000,
           PidsLimit: 512,
           CapDrop: ["ALL"],
           CapAdd: ["CAP_SETUID", "CAP_SETGID"],
@@ -468,7 +576,7 @@ describe("containerComputerStatus", () => {
 
   it("reports the bounded desktop startup error instead of waiting forever", async () => {
     const errorProbe =
-      `docker exec ${CONTAINER} tail -n 4 /var/log/supervisor/cua-driver.error.log`;
+      `docker exec ${CONTAINER} tail -n 12 /var/log/supervisor/cua-driver.error.log`;
     const fake = runner({
       "/usr/bin/which docker": "docker\n",
       "/usr/bin/which podman": new Error("missing"),
@@ -486,8 +594,71 @@ describe("containerComputerStatus", () => {
     expect(status.problem).toContain("desktop failed to start");
   });
 
+  describe("a failed desktop probe never blames the Driver's normal startup output", () => {
+    const ESC = "\u001b";
+    const errorProbe = `docker exec ${CONTAINER} tail -n 12 /var/log/supervisor/cua-driver.error.log`;
+    const healthyLog = [
+      "cua-driver v0.34.0 is available (you have v0.20.0)",
+      "   Update with: cua-driver update",
+      "   Release notes: https://github.com/trycua/cua/releases/tag/cua-driver-rs-v0.34.0",
+      `${ESC}[2m2026-10-07T13:54:42.869037Z${ESC}[0m ${ESC}[33m WARN${ESC}[0m ${ESC}[2mplatform_linux::overlay${ESC}[0m${ESC}[2m:${ESC}[0m X11 overlay: root reads cannot see this window's own pixels`,
+      "Cua Driver daemon listening on /opt/ogb/run/cua.sock",
+    ].join("\n");
+
+    function statusWith(probes: Record<string, string | Error>) {
+      const fake = runner({
+        "/usr/bin/which docker": "docker\n",
+        "/usr/bin/which podman": new Error("missing"),
+        "docker info --format {{.ServerVersion}}": "29\n",
+        [`docker image inspect ${IMAGE}`]: preparedImageInspect(),
+        [`docker inspect ${CONTAINER}`]: readyInspect(),
+        ...probes,
+      });
+      return containerComputerStatus(fake.run, "linux");
+    }
+
+    it("shows no banner, no WARN and no escape codes when the log is only startup noise", async () => {
+      const status = await statusWith({
+        [versionProbe]: `cua-driver ${CUA_DRIVER_VERSION}\n`,
+        [statusProbe]: "running\n",
+        [healthProbe]: JSON.stringify({ schema_version: "1", overall: "failed", checks: [] }),
+        [errorProbe]: healthyLog,
+      });
+      expect(status.desktopReady).toBe(false);
+      expect(status.problem).toBe("The Local VM desktop failed to start: CUA health report is failed");
+      for (const noise of ["Release notes", "WARN", "overlay", "listening", "[2m", "[0m", ESC]) {
+        expect(status.problem).not.toContain(noise);
+      }
+    });
+
+    it("reports a probe killed by its timeout as a transient check failure", async () => {
+      const killed = Object.assign(new Error(`Command failed: ${versionProbe}`), {
+        killed: true,
+        signal: "SIGTERM",
+        code: null,
+      });
+      const status = await statusWith({ [versionProbe]: killed, [errorProbe]: killed });
+      expect(status.container).toBe("running");
+      expect(status.desktopReady).toBe(false);
+      expect(status.desktop_error).toBeNull();
+      expect(status.desktopUnreachable).toBe(true);
+      expect(status.ready).toBe(false);
+      expect(status.problem).toBe("Couldn't reach the Local VM desktop just now; retrying");
+    });
+
+    it("still reports a real supervisor fault, with its colour stripped", async () => {
+      const status = await statusWith({
+        [versionProbe]: new Error("driver unavailable"),
+        [errorProbe]: `${healthyLog.split("\n")[0]}\n${ESC}[31m2026-10-07T13:56:00Z ERROR${ESC}[0m cua_driver: worker panicked`,
+      });
+      expect(status.problem).toBe(
+        "The Local VM desktop failed to start: 2026-10-07T13:56:00Z ERROR cua_driver: worker panicked",
+      );
+    });
+  });
+
   it("does not report ready when the driver's health contract fails", async () => {
-    const errorProbe = `docker exec ${CONTAINER} tail -n 4 /var/log/supervisor/cua-driver.error.log`;
+    const errorProbe = `docker exec ${CONTAINER} tail -n 12 /var/log/supervisor/cua-driver.error.log`;
     const fake = runner({
       "/usr/bin/which docker": "docker\n",
       "/usr/bin/which podman": new Error("missing"),
@@ -525,7 +696,7 @@ describe("containerComputerStatus", () => {
 
     expect(status.imageMatches).toBe(false);
     expect(status.ready).toBe(false);
-    expect(status.problem).toContain("older desktop or Cua Driver");
+    expect(status.problem).toContain("older desktop or CUA Driver");
     expect(fake.calls).not.toContain(versionProbe);
   });
 
@@ -543,7 +714,7 @@ describe("containerComputerStatus", () => {
     expect(status.image_id).toBe("managed-image-id");
     expect(status.imageMatches).toBe(false);
     expect(status.ready).toBe(false);
-    expect(status.problem).toContain("older desktop or Cua Driver");
+    expect(status.problem).toContain("older desktop or CUA Driver");
   });
 
   it("does not treat an unlabelled image under the local tag as prepared", async () => {
@@ -558,19 +729,165 @@ describe("containerComputerStatus", () => {
     const status = await containerComputerStatus(fake.run, "linux");
 
     expect(status.image).toBe(false);
-    expect(status.problem).toContain("Prepare the Cua desktop image");
+    expect(status.problem).toContain("Prepare the CUA desktop image");
   });
 });
 
-describe("Cua integration", () => {
-  it("hands cloud credentials only to the isolated remote adapter", () => {
-    expect(computerProxyEnv({ boxId: "bx_1", token: "t" })).toEqual({
+describe("CUA integration", () => {
+  it("points the box proxy at the harness gateway instead of the account's Box API", () => {
+    // Repinned: the proxy used to receive the account-wide API key and talk
+    // to ascii.dev itself.  It now receives a per-mount grant and the
+    // loopback base that grant is only good at.
+    expect(
+      computerProxyEnv({
+        boxId: "bx_1",
+        token: "grant-value",
+        gatewayUrl: `http://127.0.0.1:8799${BOX_GATEWAY_PATH}`,
+        control: { url: "http://127.0.0.1:8799/api/internal/computer-control?botId=b1", token: "ctl" },
+      }),
+    ).toEqual({
+      OGB_BOX_API: `http://127.0.0.1:8799${BOX_GATEWAY_PATH}`,
       OGB_BOX_ID: "bx_1",
-      OGB_BOX_TOKEN: "t",
+      OGB_BOX_TOKEN: "grant-value",
+      OMB_CONTROL_URL: "http://127.0.0.1:8799/api/internal/computer-control?botId=b1",
+      OMB_CONTROL_TOKEN: "ctl",
     });
   });
 
-  it("mounts the official Cua MCP server for Local VM turns", () => {
+  it("derives the gateway base from the turn's own control endpoint", () => {
+    expect(boxGatewayUrl({ url: `http://127.0.0.1:8799/api/internal/computer-control?botId=b%201` })).toBe(
+      `http://127.0.0.1:8799${BOX_GATEWAY_PATH}`,
+    );
+    expect(boxGatewayUrl(undefined)).toBe("");
+    expect(boxGatewayUrl({ url: "not a url" })).toBe("");
+  });
+
+  it("keeps the VM workspace out of the tree the desktop app can open", () => {
+    // `resolveOpenablePath` (electron/open-file.mjs) confines every
+    // renderer-supplied path to DATA_DIR and then calls shell.openPath, so a
+    // workspace inside that tree is one click from a user.  The check is a
+    // path-segment test, not a string prefix: the new root's name starts with
+    // the old one ("~/.botfleet-vm"), which a prefix test would call inside.
+    const inside = (root: string, candidate: string) => {
+      const rel = relative(root, candidate);
+      return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+    };
+    expect(inside(DATA_DIR, VM_WORKSPACE_DIR)).toBe(false);
+    expect(inside(DATA_DIR, VM_WORKSPACE_ROOT)).toBe(false);
+    expect(inside(VM_WORKSPACE_ROOT, VM_WORKSPACE_DIR)).toBe(true);
+    expect(legacyVmWorkspaceDir(SHARED_LOCAL_VM_TARGET)).toBe(LEGACY_VM_WORKSPACE_DIR);
+    expect(legacyVmWorkspaceDir(perBotLocalVmTarget("bot-1"))).toBe(
+      join(DATA_DIR, "vm-homes", basename(perBotLocalVmTarget("bot-1").workspaceDir)),
+    );
+  });
+
+  it("accepts a running pre-move container as a correctly bound workspace", () => {
+    expect(workspaceSources(SHARED_LOCAL_VM_TARGET)).toEqual([VM_WORKSPACE_DIR, LEGACY_VM_WORKSPACE_DIR]);
+  });
+
+  it("names the host gateway blackhole per runtime instead of leaving the network implicit", () => {
+    // Podman on macOS and Windows: the only supported setups are `podman
+    // machine`, whose slirp4netns already denies host loopback — stated, not
+    // inherited.  Rootful Linux Podman has no slirp4netns, so the mode is
+    // left alone there.
+    expect(containerNetworkArgs("podman", "darwin")).toEqual([
+      "--network",
+      "slirp4netns:allow_host_loopback=false",
+      "--add-host",
+      `host.docker.internal:${HOST_GATEWAY_BLACKHOLE}`,
+      "--add-host",
+      `host.containers.internal:${HOST_GATEWAY_BLACKHOLE}`,
+    ]);
+    expect(containerNetworkArgs("podman", "linux")).not.toContain("--network");
+    expect(containerNetworkArgs("podman", "linux").join(" ")).toContain(
+      `--add-host host.docker.internal:${HOST_GATEWAY_BLACKHOLE}`,
+    );
+    // Docker and Colima share an engine: the bridge gateway is not removable
+    // by a run flag, so the names it answers to are pinned at a
+    // documentation-only address instead.
+    expect(containerNetworkArgs("docker", "darwin")).toEqual([
+      "--network",
+      "bridge",
+      "--add-host",
+      `host.docker.internal:${HOST_GATEWAY_BLACKHOLE}`,
+      "--add-host",
+      `host.containers.internal:${HOST_GATEWAY_BLACKHOLE}`,
+    ]);
+    // Apple's `container` CLI cannot be verified from this tree, so it is
+    // given no flag it might reject.
+    expect(containerNetworkArgs("container", "darwin")).toEqual([]);
+
+    const docker = containerRunArgs("docker", "pw", SHARED_LOCAL_VM_TARGET, "darwin");
+    expect(docker.join(" ")).toContain("--add-host host.docker.internal:203.0.113.1");
+    expect(containerRunArgs("podman", "pw", SHARED_LOCAL_VM_TARGET, "darwin").join(" ")).toContain(
+      "--network slirp4netns:allow_host_loopback=false",
+    );
+  });
+
+  it("mounts host CLI credentials into the guest when shareCliCredentials is enabled", () => {
+    const fakeHome = mkdtempSync(join(tmpdir(), "bf-cli-home-"));
+    mkdirSync(join(fakeHome, ".config", "gh"), { recursive: true });
+    mkdirSync(join(fakeHome, ".config", "infisical"), { recursive: true });
+    mkdirSync(join(fakeHome, ".infisical"), { recursive: true });
+    mkdirSync(join(fakeHome, ".ssh"), { recursive: true });
+    mkdirSync(join(fakeHome, ".docker"), { recursive: true });
+    writeFileSync(join(fakeHome, ".gitconfig"), "fake git config");
+    writeFileSync(join(fakeHome, ".config", "gh", "hosts.yml"), "fake gh");
+    writeFileSync(join(fakeHome, ".infisical", "infisical-config.json"), "fake infisical");
+    writeFileSync(join(fakeHome, ".config", "infisical", "shared.env"), "fake shared env");
+    writeFileSync(join(fakeHome, ".ssh", "config"), "fake ssh");
+    writeFileSync(join(fakeHome, ".docker", "config.json"), '{"credsStore":"osxkeychain"}\n');
+
+    const stagingRoot = credentialMountStagingRoot(fakeHome);
+    const stagedDockerConfig = join(stagingRoot, ".docker", "config.json");
+
+    const mounts = hostCliCredentialMounts("darwin", fakeHome);
+    expectBindMount(mounts, "/home/cua/.gitconfig", join(fakeHome, ".gitconfig"));
+    expectBindMount(mounts, "/home/cua/.config/gh", join(fakeHome, ".config", "gh"));
+    expectBindMount(mounts, "/home/cua/.infisical", join(fakeHome, ".infisical"));
+    expectBindMount(mounts, "/home/cua/.config/infisical", join(fakeHome, ".config", "infisical"));
+    expectBindMount(mounts, "/home/cua/.ssh", join(fakeHome, ".ssh"));
+    expectBindMount(mounts, "/home/cua/.docker/config.json", stagedDockerConfig);
+    expect(readFileSync(stagedDockerConfig, "utf8")).not.toContain("osxkeychain");
+
+    const args = containerRunArgs("docker", "pw", SHARED_LOCAL_VM_TARGET, "darwin", {
+      shareCliCredentials: true,
+      homeDir: fakeHome,
+    });
+    expectBindMount(args, "/home/cua/.gitconfig", join(fakeHome, ".gitconfig"));
+    expectBindMount(args, "/home/cua/.infisical", join(fakeHome, ".infisical"));
+    expectBindMount(args, "/home/cua/.ssh", join(fakeHome, ".ssh"));
+    expectBindMount(args, "/home/cua/.docker/config.json", stagedDockerConfig);
+  });
+
+  it("accepts containers running with read-only CLI credential mounts as safe and durable", async () => {
+    const credentialHome = mkdtempSync(join(tmpdir(), "bf-cli-inspect-home-"));
+    const fake = runner({
+      "/usr/bin/which docker": "docker\n",
+      "/usr/bin/which podman": new Error("missing"),
+      "docker info --format {{.ServerVersion}}": "29\n",
+      [`docker image inspect ${IMAGE}`]: preparedImageInspect(),
+      [`docker inspect ${CONTAINER}`]: readyInspect({
+        Mounts: [
+          { Type: "bind", Source: VM_WORKSPACE_DIR, Destination: VM_WORKSPACE_GUEST, RW: true },
+          { Type: "bind", Source: join(credentialHome, ".infisical"), Destination: "/home/cua/.infisical", RW: false },
+          { Type: "bind", Source: join(credentialHome, ".ssh"), Destination: "/home/cua/.ssh", RW: false },
+          { Type: "bind", Source: join(credentialHome, ".gitconfig"), Destination: "/home/cua/.gitconfig", RW: false },
+        ],
+      }),
+      [versionProbe]: `cua-driver ${CUA_DRIVER_VERSION}\n`,
+      [statusProbe]: "running\n",
+      [healthProbe]: JSON.stringify({ schema_version: "1", overall: "ok", checks: [] }),
+      [readinessProbe]: "{}\n",
+      [readinessRead]: validPng.toString("base64"),
+    });
+
+    const status = await containerComputerStatus(fake.run, "linux");
+    expect(status.persistence).toBe("durable");
+    expect(status.ready).toBe(true);
+  });
+
+  it("mounts the official CUA MCP server for Local VM turns", () => {
     const connection = containerComputerMcp("podman");
     expect(connection.command).toBe(process.execPath);
     expect(connection.args.at(-3)).toBe("podman");
@@ -579,8 +896,9 @@ describe("Cua integration", () => {
     expect(connection.env).toEqual({ ELECTRON_RUN_AS_NODE: "1" });
   });
 
-  it("builds an exact, checksum-verified Cua Driver 0.20.0 image", () => {
+  it("builds an exact, checksum-verified CUA Driver 0.20.0 image", () => {
     const dockerfile = managedImageDockerfile();
+    expect(dockerfile.startsWith("# syntax=docker/dockerfile:1\n")).toBe(true);
     expect(BASE_IMAGE).toMatch(/@sha256:[a-f0-9]{64}$/);
     expect(dockerfile).toContain(`FROM ${BASE_IMAGE}`);
     expect(dockerfile).toContain("cua_driver-0.20.0-py3-none-manylinux_2_31_x86_64.whl");
@@ -598,6 +916,8 @@ describe("Cua integration", () => {
     expect(dockerfile).toContain("migrate_profile chromium");
     expect(dockerfile).toContain("SingletonLock");
     expect(dockerfile).toContain(`${IMAGE_LAYER_LABEL}="${IMAGE_LAYER_VERSION}"`);
+    expect(dockerfile).toContain("BOTFLEET_VM_CLI_INSTALL");
+    expect(dockerfile).toContain("botfleet-vm-cli-verify");
     expect(dockerfile).toContain("did not become ready within 45 seconds");
     expect(dockerfile).not.toContain("while ! DISPLAY=:1 xset q");
   });
@@ -617,7 +937,7 @@ describe("Cua integration", () => {
     expect(fetch).toBeGreaterThan(gate);
   });
 
-  it("captures the preview through Cua Driver rather than xdotool or VNC", async () => {
+  it("captures the preview through CUA Driver rather than xdotool or VNC", async () => {
     const screenshotCall =
       `${driverExec} call get_desktop_state {} --socket ${CUA_SOCKET} ` +
       "--screenshot-out-file /tmp/botfleet-preview.png";
@@ -673,7 +993,7 @@ describe("containerComputerAction", () => {
     });
 
     await expect(containerComputerAction("run", fake.run, "linux")).rejects.toThrow(
-      "Prepare the Cua desktop image",
+      "Prepare the CUA desktop image",
     );
     expect(fake.calls.some((call) => call.startsWith("docker run "))).toBe(false);
   });
@@ -690,8 +1010,427 @@ describe("containerComputerAction", () => {
     await expect(containerComputerAction("start", fake.run, "linux")).rejects.toThrow("cannot safely resume");
     expect(fake.calls).not.toContain(`docker start ${CONTAINER}`);
   });
+
+  it("starts only a never-started managed desktop with verified safety fields", async () => {
+    let started = false;
+    const calls: string[] = [];
+    const fake: CommandRunner = async (command, args) => {
+      const key = [command, ...args].join(" ");
+      calls.push(key);
+      if (key === "/usr/bin/which docker") return { stdout: "docker\n" };
+      if (key === "/usr/bin/which podman") throw new Error("missing");
+      if (key === "docker info --format {{.ServerVersion}}") return { stdout: "29\n" };
+      if (key === `docker image inspect ${IMAGE}`) return { stdout: preparedImageInspect() };
+      if (key === `docker inspect ${CONTAINER}`) {
+        return { stdout: readyInspect({ State: started ? { Running: true } : { Running: false, Status: "created" } }) };
+      }
+      if (key === `docker start ${CONTAINER}`) {
+        started = true;
+        return { stdout: `${CONTAINER}\n` };
+      }
+      throw new Error(`fixture probe unavailable: ${key}`);
+    };
+    const created = await containerComputerStatus(fake, "linux");
+    expect(created).toMatchObject({ container: "created", imageMatches: true, managed: true,
+      network: "loopback", security: "hardened", persistence: "durable" });
+    await containerComputerAction("start", fake, "linux");
+    expect(calls).toContain(`docker start ${CONTAINER}`);
+    expect(calls.some((call) => call.startsWith("docker rm ") || call.startsWith("docker run "))).toBe(false);
+  });
+
+  it("provisions a fresh shared VM with Docker create only", async () => {
+    const commands: string[][] = [];
+    let failCreate = false;
+    const fake: CommandRunner = async (command, args) => {
+      commands.push([command, ...args]);
+      const key = [command, ...args].join(" ");
+      if (key === `docker image inspect --format {{json .Config.Labels}} ${IMAGE}`) return { stdout: JSON.stringify({
+        [MANAGED_LABEL]: "1", [DRIVER_LABEL]: CUA_DRIVER_VERSION,
+        [BASE_IMAGE_LABEL]: BASE_IMAGE_DIGEST, [IMAGE_LAYER_LABEL]: IMAGE_LAYER_VERSION,
+      }) };
+      if (key === "docker info --format {{.NCPU}} {{.MemTotal}}") return { stdout: "8 17179869184\n" };
+      if (key === "docker info --format {{.OperatingSystem}}") return { stdout: "OrbStack\n" };
+      if (args[0] === "create") {
+        if (failCreate) throw new Error(`Docker rejected ${args.join(" ")}`);
+        return { stdout: "new-container-id\n" };
+      }
+      throw new Error(`unexpected command: ${key}`);
+    };
+
+    await createStoppedSharedLocalVm(fake, "darwin");
+
+    const mutations = commands.filter((args) => ["create", "start", "run", "rm", "pull", "build"].includes(args[1] ?? ""));
+    expect(mutations).toHaveLength(1);
+    const create = mutations[0]!;
+    expect(create.slice(0, 2)).toEqual(["docker", "create"]);
+    expect(create).toContain(`${MANAGED_LABEL}=1`);
+    expect(create).toContain(`${TARGET_LABEL}=shared`);
+    expect(create).toContain(`type=bind,source=${VM_WORKSPACE_DIR},target=${VM_WORKSPACE_GUEST}`);
+    expect(create).toContain(IMAGE);
+    expect(create).not.toContain("-d");
+    failCreate = true;
+    await expect(createStoppedSharedLocalVm(fake, "darwin")).rejects.toThrow(
+      /^Docker could not create the stopped Local VM; check the local daemon and available resources$/,
+    );
+  });
 });
 
+// Regression, 2026-10-08.  On a Mac whose load average sat between 115 and 450,
+// `docker info` took 1.2 s from a shell yet the harness's 10 s probe timed out
+// now and then.  A GET of /api/local-computer showed `daemonUp: true`; seconds
+// later a POST to /run failed with "Start docker first" while OrbStack was up
+// the whole time.  A timeout says nothing about the daemon, so it is asked
+// again once, and two timeouts are "slow", never "stopped".
+describe("container runtime health probe on a loaded host", () => {
+  const healthy = "29\n";
+  const slowMessage = "Docker is slow to respond right now; try again in a moment";
+  const whichDockerOnly = { "/usr/bin/which docker": ["docker\n"], "/usr/bin/which podman": [new Error("missing")] };
+
+  it("costs one call when the daemon answers at once", async () => {
+    const fake = sequencedRunner({ ...whichDockerOnly, [DOCKER_PROBE]: [healthy] });
+
+    const status = await containerRuntimeStatus(fake.run, "linux");
+
+    expect(status).toEqual({ runtime: "docker", available: ["docker"], daemonUp: true });
+    expect(fake.count(DOCKER_PROBE)).toBe(1);
+  });
+
+  it("asks again after a timeout and reports the daemon up when the second look answers", async () => {
+    const fake = sequencedRunner({ ...whichDockerOnly, [DOCKER_PROBE]: [probeTimeout(), healthy] });
+
+    const status = await containerRuntimeStatus(fake.run, "linux");
+
+    expect(status).toEqual({ runtime: "docker", available: ["docker"], daemonUp: true });
+    expect(status.daemonSlow).toBeUndefined();
+    expect(fake.count(DOCKER_PROBE)).toBe(2);
+  });
+
+  it("gives the probe about 24 seconds in total, spread over its attempts", async () => {
+    const fake = sequencedRunner({ ...whichDockerOnly, [DOCKER_PROBE]: [probeTimeout()] });
+
+    await containerRuntimeStatus(fake.run, "linux");
+
+    const budgets = fake.timeouts(DOCKER_PROBE);
+    expect(budgets).toEqual(Array(RUNTIME_PROBE_ATTEMPTS).fill(RUNTIME_PROBE_TIMEOUT_MS));
+    const total = RUNTIME_PROBE_ATTEMPTS * RUNTIME_PROBE_TIMEOUT_MS;
+    expect(total).toBeGreaterThanOrEqual(20_000);
+    expect(total).toBeLessThanOrEqual(25_000);
+  });
+
+  it("reports a slow daemon, not a stopped one, after two timeouts", async () => {
+    const fake = sequencedRunner({ ...whichDockerOnly, [DOCKER_PROBE]: [probeTimeout()] });
+
+    const runtime = await containerRuntimeStatus(fake.run, "linux");
+    expect(runtime).toEqual({ runtime: "docker", available: ["docker"], daemonUp: false, daemonSlow: true });
+    expect(fake.count(DOCKER_PROBE)).toBe(RUNTIME_PROBE_ATTEMPTS);
+
+    const status = await containerComputerStatus(fake.run, "linux");
+    expect(status.daemonUp).toBe(false);
+    expect(status.daemonSlow).toBe(true);
+    expect(status.ready).toBe(false);
+    expect(status.problem).toBe(slowMessage);
+    expect(status.problem).not.toMatch(/Start docker/i);
+    // Nothing past the failed probe is asked of a daemon that is not answering.
+    expect(fake.keys().filter((key) => key.includes("inspect"))).toEqual([]);
+  });
+
+  it("still says Start docker first when the daemon refuses at once, and does not ask twice", async () => {
+    const fake = sequencedRunner({ ...whichDockerOnly, [DOCKER_PROBE]: [daemonRefused()] });
+
+    const status = await containerComputerStatus(fake.run, "linux");
+
+    expect(status.daemonUp).toBe(false);
+    expect(status.daemonSlow).toBe(false);
+    expect(status.problem).toBe("Start docker first");
+    expect(fake.count(DOCKER_PROBE)).toBe(1);
+  });
+
+  it("does not treat a timeout then a refusal as slow: the refusal is the answer", async () => {
+    const fake = sequencedRunner({ ...whichDockerOnly, [DOCKER_PROBE]: [probeTimeout(), daemonRefused()] });
+
+    const status = await containerComputerStatus(fake.run, "linux");
+
+    expect(status.daemonSlow).toBe(false);
+    expect(status.problem).toBe("Start docker first");
+    expect(fake.count(DOCKER_PROBE)).toBe(2);
+  });
+
+  it("names the runtime that timed out when the other one refused outright", async () => {
+    const fake = sequencedRunner({
+      "/usr/bin/which docker": ["docker\n"],
+      "/usr/bin/which podman": ["podman\n"],
+      [DOCKER_PROBE]: [daemonRefused()],
+      "podman info --format json": [probeTimeout("podman info")],
+    });
+
+    const status = await containerComputerStatus(fake.run, "linux");
+
+    expect(status.runtime).toBe("podman");
+    expect(status.available).toEqual(["docker", "podman"]);
+    expect(status.daemonSlow).toBe(true);
+    expect(status.problem).toBe("Podman is slow to respond right now; try again in a moment");
+  });
+
+  it("prefers a runtime that answers over one that is only slow", async () => {
+    const fake = sequencedRunner({
+      "/usr/bin/which docker": ["docker\n"],
+      "/usr/bin/which podman": ["podman\n"],
+      [DOCKER_PROBE]: [probeTimeout()],
+      "podman info --format json": ['{"host":{"arch":"amd64"}}\n'],
+    });
+
+    const status = await containerRuntimeStatus(fake.run, "linux");
+
+    expect(status).toEqual({ runtime: "podman", available: ["docker", "podman"], daemonUp: true });
+  });
+});
+
+describe("wakeContainerComputer", () => {
+  // A stateful fake daemon: the container starts STOPPED, `rm` moves it to
+  // missing, `run` moves it to running (unless scripted to fail). Every
+  // status probe answers from the current phase.
+  function wakeFake(
+    opts: {
+      removeResult?: Error;
+      runResult?: Error;
+      initialPhase?: "stopped" | "missing" | "running";
+      /** Answers to the daemon health probe, in order; the last repeats.  Absent
+       * means a healthy daemon.  Lets a test script a loaded host's flap. */
+      daemonProbe?: Array<string | Error>;
+    } = {},
+  ) {
+    let phase: "stopped" | "missing" | "running" = opts.initialPhase ?? "stopped";
+    let probes = 0;
+    const calls: string[] = [];
+    const run: CommandRunner = async (command, args) => {
+      const key = [command, ...args].join(" ");
+      calls.push(key);
+      if (key === "/usr/bin/which docker") return { stdout: "docker\n" };
+      if (key === "/usr/bin/which podman") throw new Error("missing");
+      if (key === "docker info --format {{.ServerVersion}}") {
+        const answers = opts.daemonProbe ?? ["29\n"];
+        const answer = answers[Math.min(probes, answers.length - 1)]!;
+        probes += 1;
+        if (answer instanceof Error) throw answer;
+        return { stdout: answer };
+      }
+      if (key === "docker info --format {{.NCPU}} {{.MemTotal}}") return { stdout: "8 17179869184\n" };
+      if (key === "docker info --format {{.OperatingSystem}}") return { stdout: "Linux\n" };
+      if (key === `docker image inspect ${IMAGE}`) return { stdout: preparedImageInspect() };
+      if (key === `docker inspect ${CONTAINER}`) {
+        if (phase === "running") return { stdout: readyInspect() };
+        if (phase === "stopped") return { stdout: readyInspect({ State: { Running: false } }) };
+        throw new Error("No such container");
+      }
+      if (key === `docker rm -f ${CONTAINER}`) {
+        if (opts.removeResult) throw opts.removeResult;
+        phase = "missing";
+        return { stdout: `${CONTAINER}\n` };
+      }
+      if (key.startsWith("docker run ")) {
+        if (opts.runResult) throw opts.runResult;
+        phase = "running";
+        return { stdout: "new-container-id\n" };
+      }
+      if (key === versionProbe) return { stdout: `cua-driver ${CUA_DRIVER_VERSION}\n` };
+      if (key === statusProbe) return { stdout: "running\n" };
+      if (key === healthProbe) return { stdout: JSON.stringify({ schema_version: "1", overall: "ok", checks: [] }) };
+      if (key === readinessProbe) return { stdout: "{}\n" };
+      if (key === readinessRead) return { stdout: validPng.toString("base64") };
+      throw new Error(`unexpected command: ${key}`);
+    };
+    return { calls, run };
+  }
+
+  it("recreates a stopped container and returns the fresh running status", async () => {
+    const fake = wakeFake();
+    const stopped = await containerComputerStatus(fake.run, "linux");
+    expect(stopped.container).toBe("stopped");
+
+    const woken = await wakeContainerComputer(stopped, fake.run, "linux");
+
+    expect(woken.container).toBe("running");
+    expect(woken.ready).toBe(true);
+    expect(fake.calls).toContain(`docker rm -f ${CONTAINER}`);
+    expect(fake.calls.some((call) => call.startsWith("docker run "))).toBe(true);
+  });
+
+  it("never removes a stopped container its runtime cannot recreate", async () => {
+    const probe = wakeFake();
+    const stopped = await containerComputerStatus(probe.run, "linux");
+    expect(stopped.container).toBe("stopped");
+
+    // create_supported:false (e.g. a runtime that cannot create this
+    // target): removal would destroy the VM with no way back.
+    const fake = wakeFake();
+    const result = await wakeContainerComputer({ ...stopped, create_supported: false }, fake.run, "linux");
+
+    expect(result.container).toBe("stopped");
+    expect(fake.calls).toHaveLength(0);
+  });
+
+  it("leaves a running container alone", async () => {
+    const fake = wakeFake({ initialPhase: "running" });
+    const running = await containerComputerStatus(fake.run, "linux");
+    expect(running.container).toBe("running");
+
+    const callsBefore = fake.calls.length;
+    const result = await wakeContainerComputer(running, fake.run, "linux");
+
+    expect(result.container).toBe("running");
+    expect(fake.calls.slice(callsBefore).some((call) => call.includes(" rm ") || call.startsWith("docker run "))).toBe(false);
+  });
+
+  it("reports the real failure when remove succeeds but run cannot recreate", async () => {
+    // The regression from the #696 review thread: the old code suppressed
+    // this and the readiness check judged the stale pre-wake snapshot,
+    // misreporting a REMOVED container as merely stopped.
+    const fake = wakeFake({ runResult: new Error("daemon exploded") });
+    const stopped = await containerComputerStatus(fake.run, "linux");
+
+    await expect(wakeContainerComputer(stopped, fake.run, "linux")).rejects.toThrow(
+      /could not be started: daemon exploded/,
+    );
+    // The removal really happened (no silent skip), and no stale "stopped"
+    // verdict was reused.
+    expect(fake.calls).toContain(`docker rm -f ${CONTAINER}`);
+  });
+
+  it("creates a missing container on wake without calling remove first", async () => {
+    const fake = wakeFake();
+    let containerMissing = true;
+    const run: CommandRunner = async (command, args) => {
+      const key = [command, ...args].join(" ");
+      if (key === `docker inspect ${CONTAINER}` && containerMissing) throw new Error("No such container");
+      if (key.startsWith("docker run ")) containerMissing = false;
+      if (key === "docker info --format {{.NCPU}} {{.MemTotal}}") return { stdout: "4 8589934592\n" };
+      if (key === "docker info --format {{.OperatingSystem}}") return { stdout: "OrbStack\n" };
+      return fake.run(command, args);
+    };
+    const missing = await containerComputerStatus(run, "linux");
+    expect(missing.container).toBe("missing");
+
+    const woken = await wakeContainerComputer(missing, run, "linux");
+    expect(woken.container).toBe("running");
+    expect(fake.calls.filter((call) => call === `docker rm -f ${CONTAINER}`)).toHaveLength(0);
+    expect(fake.calls.some((call) => call.startsWith("docker run "))).toBe(true);
+  });
+
+  it("reports a remove failure without attempting a run", async () => {
+    const fake = wakeFake({ removeResult: new Error("rm refused") });
+    const stopped = await containerComputerStatus(fake.run, "linux");
+
+    await expect(wakeContainerComputer(stopped, fake.run, "linux")).rejects.toThrow(
+      /could not be started: rm refused/,
+    );
+    expect(fake.calls.some((call) => call.startsWith("docker run "))).toBe(false);
+  });
+
+  // The same flap, hit through the lifecycle actions: a button press or a bot
+  // turn's auto-wake lands on a probe that times out once and then answers.
+  describe("when the daemon probe flaps on a loaded host", () => {
+    const slowPattern = /Docker is slow to respond right now; try again in a moment/;
+
+    function withImageBuild(fake: ReturnType<typeof wakeFake>): CommandRunner {
+      return async (command, args, timeout, options) => {
+        const key = [command, ...args].join(" ");
+        if (key.startsWith("docker pull ") || key.startsWith("docker build ")) {
+          fake.calls.push(key);
+          return { stdout: "" };
+        }
+        return fake.run(command, args, timeout, options);
+      };
+    }
+
+    it("creates the VM when the probe times out once and then answers", async () => {
+      const fake = wakeFake({ initialPhase: "missing", daemonProbe: [probeTimeout(), "29\n"] });
+
+      const status = await containerComputerAction("run", fake.run, "linux");
+
+      expect(status.container).toBe("running");
+      expect(fake.calls.some((call) => call.startsWith("docker run "))).toBe(true);
+    });
+
+    it("prepares the image when the probe times out once and then answers", async () => {
+      const fake = wakeFake({ initialPhase: "missing", daemonProbe: [probeTimeout(), "29\n"] });
+
+      await containerComputerAction("pull", withImageBuild(fake), "linux");
+
+      expect(fake.calls.some((call) => call.startsWith("docker build "))).toBe(true);
+    });
+
+    it("gets past the daemon gate on start after one timeout (start itself is refused for another reason)", async () => {
+      const fake = wakeFake({ initialPhase: "stopped", daemonProbe: [probeTimeout(), "29\n"] });
+
+      await expect(containerComputerAction("start", fake.run, "linux")).rejects.toThrow(/cannot safely resume/);
+    });
+
+    it.each(["run", "start", "pull"] as const)(
+      "refuses %s with the slow-daemon message, never Start docker first, after two timeouts",
+      async (action) => {
+        const fake = wakeFake({ initialPhase: "missing", daemonProbe: [probeTimeout()] });
+
+        const attempt = containerComputerAction(action, withImageBuild(fake), "linux");
+
+        await expect(attempt).rejects.toBeInstanceOf(Error);
+        await expect(attempt).rejects.toMatchObject({ status: 409, message: expect.stringMatching(slowPattern) });
+        await expect(attempt).rejects.not.toMatchObject({ message: expect.stringMatching(/Start docker/i) });
+        expect(fake.calls.some((call) => call.startsWith("docker run ") || call.startsWith("docker build "))).toBe(false);
+      },
+    );
+
+    it("tells a bot turn the daemon is slow, not stopped, instead of waking a VM", async () => {
+      const probe = wakeFake({ initialPhase: "missing", daemonProbe: [probeTimeout()] });
+      const slow = await containerComputerStatus(probe.run, "linux");
+      expect(slow.daemonSlow).toBe(true);
+
+      const fake = wakeFake({ initialPhase: "missing", daemonProbe: [probeTimeout()] });
+      const result = await wakeContainerComputer(slow, fake.run, "linux");
+
+      expect(result).toBe(slow);
+      expect(result.problem).toMatch(slowPattern);
+      expect(fake.calls).toHaveLength(0);
+    });
+  });
+});
+
+describe("shellWord", () => {
+  it("leaves bare shell tokens alone", () => {
+    expect(shellWord("docker")).toBe("docker");
+    expect(shellWord("type=bind,source=/srv/x,target=/guest")).toBe(
+      "type=bind,source=/srv/x,target=/guest",
+    );
+  });
+
+  it("quotes an empty word so it cannot vanish from the pasted command", () => {
+    expect(shellWord("", "linux")).toBe("''");
+    expect(shellWord("", "win32")).toBe('""');
+  });
+
+  it("quotes bracket globs and cmd.exe percent and caret", () => {
+    expect(shellWord("/srv/[a]", "linux")).toBe(`'/srv/[a]'`);
+    expect(shellWord("/srv/%PATH%", "win32")).toBe('"/srv/%PATH%"');
+    expect(shellWord("a^b", "win32")).toBe('"a^b"');
+  });
+
+  it("leaves a backslash or tilde bare, as Windows paths have always printed", () => {
+    expect(shellWord("C:\\Users\\jay", "linux")).toBe("C:\\Users\\jay");
+    expect(shellWord("~~workspace", "linux")).toBe("~~workspace");
+    expect(shellWord("C:\\Users\\my dir", "win32")).toBe(`"C:\\Users\\my dir"`);
+    // A trailing backslash must not escape the closing quote.
+    expect(shellWord("C:\\Program Files\\", "win32")).toBe(`"C:\\Program Files\\\\"`);
+  });
+
+  it("single-quotes POSIX words with spaces and escapes single quotes", () => {
+    expect(shellWord('/srv/my dir', 'linux')).toBe(`'/srv/my dir'`);
+    expect(shellWord("/srv/o'brien", 'linux')).toBe(`'/srv/o'\\''brien'`);
+  });
+
+  it("double-quotes cmd.exe words because cmd ignores single quotes", () => {
+    expect(shellWord('/srv/my dir', 'win32')).toBe('"/srv/my dir"');
+    expect(shellWord('/srv/o"brien', 'win32')).toBe('"/srv/o""brien"');
+  });
+});
 describe("setupCommands", () => {
   it("derives opaque, distinct per-bot container and workspace identities", () => {
     const a = perBotLocalVmTarget("bot-a");
@@ -740,7 +1479,7 @@ describe("setupCommands", () => {
 
   it("limits resources and retains only the sandbox supervisor's identity-switch caps", () => {
     const command = setupCommands("docker", "linux").run!;
-    expect(command).toContain("--memory 4g --memory-swap 4g");
+    expect(command).toContain("--memory 3g --memory-swap 3g");
     expect(command).toContain("--cpus 2 --pids-limit 512");
     expect(command).toContain("--ipc private --cgroupns private");
     expect(command).toContain("--cap-drop ALL --cap-add SETUID --cap-add SETGID");
@@ -775,11 +1514,511 @@ describe("setupCommands", () => {
     const commands = setupCommands("container", "darwin");
     expect(commands.runtimeStart).toBe("container system start");
     expect(commands.remove).toBe(`container rm --force ${CONTAINER}`);
-    expect(commands.run).toContain("--memory 4g --cpus 2 --cap-drop ALL");
+    expect(commands.run).toContain("--memory 3g --cpus 2 --cap-drop ALL");
     expect(commands.run).not.toContain("--memory-swap");
   });
 
   it("offers the supported Podman Desktop installer on Windows", () => {
     expect(setupCommands(null, "win32").install).toBe("winget install -e --id RedHat.Podman-Desktop");
+  });
+});
+
+describe("Local VM mode switch targets", () => {
+  it("covers the shared target and every bot's own, without duplicates", () => {
+    // A mode switch removes containers and refuses on a held lease.  Looking
+    // only at the shared target meant switching to per-bot orphaned the
+    // shared container and switching back orphaned one per bot, and a per-bot
+    // lease held mid-turn never blocked the switch at all.
+    const targets = localVmModeSwitchTargets(["bot-a", "bot-b", "bot-a"]);
+    expect(targets[0]).toBe(SHARED_LOCAL_VM_TARGET);
+    expect(targets.map((target) => target.key)).toEqual([
+      SHARED_LOCAL_VM_TARGET.key,
+      perBotLocalVmTarget("bot-a").key,
+      perBotLocalVmTarget("bot-b").key,
+    ]);
+    // Distinct container names and workspaces, so "remove them all" removes
+    // three different things rather than the same one three times.
+    expect(new Set(targets.map((target) => target.containerName)).size).toBe(3);
+    expect(new Set(targets.map((target) => target.workspaceDir)).size).toBe(3);
+  });
+
+  it("is just the shared target when the workspace has no bots", () => {
+    expect(localVmModeSwitchTargets([])).toEqual([SHARED_LOCAL_VM_TARGET]);
+  });
+});
+
+describe("migrateVmWorkspace", () => {
+  const temp = () => mkdtempSync(join(tmpdir(), "omb-vm-migrate-"));
+
+  it("moves a pre-move workspace into the new root, keeping the files", async () => {
+    const dir = temp();
+    const from = join(dir, "vm-home");
+    const to = join(dir, "homes", "shared");
+    mkdirSync(from, { recursive: true });
+    writeFileSync(join(from, "keep-me.txt"), "workspace contents");
+
+    expect(await migrateVmWorkspace(SHARED_LOCAL_VM_TARGET, { from, to })).toBe(from);
+    expect(readFileSync(join(to, "keep-me.txt"), "utf8")).toBe("workspace contents");
+  });
+
+  it("does nothing when there is nothing to move, or the new root already exists", async () => {
+    const dir = temp();
+    expect(await migrateVmWorkspace(SHARED_LOCAL_VM_TARGET, { from: join(dir, "absent"), to: join(dir, "new") })).toBeNull();
+
+    const from = join(dir, "vm-home");
+    const to = join(dir, "new");
+    mkdirSync(from, { recursive: true });
+    mkdirSync(to, { recursive: true });
+    writeFileSync(join(to, "already-here.txt"), "new root");
+    expect(await migrateVmWorkspace(SHARED_LOCAL_VM_TARGET, { from, to })).toBeNull();
+    // A migration is never destructive: the pre-move directory stays put.
+    expect(existsSync(from)).toBe(true);
+    expect(readFileSync(join(to, "already-here.txt"), "utf8")).toBe("new root");
+  });
+});
+
+describe("Box gateway", () => {
+  const bearer = (token: string) => `Bearer ${token}`;
+
+  it("refuses a box the mount's grant does not name", async () => {
+    resetBoxGatewayGrants();
+    const grant = mintBoxGatewayGrant("bot-1", "box-allowed", `http://127.0.0.1:8799${BOX_GATEWAY_PATH}`);
+    const call = (boxId: string) =>
+      handleBoxGatewayRequest(
+        { method: "POST", url: `${BOX_GATEWAY_PATH}/boxes/${boxId}/commands`, authorization: bearer(grant.token), remoteAddress: "127.0.0.1", body: "{}" },
+        // SAFETY: the gateway reads `cfg.box.token` and nothing else, and this
+        // test hands it one literal; a full AppConfig would only add sections
+        // the gateway never looks at.
+        { cfg: { box: { token: "account-wide-key" } } as never, fetchImpl: async () => new Response("{}") },
+      );
+
+    // The provider would have honoured both of these.  The gateway does not.
+    expect((await call("box-someone-else")).status).toBe(403);
+    expect((await call("box-allowed")).status).toBe(200);
+  });
+
+  it("forwards the granted call with the account key, which the child never sends", async () => {
+    resetBoxGatewayGrants();
+    const grant = mintBoxGatewayGrant("bot-1", "box-1", `http://127.0.0.1:8799${BOX_GATEWAY_PATH}`);
+    const seen: Array<{ url: string; init: RequestInit }> = [];
+    // SAFETY: the recorder answers the one Box command call this test makes and
+    // never reaches the network, so the narrowed `(string, RequestInit)` shape
+    // stands in for the overloaded global `fetch` without being one.
+    const recordingFetch = async (url: string, init: RequestInit) => {
+      seen.push({ url: String(url), init });
+      return new Response('{"exitCode":0}', { status: 200 });
+    };
+    const res = await handleBoxGatewayRequest(
+      {
+        method: "POST",
+        url: `${BOX_GATEWAY_PATH}/boxes/box-1/commands?x=1`,
+        authorization: bearer(grant.token),
+        remoteAddress: "::1",
+        body: '{"command":"ls"}',
+      },
+      {
+        // SAFETY: the gateway reads `cfg.box.token` and nothing else, and this
+        // test hands it one literal; a full AppConfig would only add sections
+        // the gateway never looks at.
+        cfg: { box: { token: "account-wide-key" } } as never,
+        // SAFETY: the recorder answers the one Box command call this test makes
+        // and never reaches the network, so the narrowed `(string, RequestInit)`
+        // shape stands in for the overloaded global `fetch` without being one.
+        fetchImpl: recordingFetch as typeof fetch,
+      },
+    );
+
+    expect(res).toEqual({ status: 200, body: '{"exitCode":0}' });
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.url).toContain("/boxes/box-1/commands?x=1");
+    // The child's own bearer is replaced, never forwarded.
+    // SAFETY: `fetch` was handed a plain object literal for `headers`, so
+    // reading it back as a flat string map is exact rather than hopeful.
+    expect((seen[0]!.init.headers as Record<string, string>).authorization).toBe("Bearer account-wide-key");
+    expect(seen[0]!.init.body).toBe('{"command":"ls"}');
+  });
+
+  it("answers only a loopback caller holding a live grant", () => {
+    resetBoxGatewayGrants();
+    const grant = mintBoxGatewayGrant("bot-1", "box-1", "");
+    const call = (over: Partial<Parameters<typeof handleBoxGatewayRequest>[0]>) =>
+      handleBoxGatewayRequest(
+        { method: "GET", url: `${BOX_GATEWAY_PATH}/boxes/box-1/files?path=/tmp/a`, remoteAddress: "127.0.0.1", ...over },
+        // SAFETY: the gateway reads `cfg.box.token` and nothing else, and this
+        // test hands it one literal; a full AppConfig would only add sections
+        // the gateway never looks at.
+        { cfg: { box: { token: "account-wide-key" } } as never, fetchImpl: async () => new Response("{}") },
+      );
+
+    return Promise.all([
+      expect(call({ remoteAddress: "10.0.0.7" }).then((r) => r.status)).resolves.toBe(403),
+      expect(call({}).then((r) => r.status)).resolves.toBe(401),
+      expect(call({ authorization: bearer("not-a-grant") }).then((r) => r.status)).resolves.toBe(401),
+      expect(call({ authorization: bearer(grant.token) }).then((r) => r.status)).resolves.toBe(200),
+    ]);
+  });
+
+  it("refuses operations outside the proxy's surface, so the key is never a general pass-through", async () => {
+    resetBoxGatewayGrants();
+    const grant = mintBoxGatewayGrant("bot-1", "box-1", "");
+    const call = (method: string, tail: string) =>
+      handleBoxGatewayRequest(
+        { method, url: `${BOX_GATEWAY_PATH}/boxes/box-1/${tail}`, authorization: bearer(grant.token), remoteAddress: "127.0.0.1" },
+        // SAFETY: the gateway reads `cfg.box.token` and nothing else, and this
+        // test hands it one literal; a full AppConfig would only add sections
+        // the gateway never looks at.
+        { cfg: { box: { token: "account-wide-key" } } as never, fetchImpl: async () => new Response("{}") },
+      );
+
+    // Deleting a box, renaming one, and reading its account-wide listing all
+    // used to be reachable with the key the child held.
+    expect((await call("DELETE", "")).status).toBe(405);
+    expect((await call("PATCH", "")).status).toBe(405);
+    expect((await call("POST", "stop")).status).toBe(405);
+    expect((await call("GET", "")).status).toBe(200);
+    expect((await call("GET", "commands")).status).toBe(405);
+    expect(authorizeBoxGateway(bearer(grant.token), "box-1", Date.now() + 5 * 60 * 60 * 1000).ok).toBe(false);
+  });
+
+  it("forgets a grant when it is revoked", () => {
+    resetBoxGatewayGrants();
+    const grant = mintBoxGatewayGrant("bot-1", "box-1", "");
+    expect(authorizeBoxGateway(bearer(grant.token), "box-1").ok).toBe(true);
+    revokeBoxGatewayGrant(grant.token);
+    expect(authorizeBoxGateway(bearer(grant.token), "box-1").ok).toBe(false);
+  });
+});
+
+describe("localVmHostCapacityError", () => {
+  it("refuses hosts below the CPU and memory floors with plain guidance", () => {
+    expect(localVmHostCapacityError({ cpus: 1, memoryBytes: 4 * 1024 ** 3 }, "OrbStack")).toMatch(
+      /OrbStack has 1 CPUs.*at least 2.*Settings → System/,
+    );
+    expect(localVmHostCapacityError({ cpus: 4, memoryBytes: 1024 ** 3 }, "Docker")).toMatch(
+      /about 1 GiB.*at least 2 GiB/,
+    );
+    expect(localVmHostCapacityError({ cpus: 3, memoryBytes: 4 * 1024 ** 3 }, "OrbStack")).toBeNull();
+    expect(adaptContainerLimits({ cpus: 3, memoryBytes: 4 * 1024 ** 3 })).toEqual({ cpus: 2, memoryGib: 3 });
+  });
+});
+
+describe("adaptive container limits", () => {
+  it("requests a modest 2 CPU / 3 GiB cap on a roomy runtime", () => {
+    expect(adaptContainerLimits({ cpus: 16, memoryBytes: 64 * 1024 ** 3 })).toEqual({ cpus: 2, memoryGib: 3 });
+    expect(adaptContainerLimits(null)).toEqual(DEFAULT_CONTAINER_LIMITS);
+  });
+
+  it("shrinks to an OrbStack-sized runtime (3 CPUs, 4 GiB) instead of failing to start", () => {
+    expect(adaptContainerLimits({ cpus: 3, memoryBytes: 4 * 1024 ** 3 })).toEqual({ cpus: 2, memoryGib: 3 });
+    expect(adaptContainerLimits({ cpus: 1, memoryBytes: 1024 ** 3 })).toEqual({ cpus: 1, memoryGib: 1 });
+  });
+
+  it("honours a configured ceiling and never exceeds 4 / 8", () => {
+    expect(adaptContainerLimits({ cpus: 16, memoryBytes: 64 * 1024 ** 3 }, { cpus: 4, memoryGib: 8 })).toEqual({
+      cpus: 4,
+      memoryGib: 8,
+    });
+    expect(adaptContainerLimits(null, { cpus: 99, memoryGib: 99 })).toEqual({ cpus: 4, memoryGib: 8 });
+  });
+
+  it("asks the runtime what it has, and falls back to the ceiling when it will not say", async () => {
+    const answering = runner({ "docker info --format {{.NCPU}} {{.MemTotal}}": "3 4294967296\n" });
+    expect(await resolveContainerLimits("docker", answering.run)).toEqual({ cpus: 2, memoryGib: 3 });
+    const podman = runner({ "podman info --format {{.Host.CPUs}} {{.Host.MemTotal}}": "2 8589934592\n" });
+    expect(await resolveContainerLimits("podman", podman.run)).toEqual({ cpus: 2, memoryGib: 3 });
+    const silent = runner({});
+    expect(await resolveContainerLimits("docker", silent.run)).toEqual(DEFAULT_CONTAINER_LIMITS);
+  });
+
+  it("ignores malformed docker info stdout instead of trusting manual coercion", async () => {
+    const junk = runner({ "docker info --format {{.NCPU}} {{.MemTotal}}": "not-a-number 4294967296\n" });
+    expect(await readRuntimeHost("docker", junk.run)).toEqual({});
+    const partial = runner({ "docker info --format {{.NCPU}} {{.MemTotal}}": "3\n" });
+    expect(await readRuntimeHost("docker", partial.run)).toEqual({});
+    expect(await resolveContainerLimits("docker", junk.run)).toEqual(DEFAULT_CONTAINER_LIMITS);
+  });
+
+  it("reads declared limits from the label and treats anything odd as the historical cap", () => {
+    expect(limitsFromLabels({ [LIMITS_LABEL]: "3x3" })).toEqual({ cpus: 3, memoryGib: 3 });
+    expect(limitsFromLabels({})).toEqual(LEGACY_UNLABELED_CONTAINER_LIMITS);
+    expect(limitsFromLabels({ [LIMITS_LABEL]: "64x512" })).toEqual(LEGACY_UNLABELED_CONTAINER_LIMITS);
+    expect(limitsFromLabels({ [LIMITS_LABEL]: "0x0" })).toEqual(LEGACY_UNLABELED_CONTAINER_LIMITS);
+    expect(limitsFromLabels({ [LIMITS_LABEL]: "junk" })).toEqual(LEGACY_UNLABELED_CONTAINER_LIMITS);
+  });
+
+  it("judges declaredHardening against safety floors and rejects self-declared sub-minimum limits", () => {
+    expect(declaredHardening({ [LIMITS_LABEL]: "3x3" })).toEqual({
+      nanoCpus: 3_000_000_000,
+      memoryBytes: 3 * 1024 ** 3,
+    });
+    expect(declaredHardening({ [LIMITS_LABEL]: "1x1" })).toEqual({
+      nanoCpus: 1_000_000_000,
+      memoryBytes: 1 * 1024 ** 3,
+    });
+    expect(declaredHardening(null)).toEqual({
+      nanoCpus: LEGACY_UNLABELED_CONTAINER_LIMITS.cpus * 1_000_000_000,
+      memoryBytes: LEGACY_UNLABELED_CONTAINER_LIMITS.memoryGib * 1024 ** 3,
+    });
+  });
+
+  it("creates the container with the adapted caps and records them in a label", () => {
+    const args = containerRunArgs("docker", "pw", SHARED_LOCAL_VM_TARGET, "linux", { limits: { cpus: 3, memoryGib: 3 } });
+    expect(args[args.indexOf("--memory") + 1]).toBe("3g");
+    expect(args[args.indexOf("--memory-swap") + 1]).toBe("3g");
+    expect(args[args.indexOf("--cpus") + 1]).toBe("3");
+    expect(args).toContain(`${LIMITS_LABEL}=3x3`);
+    const defaults = containerRunArgs("docker", "pw", SHARED_LOCAL_VM_TARGET, "linux");
+    expect(defaults[defaults.indexOf("--memory") + 1]).toBe("3g");
+    expect(defaults[defaults.indexOf("--cpus") + 1]).toBe("2");
+  });
+
+  it("reports a container built with adapted limits as hardened, and a mismatch as unsafe", async () => {
+    const adapted = JSON.parse(readyInspect())[0];
+    adapted.Config.Labels[LIMITS_LABEL] = "3x3";
+    adapted.HostConfig.Memory = 3 * 1024 ** 3;
+    adapted.HostConfig.MemorySwap = 3 * 1024 ** 3;
+    adapted.HostConfig.NanoCpus = 3_000_000_000;
+    const status = (inspect: string) =>
+      runner({
+        "/usr/bin/which docker": "docker\n",
+        "/usr/bin/which podman": new Error("missing"),
+        "docker info --format {{.ServerVersion}}": "29\n",
+        [`docker image inspect ${IMAGE}`]: preparedImageInspect(),
+        [`docker inspect ${CONTAINER}`]: inspect,
+      });
+    expect((await containerComputerStatus(status(JSON.stringify([adapted])).run, "linux")).security).toBe("hardened");
+    // declared 3x3 but actually running with the old 8 GiB / 4 CPU limits
+    const drifted = JSON.parse(JSON.stringify(adapted));
+    drifted.HostConfig.Memory = 8 * 1024 ** 3;
+    drifted.HostConfig.MemorySwap = 8 * 1024 ** 3;
+    expect((await containerComputerStatus(status(JSON.stringify([drifted])).run, "linux")).security).toBe("unsafe");
+    // an unlabeled container is judged against the historical cap, as before
+    expect((await containerComputerStatus(status(readyInspect()).run, "linux")).security).toBe("hardened");
+  });
+});
+
+describe("secret redaction", () => {
+  it("scrubs the viewer password out of a failed docker run command line", () => {
+    const message =
+      "Command failed: docker run -d --name x -e VNC_PW=hunter2 -p 127.0.0.1:6080:6901 image\n" +
+      "docker: Error response from daemon: ports are not available";
+    const redacted = redactSecrets(message);
+    expect(redacted).not.toContain("hunter2");
+    expect(redacted).toContain("VNC_PW=<redacted>");
+    expect(redacted).toContain("ports are not available");
+  });
+
+  it("scrubs the password from the error the real command runner throws", async () => {
+    const failure = await defaultCommandRunner("/bin/sh", ["-c", "exit 3", "x", "-e", "VNC_PW=hunter2"]).catch(
+      (error: Error & { cmd?: string }) => error,
+    );
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).not.toContain("hunter2");
+    expect((failure as Error & { cmd?: string }).cmd ?? "").not.toContain("hunter2");
+  });
+
+  it("scrubs other credential-shaped variables and leaves ordinary text alone", () => {
+    expect(redactSecrets("-e API_TOKEN=abc -e DB_PASSWORD='p w' --cpus 4")).toBe(
+      "-e API_TOKEN=<redacted> -e DB_PASSWORD=<redacted> --cpus 4",
+    );
+  });
+});
+
+describe("Local VM creation on a busy host", () => {
+  const dockerHost = (runCalls: string[][]) => {
+    const run: CommandRunner = async (command, args) => {
+      const key = [command, ...args].join(" ");
+      if (key === "/usr/bin/which docker") return { stdout: "docker\n" };
+      if (key === "/usr/bin/which podman") throw new Error("missing");
+      if (key === "docker info --format {{.ServerVersion}}") return { stdout: "29\n" };
+      if (key === "docker info --format {{.NCPU}} {{.MemTotal}}") return { stdout: "3 4294967296\n" };
+      if (key === `docker image inspect ${IMAGE}`) return { stdout: preparedImageInspect() };
+      if (command === "docker" && args[0] === "run") {
+        runCalls.push(args);
+        return { stdout: "id\n" };
+      }
+      throw new Error(`no such object: ${key}`);
+    };
+    return run;
+  };
+  const tempTarget = (viewerPort: number | null): LocalVmTarget => {
+    const base = perBotLocalVmTarget("busy-port-test");
+    return { ...base, viewerPort, workspaceDir: join(mkdtempSync(join(tmpdir(), "vm-port-")), "homes", "abcd") };
+  };
+
+  it("adapts the container limits to the runtime when it is created", async () => {
+    const runCalls: string[][] = [];
+    await containerComputerAction("run", dockerHost(runCalls), "linux", tempTarget(null));
+    expect(runCalls).toHaveLength(1);
+    expect(runCalls[0]![runCalls[0]!.indexOf("--cpus") + 1]).toBe("2");
+    expect(runCalls[0]![runCalls[0]!.indexOf("--memory") + 1]).toBe("3g");
+  });
+
+  it("falls back to an ephemeral loopback viewer port when the fixed one is taken", async () => {
+    const blocker = createServer();
+    await new Promise<void>((resolve) => blocker.listen(0, "127.0.0.1", resolve));
+    const busy = (blocker.address() as { port: number }).port;
+    try {
+      const runCalls: string[][] = [];
+      await containerComputerAction("run", dockerHost(runCalls), "linux", tempTarget(busy));
+      const published = runCalls[0]![runCalls[0]!.indexOf("-p") + 1];
+      expect(published).toBe("127.0.0.1::6901");
+    } finally {
+      await new Promise<void>((resolve) => blocker.close(() => resolve()));
+    }
+  });
+
+  it("keeps the fixed viewer port when it is free", async () => {
+    const probe = createServer();
+    await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
+    const free = (probe.address() as { port: number }).port;
+    await new Promise<void>((resolve) => probe.close(() => resolve()));
+    const runCalls: string[][] = [];
+    await containerComputerAction("run", dockerHost(runCalls), "linux", tempTarget(free));
+    expect(runCalls[0]![runCalls[0]!.indexOf("-p") + 1]).toBe(`127.0.0.1:${free}:6901`);
+  });
+});
+
+describe("PATH driver symlink repair", () => {
+  it("links both PATH entries to the root-owned binary, only when it exists and a link is missing", () => {
+    const script = healCuaShimsScript();
+    expect(script).toContain(`[ -x ${CUA_EXECUTABLE} ] || exit 0`);
+    for (const shim of ["/usr/local/bin/cua-driver", "/opt/venv/bin/cua-driver"]) {
+      expect(script).toContain(`ln -sf ${CUA_EXECUTABLE} ${shim}`);
+      expect(script).toContain(`readlink ${shim}`);
+    }
+  });
+  // Kody review on #911.  `imageLabelsMatch` treats the layer label as the
+  // compatibility check, so an image-content change that does not bump
+  // IMAGE_LAYER_VERSION is invisible: already-provisioned containers keep the
+  // broken layer and never rebuild.  This tripwire fails if the bump that
+  // carries `ENV RUSTUP_HOME` is reverted while the ENV stays.
+  it("bumps the image layer whenever the CLI layer bakes image-level ENV", () => {
+    const dockerfile = managedImageDockerfile();
+    expect(dockerfile).toContain("ENV RUSTUP_HOME=/usr/local/rustup");
+    expect(IMAGE_LAYER_VERSION).not.toBe("6");
+  });
+
+  // The Mac-parity layer (Homebrew, zsh login shell, the gap-list CLIs) is
+  // image content too, so it needs its own bump: a v7 image has none of it.
+  it("is at least layer 8, which is the first to carry Homebrew and zsh", () => {
+    const dockerfile = managedImageDockerfile();
+    expect(dockerfile).toContain("ENV HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ANALYTICS=1");
+    expect(dockerfile).toContain("botfleet_install_zsh_shell");
+    expect(Number(IMAGE_LAYER_VERSION)).toBeGreaterThanOrEqual(8);
+  });
+
+  // The baked verifier checks ping by presence.  The layer version is NOT bumped
+  // for this verify-only change (a bump blocks Local VM bots and invalidates
+  // Self-Hosted VPS containers), so the fix reaches the next image that is built
+  // for a real reason.
+  it("bakes the presence-only ping check into newly built images", () => {
+    const dockerfile = managedImageDockerfile();
+    expect(dockerfile).toContain("command '-v' 'ping'");
+    expect(dockerfile).not.toContain("ping '-V'");
+  });
+
+});
+
+describe("shared container probe context", () => {
+  const sharedTargets = [
+    SHARED_LOCAL_VM_TARGET,
+    perBotLocalVmTarget("bot-a"),
+    perBotLocalVmTarget("bot-b"),
+  ];
+
+  /** A container that exists but is not running: enough for the detail read,
+   *  and it never reaches the CUA probes. */
+  function stoppedInspect(): string {
+    return JSON.stringify([
+      {
+        Config: { Image: IMAGE, Labels: {}, Env: [] },
+        State: { Running: false, Status: "exited" },
+        Image: "sha256:managed-image-id",
+        HostConfig: {},
+        Mounts: [],
+        NetworkSettings: {},
+      },
+    ]);
+  }
+
+  function probeResponses(): ProbeResponses {
+    const responses: ProbeResponses = {
+      "/usr/bin/which docker": "/usr/bin/docker\n",
+      "/usr/bin/which podman": new Error("missing"),
+      [DOCKER_PROBE]: "29.0.0\n",
+      [`docker image inspect ${IMAGE}`]: preparedImageInspect(),
+    };
+    for (const target of sharedTargets) {
+      responses[`docker inspect ${target.containerName}`] = stoppedInspect();
+    }
+    return responses;
+  }
+
+  it("probes the runtime and the image once for a whole list of targets", async () => {
+    const fake = runner(probeResponses());
+    const context = await containerProbeContext(fake.run, "linux");
+    await Promise.all(sharedTargets.map((target) =>
+      containerComputerStatus(fake.run, "linux", target, context)));
+
+    expect(fake.calls.filter((call) => call === DOCKER_PROBE)).toHaveLength(1);
+    expect(fake.calls.filter((call) => call === `docker image inspect ${IMAGE}`)).toHaveLength(1);
+    // One inspect per target, not two: the detail read reuses the first.
+    for (const target of sharedTargets) {
+      expect(fake.calls.filter((call) => call === `docker inspect ${target.containerName}`)).toHaveLength(1);
+    }
+  });
+
+  it("probes the runtime and the image once per target without a shared context", async () => {
+    const fake = runner(probeResponses());
+    for (const target of sharedTargets) {
+      await containerComputerStatus(fake.run, "linux", target);
+    }
+
+    expect(fake.calls.filter((call) => call === DOCKER_PROBE)).toHaveLength(sharedTargets.length);
+    expect(fake.calls.filter((call) => call === `docker image inspect ${IMAGE}`)).toHaveLength(sharedTargets.length);
+  });
+
+  it("reports the same state with a shared context as without one", async () => {
+    const withContext = runner(probeResponses());
+    const context = await containerProbeContext(withContext.run, "linux");
+    const alone = runner(probeResponses());
+
+    for (const target of sharedTargets) {
+      const shared = await containerComputerStatus(withContext.run, "linux", target, context);
+      const single = await containerComputerStatus(alone.run, "linux", target);
+      expect(shared).toEqual(single);
+    }
+  });
+
+  it("does not inspect the image when no runtime is usable", async () => {
+    const fake = runner({
+      "/usr/bin/which docker": new Error("missing"),
+      "/usr/bin/which podman": new Error("missing"),
+    });
+    const context = await containerProbeContext(fake.run, "linux");
+
+    expect(context.runtimeStatus.runtime).toBeNull();
+    expect(context.image).toEqual({ present: false, image_id: null });
+    expect(fake.calls.some((call) => call.includes("image inspect"))).toBe(false);
+
+    const status = await containerComputerStatus(fake.run, "linux", SHARED_LOCAL_VM_TARGET, context);
+    expect(status.image).toBe(false);
+    expect(status.problem).toMatch(/runtime/i);
+  });
+
+  it("still reports a missing image when the shared context found none", async () => {
+    const fake = runner({
+      "/usr/bin/which docker": "/usr/bin/docker\n",
+      "/usr/bin/which podman": new Error("missing"),
+      [DOCKER_PROBE]: "29.0.0\n",
+      [`docker image inspect ${IMAGE}`]: new Error("no such image"),
+    });
+    const context = await containerProbeContext(fake.run, "linux");
+
+    expect(context.image).toEqual({ present: false, image_id: null });
+    const status = await containerComputerStatus(fake.run, "linux", SHARED_LOCAL_VM_TARGET, context);
+    expect(status.image).toBe(false);
+    expect(status.problem).toMatch(/Prepare the CUA desktop image/);
   });
 });

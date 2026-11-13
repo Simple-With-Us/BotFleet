@@ -1,4 +1,4 @@
-# OpenMausBot companion (iOS)
+# BotFleet companion (iOS)
 
 Your bots keep running on the laptop. This is the phone you watch them from,
 answer their approvals on, and send them the next thing.
@@ -43,6 +43,7 @@ ios/
     Frames.swift                 SSE frames, unknown kinds absorbed
     SSE.swift                    line parser + URLSession event stream
     Client.swift                 every call the phone is allowed to make
+    ChatAttachments.swift        compose/split <attached-image> / <attached-file>
     Store.swift                  the fold: frames → state
     Dictation.swift              composer text + transcript join
   Tests/CompanionCoreTests/
@@ -54,9 +55,9 @@ ios/
   App/                           SwiftUI, and everything that needs a device
     CompanionApp.swift           entry; owns when the stream lives and dies
     Session.swift                connection, lifecycle, actions
-    Discovery.swift              NWBrowser for _openmausbot._tcp
+    Discovery.swift              NWBrowser for _botfleet._tcp
     Keychain.swift               the device token
-    MausAvatar.swift             the mascot face, in the desktop's palette
+    BotMascot.swift             the mascot face, in the desktop's palette
     PairingView.swift            QR handoff, discovery, address and code fallback
     PairingScanner.swift         native QR camera, permission and recovery UI
     Glass.swift                  the one material the chrome is made of (Liquid Glass on 26+)
@@ -84,9 +85,13 @@ swift test
 The app needs Xcode. The `.xcodeproj` is generated rather than committed:
 
 ```sh
-brew install xcodegen
-cd ios && xcodegen generate && open OpenMausCompanion.xcodeproj
+bash scripts/ios-install-xcodegen.sh
+cd ios && xcodegen generate && open BotFleet.xcodeproj
 ```
+
+`xcodegen generate` runs `scripts/ios-xcodegen-post.sh` via `postGenCommand` so
+the generated project uses the Xcode 27.0 document format (objectVersion 100).  XcodeGen
+2.45+ is required; 2.46+ is what hosted CI installs.
 
 **Re-run `xcodegen generate` after pulling any change that adds a file to
 `App/`.** The spec says `sources: App`, but XcodeGen resolves that to explicit
@@ -161,19 +166,19 @@ the host computer remain unreachable through the companion.
   `resumed: false`, which is the signal to hydrate. Lifecycle — not the parser —
   is the hard part of a phone client, which is why the stream is torn down
   deliberately on backgrounding rather than left for iOS to kill.
-- **No optimistic state.** Actions call the harness and let the event stream
-  deliver the result. A phone that draws its own version of what just happened
-  is a phone that disagrees with the laptop.
+- **Pending own-sends only.**  The draft clears on send, so a local user row
+  stands in until the matching `message` frame (or 202 queueId) lands.  Nothing
+  else is drawn ahead of the harness.
 - **Messaging-app shape, not settings-list shape.** Mascot faces at roster size,
   the bot's role as a chip beside its name, timestamps that say "Yesterday"
   rather than a date, and a gap-based separator in the transcript instead of a
-  stamp on every message. The palette in `MausAvatar.swift` is copied verbatim
+  stamp on every message. The palette in `BotMascot.swift` is copied verbatim
   from `src/lib/mascot.ts`: a bot the user knows as "the orange one" should be
   the same orange on both screens.
-- **Return sends, Shift+Return breaks the line**, via `.onKeyPress`. Returning
-  `.ignored` for the shifted case hands the keypress back to the text field,
-  which is the only thing that can insert the newline once Return is claimed.
-  Software keyboards have no Shift+Return, so there `.onSubmit` sends.
+- **Return inserts a newline.**  Send is the arrow button in the composer, not
+  the keyboard's bottom-right key, so that key stays a Return glyph rather than
+  the blue send arrow.  Slash commands and dictation live in the + menu so the
+  field stays wide; a Steer chip appears while the bot is working.
 - **Composer dictation is the mic.** Tap to talk, tap to stop, then edit or
   send. Recognition stays on-device when the phone supports it, and the mic
   remains visible so another spoken sentence can be appended. Search covers
@@ -183,13 +188,15 @@ the host computer remain unreachable through the companion.
 
 ## Limits in this version
 
-The live connection is foreground-only. Notification frames produce native
+The live connection is foreground SSE. Notification frames produce native
 banners, sounds, time-sensitive approval alerts, and an app badge while connected;
-the resume cursor replays alerts missed during a short background pause. There is
-no APNs delivery after the app is terminated, no call mode or spoken replies,
-and no hosted relay. Composer dictation is available.
+the resume cursor replays alerts missed during a short background pause. After
+notification authorization the app registers an APNs token with the Mac sidecar,
+which wakes a killed or backgrounded companion when a bot needs you. There is
+no call mode or spoken replies, and no hosted relay. Composer dictation is
+available.
 Task management, SQLite transcript search,
 transcript sharing, reactions, and edit/version controls use narrow companion
 routes and the computer remains the source of truth. Tailscale is supported
-through manual MagicDNS entry; it is not a dependency and OpenMausBot does not
+through manual MagicDNS entry; it is not a dependency and BotFleet does not
 operate a cloud copy of local data.

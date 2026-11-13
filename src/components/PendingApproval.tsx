@@ -7,9 +7,10 @@
 // the detail printed raw in a monospace block that is NEVER truncated
 // (it scrolls instead), and the buttons ordered least-destructive-last so
 // the primary action sits under your thumb.
-import { memo } from "react";
+import { memo, useState } from "react";
 import { useStore, type Bot, type Message } from "@/state/store";
 import { cn } from "@/lib/cn";
+import { ConfirmDialog } from "./ConfirmDialog";
 
 interface ApprovalLabels {
   [tool: string]: string;
@@ -21,6 +22,7 @@ export interface Pending {
   tool: string;
   /** the narrow grant "always allow" writes, computed server-side */
   allowKey?: string;
+  allowKeyWarnWrite?: boolean;
   detail: string;
   held?: string;
 }
@@ -40,6 +42,7 @@ export function pendingApprovals(messages: Message[]): Pending[] {
       requestId: m.card!.requestId!,
       tool: m.card!.tool!,
       allowKey: m.card!.allowKey,
+      allowKeyWarnWrite: m.card!.allowKeyWarnWrite,
       detail: m.card!.subtitle,
       held: m.card!.held,
     }));
@@ -57,7 +60,8 @@ export function spokenApprovalPrompt(pending: Pending, requester: string): strin
   return `${requester} asks: ${title}${/[.!?]$/.test(title) ? "" : "."} Review the schedule and instructions on screen. Should I confirm it?`;
 }
 
-function label(pending: Pending): string {
+/** The composer strip's line for a waiting approval. */
+export function pendingApprovalLabel(pending: Pending): string {
   if (isRoutineApproval(pending)) {
     return pending.message.card?.routineRequest?.operation.action === "create"
       ? "Confirm this routine"
@@ -70,6 +74,7 @@ function label(pending: Pending): string {
     Write: "File-change approval requested",
     Edit: "File-change approval requested",
     edit: "File-change approval requested",
+    job_start: "Background job approval requested",
   };
   return nice[pending.tool] ?? "Approval requested";
 }
@@ -78,10 +83,12 @@ export const PendingApprovalPanel = memo(function PendingApprovalPanel({
   pending,
   count,
   index,
+  bypassActive,
 }: {
   pending: Pending;
   count: number;
   index: number;
+  bypassActive?: boolean;
 }) {
   return (
     <div
@@ -96,7 +103,12 @@ export const PendingApprovalPanel = memo(function PendingApprovalPanel({
             {index + 1} of {count}
           </span>
         )}
-        <span className="text-[13px] text-ink">{label(pending)}</span>
+        {bypassActive && (
+          <span className="rounded-full bg-accent/15 px-2 py-0.5 text-[11px] font-semibold text-accent">
+            Bypass Active
+          </span>
+        )}
+        <span className="text-[13px] text-ink">{pendingApprovalLabel(pending)}</span>
         <span className="font-mono text-[11px] text-ink-secondary">
           {isRoutineApproval(pending)
             ? pending.message.card?.routineRequest?.operation.action === "create"
@@ -122,15 +134,20 @@ export function PendingApprovalActions({
   pending,
   threadId,
   bot,
+  totalCount,
   onCancelTurn,
+  onApproveAll,
 }: {
   pending: Pending;
   threadId: string;
   /** who asked — "always allow" is remembered against them */
   bot?: Bot;
+  totalCount?: number;
   onCancelTurn: () => void;
+  onApproveAll?: () => void;
 }) {
   const { dispatch } = useStore();
+  const [writeAlwaysConfirm, setWriteAlwaysConfirm] = useState(false);
   const isRoutineRequest = isRoutineApproval(pending);
   const decide = (behavior: "allow" | "deny", always = false) =>
     dispatch({
@@ -141,6 +158,8 @@ export function PendingApprovalActions({
       message: behavior === "deny" ? "Denied by the user." : undefined,
       alwaysAllow: always && bot && pending.allowKey ? { botId: bot.id, key: pending.allowKey } : undefined,
     });
+
+  const approveAll = onApproveAll ?? (() => dispatch({ type: "approveAllRequests", threadId }));
 
   const base = "rounded-full px-3.5 py-1.5 text-[13.5px] transition-colors";
   return (
@@ -158,18 +177,48 @@ export function PendingApprovalActions({
       </button>
       {!isRoutineRequest && bot && pending.allowKey && (
         <button
-          onClick={() => decide("allow", true)}
+          onClick={() => {
+            if (pending.allowKeyWarnWrite) setWriteAlwaysConfirm(true);
+            else decide("allow", true);
+          }}
           title={`Stop asking ${bot.name} about ${pending.allowKey}`}
           className={cn(base, "border border-hairline/50 text-ink hover:bg-control")}
         >
           Always allow
         </button>
       )}
+      <ConfirmDialog
+        open={writeAlwaysConfirm}
+        title="Always allow this write tool?"
+        body={
+          <>
+            This tool can change data outside a read-only lookup.&nbsp; BotFleet will stop asking{" "}
+            <span className="font-mono text-[12px]">{pending.allowKey}</span> on every future turn until you revoke it in
+            this bot&apos;s settings.
+          </>
+        }
+        confirmLabel="Always allow"
+        destructive
+        onCancel={() => setWriteAlwaysConfirm(false)}
+        onConfirm={() => {
+          setWriteAlwaysConfirm(false);
+          decide("allow", true);
+        }}
+      />
+      {totalCount !== undefined && totalCount > 1 && (
+        <button
+          onClick={approveAll}
+          title="Approve all waiting requests in this conversation"
+          className={cn(base, "border border-accent/40 bg-accent/15 font-medium text-accent hover:bg-accent/25")}
+        >
+          Approve All ({totalCount})
+        </button>
+      )}
       <button
         onClick={() => decide("allow")}
         className={cn(base, "bg-accent font-medium text-white hover:brightness-110")}
       >
-        {isRoutineRequest ? "Confirm" : "Allow once"}
+        {isRoutineRequest ? "Confirm" : "Allow Once"}
       </button>
     </div>
   );

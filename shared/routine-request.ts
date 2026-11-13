@@ -8,11 +8,13 @@
  * app restart without asking the model to interpret the request again.
  */
 
-export type RoutineRequestRunOn = "maus" | "cloud";
+import { type RoutineRunOn } from "./run-on.ts";
+
+export type RoutineRequestRunOn = RoutineRunOn;
 
 export type RoutineRequestSchedule =
   | { type: "once"; at: number }
-  | { type: "daily"; time: string; weekdays: number[] };
+  | { type: "daily"; time: string; weekdays: number[]; timeZone?: string };
 
 export interface RoutineRequestDefinition {
   name: string;

@@ -10,11 +10,8 @@ describe("cloud computer provisioning cleanup", () => {
   let scenario: "rename-failure" | "existing-desktop-failure" = "rename-failure";
   const requests: RequestRecord[] = [];
 
-  const nameFor = (botId: string) => {
-    const prefix = botId.slice(0, 8).toLowerCase().replace(/[^a-z0-9]/g, "");
-    const hash = createHash("sha256").update(botId).digest("hex").slice(0, 6);
-    return `ogb-${prefix}-${hash}`;
-  };
+  // Same pool-slot derivation as boxNameFor in box.ts (#117 hetzner pooling).
+  const nameFor = (botId: string) => `ogb-pool-${createHash("sha256").update(botId).digest()[0] % 4}`;
 
   beforeAll(async () => {
     api = createServer((req, res) => {

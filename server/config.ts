@@ -3,14 +3,57 @@
 //     "instances": { "<instanceId>": {"driver":"grok", …} } }
 import { readFileSync, mkdirSync, existsSync, renameSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { z } from "zod";
 
-import { writeFileAtomic } from "./atomic.ts";
-import type { InstanceConfigMap } from "./contracts.ts";
-import { parseJson, schemaIssue, type JsonObject, type JsonValue } from "./schema.ts";
+import { updateConfigFile, type ConfigFileSetAside } from "../electron/config-file-lock.mjs";
+import { readPersistOnExitPolicy, writePersistOnExitPolicy } from "../electron/persist-on-exit-policy.mjs";
+import type { InstanceConfig, InstanceConfigMap } from "./contracts.ts";
+import { dataDir } from "./data-dir.ts";
+import { clearDataFault, findSetAsideFiles, recordDataFault, type SetAsideFile } from "./data-faults.ts";
+import { isJsonObject, isJsonString, parseJson, schemaIssue, type JsonObject, type JsonValue } from "./schema.ts";
+import { infisicalSnapshot, resolveSecretFields, stripVaultManagedValues } from "./secret-map.ts";
+import { resolveKnobFields, stripVaultManagedKnobs } from "./knob-map.ts";
+import { CONTROL_ACT_WITHIN_MS, CONTROL_WAIT_MS } from "./control-client.ts";
+import { describeDsn } from "./sentry.ts";
+import {
+  parseConversationMode,
+  STORED_CONVERSATION_MODES,
+  type ConversationMode,
+} from "../shared/conversation-mode.ts";
+import { BUSY_SEND_DEFAULTS, type BusySendDefault } from "../shared/busy-send-default.ts";
+import {
+  ROOM_LABEL_MAX_LENGTH,
+  type CustomRoomLabels,
+  type RoomTerminology,
+} from "../shared/terminology.ts";
+import { DEFAULT_MAX_REVIEWS_PER_TURN, MAX_MAX_REVIEWS_PER_TURN, MIN_MAX_REVIEWS_PER_TURN } from "../shared/auto-review.ts";
+import { DEFAULT_VPS_MODE, migrateAllowedComputersToProviders } from "../shared/local-auto-consent.ts";
+import { fsFailureCode, jsonFailureReason, stripBom } from "./store-guard.ts";
+import {
+  checkPronunciations,
+  PronunciationDraftListSchema,
+  sanitizeStoredPronunciations,
+  type Pronunciation,
+} from "../shared/pronunciations.ts";
+import {
+  CALL_STT_PROVIDERS,
+  CLOUD_STT_PROVIDERS,
+  HOSTED_TTS_PROVIDERS,
+  TTS_PROVIDERS,
+} from "../shared/voice-providers.ts";
 
 const optionalText = z.string().optional();
+const externalCredentialStorage = z.literal("external").optional();
+/** The workspace pronunciation list (shared/pronunciations.ts), checked and
+ * canonicalized by the one validator every client also runs.  Absent means
+ * the seeded defaults; a saved list, even an empty one, is used as is. */
+const pronunciationListSchema = PronunciationDraftListSchema.transform((drafts, ctx): Pronunciation[] => {
+  const checked = checkPronunciations(drafts);
+  if (checked.ok) return checked.list;
+  ctx.addIssue({ code: "custom", message: checked.error });
+  return z.NEVER;
+});
 const SSH_ALIAS = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
 
 export const DEFAULT_ROOM_TURN_TIMEOUT_MINUTES = 5;
@@ -22,7 +65,8 @@ export const MIN_LOCAL_VM_MAX_INSTANCES = 1;
 export const MAX_LOCAL_VM_MAX_INSTANCES = 4;
 
 export function isValidSshAlias(value: unknown): value is string {
-  return typeof value === "string" && SSH_ALIAS.test(value);
+  if (Object.prototype.toString.call(value) !== "[object String]") return false;
+  return SSH_ALIAS.test(String(value));
 }
 
 /** Custom webhook ingress must be a real origin, not a scheme-less host. */
@@ -36,24 +80,161 @@ export function isAbsoluteHttpUrl(value: unknown): value is string {
   }
 }
 
+/** A secret store is reached over TLS or not at all: the machine identity's
+ * client secret rides in the request body on every login, so `http://` is not
+ * a lesser configuration, it is a leak. */
+export function isHttpsUrl(value: unknown): value is string {
+  if (typeof value !== "string" || !value.trim()) return false;
+  try {
+    const parsed = new URL(value.trim());
+    return parsed.protocol === "https:" && !parsed.username && !parsed.password;
+  } catch {
+    return false;
+  }
+}
+
+/** Both of these land in the query string of every secret-store call. */
+const INFISICAL_ENVIRONMENT_PATTERN = /^[a-z0-9-]{1,64}$/;
+const INFISICAL_PROJECT_ID_PATTERN = /^[A-Za-z0-9-]{1,64}$/;
+
+/** A Sentry DSN, which is more than an https URL: the public key rides in
+ * the username and the project id is the last path segment.
+ * `isAbsoluteHttpUrl` accepts `http://` and rejects a username outright, so
+ * it cannot stand in here.  A DSN missing either half is silently inert
+ * inside the SDK, which is exactly the failure this rejects at the door.
+ *
+ * The rule itself lives in `describeDsn` rather than here, because the door
+ * check and the runtime check drifting apart is what lets a DSN the SDK
+ * refuses reach `Sentry.init`, where the SDK prints the whole thing —
+ * public key included — through its own `console.error`.  One grammar, one
+ * place, no drift. */
+export function isSentryDsn(value: string): boolean {
+  const raw = value.trim();
+  if (!raw) return false;
+  return describeDsn(raw) !== null;
+}
+
+/** Sentry truncates an environment past 80 characters, and so does the
+ * usage-telemetry v2 schema.  Reject rather than silently store a name the
+ * operator will never see again. */
+export const MAX_OBSERVABILITY_ENVIRONMENT_LENGTH = 80;
+
+/** Per-desktop budget on a VPS.  Unlike the Local VM — the only desktop on
+ * the person's own workstation — a VPS runs one desktop per bot on a single
+ * shared machine, so the default is a fraction of that host rather than a
+ * whole workstation's worth.  3 GiB and 2 CPUs leaves an idle XFCE desktop
+ * several times its observed footprint while letting a modest box carry four
+ * to six bots at once.  Operators with a bigger or smaller VPS override it. */
+export const VPS_DEFAULT_MEMORY_GIB = 3;
+export const VPS_DEFAULT_CPUS = 2;
+
+/** Bounds, not preferences: below these a desktop cannot boot, and above them
+ * the value is far more likely a typo than an intent. */
+const VPS_MEMORY_GIB_RANGE = { min: 2, max: 64 } as const;
+const VPS_CPUS_RANGE = { min: 1, max: 32 } as const;
+
+function normalizeVpsNumber(
+  value: unknown,
+  field: string,
+  range: { min: number; max: number },
+): number | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  if (typeof value !== "number" || !Number.isInteger(value) || value < range.min || value > range.max) {
+    throw new Error(`vps.${field} must be a whole number between ${range.min} and ${range.max}`);
+  }
+  return value;
+}
+
 /** Keep the persisted VPS shape deliberately smaller than an SSH connection. */
-export function normalizeVpsConfig(raw: unknown): { sshAlias?: string } {
+export function normalizeVpsConfig(raw: unknown): { sshAlias?: string; memoryGib?: number; cpus?: number } {
   if (raw === undefined || raw === null) return {};
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     throw new Error("vps must be an object containing an SSH config alias");
   }
-  const alias = (raw as Record<string, unknown>).sshAlias;
-  if (alias === undefined || alias === "") return {};
+  const record = raw as Record<string, unknown>;
+  const memoryGib = normalizeVpsNumber(record.memoryGib, "memoryGib", VPS_MEMORY_GIB_RANGE);
+  const cpus = normalizeVpsNumber(record.cpus, "cpus", VPS_CPUS_RANGE);
+  const sizing = { ...(memoryGib === undefined ? {} : { memoryGib }), ...(cpus === undefined ? {} : { cpus }) };
+  const alias = record.sshAlias;
+  // Sizing is meaningful on its own: an operator may set the budget before
+  // naming the host, and dropping it here would silently lose the setting.
+  if (alias === undefined || alias === "") return sizing;
   if (!isValidSshAlias(alias)) {
     throw new Error("vps.sshAlias must be a simple SSH config alias (letters, numbers, dot, dash, or underscore)");
   }
-  return { sshAlias: alias };
+  return { sshAlias: alias, ...sizing };
 }
 
 const vpsConfigSchema = z.object({
   sshAlias: z.string().refine((value) => value === "" || isValidSshAlias(value), {
     message: "must be a simple SSH config alias",
   }).optional(),
+  memoryGib: z.number().int().min(VPS_MEMORY_GIB_RANGE.min).max(VPS_MEMORY_GIB_RANGE.max).optional(),
+  cpus: z.number().int().min(VPS_CPUS_RANGE.min).max(VPS_CPUS_RANGE.max).optional(),
+});
+/** What a bot that has never been configured is given.
+ *
+ * This fills in for `computers: undefined` only.  A bot whose computers were
+ * explicitly emptied stays off, and a bot with its own destinations keeps
+ * them — the workspace default is the answer to "nobody has said", not an
+ * override of anyone who has.
+ *
+ * Unset ships as unset, so a fresh install still behaves exactly as before:
+ * reuse whatever already exists, provision nothing, and on macOS fall back to
+ * host control.  Nobody gets a server they did not ask for.
+ *
+ * `allowedComputers` is the operator-level allowlist: every granted set is
+ * filtered through it before it is mounted, so disabling "This Computer" at the
+ * top of the settings page is enough to keep any bot from running on the
+ * host.  Absent means "every destination is allowed", preserving the shipped
+ * behavior for every existing install. */
+/** Shape of the per-provider toggle the new Computer settings UI writes.
+ * Each key is a `ComputerProviderId`; values are explicit booleans so a
+ * partial save is fail-closed (an unknown future provider reads as off).
+ * Matches `ComputerProviders` in `shared/local-auto-consent.ts`. */
+const computerProvidersSchema = z.object({
+  asciiBox: z.boolean().optional(),
+  selfHostedVps: z.boolean().optional(),
+  localVm: z.boolean().optional(),
+  localMac: z.boolean().optional(),
+});
+
+const botDefaultsSchema = z.object({
+  computers: z.array(z.enum(["cloud", "vm", "local"])).max(3).optional(),
+  cloudBackend: z.enum(["box", "vps"]).optional(),
+  /** Per-bot iMessage transport choice.  Absent = "off" (no surprise Linq
+   *  activation).  Stored alongside the other botDefaults because the
+   *  settings panel carries the whole block on every save, and because
+   *  `saveConfig` merges section-by-section so an unrelated edit never
+   *  wipes the per-bot mapping. */
+  imessagePerBot: z.record(z.string(), z.enum(["off", "mac-relay", "linq"])).optional(),
+  // `null` is the wire spelling of "no allowlist — every destination is
+  // allowed", and it has to be accepted, not merely tolerated: the settings
+  // panel carries the whole botDefaults block on every save, so a fresh
+  // install (which has no allowlist) sent `null` with each unrelated change
+  // and got a 400 back for it.  Omitting the key is not a substitute, either
+  // -- the patch merges section by section, so an omitted key preserves
+  // whatever is on disk, and re-enabling the last destination would silently
+  // fail to clear the stored array.  null CLEARS; absent means "leave it".
+  //
+  // DEPRECATED — the redesigned Computer settings UI writes
+  // `computerProviders` instead and reads `allowedComputers` only as a
+  // backwards-compatibility input during the boot migration
+  // (`migrateComputerProvidersConfig` in `server/config.ts`).  Server
+  // code that still keys off `allowedComputers` (the allowlist gate in
+  // `server/computer-grants.ts`) keeps reading it on disk and ignores
+  // the new shape; the two stay in sync because the renderer writes
+  // both for the cut-over release.
+  allowedComputers: z.array(z.enum(["cloud", "vm", "local"])).max(3).nullable().optional(),
+  /** Per-provider allowlist that the redesigned Computer settings UI
+   * drives.  The settings panel writes this directly; the renderer
+   * derives `allowedComputers` from it before each save so the server's
+   * legacy allowlist gate keeps working through the cut-over. */
+  computerProviders: computerProvidersSchema.optional(),
+  /** Shared-vs-per-bot VPS mode.  Only meaningful when `selfHostedVps`
+   * is enabled; the schema does not cross-validate here because the
+   * renderer is the only writer and it already enforces the rule. */
+  vpsMode: z.enum(["shared", "per-bot"]).nullable().optional(),
 });
 const roomConfigSchema = z.object({
   turnTimeoutMinutes: z
@@ -70,6 +251,14 @@ const localVmConfigSchema = z.object({
     .min(MIN_LOCAL_VM_MAX_INSTANCES)
     .max(MAX_LOCAL_VM_MAX_INSTANCES)
     .optional(),
+  shareCliCredentials: z.boolean().optional(),
+  shareGpgPrivateKeys: z.boolean().optional(),
+  allowHostTerminal: z.boolean().optional(),
+  /** Optional ceilings for the Local VM container.  Absent means "request about
+   * 2 CPUs and 3 GiB, then adapt to what the container runtime actually has,
+   * up to 4 CPUs / 8 GiB". */
+  cpus: z.number().int().min(1).max(4).optional(),
+  memoryGib: z.number().int().min(1).max(8).optional(),
 });
 const featureConfigSchema = z.object({
   /** Experimental desktop workflow recorder. Hidden unless explicitly enabled. */
@@ -78,6 +267,93 @@ const featureConfigSchema = z.object({
   showToolCalls: z.boolean().optional(),
   /** Summarize consecutive tool actions into an expandable live summary card. On by default. */
   summarizeToolCalls: z.boolean().optional(),
+  /** Per-turn Git worktree isolation for bots working in a shared repository. */
+  gitWorktreeLeases: z.boolean().optional(),
+});
+const zulipKeyPatternSchema = z.string().trim().regex(/^[A-Z0-9_{}]+$/).max(200);
+// Without `{ROLE}` every role resolves to the same secret name, so a
+// pattern that omits it must never validate.  The login pattern also
+// needs `{FIELD}`, or EMAIL/API_KEY/SITE collapse onto one name.  The
+// outgoing pattern must not carry `{FIELD}`: there is no field to expand
+// it with, so it would become "" and leave a double underscore.
+const zulipLoginCredentialFieldSourceSchema = z.object({
+  source: z.string().trim().regex(/^[a-z0-9][a-z0-9-]{0,63}$/),
+  keyPattern: zulipKeyPatternSchema
+    .refine((value) => value.includes("{ROLE}") && value.includes("{FIELD}"), {
+      message: "login keyPattern must contain {ROLE} and {FIELD}",
+    })
+    .optional(),
+  path: z.string().trim().regex(/^\/[A-Za-z0-9/_-]*$/).max(200).optional(),
+});
+const zulipOutgoingCredentialFieldSourceSchema = z.object({
+  source: z.string().trim().regex(/^[a-z0-9][a-z0-9-]{0,63}$/),
+  keyPattern: zulipKeyPatternSchema
+    .refine((value) => value.includes("{ROLE}") && !value.includes("{FIELD}"), {
+      message: "outgoing keyPattern must contain {ROLE} and must not contain {FIELD}",
+    })
+    .optional(),
+  path: z.string().trim().regex(/^\/[A-Za-z0-9/_-]*$/).max(200).optional(),
+});
+const zulipConfigSchema = z.object({
+  enabled: z.boolean().optional(),
+  dryRun: z.boolean().optional(),
+  realm: optionalText,
+  ownerUserId: z.number().int().positive().optional(),
+  ownerClients: z.array(z.string().trim().min(1)).max(20).optional(),
+  credentialDir: optionalText,
+  credentialSource: z.enum(["file", "infisical"]).optional(),
+  infisicalPath: z.string().trim().regex(/^\/[A-Za-z0-9/_-]*$/).max(200).optional(),
+  // Empty means unset (the harness's own project and environment).
+  infisicalProjectId: z.string().trim().regex(/^[A-Za-z0-9-]*$/).max(64).optional(),
+  infisicalEnv: z.string().trim().regex(/^[A-Za-z0-9_-]*$/).max(64).optional(),
+  credentialSources: z.object({
+    login: zulipLoginCredentialFieldSourceSchema.optional(),
+    outgoing: zulipOutgoingCredentialFieldSourceSchema.optional(),
+  }).optional(),
+  bots: z
+    .record(z.string(), z.object({ role: z.string().trim().min(1).max(48), enabled: z.boolean().optional() }))
+    .optional(),
+  postChannels: z.array(z.string().trim().min(1)).max(50).optional(),
+  autoReply: z.enum(["final", "off"]).optional(),
+  staleMinutes: z.number().int().min(1).max(10_080).optional(),
+  budgets: z
+    .object({
+      dmsPerHour: z.number().int().min(0).max(1000).optional(),
+      peerWakesPerHour: z.number().int().min(0).max(1000).optional(),
+      peerWakesPerTopicPerHour: z.number().int().min(0).max(1000).optional(),
+      ownerWakesPerHour: z.number().int().min(0).max(1000).optional(),
+      peerChainLimit: z.number().int().min(0).max(1000).optional(),
+    })
+    .optional(),
+});
+
+const infisicalAuthMethodSchema = z.enum(["service-token", "machine-identity"]);
+const infisicalReadSourceSchema = z.object({
+  name: z.string().trim().regex(/^[a-z0-9][a-z0-9-]{0,63}$/),
+  tokenFile: z.string().trim().min(1).max(4096).refine((v) => v.startsWith("/"), "tokenFile must be an absolute path").optional(),
+  tokenEnv: z.string().trim().max(256).regex(/^[A-Z][A-Z0-9_]*$/).optional(),
+  writeTokenFile: z.string().trim().min(1).max(4096).refine((v) => v.startsWith("/"), "writeTokenFile must be an absolute path").optional(),
+  writeTokenEnv: z.string().trim().max(256).regex(/^[A-Z][A-Z0-9_]*$/).optional(),
+  projectId: z.string().trim().regex(/^[A-Za-z0-9-]{1,64}$/),
+  environment: z.string().trim().regex(/^[a-z0-9-]{1,64}$/).optional(),
+  secretPath: z.string().trim().regex(/^\/[A-Za-z0-9/_-]*$/).max(200).optional(),
+});
+const infisicalConfigSchema = z.object({
+  authMethod: infisicalAuthMethodSchema.optional(),
+  enabled: z.boolean().optional(),
+  writeThrough: z.boolean().optional(),
+  siteUrl: optionalText,
+  projectId: optionalText,
+  environment: optionalText,
+  secretPath: optionalText,
+  clientId: optionalText,
+  clientSecret: optionalText,
+  // Primary tokens must survive stored-file parsing rather than being stripped as unknown fields.
+  token: optionalText,
+  writeToken: optionalText,
+  readSources: z.array(infisicalReadSourceSchema).max(32).optional(),
+  credentialStorage: externalCredentialStorage,
+  refreshMinutes: z.number().int().min(5).max(1440).optional(),
 });
 const instanceConfigSchema = z.object({
   driver: z.string().min(1),
@@ -88,26 +364,159 @@ const instanceConfigSchema = z.object({
   config: z.json().optional(),
 });
 const instanceConfigMapSchema = z.record(z.string(), instanceConfigSchema);
+
+/** The placement transport's two knobs, with their own invariant.
+ *
+ *  The unreachable window has to be longer than the heartbeat period:  a
+ *  worker that has not said so for less than one period is healthy, and
+ *  marking it unreachable would stop work that is running fine.  The window
+ *  is raised rather than the heartbeat lowered, because a generous window
+ *  is the safe direction and a short heartbeat only costs a little traffic.
+ *
+ *  The pair is clamped, never rejected:  a knob that fails closed on a typo
+ *  would rather hold its bound than fail the whole configuration file, and
+ *  the store's rule for every other knob is the same one.  The vault can
+ *  hold an inverted pair the file never sees, so `clampPlacementWindow`
+ *  applies the same rule after the vault resolves. */
+export const placementSchema = z.object({
+  heartbeatSeconds: z.number().int().min(1).max(3600).optional(),
+  unreachableAfterSeconds: z.number().int().min(16).max(86400).optional(),
+}).strict().transform((value) => clampPlacementWindow(value));
+
+/** The placement knobs' shape, before the schema's transform. */
+export interface PlacementWindow {
+  heartbeatSeconds?: number;
+  unreachableAfterSeconds?: number;
+}
+
+/** The placement knobs' own invariant, applied to whatever the file and the
+ *  vault hold.  Returns the pair with the window raised above the period. */
+export function clampPlacementWindow(value: PlacementWindow): PlacementWindow {
+  const heartbeat = value.heartbeatSeconds;
+  const unreachable = value.unreachableAfterSeconds;
+  if (heartbeat === undefined || unreachable === undefined) return value;
+  if (unreachable <= heartbeat) return { ...value, unreachableAfterSeconds: heartbeat + 1 };
+  return value;
+}
+
 const appConfigSchema = z.object({
-  xai: z.object({ key: optionalText, url: optionalText }).optional(),
-  openaiCompat: z.object({ key: optionalText, url: optionalText }).optional(),
+  deleteInstance: optionalText,
+  xai: z.object({ key: optionalText, url: optionalText, credentialStorage: externalCredentialStorage }).optional(),
+  gemini: z.object({ key: optionalText, credentialStorage: externalCredentialStorage }).optional(),
+  openaiCompat: z.object({ key: optionalText, url: optionalText, credentialStorage: externalCredentialStorage }).optional(),
+  /** MiniMax API key and base URL.  Same shape as `openaiCompat` above and
+   * for the same reason: the driver speaks the OpenAI wire protocol against
+   * an endpoint the operator may repoint (global, China, a gateway), so the
+   * key and the URL travel together.  The driver itself reads
+   * `MINIMAX_API_KEY` and its per-instance `config.url`; this section is the
+   * workspace default those resolve from when no per-instance value is set. */
+  minimax: z.object({ key: optionalText, url: optionalText, credentialStorage: externalCredentialStorage }).optional(),
   /** Project key used for Sessions, catalog and agent tools. userId/sessionId
    * are non-secret local identifiers used to reuse one Composio Session. */
-  composio: z.object({ apiKey: optionalText, userId: optionalText, sessionId: optionalText }).optional(),
-  box: z.object({ token: optionalText }).optional(),
+  // brokerUrl is read by the desktop shell only: the HTTPS origin of a
+  // connected-apps broker the operator runs. There is no built-in default.
+  composio: z.object({ apiKey: optionalText, userId: optionalText, sessionId: optionalText, brokerUrl: optionalText, credentialStorage: externalCredentialStorage }).optional(),
+  box: z.object({ token: optionalText, credentialStorage: externalCredentialStorage }).optional(),
   vps: vpsConfigSchema.optional(),
   /** Optional OpenCode key; persisted write-only and passed only to its child. */
-  opencodeGo: z.object({ apiKey: optionalText }).optional(),
-  /** Voice credentials and the selected voice id. `provider` picks the
-   * engine: "elevenlabs" (default; needs a key) or "system" (the Mac's
-   * built-in voices, no key). */
-  tts: z.object({ key: optionalText, voice: optionalText, provider: z.enum(["elevenlabs", "system"]).optional() }).optional(),
+  opencodeGo: z.object({ apiKey: optionalText, credentialStorage: externalCredentialStorage }).optional(),
+  /** Optional DeepSeek API key — used only to display the user's account
+   * balance under the engine row, never injected into the engine's process
+   * environment. The user can run a deepseek CLI without this set; the
+   * engine does not need the key to function. "for my user" — workspace
+   * scope, not per-bot. */
+  deepseek: z.object({ key: optionalText, url: optionalText, credentialStorage: externalCredentialStorage }).optional(),
+  /** Voice credentials, the workspace default voice id (what every bot
+   * without a voice of its own speaks with), and the pronunciation list.
+   * `provider` picks the engine; `ladder` overrides hosted fallback order. */
+  tts: z.object({
+    key: optionalText,
+    voice: optionalText,
+    provider: z.enum(TTS_PROVIDERS).optional(),
+    ladder: z.array(z.enum(HOSTED_TTS_PROVIDERS)).max(HOSTED_TTS_PROVIDERS.length).optional(),
+    enabled: z.boolean().optional(),
+    optimizedSummary: z.boolean().optional(),
+    audioRetentionDays: z.number().int().min(0).max(3650).optional(),
+    pronunciations: pronunciationListSchema.optional(),
+    credentialStorage: externalCredentialStorage,
+  }).strict().optional(),
+  callStt: z.object({
+    provider: z.enum(CALL_STT_PROVIDERS).nullable().optional(),
+    ladder: z.array(z.enum(CLOUD_STT_PROVIDERS)).max(CLOUD_STT_PROVIDERS.length).optional(),
+    keyterms: z.array(z.string().trim().min(1)).max(100).optional(),
+  }).strict().optional(),
+  azureSpeech: z.object({ key: optionalText, region: optionalText, credentialStorage: externalCredentialStorage }).strict().optional(),
+  metaSpeech: z.object({ key: optionalText, credentialStorage: externalCredentialStorage }).strict().optional(),
+  groq: z.object({ key: optionalText, credentialStorage: externalCredentialStorage }).strict().optional(),
+  assemblyai: z.object({ key: optionalText, credentialStorage: externalCredentialStorage }).strict().optional(),
+  // Call-mode speech-to-speech.  Opt-in per workspace and deliberately separate
+  // from callStt: an STS provider replaces the whole chained loop rather than
+  // swapping one link of it.  `provider: null` means Auto — use whichever
+  // provider has a key, preferring the configured default.
+  sts: z.object({
+    provider: z.enum(["xai", "gemini"]).nullable().optional(),
+    // Hand real work to the bot's own engine through a function tool.  When
+    // false the model answers alone; when true a slow or failed engine falls
+    // back to the model for that turn and marks the line engineBypassed.
+    frontEngine: z.boolean().optional(),
+    engineTimeoutMs: z.number().int().min(1000).max(120000).optional(),
+  }).optional(),
   /** OpenAI key used only by the in-process avatar image generator. */
-  imageGen: z.object({ key: optionalText }).optional(),
-  autoUpdate: z.object({ enabled: z.boolean().optional() }).optional(),
+  imageGen: z.object({ key: optionalText, credentialStorage: externalCredentialStorage }).optional(),
+  autoUpdate: z
+    .object({
+      enabled: z.boolean().optional(),
+      /** Wall-clock ms of the last successful automatic check.  Used by the
+       * desktop shell to enforce the 6-hour throttle without consulting the
+       * harness on every tick. */
+      lastCheckMs: z.number().int().nonnegative().optional(),
+      /** Fingerprint of the BotFleet.app bundle at the last check, so a
+       * reinstall that landed an out-of-band build between checks still
+       * shows up as "different from last known" on the next cycle. */
+      lastAppFingerprint: z.string().optional(),
+    })
+    .optional(),
   /** Non-secret profile details shown in the sidebar. */
   profile: z.object({ name: optionalText, email: optionalText }).optional(),
   rooms: roomConfigSchema.optional(),
+  botDefaults: botDefaultsSchema.optional(),
+  /** Linq transport credentials live in `process.env` — never on disk — so
+   *  a stolen config.json does not hand an attacker a phone number.  Only
+   *  the workspace phone + per-bot toggle + sender policy live on disk. */
+  githubRequestLog: z.object({
+    /** Dedicated HMAC secret resolved through the canonical secret map. */
+    webhookSecret: optionalText,
+  }).optional(),
+  imessageLinq: z.object({
+    /** Linq phone number that receives iMessage on this workspace's behalf
+     *  — typically the Director bot's number.  Formatted E.164.  Stored
+     *  because operators want to see the number they bound. */
+    botNumber: optionalText,
+    /** Partner API token. Prefer env/Infisical; kept optional on disk for sync only. */
+    apiToken: optionalText,
+    /** Webhook signing secret. Prefer env/Infisical; kept optional on disk for sync only. */
+    webhookSecret: optionalText,
+    /** Per-bot transport choice.  Absent means the bot defaults to
+     *  "mac-relay" (the existing python relay path); setting this to "linq"
+     *  routes that bot's inbound through Linq.  We surface "mac-relay" for
+     *  completeness even though this lane adds no new behavior on that
+     *  side. */
+    perBot: z.record(z.string(), z.enum(["off", "mac-relay", "linq"])).optional(),
+    /** Hub workspace-level allow/deny lists, applied before per-bot
+     *  overrides.  Phone numbers in E.164. */
+    ignoredSenders: z.array(z.string()).optional(),
+    allowedSenders: z.array(z.string()).optional(),
+    /** Toggle for the optional `send_voice_message` tool.  Off by default
+     *  because a hosted voice costs per character and we will not enable it
+     *  without the operator's explicit consent. */
+    allowVoiceByDefault: z.boolean().optional(),
+  }).optional(),
+  /** The Zulip source (docs/zulip.md): which BotFleet bots hold a Zulip
+   *  identity, where their keys come from, and the wake and post rules.  No
+   *  key lives here — `credentialDir` names the folder of `<Role>-zuliprc`
+   *  files, and `credentialSource: "infisical"` reads the vault instead.  A malformed section reads as absent rather than failing the
+   *  whole stored config, so a typo turns Zulip off and nothing else. */
+  zulip: zulipConfigSchema.optional().catch(undefined),
   ingress: z.object({
     publicUrl: z
       .string()
@@ -115,57 +524,654 @@ const appConfigSchema = z.object({
       .refine((value) => value === undefined || value === "" || isAbsoluteHttpUrl(value), {
         message: "must be an absolute http(s) URL",
       }),
+    webhookPublicUrl: z
+      .string()
+      .optional()
+      .refine((value) => value === undefined || value === "" || isAbsoluteHttpUrl(value), {
+        message: "must be an absolute http(s) URL",
+      }),
+    /** Whether the public URL is applied at all. Off keeps the stored URL
+     * for the next time the toggle is flipped on, but the webhook receiver
+     * does not advertise it. */
+    enabled: z.boolean().optional(),
   }).optional(),
   localVm: localVmConfigSchema.optional(),
+  qdrant: z.object({
+    enabled: z.boolean().optional(),
+    url: z.string().optional(),
+    apiKey: z.string().optional(),
+    collection: z.string().optional(),
+    // Cloudflare Access service token, for a recall service published
+    // behind Access.  Access ignores a bearer credential and wants this
+    // header pair instead, so it is a separate field, not another API key.
+    accessClientId: z.string().optional(),
+    accessClientSecret: z.string().optional(),
+  }).optional(),
+  // The fleet's fallback reviewer: the provider instance that reviews a
+  // bot's approvals when the bot's own engine cannot run an isolated review,
+  // or when its own review fails (server/auto-review.ts `reviewersFor`).
+  // Absent or empty is Automatic (the best healthy engine that can review,
+  // shared/auto-review.ts `pickAutoReviewer`), "none" turns it off, and
+  // anything else is the instance id the owner picked.
+  // `maxReviewsPerTurn` caps reviewer calls per turn (a knob, see
+  // server/knob-map.ts); past it On fails closed and Watch stops recording.
+  autoReview: z.object({
+    fallbackReviewer: z.string().max(200).optional(),
+    maxReviewsPerTurn: z.number().int().min(MIN_MAX_REVIEWS_PER_TURN).max(MAX_MAX_REVIEWS_PER_TURN).optional(),
+  }).optional(),
+  // Usage telemetry has no built-in endpoint: whoever runs BotFleet points
+  // it at their own usage monitor. Unconfigured means the stream is off.
+  usage: z.object({
+    ingestUrl: optionalText,
+    ingestToken: optionalText,
+    readToken: optionalText,
+    // Whether a subscription window the native Usage Monitor app reports
+    // spent on this Mac may divert auto-fallback.  Absent means on.
+    localQuotaRouting: z.boolean().optional(),
+    projects: z
+      .array(z.object({ slug: z.string(), match: z.array(z.string()).optional() }))
+      .optional(),
+    enginePlans: z
+      .record(
+        z.string(),
+        z.object({
+          planName: z.string().optional(),
+          costPerMonth: z.number().nullable().optional(),
+        }),
+      )
+      .optional(),
+    // Hard stop on rolling 5-hour spend, in dollars.  OFF unless a number is
+    // set, because an unattended fleet that stops working is a worse failure
+    // than one that overspends — and the number this is measured against is
+    // only as complete as the engines that report a cost, which is why the
+    // gate also requires `spendCeilingMinPricedShare` below.
+    spendCeilingUsd: z.number().positive().optional(),
+    /** The share of settled turns in the window that must carry a real price
+     *  before the ceiling is allowed to act.  Below it, the visible total is
+     *  too much of a floor to block work on: an engine that reports no cost
+     *  contributes zero to the sum while spending very much more than zero.
+     *  Defaults to 0.5 — the ceiling must be able to see at least half the
+     *  window to be trusted with stopping the fleet. */
+    spendCeilingMinPricedShare: z.number().min(0).max(1).optional(),
+  }).optional(),
+  // Background jobs (jobs P1, docs/plans/2026-10-01-background-jobs-and-
+  // subagents-decision.md).  On by default for HTTP-lane bots; `wake: false`
+  // is the kill switch for wake turns, and `cliLanes: false` returns the job
+  // tools to the HTTP lane only (jobs P2, which mounts them for command-line
+  // engines over MCP).  Every number is clamped again where it is used
+  // (server/jobs/registry.ts resolveJobsSettings): no setting can lift a
+  // job's run limit past 6 hours.
+  jobs: z.object({
+    enabled: z.boolean().optional(),
+    wake: z.boolean().optional(),
+    cliLanes: z.boolean().optional(),
+    defaultMinutes: z.number().int().min(1).max(360).optional(),
+    maxMinutes: z.number().int().min(1).max(360).optional(),
+    queueWaitMinutes: z.number().int().min(1).max(10080).optional(),
+    cpuCores: z.number().min(1).max(64).optional(),
+    admission: z.object({
+      maxSwapPercent: z.number().min(1).max(100).optional(),
+      minFreeDiskMb: z.number().min(0).optional(),
+      minFreeInodes: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
+      // Headroom (P-BF-6 B7): absent means unset — no gate and no default.
+      // `null` is the wire spelling of "clear this knob back to unset" and is
+      // what a client sends when the owner empties a previously-set box.
+      // Absent still means "leave it"; only an explicit null deletes, the
+      // same differential `botDefaults.allowedComputers` and
+      // `callStt.provider` already use.  The merge below turns null into the
+      // deletion itself, so a stored file never holds null and resolution
+      // keeps reading `number | undefined`.
+      reservedCpuCores: z.number().int().min(0).max(64).nullable().optional(),
+      reservedRamMb: z.number().int().min(0).nullable().optional(),
+      minMemoryAvailablePercent: z.number().min(0).max(100).nullable().optional(),
+    }).optional(),
+    // How long a webhook may sit queued while the host is hot before the
+    // scheduler dispatches it anyway.  Absent means 20 minutes
+    // (DEFAULT_WEBHOOK_HOT_DEFER_MINUTES).  The vault knob of the same
+    // field overrides the file.
+    webhookHotDeferMinutes: z.number().int().min(1).max(720).optional(),
+    // Seconds to drop a repeat of an accepted webhook for the same bot and source (absent means 120, and 0 disables).
+    webhookPayloadDedupeSeconds: z.number().int().min(0).max(3600).optional(),
+  }).optional(),
+  // The placement transport's own two knobs (server/placement-controller-bridge.ts
+  // and the lease service's unreachable window).  Both are optional: an
+  // absent field resolves to the built-in default, and the vault knob of the
+  // same field overrides the file.  `heartbeatSeconds` is the worker's
+  // heartbeat period and `unreachableAfterSeconds` is how long a worker may
+  // go quiet before the controller marks it unreachable, so the second must
+  // be longer than the first or a healthy worker is swept.
+  placement: placementSchema.optional(),
+  // How long one computer call waits inside the harness while its desktop
+  // is busy (server/computer-call-gate.ts).  Every field is optional: an
+  // absent field resolves through the legacy `OMB_COMPUTER_*` env names to
+  // the gate's built-in defaults (`computerCallSettings` below), and the
+  // vault knobs of the same fields override both.  The bounds are the
+  // gate's own clamps — a wait can never outlast the bridge client that is
+  // blocked on it (`CONTROL_WAIT_MS` in server/control-client.ts).
+  computerCall: z.object({
+    waitMs: z.number().int().min(500).max(CONTROL_WAIT_MS).optional(),
+    actWithinMs: z.number().int().min(100).max(CONTROL_ACT_WITHIN_MS).optional(),
+    personAwayMs: z.number().int().min(1).max(2_147_483_647).optional(),
+  }).strict().optional(),
+  // How long an idle Claude CLI session is kept warm before the driver
+  // closes it (server/drivers/claude.ts).  `idleMinMs` is the floor the
+  // effective window never drops below.  Absent fields resolve through the
+  // legacy `OMB_CLAUDE_SESSION_IDLE_*` env names to the driver's built-in
+  // defaults (`claudeSessionIdleMs` below); the vault knobs override both.
+  claudeSession: z.object({
+    idleMs: z.number().int().min(1).max(2_147_483_647).optional(),
+    idleMinMs: z.number().int().min(1).max(2_147_483_647).optional(),
+  }).strict().optional(),
+  // Error and performance reporting.  The kill switch is explicit: a DSN
+  // with no `enabled` flag reports.  Only a stored `false` stops it, so an
+  // upgraded install never goes quiet without saying why.
+  observability: z.object({
+    sentryDsn: optionalText,
+    sentryFleetDsn: optionalText,
+    enabled: z.boolean().optional(),
+    environment: optionalText,
+    tracesSampleRate: z.number().min(0).max(1).optional(),
+    aiTracesSampleRate: z.number().min(0).max(1).optional(),
+    httpTracesSampleRate: z.number().min(0).max(1).optional(),
+    uiTracesSampleRate: z.number().min(0).max(1).optional(),
+    logsEnabled: z.boolean().optional(),
+  }).optional(),
+  // An optional external secret store.
+  //
+  // Unconfigured is inert: without the
+  // project and selected method's credentials, BotFleet resolves as it always
+  // has.  The kill switch is explicit the same way `ingress` and
+  // `observability` are — absent means on once it is configured.
+  infisical: infisicalConfigSchema.optional(),
+  // Infisical Agent Proxy settings. Off by default. When enabled, agent CLIs
+  // and child processes route through the local Infisical Agent Proxy
+  // daemon (HTTP_PROXY/HTTPS_PROXY/NO_PROXY and TLS CA certificate injection).
+  agentProxy: z.object({
+    enabled: z.boolean().optional(),
+    address: optionalText,
+    projectId: optionalText,
+    environment: optionalText,
+    secretPath: optionalText,
+    caCertPath: optionalText,
+  }).strict().optional(),
+  // Lifecycle policy for the always-on harness itself: who may wake it, who
+  // may raise the desktop, and what quitting the desktop app does to it.
+  //
+  // Every field is optional and every ABSENT field means the conservative
+  // choice, so an existing config file keeps its behaviour with no migration.
+  // `allowRemoteDesktopLaunch` defaults to false because the path it guards
+  // reaches this Mac from a phone: the Companion sidecar replays a device
+  // request to 127.0.0.1, which satisfies the loopback-only check in the
+  // harness by construction (companion/src/proxy.ts says so in its header).
+  // A named permission that is off until asked for is the only defensible
+  // default for that.
+  //
+  // `persistOnExit` defaults to TRUE, deliberately, and is the one place this
+  // section does not take the conservative option.  False means quitting the
+  // desktop app tears down the harness and the local VM.  The harness is
+  // launchd-supervised and is documented as always-on in MAC-LOCAL-PROCESSES,
+  // and every paired phone depends on it answering after the window closes;
+  // defaulting this to false would turn a normal quit into an outage.  The
+  // native Mac app is the thing that wants false, and it does not exist yet —
+  // when it lands it opts in here explicitly rather than inheriting it.
+  server: z.object({
+    allowRemoteDesktopLaunch: z.boolean().optional(),
+    persistOnExit: z.boolean().optional(),
+  }).strict().optional(),
   features: featureConfigSchema.optional(),
+  conversationMode: z.enum(STORED_CONVERSATION_MODES).optional(),
+  busySendDefault: z.enum(BUSY_SEND_DEFAULTS).optional(),
+  terminology: z
+    .enum(["channels", "groups", "projects", "apps", "topics", "repos", "custom"])
+    .optional(),
+  // Only read when terminology is "custom".  Both forms are stored because
+  // English plurals are not reliably "add an s" — Category/Categories.
+  terminologyCustom: z
+    .object({
+      singular: z.string().max(ROOM_LABEL_MAX_LENGTH).optional(),
+      plural: z.string().max(ROOM_LABEL_MAX_LENGTH).optional(),
+    })
+    .optional(),
   instances: instanceConfigMapSchema.optional(),
+  /** Owner-managed MCP servers (Claude/Cursor `mcpServers` shape). */
+  mcpServers: z.record(z.string(), z.json()).optional(),
 });
-const appConfigPatchSchema = appConfigSchema.omit({ instances: true });
+// `deleteInstance` also lives on the base schema (saveConfig's internal
+// callers use appConfigSchema.partial() directly, not this schema) but must
+// never be reachable from the general PATCH /api/config body: that route has
+// none of the DELETE /api/instances/:id route's protections (protected-engine
+// check, busy-bot check, atomic reassignment), so accepting it here would let
+// `PATCH /api/config {"deleteInstance":"claude"}` bypass all of them and
+// strand bots on a protected engine that no longer exists.
+// A save is strict about the Zulip section (a bad value is a 400 the panel
+// can show), while a stored file stays lenient (a bad value turns Zulip off).
+const appConfigPatchSchema = appConfigSchema
+  .omit({ instances: true, deleteInstance: true })
+  .extend({
+    zulip: zulipConfigSchema.optional(),
+    // Stored files stay forward-compatible; requests must not silently accept typos or inline source tokens.
+    infisical: infisicalConfigSchema.extend({
+      readSources: z.array(infisicalReadSourceSchema.strict()).max(32).optional(),
+    }).strict().optional(),
+  });
 const jsonObjectSchema = z.record(z.string(), z.json());
 
 export interface AppConfig {
-  xai?: { key?: string; url?: string };
-  openaiCompat?: { key?: string; url?: string };
-  composio?: { apiKey?: string; userId?: string; sessionId?: string };
-  box?: { token?: string };
+  deleteInstance?: string;
+  xai?: { key?: string; url?: string; credentialStorage?: "external" };
+  gemini?: { key?: string; credentialStorage?: "external" };
+  openaiCompat?: { key?: string; url?: string; credentialStorage?: "external" };
+  minimax?: { key?: string; url?: string; credentialStorage?: "external" };
+  composio?: { apiKey?: string; userId?: string; sessionId?: string; brokerUrl?: string; credentialStorage?: "external" };
+  box?: { token?: string; credentialStorage?: "external" };
   /** A named host from the user's SSH config. Authentication stays with SSH. */
-  vps?: { sshAlias?: string };
-  opencodeGo?: { apiKey?: string };
-  tts?: { key?: string; voice?: string; provider?: "elevenlabs" | "system" };
-  imageGen?: { key?: string };
-  autoUpdate?: { enabled?: boolean };
+  vps?: { sshAlias?: string; memoryGib?: number; cpus?: number };
+  opencodeGo?: { apiKey?: string; credentialStorage?: "external" };
+  deepseek?: { key?: string; url?: string; credentialStorage?: "external" };
+  /** `voice` is the workspace default voice; `pronunciations` is the
+   *  workspace list of terms and how to say them (shared/pronunciations.ts),
+   *  absent until first saved, which means the seeded defaults. */
+  tts?: {
+    key?: string;
+    voice?: string;
+    provider?: (typeof TTS_PROVIDERS)[number];
+    ladder?: Array<(typeof HOSTED_TTS_PROVIDERS)[number]>;
+    /** Absent or true keeps voice on (existing behavior).  False gates
+     *  auto-speak, calls, and the TTS / STS routes. */
+    enabled?: boolean;
+    optimizedSummary?: boolean;
+    audioRetentionDays?: number;
+    pronunciations?: Pronunciation[];
+    credentialStorage?: "external";
+  };
+  /** Call-mode dictation. The picker in `src/lib/transcription-provider.ts`
+   *  falls back to platform defaults when `provider` is absent (Apple on
+   *  macOS without a cloud key, cloud providers when keys land).
+   *  `keyterms` is the global vocabulary the model is told to spell correctly. */
+  callStt?: {
+    provider?: (typeof CALL_STT_PROVIDERS)[number] | null;
+    ladder?: Array<(typeof CLOUD_STT_PROVIDERS)[number]>;
+    keyterms?: string[];
+  };
+  azureSpeech?: { key?: string; region?: string; credentialStorage?: "external" };
+  metaSpeech?: { key?: string; credentialStorage?: "external" };
+  groq?: { key?: string; credentialStorage?: "external" };
+  assemblyai?: { key?: string; credentialStorage?: "external" };
+  sts?: {
+    provider?: "xai" | "gemini" | null;
+    frontEngine?: boolean;
+    engineTimeoutMs?: number;
+  };
+  imageGen?: { key?: string; credentialStorage?: "external" };
+  autoUpdate?: {
+    enabled?: boolean;
+    lastCheckMs?: number;
+    lastAppFingerprint?: string;
+  };
   profile?: { name?: string; email?: string };
   rooms?: { turnTimeoutMinutes: number };
-  ingress?: { publicUrl?: string };
+  botDefaults?: {
+    computers?: Array<"cloud" | "vm" | "local">;
+    cloudBackend?: "box" | "vps";
+    /** Operator-level allowlist; an absent entry means the destination is
+     * allowed.  `null` is the same thing said out loud, and is what a client
+     * sends to clear a narrowed allowlist back to "everything".  Legacy
+     * input — the redesigned Computer settings UI writes
+     * `computerProviders` and `vpsMode` instead, and the renderer
+     * back-fills `allowedComputers` from the new shape for the cut-over
+     * so server-side allowlist gates keep working. */
+    allowedComputers?: Array<"cloud" | "vm" | "local"> | null;
+    /** Per-bot iMessage transport.  Lives under `botDefaults` (not in the
+     *  bot record) so settings can carry it as part of the same workspace
+     *  config the user patches in one round-trip.  Resolution per inbound:
+     *    1. `perBot[botId]` — explicit operator choice.
+     *    2. absent — treated as "off" (no surprise Linq activation). */
+    imessagePerBot?: Record<string, "off" | "mac-relay" | "linq">;
+    /** Per-provider allowlist written by the redesigned Computer settings
+     * UI.  Boots migrate any pre-existing `allowedComputers` to this
+     * shape via `migrateComputerProvidersConfig` below. */
+    computerProviders?: {
+      asciiBox?: boolean;
+      selfHostedVps?: boolean;
+      localVm?: boolean;
+      localMac?: boolean;
+    };
+    /** Shared-vs-per-bot VPS mode.  `null` means "not configured" and
+     * is only valid when `selfHostedVps` is off. */
+    vpsMode?: "shared" | "per-bot" | null;
+  };
+  /** Workspace Linq binding.  Phone number + sender policy + voice-tool
+   *  consent live here, not on the bot itself, because Linq hands one phone
+   *  number per workspace in hobby tier — multiple bots share it; the
+   *  per-bot transport choice picks WHICH bot each inbound routes to.
+   *
+   *  Tokens never live here: `LINQ_API_TOKEN` and `LINQ_WEBHOOK_SECRET`
+   *  come from `process.env` (the runtime secret layer). */
+  githubRequestLog?: { webhookSecret?: string };
+  imessageLinq?: {
+    botNumber?: string;
+    apiToken?: string;
+    webhookSecret?: string;
+    ignoredSenders?: string[];
+    allowedSenders?: string[];
+    allowVoiceByDefault?: boolean;
+  };
+  ingress?: { publicUrl?: string; enabled?: boolean; webhookPublicUrl?: string };
+  /** The Zulip source (docs/zulip.md, server/zulip/types.ts). */
+  zulip?: import("./zulip/types.ts").ZulipSettings;
   /** Shared preserves the historical singleton. Per-bot gives every bot a
    * separate container, durable workspace, viewer and lease. */
-  localVm?: { mode?: "shared" | "per-bot"; maxInstances?: number };
+  localVm?: {
+    mode?: "shared" | "per-bot";
+    maxInstances?: number;
+    shareCliCredentials?: boolean;
+    shareGpgPrivateKeys?: boolean;
+    allowHostTerminal?: boolean;
+    cpus?: number;
+    memoryGib?: number;
+  };
+  /** Shared Qdrant Agent RAG vector database settings.  `accessClientId` /
+   * `accessClientSecret` are a Cloudflare Access service token: a pair of
+   * headers, needed when the recall service sits behind Access, where a
+   * bearer credential is ignored. */
+  qdrant?: {
+    enabled?: boolean;
+    url?: string;
+    apiKey?: string;
+    collection?: string;
+    accessClientId?: string;
+    accessClientSecret?: string;
+  };
+  /** Usage-monitor telemetry. `ingestUrl` is the operator's own endpoint —
+   * BotFleet ships none — and `projects` classifies a turn's working
+   * directory, bot name, or task title into a project slug. */
+  /** Background jobs (jobs P1).  See the schema above for what each field
+   *  means; absent is on, with the decision doc's defaults. */
+  jobs?: {
+    enabled?: boolean;
+    wake?: boolean;
+    cliLanes?: boolean;
+    defaultMinutes?: number;
+    maxMinutes?: number;
+    queueWaitMinutes?: number;
+    cpuCores?: number;
+    admission?: { maxSwapPercent?: number; minFreeDiskMb?: number; minFreeInodes?: number; reservedCpuCores?: number | null; reservedRamMb?: number | null; minMemoryAvailablePercent?: number | null };
+    /** Minutes a hot host may park a webhook before the wake dispatches
+     *  anyway.  Absent means 20. */
+    webhookHotDeferMinutes?: number;
+    /** Seconds to drop a repeat of an accepted webhook for the same bot and source (absent means 120, and 0 disables). */
+    webhookPayloadDedupeSeconds?: number;
+  };
+  /** The placement transport's two knobs (server/placement-controller-bridge.ts).
+   *  Derived from the schema, so the type cannot drift from what the store
+   *  accepts.  Absent fields resolve to the built-in defaults. */
+  placement?: z.infer<typeof placementSchema>;
+  /** Computer-call gate waits (server/computer-call-gate.ts).  See the
+   *  schema above; absent fields resolve in `computerCallSettings`. */
+  computerCall?: {
+    waitMs?: number;
+    actWithinMs?: number;
+    personAwayMs?: number;
+  };
+  /** Idle lifetime of a warm Claude CLI session (server/drivers/claude.ts).
+   *  Absent fields resolve in `claudeSessionIdleMs`. */
+  claudeSession?: {
+    idleMs?: number;
+    idleMinMs?: number;
+  };
+  /** Who reviews a bot's approvals when its own engine cannot, and how many
+   *  reviews one turn may spend. */
+  autoReview?: {
+    /** Empty or absent is Automatic, "none" is off, else an instance id. */
+    fallbackReviewer?: string;
+    /** Reviewer calls per turn.  Absent means DEFAULT_MAX_REVIEWS_PER_TURN. */
+    maxReviewsPerTurn?: number;
+  };
+  usage?: {
+    ingestUrl?: string;
+    ingestToken?: string;
+    readToken?: string;
+    /** Whether a locally-observed subscription cap diverts auto-fallback.
+     *  Absent means on; only a stored `false` turns it off. */
+    localQuotaRouting?: boolean;
+    projects?: Array<{ slug: string; match?: string[] }>;
+    enginePlans?: Record<string, { planName?: string; costPerMonth?: number | null }>;
+    /** Hard stop on rolling 5-hour spend, in dollars.  Off unless set, and
+     *  consulted only for unattended work. */
+    spendCeilingUsd?: number;
+    /** Share of the window that must be priced before the ceiling may act.
+     *  Absent means `DEFAULT_MIN_PRICED_SHARE`. */
+    spendCeilingMinPricedShare?: number;
+  };
+  /** Error and performance reporting.  `sentryDsn` is the operator's own
+   * Sentry project — BotFleet ships none.  `enabled` is the explicit kill
+   * switch: absent means on, so a stored DSN reports until somebody turns
+   * it off on purpose. */
+  observability?: {
+    sentryDsn?: string;
+    sentryFleetDsn?: string;
+    enabled?: boolean;
+    environment?: string;
+    tracesSampleRate?: number;
+    aiTracesSampleRate?: number;
+    httpTracesSampleRate?: number;
+    uiTracesSampleRate?: number;
+    logsEnabled?: boolean;
+  };
+  /** The optional external secret store.  When it holds one of the names in
+   * `server/secret-map.ts`, that value wins over both the environment and
+   * this file; every other field keeps the ordering it always had.
+   *
+   * `clientId` and `clientSecret` are the machine identity that unlocks the
+   * store, so they are the one pair of credentials in this file that never
+   * resolves through the vault — a lock cannot hold its own key.  They are
+   * read from this section or from `INFISICAL_CLIENT_ID` /
+   * `INFISICAL_CLIENT_SECRET`, and nowhere else.
+   *
+   * `token` and `writeToken` are service tokens: one read-only token for the
+   * folders this install reads and one write token for the folders it
+   * writes.  A token wins over the machine identity, and it is what every
+   * non-agent consumer uses.  They are read from this section or from
+   * `INFISICAL_TOKEN` / `INFISICAL_WRITE_TOKEN`. */
+  infisical?: {
+    authMethod?: InfisicalAuthMethod;
+    enabled?: boolean;
+    writeThrough?: boolean;
+    siteUrl?: string;
+    projectId?: string;
+    environment?: string;
+    secretPath?: string;
+    clientId?: string;
+    clientSecret?: string;
+    token?: string;
+    writeToken?: string;
+    readSources?: InfisicalReadSource[];
+    credentialStorage?: "external";
+    refreshMinutes?: number;
+  };
+  /** Infisical Agent Proxy settings. Off by default. */
+  agentProxy?: {
+    enabled?: boolean;
+    address?: string;
+    projectId?: string;
+    environment?: string;
+    secretPath?: string;
+    caCertPath?: string;
+  };
+  /** Lifecycle policy for the always-on harness.  Absent means the
+   *  conservative choice for every field; see the zod schema above for why
+   *  `persistOnExit` is the exception. */
+  server?: {
+    /** May a paired phone raise the BotFleet window on this Mac? */
+    allowRemoteDesktopLaunch?: boolean;
+    /** Does the harness outlive the desktop app's window? */
+    persistOnExit?: boolean;
+  };
   /** Opt-in product experiments. Every flag defaults to disabled. */
-  features?: { skillRecorder?: boolean; showToolCalls?: boolean; summarizeToolCalls?: boolean };
+  features?: {
+    skillRecorder?: boolean;
+    showToolCalls?: boolean;
+    summarizeToolCalls?: boolean;
+    gitWorktreeLeases?: boolean;
+  };
+  /** How the roster and threads are laid out.  Absent means simple. */
+  conversationMode?: ConversationMode;
+  /** Default delivery while a bot turn is busy.  Absent means steer-first. */
+  busySendDefault?: BusySendDefault;
+  /** What this person calls a room: one of the presets, or "custom" with a
+   * word of their own in `terminologyCustom`.  Absent means channels. */
+  terminology?: RoomTerminology;
+  /** The custom room word, singular and plural.  Read only when
+   * `terminology` is "custom"; resolved for clients by `resolveRoomLabels`. */
+  terminologyCustom?: CustomRoomLabels;
   instances?: InstanceConfigMap;
+  /** Owner-managed MCP servers (Claude/Cursor `mcpServers` shape). */
+  mcpServers?: Record<string, JsonValue>;
 }
-export type ConfigPatch = z.output<typeof appConfigPatchSchema>;
+export type ConfigPatch = Omit<z.output<typeof appConfigPatchSchema>, "conversationMode"> & {
+  conversationMode?: ConversationMode;
+};
 
 export function parseStoredConfig(value: JsonValue): AppConfig {
+  // Stored installs may still explicitly name the retired provider. Normalize
+  // that one legacy value before the strict schema runs, otherwise loadConfig
+  // catches the rejection as a first run and drops every setting in the file.
+  // API patches still use parseConfigPatch and cannot reintroduce ElevenLabs.
+  if (value && typeof value === "object" && !Array.isArray(value) &&
+      value.tts && typeof value.tts === "object" && !Array.isArray(value.tts) &&
+      value.tts.provider === "elevenlabs") {
+    value = { ...value, tts: { ...value.tts, provider: "minimax" } };
+  }
+  // A hand-edited pronunciation list must not cost every other setting: the
+  // strict schema below would reject the whole file over one bad entry, and
+  // loadConfig reads a rejection as a first run.  Keep the entries that pass
+  // on their own; a value that is not a list at all reads as never saved.
+  if (value && typeof value === "object" && !Array.isArray(value) &&
+      value.tts && typeof value.tts === "object" && !Array.isArray(value.tts) &&
+      Object.hasOwn(value.tts, "pronunciations")) {
+    const { pronunciations: stored, ...ttsRest } = value.tts;
+    const kept = sanitizeStoredPronunciations(stored);
+    value = {
+      ...value,
+      tts: kept === undefined ? ttsRest : { ...ttsRest, pronunciations: kept.map(({ term, say }) => ({ term, say })) },
+    };
+  }
   const parsed = appConfigSchema.safeParse(value);
   if (!parsed.success) throw new Error(schemaIssue(parsed.error, "Invalid stored configuration"));
-  return parsed.data;
+  return {
+    ...parsed.data,
+    conversationMode: parsed.data.conversationMode === undefined
+      ? undefined
+      : parseConversationMode(parsed.data.conversationMode),
+  };
 }
 
 export function parseConfigPatch(value: JsonValue): ConfigPatch {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    for (const section of ["xai", "gemini", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "azureSpeech", "metaSpeech", "groq", "assemblyai", "imageGen", "infisical"]) {
+      const candidate = value[section];
+      if (candidate && typeof candidate === "object" && !Array.isArray(candidate) &&
+          Object.hasOwn(candidate, "credentialStorage")) {
+        throw Object.assign(new Error(`${section}.credentialStorage is managed by the desktop credential store`), { status: 400 });
+      }
+    }
+  }
   const parsed = appConfigPatchSchema.safeParse(value);
   if (!parsed.success) {
     throw Object.assign(new Error(schemaIssue(parsed.error, "Invalid configuration")), { status: 400 });
   }
-  return parsed.data;
+  const { conversationMode: rawMode, ...rest } = parsed.data;
+  const ingestUrl = rest.usage?.ingestUrl;
+  if (ingestUrl !== undefined && ingestUrl.trim() && !isAbsoluteHttpUrl(ingestUrl)) {
+    throw Object.assign(new Error("usage.ingestUrl must be an absolute http(s) URL"), { status: 400 });
+  }
+  // An empty or whitespace DSN is the documented "clear the stored key"
+  // path, so it passes; anything else has to be a real DSN.
+  const sentryDsn = rest.observability?.sentryDsn;
+  if (sentryDsn !== undefined && sentryDsn.trim() && !isSentryDsn(sentryDsn)) {
+    throw Object.assign(new Error("observability.sentryDsn must be a Sentry https:// DSN"), { status: 400 });
+  }
+  const sentryFleetDsn = rest.observability?.sentryFleetDsn;
+  if (sentryFleetDsn !== undefined && sentryFleetDsn.trim() && !isSentryDsn(sentryFleetDsn)) {
+    throw Object.assign(new Error("observability.sentryFleetDsn must be a Sentry https:// DSN"), { status: 400 });
+  }
+  const sentryEnvironment = rest.observability?.environment;
+  if (
+    sentryEnvironment !== undefined &&
+    sentryEnvironment.trim().length > MAX_OBSERVABILITY_ENVIRONMENT_LENGTH
+  ) {
+    throw Object.assign(
+      new Error(
+        `observability.environment must be ${MAX_OBSERVABILITY_ENVIRONMENT_LENGTH} characters or fewer`,
+      ),
+      { status: 400 },
+    );
+  }
+  // The site URL, the project id, the environment and the secret path all end
+  // up in the URL of every call to the secret store, so they are validated at
+  // the door rather than escaped at each use.  An empty string is the
+  // documented "clear this field" path for all four.
+  const siteUrl = rest.infisical?.siteUrl;
+  if (siteUrl !== undefined && siteUrl.trim() && !isHttpsUrl(siteUrl)) {
+    throw Object.assign(new Error("infisical.siteUrl must be an absolute https:// URL"), { status: 400 });
+  }
+  const secretPath = rest.infisical?.secretPath;
+  if (secretPath !== undefined && secretPath.trim() && !secretPath.trim().startsWith("/")) {
+    throw Object.assign(new Error("infisical.secretPath must start with /"), { status: 400 });
+  }
+  const infisicalEnvironment = rest.infisical?.environment;
+  if (
+    infisicalEnvironment !== undefined &&
+    infisicalEnvironment.trim() &&
+    !INFISICAL_ENVIRONMENT_PATTERN.test(infisicalEnvironment.trim())
+  ) {
+    throw Object.assign(
+      new Error("infisical.environment must be 1 to 64 lowercase letters, numbers, or dashes"),
+      { status: 400 },
+    );
+  }
+  const projectId = rest.infisical?.projectId;
+  if (projectId !== undefined && projectId.trim() && !INFISICAL_PROJECT_ID_PATTERN.test(projectId.trim())) {
+    throw Object.assign(
+      new Error("infisical.projectId must be 1 to 64 letters, numbers, or dashes"),
+      { status: 400 },
+    );
+  }
+  return rawMode === undefined
+    ? rest
+    : { ...rest, conversationMode: parseConversationMode(rawMode) };
 }
 
 export function vpsSshAlias(cfg: AppConfig): string | null {
   return isValidSshAlias(cfg.vps?.sshAlias) ? cfg.vps.sshAlias : null;
 }
 
+/** The per-desktop budget on this operator's VPS.  Both accessors fall back
+ * to the shared-host default, so an unconfigured VPS still gets a size that
+ * lets several bots coexist on one machine. */
+export function vpsMemoryGib(cfg: AppConfig): number {
+  return cfg.vps?.memoryGib ?? VPS_DEFAULT_MEMORY_GIB;
+}
+
+export function vpsCpus(cfg: AppConfig): number {
+  return cfg.vps?.cpus ?? VPS_DEFAULT_CPUS;
+}
+
 export function roomTurnTimeoutMinutes(cfg: AppConfig): number {
   return cfg.rooms?.turnTimeoutMinutes ?? DEFAULT_ROOM_TURN_TIMEOUT_MINUTES;
+}
+
+export const AUTO_UPDATE_THROTTLE_MS = 6 * 60 * 60 * 1000;
+
+/** True when an automatic check is allowed to run right now.  The toggle
+ * gates the throttle: an off setting means no auto check ever, regardless
+ * of how long it has been since the last one.  Manual "Check for Updates"
+ * always bypasses this helper. */
+export function autoUpdateDue(cfg: AppConfig, nowMs: number = Date.now()): boolean {
+  if (cfg.autoUpdate?.enabled !== true) return false;
+  const last = cfg.autoUpdate?.lastCheckMs;
+  if (typeof last !== "number" || !Number.isFinite(last) || last < 0) return true;
+  return nowMs - last >= AUTO_UPDATE_THROTTLE_MS;
 }
 
 export function publicIngressUrl(cfg: AppConfig): string | null {
@@ -173,31 +1179,566 @@ export function publicIngressUrl(cfg: AppConfig): string | null {
   return raw && isAbsoluteHttpUrl(raw) ? raw.replace(/\/+$/, "") : null;
 }
 
-export function localVmMode(cfg: AppConfig): "shared" | "per-bot" {
-  return cfg.localVm?.mode ?? DEFAULT_LOCAL_VM_MODE;
+export function webhookPublicIngressUrl(cfg: AppConfig): string | null {
+  const dedicated = cfg.ingress?.webhookPublicUrl?.trim();
+  const raw = dedicated && isAbsoluteHttpUrl(dedicated) ? dedicated : cfg.ingress?.publicUrl?.trim();
+  return raw && isAbsoluteHttpUrl(raw) ? raw.replace(/\/+$/, "") : null;
+}
+
+/** The public URL that should actually be advertised.  Disabled
+ * (`ingress.enabled === false`) keeps the stored value on disk for the next
+ * time the user flips the switch, but the harness behaves as if the URL
+ * were empty.  An absent flag defaults to on, so a config without the field
+ * keeps working as it did before the toggle existed. */
+export function publicIngressUrlEffective(cfg: AppConfig): string | null {
+  if (cfg.ingress?.enabled === false) return null;
+  return publicIngressUrl(cfg);
+}
+
+export function webhookPublicIngressUrlEffective(cfg: AppConfig): string | null {
+  if (cfg.ingress?.enabled === false) return null;
+  return webhookPublicIngressUrl(cfg);
+}
+
+
+/** The operator's usage-monitor origin, or null when they have not set one.
+ * There is deliberately no fallback endpoint — an unconfigured install sends
+ * telemetry nowhere. */
+export function usageIngestUrl(cfg: AppConfig): string | null {
+  const raw = cfg.usage?.ingestUrl?.trim();
+  return raw && isAbsoluteHttpUrl(raw) ? raw.replace(/\/+$/, "") : null;
+}
+
+/** Project classification rules, in the order they should be consulted.
+ * Rules with no usable slug or no match terms are dropped. */
+/** Local subscription caps divert auto-fallback unless turned off. */
+/** The stored fallback-reviewer setting: null for Automatic, "none" for off,
+ *  or the instance id the owner picked (shared/auto-review.ts
+ *  `fallbackReviewerSetting` reads it). */
+export function autoReviewFallbackReviewer(cfg: AppConfig): string | null {
+  const id = cfg.autoReview?.fallbackReviewer?.trim();
+  return id ? id : null;
+}
+
+/** Reviewer calls one turn may spend, clamped to the knob's bounds. */
+export function autoReviewMaxPerTurn(cfg: AppConfig): number {
+  const value = cfg.autoReview?.maxReviewsPerTurn ?? Number.NaN;
+  if (!Number.isFinite(value)) return DEFAULT_MAX_REVIEWS_PER_TURN;
+  return Math.min(MAX_MAX_REVIEWS_PER_TURN, Math.max(MIN_MAX_REVIEWS_PER_TURN, Math.floor(value)));
+}
+
+/** The longest any turn waits for a person who has the computer before it
+ *  stops waiting and says so.  Mirrors `COMPUTER_WAIT_MAX_MS` in
+ *  server/computer-call-gate.ts, the gate's own fallback when no resolved
+ *  setting reaches it. */
+export const DEFAULT_COMPUTER_PERSON_AWAY_MS = 30 * 60 * 1000;
+
+export interface ComputerCallSettings {
+  waitMs: number;
+  actWithinMs: number;
+  personAwayMs: number;
+}
+
+function boundedMs(value: number | undefined, fallback: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value !== undefined && Number.isFinite(value) && value > 0 ? value : fallback));
+}
+
+/** The computer-call gate's waits, already defaulted and clamped to the
+ *  gate's bounds.  The stored (or vault-resolved) field wins; underneath it
+ *  the long-standing `OMB_COMPUTER_*` env names still apply, so an operator
+ *  who pinned those before this section existed keeps what they had — the
+ *  same ordering `observabilitySettings` uses for the Sentry rates. */
+export function computerCallSettings(cfg: AppConfig): ComputerCallSettings {
+  const wait = cfg.computerCall?.waitMs ?? Number(process.env.OMB_COMPUTER_CALL_WAIT_MS);
+  const actWithin = cfg.computerCall?.actWithinMs ?? Number(process.env.OMB_COMPUTER_CALL_ACT_WITHIN_MS);
+  const personAway = cfg.computerCall?.personAwayMs ?? Number(process.env.OMB_COMPUTER_WAIT_MAX_MS);
+  return {
+    waitMs: boundedMs(wait, CONTROL_WAIT_MS, 500, CONTROL_WAIT_MS),
+    actWithinMs: boundedMs(actWithin, CONTROL_ACT_WITHIN_MS, 100, CONTROL_ACT_WITHIN_MS),
+    personAwayMs:
+      personAway !== undefined && Number.isFinite(personAway) && personAway > 0
+        ? personAway
+        : DEFAULT_COMPUTER_PERSON_AWAY_MS,
+  };
+}
+
+/** Ten quiet minutes is long enough that a follow-up message reuses the
+ *  warm Claude process, short enough that an abandoned thread does not
+ *  hold one open all day.  The floor exists so a typo cannot close a
+ *  session out from under a turn that is merely slow to start. */
+export const DEFAULT_CLAUDE_SESSION_IDLE_MS = 10 * 60_000;
+export const DEFAULT_CLAUDE_SESSION_IDLE_MIN_MS = 10_000;
+
+/** How long an idle Claude CLI session stays warm, with the configured
+ *  floor applied.  Stored (or vault-resolved) fields win; the legacy
+ *  `OMB_CLAUDE_SESSION_IDLE_*` env names sit underneath them, as in
+ *  `observabilitySettings`. */
+export function claudeSessionIdleMs(cfg: AppConfig): number {
+  const configuredMinimum = cfg.claudeSession?.idleMinMs ?? Number(process.env.OMB_CLAUDE_SESSION_IDLE_MIN_MS);
+  const minimum =
+    configuredMinimum !== undefined && Number.isFinite(configuredMinimum) && configuredMinimum > 0
+      ? configuredMinimum
+      : DEFAULT_CLAUDE_SESSION_IDLE_MIN_MS;
+  const configured = cfg.claudeSession?.idleMs ?? Number(process.env.OMB_CLAUDE_SESSION_IDLE_MS);
+  // Node timers collapse delays above 2^31-1 to 1ms, which would close
+  // the warm session on every turn instead of keeping it.
+  return Math.min(2_147_483_647, Math.max(minimum, configured || DEFAULT_CLAUDE_SESSION_IDLE_MS));
+}
+
+export function localQuotaRoutingEnabled(cfg: AppConfig): boolean {
+  return cfg.usage?.localQuotaRouting !== false;
+}
+
+export function usageProjectRules(cfg: AppConfig): Array<{ slug: string; match: string[] }> {
+  const rules = cfg.usage?.projects ?? [];
+  return rules
+    .map((rule) => ({
+      slug: (rule.slug || "").trim(),
+      match: (rule.match ?? []).map((term) => term.trim()).filter(Boolean),
+    }))
+    .filter((rule) => rule.slug.length > 0 && rule.match.length > 0);
+}
+
+/** Sentry's own default is 1.0, which is far too much traffic for a
+ * long-running harness.  A fifth of turns is enough to see a latency
+ * regression without paying for every span. */
+export const DEFAULT_SENTRY_TRACES_SAMPLE_RATE = 0.2;
+export const DEFAULT_SENTRY_AI_TRACES_SAMPLE_RATE = 1.0;
+export const DEFAULT_SENTRY_HTTP_TRACES_SAMPLE_RATE = 0.1;
+export const DEFAULT_SENTRY_UI_TRACES_SAMPLE_RATE = 0.1;
+
+/** Everything the Sentry runtime reads out of app config, already
+ * defaulted.  `dsn` is null when nothing usable is stored — the operator's
+ * own project or nothing, because BotFleet ships no DSN. */
+export interface ObservabilitySettings {
+  dsn: string | null;
+  fleetDsn: string | null;
+  enabled: boolean;
+  environment: string;
+  tracesSampleRate: number;
+  aiTracesSampleRate: number;
+  httpTracesSampleRate: number;
+  uiTracesSampleRate: number;
+  logsEnabled: boolean;
+}
+
+/** The stored DSN string, or null when none is present.  Shape checks live
+ * in the runtime so a vault-injected malformed value stays visible on the
+ * status card instead of disappearing as "not configured". */
+export function sentryDsnConfigured(cfg: AppConfig): string | null {
+  const raw = cfg.observability?.sentryDsn?.trim();
+  return raw || null;
+}
+
+export function sentryFleetDsnConfigured(cfg: AppConfig): string | null {
+  const raw = cfg.observability?.sentryFleetDsn?.trim();
+  return raw || null;
+}
+
+/** The explicit kill switch.  Absent means on, matching `ingress.enabled`:
+ * an install that has never seen this setting keeps reporting, and only a
+ * stored `false` stops it. */
+export function observabilityEnabled(cfg: AppConfig): boolean {
+  return cfg.observability?.enabled !== false;
+}
+
+/** Resolve the stored settings against their defaults.  `environment` and
+ * `tracesSampleRate` fall back to the long-standing `SENTRY_ENV` and
+ * `SENTRY_TRACES_SAMPLE_RATE` env names so an operator who pinned those
+ * before this section existed keeps what they had; a value saved in
+ * Settings wins over both.  The DSN resolves the other way round — env
+ * beats config — and that ordering lives in the observability manager. */
+export function observabilitySettings(cfg: AppConfig): ObservabilitySettings {
+  const envRate = Number(process.env.SENTRY_TRACES_SAMPLE_RATE);
+  const rate =
+    cfg.observability?.tracesSampleRate ??
+    (Number.isFinite(envRate) ? envRate : DEFAULT_SENTRY_TRACES_SAMPLE_RATE);
+
+  const envAiRate = Number(process.env.SENTRY_AI_TRACES_SAMPLE_RATE);
+  const aiRate =
+    cfg.observability?.aiTracesSampleRate ??
+    (Number.isFinite(envAiRate) ? envAiRate : DEFAULT_SENTRY_AI_TRACES_SAMPLE_RATE);
+
+  const envHttpRate = Number(process.env.SENTRY_HTTP_TRACES_SAMPLE_RATE);
+  const httpRate =
+    cfg.observability?.httpTracesSampleRate ??
+    (Number.isFinite(envHttpRate) ? envHttpRate : DEFAULT_SENTRY_HTTP_TRACES_SAMPLE_RATE);
+
+  const envUiRate = Number(process.env.SENTRY_UI_TRACES_SAMPLE_RATE);
+  const uiRate =
+    cfg.observability?.uiTracesSampleRate ??
+    (Number.isFinite(envUiRate) ? envUiRate : DEFAULT_SENTRY_UI_TRACES_SAMPLE_RATE);
+
+  const environment =
+    cfg.observability?.environment?.trim() ||
+    (process.env.SENTRY_ENV || process.env.NODE_ENV || "production").trim() ||
+    "production";
+  return {
+    dsn: sentryDsnConfigured(cfg),
+    fleetDsn: sentryFleetDsnConfigured(cfg),
+    enabled: observabilityEnabled(cfg),
+    environment: environment.slice(0, MAX_OBSERVABILITY_ENVIRONMENT_LENGTH),
+    tracesSampleRate: Math.min(Math.max(rate, 0), 1),
+    aiTracesSampleRate: Math.min(Math.max(aiRate, 0), 1),
+    httpTracesSampleRate: Math.min(Math.max(httpRate, 0), 1),
+    uiTracesSampleRate: Math.min(Math.max(uiRate, 0), 1),
+    logsEnabled: cfg.observability?.logsEnabled !== false,
+  };
+}
+
+/** Infisical's own hosted site, the environment BotFleet's fleet uses, and a
+ * cadence low enough that a rotated key is picked up within a coffee break
+ * without the store seeing meaningful traffic. */
+export const DEFAULT_INFISICAL_SITE_URL = "https://app.infisical.com";
+export const DEFAULT_INFISICAL_ENVIRONMENT = "prod";
+export const DEFAULT_INFISICAL_SECRET_PATH = "/";
+export const DEFAULT_INFISICAL_REFRESH_MINUTES = 15;
+
+/** Everything the secret-store runtime reads out of app config, already
+ * defaulted.  Values are used, never rendered: the only fields here a status
+ * view may repeat are the site URL, the project id, the environment and the
+ * path. */
+export type InfisicalAuthMethod = z.infer<typeof infisicalAuthMethodSchema>;
+
+export interface InfisicalReadSource {
+  name: string;
+  tokenFile?: string;
+  tokenEnv?: string;
+  writeTokenFile?: string;
+  writeTokenEnv?: string;
+  projectId: string;
+  environment?: string;
+  secretPath?: string;
+}
+
+/** Strip a single trailing slash (except root), so `/zulip/` and `/zulip`
+ * name the same folder everywhere paths are stored or compared. */
+export function normalizeInfisicalSecretPath(path: string): string {
+  const trimmed = path.trim();
+  if (!trimmed) return "/";
+  return trimmed.length > 1 && trimmed.endsWith("/") && !trimmed.endsWith("//") ? trimmed.slice(0, -1) : trimmed;
+}
+
+export interface ResolvedInfisicalReadSource {
+  name: string;
+  tokenFile: string;
+  tokenEnv: string;
+  writeTokenFile?: string;
+  writeTokenEnv?: string;
+  projectId: string;
+  environment: string;
+  secretPath: string;
+}
+
+export interface InfisicalSettings {
+  authMethod?: InfisicalAuthMethod;
+  configurationError?: string;
+  enabled: boolean;
+  writeThrough: boolean;
+  siteUrl: string;
+  projectId: string;
+  environment: string;
+  secretPath: string;
+  clientId: string;
+  clientSecret: string;
+  token: string;
+  writeToken: string;
+  readSources: ResolvedInfisicalReadSource[];
+  refreshMinutes: number;
+}
+
+/** True when this install has actually been pointed at a secret store.  All
+ * three parts are required: a project with no identity cannot be read, and an
+ * identity with no project has nothing to read.  Unconfigured is inert — no
+ * request is ever made, and nothing about resolution changes. */
+export function infisicalConfigured(cfg: AppConfig): boolean {
+  const settings = infisicalSettings(cfg);
+  if (!settings.projectId) return false;
+  if (settings.authMethod === "machine-identity") return Boolean(settings.clientId && settings.clientSecret);
+  const source = settings.readSources.find((entry) => entry.projectId === settings.projectId &&
+    entry.environment === settings.environment && entry.secretPath === settings.secretPath);
+  return source ? Boolean(source.tokenEnv || source.tokenFile) : Boolean(settings.token);
+}
+
+/** The explicit kill switch.  Absent means on once configured, matching
+ * `ingress.enabled` and `observability.enabled`: connecting a store is the
+ * deliberate act, and only a stored `false` undoes it. */
+export function infisicalEnabled(cfg: AppConfig): boolean {
+  return cfg.infisical?.enabled !== false;
+}
+
+/** Resolve the stored settings against their defaults.  Write-through
+ * defaults to off: with it off a Settings save of a name the store manages is
+ * refused outright, which is honest, rather than accepted and then reverted by
+ * the next refresh, which is not. */
+export function infisicalSettings(cfg: AppConfig): InfisicalSettings {
+  const stored = cfg.infisical ?? {};
+  const refresh = stored.refreshMinutes;
+  const resolved: InfisicalSettings = {
+    authMethod: stored.authMethod ?? "service-token",
+    enabled: infisicalEnabled(cfg),
+    writeThrough: stored.writeThrough === true,
+    siteUrl: (stored.siteUrl?.trim() || DEFAULT_INFISICAL_SITE_URL).replace(/\/+$/, ""),
+    projectId: stored.projectId?.trim() ?? "",
+    environment: stored.environment?.trim() || DEFAULT_INFISICAL_ENVIRONMENT,
+    secretPath: normalizeInfisicalSecretPath(stored.secretPath || DEFAULT_INFISICAL_SECRET_PATH),
+    clientId: stored.clientId?.trim() ?? "",
+    clientSecret: stored.clientSecret ?? "",
+    token: stored.token?.trim() ?? "",
+    writeToken: stored.writeToken?.trim() ?? "",
+    readSources: (() => {
+      const seen = new Set<string>();
+      const out: ResolvedInfisicalReadSource[] = [];
+      for (const src of stored.readSources ?? []) {
+        const name = src.name?.trim() ?? "";
+        const projectId = src.projectId?.trim() ?? "";
+        if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(name) || !INFISICAL_PROJECT_ID_PATTERN.test(projectId) || seen.has(name)) continue;
+        const env = src.environment?.trim() ?? "";
+        const path = src.secretPath?.trim() ?? "";
+        if (env && !INFISICAL_ENVIRONMENT_PATTERN.test(env)) continue;
+        if (path && (!/^\/[A-Za-z0-9/_-]*$/.test(path) || path.length > 200)) continue;
+        if ([src.tokenEnv, src.writeTokenEnv].some((value) => value && (value.trim().length > 256 || !/^[A-Z][A-Z0-9_]*$/.test(value.trim())))) continue;
+        if ([src.tokenFile, src.writeTokenFile].some((value) => value && (value.trim().length > 4096 || !value.trim().startsWith("/")))) continue;
+        seen.add(name);
+        const source: ResolvedInfisicalReadSource = {
+          name,
+          tokenFile: src.tokenFile?.trim() ?? "",
+          tokenEnv: src.tokenEnv?.trim() ?? "",
+          projectId,
+          environment: INFISICAL_ENVIRONMENT_PATTERN.test(env) ? env : (stored.environment?.trim() || DEFAULT_INFISICAL_ENVIRONMENT),
+          secretPath: path.startsWith("/") ? normalizeInfisicalSecretPath(path) : DEFAULT_INFISICAL_SECRET_PATH,
+        };
+        if (src.writeTokenFile) source.writeTokenFile = src.writeTokenFile.trim();
+        if (src.writeTokenEnv) source.writeTokenEnv = src.writeTokenEnv.trim();
+        out.push(source);
+      }
+      return out;
+    })(),
+    refreshMinutes:
+      refresh !== undefined && Number.isFinite(refresh)
+        ? Math.min(Math.max(Math.trunc(refresh), 5), 1440)
+        : DEFAULT_INFISICAL_REFRESH_MINUTES,
+  };
+  const error = infisicalTokenScopeError(resolved);
+  if (error) resolved.configurationError = error;
+  return resolved;
+}
+
+/** One read reference and one optional write reference per project may be
+ * reused across environment/folder routes; credentials never appear in errors. */
+export function infisicalTokenScopeError(settings: InfisicalSettings): string | null {
+  if (settings.readSources.length > 32) return "Infisical supports at most 32 service-token folder routes.";
+  const projects = new Map<string, { read: Set<string>; write: Set<string> }>();
+  const add = (project: string, mode: "read" | "write", reference: string) => {
+    if (!project || !reference) return;
+    const refs = projects.get(project) ?? { read: new Set<string>(), write: new Set<string>() };
+    refs[mode].add(reference);
+    projects.set(project, refs);
+  };
+  const reference = (file?: string, env?: string) => file?.trim()
+    ? `file:${resolve(file.trim())}` : env?.trim() ? `env:${env.trim()}` : "";
+  for (const source of settings.readSources) {
+    add(source.projectId, "read", reference(source.tokenFile, source.tokenEnv));
+    add(source.projectId, "write", reference(source.writeTokenFile, source.writeTokenEnv));
+  }
+  const primarySource = settings.readSources.some((source) => source.projectId === settings.projectId &&
+    source.environment === settings.environment && normalizeInfisicalSecretPath(source.secretPath) === normalizeInfisicalSecretPath(settings.secretPath));
+  if (settings.authMethod !== "machine-identity" && !primarySource) {
+    if (settings.token.trim()) add(settings.projectId, "read", "env:INFISICAL_TOKEN");
+    if (settings.writeToken.trim()) add(settings.projectId, "write", "env:INFISICAL_WRITE_TOKEN");
+  }
+  for (const [project, refs] of projects) {
+    if (refs.read.size > 1 || refs.write.size > 1) {
+      return `Infisical project ${project} permits one read token reference and at most one write token reference; reuse those references across its folder and environment routes.`;
+    }
+  }
+  return null;
+}
+
+/** Validate against resolved current config, including bootstrap environment
+ * overlays, before a settings save can persist or activate another token. */
+export function validateInfisicalConfigPatch(cfg: AppConfig, patch: Partial<AppConfig>): void {
+  if (!patch.infisical) return;
+  const candidate = infisicalSettings({ infisical: { ...cfg.infisical, ...patch.infisical } });
+  if (candidate.configurationError) throw Object.assign(new Error(candidate.configurationError), { status: 400 });
+}
+
+export const DEFAULT_AGENT_PROXY_ADDRESS = "127.0.0.1:17322";
+export const DEFAULT_AGENT_PROXY_ENVIRONMENT = "prod";
+export const DEFAULT_AGENT_PROXY_SECRET_PATH = "/";
+
+export interface AgentProxySettings {
+  enabled: boolean;
+  address: string;
+  projectId: string;
+  environment: string;
+  secretPath: string;
+  caCertPath?: string;
+}
+
+/** The explicit toggle for Infisical Agent Proxy.  Off by default. */
+export function agentProxyEnabled(cfg: AppConfig): boolean {
+  return cfg.agentProxy?.enabled === true;
+}
+
+/** May a paired phone raise the BotFleet window on this computer?
+ *
+ *  Off unless the owner turned it on.  This is the only thing standing
+ *  between a phone on someone else's network and a window appearing on this
+ *  Mac, because the sidecar replays the device request to 127.0.0.1 and the
+ *  harness's loopback-only check on `/api/desktop/open` is satisfied by
+ *  that replay rather than by the caller actually being local. */
+export function remoteDesktopLaunchAllowed(cfg: AppConfig): boolean {
+  return cfg.server?.allowRemoteDesktopLaunch === true;
+}
+
+/** Does the harness outlive the desktop app's window?
+ *
+ *  True when unset: the harness is launchd-supervised and documented as
+ *  always-on, so a quit that tore it down would strand every paired phone.
+ *
+ *  Deliberately not consumed by this file's callers.  The one place that has
+ *  to act on it is Electron's quit path, and `electron/main.mjs` is plain ESM
+ *  that cannot import this TypeScript module — so it reads the field from the
+ *  config file directly, with its own copy of the `!== false` default.  That
+ *  duplicated default is the thing to watch: if it is ever changed here it
+ *  must be changed there in the same commit, or quitting the app will quietly
+ *  do something other than what this comment says. */
+export const SERVER_PERSISTS_ON_EXIT_WHEN_UNSET = true;
+
+/** Resolve stored Agent Proxy settings against defaults. */
+export function agentProxySettings(cfg: AppConfig): AgentProxySettings {
+  const stored = cfg.agentProxy ?? {};
+  return {
+    enabled: agentProxyEnabled(cfg),
+    address: stored.address?.trim() || DEFAULT_AGENT_PROXY_ADDRESS,
+    projectId: stored.projectId?.trim() || cfg.infisical?.projectId?.trim() || "",
+    environment: stored.environment?.trim() || cfg.infisical?.environment?.trim() || DEFAULT_AGENT_PROXY_ENVIRONMENT,
+    secretPath: stored.secretPath?.trim() || cfg.infisical?.secretPath?.trim() || DEFAULT_AGENT_PROXY_SECRET_PATH,
+    caCertPath: stored.caCertPath?.trim() || undefined,
+  };
+}
+
+/**
+ * Injects proxy environment variables into a process environment when
+ * Agent Proxy is enabled.  When disabled, returns the input baseEnv untouched.
+ *
+ * Precedence: the proxy URL variables (`HTTP_PROXY`, `HTTPS_PROXY`,
+ * `ALL_PROXY`, `NO_PROXY`) keep whatever the caller already set, so a
+ * deliberate corporate proxy is never silently replaced.  Everything the
+ * operator configured under `agentProxy` (address, routing ids, CA path) wins
+ * over an ambient `INFISICAL_*`, `SSL_CERT_FILE` or `NODE_EXTRA_CA_CERTS` the
+ * harness happened to inherit.  A routing id that only fell back to
+ * BotFleet's own Infisical settings never displaces an inherited one.
+ */
+export function applyAgentProxyEnv(
+  cfg: AppConfig,
+  baseEnv?: NodeJS.ProcessEnv,
+): NodeJS.ProcessEnv | undefined {
+  if (!agentProxyEnabled(cfg)) return baseEnv;
+  const settings = agentProxySettings(cfg);
+  const stored = cfg.agentProxy ?? {};
+  const proxyUrl = `http://${settings.address}`;
+  const env: NodeJS.ProcessEnv = { ...(baseEnv ?? process.env) };
+  if (!env.HTTP_PROXY && !env.http_proxy) {
+    env.HTTP_PROXY = proxyUrl;
+    env.http_proxy = proxyUrl;
+  }
+  if (!env.HTTPS_PROXY && !env.https_proxy) {
+    env.HTTPS_PROXY = proxyUrl;
+    env.https_proxy = proxyUrl;
+  }
+  if (!env.ALL_PROXY && !env.all_proxy) {
+    env.ALL_PROXY = proxyUrl;
+    env.all_proxy = proxyUrl;
+  }
+  if (!env.NO_PROXY && !env.no_proxy) {
+    env.NO_PROXY = "localhost,127.0.0.1";
+    env.no_proxy = "localhost,127.0.0.1";
+  }
+  // The resolved address already folds in an ambient INFISICAL_AGENT_PROXY_ADDRESS
+  // (loadConfig) and the vault knob, and it is what the proxy URLs above are
+  // built from, so the two must never disagree.
+  env.INFISICAL_AGENT_PROXY_ADDRESS = settings.address;
+  const routing: Array<[key: string, resolved: string, explicit: string | undefined]> = [
+    ["INFISICAL_PROJECT_ID", settings.projectId, stored.projectId],
+    ["INFISICAL_ENVIRONMENT", settings.environment, stored.environment],
+    ["INFISICAL_SECRET_PATH", settings.secretPath, stored.secretPath],
+  ];
+  for (const [key, resolved, explicit] of routing) {
+    if (resolved && (explicit?.trim() || !env[key])) env[key] = resolved;
+  }
+  if (settings.caCertPath) {
+    env.SSL_CERT_FILE = settings.caCertPath;
+    env.NODE_EXTRA_CA_CERTS = settings.caCertPath;
+  }
+  return env;
 }
 
 export function localVmMaxInstances(cfg: AppConfig): number {
   return cfg.localVm?.maxInstances ?? DEFAULT_LOCAL_VM_MAX_INSTANCES;
 }
 
+/** The destinations any bot is allowed to run on.  An absent allowlist means
+ * "every destination is allowed", which is the shipped default and the
+ * behavior an upgraded install sees until the operator narrows it.  An empty
+ * allowlist is a deliberate, persisted "no bot may run on any desktop here". */
+export function allowedBotComputers(cfg: AppConfig): Array<"cloud" | "vm" | "local"> | null {
+  const list = cfg.botDefaults?.allowedComputers;
+  // Absent and null are the same answer — "the operator never narrowed
+  // anything" — and they must not diverge, because null reaches here from
+  // both the wire and any config.json written before the key was dropped.
+  if (list === undefined || list === null) return null;
+  // De-duplicate while keeping the order the operator chose.
+  return [...new Set(list)];
+}
+
+/** Filter a granted set against the operator allowlist.  An absent allowlist
+ * passes everything through.  An entry blocked by the allowlist is dropped;
+ * the result keeps the order of the input. */
+export function filterAllowedComputers<T extends "cloud" | "vm" | "local">(
+  granted: readonly T[],
+  allowed: Array<"cloud" | "vm" | "local"> | null,
+): T[] {
+  if (allowed === null) return [...granted];
+  const set = new Set(allowed);
+  return granted.filter((entry) => set.has(entry));
+}
+
 export function skillRecorderEnabled(cfg: AppConfig): boolean {
   return cfg.features?.skillRecorder === true;
 }
 
+/** Tool steps in the transcript.  On by default.
+ *
+ * They used to be off, and the reason was sound at the time: a chip carried
+ * a bare tool name, so a hundred of them said only "work happened".  A step
+ * now says what it read, what it ran and how long it took (see
+ * `shared/tool-activity.ts`), which is the difference between noise and the
+ * record of a turn.  Settings still turns them off.
+ *
+ * Kept in step with `src/lib/feature-flags.ts`: this is the value the
+ * clients are handed, so a default that disagreed with theirs would decide
+ * the question here and make the other one dead code. */
 export function showToolCallsEnabled(cfg: AppConfig): boolean {
-  return cfg.features?.showToolCalls === true;
+  return cfg.features?.showToolCalls !== false;
 }
 
 export function summarizeToolCallsEnabled(cfg: AppConfig): boolean {
   return cfg.features?.summarizeToolCalls !== false;
 }
 
-// OMB_DATA_DIR isolates test/soak rigs from the user's real fleet.
-export const DATA_DIR = process.env.OMB_DATA_DIR ?? join(homedir(), ".botfleet");
+// OMB_DATA_DIR isolates test/soak rigs from the user's real fleet.  dataDir() applies the
+// same trim-and-blank rule the desktop app does (electron/app-paths.mjs), so both processes
+// resolve one directory.
+export const DATA_DIR = dataDir();
 const LEGACY_HOME_DATA_DIRS = [".openmausbot", ".opengrokbot"] as const;
 export const EVENTS_DIR = join(DATA_DIR, "events");
 export const NATIVE_DIR = join(DATA_DIR, "native");
+/** Full tool inputs and outputs, and injected context text, per thread —
+ * bounded, rotated, and fetched only when a row is opened
+ * (server/item-io-store.ts). */
+export const ITEM_IO_DIR = join(DATA_DIR, "item-io");
 
 function migrateLegacyHomeDir(current: string, legacyNames: readonly string[]): void {
   if (existsSync(current)) return;
@@ -217,15 +1758,388 @@ export function ensureDirs() {
   // one-time migration from the pre-rename data dirs — bots, transcripts,
   // config and keys all carry over. Skip when tests isolate via OMB_DATA_DIR.
   if (!process.env.OMB_DATA_DIR) migrateLegacyHomeDir(DATA_DIR, LEGACY_HOME_DATA_DIRS);
-  for (const dir of [DATA_DIR, EVENTS_DIR, NATIVE_DIR]) mkdirSync(dir, { recursive: true });
+  for (const dir of [DATA_DIR, EVENTS_DIR, NATIVE_DIR, ITEM_IO_DIR]) mkdirSync(dir, { recursive: true });
+}
+
+/** Migration: pin legacy ElevenLabs installs (tts.key set, tts.provider
+ * absent) to provider: "elevenlabs" so PR #513's MiniMax default does not
+ * silently route a valid ElevenLabs key to MiniMax's `/v1/get_voice`.
+ * Idempotent: returns false if provider is already set, if the tts section
+ * is empty, or if only a voice (no key) is present.  Mutates the cfg in
+ * place so the current `loadConfig()` call carries the pin; the call site
+ * skips `saveConfig` so a desktop install — whose real key lives in the OS
+ * keychain and arrives via `OMB_TTS_KEY` AFTER the file is read — never has
+ * that key written back into config.json in cleartext.
+ *
+ * The shape check is key + no-provider.  Voice is intentionally NOT part of
+ * the discriminator: a legacy install may carry its ElevenLabs voice only on
+ * each bot (`speak()` and `voiceReady()` accept a per-bot `voiceId` when the
+ * workspace fallback is absent), so a key-only record is a legitimate legacy
+ * shape, not an ambiguous one.  Fresh MiniMax key-only saves are
+ * distinguished by new key saves persisting `provider: "minimax"`
+ * alongside the key — every post-default save carries the explicit provider,
+ * so any record that arrives here without one predates the default. */
+export function migrateLegacyElevenLabsTtsProvider(cfg: AppConfig): boolean {
+  if (!cfg.tts) return false;
+  if (cfg.tts.provider !== undefined) return false;
+  // Trim because a stale env-overlay can leave a whitespace-only key that
+  // would not match any provider's `verifyKey` probe; that case is "no key".
+  if (!cfg.tts.key?.trim()) return false;
+  cfg.tts = { ...cfg.tts, provider: "minimax" };
+  return true;
+}
+
+/** Map the legacy per-destination allowlist onto the new per-provider
+ * shape the redesigned Computer settings UI drives.  Returns `true` when
+ * the caller's config was actually changed — idempotent on a config that
+ * already carries `botDefaults.computerProviders` (the redesigned UI is
+ * the only writer, so a config with the new key has the new key as its
+ * source of truth and the legacy field is left untouched).
+ *
+ * Cross-field invariants the new shape enforces (handled here, not by the
+ * zod schema, because the schema does not cross-validate):
+ * - `vpsMode === null` is only legal when `selfHostedVps` is false.  A
+ *   stored `null` alongside `selfHostedVps: true` falls back to
+ *   `DEFAULT_VPS_MODE` (per-bot) rather than throwing, so an upgrade cannot break a fleet that was
+ *   operating a VPS in shared mode before the schema was tightened.
+ * - The legacy `["cloud"]` entry never picked a VPS mode; the runtime
+ *   has always run one VPS container per bot, so the migrator pins it
+ *   to `DEFAULT_VPS_MODE` (per-bot). */
+export function migrateComputerProvidersConfig(cfg: AppConfig): boolean {
+  const defaults = cfg.botDefaults;
+  if (!defaults) return false;
+  if (defaults.computerProviders) {
+    // Already migrated.  Repair the cross-field invariant in place
+    // rather than refusing: a config the new UI wrote that landed a
+    // null vpsMode alongside an enabled VPS is a logic bug, but the
+    // repair is a single default and a single repair is cheaper than a
+    // hard refusal at boot.
+    if (defaults.computerProviders.selfHostedVps && defaults.vpsMode === null) {
+      defaults.vpsMode = DEFAULT_VPS_MODE;
+      return true;
+    }
+    if (!defaults.computerProviders.selfHostedVps && defaults.vpsMode !== null && defaults.vpsMode !== undefined) {
+      defaults.vpsMode = null;
+      return true;
+    }
+    return false;
+  }
+  // No new-shape key.  Compute from the legacy `allowedComputers` with
+  // the one shared mapping, so the server, the desktop boot migration
+  // and the renderer agree:
+  //   null / undefined -> every provider on (legacy "no allowlist")
+  //   []               -> every provider off (explicit deny-all)
+  //   [...]            -> each named destination's providers on
+  // Getting either of the first two wrong is not cosmetic: the next
+  // provider save back-fills `allowedComputers` from this shape, so a
+  // deny-all would silently re-enable cloud and an unrestricted install
+  // would silently lose its Local VM and host grants.
+  const migrated = migrateAllowedComputersToProviders(defaults.allowedComputers);
+  defaults.computerProviders = migrated.providers;
+  defaults.vpsMode = migrated.vpsMode;
+  return true;
+}
+
+/** What reading config.json turned up besides the settings themselves. */
+interface StoredConfigProblem {
+  /** "config-ignored": nothing in the file was usable.  "config-partial": some sections were left out. */
+  kind: "config-ignored" | "config-partial";
+  /** For the log and the notice.  Built from paths and error codes only, never from values. */
+  reason: string;
+  sections: string[];
+}
+
+interface StoredConfigRead {
+  config: AppConfig;
+  problem: StoredConfigProblem | null;
+}
+
+/** The sections of config.json this build understands.  Salvage keeps only these, so a key it has
+ * never heard of (a newer build's, or a hostile one such as `__proto__`) never reaches the config. */
+const STORED_CONFIG_SECTIONS: ReadonlySet<string> = new Set<string>(appConfigSchema.keyof().options);
+
+/** The last problem reported, so a file that stays broken is reported once rather than on every
+ * loadConfig() call, which routes make per request.  A clean read resets it, so a file that is
+ * repaired and then breaks again is reported again. */
+let lastStoredConfigWarning: string | null = null;
+
+function ignoredConfig(reason: string): StoredConfigRead {
+  return { config: {}, problem: { kind: "config-ignored", reason, sections: [] } };
+}
+
+/** Drop only the invalid `infisical.readSources` entries.  The warning
+ * names the entry index and, when present, its name — never any other
+ * value from the entry.  Returns null when nothing was dropped or when
+ * the rest of the section still does not validate. */
+function salvageInfisicalReadSources(value: JsonValue): { usable: JsonObject; issues: string[]; left: string[] } | null {
+  if (!isJsonObject(value)) return null;
+  const raw = value.readSources;
+  if (raw === undefined) return null;
+  if (!Array.isArray(raw)) {
+    const { readSources: _dropped, ...rest } = value;
+    try {
+      parseStoredConfig({ infisical: rest });
+    } catch {
+      return null;
+    }
+    return { usable: rest, issues: ["infisical.readSources is invalid"], left: ["infisical.readSources"] };
+  }
+  const kept: JsonValue[] = [];
+  const issues: string[] = [];
+  const left: string[] = [];
+  raw.forEach((entry, index) => {
+    if (infisicalReadSourceSchema.safeParse(entry).success) {
+      kept.push(entry);
+      return;
+    }
+    const name = isJsonObject(entry) && isJsonString(entry.name) ? ` (name ${JSON.stringify(entry.name.slice(0, 64))})` : "";
+    issues.push(`infisical.readSources.${index}${name} is invalid`);
+    left.push(`infisical.readSources.${index}`);
+  });
+  if (issues.length === 0) return null;
+  const usable: JsonObject = { ...value, readSources: kept };
+  try {
+    parseStoredConfig({ infisical: usable });
+  } catch {
+    return null;
+  }
+  return { usable, issues, left };
+}
+
+/** Drop only the invalid `zulip.credentialSources` entries (`login` /
+ * `outgoing`).  Returns null when nothing was dropped or when the rest
+ * of the section still does not validate. */
+function salvageZulipCredentialSources(value: JsonValue): { usable: JsonObject; issues: string[]; left: string[] } | null {
+  if (!isJsonObject(value)) return null;
+  const raw = value.credentialSources;
+  if (raw === undefined) return null;
+  if (!isJsonObject(raw)) {
+    const { credentialSources: _dropped, ...rest } = value;
+    if (!zulipConfigSchema.safeParse(rest).success) return null;
+    return { usable: rest, issues: ["zulip.credentialSources is invalid"], left: ["zulip.credentialSources"] };
+  }
+  const kept: JsonObject = {};
+  const issues: string[] = [];
+  const left: string[] = [];
+  for (const field of ["login", "outgoing"] as const) {
+    const entry = raw[field];
+    if (entry === undefined) continue;
+    const fieldSchema = field === "login" ? zulipLoginCredentialFieldSourceSchema : zulipOutgoingCredentialFieldSourceSchema;
+    if (fieldSchema.safeParse(entry).success) {
+      kept[field] = entry;
+    } else {
+      issues.push(`zulip.credentialSources.${field} is invalid`);
+      left.push(`zulip.credentialSources.${field}`);
+    }
+  }
+  if (issues.length === 0) return null;
+  const { credentialSources: _dropped, ...rest } = value;
+  const usable: JsonObject = Object.keys(kept).length > 0 ? { ...rest, credentialSources: kept } : rest;
+  if (!zulipConfigSchema.safeParse(usable).success) return null;
+  return { usable, issues, left };
+}
+
+/** Keep every section of an invalid config.json that validates on its own, and report the rest.
+ * Inside `instances` the unit is one engine entry, because dropping the whole map reroutes every
+ * engine to its default for the sake of one bad field.  Each piece is validated with the same
+ * parseStoredConfig the whole file goes through, so the legacy-value rewrites apply here too. */
+function salvageStoredConfig(stored: JsonObject): StoredConfigRead {
+  const usable: JsonObject = {};
+  const issues: string[] = [];
+  const left: string[] = [];
+  for (const [section, value] of Object.entries(stored)) {
+    if (!STORED_CONFIG_SECTIONS.has(section)) continue;
+    if (section === "zulip") {
+      const salvaged = salvageZulipCredentialSources(value);
+      if (salvaged) {
+        usable[section] = salvaged.usable;
+        issues.push(...salvaged.issues);
+        left.push(...salvaged.left);
+        continue;
+      }
+    }
+    try {
+      parseStoredConfig({ [section]: value });
+      usable[section] = value;
+      continue;
+    } catch (error) {
+      if (section === "infisical") {
+        const salvaged = salvageInfisicalReadSources(value);
+        if (salvaged) {
+          usable[section] = salvaged.usable;
+          issues.push(...salvaged.issues);
+          left.push(...salvaged.left);
+          continue;
+        }
+      }
+      const entries = section === "instances" ? jsonObjectSchema.safeParse(value) : null;
+      if (!entries?.success) {
+        issues.push(error instanceof Error ? error.message : `${section} is invalid`);
+        left.push(section);
+        continue;
+      }
+      const kept: Array<[string, JsonValue]> = [];
+      for (const [id, entry] of Object.entries(entries.data)) {
+        try {
+          parseStoredConfig({ [section]: { [id]: entry } });
+          kept.push([id, entry]);
+        } catch (entryError) {
+          issues.push(entryError instanceof Error ? entryError.message : `${section}.${id} is invalid`);
+          left.push(`${section}.${id}`);
+        }
+      }
+      if (kept.length > 0) usable[section] = Object.fromEntries(kept);
+    }
+  }
+  // Nothing survived: every setting was left out, so this is a total loss —
+  // the same "using defaults" notice as an unreadable file, not a partial one
+  // that claims the rest of the file is in use.
+  if (Object.keys(usable).length === 0) return ignoredConfig(issues.join("; "));
+  return {
+    config: parseStoredConfig(usable),
+    problem: { kind: "config-partial", reason: issues.join("; "), sections: left },
+  };
+}
+
+/** The set-aside files in `dir`.
+ *
+ * `findSetAsideFiles` is a synchronous read of the whole data directory, and that directory grows
+ * one message file per thread, so asking on every `loadConfig()` would put an O(files in the data
+ * directory) read on a request path — `loadConfig()` is called per turn from the Linq webhook, the
+ * tool lane and the index, and a fresh install has no config.json at all, which is the very branch
+ * that asks.  A directory mtime/ctime/size stamp was tried here as a cheap change signal, but it is
+ * not reliable: a `writeFileSync` of a set-aside into the data directory left mtime, ctime and size
+ * unchanged on the windows-latest runner and on this Linux box, so a cached stamp returned a stale
+ * empty listing and `loadConfig()` after the first-run read reported a first run over a quarantined
+ * file for the life of the process (the "still sees a set-aside file that appears after an earlier
+ * first-run read" test).  The stamp is therefore not trusted to skip `findSetAsideFiles`; the
+ * directory is read every time.  The hot-path cost — one `readdirSync` plus a handful of `statSync`
+ * calls per `loadConfig()` — is accepted; the contract that a new set-aside is always seen is not
+ * worth trading for it. */
+function setAsideFilesIn(dir: string): SetAsideFile[] {
+  return findSetAsideFiles(dir);
+}
+
+/** Read config.json.  Silent only when the file does not exist AND nothing of it is lying around, which
+ * is a first run; every other way of not getting a full config out of it is a problem the caller
+ * reports. */
+function readStoredConfig(path: string): StoredConfigRead {
+  let text: string;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch (error) {
+    const code = fsFailureCode(error instanceof Error ? error : new Error(String(error)));
+    if (code !== "ENOENT") return ignoredConfig(`it could not be read (${code})`);
+    // A missing config.json is a first run only when nothing of it is left
+    // over.  The config lock renames the old file aside and then renames the
+    // staged one over it, and a process that dies between those two adjacent
+    // syscalls leaves the file absent with its contents sitting in the
+    // set-aside.  Reading that as a first run would put BotFleet on defaults
+    // with no fault, no log and no banner — the exact silent loss this branch
+    // exists to prevent.  registerLeftOverSetAsideFiles would also raise it,
+    // but only once it runs, and only as history; this branch runs on the read
+    // itself and says which file is waiting, so the two cannot both be quiet.
+    const leftOver = setAsideFilesIn(dirname(path)).find((entry) => entry.file === basename(path));
+    return leftOver
+      ? ignoredConfig(`it is missing, but an earlier copy of it was set aside as ${leftOver.name}, so these are not first-run settings`)
+      : { config: {}, problem: null };
+  }
+  const body = stripBom(text);
+  if (body.trim() === "") return ignoredConfig("it is empty");
+  let parsed: JsonValue;
+  try {
+    parsed = parseJson(body);
+  } catch (error) {
+    return ignoredConfig(jsonFailureReason(error instanceof Error ? error : new Error(String(error)), body.length));
+  }
+  try {
+    const config = parseStoredConfig(parsed);
+    // `zulip` is caught to undefined by its schema, so a bad
+    // `credentialSources` entry would otherwise drop the whole section
+    // silently instead of reaching the per-entry salvage below.
+    if (isJsonObject(parsed) && parsed.zulip !== undefined && salvageZulipCredentialSources(parsed.zulip) !== null) {
+      return salvageStoredConfig(parsed);
+    }
+    return { config, problem: null };
+  } catch {
+    const asObject = jsonObjectSchema.safeParse(parsed);
+    return asObject.success ? salvageStoredConfig(asObject.data) : ignoredConfig("it must hold a JSON object");
+  }
+}
+
+function reportStoredConfig(path: string, problem: StoredConfigProblem | null): void {
+  if (!problem) {
+    lastStoredConfigWarning = null;
+    clearDataFault("config.json", ["config-ignored", "config-partial"]);
+    return;
+  }
+  const message =
+    problem.kind === "config-ignored"
+      ? `config: ignoring ${path} and using defaults because ${problem.reason}.  The file itself was not changed.`
+      : `config: ${path} has settings BotFleet could not use, and they were left out: ${problem.reason}.  Every other setting in the file is in use.  The file itself was not changed.`;
+  if (message !== lastStoredConfigWarning) {
+    lastStoredConfigWarning = message;
+    console.warn(message);
+  }
+  recordDataFault({
+    file: "config.json",
+    kind: problem.kind,
+    reason: problem.reason,
+    setAsideAs: null,
+    omitted: 0,
+    sections: problem.sections,
+    writesRefused: false,
+    holdsCleanup: false,
+    at: Date.now(),
+  });
+}
+
+/** Resolve bootstrap credentials and source routes identically for loads and locked saves. */
+function overlayInfisicalBootstrap(stored: AppConfig["infisical"]): NonNullable<AppConfig["infisical"]> {
+  const section = { ...stored };
+  const fields: Array<[field: "clientId" | "clientSecret" | "token" | "writeToken" | "projectId" | "siteUrl" | "environment" | "secretPath", names: string[]]> = [
+    ["clientId", ["INFISICAL_CLIENT_ID", "INFISICAL_UNIVERSAL_AUTH_CLIENT_ID"]],
+    ["clientSecret", ["INFISICAL_CLIENT_SECRET", "INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET"]],
+    ["token", ["INFISICAL_TOKEN"]],
+    ["writeToken", ["INFISICAL_WRITE_TOKEN"]],
+    ["projectId", ["INFISICAL_PROJECT_ID"]],
+    ["siteUrl", ["INFISICAL_SITE_URL", "INFISICAL_DOMAIN"]],
+    ["environment", ["INFISICAL_ENVIRONMENT"]],
+    ["secretPath", ["INFISICAL_SECRET_PATH"]],
+  ];
+  for (const [field, names] of fields) {
+    const name = names.find((candidate) => process.env[candidate] !== undefined);
+    if (name !== undefined) section[field] = process.env[name];
+  }
+  if (process.env.INFISICAL_READ_SOURCES !== undefined) {
+    try {
+      const parsed: unknown = JSON.parse(process.env.INFISICAL_READ_SOURCES);
+      if (Array.isArray(parsed)) {
+        section.readSources = parsed.flatMap((entry): InfisicalReadSource[] => {
+          if (!isJsonObject(entry) || !isJsonString(entry.name) || !isJsonString(entry.projectId)) return [];
+          const source: InfisicalReadSource = { name: entry.name, projectId: entry.projectId };
+          if (isJsonString(entry.tokenFile)) source.tokenFile = entry.tokenFile;
+          if (isJsonString(entry.tokenEnv)) source.tokenEnv = entry.tokenEnv;
+          if (isJsonString(entry.writeTokenFile)) source.writeTokenFile = entry.writeTokenFile;
+          if (isJsonString(entry.writeTokenEnv)) source.writeTokenEnv = entry.writeTokenEnv;
+          if (isJsonString(entry.environment)) source.environment = entry.environment;
+          if (isJsonString(entry.secretPath)) source.secretPath = entry.secretPath;
+          return [source];
+        });
+      }
+    } catch { /* Invalid JSON leaves the stored routes unchanged. */ }
+  }
+  return section;
 }
 
 export function loadConfig(): AppConfig {
-  let cfg: AppConfig = {};
-  try {
-    cfg = parseStoredConfig(parseJson(readFileSync(join(DATA_DIR, "config.json"), "utf8")));
-  } catch {
-    /* first run — env fallbacks below */
+  const configPath = join(DATA_DIR, "config.json");
+  const stored = readStoredConfig(configPath);
+  reportStoredConfig(configPath, stored.problem);
+  const cfg: AppConfig = stored.config;
+  const persistOnExitPolicy = readPersistOnExitPolicy(DATA_DIR);
+  if (persistOnExitPolicy !== null) {
+    cfg.server = { ...cfg.server, persistOnExit: persistOnExitPolicy };
   }
   // these secrets OS-encrypted and hands them to this process as env at
   // spawn, leaving config.json without the plaintext field — so the file
@@ -233,21 +2147,109 @@ export function loadConfig(): AppConfig {
   // Anything that saves a credential mid-session must keep process.env in
   // step (syncCredentialEnv below), or the value injected at boot would
   // shadow the save until the next launch.
+  //
+  // This overlay is unchanged, and deliberately so.  `server/secret-map.ts`
+  // sits ABOVE it rather than replacing it: for the names an external secret
+  // store holds, the store wins; for every other name the ordering below —
+  // env over file here, file over env in the per-call readers — is exactly
+  // what it has always been.
+  cfg.githubRequestLog = { ...cfg.githubRequestLog };
+  if (process.env.GITHUB_REQUEST_LOG_WEBHOOK_SECRET !== undefined) cfg.githubRequestLog.webhookSecret = process.env.GITHUB_REQUEST_LOG_WEBHOOK_SECRET;
   cfg.xai = { ...cfg.xai };
   if (process.env.XAI_API_KEY !== undefined) cfg.xai.key = process.env.XAI_API_KEY;
   cfg.openaiCompat = { ...cfg.openaiCompat };
   if (process.env.OPENAI_COMPAT_API_KEY !== undefined) cfg.openaiCompat.key = process.env.OPENAI_COMPAT_API_KEY;
   if (process.env.OPENAI_COMPAT_URL !== undefined) cfg.openaiCompat.url = process.env.OPENAI_COMPAT_URL;
+  // Mirrors openaiCompat: the MiniMax driver reads `MINIMAX_API_KEY` and
+  // `MINIMAX_BASE_URL` from the environment on its own, so without this
+  // overlay a key exported in the shell would be invisible to the Settings
+  // card that reports where the value came from — the driver would work and
+  // the app would still say "not configured".
+  cfg.minimax = { ...cfg.minimax };
+  if (process.env.MINIMAX_API_KEY !== undefined) cfg.minimax.key = process.env.MINIMAX_API_KEY;
+  if (process.env.MINIMAX_BASE_URL !== undefined) cfg.minimax.url = process.env.MINIMAX_BASE_URL;
   cfg.composio = { ...cfg.composio };
   if (process.env.COMPOSIO_API_KEY !== undefined) cfg.composio.apiKey = process.env.COMPOSIO_API_KEY;
   cfg.box = { ...cfg.box };
   if (process.env.BOX_TOKEN !== undefined) cfg.box.token = process.env.BOX_TOKEN;
   cfg.opencodeGo = { ...cfg.opencodeGo };
   if (process.env.OPENCODE_API_KEY !== undefined) cfg.opencodeGo.apiKey = process.env.OPENCODE_API_KEY;
+  // Mirrors openaiCompat above: the desktop shell moves the key into
+  // credentials.bin and hands it back as DEEPSEEK_API_KEY at spawn, so this
+  // is the one place a packaged-app save becomes visible again. Without it
+  // the file value the tombstone leaves behind ("") was final: nothing ever
+  // read the env var back, so configStatus.deepseek.configured stayed false
+  // forever after a save.
+  cfg.deepseek = { ...cfg.deepseek };
+  if (process.env.DEEPSEEK_API_KEY !== undefined) cfg.deepseek.key = process.env.DEEPSEEK_API_KEY;
+  if (process.env.DEEPSEEK_URL !== undefined) cfg.deepseek.url = process.env.DEEPSEEK_URL;
   cfg.tts = { ...cfg.tts };
   if (process.env.OMB_TTS_KEY !== undefined) cfg.tts.key = process.env.OMB_TTS_KEY;
+  cfg.azureSpeech = { ...cfg.azureSpeech };
+  if (process.env.AZURE_SPEECH_KEY !== undefined) cfg.azureSpeech.key = process.env.AZURE_SPEECH_KEY;
+  if (process.env.AZURE_SPEECH_REGION !== undefined) cfg.azureSpeech.region = process.env.AZURE_SPEECH_REGION;
+  cfg.metaSpeech = { ...cfg.metaSpeech };
+  if (process.env.META_SPEECH_API_KEY !== undefined) cfg.metaSpeech.key = process.env.META_SPEECH_API_KEY;
+  cfg.groq = { ...cfg.groq };
+  if (process.env.GROQ_API_KEY !== undefined) cfg.groq.key = process.env.GROQ_API_KEY;
+  cfg.assemblyai = { ...cfg.assemblyai };
+  if (process.env.ASSEMBLYAI_API_KEY !== undefined) cfg.assemblyai.key = process.env.ASSEMBLYAI_API_KEY;
   cfg.imageGen = { ...cfg.imageGen };
-  if (process.env.OMB_OPENAI_IMAGE_KEY !== undefined) cfg.imageGen.key = process.env.OMB_OPENAI_IMAGE_KEY;  return cfg;
+  if (process.env.OMB_OPENAI_IMAGE_KEY !== undefined) cfg.imageGen.key = process.env.OMB_OPENAI_IMAGE_KEY;
+  // Bootstrap env beats disk; an inherited machine identity still requires explicit selection.
+  cfg.infisical = overlayInfisicalBootstrap(cfg.infisical);
+  cfg.agentProxy = { ...cfg.agentProxy };
+  if (process.env.INFISICAL_AGENT_PROXY_ENABLED !== undefined) {
+    const raw = process.env.INFISICAL_AGENT_PROXY_ENABLED.trim().toLowerCase();
+    cfg.agentProxy.enabled = raw === "true" || raw === "1" || raw === "yes";
+  }
+  const proxyFields: Array<[field: "address" | "projectId" | "environment" | "secretPath" | "caCertPath", names: string[]]> = [
+    ["address", ["INFISICAL_AGENT_PROXY_ADDRESS"]],
+    ["projectId", ["INFISICAL_AGENT_PROXY_PROJECT_ID"]],
+    ["environment", ["INFISICAL_AGENT_PROXY_ENV", "INFISICAL_AGENT_PROXY_ENVIRONMENT"]],
+    ["secretPath", ["INFISICAL_AGENT_PROXY_PATH", "INFISICAL_AGENT_PROXY_SECRET_PATH"]],
+    ["caCertPath", ["INFISICAL_AGENT_PROXY_CA_CERT_PATH", "INFISICAL_AGENT_PROXY_CA_CERT"]],
+  ];
+  for (const [field, names] of proxyFields) {
+    const name = names.find((candidate) => process.env[candidate] !== undefined);
+    if (name !== undefined) cfg.agentProxy[field] = process.env[name];
+  }
+  // One resolution point, last: whatever the store holds for a mapped name
+  // overwrites what env and file just agreed on, and the provenance of every
+  // mapped field is recorded for the Secrets card.  With no store configured
+  // the snapshot is null and this is a no-op.
+  resolveSecretFields(cfg, process.env, infisicalSnapshot());
+  // The tunable-knob twin of the line above, from `server/knob-map.ts`: for
+  // a knob name the vault holds, the vault wins over the file.  Runs after
+  // the credential overlay so both layers read the same snapshot, and both
+  // are no-ops when the store is unconfigured.  Runtime reads never consult
+  // the vault — they read this resolved `cfg` from memory.
+  resolveKnobFields(cfg, infisicalSnapshot());
+  for (const source of cfg.infisical?.readSources ?? []) {
+    for (const locator of [source.tokenEnv, source.writeTokenEnv]) {
+      const name = locator?.trim();
+      if (name && name.length <= 256 && /^[A-Z][A-Z0-9_]*$/.test(name)) scopedInfisicalCredentialEnv.add(name);
+    }
+  }
+  // The vault can hold a pair the file schema never saw, so the placement
+  // knobs' own invariant is applied here too:  the unreachable window has to
+  // be longer than the heartbeat period, or a healthy worker is swept.
+  if (cfg.placement) cfg.placement = clampPlacementWindow(cfg.placement);
+  // Pin pre-MiniMax key-only installs after env and external-secret resolution.
+  // Never persist the injected key to config.json in cleartext.
+  migrateLegacyElevenLabsTtsProvider(cfg);
+  // Migration: existing installs carried the legacy
+  // `botDefaults.allowedComputers` shape (an array of three legacy
+  // destinations).  The redesigned Computer settings UI drives the new
+  // `botDefaults.computerProviders` shape (four per-provider booleans
+  // plus `vpsMode`).  Runs in-memory only on the loaded copy; the
+  // desktop boot path in `electron/main.mjs` persists the new shape
+  // through `updateConfigFile` so the next load finds it and is a
+  // no-op.  Doing the migration here keeps the server's allowlist gate
+  // (which still reads `allowedComputers`) answering the SAME question
+  // the new UI is asking on the very first request after upgrade.
+  migrateComputerProvidersConfig(cfg);
+  return cfg;
 }
 
 /** After saveConfig() writes a credential, the running process's env must
@@ -261,11 +2263,30 @@ export function syncCredentialEnv(patch: Partial<AppConfig>): void {
   const secrets: Array<[value: string | undefined, name: string]> = [
     [patch.xai?.key, "XAI_API_KEY"],
     [patch.openaiCompat?.key, "OPENAI_COMPAT_API_KEY"],
+    [patch.minimax?.key, "MINIMAX_API_KEY"],
     [patch.composio?.apiKey, "COMPOSIO_API_KEY"],
     [patch.box?.token, "BOX_TOKEN"],
     [patch.opencodeGo?.apiKey, "OPENCODE_API_KEY"],
+    // Keeps the running process in step with a packaged-app save the same
+    // way every sibling credential above does — loadConfig() prefers env,
+    // so without this entry the key just saved to credentials.bin would
+    // stay invisible to this process until the next launch.
+    [patch.deepseek?.key, "DEEPSEEK_API_KEY"],
     [patch.tts?.key, "OMB_TTS_KEY"],
+    [patch.azureSpeech?.key, "AZURE_SPEECH_KEY"],
+    [patch.metaSpeech?.key, "META_SPEECH_API_KEY"],
+    [patch.groq?.key, "GROQ_API_KEY"],
+    [patch.assemblyai?.key, "ASSEMBLYAI_API_KEY"],
     [patch.imageGen?.key, "OMB_OPENAI_IMAGE_KEY"],
+    [patch.usage?.ingestUrl, "USAGE_MONITOR_INGEST_URL"],
+    [patch.usage?.ingestToken, "USAGE_MONITOR_INGEST_TOKEN"],
+    [patch.usage?.readToken, "USAGE_READ_TOKEN"],
+    // Without this, an identity injected by a plist or a shell export would
+    // keep shadowing the one just saved in Settings, and the card would report
+    // a store the operator has already replaced.
+    [patch.infisical?.clientSecret, "INFISICAL_CLIENT_SECRET"],
+    [patch.infisical?.token, "INFISICAL_TOKEN"],
+    [patch.infisical?.writeToken, "INFISICAL_WRITE_TOKEN"],
   ];
   for (const [value, name] of secrets) {
     if (value === undefined) continue;
@@ -276,6 +2297,36 @@ export function syncCredentialEnv(patch: Partial<AppConfig>): void {
     if (patch.openaiCompat.url) process.env["OPENAI_COMPAT_URL"] = patch.openaiCompat.url;
     else delete process.env["OPENAI_COMPAT_URL"];
   }
+  if (patch.minimax?.url !== undefined) {
+    if (patch.minimax.url) process.env["MINIMAX_BASE_URL"] = patch.minimax.url;
+    else delete process.env["MINIMAX_BASE_URL"];
+  }
+  if (patch.deepseek?.url !== undefined) {
+    if (patch.deepseek.url) process.env["DEEPSEEK_URL"] = patch.deepseek.url;
+    else delete process.env["DEEPSEEK_URL"];
+  }
+  if (patch.azureSpeech?.region !== undefined) {
+    if (patch.azureSpeech.region) process.env["AZURE_SPEECH_REGION"] = patch.azureSpeech.region;
+    else delete process.env["AZURE_SPEECH_REGION"];
+  }
+  if (patch.infisical?.clientId !== undefined) {
+    delete process.env["INFISICAL_UNIVERSAL_AUTH_CLIENT_ID"];
+    if (patch.infisical.clientId) process.env["INFISICAL_CLIENT_ID"] = patch.infisical.clientId;
+    else delete process.env["INFISICAL_CLIENT_ID"];
+  }
+  if (patch.infisical?.clientSecret !== undefined) delete process.env["INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET"];
+  const vaultPointers = [
+    ["projectId", "INFISICAL_PROJECT_ID"], ["siteUrl", "INFISICAL_SITE_URL"],
+    ["environment", "INFISICAL_ENVIRONMENT"], ["secretPath", "INFISICAL_SECRET_PATH"],
+  ] as const;
+  for (const [field, envName] of vaultPointers) {
+    const value = patch.infisical?.[field];
+    if (value === undefined) continue;
+    if (value) process.env[envName] = value;
+    else delete process.env[envName];
+  }
+  if (patch.infisical?.siteUrl !== undefined) delete process.env.INFISICAL_DOMAIN;
+  if (patch.infisical?.readSources !== undefined) process.env.INFISICAL_READ_SOURCES = JSON.stringify(patch.infisical.readSources);
 }
 
 /** Env names of every workspace credential this process may be holding —
@@ -287,19 +2338,64 @@ export const WORKSPACE_CREDENTIAL_ENV = [
   "XAI_API_KEY",
   "OPENAI_COMPAT_API_KEY",
   "OPENAI_COMPAT_URL",
+  // The MiniMax driver spawns no CLI, so neither of these has ever been
+  // needed by a child process — they are listed for the same reason
+  // OPENAI_COMPAT_* are: a workspace credential the harness holds must not
+  // ride into an unrelated engine through `...process.env`.
+  "MINIMAX_API_KEY",
+  "MINIMAX_BASE_URL",
+  // Linq partner-API token (and its Infisical alias).  The harness holds it
+  // for webhook outbound / voice upload; no spawned engine CLI should inherit it.
+  "BOTFLEET_LINQAPP_API_KEY",
+  "LINQ_API_TOKEN",
+  // Linq webhook signing secret: the harness holds it to verify inbound
+  // webhooks; no spawned engine CLI should inherit it.
+  "LINQ_WEBHOOK_SECRET",
+  "GITHUB_REQUEST_LOG_WEBHOOK_SECRET",
   "BOX_TOKEN",
   "OPENCODE_API_KEY",
   "OMB_TTS_KEY",
+  "AZURE_SPEECH_KEY",
+  "AZURE_SPEECH_REGION",
+  "META_SPEECH_API_KEY",
+  "GROQ_API_KEY",
+  "ASSEMBLYAI_API_KEY",
   "OMB_OPENAI_IMAGE_KEY",
   "COMPOSIO_API_KEY",
   "OMB_COMPOSIO_BROKER_TOKEN",
   "DEEPSEEK_API_KEY",
   "DEEPSEEK_URL",
+  // The secret store's machine identity.  It reads every name in the project,
+  // so of everything on this list it is the one that must never ride into a
+  // spawned engine CLI.  `electron/diagnostics.mjs` mirrors these four in
+  // this exact order.
+  //
+  // Both spellings, because `resolveSecretFields` above accepts the
+  // universal-auth aliases as equals: a headless install that exports only
+  // the alias pair — the pair the iOS ship workflow already uses, which is
+  // why the aliases exist — is authenticated exactly as strongly, so
+  // stripping the canonical names alone would hand every bot CLI a machine
+  // identity that can read the whole project.
+  //
+  // Deliberately NOT extended to the pointer names (project id, site URL,
+  // domain, environment, secret path): those are not credentials, they carry
+  // nothing an engine could authenticate with, and once both identity pairs
+  // are gone they unlock nothing.  This list is what a child must never
+  // inherit, not everything the store happens to read.
+  "INFISICAL_CLIENT_ID",
+  "INFISICAL_CLIENT_SECRET",
+  "INFISICAL_UNIVERSAL_AUTH_CLIENT_ID",
+  "INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET",
+  "INFISICAL_TOKEN",
+  "INFISICAL_WRITE_TOKEN",
 ] as const;
 
 /** Drop every workspace credential from a child-process env (in place). */
+const scopedInfisicalCredentialEnv = new Set<string>();
+
 export function stripWorkspaceCredentialEnv(env: Record<string, string | undefined>): void {
   for (const key of WORKSPACE_CREDENTIAL_ENV) delete env[key];
+  for (const key of scopedInfisicalCredentialEnv) delete env[key];
 }
 
 /** Env names a provider CLI might read as its own billing identity. A spawned
@@ -323,17 +2419,128 @@ export const PROVIDER_CREDENTIAL_ENV = [
 
 /** Merge a partial config into ~/.botfleet/config.json (secrets never
  * echoed back — callers report configured-or-not booleans only). */
-export function saveConfig(patch: Partial<AppConfig>): void {
+type CheckedConfigPatch = z.infer<ReturnType<typeof appConfigSchema.partial>>;
+
+type ExternalCredentialSection =
+  | "xai"
+  | "openaiCompat"
+  | "minimax"
+  | "composio"
+  | "box"
+  | "opencodeGo"
+  | "deepseek"
+  | "tts"
+  | "azureSpeech"
+  | "metaSpeech"
+  | "groq"
+  | "assemblyai"
+  | "imageGen"
+  | "infisical";
+
+export function saveConfig(
+  patch: Partial<AppConfig>,
+  options: { externalCredentialSections?: Partial<Record<ExternalCredentialSection, boolean>> } = {},
+): void {
   const p = join(DATA_DIR, "config.json");
-  let disk: JsonObject = {};
-  try {
-    const parsed = jsonObjectSchema.safeParse(parseJson(readFileSync(p, "utf8")));
-    if (parsed.success) disk = parsed.data;
-  } catch {
-    /* first write */
-  }
   const checkedPatch = appConfigSchema.partial().parse(patch);
-  for (const key of ["xai", "openaiCompat", "composio", "box", "opencodeGo", "tts", "imageGen", "profile", "rooms", "localVm", "features", "autoUpdate", "ingress"] as const) {
+  // Last line of defence, on the parsed COPY so a caller's own object is
+  // never mutated: whatever the store is currently canonical for does not go
+  // to disk in cleartext.  A route that hands us the live config object --
+  // instead of the section it owns -- is handing us every value
+  // `resolveSecretFields` just wrote into it, and persisting those would put
+  // the vault's contents in `~/.botfleet/config.json` for anything running as
+  // this user, Time Machine, and every backup to read.  An empty string is
+  // left alone: that is the write-through path's deliberate tombstone.
+  // SAFETY: `checkedPatch` is `appConfigSchema.partial()`'s output — the same
+  // sections `AppConfig` declares, differing only in zod's wider literal
+  // unions, which the section-and-path walk below never reads.
+  const strippedFromDisk = stripVaultManagedValues(checkedPatch as Partial<AppConfig>);
+  if (strippedFromDisk.length > 0) {
+    // Field ids only, never values -- and worth saying out loud, because it
+    // means a caller tried to persist something the store owns.
+    console.warn(`[secrets] not persisting vault-managed values: ${strippedFromDisk.join(", ")}`);
+  }
+  // The tunable-knob twin: whatever the store is currently canonical for
+  // does not get baked into `~/.botfleet/config.json` either, or the file
+  // starts shadowing the store it is supposed to defer to.  Knob values are
+  // not sensitive, so this is about authority, not cleartext.
+  // SAFETY: same partial-config invariant as `stripVaultManagedValues` above.
+  const strippedKnobsFromDisk = stripVaultManagedKnobs(checkedPatch as Partial<AppConfig>);
+  if (strippedKnobsFromDisk.length > 0) {
+    console.warn(`[secrets] not persisting vault-managed knobs: ${strippedKnobsFromDisk.join(", ")}`);
+  }
+  mkdirSync(DATA_DIR, { recursive: true });
+  // Under the cross-process lock (electron/config-file-lock.mjs) -- the same
+  // one the Electron auto-updater and boot migrations take -- so the read,
+  // the merge and the rename happen with no other writer in between.  A
+  // save from the other process can never be answered with this one's
+  // stale snapshot, and vice versa.  (PR #251 review, board a2a3a586.)
+  updateConfigFile(p, (raw) => {
+    const merged = mergeConfigPatch(raw, checkedPatch);
+    if (checkedPatch.infisical) {
+      const section = infisicalConfigSchema.parse(merged.infisical);
+      validateInfisicalConfigPatch({ infisical: overlayInfisicalBootstrap(section) }, { infisical: checkedPatch.infisical });
+    }
+    for (const [section, present] of Object.entries(options.externalCredentialSections ?? {})) {
+      const current = jsonObjectSchema.safeParse(merged[section]);
+      const next: JsonObject = current.success ? { ...current.data } : {};
+      if (present) next.credentialStorage = "external";
+      else delete next.credentialStorage;
+      merged[section] = next;
+    }
+    return merged;
+  }, { mode: 0o600, onSetAside: reportConfigSetAside });
+  if (checkedPatch.server?.persistOnExit !== undefined) {
+    writePersistOnExitPolicy(DATA_DIR, checkedPatch.server.persistOnExit);
+  }
+}
+
+/** updateConfigFile renamed an unusable config.json aside just before replacing it.  Say so in the
+ * log and in the app: the new file holds this save and nothing else, so the owner needs to know
+ * where the rest of their settings went. */
+function reportConfigSetAside(info: ConfigFileSetAside): void {
+  const to = info.setAsidePath;
+  console.error(
+    `config: ${info.path} could not be used because ${info.reason}.  ${to ? `Moved it to ${to}` : "It had already been moved aside"} and saved this change into a new file.  Nothing was deleted.  Settings that were only in the old file are not in effect until you copy them across.`,
+  );
+  recordDataFault({
+    file: "config.json",
+    kind: "set-aside",
+    reason: info.reason,
+    setAsideAs: to ? basename(to) : null,
+    omitted: 0,
+    sections: [],
+    writesRefused: false,
+    holdsCleanup: false,
+    at: Date.now(),
+  });
+}
+
+/** Merge a validated patch into the parsed on-disk object.  Runs under the
+ * config lock, so it must stay synchronous and must not call back into
+ * saveConfig. */
+function mergeConfigPatch(raw: Record<string, unknown>, checkedPatch: CheckedConfigPatch): JsonObject {
+  const parsed = jsonObjectSchema.safeParse(raw);
+  const disk: JsonObject = parsed.success ? parsed.data : {};
+  // usage, qdrant and observability are operator-supplied endpoints (Usage
+  // Monitor telemetry, Bot RAG, Sentry).  They must merge like the other
+  // sections: a URL-only patch must not wipe a stored token, and a
+  // toggle-only patch must not wipe a stored DSN.  Omitting them from this
+  // list meant PATCH /api/config { usage } never wrote
+  // ~/.botfleet/config.json, so Settings reloaded empty fields.
+  //
+  // `computerCall` and `claudeSession` are knob sections like `jobs`:
+  // they resolve from the file when the vault is off, so they belong in
+  // this list for the same reason.
+  // `deepseek` was missing for the same reason and had the same bug: the key
+  // is in the schema, in the API Keys panel and in the tombstone list, but a
+  // save of it never reached disk.  `infisical` is here from the start so the
+  // machine identity does not repeat it a third time.  `jobs` was missing
+  // too: background-job tunables (the knob table in `server/knob-map.ts`)
+  // resolve from the file when the vault is off, so a save that never
+  // reaches disk breaks the vault-over-file contract for exactly the knobs
+  // this rollout manages.
+  for (const key of ["xai", "gemini", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "callStt", "azureSpeech", "metaSpeech", "groq", "assemblyai", "imageGen", "profile", "rooms", "jobs", "localVm", "server", "features", "autoUpdate", "ingress", "usage", "qdrant", "observability", "infisical", "agentProxy", "botDefaults", "imessageLinq", "githubRequestLog", "zulip", "autoReview", "sts", "computerCall", "claudeSession", "placement"] as const) {
     const section = checkedPatch[key];
     if (!section) continue;
     const current = jsonObjectSchema.safeParse(disk[key]);
@@ -341,7 +2548,58 @@ export function saveConfig(patch: Partial<AppConfig>): void {
     Object.assign(merged, section);
     disk[key] = merged;
   }
+  // Explicit null resets the STT provider to automatic. Section merging
+  // would otherwise retain the previously saved explicit provider.
+  if (checkedPatch.callStt?.provider === null) {
+    const stored = jsonObjectSchema.safeParse(disk.callStt);
+    if (stored.success) {
+      const { provider: _cleared, ...rest } = stored.data;
+      disk.callStt = rest;
+    }
+  }
+  // `botDefaults.allowedComputers: null` clears the allowlist: the key is
+  // present and narrows, or absent and allows everything.
+  if (checkedPatch.botDefaults?.allowedComputers === null) {
+    const stored = jsonObjectSchema.safeParse(disk.botDefaults);
+    if (stored.success) {
+      const { allowedComputers: _cleared, ...rest } = stored.data;
+      disk.botDefaults = rest;
+    }
+  }
+  // Headroom null-clear (P-BF-6 slice 7b): the generic section merge above
+  // would persist a JSON null, so an explicit null on any of the three
+  // unset-by-default knobs deletes the stored key instead — the file keeps
+  // reading "unset", exactly as before the knob was set.  Only an explicit
+  // null deletes; an absent key still leaves the stored value alone.
+  {
+    const admission = checkedPatch.jobs?.admission;
+    if (admission && (admission.reservedCpuCores === null || admission.reservedRamMb === null || admission.minMemoryAvailablePercent === null)) {
+      const stored = jsonObjectSchema.safeParse(disk.jobs);
+      if (stored.success) {
+        const storedAdmission = jsonObjectSchema.safeParse(stored.data.admission);
+        if (storedAdmission.success) {
+          const next = { ...storedAdmission.data };
+          if (admission.reservedCpuCores === null) delete next.reservedCpuCores;
+          if (admission.reservedRamMb === null) delete next.reservedRamMb;
+          if (admission.minMemoryAvailablePercent === null) delete next.minMemoryAvailablePercent;
+          stored.data.admission = next;
+        }
+        disk.jobs = stored.data;
+      }
+    }
+  }
   if (checkedPatch.vps !== undefined) disk.vps = normalizeVpsConfig(checkedPatch.vps);
+  if (checkedPatch.conversationMode !== undefined) disk.conversationMode = checkedPatch.conversationMode;
+  if (checkedPatch.busySendDefault !== undefined) disk.busySendDefault = checkedPatch.busySendDefault;
+  if (checkedPatch.terminology !== undefined) disk.terminology = checkedPatch.terminology;
+  if (checkedPatch.terminologyCustom !== undefined) disk.terminologyCustom = checkedPatch.terminologyCustom;
+  if (checkedPatch.deleteInstance) {
+    const currentInstances = jsonObjectSchema.safeParse(disk.instances);
+    if (currentInstances.success && currentInstances.data) {
+      delete currentInstances.data[checkedPatch.deleteInstance];
+      disk.instances = currentInstances.data;
+    }
+  }
   if (checkedPatch.instances) {
     const currentInstances = jsonObjectSchema.safeParse(disk.instances);
     const diskInstances: JsonObject = currentInstances.success ? currentInstances.data : {};
@@ -353,8 +2611,7 @@ export function saveConfig(patch: Partial<AppConfig>): void {
     }
     disk.instances = diskInstances;
   }
-  mkdirSync(DATA_DIR, { recursive: true });
-  writeFileAtomic(p, JSON.stringify(disk, null, 2), { mode: 0o600 });
+  return disk;
 }
 
 /** Set one instance's `config.cli` ("" clears the override back to the
@@ -369,7 +2626,7 @@ export function saveConfig(patch: Partial<AppConfig>): void {
 export function patchInstanceConfig(
   cfg: AppConfig,
   instanceId: string,
-  patch: { cli?: string; fullAuto?: boolean },
+  patch: { cli?: string; fullAuto?: boolean; enabled?: boolean; key?: string; externalCredential?: boolean; models?: Array<{ id: string; label: string }>; replyWaitMinutes?: number | null },
 ): InstanceCliUpdate {
   const next: AppConfig = structuredClone(cfg);
   const map = instanceConfigs(next);
@@ -378,9 +2635,26 @@ export function patchInstanceConfig(
   // assignment below would poison EVERY object in the process (instanceId
   // comes off the URL, where `__proto__` passes the route's [\w.-]+ regex)
   if (!Object.hasOwn(map, instanceId)) return { ok: false, config: cfg };
-  const entry = map[instanceId];
-  
-  const currentConfig = jsonObjectSchema.safeParse(entry.config);
+
+  // Every OTHER instance is carried through in the form it already has on
+  // disk, untouched.  This function used to hand back a stripped copy of the
+  // whole live map, which meant patching one engine's CLI path rewrote every
+  // other engine's entry too — and stripped anything that happened to look
+  // like a workspace default in all of them.  A patch changes one instance.
+  const persistable: InstanceConfigMap = { ...persistableInstanceConfigs(next) };
+
+  // The one being patched is read in PERSISTABLE form, never live: `map` came
+  // out of instanceConfigs(), so its entry carries what workspace config
+  // materialized onto it — the injected credential env, and a `config.url`
+  // resolved from the workspace endpoint.  Layering the patch onto that would
+  // copy both into `nextConfig` and persist them: the key half leaves a
+  // PREVIOUS key behind in the persisted environment, still shadowing the one
+  // just saved, and the url half turns a fallback into a per-instance
+  // override that the next workspace change can no longer reach.
+  const persisted = { ...(persistable[instanceId] ?? stripInjectedDefaults(next, { [instanceId]: map[instanceId] })[instanceId]) };
+  persistable[instanceId] = persisted;
+
+  const currentConfig = jsonObjectSchema.safeParse(persisted.config);
   const nextConfig: JsonObject = currentConfig.success ? { ...currentConfig.data } : {};
 
   if (patch.cli !== undefined) {
@@ -392,6 +2666,19 @@ export function patchInstanceConfig(
     }
   }
 
+  if (patch.models !== undefined) {
+    if (patch.models.length) {
+      nextConfig.userModels = patch.models;
+    } else {
+      delete nextConfig.userModels;
+    }
+  }
+
+  if (patch.replyWaitMinutes !== undefined) {
+    if (patch.replyWaitMinutes === null) delete nextConfig.replyWaitMinutes;
+    else nextConfig.replyWaitMinutes = patch.replyWaitMinutes;
+  }
+
   if (patch.fullAuto !== undefined) {
     if (patch.fullAuto) {
       nextConfig.fullAuto = true;
@@ -400,15 +2687,55 @@ export function patchInstanceConfig(
     }
   }
 
-  entry.config = Object.keys(nextConfig).length ? nextConfig : undefined;
-  for (const e of Object.values(map)) {
-    if (!e.environment) continue;
-    const injected = injectedEnvironment(next, e.driver);
-    for (const [k, v] of Object.entries(e.environment)) {
-      if (injected.get(k) === v) delete e.environment[k];
+  // Dev-mode (no Electron bridge) fallback only: the caller in server/index.ts
+  // intercepts `key` ahead of this function whenever the request carries
+  // `?secretStorage=external`, so a key routed through the encrypted store
+  // never reaches here and never lands in `nextConfig` — it rides a
+  // runtime-only environment override instead. This branch is what a plain
+  // PATCH (dev/browser, no bridge) falls back to, same plaintext-in-config.json
+  // shape the create-time `customConfig.key` path already uses.
+  if (patch.key !== undefined) {
+    const keyValue = patch.key.trim();
+    if (keyValue) {
+      nextConfig.key = keyValue;
+    } else {
+      delete nextConfig.key;
     }
-    if (!Object.keys(e.environment).length) delete e.environment;
   }
+
+  if (patch.externalCredential !== undefined) {
+    if (patch.externalCredential) nextConfig.credentialStorage = "external";
+    else delete nextConfig.credentialStorage;
+  }
+
+  // `enabled` lives on the entry envelope, not in `entry.config` — same shape
+  // the registry reads in ProviderRegistry.load. Re-enabling clears the flag
+  // so a true re-enable and a fresh install both round-trip as the same
+  // on-disk form — explicit `undefined`, NOT `delete`: saveConfig's instances
+  // merge is per-key (mergeConfigPatch does Object.assign(merged, entry) onto
+  // the existing disk entry), so a key this object never HAS is invisible to
+  // that merge and a stale `enabled: false` already on disk would survive a
+  // re-enable forever. Keeping the key with an explicit `undefined` value
+  // clears it on merge — JSON.stringify drops it from the file the same way
+  // `entry.config = undefined` already does just below.
+  if (patch.enabled !== undefined) {
+    // Set on the stripped copy, which is the object that gets persisted.
+    persisted.enabled = patch.enabled ? undefined : false;
+  }
+
+  persisted.config = Object.keys(nextConfig).length ? nextConfig : undefined;
+  next.instances = persistable;
+  return { ok: true, config: next };
+}
+
+export function deleteInstanceConfig(
+  cfg: AppConfig,
+  instanceId: string,
+): { ok: boolean; config: AppConfig } {
+  const next: AppConfig = structuredClone(cfg);
+  const map = instanceConfigs(next);
+  if (!Object.hasOwn(map, instanceId)) return { ok: false, config: cfg };
+  delete map[instanceId];
   next.instances = map;
   return { ok: true, config: next };
 }
@@ -418,23 +2745,149 @@ interface InstanceCliUpdate {
   config: AppConfig;
 }
 
-/** The credential env instanceConfigs() injects for one driver — shared with
+/** The credential env instanceConfigs() injects for one instance — shared with
  * patchInstanceConfig() so the inject rule and the strip rule cannot drift apart.
  * Each secret goes only to the driver that actually reads it: the API-key
  * Grok driver reads XAI_API_KEY, the Computer driver reads BOX_TOKEN, and
  * OpenCode reads OPENCODE_API_KEY. Every other engine brings its own
  * login, so handing it a key it never uses would only put that key in the
- * environment of an unrelated child process. */
-function injectedEnvironment(cfg: AppConfig, driver: string): Map<string, string> {
+ * environment of an unrelated child process.
+ *
+ * `openai-compat` is the one driver with multiple instances (a user-added
+ * custom engine shares it), so the driver check alone is not enough — the
+ * workspace's `openaiCompat.key`/`url` may only reach the single reserved
+ * `openaiCompat` instance. A user-added instance keeps the same driver but
+ * points at whatever arbitrary endpoint the user just typed in; injecting the
+ * shared credential into it too would hand that endpoint the workspace's real
+ * OpenRouter/Groq key as a bearer token. A custom instance gets only the key
+ * (if any) the user entered for that specific instance, via `config.key`. */
+function injectedEnvironment(
+  cfg: AppConfig,
+  driver: string,
+  instanceId: string,
+  /** The entry's own opaque `config` blob, for the one driver whose
+   * per-instance key rides in it — `readInstanceConfigText` is its parse. */
+  entryConfig?: InstanceConfig["config"],
+): Map<string, string> {
   const environment = new Map<string, string>();
   if (driver === "grok" && cfg.xai?.key) environment.set("XAI_API_KEY", cfg.xai.key);
-  if (driver === "openai-compat" && cfg.openaiCompat?.key)
+  const isWorkspaceOpenAiCompatInstance = driver === "openai-compat" && instanceId === "openaiCompat";
+  if (isWorkspaceOpenAiCompatInstance && cfg.openaiCompat?.key)
     environment.set("OPENAI_COMPAT_API_KEY", cfg.openaiCompat.key);
-  if (driver === "openai-compat" && cfg.openaiCompat?.url)
+  if (isWorkspaceOpenAiCompatInstance && cfg.openaiCompat?.url)
     environment.set("OPENAI_COMPAT_URL", cfg.openaiCompat.url);
+  // MiniMax is the second driver that can carry more than one instance, and
+  // the same instance-id gate applies for the same reason: a second instance
+  // points at whatever endpoint the operator typed in (the China host, a
+  // gateway, a reseller), so the workspace key may only reach the reserved
+  // `minimax` instance.  Unlike openai-compat the driver reads no `config.key`
+  // of its own — `resolveMinimaxCredentials` looks at the instance
+  // environment, then process env, then ~/.mmx/config.json — so a
+  // per-instance key is delivered here, and takes precedence over the
+  // workspace one for the instance that carries it.
+  if (driver === "minimax") {
+    const instanceKey = readInstanceConfigText(entryConfig, "key");
+    if (instanceKey) environment.set("MINIMAX_API_KEY", instanceKey);
+    else if (instanceId === "minimax" && cfg.minimax?.key)
+      environment.set("MINIMAX_API_KEY", cfg.minimax.key);
+  }
   if (driver === "boxAgent" && cfg.box?.token) environment.set("BOX_TOKEN", cfg.box.token);
   if (driver === "opencodeGo" && cfg.opencodeGo?.apiKey) environment.set("OPENCODE_API_KEY", cfg.opencodeGo.apiKey);
   return environment;
+}
+
+/** One string field out of an instance's opaque `config` blob.  The blob is
+ * `z.json()` in the schema, so this IS its parse boundary — the same shape
+ * `cliOfRaw` and `fullAutoOfRaw` already use in the registry. */
+const instanceTextSchema = z.object({
+  key: z.string().optional(),
+  url: z.string().optional(),
+  urlSource: z.string().optional(),
+});
+
+function readInstanceConfigText(
+  raw: InstanceConfig["config"],
+  field: "key" | "url" | "urlSource",
+): string | undefined {
+  const parsed = instanceTextSchema.safeParse(raw);
+  if (!parsed.success) return undefined;
+  const value = parsed.data[field]?.trim();
+  return value ? value : undefined;
+}
+
+/** The per-instance environment variable each driver that supports more than
+ * one instance reads its API key from.  Declared in
+ * electron/workspace-credentials.mjs and re-exported here: the desktop shell's
+ * boot-time marker repair walks the same table and cannot import TypeScript,
+ * and two copies of it is exactly the drift that left MiniMax instances out
+ * of that repair. */
+export { INSTANCE_API_KEY_ENV } from "../electron/workspace-credentials.mjs";
+
+/** Strip everything instanceConfigs() materialized onto an entry from
+ * WORKSPACE config, before that entry is persisted.
+ *
+ * Two kinds of value, one rule.  The credential env is the obvious one:
+ * instanceConfigs() bakes each secret into the consuming entry's
+ * `environment` for the live driver to read, and anything that persists a
+ * snapshot of that transient map — adding the first custom engine when
+ * `cfg.instances` was never set, patching a per-instance override — must
+ * strip them back out, or config.json ends up holding a literal copy of a
+ * secret that was never meant to live on disk and a later rotation leaves the
+ * stale copy still active.
+ *
+ * `config.url` is the same bug wearing different clothes.  The workspace
+ * endpoint is a FALLBACK: an instance with no url of its own resolves one at
+ * load time.  Persisting the resolved value turns that fallback into a
+ * per-instance override, so the next change to the workspace endpoint
+ * silently stops reaching the instance it was set for, and Settings reports
+ * an endpoint the engine is no longer using.
+ *
+ * Which url is which is decided by PROVENANCE, never by comparing values.
+ * instanceConfigs() stamps `urlSource: "workspace"` on exactly the entries it
+ * resolved one onto, and only those are stripped.  Comparing values instead
+ * was its own bug in both directions: a connection the operator deliberately
+ * pointed at the workspace's own endpoint looked identical to a resolved
+ * fallback, so it was stripped and then silently re-pointed by the next
+ * workspace change — and an entry written before this marker existed has no
+ * way to prove it was typed, so it is left alone rather than guessed at. */
+export function stripInjectedDefaults(cfg: AppConfig, map: InstanceConfigMap): InstanceConfigMap {
+  const stripped: InstanceConfigMap = {};
+  for (const [id, entry] of Object.entries(map)) {
+    const next = { ...entry };
+    if (readInstanceConfigText(entry.config, "urlSource") === WORKSPACE_URL_SOURCE) {
+      const parsed = jsonObjectSchema.safeParse(entry.config);
+      const { url: _resolved, urlSource: _marker, ...rest } = parsed.success ? parsed.data : {};
+      next.config = Object.keys(rest).length ? rest : undefined;
+    }
+    if (!entry.environment) {
+      stripped[id] = next;
+      continue;
+    }
+    const injected = injectedEnvironment(cfg, entry.driver, id, entry.config);
+    const environment = { ...entry.environment };
+    for (const [k, v] of Object.entries(environment)) {
+      if (injected.get(k) === v) delete environment[k];
+    }
+    stripped[id] = Object.keys(environment).length
+      ? { ...next, environment }
+      : { ...next, environment: undefined };
+  }
+  return stripped;
+}
+
+/** Stamped by instanceConfigs() onto an entry whose `config.url` it resolved
+ * from workspace config, and read by stripInjectedDefaults() on the way back
+ * out.  Transient by construction: it never survives a persist, so an entry
+ * on disk carrying it would have to have been written by a build that had
+ * this materialiser and not this strip. */
+const WORKSPACE_URL_SOURCE = "workspace";
+
+/** The workspace-level endpoint a driver's instances fall back to, if it has
+ * one.  Only the two engines configured with an endpoint and a key do. */
+function workspaceDriverUrl(cfg: AppConfig, driver: string): string | undefined {
+  if (driver === "openai-compat") return cfg.openaiCompat?.url;
+  if (driver === "minimax") return cfg.minimax?.url;
+  return undefined;
 }
 
 // Default fleet: one instance per built-in driver (upstream
@@ -450,21 +2903,20 @@ export function instanceConfigs(cfg: AppConfig): InstanceConfigMap {
   // a credential Milind doesn't want to manage; an `instances` entry brings
   // it back anytime.
   //
-  // Google rides `antigravityAgent` (the `agy` CLI), not `geminiAgent`:
-  // Google retired Gemini CLI for the free/Pro/Ultra tiers on 2026-06-18
-  // (developers.googleblog.com, "transitioning Gemini CLI to Antigravity
-  // CLI"), so a default `gemini` instance could only ever show unavailable.
-  // The driver stays registered for enterprise licences, which keep Gemini
-  // CLI — `{"instances": {"gemini": {"driver": "geminiAgent"}}}` restores it.
+  // Google models exclusively ride `antigravityAgent` (the `agy` CLI).
+  // Gemini direct CLI and API drivers have been retired in favor of the
+  // mature, fully integrated Antigravity driver.
   const DEFAULT_FLEET: InstanceConfigMap = {
     grok: { driver: "grokAgent" },
     dsh: { driver: "dshAgent" },
-    kimi: { driver: "kimiAgent" },
     droid: { driver: "droidAgent" },
     cursor: { driver: "cursorAgent" },
     claude: { driver: "claudeAgent" },
     codex: { driver: "codex" },
     antigravity: { driver: "antigravityAgent" },
+    minimax: { driver: "minimax" },
+    mcode: { driver: "mcodeAgent" },
+    muse: { driver: "museAgent" },
     opencodeGo: { driver: "opencodeGo" },
     computer: { driver: "boxAgent" },
     openaiCompat: { driver: "openai-compat" },
@@ -473,6 +2925,9 @@ export function instanceConfigs(cfg: AppConfig): InstanceConfigMap {
     pi: { driver: "piAgent" },
   };
   const CUSTOM_ONLY = {
+    kimi: { driver: "kimiAgent" },
+    zcode: { driver: "zcodeAgent" },
+    zcodeAcp: { driver: "zcodeAcp" },
     qwen: { driver: "qwenAgent" },
     hermes: { driver: "hermesAgent" },
     pi: { driver: "piAgent" },
@@ -484,6 +2939,9 @@ export function instanceConfigs(cfg: AppConfig): InstanceConfigMap {
     cursor: { driver: "cursorAgent" },
     openaiCompat: { driver: "openai-compat" },
     dsh: { driver: "dshAgent" },
+    minimax: { driver: "minimax" },
+    mcode: { driver: "mcodeAgent" },
+    muse: { driver: "museAgent" },
     ...CUSTOM_ONLY,
   } as const;
   const configured = cfg.instances && Object.keys(cfg.instances).length ? cfg.instances : null;
@@ -505,23 +2963,42 @@ export function instanceConfigs(cfg: AppConfig): InstanceConfigMap {
     const entry = { ...sourceEntry };
     map[id] = entry;
     const environment = { ...entry.environment };
-    for (const [key, value] of injectedEnvironment(cfg, entry.driver)) environment[key] = value;
+    for (const [key, value] of injectedEnvironment(cfg, entry.driver, id, entry.config)) environment[key] = value;
     entry.environment = environment;
     // The driver URL is configuration, not a credential. Environment is
     // intentionally not consulted by ProviderRegistry when it decodes a
     // driver's config, so carry the workspace default into the transient
-    // instance map while preserving a per-instance override.
-    if (entry.driver === "openai-compat" && cfg.openaiCompat?.url) {
-      const raw = entry.config;
-      if (raw === undefined) {
-        entry.config = { url: cfg.openaiCompat.url };
-      } else if (typeof raw === "object" && raw !== null && !Array.isArray(raw)) {
-        const current = raw as Record<string, unknown>;
-        if (typeof current.url !== "string" || !current.url.trim()) {
-          entry.config = { ...current, url: cfg.openaiCompat.url };
-        }
+    // instance map while preserving a per-instance override.  MiniMax joins
+    // openai-compat here because its own `decodeMinimaxConfig` reads
+    // `config.url` first and only then `MINIMAX_BASE_URL` from process env —
+    // a workspace URL saved in Settings would otherwise never reach it.
+    const workspaceUrl = workspaceDriverUrl(cfg, entry.driver);
+    if (workspaceUrl) {
+      const parsed = jsonObjectSchema.safeParse(entry.config);
+      const current = parsed.success ? parsed.data : {};
+      // Stamped as workspace-resolved so the persist paths can tell this url
+      // apart from one the operator typed, WITHOUT comparing the two values —
+      // they are frequently equal, and guessing from that is how a typed
+      // endpoint got silently re-pointed.
+      if (typeof current.url !== "string" || !current.url.trim()) {
+        entry.config = { ...current, url: workspaceUrl, urlSource: WORKSPACE_URL_SOURCE };
       }
     }
   }
   return map;
+}
+
+/** The base instances map a new entry (e.g. a newly added custom engine)
+ * should be merged onto before persisting. When `cfg.instances` is already
+ * set, it IS the persistable base — reuse it untouched. On a default
+ * install (`cfg.instances` absent), the base has to be instanceConfigs()'s
+ * materialized default fleet so the full built-in roster round-trips onto
+ * disk once `instances` becomes non-empty — but that map is the LIVE
+ * transient one, with injected credentials baked into `environment`
+ * (BOX_TOKEN, OPENCODE_API_KEY, OPENAI_COMPAT_API_KEY, …), so it must be
+ * stripped first or saving it copies those live secrets into config.json. */
+export function persistableInstanceConfigs(cfg: AppConfig): InstanceConfigMap {
+  return cfg.instances && Object.keys(cfg.instances).length
+    ? cfg.instances
+    : stripInjectedDefaults(cfg, instanceConfigs(cfg));
 }

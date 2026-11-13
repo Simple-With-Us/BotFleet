@@ -200,8 +200,8 @@ describe("hermesAcpModelId", () => {
     // These are what `session/new` advertises. Returning null for them is what
     // confined the picker to locally injected hosts.
     expect(hermesAcpModelId("openrouter:qwen/qwen3.8-max")).toBe("openrouter:qwen/qwen3.8-max");
-    expect(hermesAcpModelId("openrouter:deepseek/deepseek-v4-flash")).toBe(
-      "openrouter:deepseek/deepseek-v4-flash",
+    expect(hermesAcpModelId("openrouter:deepseek/deepseek-chat")).toBe(
+      "openrouter:deepseek/deepseek-chat",
     );
   });
 

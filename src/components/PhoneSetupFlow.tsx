@@ -10,6 +10,7 @@ import {
 import {
   ArrowLeft,
   Check,
+  Cloud,
   Loader2,
   Mail,
   QrCode,
@@ -93,9 +94,11 @@ export type CompanionBridge = {
 type AccountBridge = NonNullable<NonNullable<Window["ogb"]>["companionAccount"]>;
 type StateBridge<T> = { state: () => Promise<T> };
 const DIRECT_PAIRING_UNAVAILABLE =
-  "Direct Wi-Fi pairing isn’t available on this computer right now. Connect this computer to Wi-Fi, then try again.";
+  "Direct Wi-Fi pairing isn’t available on this computer right now.\u00A0 Connect this computer to Wi-Fi, then try again.";
+const TAILSCALE_PAIRING_UNAVAILABLE =
+  "Tailscale pairing isn’t available right now.\u00A0 Make sure Tailscale is connected and MagicDNS is on.";
 const PROTECTED_PAIRING_UNAVAILABLE =
-  "The HTTPS pairing route became unavailable. Check secure access, then create a new code.";
+  "The secure pairing route became unavailable.\u00A0 Check secure access, then create a new code.";
 
 interface OwnedCompanionPairingRoutePin extends CompanionPairingRoutePin {
   generation: number;
@@ -399,7 +402,7 @@ export function usePhoneSetupController(profileEmail = ""): PhoneSetupController
         if (explicitRoute && !companionPairingRoute(started, routeMode)) {
           setProvisioning(false);
           setError(routeMode === "tailscale"
-            ? "Tailscale pairing isn’t available right now. Make sure Tailscale is connected and MagicDNS is on."
+            ? TAILSCALE_PAIRING_UNAVAILABLE
             : DIRECT_PAIRING_UNAVAILABLE);
           dispatchFlow({ type: "reset" });
           return;
@@ -445,7 +448,7 @@ export function usePhoneSetupController(profileEmail = ""): PhoneSetupController
           setError(pairingFailure ?? (routeMode === "local"
             ? DIRECT_PAIRING_UNAVAILABLE
             : routeMode === "tailscale"
-              ? "Tailscale pairing isn’t available right now. Make sure Tailscale is connected and MagicDNS is on."
+              ? TAILSCALE_PAIRING_UNAVAILABLE
               : PROTECTED_PAIRING_UNAVAILABLE));
           dispatchFlow({ type: "reset" });
           return;
@@ -695,9 +698,14 @@ export function usePhoneSetupController(profileEmail = ""): PhoneSetupController
     setState((current) => current ? { ...current, pairing: null } : current);
     setProvisioning(false);
     setSetupTimedOut(false);
+    const routeError = pin.protectedEndpoint?.kind === "tailnet"
+      ? TAILSCALE_PAIRING_UNAVAILABLE
+      : pin.protectedEndpoint === null
+        ? DIRECT_PAIRING_UNAVAILABLE
+        : PROTECTED_PAIRING_UNAVAILABLE;
     setError(tokenMatches
-      ? PROTECTED_PAIRING_UNAVAILABLE
-      : "The pairing code changed before setup finished. Create a new code and try again.");
+      ? routeError
+      : "The pairing code changed before setup finished.\u00A0 Create a new code and try again.");
     dispatchFlow({ type: "reset" });
 
     if (tokenMatches && companion) {
@@ -874,9 +882,9 @@ export function usePhoneSetupController(profileEmail = ""): PhoneSetupController
 
 function ValuePoints() {
   const points: Array<{ Icon: typeof Smartphone; title: string; detail: string }> = [
-    { Icon: Smartphone, title: "Your chats", detail: "Read and reply from your phone." },
-    { Icon: Check, title: "Quick approvals", detail: "Keep work moving when you step away." },
-    { Icon: ShieldCheck, title: "Private by default", detail: "Only phones you approve can connect." },
+    { Icon: Smartphone, title: "Your Chats", detail: "Read and reply from your phone." },
+    { Icon: Check, title: "Quick Approvals", detail: "Keep work moving when you step away." },
+    { Icon: ShieldCheck, title: "Private by Default", detail: "Only phones you approve can connect." },
   ];
   return (
     <div className="mt-5 grid w-full gap-2 sm:grid-cols-3">
@@ -890,6 +898,14 @@ function ValuePoints() {
     </div>
   );
 }
+
+const endpointHost = (url: string): string => {
+  try {
+    return new URL(url).host;
+  } catch {
+    return url;
+  }
+};
 
 export function PhoneSetupFlowView({
   controller,
@@ -908,12 +924,145 @@ export function PhoneSetupFlowView({
   const manualCodeMode = phonePairingManualCodeMode(Boolean(c.state?.pairing), c.pairingLink);
 
   if (c.phase === "intro") {
+    if (variant === "settings") {
+      const hostedEndpoint = c.state?.endpoints?.find((e) => e.kind === "hosted");
+      const hostedHost = hostedEndpoint ? endpointHost(hostedEndpoint.url) : null;
+      const tailscaleHost = c.state?.tailnetName
+        ? `${c.state.tailnetName}:${c.state.port}`
+        : c.state?.tailscale
+          ? `${c.state.tailscale}:${c.state.port}`
+          : null;
+      const lanHost = c.state?.lan ? `${c.state.lan}:${c.state.port}` : null;
+
+      return (
+        <div className="flex flex-col gap-4 text-left">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h2 className="text-[16px] font-semibold text-ink">
+                {c.state?.devices.length ? "Pair Another Phone" : "Pair a Phone"}
+              </h2>
+              <p className="mt-1 text-[13px] leading-relaxed text-ink-secondary">
+                Choose how this phone should connect.{'\u00A0 '}Then scan the code on your iPhone.
+              </p>
+            </div>
+            <button
+              onClick={c.start}
+              disabled={!c.state || c.busy || c.accountBusy}
+              className="min-h-11 rounded-lg bg-accent px-3.5 py-2 text-[13px] font-medium text-white hover:opacity-90 disabled:cursor-wait disabled:opacity-40"
+            >
+              {c.state?.devices.length ? "Pair Another Phone" : "Pair a Phone"}
+            </button>
+          </div>
+
+          <div className="grid gap-3 sm:grid-cols-3">
+            {/* Route 1: Tailscale */}
+            <div className="flex flex-col justify-between rounded-xl border border-hairline/40 bg-inset p-3.5">
+              <div>
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <ShieldCheck size={16} className={c.tailscaleAvailable ? "text-accent" : "text-ink-secondary"} />
+                    <span className="text-[13px] font-semibold text-ink">Tailscale</span>
+                  </div>
+                  <span
+                    className={`rounded-full px-2 py-0.5 text-[10.5px] font-medium ${
+                      c.tailscaleAvailable ? "bg-success/15 text-success" : "bg-control text-ink-secondary"
+                    }`}
+                  >
+                    {c.tailscaleAvailable ? "Connected" : "Offline"}
+                  </span>
+                </div>
+                <div className="mt-2 truncate font-mono text-[11.5px] text-ink-secondary" title={tailscaleHost ?? "Not connected"}>
+                  {tailscaleHost ?? "Not connected"}
+                </div>
+                <p className="mt-1 text-[11.5px] leading-relaxed text-ink-secondary">
+                  A private network.{'\u00A0 '}Best when your phone is also signed in to Tailscale.
+                </p>
+              </div>
+              <button
+                onClick={c.useTailscale}
+                disabled={!c.tailscaleAvailable || c.busy || c.accountBusy}
+                className="mt-3 min-h-11 w-full rounded-lg border border-hairline/50 bg-control/60 py-2 text-[12px] font-medium text-ink hover:bg-control disabled:opacity-40"
+              >
+                Pair over Tailscale
+              </button>
+            </div>
+
+            {/* Route 2: Companion Gateway */}
+            <div className="flex flex-col justify-between rounded-xl border border-hairline/40 bg-inset p-3.5">
+              <div>
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <Cloud size={16} className={c.hostedReady ? "text-accent" : "text-ink-secondary"} />
+                    <span className="text-[13px] font-semibold text-ink">Gateway</span>
+                  </div>
+                  <span
+                    className={`rounded-full px-2 py-0.5 text-[10.5px] font-medium ${
+                      c.hostedReady ? "bg-success/15 text-success" : "bg-control text-ink-secondary"
+                    }`}
+                  >
+                    {c.hostedReady ? "Ready" : "Not Set Up"}
+                  </span>
+                </div>
+                <div className="mt-2 truncate font-mono text-[11.5px] text-ink-secondary" title={hostedHost ?? "Not set up on this computer"}>
+                  {hostedHost ?? "Not set up on this computer"}
+                </div>
+                <p className="mt-1 text-[11.5px] leading-relaxed text-ink-secondary">
+                  Works away from home on cellular or travel Wi-Fi without VPN.
+                </p>
+              </div>
+              <button
+                onClick={c.start}
+                disabled={!c.state || c.busy || c.accountBusy}
+                className="mt-3 min-h-11 w-full rounded-lg bg-accent/90 py-2 text-[12px] font-medium text-white hover:bg-accent disabled:opacity-40"
+              >
+                Pair via Gateway
+              </button>
+            </div>
+
+            {/* Route 3: Local Wi-Fi */}
+            <div className="flex flex-col justify-between rounded-xl border border-hairline/40 bg-inset p-3.5">
+              <div>
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <Wifi size={16} className={lanHost ? "text-accent" : "text-ink-secondary"} />
+                    <span className="text-[13px] font-semibold text-ink">Local Wi-Fi</span>
+                  </div>
+                  <span
+                    className={`rounded-full px-2 py-0.5 text-[10.5px] font-medium ${
+                      lanHost ? "bg-success/15 text-success" : "bg-control text-ink-secondary"
+                    }`}
+                  >
+                    {lanHost ? "Available" : "Offline"}
+                  </span>
+                </div>
+                <div className="mt-2 truncate font-mono text-[11.5px] text-ink-secondary" title={lanHost ?? "Not on Wi-Fi"}>
+                  {lanHost ?? "Not on Wi-Fi"}
+                </div>
+                <p className="mt-1 text-[11.5px] leading-relaxed text-ink-secondary">
+                  Same Wi-Fi.{'\u00A0 '}Both devices need to be on your home network.
+                </p>
+              </div>
+              <button
+                onClick={c.useLocal}
+                disabled={!lanHost || c.busy || c.accountBusy}
+                className="mt-3 min-h-11 w-full rounded-lg border border-hairline/50 bg-control/60 py-2 text-[12px] font-medium text-ink hover:bg-control disabled:opacity-40"
+              >
+                Pair on Wi-Fi
+              </button>
+            </div>
+          </div>
+
+          {c.error && <p role="alert" className="mt-1 text-[12.5px] text-danger">{c.error}</p>}
+        </div>
+      );
+    }
+
     return (
       <div className="flex flex-col items-center text-center">
         <div className="flex size-14 items-center justify-center rounded-2xl bg-accent/12 text-accent">
           <Smartphone size={26} />
         </div>
-        <h2 className="mt-4 text-[19px] font-semibold text-ink">Use BotFleet from your phone</h2>
+        <h2 className="mt-4 text-[19px] font-semibold text-ink">Use BotFleet from Your Phone</h2>
         <p className="mt-1.5 max-w-[460px] text-[13.5px] leading-relaxed text-ink-secondary">
           Check chats, answer approvals, and send new work without staying at your computer.
         </p>
@@ -923,11 +1072,7 @@ export function PhoneSetupFlowView({
           disabled={!c.state || c.busy || c.accountBusy}
           className="mt-5 w-full max-w-[320px] rounded-lg bg-accent py-2.5 text-[14px] font-medium text-white hover:opacity-90 disabled:cursor-wait disabled:opacity-40"
         >
-          {variant === "settings"
-            ? c.state?.devices.length
-              ? "Pair another phone"
-              : "Pair a phone"
-            : "Set up my phone"}
+          Set Up My Phone
         </button>
         {c.error && <p role="alert" className="mt-3 max-w-[390px] text-[12.5px] text-danger">{c.error}</p>}
         {variant === "onboarding" && (
@@ -937,9 +1082,9 @@ export function PhoneSetupFlowView({
                 c.skip();
                 onSkip?.();
               }}
-              className="mt-2.5 text-[12.5px] text-ink-secondary hover:text-ink"
+              className="mt-2.5 inline-flex min-h-11 items-center justify-center px-3 text-[13px] text-ink-secondary hover:text-ink"
             >
-              Not now
+              Not Now
             </button>
             <p className="mt-2 text-[11.5px] text-ink-secondary">
               You can resume anytime from Settings → Phone.
@@ -951,30 +1096,40 @@ export function PhoneSetupFlowView({
   }
 
   if (c.phase === "sign-in") {
+    // No hosted control plane in this build: say so plainly and offer the
+    // routes that do exist, instead of "needs attention" plus a retry that
+    // can never succeed.
+    const unconfigured = c.account?.configured === false;
     const unavailable = !c.account?.available;
     const failed = c.account?.status === "error" || c.setupTimedOut;
     return (
       <div className="mx-auto flex w-full max-w-[430px] flex-col">
-        <button onClick={c.cancel} className="mb-4 flex w-fit items-center gap-1.5 text-[12px] text-ink-secondary hover:text-ink">
-          <ArrowLeft size={13} /> Back
+        <button onClick={c.cancel} className="mb-4 inline-flex min-h-11 w-fit items-center gap-1.5 px-1 text-[13px] text-ink-secondary hover:text-ink">
+          <ArrowLeft size={16} /> Back
         </button>
         <div className="flex size-11 items-center justify-center rounded-xl bg-accent/12 text-accent">
           <Mail size={20} />
         </div>
         <h2 className="mt-3 text-[18px] font-semibold text-ink">
-          {unavailable || failed ? "Secure access needs attention" : "Sign in to pair securely"}
+          {unconfigured
+            ? "Pair on Your Own Network"
+            : unavailable || failed
+              ? "Secure Access Needs Attention"
+              : "Sign In to Pair Securely"}
         </h2>
         <p
           role={c.setupTimedOut ? "alert" : undefined}
           className="mt-1 text-[13px] leading-relaxed text-ink-secondary"
         >
-          {unavailable
-            ? "Online phone access is not available right now. You can still pair directly on the same Wi-Fi."
+          {unconfigured
+            ? "Secure online access is not configured in this build.\u00a0 Pair directly on the same Wi-Fi, or over Tailscale when both devices share a network."
+            : unavailable
+            ? "Online phone access is not available right now.\u00a0 You can still pair directly on the same Wi-Fi."
             : c.setupTimedOut
-              ? "Secure access is taking longer than expected. You can try again or pair directly on this Wi-Fi."
-            : failed
+              ? "Secure access is taking longer than expected.\u00a0 You can try again or pair directly on this Wi-Fi."
+              : failed
               ? c.account?.message ?? "We could not finish creating your private connection."
-              : "We’ll email you a one-time code. No password needed."}
+              : "We’ll email you a one-time code.\u00a0 No password needed."}
         </p>
 
         {!unavailable && !failed && (
@@ -1018,7 +1173,7 @@ export function PhoneSetupFlowView({
               onClick={c.codeSent ? c.verifyCode : c.requestCode}
               className="rounded-lg bg-accent py-2.5 text-[14px] font-medium text-white hover:opacity-90 disabled:opacity-40"
             >
-              {c.accountBusy ? "Working…" : c.codeSent ? "Verify and continue" : "Email me a code"}
+              {c.accountBusy ? "Working…" : c.codeSent ? "Verify and Continue" : "Email Me a Code"}
             </button>
             {c.codeSent && (
               <button
@@ -1026,7 +1181,7 @@ export function PhoneSetupFlowView({
                 onClick={c.changeEmail}
                 className="text-[12px] text-ink-secondary hover:text-ink disabled:opacity-40"
               >
-                Use another email
+                Use Another Email
               </button>
             )}
             {c.codeSent && !actionError && (
@@ -1035,13 +1190,13 @@ export function PhoneSetupFlowView({
           </div>
         )}
 
-        {(unavailable || failed) && (
+        {(unavailable || failed) && !unconfigured && (
           <button
             disabled={c.accountBusy}
             onClick={c.retryAccount}
             className="mt-5 rounded-lg bg-accent py-2.5 text-[14px] font-medium text-white disabled:opacity-40"
           >
-            {c.accountBusy ? "Trying again…" : "Try secure access again"}
+            {c.accountBusy ? "Trying again…" : "Try Secure Access Again"}
           </button>
         )}
         {actionError && <p role="alert" className="mt-3 text-[12.5px] text-danger">{actionError}</p>}
@@ -1058,7 +1213,7 @@ export function PhoneSetupFlowView({
               <ShieldCheck size={15} /> Pair over Tailscale
             </button>
             <p className="mt-2 text-center text-[11px] leading-relaxed text-ink-secondary">
-              Your iPhone must be signed in to the same tailnet.
+              Your iPhone must be signed in to the same Tailscale network.
             </p>
           </>
         )}
@@ -1084,22 +1239,22 @@ export function PhoneSetupFlowView({
         </div>
         <h2 className="mt-4 text-[18px] font-semibold text-ink">
           {c.localFallback
-            ? "Preparing your pairing code"
+            ? "Preparing Your Pairing Code"
             : c.tailscaleFallback
-              ? "Preparing Tailscale pairing"
-              : "Creating secure phone access"}
+              ? "Preparing Tailscale Pairing"
+              : "Creating Secure Phone Access"}
         </h2>
         <p className="mt-1.5 max-w-[360px] text-[13px] leading-relaxed text-ink-secondary">
           {c.localFallback
             ? "This should only take a moment."
             : c.tailscaleFallback
-              ? "Your pairing code will use your private tailnet connection."
+              ? "Your pairing code will use your private Tailscale connection."
             : "We’re giving this computer a private connection that works even when your phone is away from this Wi-Fi."}
         </p>
         {(c.error || c.accountError) && (
           <p role="alert" className="mt-3 max-w-[380px] text-[12.5px] text-danger">{c.error ?? c.accountError}</p>
         )}
-        <button onClick={c.cancel} className="mt-5 text-[12px] text-ink-secondary hover:text-ink">Cancel</button>
+        <button onClick={c.cancel} className="mt-5 inline-flex min-h-11 items-center justify-center px-3 text-[13px] text-ink-secondary hover:text-ink">Cancel</button>
       </div>
     );
   }
@@ -1110,7 +1265,7 @@ export function PhoneSetupFlowView({
         <div className="flex size-14 items-center justify-center rounded-full bg-success/15 text-success">
           <Check size={28} />
         </div>
-        <h2 className="mt-4 text-[19px] font-semibold text-ink">Your phone is ready</h2>
+        <h2 className="mt-4 text-[19px] font-semibold text-ink">Your Phone Is Ready</h2>
         <p className="mt-1.5 text-[13px] text-ink-secondary">
           It can now open chats, answer approvals, and send new work.
         </p>

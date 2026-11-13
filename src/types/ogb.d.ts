@@ -77,6 +77,7 @@ type SkillRecordingPayload = {
       available: boolean;
       engine: "apple-speech" | "none";
       onDevice: boolean;
+      personalVoice?: boolean;
       reasonCode?: string;
     };
     localComputer: {
@@ -109,11 +110,27 @@ type SkillRecordingPayload = {
     code?: "load-failed" | "renderer-gone";
   }
 
+  /** The build the running process reports.  There is deliberately no build
+   *  number field: the Mac app carries a hand-maintained semver, so its patch
+   *  component is not a build anyone can look up.  `version` is the truth. */
+  interface AppRuntimeInfo {
+    version: string;
+    platform: string;
+    arch: string;
+    electron: string;
+    node: string;
+    packaged: boolean;
+    harness: string | null;
+    /** The same fields on one line, ready to copy into a bug report. */
+    summary: string;
+  }
+
   interface Window {
     ogb?: {
       platform: NodeJS.Platform;
       getCapabilities(): Promise<DesktopCapabilities>;
       onCapabilitiesChanged(cb: (capabilities: DesktopCapabilities) => void): () => void;
+      appInfo?(): Promise<AppRuntimeInfo>;
       companionAccount?: {
         state(): Promise<CompanionAccountState>;
         requestCode(email: string): Promise<CompanionAccountState>;
@@ -145,6 +162,22 @@ type SkillRecordingPayload = {
         cb: (line: { partial?: boolean; text?: string; error?: string }) => void,
       ): () => void;
       onSpeechEnd(cb: (info: { code: number | null; reason?: string }) => void): () => void;
+      personalVoice?: {
+        isAvailable(): Promise<boolean>;
+        list(): Promise<Array<{ id: string; name: string; locale?: string }>>;
+        /** `onRange` fires as each word is about to be spoken.  `location`
+         * and `length` are UTF-16 offsets into `text` (JavaScript string
+         * indices); `elapsedMs` is the synthesizer's own clock since speech
+         * began, or null. */
+        speak(
+          text: string,
+          voiceId?: string,
+          options?: {
+            onRange?: (range: { location: number; length: number; elapsedMs: number | null }) => void;
+          },
+        ): Promise<void>;
+        stop(): Promise<void>;
+      };
       skillRecorder?: {
         permissions(): Promise<{ supported: boolean; reason?: string }>;
         start(): Promise<{ recording: boolean }>;
@@ -157,6 +190,16 @@ type SkillRecordingPayload = {
         status(): Promise<{ configured: boolean }>;
         setKey(value: string): Promise<{ configured: boolean }>;
         streamingToken(): Promise<{ token: string; expiresInSeconds: number }>;
+      };
+      // Speech-to-speech session tokens.  The permanent provider key stays in
+      // the encrypted main-process store; the renderer only ever receives one
+      // of these short-lived, single-session tokens, exactly like
+      // transcription.streamingToken above.
+      sts?: {
+        /** Which STS providers have a credential configured. */
+        status(): Promise<{ xai: boolean; gemini: boolean }>;
+        xaiToken(): Promise<{ token: string; expiresInSeconds: number }>;
+        geminiToken(): Promise<{ token: string; expiresInSeconds: number }>;
       };
       /** Absolute path of a dropped File ("" when the drag carried no
        * file on disk). Absent in older builds of the shell. */
@@ -178,6 +221,8 @@ type SkillRecordingPayload = {
       applySkin?(skin: string): Promise<boolean>;
       /** Receives a GitHub package URL opened through botfleet://install. */
       onPackageInstall?(cb: (url: string) => void): () => void;
+      /** Native menu bar actions dispatched from the main process. */
+      onMenuAction?(cb: (action: string, payload?: unknown) => void): () => void;
       /** Updates the native Dock/taskbar unread indicator. */
       setUnreadCount?(count: number): void;
       /** Opens a live desktop as a sandboxed window owned by BotFleet. */
@@ -207,8 +252,9 @@ type SkillRecordingPayload = {
         close(contextId?: string): Promise<boolean>;
         onState(cb: (state: DesktopWorkspaceState) => void): () => void;
       };
-      /** Native folder picker; resolves null when the user cancels. */
-      pickFolder?(current?: string): Promise<string | null>;
+      /** Native folder picker; resolves null when the user cancels.
+       * `title` labels the dialog for what is being chosen. */
+      pickFolder?(current?: string, title?: string): Promise<string | null>;
       /** Writes the redacted diagnostics report to a user-chosen file;
        * resolves the path, or null when cancelled. */
       exportDiagnostics?(): Promise<string | null>;
@@ -216,15 +262,49 @@ type SkillRecordingPayload = {
       openFile?(filePath: string): Promise<boolean>;
       /** Reveal a file in Finder / file manager with the file selected. */
       showInFolder?(filePath: string): Promise<boolean>;
+      /** Reveal a user-chosen absolute file or folder outside ~/.botfleet. */
+      revealLocalPath?(filePath: string): Promise<boolean>;
       /** Asks where to save a bot-created file (inside ~/.botfleet), copies
        * it there and reveals it. Resolves the chosen path, or null if the
        * user cancelled the dialog. */
       saveFile?(filePath: string): Promise<string | null>;
       /** Save a provider credential through Electron's OS-backed store. */
       setCredential?(
-        name: "composioApiKey" | "xaiApiKey" | "deepseekApiKey" | "boxToken" | "opencodeGoApiKey" | "ttsKey" | "openaiImageApiKey",
+        name:
+          | "composioApiKey"
+          | "xaiApiKey"
+          | "geminiApiKey"
+          | "openaiCompatApiKey"
+          | "minimaxApiKey"
+          | "deepseekApiKey"
+          | "boxToken"
+          | "opencodeGoApiKey"
+          | "ttsKey"
+          | "openaiImageApiKey"
+          | "infisicalClientSecret"
+          | "infisicalReadToken"
+          | "infisicalWriteToken",
         value: string,
+        provider?: "minimax" | "system",
       ): Promise<ConfigStatus>;
+      /** Save a user-added custom engine's API key through the same
+       * OS-backed store `setCredential` uses — a sibling method, not a name
+       * in that fixed union, because a custom engine's instance id is
+       * dynamic (operator-chosen at creation) rather than one of
+       * setCredential's known singleton slots. Call after the instance
+       * already exists (POST /api/instances returns its id): the key never
+       * lands in config.json, only in credentials.bin and the live running
+       * instance's process-local environment. */
+      setInstanceCredential?(instanceId: string, value: string): Promise<void>;
+      /** Purge a deleted custom engine's key from the encrypted store
+       * WITHOUT touching the live harness — unlike setInstanceCredential,
+       * which PATCHes the live instance and would reload that provider
+       * (settling any busy bot as no-longer-busy and defeating the delete
+       * route's own busy-bot guard if called before the delete). Call AFTER
+       * the instance is already gone, so a later engine that reuses the
+       * same name (same slug, same instance id) cannot inherit this key on
+       * the next app launch. */
+      clearInstanceCredential?(instanceId: string): Promise<void>;
       /** In-app auto-update (packaged app only; dormant in dev). onState
        * fires immediately with the current state, then on transitions. */
       updater?: {
@@ -232,6 +312,8 @@ type SkillRecordingPayload = {
         download(): Promise<void>;
         /** quit-and-install the downloaded update */
         install(): Promise<void>;
+        /** Mac-only: run ~/apps/update-botfleet.sh when GitHub has no latest-mac.yml. */
+        local?(): Promise<void>;
         setEnabled?(enabled: boolean): Promise<void>;
         onState(cb: (s: UpdaterState) => void): () => void;
       };
@@ -267,10 +349,15 @@ export interface UpdaterState {
   version?: string;
   percent?: number;
   message?: string;
+  /** True when this Mac has ~/apps/update-botfleet.sh (owner local rebuild). */
+  canLocalUpdate?: boolean;
 }
 
 export interface CompanionAccountState {
   available: boolean;
+  /** False only when this build has no hosted control plane at all; the
+   * sign-in card is then hidden rather than shown as "needs attention". */
+  configured?: boolean;
   status: "signed-out" | "connecting" | "ready" | "error";
   email?: string;
   endpoint?: string;

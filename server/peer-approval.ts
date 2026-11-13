@@ -70,6 +70,14 @@ function allowKeyAllowed(from: BotRecord, allowKey: string): boolean {
   return from.alwaysAllow?.includes(allowKey) ?? false;
 }
 
+/** coordinate_bots is the one peer tool.  A grant saved under the old
+ *  ask_bot or delegate_bot key still authorizes that same teammate. */
+function peerGrantAllowed(from: BotRecord, action: PeerAction, targetId: string): boolean {
+  if (allowKeyAllowed(from, peerAllowKey(action, targetId))) return true;
+  if (action !== "coordinate_bots") return false;
+  return allowKeyAllowed(from, `ask_bot:${targetId}`) || allowKeyAllowed(from, `delegate_bot:${targetId}`);
+}
+
 function pushApprovalCard(
   bus: ApprovalBus,
   from: BotRecord,
@@ -84,7 +92,7 @@ function pushApprovalCard(
     role: "bot",
     kind: "options",
     card: {
-      title: `@${from.name} wants to ${action === "ask_bot" ? "contact" : "delegate to"} @${target.name}`,
+      title: `@${from.name} wants to ${action === "coordinate_bots" ? "hand work to" : action === "ask_bot" ? "contact" : "delegate to"} @${target.name}`,
       subtitle,
       options: ["Allow", "Deny", "Always allow"],
       requestId,
@@ -107,7 +115,7 @@ export function requestPeerApproval(
   action: PeerAction,
   sourceThreadId = from.threadId,
 ): Promise<"allow" | "deny"> {
-  if (allowKeyAllowed(from, peerAllowKey(action, target.id))) {
+  if (peerGrantAllowed(from, action, target.id)) {
     return Promise.resolve("allow");
   }
   return new Promise((resolve) => {
@@ -141,14 +149,23 @@ export function requestPeerApproval(
 /** Called by the respond endpoints BEFORE forwarding to the provider
  * adapter. Returns true if the requestId belonged to a pending peer
  * approval (and resolves it); false if it was a provider request and
- * the endpoint should keep going. */
+ * the endpoint should keep going.
+ *
+ * `threadId` is the thread the answer arrived on, and it must match the one
+ * the card was raised on. Every other answer path already checks that; this
+ * was the one that did not, which let a request id learned from one thread
+ * settle a peer approval owned by another. */
 export function resolvePeerComms(
   _bus: ApprovalBus,
   requestId: string,
   behavior: string | undefined,
+  threadId: string,
 ): boolean {
   const pending = pendingComms.get(requestId);
   if (!pending) return false;
+  // Not this thread's card: leave it pending and let the caller fall
+  // through, exactly as it would for a request id it has never seen.
+  if (pending.threadId !== threadId) return false;
   pendingComms.delete(requestId);
   clearTimeout(pending.timer);
   const allow = behavior === "allow";
@@ -193,7 +210,7 @@ export function dismissStalePeerCards(bus: ApprovalBus): number {
       for (const message of bus.store.messagesFor(threadId)) {
         const card = message.card;
         if (!card?.requestId || card.answered || card.dismissed) continue;
-        if (card.tool !== "ask_bot" && card.tool !== "delegate_bot") continue;
+        if (card.tool !== "ask_bot" && card.tool !== "delegate_bot" && card.tool !== "coordinate_bots") continue;
         if (pendingComms.has(card.requestId)) continue;
         const patched = bus.store.patchMessage(threadId, message.id, {
           card: { ...card, answered: "deny", dismissed: true },

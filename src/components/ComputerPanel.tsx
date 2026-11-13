@@ -5,6 +5,7 @@
 // separate preview remains explicitly user-initiated. Auto never selects a
 // Linux user's desktop.
 import { useEffect, useRef, useState } from "react";
+import { z } from "zod";
 import {
   CalendarDays,
   CalendarClock,
@@ -21,10 +22,27 @@ import {
   X,
 } from "lucide-react";
 import { useStore, type Bot } from "@/state/store";
-import type { Routine } from "@/lib/routines";
+import { nextCalendarRunLabel, routineScheduleLabel } from "@/lib/routine-calendar";
 import { ApiKeyRow } from "./ApiKeys";
 import { cn } from "@/lib/cn";
+import { railAsideClass } from "@/lib/layout-rails";
 import { usePageVisible } from "@/lib/page-visible";
+import {
+  resolvePreviewSource,
+  choiceSurvives,
+  hasPreviewChoice,
+  type ComputerKind,
+  type PreviewChoice,
+} from "@/lib/computer-source";
+import { ComputerSourcePicker } from "./ComputerSourcePicker";
+import {
+  captureFailureIsActionable,
+  cloudCaptureErrorIsStale,
+  decideCloudPreview,
+  newestPreview,
+  FRAME_STALE_MS,
+  type ScreenStreamState,
+} from "@/lib/computer-preview";
 import { CloudBackendPicker } from "./CloudBackendPicker";
 import { useDesktopCapabilities } from "./DesktopCapabilities";
 import { RoutineEditor } from "./RoutinesPage";
@@ -34,13 +52,21 @@ import { LinuxLocalControl } from "./LinuxLocalControl";
 import { MacLocalControl } from "./MacLocalControl";
 import { LocalComputerAutoWarning } from "./LocalComputerAutoWarning";
 import {
+  COMPUTER_REACH_CHECKING,
   autoSelectsLocalComputer,
+  cloudBackendUnavailableNote,
+  computerDestinationDisabledReason,
+  engineReachKnown,
+  instanceSupportsCloudComputer,
   instanceSupportsLocalComputer,
   linuxAutoDescription,
   localComputerDisabledReason,
   localComputerSelectable,
+  runsOnDisabledNote,
 } from "@/lib/local-computer";
+import { botCloudBackend, cloudBackendInherited, cloudDestinationLabel } from "@/lib/cloud-backend";
 import { vpsComputerNeedsReplacement, type VpsComputerStatus } from "@/lib/vps-computer";
+import { CliCredentialSyncPanel } from "./CliCredentialSyncPanel";
 
 async function api(path: string, init?: RequestInit): Promise<any> {
   const res = await fetch(path, { headers: { "content-type": "application/json" }, ...init });
@@ -81,33 +107,29 @@ interface LocalVmStatus {
   viewer_url: string;
 }
 
-function routineScheduleLabel(routine: Routine) {
-  if (routine.schedule.type === "once") {
-    return new Date(routine.schedule.at).toLocaleString([], {
-      month: "short",
-      day: "numeric",
-      hour: "numeric",
-      minute: "2-digit",
-    });
-  }
-  const days = routine.schedule.weekdays;
-  const cadence =
-    days.length === 7
-      ? "Every day"
-      : days.join(",") === "1,2,3,4,5"
-        ? "Weekdays"
-        : days.map((day) => ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][day]).join(", ");
-  const [hour, minute] = routine.schedule.time.split(":").map(Number);
-  return `${cadence} · ${new Date(2000, 0, 1, hour, minute).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`;
-}
+const liveScreenFrame = z.object({
+  kind: z.literal("screen"),
+  botId: z.string(),
+  png: z.string(),
+  mime: z.string().optional(),
+  // The harness stamps this so a streamed frame and a polled screenshot are
+  // both aged against the server's clock.  Without it the comparison would
+  // mix a host timestamp with a browser one, and any skew between them would
+  // decide which picture wins.
+  capturedAt: z.number().optional(),
+});
 
-function nextRunLabel(at: number | null) {
-  if (at == null) return "Paused";
-  const date = new Date(at);
-  const today = new Date();
-  const sameDay = date.toDateString() === today.toDateString();
-  return `${sameDay ? "Today" : date.toLocaleDateString([], { month: "short", day: "numeric" })}, ${date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`;
-}
+/**
+ * The polled screenshot crosses an HTTP boundary and decides which picture the
+ * panel paints, so its shape is checked rather than trusted.  A malformed or
+ * truncated body must not be able to land `undefined` in `polledAt` and silently
+ * make a capture look older than a frame it actually beat.
+ */
+const cloudScreenshot = z.object({
+  png: z.string().min(1),
+  format: z.enum(["png", "jpeg"]),
+  capturedAt: z.number().int().positive(),
+});
 
 export function ComputerPanel({
   bot,
@@ -143,6 +165,26 @@ export function ComputerPanel({
   const [error, setError] = useState<string | null>(null);
   const [creatingRoutine, setCreatingRoutine] = useState(false);
   const [panelView, setPanelView] = useState<"computer" | "android">("computer");
+
+  // WHICH computer the preview is looking at, when the bot holds more than
+  // one.  Auto is the default and reproduces the precedence this panel always
+  // used; the override exists because "the bot has a Local VM" and "the Local
+  // VM actually works for this bot" are different claims and only the second
+  // one is visible.  Picking a source the bot does not hold falls back to auto
+  // rather than showing a computer it has no claim to.
+  const [previewChoice, setPreviewChoice] = useState<PreviewChoice>("auto");
+  // A choice made for a previous bot must not follow the selection.
+  useEffect(() => {
+    setPreviewChoice("auto");
+  }, [bot.id]);
+  const heldComputers = (bot.computers ?? []).filter(
+    (c): c is ComputerKind => c !== "off",
+  );
+  const platformIsMac =
+    capabilities.host.platform === "darwin" ||
+    (capabilities.host.platform === "other" &&
+      globalThis.navigator?.userAgent.includes("Mac") === true);
+  const previewSource = resolvePreviewSource(heldComputers, previewChoice);
   const androidStatus = useAndroidUsbDevices();
   const androidConnected = androidStatus.devices.length > 0;
   // bumped when a Box API key is saved inline, to re-run the spin-up flow
@@ -179,18 +221,39 @@ export function ComputerPanel({
   }, [androidConnected, panelView]);
   useEffect(() => {
     vmReadinessAttempts.current = 0;
-  }, [bot.id, bot.computer]);
+  }, [bot.id, bot.computers]);
   const vmSupported = Boolean(
     selectedInstance?.snapshot.state === "available" &&
       selectedInstance.capabilities?.computerMcp &&
       selectedInstance.driverKind !== "boxAgent",
   );
-  const computerToolSupported = selectedInstance?.capabilities?.computerMcp === true;
-  const vpsSupported = Boolean(computerToolSupported && selectedInstance?.driverKind !== "boxAgent");
-  const cloudBackend = bot.cloudBackend ?? "box";
-  const cloudSupported = cloudBackend === "vps"
-    ? vpsSupported
-    : computerToolSupported || selectedInstance?.driverKind === "boxAgent";
+  // Reach is derived once on the server.  Until that list is in, remote
+  // choices stay grey instead of looking selectable for an HTTP engine.
+  const reachReady = engineReachKnown({
+    instances: state.instances,
+    hydrationStatus: state.hydration.status,
+  });
+  const vpsSupported = reachReady && instanceSupportsCloudComputer(state.instances, bot, "vps");
+  const boxSupported = reachReady && instanceSupportsCloudComputer(state.instances, bot, "box");
+  // Resolved, never `bot.cloudBackend ?? "box"`: a bot that never opened the
+  // picker inherits the workspace default, and the server resolves it that way
+  // for the status body this panel is about to parse.  Reading the bot's own
+  // field here made the panel label a VPS "ASCII.dev Box" and hand it the box
+  // lifecycle.  Everything downstream — labels, the status shape, the sleep and
+  // provision calls, this effect's deps — hangs off this one const.
+  const cloudBackend = botCloudBackend(bot, state.config?.botDefaults?.cloudBackend);
+  const cloudSupported = cloudBackend === "vps" ? vpsSupported : boxSupported;
+  const cloudNote = reachReady
+    ? cloudBackendUnavailableNote(state.instances, bot, platformIsMac)
+    : COMPUTER_REACH_CHECKING;
+  const cloudReason = reachReady
+    ? computerDestinationDisabledReason("cloud", state.instances, bot, cloudBackend, platformIsMac)
+    : COMPUTER_REACH_CHECKING;
+  const vmReason = reachReady
+    ? computerDestinationDisabledReason("vm", state.instances, bot, cloudBackend, platformIsMac)
+    : COMPUTER_REACH_CHECKING;
+  const cloudPickerVisible = !bot.computers || (bot.computers ?? []).includes("cloud");
+  const runsOnNote = runsOnDisabledNote(cloudReason, vmReason, cloudNote, cloudPickerVisible);
   const botRoutines = state.routines
     .filter((routine) => routine.botId === bot.id)
     .sort((a, b) => Number(b.enabled) - Number(a.enabled) || (a.nextRunAt ?? Infinity) - (b.nextRunAt ?? Infinity));
@@ -202,16 +265,16 @@ export function ComputerPanel({
     (run) => run.botId === bot.id && ["queued", "running", "waiting"].includes(run.status),
   );
   const computerDestination =
-    bot.computer === "cloud"
-      ? cloudBackend === "vps" ? "this self-hosted VPS" : "this cloud box"
-      : bot.computer === "vm"
+    (bot.computers ?? []).includes("cloud")
+      ? cloudBackend === "vps" ? "this self-hosted VPS" : "this ASCII.dev Box"
+      : (bot.computers ?? []).includes("vm")
         ? "the Local VM"
-      : bot.computer === "local"
+      : (bot.computers ?? []).includes("local")
         ? "this computer"
-        : bot.computer === "off"
+        : (bot.computers ?? []).length === 0
           ? null
           : phase === "ready"
-            ? cloudBackend === "vps" ? "the self-hosted VPS selected by Auto" : "the cloud box selected by Auto"
+            ? cloudBackend === "vps" ? "the self-hosted VPS selected by Auto" : "the ASCII.dev Box selected by Auto"
             : "this computer selected by Auto";
 
   // resolve the mode on open; box endpoints are only ever hit on the
@@ -226,20 +289,14 @@ export function ComputerPanel({
     setVpsStatus(null);
     setLocalFrame(null);
     setError(null);
-    if (bot.computer === "off") {
+    setCaptureProblem(null);
+    if ((bot.computers ?? []).length === 0) {
       setPhase("off");
       return;
     }
-    if (bot.computer === "local") {
-      if (!providerSupportsLocal) {
-        setError("This model engine cannot control this computer. Choose Claude or an ACP engine.");
-      }
-      setPhase(capabilitiesReady && localAvailable && providerSupportsLocal ? "local" : "local-unavailable");
-      return;
-    }
-    if (bot.computer === "vm") {
+    if (previewSource === "vm") {
       if (!vmSupported) {
-        setError("This model engine cannot use the Local VM. Choose Claude or an ACP engine.");
+        setError("This bot cannot use the Local VM.\u00A0 Choose Claude or an ACP engine.");
         setPhase("vm-unavailable");
         return;
       }
@@ -272,11 +329,11 @@ export function ComputerPanel({
           }
           else {
             const canCreateHere =
-              status.mode === "per-bot" &&
-              status.container === "missing" &&
+              (status.mode === "per-bot" || status.mode === "shared") &&
+              (status.container === "missing" || status.container === "stopped") &&
               status.image &&
               status.create_supported;
-            setError(canCreateHere ? null : `${status.problem ?? "The Local VM is not ready"}. Open App Settings → Local VM.`);
+            setError(canCreateHere ? null : `${status.problem ?? "The Local VM is not ready"}.  Open App Settings → Computers.`);
             setPhase("vm-unavailable");
           }
         })
@@ -290,19 +347,34 @@ export function ComputerPanel({
         if (retryTimer !== undefined) window.clearTimeout(retryTimer);
       };
     }
-    if (bot.computer === "cloud" && !cloudSupported) {
-      setError("This model engine cannot use cloud computer tools. Choose Claude, an ACP engine, or the Computer engine.");
+    if (previewSource === "cloud" && !cloudSupported) {
+      if (!reachReady) {
+        setPhase("checking");
+        return;
+      }
+      setError("This bot cannot use cloud computer tools.\u00A0 Choose Claude, an ACP engine, or ASCII.dev Box.");
       setPhase("error");
       return;
     }
-    if (bot.computer !== "cloud" && !capabilitiesReady) return;
+    if (previewSource === "local") {
+      if (!providerSupportsLocal) {
+        setError("This model engine has no approval channel for actions on this computer, so it cannot control it.  Choose another engine, or another destination.");
+      }
+      setPhase(capabilitiesReady && localAvailable && providerSupportsLocal ? "local" : "local-unavailable");
+      return;
+    }
+    if (previewSource !== "cloud" && !capabilitiesReady) return;
     if (cloudBackend === "vps") {
       const autoLocal =
-        !isLinux && bot.computer !== "cloud" && capabilitiesReady && localSelectable;
+        !isLinux && !(bot.computers ?? []).includes("cloud") && capabilitiesReady && localSelectable;
       if (!vpsSupported) {
+        if (!reachReady) {
+          setPhase("checking");
+          return;
+        }
         if (autoLocal) setPhase("local");
         else {
-          setError("This model engine cannot use a self-hosted VPS. Choose Claude or an ACP engine, or switch the cloud backend to Box.");
+          setError("This bot cannot use a self-hosted VPS.\u00A0 Choose Claude or an ACP engine, or switch the cloud backend to Box.");
           setPhase("error");
         }
         return;
@@ -334,14 +406,14 @@ export function ComputerPanel({
             setPhase("vps-incompatible");
             return;
           }
-          if (bot.computer === "cloud") {
+          if ((bot.computers ?? []).includes("cloud")) {
             setPhase("starting");
             return api(`/api/bots/${bot.id}/computer/provision`, { method: "POST" }).then((result) => {
               if (!alive) return;
               setBoxState(result.container ?? null);
               if (result.ready) setPhase("ready");
               else {
-                setError(result.problem ?? "The VPS Cua desktop is not ready yet");
+                setError(result.problem ?? "The VPS Linux desktop is not ready yet");
                 setPhase("error");
               }
             });
@@ -353,8 +425,8 @@ export function ComputerPanel({
           setBoxState(status.container ?? null);
           setError(
             bot.autoStartVps
-              ? `${status.problem ?? "No ready VPS container"}. Auto will prepare or wake it when this bot next works.`
-              : `${status.problem ?? "No ready VPS container"}. Enable Start VPS automatically below, or choose Cloud to provision it.`,
+              ? `${status.problem ?? "No ready VPS container"}.\u00a0 Auto will prepare or wake it when this bot next works.`
+              : `${status.problem ?? "No ready VPS container"}.\u00a0 Enable Start VPS automatically below, or choose ASCII.dev Box to provision it.`,
           );
           setPhase(status.container === "stopped" ? "vps-stopped" : "vps-unconfigured");
         })
@@ -373,7 +445,7 @@ export function ComputerPanel({
         if (!alive) return;
         const autoLocal = autoSelectsLocalComputer({
           platform: capabilities.host.platform,
-          computer: bot.computer,
+          computers: bot.computers,
           capabilitiesReady,
           localSelectable,
         });
@@ -402,7 +474,12 @@ export function ComputerPanel({
     };
   }, [
     bot.id,
-    bot.computer,
+    bot.computers,
+    // The resolved SOURCE, not the raw list: switching the preview has to
+    // re-resolve the mode, or the panel keeps painting the computer the person
+    // just navigated away from.  `previewSource` changes whenever the choice
+    // does and whenever the bot's holdings do, so it subsumes both.
+    previewSource,
     bot.autoStartVps,
     cloudBackend,
     retry,
@@ -413,6 +490,7 @@ export function ComputerPanel({
     vmSupported,
     cloudSupported,
     vpsSupported,
+    reachReady,
     state.config?.vps?.sshAlias,
   ]);
 
@@ -421,34 +499,203 @@ export function ComputerPanel({
   // idle bot — a drawer left open overnight must not keep shooting.
   const pageVisible = usePageVisible();
   const live = state.screens[bot.id];
-  const sseFlowing = Boolean(bot.busy && live);
-  const inFlight = useRef(false);
+  const [screenStreamState, setScreenStreamState] = useState<ScreenStreamState>("connecting");
+  // Has THIS turn's stream delivered a frame, and when?  The socket being
+  // open proves nothing: the server registers a screen poller inside
+  // `startTurn` and tears it down when the turn settles, so a stream can sit
+  // connected for a whole turn and never paint.  And one delivered frame
+  // proves the stream *can* deliver, not that it still is — the server's
+  // poller swallows capture errors, so a box that goes quiet mid-turn would
+  // otherwise latch the fallback off.  Hence a timestamp, not a boolean.
+  const [lastFrameAt, setLastFrameAt] = useState(0);
+  // The clock the gate compares against.  A stream that stops delivering has
+  // to re-render once, when its last frame goes stale, or the fallback never
+  // starts.
+  const [nowMs, setNowMs] = useState(() => Date.now());
   useEffect(() => {
-    if (phase !== "ready" || sseFlowing || viewerOpen || !pageVisible) return;
-    let alive = true;
-    const shoot = async () => {
-      if (inFlight.current) return;
-      inFlight.current = true;
+    if (!lastFrameAt) return;
+    const remaining = FRAME_STALE_MS - (Date.now() - lastFrameAt);
+    if (remaining <= 0) return;
+    const timer = window.setTimeout(() => setNowMs(Date.now()), remaining + 10);
+    return () => window.clearTimeout(timer);
+  }, [lastFrameAt, nowMs]);
+  // The age of the picture the store is holding.  Tracked apart from
+  // `lastFrameAt` on purpose: that one is zeroed whenever a new stream is
+  // subscribed or a turn begins, because the gate is asking "has this turn
+  // proven it streams?" — but the store's frame is never cleared, so zero
+  // there means "unproven", not "infinitely old".  Using it as the live
+  // frame's age let a leftover polled capture outrank a live frame that was
+  // genuinely on screen.  The `key={bot.id}` remount is what scopes this.
+  const [liveFrameAt, setLiveFrameAt] = useState(0);
+  const wasBusy = useRef(bot.busy);
+  useEffect(() => {
+    if (wasBusy.current === bot.busy) return;
+    wasBusy.current = bot.busy;
+    // A new turn brings its own turn-scoped poller, which has to prove itself.
+    if (bot.busy) setLastFrameAt(0);
+  }, [bot.busy]);
+  useEffect(() => {
+    if (phase !== "ready" || panelView !== "computer" || viewerOpen || !pageVisible) return;
+    setScreenStreamState("connecting");
+    // A brand new stream has not demonstrated anything yet.
+    setLastFrameAt(0);
+    const stream = new EventSource(`/api/events?screens=on&botId=${encodeURIComponent(bot.id)}`);
+    let active = true;
+    let failed = false;
+    stream.onopen = () => {
+      if (!active) return;
+      failed = false;
+      setScreenStreamState("connected");
+    };
+    stream.onerror = () => {
+      if (!active) return;
+      if (!failed) setPolledFrame(null);
+      failed = true;
+      setScreenStreamState("failed");
+    };
+    stream.onmessage = (event) => {
+      if (!active) return;
       try {
-        const { png, format } = await api(`/api/bots/${bot.id}/computer/screenshot`, { method: "POST" });
-        if (alive) setPolledFrame({ png, mime: format === "jpeg" ? "image/jpeg" : "image/png" });
+        const parsed = liveScreenFrame.safeParse(JSON.parse(event.data));
+        if (parsed.success && parsed.data.botId === bot.id) {
+          const frame = parsed.data;
+          // Same clock as the polled capture's stamp.  The browser clock is
+          // only a fallback for a harness too old to stamp its own frames.
+          setLiveFrameAt(typeof frame.capturedAt === "number" ? frame.capturedAt : Date.now());
+          setLastFrameAt(Date.now());
+          setNowMs(Date.now());
+          dispatch({ type: "screenFrame", botId: bot.id, png: frame.png, mime: frame.mime ?? "image/png" });
+        }
       } catch {
-        /* box mid-command or asleep — next tick */
-      } finally {
-        inFlight.current = false;
+        // Ignore malformed frames; EventSource reconnects after a broken stream.
       }
     };
-    void shoot();
-    const timer = setInterval(shoot, bot.busy ? 4000 : 30_000);
     return () => {
-      alive = false;
+      active = false;
+      stream.close();
+    };
+  }, [phase, panelView, viewerOpen, pageVisible, bot.id, dispatch]);
+  const preview = decideCloudPreview({
+    phase,
+    panelView,
+    botBusy: bot.busy === true,
+    lastFrameAt,
+    nowMs,
+    streamState: screenStreamState,
+    viewerOpen,
+    pageVisible,
+  });
+  const captureFailures = useRef(0);
+  const [captureProblem, setCaptureProblem] = useState<string | null>(null);
+  // A cloud capture error that outlives the capture that raised it is its own
+  // bug.  The banner is only ever cleared by the next GOOD capture, and the
+  // poll effect below is torn down the moment the gate stops asking — so a
+  // stream that resumes mid-turn leaves a red "Couldn't capture this computer's
+  // screen" banner over a preview that is streaming fine.  Resetting the
+  // counter as well as the message is what stops the next blip from re-raising
+  // an error that had already been proven untrue by the frames on screen.
+  // Scoped to the cloud path: the Local VM writes the same state and is also
+  // `poll: false`, so this must not take down a live VM error.
+  useEffect(() => {
+    if (!cloudCaptureErrorIsStale(phase, preview.poll)) return;
+    // Both counters, not just the cloud one: clearing the banner while the VM
+    // counter is still pinned at the limit means the next transient VM blip
+    // re-raises an error the person has already been shown is stale.
+    captureFailures.current = 0;
+    vmFailures.current = 0;
+    setCaptureProblem(null);
+  }, [phase, preview.poll]);
+  // When the polled capture landed, so `newestPreview` can compare ages.
+  const [polledAt, setPolledAt] = useState(0);
+  // One capture at a time, SHARED across poll-effect generations.
+  //
+  // The gate changes mid-flight — including the staleness timer, every turn
+  // boundary — and a remote capture is a ~17s round trip that has already been
+  // paid for.  A per-generation guard threw that result away and then refused
+  // to replace it, because this ref was still held: the first picture of the
+  // silent-stream fallback arrived roughly 20s after the gate asked for it.
+  // So the pending capture is the shared thing, and a new generation adopts
+  // the one already running instead of starting a second.  Clearing the ref in
+  // the cleanup instead would let two full-frame SSH captures hit the box at
+  // once, which is the opposite of what this is for.
+  const pendingCapture = useRef<Promise<z.infer<typeof cloudScreenshot>> | null>(null);
+  // Whether this panel instance is still on screen.  Guarding the RESULT on
+  // this rather than on the effect generation is what lets an adopted capture
+  // still paint.  `key={bot.id}` remounts per bot, so one instance is one bot.
+  const panelLive = useRef(true);
+  useEffect(() => {
+    panelLive.current = true;
+    return () => {
+      panelLive.current = false;
+    };
+  }, []);
+  useEffect(() => {
+    if (!preview.poll || !pageVisible) return;
+    const shoot = () => {
+      pendingCapture.current ??= (async () => {
+        try {
+          // Validated, not trusted: a body that does not match is a capture
+          // failure like any other, and is counted and reported as one rather
+          // than being allowed to half-apply.
+          const frame = cloudScreenshot.parse(
+            await api(`/api/bots/${bot.id}/computer/screenshot`, { method: "POST" }),
+          );
+          if (captureFailures.current > 0) {
+            captureFailures.current = 0;
+            setCaptureProblem(null);
+          }
+          return frame;
+        } catch (e) {
+          /* Counted ONCE, here, and not once per awaiter.  The busy cadence is
+           * 4s against a ~17s capture, so five apply() calls can be awaiting
+           * this same promise; counting in the callers turned a single
+           * transient failure into five and raised the banner for a box that
+           * had simply been mid-command.  The previous per-generation guard
+           * tolerated that by construction, and sharing the promise took that
+           * tolerance away.
+           * A box mid-command fails transiently and retries next tick.  One
+           * that fails every tick is not slow, it is broken, and saying so
+           * beats an eternal "Waiting for the first frame…". */
+          captureFailures.current += 1;
+          if (panelLive.current && captureFailureIsActionable(captureFailures.current)) {
+            setCaptureProblem(
+              `Couldn't capture this computer's screen: ${e instanceof Error ? e.message : String(e)}`,
+            );
+          }
+          throw e;
+        } finally {
+          pendingCapture.current = null;
+        }
+      })();
+      return pendingCapture.current;
+    };
+    const apply = async () => {
+      let frame: z.infer<typeof cloudScreenshot>;
+      try {
+        frame = await shoot();
+      } catch {
+        // Already counted and reported by `shoot`, once per capture.
+        return;
+      }
+      if (!panelLive.current) return;
+      setPolledFrame({ png: frame.png, mime: frame.format === "jpeg" ? "image/jpeg" : "image/png" });
+      // Compare PICTURE age, not arrival age, and in the harness's clock for
+      // both sources.  The schema makes `capturedAt` required precisely so the
+      // browser clock is never silently substituted here — that substitution
+      // is what put two clock domains in the comparison in the first place.
+      setPolledAt(frame.capturedAt);
+    };
+    void apply();
+    const timer = setInterval(() => void apply(), preview.intervalMs);
+    return () => {
       clearInterval(timer);
     };
-  }, [phase, sseFlowing, bot.id, viewerOpen, pageVisible, bot.busy]);
+  }, [preview.poll, preview.intervalMs, bot.id, pageVisible]);
 
-  // Local VM preview comes directly from Cua Driver through the harness. It
+  // Local VM preview comes directly from Computer Driver through the harness. It
   // does not use the password-protected noVNC viewer or cloud endpoints.
   const vmInFlight = useRef(false);
+  const vmFailures = useRef(0);
   useEffect(() => {
     if (phase !== "vm" || viewerOpen || !pageVisible) return;
     let alive = true;
@@ -458,8 +705,21 @@ export function ComputerPanel({
       try {
         const { image } = await api(`/api/bots/${bot.id}/local-computer/screenshot`, { method: "POST" });
         if (alive && typeof image === "string") setVmFrame(image);
+        if (vmFailures.current > 0) {
+          vmFailures.current = 0;
+          setCaptureProblem(null);
+        }
       } catch (e) {
-        if (alive) setError(e instanceof Error ? e.message : String(e));
+        /* The desktop restarting mid-capture fails once and recovers.  Raise it
+         * only when it keeps failing, and let a good frame take the message
+         * back down — an error that outlives its cause is its own bug. */
+        if (!alive) return;
+        vmFailures.current += 1;
+        if (captureFailureIsActionable(vmFailures.current)) {
+          setCaptureProblem(
+            `Couldn't capture the Local VM's screen: ${e instanceof Error ? e.message : String(e)}`,
+          );
+        }
       } finally {
         vmInFlight.current = false;
       }
@@ -501,9 +761,14 @@ export function ComputerPanel({
   }, [phase, isLinux, pageVisible, bot.busy]);
 
   const lastScreenMessage = [...bot.messages].reverse().find((m) => m.kind === "screen" && m.png);
+  // Both sources persist: the store's `live` frame is written but never
+  // cleared, and `polledFrame` is replaced only when a capture lands.  Each
+  // carries its own capture time, because "one exists" says nothing about
+  // which is newer — preferring by nullability makes the preview jump
+  // backwards in time at a turn boundary or a staleness transition.
+  const latestPreview = newestPreview(live, polledFrame, polledAt, liveFrameAt);
   const cloudFrame =
-    live ??
-    polledFrame ??
+    latestPreview ??
     (lastScreenMessage ? { png: lastScreenMessage.png!, mime: lastScreenMessage.mime ?? "image/png" } : null);
   const frameSrc =
     phase === "vm"
@@ -599,7 +864,7 @@ export function ComputerPanel({
     } catch (e) {
       fallbackTab?.close();
       // Release the bot before waiting on best-effort tunnel cleanup. A sick
-      // SSH process must never leave the agent paused indefinitely.
+      // SSH process must never leave the bot paused indefinitely.
       if (tookControl) await requestControl("release").catch(() => {});
       if (phase === "ready" && cloudBackend === "vps") {
         await api(`/api/bots/${bot.id}/computer/viewer-close`, { method: "POST", body: "{}" }).catch(() => {});
@@ -620,7 +885,7 @@ export function ComputerPanel({
           setBoxState(result.container ?? null);
           if (result.ready) setPhase("ready");
           else {
-            setError(result.problem ?? "The VPS Cua desktop is not ready yet");
+            setError(result.problem ?? "The VPS Linux desktop is not ready yet");
             setPhase("error");
           }
         }
@@ -637,11 +902,16 @@ export function ComputerPanel({
 
   const runVmAction = async (action: "vm-create" | "vm-recreate" | "vm-delete") => {
     if (
-      (action === "vm-recreate" || action === "vm-delete") &&
+      action === "vm-delete" &&
       !window.confirm(
-        action === "vm-delete"
-          ? `Delete ${bot.name}'s Local VM? Its private durable workspace will remain.`
-          : `Replace ${bot.name}'s Local VM? Its private durable workspace will remain.`,
+        `Delete ${bot.name}'s Local VM? Its private durable workspace will remain.`,
+      )
+    ) return;
+    if (
+      action === "vm-recreate" &&
+      vmStatus?.container === "running" &&
+      !window.confirm(
+        `Replace ${bot.name}'s Local VM? Its private durable workspace will remain.`,
       )
     ) return;
     setPending(action);
@@ -688,7 +958,7 @@ export function ComputerPanel({
       setVpsStatus(result);
       setBoxState(result.container ?? null);
       setPhase(result.ready ? "ready" : "error");
-      if (!result.ready) setError(result.problem ?? "The replacement VPS Cua desktop is not ready yet");
+      if (!result.ready) setError(result.problem ?? "The replacement VPS Linux desktop is not ready yet");
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       setPhase("error");
@@ -710,25 +980,25 @@ export function ComputerPanel({
   const emptyState = {
     checking: "Checking…",
     starting: "Starting your bot's computer…",
-    unconfigured: "No cloud computer configured",
+    unconfigured: "No ASCII.dev Box configured",
     "vps-unconfigured": "No managed VPS computer is configured for this bot",
     "vps-incompatible": "This VPS computer belongs to an earlier BotFleet version",
     "vps-stopped": "The managed VPS computer is stopped",
     "local-unavailable": localDisabledReason ?? "Local computer control isn't ready.",
-    "vm-unavailable": "The Local VM isn't available for this bot",
+    "vm-unavailable": vmStatus?.container === "stopped" ? "The Local VM is stopped" : "The Local VM isn't available for this bot",
     off: "This bot's computer is off",
     error: "Couldn't reach the computer",
   } satisfies Record<Exclude<Phase, "ready" | "local" | "vm">, string>;
 
   return (
     <>
-    <aside className="animate-panel-in flex h-full w-[400px] shrink-0 flex-col border-l border-hairline/40 bg-panel">
+    <aside className={railAsideClass("w-[400px]")}>
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-3">
         <button
           onClick={() => dispatch({ type: "toggleSettings", open: true })}
           className="rounded-md p-1 text-ink-secondary hover:bg-control hover:text-ink"
-          title="Bot settings"
+          title="Bot Settings"
         >
           <Settings size={18} />
         </button>
@@ -773,12 +1043,28 @@ export function ComputerPanel({
       ) : (
       <div className="flex-1 overflow-y-auto px-5 pb-5">
           {/* Screen preview */}
-          <div className="mb-1.5 mt-2 flex items-center justify-between text-[13px] text-ink-secondary">
-            <span>{bot.name}'s screen</span>
-            {phase === "local" && <span className="text-[11px]">this computer</span>}
-            {phase === "vm" && <span className="text-[11px]">Local VM</span>}
-            {cloudBackend === "vps" && (phase === "ready" || phase === "starting") && <span className="text-[11px]">self-hosted VPS</span>}
-        </div>
+          <div className="mb-1.5 mt-2 flex items-center justify-between gap-3 text-[13px] text-ink-secondary">
+            <span className="truncate">{bot.name}'s screen</span>
+            {/* Only when the bot actually holds more than one: a one-option
+                control is noise.  The label doubles as the answer to "which
+                computer am I looking at", which is the question this exists to
+                answer — so it names the destination, never just "Cloud". */}
+            {hasPreviewChoice(heldComputers) ? (
+              <ComputerSourcePicker
+                computers={heldComputers}
+                choice={choiceSurvives(previewChoice, heldComputers)}
+                cloudBackend={cloudBackend}
+                platformIsMac={platformIsMac}
+                onChange={setPreviewChoice}
+              />
+            ) : (
+              <>
+                {phase === "local" && <span className="text-[11px]">this computer</span>}
+                {phase === "vm" && <span className="text-[11px]">Local VM</span>}
+                {cloudBackend === "vps" && (phase === "ready" || phase === "starting") && <span className="text-[11px]">self-hosted VPS</span>}
+              </>
+            )}
+          </div>
         <div className="flex aspect-[16/10] w-full items-center justify-center overflow-hidden rounded-xl bg-card">
           {frameSrc && previewOpensDesktop ? (
             <button
@@ -787,7 +1073,7 @@ export function ComputerPanel({
               disabled={controlPending || pending === "join"}
               className="group relative flex h-full w-full cursor-pointer items-center justify-center focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:cursor-wait"
               aria-label={`Open ${bot.name}'s live desktop`}
-              title="Open live desktop"
+              title="Open Live Desktop"
             >
               <img
                 src={frameSrc}
@@ -837,7 +1123,7 @@ export function ComputerPanel({
                 </button>
               )}
               {phase === "vm-unavailable" && (
-                vmStatus?.mode === "per-bot" && vmStatus.image && vmStatus.create_supported ? (
+                vmStatus?.image && vmStatus.create_supported ? (
                   <button
                     onClick={() => void runVmAction(vmStatus.container === "missing" ? "vm-create" : "vm-recreate")}
                     disabled={pending !== null}
@@ -846,7 +1132,9 @@ export function ComputerPanel({
                     {(pending === "vm-create" || pending === "vm-recreate") && (
                       <Loader2 size={13} className="mr-1.5 inline animate-spin" />
                     )}
-                    {vmStatus.container === "missing" ? `Create ${bot.name}'s VM` : `Replace ${bot.name}'s VM`}
+                    {vmStatus.container === "missing"
+                      ? (vmStatus.mode === "shared" ? "Prepare Local VM" : `Create ${bot.name}'s VM`)
+                      : (vmStatus.container === "stopped" ? "Start Local VM" : `Replace ${bot.name}'s VM`)}
                   </button>
                 ) : (
                   <button
@@ -866,7 +1154,7 @@ export function ComputerPanel({
                 </button>
               )}
               {(phase === "vps-stopped" || (phase === "vps-unconfigured" && vpsStatus?.configured)) &&
-                (bot.computer === "cloud" || bot.autoStartVps) && (
+                ((bot.computers ?? []).includes("cloud") || bot.autoStartVps) && (
                 <button
                   onClick={() => run("provision")}
                   disabled={pending === "provision"}
@@ -877,7 +1165,7 @@ export function ComputerPanel({
                 </button>
               )}
               {phase === "vps-incompatible" && vpsStatus?.managed &&
-                (bot.computer === "cloud" || bot.autoStartVps) && (
+                ((bot.computers ?? []).includes("cloud") || bot.autoStartVps) && (
                 <button
                   onClick={() => void replaceVpsComputer()}
                   disabled={pending === "vps-replace"}
@@ -896,10 +1184,15 @@ export function ComputerPanel({
             {error}
           </div>
         )}
+        {captureProblem && (
+          <div className="mt-2 rounded-lg border border-danger/30 bg-danger/10 px-3 py-2 text-[12px] text-danger">
+            {captureProblem}
+          </div>
+        )}
         {phase === "unconfigured" && (
           <div className="mt-3 rounded-xl bg-card p-4">
             <div className="mb-3 text-[13px] text-ink-secondary">
-              Add a Box API key to give this bot a cloud computer — it spins up right here.
+              Add a Box API key to give this bot an ASCII.dev Box — it spins up right here.
             </div>
             <ApiKeyRow
               section="box"
@@ -910,7 +1203,7 @@ export function ComputerPanel({
         {phase === "vps-unconfigured" && (
           <div className="mt-3 rounded-xl bg-card p-4">
             <div className="mb-3 text-[13px] text-ink-secondary">
-              Configure the VPS SSH alias in App Settings → Connections. Auto only reuses an existing ready container.
+              Configure the VPS SSH alias in App Settings → Connections.{"\u00a0 "}Auto only reuses an existing ready container.
             </div>
             <button
               onClick={openConnectionSettings}
@@ -1018,6 +1311,15 @@ export function ComputerPanel({
           </button>
         )}
         {/* Cloud-only actions */}
+        {phase === "ready" && cloudBackend === "vps" && vpsStatus?.container === "running" && (
+          <div className="mt-3">
+            <CliCredentialSyncPanel
+              syncUrl={`/api/bots/${bot.id}/computer/sync-credentials`}
+              description="Copy host CLI login files from the VM CLI manifest into this bot's cloud VPS container (shared or per-bot, per workspace mode)."
+              autoSyncEnabled={Boolean(state.config?.localVm?.shareCliCredentials)}
+            />
+          </div>
+        )}
         {phase === "ready" && (
           <div className="mt-3 flex gap-2">
             {!control.held && !control.helpReason && (
@@ -1063,26 +1365,30 @@ export function ComputerPanel({
 
         {/* Computer source */}
           <div className="mt-4 rounded-xl bg-card p-4">
-            <div className="text-[15px] font-medium text-ink">Runs on</div>
+            <div className="text-[15px] font-medium text-ink">Runs On</div>
             <div className="mt-0.5 text-[13px] text-ink-secondary">
-              {!bot.computer &&
+              {!bot.computers &&
                 (isLinux || !localSelectable
                   ? cloudBackend === "vps"
-                    ? "Auto reuses a ready VPS when one is configured; otherwise computer use stays off. "
-                    : `${linuxAutoDescription()} `
+                    ? "Auto reuses a ready VPS when one is configured; otherwise computer use stays off.\u00a0 "
+                    : `${linuxAutoDescription()}\u00a0 `
                   : cloudBackend === "vps"
-                    ? "Auto reuses a ready VPS when one exists, otherwise this computer. "
-                    : "Auto uses a cloud box when one exists, otherwise this computer. ")}
-              Pick where this bot's computer lives. <b className="text-ink">Local VM</b> is a Cua-controlled Linux desktop
-              in a container on this machine — free and separate from your own desktop. Set it up in App
+                    ? "Auto reuses a ready VPS when one exists, otherwise this computer.\u00a0 "
+                    : "Auto uses an ASCII.dev Box when one exists, otherwise this computer.\u00a0 ")}
+              Pick where this bot's computer lives.{"\u00a0 "}<b className="text-ink">Local VM</b> is a BotFleet-controlled Linux desktop
+              in a container on this machine — free and separate from your own desktop.{"\u00a0 "}Set it up in App
               Settings → Local VM.
-          </div>
+            </div>
           <div className="mt-3 flex overflow-hidden rounded-lg border border-hairline/40">
             {(
               [
-                ["cloud", "Cloud"],
+                // Named for the backend this bot actually uses: the same
+                // button provisions an ASCII.dev Box or a container on the
+                // person's own server depending on cloudBackend, and one
+                // label for both hides which one is about to happen.
+                ["cloud", cloudDestinationLabel(cloudBackend)],
                 ["vm", "Local VM"],
-                ["local", "This computer"],
+                ["local", typeof window !== "undefined" && (window.ogb?.platform === "darwin" || (typeof navigator !== "undefined" && navigator.userAgent.includes("Mac"))) ? "This Mac" : "This Computer"],
                 ["off", "Off"],
               ] as const
             ).map(([mode, label], i) => (
@@ -1091,31 +1397,42 @@ export function ComputerPanel({
                   (mode === "cloud" && !cloudSupported) ||
                   (mode === "vm" && !vmSupported) ||
                   (mode === "local" && !localSelectable);
+                const selected = mode === "off"
+                  ? (bot.computers ?? []).length === 0
+                  : (bot.computers ?? []).includes(mode as any);
                 const unavailableTitle =
                   mode === "vm" && !vmSupported
-                    ? "This model engine cannot use the Local VM"
+                    ? vmReason ?? "This model engine cannot use the Local VM"
                     : mode === "cloud" && !cloudSupported
-                      ? "This model engine cannot use cloud computer tools"
+                      ? cloudReason ?? cloudNote ?? undefined
                       : mode === "local" && !localSelectable
                         ? localDisabledReason ?? "Local computer control isn't ready"
                           : undefined;
                 return (
               <button
                 key={mode}
+                type="button"
                 disabled={disabled}
                 title={unavailableTitle}
                 onClick={() => {
-                  if (mode === bot.computer) return;
-                  if (mode === "local" && bot.autoApprove) setLocalAutoWarning(true);
-                  else dispatch({ type: "updateBot", botId: bot.id, patch: { computer: mode } });
+                  if (mode === "off") {
+                    dispatch({ type: "updateBot", botId: bot.id, patch: { computers: [] } });
+                    return;
+                  }
+                  if (mode === "local" && bot.autoApprove) {
+                    setLocalAutoWarning(true);
+                    return;
+                  }
+                  const cur = bot.computers ?? [];
+                  const nxt = cur.includes(mode) ? cur.filter(c => c !== mode) : [...cur, mode];
+                  dispatch({ type: "updateBot", botId: bot.id, patch: { computers: nxt } });
                 }}
                 className={cn(
                   "flex-1 py-1.5 text-[13px]",
                   i > 0 && "border-l border-hairline/40",
                   disabled && "cursor-not-allowed opacity-40",
-                  bot.computer === mode
-                    ? "bg-control text-ink"
-                    : "text-ink-secondary hover:bg-control/60 hover:text-ink",
+                  selected ? "bg-control text-ink font-medium" : "text-ink-secondary",
+                  !disabled && !selected && "hover:bg-control/60 hover:text-ink",
                 )}
               >
                 {label}
@@ -1124,19 +1441,28 @@ export function ComputerPanel({
               })()
             ))}
           </div>
-          {(!bot.computer || bot.computer === "cloud") && (
+          {runsOnNote && (
+            <div className="mt-2 text-[11.5px] leading-relaxed text-ink-secondary">
+              {runsOnNote}
+            </div>
+          )}
+          {(!bot.computers || (bot.computers ?? []).includes("cloud")) && (
             <>
               <CloudBackendPicker
                 value={cloudBackend}
+                inherited={cloudBackendInherited(bot)}
                 vpsSupported={vpsSupported}
+                boxSupported={boxSupported}
+                engineName={selectedInstance?.displayName}
+                unavailableNote={cloudNote}
                 onChange={(backend) => dispatch({ type: "updateBot", botId: bot.id, patch: { cloudBackend: backend } })}
               />
-              {!bot.computer && cloudBackend === "vps" && (
+              {!(bot.computers?.length) && cloudBackend === "vps" && (
                 <div className="mt-3 flex items-center justify-between gap-4 rounded-lg bg-inset px-3 py-2.5">
                   <div className="min-w-0">
                     <div className="text-[13px] text-ink">Start VPS automatically</div>
                     <div className="mt-0.5 text-[11.5px] text-ink-secondary">
-                      Off by default. When enabled, Auto may create or wake this bot's managed container.
+                      Off by default.{"\u00a0 "}When enabled, Auto may create or wake this bot's managed container.
                     </div>
                   </div>
                   <button
@@ -1180,12 +1506,12 @@ export function ComputerPanel({
             )}
           </div>
           <div className="mt-0.5 text-[13px] text-ink-secondary">
-            Schedule work for {bot.name}. Use its current setup, or run the whole job inside its cloud VM.
+            Schedule work for {bot.name}. Use its current setup, or run the whole job inside its ASCII.dev Box.
           </div>
           {!computerDestination && (
             <div className="mt-3 flex items-start gap-2 rounded-lg border border-warning/25 bg-warning/10 px-3 py-2 text-[11.5px] leading-relaxed text-warning">
               <Power size={13} className="mt-0.5 shrink-0" />
-              Scheduled tasks on this computer will not have desktop access while this is Off. Choose Cloud VM in the schedule editor to run the whole job there.
+              Scheduled tasks on this computer will not have desktop access while this is Off.{"\u00a0 "}Choose ASCII.dev Box in the schedule editor to run the whole job there.
             </div>
           )}
           {activeRoutineRun && (
@@ -1194,7 +1520,10 @@ export function ComputerPanel({
               className="mt-3 flex w-full items-center gap-2 rounded-lg border border-accent/25 bg-accent/10 px-3 py-2 text-left text-[12px] text-accent hover:bg-accent/15"
             >
               <Loader2 size={13} className={activeRoutineRun.status === "queued" ? "" : "animate-spin"} />
-              <span className="min-w-0 flex-1 truncate">
+              <span
+                className="min-w-0 flex-1 truncate"
+                title={`${activeRoutineRun.routineName} · ${activeRoutineRun.status === "waiting" ? "needs you" : activeRoutineRun.status}`}
+              >
                 {activeRoutineRun.routineName} · {activeRoutineRun.status === "waiting" ? "needs you" : activeRoutineRun.status}
               </span>
             </button>
@@ -1209,12 +1538,15 @@ export function ComputerPanel({
                 >
                   <span className={cn("size-1.5 shrink-0 rounded-full", routine.enabled ? "bg-success" : "bg-ink-secondary/40")} />
                   <span className="min-w-0 flex-1">
-                    <span className="block truncate text-[12.5px] font-medium text-ink">{routine.name}</span>
-                    <span className="block truncate text-[10.5px] text-ink-secondary">
-                      {routineScheduleLabel(routine)}{routine.runOn === "cloud" ? " · runs on VM" : ""}
+                    <span className="block truncate text-[12.5px] font-medium text-ink" title={routine.name}>{routine.name}</span>
+                    <span
+                      className="block truncate text-[10.5px] text-ink-secondary"
+                      title={`${routineScheduleLabel(routine)}${routine.runOn === "cloud" ? " · runs on ASCII.dev Box" : ""}`}
+                    >
+                      {routineScheduleLabel(routine)}{routine.runOn === "cloud" ? " · runs on ASCII.dev Box" : ""}
                     </span>
                   </span>
-                  <span className="shrink-0 text-[10px] text-ink-secondary">{nextRunLabel(routine.nextRunAt)}</span>
+                  <span className="shrink-0 text-[10px] text-ink-secondary">{nextCalendarRunLabel(routine.nextRunAt)}</span>
                 </button>
               ))}
             </div>
@@ -1225,12 +1557,12 @@ export function ComputerPanel({
               className="flex flex-1 items-center justify-center gap-1.5 rounded-lg bg-accent py-2 text-[13px] font-medium text-white hover:brightness-110"
             >
               <Plus size={14} />
-              Create schedule
+              Create Schedule
             </button>
             <button
               onClick={() => dispatch({ type: "showRoutines" })}
               className="flex items-center justify-center gap-1.5 rounded-lg bg-control px-3 py-2 text-[13px] text-ink hover:bg-raised-hover"
-              title="Open schedules"
+              title="Open Schedules"
             >
               <CalendarDays size={14} />
               Schedules
@@ -1243,7 +1575,7 @@ export function ComputerPanel({
         <RoutineEditor
           bots={[bot]}
           lockedBotId={bot.id}
-          defaultRunOn={cloudRoutineReady ? "cloud" : "maus"}
+          defaultRunOn={cloudRoutineReady ? "cloud" : "bot"}
           onClose={() => setCreatingRoutine(false)}
         />
       )}
@@ -1252,7 +1584,7 @@ export function ComputerPanel({
       open={localAutoWarning}
       onCancel={() => setLocalAutoWarning(false)}
       onConfirm={() => {
-        dispatch({ type: "updateBot", botId: bot.id, patch: { computer: "local", acknowledgeLocalAuto: true } });
+        dispatch({ type: "updateBot", botId: bot.id, patch: { computers: [...(bot.computers ?? []), "local"], acknowledgeLocalAuto: true } });
         setLocalAutoWarning(false);
       }}
     />

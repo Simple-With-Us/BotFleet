@@ -1,0 +1,130 @@
+// The permission-prompt proxy the Claude CLI spawns.  Auto-review matches each
+// ask to the step the CLI already showed by the tool_use id, so the proxy has
+// to carry that id to the broker; without it every asked step on a held turn
+// was reviewed twice, once as a step and once at the card.
+import type { ChildProcess } from "node:child_process";
+import { mkdtempSync } from "node:fs";
+import { createServer, type Server, type Socket } from "node:net";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { afterEach, describe, expect, it } from "vitest";
+
+import { removeTempDir, spawnDetached, waitForExit } from "./testing/cleanup.ts";
+
+const PROXY = join(dirname(fileURLToPath(import.meta.url)), "permission-proxy.ts");
+const posixOnly = describe.skipIf(process.platform === "win32");
+
+let child: ChildProcess | undefined;
+let broker: Server | undefined;
+let dir: string | undefined;
+
+afterEach(async () => {
+  if (child) await waitForExit(child, { signal: "SIGTERM" });
+  const open = broker;
+  if (open) await new Promise<void>((resolve) => open.close(() => resolve()));
+  if (dir) await removeTempDir(dir);
+  child = undefined;
+  broker = undefined;
+  dir = undefined;
+});
+
+/** Run the proxy against a stand-in broker; resolves with the ask it sent. */
+async function askThroughProxy(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+  dir = mkdtempSync(join(tmpdir(), "omb-pp-"));
+  const socketPath = join(dir, "p.sock");
+  const ask = new Promise<Record<string, unknown>>((resolve) => {
+    broker = createServer((conn: Socket) => {
+      conn.on("error", () => {});
+      conn.setEncoding("utf8");
+      let buffered = "";
+      conn.on("data", (chunk) => {
+        buffered += chunk;
+        let newline: number;
+        while ((newline = buffered.indexOf("\n")) !== -1) {
+          const line = buffered.slice(0, newline);
+          buffered = buffered.slice(newline + 1);
+          if (!line.trim()) continue;
+          // SAFETY: this fake broker only ever receives the one JSON object the proxy
+          // under test writes, and the test reads `message.id` and compares fields.
+          const message = JSON.parse(line) as Record<string, unknown>;
+          conn.write(JSON.stringify({ t: "answer", id: message.id, behavior: "deny", message: "no" }) + "\n");
+          conn.end();
+          resolve(message);
+          return;
+        }
+      });
+    });
+  });
+  await new Promise<void>((resolve) => broker?.listen(socketPath, resolve));
+  child = spawnDetached(process.execPath, ["--experimental-strip-types", "--no-warnings", PROXY, socketPath], { stdio: ["pipe", "pipe", "ignore"] });
+  child.stdin?.write(
+    JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "approve", arguments: args } }) + "\n",
+  );
+  return ask;
+}
+
+posixOnly("permission proxy", () => {
+  it("carries the tool_use id of the call being asked about to the broker", async () => {
+    const ask = await askThroughProxy({ tool_name: "Bash", input: { command: "ls" }, tool_use_id: "toolu_abc" });
+    expect(ask).toMatchObject({ t: "ask", tool: "Bash", input: { command: "ls" }, toolUseId: "toolu_abc" });
+  });
+
+  it("sends no id when the CLI named none", async () => {
+    const ask = await askThroughProxy({ tool_name: "Bash", input: { command: "ls" } });
+    expect(ask).toMatchObject({ t: "ask", tool: "Bash" });
+    expect(ask.toolUseId).toBeUndefined();
+  });
+
+  it("hands a large non-ASCII tool input to the broker byte for byte", async () => {
+    const content = "中文ok€".repeat(150_000);
+    dir = mkdtempSync(join(tmpdir(), "omb-pp-"));
+    const socketPath = join(dir, "p.sock");
+    const ask = new Promise<Record<string, unknown>>((resolve) => {
+      broker = createServer((conn: Socket) => {
+        conn.on("error", () => {});
+        conn.setEncoding("utf8");
+        let buffered = "";
+        conn.on("data", (chunk) => {
+          buffered += chunk;
+          let newline: number;
+          while ((newline = buffered.indexOf("\n")) !== -1) {
+            const line = buffered.slice(0, newline);
+            buffered = buffered.slice(newline + 1);
+            if (!line.trim()) continue;
+            // SAFETY: this broker only receives the proxy's single JSON ask; the test
+            // asserts the Write `input.content` round-trips without replacement chars.
+            const message = JSON.parse(line) as Record<string, unknown>;
+            conn.write(JSON.stringify({ t: "answer", id: message.id, behavior: "allow", updatedInput: message.input }) + "\n");
+            conn.end();
+            resolve(message);
+            return;
+          }
+        });
+      });
+    });
+    await new Promise<void>((resolve) => broker?.listen(socketPath, resolve));
+    child = spawnDetached(process.execPath, ["--experimental-strip-types", "--no-warnings", PROXY, socketPath], { stdio: ["pipe", "pipe", "ignore"] });
+    const payload = JSON.stringify({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: { name: "approve", arguments: { tool_name: "Write", input: { file_path: "notes.md", content } } },
+    }) + "\n";
+    await new Promise<void>((resolve, reject) => {
+      const stdin = child!.stdin;
+      if (!stdin) return reject(new Error("proxy stdin missing"));
+      const ok = stdin.write(payload, (error) => (error ? reject(error) : undefined));
+      if (ok) resolve();
+      else stdin.once("drain", () => resolve());
+    });
+    const frame = await ask;
+    // SAFETY: the test payload is a Write call; `frame` is that ask object from the broker.
+    const received = (frame.input as { content: string }).content;
+    expect(received.includes("\uFFFD")).toBe(false);
+    expect(received === content).toBe(true);
+    child.stdin?.end();
+    await waitForExit(child, { signal: "SIGTERM" });
+    child = undefined;
+  }, 30_000);
+});

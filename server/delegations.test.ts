@@ -355,7 +355,7 @@ describe("drainDelegations", () => {
     expect(card.card?.options).toEqual(["Allow", "Deny", "Always allow"]);
     expect(runTargetCalls).toEqual([]);
 
-    resolvePeerComms(approvalBus, card.card!.requestId!, "allow");
+    resolvePeerComms(approvalBus, card.card!.requestId!, "allow", from.threadId);
     await waitFor(() => runTargetCalls.length === 1);
     expect(runTargetCalls[0]!.toBotId).toBe(target.id);
     expect(runTargetCalls[0]!.commsDepth).toBe(1);
@@ -371,7 +371,7 @@ describe("drainDelegations", () => {
     const card = await waitFor(() =>
       store.messagesFor(from.threadId).find((m) => m.card?.requestId),
     );
-    resolvePeerComms(approvalBus, card.card!.requestId!, "deny");
+    resolvePeerComms(approvalBus, card.card!.requestId!, "deny", from.threadId);
 
     const chip = await waitFor(() =>
       store

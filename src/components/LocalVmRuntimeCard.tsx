@@ -1,0 +1,578 @@
+// Local VM runtime setup — extracted from `LocalComputerSection.tsx` so
+// the redesigned Computer settings section can swap the section's body
+// for provider toggles + matrix without silently dropping the one-click
+// container install that operators rely on.  Behavior is unchanged from
+// the prior file: a status poll against `/api/local-computer`, four
+// numbered setup steps (install runtime / open runtime / prepare BotFleet
+// desktop / create VM), a per-bot-vs-shared switch that hits
+// `/api/local-computer/mode`, and a Safety / Storage card with stop /
+// delete controls.
+//
+// This file is the operational home of the VM.  The redesigned
+// settings UI is the operator-facing home of "which providers are
+// available".  Keeping them split lets a future ops change to the
+// runtime not drag the settings UX with it, and vice versa.
+import { useCallback, useEffect, useState } from "react";
+import { AlertTriangle, Check, Circle, Loader2, RefreshCw, RotateCcw, Square, Trash2 } from "lucide-react";
+import { api, useStore, type ConfigStatus } from "@/state/store";
+import { Card, CommandLine } from "./SettingsPrimitives";
+import { cn } from "@/lib/cn";
+import { ConfirmDialog } from "./ConfirmDialog";
+import { redactCommandSecrets } from "@/lib/redact-command-secrets";
+import { localVmSetupLine, type LocalVmSetupFacts } from "@/lib/local-vm-setup-line";
+import { PersistentActionErrorCard } from "./PersistentActionErrorCard";
+
+// Must outlast the harness's worst case for one status read: a 4 s presence
+// check, then the runtime health probe, which retries once on a timeout (two
+// 12 s attempts).  A shorter wait aborts the request in exactly the case the
+// "slow to respond" message exists for, and each abandoned request keeps
+// running on the harness.
+const STATUS_TIMEOUT_MS = 40_000;
+
+type Action = "pull" | "run" | "start" | "stop" | "remove" | "recreate";
+
+interface Status {
+  platform: string;
+  runtime: string | null;
+  available: string[];
+  daemonUp: boolean;
+  /** Installed, but its health check timed out twice: unknown, not stopped. */
+  daemonSlow?: boolean;
+  image: boolean;
+  imageMatches: boolean;
+  managed: boolean;
+  container: "running" | "stopped" | "created" | "missing";
+  network: "loopback" | "unsafe" | "unknown";
+  security: "hardened" | "unsafe" | "unknown";
+  persistence: "durable" | "unsafe" | "unknown";
+  desktopReady: boolean;
+  ready: boolean;
+  problem: string | null;
+  image_ref: string;
+  base_image_ref: string;
+  driver_version: string;
+  container_name: string;
+  workspace_path: string;
+  workspace_guest_path: string;
+  idle_timeout_ms: number;
+  max_instances: number;
+  commands: {
+    install: string | null;
+    runtimeStart: string | null;
+    pull: string | null;
+    run: string | null;
+    start: string | null;
+    stop: string | null;
+    remove: string | null;
+  };
+}
+
+function Step({ n, title, done, children }: { n: number; title: string; done: boolean; children?: React.ReactNode }) {
+  return (
+    <div className="flex gap-3">
+      <div
+        className={cn(
+          "mt-0.5 flex size-5 shrink-0 items-center justify-center rounded-full text-[11px]",
+          done ? "bg-success/20 text-success" : "border border-hairline/50 text-ink-secondary",
+        )}
+      >
+        {done ? <Check size={12} /> : n}
+      </div>
+      <div className="min-w-0 flex-1">
+        <div className={cn("text-[14px]", done ? "text-ink-secondary line-through" : "text-ink")}>{title}</div>
+        {!done && children && <div className="mt-2 flex flex-col items-start gap-2 [&>*]:max-w-full">{children}</div>}
+      </div>
+    </div>
+  );
+}
+
+function ActionButton({
+  action,
+  pending,
+  children,
+  onClick,
+  danger = false,
+  disabled = false,
+}: {
+  action: Action;
+  pending: Action | null;
+  children: React.ReactNode;
+  onClick: () => void;
+  danger?: boolean;
+  disabled?: boolean;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled || pending !== null}
+      className={cn(
+        "flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-[12.5px] font-medium disabled:opacity-50",
+        danger ? "bg-danger/15 text-danger hover:bg-danger/20" : "bg-accent text-white hover:brightness-110",
+      )}
+    >
+      {pending === action && <Loader2 size={13} className="animate-spin" />}
+      {children}
+    </button>
+  );
+}
+
+export function LocalVmRuntimeCard() {
+  const { state, dispatch } = useStore();
+  const [status, setStatus] = useState<Status | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [pending, setPending] = useState<Action | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [statusError, setStatusError] = useState<string | null>(null);
+  const [confirm, setConfirm] = useState<null | { title: string; body: string; confirmLabel: string; action: Action }>(null);
+  const [modePending, setModePending] = useState(false);
+  const [modeError, setModeError] = useState<string | null>(null);
+  const [refreshKey, setRefreshKey] = useState(0);
+
+  // The redesigned settings UI drives the per-bot-vs-shared switch
+  // through `botDefaults.vpsMode`; this runtime card still owns the
+  // shared Local VM mode that the legacy `localVm.mode` field used to
+  // pick.  Both states are read so a button label that says "shared"
+  // stays internally consistent with the rest of the section.
+  const localVmMode = state.config?.localVm?.mode;
+  const perBot = localVmMode === "per-bot";
+  // The Local VM provider toggle in Computer settings.  When it is off the
+  // server refuses run and start (409), so the controls that would create
+  // or start the VM are disabled here too.  Stop and remove stay available.
+  // An install with no `computerProviders` yet defers to the legacy
+  // allowlist, same as the server.
+  const computerProviders = state.config?.botDefaults?.computerProviders;
+  const localVmOff = Boolean(computerProviders) && computerProviders?.localVm !== true;
+
+  const refresh = useCallback(async (signal?: AbortSignal) => {
+    const response = await fetch("/api/local-computer", { signal });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.error ?? `Status request failed (${response.status})`);
+    setStatus(body as Status);
+    setStatusError(null);
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    let timer: number | undefined;
+    let controller: AbortController | undefined;
+    const poll = async () => {
+      controller = new AbortController();
+      let timedOut = false;
+      const timeoutId = window.setTimeout(() => {
+        timedOut = true;
+        controller?.abort();
+      }, STATUS_TIMEOUT_MS);
+      try {
+        await refresh(controller.signal);
+      } catch (e) {
+        if (!active) return;
+        if (e instanceof DOMException && e.name === "AbortError" && !timedOut) return;
+        // A previous poll is stale after a failed refresh.  Stop exposing
+        // actions based on it until the server confirms the current state.
+        setStatus(null);
+        const message = e instanceof Error ? e.message : String(e);
+        setStatusError(
+          redactCommandSecrets(
+            timedOut
+              ? `Status check timed out after ${Math.round(STATUS_TIMEOUT_MS / 1000)} seconds. The container runtime may be busy or not responding.`
+              : message,
+          ),
+        );
+      } finally {
+        window.clearTimeout(timeoutId);
+        if (active) {
+          setLoading(false);
+          timer = window.setTimeout(() => void poll(), 5000);
+        }
+      }
+    };
+    void poll();
+    return () => {
+      active = false;
+      controller?.abort();
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [refresh, refreshKey]);
+
+  const post = async (action: Exclude<Action, "recreate">) => {
+    const response = await fetch(`/api/local-computer/${action}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.error ?? `${action} failed`);
+    setStatus(body as Status);
+  };
+
+  const act = async (action: Action, confirmed = false) => {
+    if (action === "remove" && !confirmed) {
+      setConfirm({
+        title: "Delete Local VM?",
+        body: "Delete the Local VM?\u00a0 Files and browser sign-ins in its durable workspace will remain.",
+        confirmLabel: "Delete VM",
+        action,
+      });
+      return;
+    }
+    if (action === "recreate" && !confirmed) {
+      setConfirm({
+        title: "Replace Local VM?",
+        body: "Replace the existing Local VM with the pinned image and safety limits?\u00a0 Files and browser sign-ins in its durable workspace will remain.",
+        confirmLabel: "Replace VM",
+        action,
+      });
+      return;
+    }
+    setPending(action);
+    setActionError(null);
+    try {
+      if (action === "recreate") {
+        await post("remove");
+        await post("run");
+      } else {
+        await post(action);
+      }
+      await refresh();
+    } catch (e) {
+      setActionError(redactCommandSecrets(e instanceof Error ? e.message : String(e)));
+    } finally {
+      setPending(null);
+    }
+  };
+
+  const c = status?.commands;
+  const ready = status?.ready === true;
+  const createdVmVerified = Boolean(
+    status?.container === "created" &&
+      status.image &&
+      status.imageMatches &&
+      status.managed &&
+      status.network === "loopback" &&
+      status.security === "hardened" &&
+      status.persistence === "durable",
+  );
+  const firstStartSafe = createdVmVerified && status?.daemonUp === true;
+  // Only an explicitly returned container state is affirmative evidence
+  // that a VM exists.  A
+  // failed/null/malformed status response must never expose destructive VM
+  // controls or imply that its durable workspace is absent.
+  const existing = status?.container === "running" || status?.container === "stopped" || status?.container === "created";
+  const needsRecreate = Boolean(
+    existing &&
+      (status?.container === "stopped" ||
+        (status?.container === "created" && !createdVmVerified) ||
+        !status?.imageMatches ||
+        !status?.managed ||
+        status?.network === "unsafe" ||
+        status?.security === "unsafe" ||
+        status?.persistence === "unsafe"),
+  );
+  const unavailable = !loading && !status;
+  const host = status?.platform === "darwin" ? "Mac" : "computer";
+  const perBotRuntimeUnsupported = perBot && status?.runtime === "container";
+  const headerReady = perBot ? Boolean(status?.daemonUp && status?.image && !perBotRuntimeUnsupported) : ready;
+  const setupStatus: LocalVmSetupFacts | null = status
+    ? {
+        runtime: status.runtime,
+        daemonUp: status.daemonUp,
+        daemonSlow: status.daemonSlow,
+        image: status.image,
+        container: status.container === "created" ? "missing" : status.container,
+        problem: status.problem,
+      }
+    : null;
+
+  const switchMode = (next: "shared" | "per-bot") => {
+    if (modePending) return;
+    setModePending(true);
+    setModeError(null);
+    api("/api/local-computer/mode", {
+      method: "POST",
+      body: JSON.stringify({ mode: next }),
+    })
+      .then((response: { config: ConfigStatus }) => {
+        dispatch({ type: "configStatus", config: response.config });
+      })
+      .catch((e) => setModeError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setModePending(false));
+  };
+
+  return (
+    <>
+      <Card
+        id="setting-computers-local-vm"
+        title="Local VM"
+        subtitle={perBot
+          ? `Private Linux desktops on this ${host}, with one container and durable workspace per bot.\u00a0 Distinct bots can work concurrently and idle desktops stop after 8 hours.`
+          : `A shared Linux sandbox on this ${host} for bots to browse and work in, each on its own desktop, backed by one durable workspace and automatically recycled after 8 hours without activity.`}
+      >
+        <div className="flex flex-wrap items-center gap-2">
+          <span
+            className={cn(
+              "flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[12.5px]",
+              headerReady ? "bg-success/15 text-success" : "bg-control text-ink-secondary",
+            )}
+          >
+            {loading ? <Loader2 size={12} className="animate-spin" /> : headerReady ? <Check size={12} /> : <Circle size={9} />}
+            {loading
+              ? "Checking…"
+              : unavailable
+                ? "Status unavailable"
+                : perBot && headerReady
+                  ? "Ready for per-bot desktops"
+                  : perBotRuntimeUnsupported
+                    ? "Per-bot mode requires Docker or Podman"
+                  : ready
+                    ? "Ready"
+                    : status?.container === "created"
+                      ? createdVmVerified
+                        ? firstStartSafe ? "Ready to start" : status.daemonSlow ? "Waiting for Docker to respond" : `Start ${status.runtime ?? "the container runtime"} first`
+                        : status.problem ?? "Local VM needs attention"
+                      : localVmSetupLine(setupStatus, perBot)}
+          </span>
+          <button
+            onClick={() => {
+              setLoading(true);
+              setRefreshKey((key) => key + 1);
+            }}
+            disabled={loading || pending !== null}
+            className="flex items-center gap-1.5 rounded-lg border border-hairline/40 px-2.5 py-1 text-[12.5px] text-ink-secondary hover:bg-control hover:text-ink disabled:opacity-40"
+          >
+            <RefreshCw size={12} /> Re-check
+          </button>
+        </div>
+        {statusError && (
+          <div className="mt-3">
+            <PersistentActionErrorCard message={statusError} onDismiss={() => setStatusError(null)} />
+          </div>
+        )}
+        {actionError && (
+          <div className="mt-3">
+            <PersistentActionErrorCard message={actionError} onDismiss={() => setActionError(null)} />
+          </div>
+        )}
+      </Card>
+
+      <Card
+        title="VM Mode"
+        subtitle={
+          perBot
+            ? "Each bot gets its own private container, durable workspace, and loopback viewer.\u00a0 Idle desktops stop on their own after 8 hours."
+            : "One shared container on this machine, with a separate desktop for each bot.\u00a0 Bots work at the same time, but they share cookies, sign-ins, files, and installed apps/CLI tools."
+        }
+      >
+        {unavailable ? (
+          <div className="flex items-center gap-2 text-[13px] text-ink-secondary">
+            <AlertTriangle size={14} className="text-warning" />
+            Status is unavailable, so VM mode is greyed out.{"\u00a0 "}Re-check above.
+          </div>
+        ) : (
+          <div className="flex overflow-hidden rounded-lg border border-hairline/40">
+            {(["shared", "per-bot"] as const).map((option, i) => (
+              <button
+                key={option}
+                disabled={modePending}
+                onClick={() => switchMode(option)}
+                className={cn(
+                  "flex-1 py-1.5 text-[13px]",
+                  i > 0 && "border-l border-hairline/40",
+                  modePending && "opacity-60",
+                  (perBot ? option === "per-bot" : option === "shared")
+                    ? "bg-control text-ink"
+                    : "text-ink-secondary hover:bg-control/60 hover:text-ink",
+                )}
+              >
+                {option === "per-bot" ? "Per-Bot" : "Shared"}
+              </button>
+            ))}
+          </div>
+        )}
+        <div className="mt-2 text-[11.5px] text-ink-secondary">
+          Switching modes removes the existing desktop on the way out, so a shared workspace cannot be silently inherited by a per-bot one (or vice versa).
+        </div>
+        {modeError && <div className="mt-2 text-[11.5px] text-danger">{modeError}</div>}
+      </Card>
+
+      <Card title="Setup" subtitle="Once a container runtime is open, BotFleet prepares the Linux desktop and the VM for you.">
+        {unavailable ? (
+          <div className="flex items-center gap-2 text-[13px] text-ink-secondary">
+            <AlertTriangle size={15} className="shrink-0 text-warning" />
+            <span>Runtime and VM state are unknown until status is available.{"\u00a0 "}Re-check above before preparing an image or creating a VM.</span>
+          </div>
+        ) : loading ? (
+          <div className="flex items-center gap-2 text-[13px] text-ink-secondary"><Loader2 size={14} className="animate-spin" /> Checking runtime and VM status…</div>
+        ) : <div className="flex flex-col gap-4">
+          <Step n={1} title="Install a Container Runtime" done={Boolean(status?.runtime)}>
+            <div className="text-[13px] leading-relaxed text-ink-secondary">
+              Podman and Colima are free.{"\u00a0 "}Docker Desktop may require a paid licence for larger companies and government use.
+            </div>
+            {c?.install ? (
+              <CommandLine command={c.install} />
+            ) : (
+              <a href="https://podman.io/docs/installation" target="_blank" rel="noreferrer" className="text-[13px] text-accent hover:underline">
+                Open the Podman installation guide
+              </a>
+            )}
+          </Step>
+
+          <Step
+            n={2}
+            title={
+              status?.runtime && status.daemonSlow && !status.daemonUp
+                ? `Waiting for ${status.runtime} to respond`
+                : status?.runtime && !status.daemonUp
+                  ? `Open and start ${status.runtime}`
+                  : "Start the container runtime"
+            }
+            done={Boolean(status?.daemonUp)}
+          >
+            {!status?.runtime ? null : status.daemonSlow && !status.daemonUp ? (
+              <div className="text-[13px] text-ink-secondary">
+                The container runtime ({status.runtime}) is installed but did not answer in time, usually because this {host} is busy.{"\u00a0 "}BotFleet keeps checking.
+              </div>
+            ) : c?.runtimeStart ? (
+              <CommandLine command={c.runtimeStart} />
+            ) : (
+              <div className="text-[13px] text-ink-secondary">Open the installed runtime and start its engine, then re-check.</div>
+            )}
+          </Step>
+
+          <Step n={3} title="Prepare the Linux Desktop (One-Time Download and Build)" done={Boolean(status?.image)}>
+            {status?.daemonUp && (
+              <ActionButton action="pull" pending={pending} onClick={() => void act("pull")}>Prepare Linux Desktop</ActionButton>
+            )}
+            {c?.pull && <details className="text-[12px] text-ink-secondary"><summary className="cursor-pointer">Show Base-Image Download</summary><div className="mt-2"><CommandLine command={c.pull} /></div></details>}
+          </Step>
+
+          <Step
+            n={4}
+            title={perBot
+              ? "Create a Private Desktop from Each Bot's Computer Panel"
+              : needsRecreate
+                ? "Replace the Older or Unsafe VM"
+                : status?.container === "created" && createdVmVerified
+                  ? "Start the Local VM"
+                  : "Create and Start the Local VM"}
+            done={!perBot && ready}
+          >
+            {perBot ? (
+              <div className="text-[13px] leading-relaxed text-ink-secondary">
+                {perBotRuntimeUnsupported
+                  ? "Apple container requires an explicit host port, so BotFleet will not guess or expose one.\u00a0 Install or start Docker or Podman for safe per-bot dynamic loopback ports."
+                  : <>
+                      Choose <b className="text-ink">Local VM</b> for a bot, open that bot's Computer panel, then create its desktop there.{"\u00a0 "}BotFleet assigns a private workspace and an available loopback viewer port automatically.
+                    </>}
+              </div>
+            ) : needsRecreate ? (
+              <>
+                <div className="flex gap-2 text-[13px] text-warning">
+                  <AlertTriangle size={15} className="mt-0.5 shrink-0" />
+                  <span>{status?.problem}</span>
+                </div>
+                {status?.image ? (
+                  <ActionButton action="recreate" pending={pending} onClick={() => void act("recreate")} danger disabled={localVmOff}>
+                    <RotateCcw size={13} /> Delete and Recreate
+                  </ActionButton>
+                ) : (
+                  <div className="text-[13px] text-ink-secondary">Prepare the pinned Linux desktop above before replacing this VM.</div>
+                )}
+              </>
+            ) : status?.container === "stopped" ? (
+              <>
+                <div className="flex gap-2 text-[13px] text-warning">
+                  <AlertTriangle size={15} className="mt-0.5 shrink-0" />
+                  <span>{status?.problem ?? "This desktop cannot be resumed safely. Create a new Local VM instead."}</span>
+                </div>
+                {status?.image ? (
+                  <ActionButton action="recreate" pending={pending} onClick={() => void act("recreate")} danger disabled={localVmOff}>
+                    <RotateCcw size={13} /> Delete and Recreate
+                  </ActionButton>
+                ) : (
+                  <div className="text-[13px] text-ink-secondary">Prepare the pinned Linux desktop above before recreating this VM.</div>
+                )}
+              </>
+            ) : status?.container === "created" && firstStartSafe ? (
+              <ActionButton action="start" pending={pending} onClick={() => void act("start")} disabled={localVmOff}>Start Local VM</ActionButton>
+            ) : status?.container === "created" && createdVmVerified ? (
+              <div className="text-[13px] text-ink-secondary">
+                {status.daemonSlow ? `Waiting for ${status.runtime ?? "the container runtime"} to respond.` : `Start ${status.runtime ?? "the container runtime"} above first.`}
+              </div>
+            ) : status?.container === "running" ? (
+              <div className="flex items-center gap-2 text-[13px] text-ink-secondary"><Loader2 size={13} className="animate-spin" /> Waiting for the desktop…</div>
+            ) : status?.container === "missing" && status.image ? (
+              <ActionButton action="run" pending={pending} onClick={() => void act("run")} disabled={localVmOff}>Create Local VM</ActionButton>
+            ) : status?.container === "missing" ? (
+              // The VM comes last: say which step is still ahead of it.
+              <div className="text-[13px] text-ink-secondary">
+                {status.daemonUp
+                  ? "Prepare the Linux desktop above first.\u00a0 Then create the VM here."
+                  : status.daemonSlow
+                    ? "Waiting for the container runtime to respond."
+                    : "Start the container runtime above first."}
+              </div>
+            ) : status ? (
+              <div className="text-[13px] text-ink-secondary">VM state is unknown. Re-check status before creating or removing a VM.</div>
+            ) : null}
+            {localVmOff && !perBot && (
+              <div className="text-[13px] text-ink-secondary">
+                Local VM is turned off in Computer settings.{"\u00a0 "}
+                <a href="#setting-computers-providers" className="text-accent hover:underline">Enable Local VM in Computer settings</a> to create or start it.
+              </div>
+            )}
+            {c?.run && <details className="text-[12px] text-ink-secondary"><summary className="cursor-pointer">Show Command</summary><div className="mt-2"><CommandLine command={c.run} /></div></details>}
+          </Step>
+        </div>}
+      </Card>
+
+      {unavailable && (
+        <Card>
+          <div className="flex gap-2 text-[13px] text-ink-secondary">
+            <AlertTriangle size={15} className="mt-0.5 shrink-0 text-warning" />
+            <span>
+              BotFleet could not confirm whether a Local VM exists.{"\u00a0 "}
+              {statusError ? <>Re-check after the status request recovers, or review the app logs.</> : <>Re-check status before creating or removing a VM.</>}
+            </span>
+          </div>
+        </Card>
+      )}
+
+      <Card
+        title="Safety and Storage"
+        subtitle={perBot
+          ? `Computer Driver operates only this VM's desktop.\u00a0 Every bot gets a private host folder mounted at ${status?.workspace_guest_path ?? "/home/cua/workspace"}; its files and browser profile survive VM replacement.\u00a0 Viewers bind only to loopback, and exact bot-derived targets prevent one bot from attaching to another bot's container.\u00a0 CPU and memory are sized to your container runtime (about 2 CPUs and 2–3 GiB by default), with a 512-process cap and dropped Linux capabilities.\u00a0 VMs can still reach the internet.`
+          : `Computer Driver operates only the VM's desktop.\u00a0 Exactly one private host folder is mounted at ${status?.workspace_guest_path ?? "/home/cua/workspace"}; files and browser sign-ins there survive VM replacement, while everything elsewhere in the VM remains disposable.\u00a0 The password-protected viewer is available only on this machine.\u00a0 Docker and Podman runs are sized to your runtime (about 2 CPUs and 2–3 GiB by default), capped at 512 processes, with all Linux capabilities dropped except the two the desktop supervisor needs.\u00a0 The VM can still reach the internet, and every bot sees the same files and sign-ins.`}
+      >
+        {existing && (
+          <div className="flex flex-wrap gap-2">
+            {status?.container === "running" && (
+              <ActionButton action="stop" pending={pending} onClick={() => void act("stop")}>
+                <Square size={12} /> Stop
+              </ActionButton>
+            )}
+            <ActionButton action="remove" pending={pending} onClick={() => void act("remove")} danger>
+              <Trash2 size={12} /> {perBot ? "Delete Legacy Shared VM" : "Delete VM"}
+            </ActionButton>
+          </div>
+        )}
+        <div className="mt-3 break-all text-[11px] text-ink-secondary">
+          Durable workspace: {status ? status.workspace_path || (status.container === "missing" ? "not created" : "unknown") : "status unavailable"} ·{" "}
+          Computer Driver: {status?.driver_version ?? "0.20.0"} · Local image: {status ? status.image_ref || (status.image ? "prepared" : "not prepared") : "status unavailable"}
+          {status?.base_image_ref ? <> · Base: {status.base_image_ref}</> : null}
+        </div>
+      </Card>
+      <ConfirmDialog
+        open={Boolean(confirm)}
+        title={confirm?.title ?? ""}
+        body={confirm?.body ?? ""}
+        confirmLabel={confirm?.confirmLabel}
+        onCancel={() => setConfirm(null)}
+        onConfirm={() => {
+          const next = confirm?.action;
+          setConfirm(null);
+          if (next) void act(next, true);
+        }}
+      />
+    </>
+  );
+}

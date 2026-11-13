@@ -308,6 +308,15 @@ export function encodeResponse(
 
 // ── the service we advertise ───────────────────────────────────────────
 
+/** The Bonjour type the phone browses for. */
+export const SERVICE_TYPE = "_botfleet._tcp";
+
+/** Types earlier builds advertised under, still answered so a phone that
+ * has not updated yet finds this computer.  The current type never belongs
+ * here: `serviceRecords` drops it, and a list that names itself keeps no
+ * predecessor reachable. */
+export const LEGACY_SERVICE_TYPES = ["_openmausbot._tcp"] as const;
+
 /** The service being advertised: what it is called, where it answers, and
  * the addresses that resolve to this machine. */
 export interface ServiceInfo {

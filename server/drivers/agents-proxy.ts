@@ -1,18 +1,19 @@
 // Agent-to-agent comms MCP proxy — spawned as an MCP server inside a bot's
-// agent process (via the "agents" integration). Exposes eight tools that
+// agent process (via the "agents" integration). Exposes the fleet tools that
 // let one bot talk to another, routed back through the harness so the
 // harness stays the single owner of turns, permissions, and recursion
 // limits:
 //
 //   list_bots()                          → the other bots in this section + their status
-//   ask_bot(bot_id, msg)                 → send msg to that bot, wait, return its reply
-//   delegate_bot(bot_id, msg, reason?)   → hand the task to a peer ASYNC: returns
+//   coordinate_bots(bot_ids, message, ...)  → record a durable handoff and return
+//   assignment_status(id?)                  → read handoffs, change nothing
 //                                          immediately, the peer runs after your
 //                                          current turn finishes, the user sees
 //                                          the peer's reply as its own turn
 //   create_bot(name, role, instructions) → Chiefs can add a specialist to
 //                                          their own section
 //   request_credential(id, reason?)       → show a secure, allowlisted key card
+//   request_sign_in(site, reason?)        → show a Sign in needed card; never a password
 //   list_routines()                       → inspect this bot's scheduled work
 //   propose_routine(...)                  → show a confirmation card for a new routine
 //   propose_routine_action(...)           → show a confirmation card for a routine change
@@ -27,270 +28,80 @@
 import readline from "node:readline";
 
 import { CREDENTIAL_TARGETS, isCredentialTargetId } from "../../shared/credential-request.ts";
+import { inboundText } from "../../shared/sign-in-request.ts";
+import { MAX_CREATED_BOTS_PER_TURN, mcpToolDefinitions } from "../tools/registry.ts";
+import { routineFields } from "../tools/schedule.ts";
 
 const HARNESS = process.env.OMB_HARNESS_URL ?? "http://127.0.0.1:8799";
 const BOT_ID = process.env.OMB_BOT_ID ?? "";
 const THREAD_ID = process.env.OMB_THREAD_ID ?? "";
 const TOKEN = process.env.OMB_COMMS_TOKEN ?? "";
 const DEPTH = Number(process.env.OMB_TURN_DEPTH ?? "0") || 0;
-const MAX_CREATED_PER_TURN = 4;
+// This proxy is a bare child process, so it cannot share a JS closure with
+// the harness the way `server/tools/agents.ts#createAgentTools` does for
+// the HTTP lane — see `MAX_CREATED_BOTS_PER_TURN`'s own comment in
+// registry.ts.  This process's own lifetime is this lane's turn scope, so a
+// local counter is still the right mechanism here; only the NUMBER is
+// shared now, so the two lanes cannot drift on it.
 let createdThisTurn = 0;
 
-const WEEKDAYS = [
-  "monday",
-  "tuesday",
-  "wednesday",
-  "thursday",
-  "friday",
-  "saturday",
-  "sunday",
-] as const;
+/** Every tool's wire definition now comes from the registry — `list_bots`,
+ *  `ask_bot` and `list_routines` since PR 4, the remaining five as of this
+ *  PR.  This proxy renders them onto the MCP wire instead of keeping a
+ *  second copy that can drift from the HTTP lane's; `callTool` below still
+ *  owns EXECUTION for every one of them, because this process reaches the
+ *  harness only over the loopback + COMMS_TOKEN hop and has no in-process
+ *  host to hand the call to.
+ *
+ *  The gate is deliberately wide open: the harness decides whether to mount
+ *  this proxy at all, and by the time the process exists the bot has peer
+ *  comms.  Every guard that matters is enforced by the `/api/internal/`
+ *  endpoint each tool calls, not by what `tools/list` advertises. */
+const REGISTRY_TOOLS = mcpToolDefinitions({
+  agents: true,
+  commsDepth: 0,
+  maxCommsDepth: 1,
+  chiefOfStaff: true,
+  // Jobs P2.  The harness sets OMB_JOBS=1 only on a turn it decided to mount
+  // the job tools on, so this gate is the harness's own verdict and not a
+  // second guess at it: no env, no job tools on this wire.  The settings it
+  // reads are the same per-turn values the HTTP lane's tool host gets, so the
+  // two lanes' descriptions cannot drift.
+  jobs: process.env.OMB_JOBS === "1",
+  // Zulip (docs/zulip.md).  Same shape as jobs: the harness sets OMB_ZULIP=1
+  // only for a bot whose Zulip identity is connected, and the
+  // `/api/internal/zulip` endpoints decide every target from this process's
+  // comms grant, never from the arguments.
+  zulip: process.env.OMB_ZULIP === "1",
+});
 
-// One flat object, deliberately free of oneOf/const/format: several agent
-// CLIs flatten or drop JSON-Schema composition keywords when converting MCP
-// tools into their provider's function-call format, and a model that never
-// saw the branches guesses shapes forever (the 0.1.38 field failure). The
-// per-type rules live in descriptions and are enforced with guiding errors
-// in normalizeScheduleInput below.
-const ROUTINE_SCHEDULE_SCHEMA = {
-  type: "object",
-  additionalProperties: false,
-  description:
-    'Either {"type":"once","at":RFC3339} for one future run, {"type":"weekly","time":"HH:MM","weekdays":[...]} for chosen days, or {"type":"daily","time":"HH:MM"} to run every day. Sub-day intervals (every N minutes/hours) are not supported.',
-  properties: {
-    type: {
-      type: "string",
-      enum: ["once", "weekly", "daily"],
-      description: "once = a single future run; weekly = chosen weekdays; daily = every day of the week.",
-    },
-    at: {
-      type: "string",
-      description:
-        "Only for type once: future RFC3339 date-time with an explicit timezone offset, for example 2026-09-01T09:00:00+05:30 or 2026-09-01T03:30:00Z.",
-    },
-    time: {
-      type: "string",
-      description: "For type weekly or daily: local computer time in 24-hour HH:MM format, for example 09:00.",
-    },
-    weekdays: {
-      type: "array",
-      items: { type: "string", enum: WEEKDAYS },
-      description: "Only for type weekly: which days the routine runs, in the computer's local timezone.",
-    },
-  },
-  required: ["type"],
-} as const;
-
-const SHORT_WEEKDAYS = {
-  mon: "monday",
-  tue: "tuesday",
-  tues: "tuesday",
-  wed: "wednesday",
-  thu: "thursday",
-  thur: "thursday",
-  thurs: "thursday",
-  fri: "friday",
-  sat: "saturday",
-  sun: "sunday",
-} as const satisfies Record<string, (typeof WEEKDAYS)[number]>;
-
-const SUPPORTED_SCHEDULES =
-  'Supported schedules: {"type":"once","at":"2026-09-01T09:00:00+05:30"} (future RFC3339 with explicit offset), ' +
-  '{"type":"weekly","time":"09:00","weekdays":["monday","friday"]}, or {"type":"daily","time":"09:00"} for every day.';
-
-/** The outcome of coercing a model-sent schedule: the harness-dialect
- * schedule, or a message telling the model exactly what to send instead. */
-interface NormalizedSchedule {
-  schedule?: Json;
-  error?: string;
-}
-
-/** A schedule as the harness accepts it, or a message telling the model
- * exactly what to send instead. Coercion first, error second: models
- * routinely stringify nested objects, say "daily", or shorten weekday
- * names, and each of those has one obvious meaning. */
-function normalizeScheduleInput(args: Json): NormalizedSchedule {
-  let raw = args.schedule;
-  if (typeof raw === "string") {
-    // Some models deliver nested objects as JSON strings.
-    try {
-      raw = JSON.parse(raw);
-    } catch {
-      return { error: `The schedule must be a JSON object, not text. ${SUPPORTED_SCHEDULES}` };
-    }
-  }
-  if (!jsonRecord(raw)) return { error: `The schedule must be a JSON object. ${SUPPORTED_SCHEDULES}` };
-  const type = typeof raw.type === "string" ? raw.type.trim().toLowerCase() : "";
-  if (type === "once") {
-    if (typeof raw.at !== "string" || !raw.at.trim()) {
-      return { error: `A once schedule needs "at": a future RFC3339 date-time with an explicit offset, for example 2026-09-01T09:00:00+05:30.` };
-    }
-    return { schedule: { type: "once", at: raw.at.trim() } };
-  }
-  if (type === "weekly" || type === "daily") {
-    const time = typeof raw.time === "string" ? raw.time.trim() : "";
-    if (!time) return { error: `A ${type} schedule needs "time" in 24-hour HH:MM, for example 09:00.` };
-    let weekdays: string[];
-    if (type === "daily") {
-      // daily = weekly on all seven days; an explicit weekdays list narrows it.
-      weekdays = Array.isArray(raw.weekdays) && raw.weekdays.length ? raw.weekdays : [...WEEKDAYS];
-    } else {
-      if (!Array.isArray(raw.weekdays) || raw.weekdays.length === 0) {
-        return { error: `A weekly schedule needs "weekdays", for example ["monday","friday"] — or use {"type":"daily"} to run every day.` };
-      }
-      weekdays = raw.weekdays;
-    }
-    const normalized: string[] = [];
-    for (const day of weekdays) {
-      const lower = String(day).trim().toLowerCase();
-      const full = (WEEKDAYS as readonly string[]).includes(lower)
-        ? lower
-        : Object.hasOwn(SHORT_WEEKDAYS, lower)
-          ? SHORT_WEEKDAYS[lower as keyof typeof SHORT_WEEKDAYS]
-          : undefined;
-      if (!full) return { error: `Unsupported weekday "${String(day)}". Use full names: ${WEEKDAYS.join(", ")}.` };
-      if (!normalized.includes(full)) normalized.push(full);
-    }
-    return { schedule: { type: "weekly", time, weekdays: normalized } };
-  }
-  if (type === "interval" || type === "cron" || type === "hourly" || type === "minutes") {
-    return { error: `Routines cannot run on sub-day intervals. ${SUPPORTED_SCHEDULES} Pick the closest daily or weekly time and tell the user about this limit.` };
-  }
-  return { error: `Unknown schedule type "${type || "(missing)"}". ${SUPPORTED_SCHEDULES}` };
-}
-
-const ROUTINE_FIELDS_SCHEMA = {
-  name: { type: "string", minLength: 1, maxLength: 80, description: "Short name shown in Routines." },
-  instructions: {
-    type: "string",
-    minLength: 1,
-    maxLength: 20_000,
-    description: "The complete instructions the bot should follow each time the routine runs.",
-  },
-  schedule: ROUTINE_SCHEDULE_SCHEMA,
-  run_on: {
-    type: "string",
-    enum: ["maus", "cloud"],
-    description: "Where the routine runs. Defaults to maus (this BotFleet setup).",
-  },
-  duration_minutes: {
-    type: "integer",
-    minimum: 15,
-    maximum: 240,
-    description: "Maximum run duration in minutes. Defaults to 30.",
-  },
-} as const;
-
-const TOOLS = [
-  {
-    name: "list_bots",
-    description:
-      "List the other bots (agents) in your BotFleet section you can message, with their model and whether they're busy. Call this before ask_bot to discover who's available.",
-    inputSchema: { type: "object", properties: {} },
-  },
-  {
-    name: "ask_bot",
-    description:
-      "Send a message to another bot in your section and wait for its reply. Use it to delegate a subtask to a specialist bot or ask a peer a question. The other bot runs a full turn under its own model and permissions; the reply is returned to you as text. Returns promptly with a note if that bot is busy.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        bot_id: { type: "string", description: "The target bot's id (from list_bots)." },
-        message: { type: "string", description: "What to say / ask the bot." },
-      },
-      required: ["bot_id", "message"],
-    },
-  },
-  {
-    name: "delegate_bot",
-    description:
-      "Hand a task to another bot ASYNCHRONOUSLY: returns immediately and the peer runs after your current turn finishes. Use this when you want to keep working or hand off a long-running subtask without waiting. The user sees the peer's reply as its own turn; you do NOT receive the reply inline.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        bot_id: { type: "string", description: "The target bot's id (from list_bots)." },
-        message: { type: "string", description: "What the peer should do / answer." },
-        reason: { type: "string", description: "Optional one-line reason for the delegation (shown to the user as a chip)." },
-      },
-      required: ["bot_id", "message"],
-    },
-  },
-  {
-    name: "create_bot",
-    description:
-      "Create a specialist bot in your section. Only a section's Chief of Staff may use this. The new bot inherits the Chief's engine, starts with connected apps and automatic approvals disabled, and can then receive work through delegate_bot. Create only the smallest useful team (maximum four per turn).",
-    inputSchema: {
-      type: "object",
-      properties: {
-        name: { type: "string", description: "Short, unique display name for the specialist." },
-        role: { type: "string", description: "The specialist's job title or role." },
-        instructions: { type: "string", description: "What this specialist is responsible for and how it should work." },
-      },
-      required: ["name", "role", "instructions"],
-    },
-  },
-  {
-    name: "request_credential",
-    description:
-      "Ask the user for a supported API key through BotFleet's secure credential card. Use this instead of asking them to paste a secret into chat. The secret is saved by the desktop app and is never returned to you. After calling this tool, end the turn; BotFleet resumes the task after the user saves or declines.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        credential_id: {
-          type: "string",
-          enum: Object.keys(CREDENTIAL_TARGETS),
-          description: "The credential the current task requires.",
-        },
-        reason: {
-          type: "string",
-          description: "Optional short, non-sensitive explanation of why the task needs it.",
-        },
-      },
-      required: ["credential_id"],
-    },
-  },
-  {
-    name: "list_routines",
-    description:
-      "List routines owned by this bot, including their ids, schedules, status, and next run. The result includes the computer's authoritative current time and timezone; use those when interpreting relative dates. Only call this when the user asks about routines or wants to change one.",
-    inputSchema: { type: "object", additionalProperties: false, properties: {} },
-  },
-  {
-    name: "propose_routine",
-    description:
-      "Prepare a new routine after the user explicitly asks to schedule recurring or future work. Call list_routines first for relative dates or times so you use its authoritative current time and timezone. This only creates a durable confirmation card; it does NOT enable the routine. Resolve ambiguous dates, times, timezone, destination, or instructions with the user first, and always give one-time schedules an explicit RFC3339 offset. After calling it, end the turn and do not claim the routine exists until the user confirms the card.",
-    inputSchema: {
-      type: "object",
-      additionalProperties: false,
-      properties: ROUTINE_FIELDS_SCHEMA,
-      required: ["name", "instructions", "schedule"],
-    },
-  },
-  {
-    name: "propose_routine_action",
-    description:
-      "Prepare a user-requested change to one of this bot's existing routines. This only creates a durable confirmation card; it does NOT apply the change. Use list_routines first to get the routine id. After calling it, end the turn and do not claim the action completed until the user confirms the card.",
-    inputSchema: {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        routine_id: { type: "string", minLength: 1, description: "Routine id from list_routines." },
-        action: {
-          type: "string",
-          enum: ["update", "pause", "resume", "run_now", "delete"],
-          description: "The requested action. Supply changes only for update.",
-        },
-        changes: {
-          type: "object",
-          additionalProperties: false,
-          properties: ROUTINE_FIELDS_SCHEMA,
-          description: "Fields to change when action is update. Omit for every other action.",
-        },
-      },
-      required: ["routine_id", "action"],
-    },
-  },
+// The publication order shipped CLI engines already see.  Spelled out so
+// reordering the registry's own array cannot silently reorder this wire
+// list too.
+const MCP_TOOL_ORDER = [
+  "list_bots",
+  "coordinate_bots",
+  "assignment_status",
+  "create_bot",
+  "request_credential",
+  "request_sign_in",
+  "list_routines",
+  "propose_routine",
+  "propose_routine_action",
+  // Background jobs (jobs P2).  Listed after the fleet tools so a turn that
+  // mounts them publishes its existing surface unchanged first.
+  ...(process.env.OMB_JOBS === "1" ? ["job_start", "job_output", "job_list", "job_kill"] : []),
+  // Zulip, last: a turn without it publishes the existing surface unchanged.
+  ...(process.env.OMB_ZULIP === "1" ? ["zulip_reply", "zulip_post", "zulip_follow_topic"] : []),
 ];
+
+const TOOLS_BY_NAME = new Map(REGISTRY_TOOLS.map((tool) => [tool.name, tool]));
+
+const TOOLS = MCP_TOOL_ORDER.map((name) => {
+  const tool = TOOLS_BY_NAME.get(name);
+  if (!tool) throw new Error(`agents-proxy: no definition for ${name}`);
+  return tool;
+});
 
 type Json = Record<string, unknown>;
 type RoutineAction = "update" | "pause" | "resume" | "run_now" | "delete";
@@ -315,24 +126,24 @@ function jsonRecord(value: unknown): value is Json {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+/** One background-job tool call (jobs P2).  A hop to the harness, which owns
+ *  the registry, the fences, the refusals and the approval.  The token in
+ * *this* process is the identity, so no bot or thread is ever named here;
+ *  `isError` is carried straight back because a refused start (an unanswered
+ *  card, a Windows host, an admission refusal) must read as a refusal to the
+ *  model and not as a job that started. */
+async function jobCall(action: "start" | "output" | "list" | "kill", args: Json): Promise<{ text: string; isError?: boolean }> {
+  const r = await api(action === "list" ? "/api/internal/jobs" : `/api/internal/jobs/${action}`, {
+    method: "POST",
+    body: JSON.stringify(args),
+  });
+  return { text: typeof r.text === "string" ? r.text : JSON.stringify(r), isError: r.isError === true };
+}
+
 function routineAction(value: unknown): RoutineAction | null {
   return value === "update" || value === "pause" || value === "resume" || value === "run_now" || value === "delete"
     ? value
     : null;
-}
-
-function routineFields(args: Json): { fields: Json; error?: string } {
-  const fields: Json = {};
-  if (typeof args.name === "string") fields.name = args.name.trim();
-  if (typeof args.instructions === "string") fields.instructions = args.instructions.trim();
-  if (args.schedule !== undefined && args.schedule !== null) {
-    const normalized = normalizeScheduleInput(args);
-    if (normalized.error) return { fields, error: normalized.error };
-    fields.schedule = normalized.schedule;
-  }
-  if (typeof args.run_on === "string") fields.runOn = args.run_on;
-  if (typeof args.duration_minutes === "number") fields.durationMinutes = args.duration_minutes;
-  return { fields };
 }
 
 function confirmationResult(r: Json, fallback: string): { text: string } {
@@ -350,40 +161,51 @@ async function callTool(name: string, args: Json): Promise<{ text: string; isErr
     const lines = bots.map((b) => {
       const role = b.title ? ` — ${b.title}` : "";
       const about = b.description ? ` (${String(b.description).slice(0, 120)})` : "";
-      return `- ${b.name}${role}${about} [id: ${b.id}, model: ${b.model}${b.busy ? ", busy" : ""}]`;
+      // `off` rides the row only for a bot that is switched Off, exactly as it
+      // does on the HTTP lane, so a peer can tell before it tries a handoff.
+      return `- ${b.name}${role}${about} [id: ${b.id}, model: ${b.model}${b.busy ? ", busy" : ""}${b.off === true ? ", off" : ""}]`;
     });
-    return { text: `Other bots you can message with ask_bot:\n${lines.join("\n")}` };
+    return { text: `Other bots you can message with coordinate_bots:\n${lines.join("\n")}` };
   }
-  if (name === "ask_bot") {
-    const toBotId = String(args.bot_id ?? "").trim();
+  if (name === "coordinate_bots") {
+    const listed = Array.isArray(args.bot_ids) ? args.bot_ids : [];
+    const single = args.bot_id;
+    const botIds = listed.map((value) => String(value ?? "").trim()).filter(Boolean);
+    if (single !== undefined && single !== null) {
+      const extra = String(single).trim();
+      if (extra) botIds.push(extra);
+    }
     const message = String(args.message ?? "").trim();
-    if (!toBotId || !message) return { text: "ask_bot needs bot_id and message.", isError: true };
-    const r = await api(`/api/internal/ask-bot`, {
-      method: "POST",
-      body: JSON.stringify({ fromBotId: BOT_ID, fromThreadId: THREAD_ID, toBotId, message, depth: DEPTH }),
-    });
-    if (r.busy) return { text: `That bot is busy right now — try again after it finishes.` };
-    if (r.error) return { text: `Couldn't reach that bot: ${r.error}`, isError: true };
-    return { text: `${r.botName ?? "Bot"} replied:\n${r.text ?? "(no reply)"}` };
-  }
-  if (name === "delegate_bot") {
-    const toBotId = String(args.bot_id ?? "").trim();
-    const message = String(args.message ?? "").trim();
-    const reason = typeof args.reason === "string" ? args.reason.trim() : "";
-    if (!toBotId || !message) return { text: "delegate_bot needs bot_id and message.", isError: true };
+    if (botIds.length === 0 || !message) return { text: "coordinate_bots needs bot_ids and message.", isError: true };
     const body: Record<string, unknown> = {
       fromBotId: BOT_ID,
       fromThreadId: THREAD_ID,
-      toBotId,
+      botIds,
       message,
       depth: DEPTH,
     };
-    if (reason) body.reason = reason;
-    const r = await api(`/api/internal/delegate-bot`, { method: "POST", body: JSON.stringify(body) });
-    if (r.error) return { text: `Couldn't queue the delegation: ${r.error}`, isError: true };
-    // Fire-and-forget by contract: the harness returns immediately, the
-    // peer turn runs after our current turn finishes.
-    return { text: typeof r.message === "string" ? r.message : "Delegation queued." };
+    if (typeof args.reason === "string" && args.reason.trim()) body.reason = args.reason.trim();
+    if (args.rework === true) body.rework = true;
+    if (args.thread === "standing" || args.thread === "new") body.thread = args.thread;
+    if (args.reply === "resume" || args.reply === "none") body.reply = args.reply;
+    if (args.consult === true) body.consult = true;
+    if (args.done_when === String(args.done_when)) {
+      const doneWhen = String(args.done_when).trim();
+      if (doneWhen) body.doneWhen = doneWhen;
+    }
+    const r = await api(`/api/internal/coordinate-bots`, { method: "POST", body: JSON.stringify(body) });
+    if (r.error && !Array.isArray(r.assignments)) return { text: `Couldn't hand that off: ${r.error}`, isError: true };
+    return { text: typeof r.message === "string" ? r.message : "Handed off." };
+  }
+  if (name === "assignment_status") {
+    const id = args.id === String(args.id) ? String(args.id).trim() : "";
+    const query = id ? `?id=${encodeURIComponent(id)}` : "";
+    const r = await api(`/api/internal/assignment-status${query}`, {
+      method: "POST",
+      body: JSON.stringify(id ? { fromBotId: BOT_ID, fromThreadId: THREAD_ID, id } : { fromBotId: BOT_ID, fromThreadId: THREAD_ID }),
+    });
+    if (r.error) return { text: `Couldn't read that assignment: ${r.error}`, isError: true };
+    return { text: JSON.stringify(r) };
   }
   if (name === "create_bot") {
     const botName = String(args.name ?? "").trim();
@@ -392,8 +214,8 @@ async function callTool(name: string, args: Json): Promise<{ text: string; isErr
     if (!botName || !role || !instructions) {
       return { text: "create_bot needs name, role, and instructions.", isError: true };
     }
-    if (createdThisTurn >= MAX_CREATED_PER_TURN) {
-      return { text: `You can create at most ${MAX_CREATED_PER_TURN} bots in one turn. Use the team you have before adding more.`, isError: true };
+    if (createdThisTurn >= MAX_CREATED_BOTS_PER_TURN) {
+      return { text: `You can create at most ${MAX_CREATED_BOTS_PER_TURN} bots in one turn. Use the team you have before adding more.`, isError: true };
     }
     const r = await api(`/api/internal/create-bot`, {
       method: "POST",
@@ -407,7 +229,7 @@ async function callTool(name: string, args: Json): Promise<{ text: string; isErr
     });
     createdThisTurn += 1;
     return {
-      text: `Created @${r.name ?? botName} in ${r.section ?? "General"} [id: ${r.id}]. Assign work with delegate_bot.`,
+      text: `Created @${r.name ?? botName} in ${r.section ?? "General"} [id: ${r.id}]. Assign work with coordinate_bots.`,
     };
   }
   if (name === "request_credential") {
@@ -432,17 +254,44 @@ async function callTool(name: string, args: Json): Promise<{ text: string; isErr
       text: `A secure ${r.label ?? CREDENTIAL_TARGETS[credentialId].label} card is now visible to the user. End this turn; BotFleet will resume the task after they save or decline. Never ask them to paste the key into chat.`,
     };
   }
+  if (name === "request_sign_in") {
+    const site = inboundText(args.site);
+    if (!site) return { text: "request_sign_in needs a site, like example.com.", isError: true };
+    const reason = inboundText(args.reason).slice(0, 280);
+    const payload = {
+      fromBotId: BOT_ID,
+      fromThreadId: THREAD_ID,
+      site,
+      reason,
+    };
+    const r = await api("/api/internal/request-sign-in", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    const named = inboundText(r.site) || site;
+    return {
+      text: `A Sign in needed card for ${named} is now visible. End this turn. The person signs in on the computer where you work. Never ask them to paste a password or one-time code into chat.`,
+    };
+  }
   if (name === "list_routines") {
+    const routineId = typeof args.routine_id === "string" ? args.routine_id.trim() : "";
     const query = new URLSearchParams({ fromBotId: BOT_ID, fromThreadId: THREAD_ID });
+    if (routineId) query.set("routineId", routineId);
     const r = await api(`/api/internal/routines?${query.toString()}`);
     const routines = Array.isArray(r.routines) ? r.routines : [];
     const now = typeof r.now === "string" ? r.now : new Date().toISOString();
     const timeZone = typeof r.timeZone === "string" && r.timeZone ? r.timeZone : "local computer timezone";
-    if (!routines.length) {
+    if (r.routine) {
+      return { text: JSON.stringify({ now, timeZone, routine: r.routine }) };
+    }
+    // A budget-trimmed list must say so: pass the omitted count through, and
+    // never report "no routines" when rows were only cut for size.
+    const routinesOmitted = typeof r.routinesOmitted === "number" && r.routinesOmitted > 0 ? r.routinesOmitted : 0;
+    if (!routines.length && !routinesOmitted) {
       return { text: `This bot has no routines. Current time: ${now}. Timezone: ${timeZone}.` };
     }
     return {
-      text: `This bot's routines (current time: ${now}; timezone: ${timeZone}):\n${JSON.stringify(routines, null, 2)}`,
+      text: JSON.stringify({ now, timeZone, routines, ...(routinesOmitted ? { routinesOmitted } : {}) }),
     };
   }
   if (name === "propose_routine") {
@@ -492,6 +341,33 @@ async function callTool(name: string, args: Json): Promise<{ text: string; isErr
       body: JSON.stringify(body),
     });
     return confirmationResult(r, `${action.replace("_", " ")} on routine ${routineId}`);
+  }
+  // Background jobs (jobs P2).  Every one of these is a thin hop: the harness
+  // owns the registry, the fences, the refusals and the approval, and decides
+  // the caller's identity from this process's own comms token.  Nothing here
+  // names a bot, a thread or a job the model did not name — the token does.
+  if (name === "job_start") {
+    return jobCall("start", args);
+  }
+  if (name === "job_output") {
+    return jobCall("output", args);
+  }
+  if (name === "job_list") {
+    return jobCall("list", args);
+  }
+  if (name === "job_kill") {
+    return jobCall("kill", args);
+  }
+  // Zulip.  A thin hop like the job tools: the comms token is the identity,
+  // and the harness answers a refusal as `isError` so the model reads it as
+  // "not posted" rather than as a post that happened.
+  if (name === "zulip_reply" || name === "zulip_post" || name === "zulip_follow_topic") {
+    const route = name === "zulip_reply" ? "reply" : name === "zulip_post" ? "post" : "follow";
+    const r = await api(`/api/internal/zulip/${route}`, {
+      method: "POST",
+      body: JSON.stringify(args),
+    });
+    return { text: String(r.text ?? JSON.stringify(r)), isError: r.isError === true };
   }
   return { text: `Unknown tool: ${name}`, isError: true };
 }

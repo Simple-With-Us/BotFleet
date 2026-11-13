@@ -4,14 +4,33 @@
 // binary (`<cli> --version`, same PATH a real turn uses); a failed probe
 // asks before registering — the classic miss is a path the terminal sees
 // but this GUI app can't.
-import { useEffect, useRef, useState } from "react";
-import { Check, ChevronDown, Loader2, TriangleAlert } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { Check, ChevronDown, Loader2, Plus, Search, TriangleAlert, Upload, X } from "lucide-react";
 
 import { api, useStore, type InstanceInfo } from "@/state/store";
+import { listedInEnginesSettings, showBuiltInOpenAiCompatible } from "@/lib/engine-status";
 import { EngineGroupLabel } from "./EngineGroupLabel";
+import { EngineCallout } from "./EngineCallout";
+import { EngineCapabilitiesMatrix } from "./EngineCapabilitiesMatrix";
 import { ProviderMark } from "./ProviderIcons";
 import { splitEngineRail } from "@/lib/engine-rail";
+import { engineProviderKinds, engineProviderLabels } from "@/lib/engine-capabilities";
+import {
+  INSTANCE_AUTONOMOUS_MODE_NO_OP_NOTE,
+  instanceAutonomousModeApplies,
+} from "../../shared/bypass-coverage";
 import { cn } from "@/lib/cn";
+import { openCodeModelProbeSentence } from "@/lib/opencode-engine-status";
+import { ConfirmDialog } from "./ConfirmDialog";
+import {
+  ADD_ENGINE_DRIVERS,
+  addEngineDriverOption,
+  createCustomEngine,
+  deleteCustomEngine,
+  isCustomEngineInstance,
+  validateAddEngine,
+  type EngineCredentialDeps,
+} from "@/lib/custom-engine";
 
 interface ProbeResult {
   ok: boolean;
@@ -19,11 +38,60 @@ interface ProbeResult {
   message?: string;
 }
 
-function CustomPicker({ instance, cliDefault, onClose, onSaved }: {
+const LOCAL_REPLY_WAIT_CHOICES = [5, 10, 20, 30, 60] as const;
+
+/** Default the toggle to ON when the persisted config never had the field
+ * — the registry treats absent `enabled` as `true` and the UI must match. */
+function isEngineEnabled(instance: InstanceInfo): boolean {
+  return instance.enabled !== false;
+}
+
+/** Why an engine is not in the active rail.  `snapshot.reason` is the
+ *  driver's own words whenever it supplies any; otherwise the three cases a
+ *  reader can actually act on are separated out.  Nothing here is
+ *  invented — a field the runtime does not set never produces a sentence. */
+function engineUnavailableReason(instance: InstanceInfo): string {
+  if (instance.snapshot.reason) return instance.snapshot.reason;
+  if (instance.snapshot.state !== "available") {
+    return "Command-line app not found on this computer.";
+  }
+  if (instance.snapshot.authenticated === false) return "Installed, but not signed in.";
+  return "Turned off in Settings.";
+}
+
+/** Real deps for createCustomEngine/deleteCustomEngine (src/lib/custom-engine.ts),
+ * built fresh per call so a bridge that appears or disappears between
+ * renders (should never happen in practice, but window.ogb is read live
+ * rather than cached) is always current. */
+function buildEngineCredentialDeps(): EngineCredentialDeps {
+  return {
+    createInstance: (body, options) =>
+      api(
+        options?.secretStorage === "external" ? "/api/instances?secretStorage=external" : "/api/instances",
+        { method: "POST", body: JSON.stringify(body) },
+      ),
+    deleteInstance: (instanceId) => api(`/api/instances/${encodeURIComponent(instanceId)}`, { method: "DELETE" }),
+    setInstanceCredential: window.ogb?.setInstanceCredential
+      ? (instanceId, value) => window.ogb!.setInstanceCredential!(instanceId, value)
+      : undefined,
+    clearInstanceCredential: window.ogb?.clearInstanceCredential
+      ? (instanceId) => window.ogb!.clearInstanceCredential!(instanceId)
+      : undefined,
+  };
+}
+
+function CustomPicker({
+  instance,
+  cliDefault,
+  isBusy,
+  onClose,
+  onSave,
+}: {
   instance: InstanceInfo;
   cliDefault?: string;
+  isBusy?: boolean;
   onClose: () => void;
-  onSaved: () => Promise<void>;
+  onSave: (cli: string) => Promise<{ ok: boolean; error?: string }>;
 }) {
   const [candidates, setCandidates] = useState<string[] | null>(instance.cliCandidates ?? null);
   // `selected` starts EMPTY, never at instance.cli: a wrapper override
@@ -47,7 +115,14 @@ function CustomPicker({ instance, cliDefault, onClose, onSaved }: {
   useEffect(() => {
     if (fetchedRef.current) return;
     fetchedRef.current = true;
-    api(`/api/cli-candidates?name=${encodeURIComponent(cliDefault ?? "")}`)
+    api(
+      `/api/cli-candidates?name=${encodeURIComponent(cliDefault ?? "")}` +
+        // The engine may run under more than one command (Clutch ships as
+        // `clutch` while its driver default is `dsh`), so the refresh asks for
+        // the same name set describe() used — otherwise a binary the panel
+        // already lists vanishes the moment the picker is opened.
+        `&aliases=${encodeURIComponent((instance.cliAliases ?? []).join(","))}`,
+    )
       .then(({ candidates: found }: { candidates: string[] }) => {
         setCandidates(found);
         if (!instance.cli) return;
@@ -61,7 +136,7 @@ function CustomPicker({ instance, cliDefault, onClose, onSaved }: {
 
   const value = manual.trim() || selected;
   const dirty = value !== (instance.cli ?? "");
-  const busy = probing || saving;
+  const busy = probing || saving || Boolean(isBusy);
 
   // Editing the path invalidates a previous probe result.
   useEffect(() => {
@@ -74,15 +149,14 @@ function CustomPicker({ instance, cliDefault, onClose, onSaved }: {
     setError(null);
     const committed = value; // freeze: inputs disable during save, but the
     // closure must not see a later keystroke either
-    api(`/api/instances/${encodeURIComponent(instance.instanceId)}`, {
-      method: "PATCH",
-      body: JSON.stringify({ cli: committed }),
-    })
-      // onSaved (refreshInstances) failing must NOT read as "not saved" —
-      // the PATCH already returned 200. Close regardless; the global banner
-      // from refreshInstances already reports the refresh failure.
-      .then(() => Promise.resolve(onSaved()).catch(() => {}))
-      .then(onClose)
+    onSave(committed)
+      .then((res) => {
+        if (res.ok) {
+          onClose();
+        } else {
+          setError(res.error ?? "Failed to save CLI path");
+        }
+      })
       .catch((e) => setError(e.message))
       .finally(() => setSaving(false));
   };
@@ -177,7 +251,7 @@ function CustomPicker({ instance, cliDefault, onClose, onSaved }: {
               disabled={busy}
               className="flex items-center gap-1.5 rounded-lg bg-raised px-3 py-1.5 text-[13px] text-danger hover:bg-raised-hover disabled:opacity-50"
             >
-              {saving ? <Loader2 size={13} className="animate-spin" /> : "Save anyway"}
+              {saving ? <Loader2 size={13} className="animate-spin" /> : "Save Anyway"}
             </button>
           </>
         ) : (
@@ -198,12 +272,133 @@ function CustomPicker({ instance, cliDefault, onClose, onSaved }: {
   );
 }
 
-function EngineRow({ instance }: { instance: InstanceInfo }) {
+function AddModelForm({
+  instance,
+  isBusy,
+  onCancel,
+  onSave,
+}: {
+  instance: InstanceInfo;
+  isBusy: boolean;
+  onCancel: () => void;
+  onSave: (models: Array<{ id: string; label: string }>) => Promise<{ ok: boolean; error?: string }>;
+}) {
+  const [slug, setSlug] = useState("");
+  const [displayName, setDisplayName] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const normalizedSlug = slug.trim();
+  const normalizedName = displayName.trim();
+  const duplicate = instance.models.options.some((model) => model.id === normalizedSlug);
+
+  const add = async () => {
+    if (!normalizedSlug || !normalizedName || duplicate || saving || isBusy) return;
+    setSaving(true);
+    setError(null);
+    const models = [
+      ...instance.models.options
+        .filter((model) => model.custom)
+        .map((model) => ({ id: model.id, label: model.label })),
+      { id: normalizedSlug, label: normalizedName },
+    ];
+    try {
+      const result = await onSave(models);
+      if (result.ok) onCancel();
+      else setError(result.error ?? "Failed to add model");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to add model");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="mt-2.5 rounded-lg border border-hairline/40 bg-inset p-3">
+      <div className="mb-2 text-[11px] leading-relaxed text-ink-secondary">
+        Add a model identifier accepted by this engine.  The display name is what BotFleet shows in model pickers.
+      </div>
+      <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]">
+        <input
+          value={slug}
+          onChange={(event) => setSlug(event.target.value)}
+          placeholder="Model slug"
+          aria-label={`${instance.displayName} model slug`}
+          spellCheck={false}
+          disabled={saving || isBusy}
+          className="rounded-lg border border-hairline/40 bg-surface px-3 py-2 font-mono text-[12px] text-ink placeholder:font-sans placeholder:text-ink-secondary focus:border-hairline focus:outline-none disabled:opacity-50"
+        />
+        <input
+          value={displayName}
+          onChange={(event) => setDisplayName(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key !== "Enter") return;
+            event.preventDefault();
+            void add();
+          }}
+          placeholder="Display name"
+          aria-label={`${instance.displayName} model display name`}
+          disabled={saving || isBusy}
+          className="rounded-lg border border-hairline/40 bg-surface px-3 py-2 text-[12px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none disabled:opacity-50"
+        />
+        <button
+          type="button"
+          onClick={() => void add()}
+          disabled={!normalizedSlug || !normalizedName || duplicate || saving || isBusy}
+          className="flex items-center justify-center gap-1.5 rounded-lg bg-raised px-3 py-2 text-[12px] text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {saving ? <Loader2 size={13} className="animate-spin" /> : <Plus size={13} />}
+          Add Model
+        </button>
+      </div>
+      {duplicate && normalizedSlug && (
+        <div role="alert" className="mt-2 text-[11px] text-warning">That model slug is already available on this engine.</div>
+      )}
+      {error && <div role="alert" className="mt-2 text-[11px] text-danger">{error}</div>}
+      <div className="mt-2 flex justify-end">
+        <button type="button" onClick={onCancel} disabled={saving || isBusy} className="text-[11.5px] text-ink-secondary hover:text-ink disabled:opacity-50">
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+}
+
+export function EngineRow({
+  instance,
+  busyInstanceId,
+  onPatch,
+  reason,
+}: {
+  instance: InstanceInfo;
+  busyInstanceId: string | null;
+  onPatch: (
+    patch: { cli?: string; fullAuto?: boolean; enabled?: boolean; models?: Array<{ id: string; label: string }>; replyWaitMinutes?: number | null },
+  ) => Promise<{ ok: boolean; error?: string }>;
+  /** One line saying why this engine is not usable right now.  Rendered
+   *  only where the panel knows the answer. */
+  reason?: string;
+}) {
   const { refreshInstances } = useStore();
   const [open, setOpen] = useState(false);
-  const [switching, setSwitching] = useState(false);
+  const [modelFormOpen, setModelFormOpen] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const wasOpenFor = useRef<string | null>(null);
+
+  // A disabled engine keeps the same controls visible — ungrey them while
+  // you flip the toggle back on is the right call — but none of them should
+  // be *clickable*. Use the per-row `enabled` state, not the snapshot reason,
+  // because a separately-disabled wildcard cooldown on an otherwise available
+  // engine is the wrong gate (we want settings, not quotas, to block the row).
+  const enabled = isEngineEnabled(instance);
+  const catalogProbeProblem = openCodeModelProbeSentence(instance);
+  const isBusy = busyInstanceId !== null;
+  const isThisBusy = busyInstanceId === instance.instanceId;
+  const hasCli = instance.cli !== undefined || instance.cliDefault !== undefined;
+  const isCustom = isCustomEngineInstance(instance);
+  const providerKinds = engineProviderKinds(instance.driverKind);
+  const providerLabels = engineProviderLabels(instance.driverKind);
 
   // Close the picker when this instance's override changes to anything else
   // — a save from this row, another tab, or the 5-min refresh. The picker
@@ -216,129 +411,736 @@ function EngineRow({ instance }: { instance: InstanceInfo }) {
     wasOpenFor.current = instance.cli ?? null;
   }, [instance.cli]);
 
-  const reset = () => {
-    if (switching) return;
-    setSwitching(true);
+  const patchWithLocalError = async (patch: { cli?: string; fullAuto?: boolean; enabled?: boolean; models?: Array<{ id: string; label: string }>; replyWaitMinutes?: number | null }) => {
     setError(null);
-    api(`/api/instances/${encodeURIComponent(instance.instanceId)}`, {
-      method: "PATCH",
-      body: JSON.stringify({ cli: "" }),
-    })
-      // The reset already succeeded once PATCH returns 200. A follow-up list
-      // refresh failure should not tell the user the reset itself failed.
-      .then(() => Promise.resolve(refreshInstances()).catch(() => {}))
-      .catch((e) => setError(e.message))
-      .finally(() => setSwitching(false));
+    const res = await onPatch(patch);
+    if (!res.ok && res.error) {
+      setError(res.error);
+    }
+    return res;
+  };
+
+  const reset = () => {
+    if (isBusy || !enabled || deleting) return;
+    void patchWithLocalError({ cli: "" });
+  };
+
+  const deleteEngine = () => {
+    if (isBusy || deleting) return;
+    setConfirmDelete(true);
+  };
+
+  const confirmDeleteEngine = () => {
+    if (isBusy || deleting) return;
+    setConfirmDelete(false);
+    setDeleting(true);
+    setError(null);
+    deleteCustomEngine(buildEngineCredentialDeps(), instance.instanceId)
+      .then(({ credentialClearError }) =>
+        Promise.resolve(refreshInstances({ fresh: true }))
+          .catch(() => {})
+          .then(() => {
+            if (credentialClearError) {
+              // NBSP, not two ASCII spaces — see createCustomEngine's own
+              // note; same plain <div> below.
+              setError(`Engine deleted.  Its stored key could not be cleared: ${credentialClearError}`);
+            }
+          }),
+      )
+      .catch((e: Error) => setError(e.message))
+      .finally(() => setDeleting(false));
+  };
+
+  const toggleEnabled = (next: boolean) => {
+    if (isBusy || deleting) return;
+    void patchWithLocalError({ enabled: next });
   };
 
   return (
-    <div>
+    <div className="border-b border-hairline/30 py-3 first:pt-0 last:border-b-0">
       <div className="flex items-center gap-2 text-[13px]">
+        <label
+          className={cn(
+            "flex shrink-0 items-center gap-1.5 text-[11.5px] uppercase tracking-wide",
+            enabled ? "text-ink-secondary cursor-pointer" : "text-ink-secondary/70 cursor-pointer",
+            (isBusy || deleting) && "cursor-not-allowed opacity-60",
+          )}
+          title={enabled ? "Disable this engine" : "Enable this engine"}
+        >
+          <input
+            type="checkbox"
+            aria-label={`${instance.displayName} enabled`}
+            className="accent-accent"
+            checked={enabled}
+            disabled={isBusy || deleting}
+            onChange={(e) => toggleEnabled(e.target.checked)}
+          />
+          {enabled ? "On" : "Off"}
+        </label>
         <span className={cn("size-1.5 shrink-0 rounded-full", instance.cli ? "bg-accent" : "bg-raised-hover")} />
-        <ProviderMark driverKind={instance.driverKind} size={14} />
-        <span className="shrink-0 text-ink">{instance.displayName}</span>
+        <ProviderMark driverKind={instance.driverKind} size={18} iconUrl={instance.iconUrl} />
+        <span className={cn("shrink-0 flex items-center gap-1.5", enabled ? "text-ink" : "text-ink-secondary/70")}>
+          {instance.displayName}
+          {isThisBusy && <Loader2 size={12} className="animate-spin text-accent" />}
+        </span>
+        {/* Which platform(s) this engine actually serves, on the row.  It was
+            already in the capability data, but only ever rendered inside the
+            details disclosure.  The app mark stays first; provider/model
+            marks follow it.  Only multi-brand engines get the extra marks. */}
+        {providerKinds.length > 1 && (
+          <span className="flex shrink-0 items-center gap-1" aria-label={`Runs ${providerLabels.join(" and ")} models`}>
+            {providerKinds.map((kind) => (
+              <span
+                key={kind}
+                className="inline-flex size-4 items-center justify-center rounded-[4px] border border-hairline/40 bg-surface"
+                title={`${providerLabels[providerKinds.indexOf(kind)]} models`}
+              >
+                <ProviderMark driverKind={kind} size={12} />
+              </span>
+            ))}
+          </span>
+        )}
         {instance.cli ? (
-          <span className="truncate font-mono text-[11.5px] text-accent" title={instance.cli}>
+          <span className={cn("truncate font-mono text-[11.5px]", enabled ? "text-accent" : "text-ink-secondary/60")} title={instance.cli}>
             {instance.cli}
           </span>
         ) : (
           instance.cliDefault && (
-            <span className="truncate text-[11px] text-ink-secondary">{instance.cliDefault} · default</span>
+            <span className={cn("truncate text-[11px]", enabled ? "text-ink-secondary" : "text-ink-secondary/60")} title={`${instance.cliDefault} · default`}>{instance.cliDefault} · default</span>
           )
+        )}
+        {instance.localModelWaitAvailable && (
+          <label className="flex shrink-0 items-center gap-1.5 text-[11.5px] text-ink-secondary">
+            <span>Reply Wait</span>
+            <select
+              aria-label={`How long to wait for ${instance.displayName} to reply`}
+              title="How long to wait for the local model to reply before stopping the turn."
+              value={instance.replyWaitMinutes ?? ""}
+              disabled={isBusy || !enabled || deleting}
+              onChange={(event) => {
+                const value = event.target.value;
+                patchWithLocalError({ replyWaitMinutes: value ? Number(value) : null }).catch(() => undefined);
+              }}
+              className="rounded-md border border-hairline/60 bg-inset px-1.5 py-1 text-[11.5px] text-ink disabled:opacity-50"
+            >
+              <option value="">Default (3 min)</option>
+              {[...new Set([...LOCAL_REPLY_WAIT_CHOICES, ...(instance.replyWaitMinutes ? [instance.replyWaitMinutes] : [])])]
+                .sort((a, b) => a - b)
+                .map((minutes) => <option key={minutes} value={minutes}>{minutes} min</option>)}
+            </select>
+          </label>
         )}
         <span className="flex-1" />
         {instance.cli && (
           <button
             onClick={reset}
-            disabled={switching}
-            className="shrink-0 text-[11.5px] text-ink-secondary hover:text-ink disabled:opacity-50"
+            disabled={isBusy || !enabled || deleting}
+            className="shrink-0 text-[11.5px] text-ink-secondary hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"
           >
-            {switching ? "Resetting…" : "Reset"}
+            {isThisBusy ? "Resetting…" : "Reset"}
           </button>
         )}
-        <label className="flex items-center gap-1.5 shrink-0 text-[12px] text-ink-secondary hover:text-ink cursor-pointer">
+        <label className={cn(
+          "flex items-center gap-1.5 shrink-0 text-[12px] text-ink-secondary",
+          enabled && !isBusy && !deleting ? "hover:text-ink cursor-pointer" : "cursor-not-allowed opacity-60",
+        )}>
           <input
             type="checkbox"
             className="accent-accent"
             checked={!!instance.fullAuto}
-            disabled={switching}
-            onChange={(e) => {
-              const checked = e.target.checked;
-              setSwitching(true);
-              setError(null);
-              api(`/api/instances/${encodeURIComponent(instance.instanceId)}`, {
-                method: "PATCH",
-                body: JSON.stringify({ fullAuto: checked }),
-              })
-                .then(() => Promise.resolve(refreshInstances()).catch(() => {}))
-                .catch((e) => setError(e.message))
-                .finally(() => setSwitching(false));
-            }}
+            disabled={isBusy || !enabled || deleting}
+            onChange={(e) => void patchWithLocalError({ fullAuto: e.target.checked })}
           />
           Bypass permissions (autonomous mode)
         </label>
         <button
-          onClick={() => setOpen((v) => !v)}
-          aria-expanded={open}
+          type="button"
+          onClick={() => setModelFormOpen((value) => !value)}
+          disabled={!enabled || isBusy || deleting}
+          aria-expanded={modelFormOpen}
           className={cn(
             "shrink-0 rounded-lg border border-hairline/40 px-3 py-1 text-[12px]",
-            open ? "bg-accent/15 text-accent" : "text-ink-secondary hover:bg-raised/50 hover:text-ink",
+            !enabled || isBusy || deleting
+              ? "cursor-not-allowed opacity-40"
+              : modelFormOpen
+                ? "bg-accent/15 text-accent"
+                : "text-ink-secondary hover:bg-raised/50 hover:text-ink",
           )}
         >
-          Set CLI…
+          Add Model…
         </button>
+        {hasCli && (
+          <button
+            onClick={() => setOpen((v) => !v)}
+            disabled={!enabled || isBusy || deleting}
+            aria-expanded={open}
+            className={cn(
+              "shrink-0 rounded-lg border border-hairline/40 px-3 py-1 text-[12px]",
+              !enabled || isBusy || deleting
+                ? "cursor-not-allowed opacity-40"
+                : open
+                  ? "bg-accent/15 text-accent"
+                  : "text-ink-secondary hover:bg-raised/50 hover:text-ink",
+            )}
+          >
+            Set CLI…
+          </button>
+        )}
+        {isCustom && (
+          <button
+            type="button"
+            onClick={deleteEngine}
+            disabled={isBusy || deleting}
+            className="shrink-0 rounded-lg border border-danger/30 px-2.5 py-1 text-[12px] text-danger hover:bg-danger/10 disabled:opacity-40"
+            title="Remove this added connection"
+          >
+            {deleting ? "Removing…" : "Remove"}
+          </button>
+        )}
       </div>
-      {["minimax"].includes(instance.driverKind) && (
-        <div className="mt-2 rounded bg-warning/10 px-2 py-1.5 text-[11px] leading-relaxed text-warning-dark border border-warning/20">
-          <strong>Limited functionality:</strong> This native HTTP driver does not support BotFleet tools. 
-          For full tool support, use the Pi Engine's OpenAI compat, or the DeepSeek Harness (<code>dsh</code>) instead.
+      {reason && (
+        <p className="mt-1 text-[11px] leading-relaxed text-ink-secondary/70">{reason}</p>
+      )}
+      {enabled && catalogProbeProblem && (
+        <p className="mt-1 text-[11px] leading-relaxed text-ink-secondary/70">{catalogProbeProblem}</p>
+      )}
+      {!instanceAutonomousModeApplies(instance.driverKind) && (
+        <p className="mt-1 text-[11px] leading-relaxed text-ink-secondary/70">{INSTANCE_AUTONOMOUS_MODE_NO_OP_NOTE}</p>
+      )}
+      {instance.driverKind === "antigravityAgent" && (
+        <div className="mt-2 rounded bg-raised/40 px-2 py-1.5 text-[11px] leading-relaxed text-ink-secondary border border-hairline/40">
+          Antigravity's print mode has no approval cards.  With the bypass off, file edits go through and shell
+          commands are refused.  With it on, every tool runs on this computer without asking, and BotFleet's
+          permission guards do not apply.
         </div>
       )}
+      <EngineCallout
+        driverKind={instance.driverKind}
+        models={instance.models.options.map((model) => model.id)}
+      />
       {error && <div role="alert" className="mt-1 text-[12px] text-danger">{error}</div>}
-      {open && (
+      {modelFormOpen && enabled && (
+        <AddModelForm
+          instance={instance}
+          isBusy={isBusy}
+          onCancel={() => setModelFormOpen(false)}
+          onSave={(models) => patchWithLocalError({ models })}
+        />
+      )}
+      {open && enabled && (
         <CustomPicker
           instance={instance}
           cliDefault={instance.cliDefault}
+          isBusy={isBusy}
           onClose={() => setOpen(false)}
-          onSaved={refreshInstances}
+          onSave={(cli) => patchWithLocalError({ cli })}
         />
       )}
+      <ConfirmDialog
+        open={confirmDelete}
+        title="Remove Added Connection?"
+        body={`Remove “${instance.displayName}”?  Built-in engines cannot be removed.`}
+        confirmLabel="Remove Connection"
+        onCancel={() => setConfirmDelete(false)}
+        onConfirm={confirmDeleteEngine}
+      />
     </div>
   );
 }
 
-export function EnginesSettings() {
-  const { state } = useStore();
-  // every KNOWN-driver instance has cliDefault; unknown-driver shadows have
-  // neither unless an override was set. Including them keeps a Reset-able row
-  // (and a Set CLI… path) for engines the running build doesn't recognize.
-  const rows = state.instances.filter((i) => i.cli !== undefined || i.cliDefault !== undefined || i.snapshot.state === "unavailable");
+function AddCustomEngineModal({ onClose, onAdded }: { onClose: () => void; onAdded: () => Promise<void> }) {
+  const [driver, setDriver] = useState(ADD_ENGINE_DRIVERS[0].driver);
+  const [name, setName] = useState("");
+  const [endpoint, setEndpoint] = useState("");
+  const [apiKey, setApiKey] = useState("");
+  const [modelsText, setModelsText] = useState("");
+  const [iconUrl, setIconUrl] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  // "Fetch Models" is its own async step: it asks the endpoint what it serves
+  // before the engine exists, so a wrong URL or a rejected key is caught here
+  // rather than as a bot that fails every turn.
+  const [probing, setProbing] = useState(false);
+  const [probeNote, setProbeNote] = useState<string | null>(null);
+  const option = addEngineDriverOption(driver);
+
+  /** What a failed probe means, in the words of the HTTP status it returned.
+   *  "Something went wrong" is useless here: the four answers have four
+   *  different fixes, and 401/403 is by far the most common one. */
+  function probeFailure(status: number | null): string {
+    if (status === 401 || status === 403) return "That endpoint rejected the API key.  Check the key and try again.";
+    if (status === 404) return "That endpoint has no /models list.  Type the model IDs the endpoint documents.";
+    if (status === 429) return "That endpoint is rate limiting.  Wait a moment and try again.";
+    if (status && status >= 500) return `That endpoint answered ${status}.  It may be down.`;
+    if (status) return `That endpoint answered ${status} instead of a model list.`;
+    return "That endpoint could not be reached.  Check the URL, including the path and port.";
+  }
+
+  const fetchModels = async () => {
+    const trimmedEndpoint = endpoint.trim();
+    if (!trimmedEndpoint) {
+      setProbeNote("Enter the endpoint URL first.");
+      return;
+    }
+    setProbing(true);
+    setProbeNote(null);
+    try {
+      const reply = await api("/api/instances/probe-models", {
+        method: "POST",
+        // The key travels to the endpoint that issued it and nowhere else: it
+        // is not stored, logged, or echoed by the probe route.
+        body: JSON.stringify({ endpoint: trimmedEndpoint, key: apiKey.trim() || undefined }),
+      });
+      const found = Array.isArray(reply?.models) ? reply.models : [];
+      if (!reply?.ok) {
+        setProbeNote(probeFailure(Number.isInteger(reply?.status) ? reply.status : null));
+        return;
+      }
+      if (found.length === 0) {
+        setProbeNote("The endpoint answered but listed no models.  Type the model IDs it documents.");
+        return;
+      }
+      setModelsText(found.slice(0, 15).join("\n"));
+      setProbeNote(
+        found.length > 15
+          ? `Found ${found.length} models — added the first 15.  Edit the list to choose.`
+          : `Found ${found.length} ${found.length === 1 ? "model" : "models"}.`,
+      );
+    } catch (error) {
+      setProbeNote(error instanceof Error ? error.message : "Could not reach this computer's harness.");
+    } finally {
+      setProbing(false);
+    }
+  };
+
+  // Switching engine offers that engine's own endpoint, but only into a
+  // field the person has not typed in yet — retyping over somebody's URL
+  // because they glanced at the other tab would be worse than no help at all.
+  const chooseDriver = (next: string) => {
+    setDriver(next);
+    setError(null);
+    const suggestion = addEngineDriverOption(next).suggestedEndpoint;
+    if (suggestion && !endpoint.trim()) setEndpoint(suggestion);
+  };
+
+  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (file.size > 300 * 1024) {
+      setError("Icon file must be under 300 KB");
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      // `readAsDataURL` hands back a data-URL string, but FileReader's result
+      // is allowed to be a buffer or nothing at all.  Take the URL only when
+      // one really arrived rather than narrowing on the representation and
+      // storing whatever shape turned up as an <img> source.
+      const { result } = reader;
+      if (result === null || result instanceof ArrayBuffer) return;
+      setIconUrl(result);
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const save = () => {
+    const trimmedName = name.trim();
+    const trimmedUrl = endpoint.trim();
+    const models = option.requiresModels
+      ? modelsText
+          .split(/[\n,]+/)
+          .map((m) => m.trim())
+          .filter(Boolean)
+      : [];
+    const invalid = validateAddEngine({
+      driver,
+      name: trimmedName,
+      endpoint: trimmedUrl,
+      key: apiKey,
+      models,
+    });
+    if (invalid) {
+      setError(invalid);
+      return;
+    }
+
+    setSaving(true);
+    setError(null);
+    // Every other credential card in this app (ApiKeys.tsx, the Secret Store
+    // card) routes through window.ogb.setCredential when the desktop bridge
+    // exists, so the key reaches the OS-encrypted store instead of sitting
+    // in plaintext config.json. A custom engine's key is a dynamic per-
+    // instance secret, not one of that bridge's fixed named slots, so it
+    // takes a sibling method (createCustomEngine, above) plus a
+    // create-then-set-credential sequence: the instance id is only known
+    // once the server has deduped the slug.
+    createCustomEngine(buildEngineCredentialDeps(), {
+      name: trimmedName,
+      endpoint: trimmedUrl,
+      driver,
+      key: apiKey.trim(),
+      models,
+      iconUrl: option.supportsIcon ? iconUrl.trim() || undefined : undefined,
+    })
+      .then(() => Promise.resolve(onAdded()).catch(() => {}))
+      .then(onClose)
+      .catch((e: Error) => setError(e.message))
+      .finally(() => setSaving(false));
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-5 backdrop-blur-sm"
+      onMouseDown={(e) => e.target === e.currentTarget && onClose()}
+    >
+      <div className="flex max-h-[90vh] w-full max-w-[540px] flex-col overflow-hidden rounded-2xl border border-hairline/60 bg-panel shadow-2xl text-ink">
+        <div className="flex items-start justify-between border-b border-hairline/40 px-5 py-4">
+          <div>
+            <div className="text-[16px] font-semibold text-ink">Add Engine</div>
+            <div className="mt-1 text-[12px] text-ink-secondary">{option.blurb}</div>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-lg p-1.5 text-ink-secondary hover:bg-raised hover:text-ink"
+            aria-label="Close"
+          >
+            <X size={18} />
+          </button>
+        </div>
+
+        <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-5 text-[13px]">
+          <div>
+            <label className="mb-1.5 block text-[11.5px] font-medium text-ink-secondary uppercase tracking-wide">
+              Engine Type
+            </label>
+            <div role="radiogroup" aria-label="Engine Type" className="flex gap-2">
+              {ADD_ENGINE_DRIVERS.map((candidate) => (
+                <button
+                  key={candidate.driver}
+                  type="button"
+                  role="radio"
+                  aria-checked={candidate.driver === driver}
+                  onClick={() => chooseDriver(candidate.driver)}
+                  className={cn(
+                    "flex-1 rounded-xl border px-3.5 py-2 text-[12.5px] font-medium outline-none",
+                    candidate.driver === driver
+                      ? "border-accent/70 bg-accent/10 text-ink"
+                      : "border-hairline/60 bg-inset text-ink-secondary hover:text-ink",
+                  )}
+                >
+                  {candidate.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div>
+            <label className="mb-1.5 block text-[11.5px] font-medium text-ink-secondary uppercase tracking-wide">
+              Engine Name
+            </label>
+            <input
+              type="text"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder={driver === "minimax" ? "e.g. MiniMax China, MiniMax Team Account" : "e.g. Together AI, Ollama Local, Groq Open"}
+              className="w-full rounded-xl border border-hairline/60 bg-inset px-3.5 py-2.5 text-[13px] text-ink outline-none placeholder:text-ink-secondary/60 focus:border-accent/70"
+            />
+          </div>
+
+          <div>
+            <label className="mb-1.5 block text-[11.5px] font-medium text-ink-secondary uppercase tracking-wide">
+              API Endpoint URL
+            </label>
+            <input
+              type="text"
+              value={endpoint}
+              onChange={(e) => setEndpoint(e.target.value)}
+              placeholder={option.endpointPlaceholder}
+              className="w-full rounded-xl border border-hairline/60 bg-inset px-3.5 py-2.5 text-[13px] font-mono text-ink outline-none placeholder:font-sans placeholder:text-ink-secondary/60 focus:border-accent/70"
+            />
+          </div>
+
+          <div>
+            <label className="mb-1.5 block text-[11.5px] font-medium text-ink-secondary uppercase tracking-wide">
+              API Key{" "}
+              <span className="font-normal normal-case text-[11px]">
+                {option.requiresKey ? "· this connection's own key" : "· optional"}
+              </span>
+            </label>
+            <input
+              type="password"
+              value={apiKey}
+              onChange={(e) => setApiKey(e.target.value)}
+              placeholder={
+                option.requiresKey
+                  ? "The MiniMax key this connection bills against"
+                  : "Optional API key (leave blank for local Ollama / LM Studio)"
+              }
+              className="w-full rounded-xl border border-hairline/60 bg-inset px-3.5 py-2.5 text-[13px] font-mono text-ink outline-none placeholder:font-sans placeholder:text-ink-secondary/60 focus:border-accent/70"
+            />
+          </div>
+
+          {option.requiresModels ? (
+            <div>
+              <div className="mb-1.5 flex items-baseline justify-between gap-3">
+                <label className="text-[11.5px] font-medium text-ink-secondary uppercase tracking-wide">
+                  Model IDs <span className="font-normal normal-case text-[11px]">· up to 15, comma or newline separated</span>
+                </label>
+                <button
+                  type="button"
+                  onClick={() => void fetchModels()}
+                  disabled={probing}
+                  className="flex shrink-0 items-center gap-1.5 rounded-lg border border-hairline/60 bg-inset px-2.5 py-1 text-[11.5px] font-medium text-ink hover:border-accent/50 hover:text-ink disabled:opacity-50"
+                >
+                  {probing ? <Loader2 size={12} className="animate-spin" /> : <Search size={12} />}
+                  {probing ? "Asking" : "Fetch Models"}
+                </button>
+              </div>
+              <textarea
+                rows={3}
+                value={modelsText}
+                onChange={(e) => setModelsText(e.target.value)}
+                placeholder="Leave blank to let the endpoint answer, or fetch the list"
+                className="w-full resize-y rounded-xl border border-hairline/60 bg-inset px-3.5 py-2.5 font-mono text-[12.5px] text-ink outline-none placeholder:font-sans placeholder:text-ink-secondary/60 focus:border-accent/70"
+              />
+              {probeNote && (
+                <p role="status" className="mt-1.5 text-[11.5px] text-ink-secondary">
+                  {probeNote}
+                </p>
+              )}
+            </div>
+          ) : (
+            <div className="rounded-xl border border-hairline/60 bg-inset px-3.5 py-2.5 text-[12px] text-ink-secondary">
+              MiniMax publishes its own model list, so there is nothing to type here.  This connection offers the
+              same models as the built-in one and bills them to the key above.
+            </div>
+          )}
+
+          {option.supportsIcon && (
+          <div>
+            <label className="mb-1.5 block text-[11.5px] font-medium text-ink-secondary uppercase tracking-wide">
+              Engine Icon <span className="font-normal normal-case text-[11px]">· optional SVG or image URL / upload</span>
+            </label>
+            <div className="flex items-center gap-2">
+              <input
+                type="text"
+                value={iconUrl.startsWith("data:") ? "[Uploaded image file]" : iconUrl}
+                onChange={(e) => setIconUrl(e.target.value)}
+                readOnly={iconUrl.startsWith("data:")}
+                placeholder="https://.../icon.svg or data:image/..."
+                className="flex-1 rounded-xl border border-hairline/60 bg-inset px-3.5 py-2 text-[12.5px] text-ink outline-none placeholder:text-ink-secondary/60 focus:border-accent/70"
+              />
+              <label className="flex shrink-0 cursor-pointer items-center gap-1.5 rounded-xl border border-hairline/60 bg-raised px-3 py-2 text-[12px] font-medium text-ink hover:bg-raised-hover">
+                <Upload size={13} />
+                Upload
+                <input type="file" accept=".svg,.png,.webp,.jpg,.jpeg" className="hidden" onChange={handleFileUpload} />
+              </label>
+              {iconUrl && (
+                <div className="flex shrink-0 items-center gap-1.5">
+                  <div className="flex size-8 items-center justify-center rounded-lg border border-hairline/40 bg-raised p-1">
+                    <img src={iconUrl} alt="Icon preview" className="size-full object-contain" />
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setIconUrl("")}
+                    className="text-[11px] text-ink-secondary hover:text-danger"
+                  >
+                    Clear
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+          )}
+
+          {error && (
+            <div role="alert" className="rounded-xl border border-danger/30 bg-danger/10 px-3.5 py-2.5 text-[12px] text-danger">
+              {error}
+            </div>
+          )}
+        </div>
+
+        <div className="flex justify-end gap-2 border-t border-hairline/40 px-5 py-4">
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={saving}
+            className="rounded-xl px-4 py-2 text-[13px] text-ink-secondary hover:bg-raised hover:text-ink disabled:opacity-50"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={save}
+            disabled={
+              saving ||
+              !name.trim() ||
+              !endpoint.trim() ||
+              (option.requiresKey && !apiKey.trim())
+            }
+            className="flex items-center gap-2 rounded-xl bg-accent px-4 py-2 text-[13px] font-medium text-white hover:brightness-110 disabled:opacity-40"
+          >
+            {saving && <Loader2 size={14} className="animate-spin" />}
+            {driver === "minimax" ? "Add MiniMax Connection" : "Add Custom Engine"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export function EnginesSettings({ highlightClass }: { highlightClass?: (domId: string) => string | undefined }) {
+  const { state, dispatch, refreshInstances } = useStore();
+  const [busyInstanceId, setBusyInstanceId] = useState<string | null>(null);
+  const [globalError, setGlobalError] = useState<string | null>(null);
+
+  const handlePatch = useCallback(
+    async (
+      instanceId: string,
+      patch: { cli?: string; fullAuto?: boolean; enabled?: boolean; models?: Array<{ id: string; label: string }>; replyWaitMinutes?: number | null },
+    ): Promise<{ ok: boolean; error?: string }> => {
+      setBusyInstanceId(instanceId);
+      setGlobalError(null);
+      try {
+        const res = await api(`/api/instances/${encodeURIComponent(instanceId)}`, {
+          method: "PATCH",
+          body: JSON.stringify(patch),
+        });
+        if (res?.instances) {
+          dispatch({ type: "instances", instances: res.instances, describedAt: res.describedAt });
+        }
+        return { ok: true };
+      } catch (e: any) {
+        const message = e.message || "Failed to update engine settings";
+        setGlobalError(message);
+        return { ok: false, error: message };
+      } finally {
+        setBusyInstanceId(null);
+      }
+    },
+    [dispatch],
+  );
+
+  const rows = state.instances
+    .filter(listedInEnginesSettings)
+    .filter((instance) => {
+      if (instance.driverKind !== "openai-compat" || isCustomEngineInstance(instance)) return true;
+      return showBuiltInOpenAiCompatible(
+        state.config?.openaiCompat?.configured ?? false,
+        state.config?.openaiCompat?.url,
+      );
+    });
+  // Engines the user has turned off used to sit behind a "Show (N)" link
+  // that defaulted to hidden, so a newly added engine whose CLI is not
+  // installed yet was simply absent from Settings — the reader saw a count
+  // and no list.  Default to showing them; the toggle stays for anyone who
+  // wants the short rail.
+  const [showDisabled, setShowDisabled] = useState(true);
+  const [addModalOpen, setAddModalOpen] = useState(false);
 
   return (
     <div className="flex flex-col gap-5">
-      {rows.length === 0 && (
-        <div className="text-[13px] text-ink-secondary">No CLI engines detected yet.</div>
+      <div className="flex items-start justify-between gap-4">
+        <div className="text-[12px] leading-relaxed text-ink-secondary flex-1">
+          <strong className="text-ink">Set CLI…</strong> points an engine at a specific binary,{"  "}
+          <strong className="text-ink">Reset</strong> goes back to the driver&apos;s default,{"  "}
+          <strong className="text-ink">Bypass permissions</strong> drops the approval cards and hands the engine full tool autonomy.{"  "}
+          Saving any of them reloads providers and interrupts running turns.
+        </div>
+        <button
+          id="setting-engines-add-custom"
+          type="button"
+          onClick={() => setAddModalOpen(true)}
+          className={cn("flex shrink-0 items-center gap-1.5 rounded-xl border border-hairline/50 bg-raised px-3.5 py-2 text-[12.5px] font-medium text-ink hover:bg-raised-hover shadow-sm", highlightClass?.("setting-engines-add-custom"))}
+        >
+          <Plus size={14} />
+          Add Engine
+        </button>
+      </div>
+      {busyInstanceId && (
+        <div className="flex items-center gap-2 rounded-lg border border-accent/30 bg-accent/10 px-3 py-2 text-[12px] text-accent">
+          <Loader2 size={13} className="animate-spin shrink-0" />
+          <span>Updating engine settings…</span>
+        </div>
       )}
+      {globalError && (
+        <div role="alert" className="flex items-center gap-2 rounded-lg border border-danger/30 bg-danger/10 px-3 py-2 text-[12px] text-danger">
+          <TriangleAlert size={13} className="shrink-0" />
+          <span>{globalError}</span>
+        </div>
+      )}
+      {rows.length === 0 && (
+        <div className="text-[13px] text-ink-secondary">No engines detected yet.</div>
+      )}
+      <div id="setting-engines-matrix" className={highlightClass?.("setting-engines-matrix")}>
+        <EngineCapabilitiesMatrix instances={rows} />
+      </div>
+      <div className="flex flex-col gap-3">
       {(() => {
-        const { subscription, custom } = splitEngineRail(rows);
+        const enabled = rows.filter(isEngineEnabled);
+        const disabled = rows.filter((row) => !isEngineEnabled(row));
+        const { subscription, custom } = splitEngineRail(enabled);
         subscription.sort((a, b) => (a.snapshot.state === "unavailable" ? 1 : 0) - (b.snapshot.state === "unavailable" ? 1 : 0));
         return (
           <>
             {subscription.length > 0 && <EngineGroupLabel>Cloud</EngineGroupLabel>}
             {subscription.map((i) => (
-              <EngineRow key={i.instanceId} instance={i} />
+              <EngineRow
+                key={i.instanceId}
+                instance={i}
+                busyInstanceId={busyInstanceId}
+                onPatch={(patch) => handlePatch(i.instanceId, patch)}
+              />
             ))}
-            {custom.length > 0 && <EngineGroupLabel className="pt-1">Local</EngineGroupLabel>}
+            {custom.length > 0 && <EngineGroupLabel className="pt-1">Local & Custom</EngineGroupLabel>}
             {custom.map((i) => (
-              <EngineRow key={i.instanceId} instance={i} />
+              <EngineRow
+                key={i.instanceId}
+                instance={i}
+                busyInstanceId={busyInstanceId}
+                onPatch={(patch) => handlePatch(i.instanceId, patch)}
+              />
             ))}
+            {disabled.length > 0 && (
+              <>
+                <div className="mt-2 flex items-center gap-2">
+                  <EngineGroupLabel>Not Enabled</EngineGroupLabel>
+                  <button
+                    type="button"
+                    onClick={() => setShowDisabled((value) => !value)}
+                    aria-expanded={showDisabled}
+                    className="text-[11px] text-ink-secondary hover:text-ink"
+                  >
+                    {showDisabled ? "Hide" : `Show (${disabled.length})`}
+                  </button>
+                </div>
+                {showDisabled && (
+                  <div className="flex flex-col gap-3">
+                    {disabled.map((i) => (
+                      <EngineRow
+                        key={i.instanceId}
+                        instance={i}
+                        busyInstanceId={busyInstanceId}
+                        reason={engineUnavailableReason(i)}
+                        onPatch={(patch) => handlePatch(i.instanceId, patch)}
+                      />
+                    ))}
+                  </div>
+                )}
+              </>
+            )}
           </>
         );
       })()}
-      <div className="text-[12px] leading-relaxed text-ink-secondary">
-        Set CLI points an engine at a specific binary — a versioned build, a wrapper script, or an
-        absolute path. Saving reloads providers and interrupts any running turns.
       </div>
+
+      {addModalOpen && (
+        <AddCustomEngineModal
+          onClose={() => setAddModalOpen(false)}
+          onAdded={() => refreshInstances({ fresh: true })}
+        />
+      )}
     </div>
   );
 }

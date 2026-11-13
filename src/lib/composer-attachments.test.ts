@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   appendPastedText,
+  filesFromClipboard,
   attachmentBasename,
   attachmentImageUrl,
   composeMessage,
@@ -86,6 +87,15 @@ describe("splitAttachedImages", () => {
     expect(display).toBe(stored);
     expect(images).toEqual([]);
   });
+
+  it("strips attached-file tags and previews image files as images", () => {
+    const stored =
+      'see this\n\n<attached-file path="/Users/j/.botfleet/attachments/123e4567-e89b-12d3-a456-426614174000.jpg" />\n\n<attached-file path="/Users/j/.botfleet/attachments/123e4567-e89b-12d3-a456-426614174001.pdf" />';
+    const { display, images, files } = splitAttachedImages(stored);
+    expect(display).toBe("see this");
+    expect(images).toEqual(["/Users/j/.botfleet/attachments/123e4567-e89b-12d3-a456-426614174000.jpg"]);
+    expect(files).toEqual(["/Users/j/.botfleet/attachments/123e4567-e89b-12d3-a456-426614174001.pdf"]);
+  });
 });
 
 describe("attachmentBasename", () => {
@@ -100,17 +110,39 @@ describe("attachmentBasename", () => {
     );
     expect(attachmentImageUrl("C:\\a\\b\\photo.webp")).toBe("/api/attachments/photo.webp");
     expect(attachmentImageUrl("https://attacker.example/tracker.png?cookie=1")).toBeNull();
-    expect(attachmentImageUrl("/a/b/payload.svg")).toBeNull();
+    expect(attachmentImageUrl("/a/b/payload.html")).toBeNull();
+    expect(attachmentImageUrl("/a/b/123e4567-e89b-12d3-a456-426614174000.svg")).toBe(
+      "/api/attachments/123e4567-e89b-12d3-a456-426614174000.svg",
+    );
     expect(attachmentImageUrl("/a/b/not%2Fan-image.png")).toBeNull();
   });
 });
 
 describe("isImageFile", () => {
-  it("accepts the served image mimes and rejects others", () => {
+  it("accepts the served image mimes, including HEIC, BMP, and SVG", () => {
     expect(isImageFile({ type: "image/png", size: 10 })).toBe(true);
     expect(isImageFile({ type: "image/jpeg", size: 10 })).toBe(true);
     expect(isImageFile({ type: "image/webp", size: 10 })).toBe(true);
-    expect(isImageFile({ type: "image/svg+xml", size: 10 })).toBe(false);
+    expect(isImageFile({ type: "image/gif", size: 10 })).toBe(true);
+    expect(isImageFile({ type: "image/heic", size: 10, name: "face.heic" })).toBe(true);
+    expect(isImageFile({ type: "image/bmp", size: 10 })).toBe(true);
+    expect(isImageFile({ type: "image/svg+xml", size: 10 })).toBe(true);
+    expect(isImageFile({ type: "", size: 10, name: "spin.gif" })).toBe(true);
+    expect(isImageFile({ type: "", size: 10, name: "mark.svg" })).toBe(true);
     expect(isImageFile({ type: "text/plain", size: 10 })).toBe(false);
+  });
+});
+
+/** Clipboard paste often exposes HEIC plus a converted TIFF under image.* names. */
+describe("filesFromClipboard", () => {
+  it("dedupes generated HEIC + TIFF clipboard items to a single file", () => {
+    const heic = new File([new Uint8Array([1, 2, 3])], "image.heic", { type: "image/heic" });
+    const tiff = new File([new Uint8Array([4, 5, 6, 7])], "image.tiff", { type: "image/tiff" });
+    const out = filesFromClipboard({
+      files: [heic, tiff],
+      items: [],
+    });
+    expect(out).toHaveLength(1);
+    expect(out[0]?.name).toMatch(/^image\.(heic|tiff)$/i);
   });
 });

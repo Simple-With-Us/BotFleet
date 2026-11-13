@@ -18,6 +18,7 @@ import {
 } from "./PhoneSetupFlow";
 import { companionPairingMode } from "../lib/phone-setup";
 import { ConnectionDetail } from "./ConnectionDetail";
+import { CompanionGatewayCard } from "./RemoteAccessSection";
 import { Card } from "./SettingsPrimitives";
 
 export {
@@ -70,7 +71,7 @@ export function CompanionSection({ profileEmail = "" }: { profileEmail?: string 
   if (!companionBridge()) {
     return (
       <Card
-        title="Use BotFleet from your phone"
+        title="Use BotFleet from Your Phone"
         subtitle="Open Settings in the BotFleet desktop app to set up a phone."
       />
     );
@@ -92,11 +93,11 @@ export function CompanionSection({ profileEmail = "" }: { profileEmail?: string 
     state.tailnetName ? { label: "Tailscale", value: `${state.tailnetName}:${state.port}` } : null,
     state.lan ? { label: "Wi-Fi", value: `${state.lan}:${state.port}` } : null,
     state.discovery?.name
-      ? { label: "Nearby discovery", value: `${state.discovery.name}:${state.port}` }
+      ? { label: "Nearby Discovery", value: `${state.discovery.name}:${state.port}` }
       : null,
     ...(state.addresses ?? [])
       .filter((address) => address !== state.lan && address !== state.tailscale)
-      .map((address, index) => ({ label: `Local route ${index + 1}`, value: `${address}:${state.port}` })),
+      .map((address, index) => ({ label: `Local Route ${index + 1}`, value: `${address}:${state.port}` })),
   ].filter((route): route is { label: string; value: string } => Boolean(route));
 
   return (
@@ -124,8 +125,15 @@ export function CompanionSection({ profileEmail = "" }: { profileEmail?: string 
         <PhoneSetupFlowView controller={c} variant="settings" />
       </Card>
 
+      <CompanionGatewayCard />
+
       <Card
-        title="Paired phones"
+        title="Desktop Browser Access"
+        subtitle="Looking to open BotFleet in a web browser from another Mac or PC?  Manage and test your public web ingress tunnel under the Remote tab in Settings."
+      />
+
+      <Card
+        title="Paired Phones"
         subtitle={pairedCount ? "Manage the phones that can use this BotFleet." : "No phones are paired yet."}
       >
         {pairedCount > 0 && (
@@ -137,7 +145,7 @@ export function CompanionSection({ profileEmail = "" }: { profileEmail?: string 
                     <Smartphone size={15} />
                   </div>
                   <div className="min-w-0 flex-1">
-                    <div className="truncate text-[13.5px] font-medium text-ink">{device.name}</div>
+                    <div className="truncate text-[13.5px] font-medium text-ink" title={device.name}>{device.name}</div>
                     <div className="text-[11.5px] text-ink-secondary">Last seen {relative(device.lastSeenAt)}</div>
                   </div>
                   <button
@@ -177,12 +185,12 @@ export function CompanionSection({ profileEmail = "" }: { profileEmail?: string 
 
       <details className="rounded-xl border border-hairline/40 bg-card">
         <summary className="cursor-pointer px-4 py-3.5 text-[13px] font-medium text-ink">
-          Advanced & troubleshooting
+          Advanced &amp; Troubleshooting
         </summary>
         <div className="flex flex-col gap-4 border-t border-hairline/30 px-4 py-4">
           <div className="flex items-center justify-between gap-4">
             <div className="min-w-0">
-              <div className="text-[13px] text-ink">Phone access</div>
+              <div className="text-[13px] text-ink">Phone Access</div>
               <div className="mt-0.5 text-[11.5px] leading-relaxed text-ink-secondary">
                 Turn off all phone connections to this computer.
               </div>
@@ -190,7 +198,7 @@ export function CompanionSection({ profileEmail = "" }: { profileEmail?: string 
             <button
               role="switch"
               aria-checked={state.enabled}
-              aria-label="Phone access"
+              aria-label="Phone Access"
               disabled={c.busy}
               onClick={() => void c.act((companion) => (state.enabled ? companion.stop() : companion.start()))}
               className={cnSwitch(state.enabled)}
@@ -218,12 +226,13 @@ export function CompanionSection({ profileEmail = "" }: { profileEmail?: string 
             </button>
           </div>
 
+          {c.account?.configured !== false && (
           <div className="border-t border-hairline/30 pt-4">
             <div className="flex items-start justify-between gap-3">
               <div className="flex min-w-0 items-start gap-2.5">
                 <Cloud size={15} className="mt-0.5 shrink-0 text-accent" />
                 <div className="min-w-0">
-                  <div className="text-[13px] text-ink">Secure phone account</div>
+                  <div className="text-[13px] text-ink">Secure Phone Account</div>
                   <div className="mt-0.5 text-[11.5px] leading-relaxed text-ink-secondary">
                     {c.account?.status === "ready"
                       ? `Signed in as ${c.account.email ?? "your account"}.`
@@ -251,19 +260,20 @@ export function CompanionSection({ profileEmail = "" }: { profileEmail?: string 
                 onClick={c.retryAccount}
                 className="mt-3 rounded-lg border border-hairline/40 px-3 py-1.5 text-[12px] text-ink hover:bg-control disabled:opacity-40"
               >
-                {c.accountBusy ? "Trying again…" : "Retry secure access"}
+                {c.accountBusy ? "Trying again…" : "Retry Secure Access"}
               </button>
             )}
             {accountActionError && <div className="mt-2 text-[12px] text-danger">{accountActionError}</div>}
           </div>
+          )}
 
           <div className="border-t border-hairline/30 pt-4">
-            <div className="text-[13px] text-ink">Connection details</div>
+            <div className="text-[13px] text-ink">Connection Details</div>
             <div className="mt-0.5 text-[11.5px] text-ink-secondary">
               Reveal or copy an address only when troubleshooting manual pairing.
             </div>
             <div className="mt-3 flex flex-col gap-2">
-              {hosted && <ConnectionDetail label="Secure route" value={endpointHost(hosted.url)} />}
+              {hosted && <ConnectionDetail label="Secure Route" value={endpointHost(hosted.url)} />}
               {localRoutes.map((route) => <ConnectionDetail key={`${route.label}:${route.value}`} {...route} />)}
               {!hosted && localRoutes.length === 0 && (
                 <div className="text-[12px] text-ink-secondary">No reachable address is available yet.</div>
@@ -277,16 +287,16 @@ export function CompanionSection({ profileEmail = "" }: { profileEmail?: string 
                 <div className="flex items-start gap-2.5">
                   <ShieldCheck size={15} className="mt-0.5 shrink-0 text-accent" />
                   <div>
-                    <div className="text-[13px] text-ink">Tailscale pairing</div>
+                    <div className="text-[13px] text-ink">Tailscale Pairing</div>
                     <div className="mt-0.5 text-[11.5px] leading-relaxed text-ink-secondary">
-                      Keep pairing on your private tailnet, even when a secure hosted route is available.
+                      Keep pairing on your private Tailscale network, even when a secure hosted route is available.
                     </div>
                   </div>
                 </div>
                 <button
                   disabled={c.busy || c.accountBusy}
                   onClick={c.useTailscale}
-                  className="mt-3 rounded-lg border border-hairline/40 px-3 py-1.5 text-[12px] text-ink hover:bg-control disabled:opacity-40"
+                  className="mt-3 min-h-11 rounded-lg border border-hairline/40 px-3 py-2 text-[12px] text-ink hover:bg-control disabled:opacity-40"
                 >
                   Pair over Tailscale
                 </button>
@@ -295,7 +305,7 @@ export function CompanionSection({ profileEmail = "" }: { profileEmail?: string 
             <div className="flex items-start gap-2.5">
               <Wifi size={15} className="mt-0.5 shrink-0 text-ink-secondary" />
               <div>
-                <div className="text-[13px] text-ink">Direct Wi-Fi pairing</div>
+                <div className="text-[13px] text-ink">Direct Wi-Fi Pairing</div>
                 <div className="mt-0.5 text-[11.5px] leading-relaxed text-ink-secondary">
                   Use this only when both devices are nearby and the network allows devices to see each other.
                 </div>
@@ -304,7 +314,7 @@ export function CompanionSection({ profileEmail = "" }: { profileEmail?: string 
             <button
               disabled={c.busy || c.accountBusy}
               onClick={c.useLocal}
-              className="mt-3 rounded-lg border border-hairline/40 px-3 py-1.5 text-[12px] text-ink hover:bg-control disabled:opacity-40"
+              className="mt-3 min-h-11 rounded-lg border border-hairline/40 px-3 py-2 text-[12px] text-ink hover:bg-control disabled:opacity-40"
             >
               Pair on this Wi-Fi
             </button>
@@ -312,7 +322,7 @@ export function CompanionSection({ profileEmail = "" }: { profileEmail?: string 
 
           {state.enabled && !hosted && state.tailscale && !state.tailnetName && (
             <div className="rounded-lg bg-warning/10 px-3 py-2 text-[11.5px] leading-relaxed text-ink-secondary">
-              Tailscale is connected, but its device name could not be read. Check MagicDNS in Tailscale or use the secure account above.
+              Tailscale is connected, but its device name could not be read.{"\u00a0 "}Check MagicDNS in Tailscale or use the secure account above.
             </div>
           )}
           {state.enabled && !hosted && !state.tailscale && (

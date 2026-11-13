@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { Check, AlertTriangle, Loader2, Mic } from "lucide-react";
-import { MausAvatar } from "./Avatar";
+import { BotMascot } from "./Avatar";
 import { identifyEmail, setEmailGateDone, track } from "@/lib/analytics";
 import { useDesktopCapabilities } from "./DesktopCapabilities";
 import { EngineSetup } from "./EngineSetup";
@@ -42,7 +42,7 @@ function StatusRow({
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2 text-[14px] font-medium text-ink">
           {mark}
-          <span className="min-w-0 truncate">{title}</span>
+          <span className="min-w-0 truncate" title={title}>{title}</span>
         </div>
         {detail && <div className="mt-0.5 text-[12.5px] leading-relaxed text-ink-secondary">{detail}</div>}
         {children}
@@ -81,7 +81,7 @@ function ReadyTile(entry: EngineEntry) {
     <div className="flex items-start gap-2.5 rounded-xl bg-card p-3">
       <ProviderMark driverKind={entry.instance.driverKind} size={17} />
       <div className="min-w-0">
-        <div className="truncate text-[13.5px] font-medium text-ink">{engineTitle(entry)}</div>
+        <div className="truncate text-[13.5px] font-medium text-ink" title={engineTitle(entry)}>{engineTitle(entry)}</div>
         <div className="mt-0.5 text-[12px] leading-snug text-ink-secondary">{entry.readyNote}</div>
       </div>
     </div>
@@ -194,10 +194,10 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
       >
         {step === 0 && (
           <div className="flex flex-col items-center">
-            <MausAvatar color="green" state="happy" size={72} />
+            <BotMascot color="green" state="happy" size={72} />
             <h1 className="mt-4 text-[20px] font-semibold text-ink">Welcome to BotFleet</h1>
             <p className="mt-1.5 text-center text-[14px] leading-relaxed text-ink-secondary">
-              Bots that do real work on their own computer. Tell us who you are
+              Bots that do real work on their own computer.{'\u00A0 '}Tell us who you are
               and we&rsquo;ll let you know when big things ship.
             </p>
             <input
@@ -228,16 +228,16 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
                 track("email_skipped");
                 setStep(1);
               }}
-              className="mt-3 text-[12px] text-ink-secondary hover:text-ink"
+              className="mt-3 inline-flex min-h-11 items-center justify-center px-3 text-[13px] text-ink-secondary hover:text-ink"
             >
-              Maybe later
+              Maybe Later
             </button>
           </div>
         )}
 
         {step === 1 && (
           <div className="flex min-h-0 flex-col">
-            <h1 className="text-[18px] font-semibold text-ink">Your engines</h1>
+            <h1 className="text-[18px] font-semibold text-ink">Your Engines</h1>
             <p className="mt-1 text-[13.5px] text-ink-secondary">
               Bots run on AI tools installed on this computer — here&rsquo;s what we found.
             </p>
@@ -291,7 +291,7 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
                 <div className="flex items-start gap-3">
                   <Mic size={18} className="mt-0.5 shrink-0 text-ink-secondary" />
                   <div>
-                    <div className="text-[14px] font-medium text-ink">Microphone & speech</div>
+                    <div className="text-[14px] font-medium text-ink">Microphone &amp; Speech</div>
                     <div className="mt-0.5 text-[12.5px] text-ink-secondary">
                       Voice dictation into the composer, transcribed on-device.
                     </div>
@@ -326,8 +326,8 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
             <button onClick={() => setStep(3)} className="mt-5 w-full rounded-lg bg-accent py-2.5 text-[15px] font-medium text-white">
               Continue
             </button>
-            <button onClick={() => setStep(3)} className="mt-3 text-[12px] text-ink-secondary hover:text-ink">
-              Skip for now
+            <button onClick={() => setStep(3)} className="mt-3 inline-flex min-h-11 items-center justify-center px-3 text-[13px] text-ink-secondary hover:text-ink">
+              Skip for Now
             </button>
           </div>
         )}

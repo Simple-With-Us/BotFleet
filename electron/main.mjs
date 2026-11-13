@@ -1,6 +1,9 @@
 import { app, BrowserWindow, WebContentsView, clipboard, desktopCapturer, dialog, ipcMain, Menu, nativeImage, powerSaveBlocker, safeStorage, screen, session, shell, systemPreferences, Tray, utilityProcess } from "electron";
 import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { openServerControls, shutdownAttachedServer, updateServerControls, UPDATE_CONTROL_ARGUMENT } from "./server-controls.mjs";
+import { botfleetDataDir } from "./app-paths.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -8,7 +11,20 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { startCua, stopCua, registerCuaIpc, setCuaStateListener } from "./cua.mjs";
 import { createAndroidDeviceController } from "./android-device.mjs";
 import { assemblyAICredential, mintAssemblyAIStreamingToken } from "./assemblyai.mjs";
-import { finishSpeech, startSpeech, stopSpeech } from "./speech.mjs";
+import {
+  geminiCredential,
+  mintGeminiLiveToken,
+  mintXaiRealtimeToken,
+  xaiCredential,
+} from "./sts-tokens.mjs";
+import {
+  finishSpeech,
+  listPersonalVoices,
+  speakPersonalVoice,
+  startSpeech,
+  stopPersonalVoice,
+  stopSpeech,
+} from "./speech.mjs";
 import {
   recorderPermissionStatus,
   saveSkillRecording,
@@ -17,12 +33,34 @@ import {
 } from "./skill-recorder.mjs";
 import { openBlankTerminal } from "./terminal-launch.mjs";
 import { startUpdater, registerUpdaterIpc } from "./updater.mjs";
+import { readConfigFile, updateConfigFile } from "./config-file-lock.mjs";
+import { readPersistOnExitPolicy } from "./persist-on-exit-policy.mjs";
 import { buildDiagnosticsReport, decodeLogTail, diagnosticsFileName } from "./diagnostics.mjs";
-import { migrateWorkspaceCredentials, workspaceCredentialEnv } from "./workspace-credentials.mjs";
+import {
+  assertExternalWorkspaceCredentialMarkers,
+  instanceKeyedDriver,
+  markExternalWorkspaceCredentials,
+  migrateWorkspaceCredentials,
+  workspaceCredentialEnv,
+} from "./workspace-credentials.mjs";
+import { markExternalInstanceCredentials, restoreWorkspaceCredentials, restoreInstanceCredentials } from "./credential-restore.mjs";
+import {
+  createUpdateCredentialReceipt,
+  updateCredentialReceiptPath,
+} from "./update-credential-preparation.mjs";
 import { activateExistingWindow } from "./single-instance.mjs";
-import { pollServerIdentity } from "./server-boot-probe.mjs";
+import { pollServerIdentity, probeHarness, resolvePackagedServer } from "./server-boot-probe.mjs";
+import { readPackagedBuildIdentity } from "./runtime-identity.mjs";
+import { desktopStartupReceiptPath, desktopStartupUiPort, writeDesktopStartupReceipt } from "./desktop-startup-receipt.mjs";
+import { readHarnessOwner } from "./harness-ownership.mjs";
+import { startUiShim } from "./attached-ui-shim.mjs";
+import { readKeychainServiceToken, resolveServerTarget, SERVER_TARGET_FILE } from "./server-target.mjs";
+import { readStartupEnrollment, resolveEnrolledServerTarget, writeStartupEnrollment } from "./startup-enrollment.mjs";
 import { packageUrlFromCommandLine, packageUrlFromDeepLink } from "./package-link.mjs";
 import { windowChromeOptions } from "./window-chrome.mjs";
+import { parseExternalHttpUrl, windowOpenExternalUrl } from "./external-url.mjs";
+import { mayOpenBotFile, resolveLocalRevealPath, resolveOpenablePath } from "./open-file.mjs";
+import { installTrustedIpcGuard, isTrustedRendererUrl } from "./renderer-trust.mjs";
 import { defaultSaveName, withSavableFile } from "./save-file.mjs";
 import {
   ensureManagedComposioCredentials,
@@ -40,18 +78,161 @@ import {
 } from "./managed-companion-tunnel.mjs";
 import { createSecureCredentialState } from "./secure-credential-state.mjs";
 import { isKnownSkin } from "./skin-overlay.cjs";
-import { readSecureCredentials } from "./secure-credentials.mjs";
+import {
+  applySafeStorageMigration,
+  readSecureCredentials,
+  SAFE_STORAGE_MIGRATION_BASENAME,
+  wantsSafeStorageExport,
+} from "./secure-credentials.mjs";
 import { createControlPlaneClient } from "./control-plane-client.mjs";
+import { REMOTE_CREDENTIAL_ERROR, refuseCredentialsInRemoteMode } from "./remote-credential-guard.mjs";
 import {
   companionAccountCleanupPending,
   createCompanionAccountService,
   resolveCompanionControlPlaneURL,
 } from "./companion-account-service.mjs";
 import capabilitiesModule from "./capabilities.cjs";
+import appInfoModule from "./app-info.cjs";
+
+// The packaged Server-menu smoke must never touch the owner's real
+// user-data directory.  On macOS `app.getPath("userData")` resolves from the
+// password database, not from $HOME, so a smoke that only overrides HOME
+// would write the owner's real target file.  The smoke therefore hands the
+// app its own throwaway directory, and this runs before anything reads a
+// path — every later `app.getPath("userData")` sees the isolated directory.
+if (process.env.OMB_SMOKE_SERVER_MENU === "1" && process.env.OMB_SMOKE_USER_DATA_DIR) {
+  const smokeUserData = path.resolve(process.env.OMB_SMOKE_USER_DATA_DIR);
+  const smokeLogs = path.join(smokeUserData, "logs");
+  // Electron refuses to point a path at a directory that does not exist, and
+  // a smoke that cannot isolate its user data must never fall through to the
+  // owner's real directory.  Say why and stop.
+  try {
+    fs.mkdirSync(smokeUserData, { recursive: true });
+    fs.mkdirSync(smokeLogs, { recursive: true });
+  } catch (error) {
+    console.error(
+      `[smoke] server-menu could not create its user-data directory ${smokeUserData}: ${error?.code ?? error?.message ?? error}`,
+    );
+    process.exit(2);
+  }
+  app.setPath("userData", smokeUserData);
+  // The log folder travels with the user data for the smoke, so a run
+  // leaves nothing behind in the real one.
+  app.setPath("logs", smokeLogs);
+}
+
+// The packaged Server-menu smoke must never read the owner's login Keychain
+// either: on an enrolled Mac that would point the app under test at the real
+// server with the real gate token.  The smoke hands the app a throwaway
+// keychain of its own (a test-only launch hook, like the user-data one), and
+// a smoke launched without one stops instead of searching the real Keychain.
+let smokeKeychainPath = null;
+if (app.isPackaged && process.env.OMB_SMOKE_SERVER_MENU === "1") {
+  const keychain = process.env.OMB_SMOKE_KEYCHAIN ?? "";
+  if (!path.isAbsolute(keychain) || !fs.existsSync(keychain)) {
+    console.error("[smoke] server-menu needs OMB_SMOKE_KEYCHAIN, an absolute path to a throwaway keychain that exists");
+    process.exit(2);
+  }
+  smokeKeychainPath = keychain;
+}
 
 const { desktopCapabilities, nativeDesktopActions } = capabilitiesModule;
+const { appRuntimeInfo, appRuntimeSummary } = appInfoModule;
+let updateCredentialPreparationPath;
+let updateStartupReceiptPath;
+try {
+  updateCredentialPreparationPath = updateCredentialReceiptPath(process.argv);
+  updateStartupReceiptPath = desktopStartupReceiptPath(process.argv);
+} catch {
+  console.error("[desktop] invalid private update request");
+  process.exit(1);
+}
 const nativeActions = nativeDesktopActions(process.platform);
 const require = createRequire(import.meta.url);
+
+// Match server/sentry.ts: all-zeros is an unknown checkout, never a release.
+const UNKNOWN_COMMIT = "0".repeat(40);
+const RELEASE_SHA = /^[0-9a-f]{7,40}$/i;
+
+function resolvedDesktopReleaseSha() {
+  const candidates = [];
+  for (const key of ["SENTRY_RELEASE", "GITHUB_SHA", "VERCEL_GIT_COMMIT_SHA"]) {
+    const value = process.env[key]?.trim();
+    if (value) candidates.push(value);
+  }
+  // Packaged Electron builds stamp a real SHA in build-identity.json; env
+  // overrides still win when set.
+  if (process.resourcesPath) {
+    try {
+      const build = readPackagedBuildIdentity(path.join(process.resourcesPath, "server"));
+      if (build?.sourceCommit) candidates.push(build.sourceCommit);
+    } catch {
+      /* dev runs and unpackaged CI have no identity; release stays env-only */
+    }
+  }
+  for (const candidate of candidates) {
+    if (candidate && candidate !== UNKNOWN_COMMIT && RELEASE_SHA.test(candidate)) return candidate;
+  }
+  return undefined;
+}
+
+function redactQueryStringTokens(url) {
+  if (url == null || url === "") return url;
+  return String(url).replace(/([?&])(token|key|secret|authorization)=[^&]*/gi, "$1$2=[redacted]");
+}
+
+function scrubDesktopSentryRequest(event) {
+  if (!event) return event;
+  if (event.request) {
+    if (event.request.headers) event.request.headers = {};
+    if (event.request.query_string) {
+      event.request.query_string = "[redacted]";
+    }
+  }
+  return event;
+}
+
+function initDesktopSentry() {
+  if (process.env.VITEST === "true" || process.env.NODE_ENV === "test") return;
+  const dsn = String(process.env.SENTRY_DSN || process.env.VITE_SENTRY_DSN || "").trim();
+  if (!dsn) return;
+  try {
+    const Sentry = require("@sentry/electron/main");
+    const release = resolvedDesktopReleaseSha();
+    Sentry.init({
+      dsn,
+      // @sentry/electron v8 resolves the v11 JavaScript SDK.  v11 replaced
+      // sendDefaultPii with dataCollection and collects these categories by
+      // default, so keep the desktop client on an explicit restrictive policy.
+      dataCollection: {
+        userInfo: false,
+        cookies: false,
+        httpHeaders: { request: false, response: false },
+        httpBodies: [],
+        urlQueryParams: false,
+        genAI: { inputs: false, outputs: false },
+        databaseQueryData: false,
+        queues: false,
+        graphQL: { document: false, variables: false },
+        stackFrameVariables: false,
+        frameContextLines: 0,
+      },
+      environment: String(process.env.SENTRY_ENV || process.env.NODE_ENV || "production").trim() || "production",
+      release,
+      beforeSend(event) {
+        return scrubDesktopSentryRequest(event);
+      },
+      beforeBreadcrumb(breadcrumb) {
+        if (breadcrumb?.data?.url) breadcrumb.data.url = redactQueryStringTokens(breadcrumb.data.url);
+        return breadcrumb;
+      },
+    });
+  } catch {
+    /* @sentry/electron is optional in a source checkout */
+  }
+}
+initDesktopSentry();
+
 const { createDisplayMediaGuard, invokeDisplayMediaCallback, selectCaptureSource } = require(
   "./screen-preview.cjs",
 );
@@ -64,9 +245,19 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // 127.0.0.1 explicitly — vite binds IPv4; a bare "localhost" here can
 // resolve to ::1 and paint a black window
 const DEV_URL = process.env.ELECTRON_START_URL ?? "http://127.0.0.1:5199";
-const DEFAULT_COMPOSIO_BROKER_URL = "https://botfleet-composio.milindsoni201.workers.dev";
+// There is deliberately no built-in connected-apps broker. The previous
+// default pointed at a Worker this project does not operate (it answers 404
+// today), so every packaged install registered against a stranger's host and
+// failed silently. A packaged build only talks to a broker the operator set:
+// OMB_COMPOSIO_BROKER_URL, or composio.brokerUrl in ~/.botfleet/config.json.
 let SERVER_PORT = 8799;
 const APP_ICON = path.join(__dirname, "resources/app-icon.png");
+// Windows groups notifications and the taskbar by this id.  Packaged builds
+// inherit it from electron-builder's appId; set it here so unpackaged runs
+// still match.
+if (process.platform === "win32") {
+  app.setAppUserModelId("app.botfleet.macos");
+}
 let desktopViewerWindow = null;
 let desktopViewerOwner = null;
 let desktopViewerContextId = null;
@@ -90,21 +281,23 @@ function readWindowState() {
   }
 }
 
-function writeWindowState(win) {
+async function writeWindowState(win) {
   if (!win || win.isDestroyed()) return;
+  let payload;
+  try {
+    payload = JSON.stringify({ bounds: win.getNormalBounds(), maximized: win.isMaximized() });
+  } catch {
+    return;
+  }
   const file = windowStateFile();
   const temporary = `${file}.${process.pid}.tmp`;
   try {
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(
-      temporary,
-      JSON.stringify({ bounds: win.getNormalBounds(), maximized: win.isMaximized() }),
-      { mode: 0o600 },
-    );
-    fs.renameSync(temporary, file);
+    await fs.promises.mkdir(path.dirname(file), { recursive: true });
+    await fs.promises.writeFile(temporary, payload, { mode: 0o600 });
+    await fs.promises.rename(temporary, file);
   } catch (error) {
     try {
-      fs.rmSync(temporary, { force: true });
+      await fs.promises.rm(temporary, { force: true });
     } catch {}
     slog(`window state save failed: ${error?.message ?? error}`);
   }
@@ -115,7 +308,7 @@ function installWindowStatePersistence(win) {
   const flush = () => {
     if (timer) clearTimeout(timer);
     timer = null;
-    writeWindowState(win);
+    void writeWindowState(win);
   };
   const schedule = () => {
     if (timer) clearTimeout(timer);
@@ -183,12 +376,36 @@ app.on("open-url", (event, url) => {
 });
 
 app.on("second-instance", (_event, commandLine) => {
+  if (commandLine.includes(UPDATE_CONTROL_ARGUMENT)) {
+    void app.whenReady().then(() => performControlUpdate()).catch(() => {
+      console.error("[control] Could not handle the Control update request");
+    });
+    return;
+  }
   const packageUrl = packageUrlFromCommandLine(commandLine);
   if (packageUrl) pendingPackageInstallUrl = packageUrl;
   activateExistingWindow(BrowserWindow.getAllWindows());
   const target = BrowserWindow.getAllWindows().find((win) => !win.isDestroyed());
   deliverPackageInstall(target);
 });
+
+let controlUpdateInProgress = false;
+async function performControlUpdate() {
+  if (controlUpdateInProgress || process.platform !== "darwin") return;
+  controlUpdateInProgress = true;
+  try {
+    await updateServerControls({
+      source: app.isPackaged ? path.join(process.resourcesPath, "BotFleet Control.app") : fileURLToPath(new URL("./resources/BotFleet Control.app", import.meta.url)),
+      shell,
+      dialog,
+    });
+  } catch {
+    // The error dialog itself can throw while Electron is shutting down.
+    console.error("[control] Could not complete the Control update");
+  } finally {
+    controlUpdateInProgress = false;
+  }
+}
 
 // Packaged: the harness server ships in Resources (compiled JS, zero deps)
 // and runs on Electron's own Node via utilityProcess. It serves the built
@@ -198,6 +415,24 @@ app.on("second-instance", (_event, commandLine) => {
 // our API shape, not just a 200).
 let serverProc = null;
 let serverReady = true;
+// "spawned": this app forked the harness child above. "attached": a BotFleet
+// harness was already answering /api/health (the always-on launchd job, or a
+// dev harness) and the app joined it instead of forking a second server
+// against the same data dir. An attached harness is never killed on quit.
+let serverMode = "spawned";
+// Which BotFleet server this launch talks to: the harness on this Mac
+// ("local") or a remote server Infisical points the app at ("remote").
+// Local startup is explicit; enrolled startup reads Infisical after consent.
+let serverTarget = { mode: "local", source: "", legacyFile: false };
+// Why the remote server could not be used (an invalid gate token, say).  The
+// error page shows it instead of the generic "could not reach it" line.
+let serverRemoteError = null;
+// Serves the bundled UI (and streams /api through) when the attached harness
+// runs headless — see attached-ui-shim.mjs.
+let uiShim = null;
+// Origin the window loads. Usually the harness itself; the shim's when attached
+// to a headless harness. Null until the packaged boot settles.
+let rendererBase = null;
 let secureCredentials = {};
 let secureCredentialState = null;
 
@@ -209,7 +444,11 @@ const CREDENTIALS_FILE = path.join(app.getPath("userData"), "credentials.bin");
  * installation — keys off this rather than off an empty object. */
 let credentialStoreUnavailable = false;
 
-async function loadSecureCredentials() {
+function safeStorageMigrationFile() {
+  return path.join(path.dirname(CREDENTIALS_FILE), SAFE_STORAGE_MIGRATION_BASENAME);
+}
+
+async function readSecureCredentialStore() {
   const result = await readSecureCredentials({
     exists: () => fs.existsSync(CREDENTIALS_FILE),
     isAvailable: () => safeStorage.isAsyncEncryptionAvailable(),
@@ -217,11 +456,27 @@ async function loadSecureCredentials() {
     decrypt: (buffer) => safeStorage.decryptStringAsync(buffer),
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   });
+  return applySafeStorageMigration(result, {
+    migrationExists: () => fs.existsSync(safeStorageMigrationFile()),
+    readMigration: () => fs.readFileSync(safeStorageMigrationFile(), "utf8"),
+    removeMigration: () => fs.rmSync(safeStorageMigrationFile(), { force: true }),
+  });
+}
+
+async function loadSecureCredentials() {
+  const result = await readSecureCredentialStore();
   credentialStoreUnavailable = result.status === "unavailable";
   if (credentialStoreUnavailable) {
     // Deliberately loud. A silent {} here is what made a keychain hiccup
     // look like "your connected apps are gone".
     slog(`credential store unreadable after retries (${result.error}); saved keys are not loaded this launch`);
+    return result.credentials;
+  }
+  if (result.fromMigration) {
+    // Re-encrypt under this executable's designated requirement, then drop
+    // the plaintext handoff the predecessor wrote.
+    await saveSecureCredentials(result.credentials);
+    fs.rmSync(safeStorageMigrationFile(), { force: true });
   }
   return result.credentials;
 }
@@ -243,41 +498,56 @@ async function saveSecureCredentials(credentials) {
   fs.renameSync(temporary, CREDENTIALS_FILE);
 }
 
-async function secureComposioConfig() {
-  const dataDir = process.env.OMB_DATA_DIR || path.join(app.getPath("home"), ".botfleet");
-  const configPath = path.join(dataDir, "config.json");
+async function secureComposioConfig({ strict = false } = {}) {
+  const configPath = desktopConfigPath();
   try {
-    const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
-    if (!config?.composio || typeof config.composio !== "object") return;
-    let changed = false;
-    const apiKey = config?.composio?.apiKey;
-    if (typeof apiKey === "string" && apiKey.trim().startsWith("ak_")) {
-      if (!secureCredentials.composioApiKey) {
-        secureCredentials.composioApiKey = apiKey.trim();
-        await saveSecureCredentials(secureCredentials);
-      }
-      config.composio.apiKey = "";
-      changed = true;
-    } else if (typeof apiKey === "string" && apiKey.trim()) {
-      config.composio.apiKey = "";
-      changed = true;
+    // The credential store first, outside the lock -- it is async and may
+    // take a moment.  Then the file, under the lock every other config.json
+    // writer takes (config-file-lock.mjs), so a save by a harness that is
+    // already running against this data dir is never overwritten with the
+    // snapshot read here.
+    const apiKey = readConfigFile(configPath)?.composio?.apiKey;
+    const diskKey = typeof apiKey === "string" ? apiKey.trim() : "";
+    if (diskKey.startsWith("ak_") && diskKey !== secureCredentials.composioApiKey) {
+      secureCredentials.composioApiKey = diskKey;
+      await saveSecureCredentials(secureCredentials);
     }
-    // These were the old Connect credential and endpoint. They are no longer
-    // read; remove them during the upgrade so an unused secret is not left in
-    // plaintext indefinitely.
-    for (const field of ["key", "url"]) {
-      if (Object.hasOwn(config.composio, field)) {
-        delete config.composio[field];
-        changed = true;
-      }
-    }
-    if (!changed) return;
-    const temporary = `${configPath}.${process.pid}.tmp`;
-    fs.writeFileSync(temporary, JSON.stringify(config, null, 2), { mode: 0o600 });
-    fs.renameSync(temporary, configPath);
+    updateConfigFile(configPath, (config) =>
+      stripLegacyComposioFields(config, secureCredentials.composioApiKey) ? config : null,
+    );
   } catch (error) {
+    if (strict) throw error;
     if (error?.code !== "ENOENT") slog(`credential migration failed: ${error?.message ?? error}`);
   }
+}
+
+/** Blank the plaintext Composio key and drop the retired Connect credential
+ * and endpoint (`key`, `url`) in place.  They are no longer read; removing
+ * them during the upgrade keeps an unused secret from sitting in plaintext
+ * indefinitely.  Returns true when anything changed.
+ *
+ * Runs under the config lock on the copy read there, so it re-evaluates the
+ * key it finds rather than trusting the earlier unlocked read: a real key
+ * is blanked only once `storedApiKey` (the encrypted store) holds that
+ * exact value.  One that arrived from another process in between has not
+ * been copied anywhere yet; blanking it would lose the only copy, so it
+ * stays for the next launch to migrate.  A value that is not a Composio key
+ * at all is legacy residue and is cleared as before. */
+function stripLegacyComposioFields(config, storedApiKey) {
+  if (!config?.composio || typeof config.composio !== "object") return false;
+  let changed = false;
+  const apiKey = typeof config.composio.apiKey === "string" ? config.composio.apiKey.trim() : "";
+  if (apiKey && (!apiKey.startsWith("ak_") || storedApiKey === apiKey)) {
+    config.composio.apiKey = "";
+    changed = true;
+  }
+  for (const field of ["key", "url"]) {
+    if (Object.hasOwn(config.composio, field)) {
+      delete config.composio[field];
+      changed = true;
+    }
+  }
+  return changed;
 }
 
 // The remaining workspace credentials (xai/box/voice/OpenCode keys) get
@@ -285,32 +555,175 @@ async function secureComposioConfig() {
 // saves go straight through credential:set below; this boot-time sweep also
 // migrates plaintext left by older versions or direct development clients.
 // See workspace-credentials.mjs for the exact rules.
-async function secureWorkspaceConfig() {
-  const dataDir = process.env.OMB_DATA_DIR || path.join(app.getPath("home"), ".botfleet");
-  const configPath = path.join(dataDir, "config.json");
+async function secureWorkspaceConfig({ strict = false } = {}) {
+  const configPath = desktopConfigPath();
   try {
-    const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
-    const migrated = migrateWorkspaceCredentials(config, secureCredentials);
-    // credentials.bin first: if the OS store cannot take the secrets, the
-    // plaintext stays put and the next boot retries — losing the only copy
-    // is the one unacceptable outcome
+    // credentials.bin first, outside the lock: if the OS store cannot take
+    // the secrets, the plaintext stays put and the next boot retries --
+    // losing the only copy is the one unacceptable outcome.
+    const migrated = migrateWorkspaceCredentials(readConfigFile(configPath), secureCredentials);
     if (migrated.credentialsChanged) await saveSecureCredentials(migrated.credentials);
     secureCredentials = migrated.credentials;
     if (!migrated.configChanged) return;
-    const temporary = `${configPath}.${process.pid}.tmp`;
-    fs.writeFileSync(temporary, JSON.stringify(migrated.config, null, 2), { mode: 0o600 });
-    fs.renameSync(temporary, configPath);
+    // Then strip the file under the cross-process lock (config-file-lock.mjs),
+    // re-running the migration on the copy read there rather than writing the
+    // snapshot from above: a harness already running against this data dir
+    // may have saved in between.  Should that copy carry a secret the store
+    // does not have yet, leave the file alone and let the next boot retry.
+    updateConfigFile(configPath, (config) => {
+      const again = migrateWorkspaceCredentials(config, secureCredentials);
+      if (again.credentialsChanged || !again.configChanged) return null;
+      return again.config;
+    });
   } catch (error) {
+    if (strict) throw error;
     if (error?.code !== "ENOENT") slog(`credential migration failed: ${error?.message ?? error}`);
   }
 }
 
-function composioBrokerUrl() {
-  const configured = process.env.OMB_COMPOSIO_BROKER_URL?.trim();
-  return normalizeManagedComposioBrokerUrl(
-    configured || (app.isPackaged ? DEFAULT_COMPOSIO_BROKER_URL : ""),
-  );
+/** Upgrade encrypted custom-engine keys created before config carried the
+ * nonsecret external-storage marker.  This runs before attach-or-spawn, so a
+ * fresh standalone harness can gate those exact engines from its first turn. */
+/** Mirrors `DEFAULT_VPS_MODE` in shared/local-auto-consent.ts: per-bot is
+ * the only VPS mode the runtime implements. */
+const DEFAULT_VPS_MODE = "per-bot";
+
+/** Migrate the legacy `botDefaults.allowedComputers` shape onto the new
+ * per-provider `botDefaults.computerProviders` + `vpsMode` fields the
+ * redesigned Computer settings UI writes.  Runs once at app launch
+ * through the same `updateConfigFile` lock used by every other config
+ * migration, so a save in flight from the harness is never overwritten
+ * with a snapshot read here.
+ *
+ * Idempotent: a config that already carries `computerProviders` is a
+ * no-op (the new UI is the only writer and the new field is the
+ * source of truth).  The cross-field invariant
+ * (`vpsMode === null` only legal when `selfHostedVps` is off) is
+ * repaired in place rather than refused — a single default is cheaper
+ * than a hard refusal at boot, and the schema only allows that exact
+ * combination on a config the operator wrote by hand. */
+function migrateComputerProviders({ strict = false } = {}) {
+  try {
+    updateConfigFile(desktopConfigPath(), (config) => {
+      if (!config?.botDefaults) return null;
+      const defaults = config.botDefaults;
+      // Already migrated: enforce the cross-field invariant and return
+      // null when nothing actually changed, so the file's mtime does
+      // not move on every boot.
+      if (defaults.computerProviders) {
+        const providers = defaults.computerProviders;
+        if (providers.selfHostedVps === true && defaults.vpsMode === null) {
+          defaults.vpsMode = DEFAULT_VPS_MODE;
+          return config;
+        }
+        if (providers.selfHostedVps !== true && defaults.vpsMode !== null && defaults.vpsMode !== undefined) {
+          defaults.vpsMode = null;
+          return config;
+        }
+        return null;
+      }
+      // Compute from the legacy `allowedComputers`.  Mirrors
+      // `migrateAllowedComputersToProviders` in shared/local-auto-consent.ts
+      // (this file cannot import TypeScript):
+      //   null / undefined -> every provider on (legacy "no allowlist")
+      //   []               -> every provider off (explicit deny-all)
+      //   [...]            -> each named destination's providers on
+      // The next provider save back-fills `allowedComputers` from this
+      // shape, so mapping [] to anything but all-off would silently
+      // re-enable cloud, and mapping null to anything but all-on would
+      // silently revoke Local VM and host grants.
+      const allowed = defaults.allowedComputers;
+      let providers = { asciiBox: false, selfHostedVps: false, localVm: false, localMac: false };
+      let vpsMode = null;
+      if (allowed === null || allowed === undefined) {
+        providers = { asciiBox: true, selfHostedVps: true, localVm: true, localMac: true };
+        vpsMode = DEFAULT_VPS_MODE;
+      } else if (Array.isArray(allowed) && allowed.length > 0) {
+        for (const dest of allowed) {
+          if (dest === "cloud") {
+            providers.asciiBox = true;
+            providers.selfHostedVps = true;
+          } else if (dest === "vm") {
+            providers.localVm = true;
+          } else if (dest === "local") {
+            providers.localMac = true;
+          }
+        }
+        vpsMode = providers.selfHostedVps ? DEFAULT_VPS_MODE : null;
+      }
+      // Anything else (empty array, or a hand-edited non-array) stays
+      // all-off: an explicit deny-all is preserved, never widened.
+      defaults.computerProviders = providers;
+      defaults.vpsMode = vpsMode;
+      return config;
+    });
+  } catch (error) {
+    if (strict) throw error;
+    slog(`computer providers migration failed: ${error?.message ?? error}`);
+  }
 }
+
+function secureCredentialMarkers({ strict = false } = {}) {
+  if (credentialStoreUnavailable) {
+    if (strict) throw new Error("The operating-system credential store could not be read");
+    return { ok: false, markerNames: [] };
+  }
+  const ids = Object.keys(secureCredentials?.instanceKeys ?? {});
+  try {
+    updateConfigFile(desktopConfigPath(), (config) => {
+      const workspace = markExternalWorkspaceCredentials(config, secureCredentials);
+      const instances = markExternalInstanceCredentials(workspace.config, ids);
+      return workspace.changed || instances.changed ? instances.config : null;
+    });
+    const stored = readConfigFile(desktopConfigPath());
+    const markerNames = assertExternalWorkspaceCredentialMarkers(stored, secureCredentials);
+    for (const id of ids) {
+      if (stored?.instances?.[id]?.config?.credentialStorage === "external") markerNames.push(`instance.${id}`);
+      else if (instanceKeyedDriver(stored?.instances?.[id])) {
+        throw new Error(`Custom credential marker was not durably written for ${id}`);
+      }
+    }
+    return { ok: true, markerNames };
+  } catch (error) {
+    if (strict) throw error;
+    slog(`custom credential marker migration failed: ${error?.message ?? error}`);
+    return { ok: false, markerNames: [] };
+  }
+}
+
+function writeUpdateCredentialReceipt(receiptPath, receipt) {
+  fs.mkdirSync(path.dirname(receiptPath), { recursive: true, mode: 0o700 });
+  const temporary = `${receiptPath}.${process.pid}.${randomUUID()}.tmp`;
+  fs.writeFileSync(temporary, `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o600, flag: "wx" });
+  fs.renameSync(temporary, receiptPath);
+}
+
+function desktopConfigPath() {
+  const dataDir = botfleetDataDir();
+  return path.join(dataDir, "config.json");
+}
+
+/** composio.brokerUrl from config.json, or "" — read fresh so a value the
+ * operator adds while the app runs is picked up by the next registration. */
+function configuredComposioBrokerUrl() {
+  try {
+    const config = JSON.parse(fs.readFileSync(desktopConfigPath(), "utf8"));
+    const value = config?.composio?.brokerUrl;
+    return typeof value === "string" ? value.trim() : "";
+  } catch {
+    return "";
+  }
+}
+
+function composioBrokerUrl() {
+  const configured = process.env.OMB_COMPOSIO_BROKER_URL?.trim() || configuredComposioBrokerUrl();
+  return normalizeManagedComposioBrokerUrl(configured || "");
+}
+
+// The outcome of the last connected-apps registration, forwarded to the
+// server child so Connected Apps can show a real notice ("could not be set
+// up: …") instead of the generic "needs setup" a log line leaves behind.
+let managedComposioSetup = { status: "unconfigured" };
 
 // The packaged app has no terminal: everything about the server child's life
 // goes to server.log in the OS log dir (~/Library/Logs/BotFleet on macOS,
@@ -318,6 +731,11 @@ function composioBrokerUrl() {
 // why stdio is piped, not inherited — under a Finder/Explorer launch the
 // parent's stdio leads nowhere and a failed boot is otherwise undiagnosable.
 const LOG_DIR = app.getPath("logs");
+// The app's own data directory: ~/.botfleet unless OMB_DATA_DIR says
+// otherwise.  The application menu opens this, so it has to resolve to the
+// same place the harness writes to — see app-paths.mjs for why this is one
+// function rather than a literal in three places.
+const DATA_DIR = botfleetDataDir();
 let logStream = null;
 import {
   companionAdvertisedHostedUrl,
@@ -418,7 +836,15 @@ async function desktopCompanionState() {
   return decorateDesktopCompanionState(await companionState());
 }
 
+// A remote server has its own phone pairing, so the local sidecar never runs
+// in remote mode: it would hand the sidecar a harness port where nothing
+// listens, and its proxy would offer the remote server to any paired
+// device.  This is the error the owner sees instead.
+const REMOTE_COMPANION_ERROR = "The phone companion runs on the remote server, not this app.";
+
 function companionLaunchOptions(hostedUrl = null) {
+  // Remote mode has no local harness to point the sidecar at.
+  if (serverMode === "remote") throw new Error(REMOTE_COMPANION_ERROR);
   return {
     resourcesPath: process.resourcesPath,
     harnessPort: SERVER_PORT,
@@ -477,8 +903,6 @@ function reconcileCompanionAdvertisement(
 
 function readConfigIngressPublicUrl() {
   try {
-    const dataDir = process.env.OMB_DATA_DIR || path.join(import.meta.dirname, "../.."); // Fallback, but app.getPath("home") is better
-    // wait, I can use app.getPath("home") because `app` is available in main.mjs
     const realDataDir = process.env.OMB_DATA_DIR || path.join(app.getPath("home"), ".botfleet");
     const configPath = path.join(realDataDir, "config.json");
     if (!fs.existsSync(configPath)) return null;
@@ -517,6 +941,10 @@ async function startManagedCompanionConnection({ waitForVerification = true } = 
 }
 
 async function startDesktopCompanion({ waitForHosted = true, remember = true } = {}) {
+  // The sidecar talks to a harness on this Mac, so it cannot run against a
+  // remote server.  Refuse here as well as at the call sites: this is the
+  // one place that would hand SERVER_PORT to the sidecar.
+  if (serverMode === "remote") throw new Error(REMOTE_COMPANION_ERROR);
   companionDesiredThisLaunch = true;
   companionLaunchGeneration += 1;
   // Direct LAN comes up first. The hosted endpoint is added in place only
@@ -661,11 +1089,15 @@ function readLogTail(logPath) {
 // file is safe to paste into a public issue even if a future log line ever
 // carried a secret.
 async function gatherDiagnostics() {
-  const serverStatus = await fetch(`http://127.0.0.1:${SERVER_PORT}/api/config`, {
-    signal: AbortSignal.timeout(3_000),
-  })
-    .then((res) => (res.ok ? res.json() : null))
-    .catch(() => null);
+  // A remote server is not this machine's business: there is no local harness
+  // to read a config summary from, so the report simply carries none.
+  const serverStatus = serverMode === "remote"
+    ? null
+    : await fetch(`http://127.0.0.1:${SERVER_PORT}/api/config`, {
+        signal: AbortSignal.timeout(3_000),
+      })
+        .then((res) => (res.ok ? res.json() : null))
+        .catch(() => null);
   const logPath = path.join(LOG_DIR, "server.log");
   const log = readLogTail(logPath);
   return buildDiagnosticsReport({
@@ -676,6 +1108,7 @@ async function gatherDiagnostics() {
       electron: process.versions.electron,
       node: process.versions.node,
       packaged: app.isPackaged,
+      harness: app.isPackaged ? harnessLabel() : "dev",
       uptimeSeconds: Math.round(process.uptime()),
     },
     configSummary: serverStatus ?? {},
@@ -686,6 +1119,9 @@ async function gatherDiagnostics() {
 // Set by startServerPackaged: true only when every failing candidate port was
 // taken by another process — decides which error-page message renders.
 let serverStartConflictOnly = false;
+// Set alongside it when the live data-root owner never answered: the error
+// page names that process instead of blaming slow startup.
+let serverStartUnresponsiveOwner = null;
 
 async function startServerOn(port) {
   const entry = path.join(process.resourcesPath, "server", "index.js");
@@ -694,6 +1130,7 @@ async function startServerOn(port) {
     OMB_STATIC_DIR: path.join(process.resourcesPath, "ui"),
     OMB_RESOURCES_PATH: process.resourcesPath,
     OMB_SKILLS_DIR: path.join(process.resourcesPath, "skills"),
+    OMB_BOTS_DIR: path.join(process.resourcesPath, "bots"),
     OMB_PORT: String(port),
     OMB_USER_DATA: app.getPath("userData"),
     ...(secureCredentials.composioApiKey
@@ -739,7 +1176,13 @@ async function startServerOn(port) {
     bootTimeoutMs: SERVER_BOOT_TIMEOUT_MS,
     isExited: () => exited,
   });
-  if (identity.outcome === "ready") return { proc };
+  smokeStep(`harness on port ${port}: ${identity.outcome}`);
+  if (identity.outcome === "ready") {
+    // Restore missing encrypted credentials once the child is idle.  The
+    // same authenticated path also handles attaching to an existing owner.
+    await replayAttachedWorkspaceCredentials(port, readPackagedBuildIdentity(path.join(process.resourcesPath, "server")));
+    return { proc };
+  }
   if (identity.outcome === "exited") {
     slog(`child on port ${port} exited before answering /api/health`);
   } else {
@@ -755,26 +1198,384 @@ async function startServerOn(port) {
   return { proc: null, reason: identity.outcome };
 }
 
-async function startServerPackaged() {
-  // two passes: a quit-and-reopen relaunch can race the dying instance's
-  // server during teardown — one settle-and-retry covers it
-  let everyPortForeignOwned = true;
-  for (let attempt = 0; attempt < 2; attempt++) {
-    for (const port of [8799, 18799, 28799]) {
-      const started = await startServerOn(port);
-      if (started.proc) {
-        serverProc = started.proc;
-        SERVER_PORT = port;
-        return true;
-      }
-      // A child that exited or timed out is not evidence of a port conflict —
-      // only "another process answered health checks" is.
-      if (started.reason !== "foreign-owner") everyPortForeignOwned = false;
-    }
-    await new Promise((r) => setTimeout(r, 2500));
+let credentialRestoreTimer = null;
+let credentialRestoreStopped = false;
+let credentialRestoreLastOutcome = null;
+async function replayAttachedWorkspaceCredentials(port, expectedBuild) {
+  if (credentialRestoreStopped) return;
+  // Local Keychain secrets are never copied to a remote server.
+  if (serverMode === "remote") return;
+  // The packaged Server-menu smoke never touches the operating-system
+  // credential store: restoring would read and write the encrypted store
+  // through the login Keychain, which the smoke must never reach, and its
+  // throwaway user data holds no credentials to restore anyway.
+  if (serverMenuSmokeEnabled()) {
+    smokeStep("credential restore skipped");
+    return;
   }
-  serverStartConflictOnly = everyPortForeignOwned;
+  const owner = readHarnessOwner(botfleetDataDir());
+  let outcome = "unavailable";
+  try {
+    // Hold the existing credential transaction through the network restore.
+    // A successful clear/save cannot race an older snapshot back into memory.
+    await updateSecureCredentialDocument(async (credentials) => {
+      const options = { port, owner, credentials,
+        verifyOwner: async (candidate) => (await probeHarness({ port, owner: candidate, expectedBuild })).kind === "botfleet" };
+      outcome = await restoreWorkspaceCredentials(options);
+      if (outcome === "restored" || outcome === "empty") {
+        const instances = await restoreInstanceCredentials(options);
+        outcome = instances.outcome;
+        for (const id of instances.missing) delete credentials.instanceKeys[id];
+      }
+      return credentials;
+    });
+  } catch {
+    outcome = "unavailable";
+  }
+  if (outcome === "restored" || outcome === "empty" || credentialRestoreStopped) return;
+  // Active work owns its credentials until it finishes.  Retry from the
+  // encrypted store so a settings edit during the wait is never overwritten.
+  if (outcome !== credentialRestoreLastOutcome) {
+    slog(`[credentials] workspace restoration ${outcome}; will retry`);
+    credentialRestoreLastOutcome = outcome;
+  }
+  credentialRestoreTimer = setTimeout(() => void replayAttachedWorkspaceCredentials(port, expectedBuild), 15_000);
+  credentialRestoreTimer.unref?.();
+}
+
+async function startServerPackaged() {
+  let expectedBuild;
+  try { expectedBuild = readPackagedBuildIdentity(path.join(process.resourcesPath, "server")); }
+  catch {
+    slog("packaged build identity is missing or invalid; reinstall the app before attaching");
+    serverStartConflictOnly = false;
+    return false;
+  }
+  // Attach-or-spawn: a proven data-root owner is joined, a foreign owner
+  // is skipped, and an unambiguous free port gets our own child.  Two
+  // passes: a quit-and-reopen relaunch can race the dying instance's server
+  // during teardown — one settle-and-retry covers it.
+  const result = await resolvePackagedServer({
+    ports: [8799, 18799, 28799],
+    owner: () => readHarnessOwner(botfleetDataDir()),
+    probe: (port, owner) => probeHarness({ port, owner, expectedBuild }),
+    spawn: startServerOn,
+    log: slog,
+  });
+  if (result.mode === "spawned") {
+    serverProc = result.proc;
+    serverMode = "spawned";
+    SERVER_PORT = result.port;
+    rendererBase = `http://127.0.0.1:${SERVER_PORT}`;
+    return true;
+  }
+  if (result.mode === "attached") {
+    serverProc = null;
+    serverMode = "attached";
+    SERVER_PORT = result.port;
+    // An independently restarted harness has no memory of keys held in the
+    // desktop's encrypted store.  Restore missing values after attachment.
+    await replayAttachedWorkspaceCredentials(SERVER_PORT, expectedBuild);
+    if (result.static) {
+      rendererBase = `http://127.0.0.1:${SERVER_PORT}`;
+      return true;
+    }
+    // Headless harness: serve our bundled UI from a sibling port and stream
+    // /api through to it. Prefer the app's own port list so the renderer
+    // origin stays stable across launches.
+    try {
+      uiShim = await startUiShim({
+        uiDir: path.join(process.resourcesPath, "ui"),
+        harnessPort: SERVER_PORT,
+        listenPorts: [8799, 18799, 28799].filter((port) => port !== SERVER_PORT),
+        log: slog,
+      });
+      rendererBase = `http://127.0.0.1:${uiShim.port}`;
+      slog(`serving the bundled UI on port ${uiShim.port} for the attached harness on port ${SERVER_PORT}`);
+      return true;
+    } catch (error) {
+      slog(`could not serve the bundled UI for the attached harness: ${error?.message ?? error}`);
+      serverStartConflictOnly = false;
+      return false;
+    }
+  }
+  serverStartConflictOnly = result.conflictOnly;
+  serverStartUnresponsiveOwner = result.unresponsiveOwner ?? null;
+  slog(
+    serverStartUnresponsiveOwner
+      ? `showing the error page: the data owner (pid ${serverStartUnresponsiveOwner.pid}, port ${serverStartUnresponsiveOwner.port}) is alive but not answering`
+      : result.conflictOnly
+        ? "showing the error page: every candidate port answered health checks from another program"
+        : "showing the error page: no harness came up in time",
+  );
   return false;
+}
+
+// Enrolled server addresses and tokens come only from Infisical.
+// An unreadable vault never selects a different server.
+function serverTargetFailure(error) {
+  return {
+    mode: "error",
+    source: "infisical",
+    legacyFile: false,
+    message: `BotFleet could not read its server settings from Infisical: ${error?.message ?? error}`,
+  };
+}
+
+// The vault read for this launch.  The packaged Server-menu smoke reads its
+// own throwaway keychain; everything else reads the login Keychain.
+function readServerTargetFromInfisical() {
+  const userDataDir = app.getPath("userData");
+  if (smokeKeychainPath) {
+    return resolveServerTarget({
+      userDataDir,
+      readToken: () => readKeychainServiceToken({ keychain: smokeKeychainPath }),
+    });
+  }
+  return resolveServerTarget({ userDataDir });
+}
+
+async function readStartupServerTarget({ forceChoice = false } = {}) {
+  const dataDir = botfleetDataDir();
+  return resolveEnrolledServerTarget({
+    readEnrollment: () => readStartupEnrollment(dataDir),
+    writeEnrollment: (mode) => writeStartupEnrollment(mode, dataDir),
+    legacyFile: fs.existsSync(path.join(app.getPath("userData"), SERVER_TARGET_FILE)),
+    forceChoice,
+    hasLegacyEnrollment: async () => (await readKeychainServiceToken()) !== null,
+    chooseMode: async () => {
+      const { response } = await dialog.showMessageBox({
+        type: "question",
+        title: "Server Setup",
+        message: "How Should BotFleet Start?",
+        detail: "Start with this Mac’s server, or read your enrolled server settings from Infisical.\u00a0 You can change this in the Server menu.",
+        buttons: ["Use This Mac", "Use Infisical Server Settings", "Not Now"],
+        defaultId: 2,
+        cancelId: 2,
+        noLink: true,
+      });
+      return response === 0 ? "local" : response === 1 ? "remote" : null;
+    },
+    readRemoteTarget: readServerTargetFromInfisical,
+  });
+}
+
+// The host of a validated remote origin, for the Server menu.
+function serverMenuHost(origin) {
+  try {
+    return new URL(origin).hostname || origin;
+  } catch {
+    return origin;
+  }
+}
+
+// One step of the packaged Server-menu smoke, in the app log.  A smoke that
+// never prints its line then says how far the app got.
+function smokeStep(step) {
+  if (serverMenuSmokeEnabled()) slog(`smoke: ${step}`);
+}
+
+// A remote server replaces the local harness entirely: no child is forked and
+// no local harness is joined.  The bundled UI is still served from this
+// machine, so the renderer stays on a loopback origin and every trust check
+// in the app keeps working; only the far end of the /api pipe moves.
+async function startRemoteServer(remoteOrigin, remoteToken = "") {
+  serverMode = "remote";
+  serverProc = null;
+  if (!remoteToken) {
+    // A token is optional by design: a server behind a Tailscale login
+    // admits its own devices without one.  Say so once, so the log explains
+    // a 403 from the gate instead of leaving it to be guessed.
+    slog("the remote server has no gate token; only devices signed in to the tailnet can reach it");
+  }
+  try {
+    uiShim = await startUiShim({
+      uiDir: path.join(process.resourcesPath, "ui"),
+      remoteOrigin,
+      remoteToken,
+      listenPorts: [18799, 28799, 8799],
+      log: slog,
+    });
+    rendererBase = `http://127.0.0.1:${uiShim.port}`;
+    slog(`using the remote BotFleet server at ${remoteOrigin}`);
+    return true;
+  } catch (error) {
+    slog(`could not serve the bundled UI for the remote server at ${remoteOrigin}: ${error?.message ?? error}`);
+    serverRemoteError = String(error?.message ?? error);
+    serverStartConflictOnly = false;
+    return false;
+  }
+}
+
+// The packaged Server-menu smoke.  It is active only in a packaged app that
+// was launched with OMB_SMOKE_SERVER_MENU=1, and it drives the real menu
+// handlers with nobody in front of the screen: the dialogs, the file opener
+// and the relaunch are skipped and logged instead.
+function serverMenuSmokeEnabled() {
+  return app.isPackaged && process.env.OMB_SMOKE_SERVER_MENU === "1";
+}
+
+// The "Server" menu item, wherever the platform put it: on macOS it lives in
+// the app-name menu, everywhere else under File.
+function findServerMenuItem() {
+  const menu = Menu.getApplicationMenu();
+  if (!menu) return null;
+  for (const top of menu.items) {
+    if (top.label === "Server") return top;
+    for (const item of top.submenu?.items ?? []) {
+      if (item.label === "Server") return item;
+    }
+  }
+  return null;
+}
+
+// The labels of the Server submenu, with the separators dropped.
+function serverMenuLabels() {
+  const item = findServerMenuItem();
+  return (item?.submenu?.items ?? [])
+    .map((entry) => entry.label ?? "")
+    .filter((label) => label !== "");
+}
+
+// The report the packaged Server-menu smoke prints.  It never carries a
+// token: only the mode, where the target came from, the menu labels and the
+// error.
+function serverMenuSmokeReport() {
+  return {
+    serverMode: serverTarget?.mode ?? "local",
+    source: serverTarget?.source ?? "",
+    legacyFile: serverTarget?.legacyFile === true,
+    harness: harnessLabel(),
+    rendererBaseUrl: rendererBaseUrl(),
+    health: { status: 0, json: false },
+    serverMenu: { labels: [] },
+    reload: { labels: [], mode: "" },
+    error: null,
+  };
+}
+
+// The report goes out through the write callback, not through a bare
+// console.log: a pipe write is asynchronous on macOS, and quitting on the
+// next line would drop the queued line before the parent ever saw it.
+async function writeServerMenuSmokeReport(report) {
+  await new Promise((resolve) => {
+    process.stdout.write(`[smoke] server-menu ${JSON.stringify(report)}\n`, resolve);
+  });
+}
+
+// Drive the Server menu the way an owner would and report what happened.
+// The report never carries a token: only the mode, where the target came
+// from, the menu labels and the error.
+async function runServerMenuSmoke() {
+  const report = serverMenuSmokeReport();
+  try {
+    // The health of the server this app talks to.  A server that cannot be
+    // reached must answer with a clean error, not a hang and not a crash.
+    try {
+      const response = await fetch(`${rendererBaseUrl()}/api/health`, {
+        signal: AbortSignal.timeout(15_000),
+      });
+      const body = await response.text();
+      try {
+        JSON.parse(body);
+        report.health = { status: response.status, json: true };
+      } catch {
+        report.health = { status: response.status, json: false };
+      }
+    } catch (error) {
+      report.health = { status: 0, json: false, error: String(error?.message ?? error) };
+    }
+
+    smokeStep(`health ${report.health.status}`);
+    report.serverMenu = { labels: serverMenuLabels() };
+
+    // "Reload From Infisical" reads the vault again.  On a runner with no
+    // enrollment the reload changes nothing, and the app has to survive that.
+    const reload = (findServerMenuItem()?.submenu?.items ?? []).find(
+      (entry) => entry.label === "Reload From Infisical",
+    );
+    await reload?.click?.();
+    smokeStep("reload finished");
+    report.reload = { labels: serverMenuLabels(), mode: serverTarget?.mode ?? "" };
+  } catch (error) {
+    report.error = String(error?.message ?? error);
+  }
+  await writeServerMenuSmokeReport(report);
+  app.quit();
+}
+
+// Read the server target from Infisical again.  A failed read changes
+// nothing: the app keeps talking to the server it is on, and the owner is
+// told why the reload did nothing.
+async function reloadServerTargetFromInfisical({ forceChoice = false } = {}) {
+  let target;
+  try {
+    target = await readStartupServerTarget({ forceChoice });
+  } catch (error) {
+    target = serverTargetFailure(error);
+  }
+  if (target.mode === "cancelled") return target;
+  if (target.mode === "error") {
+    if (serverMenuSmokeEnabled()) {
+      slog(`smoke: the reload from Infisical failed: ${target.message}`);
+    } else {
+      dialog.showErrorBox("BotFleet cannot read its server settings from Infisical", target.message);
+    }
+    return target;
+  }
+  // A rotated gate token is a change too: the running pipe still carries the
+  // old one, and every request would be refused until a restart.  The tokens
+  // are compared, never logged.
+  const changed =
+    target.mode !== serverTarget?.mode ||
+    (target.mode === "remote" &&
+      (target.origin !== serverTarget?.origin || target.token !== serverTarget?.token));
+  if (!changed) {
+    // Same server, same token: only the status line (where the target came
+    // from) can differ, so the menu is rebuilt in place.
+    serverTarget = target;
+    setupApplicationMenu();
+    slog("the server target from Infisical has not changed");
+    return target;
+  }
+  // The new target is staged until the restart is accepted.  Until then the
+  // app keeps talking to the server it is on, so the menu and diagnostics
+  // keep describing that server.
+  const relaunched = await offerRestartForServerTarget(target);
+  if (relaunched) {
+    serverTarget = target;
+    setupApplicationMenu();
+  } else {
+    slog("the new server target from Infisical takes effect at the next restart");
+  }
+  return target;
+}
+
+// Point the app at a server and offer to restart into it.  The server the
+// app talks to cannot change under a running window: the renderer origin,
+// the trust checks and the event stream are all built on it.
+//
+// Answers whether the app is relaunching into the new target.
+async function offerRestartForServerTarget(target) {
+  if (serverMenuSmokeEnabled()) {
+    slog(`smoke: would offer a restart into ${target?.mode ?? "unknown"}`);
+    return false;
+  }
+  // The dialog names the server the same way the Server menu does, with the
+  // address in the detail line.
+  const remote = target?.mode === "remote";
+  const { response } = await dialog.showMessageBox({
+    type: "info",
+    buttons: ["Restart", "Not Now"],
+    defaultId: 0,
+    cancelId: 1,
+    message: `Restart BotFleet To Use ${remote ? "The Remote Server" : "The Server On This Mac"}?`,
+    detail: `BotFleet restarts before it connects to ${remote ? `the remote server at ${target.origin}` : "the server on this Mac"}.\u00a0 Your conversations and settings stay where they are.`,
+  });
+  if (response !== 0) return false;
+  app.relaunch();
+  app.quit();
+  return true;
 }
 
 function syncManagedComposioCredentials() {
@@ -783,6 +1584,7 @@ function syncManagedComposioCredentials() {
     serverProc.postMessage({
       type: "botfleet:managed-composio",
       access: managedComposioAccess(composioBrokerUrl(), secureCredentials),
+      setup: managedComposioSetup,
     });
   } catch (error) {
     slog(`connected-apps credential sync failed: ${error?.message ?? error}`);
@@ -798,16 +1600,35 @@ function escapeHtml(value) {
   return value.replace(/[&<>"']/g, (ch) => `&#${ch.charCodeAt(0)};`);
 }
 
-function buildErrorPage({ allPortsOccupied }) {
+// Text only, by owner request: no logo, no emoji.  Light by default, dark
+// when the system is.  The Try Again link is a window-open request the
+// handler below turns into a relaunch, so the page needs no preload or IPC.
+const ERROR_PAGE_STYLE =
+  "body{margin:0;display:flex;align-items:center;justify-content:center;height:100vh;background:#fcfcfc;color:#111;font:15px -apple-system,system-ui}" +
+  "h2{font-weight:600;margin:0 0 8px}p{color:#555;line-height:1.5}a{color:inherit}" +
+  "a.retry{display:inline-block;margin-top:14px;padding:8px 16px;border:1px solid currentColor;border-radius:8px;text-decoration:none;font-weight:600}" +
+  "@media(prefers-color-scheme:dark){body{background:#070707;color:#fcfcfc}p{color:#fcfcfc99}}";
+
+// A link target the window-open handler recognises: relaunch the app so the
+// harness probe runs again.  Never opened externally (it is not http).
+const SERVER_RETRY_URL = "botfleet://retry-server";
+
+function buildErrorPage({ allPortsOccupied, unresponsiveOwner = null, remoteOrigin = null, remoteError = null }) {
   const serverLogPath = path.join(LOG_DIR, "server.log");
   const serverLogHref = pathToFileURL(serverLogPath).href;
-  const reason = allPortsOccupied
-    ? "Every BotFleet port answered health checks from another process — likely a second copy of the app, or another program on ports 8799–28799. Quit that program, then quit and reopen BotFleet."
-    : "The background server didn't come up in time — this is usually slow startup, not a port conflict. Quit and reopen BotFleet.";
+  const reason = remoteError
+    ? `BotFleet could not use the remote server at ${remoteOrigin}.\u00a0 ${remoteError}`
+    : remoteOrigin
+    ? `BotFleet could not reach the server at ${remoteOrigin}.\u00a0 Check that the address is right and that this Mac can reach it, then try again.`
+    : unresponsiveOwner
+    ? `A BotFleet server that owns this Mac's fleet data (process ${unresponsiveOwner.pid} on port ${unresponsiveOwner.port}) is running but not answering.\u00a0 BotFleet will not start a second server on the same data.\u00a0 Wait a minute and try again, or quit that process first.`
+    : allPortsOccupied
+      ? "Every BotFleet port answered health checks from another program on ports 8799–28799.\u00a0 Quit that program, then try again."
+      : "The background server didn't come up in time — this is usually slow startup, not a port conflict.\u00a0 Try again in a moment.";
   return (
     "data:text/html;charset=utf-8," +
     encodeURIComponent(
-      `<body style="margin:0;display:flex;align-items:center;justify-content:center;height:100vh;background:#070707;color:#fcfcfc;font:15px -apple-system,system-ui"><div style="text-align:center;max-width:360px"><div style="font-size:40px">🐭</div><h2 style="font-weight:600;margin:12px 0 6px">Couldn't start the bot server</h2><p style="color:#fcfcfc99;line-height:1.5">${escapeHtml(reason)} If it keeps happening, check <a target="_blank" rel="noopener" href="${serverLogHref}" style="color:#fcfcfc">${escapeHtml(serverLogPath)}</a>.</p></div></body>`,
+      `<style>${ERROR_PAGE_STYLE}</style><body><div style="text-align:center;max-width:360px"><h2>${remoteOrigin ? "Couldn't Reach The Bot Server" : "Couldn't Start The Bot Server"}</h2><p>${escapeHtml(reason)}&#160; If it keeps happening, check <a target="_blank" rel="noopener" href="${serverLogHref}">${escapeHtml(serverLogPath)}</a>.</p><a class="retry" target="_blank" rel="noopener" href="${SERVER_RETRY_URL}">Try Again</a></div></body>`,
     )
   );
 }
@@ -824,9 +1645,29 @@ const androidDevice = createAndroidDeviceController({ resourcesPath: process.res
 const displayMediaGuard = createDisplayMediaGuard();
 let displayMediaRequestCount = 0;
 
-function rendererOrigin() {
-  return new URL(app.isPackaged ? `http://127.0.0.1:${SERVER_PORT}` : DEV_URL).origin;
+function rendererBaseUrl() {
+  if (!app.isPackaged) return DEV_URL;
+  return rendererBase ?? `http://127.0.0.1:${SERVER_PORT}`;
 }
+
+// Which server the app is talking to, in one word for the diagnostics and the
+// settings panel.  A remote server has no local port to name, so it is named
+// by its origin instead.
+function harnessLabel() {
+  if (serverMode === "remote") return `remote:${serverTarget.origin}`;
+  return `${serverMode}:${SERVER_PORT}`;
+}
+
+function rendererOrigin() {
+  return new URL(rendererBaseUrl()).origin;
+}
+
+// Every ipcMain.handle below — and the ones registerCuaIpc, registerUpdaterIpc,
+// and the Android controller add later — hands a privileged action to whoever
+// is calling: a device token, a credential write, a terminal.  Wrap the
+// registration itself so no handler can forget, and resolve the origin lazily
+// because the renderer port is not settled until the harness probe finishes.
+installTrustedIpcGuard(ipcMain, { origin: rendererOrigin });
 
 function respondToDisplayMediaRequest(callback, response) {
   const error = invokeDisplayMediaCallback(callback, response);
@@ -1054,9 +1895,34 @@ function createWindow() {
   });
 
   win.webContents.setWindowOpenHandler(({ url }) => {
-    shell.openExternal(url);
+    if (url === SERVER_RETRY_URL) {
+      // Relaunch rather than re-probe in place: a fresh process re-reads the
+      // data-owner record, retries every port, and goes through the normal
+      // quit path (companion, CUA daemon, credential timers) on the way out.
+      slog("try again requested from the error page; relaunching");
+      app.relaunch();
+      app.quit();
+      return { action: "deny" };
+    }
+    const external = windowOpenExternalUrl(url);
+    if (external) void shell.openExternal(external);
     return { action: "deny" };
   });
+
+  // A same-frame link navigates this window in place, and a navigated page
+  // keeps the preload bridge — the whole privileged surface above would then
+  // answer for a page on the web.  ErrorRow's "Get It From The Website" is a
+  // live example.  Keep our own origin (every route, hash, and query is the
+  // same document) and hand anything else to the user's browser through the
+  // same allowlist the window-open handler above uses.
+  const guardNavigation = (event, target) => {
+    if (isTrustedRendererUrl(target, rendererOrigin())) return;
+    event.preventDefault();
+    const external = windowOpenExternalUrl(target);
+    if (external) void shell.openExternal(external);
+  };
+  win.webContents.on("will-navigate", guardNavigation);
+  win.webContents.on("will-redirect", guardNavigation);
   win.webContents.on("did-finish-load", () => deliverPackageInstall(win));
 
   // Native context menu for text inputs — without this, right-click does
@@ -1149,7 +2015,7 @@ function createWindow() {
             };
           })()
         `);
-        const expectedLocation = `http://127.0.0.1:${SERVER_PORT}/`;
+        const expectedLocation = `${rendererOrigin()}/`;
         if (result.location !== expectedLocation) {
           throw new Error(
             `unexpected packaged renderer URL: ${result.location} (expected ${expectedLocation})`,
@@ -1198,8 +2064,34 @@ function createWindow() {
     });
   }
 
+  // The packaged Server-menu smoke: it drives the real Server menu handlers
+  // with nobody in front of the screen and prints one line of JSON.  It is
+  // active only in a packaged app launched with OMB_SMOKE_SERVER_MENU=1.
+  if (app.isPackaged && process.env.OMB_SMOKE_SERVER_MENU === "1") {
+    let smokeStarted = false;
+    smokeStep("window created");
+    const startServerMenuSmoke = () => {
+      if (smokeStarted) return;
+      smokeStarted = true;
+      smokeStep("menu smoke started");
+      void runServerMenuSmoke();
+    };
+    win.webContents.once("did-finish-load", startServerMenuSmoke);
+    // A window that never finishes loading must not hang the smoke.
+    setTimeout(startServerMenuSmoke, 20_000);
+  }
+
   if (app.isPackaged) {
-    win.loadURL(serverReady ? `http://127.0.0.1:${SERVER_PORT}` : buildErrorPage({ allPortsOccupied: serverStartConflictOnly }));
+    win.loadURL(
+      serverReady
+        ? rendererBaseUrl()
+        : buildErrorPage({
+            allPortsOccupied: serverStartConflictOnly,
+            unresponsiveOwner: serverStartUnresponsiveOwner,
+            remoteOrigin: serverMode === "remote" ? serverTarget.origin : null,
+            remoteError: serverMode === "remote" ? serverRemoteError : null,
+          }),
+    );
   } else {
     win.loadURL(DEV_URL);
   }
@@ -1208,13 +2100,20 @@ function createWindow() {
 
 // Local-control screen preview — served from the main process so the Screen
 // Recording permission prompt attributes to the app, never the server
-ipcMain.handle("screen:frame", async () => {
+ipcMain.handle("screen:frame", async (_event, options) => {
   if (process.platform !== "darwin") return null;
   const sources = await desktopCapturer.getSources({
     types: ["screen"],
     thumbnailSize: { width: 1280, height: 800 },
   });
-  return sources[0]?.thumbnail.toDataURL() ?? null;
+  const target =
+    typeof options?.displayIndex === "number" && sources[options.displayIndex]
+      ? sources[options.displayIndex]
+      : sources.length > 1
+        ? sources[1]
+        : sources[0];
+  if (!target) return null;
+  return `data:image/jpeg;base64,${target.thumbnail.toJPEG(75).toString("base64")}`;
 });
 
 // Onboarding permission checks. Status reads are free; the mic request
@@ -1246,10 +2145,10 @@ ipcMain.handle("engine:open-terminal", async (_event, command) => {
 // renderer sandboxed and let the main process open only ordinary web links.
 // A bot's working folder: the native picker, so the path is real and the
 // user never types one. Returns null when they cancel.
-ipcMain.handle("desktop:pick-folder", async (event, current) => {
+ipcMain.handle("desktop:pick-folder", async (event, current, title) => {
   const win = BrowserWindow.fromWebContents(event.sender) ?? undefined;
   const result = await dialog.showOpenDialog(win, {
-    title: "Choose a working folder",
+    title: typeof title === "string" && title.trim() ? title.trim().slice(0, 120) : "Choose a working folder",
     properties: ["openDirectory", "createDirectory"],
     ...(typeof current === "string" && current ? { defaultPath: current } : {}),
   });
@@ -1311,37 +2210,36 @@ ipcMain.handle("desktop:save-file", async (event, rawPath) => {
   });
 });
 
+// Same confinement as save-file: fileURLToPath for file://, realpath, then
+// ~/.botfleet.  A path outside that tree must throw, not open.
 ipcMain.handle("desktop:open-file", async (_event, rawPath) => {
-  if (typeof rawPath !== "string") throw new Error("A file path is required");
-  let normPath = rawPath.trim();
-  if (normPath.startsWith("file://")) {
-    try {
-      normPath = decodeURIComponent(new URL(normPath).pathname);
-    } catch {
-      // keep normPath
-    }
+  const filePath = await resolveOpenablePath(rawPath, { home: os.homedir() });
+  if (!mayOpenBotFile(filePath)) {
+    shell.showItemInFolder(filePath);
+    return true;
   }
-  if (!fs.existsSync(normPath)) {
-    throw new Error(`File does not exist: ${normPath}`);
-  }
-  const openError = await shell.openPath(normPath);
-  if (openError) {
-    shell.showItemInFolder(normPath);
-  }
+  const openError = await shell.openPath(filePath);
+  if (openError) shell.showItemInFolder(filePath);
   return true;
 });
 
 ipcMain.handle("desktop:show-in-folder", async (_event, rawPath) => {
-  if (typeof rawPath !== "string") throw new Error("A file path is required");
-  let normPath = rawPath.trim();
-  if (normPath.startsWith("file://")) {
-    try {
-      normPath = decodeURIComponent(new URL(normPath).pathname);
-    } catch {
-      // keep normPath
-    }
+  const filePath = await resolveOpenablePath(rawPath, { home: os.homedir() });
+  shell.showItemInFolder(filePath);
+  return true;
+});
+
+// Plugin install sources may be folders outside ~/.botfleet; reveal them in
+// the file manager without the bot-file confinement used for chat attachments.
+ipcMain.handle("desktop:reveal-local-path", async (_event, rawPath) => {
+  const resolved = await resolveLocalRevealPath(rawPath);
+  const stats = await fs.promises.stat(resolved);
+  if (stats.isDirectory()) {
+    const openError = await shell.openPath(resolved);
+    if (openError) throw new Error(openError);
+  } else {
+    shell.showItemInFolder(resolved);
   }
-  shell.showItemInFolder(normPath);
   return true;
 });
 
@@ -1354,16 +2252,7 @@ ipcMain.handle("desktop:skin", (_event, skin) => {
 });
 
 ipcMain.handle("desktop:open-external", async (_event, rawUrl) => {
-  if (typeof rawUrl !== "string") throw new Error("A web address is required");
-  let url;
-  try {
-    url = new URL(rawUrl);
-  } catch {
-    throw new Error("That web address is invalid");
-  }
-  if (url.protocol !== "https:" && url.protocol !== "http:") {
-    throw new Error("Only web links can be opened");
-  }
+  const url = parseExternalHttpUrl(rawUrl);
   await shell.openExternal(url.toString());
   return true;
 });
@@ -1460,6 +2349,30 @@ ipcMain.handle("speech:finish", () => {
   if (nativeActions.appleSpeech) finishSpeech();
 });
 
+ipcMain.handle("personal-voice:available", () => nativeActions.appleSpeech);
+ipcMain.handle("personal-voice:list", async () => {
+  if (!nativeActions.appleSpeech) return [];
+  return listPersonalVoices();
+});
+ipcMain.handle("personal-voice:speak", async (event, text, voiceId, options) => {
+  if (!nativeActions.appleSpeech) throw new Error("Personal Voice requires macOS.");
+  // Word ranges go back only to the window that asked, tagged with the id
+  // its preload chose, and carry numbers only: no text crosses back.
+  const progressId = Number(options?.progressId);
+  const sender = event.sender;
+  const onRange = Number.isSafeInteger(progressId) && progressId > 0
+    ? ({ location, length, elapsedMs }) => {
+      if (!sender.isDestroyed()) {
+        sender.send("personal-voice:range", { id: progressId, location, length, elapsedMs });
+      }
+    }
+    : undefined;
+  return speakPersonalVoice(text, voiceId, { onRange });
+});
+ipcMain.handle("personal-voice:stop", () => {
+  if (nativeActions.appleSpeech) stopPersonalVoice();
+});
+
 ipcMain.handle("skill-recorder:permissions", () => recorderPermissionStatus());
 ipcMain.handle("skill-recorder:start", (event) => {
   const win = BrowserWindow.fromWebContents(event.sender);
@@ -1487,7 +2400,13 @@ ipcMain.handle("companion:set-custom-ingress", async (_event) => {
 });
 
 ipcMain.handle("companion:state", () => desktopCompanionState());
-ipcMain.handle("companion:start", () => startDesktopCompanion());
+ipcMain.handle("companion:start", () => {
+  // The same gate as the at-rest start: a remote server has its own phone
+  // pairing, so the local sidecar must not run against a port that holds no
+  // BotFleet server.
+  if (serverMode === "remote") throw new Error(REMOTE_COMPANION_ERROR);
+  return startDesktopCompanion();
+});
 ipcMain.handle("companion:stop", () => stopDesktopCompanion());
 ipcMain.handle("companion:keep-awake", async (_event, enabled) => {
   rememberCompanionKeepAwake(Boolean(enabled));
@@ -1524,6 +2443,18 @@ ipcMain.handle("desktop:capabilities", async () =>
   }),
 );
 
+// Which build is running, for the settings panel. Answered from the live
+// process, so it always describes the app the user is actually looking at
+// rather than whatever was last installed.
+ipcMain.handle("desktop:app-info", () => {
+  const info = appRuntimeInfo({
+    version: app.getVersion(),
+    packaged: app.isPackaged,
+    harness: app.isPackaged ? harnessLabel() : "dev",
+  });
+  return { ...info, summary: appRuntimeSummary(info) };
+});
+
 ipcMain.handle("assemblyai:status", () => ({
   configured: Boolean(assemblyAICredential(secureCredentials)),
 }));
@@ -1546,17 +2477,95 @@ ipcMain.handle("assemblyai:streaming-token", () =>
   mintAssemblyAIStreamingToken(assemblyAICredential(secureCredentials)),
 );
 
+// Speech-to-speech call sessions.  Same rule as the transcription token above:
+// the renderer gets a short-lived, single-session token and never a permanent
+// key.  A provider with no key fails here rather than at socket-open time, so
+// the call view can say which key is missing.
+ipcMain.handle("sts:status", () => ({
+  xai: Boolean(xaiCredential(secureCredentials)),
+  gemini: Boolean(geminiCredential(secureCredentials)),
+}));
+
+// A call session being opened is the one measurable thing about its cost: the
+// audio flows from the renderer to the vendor and never through this process.
+// The harness holds the Usage Monitor connection, so it is told, and the call
+// never waits on it or fails because of it.
+function reportStsSession(provider) {
+  // A remote server is told through the shim; there is no local harness to
+  // report the session to.
+  const base = serverMode === "remote" ? rendererBaseUrl() : `http://127.0.0.1:${SERVER_PORT}`;
+  void fetch(`${base}/api/sts/session-started`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ provider }),
+    signal: AbortSignal.timeout(3000),
+  }).catch(() => {});
+}
+
+function isConfigObject(value) {
+  return value !== null && value !== undefined && !Array.isArray(value) && value === Object(value);
+}
+
+function desktopVoiceIsOff() {
+  // Same default-on rule as shared/voice-master.ts: absent or true means on.
+  // readConfigFile returns a boundary object from disk, so validate the
+  // nested tts object before treating voice as off.  Only the boolean
+  // `false` turns voice off; any other enabled value keeps the default on.
+  const config = readConfigFile(desktopConfigPath());
+  if (!isConfigObject(config)) return false;
+  const tts = config.tts;
+  if (tts === undefined) return false;
+  if (!isConfigObject(tts)) return false;
+  return tts.enabled === false;
+}
+
+ipcMain.handle("sts:xai-token", async () => {
+  if (desktopVoiceIsOff()) throw new Error("Voice is turned off in Settings.");
+  const minted = await mintXaiRealtimeToken(xaiCredential(secureCredentials));
+  reportStsSession("xai");
+  return minted;
+});
+
+ipcMain.handle("sts:gemini-token", async () => {
+  if (desktopVoiceIsOff()) throw new Error("Voice is turned off in Settings.");
+  const minted = await mintGeminiLiveToken(geminiCredential(secureCredentials));
+  reportStsSession("gemini");
+  return minted;
+});
+
 const CREDENTIAL_PATCH = {
   composioApiKey: (value) => ({ composio: { apiKey: value } }),
   xaiApiKey: (value) => ({ xai: { key: value } }),
+  // The STS panel offers Gemini beside xAI, so its key has to be settable
+  // through the same path.  Without this entry `credential:set` rejected the
+  // name with "Unsupported credential", so the panel named a key it could
+  // never be given and a fresh install was stuck with no Gemini calls at all.
+  geminiApiKey: (value) => ({ gemini: { key: value } }),
+  openaiCompatApiKey: (value) => ({ openaiCompat: { key: value } }),
+  minimaxApiKey: (value) => ({ minimax: { key: value } }),
   deepseekApiKey: (value) => ({ deepseek: { key: value } }),
   boxToken: (value) => ({ box: { token: value } }),
   opencodeGoApiKey: (value) => ({ opencodeGo: { apiKey: value } }),
-  ttsKey: (value) => ({ tts: { key: value } }),
+  // The provider is the card's, not a default this process invented: a key
+  // pasted into the ElevenLabs field must be verified as an ElevenLabs key,
+  // never relabelled as another engine's.  With no provider named at all the
+  // field still gets written explicitly, because the config reader must never
+  // have to guess which engine a stored key belongs to — that guess is what
+  // sent an ElevenLabs key to MiniMax in the first place.
+  ttsKey: (value, provider) => ({
+    tts: { key: value, provider: provider || "minimax" },
+  }),
   openaiImageApiKey: (value) => ({ imageGen: { key: value } }),
+  infisicalClientSecret: (value) => ({ infisical: { clientSecret: value } }),
+  infisicalReadToken: (value) => ({ infisical: { token: value } }),
+  infisicalWriteToken: (value) => ({ infisical: { writeToken: value } }),
 };
 
-ipcMain.handle("credential:set", async (_event, name, value) => {
+ipcMain.handle("credential:set", async (_event, name, value, provider) => {
+  refuseCredentialsInRemoteMode(serverMode);
+  if (name === "ttsKey" && provider !== undefined && !["minimax", "elevenlabs", "system"].includes(provider)) {
+    throw new Error("Unsupported voice engine");
+  }
   const patchFor = CREDENTIAL_PATCH[name];
   if (!patchFor || typeof value !== "string") {
     throw new Error("Unsupported credential");
@@ -1566,6 +2575,11 @@ ipcMain.handle("credential:set", async (_event, name, value) => {
   }
   const secret = value.trim();
   const applyToHarness = async () => {
+    // Local Keychain secrets are never copied to a remote server.  The
+    // handler refuses in remote mode before it gets here, so this is the
+    // backstop: it throws rather than returning a value the shared
+    // credential state would turn into the decrypted document.
+    if (serverMode === "remote") throw new Error(REMOTE_CREDENTIAL_ERROR);
     // In development the server is a separately launched process, so it
     // cannot receive credentials from Electron at boot. Keep its established
     // local config path there; production always uses the encrypted store.
@@ -1573,7 +2587,7 @@ ipcMain.handle("credential:set", async (_event, name, value) => {
     const response = await fetch(`http://127.0.0.1:${SERVER_PORT}/api/config${secretStorage}`, {
       method: "PUT",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify(patchFor(secret)),
+      body: JSON.stringify(patchFor(secret, provider)),
     });
     const body = await response.json().catch(() => null);
     if (!response.ok) throw new Error(body?.error || `Could not save credential (HTTP ${response.status})`);
@@ -1594,6 +2608,89 @@ ipcMain.handle("credential:set", async (_event, name, value) => {
   );
 });
 
+// A custom OpenAI-compatible engine is dynamic — created with whatever
+// instance id the operator's chosen name slugs to — so it cannot sit in
+// CREDENTIAL_PATCH's fixed union above. Same treatment (encrypt at rest,
+// apply live over loopback), keyed by instance id under its own
+// credentials.bin field instead of a top-level config section: PATCH
+// /api/instances/:id?secretStorage=external never writes the key to
+// config.json, applying it only to the live running instance's
+// environment (server/index.ts's instanceKeyOverrides).
+ipcMain.handle("credential:set-instance", async (_event, instanceId, value) => {
+  refuseCredentialsInRemoteMode(serverMode);
+  if (typeof instanceId !== "string" || !/^[\w.-]+$/.test(instanceId) || typeof value !== "string") {
+    throw new Error("Unsupported credential");
+  }
+  if (app.isPackaged && !(await safeStorage.isAsyncEncryptionAvailable())) {
+    throw new Error("The operating-system credential store is unavailable");
+  }
+  const secret = value.trim();
+  const applyToHarness = async () => {
+    // Local Keychain secrets are never copied to a remote server.  The
+    // handler refuses in remote mode before it gets here, so this is the
+    // backstop: it throws rather than returning a value the shared
+    // credential state would turn into the decrypted document.
+    if (serverMode === "remote") throw new Error(REMOTE_CREDENTIAL_ERROR);
+    // Dev/browser fallback: no desktop shell to replay this from at the next
+    // spawn, so the server's own PATCH persists the key in config.json —
+    // the same plaintext shape the create-time flow already falls back to.
+    const secretStorage = app.isPackaged ? "?secretStorage=external" : "";
+    const response = await fetch(
+      `http://127.0.0.1:${SERVER_PORT}/api/instances/${encodeURIComponent(instanceId)}${secretStorage}`,
+      {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ key: secret }),
+      },
+    );
+    const body = await response.json().catch(() => null);
+    if (!response.ok) throw new Error(body?.error || `Could not save credential (HTTP ${response.status})`);
+    return body;
+  };
+  if (!app.isPackaged) return applyToHarness();
+
+  return updateSecureCredentialDocument(
+    (credentials) => {
+      const instanceKeys = { ...credentials.instanceKeys };
+      if (secret) instanceKeys[instanceId] = secret;
+      else delete instanceKeys[instanceId];
+      return { ...credentials, instanceKeys };
+    },
+    applyToHarness,
+  );
+});
+
+/** Purge a deleted custom engine's key from the encrypted store ONLY — never
+ * touches the live harness. This is deliberately a different operation from
+ * credential:set-instance(id, ""): that one PATCHes the live instance
+ * (?secretStorage=external), which reloads that provider and settles any
+ * bot mid-turn on it as no-longer-busy. Calling it BEFORE deleting an
+ * engine silently defeated DELETE /api/instances/:id's own busy-bot guard;
+ * the renderer now deletes first and purges the encrypted store after, once
+ * the instance is already gone (server/index.ts's own DELETE handler drops
+ * the live, in-memory override itself). At that point a live PATCH would
+ * only 404 — there is nothing left to reload — so this handler skips it
+ * entirely and only ever touches credentials.bin. */
+ipcMain.handle("credential:clear-instance", async (_event, instanceId) => {
+  if (typeof instanceId !== "string" || !/^[\w.-]+$/.test(instanceId)) {
+    throw new Error("Unsupported credential");
+  }
+  // Dev/browser fallback never wrote this instance's key into the
+  // encrypted store in the first place (credential:set-instance's own
+  // dev-mode branch persists straight to config.json instead) — nothing to
+  // purge here.
+  if (!app.isPackaged) return;
+  if (!(await safeStorage.isAsyncEncryptionAvailable())) {
+    throw new Error("The operating-system credential store is unavailable");
+  }
+  await updateSecureCredentialDocument((credentials) => {
+    const instanceKeys = { ...credentials.instanceKeys };
+    delete instanceKeys[instanceId];
+    return { ...credentials, instanceKeys };
+  });
+});
+
+
 async function broadcastDesktopCapabilities() {
   const capabilities = desktopCapabilities({
     platform: process.platform,
@@ -1613,9 +2710,345 @@ setCuaStateListener((connection) => {
   });
 });
 
+function setupApplicationMenu() {
+  const isMac = process.platform === "darwin";
+
+  const sendToRenderer = (action, payload) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.show();
+      mainWindow.focus();
+      mainWindow.webContents.send("menu:action", action, payload);
+    }
+  };
+
+  // The menu shows the active server and offers an explicit startup choice.
+  const serverSubmenu = () => {
+    const mode = serverTarget?.mode ?? "local";
+    const origin = serverTarget?.origin ?? "";
+    const enrolled = serverTarget?.source === "infisical";
+    return [
+      {
+        label: "This Mac",
+        type: "radio",
+        checked: mode !== "remote",
+        enabled: false,
+      },
+      ...(mode === "remote" && origin
+        ? [
+            {
+              // The host alone names the server; a full URL gets cut off.
+              label: `Remote: ${serverMenuHost(origin)}`,
+              type: "radio",
+              checked: true,
+              enabled: false,
+            },
+          ]
+        : []),
+      { type: "separator" },
+      {
+        label: enrolled
+          ? "From Infisical"
+          : "Infisical Server Lookup Off",
+        enabled: false,
+      },
+      {
+        label: "Server Setup…",
+        click: () => reloadServerTargetFromInfisical({ forceChoice: true }).catch(() => {
+          dialog.showErrorBox("Server Setup Failed", "BotFleet could not save its startup choice.");
+        }),
+      },
+      {
+        label: "Reload From Infisical",
+        enabled: enrolled,
+        // The promise is returned so the smoke can wait for it; the catch is
+        // the backstop for a menu click nobody awaits, and it logs only the
+        // message, never a target or a token.
+        click: () =>
+          reloadServerTargetFromInfisical().catch((error) => {
+            slog(`the reload from Infisical failed: ${error instanceof Error ? error.message : "unknown error"}`);
+          }),
+      },
+    ];
+  };
+
+  const template = [
+    ...(isMac
+      ? [
+          {
+            label: "BotFleet",
+            submenu: [
+              { label: "About BotFleet", role: "about" },
+              { type: "separator" },
+              {
+                label: "Settings...",
+                accelerator: "CmdOrCtrl+,",
+                click: () => sendToRenderer("open-settings"),
+              },
+              // "<Section Name>  (<descriptor>...)" — the leading word is the
+              // section's own name in Settings (SETTINGS_SECTIONS in
+              // src/components/SettingsNav.tsx) so the menu and the in-app
+              // sidebar agree, and every id below must be a real
+              // AppSettingsSection. There is no "keys" section: API keys live
+              // in Connections, which is why both key entries land there.
+              {
+                label: "Connections  (API Keys, Models & Ingress...)",
+                click: () => sendToRenderer("open-settings", { section: "connections" }),
+              },
+              {
+                label: "Phone  (Companion Access...)",
+                click: () => sendToRenderer("open-settings", { section: "companion" }),
+              },
+              {
+                label: "Engines  (CLIs...)",
+                click: () => sendToRenderer("open-settings", { section: "engines" }),
+              },
+              {
+                label: "Usage  (Token Spend...)",
+                click: () => sendToRenderer("open-settings", { section: "usage" }),
+              },
+              { label: "Server", submenu: serverSubmenu() },
+              { type: "separator" },
+              { role: "services" },
+              { type: "separator" },
+              { role: "hide" },
+              { role: "hideOthers" },
+              { role: "unhide" },
+              { type: "separator" },
+              { role: "quit" },
+            ],
+          },
+        ]
+      : []),
+    {
+      label: "File",
+      submenu: [
+        {
+          label: "New Task / Thread",
+          accelerator: "CmdOrCtrl+T",
+          click: () => sendToRenderer("new-task"),
+        },
+        {
+          label: "New Bot...",
+          accelerator: "CmdOrCtrl+N",
+          click: () => sendToRenderer("new-bot"),
+        },
+        {
+          label: "New Channel...",
+          accelerator: "CmdOrCtrl+Shift+N",
+          click: () => sendToRenderer("new-channel"),
+        },
+        { type: "separator" },
+        {
+          label: "Export Bots\u2026",
+          click: () => sendToRenderer("export-bots"),
+        },
+        {
+          label: "Import Bots\u2026",
+          click: () => sendToRenderer("import-bots"),
+        },
+        {
+          // Export only: a transcript is tied to thread ids and provider
+          // sessions from the machine that made it, so an imported one
+          // would be a conversation no bot could continue.
+          label: "Export All Conversations\u2026",
+          click: () => sendToRenderer("export-conversations"),
+        },
+        { type: "separator" },
+        {
+          label: "Open Data Folder",
+          click: () => shell.openPath(DATA_DIR),
+        },
+        ...(isMac ? [{
+          label: "Server Controls…",
+          click: () => openServerControls({
+            source: app.isPackaged ? path.join(process.resourcesPath, "BotFleet Control.app") : fileURLToPath(new URL("./resources/BotFleet Control.app", import.meta.url)),
+            shell,
+            dialog,
+          }),
+        }] : []),
+        ...(isMac ? [{ label: "Update Control…", click: () => performControlUpdate() }] : []),
+        // On macOS the Server submenu lives in the app-name menu, so it is
+        // not repeated here; every other platform has no app-name menu and
+        // gets it under File instead.
+        ...(!isMac ? [{ label: "Server", submenu: serverSubmenu() }] : []),
+        { type: "separator" },
+        isMac ? { role: "close" } : { role: "quit" },
+      ],
+    },
+    {
+      label: "Edit",
+      submenu: [
+        { role: "undo" },
+        { role: "redo" },
+        { type: "separator" },
+        { role: "cut" },
+        { role: "copy" },
+        { role: "paste" },
+        { role: "pasteAndMatchStyle" },
+        { role: "delete" },
+        { role: "selectAll" },
+      ],
+    },
+    {
+      label: "View",
+      submenu: [
+        {
+          label: "Chat & Threads",
+          accelerator: "CmdOrCtrl+1",
+          click: () => sendToRenderer("view-chat"),
+        },
+        {
+          label: "Automations & Routines",
+          accelerator: "CmdOrCtrl+2",
+          click: () => sendToRenderer("view-routines"),
+        },
+        {
+          label: "Resource Triggers",
+          click: () => sendToRenderer("view-triggers"),
+        },
+        {
+          label: "Computer Control (Local VM)",
+          click: () => sendToRenderer("view-computer"),
+        },
+        {
+          label: "Skills & Plugins",
+          click: () => sendToRenderer("view-plugins"),
+        },
+        { type: "separator" },
+        { role: "reload" },
+        { role: "forceReload" },
+        { role: "toggleDevTools" },
+        { type: "separator" },
+        { role: "resetZoom" },
+        { role: "zoomIn" },
+        { role: "zoomOut" },
+        { type: "separator" },
+        { role: "togglefullscreen" },
+      ],
+    },
+    {
+      label: "Window",
+      submenu: [
+        { role: "minimize" },
+        { role: "zoom" },
+        ...(isMac
+          ? [
+              { type: "separator" },
+              { role: "front" },
+              { type: "separator" },
+              { role: "window" },
+            ]
+          : [{ role: "close" }]),
+      ],
+    },
+    {
+      role: "help",
+      submenu: [
+        {
+          label: "BotFleet Documentation",
+          click: () => shell.openExternal("https://github.com/Simple-With-Us/BotFleet"),
+        },
+        {
+          label: "Open Logs Folder",
+          click: () => shell.openPath(LOG_DIR),
+        },
+      ],
+    },
+  ];
+
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+}
+
 app.whenReady().then(async () => {
-  if (app.isPackaged) {
-    app.setAsDefaultProtocolClient("botfleet");
+  // A Control-only update must not clear a deliberate server stop, start a
+  // server, or load/migrate account credentials as ordinary app launch does.
+  if (process.argv.includes(UPDATE_CONTROL_ARGUMENT)) {
+    await performControlUpdate();
+    app.exit(0);
+    return;
+  }
+  // A deliberate shutdown writes a sentinel so launchd's periodic tick leaves
+  // the harness alone.  Launching the app is the documented way back, so clear
+  // it first — before anything here tries to reach a server, so the request
+  // below is never made against a marker that says "stay down".
+  if (!wantsSafeStorageExport(process.argv) && !updateCredentialPreparationPath) {
+    recordExplicitStartupSession();
+    clearHarnessShutdownMarker();
+  }
+  if (wantsSafeStorageExport(process.argv)) {
+    try {
+      const result = await readSecureCredentials({
+        exists: () => fs.existsSync(CREDENTIALS_FILE),
+        isAvailable: () => safeStorage.isAsyncEncryptionAvailable(),
+        readFile: () => fs.readFileSync(CREDENTIALS_FILE),
+        decrypt: (buffer) => safeStorage.decryptStringAsync(buffer),
+        sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+      });
+      if (result.status === "unavailable") {
+        throw new Error(result.error || "the operating-system credential store could not be read");
+      }
+      const dest = safeStorageMigrationFile();
+      const temporary = `${dest}.${process.pid}.tmp`;
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.writeFileSync(temporary, JSON.stringify(result.credentials), { mode: 0o600 });
+      fs.renameSync(temporary, dest);
+      app.exit(0);
+    } catch (error) {
+      console.error(`[desktop] safeStorage export failed: ${error instanceof Error ? error.message : error}`);
+      app.exit(1);
+    }
+    return;
+  }
+  if (updateCredentialPreparationPath) {
+    try {
+      if (!app.isPackaged) throw new Error("Credential preparation requires an installed BotFleet build");
+      secureCredentials = await loadSecureCredentials();
+      // Preparation is rollback-safe metadata work only.  Do not move or
+      // delete legacy plaintext secrets before the candidate harness proves
+      // it can start; regular desktop startup performs those migrations.
+      const markers = secureCredentialMarkers({ strict: true });
+      const build = readPackagedBuildIdentity(path.join(process.resourcesPath, "server"));
+      writeUpdateCredentialReceipt(
+        updateCredentialPreparationPath,
+        createUpdateCredentialReceipt(build, markers.markerNames),
+      );
+      app.exit(0);
+    } catch {
+      console.error("[desktop] update credential preparation failed");
+      app.exit(1);
+    }
+    return;
+  }
+  setupApplicationMenu();
+  // Resolve the explicit startup choice before any credential preparation.
+  let serverTargetRead = app.isPackaged
+    ? await readStartupServerTarget().catch((error) => serverTargetFailure(error))
+    : null;
+  // A saved choice that cannot be used (a remote choice whose bootstrap token
+  // is gone, say) offers Server Setup instead of failing the same way on
+  // every launch.
+  if (serverTargetRead?.mode === "error" && !serverMenuSmokeEnabled()) {
+    const { response } = await dialog.showMessageBox({
+      type: "error",
+      title: "BotFleet Could Not Complete Server Setup",
+      message: serverTargetRead.message,
+      buttons: ["Open Server Setup", "Quit"],
+      defaultId: 0,
+      cancelId: 1,
+      noLink: true,
+    });
+    if (response === 0) {
+      serverTargetRead = await readStartupServerTarget({ forceChoice: true }).catch((error) => serverTargetFailure(error));
+    }
+  }
+  if (serverTargetRead?.mode === "cancelled" || serverTargetRead?.mode === "error") {
+    if (serverTargetRead.mode === "error" && serverMenuSmokeEnabled()) {
+      await writeServerMenuSmokeReport({ ...serverMenuSmokeReport(), error: serverTargetRead.message });
+    }
+    app.quit();
+    return;
+  }
+  if (app.isPackaged && process.env.OMB_SMOKE_SERVER_MENU !== "1" && process.env.OMB_SMOKE_TEST !== "1") {
     app.setAsDefaultProtocolClient("botfleet");
   }
   // if (process.platform === "darwin") app.dock.setIcon(APP_ICON);
@@ -1624,10 +3057,22 @@ app.whenReady().then(async () => {
   tray = new Tray(trayIcon);
   tray.setToolTip("BotFleet");
   tray.setContextMenu(Menu.buildFromTemplate([
+    ...(process.platform === "darwin" ? [{ label: "Server Controls…", click: () => openServerControls({
+      source: app.isPackaged ? path.join(process.resourcesPath, "BotFleet Control.app") : fileURLToPath(new URL("./resources/BotFleet Control.app", import.meta.url)),
+      shell,
+      dialog,
+    }) }] : []),
     { label: "Show BotFleet", click: () => {
         if (app.dock) app.dock.show();
         if (BrowserWindow.getAllWindows().length === 0) createWindow();
         else { mainWindow?.show(); mainWindow?.focus(); }
+      }
+    },
+    { type: "separator" },
+    { label: "Settings...", click: () => {
+        if (BrowserWindow.getAllWindows().length === 0) createWindow();
+        else { mainWindow?.show(); mainWindow?.focus(); }
+        mainWindow?.webContents.send("menu:action", "open-settings");
       }
     },
     { type: "separator" },
@@ -1638,6 +3083,20 @@ app.whenReady().then(async () => {
   if (app.isPackaged) {
     await secureComposioConfig();
     await secureWorkspaceConfig();
+    // Boot migration: rewrite the legacy `botDefaults.allowedComputers`
+    // onto the new `botDefaults.computerProviders` + `vpsMode` fields
+    // the redesigned Computer settings UI writes.  Runs after the
+    // credential sweep so the lock's serializer does not see the file
+    // mutated twice in quick succession on the same launch.
+    migrateComputerProviders();
+    if (!secureCredentialMarkers().ok) {
+      dialog.showErrorBox(
+        "BotFleet could not protect saved custom-engine credentials",
+        "BotFleet could not update its local credential metadata.  Close other BotFleet processes and reopen the app.",
+      );
+      app.quit();
+      return;
+    }
   }
   // Boot migrations above are deliberately sequential. From this point on,
   // every account/API-key writer must use the shared serialized state.
@@ -1711,16 +3170,57 @@ app.whenReady().then(async () => {
           return { mode: "unavailable", reason: String(e) };
         })
       : Promise.resolve({ mode: "unavailable", reason: "unsupported-platform" });
-  if (app.isPackaged) serverReady = await startServerPackaged();
+  if (app.isPackaged) {
+    // The startup choice has settled before any local server can start.
+    const target = serverTargetRead;
+    serverTarget = target;
+    smokeStep(`server target ${target.mode} (${target.source})`);
+    if (target.legacyFile) {
+      slog("server-target.json is no longer read.\u00a0 Use Server Setup to choose this Mac or enrolled Infisical server settings.");
+    }
+    if (target.mode === "error") {
+      // The vault could not be read, or what it says is unusable.  Falling
+      // back to the server on this Mac would talk to a different server than
+      // the owner configured, so the launch stops with the reason instead.
+      slog(`server target: ${target.message}`);
+      if (serverMenuSmokeEnabled()) {
+        await writeServerMenuSmokeReport({ ...serverMenuSmokeReport(), error: target.message });
+      } else {
+        dialog.showErrorBox("BotFleet cannot read its server settings from Infisical", target.message);
+      }
+      app.quit();
+      return;
+    }
+    if (target.mode === "remote") serverReady = await startRemoteServer(target.origin, target.token ?? "");
+    else serverReady = await startServerPackaged();
+    smokeStep(`server settled (ready ${serverReady})`);
+    // The Server menu shows where the app is pointed, so it is built again
+    // once the server it talks to is settled.
+    setupApplicationMenu();
+  }
   // The companion the user left on comes back without anyone finding the
   // toggle again — one attempt, after the harness port is settled, with the
   // exact options the IPC handler uses. A failure surfaces in companionState
   // (the panel shows the error) rather than retrying; and it never delays
-  // the window.
-  if (serverReady && companionEnabledAtRest()) {
+  // the window.  A remote server has its own phone pairing, so the local
+  // sidecar stays off.
+  if (serverReady && serverMode !== "remote" && companionEnabledAtRest()) {
     void startDesktopCompanion({ waitForHosted: false, remember: false });
   }
   const win = createWindow();
+  if (updateStartupReceiptPath) {
+    try {
+      if (!app.isPackaged || !serverReady) throw new Error("Desktop startup is incomplete");
+      const build = readPackagedBuildIdentity(path.join(process.resourcesPath, "server"));
+      writeDesktopStartupReceipt(updateStartupReceiptPath, build, {
+        pid: process.pid, mode: serverMode === "remote" ? "remote" : "local", uiPort: desktopStartupUiPort(rendererBaseUrl()),
+      });
+    } catch {
+      console.error("[desktop] update startup confirmation failed");
+      app.quit();
+      return;
+    }
+  }
   // Reconcile incomplete setup and resume interrupted sign-out only after the
   // local app is usable. This background network work never gates LAN pairing
   // or the first window.
@@ -1734,7 +3234,9 @@ app.whenReady().then(async () => {
   if (credentialStoreUnavailable) {
     slog("skipping connected-apps registration: the credential store was unreadable this launch");
   }
-  if (app.isPackaged && composioBrokerUrl() && !credentialStoreUnavailable) {
+  // Connected Apps live on the server this app talks to; a remote server
+  // registers its own, so nothing is pushed into a local harness here.
+  if (app.isPackaged && serverMode !== "remote" && composioBrokerUrl() && !credentialStoreUnavailable) {
     void updateSecureCredentialDocument(async (credentials) => {
       await ensureManagedComposioCredentials({
         brokerUrl: composioBrokerUrl(),
@@ -1743,9 +3245,17 @@ app.whenReady().then(async () => {
         // write after this registration has derived its complete document.
         saveCredentials: async () => {},
         log: slog,
+        report: (setup) => {
+          managedComposioSetup = setup;
+        },
       });
       return credentials;
     }).finally(syncManagedComposioCredentials);
+  } else if (app.isPackaged && !composioBrokerUrl()) {
+    // No broker configured: tell the server so the UI says "not configured"
+    // rather than "temporarily unavailable, restart to retry".
+    managedComposioSetup = { status: "unconfigured" };
+    syncManagedComposioCredentials();
   }
   // in-app auto-update (packaged only) — checks GitHub releases, downloads on
   // the user's click, installs on "Restart to update"
@@ -1756,10 +3266,8 @@ app.whenReady().then(async () => {
 });
 
 app.on("window-all-closed", () => {
-  if (process.platform === "darwin" && app.dock) {
-    app.dock.hide();
-    return;
-  }
+  // Background controls live in the independent native app.  Closing the
+  // desktop must release Electron, its helpers and its sleep blocker.
   app.quit();
 });
 
@@ -1784,17 +3292,124 @@ const requestSignalQuit = () => {
 process.once("SIGINT", requestSignalQuit);
 process.once("SIGTERM", requestSignalQuit);
 
+// Whether the always-on harness should outlive this window.
+//
+// This reads the config file directly rather than importing the server's
+// config module: main.mjs is plain ESM and server/config.ts is TypeScript, and
+// pulling a transpile step into the Electron entry point to read one boolean
+// is not a trade worth making.  The field is a plain boolean with one
+// documented default, so reading it is safe; a malformed or missing file
+// falls back to the same answer as an absent field.
+//
+// Absent means TRUE on purpose.  The harness is launchd-supervised and is
+// documented as always-on, and every paired phone depends on it still
+// answering after the window closes, so "not configured" must never be read
+// as "shut it all down".  Turning it off is always a deliberate act.
+function serverPersistsOnExit() {
+  try {
+    const dir = botfleetDataDir();
+    const policy = readPersistOnExitPolicy(dir);
+    if (policy !== null) return policy;
+    const parsed = JSON.parse(fs.readFileSync(path.join(dir, "config.json"), "utf8"));
+    return parsed?.server?.persistOnExit !== false;
+  } catch {
+    return true;
+  }
+}
+
+// Ask the harness we are attached to stop cleanly, so it writes the sentinel
+// the launchd wrapper reads.  Without that marker the five-minute tick treats
+// the exit as a crash and brings the harness straight back, which is what
+// makes a quiet "shut it down" impossible today.
+//
+// Fire and forget by design: this runs during quit, the app is going away
+// regardless, and the harness's own reply is not something anyone is left to
+// read.  A refused connection means it was already gone.
+//
+// SERVER_PORT, not process.env.OMB_PORT: OMB_PORT is what this process hands
+// a harness it forks itself, and it is unset whenever we attached to one that
+// launchd started.  SERVER_PORT is the port we actually talked to, and it is
+// already a number — reading it also removes the NaN case a non-numeric OMB_PORT
+// would produce here.
+function requestAttachedHarnessShutdown() {
+  return shutdownAttachedServer(SERVER_PORT).catch((error) => {
+    dialog.showErrorBox(
+      "Could Not Confirm Server Shutdown",
+      `The server or a Local VM may still be running.\u00a0 ${error instanceof Error ? error.message : String(error)}`,
+    );
+  });
+}
+
+// Clear the "stopped on purpose" sentinel when the app starts, which is the
+// other half of what POST /api/system/shutdown promises: the marker text and
+// the docs both say "launch the BotFleet app to let it come back", and without
+// this the app would launch into a permanently blocked harness.
+//
+// Safe to do unconditionally on launch, and the ordering is the reason.  The
+// launchd wrapper reads this marker itself and exits 0 while it exists, so a
+// periodic tick never reaches the harness and never runs this code.  This only
+// runs when a person actually opened the app -- BotFleet is not a login item,
+// and even if it became one, the wrapper would still be the thing refusing to
+// start a server, which is the decision we want to honour only on a real
+// launch.  A manual run of the wrapper clears it too, so there are two ways
+// back and neither depends on the other.
+function clearHarnessShutdownMarker() {
+  const marker = path.join(botfleetDataDir(), "stopped.marker");
+  try {
+    fs.rmSync(marker, { force: true });
+  } catch {
+    // Already gone, or a path we cannot touch.  Either way the app launching
+    // is the intent, and the wrapper treats a missing marker as "start".
+  }
+}
+
+function recordExplicitStartupSession() {
+  if (process.platform !== "darwin") return;
+  // BF_CONTROL_STARTUP_POLICY_V1: a direct app launch allows this boot even
+  // when login startup is disabled.  Marker absence keeps default behavior.
+  const dir = botfleetDataDir();
+  try {
+    const current = process.env.BOTFLEET_BOOT_SESSION_OVERRIDE
+      || execFileSync("/usr/sbin/sysctl", ["-n", "kern.bootsessionuuid"], { encoding: "utf8" }).trim();
+    if (!current) throw new Error("boot session is empty");
+    const sessionPath = process.env.BOTFLEET_STARTUP_SESSION ?? path.join(dir, "startup-session");
+    fs.mkdirSync(path.dirname(sessionPath), { recursive: true });
+    fs.writeFileSync(sessionPath, `${current}\n`, { mode: 0o600 });
+  } catch (error) {
+    console.error("Could not record explicit server start for this boot:", error);
+  }
+}
+
 app.on("before-quit", (e) => {
+  credentialRestoreStopped = true;
+  clearTimeout(credentialRestoreTimer);
   if (cuaCleanedUp) return;
   e.preventDefault();
   try {
+    // serverProc is null when attached — the always-on harness outlives us.
     serverProc?.kill();
+  } catch {}
+  // …unless the owner asked for the harness to go down with the window.  Only
+  // meaningful when we did not spawn it ourselves: a child we own is already
+  // killed above, and asking the harness to shut down would be asking a process
+  // that is already dead.  See serverPersistsOnExit() for why absent means yes.
+  // A remote server is never stopped by the desktop app: it is not ours to
+  // stop, and it may well be serving another machine.
+  const stopAttachedHarness =
+    serverMode === "remote" || serverProc || serverPersistsOnExit()
+      ? Promise.resolve()
+      : requestAttachedHarnessShutdown();
+  try {
+    uiShim?.close();
   } catch {}
   // Release the sleep blocker synchronously; child shutdown is awaited below.
   syncCompanionKeepAwake(false, false);
   // a live dictation session runs its own helper child that holds the mic —
   // stop it here so quitting never orphans a recording process
   if (nativeActions.appleSpeech) stopSpeech();
+  // a speaking Personal Voice helper parks in its own run loop until the stop
+  // marker appears; write it so quitting never leaves one behind
+  if (nativeActions.appleSpeech) stopPersonalVoice();
   stopRecorder();
   const cleanup = Promise.race([
     Promise.all([
@@ -1803,6 +3418,10 @@ app.on("before-quit", (e) => {
       // Shut the connector down first, then the sidecar, without changing the
       // remembered toggle the next launch will restore.
       stopDesktopCompanion({ remember: false }).catch(() => {}),
+      // Asked for, not forced, and it does not outrank the app exiting: a
+      // harness that is already gone answers with a refused connection, which
+      // is a perfectly good outcome for something we are shutting down anyway.
+      stopAttachedHarness.catch(() => {}),
     ]),
     new Promise((resolve) => setTimeout(resolve, CUA_STOP_TIMEOUT_MS).unref()),
   ]);

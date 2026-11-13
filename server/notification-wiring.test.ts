@@ -3,15 +3,16 @@
 // stream. A generic `done` frame for the same failure would produce two desktop
 // notifications, so the marker PATCH below is an ordering barrier before the
 // exact emitted set is asserted.
-import { spawn, type ChildProcess } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { removeTempDir, waitForExit } from "./testing/cleanup.ts";
+import { removeTempDir, spawnDetached, waitForExit } from "./testing/cleanup.ts";
 import { openSse } from "./testing/sse.ts";
+import { harnessReady } from "./testing/harness-ready.ts";
 
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
 const FAKE_CLI = join(SERVER_DIR, "testing", "fake-acp-cli.ts");
@@ -34,7 +35,7 @@ interface RoutineBody {
   name: string;
   prompt: string;
   botId: string;
-  runOn: "maus";
+  runOn: "bot";
   schedule: { type: "once"; at: number };
 }
 
@@ -59,6 +60,7 @@ posixOnly("routine failure notification wiring", () => {
     writeFileSync(
       join(home, ".botfleet", "config.json"),
       JSON.stringify({
+        conversationMode: "projects",
         instances: {
           grok: {
             driver: "grokAgent",
@@ -82,7 +84,7 @@ posixOnly("routine failure notification wiring", () => {
     if (process.env.PATH) env.PATH = process.env.PATH;
     if (process.env.SystemRoot) env.SystemRoot = process.env.SystemRoot;
 
-    child = spawn(process.execPath, [join(SERVER_DIR, "index.ts")], {
+    child = spawnDetached(process.execPath, [join(SERVER_DIR, "index.ts")], {
       cwd: join(SERVER_DIR, ".."),
       env,
       stdio: ["ignore", "pipe", "pipe"],
@@ -92,7 +94,7 @@ posixOnly("routine failure notification wiring", () => {
     const deadline = Date.now() + 20_000;
     for (;;) {
       try {
-        if ((await fetch(`${BASE}/api/health`)).ok) break;
+        if (await harnessReady(BASE)) break;
       } catch {
         /* not up yet */
       }
@@ -126,7 +128,7 @@ posixOnly("routine failure notification wiring", () => {
         name: "Broken nightly report",
         prompt: "Prepare the report",
         botId: bot.id,
-        runOn: "maus",
+        runOn: "bot",
         schedule: { type: "once", at: Date.now() + 60_000 },
       });
       expect(created.status).toBe(201);
@@ -149,7 +151,11 @@ posixOnly("routine failure notification wiring", () => {
           botId: bot.id,
           title: "Routine Scout's routine failed",
         });
-        expect(frame.notification.threadId).not.toBe(bot.threadId);
+        // The wake now reuses the bot's primary conversation instead of
+        // minting a sibling thread (see RoutineManager#executeOnce), so the
+        // failure attaches to the chat the user is already looking at and
+        // the receipts endpoint reports the same thread.
+        expect(frame.notification.threadId).toBe(bot.threadId);
         expect(frame.notification.body).toContain("Broken nightly report");
 
         const receipts = await api("GET", "/api/routines");
@@ -157,7 +163,7 @@ posixOnly("routine failure notification wiring", () => {
         expect(receipt).toMatchObject({
           status: "failed",
           botId: bot.id,
-          threadId: frame.notification.threadId,
+          threadId: bot.threadId,
         });
 
         // A unique bot patch is an SSE ordering barrier: by the time it is

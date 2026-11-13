@@ -184,7 +184,7 @@ export function SkillRecorderPage() {
       return;
     }
     if (!transcriptionConfigured || !window.ogb.transcription) {
-      setError("Add your AssemblyAI key under Cloud transcription before recording.");
+      setError("Add your AssemblyAI key under Cloud Transcription before recording.");
       return;
     }
     const nextPermission = await bridge.permissions();
@@ -351,8 +351,8 @@ export function SkillRecorderPage() {
       <video ref={videoRef} muted playsInline className="pointer-events-none absolute size-px opacity-0" />
       <header className="flex h-[60px] shrink-0 items-center justify-between border-b border-hairline px-6">
         <div>
-          <h1 className="text-[15px] font-semibold">Teach a skill</h1>
-          <p className="text-[11px] text-ink-secondary">Show it once. Let every bot repeat it.</p>
+          <h1 className="text-[15px] font-semibold">Teach a Skill</h1>
+          <p className="text-[11px] text-ink-secondary">Show it once.{"\u00a0 "}Let every bot repeat it.</p>
         </div>
         {recording && (
           <button type="button" onClick={() => void stop()} className="flex items-center gap-2 rounded-full bg-danger px-4 py-2 text-[12px] font-semibold text-white shadow-sm">
@@ -399,7 +399,7 @@ export function SkillRecorderPage() {
                   <span className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-accent/12 text-accent-text"><Cloud size={17} /></span>
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-2 text-[13px] font-medium">
-                      Cloud transcription
+                      Cloud Transcription
                       {transcriptionConfigured && <span className="text-[10px] font-medium text-success">Saved</span>}
                     </div>
                     <p className="mt-0.5 text-[11px] leading-4 text-ink-secondary">
@@ -416,7 +416,7 @@ export function SkillRecorderPage() {
                 </div>
 
                 <button type="button" disabled={phase === "starting" || !transcriptionConfigured} onClick={() => void start()} className="mt-6 flex w-full items-center justify-center gap-2 rounded-2xl bg-accent px-5 py-3.5 text-[14px] font-semibold text-white hover:brightness-110 disabled:opacity-40">
-                  {phase === "starting" ? <><Circle size={15} className="animate-pulse" /> Getting ready…</> : <><Circle size={14} fill="currentColor" /> Start recording</>}
+                  {phase === "starting" ? <><Circle size={15} className="animate-pulse" /> Getting ready…</> : <><Circle size={14} fill="currentColor" /> Start Recording</>}
                 </button>
                 <p className="mt-3 text-center text-[11px] text-ink-secondary">macOS will ask for screen, microphone, and action-recording access the first time.</p>
               </div>
@@ -451,7 +451,7 @@ export function SkillRecorderPage() {
                   <h2 className="mt-1 text-[24px] font-semibold tracking-[-0.02em]">Review what the bot learned</h2>
                   <p className="mt-1 text-[13px] text-ink-secondary">Remove anything private or irrelevant, then name the skill.</p>
                 </div>
-                <button type="button" onClick={() => void discard()} className="flex items-center gap-2 rounded-xl px-3 py-2 text-[12px] text-ink-secondary hover:bg-raised"><Trash2 size={15} /> Discard recording</button>
+                <button type="button" onClick={() => void discard()} className="flex items-center gap-2 rounded-xl px-3 py-2 text-[12px] text-ink-secondary hover:bg-raised"><Trash2 size={15} /> Discard Recording</button>
               </div>
 
               <div className="mt-6 grid gap-6 lg:grid-cols-[minmax(0,1fr)_300px]">
@@ -471,18 +471,18 @@ export function SkillRecorderPage() {
                           <span className="flex size-8 shrink-0 items-center justify-center rounded-xl bg-card text-ink-secondary"><Icon size={15} /></span>
                           <div className="min-w-0 flex-1">
                             <div className="text-[12px] font-medium">{index + 1}. {eventLabel(event)}</div>
-                            <div className="truncate text-[10.5px] text-ink-secondary">{context}</div>
+                            <div className="truncate text-[10.5px] text-ink-secondary" title={context}>{context}</div>
                           </div>
                           <button type="button" aria-label={`Remove step ${index + 1}`} onClick={() => removeEvent(event.id)} className="rounded-lg p-2 text-ink-secondary opacity-60 hover:bg-raised hover:text-danger group-hover:opacity-100"><X size={14} /></button>
                         </div>
                       </article>
                     );
                   })}
-                  {!events.length && <div className="rounded-2xl border border-dashed border-hairline p-8 text-center text-[12px] text-ink-secondary">No action steps remain. The narration can still become the skill.</div>}
+                  {!events.length && <div className="rounded-2xl border border-dashed border-hairline p-8 text-center text-[12px] text-ink-secondary">No action steps remain.{"\u00a0 "}The narration can still become the skill.</div>}
                 </section>
 
                 <aside className="h-fit rounded-2xl border border-hairline bg-panel p-5 lg:sticky lg:top-0">
-                  <label className="block text-[11px] font-medium text-ink-secondary" htmlFor="skill-name">Skill name</label>
+                  <label className="block text-[11px] font-medium text-ink-secondary" htmlFor="skill-name">Skill Name</label>
                   <input id="skill-name" value={name} onChange={(event) => setName(event.target.value)} placeholder="e.g. File an expense report" maxLength={100} className="mt-2 w-full rounded-xl border border-hairline bg-inset px-3 py-2.5 text-[13px] outline-none placeholder:text-ink-secondary/60 focus:border-accent" />
                   <label className="mt-4 block text-[11px] font-medium text-ink-secondary" htmlFor="skill-description">When should bots use it?</label>
                   <textarea id="skill-description" value={description} onChange={(event) => setDescription(event.target.value)} placeholder="Use when I ask to submit a company expense…" maxLength={300} rows={4} className="mt-2 w-full resize-none rounded-xl border border-hairline bg-inset px-3 py-2.5 text-[12px] leading-5 outline-none placeholder:text-ink-secondary/60 focus:border-accent" />
@@ -492,7 +492,7 @@ export function SkillRecorderPage() {
                     <div className="flex items-center justify-between"><span className="flex items-center gap-2"><ShieldCheck size={13} /> Storage</span><span>Local</span></div>
                   </div>
                   <button type="button" disabled={!name.trim() || phase === "saving"} onClick={() => void save()} className="mt-5 flex w-full items-center justify-center gap-2 rounded-xl bg-accent px-4 py-3 text-[13px] font-semibold text-white disabled:opacity-40">
-                    <Sparkles size={15} /> {phase === "saving" ? "Creating skill…" : "Create skill"}
+                    <Sparkles size={15} /> {phase === "saving" ? "Creating skill…" : "Create Skill"}
                   </button>
                 </aside>
               </div>
@@ -500,13 +500,13 @@ export function SkillRecorderPage() {
           ) : (
             <div className="mx-auto max-w-xl rounded-3xl border border-hairline bg-panel p-9 text-center">
               <div className="mx-auto flex size-14 items-center justify-center rounded-full bg-success/15 text-success"><Check size={27} /></div>
-              <h2 className="mt-5 text-[25px] font-semibold">Skill ready</h2>
+              <h2 className="mt-5 text-[25px] font-semibold">Skill Ready</h2>
               <p className="mt-2 text-[13px] leading-5 text-ink-secondary">Bots will load <span className="text-ink">{name}</span> automatically when a request matches it.</p>
               <div className="mt-5 rounded-2xl bg-inset p-4 text-left">
                 <div className="text-[10px] font-medium uppercase tracking-[0.12em] text-ink-secondary">Saved locally</div>
                 <div className="mt-1 break-all text-[11px] text-ink">{saved?.path}</div>
               </div>
-              <button type="button" onClick={restart} className="mt-6 rounded-xl bg-raised px-5 py-2.5 text-[13px] font-medium hover:bg-raised-hover">Teach another skill</button>
+              <button type="button" onClick={restart} className="mt-6 rounded-xl bg-raised px-5 py-2.5 text-[13px] font-medium hover:bg-raised-hover">Teach Another Skill</button>
             </div>
           )}
 

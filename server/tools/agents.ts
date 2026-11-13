@@ -1,0 +1,590 @@
+// The agents tools' one implementation.
+//
+// `createAgentTools(deps)` takes EVERY dependency explicitly.  That is not
+// style: `server/tools/*` must never import `server/index.ts`, because
+// `index.ts` imports the tool modules and the cycle that made was how the
+// old `tool-executor.ts` ended up with its own private copy of the
+// `list_bots` filter — one that offered a bot its own row and hid `busy`.
+// With the dependencies injected there is nowhere for a second copy to
+// live: the host and the `/api/internal/` endpoints call the same
+// functions, and `registry.test.ts` asserts no file here reaches `index.ts`.
+//
+// Caller identity arrives in `AgentToolCallContext`, which only the turn
+// tool host constructs.  The HTTP lane bypasses the loopback + COMMS_TOKEN
+// hop the MCP lane uses, so a `fromBotId` in the model's arguments is
+// ignored everywhere below — the turn's own identity is the only one that
+// reaches an endpoint function.
+
+import { z } from "zod";
+
+import { joinRefusals } from "../../shared/peer-refusals.ts";
+import { inboundText, signInReason, signInSite } from "../../shared/sign-in-request.ts";
+import type { TurnToolCall, TurnToolOutcome, TurnToolRuntime } from "../contracts.ts";
+import { sectionKey } from "../store.ts";
+import { MAX_CREATED_BOTS_PER_TURN } from "./registry.ts";
+import { routineFields } from "./schedule.ts";
+
+/** The slice of a bot record the agents tools read.  Structural on purpose,
+ *  so this module never has to know what a full bot is. */
+export interface AgentBot {
+  id: string;
+  name: string;
+  section?: string | null;
+  hidden?: boolean;
+  /** Switched Off (shared/bot-power.ts): visible, but takes no new work. */
+  off?: boolean;
+  busy?: boolean;
+  title?: string | null;
+  description?: string | null;
+  modelSelection: { model: string };
+}
+
+/** One row of the peer roster, as both lanes see it. */
+export interface AgentPeerRow {
+  id: string;
+  name: string;
+  model: string;
+  busy: boolean;
+  /** `true` only when the peer is switched Off (absent otherwise, and dropped
+   *  from the JSON): ask_bot and delegate_bot refuse it, so a model should pick
+   *  someone else. */
+  off?: true;
+  title?: string;
+  description?: string;
+}
+
+/** What an `/api/internal/` endpoint body returns.  The same shape the HTTP
+ *  response carries, so one function serves the endpoint and the host. */
+export interface AgentRequestResult {
+  status: number;
+  body: Record<string, unknown>;
+}
+
+/** THE peer filter.  Same section, not hidden, and never the caller itself,
+ *  with each peer's `busy` flag — the two facts that stop a model spending a
+ *  round asking itself or a peer that cannot answer.  Returns `null` when
+ *  the sender is unknown.
+ *
+ *  Every lane reaches this through `listAgentsResponse`; there is no second
+ *  filter anywhere, which is the point of the PR that introduced it. */
+export function selectPeerBots(selfId: string, all: readonly AgentBot[]): AgentPeerRow[] | null {
+  const sender = all.find((bot) => bot.id === selfId);
+  if (!sender) return null;
+  return all
+    .filter(
+      (bot) =>
+        bot.id !== selfId && !bot.hidden && sectionKey(bot.section) === sectionKey(sender.section),
+    )
+    .map((bot) => ({
+      id: bot.id,
+      name: bot.name,
+      model: bot.modelSelection.model,
+      busy: !!bot.busy,
+      // only ever `true` (an On bot carries nothing, like title below)
+      off: bot.off === true ? true : undefined,
+      // title/description so a Chief-of-Staff-style bot can judge the team:
+      // who does what, and who has no job description yet.
+      title: bot.title || undefined,
+      description: bot.description || undefined,
+    }));
+}
+
+/** The `GET /api/internal/agents` body.  `index.ts` exports a one-line
+ *  wrapper that binds this to the live store; the host receives that wrapper
+ *  as a dependency, so both lanes run this code and not a copy of it. */
+export function listAgentsResponse(selfId: string, all: readonly AgentBot[]): AgentRequestResult {
+  const bots = selectPeerBots(selfId, all);
+  if (!bots) return { status: 403, body: { error: "unknown sender" } };
+  // `section` rides along because the pre-registry `list_bots` payload
+  // carried it and in-flight conversations quote it back.  It is the
+  // CALLER's own section — every row in `bots` is in it by construction —
+  // so restoring it here, not in the tool, keeps the one-implementation
+  // rule: the `/api/internal/agents` body and the host see the same field.
+  const section = all.find((bot) => bot.id === selfId)?.section ?? "";
+  return { status: 200, body: { section, bots } };
+}
+
+export interface CoordinateBotsRequestInput {
+  fromBotId: string;
+  botIds: string[];
+  message: string;
+  depth: number;
+  fromThreadId?: string;
+  reason?: string;
+  rework?: boolean;
+  thread?: "standing" | "new";
+  reply?: "resume" | "none";
+  consult?: boolean;
+  doneWhen?: string;
+}
+
+export interface ListRoutinesRequestInput {
+  fromBotId: string;
+  fromThreadId?: string;
+  routineId?: string;
+}
+
+export interface AssignmentStatusRequestInput {
+  fromBotId: string;
+  fromThreadId?: string;
+  id?: string;
+}
+
+export interface CreateBotRequestInput {
+  fromBotId: string;
+  fromThreadId?: string;
+  name: string;
+  role: string;
+  instructions: string;
+}
+
+export interface RequestCredentialRequestInput {
+  fromBotId: string;
+  fromThreadId?: string;
+  credentialId: string;
+  reason?: string;
+}
+
+/** One shape for both `propose_routine` (action `create`) and
+ *  `propose_routine_action` (every other action) — the same envelope
+ *  `POST /api/internal/routine-requests` has always accepted, so the two
+ *  tools stay one body with two callers. */
+export interface RoutineRequestInput {
+  fromBotId: string;
+  // Required, unlike the other endpoints here: `propose_routine` and
+  // `propose_routine_action` have never defaulted this to the bot's own
+  // thread — the source envelope schema in index.ts has always required it
+  // outright, and this keeps that rule visible at the type.
+  fromThreadId: string;
+  action: "create" | "update" | "pause" | "resume" | "run_now" | "delete";
+  routine?: Record<string, unknown>;
+  routineId?: string;
+  changes?: Record<string, unknown>;
+}
+
+/** Every dependency the agents tools have, named.  Each one is an
+ *  `/api/internal/` endpoint body exported from `index.ts`, so the tool a
+ *  MiniMax bot runs in-process and the tool a Claude bot runs over the
+ *  loopback hop are the same function with the same guards. */
+export interface AgentToolDeps {
+  executeListAgentsRequest(input: { selfId: string }): AgentRequestResult | Promise<AgentRequestResult>;
+  executeCoordinateBotsRequest(
+    input: CoordinateBotsRequestInput,
+  ): AgentRequestResult | Promise<AgentRequestResult>;
+  executeListRoutinesRequest(
+    input: ListRoutinesRequestInput,
+  ): AgentRequestResult | Promise<AgentRequestResult>;
+  executeAssignmentStatusRequest(
+    input: AssignmentStatusRequestInput,
+  ): AgentRequestResult | Promise<AgentRequestResult>;
+  executeCreateBotRequest(input: CreateBotRequestInput): AgentRequestResult | Promise<AgentRequestResult>;
+  executeRequestCredentialRequest(
+    input: RequestCredentialRequestInput,
+  ): AgentRequestResult | Promise<AgentRequestResult>;
+  executeRequestSignInRequest(input: {
+    fromBotId: string;
+    fromThreadId?: string;
+    site: unknown;
+    reason?: unknown;
+  }): AgentRequestResult | Promise<AgentRequestResult>;
+  executeRoutineRequestRequest(input: RoutineRequestInput): AgentRequestResult | Promise<AgentRequestResult>;
+}
+
+/** Who is calling.  Constructible only inside the turn tool host: this is
+ *  the identity the endpoints trust, and it must never be assembled from a
+ *  model's arguments. */
+export interface AgentToolCallContext {
+  readonly botId: string;
+  readonly threadId: string;
+  readonly commsDepth: number;
+}
+
+export type AgentToolExecutor = (
+  call: TurnToolCall,
+  ctx: AgentToolCallContext,
+  runtime: TurnToolRuntime,
+) => Promise<TurnToolOutcome>;
+
+/** The names this module implements.  They are the registry's names, and
+ *  `registry.test.ts` is what keeps the two lists in step. */
+export type AgentToolName =
+  | "list_bots"
+  | "coordinate_bots"
+  | "assignment_status"
+  | "create_bot"
+  | "request_credential"
+  | "request_sign_in"
+  | "list_routines"
+  | "propose_routine"
+  | "propose_routine_action";
+
+/** One executor per name — a named contract rather than an open dictionary,
+ *  so adding a tool to the registry without implementing it is a type error
+ *  rather than an "unknown tool" string a user discovers at runtime. */
+export type AgentTools = Record<AgentToolName, AgentToolExecutor>;
+
+/** The peer roster as the tools read it: the caller's own section plus the
+ *  rows in it.  One record so `list_bots` can re-emit `section` without a
+ *  second trip to the endpoint. */
+interface Roster {
+  section: string;
+  rows: AgentPeerRow[];
+}
+
+const ok = (content: string, detail?: string): TurnToolOutcome =>
+  detail ? { kind: "result", content, detail } : { kind: "result", content };
+
+const failed = (content: string, detail?: string): TurnToolOutcome =>
+  detail ? { kind: "error", content, detail } : { kind: "error", content };
+
+/** Model arguments for request_sign_in.  Strict, so a password, code, or
+ * any other extra field is refused.  The refusal text is fixed and never
+ * includes the rejected value. */
+export const SIGN_IN_CALL = z
+  .object({
+    site: z.string().min(1),
+    reason: z.string().optional(),
+  })
+  .strict();
+
+export type SignInCall = z.infer<typeof SIGN_IN_CALL>;
+
+const SIGN_IN_CALL_REFUSAL =
+  "request_sign_in accepts only a site and an optional reason.\u00A0 Never send a password or one-time code.";
+
+const errorText = (body: Record<string, unknown>, fallback: string): string =>
+  typeof body.error === "string" && body.error ? body.error : fallback;
+
+function jsonRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+type RoutineAction = "update" | "pause" | "resume" | "run_now" | "delete";
+
+function routineAction(value: unknown): RoutineAction | null {
+  return value === "update" || value === "pause" || value === "resume" || value === "run_now" || value === "delete"
+    ? value
+    : null;
+}
+
+/** `propose_routine` and `propose_routine_action` both end the same way: the
+ *  proposal endpoint made a card, the turn has to end here, and the model
+ *  must not claim the change already happened.  One function so the two
+ *  tools cannot say it differently. */
+function routineSuspendOutcome(body: Record<string, unknown>, fallback: string): TurnToolOutcome {
+  const summary = typeof body.summary === "string" && body.summary.trim() ? `\n\n${body.summary.trim()}` : "";
+  return {
+    kind: "suspend",
+    content: `A confirmation card is now visible to the user for ${fallback}.${summary}\n\nThis change has not been applied yet. End this turn and wait for the user to confirm or deny the card; do not claim the routine was created or changed before confirmation.`,
+    stopReason: "awaiting_human",
+  };
+}
+
+/** Build the agents tools' executors.  Keyed by the registry name, so the
+ *  host can look up exactly what the catalog advertised and nothing else. */
+export function createAgentTools(deps: AgentToolDeps): AgentTools {
+  // `create_bot`'s per-turn cap.  A closure variable, not module state: this
+  // function runs once per `createTurnToolHost` call, which is once per HTTP
+  // turn, so a fresh call gets a fresh counter — the turn-scoping the MCP
+  // lane gets for free from being a fresh child process, and the HTTP lane
+  // never had until now.  See `MAX_CREATED_BOTS_PER_TURN`'s own comment in
+  // `registry.ts` for why the MCP lane keeps a separate counter instead of
+  // sharing this one.
+  let createdThisTurn = 0;
+
+  async function roster(ctx: AgentToolCallContext): Promise<Roster | string> {
+    const result = await deps.executeListAgentsRequest({ selfId: ctx.botId });
+    if (result.status !== 200 || !Array.isArray(result.body.bots)) {
+      return errorText(result.body, "the peer roster is unavailable");
+    }
+    // SAFETY: `executeListAgentsRequest` is `listAgentsResponse`, whose only
+    // 200 body is `{ section, bots: AgentPeerRow[] }` built by
+    // `selectPeerBots`.  The `Array.isArray` guard above rules out the 403
+    // shape.
+    return {
+      section: typeof result.body.section === "string" ? result.body.section : "",
+      rows: result.body.bots as AgentPeerRow[],
+    };
+  }
+
+  return {
+    async list_bots(_call, ctx): Promise<TurnToolOutcome> {
+      const list = await roster(ctx);
+      if (typeof list === "string") {
+        return failed(JSON.stringify({ error: list }), list);
+      }
+      const { section, rows } = list;
+      return ok(
+        JSON.stringify({ section, bots: rows }),
+        rows.length === 1 ? "1 peer" : `${rows.length} peers`,
+      );
+    },
+
+    async coordinate_bots(call, ctx): Promise<TurnToolOutcome> {
+      const listed = Array.isArray(call.arguments.bot_ids) ? call.arguments.bot_ids : [];
+      const single = call.arguments.bot_id ?? call.arguments.bot;
+      const tokens = listed.map((value) => String(value ?? "").trim()).filter(Boolean);
+      if (single !== undefined && single !== null) {
+        const extra = String(single).trim();
+        if (extra) tokens.push(extra);
+      }
+      const message = String(call.arguments.message ?? call.arguments.task ?? "").trim();
+      if (tokens.length === 0 || !message) {
+        return failed(
+          JSON.stringify({ error: "coordinate_bots requires `bot_ids` and `message`" }),
+          "bad arguments",
+        );
+      }
+      const list = await roster(ctx);
+      if (typeof list === "string") return failed(JSON.stringify({ error: list }), list);
+      const botIds: string[] = [];
+      const unmatched: string[] = [];
+      for (const token of tokens) {
+        const peer = list.rows.find((row) => row.id === token || `@${row.name}` === token || row.name === token.replace(/^@/, ""));
+        if (peer) botIds.push(peer.id);
+        else unmatched.push(`no bot matches ${token}`);
+      }
+      // Every token that matched nobody is named, not only the first, so one
+      // retry can fix them all.
+      if (unmatched.length > 0) {
+        const errorMessage = joinRefusals(unmatched);
+        return failed(JSON.stringify({ error: errorMessage }), errorMessage);
+      }
+      const reason = typeof call.arguments.reason === "string" ? call.arguments.reason.trim() : "";
+      const thread = call.arguments.thread === "new" || call.arguments.thread === "standing" ? call.arguments.thread : undefined;
+      const reply = call.arguments.reply === "none" || call.arguments.reply === "resume" ? call.arguments.reply : undefined;
+      const doneWhen = typeof call.arguments.done_when === "string" ? call.arguments.done_when.trim() : "";
+      const result = await deps.executeCoordinateBotsRequest({
+        fromBotId: ctx.botId,
+        botIds,
+        message,
+        depth: ctx.commsDepth,
+        fromThreadId: ctx.threadId,
+        reason: reason || undefined,
+        rework: call.arguments.rework === true ? true : undefined,
+        thread,
+        reply,
+        consult: call.arguments.consult === true ? true : undefined,
+        doneWhen: doneWhen || undefined,
+      });
+      if (result.body.error && !Array.isArray(result.body.assignments)) {
+        const errorMessage = String(result.body.error);
+        return failed(JSON.stringify({ error: errorMessage }), errorMessage);
+      }
+      const text = typeof result.body.message === "string" ? result.body.message : "Handed off.";
+      return ok(JSON.stringify(result.body), text);
+    },
+
+    async assignment_status(call, ctx): Promise<TurnToolOutcome> {
+      const id = typeof call.arguments.id === "string" ? call.arguments.id.trim() : "";
+      const result = await deps.executeAssignmentStatusRequest({
+        fromBotId: ctx.botId,
+        fromThreadId: ctx.threadId,
+        id: id || undefined,
+      });
+      if (result.status >= 400 || result.body.error) {
+        const errorMessage = errorText(result.body, "that assignment could not be read");
+        return failed(JSON.stringify({ error: errorMessage }), errorMessage);
+      }
+      return ok(JSON.stringify(result.body));
+    },
+
+    async create_bot(call, ctx): Promise<TurnToolOutcome> {
+      const name = String(call.arguments.name ?? "").trim();
+      const role = String(call.arguments.role ?? "").trim();
+      const instructions = String(call.arguments.instructions ?? "").trim();
+      if (!name || !role || !instructions) {
+        return failed(
+          JSON.stringify({ error: "create_bot needs name, role, and instructions" }),
+          "bad arguments",
+        );
+      }
+      // The cap this closure owns — see its declaration above and
+      // `MAX_CREATED_BOTS_PER_TURN`'s comment in registry.ts.  Checked
+      // before the call, incremented only after it actually created a bot,
+      // matching the pre-registry behaviour in agents-proxy.ts exactly.
+      if (createdThisTurn >= MAX_CREATED_BOTS_PER_TURN) {
+        const message = `You can create at most ${MAX_CREATED_BOTS_PER_TURN} bots in one turn. Use the team you have before adding more.`;
+        return failed(JSON.stringify({ error: message }), "per-turn cap reached");
+      }
+      const result = await deps.executeCreateBotRequest({
+        fromBotId: ctx.botId,
+        fromThreadId: ctx.threadId,
+        name,
+        role,
+        instructions,
+      });
+      if (result.status !== 201) {
+        const message = errorText(result.body, "that bot could not be created");
+        return failed(JSON.stringify({ error: message }), message);
+      }
+      createdThisTurn += 1;
+      const createdName = typeof result.body.name === "string" ? result.body.name : name;
+      const section = typeof result.body.section === "string" ? result.body.section : "General";
+      return ok(`Created @${createdName} in ${section} [id: ${result.body.id}]. Assign work with coordinate_bots.`);
+    },
+
+    async request_credential(call, ctx): Promise<TurnToolOutcome> {
+      const credentialId = call.arguments.credential_id;
+      if (typeof credentialId !== "string" || !credentialId) {
+        return failed(
+          JSON.stringify({ error: "request_credential needs a supported credential_id" }),
+          "bad arguments",
+        );
+      }
+      const reason =
+        typeof call.arguments.reason === "string" ? call.arguments.reason.trim().slice(0, 240) : "";
+      // The allowlist itself is enforced by executeRequestCredentialRequest
+      // — the one place both lanes reach it — so this stays free of the
+      // credential target list.
+      const result = await deps.executeRequestCredentialRequest({
+        fromBotId: ctx.botId,
+        fromThreadId: ctx.threadId,
+        credentialId,
+        ...(reason ? { reason } : {}),
+      });
+      if (result.status >= 400) {
+        const message = errorText(result.body, "that credential is not supported");
+        return failed(JSON.stringify({ error: message }), message);
+      }
+      const label = typeof result.body.label === "string" ? result.body.label : "That credential";
+      if (result.body.alreadyConfigured) {
+        // Nothing to show, nothing to wait for — the loop keeps going.
+        return ok(`${label} is already configured. Continue the task.`);
+      }
+      // The turn ends here: a card is now visible, and the existing secret
+      // resume drain dispatches a fresh turn once the user saves or
+      // declines — the CLI lane's "end this turn" contract, now enforced by
+      // the loop rather than trusted from the model's own text.
+      return {
+        kind: "suspend",
+        content: `A secure ${label} card is now visible to the user. End this turn; BotFleet will resume the task after they save or decline. Never ask them to paste the key into chat.`,
+        stopReason: "awaiting_human",
+      };
+    },
+
+    async request_sign_in(call, ctx): Promise<TurnToolOutcome> {
+      const parsed = SIGN_IN_CALL.safeParse(call.arguments);
+      if (!parsed.success) {
+        return failed(JSON.stringify({ error: SIGN_IN_CALL_REFUSAL }), "bad arguments");
+      }
+      const site = signInSite(parsed.data.site);
+      if (!site) {
+        return failed(JSON.stringify({ error: "request_sign_in needs a site, like example.com" }), "bad arguments");
+      }
+      const reason = signInReason(parsed.data.reason ?? "");
+      const result = await deps.executeRequestSignInRequest({
+        fromBotId: ctx.botId,
+        fromThreadId: ctx.threadId,
+        site,
+        reason,
+      });
+      if (result.status >= 400) {
+        const message = errorText(result.body, "that sign-in could not be requested");
+        return failed(JSON.stringify({ error: message }), message);
+      }
+      const named = inboundText(result.body.site) || site;
+      return {
+        kind: "suspend",
+        content:
+          `A Sign in needed card for ${named} is now visible. End this turn. The person signs in on the computer where you work. Never ask them to paste a password or one-time code into chat.`,
+        stopReason: "awaiting_human",
+      };
+    },
+
+    async list_routines(call, ctx): Promise<TurnToolOutcome> {
+      const routineId = typeof call.arguments.routine_id === "string"
+        ? call.arguments.routine_id.trim()
+        : "";
+      const result = await deps.executeListRoutinesRequest({
+        fromBotId: ctx.botId,
+        fromThreadId: ctx.threadId,
+        ...(routineId ? { routineId } : {}),
+      });
+      if (result.status !== 200) {
+        const message = errorText(result.body, "routines are unavailable");
+        return failed(JSON.stringify({ error: message }), message);
+      }
+      const routines = Array.isArray(result.body.routines) ? result.body.routines : [];
+      const routine = result.body.routine;
+      // A budget-trimmed list must say so, or it reads as complete.
+      const omitted = typeof result.body.routinesOmitted === "number" && result.body.routinesOmitted > 0
+        ? result.body.routinesOmitted
+        : 0;
+      const listed = routines.length === 1 ? "1 routine" : `${routines.length} routines`;
+      return ok(
+        JSON.stringify({
+          now: result.body.now,
+          timeZone: result.body.timeZone,
+          ...(routine ? { routine } : { routines, ...(omitted ? { routinesOmitted: omitted } : {}) }),
+        }),
+        routine ? "routine instructions" : omitted ? `${listed} (+${omitted} omitted)` : listed,
+      );
+    },
+
+    async propose_routine(call, ctx): Promise<TurnToolOutcome> {
+      const { fields: routine, error: scheduleError } = routineFields(call.arguments);
+      if (scheduleError) return failed(JSON.stringify({ error: scheduleError }), scheduleError);
+      if (!routine.name || !routine.instructions || !routine.schedule) {
+        return failed(
+          JSON.stringify({ error: "propose_routine needs name, instructions, and schedule" }),
+          "bad arguments",
+        );
+      }
+      const result = await deps.executeRoutineRequestRequest({
+        fromBotId: ctx.botId,
+        fromThreadId: ctx.threadId,
+        action: "create",
+        routine,
+      });
+      if (result.status >= 400) {
+        const message = errorText(result.body, "that routine could not be prepared");
+        return failed(JSON.stringify({ error: message }), message);
+      }
+      return routineSuspendOutcome(result.body, `the new routine "${String(routine.name)}"`);
+    },
+
+    async propose_routine_action(call, ctx): Promise<TurnToolOutcome> {
+      const routineId = String(call.arguments.routine_id ?? "").trim();
+      const action = routineAction(call.arguments.action);
+      if (!routineId || !action) {
+        return failed(
+          JSON.stringify({ error: "propose_routine_action needs a routine_id and supported action" }),
+          "bad arguments",
+        );
+      }
+      let changes: Record<string, unknown> | undefined;
+      if (action === "update") {
+        if (!jsonRecord(call.arguments.changes)) {
+          return failed(
+            JSON.stringify({ error: "The update action needs at least one field in changes" }),
+            "bad arguments",
+          );
+        }
+        const { fields, error: scheduleError } = routineFields(call.arguments.changes);
+        if (scheduleError) return failed(JSON.stringify({ error: scheduleError }), scheduleError);
+        if (!Object.keys(fields).length) {
+          return failed(
+            JSON.stringify({ error: "The update action needs at least one supported field in changes" }),
+            "bad arguments",
+          );
+        }
+        changes = fields;
+      } else if (call.arguments.changes !== undefined) {
+        return failed(JSON.stringify({ error: `The ${action} action does not accept changes` }), "bad arguments");
+      }
+      const result = await deps.executeRoutineRequestRequest({
+        fromBotId: ctx.botId,
+        fromThreadId: ctx.threadId,
+        action,
+        routineId,
+        ...(changes ? { changes } : {}),
+      });
+      if (result.status >= 400) {
+        const message = errorText(result.body, "that change could not be prepared");
+        return failed(JSON.stringify({ error: message }), message);
+      }
+      return routineSuspendOutcome(result.body, `${action.replace("_", " ")} on routine ${routineId}`);
+    },
+  };
+}

@@ -76,6 +76,33 @@ describe("bot packages", () => {
     });
   });
 
+  it("round-trips an explicit routine timezone and rejects an unknown zone", () => {
+    const routine = {
+      key: "morning-brief",
+      name: "Morning brief",
+      agent: "lead",
+      prompt: "Prepare the brief.",
+      runOn: "bot",
+      schedule: { type: "daily", time: "09:00", weekdays: [1, 2, 3, 4, 5], timeZone: "America/Chicago" },
+      durationMinutes: 30,
+      enabledAfterInstall: false,
+    };
+    const document = parseBotPackage({
+      ...validPackage,
+      package: { ...validPackage.package, routines: [routine] },
+    });
+    expect(document.package.routines?.[0].schedule).toMatchObject({ timeZone: "America/Chicago" });
+    expect(parseBotPackage(renderBotPackageMarkdown(document)).package.routines?.[0].schedule)
+      .toMatchObject({ timeZone: "America/Chicago" });
+    expect(() => parseBotPackage({
+      ...validPackage,
+      package: {
+        ...validPackage.package,
+        routines: [{ ...routine, schedule: { ...routine.schedule, timeZone: "Mars/Olympus" } }],
+      },
+    })).toThrow("must be an IANA timezone");
+  });
+
   it("rejects dangling agent, room, playbook, chief, and routine references", () => {
     expect(() => parseBotPackage({
       ...validPackage,

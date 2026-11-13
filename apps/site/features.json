@@ -1,86 +1,120 @@
 {
   "site": {
-    "testflightUrl": "https://testflight.apple.com/join/XYZ123",
-    "repo": "https://github.com/jaywedgeworth22/BotFleet",
-    "upstream": "https://github.com/milind-soni/OpenMausBot"
+    "testflightUrl": "https://testflight.apple.com/join/ER6sPNMh",
+    "repo": "https://github.com/Simple-With-Us/BotFleet",
+    "upstream": "https://github.com/milind-soni/OpenMausBot",
+    "releases": "https://github.com/Simple-With-Us/BotFleet/releases",
+    "macDownload": "https://github.com/Simple-With-Us/BotFleet/releases/latest/download/BotFleet.dmg",
+    "macDownloadIntel": "https://github.com/Simple-With-Us/BotFleet/releases/latest/download/BotFleet-intel.dmg"
   },
-  "exampleFleet": ["Director", "Builder", "Reviewer"],
+  "exampleFleet": ["Builder", "Reviewer", "Scout"],
   "sections": [
     {
-      "id": "established",
-      "title": "Established &amp; Tested",
-      "badge": "est",
-      "badgeLabel": "Established",
-      "sub": "Verified, landed, and running in daily production use.",
+      "id": "addons",
+      "title": "BotFleet Add-Ons",
+      "badge": "beta",
+      "badgeLabel": "In Testing",
+      "sub": "Everything this fork layered on after OpenMausBot.  All of these are in testing — some are used regularly on this fleet, but none are a finished product surface and their behavior can still change.",
       "features": [
+        {
+          "title": "Always-On iMessage Relay",
+          "desc": "A Mac relay can connect bot group chats in Messages.app to BotFleet while its host service is running.",
+          "prov": { "type": "host", "note": "In testing" }
+        },
+        {
+          "title": "iOS Companion on Public TestFlight",
+          "desc": "The public TestFlight companion pairs with a running Mac host to show conversations and approvals.  Notification behavior depends on the Mac sidecar and iOS permissions; iPad runs in compatibility mode.",
+          "prov": { "type": "pr", "prs": [26, 155], "state": "merged", "note": "Public TestFlight · in testing" }
+        },
+        {
+          "title": "Nested Conversations Under Channels",
+          "desc": "Renameable task threads live under their channel, can be moved, searched, and collapsed, with a custom word for room if you want one.",
+          "prov": { "type": "pr", "prs": [156, 158], "state": "merged", "note": "In testing" }
+        },
         {
           "title": "Chat Bubble &amp; Request ID Copy Controls",
-          "desc": "Click any user or bot message bubble to instantly copy its text.&nbsp; Hover for a dedicated copy button with right-click options to copy the Request ID or Message ID for quick logging.",
-          "prov": { "type": "pr", "prs": [5], "state": "open", "note": "Verified in daily use" }
+          "desc": "Click any user or bot message bubble to copy its text.  Hover for a dedicated copy button with right-click options to copy the Request ID or Message ID.",
+          "prov": { "type": "main", "note": "In testing" }
         },
         {
-          "title": "Usage Telemetry &amp; Central Accounting",
-          "desc": "Live token consumption (prompt, completion, cache hits) and model costs stream to Usage Monitor (usage.jays.services) with automatic project and repo classification.",
-          "prov": { "type": "pr", "prs": [5], "state": "open", "note": "Live on usage.jays.services" }
+          "title": "macOS Menu Bar Tray",
+          "desc": "A menu-bar extra keeps BotFleet reachable while the window is hidden.",
+          "prov": { "type": "pr", "prs": [84], "state": "merged", "note": "In testing" }
         },
         {
-          "title": "Multi-Repo Channels &amp; Interactive File Links",
-          "desc": "Channels can attach multiple repositories (e.g. AI Fleet Coordinator + Fleet Ops) with automatic context injection.&nbsp; Local file links open in default Mac apps with 1 click or reveal in Finder on Option-click.",
-          "prov": { "type": "pr", "prs": [5], "state": "open", "note": "Verified in daily use" }
+          "title": "System Auto Default &amp; Readable Code Fences",
+          "desc": "First visit uses System Auto, which follows this computer — Studio in light, Midnight in dark.  Other skins stay explicit picker rows.  Code fences pick a Shiki theme that stays readable on the painted skin.  Includes update toggle preferences and in-app banner controls.",
+          "prov": { "type": "pr", "prs": [143], "state": "merged", "note": "In testing" }
         },
         {
-          "title": "Dynamic System Theme &amp; Update Controls",
-          "desc": "Theme auto-switches between dark and light to match macOS.&nbsp; Includes update toggle preferences and refined in-app banner controls.",
-          "prov": { "type": "pr", "prs": [5], "state": "open", "note": "Verified in daily use" }
-        }
-      ]
-    },
-    {
-      "id": "beta",
-      "title": "Beta &amp; In Review",
-      "badge": "beta",
-      "badgeLabel": "Beta",
-      "sub": "Feature-complete add-ons undergoing active tuning and review.",
-      "features": [
+          "title": "Always-On Harness Attach",
+          "desc": "The desktop app attaches to an already-running BotFleet harness instead of forking a second one.",
+          "prov": { "type": "pr", "prs": [137], "state": "merged", "note": "In testing" }
+        },
         {
           "title": "Native DeepSeek Engine &amp; Pricing Breakdown",
-          "desc": "Native API and ACP drivers for DeepSeek V4 Flash, V4 Pro, and R1 Reasoner, complete with an in-app model rates and token pricing reference in Settings.",
-          "prov": { "type": "pr", "prs": [5], "state": "open", "note": "Under active test" }
+          "desc": "Native API and ACP drivers for DeepSeek models, complete with an in-app model rates and token pricing reference in Settings.",
+          "prov": { "type": "host", "note": "In testing" }
+        },
+        {
+          "title": "Antigravity Engine &amp; Gemini Models",
+          "desc": "Antigravity is the engine, and it serves Google's Gemini 3.7 and 3.8 Flash catalog alongside its own models.  Tool access and local computer dispatch work where configured and approved.  There is no separate Gemini engine — Gemini appears under Antigravity.",
+          "prov": { "type": "pr", "prs": [144, 151], "state": "merged", "note": "In testing" }
         },
         {
           "title": "Multi-Tier Model Fallback Chains",
-          "desc": "Assign 1st, 2nd, and 3rd choice fallback models to each bot.&nbsp; When primary engines hit rate limits or downtime, BotFleet degrades down the chain automatically without interrupting work.",
-          "prov": { "type": "pr", "prs": [5], "state": "open", "note": "In review" }
+          "desc": "Assign 1st, 2nd, and 3rd choice fallback models to each bot.  Quota, usage-cap, and session-limit chips fail over automatically, including after tools already ran and in rooms.  Other streamed error paths are still in review.",
+          "prov": { "type": "pr", "prs": [89, 95], "state": "merged", "note": "In testing" }
+        },
+        {
+          "title": "Elapsed Turn Timer",
+          "desc": "A live timer on the in-progress turn, plus duration on completed activity runs.",
+          "prov": { "type": "pr", "prs": [150], "state": "merged", "note": "In testing" }
+        },
+        {
+          "title": "Usage Telemetry &amp; Central Accounting",
+          "desc": "Live token consumption (prompt, completion, cache hits) and model costs stream to a Usage Monitor instance you configure, with automatic project and repo classification.",
+          "prov": { "type": "host", "note": "In testing" }
+        },
+        {
+          "title": "Provider Marks &amp; Picker Filtering",
+          "desc": "Official-style marks for Grok, Claude, DeepSeek, Gemini/Antigravity, and others.  Unconfigured models stay out of the picker.",
+          "prov": { "type": "pr", "prs": [148], "state": "merged", "note": "In testing" }
+        },
+        {
+          "title": "Fleet Recall",
+          "desc": "Bots search and contribute to a shared memory store instead of a private hash-proxy index.",
+          "prov": { "type": "pr", "prs": [153], "state": "merged", "note": "In testing" }
+        },
+        {
+          "title": "Fleet MCP Tools",
+          "desc": "List and answer approvals, open_app, routines, webhooks, decision-log tools, and idempotent sends for external MCP clients.",
+          "prov": { "type": "pr", "prs": [1, 142], "state": "merged", "note": "In testing" }
+        },
+        {
+          "title": "Multi-Repo Channels &amp; Interactive File Links",
+          "desc": "Channels can attach multiple repositories with automatic context injection.  Local file links open in default Mac apps with 1 click or reveal in Finder on Option-click.",
+          "prov": { "type": "main", "note": "In testing" }
+        },
+        {
+          "title": "Resource-Threshold Triggers",
+          "desc": "Sample local disk, RAM/swap, and optional CPU load while BotFleet is running and enqueue the same kind of task a routine would when a threshold is crossed.",
+          "prov": { "type": "pr", "prs": [80], "state": "merged", "note": "In testing" }
+        },
+        {
+          "title": "TryCloudflare, Tailscale, and Custom Domains",
+          "desc": "A free *.trycloudflare.com URL from Settings, Tailscale MagicDNS for phone linking, or a Cloudflare token for a custom domain.  Custom webhook ingress can sit on its own domain with token validation.",
+          "prov": { "type": "host", "note": "In testing" }
         },
         {
           "title": "Mid-Task Crash &amp; Restart Recovery",
-          "desc": "Interrupted turns and mid-flight tool executions are automatically detected on boot, prompting immediate resumption instead of leaving tasks stuck in an unknown state.",
-          "prov": { "type": "pr", "prs": [5], "state": "open", "note": "In review" }
-        },
-        {
-          "title": "Always-On iMessage Relay Daemon",
-          "desc": "Background relay daemon connecting Messages.app bot group chats to the BotFleet backend with persistent launchd supervision.",
-          "prov": { "type": "host", "note": "Under active test" }
-        },
-        {
-          "title": "iOS Companion Deep-Link Infrastructure",
-          "desc": "Universal Links (BotFleet.app), App Groups, and Remote Control companion for iPhone and iPad, prepared for public TestFlight.",
-          "prov": { "type": "pr", "prs": [5], "state": "open" }
-        },
-        {
-          "title": "Fleet MCP Tools &amp; Standard Skills",
-          "desc": "Global MCP servers from Claude desktop configurations merged into BotFleet bots, alongside standard fleet repo skills.",
-          "prov": { "type": "pr", "prs": [1], "state": "open" }
-        },
-        {
-          "title": "Custom Webhook Ingress Domain",
-          "desc": "Route webhook triggers to a dedicated custom domain with token validation for external CI/CD pipelines.",
-          "prov": { "type": "pr", "prs": [5], "state": "open" }
+          "desc": "The Mac host checks interrupted turns on restart and can resume work that is safe to retry.",
+          "prov": { "type": "host", "note": "In testing" }
         },
         {
           "title": "One-Command TestFlight Ship",
           "desc": "Automated signing, archiving, and TestFlight upload pipeline from the Mac build environment.",
-          "prov": { "type": "pr", "prs": [4], "state": "merged", "note": "Merged to integration branch" }
+          "prov": { "type": "host", "note": "In testing" }
         }
       ]
     }

@@ -3,9 +3,9 @@
 // resolves them through attachmentImageUrl rather than loading them as URLs.
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { Download, ImageOff, Maximize2, X } from "lucide-react";
+import { Download, File as FileIcon, ImageOff, Maximize2, X } from "lucide-react";
 
-import { attachmentBasename, attachmentImageUrl } from "@/lib/composer-attachments";
+import { attachmentBasename, attachmentFileUrl, attachmentImageUrl } from "@/lib/composer-attachments";
 import { cn } from "@/lib/cn";
 
 export interface PreviewImage {
@@ -80,7 +80,7 @@ export function AttachmentPreviewDialog({ image, onClose }: { image: PreviewImag
       >
         <header className="flex shrink-0 items-center justify-between gap-4 border-b border-white/10 bg-black/45 px-4 py-3">
           <div className="min-w-0">
-            <div className="truncate text-[13px] font-medium text-white">{image.name}</div>
+            <div className="truncate text-[13px] font-medium text-white" title={image.name}>{image.name}</div>
             <div className="text-[10.5px] text-white/50">Saved locally by BotFleet</div>
           </div>
           <div className="flex shrink-0 items-center gap-1">
@@ -96,7 +96,7 @@ export function AttachmentPreviewDialog({ image, onClose }: { image: PreviewImag
             <button
               onClick={onClose}
               className="flex size-9 items-center justify-center rounded-lg text-white/65 hover:bg-white/10 hover:text-white"
-              aria-label="Close image preview"
+              aria-label="Close Image Preview"
             >
               <X size={19} />
             </button>
@@ -144,6 +144,35 @@ function Thumbnail({ image, onPreview }: { image: PreviewImage; onPreview: () =>
         <Maximize2 size={13} />
       </span>
     </button>
+  );
+}
+
+export function AttachedFileChips({ paths, className }: { paths: string[]; className?: string }) {
+  if (paths.length === 0) return null;
+  return (
+    <div className={cn("mb-2 flex flex-wrap gap-2", className)}>
+      {paths.map((path) => {
+        const name = attachmentBasename(path) || "File";
+        const href = attachmentFileUrl(path);
+        const inner = (
+          <>
+            <FileIcon size={16} className="shrink-0 text-ink-secondary" />
+            <span className="min-w-0 truncate text-[13px] font-medium text-ink" title={name}>{name}</span>
+          </>
+        );
+        const chipClass =
+          "flex max-w-[220px] items-center gap-2 rounded-xl border border-hairline/40 bg-inset px-2.5 py-2 text-left hover:border-hairline hover:bg-panel";
+        return href ? (
+          <a key={path} href={href} target="_blank" rel="noreferrer" className={chipClass} aria-label={`Open ${name}`}>
+            {inner}
+          </a>
+        ) : (
+          <div key={path} className={chipClass} title={path}>
+            {inner}
+          </div>
+        );
+      })}
+    </div>
   );
 }
 

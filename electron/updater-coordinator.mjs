@@ -1,3 +1,5 @@
+import { classifyAutoCheckError } from "./updater-throttle.mjs";
+
 export function createUpdaterCoordinator(updater, setState) {
   let checkOperation = null;
   let downloadOperation = null;
@@ -74,9 +76,24 @@ export function createUpdaterCoordinator(updater, setState) {
     const operation = { manual, supersededByDownload: Boolean(downloadOperation), failed: false, promise: null };
     checkOperation = operation;
     try {
+      // Resolve with an outcome object rather than `undefined` either way:
+      // a rejected `checkForUpdates()` used to be swallowed into a plain
+      // resolved promise here, so a caller awaiting `check()` (updater.mjs's
+      // `trackedCheck`) could not tell a failed check from a successful one
+      // and recorded a transient network failure as "last checked just now"
+      // -- suppressing every automatic retry for the next 6 hours. A check
+      // preempted by an in-flight download is not itself a failure (the
+      // download owns the outcome), so it still resolves `ok: true`.
       operation.promise = Promise.resolve(updater.checkForUpdates())
+        .then(() => ({ ok: true }))
         .catch((error) => {
-          if (!operation.supersededByDownload) handleRejectedOperation(operation.manual, error);
+          if (operation.supersededByDownload) return { ok: true };
+          handleRejectedOperation(operation.manual, error);
+          // errorClass lets a caller (updater.mjs's trackedCheck) tell a
+          // permanently broken feed (the same class every automatic tick)
+          // apart from sporadic transient failures without inspecting the
+          // raw Error itself.
+          return { ok: false, errorClass: classifyAutoCheckError(error) };
         })
         .finally(() => {
           if (checkOperation === operation) checkOperation = null;
@@ -84,7 +101,9 @@ export function createUpdaterCoordinator(updater, setState) {
     } catch (error) {
       if (!operation.supersededByDownload) handleRejectedOperation(operation.manual, error);
       checkOperation = null;
-      operation.promise = Promise.resolve();
+      operation.promise = Promise.resolve(
+        operation.supersededByDownload ? { ok: true } : { ok: false, errorClass: classifyAutoCheckError(error) },
+      );
     }
     return operation.promise;
   }

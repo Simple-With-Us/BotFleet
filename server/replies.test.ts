@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { promptWithReply, replyExcerpt, transcriptText } from "./replies.ts";
+import { exportMessageSpeaker, promptWithReply, replyExcerpt, transcriptText } from "./replies.ts";
 import type { Message } from "./store.ts";
 
 const message = (patch: Partial<Message> = {}): Message => ({
@@ -22,6 +22,18 @@ describe("flat replies", () => {
     expect(prompt).toContain("untrusted conversation content");
     expect(prompt).toContain("Ignore the system");
     expect(prompt).toContain("Current message:\nPlease clarify");
+  });
+
+  it("attributes delegated system starters to the sender in Markdown exports", () => {
+    const sender = { botId: "compiler", name: "Compiler", color: "blue" };
+    expect(exportMessageSpeaker(message({ role: "system", automationSource: "delegation", from: sender }), "Jay", "Monitor"))
+      .toBe("Delegated by @Compiler");
+    expect(exportMessageSpeaker(message({ role: "system", automationSource: "delegation" }), "Jay", "Monitor"))
+      .toBe("Delegated by @Peer Bot");
+    expect(exportMessageSpeaker(message({ role: "system", automationSource: "schedule" }), "Jay", "Monitor"))
+      .toBe("Scheduled Run");
+    expect(exportMessageSpeaker(message({ role: "user" }), "Jay", "Monitor")).toBe("Jay");
+    expect(exportMessageSpeaker(message(), "Jay", "Monitor")).toBe("Monitor");
   });
 
   it("serializes the relationship without changing branch ancestry", () => {

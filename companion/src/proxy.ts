@@ -13,13 +13,16 @@
 // serve. Nothing upstream has to change, or even know this exists.
 import { request as httpRequest, type IncomingMessage, type ServerResponse } from "node:http";
 
+import type { PushSenderHealth } from "./apns.ts";
 import { bearerToken } from "./devices.ts";
 import {
   COMPANION_ENDPOINT_KINDS,
   MAX_COMPANION_ENDPOINTS,
   type CompanionEndpoint,
 } from "./endpoints.ts";
-import { denyReason, isCloudDesktopJoin } from "./routes.ts";
+import { companionBodyCheck, companionLiveActivityTokenDenial, denyReason, isCloudDesktopJoin } from "./routes.ts";
+import { cleanDeviceName, parsePairRequestId } from "./devices.ts";
+import { isJsonObject, type JsonObject, type JsonValue } from "./json.ts";
 import { createSseScrubber, isJson, scrub } from "./wire.ts";
 
 /** What the forwarding handler needs from the process around it. */
@@ -33,8 +36,8 @@ export interface ProxyOptions {
    * own concern, and the one thing a device does before it has a token. */
   redeem: (
     code: string,
-    deviceName: unknown,
-    pairRequestId?: unknown,
+    deviceName: string,
+    pairRequestId?: string | null,
   ) => { token: string; device: unknown } | { error: string };
   /** What the phone should call this computer in its connection list. */
   serverName: () => string;
@@ -50,6 +53,15 @@ export interface ProxyOptions {
    * it synchronously when that device is revoked; the returned disposer is
    * called exactly once when either side closes it. */
   connected?: (deviceId: string, disconnect: () => void) => () => void;
+  /** Store an APNs device token for closed-app wake. */
+  setPushToken?: (deviceId: string, token: string) => boolean;
+  /** Store the push-to-start Live Activity token.  Separate from the one
+   * above because the phone registers them separately and either can be
+   * reissued without the other. */
+  setLiveActivityToken?: (deviceId: string, token: string) => boolean;
+  /** How the closed-app wake sender is doing.  Counts, timestamps, and the
+   * last status Apple returned — nothing derived from the signing key. */
+  pushHealth?: () => PushSenderHealth;
   /** How long the harness may take to produce response *headers*. Optional,
    * and only ever set by tests — the default is the one that ships. */
   headersTimeoutMs?: number;
@@ -75,7 +87,7 @@ const MAX_JSON_BODY_BYTES = 32 * 1024 * 1024;
 
 /** Read a JSON body, bounded. An unbounded read on an unauthenticated route
  * is a way to be memory-exhausted by anyone who can reach the port. */
-const readJson = (req: IncomingMessage, limit = 64 * 1024): Promise<Record<string, unknown>> =>
+const readJson = (req: IncomingMessage, limit = 64 * 1024): Promise<JsonObject> =>
   new Promise((resolve, reject) => {
     let size = 0;
     const chunks: Buffer[] = [];
@@ -93,8 +105,13 @@ const readJson = (req: IncomingMessage, limit = 64 * 1024): Promise<Record<strin
       const text = Buffer.concat(chunks).toString("utf8").trim();
       if (!text) return resolve({});
       try {
-        const parsed: unknown = JSON.parse(text);
-        resolve(parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {});
+        // SAFETY: JSON.parse without a reviver only produces JsonValue-shaped data.
+        const parsed = JSON.parse(text) as JsonValue;
+        if (!isJsonObject(parsed)) {
+          reject(new Error("body must be a JSON object"));
+          return;
+        }
+        resolve(parsed);
       } catch {
         reject(new Error("invalid JSON body"));
       }
@@ -154,7 +171,7 @@ const endpointSnapshot = (options: ProxyOptions): CompanionEndpointSnapshot => {
     if (
       !candidate ||
       !COMPANION_ENDPOINT_KINDS.includes(candidate.kind) ||
-      typeof candidate.url !== "string" ||
+      Object.prototype.toString.call(candidate.url) !== "[object String]" ||
       !Number.isSafeInteger(candidate.priority) ||
       candidate.priority < 0 ||
       candidate.priority > 10_000 ||
@@ -218,7 +235,7 @@ const forwardHeaders = (req: IncomingMessage): Record<string, string> => {
  * the token, then replay the request to the harness over loopback and scrub
  * what comes back. Pairing is the one route that stops here. */
 export function createProxyHandler(options: ProxyOptions) {
-  return function handle(req: IncomingMessage, res: ServerResponse): void {
+  return async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const path = (req.url ?? "/").split("?")[0];
     const method = req.method ?? "GET";
 
@@ -260,8 +277,8 @@ export function createProxyHandler(options: ProxyOptions) {
           // `code` remains accepted for manual entry and older mobile builds.
           const result = options.redeem(
             String(body.credential ?? body.code ?? ""),
-            body.deviceName,
-            body.pairRequestId,
+            cleanDeviceName(body.deviceName),
+            parsePairRequestId(body.pairRequestId),
           );
           if ("error" in result) return sendJson(res, 401, { error: result.error });
           // `hosts` rides along whichever way the phone paired — QR, typed
@@ -293,6 +310,77 @@ export function createProxyHandler(options: ProxyOptions) {
     // default-deny checks above and never send it to the harness.
     if (method === "GET" && path === "/api/companion/endpoints") {
       return sendJson(res, 200, endpointSnapshot(options));
+    }
+
+    // Also sidecar-owned: whether a push could reach this phone at all when
+    // it stops streaming.  A phone that never sees a closed-app notification
+    // cannot otherwise tell a quiet fleet from a sender with no key.
+    if (method === "GET" && path === "/api/companion/push-health") {
+      return sendJson(res, 200, options.pushHealth?.() ?? { configured: false });
+    }
+
+    if (method === "POST" && path === "/api/companion/push-token") {
+      const device = options.authenticate(token);
+      const deviceId = device?.id;
+      if (!deviceId) {
+        return sendJson(res, 401, { error: "pair this device from Phone settings in BotFleet on your computer" });
+      }
+      readJson(req).then(
+        (body) => {
+          const push = String(body.token ?? "");
+          if (!options.setPushToken?.(deviceId, push)) {
+            return sendJson(res, 400, { error: "that push token is not usable" });
+          }
+          return sendJson(res, 200, { ok: true });
+        },
+        (error: Error) => sendJson(res, 400, { error: error.message }),
+      );
+      return;
+    }
+
+    if (method === "POST" && path === "/api/companion/live-activity-token") {
+      const device = options.authenticate(token);
+      const deviceId = device?.id;
+      if (!deviceId) {
+        return sendJson(res, 401, { error: "pair this device from Phone settings in BotFleet on your computer" });
+      }
+      readJson(req).then(
+        (body) => {
+          // Validated before the field is read: this is a body off the
+          // network, and `String(body.token)` would coerce a number or an
+          // object into something the registry has to reject.
+          const denial = companionLiveActivityTokenDenial(body);
+          if (denial) return sendJson(res, denial.status, { error: denial.error });
+          if (!options.setLiveActivityToken?.(deviceId, String(body.token))) {
+            return sendJson(res, 400, { error: "that Live Activity token is not usable" });
+          }
+          return sendJson(res, 200, { ok: true });
+        },
+        (error: Error) => sendJson(res, 400, { error: error.message }),
+      );
+      return;
+    }
+
+    // Routes that reach a broader harness handler (the bot profile and the
+    // bot organize PATCHes) have their body checked against a field
+    // allowlist first.  What is forwarded is the re-serialized, validated
+    // object, never the bytes the phone sent.
+    let forwardedBody: Buffer | undefined;
+    const bodyCheck = companionBodyCheck(method, path);
+    if (bodyCheck) {
+      let body: JsonObject;
+      try {
+        body = await readJson(req);
+      } catch (error) {
+        sendJson(res, 400, { error: error instanceof Error ? error.message : "invalid JSON body" });
+        return;
+      }
+      const bodyDenial = bodyCheck(body);
+      if (bodyDenial) {
+        sendJson(res, bodyDenial.status, { error: bodyDenial.error });
+        return;
+      }
+      forwardedBody = Buffer.from(JSON.stringify(body));
     }
 
     const upstream = httpRequest(
@@ -350,7 +438,14 @@ export function createProxyHandler(options: ProxyOptions) {
               return;
             }
             finished = true;
-            sendJson(res, 200, { app: "botfleet" });
+            // The harness opens its port before it finishes booting and
+            // answers health at 200 with `ready: false` until it has, while
+            // 503-ing every other route.  A phone told only "app: botfleet"
+            // would read that as a working Mac and fail on its first real
+            // request, so this one boolean crosses with it.  Still nothing
+            // identifying: no pid, no static.
+            const ready = (identity as { ready?: unknown } | null)?.ready !== false;
+            sendJson(res, 200, { app: "botfleet", ready });
           });
           return;
         }
@@ -577,6 +672,7 @@ export function createProxyHandler(options: ProxyOptions) {
           : { error: "BotFleet is not running on this computer" },
       );
     });
-    req.pipe(upstream);
+    if (forwardedBody) upstream.end(forwardedBody);
+    else req.pipe(upstream);
   };
 }

@@ -3,7 +3,9 @@
 // so App.tsx only mounts it.
 import { useEffect, useRef, useState } from "react";
 import { Bot as BotIcon, MessageSquare, Search, Users } from "lucide-react";
-import { api, useStore, type Bot, type Group } from "@/state/store";
+import { api, getRoomTerminology, useStore, type Bot, type Group } from "@/state/store";
+import { preparePaletteBots, preparePaletteGroups } from "@/lib/command-palette-entries";
+import { BOT_CHATS_SECTION } from "@/lib/sidebar-preferences";
 import { rankByName } from "@/lib/palette-rank";
 import { cn } from "@/lib/cn";
 import type { SearchHit } from "@/lib/search-hit";
@@ -16,6 +18,7 @@ type PaletteEntry =
 
 export function CommandPalette({ onOpenChange }: { onOpenChange?: (open: boolean) => void }) {
   const { state, dispatch } = useStore();
+  const terminology = getRoomTerminology(state.config);
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [messageHits, setMessageHits] = useState<SearchHit[]>([]);
@@ -62,14 +65,19 @@ export function CommandPalette({ onOpenChange }: { onOpenChange?: (open: boolean
     // debounce and request for this query are pending.
     setMessageHits([]);
     let alive = true;
+    const controller = new AbortController();
     const timer = setTimeout(() => {
-      api(`/api/search?q=${encodeURIComponent(q)}&limit=12`)
+      api(`/api/search?q=${encodeURIComponent(q)}&limit=12`, { signal: controller.signal })
         .then((result: { hits?: SearchHit[] }) => alive && setMessageHits(result.hits ?? []))
-        .catch(() => alive && setMessageHits([]));
+        .catch(() => {
+          if (!alive || controller.signal.aborted) return;
+          setMessageHits([]);
+        });
     }, 150);
     return () => {
       alive = false;
       clearTimeout(timer);
+      controller.abort();
     };
   }, [open, q]);
 
@@ -81,11 +89,14 @@ export function CommandPalette({ onOpenChange }: { onOpenChange?: (open: boolean
 
   if (!open) return null;
 
-  const bots = rankByName(state.bots.filter((b) => !b.hidden), q);
-  const rooms = rankByName(state.groups, q);
+  const { rooms: roomPool, botChats: botChatPool } = preparePaletteGroups(state.groups);
+  const bots = rankByName(preparePaletteBots(state.bots), q);
+  const rooms = rankByName(roomPool, q);
+  const botChats = rankByName(botChatPool, q);
   const entries: PaletteEntry[] = [
     ...bots.map((bot): PaletteEntry => ({ kind: "bot", bot })),
     ...rooms.map((group): PaletteEntry => ({ kind: "room", group })),
+    ...botChats.map((group): PaletteEntry => ({ kind: "room", group })),
     // message hits only make sense for a typed query; empty = switcher mode
     ...(q ? messageHits.map((hit): PaletteEntry => ({ kind: "message", hit })) : []),
   ];
@@ -127,7 +138,8 @@ export function CommandPalette({ onOpenChange }: { onOpenChange?: (open: boolean
 
   // flat cursor across sections; each row needs its absolute index
   const roomOffset = bots.length;
-  const messageOffset = bots.length + rooms.length;
+  const botChatsOffset = bots.length + rooms.length;
+  const messageOffset = botChatsOffset + botChats.length;
 
   const row = (key: string, index: number, onPick: () => void, children: React.ReactNode, twoLine = false) => (
     <button
@@ -156,7 +168,7 @@ export function CommandPalette({ onOpenChange }: { onOpenChange?: (open: boolean
       <div
         role="dialog"
         aria-modal="true"
-        aria-label="Command palette"
+        aria-label="Command Palette"
         className="flex max-h-[min(480px,70vh)] w-full max-w-[560px] flex-col overflow-hidden rounded-xl border border-hairline/50 bg-card shadow-2xl shadow-black/60"
       >
         <div className="flex items-center gap-3 border-b border-hairline/40 px-4 py-3">
@@ -165,7 +177,7 @@ export function CommandPalette({ onOpenChange }: { onOpenChange?: (open: boolean
             autoFocus
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search bots, channels, messages…"
+            placeholder={`Search bots, ${terminology.plural.toLowerCase()}, messages\u2026`}
             className="w-full bg-transparent text-[14px] text-ink placeholder:text-ink-secondary focus:outline-none"
           />
           <kbd className="shrink-0 rounded-md border border-hairline/40 px-1.5 py-0.5 text-[11px] text-ink-secondary">
@@ -190,16 +202,16 @@ export function CommandPalette({ onOpenChange }: { onOpenChange?: (open: boolean
               () => void activate({ kind: "bot", bot }),
               <>
                 <BotIcon size={16} className="shrink-0 text-ink-secondary" />
-                <span className="truncate text-[14px] text-ink">{bot.name}</span>
+                <span className="truncate text-[14px] text-ink" title={bot.name}>{bot.name}</span>
                 {bot.title && (
-                  <span className="min-w-0 truncate text-[12.5px] text-ink-secondary">{bot.title}</span>
+                  <span className="min-w-0 truncate text-[12.5px] text-ink-secondary" title={bot.title}>{bot.title}</span>
                 )}
               </>,
             ),
           )}
           {rooms.length > 0 && (
             <div className="px-3 pb-1 pt-2 text-[11px] font-medium uppercase tracking-[0.08em] text-ink-secondary">
-              Channels
+              {terminology.plural}
             </div>
           )}
           {rooms.map((group, i) =>
@@ -209,7 +221,23 @@ export function CommandPalette({ onOpenChange }: { onOpenChange?: (open: boolean
               () => void activate({ kind: "room", group }),
               <>
                 <Users size={16} className="shrink-0 text-ink-secondary" />
-                <span className="truncate text-[14px] text-ink">{group.name}</span>
+                <span className="truncate text-[14px] text-ink" title={group.name}>{group.name}</span>
+              </>,
+            ),
+          )}
+          {botChats.length > 0 && (
+            <div className="px-3 pb-1 pt-2 text-[11px] font-medium uppercase tracking-[0.08em] text-ink-secondary">
+              {BOT_CHATS_SECTION}
+            </div>
+          )}
+          {botChats.map((group, i) =>
+            row(
+              `room:${group.id}`,
+              botChatsOffset + i,
+              () => void activate({ kind: "room", group }),
+              <>
+                <Users size={16} className="shrink-0 text-ink-secondary" />
+                <span className="truncate text-[14px] text-ink" title={group.name}>{group.name}</span>
               </>,
             ),
           )}
@@ -228,12 +256,15 @@ export function CommandPalette({ onOpenChange }: { onOpenChange?: (open: boolean
                 messageOffset + i,
                 () => void activate({ kind: "message", hit }),
                 <>
-                  <span className="flex items-center gap-2 truncate text-[13px] font-medium text-ink">
+                  <span
+                    className="flex items-center gap-2 truncate text-[13px] font-medium text-ink"
+                    title={hit.task ? `${hit.name} · ${hit.task}` : hit.name}
+                  >
                     <MessageSquare size={13} className="shrink-0 text-ink-secondary" />
                     {hit.name}
                     {hit.task ? <span className="font-normal text-ink-secondary"> · {hit.task}</span> : null}
                   </span>
-                  <span className="line-clamp-2 text-[12.5px] text-ink-secondary">
+                  <span className="line-clamp-2 text-[12.5px] text-ink-secondary" title={hit.snippet}>
                     {before}<mark className="rounded-sm bg-accent/25 px-0.5 text-ink">{match}</mark>{after}
                   </span>
                 </>,

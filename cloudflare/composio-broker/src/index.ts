@@ -5,6 +5,7 @@ interface InstallationRow {
   composio_user_id: string;
   session_id: string | null;
   disabled_at: number | null;
+  session_upgrade_attempted?: number | null;
 }
 
 interface ComposioSession {
@@ -203,53 +204,142 @@ async function createSession(env: Env, userId: string) {
     }),
   });
   if (!response.ok) throw new Error(await upstreamError(response, `Session creation failed (${response.status})`));
-  return parseSession(sessionWireSchema.parse(await response.json()));
+  const session = parseSession(sessionWireSchema.parse(await response.json()));
+  if (session.userId && session.userId !== userId) {
+    throw new Error("Composio returned a Session for another user");
+  }
+  return { ...session, userId };
 }
 
-/** Session ids this isolate already tried to upgrade once. If the fresh
- *  Session STILL doesn't echo multi-account, Composio isn't granting it —
- *  serve single-account behavior instead of recreating a Session and writing
- *  D1 on every request. */
+/** Same-isolate cache for Session upgrade attempts.  Durable copy is D1
+ *  `installations.session_upgrade_attempted` so a cold isolate does not
+ *  recreate Sessions forever when Composio still withholds multi-account. */
 const multiAccountUpgradeAttempted = new Set<string>();
+
+function sessionUpgradeAttempted(installation: InstallationRow, session: ComposioSession | null) {
+  if (Number(installation.session_upgrade_attempted) === 1) return true;
+  return Boolean(session && multiAccountUpgradeAttempted.has(session.sessionId));
+}
 
 async function ensureSession(installation: InstallationRow, env: Env, ctx: ExecutionContext) {
   if (!(await env.SESSION_LIMITER.limit({ key: installation.id })).success) {
     throw new Response(JSON.stringify({ error: "too many connected-app requests" }), { status: 429, headers: JSON_HEADERS });
   }
-  let session = installation.session_id ? await getSession(env, installation.session_id) : null;
-  if (session && !session.multiAccountConfigured && multiAccountUpgradeAttempted.has(session.sessionId)) {
-    return session;
-  }
-  if (!session?.multiAccountConfigured) {
-    // Connected accounts are attached to this stable Composio user ID. A new
-    // Session upgrades legacy installations without relinking OAuth grants.
-    session = await createSession(env, installation.composio_user_id);
-    multiAccountUpgradeAttempted.add(session.sessionId);
-    await env.DB.prepare("UPDATE installations SET session_id = ?, last_seen_at = ? WHERE id = ?")
-      .bind(session.sessionId, Date.now(), installation.id)
-      .run();
-  } else {
+  const readCurrent = async () => {
+    const row = await env.DB.prepare(
+      "SELECT id, composio_user_id, session_id, disabled_at, session_upgrade_attempted FROM installations WHERE id = ?",
+    ).bind(installation.id).first<InstallationRow>();
+    if (!row || row.id !== installation.id || row.disabled_at !== null || !row.composio_user_id) {
+      throw new Response(JSON.stringify({ error: "installation is unavailable" }), { status: 401, headers: JSON_HEADERS });
+    }
+    return row;
+  };
+  const touchLastSeen = (row: InstallationRow) => {
     ctx.waitUntil(
-      env.DB.prepare("UPDATE installations SET last_seen_at = ? WHERE id = ?")
-        .bind(Date.now(), installation.id)
+      env.DB.prepare(
+        "UPDATE installations SET last_seen_at = ? WHERE id = ? AND composio_user_id = ? AND disabled_at IS NULL AND session_id IS ?",
+      ).bind(Date.now(), row.id, row.composio_user_id, row.session_id)
         .run()
-        .catch((error: Error) => console.error(JSON.stringify({ message: "last-seen update failed", id: installation.id, error: error.message }))),
+        .catch((error: Error) => console.error(JSON.stringify({ message: "last-seen update failed", id: row.id, error: error.message }))),
     );
+  };
+  const sameSnapshot = (left: InstallationRow, right: InstallationRow) =>
+    left.composio_user_id === right.composio_user_id
+    && left.session_id === right.session_id
+    && Number(left.session_upgrade_attempted ?? 0) === Number(right.session_upgrade_attempted ?? 0);
+  let current = installation;
+  const adoptCurrent = (row: InstallationRow) => {
+    current = row;
+    installation.composio_user_id = row.composio_user_id;
+    installation.session_id = row.session_id;
+    installation.session_upgrade_attempted = row.session_upgrade_attempted;
+  };
+  const unavailable = () => new Response(JSON.stringify({ error: "installation changed during session setup" }), { status: 503, headers: JSON_HEADERS });
+
+  if (installation.disabled_at !== null || !installation.composio_user_id) {
+    throw new Response(JSON.stringify({ error: "installation is unavailable" }), { status: 401, headers: JSON_HEADERS });
   }
-  return session;
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const expectedUserId = current.composio_user_id;
+    const previousSessionId = current.session_id;
+    const cached = previousSessionId ? await getSession(env, previousSessionId) : null;
+    const afterLookup = await readCurrent();
+    if (!sameSnapshot(current, afterLookup)) {
+      adoptCurrent(afterLookup);
+      continue;
+    }
+    adoptCurrent(afterLookup);
+    if (cached?.userId === expectedUserId && (cached.multiAccountConfigured || sessionUpgradeAttempted(afterLookup, cached))) {
+      touchLastSeen(afterLookup);
+      return cached;
+    }
+
+    // Create a replacement when the cached Session is absent, legacy, or belongs to another user.
+    const created = await createSession(env, expectedUserId);
+    const afterCreate = await readCurrent();
+    if (afterCreate.composio_user_id !== expectedUserId) {
+      adoptCurrent(afterCreate);
+      continue;
+    }
+    if (afterCreate.session_id !== previousSessionId) {
+      adoptCurrent(afterCreate);
+      if (!current.session_id) continue;
+      const winner = await getSession(env, current.session_id);
+      const afterWinnerLookup = await readCurrent();
+      if (!sameSnapshot(current, afterWinnerLookup)) {
+        adoptCurrent(afterWinnerLookup);
+        continue;
+      }
+      if (winner?.userId === expectedUserId) {
+        touchLastSeen(current);
+        return winner;
+      }
+      continue;
+    }
+
+    const saved = await env.DB.prepare(
+      "UPDATE installations SET session_id = ?, last_seen_at = ?, session_upgrade_attempted = 1 WHERE id = ? AND composio_user_id = ? AND disabled_at IS NULL AND session_id IS ?",
+    ).bind(created.sessionId, Date.now(), installation.id, expectedUserId, previousSessionId).run();
+    const afterSave = await readCurrent();
+    if (afterSave.composio_user_id !== expectedUserId) {
+      adoptCurrent(afterSave);
+      continue;
+    }
+    if ((saved.meta?.changes ?? 0) > 0 && afterSave.session_id === created.sessionId) {
+      installation.session_id = created.sessionId;
+      installation.session_upgrade_attempted = 1;
+      multiAccountUpgradeAttempted.add(created.sessionId);
+      return created;
+    }
+    adoptCurrent(afterSave);
+    if (current.session_id && current.session_id !== previousSessionId) {
+      const winner = await getSession(env, current.session_id);
+      const afterWinnerLookup = await readCurrent();
+      if (!sameSnapshot(current, afterWinnerLookup)) {
+        adoptCurrent(afterWinnerLookup);
+        continue;
+      }
+      if (winner?.userId === expectedUserId) {
+        touchLastSeen(current);
+        return winner;
+      }
+    }
+  }
+  throw unavailable();
 }
 
 async function authenticate(request: Request, env: Env) {
   const token = request.headers.get("authorization")?.match(/^Bearer ([0-9a-f]{64})$/)?.[1];
   if (!token) return null;
   const row = await env.DB.prepare(
-    "SELECT id, composio_user_id, session_id, disabled_at FROM installations WHERE token_hash = ?",
+    "SELECT id, composio_user_id, session_id, disabled_at, session_upgrade_attempted FROM installations WHERE token_hash = ?",
   ).bind(await sha256(token)).first<InstallationRow>();
   return row && row.disabled_at === null ? row : null;
 }
 
 async function register(request: Request, env: Env) {
-  if (env.REGISTRATION_MODE !== "open") return json({ error: "registration is temporarily closed" }, 503);
+  if (String(env.REGISTRATION_MODE) !== "open") return json({ error: "registration is temporarily closed" }, 503);
   const fingerprint = `${request.headers.get("cf-connecting-ip") ?? "unknown"}|${request.headers.get("user-agent") ?? "unknown"}`;
   if (!(await env.REGISTRATION_LIMITER.limit({ key: await sha256(fingerprint.slice(0, 512)) })).success) {
     return json({ error: "too many registration attempts" }, 429);

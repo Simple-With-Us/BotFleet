@@ -7,18 +7,25 @@ struct TasksRoutinesView: View {
     @State private var runs: [RoutineRun] = []
     @State private var editor: RoutineEditorTarget?
     @State private var deleting: Routine?
+    @State private var confirmingMarkAllSeen = false
     @State private var loading = true
+
+    /// Failed or missed runs nobody has acknowledged yet — the same set the
+    /// harness's "mark every failure seen" sweep clears.
+    private var unseenFailureCount: Int {
+        runs.filter(\.needsAcknowledgement).count
+    }
 
     var body: some View {
         List {
             Section {
                 VStack(alignment: .leading, spacing: 8) {
                     Label("Task = one conversation and result", systemImage: "bubble.left.and.text.bubble.right")
-                    Label("Routine = a schedule that creates a fresh task", systemImage: "calendar.badge.clock")
+                    Label("Routine = a schedule that continues the previous task", systemImage: "calendar.badge.clock")
                 }
                 .font(.subheadline)
             } footer: {
-                Text("No cron syntax. Every run uses the agent's existing model, tools, permissions, computer, and connected apps. Times follow the paired computer's local timezone.")
+                Text("No cron syntax.\u{00A0} Every run uses the bot's existing model, tools, permissions, computer, and connected apps.\u{00A0} Recurring times show the timezone used by the paired scheduler.")
             }
 
             Section("Routines") {
@@ -60,8 +67,13 @@ struct TasksRoutinesView: View {
                     Text("Completed, waiting, failed, and manually started runs appear here.")
                         .foregroundStyle(.secondary)
                 }
+                if unseenFailureCount > 0 {
+                    Button("Mark All Seen (\(unseenFailureCount))", systemImage: "checkmark.circle") {
+                        confirmingMarkAllSeen = true
+                    }
+                }
                 ForEach(runs.sorted(by: { $0.scheduledFor > $1.scheduledFor }).prefix(50)) { run in
-                    RoutineRunRow(run: run, bot: session.state.bot(run.botId))
+                    RoutineRunRow(run: run, bot: session.state.bot(run.botId)) { await reload() }
                 }
             }
 
@@ -100,6 +112,19 @@ struct TasksRoutinesView: View {
         } message: {
             Text("Past run receipts remain available.")
         }
+        .confirmationDialog(
+            "Mark \(unseenFailureCount) \(unseenFailureCount == 1 ? "Failure" : "Failures") Seen?",
+            isPresented: $confirmingMarkAllSeen,
+            titleVisibility: .visible
+        ) {
+            Button("Mark All Seen") {
+                Task {
+                    if await session.markAllRoutineRunsSeen() { await reload() }
+                }
+            }
+        } message: {
+            Text("They stay in the run receipts with their errors.\u{00A0} This only clears the badge, and the next failure brings it back.")
+        }
     }
 
     private func reload() async {
@@ -136,7 +161,9 @@ private struct RoutineRow: View {
     var body: some View {
         let canToggle = routine.canToggle()
         HStack(spacing: 12) {
-            if let bot { BotAvatarView(bot: bot, size: 42, state: routine.enabled ? .idle : .sleeping, animated: false) }
+            if let bot {
+                BotAvatarWithProviderBadge(bot: bot, size: 42, state: routine.enabled ? .idle : .sleeping, animated: false)
+            }
             else { Image(systemName: "calendar.badge.exclamationmark").frame(width: 42, height: 42) }
             VStack(alignment: .leading, spacing: 3) {
                 Text(routine.name).font(.headline)
@@ -156,7 +183,10 @@ private struct RoutineRow: View {
 private struct RoutineRunRow: View {
     let run: RoutineRun
     let bot: Bot?
+    /// Reloads the receipts after a run is stopped or marked seen.
+    let onChanged: () async -> Void
     @EnvironmentObject private var session: Session
+    @State private var working = false
 
     var body: some View {
         DisclosureGroup {
@@ -169,6 +199,33 @@ private struct RoutineRunRow: View {
                     Button("Open task", systemImage: "arrow.up.right.square") {
                         Task { await session.openNotification(target) }
                     }
+                    .buttonStyle(.borderless)
+                }
+                // Only where the harness will act: a settled run answers 404
+                // to Cancel, and a run already marked seen has nothing to mark.
+                if run.canCancel {
+                    Button("Cancel Run", systemImage: "xmark.circle", role: .destructive) {
+                        working = true
+                        Task {
+                            _ = await session.cancelRoutineRun(run)
+                            await onChanged()
+                            working = false
+                        }
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(working)
+                }
+                if run.needsAcknowledgement {
+                    Button("Mark Seen", systemImage: "checkmark.circle") {
+                        working = true
+                        Task {
+                            _ = await session.markRoutineRunSeen(run)
+                            await onChanged()
+                            working = false
+                        }
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(working)
                 }
             }
             .font(.subheadline)
@@ -204,6 +261,7 @@ private struct RoutineEditorView: View {
     @State private var onceAt: Date
     @State private var dailyTime: Date
     @State private var weekdays: Set<Int>
+    @State private var scheduleTimeZone: String?
     @State private var duration: Int
     @State private var saving = false
 
@@ -213,15 +271,23 @@ private struct RoutineEditorView: View {
         _name = State(initialValue: routine?.name ?? "")
         _prompt = State(initialValue: routine?.prompt ?? "")
         _botId = State(initialValue: routine?.botId ?? "")
-        _runOn = State(initialValue: routine?.runLocation ?? .maus)
+        _runOn = State(initialValue: routine?.runLocation ?? .bot)
         _runAvailability = State(initialValue: nil)
         _availabilityLoaded = State(initialValue: false)
         _kind = State(initialValue: routine?.schedule.type ?? .daily)
         _onceAt = State(initialValue: routine?.schedule.at.map { Date(timeIntervalSince1970: $0 / 1_000) } ?? Date().addingTimeInterval(3_600))
-        let parts = (routine?.schedule.time ?? "09:00").split(separator: ":").compactMap { Int($0) }
-        let time = Calendar.current.date(bySettingHour: parts.first ?? 9, minute: parts.count > 1 ? parts[1] : 0, second: 0, of: Date()) ?? Date()
+        // The server sends its effective zone even for legacy host-local
+        // schedules.  Keep it for truthful display on a phone in another
+        // zone, but omit it again when serializing that legacy schedule.
+        let effectiveTimeZone = routineEditorTimeZoneIdentifier(
+            effectiveTimeZone: routine?.schedule.timeZone,
+            existingScheduleType: routine?.schedule.type
+        )
+        let editorTimeZone = effectiveTimeZone.flatMap(TimeZone.init(identifier:)) ?? .current
+        let time = routineEditorTimeDate(routine?.schedule.time, in: editorTimeZone)
         _dailyTime = State(initialValue: time)
         _weekdays = State(initialValue: Set(routine?.schedule.weekdays ?? [1, 2, 3, 4, 5]))
+        _scheduleTimeZone = State(initialValue: effectiveTimeZone)
         _duration = State(initialValue: routine?.durationMinutes ?? 30)
     }
 
@@ -241,28 +307,28 @@ private struct RoutineEditorView: View {
                 Section {
                     Picker("Run location", selection: $runOn) {
                         Label("This computer", systemImage: "laptopcomputer")
-                            .tag(RoutineRunLocation.maus)
-                        Label("Cloud VM", systemImage: "cloud")
+                            .tag(RoutineRunLocation.bot)
+                        Label("Cloud desktop", systemImage: "cloud")
                             .tag(RoutineRunLocation.cloud)
                             .selectionDisabled(!cloudSelectable)
                     }
                     .pickerStyle(.inline)
 
                     if !availabilityLoaded {
-                        ProgressView("Checking Cloud VM availability…")
+                        ProgressView("Checking Cloud desktop availability…")
                     } else if runAvailability == nil {
-                        Label("Cloud VM status is unavailable", systemImage: "exclamationmark.triangle")
+                        Label("Cloud desktop status is unavailable", systemImage: "exclamationmark.triangle")
                             .foregroundStyle(.secondary)
                     }
                 } header: {
                     Text("Where does it run?")
                 } footer: {
-                    if runOn == .maus {
+                    if runOn == .bot {
                         Text("Uses this agent's selected model and computer setting on the paired computer.")
                     } else if runAvailability?.cloudReady == true {
-                        Text("Runs the agent and its tools inside its Box virtual machine. The VM wakes automatically for each run; keep OpenMausBot running so its scheduler can launch the job.")
+                        Text("Runs the agent and its tools inside its Box virtual machine. The VM wakes automatically for each run; keep BotFleet running so its scheduler can launch the job.")
                     } else {
-                        Text("This existing Cloud VM choice is preserved, but it cannot run until the paired computer has a configured Box API key and an available Box agent.")
+                        Text("This existing Cloud desktop choice is preserved, but it cannot run until the paired computer has a configured Box API key and an available Box agent.")
                     }
                 }
 
@@ -279,6 +345,8 @@ private struct RoutineEditorView: View {
                         DatePicker("Run", selection: $onceAt, in: Date()...)
                     } else if kind == .daily {
                         DatePicker("Time", selection: $dailyTime, displayedComponents: .hourAndMinute)
+                            .environment(\.timeZone, editorTimeZone)
+                        LabeledContent("Time zone", value: scheduleTimeZone ?? TimeZone.current.identifier)
                         HStack {
                             ForEach(0..<7) { day in
                                 Button(Self.dayLetters[day]) {
@@ -291,7 +359,7 @@ private struct RoutineEditorView: View {
                         }
                     } else {
                         Label(
-                            "This routine uses a schedule added by a newer OpenMausBot. Choose One time or Selected days before saving.",
+                            "This routine uses a schedule added by a newer BotFleet. Choose One time or Selected days before saving.",
                             systemImage: "exclamationmark.triangle"
                         )
                         .font(.footnote)
@@ -300,7 +368,7 @@ private struct RoutineEditorView: View {
                 } header: {
                     Text("Schedule")
                 } footer: {
-                    Text("Each occurrence creates a fresh task. No cron syntax is used.")
+                    Text("Later runs of the same routine continue the previous task.\u{00A0} No cron syntax is used.")
                 }
             }
             .navigationTitle(routine == nil ? "New routine" : "Edit routine")
@@ -324,6 +392,10 @@ private struct RoutineEditorView: View {
         runAvailability?.canSelect(.cloud, preserving: runOn) ?? (runOn == .cloud)
     }
 
+    private var editorTimeZone: TimeZone {
+        scheduleTimeZone.flatMap(TimeZone.init(identifier:)) ?? .current
+    }
+
     private func save() async {
         guard kind != .unknown else {
             session.actionError = "Choose a supported schedule before saving this routine."
@@ -333,9 +405,19 @@ private struct RoutineEditorView: View {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.calendar = Calendar(identifier: .gregorian)
-        formatter.timeZone = .current
+        formatter.timeZone = editorTimeZone
         formatter.dateFormat = "HH:mm"
-        let schedule = kind == .once ? RoutineSchedule.once(at: onceAt) : .daily(time: formatter.string(from: dailyTime), weekdays: weekdays.sorted())
+        let schedule = kind == .once
+            ? RoutineSchedule.once(at: onceAt)
+            : .daily(
+                time: formatter.string(from: dailyTime),
+                weekdays: weekdays.sorted(),
+                timeZone: routineTimeZoneForUpdate(
+                    effectiveTimeZone: scheduleTimeZone,
+                    source: routine?.scheduleTimeZoneSource,
+                    existingScheduleType: routine?.schedule.type
+                )
+            )
         let input = RoutineInput(
             name: String(name.trimmingCharacters(in: .whitespacesAndNewlines).prefix(80)),
             prompt: String(prompt.trimmingCharacters(in: .whitespacesAndNewlines).prefix(20_000)),
@@ -356,8 +438,8 @@ private struct RoutineEditorView: View {
 private extension RoutineRunLocation {
     var label: String {
         switch self {
-        case .maus: "This computer"
-        case .cloud: "Cloud VM"
+        case .bot: "This computer"
+        case .cloud: "Cloud desktop"
         }
     }
 }
@@ -378,7 +460,8 @@ private extension RoutineSchedule {
         if values.count == 7 { dayText = "Every day" }
         else if values == [1, 2, 3, 4, 5] { dayText = "Weekdays" }
         else { dayText = values.compactMap { (0..<7).contains($0) ? RoutineEditorView.dayNames[$0].prefix(3) : nil }.joined(separator: ", ") }
-        return "\(dayText) at \(time ?? "—")"
+        let zoneText = timeZone ?? "paired computer zone"
+        return "\(dayText) at \(time ?? "—") · \(zoneText)"
     }
 }
 

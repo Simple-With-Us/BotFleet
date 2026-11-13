@@ -1,7 +1,14 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  assertExternalWorkspaceCredentialMarkers,
+  EXTERNAL_WORKSPACE_CREDENTIALS,
+  instanceKeyedDriver,
+  INSTANCE_API_KEY_ENV,
+  markExternalWorkspaceCredentials,
   migrateWorkspaceCredentials,
+  setWorkspaceCredentialMarker,
+  workspaceCredentialPending,
   workspaceCredentialEnv,
   WORKSPACE_CREDENTIALS,
 } from "./workspace-credentials.mjs";
@@ -38,6 +45,25 @@ describe("workspace credential migration", () => {
     });
     // inputs are never mutated — main.mjs decides which files to rewrite
     expect(config.xai.key).toBe("xai-secret");
+  });
+
+  it("migrates legacy primary Infisical tokens to encrypted credential slots", () => {
+    const result = migrateWorkspaceCredentials({
+      infisical: { clientSecret: "identity-secret", token: "read-service-token", writeToken: "write-service-token", projectId: "fixture-project" },
+    }, {});
+
+    expect(result.credentials).toEqual({
+      infisicalClientSecret: "identity-secret",
+      infisicalReadToken: "read-service-token",
+      infisicalWriteToken: "write-service-token",
+    });
+    expect(result.config).toEqual({ infisical: { projectId: "fixture-project" } });
+    expect(JSON.stringify(result.config)).not.toMatch(/identity-secret|read-service-token|write-service-token/);
+    expect(workspaceCredentialEnv(result.credentials)).toEqual({
+      INFISICAL_CLIENT_SECRET: "identity-secret",
+      INFISICAL_TOKEN: "read-service-token",
+      INFISICAL_WRITE_TOKEN: "write-service-token",
+    });
   });
 
   it("is idempotent: a second boot over migrated output changes nothing", () => {
@@ -139,5 +165,81 @@ describe("workspace credential env", () => {
     const credentials = Object.fromEntries(WORKSPACE_CREDENTIALS.map((c) => [c.name, `v-${c.name}`]));
     const env = workspaceCredentialEnv(credentials);
     expect(Object.keys(env).sort()).toEqual(WORKSPACE_CREDENTIALS.map((c) => c.env).sort());
+  });
+});
+
+describe("workspace credential replay markers", () => {
+  it("marks only encrypted credentials and never persists their values", () => {
+    const source = { xai: { url: "https://api.example.test/v1" }, profile: { name: "Ada" } };
+    const result = markExternalWorkspaceCredentials(source, {
+      xaiApiKey: "saved-xai",
+      composioApiKey: "saved-composio",
+    });
+
+    expect(result).toEqual({ changed: true, config: {
+      xai: { url: "https://api.example.test/v1", credentialStorage: "external" },
+      composio: { credentialStorage: "external" },
+      profile: { name: "Ada" },
+    } });
+    expect(JSON.stringify(result.config)).not.toMatch(/saved-xai|saved-composio/);
+    expect(source.xai).not.toHaveProperty("credentialStorage");
+  });
+
+  it("rejects a preparation readback missing any fixed encrypted credential marker", () => {
+    const credentials = { xaiApiKey: "saved-xai", boxToken: "saved-box" };
+    expect(() => assertExternalWorkspaceCredentialMarkers(
+      { xai: { credentialStorage: "external" }, box: {} },
+      credentials,
+    )).toThrow(/boxToken/);
+    expect(assertExternalWorkspaceCredentialMarkers(
+      {
+        xai: { credentialStorage: "external" },
+        box: { credentialStorage: "external" },
+      },
+      credentials,
+    )).toEqual(["xaiApiKey", "boxToken"]);
+  });
+
+  it("distinguishes pending replay from a restored value", () => {
+    expect(workspaceCredentialPending({ xai: { credentialStorage: "external" } }, "xaiApiKey")).toBe(true);
+    expect(workspaceCredentialPending({ xai: { credentialStorage: "external", key: "runtime-only" } }, "xaiApiKey")).toBe(false);
+    expect(workspaceCredentialPending({ xai: {} }, "xaiApiKey")).toBe(false);
+    expect(EXTERNAL_WORKSPACE_CREDENTIALS.map((field) => field.name)).toContain("infisicalClientSecret");
+    expect(EXTERNAL_WORKSPACE_CREDENTIALS.map((field) => field.name)).toContain("infisicalReadToken");
+    expect(EXTERNAL_WORKSPACE_CREDENTIALS.map((field) => field.name)).toContain("infisicalWriteToken");
+  });
+
+  it("removes an external marker only on an explicit credential clear", () => {
+    const marked = { xai: { url: "https://api.example.test/v1", credentialStorage: "external" } };
+    expect(setWorkspaceCredentialMarker(marked, "xaiApiKey", false)).toEqual({
+      xai: { url: "https://api.example.test/v1" },
+    });
+    expect(setWorkspaceCredentialMarker({ xai: {} }, "xaiApiKey", true)).toEqual({
+      xai: { credentialStorage: "external" },
+    });
+  });
+});
+
+describe("drivers that keep a per-instance key", () => {
+  it("names them once, for both the server and the desktop shell", () => {
+    // One table, two readers: server/config.ts re-exports it for the instance
+    // routes, and the shell's boot-time marker repair walks it.  Two copies of
+    // it is exactly the drift that left MiniMax instances unrepaired.
+    expect([...INSTANCE_API_KEY_ENV]).toEqual([
+      ["openai-compat", "OPENAI_COMPAT_API_KEY"],
+      ["minimax", "MINIMAX_API_KEY"],
+    ]);
+  });
+
+  it("recognises an instance entry by its driver, and nothing else", () => {
+    expect(instanceKeyedDriver({ driver: "minimax" })).toBe(true);
+    expect(instanceKeyedDriver({ driver: "openai-compat" })).toBe(true);
+    // A CLI engine reads a login from the user's home directory; there is no
+    // per-instance key for the encrypted store to hold.
+    expect(instanceKeyedDriver({ driver: "claudeAgent" })).toBe(false);
+    expect(instanceKeyedDriver({ driver: "grok" })).toBe(false);
+    for (const shape of [undefined, null, "minimax", 7, ["minimax"], {}]) {
+      expect(instanceKeyedDriver(shape)).toBe(false);
+    }
   });
 });

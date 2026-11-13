@@ -157,6 +157,10 @@ export function drainDelegations(
     commsDepth: number,
     sourceThreadId: string,
     channel?: GroupRecord,
+    options?: {
+      sender?: { botId: string; name: string; color: string };
+      reason?: string;
+    },
   ) => void | Promise<void>,
 ): void {
   if (drainingThreads.has(threadId)) return;
@@ -238,6 +242,10 @@ async function processOne(
     commsDepth: number,
     sourceThreadId: string,
     channel?: GroupRecord,
+    options?: {
+      sender?: { botId: string; name: string; color: string };
+      reason?: string;
+    },
   ) => void | Promise<void>,
 ): Promise<void> {
   let sender = from;
@@ -297,7 +305,10 @@ async function processOne(
   mirrorExchange(bus, sender, target, item.message, channel, sourceThreadId);
   const reasonLine = item.reason ? `\n\n[Reason: ${item.reason}]` : "";
   const prefixed = `[Delegated by @${sender.name}, another bot in this BotFleet workspace. Do the work and reply directly.]\n\n${item.message}${reasonLine}`;
-  await runTarget(item.toBotId, prefixed, item.depth + 1, sourceThreadId, channel);
+  await runTarget(item.toBotId, prefixed, item.depth + 1, sourceThreadId, channel, {
+    sender: { botId: sender.id, name: sender.name, color: sender.color },
+    reason: item.reason,
+  });
 }
 
 /** Test helper: how many items remain queued for a thread. */

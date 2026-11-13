@@ -14,6 +14,8 @@
 // Pure and synchronous on purpose: it is the piece most likely to need
 // tuning against real transcripts, so it stays trivially testable.
 
+import { SPOKEN_ENTITY, spokenEntity } from "../../shared/speech-spans.ts";
+
 /** A fenced block becomes a mention of itself, with its language if known. */
 function describeCodeBlock(fence: string): string {
   const lang = fence.trim().split(/\s+/)[0]?.replace(/[^a-z0-9+#]/gi, "") ?? "";
@@ -37,7 +39,7 @@ function describeCodeBlock(fence: string): string {
     diff: "diff",
   };
   const name = spoken[lang.toLowerCase()];
-  return name ? `. (a ${name} code block) ` : ". (a code block) ";
+  return name ? `. A ${name} code block. ` : ". A code block. ";
 }
 
 /** `a/b/c/file.ts` → `file.ts`. A path's directories are for the eye. */
@@ -64,7 +66,7 @@ export function speakable(input: string): string {
   text = text.replace(/~~~([^\n]*)\n[\s\S]*?(?:~~~|$)/g, (_m, fence: string) => describeCodeBlock(fence));
 
   // images before links — the syntax differs by one character
-  text = text.replace(/!\[([^\]]*)\]\([^)]*\)/g, (_m, alt: string) => (alt ? `. (image: ${alt}) ` : ". (an image) "));
+  text = text.replace(/!\[([^\]]*)\]\([^)]*\)/g, (_m, alt: string) => (alt ? `. Image: ${alt}. ` : ". An image. "));
   // [label](url) → label; a bare url becomes a noun rather than an alphabet soup
   text = text.replace(/\[([^\]]+)\]\([^)]*\)/g, "$1");
   text = text.replace(/<https?:\/\/[^>\s]+>/g, " a link ");
@@ -110,6 +112,12 @@ export function speakable(input: string): string {
     /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE00}-\u{FE0F}\u{2190}-\u{21FF}\u{2B00}-\u{2BFF}]/gu,
     "",
   );
+
+  // HTML entities read as the character the screen shows.  After the
+  // markdown rules (an entity is text, never syntax), before the whitespace
+  // tidy and the sentence split, which both need the no-break space as a
+  // space.
+  text = text.replace(SPOKEN_ENTITY, (_m, name: string) => spokenEntity(name));
 
   // a blank line is a paragraph break — make it an audible one
   text = text.replace(/\n{2,}/g, ". ");
@@ -209,6 +217,7 @@ export function narrateTool(toolName: string): string | null {
     [/^open_url$/, "opening a page"],
     [/^list_bots$/, "checking who's around"],
     [/^ask_bot$/, "asking a teammate"],
+    [/^coordinate_bots$/, "handing work to a teammate"],
   ];
   for (const [pattern, phrase] of verbs) {
     if (pattern.test(bare)) return phrase;

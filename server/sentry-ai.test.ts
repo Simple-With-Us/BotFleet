@@ -1,0 +1,1488 @@
+import { afterEach, describe, expect, it } from "vitest";
+import {
+  annotatePromptBudget,
+  captureTurnPrompt,
+  classifyMessage,
+  configureTurnIdentity,
+  formatGenAiMessages,
+  genAiProvider,
+  isPromptCaptureEnabled,
+  observeRuntimeEvent,
+  recordExecutedTools,
+  resetSentryAiForTests,
+  type SentryAiSink,
+  type SentryBreadcrumb,
+  type SentryCaptureContext,
+  type SentryMessageContext,
+  type SpanLike,
+  withChatSpan,
+} from "./sentry-ai.ts";
+import { describeResult } from "../shared/tool-activity.ts";
+import type { RuntimeEvent } from "./contracts.ts";
+import {
+  resetSentryFleetForTests,
+  setFleetSinkForTests,
+  type FleetCapture,
+} from "./sentry-fleet.ts";
+
+function base(over: Partial<RuntimeEvent> & Pick<RuntimeEvent, "type">): RuntimeEvent {
+  const event = {
+    eventId: "e1",
+    provider: "openai-compat",
+    threadId: "thread-1",
+    turnId: "turn-1",
+    createdAt: "2026-09-01T00:00:00.000Z",
+    ...over,
+  };
+  // SAFETY: tests assemble a RuntimeEvent from the required base plus one typed variant.
+  return event as RuntimeEvent;
+}
+
+function recordingSink() {
+  const spans: Array<{
+    op: string;
+    name: string;
+    attributes: Record<string, string | number | boolean>;
+    ended: boolean;
+    status?: { code: number; message?: string };
+    /** The handle this sink handed back, and the handle it was told to nest
+     *  under.  Identity, not a name — comparing these two is what proves a
+     *  real trace-tree parent/child rather than two spans that merely share
+     *  a gen_ai.conversation.id.  Neither survives JSON.stringify (a
+     *  SpanLike is all functions), so the "nothing sensitive on the wire"
+     *  assertions elsewhere in this file are unaffected. */
+    handle?: SpanLike;
+    parent?: SpanLike;
+  }> = [];
+  const exceptions: unknown[] = [];
+  const contexts: Array<SentryCaptureContext | undefined> = [];
+  const breadcrumbs: SentryBreadcrumb[] = [];
+  const messages: Array<{ message: string; context?: SentryMessageContext }> = [];
+  const conversations: string[] = [];
+  const users: Array<{ id?: string; username?: string; email?: string } | null> = [];
+  const sink: SentryAiSink = {
+    setConversationId: (id) => conversations.push(id),
+    setUser: (user) => users.push(user),
+    startInactiveSpan: (opts) => {
+      // SAFETY: the field starts unset and only setStatus ever writes it, so
+      // the assertion widens `undefined` to the shape that write produces.
+      const emptyStatus = undefined as { code: number; message?: string } | undefined;
+      const rec = {
+        op: opts.op,
+        name: opts.name,
+        attributes: { ...opts.attributes },
+        ended: false,
+        status: emptyStatus,
+        // SAFETY: recording sink stub — root spans have no parent handle in tests.
+        handle: undefined as SpanLike | undefined,
+        parent: opts.parentSpan,
+      };
+      const handle: SpanLike = {
+        setAttribute: (key, value) => {
+          rec.attributes[key] = value;
+        },
+        setStatus: (status) => {
+          rec.status = status;
+        },
+        end: () => {
+          rec.ended = true;
+        },
+      };
+      rec.handle = handle;
+      spans.push(rec);
+      return handle;
+    },
+    captureException: (error, context) => {
+      exceptions.push(error);
+      contexts.push(context);
+    },
+    captureMessage: (message, context) => {
+      messages.push({ message, context });
+    },
+    addBreadcrumb: (crumb) => breadcrumbs.push(crumb),
+  };
+  return { sink, spans, exceptions, contexts, breadcrumbs, messages, conversations, users };
+}
+
+afterEach(() => {
+  resetSentryAiForTests();
+  resetSentryFleetForTests();
+});
+
+describe("Sentry AI observability", () => {
+  it("is a no-op without a sink so tests never talk to Sentry", () => {
+    observeRuntimeEvent(base({ type: "turn.started" }), null);
+    recordExecutedTools("thread-1", ["bash"], null);
+  });
+
+  it("stamps actual turn cost and skips estimated or invalid figures", () => {
+    const { sink, spans } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: true, usage: { input: 2, output: 1 }, cost: 0.0421 }), sink);
+    expect(spans[0].attributes["gen_ai.usage.cost"]).toBe(0.0421);
+
+    resetSentryAiForTests();
+    const estimated = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), estimated.sink);
+    observeRuntimeEvent(
+      base({ type: "turn.completed", ok: true, usage: { input: 2, output: 1 }, cost: 0.0421, billingMode: "estimated" }),
+      estimated.sink,
+    );
+    expect(estimated.spans[0].attributes["gen_ai.usage.cost"]).toBeUndefined();
+    expect(estimated.spans[0].attributes["botfleet.cost.estimated_usd"]).toBe(0.0421);
+
+    resetSentryAiForTests();
+    const invalid = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), invalid.sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: true, cost: Number.NaN }), invalid.sink);
+    expect(invalid.spans[0].attributes["gen_ai.usage.cost"]).toBeUndefined();
+  });
+
+  it("stamps input tokens without a fabricated output figure when a driver reports only one side (DSH)", () => {
+    // DSH's ACP `usage_update` reports a combined context-occupancy number,
+    // never a real input/output split (see server/drivers/acp/core.ts's
+    // usage_update handling) — output must stay unset, not a fake 0.
+    const { sink, spans } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "thread.token-usage.updated", input: 900 }), sink);
+    expect(spans[0].attributes["gen_ai.usage.input_tokens"]).toBe(900);
+    expect(spans[0].attributes).not.toHaveProperty("gen_ai.usage.output_tokens");
+
+    observeRuntimeEvent(base({ type: "turn.completed", ok: true, usage: { input: 950 } }), sink);
+    expect(spans[0].attributes["gen_ai.usage.input_tokens"]).toBe(950);
+    expect(spans[0].attributes).not.toHaveProperty("gen_ai.usage.output_tokens");
+  });
+
+  it("keeps the turn alive when conversation tagging throws", () => {
+    const { sink, spans } = recordingSink();
+    sink.setConversationId = () => {
+      throw new Error("setConversationId exploded");
+    };
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    expect(spans).toHaveLength(1);
+    expect(spans[0].op).toBe("gen_ai.invoke_agent");
+  });
+
+  it("names invoke_agent after the bot, not the driver kind", () => {
+    configureTurnIdentity(() => ({ botName: "Scout" }));
+    const { sink, spans } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    expect(spans[0].name).toBe("invoke_agent Scout");
+    expect(spans[0].attributes["gen_ai.agent.name"]).toBe("Scout");
+  });
+
+  it("attaches prompt bytes before and after, and the trimmed flag, to the invoke_agent span", () => {
+    const { sink, spans } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    annotatePromptBudget("thread-1", "turn-1", {
+      before: { stable: 4000, volatile: 9000 },
+      after: { stable: 4000, volatile: 120 },
+      trimmed: true,
+    });
+    expect(spans[0].op).toBe("gen_ai.invoke_agent");
+    expect(spans[0].attributes["botfleet.prompt.stable_bytes_before"]).toBe(4000);
+    expect(spans[0].attributes["botfleet.prompt.volatile_bytes_before"]).toBe(9000);
+    expect(spans[0].attributes["botfleet.prompt.stable_bytes_after"]).toBe(4000);
+    expect(spans[0].attributes["botfleet.prompt.volatile_bytes_after"]).toBe(120);
+    expect(spans[0].attributes["botfleet.prompt.trimmed"]).toBe(true);
+    expect(() => annotatePromptBudget("missing", "turn", {
+      before: { stable: 1, volatile: 1 },
+      after: { stable: 1, volatile: 1 },
+      trimmed: false,
+    })).not.toThrow();
+  });
+
+  it("opens an invoke_agent span, tags the conversation, model, tokens, and tools", () => {
+    const { sink, spans, conversations } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "session.started", sessionId: "s", model: "gpt-test" }), sink);
+    observeRuntimeEvent(
+      base({ type: "item.started", itemType: "tool", itemId: "tool-1", title: "bash ls" }),
+      sink,
+    );
+    observeRuntimeEvent(base({ type: "item.completed", itemType: "tool", itemId: "tool-1", ok: true }), sink);
+    observeRuntimeEvent(base({ type: "thread.token-usage.updated", input: 11, output: 7 }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: true, usage: { input: 11, output: 7 } }), sink);
+
+    // The conversation id is the per-task turnId, not the persistent
+    // threadId — see "Sentry Agents conversation identity" below.  The
+    // threadId still rides along as botfleet.room_id so it is never lost.
+    expect(conversations[0]).toBe("turn-1");
+    expect(spans.map((s) => s.op)).toEqual(["gen_ai.invoke_agent", "gen_ai.execute_tool"]);
+    expect(spans[0].attributes["gen_ai.conversation.id"]).toBe("turn-1");
+    expect(spans[0].attributes["botfleet.room_id"]).toBe("thread-1");
+    expect(spans[1].attributes["gen_ai.conversation.id"]).toBe("turn-1");
+    expect(spans[1].attributes["botfleet.room_id"]).toBe("thread-1");
+    expect(spans[0].attributes["gen_ai.request.model"]).toBe("gpt-test");
+    expect(spans[0].attributes["gen_ai.usage.input_tokens"]).toBe(11);
+    expect(spans[0].attributes["gen_ai.usage.output_tokens"]).toBe(7);
+    expect(spans[1].attributes["gen_ai.tool.name"]).toBe("bash");
+    expect(spans[1].attributes["gen_ai.system"]).toBe("openai-compat");
+    expect(spans[1].attributes["gen_ai.provider.name"]).toBe("openai-compat");
+    expect(spans[1].attributes["gen_ai.request.model"]).toBe("gpt-test");
+    expect(spans.every((s) => s.ended)).toBe(true);
+  });
+
+  it("captures runtime errors without attaching prompt text", () => {
+    const { sink, exceptions, spans } = recordingSink();
+    observeRuntimeEvent(base({ type: "runtime.error", message: "upstream HTTP 500" }), sink);
+    expect(exceptions).toHaveLength(1);
+    expect(String(exceptions[0])).toContain("upstream HTTP 500");
+    expect(JSON.stringify(spans)).not.toMatch(/sk-|password|BEGIN /);
+  });
+
+  it("reports one attributed actual error for repeated runtime errors and the failed completion of the same turn", () => {
+    configureTurnIdentity(() => ({
+      botId: "bot-1",
+      instanceId: "instance-1",
+      model: "model-1",
+      roomId: "room-1",
+    }));
+    const { sink, exceptions, contexts } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "runtime.error", message: "upstream HTTP 500" }), sink);
+    observeRuntimeEvent(base({ type: "runtime.error", message: "child exited after HTTP 500" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "exit code 1" }), sink);
+
+    expect(exceptions).toHaveLength(1);
+    expect(String(exceptions[0])).toContain("upstream HTTP 500");
+    expect(contexts[0]?.tags).toMatchObject({
+      "botfleet.bot.id": "bot-1",
+      "botfleet.instance.id": "instance-1",
+      "botfleet.room.id": "room-1",
+      "botfleet.provider": "openai-compat",
+      "botfleet.thread.id": "thread-1",
+      "gen_ai.provider.name": "openai-compat",
+      "gen_ai.request.model": "model-1",
+    });
+  });
+
+  it("deduplicates a runtime error when diagnostics starts after the turn span", () => {
+    configureTurnIdentity(() => ({
+      botId: "bot-1",
+      instanceId: "instance-1",
+      model: "model-1",
+      roomId: "room-1",
+    }));
+    const { sink, exceptions, contexts } = recordingSink();
+    observeRuntimeEvent(base({ type: "runtime.error", message: "provider process exited" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "exit code 1" }), sink);
+
+    expect(exceptions).toHaveLength(1);
+    expect(String(exceptions[0])).toContain("provider process exited");
+    expect(contexts[0]?.tags).toMatchObject({
+      "botfleet.bot.id": "bot-1",
+      "botfleet.instance.id": "instance-1",
+      "botfleet.room.id": "room-1",
+      "botfleet.provider": "openai-compat",
+      "botfleet.thread.id": "thread-1",
+      "gen_ai.provider.name": "openai-compat",
+      "gen_ai.request.model": "model-1",
+    });
+  });
+
+  it("does not carry runtime-error suppression into a later turn on the same thread", () => {
+    const { sink, exceptions } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "runtime.error", message: "first turn failed" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "exit code 1" }), sink);
+    observeRuntimeEvent(base({ type: "turn.started", turnId: "turn-2" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", turnId: "turn-2", ok: false, stopReason: "exit code 2" }), sink);
+
+    expect(exceptions).toHaveLength(2);
+    expect(String(exceptions[0])).toContain("first turn failed");
+    expect(String(exceptions[1])).toContain("bot turn failed: exit code 2");
+  });
+
+  it("does not let an event-log warning hide the provider failure for the same turn", () => {
+    const { sink, exceptions } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({
+      type: "runtime.error",
+      message: "Canonical event history is incomplete",
+      raw: { source: "botfleet.event-log", payload: { kind: "write-failed" } },
+    }), sink);
+    observeRuntimeEvent(base({ type: "runtime.error", message: "provider process exited" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "exit code 1" }), sink);
+
+    expect(exceptions).toHaveLength(2);
+    expect(String(exceptions[0])).toContain("event history is incomplete");
+    expect(String(exceptions[1])).toContain("provider process exited");
+  });
+
+  it("clears an unterminated turn's error boundary when its session exits", () => {
+    const { sink, exceptions } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "runtime.error", message: "session one failed" }), sink);
+    observeRuntimeEvent(base({ type: "session.exited", reason: "child exited" }), sink);
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "runtime.error", message: "session two failed" }), sink);
+
+    expect(exceptions).toHaveLength(2);
+  });
+
+  it("does not Issue a setup runtime.error (operator login)", () => {
+    const { sink, exceptions, breadcrumbs } = recordingSink();
+    observeRuntimeEvent(
+      base({ type: "runtime.error", message: "Grok CLI is not signed in — run `grok login` in a terminal", setup: true }),
+      sink,
+    );
+    expect(exceptions).toHaveLength(0);
+    expect(breadcrumbs.some((b) => b.message.includes("not signed in"))).toBe(true);
+  });
+
+  it("does not Issue expected non-crash runtime errors (ACP resume failure, permission timeout, provider timeout)", () => {
+    const { sink, exceptions, breadcrumbs } = recordingSink();
+    observeRuntimeEvent(
+      base({ type: "runtime.error", message: "The saved ACP session could not be resumed.  Start a fresh task or rewind this conversation to replay its visible history." }),
+      sink,
+    );
+    observeRuntimeEvent(
+      base({ type: "runtime.error", message: "BotFleet: nobody answered this permission request in time. Skip this action and finish what you can without it." }),
+      sink,
+    );
+    observeRuntimeEvent(
+      base({ type: "runtime.error", message: "Antigravity: timeout waiting for response" }),
+      sink,
+    );
+    expect(exceptions).toHaveLength(0);
+    expect(breadcrumbs).toHaveLength(3);
+  });
+
+  it("records API-backed tool names and chat tokens without messages", async () => {
+    const { sink, spans } = recordingSink();
+    recordExecutedTools("thread-9", ["read_file", "write_file"], sink);
+    expect(spans.map((s) => s.attributes["gen_ai.tool.name"])).toEqual(["read_file", "write_file"]);
+    expect(spans.every((s) => s.ended)).toBe(true);
+
+    const result = await withChatSpan(
+      { model: "llama-test", conversationId: "thread-9", provider: "openai" },
+      async () => ({ text: "ok", usage: { input: 3, output: 1 } }),
+      sink,
+    );
+    expect(result.text).toBe("ok");
+    const chat = spans.find((s) => s.op === "gen_ai.chat");
+    expect(chat?.attributes["gen_ai.request.model"]).toBe("llama-test");
+    expect(chat?.attributes["gen_ai.usage.input_tokens"]).toBe(3);
+    expect(chat?.attributes["gen_ai.conversation.id"]).toBe("thread-9");
+    expect(JSON.stringify(spans)).not.toMatch(/prompt|messages|sk-/);
+  });
+
+  it("uses taskId for gen_ai.conversation.id when the caller has a turnId, and keeps conversationId as botfleet.room_id", async () => {
+    const { sink, spans } = recordingSink();
+    await withChatSpan(
+      { model: "MiniMax-M3", conversationId: "thread-9", taskId: "turn-42", provider: "minimax" },
+      async () => ({ text: "ok", usage: undefined }),
+      sink,
+    );
+    const chat = spans.find((s) => s.op === "gen_ai.chat");
+    expect(chat?.attributes["gen_ai.conversation.id"]).toBe("turn-42");
+    expect(chat?.attributes["botfleet.room_id"]).toBe("thread-9");
+  });
+
+  it("recordExecutedTools takes an optional taskId the same way, defaulting to the thread", () => {
+    const { sink, spans } = recordingSink();
+    recordExecutedTools("thread-9", ["grep"], sink, "turn-42");
+    expect(spans[0].attributes["gen_ai.conversation.id"]).toBe("turn-42");
+    expect(spans[0].attributes["botfleet.room_id"]).toBe("thread-9");
+
+    const untagged = recordingSink();
+    recordExecutedTools("thread-9", ["grep"], untagged.sink);
+    expect(untagged.spans[0].attributes["gen_ai.conversation.id"]).toBe("thread-9");
+  });
+
+  it("attaches cached input tokens to the chat span when present", async () => {
+    const { sink, spans } = recordingSink();
+    await withChatSpan(
+      { model: "MiniMax-M3", conversationId: "thread-cached", provider: "minimax" },
+      async () => ({ text: "ok", usage: { input: 100, output: 50, cachedInput: 40 } }),
+      sink,
+    );
+
+    const chat = spans.find((s) => s.op === "gen_ai.chat");
+    expect(chat?.attributes["gen_ai.usage.input_tokens"]).toBe(100);
+    expect(chat?.attributes["gen_ai.usage.output_tokens"]).toBe(50);
+    expect(chat?.attributes["gen_ai.usage.input_tokens.cached"]).toBe(40);
+  });
+
+  it("preserves streamed usage on the chat span when the round fails mid-stream", async () => {
+    const { sink, spans } = recordingSink();
+    await expect(
+      withChatSpan(
+        { model: "MiniMax-M3", conversationId: "thread-fail", provider: "minimax" },
+        async ({ recordUsage }) => {
+          recordUsage({ input: 80, output: 20, cachedInput: 15 });
+          throw new Error("stream disconnected abruptly");
+        },
+        sink,
+      ),
+    ).rejects.toThrow("stream disconnected abruptly");
+
+    const chat = spans.find((s) => s.op === "gen_ai.chat");
+    expect(chat).toBeDefined();
+    expect(chat?.attributes["gen_ai.usage.input_tokens"]).toBe(80);
+    expect(chat?.attributes["gen_ai.usage.output_tokens"]).toBe(20);
+    expect(chat?.attributes["gen_ai.usage.input_tokens.cached"]).toBe(15);
+    expect(chat?.status).toEqual({ code: 2, message: "internal_error" });
+    expect(chat?.ended).toBe(true);
+  });
+
+  it("nests the chat span under the turn's invoke_agent span, not merely beside it", async () => {
+    // Sharing a gen_ai.conversation.id only CORRELATES two spans.  Sentry's
+    // AI Agents view reads the trace tree, so a chat round that is not an
+    // actual child of the turn shows up as its own root next to the turn
+    // instead of as a step inside it.
+    const { sink, spans } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    await withChatSpan(
+      { model: "MiniMax-M3", conversationId: "thread-1", provider: "minimax" },
+      async () => ({ text: "ok", usage: { input: 2, output: 1 } }),
+      sink,
+    );
+
+    const turn = spans.find((s) => s.op === "gen_ai.invoke_agent");
+    const chat = spans.find((s) => s.op === "gen_ai.chat");
+    expect(turn).toBeDefined();
+    expect(chat).toBeDefined();
+    expect(chat?.parent).toBe(turn?.handle);
+  });
+
+  it("nests every round of a multi-round turn under that same turn span", async () => {
+    const { sink, spans } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    for (const model of ["MiniMax-M3", "MiniMax-M3"]) {
+      await withChatSpan(
+        { model, conversationId: "thread-1", provider: "minimax" },
+        async () => ({ text: "ok", usage: { input: 1, output: 1 } }),
+        sink,
+      );
+    }
+
+    const turn = spans.find((s) => s.op === "gen_ai.invoke_agent");
+    const chats = spans.filter((s) => s.op === "gen_ai.chat");
+    expect(chats).toHaveLength(2);
+    expect(chats.every((s) => s.parent === turn?.handle)).toBe(true);
+  });
+
+  it("leaves the parent unset — never null — for a chat round with no open turn", async () => {
+    // generateText's title and summary rounds run outside any turn.  An
+    // explicit null parent would make each of them a trace ROOT; leaving it
+    // unset keeps Sentry's own default parenting.
+    const { sink, spans } = recordingSink();
+    await withChatSpan(
+      { model: "MiniMax-M2.7-highspeed", conversationId: "thread-with-no-turn", provider: "minimax" },
+      async () => ({ text: "a title", usage: null }),
+      sink,
+    );
+
+    const chat = spans.find((s) => s.op === "gen_ai.chat");
+    expect(chat).toBeDefined();
+    expect(chat?.parent).toBeUndefined();
+  });
+
+  it("stops nesting under a turn once that turn has ended", async () => {
+    const { sink, spans } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: true }), sink);
+    await withChatSpan(
+      { model: "MiniMax-M3", conversationId: "thread-1", provider: "minimax" },
+      async () => ({ text: "ok", usage: null }),
+      sink,
+    );
+
+    expect(spans.find((s) => s.op === "gen_ai.chat")?.parent).toBeUndefined();
+  });
+});
+
+describe("failed turns become Issues", () => {
+  it("captures exactly one exception, tagged, when a turn ends not ok", () => {
+    const { sink, exceptions, contexts, spans } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "session.started", sessionId: "s", model: "gpt-test" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "exit code 1" }), sink);
+
+    expect(exceptions).toHaveLength(1);
+    expect(String(exceptions[0])).toContain("bot turn failed: exit code 1");
+    expect(contexts[0]?.tags).toMatchObject({
+      "botfleet.provider": "openai-compat",
+      "botfleet.thread.id": "thread-1",
+      "gen_ai.provider.name": "openai-compat",
+      "gen_ai.request.model": "gpt-test",
+    });
+    expect(spans[0].status).toEqual({ code: 2, message: "internal_error" });
+    expect(spans[0].ended).toBe(true);
+  });
+
+  it("captures nothing when a turn ends ok", () => {
+    const { sink, exceptions } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: true, usage: { input: 1, output: 1 } }), sink);
+    expect(exceptions).toHaveLength(0);
+  });
+
+  it("says unknown rather than null when the driver reports no stop reason", () => {
+    const { sink, exceptions } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: null }), sink);
+    expect(String(exceptions[0])).toContain("bot turn failed: unknown");
+  });
+
+  it("does not Issue expected setup or cancel stop reasons", () => {
+    const { sink, exceptions, breadcrumbs, spans } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "auth_required" }), sink);
+    observeRuntimeEvent(base({ type: "turn.started", turnId: "turn-2" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "cancelled", turnId: "turn-2" }), sink);
+    expect(exceptions).toHaveLength(0);
+    expect(breadcrumbs.filter((b) => b.message.startsWith("bot turn failed:")).length).toBe(2);
+    expect(spans.map((span) => span.status)).toEqual([undefined, undefined]);
+    expect(spans.every((span) => span.ended)).toBe(true);
+  });
+
+  it("does not Issue a request_timeout completion after the timeout runtime.error breadcrumb", () => {
+    // The 180s model-request timeout breadcrumbs runtime.error ("the model
+    // did not answer within") as an expected condition, then the turn ends
+    // not-ok with stopReason "request_timeout".  The completion must not
+    // escalate to a Sentry Issue.
+    const { sink, exceptions, breadcrumbs } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(
+      base({ type: "runtime.error", message: "the model did not answer within 180s" }),
+      sink,
+    );
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "request_timeout" }), sink);
+    expect(exceptions).toHaveLength(0);
+    expect(breadcrumbs.filter((b) => b.message.startsWith("bot turn failed:")).length).toBe(1);
+  });
+
+  it("breadcrumbs MiniMax Code lock contention instead of paging an Issue", () => {
+    const { sink, exceptions, breadcrumbs } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started", provider: "mcodeAgent" }), sink);
+    observeRuntimeEvent(
+      base({
+        type: "runtime.error",
+        provider: "mcodeAgent",
+        message: "MiniMax Code Runtime failed: Lock file is already being held",
+      }),
+      sink,
+    );
+    expect(exceptions).toHaveLength(0);
+    expect(breadcrumbs.some((b) => b.message.includes("Lock file is already being held"))).toBe(true);
+  });
+
+  it("does not Issue an rpc_error completion after an ACP init-timeout breadcrumb", () => {
+    // An ACP "initialize timed out" is breadcrumbed as expected, then the
+    // turn completes as a generic rpc_error — that completion must not page
+    // a second report for the same condition.
+    const { sink, exceptions, breadcrumbs } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "runtime.error", message: "initialize timed out" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "rpc_error" }), sink);
+    expect(exceptions).toHaveLength(0);
+    expect(breadcrumbs.filter((b) => b.message.startsWith("bot turn failed:")).length).toBe(1);
+  });
+
+  it("still Issues an rpc_error completion with no preceding init timeout", () => {
+    const { sink, exceptions } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "rpc_error" }), sink);
+    expect(exceptions).toHaveLength(1);
+    expect(String(exceptions[0])).toContain("bot turn failed: rpc_error");
+  });
+
+  it("still Issues a genuinely failed completion after an expected timeout breadcrumb", () => {
+    // Marking nothing as reported: a later real failure on the same turn
+    // must still page.
+    const { sink, exceptions } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(
+      base({ type: "runtime.error", message: "the model did not answer within 180s" }),
+      sink,
+    );
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "exit code 1" }), sink);
+    expect(exceptions).toHaveLength(1);
+    expect(String(exceptions[0])).toContain("bot turn failed: exit code 1");
+  });
+
+  it("does not Issue an 'interrupted' stop reason (openai-compat/Grok/BoxAgent stop shape)", () => {
+    // Those drivers report a user-initiated stop as stopReason "interrupted"
+    // rather than "cancelled" — this must be treated as the same expected,
+    // benign shape of a stop, not sent to Sentry as an error.
+    const { sink, exceptions, breadcrumbs, spans } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "interrupted" }), sink);
+    expect(exceptions).toHaveLength(0);
+    expect(breadcrumbs.filter((b) => b.message.startsWith("bot turn failed:")).length).toBe(1);
+    expect(spans[0].status).toBeUndefined();
+    expect(spans[0].ended).toBe(true);
+  });
+
+  it("keeps a provider error status when a later stop says cancelled", () => {
+    const { sink, exceptions, spans } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "runtime.error", message: "upstream HTTP 500" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "cancelled" }), sink);
+    expect(exceptions).toHaveLength(1);
+    expect(spans[0].status).toEqual({ code: 2, message: "internal_error" });
+  });
+
+  it("does not Issue a request_timeout completion after the timeout runtime.error breadcrumb", () => {
+    // The 180s model-request timeout breadcrumbs runtime.error ("the model
+    // did not answer within") as an expected condition, then the turn ends
+    // not-ok with stopReason "request_timeout".  The completion must not
+    // escalate to a Sentry Issue.
+    const { sink, exceptions, breadcrumbs } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(
+      base({ type: "runtime.error", message: "the model did not answer within 180s" }),
+      sink,
+    );
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "request_timeout" }), sink);
+    expect(exceptions).toHaveLength(0);
+    expect(breadcrumbs.filter((b) => b.message.startsWith("bot turn failed:")).length).toBe(1);
+  });
+
+  it("does not Issue an rpc_error completion after an ACP init-timeout breadcrumb", () => {
+    const { sink, exceptions, breadcrumbs } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "runtime.error", message: "initialize timed out" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "rpc_error" }), sink);
+    expect(exceptions).toHaveLength(0);
+    expect(breadcrumbs.filter((b) => b.message.startsWith("bot turn failed:")).length).toBe(1);
+  });
+
+  it("still Issues an rpc_error completion with no preceding init timeout", () => {
+    const { sink, exceptions } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "rpc_error" }), sink);
+    expect(exceptions).toHaveLength(1);
+    expect(String(exceptions[0])).toContain("bot turn failed: rpc_error");
+  });
+
+  it("still Issues a stop_sequence completion — it is not a benign stop reason here", () => {
+    // BOTFLEET-K / board 28a249c3 / Seer PR #605: production events tagged
+    // stopReason "stop_sequence" were all real Anthropic API failures
+    // (is_error: true, terminal_reason "api_error", api_error_status 429) —
+    // "stop_sequence" was a stale value left over from the CLI's
+    // result-builder on a request that never got a real model response, not
+    // a genuine benign model-side stop. A genuinely benign stop_sequence
+    // completion has is_error: false and so never reaches this branch at
+    // all (see the "normalizes a full turn" driver test's stopReason:
+    // "end_turn" pin). Allowlisting "stop_sequence" here, as #605 proposed,
+    // would silently swallow every one of those rate-limit failures instead
+    // of surfacing them. The real fix is in the driver
+    // (server/drivers/claude.ts): prefer terminal_reason over stop_reason
+    // on a failed turn, so this case now arrives here as stopReason
+    // "api_error", asserted below — not "stop_sequence".
+    const { sink, exceptions, breadcrumbs } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "stop_sequence" }), sink);
+    expect(exceptions).toHaveLength(1);
+    expect(String(exceptions[0])).toContain("bot turn failed: stop_sequence");
+    expect(breadcrumbs.filter((b) => b.message.startsWith("bot turn failed:"))).toHaveLength(0);
+  });
+
+  it("still Issues an api_error completion — a real Anthropic-side failure, not expected/setup", () => {
+    const { sink, exceptions } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "api_error" }), sink);
+    expect(exceptions).toHaveLength(1);
+    expect(String(exceptions[0])).toContain("bot turn failed: api_error");
+  });
+
+});
+
+describe("approval, retry, and session lifecycle", () => {
+  it("ends the approval span with the decision before the turn completes", () => {
+    const { sink, spans } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(
+      base({
+        type: "request.opened",
+        requestId: "req-1",
+        requestType: "permission",
+        tool: "bash",
+        summary: "run ls",
+      }),
+      sink,
+    );
+    const approval = spans[1];
+    expect(approval.op).toBe("gen_ai.execute_tool");
+    expect(approval.ended).toBe(false);
+
+    observeRuntimeEvent(
+      base({ type: "request.resolved", requestId: "req-1", behavior: "allow", source: "user" }),
+      sink,
+    );
+    expect(approval.attributes["botfleet.approval.behavior"]).toBe("allow");
+    expect(approval.attributes["botfleet.approval.source"]).toBe("user");
+    expect(approval.ended).toBe(true);
+
+    observeRuntimeEvent(base({ type: "turn.completed", ok: true }), sink);
+    expect(spans.every((s) => s.ended)).toBe(true);
+  });
+
+  it("records a breadcrumb when a turn is retried", () => {
+    const { sink, breadcrumbs, spans } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(
+      base({ type: "turn.retrying", attempt: 2, delayMs: 1500, reason: "transport reset" }),
+      sink,
+    );
+    expect(breadcrumbs).toHaveLength(1);
+    expect(breadcrumbs[0].message).toBe("turn retrying: transport reset");
+    expect(breadcrumbs[0].data).toMatchObject({ attempt: 2, delayMs: 1500 });
+    // A retry is not a new span.
+    expect(spans).toHaveLength(1);
+  });
+
+  it("closes an open turn when the session exits under it", () => {
+    const { sink, spans } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(
+      base({ type: "item.started", itemType: "tool", itemId: "tool-1", title: "bash ls" }),
+      sink,
+    );
+    observeRuntimeEvent(base({ type: "session.exited", reason: "cli exited" }), sink);
+    expect(spans.every((s) => s.ended)).toBe(true);
+    expect(spans[0].status).toEqual({ code: 2, message: "internal_error" });
+  });
+
+  it("attaches a failed tool's detail, clipped, and never its arguments", () => {
+    const { sink, spans } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(
+      base({ type: "item.started", itemType: "tool", itemId: "tool-1", title: "bash ls" }),
+      sink,
+    );
+    observeRuntimeEvent(
+      base({
+        type: "item.completed",
+        itemType: "tool",
+        itemId: "tool-1",
+        ok: false,
+        detail: "x".repeat(500),
+        arguments: '{"password":"sk-secret"}',
+      }),
+      sink,
+    );
+    const detail = spans[1].attributes["gen_ai.tool.result.detail"];
+    expect(detail).toEqual(expect.any(String));
+    expect(String(detail)).toHaveLength(200);
+    expect(spans[1].status).toEqual({ code: 2, message: "internal_error" });
+    expect(JSON.stringify(spans)).not.toMatch(/sk-|password|BEGIN /);
+  });
+
+  it("redacts a secret in a failed tool's detail before it reaches the span", () => {
+    // event.detail is real provider output (stdout/stderr/error text a
+    // driver read back from the tool call, not a synthetic message), so a
+    // failed command that echoed a credential must not reach Sentry intact.
+    const { sink, spans } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(
+      base({ type: "item.started", itemType: "tool", itemId: "tool-1", title: "bash curl" }),
+      sink,
+    );
+    observeRuntimeEvent(
+      base({
+        type: "item.completed",
+        itemType: "tool",
+        itemId: "tool-1",
+        ok: false,
+        detail: 'curl failed: {"api_key": "abcd1234efgh5678"}',
+      }),
+      sink,
+    );
+    const detail = String(spans[1].attributes["gen_ai.tool.result.detail"]);
+    expect(detail).not.toContain("abcd1234efgh5678");
+    expect(detail).toContain("«redacted 16 chars»");
+  });
+
+  // ── the real driver-to-Sentry path ──────────────────────────────────
+  // Every production driver builds a failed tool's `detail` by handing the
+  // provider's raw result to `describeResult()`, which clips it to 240
+  // characters.  That clip used to run BEFORE any redaction, so a secret
+  // longer than the clip lost the closing marker its pattern anchors on and
+  // the first 200 characters went to Sentry intact.  These tests drive that
+  // exact path — the driver's own payload shape, through the driver's own
+  // `describeResult()` call, into the observer that sets the span attribute
+  // — rather than handing `observeRuntimeEvent` a pre-redacted string.
+
+  /** Obviously-fake credential material, assembled from pieces so no
+   *  token-shaped literal sits in the source and nobody mistakes it for a
+   *  live key.  Each one is longer than DETAIL_LIMIT on purpose. */
+  const FAKE_PEM_BODY = "FAKEFAKE".repeat(38); // 304 chars of nothing
+  const FAKE_PEM = `-----BEGIN RSA PRIVATE KEY-----\n${FAKE_PEM_BODY}\n-----END RSA PRIVATE KEY-----`;
+  const FAKE_JWT = `eyJhbGciOiJGQUtFIn0.eyJwYXlsb2FkIjoi${"RkFLRQ".repeat(40)}.RkFLRVNJRw`;
+  const FAKE_OPAQUE = `FAKE${"0123456789".repeat(30)}`; // a 304-char opaque value
+  const FAKE_SECRETS = [FAKE_PEM_BODY, FAKE_JWT, FAKE_OPAQUE];
+
+  /** One failed tool's output carrying all three shapes, the way a `curl -v`
+   *  or a `cat` of a config file would print them. */
+  const rawFailedOutput = [
+    "$ deploy --verbose",
+    FAKE_PEM,
+    `POST /v1/deploy 401 {"api_key":"${FAKE_OPAQUE}","retry":false}`,
+    `sent Authentication: ${FAKE_JWT}`,
+    "exit 1",
+  ].join("\n");
+
+  /** The payload shape each driver actually hands `describeResult()`, at the
+   *  line noted.  If a driver changes shape, this table is what fails. */
+  const driverPayloads: Array<[string, unknown]> = [
+    // server/drivers/codex.ts — item.aggregatedOutput, a plain string
+    ["codex", rawFailedOutput],
+    // server/drivers/claude.ts — b.content, Claude tool_result blocks
+    ["claude", [{ type: "text", text: rawFailedOutput }]],
+    // server/drivers/pi.ts — evt.result, an object the harness wraps
+    ["pi", { output: rawFailedOutput }],
+    // server/drivers/acp/core.ts — u.content, ACP content blocks
+    ["acp", [{ type: "content", content: { type: "text", text: rawFailedOutput } }]],
+  ];
+
+  for (const [driver, payload] of driverPayloads) {
+    it(`redacts a failed tool result on the ${driver} driver's path to Sentry`, () => {
+      // exactly what the driver call site does
+      const detailFromDriver = describeResult(payload);
+      expect(detailFromDriver, "the driver produced no detail at all").toBeTruthy();
+
+      const { sink, spans } = recordingSink();
+      observeRuntimeEvent(base({ type: "turn.started" }), sink);
+      observeRuntimeEvent(
+        base({ type: "item.started", itemType: "tool", itemId: "tool-1", title: "bash deploy" }),
+        sink,
+      );
+      observeRuntimeEvent(
+        base({ type: "item.completed", itemType: "tool", itemId: "tool-1", ok: false, detail: detailFromDriver }),
+        sink,
+      );
+
+      const detail = String(spans[1].attributes["gen_ai.tool.result.detail"]);
+      // nothing secret-shaped survives, at any prefix length the clip could
+      // have left behind
+      for (const secret of FAKE_SECRETS) {
+        for (const length of [16, 24, 40, 80]) {
+          expect(detail, `${driver}: ${secret.slice(0, 12)}… survived`).not.toContain(secret.slice(0, length));
+        }
+      }
+      expect(detail).not.toMatch(/eyJ[A-Za-z0-9_-]{8,}\./);
+      // and the shape a reader debugs with is still there
+      expect(detail).toContain("BEGIN RSA PRIVATE KEY");
+      expect(detail).toMatch(/«redacted \d+ chars»/);
+      expect(JSON.stringify(spans)).not.toContain(FAKE_OPAQUE.slice(0, 24));
+    });
+  }
+
+  it("redacts before describeResult clips, so the closing markers still exist", () => {
+    // The order is the fix.  Clipping first is what removed the `END …
+    // PRIVATE KEY` trailer, the JWT's third segment and the closing quote
+    // that the patterns need — this asserts the detail is short and masked,
+    // not long and cut.
+    const detail = String(describeResult(rawFailedOutput));
+    expect(detail).not.toContain(FAKE_PEM_BODY.slice(0, 16));
+    expect(detail).toContain("END RSA PRIVATE KEY");
+    expect(detail.length).toBeLessThanOrEqual(240);
+  });
+
+  it("leaves a successful tool without a result detail", () => {
+    const { sink, spans } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(
+      base({ type: "item.started", itemType: "tool", itemId: "tool-1", title: "bash ls" }),
+      sink,
+    );
+    observeRuntimeEvent(
+      base({ type: "item.completed", itemType: "tool", itemId: "tool-1", ok: true, detail: "3 rows" }),
+      sink,
+    );
+    expect(spans[1].attributes["gen_ai.tool.result.detail"]).toBeUndefined();
+  });
+});
+
+describe("bot and room identity", () => {
+  it("stamps every span, and tags the failure, when a resolver is installed", () => {
+    const { sink, spans, contexts } = recordingSink();
+    configureTurnIdentity(() => ({
+      botId: "bot-7",
+      botName: "Scout",
+      instanceId: "claudeAgent",
+      model: "sonnet-test",
+      roomId: "room-3",
+      roomName: "Standup",
+    }));
+
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(
+      base({ type: "item.started", itemType: "tool", itemId: "tool-1", title: "bash ls" }),
+      sink,
+    );
+    observeRuntimeEvent(
+      base({
+        type: "request.opened",
+        requestId: "req-1",
+        requestType: "permission",
+        tool: "bash",
+        summary: "run ls",
+      }),
+      sink,
+    );
+    recordExecutedTools("thread-1", ["read_file"], sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "boom" }), sink);
+
+    expect(spans).toHaveLength(4);
+    for (const span of spans) {
+      expect(span.attributes["botfleet.bot.id"]).toBe("bot-7");
+      expect(span.attributes["botfleet.bot.name"]).toBe("Scout");
+      expect(span.attributes["botfleet.instance.id"]).toBe("claudeAgent");
+      expect(span.attributes["botfleet.room.id"]).toBe("room-3");
+      expect(span.attributes["botfleet.room.name"]).toBe("Standup");
+      expect(span.attributes["gen_ai.agent.name"]).toBe("Scout");
+    }
+    expect(spans[0].attributes["gen_ai.request.model"]).toBe("sonnet-test");
+    expect(contexts[0]?.tags).toMatchObject({
+      "botfleet.bot.id": "bot-7",
+      "botfleet.room.id": "room-3",
+      "gen_ai.request.model": "sonnet-test",
+    });
+  });
+
+  it("stamps a chat span too", async () => {
+    const { sink, spans } = recordingSink();
+    configureTurnIdentity(() => ({ botId: "bot-7", botName: "Scout" }));
+    await withChatSpan(
+      { model: "llama-test", conversationId: "thread-1", provider: "openrouter" },
+      async () => ({ text: "ok", usage: { input: 1, output: 1 } }),
+      sink,
+    );
+    expect(spans[0].attributes["botfleet.bot.id"]).toBe("bot-7");
+    expect(spans[0].attributes["gen_ai.agent.name"]).toBe("Scout");
+    expect(spans[0].attributes["gen_ai.provider.name"]).toBe("openrouter");
+  });
+
+  it("writes no botfleet attribute at all without a resolver", () => {
+    const { sink, spans } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    expect(Object.keys(spans[0].attributes).sort()).toEqual([
+      "botfleet.room_id",
+      "gen_ai.agent.name",
+      "gen_ai.conversation.id",
+      "gen_ai.operation.name",
+      "gen_ai.provider.name",
+      "gen_ai.system",
+    ]);
+    expect(spans[0].attributes["gen_ai.agent.name"]).toBe("openai-compat");
+    expect(Object.values(spans[0].attributes).some((value) => value === "")).toBe(false);
+  });
+
+  it("skips blank identity fields rather than writing empty attributes", () => {
+    const { sink, spans } = recordingSink();
+    configureTurnIdentity(() => ({ botId: "bot-7", botName: "   ", roomId: "" }));
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    expect(spans[0].attributes["botfleet.bot.id"]).toBe("bot-7");
+    expect(spans[0].attributes).not.toHaveProperty("botfleet.bot.name");
+    expect(spans[0].attributes).not.toHaveProperty("botfleet.room.id");
+    // Falls back to the driver kind when the bot has no usable display name.
+    expect(spans[0].attributes["gen_ai.agent.name"]).toBe("openai-compat");
+    expect(Object.values(spans[0].attributes).some((value) => value === "")).toBe(false);
+  });
+
+  it("survives a resolver that throws", () => {
+    const { sink, spans } = recordingSink();
+    configureTurnIdentity(() => {
+      throw new Error("store went away");
+    });
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    expect(spans).toHaveLength(1);
+    expect(spans[0].attributes["gen_ai.agent.name"]).toBe("openai-compat");
+  });
+});
+
+describe("Sentry provider vocabulary", () => {
+  it("keeps OpenAI-compatible endpoints out of the OpenAI bucket", () => {
+    expect(genAiProvider("openai-compat")).not.toBe("openai");
+    expect(genAiProvider("openai-compat")).toBe("openai-compat");
+    expect(genAiProvider("codex")).toBe("openai");
+  });
+
+  it("maps every shipped driver kind to Sentry's name", () => {
+    expect(genAiProvider("claudeAgent")).toBe("anthropic");
+    expect(genAiProvider("grokAgent")).toBe("x_ai");
+    expect(genAiProvider("grok")).toBe("x_ai");
+    expect(genAiProvider("antigravityAgent")).toBe("gcp.gemini");
+    expect(genAiProvider("deepseekAgent")).toBe("deepseek");
+    expect(genAiProvider("dshAgent")).toBe("deepseek");
+    expect(genAiProvider("kimiAgent")).toBe("moonshot");
+    expect(genAiProvider("cursorAgent")).toBe("cursor");
+    expect(genAiProvider("minimax")).toBe("minimax");
+    expect(genAiProvider("minimaxAgent")).toBe("minimax");
+    expect(genAiProvider("mcode")).toBe("minimax");
+    expect(genAiProvider("mcodeAgent")).toBe("minimax");
+    expect(genAiProvider("boxAgent")).toBe("box");
+  });
+
+  it("corrects a multi-provider engine from the model id", () => {
+    expect(genAiProvider("dshAgent", "MiniMax-M3.1-Flash")).toBe("minimax");
+    expect(genAiProvider("dshAgent", "DeepSeek-V4.1-Flash")).toBe("deepseek");
+    expect(genAiProvider("dshAgent")).toBe("deepseek");
+  });
+
+  it("keeps an engine Sentry has no name for as its own kind", () => {
+    expect(genAiProvider("opencodeGo")).toBe("opencodeGo");
+    expect(genAiProvider("")).toBe("custom");
+  });
+});
+
+describe("Sentry Agents conversation identity", () => {
+  it("sets conversation id and user from bot identity for the Conversations User column", () => {
+    configureTurnIdentity(() => ({
+      botId: "bot-fixer",
+      botName: "Fixer",
+      roomId: "room-1",
+      roomName: "Ops",
+    }));
+    const { sink, conversations, users, spans } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    expect(conversations[0]).toBe("turn-1");
+    expect(users[0]).toEqual({ id: "bot-fixer", username: "Fixer" });
+    expect(spans[0].attributes["gen_ai.agent.name"]).toBe("Fixer");
+    expect(spans[0].attributes["gen_ai.conversation.id"]).toBe("turn-1");
+    expect(spans[0].attributes["botfleet.room_id"]).toBe("thread-1");
+  });
+
+  it("gives two turns on the same thread two different conversation ids", () => {
+    // This is the whole point of the change: gen_ai.conversation.id used to
+    // be the threadId, so every turn a bot ever ran landed in the same
+    // Sentry Conversation.  It must now change per task (turnId) while
+    // botfleet.room_id keeps the thread constant.
+    const { sink, spans } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started", turnId: "turn-a" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: true, turnId: "turn-a" }), sink);
+    observeRuntimeEvent(base({ type: "turn.started", turnId: "turn-b" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: true, turnId: "turn-b" }), sink);
+
+    const turns = spans.filter((s) => s.op === "gen_ai.invoke_agent");
+    expect(turns).toHaveLength(2);
+    expect(turns[0].attributes["gen_ai.conversation.id"]).toBe("turn-a");
+    expect(turns[1].attributes["gen_ai.conversation.id"]).toBe("turn-b");
+    expect(turns[0].attributes["botfleet.room_id"]).toBe("thread-1");
+    expect(turns[1].attributes["botfleet.room_id"]).toBe("thread-1");
+  });
+
+  it("falls back to the thread id when an event carries no turnId", () => {
+    const { sink, conversations } = recordingSink();
+    observeRuntimeEvent(base({ type: "runtime.error", message: "boom", turnId: undefined }), sink);
+    expect(conversations[0]).toBe("thread-1");
+  });
+});
+
+describe("honest failure classification", () => {
+  it("reports a setup failure's own reason at warning level, not a reasonless spawn_error", () => {
+    const { sink, exceptions, messages } = recordingSink();
+    const setup = "`dsh` isn't installed, or isn't on this app's PATH";
+    observeRuntimeEvent(base({ type: "turn.started", provider: "dshAgent" }), sink);
+    observeRuntimeEvent(base({ type: "runtime.error", provider: "dshAgent", message: setup, setup: true }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", provider: "dshAgent", ok: false, stopReason: "spawn_error" }), sink);
+
+    expect(exceptions).toHaveLength(0);
+    expect(messages).toHaveLength(1);
+    expect(messages[0].message).toContain("isn't installed");
+    expect(messages[0].message).not.toContain("bot turn failed: spawn_error");
+    expect(messages[0].context?.level).toBe("warning");
+    expect(messages[0].context?.fingerprint).toEqual(["bot-setup", "dshAgent"]);
+    expect(messages[0].context?.tags).toMatchObject({
+      "botfleet.stop_reason": "spawn_error",
+      "botfleet.setup": "true",
+    });
+  });
+
+  it("falls back to captureException with the setup text for a sink without captureMessage", () => {
+    const { sink, exceptions, contexts } = recordingSink();
+    delete sink.captureMessage;
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "runtime.error", message: "`grok` isn't installed", setup: true }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "spawn_error" }), sink);
+    expect(exceptions).toHaveLength(1);
+    expect(String(exceptions[0])).toContain("isn't installed");
+    expect(contexts[0]?.fingerprint).toEqual(["bot-setup", "openai-compat"]);
+  });
+
+  it("does not carry a setup message into the next turn", () => {
+    const { sink, exceptions, messages } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "runtime.error", message: "`dsh` isn't installed", setup: true }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "spawn_error" }), sink);
+    observeRuntimeEvent(base({ type: "turn.started", turnId: "turn-2" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", turnId: "turn-2", ok: false, stopReason: "spawn_error" }), sink);
+    expect(messages).toHaveLength(1);
+    expect(exceptions).toHaveLength(1);
+    expect(String(exceptions[0])).toContain("bot turn failed: spawn_error");
+  });
+
+  it("gives two engines failing at the same throw site different fingerprints", () => {
+    const { sink, contexts } = recordingSink();
+    const message = "session/new timed out after 30000ms";
+    observeRuntimeEvent(base({ type: "turn.started", provider: "dshAgent" }), sink);
+    observeRuntimeEvent(base({ type: "runtime.error", provider: "dshAgent", message }), sink);
+    observeRuntimeEvent(base({ type: "turn.started", provider: "minimax", threadId: "thread-2" }), sink);
+    observeRuntimeEvent(base({ type: "runtime.error", provider: "minimax", threadId: "thread-2", message }), sink);
+    const [first, second] = contexts.map((context) => context?.fingerprint);
+    expect(first?.[0]).toBe("bot-runtime-error");
+    expect(second?.[0]).toBe("bot-runtime-error");
+    expect(first).not.toEqual(second);
+    expect(first?.[1]).toBe("dshAgent");
+    expect(second?.[1]).toBe("minimax");
+    expect(first?.[2]).toBe(second?.[2]);
+  });
+
+  it("fingerprints failed completions by engine and stop reason", () => {
+    const { sink, contexts } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started", provider: "claudeAgent" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", provider: "claudeAgent", ok: false, stopReason: "api_error" }), sink);
+    expect(contexts[0]?.fingerprint).toEqual(["bot-turn-failure", "claudeAgent", "api_error"]);
+    expect(contexts[0]?.tags?.["botfleet.stop_reason"]).toBe("api_error");
+  });
+
+  it("classifies a message by shape, never by its raw variable text", () => {
+    const a = classifyMessage("session/new timed out after 30000ms (request 7f3a9c2e11)");
+    const b = classifyMessage("session/new timed out after 45000ms (request 0b1c2d3e4f)");
+    expect(a).toBe(b);
+    expect(a).not.toContain("30000");
+    expect(a).not.toContain("7f3a9c2e11");
+    expect(classifyMessage("upstream HTTP 500")).not.toBe(a);
+    const leaky = classifyMessage("POST /hooks/wh_abc/whsec_xyz0123456789 failed");
+    expect(leaky).not.toContain("whsec_xyz");
+  });
+
+  it("does not Issue a timeout completion after the model-request timeout breadcrumb", () => {
+    // chat-completions/loop.ts maps its request_timeout exit to stopReason
+    // "timeout" — the stop a real turn ends with, not "request_timeout".
+    const { sink, exceptions, breadcrumbs, spans } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "runtime.error", message: "the model did not answer within 180s" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "timeout" }), sink);
+    expect(exceptions).toHaveLength(0);
+    expect(breadcrumbs.filter((b) => b.message === "bot turn failed: timeout")).toHaveLength(1);
+    expect(spans[0].status).toBeUndefined();
+  });
+
+  it("still Issues a wall-clock timeout, which ends with the same stop reason", () => {
+    const { sink, exceptions } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "timeout" }), sink);
+    expect(exceptions).toHaveLength(1);
+    expect(String(exceptions[0])).toContain("bot turn failed: timeout");
+  });
+
+  it("does not carry a model-timeout flag into the next turn", () => {
+    const { sink, exceptions } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "runtime.error", message: "the model did not answer within 180s" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "timeout" }), sink);
+    observeRuntimeEvent(base({ type: "turn.started", turnId: "turn-2" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", turnId: "turn-2", ok: false, stopReason: "timeout" }), sink);
+    expect(exceptions).toHaveLength(1);
+  });
+
+  it("does not page an Antigravity host-control policy refusal", async () => {
+    const { antigravityHostPolicyRefusal } = await import("./drivers/antigravity.ts");
+    for (const reported of ["always-proceed", null, "turbo"]) {
+      const { sink, exceptions, breadcrumbs } = recordingSink();
+      observeRuntimeEvent(base({ type: "turn.started", provider: "antigravity" }), sink);
+      observeRuntimeEvent(
+        base({ type: "runtime.error", provider: "antigravity", message: antigravityHostPolicyRefusal(reported) }),
+        sink,
+      );
+      observeRuntimeEvent(
+        base({ type: "turn.completed", provider: "antigravity", ok: false, stopReason: "host_control_policy" }),
+        sink,
+      );
+      expect(exceptions).toHaveLength(0);
+      expect(breadcrumbs.some((b) => b.level === "warning" && b.message.startsWith("Antigravity's tool execution policy"))).toBe(true);
+      expect(breadcrumbs.some((b) => b.message === "bot turn failed: host_control_policy")).toBe(true);
+      resetSentryAiForTests();
+    }
+  });
+});
+
+// O2: runtime error text reaches Sentry unredacted.
+//
+// The finding was specific about why this hid so well: the same message is
+// redacted for `errors.log` a few lines away and redacted again inside
+// `classifyMessage`, so the Issue's fingerprint came out clean while the
+// Issue's body did not.  Only installs carrying a Sentry DSN were ever
+// exposed, and only when a driver happened to echo a credential — raw CLI
+// stderr being the ordinary way that happens.
+//
+// Both credentials below are fake and are assembled at runtime, so no
+// token-shaped literal sits in the source (GitHub's push protection flags
+// those).  Neither is a real key in any form.
+describe("runtime error text is redacted before it reaches the sink", () => {
+  const SYNTHETIC_KEY = ["sk", "-ant-api03-", "A".repeat(24)].join("");
+  const SYNTHETIC_BEARER = ["Bearer", " ", "bearer", ".token", ".value", ".9f2c"].join("");
+
+  it("keeps a synthetic key out of the captured exception and its stack", () => {
+    const { sink, exceptions } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(
+      base({ type: "runtime.error", message: `grok auth failed: sent ${SYNTHETIC_KEY} and gave up` }),
+      sink,
+    );
+    expect(exceptions).toHaveLength(1);
+    // SAFETY: `SentryAiSink.captureException` takes its first argument as an
+    // `Error`, so the recording sink only ever holds Errors.
+    const [error] = exceptions as Error[];
+    expect(error.message).not.toContain(SYNTHETIC_KEY);
+    expect(error.message).toMatch(/«redacted \d+ chars»/);
+    // The stack header is the field the Issue view shows, and V8 caches it
+    // from the message — redacting the message alone would leave the original
+    // text sitting right there in the frames' header line.
+    expect(error.stack ?? "").not.toContain(SYNTHETIC_KEY);
+  });
+
+  it("keeps a synthetic Bearer token out of the expected-non-crash breadcrumb", () => {
+    const { sink, breadcrumbs } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(
+      base({
+        type: "runtime.error",
+        message: `The saved ACP session could not be resumed: sent ${SYNTHETIC_BEARER}`,
+      }),
+      sink,
+    );
+    const crumb = breadcrumbs.find((b) => b.message.includes("could not be resumed"));
+    expect(crumb, "the expected-non-crash breadcrumb was not recorded").toBeDefined();
+    expect(crumb?.message).not.toContain("bearer.token.value.9f2c");
+    expect(crumb?.message).toMatch(/«redacted \d+ chars»/);
+  });
+
+  it("keeps both out of the turn-retrying breadcrumb and a driver stop reason", () => {
+    const { sink, breadcrumbs, exceptions } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(
+      base({
+        type: "turn.retrying",
+        attempt: 2,
+        reason: `rate limited, header was ${SYNTHETIC_BEARER}`,
+      }),
+      sink,
+    );
+    observeRuntimeEvent(
+      base({ type: "turn.completed", ok: false, stopReason: `crashed holding ${SYNTHETIC_KEY}` }),
+      sink,
+    );
+    const retry = breadcrumbs.find((b) => b.message.startsWith("turn retrying"));
+    expect(retry?.message).not.toContain("bearer.token.value.9f2c");
+    // The retry breadcrumb's `data` is a free-form map a driver controls, so
+    // the sink redacts its string values too.
+    expect(JSON.stringify(retry?.data ?? {})).not.toContain("bearer.token.value.9f2c");
+    // An unrecognised stop reason is not an expected stop and there is no
+    // setup message, so the turn-failure text is captured as an Error rather
+    // than breadcrumbled — and that Error's message carries the stop reason.
+    expect(exceptions.length).toBeGreaterThan(0);
+    // SAFETY: `SentryAiSink.captureException` takes its first argument as an
+    // `Error`, so the recording sink only ever holds Errors.
+    for (const error of exceptions as Error[]) {
+      expect(error.message).not.toContain(SYNTHETIC_KEY);
+      expect(error.stack ?? "").not.toContain(SYNTHETIC_KEY);
+    }
+  });
+
+  it("redacts before the clip, so a long message still masks a secret at the cut", () => {
+    // Redacting after `.slice()` is the failure this ordering exists to
+    // prevent: a credential cut at 500 characters has lost the closing marker
+    // the patterns anchor on, and the head of it ships in the clear.
+    const padded = `${"filler ".repeat(60)}${SYNTHETIC_KEY}`;
+    const { sink, exceptions } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "runtime.error", message: padded }), sink);
+    // SAFETY: `SentryAiSink.captureException` takes its first argument as an
+    // `Error`, so the recording sink only ever holds Errors.
+    const [error] = exceptions as Error[];
+    expect(error.message).not.toContain(SYNTHETIC_KEY);
+    expect(error.message).toMatch(/«redacted \d+ chars»/);
+  });
+});
+
+describe("catalog cost fallback", () => {
+  it("stamps gen_ai.usage.cost from the MiniMax catalog when the agent reported none", () => {
+    configureTurnIdentity(() => ({ model: "MiniMax-M3.1-Flash" }));
+    const { sink, spans } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started", provider: "mcodeAgent" }), sink);
+    observeRuntimeEvent(
+      base({
+        type: "session.started",
+        provider: "mcodeAgent",
+        sessionId: "s",
+        model: "MiniMax-M3.1-Flash",
+      }),
+      sink,
+    );
+    observeRuntimeEvent(
+      base({
+        type: "turn.completed",
+        provider: "mcodeAgent",
+        ok: true,
+        usage: { input: 100_000, output: 50_000 },
+        cost: null,
+      }),
+      sink,
+    );
+    expect(spans[0].attributes["gen_ai.usage.cost"]).toBeCloseTo(
+      (100_000 * 0.3 + 50_000 * 1.2) / 1_000_000,
+      10,
+    );
+    expect(spans[0].attributes["botfleet.cost.source"]).toBe("catalog");
+    expect(spans[0].attributes["gen_ai.provider.name"]).toBe("minimax");
+    expect(spans[0].attributes["gen_ai.system"]).toBe("minimax");
+  });
+
+  it("mirrors a completed catalog-priced turn to the fleet sink", () => {
+    const captured: FleetCapture[] = [];
+    setFleetSinkForTests({ capture: (event) => captured.push(event) });
+    configureTurnIdentity(() => ({ model: "MiniMax-M3.1-Flash", botName: "Coder" }));
+    const { sink } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started", provider: "mcodeAgent" }), sink);
+    observeRuntimeEvent(
+      base({
+        type: "item.started",
+        itemType: "tool",
+        itemId: "t1",
+        title: "bash",
+      }),
+      sink,
+    );
+    observeRuntimeEvent(
+      base({
+        type: "turn.completed",
+        provider: "mcodeAgent",
+        ok: true,
+        usage: { input: 100_000, output: 50_000 },
+        cost: null,
+      }),
+      sink,
+    );
+    expect(captured).toHaveLength(1);
+    expect(captured[0]?.tags.platform).toBe("botfleet");
+    expect(captured[0]?.tags["gen_ai.system"]).toBe("minimax");
+    expect(captured[0]?.extra["botfleet.tool.names"]).toBe("bash");
+    expect(captured[0]?.extra["gen_ai.usage.cost"]).toBeCloseTo(
+      (100_000 * 0.3 + 50_000 * 1.2) / 1_000_000,
+      10,
+    );
+  });
+
+  it("puts a catalog-priced estimated cost on gen_ai.usage.cost as well", () => {
+    configureTurnIdentity(() => ({ model: "DeepSeek-V4.1-Flash" }));
+    const { sink, spans } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started", provider: "dshAgent" }), sink);
+    observeRuntimeEvent(
+      base({
+        type: "session.started",
+        provider: "dshAgent",
+        sessionId: "s",
+        model: "DeepSeek-V4.1-Flash",
+      }),
+      sink,
+    );
+    observeRuntimeEvent(
+      base({
+        type: "turn.completed",
+        provider: "dshAgent",
+        ok: true,
+        usage: { input: 1_000_000, output: 0 },
+        cost: 0.3,
+        billingMode: "estimated",
+      }),
+      sink,
+    );
+    expect(spans[0].attributes["gen_ai.usage.cost"]).toBe(0.3);
+    expect(spans[0].attributes["botfleet.cost.estimated_usd"]).toBe(0.3);
+    expect(spans[0].attributes["botfleet.cost.source"]).toBe("catalog");
+    expect(spans[0].attributes["gen_ai.provider.name"]).toBe("deepseek");
+  });
+
+  it("still skips estimated Claude dollars on gen_ai.usage.cost", () => {
+    configureTurnIdentity(() => ({ model: "claude-sonnet-4-5" }));
+    const { sink, spans } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started", provider: "claudeAgent" }), sink);
+    observeRuntimeEvent(
+      base({
+        type: "turn.completed",
+        provider: "claudeAgent",
+        ok: true,
+        usage: { input: 2, output: 1 },
+        cost: 0.0421,
+        billingMode: "estimated",
+      }),
+      sink,
+    );
+    expect(spans[0].attributes["gen_ai.usage.cost"]).toBeUndefined();
+    expect(spans[0].attributes["botfleet.cost.estimated_usd"]).toBe(0.0421);
+  });
+});
+
+describe("opt-in prompt capture", () => {
+  const previous = process.env.SENTRY_AI_PROMPT_CAPTURE;
+
+  const restore = () => {
+    if (previous === undefined) delete process.env.SENTRY_AI_PROMPT_CAPTURE;
+    else process.env.SENTRY_AI_PROMPT_CAPTURE = previous;
+  };
+
+  afterEach(restore);
+
+  it("is off by default so exclusion tests keep their contract", () => {
+    delete process.env.SENTRY_AI_PROMPT_CAPTURE;
+    expect(isPromptCaptureEnabled()).toBe(false);
+    expect(formatGenAiMessages([{ role: "user", content: "secret task" }])).toContain("secret task");
+  });
+
+  it("stamps redacted input and output on the turn when the flag is on", () => {
+    process.env.SENTRY_AI_PROMPT_CAPTURE = "1";
+    const { sink, spans } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    captureTurnPrompt("thread-1", "turn-1", "User asked about sk-live-not-a-real-key-aaaaaaaa");
+    observeRuntimeEvent(
+      base({ type: "content.delta", streamKind: "assistant_text", delta: "Here is the " }),
+      sink,
+    );
+    observeRuntimeEvent(
+      base({ type: "content.delta", streamKind: "assistant_text", delta: "answer." }),
+      sink,
+    );
+    observeRuntimeEvent(base({ type: "turn.completed", ok: true }), sink);
+    expect(spans[0].attributes["gen_ai.input.messages"]).toMatch(/User asked about/);
+    expect(spans[0].attributes["gen_ai.input.messages"]).not.toContain("sk-live-not-a-real-key-aaaaaaaa");
+    expect(spans[0].attributes["gen_ai.output.messages"]).toBe("Here is the answer.");
+  });
+
+  it("stamps chat-span messages only when the flag is on", async () => {
+    delete process.env.SENTRY_AI_PROMPT_CAPTURE;
+    const off = recordingSink();
+    await withChatSpan(
+      { model: "MiniMax-M3", conversationId: "thread-9", provider: "minimax", input: "do the thing" },
+      async () => ({ text: "done", usage: { input: 1, output: 1 } }),
+      off.sink,
+    );
+    expect(off.spans[0].attributes["gen_ai.input.messages"]).toBeUndefined();
+    expect(off.spans[0].attributes["gen_ai.output.messages"]).toBeUndefined();
+
+    process.env.SENTRY_AI_PROMPT_CAPTURE = "yes";
+    const on = recordingSink();
+    await withChatSpan(
+      { model: "MiniMax-M3", conversationId: "thread-9", provider: "minimax", input: "do the thing" },
+      async () => ({ text: "done", usage: { input: 1, output: 1 } }),
+      on.sink,
+    );
+    expect(on.spans[0].attributes["gen_ai.input.messages"]).toBe("do the thing");
+    expect(on.spans[0].attributes["gen_ai.output.messages"]).toBe("done");
+  });
+
+  it("stamps system and model on recordExecutedTools when identity has a model", () => {
+    configureTurnIdentity(() => ({ model: "MiniMax-M3.1-Flash" }));
+    const { sink, spans } = recordingSink();
+    recordExecutedTools("thread-1", ["read_file"], sink, "turn-1");
+    expect(spans[0].attributes["gen_ai.request.model"]).toBe("MiniMax-M3.1-Flash");
+    expect(spans[0].attributes["gen_ai.system"]).toBe("minimax");
+  });
+});

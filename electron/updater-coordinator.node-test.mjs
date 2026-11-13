@@ -40,6 +40,58 @@ test("automatic check rejection is handled and returns to idle", async () => {
   assert.equal(getState().status, "idle");
 });
 
+// updater.mjs's `trackedCheck` awaits this outcome to decide whether the
+// automatic-check timestamp gets persisted. Before this shape existed the
+// promise resolved to plain `undefined` whether the check had actually
+// succeeded or a rejection was silently swallowed here -- so a caller
+// could not distinguish "checked, nothing new" from "the update service
+// is unreachable", and recorded the latter as a successful check anyway.
+test("check() resolves { ok: true } when checkForUpdates succeeds", async () => {
+  const { updater, coordinator } = harness();
+  updater.checkForUpdates = () => Promise.resolve({ updateInfo: { version: "1.0.0" } });
+
+  assert.deepEqual(await coordinator.check(), { ok: true });
+});
+
+test("check() resolves { ok: false } when checkForUpdates rejects and is not superseded", async () => {
+  const { updater, coordinator } = harness();
+  updater.checkForUpdates = () => Promise.reject(new Error("offline"));
+
+  assert.deepEqual(await coordinator.check(), { ok: false, errorClass: "Error" });
+  assert.deepEqual(await coordinator.check(true), { ok: false, errorClass: "Error" });
+});
+
+test("check() resolves { ok: false } on a synchronous checkForUpdates throw", async () => {
+  const { updater, coordinator } = harness();
+  updater.checkForUpdates = () => {
+    throw new Error("check threw");
+  };
+
+  assert.deepEqual(await coordinator.check(true), { ok: false, errorClass: "Error" });
+});
+
+// updater.mjs's automatic-failure backoff (electron/updater-throttle.mjs's
+// nextAutoCheckFailureStreak) groups consecutive failures by this field, so
+// electron-updater's actual HttpError shape (name + statusCode, from
+// builder-util-runtime) must classify as one stable, comparable string.
+test("check() classifies a rejection's error class for the automatic-failure streak", async () => {
+  const { updater, coordinator } = harness();
+  const httpError = Object.assign(new Error("HTTP error: 404 https://…/latest-mac.yml"), {
+    name: "HttpError",
+    statusCode: 404,
+  });
+  updater.checkForUpdates = () => Promise.reject(httpError);
+
+  assert.deepEqual(await coordinator.check(), { ok: false, errorClass: "HttpError:404" });
+});
+
+test("check() classifies a rejection with no status as just its name", async () => {
+  const { updater, coordinator } = harness();
+  updater.checkForUpdates = () => Promise.reject(new TypeError("network down"));
+
+  assert.deepEqual(await coordinator.check(), { ok: false, errorClass: "TypeError" });
+});
+
 test("manual check rejection is handled as a user-visible error", async () => {
   const { updater, coordinator, getState } = harness();
   updater.checkForUpdates = () => Promise.reject(new Error("feed failed"));
@@ -188,7 +240,10 @@ test("an active download state survives a later background check failure", async
 
   const background = coordinator.check();
   checkPending.reject(new Error("background check failed"));
-  await background;
+  // Superseded by the in-flight download, so this is not itself a failure
+  // worth throttling the next automatic check over -- the download owns
+  // the outcome the user actually sees.
+  assert.deepEqual(await background, { ok: true });
   assert.deepEqual(getState(), { status: "downloading", percent: 42 });
 
   downloadPending.resolve();

@@ -1,0 +1,787 @@
+// The renderer's half of "check for a newer BotFleet, and install it".
+//
+// Two update paths exist and they answer different questions.  The signed
+// release feed (electron-updater) asks "has a build been published?" and only
+// works in a packaged, signed app that shipped with `app-update.yml`.  This
+// one asks "is this Mac's own always-on checkout behind `origin/main`?" and
+// is answered by the harness, which can also start the transactional local
+// updater.  A locally built app has no release feed at all, so its Check for
+// Updates used to fail silently — this is what it uses instead.
+//
+// Everything here is either a fetch or a pure string: the components own the
+// markup, this file owns the wording and the decision about which path is
+// live, so both can be tested without rendering anything.
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+
+/** The gap protocol's wide sentence break, for copy a person reads. */
+const GAP = "\u00a0 ";
+
+export interface UpdateCommit {
+  sha: string;
+  subject: string;
+}
+
+export interface UpdateAvailable {
+  sourceCommit: string;
+  version?: string;
+  aheadBy: number;
+  commits: UpdateCommit[];
+}
+
+export interface UpdateRunning {
+  runId: string;
+  startedAt: string;
+  step: string;
+  /** What the step is waiting on ("Waiting for 3 bots to finish"), when the
+   * updater says.  Absent from an older harness, and most of the time. */
+  detail?: string;
+  progress?: number;
+  logTail: string[];
+}
+
+/** An update is holding new work while bots finish (`UpdateStatus.drain`).
+ * Counts and times, epoch milliseconds, from the harness's own clock. */
+export interface UpdateDrain {
+  startedAt: number;
+  /** The latest the restart begins: the end of the updater's own window.  The
+   * hold ends by then, or the update is called off and everything runs. */
+  windowEndsAt: number;
+  /** When the harness gives the hold up by itself.  Past this, a screen still
+   * showing the hold is showing a harness that went away. */
+  deadline: number;
+  /** Bots mid-turn: what the update is waiting for. */
+  bots: number;
+  /** Live room turns, which an update will not interrupt. */
+  rooms: number;
+  /** What is saved and waiting rather than running. */
+  held: { sends: number; rooms: number; routineRuns: number };
+}
+
+export type UpdateOutcome = "verified" | "rolled-back" | "failed" | "refused";
+
+export interface UpdateLastRun {
+  runId: string;
+  startedAt: string;
+  finishedAt: string;
+  outcome: UpdateOutcome;
+  message: string;
+  receiptPath?: string;
+}
+
+export interface UpdateStatus {
+  installed: { version: string; sourceCommit: string; installedAt?: string };
+  available: UpdateAvailable | null;
+  checkedAt: string | null;
+  /** Why the last check produced no answer, or null when it did.  A failed
+   * `git fetch` leaves a stale `origin/main` on disk, so "no error" is the
+   * only thing that makes "up to date" mean anything. */
+  checkError?: string | null;
+  running: UpdateRunning | null;
+  lastRun: UpdateLastRun | null;
+  capabilities: {
+    canCheck: boolean;
+    canRun: boolean;
+    reasons: string[];
+    /** One code per `reasons` entry, same order — absent from an older
+     * harness that has never heard of it, so every read of this falls back
+     * to the harness's own sentence at that index. */
+    codes?: string[];
+    /** Bots are working.  Not a blocker: the update gives them a short grace,
+     * then pauses and resumes them.  Absent from an older harness. */
+    busy?: boolean;
+  };
+  /** Present only while an update is holding new work for bots to finish,
+   * whether or not the harness started the run.  Absent from an older harness. */
+  drain?: UpdateDrain;
+}
+
+/** The event the store re-broadcasts when an `update.status` frame lands. */
+export const UPDATE_STATUS_EVENT = "botfleet:update-status";
+
+type Fetcher = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+
+const JSON_HEADERS = { "content-type": "application/json" };
+
+async function readJson(response: Response): Promise<Record<string, unknown>> {
+  return (await response.json().catch(() => ({}))) as Record<string, unknown>;
+}
+
+/** Null rather than a throw when this build has no harness answer for it —
+ * a dev browser, an older harness, a non-Mac. */
+export async function fetchUpdateStatus(request: Fetcher = fetch): Promise<UpdateStatus | null> {
+  try {
+    const response = await request("/api/update/status");
+    if (!response.ok) return null;
+    const body = await readJson(response);
+    return isUpdateStatus(body) ? body : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A check that could not reach the source answers 502 with the status and the
+ * reason.  Both matter: the reason is what the person reads, and the status
+ * still carries the previous answer and its timestamp, so the card keeps
+ * saying what it last knew rather than blanking.
+ */
+export async function requestUpdateCheck(request: Fetcher = fetch): Promise<UpdateStatus> {
+  const response = await request("/api/update/check", { method: "POST", headers: JSON_HEADERS, body: "{}" });
+  const body = await readJson(response);
+  if (!response.ok) {
+    const failure = new Error(asError(body) ?? `Could not check for updates (${response.status}).`);
+    if (isUpdateStatus(body.status)) Object.assign(failure, { status: body.status });
+    throw failure;
+  }
+  if (!isUpdateStatus(body)) throw new Error(`Could not check for updates (${response.status}).`);
+  return body;
+}
+
+/** Started, or refused with the reason and the status that goes with it. */
+export type UpdateRunResult =
+  | { ok: true; runId: string; status: UpdateStatus }
+  | { ok: false; error: string; status: UpdateStatus | null };
+
+/**
+ * A refusal is an answer, not an exception.
+ *
+ * The harness sends `{ error, status }` with its 409, and that status is the
+ * one that explains the refusal — the run already in flight, the busy
+ * machine, the reason list.  Throwing the error and dropping the body left
+ * the UI showing whatever it last knew while saying "an update is already
+ * running", with no run on screen.  Only a transport or shape failure throws
+ * now; a refusal comes back with the status folded in.
+ */
+export async function requestUpdateRun(
+  options: { force?: boolean } = {},
+  request: Fetcher = fetch,
+): Promise<UpdateRunResult> {
+  const response = await request("/api/update/run", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify(options.force ? { force: true } : {}),
+  });
+  const body = await readJson(response);
+  const status = isUpdateStatus(body.status) ? body.status : null;
+  if (!response.ok) {
+    return {
+      ok: false,
+      error: asError(body) ?? `Could not start the update (${response.status}).`,
+      status,
+    };
+  }
+  if (typeof body.runId !== "string" || !status) {
+    throw new Error("The harness started an update but did not describe it.");
+  }
+  return { ok: true, runId: body.runId, status };
+}
+
+function asError(body: Record<string, unknown>): string | null {
+  return typeof body.error === "string" && body.error ? body.error : null;
+}
+
+/** A shape check rather than a cast: this crosses a process boundary and an
+ * older harness answers 404 with an HTML body. */
+export function isUpdateStatus(value: unknown): value is UpdateStatus {
+  if (!value || typeof value !== "object") return false;
+  const record = value as Record<string, unknown>;
+  const installed = record.installed as Record<string, unknown> | undefined;
+  const capabilities = record.capabilities as Record<string, unknown> | undefined;
+  return Boolean(
+    installed && typeof installed.version === "string" && typeof installed.sourceCommit === "string"
+    && capabilities && typeof capabilities.canCheck === "boolean" && typeof capabilities.canRun === "boolean",
+  );
+}
+
+export type UpdateSource = "harness" | "feed" | "none";
+
+/**
+ * Which path drives the Updates card.
+ *
+ * The harness wins whenever it says this computer can check or install,
+ * because that answer already means macOS plus a real always-on checkout —
+ * exactly "the app is attached to a local harness on a Mac".  The signed
+ * release feed is the fallback, and it only exists at all when the preload's
+ * updater bridge is there (a packaged build).  Neither, in a dev browser.
+ */
+export function updateSource(status: UpdateStatus | null, hasUpdaterBridge: boolean): UpdateSource {
+  if (status && (status.capabilities.canCheck || status.capabilities.canRun)) return "harness";
+  return hasUpdaterBridge ? "feed" : "none";
+}
+
+/** `1.0.30 (ae8abe7)` — the version alone is ambiguous between two builds of
+ * the same version, and on this Mac that happens every day. */
+export function installedLabel(status: UpdateStatus): string {
+  return `${status.installed.version} (${shortCommit(status.installed.sourceCommit)})`;
+}
+
+export function shortCommit(sha: string): string {
+  return /^[a-f0-9]{7,}$/i.test(sha) ? sha.slice(0, 7) : sha;
+}
+
+/** The headline when something is waiting to be installed. */
+export function availableLabel(status: UpdateStatus): string | null {
+  const available = status.available;
+  if (!available) return null;
+  const name = available.version ?? shortCommit(available.sourceCommit);
+  const commits = available.aheadBy === 1 ? "1 commit ahead" : `${available.aheadBy} commits ahead`;
+  return `Update Available: ${name}, ${commits}`;
+}
+
+/** The percent to draw beside a running step, or null when there is none worth
+ * drawing.
+ *
+ * `progress` counts the run's own steps and stays where it is while a step
+ * waits on something outside it: bots finishing, a process letting go of
+ * BotFleet's files.  "Waiting for 3 bots to finish (40%)" read as 40% of the
+ * wait, and sat there for a minute.  So a wait detail replaces the percent on
+ * every surface that draws one (this label, the banner's bar, the phone), and
+ * the percent comes back with the next step that has no detail. */
+export function runningPercent(running: UpdateRunning): number | null {
+  const { progress, detail } = running;
+  if (progress === undefined || !Number.isFinite(progress) || detail) return null;
+  return Math.round(Math.min(1, Math.max(0, progress)) * 100);
+}
+
+/** Sentence case, present tense, and never a percentage the updater did not
+ * actually report, nor one that has stopped moving. */
+export function runningLabel(running: UpdateRunning): string {
+  const percent = runningPercent(running);
+  return `${running.detail ?? running.step}${percent === null ? "" : ` (${percent}%)`}…`;
+}
+
+/** The hold, when this build can trust what the harness sent.  Finite numbers
+ * only: `Number.isFinite` does not coerce, so a string or a missing field is
+ * not one. */
+export function isUpdateDrain(value: UpdateDrain | null | undefined): value is UpdateDrain {
+  if (!value?.held) return false;
+  const { startedAt, windowEndsAt, deadline, bots, rooms, held } = value;
+  return [startedAt, windowEndsAt, deadline, bots, rooms, held.sends, held.rooms, held.routineRuns]
+    .every((count) => Number.isFinite(count));
+}
+
+/** The hold that is still worth showing at `now`.  One whose lease has run
+ * out is a harness that went away mid-update: the restart itself, which the
+ * next status answer clears. */
+export function activeDrain(status: Pick<UpdateStatus, "drain"> | null | undefined, now: number): UpdateDrain | null {
+  const drain = status?.drain;
+  return isUpdateDrain(drain) && now < drain.deadline ? drain : null;
+}
+
+/** How long a person should expect to wait, as they would say it: "about 40
+ * seconds", "about 4 minutes", or null when it is nearly over.  Rounded up
+ * on purpose; a wait that ends early costs nobody anything. */
+export function waitLabel(ms: number): string | null {
+  if (!Number.isFinite(ms) || ms <= 5_000) return null;
+  if (ms < 90_000) return `about ${Math.ceil(ms / 10_000) * 10} seconds`;
+  return `about ${Math.ceil(ms / 60_000)} minutes`;
+}
+
+/** When the restart begins, as the end of a sentence. */
+function restartTiming(drain: UpdateDrain, now: number): string {
+  const label = waitLabel(drain.windowEndsAt - now);
+  return label ? `The restart begins within ${label}.` : "The restart begins shortly.";
+}
+
+/** Messages saved for after the restart: a send waiting in a bot's queue, or
+ * a room round waiting for its bots to speak. */
+export function heldMessageCount(drain: UpdateDrain): number {
+  return drain.held.sends + drain.held.rooms;
+}
+
+/**
+ * What a chat or a room says while an update holds new work.
+ *
+ * The harness accepts a message sent now and keeps it: it neither runs nor
+ * errors until the restart.  With nothing said, a bot looks stuck and a room
+ * goes quiet.  The counts are the whole harness's, not this thread's, so
+ * nothing here claims a message of THIS thread is among them; it says what
+ * happens to the one being typed.
+ */
+export function drainNoticeCopy(drain: UpdateDrain, now: number): string {
+  return `BotFleet is updating.${GAP}Messages you send now are saved and will run after the restart.${GAP}${restartTiming(drain, now)}`;
+}
+
+/** What the update's own card says about the hold, beside the step it is on:
+ * how many messages are waiting, and when the restart begins. */
+export function drainLabel(drain: UpdateDrain | null | undefined, now: number): string | null {
+  if (!drain) return null;
+  const held = heldMessageCount(drain);
+  const saved = held > 0
+    ? `${held} ${held === 1 ? "message is" : "messages are"} saved and will run after the restart.`
+    : "New messages are saved and will run after the restart.";
+  return `${saved}${GAP}${restartTiming(drain, now)}`;
+}
+
+/** The card's step line when an update is holding new work but this harness
+ * is not the one running it (an updater started from a terminal). */
+export const HOLDING_COPY = "Holding new work while running work finishes…";
+
+/** The queued-message chip's sentence in a chat.  A send held for an update
+ * waits for the restart, not for the bot, which is idle. */
+export function queuedChipLabel(input: { text: string; busyName: string; draining: boolean }): string {
+  return input.draining
+    ? `Saved — runs after the update restarts: “${input.text}”`
+    : `Queued — sends when ${input.busyName} finishes: “${input.text}”`;
+}
+
+/** A short local date and time for a finished run, or null when there is
+ * nothing usable to format — an empty or malformed `finishedAt`, mostly
+ * seen only in tests. */
+function finishedAtLabel(finishedAt: string): string | null {
+  if (!finishedAt) return null;
+  const date = new Date(finishedAt);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+}
+
+/**
+ * The Updates card's last-run line: a short, stable product sentence for the
+ * outcome, followed by when it finished.
+ *
+ * The updater's own message used to be appended here — for a failed run,
+ * often a raw line straight from its log, like `bash …
+ * update-botfleet-mac.mjs: pnpm package:mac:local failed with exit 1`.  That
+ * is diagnostic text, not something to paint into the card, so it lives in
+ * `lastRunDetail` instead, for a hover title or a details affordance.
+ */
+export function lastRunLabel(lastRun: UpdateLastRun | null): string | null {
+  if (!lastRun) return null;
+  const headline = lastRun.outcome === "verified"
+    ? "The last update installed and verified."
+    : lastRun.outcome === "rolled-back"
+      ? "The last update failed and rolled back."
+      : lastRun.outcome === "refused"
+        ? "The last update was refused."
+        : "The last update did not finish.";
+  const when = finishedAtLabel(lastRun.finishedAt);
+  return when ? `${headline}${GAP}${when}` : headline;
+}
+
+/** The updater's own message for the last run — the raw detail that belongs
+ * on hover or in a details affordance, never inline.  See `lastRunLabel`. */
+export function lastRunDetail(lastRun: UpdateLastRun | null): string | null {
+  return lastRun?.message || null;
+}
+
+/** What the card says when there is nothing to install. */
+export function idleLabel(status: UpdateStatus): string {
+  if (!status.capabilities.canCheck) {
+    return status.capabilities.reasons[0] ?? "Updating from this computer is not available here.";
+  }
+  if (!status.checkedAt) return "This computer has not checked for a newer build yet.";
+  return "BotFleet is on the newest build this computer knows about.";
+}
+
+/**
+ * The check failure a person should be reading, from either place it lives.
+ *
+ * A failed check leaves two traces, and only one of them survives a remount.
+ * The hook catches the 502 and holds the reason in its own state; the harness
+ * holds the same sentence on the status as `checkError` until a check
+ * succeeds.  Closing and reopening Settings remounts the hook, which hydrates
+ * from `GET /api/update/status` — so the local reason was gone while the
+ * status still knew, and the card went back to "Update Available" or "on the
+ * newest build this computer knows about" over a comparison that never
+ * happened.  Reading both means the sentence after a remount is the sentence
+ * from right after the failed check.
+ *
+ * The local error wins when there is one: it is the newer of the two, and an
+ * install failure has no `checkError` of its own to be mistaken for.
+ */
+export function visibleUpdateError(local: string | null, status: UpdateStatus | null): string | null {
+  return local ?? status?.checkError ?? null;
+}
+
+/**
+ * Product copy for a structural refusal the harness can name by its stable
+ * `code` — the reason the update path is missing on this Mac, not the
+ * transient "already running" or "busy" ones, which already read as product
+ * copy and are returned unchanged.
+ *
+ * Falls back to the harness's own sentence for a code this build does not
+ * recognise: an older harness with no `codes` array at all, or a refusal
+ * added after this build shipped.  Matching on the code rather than the
+ * English text means a wording change on the harness side does not silently
+ * stop being mapped.
+ */
+function structuralReasonCopy(code: string | undefined, reason: string): string {
+  switch (code) {
+    case "checkout-missing":
+      return "This Mac's BotFleet folder is missing.";
+    case "updater-missing":
+      return "The updater is not installed on this Mac.";
+    case "updater-outdated":
+      return `This Mac's updater is out of date.${GAP}Update from this Mac once to pick up the new one.`;
+    default:
+      return reason;
+  }
+}
+
+/**
+ * Why **Install Update** is unavailable although there is something to
+ * install, or null when it is available.
+ *
+ * `capabilities.reasons` carries the harness's own sentence for every refusal
+ * it can see coming, and no surface rendered one: the floating card asserted
+ * "This Mac can build and install it." while the button was conditioned away,
+ * the Settings card simply lost its button, and the sidebar's install button
+ * quietly ran a check instead.  All three ask this, so all three say the same
+ * thing — now product copy for the refusals that have it, by way of
+ * `structuralReasonCopy`.
+ */
+export function installBlockedReason(status: UpdateStatus | null): string | null {
+  if (!status?.available || status.running) return null;
+  if (status.capabilities.canRun) return null;
+  const reason = status.capabilities.reasons[0];
+  if (!reason) return "This Mac cannot install the update right now.";
+  return structuralReasonCopy(status.capabilities.codes?.[0], reason);
+}
+
+/**
+ * The harness's own sentence behind the copy above — a checkout path, a
+ * script path, "run it once from a terminal" — for a hover title, never for
+ * the label itself.  Null when there is nothing extra to say: no reason, or
+ * the visible copy already IS the harness's sentence (an unmapped code, or
+ * none at all), which is what an older harness with no `codes` array always
+ * looks like.
+ */
+/**
+ * Whether installing now would pause busy bots.  Busy is not a blocker any
+ * more: the update holds new work, gives the bots a short grace to finish,
+ * then pauses what is left and resumes it after the restart.  True only when
+ * Install is actually available, so a structural blocker always wins.
+ */
+export function installPausesWork(status: UpdateStatus | null): boolean {
+  return Boolean(status?.available && !status.running && status.capabilities.canRun && status.capabilities.busy);
+}
+
+/** What a surface says when installing would pause busy bots. */
+export const PAUSES_WORK_COPY = "Busy bots get a minute to finish, then pause and resume after the update";
+
+export function installBlockedReasonDetail(status: UpdateStatus | null): string | null {
+  if (!status?.available || status.running || status.capabilities.canRun) return null;
+  const reason = status.capabilities.reasons[0];
+  if (!reason) return null;
+  const mapped = structuralReasonCopy(status.capabilities.codes?.[0], reason);
+  return mapped === reason ? null : reason;
+}
+
+/**
+ * What is left of this session's remembered failure once a status arrives on
+ * its own — a push frame, a refocus, the poll.
+ *
+ * `visibleUpdateError` gives the local sentence precedence because it is the
+ * newer of the two, and it stops being newer the moment the harness answers
+ * again.  Without this, a check that failed while the network was down kept
+ * its red sentence on screen beside a subtitle the successful check had
+ * already replaced.  A status still carrying `checkError` is not a recovery,
+ * so that one leaves the local error alone and the same precedence goes on
+ * showing it.
+ */
+export function keepLocalError(local: string | null, next: UpdateStatus): string | null {
+  return next.checkError ? local : null;
+}
+
+/**
+ * What a dismissal of the floating banner should be remembered against.
+ *
+ * Dismissing "1.0.31 is available" must not also dismiss "that install
+ * failed" — but the available answer survives an unsuccessful run, so a key
+ * built from the available commit alone stayed the same across it and the
+ * failure was never shown.  The last run's identity is part of the key, so a
+ * run finishing always produces a banner the person has not dismissed yet.
+ */
+export function bannerDismissKey(status: UpdateStatus): string {
+  if (status.running) return `running:${status.running.runId}`;
+  if (isUpdateDrain(status.drain)) return "holding";
+  const offer = status.available ? `available:${status.available.sourceCommit}` : "idle";
+  const lastRun = status.lastRun ? `${status.lastRun.runId}@${status.lastRun.finishedAt}` : "none";
+  return `${offer}|${lastRun}`;
+}
+
+/** Whether the floating banner should show the harness card at all. */
+export function bannerIsActionable(status: UpdateStatus | null): boolean {
+  if (!status) return false;
+  if (status.running || isUpdateDrain(status.drain)) return true;
+  if (status.available) return true;
+  return status.lastRun !== null && status.lastRun.outcome !== "verified";
+}
+
+/**
+ * May the old fire-and-forget local updater still be offered?
+ *
+ * `window.ogb.updater.local()` spawns `~/apps/update-botfleet.sh` with no
+ * run id and no progress file, so nothing can describe it, no second caller
+ * can be refused against it, and the harness never learns it happened.  It
+ * stays reachable in exactly one case: the harness gave no answer at all —
+ * an old harness, or one that is down — where it is the only local path
+ * there is.  A harness that answered and said it cannot install has made a
+ * decision, and an untracked update must not talk past it.
+ */
+export function mayUseLegacyLocalUpdate(
+  status: UpdateStatus | null,
+  canLocalUpdate: boolean | undefined,
+): boolean {
+  return Boolean(canLocalUpdate) && status === null;
+}
+
+/** How long to wait before asking again after a status fetch came back with
+ * nothing.  A miss is usually a harness that is restarting — which is exactly
+ * what an update does to it — so the first retries are quick and the tail is
+ * a slow heartbeat rather than a poll. */
+export const STATUS_RETRY_DELAYS_MS = [5_000, 15_000, 60_000] as const;
+export const STATUS_RETRY_STEADY_MS = 5 * 60_000;
+
+export function statusRetryDelay(attempt: number): number {
+  return STATUS_RETRY_DELAYS_MS[attempt] ?? STATUS_RETRY_STEADY_MS;
+}
+
+/**
+ * Keep asking until the harness answers, then stop.
+ *
+ * One failed fetch used to leave `status` null for the whole session, and a
+ * null status means `updateSource` reports "feed" — so a single blip during
+ * the restart an update performs would flip the UI back to the release feed
+ * and re-enable the old untracked local updater.  The retry is what makes
+ * "the harness is temporarily gone" temporary.
+ *
+ * Returns a disposer.  Injectable timers so the schedule is testable.
+ */
+export function scheduleStatusRetries(options: {
+  fetchStatus: () => Promise<UpdateStatus | null>;
+  onStatus: (status: UpdateStatus) => void;
+  setTimer?: (handler: () => void, ms: number) => unknown;
+  clearTimer?: (handle: never) => void;
+}): () => void {
+  const setTimer = options.setTimer ?? ((handler, ms) => setTimeout(handler, ms));
+  const clearTimer = options.clearTimer ?? ((handle) => clearTimeout(handle));
+  let stopped = false;
+  let handle: unknown = null;
+  let attempt = 0;
+
+  const tick = () => {
+    void options.fetchStatus().then((status) => {
+      if (stopped) return;
+      if (status) {
+        options.onStatus(status);
+        return;
+      }
+      handle = setTimer(tick, statusRetryDelay(attempt));
+      attempt += 1;
+    });
+  };
+
+  tick();
+  return () => {
+    stopped = true;
+    if (handle !== null) clearTimer(handle as never);
+  };
+}
+
+export interface UpdateControlView {
+  status: UpdateStatus | null;
+  error: string | null;
+  busy: "check" | "install" | null;
+  check: () => Promise<void>;
+  install: (options?: { force?: boolean }) => Promise<void>;
+}
+
+/**
+ * One live view of the harness's update status.
+ *
+ * Live updates arrive as `update.status` frames on the existing event stream
+ * (the store re-broadcasts them as a window event, so this does not open a
+ * second EventSource).  The poll is only a backstop for a dropped stream
+ * while a run is actually going — an update takes minutes and the person is
+ * watching it.
+ */
+export function useUpdateControl(pollMs = 5_000): UpdateControlView {
+  const [status, setStatus] = useState<UpdateStatus | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState<"check" | "install" | null>(null);
+  const running = Boolean(status?.running);
+  const alive = useRef(true);
+
+  // A status that arrived on its own supersedes this session's remembered
+  // failure — see `keepLocalError`.
+  const adopt = useCallback((next: UpdateStatus) => {
+    setStatus(next);
+    setError((current) => keepLocalError(current, next));
+  }, []);
+
+  useEffect(() => {
+    alive.current = true;
+    const stopRetries = scheduleStatusRetries({
+      fetchStatus: () => fetchUpdateStatus(),
+      onStatus: adopt,
+    });
+    const onPush = (event: Event) => {
+      const detail = (event as CustomEvent<unknown>).detail;
+      if (isUpdateStatus(detail)) adopt(detail);
+    };
+    // Coming back to the window is the moment the answer is most likely to
+    // have changed — an update finished, or a harness came back — and it is
+    // free compared with polling for it.
+    const onFocus = () => {
+      void fetchUpdateStatus().then((next) => {
+        if (alive.current && next) adopt(next);
+      });
+    };
+    window.addEventListener(UPDATE_STATUS_EVENT, onPush);
+    window.addEventListener("focus", onFocus);
+    return () => {
+      alive.current = false;
+      stopRetries();
+      window.removeEventListener(UPDATE_STATUS_EVENT, onPush);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [adopt]);
+
+  useEffect(() => {
+    if (!running) return;
+    const timer = setInterval(() => {
+      void fetchUpdateStatus().then((next) => {
+        if (alive.current && next) adopt(next);
+      });
+    }, pollMs);
+    return () => clearInterval(timer);
+  }, [running, pollMs, adopt]);
+
+  const check = useCallback(async () => {
+    setBusy("check");
+    setError(null);
+    try {
+      setStatus(await requestUpdateCheck());
+    } catch (failure) {
+      // A 502 carries the status it could not refresh; keep showing it.
+      const carried = (failure as { status?: unknown })?.status;
+      if (isUpdateStatus(carried)) setStatus(carried);
+      setError(failure instanceof Error ? failure.message : "Could not check for updates.");
+    } finally {
+      setBusy(null);
+    }
+  }, []);
+
+  const install = useCallback(async (options?: { force?: boolean }) => {
+    setBusy("install");
+    setError(null);
+    try {
+      // No `force`: the harness's own default already never waits on busy
+      // bots for long, and it gives them a grace before pausing them.
+      const result = await requestUpdateRun(options ?? {});
+      // The refusal's own status is the one that explains it — take it even
+      // when the answer is no.
+      if (result.status) setStatus(result.status);
+      if (!result.ok) setError(result.error);
+    } catch (failure) {
+      setError(failure instanceof Error ? failure.message : "Could not start the update.");
+    } finally {
+      setBusy(null);
+    }
+  }, []);
+
+  // `error` is this session's own failure; the status carries the harness's
+  // memory of the last failed check.  A remount has only the second one.
+  return { status, error: visibleUpdateError(error, status), busy, check, install };
+}
+
+// ── the hold, for a chat or a room ───────────────────────────────────────
+//
+// A chat or a room only needs one fact — "an update is holding new work, and
+// until when" — and there can be several of them mounted at once (the
+// transcript's notice and the composer's queued chip).  They share one
+// watcher: a status fetch when the first mounts, the `update.status` push,
+// a refetch on focus, and a slow poll for as long as a hold lasts, as a
+// backstop for a dropped stream.  None of it runs when nothing is mounted.
+
+/** How often a hold is re-read when the stream stays quiet.  A hold lasts
+ * minutes at the most, and the harness pushes every change. */
+export const DRAIN_POLL_MS = 5_000;
+
+let sharedDrain: UpdateDrain | null = null;
+const drainListeners = new Set<() => void>();
+let stopDrainWatch: (() => void) | null = null;
+
+function sameDrain(a: UpdateDrain | null, b: UpdateDrain | null): boolean {
+  return a === b || (a !== null && b !== null && JSON.stringify(a) === JSON.stringify(b));
+}
+
+function watchDrain(): () => void {
+  let alive = true;
+  let poll: ReturnType<typeof setInterval> | null = null;
+
+  const arm = () => {
+    if (sharedDrain && !poll) poll = setInterval(refresh, DRAIN_POLL_MS);
+    if (!sharedDrain && poll) {
+      clearInterval(poll);
+      poll = null;
+    }
+  };
+  const adopt = (next: UpdateStatus | null) => {
+    // A failed fetch is a harness that is restarting, which is what an
+    // update does to it; it says nothing about the hold until it answers.
+    if (!alive || !next) return;
+    const drain = isUpdateDrain(next.drain) ? next.drain : null;
+    if (!sameDrain(drain, sharedDrain)) {
+      sharedDrain = drain;
+      for (const listener of drainListeners) listener();
+    }
+    arm();
+  };
+  function refresh() {
+    void fetchUpdateStatus().then(adopt);
+  }
+  const onPush = (event: Event) => {
+    const detail = event instanceof CustomEvent ? event.detail : null;
+    if (isUpdateStatus(detail)) adopt(detail);
+  };
+
+  refresh();
+  window.addEventListener(UPDATE_STATUS_EVENT, onPush);
+  window.addEventListener("focus", refresh);
+  return () => {
+    alive = false;
+    if (poll) clearInterval(poll);
+    window.removeEventListener(UPDATE_STATUS_EVENT, onPush);
+    window.removeEventListener("focus", refresh);
+  };
+}
+
+/** What the shared watcher knows right now. */
+export function currentDrain(): UpdateDrain | null {
+  return sharedDrain;
+}
+
+/** Start watching for the hold for as long as `listener` is subscribed.  The
+ * first listener starts the watcher and the last one stops it. */
+export function subscribeDrain(listener: () => void): () => void {
+  drainListeners.add(listener);
+  if (drainListeners.size === 1) stopDrainWatch = watchDrain();
+  return () => {
+    drainListeners.delete(listener);
+    if (drainListeners.size === 0) {
+      stopDrainWatch?.();
+      stopDrainWatch = null;
+      sharedDrain = null;
+    }
+  };
+}
+
+/** The hold an update has on new work right now, or null.  Re-renders only
+ * when the hold changes; use `useNow` beside it for a countdown. */
+export function useUpdateDrain(): UpdateDrain | null {
+  return useSyncExternalStore(subscribeDrain, currentDrain, () => null);
+}
+
+/** A clock that ticks only while something is showing a countdown. */
+export function useNow(intervalMs: number | null): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (intervalMs === null) return;
+    setNow(Date.now());
+    const timer = setInterval(() => setNow(Date.now()), intervalMs);
+    return () => clearInterval(timer);
+  }, [intervalMs]);
+  return now;
+}

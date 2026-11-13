@@ -7,38 +7,168 @@
 // than asking for everything.
 import SwiftUI
 import CompanionCore
+import UIKit
 import UserNotifications
 
 @main
 struct CompanionApp: App {
-    @StateObject private var session = Session()
+    @UIApplicationDelegateAdaptor(CompanionAppDelegate.self) private var appDelegate
+    @StateObject private var session: Session
+    @StateObject private var testFlightUpdate = TestFlightUpdateMonitor()
     @Environment(\.scenePhase) private var scenePhase
     @State private var liveActivities = LiveActivityCoordinator()
 
     init() {
         SentryTelemetry.start()
+        let session = Session()
+        _session = StateObject(wrappedValue: session)
+        // Answer from the island or the Lock Screen.  Installed here rather
+        // than in `onAppear` because a `LiveActivityIntent` launches this
+        // process in the background without ever showing the scene, so a route
+        // wired on appearance would be nil at exactly the moment a Lock Screen
+        // tap needs it.
+        LiveActivityApprovalRoute.install(session: session)
+        appDelegate.onDeviceToken = { hex in
+            Task { await session.registerPushToken(hex) }
+        }
+        appDelegate.onRemoteRefresh = {
+            try await session.refreshFromRemoteNotification()
+        }
     }
 
     var body: some Scene {
         WindowGroup {
-            RootView()
+            launchRoot
+                // Fleet UI ruling 2026-09-19: default theme is **system**, not
+                // light.  We removed the explicit `.preferredColorScheme(.light)`
+                // so the iOS app follows the OS appearance setting; a Light
+                // Mac still boots Light and a Dark Mac boots Dark.  The owner
+                // can override per-device via the iOS Settings → Display &
+                // Brightness system toggle.
                 .environmentObject(session)
+                .environmentObject(testFlightUpdate)
+                .safeAreaInset(edge: .top) {
+                    TestFlightUpdateBanner(monitor: testFlightUpdate)
+                }
                 .onAppear {
                     session.connect()
+                    session.registerForRemoteNotificationsIfAllowed()
                     liveActivities.attach(to: session)
+                    liveActivities.transition(to: liveActivityPhase(scenePhase))
+                    Task { await testFlightUpdate.checkIfDue() }
+                    // Categories and the notification-settings lookup are
+                    // XPC.  Yield once so they are not inside the same
+                    // main-thread turn as the first layout.
+                    Task { @MainActor in
+                        await Task.yield()
+                        session.activateAfterFirstFrame()
+                        await session.refreshNotificationAuthorization()
+                    }
+                    #if DEBUG
+                    if ProcessInfo.processInfo.arguments.contains("-live-activity-preview") {
+                        LiveActivityCoordinator.startPreviewActivity()
+                    }
+                    #endif
                 }
-                .onOpenURL { session.receivePairingURL($0) }
+                .onOpenURL { session.receiveOpenURL($0) }
                 .onChange(of: scenePhase) { _, phase in
+                    liveActivities.transition(to: liveActivityPhase(phase))
                     switch phase {
                     case .active:
                         session.connect()
                         Task { await session.refreshNotificationAuthorization() }
-                    case .background: session.linger()
+                        Task { await testFlightUpdate.checkIfDue() }
+                    case .background:
+                        // A reply being read keeps going: the `audio`
+                        // background mode lets it outlast auto-lock, which
+                        // used to cut every long read off partway.
+                        session.linger()
                     case .inactive: break
                     @unknown default: break
                     }
                 }
         }
+    }
+
+    /// RootView reads onboarding preferences and builds the real route.
+    /// That waits until pairing restore has published, so the first layout
+    /// is not also the keychain read (BOTFLEET-W).
+    @ViewBuilder
+    private var launchRoot: some View {
+        if session.launchRestoreSettled {
+            RootView()
+        } else {
+            CompanionLaunchPlaceholder()
+        }
+    }
+
+    private func liveActivityPhase(_ phase: ScenePhase) -> LiveActivityLifecyclePhase {
+        switch phase {
+        case .active: return .active
+        case .inactive: return .inactive
+        case .background: return .background
+        @unknown default: return .inactive
+        }
+    }
+}
+
+/// Registers for remote notifications after the user allows alerts.  The
+/// token is posted to the sidecar; this process never sends an APNs push.
+final class CompanionAppDelegate: NSObject, UIApplicationDelegate {
+    var onDeviceToken: ((String) -> Void)?
+    var onRemoteRefresh: (@MainActor @Sendable () async throws -> Bool)?
+
+    func application(
+        _ application: UIApplication,
+        didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data
+    ) {
+        let hex = deviceToken.map { String(format: "%02x", $0) }.joined()
+        onDeviceToken?(hex)
+    }
+
+    func application(
+        _ application: UIApplication,
+        didFailToRegisterForRemoteNotificationsWithError error: Error
+    ) {
+        // Simulator and missing entitlements land here.  Local alerts still work.
+    }
+
+    func application(
+        _ application: UIApplication,
+        didReceiveRemoteNotification userInfo: [AnyHashable: Any],
+        fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void
+    ) {
+        // Before the refresh, not after: this wake is what reconnects the
+        // stream, and the harness replays the very frame this push was built
+        // from.  Noting it first is what keeps that replay from drawing a
+        // second banner for a notification Apple has already delivered.
+        NotificationCoordinator.shared.notePushDelivered(userInfo: userInfo)
+        guard let onRemoteRefresh else {
+            completionHandler(.noData)
+            return
+        }
+        Task {
+            let outcome = await BackgroundRefreshCoordinator.run(timeoutNanoseconds: 15_000_000_000) {
+                try await onRemoteRefresh()
+            }
+            switch outcome {
+            case .newData: completionHandler(.newData)
+            case .noData: completionHandler(.noData)
+            case .failed: completionHandler(.failed)
+            }
+        }
+    }
+}
+
+/// Static first frame while pairing restore runs off the main thread.
+/// No accessibility modifiers and no asset lookup: those are what pull
+/// UIKit's settings bundle onto the main thread during launch.
+struct CompanionLaunchPlaceholder: View {
+    var body: some View {
+        Text("BotFleet")
+            .font(.title2)
+            .foregroundStyle(Color.gray)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 
@@ -52,7 +182,52 @@ struct RootView: View {
 
     var body: some View {
         Group {
-            switch route {
+#if DEBUG
+            if ProcessInfo.processInfo.arguments.contains("-tvface-preview") {
+                TVFacePreviewHarness()
+            } else if ProcessInfo.processInfo.arguments.contains("-composer-regression-preview") {
+                ComposerScrollRegressionPreview().padding()
+            } else {
+                mainRoutes
+            }
+#else
+            mainRoutes
+#endif
+        }
+        .onChange(of: session.pairingInvite) { _, invite in
+            guard invite != nil else { return }
+            hasSeenWelcome = true
+            pairingRequested = true
+        }
+        .onAppear { reconcileNotificationOnboarding() }
+        .onChange(of: session.notificationAuthorizationResolved) { _, _ in
+            reconcileNotificationOnboarding()
+        }
+        .onChange(of: session.notificationAuthorization) { _, _ in
+            reconcileNotificationOnboarding()
+        }
+        .onChange(of: notificationOnboardingPending) { _, isPending in
+            if isPending { reconcileNotificationOnboarding() }
+        }
+        .alert(
+            "Something went wrong",
+            isPresented: Binding(
+                get: { session.actionError != nil },
+                set: { if !$0 { session.actionError = nil } }
+            ),
+            presenting: session.actionError
+        ) { _ in
+            Button("OK", role: .cancel) { session.actionError = nil }
+        } message: { message in
+            Text(message)
+        }
+    }
+
+    @ViewBuilder
+    private var mainRoutes: some View {
+        switch route {
+            case .restoring:
+                CompanionLaunchPlaceholder()
             case .welcome:
                 CompanionWelcomeView(
                     onConnect: startPairing,
@@ -94,34 +269,6 @@ struct RootView: View {
                     session.signOut()
                     startPairing()
                 }
-            }
-        }
-        .onChange(of: session.pairingInvite) { _, invite in
-            guard invite != nil else { return }
-            hasSeenWelcome = true
-            pairingRequested = true
-        }
-        .onAppear { reconcileNotificationOnboarding() }
-        .onChange(of: session.notificationAuthorizationResolved) { _, _ in
-            reconcileNotificationOnboarding()
-        }
-        .onChange(of: session.notificationAuthorization) { _, _ in
-            reconcileNotificationOnboarding()
-        }
-        .onChange(of: notificationOnboardingPending) { _, isPending in
-            if isPending { reconcileNotificationOnboarding() }
-        }
-        .alert(
-            "Something went wrong",
-            isPresented: Binding(
-                get: { session.actionError != nil },
-                set: { if !$0 { session.actionError = nil } }
-            ),
-            presenting: session.actionError
-        ) { _ in
-            Button("OK", role: .cancel) { session.actionError = nil }
-        } message: { message in
-            Text(message)
         }
     }
 
@@ -141,7 +288,8 @@ struct RootView: View {
             hasPendingPairingInvite: session.pairingInvite != nil,
             notificationOnboardingPending: notificationOnboardingPending,
             hasSeenNotificationPrompt: hasSeenNotificationPrompt,
-            notificationAuthorization: notificationAuthorizationState
+            notificationAuthorization: notificationAuthorizationState,
+            launchRestoreSettled: session.launchRestoreSettled
         ))
     }
 
