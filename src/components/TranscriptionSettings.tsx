@@ -8,7 +8,7 @@ import { KEYTERMS_MAX, formatKeyterms, keytermsDirty, parseKeyterms, persistKeyt
 
 type Provider = "auto" | "apple" | "assemblyai" | "xai" | "meta" | "azure" | "groq";
 
-type ProviderOption = { value: Provider; title: string; description: string };
+type ProviderOption = { value: Provider; title: string; description: string; available?: boolean };
 
 function providerFromRadio(value: string): Provider {
   if (value === "auto") return "auto";
@@ -20,7 +20,7 @@ const CALL_STT_PROVIDER_OPTIONS: readonly ProviderOption[] = [
     value: "auto",
     title: "Automatic",
     description:
-      "Use the best provider for this device — Apple on macOS, AssemblyAI on every other platform.",
+      "Apple on-device dictation on macOS, then xAI, then AssemblyAI on other computers.",
   },
   {
     value: "apple",
@@ -37,23 +37,25 @@ const CALL_STT_PROVIDER_OPTIONS: readonly ProviderOption[] = [
   {
     value: "xai",
     title: "xAI Cloud Recognition",
-    description: "Uses the xAI API key from Connections.\u00A0 Streaming bridge ships in a follow-up.",
+    description: "Uses the xAI API key from Connections.\u00A0 Streaming speech-to-text in 38+ languages.",
   },
   {
     value: "meta",
     title: "Meta Muse Voice Transcribe",
-    description: "Uses the Meta speech key from Connections.\u00A0 Streaming bridge ships in a follow-up.",
+    description: "Not yet available in this version.",
+    available: false,
   },
   {
     value: "azure",
     title: "Azure Speech",
-    description:
-      "Uses the Azure Speech key and region from Connections.\u00A0 Streaming bridge ships in a follow-up.",
+    description: "Not yet available in this version.",
+    available: false,
   },
   {
     value: "groq",
     title: "Groq Whisper",
-    description: "Batch transcription path.\u00A0 Uses the Groq key from Connections.",
+    description: "Not yet available in this version.",
+    available: false,
   },
 ];
 
@@ -218,9 +220,7 @@ export function TranscriptionSettings() {
           <span className="text-ink">Voice Calls & Dictation</span>
         </div>
         <p className="mb-2 text-[12px] leading-relaxed text-ink-secondary">
-          Voice mode works everywhere.{"\u00A0 "}macOS uses on-device Apple Speech Recognition until a
-          key is added, then opts into the same cloud engine that powers skill narration —
-          quicker turnaround, custom vocabulary, server-side turn detection.
+          Automatic uses Apple on-device dictation on macOS (private and free), then xAI, then AssemblyAI.{"\u00A0 "}Pin a cloud provider when you want that one every time.
         </p>
         <fieldset className="space-y-1.5">
           <legend className="sr-only">Voice call dictation provider</legend>
@@ -228,7 +228,8 @@ export function TranscriptionSettings() {
             <label
               key={option.value}
               className={cn(
-                "flex cursor-pointer items-start gap-3 rounded-lg border border-hairline/40 bg-inset px-3 py-2 hover:border-hairline",
+                "flex items-start gap-3 rounded-lg border border-hairline/40 bg-inset px-3 py-2",
+                option.available === false ? "cursor-not-allowed opacity-60" : "cursor-pointer hover:border-hairline",
                 provider === option.value && "border-accent",
               )}
             >
@@ -238,7 +239,7 @@ export function TranscriptionSettings() {
                 value={option.value}
                 checked={provider === option.value}
                 onChange={(event) => void saveProvider(providerFromRadio(event.target.value))}
-                disabled={!callSttLoaded || savingProvider}
+                disabled={!callSttLoaded || savingProvider || option.available === false}
                 className="mt-1 size-3 accent-accent"
               />
               <div>

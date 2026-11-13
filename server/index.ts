@@ -535,6 +535,7 @@ import {
 } from "./store.ts";
 import * as tts from "./tts/index.ts";
 import { speechUsageTotals } from "./tts/usage.ts";
+import { handleXaiSttRoutes, voiceIsOff, VOICE_OFF_ERROR } from "./stt/routes.ts";
 import {
   VOICE_SUMMARY_PROMPT,
   spokenReply,
@@ -12417,10 +12418,21 @@ function readBody(req: IncomingMessage, maxBytes = 1_000_000): Promise<any> {
 // parsed any content type, so a page anywhere could drive them.
 //
 // Bodyless mutating requests (a stop, a cancel) are exempt — there is no
-// content type to check.  The binary upload is exempt by name, because it is
-// the one route whose body is not JSON, and the phone sends its own type
+// content type to check.  Binary uploads are exempt by name or pattern,
+// because their bodies are not JSON, and the phone sends its own type
 // through `companion/src/proxy.ts`, which forwards it verbatim.
 const NON_JSON_BODY_ROUTES = new Set(["/api/attachments"]);
+const NON_JSON_BODY_ROUTE_PATTERN = /^\/api\/stt\/xai\/sessions\/[^/]+\/audio$/;
+
+function isNonJsonBodyRoute(path: string, req: IncomingMessage): boolean {
+  if (NON_JSON_BODY_ROUTES.has(path)) return true;
+  if (!NON_JSON_BODY_ROUTE_PATTERN.test(path)) return false;
+  // Only raw PCM may skip the JSON content-type gate.  A CORS-simple
+  // text/plain POST must still receive a 415 so a cross-origin page cannot
+  // append attacker-controlled bytes to a live dictation session.
+  const type = String(req.headers["content-type"] ?? "").split(";")[0]!.trim().toLowerCase();
+  return type === "application/octet-stream";
+}
 
 /** The 415 a mutating request gets when it carries a body the harness will
  *  not parse.  One string for one condition: the shared gate and the per-route
@@ -13702,7 +13714,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         path !== "/api/health" && path !== "/api/update/status") {
       return json(res, 503, { error: controlShutdownPending ? "server shutdown is in progress" : "BotFleet is quiescing for an update" });
     }
-    if (mutatingApiRequest && !NON_JSON_BODY_ROUTES.has(path) && hasRequestBody(req) && !isJsonContentType(req)) {
+    if (mutatingApiRequest && !isNonJsonBodyRoute(path, req) && hasRequestBody(req) && !isJsonContentType(req)) {
       // the commands route names its code so a client can branch on it
       return json(res, 415, /^\/api\/bots\/[\w-]+\/commands$/.test(path)
         ? { error: UNSUPPORTED_JSON_BODY, code: "unsupported_media_type" }
@@ -19083,6 +19095,8 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     // token and nothing else.  The policy -- which provider, why not, how
     // often -- lives in server/sts-access.ts and the minting itself in
     // shared/sts-tokens.ts, so a phone and the desktop cannot disagree.
+    if (await handleXaiSttRoutes({ method, path, req, res, cfg, json, readBody })) return;
+
     if (method === "GET" && path === "/api/sts/status") {
       // Booleans only.  Reading that a provider is set up is not reading its
       // key, which is the same line /api/config draws.
@@ -19098,6 +19112,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       return json(res, 200, stsStatusBody(keys, preference));
     }
     if (method === "POST" && path === "/api/sts/token") {
+      if (voiceIsOff(cfg)) return json(res, 409, { error: VOICE_OFF_ERROR });
       // Parsed here, at the door: everything below works on a provider, not
       // on whatever a device put in the body.
       const parsed = stsTokenRequest.safeParse(await readBody(req));
@@ -20182,6 +20197,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         return res.end(result.bytes ? Buffer.from(result.bytes) : undefined);
       }
       if (clipIndex !== undefined) return json(res, 405, { error: "POST the message audio route" });
+      if (voiceIsOff(cfg)) return json(res, 409, { error: VOICE_OFF_ERROR });
       if (!owner) return json(res, 404, { error: "no voice owner" });
       const body = await readBody(req);
       const result = await messageAudio.post({ threadId, messageId, owner, body, startedAt });
@@ -20214,6 +20230,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       }
     }
     if (method === "POST" && path === "/api/tts/speak") {
+      if (voiceIsOff(cfg)) return json(res, 409, { error: VOICE_OFF_ERROR });
       if (cfg.tts?.provider !== "system" && workspaceCredentialPending(cfg, "ttsKey")) {
         return json(res, 409, { error: "Voice synthesis is waiting for its encrypted credential" });
       }
@@ -20243,6 +20260,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     // Uses the same authenticated workspace-settings boundary as key changes.
     // Never treat an arbitrary nonce as proof of ownership.
     if (method === "POST" && path === "/api/tts/voice-clone") {
+      if (voiceIsOff(cfg)) return json(res, 409, { error: VOICE_OFF_ERROR });
       // The clone clip is up to 20 MB; base64 expands it to ~27 MB.
       // Only this route accepts the larger body, after the normal host/origin gate.
       const body = await readBody(req, 28_000_000);

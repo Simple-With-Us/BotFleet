@@ -619,10 +619,10 @@ export function buildTurnEvents(
 }
 
 /** Spend that is not a chat turn: a synthesized clip, a generated avatar, a
- * speech summary, a voice-call token.  Nothing here carries prompt text, a
- * key, or a task title. */
+ * speech summary, a voice-call token, or a speech-to-text session.  Nothing
+ * here carries prompt text, a key, or a task title. */
 export interface TelemetryAuxParams {
-  kind: "tts" | "avatar-image" | "speech-summary" | "sts-session";
+  kind: "tts" | "avatar-image" | "speech-summary" | "sts-session" | "stt";
   /** Usage Monitor's provider name for who was paid. */
   provider: string;
   /** The model, voice engine or surface inside that provider. */

@@ -212,6 +212,8 @@ const SAFE_METADATA_KEYS = new Set([
   "characters",
   "characterSource",
   "images",
+  "durationSeconds",
+  "mode",
   "success",
   "tokenType",
   "model",

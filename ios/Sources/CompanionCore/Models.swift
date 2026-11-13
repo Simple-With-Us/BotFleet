@@ -1123,7 +1123,7 @@ public struct ConfigStatus: Codable, Sendable {
     }
 
     /// Whether synthesis is available on the paired computer. Deliberately
-    /// provider-neutral: under ElevenLabs this is a key on file, while under
+    /// provider-neutral: under a hosted engine this is a key on file, while under
     /// the built-in engine `providerConfigured` in `server/tts/index.ts`
     /// reports whether the computer has voices it can use and no credential
     /// exists at all. Only the reason behind the flag changes — so anything
