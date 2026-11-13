@@ -20,7 +20,7 @@ A session BotFleet launched keeps the role seat BotFleet assigned it, on whateve
 
 Linear (team **BF**, issue ids like `BF-123`) is the system of record for claims, status, and closeouts.  The `simple-board` CLI is Linear-backed and loads credentials itself — the secret never hits a command line.
 
-**Never prepend `~/apps/mac-collab` to `PATH`.**  Its legacy `board` binary targets the retired tracker.  Use `simple-board`; `board`, `board-legacy` and the mac-collab backend are retired write routes.  Verify `command -v simple-board` and the authenticated seat on the installed route before trusting it.  Humans may browse `https://mac.jays.services/board` as a read-only archive.
+**Never prepend `~/apps/mac-collab` to `PATH`.**  Its legacy `board` binary targets the retired tracker.  Use `simple-board`; the legacy `~/.local/bin/board` alias, `board-legacy` and the mac-collab backend are retired write routes.  Verify `command -v simple-board` and the authenticated seat on the installed route before trusting it.  Humans may browse `https://mac.jays.services/board` as a read-only archive.
 
 ```bash
 command -v simple-board
