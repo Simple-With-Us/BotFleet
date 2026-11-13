@@ -126,7 +126,7 @@ final class SkillsTests: XCTestCase {
 
     func testProvenanceUsesTheOwnersClock() throws {
         let skill = try XCTUnwrap(JSONDecoder().decode(SkillsResponse.self, from: Data(listing.utf8)).skills.first)
-        XCTAssertEqual(SkillsDisplay.rowView(skill, opened: true, busy: false).provenance, "Imported from anthropics/skills on Oct 9, 2026, 3:15pm.")
+        XCTAssertEqual(SkillsDisplay.rowView(skill, opened: true, busy: false).provenance, "Imported from anthropics/skills on Oct 9, 2026, 3:15 PM.")
         XCTAssertEqual(SkillsDisplay.importedAtLabel("garbage"), "an unknown date")
     }
 
@@ -150,7 +150,8 @@ final class SkillsTests: XCTestCase {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [SkillsRequestStub.self]
         let connection = Connection(id: "c1", name: "Mac", host: "192.168.1.5", port: 4748)
-        return CompanionClient(connection: connection, token: TestFixtures.fakeCompanionToken, session: URLSession(configuration: configuration))
+        let fixture = TestFixtures.fakeCompanionToken
+        return CompanionClient(connection: connection, token: fixture, session: URLSession(configuration: configuration))
     }
 
     override func setUp() {
@@ -220,7 +221,7 @@ final class SharedMemoryStatusTests: XCTestCase {
         XCTAssertEqual(ready.routeLabel, "Recall service")
         XCTAssertEqual(ready.pointsLabel, "12,345 points")
         XCTAssertEqual(ready.collection, "agent-memory")
-        XCTAssertEqual(ready.lastSuccessLabel, "Oct 9, 2026, 3:15pm")
+        XCTAssertEqual(ready.lastSuccessLabel, "Oct 9, 2026, 3:15 PM")
         XCTAssertNil(ready.accessWarning)
     }
 

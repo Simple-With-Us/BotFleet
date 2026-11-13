@@ -144,7 +144,7 @@ public enum SkillsDisplay {
         return "\(count) enabled skill\(count == 1 ? "" : "s") not indexed \u{2014} \(names.joined(separator: ", ")).\(gap)Still enabled, but there are too many (or they are too long) for this bot to discover on its own.\(gap)Disable one you don't need, or ask the bot to read it directly."
     }
 
-    /// "Oct 9, 2026, 3:15pm", or "an unknown date".
+    /// "Oct 9, 2026, 3:15 PM", or "an unknown date".
     public static func importedAtLabel(_ importedAt: String) -> String {
         OwnerClock.stamp(iso: importedAt) ?? "an unknown date"
     }
