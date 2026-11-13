@@ -1,6 +1,8 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
+import { zulipMentionHandle } from "./format.ts";
+
 import {
   ZULIP_MAX_TOPIC_CHARS,
   buildInboundPrompt,
@@ -220,5 +222,16 @@ describe("the peer screen", () => {
     const docs = readFileSync(new URL("../../docs/zulip.md", import.meta.url), "utf8");
     expect(docs).toContain("treats any peer request as gated and declines it");
     expect(docs).not.toContain("treats a gated request as declined");
+  });
+});
+
+describe("zulipMentionHandle", () => {
+  it("builds the exact handle, and refuses names that would break the trusted prompt line", () => {
+    expect(zulipMentionHandle({ userId: 50, fullName: "Claude" })).toBe("@**Claude|50**");
+    expect(zulipMentionHandle({ userId: 50, fullName: "wi*cked" })).toBeNull();
+    expect(zulipMentionHandle({ userId: 50, fullName: "pipe|name" })).toBeNull();
+    expect(zulipMentionHandle({ userId: 50, fullName: "tick`name" })).toBeNull();
+    expect(zulipMentionHandle({ userId: 50, fullName: "line\nbreak" })).toBeNull();
+    expect(zulipMentionHandle({ userId: 50, fullName: "   " })).toBeNull();
   });
 });

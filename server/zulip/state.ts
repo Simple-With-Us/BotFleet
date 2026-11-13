@@ -119,6 +119,8 @@ const unitSchema = z.object({
   updatedAt: z.number(),
   attempts: z.number(),
   notBefore: z.number(),
+  held: z.string().optional(),
+  dropped: z.number().optional(),
 });
 /** One queued owner notice, parsed on its own so a single damaged entry can
  *  be quarantined (with its raw form preserved privately) instead of costing
@@ -172,7 +174,7 @@ export class ZulipStateStore {
     } catch {
       return emptyState(role);
     }
-    let rawJson: unknown;
+    let rawJson;
     try {
       rawJson = JSON.parse(text);
     } catch {
@@ -193,13 +195,18 @@ export class ZulipStateStore {
     if (droppedTotal > 0) state.noticesDroppedOnLoad = droppedTotal;
     // Quarantine the raw invalid entries BEFORE any save can overwrite the
     // file: private, mode-600, never logged, never posted.
-    const rawEntries: unknown[] =
-      rawJson !== null && typeof rawJson === "object" && Array.isArray((rawJson as { notices?: unknown }).notices)
-        ? ((rawJson as { notices: unknown[] }).notices)
-        : [];
+    const rawEntries: unknown[] = Array.isArray(rawJson?.notices) ? rawJson.notices : [];
     const invalidRaw = rawEntries.filter((entry) => !noticeEntrySchema.safeParse(entry).success);
     if (invalidRaw.length > 0) this.archive(botId, "schema-invalid-on-load", invalidRaw);
     return state;
+  }
+
+  /** Preserve queue-cap-trimmed inbound items in the same private archive
+   *  as quarantined notices: accepted input is evidence and is never
+   *  destroyed without a private copy.  Throws on write failure so the
+   *  caller keeps the items instead of dropping them silently. */
+  archiveDroppedItems(botId: string, origin: ZulipOrigin, items: ZulipInboundItem[]): void {
+    this.archive(botId, "queue-cap-item-drop", items.map((item) => ({ origin, item })));
   }
 
   /** Append records to the bot's private notices archive (mode-600 JSONL
